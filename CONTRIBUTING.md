@@ -22,5 +22,11 @@ People with Soul can serve on juries (`blockula contrib join-jury`), which earns
 - Explain what changed and how you verified it.
 - Volume doesn't pay: rewards are square-rooted per sponsor and vest with clawback. One solid PR beats ten small ones.
 
+## How PRs merge
+- Everything reaches `main` through a PR: a maintainer's approval, both CI jobs green, review threads resolved, and the branch up to date with `main`. Pushing new commits after an approval needs a fresh one.
+- PRs are squash-merged, so each one becomes a single commit on `main` titled `<PR title> (#n)`. That commit is the merge SHA validators attest to for your claim, and what gets reverted if the change is backed out.
+- `main`'s history is never rewritten (no force pushes), so a merge SHA stays valid for the whole revert window.
+- CI for a first-time contributor's PR waits for a maintainer to approve the run. Leave "Allow edits by maintainers" on so we can update your branch.
+
 ## Security
 Please report vulnerabilities privately via GitHub Security Advisories on this repo rather than in a public issue.
