@@ -29,18 +29,20 @@ CI (`.github/workflows/fuzz.yml`) runs the stable checks on PRs that touch `node
 
 ### How the crate builds
 
-The node is a binary crate with no library target, so `src/lib.rs` compiles its modules straight from `node/src` through a `#[path]` module and re-exports them, so the node's `crate::…` paths still resolve. Nothing in `node/` changes. In exchange, this crate repeats the node's module list and `[dependencies]`; `check-sync.sh` (run in CI) fails when they drift. If the node gains a `lib.rs`, this crate can depend on it and drop both copies.
+The node is a binary crate with no library target, so `src/lib.rs` compiles its modules straight from `node/src` through a `#[path]` module and re-exports them, so the node's `crate::…` paths still resolve. The node crate itself doesn't change. In exchange, this crate repeats the node's module list and `[dependencies]`; `check-sync.sh` (run in CI) fails when they drift. If the node gains a `lib.rs`, this crate can depend on it and drop both copies.
 
-## Results (2026-10-14, local, Apple M-series, nightly-2026-10-13, 90 s per target)
+## Results (2026-10-14, local, Apple M-series, nightly-2026-10-13)
 
-| Target | Executions | Result |
+Two rounds per target, 90 s and then 180 s, both from the committed seeds and the corpus built so far:
+
+| Target | Executions (90 s + 180 s) | Result |
 |---|---|---|
-| `cblock` | 197,777 (2,173/s) | no crash |
-| `tx_json` | 98,340 (1,080/s) | no crash |
-| `snapshot_manifest` | 114,412 (1,257/s) | no crash. FUZZ-1 (below) surfaced earlier, when the first seed for this target, a checkpoint in epoch 0, crashed the harness; the committed seed uses epoch 1 so the fuzzer can get past it |
-| `sync_batch` | 101,100 (1,110/s) | no crash |
-| `epochs_registry` | 71,642 (1,214/s) | **FUZZ-2 after 59 s**, then 100 s more in fork mode (`-fork=1 -ignore_crashes=1`) with no other crash |
-| `certificate` | 209,337 (2,300/s) | no crash |
+| `cblock` | 197,777 + 396,536 | no crash |
+| `tx_json` | 98,340 + 376,658 | no crash |
+| `snapshot_manifest` | 114,412 + 400,812 | no crash. FUZZ-1 (below) showed up before fuzzing started: this target's first seed, a checkpoint in epoch 0, crashed the harness. The committed seed uses epoch 1 so the fuzzer can get past it |
+| `sync_batch` | 101,100 + 378,575 | no crash |
+| `epochs_registry` | 71,642 + 301,970 | **FUZZ-2**, found on its own after 59 s. The second round ran in fork mode (`-fork=1 -ignore_crashes=1`) to fuzz past it; all 4 crash inputs saved (counting one more 100 s fork-mode run) were FUZZ-2, and nothing else crashed |
+| `certificate` | 209,337 + 455,263 | no crash |
 
 These are smoke runs, not the two-week soak SEC-3 asks for.
 
