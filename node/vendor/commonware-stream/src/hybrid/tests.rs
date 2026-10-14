@@ -704,3 +704,47 @@ fn random_identities_handshake() {
     )
     .unwrap();
 }
+
+#[test]
+#[ignore = "timing; run with --release -- --ignored --nocapture"]
+fn handshake_cost() {
+    use std::time::Instant;
+    const N: u32 = 200;
+    let (dialer, listener) = mldsa_pair();
+
+    let start = Instant::now();
+    for _ in 0..N {
+        let (d, syn) = dial_start(rng(b"d"), ctx(dialer.clone(), listener.public_key()));
+        let (l, syn_ack) =
+            listen_start(rng(b"l"), ctx(listener.clone(), dialer.public_key()), syn).unwrap();
+        let (ack, _, _) = dial_end(d, syn_ack).unwrap();
+        listen_end(l, ack).unwrap();
+    }
+    let hybrid = start.elapsed() / N;
+
+    let start = Instant::now();
+    for _ in 0..N {
+        let classic_ctx = |me: &mldsa::PrivateKey, peer: &mldsa::PrivateKey| {
+            classic::Context::new(NS, NOW, WINDOW, me.clone(), peer.public_key())
+        };
+        let (d, syn) = classic::dial_start(rng(b"d"), classic_ctx(&dialer, &listener));
+        let (l, syn_ack) =
+            classic::listen_start(rng(b"l"), classic_ctx(&listener, &dialer), syn).unwrap();
+        let (ack, _, _) = classic::dial_end(d, syn_ack).unwrap();
+        classic::listen_end(l, ack).unwrap();
+    }
+    let classical = start.elapsed() / N;
+
+    let start = Instant::now();
+    for _ in 0..N {
+        let (secret, share) = generate(&mut rng(b"d"));
+        let (reply, _) = encapsulate(&mut rng(b"l"), &share).unwrap();
+        decapsulate(secret, &reply).unwrap();
+    }
+    let key_exchange = start.elapsed() / N;
+
+    println!(
+        "per handshake with ML-DSA-65 identities: hybrid {hybrid:?}, classical {classical:?}; \
+         hybrid key exchange alone (both sides) {key_exchange:?}"
+    );
+}

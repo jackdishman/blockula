@@ -411,7 +411,7 @@ async fn status(State(n): State<Node>) -> ApiResult {
         "head_age_ms": c.last_block().map(|b| crate::chain::now_ms().saturating_sub(b.timestamp_ms)),
         "history_from": c.base_height() + 1,
         "fast_synced_from": c.base.as_ref().map(|b| b.height),
-        "crypto": { "signatures": "ML-DSA-65 (FIPS 204)", "hash": "BLAKE3-256", "addresses": "bech32m(boo, BLAKE3(pubkey))", "p2p_transport": "X25519 + ChaCha20-Poly1305 (not post-quantum), ML-DSA-65 peer auth" },
+        "crypto": { "signatures": "ML-DSA-65 (FIPS 204)", "hash": "BLAKE3-256", "addresses": "bech32m(boo, BLAKE3(pubkey))", "p2p_transport": "hybrid X25519 + ML-KEM-768 key exchange, ChaCha20-Poly1305, ML-DSA-65 peer auth" },
     })))
 }
 
