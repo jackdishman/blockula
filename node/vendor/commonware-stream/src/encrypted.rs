@@ -14,8 +14,8 @@
 //!
 //! All traffic is encrypted using ChaCha20-Poly1305. A shared secret is established using an
 //! ephemeral hybrid key exchange: X25519 Diffie-Hellman and ML-KEM-768 (Blockula; upstream uses
-//! X25519 alone). Both secrets, combined with the handshake transcript, are used to derive keys for both the handshake's key confirmation messages and
-//! the post-handshake data traffic. Binding the derived keys to the handshake transcript prevents
+//! X25519 alone). Both secrets, combined with the handshake transcript, are used to derive keys
+//! for both the handshake's key confirmation messages and the post-handshake data traffic. Binding the derived keys to the handshake transcript prevents
 //! man-in-the-middle and transcript substitution attacks.
 //!
 //! Each directional cipher uses a 12-byte nonce derived from a counter that is incremented for each
