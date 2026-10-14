@@ -1,0 +1,106 @@
+# cargo-fuzz crate for the node's network-facing decoders (SEC-3). See README.md.
+[package]
+name = "blockula-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[lib]
+path = "src/lib.rs"
+# The node's own unit tests compile in here too under cfg(test); `cargo test` in node/ runs them.
+test = false
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+# The node's [dependencies], copied verbatim: src/lib.rs compiles ../src. check-sync.sh
+# fails if they drift.
+anyhow = "1.0.104"
+axum = "0.8"
+bech32 = "=0.12.0"
+blake3 = "=1.8.7"
+clap = { version = "4.6.7", features = ["derive"] }
+getrandom = "0.3"
+hex = "0.4.3"
+ml-dsa = "=0.1.1"
+parking_lot = "0.12.5"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.53.3", features = ["full"] }
+tower-http = { version = "0.7.1", features = ["cors"] }
+commonware-actor = "=2026.9.0"
+commonware-broadcast = "=2026.9.0"
+commonware-codec = "=2026.9.0"
+commonware-consensus = "=2026.9.0"
+commonware-cryptography = "=2026.9.0"
+commonware-macros = "=2026.9.0"
+commonware-math = "=2026.9.0"
+commonware-p2p = "=2026.9.0"
+commonware-parallel = "=2026.9.0"
+commonware-runtime = "=2026.9.0"
+commonware-storage = "=2026.9.0"
+commonware-utils = "=2026.9.0"
+bytes = "1"
+futures = "0.3"
+rand_core = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tracing = "0.1"
+zstd = "0.13"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Like the node's release build: arithmetic overflow panics instead of wrapping.
+[profile.release]
+debug = 1
+overflow-checks = true
+
+# As in node/Cargo.toml: ML-DSA and consensus are slow unoptimized (tests/seeds.rs on stable).
+[profile.dev.package."*"]
+opt-level = 2
+
+[[bin]]
+name = "cblock"
+path = "fuzz_targets/cblock.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tx_json"
+path = "fuzz_targets/tx_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot_manifest"
+path = "fuzz_targets/snapshot_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sync_batch"
+path = "fuzz_targets/sync_batch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "epochs_registry"
+path = "fuzz_targets/epochs_registry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "certificate"
+path = "fuzz_targets/certificate.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

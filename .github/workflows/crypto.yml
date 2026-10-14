@@ -1,0 +1,46 @@
+# SEC-2: ML-DSA-65 known-answer tests (NIST ACVP, Wycheproof) and the Rust ⇄ TypeScript
+# cross-implementation vectors, for both implementations Blockula signs with. Offline: no node,
+# no network beyond dependencies. See node/testdata/acvp/README.md.
+name: Crypto KATs
+on:
+  push: { branches: [main] }
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: crypto-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  rust:
+    name: ml-dsa (node)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: node }
+      - name: Crypto dependencies are pinned exactly
+        run: |
+          for dep in ml-dsa blake3 bech32; do
+            grep -Eq "^$dep = \"=[0-9]" node/Cargo.toml || { echo "::error::$dep must be pinned with = in node/Cargo.toml"; exit 1; }
+          done
+      - name: Known-answer and cross-implementation tests
+        run: "cargo test --locked --manifest-path node/Cargo.toml kat:: -- --nocapture"
+
+  ts:
+    name: "@noble/post-quantum (SDK)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - name: Crypto dependencies are pinned exactly
+        run: |
+          node -e '
+            const deps = require("./sdk-ts/package.json").dependencies;
+            for (const d of ["@noble/post-quantum", "@noble/hashes", "@scure/base"])
+              if (!/^\d+\.\d+\.\d+$/.test(deps[d] ?? "")) { console.error(`::error::${d} must be an exact version in sdk-ts/package.json`); process.exit(1); }'
+      - name: Known-answer and cross-implementation tests
+        run: npm run test:kat -w @blockula/sdk
