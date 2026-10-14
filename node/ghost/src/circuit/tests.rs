@@ -264,6 +264,24 @@ fn foreign_note_is_rejected() {
 }
 
 #[test]
+fn viewing_key_cannot_spend() {
+    // A full viewing key holder knows ak and nk but not sk. Feeding them in directly (a
+    // random sk, then ak into the owner hash and nk into the register) must fail.
+    let mut r = rng(45);
+    let w = action(&mut r, [Some(500), None], [500, 0]);
+    let fvk_ak = sponge(Domain::SpendAuth, &w.spends[0].sk);
+    let fvk_nk = sponge(Domain::NullifierKey, &w.spends[0].sk);
+    let mut a = raw(&w);
+    a.spends[0].sk = SpendingKey::from_seed(random_bytes(&mut r)).sk();
+    let b = spend_base(0);
+    let mut cheats: Vec<Cheat> = (0..8).map(|j| Cheat { row: b + OWN_A, col: IN + j, value: fvk_ak[j] }).collect();
+    cheats.extend((0..8).map(|j| Cheat { row: b + NK, col: REG_NK + j, value: fvk_nk[j] }));
+    let built = build_with(&a, &cheats);
+    assert_eq!(built.nullifiers[0], w.spends[0].nullifier(), "the attacker reproduced the real nullifier");
+    assert_rejected(built, "spend with a viewing key");
+}
+
+#[test]
 fn dummy_cannot_carry_value() {
     // A dummy skips the membership check, so it must spend exactly zero.
     let w = action(&mut rng(21), [Some(5), None], [5, 0]);
