@@ -983,3 +983,121 @@ mod memory_tests {
         assert!(1027 * 10_000 * MAILBOX_SLOT_BYTES > 400 << 20);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chain::SummonOpts;
+    use commonware_codec::DecodeExt as _;
+    use commonware_consensus::types::{Round, View};
+    use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
+
+    #[test]
+    fn cblock_v2_encodes_decodes_and_commits_to_every_field() {
+        let b = CBlock::new(Digest([1; 32]), 5, 9, 7, 1_000, "boo1proposer".into(), 4, [2; 32], vec![vec![1, 2, 3], vec![]]);
+        let bytes = b.encode();
+        assert_eq!(bytes.len(), b.encode_size());
+        let back = CBlock::decode(bytes.as_ref()).unwrap();
+        assert_eq!(back, b);
+        assert_eq!((back.version, back.view, back.parent_view, back.signal), (PROTOCOL_VERSION, 9, 7, SUPPORTED_PROTOCOL_VERSION));
+        assert_eq!(b.digest(), Blake3::hash(&[b"BLOCKULA_CBLOCK_V2", bytes.as_ref()]));
+        assert_eq!(hex::encode(b.digest_bytes()), "ca6c7aad4e59ed281b8cca54e99c172eb72ebdf3f5ce4e51c5c83cd3eecb23e3");
+        // Every header field is under the digest.
+        let variants = [
+            CBlock { version: 2, ..b.clone() },
+            CBlock { view: 10, ..b.clone() },
+            CBlock { parent_view: 8, ..b.clone() },
+            CBlock { signal: 2, ..b.clone() },
+            CBlock { exec_height: 3, ..b.clone() },
+        ];
+        for v in variants {
+            assert_ne!(v.sealed().digest(), b.digest());
+        }
+        // Decoding bounds and exactness.
+        let mut trailing = bytes.to_vec();
+        trailing.push(0);
+        assert!(CBlock::decode(trailing.as_slice()).is_err());
+        assert!(CBlock::decode(&bytes[..bytes.len() - 1]).is_err());
+        let many = CBlock::new(Digest([1; 32]), 5, 9, 7, 1_000, String::new(), 4, [2; 32], vec![vec![]; MAX_BLOCK_TXS + 1]);
+        assert!(CBlock::decode(many.encode().as_ref()).is_err());
+        let big = CBlock::new(Digest([1; 32]), 5, 9, 7, 1_000, String::new(), 4, [2; 32], vec![vec![0; MAX_TX_BYTES + 1]]);
+        assert!(CBlock::decode(big.encode().as_ref()).is_err());
+        // Txs that aren't canonical wire bytes don't parse.
+        assert_eq!(b.parse_txs(), vec![None, None]);
+    }
+
+    /// A verifier that hasn't executed the height a block cites keeps the verdict pending (it
+    /// used to vote no after ~3 block times at checkpoints), then checks the root once it has.
+    /// Mismatched views, versions and junk txs are still rejected at once.
+    #[test]
+    fn lagging_verifier_waits_instead_of_rejecting() {
+        let root_dir = std::env::temp_dir().join(format!("blockula-lag-{}-{}", crate::chain::now_ms(), std::process::id()));
+        let ahead = root_dir.join("ahead");
+        Chain::summon(&ahead, &SummonOpts::new("lag", 1)).unwrap();
+        let behind = root_dir.join("behind");
+        std::fs::create_dir_all(&behind).unwrap();
+        for f in ["genesis.json", "validator.key"] {
+            std::fs::copy(ahead.join(f), behind.join(f)).unwrap();
+        }
+        // The proposer's view of the chain: executed through 103. The verifier: through 99.
+        let mut a = Chain::open(&ahead).unwrap();
+        for _ in 0..103 {
+            a.produce_block_with(vec![]).unwrap();
+        }
+        let mut b = Chain::open(&behind).unwrap();
+        for _ in 0..99 {
+            b.produce_block_with(vec![]).unwrap();
+        }
+        let (root100, root101) = (hex_32(&a.root_at(100).unwrap()), hex_32(&a.root_at(101).unwrap()));
+        drop(a);
+        let seed: [u8; 32] = hex::decode(std::fs::read_to_string(ahead.join("validator.key")).unwrap().trim()).unwrap().try_into().unwrap();
+        let chain: Shared = Arc::new(Mutex::new(b));
+        deterministic::Runner::timed(Duration::from_secs(120)).start(|context| async move {
+            let leader = PrivateKey::from_seed_bytes(seed).public_key();
+            let mut app = App { chain: chain.clone(), block_time_ms: 1_000, address_prefix: "boo".into() };
+            let parent_at = |height: u64| CBlock::new(Digest([height as u8; 32]), height, 6, 5, 0, String::new(), height - 4, [0; 32], vec![]);
+            let child = |parent: &CBlock, view: u64, exec_height: u64, root: [u8; 32], txs: Vec<Vec<u8>>| CBlock::new(parent.digest(), parent.height + 1, view, 6, 1_000, leader.address("boo"), exec_height, root, txs);
+            let cctx = |parent: &CBlock| SimplexContext { round: Round::new(Epoch::zero(), View::new(7)), leader: leader.clone(), parent: (View::new(6), parent.digest()) };
+            let mut verify = async |block: CBlock, parent: &CBlock| {
+                let cctx = cctx(parent);
+                let ancestry = marshal::ancestry::from_iter([Arc::new(block), Arc::new(parent.clone())]);
+                Application::<deterministic::Context>::verify(&mut app, (context.child("verify"), cctx), ancestry).await
+            };
+            let p103 = parent_at(103);
+            // Permanent failures don't wait.
+            assert!(!verify(child(&p103, 8, 100, root100, vec![]), &p103).await, "view isn't the round's");
+            assert!(!verify(CBlock { version: 2, ..child(&p103, 7, 100, root100, vec![]) }.sealed(), &p103).await, "unknown version");
+            assert!(!verify(child(&p103, 7, 100, root100, vec![b"junk".to_vec()]), &p103).await, "junk tx bytes");
+            let user = crate::crypto::Keys::from_seed([5; 32]);
+            let tx = |valid_until: u64| {
+                let mut t = Tx { chain_id: "lag".into(), from: user.address(), nonce: 0, fee: 0, tip: 0, valid_until, action: crate::types::Action::Transfer { to: "xyz.boo".into(), amount: 1 }, memo: String::new(), public_key: hex::encode(user.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+                t.fee = t.charge().unwrap();
+                t.sign(&user)
+            };
+            assert!(!verify(child(&p103, 7, 100, root100, vec![tx(50).to_bytes()]), &p103).await, "expired tx");
+            let mut padded = tx(110).to_bytes();
+            padded.push(0);
+            assert!(!verify(child(&p103, 7, 100, root100, vec![padded]), &p103).await, "non-canonical tx bytes");
+            assert_eq!(context.current(), std::time::UNIX_EPOCH, "rejected without waiting");
+
+            // The verifier catches up 10 s from now (well past 3 block times), then 10 s later.
+            let catch_up = chain.clone();
+            context.child("catch_up").spawn(move |ctx| async move {
+                for _ in 0..2 {
+                    ctx.sleep(Duration::from_secs(10)).await;
+                    catch_up.lock().produce_block_with(vec![]).unwrap();
+                }
+            });
+            // Block 104 must certify checkpoint 100, which we haven't executed: wait, then accept.
+            assert!(verify(child(&p103, 7, 100, root100, vec![]), &p103).await);
+            assert!(context.current() >= std::time::UNIX_EPOCH + Duration::from_secs(10), "waited for execution");
+            // A block citing 101 (not executed yet) with the wrong root: rejected only once we
+            // can check it (it used to be accepted unchecked).
+            let p102 = parent_at(102);
+            assert!(!verify(child(&p102, 7, 101, [9; 32], vec![]), &p102).await);
+            assert!(context.current() >= std::time::UNIX_EPOCH + Duration::from_secs(20));
+            assert!(verify(child(&p102, 7, 101, root101, vec![tx(110).to_bytes()]), &p102).await);
+        });
+        std::fs::remove_dir_all(root_dir).ok();
+    }
+}

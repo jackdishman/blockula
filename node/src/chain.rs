@@ -2384,9 +2384,9 @@ mod audit {
         c.submit(signed_fee(&c, &a.address(), &a, 0, Action::RegisterName { name: "victim".into() }, None)).unwrap();
         c.produce_block().unwrap();
         // The old PoC: `to` padded with 60 KB of spaces used to be trimmed and accepted.
-        let pad = format!("victim.boo{}", " ".repeat(60_000));
+        let pad = format!("victim.boo{}", " ".repeat(62_000));
         let big = signed_fee(&c, &a.address(), &a, 1, Action::Transfer { to: pad, amount: 1 }, Some(100 * 66_000));
-        assert!(serde_json::to_vec(&big).unwrap().len() > MAX_TX_BYTES);
+        assert!(big.size() as usize > MAX_TX_BYTES);
         let err = c.submit(big.clone()).unwrap_err().to_string();
         assert!(err.contains("too large"), "{err}");
         assert!(c.track_pending(big).is_err());
@@ -2397,14 +2397,16 @@ mod audit {
         let mut memo = signed_fee(&c, &a.address(), &a, 1, Action::Transfer { to: c.me().unwrap(), amount: 1 }, None);
         memo.memo = "m".repeat(257);
         assert!(c.submit(memo.sign(&a)).is_err());
-        // A tx that can never be included expires instead of sitting in the mempool forever.
+        // A tx that's never included leaves the mempool after the TTL instead of sitting there
+        // forever. It isn't expired (it can still execute until `valid_until`), and says so.
         let later = signed_fee(&c, &a.address(), &a, 1, Action::Transfer { to: c.me().unwrap(), amount: 1 }, None);
-        let id = c.submit(later).unwrap();
+        let id = c.submit(later.clone()).unwrap();
         for _ in 0..=MEMPOOL_TTL_BLOCKS {
             c.produce_block_with(vec![]).unwrap();
         }
         assert!(c.mempool.is_empty());
-        assert!(c.failure(&id).unwrap().0.contains("expired"));
+        let why = &c.failure(&id).unwrap().0;
+        assert!(why.contains(&format!("not included within {MEMPOOL_TTL_BLOCKS} blocks")) && why.contains(&format!("valid until block {}", later.valid_until)), "{why}");
     }
 
     #[test]
@@ -2573,12 +2575,25 @@ mod audit {
         let x = Keys::from_seed([77u8; 32]);
         c.state.accounts.insert(x.address(), Account { balance: 100 * DROPS_PER_FANG, ..Default::default() });
         let mut tx = unsigned("audit", &x, 0, Action::Transfer { to: me.clone(), amount: 1 });
-        tx.fee *= 2; // outbids the cheapest, so it evicts one
+        let lowball = Tx { tip: 0, ..tx.clone() };
+        assert!(c.submit(lowball).unwrap_err().to_string().contains("mempool is full; resubmit with a tip of at least 1 drops"));
+        tx.tip = 1; // outbids the cheapest (no tip), so it evicts one
+        tx.fee = tx.charge().unwrap();
         let t = Instant::now();
         c.submit(tx).unwrap();
         let one = t.elapsed();
         println!("filled 5,000-tx mempool in {fill:?}; one more submit (with eviction) took {one:?}");
         assert!(one.as_millis() < 250, "submit took {one:?}");
+        // The newest sender's last tx went (no one is left with a nonce gap).
+        assert_eq!(c.mempool.len(), MAX_MEMPOOL);
+        let mut next: HashMap<&str, u64> = HashMap::new();
+        for t in &c.mempool {
+            let n = next.entry(t.from.as_str()).or_insert(0);
+            assert_eq!(t.nonce, *n, "nonces stay contiguous");
+            *n += 1;
+        }
+        let last_sender = c.mempool.iter().rev().find(|t| t.from != x.address()).unwrap().from.clone();
+        assert_eq!(next[last_sender.as_str()], (MAX_MEMPOOL - 64 * (MAX_MEMPOOL / 64)) as u64 - 1, "the newest arrival among the cheapest tails was evicted");
         let t = Instant::now();
         c.revalidate_mempool();
         println!("revalidating 5,000 txs: {:?}", t.elapsed());
@@ -2757,5 +2772,189 @@ mod hunts {
         t.tx(&alice, Action::RemoveKey { key_id: kid.clone() }).unwrap();
         assert!(!t.c.state.familiars.contains_key(&alice.address()));
         fs::remove_dir_all(&t.home).ok();
+    }
+}
+
+/// Protocol v1 rules at the state machine: tips and the charged fee, `valid_until`, address
+/// prefixes, and the order proposals take mempool txs in.
+#[cfg(test)]
+mod v1 {
+    use super::*;
+
+    fn fresh(tag: &str, prefix: &str) -> (PathBuf, Chain) {
+        let home = std::env::temp_dir().join(format!("blockula-v1-{tag}-{}-{}", now_ms(), std::process::id()));
+        Chain::summon(&home, &SummonOpts { address_prefix: prefix.into(), ..SummonOpts::new("v1", 1) }).unwrap();
+        let c = Chain::open(&home).unwrap();
+        (home, c)
+    }
+
+    /// `keys` acting for `from`, paying exactly the charge (`min_fee + tip`).
+    fn tx(c: &Chain, keys: &Keys, from: &str, nonce: u64, tip: u64, valid_until: u64, action: Action) -> Tx {
+        let mut tx = Tx { chain_id: c.genesis.chain_id.clone(), from: from.into(), nonce, fee: 0, tip, valid_until, action, memo: String::new(), public_key: hex::encode(keys.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+        tx.fee = tx.charge().unwrap();
+        tx.sign(keys)
+    }
+
+    fn bal(c: &Chain, addr: &str) -> u64 {
+        c.state.account(addr).balance
+    }
+
+    #[test]
+    fn tip_goes_to_the_proposer_and_only_the_charge_is_debited() {
+        let (home, mut c) = fresh("tip", "boo");
+        let (a, friend) = (Keys::from_seed([1; 32]), Keys::from_seed([2; 32]).address());
+        c.faucet(&a.address(), 50 * DROPS_PER_FANG).unwrap();
+        c.produce_block().unwrap();
+        let me = c.me().unwrap();
+        let (a0, me0, supply0, burned0) = (bal(&c, &a.address()), bal(&c, &me), c.state.supply, c.state.burned);
+        // `fee` allows more than the charge: the rest stays with the sender.
+        let mut t = tx(&c, &a, &a.address(), 0, 7_000, c.height() + 10, Action::Transfer { to: friend.clone(), amount: DROPS_PER_FANG });
+        t.fee += 1_000_000;
+        let t = t.sign(&a);
+        let base = min_fee(t.size());
+        c.submit(t.clone()).unwrap();
+        c.produce_block().unwrap();
+        assert_eq!(bal(&c, &a.address()), a0 - DROPS_PER_FANG - base - 7_000);
+        assert_eq!(bal(&c, &me), me0 + 7_000, "the tip goes to the proposer");
+        assert_eq!((c.state.supply, c.state.burned), (supply0 - base, burned0 + base), "the base fee is burned");
+        // A fee that doesn't cover min_fee + tip isn't admittable: not in the mempool, not in a block.
+        let mut short = tx(&c, &a, &a.address(), 1, 5_000, c.height() + 10, Action::Transfer { to: friend.clone(), amount: DROPS_PER_FANG });
+        short.fee -= 1;
+        let short = short.sign(&a);
+        assert!(c.submit(short.clone()).unwrap_err().to_string().contains("fee too low"));
+        assert!(crate::consensus::check_tx_stateless(&short, "v1", "boo").unwrap_err().to_string().contains("fee too low"));
+        c.produce_block_with(vec![short.clone()]).unwrap();
+        assert!(c.failure(&short.id()).unwrap().0.contains("fee too low"));
+        assert_eq!(c.state.account(&a.address()).nonce, 1);
+        // A tip that overflows the charge is refused too.
+        let mut huge = tx(&c, &a, &a.address(), 1, 0, c.height() + 10, Action::Transfer { to: friend, amount: 1 });
+        (huge.tip, huge.fee) = (u64::MAX, u64::MAX);
+        assert!(c.submit(huge.sign(&a)).unwrap_err().to_string().contains("fee too low"));
+        let root = c.state.root();
+        drop(c);
+        assert_eq!(Chain::open(&home).unwrap().state.root(), root, "replays identically");
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn session_limits_count_the_charged_fee() {
+        let (home, mut c) = fresh("sess", "boo");
+        let (owner, agent, friend) = (Keys::from_seed([1; 32]), Keys::from_seed([2; 32]), Keys::from_seed([3; 32]).address());
+        let acct = owner.address();
+        c.faucet(&acct, 50 * DROPS_PER_FANG).unwrap();
+        c.produce_block().unwrap();
+        let limit = DROPS_PER_FANG;
+        let role = KeyRole::Session { limit, period_blocks: 100, expires_at: c.height() + 1_000 };
+        c.submit(tx(&c, &owner, &acct, 0, 0, c.height() + 10, Action::AddKey { key_id: key_id(&agent.public_key()), label: "claude".into(), role })).unwrap();
+        c.produce_block().unwrap();
+        // An amount that fits with the base fee alone, but not with a tip on top.
+        let charge0 = min_fee(tx(&c, &agent, &acct, 1, 0, c.height() + 10, Action::Transfer { to: friend.clone(), amount: 1 }).size());
+        let amount = limit - charge0 - 10;
+        let tipped = tx(&c, &agent, &acct, 1, 100, c.height() + 10, Action::Transfer { to: friend.clone(), amount });
+        assert!(c.submit(tipped).unwrap_err().to_string().contains("limit reached"));
+        c.submit(tx(&c, &agent, &acct, 1, 0, c.height() + 10, Action::Transfer { to: friend, amount })).unwrap();
+        c.produce_block().unwrap();
+        assert_eq!(c.state.keys_of(&acct)[&key_id(&agent.public_key())].spent, amount + charge0, "spent = amount + charged fee");
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn expired_txs_never_execute_and_leave_the_mempool() {
+        let (home, mut c) = fresh("exp", "boo");
+        let (a, friend) = (Keys::from_seed([1; 32]), Keys::from_seed([2; 32]).address());
+        c.faucet(&a.address(), 50 * DROPS_PER_FANG).unwrap();
+        c.produce_block().unwrap();
+        let h = c.height();
+        let send = |c: &Chain, valid_until: u64| tx(c, &a, &a.address(), 0, 0, valid_until, Action::Transfer { to: friend.clone(), amount: DROPS_PER_FANG });
+        // Admission wants `next <= valid_until <= next + an hour of blocks`.
+        let max = c.state.params.max_tx_validity_blocks();
+        assert_eq!(max, 3_600, "an hour of 1 s blocks");
+        assert_eq!(c.submit(send(&c, h)).unwrap_err().to_string(), format!("expired at block {h}"));
+        assert!(c.submit(send(&c, h + 1 + max + 1)).unwrap_err().to_string().contains("too far ahead"));
+        // A signed tx with an unused nonce that nobody includes before `valid_until`…
+        let t = send(&c, h + 3);
+        c.submit(t.clone()).unwrap();
+        c.produce_block_with(vec![]).unwrap();
+        c.produce_block_with(vec![]).unwrap();
+        assert!(c.in_mempool(&t.id()), "still valid for block h + 3");
+        c.produce_block_with(vec![]).unwrap();
+        // …is dropped as expired, and can't come back.
+        assert!(!c.in_mempool(&t.id()));
+        assert_eq!(c.failure(&t.id()).unwrap().0, format!("expired at block {}", h + 3));
+        assert!(c.submit(t.clone()).unwrap_err().to_string().contains("expired"));
+        // Even a proposer that includes it can't execute it: the nonce stays unused.
+        c.produce_block_with(vec![t.clone()]).unwrap();
+        assert!(!c.tx_index.contains_key(&t.id()));
+        assert_eq!(c.state.account(&a.address()).nonce, 0);
+        assert!(c.failure(&t.id()).unwrap().0.contains("expired at block"));
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn testnet_prefix_is_enforced() {
+        let (home, mut c) = fresh("tboo", "tboo");
+        let me = c.me().unwrap();
+        assert!(me.starts_with("tboo1") && c.genesis.validators[0].address == me);
+        assert!(c.state.treasury().starts_with("tboo1") && c.state.pool().starts_with("tboo1"));
+        assert!(c.state.accounts.contains_key(&c.state.treasury()), "the treasury allocation uses the prefix");
+        let a = Keys::from_seed([1; 32]);
+        let (main, test) = (a.address(), a.address_with("tboo"));
+        let vu = c.height() + 10;
+        // The faucet won't pay a mainnet address on a testnet.
+        assert!(c.faucet(&main, DROPS_PER_FANG).unwrap_err().to_string().contains("`to` is a boo (mainnet) address"));
+        c.faucet(&test, 10 * DROPS_PER_FANG).unwrap();
+        c.produce_block().unwrap();
+        // Acting as the mainnet form of the same key, or paying a mainnet address, is refused.
+        let err = c.submit(tx(&c, &a, &main, 0, 0, vu, Action::Transfer { to: me.clone(), amount: 1 })).unwrap_err().to_string();
+        assert!(err.contains("`from` is a boo (mainnet) address, but this chain's addresses start with tboo1"), "{err}");
+        let pay_main = tx(&c, &a, &test, 0, 0, vu, Action::Transfer { to: Keys::from_seed([2; 32]).address(), amount: DROPS_PER_FANG });
+        assert!(c.submit(pay_main.clone()).unwrap_err().to_string().contains("`to` is a boo (mainnet) address"));
+        assert!(crate::consensus::check_tx_stateless(&pay_main, "v1", "tboo").is_err(), "verify, gossip and HTTP refuse it too");
+        c.produce_block_with(vec![pay_main.clone()]).unwrap();
+        assert!(!c.tx_index.contains_key(&pay_main.id()), "and it can't execute");
+        // Native addresses and names work.
+        c.submit(tx(&c, &a, &test, 0, 0, vu, Action::RegisterName { name: "tessa".into() })).unwrap();
+        c.produce_block().unwrap();
+        assert_eq!(c.state.resolve("tessa.boo").unwrap(), test);
+        assert_eq!(bal(&c, &c.state.treasury()), 100_000_000 * DROPS_PER_FANG + name_price("tessa"));
+        // A genesis whose addresses don't match its prefix (or an unknown prefix) doesn't load.
+        let path = home.join("other.json");
+        for (prefix, why) in [("boo", "doesn't use this chain's prefix"), ("xyz", "must be one of")] {
+            let g = Genesis { address_prefix: prefix.into(), ..c.genesis.clone() };
+            fs::write(&path, serde_json::to_string(&g).unwrap()).unwrap();
+            assert!(format!("{:#}", Genesis::load(&path).unwrap_err()).contains(why));
+        }
+        let root = c.state.root();
+        drop(c);
+        assert_eq!(Chain::open(&home).unwrap().state.root(), root);
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn proposals_take_the_highest_tip_per_byte_first() {
+        let (home, mut c) = fresh("order", "boo");
+        let ks: Vec<Keys> = (1..=4u8).map(|i| Keys::from_seed([i; 32])).collect();
+        for k in &ks {
+            c.state.accounts.insert(k.address(), Account { balance: 100 * DROPS_PER_FANG, ..Default::default() });
+        }
+        let to = Keys::from_seed([9; 32]).address();
+        let vu = c.height() + 10;
+        let send = |k: &Keys, nonce: u64, tip: u64, memo: &str| {
+            let mut t = Tx { memo: memo.into(), ..tx(&c, k, &k.address(), nonce, tip, vu, Action::Transfer { to: to.clone(), amount: DROPS_PER_FANG }) };
+            t.fee = t.charge().unwrap();
+            t.sign(k)
+        };
+        let a0 = send(&ks[0], 0, 0, "");
+        let a1 = send(&ks[0], 1, 1_000_000, ""); // a big tip, but it can't jump its own nonce 0
+        let b = send(&ks[1], 0, 500, "");
+        let d = send(&ks[2], 0, 500, ""); // same rate as b, arrived later
+        let e = send(&ks[3], 0, 520, &"m".repeat(256)); // a bigger tip, but less per byte
+        assert!(TipRate::of(&e) < TipRate::of(&b));
+        for t in [&a0, &a1, &b, &d, &e] {
+            c.submit(t.clone()).unwrap();
+        }
+        let order: Vec<String> = c.proposal_order().iter().map(|t| t.id()).collect();
+        assert_eq!(order, [&b, &d, &e, &a0, &a1].map(|t| t.id()));
+        fs::remove_dir_all(home).ok();
     }
 }

@@ -1242,6 +1242,8 @@ mod http_tests {
         assert!(text.contains("blockula_height 1") && text.contains("blockula_mempool_size"), "{text}");
         let (_, g, _) = call(&n, "GET", "/api/genesis", None, "127.0.0.1:1").await;
         assert_eq!(g["genesis_hash"], status["genesis_hash"]);
+        assert_eq!((status["address_prefix"].as_str(), g["address_prefix"].as_str()), (Some("boo"), Some("boo")));
+        assert_eq!(status["max_tx_validity_blocks"], 3_600);
         // A node without a stored certificate for the range says so (the joiner rotates).
         let (s, _, _) = call(&n, "GET", "/api/sync?from=1", None, "127.0.0.1:1").await;
         assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
@@ -1292,6 +1294,13 @@ mod http_tests {
             tx.sign(&k)
         };
         let (t1, t2) = (mk(0), mk(1));
+        // JSON is strict: an unsigned extra field is refused, not carried along.
+        let mut padded = serde_json::to_value(&t1).unwrap();
+        padded["padding"] = json!("x".repeat(1000));
+        let (s, _, _) = call(&n, "POST", "/api/tx", Some(padded), "127.0.0.1:1").await;
+        assert!(s.is_client_error(), "{s}");
+        let (s, v, _) = call(&n, "GET", &format!("/api/tx/{}", t1.id()), None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "{v}");
         n.chain.lock().produce_block_with(vec![t1, t2.clone()]).unwrap();
         let (s, v, _) = call(&n, "GET", &format!("/api/tx/{}", t2.id()), None, "127.0.0.1:1").await;
         assert_eq!(s, StatusCode::OK);
