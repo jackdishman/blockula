@@ -147,3 +147,14 @@ fn random_garbage_never_decrypts() {
         assert!(scanner.try_decrypt(&s.note.commitment(), &enc).is_none());
     }
 }
+
+#[test]
+fn dummy_outputs_have_the_same_shape() {
+    let mut rng = StdRng::seed_from_u64(100);
+    let (note, enc) = dummy_output(&mut rng);
+    assert_eq!(note.value, 0);
+    assert_eq!(enc.enc.len(), ENC_CIPHERTEXT_BYTES);
+    assert_eq!(enc.out.len(), OUT_CIPHERTEXT_BYTES);
+    let (note2, _) = dummy_output(&mut rng);
+    assert_ne!(note.owner, note2.owner);
+}

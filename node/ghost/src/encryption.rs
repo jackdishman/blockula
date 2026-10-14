@@ -20,7 +20,7 @@ use ml_kem::{B32, MlKem768, ml_kem_768};
 use rand::CryptoRng;
 
 use crate::field::{DIGEST_BYTES, Digest, digest_from_bytes, digest_to_bytes, xof_bytes};
-use crate::keys::{Address, IncomingViewingKey, OutgoingViewingKey};
+use crate::keys::{Address, IncomingViewingKey, OutgoingViewingKey, SpendingKey};
 use crate::note::{NOTE_VERSION, Note};
 
 /// Bytes of memo in every note (fixed, so ciphertexts don't leak memo length).
@@ -135,6 +135,19 @@ pub fn encrypt_note<R: CryptoRng + ?Sized>(
         }
     };
     Ok(EncryptedNote { enc, out })
+}
+
+/// A zero-value output to a throwaway address, for padding an action to two outputs. Its
+/// commitment and ciphertexts look like any other output's.
+pub fn dummy_output<R: CryptoRng + ?Sized>(rng: &mut R) -> (Note, EncryptedNote) {
+    let mut seed = [0u8; 32];
+    rng.fill_bytes(&mut seed);
+    let address = SpendingKey::from_seed(seed).address();
+    let mut rseed = [0u8; 32];
+    rng.fill_bytes(&mut rseed);
+    let note = Note { value: 0, owner: address.owner(), rseed };
+    let enc = encrypt_note(&note, &address, &[0; MEMO_BYTES], None, rng).expect("own address");
+    (note, enc)
 }
 
 /// Decrypts the AEAD part of `enc` with a known shared secret and checks the commitment.

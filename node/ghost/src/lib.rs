@@ -21,7 +21,9 @@ pub use circuit::{
     ActionWitness, CIRCUIT_ID, MAX_PROOF_BYTES, ProveError, PublicInputs, SpendWitness, ValueBalance,
     VerifyError, prove, verify,
 };
-pub use encryption::{EncryptedNote, TrialDecryptor, encrypt_note, try_decrypt_incoming, try_decrypt_outgoing};
+pub use encryption::{
+    EncryptedNote, TrialDecryptor, dummy_output, encrypt_note, try_decrypt_incoming, try_decrypt_outgoing,
+};
 pub use field::Digest;
 pub use keys::{Address, FullViewingKey, IncomingViewingKey, OutgoingViewingKey, SpendingKey};
 pub use note::{Note, nullifier};
