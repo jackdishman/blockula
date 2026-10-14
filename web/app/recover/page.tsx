@@ -51,8 +51,9 @@ export default function RecoverPage() {
     try {
       kit = Wallet.fromSeed(wordsToSeed(text), client);
       kitRef.current = kit;
-      setText("");
       const list = (await findAccounts(client, kit)).filter((a) => a.role === "owner" && a.address !== kit?.address);
+      // The words have been read: off the page they go (kept only if the node couldn't be asked).
+      setText("");
       if (!list.length) {
         wipeWallet(kit);
         setError(`This kit isn't an owner of any account on ${NETWORK.label}. Check the network at the top of the page, and that the kit was activated (Devices & agents → Recovery kit).`);
@@ -78,11 +79,10 @@ export default function RecoverPage() {
       if (!stage.device) setStage({ ...stage, device });
       await kit.actAs(account.address);
       const tx = (await kit.addOwnerKey(device.wallet.keyId, "Restored device")) as TxView;
-      const kitKeyId = kit.keyId;
-      wipeWallet(kit);
       await device.wallet.actAs(account.address);
       unlocked(device.wallet, { ...device.hint, account: account.address, name: account.name ?? undefined });
-      setStage({ s: "cleanup", account, kitKeyId, deviceKeyId: device.wallet.keyId, tx });
+      setStage({ s: "cleanup", account, kitKeyId: kit.keyId, deviceKeyId: device.wallet.keyId, tx });
+      wipeWallet(kit);
     } catch (e) {
       setError(friendly(e));
     } finally {

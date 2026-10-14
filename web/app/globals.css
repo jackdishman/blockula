@@ -265,7 +265,7 @@ textarea:focus { outline: none; border-color: var(--blood); box-shadow: 0 0 0 1p
   html, body { background: #fff; }
   body * { visibility: hidden; }
   .kit-sheet, .kit-sheet * { visibility: visible; }
-  .kit-sheet { position: absolute; inset: 0 0 auto 0; box-shadow: none; background: #fff; }
+  .card.plate.kit-sheet { position: absolute; inset: 0 0 auto 0; background: #fff; }
   .no-print { display: none !important; }
 }
 @media (prefers-reduced-motion: reduce) { .splash .ornament-bat, .spinner { animation: none; } }
