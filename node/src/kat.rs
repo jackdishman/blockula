@@ -368,9 +368,12 @@ fn handoff_keys() -> Vec<String> {
     keys
 }
 
+/// Seed → public key, key id, and its address under both prefixes (mainnet `boo`, testnet `tboo`).
 fn key_json(seed: [u8; 32]) -> Value {
     let k = crypto::Keys::from_seed(seed);
-    json!({ "seed": hex::encode(seed), "public_key_sha256": sha256(&k.public_key()), "key_id": types::key_id(&k.public_key()), "address": k.address() })
+    let testnet = k.address_with(crypto::TESTNET_HRP);
+    assert_eq!(testnet, pq::PrivateKey::from_seed_bytes(seed).public_key().address(crypto::TESTNET_HRP), "tx and consensus keys derive the same address");
+    json!({ "seed": hex::encode(seed), "public_key_sha256": sha256(&k.public_key()), "key_id": types::key_id(&k.public_key()), "address": k.address(), "testnet_address": testnet })
 }
 
 /// What FIPS 204 sees as the context for a pq.rs namespace.
@@ -385,18 +388,22 @@ fn case(label: &str, seed: [u8; 32], namespace: &[u8], msg: &[u8], sig: &[u8]) -
 /// Everything the node signs, made by the node's own code (`testdata/cross/rust-signed.json`).
 fn rust_signed() -> Value {
     let mut cases = vec![];
-    // Txs: `Tx::sign` signs the signing bytes with an empty context.
+    // Txs (v3): `Tx::sign` signs the signing bytes with an empty context. Each case also records
+    // the wire form (`Tx::to_bytes`) that blocks and gossip carry. One acts from a testnet address.
     let owner = crypto::Keys::from_seed([7; 32]);
+    let testnet_to = crypto::Keys::from_seed([0xff; 32]).address_with(crypto::TESTNET_HRP);
     let actions = [
-        ("tx/transfer", json!({ "type": "transfer", "to": "alice.boo", "amount": "1500000000" })),
-        ("tx/add_key", json!({ "type": "add_key", "key_id": "ab".repeat(32), "label": "agent", "role": { "type": "session", "limit": "5000000000", "period_blocks": 600, "expires_at": 100000 } })),
+        ("tx/transfer", owner.address(), json!({ "type": "transfer", "to": "alice.boo", "amount": "1500000000" })),
+        ("tx/add_key", owner.address(), json!({ "type": "add_key", "key_id": "ab".repeat(32), "label": "agent", "role": { "type": "session", "limit": "5000000000", "period_blocks": 600, "expires_at": 100000 } })),
+        ("tx/transfer-tboo", owner.address_with(crypto::TESTNET_HRP), json!({ "type": "transfer", "to": testnet_to, "amount": "42" })),
     ];
-    for (label, action) in actions {
-        let unsigned = json!({ "chain_id": CROSS_CHAIN, "from": owner.address(), "nonce": 7, "fee": "123456", "action": action, "memo": "🧛 kat", "public_key": "", "signature": "" });
+    for (label, from, action) in actions {
+        let unsigned = json!({ "chain_id": CROSS_CHAIN, "from": from, "nonce": 7, "fee": "123456", "tip": "250", "valid_until": 4242, "action": action, "memo": "🧛 kat", "public_key": "", "signature": "" });
         let tx: types::Tx = serde_json::from_value(unsigned).unwrap_or_else(|e| panic!("tx JSON shape changed ({e}): update rust_signed() and regenerate testdata/cross"));
         let tx = tx.sign(&owner);
         let mut c = case(label, [7; 32], b"", &tx.signing_bytes(), &hex::decode(&tx.signature).unwrap());
         c["tx"] = serde_json::to_value(&tx).unwrap();
+        c["wire"] = json!(hex::encode(tx.to_bytes()));
         cases.push(c);
     }
     // Consensus votes, signed by simplex through `MlDsaScheme` exactly as validators sign them.
@@ -457,7 +464,7 @@ fn check_keys(file: &Value, side: &str) {
 fn cross_rust_signed() {
     let file = load("cross/rust-signed.json");
     check_keys(&file, "rust-signed");
-    assert_eq!(cases_of(&file).len(), 10);
+    assert_eq!(cases_of(&file).len(), 11);
     for c in cases_of(&file) {
         let (label, seed, ns, msg) = (str_of(c, "label"), seed_of(c, "seed"), hx(c, "namespace"), hx(c, "msg"));
         assert_eq!(hx(c, "ctx"), context_for(&ns), "{label}: context");
@@ -474,7 +481,7 @@ fn cross_rust_signed() {
 fn cross_ts_signed() {
     let file = load("cross/ts-signed.json");
     check_keys(&file, "ts-signed");
-    assert_eq!(cases_of(&file).len(), 13);
+    assert_eq!(cases_of(&file).len(), 14);
     for c in cases_of(&file) {
         let (label, seed, ns, msg, sigb) = (str_of(c, "label"), seed_of(c, "seed"), hx(c, "namespace"), hx(c, "msg"), hx(c, "sig"));
         assert_eq!(hx(c, "ctx"), context_for(&ns), "{label}: context");
@@ -542,6 +549,12 @@ fn cross_formats_are_current() {
             assert_eq!(hex::encode(tx.signing_bytes()), str_of(c, "msg"), "{}", stale(label));
             tx.check_format().unwrap_or_else(|e| panic!("{label}: check_format: {e}"));
             tx.verify_signature().unwrap_or_else(|e| panic!("{label}: verify_signature: {e}"));
+            // The wire form both sides recorded is the node's, and parses back to the same tx.
+            let wire = hx(c, "wire");
+            assert_eq!(hex::encode(tx.to_bytes()), hex::encode(&wire), "{}", stale(label));
+            assert_eq!(types::Tx::from_bytes(&wire).unwrap_or_else(|e| panic!("{label}: Tx::from_bytes: {e}")), tx, "{label}: wire round trip");
+            let (prefix, _) = crypto::parse_address(&tx.from).unwrap_or_else(|| panic!("{label}: `from` isn't an address"));
+            tx.check_prefix(prefix).unwrap_or_else(|e| panic!("{label}: check_prefix: {e}"));
         }
         if let Some(pop) = c.get("pop") {
             let msg = types::pop_message(str_of(pop, "chain_id"), str_of(pop, "owner"), str_of(pop, "p2p_addr"), str_of(pop, "http_addr"));

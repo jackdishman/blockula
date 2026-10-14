@@ -12,7 +12,7 @@ import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex, hexToBytes, utf8ToBytes } from "@noble/hashes/utils.js";
-import { POP_CONTEXT, Wallet, popMessage, signingBytes, type Tx, type UnsignedTx } from "../src/index.js";
+import { Client, POP_CONTEXT, Wallet, popMessage, signingBytes, txBytes, type Tx, type UnsignedTx } from "../src/index.js";
 
 /** Vector files are plain JSON; fields are read by their upstream names. */
 type Json = any;
@@ -145,9 +145,11 @@ const rust = load("cross/rust-signed.json");
 const CHAIN: string = rust.chain_id;
 const WRITE = process.argv.includes("--write");
 
+/** A client pinned to the testnet prefix (never contacted: `Wallet.address` reads its prefix). */
+const testnet = new Client("http://127.0.0.1:9", { prefix: "tboo" });
 const keyJson = (seed: string) => {
   const w = Wallet.fromSeed(seed);
-  return { seed, public_key_sha256: sha(w.publicKey), key_id: w.keyId, address: w.address };
+  return { seed, public_key_sha256: sha(w.publicKey), key_id: w.keyId, address: w.address, testnet_address: Wallet.fromSeed(seed, testnet).address };
 };
 const stale = (label: string) => `${label}: encoding changed; regenerate node/testdata/cross (see its README.md)`;
 /** pq.rs signs with the namespace as context, hashed with BLAKE3 when over 255 bytes. */
@@ -162,16 +164,19 @@ function tsSigned(): Json {
     out.push({ label, seed, namespace: bytesToHex(ns), ctx: bytesToHex(contextFor(ns)), msg: bytesToHex(msg), sig: bytesToHex(sig), ...extra });
   const det = (seed: string, ns: Uint8Array, msg: Uint8Array) =>
     bytesToHex(ml_dsa65.sign(msg, keys(hx(seed)).secretKey, { context: contextFor(ns), extraEntropy: false }));
-  // Txs through `Wallet.sign` (hedged, fresh randomness, empty context).
+  // Txs (v3) through `Wallet.sign` (hedged, fresh randomness, empty context), with their wire
+  // form; one from the same key's testnet (`tboo`) address.
   const owner = "07".repeat(32);
   const w = Wallet.fromSeed(owner);
-  for (const [label, action] of [
-    ["tx/transfer", { type: "transfer", to: "bob.boo", amount: "2500000000" }],
-    ["tx/register_name", { type: "register_name", name: "vampire" }],
+  const wt = Wallet.fromSeed(owner, testnet);
+  for (const [label, signer, action] of [
+    ["tx/transfer", w, { type: "transfer", to: "bob.boo", amount: "2500000000" }],
+    ["tx/register_name", w, { type: "register_name", name: "vampire" }],
+    ["tx/transfer-tboo", wt, { type: "transfer", to: Wallet.fromSeed("ff".repeat(32), testnet).address, amount: "7" }],
   ] as const) {
-    const tx = w.sign({ chain_id: CHAIN, from: w.address, nonce: 3, fee: "200000", action, memo: "from the SDK" });
+    const tx = signer.sign({ chain_id: CHAIN, from: signer.address, nonce: 3, fee: "200000", tip: "1000", valid_until: 777, action, memo: "from the SDK" });
     const msg = signingBytes(tx);
-    push(label, owner, new Uint8Array(), msg, hx(tx.signature), { sig_det: det(owner, new Uint8Array(), msg), tx });
+    push(label, owner, new Uint8Array(), msg, hx(tx.signature), { sig_det: det(owner, new Uint8Array(), msg), tx, wire: bytesToHex(txBytes(tx)) });
   }
   // A validator PoP built by the SDK.
   const v = rust.cases.find((c: Json) => c.label === "validator-pop").seed as string;
@@ -206,7 +211,7 @@ const ts = load("cross/ts-signed.json");
 
 group("cross seed → key id / address (Rust-derived)", rust.keys, (k) => {
   const want = keyJson(k.seed);
-  if (JSON.stringify(want) !== JSON.stringify({ seed: k.seed, public_key_sha256: k.public_key_sha256, key_id: k.key_id, address: k.address })) return `TS derives ${JSON.stringify(want)}`;
+  if (JSON.stringify(want) !== JSON.stringify({ seed: k.seed, public_key_sha256: k.public_key_sha256, key_id: k.key_id, address: k.address, testnet_address: k.testnet_address })) return `TS derives ${JSON.stringify(want)}`;
 }, 5);
 
 // Rust signed (deterministically, through the node's own paths): noble accepts every signature,
@@ -219,7 +224,7 @@ group("cross rust-signed", rust.cases, (c) => {
   if (ml_dsa65.verify(sig, msg, publicKey, { context: utf8ToBytes("blockula/other") })) return "verifies under another context";
   if (!eq(ml_dsa65.sign(msg, secretKey, { context: ctx, extraEntropy: false }), sig)) return "deterministic signatures differ between Rust and TS";
   if (c.tx && !eq(hx(c.tx.public_key), publicKey)) return "tx public key";
-}, 10);
+}, 11);
 
 // The SDK-signed file still verifies and reproduces (the node checks it in node/src/kat.rs).
 group("cross ts-signed", ts.cases, (c) => {
@@ -228,7 +233,7 @@ group("cross ts-signed", ts.cases, (c) => {
   if (!eq(contextFor(hx(c.namespace)), ctx)) return "context";
   if (!ml_dsa65.verify(sig, msg, publicKey, { context: ctx })) return "signature";
   if (c.sig_det && !eq(ml_dsa65.sign(msg, secretKey, { context: ctx, extraEntropy: false }), hx(c.sig_det))) return "deterministic signature";
-}, 13);
+}, 14);
 group("cross seed → key id / address (TS-derived)", ts.keys, (k) => {
   if (JSON.stringify(keyJson(k.seed)) !== JSON.stringify(k)) return "derivation changed";
 }, 5);
@@ -237,6 +242,7 @@ group("cross seed → key id / address (TS-derived)", ts.keys, (k) => {
 // and signed the node's current vote and handoff messages.
 group("cross formats", [...rust.cases, ...ts.cases], (c) => {
   if (c.tx && bytesToHex(signingBytes(unsigned(c.tx))) !== c.msg) return stale(c.label);
+  if (c.tx && bytesToHex(txBytes(c.tx)) !== c.wire) return `${stale(c.label)} (wire form)`;
   if (c.pop) {
     if (bytesToHex(popMessage(c.pop.chain_id, c.pop.owner, c.pop.p2p_addr, c.pop.http_addr)) !== c.msg) return stale(c.label);
     if (bytesToHex(POP_CONTEXT) !== c.namespace) return stale(c.label);
