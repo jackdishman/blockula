@@ -61,7 +61,7 @@ Sizes with the node's ML-DSA-65 identities (each frame also has a 1–2 byte len
 | `Ack` | 32 B | 32 B |
 | Total | 8,714 B | 10,986 B (+2,272 B, +26%) |
 
-The whole handshake still fits in one initial TCP congestion window (10 × 1,460 B), so it shouldn't cost an extra round trip. Steady-state traffic is unchanged (same AEAD, same framing). CPU: measured below.
+The whole handshake still fits in one initial TCP congestion window (10 × 1,460 B), so it shouldn't cost an extra round trip. Steady-state traffic is unchanged (same AEAD, same framing). CPU cost: about +80 µs per handshake (see [Test evidence](#test-evidence)).
 
 ### Why this construction
 
@@ -100,9 +100,11 @@ The whole handshake still fits in one initial TCP congestion window (10 × 1,460
 | ML-KEM-768 against NIST ACVP (keyGen, encapsulation, decapsulation, both key checks; ACVP-Server `975de31e`) and Wycheproof (decapsulation incl. implicit rejection and malleable ciphertexts, encapsulation-key validation incl. modulus overflow; C2SP `7a325932`) | `acvp_*`, `wycheproof_*`, `modulus_check_boundary` |
 | ML-KEM-768 against aws-lc-rs (FIPS 140-3 validated): their encapsulation to our keys and ours to theirs, identical implicit-rejection outputs, the same modulus-check verdicts | `aws_lc::*` |
 
-End to end, `scripts/local-testnet.sh` runs 4 genesis validators plus a joining validator and full nodes over real TCP with this transport; they finalize, agree on every block hash and state root, survive a validator restart, and onboard a validator at an epoch boundary.
+End to end, `scripts/local-testnet.sh` (passed 2026-10-14) runs 4 genesis validators over real TCP with this transport, onboards a fifth at an epoch boundary, restarts one, joins two full nodes (one from a snapshot), runs the SDK e2e, and checks that every node has the same block hash and state root at a common height.
 
-Cost, `cargo test --release -p commonware-stream handshake_cost -- --ignored --nocapture` on an Apple M-series laptop: HANDSHAKE_COST.
+Mixed network (2026-10-14): a chain summoned with 4 validators, three running this build and one a build of the parent commit (classical transport). The three finalized normally; the classical one stayed at height 1. With `BLOCKULA_LOG=commonware_p2p=debug` the hybrid listeners logged `failed to complete handshake err=UnableToDecode(Invalid("hybrid::KeyShare", ...))` for its dials, and it logged `RecvTooLarge(4533)` for theirs.
+
+Cost, from `cargo test --manifest-path node/Cargo.toml --release -p commonware-stream handshake_cost -- --ignored --nocapture` on an Apple M4 Max (both sides' work in one thread, ML-DSA-65 identities): about 620 µs per hybrid handshake against 540 µs for the classical one, so roughly +80 µs, most of it ML-KEM key generation (done twice by the dialer, which stores only the seed), encapsulation and decapsulation. ML-DSA signing and verification dominate either way, and nothing changes after the handshake.
 
 ## HTTPS
 
