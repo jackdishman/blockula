@@ -71,12 +71,12 @@ export function NameClaim({ onClaimed, suggestion = "" }: { onClaimed: (name: st
         {check.state === "bad" && <span className="warn">{check.msg}</span>}
         {view?.available && (
           <span className="ok">
-            ✅ {view.name} is available · {view.price_display}
+            ✓ {view.name} is available · {view.price_display}
           </span>
         )}
         {view && !view.available && (
           <span className="warn">
-            👻 {view.name} is taken (owned by {view.owner?.short})
+            {view.name} is taken (owned by {view.owner?.short})
           </span>
         )}
       </div>

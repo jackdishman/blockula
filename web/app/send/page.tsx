@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
 import { RequireWallet } from "@/components/Gate";
+import { Ornament } from "@/components/Ornament";
 import { ErrorNote, ExplorerLink, Spinner, Tip } from "@/components/ui";
 import { explorer } from "@/lib/config";
 import { friendly } from "@/lib/errors";
@@ -38,7 +39,7 @@ function useRecipient(input: string): Recipient {
     if (!q) return setR({ state: "empty" });
     if (q.startsWith("boo1")) {
       if (!isAddress(q)) return setR({ state: "bad", msg: "That address doesn't look right. Check for typos." });
-      const label = status?.validator.address === q ? "the validator 🧛" : "an address";
+      const label = status?.validator.address === q ? "the validator" : "an address";
       return setR({ state: "ok", address: q, display: shortAddr(q), detail: label });
     }
     setR({ state: "checking" });
@@ -124,8 +125,8 @@ function Send() {
   if (sent)
     return (
       <main className="narrow stack-lg center">
-        <div className="hero-emoji">🦇</div>
-        <h1>Sent!</h1>
+        <Ornament kind="bat" className="hero-ornament" />
+        <h1>Sent</h1>
         <p className="summary">{sent.summary}</p>
         <p className="dim">Sealed in block #{sent.height}. That&apos;s final: no waiting for confirmations.</p>
         <div className="row-gap center-row">
@@ -141,7 +142,10 @@ function Send() {
     const me = account?.names[0] ?? "You";
     return (
       <main className="narrow stack-lg">
-        <h1>Review</h1>
+        <div className="section-head">
+          <span className="eyebrow">Read it twice</span>
+          <h1>Review</h1>
+        </div>
         <section className="card stack">
           <p className="summary">
             {me} sends {formatFang(amt)} to {review.display}
@@ -156,13 +160,13 @@ function Send() {
             <dt>Amount</dt>
             <dd>{formatFang(amt)}</dd>
             <dt>Network fee</dt>
-            <dd>{formatFang(fee)} <span className="dim small">🔥 burned</span></dd>
-            <dt>Total</dt>
-            <dd><b>{formatFang(amt + fee)}</b></dd>
+            <dd>{formatFang(fee)} <span className="dim small">(burned)</span></dd>
+            <dt className="total">Total</dt>
+            <dd className="total"><b>{formatFang(amt + fee)}</b></dd>
             {review.tx.memo && (
               <>
                 <dt>Memo</dt>
-                <dd>💬 “{review.tx.memo}” <span className="dim small">(public)</span></dd>
+                <dd><i>“{review.tx.memo}”</i> <span className="dim small">(public)</span></dd>
               </>
             )}
           </dl>
@@ -184,10 +188,10 @@ function Send() {
   return (
     <main className="narrow stack-lg">
       <Link href="/" className="back">← Home</Link>
-      <h1>📤 Send FANG</h1>
+      <h1>Send FANG</h1>
       {prefilled && (
         <div className="banner">
-          🔗 A link filled in this payment. Double-check who it goes to and how much before sending.
+          A link filled in this payment. Double-check who it goes to and how much before sending.
         </div>
       )}
       <section className="card stack">
@@ -197,9 +201,9 @@ function Send() {
         </label>
         <div className="name-status" aria-live="polite">
           {recipient.state === "checking" && <Spinner>Looking up…</Spinner>}
-          {recipient.state === "ok" && !self && <span className="ok">✅ {recipient.display} · <span className="dim">{recipient.detail}</span></span>}
+          {recipient.state === "ok" && !self && <span className="ok">✓ {recipient.display} · <span className="dim">{recipient.detail}</span></span>}
           {self && <span className="warn">That&apos;s you! Pick someone else.</span>}
-          {recipient.state === "bad" && <span className="warn">👻 {recipient.msg}</span>}
+          {recipient.state === "bad" && <span className="warn">{recipient.msg}</span>}
         </div>
         <label className="field">
           <span>Amount</span>
@@ -213,7 +217,7 @@ function Send() {
         </div>
         <label className="field">
           <span>Memo <span className="dim">(optional, public)</span></span>
-          <input value={memo} onChange={(e) => setMemo(e.target.value)} placeholder="trick or treat 🎃" />
+          <input value={memo} onChange={(e) => setMemo(e.target.value)} placeholder="trick or treat" />
         </label>
         {memoErr && <span className="warn">{memoErr}</span>}
         <button className="btn primary" disabled={!canReview || busy} onClick={toReview}>

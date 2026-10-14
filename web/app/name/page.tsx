@@ -12,7 +12,7 @@ export default function NamePage() {
     <RequireWallet>
       <main className="narrow stack-lg">
         <Link href="/" className="back">← Home</Link>
-        <h1>🏷️ Claim a .boo name</h1>
+        <h1>Claim a .boo name</h1>
         <p className="dim">Pick something friends can remember. Names are first come, first served.</p>
         <section className="card">
           <NameClaim onClaimed={() => router.push("/")} />

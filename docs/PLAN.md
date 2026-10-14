@@ -114,7 +114,7 @@ What runs today (Commonware `=2026.9.0`: consensus, p2p, broadcast, storage, run
   - Marshal spans epochs through an epoch-scoped scheme provider.
   - Nodes outside the active set observe (verify-only scheme) until their activation epoch.
   - CLI: `blockula validator init|register|approve|remove|unbond|list`.
-  - API: `/api/validators`. The explorer has a 🧛 Validators page with every admin action.
+  - API: `/api/validators`. The explorer has a Validators page with every admin action.
 - **Mempool:** a tx submitted to any validator is checked against state + mempool, then gossiped to all validators on its own channel and de-duplicated by id. After each finalized block, included or now-invalid txs are evicted.
 - **Faucet (testnets):** each validator's genesis-funded account pays its own faucet drips, so there's no shared secret and no nonce races. Full nodes forward faucet requests.
 - `blockula summon <id> [--validators N]`, `blockula run --home`, `blockula dev` (one-validator simplex).

@@ -21,10 +21,10 @@ function Receive() {
   return (
     <main className="narrow stack-lg">
       <Link href="/" className="back">← Home</Link>
-      <h1>📥 Receive FANG</h1>
+      <h1>Receive FANG</h1>
       {name ? (
         <section className="card stack">
-          <span className="dim small">Share your name</span>
+          <span className="eyebrow">Share your name</span>
           <div className="big-name">{name}</div>
           <Copy text={name} label="Copy name" />
         </section>
@@ -34,7 +34,7 @@ function Receive() {
         </section>
       )}
       <section className="card stack">
-        <span className="dim small">Or your full address</span>
+        <span className="eyebrow">Or your full address</span>
         <div className="mono address">{addr}</div>
         <div className="row-gap">
           <Copy text={addr} label="Copy address" />

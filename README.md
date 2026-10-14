@@ -22,6 +22,20 @@ Quantum entanglement is literally "spooky action at a distance". We took that pe
 
 What it is, on one page: [docs/ONE_PAGER.md](docs/ONE_PAGER.md).
 
+## npm packages
+
+```bash
+npm install @blockula/sdk                         # SDK for apps, scripts and browsers
+claude mcp add blockula -- npx -y @blockula/mcp   # MCP server for coding agents
+```
+
+| Package | Install | What it is |
+|---|---|---|
+| [`@blockula/sdk`](https://www.npmjs.com/package/@blockula/sdk) | `npm install @blockula/sdk` | TypeScript SDK: `Wallet` (ML-DSA-65 signing), `Client` (reads), `.boo` names, session keys, Hunts. Passkey wallets for the browser live at `@blockula/sdk/passkey`. |
+| [`@blockula/mcp`](https://www.npmjs.com/package/@blockula/mcp) | `npx -y @blockula/mcp`, or `npm install -g @blockula/mcp` for a `blockula-mcp` binary | MCP server so any coding agent can hold a wallet, send FANG, claim names and list Hunts. |
+
+Both need Node 20 or newer. The MCP server finds the public testnet on its own when no local node is running. The SDK's `Client` defaults to `http://localhost:7070`, so pass the testnet explicitly: `new Client("https://blockula-testnet.fly.dev")`.
+
 ## Install the node (no Rust needed)
 
 ```bash
@@ -35,7 +49,7 @@ Prebuilt for macOS (Apple Silicon and Intel) and Linux (x64 and arm64), with SHA
 
 Open **Hunts** are [issues labeled `hunt`](https://github.com/jackdishman/blockula/issues?q=is%3Aopen+label%3Ahunt), each with acceptance criteria and a FANG bounty. Agents are welcome as Familiars. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-Bounties live on-chain: the FANG is escrowed in a Hunt, anyone can add to it, and the creator (or a Season 0 admin) awards it for the merged PR. Browse them in the explorer's 🏹 Hunts page or `GET /api/hunts`.
+Bounties live on-chain: the FANG is escrowed in a Hunt, anyone can add to it, and the creator (or a Season 0 admin) awards it for the merged PR. Browse them in the explorer's Hunts page or `GET /api/hunts`.
 
 ```ts
 await wallet.linkGithub("vlad", "<gist id>");  // a public gist by @vlad containing your boo1 address verifies it
@@ -144,7 +158,7 @@ blockula wallet balance --rpc https://<node>
 
 ## Become a validator
 
-Season 0 is allowlisted: anyone can bond and register, and a validator admin listed in genesis approves. Everything is on-chain and visible in the explorer's 🧛 Validators page.
+Season 0 is allowlisted: anyone can bond and register, and a validator admin listed in genesis approves. Everything is on-chain and visible in the explorer's Validators page.
 
 ```bash
 # 1. Create a validator home: fetches genesis, generates the ML-DSA-65 key, records your public addresses

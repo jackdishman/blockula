@@ -3,45 +3,120 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>🧛 Blockula Explorer</title>
+<title>Blockula Explorer</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' fill='%2317120f'/%3E%3Cg fill='%23ece3cd' transform='translate(11 31) scale(.65)'%3E%3Cpath id='w' d='M60 21 L62.5 20.5 L65 11 L67.5 20.5 C72 21 76 19.5 80 16.5 C90 9.5 103 6 118 5.5 C113.5 10.5 110.5 16 109.5 24 C104.5 21 99.5 22 96 28.5 C91 25.5 85 27 81.5 34 C76.5 32 71.5 35 68.5 42.5 C65.5 41.5 62.5 43.5 60 48 Z'/%3E%3Cuse href='%23w' transform='translate(120 0) scale(-1 1)'/%3E%3C/g%3E%3C/svg%3E" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Courier+Prime:wght@400;700&family=EB+Garamond:ital,wght@0,400..600;1,400&family=IM+Fell+English:ital@0;1&family=IM+Fell+English+SC&family=UnifrakturMaguntia&display=swap" />
 <style>
-  :root { --bg:#0e0a14; --panel:#181121; --line:#2c2038; --text:#ece6f3; --dim:#9a8fab; --pumpkin:#ff8a2a; --blood:#e2385a; --slime:#8be36b; }
-  * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif; }
-  a { color:var(--pumpkin); text-decoration:none; } a:hover { text-decoration:underline; }
-  header { display:flex; gap:16px; align-items:center; padding:14px 24px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
-  header h1 { margin:0; font-size:20px; } header h1 a { color:var(--text); }
+  /* Penny-dreadful print, same palette and faces as the web wallet (web/app/globals.css). */
+  :root {
+    --paper:#ece3cd; --paper-hi:#f4eedf; --paper-lo:#e1d6ba; --ink:#17120f; --ink-soft:#3b332c; --dim:#6a5f53;
+    --hair:rgba(23,18,15,.2); --blood:#8d1418; --moss:#34502b; --ochre:#8a5410;
+    --serif:"EB Garamond", Garamond, "Iowan Old Style", Georgia, serif;
+    --display:"IM Fell English", "Iowan Old Style", Palatino, Georgia, serif;
+    --caps:"IM Fell English SC", var(--display);
+    --mono:"Courier Prime", "Courier New", ui-monospace, monospace;
+    --fraktur:"UnifrakturMaguntia", "Old English Text MT", var(--display);
+    color-scheme: light;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; color:var(--ink); background:var(--paper); font:18px/1.5 var(--serif); font-variant-numeric:lining-nums; -webkit-font-smoothing:antialiased;
+    background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='220' height='220'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 .09  0 0 0 0 .07  0 0 0 0 .05  .55 0 0 0 -.2'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>"), radial-gradient(ellipse at 50% 40%, transparent 55%, rgba(70,45,20,.14) 100%); min-height:100vh; }
+  ::selection { background:var(--blood); color:var(--paper-hi); }
+  a { color:inherit; text-decoration:underline; text-decoration-color:var(--blood); text-decoration-thickness:1px; text-underline-offset:3px; }
+  a:hover { color:var(--blood); }
+  :focus-visible { outline:2px solid var(--blood); outline-offset:2px; }
+
+  header { position:relative; display:flex; gap:14px 28px; align-items:center; padding:14px 28px 12px; border-bottom:3px solid var(--ink); margin-bottom:4px; flex-wrap:wrap; }
+  header::after { content:""; position:absolute; left:0; right:0; bottom:-7px; height:1px; background:var(--ink); }
+  .brand { display:inline-flex; align-items:baseline; gap:10px; text-decoration:none; color:var(--ink); }
+  .brand:hover { color:var(--ink); }
+  .wordmark { font:400 34px/1 var(--fraktur); }
+  .edition { font:400 15px var(--caps); letter-spacing:.18em; text-transform:lowercase; color:var(--blood); }
   header form { flex:1; min-width:240px; }
-  input { width:100%; padding:10px 14px; border-radius:10px; border:1px solid var(--line); background:var(--panel); color:var(--text); font-size:15px; }
-  nav a { margin-left:14px; color:var(--dim); }
-  main { max-width:1100px; margin:0 auto; padding:24px; }
-  .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(170px,1fr)); gap:12px; margin-bottom:24px; }
-  .card { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:16px; }
-  .stat .v { font-size:22px; font-weight:600; } .stat .k { color:var(--dim); font-size:13px; }
-  .row { display:flex; justify-content:space-between; gap:12px; padding:10px 0; border-bottom:1px solid var(--line); align-items:center; }
+  input { width:100%; padding:7px 2px 5px; border:0; border-bottom:1.5px solid var(--ink); border-radius:0; background:transparent; color:var(--ink); font:400 19px var(--serif); }
+  input::placeholder { color:rgba(106,95,83,.75); font-style:italic; }
+  input:focus { outline:none; border-bottom-color:var(--blood); box-shadow:0 1.5px 0 var(--blood); }
+  nav { display:flex; gap:22px; flex-wrap:wrap; font:400 17px var(--caps); letter-spacing:.04em; }
+  nav a { color:var(--ink-soft); text-decoration:none; border-bottom:2px solid transparent; padding:2px 0; }
+  nav a:hover { color:var(--ink); border-bottom-color:var(--hair); }
+  nav a[aria-current] { color:var(--ink); border-bottom-color:var(--blood); }
+
+  main { max-width:1080px; margin:0 auto; padding:40px 24px 64px; }
+  footer { text-align:center; padding:20px; border-top:1px solid var(--ink); color:var(--dim); font:400 15px var(--caps); letter-spacing:.06em; }
+  .loading { font-style:italic; color:var(--dim); text-align:center; padding:60px 0; }
+  .stack > * + * { margin-top:24px; }
+
+  .card { background:rgba(250,246,236,.5); border:1.5px solid var(--ink); padding:22px 24px; }
+  .learn { border:5px double var(--ink); }
+  .learn ol { margin:8px 0 0; padding-left:30px; list-style:upper-roman; } .learn li { margin:10px 0; padding-left:4px; }
+  .learn li::marker { font-family:var(--display); color:var(--blood); }
+  h1 { font:400 40px/1.1 var(--display); margin:0 0 6px; }
+  h2 { font:400 20px/1.2 var(--caps); letter-spacing:.06em; margin:0 0 12px; }
+  .eyebrow { font:400 15px/1.2 var(--caps); letter-spacing:.2em; text-transform:lowercase; color:var(--blood); display:block; margin-bottom:6px; }
+  .summary { font:500 25px/1.3 var(--serif); margin-bottom:8px; }
+  .figure-title { font:500 44px/1.1 var(--serif); letter-spacing:-.01em; }
+  .lede { font-size:20px; color:var(--ink-soft); margin:0; }
+  .lede::first-letter { float:left; font:400 64px/.8 var(--display); color:var(--blood); padding:6px 8px 0 0; }
+  p { margin:0 0 10px; } p:last-child { margin-bottom:0; }
+
+  /* Figures: a ruled table of numbers, like the front page of a gazette */
+  .figures { display:grid; grid-template-columns:repeat(auto-fit, minmax(190px,1fr)); border-top:3px solid var(--ink); border-bottom:1px solid var(--ink); }
+  .stat { padding:14px 18px 12px; border-right:1px solid var(--hair); min-width:0; }
+  .stat:last-child { border-right:0; }
+  .stat .v { font:500 30px/1.15 var(--serif); letter-spacing:-.01em; font-variant-numeric:lining-nums tabular-nums; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .stat .v small { font:400 15px var(--caps); letter-spacing:.1em; color:var(--blood); margin-left:4px; }
+  .stat .k { color:var(--dim); font:400 15px var(--caps); letter-spacing:.06em; }
+  .health { display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; align-items:baseline; padding:8px 0; font-size:16px; color:var(--dim); }
+  .health b { font:400 16px var(--caps); letter-spacing:.08em; font-weight:400; }
+  .health .ok { color:var(--moss); } .health .bad { color:var(--blood); }
+
+  .row { display:flex; justify-content:space-between; gap:16px; padding:11px 0; border-bottom:1px solid var(--hair); align-items:baseline; }
   .row:last-child { border-bottom:0; }
-  .dim { color:var(--dim); font-size:13px; }
-  .mono { font-family:ui-monospace, Menlo, monospace; font-size:13px; word-break:break-all; }
-  .summary { font-size:17px; }
-  .pill { display:inline-block; padding:2px 8px; border-radius:99px; font-size:12px; background:#2a1d36; color:var(--slime); }
-  .pill.pending { color:var(--pumpkin); }
-  .pill.failed { color:#ff6b6b; }
-  dl { display:grid; grid-template-columns:200px 1fr; gap:10px 16px; margin:0; } dt { color:var(--dim); }
-  .term { border-bottom:1px dotted var(--dim); cursor:help; position:relative; }
-  .term:hover::after { content:attr(data-tip); position:absolute; left:0; top:100%; margin-top:6px; width:300px; padding:10px 12px; border-radius:10px; background:#241830; border:1px solid var(--line); color:var(--text); font-size:13px; z-index:5; white-space:normal; }
-  .learn { border-color:var(--pumpkin); }
-  .learn ol { margin:8px 0 0; padding-left:20px; } .learn li { margin:6px 0; }
-  h2 { font-size:16px; margin:0 0 8px; } .err { color:var(--blood); }
-  details summary { cursor:pointer; color:var(--dim); margin-top:12px; }
+  .rows { border-top:1px solid var(--ink); }
+  .blockrow { display:grid; grid-template-columns:110px 1fr auto; gap:16px; }
+  .height { font:500 20px var(--serif); }
+  .dim { color:var(--dim); font-size:16px; }
+  .mono { font-family:var(--mono); font-size:15px; word-break:break-all; }
+  .label { font-style:italic; }
+  .pill { display:inline-block; padding:0 7px; border:1px solid currentColor; font:400 13px/1.5 var(--caps); letter-spacing:.1em; text-transform:lowercase; color:var(--moss); vertical-align:2px; white-space:nowrap; }
+  .pill.pending { color:var(--ochre); }
+  .pill.failed { color:var(--blood); }
+  dl { display:grid; grid-template-columns:220px 1fr; gap:12px 18px; margin:0; }
+  dt { color:var(--dim); font:400 16px/1.7 var(--caps); letter-spacing:.06em; } dd { margin:0; min-width:0; }
+  .term { text-decoration:underline dotted var(--dim); text-underline-offset:4px; cursor:help; position:relative; }
+  .term:hover::after { content:attr(data-tip); position:absolute; left:0; top:100%; margin-top:8px; width:320px; padding:12px 14px; background:var(--paper-hi); border:1.5px solid var(--ink); box-shadow:4px 4px 0 var(--ink); color:var(--ink); font:400 16px/1.45 var(--serif); font-style:normal; letter-spacing:0; text-transform:none; z-index:5; white-space:normal; }
+  .err { color:var(--blood); }
+  .empty { font-style:italic; color:var(--dim); }
+  details summary { cursor:pointer; color:var(--dim); margin-top:14px; font:400 16px var(--caps); letter-spacing:.06em; }
+  pre.mono { background:var(--paper-hi); border:1px solid var(--hair); padding:12px; white-space:pre-wrap; }
+
+  @media (max-width:640px) {
+    header { padding:12px 16px 10px; }
+    nav { gap:14px; font-size:16px; }
+    main { padding:28px 14px 48px; }
+    .card { padding:18px 16px; }
+    dl { grid-template-columns:1fr; gap:2px 0; } dd { margin-bottom:10px; }
+    .blockrow { grid-template-columns:auto 1fr auto; } .proposer { display:none; }
+    .figures { grid-template-columns:1fr 1fr; }
+    .stat { border-right:0; border-bottom:1px solid var(--hair); padding:12px 12px 10px; }
+    .stat:nth-child(odd) { border-right:1px solid var(--hair); }
+    .stat:nth-last-child(-n+2):nth-child(odd), .stat:last-child { border-bottom:0; }
+    .stat .v { font-size:22px; } .stat .v small { display:block; margin:0; line-height:1.2; }
+    h1 { font-size:32px; } .summary { font-size:22px; }
+    .term:hover::after { width:240px; }
+  }
 </style>
 </head>
 <body>
 <header>
-  <h1><a href="#/">🧛 Blockula</a></h1>
-  <form id="search"><input id="q" placeholder="Search a name (jack.boo), address, block # or tx…" autocomplete="off" /></form>
-  <nav><a href="#/learn">📖 Learn</a><a href="#/">⛓️ Blocks</a><a href="#/validators">🧛 Validators</a><a href="#/mempool">⏳ Mempool</a><a href="#/hunts">🏹 Hunts</a></nav>
+  <a class="brand" href="#/"><span class="wordmark">Blockula</span><span class="edition">The Explorer</span></a>
+  <form id="search" role="search"><input id="q" aria-label="Search" placeholder="Search names, addresses, blocks or transactions" autocomplete="off" /></form>
+  <nav><a href="#/">Blocks</a><a href="#/validators">Validators</a><a href="#/mempool">Mempool</a><a href="#/hunts">Hunts</a><a href="#/learn">Learn</a></nav>
 </header>
-<main id="app">Rising from the grave…</main>
+<main id="app"><div class="loading">Rising from the grave…</div></main>
+<footer>Post-quantum signatures · ML-DSA-65 · Not audited, test chains only</footer>
 <script>
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
@@ -54,7 +129,7 @@ const GLOSSARY = {
   hash: "A 256-bit BLAKE3 fingerprint. Change one byte of the data and the fingerprint changes completely. Quantum computers only weaken hashes a little, so 256 bits stays safe.",
   signature: "Proof that the owner of a key approved this. Blockula uses ML-DSA-65 (NIST FIPS 204), a lattice-based scheme designed to resist quantum computers — unlike the ECDSA used by Bitcoin and Ethereum.",
   nonce: "A counter for each account. It stops anyone from replaying the same signed transaction twice.",
-  fee: "What it costs to include a transaction. The base part is burned 🔥 forever, slowly reducing supply. It's priced by size because post-quantum signatures are bigger.",
+  fee: "What it costs to include a transaction. The base part is burned forever, slowly reducing supply. It's priced by size because post-quantum signatures are bigger.",
   state_root: "A single hash summarizing every balance and name after this block. If two nodes agree on it, they agree on everything.",
   address: "Your account ID: bech32m('boo', BLAKE3(public key)). You rarely need to see it — names like jack.boo point to it.",
   name: "A human-readable .boo name that points to an address, like a domain name for your wallet.",
@@ -68,7 +143,25 @@ const GLOSSARY = {
   burned: "Fees destroyed forever. Burning offsets new issuance and ties the token's value to real network usage.",
 };
 const term = (key, text) => `<span class="term" data-tip="${esc(GLOSSARY[key])}">${esc(text ?? key)}</span>`;
-const who = (l) => l ? `<a href="#/account/${esc(l.name && !l.name.includes(" ") ? l.name : l.address)}">${esc(l.name || l.short)}</a>` : "—";
+// The node labels unnamed system accounts ("🧛 validator", "🏛️ treasury"); show those as an italic label.
+const plain = (s) => String(s).replace(/^[\p{Extended_Pictographic}️‍]+\s*/u, "");
+const who = (l) => {
+  if (!l) return "—";
+  const named = l.name && !l.name.includes(" ");
+  const text = named ? esc(l.name) : l.name ? `<span class="label">${esc(plain(l.name))}</span> <span class="mono">${esc(l.short)}</span>` : `<span class="mono">${esc(l.short)}</span>`;
+  return `<a href="#/account/${esc(named ? l.name : l.address)}">${text}</a>`;
+};
+// "1099999999.99909702 FANG" → "1,099,999,999 FANG" for big figures; the exact value stays in the tooltip.
+const fang = (display) => {
+  const [n, unit = ""] = String(display).split(" ");
+  const [w, f = ""] = n.split(".");
+  if (!/^\d+$/.test(w)) return esc(display);
+  const frac = (w.length > 6 ? "" : w.length > 3 ? f.slice(0, 2) : f).replace(/0+$/, "");
+  return `<span title="${esc(display)}">${Number(w).toLocaleString("en-US")}${frac ? "." + frac : ""}<small>${esc(unit)}</small></span>`;
+};
+const stat = (v, k) => `<div class="stat"><div class="v">${v}</div><div class="k">${k}</div></div>`;
+const card = (inner, cls = "") => `<section class="card ${cls}">${inner}</section>`;
+const plural = (n, one, many = one + "s") => `${n} ${n == 1 ? one : many}`;
 
 const views = {
   async home() {
@@ -77,143 +170,145 @@ const views = {
       fetch("/api/health").then((r) => r.json()).catch(() => ({ ok: false, reason: "unreachable" })),
     ]);
     const age = s.head_age_ms != null ? Math.round(s.head_age_ms / 1000) : null;
-    return `
-      <div class="card" style="margin-bottom:16px"><h2>${health.ok ? "🟢" : "🟠"} Network health</h2>
-        <div class="grid">
-          <div class="stat"><div class="v">#${s.height}</div><div class="k">height${s.syncing ? ` · syncing… ${Math.floor((s.sync_progress || 0) * 100)}% of ~#${s.network_height_claimed}` : ""}</div></div>
-          <div class="stat"><div class="v">${age == null ? "—" : age + "s"}</div><div class="k">since the last block</div></div>
-          <div class="stat"><div class="v">${s.active_validators}</div><div class="k"><a href="#/validators">validators</a> in ${term("epoch")} ${s.epoch}</div></div>
-          <div class="stat"><div class="v">${s.mempool}</div><div class="k"><a href="#/mempool">pending txs</a></div></div>
+    return `<div class="stack">
+      <section>
+        <div class="figures">
+          ${stat(`#${s.height}`, `${term("height", "latest block")}${s.syncing ? ` · syncing ${Math.floor((s.sync_progress || 0) * 100)}% of ~#${s.network_height_claimed}` : ""}`)}
+          ${stat(age == null ? "—" : age + "s", "since the last block")}
+          ${stat(s.active_validators, `<a href="#/validators">validators</a> in ${term("epoch")} ${s.epoch}`)}
+          ${stat(s.mempool, `<a href="#/mempool">pending</a>`)}
         </div>
-        ${health.ok ? "" : `<div class="dim">${esc(health.reason || "")}</div>`}
-        ${s.history_from > 1 ? `<div class="dim">⚡ This node fast-synced from a certified snapshot at #${s.fast_synced_from}; history before #${s.history_from} isn't available on this node.</div>` : ""}
-        ${v ? `<div class="dim">${v.blocks_until_next_epoch} blocks until epoch ${v.epoch + 1}${v.pending.length ? ` · ${v.pending.length} validator${v.pending.length == 1 ? "" : "s"} awaiting approval` : ""}</div>` : ""}
-      </div>`
-      + `
-      <div class="grid">
-        <div class="card stat"><div class="v">#${s.height}</div><div class="k">${term("height", "latest block")}</div></div>
-        <div class="card stat"><div class="v">${esc(s.supply_display)}</div><div class="k">total supply</div></div>
-        <div class="card stat"><div class="v">${esc(s.burned_display)}</div><div class="k">${term("burned", "🔥 burned")}</div></div>
-        <div class="card stat"><div class="v">${s.accounts}</div><div class="k">accounts</div></div>
-        <div class="card stat"><div class="v">${s.names}</div><div class="k">${term("name", ".boo names")}</div></div>
-      </div>
-      <div class="card learn" style="margin-bottom:24px">
-        <h2>👻 New here?</h2>
-        This is <b>${esc(s.chain_id)}</b>, a blockchain secured by <b>${term("signature", "post-quantum signatures")}</b>.
-        Every second a new ${term("block")} is sealed. Click anything to dig in, or <a href="#/learn">take the 2-minute tour →</a>
-      </div>
-      <div class="card"><h2>Latest blocks</h2>
-        ${blocks.map((b) => `<div class="row"><div><a href="#/block/${b.height}">#${b.height}</a> <span class="dim">${esc(b.summary)}</span></div><div class="dim">${ago(b.timestamp_ms)}</div></div>`).join("")}
-      </div>`;
+        <div class="figures" style="border-top-width:1px">
+          ${stat(fang(s.supply_display), "total supply")}
+          ${stat(fang(s.burned_display), term("burned"))}
+          ${stat(s.accounts, "accounts")}
+          ${stat(s.names, term("name", ".boo names"))}
+        </div>
+        <div class="health">
+          <span><b class="${health.ok ? "ok" : "bad"}">${health.ok ? "● The network is healthy" : "● " + esc(health.reason || "unhealthy")}</b></span>
+          ${v ? `<span>${plural(v.blocks_until_next_epoch, "block")} until epoch ${v.epoch + 1}${v.pending.length ? ` · ${plural(v.pending.length, "validator")} awaiting approval` : ""}</span>` : ""}
+        </div>
+        ${s.history_from > 1 ? `<div class="dim">This node fast-synced from a certified snapshot at #${s.fast_synced_from}; history before #${s.history_from} isn't available here.</div>` : ""}
+      </section>
+      ${card(`<span class="eyebrow">New here?</span>
+        <p class="lede">This is <b>${esc(s.chain_id)}</b>, a blockchain secured by ${term("signature", "post-quantum signatures")}. Every second a new ${term("block")} is sealed. Click anything to dig in, or <a href="#/learn">read the two-minute guide</a>.</p>`, "learn")}
+      ${card(`<h2>Latest blocks</h2><div class="rows">
+        ${blocks.map((b) => `<div class="row blockrow"><a class="height" href="#/block/${b.height}">#${b.height}</a><span class="dim">${b.tx_count ? `<a href="#/block/${b.height}">${plural(b.tx_count, "transaction")}</a>` : "no transactions"}<span class="proposer"> · proposed by ${who(b.proposer)}</span></span><span class="dim">${ago(b.timestamp_ms)}</span></div>`).join("")}
+      </div>`)}
+    </div>`;
   },
   async block(id) {
     const b = await api("/block/" + id);
-    return `
-      <div class="card"><div class="summary">${esc(b.summary)}</div><div class="dim">${new Date(b.timestamp_ms).toLocaleString()} · ${ago(b.timestamp_ms)}</div></div><br>
-      <div class="card"><dl>
-        <dt>${term("height")}</dt><dd>#${b.height} · <a href="#/block/${b.height - 1}">← prev</a> · <a href="#/block/${b.height + 1}">next →</a></dd>
+    return `<div class="stack">
+      <div><span class="eyebrow">Block</span><h1 class="figure-title">#${b.height}</h1><div class="dim">${esc(b.summary)} · ${new Date(b.timestamp_ms).toLocaleString()} (${ago(b.timestamp_ms)}) · <a href="#/block/${b.height - 1}">← previous</a> · <a href="#/block/${b.height + 1}">next →</a></div></div>
+      ${card(`<dl>
         <dt>${term("proposer")}</dt><dd>${who(b.proposer)}</dd>
         <dt>${term("hash", "block hash")}</dt><dd class="mono">${esc(b.hash)}</dd>
         <dt>${term("hash", "previous hash")}</dt><dd class="mono">${esc(b.prev_hash)}</dd>
-        <dt>${term("state_root")}</dt><dd class="mono">${esc(b.state_root)}</dd>
+        <dt>${term("state_root", "state root")}</dt><dd class="mono">${esc(b.state_root)}</dd>
         <dt>${term("certificate", "finality certificate")}</dt><dd>${b.signature_bytes ? `ML-DSA-65 quorum · ${b.signature_bytes.toLocaleString()} bytes` : "finalized via a later block's certificate"}</dd>
-      </dl></div><br>
-      <div class="card"><h2>Transactions (${b.tx_count})</h2>${b.txs.length ? b.txs.map(txRow).join("") : '<div class="dim">A quiet block. Nothing stirred. 🕸️</div>'}</div>`;
+      </dl>`)}
+      ${card(`<h2>Transactions (${b.tx_count})</h2>${b.txs.length ? `<div class="rows">${b.txs.map(txRow).join("")}</div>` : '<p class="empty">A quiet block. Nothing stirred.</p>'}`)}
+    </div>`;
   },
   async tx(id) {
     const t = await api("/tx/" + id);
     if (t.status === "failed" && !t.from) {
-      return `<div class="card"><div class="summary">❌ This transaction didn't go through</div><span class="pill failed">failed</span><p>${esc(t.error || "")}</p><p class="dim">It was dropped around block #${t.height}. Nothing moved; if it was included, only the fee was charged.</p></div>`;
+      return card(`<span class="eyebrow">Transaction</span><div class="summary">This transaction didn't go through</div><span class="pill failed">failed</span><p>${esc(t.error || "")}</p><p class="dim">It was dropped around block #${t.height}. Nothing moved; if it was included, only the fee was charged.</p>`);
     }
-    return `
-      <div class="card"><div class="summary">${esc(t.summary)}</div>
-        <span class="pill ${t.status}">${term("finalized", t.status)}</span> ${t.height ? `in <a href="#/block/${t.height}">block #${t.height}</a>` : ""}
-        ${t.error ? `<p>❌ The action failed: ${esc(t.error)}. The fee was still charged.</p>` : ""}
-        ${t.memo ? `<p>💬 “${esc(t.memo)}”</p>` : ""}</div><br>
-      <div class="card"><dl>
+    return `<div class="stack">
+      ${card(`<span class="eyebrow">Transaction</span><div class="summary">${esc(t.summary)}</div>
+        <span class="pill ${t.status}">${term("finalized", t.status)}</span> ${t.height ? `<span class="dim">in <a href="#/block/${t.height}">block #${t.height}</a></span>` : ""}
+        ${t.error ? `<p class="err">The action failed: ${esc(t.error)}. The fee was still charged.</p>` : ""}
+        ${t.memo ? `<p><i>“${esc(t.memo)}”</i></p>` : ""}`)}
+      ${card(`<dl>
         <dt>From</dt><dd>${who(t.from)}</dd>
         ${t.to ? `<dt>To</dt><dd>${who(t.to)}</dd>` : ""}
         ${t.amount_display ? `<dt>Amount</dt><dd>${esc(t.amount_display)}</dd>` : ""}
-        <dt>${term("fee")}</dt><dd>${esc(t.fee_display)}</dd>
+        <dt>${term("fee")}</dt><dd>${esc(t.fee_display)} <span class="dim">(burned)</span></dd>
         <dt>${term("nonce")}</dt><dd>${t.nonce}</dd>
         <dt>${term("signature")}</dt><dd>${esc(t.signature_scheme)} · ${t.size_bytes.toLocaleString()} byte transaction</dd>
         <dt>${term("hash", "transaction id")}</dt><dd class="mono">${esc(t.id)}</dd>
       </dl>
-      <details><summary>Raw data (for the brave)</summary><pre class="mono">${esc(JSON.stringify(t.action, null, 2))}</pre></details></div>`;
+      <details><summary>Raw data, for the brave</summary><pre class="mono">${esc(JSON.stringify(t.action, null, 2))}</pre></details>`)}
+    </div>`;
   },
   async account(id) {
     const a = await api("/account/" + encodeURIComponent(id));
     let gh = null;
     if (a.github) gh = await api("/github/" + encodeURIComponent(a.github.handle)).catch(() => null);
-    const bits = [esc(a.account.name || "Unnamed account")];
-    if (a.github) bits.push(`GitHub <a href="https://github.com/${esc(a.github.handle)}">@${esc(a.github.handle)}</a> ${gh && gh.verified ? `<span class="pill" title="${esc(gh.reason)}">✓ verified</span>` : `<span class="pill pending" title="${esc(gh ? gh.reason : "not checked")}">unverified</span>`}`);
-    if (a.hunts_won.length) bits.push(`${a.hunts_won.length} hunt${a.hunts_won.length == 1 ? "" : "s"} won`);
+    const name = a.account.name ? (a.account.name.includes(" ") ? `<i>${esc(plain(a.account.name))}</i>` : esc(a.account.name)) : "Unnamed account";
+    const bits = [];
+    if (a.github) bits.push(`GitHub <a href="https://github.com/${esc(a.github.handle)}">@${esc(a.github.handle)}</a> ${gh && gh.verified ? `<span class="pill" title="${esc(gh.reason)}">verified</span>` : `<span class="pill pending" title="${esc(gh ? gh.reason : "not checked")}">unverified</span>`}`);
+    if (a.hunts_won.length) bits.push(plural(a.hunts_won.length, "hunt") + " won");
     if (a.familiars.length) bits.push(`${a.familiars.length} ${term("familiar", a.familiars.length == 1 ? "Familiar" : "Familiars")}`);
-    return `
-      <div class="card"><div class="summary">${bits.join(" · ")}</div>
-        <div class="dim">${term("address")}: <span class="mono">${esc(a.account.address)}</span></div></div><br>
-      ${a.hunts_won.length || a.familiars.length || a.hunts_created.length ? `<div class="card"><h2>🏹 Hunts</h2>
-        ${a.hunts_won.map((h) => `<div class="row"><div><a href="#/hunt/${h.id}">${esc(h.repo)}#${h.issue}</a> won ${esc(h.amount_display)} for PR #${h.pr}${h.self_awarded ? ' <span class="pill pending">self-awarded</span>' : ""}</div></div>`).join("")}
-        ${a.hunts_created.length ? `<div class="dim">Created ${a.hunts_created.map((id) => `<a href="#/hunt/${id}">#${id}</a>`).join(", ")}</div>` : ""}
-        ${a.familiars.length ? `<div class="dim">Familiars: ${a.familiars.map((f) => `🐈‍⬛ ${esc(f.label)}`).join(", ")}</div>` : ""}</div><br>` : ""}
-      <div class="grid">
-        <div class="card stat"><div class="v">${esc(a.balance_display)}</div><div class="k">balance</div></div>
-        <div class="card stat"><div class="v">${a.nonce}</div><div class="k">${term("nonce", "transactions sent")}</div></div>
-        <div class="card stat"><div class="v">${a.names.length}</div><div class="k">${term("name", "names owned")}</div></div>
+    return `<div class="stack">
+      <div><span class="eyebrow">Account</span><h1>${name}</h1>
+        ${bits.length ? `<div>${bits.join(" · ")}</div>` : ""}
+        <div class="dim">${term("address")}: <span class="mono">${esc(a.account.address)}</span></div></div>
+      <div class="figures">
+        ${stat(fang(a.balance_display), "balance")}
+        ${stat(a.nonce, term("nonce", "transactions sent"))}
+        ${stat(a.names.length, term("name", "names owned"))}
       </div>
-      ${a.names.length ? `<div class="card"><h2>Names</h2>${a.names.map((n) => `<span class="pill">${esc(n)}</span> `).join("")}</div><br>` : ""}
-      <div class="card"><h2>Recent activity</h2>${a.recent_txs.length ? a.recent_txs.map(txRow).join("") : '<div class="dim">No activity yet. Spooky quiet.</div>'}</div>`;
+      ${a.names.length ? card(`<h2>Names</h2>${a.names.map((n) => `<span class="pill">${esc(n)}</span>`).join(" ")}`) : ""}
+      ${a.hunts_won.length || a.familiars.length || a.hunts_created.length ? card(`<h2>Hunts</h2><div class="rows">
+        ${a.hunts_won.map((h) => `<div class="row"><div><a href="#/hunt/${h.id}">${esc(h.repo)}#${h.issue}</a> won ${esc(h.amount_display)} for PR #${h.pr}${h.self_awarded ? ' <span class="pill pending">self-awarded</span>' : ""}</div></div>`).join("")}
+        ${a.hunts_created.length ? `<div class="row dim"><div>Created ${a.hunts_created.map((id) => `<a href="#/hunt/${id}">#${id}</a>`).join(", ")}</div></div>` : ""}
+        ${a.familiars.length ? `<div class="row dim"><div>${term("familiar", "Familiars")}: ${a.familiars.map((f) => esc(f.label)).join(", ")}</div></div>` : ""}</div>`) : ""}
+      ${card(`<h2>Recent activity</h2>${a.recent_txs.length ? `<div class="rows">${a.recent_txs.map(txRow).join("")}</div>` : '<p class="empty">No activity yet. Spooky quiet.</p>'}`)}
+    </div>`;
   },
   async name(n) {
     const r = await api("/name/" + n);
-    return `<div class="card"><div class="summary">🪦 ${esc(r.name)} is unclaimed</div><p>Anyone can register it for <b>${esc(r.price_display)}</b>. Shorter names cost more because they're scarcer. The fee goes to the community treasury.</p>
-      <p class="dim">Register it with the SDK: <span class="mono">await wallet.registerName("${esc(r.name)}")</span></p></div>`;
+    return card(`<span class="eyebrow">Unclaimed name</span><h1>${esc(r.name)}</h1><p>Anyone can register it for <b>${esc(r.price_display)}</b>. Shorter names cost more because they're scarcer. The fee goes to the community treasury.</p>
+      <p class="dim">Register it with the SDK: <span class="mono">await wallet.registerName("${esc(r.name)}")</span></p>`);
   },
   async learn() {
     const s = await api("/status");
-    return `<div class="card learn"><h2>📖 Blockula in 2 minutes</h2><ol>
+    return card(`<span class="eyebrow">A short guide</span><h1>Blockula in two minutes</h1><ol>
       <li><b>A blockchain is a shared notebook.</b> Thousands of computers keep identical copies, and new pages (${term("block", "blocks")}) are added every second. Each page includes a ${term("hash")} of the one before, so nobody can quietly rip one out.</li>
       <li><b>Your wallet is a key, not an account at a company.</b> Only your key can produce the ${term("signature")} that moves your FANG. Blockula's keys are unlocked by a <b>passkey</b> (Face ID / Touch ID), so there's no seed phrase to lose.</li>
       <li><b>Why "post-quantum"?</b> Future quantum computers could forge the signatures that Bitcoin and Ethereum use today. Blockula uses ML-DSA, a NIST-standardized scheme built on lattice math that quantum computers aren't known to break. The tradeoff: signatures are about 3 KB instead of 64 bytes.</li>
       <li><b>Names instead of gibberish.</b> Instead of <span class="mono">boo1qx…</span>, you send to <b>alice.boo</b>.</li>
       <li><b>Fees are burned.</b> Every transaction pays a small ${term("fee")}, and the base part is destroyed. So far ${esc(s.burned_display)} has been ${term("burned")}.</li>
-      <li><b>Coming soon: 👻 Ghost Mode.</b> Private transfers using zero-knowledge proofs (hash-based STARKs, also quantum-safe). The explorer will show <i>that</i> something happened, but not who or how much.</li>
-    </ol><p>Try it: search for a name above, or open the <a href="#/">latest blocks</a> and click around. Every dotted word has an explanation if you hover.</p></div>`;
+      <li><b>Coming soon: Ghost Mode.</b> Private transfers using zero-knowledge proofs (hash-based STARKs, also quantum-safe). The explorer will show <i>that</i> something happened, but not who or how much.</li>
+    </ol><p>Try it: search for a name above, or open the <a href="#/">latest blocks</a> and click around. Every underlined term has an explanation if you hover.</p>`, "learn");
   },
 };
 
 views.hunts = async function () {
   const r = await api("/hunts");
   const row = (h) => `<div class="row"><div><a href="#/hunt/${h.id}"><b>${esc(h.amount_display)}</b> · ${esc(h.title)}</a>
-    <span class="dim">· <a href="${esc(h.issue_url)}">${esc(h.repo)}#${h.issue}</a> · ${h.funders.length} funder${h.funders.length == 1 ? "" : "s"}</span></div><span class="pill ${h.status == "open" ? "" : "pending"}">${esc(h.status)}</span></div>`;
-  return `<div class="card learn"><h2>🏹 Hunts</h2><p>${term("hunt", "Hunts")} are bounties on GitHub issues. Anyone can add to one. Fix the issue, get the pull request merged, and the bounty is awarded to your account (or to your ${term("familiar", "Familiar")}'s sponsor). Open bounties right now: <b>${esc(r.open_bounties_display)}</b>.</p>
-    <p class="dim">Put one up with the SDK: <span class="mono">wallet.createHunt({ repo: "owner/name", issue: 12, amount: "50", title: "…", expiresInBlocks: 100000 })</span></p></div><br>
-    <div class="card"><h2>All hunts (${r.count})</h2>${r.hunts.length ? r.hunts.map(row).join("") : '<div class="dim">No hunts yet.</div>'}</div>`;
+    <span class="dim">· <a href="${esc(h.issue_url)}">${esc(h.repo)}#${h.issue}</a> · ${plural(h.funders.length, "funder")}</span></div><span class="pill ${h.status == "open" ? "" : "pending"}">${esc(h.status)}</span></div>`;
+  return `<div class="stack">${card(`<span class="eyebrow">Bounties</span><h1>Hunts</h1><p>${term("hunt", "Hunts")} are bounties on GitHub issues. Anyone can add to one. Fix the issue, get the pull request merged, and the bounty is awarded to your account (or to your ${term("familiar", "Familiar")}'s sponsor). Open bounties right now: <b>${esc(r.open_bounties_display)}</b>.</p>
+    <p class="dim">Put one up with the SDK: <span class="mono">wallet.createHunt({ repo: "owner/name", issue: 12, amount: "50", title: "…", expiresInBlocks: 100000 })</span></p>`, "learn")}
+    ${card(`<h2>All hunts (${r.count})</h2>${r.hunts.length ? `<div class="rows">${r.hunts.map(row).join("")}</div>` : '<p class="empty">No hunts yet.</p>'}`)}</div>`;
 };
 
 views.hunt = async function (id) {
   const h = await api("/hunt/" + id);
-  return `<div class="card"><div class="summary">🏹 ${esc(h.amount_display)} for <a href="${esc(h.issue_url)}">${esc(h.repo)}#${h.issue}</a></div>
-      <p>“${esc(h.title)}”</p><span class="pill ${h.status == "open" ? "" : "pending"}">${esc(h.status)}</span></div><br>
-    <div class="card"><dl>
+  return `<div class="stack">${card(`<span class="eyebrow">Hunt #${h.id}</span><div class="summary">${esc(h.amount_display)} for <a href="${esc(h.issue_url)}">${esc(h.repo)}#${h.issue}</a></div>
+      <p><i>“${esc(h.title)}”</i></p><span class="pill ${h.status == "open" ? "" : "pending"}">${esc(h.status)}</span>`)}
+    ${card(`<dl>
       <dt>Created by</dt><dd>${who(h.creator)} at block <a href="#/block/${h.created_at}">#${h.created_at}</a></dd>
       <dt>Expires</dt><dd>block #${h.expires_at}</dd>
-      ${h.awarded_to ? `<dt>Winner</dt><dd>${who(h.awarded_to)}${h.familiar ? ` (via their ${term("familiar", "Familiar")} 🐈‍⬛ ${esc(h.familiar)})` : ""} for <a href="${esc(h.pr_url)}">PR #${h.pr}</a>${h.self_awarded ? ' <span class="pill pending">self-awarded</span>' : ""}</dd><dt>Awarded by</dt><dd>${who(h.awarded_by)} at block #${h.awarded_at}</dd>` : ""}
+      ${h.awarded_to ? `<dt>Winner</dt><dd>${who(h.awarded_to)}${h.familiar ? ` (via their ${term("familiar", "Familiar")} ${esc(h.familiar)})` : ""} for <a href="${esc(h.pr_url)}">PR #${h.pr}</a>${h.self_awarded ? ' <span class="pill pending">self-awarded</span>' : ""}</dd><dt>Awarded by</dt><dd>${who(h.awarded_by)} at block #${h.awarded_at}</dd>` : ""}
       ${h.cancelled_at ? `<dt>Cancelled</dt><dd>block #${h.cancelled_at}; every funder was refunded what they put in</dd>` : ""}
-    </dl></div><br>
-    <div class="card"><h2>Funders (${h.funders.length})</h2>${h.funders.map((f) => `<div class="row"><div>${who(f.account)}</div><div>${esc(f.amount_display)}</div></div>`).join("")}</div>`;
+    </dl>`)}
+    ${card(`<h2>Funders (${h.funders.length})</h2><div class="rows">${h.funders.map((f) => `<div class="row"><div>${who(f.account)}</div><div>${esc(f.amount_display)}</div></div>`).join("")}</div>`)}</div>`;
 };
 
 views.mempool = async function () {
   const m = await api("/mempool?limit=100");
-  return `<div class="card learn"><h2>⏳ Waiting to be included</h2><p>Transactions this node has accepted but no block has finalized yet. Validators pick them up in the next few blocks; ones that can't apply anymore (or wait too long) are dropped.</p></div><br>
-    <div class="card"><h2>Pending (${m.count})</h2>${m.txs.length ? m.txs.map(txRow).join("") : '<div class="dim">Nothing pending. 🕸️</div>'}</div>`;
+  return `<div class="stack">${card(`<span class="eyebrow">Mempool</span><h1>Waiting to be included</h1><p>Transactions this node has accepted but no block has finalized yet. Validators pick them up in the next few blocks; ones that can't apply anymore (or wait too long) are dropped.</p>`, "learn")}
+    ${card(`<h2>Pending (${m.count})</h2>${m.txs.length ? `<div class="rows">${m.txs.map(txRow).join("")}</div>` : '<p class="empty">Nothing pending. All is still.</p>'}`)}</div>`;
 };
 
 views.validators = async function () {
   const v = await api("/validators");
   const row = (x) => `<div class="row"><div>${who(x.validator)} <span class="dim">${esc(x.p2p_addr)}${x.genesis ? " · genesis" : ""}${x.bond !== "0" ? " · " + term("bond", "bond") + " " + esc(x.bond_display) : ""}</span></div><span class="pill">${esc(x.status)}</span></div>`;
-  const list = (title, xs, empty) => `<div class="card"><h2>${title} (${xs.length})</h2>${xs.length ? xs.map(row).join("") : `<div class="dim">${empty}</div>`}</div><br>`;
+  const list = (title, xs, empty) => card(`<h2>${title} (${xs.length})</h2>${xs.length ? `<div class="rows">${xs.map(row).join("")}</div>` : `<p class="empty">${empty}</p>`}`);
   const all = [...v.active, ...v.pending, ...v.approved, ...v.removed];
   const seen = new Set();
   const events = [];
@@ -225,39 +320,45 @@ views.validators = async function () {
     if (x.removed_by) events.push([x.removed_at, `${who(x.removed_by)} removed validator ${who(x.validator)}${x.active_until_epoch != null ? `, last active in epoch ${x.active_until_epoch}` : ", leaving at the next epoch"}`]);
   }
   events.sort((a, b) => b[0] - a[0]);
-  return `
-    <div class="grid">
-      <div class="card stat"><div class="v">${v.epoch}</div><div class="k">${term("epoch", "current epoch")}</div></div>
-      <div class="card stat"><div class="v">${v.active.length}</div><div class="k">active validators</div></div>
-      <div class="card stat"><div class="v">${v.blocks_until_next_epoch}</div><div class="k">blocks until the next epoch</div></div>
-      <div class="card stat"><div class="v">${esc(v.min_bond_display)}</div><div class="k">${term("bond", "minimum bond")}</div></div>
+  return `<div class="stack">
+    <div><span class="eyebrow">Consensus</span><h1>Validators</h1></div>
+    <div class="figures">
+      ${stat(v.epoch, term("epoch", "current epoch"))}
+      ${stat(v.active.length, "active validators")}
+      ${stat(v.blocks_until_next_epoch, "blocks until the next epoch")}
+      ${stat(fang(v.min_bond_display), term("bond", "minimum bond"))}
     </div>
-    <div class="card learn"><h2>🧛 What validators do</h2>
+    ${card(`<h2>What validators do</h2>
       <p>Validators take turns proposing blocks and vote to finalize them. A block is final once more than two-thirds of the active validators have signed it with ML-DSA-65, a post-quantum signature. There are no confirmations to wait for.</p>
-      <p>The set only changes between ${term("epoch", "epochs")} (every ${v.epoch_blocks} blocks). In Season 0, anyone can bond FANG and register, and an admin (${v.admins.map(who).join(", ")}) approves them. Approved validators join when the next epoch starts.</p></div><br>
+      <p>The set only changes between ${term("epoch", "epochs")} (every ${v.epoch_blocks} blocks). In Season 0, anyone can bond FANG and register, and an admin (${v.admins.map(who).join(", ")}) approves them. Approved validators join when the next epoch starts.</p>`, "learn")}
     ${list("Active this epoch", v.active, "—")}
     ${list("Next epoch", v.next_epoch, "—")}
     ${list("Waiting for approval", v.pending, "Nobody is waiting. Run <span class=\"mono\">blockula validator init</span> to become a validator.")}
     ${v.approved.length ? list("Approved, joining soon", v.approved, "") : ""}
     ${v.removed.length ? list("Removed", v.removed, "") : ""}
-    <div class="card"><h2>Admin actions</h2>${events.length ? events.map(([h, t]) => `<div class="row"><div>${t}</div><a class="dim" href="#/block/${h}">block #${h}</a></div>`).join("") : '<div class="dim">No changes since genesis.</div>'}</div>`;
+    ${card(`<h2>Admin actions</h2>${events.length ? `<div class="rows">${events.map(([h, t]) => `<div class="row"><div>${t}</div><a class="dim" href="#/block/${h}">block #${h}</a></div>`).join("")}</div>` : '<p class="empty">No changes since genesis.</p>'}`)}
+  </div>`;
 };
 
 function txRow(t) {
-  return `<div class="row"><div><a href="#/tx/${t.id}">${esc(t.summary)}</a>${t.memo ? ` <span class="dim">“${esc(t.memo)}”</span>` : ""}</div><span class="pill ${t.status}">${t.status}</span></div>`;
+  return `<div class="row"><div><a href="#/tx/${t.id}">${esc(t.summary)}</a>${t.memo ? ` <span class="dim"><i>“${esc(t.memo)}”</i></span>` : ""}</div><span class="pill ${t.status}">${t.status}</span></div>`;
 }
 
 async function route() {
   const [, view = "", id = ""] = location.hash.split("/");
   const fn = views[view] || views.home;
+  // Detail pages (a block, tx, account, name) don't belong to one section; a single hunt does.
+  const section = { block: null, tx: null, account: null, name: null, hunt: "hunts" }[view];
+  const current = section === undefined ? view : section;
+  document.querySelectorAll("nav a").forEach((a) => a.toggleAttribute("aria-current", current !== null && a.getAttribute("href") === `#/${current}`));
   try { $("#app").innerHTML = await fn(decodeURIComponent(id)); }
-  catch (e) { $("#app").innerHTML = `<div class="card err">🦴 ${esc(e.message)}</div>`; }
+  catch (e) { $("#app").innerHTML = card(`<span class="eyebrow">Not found</span><p class="err">${esc(e.message)}</p>`); }
 }
 
 $("#search").addEventListener("submit", async (e) => {
   e.preventDefault();
   try { const h = await api("/search/" + encodeURIComponent($("#q").value)); location.hash = `#/${h.type}/${h.id}`; }
-  catch (err) { $("#app").innerHTML = `<div class="card err">🦴 ${esc(err.message)}</div>`; }
+  catch (err) { $("#app").innerHTML = card(`<span class="eyebrow">Nothing found</span><p class="err">${esc(err.message)}</p>`); }
 });
 window.addEventListener("hashchange", route);
 route();

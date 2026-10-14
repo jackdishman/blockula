@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { Splash, Unlock } from "@/components/Gate";
 import { AccountPicker } from "@/components/AccountPicker";
+import { Ornament } from "@/components/Ornament";
 import { Copy, ErrorNote, Spinner, Tip } from "@/components/ui";
 import { friendly, isPrfUnsupported } from "@/lib/errors";
 import { keyCode } from "@/lib/format";
@@ -73,7 +74,7 @@ export default function LinkPage() {
   if (wallet && hint?.account)
     return (
       <main className="narrow center stack-lg">
-        <div className="hero-emoji">✅</div>
+        <Ornament kind="key" className="hero-ornament" />
         <h1>This device is already set up</h1>
         <p className="dim">It acts for {hint.name ?? "your account"}. To link another device, open Devices &amp; agents.</p>
         <Link className="btn primary" href="/">Go home</Link>
@@ -84,15 +85,15 @@ export default function LinkPage() {
     return (
       <main className="narrow stack-lg">
         <div className="center">
-          <div className="hero-emoji">📲</div>
+          <Ornament kind="candle" className="hero-ornament" />
           <h1>Almost there</h1>
           <p className="dim">On a device that already has your wallet, open <b>Devices &amp; agents → Link a device</b> and paste this key id.</p>
         </div>
         <section className="card stack">
-          <span className="dim small">This device&apos;s key id</span>
+          <span className="eyebrow">This device&apos;s key id</span>
           <div className="mono address">{wallet.keyId}</div>
           <Copy text={wallet.keyId} label="Copy key id" />
-          <span className="dim small">Check code (should match on the other device)</span>
+          <span className="eyebrow">Check code (should match on the other device)</span>
           <div className="code">{keyCode(wallet.keyId)}</div>
         </section>
         <p className="center"><Spinner>Waiting to be added…</Spinner></p>
@@ -107,7 +108,7 @@ export default function LinkPage() {
     <main className="narrow stack-lg">
       <Link href="/welcome" className="back">← Back</Link>
       <div className="center">
-        <div className="hero-emoji">🔗</div>
+        <Ornament kind="key" className="hero-ornament" />
         <h1>Link this device</h1>
         <p className="dim">
           This device gets its own passkey and key. Your other device then adds it as a co-owner of your account. Nothing secret ever leaves either device.
@@ -116,7 +117,7 @@ export default function LinkPage() {
       {!prf ? (
         <section className="card stack">
           <button className="btn primary big" disabled={busy} onClick={() => make("passkey")}>
-            {busy ? <Spinner>Waiting for your passkey…</Spinner> : "🔑 Create a passkey for this device"}
+            {busy ? <Spinner>Waiting for your passkey…</Spinner> : "Create a passkey for this device"}
           </button>
           <ErrorNote error={error} />
         </section>
@@ -124,7 +125,7 @@ export default function LinkPage() {
         <section className="card stack warn-card">
           <p>This passkey provider doesn&apos;t support <b>PRF</b>, which Blockula needs to derive your key. Try iCloud Keychain, Google Password Manager or 1Password.</p>
           <button className="btn primary" onClick={() => setPrf(false)}>← Try another passkey</button>
-          <button className="btn" onClick={() => make("local")}>⚠️ Use a browser-only key (less secure, for testing)</button>
+          <button className="btn" onClick={() => make("local")}>Use a browser-only key (less secure, for testing)</button>
         </section>
       )}
     </main>

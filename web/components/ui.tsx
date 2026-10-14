@@ -30,7 +30,7 @@ export function Copy({ text, label = "Copy" }: { text: string; label?: string })
 }
 
 export function ErrorNote({ error }: { error: string | null }) {
-  return error ? <p className="error" role="alert">🩸 {error}</p> : null;
+  return error ? <p className="error" role="alert">{error}</p> : null;
 }
 
 export function Spinner({ children }: { children?: ReactNode }) {
@@ -51,5 +51,9 @@ export function ExplorerLink({ href, children, className }: { href: string; chil
 }
 
 export function Tip({ children }: { children: ReactNode }) {
-  return <p className="tip">💡 {children}</p>;
+  return (
+    <p className="tip">
+      <span className="nb">N.B.</span> {children}
+    </p>
+  );
 }

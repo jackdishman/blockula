@@ -66,4 +66,4 @@ What earns the most, because it can be verified objectively:
 
 What earns nothing: PR floods, cosmetic churn, unverified changes. Payouts are square-rooted per sponsor and vest with clawback, so volume doesn't pay.
 
-Hunt bounties are live on the testnet now (`/api/hunts`, the explorer's 🏹 Hunts page, or MCP `list_hunts`). Souls, Séances and the contribution pool come in Phase 2.
+Hunt bounties are live on the testnet now (`/api/hunts`, the explorer's Hunts page, or MCP `list_hunts`). Souls, Séances and the contribution pool come in Phase 2.
