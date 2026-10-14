@@ -67,7 +67,7 @@ Action tags 0–29 keep their meaning. New tags are reserved here so packages ne
 | 45 | `RenewName { name, years }` | P-ECON |
 | 46 | `TransferName { name, to }` | P-ECON |
 | 47 | `ReleaseName { name }` | P-ECON |
-| 48 | `ClaimVested {}` (reserved; vesting is lock-based, see 3.7) | P-ECON |
+| 48 | `ClaimDistribution { distribution_id, amount, proof }` | P-GOV |
 | 49 | `AttestRevert { claim_id, revert_sha }` | P-BEACON |
 | 50–59 | reserved for Ghost Mode | P-GHOST |
 
@@ -104,9 +104,12 @@ CBlock { version: u32, parent, height, view: u64, parent_view: u64, timestamp_ms
 
 ### 3.5 Governance, treasury, multisig (GOV-1..3, TOK-3, SF-11)
 
-- **No admin keys on mainnet.** Every former admin lever is a proposal kind: `ParamChange`, `TreasurySpend`, `SetRepo`, `GrantSoul` (bounded), `FlagSybil`, `RejectClaim`, `Clawback`, `UnlinkGithub`, `RefundHunt`, `ScheduleUpgrade`, `ActivateFeature` (e.g. Ghost Mode), `Text`.
+- **No admin keys on mainnet.** Every former admin lever is a proposal kind: `ParamChange`, `TreasurySpend`, `Distribution`, `SetRepo`, `GrantSoul` (bounded), `FlagSybil`, `RejectClaim`, `Clawback`, `UnlinkGithub`, `RefundHunt`, `ScheduleUpgrade`, `ActivateFeature` (e.g. Ghost Mode), `Text`.
 - `Propose` bonds `proposal_deposit` (refunded once the proposal reaches quorum; burned if it doesn't). Voting lasts `voting_blocks` (7 days), then a `timelock_blocks` (2 days) queue, then the action executes at end of block. Upgrades and treasury spends above `treasury_large_bps` of the treasury need a ⅔ supermajority; everything else a simple majority. Quorum is `quorum_bps` of unlocked supply.
 - `Vote` locks `amount` of the voter's own unlocked holdings (liquid + staked + unbonding) for `conviction` lock periods; weight = amount × conviction multiplier (0.1× with no lock, then 1×–6× for 1–32 lock periods). Locks overlap, constrain transfers out, and are released by `Unlock` after they expire. Unvested tokens can't vote.
+- **Bootstrap council.** At genesis almost nothing can vote (insider allocations are locked and locked tokens don't vote; the treasury, community and endowment buckets are keyless). Until `bootstrap_end_height` (12 months), a proposal also passes if ⅔ of the active validator set approves it (`Vote` signed by a validator's consensus key or owner counts as that validator's council vote), provided token-weighted Nay doesn't exceed token-weighted Aye. The timelock still applies. Validators are 22–31 independent operators and the founder holds at most 2 seats, so no single party distributes or spends.
+- **Community distributions** come from the keyless community account through `Distribution { merkle_root, total, claim_until }` proposals; recipients `ClaimDistribution` with a Merkle proof (BLAKE3 leaves `(distribution_id, address, amount)`); unclaimed amounts return to the community account after `claim_until`. Criteria are published with the proposal, never before mainnet.
+- Issuance parameters can only change within code bounds (floor ≥ 0.5%, stakers' share ≥ 50%) and with a ⅔ supermajority.
 - The treasury is a keyless system account; only `TreasurySpend` moves funds out. Quorum has an absolute floor (`quorum_floor`, in FANG) as well as `quorum_bps`, and spending proposals are rejected before `governance_spend_height` (≈ 6 months), because almost nothing can vote at launch.
 - `MultisigCreate` turns an account into an M-of-N multisig of its owner keys: owner-only actions then need `MultisigPropose` plus approvals; session keys keep working within their limits.
 - Hunts: only the creator awards. Governance can refund a hunt's funders; nobody can redirect escrow.
