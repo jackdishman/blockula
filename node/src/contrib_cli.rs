@@ -4,7 +4,7 @@
 
 use crate::crypto::{self, Keys};
 use crate::types::*;
-use crate::validator_cli::{get, load_seed, parse_fang, rt, send_memo, wallet_keys};
+use crate::validator_cli::{get, load_seed, own_address, parse_fang, rt, send_memo, wallet_keys};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand};
 use serde_json::Value;
@@ -42,7 +42,7 @@ impl Signer {
     async fn from(&self, keys: &Keys) -> Result<String> {
         match &self.from {
             Some(a) => resolve(&self.rpc, a).await,
-            None => Ok(keys.address()),
+            None => own_address(&self.rpc, keys).await,
         }
     }
 }
@@ -463,7 +463,7 @@ pub fn contrib(cmd: ContribCmd, dir: &Path) -> Result<()> {
             let rt = rt()?;
             let who = match account.or(signer.from.clone()) {
                 Some(a) => a,
-                None => signer.keys(dir).map(|k| k.address()).map_err(|_| anyhow!("no wallet here; pass --account"))?,
+                None => rt.block_on(own_address(&signer.rpc, &signer.keys(dir).map_err(|_| anyhow!("no wallet here; pass --account"))?))?,
             };
             let v = rt.block_on(get(&signer.rpc, &format!("/account/{who}")))?;
             let p = &v["contribution"];
@@ -495,10 +495,10 @@ pub fn contrib(cmd: ContribCmd, dir: &Path) -> Result<()> {
             for c in &claims {
                 print_claim(c);
             }
-            let me = signer.keys(dir).ok().map(|k| k.address());
-            let me = match (&signer.from, me) {
+            let me = match (&signer.from, signer.keys(dir).ok()) {
                 (Some(f), _) => Some(rt.block_on(resolve(&signer.rpc, f))?),
-                (None, m) => m,
+                (None, Some(k)) => Some(rt.block_on(own_address(&signer.rpc, &k))?),
+                (None, None) => None,
             };
             let seat = s["jurors"].as_array().cloned().unwrap_or_default().into_iter().find(|j| me.as_deref().is_some_and(|m| j["juror"]["address"] == m));
             match seat {

@@ -116,6 +116,20 @@ pub(crate) async fn get(rpc: &str, path: &str) -> Result<Value> {
     Ok(v)
 }
 
+/// The address prefix of the chain behind `rpc` (`boo` from nodes that predate prefixes).
+pub(crate) async fn chain_prefix(rpc: &str) -> Result<String> {
+    let prefix = get(rpc, "/status").await?["address_prefix"].as_str().unwrap_or(crate::crypto::ADDRESS_HRP).to_string();
+    if !crate::crypto::is_prefix(&prefix) {
+        bail!("{rpc} reports an unknown address prefix {prefix:?}");
+    }
+    Ok(prefix)
+}
+
+/// `keys`' own account on the chain behind `rpc`: its address with that chain's prefix.
+pub(crate) async fn own_address(rpc: &str, keys: &Keys) -> Result<String> {
+    Ok(keys.address_with(&chain_prefix(rpc).await?))
+}
+
 /// Builds, signs, submits and waits for a tx; returns the finalized tx JSON.
 async fn send(rpc: &str, keys: &Keys, from: &str, action: Action) -> Result<Value> {
     send_memo(rpc, keys, from, action, String::new()).await
@@ -162,7 +176,9 @@ pub fn run(cmd: ValidatorCmd) -> Result<()> {
             }
             std::fs::create_dir_all(&home)?;
             let g: Genesis = if genesis.starts_with("http://") || genesis.starts_with("https://") {
-                serde_json::from_value(rt()?.block_on(get(&genesis, "/genesis"))?)?
+                let g: Genesis = serde_json::from_value(rt()?.block_on(get(&genesis, "/genesis"))?)?;
+                g.check_prefix().context("genesis")?;
+                g
             } else {
                 Genesis::load(Path::new(&genesis))?
             };
@@ -171,24 +187,26 @@ pub fn run(cmd: ValidatorCmd) -> Result<()> {
             crate::chain::check_host_port(&p2p).context("--public-p2p-addr")?;
             crate::chain::check_http_addr(&http).context("--public-http-addr")?;
             let keys = Keys::generate();
+            let me = keys.address_with(&g.address_prefix);
             std::fs::write(home.join("genesis.json"), serde_json::to_string_pretty(&g)?)?;
             write_secret(&home.join("validator.key"), &keys.seed_hex())?;
             std::fs::write(home.join("node.json"), serde_json::to_string_pretty(&NodeAddrs { p2p_addr: p2p.clone(), http_addr: http.clone() })?)?;
             println!("🧛 Validator home ready at {}", home.display());
-            println!("   address (account + validator id): {}", keys.address());
+            println!("   address (account + validator id): {me}");
             println!("   consensus key: ML-DSA-65, {}…", &hex::encode(keys.public_key())[..32]);
             println!("   advertised p2p {p2p} · http {http}");
             println!("\nNext:");
-            println!("   1. Fund {} with at least {} plus fees (testnets: POST /api/faucet {{\"to\": \"{}\"}})", keys.address(), fmt_fang(g.min_bond), keys.address());
+            println!("   1. Fund {me} with at least {} plus fees (testnets: POST /api/faucet {{\"to\": \"{me}\"}})", fmt_fang(g.min_bond));
             println!("   2. blockula validator register --home {} --rpc <node url>", home.display());
-            println!("   3. Ask a validator admin to approve {}", keys.address());
+            println!("   3. Ask a validator admin to approve {me}");
             println!("   4. blockula run --home {} --bind 0.0.0.0   (syncs now, votes from its activation epoch)", home.display());
             Ok(())
         }
         ValidatorCmd::Register { home, rpc, bond } => {
             let keys = load_seed(&home.join("validator.key"))?;
             let g = Genesis::load(&home.join("genesis.json"))?;
-            let addrs: NodeAddrs = match g.validators.iter().find(|v| v.address == keys.address()) {
+            let me = keys.address_with(&g.address_prefix);
+            let addrs: NodeAddrs = match g.validators.iter().find(|v| v.address == me) {
                 Some(v) => NodeAddrs { p2p_addr: v.p2p_addr.clone(), http_addr: v.http_addr.clone() },
                 None => serde_json::from_slice(&std::fs::read(home.join("node.json")).context("node.json missing — run `blockula validator init`")?)?,
             };
@@ -198,11 +216,11 @@ pub fn run(cmd: ValidatorCmd) -> Result<()> {
                 None => rt.block_on(get(&rpc, "/validators"))?["min_bond"].as_str().and_then(|s| s.parse().ok()).unwrap_or(g.min_bond),
             };
             let seed: [u8; 32] = hex::decode(std::fs::read_to_string(home.join("validator.key"))?.trim())?.try_into().map_err(|_| anyhow!("bad validator.key"))?;
-            let pop = crate::chain::make_pop(seed, &g.chain_id, &keys.address(), &addrs.p2p_addr, &addrs.http_addr);
+            let pop = crate::chain::make_pop(seed, &g.chain_id, &me, &addrs.p2p_addr, &addrs.http_addr);
             let action = Action::RegisterValidator { consensus_key: hex::encode(keys.public_key()), p2p_addr: addrs.p2p_addr, http_addr: addrs.http_addr, bond, pop };
-            let tx = rt.block_on(send(&rpc, &keys, &keys.address(), action))?;
+            let tx = rt.block_on(send(&rpc, &keys, &me, action))?;
             println!("✓ {}", tx["summary"].as_str().unwrap_or_default());
-            println!("  Now ask a validator admin to run: blockula validator approve {} --key <admin key file> --rpc {rpc}", keys.address());
+            println!("  Now ask a validator admin to run: blockula validator approve {me} --key <admin key file> --rpc {rpc}");
             Ok(())
         }
         ValidatorCmd::Approve(a) => admin(a, |v| Action::ApproveValidator { validator: v }),
@@ -212,7 +230,7 @@ pub fn run(cmd: ValidatorCmd) -> Result<()> {
             let g = Genesis::load(&home.join("genesis.json"))?;
             let seed: [u8; 32] = hex::decode(std::fs::read_to_string(home.join("validator.key"))?.trim())?.try_into().map_err(|_| anyhow!("bad validator.key"))?;
             let keys = Keys::from_seed(seed);
-            let addrs: NodeAddrs = match g.validators.iter().find(|v| v.address == keys.address()) {
+            let addrs: NodeAddrs = match g.validators.iter().find(|v| v.address == keys.address_with(&g.address_prefix)) {
                 Some(v) => NodeAddrs { p2p_addr: v.p2p_addr.clone(), http_addr: v.http_addr.clone() },
                 None => serde_json::from_slice(&std::fs::read(home.join("node.json"))?)?,
             };
@@ -236,8 +254,12 @@ pub fn run(cmd: ValidatorCmd) -> Result<()> {
 
 fn admin(a: AdminArgs, action: impl FnOnce(String) -> Action) -> Result<()> {
     let keys = load_seed(&a.key)?;
-    let from = a.from.unwrap_or_else(|| keys.address());
-    let tx = rt()?.block_on(send(&a.rpc, &keys, &from, action(a.validator)))?;
+    let rt = rt()?;
+    let from = match a.from {
+        Some(f) => f,
+        None => rt.block_on(own_address(&a.rpc, &keys))?,
+    };
+    let tx = rt.block_on(send(&a.rpc, &keys, &from, action(a.validator)))?;
     println!("✓ {}", tx["summary"].as_str().unwrap_or_default());
     Ok(())
 }
@@ -306,8 +328,10 @@ pub fn wallet(cmd: WalletCmd, dir: &Path) -> Result<()> {
         }
         WalletCmd::Balance { rpc } => {
             let keys = wallet_keys(dir)?;
-            let a = rt()?.block_on(get(&rpc, &format!("/account/{}", keys.address())))?;
-            println!("{}  {}", keys.address(), a["balance_display"].as_str().unwrap_or("0 FANG"));
+            let rt = rt()?;
+            let me = rt.block_on(own_address(&rpc, &keys))?;
+            let a = rt.block_on(get(&rpc, &format!("/account/{me}")))?;
+            println!("{me}  {}", a["balance_display"].as_str().unwrap_or("0 FANG"));
             Ok(())
         }
         WalletCmd::Send { to, amount, memo, rpc } => {
@@ -316,13 +340,16 @@ pub fn wallet(cmd: WalletCmd, dir: &Path) -> Result<()> {
             let rt = rt()?;
             // Resolve names locally so we sign the exact recipient address.
             let to = if crate::crypto::is_address(&to) { to } else { rt.block_on(get(&rpc, &format!("/account/{to}")))?["account"]["address"].as_str().ok_or_else(|| anyhow!("can't resolve {to}"))?.to_string() };
-            let tx = rt.block_on(send_memo(&rpc, &keys, &keys.address(), Action::Transfer { to, amount }, memo))?;
+            let me = rt.block_on(own_address(&rpc, &keys))?;
+            let tx = rt.block_on(send_memo(&rpc, &keys, &me, Action::Transfer { to, amount }, memo))?;
             println!("✓ {}", tx["summary"].as_str().unwrap_or_default());
             Ok(())
         }
         WalletCmd::Name { name, rpc } => {
             let keys = wallet_keys(dir)?;
-            let tx = rt()?.block_on(send(&rpc, &keys, &keys.address(), Action::RegisterName { name }))?;
+            let rt = rt()?;
+            let me = rt.block_on(own_address(&rpc, &keys))?;
+            let tx = rt.block_on(send(&rpc, &keys, &me, Action::RegisterName { name }))?;
             println!("✓ {}", tx["summary"].as_str().unwrap_or_default());
             Ok(())
         }
@@ -330,7 +357,8 @@ pub fn wallet(cmd: WalletCmd, dir: &Path) -> Result<()> {
             let keys = wallet_keys(dir)?;
             let rt = rt()?;
             let res = rt.block_on(async {
-                let res = reqwest::Client::new().post(format!("{}/api/faucet", rpc.trim_end_matches('/'))).json(&serde_json::json!({ "to": keys.address() })).send().await?;
+                let me = own_address(&rpc, &keys).await?;
+                let res = reqwest::Client::new().post(format!("{}/api/faucet", rpc.trim_end_matches('/'))).json(&serde_json::json!({ "to": me })).send().await?;
                 let ok = res.status().is_success();
                 let v: Value = res.json().await?;
                 if !ok {

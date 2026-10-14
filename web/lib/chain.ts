@@ -79,6 +79,9 @@ export function initialPin(net: Network): ChainPin {
 export class PinnedClient extends Client {
   constructor(rpc: string, public pin: ChainPin, private onFirstPin?: (pin: ChainPin) => void) {
     super(rpc);
+    // `Wallet.address` renders with the client's prefix: use the pinned one before the first
+    // status arrives (which still checks it, through `status()` below).
+    if (pin.prefix) this.prefix = pin.prefix;
   }
 
   async status(): Promise<Status> {
