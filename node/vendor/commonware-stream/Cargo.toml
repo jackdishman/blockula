@@ -8,6 +8,8 @@
 # If you are reading this file be aware that the original Cargo.toml
 # will likely look very different (and much more reasonable).
 # See Cargo.toml.orig for the original contents.
+#
+# Blockula: vendored and patched. See VENDORED.md; every change is marked "Blockula:".
 
 [package]
 edition = "2024"
@@ -26,7 +28,7 @@ documentation = "https://docs.rs/commonware-stream"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/commonwarexyz/monorepo/tree/main/stream"
-resolver = "2"
+# Blockula: `resolver = "2"` dropped; the workspace root (node/) sets it.
 
 [lib]
 name = "commonware_stream"
@@ -71,40 +73,52 @@ default-features = false
 
 [dependencies.x25519-dalek]
 version = "3.0.0"
+features = ["zeroize"]
+
+# Blockula: ML-KEM-768 for the hybrid handshake (src/hybrid.rs). Exact pin: the transport's
+# security rests on this crate, so upgrades are reviewed, not picked up by `cargo update`.
+# Default features stay on (`alloc` boxes the expanded keys); `zeroize` wipes them on drop.
+[dependencies.ml-kem]
+version = "=0.3.2"
+features = ["zeroize"]
 
 [dependencies.zeroize]
 version = "1.9.0"
 
-[dev-dependencies.criterion]
-version = "0.8.2"
-
 [dev-dependencies.rand]
 version = "0.10.2"
 default-features = false
+
+# Blockula: hybrid handshake tests (ML-DSA test signer, KAT fixture, ML-KEM vectors).
+[dev-dependencies.blake3]
+version = "1.8"
+
+[dev-dependencies.bytes]
+version = "1"
+
+[dev-dependencies.commonware-math]
+version = "2026.9.0"
+
+[dev-dependencies.hex]
+version = "0.4"
+
+[dev-dependencies.ml-dsa]
+version = "0.1.1"
+
+[dev-dependencies.serde_json]
+version = "1"
+
+# Differential ML-KEM oracle; aws-lc-rs is already in the tree on these targets (commonware's AEAD).
+[target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dev-dependencies.aws-lc-rs]
+version = "1.18"
 
 [target.'cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies.chacha20poly1305]
 version = "0.11.0"
 features = ["getrandom"]
 default-features = false
 
-[lints.clippy]
-disallowed_macros = "deny"
-disallowed_methods = "deny"
-disallowed_types = "deny"
-large_futures = "warn"
-missing-const-for-fn = "warn"
-option-if-let-else = "warn"
-redundant-clone = "warn"
-suspicious_op_assign_impl = "allow"
-undocumented_unsafe_blocks = "deny"
-unused-async = "warn"
-use-self = "warn"
-
-[lints.rust]
-rust-2018-idioms = "deny"
-unused-must-use = "deny"
-warnings = "deny"
-
+# Blockula: the upstream `[lints.clippy]` and `[lints.rust]` deny tables are dropped. Path
+# dependencies aren't lint-capped, so `warnings = "deny"` would break our build on a newer rustc.
 [lints.rust.unexpected_cfgs]
 level = "warn"
 priority = 0

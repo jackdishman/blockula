@@ -48,3 +48,14 @@ overflow-checks = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+
+# The vendored stream crate is a member only so its tests run against this lockfile:
+# `cargo test --manifest-path node/Cargo.toml -p commonware-stream`. Plain `cargo test` and
+# `cargo build` still act on `blockula` alone.
+[workspace]
+members = ["vendor/commonware-stream"]
+exclude = ["fuzz"]
+
+# p2p key exchange: hybrid X25519 + ML-KEM-768 instead of X25519 alone (docs/PQ-TRANSPORT.md).
+[patch.crates-io]
+commonware-stream = { path = "vendor/commonware-stream" }

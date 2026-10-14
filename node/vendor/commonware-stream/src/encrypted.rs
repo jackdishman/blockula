@@ -4,7 +4,8 @@
 //!
 //! ## Handshake
 //!
-//! c.f. [commonware_cryptography::handshake]. One difference here is that the listener does not
+//! c.f. [crate::hybrid] (Blockula: a hybrid X25519 + ML-KEM-768 variant of
+//! [commonware_cryptography::handshake]). One difference here is that the listener does not
 //! know the dialer's public key in advance. Instead, the dialer tells the listener its public key
 //! in the first message. The listener has an opportunity to reject the connection if it does not
 //! wish to connect ([listen] takes in an arbitrary function to implement this).
@@ -12,8 +13,8 @@
 //! ## Encryption
 //!
 //! All traffic is encrypted using ChaCha20-Poly1305. A shared secret is established using an
-//! ephemeral X25519 Diffie-Hellman key exchange. This secret, combined with the handshake
-//! transcript, is used to derive keys for both the handshake's key confirmation messages and
+//! ephemeral hybrid key exchange: X25519 Diffie-Hellman and ML-KEM-768 (Blockula; upstream uses
+//! X25519 alone). Both secrets, combined with the handshake transcript, are used to derive keys for both the handshake's key confirmation messages and
 //! the post-handshake data traffic. Binding the derived keys to the handshake transcript prevents
 //! man-in-the-middle and transcript substitution attacks.
 //!
@@ -41,9 +42,11 @@
 //!   signatures.
 //! - **Forward Secrecy**: Ephemeral encryption keys ensure that any compromise of long-term static keys
 //!   doesn't expose the contents of previous sessions.
-//! - **Session Uniqueness**: A listener's [commonware_cryptography::handshake::SynAck] is bound to the dialer's [commonware_cryptography::handshake::Syn] message and
-//!   [commonware_cryptography::handshake::Ack]s are bound to the complete handshake transcript, preventing replay attacks and ensuring
+//! - **Session Uniqueness**: A listener's [crate::hybrid::SynAck] is bound to the dialer's [crate::hybrid::Syn] message and
+//!   [crate::hybrid::Ack]s are bound to the complete handshake transcript, preventing replay attacks and ensuring
 //!   message integrity.
+//! - **Post-Quantum Confidentiality** (Blockula): session keys stay secret as long as either X25519
+//!   or ML-KEM-768 holds, so recorded traffic can't be decrypted later with a quantum computer.
 //! - **Handshake Timeout**: A configurable deadline is enforced for handshake completion to protect
 //!   against malicious peers that create connections but abandon handshakes.
 //!
@@ -57,12 +60,12 @@
 
 use crate::utils::codec::{append_frame, framed_len, recv_frame, send_frame};
 use commonware_codec::{DecodeExt, Encode as _, Error as CodecError, FixedSize};
+// Blockula: the handshake messages and state machine come from the hybrid module; the AEAD and
+// error types are still commonware-cryptography's.
+use crate::hybrid::{Ack, Context, Syn, SynAck, dial_end, dial_start, listen_end, listen_start};
 use commonware_cryptography::{
     Signer,
-    handshake::{
-        self, Ack, Context, Error as HandshakeError, RecvCipher, SendCipher, Syn, SynAck, dial_end,
-        dial_start, listen_end, listen_start,
-    },
+    handshake::{self, Error as HandshakeError, RecvCipher, SendCipher},
 };
 use commonware_formatting::hex;
 use commonware_macros::select;
