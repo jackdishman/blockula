@@ -5,8 +5,7 @@
 # Local run: `cargo install cargo-deny --locked`, then the command above.
 
 [graph]
-# The targets we ship (release.yml) plus the dev machines that build them. Windows-only crates
-# don't count against us.
+# The targets we ship (release.yml). Windows-only crates don't count against us.
 targets = [
   "x86_64-unknown-linux-gnu",
   "aarch64-unknown-linux-gnu",
