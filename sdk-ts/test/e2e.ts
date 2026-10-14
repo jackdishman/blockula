@@ -2,13 +2,69 @@
 // Proves TS-signed ML-DSA transactions verify in the Rust node.
 import assert from "node:assert/strict";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
-import { randomBytes } from "@noble/hashes/utils.js";
-import { Client, POP_CONTEXT, Wallet, addressFromPublicKey, formatFang, minFee, parseFang, parseSoul, popMessage, seanceCommitment } from "../src/index.js";
+import { blake3 } from "@noble/hashes/blake3.js";
+import { bytesToHex, randomBytes } from "@noble/hashes/utils.js";
+import { ApiError, Client, POP_CONTEXT, Wallet, addressFromPublicKey, addressPrefix, formatFang, isAddress, minFee, parseFang, parseSoul, popMessage, seanceCommitment, signingBytes, txBytes, txCharge, txId, txSize, type Action, type Tx } from "../src/index.js";
 
 const client = new Client(process.env.BLOCKULA_RPC ?? "http://localhost:7070");
 
 assert.equal(parseFang("1.5"), 1_500_000_000n);
 assert.equal(formatFang(1_500_000_000n), "1.5 FANG");
+
+// Shared vectors: node/src/types.rs `encodings_match_the_sdk` asserts the same hashes.
+// One action per tag (0–29), in tag order (`vector_actions` there).
+const vectorActions: Action[] = [
+  { type: "transfer", to: "x.boo", amount: "5" },
+  { type: "register_name", name: "vlad" },
+  { type: "add_key", key_id: "ab".repeat(32), label: "phone", role: { type: "owner" } },
+  { type: "add_key", key_id: "cd".repeat(32), label: "claude", role: { type: "session", limit: "10", period_blocks: 100, expires_at: 1000 } },
+  { type: "remove_key", key_id: "ab".repeat(32) },
+  { type: "register_validator", consensus_key: "0a", p2p_addr: "1.2.3.4:5", http_addr: "https://v.example", bond: "50", pop: "0b" },
+  { type: "approve_validator", validator: "boo1v" },
+  { type: "remove_validator", validator: "boo1v" },
+  { type: "unbond", validator: "boo1v" },
+  { type: "link_github", handle: "vlad", gist_id: "abc123" },
+  { type: "unlink_github", handle: "vlad" },
+  { type: "create_hunt", repo: "a/b", issue: 3, amount: "10", expires_at: 500, title: "t" },
+  { type: "fund_hunt", hunt_id: 1, amount: "2" },
+  { type: "award_hunt", hunt_id: 1, to: "x.boo", pr: 4, familiar_key: "ef".repeat(32) },
+  { type: "award_hunt", hunt_id: 1, to: "x.boo", pr: 4 },
+  { type: "cancel_hunt", hunt_id: 1 },
+  { type: "register_familiar", key_id: "cd".repeat(32), label: "claude" },
+  { type: "set_repo", repo: "a/b", weight: 10 },
+  { type: "grant_soul", to: "x.boo", amount: 2500, reason: "r" },
+  { type: "vouch", account: "x.boo" },
+  { type: "unvouch", account: "x.boo" },
+  { type: "flag_sybil", account: "x.boo", reason: "r" },
+  { type: "submit_claim", repo: "a/b", pr: 9, familiar_key: "ab".repeat(32) },
+  { type: "submit_claim", repo: "a/b", pr: 9 },
+  { type: "attest_claim", claim_id: 4, ok: true, merge_sha: "cd".repeat(20), note: "" },
+  { type: "reject_claim", claim_id: 4, reason: "r" },
+  { type: "join_jury", bond: (10n * 1_000_000_000n).toString() },
+  { type: "leave_jury" },
+  { type: "commit_votes", seance_id: 2, commitment: "ef".repeat(32) },
+  { type: "reveal_votes", seance_id: 2, votes: "ab=", spam: [5, 6], salt: "s" },
+  { type: "fund_pool", amount: "5" },
+  { type: "withdraw_vested" },
+  { type: "clawback", account: "x.boo", reason: "r" },
+];
+const vectorTx = (action: Action): Tx => ({ chain_id: "vec", from: "boo1from", nonce: 7, fee: "12345", tip: "3", valid_until: 99, action, memo: "m", public_key: "01".repeat(1952), signature: "02".repeat(3309) });
+const all = vectorActions.map((a) => signingBytes(vectorTx(a)));
+const joined = new Uint8Array(all.reduce((n, b) => n + b.length, 0));
+all.reduce((at, b) => (joined.set(b, at), at + b.length), 0);
+assert.equal(bytesToHex(blake3(joined)), "67416fa0f99281aa382895815bea59d2a43b40f6865c500e4cb80611d8754875");
+const vt = vectorTx(vectorActions[0]);
+assert.equal(bytesToHex(blake3(txBytes(vt))), "f32398f98b16d95d4f68af7ee29524a274d5465476390d91b357633627712e39");
+assert.equal(txBytes(vt).length, txSize(vt));
+assert.equal(txId(vt), "0a787dbaf66a3f5a3df1609272c68f5229397c418010ecd8453b1e7c7ff6617d");
+assert.equal(txCharge(vt), minFee(vt) + 3n);
+// Addresses: any known prefix is an address; `isAddress(s, prefix)` asks for one.
+const someKey = ml_dsa65.keygen(new Uint8Array(32).fill(4)).publicKey;
+const [mainAddr, testAddr] = [addressFromPublicKey(someKey), addressFromPublicKey(someKey, "tboo")];
+assert.ok(testAddr.startsWith("tboo1") && isAddress(testAddr) && isAddress(mainAddr, "boo") && !isAddress(testAddr, "boo"));
+assert.equal(addressPrefix(testAddr), "tboo");
+assert.ok(!isAddress(testAddr.toUpperCase()));
+console.log("✓ shared encoding vectors match the node");
 
 const alice = Wallet.generate(client);
 const bob = Wallet.generate(client);
@@ -29,8 +85,27 @@ assert.equal(viaName.account.address, alice.address);
 
 const bobTx = await bob.send(`${name}.boo`, "2");
 assert.equal(await bob.balance(), formatFang(parseFang("10.5") - BigInt(bobTx.fee)));
-assert.equal(BigInt(bobTx.fee), minFee({ chain_id: (await client.status()).chain_id, from: bob.address, nonce: 0, fee: "0", action: bobTx.action, memo: "" }));
+assert.equal(BigInt(bobTx.fee), minFee({ chain_id: (await client.status()).chain_id, from: bob.address, nonce: 0, fee: "0", valid_until: bobTx.valid_until, action: bobTx.action, memo: "" }));
+assert.equal(await client.addressPrefix(), "boo");
 console.log("✓", bobTx.summary);
+
+// Tips: paid on top of the base fee (which is burned), and the fee covers exactly both.
+const tipped = await alice.send(bob.address, "1", { tip: "0.001" });
+assert.equal(tipped.tip, "1000000");
+assert.equal(BigInt(tipped.fee), BigInt(tipped.max_fee));
+console.log("✓ tipped 0.001 FANG:", tipped.fee_display, "charged");
+
+// Expiry: a tx past `valid_until` can never execute, and one too far ahead isn't accepted.
+const { public_key: _pk, signature: _sig, ...unsigned } = await alice.build({ type: "transfer", to: bob.address, amount: "1" });
+const height = (await client.status()).height;
+await assert.rejects(client.submit(alice.sign({ ...unsigned, valid_until: height })), /expired at block/);
+await assert.rejects(client.submit(alice.sign({ ...unsigned, valid_until: height + 100_000 })), /too far ahead/);
+await assert.rejects(alice.send(bob.address, "1", { validForBlocks: 100_000 }), /at most/);
+// The node checks address prefixes, and JSON with unknown fields is refused.
+await assert.rejects(alice.send(testAddr, "1"), /tboo \(testnet\) address/);
+const extra = { ...(await alice.build({ type: "transfer", to: bob.address, amount: "1" })), padding: "x".repeat(100) };
+await assert.rejects(client.submit(extra as Tx), (e: unknown) => e instanceof ApiError && e.status === 422);
+console.log("✓ validity windows, prefixes and strict JSON enforced");
 
 // Account abstraction: alice lets an agent key spend up to 5 FANG per 100 blocks from her account.
 const agent = Wallet.generate(client);

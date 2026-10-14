@@ -1,10 +1,10 @@
 // Canonical transaction encoding. Must stay byte-identical to node/src/types.rs `Tx::signing_bytes`.
 import { blake3 } from "@noble/hashes/blake3.js";
-import { bytesToHex } from "@noble/hashes/utils.js";
+import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
 
 export type KeyRole =
   | { type: "owner" }
-  /** Transfers only, at most `limit` drops (amount + fee) per `period_blocks`, until block `expires_at`. */
+  /** Transfers only, at most `limit` drops (amount + charged fee) per `period_blocks`, until block `expires_at`. */
   | { type: "session"; limit: string; period_blocks: number; expires_at: number };
 
 export type Action =
@@ -63,7 +63,12 @@ export interface UnsignedTx {
   /** The account acting; the signing key must be authorized on it. */
   from: string;
   nonce: number;
+  /** The most the sender will pay, in drops. The tx is charged `minFee + tip` (see `txCharge`). */
   fee: string;
+  /** Drops paid to the block's proposer on top of the burned base fee (default "0"). Blocks take the highest tip per byte first. */
+  tip?: string;
+  /** Last block height at which the tx may execute (at most an hour of blocks ahead). After it, the tx can never execute. */
+  valid_until: number;
   action: Action;
   memo: string;
 }
@@ -85,18 +90,25 @@ class Writer {
   u8(n: number) { this.parts.push(n & 0xff); }
   u16(n: number) { this.u8(n); this.u8(n >> 8); }
   u64(n: bigint) { for (let i = 0n; i < 8n; i++) this.u8(Number((n >> (8n * i)) & 0xffn)); }
-  str(s: string) { const b = utf8.encode(s); this.u16(b.length); this.bytes(b); }
+  str(s: string) {
+    const b = utf8.encode(s);
+    if (b.length > 0xffff) throw new Error("string field too long to encode");
+    this.u16(b.length);
+    this.bytes(b);
+  }
   ids(xs: number[]) { this.u16(xs.length); for (const x of xs) this.u64(BigInt(x)); }
   done() { return Uint8Array.from(this.parts); }
 }
 
 export function signingBytes(tx: UnsignedTx): Uint8Array {
   const w = new Writer();
-  w.bytes(utf8.encode("BLOCKULA_TX_V2"));
+  w.bytes(utf8.encode("BLOCKULA_TX_V3"));
   w.str(tx.chain_id);
   w.str(tx.from);
   w.u64(BigInt(tx.nonce));
   w.u64(BigInt(tx.fee));
+  w.u64(BigInt(tx.tip ?? "0"));
+  w.u64(BigInt(tx.valid_until));
   const a = tx.action;
   switch (a.type) {
     case "transfer":
@@ -230,10 +242,39 @@ export function popMessage(chainId: string, owner: string, p2pAddr: string, http
   return w.done();
 }
 
+/** Wire size in bytes (node/src/types.rs `Tx::size`): signing bytes plus the key and signature. Fees are priced on it. */
+export function txSize(tx: UnsignedTx): number {
+  return signingBytes(tx).length + PUBLIC_KEY_LEN + SIGNATURE_LEN;
+}
+
 /** Mirrors `min_fee` in node/src/types.rs: base fee is priced per byte and burned. */
 export function minFee(tx: UnsignedTx): bigint {
-  const size = signingBytes(tx).length + PUBLIC_KEY_LEN + SIGNATURE_LEN;
-  return 10_000n + BigInt(size) * 10n;
+  return 10_000n + BigInt(txSize(tx)) * 10n;
+}
+
+/** What the tx is charged (node/src/types.rs `Tx::charge`): `minFee + tip`. Its `fee` must cover it; nothing more is debited. */
+export function txCharge(tx: UnsignedTx): bigint {
+  return minFee(tx) + BigInt(tx.tip ?? "0");
+}
+
+/** Wire form (node/src/types.rs `Tx::to_bytes`): signing bytes ‖ public key (1,952 B) ‖ signature (3,309 B). Blocks and gossip carry this. */
+export function txBytes(tx: Tx): Uint8Array {
+  const sb = signingBytes(tx);
+  const out = new Uint8Array(sb.length + PUBLIC_KEY_LEN + SIGNATURE_LEN);
+  out.set(sb);
+  out.set(hexToBytes(tx.public_key), sb.length);
+  out.set(hexToBytes(tx.signature), sb.length + PUBLIC_KEY_LEN);
+  return out;
+}
+
+/** A tx's id (node/src/types.rs `Tx::id`): hex BLAKE3 of the signing bytes and the signature. Known before submitting. */
+export function txId(tx: Tx): string {
+  const sb = signingBytes(tx);
+  const sig = hexToBytes(tx.signature);
+  const buf = new Uint8Array(sb.length + sig.length);
+  buf.set(sb);
+  buf.set(sig, sb.length);
+  return bytesToHex(blake3(buf));
 }
 
 /** "1.5" → 1500000000n drops. Accepts numbers, decimal strings or bigint drops. */
