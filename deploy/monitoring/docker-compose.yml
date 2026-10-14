@@ -1,0 +1,70 @@
+# Reference monitoring for one Blockula validator host: Prometheus, Alertmanager, Grafana and
+# node_exporter. See README.md. Everything listens on 127.0.0.1 only (host networking, Linux):
+# reach Grafana through an SSH tunnel, never a public port.
+#   docker compose -f deploy/monitoring/docker-compose.yml up -d
+# Images are pinned by digest (scripts/check-pins.sh); Dependabot proposes digest bumps.
+name: blockula-monitoring
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+    network_mode: host
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --web.listen-address=127.0.0.1:9090
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+      - prometheus:/prometheus
+
+  alertmanager:
+    image: prom/alertmanager:v0.34.1@sha256:e9733bafb1bdef9b00e25a21f8f99dc26a22224bf16641ad754d1649f4c3357a
+    network_mode: host
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --web.listen-address=127.0.0.1:9093
+      - --cluster.listen-address= # no gossip port: a single Alertmanager
+    volumes:
+      - ./alertmanager:/etc/alertmanager:ro
+      - alertmanager:/alertmanager
+
+  grafana:
+    image: grafana/grafana:13.2.4@sha256:dbbc38ea21103cefb50396340cd88afec779c7e070b0a7bf5a75b4ce46651d3f
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      GF_SERVER_HTTP_ADDR: 127.0.0.1
+      GF_SERVER_HTTP_PORT: "3000"
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in deploy/monitoring/.env}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # A validator host makes no calls home and installs no plugins at startup.
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana:/var/lib/grafana
+
+  node-exporter:
+    image: prom/node-exporter:v1.12.1@sha256:1b4e4438faca4dd7e001dd445d161a4a2091b0fededa84093b3a8dfeae1f1be0
+    network_mode: host
+    pid: host
+    restart: unless-stopped
+    command:
+      - --path.rootfs=/host
+      - --web.listen-address=127.0.0.1:9100
+      # timex (clock offset and sync state) is on by default; it's what the clock-skew alert uses.
+    volumes:
+      - /:/host:ro,rslave
+
+volumes:
+  prometheus:
+  alertmanager:
+  grafana:

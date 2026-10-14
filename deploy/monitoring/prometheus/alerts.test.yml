@@ -1,0 +1,211 @@
+# Unit tests for alerts.yml: `promtool test rules alerts.test.yml` (deploy/monitoring/check.sh).
+rule_files: [alerts.yml]
+evaluation_interval: 1m
+
+tests:
+  # A node's head goes stale while another stays fresh: HeadStale for that node, no ChainHalted.
+  - interval: 1m
+    input_series:
+      - series: 'blockula_head_age_seconds{job="blockula",instance="a",node="v1"}'
+        values: "1 1 30 30 30 30"
+      - series: 'blockula_head_age_seconds{job="blockula",instance="b",node="v2"}'
+        values: "1 1 1 1 1 1"
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: BlockulaHeadStale
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: BlockulaHeadStale
+        exp_alerts:
+          - exp_labels: { severity: warning, job: blockula, instance: a, node: v1 }
+            exp_annotations:
+              summary: "v1: no new block executed for 30s"
+              runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#head-stale
+      - eval_time: 5m
+        alertname: BlockulaChainHalted
+        exp_alerts: []
+
+  # Every node is stale: the chain is halted.
+  - interval: 1m
+    input_series:
+      - series: 'blockula_head_age_seconds{job="blockula",instance="a",node="v1"}'
+        values: "1 90 150 210"
+      - series: 'blockula_head_age_seconds{job="blockula",instance="b",node="v2"}'
+        values: "1 70 130 190"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: BlockulaChainHalted
+        exp_alerts:
+          - exp_labels: { severity: critical }
+            exp_annotations:
+              summary: "Chain halted: the freshest node's head is 3m 10s old"
+              runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#chain-halted
+
+  # Execution falls behind finality: warning past 8 blocks, critical past MAX_EXEC_LAG.
+  - interval: 1m
+    input_series:
+      - series: 'blockula_finalized_lag{job="blockula",instance="a",node="v1"}'
+        values: "0 10 10 10 20 20 20"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: BlockulaExecutionLagging
+        exp_alerts:
+          - exp_labels: { severity: warning, job: blockula, instance: a, node: v1 }
+            exp_annotations:
+              summary: "v1: execution is 10 blocks behind finality"
+              runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#execution-lagging
+      - eval_time: 3m
+        alertname: BlockulaExecutionPastMaxLag
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: BlockulaExecutionPastMaxLag
+        exp_alerts:
+          - exp_labels: { severity: critical, job: blockula, instance: a, node: v1 }
+            exp_annotations:
+              summary: "v1: execution is 20 blocks behind finality (max 16)"
+              runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#execution-lagging
+
+  - interval: 1m
+    input_series:
+      - series: 'blockula_mempool_size{job="blockula",instance="a",node="v1"}'
+        values: "100 4500x10"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: BlockulaMempoolNearCap
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: BlockulaMempoolNearCap
+        exp_alerts:
+          - exp_labels: { severity: warning, job: blockula, instance: a, node: v1 }
+            exp_annotations:
+              summary: "v1: mempool at 4500 of 5000; new txs are refused when full"
+              runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#mempool-full
+
+  # A restart: counters reset and the height drops while the node replays.
+  - interval: 1m
+    input_series:
+      - series: 'blockula_height{job="blockula",instance="a",node="v1"}'
+        values: "100 160 220 280 3 60 120"
+      - series: 'blockula_tx_submitted_total{job="blockula",instance="a",node="v1"}'
+        values: "5 6 7 8 0 0 0"
+      - series: 'blockula_tx_rejected_total{job="blockula",instance="a",node="v1"}'
+        values: "0 0 0 0 0 0 0"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: BlockulaRestarted
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: BlockulaRestarted
+        exp_alerts:
+          - exp_labels: { severity: warning, job: blockula, instance: a, node: v1 }
+            exp_annotations:
+              summary: "v1: the node restarted in the last 15 minutes"
+              runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#restarts
+
+  # 4 validators need 3 signatures; 2 is below quorum. NaN means no recent certificate.
+  - interval: 1m
+    input_series:
+      - series: 'blockula_active_validators{job="blockula",instance="a",node="v1"}'
+        values: "4x6"
+      - series: 'blockula_validators_online{job="blockula",instance="a",node="v1"}'
+        values: "3 3 2 2 2 2 2"
+      - series: 'blockula_active_validators{job="blockula",instance="b",node="v2"}'
+        values: "32x6"
+      - series: 'blockula_validators_online{job="blockula",instance="b",node="v2"}'
+        values: "22 NaN NaN NaN NaN NaN NaN"
+    promql_expr_test:
+      - expr: blockula:quorum
+        eval_time: 0m
+        exp_samples:
+          - labels: 'blockula:quorum{job="blockula",instance="a",node="v1"}'
+            value: 3
+          - labels: 'blockula:quorum{job="blockula",instance="b",node="v2"}'
+            value: 22
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: BlockulaCertificateBelowQuorum
+        exp_alerts:
+          - exp_labels: { severity: critical, job: blockula, instance: a, node: v1 }
+            exp_annotations:
+              summary: "v1: newest certificate has 2 signers, below quorum for its active set"
+              runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#validator-set
+      - eval_time: 6m
+        alertname: BlockulaNoRecentCertificate
+        exp_alerts:
+          - exp_labels: { severity: warning, job: blockula, instance: b, node: v2 }
+            exp_annotations:
+              summary: "v2: no recent finalization certificate (cut off from validators, or still syncing)"
+              runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#validator-set
+
+  # Clock skew: 150 ms warns, 300 ms is critical.
+  - interval: 1m
+    input_series:
+      - series: 'node_timex_offset_seconds{job="node",instance="a",node="v1"}'
+        values: "0.001 0.15x10"
+      - series: 'node_timex_offset_seconds{job="node",instance="b",node="v2"}'
+        values: "0.001 -0.3x10"
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: HostClockSkew
+        exp_alerts:
+          - exp_labels: { severity: warning, job: node, instance: a, node: v1 }
+            exp_annotations:
+              summary: "v1: clock off by 150ms"
+              runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#time
+          - exp_labels: { severity: warning, job: node, instance: b, node: v2 }
+            exp_annotations:
+              summary: "v2: clock off by 300ms"
+              runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#time
+      - eval_time: 7m
+        alertname: HostClockSkewCritical
+        exp_alerts:
+          - exp_labels: { severity: critical, job: node, instance: b, node: v2 }
+            exp_annotations:
+              summary: "v2: clock off by 300ms"
+              runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#time
+
+  # The data volume passes 80%; tmpfs is ignored.
+  - interval: 1m
+    input_series:
+      - series: 'node_filesystem_avail_bytes{job="node",instance="a",node="v1",mountpoint="/data",fstype="ext4"}'
+        values: "50x5 15x15"
+      - series: 'node_filesystem_size_bytes{job="node",instance="a",node="v1",mountpoint="/data",fstype="ext4"}'
+        values: "100x20"
+      - series: 'node_filesystem_avail_bytes{job="node",instance="a",node="v1",mountpoint="/run",fstype="tmpfs"}'
+        values: "1x20"
+      - series: 'node_filesystem_size_bytes{job="node",instance="a",node="v1",mountpoint="/run",fstype="tmpfs"}'
+        values: "100x20"
+    alert_rule_test:
+      - eval_time: 17m
+        alertname: HostDiskAlmostFull
+        exp_alerts:
+          - exp_labels: { severity: warning, job: node, instance: a, node: v1, mountpoint: /data, fstype: ext4 }
+            exp_annotations:
+              summary: "v1: /data is 85% full"
+              runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#disk
+
+  - interval: 1m
+    input_series:
+      - series: 'node_memory_MemAvailable_bytes{job="node",instance="a",node="v1"}'
+        values: "8x5 1x15"
+      - series: 'node_memory_MemTotal_bytes{job="node",instance="a",node="v1"}'
+        values: "16x20"
+    alert_rule_test:
+      - eval_time: 17m
+        alertname: HostMemoryLow
+        exp_alerts:
+          - exp_labels: { severity: warning, job: node, instance: a, node: v1 }
+            exp_annotations:
+              summary: "v1: only 6.25% of memory available"
+              runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#memory
+
+  - interval: 1m
+    input_series: []
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: Watchdog
+        exp_alerts:
+          - exp_labels: { severity: none }
+            exp_annotations:
+              summary: "Heartbeat: the alerting pipeline works"
+              runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#monitoring
