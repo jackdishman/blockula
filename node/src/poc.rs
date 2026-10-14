@@ -7,16 +7,18 @@
 //! Séance → jurors compare pairs of claims ("which mattered more?"), commit, then reveal → the
 //! Séance closes: scores, Soul, rewards (vesting) and bonds are settled.
 //!
-//! Everything here is deterministic integer math over `BTreeMap`s; the open/close of Séances runs
+//! Everything here is deterministic integer math over ordered maps; the open/close of Séances runs
 //! in `end_block`, after a block's txs, on every node. The constants below (and the default
 //! timings) are consensus rules: changing one changes every chain that uses it.
 
 use crate::chain::{short, Journal, State};
 use crate::crypto;
+use crate::state::{JMap, TMap};
 use crate::types::*;
 use anyhow::{anyhow, bail, Result};
+use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Soul is counted in milli-Soul.
 pub const SOUL: u64 = 1_000;
@@ -75,7 +77,7 @@ pub fn fmt_soul(milli: u64) -> String {
 }
 
 /// Timings, in blocks. From genesis (`contribution`), or derived from the block time.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct PocTimes {
     /// Length of a Séance: the first two thirds for sealed votes, the rest for reveals.
     pub seance_blocks: u64,
@@ -123,7 +125,7 @@ impl PocTimes {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Soul {
     /// milli-Soul as of height `at`; it decays from there (half-life `soul_half_life_blocks`).
     pub points: u64,
@@ -145,7 +147,7 @@ pub fn decay(points: u64, elapsed: u64, half_life: u64) -> u64 {
     v - (v as u128 * (elapsed % hl) as u128 / (2 * hl as u128)) as u64
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Vouch {
     pub voucher: String,
     #[serde(with = "u64_str")]
@@ -153,14 +155,14 @@ pub struct Vouch {
     pub at: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Sybil {
     pub at: u64,
     pub by: String,
     pub reason: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaimStatus {
     /// Waiting for validators to check GitHub.
@@ -181,7 +183,7 @@ impl ClaimStatus {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Attestation {
     pub ok: bool,
     pub merge_sha: String,
@@ -191,7 +193,7 @@ pub struct Attestation {
     pub note: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Claim {
     pub id: u64,
     pub claimant: String,
@@ -220,7 +222,7 @@ pub struct Claim {
     pub reason: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Juror {
     #[serde(with = "u64_str")]
     pub bond: u64,
@@ -230,7 +232,7 @@ pub struct Juror {
     pub served: u64,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct JurySeat {
     /// Pairs of claim ids to compare, in the order votes refer to them.
     pub pairs: Vec<[u64; 2]>,
@@ -246,7 +248,7 @@ pub struct JurySeat {
     pub soul_delta: i64,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct SeanceResults {
     pub accepted: usize,
     pub below_threshold: usize,
@@ -260,7 +262,7 @@ pub struct SeanceResults {
     pub returned: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Seance {
     pub id: u64,
     pub opened_at: u64,
@@ -278,7 +280,7 @@ pub struct Seance {
     pub results: Option<SeanceResults>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GrantSource {
     Claim { claim_id: u64 },
@@ -288,7 +290,7 @@ pub enum GrantSource {
 }
 
 /// A reward that vests linearly from `start` to `end`. Unvested FANG can be clawed back.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Grant {
     pub id: u64,
     #[serde(with = "u64_str")]
@@ -309,25 +311,24 @@ impl Grant {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default)]
 pub struct Poc {
     /// Lowercase `owner/name` → weight.
-    pub repos: BTreeMap<String, u64>,
-    pub souls: BTreeMap<String, Soul>,
+    pub repos: TMap<String, u64>,
+    pub souls: TMap<String, Soul>,
     /// Vouchee → the vouch.
-    pub vouches: BTreeMap<String, Vouch>,
-    pub sybils: BTreeMap<String, Sybil>,
-    pub claims: BTreeMap<u64, Claim>,
+    pub vouches: TMap<String, Vouch>,
+    pub sybils: TMap<String, Sybil>,
+    pub claims: TMap<u64, Claim>,
     /// `repo#pr` → claim id, so a PR is claimed once (cleared when validators reject it).
-    pub claim_by_pr: BTreeMap<String, u64>,
+    pub claim_by_pr: TMap<String, u64>,
     /// Lowercase GitHub handle → the account its first verified claim credited. A handle's work
     /// is always credited to one account, so relinking it can't split one person's √ payout.
-    #[serde(default)]
-    pub handles: BTreeMap<String, String>,
-    pub jurors: BTreeMap<String, Juror>,
-    pub seances: BTreeMap<u64, Seance>,
+    pub handles: TMap<String, String>,
+    pub jurors: TMap<String, Juror>,
+    pub seances: TMap<u64, Seance>,
     /// Account → grant id → grant.
-    pub grants: BTreeMap<String, BTreeMap<u64, Grant>>,
+    pub grants: TMap<String, BTreeMap<u64, Grant>>,
     pub next_claim_id: u64,
     pub next_seance_id: u64,
     pub next_grant_id: u64,
@@ -339,7 +340,8 @@ pub struct Poc {
 }
 
 impl Poc {
-    /// False on chains that never used it, so their state roots are unchanged.
+    /// False until Proof of Contribution is first used; until then the end-of-block step
+    /// (randomness, Séances) doesn't run.
     pub fn is_active(&self) -> bool {
         !(self.seed.is_empty() && self.repos.is_empty() && self.souls.is_empty() && self.vouches.is_empty() && self.sybils.is_empty() && self.claims.is_empty() && self.jurors.is_empty() && self.grants.is_empty() && self.handles.is_empty())
     }
@@ -350,40 +352,6 @@ impl Poc {
 }
 
 // ------------------------------------------------------------------------------------ journal
-
-/// Old values of touched entries, for rollback (first touch wins).
-pub struct JMap<K, V>(HashMap<K, Option<V>>);
-
-impl<K, V> Default for JMap<K, V> {
-    fn default() -> Self {
-        Self(HashMap::new())
-    }
-}
-
-impl<K: Ord + std::hash::Hash + Clone, V: Clone> JMap<K, V> {
-    fn touch(&mut self, map: &BTreeMap<K, V>, k: &K) {
-        if !self.0.contains_key(k) {
-            self.0.insert(k.clone(), map.get(k).cloned());
-        }
-    }
-    fn absorb(&mut self, other: Self) {
-        for (k, v) in other.0 {
-            self.0.entry(k).or_insert(v);
-        }
-    }
-    fn restore(self, map: &mut BTreeMap<K, V>) {
-        for (k, old) in self.0 {
-            match old {
-                Some(v) => {
-                    map.insert(k, v);
-                }
-                None => {
-                    map.remove(&k);
-                }
-            }
-        }
-    }
-}
 
 type Scalars = (u64, u64, u64, String, Option<u64>, u64);
 
@@ -1498,16 +1466,7 @@ mod scenarios {
 
     /// Every drop is somewhere: balances plus everything held in escrow equals the supply.
     fn conserved(s: &State) {
-        let mut total: u128 = s.accounts.values().map(|a| a.balance as u128).sum();
-        total += s.hunts.values().filter(|h| h.status == crate::chain::HuntStatus::Open).map(|h| h.amount as u128).sum::<u128>();
-        total += s.validators.values().map(|v| v.bond as u128).sum::<u128>();
-        let p = &s.poc;
-        total += p.vouches.values().map(|v| v.bond as u128).sum::<u128>();
-        total += p.jurors.values().map(|r| r.bond as u128).sum::<u128>();
-        total += p.claims.values().map(|c| c.bond as u128).sum::<u128>();
-        total += p.grants.values().flat_map(|g| g.values()).map(|g| (g.amount - g.withdrawn) as u128).sum::<u128>();
-        total += p.seances.values().filter(|x| !x.closed).map(|x| x.budget as u128).sum::<u128>();
-        assert_eq!(total, s.supply as u128, "FANG conserved");
+        s.check_invariants().expect("FANG conserved");
     }
 
     #[test]

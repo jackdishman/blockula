@@ -5,11 +5,11 @@
 //! verifier must have executed C and checked it before voting. So the finalization certificate
 //! of that block (or of any descendant, via hash links) certifies `state_root(C)`.
 //!
-//! Each node writes the state at its latest checkpoints (JSON → zstd → 1 MiB chunks, each
-//! BLAKE3-hashed) and serves a manifest: chunk hashes, the blocks C+1..=F, F's finalization
-//! certificate, and the validator-set history (handoff proofs) needed to check that certificate.
-//! A joining node verifies everything, rebuilds the state, checks its root against the certified
-//! one, executes C+1..=F and carries on syncing.
+//! Each node writes the state at its latest checkpoints (canonical records → zstd → 1 MiB
+//! chunks, each BLAKE3-hashed) and serves a manifest: chunk hashes, the blocks C+1..=F, F's
+//! finalization certificate, and the validator-set history (handoff proofs) needed to check that
+//! certificate. A joining node verifies everything, rebuilds the state and its tree from the
+//! records, checks the root against the certified one, executes C+1..=F and carries on syncing.
 
 use crate::chain::{Chain, Genesis, State};
 use crate::consensus::{self, CBlock};
@@ -20,6 +20,7 @@ use commonware_codec::{Decode, DecodeExt};
 use commonware_consensus::simplex::types::Finalization;
 use commonware_cryptography::{Digestible, blake3::Digest, certificate::Verifier as _};
 use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 pub const CHECKPOINT_INTERVAL: u64 = 100;
@@ -57,10 +58,74 @@ pub fn dir(home: &Path) -> PathBuf {
     home.join("snapshots")
 }
 
+/// First bytes of an encoded state.
+const STATE_MAGIC: &[u8; 8] = b"BOOSTATE";
+
+/// Writes the state as canonical records: `"BOOSTATE" ‖ schema u32 ‖ count u64`, then per record
+/// `namespace u8 ‖ key_len u32 ‖ key ‖ value_len u32 ‖ value`, little-endian, in canonical order.
+pub fn write_state(state: &State, w: &mut impl Write) -> Result<()> {
+    w.write_all(STATE_MAGIC)?;
+    w.write_all(&crate::state::codec::SCHEMA_VERSION.to_le_bytes())?;
+    w.write_all(&(state.record_count() as u64).to_le_bytes())?;
+    let mut err = Ok(());
+    state.for_each_record(|n, k, v| {
+        if err.is_ok() {
+            err = (|| {
+                w.write_all(&[n])?;
+                w.write_all(&(k.len() as u32).to_le_bytes())?;
+                w.write_all(k)?;
+                w.write_all(&(v.len() as u32).to_le_bytes())?;
+                w.write_all(v)
+            })();
+        }
+    });
+    Ok(err?)
+}
+
+/// The inverse of [`write_state`]: rebuilds the state and its tree from the records (strict:
+/// see `State::from_records`). The caller checks the root.
+pub fn read_state(r: &mut impl Read) -> Result<State> {
+    fn u32_at(r: &mut impl Read) -> Result<u32> {
+        let mut b = [0u8; 4];
+        r.read_exact(&mut b)?;
+        Ok(u32::from_le_bytes(b))
+    }
+    fn bytes(r: &mut impl Read, max: usize) -> Result<Vec<u8>> {
+        let len = u32_at(r)? as usize;
+        if len > max {
+            bail!("record too large ({len} bytes)");
+        }
+        let mut b = vec![0u8; len];
+        r.read_exact(&mut b)?;
+        Ok(b)
+    }
+    let mut head = [0u8; 20];
+    r.read_exact(&mut head).context("state snapshot too short")?;
+    if &head[..8] != STATE_MAGIC {
+        bail!("not a Blockula state snapshot");
+    }
+    let schema = u32::from_le_bytes(head[8..12].try_into().unwrap());
+    if schema != crate::state::codec::SCHEMA_VERSION {
+        bail!("state snapshot schema {schema}, this binary reads {}", crate::state::codec::SCHEMA_VERSION);
+    }
+    let count = u64::from_le_bytes(head[12..20].try_into().unwrap());
+    let records = (0..count).map(|_| {
+        let mut n = [0u8; 1];
+        r.read_exact(&mut n)?;
+        Ok((n[0], bytes(r, crate::state::MAX_KEY_BYTES)?, bytes(r, crate::state::MAX_VALUE_BYTES)?))
+    });
+    let state = State::from_records(records)?;
+    if r.read(&mut [0u8; 1])? != 0 {
+        bail!("trailing bytes after the state records");
+    }
+    Ok(state)
+}
+
 /// Serializes and writes the state at `height` (call from a background thread with a clone).
 pub fn write(home: &Path, height: u64, state_root: &str, state: &State) -> Result<SnapshotMeta> {
-    let json = serde_json::to_vec(state)?;
-    let packed = zstd::encode_all(json.as_slice(), 3)?;
+    let mut enc = zstd::Encoder::new(vec![], 3)?;
+    write_state(state, &mut enc)?;
+    let packed = enc.finish()?;
     let tmp = dir(home).join(format!("{height}.tmp"));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
@@ -201,8 +266,10 @@ pub fn check_chunk(v: &Verified, i: usize, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Rebuilds the state from verified chunks and checks it against the certified root.
-pub fn restore(g: &Genesis, v: &Verified, chunks: &[Vec<u8>]) -> Result<State> {
+/// Rebuilds the state (and its tree) from verified chunks and checks it against the certified
+/// root. The state carries its own parameters, so `_g` isn't needed (the manifest was checked
+/// against it already).
+pub fn restore(_g: &Genesis, v: &Verified, chunks: &[Vec<u8>]) -> Result<State> {
     if chunks.len() != v.chunks.len() {
         bail!("expected {} chunks", v.chunks.len());
     }
@@ -210,20 +277,16 @@ pub fn restore(g: &Genesis, v: &Verified, chunks: &[Vec<u8>]) -> Result<State> {
         check_chunk(v, i, c)?;
     }
     let packed: Vec<u8> = chunks.concat();
-    let state = decode_state(g, &packed)?;
+    let state = decode_state(&packed)?;
     if state.root() != v.state_root {
         bail!("rebuilt state root doesn't match the certified root");
     }
     Ok(state)
 }
 
-pub fn decode_state(g: &Genesis, packed: &[u8]) -> Result<State> {
-    use std::io::Read;
-    let mut json = vec![];
-    zstd::Decoder::new(packed)?.take(MAX_STATE_BYTES).read_to_end(&mut json)?;
-    let mut state: State = serde_json::from_slice(&json)?;
-    state.params = g.params();
-    Ok(state)
+/// Decompresses (up to `MAX_STATE_BYTES`) and decodes a packed snapshot.
+pub fn decode_state(packed: &[u8]) -> Result<State> {
+    read_state(&mut std::io::BufReader::new(zstd::Decoder::new(packed)?.take(MAX_STATE_BYTES)))
 }
 
 /// Fetches, verifies and installs the newest certified snapshot from `peers` into an empty chain.
