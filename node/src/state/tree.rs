@@ -265,7 +265,8 @@ impl NodeStore for NoNodes {
 pub struct Smt {
     root: Child,
     /// Nodes written since the base was last brought up to date (`None`: deleted from the base).
-    overlay: imbl::HashMap<NodeKey, Option<Node>>,
+    /// Boxed so the map's chunks stay small: a write copies the chunk it shares with clones.
+    overlay: imbl::HashMap<NodeKey, Option<Arc<Node>>>,
     base: Arc<dyn NodeStore>,
 }
 
@@ -292,7 +293,7 @@ impl Smt {
 
     /// Node changes not yet in the base store, in key order (`None`: delete).
     pub fn pending_changes(&self) -> Vec<(NodeKey, Option<Node>)> {
-        let mut v: Vec<(NodeKey, Option<Node>)> = self.overlay.iter().map(|(k, n)| (*k, *n)).collect();
+        let mut v: Vec<(NodeKey, Option<Node>)> = self.overlay.iter().map(|(k, n)| (*k, n.as_deref().copied())).collect();
         v.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         v
     }
@@ -305,14 +306,14 @@ impl Smt {
 
     fn node(&self, key: &NodeKey) -> Result<Node> {
         match self.overlay.get(key) {
-            Some(Some(n)) => Ok(*n),
+            Some(Some(n)) => Ok(**n),
             Some(None) => bail!("state tree node {key:?} was deleted"),
             None => self.base.get(key)?.ok_or_else(|| anyhow!("state tree node {key:?} is missing")),
         }
     }
 
     fn put(&mut self, key: NodeKey, node: Node) -> Child {
-        self.overlay.insert(key, Some(node));
+        self.overlay.insert(key, Some(Arc::new(node)));
         Child::Node(node.hash())
     }
 
@@ -544,7 +545,11 @@ mod tests {
         let n = Node([Child::Leaf { key: [1; 32], value: [2; 32] }, Child::Node([3; 32])]);
         assert_eq!(Node::decode(&n.encode()).unwrap(), n);
         assert!(Node::decode(&[n.encode(), vec![0]].concat()).is_err());
+        for c in [Child::Empty, n.0[0], n.0[1]] {
+            assert_eq!(Child::decode(&c.encode()).unwrap(), c);
+        }
         assert!(Child::decode(&[3]).is_err());
+        assert!(Child::decode(&[2, 0]).is_err(), "truncated");
         let k = NodeKey { depth: 9, prefix: with_bit(with_bit(EMPTY, 0), 8) };
         assert_eq!(NodeKey::from_bytes(&k.to_bytes()).unwrap(), k);
         assert!(NodeKey::from_bytes(&[9, 0x80, 0xc0]).is_err(), "bit 9 is past depth 9");

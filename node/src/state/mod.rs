@@ -14,6 +14,10 @@
 //! Mainnet is a new chain: there are no compatibility roots for v0.4 testnet chains, whose
 //! `blocks.jsonl` won't replay under this binary.
 
+// Proofs, record lookups and the persistence hooks are exercised by tests now; `/api/proof` and
+// the redb store (P-STATE-B) are their callers in the node.
+#![cfg_attr(not(test), allow(dead_code))]
+
 pub mod codec;
 pub mod tmap;
 pub mod tree;
@@ -90,7 +94,7 @@ pub trait Table {
     fn encoded(&self, key: &[u8]) -> Option<Vec<u8>>;
     /// Moves the changed keys out as records (in key order), current values encoded.
     fn take_changes(&mut self, namespace: u8, out: &mut Vec<RecordChange>);
-    /// Adds a decoded record (snapshot restore).
+    /// Adds a record the tree already has (snapshot restore). Rejects non-canonical bytes.
     fn load(&mut self, key: &[u8], value: &[u8]) -> Result<()>;
 }
 
@@ -123,8 +127,10 @@ where
     }
 
     fn load(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        let k = K::from_key_bytes(key)?;
-        ensure!(self.insert(k, decode(value)?).is_none(), "duplicate record");
+        let (k, v) = (K::from_key_bytes(key)?, decode::<V>(value)?);
+        // Strict decoding makes these hold already; checked because the tree hashes these bytes.
+        ensure!(k.key_bytes() == key && encode(&v) == value, "non-canonical record encoding");
+        ensure!(self.insert_committed(k, v).is_none(), "duplicate record");
         Ok(())
     }
 }
@@ -268,7 +274,8 @@ impl State {
     pub fn from_records(records: impl IntoIterator<Item = Result<(u8, Vec<u8>, Vec<u8>)>>) -> Result<State> {
         let mut state = State::default();
         let mut last: Option<(u8, Vec<u8>)> = None;
-        let mut scalars = 0;
+        let mut scalars = vec![];
+        let mut leaves = vec![];
         for r in records {
             let (n, key, value) = r?;
             if let Some(prev) = &last {
@@ -276,15 +283,18 @@ impl State {
             }
             if n == ns::META {
                 state.load_meta(&key, &value)?;
-                scalars += 1;
+                scalars.push((key.clone(), value.clone()));
             } else {
                 let Some((_, t)) = state.tables_mut().into_iter().find(|(m, _)| *m == n) else { bail!("unknown record namespace {n}") };
                 t.load(&key, &value)?;
             }
+            leaves.push((tree::key_hash(n, &key), Some(tree::value_hash(&value))));
             last = Some((n, key));
         }
-        ensure!(scalars == state.meta_records().len(), "snapshot is missing scalar records");
-        state.commit_block()?;
+        let expected: Vec<(Vec<u8>, Vec<u8>)> = state.meta_records().into_iter().map(|(k, v)| (k.to_vec(), v)).collect();
+        ensure!(scalars == expected, "missing or non-canonical scalar records");
+        leaves.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        state.tree.update(&leaves)?;
         Ok(state)
     }
 

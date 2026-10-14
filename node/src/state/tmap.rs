@@ -94,6 +94,11 @@ impl<K: Ord + Clone, V: Clone> TMap<K, V> {
         self.map.entry(key)
     }
 
+    /// Inserts a value the state tree already commits to (loading a snapshot): not dirty.
+    pub fn insert_committed(&mut self, key: K, value: V) -> Option<V> {
+        self.map.insert(key, value)
+    }
+
     pub fn is_dirty<Q: Ord + ?Sized>(&self, key: &Q) -> bool
     where
         K: Borrow<Q>,

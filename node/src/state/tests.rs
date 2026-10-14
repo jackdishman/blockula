@@ -316,7 +316,9 @@ fn snapshots_reject_tampering() {
     let mut bytes = vec![];
     crate::snapshot::write_state(&s.c.state, &mut bytes).unwrap();
     let root = s.c.state.root();
-    assert_eq!(crate::snapshot::read_state(&mut bytes.as_slice()).unwrap().root(), root);
+    let mut back = crate::snapshot::read_state(&mut bytes.as_slice()).unwrap();
+    assert_eq!((back.root(), back.full_root()), (root.clone(), s.c.state.root_hash()));
+    assert!(back.commit_block().unwrap().records.is_empty(), "a restored state has nothing to commit");
     // A flipped byte in a value: a different state (or no state at all), never the same root.
     let at = bytes.len() - 5;
     let mut bad = bytes.clone();
@@ -421,8 +423,25 @@ fn bench_million_accounts() {
         times.push(t.elapsed());
         assert_eq!(commit.records.len(), 400);
     }
+    println!("commits of 400 touched records over 1M, per block: {times:?}");
     times.sort();
     println!("commit of 400 touched records over 1M: median {:?}, max {:?}", times[times.len() / 2], times[times.len() - 1]);
+    // The same with a clone of the previous state alive across each commit (an API snapshot),
+    // so every write copies the paths it shares.
+    let mut times = vec![];
+    for block in 20..40 {
+        let _snapshot = st.clone();
+        for i in 0..200 {
+            let (from, to) = (&keys[(block * 400 + 2 * i) % keys.len()], &keys[(block * 400 + 2 * i + 1) % keys.len()]);
+            st.accounts.get_mut(from).unwrap().balance -= 1;
+            st.accounts.get_mut(to).unwrap().balance += 1;
+        }
+        let t = Instant::now();
+        st.commit_block().unwrap();
+        times.push(t.elapsed());
+    }
+    times.sort();
+    println!("same, with a snapshot clone held: median {:?}, max {:?}", times[times.len() / 2], times[times.len() - 1]);
     let key = keys[0].clone();
     let t = Instant::now();
     for _ in 0..1000 {
