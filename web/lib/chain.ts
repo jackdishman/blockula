@@ -1,0 +1,102 @@
+import { Client } from "@blockula/sdk";
+import { KNOWN_GENESIS, NETWORK, type Network } from "./config";
+import type { Status } from "./types";
+
+/** What the node must report: the network's pins, then whatever it reported first (unpinned nodes). */
+export interface ChainPin {
+  chainId?: string;
+  genesisHash?: string;
+  prefix?: string;
+}
+
+type Reported = ChainPin & { chainId: string };
+
+/** The node reported a different chain than the one this wallet is pinned to. */
+export class ChainMismatchError extends Error {
+  constructor(readonly expected: ChainPin, readonly reported: Reported) {
+    super(describe(expected, reported));
+    this.name = "ChainMismatchError";
+  }
+}
+
+const short = (h?: string) => (h ? `${h.slice(0, 8)}…${h.slice(-4)}` : "none");
+
+function describe(e: ChainPin, r: Reported) {
+  if (e.chainId && e.chainId !== r.chainId) return `This node is on chain “${r.chainId}”, not “${e.chainId}”.`;
+  if (e.genesisHash && e.genesisHash !== r.genesisHash) return `This node's “${r.chainId}” starts from genesis ${short(r.genesisHash)}, not ${short(e.genesisHash)}.`;
+  return `This node uses “${r.prefix}1…” addresses, not “${e.prefix}1…”.`;
+}
+
+/** The address prefix a node reports, if it reports one (protocol v1 nodes; DEC-7). */
+const prefixOf = (s: Status) => s.address_prefix ?? s.prefix;
+
+/** Compare a node's status with a pin; null when it matches. */
+export function chainMismatch(pin: ChainPin, s: Status): ChainMismatchError | null {
+  const reported: Reported = { chainId: s.chain_id, genesisHash: s.genesis_hash?.toLowerCase(), prefix: prefixOf(s) };
+  // A known chain id must come with that chain's genesis, whichever network the node claims to be.
+  const want: ChainPin = { ...pin, genesisHash: pin.genesisHash ?? KNOWN_GENESIS[pin.chainId ?? reported.chainId] };
+  const bad =
+    (want.chainId && want.chainId !== reported.chainId) ||
+    (want.genesisHash && want.genesisHash !== reported.genesisHash) ||
+    (want.prefix && reported.prefix && want.prefix !== reported.prefix);
+  return bad ? new ChainMismatchError(want, reported) : null;
+}
+
+const PINS = "blockula.customChain";
+
+/** Custom nodes are trusted on first use: remember the chain they reported, per node URL. */
+export function savedCustomPin(rpc: string): ChainPin | undefined {
+  try {
+    return (JSON.parse(localStorage.getItem(PINS) ?? "{}") as Record<string, ChainPin>)[rpc];
+  } catch {
+    return undefined;
+  }
+}
+
+export function saveCustomPin(rpc: string, pin: ChainPin | null) {
+  try {
+    const all = JSON.parse(localStorage.getItem(PINS) ?? "{}") as Record<string, ChainPin>;
+    if (pin) all[rpc] = pin;
+    else delete all[rpc];
+    localStorage.setItem(PINS, JSON.stringify(all));
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+/** The pin to start from for a network: its configured chain, or a custom node's remembered one. */
+export function initialPin(net: Network): ChainPin {
+  if (net.key === "custom") return (typeof window !== "undefined" && savedCustomPin(net.rpc)) || {};
+  return { chainId: net.chainId, genesisHash: net.genesisHash, prefix: net.prefix };
+}
+
+/**
+ * The SDK client, except every status read must match the pinned chain. `Wallet.build` signs
+ * against the chain id from `status()`, so no tx can be signed for a chain other than the one
+ * the wallet shows. Unpinned fields are pinned from the first status seen, so a node can't
+ * switch chains mid-session either.
+ */
+export class PinnedClient extends Client {
+  constructor(rpc: string, public pin: ChainPin, private onFirstPin?: (pin: ChainPin) => void) {
+    super(rpc);
+  }
+
+  async status(): Promise<Status> {
+    const s = (await super.status()) as Status;
+    const err = chainMismatch(this.pin, s);
+    if (err) throw err;
+    const filled: ChainPin = { chainId: this.pin.chainId ?? s.chain_id, genesisHash: this.pin.genesisHash ?? s.genesis_hash?.toLowerCase(), prefix: this.pin.prefix ?? prefixOf(s) };
+    if (filled.chainId !== this.pin.chainId || filled.genesisHash !== this.pin.genesisHash || filled.prefix !== this.pin.prefix) {
+      this.pin = filled;
+      this.onFirstPin?.(filled);
+    }
+    return s;
+  }
+}
+
+/** The client for the selected network. Custom nodes remember the chain they first reported. */
+export function networkClient() {
+  return new PinnedClient(NETWORK.rpc.replace(/\/$/, ""), initialPin(NETWORK), (pin) => {
+    if (NETWORK.key === "custom") saveCustomPin(NETWORK.rpc, pin);
+  });
+}

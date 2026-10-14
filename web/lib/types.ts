@@ -16,6 +16,10 @@ export interface Status {
   faucet: boolean;
   supply_display: string;
   burned_display: string;
+  genesis_hash?: string;
+  /** bech32m address prefix, on nodes that report it (protocol v1). */
+  address_prefix?: string;
+  prefix?: string;
 }
 
 export interface TxView {
