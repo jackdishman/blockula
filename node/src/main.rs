@@ -96,6 +96,9 @@ enum Cmd {
         /// Blocks contribution rewards vest over (default: ~90 days)
         #[arg(long)]
         vesting_blocks: Option<u64>,
+        /// Address prefix: `boo` (mainnet) or `tboo` (public testnets)
+        #[arg(long, default_value = "boo")]
+        address_prefix: String,
     },
     /// Run a validator (a home with validator.key) or a joined full node
     Run {
@@ -184,7 +187,7 @@ fn main() -> Result<()> {
             }
             node::run_validator(home, net_opts(net, Some(port), Some("local".into()), true))
         }
-        Cmd::Summon { chain_id, home, no_faucet, block_time_ms, validators, admins, epoch_blocks, min_bond, seance_blocks, claim_maturity_blocks, vesting_blocks } => {
+        Cmd::Summon { chain_id, home, no_faucet, block_time_ms, validators, admins, epoch_blocks, min_bond, seance_blocks, claim_maturity_blocks, vesting_blocks, address_prefix } => {
             let home = home.unwrap_or_else(|| blockula_dir().join(&chain_id));
             if home.join("genesis.json").exists() {
                 anyhow::bail!("{} already has a chain", home.display());
@@ -203,6 +206,7 @@ fn main() -> Result<()> {
                     let d = poc::PocTimes::for_block_time(block_time_ms);
                     poc::PocTimes { seance_blocks: seance_blocks.unwrap_or(d.seance_blocks), claim_maturity_blocks: claim_maturity_blocks.unwrap_or(d.claim_maturity_blocks), vesting_blocks: vesting_blocks.unwrap_or(d.vesting_blocks), ..d }
                 }),
+                address_prefix,
             };
             let homes = Chain::summon(&home, &opts)?;
             let g = chain::Genesis::load(&homes[0].join("genesis.json"))?;

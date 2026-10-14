@@ -65,8 +65,8 @@ pub const SYBIL_VOUCHER_SOUL: u64 = 50 * SOUL;
 pub const BOOST_CAP_SOUL: u64 = 100 * SOUL;
 
 /// The contribution pool's system account. Anyone can fund it; only Séances pay out of it.
-pub fn pool_address() -> String {
-    crypto::system_address("contribution-pool")
+pub fn pool_address(prefix: &str) -> String {
+    crypto::system_address(prefix, "contribution-pool")
 }
 
 pub fn fmt_soul(milli: u64) -> String {
@@ -614,7 +614,8 @@ impl State {
     /// Returns `amount` to the pool account.
     fn to_pool(&mut self, j: &mut Journal, amount: u64) {
         if amount > 0 {
-            self.j_credit(j, &pool_address(), amount);
+            let pool = self.pool();
+            self.j_credit(j, &pool, amount);
         }
     }
 
@@ -1152,7 +1153,7 @@ impl State {
         if seats.len() < MIN_JURY {
             return retry(self);
         }
-        let pool_addr = pool_address();
+        let pool_addr = self.pool();
         let budget = (bps(self.account(&pool_addr).balance, SEANCE_POOL_BPS) as u128 * (claims.len() as u64).min(FULL_BUDGET_CLAIMS) as u128 / FULL_BUDGET_CLAIMS as u128) as u64;
         if budget > 0 {
             let _ = self.j_debit(&mut j, &pool_addr, budget);
@@ -1433,7 +1434,7 @@ mod scenarios {
 
     impl T {
         fn tx_as(&mut self, key: &Keys, from: &str, action: Action) -> Result<String> {
-            let mut tx = Tx { chain_id: "poc".into(), nonce: self.c.next_nonce(from), from: from.into(), fee: 0, action, memo: String::new(), public_key: hex::encode(key.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+            let mut tx = Tx { chain_id: "poc".into(), nonce: self.c.next_nonce(from), from: from.into(), fee: 0, tip: 0, valid_until: self.c.height() + 100, action, memo: String::new(), public_key: hex::encode(key.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
             tx.fee = min_fee(tx.size());
             let id = self.c.submit(tx.sign(key))?;
             self.c.produce_block()?;
@@ -1482,7 +1483,7 @@ mod scenarios {
         fn attest_all(&mut self, ids: &[u64]) {
             let me = self.admin.address();
             for id in ids {
-                let mut tx = Tx { chain_id: "poc".into(), nonce: self.c.next_nonce(&me), from: me.clone(), fee: 0, action: Action::AttestClaim { claim_id: *id, ok: true, merge_sha: "cd".repeat(20), note: String::new() }, memo: String::new(), public_key: hex::encode(self.admin.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+                let mut tx = Tx { chain_id: "poc".into(), nonce: self.c.next_nonce(&me), from: me.clone(), fee: 0, tip: 0, valid_until: self.c.height() + 100, action: Action::AttestClaim { claim_id: *id, ok: true, merge_sha: "cd".repeat(20), note: String::new() }, memo: String::new(), public_key: hex::encode(self.admin.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
                 tx.fee = min_fee(tx.size());
                 self.c.submit(tx.sign(&self.admin)).unwrap();
             }
@@ -1546,10 +1547,10 @@ mod scenarios {
         t.tx(&alice, Action::Unvouch { account: dave.address() }).unwrap();
         assert!(t.bal(&alice) > before + VOUCH_BOND - DROPS_PER_FANG / 100);
         // Flagging carol as a sybil costs alice her bond and Soul, and blocks carol.
-        let pool0 = t.c.state.account(&pool_address()).balance;
+        let pool0 = t.c.state.account(&t.c.state.pool()).balance;
         assert!(t.tx(&bob, Action::FlagSybil { account: carol.address(), reason: "x".into() }).is_err());
         t.admin(Action::FlagSybil { account: carol.address(), reason: "same person as dave".into() }).unwrap();
-        assert_eq!(t.c.state.account(&pool_address()).balance, pool0 + VOUCH_BOND, "bond slashed into the pool");
+        assert_eq!(t.c.state.account(&t.c.state.pool()).balance, pool0 + VOUCH_BOND, "bond slashed into the pool");
         assert_eq!(t.soul(&alice), 0, "voucher loses 50 Soul (saturating)");
         assert!(t.c.state.poc.vouches.get(&carol.address()).is_none());
         assert!(t.admin(Action::GrantSoul { to: carol.address(), amount: SOUL, reason: "x".into() }).unwrap_err().to_string().contains("sybil"));
@@ -1583,11 +1584,11 @@ mod scenarios {
         t.attest(c1, true).unwrap();
         assert_eq!(t.c.state.poc.claims[&c1].status, ClaimStatus::Verified);
         assert!(t.attest(c1, true).is_err(), "already settled");
-        let pool0 = t.c.state.account(&pool_address()).balance;
+        let pool0 = t.c.state.account(&t.c.state.pool()).balance;
         t.attest(c2, false).unwrap();
         assert_eq!(t.c.state.poc.claims[&c2].status, ClaimStatus::Rejected);
         assert!(t.c.state.poc.claims[&c2].reason.as_deref().unwrap().contains("closed without merging"));
-        assert_eq!(t.c.state.account(&pool_address()).balance, pool0 + 2 * CLAIM_BOND, "rejected bond goes to the pool");
+        assert_eq!(t.c.state.account(&t.c.state.pool()).balance, pool0 + 2 * CLAIM_BOND, "rejected bond goes to the pool");
         let c3 = t.claim(&alice, 2).unwrap();
         assert!(c3 > c2, "a rejected PR can be claimed again");
         // Admin rejection of a verified claim (e.g. reverted) blocks re-claims.
@@ -1734,9 +1735,9 @@ mod scenarios {
         assert!(t.bal(&solid) > b0);
         conserved(&t.c.state);
         // Clawback returns what hasn't vested to the pool.
-        let pool0 = t.c.state.account(&pool_address()).balance;
+        let pool0 = t.c.state.account(&t.c.state.pool()).balance;
         t.admin(Action::Clawback { account: solid.address(), reason: "PR reverted".into() }).unwrap();
-        assert!(t.c.state.account(&pool_address()).balance > pool0);
+        assert!(t.c.state.account(&t.c.state.pool()).balance > pool0);
         assert_eq!(t.c.state.grant_totals(&solid.address(), t.h() + 100).2, 0);
         conserved(&t.c.state);
         // The voucher got a cut of mid's reward; rejecting mid's claim (say it was reverted) claws

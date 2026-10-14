@@ -11,8 +11,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub fn treasury() -> String {
-    crypto::system_address("treasury")
+/// The treasury's system account on a chain whose addresses use `prefix`.
+pub fn treasury(prefix: &str) -> String {
+    crypto::system_address(prefix, "treasury")
 }
 
 pub fn now_ms() -> u64 {
@@ -63,10 +64,16 @@ pub struct Genesis {
     /// Proof of Contribution timings. Absent: derived from `block_time_ms` (weeks, not minutes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contribution: Option<crate::poc::PocTimes>,
+    /// bech32m prefix of this chain's addresses: `boo` (mainnet, dev) or `tboo` (public testnets).
+    #[serde(default = "default_address_prefix")]
+    pub address_prefix: String,
 }
 
 fn default_epoch_blocks() -> u64 {
     600
+}
+fn default_address_prefix() -> String {
+    crypto::ADDRESS_HRP.into()
 }
 fn default_min_bond() -> u64 {
     10_000 * DROPS_PER_FANG
@@ -87,9 +94,21 @@ pub struct Params {
     pub min_bond: u64,
     pub max_validators: usize,
     pub poc: crate::poc::PocTimes,
+    /// The chain's address prefix (see [`Params::prefix`]).
+    pub address_prefix: String,
 }
 
 impl Params {
+    /// The chain's address prefix (`boo` when unset, e.g. in a default `Params`).
+    pub fn prefix(&self) -> &str {
+        if self.address_prefix.is_empty() { crypto::ADDRESS_HRP } else { &self.address_prefix }
+    }
+
+    /// How far ahead a tx's `valid_until` may be: one hour of blocks.
+    pub fn max_tx_validity_blocks(&self) -> u64 {
+        (3_600_000 / self.block_time_ms.max(1)).max(1)
+    }
+
     /// Longest a session key may stay valid: ~400 days of blocks.
     pub fn max_session_blocks(&self) -> u64 {
         400 * 86_400 * 1000 / self.block_time_ms.max(1)
@@ -152,7 +171,7 @@ impl Genesis {
 
     pub fn params(&self) -> Params {
         let poc = self.contribution.clone().unwrap_or_else(|| crate::poc::PocTimes::for_block_time(self.block_time_ms));
-        Params { block_time_ms: self.block_time_ms, epoch_blocks: self.epoch_blocks, admins: self.validator_admins.clone(), min_bond: self.min_bond, max_validators: self.max_validators, poc }
+        Params { block_time_ms: self.block_time_ms, epoch_blocks: self.epoch_blocks, admins: self.validator_admins.clone(), min_bond: self.min_bond, max_validators: self.max_validators, poc, address_prefix: self.address_prefix.clone() }
     }
 
     pub fn initial_state(&self) -> State {
@@ -197,7 +216,23 @@ impl Genesis {
         if let Some(t) = &g.contribution {
             t.check().with_context(|| format!("{}", path.display()))?;
         }
+        g.check_prefix().with_context(|| format!("{}", path.display()))?;
         Ok(g)
+    }
+
+    /// The prefix is a known one, and every genesis address uses it.
+    pub fn check_prefix(&self) -> Result<()> {
+        let p = self.address_prefix.as_str();
+        if !crypto::is_prefix(p) {
+            bail!("address_prefix must be one of {:?}", crypto::KNOWN_PREFIXES);
+        }
+        let addrs = self.validators.iter().map(|v| &v.address).chain(self.allocations.iter().map(|a| &a.address)).chain(&self.validator_admins);
+        for a in addrs {
+            if crypto::parse_address(a).map(|(q, _)| q) != Some(p) {
+                bail!("genesis address {a} doesn't use this chain's prefix {p}");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -432,6 +467,16 @@ impl State {
         self.accounts.get(addr).cloned().unwrap_or_default()
     }
 
+    /// This chain's treasury account.
+    pub fn treasury(&self) -> String {
+        treasury(self.params.prefix())
+    }
+
+    /// This chain's contribution pool account.
+    pub fn pool(&self) -> String {
+        crate::poc::pool_address(self.params.prefix())
+    }
+
     /// Active set for an epoch (validator records, in set order), if known.
     pub fn active_set(&self, epoch: u64) -> Option<Vec<&ValidatorRecord>> {
         self.active_sets.get(&epoch).map(|s| s.iter().filter_map(|a| self.validators.get(a)).collect())
@@ -624,28 +669,28 @@ impl State {
         j.poc.rollback(&mut self.poc);
     }
 
-    /// Checks that decide whether a tx can be included at all. No state changes.
-    fn admit(&self, tx: &Tx, chain_id: &str, height: u64, full_checks: bool) -> Result<(String, String, KeyRecord)> {
+    /// Checks that decide whether a tx can be included at all (at `height`). No state changes.
+    /// Returns the sender, the signer's key id and record, and what the tx is charged.
+    fn admit(&self, tx: &Tx, chain_id: &str, height: u64, full_checks: bool) -> Result<(String, String, KeyRecord, u64)> {
         if tx.chain_id != chain_id {
             bail!("wrong chain_id: expected {chain_id}");
         }
         if full_checks {
             tx.check_format()?;
         }
+        tx.check_prefix(self.params.prefix())?;
+        check_validity(tx, height, self.params.max_tx_validity_blocks())?;
         let sender = tx.sender()?;
         let signer = tx.signer_key_id()?;
         let keys = self.keys_of(&sender);
         let key = keys.get(&signer).cloned().ok_or_else(|| anyhow!("this key isn't authorized on {}", short(&sender)))?;
-        let min = min_fee(tx.size());
-        if tx.fee < min {
-            bail!("fee too low: minimum is {} drops", min);
-        }
+        let charge = check_fee(tx)?;
         let acct = self.account(&sender);
         if tx.nonce != acct.nonce {
             bail!("bad nonce: expected {}, got {}", acct.nonce, tx.nonce);
         }
-        if acct.balance < tx.fee {
-            bail!("insufficient balance for the fee: has {}, needs {}", fmt_fang(acct.balance), fmt_fang(tx.fee));
+        if acct.balance < charge {
+            bail!("insufficient balance for the fee: has {}, needs {}", fmt_fang(acct.balance), fmt_fang(charge));
         }
         if let KeyRole::Session { limit, period_blocks, expires_at } = key.role {
             if height > expires_at {
@@ -658,11 +703,11 @@ impl State {
                 _ => bail!("session keys can only send transfers (and claims, for registered Familiars)"),
             };
             let spent = if height >= key.window_start.saturating_add(period_blocks) { 0 } else { key.spent };
-            if spent.saturating_add(amount).saturating_add(tx.fee) > limit {
+            if spent.saturating_add(amount).saturating_add(charge) > limit {
                 bail!("session key limit reached: {} per {period_blocks} blocks", fmt_fang(limit));
             }
         }
-        Ok((sender, signer, key))
+        Ok((sender, signer, key, charge))
     }
 
     /// Validates and applies a tx (signatures are checked before txs reach the state machine:
@@ -680,9 +725,10 @@ impl State {
     /// `apply`, recording every change in `j` so the caller can roll back (dry runs, mempool
     /// checks, proposals) without cloning the state.
     pub fn apply_j(&mut self, j: &mut Journal, tx: &Tx, chain_id: &str, proposer: &str, height: u64, full_checks: bool) -> Result<Outcome> {
-        let (sender, signer, key) = self.admit(tx, chain_id, height, full_checks)?;
-        let min = min_fee(tx.size());
-        // Fee phase (always sticks once admitted).
+        let (sender, signer, key, charge) = self.admit(tx, chain_id, height, full_checks)?;
+        let base = charge - tx.tip;
+        // Fee phase (always sticks once admitted): the charge is debited (not the whole `fee`),
+        // its base part burned and the tip paid to the proposer.
         if let KeyRole::Session { period_blocks, .. } = key.role {
             let mut keys = self.keys_of(&sender);
             let rec = keys.get_mut(&signer).unwrap();
@@ -690,14 +736,14 @@ impl State {
                 rec.spent = 0;
                 rec.window_start = height;
             }
-            rec.spent = rec.spent.saturating_add(tx.fee);
+            rec.spent = rec.spent.saturating_add(charge);
             self.acct_mut(j, &sender).keys = keys;
         }
-        self.j_debit(j, &sender, tx.fee)?;
+        self.j_debit(j, &sender, charge)?;
         self.j_scalars(j);
-        self.burned += min;
-        self.supply -= min;
-        self.j_credit(j, proposer, tx.fee - min);
+        self.burned += base;
+        self.supply -= base;
+        self.j_credit(j, proposer, tx.tip);
         self.acct_mut(j, &sender).nonce += 1;
         // Action phase (rolled back on failure).
         let mut aj = Journal::default();
@@ -737,7 +783,8 @@ impl State {
                     bail!("{n}{NAME_SUFFIX} is already taken");
                 }
                 self.j_debit(j, &sender, name_price(&n))?;
-                self.j_credit(j, &treasury(), name_price(&n));
+                let treasury = self.treasury();
+                self.j_credit(j, &treasury, name_price(&n));
                 j.names.entry(n.clone()).or_insert(None);
                 self.names.insert(n.clone(), NameRecord { name: n, owner: sender.clone(), registered_at: height });
             }
@@ -803,7 +850,7 @@ impl State {
                 if *bond < self.params.min_bond {
                     bail!("bond must be at least {}", fmt_fang(self.params.min_bond));
                 }
-                let address = crypto::address_from_public_key(&pk);
+                let address = crypto::address_with_prefix(self.params.prefix(), &pk);
                 if let Some(v) = self.validators.get(&address) {
                     if v.status != ValidatorStatus::Unbonded {
                         bail!("that consensus key is already registered");
@@ -1012,9 +1059,9 @@ impl State {
         Ok(())
     }
 
-    /// What admitting this tx reserves from the sender's balance (fee + amount moved out).
+    /// What admitting this tx reserves from the sender's balance (charge + amount moved out).
     pub fn tx_debit(tx: &Tx) -> u64 {
-        tx.fee.saturating_add(match &tx.action {
+        tx.charge().unwrap_or(u64::MAX).saturating_add(match &tx.action {
             Action::Transfer { amount, .. } => *amount,
             Action::RegisterName { name } => normalize_name(name).map(|n| name_price(&n)).unwrap_or(0),
             Action::RegisterValidator { bond, .. } => *bond,
@@ -1094,7 +1141,7 @@ impl State {
             }
             Action::RemoveKey { key_id } => format!("{from} revoked key {}…", &key_id[..key_id.len().min(10)]),
             Action::RegisterValidator { consensus_key, bond, .. } => {
-                let v = hex::decode(consensus_key).map(|pk| short(&crypto::address_from_public_key(&pk))).unwrap_or_default();
+                let v = hex::decode(consensus_key).map(|pk| short(&crypto::address_with_prefix(self.params.prefix(), &pk))).unwrap_or_default();
                 format!("{from} bonded {} to run validator {v} (pending admin approval)", fmt_fang(*bond))
             }
             Action::ApproveValidator { validator } => {
@@ -1143,6 +1190,26 @@ impl State {
     }
 }
 
+/// `height <= valid_until <= height + max_validity`: a tx past `valid_until` can never execute.
+pub fn check_validity(tx: &Tx, height: u64, max_validity: u64) -> Result<()> {
+    if tx.valid_until < height {
+        bail!("expired at block {}", tx.valid_until);
+    }
+    let latest = height.saturating_add(max_validity);
+    if tx.valid_until > latest {
+        bail!("valid_until {} is too far ahead: at most {latest} (an hour of blocks from now)", tx.valid_until);
+    }
+    Ok(())
+}
+
+/// The tx's charge (`min_fee(size) + tip`), which `fee` must cover.
+pub fn check_fee(tx: &Tx) -> Result<u64> {
+    match tx.charge() {
+        Some(charge) if charge <= tx.fee => Ok(charge),
+        _ => bail!("fee too low: this tx costs {} drops (minimum {} + tip {}), but its fee allows {}", min_fee(tx.size()).saturating_add(tx.tip), min_fee(tx.size()), tx.tip, tx.fee),
+    }
+}
+
 pub fn short(addr: &str) -> String {
     if addr.len() > 16 { format!("{}…{}", &addr[..10], &addr[addr.len() - 6..]) } else { addr.to_string() }
 }
@@ -1169,11 +1236,13 @@ pub struct SummonOpts {
     pub min_bond: Option<u64>,
     /// Proof of Contribution timings (`None`: derived from the block time).
     pub contribution: Option<crate::poc::PocTimes>,
+    /// Address prefix: `boo` (mainnet, dev) or `tboo` (public testnets).
+    pub address_prefix: String,
 }
 
 impl SummonOpts {
     pub fn new(chain_id: &str, validators: usize) -> Self {
-        Self { chain_id: chain_id.into(), faucet: true, block_time_ms: 1000, validators, http_port: None, admins: vec![], epoch_blocks: default_epoch_blocks(), min_bond: None, contribution: None }
+        Self { chain_id: chain_id.into(), faucet: true, block_time_ms: 1000, validators, http_port: None, admins: vec![], epoch_blocks: default_epoch_blocks(), min_bond: None, contribution: None, address_prefix: default_address_prefix() }
     }
 }
 
@@ -1187,8 +1256,11 @@ pub const REPLAY_ROOT_CHECK: u64 = 1_000;
 pub const CERT_CHECKPOINT: u64 = 100;
 /// … and kept in memory for this many recent heights.
 pub const RECENT_CERTS: usize = 1_024;
-/// Mempool txs not included within this many blocks are dropped.
+/// Mempool txs not included within this many blocks are dropped (they stay valid until their
+/// `valid_until`, so a holder could resubmit them).
 pub const MEMPOOL_TTL_BLOCKS: u64 = 600;
+/// How long the node's own txs (faucet drips, attestations) stay valid.
+pub const OWN_TX_VALIDITY: u64 = 600;
 /// Recently failed/dropped tx ids remembered for `/api/tx/{id}`.
 pub const RECENT_FAILED: usize = 10_000;
 /// Max faucet drips waiting in the mempool (kept below `MAX_PENDING_PER_SENDER`).
@@ -1317,6 +1389,10 @@ pub struct Finalized {
     pub hash: String,
     pub parent: String,
     pub timestamp_ms: u64,
+    /// The consensus view it was proposed in, its parent's view, and its protocol version.
+    pub view: u64,
+    pub parent_view: u64,
+    pub version: u32,
     pub proposer: String,
     pub txs: Vec<Tx>,
     /// The exact consensus block bytes (stored so this node can serve `/api/sync`).
@@ -1346,12 +1422,16 @@ impl Chain {
     /// with localhost ports picked automatically.
     pub fn summon(home: &Path, o: &SummonOpts) -> Result<Vec<PathBuf>> {
         let (chain_id, faucet, block_time_ms, validators, http_port) = (o.chain_id.as_str(), o.faucet, o.block_time_ms, o.validators, o.http_port);
+        let prefix = o.address_prefix.as_str();
         if o.epoch_blocks < 2 {
             bail!("epoch_blocks must be at least 2");
         }
+        if !crypto::is_prefix(prefix) {
+            bail!("address prefix must be one of {:?}", crypto::KNOWN_PREFIXES);
+        }
         for a in &o.admins {
-            if !crypto::is_address(a) {
-                bail!("admin {a} is not a lowercase boo1… address");
+            if crypto::parse_address(a).map(|(p, _)| p) != Some(prefix) {
+                bail!("admin {a} is not a lowercase {prefix}1… address");
             }
         }
         if validators == 0 {
@@ -1367,12 +1447,12 @@ impl Chain {
                 (0, Some(p)) => p,
                 _ => free_port()?,
             };
-            infos.push(ValidatorInfo { address: k.address(), public_key: hex::encode(k.public_key()), p2p_addr: format!("127.0.0.1:{}", free_port()?), http_addr: format!("127.0.0.1:{http}") });
+            infos.push(ValidatorInfo { address: k.address_with(prefix), public_key: hex::encode(k.public_key()), p2p_addr: format!("127.0.0.1:{}", free_port()?), http_addr: format!("127.0.0.1:{http}") });
         }
         let per_validator = 1_000_000_000 * DROPS_PER_FANG / validators as u64;
-        let mut allocations: Vec<Allocation> = keys.iter().map(|k| Allocation { address: k.address(), amount: per_validator }).collect();
-        allocations.push(Allocation { address: treasury(), amount: 100_000_000 * DROPS_PER_FANG });
-        let validator_admins = if o.admins.is_empty() { vec![keys[0].address()] } else { o.admins.clone() };
+        let mut allocations: Vec<Allocation> = keys.iter().map(|k| Allocation { address: k.address_with(prefix), amount: per_validator }).collect();
+        allocations.push(Allocation { address: treasury(prefix), amount: 100_000_000 * DROPS_PER_FANG });
+        let validator_admins = if o.admins.is_empty() { vec![keys[0].address_with(prefix)] } else { o.admins.clone() };
         let genesis = Genesis {
             chain_id: chain_id.to_string(),
             token: "FANG".into(),
@@ -1387,6 +1467,7 @@ impl Chain {
             min_bond: o.min_bond.unwrap_or(if faucet { 50 * DROPS_PER_FANG } else { default_min_bond() }),
             max_validators: default_max_validators(),
             contribution: o.contribution.clone(),
+            address_prefix: prefix.into(),
         };
         let homes: Vec<PathBuf> = if validators == 1 { vec![home.to_path_buf()] } else { (0..validators).map(|i| home.join(format!("v{i}"))).collect() };
         for (h, k) in homes.iter().zip(&keys) {
@@ -1523,7 +1604,7 @@ impl Chain {
 
     /// The validator's own address (fee recipient, faucet account).
     pub fn me(&self) -> Option<String> {
-        self.keys.as_ref().map(|k| k.address())
+        self.keys.as_ref().map(|k| k.address_with(self.state.params.prefix()))
     }
 
     pub fn height(&self) -> u64 {
@@ -1769,7 +1850,7 @@ impl Chain {
                 self.sign_handoffs();
             }
         }
-        let block = Block { height: f.height, prev_hash: f.parent, timestamp_ms: f.timestamp_ms, proposer: f.proposer, state_root: self.state.root(), txs, hash: f.hash, signature: String::new(), failed };
+        let block = Block { height: f.height, prev_hash: f.parent, timestamp_ms: f.timestamp_ms, view: f.view, parent_view: f.parent_view, version: f.version, proposer: f.proposer, state_root: self.state.root(), txs, hash: f.hash, signature: String::new(), failed };
         let (at, len) = self.cblocks.append(f.height, &f.cblock)?;
         self.cblock_index.push((at, len));
         let line = serde_json::to_string(&block)? + "\n";
@@ -1900,9 +1981,14 @@ impl Chain {
                 self.pool.remove(&id);
                 continue;
             }
+            if tx.valid_until < next {
+                dropped.push((id, format!("expired at block {}", tx.valid_until)));
+                continue;
+            }
             let added = self.pool.get(&id).map(|e| e.added_at).unwrap_or(next);
             if added + MEMPOOL_TTL_BLOCKS < next {
-                dropped.push((id, format!("expired: not included within {MEMPOOL_TTL_BLOCKS} blocks")));
+                // Not expired: anyone holding it may resubmit it until `valid_until`.
+                dropped.push((id, format!("dropped from the mempool: not included within {MEMPOOL_TTL_BLOCKS} blocks (it stays valid until block {} if resubmitted)", tx.valid_until)));
                 continue;
             }
             match self.state.apply_j(&mut j, &tx, &chain_id, &proposer, next, false) {
@@ -1957,16 +2043,28 @@ impl Chain {
             Outcome::Failed(r) => bail!(r),
         }
         if self.mempool.len() >= MAX_MEMPOOL {
-            // Full: evict the lowest fee-per-byte tx if this one pays more, else refuse.
-            let rate = |t: &Tx| t.fee as f64 / t.size().max(1) as f64;
-            let (idx, lowest) = self.mempool.iter().enumerate().min_by(|a, b| rate(a.1).total_cmp(&rate(b.1))).map(|(i, t)| (i, rate(t))).unwrap();
-            if rate(&tx) <= lowest {
-                bail!("mempool is full; raise your fee above {:.1} drops/byte or try again shortly", lowest);
+            // Full: evict the lowest tip per byte if this one pays more, else refuse. Only the
+            // last queued tx of another sender can go, so no sender is left with a nonce gap.
+            let mut last = HashMap::new();
+            for (i, t) in self.mempool.iter().enumerate() {
+                last.insert(t.from.as_str(), i);
             }
+            last.remove(sender.as_str());
+            // Lowest rate; among equals, the newest arrival.
+            let lowest = last.into_values().min_by(|&a, &b| TipRate::of(&self.mempool[a]).cmp(&TipRate::of(&self.mempool[b])).then(b.cmp(&a)));
+            let idx = match lowest {
+                Some(i) if TipRate::of(&tx) > TipRate::of(&self.mempool[i]) => i,
+                Some(i) => {
+                    let low = TipRate::of(&self.mempool[i]);
+                    let need = (low.tip as u128 * tx.size() as u128 / low.size.max(1) as u128 + 1).min(u64::MAX as u128);
+                    bail!("mempool is full; resubmit with a tip of at least {need} drops (and the fee to cover it), or try again shortly");
+                }
+                None => bail!("mempool is full; try again shortly"),
+            };
             let evicted = self.mempool.remove(idx);
             let eid = evicted.id();
             self.pool.remove(&eid);
-            self.note_failed(eid, "evicted from a full mempool by a higher-fee transaction".into(), next);
+            self.note_failed(eid, "evicted from a full mempool by a transaction with a higher tip".into(), next);
             self.rebuild_pending();
         }
         if let Some(g) = &self.gossip {
@@ -2049,12 +2147,14 @@ impl Chain {
     /// Signs `action` with this validator's key, from its own account, and queues it.
     pub fn submit_own(&mut self, action: Action, memo: &str) -> Result<Tx> {
         let keys = self.keys.as_ref().ok_or_else(|| anyhow!("this node has no validator key"))?;
-        let from = keys.address();
+        let from = keys.address_with(self.state.params.prefix());
         let mut tx = Tx {
             chain_id: self.genesis.chain_id.clone(),
             nonce: self.next_nonce(&from),
             from,
             fee: 0,
+            tip: 0,
+            valid_until: self.height() + OWN_TX_VALIDITY.min(self.state.params.max_tx_validity_blocks()),
             action,
             memo: memo.into(),
             public_key: hex::encode(keys.public_key()),
@@ -2075,13 +2175,71 @@ impl Chain {
 
     #[cfg(test)]
     pub fn produce_block_with(&mut self, txs: Vec<Tx>) -> Result<()> {
-        let f = Finalized { height: self.height() + 1, hash: hex::encode(crypto::hash(format!("test-{}-{}", self.height(), self.last_hash()).as_bytes())), parent: self.last_hash().to_string(), timestamp_ms: now_ms(), proposer: self.fee_sink(), txs, cblock: vec![], certificate: None };
+        let height = self.height() + 1;
+        let f = Finalized { height, hash: hex::encode(crypto::hash(format!("test-{}-{}", self.height(), self.last_hash()).as_bytes())), parent: self.last_hash().to_string(), timestamp_ms: now_ms(), view: height, parent_view: height - 1, version: crate::consensus::PROTOCOL_VERSION, proposer: self.fee_sink(), txs, cblock: vec![], certificate: None };
         self.execute(f)
     }
 }
 
 pub const MAX_MEMPOOL: usize = 5_000;
 pub const MAX_PENDING_PER_SENDER: usize = 64;
+
+/// Mempool txs in the order a proposal takes them: highest tip per byte first (earlier arrival
+/// first among equals), each sender's txs still in nonce (arrival) order.
+pub fn proposal_order(mempool: &[Tx]) -> Vec<&Tx> {
+    use std::cmp::Reverse;
+    use std::collections::{BinaryHeap, VecDeque};
+    let mut queues: Vec<VecDeque<usize>> = vec![];
+    let mut by_sender: HashMap<&str, usize> = HashMap::new();
+    for (i, t) in mempool.iter().enumerate() {
+        let q = *by_sender.entry(t.from.as_str()).or_insert_with(|| {
+            queues.push(VecDeque::new());
+            queues.len() - 1
+        });
+        queues[q].push_back(i);
+    }
+    // Max-heap of each sender's next tx: (rate, earliest arrival, queue).
+    let mut heap: BinaryHeap<(TipRate, Reverse<usize>, usize)> = queues.iter().enumerate().map(|(q, txs)| (TipRate::of(&mempool[txs[0]]), Reverse(txs[0]), q)).collect();
+    let mut out = Vec::with_capacity(mempool.len());
+    while let Some((_, Reverse(i), q)) = heap.pop() {
+        out.push(&mempool[i]);
+        queues[q].pop_front();
+        if let Some(&next) = queues[q].front() {
+            heap.push((TipRate::of(&mempool[next]), Reverse(next), q));
+        }
+    }
+    out
+}
+
+/// A tx's tip per byte, compared exactly (cross-multiplied in u128, no floats).
+#[derive(Clone, Copy, Debug)]
+pub struct TipRate {
+    pub tip: u64,
+    pub size: u64,
+}
+
+impl TipRate {
+    pub fn of(tx: &Tx) -> Self {
+        Self { tip: tx.tip, size: tx.size().max(1) }
+    }
+}
+
+impl Ord for TipRate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.tip as u128 * other.size as u128).cmp(&(other.tip as u128 * self.size as u128))
+    }
+}
+impl PartialOrd for TipRate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for TipRate {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for TipRate {}
 
 #[cfg(test)]
 mod tests {
@@ -2096,7 +2254,7 @@ mod tests {
             let mut c = Chain::open(&home).unwrap();
             c.faucet(&alice.address(), 50 * DROPS_PER_FANG).unwrap();
             c.produce_block().unwrap();
-            let mut tx = Tx { chain_id: "test-1".into(), from: alice.address(), nonce: 0, fee: 0, action: Action::RegisterName { name: "alice".into() }, memo: String::new(), public_key: String::new(), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+            let mut tx = Tx { chain_id: "test-1".into(), from: alice.address(), nonce: 0, fee: 0, tip: 0, valid_until: c.height() + 100, action: Action::RegisterName { name: "alice".into() }, memo: String::new(), public_key: String::new(), signature: "00".repeat(crypto::SIGNATURE_LEN) };
             tx.public_key = hex::encode(alice.public_key());
             tx.fee = min_fee(tx.size());
             c.submit(tx.sign(&alice)).unwrap();
@@ -2140,7 +2298,7 @@ mod tests {
     }
 
     fn signed(c: &Chain, from: &str, keys: &Keys, nonce: u64, action: Action) -> Tx {
-        let mut tx = Tx { chain_id: c.genesis.chain_id.clone(), from: from.into(), nonce, fee: 0, action, memo: String::new(), public_key: hex::encode(keys.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+        let mut tx = Tx { chain_id: c.genesis.chain_id.clone(), from: from.into(), nonce, fee: 0, tip: 0, valid_until: c.height() + 100, action, memo: String::new(), public_key: hex::encode(keys.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
         tx.fee = min_fee(tx.size());
         tx.sign(keys)
     }
@@ -2204,15 +2362,15 @@ mod audit {
     }
 
     fn signed_fee(c: &Chain, from: &str, keys: &Keys, nonce: u64, action: Action, fee: Option<u64>) -> Tx {
-        let mut tx = Tx { chain_id: c.genesis.chain_id.clone(), from: from.into(), nonce, fee: 0, action, memo: String::new(), public_key: hex::encode(keys.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+        let mut tx = Tx { chain_id: c.genesis.chain_id.clone(), from: from.into(), nonce, fee: 0, tip: 0, valid_until: c.height() + 1_000, action, memo: String::new(), public_key: hex::encode(keys.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
         tx.fee = fee.unwrap_or_else(|| min_fee(tx.size()));
         tx.sign(keys)
     }
 
     /// Unsigned (zero signature) tx: the state machine doesn't verify signatures (admission and
-    /// block verification do), so benchmarks can skip ML-DSA signing.
+    /// block verification do), so benchmarks can skip ML-DSA signing. Valid through block 1,000.
     fn unsigned(chain_id: &str, from: &Keys, nonce: u64, action: Action) -> Tx {
-        let mut tx = Tx { chain_id: chain_id.into(), from: from.address(), nonce, fee: 0, action, memo: String::new(), public_key: hex::encode(from.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+        let mut tx = Tx { chain_id: chain_id.into(), from: from.address(), nonce, fee: 0, tip: 0, valid_until: 1_000, action, memo: String::new(), public_key: hex::encode(from.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
         tx.fee = min_fee(tx.size());
         tx
     }
@@ -2226,9 +2384,9 @@ mod audit {
         c.submit(signed_fee(&c, &a.address(), &a, 0, Action::RegisterName { name: "victim".into() }, None)).unwrap();
         c.produce_block().unwrap();
         // The old PoC: `to` padded with 60 KB of spaces used to be trimmed and accepted.
-        let pad = format!("victim.boo{}", " ".repeat(60_000));
+        let pad = format!("victim.boo{}", " ".repeat(62_000));
         let big = signed_fee(&c, &a.address(), &a, 1, Action::Transfer { to: pad, amount: 1 }, Some(100 * 66_000));
-        assert!(serde_json::to_vec(&big).unwrap().len() > MAX_TX_BYTES);
+        assert!(big.size() as usize > MAX_TX_BYTES);
         let err = c.submit(big.clone()).unwrap_err().to_string();
         assert!(err.contains("too large"), "{err}");
         assert!(c.track_pending(big).is_err());
@@ -2239,14 +2397,16 @@ mod audit {
         let mut memo = signed_fee(&c, &a.address(), &a, 1, Action::Transfer { to: c.me().unwrap(), amount: 1 }, None);
         memo.memo = "m".repeat(257);
         assert!(c.submit(memo.sign(&a)).is_err());
-        // A tx that can never be included expires instead of sitting in the mempool forever.
+        // A tx that's never included leaves the mempool after the TTL instead of sitting there
+        // forever. It isn't expired (it can still execute until `valid_until`), and says so.
         let later = signed_fee(&c, &a.address(), &a, 1, Action::Transfer { to: c.me().unwrap(), amount: 1 }, None);
-        let id = c.submit(later).unwrap();
+        let id = c.submit(later.clone()).unwrap();
         for _ in 0..=MEMPOOL_TTL_BLOCKS {
             c.produce_block_with(vec![]).unwrap();
         }
         assert!(c.mempool.is_empty());
-        assert!(c.failure(&id).unwrap().0.contains("expired"));
+        let why = &c.failure(&id).unwrap().0;
+        assert!(why.contains(&format!("not included within {MEMPOOL_TTL_BLOCKS} blocks")) && why.contains(&format!("valid until block {}", later.valid_until)), "{why}");
     }
 
     #[test]
@@ -2260,7 +2420,7 @@ mod audit {
         let mut m = tx.clone();
         m.signature = m.signature.to_uppercase();
         assert_eq!(m.id(), orig_id, "id is over the decoded signature bytes");
-        assert!(crate::consensus::check_tx_stateless(&m, "audit").is_err(), "uppercase hex is rejected");
+        assert!(crate::consensus::check_tx_stateless(&m, "audit", "boo").is_err(), "uppercase hex is rejected");
         assert!(c.submit(m).is_err());
         c.submit(tx).unwrap();
         c.produce_block().unwrap();
@@ -2415,12 +2575,25 @@ mod audit {
         let x = Keys::from_seed([77u8; 32]);
         c.state.accounts.insert(x.address(), Account { balance: 100 * DROPS_PER_FANG, ..Default::default() });
         let mut tx = unsigned("audit", &x, 0, Action::Transfer { to: me.clone(), amount: 1 });
-        tx.fee *= 2; // outbids the cheapest, so it evicts one
+        let lowball = Tx { tip: 0, ..tx.clone() };
+        assert!(c.submit(lowball).unwrap_err().to_string().contains("mempool is full; resubmit with a tip of at least 1 drops"));
+        tx.tip = 1; // outbids the cheapest (no tip), so it evicts one
+        tx.fee = tx.charge().unwrap();
         let t = Instant::now();
         c.submit(tx).unwrap();
         let one = t.elapsed();
         println!("filled 5,000-tx mempool in {fill:?}; one more submit (with eviction) took {one:?}");
         assert!(one.as_millis() < 250, "submit took {one:?}");
+        // The newest sender's last tx went (no one is left with a nonce gap).
+        assert_eq!(c.mempool.len(), MAX_MEMPOOL);
+        let mut next: HashMap<&str, u64> = HashMap::new();
+        for t in &c.mempool {
+            let n = next.entry(t.from.as_str()).or_insert(0);
+            assert_eq!(t.nonce, *n, "nonces stay contiguous");
+            *n += 1;
+        }
+        let last_sender = c.mempool.iter().rev().find(|t| t.from != x.address()).unwrap().from.clone();
+        assert_eq!(next[last_sender.as_str()], (MAX_MEMPOOL - 64 * (MAX_MEMPOOL / 64)) as u64 - 1, "the newest arrival among the cheapest tails was evicted");
         let t = Instant::now();
         c.revalidate_mempool();
         println!("revalidating 5,000 txs: {:?}", t.elapsed());
@@ -2472,7 +2645,7 @@ mod hunts {
     impl T {
         fn tx(&mut self, who: &Keys, action: Action) -> Result<String> {
             let from = who.address();
-            let mut tx = Tx { chain_id: "hunts".into(), nonce: self.c.next_nonce(&from), from, fee: 0, action, memo: String::new(), public_key: hex::encode(who.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+            let mut tx = Tx { chain_id: "hunts".into(), nonce: self.c.next_nonce(&from), from, fee: 0, tip: 0, valid_until: self.c.height() + 100, action, memo: String::new(), public_key: hex::encode(who.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
             tx.fee = min_fee(tx.size());
             let id = self.c.submit(tx.sign(who))?;
             self.c.produce_block()?;
@@ -2599,5 +2772,189 @@ mod hunts {
         t.tx(&alice, Action::RemoveKey { key_id: kid.clone() }).unwrap();
         assert!(!t.c.state.familiars.contains_key(&alice.address()));
         fs::remove_dir_all(&t.home).ok();
+    }
+}
+
+/// Protocol v1 rules at the state machine: tips and the charged fee, `valid_until`, address
+/// prefixes, and the order proposals take mempool txs in.
+#[cfg(test)]
+mod v1 {
+    use super::*;
+
+    fn fresh(tag: &str, prefix: &str) -> (PathBuf, Chain) {
+        let home = std::env::temp_dir().join(format!("blockula-v1-{tag}-{}-{}", now_ms(), std::process::id()));
+        Chain::summon(&home, &SummonOpts { address_prefix: prefix.into(), ..SummonOpts::new("v1", 1) }).unwrap();
+        let c = Chain::open(&home).unwrap();
+        (home, c)
+    }
+
+    /// `keys` acting for `from`, paying exactly the charge (`min_fee + tip`).
+    fn tx(c: &Chain, keys: &Keys, from: &str, nonce: u64, tip: u64, valid_until: u64, action: Action) -> Tx {
+        let mut tx = Tx { chain_id: c.genesis.chain_id.clone(), from: from.into(), nonce, fee: 0, tip, valid_until, action, memo: String::new(), public_key: hex::encode(keys.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+        tx.fee = tx.charge().unwrap();
+        tx.sign(keys)
+    }
+
+    fn bal(c: &Chain, addr: &str) -> u64 {
+        c.state.account(addr).balance
+    }
+
+    #[test]
+    fn tip_goes_to_the_proposer_and_only_the_charge_is_debited() {
+        let (home, mut c) = fresh("tip", "boo");
+        let (a, friend) = (Keys::from_seed([1; 32]), Keys::from_seed([2; 32]).address());
+        c.faucet(&a.address(), 50 * DROPS_PER_FANG).unwrap();
+        c.produce_block().unwrap();
+        let me = c.me().unwrap();
+        let (a0, me0, supply0, burned0) = (bal(&c, &a.address()), bal(&c, &me), c.state.supply, c.state.burned);
+        // `fee` allows more than the charge: the rest stays with the sender.
+        let mut t = tx(&c, &a, &a.address(), 0, 7_000, c.height() + 10, Action::Transfer { to: friend.clone(), amount: DROPS_PER_FANG });
+        t.fee += 1_000_000;
+        let t = t.sign(&a);
+        let base = min_fee(t.size());
+        c.submit(t.clone()).unwrap();
+        c.produce_block().unwrap();
+        assert_eq!(bal(&c, &a.address()), a0 - DROPS_PER_FANG - base - 7_000);
+        assert_eq!(bal(&c, &me), me0 + 7_000, "the tip goes to the proposer");
+        assert_eq!((c.state.supply, c.state.burned), (supply0 - base, burned0 + base), "the base fee is burned");
+        // A fee that doesn't cover min_fee + tip isn't admittable: not in the mempool, not in a block.
+        let mut short = tx(&c, &a, &a.address(), 1, 5_000, c.height() + 10, Action::Transfer { to: friend.clone(), amount: DROPS_PER_FANG });
+        short.fee -= 1;
+        let short = short.sign(&a);
+        assert!(c.submit(short.clone()).unwrap_err().to_string().contains("fee too low"));
+        assert!(crate::consensus::check_tx_stateless(&short, "v1", "boo").unwrap_err().to_string().contains("fee too low"));
+        c.produce_block_with(vec![short.clone()]).unwrap();
+        assert!(c.failure(&short.id()).unwrap().0.contains("fee too low"));
+        assert_eq!(c.state.account(&a.address()).nonce, 1);
+        // A tip that overflows the charge is refused too.
+        let mut huge = tx(&c, &a, &a.address(), 1, 0, c.height() + 10, Action::Transfer { to: friend, amount: 1 });
+        (huge.tip, huge.fee) = (u64::MAX, u64::MAX);
+        assert!(c.submit(huge.sign(&a)).unwrap_err().to_string().contains("fee too low"));
+        let root = c.state.root();
+        drop(c);
+        assert_eq!(Chain::open(&home).unwrap().state.root(), root, "replays identically");
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn session_limits_count_the_charged_fee() {
+        let (home, mut c) = fresh("sess", "boo");
+        let (owner, agent, friend) = (Keys::from_seed([1; 32]), Keys::from_seed([2; 32]), Keys::from_seed([3; 32]).address());
+        let acct = owner.address();
+        c.faucet(&acct, 50 * DROPS_PER_FANG).unwrap();
+        c.produce_block().unwrap();
+        let limit = DROPS_PER_FANG;
+        let role = KeyRole::Session { limit, period_blocks: 100, expires_at: c.height() + 1_000 };
+        c.submit(tx(&c, &owner, &acct, 0, 0, c.height() + 10, Action::AddKey { key_id: key_id(&agent.public_key()), label: "claude".into(), role })).unwrap();
+        c.produce_block().unwrap();
+        // An amount that fits with the base fee alone, but not with a tip on top.
+        let charge0 = min_fee(tx(&c, &agent, &acct, 1, 0, c.height() + 10, Action::Transfer { to: friend.clone(), amount: 1 }).size());
+        let amount = limit - charge0 - 10;
+        let tipped = tx(&c, &agent, &acct, 1, 100, c.height() + 10, Action::Transfer { to: friend.clone(), amount });
+        assert!(c.submit(tipped).unwrap_err().to_string().contains("limit reached"));
+        c.submit(tx(&c, &agent, &acct, 1, 0, c.height() + 10, Action::Transfer { to: friend, amount })).unwrap();
+        c.produce_block().unwrap();
+        assert_eq!(c.state.keys_of(&acct)[&key_id(&agent.public_key())].spent, amount + charge0, "spent = amount + charged fee");
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn expired_txs_never_execute_and_leave_the_mempool() {
+        let (home, mut c) = fresh("exp", "boo");
+        let (a, friend) = (Keys::from_seed([1; 32]), Keys::from_seed([2; 32]).address());
+        c.faucet(&a.address(), 50 * DROPS_PER_FANG).unwrap();
+        c.produce_block().unwrap();
+        let h = c.height();
+        let send = |c: &Chain, valid_until: u64| tx(c, &a, &a.address(), 0, 0, valid_until, Action::Transfer { to: friend.clone(), amount: DROPS_PER_FANG });
+        // Admission wants `next <= valid_until <= next + an hour of blocks`.
+        let max = c.state.params.max_tx_validity_blocks();
+        assert_eq!(max, 3_600, "an hour of 1 s blocks");
+        assert_eq!(c.submit(send(&c, h)).unwrap_err().to_string(), format!("expired at block {h}"));
+        assert!(c.submit(send(&c, h + 1 + max + 1)).unwrap_err().to_string().contains("too far ahead"));
+        // A signed tx with an unused nonce that nobody includes before `valid_until`…
+        let t = send(&c, h + 3);
+        c.submit(t.clone()).unwrap();
+        c.produce_block_with(vec![]).unwrap();
+        c.produce_block_with(vec![]).unwrap();
+        assert!(c.in_mempool(&t.id()), "still valid for block h + 3");
+        c.produce_block_with(vec![]).unwrap();
+        // …is dropped as expired, and can't come back.
+        assert!(!c.in_mempool(&t.id()));
+        assert_eq!(c.failure(&t.id()).unwrap().0, format!("expired at block {}", h + 3));
+        assert!(c.submit(t.clone()).unwrap_err().to_string().contains("expired"));
+        // Even a proposer that includes it can't execute it: the nonce stays unused.
+        c.produce_block_with(vec![t.clone()]).unwrap();
+        assert!(!c.tx_index.contains_key(&t.id()));
+        assert_eq!(c.state.account(&a.address()).nonce, 0);
+        assert!(c.failure(&t.id()).unwrap().0.contains("expired at block"));
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn testnet_prefix_is_enforced() {
+        let (home, mut c) = fresh("tboo", "tboo");
+        let me = c.me().unwrap();
+        assert!(me.starts_with("tboo1") && c.genesis.validators[0].address == me);
+        assert!(c.state.treasury().starts_with("tboo1") && c.state.pool().starts_with("tboo1"));
+        assert!(c.state.accounts.contains_key(&c.state.treasury()), "the treasury allocation uses the prefix");
+        let a = Keys::from_seed([1; 32]);
+        let (main, test) = (a.address(), a.address_with("tboo"));
+        let vu = c.height() + 10;
+        // The faucet won't pay a mainnet address on a testnet.
+        assert!(c.faucet(&main, DROPS_PER_FANG).unwrap_err().to_string().contains("`to` is a boo (mainnet) address"));
+        c.faucet(&test, 10 * DROPS_PER_FANG).unwrap();
+        c.produce_block().unwrap();
+        // Acting as the mainnet form of the same key, or paying a mainnet address, is refused.
+        let err = c.submit(tx(&c, &a, &main, 0, 0, vu, Action::Transfer { to: me.clone(), amount: 1 })).unwrap_err().to_string();
+        assert!(err.contains("`from` is a boo (mainnet) address, but this chain's addresses start with tboo1"), "{err}");
+        let pay_main = tx(&c, &a, &test, 0, 0, vu, Action::Transfer { to: Keys::from_seed([2; 32]).address(), amount: DROPS_PER_FANG });
+        assert!(c.submit(pay_main.clone()).unwrap_err().to_string().contains("`to` is a boo (mainnet) address"));
+        assert!(crate::consensus::check_tx_stateless(&pay_main, "v1", "tboo").is_err(), "verify, gossip and HTTP refuse it too");
+        c.produce_block_with(vec![pay_main.clone()]).unwrap();
+        assert!(!c.tx_index.contains_key(&pay_main.id()), "and it can't execute");
+        // Native addresses and names work.
+        c.submit(tx(&c, &a, &test, 0, 0, vu, Action::RegisterName { name: "tessa".into() })).unwrap();
+        c.produce_block().unwrap();
+        assert_eq!(c.state.resolve("tessa.boo").unwrap(), test);
+        assert_eq!(bal(&c, &c.state.treasury()), 100_000_000 * DROPS_PER_FANG + name_price("tessa"));
+        // A genesis whose addresses don't match its prefix (or an unknown prefix) doesn't load.
+        let path = home.join("other.json");
+        for (prefix, why) in [("boo", "doesn't use this chain's prefix"), ("xyz", "must be one of")] {
+            let g = Genesis { address_prefix: prefix.into(), ..c.genesis.clone() };
+            fs::write(&path, serde_json::to_string(&g).unwrap()).unwrap();
+            assert!(format!("{:#}", Genesis::load(&path).unwrap_err()).contains(why));
+        }
+        let root = c.state.root();
+        drop(c);
+        assert_eq!(Chain::open(&home).unwrap().state.root(), root);
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn proposals_take_the_highest_tip_per_byte_first() {
+        let (home, mut c) = fresh("order", "boo");
+        let ks: Vec<Keys> = (1..=4u8).map(|i| Keys::from_seed([i; 32])).collect();
+        for k in &ks {
+            c.state.accounts.insert(k.address(), Account { balance: 100 * DROPS_PER_FANG, ..Default::default() });
+        }
+        let to = Keys::from_seed([9; 32]).address();
+        let vu = c.height() + 10;
+        let send = |k: &Keys, nonce: u64, tip: u64, memo: &str| {
+            let mut t = Tx { memo: memo.into(), ..tx(&c, k, &k.address(), nonce, tip, vu, Action::Transfer { to: to.clone(), amount: DROPS_PER_FANG }) };
+            t.fee = t.charge().unwrap();
+            t.sign(k)
+        };
+        let a0 = send(&ks[0], 0, 0, "");
+        let a1 = send(&ks[0], 1, 1_000_000, ""); // a big tip, but it can't jump its own nonce 0
+        let b = send(&ks[1], 0, 500, "");
+        let d = send(&ks[2], 0, 500, ""); // same rate as b, arrived later
+        let e = send(&ks[3], 0, 520, &"m".repeat(256)); // a bigger tip, but less per byte
+        assert!(TipRate::of(&e) < TipRate::of(&b));
+        for t in [&a0, &a1, &b, &d, &e] {
+            c.submit(t.clone()).unwrap();
+        }
+        let order: Vec<String> = proposal_order(&c.mempool).iter().map(|t| t.id()).collect();
+        assert_eq!(order, [&b, &d, &e, &a0, &a1].map(|t| t.id()));
+        fs::remove_dir_all(home).ok();
     }
 }

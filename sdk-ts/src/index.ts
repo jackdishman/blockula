@@ -7,9 +7,16 @@ import { minFee, parseFang, parseSoul, seanceCommitment, signingBytes, type Acti
 export * from "./tx.js";
 
 export const DEFAULT_RPC = "http://localhost:7070";
+/** Address prefixes: `boo` on mainnet (and dev chains), `tboo` on public testnets. */
+export const KNOWN_PREFIXES = ["boo", "tboo"] as const;
+export const DEFAULT_PREFIX = "boo";
+/** How long a transaction stays valid by default: 600 blocks (10 minutes at 1 s blocks). */
+export const DEFAULT_VALID_FOR_BLOCKS = 600;
 
-export function addressFromPublicKey(publicKey: Uint8Array): string {
-  return bech32m.encode("boo", bech32m.toWords(blake3(publicKey)));
+/** The address of a public key: bech32m(prefix, BLAKE3(public key)). */
+export function addressFromPublicKey(publicKey: Uint8Array, prefix: string = DEFAULT_PREFIX): string {
+  if (!(KNOWN_PREFIXES as readonly string[]).includes(prefix)) throw new Error(`unknown address prefix ${prefix}`);
+  return bech32m.encode(prefix, bech32m.toWords(blake3(publicKey)));
 }
 
 /** A key's id: BLAKE3(public key) as hex. Same 32 bytes as inside the `boo1…` address it derives. */
@@ -17,15 +24,30 @@ export function keyId(publicKey: Uint8Array): string {
   return bytesToHex(blake3(publicKey));
 }
 
-export function isAddress(s: string): boolean {
+/** The prefix of a canonical address (`boo`, `tboo`), or `undefined` if `s` isn't one. */
+export function addressPrefix(s: string): string | undefined {
   // Addresses are canonical lowercase; the node rejects any other casing.
-  if (s !== s.toLowerCase()) return false;
+  if (s !== s.toLowerCase()) return undefined;
   try {
     const { prefix, words } = bech32m.decode(s as `${string}1${string}`);
-    return prefix === "boo" && bech32m.fromWords(words).length === 32;
+    return (KNOWN_PREFIXES as readonly string[]).includes(prefix) && bech32m.fromWords(words).length === 32 ? prefix : undefined;
   } catch {
-    return false;
+    return undefined;
   }
+}
+
+/** Whether `s` is an address: with any known prefix, or exactly `prefix` when given. */
+export function isAddress(s: string, prefix?: string): boolean {
+  const p = addressPrefix(s);
+  return p !== undefined && (prefix === undefined || p === prefix);
+}
+
+/** Per-transaction options. */
+export interface TxOptions {
+  /** Paid to the block's proposer on top of the base fee: FANG ("0.001") or bigint drops. Default: the wallet's `tip` (0). */
+  tip?: string | number | bigint;
+  /** Blocks from now the tx stays valid (at most the chain's `max_tx_validity_blocks`, an hour of blocks). Default: the wallet's `validForBlocks` (600). */
+  validForBlocks?: number;
 }
 
 /**
@@ -35,20 +57,33 @@ export function isAddress(s: string): boolean {
  */
 export class Wallet {
   readonly publicKey: Uint8Array;
-  /** This key's own address. */
-  readonly address: string;
-  /** The account this wallet acts for (defaults to `address`). */
-  account: string;
   /** WebAuthn credential id, when the wallet was unlocked by a passkey. Not secret. */
   credentialId?: Uint8Array;
+  /** Default tip (drops) for this wallet's transactions. */
+  tip = 0n;
+  /** Default validity (blocks from now) for this wallet's transactions. */
+  validForBlocks = DEFAULT_VALID_FOR_BLOCKS;
   private readonly secretKey: Uint8Array;
+  private acting?: string;
 
   private constructor(readonly seed: Uint8Array, public client: Client = new Client()) {
     const keys = ml_dsa65.keygen(seed);
     this.publicKey = keys.publicKey;
     this.secretKey = keys.secretKey;
-    this.address = addressFromPublicKey(keys.publicKey);
-    this.account = this.address;
+  }
+
+  /** This key's own address, with the chain's prefix once the client knows it (`await client.addressPrefix()`). */
+  get address(): string {
+    return addressFromPublicKey(this.publicKey, this.client.prefix);
+  }
+
+  /** The account this wallet acts for (defaults to `address`). */
+  get account(): string {
+    return this.acting ?? this.address;
+  }
+
+  set account(account: string) {
+    this.acting = account;
   }
 
   get keyId() {
@@ -57,7 +92,7 @@ export class Wallet {
 
   /** Act for another account this key has been authorized on. Accepts a name or address. */
   async actAs(account: string) {
-    this.account = await this.client.resolve(account);
+    this.acting = await this.client.resolve(account);
     return this;
   }
 
@@ -88,24 +123,34 @@ export class Wallet {
     return { ...tx, public_key: bytesToHex(this.publicKey), signature: bytesToHex(signature) };
   }
 
-  async build(action: Action, memo = ""): Promise<Tx> {
+  /**
+   * Builds and signs a tx: `fee` = `minFee + tip` (exactly what's charged) and `valid_until` =
+   * the current height + `validForBlocks`.
+   */
+  async build(action: Action, memo = "", opts: TxOptions = {}): Promise<Tx> {
+    await this.client.addressPrefix(); // so `this.account` uses the chain's prefix
     const [status, account] = await Promise.all([this.client.status(), this.client.account(this.account).catch(() => null)]);
-    const unsigned: UnsignedTx = { chain_id: status.chain_id, from: this.account, nonce: account?.next_nonce ?? 0, fee: "0", action, memo };
-    unsigned.fee = minFee(unsigned).toString();
+    const max: number = status.max_tx_validity_blocks ?? Number.MAX_SAFE_INTEGER;
+    const validFor = opts.validForBlocks ?? Math.min(this.validForBlocks, max);
+    if (!Number.isSafeInteger(validFor) || validFor < 1) throw new Error("validForBlocks must be a positive whole number of blocks");
+    if (validFor > max) throw new Error(`validForBlocks can be at most ${max} (an hour of blocks)`);
+    const tip = opts.tip === undefined ? this.tip : parseFang(opts.tip);
+    const unsigned: UnsignedTx = { chain_id: status.chain_id, from: this.account, nonce: account?.next_nonce ?? 0, fee: "0", tip: tip.toString(), valid_until: status.height + validFor, action, memo };
+    unsigned.fee = (minFee(unsigned) + tip).toString();
     return this.sign(unsigned);
   }
 
-  /** Send FANG to a `.boo` name or `boo1…` address. `amount` is in FANG ("1.5") or bigint drops. */
-  async send(to: string, amount: string | number | bigint, opts: { memo?: string; wait?: boolean } = {}) {
+  /** Send FANG to a `.boo` name or an address. `amount` is in FANG ("1.5") or bigint drops. */
+  async send(to: string, amount: string | number | bigint, opts: { memo?: string; wait?: boolean } & TxOptions = {}) {
     // Sign the resolved address, not the name: what you checked is exactly who gets paid,
     // even if the name changes hands before the block is sealed.
     const recipient = await this.client.resolve(to);
-    const tx = await this.build({ type: "transfer", to: recipient, amount: parseFang(amount).toString() }, opts.memo);
+    const tx = await this.build({ type: "transfer", to: recipient, amount: parseFang(amount).toString() }, opts.memo, opts);
     return this.client.submit(tx, opts.wait ?? true);
   }
 
-  async registerName(name: string, opts: { wait?: boolean } = {}) {
-    const tx = await this.build({ type: "register_name", name });
+  async registerName(name: string, opts: { wait?: boolean } & TxOptions = {}) {
+    const tx = await this.build({ type: "register_name", name }, "", opts);
     return this.client.submit(tx, opts.wait ?? true);
   }
 
@@ -213,6 +258,7 @@ export class Wallet {
    * plus claim ids you think are spam. Keep the returned `salt`: `revealVotes` needs it.
    */
   async sealVotes(seanceId: number, votes: string, spam: number[] = [], salt: string = bytesToHex(randomBytes(16))) {
+    await this.client.addressPrefix(); // the commitment names this account
     const commitment = seanceCommitment(seanceId, this.account, votes, spam, salt);
     const tx = await this.client.submit(await this.build({ type: "commit_votes", seance_id: seanceId, commitment }));
     return { tx, salt, votes, spam };
@@ -262,11 +308,12 @@ export class Wallet {
   }
 
   balance() {
-    return this.client.account(this.account).then((a) => a.balance_display as string, () => "0 FANG");
+    return this.client.addressPrefix().then(() => this.client.account(this.account)).then((a) => a.balance_display as string, () => "0 FANG");
   }
 
   /** Dev/test chains only: drip 100 FANG to this wallet. */
-  faucet(wait = true) {
+  async faucet(wait = true) {
+    await this.client.addressPrefix();
     return this.client.faucet(this.account, wait);
   }
 }
@@ -288,7 +335,24 @@ export class TxFailedError extends Error {
 }
 
 export class Client {
-  constructor(readonly rpc: string = DEFAULT_RPC) {}
+  /** The chain's address prefix: given, learned from `/api/status`, or `boo` until then. */
+  prefix: string;
+  private prefixKnown: boolean;
+  private readonly pinnedPrefix?: string;
+
+  /** `opts.prefix` pins the address prefix you expect (`boo` or `tboo`); a node reporting another is refused. */
+  constructor(readonly rpc: string = DEFAULT_RPC, opts: { prefix?: string } = {}) {
+    if (opts.prefix !== undefined && !(KNOWN_PREFIXES as readonly string[]).includes(opts.prefix)) throw new Error(`unknown address prefix ${opts.prefix}`);
+    this.pinnedPrefix = opts.prefix;
+    this.prefix = opts.prefix ?? DEFAULT_PREFIX;
+    this.prefixKnown = opts.prefix !== undefined;
+  }
+
+  /** The chain's address prefix, asking the node once if it isn't known yet. */
+  async addressPrefix(): Promise<string> {
+    if (!this.prefixKnown) await this.status();
+    return this.prefix;
+  }
 
   private async call(path: string, body?: unknown) {
     const res = await fetch(this.rpc.replace(/\/$/, "") + "/api" + path, body === undefined ? undefined : { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -303,7 +367,17 @@ export class Client {
     return json;
   }
 
-  status() { return this.call("/status"); }
+  async status() {
+    const s = await this.call("/status");
+    if (typeof s.address_prefix === "string") {
+      if (this.pinnedPrefix !== undefined && s.address_prefix !== this.pinnedPrefix) {
+        throw new Error(`${this.rpc} is a ${s.address_prefix} chain, but this client expects ${this.pinnedPrefix} addresses`);
+      }
+      this.prefix = s.address_prefix;
+      this.prefixKnown = true;
+    }
+    return s;
+  }
   blocks(limit = 20) { return this.call(`/blocks?limit=${limit}`); }
   block(heightOrHash: number | string) { return this.call(`/block/${heightOrHash}`); }
   tx(id: string) { return this.call(`/tx/${id}`); }
@@ -333,7 +407,7 @@ export class Client {
 
   async resolve(nameOrAddress: string): Promise<string> {
     if (isAddress(nameOrAddress)) return nameOrAddress;
-    if (/^boo1/i.test(nameOrAddress.trim())) throw new Error(`${nameOrAddress} isn't a valid address (check for typos; addresses are lowercase)`);
+    if (/^t?boo1/i.test(nameOrAddress.trim())) throw new Error(`${nameOrAddress} isn't a valid address (check for typos; addresses are lowercase)`);
     const r = await this.name(nameOrAddress);
     if (r.available) throw new Error(`${r.name} isn't registered`);
     return r.owner.address;

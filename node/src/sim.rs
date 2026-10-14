@@ -62,8 +62,11 @@ async fn wait_for_height(context: &deterministic::Context, vals: &[Val], height:
     panic!("validators stuck at {heights:?}, wanted {height}");
 }
 
+/// Sim txs are valid through this height (every scenario stays within an hour of blocks of it).
+const VALID_UNTIL: u64 = 3_000;
+
 fn transfer(chain_id: &str, from: &Keys, nonce: u64, to: &str, amount: u64) -> Tx {
-    let mut tx = Tx { chain_id: chain_id.into(), from: from.address(), nonce, fee: 0, action: Action::Transfer { to: to.into(), amount }, memo: "sim".into(), public_key: hex::encode(from.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+    let mut tx = Tx { chain_id: chain_id.into(), from: from.address(), nonce, fee: 0, tip: 0, valid_until: VALID_UNTIL, action: Action::Transfer { to: to.into(), amount }, memo: "sim".into(), public_key: hex::encode(from.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
     tx.fee = min_fee(tx.size());
     tx.sign(from)
 }
@@ -110,7 +113,7 @@ async fn network(context: &deterministic::Context, genesis: &Genesis, extra: &[P
 }
 
 fn signed(chain_id: &str, from: &Keys, nonce: u64, action: Action) -> Tx {
-    let mut tx = Tx { chain_id: chain_id.into(), from: from.address(), nonce, fee: 0, action, memo: String::new(), public_key: hex::encode(from.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+    let mut tx = Tx { chain_id: chain_id.into(), from: from.address(), nonce, fee: 0, tip: 0, valid_until: VALID_UNTIL, action, memo: String::new(), public_key: hex::encode(from.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
     tx.fee = min_fee(tx.size());
     tx.sign(from)
 }

@@ -1,5 +1,5 @@
 //! Post-quantum primitives: ML-DSA-65 (FIPS 204) signatures, BLAKE3 hashing,
-//! bech32m `boo1…` addresses. Nothing in here relies on elliptic curves.
+//! bech32m `boo1…` (mainnet) and `tboo1…` (testnet) addresses. Nothing in here relies on elliptic curves.
 
 use anyhow::{anyhow, bail, Result};
 use bech32::{Bech32m, Hrp};
@@ -8,7 +8,13 @@ use ml_dsa::{
     EncodedSignature, EncodedVerifyingKey, MlDsa65, Seed, Signature, SigningKey, VerifyingKey,
 };
 
+/// Mainnet (and dev chains) use `boo`; public testnets use `tboo` (DEC-7). The prefix is a
+/// genesis parameter.
 pub const ADDRESS_HRP: &str = "boo";
+pub const TESTNET_HRP: &str = "tboo";
+/// Every prefix an address may carry. Statelessly any of them is accepted; admission requires
+/// the chain's own.
+pub const KNOWN_PREFIXES: [&str; 2] = [ADDRESS_HRP, TESTNET_HRP];
 pub const PUBLIC_KEY_LEN: usize = 1952;
 pub const SIGNATURE_LEN: usize = 3309;
 
@@ -16,35 +22,66 @@ pub fn hash(data: &[u8]) -> [u8; 32] {
     *blake3::hash(data).as_bytes()
 }
 
-/// An address is bech32m("boo", BLAKE3(public_key)). A full 256-bit hash keeps
-/// collision resistance at ~128 bits even against quantum (BHT) attacks.
+/// An address is bech32m(prefix, BLAKE3(public_key)). A full 256-bit hash keeps
+/// collision resistance at ~128 bits even against quantum (BHT) attacks. This one uses `boo`
+/// (tests, CLI defaults); chain code uses [`address_with_prefix`].
 pub fn address_from_public_key(public_key: &[u8]) -> String {
-    address_from_bytes(&hash(public_key))
+    address_with_prefix(ADDRESS_HRP, public_key)
 }
 
+/// The address of `public_key` on a chain whose addresses use `prefix`.
+pub fn address_with_prefix(prefix: &str, public_key: &[u8]) -> String {
+    render_address(prefix, &hash(public_key))
+}
+
+/// `boo1…` rendering of 32 address bytes (tests; chain code uses [`render_address`]).
+#[cfg(test)]
 pub fn address_from_bytes(bytes: &[u8; 32]) -> String {
-    bech32::encode::<Bech32m>(Hrp::parse(ADDRESS_HRP).unwrap(), bytes).unwrap()
+    render_address(ADDRESS_HRP, bytes)
 }
 
-/// Well-known protocol accounts that no one holds a key for.
-pub fn system_address(label: &str) -> String {
-    address_from_bytes(&hash(format!("blockula/system/{label}").as_bytes()))
+/// bech32m rendering of 32 address bytes with an explicit prefix (a known one, see
+/// [`is_prefix`]; anything else panics).
+pub fn render_address(prefix: &str, bytes: &[u8; 32]) -> String {
+    assert!(is_prefix(prefix), "unknown address prefix {prefix}");
+    bech32::encode::<Bech32m>(Hrp::parse(prefix).unwrap(), bytes).unwrap()
 }
 
-pub fn address_bytes(s: &str) -> Option<[u8; 32]> {
-    if !is_address(s) {
+/// Parses a canonical address with a known prefix into (prefix, bytes). Only the exact
+/// rendering is accepted: uppercase or a bech32 (non-m) checksum would alias the same account.
+pub fn parse_address(s: &str) -> Option<(&'static str, [u8; 32])> {
+    if s.len() > 90 {
         return None;
     }
-    match bech32::decode(s) {
-        Ok((hrp, data)) if hrp.as_str() == ADDRESS_HRP => data.try_into().ok(),
-        _ => None,
-    }
+    let (hrp, data) = bech32::decode(s).ok()?;
+    let prefix = KNOWN_PREFIXES.into_iter().find(|p| hrp.as_str() == *p)?;
+    let bytes: [u8; 32] = data.try_into().ok()?;
+    (render_address(prefix, &bytes) == s).then_some((prefix, bytes))
 }
 
-/// Canonical (lowercase) `boo1…` address. Bech32 also accepts all-uppercase strings, which
-/// would alias accounts, so they're rejected.
+pub fn is_prefix(prefix: &str) -> bool {
+    KNOWN_PREFIXES.contains(&prefix)
+}
+
+/// Which network an address prefix belongs to, for error messages.
+pub fn network_of(prefix: &str) -> &'static str {
+    if prefix == TESTNET_HRP { "testnet" } else { "mainnet" }
+}
+
+/// Well-known protocol accounts that no one holds a key for, rendered with the chain's prefix.
+pub fn system_address(prefix: &str, label: &str) -> String {
+    render_address(prefix, &hash(format!("blockula/system/{label}").as_bytes()))
+}
+
+/// The 32 bytes inside an address of any known prefix.
+pub fn address_bytes(s: &str) -> Option<[u8; 32]> {
+    parse_address(s).map(|(_, b)| b)
+}
+
+/// Canonical (lowercase) address with any known prefix. Bech32 also accepts all-uppercase
+/// strings, which would alias accounts, so they're rejected.
 pub fn is_address(s: &str) -> bool {
-    s.len() <= 90 && !s.bytes().any(|b| b.is_ascii_uppercase()) && matches!(bech32::decode(s), Ok((hrp, data)) if hrp.as_str() == ADDRESS_HRP && data.len() == 32)
+    parse_address(s).is_some()
 }
 
 /// Lowercase hex only (no uppercase aliases of the same bytes).
@@ -87,8 +124,14 @@ impl Keys {
         self.signing.verifying_key().encode().to_vec()
     }
 
+    /// This key's `boo1…` address (tests, CLI defaults).
     pub fn address(&self) -> String {
         address_from_public_key(&self.public_key())
+    }
+
+    /// This key's address on a chain whose addresses use `prefix`.
+    pub fn address_with(&self, prefix: &str) -> String {
+        address_with_prefix(prefix, &self.public_key())
     }
 
     pub fn sign(&self, msg: &[u8]) -> Vec<u8> {
@@ -125,5 +168,27 @@ mod tests {
         assert!(verify(&k.public_key(), b"tampered", &sig).is_err());
         assert!(k.address().starts_with("boo1"));
         assert!(is_address(&k.address()));
+    }
+
+    #[test]
+    fn prefixes_render_and_parse() {
+        let k = Keys::from_seed([7u8; 32]);
+        let (main, test) = (k.address(), k.address_with(TESTNET_HRP));
+        assert!(test.starts_with("tboo1"));
+        assert_eq!(parse_address(&main), Some((ADDRESS_HRP, hash(&k.public_key()))));
+        assert_eq!(parse_address(&test), Some((TESTNET_HRP, hash(&k.public_key()))));
+        assert!(is_address(&test), "any known prefix is an address, statelessly");
+        assert_eq!(address_bytes(&main), address_bytes(&test));
+        assert!(!is_address(&test.to_uppercase()));
+        let other = bech32::encode::<Bech32m>(Hrp::parse("bc").unwrap(), &hash(b"x")).unwrap();
+        assert!(!is_address(&other), "unknown prefixes aren't addresses");
+        let classic = bech32::encode::<bech32::Bech32>(Hrp::parse("boo").unwrap(), &hash(&k.public_key())).unwrap();
+        assert!(!is_address(&classic), "a bech32 (non-m) checksum would alias the account");
+        assert_ne!(system_address(ADDRESS_HRP, "treasury"), system_address(TESTNET_HRP, "treasury"));
+        // Same vectors in sdk-ts/test/e2e.ts (the SDK derives the same key from the same seed).
+        let v = Keys::from_seed([4u8; 32]);
+        assert_eq!(v.address(), "boo15le8r6nlt2mpl4k9df9zd5ragyw35m9hm5spjr6td8h93kdkps7qaltngu");
+        assert_eq!(v.address_with(TESTNET_HRP), "tboo15le8r6nlt2mpl4k9df9zd5ragyw35m9hm5spjr6td8h93kdkps7qscv9f0");
+        assert_eq!(network_of(TESTNET_HRP), "testnet");
     }
 }

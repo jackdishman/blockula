@@ -270,7 +270,7 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
     let genesis = chain.genesis.clone();
     let seed: [u8; 32] = hex::decode(std::fs::read_to_string(home.join("validator.key"))?.trim())?.try_into().map_err(|_| anyhow!("bad validator.key"))?;
     let key = PrivateKey::from_seed_bytes(seed);
-    let me = commonware_cryptography::Signer::public_key(&key).address();
+    let me = commonware_cryptography::Signer::public_key(&key).address(&genesis.address_prefix);
     let addrs = match genesis.validators.iter().find(|v| v.address == me) {
         Some(v) => NodeAddrs { p2p_addr: v.p2p_addr.clone(), http_addr: v.http_addr.clone() },
         None => serde_json::from_slice(&std::fs::read(home.join("node.json")).context("validator.key isn't a genesis validator and node.json is missing — use `blockula validator init`")?)?,

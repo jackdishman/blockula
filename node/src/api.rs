@@ -1,4 +1,4 @@
-use crate::chain::{short, treasury, Chain, Role};
+use crate::chain::{short, Chain, Role};
 use crate::consensus::MarshalMailbox;
 use crate::crypto;
 use crate::types::*;
@@ -290,7 +290,7 @@ pub fn router(node: Node) -> Router {
 }
 
 fn label(c: &Chain, addr: &str) -> Value {
-    let name = if addr == treasury() { Some("🏛️ treasury".to_string()) } else if addr == crate::poc::pool_address() { Some("🪦 contribution pool".to_string()) } else if c.state.validators.get(addr).is_some_and(|v| v.status == crate::chain::ValidatorStatus::Active) { c.state.primary_name(addr).or(Some("🧛 validator".into())) } else { c.state.primary_name(addr) };
+    let name = if addr == c.state.treasury() { Some("🏛️ treasury".to_string()) } else if addr == c.state.pool() { Some("🪦 contribution pool".to_string()) } else if c.state.validators.get(addr).is_some_and(|v| v.status == crate::chain::ValidatorStatus::Active) { c.state.primary_name(addr).or(Some("🧛 validator".into())) } else { c.state.primary_name(addr) };
     json!({ "address": addr, "name": name, "short": short(addr) })
 }
 
@@ -328,7 +328,7 @@ fn tx_json_with(c: &Chain, tx: &Tx, height: Option<u64>, error: Option<&str>) ->
         Action::LeaveJury {} => ("leave_jury", None, None),
         Action::CommitVotes { .. } => ("commit_votes", None, None),
         Action::RevealVotes { .. } => ("reveal_votes", None, None),
-        Action::FundPool { amount } => ("fund_pool", Some(crate::poc::pool_address()), Some(*amount)),
+        Action::FundPool { amount } => ("fund_pool", Some(c.state.pool()), Some(*amount)),
         Action::WithdrawVested {} => ("withdraw_vested", None, None),
         Action::Clawback { account, .. } => ("clawback", c.state.resolve(account).ok(), None),
     };
@@ -343,8 +343,12 @@ fn tx_json_with(c: &Chain, tx: &Tx, height: Option<u64>, error: Option<&str>) ->
         "to": to.map(|t| label(c, &t)),
         "amount": amount.map(|a| a.to_string()),
         "amount_display": amount.map(fmt_fang),
-        "fee": tx.fee.to_string(),
-        "fee_display": fmt_fang(tx.fee),
+        // What the tx is charged (base fee burned + tip); `max_fee` is what it allowed.
+        "fee": tx.charge().unwrap_or(tx.fee).to_string(),
+        "fee_display": fmt_fang(tx.charge().unwrap_or(tx.fee)),
+        "max_fee": tx.fee.to_string(),
+        "tip": tx.tip.to_string(),
+        "valid_until": tx.valid_until,
         "size_bytes": tx.size(),
         "nonce": tx.nonce,
         "signer_key": tx.signer_key_id().ok(),
@@ -411,7 +415,10 @@ async fn status(State(n): State<Node>) -> ApiResult {
         "head_age_ms": c.last_block().map(|b| crate::chain::now_ms().saturating_sub(b.timestamp_ms)),
         "history_from": c.base_height() + 1,
         "fast_synced_from": c.base.as_ref().map(|b| b.height),
-        "crypto": { "signatures": "ML-DSA-65 (FIPS 204)", "hash": "BLAKE3-256", "addresses": "bech32m(boo, BLAKE3(pubkey))", "p2p_transport": "X25519 + ChaCha20-Poly1305 (not post-quantum), ML-DSA-65 peer auth" },
+        "address_prefix": c.genesis.address_prefix,
+        "max_tx_validity_blocks": c.state.params.max_tx_validity_blocks(),
+        "protocol_version": crate::consensus::PROTOCOL_VERSION,
+        "crypto": { "signatures": "ML-DSA-65 (FIPS 204)", "hash": "BLAKE3-256", "addresses": format!("bech32m({}, BLAKE3(pubkey))", c.genesis.address_prefix), "p2p_transport": "X25519 + ChaCha20-Poly1305 (not post-quantum), ML-DSA-65 peer auth" },
     })))
 }
 
@@ -484,11 +491,11 @@ async fn submit(State(n): State<Node>, ConnectInfo(peer): ConnectInfo<SocketAddr
 
 async fn submit_inner(n: &Node, headers: &HeaderMap, client: Option<IpAddr>, tx: Tx) -> ApiResult {
     // Format + ML-DSA signature checks run without holding the chain lock.
-    let (chain_id, role) = {
+    let (chain_id, prefix, role) = {
         let c = n.chain.lock();
-        (c.genesis.chain_id.clone(), c.role)
+        (c.genesis.chain_id.clone(), c.genesis.address_prefix.clone(), c.role)
     };
-    crate::consensus::check_tx_stateless(&tx, &chain_id)?;
+    crate::consensus::check_tx_stateless(&tx, &chain_id, &prefix)?;
     if role == Role::FullNode {
         if forwarded(headers) {
             return Err(ApiError(StatusCode::LOOP_DETECTED, "forwarding loop: this full node was sent a forwarded tx".into()));
@@ -612,7 +619,7 @@ async fn key_accounts(State(n): State<Node>, Path(key_id): Path<String>) -> ApiR
     let mut accounts: Vec<Value> = c.state.accounts.iter().filter(|(_, a)| a.keys.contains_key(&key_id)).map(|(addr, a)| json!({ "account": label(&c, addr), "role": a.keys[&key_id].role, "label": a.keys[&key_id].label })).collect();
     if let Ok(bytes) = hex::decode(&key_id) {
         if let Ok(bytes) = <[u8; 32]>::try_from(bytes) {
-            let own = crypto::address_from_bytes(&bytes);
+            let own = crypto::render_address(c.state.params.prefix(), &bytes);
             let listed = accounts.iter().any(|a| a["account"]["address"] == own.as_str());
             if !listed && c.state.keys_of(&own).contains_key(&key_id) {
                 accounts.insert(0, json!({ "account": label(&c, &own), "role": { "type": "owner" }, "label": "original key" }));
@@ -1059,7 +1066,7 @@ async fn contributions(State(n): State<Node>) -> ApiResult {
     let c = n.chain.lock();
     let p = &c.state.poc;
     let t = &c.state.params.poc;
-    let pool = c.state.account(&crate::poc::pool_address()).balance;
+    let pool = c.state.account(&c.state.pool()).balance;
     let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
     for cl in p.claims.values() {
         *counts.entry(serde_json::to_value(cl.status).unwrap().as_str().unwrap_or_default().to_string()).or_default() += 1;
@@ -1067,7 +1074,7 @@ async fn contributions(State(n): State<Node>) -> ApiResult {
     use crate::poc::*;
     Ok(Json(json!({
         "active": p.is_active(),
-        "pool": { "account": label(&c, &pool_address()), "balance": pool.to_string(), "balance_display": fmt_fang(pool), "next_budget_display": fmt_fang((pool as u128 * SEANCE_POOL_BPS as u128 / 10_000) as u64) },
+        "pool": { "account": label(&c, &c.state.pool()), "balance": pool.to_string(), "balance_display": fmt_fang(pool), "next_budget_display": fmt_fang((pool as u128 * SEANCE_POOL_BPS as u128 / 10_000) as u64) },
         "repos": p.repos.iter().map(|(r, w)| json!({ "repo": r, "weight": w })).collect::<Vec<_>>(),
         "open_seance": p.open_seance.and_then(|id| p.seances.get(&id)).map(|s| seance_json(&c, s, false)),
         "next_seance_at": p.next_seance_at,
@@ -1235,6 +1242,8 @@ mod http_tests {
         assert!(text.contains("blockula_height 1") && text.contains("blockula_mempool_size"), "{text}");
         let (_, g, _) = call(&n, "GET", "/api/genesis", None, "127.0.0.1:1").await;
         assert_eq!(g["genesis_hash"], status["genesis_hash"]);
+        assert_eq!((status["address_prefix"].as_str(), g["address_prefix"].as_str()), (Some("boo"), Some("boo")));
+        assert_eq!(status["max_tx_validity_blocks"], 3_600);
         // A node without a stored certificate for the range says so (the joiner rotates).
         let (s, _, _) = call(&n, "GET", "/api/sync?from=1", None, "127.0.0.1:1").await;
         assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
@@ -1278,12 +1287,20 @@ mod http_tests {
         n.chain.lock().faucet(&k.address(), 10 * DROPS_PER_FANG).unwrap();
         n.chain.lock().produce_block().unwrap();
         let me = n.chain.lock().me().unwrap();
+        let valid_until = n.chain.lock().height() + 100;
         let mk = |nonce: u64| {
-            let mut tx = Tx { chain_id: "txfail".into(), from: k.address(), nonce, fee: 0, action: Action::Transfer { to: me.clone(), amount: 6 * DROPS_PER_FANG }, memo: String::new(), public_key: hex::encode(k.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+            let mut tx = Tx { chain_id: "txfail".into(), from: k.address(), nonce, fee: 0, tip: 0, valid_until, action: Action::Transfer { to: me.clone(), amount: 6 * DROPS_PER_FANG }, memo: String::new(), public_key: hex::encode(k.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
             tx.fee = min_fee(tx.size());
             tx.sign(&k)
         };
         let (t1, t2) = (mk(0), mk(1));
+        // JSON is strict: an unsigned extra field is refused, not carried along.
+        let mut padded = serde_json::to_value(&t1).unwrap();
+        padded["padding"] = json!("x".repeat(1000));
+        let (s, _, _) = call(&n, "POST", "/api/tx", Some(padded), "127.0.0.1:1").await;
+        assert!(s.is_client_error(), "{s}");
+        let (s, v, _) = call(&n, "GET", &format!("/api/tx/{}", t1.id()), None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "{v}");
         n.chain.lock().produce_block_with(vec![t1, t2.clone()]).unwrap();
         let (s, v, _) = call(&n, "GET", &format!("/api/tx/{}", t2.id()), None, "127.0.0.1:1").await;
         assert_eq!(s, StatusCode::OK);
