@@ -393,7 +393,8 @@ fn rust_signed() -> Value {
     ];
     for (label, action) in actions {
         let unsigned = json!({ "chain_id": CROSS_CHAIN, "from": owner.address(), "nonce": 7, "fee": "123456", "action": action, "memo": "🧛 kat", "public_key": "", "signature": "" });
-        let tx = serde_json::from_value::<types::Tx>(unsigned).unwrap().sign(&owner);
+        let tx: types::Tx = serde_json::from_value(unsigned).unwrap_or_else(|e| panic!("tx JSON shape changed ({e}): update rust_signed() and regenerate testdata/cross"));
+        let tx = tx.sign(&owner);
         let mut c = case(label, [7; 32], b"", &tx.signing_bytes(), &hex::decode(&tx.signature).unwrap());
         c["tx"] = serde_json::to_value(&tx).unwrap();
         cases.push(c);

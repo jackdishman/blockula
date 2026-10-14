@@ -152,8 +152,8 @@ const keyJson = (seed: string) => {
 const stale = (label: string) => `${label}: encoding changed; regenerate node/testdata/cross (see its README.md)`;
 /** pq.rs signs with the namespace as context, hashed with BLAKE3 when over 255 bytes. */
 const contextFor = (ns: Uint8Array) => (ns.length <= 255 ? ns : blake3(ns));
-/** Exactly what `Wallet.sign` produces for this tx, minus the signature and key. */
-const unsigned = (tx: Tx): UnsignedTx => ({ chain_id: tx.chain_id, from: tx.from, nonce: tx.nonce, fee: tx.fee, action: tx.action, memo: tx.memo });
+/** A signed tx minus its key and signature: what `signingBytes` encodes. */
+const unsigned = ({ public_key: _pk, signature: _sig, ...tx }: Tx): UnsignedTx => tx;
 
 /** The SDK's own signatures over its own and the node's messages (`ts-signed.json`). */
 function tsSigned(): Json {
