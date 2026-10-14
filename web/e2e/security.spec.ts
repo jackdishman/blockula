@@ -89,7 +89,7 @@ test("the app runs under the CSP without a single violation, and the CSP bites",
   });
   const consoleCsp: string[] = [];
   page.on("console", (m) => {
-    if (/Content Security Policy/i.test(m.text())) consoleCsp.push(m.text());
+    if (/Content Security Policy|Permissions-Policy/i.test(m.text())) consoleCsp.push(m.text());
   });
   // Onboarding, a recovery kit and the devices page cover most of the app's code paths.
   await createWallet(page, { kit: async (p) => { await makeKit(p); await p.getByRole("button", { name: "Next: claim a name" }).click(); } });

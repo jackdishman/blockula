@@ -1,5 +1,6 @@
 import { CHAIN_ID, GENESIS } from "./env";
 import { createWallet, expect, test } from "./helpers";
+import { MockNode } from "./mock-node";
 
 test("shows the network and chain id on every screen", async ({ page }) => {
   for (const path of ["/welcome", "/recover", "/link"]) {
@@ -65,4 +66,29 @@ test("lets the user leave a wrong-chain node for another network", async ({ page
   expect(await page.evaluate(() => localStorage.getItem("blockula.network"))).toBe("local");
   // Nothing answers there, which the wallet says without blocking.
   await expect(page.getByText(/Can.t reach the node/)).toBeVisible();
+});
+
+test("a custom node: let through the CSP, trusted on first use, refused when its chain changes", async ({ page, context }) => {
+  const url = "https://my-node.blockula.test";
+  const custom = new MockNode("testnet", url);
+  await custom.install(context);
+  page.on("dialog", (d) => d.accept(d.type() === "prompt" ? url : undefined));
+  await page.goto("/welcome");
+  await page.getByRole("combobox", { name: "Network" }).selectOption("custom");
+  // The page reloads with the node's origin in its CSP, and the node's chain on the badge.
+  await expect(page.getByTestId("network-badge")).toContainText("Custom node");
+  await expect(page.getByTestId("network-badge")).toContainText(CHAIN_ID);
+  await expect(page.getByTestId("network-badge")).toHaveClass(/\bcustom\b/);
+  expect((await page.request.get("/welcome")).headers()["content-security-policy"]).toContain(url);
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem("blockula.customChain") ?? "{}"))).toEqual({
+    [url]: { chainId: CHAIN_ID, genesisHash: GENESIS },
+  });
+
+  // The node comes back on another chain: refused until the user says they reset it.
+  custom.chainId = "my-dev-chain";
+  custom.genesisHash = "11".repeat(32);
+  await page.reload();
+  await expect(page.getByTestId("wrong-chain")).toContainText("my-dev-chain");
+  await page.getByRole("button", { name: /trust its new chain/ }).click();
+  await expect(page.getByTestId("network-badge")).toContainText("my-dev-chain");
 });

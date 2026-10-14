@@ -54,8 +54,10 @@ export class MockNode {
   /** Every request body the wallet sent to the node, to prove secrets never leave the page. */
   bodies: string[] = [];
 
-  constructor(chain: keyof typeof CHAINS = "testnet") {
+  /** A node of one of the e2e chains, optionally at another URL (a "custom node"). */
+  constructor(chain: keyof typeof CHAINS = "testnet", rpc?: string) {
     ({ rpc: this.rpc, chainId: this.chainId, genesisHash: this.genesisHash } = CHAINS[chain]);
+    if (rpc) this.rpc = rpc;
   }
 
   /** Answer the wallet's RPC calls in this page or browser context. */
