@@ -53,9 +53,9 @@ use zeroize::Zeroizing;
 pub use commonware_cryptography::handshake::Error;
 
 #[cfg(test)]
-mod mldsa;
-#[cfg(test)]
 mod ml_kem_vectors;
+#[cfg(test)]
+mod mldsa;
 #[cfg(test)]
 mod tests;
 
@@ -239,7 +239,10 @@ fn encapsulate(rng: &mut impl CryptoRng, share: &KeyShare) -> Option<(Reply, Sha
 /// The dialer's half. Returns `None` if the X25519 exchange is non-contributory. ML-KEM never
 /// fails here: a bad ciphertext yields a pseudorandom secret and key confirmation catches it.
 fn decapsulate(secret: DialSecret, reply: &Reply) -> Option<SharedSecret> {
-    let x25519 = secret.x25519.expose_unwrap().diffie_hellman(&reply.x25519());
+    let x25519 = secret
+        .x25519
+        .expose_unwrap()
+        .diffie_hellman(&reply.x25519());
     if !x25519.was_contributory() {
         return None;
     }
