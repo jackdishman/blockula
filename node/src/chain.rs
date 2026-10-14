@@ -2604,7 +2604,7 @@ mod hunts {
         assert!(t.tx(&bob, Action::FundHunt { hunt_id: id, amount: DROPS_PER_FANG }).is_err());
         // Self-award is allowed (and flagged).
         t.tx(&bob, create("jackdishman/blockula", 4, 10 * DROPS_PER_FANG, t.c.height() + 50, "QR")).unwrap();
-        let id2 = t.c.state.hunts.keys().last().copied().unwrap();
+        let id2 = t.c.state.hunts.keys().next_back().copied().unwrap();
         t.tx(&bob, Action::AwardHunt { hunt_id: id2, to: bob.address(), pr: 3, familiar_key: None }).unwrap();
         assert!(t.c.state.hunts[&id2].self_awarded());
         // Everything replays to the same root.
@@ -2638,7 +2638,7 @@ mod hunts {
         assert!(t.tx(&alice, Action::AwardHunt { hunt_id: id, to: bob.address(), pr: 1, familiar_key: None }).is_err());
         // Admins can cancel open hunts any time.
         t.tx(&alice, create("jackdishman/blockula", 3, 10 * DROPS_PER_FANG, t.c.height() + 1000, "python sdk")).unwrap();
-        let id2 = t.c.state.hunts.keys().last().copied().unwrap();
+        let id2 = t.c.state.hunts.keys().next_back().copied().unwrap();
         let admin = t.admin.clone_keys();
         t.tx(&admin, Action::CancelHunt { hunt_id: id2 }).unwrap();
         fs::remove_dir_all(&t.home).ok();
@@ -2668,7 +2668,7 @@ mod hunts {
         t.tx(&alice, Action::RegisterFamiliar { key_id: kid.clone(), label: "claude".into() }).unwrap();
         // Awards can credit the Familiar; a non-Familiar key can't be named.
         t.tx(&bob, create("jackdishman/blockula", 5, 10 * DROPS_PER_FANG, t.c.height() + 100, "PQ handshake")).unwrap();
-        let id = t.c.state.hunts.keys().last().copied().unwrap();
+        let id = t.c.state.hunts.keys().next_back().copied().unwrap();
         assert!(t.tx(&bob, Action::AwardHunt { hunt_id: id, to: alice.address(), pr: 8, familiar_key: Some("ab".repeat(32)) }).unwrap_err().to_string().contains("Familiar"));
         t.tx(&bob, Action::AwardHunt { hunt_id: id, to: alice.address(), pr: 8, familiar_key: Some(kid.clone()) }).unwrap();
         assert_eq!(t.c.state.hunts[&id].familiar_key.as_deref(), Some(kid.as_str()));

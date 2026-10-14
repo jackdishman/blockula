@@ -264,7 +264,7 @@ fn commits_write_only_touched_records() {
     let me = s.c.me().unwrap();
     s.c.state.apply(&t, "state", &me, s.c.height() + 1).unwrap();
     let commit = s.c.state.commit_block().unwrap();
-    let mut accounts = vec![a.address(), b, me];
+    let mut accounts = [a.address(), b, me];
     accounts.sort();
     let touched: Vec<(u8, Vec<u8>)> = commit.records.iter().map(|r| (r.namespace, r.key.clone())).collect();
     let mut expected: Vec<(u8, Vec<u8>)> = vec![(ns::META, meta::BURNED.to_vec()), (ns::META, meta::SUPPLY.to_vec())];
