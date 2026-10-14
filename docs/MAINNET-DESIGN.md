@@ -10,7 +10,7 @@ Mainnet is a **new chain**. Nothing here has to replay the current public testne
 |---|---|
 | DEC-1 Scope at genesis | Everything that can be made safe is on at genesis: transfers, names, accounts and session keys, Hunts, the contribution pool (Souls, vouches, claims, Séances), permissionless staking with slashing, on-chain governance, the fee market and issuance. Admin levers are replaced by governance (GOV-1..3) and the jury draw by a randomness beacon (CRY-3). |
 | DEC-2 Ghost Mode | Wanted at genesis. Its code ships behind a governance-controlled activation (`ghost` feature flag in state) and is switched on only after its own audit: a soundness bug in a shielded pool is a silent infinite mint. See section 6. |
-| DEC-3 Validator set | Permissionless, stake-ranked, equal-weight votes (Polkadot NPoS style; see 3.4). Genesis target ≥ 21 independent operators, active-set cap 64. See the operator policy in OPERATIONS.md. |
+| DEC-3 Validator set | Permissionless, stake-ranked, equal-weight votes (Polkadot NPoS style; see 3.4): simplex's quorum is count-based (`N3f1`), so weighted voting would need a fork. Active-set cap 32 at genesis (a ⅔ certificate is ~73 KB and each validator re-broadcasts two per view, ~4.5 MB/s egress at n = 32 and ~18 MB/s at 64), raised by governance once certificates shrink. Genesis target: 21–32 independent operators. See OPERATIONS.md. |
 | DEC-4 Staking | Self-custodial delegation to validator pools (share accounting), min self-bond, 21-day unbonding, slashing for equivocation (heavy) and downtime (light, jail first). |
 | DEC-5 Supply | See [TOKENOMICS.md](TOKENOMICS.md): no sale, founder allocation with on-chain vesting, governed treasury, contribution endowment, tail issuance. |
 | DEC-6 State growth | Creating an account burns a creation fee; names renew yearly; every other record is bonded already. Parameters are governance-adjustable. |
@@ -74,14 +74,16 @@ Action tags 0–29 keep their meaning. New tags are reserved here so packages ne
 ### 3.2 Blocks (CBlock v2)
 
 ```
-CBlock { version: u32, parent, height, view: u64, timestamp_ms, proposer, exec_height, exec_root, signal: u32, txs: Vec<wire tx> }
+CBlock { version: u32, parent, height, view: u64, parent_view: u64, timestamp_ms, proposer, exec_height, exec_root, signal: u32, txs: Vec<wire tx> }
 ```
 - Digest domain `BLOCKULA_CBLOCK_V2`.
-- `view` is the simplex view the block was proposed in; verifiers require it to equal the round's view. Executed blocks (`blocks.jsonl`) record it too, so missed leader slots are derivable at execution (3.4).
+- `view` and `parent_view` are the simplex round's view and its parent's view (from the consensus context); verifiers require both to match the context. Notarization needs 2f+1 votes, so at least f+1 honest nodes checked them. Executed blocks (`blocks.jsonl`) record them, so missed leader slots are derivable at execution (3.4). Views restart at 1 each epoch; the first block of an epoch has `parent_view = 0`.
+- `verify` returns `false` only for permanently invalid blocks (the `Application` contract). Conditions that may still change (we haven't executed the checkpoint or the cited height yet) keep the future pending instead of voting against a valid block.
 - `version` is the protocol version in force at `height` (3.9); `signal` is the newest version the proposer's binary supports (upgrade readiness, display only).
 
 ### 3.3 State layer
 
+- Store: a Jellyfish-style sparse Merkle tree (BLAKE3; the `jmt` crate or our own) on `redb`, behind a synchronous `StateStore` trait. Commonware's `qmdb` was rejected for now: ALPHA, async-only, and its root commits to operation history rather than the key-value set (`.context/research/commonware.md` §4).
 - Every state map is an `imbl::OrdMap` (structural sharing): cloning `State` is O(1), so the API reads a per-block snapshot without the consensus lock and snapshots don't copy the world.
 - Every record has a canonical binary encoding and a key `(namespace, bytes)`. The state root is the root of an authenticated tree over `BLAKE3(namespace ‖ key) → BLAKE3(value)`, updated incrementally from the keys a block touched. Inclusion and exclusion proofs are served at `/api/proof/...`.
 - Records, tree nodes and the commit point (height, root, block hash, schema version) are written per block in one transaction to an embedded database, after `blocks.jsonl` and `cblocks.bin` are synced and before consensus is acknowledged. Restart loads the database and re-executes at most the blocks after its commit point: restart time no longer depends on history length.
@@ -93,9 +95,10 @@ CBlock { version: u32, parent, height, view: u64, timestamp_ms, proposer, exec_h
 - `RegisterValidator` (permissionless, self-bond ≥ `min_self_bond`) creates a candidate that owns a stake pool. Anyone can `Delegate` to a pool; pools account in shares, so rewards compound and slashes scale every delegator alike. Commission is minted to the owner as shares.
 - At each epoch boundary the next active set is the top `max_validators` candidates by pool stake (not jailed, self-bond ≥ minimum), ties by address, **subject to the churn limit**: at most ⌊(n−1)/3⌋ members replaced per epoch, highest stake first. Votes are equal-weight within the set.
 - `Undelegate`/unbonding lasts `unbonding_blocks` (21 days). Unbonding entries stay slashable for infractions committed before they started.
-- **Equivocation:** nodes capture simplex's conflicting-vote reports and submit `ReportEquivocation` with both signed votes. The chain verifies both against that epoch's set and namespace, slashes the pool `slash_double_sign_bps` (5%), tombstones the validator (never active again), and pays the reporter a share of the slash; the rest is burned.
-- **Downtime:** from each executed block's `view` and its parent's, the views skipped in between had leaders that didn't produce. A validator missing more than `downtime_max_missed` of its last `downtime_window` leader slots is jailed (leaves the set at the next boundary, `slash_downtime_bps` = 0.1%) and may `Unjail` after `jail_blocks`.
-- **Junk blocks (CV-5):** verifiers that are caught up dry-run a proposal's txs on top of their executed state and its unexecuted ancestors and reject blocks containing unadmittable txs. At execution, every skipped tx costs the proposer `base_fee × size` (from its account, then its self-bond).
+- **Equivocation:** simplex runs with `track_historical_votes: true` and an `AttributableReporter`-wrapped evidence sink; nodes capture its `ConflictingNotarize`, `ConflictingFinalize` and `NullifyFinalize` reports and submit `ReportEquivocation` with both signed votes. The chain verifies both against that epoch's set and namespace, slashes the pool `slash_double_sign_bps` (5%), once per (validator, epoch, view), tombstones the validator (never active again), and pays the reporter a share of the slash; the rest is burned.
+- Validator sets are kept in state for the whole evidence window (≥ unbonding), not just 8 epochs. Slashing only switches on together with slashing protection (3.9), so a restored disk can't get an honest operator slashed.
+- **Downtime:** for a block `(epoch e, view v, parent_view u)`, every view in `u+1 .. v−1` was nullified; charge a missed slot to `leader(e, x) = sorted_set[(e + x) mod n]` (call simplex's `RoundRobin` elector for exact parity) and credit `leader(e, v)`. Epoch-boundary re-proposals add no height and aren't counted. A validator missing more than `downtime_max_missed` of its last `downtime_window` leader slots is jailed (leaves the set at the next boundary, `slash_downtime_bps` = 0.1%) and may `Unjail` after `jail_blocks`.
+- **Junk blocks (CV-5):** verifiers replay a proposal's unexecuted ancestors with the exact execute path (end-of-block and end-of-epoch steps included), up to 64 ancestors (beyond that they abstain by staying pending), and reject blocks containing unadmittable txs. At execution, every skipped tx costs the proposer `base_fee × size` (from its account, then its self-bond).
 - Validator system txs (attestations, beacon, evidence) may name a separate fee payer (the pool owner) so consensus keys only hold a fee float (OPS-1, SF-13).
 
 ### 3.5 Governance, treasury, multisig (GOV-1..3, TOK-3, SF-11)
