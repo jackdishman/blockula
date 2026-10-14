@@ -451,6 +451,10 @@ of a more complex AIR.
   bit in every byte of a proof.
 - **Encryption** (`tests/encryption.rs`): round trip, sizes, other keys, tampering in each
   region, wrong `cm`, outgoing recovery, no-ovk noise, wrong recipient, freshness, random garbage.
+- **Lifecycle** (`tests/lifecycle.rs`): through the public API with a toy node (frontier, root
+  history, nullifier set, turnstile): shield, scan, private transfer, outgoing recovery, unshield,
+  a replayed spend refused, and an unshield from outside the pool's history stopped by the
+  turnstile.
 - **cargo-fuzz** (`node/ghost/fuzz`): `verify_proof` and `decoders`. The nightly installed while
   writing this (2026-10-13) hits a compiler panic in `p3-monty-31`, so they haven't run yet.
 
