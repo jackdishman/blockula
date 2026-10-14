@@ -44,7 +44,7 @@ await other.fundHunt(huntId, "10");            // crowdfund; refunded pro-rata i
 await wallet.awardHunt(huntId, "vlad.boo", 34, familiarKeyId);  // optional: credit vlad's agent Familiar
 ```
 
-Awarding from the CLI checks GitHub first: the PR must be merged into the hunt's repo, and it pays the account the PR's author linked.
+Awarding from the CLI checks GitHub first: the PR must be merged into the hunt's repo's default branch, and it pays the account the PR's author linked.
 
 ```bash
 blockula hunt award 3 --pr 34 --rpc https://blockula-testnet.fly.dev            # signs with ~/.blockula/wallet.json

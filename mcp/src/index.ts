@@ -290,7 +290,7 @@ tool("contribution_pool", "Blockula's contribution pool (Proof of Contribution):
     claims: c.claims,
     open_seance: c.open_seance ? { id: c.open_seance.id, phase: c.open_seance.phase, claims: c.open_seance.claims.length, jurors: c.open_seance.jurors.length, reveals_until_block: c.open_seance.reveal_until } : null,
     rules: c.rules,
-    how_to_earn: "Get a PR merged into a pool repo, authored by the GitHub handle linked to the account you act for (link_github), then submit_contribution. Validators check the merge on GitHub; a jury compares it with other claims.",
+    how_to_earn: "Get a PR merged into a pool repo's default branch, authored by the GitHub handle linked to the account you act for (link_github), then submit_contribution. Validators check the merge on GitHub; a jury compares it with other claims.",
     explorer: `${RPC}/#/contribute`,
   };
 });
