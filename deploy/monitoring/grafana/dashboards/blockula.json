@@ -388,7 +388,7 @@
         "colorMode": "none",
         "graphMode": "none",
         "justifyMode": "auto",
-        "textMode": "value_and_name",
+        "textMode": "value",
         "orientation": "auto",
         "wideLayout": true,
         "showPercentChange": false
@@ -570,6 +570,7 @@
             "showPoints": "never",
             "spanNulls": false,
             "axisSoftMin": 0,
+            "axisSoftMax": 15,
             "thresholdsStyle": {
               "mode": "dashed"
             }
@@ -642,6 +643,7 @@
             "showPoints": "never",
             "spanNulls": false,
             "axisSoftMin": 0,
+            "axisSoftMax": 20,
             "thresholdsStyle": {
               "mode": "dashed"
             }
@@ -714,6 +716,7 @@
             "showPoints": "never",
             "spanNulls": false,
             "axisSoftMin": 0,
+            "axisSoftMax": 5000,
             "thresholdsStyle": {
               "mode": "dashed"
             }
@@ -916,7 +919,7 @@
       "description": "Validators in this epoch's active set.",
       "gridPos": {
         "h": 4,
-        "w": 6,
+        "w": 5,
         "x": 0,
         "y": 30
       },
@@ -960,7 +963,7 @@
         "colorMode": "none",
         "graphMode": "none",
         "justifyMode": "auto",
-        "textMode": "value_and_name",
+        "textMode": "value",
         "orientation": "auto",
         "wideLayout": true,
         "showPercentChange": false
@@ -977,8 +980,8 @@
       "description": "Votes a certificate needs: n − ⌊(n−1)/3⌋.",
       "gridPos": {
         "h": 4,
-        "w": 6,
-        "x": 6,
+        "w": 5,
+        "x": 5,
         "y": 30
       },
       "targets": [
@@ -1021,7 +1024,7 @@
         "colorMode": "none",
         "graphMode": "none",
         "justifyMode": "auto",
-        "textMode": "value_and_name",
+        "textMode": "value",
         "orientation": "auto",
         "wideLayout": true,
         "showPercentChange": false
@@ -1039,7 +1042,7 @@
       "gridPos": {
         "h": 4,
         "w": 6,
-        "x": 12,
+        "x": 10,
         "y": 30
       },
       "targets": [
@@ -1098,8 +1101,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 6,
-        "x": 18,
+        "w": 8,
+        "x": 16,
         "y": 30
       },
       "description": "blockula version and git sha per node (blockula_build_info).",
@@ -1235,7 +1238,7 @@
       "title": "TODO · Peers",
       "id": 20,
       "gridPos": {
-        "h": 5,
+        "h": 7,
         "w": 6,
         "x": 0,
         "y": 42
@@ -1250,7 +1253,7 @@
       "title": "TODO · Missed leader slots",
       "id": 21,
       "gridPos": {
-        "h": 5,
+        "h": 7,
         "w": 6,
         "x": 6,
         "y": 42
@@ -1265,7 +1268,7 @@
       "title": "TODO · Jailed / tombstoned",
       "id": 22,
       "gridPos": {
-        "h": 5,
+        "h": 7,
         "w": 6,
         "x": 12,
         "y": 42
@@ -1280,7 +1283,7 @@
       "title": "TODO · Slashing protection",
       "id": 23,
       "gridPos": {
-        "h": 5,
+        "h": 7,
         "w": 6,
         "x": 18,
         "y": 42
@@ -1299,7 +1302,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 47
+        "y": 49
       },
       "panels": []
     },
@@ -1316,7 +1319,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 48
+        "y": 50
       },
       "targets": [
         {
@@ -1385,7 +1388,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 48
+        "y": 50
       },
       "targets": [
         {
@@ -1458,7 +1461,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 48
+        "y": 50
       },
       "targets": [
         {
@@ -1535,7 +1538,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 56
+        "y": 58
       },
       "targets": [
         {
@@ -1601,18 +1604,18 @@
     },
     {
       "type": "timeseries",
-      "title": "Clock offset",
+      "title": "Clock offset (absolute)",
       "id": 29,
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Offset from NTP time (node_exporter timex). Verifiers reject blocks more than 1 s ahead of their clock; the alert fires past 100 ms.",
+      "description": "Distance from NTP time (node_exporter timex). Verifiers reject blocks more than 1 s ahead of their clock; alerts fire past 100 ms and 250 ms.",
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 56
+        "y": 58
       },
       "targets": [
         {
@@ -1620,7 +1623,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "node_timex_offset_seconds{node=~\"$node\"}",
+          "expr": "abs(node_timex_offset_seconds{node=~\"$node\"})",
           "legendFormat": "{{node}}",
           "refId": "A"
         }
@@ -1637,6 +1640,8 @@
             "fillOpacity": 0,
             "showPoints": "never",
             "spanNulls": false,
+            "axisSoftMin": 0,
+            "axisSoftMax": 0.3,
             "thresholdsStyle": {
               "mode": "dashed"
             }
@@ -1649,11 +1654,16 @@
                 "value": null
               },
               {
-                "color": "red",
+                "color": "orange",
                 "value": 0.1
+              },
+              {
+                "color": "red",
+                "value": 0.25
               }
             ]
-          }
+          },
+          "min": 0
         },
         "overrides": []
       },
