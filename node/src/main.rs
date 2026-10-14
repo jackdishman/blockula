@@ -14,6 +14,7 @@ mod validator_cli;
 
 #[cfg(test)]
 mod sim;
+#[cfg(test)] mod kat;
 
 use anyhow::Result;
 use chain::{Chain, SummonOpts};

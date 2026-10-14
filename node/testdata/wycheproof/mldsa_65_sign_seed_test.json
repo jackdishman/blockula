@@ -1,0 +1,1733 @@
+{
+ "source": "https://raw.githubusercontent.com/C2SP/wycheproof/7a325932231bd7a724c791c8b0d65ea4d6d2f435/testvectors_v1/mldsa_65_sign_seed_test.json",
+ "sourceSha256": "e26b2bb9ab8d45ed570ba6828c7e40b6fa3e1545bb8bc2c449c77531760133e0",
+ "trimmedBy": "node/testdata/acvp/trim.py",
+ "algorithm": "ML-DSA-65",
+ "header": [
+  "Test vectors of type MlDsaSign are meant for the generation of ML-DSA signatures",
+  "See doc/mldsa.md for details on how to apply these test vectors."
+ ],
+ "notes": {
+  "BoundaryCondition": {
+   "bugType": "EDGE_CASE",
+   "description": "This case exercises a boundary condition (e.g. in the signing rejection loop)."
+  },
+  "InvalidContext": {
+   "bugType": "BASIC",
+   "description": "The context is invalid (too long)."
+  },
+  "ManySteps": {
+   "bugType": "EDGE_CASE",
+   "description": "This case requires many steps (e.g. many hashes in the matrix expansion, many iterations in the signing rejection loop)."
+  },
+  "Randomized": {
+   "bugType": "BASIC",
+   "description": "The signature was generated with the provided non-zero rnd value (hedged signing) instead of the deterministic all-zero value."
+  },
+  "ValidSignature": {
+   "bugType": "BASIC",
+   "description": "The test vector contains a valid signature."
+  },
+  "Internal": {
+   "bugType": "BASIC",
+   "description": "A test vector with mu and no msg for use with Sign_internal and Verify_internal"
+  },
+  "IncorrectPrivateKeyLength": {
+   "bugType": "BASIC",
+   "description": "The private key has an incorrect length."
+  }
+ },
+ "numberOfTests": 105,
+ "schema": "mldsa_sign_seed_schema.json",
+ "testGroups": [
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a",
+   "publicKeySha256": "b7acce2ddb11f8cc1aa46e2bafac6eacfa2b732ef192bd636ad8d3a56d649c66",
+   "source": {
+    "name": "github/gendx",
+    "version": "0.1"
+   },
+   "tests": [
+    {
+     "tcId": 1,
+     "comment": "baseline",
+     "msg": "48656c6c6f20776f726c64",
+     "mu": "de30bd32395e1998bcdae79ad419cec6ea9e9a903fdc552c6e9801208174d80a9d2f3902a144e62f89d6e505cc9c69fb01de013fc1d0204ee4dcf5fcc25f1378",
+     "sigSha256": "39fbbb0d97a52c79844213b325af823a7f16a174e00a5b3daeb3e6e6d1c89681",
+     "result": "valid",
+     "flags": [
+      "ValidSignature"
+     ]
+    },
+    {
+     "tcId": 2,
+     "comment": "empty provided context",
+     "msg": "48656c6c6f20776f726c64",
+     "ctx": "",
+     "mu": "de30bd32395e1998bcdae79ad419cec6ea9e9a903fdc552c6e9801208174d80a9d2f3902a144e62f89d6e505cc9c69fb01de013fc1d0204ee4dcf5fcc25f1378",
+     "sigSha256": "39fbbb0d97a52c79844213b325af823a7f16a174e00a5b3daeb3e6e6d1c89681",
+     "result": "valid",
+     "flags": [
+      "ValidSignature"
+     ]
+    },
+    {
+     "tcId": 3,
+     "comment": "non-empty context",
+     "msg": "48656c6c6f20776f726c64",
+     "ctx": "436f6e74657874",
+     "mu": "4ecc98bbf304ae91fffce597406e7214dc7b3f6d023f54e0d435d916a57375095d50f842fbfc064c0b23e975ef1c7bbff74b9a7de17a53eb72974f9d96bcdd23",
+     "sigSha256": "c32dd9c1fdb53c049ebb75d98604d27593e32f5da2b1201c9289692de6ebea2e",
+     "result": "valid",
+     "flags": [
+      "ValidSignature"
+     ]
+    },
+    {
+     "tcId": 4,
+     "comment": "longest context",
+     "msg": "48656c6c6f20776f726c64",
+     "ctx": "414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141",
+     "mu": "4974b756a35319eba99edec94cd0485a04d2779cb4c7eab0a2ae387631f39ae4fa654f4a0a09152176aebd8c6f7c4e2c3e9d376c8a0b9bbf9ca0d60a9a3a557d",
+     "sigSha256": "e016b21537310a1eddd2f5093c21dfe5626919c8103b6e520163d2072c9e7685",
+     "result": "valid",
+     "flags": [
+      "ValidSignature"
+     ]
+    },
+    {
+     "tcId": 5,
+     "comment": "context too long",
+     "msg": "48656c6c6f20776f726c64",
+     "ctx": "41414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141",
+     "sig": "",
+     "result": "invalid",
+     "flags": [
+      "InvalidContext"
+     ]
+    },
+    {
+     "tcId": 6,
+     "comment": "signature that takes 1 iteration(s)",
+     "msg": "0700000000000000000000000000000000000000000000000000000000000000",
+     "mu": "a5cbede661da694ca1fa70c166a58a32e353d654af9c14e662455b95c504a2384876fdfdf6a32ac1f377f3454159c9cc49e800a629a0ab913566da4c91aad223",
+     "sigSha256": "54dffec43b1410c8f11bd3f9534830dd2cb98fcd3809a2af3634a89d936954d9",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 7,
+     "comment": "signature that takes 2 iteration(s)",
+     "msg": "0f00000000000000000000000000000000000000000000000000000000000000",
+     "mu": "b10d9539b6864441b9c7d11900c7385a54e07598553314a7759154437302f34fd6635c0f0ba3b72aa74aa98bc028aa152e9247b2fdeff620bcf4094eeb995d39",
+     "sigSha256": "5627158fdfa74d6eee54bf2ae2f362257cca6f13f8e616de2714ddf1400a7e31",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 8,
+     "comment": "signature that takes 3 iteration(s)",
+     "msg": "0100000000000000000000000000000000000000000000000000000000000000",
+     "mu": "e47e2a00c99c67f670134cfd7829194111e7959ca845eda3234e740a9ba444085216ef3d9549b0eb0f21cc8e3b251af73badd1e2ff78071c81b10275275eefa8",
+     "sigSha256": "5e558b25ae2f5faed3c160835267448764534050312093c05c46084c92b1c2bf",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 9,
+     "comment": "signature that takes 4 iteration(s)",
+     "msg": "0800000000000000000000000000000000000000000000000000000000000000",
+     "mu": "e569465543085579b791bf754f74a52052e2bbfab9e7f4a1860a45b98f91d1a527b935a177cfb6e20d64350c7533d45faf105ce51e7c2d1117bafdf96f88d4e2",
+     "sigSha256": "d374ef3bfa5184fe05b40c2cbcb574eb564aeaad976c68317b082f91c972410b",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 10,
+     "comment": "signature that takes 5 iteration(s)",
+     "msg": "0500000000000000000000000000000000000000000000000000000000000000",
+     "mu": "9257942d205642c1ab250d1f3ddeeed72db9a4279b0f93b7a911ac7694d37be1956fb298b26764aad6522f696ebcfe4c9a0847553ef7a245e6345e411263e3c3",
+     "sigSha256": "b24ad2b44b4594641324b3b503eb28c01f82b2bef7dbe5d0c20104a137022b19",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 11,
+     "comment": "signature that takes 6 iteration(s)",
+     "msg": "2c00000000000000000000000000000000000000000000000000000000000000",
+     "mu": "6931eeced3fcca3f4d95d0dbc9f673a71fc626e5bd57f0f121697f0459b473a4ae05216ceabc263914d8247f33378b481e0231d427e5bc25916ef75e3f686e50",
+     "sigSha256": "2551eb35723254b4aea274ec377211b04e4d39ebc3f021fa8cd6ed599e6e0cc6",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 12,
+     "comment": "signature that takes 7 iteration(s)",
+     "msg": "1200000000000000000000000000000000000000000000000000000000000000",
+     "mu": "0253381f90978e6f2c838bd823d99b340c0f923ce9df68c8e7aae5155c8d4c72520aadc1765c26fc5fed28afbafb65092f08c8174ce2e8a06053563d16cea554",
+     "sigSha256": "89eb4bfe466b831c08dff67b5c795b4c7a2825dc4931c8d398990bc83c03518d",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 13,
+     "comment": "signature that takes 8 iteration(s)",
+     "msg": "0900000000000000000000000000000000000000000000000000000000000000",
+     "mu": "6f0aa53130c08e0c876ca6fcc23eaed532d9bcc85e3bed58adeeeac6f8b98f3322c38f37f9c824005b0e9f775edd5c425b633ebe90411525d9d10e6fe8a94120",
+     "sigSha256": "e233ab9c07ae5059e8acd4394981f2e38f9def2a745485c12f46e959ddb8989a",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 14,
+     "comment": "signature that takes 9 iteration(s)",
+     "msg": "0a00000000000000000000000000000000000000000000000000000000000000",
+     "mu": "c44e118598b50eea4347479d974a8c6bceb5f257a94cdbb9144c95baf1cd435d64379954a36ff7174114528a9daafc047bca669db35575c91858eb95ad06be57",
+     "sigSha256": "3bfa8cd6ef8ceb051093b58da064176111ab388158ab9d65bb53d2b32ec25241",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 15,
+     "comment": "signature that takes 10 iteration(s)",
+     "msg": "0b00000000000000000000000000000000000000000000000000000000000000",
+     "mu": "bdc5ebd62f530eba805831f5e12c2864ddc2fb3277bf1389043a38816f89730ca5192f0261d4f6e5f8189c032e4380c3ad0ea198784fcce13c066498377bc8aa",
+     "sigSha256": "cf7d1ad54141e64d1e282faa875500faadc30184cdb91e1d9c4c7f2b3aeca845",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 16,
+     "comment": "signature that takes 11 iteration(s)",
+     "msg": "0200000000000000000000000000000000000000000000000000000000000000",
+     "mu": "70b6e286d7c3ed051e3e798c24d9fbc64f0ff1bacd4395eedae027ddd40f64ba1b4102119067be954629550794e08d7bbaa4bcba2c34426c7f52c155d21fe0d5",
+     "sigSha256": "f0913aede6ba6e4da48e74816564187866cd1d88ae305edcaeca4fa12447b343",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 17,
+     "comment": "signature that takes 12 iteration(s)",
+     "msg": "1000000000000000000000000000000000000000000000000000000000000000",
+     "mu": "feeb433b142928771e65a55feb309c9afc63303b6a45e2b939f827f041bff003f4fa526c15f05f477ea1af415942ebe5329a057b6d7167c756e96c9a2153be08",
+     "sigSha256": "c422cd93494f1c308995759704d7fc128397d74b4aba452431183f607d24ebe2",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 18,
+     "comment": "signature that takes 13 iteration(s)",
+     "msg": "1500000000000000000000000000000000000000000000000000000000000000",
+     "mu": "d501e05711cf1f7584558aec64e1f66183df7902efdd98a470c332deb5083f3f228840377fa62570dfaed493dd246b648f357b151d73805c9daa340ade8083d9",
+     "sigSha256": "9128d18d40e31fa03586ca95f3cbe2903609e25541ae8eb7959c8bbe8a2ea48b",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 19,
+     "comment": "signature that takes 14 iteration(s)",
+     "msg": "8e00000000000000000000000000000000000000000000000000000000000000",
+     "mu": "00c52c76af4feaa0e66d1db376e190bc7da1387a42df89ec55b5d996a08efaf0f71823706803d9e6a680a864b4be62a065e623c178d76327d735638134c0ab0f",
+     "sigSha256": "c144211bd712c5002af91f68d36ae9e473a7fbd1d0a37b80ab48b01ed2570a8b",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 20,
+     "comment": "signature that takes 15 iteration(s)",
+     "msg": "dd00000000000000000000000000000000000000000000000000000000000000",
+     "mu": "3a6a74a7492ce4c08a4ad8c487c0427c9d4f28f0a8216832cd939c8be1d1b9be02a92933a935f1689d033590b5530bb08d7a3607099cfacc32ad2689664cf9f4",
+     "sigSha256": "b81eca51a33fadacd9bea2bb2d8420038dfa1d238f9bb4ce96250fc5759589e0",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 21,
+     "comment": "signature that takes 16 iteration(s)",
+     "msg": "6c00000000000000000000000000000000000000000000000000000000000000",
+     "mu": "5e4bf75c177cf84fc8afae46fccac86cce67d7a4097eed103bd388abfa05dd799c8f0fd5b6935ea826281d925758e66f75a35355117ba56d7ffbc849bf509c3c",
+     "sigSha256": "8907d796e4a813a632fda92cd5b7e4058c2b330c58d87d8223521acd737ff998",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 22,
+     "comment": "signature that takes 17 iteration(s)",
+     "msg": "2400000000000000000000000000000000000000000000000000000000000000",
+     "mu": "4c6577550174e437f0c37f37a53c5ae4301b165533739358e000ac9ca0cde1c3d064cf1bcb4f376a3b1e714766eb88ad3edfc6cb128efd23b278fd784033f895",
+     "sigSha256": "062fd2681edce7dac8b55b01ef9f2cdcd0d0187e47e0e4f77d4405ea486f94a8",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 23,
+     "comment": "signature that takes 18 iteration(s)",
+     "msg": "f900000000000000000000000000000000000000000000000000000000000000",
+     "mu": "536e7cadc1c239a2d7ec9bc5f344110236aff98d093461f5c31823bdf9a17118f0c2b49ee47ba87c3743b7f3f966118ef03033a1a0eb9525dea3ad773d26736a",
+     "sigSha256": "af8ce84df5095a1798a16b3547a7422afcd07fa78210f4fde81ae58d6b92deb7",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 24,
+     "comment": "signature that takes 19 iteration(s)",
+     "msg": "a401000000000000000000000000000000000000000000000000000000000000",
+     "mu": "ffeb15023b07a43133ddfb4d63ebcdc930fb5e9651e89f7dbe340b6086e5ddf2d8aebdb8968d49cc5384aa2bfa0443984869f1e4c277c496e5a45a8757cb997b",
+     "sigSha256": "ad27d3a269c7bf5a2e58fe24bfedd20ab96a2ee45905a112e0491cf3fc38808c",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 25,
+     "comment": "signature that takes 20 iteration(s)",
+     "msg": "1305000000000000000000000000000000000000000000000000000000000000",
+     "mu": "1ad91b7d0600124b5121edcbd121ff707e2bf5bb8b3a6b672b5a4047a5f2154ffb8ee21b679b2fecbc6a656a6658b1656067a3a973dbec17d140ebffbc0a57f0",
+     "sigSha256": "1924d59e760216f824dcce8081f57f8147e9890163dd67788ef505b4071f290e",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 26,
+     "comment": "signature that takes 21 iteration(s)",
+     "msg": "8d00000000000000000000000000000000000000000000000000000000000000",
+     "mu": "3029100bbbe1cb80271ea9b74581f392aa078eb455122d80d950ca4333e4f08e8c85ff0d1a4ecee30d8f1cf894446316952cd2ed6db3959df67a5a28aa118be0",
+     "sigSha256": "1ab414bf7df407ea646005ccb084b05151d8aa3b9c2fee357bea257f08ba7365",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 27,
+     "comment": "signature that takes 22 iteration(s)",
+     "msg": "7d00000000000000000000000000000000000000000000000000000000000000",
+     "mu": "a0699b144cf4806932d333b7854fbc52f99ec9399b23b9bf2037c7c432185e96781185e42a0a89c56dacdb62dcc37390ca76b778dbffcc76bedb5da52e5c0ea7",
+     "sigSha256": "9f5f11f15fdb5161169a4931d135aafa6d8b854c7041f3da4bea92970f48de51",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 28,
+     "comment": "signature that takes 23 iteration(s)",
+     "msg": "b900000000000000000000000000000000000000000000000000000000000000",
+     "mu": "6e05e7460d4efade385cc860672920269d4828b505e0b0449a9e858878539a7b27a3b5c315ada562aca2d9065954b2408ddfcb917b739e8b431414732eff3457",
+     "sigSha256": "09c71a315acf1d6f950ef2266ab51805b3408f96ff5c66af100787578cbaa8d4",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 29,
+     "comment": "signature that takes 24 iteration(s)",
+     "msg": "2606000000000000000000000000000000000000000000000000000000000000",
+     "mu": "46bec3f874bc581e3f87675f821c9bbf8fa6a283efc254d755311f97b2883c5ad8f71048b57305385387e65b29e9877aef7b26586c4b2b1765b0e0109aaff8fc",
+     "sigSha256": "a4186615b10f5e4b3d4a2adc31021ea45fe9aabf76ccea7e7608062d7ab1d56f",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 30,
+     "comment": "signature that takes 25 iteration(s)",
+     "msg": "4301000000000000000000000000000000000000000000000000000000000000",
+     "mu": "c04c00dcd05e3b0a06ba1f6b769eaa2832cda7d234187603951808516672c57a606eaa7736cf84c5d9c79caa67f57d42c15395ef850524ed3e5c191d2184dce0",
+     "sigSha256": "64048b81fed0edbcba002eb61edad14ca15cbf30a8234cecf52b7347c292bc7a",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 31,
+     "comment": "signature that takes 26 iteration(s)",
+     "msg": "4801000000000000000000000000000000000000000000000000000000000000",
+     "mu": "9032321b3fbf9494883589a58c17150eba85c98c75eee48f063acf4463525da3e8f04e949744494b13d15f00e108156387b60df5ce041af242fd2f1dab511348",
+     "sigSha256": "18752b03f82fd8605d8fba52c5f7f76fa7ab3fc4bdd276f1d91507644fc2b497",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 32,
+     "comment": "signature that takes 27 iteration(s)",
+     "msg": "c302000000000000000000000000000000000000000000000000000000000000",
+     "mu": "0bae871f998f3137a5aa7264ecc1f6f0200a7e48ce411547e5e87ca0bc0e11efd281263fd7c9c9384e1b6a9b500ec1f250d8dbdf873eb1ed5ab34e657dac0ddd",
+     "sigSha256": "11d3fc6d90fbc857772de431453e37abbc9826fa763067f07ddff31eece7dc8e",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 33,
+     "comment": "signature that takes 28 iteration(s)",
+     "msg": "8f07000000000000000000000000000000000000000000000000000000000000",
+     "mu": "d9509b3fb1234469d215c8a64e2025c491dd464a80d430007beb1368a5555a8a4feb5ce56681941950bffd8eaa10b96d8df9fd8c84fe7207771fad2c751e493b",
+     "sigSha256": "edb36777fc78ba41af1be1f768eba930c30dd2add3a352819bddaf289d380d20",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 34,
+     "comment": "signature that takes 29 iteration(s)",
+     "msg": "2001000000000000000000000000000000000000000000000000000000000000",
+     "mu": "e36717164f1507ac05aca51762b7af005690da5af5b899982ddb9226c0276a827d0e251c45640df11c68ada3b1a4b526e89ed36429262dd2b0fc4c3ccb763315",
+     "sigSha256": "ccdde38760861ad2ca1527bb65fa500d5d009abe3d8f856fc470e52df31f2656",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 35,
+     "comment": "signature that takes 30 iteration(s)",
+     "msg": "4901000000000000000000000000000000000000000000000000000000000000",
+     "mu": "d12f469807a613450537082aeea5c1819c1c370d23cae8a8810632f456ce2171d7f5fe73dd810eb26ea3eb5ad24dd69cd2029d52b0ed74420d4a3e16937949ff",
+     "sigSha256": "1aca0e2f580b3a75746e3a6186893369a494ecf71a9f26ef204d911f3a44b48a",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 36,
+     "comment": "signature that takes 31 iteration(s)",
+     "msg": "3308000000000000000000000000000000000000000000000000000000000000",
+     "mu": "a4c1098ad283f1912d8c686b20db6633cc2458a6ec12a13643e74bbc7d9003e2119894917a32d61ec74ef36a84d8bf07b9d66b937f7c483b91a839d1c78bcbb2",
+     "sigSha256": "276e3871f71c1628072aaf3e20cca0b24f319679bb69bb2f2c4da4f9653b8aed",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 37,
+     "comment": "signature that takes 32 iteration(s)",
+     "msg": "9721000000000000000000000000000000000000000000000000000000000000",
+     "mu": "faddf19c45b55aa01db1e50c8ea10cb4a3125e810ee40d5c41e7e3d2f36be28aad089b2e685afc999c0c9a3bbfe39281c78889344774b906f6ff998300d9ba9f",
+     "sigSha256": "67c36b13b0dea6943797183fa03bbb2f6f109667e7e2190308fb1c0f07005c76",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 38,
+     "comment": "signature that takes 33 iteration(s)",
+     "msg": "b504000000000000000000000000000000000000000000000000000000000000",
+     "mu": "cadcc1b9a4df3a7aaa8fecc3c41a4de88ab2c78eace432a0a116c2836679655b6acc8d97f19e877df44757677f8c59659ca5eba09cd743acb57bc98b5bd05967",
+     "sigSha256": "01b2858e6f751f20d33f5cdb3e494f72fa0b6d6ba67590c05cc53c759de25537",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 39,
+     "comment": "signature that takes 34 iteration(s)",
+     "msg": "b502000000000000000000000000000000000000000000000000000000000000",
+     "mu": "491c03b8c84d32639f925f270f598685ed8c9e75737840cfd88ed8c511e4e689401203eed4a22687ed237e694c88139d397fd6cf0a7453a0ae70aa9b4297fc54",
+     "sigSha256": "4db2225d517d7660323a8ce243398024938b25fea32d1fcd0e34bd400dd1cbe9",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 40,
+     "comment": "signature that takes 37 iteration(s)",
+     "msg": "d20c000000000000000000000000000000000000000000000000000000000000",
+     "mu": "6b707cce29816c722b350722537e002920d0ef64f48e4e8d76a27730fa309c87272f20ec5c44459d5b4532a57eafe68178092cb3a227d9899b470e5084133231",
+     "sigSha256": "1d7b3eb971ef6cad8209eaaadb5183eb38adfb108c481af2bcb450161f923379",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 41,
+     "comment": "signature that takes 39 iteration(s)",
+     "msg": "cb0c000000000000000000000000000000000000000000000000000000000000",
+     "mu": "4d2d35034e77e0e687be822deb0a6baec5401a921fd429a5a3a6f15a94eb40e093830123269cb4794c082b1218a4c0602f5ce6c8bcdecf5a80285d3bef1f6902",
+     "sigSha256": "dc6bf696bc26935dd3c1a4f4ba981781f504b9798f8a702f04cc62446b5d9f81",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 42,
+     "comment": "signature that takes 43 iteration(s)",
+     "msg": "fe03000000000000000000000000000000000000000000000000000000000000",
+     "mu": "28804e4ea8029877fa03129a332da140f9d20db34dade2227687117d32c72545556c0fce16e0c50228c2cfa0a8df2e50c873d89a1bd1c846703f53a20071b21e",
+     "sigSha256": "79c7a4e568eb2cc0f463c1ceacabc728a21c583113aee22f03227a39e6ae3ab7",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 43,
+     "comment": "signature that takes 44 iteration(s)",
+     "msg": "bc10000000000000000000000000000000000000000000000000000000000000",
+     "mu": "de5f0f0583505914dcbe929bb127baa5851c4eaf6eeb1358904a7d18dbb3794d0721005f2d851b501daf5dff89b5101ac3fa4275915f73f95ba858a4df9fdf5a",
+     "sigSha256": "ecfc8661b5f696ab5ad2ccca405a4e7f3d83b1f7ace95fdf5c1b830bf4bb39e5",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 44,
+     "comment": "sample_in_ball requires 1 SHAKE blocks",
+     "msg": "0100000000000000000000000000000000000000000000000000000000000000",
+     "mu": "e47e2a00c99c67f670134cfd7829194111e7959ca845eda3234e740a9ba444085216ef3d9549b0eb0f21cc8e3b251af73badd1e2ff78071c81b10275275eefa8",
+     "sigSha256": "5e558b25ae2f5faed3c160835267448764534050312093c05c46084c92b1c2bf",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 45,
+     "comment": "sample_in_ball requires 76 SHAKE bytes",
+     "msg": "933a000000000000000000000000000000000000000000000000000000000000",
+     "mu": "47f4c12f533de89ce650e8b28ad08fe2b1bcb7397a2d50f9eb1d8328894ff8cc8a131355a3fc365d6107f393dfe856413f768a6dbdfdfb0a99da78e7f8332957",
+     "sigSha256": "b9c90034629199ab8deba43982d4f31f464ca0aa3c41243f4872eb07de42a7ae",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 46,
+     "comment": "z_max below the limit",
+     "msg": "8700000000000000000000000000000000000000000000000000000000000000",
+     "mu": "d90d7c75528b7d3273fe85d880dbbf781da85ff360c9bfcd759a6d787d801c917961ae6b36a6cc23c0a18475776aadecfe53f6b17650dcc102c3ddb945e183d4",
+     "sigSha256": "3b0c7a89c14176246995400d9bb9b02d86b1d5e4feec92c6c4f25b8532de59e7",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "BoundaryCondition"
+     ]
+    },
+    {
+     "tcId": 47,
+     "comment": "z_max above the limit",
+     "msg": "6e01000000000000000000000000000000000000000000000000000000000000",
+     "mu": "f122f7c4eacb7a30e3d562ec5316e8fe43000d85c9da934af3f6f614c057bacb2efa0050a780f0b1b6fc200fbfdcf6ece36a8107e6dec86e7475d79c97230aab",
+     "sigSha256": "76b0b39f41c19a3276a3a94dd69ab394adede2bbc2f3ea149b9d1c102551974f",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "BoundaryCondition"
+     ]
+    },
+    {
+     "tcId": 48,
+     "comment": "r0_max below the limit",
+     "msg": "3c00000000000000000000000000000000000000000000000000000000000000",
+     "mu": "4e3df867677ddcaf01545137405a91e70d2e10dd46b0b13ab356874a43ce6dfa70f2f530dde581927f1c10a3196889caa5eb75492fecc640e7d8712d18acb327",
+     "sigSha256": "facafa123eb5d07715505f8645c95714d7265a5d891dee642b2c863331319c1d",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "BoundaryCondition"
+     ]
+    },
+    {
+     "tcId": 49,
+     "comment": "r0_max above the limit",
+     "msg": "6400000000000000000000000000000000000000000000000000000000000000",
+     "mu": "a01228e1b6b49b5a2f2eeba90213896c7d8f432cc3512d9928995a85dbe31bb882f146a6fe078f1de38ca74df588e0e94c4cee400c5c8f22ab2a377a86443502",
+     "sigSha256": "bf1ea9780242b2038b2155a548d460222090363e6fd56f98f2a20e716c4a2db0",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "BoundaryCondition"
+     ]
+    },
+    {
+     "tcId": 50,
+     "comment": "h_ones below the limit",
+     "msg": "2d05000000000000000000000000000000000000000000000000000000000000",
+     "mu": "a21051c6bdf0fac92db2bd447d5de8baf9e6805ba3552a61ae01e7591f5e9aee3d42b776c22e388ea7d26a254e8136dd5ebf5ad86c8e38ef319a376fa8f6777a",
+     "sigSha256": "a2efea9466471d0677a0438b7118aa82eacf9e3acaa46f9e0cc2ee2aa973bf9b",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "BoundaryCondition"
+     ]
+    },
+    {
+     "tcId": 51,
+     "comment": "h_ones above the limit",
+     "msg": "9a01000000000000000000000000000000000000000000000000000000000000",
+     "mu": "6bd3e30fbed22a78b5921f0ce34c5c1c936f2f4bda147626769e90380e72c32e88c661096deb3e8e1ea78a726e6a6d71b491bd2dcce73a0da89d24f66816efb5",
+     "sigSha256": "c85ba39f1176cc26e0c608c8f1726f0508a8c00989129f18b88d2f1b6e6f764d",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "BoundaryCondition"
+     ]
+    },
+    {
+     "tcId": 52,
+     "comment": "high_bits called on the edge case",
+     "msg": "8803000000000000000000000000000000000000000000000000000000000000",
+     "mu": "aa3f2137c0480cb05023cd517eadcc5977003fa139b60a77bcac57d2dcbee35a48e9b9cb98b6ea9b1ae2fdcf0d2ed671b803819c187421db0a7ae3f6afb58c80",
+     "sigSha256": "535fa6f13c9b568958d6285574ded795be070176822ff6165dcf5f72de07f96f",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "BoundaryCondition"
+     ]
+    },
+    {
+     "tcId": 53,
+     "comment": "low_bits called on the edge case",
+     "msg": "b502000000000000000000000000000000000000000000000000000000000000",
+     "mu": "491c03b8c84d32639f925f270f598685ed8c9e75737840cfd88ed8c511e4e689401203eed4a22687ed237e694c88139d397fd6cf0a7453a0ae70aa9b4297fc54",
+     "sigSha256": "4db2225d517d7660323a8ce243398024938b25fea32d1fcd0e34bd400dd1cbe9",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "BoundaryCondition"
+     ]
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "0100000000000000000000000000000000000000000000000000000000000000",
+   "publicKeySha256": "5cf5ca52795ec3625aa2a4f78896a05d727be90ad855a17793f3ca152205dbc3",
+   "source": {
+    "name": "github/gendx",
+    "version": "0.1"
+   },
+   "tests": [
+    {
+     "tcId": 58,
+     "comment": "rej_ntt_poly (sample_uniform) requires 5 SHAKE blocks",
+     "msg": "48656c6c6f20776f726c64",
+     "mu": "0855bbb7c76a878e24757c40f18010f1f3d63bfcd1ad3ef1e700845e3f873be6ddcef351ac16ebd16559ab060665b46253e40b910b1188914e13d833b0768aa8",
+     "sigSha256": "66d43d53a9021642290ad9a8c52da8babd351e6451c2abd75b4d6fa061e5b0ef",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 59,
+     "comment": "expand_a requires 150 SHAKE blocks",
+     "msg": "48656c6c6f20776f726c64",
+     "mu": "0855bbb7c76a878e24757c40f18010f1f3d63bfcd1ad3ef1e700845e3f873be6ddcef351ac16ebd16559ab060665b46253e40b910b1188914e13d833b0768aa8",
+     "sigSha256": "66d43d53a9021642290ad9a8c52da8babd351e6451c2abd75b4d6fa061e5b0ef",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "c341000000000000000000000000000000000000000000000000000000000000",
+   "publicKeySha256": "fc740d33115fc51bd657ff2158faf67ba9cdc08f35cae7aa35f1e02431afc437",
+   "source": {
+    "name": "github/cpu/mldsa-edge-cases",
+    "version": "1.0"
+   },
+   "tests": [
+    {
+     "tcId": 60,
+     "comment": "rej_ntt_poly (sample_uniform) requires 783 SHAKE bytes",
+     "msg": "48656c6c6f20776f726c64",
+     "mu": "a9369a66aa77d337d633502de9aa2c0b5c5065bb23ccf3ad032314b2a26c0b1af47354dbccd118b3ccce24670fb1d745433af2085c21f2bb252d4850f0d0a033",
+     "sigSha256": "5fb6ae6b2f3ea5198eab0588d4b74480a08911651f5c8e685d2f6e0c2dac9754",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "511e000000000000000000000000000000000000000000000000000000000000",
+   "publicKeySha256": "1f1091ebfe9ca54d7fea02026fc9f4ffc87868440d6d061f6f6f9319bb4fa16c",
+   "source": {
+    "name": "github/cpu/mldsa-edge-cases",
+    "version": "1.0"
+   },
+   "tests": [
+    {
+     "tcId": 61,
+     "comment": "expand_a requires 23103 SHAKE bytes",
+     "msg": "48656c6c6f20776f726c64",
+     "mu": "b37a0b30652124e0203aa6ee7eb16868ae8c08a1188334ccbb84a93a7f18b83a4933456e69486e88f9d2e23e12fc3b64b681f53fbeb4f28e43424bbfb1773b18",
+     "sigSha256": "fb8c2f96d17e43ffb1cd81fc4df04e62b7054be188ee69198e57babd126eac49",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "f6f1010000000000000000000000000000000000000000000000000000000000",
+   "publicKeySha256": "8580dbb4a4f94a10101143cc26b6abb2caedc1c20fbcfc08ffb33edfa820d5f0",
+   "source": {
+    "name": "github/cpu/mldsa-edge-cases",
+    "version": "1.0"
+   },
+   "tests": [
+    {
+     "tcId": 62,
+     "comment": "rej_bounded_poly (sample_uniform_eta) requires 3 SHAKE blocks",
+     "msg": "48656c6c6f20776f726c64",
+     "mu": "8b1051301200b9f88ff5fb3426313de92be79194767ce0bb357c7458579a01be8fdf203ffad021ffe262f7c1f0ecbd924cf8a1d5a06eb4e57f8c02b60e3b815f",
+     "sigSha256": "762966910d9c385508bbcada0b1da1900981d74ed8c0bb1c23a00ad557c7eeb6",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    },
+    {
+     "tcId": 63,
+     "comment": "expand_s requires 23 SHAKE blocks",
+     "msg": "48656c6c6f20776f726c64",
+     "mu": "8b1051301200b9f88ff5fb3426313de92be79194767ce0bb357c7458579a01be8fdf203ffad021ffe262f7c1f0ecbd924cf8a1d5a06eb4e57f8c02b60e3b815f",
+     "sigSha256": "762966910d9c385508bbcada0b1da1900981d74ed8c0bb1c23a00ad557c7eeb6",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "4cce020000000000000000000000000000000000000000000000000000000000",
+   "publicKeySha256": "1ce25692799ab125dcbcda07c4d33e4f812169cdc617ab0b2c7633dc9e62b8a2",
+   "source": {
+    "name": "github/cpu/mldsa-edge-cases",
+    "version": "1.0"
+   },
+   "tests": [
+    {
+     "tcId": 64,
+     "comment": "rej_bounded_poly (sample_uniform_eta) requires 277 SHAKE bytes",
+     "msg": "48656c6c6f20776f726c64",
+     "mu": "728a817d4af26f478019bf3412784689f1012f583e2555ae3316a3cac6a151acad5ca718f6792885c2001c5b5a98a5e4f38fe4574f2c9c8df78bd181457d4506",
+     "sigSha256": "fd1b98da76aba545cfc6a3b9d0d405acf7a30df5d4baca26324cd633b6e87f49",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "9b8e060000000000000000000000000000000000000000000000000000000000",
+   "publicKeySha256": "de810e925560c810e35895d9447fe64b32c04937f3c6cbf20c142f47143444aa",
+   "source": {
+    "name": "github/cpu/mldsa-edge-cases",
+    "version": "1.0"
+   },
+   "tests": [
+    {
+     "tcId": 65,
+     "comment": "expand_s requires 2649 SHAKE bytes",
+     "msg": "48656c6c6f20776f726c64",
+     "mu": "e59646628fb1e73ea9df226680796bbf51b25ea9b4072bd1fb9e71f97c39bb36007b4cbf4040e50c75b6d7274b46c664e54ea09ae28057c81ec9bdb5f0912758",
+     "sigSha256": "6dec38f9d6c46d7fed3461967cd4916d3521a0748dde81be578a57998568ef3d",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "ManySteps"
+     ]
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "4200000000000000000000000000000000000000000000000000000000000000",
+   "publicKeySha256": "6dd6fbf86c1218d3372dd1b820b64ce208d91685691f701ded4d229b40d077a4",
+   "source": {
+    "name": "github/cpu/mldsa-edge-cases",
+    "version": "1.0"
+   },
+   "tests": [
+    {
+     "tcId": 66,
+     "comment": "power_2_round returns a remainder of 4096",
+     "msg": "48656c6c6f20776f726c64",
+     "mu": "02910479dc641e54151023c096e8828137969ca4d45a6c55c2447bbd5aadee07a9f6d577f4fbf115e3625f46d07f635b5ab5cbeeae7d4485cd548ff589407a3d",
+     "sigSha256": "dcf792aac6b62c48edc12ff8694449255d19c8de209d3fa13c95bc2d81954ccb",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "BoundaryCondition"
+     ]
+    },
+    {
+     "tcId": 67,
+     "comment": "power_2_round returns a remainder of -4095",
+     "msg": "48656c6c6f20776f726c64",
+     "mu": "02910479dc641e54151023c096e8828137969ca4d45a6c55c2447bbd5aadee07a9f6d577f4fbf115e3625f46d07f635b5ab5cbeeae7d4485cd548ff589407a3d",
+     "sigSha256": "dcf792aac6b62c48edc12ff8694449255d19c8de209d3fa13c95bc2d81954ccb",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "BoundaryCondition"
+     ]
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "464756a985e5df03739d95dd309c1ed9c5b04254cc294e7e7eb9b9365ee15117",
+   "publicKeySha256": "fa72d127d6c6f142c6b77204592689764ed697c2729893bd1b6e19bcf5d64166",
+   "source": {
+    "name": "NIST draft-celi-acvp-ml-dsa table 1",
+    "version": "1.0"
+   },
+   "tests": [
+    {
+     "tcId": 68,
+     "comment": "NIST draft-celi-acvp-ml-dsa.html Table-1 - KATs for rejection cases",
+     "mu": "bcbed96ad917133fbecd0de58dfbd124d66887009814dc4ad756992c9c23af9b7e0f08c34d87f29f89256112e827e66c36bcc107eb99aff5fd4d254754c1f9e3",
+     "sigSha256": "8e08ea0c8db941685b9905a73b0b57bad3500b1f73490480b24375b41230cc04",
+     "result": "valid",
+     "flags": [
+      "BoundaryCondition",
+      "ValidSignature",
+      "Internal"
+     ]
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "235a48db4ca7916b884f424a8586efd517e87c64aecec0fce9a3cc212ba1522e",
+   "publicKeySha256": "8baefd71d236ca903bc7712ea738734a0f9a2f8ea59adf5059dfb64b5605b472",
+   "source": {
+    "name": "NIST draft-celi-acvp-ml-dsa table 1",
+    "version": "1.0"
+   },
+   "tests": [
+    {
+     "tcId": 69,
+     "comment": "NIST draft-celi-acvp-ml-dsa.html Table-1 - KATs for rejection cases",
+     "mu": "700b34d900286bc65908468bf8cb702888a215faea69875d4afd2f556432e0802d316c52308a85f4a56b157693d76b2454f0603ae1bc6887383eeb0f7938c7f9",
+     "sigSha256": "ae9531a01738615b6d33c77b3ff618a86e101fdc4c8504681f0edfa64511ad63",
+     "result": "valid",
+     "flags": [
+      "BoundaryCondition",
+      "ValidSignature",
+      "Internal"
+     ]
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "e13131b705a760305feffebfe99082e2691a444bbefcc3edf67d909886200207",
+   "publicKeySha256": "34d76c326e2b73c1d348e897c53e494d0185e3835a12f17f77690d19086321a7",
+   "source": {
+    "name": "NIST draft-celi-acvp-ml-dsa table 1",
+    "version": "1.0"
+   },
+   "tests": [
+    {
+     "tcId": 70,
+     "comment": "NIST draft-celi-acvp-ml-dsa.html Table-1 - KATs for rejection cases",
+     "mu": "c0b6ae56af5247390d093972c6c1794f8796e5bdaff602f291d7d57f2e8513241237c0446cd263ba00f9ed567b267bae1051b0f46bc853a5465857f7980e65ea",
+     "sigSha256": "3c55e604deca7b89a99305d7a391c35f66a17c1923f467675ec951c0948d21c9",
+     "result": "valid",
+     "flags": [
+      "BoundaryCondition",
+      "ValidSignature",
+      "Internal"
+     ]
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "0a4793e040a4bc0d0f37643d12c1ea1f10648724609936c76e0ec83e37209e92",
+   "publicKeySha256": "52750735f6fa4e13bb44d97564a58dcd39cc100f9b546411e3336a1f408c4d85",
+   "source": {
+    "name": "NIST draft-celi-acvp-ml-dsa table 1",
+    "version": "1.0"
+   },
+   "tests": [
+    {
+     "tcId": 71,
+     "comment": "NIST draft-celi-acvp-ml-dsa.html Table-1 - KATs for rejection cases",
+     "mu": "63632e247bc96d473540b160540aae2b175110a32846e73538e9d21ef70cdb342e64a9752a0c82934d0f7506f4b269670f0ab74209d9eb897bba76f49f3086b6",
+     "sigSha256": "3b141110b9f56540b2d49aacde6399974a4eac40621e367e68d4504f294db21b",
+     "result": "valid",
+     "flags": [
+      "BoundaryCondition",
+      "ValidSignature",
+      "Internal"
+     ]
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "f865b889e5022d54babc81ca67e7eb39f1ac42f92cf5295c3da5c9667db1b924",
+   "publicKeySha256": "115fafcefef5af1da2f3d4f6419e64af98773e83b800dbfb51b2fcd3ebfee5a1",
+   "source": {
+    "name": "NIST draft-celi-acvp-ml-dsa table 1",
+    "version": "1.0"
+   },
+   "tests": [
+    {
+     "tcId": 72,
+     "comment": "NIST draft-celi-acvp-ml-dsa.html Table-1 - KATs for rejection cases",
+     "mu": "2e52bab5646eab4cd23f73730c168842950ad776b0e2b06a31ba49bb5eac0ce93c3beea9747e784ef3301df9e17533ad75e76df4d2f4ebf235cf0684c42573bf",
+     "sigSha256": "56308a3578360c41356ba9c97d3240e01767fa76bbba9fd0cc6cfa9add088db9",
+     "result": "valid",
+     "flags": [
+      "BoundaryCondition",
+      "ValidSignature",
+      "Internal"
+     ]
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "26b605c78ac762fa1634c6f91dd117c4fbff7f3a7e7781f0cc83b6281f04ad7f",
+   "publicKeySha256": "74a15a68a321ac862801102c5b00286e842e88e6f73bc8dba3e623ed719c2955",
+   "source": {
+    "name": "NIST draft-celi-acvp-ml-dsa table 2",
+    "version": "1.0"
+   },
+   "tests": [
+    {
+     "tcId": 73,
+     "comment": "NIST draft-celi-acvp-ml-dsa.html Table-2 - KATs for rejection count",
+     "mu": "7cbd3e2c06749ab0f0060ea1572db256613e23a2c0120349decdcf567bf860b0c0cdca7549d825465ab9b944e5314ee9a56eacc7c670d7e39eeeeffb89f2ef1c",
+     "sigSha256": "12a4637e3a833a5a2a46f6a991399e544b62a230b7aa82f7366840ff6a88de61",
+     "result": "valid",
+     "flags": [
+      "ManySteps",
+      "ValidSignature",
+      "Internal"
+     ]
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "9191cf381bee17475c011986efb6afb1efa6997442fd33427353f1da1aa39fc0",
+   "publicKeySha256": "30064baf40422fee32b900c491fb8567539a04de2691b488c1afe70bc8230e1b",
+   "source": {
+    "name": "NIST draft-celi-acvp-ml-dsa table 2",
+    "version": "1.0"
+   },
+   "tests": [
+    {
+     "tcId": 74,
+     "comment": "NIST draft-celi-acvp-ml-dsa.html Table-2 - KATs for rejection count",
+     "mu": "787da5c8d1e39b421756d39bad40d44d8b659ae1ce4208effd30c957297f78bec1f42b57f85a1ed9617c34eb7e555b24eb350254dd9d3a13f20eb0eb31fbfa49",
+     "sigSha256": "3d758ace312433d780403b3d4273171fb93d008b395352142c6dc5173e517310",
+     "result": "valid",
+     "flags": [
+      "ManySteps",
+      "ValidSignature",
+      "Internal"
+     ]
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "516912c7b90a3dbe009b7478dbcaf0f5c5c9ed9699a20d0ca56cc516e5a444cd",
+   "publicKeySha256": "c623ee94b1be8d6dd33a012c68f19984f5aca26faf9336e15a54c6ca5fa7356d",
+   "source": {
+    "name": "NIST draft-celi-acvp-ml-dsa table 2",
+    "version": "1.0"
+   },
+   "tests": [
+    {
+     "tcId": 75,
+     "comment": "NIST draft-celi-acvp-ml-dsa.html Table-2 - KATs for rejection count",
+     "mu": "fb07140f582662ff3f97bff4e58b5810b83a67770a28e66226448e0b72f599b985c55bbd7a8443d98999e2c583fae249761fb0a6f47e4569beb0edd9de651cac",
+     "sigSha256": "e5ce267800edf33588451050f9b4a5bf97030d045132a7e3ed9210e74028d23b",
+     "result": "valid",
+     "flags": [
+      "ManySteps",
+      "ValidSignature",
+      "Internal"
+     ]
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "d4b841f882d50ab9e590066bafaba0f0d04d32641c0b978e54ccaa69a6e8d2c4",
+   "publicKeySha256": "71039079f7c3815d56e5ee864cc869b9b5be9e80c820c5cdcef71138f30b36af",
+   "source": {
+    "name": "NIST draft-celi-acvp-ml-dsa table 2",
+    "version": "1.0"
+   },
+   "tests": [
+    {
+     "tcId": 76,
+     "comment": "NIST draft-celi-acvp-ml-dsa.html Table-2 - KATs for rejection count",
+     "mu": "c970ed3560c78307af61c9ab6c968dde8ba09d91a71716914606a49a37b7f3be56a0a7874a88ba26a2e64d82424d7eac337d347e58323c1f92a31e8604dfeaa9",
+     "sigSha256": "8830ea254af2854bf67c2b907e2321c94fd6efb2fdaa77669fc3a5c4426c57c9",
+     "result": "valid",
+     "flags": [
+      "ManySteps",
+      "ValidSignature",
+      "Internal"
+     ]
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "5492eb8d811072c030a30cc66b23a173059eba0d4868ccb92fbe2510b4a5915f",
+   "publicKeySha256": "309b29b9227bd55c57d76a8c9d6ad8fa87114e918139fda446b618a89e03a3d1",
+   "source": {
+    "name": "NIST draft-celi-acvp-ml-dsa table 2",
+    "version": "1.0"
+   },
+   "tests": [
+    {
+     "tcId": 77,
+     "comment": "NIST draft-celi-acvp-ml-dsa.html Table-2 - KATs for rejection count",
+     "mu": "62dfebd88e04c2264bbea6c4e66dc2bd59172b9d4f590eeb92a10ff0dfbda6ba1e487dc102e77a32be852a00baa1bf1d7cb6650fe4aee6ba5a7288c2e7892809",
+     "sigSha256": "84d4af50933d6e13d4332b86af0692a66f5030ab01c2eac4131a5eebf78ce9e5",
+     "result": "valid",
+     "flags": [
+      "ManySteps",
+      "ValidSignature",
+      "Internal"
+     ]
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "9107000000000000000000000000000000000000000000000000000000000000",
+   "publicKeySha256": "e80cbacd08dfd42f28d0b7160aee445d346c6f01d0741b59a204790d4f99d76a",
+   "source": {
+    "name": "github/FiloSottile/samplentt",
+    "version": "0.1"
+   },
+   "tests": [
+    {
+     "tcId": 78,
+     "comment": "sampleNTT samples the value 0 during matrix A expansion",
+     "msg": "",
+     "mu": "1f99bae828a3f7782bf408a6be79af80e71373975a10b1c774557b736d6c124f7e8d4b34f1add40328d2756fc8317b2214fe764e190a37d8168dbac18592ab1c",
+     "sigSha256": "f8b6031054989ec716b2f51f5d0cc688bb69ba13898443008463c278919c128a",
+     "result": "valid",
+     "flags": [
+      "BoundaryCondition"
+     ]
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "c603000000000000000000000000000000000000000000000000000000000000",
+   "publicKeySha256": "b132a0082135a5d56d8b20e39707224ec55acd15182c51c9d7e7b45ddaadd2c6",
+   "source": {
+    "name": "github/FiloSottile/samplentt",
+    "version": "0.1"
+   },
+   "tests": [
+    {
+     "tcId": 79,
+     "comment": "sampleNTT samples the value q-1 during matrix A expansion",
+     "msg": "",
+     "mu": "34bddf39dca691e7c43fd15e6fb1feb2703f1eb677c14783b350ba6ca512919d99446eab1e8b987ce7ed1fa99a113ffca392570c41e826439045a5a6bae22d19",
+     "sigSha256": "adb8752478215007bc37388f7856f1bdf52b139a2dd34f635e580dae7f26279b",
+     "result": "valid",
+     "flags": [
+      "BoundaryCondition"
+     ]
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "2c07000000000000000000000000000000000000000000000000000000000000",
+   "publicKeySha256": "e5744c636310dc8aa98cbe1f1b519f905351858112ee25562d74e6bb2f567bdb",
+   "source": {
+    "name": "github/FiloSottile/samplentt",
+    "version": "0.1"
+   },
+   "tests": [
+    {
+     "tcId": 80,
+     "comment": "sampleNTT encounters the value q (rejected) during matrix A expansion",
+     "msg": "",
+     "mu": "3cec887d0be480ac06f09036d580c235ca1ed56dad88a4907885b554cf80cc044387f264bb2810f723e0424b1b5b8444f40a16db23892cc0d4cd5b9f90e8ba61",
+     "sigSha256": "ad7e57f115af2982bb52f092eb5b840608cee9bccb72ff32f222a7bd748713e4",
+     "result": "valid",
+     "flags": [
+      "BoundaryCondition"
+     ]
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "0000000000000000000000000000000000000000000000000000000000000000",
+   "publicKeySha256": "085ba380ff386dd52e42349c6eb88489d6058ea541a4e3fb0dce9a3fd1f7a911",
+   "source": {
+    "name": "github/FiloSottile/decompose",
+    "version": "0.1"
+   },
+   "tests": [
+    {
+     "tcId": 81,
+     "comment": "decompose coefficient mod 2*gamma2 = gamma2 during verification",
+     "msg": "000000000000001f",
+     "mu": "88651c16a9d4a233738619182e04338efdbf77daad8b3451bb1b6460ab5a8f6f4c3297ccf2ede0dc9d4fd803f5da64fef15d7f2d0e3a3629264c9f8c1ea5742f",
+     "sigSha256": "a2d3e5b8a7723b7d778e1f2c38e8b59f10804466f402c25a595e75f768e92db5",
+     "result": "valid",
+     "flags": [
+      "BoundaryCondition"
+     ]
+    },
+    {
+     "tcId": 82,
+     "comment": "centered_mod output is 0 (coefficient is multiple of 2*gamma2) during verification",
+     "msg": "0000000000000023",
+     "mu": "004cfa5535a9cd7a4f741da0dbd814eda7f2ef3351145cd3ffeac32ed016714319244547d7795ee8bd7c09a2c8dffbbabc929da9b2fec830488c2c2d320072d6",
+     "sigSha256": "ca0d81934d0908f1c71922d0a14b9ed9859093dc3d5afac1311c4efcbd01dc17",
+     "result": "valid",
+     "flags": [
+      "BoundaryCondition"
+     ]
+    },
+    {
+     "tcId": 83,
+     "comment": "centered_mod output is 1 during verification",
+     "msg": "0000000000000089",
+     "mu": "b11f1898caff74d9bea569e35c055de156814075280f6df66ecfe246a867df6f1496696477083044054a3d19aca1bcc2bfb71c9e0d890ee852943eb7539f90bb",
+     "sigSha256": "8a6ef7644c870cac32553a2a7403bcfc70f1d25f3f7b00f26f7753aa7b314a52",
+     "result": "valid",
+     "flags": [
+      "BoundaryCondition"
+     ]
+    },
+    {
+     "tcId": 84,
+     "comment": "decompose coefficient mod 2*gamma2 = gamma2+1 during verification",
+     "msg": "0000000000000135",
+     "mu": "163af32aaa1ebe17a95eed0751baeb744231899a77af625d545014fae804ce80ed84f6f4702f7fabe1a785de6b93ad21d40abc18bebcda1e7c4f63894e27697a",
+     "sigSha256": "33997a3580f15190a52117b755594a1dfb47f43040d21ed2ffc1152a0f1db0e0",
+     "result": "valid",
+     "flags": [
+      "BoundaryCondition"
+     ]
+    },
+    {
+     "tcId": 85,
+     "comment": "centered_mod output is -1 during verification",
+     "msg": "00000000000001a4",
+     "mu": "86bbab0118e4be40ad525d24b547f8ec4a25de7341ef1e0b759a1de172068c1ea87e4518ba7d3fe3bd9a4bf4ffae91540d7b301d5107d7c269a9dd4502291288",
+     "sigSha256": "47f565456487f1cb0f22af7eb6f43482a3f9a0ee33542b094604afaad798fa54",
+     "result": "valid",
+     "flags": [
+      "BoundaryCondition"
+     ]
+    },
+    {
+     "tcId": 86,
+     "comment": "decompose coefficient mod 2*gamma2 = gamma2+2 during verification",
+     "msg": "0000000000000280",
+     "mu": "28792760c1499258eb93d6ff1d23e783129ee4f888805179c50a21fffa177bebd198aa481cf4f247a087395211daf029327d5b5824002058cbcb4ca562a18e23",
+     "sigSha256": "0fb90c4a81aef344a3f1e623c8a266eff145c64cbc89ec10f36259cfb6e02440",
+     "result": "valid",
+     "flags": [
+      "BoundaryCondition"
+     ]
+    },
+    {
+     "tcId": 87,
+     "comment": "signing lowBits boundary in decompose special case (skip r0 adjustment)",
+     "msg": "0000000000000633",
+     "mu": "1cca0a793c915415f81dd60afc0641ac12b7e2841bcf54204e352ccb614611a5a86e3f8c275060b9a6b7abe7cce4b9a2fce1cd4821b007d87285fef31535d816",
+     "sigSha256": "3f1432f77280ea125a6a6bb2e2f3ebd9440a9b12def447dedbae1a368174d41b",
+     "result": "valid",
+     "flags": [
+      "BoundaryCondition"
+     ]
+    },
+    {
+     "tcId": 88,
+     "comment": "signing lowBits boundary in decompose special case (r0 adjustment flipped)",
+     "msg": "0000000000000633",
+     "mu": "1cca0a793c915415f81dd60afc0641ac12b7e2841bcf54204e352ccb614611a5a86e3f8c275060b9a6b7abe7cce4b9a2fce1cd4821b007d87285fef31535d816",
+     "sigSha256": "3f1432f77280ea125a6a6bb2e2f3ebd9440a9b12def447dedbae1a368174d41b",
+     "result": "valid",
+     "flags": [
+      "BoundaryCondition"
+     ]
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "0000000000000000000000000000000000000000000000000000000000000000",
+   "publicKeySha256": "085ba380ff386dd52e42349c6eb88489d6058ea541a4e3fb0dce9a3fd1f7a911",
+   "source": {
+    "name": "github/FiloSottile/hintlimits",
+    "version": "0.1"
+   },
+   "tests": [
+    {
+     "tcId": 89,
+     "comment": "valid signature with maximum (ω) hints",
+     "msg": "0000000000000150",
+     "sigSha256": "0a4fd5fffe90894ab1ace3ebcf408f184fdeef92d3ee3abd2cf8e0e742ff6f69",
+     "result": "valid",
+     "flags": [
+      "BoundaryCondition"
+     ],
+     "mu": "b80b4a3c5f294167d62f96053a7afaffcef0e4fde8edd3963d0ad7173d564f08d47580fbf5fc9f65aa53538697ccbe63363be473124dc6352a336f829615a4f7"
+    },
+    {
+     "tcId": 90,
+     "comment": "valid signature where one polynomial has zero hints",
+     "msg": "0000000000000084",
+     "sigSha256": "2d91418ffd01b479e611827a9fe109197c4f46deebfbf05f13f9f297c099b87f",
+     "result": "valid",
+     "flags": [
+      "BoundaryCondition"
+     ],
+     "mu": "cfd8387335a660244571854270f4427c2adc1e496f6447d1f6c748c708ee793529fc6f6ade06ceec5ed43c3c220d3014128d9624e852a38bc49ac352f47c9866"
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "",
+   "publicKey": null,
+   "source": {
+    "name": "github/FiloSottile/lengths",
+    "version": "0.1"
+   },
+   "tests": [
+    {
+     "tcId": 91,
+     "comment": "empty private seed",
+     "msg": "",
+     "sig": "",
+     "result": "invalid",
+     "flags": [
+      "IncorrectPrivateKeyLength"
+     ]
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "00000000000000000000000000000000000000000000000000000000000000",
+   "publicKey": null,
+   "source": {
+    "name": "github/FiloSottile/lengths",
+    "version": "0.1"
+   },
+   "tests": [
+    {
+     "tcId": 92,
+     "comment": "private seed one byte too short",
+     "msg": "",
+     "sig": "",
+     "result": "invalid",
+     "flags": [
+      "IncorrectPrivateKeyLength"
+     ]
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "000000000000000000000000000000000000000000000000000000000000000000",
+   "publicKey": null,
+   "source": {
+    "name": "github/FiloSottile/lengths",
+    "version": "0.1"
+   },
+   "tests": [
+    {
+     "tcId": 93,
+     "comment": "private seed one byte too long",
+     "msg": "",
+     "sig": "",
+     "result": "invalid",
+     "flags": [
+      "IncorrectPrivateKeyLength"
+     ]
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "9d881c3a88a1edf505eccd12c92f8d0be6fc3aa2d6e095e7873b45802955c4bb",
+   "publicKeySha256": "58dd31f14587c3d9063dfa8842233c8f202b35156f32a4efce5e9a9d7c0e679e",
+   "source": {
+    "name": "github/smuellerDD/leancrypto",
+    "version": "6561beea"
+   },
+   "tests": [
+    {
+     "tcId": 94,
+     "comment": "signing exercises all rejection paths",
+     "sigSha256": "c9620e39ca198fc2ce15aa3a462bef32b33186fcf8b812700499d7e54f06edad",
+     "result": "valid",
+     "flags": [
+      "ValidSignature"
+     ],
+     "msg": "1a84210d357a88c86a11e31524ec0d2e76b9cf2b042516ae6242a02068253eb475a71d64c3d1080767b6f77676f6d6626604890c8f07acc85177d9475eb52220",
+     "mu": "18d92301042e2eb37a7c584e173b9b3e60efd01392b79eeca1587b90e330e5e70d3b59832a4c494e03cbdc074e6295a02aac6b397c9bbc6abcb7d869b188f2b2"
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "b5952a6bc7422c883955247fd852b08f49a6315b1eeb7ca9d610959b3f6b353c",
+   "publicKeySha256": "fe77eb6a8ceab49a0db0a61100a89ab12c4b910e997290e9efe8d6663d99a697",
+   "source": {
+    "name": "github/smuellerDD/leancrypto",
+    "version": "6561beea"
+   },
+   "tests": [
+    {
+     "tcId": 95,
+     "comment": "signing exercises all rejection paths",
+     "sigSha256": "c6ea90022733effcef45e883d662fc54e8ec7b30a8ab9534582f3c79fe25f11d",
+     "result": "valid",
+     "flags": [
+      "ValidSignature"
+     ],
+     "msg": "679b88b9c33050563f8c56fc3a659e59c8ccb2e7a91b5bf6bcefeeac24ca97a4b4fecd0a7e903d73c8fad6c7aa94972b0c7f38d328ea7cf630558a37c33d382e",
+     "mu": "a3991ecd8e89330e8c2c54ef21e4dd5c04ed537606a1e4c427d69ee7873187654c8859a0c674d9a3217e980789879de6888a4fd29d9ab8a34144bcbdd7220c5f"
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "31cf3cb35d5237e805c8a1722f221cf138ddc0d3734ef3771be811f065e3e86a",
+   "publicKeySha256": "b6743c38a983280dc6cad0a7e31e523a9284839c56fd6f3840f324d106cad81b",
+   "source": {
+    "name": "github/smuellerDD/leancrypto",
+    "version": "6561beea"
+   },
+   "tests": [
+    {
+     "tcId": 96,
+     "comment": "signing exercises all rejection paths",
+     "sigSha256": "55245acd9679f830f890d0ac22a56c194a98fa80f684c2741155ae2141075d5b",
+     "result": "valid",
+     "flags": [
+      "ValidSignature"
+     ],
+     "msg": "676f8eb2cdfd17fbdbbc03a0e9fd3e7a94ea50d51cfbec7a3ee0de7858e8318a8a076fd6b0ad10aaac1d6dccea45ba40b42c4d318586b74d64a1a6ef1877d0f0",
+     "mu": "3dce6caf9239b6d3244006def82f5103ff1050fb0cb71bb2b377fb393b7687c944d7cf68e22a3fbbcff383a68ecf41b2f52d55eb07fcd23d2f0c5ad923aa7381"
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "230e1916b4f5705225dcfbce6d90cd1dc370b893c25c97bb0f18c30a0fef0b76",
+   "publicKeySha256": "89287b4f79e298dd29d96b29a12ac00bb28a3d7060bca0785c3f84d185f2ba5d",
+   "source": {
+    "name": "github/smuellerDD/leancrypto",
+    "version": "6561beea"
+   },
+   "tests": [
+    {
+     "tcId": 97,
+     "comment": "signing exercises all rejection paths",
+     "sigSha256": "6a1688caffb6cb009d480c19a1938e92d33480e9797b343d0677bb32b9416995",
+     "result": "valid",
+     "flags": [
+      "ValidSignature"
+     ],
+     "msg": "7e0bd48d8a6274c7e62f31d80911ba1d6ec8e5ac5f11d2f17522d345140b6b25f4bf8d0d94f2a60d2c245ab5832d12d4e1f5a401b28a18fd49299f3c37b6bf0a",
+     "mu": "2b94c1135e70a255cef8cd84a60d9ad42610fd525d2ea8baae08602f32a2c9c518329a50e480877694d273a0059ed472f410d45aefc19af393f2348612b92b4d"
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "1e832a9a8c49a62794692772b760f29ac214ead38d11128e33b5ca62a775df99",
+   "publicKeySha256": "ba1b033e4935ec1a4a2cb21204a721deb3bac6c68fb93c6fbfc452fcab760733",
+   "source": {
+    "name": "github/smuellerDD/leancrypto",
+    "version": "6561beea"
+   },
+   "tests": [
+    {
+     "tcId": 98,
+     "comment": "signing exercises all rejection paths",
+     "sigSha256": "c0dba8c0470d5b185cf827ceceaa0412408bb3f3f2cf5b27bcfbd7411fcdc806",
+     "result": "valid",
+     "flags": [
+      "ValidSignature"
+     ],
+     "msg": "545e06b58af27569994a4831656ed1747115249f8874ec9799294137eaff40f5e81e4c134f306c5a3d45069ff1457ed9ac304b0541f140d432cb1d0b9a1d83b2",
+     "mu": "6f0a133dcca9c8336f7cc95ff3f73f56ac6e52f2056a8fbeeb873d3b28af87fa7fe5f3722967019a77ff84dcb7c1abef48f2a8ebd7ef2ae5c972b01ba920f72c"
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "9488a1a4f206a015aebaa2f122a81f51f74869d9088af66a9179e24f480651df",
+   "publicKeySha256": "8ae7937883d7ff9c606c98fd2ea17e60000a6cff348ea4e0d91a816badc4d89b",
+   "source": {
+    "name": "github/smuellerDD/leancrypto",
+    "version": "6561beea"
+   },
+   "tests": [
+    {
+     "tcId": 99,
+     "comment": "signing exercises all rejection paths",
+     "sigSha256": "c7be749e4d14ed0ca93d93a0173c1c4ff176afadc51faecd9efc805179b3ef17",
+     "result": "valid",
+     "flags": [
+      "ValidSignature"
+     ],
+     "msg": "1602e1d5b2069b7c7c48d3122ac3a01f88effa081537cd041d13670394a5782cfbb6d66259471c7abaf2883c4593a88d3d8d4b096d669a6aeeec6e3142ffcf38",
+     "mu": "7e7371d6d5e914942e9fa496f0d975f262c616d99445e305501b98f809095a564d8405acbdcbf2eaf48b80a9aa77bdc681c709abb18692f48a6914f4079acb1c"
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "ba129fba657782adaf97b29997f9864cee942bb09cd6593a3e0c995b518bbdbc",
+   "publicKeySha256": "ffaede4a4d1da15390e4447ae8976e1f42542f9bb05b8df7f1d196d0a1df0510",
+   "source": {
+    "name": "github/smuellerDD/leancrypto",
+    "version": "6561beea"
+   },
+   "tests": [
+    {
+     "tcId": 100,
+     "comment": "signing exercises all rejection paths",
+     "sigSha256": "537a1d1f8e51d816cc4d9bd351c26f780e78d935ff9fcc39416e7b48fc12d218",
+     "result": "valid",
+     "flags": [
+      "ValidSignature"
+     ],
+     "msg": "868dae887821ba42e2b114f544ea6475e7caddf157d38a45ed972055d3d3fa9c5b790bb4505377d1b4aa20f3d1f04e20b44b5fa8d6bcdc06b6ccfe007fa0767b",
+     "mu": "dd992a99c8648d0a64adbff236900a242974760656cf76e0716467a64e2399f4a3a24c209c16bd15f46a77cb36dfc3a952d4d6a779cc6cd7eb157bb587f66228"
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "a2b4eeb389b24345fbe597d89d4abc191d1e69a94515c13782b2082e2f4c4db8",
+   "publicKeySha256": "afdf67ab6fcc6ca3e95fce206f5f0c0cbed759fedeb7765d854c128fbc465e8c",
+   "source": {
+    "name": "github/smuellerDD/leancrypto",
+    "version": "6561beea"
+   },
+   "tests": [
+    {
+     "tcId": 101,
+     "comment": "signing exercises all rejection paths (external mu)",
+     "sigSha256": "2d0abd0fe52a72dcb8ac1205ece38559f19d740fd7dd5f92c911175d4c3ae31b",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "Internal"
+     ],
+     "mu": "ac00e407fb8109900464b707f8a25022f03d19aafabdaa6be2f9800812f73253d0999f4d899ae2d56e01d7144330bcb90469abfa6f2f604512f5e63e9cf9a5b9"
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "960536337fe23c543699deb473cc0cc710f32aa102f245eb88c24cc8de244a02",
+   "publicKeySha256": "7ff189794b4421bc8d4cf445f0c7505285d37cec0a79ec20ea33b70ae48d7d7b",
+   "source": {
+    "name": "github/smuellerDD/leancrypto",
+    "version": "6561beea"
+   },
+   "tests": [
+    {
+     "tcId": 102,
+     "comment": "signing exercises all rejection paths (external mu)",
+     "sigSha256": "5951b65c203386766e5fe4ded52c298de2d9cc9b95a6aa3faf1a33e1166c868c",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "Internal"
+     ],
+     "mu": "cc75f045f9b971553e0052fea6aed8e5f04d203e714970a981b8007e6866b1a0fa39b01dca8926fec2f40e5eda8063a1a010e175488b3f71ff67cb493ebb2f5d"
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "ddb638be21b2ee326becde542f1094ee2bae71016d214c51a8a96c7a3baa2792",
+   "publicKeySha256": "39ef3b62ccc77565e4630589b395b63a73e2a986e25c20992d9f46aa73752f16",
+   "source": {
+    "name": "github/smuellerDD/leancrypto",
+    "version": "6561beea"
+   },
+   "tests": [
+    {
+     "tcId": 103,
+     "comment": "signing exercises all rejection paths (external mu)",
+     "sigSha256": "c29c7bcc3a649243a586884f73008b0c9161ed6caec87f6de57ce158eddc0c48",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "Internal"
+     ],
+     "mu": "113f2b58b15a2f12f187b8935fe0b3cbf985f7253c54ced91e052b7652726bf37b25ac66c5b92c644030f3cb5c49256155ce935abb94862034ff18e0dfcba696"
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "4d1c52f4eb4ea52a46997145cc65ec493f2b698d2cc127e3f3ab423e823caf4d",
+   "publicKeySha256": "c2ebce23703e8b02e444e4185ddd60ed2acea5dc10f88f08c3983da8720aea51",
+   "source": {
+    "name": "github/smuellerDD/leancrypto",
+    "version": "6561beea"
+   },
+   "tests": [
+    {
+     "tcId": 104,
+     "comment": "signing exercises all rejection paths (external mu)",
+     "sigSha256": "3d10913b15656132fb0f99480ae302606fe0a60d2fa4d640851286267bf9c24e",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "Internal"
+     ],
+     "mu": "b955faf9420c95ea80b108c29af0850bf076fb863e0e0b0b37133231a1725b9d11897c97daa049f2f7cd2e818a68c876fd5b419b9e8e97559da3b823734980c0"
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "af36abbf404eba3fd6b1f7b419ac3b574d794ba6ec4991189777227216ac0c7d",
+   "publicKeySha256": "cce38303caed3b8a42b68f6db3d2d39c42ba911290b502f49c20b78e3b265f89",
+   "source": {
+    "name": "github/smuellerDD/leancrypto",
+    "version": "6561beea"
+   },
+   "tests": [
+    {
+     "tcId": 105,
+     "comment": "signing exercises all rejection paths (external mu)",
+     "sigSha256": "f8a3173b1557c9ab5ce20b8304c1c43e0fa12d02b12a09b5f0c5d4ded6a92f8f",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "Internal"
+     ],
+     "mu": "c1276891d599ca9177a624aedfa7decfc7969684f91927c6a9eeeee6110514ff7cf93aa584083ada5d0786f52d02a6cfc689bf5c9096ed91bc3516b08369e3dd"
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "c8edbfbccbfb851516b5a20432eb19512dc6e9d56ce62b395e504c51c24b4cbd",
+   "publicKeySha256": "2fdfe79e345772aa4d41121a99e4577de99e0a4096e6097988abdd0eeac69c20",
+   "source": {
+    "name": "github/smuellerDD/leancrypto",
+    "version": "6561beea"
+   },
+   "tests": [
+    {
+     "tcId": 106,
+     "comment": "signing exercises all rejection paths (external mu)",
+     "sigSha256": "fc2678398118befe63d0f88117baf92a36f488a4066d222cfb324955216d0839",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "Internal"
+     ],
+     "mu": "14d76babd3179b3f9951a539efa64039ff956a7c6aa08b30090cc185ce8fd625b17b87849b670b973d26f62bb7da5695a833fb0282c9d08f9ddeeecc22ee5d64"
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "c69dcd219419bbc85c3aec243ec7464bc4b845bca1111f473f4ed50db4f4769f",
+   "publicKeySha256": "ef32e598923277af4e7ef825f4cbc8cb681d45e1d8cc3ea474303d367658e21f",
+   "source": {
+    "name": "github/smuellerDD/leancrypto",
+    "version": "6561beea"
+   },
+   "tests": [
+    {
+     "tcId": 107,
+     "comment": "signing exercises all rejection paths (external mu)",
+     "sigSha256": "ba36990f167da0a342f0efe017d039e98668c1cbae8106109480bbdc49dd2d1e",
+     "result": "valid",
+     "flags": [
+      "ValidSignature",
+      "Internal"
+     ],
+     "mu": "5ff5effc5dd46efebb2aad50c9354a6a06095168aea3de72bf72253309da4dadcb1b6bc36907b7b1ce00cd20f3d7a12c3bdcb8d29bf55b5893686fc1b42168c6"
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1",
+   "publicKeySha256": "eeb3e0b6172facb84494c721e462752f09fe365a5ecba65bf94ef20202441fdd",
+   "source": {
+    "name": "github/trailofbits/wycheproof/vector-forge",
+    "version": "0.1"
+   },
+   "tests": [
+    {
+     "comment": "deterministic signature with ctx length exactly 255 bytes (upper boundary of FIPS 204 domain separator)",
+     "ctx": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfe",
+     "flags": [
+      "ValidSignature",
+      "BoundaryCondition"
+     ],
+     "msg": "577963686570726f6f66206374782d626f756e6461727920746573743a20637478206c656e6774682065786163746c7920323535206279746573",
+     "mu": "08d8a02f0de54826af362b7845f59d57b372b34eae122cdb9d95adbd1ff262aa3a50e963eae40f9a1a503c0fd91d6e9b22696f26c864e440ef7657d9366f60ec",
+     "result": "valid",
+     "sigSha256": "c23eb6278d0e3db3c6a2273068b612a218d2ed4ebd968273d2dab95f8b6ec44c",
+     "tcId": 108
+    }
+   ]
+  },
+  {
+   "type": "MlDsaSign",
+   "privateSeed": "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a",
+   "publicKeySha256": "b7acce2ddb11f8cc1aa46e2bafac6eacfa2b732ef192bd636ad8d3a56d649c66",
+   "source": {
+    "name": "github/FiloSottile",
+    "version": "0.1"
+   },
+   "tests": [
+    {
+     "tcId": 109,
+     "comment": "randomized valid signature",
+     "msg": "48656c6c6f20776f726c64",
+     "rnd": "60879ebd4f33a5d8e6238983cca4b03abfafa716d836f2ab3f500cde36b3b1e3",
+     "mu": "de30bd32395e1998bcdae79ad419cec6ea9e9a903fdc552c6e9801208174d80a9d2f3902a144e62f89d6e505cc9c69fb01de013fc1d0204ee4dcf5fcc25f1378",
+     "sigSha256": "efa771a2cdd3df8c9867722c9d40bd43e297bc324d8e31919661e493b1ab4007",
+     "result": "valid",
+     "flags": [
+      "Randomized",
+      "ValidSignature"
+     ]
+    }
+   ]
+  }
+ ]
+}
