@@ -8,12 +8,13 @@ import { findAccounts, unlockPasskey, type AccountChoice } from "@/lib/keys";
 import type { Hint } from "@/lib/session";
 import { useWallet } from "@/lib/wallet";
 import { AccountPicker } from "./AccountPicker";
+import { Ornament } from "./Ornament";
 import { ErrorNote, Spinner } from "./ui";
 
 export function Splash({ text = "Rising from the grave…" }: { text?: string }) {
   return (
     <div className="splash">
-      <div className="bat">🦇</div>
+      <Ornament kind="bat" />
       <p className="dim">{text}</p>
     </div>
   );
@@ -107,13 +108,14 @@ export function Unlock() {
 
   return (
     <main className="narrow center">
-      <div className="hero-emoji">🔒</div>
+      <Ornament kind="key" className="hero-ornament" />
+      <span className="eyebrow">The door is locked</span>
       <h1>Welcome back{h.name ? `, ${h.name}` : ""}</h1>
       <p className="dim">
         Your wallet stays locked when you're away. We never store your key, so your passkey re-derives it each visit.
       </p>
       <button className="btn primary big" disabled={busy} onClick={go}>
-        {busy ? <Spinner>Waiting for your passkey…</Spinner> : h.kind === "local" ? "Unlock browser-only key" : "🔑 Unlock with passkey"}
+        {busy ? <Spinner>Waiting for your passkey…</Spinner> : h.kind === "local" ? "Unlock browser-only key" : "Unlock with passkey"}
       </button>
       <ErrorNote error={error} />
       <button

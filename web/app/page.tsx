@@ -26,18 +26,20 @@ function Home() {
   const addr = account.account.address;
   return (
     <main className="narrow stack-lg">
-      <section className="card balance-card">
+      <section className="card plate balance-card">
+        <span className="eyebrow">The account of</span>
         <div className="who">
-          {name ? <b>{name}</b> : <Link href="/name" className="claim-pill">🏷️ Claim your .boo name</Link>}
-          <span className="dim mono small">{shortAddr(addr)} <Copy text={addr} label="⧉" /></span>
+          {name ? <span className="who-name">{name}</span> : <Link href="/name" className="claim-pill">Claim your .boo name</Link>}
+          <span className="addr-line"><span className="mono">{shortAddr(addr)}</span> <Copy text={addr} label="Copy" /></span>
         </div>
         <div className="balance" aria-label={`${account.balance_display}`}>
           {whole}
-          {frac && <span className="frac">.{frac}</span>} <span className="unit">FANG</span>
+          {frac && <span className="frac">.{frac}</span>}
+          <span className="unit">FANG</span>
         </div>
         <div className="actions">
-          <Link className="btn primary" href="/send">📤 Send</Link>
-          <Link className="btn" href="/receive">📥 Receive</Link>
+          <Link className="btn primary" href="/send">Send</Link>
+          <Link className="btn" href="/receive">Receive</Link>
         </div>
       </section>
 
@@ -46,7 +48,7 @@ function Home() {
       <section className="card">
         <div className="row-between">
           <h2>Activity</h2>
-          <ExplorerLink className="small" href={explorer.account(name ?? addr)}>View in explorer ↗</ExplorerLink>
+          <ExplorerLink className="small" href={explorer.account(name ?? addr)}>Open in the explorer ↗</ExplorerLink>
         </div>
         <Activity txs={account.recent_txs} me={addr} />
       </section>
@@ -54,7 +56,7 @@ function Home() {
       {tutorial.dismissed && (
         <button className="link small center-self" onClick={() => updateTutorial({ dismissed: false })}>Show the tutorial again</button>
       )}
-      {hint.kind === "passkey" && <p className="dim small center-self">🔑 Unlocked with your passkey. The key lives only in this tab&apos;s memory.</p>}
+      {hint.kind === "passkey" && <p className="dim small center-self">Unlocked with your passkey. The key lives only in this tab&apos;s memory.</p>}
     </main>
   );
 }

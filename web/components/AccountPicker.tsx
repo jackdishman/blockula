@@ -11,7 +11,7 @@ export function AccountPicker({ choices, onPick }: { choices: AccountChoice[]; o
         <button key={c.address} className="choice" onClick={() => onPick(c)}>
           <span>
             <b>{c.name ?? c.short}</b>
-            <span className="dim block">{c.role === "owner" ? "👑 owner" : "🤖 limited"} · {c.label}</span>
+            <span className="dim block">{c.role === "owner" ? "Owner" : "Limited (agent)"} · {c.label}</span>
           </span>
           <span className="dim">{c.balance}</span>
         </button>

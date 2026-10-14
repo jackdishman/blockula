@@ -9,6 +9,8 @@ import type { AccountView, Status } from "@/lib/types";
 import { useUnlocked } from "@/lib/wallet";
 import { ErrorNote, ExplorerLink, Spinner } from "./ui";
 
+const ROMAN = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII"];
+
 interface Item {
   id: string;
   title: string;
@@ -67,17 +69,20 @@ export function Tutorial({ state, update }: { state: TutorialState; update: (p: 
   return (
     <section className="card learn">
       <div className="row-between">
-        <h2>🎃 Learn by doing · {done}/{items.length}</h2>
-        <button className="link small" onClick={() => update({ dismissed: true })}>Hide</button>
+        <h2>Learn by doing</h2>
+        <span className="row-gap">
+          <span className="dim small">{done} of {items.length}</span>
+          <button className="link small" onClick={() => update({ dismissed: true })}>Hide</button>
+        </span>
       </div>
       <div className="progress"><span style={{ width: `${(done / items.length) * 100}%` }} /></div>
       <ul className="checklist">
-        {items.map((i) => (
+        {items.map((i, n) => (
           <li key={i.id} className={i.done ? "done" : ""}>
             <button className="check-row" onClick={() => setOpen(open === i.id ? null : i.id)} aria-expanded={open === i.id}>
-              <span className="check">{i.done ? "✓" : ""}</span>
+              <span className="check" aria-label={i.done ? "Done" : undefined}>{i.done ? "✓" : ROMAN[n]}</span>
               <span className="grow">{i.title}</span>
-              <span className="dim">{open === i.id ? "▾" : "▸"}</span>
+              <span className="check-chevron" aria-hidden>{open === i.id ? "−" : "+"}</span>
             </button>
             {open === i.id && (
               <div className="check-body">
@@ -89,7 +94,7 @@ export function Tutorial({ state, update }: { state: TutorialState; update: (p: 
         ))}
       </ul>
       <ErrorNote error={error} />
-      {done === items.length && <p className="ok">🧛 You've mastered the basics. The night is yours.</p>}
+      {done === items.length && <p className="finale">You&apos;ve mastered the basics. The night is yours.</p>}
     </section>
   );
 }
@@ -105,9 +110,9 @@ function buildItems(account: AccountView, status: Status | null, state: Tutorial
       id: "fang",
       title: "Get some FANG",
       done: BigInt(account.balance) > 0n || txs.some((t) => t.to?.address === me),
-      learn: "FANG is Blockula's currency (1 FANG = 1,000,000,000 drops 🩸). Your balance isn't stored in this app; it lives on the blockchain, a shared ledger every node agrees on. Test chains have a faucet that hands it out free.",
+      learn: "FANG is Blockula's currency (1 FANG = 1,000,000,000 drops). Your balance isn't stored in this app; it lives on the blockchain, a shared ledger every node agrees on. Test chains have a faucet that hands it out free.",
       action: status?.faucet ? (
-        <button className="btn small" disabled={busy} onClick={faucet}>{busy ? <Spinner>Dripping…</Spinner> : "🦇 Get 100 test FANG"}</button>
+        <button className="btn small" disabled={busy} onClick={faucet}>{busy ? <Spinner>Dripping…</Spinner> : "Get 100 test FANG"}</button>
       ) : (
         <span className="dim small">Ask a friend to send you some: share your name from Receive.</span>
       ),
@@ -123,11 +128,11 @@ function buildItems(account: AccountView, status: Status | null, state: Tutorial
       id: "send",
       title: "Send FANG to a friend",
       done: !!sent,
-      learn: "Sending signs a transaction with your quantum-safe ML-DSA key. A validator seals it into a block about a second later, and then it's final. A tiny fee, priced by size, is burned 🔥 forever.",
+      learn: "Sending signs a transaction with your quantum-safe ML-DSA key. A validator seals it into a block about a second later, and then it's final. A tiny fee, priced by size, is burned forever.",
       action: (
         <span className="row-gap">
           <Link className="btn small" href="/send">Send</Link>
-          {friend && <Link className="btn small ghost" href={`/send?to=${friend}&amount=1&memo=${encodeURIComponent("first fang 🦇")}`}>Try: 1 FANG to the validator</Link>}
+          {friend && <Link className="btn small ghost" href={`/send?to=${friend}&amount=1&memo=${encodeURIComponent("first fang")}`}>Try: 1 FANG to the validator</Link>}
         </span>
       ),
     },

@@ -68,7 +68,7 @@ Native account abstraction (Phase 1). Each account holds a list of authorized ke
 - `link_github` is an on-chain claim: one handle per account, one account per handle. The holder or an admin can unlink, so admins can clear squatters. Nodes check it off-chain: a public gist owned by the handle must contain the account's address (`/api/github/{handle}`). Validators re-check it for every contribution claim.
 - `register_familiar` marks a session key as an agent Familiar. Awards can credit it, and profiles show "won by vlad.boo's Familiar 'claude'".
 
-**Proof of Contribution v1** (`node/src/poc.rs`; explorer 🕯️ Contribute page; `blockula contrib …`; SDK; MCP `contribution_pool`, `submit_contribution`, `my_contributions`)
+**Proof of Contribution v1** (`node/src/poc.rs`; explorer Contribute page; `blockula contrib …`; SDK; MCP `contribution_pool`, `submit_contribution`, `my_contributions`)
 - **Souls:** milli-Soul per account, never transferable. It decays (half-life ~1 year, integer math) and is earned only from jury outcomes: up to 10 Soul for an accepted claim (scaled by its score), +1 for a juror who agrees with the outcome. It's lost for spam claims (−20), diverging badly as a juror (−2), not revealing (−2, so holding back a bad ballot never pays), or vouching for a sybil (−50). Season 0 admins bootstrap it with `grant_soul` (≤ 100 per grant); governance replaces that in Phase 3. Soul gates vouching (10) and jury duty (5), raises the open-claim cap (3 + 1 per 10 Soul, max 20) and boosts payouts up to 1.5× (at 100 Soul).
 - **Vouching:** `vouch` bonds 10 FANG on a newcomer: someone with no Soul and no judged work (one vouch per 10 Soul held, max 10). It's locked for ~90 days, then `unvouch` returns the bond; the newcomer can decline it any time. While the vouch is young, the voucher gets 10% of the newcomer's rewards. `flag_sybil` (Season 0 admins) zeroes the account's Soul, rejects its open claims, claws back its unvested rewards, removes it from the jury pool, voids its vouches, and slashes its voucher's bond and 50 Soul.
 - **Repos:** `set_repo` (admins) puts a repo in the pool with a weight of 1–100. Removing one refunds the claims still waiting on it.
@@ -130,7 +130,7 @@ What runs today (Commonware `=2026.9.0`: consensus, p2p, broadcast, storage, run
   - Marshal spans epochs through an epoch-scoped scheme provider.
   - Nodes outside the active set observe (verify-only scheme) until their activation epoch.
   - CLI: `blockula validator init|register|approve|remove|unbond|list`.
-  - API: `/api/validators`. The explorer has a 🧛 Validators page with every admin action.
+  - API: `/api/validators`. The explorer has a Validators page with every admin action.
 - **Mempool:** a tx submitted to any validator is checked against state + mempool, then gossiped to all validators on its own channel and de-duplicated by id. After each finalized block, included or now-invalid txs are evicted.
 - **Faucet (testnets):** each validator's genesis-funded account pays its own faucet drips, so there's no shared secret and no nonce races. Full nodes forward faucet requests.
 - `blockula summon <id> [--validators N]`, `blockula run --home`, `blockula dev` (one-validator simplex).
