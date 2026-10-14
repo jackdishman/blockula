@@ -356,6 +356,13 @@ fn fast_sync_from_certified_snapshot_and_tamper_rejection() {
         let mut bad = chunks.clone();
         bad[0][10] ^= 1;
         assert!(snapshot::restore(&genesis, &v, &bad).err().unwrap().to_string().contains("doesn't match"));
+        // A manifest can't make the joiner download (and hold) more than a state's worth of chunks.
+        let mut flood = m.clone();
+        flood.chunks = vec![m.chunks[0].clone(); snapshot::MAX_SNAPSHOT_CHUNKS + 1];
+        assert!(snapshot::verify_manifest(&genesis, &flood).err().unwrap().to_string().contains("chunks"));
+        let mut big = m.clone();
+        big.chunks[0].size = snapshot::CHUNK_SIZE + 1;
+        assert!(snapshot::verify_manifest(&genesis, &big).err().unwrap().to_string().contains("chunk sizes"));
         let mut wrong_root = m.clone();
         wrong_root.state_root = "11".repeat(32);
         assert!(snapshot::verify_manifest(&genesis, &wrong_root).err().unwrap().to_string().contains("commit"));
@@ -378,7 +385,7 @@ fn fast_sync_from_certified_snapshot_and_tamper_rejection() {
         // The honest manifest installs and the node follows the chain.
         let state = snapshot::restore(&genesis, &v, &chunks).unwrap();
         let joiner: Shared = Arc::new(Mutex::new(Chain::open(&joiner_home).unwrap()));
-        joiner.lock().install_snapshot(&v, state, &chunks.concat(), None).unwrap();
+        joiner.lock().install_snapshot(&v, state, &chunks, None).unwrap();
         assert_eq!(joiner.lock().base_height(), m.height);
         assert!(joiner.lock().block(m.height).is_none(), "no history before the snapshot");
         let target = vals[0].chain.lock().height() + 20;

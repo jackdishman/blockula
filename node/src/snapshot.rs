@@ -31,6 +31,9 @@ pub const CHUNK_SIZE: usize = 1 << 20;
 pub const KEEP_SNAPSHOTS: usize = 2;
 /// Refuse to decompress a snapshot bigger than this.
 pub const MAX_STATE_BYTES: u64 = 4 << 30;
+/// Most chunks a manifest may list: `MAX_STATE_BYTES` of state, plus slack for a compressed
+/// stream that ends up a little larger than its input. Checked before anything is downloaded.
+pub const MAX_SNAPSHOT_CHUNKS: usize = (MAX_STATE_BYTES / CHUNK_SIZE as u64) as usize + 16;
 
 pub fn is_checkpoint(height: u64) -> bool {
     height > 0 && height % CHECKPOINT_INTERVAL == 0
@@ -95,8 +98,12 @@ pub fn read_state(r: &mut impl Read) -> Result<State> {
         if len > max {
             bail!("record too large ({len} bytes)");
         }
-        let mut b = vec![0u8; len];
-        r.read_exact(&mut b)?;
+        // Grows with the bytes actually there, so a length prefix alone can't allocate `max`.
+        let mut b = Vec::new();
+        r.take(len as u64).read_to_end(&mut b)?;
+        if b.len() != len {
+            bail!("state snapshot truncated inside a record");
+        }
         Ok(b)
     }
     let mut head = [0u8; 20];
@@ -219,6 +226,13 @@ pub fn verify_manifest(g: &Genesis, m: &Manifest) -> Result<Verified> {
     if !is_checkpoint(m.height) {
         bail!("{} isn't a checkpoint height", m.height);
     }
+    // Bounds what a joiner downloads and holds before the root check.
+    if m.chunks.len() > MAX_SNAPSHOT_CHUNKS {
+        bail!("manifest lists {} chunks, at most {MAX_SNAPSHOT_CHUNKS}", m.chunks.len());
+    }
+    if m.chunks.iter().any(|c| c.size == 0 || c.size > CHUNK_SIZE) {
+        bail!("manifest chunk sizes must be 1..={CHUNK_SIZE} bytes");
+    }
     let blocks: Vec<CBlock> = m.blocks.iter().map(|h| Ok(CBlock::decode(hex::decode(h)?.as_slice())?)).collect::<Result<_>>()?;
     let mut expect = m.height + 1;
     for w in blocks.windows(2) {
@@ -268,7 +282,10 @@ pub fn check_chunk(v: &Verified, i: usize, bytes: &[u8]) -> Result<()> {
 
 /// Rebuilds the state (and its tree) from verified chunks and checks it against the certified
 /// root. The state carries its own parameters, so `_g` isn't needed (the manifest was checked
-/// against it already).
+/// against it already). Memory before the root check is bounded: the chunks (at most
+/// `MAX_SNAPSHOT_CHUNKS`) are decompressed as a stream, never into one buffer, each record is
+/// capped (`state::MAX_KEY_BYTES`, `state::MAX_VALUE_BYTES`) and so is the total
+/// (`MAX_STATE_BYTES`); what remains is the state being rebuilt.
 pub fn restore(_g: &Genesis, v: &Verified, chunks: &[Vec<u8>]) -> Result<State> {
     if chunks.len() != v.chunks.len() {
         bail!("expected {} chunks", v.chunks.len());
@@ -276,8 +293,7 @@ pub fn restore(_g: &Genesis, v: &Verified, chunks: &[Vec<u8>]) -> Result<State> 
     for (i, c) in chunks.iter().enumerate() {
         check_chunk(v, i, c)?;
     }
-    let packed: Vec<u8> = chunks.concat();
-    let state = decode_state(&packed)?;
+    let state = decode_state_from(Chunks { chunks, at: 0, off: 0 })?;
     if state.root() != v.state_root {
         bail!("rebuilt state root doesn't match the certified root");
     }
@@ -286,7 +302,34 @@ pub fn restore(_g: &Genesis, v: &Verified, chunks: &[Vec<u8>]) -> Result<State> 
 
 /// Decompresses (up to `MAX_STATE_BYTES`) and decodes a packed snapshot.
 pub fn decode_state(packed: &[u8]) -> Result<State> {
+    decode_state_from(packed)
+}
+
+/// [`decode_state`] from a stream of packed bytes.
+fn decode_state_from(packed: impl Read) -> Result<State> {
     read_state(&mut std::io::BufReader::new(zstd::Decoder::new(packed)?.take(MAX_STATE_BYTES)))
+}
+
+/// Reads a list of chunks as one stream, without concatenating them.
+struct Chunks<'a> {
+    chunks: &'a [Vec<u8>],
+    at: usize,
+    off: usize,
+}
+
+impl Read for Chunks<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        while let Some(c) = self.chunks.get(self.at) {
+            if self.off < c.len() {
+                let n = buf.len().min(c.len() - self.off);
+                buf[..n].copy_from_slice(&c[self.off..self.off + n]);
+                self.off += n;
+                return Ok(n);
+            }
+            (self.at, self.off) = (self.at + 1, 0);
+        }
+        Ok(0)
+    }
 }
 
 /// Fetches, verifies and installs the newest certified snapshot from `peers` into an empty chain.
@@ -325,7 +368,6 @@ async fn fast_sync_from(client: &reqwest::Client, g: &Genesis, chain: &crate::co
         }
     }
     let state = restore(g, &v, &chunks)?;
-    let packed = chunks.concat();
     // Consensus anchors each epoch at the previous epoch's last block; if that's before the
     // snapshot, ask the peer for its hash (only used to seed this epoch's engine).
     let params = g.params();
@@ -339,6 +381,39 @@ async fn fast_sync_from(client: &reqwest::Client, g: &Genesis, chain: &crate::co
         _ => None,
     };
     let mut c = chain.lock();
-    c.install_snapshot(&v, state, &packed, epoch_start)?;
+    c.install_snapshot(&v, state, &chunks, epoch_start)?;
     Ok(c.height())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chain::Account;
+
+    /// Restore decompresses the chunks as one stream, whatever the split, and a record's length
+    /// prefix can't promise more than the stream holds.
+    #[test]
+    fn chunked_restore_streams_and_records_are_bounded() {
+        let mut st = State::default();
+        for i in 0..50u64 {
+            st.accounts.insert(format!("boo1account{i}"), Account { balance: i, ..Default::default() });
+        }
+        st.supply = (0..50).sum();
+        st.commit_block().unwrap();
+        let mut enc = zstd::Encoder::new(vec![], 3).unwrap();
+        write_state(&st, &mut enc).unwrap();
+        let packed = enc.finish().unwrap();
+        let chunks: Vec<Vec<u8>> = packed.chunks(7).map(<[u8]>::to_vec).collect();
+        assert!(chunks.len() > 10);
+        assert_eq!(decode_state_from(Chunks { chunks: &chunks, at: 0, off: 0 }).unwrap().root(), st.root());
+        assert_eq!(decode_state(&packed).unwrap().root(), st.root());
+        // Raw records: cut inside the last record, then a key length over the cap.
+        let mut raw = vec![];
+        write_state(&st, &mut raw).unwrap();
+        assert!(read_state(&mut &raw[..raw.len() - 3]).err().unwrap().to_string().contains("truncated"));
+        let mut huge = raw[..20].to_vec();
+        huge.push(crate::state::ns::META);
+        huge.extend_from_slice(&(crate::state::MAX_KEY_BYTES as u32 + 1).to_le_bytes());
+        assert!(read_state(&mut huge.as_slice()).err().unwrap().to_string().contains("too large"));
+    }
 }

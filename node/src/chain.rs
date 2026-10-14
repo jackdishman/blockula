@@ -1826,12 +1826,17 @@ impl Chain {
     }
 
     /// Installs a verified snapshot into an empty home, then executes the manifest's blocks.
-    pub fn install_snapshot(&mut self, v: &crate::snapshot::Verified, state: State, packed: &[u8], epoch_start: Option<(u64, String)>) -> Result<()> {
+    /// Installs a restored snapshot: `chunks` (the packed state, in order) become `base.state.zst`.
+    pub fn install_snapshot(&mut self, v: &crate::snapshot::Verified, state: State, chunks: &[Vec<u8>], epoch_start: Option<(u64, String)>) -> Result<()> {
         if self.height != 0 || self.base.is_some() {
             bail!("fast sync needs an empty home");
         }
         let base_hash = hex::encode(v.blocks[0].parent_bytes());
-        fs::write(self.home.join("base.state.zst"), packed)?;
+        let mut packed = File::create(self.home.join("base.state.zst"))?;
+        for c in chunks {
+            packed.write_all(c)?;
+        }
+        packed.sync_all()?;
         let base = Base { height: v.height, hash: base_hash.clone(), state_root: v.state_root.clone(), epoch_start };
         self.epochs = v.epochs.clone();
         self.save_epochs();

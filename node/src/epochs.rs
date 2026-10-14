@@ -77,10 +77,12 @@ impl EpochRegistry {
         self.sets.keys().copied().filter(|e| *e > 0)
     }
 
-    /// Adds a handoff signature after checking it. Returns whether it was new.
+    /// Adds a handoff signature after checking it. Returns whether it was new. Epoch 0's set is
+    /// the genesis set: nothing hands off to it, so a "proof" for it is an error (FUZZ-2).
     pub fn add_sig(&mut self, chain_id: &str, epoch: u64, signer: u32, sig_hex: &str) -> Result<bool> {
+        let before = epoch.checked_sub(1).ok_or_else(|| anyhow!("epoch 0 is the genesis set; it has no handoff"))?;
         let new_set = self.sets.get(&epoch).ok_or_else(|| anyhow!("no set change recorded at epoch {epoch}"))?.clone();
-        let prev = self.set(epoch - 1).ok_or_else(|| anyhow!("unknown set before epoch {epoch}"))?;
+        let prev = self.set(before).ok_or_else(|| anyhow!("unknown set before epoch {epoch}"))?;
         let pk_hex = prev.get(signer as usize).ok_or_else(|| anyhow!("signer {signer} isn't in the previous set"))?;
         verify_sig(pk_hex, &handoff_message(chain_id, epoch, &new_set), sig_hex)?;
         Ok(self.proofs.entry(epoch).or_default().insert(signer, sig_hex.to_string()).is_none())
@@ -104,10 +106,11 @@ impl EpochRegistry {
         out
     }
 
-    /// Merges another node's registry: only sets we already know, only valid signatures.
+    /// Merges another node's registry: only sets we already know, only valid signatures. A peer's
+    /// proofs for epoch 0 (the genesis set, which nothing hands off to) are ignored.
     pub fn merge_sigs(&mut self, chain_id: &str, other: &EpochRegistry) -> usize {
         let mut added = 0;
-        for (epoch, sigs) in &other.proofs {
+        for (epoch, sigs) in other.proofs.range(1..) {
             if other.sets.get(epoch) != self.sets.get(epoch) {
                 continue;
             }
@@ -143,8 +146,8 @@ fn verify_sig(pk_hex: &str, msg: &[u8], sig_hex: &str) -> Result<()> {
 }
 
 /// Verifies a peer's registry from the genesis set up to `epoch` and returns the set in effect
-/// at `epoch`. Every set change needs a quorum of distinct, valid signatures from the set
-/// before it.
+/// at `epoch` (for epoch 0, the genesis set). Every set change needs a quorum of distinct, valid
+/// signatures from the set before it. Never panics on a peer's registry (FUZZ-1).
 pub fn verify_chain(g: &Genesis, claimed: &EpochRegistry, epoch: u64) -> Result<Vec<String>> {
     let genesis = EpochRegistry::genesis(g);
     if claimed.sets.get(&0) != genesis.sets.get(&0) {
@@ -154,7 +157,8 @@ pub fn verify_chain(g: &Genesis, claimed: &EpochRegistry, epoch: u64) -> Result<
         bail!("peer only knows validator sets through epoch {}", claimed.known_through);
     }
     let mut prev = genesis.sets[&0].clone();
-    for (&e, set) in claimed.sets.range(1..=epoch) {
+    // `range(1..=0)` would panic: walk the changes after genesis and stop past `epoch`.
+    for (&e, set) in claimed.sets.range(1..).take_while(|(e, _)| **e <= epoch) {
         if set.is_empty() || set.windows(2).any(|w| w[0] >= w[1]) {
             bail!("set for epoch {e} isn't a sorted list of distinct keys");
         }
@@ -223,6 +227,47 @@ mod tests {
             stuffed.proofs.entry(2).or_default().insert(i, evil_sig.clone());
         }
         assert!(verify_chain(&g, &stuffed, 2).is_err());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    fn one_validator_genesis(tag: &str) -> (std::path::PathBuf, Genesis) {
+        let root = std::env::temp_dir().join(format!("blockula-epochs-{tag}-{}-{}", crate::chain::now_ms(), std::process::id()));
+        let homes = Chain::summon(&root, &SummonOpts::new("ep0", 1)).unwrap();
+        let g = Genesis::load(&homes[0].join("genesis.json")).unwrap();
+        (root, g)
+    }
+
+    /// FUZZ-1: a fast-sync manifest from epoch 0 (a young chain, or any peer making one up) asked
+    /// for `verify_chain(.., 0)`, which ran `sets.range(1..=0)` and panicked the joining node.
+    #[test]
+    fn verify_chain_at_epoch_0_is_the_genesis_set() {
+        let (root, g) = one_validator_genesis("fuzz1");
+        let reg = EpochRegistry::genesis(&g);
+        assert_eq!(verify_chain(&g, &reg, 0).unwrap(), reg.sets[&0]);
+        // Later set changes (even bogus, unsigned ones) don't matter at epoch 0.
+        let mut later = reg.clone();
+        later.sets.insert(5, vec!["zz".into()]);
+        later.known_through = 5;
+        assert_eq!(verify_chain(&g, &later, 0).unwrap(), reg.sets[&0]);
+        assert!(verify_chain(&g, &later, 5).is_err(), "the unsigned change still fails where it applies");
+        // A registry that doesn't start from this genesis is refused at epoch 0 too.
+        let mut other = reg.clone();
+        other.sets.insert(0, vec!["ab".into()]);
+        assert!(verify_chain(&g, &other, 0).is_err());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// FUZZ-2: a peer's "handoff proof" for epoch 0 made `add_sig` compute `0 - 1`, an overflow
+    /// panic (overflow checks are on in release) that ended the `exchange_epochs` task.
+    #[test]
+    fn handoff_proofs_for_epoch_0_are_ignored() {
+        let (root, g) = one_validator_genesis("fuzz2");
+        let mut reg = EpochRegistry::genesis(&g);
+        let mut peer = reg.clone();
+        peer.proofs.entry(0).or_default().insert(0, "00".into());
+        assert_eq!(reg.merge_sigs("ep0", &peer), 0);
+        assert!(reg.add_sig("ep0", 0, 0, "00").unwrap_err().to_string().contains("genesis"));
+        assert_eq!(reg, EpochRegistry::genesis(&g), "nothing was recorded");
         std::fs::remove_dir_all(root).ok();
     }
 }
