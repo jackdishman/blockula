@@ -26,7 +26,7 @@ pub use tmap::{JMap, TMap};
 pub use tree::{Hash, Proof};
 
 use crate::chain::{HuntStatus, State};
-use crate::poc::ClaimStatus;
+use crate::poc::{ClaimStatus, Poc};
 use anyhow::{bail, ensure, Result};
 use borsh::{BorshDeserialize, BorshSerialize};
 use codec::{decode, encode, RecordKey, SCHEMA_VERSION};
@@ -136,65 +136,72 @@ where
 }
 
 impl State {
-    /// Every map, by namespace, in namespace order.
+    /// Every map, by namespace, in namespace order. The destructuring is exhaustive on purpose:
+    /// a new `State` or `Poc` field doesn't compile until it is listed here as a map (with a new
+    /// namespace) or skipped as a scalar that `meta_records` covers, so nothing escapes the root.
     fn tables(&self) -> [(u8, &dyn Table); 18] {
-        let p = &self.poc;
+        let State { accounts, names, supply: _, burned: _, validators, active_sets, params: _, hunts, next_hunt_id: _, github, github_by_account, familiars, poc, tree: _ } = self;
+        let Poc { repos, souls, vouches, sybils, claims, claim_by_pr, handles, jurors, seances, grants, next_claim_id: _, next_seance_id: _, next_grant_id: _, seed: _, open_seance: _, next_seance_at: _ } = poc;
         [
-            (ns::ACCOUNTS, &self.accounts),
-            (ns::NAMES, &self.names),
-            (ns::VALIDATORS, &self.validators),
-            (ns::ACTIVE_SETS, &self.active_sets),
-            (ns::HUNTS, &self.hunts),
-            (ns::GITHUB, &self.github),
-            (ns::GITHUB_BY_ACCOUNT, &self.github_by_account),
-            (ns::FAMILIARS, &self.familiars),
-            (ns::REPOS, &p.repos),
-            (ns::SOULS, &p.souls),
-            (ns::VOUCHES, &p.vouches),
-            (ns::SYBILS, &p.sybils),
-            (ns::CLAIMS, &p.claims),
-            (ns::CLAIM_BY_PR, &p.claim_by_pr),
-            (ns::HANDLES, &p.handles),
-            (ns::JURORS, &p.jurors),
-            (ns::SEANCES, &p.seances),
-            (ns::GRANTS, &p.grants),
+            (ns::ACCOUNTS, accounts),
+            (ns::NAMES, names),
+            (ns::VALIDATORS, validators),
+            (ns::ACTIVE_SETS, active_sets),
+            (ns::HUNTS, hunts),
+            (ns::GITHUB, github),
+            (ns::GITHUB_BY_ACCOUNT, github_by_account),
+            (ns::FAMILIARS, familiars),
+            (ns::REPOS, repos),
+            (ns::SOULS, souls),
+            (ns::VOUCHES, vouches),
+            (ns::SYBILS, sybils),
+            (ns::CLAIMS, claims),
+            (ns::CLAIM_BY_PR, claim_by_pr),
+            (ns::HANDLES, handles),
+            (ns::JURORS, jurors),
+            (ns::SEANCES, seances),
+            (ns::GRANTS, grants),
         ]
     }
 
+    /// [`State::tables`], mutably (same list, same order).
     fn tables_mut(&mut self) -> [(u8, &mut dyn Table); 18] {
-        let p = &mut self.poc;
+        let State { accounts, names, supply: _, burned: _, validators, active_sets, params: _, hunts, next_hunt_id: _, github, github_by_account, familiars, poc, tree: _ } = self;
+        let Poc { repos, souls, vouches, sybils, claims, claim_by_pr, handles, jurors, seances, grants, next_claim_id: _, next_seance_id: _, next_grant_id: _, seed: _, open_seance: _, next_seance_at: _ } = poc;
         [
-            (ns::ACCOUNTS, &mut self.accounts),
-            (ns::NAMES, &mut self.names),
-            (ns::VALIDATORS, &mut self.validators),
-            (ns::ACTIVE_SETS, &mut self.active_sets),
-            (ns::HUNTS, &mut self.hunts),
-            (ns::GITHUB, &mut self.github),
-            (ns::GITHUB_BY_ACCOUNT, &mut self.github_by_account),
-            (ns::FAMILIARS, &mut self.familiars),
-            (ns::REPOS, &mut p.repos),
-            (ns::SOULS, &mut p.souls),
-            (ns::VOUCHES, &mut p.vouches),
-            (ns::SYBILS, &mut p.sybils),
-            (ns::CLAIMS, &mut p.claims),
-            (ns::CLAIM_BY_PR, &mut p.claim_by_pr),
-            (ns::HANDLES, &mut p.handles),
-            (ns::JURORS, &mut p.jurors),
-            (ns::SEANCES, &mut p.seances),
-            (ns::GRANTS, &mut p.grants),
+            (ns::ACCOUNTS, accounts),
+            (ns::NAMES, names),
+            (ns::VALIDATORS, validators),
+            (ns::ACTIVE_SETS, active_sets),
+            (ns::HUNTS, hunts),
+            (ns::GITHUB, github),
+            (ns::GITHUB_BY_ACCOUNT, github_by_account),
+            (ns::FAMILIARS, familiars),
+            (ns::REPOS, repos),
+            (ns::SOULS, souls),
+            (ns::VOUCHES, vouches),
+            (ns::SYBILS, sybils),
+            (ns::CLAIMS, claims),
+            (ns::CLAIM_BY_PR, claim_by_pr),
+            (ns::HANDLES, handles),
+            (ns::JURORS, jurors),
+            (ns::SEANCES, seances),
+            (ns::GRANTS, grants),
         ]
     }
 
-    /// The scalar records, in key order. Cheap, so every commit re-checks them all.
+    /// The scalar records, in key order. Cheap, so every commit re-checks them all. Exhaustive
+    /// like [`State::tables`].
     fn meta_records(&self) -> [(&'static [u8], Vec<u8>); 6] {
-        let p = &self.poc;
+        let State { supply, burned, params, next_hunt_id, poc, accounts: _, names: _, validators: _, active_sets: _, hunts: _, github: _, github_by_account: _, familiars: _, tree: _ } = self;
+        let Poc { next_claim_id, next_seance_id, next_grant_id, seed, open_seance, next_seance_at, repos: _, souls: _, vouches: _, sybils: _, claims: _, claim_by_pr: _, handles: _, jurors: _, seances: _, grants: _ } = poc;
         [
-            (meta::BURNED, encode(&self.burned)),
-            (meta::NEXT_HUNT_ID, encode(&self.next_hunt_id)),
-            (meta::PARAMS, encode(&self.params)),
-            (meta::POC, encode(&(p.next_claim_id, p.next_seance_id, p.next_grant_id, &p.seed, p.open_seance, p.next_seance_at))),
+            (meta::BURNED, encode(burned)),
+            (meta::NEXT_HUNT_ID, encode(next_hunt_id)),
+            (meta::PARAMS, encode(params)),
+            (meta::POC, encode(&(next_claim_id, next_seance_id, next_grant_id, seed, open_seance, next_seance_at))),
             (meta::SCHEMA, encode(&SCHEMA_VERSION)),
-            (meta::SUPPLY, encode(&self.supply)),
+            (meta::SUPPLY, encode(supply)),
         ]
     }
 

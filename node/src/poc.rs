@@ -1477,7 +1477,7 @@ mod scenarios {
         assert!(t.tx(&alice, Action::GrantSoul { to: bob.address(), amount: SOUL, reason: "x".into() }).unwrap_err().to_string().contains("only validator admins"));
         assert!(t.tx(&alice, Action::SetRepo { repo: "a/b".into(), weight: 1 }).unwrap_err().to_string().contains("only validator admins"));
         assert!(t.admin(Action::GrantSoul { to: bob.address(), amount: MAX_SOUL_GRANT + 1, reason: "x".into() }).is_err());
-        assert!(!t.c.state.poc.is_active(), "nothing has happened yet, so old roots are unchanged");
+        assert!(!t.c.state.poc.is_active(), "nothing has happened yet, so the end-of-block step stays off");
         t.grant(&alice, 20);
         assert_eq!(t.soul(&alice), 20 * SOUL);
         t.grant(&bob, 3);

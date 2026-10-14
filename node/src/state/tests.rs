@@ -24,7 +24,9 @@ struct Sim {
 }
 
 fn sim(tag: &str) -> Sim {
-    let home = std::env::temp_dir().join(format!("blockula-state-{tag}-{}-{}", now_ms(), std::process::id()));
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let home = std::env::temp_dir().join(format!("blockula-state-{tag}-{}-{}-{n}", now_ms(), std::process::id()));
     let times = PocTimes { seance_blocks: 12, claim_maturity_blocks: 0, vesting_blocks: 20, vouch_lock_blocks: 10, claim_ttl_blocks: 30, soul_half_life_blocks: 200 };
     Chain::summon(&home, &SummonOpts { contribution: Some(times), epoch_blocks: 10, ..SummonOpts::new("state", 1) }).unwrap();
     let seed: [u8; 32] = hex::decode(std::fs::read_to_string(home.join("validator.key")).unwrap().trim()).unwrap().try_into().unwrap();
