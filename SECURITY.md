@@ -1,18 +1,19 @@
 # Security policy
 
-Blockula is an unaudited testnet. Nothing on it has real value, but the code is meant to secure a mainnet one day, so we want to hear about every vulnerability now.
+Blockula is an unaudited testnet: it has had an internal review but no third-party audit yet (see the README). Nothing on it has real value, but the code is meant to secure a mainnet one day, so we want to hear about every vulnerability now.
 
 ## Reporting
 
 Report privately through GitHub: **[open a security advisory](https://github.com/jackdishman/blockula/security/advisories/new)**. Please don't open a public issue or PR for a vulnerability.
 
-Include what you found, how to reproduce it (a failing test or a script is ideal), which version or commit, and the impact you expect.
+Include what you found, how to reproduce it (a deterministic repro, such as a failing test or a script, is ideal), which version or commit, and the impact you expect.
 
 ## Scope
 
-- The node (`node/`): consensus integration, block and tx validation, the state machine (`chain.rs`, `poc.rs`), sync and snapshots, the HTTP API and explorer, the CLI.
-- Cryptography and its use: ML-DSA-65 signing and verification, address and key-id derivation, the Rust ⇄ TypeScript signing encoding (`node/src/types.rs` ⇄ `sdk-ts/src/tx.ts`), passkey key derivation (`sdk-ts/src/passkey.ts`).
-- `@blockula/sdk`, `@blockula/mcp`, the web wallet (`web/`), `scripts/install.sh`, release workflows and `deploy/`.
+- The node (`node/`): consensus integration, block and tx validation, state transitions (`chain.rs`, `poc.rs`), p2p, sync and snapshots, the HTTP API and explorer, the CLI.
+- Cryptography and its use: ML-DSA-65 signing and verification, address and key-id derivation, the Rust ⇄ TypeScript tx encoding (`node/src/types.rs` ⇄ `sdk-ts/src/tx.ts`), passkey key derivation (`sdk-ts/src/passkey.ts`).
+- The contribution machinery: GitHub links, claims and validator attestations, Séances, payouts and vesting.
+- `@blockula/sdk`, the passkey web wallet (`web/`), `@blockula/mcp`, `scripts/install.sh`, release workflows and `deploy/`.
 
 Especially wanted: anything that halts or splits the chain, mints or moves FANG without authorization, bypasses a session key's limits, forges a signature or certificate, or makes nodes disagree on state.
 

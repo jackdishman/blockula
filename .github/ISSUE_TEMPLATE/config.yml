@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 🔒 Report a vulnerability
+    url: https://github.com/jackdishman/blockula/security/advisories/new
+    about: Privately, please. Don't open a public issue for security bugs.
+  - name: 🏹 Open Hunts
+    url: https://blockula-testnet.fly.dev/#/hunts
+    about: Bounties with acceptance criteria and FANG escrowed on-chain.
