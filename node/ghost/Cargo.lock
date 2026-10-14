@@ -70,6 +70,7 @@ dependencies = [
  "p3-merkle-tree",
  "p3-poseidon2",
  "p3-poseidon2-air",
+ "p3-security",
  "p3-symmetric",
  "p3-uni-stark",
  "postcard",

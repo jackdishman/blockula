@@ -51,9 +51,9 @@ pub const QUERY_POW_BITS: usize = 16;
 /// Proof-of-work bits before each FRI folding challenge.
 pub const COMMIT_POW_BITS: usize = 0;
 /// Proof-of-work bits before the batching challenge.
-pub const BATCH_POW_BITS: usize = 0;
+pub const BATCH_POW_BITS: usize = 16;
 /// Proof-of-work bits before the out-of-domain point.
-pub const OOD_POW_BITS: usize = 0;
+pub const OOD_POW_BITS: usize = 16;
 /// log2 of the final FRI polynomial length.
 pub const LOG_FINAL_POLY_LEN: usize = 0;
 /// log2 of the maximum FRI folding arity.
@@ -96,4 +96,87 @@ pub fn config(seed: [u8; 32]) -> Config {
         StdRng::from_rng(&mut rng),
     );
     Config::new(pcs, Challenger::new(perm)).with_ood_proof_of_work_bits(OOD_POW_BITS)
+}
+
+/// Soundness of the configuration, from Plonky3's own calculator (`p3-uni-stark` `security.rs`
+/// over `p3-security`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SecurityReport {
+    /// Proven round-by-round soundness, best of unique- and list-decoding (bits).
+    pub proven_bits: usize,
+    /// Proven, unique-decoding regime.
+    pub proven_unique_decoding_bits: usize,
+    /// Proven, list-decoding (Johnson) regime.
+    pub proven_list_decoding_bits: usize,
+    /// Conjectured ("random words", eprint 2025/2010).
+    pub conjectured_bits: usize,
+    /// Number of AIR constraints.
+    pub num_constraints: usize,
+    /// Maximum constraint degree.
+    pub max_constraint_degree: usize,
+    /// Committed quotient chunks.
+    pub num_quotient_chunks: usize,
+    /// Functions batched into the one FRI instance.
+    pub num_batched_functions: usize,
+}
+
+/// Bits of the challenge field, rounded down: 4 × log2(p) ≈ 123.96.
+pub const CHALLENGE_FIELD_BITS: usize = 123;
+/// Collision resistance of the Poseidon2 commitment hash (8 × 31-bit digests).
+pub const HASH_COLLISION_BITS: usize = 124;
+
+/// The security report for these parameters and the Action AIR.
+pub fn security_report() -> SecurityReport {
+    security_report_for(LOG_BLOWUP, NUM_QUERIES, QUERY_POW_BITS, COMMIT_POW_BITS, BATCH_POW_BITS, OOD_POW_BITS)
+}
+
+/// The report for other FRI parameters (for choosing them).
+pub fn security_report_for(
+    log_blowup: usize,
+    num_queries: usize,
+    query_pow: usize,
+    commit_pow: usize,
+    batch_pow: usize,
+    ood_pow: usize,
+) -> SecurityReport {
+    use p3_field::PrimeCharacteristicRing;
+    use p3_field::coset::TwoAdicMultiplicativeCoset;
+    use p3_security::fri::FriRegime;
+    use p3_uni_stark::{AirLayout, ConjecturedSecurity, GrindingSites, OpeningShape, ProvenSecurity, StarkSecurityParams};
+
+    let air = super::air::ActionAir::default();
+    let fri = FriRegime {
+        log_blowup,
+        num_queries,
+        log_final_poly_len: LOG_FINAL_POLY_LEN,
+        max_log_arity: MAX_LOG_ARITY,
+        commit_pow_bits: commit_pow,
+        query_pow_bits: query_pow,
+    };
+    let grinding = GrindingSites { batch_combination: batch_pow, out_of_domain: ood_pow, ..GrindingSites::NONE };
+    let domain = TwoAdicMultiplicativeCoset::new(F::ONE, super::layout::LOG_HEIGHT).expect("small domain");
+    let params = StarkSecurityParams::from_air::<F, Challenge, _>(
+        fri,
+        &air,
+        AirLayout::from_air::<F>(&air),
+        domain,
+        CHALLENGE_FIELD_BITS,
+        HASH_COLLISION_BITS,
+        2,
+        OpeningShape::hiding(NUM_RANDOM_CODEWORDS),
+        grinding,
+    );
+    // Hiding doubles the committed height.
+    let degree_bits = super::layout::LOG_HEIGHT + 1;
+    let proven = ProvenSecurity::compute_from_proof(degree_bits, &params);
+    SecurityReport {
+        proven_bits: proven.security_bits(),
+        proven_unique_decoding_bits: proven.unique_decoding_bits,
+        proven_list_decoding_bits: proven.list_decoding_bits,
+        conjectured_bits: ConjecturedSecurity::compute_from_params(&params, degree_bits).security_bits,
+        num_constraints: params.num_constraints,
+        max_constraint_degree: params.air_max_constraint_degree,
+        num_quotient_chunks: params.num_quotient_chunks,
+        num_batched_functions: params.num_batched_functions,
+    }
 }

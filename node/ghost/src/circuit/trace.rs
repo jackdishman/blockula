@@ -1,50 +1,129 @@
-//! Witness to trace. This follows the witness without judging it: an inconsistent witness gives
-//! a trace that fails the constraints, which is what the soundness tests rely on.
+//! Witness to trace.
+//!
+//! Witnesses are first lowered to a [`RawAction`] of field elements, then laid out. The layout
+//! step follows the raw action without judging it: values that break a constraint give a trace
+//! that fails it, with everything else consistent. That is how the soundness tests play a
+//! cheating prover.
 
 use p3_field::{PrimeCharacteristicRing, PrimeField32};
 use p3_matrix::dense::RowMajorMatrix;
 
 use super::layout::*;
-use super::{ActionWitness, PublicInputs, ValueBalance};
-use crate::field::{Digest, F, ZERO_DIGEST};
+use super::{ActionWitness, CIRCUIT_ID, ValueBalance, sighash_fields};
+use crate::field::{Digest, F, P, ZERO_DIGEST, u64_to_limbs};
 use crate::hash::{Domain, compress, permute, sponge, sponge_inputs};
-use crate::note::{Note, nullifier_input};
+use crate::note::nullifier_input;
 
-/// What a trace proves, before the value balance is known to fit.
+/// A spend at the field level.
+#[derive(Clone, Debug)]
+pub(crate) struct RawSpend {
+    pub sk: Digest,
+    pub limbs: [F; 4],
+    pub rcm: Digest,
+    pub position: u32,
+    pub siblings: [Digest; 32],
+    pub dummy: bool,
+}
+
+/// An output at the field level.
+#[derive(Clone, Debug)]
+pub(crate) struct RawOutput {
+    pub owner: Digest,
+    pub limbs: [F; 4],
+    pub rcm: Digest,
+}
+
+/// An action at the field level, with the public values that aren't computed from the trace.
+#[derive(Clone, Debug)]
+pub(crate) struct RawAction {
+    pub spends: [RawSpend; 2],
+    pub outputs: [RawOutput; 2],
+    pub anchor: Digest,
+    pub vb_neg: F,
+    pub vb: [F; 4],
+    pub sighash: Digest,
+    pub circuit_id: F,
+}
+
+impl RawAction {
+    /// Lowers a witness, claiming value balance `vb`.
+    pub fn from_witness(w: &ActionWitness, vb: ValueBalance) -> Self {
+        Self {
+            spends: core::array::from_fn(|i| {
+                let s = &w.spends[i];
+                RawSpend {
+                    sk: s.sk,
+                    limbs: u64_to_limbs(s.note.value),
+                    rcm: s.note.rcm(),
+                    position: s.path.position,
+                    siblings: s.path.siblings,
+                    dummy: s.dummy,
+                }
+            }),
+            outputs: core::array::from_fn(|j| {
+                let n = &w.outputs[j];
+                RawOutput { owner: n.owner, limbs: n.limbs(), rcm: n.rcm() }
+            }),
+            anchor: w.anchor,
+            vb_neg: F::from_bool(vb.is_negative()),
+            vb: u64_to_limbs(vb.magnitude()),
+            sighash: sighash_fields(&w.sighash),
+            circuit_id: F::from_u32(CIRCUIT_ID),
+        }
+    }
+}
+
+/// A laid-out trace and the public values it proves.
 pub(crate) struct Built {
     pub trace: RowMajorMatrix<F>,
     pub nullifiers: [Digest; 2],
     pub commitments: [Digest; 2],
-    /// Σ spent − Σ output, as an integer.
-    pub balance: i128,
+    pub public: Vec<F>,
 }
 
 fn out8(state: [F; 16]) -> Digest {
     permute(state)[..8].try_into().expect("8")
 }
 
-/// Builds the trace (with the honest carries for `vb`) and the public values it implies.
-pub(crate) fn build(w: &ActionWitness, vb: Option<ValueBalance>) -> Built {
+/// A field element as a small signed integer (elements above p/2 are negative).
+fn centered(x: F) -> i64 {
+    let v = i64::from(x.as_canonical_u32());
+    if v > i64::from(P / 2) { v - i64::from(P) } else { v }
+}
+
+fn commitment_input(owner: &Digest, limbs: &[F; 4], rcm: &Digest) -> [F; 20] {
+    let mut input = [F::ZERO; 20];
+    input[..8].copy_from_slice(owner);
+    input[8..12].copy_from_slice(limbs);
+    input[12..].copy_from_slice(rcm);
+    input
+}
+
+/// Lays out the trace.
+pub(crate) fn build(raw: &RawAction) -> Built {
+    const EXTRA: usize = WIDTH - P2_COLS;
     let mut inputs = vec![[F::ZERO; 16]; HEIGHT];
-    let mut extra = vec![[F::ZERO; WIDTH - P2_COLS]; HEIGHT];
+    let mut extra = vec![[F::ZERO; EXTRA]; HEIGHT];
     let col = |c: usize| c - P2_COLS;
     let mut nullifiers = [ZERO_DIGEST; 2];
     let mut commitments = [ZERO_DIGEST; 2];
-    let mut balance: i128 = 0;
 
-    let set_value_bits = |row: &mut [F; WIDTH - P2_COLS], value: u64| {
-        for i in 0..64 {
-            row[col(VBITS) + i] = F::from_bool((value >> i) & 1 == 1);
+    // Value bits: the low 16 bits of each limb. A limb ≥ 2^16 has no valid decomposition.
+    let set_value_bits = |row: &mut [F; EXTRA], limbs: &[F; 4]| {
+        for (k, limb) in limbs.iter().enumerate() {
+            let v = limb.as_canonical_u32();
+            for i in 0..16 {
+                row[col(VBITS) + 16 * k + i] = F::from_bool((v >> i) & 1 == 1);
+            }
         }
     };
 
-    for (i, sp) in w.spends.iter().enumerate() {
+    for (i, sp) in raw.spends.iter().enumerate() {
         let b = spend_base(i);
-        let sk = sp.sk;
-        inputs[b + NK] = sponge_inputs(Domain::NullifierKey, &sk)[0];
-        inputs[b + AK] = sponge_inputs(Domain::SpendAuth, &sk)[0];
-        let nk = sponge(Domain::NullifierKey, &sk);
-        let ak = sponge(Domain::SpendAuth, &sk);
+        inputs[b + NK] = sponge_inputs(Domain::NullifierKey, &sp.sk)[0];
+        inputs[b + AK] = sponge_inputs(Domain::SpendAuth, &sp.sk)[0];
+        let nk = sponge(Domain::NullifierKey, &sp.sk);
+        let ak = sponge(Domain::SpendAuth, &sp.sk);
         let mut own_in = [F::ZERO; 16];
         own_in[..8].copy_from_slice(&ak);
         own_in[8..].copy_from_slice(&nk);
@@ -52,18 +131,13 @@ pub(crate) fn build(w: &ActionWitness, vb: Option<ValueBalance>) -> Built {
         inputs[b + OWN_A] = own[0];
         inputs[b + OWN_B] = own[1];
         let owner = sponge(Domain::Owner, &own_in);
-        // The circuit commits to the owner derived from sk, whatever the witness note says.
-        let note = Note { owner, ..sp.note };
-        let cm_in = sponge_inputs(Domain::NoteCommitment, &note.commitment_input());
-        inputs[b + CM_A] = cm_in[0];
-        inputs[b + CM_B] = cm_in[1];
-        inputs[b + CM_C] = cm_in[2];
+        let cm_in = sponge_inputs(Domain::NoteCommitment, &commitment_input(&owner, &sp.limbs, &sp.rcm));
+        inputs[b + CM_A..b + CM_C + 1].copy_from_slice(&cm_in);
         let cm = out8(cm_in[2]);
-        let pos = sp.path.position;
         let mut node = cm;
         for k in 0..32 {
-            let bit = (pos >> k) & 1 == 1;
-            let sib = sp.path.siblings[k];
+            let bit = (sp.position >> k) & 1 == 1;
+            let sib = sp.siblings[k];
             let (left, right) = if bit { (sib, node) } else { (node, sib) };
             let row = b + MERKLE + k;
             inputs[row][..8].copy_from_slice(&left);
@@ -71,13 +145,10 @@ pub(crate) fn build(w: &ActionWitness, vb: Option<ValueBalance>) -> Built {
             extra[row][col(BIT)] = F::from_bool(bit);
             node = compress(&left, &right);
         }
-        let nf_in = sponge_inputs(Domain::Nullifier, &nullifier_input(&nk, &cm, pos));
-        inputs[b + NF_A] = nf_in[0];
-        inputs[b + NF_B] = nf_in[1];
-        inputs[b + NF_C] = nf_in[2];
+        let nf_in = sponge_inputs(Domain::Nullifier, &nullifier_input(&nk, &cm, sp.position));
+        inputs[b + NF_A..b + NF_C + 1].copy_from_slice(&nf_in);
         nullifiers[i] = out8(nf_in[2]);
 
-        // Registers.
         let mut pacc = [0u32; 2];
         for r in 0..SPEND_ROWS {
             let row = &mut extra[b + r];
@@ -88,51 +159,38 @@ pub(crate) fn build(w: &ActionWitness, vb: Option<ValueBalance>) -> Built {
             row[col(PACC_HI)] = F::from_u32(pacc[1]);
             if (MERKLE..MERKLE + 32).contains(&r) {
                 let k = r - MERKLE;
-                if (pos >> k) & 1 == 1 {
+                if (sp.position >> k) & 1 == 1 {
                     pacc[k / 16] += 1 << (k % 16);
                 }
             }
         }
-        set_value_bits(&mut extra[b + CM_B], note.value);
-        balance += i128::from(note.value);
+        set_value_bits(&mut extra[b + CM_B], &sp.limbs);
     }
 
-    for (j, note) in w.outputs.iter().enumerate() {
+    for (j, out) in raw.outputs.iter().enumerate() {
         let b = output_base(j);
-        let cm_in = sponge_inputs(Domain::NoteCommitment, &note.commitment_input());
-        inputs[b..b + 3].copy_from_slice(&cm_in);
+        let cm_in = sponge_inputs(Domain::NoteCommitment, &commitment_input(&out.owner, &out.limbs, &out.rcm));
+        inputs[b..b + OUTPUT_ROWS].copy_from_slice(&cm_in);
         commitments[j] = out8(cm_in[2]);
-        set_value_bits(&mut extra[b + 1], note.value);
-        balance -= i128::from(note.value);
+        set_value_bits(&mut extra[b + 1], &out.limbs);
     }
 
-    // Balance accumulator: acc on row r includes the value rows before r.
+    // Balance accumulator: row r holds the sum over value rows before r.
     let vsign = &periodic_columns()[sel::VSIGN];
-    let mut acc = [0i64; 4];
+    let mut acc = [F::ZERO; 4];
     for r in 0..HEIGHT {
+        extra[r][col(ACC)..col(ACC) + 4].copy_from_slice(&acc);
         for k in 0..4 {
-            extra[r][col(ACC) + k] = F::from_i64(acc[k]);
-        }
-        let sign = if vsign[r] == F::ONE {
-            1
-        } else if vsign[r] == F::NEG_ONE {
-            -1
-        } else {
-            0
-        };
-        for k in 0..4 {
-            acc[k] += sign * i64::from(inputs[r][k].as_canonical_u32());
+            acc[k] += vsign[r] * inputs[r][k];
         }
     }
 
-    // Carries for the claimed value balance (the honest one unless a test overrides it).
-    let vb = vb.or_else(|| ValueBalance::new(balance)).unwrap_or_default();
-    let mut carry_in = 0i64;
+    // Carries for the claimed value balance.
     let last = &mut extra[BALANCE_ROW];
+    let sign = F::ONE - raw.vb_neg.double();
+    let mut carry_in = 0i64;
     for k in 0..3 {
-        let vb_limb = ((vb.magnitude() >> (16 * k)) & 0xffff) as i64;
-        let signed = if vb.is_negative() { -vb_limb } else { vb_limb };
-        let t = last_acc(last, col(ACC) + k) - signed + carry_in;
+        let t = centered(last[col(ACC) + k] - sign * raw.vb[k]) + carry_in;
         let c = t.div_euclid(1 << 16);
         let bits = (c + 4).clamp(0, 7);
         for i in 0..3 {
@@ -147,27 +205,23 @@ pub(crate) fn build(w: &ActionWitness, vb: Option<ValueBalance>) -> Built {
         values.extend_from_slice(&p2.values[r * P2_COLS..(r + 1) * P2_COLS]);
         values.extend_from_slice(&extra[r]);
     }
-    Built {
-        trace: RowMajorMatrix::new(values, WIDTH),
-        nullifiers,
-        commitments,
-        balance,
+
+    let mut public = vec![F::ZERO; pv::COUNT];
+    public[pv::ANCHOR..pv::ANCHOR + 8].copy_from_slice(&raw.anchor);
+    for i in 0..2 {
+        public[pv::NF + 8 * i..pv::NF + 8 * i + 8].copy_from_slice(&nullifiers[i]);
+        public[pv::CM + 8 * i..pv::CM + 8 * i + 8].copy_from_slice(&commitments[i]);
     }
+    public[pv::VB_NEG] = raw.vb_neg;
+    public[pv::VB..pv::VB + 4].copy_from_slice(&raw.vb);
+    public[pv::SIGHASH..pv::SIGHASH + 8].copy_from_slice(&raw.sighash);
+    public[pv::CIRCUIT] = raw.circuit_id;
+
+    Built { trace: RowMajorMatrix::new(values, WIDTH), nullifiers, commitments, public }
 }
 
-fn last_acc(row: &[F; WIDTH - P2_COLS], c: usize) -> i64 {
-    let v = row[c].as_canonical_u32();
-    // acc is a small signed integer stored mod p.
-    if v > crate::field::P / 2 { i64::from(v) - i64::from(crate::field::P) } else { i64::from(v) }
-}
-
-/// The public values a built trace proves.
-pub(crate) fn public_inputs(w: &ActionWitness, built: &Built, vb: ValueBalance) -> PublicInputs {
-    PublicInputs {
-        anchor: w.anchor,
-        nullifiers: built.nullifiers,
-        commitments: built.commitments,
-        value_balance: vb,
-        sighash: w.sighash,
-    }
+/// `Σ spent − Σ output` of a witness, over the integers.
+pub(crate) fn balance(w: &ActionWitness) -> i128 {
+    w.spends.iter().map(|s| i128::from(s.note.value)).sum::<i128>()
+        - w.outputs.iter().map(|n| i128::from(n.value)).sum::<i128>()
 }

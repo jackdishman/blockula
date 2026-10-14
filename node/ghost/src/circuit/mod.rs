@@ -216,18 +216,29 @@ fn action_air() -> &'static ActionAir {
 
 /// Checks the witness against every constraint and returns the statement it proves.
 pub fn check_witness(w: &ActionWitness) -> Result<PublicInputs, ProveError> {
-    let built = trace::build(w, None);
-    let vb = ValueBalance::new(built.balance).ok_or(ProveError::ValueBalanceOutOfRange)?;
-    let public = trace::public_inputs(w, &built, vb);
+    check_and_build(w).map(|(public, _)| public)
+}
+
+fn check_and_build(w: &ActionWitness) -> Result<(PublicInputs, trace::Built), ProveError> {
+    let vb = ValueBalance::new(trace::balance(w)).ok_or(ProveError::ValueBalanceOutOfRange)?;
+    let built = trace::build(&trace::RawAction::from_witness(w, vb));
+    let public = PublicInputs {
+        anchor: w.anchor,
+        nullifiers: built.nullifiers,
+        commitments: built.commitments,
+        value_balance: vb,
+        sighash: w.sighash,
+    };
+    debug_assert_eq!(public.to_fields(), built.public);
     if public.nullifiers[0] == public.nullifiers[1] {
         return Err(ProveError::DuplicateNullifier);
     }
-    let report = check_all_constraints(action_air(), &built.trace, &public.to_fields(), Some(4));
+    let report = check_all_constraints(action_air(), &built.trace, &built.public, Some(4));
     if !report.is_ok() {
         let rows: Vec<String> = report.failures.iter().map(|f| format!("row {} {}", f.row, f)).collect();
         return Err(ProveError::Unsatisfied(rows.join(", ")));
     }
-    Ok(public)
+    Ok((public, built))
 }
 
 /// Proves an action with fresh OS randomness for the zero-knowledge masks.
@@ -242,25 +253,38 @@ pub fn prove(w: &ActionWitness) -> Result<(PublicInputs, Vec<u8>), ProveError> {
 /// Proves with the masks drawn from `seed`. Only for reproducible tests: reusing a seed for two
 /// different witnesses can leak them.
 pub fn prove_with_seed(w: &ActionWitness, seed: [u8; 32]) -> Result<(PublicInputs, Vec<u8>), ProveError> {
-    let public = check_witness(w)?;
-    let built = trace::build(w, Some(public.value_balance));
-    let proof = p3_uni_stark::prove(&config(seed), action_air(), built.trace, &public.to_fields())
-        .map_err(|e| ProveError::Prover(format!("{e:?}")))?;
-    let bytes = postcard::to_allocvec(&proof).map_err(|e| ProveError::Prover(e.to_string()))?;
+    let (public, built) = check_and_build(w)?;
+    let bytes = prove_trace(built.trace, &built.public, seed)?;
     Ok((public, bytes))
+}
+
+/// Proves a laid-out trace without checking it first (the soundness tests use this to play a
+/// cheating prover).
+pub(crate) fn prove_trace(
+    trace: p3_matrix::dense::RowMajorMatrix<F>,
+    public: &[F],
+    seed: [u8; 32],
+) -> Result<Vec<u8>, ProveError> {
+    let proof = p3_uni_stark::prove(&config(seed), action_air(), trace, public)
+        .map_err(|e| ProveError::Prover(format!("{e:?}")))?;
+    postcard::to_allocvec(&proof).map_err(|e| ProveError::Prover(e.to_string()))
 }
 
 /// Verifies an Action proof. Never panics: decoding is strict and canonical, and the Plonky3
 /// verifier (which "may panic on certain malformed proofs") runs under `catch_unwind`.
 pub fn verify(public: &PublicInputs, proof: &[u8]) -> Result<(), VerifyError> {
-    if proof.len() > MAX_PROOF_BYTES {
-        return Err(VerifyError::TooLarge);
-    }
     if public.nullifiers[0] == public.nullifiers[1] {
         return Err(VerifyError::DuplicateNullifier);
     }
-    let fields = public.to_fields();
-    catch_unwind(AssertUnwindSafe(|| verify_fields(&fields, proof))).unwrap_or(Err(VerifyError::Panicked))
+    verify_raw(&public.to_fields(), proof)
+}
+
+/// [`verify`] on raw public values (tests feed it values no [`PublicInputs`] can encode).
+pub(crate) fn verify_raw(fields: &[F], proof: &[u8]) -> Result<(), VerifyError> {
+    if proof.len() > MAX_PROOF_BYTES {
+        return Err(VerifyError::TooLarge);
+    }
+    catch_unwind(AssertUnwindSafe(|| verify_fields(fields, proof))).unwrap_or(Err(VerifyError::Panicked))
 }
 
 /// Decodes a proof: postcard, canonical (re-encodes to the same bytes), the expected height.
