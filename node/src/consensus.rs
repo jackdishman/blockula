@@ -339,7 +339,8 @@ where
         let mut bytes = 0;
         // Senders whose earlier tx was left out: their later nonces can't apply.
         let mut stuck = std::collections::HashSet::new();
-        for tx in c.proposal_order() {
+        let c = &mut *c; // borrow the mempool and the state separately
+        for tx in crate::chain::proposal_order(&c.mempool) {
             if txs.len() >= MAX_BLOCK_TXS {
                 break;
             }
@@ -353,7 +354,7 @@ where
             }
             // Only propose txs that will succeed; a tx that would just burn its fee waits/expires.
             let mut tj = crate::chain::Journal::default();
-            match c.state.apply_j(&mut tj, &tx, &chain_id, &proposer, height, false) {
+            match c.state.apply_j(&mut tj, tx, &chain_id, &proposer, height, false) {
                 Ok(crate::chain::Outcome::Applied) => j.absorb_pub(tj),
                 Ok(crate::chain::Outcome::Failed(_)) | Err(_) => {
                     c.state.rollback(tj);

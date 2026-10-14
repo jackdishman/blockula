@@ -2083,33 +2083,6 @@ impl Chain {
         self.submit_tx(tx).map(|(id, _)| id)
     }
 
-    /// Mempool txs in the order a proposal takes them: highest tip per byte first (earlier
-    /// arrival first among equals), each sender's txs still in nonce order.
-    pub fn proposal_order(&self) -> Vec<Tx> {
-        use std::cmp::Reverse;
-        use std::collections::{BinaryHeap, VecDeque};
-        let mut queues: Vec<VecDeque<usize>> = vec![];
-        let mut by_sender: HashMap<&str, usize> = HashMap::new();
-        for (i, t) in self.mempool.iter().enumerate() {
-            let q = *by_sender.entry(t.from.as_str()).or_insert_with(|| {
-                queues.push(VecDeque::new());
-                queues.len() - 1
-            });
-            queues[q].push_back(i);
-        }
-        // Max-heap of each sender's next tx: (rate, earliest arrival, queue).
-        let mut heap: BinaryHeap<(TipRate, Reverse<usize>, usize)> = queues.iter().enumerate().map(|(q, txs)| (TipRate::of(&self.mempool[txs[0]]), Reverse(txs[0]), q)).collect();
-        let mut out = Vec::with_capacity(self.mempool.len());
-        while let Some((_, Reverse(i), q)) = heap.pop() {
-            out.push(self.mempool[i].clone());
-            queues[q].pop_front();
-            if let Some(&next) = queues[q].front() {
-                heap.push((TipRate::of(&self.mempool[next]), Reverse(next), q));
-            }
-        }
-        out
-    }
-
     /// Adds a tx that another node already accepted (full nodes track what they forwarded).
     pub fn track_pending(&mut self, tx: Tx) -> Result<()> {
         tx.check_format()?;
@@ -2210,6 +2183,33 @@ impl Chain {
 
 pub const MAX_MEMPOOL: usize = 5_000;
 pub const MAX_PENDING_PER_SENDER: usize = 64;
+
+/// Mempool txs in the order a proposal takes them: highest tip per byte first (earlier arrival
+/// first among equals), each sender's txs still in nonce (arrival) order.
+pub fn proposal_order(mempool: &[Tx]) -> Vec<&Tx> {
+    use std::cmp::Reverse;
+    use std::collections::{BinaryHeap, VecDeque};
+    let mut queues: Vec<VecDeque<usize>> = vec![];
+    let mut by_sender: HashMap<&str, usize> = HashMap::new();
+    for (i, t) in mempool.iter().enumerate() {
+        let q = *by_sender.entry(t.from.as_str()).or_insert_with(|| {
+            queues.push(VecDeque::new());
+            queues.len() - 1
+        });
+        queues[q].push_back(i);
+    }
+    // Max-heap of each sender's next tx: (rate, earliest arrival, queue).
+    let mut heap: BinaryHeap<(TipRate, Reverse<usize>, usize)> = queues.iter().enumerate().map(|(q, txs)| (TipRate::of(&mempool[txs[0]]), Reverse(txs[0]), q)).collect();
+    let mut out = Vec::with_capacity(mempool.len());
+    while let Some((_, Reverse(i), q)) = heap.pop() {
+        out.push(&mempool[i]);
+        queues[q].pop_front();
+        if let Some(&next) = queues[q].front() {
+            heap.push((TipRate::of(&mempool[next]), Reverse(next), q));
+        }
+    }
+    out
+}
 
 /// A tx's tip per byte, compared exactly (cross-multiplied in u128, no floats).
 #[derive(Clone, Copy, Debug)]
@@ -2953,7 +2953,7 @@ mod v1 {
         for t in [&a0, &a1, &b, &d, &e] {
             c.submit(t.clone()).unwrap();
         }
-        let order: Vec<String> = c.proposal_order().iter().map(|t| t.id()).collect();
+        let order: Vec<String> = proposal_order(&c.mempool).iter().map(|t| t.id()).collect();
         assert_eq!(order, [&b, &d, &e, &a0, &a1].map(|t| t.id()));
         fs::remove_dir_all(home).ok();
     }
