@@ -17,6 +17,29 @@ Blockula is a solid testnet and not close to a responsible mainnet. Expect about
 
 Legal review, the post-quantum handshake, supply-chain hardening and wallet recovery run in parallel, but all must be done before genesis.
 
+## Decisions taken (2026-10-14)
+
+The decisions in section 6 have been made. [MAINNET-DESIGN.md](MAINNET-DESIGN.md) records them with the protocol spec and work packages, and wins where it and this assessment disagree. In one line each:
+
+| ID | Decision |
+|---|---|
+| DEC-1 | Everything that can be made safe is on at genesis, contribution pool included. Admin levers become governance; the jury draw uses a randomness beacon. |
+| DEC-2 | Ghost Mode ships at genesis but disabled. Governance switches it on after its own ZK audit, testnet time and counsel. |
+| DEC-3 | Permissionless, stake-ranked validators with equal-weight votes. Cap 31; genesis floor 22, target 28–31; the founder runs at most 2 seats. |
+| DEC-4 | Self-custodial delegation to share-accounted pools, 21-day unbonding, slashing for double-signing (heavy) and downtime (light, jail first). |
+| DEC-5 | 1B FANG, no sale: community 32%, treasury 25%, contribution endowment 15%, bootstrap delegation 10%, founder 10% (1-year cliff, 4-year vest), foundation 5%, operators and security grants 3%. See [TOKENOMICS.md](TOKENOMICS.md). |
+| DEC-6 | Account creation burns a fee and names renew yearly; every other record is already bonded. |
+| DEC-7 | Mainnet chain id `blockula-1` with address prefix `boo`; testnets use `tboo`. |
+| DEC-8 | The wallet's passkey domain is one the project's entity owns, never `*.vercel.app`. |
+| DEC-9 | Post-quantum transport before launch: a hybrid X25519 + ML-KEM-768 handshake in a vendored `commonware-stream`. |
+| DEC-10 | No admin keys and no faucet on mainnet. |
+| DEC-11 | Names: one-year registration, renewal at 20% a year, 30-day grace, transfer and release, a governance-assigned reserved list. |
+| DEC-12 | 1 s blocks, `max_block_bytes` 2 MiB at genesis, a base fee that follows fullness, 1-hour epochs. |
+| DEC-13 | Voting weight is FANG locked × conviction. Unvested tokens and Soul don't vote at genesis. |
+| DEC-14 | At most ⌊n/4⌋ validators per provider, ASN or country (target ⌊f/2⌋), and 15% per facility. The foundation's 2 validators run on Fly.io; Hetzner is excluded. |
+
+The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
+
 ## Where things stand
 
 | | Today |
