@@ -6,6 +6,7 @@ mod crypto;
 mod epochs;
 mod github;
 mod snapshot;
+mod state;
 mod node;
 mod pq;
 mod poc;

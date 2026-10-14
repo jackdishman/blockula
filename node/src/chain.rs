@@ -2,8 +2,10 @@
 //! finalized blocks deterministically, in order, and keeps the mempool, indexes and `blocks.jsonl`.
 
 use crate::crypto::{self, Keys};
+use crate::state::{JMap, TMap};
 use crate::types::*;
 use anyhow::{anyhow, bail, Context, Result};
+use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
@@ -85,8 +87,9 @@ fn default_max_validators() -> usize {
 /// How many past epochs' validator sets the state keeps (for verifying recent certificates).
 pub const EPOCH_SETS_KEPT: u64 = 8;
 
-/// Genesis constants the state machine needs while applying txs.
-#[derive(Clone, Debug, Default)]
+/// Genesis constants the state machine needs while applying txs (a state record, so the root
+/// commits to them).
+#[derive(Clone, Debug, Default, BorshSerialize, BorshDeserialize)]
 pub struct Params {
     pub block_time_ms: u64,
     pub epoch_blocks: u64,
@@ -125,7 +128,7 @@ impl Params {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ValidatorStatus {
     /// Registered and bonded, waiting for an admin.
@@ -139,7 +142,7 @@ pub enum ValidatorStatus {
     Unbonded,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct ValidatorRecord {
     /// `boo1…` address of the consensus key (the validator's id).
     pub address: String,
@@ -174,6 +177,7 @@ impl Genesis {
         Params { block_time_ms: self.block_time_ms, epoch_blocks: self.epoch_blocks, admins: self.validator_admins.clone(), min_bond: self.min_bond, max_validators: self.max_validators, poc, address_prefix: self.address_prefix.clone() }
     }
 
+    /// The state before block 1, committed (its root is the genesis state root).
     pub fn initial_state(&self) -> State {
         let mut state = State { params: self.params(), ..Default::default() };
         for a in &self.allocations {
@@ -203,6 +207,7 @@ impl Genesis {
             );
         }
         state.active_sets.insert(0, self.validators.iter().map(|v| v.address.clone()).collect());
+        state.commit_block().expect("an in-memory tree can't fail");
         state
     }
 
@@ -288,13 +293,13 @@ pub fn make_pop(seed: [u8; 32], chain_id: &str, owner: &str, p2p_addr: &str, htt
 /// Undo log for state changes: the old value of every entry touched (first touch wins).
 #[derive(Default)]
 pub struct Journal {
-    accounts: HashMap<String, Option<Account>>,
-    names: HashMap<String, Option<NameRecord>>,
-    validators: HashMap<String, Option<ValidatorRecord>>,
-    hunts: HashMap<u64, Option<Hunt>>,
-    github: HashMap<String, Option<GithubLink>>,
-    github_by_account: HashMap<String, Option<String>>,
-    familiars: HashMap<String, Option<BTreeMap<String, String>>>,
+    accounts: JMap<String, Account>,
+    names: JMap<String, NameRecord>,
+    validators: JMap<String, ValidatorRecord>,
+    hunts: JMap<u64, Hunt>,
+    github: JMap<String, GithubLink>,
+    github_by_account: JMap<String, String>,
+    familiars: JMap<String, BTreeMap<String, String>>,
     scalars: Option<(u64, u64)>,
     next_hunt_id: Option<u64>,
     pub(crate) poc: crate::poc::PocJournal,
@@ -307,27 +312,13 @@ impl Journal {
 
     /// Folds a nested journal in, keeping the oldest values.
     fn absorb(&mut self, other: Journal) {
-        for (k, v) in other.accounts {
-            self.accounts.entry(k).or_insert(v);
-        }
-        for (k, v) in other.names {
-            self.names.entry(k).or_insert(v);
-        }
-        for (k, v) in other.validators {
-            self.validators.entry(k).or_insert(v);
-        }
-        for (k, v) in other.hunts {
-            self.hunts.entry(k).or_insert(v);
-        }
-        for (k, v) in other.github {
-            self.github.entry(k).or_insert(v);
-        }
-        for (k, v) in other.github_by_account {
-            self.github_by_account.entry(k).or_insert(v);
-        }
-        for (k, v) in other.familiars {
-            self.familiars.entry(k).or_insert(v);
-        }
+        self.accounts.absorb(other.accounts);
+        self.names.absorb(other.names);
+        self.validators.absorb(other.validators);
+        self.hunts.absorb(other.hunts);
+        self.github.absorb(other.github);
+        self.github_by_account.absorb(other.github_by_account);
+        self.familiars.absorb(other.familiars);
         if self.scalars.is_none() {
             self.scalars = other.scalars;
         }
@@ -350,7 +341,7 @@ pub fn free_port() -> Result<u16> {
     Ok(std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Account {
     #[serde(with = "u64_str")]
     pub balance: u64,
@@ -359,7 +350,7 @@ pub struct Account {
     pub keys: BTreeMap<String, KeyRecord>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct KeyRecord {
     pub label: String,
     pub role: KeyRole,
@@ -372,14 +363,14 @@ pub struct KeyRecord {
 
 pub const MAX_KEYS: usize = 16;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct NameRecord {
     pub name: String,
     pub owner: String,
     pub registered_at: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HuntStatus {
     Open,
@@ -387,7 +378,7 @@ pub enum HuntStatus {
     Cancelled,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Hunt {
     pub id: u64,
     pub creator: String,
@@ -419,7 +410,7 @@ impl Hunt {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct GithubLink {
     pub handle: String,
     pub account: String,
@@ -432,34 +423,32 @@ pub fn max_hunt_blocks(block_time_ms: u64) -> u64 {
     365 * 86_400 * 1000 / block_time_ms.max(1)
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+/// The chain state. Maps are `TMap`s: cloning a `State` is O(1) (structure is shared), and
+/// changed keys are tracked so `commit_block` updates the root from just those. How it maps to
+/// records and the root is in `state/mod.rs`.
+#[derive(Clone, Default)]
 pub struct State {
-    pub accounts: BTreeMap<String, Account>,
-    pub names: BTreeMap<String, NameRecord>,
+    pub accounts: TMap<String, Account>,
+    pub names: TMap<String, NameRecord>,
     pub supply: u64,
     pub burned: u64,
     /// Every validator ever registered (genesis ones included), by validator address.
-    pub validators: BTreeMap<String, ValidatorRecord>,
+    pub validators: TMap<String, ValidatorRecord>,
     /// Active set per epoch (validator addresses), for the last `EPOCH_SETS_KEPT` epochs.
-    pub active_sets: BTreeMap<u64, Vec<String>>,
-    #[serde(skip)]
+    pub active_sets: TMap<u64, Vec<String>>,
     pub params: Params,
     /// Hunts (bounties on GitHub issues) by id.
-    #[serde(default)]
-    pub hunts: BTreeMap<u64, Hunt>,
-    #[serde(default)]
+    pub hunts: TMap<u64, Hunt>,
     pub next_hunt_id: u64,
     /// GitHub links by lowercase handle, and the reverse.
-    #[serde(default)]
-    pub github: BTreeMap<String, GithubLink>,
-    #[serde(default)]
-    pub github_by_account: BTreeMap<String, String>,
+    pub github: TMap<String, GithubLink>,
+    pub github_by_account: TMap<String, String>,
     /// Registered Familiars (agent session keys) per account: key id → label.
-    #[serde(default)]
-    pub familiars: BTreeMap<String, BTreeMap<String, String>>,
+    pub familiars: TMap<String, BTreeMap<String, String>>,
     /// 🪦 Proof of Contribution: Souls, vouches, claims, Séances, the pool's grants.
-    #[serde(default)]
     pub poc: crate::poc::Poc,
+    /// The authenticated tree over every record, as of the last `commit_block`.
+    pub tree: crate::state::tree::Smt,
 }
 
 impl State {
@@ -556,16 +545,12 @@ impl State {
     // ---- journaled mutation helpers: record the old value on first touch, then mutate ----
 
     pub(crate) fn acct_mut(&mut self, j: &mut Journal, addr: &str) -> &mut Account {
-        if !j.accounts.contains_key(addr) {
-            j.accounts.insert(addr.to_string(), self.accounts.get(addr).cloned());
-        }
+        j.accounts.touch(&self.accounts, addr);
         self.accounts.entry(addr.to_string()).or_default()
     }
 
     fn validator_mut(&mut self, j: &mut Journal, addr: &str) -> Option<&mut ValidatorRecord> {
-        if !j.validators.contains_key(addr) {
-            j.validators.insert(addr.to_string(), self.validators.get(addr).cloned());
-        }
+        j.validators.touch(&self.validators, addr);
         self.validators.get_mut(addr)
     }
 
@@ -583,25 +568,17 @@ impl State {
     }
 
     fn hunt_mut(&mut self, j: &mut Journal, id: u64) -> Option<&mut Hunt> {
-        if !j.hunts.contains_key(&id) {
-            j.hunts.insert(id, self.hunts.get(&id).cloned());
-        }
+        j.hunts.touch(&self.hunts, &id);
         self.hunts.get_mut(&id)
     }
 
     fn j_github(&mut self, j: &mut Journal, handle: &str, account: &str) {
-        if !j.github.contains_key(handle) {
-            j.github.insert(handle.to_string(), self.github.get(handle).cloned());
-        }
-        if !j.github_by_account.contains_key(account) {
-            j.github_by_account.insert(account.to_string(), self.github_by_account.get(account).cloned());
-        }
+        j.github.touch(&self.github, handle);
+        j.github_by_account.touch(&self.github_by_account, account);
     }
 
     fn familiars_mut(&mut self, j: &mut Journal, account: &str) -> &mut BTreeMap<String, String> {
-        if !j.familiars.contains_key(account) {
-            j.familiars.insert(account.to_string(), self.familiars.get(account).cloned());
-        }
+        j.familiars.touch(&self.familiars, account);
         self.familiars.entry(account.to_string()).or_default()
     }
 
@@ -611,58 +588,19 @@ impl State {
         }
     }
 
-    /// Undoes everything recorded in `j`.
+    /// Undoes everything recorded in `j` (values, and the dirty marks of keys it cleans up).
     pub fn rollback(&mut self, j: Journal) {
-        for (k, old) in j.accounts {
-            match old {
-                Some(v) => {
-                    self.accounts.insert(k, v);
-                }
-                None => {
-                    self.accounts.remove(&k);
-                }
-            }
-        }
-        for (k, old) in j.names {
-            match old {
-                Some(v) => {
-                    self.names.insert(k, v);
-                }
-                None => {
-                    self.names.remove(&k);
-                }
-            }
-        }
-        for (k, old) in j.validators {
-            match old {
-                Some(v) => {
-                    self.validators.insert(k, v);
-                }
-                None => {
-                    self.validators.remove(&k);
-                }
-            }
-        }
+        j.accounts.restore(&mut self.accounts);
+        j.names.restore(&mut self.names);
+        j.validators.restore(&mut self.validators);
         if let Some((supply, burned)) = j.scalars {
             self.supply = supply;
             self.burned = burned;
         }
-        fn restore<K: Ord, V>(map: &mut BTreeMap<K, V>, saved: HashMap<K, Option<V>>) {
-            for (k, old) in saved {
-                match old {
-                    Some(v) => {
-                        map.insert(k, v);
-                    }
-                    None => {
-                        map.remove(&k);
-                    }
-                }
-            }
-        }
-        restore(&mut self.hunts, j.hunts);
-        restore(&mut self.github, j.github);
-        restore(&mut self.github_by_account, j.github_by_account);
-        restore(&mut self.familiars, j.familiars);
+        j.hunts.restore(&mut self.hunts);
+        j.github.restore(&mut self.github);
+        j.github_by_account.restore(&mut self.github_by_account);
+        j.familiars.restore(&mut self.familiars);
         if let Some(n) = j.next_hunt_id {
             self.next_hunt_id = n;
         }
@@ -785,7 +723,7 @@ impl State {
                 self.j_debit(j, &sender, name_price(&n))?;
                 let treasury = self.treasury();
                 self.j_credit(j, &treasury, name_price(&n));
-                j.names.entry(n.clone()).or_insert(None);
+                j.names.touch(&self.names, &n);
                 self.names.insert(n.clone(), NameRecord { name: n, owner: sender.clone(), registered_at: height });
             }
             Action::AddKey { key_id, label, role } => {
@@ -965,7 +903,7 @@ impl State {
                 }
                 let id = self.next_hunt_id;
                 self.next_hunt_id = id.checked_add(1).ok_or_else(|| anyhow!("hunt ids exhausted"))?;
-                j.hunts.entry(id).or_insert(None);
+                j.hunts.touch(&self.hunts, &id);
                 self.hunts.insert(
                     id,
                     Hunt { id, creator: sender.clone(), repo: repo.clone(), issue: *issue, title: title.clone(), amount: *amount, funders: BTreeMap::from([(sender.clone(), amount.to_string())]), created_at: height, expires_at: *expires_at, status: HuntStatus::Open, awarded_to: None, awarded_by: None, awarded_at: None, pr: None, familiar_key: None, cancelled_at: None },
@@ -1073,54 +1011,9 @@ impl State {
         })
     }
 
+    /// State root (hex) as of the last `commit_block`: the sparse Merkle tree over every record.
     pub fn root(&self) -> String {
-        let mut h = blake3::Hasher::new();
-        for (a, acct) in &self.accounts {
-            h.update(a.as_bytes());
-            h.update(&acct.balance.to_le_bytes());
-            h.update(&acct.nonce.to_le_bytes());
-            for (id, k) in &acct.keys {
-                h.update(id.as_bytes());
-                h.update(serde_json::to_string(k).unwrap().as_bytes());
-            }
-        }
-        for (n, r) in &self.names {
-            h.update(n.as_bytes());
-            h.update(r.owner.as_bytes());
-        }
-        // Pre-validator-registry chains (only genesis validators, never changed) keep their roots.
-        if self.validators.values().any(|v| v.status != ValidatorStatus::Active || v.active_from != Some(0)) || self.active_sets.len() > 1 {
-            for v in self.validators.values() {
-                h.update(serde_json::to_string(v).unwrap().as_bytes());
-            }
-            for (e, set) in &self.active_sets {
-                h.update(&e.to_le_bytes());
-                h.update(set.join(",").as_bytes());
-            }
-        }
-        // Hunts and GitHub/Familiar records (empty on chains that predate them, so old roots hold).
-        if !self.hunts.is_empty() || self.next_hunt_id != 0 {
-            h.update(b"hunts");
-            h.update(&self.next_hunt_id.to_le_bytes());
-            for hunt in self.hunts.values() {
-                h.update(serde_json::to_string(hunt).unwrap().as_bytes());
-            }
-        }
-        if !self.github.is_empty() {
-            h.update(b"github");
-            for l in self.github.values() {
-                h.update(serde_json::to_string(l).unwrap().as_bytes());
-            }
-        }
-        if !self.familiars.is_empty() {
-            h.update(b"familiars");
-            h.update(serde_json::to_string(&self.familiars).unwrap().as_bytes());
-        }
-        if self.poc.is_active() {
-            h.update(b"poc");
-            h.update(serde_json::to_string(&self.poc).unwrap().as_bytes());
-        }
-        h.finalize().to_hex().to_string()
+        hex::encode(self.tree.root())
     }
 
     pub fn describe(&self, tx: &Tx, height: Option<u64>) -> String {
@@ -1250,8 +1143,6 @@ impl SummonOpts {
 pub const RECENT_BLOCKS: usize = 2_048;
 /// How far behind the (claimed) network height still counts as synced.
 pub const SYNC_SLACK: u64 = 3;
-/// During replay, verify the state root every this many blocks (plus the last one).
-pub const REPLAY_ROOT_CHECK: u64 = 1_000;
 /// Certificates are stored on disk for these heights (plus every epoch's last block) …
 pub const CERT_CHECKPOINT: u64 = 100;
 /// … and kept in memory for this many recent heights.
@@ -1499,7 +1390,7 @@ impl Chain {
         };
         let state = match &base {
             Some(b) => {
-                let st = crate::snapshot::decode_state(&genesis, &fs::read(home.join("base.state.zst")).context("base.state.zst missing")?)?;
+                let st = crate::snapshot::decode_state(&fs::read(home.join("base.state.zst")).context("base.state.zst missing")?)?;
                 if st.root() != b.state_root {
                     bail!("base.state.zst doesn't match base.json's state root");
                 }
@@ -1795,8 +1686,10 @@ impl Chain {
             self.state.end_epoch(self.state.params.epoch_of(block.height));
             self.record_epoch(block.height);
         }
-        // The root is O(state) to compute, so replay checks it periodically (and at the end).
-        if block.height % REPLAY_ROOT_CHECK == 0 && self.state.root() != block.state_root {
+        let root = hex::encode(self.state.commit_block()?.root);
+        #[cfg(test)]
+        self.state.debug_check(block.height);
+        if root != block.state_root {
             bail!("state root mismatch at height {}", block.height);
         }
         self.index(&block);
@@ -1850,7 +1743,10 @@ impl Chain {
                 self.sign_handoffs();
             }
         }
-        let block = Block { height: f.height, prev_hash: f.parent, timestamp_ms: f.timestamp_ms, view: f.view, parent_view: f.parent_view, version: f.version, proposer: f.proposer, state_root: self.state.root(), txs, hash: f.hash, signature: String::new(), failed };
+        let state_root = hex::encode(self.state.commit_block()?.root);
+        #[cfg(test)]
+        self.state.debug_check(f.height);
+        let block = Block { height: f.height, prev_hash: f.parent, timestamp_ms: f.timestamp_ms, view: f.view, parent_view: f.parent_view, version: f.version, proposer: f.proposer, state_root, txs, hash: f.hash, signature: String::new(), failed };
         let (at, len) = self.cblocks.append(f.height, &f.cblock)?;
         self.cblock_index.push((at, len));
         let line = serde_json::to_string(&block)? + "\n";
@@ -2559,6 +2455,7 @@ mod audit {
         let senders: Vec<Keys> = (0..79u32).map(|i| Keys::from_seed(crypto::hash(&i.to_le_bytes()))).collect();
         for k in &senders {
             c.state.accounts.insert(k.address(), Account { balance: 1_000 * DROPS_PER_FANG, ..Default::default() });
+            c.state.supply += 1_000 * DROPS_PER_FANG;
         }
         let me = c.me().unwrap();
         let t = Instant::now();
@@ -2574,6 +2471,7 @@ mod audit {
         assert_eq!(c.mempool.len(), MAX_MEMPOOL);
         let x = Keys::from_seed([77u8; 32]);
         c.state.accounts.insert(x.address(), Account { balance: 100 * DROPS_PER_FANG, ..Default::default() });
+        c.state.supply += 100 * DROPS_PER_FANG;
         let mut tx = unsigned("audit", &x, 0, Action::Transfer { to: me.clone(), amount: 1 });
         let lowball = Tx { tip: 0, ..tx.clone() };
         assert!(c.submit(lowball).unwrap_err().to_string().contains("mempool is full; resubmit with a tip of at least 1 drops"));
@@ -2610,6 +2508,7 @@ mod audit {
         for k in &senders {
             c.state.accounts.insert(k.address(), Account { balance: 1_000 * DROPS_PER_FANG, ..Default::default() });
         }
+        c.state.supply += 200_000 * DROPS_PER_FANG + 8 * 1_000 * DROPS_PER_FANG;
         let txs: Vec<Tx> = (0..512u64).map(|i| unsigned("audit", &senders[(i % 8) as usize], i / 8, Action::Transfer { to: crypto::address_from_bytes(&crypto::hash(&i.to_le_bytes())), amount: 1 })).collect();
         let t = Instant::now();
         c.produce_block_with(txs).unwrap();

@@ -1,0 +1,112 @@
+//! Canonical binary encoding of state records.
+//!
+//! Values are borsh 1.x (designed for consensus hashing): little-endian integers, `usize` as
+//! `u64`, u32-length-prefixed strings and sequences, maps in key order, one-byte option and enum
+//! tags (variants in declaration order). Decoding is strict: no trailing bytes, map keys strictly
+//! increasing (`de_strict_order`), valid UTF-8, known tags. Every record type derives
+//! `BorshSerialize`/`BorshDeserialize` next to its definition; changing a field, its order or an
+//! enum's variants changes the state root, so it also bumps [`SCHEMA_VERSION`].
+//!
+//! Keys are bytes that sort like the map they come from: strings as UTF-8, integers big-endian.
+
+use crate::types::KeyRole;
+use anyhow::{anyhow, Result};
+use borsh::{BorshDeserialize, BorshSerialize};
+use std::borrow::Cow;
+use std::io::{Read, Write};
+
+/// Version of the state encoding (records, namespaces, tree). It is itself a record, so it is
+/// committed to by the root.
+pub const SCHEMA_VERSION: u32 = 1;
+
+pub fn encode<T: BorshSerialize + ?Sized>(v: &T) -> Vec<u8> {
+    borsh::to_vec(v).expect("encoding to memory can't fail")
+}
+
+/// Strict inverse of [`encode`].
+pub fn decode<T: BorshDeserialize>(bytes: &[u8]) -> Result<T> {
+    borsh::from_slice(bytes).map_err(|e| anyhow!("bad record encoding: {e}"))
+}
+
+/// A map key as record key bytes, preserving order.
+pub trait RecordKey: Sized {
+    fn key_bytes(&self) -> Cow<'_, [u8]>;
+    fn from_key_bytes(b: &[u8]) -> Result<Self>;
+}
+
+impl RecordKey for String {
+    fn key_bytes(&self) -> Cow<'_, [u8]> {
+        Cow::Borrowed(self.as_bytes())
+    }
+    fn from_key_bytes(b: &[u8]) -> Result<Self> {
+        String::from_utf8(b.to_vec()).map_err(|_| anyhow!("record key isn't UTF-8"))
+    }
+}
+
+impl RecordKey for u64 {
+    fn key_bytes(&self) -> Cow<'_, [u8]> {
+        Cow::Owned(self.to_be_bytes().to_vec())
+    }
+    fn from_key_bytes(b: &[u8]) -> Result<Self> {
+        Ok(u64::from_be_bytes(b.try_into().map_err(|_| anyhow!("record key isn't 8 bytes"))?))
+    }
+}
+
+// `KeyRole` lives in types.rs (the tx format); its state encoding is written out here.
+impl BorshSerialize for KeyRole {
+    fn serialize<W: Write>(&self, w: &mut W) -> std::io::Result<()> {
+        match self {
+            KeyRole::Owner => 0u8.serialize(w),
+            KeyRole::Session { limit, period_blocks, expires_at } => {
+                1u8.serialize(w)?;
+                limit.serialize(w)?;
+                period_blocks.serialize(w)?;
+                expires_at.serialize(w)
+            }
+        }
+    }
+}
+
+impl BorshDeserialize for KeyRole {
+    fn deserialize_reader<R: Read>(r: &mut R) -> std::io::Result<Self> {
+        match u8::deserialize_reader(r)? {
+            0 => Ok(KeyRole::Owner),
+            1 => Ok(KeyRole::Session { limit: u64::deserialize_reader(r)?, period_blocks: u64::deserialize_reader(r)?, expires_at: u64::deserialize_reader(r)? }),
+            t => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad key role tag {t}"))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn keys_sort_like_their_maps() {
+        let ids = [0u64, 1, 255, 256, u64::MAX];
+        let bytes: Vec<Vec<u8>> = ids.iter().map(|i| i.key_bytes().into_owned()).collect();
+        assert!(bytes.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(u64::from_key_bytes(&bytes[3]).unwrap(), 256);
+        assert!(u64::from_key_bytes(&[1, 2]).is_err());
+        assert!(String::from_key_bytes(&[0xff]).is_err());
+    }
+
+    #[test]
+    fn decoding_is_strict() {
+        let role = KeyRole::Session { limit: 5, period_blocks: 10, expires_at: 99 };
+        let b = encode(&role);
+        assert_eq!(b.len(), 25);
+        assert_eq!(decode::<KeyRole>(&b).unwrap(), role);
+        assert!(decode::<KeyRole>(&[b.clone(), vec![0]].concat()).is_err(), "trailing bytes");
+        assert!(decode::<KeyRole>(&[2]).is_err(), "unknown tag");
+        assert!(decode::<Option<u64>>(&[2, 0, 0, 0, 0, 0, 0, 0, 0]).is_err(), "option tag");
+        assert!(decode::<bool>(&[2]).is_err());
+        // Maps must come sorted, without duplicates.
+        let m = BTreeMap::from([("a".to_string(), 1u64), ("b".to_string(), 2)]);
+        let mut b = encode(&m);
+        assert_eq!(decode::<BTreeMap<String, u64>>(&b).unwrap(), m);
+        b.swap(8, 21); // "a" ↔ "b"
+        assert!(decode::<BTreeMap<String, u64>>(&b).is_err());
+    }
+}
