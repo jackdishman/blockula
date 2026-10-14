@@ -1,9 +1,11 @@
 //! Witness to trace.
 //!
-//! Witnesses are first lowered to a [`RawAction`] of field elements, then laid out. The layout
-//! step follows the raw action without judging it: values that break a constraint give a trace
-//! that fails it, with everything else consistent. That is how the soundness tests play a
-//! cheating prover.
+//! Witnesses are first lowered to a [`RawAction`] of field elements, then laid out row by row.
+//! The layout step computes every permutation input from the cells already written (the same
+//! wiring the AIR checks), so it never judges the raw values: values that break a constraint
+//! give a trace that fails it, with everything downstream consistent. Tests can also apply
+//! [`Cheat`]s, which change a cell before anything downstream reads it. That is how the
+//! soundness tests play a cheating prover.
 
 use p3_field::{PrimeCharacteristicRing, PrimeField32};
 use p3_matrix::dense::RowMajorMatrix;
@@ -11,8 +13,7 @@ use p3_matrix::dense::RowMajorMatrix;
 use super::layout::*;
 use super::{ActionWitness, CIRCUIT_ID, ValueBalance, sighash_fields};
 use crate::field::{Digest, F, P, ZERO_DIGEST, u64_to_limbs};
-use crate::hash::{Domain, compress, permute, sponge, sponge_inputs};
-use crate::note::nullifier_input;
+use crate::hash::{Domain, permute};
 
 /// A spend at the field level.
 #[derive(Clone, Debug)]
@@ -33,7 +34,7 @@ pub(crate) struct RawOutput {
     pub rcm: Digest,
 }
 
-/// An action at the field level, with the public values that aren't computed from the trace.
+/// An action at the field level, with the public values that aren't outputs of the trace.
 #[derive(Clone, Debug)]
 pub(crate) struct RawAction {
     pub spends: [RawSpend; 2],
@@ -73,6 +74,16 @@ impl RawAction {
     }
 }
 
+/// A deliberate deviation for tests: cell `(row, col)` takes `value` before anything
+/// downstream reads it. Registers and accumulators keep the new value on later rows, as a
+/// cheating prover would arrange.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Cheat {
+    pub row: usize,
+    pub col: usize,
+    pub value: F,
+}
+
 /// A laid-out trace and the public values it proves.
 pub(crate) struct Built {
     pub trace: RowMajorMatrix<F>,
@@ -81,129 +92,306 @@ pub(crate) struct Built {
     pub public: Vec<F>,
 }
 
-fn out8(state: [F; 16]) -> Digest {
-    permute(state)[..8].try_into().expect("8")
-}
-
 /// A field element as a small signed integer (elements above p/2 are negative).
 fn centered(x: F) -> i64 {
     let v = i64::from(x.as_canonical_u32());
     if v > i64::from(P / 2) { v - i64::from(P) } else { v }
 }
 
-fn commitment_input(owner: &Digest, limbs: &[F; 4], rcm: &Digest) -> [F; 20] {
-    let mut input = [F::ZERO; 20];
-    input[..8].copy_from_slice(owner);
-    input[8..12].copy_from_slice(limbs);
-    input[12..].copy_from_slice(rcm);
-    input
+/// Lays out the honest trace.
+pub(crate) fn build(raw: &RawAction) -> Built {
+    build_with(raw, &[])
 }
 
-/// Lays out the trace.
-pub(crate) fn build(raw: &RawAction) -> Built {
-    const EXTRA: usize = WIDTH - P2_COLS;
-    let mut inputs = vec![[F::ZERO; 16]; HEIGHT];
-    let mut extra = vec![[F::ZERO; EXTRA]; HEIGHT];
-    let col = |c: usize| c - P2_COLS;
+/// The row machine.
+struct Machine<'a> {
+    rows: Vec<[F; WIDTH]>,
+    cheats: &'a [Cheat],
+}
+
+impl Machine<'_> {
+    /// Applies the cheats for `row` on columns in `cols`.
+    fn cheat(&mut self, row: usize, cols: core::ops::Range<usize>) {
+        for c in self.cheats.iter().filter(|c| c.row == row && cols.contains(&c.col)) {
+            self.rows[row][c.col] = c.value;
+        }
+    }
+
+    /// Sets register columns `cols` of `row` to `value`, then applies cheats there.
+    fn set(&mut self, row: usize, start: usize, value: &[F]) {
+        self.rows[row][start..start + value.len()].copy_from_slice(value);
+        self.cheat(row, start..start + value.len());
+    }
+
+    fn get<const N: usize>(&self, row: usize, start: usize) -> [F; N] {
+        self.rows[row][start..start + N].try_into().expect("N")
+    }
+
+    /// Writes the permutation input (`rate ‖ capacity`), applies input cheats, and returns
+    /// `out`.
+    #[must_use]
+    fn permute(&mut self, row: usize, rate: &[F; 8], capacity: &[F; 8]) -> [F; 16] {
+        self.hash(row, rate, capacity);
+        self.out(row)
+    }
+
+    /// [`Self::permute`] when the caller only needs the cells.
+    fn hash(&mut self, row: usize, rate: &[F; 8], capacity: &[F; 8]) {
+        self.rows[row][IN..IN + 8].copy_from_slice(rate);
+        self.rows[row][IN + 8..IN + 16].copy_from_slice(capacity);
+        self.cheat(row, IN..IN + 16);
+        let out = permute(self.get(row, IN));
+        self.rows[row][OUT..OUT + 16].copy_from_slice(&out);
+    }
+
+    fn out(&self, row: usize) -> [F; 16] {
+        self.get(row, OUT)
+    }
+
+    fn capacity(&self, row: usize) -> [F; 8] {
+        self.get(row, OUT + 8)
+    }
+}
+
+fn rate(parts: &[&[F]]) -> [F; 8] {
+    let mut r = [F::ZERO; 8];
+    let mut i = 0;
+    for p in parts {
+        r[i..i + p.len()].copy_from_slice(p);
+        i += p.len();
+    }
+    r
+}
+
+fn first8(x: &[F; 16]) -> [F; 8] {
+    x[..8].try_into().expect("8")
+}
+
+/// Register columns of a spend block. A cheat on a register cell holds from its row to the end
+/// of the block, overriding the definition (a prover choosing another value), so the
+/// definition and carry constraints are what must catch it.
+struct Regs {
+    nk: Option<Digest>,
+    cm: Option<Digest>,
+    dummy: F,
+    /// Honest position accumulators at the current row.
+    pacc: [F; 2],
+    /// Overrides of the register cells, indexed by column − REG_NK.
+    over: [Option<F>; PACC_LO - REG_NK + 3],
+    /// Value of every register cell and whether it was overridden, per row of the block.
+    rows: Vec<[(F, bool); PACC_LO - REG_NK + 3]>,
+}
+
+impl Regs {
+    fn new(dummy: bool) -> Self {
+        Self {
+            nk: None,
+            cm: None,
+            dummy: F::from_bool(dummy),
+            pacc: [F::ZERO; 2],
+            over: [None; PACC_LO - REG_NK + 3],
+            rows: Vec::new(),
+        }
+    }
+
+    /// The honest value of register column `c` (definitions not yet reached read as zero).
+    fn honest(&self, c: usize) -> F {
+        match c {
+            _ if (REG_NK..REG_NK + 8).contains(&c) => self.nk.map_or(F::ZERO, |d| d[c - REG_NK]),
+            _ if (REG_CM..REG_CM + 8).contains(&c) => self.cm.map_or(F::ZERO, |d| d[c - REG_CM]),
+            DUMMY => self.dummy,
+            PACC_LO => self.pacc[0],
+            _ => self.pacc[1],
+        }
+    }
+
+    /// Picks up register cheats at `row`.
+    fn enter(&mut self, m: &Machine, row: usize) {
+        for ch in m.cheats.iter().filter(|c| c.row == row && (REG_NK..=PACC_HI).contains(&c.col)) {
+            // Accumulators shift; constant registers take the value.
+            let v = match ch.col {
+                PACC_LO | PACC_HI => ch.value - self.honest(ch.col),
+                _ => ch.value,
+            };
+            self.over[ch.col - REG_NK] = Some(v);
+        }
+    }
+
+    /// The register value the wiring reads.
+    fn reg<const N: usize>(&self, start: usize) -> [F; N] {
+        core::array::from_fn(|j| self.value(start + j))
+    }
+
+    fn value(&self, c: usize) -> F {
+        match (c, self.over[c - REG_NK]) {
+            (PACC_LO | PACC_HI, Some(shift)) => self.honest(c) + shift,
+            (_, Some(v)) => v,
+            (_, None) => self.honest(c),
+        }
+    }
+
+    /// Records the row's register values and advances the accumulators by its path bit.
+    fn leave(&mut self, m: &Machine, row: usize) {
+        let periodic = periodic_columns();
+        self.rows.push(core::array::from_fn(|i| (self.value(REG_NK + i), self.over[i].is_some())));
+        let bit = m.rows[row][BIT];
+        self.pacc[0] += periodic[sel::W_LO][row] * bit;
+        self.pacc[1] += periodic[sel::W_HI][row] * bit;
+    }
+
+    /// Writes the register cells. A constant register holds its final definition on every row
+    /// that isn't overridden, including rows before the definition.
+    fn write(&self, m: &mut Machine, base: usize) {
+        for (o, vals) in self.rows.iter().enumerate() {
+            for (i, &(v, overridden)) in vals.iter().enumerate() {
+                let c = REG_NK + i;
+                let accumulator = matches!(c, PACC_LO | PACC_HI);
+                m.rows[base + o][c] = if overridden || accumulator { v } else { self.honest(c) };
+            }
+        }
+    }
+}
+
+/// Lays out the trace with `cheats` applied.
+pub(crate) fn build_with(raw: &RawAction, cheats: &[Cheat]) -> Built {
+    let mut m = Machine { rows: vec![[F::ZERO; WIDTH]; HEIGHT], cheats };
+    let periodic = periodic_columns();
     let mut nullifiers = [ZERO_DIGEST; 2];
     let mut commitments = [ZERO_DIGEST; 2];
 
-    // Value bits: the low 16 bits of each limb. A limb ≥ 2^16 has no valid decomposition.
-    let set_value_bits = |row: &mut [F; EXTRA], limbs: &[F; 4]| {
-        for (k, limb) in limbs.iter().enumerate() {
-            let v = limb.as_canonical_u32();
-            for i in 0..16 {
-                row[col(VBITS) + 16 * k + i] = F::from_bool((v >> i) & 1 == 1);
-            }
-        }
-    };
-
     for (i, sp) in raw.spends.iter().enumerate() {
         let b = spend_base(i);
-        inputs[b + NK] = sponge_inputs(Domain::NullifierKey, &sp.sk)[0];
-        inputs[b + AK] = sponge_inputs(Domain::SpendAuth, &sp.sk)[0];
-        let nk = sponge(Domain::NullifierKey, &sp.sk);
-        let ak = sponge(Domain::SpendAuth, &sp.sk);
-        let mut own_in = [F::ZERO; 16];
-        own_in[..8].copy_from_slice(&ak);
-        own_in[8..].copy_from_slice(&nk);
-        let own = sponge_inputs(Domain::Owner, &own_in);
-        inputs[b + OWN_A] = own[0];
-        inputs[b + OWN_B] = own[1];
-        let owner = sponge(Domain::Owner, &own_in);
-        let cm_in = sponge_inputs(Domain::NoteCommitment, &commitment_input(&owner, &sp.limbs, &sp.rcm));
-        inputs[b + CM_A..b + CM_C + 1].copy_from_slice(&cm_in);
-        let cm = out8(cm_in[2]);
-        let mut node = cm;
-        for k in 0..32 {
-            let bit = (sp.position >> k) & 1 == 1;
-            let sib = sp.siblings[k];
-            let (left, right) = if bit { (sib, node) } else { (node, sib) };
-            let row = b + MERKLE + k;
-            inputs[row][..8].copy_from_slice(&left);
-            inputs[row][8..].copy_from_slice(&right);
-            extra[row][col(BIT)] = F::from_bool(bit);
-            node = compress(&left, &right);
-        }
-        let nf_in = sponge_inputs(Domain::Nullifier, &nullifier_input(&nk, &cm, sp.position));
-        inputs[b + NF_A..b + NF_C + 1].copy_from_slice(&nf_in);
-        nullifiers[i] = out8(nf_in[2]);
+        let mut regs = Regs::new(sp.dummy);
 
-        let mut pacc = [0u32; 2];
-        for r in 0..SPEND_ROWS {
-            let row = &mut extra[b + r];
-            row[col(REG_NK)..col(REG_NK) + 8].copy_from_slice(&nk);
-            row[col(REG_CM)..col(REG_CM) + 8].copy_from_slice(&cm);
-            row[col(DUMMY)] = F::from_bool(sp.dummy);
-            row[col(PACC_LO)] = F::from_u32(pacc[0]);
-            row[col(PACC_HI)] = F::from_u32(pacc[1]);
-            if (MERKLE..MERKLE + 32).contains(&r) {
-                let k = r - MERKLE;
-                if (sp.position >> k) & 1 == 1 {
-                    pacc[k / 16] += 1 << (k % 16);
-                }
-            }
+        regs.enter(&m, b + NK);
+        let nk_out = m.permute(b + NK, &sp.sk, &Domain::NullifierKey.iv());
+        regs.nk = Some(first8(&nk_out));
+        regs.leave(&m, b + NK);
+
+        regs.enter(&m, b + AK);
+        let sk = m.get::<8>(b + NK, IN);
+        let ak_out = m.permute(b + AK, &sk, &Domain::SpendAuth.iv());
+        regs.leave(&m, b + AK);
+
+        regs.enter(&m, b + OWN_A);
+        m.hash(b + OWN_A, &first8(&ak_out), &Domain::Owner.iv());
+        regs.leave(&m, b + OWN_A);
+
+        regs.enter(&m, b + OWN_B);
+        let cap = m.capacity(b + OWN_A);
+        let owner_out = m.permute(b + OWN_B, &regs.reg::<8>(REG_NK), &cap);
+        regs.leave(&m, b + OWN_B);
+
+        regs.enter(&m, b + CM_A);
+        m.hash(b + CM_A, &first8(&owner_out), &Domain::NoteCommitment.iv());
+        regs.leave(&m, b + CM_A);
+        regs.enter(&m, b + CM_B);
+        let cap = m.capacity(b + CM_A);
+        m.hash(b + CM_B, &rate(&[&sp.limbs, &sp.rcm[..4]]), &cap);
+        regs.leave(&m, b + CM_B);
+        regs.enter(&m, b + CM_C);
+        let cap = m.capacity(b + CM_B);
+        let cm_out = m.permute(b + CM_C, &rate(&[&sp.rcm[4..]]), &cap);
+        regs.cm = Some(first8(&cm_out));
+        regs.leave(&m, b + CM_C);
+
+        // Merkle rows: the running node goes left or right by the bit cell.
+        let mut node = first8(&cm_out);
+        for k in 0..32 {
+            let r = b + MERKLE + k;
+            regs.enter(&m, r);
+            m.rows[r][BIT] = F::from_bool((sp.position >> k) & 1 == 1);
+            m.cheat(r, BIT..BIT + 1);
+            let sib = sp.siblings[k];
+            let (left, right) = if m.rows[r][BIT] != F::ZERO { (sib, node) } else { (node, sib) };
+            let out = m.permute(r, &left, &right);
+            let input_left = m.get::<8>(r, IN);
+            node = core::array::from_fn(|j| out[j] + input_left[j]);
+            regs.leave(&m, r);
         }
-        set_value_bits(&mut extra[b + CM_B], &sp.limbs);
+
+        regs.enter(&m, b + NF_A);
+        m.hash(b + NF_A, &regs.reg::<8>(REG_NK), &Domain::Nullifier.iv());
+        regs.leave(&m, b + NF_A);
+        regs.enter(&m, b + NF_B);
+        let cap = m.capacity(b + NF_A);
+        m.hash(b + NF_B, &regs.reg::<8>(REG_CM), &cap);
+        regs.leave(&m, b + NF_B);
+        regs.enter(&m, b + NF_C);
+        let cap = m.capacity(b + NF_B);
+        let nf_out = m.permute(b + NF_C, &rate(&[&regs.reg::<2>(PACC_LO)]), &cap);
+        nullifiers[i] = first8(&nf_out);
+        regs.leave(&m, b + NF_C);
+
+        regs.write(&mut m, b);
     }
 
     for (j, out) in raw.outputs.iter().enumerate() {
         let b = output_base(j);
-        let cm_in = sponge_inputs(Domain::NoteCommitment, &commitment_input(&out.owner, &out.limbs, &out.rcm));
-        inputs[b..b + OUTPUT_ROWS].copy_from_slice(&cm_in);
-        commitments[j] = out8(cm_in[2]);
-        set_value_bits(&mut extra[b + 1], &out.limbs);
+        m.hash(b, &out.owner, &Domain::NoteCommitment.iv());
+        let cap = m.capacity(b);
+        m.hash(b + 1, &rate(&[&out.limbs, &out.rcm[..4]]), &cap);
+        let cap = m.capacity(b + 1);
+        let cm_out = m.permute(b + 2, &rate(&[&out.rcm[4..]]), &cap);
+        commitments[j] = first8(&cm_out);
+    }
+
+    for r in PADDING..HEIGHT {
+        m.hash(r, &[F::ZERO; 8], &[F::ZERO; 8]);
+    }
+
+    // Value bits: the low 16 bits of each limb on value rows. A limb ≥ 2^16 has no valid
+    // decomposition.
+    for r in 0..HEIGHT {
+        if periodic[sel::VALUE][r] == F::ONE {
+            for k in 0..4 {
+                let v = m.rows[r][IN + k].as_canonical_u32();
+                for i in 0..16 {
+                    m.rows[r][VBITS + 16 * k + i] = F::from_bool((v >> i) & 1 == 1);
+                }
+            }
+        }
+        m.cheat(r, VBITS..VBITS + 64);
     }
 
     // Balance accumulator: row r holds the sum over value rows before r.
-    let vsign = &periodic_columns()[sel::VSIGN];
     let mut acc = [F::ZERO; 4];
     for r in 0..HEIGHT {
-        extra[r][col(ACC)..col(ACC) + 4].copy_from_slice(&acc);
+        m.set(r, ACC, &acc);
+        let row = m.rows[r];
         for k in 0..4 {
-            acc[k] += vsign[r] * inputs[r][k];
+            acc[k] = row[ACC + k] + periodic[sel::VSIGN][r] * row[IN + k];
         }
     }
 
-    // Carries for the claimed value balance.
-    let last = &mut extra[BALANCE_ROW];
+    // Carries for the claimed value balance: c_k = (acc_k − vb_k + c_{k−1}) / 2^16.
     let sign = F::ONE - raw.vb_neg.double();
     let mut carry_in = 0i64;
     for k in 0..3 {
-        let t = centered(last[col(ACC) + k] - sign * raw.vb[k]) + carry_in;
+        let t = centered(m.rows[BALANCE_ROW][ACC + k] - sign * raw.vb[k]) + carry_in;
         let c = t.div_euclid(1 << 16);
         let bits = (c + 4).clamp(0, 7);
         for i in 0..3 {
-            last[col(CBITS) + 3 * k + i] = F::from_bool((bits >> i) & 1 == 1);
+            m.rows[BALANCE_ROW][CBITS + 3 * k + i] = F::from_bool((bits >> i) & 1 == 1);
         }
         carry_in = c;
     }
+    // Any remaining cheat on a non-Poseidon2 cell (registers outside spends and so on).
+    for r in 0..HEIGHT {
+        m.cheat(r, P2_COLS..WIDTH);
+    }
 
-    let p2 = p2_trace(inputs);
+    // The Poseidon2 columns of each row from its input; then any cheat on a round column (never
+    // read by the wiring).
+    let p2 = p2_trace(m.rows.iter().map(|row| row[IN..IN + 16].try_into().expect("16")).collect());
     let mut values = Vec::with_capacity(HEIGHT * WIDTH);
     for r in 0..HEIGHT {
-        values.extend_from_slice(&p2.values[r * P2_COLS..(r + 1) * P2_COLS]);
-        values.extend_from_slice(&extra[r]);
+        let mut row = m.rows[r];
+        row[..P2_COLS].copy_from_slice(&p2.values[r * P2_COLS..(r + 1) * P2_COLS]);
+        for c in cheats.iter().filter(|c| c.row == r && c.col < P2_COLS && !(IN..IN + 16).contains(&c.col)) {
+            row[c.col] = c.value;
+        }
+        values.extend_from_slice(&row);
     }
 
     let mut public = vec![F::ZERO; pv::COUNT];

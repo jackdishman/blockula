@@ -10,7 +10,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use super::layout::*;
-use super::trace::{Built, RawAction, build};
+use super::trace::{Built, Cheat, RawAction, build, build_with};
 use super::*;
 use crate::field::P;
 use crate::hash::permute;
@@ -305,6 +305,95 @@ fn wrong_circuit_id_is_rejected() {
 }
 
 #[test]
+fn duplicate_commitments_give_distinct_nullifiers_and_no_more() {
+    // A sender can make two identical notes. Both are spendable, with different nullifiers
+    // (position binding), and the path bit can't be stretched to make a third.
+    let mut r = rng(40);
+    let key = SpendingKey::from_seed(random_bytes(&mut r));
+    let note = Note { value: 1000, owner: key.full_viewing_key().owner(), rseed: random_bytes(&mut r) };
+    let mut tree = FullTree::new();
+    tree.append(note.commitment()).unwrap();
+    tree.append(note.commitment()).unwrap();
+    let spend = |pos: u32| SpendWitness::new(&key, note, tree.path(pos).unwrap());
+    let recipient = xof_to_digest("r", b"r");
+    let w = ActionWitness {
+        spends: [spend(0), spend(1)],
+        outputs: [Note { value: 2000, owner: recipient, rseed: [1; 32] }, Note { value: 0, owner: recipient, rseed: [2; 32] }],
+        anchor: tree.root(),
+        sighash: [0; 32],
+    };
+    let public = check_witness(&w).expect("both duplicates spend");
+    assert_ne!(public.nullifiers[0], public.nullifiers[1]);
+    // At level 0 the node and its sibling are equal, so the arrangement holds for any bit.
+    // Only booleanity stops a bit of 2 (position 2, a fresh nullifier for the same note).
+    let a = raw(&w);
+    for bit in [F::TWO, F::NEG_ONE, F::from_u32(1 << 20)] {
+        let b = build_with(&a, &[Cheat { row: spend_base(0) + MERKLE, col: BIT, value: bit }]);
+        assert_eq!(b.public[..8], a.anchor[..], "same anchor");
+        assert_ne!(b.nullifiers[0], public.nullifiers[0], "a new nullifier");
+        assert_rejected(b, "non-boolean path bit at a duplicated leaf");
+    }
+}
+
+#[test]
+fn value_bits_must_be_boolean() {
+    // Limb p − 1 (= −1) decomposed as bits [p − 1, 0, …]: the sum is right, the bits aren't.
+    let w = action(&mut rng(41), [None, None], [0, 0]);
+    let mut a = raw(&w);
+    a.outputs[0].limbs[0] = F::NEG_ONE;
+    a.vb = u64_to_limbs(1);
+    let row = output_base(0) + 1;
+    let mut cheats = vec![Cheat { row, col: VBITS, value: F::NEG_ONE }];
+    cheats.extend((1..16).map(|i| Cheat { row, col: VBITS + i, value: F::ZERO }));
+    assert_rejected(build_with(&a, &cheats), "non-boolean value bits");
+}
+
+#[test]
+fn balance_starts_at_zero() {
+    // Start the accumulator at 7 and mint 7 into an output: the end balance is unchanged.
+    let w = action(&mut rng(42), [Some(100), None], [100, 0]);
+    let mut a = raw(&w);
+    a.outputs[0].limbs = u64_to_limbs(107);
+    assert_rejected(build_with(&a, &[Cheat { row: 0, col: ACC, value: F::from_u32(7) }]), "accumulator starts at 7");
+}
+
+#[test]
+fn balance_holds_over_the_integers_not_mod_p() {
+    // Mint an output of exactly p drops from nothing with value balance 0: Σ in − Σ out = −p,
+    // which is 0 mod p. Field carries (c0 = p >> 16) would accept it; 3-bit carries can't.
+    let w = action(&mut rng(43), [None, None], [0, 0]);
+    let mut a = raw(&w);
+    a.outputs[0].limbs = u64_to_limbs(u64::from(P));
+    a.vb = [F::ZERO; 4];
+    let carry = |k: usize, c: u32| -> Vec<Cheat> {
+        let v = c + 4;
+        if c > 3 {
+            // Not representable in 3 bits: put it all in the first "bit".
+            return vec![
+                Cheat { row: BALANCE_ROW, col: CBITS + 3 * k, value: F::from_u32(v) },
+                Cheat { row: BALANCE_ROW, col: CBITS + 3 * k + 1, value: F::ZERO },
+                Cheat { row: BALANCE_ROW, col: CBITS + 3 * k + 2, value: F::ZERO },
+            ];
+        }
+        (0..3).map(|i| Cheat { row: BALANCE_ROW, col: CBITS + 3 * k + i, value: F::from_bool((v >> i) & 1 == 1) }).collect()
+    };
+    let mut cheats = carry(0, P >> 16);
+    cheats.extend(carry(1, 0));
+    cheats.extend(carry(2, 0));
+    assert_rejected(build_with(&a, &cheats), "mint p with field carries");
+}
+
+#[test]
+fn sign_must_be_boolean() {
+    // Honest balance −30. Sign 2 means multiplier −3, so |vb| = 10 balances in the field.
+    let w = action(&mut rng(44), [None, None], [30, 0]);
+    let mut a = raw(&w);
+    a.vb_neg = F::TWO;
+    a.vb = u64_to_limbs(10);
+    assert_rejected(build(&a), "sign 2");
+}
+
+#[test]
 fn trace_level_cheats_are_rejected() {
     let w = action(&mut rng(26), [Some(5), Some(8)], [13, 0]);
     let honest = build(&raw(&w));
@@ -411,15 +500,90 @@ fn sweep(w: &ActionWitness, seed: u64) {
     assert!(free.is_empty(), "cells accept a change with every constraint holding: {free:?}");
 }
 
+/// The cells a prover may legitimately choose, with the anchor, value balance and sighash
+/// fixed (nullifiers and output commitments are outputs). Real spends have none: the note,
+/// its position and so its nullifier are determined by the tree. Outputs choose owner and
+/// randomness. Dummies choose key, randomness, path and position.
+fn degrees_of_freedom(w: &ActionWitness) -> std::collections::HashSet<(usize, usize)> {
+    let mut free = std::collections::HashSet::new();
+    let mut add = |row: usize, cols: core::ops::Range<usize>| {
+        for c in cols {
+            free.insert((row, c));
+        }
+    };
+    for j in 0..2 {
+        let b = output_base(j);
+        add(b, IN..IN + 8);
+        add(b + 1, IN + 4..IN + 8);
+        add(b + 2, IN..IN + 4);
+    }
+    for (i, s) in w.spends.iter().enumerate() {
+        if !s.dummy {
+            continue;
+        }
+        let b = spend_base(i);
+        add(b + NK, IN..IN + 8);
+        add(b + CM_B, IN + 4..IN + 8);
+        add(b + CM_C, IN..IN + 4);
+        for k in 0..32 {
+            let sibling = if (s.path.position >> k) & 1 == 1 { IN..IN + 8 } else { IN + 8..IN + 16 };
+            add(b + MERKLE + k, sibling);
+            add(b + MERKLE + k, BIT..BIT + 1);
+        }
+    }
+    free
+}
+
+/// The stronger sweep: change one input or register cell and let everything downstream follow
+/// (as a cheating prover would), then check the whole trace. Only the declared degrees of
+/// freedom may survive. This is what catches a permutation input or a register that nothing
+/// pins, which the single-cell sweep can't see (the permutation's own constraints break first).
+fn propagating_sweep(w: &ActionWitness) {
+    let a = raw(w);
+    let honest = build(&a);
+    assert!(satisfied(&honest));
+    let allowed = degrees_of_freedom(w);
+    let mut free = Vec::new();
+    for row in 0..HEIGHT {
+        for col in (IN..IN + 16).chain(P2_COLS..WIDTH) {
+            let value = honest.trace.values[row * WIDTH + col] + F::ONE;
+            let b = build_with(&a, &[Cheat { row, col, value }]);
+            if satisfied(&b) && !allowed.contains(&(row, col)) {
+                free.push((row, col));
+            }
+        }
+    }
+    assert!(free.is_empty(), "cells a prover can change without breaking a constraint: {free:?}");
+}
+
 #[test]
 fn sweep_two_real_spends() {
-    sweep(&action(&mut rng(30), [Some(123_456_789), Some(42)], [100, 123_456_700]), 31);
+    let w = action(&mut rng(30), [Some(123_456_789), Some(42)], [100, 123_456_700]);
+    sweep(&w, 31);
+    propagating_sweep(&w);
 }
 
 #[test]
 fn sweep_dummy_spends() {
-    sweep(&action(&mut rng(32), [None, Some(u64::MAX)], [u64::MAX, 0]), 33);
-    sweep(&action(&mut rng(34), [None, None], [7, 9]), 35);
+    let w = action(&mut rng(32), [None, Some(u64::MAX)], [u64::MAX, 0]);
+    sweep(&w, 33);
+    propagating_sweep(&w);
+    let w = action(&mut rng(34), [None, None], [7, 9]);
+    sweep(&w, 35);
+    propagating_sweep(&w);
+}
+
+#[test]
+fn declared_freedoms_are_real() {
+    // The other direction: each declared degree of freedom is accepted, so the list is exact.
+    let w = action(&mut rng(37), [None, Some(5)], [4, 0]);
+    let a = raw(&w);
+    let honest = build(&a);
+    for (row, col) in degrees_of_freedom(&w) {
+        let old = honest.trace.values[row * WIDTH + col];
+        let value = if col == BIT { F::ONE - old } else { old + F::ONE };
+        assert!(satisfied(&build_with(&a, &[Cheat { row, col, value }])), "({row}, {col}) is not free");
+    }
 }
 
 #[test]
