@@ -12,7 +12,7 @@ FANG is the native token of Blockula. It pays transaction fees, bonds validators
 |---|---|
 | Genesis supply | **1,000,000,000 FANG** (10¹⁸ drops) |
 | Sale | None. No presale, no investors, no exchange or market-maker allocation |
-| Held keyless or by the community at genesis | 82% (820M FANG), moved only by protocol rules or governance |
+| Held by keyless system accounts at genesis | 82% (820M FANG), moved only by protocol rules or governance |
 | Founder and foundation | 15% (100M + 50M), vesting on-chain |
 | Issuance | 6% a year, falling 15% a year to a 1.5% floor (reached in year 10). 70% to staked validator pools, 20% to the contribution pool, 10% to the treasury |
 | Fees | The base fee (per byte) is burned. The tip goes to the block proposer |
@@ -22,7 +22,7 @@ FANG is the native token of Blockula. It pays transaction fees, bonds validators
 
 | Bucket | % | FANG | Held by | Release (enforced on-chain) | Who moves it | Votes? |
 |---|---|---|---|---|---|---|
-| Community distributions | 32% | 320,000,000 | Keyless system account | Nothing at genesis. Who receives distributions, when and on what criteria is decided and announced only after mainnet is running, and each distribution after the first needs a governance proposal | Governance | No |
+| Community distributions | 32% | 320,000,000 | Keyless system account | Nothing at genesis. Who receives distributions, when and on what criteria is decided and announced only after mainnet is running (how the first one executes is open, section 10); later ones need a governance proposal | Governance | No |
 | Community treasury | 25% | 250,000,000 | Keyless `treasury` account | Unlocks linearly over 4 years (62.5M a year). Also receives 10% of issuance, name fees, and the bootstrap delegation as it unwinds | Governance only (`TreasurySpend`; large spends need ⅔) | No |
 | Contribution endowment | 15% | 150,000,000 | Keyless contribution pool | Released into the pool's spendable balance linearly over 10 years (15M a year), on top of 20% of issuance | Séance juries (each Séance draws at most 25% of the pool) | No |
 | Validator bootstrap delegation | 10% | 100,000,000 | Keyless `bootstrap` account | Delegated by formula: equal shares to every active, non-jailed validator not run by the foundation, rebalanced each epoch. Returns to the treasury linearly over years 2–4. Its staking rewards go to the treasury; operators keep their commission | The protocol formula | No |
@@ -155,7 +155,7 @@ Staking rewards are payment for validating and securing the network. They aren't
   - An investment contract forms when an issuer induces an investment of money with promises of essential managerial efforts. The release names a business plan with milestones, timeline, personnel, funding and how holders will profit as the riskiest kind of promise. Statements by affiliates and agents count.
   - A "central party" is anyone with operational, economic or voting control.
   - Self-custodial staking, including delegation to an operator, isn't a securities transaction.
-  - A free airdrop is covered when it's announced after the network is functional, for past use of a testing environment. It isn't covered when it's announced during testing to drive engagement, or when tokens are given for services (fixing bugs is the release's example). Hunts and pool payouts are therefore compensation for work, outside the airdrop guidance.
+  - A free airdrop is covered when it's announced after the network is functional, for past use of a testing environment. It isn't covered when it's announced during testing to drive engagement, or when tokens are given for services (fixing bugs is the release's example). So Hunts and pool payouts are best read as compensation for work, outside the airdrop guidance.
 - **Regulation Crypto Assets** (Release 33-11434), proposed 2026-08-18, comments due 2026-10-20: exemptions for raises and a safe harbor for projects that have finished their promised efforts. It gives no guidance for projects that never sell. Its disclosure list (supply, lockups, release schedules, related-person holdings, mint and burn) is what this page publishes.
 - **Congress.** The GENIUS Act (payment stablecoins, signed 2025-07-18) doesn't apply to FANG. The CLARITY Act passed the House on 2025-07-17, but Senate cloture failed on 2026-09-15; it must be reintroduced in the next Congress (from January 2027). Its "mature blockchain" test kept affiliated holders under 20% of supply; this design keeps the founder and foundation at 15%.
 - **Uncertainty.** The release is guidance: a later Commission can withdraw it, courts aren't bound by it, and states and private plaintiffs can still sue. The 2026-11-03 midterms and a 2029 administration change are live risks.
