@@ -63,6 +63,9 @@ const someKey = ml_dsa65.keygen(new Uint8Array(32).fill(4)).publicKey;
 const [mainAddr, testAddr] = [addressFromPublicKey(someKey), addressFromPublicKey(someKey, "tboo")];
 assert.ok(testAddr.startsWith("tboo1") && isAddress(testAddr) && isAddress(mainAddr, "boo") && !isAddress(testAddr, "boo"));
 assert.equal(addressPrefix(testAddr), "tboo");
+// Same vectors as node/src/crypto.rs `prefixes_render_and_parse` (Keys::from_seed([4; 32])).
+assert.equal(mainAddr, "boo15le8r6nlt2mpl4k9df9zd5ragyw35m9hm5spjr6td8h93kdkps7qaltngu");
+assert.equal(testAddr, "tboo15le8r6nlt2mpl4k9df9zd5ragyw35m9hm5spjr6td8h93kdkps7qscv9f0");
 assert.ok(!isAddress(testAddr.toUpperCase()));
 console.log("✓ shared encoding vectors match the node");
 

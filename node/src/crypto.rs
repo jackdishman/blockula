@@ -185,6 +185,10 @@ mod tests {
         let classic = bech32::encode::<bech32::Bech32>(Hrp::parse("boo").unwrap(), &hash(&k.public_key())).unwrap();
         assert!(!is_address(&classic), "a bech32 (non-m) checksum would alias the account");
         assert_ne!(system_address(ADDRESS_HRP, "treasury"), system_address(TESTNET_HRP, "treasury"));
+        // Same vectors in sdk-ts/test/e2e.ts (the SDK derives the same key from the same seed).
+        let v = Keys::from_seed([4u8; 32]);
+        assert_eq!(v.address(), "boo15le8r6nlt2mpl4k9df9zd5ragyw35m9hm5spjr6td8h93kdkps7qaltngu");
+        assert_eq!(v.address_with(TESTNET_HRP), "tboo15le8r6nlt2mpl4k9df9zd5ragyw35m9hm5spjr6td8h93kdkps7qscv9f0");
         assert_eq!(network_of(TESTNET_HRP), "testnet");
     }
 }
