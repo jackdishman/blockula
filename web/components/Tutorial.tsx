@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useEffect, useState, type ReactNode } from "react";
 import { explorer } from "@/lib/config";
 import { friendly } from "@/lib/errors";
+import { KIT_LABEL } from "@/lib/recovery";
 import { loadTutorial, saveTutorial, type TutorialState } from "@/lib/session";
 import type { AccountView, Status } from "@/lib/types";
 import { useUnlocked } from "@/lib/wallet";
@@ -103,7 +104,8 @@ function buildItems(account: AccountView, status: Status | null, state: Tutorial
   const me = account.account.address;
   const txs = account.recent_txs;
   const sent = txs.find((t) => t.kind === "transfer" && t.from.address === me);
-  const ownerKeys = account.keys.filter((k) => k.role.type === "owner").length;
+  const ownerKeys = account.keys.filter((k) => k.role.type === "owner" && k.label !== KIT_LABEL).length;
+  const kits = account.keys.filter((k) => k.role.type === "owner" && k.label === KIT_LABEL).length;
   const friend = status?.validator.address;
   return [
     {
@@ -147,8 +149,15 @@ function buildItems(account: AccountView, status: Status | null, state: Tutorial
       id: "device",
       title: "Link a second device",
       done: ownerKeys > 1,
-      learn: "An account can hold several keys. Adding your phone or laptop as a co-owner means losing one device doesn't lose your wallet, and there's still no seed phrase to write down.",
+      learn: "An account can hold several keys. Adding your phone or laptop as a co-owner means losing one device doesn't lose your wallet.",
       action: <Link className="btn small" href="/devices#device">Link a device</Link>,
+    },
+    {
+      id: "kit",
+      title: "Make a recovery kit",
+      done: kits > 0,
+      learn: "A recovery kit is one more owner key, written down as 24 words and kept offline. If every device and passkey is lost, the words add a new device to your account.",
+      action: <Link className="btn small" href="/devices#recovery">Make a kit</Link>,
     },
     {
       id: "agent",

@@ -7,6 +7,7 @@ import { Splash, Unlock } from "@/components/Gate";
 import { AccountPicker } from "@/components/AccountPicker";
 import { Ornament } from "@/components/Ornament";
 import { Copy, ErrorNote, Spinner, Tip } from "@/components/ui";
+import { localKeysAllowed } from "@/lib/config";
 import { friendly, isPrfUnsupported } from "@/lib/errors";
 import { keyCode } from "@/lib/format";
 import { createLocalKey, createPasskey, findAccounts, type AccountChoice } from "@/lib/keys";
@@ -125,7 +126,7 @@ export default function LinkPage() {
         <section className="card stack warn-card">
           <p>This passkey provider doesn&apos;t support <b>PRF</b>, which Blockula needs to derive your key. Try iCloud Keychain, Google Password Manager or 1Password.</p>
           <button className="btn primary" onClick={() => setPrf(false)}>← Try another passkey</button>
-          <button className="btn" onClick={() => make("local")}>Use a browser-only key (less secure, for testing)</button>
+          {localKeysAllowed(client.pin.chainId) && <button className="btn" onClick={() => make("local")}>Use a browser-only key (less secure, for testing)</button>}
         </section>
       )}
     </main>

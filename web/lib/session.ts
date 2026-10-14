@@ -1,6 +1,7 @@
 // Non-secret hints kept in localStorage so we know which passkey/account to unlock on reload.
-// The passkey's PRF output and the derived seed are NEVER stored. The one exception is the
-// explicitly-labeled "browser-only key" fallback, whose seed lives here by design (testing only).
+// The passkey's PRF output, the derived seed and recovery-kit words are NEVER stored. The one
+// exception is the explicitly-labeled "browser-only key" fallback, whose seed lives here by
+// design (test chains only; disabled on mainnet).
 
 export type WalletKind = "passkey" | "local";
 
@@ -16,6 +17,8 @@ export interface Hint {
   name?: string;
   /** Browser-only fallback key. Less secure: anything with access to this browser profile can read it. */
   seed?: string;
+  /** A recovery kit the user wrote down that isn't on the account yet (no FANG for the fee). Its key id only. */
+  pendingKit?: { keyId: string; created: string };
 }
 
 const HINT = "blockula.wallet";
