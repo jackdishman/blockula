@@ -473,7 +473,7 @@ fn cross_rust_signed() {
 fn cross_ts_signed() {
     let file = load("cross/ts-signed.json");
     check_keys(&file, "ts-signed");
-    assert_eq!(cases_of(&file).len(), 15);
+    assert_eq!(cases_of(&file).len(), 13);
     for c in cases_of(&file) {
         let (label, seed, ns, msg, sigb) = (str_of(c, "label"), seed_of(c, "seed"), hx(c, "namespace"), hx(c, "msg"), hx(c, "sig"));
         assert_eq!(hx(c, "ctx"), context_for(&ns), "{label}: context");

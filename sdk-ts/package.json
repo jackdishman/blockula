@@ -16,13 +16,14 @@
   ],
   "scripts": {
     "build": "tsc",
-    "test": "tsx test/e2e.ts"
+    "test": "tsx test/e2e.ts",
+    "test:kat": "tsx test/kat.ts"
   },
   "license": "MIT",
   "dependencies": {
-    "@noble/hashes": "^2.4.0",
-    "@noble/post-quantum": "^0.7.1",
-    "@scure/base": "^2.4.0"
+    "@noble/hashes": "2.4.0",
+    "@noble/post-quantum": "0.7.1",
+    "@scure/base": "2.4.0"
   },
   "devDependencies": {
     "@types/node": "*",
