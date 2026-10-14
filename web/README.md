@@ -35,7 +35,7 @@ Everything is a build-time `NEXT_PUBLIC_*` variable.
 ## Origin security (WAL-3)
 
 - `proxy.ts` sets a per-request nonce CSP on every page: `script-src 'self' 'nonce-…' 'strict-dynamic'`, `style-src 'self' 'nonce-…'`, `connect-src 'self'` plus the configured nodes (and a custom node, named by the `blockula_rpc` cookie and accepted only as a plain `https?://host[:port]` origin), `img-src 'self' data:`, `font-src 'self'`, `frame-ancestors 'none'`, `base-uri 'none'`, `form-action 'self'`, `object-src 'none'`. Pages render per request so the nonce is fresh. `next dev` adds `'unsafe-eval'` and inline styles, which React's dev tooling needs.
-- Next.js puts SRI hashes (`sha384`) on its scripts. Fonts are self-hosted (`next/font` downloads them at build time). There are no third-party scripts.
+- `experimental.sri` puts `sha384` integrity hashes on the framework and main chunks. Next.js 16 (Turbopack) still emits route chunks without them; those load only from this origin under the nonce. Fonts are self-hosted (`next/font` downloads them at build time). There are no third-party scripts.
 - `next.config.ts` sets HSTS, `nosniff`, `Referrer-Policy: no-referrer`, a `Permissions-Policy` that allows WebAuthn on this origin only, `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Resource-Policy: same-origin` and `X-Frame-Options: DENY` on every route.
 - Not covered by code: production deploys should come from a separate, locked-down project that requires review, and the wallet belongs in the audit scope.
 
