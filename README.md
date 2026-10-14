@@ -7,8 +7,9 @@ Quantum entanglement is literally "spooky action at a distance". We took that pe
 | | |
 |---|---|
 | Token | **FANG** (1 FANG = 10⁹ drops 🩸) |
-| Signatures | **ML-DSA-65** (NIST FIPS 204), no elliptic curves anywhere |
+| Signatures | **ML-DSA-65** (NIST FIPS 204), no elliptic curves on-chain |
 | Hashing | BLAKE3-256 |
+| Network | Validators key their channels with hybrid X25519 + **ML-KEM-768** (FIPS 203) and authenticate with ML-DSA-65 |
 | Addresses | `boo1…` = bech32m(BLAKE3(public key)), or just `yourname.boo` |
 | Privacy (Phase 2) | 👻 **Ghost Mode** shielded transfers + 🪦 **The Crypt** encrypted storage, built on hash-based STARKs + ML-KEM |
 
@@ -208,8 +209,10 @@ blockula validator list --rpc https://<any node>
 blockula validator unbond boo1… --key ~/val/validator.key --rpc https://<any node>
 ```
 
-**Testnet only.** The p2p transport authenticates peers with ML-DSA-65 but encrypts with
-X25519 + ChaCha20-Poly1305, which is not post-quantum (see [docs/PLAN.md](docs/PLAN.md#known-limits)).
+The p2p transport authenticates peers with ML-DSA-65 and derives its ChaCha20-Poly1305 keys from a
+hybrid X25519 + ML-KEM-768 exchange, so recorded traffic stays private unless both are broken
+([docs/PQ-TRANSPORT.md](docs/PQ-TRANSPORT.md)). Builds with the older X25519-only transport (the
+v0.4 public testnet) can't peer with it.
 
 ## Layout
 

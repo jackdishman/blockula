@@ -34,6 +34,11 @@ jobs:
         with: { node-version: 22, cache: npm }
       - run: npm ci
       - run: cargo test --release --locked --manifest-path node/Cargo.toml
+      # Hybrid X25519 + ML-KEM-768 p2p handshake (vendored commonware-stream, docs/PQ-TRANSPORT.md).
+      - run: cargo test --release --locked --manifest-path node/Cargo.toml -p commonware-stream
+      - run: bash node/vendor/commonware-stream/verify-vendor.sh
+      # Ghost Mode core (disabled at genesis, docs/GHOST-MODE.md).
+      - run: cargo test --release --locked --manifest-path node/ghost/Cargo.toml
       - run: npm run build -w @blockula/sdk && npm run build -w @blockula/mcp
       - name: 4 validators + full node + SDK e2e + CLI
         run: bash scripts/local-testnet.sh

@@ -418,7 +418,7 @@ async fn status(State(n): State<Node>) -> ApiResult {
         "address_prefix": c.genesis.address_prefix,
         "max_tx_validity_blocks": c.state.params.max_tx_validity_blocks(),
         "protocol_version": crate::consensus::PROTOCOL_VERSION,
-        "crypto": { "signatures": "ML-DSA-65 (FIPS 204)", "hash": "BLAKE3-256", "addresses": format!("bech32m({}, BLAKE3(pubkey))", c.genesis.address_prefix), "p2p_transport": "X25519 + ChaCha20-Poly1305 (not post-quantum), ML-DSA-65 peer auth" },
+        "crypto": { "signatures": "ML-DSA-65 (FIPS 204)", "hash": "BLAKE3-256", "addresses": format!("bech32m({}, BLAKE3(pubkey))", c.genesis.address_prefix), "p2p_transport": "hybrid X25519 + ML-KEM-768 key exchange, ChaCha20-Poly1305, ML-DSA-65 peer auth" },
     })))
 }
 

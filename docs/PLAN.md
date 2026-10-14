@@ -15,6 +15,7 @@
 - **Signatures:** ML-DSA-65 (FIPS 204) for users and validators. SLH-DSA (FIPS 205, hash-only) for cold recovery keys.
 - **Hashes:** BLAKE3-256. Grover's algorithm only halves security, and 256-bit addresses keep ~128-bit collision resistance even against quantum attacks.
 - **Encryption:** ML-KEM-768 (FIPS 203) for note encryption and The Crypt.
+- **Network:** validators authenticate with ML-DSA-65 and derive p2p session keys from hybrid X25519 + ML-KEM-768, so recorded traffic stays private unless both break. The node's outbound HTTPS prefers `X25519MLKEM768`. Details: [PQ-TRANSPORT.md](PQ-TRANSPORT.md).
 - **ZK:** hash-based STARKs (FRI + Poseidon2, e.g. Plonky3) only. No Groth16/KZG, because pairings fall to Shor's algorithm.
 - **Passkeys:** WebAuthn signs with P-256, which is not quantum-safe, so the passkey never signs on-chain. Its **PRF extension** output (symmetric) derives the ML-DSA key: `seed = BLAKE3-KDF("blockula passkey wallet v1", prf)`. Implemented in `sdk-ts/src/passkey.ts`.
 
@@ -183,7 +184,7 @@ Next:
   - **Mempool estimates:** admission reserves the base claim bond, not the escalating one, and the proposer's dry run of not-yet-executed blocks skips end-of-block Séance steps (like epoch ends). Both only delay or fail a tx (fee charged); neither affects consensus.
   - **Default timings are consensus rules.** Chains whose genesis omits `contribution` (the public testnet included) take them from code, as they do every constant in `poc.rs`, so changing them is a coordinated upgrade.
 
-- **The p2p transport is not post-quantum.** Commonware's handshake authenticates peers with ML-DSA-65, but the session key comes from X25519 and traffic is encrypted with ChaCha20-Poly1305. Recorded traffic could be decrypted by a future quantum computer. Consensus messages are public anyway; making the key exchange PQ (e.g. hybrid X25519 + ML-KEM-768) needs a patched `commonware-cryptography` handshake.
+- **The PQ p2p transport is a vendored fork.** The hybrid X25519 + ML-KEM-768 handshake lives in a patched copy of `commonware-stream` 2026.9.0 (`node/vendor/`) until Commonware ships a pluggable KEM (#5183), and nodes on the older X25519-only transport can't peer with it. The public RPC's TLS is only post-quantum behind an edge that negotiates `X25519MLKEM768` (Fly's didn't when measured), and HTTPS certificates are still classical ([PQ-TRANSPORT.md](PQ-TRANSPORT.md)).
 - Validator onboarding is a Season 0 allowlist (admin approval), not permissionless staking. The bond isn't slashable yet: simplex reports attributable faults, but nothing acts on them. Voting power is one vote per validator.
 - An approved validator can't connect over p2p until approval (pending registrations aren't admitted as peers). It syncs from genesis via marshal once it's admitted, and votes once caught up. Until then it counts as offline, so approve at most ⌊(n−1)/3⌋ new validators per epoch.
 - If every genesis validator is removed, new nodes still bootstrap from genesis addresses plus the active validators in their *local* state. A brand-new node then needs at least one genesis validator to be reachable, or to start from a peer's copy of the chain.

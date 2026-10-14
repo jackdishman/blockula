@@ -54,6 +54,8 @@ imbl = { version = "=7.0.2", features = ["serde"] }
 borsh = { version = "=1.8.1", features = ["derive", "de_strict_order"] }
 
 # Like the node's release build: arithmetic overflow panics instead of wrapping.
+rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std", "tls12"] }
+
 [profile.release]
 debug = 1
 overflow-checks = true
@@ -120,3 +122,7 @@ bench = false
 
 [workspace]
 members = ["."]
+
+# Same hybrid p2p handshake as the node (docs/PQ-TRANSPORT.md).
+[patch.crates-io]
+commonware-stream = { path = "../vendor/commonware-stream" }

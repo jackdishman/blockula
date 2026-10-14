@@ -12,6 +12,7 @@
 |---|---|
 | Signatures | **ML-DSA-65** (NIST FIPS 204) for every account, validator vote and block certificate. No elliptic curves on-chain |
 | Hashing | BLAKE3-256. Grover's algorithm only halves its strength, and 256-bit hashes keep a ~128-bit margin |
+| Network | Validators authenticate each other with ML-DSA-65 and key their connections with hybrid X25519 + ML-KEM-768, so recorded traffic stays private even against a future quantum computer |
 | Consensus | BFT proof-of-stake (Commonware *simplex*). Blocks are final in about a second, with no waiting for confirmations |
 | Wallet | A **passkey** unlocks the wallet. Its PRF output derives the ML-DSA key, so the passkey's own non-quantum-safe signature is never used on-chain |
 | Accounts | Multiple keys per account: **owner** keys (each device, plus recovery) and **session** keys for agents and apps, with a spend limit per period and an expiry, all enforced on-chain |
