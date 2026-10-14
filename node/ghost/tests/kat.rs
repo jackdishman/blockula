@@ -153,7 +153,7 @@ fn vectors_list() -> Vec<(&'static str, &'static str)> {
         ("enc-ciphertext-blake3", "ba809cd288afb82d58b5bd07f19b296b98ae8b035b37641c422605e102883ec8"),
         ("out-ciphertext-blake3", "63ec0c8cd079df9fed5b83b943cd67805242f37978265da82b34fddc9b4a782f"),
         ("action-public-blake3", "3c283ab255219e3f2a2362466f5db72a9aa44508a6e4e063754e25ce4cd713a8"),
-        ("action-proof-len", "144751"),
-        ("action-proof-blake3", "b4c5556c1d2b3c8e6ad5e8fc053bb184907438383746c96ce9eb48ea3cd00b91"),
+        ("action-proof-len", "128807"),
+        ("action-proof-blake3", "76576ee380323a16472091f96a665866629cd4d3531dd5b620d7b905dda3d31f"),
     ]
 }

@@ -54,8 +54,8 @@ pub const COMMIT_POW_BITS: usize = 0;
 pub const BATCH_POW_BITS: usize = 16;
 /// Proof-of-work bits before the out-of-domain point.
 pub const OOD_POW_BITS: usize = 16;
-/// log2 of the final FRI polynomial length.
-pub const LOG_FINAL_POLY_LEN: usize = 0;
+/// log2 of the final FRI polynomial length (stopping early saves ~10% of the proof).
+pub const LOG_FINAL_POLY_LEN: usize = 5;
 /// log2 of the maximum FRI folding arity.
 pub const MAX_LOG_ARITY: usize = 1;
 /// Random codewords masking the trace (must be ≥ the extension degree).
