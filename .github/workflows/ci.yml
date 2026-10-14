@@ -2,35 +2,112 @@ name: CI
 on:
   push: { branches: [main] }
   pull_request:
+  # Weekly: new RustSec / npm advisories surface even when nobody pushes.
+  schedule: [{ cron: "17 6 * * 1" }]
+  workflow_dispatch:
+
+# Every job only reads the repo. Actions are pinned by commit SHA (scripts/check-pins.sh).
+permissions:
+  contents: read
 
 # A new push to a PR cancels its stale run. Runs on main always finish.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   node:
     name: Node (Rust tests + local multi-validator testnet)
-    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustc --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with: { workspaces: node }
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with: { node-version: 22, cache: npm }
       - run: npm ci
-      - run: cargo test --release --manifest-path node/Cargo.toml
+      - run: cargo test --release --locked --manifest-path node/Cargo.toml
       - run: npm run build -w @blockula/sdk && npm run build -w @blockula/mcp
       - name: 4 validators + full node + SDK e2e + CLI
         run: bash scripts/local-testnet.sh
 
   web:
     name: Packages + wallet build
-    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with: { node-version: 22, cache: npm }
       - run: npm ci
       - run: npm run build -w @blockula/sdk && npm run build -w @blockula/mcp && npm run build -w @blockula/web
+
+  clippy:
+    name: Clippy
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustc --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with: { workspaces: node }
+      # Blocking: correctness, suspicious, perf and a few restriction lints. The style and
+      # complexity count goes to the job summary.
+      - run: scripts/clippy.sh
+
+  deps:
+    name: Dependencies (cargo-deny, npm audit)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustc --version
+      - name: Install cargo-deny 0.20.2 (checksum-pinned)
+        run: |
+          curl -fsSL -o /tmp/cargo-deny.tgz https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz
+          echo "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  /tmp/cargo-deny.tgz" | sha256sum -c -
+          tar -xzf /tmp/cargo-deny.tgz -C /tmp --strip-components=1
+          sudo install -m 755 /tmp/cargo-deny /usr/local/bin/cargo-deny
+      # Advisories (RustSec), licenses, bans and sources, per deny.toml.
+      - run: cargo deny --manifest-path node/Cargo.toml --locked check
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with: { node-version: 22 }
+      # Blocking for what ships (SDK, MCP, wallet); dev tooling is reported only.
+      - name: npm audit (runtime dependencies)
+        run: npm audit --omit=dev --audit-level=moderate
+      - name: npm audit (all, non-blocking)
+        continue-on-error: true
+        run: npm audit
+
+  ops:
+    name: Supply-chain pins, workflows, monitoring config
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - name: Pins (actions by SHA, images by digest, toolchain parity, --locked)
+        run: scripts/check-pins.sh
+      - name: actionlint 1.7.12 (checksum-pinned)
+        run: |
+          curl -fsSL -o /tmp/actionlint.tgz https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  /tmp/actionlint.tgz" | sha256sum -c -
+          tar -xzf /tmp/actionlint.tgz -C /tmp actionlint
+          /tmp/actionlint -color
+      - name: Prometheus config, alert rules and their unit tests; Alertmanager config; dashboard JSON
+        run: deploy/monitoring/check.sh
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - name: Release signature tool (known-answer vector, tamper checks)
+        run: node scripts/release-sig.mjs selftest
