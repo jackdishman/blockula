@@ -115,13 +115,8 @@ impl SpendWitness {
 
     /// The nullifier this spend reveals.
     pub fn nullifier(&self) -> Digest {
-        let nk = sponge(Domain::NullifierKey, &self.sk);
-        let ak = sponge(Domain::SpendAuth, &self.sk);
-        let mut own = [F::ZERO; 16];
-        own[..8].copy_from_slice(&ak);
-        own[8..].copy_from_slice(&nk);
-        let note = Note { owner: sponge(Domain::Owner, &own), ..self.note };
-        nullifier(&nk, &note.commitment(), self.path.position)
+        let note = Note { owner: SpendingKey::owner_of(&self.sk), ..self.note };
+        nullifier(&sponge(Domain::NullifierKey, &self.sk), &note.commitment(), self.path.position)
     }
 }
 
@@ -220,6 +215,16 @@ pub fn check_witness(w: &ActionWitness) -> Result<PublicInputs, ProveError> {
 }
 
 fn check_and_build(w: &ActionWitness) -> Result<(PublicInputs, trace::Built), ProveError> {
+    // Plain-language errors for the common mistakes; the constraint check below is the real one.
+    for (i, s) in w.spends.iter().enumerate().filter(|(_, s)| !s.dummy) {
+        let owner = SpendingKey::owner_of(&s.sk);
+        if owner != s.note.owner {
+            return Err(ProveError::Unsatisfied(format!("spend {i}: the note isn't owned by this key")));
+        }
+        if s.path.root(&s.note.commitment()) != w.anchor {
+            return Err(ProveError::Unsatisfied(format!("spend {i}: the path doesn't lead to the anchor")));
+        }
+    }
     let vb = ValueBalance::new(trace::balance(w)).ok_or(ProveError::ValueBalanceOutOfRange)?;
     let built = trace::build(&trace::RawAction::from_witness(w, vb));
     let public = PublicInputs {

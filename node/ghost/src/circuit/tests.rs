@@ -128,6 +128,25 @@ fn random_actions_satisfy_the_circuit() {
 }
 
 #[test]
+fn trace_matches_the_native_derivations() {
+    // The row machine and note.rs / tree.rs compute the same things independently.
+    let mut r = rng(8);
+    for ins in [[Some(3), Some(4)], [None, Some(9)], [None, None]] {
+        let w = action(&mut r, ins, [1, 2]);
+        let public = check_witness(&w).unwrap();
+        for i in 0..2 {
+            assert_eq!(public.nullifiers[i], w.spends[i].nullifier());
+            assert_eq!(public.commitments[i], w.outputs[i].commitment());
+            let s = &w.spends[i];
+            if !s.dummy {
+                assert_eq!(s.note.owner, SpendingKey::owner_of(&s.sk));
+                assert_eq!(s.path.root(&s.note.commitment()), w.anchor);
+            }
+        }
+    }
+}
+
+#[test]
 fn poseidon2_columns_match_the_native_permutation() {
     let w = action(&mut rng(3), [Some(5), None], [5, 0]);
     let b = build(&raw(&w));

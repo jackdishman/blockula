@@ -65,6 +65,14 @@ impl SpendingKey {
         xof_to_digest("blockula ghost v1 spending key", &self.seed)
     }
 
+    /// The owner of the key whose field elements are `sk`: `H(H_ak(sk) ‖ H_nk(sk))`.
+    pub fn owner_of(sk: &Digest) -> Digest {
+        let mut input = [Default::default(); 16];
+        input[..8].copy_from_slice(&sponge(Domain::SpendAuth, sk));
+        input[8..].copy_from_slice(&sponge(Domain::NullifierKey, sk));
+        sponge(Domain::Owner, &input)
+    }
+
     /// The full viewing key.
     pub fn full_viewing_key(&self) -> FullViewingKey {
         let sk = self.sk();
