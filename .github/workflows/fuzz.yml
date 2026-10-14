@@ -1,0 +1,72 @@
+# SEC-3: fuzzing the node's network-facing decoders (node/fuzz, see its README.md).
+# PRs that touch the node check the harness and its seeds on stable; the fuzzers themselves run
+# nightly and on demand, a few minutes per target, keeping their corpus between runs.
+name: Fuzz
+on:
+  pull_request:
+    paths: ["node/**", ".github/workflows/fuzz.yml"]
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds to fuzz each target
+        default: "300"
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  harness:
+    name: Harness and seeds (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: node/fuzz }
+      - name: Fuzz crate matches the node's modules and dependencies
+        run: node/fuzz/check-sync.sh
+      - name: Seeds are accepted; open findings still reproduce
+        run: cargo test --locked --manifest-path node/fuzz/Cargo.toml
+
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [cblock, tx_json, snapshot_manifest, sync_batch, epochs_registry, certificate]
+    env:
+      SECONDS_PER_TARGET: ${{ github.event.inputs.seconds || '300' }}
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned so a nightly regression can't masquerade as a finding; bump deliberately.
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: nightly-2026-10-13 }
+      # One shared cache of the instrumented dependencies (identical for every target).
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: node/fuzz, shared-key: fuzz-nightly, save-if: "${{ matrix.target == 'cblock' }}" }
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version 0.13.2
+      - name: Restore the corpus
+        uses: actions/cache@v4
+        with:
+          path: node/fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: Fuzz
+        working-directory: node
+        run: |
+          mkdir -p fuzz/corpus/${{ matrix.target }}
+          cargo fuzz run ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} -- \
+            -max_total_time=$SECONDS_PER_TARGET -timeout=20 -rss_limit_mb=4096 -print_final_stats=1
+      - name: Upload crashes
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: node/fuzz/artifacts/${{ matrix.target }}
