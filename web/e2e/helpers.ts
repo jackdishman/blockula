@@ -25,11 +25,11 @@ export async function addAuthenticator(page: Page) {
   };
 }
 
-/** Every browser test gets a fresh mock node (for its whole context) and a passkey authenticator. */
+/** Every browser test gets a fresh mock node of its project's chain and a passkey authenticator. */
 export const test = base.extend<{ node: MockNode; passkeys: Awaited<ReturnType<typeof addAuthenticator>> }>({
   node: [
-    async ({ context }, use) => {
-      const node = new MockNode();
+    async ({ context }, use, info) => {
+      const node = new MockNode(info.project.name === "mainnet" ? "mainnet" : "testnet");
       await node.install(context);
       await use(node);
     },

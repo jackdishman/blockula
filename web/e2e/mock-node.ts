@@ -7,7 +7,7 @@ import { hexToBytes } from "@noble/hashes/utils.js";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import type { BrowserContext, Page, Route } from "@playwright/test";
 import { bech32m } from "@scure/base";
-import { CHAIN_ID, GENESIS, RPC } from "./env";
+import { CHAIN_ID, GENESIS, MAINNET_GENESIS, MAINNET_RPC, RPC } from "./env";
 
 type Role = { type: "owner" } | { type: "session"; limit: string; period_blocks: number; expires_at: number };
 interface KeyRec { label: string; role: Role; added_at: number }
@@ -32,9 +32,16 @@ class HttpError extends Error {
   }
 }
 
+/** The two chains the e2e builds are pinned to. */
+export const CHAINS = {
+  testnet: { rpc: RPC, chainId: CHAIN_ID, genesisHash: GENESIS },
+  mainnet: { rpc: MAINNET_RPC, chainId: "blockula-1", genesisHash: MAINNET_GENESIS },
+};
+
 export class MockNode {
-  chainId = CHAIN_ID;
-  genesisHash = GENESIS;
+  readonly rpc: string;
+  chainId: string;
+  genesisHash: string;
   /** Extra /api/status fields (e.g. a v1 node's address_prefix). */
   statusExtra: Record<string, unknown> = {};
   faucet = true;
@@ -47,9 +54,13 @@ export class MockNode {
   /** Every request body the wallet sent to the node, to prove secrets never leave the page. */
   bodies: string[] = [];
 
+  constructor(chain: keyof typeof CHAINS = "testnet") {
+    ({ rpc: this.rpc, chainId: this.chainId, genesisHash: this.genesisHash } = CHAINS[chain]);
+  }
+
   /** Answer the wallet's RPC calls in this page or browser context. */
   async install(target: Page | BrowserContext) {
-    await target.route(`${RPC}/api/**`, (route) => this.handle(route));
+    await target.route(`${this.rpc}/api/**`, (route) => this.handle(route));
   }
 
   acct(address: string): Acct {
