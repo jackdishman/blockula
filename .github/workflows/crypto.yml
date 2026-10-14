@@ -7,18 +7,27 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Every job only reads the repo. Actions are pinned by commit SHA (scripts/check-pins.sh).
+permissions:
+  contents: read
+
 concurrency:
   group: crypto-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   rust:
     name: ml-dsa (node)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustc --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with: { workspaces: node }
       - name: Crypto dependencies are pinned exactly
         run: |
@@ -30,14 +39,16 @@ jobs:
 
   ts:
     name: "@noble/post-quantum (SDK)"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with: { node-version: 22, cache: npm }
       - run: npm ci
       - name: Crypto dependencies are pinned exactly
         run: |
+          # shellcheck disable=SC2016 # JavaScript, not shell: nothing in it should expand
           node -e '
             const deps = require("./sdk-ts/package.json").dependencies;
             for (const d of ["@noble/post-quantum", "@noble/hashes", "@scure/base"])

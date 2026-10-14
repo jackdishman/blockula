@@ -39,7 +39,7 @@ jobs:
         run: bash scripts/local-testnet.sh
 
   web:
-    name: Packages + wallet build
+    name: Packages + wallet build + SDK vectors
     if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     steps:
@@ -49,6 +49,31 @@ jobs:
         with: { node-version: 22, cache: npm }
       - run: npm ci
       - run: npm run build -w @blockula/sdk && npm run build -w @blockula/mcp && npm run build -w @blockula/web
+      - name: ML-DSA-65 KATs and Rust ⇄ TS cross vectors (SDK)
+        run: npm run test:kat -w @blockula/sdk
+      - name: Passkey PRF → key derivation vectors (SDK)
+        run: npm run test:vectors -w @blockula/sdk
+
+  wallet-e2e:
+    name: Wallet e2e (Playwright, Chromium)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      # The browser matching @playwright/test in package-lock.json, with its system libraries.
+      - run: npx playwright install --with-deps chromium
+      - run: npm run build -w @blockula/sdk
+      # Testnet and mainnet production builds, a PRF virtual authenticator and a mock node
+      # (web/playwright.config.ts).
+      - run: npm run test:e2e -w @blockula/web
+      - name: Traces of failed tests
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with: { name: wallet-e2e-traces, path: web/test-results, if-no-files-found: ignore }
 
   clippy:
     name: Clippy

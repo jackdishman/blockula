@@ -1,6 +1,7 @@
 # SEC-3: fuzzing the node's network-facing decoders (node/fuzz, see its README.md).
-# PRs that touch the node check the harness and its seeds on stable; the fuzzers themselves run
-# nightly and on demand, a few minutes per target, keeping their corpus between runs.
+# PRs that touch the node check the harness and its seeds on the pinned stable toolchain; the
+# fuzzers themselves run nightly and on demand, a few minutes per target, keeping their corpus
+# between runs.
 name: Fuzz
 on:
   pull_request:
@@ -13,18 +14,29 @@ on:
         description: Seconds to fuzz each target
         default: "300"
 
+# Every job only reads the repo. Actions are pinned by commit SHA (scripts/check-pins.sh).
+permissions:
+  contents: read
+
 concurrency:
   group: fuzz-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned so a nightly regression can't masquerade as a finding; bump deliberately.
+  FUZZ_NIGHTLY: nightly-2026-10-13
+
 jobs:
   harness:
     name: Harness and seeds (stable)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustc --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with: { workspaces: node/fuzz }
       - name: Fuzz crate matches the node's modules and dependencies
         run: node/fuzz/check-sync.sh
@@ -34,26 +46,29 @@ jobs:
   fuzz:
     name: Fuzz ${{ matrix.target }}
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        target: [cblock, tx_json, snapshot_manifest, sync_batch, epochs_registry, certificate]
+        target: [cblock, tx_json, tx_wire, snapshot_manifest, state_snapshot, sync_batch, epochs_registry, certificate]
     env:
       SECONDS_PER_TARGET: ${{ github.event.inputs.seconds || '300' }}
     steps:
-      - uses: actions/checkout@v4
-      # Pinned so a nightly regression can't masquerade as a finding; bump deliberately.
-      - uses: dtolnay/rust-toolchain@master
-        with: { toolchain: nightly-2026-10-13 }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - name: Rust toolchains (rust-toolchain.toml, and the pinned nightly)
+        run: rustup toolchain install && rustup toolchain install "$FUZZ_NIGHTLY" --profile minimal && rustc "+$FUZZ_NIGHTLY" --version
       # One shared cache of the instrumented dependencies (identical for every target).
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with: { workspaces: node/fuzz, shared-key: fuzz-nightly, save-if: "${{ matrix.target == 'cblock' }}" }
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked --version 0.13.2
+      # cargo-fuzz has no --locked: fail here instead if node/fuzz/Cargo.lock is out of date.
+      - name: Dependencies match node/fuzz/Cargo.lock
+        run: cargo fetch --locked --manifest-path node/fuzz/Cargo.toml
       - name: Restore the corpus
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: node/fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
@@ -62,11 +77,11 @@ jobs:
         working-directory: node
         run: |
           mkdir -p fuzz/corpus/${{ matrix.target }}
-          cargo fuzz run ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} -- \
-            -max_total_time=$SECONDS_PER_TARGET -timeout=20 -rss_limit_mb=4096 -print_final_stats=1
+          cargo "+$FUZZ_NIGHTLY" fuzz run ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} -- \
+            "-max_total_time=$SECONDS_PER_TARGET" -timeout=20 -rss_limit_mb=4096 -print_final_stats=1
       - name: Upload crashes
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fuzz-crash-${{ matrix.target }}
           path: node/fuzz/artifacts/${{ matrix.target }}

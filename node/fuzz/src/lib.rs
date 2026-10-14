@@ -22,6 +22,7 @@ mod node_src {
     pub mod poc;
     pub mod pq;
     pub mod snapshot;
+    pub mod state;
     pub mod types;
     pub mod validator_cli;
 }
