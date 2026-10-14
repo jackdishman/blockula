@@ -25,7 +25,7 @@ Blockula signs everything with ML-DSA-65, and since protocol v1 its network traf
 
 ## The handshake
 
-Message count and round trips are unchanged: the dialer sends its identity, then three messages, 1.5 round trips.
+Message count and round trips are unchanged: the dialer sends its identity, then the three handshake messages follow (1.5 round trips).
 
 ```
 dialer D                                                     listener L
@@ -66,7 +66,7 @@ The whole handshake still fits in one initial TCP congestion window (10 × 1,460
 ### Why this construction
 
 - **The combiner is the transcript.** Both secrets are hashed together with every public input: the namespace, both timestamps, both identities, `ek_M`, `X_D`, `ct_M`, `X_L`. Keys derived from that stay secret if either secret does; this is the standard hash-based KEM combiner (Giacon, Heuer, Poettering, "KEM Combiners", PKC 2018; Bindel et al., "Hybrid Key Encapsulation Mechanisms and Authenticated Key Exchange", PQCrypto 2019). It's the shape TLS uses for `X25519MLKEM768` (concatenate the secrets, run the key schedule over a transcript that covers both shares), and it binds more than X-Wing, which leaves `ek_M` and `ct_M` out of its hash. No new hash function enters the key schedule.
-- **One suite, no negotiation.** There is nothing for an attacker to downgrade. A node on the classical transport fails closed against a hybrid one: the `Syn` sizes differ, so each side rejects the other's frame, and even with sizes forced equal the signatures cover transcripts with different protocol labels.
+- **One suite, no negotiation.** There is nothing for an attacker to downgrade. A node on the classical transport fails closed against a hybrid one: the `Syn` layouts differ, so each side rejects the other's (a classical listener refuses the larger frame, a hybrid listener fails to decode the smaller one), and even with sizes forced equal the signatures cover transcripts with different protocol labels.
 - **ML-KEM first** in each concatenation, the byte order of TLS `X25519MLKEM768` and X-Wing. The key share (1,216 B) and reply (1,120 B) have X-Wing's sizes, so moving to a standard hybrid KEM later keeps message sizes.
 - **Transcript framing V1 and a new label.** V1 framing is injective for any packet history, which removes the uniqueness argument V0 needs; the label separates this protocol from the classical one cryptographically.
 - **Both identities before the dialer signs** (upstream committed the dialer's own key after its signature). Commonware's next handshake version does the same.
