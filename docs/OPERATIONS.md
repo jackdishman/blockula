@@ -47,8 +47,8 @@ A validator's HTTP API locks the same state the consensus engine uses, so a publ
 
 - **Active-set cap: 32 at genesis** (DEC-3). Votes are equal-weight; the set is the top 32 candidates by pool stake (planned: P-STAKE). The cap rises by governance once certificates shrink: a ⅔ certificate is ~73 KB at n = 32 and every validator re-broadcasts two per view (see [Bandwidth](#bandwidth)).
 - **Genesis target: 21–32 independent operators.** Halting the chain takes ⌊(n−1)/3⌋+1 validators (11 of 32), so independence is the security budget.
-- **No hosting provider, ASN or jurisdiction above ¼ of the active set** (8 of 32), always below ⅓ (DEC-14). Operators declare provider, ASN and jurisdiction at registration and when they move; the foundation publishes the distribution every epoch review and asks the over-represented operators to move. Count by the ASN that actually routes the validator's IP (`whois -h whois.radb.net <ip>` or `curl ipinfo.io/<ip>/org`), not the reseller's brand.
-- **Foundation nodes stay small.** The founder runs **at most 3 validators**, on Fly.io: `performance-8x` machines (8 dedicated vCPUs, 32 GB; `performance-4x` with 16 GB is the floor), each with a dedicated IPv4 for p2p and a volume sized per [Disk sizing](#disk-sizing). Fly volumes top out at 500 GB at the time of writing: plenty for an empty chain for years, not for a sustained flood, so foundation validators must run with epoch-journal pruning (planned: P-UPGRADE) and watch `HostDiskFillsWithinAWeek`. The public RPC nodes and the foundation's sentries also run on Fly. The foundation's share shrinks as independent operators join, and it never uses its stake to stay in the set.
+- **No hosting provider, ASN or jurisdiction above ¼ of the active set** (8 of 32), always below ⅓ (DEC-14). Operators declare provider, ASN and jurisdiction at registration and whenever they move; the foundation publishes the distribution monthly and asks operators in an over-represented provider, ASN or jurisdiction to move. Count by the ASN that actually routes the validator's IP (`whois -h whois.radb.net <ip>` or `curl ipinfo.io/<ip>/org`), not the reseller's brand.
+- **Foundation nodes stay small.** The founder runs **at most 3 validators**, on Fly.io: `performance-8x` machines (8 dedicated vCPUs, 32 GB; `performance-4x` with 16 GB is the floor), each with a dedicated IPv4 for p2p and a volume sized per [Disk sizing](#disk-sizing). Fly volumes top out at 500 GB at the time of writing: plenty for an empty chain for years, not for a sustained flood, so foundation validators must run with epoch-journal pruning (planned: P-UPGRADE) and watch `HostDiskFillsWithinAWeek`. The public RPC nodes and the foundation's sentries also run on Fly. The foundation's share of the set shrinks as independent operators join.
 - **Recommended providers, mixed.** Bare metal and dedicated servers give unmetered or generously included bandwidth and predictable disks:
   - Latitude.sh, OVHcloud, Cherry Servers, Hetzner (dedicated). **Hetzner:** its terms have restricted crypto workloads before (mining is banned, and some blockchain node operators have been asked to leave); every operator must check the current terms and get written confirmation before running a validator there.
   - Regional and colocation providers spread ASNs and jurisdictions better than any big brand. They are welcome.
@@ -200,9 +200,10 @@ gh attestation verify install.sh --repo jackdishman/blockula
 BLOCKULA_REQUIRE_VERIFY=1 sh install.sh
 sudo install -m 755 ~/.blockula/bin/blockula /usr/local/bin/blockula
 
-# 3. Create the validator home (generates the consensus key; pin the genesis hash).
+# 3. Create the validator home (generates the consensus key). Use the genesis file from the
+#    signed release (genesis-<chain id>.json, verified with the archives), not a node's copy.
 sudo -u blockula blockula validator init --home /var/lib/blockula/val \
-  --genesis https://<a sentry or RPC node> \
+  --genesis ./genesis-blockula-1.json \
   --public-p2p-addr <your-ip>:30300 --public-http-addr https://<your sentry>
 ```
 
