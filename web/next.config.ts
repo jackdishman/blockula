@@ -1,7 +1,14 @@
 import type { NextConfig } from "next";
 import path from "node:path";
-import { MAINNET_GENESIS_HASH, NETWORKS, rpIdProblem } from "./lib/config";
+import { isNodeUrl, MAINNET_GENESIS_HASH, NETWORKS, rpIdProblem } from "./lib/config";
 import { STATIC_HEADERS } from "./lib/csp";
+
+// Node URLs end up in the CSP and genesis pins in every status check: a malformed one must fail
+// the build, not every request.
+for (const n of Object.values(NETWORKS)) {
+  if (n && !isNodeUrl(n.rpc)) throw new Error(`${n.label} RPC ${JSON.stringify(n.rpc)} isn't an http(s) URL.`);
+  if (n?.genesisHash && !/^[0-9a-f]{64}$/.test(n.genesisHash)) throw new Error(`${n.label} genesis hash must be 64 hex characters.`);
+}
 
 // A mainnet deployment must pin its domain and its chain before it can build (DEC-8, WAL-4).
 if (process.env.NEXT_PUBLIC_NETWORK === "mainnet") {
