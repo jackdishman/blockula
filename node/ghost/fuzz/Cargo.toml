@@ -1,0 +1,31 @@
+[package]
+name = "blockula-ghost-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+blockula-ghost = { path = ".." }
+rand = { version = "0.10", default-features = false, features = ["std_rng"] }
+
+# Its own workspace, like the crate it fuzzes.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "verify_proof"
+path = "fuzz_targets/verify_proof.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decoders"
+path = "fuzz_targets/decoders.rs"
+test = false
+doc = false
+bench = false
