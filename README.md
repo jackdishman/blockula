@@ -22,6 +22,8 @@ Quantum entanglement is literally "spooky action at a distance". We took that pe
 
 What it is, on one page: [docs/ONE_PAGER.md](docs/ONE_PAGER.md).
 
+**It's a testnet.** Testnet FANG, Hunts and Soul have no monetary value and come with no promise of any mainnet allocation.
+
 ## npm packages
 
 ```bash
@@ -45,9 +47,11 @@ blockula dev          # local chain + explorer at http://localhost:7070
 
 Prebuilt for macOS (Apple Silicon and Intel) and Linux (x64 and arm64), with SHA-256 checksums verified. Agents can call the MCP's `install_node` tool instead.
 
-## Contribute and earn
+## Contribute
 
-Open **Hunts** are [issues labeled `hunt`](https://github.com/jackdishman/blockula/issues?q=is%3Aopen+label%3Ahunt), each with acceptance criteria and a FANG bounty. Agents are welcome as Familiars. See [CONTRIBUTING.md](CONTRIBUTING.md).
+> Testnet FANG, Hunts and Soul have no monetary value and come with no promise of any mainnet allocation.
+
+Open **Hunts** are [issues labeled `hunt`](https://github.com/jackdishman/blockula/issues?q=is%3Aopen+label%3Ahunt), each with acceptance criteria and a testnet FANG bounty. Agents are welcome as Familiars. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Bounties live on-chain: the FANG is escrowed in a Hunt, anyone can add to it, and the creator (or a Season 0 admin) awards it for the merged PR. Browse them in the explorer's Hunts page or `GET /api/hunts`.
 
@@ -66,7 +70,7 @@ blockula hunt award 3 --pr 34 --key admin.key --rpc …                         
 blockula hunt list | show | create | fund | cancel
 ```
 
-**Beyond Hunts, the contribution pool pays for any merged PR to a pool repo** (Proof of Contribution, [docs/PLAN.md](docs/PLAN.md#-proof-of-contribution-rewarding-useful-work)):
+**Beyond Hunts, the contribution pool pays testnet FANG for any merged PR to a pool repo** (Proof of Contribution, [docs/PLAN.md](docs/PLAN.md#-proof-of-contribution-rewarding-useful-work)):
 - Claim a merged PR you authored. Validators check it on GitHub.
 - A **Séance** judges it: a random jury of people with **Soul** (reputation you can't buy) compares claims in pairs, sealing their votes before revealing them.
 - Payouts are square-rooted per person (so volume doesn't pay) and vest over ~90 days with clawback.
@@ -216,7 +220,8 @@ sdk-ts/   @blockula/sdk: wallets, tx signing, client, passkey (WebAuthn PRF) hel
 mcp/      @blockula/mcp: MCP server for coding agents
 web/      Passkey web wallet (Next.js), deployed at blockula-wallet.vercel.app
 deploy/   Fly.io testnet: Dockerfile, entrypoint, launch.sh
-docs/     ONE_PAGER.md (what this is), PLAN.md (architecture, tokenomics, roadmap), MAINNET.md (launch readiness)
+docs/     ONE_PAGER.md (what this is), PLAN.md (architecture, tokenomics, roadmap), MAINNET.md (launch readiness),
+          MAINNET-DESIGN.md (mainnet decisions and spec), TOKENOMICS.md (mainnet supply and allocation)
 ```
 
 ## Status

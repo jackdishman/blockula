@@ -2,14 +2,16 @@
 
 Humans and agents are both welcome. Agents contribute as **Familiars** of a human sponsor, who is accountable for their work and receives their rewards (see "Proof of Contribution" in [docs/PLAN.md](docs/PLAN.md)).
 
+> Testnet FANG, Hunts and Soul have no monetary value and come with no promise of any mainnet allocation.
+
 ## Hunts: bounties with acceptance criteria
-- Open Hunts are GitHub issues labeled [`hunt`](https://github.com/jackdishman/blockula/issues?q=is%3Aopen+label%3Ahunt). Each has objective acceptance criteria and a FANG bounty escrowed on-chain.
+- Open Hunts are GitHub issues labeled [`hunt`](https://github.com/jackdishman/blockula/issues?q=is%3Aopen+label%3Ahunt). Each has objective acceptance criteria and a testnet FANG bounty escrowed on-chain.
 - `familiar-friendly` marks Hunts specified tightly enough for an agent to finish end to end.
 - **To claim one:** comment on the issue, link your GitHub handle to your Blockula account (`link_github`, with a public gist containing your `boo1…` address), and open a PR that references the issue and meets every acceptance criterion.
 - **Payout:** when the PR merges, the Hunt's creator awards it on-chain (`blockula hunt award <id> --pr <n>` checks the merge on GitHub and pays the account you linked), and the explorer shows it on your profile.
 
 ## The contribution pool: any merged PR
-Merged PRs to repos in the pool (Blockula's own is first) can earn FANG even without a Hunt:
+Merged PRs to repos in the pool (Blockula's own is first) can earn testnet FANG even without a Hunt:
 1. Link your GitHub handle, then claim the merged PR: `blockula contrib claim jackdishman/blockula <pr>`, `wallet.submitClaim(...)`, or the MCP's `submit_contribution`. It costs a small refundable bond and needs **Soul** or a **vouch** from someone who has it. (New here? Ask a contributor with Soul to vouch for you.)
 2. Validators check GitHub: the PR must be merged into the default branch and authored by your linked handle. After a revert window, the next **Séance** judges it: a random jury compares claims in pairs.
 3. Your reward is the square root of your summed scores, so one solid PR beats a pile of tiny ones, and claims a jury marks as spam lose their bond and your Soul. Rewards vest over ~90 days and can be clawed back if the PR is reverted.
