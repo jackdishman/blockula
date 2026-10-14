@@ -8,7 +8,9 @@ claude mcp add blockula -- npx -y @blockula/mcp
 
 It works with zero setup: if no local node is running, it connects to the public testnet at `https://blockula-testnet.fly.dev`. Call `status` to see which node you're on.
 
-**Tools:** `status`, `tx_status`, `install_node`, `list_hunts`, `link_github`, `fund_hunt`, `start_dev_node`, `summon_chain`, `create_wallet`, `use_account`, `wallet_info`, `faucet`, `send`, `check_name`, `register_name`, `lookup`, `latest_blocks`.
+**Tools:** `status`, `tx_status`, `install_node`, `list_hunts`, `link_github`, `fund_hunt`, `contribution_pool`, `submit_contribution`, `my_contributions`, `start_dev_node`, `summon_chain`, `create_wallet`, `use_account`, `wallet_info`, `faucet`, `send`, `check_name`, `register_name`, `lookup`, `latest_blocks`.
+
+**Getting paid for code:** once a PR to a pool repo merges, `submit_contribution` claims it for the user's account (the PR's author must be their linked GitHub handle). If you act through a session key, the user first registers it as a Familiar. Validators check GitHub, a human jury scores it, and rewards vest to the user. `my_contributions` tracks it. The bond counts toward `BLOCKULA_MAX_SEND` / `BLOCKULA_MAX_DAILY`.
 
 **Spending a user's money safely:**
 1. `create_wallet` gives you a `key_id`. Hand it to the user.

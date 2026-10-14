@@ -58,6 +58,30 @@ await other.fundHunt(huntId, "10");            // crowdfund; refunded pro-rata i
 await wallet.awardHunt(huntId, "vlad.boo", 34, familiarKeyId);  // optional: credit vlad's agent Familiar
 ```
 
+Awarding from the CLI checks GitHub first: the PR must be merged into the hunt's repo, and it pays the account the PR's author linked.
+
+```bash
+blockula hunt award 3 --pr 34 --rpc https://blockula-testnet.fly.dev            # signs with ~/.blockula/wallet.json
+blockula hunt award 3 --pr 34 --key admin.key --rpc …                           # or a Season 0 admin key
+blockula hunt list | show | create | fund | cancel
+```
+
+**Beyond Hunts, the contribution pool pays for any merged PR to a pool repo** (Proof of Contribution, [docs/PLAN.md](docs/PLAN.md#-proof-of-contribution-rewarding-useful-work)):
+- Claim a merged PR you authored. Validators check it on GitHub.
+- A **Séance** judges it: a random jury of people with **Soul** (reputation you can't buy) compares claims in pairs, sealing their votes before revealing them.
+- Payouts are square-rooted per person (so volume doesn't pay) and vest over ~90 days with clawback.
+
+```bash
+blockula contrib link-github vlad <gist id>       # once
+blockula contrib claim jackdishman/blockula 34    # after the PR merges
+blockula contrib status                           # the pool, its repos, the open Séance
+blockula contrib join-jury                        # jurors need 5 Soul and bond 10 FANG
+blockula contrib seance                           # your assigned pairs, with PR links
+blockula contrib vote 2 --votes ab=a --spam 17    # seal, then later:
+blockula contrib reveal 2
+blockula contrib withdraw                         # vested rewards
+```
+
 ## Quickstart (from source)
 
 ```bash
@@ -91,7 +115,7 @@ const wallet = await createPasskeyWallet({ username: "vlad" });
 claude mcp add blockula -- npx -y @blockula/mcp
 ```
 
-Then paste the prompt from [AGENTS.md](AGENTS.md). With no local node running, it connects to the public testnet, so there's nothing else to install. MCP tools: `status`, `tx_status`, `create_wallet`, `use_account`, `wallet_info`, `faucet`, `send`, `check_name`, `register_name`, `lookup`, `latest_blocks`, plus `start_dev_node` and `summon_chain` (these two need the `blockula` binary).
+Then paste the prompt from [AGENTS.md](AGENTS.md). With no local node running, it connects to the public testnet, so there's nothing else to install. MCP tools: `status`, `tx_status`, `create_wallet`, `use_account`, `wallet_info`, `faucet`, `send`, `check_name`, `register_name`, `lookup`, `latest_blocks`, `list_hunts`, `fund_hunt`, `link_github`, `contribution_pool`, `submit_contribution`, `my_contributions`, plus `install_node`, `start_dev_node` and `summon_chain` (the last two need the `blockula` binary).
 
 ## Run your own chain
 
@@ -197,4 +221,4 @@ docs/     ONE_PAGER.md (what this is), PLAN.md (architecture, tokenomics, roadma
 
 ## Status
 
-Public testnet live (Phase 1). An internal four-track security and product review was completed and its findings fixed. **No third-party audit yet: test value only.** See [docs/PLAN.md](docs/PLAN.md).
+Public testnet live (Phase 1), Hunts and Proof of Contribution v1 built (Phases 1.5–2). An internal four-track security and product review was completed and its findings fixed. **No third-party audit yet: test value only.** See [docs/PLAN.md](docs/PLAN.md).

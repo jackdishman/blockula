@@ -60,6 +60,9 @@ pub struct Genesis {
     /// Cap on the active set.
     #[serde(default = "default_max_validators")]
     pub max_validators: usize,
+    /// Proof of Contribution timings. Absent: derived from `block_time_ms` (weeks, not minutes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contribution: Option<crate::poc::PocTimes>,
 }
 
 fn default_epoch_blocks() -> u64 {
@@ -83,6 +86,7 @@ pub struct Params {
     pub admins: Vec<String>,
     pub min_bond: u64,
     pub max_validators: usize,
+    pub poc: crate::poc::PocTimes,
 }
 
 impl Params {
@@ -147,7 +151,8 @@ impl Genesis {
     }
 
     pub fn params(&self) -> Params {
-        Params { block_time_ms: self.block_time_ms, epoch_blocks: self.epoch_blocks, admins: self.validator_admins.clone(), min_bond: self.min_bond, max_validators: self.max_validators }
+        let poc = self.contribution.clone().unwrap_or_else(|| crate::poc::PocTimes::for_block_time(self.block_time_ms));
+        Params { block_time_ms: self.block_time_ms, epoch_blocks: self.epoch_blocks, admins: self.validator_admins.clone(), min_bond: self.min_bond, max_validators: self.max_validators, poc }
     }
 
     pub fn initial_state(&self) -> State {
@@ -188,7 +193,11 @@ impl Genesis {
         if v.get("validators").is_none() {
             bail!("{} was created by an older single-validator Blockula; re-summon it (or `blockula dev --reset`)", path.display());
         }
-        Ok(serde_json::from_value(v)?)
+        let g: Genesis = serde_json::from_value(v)?;
+        if let Some(t) = &g.contribution {
+            t.check().with_context(|| format!("{}", path.display()))?;
+        }
+        Ok(g)
     }
 }
 
@@ -253,6 +262,7 @@ pub struct Journal {
     familiars: HashMap<String, Option<BTreeMap<String, String>>>,
     scalars: Option<(u64, u64)>,
     next_hunt_id: Option<u64>,
+    pub(crate) poc: crate::poc::PocJournal,
 }
 
 impl Journal {
@@ -289,6 +299,7 @@ impl Journal {
         if self.next_hunt_id.is_none() {
             self.next_hunt_id = other.next_hunt_id;
         }
+        self.poc.absorb(other.poc);
     }
 }
 
@@ -411,6 +422,9 @@ pub struct State {
     /// Registered Familiars (agent session keys) per account: key id → label.
     #[serde(default)]
     pub familiars: BTreeMap<String, BTreeMap<String, String>>,
+    /// 🪦 Proof of Contribution: Souls, vouches, claims, Séances, the pool's grants.
+    #[serde(default)]
+    pub poc: crate::poc::Poc,
 }
 
 impl State {
@@ -496,7 +510,7 @@ impl State {
 
     // ---- journaled mutation helpers: record the old value on first touch, then mutate ----
 
-    fn acct_mut(&mut self, j: &mut Journal, addr: &str) -> &mut Account {
+    pub(crate) fn acct_mut(&mut self, j: &mut Journal, addr: &str) -> &mut Account {
         if !j.accounts.contains_key(addr) {
             j.accounts.insert(addr.to_string(), self.accounts.get(addr).cloned());
         }
@@ -510,7 +524,7 @@ impl State {
         self.validators.get_mut(addr)
     }
 
-    fn j_debit(&mut self, j: &mut Journal, addr: &str, amount: u64) -> Result<()> {
+    pub(crate) fn j_debit(&mut self, j: &mut Journal, addr: &str, amount: u64) -> Result<()> {
         let acct = self.acct_mut(j, addr);
         if acct.balance < amount {
             bail!("insufficient balance: has {}, needs {}", fmt_fang(acct.balance), fmt_fang(amount));
@@ -519,7 +533,7 @@ impl State {
         Ok(())
     }
 
-    fn j_credit(&mut self, j: &mut Journal, addr: &str, amount: u64) {
+    pub(crate) fn j_credit(&mut self, j: &mut Journal, addr: &str, amount: u64) {
         self.acct_mut(j, addr).balance += amount;
     }
 
@@ -607,6 +621,7 @@ impl State {
         if let Some(n) = j.next_hunt_id {
             self.next_hunt_id = n;
         }
+        j.poc.rollback(&mut self.poc);
     }
 
     /// Checks that decide whether a tx can be included at all. No state changes.
@@ -636,9 +651,14 @@ impl State {
             if height > expires_at {
                 bail!("session key expired at block {expires_at}");
             }
-            let Action::Transfer { amount, .. } = &tx.action else { bail!("session keys can only send transfers") };
+            let amount = match &tx.action {
+                Action::Transfer { amount, .. } => *amount,
+                // An agent registered as a Familiar may claim its work for its sponsor.
+                Action::SubmitClaim { .. } if self.familiars.get(&sender).is_some_and(|f| f.contains_key(&signer)) => self.claim_bond(&sender),
+                _ => bail!("session keys can only send transfers (and claims, for registered Familiars)"),
+            };
             let spent = if height >= key.window_start.saturating_add(period_blocks) { 0 } else { key.spent };
-            if spent.saturating_add(*amount).saturating_add(tx.fee) > limit {
+            if spent.saturating_add(amount).saturating_add(tx.fee) > limit {
                 bail!("session key limit reached: {} per {period_blocks} blocks", fmt_fang(limit));
             }
         }
@@ -987,6 +1007,7 @@ impl State {
                 }
                 self.familiars_mut(j, &sender).insert(key_id.clone(), label.clone());
             }
+            _ => self.apply_poc(j, tx, &sender, signer, key, height)?,
         }
         Ok(())
     }
@@ -998,6 +1019,9 @@ impl State {
             Action::RegisterName { name } => normalize_name(name).map(|n| name_price(&n)).unwrap_or(0),
             Action::RegisterValidator { bond, .. } => *bond,
             Action::CreateHunt { amount, .. } | Action::FundHunt { amount, .. } => *amount,
+            Action::FundPool { amount } | Action::JoinJury { bond: amount } => *amount,
+            Action::Vouch { .. } => crate::poc::VOUCH_BOND,
+            Action::SubmitClaim { .. } => crate::poc::CLAIM_BOND,
             _ => 0,
         })
     }
@@ -1044,6 +1068,10 @@ impl State {
         if !self.familiars.is_empty() {
             h.update(b"familiars");
             h.update(serde_json::to_string(&self.familiars).unwrap().as_bytes());
+        }
+        if self.poc.is_active() {
+            h.update(b"poc");
+            h.update(serde_json::to_string(&self.poc).unwrap().as_bytes());
         }
         h.finalize().to_hex().to_string()
     }
@@ -1110,6 +1138,7 @@ impl State {
                 format!("{from} cancelled the hunt on {what}; funders were refunded")
             }
             Action::RegisterFamiliar { label, .. } => format!("{from} registered the Familiar “{label}”"),
+            _ => self.describe_poc(tx, &from),
         }
     }
 }
@@ -1138,11 +1167,13 @@ pub struct SummonOpts {
     /// Minimum validator bond in drops. `None`: 50 FANG on faucet chains (one faucet drip
     /// covers it), 10,000 FANG otherwise.
     pub min_bond: Option<u64>,
+    /// Proof of Contribution timings (`None`: derived from the block time).
+    pub contribution: Option<crate::poc::PocTimes>,
 }
 
 impl SummonOpts {
     pub fn new(chain_id: &str, validators: usize) -> Self {
-        Self { chain_id: chain_id.into(), faucet: true, block_time_ms: 1000, validators, http_port: None, admins: vec![], epoch_blocks: default_epoch_blocks(), min_bond: None }
+        Self { chain_id: chain_id.into(), faucet: true, block_time_ms: 1000, validators, http_port: None, admins: vec![], epoch_blocks: default_epoch_blocks(), min_bond: None, contribution: None }
     }
 }
 
@@ -1324,6 +1355,9 @@ impl Chain {
         if validators == 0 {
             bail!("need at least one validator");
         }
+        if let Some(t) = &o.contribution {
+            t.check()?;
+        }
         let keys: Vec<Keys> = (0..validators).map(|_| Keys::generate()).collect();
         let mut infos = vec![];
         for (i, k) in keys.iter().enumerate() {
@@ -1350,6 +1384,7 @@ impl Chain {
             validator_admins,
             min_bond: o.min_bond.unwrap_or(if faucet { 50 * DROPS_PER_FANG } else { default_min_bond() }),
             max_validators: default_max_validators(),
+            contribution: o.contribution.clone(),
         };
         let homes: Vec<PathBuf> = if validators == 1 { vec![home.to_path_buf()] } else { (0..validators).map(|i| home.join(format!("v{i}"))).collect() };
         for (h, k) in homes.iter().zip(&keys) {
@@ -1623,11 +1658,14 @@ impl Chain {
             if let Some(s) = &sender {
                 self.history.entry(s.clone()).or_default().push(id.clone());
             }
-            if let Action::Transfer { to, .. } = &tx.action {
-                if let Ok(to) = self.state.resolve(to) {
-                    if sender.as_ref() != Some(&to) {
-                        self.history.entry(to).or_default().push(id.clone());
-                    }
+            let other = match &tx.action {
+                Action::Transfer { to, .. } | Action::AwardHunt { to, .. } | Action::GrantSoul { to, .. } => Some(to),
+                Action::Vouch { account } | Action::FlagSybil { account, .. } | Action::Clawback { account, .. } => Some(account),
+                _ => None,
+            };
+            if let Some(to) = other.and_then(|t| self.state.resolve(t).ok()) {
+                if sender.as_ref() != Some(&to) {
+                    self.history.entry(to).or_default().push(id.clone());
                 }
             }
         }
@@ -1661,6 +1699,7 @@ impl Chain {
                 bail!("replaying block {}: tx {i} gave {outcome:?}, recorded {expected:?}", block.height);
             }
         }
+        self.state.poc_end_block(block.height, &block.hash);
         if self.state.params.is_boundary(block.height) {
             self.state.end_epoch(self.state.params.epoch_of(block.height));
             self.record_epoch(block.height);
@@ -1713,6 +1752,7 @@ impl Chain {
                 Err(e) => self.note_failed(tx.id(), format!("not included: {e}"), f.height),
             }
         }
+        self.state.poc_end_block(f.height, &f.hash);
         if self.state.params.is_boundary(f.height) {
             self.state.end_epoch(self.state.params.epoch_of(f.height));
             if self.record_epoch(f.height) {
@@ -1983,16 +2023,24 @@ impl Chain {
         if self.faucet_busy() {
             bail!("faucet busy, retry in a few seconds");
         }
-        let keys = self.keys.as_ref().ok_or_else(|| anyhow!("this node has no faucet key"))?;
+        if self.keys.is_none() {
+            bail!("this node has no faucet key");
+        }
         let to = self.state.resolve(to)?;
+        self.submit_own(Action::Transfer { to, amount }, "🦇 faucet drip")
+    }
+
+    /// Signs `action` with this validator's key, from its own account, and queues it.
+    pub fn submit_own(&mut self, action: Action, memo: &str) -> Result<Tx> {
+        let keys = self.keys.as_ref().ok_or_else(|| anyhow!("this node has no validator key"))?;
         let from = keys.address();
         let mut tx = Tx {
             chain_id: self.genesis.chain_id.clone(),
             nonce: self.next_nonce(&from),
             from,
             fee: 0,
-            action: Action::Transfer { to, amount },
-            memo: "🦇 faucet drip".into(),
+            action,
+            memo: memo.into(),
             public_key: hex::encode(keys.public_key()),
             signature: "00".repeat(crypto::SIGNATURE_LEN),
         };

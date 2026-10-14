@@ -1,4 +1,6 @@
 // Canonical transaction encoding. Must stay byte-identical to node/src/types.rs `Tx::signing_bytes`.
+import { blake3 } from "@noble/hashes/blake3.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
 
 export type KeyRole =
   | { type: "owner" }
@@ -30,7 +32,31 @@ export type Action =
   | { type: "award_hunt"; hunt_id: number; to: string; pr: number; familiar_key?: string }
   | { type: "cancel_hunt"; hunt_id: number }
   /** Mark one of your session keys as an agent Familiar. */
-  | { type: "register_familiar"; key_id: string; label: string };
+  | { type: "register_familiar"; key_id: string; label: string }
+  // ---- 🪦 Proof of Contribution ----
+  /** Season 0 admins: put a repo in the contribution pool (weight 1–100; 0 removes it). */
+  | { type: "set_repo"; repo: string; weight: number }
+  /** Season 0 admins: bootstrap Soul, in milli-Soul (≤ 100 Soul per grant). */
+  | { type: "grant_soul"; to: string; amount: number; reason: string }
+  /** Stake 10 FANG on a newcomer `account` being a real, distinct person (needs 10 Soul). */
+  | { type: "vouch"; account: string }
+  /** The voucher withdraws (after the lock), or the newcomer declines (any time). */
+  | { type: "unvouch"; account: string }
+  | { type: "flag_sybil"; account: string; reason: string }
+  /** Claim a merged PR by your linked GitHub handle. Registered Familiars may sign this. */
+  | { type: "submit_claim"; repo: string; pr: number; familiar_key?: string }
+  /** Validators only (nodes do this automatically). */
+  | { type: "attest_claim"; claim_id: number; ok: boolean; merge_sha: string; note: string }
+  | { type: "reject_claim"; claim_id: number; reason: string }
+  | { type: "join_jury"; bond: string }
+  | { type: "leave_jury" }
+  /** A juror's sealed judgment: `seanceCommitment(...)`. */
+  | { type: "commit_votes"; seance_id: number; commitment: string }
+  /** One of "a", "b", "=" per assigned pair, claim ids flagged as spam, and the salt. */
+  | { type: "reveal_votes"; seance_id: number; votes: string; spam: number[]; salt: string }
+  | { type: "fund_pool"; amount: string }
+  | { type: "withdraw_vested" }
+  | { type: "clawback"; account: string; reason: string };
 
 export interface UnsignedTx {
   chain_id: string;
@@ -60,6 +86,7 @@ class Writer {
   u16(n: number) { this.u8(n); this.u8(n >> 8); }
   u64(n: bigint) { for (let i = 0n; i < 8n; i++) this.u8(Number((n >> (8n * i)) & 0xffn)); }
   str(s: string) { const b = utf8.encode(s); this.u16(b.length); this.bytes(b); }
+  ids(xs: number[]) { this.u16(xs.length); for (const x of xs) this.u64(BigInt(x)); }
   done() { return Uint8Array.from(this.parts); }
 }
 
@@ -119,9 +146,77 @@ export function signingBytes(tx: UnsignedTx): Uint8Array {
     case "register_familiar":
       w.u8(14); w.str(a.key_id); w.str(a.label);
       break;
+    case "set_repo":
+      w.u8(15); w.str(a.repo); w.u64(BigInt(a.weight));
+      break;
+    case "grant_soul":
+      w.u8(16); w.str(a.to); w.u64(BigInt(a.amount)); w.str(a.reason);
+      break;
+    case "vouch":
+      w.u8(17); w.str(a.account);
+      break;
+    case "unvouch":
+      w.u8(18); w.str(a.account);
+      break;
+    case "flag_sybil":
+      w.u8(19); w.str(a.account); w.str(a.reason);
+      break;
+    case "submit_claim":
+      w.u8(20); w.str(a.repo); w.u64(BigInt(a.pr)); w.str(a.familiar_key ?? "");
+      break;
+    case "attest_claim":
+      w.u8(21); w.u64(BigInt(a.claim_id)); w.u8(a.ok ? 1 : 0); w.str(a.merge_sha); w.str(a.note);
+      break;
+    case "reject_claim":
+      w.u8(22); w.u64(BigInt(a.claim_id)); w.str(a.reason);
+      break;
+    case "join_jury":
+      w.u8(23); w.u64(BigInt(a.bond));
+      break;
+    case "leave_jury":
+      w.u8(24);
+      break;
+    case "commit_votes":
+      w.u8(25); w.u64(BigInt(a.seance_id)); w.str(a.commitment);
+      break;
+    case "reveal_votes":
+      w.u8(26); w.u64(BigInt(a.seance_id)); w.str(a.votes); w.ids(a.spam); w.str(a.salt);
+      break;
+    case "fund_pool":
+      w.u8(27); w.u64(BigInt(a.amount));
+      break;
+    case "withdraw_vested":
+      w.u8(28);
+      break;
+    case "clawback":
+      w.u8(29); w.str(a.account); w.str(a.reason);
+      break;
   }
   w.str(tx.memo);
   return w.done();
+}
+
+/**
+ * What a Séance juror seals before revealing (node/src/types.rs `seance_commitment`): hex
+ * BLAKE3 of the Séance id, the juror's account, the votes, spam flags and a secret salt.
+ */
+export function seanceCommitment(seanceId: number, juror: string, votes: string, spam: number[], salt: string): string {
+  const w = new Writer();
+  w.bytes(utf8.encode("BLOCKULA_SEANCE_V1"));
+  w.u64(BigInt(seanceId));
+  w.str(juror);
+  w.str(votes);
+  w.ids(spam);
+  w.str(salt);
+  return bytesToHex(blake3(w.done()));
+}
+
+/** "2.5" Soul → 2500 milli-Soul. */
+export function parseSoul(soul: string | number): number {
+  const s = String(soul).trim();
+  if (!/^\d+(\.\d{1,3})?$/.test(s)) throw new Error(`invalid Soul amount: ${s}`);
+  const [whole, frac = ""] = s.split(".");
+  return Number(whole) * 1000 + Number(frac.padEnd(3, "0"));
 }
 
 /** FIPS 204 context string for validator proofs of possession (node/src/types.rs `POP_CONTEXT`). */

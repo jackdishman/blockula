@@ -113,7 +113,7 @@
 <header>
   <a class="brand" href="#/"><span class="wordmark">Blockula</span><span class="edition">The Explorer</span></a>
   <form id="search" role="search"><input id="q" aria-label="Search" placeholder="Search names, addresses, blocks or transactions" autocomplete="off" /></form>
-  <nav><a href="#/">Blocks</a><a href="#/validators">Validators</a><a href="#/mempool">Mempool</a><a href="#/hunts">Hunts</a><a href="#/learn">Learn</a></nav>
+  <nav><a href="#/">Blocks</a><a href="#/validators">Validators</a><a href="#/mempool">Mempool</a><a href="#/hunts">Hunts</a><a href="#/contribute">Contribute</a><a href="#/learn">Learn</a></nav>
 </header>
 <main id="app"><div class="loading">Rising from the grave…</div></main>
 <footer>Post-quantum signatures · ML-DSA-65 · Not audited, test chains only</footer>
@@ -141,6 +141,12 @@ const GLOSSARY = {
   proposer: "The validator that proposed this block. A 2/3+ quorum of validators then voted (ML-DSA-65 signatures) to finalize it.",
   certificate: "The finality proof: ML-DSA-65 votes from a 2/3+ quorum of validators. Blocks finalized as an ancestor of a later block share that later block's certificate.",
   burned: "Fees destroyed forever. Burning offsets new issuance and ties the token's value to real network usage.",
+  soul: "Reputation that can't be bought or transferred. It's earned when juries accept your work (or by serving well as a juror), it slowly decays, and it's lost for spam or vouching for fakes.",
+  seance: "A review jury. Randomly drawn jurors with Soul compare pairs of merged PRs (“which mattered more?”), seal their votes, then reveal them. The outcome scores each claim and pays the pool out.",
+  vouch: "Staking FANG (and your Soul) on a newcomer being a real, distinct person. If they turn out to be a sybil, the voucher loses both. Newcomers can decline a vouch.",
+  claim: "A merged PR submitted for the contribution pool. Validators check GitHub that it's merged and authored by the claimant's linked handle, then a Séance judges it.",
+  vesting: "Rewards unlock gradually (about 90 days). Until then they can be clawed back, e.g. if the PR is reverted or the account turns out to be fake.",
+  pool: "FANG set aside to reward useful work. Each Séance pays out a quarter of it, split by jury scores, square-rooted per person so volume doesn't pay.",
 };
 const term = (key, text) => `<span class="term" data-tip="${esc(GLOSSARY[key])}">${esc(text ?? key)}</span>`;
 // The node labels unnamed system accounts ("🧛 validator", "🏛️ treasury"); show those as an italic label.
@@ -242,6 +248,9 @@ const views = {
     if (a.github) bits.push(`GitHub <a href="https://github.com/${esc(a.github.handle)}">@${esc(a.github.handle)}</a> ${gh && gh.verified ? `<span class="pill" title="${esc(gh.reason)}">verified</span>` : `<span class="pill pending" title="${esc(gh ? gh.reason : "not checked")}">unverified</span>`}`);
     if (a.hunts_won.length) bits.push(plural(a.hunts_won.length, "hunt") + " won");
     if (a.familiars.length) bits.push(`${a.familiars.length} ${term("familiar", a.familiars.length == 1 ? "Familiar" : "Familiars")}`);
+    const pc = a.contribution;
+    if (pc && pc.soul.points > 0) bits.push(`${term("soul", "Soul")} ${esc(pc.soul.display)}`);
+    if (pc && pc.sybil) bits.push(`<span class="pill failed" title="${esc(pc.sybil.reason)}">flagged as a sybil</span>`);
     return `<div class="stack">
       <div><span class="eyebrow">Account</span><h1>${name}</h1>
         ${bits.length ? `<div>${bits.join(" · ")}</div>` : ""}
@@ -251,6 +260,7 @@ const views = {
         ${stat(a.nonce, term("nonce", "transactions sent"))}
         ${stat(a.names.length, term("name", "names owned"))}
       </div>
+      ${pc && (pc.soul.points > 0 || pc.claims.length || pc.juror || pc.vouched_by || pc.vouching_for.length || pc.rewards.total_display !== "0 FANG") ? contributionCard(pc) : ""}
       ${a.names.length ? card(`<h2>Names</h2>${a.names.map((n) => `<span class="pill">${esc(n)}</span>`).join(" ")}`) : ""}
       ${a.hunts_won.length || a.familiars.length || a.hunts_created.length ? card(`<h2>Hunts</h2><div class="rows">
         ${a.hunts_won.map((h) => `<div class="row"><div><a href="#/hunt/${h.id}">${esc(h.repo)}#${h.issue}</a> won ${esc(h.amount_display)} for PR #${h.pr}${h.self_awarded ? ' <span class="pill pending">self-awarded</span>' : ""}</div></div>`).join("")}
@@ -272,6 +282,7 @@ const views = {
       <li><b>Why "post-quantum"?</b> Future quantum computers could forge the signatures that Bitcoin and Ethereum use today. Blockula uses ML-DSA, a NIST-standardized scheme built on lattice math that quantum computers aren't known to break. The tradeoff: signatures are about 3 KB instead of 64 bytes.</li>
       <li><b>Names instead of gibberish.</b> Instead of <span class="mono">boo1qx…</span>, you send to <b>alice.boo</b>.</li>
       <li><b>Fees are burned.</b> Every transaction pays a small ${term("fee")}, and the base part is destroyed. So far ${esc(s.burned_display)} has been ${term("burned")}.</li>
+      <li><b>Useful work gets paid.</b> Merged pull requests to Blockula can be ${term("claim", "claimed")} from the ${term("pool", "contribution pool")}. A ${term("seance", "Séance")} of jurors with ${term("soul", "Soul")} judges them, and rewards ${term("vesting", "vest")} slowly. <a href="#/contribute">See how →</a></li>
       <li><b>Coming soon: Ghost Mode.</b> Private transfers using zero-knowledge proofs (hash-based STARKs, also quantum-safe). The explorer will show <i>that</i> something happened, but not who or how much.</li>
     </ol><p>Try it: search for a name above, or open the <a href="#/">latest blocks</a> and click around. Every underlined term has an explanation if you hover.</p>`, "learn");
   },
@@ -297,6 +308,81 @@ views.hunt = async function (id) {
       ${h.cancelled_at ? `<dt>Cancelled</dt><dd>block #${h.cancelled_at}; every funder was refunded what they put in</dd>` : ""}
     </dl>`)}
     ${card(`<h2>Funders (${h.funders.length})</h2><div class="rows">${h.funders.map((f) => `<div class="row"><div>${who(f.account)}</div><div>${esc(f.amount_display)}</div></div>`).join("")}</div>`)}</div>`;
+};
+
+const claimPill = (c) => `<span class="pill ${["rejected", "spam"].includes(c.status) ? "failed" : c.status === "scored" ? "" : "pending"}">${esc(c.status.replace("_", " "))}</span>`;
+const claimRow = (c) => `<div class="row"><div><a href="#/claim/${c.id}">Claim #${c.id}</a> · <a href="${esc(c.pr_url)}">${esc(c.repo)}#${c.pr}</a> by ${who(c.claimant)}${c.familiar ? ` <span class="dim">via ${esc(c.familiar)}</span>` : ""}
+  ${c.score_display ? ` <span class="dim">· score ${esc(c.score_display)}</span>` : ""}${c.payout !== "0" ? ` <span class="dim">· earned ${esc(c.payout_display)}</span>` : ""}</div>${claimPill(c)}</div>`;
+
+function contributionCard(pc) {
+  const r = pc.rewards;
+  return card(`<h2>Contribution</h2><dl>
+    <dt>${term("soul", "Soul")}</dt><dd>${esc(pc.soul.display)} <span class="dim">(${esc(pc.soul.earned_display)} earned in total; it decays slowly)</span></dd>
+    ${pc.vouched_by ? `<dt>${term("vouch", "Vouched for by")}</dt><dd>${who(pc.vouched_by.voucher)} at block #${pc.vouched_by.at}</dd>` : ""}
+    ${pc.vouching_for.length ? `<dt>${term("vouch", "Vouching for")}</dt><dd>${pc.vouching_for.map((v) => who(v.account)).join(", ")}</dd>` : ""}
+    ${pc.juror ? `<dt>${term("seance", "Juror")}</dt><dd>${pc.juror.active ? "in the pool" : "benched (missed a reveal; join again to return)"} · bond ${esc(pc.juror.bond_display)} · served on ${plural(pc.juror.served, "Séance")}</dd>` : ""}
+    <dt>${term("vesting", "Rewards")}</dt><dd>${esc(r.withdrawable_display)} withdrawable · ${esc(r.unvested_display)} still vesting</dd>
+    ${pc.sybil ? `<dt>Flagged</dt><dd class="err">as a sybil by ${who(pc.sybil.by)}: “${esc(pc.sybil.reason)}”</dd>` : ""}
+  </dl>${pc.claims.length ? `<h2 style="margin-top:22px">Claims</h2><div class="rows">${pc.claims.map(claimRow).join("")}</div>` : ""}`);
+}
+
+const phaseText = (s) => s.phase === "sealing" ? `sealing votes until block #${s.commit_until}` : s.phase === "revealing" ? `revealing until block #${s.reveal_until}` : `closed at block #${s.reveal_until}`;
+
+views.contribute = async function () {
+  const [c, souls, claims] = await Promise.all([api("/contributions"), api("/souls?limit=10"), api("/claims?limit=15")]);
+  const s = c.open_seance;
+  const r = c.rules;
+  return `<div class="stack">
+    <div><span class="eyebrow">Proof of Contribution</span><h1>Get paid for useful work</h1></div>
+    <div class="figures">
+      ${stat(fang(c.pool.balance_display), term("pool", "contribution pool"))}
+      ${stat(fang(c.pool.next_budget_display), `next ${term("seance", "Séance")} pays up to`)}
+      ${stat(c.repos.length, "repos in the pool")}
+      ${stat(c.jurors.active, "jurors available")}
+    </div>
+    ${card(`<h2>How it works</h2><ol>
+      <li><b>Link GitHub</b> (a public gist with your address) and get a pull request merged into a pool repo${c.repos.length ? ` (${c.repos.map((x) => `<a href="https://github.com/${esc(x.repo)}">${esc(x.repo)}</a>`).join(", ")})` : ""}.</li>
+      <li><b>${term("claim", "Claim it")}</b> with a small refundable bond (${esc(r.claim_bond_display)}, more if you have several open). You need ${term("soul", "Soul")} or a ${term("vouch", "vouch")} from someone who has it.</li>
+      <li><b>Validators check GitHub</b>: the PR must be merged and authored by your linked handle. ${r.claim_maturity_blocks ? `Then it waits ${r.claim_maturity_blocks.toLocaleString()} blocks in case it's reverted.` : ""}</li>
+      <li><b>A ${term("seance", "Séance")} judges it.</b> Up to ${r.jury_size} jurors drawn at random compare pairs of claims, seal their votes, then reveal them. Jurors who agree with the outcome earn Soul and ${esc(r.juror_share)} of the payout; those who keep disagreeing lose Soul, and no-shows lose part of their bond.</li>
+      <li><b>Payout.</b> Each Séance distributes up to ${esc(r.pool_share_per_seance)} of the pool (the full share once it has 16 claims). Your share is the <i>square root</i> of your summed scores (per GitHub handle), so one solid PR beats a pile of tiny ones, and spam costs you. Rewards ${term("vesting", "vest")} over ${r.vesting_blocks.toLocaleString()} blocks.</li>
+    </ol><p class="dim">Agents can contribute as ${term("familiar", "Familiars")} of a human sponsor: the MCP's <span class="mono">submit_contribution</span>, or <span class="mono">blockula contrib claim owner/repo 123</span> from the CLI.</p>`, "learn")}
+    ${card(`<h2>${s ? `Séance #${s.id} · ${phaseText(s)}` : "No Séance open"}</h2>
+      ${s ? `<p>${plural(s.claims.length, "claim")} · ${plural(s.jurors.length, "juror")} · budget ${esc(s.budget_display)} · <a href="#/seance/${s.id}">details →</a></p>${s.jurors.map((j) => `<span class="pill ${j.revealed ? "" : "pending"}">${esc(plain(j.juror.name || j.juror.short))} · ${j.revealed ? "revealed" : j.committed ? "sealed" : "waiting"}</span>`).join(" ")}`
+        : `<p class="empty">The next one can open from block #${c.next_seance_at} once at least 2 verified claims have matured and ${r.min_jury} jurors are available.</p>`}`)}
+    ${c.recent_seances.length ? card(`<h2>Recent Séances</h2><div class="rows">${c.recent_seances.map((x) => `<div class="row"><div><a href="#/seance/${x.id}">Séance #${x.id}</a> <span class="dim">· ${plural(x.claims, "claim")} · ${plural(x.jurors, "juror")}${x.results ? ` · ${x.results.accepted} accepted, ${x.results.spam} spam` : ""}</span></div><div class="dim">paid ${esc(x.budget_display)} budget</div></div>`).join("")}</div>`) : ""}
+    ${card(`<h2>Recent claims</h2>${claims.claims.length ? `<div class="rows">${claims.claims.map(claimRow).join("")}</div>` : '<p class="empty">No claims yet. Be the first.</p>'}`)}
+    ${card(`<h2>Souls</h2>${souls.souls.length ? `<div class="rows">${souls.souls.map((x, i) => `<div class="row"><div><span class="dim">${i + 1}.</span> ${who(x.account)}${x.github ? ` <span class="dim">@${esc(x.github)}</span>` : ""}${x.juror ? ' <span class="pill">juror</span>' : ""}</div><div>${esc(x.soul.display)}</div></div>`).join("")}</div>` : '<p class="empty">Nobody has Soul yet.</p>'}`)}
+  </div>`;
+};
+
+views.claim = async function (id) {
+  const c = await api("/claim/" + id);
+  return `<div class="stack">
+    ${card(`<span class="eyebrow">Claim #${c.id}</span><div class="summary"><a href="${esc(c.pr_url)}">${esc(c.repo)}#${c.pr}</a> by ${who(c.claimant)} (@${esc(c.handle)})</div>
+      ${claimPill(c)}${c.reason ? ` <span class="dim">${esc(c.reason)}</span>` : ""}`)}
+    ${card(`<dl>
+      <dt>Submitted</dt><dd>block #${c.submitted_at}${c.familiar ? ` by their ${term("familiar", "Familiar")} ${esc(c.familiar)}` : ""}</dd>
+      <dt>${term("bond")}</dt><dd>${c.bond !== "0" ? esc(c.bond_display) + " (held until it's judged)" : "settled"}</dd>
+      ${c.verified_at != null ? `<dt>Verified</dt><dd>block #${c.verified_at} · merge <span class="mono">${esc((c.merge_sha || "").slice(0, 12))}</span> · judged from block #${c.eligible_at}</dd>` : ""}
+      ${c.expires_at ? `<dt>Refunded if unchecked by</dt><dd>block #${c.expires_at}</dd>` : ""}
+      ${c.seance != null ? `<dt>${term("seance", "Séance")}</dt><dd><a href="#/seance/${c.seance}">#${c.seance}</a></dd>` : ""}
+      ${c.score_display ? `<dt>Score</dt><dd>${esc(c.score_display)} of comparisons won · earned ${esc(c.payout_display)} (${term("vesting", "vesting")}) · +${esc(c.soul_awarded_display)} Soul</dd>` : ""}
+    </dl>`)}
+    ${card(`<h2>Validator checks (${c.attestations.length})</h2>${c.attestations.length ? `<div class="rows">${c.attestations.map((a) => `<div class="row"><div>${who(a.validator)} ${a.ok ? `confirmed the merge as <span class="mono">${esc(a.merge_sha.slice(0, 12))}</span>` : `<span class="err">couldn't confirm it: ${esc(a.note || "GitHub doesn't confirm it")}</span>`}</div><a class="dim" href="#/block/${a.at}">block #${a.at}</a></div>`).join("")}</div>` : '<p class="empty">Waiting for validators to check GitHub…</p>'}`)}
+  </div>`;
+};
+
+views.seance = async function (id) {
+  const s = await api("/seance/" + id);
+  const r = s.results;
+  return `<div class="stack">
+    ${card(`<span class="eyebrow">Séance #${s.id}</span><div class="summary">${phaseText(s)[0].toUpperCase() + phaseText(s).slice(1)}</div>
+      <div class="dim">opened at block #${s.opened_at} · budget ${esc(s.budget_display)} · jury drawn from seed <span class="mono">${esc(s.seed.slice(0, 16))}…</span></div>
+      ${r ? `<p>${r.accepted} accepted · ${r.below_threshold} below the threshold · ${r.spam} spam · ${r.carried_over} carried over · ${plural(r.no_shows, "no-show")} · paid ${esc(s.results_display.paid)}, ${esc(s.results_display.returned)} back to the pool</p>` : ""}`)}
+    ${card(`<h2>Claims (${s.claims.length})</h2><div class="rows">${s.claims.map(claimRow).join("")}</div>`)}
+    ${card(`<h2>Jury (${s.jurors.length})</h2><div class="rows">${s.jurors.map((j) => `<div class="row"><div>${who(j.juror)} <span class="dim">· ${j.pairs} pairs${j.agreement_display ? ` · agreed ${esc(j.agreement_display)}` : ""}${j.reward_display !== "0 FANG" ? ` · earned ${esc(j.reward_display)}` : ""}${j.soul_delta_display !== "0" ? ` · Soul ${esc(j.soul_delta_display)}` : ""}</span></div><span class="pill ${j.revealed ? "" : "pending"}">${j.revealed ? "revealed" : j.committed ? "sealed" : s.phase === "closed" ? "no-show" : "waiting"}</span></div>`).join("")}</div>`)}
+  </div>`;
 };
 
 views.mempool = async function () {
@@ -348,7 +434,7 @@ async function route() {
   const [, view = "", id = ""] = location.hash.split("/");
   const fn = views[view] || views.home;
   // Detail pages (a block, tx, account, name) don't belong to one section; a single hunt does.
-  const section = { block: null, tx: null, account: null, name: null, hunt: "hunts" }[view];
+  const section = { block: null, tx: null, account: null, name: null, hunt: "hunts", claim: "contribute", seance: "contribute" }[view];
   const current = section === undefined ? view : section;
   document.querySelectorAll("nav a").forEach((a) => a.toggleAttribute("aria-current", current !== null && a.getAttribute("href") === `#/${current}`));
   try { $("#app").innerHTML = await fn(decodeURIComponent(id)); }

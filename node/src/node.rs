@@ -79,6 +79,72 @@ async fn exchange_epochs(chain: Shared, peers: Vec<String>) {
 }
 
 /// Fast sync an empty home from peers' certified snapshots (falls back to full replay).
+/// Validators check pending contribution claims against GitHub (the PR and the claimant's gist)
+/// and attest what they find. A quorum of attestations settles a claim on-chain.
+async fn attest_claims(chain: Shared) {
+    use crate::github::Verdict;
+    use crate::types::Action;
+    use std::time::Instant;
+    let mut tick = tokio::time::interval(Duration::from_secs(20));
+    let mut retry_after: std::collections::HashMap<u64, Instant> = Default::default();
+    loop {
+        tick.tick().await;
+        let todo: Vec<(u64, String, String, u64, String, Option<String>)> = {
+            let c = chain.lock();
+            let Some(me) = c.me() else { return };
+            let epoch = c.state.params.epoch_of(c.height() + 1);
+            if !c.state.active_sets.get(&epoch).is_some_and(|s| s.contains(&me)) || c.syncing() {
+                continue;
+            }
+            let queued: std::collections::BTreeSet<u64> = c.mempool.iter().filter(|t| t.from == me).filter_map(|t| if let Action::AttestClaim { claim_id, .. } = t.action { Some(claim_id) } else { None }).collect();
+            c.state
+                .poc
+                .claims
+                .values()
+                .filter(|cl| cl.status == crate::poc::ClaimStatus::Pending && !cl.attestations.contains_key(&me) && !queued.contains(&cl.id))
+                .filter(|cl| retry_after.get(&cl.id).is_none_or(|t| Instant::now() >= *t))
+                .take(4)
+                .map(|cl| {
+                    let gist = c.state.github.get(&cl.handle.to_ascii_lowercase()).filter(|l| l.account == cl.claimant).map(|l| l.gist_id.clone());
+                    (cl.id, cl.handle.clone(), cl.repo.clone(), cl.pr, cl.claimant.clone(), gist)
+                })
+                .collect()
+        };
+        for (id, handle, repo, pr, account, gist) in todo {
+            let verdict = match gist {
+                None => Ok(Verdict::Refuted(format!("@{handle} is no longer linked to the claimant"))),
+                Some(g) => crate::github::check_claim(&handle, &repo, pr, &account, &g).await,
+            };
+            let (action, memo) = match verdict {
+                Ok(Verdict::Confirmed { merge_sha }) => (Action::AttestClaim { claim_id: id, ok: true, merge_sha: merge_sha.clone(), note: String::new() }, format!("🔎 {repo}#{pr} merged as {}", &merge_sha[..12])),
+                Ok(Verdict::Refuted(why)) => {
+                    let mut note = String::new();
+                    for ch in why.chars().filter(|c| !c.is_control()) {
+                        if note.len() + ch.len_utf8() > crate::types::MAX_REASON {
+                            break;
+                        }
+                        note.push(ch);
+                    }
+                    (Action::AttestClaim { claim_id: id, ok: false, merge_sha: String::new(), note: note.clone() }, format!("🔎 {note}"))
+                }
+                Ok(Verdict::Wait) => {
+                    retry_after.insert(id, Instant::now() + Duration::from_secs(600));
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(claim = id, error = %e, "couldn't check a claim on GitHub; retrying later");
+                    retry_after.insert(id, Instant::now() + Duration::from_secs(300));
+                    continue;
+                }
+            };
+            match chain.lock().submit_own(action, &memo) {
+                Ok(_) => tracing::info!(claim = id, %memo, "attested contribution claim"),
+                Err(e) => tracing::warn!(claim = id, error = %e, "couldn't submit an attestation"),
+            }
+        }
+    }
+}
+
 async fn maybe_fast_sync(chain: &Shared, peers: &[String], full: bool) {
     let empty = {
         let c = chain.lock();
@@ -293,6 +359,7 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
         let vcfg = ValidatorConfig { chain: shared.clone(), key, genesis: genesis_block, block_time_ms, epoch_blocks: genesis.epoch_blocks, partition: "blockula".into() };
         let (handle, marshal) = consensus::start_validator(context.child("node"), vcfg, oracle.clone(), oracle.clone(), channels).await;
         tokio::spawn(exchange_epochs(shared.clone(), peers.clone()));
+        tokio::spawn(attest_claims(shared.clone()));
         tokio::spawn(serve_http(Node::new(shared, Some(marshal), peers, client_ip), http_bind));
         if let Err(e) = handle.await {
             eprintln!("consensus stopped: {e:?}");

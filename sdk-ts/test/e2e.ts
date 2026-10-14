@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { randomBytes } from "@noble/hashes/utils.js";
-import { Client, POP_CONTEXT, Wallet, addressFromPublicKey, formatFang, minFee, parseFang, popMessage } from "../src/index.js";
+import { Client, POP_CONTEXT, Wallet, addressFromPublicKey, formatFang, minFee, parseFang, parseSoul, popMessage, seanceCommitment } from "../src/index.js";
 
 const client = new Client(process.env.BLOCKULA_RPC ?? "http://localhost:7070");
 
@@ -101,6 +101,52 @@ assert.equal(prof.familiars[0].label, "claude");
 console.log("✓", (await alice.linkGithub(`alice${Date.now() % 100000}`, "0123456789abcdef")).summary);
 assert.equal((await client.github((await client.account(alice.address)).github.handle)).verified, false);
 console.log("✓ hunts, Familiars and GitHub links work");
+
+// 🪦 Proof of Contribution. Same vector as node/src/types.rs `contribution_encodings_match_the_sdk`.
+assert.equal(seanceCommitment(3, "boo1juror", "ab=", [1, 2], "pepper"), "1f3071e1123a713836e2c9c27798dc74ed1fd1f97de6b5fd985c0dba8f9f7eae");
+assert.equal(parseSoul("2.5"), 2500);
+// Every new action is signed by the SDK and verified by the node; these fail on the rules, not the signature.
+await assert.rejects(alice.joinJury("10"), /jurors need at least 5 Soul/);
+await assert.rejects(alice.vouch(bob.address), /at least 10 Soul/);
+await assert.rejects(alice.unvouch(bob.address), /has no vouch/);
+await assert.rejects(alice.submitClaim("jackdishman/blockula", 1), /Soul or a vouch|isn't in the contribution pool/);
+await assert.rejects(alice.leaveJury(), /not in the jury pool/);
+await assert.rejects(alice.sealVotes(999_999, "ab"), /no Séance/);
+await assert.rejects(alice.revealVotes(999_999, "ab", [3], "salt"), /no Séance/);
+await assert.rejects(alice.withdrawVested(), /nothing has vested/);
+await assert.rejects(alice.client.submit(await alice.build({ type: "attest_claim", claim_id: 0, ok: true, merge_sha: "ab".repeat(20), note: "" })), /only active validators/);
+for (const admin of [() => alice.setRepo("a/b", 1), () => alice.grantSoul(bob.address, "1", "x"), () => alice.rejectClaim(0, "x"), () => alice.flagSybil(bob.address, "x"), () => alice.clawback(bob.address, "x")]) {
+  await assert.rejects(admin(), /only validator admins/);
+}
+const poolBefore = BigInt((await client.contributions()).pool.balance);
+console.log("✓", (await alice.fundPool("1")).summary);
+assert.equal(BigInt((await client.contributions()).pool.balance), poolBefore + parseFang("1"));
+await assert.rejects(client.seance(999_999), /not found/);
+assert.ok(Array.isArray((await client.souls()).souls));
+
+// With a Season 0 admin key (scripts/local-testnet.sh passes validator 0's), run the admin side:
+// a repo in the pool, Soul grants, a juror, a vouch, and a claim that validators check on GitHub.
+if (process.env.BLOCKULA_ADMIN_SEED) {
+  const admin = Wallet.fromSeed(process.env.BLOCKULA_ADMIN_SEED.trim(), client);
+  console.log("✓", (await admin.setRepo("jackdishman/blockula", 10)).summary);
+  console.log("✓", (await admin.grantSoul(alice.address, "12", "e2e bootstrap")).summary);
+  console.log("✓", (await alice.joinJury("10")).summary);
+  console.log("✓", (await alice.vouch(bob.address)).summary);
+  await bob.faucet();
+  await bob.linkGithub(`bob${Date.now() % 100000}`, "0123456789abcdef");
+  const pr = 1_000_000 + (Date.now() % 1_000_000);
+  const claimed = await bob.submitClaim("jackdishman/blockula", pr);
+  console.log("✓", claimed.summary);
+  const mine = (await client.claims({ account: bob.address })).claims;
+  assert.equal(mine[0].pr, pr);
+  assert.equal(mine[0].status, "pending");
+  const profile = (await client.account(alice.address)).contribution;
+  assert.equal(profile.juror.active, true);
+  assert.equal(profile.vouching_for[0].account.address, bob.address);
+  console.log("✓", (await alice.leaveJury()).summary);
+  console.log("✓ contribution pool admin flow (validators will check the claim on GitHub)");
+}
+console.log("✓ Proof of Contribution txs verify and enforce their rules");
 
 const status = await client.status();
 console.log(`✓ all good at height ${status.height}, burned so far: ${status.burned_display}`);

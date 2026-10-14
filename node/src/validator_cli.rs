@@ -87,16 +87,16 @@ pub fn parse_fang(s: &str) -> Result<u64> {
     Ok(whole.parse::<u64>()?.checked_mul(DROPS_PER_FANG).ok_or_else(|| anyhow!("amount too large"))? + frac.parse::<u64>()?)
 }
 
-fn load_seed(path: &Path) -> Result<Keys> {
+pub(crate) fn load_seed(path: &Path) -> Result<Keys> {
     let seed = hex::decode(std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?.trim())?;
     Ok(Keys::from_seed(seed.try_into().map_err(|_| anyhow!("{} must hold a 32-byte hex seed", path.display()))?))
 }
 
-fn rt() -> Result<tokio::runtime::Runtime> {
+pub(crate) fn rt() -> Result<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Builder::new_current_thread().enable_all().build()?)
 }
 
-async fn get(rpc: &str, path: &str) -> Result<Value> {
+pub(crate) async fn get(rpc: &str, path: &str) -> Result<Value> {
     let res = reqwest::get(format!("{}/api{path}", rpc.trim_end_matches('/'))).await?;
     let ok = res.status().is_success();
     let v: Value = res.json().await?;
@@ -111,7 +111,7 @@ async fn send(rpc: &str, keys: &Keys, from: &str, action: Action) -> Result<Valu
     send_memo(rpc, keys, from, action, String::new()).await
 }
 
-async fn send_memo(rpc: &str, keys: &Keys, from: &str, action: Action, memo: String) -> Result<Value> {
+pub(crate) async fn send_memo(rpc: &str, keys: &Keys, from: &str, action: Action, memo: String) -> Result<Value> {
     let status = get(rpc, "/status").await?;
     let nonce = match get(rpc, &format!("/account/{from}")).await {
         Ok(a) => a["next_nonce"].as_u64().unwrap_or(0),
@@ -273,7 +273,7 @@ struct WalletFile {
     seed: String,
 }
 
-fn wallet_keys(dir: &Path) -> Result<Keys> {
+pub(crate) fn wallet_keys(dir: &Path) -> Result<Keys> {
     let path = dir.join("wallet.json");
     let f: WalletFile = serde_json::from_slice(&std::fs::read(&path).with_context(|| format!("no wallet at {} — run `blockula wallet new`", path.display()))?)?;
     let seed: [u8; 32] = hex::decode(&f.seed)?.try_into().map_err(|_| anyhow!("bad seed in {}", path.display()))?;

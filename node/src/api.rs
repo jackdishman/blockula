@@ -277,6 +277,11 @@ pub fn router(node: Node) -> Router {
         .route("/api/hunts", get(hunts))
         .route("/api/hunt/{id}", get(hunt))
         .route("/api/github/{handle}", get(github))
+        .route("/api/contributions", get(contributions))
+        .route("/api/claims", get(claims))
+        .route("/api/claim/{id}", get(claim))
+        .route("/api/seance/{id}", get(seance))
+        .route("/api/souls", get(souls))
         .route("/api/health", get(health))
         .route("/metrics", get(metrics))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
@@ -285,7 +290,7 @@ pub fn router(node: Node) -> Router {
 }
 
 fn label(c: &Chain, addr: &str) -> Value {
-    let name = if addr == treasury() { Some("🏛️ treasury".to_string()) } else if c.state.validators.get(addr).is_some_and(|v| v.status == crate::chain::ValidatorStatus::Active) { c.state.primary_name(addr).or(Some("🧛 validator".into())) } else { c.state.primary_name(addr) };
+    let name = if addr == treasury() { Some("🏛️ treasury".to_string()) } else if addr == crate::poc::pool_address() { Some("🪦 contribution pool".to_string()) } else if c.state.validators.get(addr).is_some_and(|v| v.status == crate::chain::ValidatorStatus::Active) { c.state.primary_name(addr).or(Some("🧛 validator".into())) } else { c.state.primary_name(addr) };
     json!({ "address": addr, "name": name, "short": short(addr) })
 }
 
@@ -311,6 +316,21 @@ fn tx_json_with(c: &Chain, tx: &Tx, height: Option<u64>, error: Option<&str>) ->
         Action::AwardHunt { to, .. } => ("award_hunt", c.state.resolve(to).ok(), None),
         Action::CancelHunt { .. } => ("cancel_hunt", None, None),
         Action::RegisterFamiliar { .. } => ("register_familiar", None, None),
+        Action::SetRepo { .. } => ("set_repo", None, None),
+        Action::GrantSoul { to, .. } => ("grant_soul", c.state.resolve(to).ok(), None),
+        Action::Vouch { account } => ("vouch", c.state.resolve(account).ok(), Some(crate::poc::VOUCH_BOND)),
+        Action::Unvouch { account } => ("unvouch", c.state.resolve(account).ok(), None),
+        Action::FlagSybil { account, .. } => ("flag_sybil", c.state.resolve(account).ok(), None),
+        Action::SubmitClaim { .. } => ("submit_claim", None, None),
+        Action::AttestClaim { .. } => ("attest_claim", None, None),
+        Action::RejectClaim { .. } => ("reject_claim", None, None),
+        Action::JoinJury { bond } => ("join_jury", None, Some(*bond)),
+        Action::LeaveJury {} => ("leave_jury", None, None),
+        Action::CommitVotes { .. } => ("commit_votes", None, None),
+        Action::RevealVotes { .. } => ("reveal_votes", None, None),
+        Action::FundPool { amount } => ("fund_pool", Some(crate::poc::pool_address()), Some(*amount)),
+        Action::WithdrawVested {} => ("withdraw_vested", None, None),
+        Action::Clawback { account, .. } => ("clawback", c.state.resolve(account).ok(), None),
     };
     json!({
         "id": tx.id(),
@@ -582,6 +602,7 @@ async fn account(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
         "familiars": c.state.familiars.get(&addr).map(|f| f.iter().filter(|(k, _)| c.state.keys_of(&addr).contains_key(*k)).map(|(k, l)| json!({ "key_id": k, "label": l })).collect::<Vec<_>>()).unwrap_or_default(),
         "hunts_created": c.state.hunts.values().filter(|h| h.creator == addr).map(|h| h.id).collect::<Vec<_>>(),
         "hunts_won": c.state.hunts.values().filter(|h| h.awarded_to.as_deref() == Some(addr.as_str())).map(|h| json!({ "id": h.id, "repo": h.repo, "issue": h.issue, "amount_display": fmt_fang(h.amount), "pr": h.pr, "self_awarded": h.self_awarded() })).collect::<Vec<_>>(),
+        "contribution": contribution_profile(&c, &addr),
     })))
 }
 
@@ -750,7 +771,6 @@ async fn hunt(State(n): State<Node>, Path(id): Path<u64>) -> ApiResult {
 /// Upstream GitHub calls allowed per minute (per node), and how long results are cached.
 pub const GITHUB_PER_MINUTE: usize = 30;
 pub const GITHUB_CACHE: Duration = Duration::from_secs(600);
-pub const GITHUB_MAX_BYTES: usize = 1 << 20;
 
 /// Checks a GitHub link off-chain: the gist must be owned by the handle and contain the linked
 /// account's address. Only ever calls api.github.com; results are cached.
@@ -765,8 +785,9 @@ async fn github(State(n): State<Node>, Path(handle): Path<String>) -> ApiResult 
         }
     }
     n.limits.allow(&[("github-upstream".into(), GITHUB_PER_MINUTE, Duration::from_secs(60))]).map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "GitHub checks are rate limited; try again in a minute".into()))?;
-    let (verified, reason) = match fetch_gist(&link.gist_id).await {
-        Ok((owner, files)) => {
+    let (verified, reason) = match crate::github::fetch_gist(&link.gist_id).await {
+        Ok(None) => (false, "gist not found".to_string()),
+        Ok(Some((owner, files))) => {
             if !owner.eq_ignore_ascii_case(&link.handle) {
                 (false, format!("gist is owned by @{owner}, not @{}", link.handle))
             } else if !files.iter().any(|f| f.contains(&link.account)) {
@@ -779,34 +800,10 @@ async fn github(State(n): State<Node>, Path(handle): Path<String>) -> ApiResult 
     };
     let v = {
         let c = n.chain.lock();
-        json!({ "handle": link.handle, "account": label(&c, &link.account), "gist_id": link.gist_id, "gist_url": format!("https://gist.github.com/{}", link.gist_id), "linked_at": link.linked_at, "verified": verified, "reason": reason, "attested_by": "this node (off-chain check; validator attestations come later)" })
+        json!({ "handle": link.handle, "account": label(&c, &link.account), "gist_id": link.gist_id, "gist_url": format!("https://gist.github.com/{}", link.gist_id), "linked_at": link.linked_at, "verified": verified, "reason": reason, "attested_by": "this node (off-chain check; validators re-check it for every contribution claim)" })
     };
     n.github_cache.lock().insert(key, (Instant::now(), v.clone()));
     Ok(Json(v))
-}
-
-async fn fetch_gist(gist_id: &str) -> anyhow::Result<(String, Vec<String>)> {
-    // gist_id is validated on-chain as [a-z0-9]{1,64}, so it can't change the host or path.
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).redirect(reqwest::redirect::Policy::none()).user_agent("blockula-node").build()?;
-    let mut req = client.get(format!("https://api.github.com/gists/{gist_id}")).header("accept", "application/vnd.github+json");
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        req = req.bearer_auth(token);
-    }
-    let mut res = req.send().await?;
-    if !res.status().is_success() {
-        anyhow::bail!("GitHub returned {}", res.status());
-    }
-    let mut body = vec![];
-    while let Some(chunk) = res.chunk().await? {
-        body.extend_from_slice(&chunk);
-        if body.len() > GITHUB_MAX_BYTES {
-            anyhow::bail!("gist too large");
-        }
-    }
-    let v: Value = serde_json::from_slice(&body)?;
-    let owner = v["owner"]["login"].as_str().unwrap_or_default().to_string();
-    let files = v["files"].as_object().map(|m| m.values().filter_map(|f| f["content"].as_str().map(String::from)).collect()).unwrap_or_default();
-    Ok((owner, files))
 }
 
 fn validator_json(c: &Chain, v: &crate::chain::ValidatorRecord) -> Value {
@@ -944,6 +941,206 @@ async fn sync(State(n): State<Node>, Query(q): Query<SyncQuery>) -> ApiResult {
     };
     blocks.truncate(last_cert_len);
     Ok(Json(json!({ "tip": tip, "blocks": blocks, "to": to, "finalization": finalization })))
+}
+
+// ---------------------------------------------------------------- 🪦 Proof of Contribution
+
+fn soul_json(c: &Chain, addr: &str) -> Value {
+    let h = c.height();
+    let soul = c.state.soul_of(addr, h);
+    let earned = c.state.poc.souls.get(addr).map(|s| s.earned).unwrap_or(0);
+    json!({ "points": soul, "display": crate::poc::fmt_soul(soul), "earned_display": crate::poc::fmt_soul(earned) })
+}
+
+fn ppm_display(ppm: u64) -> String {
+    format!("{}%", (ppm + 5_000) / 10_000)
+}
+
+fn claim_json(c: &Chain, cl: &crate::poc::Claim) -> Value {
+    let p = &c.state.params.poc;
+    let familiar = cl.familiar_key.as_ref().and_then(|k| c.state.familiars.get(&cl.claimant)?.get(k).cloned());
+    json!({
+        "id": cl.id,
+        "claimant": label(c, &cl.claimant),
+        "handle": cl.handle,
+        "repo": cl.repo,
+        "pr": cl.pr,
+        "pr_url": format!("https://github.com/{}/pull/{}", cl.repo, cl.pr),
+        "familiar": familiar,
+        "bond": cl.bond.to_string(),
+        "bond_display": fmt_fang(cl.bond),
+        "status": cl.status,
+        "submitted_at": cl.submitted_at,
+        "attestations": cl.attestations.iter().map(|(v, a)| json!({ "validator": label(c, v), "ok": a.ok, "merge_sha": a.merge_sha, "note": a.note, "at": a.at })).collect::<Vec<_>>(),
+        "merge_sha": cl.merge_sha,
+        "verified_at": cl.verified_at,
+        "eligible_at": cl.verified_at.map(|v| v + p.claim_maturity_blocks),
+        "expires_at": (cl.status == crate::poc::ClaimStatus::Pending).then(|| cl.submitted_at + p.claim_ttl_blocks),
+        "seance": cl.seance,
+        "score_ppm": cl.score_ppm,
+        "score_display": cl.score_ppm.map(ppm_display),
+        "payout": cl.payout.to_string(),
+        "payout_display": fmt_fang(cl.payout),
+        "soul_awarded_display": crate::poc::fmt_soul(cl.soul_awarded),
+        "closed_at": cl.closed_at,
+        "reason": cl.reason,
+    })
+}
+
+fn seance_json(c: &Chain, s: &crate::poc::Seance, full: bool) -> Value {
+    let h = c.height();
+    let phase = if s.closed { "closed" } else if h <= s.commit_until { "sealing" } else { "revealing" };
+    let jurors: Vec<Value> = s
+        .jurors
+        .iter()
+        .map(|(j, seat)| {
+            let mut v = json!({
+                "juror": label(c, j),
+                "pairs": seat.pairs.len(),
+                "committed": seat.commitment.is_some(),
+                "revealed": seat.votes.is_some(),
+                "agreement_ppm": seat.agreement_ppm,
+                "agreement_display": seat.agreement_ppm.map(ppm_display),
+                "reward_display": fmt_fang(seat.reward),
+                "soul_delta_display": format!("{}{}", if seat.soul_delta < 0 { "−" } else if seat.soul_delta > 0 { "+" } else { "" }, crate::poc::fmt_soul(seat.soul_delta.unsigned_abs())),
+            });
+            if full {
+                v["assigned_pairs"] = json!(seat.pairs);
+                v["commitment"] = json!(seat.commitment);
+                v["votes"] = json!(seat.votes);
+                v["spam"] = json!(seat.spam);
+            }
+            v
+        })
+        .collect();
+    json!({
+        "id": s.id,
+        "phase": phase,
+        "opened_at": s.opened_at,
+        "commit_until": s.commit_until,
+        "reveal_until": s.reveal_until,
+        "seed": s.seed,
+        "budget": s.budget.to_string(),
+        "budget_display": fmt_fang(s.budget),
+        "claims": s.claims.iter().filter_map(|id| c.state.poc.claims.get(id)).map(|cl| claim_json(c, cl)).collect::<Vec<_>>(),
+        "jurors": jurors,
+        "results": s.results,
+        "results_display": s.results.as_ref().map(|r| json!({ "paid": fmt_fang(r.paid), "returned": fmt_fang(r.returned) })),
+    })
+}
+
+/// Soul, vouches, jury seat, claims and vesting rewards for an account (`/api/account`).
+fn contribution_profile(c: &Chain, addr: &str) -> Value {
+    let h = c.height();
+    let p = &c.state.poc;
+    let (total, withdrawable, unvested) = c.state.grant_totals(addr, h);
+    json!({
+        "soul": soul_json(c, addr),
+        "sybil": p.sybils.get(addr).map(|s| json!({ "at": s.at, "by": label(c, &s.by), "reason": s.reason })),
+        "vouched_by": p.vouches.get(addr).map(|v| json!({ "voucher": label(c, &v.voucher), "at": v.at, "bond_display": fmt_fang(v.bond) })),
+        "vouching_for": p.vouches.iter().filter(|(_, v)| v.voucher == addr).map(|(to, v)| json!({ "account": label(c, to), "at": v.at, "unlocks_at": v.at + c.state.params.poc.vouch_lock_blocks })).collect::<Vec<_>>(),
+        "juror": p.jurors.get(addr).map(|r| json!({ "bond_display": fmt_fang(r.bond), "active": r.active, "served": r.served, "joined_at": r.joined_at })),
+        "claims": p.claims.values().filter(|cl| cl.claimant == addr).rev().take(50).map(|cl| claim_json(c, cl)).collect::<Vec<_>>(),
+        "next_claim_bond": c.state.claim_bond(addr).to_string(),
+        "next_claim_bond_display": fmt_fang(c.state.claim_bond(addr)),
+        "max_open_claims": c.state.max_open_claims(addr, h),
+        "rewards": {
+            "total_display": fmt_fang(total),
+            "withdrawable": withdrawable.to_string(),
+            "withdrawable_display": fmt_fang(withdrawable),
+            "unvested_display": fmt_fang(unvested),
+            "grants": p.grants.get(addr).map(|g| g.values().map(|g| json!({ "id": g.id, "amount_display": fmt_fang(g.amount), "withdrawn_display": fmt_fang(g.withdrawn), "start": g.start, "end": g.end, "source": g.source })).collect::<Vec<_>>()).unwrap_or_default(),
+        },
+    })
+}
+
+/// The contribution pool at a glance: balance, repos, rules, the open Séance, recent ones.
+async fn contributions(State(n): State<Node>) -> ApiResult {
+    let c = n.chain.lock();
+    let p = &c.state.poc;
+    let t = &c.state.params.poc;
+    let pool = c.state.account(&crate::poc::pool_address()).balance;
+    let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+    for cl in p.claims.values() {
+        *counts.entry(serde_json::to_value(cl.status).unwrap().as_str().unwrap_or_default().to_string()).or_default() += 1;
+    }
+    use crate::poc::*;
+    Ok(Json(json!({
+        "active": p.is_active(),
+        "pool": { "account": label(&c, &pool_address()), "balance": pool.to_string(), "balance_display": fmt_fang(pool), "next_budget_display": fmt_fang((pool as u128 * SEANCE_POOL_BPS as u128 / 10_000) as u64) },
+        "repos": p.repos.iter().map(|(r, w)| json!({ "repo": r, "weight": w })).collect::<Vec<_>>(),
+        "open_seance": p.open_seance.and_then(|id| p.seances.get(&id)).map(|s| seance_json(&c, s, false)),
+        "next_seance_at": p.next_seance_at,
+        "recent_seances": p.seances.values().rev().filter(|s| s.closed).take(10).map(|s| json!({ "id": s.id, "opened_at": s.opened_at, "closed_at": s.reveal_until, "claims": s.claims.len(), "jurors": s.jurors.len(), "budget_display": fmt_fang(s.budget), "results": s.results })).collect::<Vec<_>>(),
+        "claims": counts,
+        "jurors": { "pool": p.jurors.len(), "active": p.jurors.values().filter(|r| r.active).count() },
+        "rules": {
+            "seance_blocks": t.seance_blocks, "commit_blocks": t.commit_blocks(), "reveal_blocks": t.reveal_blocks(),
+            "claim_maturity_blocks": t.claim_maturity_blocks, "claim_ttl_blocks": t.claim_ttl_blocks, "vesting_blocks": t.vesting_blocks,
+            "vouch_lock_blocks": t.vouch_lock_blocks, "soul_half_life_blocks": t.soul_half_life_blocks,
+            "claim_bond_display": fmt_fang(CLAIM_BOND), "vouch_bond_display": fmt_fang(VOUCH_BOND), "juror_bond_display": fmt_fang(JUROR_BOND),
+            "vouch_min_soul": fmt_soul(VOUCH_MIN_SOUL), "juror_min_soul": fmt_soul(JUROR_MIN_SOUL),
+            "jury_size": JURY_SIZE, "min_jury": MIN_JURY, "pairs_per_juror": PAIRS_PER_JUROR, "max_claims_per_seance": MAX_SEANCE_CLAIMS,
+            "pool_share_per_seance": ppm_display(SEANCE_POOL_BPS * 100), "juror_share": ppm_display(JUROR_SHARE_BPS * 100), "min_score": ppm_display(MIN_SCORE_PPM),
+        },
+    })))
+}
+
+#[derive(Deserialize)]
+struct ClaimQuery {
+    status: Option<String>,
+    account: Option<String>,
+    limit: Option<usize>,
+}
+
+/// Claims, newest first. `?status=pending|verified|in_seance|scored|spam|rejected&account=`.
+async fn claims(State(n): State<Node>, Query(q): Query<ClaimQuery>) -> ApiResult {
+    let c = n.chain.lock();
+    let who = q.account.as_deref().map(|a| c.state.resolve(a)).transpose()?;
+    let list: Vec<Value> = c
+        .state
+        .poc
+        .claims
+        .values()
+        .rev()
+        .filter(|cl| who.as_ref().is_none_or(|w| &cl.claimant == w))
+        .filter(|cl| q.status.as_deref().is_none_or(|s| serde_json::to_value(cl.status).unwrap() == s))
+        .take(q.limit.unwrap_or(100).min(500))
+        .map(|cl| claim_json(&c, cl))
+        .collect();
+    Ok(Json(json!({ "count": c.state.poc.claims.len(), "claims": list })))
+}
+
+async fn claim(State(n): State<Node>, Path(id): Path<u64>) -> ApiResult {
+    let c = n.chain.lock();
+    let cl = c.state.poc.claims.get(&id).ok_or_else(|| not_found("claim"))?;
+    Ok(Json(claim_json(&c, cl)))
+}
+
+/// A Séance with every juror's assigned pairs (what they must judge), commitments and reveals.
+async fn seance(State(n): State<Node>, Path(id): Path<u64>) -> ApiResult {
+    let c = n.chain.lock();
+    let s = c.state.poc.seances.get(&id).ok_or_else(|| not_found("Séance"))?;
+    Ok(Json(seance_json(&c, s, true)))
+}
+
+#[derive(Deserialize)]
+struct LimitQuery {
+    limit: Option<usize>,
+}
+
+/// Soul leaderboard (effective Soul, after decay).
+async fn souls(State(n): State<Node>, Query(q): Query<LimitQuery>) -> ApiResult {
+    let c = n.chain.lock();
+    let h = c.height();
+    let mut list: Vec<(u64, &String)> = c.state.poc.souls.keys().map(|a| (c.state.soul_of(a, h), a)).filter(|(s, _)| *s > 0).collect();
+    list.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+    let rows: Vec<Value> = list
+        .into_iter()
+        .take(q.limit.unwrap_or(50).min(500))
+        .map(|(_, a)| json!({ "account": label(&c, a), "soul": soul_json(&c, a), "github": c.state.github_by_account.get(a), "juror": c.state.poc.jurors.get(a).is_some_and(|r| r.active), "vouched_by": c.state.poc.vouches.get(a).map(|v| label(&c, &v.voucher)) }))
+        .collect();
+    Ok(Json(json!({ "souls": rows })))
 }
 
 #[cfg(test)]

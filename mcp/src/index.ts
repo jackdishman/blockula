@@ -281,4 +281,47 @@ tool("fund_hunt", "Add FANG to an open Hunt's bounty (crowdfunding). Refunded to
   return { summary: tx.summary, explorer: `${RPC}/#/hunt/${hunt_id}` };
 });
 
+tool("contribution_pool", "Blockula's contribution pool (Proof of Contribution): its balance, which GitHub repos earn from it, the rules, and the Séance (review jury) that's open now. Merged PRs to pool repos can be claimed for a share; payouts are judged by human juries, square-rooted per sponsor, and vest over ~90 days.", {}, async () => {
+  const c = await client.contributions();
+  return {
+    pool: c.pool.balance_display,
+    next_seance_pays_up_to: c.pool.next_budget_display,
+    repos: c.repos,
+    claims: c.claims,
+    open_seance: c.open_seance ? { id: c.open_seance.id, phase: c.open_seance.phase, claims: c.open_seance.claims.length, jurors: c.open_seance.jurors.length, reveals_until_block: c.open_seance.reveal_until } : null,
+    rules: c.rules,
+    how_to_earn: "Get a PR merged into a pool repo, authored by the GitHub handle linked to the account you act for (link_github), then submit_contribution. Validators check the merge on GitHub; a jury compares it with other claims.",
+    explorer: `${RPC}/#/contribute`,
+  };
+});
+
+tool("submit_contribution", "Claim a merged PR for the contribution pool, for the account this agent acts for. The PR's author must be that account's linked GitHub handle. Costs a small refundable bond (lost if the jury marks it spam). If you act for a user through a session key, they must first register that key as a Familiar (wallet.registerFamiliar), or the chain refuses the claim; the claim then credits you as their Familiar.", { repo: z.string().regex(/^[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}$/), pr: z.number().int().min(1) }, async ({ repo, pr }) => {
+  const w = requireWallet();
+  const me = await client.account(w.account).catch(() => null);
+  const bond = BigInt(me?.contribution?.next_claim_bond ?? "1000000000");
+  if (bond > MAX_SEND) throw new Error(`the claim bond (${formatFang(bond)}) exceeds this agent's per-send limit (BLOCKULA_MAX_SEND)`);
+  const today = spentToday();
+  if (today.spent + bond > MAX_DAILY) throw new Error(`the claim bond would exceed the agent's daily limit (BLOCKULA_MAX_DAILY)`);
+  const tx = await w.submitClaim(repo, pr);
+  mkdirSync(HOME, { recursive: true });
+  writeFileSync(SPEND_FILE, JSON.stringify({ day: today.day, spent: (today.spent + bond + BigInt(tx.fee)).toString() }), { mode: 0o600 });
+  const claim = (await client.claims({ account: w.account })).claims.find((c: { repo: string; pr: number }) => c.repo === repo.toLowerCase() && c.pr === pr);
+  return { summary: tx.summary, claim_id: claim?.id, status: claim?.status, next: "Validators check GitHub within a minute or two; then it waits for the revert window and the next Séance. Track it with my_contributions.", explorer: `${RPC}/#/claim/${claim?.id ?? ""}` };
+});
+
+tool("my_contributions", "The Soul (reputation), contribution claims, vesting rewards, vouch and jury status of the account this agent acts for.", {}, async () => {
+  const w = requireWallet();
+  const a = await client.account(w.account);
+  const p = a.contribution;
+  return {
+    account: a.account.name ?? a.account.address,
+    soul: p.soul.display,
+    vouched_by: p.vouched_by?.voucher?.name ?? p.vouched_by?.voucher?.short ?? null,
+    juror: p.juror,
+    rewards: { withdrawable: p.rewards.withdrawable_display, still_vesting: p.rewards.unvested_display },
+    claims: p.claims.map((c: { id: number; repo: string; pr: number; status: string; score_display?: string; payout_display: string; reason?: string }) => ({ id: c.id, pr: `${c.repo}#${c.pr}`, status: c.status, score: c.score_display, earned: c.payout_display, note: c.reason })),
+    next_claim_bond: p.next_claim_bond_display,
+  };
+});
+
 await server.connect(new StdioServerTransport());
