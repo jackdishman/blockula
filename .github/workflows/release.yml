@@ -1,9 +1,9 @@
 # Tag vX.Y.Z → reproducible `blockula` archives for Linux + macOS, install.sh, any committed
 # genesis files, checksums.txt, SLSA build provenance (GitHub artifact attestations) for every
-# file, and a DRAFT release. The release stays
-# a draft until a maintainer has reproduced the Linux build, signed checksums.txt offline with the
-# ML-DSA-65 release key and attached checksums.txt.sig (docs/OPERATIONS.md "Releases").
-# scripts/install.sh and the MCP's install_node download from the published release.
+# file, and a DRAFT release. It stays a draft until a maintainer has reproduced the Linux build,
+# signed checksums.txt offline with the ML-DSA-65 release key and attached checksums.txt.sig
+# (docs/OPERATIONS.md "Releases"). scripts/install.sh and the MCP's install_node download from
+# the published release.
 name: Release
 on:
   push: { tags: ["v*"] }

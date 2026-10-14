@@ -58,9 +58,9 @@ A validator's HTTP API locks the same state the consensus engine uses, so a publ
 
 | | Minimum | Recommended | Why |
 |---|---|---|---|
-| CPU | 4 dedicated cores, x86-64 (AVX2) or arm64 | 8 cores / 16 threads, recent EPYC, Xeon or Ryzen | Signatures are cheap: ML-DSA-65 verifies in ~25 µs on a modern core, so a full block (~400 txs) plus a view's votes and certificates is ~15 ms. Cores buy headroom for the rest: today's node re-executes history from genesis on restart (until CV-1), verifiers replay up to 64 unexecuted ancestors (CV-5), p2p encryption runs over ~10 MB/s, and sentries pull sync batches. Execution is sequential, so single-thread speed matters more than core count. No shared or burstable vCPUs. |
+| CPU | 4 dedicated cores, x86-64 (AVX2) or arm64 | 8 cores / 16 threads, recent EPYC, Xeon or Ryzen | Signatures are cheap: ML-DSA-65 verifies in ~25–50 µs on a modern core, so a full block (~400 txs) plus a view's votes and certificates is 10–25 ms of one core. Cores buy headroom for the rest: today's node re-executes history from genesis on restart (until CV-1), verifiers will replay up to 64 unexecuted ancestors (CV-5, planned), p2p encryption runs over ~10 MB/s, and sentries pull sync batches. Execution is sequential, so single-thread speed matters more than core count. No shared or burstable vCPUs. |
 | Memory | 16 GB | 32 GB | State is in memory until CV-1 (accounts, names, Hunts, claims, indexes), plus marshal's caches and a 5,000-tx mempool. |
-| Disk | 1 TB NVMe SSD | 2 TB NVMe SSD, expandable online | Every block is fsynced before consensus is acknowledged: low-latency local NVMe, not network storage with burst credits. Size: [Disk sizing](#disk-sizing). |
+| Disk | 1 TB NVMe SSD | 2 TB NVMe SSD, expandable online | The node fsyncs its block logs and consensus journals on every block (and, with CV-1, commits state before acknowledging consensus): low-latency local NVMe, not network storage with burst credits. Size: [Disk sizing](#disk-sizing). |
 | Network | 1 Gbit/s, ≥ 15 TB/month included | 1 Gbit/s unmetered (or 10 Gbit/s) | [Bandwidth](#bandwidth). |
 | Other | Dedicated public IPv4 | Plus IPv6 | p2p is raw TCP; NAT and shared IPs break dialing. |
 
