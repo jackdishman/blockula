@@ -40,6 +40,11 @@ fn make(seed: u64) -> (PublicInputs, Vec<u8>) {
     prove_with_seed(&w, bytes()).unwrap()
 }
 
+/// Iterations for the fuzz-style tests: `GHOST_FUZZ_ITERS` (default `default`), for soaks.
+fn iterations(default: usize) -> usize {
+    std::env::var("GHOST_FUZZ_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
 fn rejected(public: &PublicInputs, proof: &[u8]) -> VerifyError {
     verify(public, proof).expect_err("a tampered proof verified")
 }
@@ -145,7 +150,7 @@ fn proofs_are_bound_to_their_statement() {
 fn fuzz_random_bytes() {
     let (public, _) = honest();
     let mut rng = StdRng::seed_from_u64(4);
-    for i in 0..400 {
+    for i in 0..iterations(400) {
         let len = match i % 4 {
             0 => (rng.next_u32() % 64) as usize,
             1 => (rng.next_u32() % 4096) as usize,
@@ -164,7 +169,7 @@ fn fuzz_mutated_proofs() {
     let n = proof.len();
     let mut rng = StdRng::seed_from_u64(5);
     let mut outcomes = std::collections::BTreeMap::new();
-    for _ in 0..300 {
+    for _ in 0..iterations(300) {
         let mut p = proof.clone();
         for _ in 0..1 + rng.next_u32() % 6 {
             let at = rng.next_u32() as usize % p.len();
