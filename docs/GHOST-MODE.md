@@ -21,7 +21,7 @@ choice of stack: `.context/research/ghost-mode.md`.
 | Hash | Poseidon2, width 16, Plonky3's KoalaBear parameters (8 full + 20 partial rounds, x³) |
 | Circuit | One Action: 2 spends + 2 outputs, dummies allowed, 128 rows × 261 columns, 453 constraints, degree 3 |
 | Security | 100 bits proven (list-decoding regime), 110 conjectured, from Plonky3's calculator |
-| Proof | 126–132 KiB; prove ~64 ms, verify ~6.3 ms (one core, Apple M4 Max) |
+| Proof | 126–132 KiB; prove ~60 ms, verify ~6.3 ms (one core, Apple M4 Max) |
 | Note encryption | ML-KEM-768 (`ml-kem =0.3.2`) + XChaCha20-Poly1305; 1,481 bytes per output |
 
 ## 1. Keys and addresses
@@ -402,9 +402,9 @@ Activation pins `CIRCUIT_ID`; any later circuit change is a `ScheduleUpgrade`.
 | | |
 |---|---|
 | Trace | 128 rows × 261 columns, 453 constraints, max degree 3 |
-| Proof size | 129,319–135,016 bytes (126–132 KiB) over 20 proofs; opened values 8.9 KB, FRI and Merkle paths ~120 KB |
-| Prove | 64 ms median (constraint check included) |
-| Verify | 6.3 ms median |
+| Proof size | 129,159–135,016 bytes (126–132 KiB) over two runs of 20 proofs (the masks are random); opened values 8.9 KB, FRI and Merkle paths ~120 KB |
+| Prove | 56–64 ms median across runs (constraint check included) |
+| Verify | 6.2–6.3 ms median |
 | Security | 100 bits proven, 110 conjectured |
 | Note encryption | 34 µs |
 | Trial decryption | 36 µs (not ours), 38 µs (ours) |
@@ -448,7 +448,7 @@ of a more complex AIR.
   600 random), truncation at 70 lengths, extension, an overlong varint, oversize, proofs swapped
   between statements, random byte strings and structured mutations. `GHOST_FUZZ_ITERS=20000`
   soaks: 20,000 + 20,000 inputs, 0 panics. `every_byte_flip_is_rejected` (ignored, slow) flips a
-  bit in every byte of a proof.
+  bit in every byte of a proof: 128,807 flips, all rejected, 0 panics (11 minutes in release).
 - **Encryption** (`tests/encryption.rs`): round trip, sizes, other keys, tampering in each
   region, wrong `cm`, outgoing recovery, no-ovk noise, wrong recipient, freshness, random garbage.
 - **Lifecycle** (`tests/lifecycle.rs`): through the public API with a toy node (frontier, root
