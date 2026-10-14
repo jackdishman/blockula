@@ -5,7 +5,7 @@
 #   scripts/reproduce-release.sh v0.5.0                       target = this machine's arch
 #   scripts/reproduce-release.sh v0.5.0 aarch64-unknown-linux-gnu
 # Env: CHECKSUMS=<file> (e.g. from a draft release: gh release download v0.5.0 -p checksums.txt),
-#      SRC=<checkout> (build this tree instead of cloning the tag), BLOCKULA_REPO (default
+#      SRC=<checkout> (build its committed HEAD instead of cloning the tag), BLOCKULA_REPO (default
 #      jackdishman/blockula).
 set -euo pipefail
 # The image release.yml builds Linux targets in. Its rust version must match rust-toolchain.toml
@@ -25,19 +25,17 @@ asset=blockula-$target.tar.gz
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-if [ -n "${SRC:-}" ]; then
-  src=$(cd "$SRC" && pwd)
-else
-  src=$work/src
-  git clone --quiet --depth 1 --branch "$tag" "https://github.com/$repo.git" "$src"
-fi
+src=$work/src
+if [ -n "${SRC:-}" ]; then git clone --quiet "$SRC" "$src"
+else git clone --quiet --depth 1 --branch "$tag" "https://github.com/$repo.git" "$src"; fi
 echo "🔨 Building $asset from $(git -C "$src" rev-parse HEAD) in $RELEASE_IMAGE ($platform)…"
 # A fresh clone inside a throwaway container, at a path unlike CI's: the build remaps paths, so
 # the output must not change. Only committed files are built.
 mkdir -p "$work/dist"
 docker run --rm --platform "$platform" -v "$src:/src:ro" -v "$work/dist:/out" "$RELEASE_IMAGE" bash -euc "
   git config --global --add safe.directory '*'
-  git clone -q /src /work/blockula && cd /work/blockula
+  git clone -q /src /work/blockula
+  cd /work/blockula
   rustup toolchain install >/dev/null
   scripts/release-build.sh $target /out
   chown -R $(id -u):$(id -g) /out"
