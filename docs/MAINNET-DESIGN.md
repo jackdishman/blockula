@@ -10,18 +10,18 @@ Mainnet is a **new chain**. Nothing here has to replay the current public testne
 |---|---|
 | DEC-1 Scope at genesis | Everything that can be made safe is on at genesis: transfers, names, accounts and session keys, Hunts, the contribution pool (Souls, vouches, claims, Séances), permissionless staking with slashing, on-chain governance, the fee market and issuance. Admin levers are replaced by governance (GOV-1..3) and the jury draw by a randomness beacon (CRY-3). |
 | DEC-2 Ghost Mode | Wanted at genesis. Its code ships behind a governance-controlled activation (`ghost` feature flag in state) and is switched on only after its own audit: a soundness bug in a shielded pool is a silent infinite mint. See section 6. |
-| DEC-3 Validator set | Permissionless, stake-ranked, equal-weight votes (Polkadot NPoS style; see 3.4): simplex's quorum is count-based (`N3f1`), so weighted voting would need a fork. Active-set cap 32 at genesis (a ⅔ certificate is ~73 KB and each validator re-broadcasts two per view, ~4.5 MB/s egress at n = 32 and ~18 MB/s at 64), raised by governance once certificates shrink. Genesis target: 21–32 independent operators. See OPERATIONS.md. |
+| DEC-3 Validator set | Permissionless, stake-ranked, equal-weight votes (Polkadot NPoS style; see 3.4): simplex's quorum is count-based (`N3f1`), so weighted voting would need a fork. Active-set cap **31** (3f+1, f = 10) at genesis: a ⅔ certificate is ~73 KB and each validator re-broadcasts every certificate to every peer (~4.5 MB/s egress at n = 31, ~18 MB/s at 64), so the cap rises only by governance once certificates shrink. Genesis floor 22 validators, target 28–31, founder at most 2 seats. Leaders need a 1 Gbps uplink once blocks fill. Policy and costs: OPERATIONS.md and `.context/research/validators-hosting.md`. |
 | DEC-4 Staking | Self-custodial delegation to validator pools (share accounting), min self-bond, 21-day unbonding, slashing for equivocation (heavy) and downtime (light, jail first). |
-| DEC-5 Supply | See [TOKENOMICS.md](TOKENOMICS.md): no sale, founder allocation with on-chain vesting, governed treasury, contribution endowment, tail issuance. |
+| DEC-5 Supply | 1,000,000,000 FANG, no sale. Community distributions 32% (keyless; criteria announced only after mainnet works), treasury 25% (keyless, unlocks over 4 years, governance-only), contribution endowment 15% (streams into the pool over 10 years), validator bootstrap delegation 10% (by formula, returns to the treasury in years 2–4), founder 10% (1-year cliff, 4-year vest, on-chain), foundation 5% (4-year vest, multisig with ≥ 2 non-founder signers), genesis operators and security grants 3% (6-month cliff, 2-year vest). Details and the legal posture: [TOKENOMICS.md](TOKENOMICS.md). |
 | DEC-6 State growth | Creating an account burns a creation fee; names renew yearly; every other record is bonded already. Parameters are governance-adjustable. |
 | DEC-7 Chain id and prefix | Mainnet `blockula-1`, address prefix `boo`. Public testnets use `tboo`. The prefix is a genesis parameter; nodes reject addresses of another prefix. |
 | DEC-8 Wallet domain | A domain the project's entity owns (to be registered), set via `NEXT_PUBLIC_RP_ID`. Never `*.vercel.app` on mainnet. |
-| DEC-9 PQ transport | Launch may precede it (founder's call). The research and the patch plan are in `docs/PQ-TRANSPORT.md`; README and ONE_PAGER say plainly that p2p key exchange is X25519 until it lands. |
+| DEC-9 PQ transport | Done before launch after all: a vendored `commonware-stream` with one fixed hybrid suite (X25519 + ML-KEM-768, both secrets in the BLAKE3 transcript, no negotiation, so no downgrade), ~450 lines, offered upstream on Commonware #5183. Outbound HTTPS prefers `X25519MLKEM768` (rustls on aws-lc-rs). See `docs/PQ-TRANSPORT.md`. |
 | DEC-10 Admin powers, faucet | No admin keys on mainnet (`validator_admins: []`, enforced by the genesis builder). No faucet. Admin mode survives only for dev and test chains. |
 | DEC-11 Names | One-year registration, renewal at 20% of the price per year, 30-day grace, transfer and release, a genesis reserved list assignable by governance. |
-| DEC-12 Block time | 1 s blocks, 4 MiB cap; base fee per byte adjusts with fullness (3.6). |
+| DEC-12 Block time | 1 s blocks. The codec bound stays 4 MiB, but the governance parameter `max_block_bytes` starts at 2 MiB (a full 4 MiB block at n = 31 is ~130 MB of leader egress per slot). Base fee per byte adjusts with fullness (3.6). 1-hour epochs (3,600 blocks). |
 | DEC-13 Voting weight | FANG locked in the vote × conviction. Unvested tokens don't vote. Soul doesn't vote at genesis. |
-| DEC-14 Hosting | No provider, ASN or jurisdiction above ¼ of the active set (always below ⅓). Foundation nodes stay on Fly.io (≤ 3 validators plus the public RPC/sentries) and shrink over time. |
+| DEC-14 Hosting | Hard caps per provider/ASN and per country ⌊n/4⌋, target ⌊f/2⌋; per facility 15%. Founder/foundation validators: 2 at genesis on Fly.io performance machines (snapshots off, two continents), plus the public RPC and sentries; Fly regions count as one failure domain. Recommended third-party hosting: OVHcloud dedicated (allows PoS validators, unmetered), Latitude.sh, Cherry Servers; Hetzner excluded (blocked Solana validators in 2022); AWS/GCP only with egress budgeted. Enforced through the bootstrap delegation's eligibility rules, since the protocol can't see where nodes run. |
 
 ## 2. Engineering rules (every package)
 
@@ -98,6 +98,7 @@ CBlock { version: u32, parent, height, view: u64, parent_view: u64, timestamp_ms
 - **Equivocation:** simplex runs with `track_historical_votes: true` and an `AttributableReporter`-wrapped evidence sink; nodes capture its `ConflictingNotarize`, `ConflictingFinalize` and `NullifyFinalize` reports and submit `ReportEquivocation` with both signed votes. The chain verifies both against that epoch's set and namespace, slashes the pool `slash_double_sign_bps` (5%), once per (validator, epoch, view), tombstones the validator (never active again), and pays the reporter a share of the slash; the rest is burned.
 - Validator sets are kept in state for the whole evidence window (≥ unbonding), not just 8 epochs. Slashing only switches on together with slashing protection (3.9), so a restored disk can't get an honest operator slashed.
 - **Downtime:** for a block `(epoch e, view v, parent_view u)`, every view in `u+1 .. v−1` was nullified; charge a missed slot to `leader(e, x) = sorted_set[(e + x) mod n]` (call simplex's `RoundRobin` elector for exact parity) and credit `leader(e, v)`. Epoch-boundary re-proposals add no height and aren't counted. A validator missing more than `downtime_max_missed` of its last `downtime_window` leader slots is jailed (leaves the set at the next boundary, `slash_downtime_bps` = 0.1%) and may `Unjail` after `jail_blocks`.
+- **Pruning:** validators keep a bounded window of consensus blocks and certificates (archive nodes keep all); at full load `cblocks.bin` would otherwise grow ~360 GB/day.
 - **Junk blocks (CV-5):** verifiers replay a proposal's unexecuted ancestors with the exact execute path (end-of-block and end-of-epoch steps included), up to 64 ancestors (beyond that they abstain by staying pending), and reject blocks containing unadmittable txs. At execution, every skipped tx costs the proposer `base_fee × size` (from its account, then its self-bond).
 - Validator system txs (attestations, beacon, evidence) may name a separate fee payer (the pool owner) so consensus keys only hold a fee float (OPS-1, SF-13).
 
@@ -106,7 +107,7 @@ CBlock { version: u32, parent, height, view: u64, parent_view: u64, timestamp_ms
 - **No admin keys on mainnet.** Every former admin lever is a proposal kind: `ParamChange`, `TreasurySpend`, `SetRepo`, `GrantSoul` (bounded), `FlagSybil`, `RejectClaim`, `Clawback`, `UnlinkGithub`, `RefundHunt`, `ScheduleUpgrade`, `ActivateFeature` (e.g. Ghost Mode), `Text`.
 - `Propose` bonds `proposal_deposit` (refunded once the proposal reaches quorum; burned if it doesn't). Voting lasts `voting_blocks` (7 days), then a `timelock_blocks` (2 days) queue, then the action executes at end of block. Upgrades and treasury spends above `treasury_large_bps` of the treasury need a ⅔ supermajority; everything else a simple majority. Quorum is `quorum_bps` of unlocked supply.
 - `Vote` locks `amount` of the voter's own unlocked holdings (liquid + staked + unbonding) for `conviction` lock periods; weight = amount × conviction multiplier (0.1× with no lock, then 1×–6× for 1–32 lock periods). Locks overlap, constrain transfers out, and are released by `Unlock` after they expire. Unvested tokens can't vote.
-- The treasury is a keyless system account; only `TreasurySpend` moves funds out.
+- The treasury is a keyless system account; only `TreasurySpend` moves funds out. Quorum has an absolute floor (`quorum_floor`, in FANG) as well as `quorum_bps`, and spending proposals are rejected before `governance_spend_height` (≈ 6 months), because almost nothing can vote at launch.
 - `MultisigCreate` turns an account into an M-of-N multisig of its owner keys: owner-only actions then need `MultisigPropose` plus approvals; session keys keep working within their limits.
 - Hunts: only the creator awards. Governance can refund a hunt's funders; nobody can redirect escrow.
 - Soul: bootstrapped by a published `soul_ledger` in genesis; after that only juries and bounded `GrantSoul` proposals change it.
@@ -120,6 +121,7 @@ CBlock { version: u32, parent, height, view: u64, parent_view: u64, timestamp_ms
 
 ### 3.7 Allocations, vesting and locks (TOK-4, OPS-2)
 
+- Staking rewards earned by locked tokens are locked on the same curve (otherwise a vesting allocation yields liquid income before its cliff). An account with vesting locks can delegate at most `insider_delegation_cap` (1% of supply) to any one pool.
 - Accounts carry `locks: [Lock { id, amount(curve), reason }]`. A vesting lock is a curve (`start`, `cliff`, `end`, `total`): the locked amount at height `h` is the unvested part. Transferable balance = liquid − max(0, max_lock − staked − unbonding). Locked tokens can be staked and delegated, never transferred.
 - `blockula genesis build --spec <spec.toml>` produces a byte-identical `genesis.json` and its hash from reviewed inputs (allocations with vesting, operators with their own keys and proofs of possession, parameters, reserved names, Soul ledger, `faucet: false`, `validator_admins: []` for mainnet). Several parties must reproduce the hash.
 
@@ -133,7 +135,7 @@ CBlock { version: u32, parent, height, view: u64, parent_view: u64, timestamp_ms
 
 - State holds an upgrade schedule `[(version, activation_height)]`, changed only by `ScheduleUpgrade` proposals. `params.version_at(h)` gates behavior. A node whose binary doesn't support the version scheduled at the next height halts cleanly before executing it (exit code, `/api/health` says why) instead of diverging.
 - `--halt-height H` stops after executing `H` (coordinated restarts, incidents).
-- A slashing-protection record (last signed view per epoch) is kept next to the key and checked before signing, so restoring an old volume can't double-sign.
+- **Slashing protection that survives restores:** besides a last-signed-view record checked before each signature, a validator that starts up only signs views later than the newest view it observes from the network for its epoch (a few views of abstention per restart), and halts if it sees a vote under its own key that it didn't produce in this run. A restored volume therefore can't double-sign even though its record rolled back with it.
 - On-disk formats carry a schema version and migrations.
 
 ### 3.10 Sync trust (CRY-2)
@@ -167,4 +169,10 @@ SEC-1 (an external audit), LEG-1..3 (counsel), OPS-1 recruiting and the ceremony
 
 ## 6. Ghost Mode
 
-See `docs/GHOST-MODE.md` (design, proof system choice, audit plan). The module ships disabled; `ActivateFeature { ghost }` turns it on.
+Recommendation (b) from `.context/research/ghost-mode.md`: build it, ship it **disabled**, and turn it on with `ActivateFeature { ghost }` only after a dedicated ZK audit, a clean under-constraint sweep and fuzzing, a cryptanalyst's sign-off on Poseidon2, ≥ 4 weeks on testnet with a bounty, and counsel. A shielded-pool soundness bug is a silent infinite mint (Zcash 2018; Orchard CVE-2026-54496 in May 2026).
+- One Plonky3 (`=0.8.0`) action circuit on KoalaBear with hiding FRI: 2 spends, 2 outputs, dummies allowed, Poseidon2 commitments, position-bound nullifiers, value balance with carried u64 limbs.
+- State: commitment tree frontier and a window of recent roots, the nullifier set, the transparent pool balance (a turnstile: unshield can never exceed it, and it's in `check_invariants`), a governance pool cap, and the feature record.
+- Tags: 50 `Shield`, 51 `PrivateTransfer`, 52 `Unshield` (unsigned: the proof authorizes them, nullifiers prevent replay), 53 `SetGhostAddress` (1,216-byte ML-KEM address published under a `.boo` name), 54 `GhostPause` (takes effect once f+1 validators sign; f+1 can halt the chain anyway, so it adds no power), 55–59 reserved.
+- Size limits per tag: ghost txs up to 256 KiB, at most 1 MiB of ghost txs per block.
+- Notes: ML-KEM-768 (`ml-kem =0.3.2`) + XChaCha20-Poly1305; incoming, full and outgoing viewing keys. Session keys can't spend shielded funds. Every hash use is versioned so a later pool can migrate.
+- Full design: `docs/GHOST-MODE.md`.
