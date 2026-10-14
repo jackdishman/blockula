@@ -208,4 +208,4 @@ tests:
           - exp_labels: { severity: none }
             exp_annotations:
               summary: "Heartbeat: the alerting pipeline works"
-              runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#monitoring
+              runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#alerting-pipeline

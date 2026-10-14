@@ -409,7 +409,7 @@ Above 80%: grow the volume now (online resize: grow the block device, then `resi
 
 Less than 10% available or an OOM kill. State is in memory until CV-1, so memory grows with the chain. Check `ps -o rss,cmd -u blockula`; move to the recommended 32 GB. Don't run other services on a validator.
 
-### Monitoring
+### Alerting pipeline
 
 The alerting pipeline itself: `Watchdog` should always reach your heartbeat service; `AlertmanagerNotificationsFailing` means a receiver is misconfigured or down (check `docker compose logs alertmanager`); `PrometheusRuleFailures` means a rule broke (check Prometheus's /rules page). See [deploy/monitoring/README.md](../deploy/monitoring/README.md).
 

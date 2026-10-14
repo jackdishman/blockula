@@ -187,17 +187,17 @@ groups:
         labels: { severity: none }
         annotations:
           summary: "Heartbeat: the alerting pipeline works"
-          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#monitoring
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#alerting-pipeline
       - alert: AlertmanagerNotificationsFailing
         expr: rate(alertmanager_notifications_failed_total[5m]) > 0
         for: 5m
         labels: { severity: critical }
         annotations:
           summary: "Alertmanager can't deliver to {{ $labels.integration }}: alerts are going nowhere"
-          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#monitoring
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#alerting-pipeline
       - alert: PrometheusRuleFailures
         expr: increase(prometheus_rule_evaluation_failures_total[5m]) > 0
         labels: { severity: warning }
         annotations:
           summary: "Prometheus failed to evaluate alert rules"
-          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#monitoring
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#alerting-pipeline
