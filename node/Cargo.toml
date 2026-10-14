@@ -33,6 +33,9 @@ bytes = "1"
 futures = "0.3"
 rand_core = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Outbound HTTPS on aws-lc-rs (installed in `main`), which offers X25519MLKEM768 first. reqwest's
+# ring provider stays only as the fallback for code paths that never install one (unit tests).
+rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std", "tls12"] }
 tracing = "0.1"
 zstd = "0.13"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

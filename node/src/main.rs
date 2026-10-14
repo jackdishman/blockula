@@ -163,6 +163,8 @@ fn net_opts(net: Net, http_port: Option<u16>, p2p_preset: Option<String>, epheme
 }
 
 fn main() -> Result<()> {
+    // Outbound HTTPS uses rustls on aws-lc-rs, which offers the hybrid X25519MLKEM768 first.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_env("BLOCKULA_LOG").unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,blockula=info")))
         .with_writer(std::io::stderr)
