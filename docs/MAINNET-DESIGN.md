@@ -1,0 +1,167 @@
+# Blockula mainnet design (protocol v1)
+
+This is the contract for closing the blockers in [MAINNET.md](MAINNET.md). It records the decisions, specifies every consensus-format change, and splits the work into packages. Where it and older docs disagree, this file wins; PLAN.md and MAINNET.md are updated as packages land.
+
+Mainnet is a **new chain**. Nothing here has to replay the current public testnet (`blockula-testnet`, v0.4.x): that chain keeps running its own binary until it's replaced by a testnet on protocol v1. So legacy compatibility branches (for example in the state root) are removed, not extended.
+
+## 1. Decisions
+
+| ID | Decision |
+|---|---|
+| DEC-1 Scope at genesis | Everything that can be made safe is on at genesis: transfers, names, accounts and session keys, Hunts, the contribution pool (Souls, vouches, claims, Séances), permissionless staking with slashing, on-chain governance, the fee market and issuance. Admin levers are replaced by governance (GOV-1..3) and the jury draw by a randomness beacon (CRY-3). |
+| DEC-2 Ghost Mode | Wanted at genesis. Its code ships behind a governance-controlled activation (`ghost` feature flag in state) and is switched on only after its own audit: a soundness bug in a shielded pool is a silent infinite mint. See section 6. |
+| DEC-3 Validator set | Permissionless, stake-ranked, equal-weight votes (Polkadot NPoS style; see 3.4). Genesis target ≥ 21 independent operators, active-set cap 64. See the operator policy in OPERATIONS.md. |
+| DEC-4 Staking | Self-custodial delegation to validator pools (share accounting), min self-bond, 21-day unbonding, slashing for equivocation (heavy) and downtime (light, jail first). |
+| DEC-5 Supply | See [TOKENOMICS.md](TOKENOMICS.md): no sale, founder allocation with on-chain vesting, governed treasury, contribution endowment, tail issuance. |
+| DEC-6 State growth | Creating an account burns a creation fee; names renew yearly; every other record is bonded already. Parameters are governance-adjustable. |
+| DEC-7 Chain id and prefix | Mainnet `blockula-1`, address prefix `boo`. Public testnets use `tboo`. The prefix is a genesis parameter; nodes reject addresses of another prefix. |
+| DEC-8 Wallet domain | A domain the project's entity owns (to be registered), set via `NEXT_PUBLIC_RP_ID`. Never `*.vercel.app` on mainnet. |
+| DEC-9 PQ transport | Launch may precede it (founder's call). The research and the patch plan are in `docs/PQ-TRANSPORT.md`; README and ONE_PAGER say plainly that p2p key exchange is X25519 until it lands. |
+| DEC-10 Admin powers, faucet | No admin keys on mainnet (`validator_admins: []`, enforced by the genesis builder). No faucet. Admin mode survives only for dev and test chains. |
+| DEC-11 Names | One-year registration, renewal at 20% of the price per year, 30-day grace, transfer and release, a genesis reserved list assignable by governance. |
+| DEC-12 Block time | 1 s blocks, 4 MiB cap; base fee per byte adjusts with fullness (3.6). |
+| DEC-13 Voting weight | FANG locked in the vote × conviction. Unvested tokens don't vote. Soul doesn't vote at genesis. |
+| DEC-14 Hosting | No provider, ASN or jurisdiction above ¼ of the active set (always below ⅓). Foundation nodes stay on Fly.io (≤ 3 validators plus the public RPC/sentries) and shrink over time. |
+
+## 2. Engineering rules (every package)
+
+- **Determinism.** No floats, wall clocks, randomness or `HashMap` iteration order in anything that touches state or block validity. Products use `u128`. Every new state record has a canonical binary encoding and is covered by the state root.
+- **Accounting.** All balance changes go through the journaled helpers. `State::check_invariants()` (supply = Σ balances + escrows + stakes + pool; no negative or orphaned records) must hold after every block in tests and the simulator.
+- **Parity.** Every tx type has identical signing bytes in `node/src/types.rs` and `sdk-ts/src/tx.ts`, a shared vector test on both sides, `check_format` bounds, and a plain-English `describe()` summary.
+- **Tests.** `cargo test --manifest-path node/Cargo.toml` passes; consensus-touching work adds a simulator scenario; SDK-touching work passes `npm run build -w @blockula/sdk` and the e2e against `blockula dev`.
+- **Style.** Match the surrounding code: concise, doc comments on public items, the same comment density, no new frameworks where a helper will do.
+- **Scope.** Stay inside your package's files unless the spec says otherwise. Never touch live infrastructure (Fly, npm, GitHub settings), never push.
+
+## 3. Protocol v1 specification
+
+### 3.1 Transactions (Tx v3)
+
+```
+Tx { chain_id, from, nonce, fee, tip, valid_until, action, memo, public_key, signature }
+```
+- Signing bytes: domain `BLOCKULA_TX_V3`, then `chain_id, from, nonce, fee, tip, valid_until`, the action tag and fields, `memo`.
+- `fee` is the most the sender will pay. The tx is charged `base_fee(height) × size + tip`, which must be ≤ `fee`; the base part is burned, the tip goes to the proposer. Until 3.6 lands, `base_fee × size` is `min_fee(size)`.
+- `valid_until` is the last height at which the tx may execute. Admission and execution require `height ≤ valid_until ≤ height + max_validity` (1 hour of blocks). A tx past `valid_until` can never execute, so wallets may report it as expired.
+- **Wire form:** `signing_bytes ‖ public_key (1,952 B) ‖ signature (3,309 B)`. Blocks and mempool gossip carry this form; `Tx::from_bytes` is its strict inverse (no trailing bytes, valid UTF-8, known tags, canonical bools and options). `size()` is its length. JSON stays the API format and rejects unknown fields.
+- Addresses: bech32m with the chain's prefix. Statelessly, an address field accepts any known prefix; at admission `from` and every resolved account must use this chain's prefix.
+
+Action tags 0–29 keep their meaning. New tags are reserved here so packages never collide:
+
+| Tag | Action | Package |
+|---|---|---|
+| 30 | `Delegate { validator, amount }` | P-STAKE |
+| 31 | `Undelegate { validator, shares }` | P-STAKE |
+| 32 | `Redelegate { from_validator, to_validator, shares }` | P-STAKE |
+| 33 | `WithdrawUnbonded {}` | P-STAKE |
+| 34 | `UpdateValidator { commission_bps, p2p_addr, http_addr }` | P-STAKE |
+| 35 | `Unjail { validator }` | P-STAKE |
+| 36 | `ReportEquivocation { evidence }` | P-STAKE |
+| 37 | `BeaconCommit { epoch, commitment }` | P-BEACON |
+| 38 | `BeaconReveal { epoch, secret }` | P-BEACON |
+| 39 | `Propose { kind, deposit, title, url }` | P-GOV |
+| 40 | `Vote { proposal_id, aye, amount, conviction }` | P-GOV |
+| 41 | `Unlock {}` | P-GOV |
+| 42 | `MultisigCreate { owners, threshold }` | P-GOV |
+| 43 | `MultisigPropose { action }` | P-GOV |
+| 44 | `MultisigApprove { id }` | P-GOV |
+| 45 | `RenewName { name, years }` | P-ECON |
+| 46 | `TransferName { name, to }` | P-ECON |
+| 47 | `ReleaseName { name }` | P-ECON |
+| 48 | `ClaimVested {}` (reserved; vesting is lock-based, see 3.7) | P-ECON |
+| 49 | `AttestRevert { claim_id, revert_sha }` | P-BEACON |
+| 50–59 | reserved for Ghost Mode | P-GHOST |
+
+### 3.2 Blocks (CBlock v2)
+
+```
+CBlock { version: u32, parent, height, view: u64, timestamp_ms, proposer, exec_height, exec_root, signal: u32, txs: Vec<wire tx> }
+```
+- Digest domain `BLOCKULA_CBLOCK_V2`.
+- `view` is the simplex view the block was proposed in; verifiers require it to equal the round's view. Executed blocks (`blocks.jsonl`) record it too, so missed leader slots are derivable at execution (3.4).
+- `version` is the protocol version in force at `height` (3.9); `signal` is the newest version the proposer's binary supports (upgrade readiness, display only).
+
+### 3.3 State layer
+
+- Every state map is an `imbl::OrdMap` (structural sharing): cloning `State` is O(1), so the API reads a per-block snapshot without the consensus lock and snapshots don't copy the world.
+- Every record has a canonical binary encoding and a key `(namespace, bytes)`. The state root is the root of an authenticated tree over `BLAKE3(namespace ‖ key) → BLAKE3(value)`, updated incrementally from the keys a block touched. Inclusion and exclusion proofs are served at `/api/proof/...`.
+- Records, tree nodes and the commit point (height, root, block hash, schema version) are written per block in one transaction to an embedded database, after `blocks.jsonl` and `cblocks.bin` are synced and before consensus is acknowledged. Restart loads the database and re-executes at most the blocks after its commit point: restart time no longer depends on history length.
+- The tx index and per-account history live in the database, not in memory.
+- Snapshots stream canonical records; a joiner rebuilds the tree and checks the certified root.
+
+### 3.4 Validators, staking and slashing (CV-2, CV-3, CV-4)
+
+- `RegisterValidator` (permissionless, self-bond ≥ `min_self_bond`) creates a candidate that owns a stake pool. Anyone can `Delegate` to a pool; pools account in shares, so rewards compound and slashes scale every delegator alike. Commission is minted to the owner as shares.
+- At each epoch boundary the next active set is the top `max_validators` candidates by pool stake (not jailed, self-bond ≥ minimum), ties by address, **subject to the churn limit**: at most ⌊(n−1)/3⌋ members replaced per epoch, highest stake first. Votes are equal-weight within the set.
+- `Undelegate`/unbonding lasts `unbonding_blocks` (21 days). Unbonding entries stay slashable for infractions committed before they started.
+- **Equivocation:** nodes capture simplex's conflicting-vote reports and submit `ReportEquivocation` with both signed votes. The chain verifies both against that epoch's set and namespace, slashes the pool `slash_double_sign_bps` (5%), tombstones the validator (never active again), and pays the reporter a share of the slash; the rest is burned.
+- **Downtime:** from each executed block's `view` and its parent's, the views skipped in between had leaders that didn't produce. A validator missing more than `downtime_max_missed` of its last `downtime_window` leader slots is jailed (leaves the set at the next boundary, `slash_downtime_bps` = 0.1%) and may `Unjail` after `jail_blocks`.
+- **Junk blocks (CV-5):** verifiers that are caught up dry-run a proposal's txs on top of their executed state and its unexecuted ancestors and reject blocks containing unadmittable txs. At execution, every skipped tx costs the proposer `base_fee × size` (from its account, then its self-bond).
+- Validator system txs (attestations, beacon, evidence) may name a separate fee payer (the pool owner) so consensus keys only hold a fee float (OPS-1, SF-13).
+
+### 3.5 Governance, treasury, multisig (GOV-1..3, TOK-3, SF-11)
+
+- **No admin keys on mainnet.** Every former admin lever is a proposal kind: `ParamChange`, `TreasurySpend`, `SetRepo`, `GrantSoul` (bounded), `FlagSybil`, `RejectClaim`, `Clawback`, `UnlinkGithub`, `RefundHunt`, `ScheduleUpgrade`, `ActivateFeature` (e.g. Ghost Mode), `Text`.
+- `Propose` bonds `proposal_deposit` (refunded once the proposal reaches quorum; burned if it doesn't). Voting lasts `voting_blocks` (7 days), then a `timelock_blocks` (2 days) queue, then the action executes at end of block. Upgrades and treasury spends above `treasury_large_bps` of the treasury need a ⅔ supermajority; everything else a simple majority. Quorum is `quorum_bps` of unlocked supply.
+- `Vote` locks `amount` of the voter's own unlocked holdings (liquid + staked + unbonding) for `conviction` lock periods; weight = amount × conviction multiplier (0.1× with no lock, then 1×–6× for 1–32 lock periods). Locks overlap, constrain transfers out, and are released by `Unlock` after they expire. Unvested tokens can't vote.
+- The treasury is a keyless system account; only `TreasurySpend` moves funds out.
+- `MultisigCreate` turns an account into an M-of-N multisig of its owner keys: owner-only actions then need `MultisigPropose` plus approvals; session keys keep working within their limits.
+- Hunts: only the creator awards. Governance can refund a hunt's funders; nobody can redirect escrow.
+- Soul: bootstrapped by a published `soul_ledger` in genesis; after that only juries and bounded `GrantSoul` proposals change it.
+
+### 3.6 Fees and issuance (TOK-1, TOK-2)
+
+- **Base fee per byte** for block `h` is fixed when block `h − 17` executes (`MAX_EXEC_LAG + 1`), so every proposer within the lag limit knows it exactly. Target fullness 50% of `MAX_BLOCK_BYTES`, max change 12.5% per block, floor = today's `min_fee` formula. The base part is burned.
+- Proposals order mempool txs by tip per byte; the mempool evicts the lowest tip per byte when full.
+- **Issuance** is minted at each epoch boundary: `supply × rate_ppm(year) / epochs_per_year`, with the rate starting at 6% and decaying 15% a year to a 1.5% floor (integer ppm math). Split 70% to active validators' pools (pro rata to stake, none for jailed or tombstoned validators), 20% to the contribution pool, 10% to the treasury.
+- Account creation burns `account_creation_fee` (0.1 FANG at genesis).
+
+### 3.7 Allocations, vesting and locks (TOK-4, OPS-2)
+
+- Accounts carry `locks: [Lock { id, amount(curve), reason }]`. A vesting lock is a curve (`start`, `cliff`, `end`, `total`): the locked amount at height `h` is the unvested part. Transferable balance = liquid − max(0, max_lock − staked − unbonding). Locked tokens can be staked and delegated, never transferred.
+- `blockula genesis build --spec <spec.toml>` produces a byte-identical `genesis.json` and its hash from reviewed inputs (allocations with vesting, operators with their own keys and proofs of possession, parameters, reserved names, Soul ledger, `faucet: false`, `validator_admins: []` for mainnet). Several parties must reproduce the hash.
+
+### 3.8 Randomness beacon and Proof of Contribution (CRY-3, GOV-3)
+
+- Each active validator commits `BLAKE3(secret)` for epoch `e + 2` during epoch `e` and reveals during `e + 1`. The beacon for `e + 2` is `BLAKE3` of the sorted reveals plus the previous beacon. Validators that commit but don't reveal are jailed and lightly slashed.
+- Séances open only at epoch boundaries on a fixed cadence, seeded from that epoch's beacon; the opening block's proposer has no influence. Leader order for an epoch can also be shuffled from the beacon (SF-1).
+- Validators re-check matured claims for reverts and attest (`AttestRevert`); a quorum rejects the claim and claws back its rewards. Admin rejection is gone.
+
+### 3.9 Upgrades and halts (OPS-3, OPS-5, OPS-6)
+
+- State holds an upgrade schedule `[(version, activation_height)]`, changed only by `ScheduleUpgrade` proposals. `params.version_at(h)` gates behavior. A node whose binary doesn't support the version scheduled at the next height halts cleanly before executing it (exit code, `/api/health` says why) instead of diverging.
+- `--halt-height H` stops after executing `H` (coordinated restarts, incidents).
+- A slashing-protection record (last signed view per epoch) is kept next to the key and checked before signing, so restoring an old volume can't double-sign.
+- On-disk formats carry a schema version and migrations.
+
+### 3.10 Sync trust (CRY-2)
+
+- Releases embed checkpoints (height, block hash, validator-set hash) for known chain ids, and the mainnet genesis hash. `join` requires `--genesis-hash` or a known chain id, and refuses snapshots that contradict an embedded checkpoint.
+- The fast-sync manifest carries a certificate for the epoch anchor (the boundary block before the current epoch), so nothing in it is taken from the peer on trust.
+- The weak-subjectivity period is documented and shorter than unbonding.
+
+## 4. Work packages
+
+| Package | Blockers | Files (owned) | Wave |
+|---|---|---|---|
+| P-WIRE | WAL-5, CV-5 (encoding), SF-3, DEC-7, block v2 | `types.rs`, `crypto.rs`, `consensus.rs` (CBlock), admission in `chain.rs`, `api.rs` submit/gossip, `sdk-ts/src`, `mcp/src`, web compile fixes | 1 |
+| P-OPS | OPS-7, OPS-4, OPS-5 docs, SEC-5, SF-14, OPS-1 docs | `.github/`, `deploy/`, `scripts/`, `rust-toolchain.toml`, `docs/OPERATIONS.md`, `docs/BUG_BOUNTY.md`, `SECURITY.md` | 1 |
+| P-KAT | SEC-2, SEC-3 (harness) | `node/fuzz/`, `node/testdata/`, KAT tests, `sdk-ts/test/kat.ts`, `.github/workflows/crypto.yml` | 1 |
+| P-WALLET | WAL-1..4 (web side) | `web/` | 1 |
+| P-STATE-A | CV-1 (framework, root, encoding) | `chain.rs` state/journal/root, `poc.rs` maps, new `state/` modules, `snapshot.rs` encoding | 1 |
+| P-STATE-B | CV-1 (persistence), CV-6, SEC-4, SF-4, SF-8 | `chain.rs` open/execute, store module, `api.rs` read path, `snapshot.rs` streaming | 2 |
+| P-STAKE | CV-2, CV-3, CV-4, CV-5 (verify, junk charge), SF-13 | new `staking.rs`, `consensus.rs` reporters/verify, `sim.rs` scenarios | 3 |
+| P-GOV | GOV-1, GOV-2, GOV-3 levers, TOK-3, SF-11 | new `governance.rs`, admin paths in `chain.rs`/`poc.rs` | 3 |
+| P-ECON | TOK-1, TOK-2, TOK-4, OPS-2, SF-9, DEC-6 | new `econ.rs`, `genesis.rs`, names in `chain.rs` | 3 |
+| P-BEACON | CRY-3, SF-1, revert attestations | new `beacon.rs`, `poc.rs` seeding, `node.rs` attesters | 3 |
+| P-UPGRADE | OPS-3, OPS-5 (halt), OPS-6 (slashing protection, pruning) | new `upgrade.rs`, `node.rs`, `main.rs` | 3 |
+| P-SYNC | CRY-2 | `epochs.rs`, `snapshot.rs` manifest, `node.rs` join | 3 |
+| P-CLIENTS | WAL-4 (SDK/MCP), new actions in SDK/MCP/CLI | `sdk-ts/`, `mcp/`, CLIs | 3 |
+| P-GHOST | DEC-2 | new `ghost/` | 4 |
+
+## 5. What code can't close
+
+SEC-1 (an external audit), LEG-1..3 (counsel), OPS-1 recruiting and the ceremony itself, the incentivized testnet and the fuzzing soak are calendar work. This branch prepares each: audit scope, counsel brief, ceremony tooling and runbooks.
+
+## 6. Ghost Mode
+
+See `docs/GHOST-MODE.md` (design, proof system choice, audit plan). The module ships disabled; `ActivateFeature { ghost }` turns it on.
