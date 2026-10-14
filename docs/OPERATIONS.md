@@ -320,7 +320,7 @@ Today's testnet binary has no version gating: the testnet is upgraded by redeplo
 
 **Safety failure (SEV-1):** two certificates for different blocks at one height, or nodes reporting different state roots for the same height. Ask every operator to stop their validator at the current height (`--halt-height`, or stop the service), preserve disks and logs, and don't restart until the IC calls it. Equivocation evidence from the consensus journals (`track_historical_votes`) identifies the signers (planned: P-STAKE).
 
-**Key compromise:** the operator stops the validator. With protocol v1, the owner account rotates the consensus key or leaves the set (`UpdateValidator` / unbonding), and the compromised key can't take its stake with it. Report it in the operator channel so others watch for equivocation from that key.
+**Key compromise:** the operator stops the validator at once. In protocol v1 the stake belongs to the cold owner account, so a stolen consensus key can't move it, but it can still equivocate and get the pool slashed. Protocol v1 has no consensus-key rotation: the owner undelegates the self-bond, registers a new validator with a fresh key generated offline, and asks delegators to redelegate (P-STAKE). Report it in the operator channel so others watch for votes from the old key.
 
 **Vulnerability reported privately:** the security lead triages within the SECURITY.md targets, decides severity with the IC, and runs the private patch flow below. Credit and bounty per [BUG_BOUNTY.md](BUG_BOUNTY.md).
 
