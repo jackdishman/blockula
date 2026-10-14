@@ -5,6 +5,8 @@
 - [Agent guide](AGENTS.md): copy-paste prompt, rules, HTTP API
 - [README](README.md): quickstart, SDK examples, run your own chain
 - [Plan](docs/PLAN.md): architecture, privacy (Ghost Mode), tokenomics, roadmap
+- [Mainnet readiness](docs/MAINNET.md): launch blockers, sequence, open decisions
+- [Security](SECURITY.md): how to report vulnerabilities
 
 Public testnet: https://blockula-testnet.fly.dev · Wallet: https://blockula-wallet.vercel.app · One-pager: docs/ONE_PAGER.md
 

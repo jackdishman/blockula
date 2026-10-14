@@ -87,9 +87,19 @@ pub fn parse_fang(s: &str) -> Result<u64> {
     Ok(whole.parse::<u64>()?.checked_mul(DROPS_PER_FANG).ok_or_else(|| anyhow!("amount too large"))? + frac.parse::<u64>()?)
 }
 
+/// A key file: a bare 32-byte hex seed (validator.key), or JSON with a `seed` field (the output of
+/// `blockula keygen`, or a CLI wallet's wallet.json).
 pub(crate) fn load_seed(path: &Path) -> Result<Keys> {
-    let seed = hex::decode(std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?.trim())?;
-    Ok(Keys::from_seed(seed.try_into().map_err(|_| anyhow!("{} must hold a 32-byte hex seed", path.display()))?))
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let text = text.trim();
+    let hex_seed = if text.starts_with('{') {
+        let v: Value = serde_json::from_str(text).with_context(|| format!("{} isn't valid JSON", path.display()))?;
+        v["seed"].as_str().map(String::from).ok_or_else(|| anyhow!("{} has no \"seed\" field", path.display()))?
+    } else {
+        text.to_string()
+    };
+    let seed = hex::decode(&hex_seed).map_err(|_| anyhow!("{} must hold a 32-byte hex seed (or keygen JSON)", path.display()))?;
+    Ok(Keys::from_seed(seed.try_into().map_err(|_| anyhow!("{} must hold a 32-byte hex seed (or keygen JSON)", path.display()))?))
 }
 
 pub(crate) fn rt() -> Result<tokio::runtime::Runtime> {
@@ -333,6 +343,26 @@ pub fn wallet(cmd: WalletCmd, dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--key` takes a bare hex seed, `blockula keygen` JSON (e.g. the testnet admin.json), or a
+    /// wallet.json, and they all load the same key.
+    #[test]
+    fn key_files_accept_hex_and_keygen_json() {
+        let k = Keys::generate();
+        let dir = std::env::temp_dir().join(format!("blockula-keyfile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bare = dir.join("validator.key");
+        std::fs::write(&bare, format!("{}\n", k.seed_hex())).unwrap();
+        let json = dir.join("admin.json");
+        std::fs::write(&json, serde_json::json!({ "address": k.address(), "seed": k.seed_hex() }).to_string()).unwrap();
+        assert_eq!(load_seed(&bare).unwrap().address(), k.address());
+        assert_eq!(load_seed(&json).unwrap().address(), k.address());
+        std::fs::write(&json, r#"{"address":"boo1x"}"#).unwrap();
+        assert!(load_seed(&json).err().unwrap().to_string().contains("seed"));
+        std::fs::write(&bare, "not hex").unwrap();
+        assert!(load_seed(&bare).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// `--rpc https://…` must work for the CLI (wallet, validator register/approve).
     #[test]

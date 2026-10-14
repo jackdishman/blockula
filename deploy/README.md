@@ -43,6 +43,7 @@ Options (env vars):
 | Start a brand-new testnet (wipes chain data) | `RESET=1 deploy/launch.sh` |
 | Logs | `fly logs -a blockula-v0` |
 | Status | `curl https://blockula-testnet.fly.dev/api/status` |
+| Give validators a GitHub token (contribution claims, link checks) | `pbpaste \| deploy/set-github-token.sh` (fine-grained, public-read-only token; restarts apps one at a time) |
 | Approve a validator | `node/target/release/blockula validator approve <boo1…> --key ~/.config/blockula/admin.json --rpc https://blockula-testnet.fly.dev` |
 | Add one of *our* validators later | `fly apps create`, a volume and a dedicated IPv4, then the normal "Become a validator" flow (register + approve). No new genesis needed |
 

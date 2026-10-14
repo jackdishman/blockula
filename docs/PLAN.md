@@ -61,7 +61,7 @@ Native account abstraction (Phase 1). Each account holds a list of authorized ke
 - **Covens:** teams claiming Hunts together, with the payout split recorded on-chain and shared streaks. **Seasons** (Season 1: October) with leaderboards ranked by Soul, not tokens.
 - **Profiles** in the explorer: merged PRs, Soul, who vouched for whom.
 
-### Status: Hunts v0 and Proof of Contribution v1 are built
+### Status: Hunts v0 and Proof of Contribution v1 are live on the testnet
 **Hunts**
 - `create_hunt` escrows a bounty on a GitHub issue (min 10 FANG, ≤ ~1 year). `fund_hunt` lets anyone add to it. `award_hunt` (creator or Season 0 admin) pays it out once and records the PR; self-awards are allowed but flagged. `cancel_hunt` (creator after expiry, admin any time) refunds every funder exactly what they put in.
 - `blockula hunt award <id> --pr <n>` checks on GitHub that the PR merged into the hunt's repo, looks up the account its author linked, confirms, and signs the award (`--to` names a recipient instead, `--familiar` credits their agent). `hunt list|show|create|fund|cancel` cover the rest.
@@ -163,7 +163,7 @@ Next:
 | 1 | Multi-validator BFT (Commonware) ✅, p2p ✅, `join` ✅ (snapshot sync next), epochs + on-chain validator onboarding (Season 0 allowlist) ✅, public networking + HTTP hardening ✅, account abstraction + session keys ✅, passkey web wallet ✅ (blockula-wallet.vercel.app), public testnet on Fly.io ✅ (blockula-testnet.fly.dev), npm `@blockula/sdk` + `@blockula/mcp` ✅, internal security/product review + fixes ✅, CLI wallet ✅, health/metrics ✅. certified snapshots + fast sync ✅. Remaining: a standalone indexer | mostly done |
 | 1.5 | GitHub linking ✅ (on-chain claim + node-side gist check), Hunts v0 ✅ (escrow, crowdfunding, award/cancel/refund on-chain, `blockula hunt award` checks the merge), Familiars ✅ (registered agent session keys credited on awards and allowed to claim), validator-attested GitHub facts ✅, MCP contribution tools ✅. Remaining: acceptance-test Hunts | mostly done |
 | 2 | Proof of Contribution v1 ✅: Souls, vouching, claims, Séances (commit-reveal pairwise juries), contribution pool with √-per-sponsor payouts, vesting and clawback. Remaining: a juror UI in the web wallet, Covens and Seasons, jury-run sybil flags and revert checks (replacing the Season 0 admin levers), Ghost Mode + viewing keys, The Crypt, proof aggregation | in progress |
-| 3 | Permissionless staking/slashing (replaces the Season 0 allowlist), tokenomics live, governance (conviction voting, repo budgets, fork royalties), audits, mainnet | |
+| 3 | Permissionless staking/slashing (replaces the Season 0 allowlist), tokenomics live, governance (conviction voting, repo budgets, fork royalties), audits, mainnet. The full gap analysis, blockers and sequence are in [MAINNET.md](MAINNET.md) | |
 | 4 | WASM/RISC-V contracts, light clients, STARK signature aggregation | |
 
 ## Known limits

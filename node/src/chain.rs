@@ -1295,6 +1295,8 @@ pub struct Chain {
     pub base: Option<Base>,
     /// Latest tip each HTTP peer *claims* (display-only; never trusted for anything else).
     claims: HashMap<String, u64>,
+    /// Set while a snapshot is being written, so slow disks can't pile up writer threads.
+    snapshot_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The certified snapshot a fast-synced node started from (`base.json` + `base.state.zst`).
@@ -1463,6 +1465,7 @@ impl Chain {
             epochs: crate::epochs::EpochRegistry::genesis(&genesis_for_epochs),
             base: base.clone(),
             claims: HashMap::new(),
+            snapshot_busy: Default::default(),
         };
         if let Some(b) = &base {
             chain.height = b.height;
@@ -1485,6 +1488,13 @@ impl Chain {
             if line.trim().is_empty() {
                 offset += n as u64;
                 continue;
+            }
+            // A crash mid-append can leave a torn last line. That block was never acknowledged to
+            // consensus (blocks.jsonl is synced first), so drop it: it's delivered again.
+            if !line.ends_with('\n') && serde_json::from_str::<Block>(&line).is_err() {
+                tracing::warn!(offset, bytes = n, "dropping a torn last line in blocks.jsonl (crash during a write)");
+                OpenOptions::new().write(true).open(&path)?.set_len(offset)?;
+                break;
             }
             let block: Block = serde_json::from_str(&line)?;
             chain.replay(block, offset)?;
@@ -1824,11 +1834,17 @@ impl Chain {
 
     /// Writes a snapshot of the current state in the background.
     fn take_snapshot(&self) {
-        let (home, height, root, state) = (self.home.clone(), self.height, self.state.root(), self.state.clone());
+        use std::sync::atomic::Ordering;
+        if self.snapshot_busy.swap(true, Ordering::AcqRel) {
+            tracing::warn!(height = self.height, "skipping a snapshot: the previous one is still being written");
+            return;
+        }
+        let (home, height, root, state, busy) = (self.home.clone(), self.height, self.state.root(), self.state.clone(), self.snapshot_busy.clone());
         std::thread::spawn(move || {
             if let Err(e) = crate::snapshot::write(&home, height, &root, &state) {
                 tracing::warn!(height, error = %e, "snapshot failed");
             }
+            busy.store(false, Ordering::Release);
         });
     }
 
@@ -2090,6 +2106,36 @@ mod tests {
         let c = Chain::open(&home).unwrap();
         assert_eq!(c.height(), 2);
         assert_eq!(c.state.primary_name(&alice.address()).unwrap(), "alice.boo");
+        fs::remove_dir_all(home).ok();
+    }
+
+    /// A crash mid-append leaves a torn last line; the node drops it and starts, instead of
+    /// needing manual repair. A corrupt line in the middle still refuses to start.
+    #[test]
+    fn torn_last_line_in_blocks_jsonl_is_dropped() {
+        let home = std::env::temp_dir().join(format!("blockula-torn-{}-{}", now_ms(), std::process::id()));
+        Chain::summon(&home, &SummonOpts::new("torn", 1)).unwrap();
+        let alice = Keys::from_seed([1u8; 32]);
+        let root = {
+            let mut c = Chain::open(&home).unwrap();
+            c.faucet(&alice.address(), 50 * DROPS_PER_FANG).unwrap();
+            c.produce_block().unwrap();
+            c.produce_block_with(vec![]).unwrap();
+            c.state.root()
+        };
+        let log = home.join("blocks.jsonl");
+        let good = fs::read(&log).unwrap();
+        let mut f = OpenOptions::new().append(true).open(&log).unwrap();
+        f.write_all(br#"{"height":3,"prev_hash":"ab"#).unwrap();
+        drop(f);
+        let c = Chain::open(&home).unwrap();
+        assert_eq!((c.height(), c.state.root()), (2, root));
+        assert_eq!(fs::read(&log).unwrap(), good, "the torn tail was truncated");
+        drop(c);
+        let mut bad = b"{not json}\n".to_vec();
+        bad.extend_from_slice(&good);
+        fs::write(&log, bad).unwrap();
+        assert!(Chain::open(&home).is_err());
         fs::remove_dir_all(home).ok();
     }
 

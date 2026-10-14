@@ -23,4 +23,4 @@ People with Soul can serve on juries (`blockula contrib join-jury`), which earns
 - Volume doesn't pay: rewards are square-rooted per sponsor and vest with clawback. One solid PR beats ten small ones.
 
 ## Security
-Please report vulnerabilities privately via GitHub Security Advisories on this repo rather than in a public issue.
+Please report vulnerabilities privately via GitHub Security Advisories on this repo rather than in a public issue. See [SECURITY.md](SECURITY.md) for scope and what to expect.

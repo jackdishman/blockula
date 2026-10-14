@@ -202,9 +202,9 @@ sdk-ts/   @blockula/sdk: wallets, tx signing, client, passkey (WebAuthn PRF) hel
 mcp/      @blockula/mcp: MCP server for coding agents
 web/      Passkey web wallet (Next.js), deployed at blockula-wallet.vercel.app
 deploy/   Fly.io testnet: Dockerfile, entrypoint, launch.sh
-docs/     ONE_PAGER.md (what this is), PLAN.md (architecture, tokenomics, roadmap)
+docs/     ONE_PAGER.md (what this is), PLAN.md (architecture, tokenomics, roadmap), MAINNET.md (launch readiness)
 ```
 
 ## Status
 
-Public testnet live (Phase 1), Hunts and Proof of Contribution v1 built (Phases 1.5–2). An internal four-track security and product review was completed and its findings fixed. **No third-party audit yet: test value only.** See [docs/PLAN.md](docs/PLAN.md).
+Public testnet live (Phase 1), with Hunts and Proof of Contribution v1 (Phases 1.5–2). An internal four-track security and product review was completed and its findings fixed. **No third-party audit yet: test value only.** See [docs/PLAN.md](docs/PLAN.md), and [docs/MAINNET.md](docs/MAINNET.md) for what stands between this and a mainnet. Report vulnerabilities privately: [SECURITY.md](SECURITY.md).
