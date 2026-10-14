@@ -24,7 +24,7 @@ Legal review, the post-quantum handshake, supply-chain hardening and wallet reco
 | Public testnet | Runs v0.4.0 (`b1f9614`), with the contribution pool active (one repo, 10,001 FANG). Its genesis was created 2026-10-14 12:19 UTC, so the longest continuous run on the current chain is a few hours (height ~11.3k when checked). |
 | Operators | 4 validators in one Fly.io org, in 4 regions. Every validator key and the one admin key were generated on one laptop (`deploy/launch.sh:44,71`). Nakamoto coefficient: 1. |
 | Supply | 1.1B FANG: 250M on each validator's hot consensus key, 100M on the keyless treasury (live `/api/genesis`; `chain.rs:1370-1372`). |
-| Tests | Unit tests, 3 deterministic simulator scenarios (`sim.rs`: crash and recover, onboarding, fast sync) and a 4-validator smoke test (`scripts/local-testnet.sh`). No fuzzing, property tests or Byzantine scenarios. |
+| Tests | Unit tests, 3 deterministic simulator scenarios (`sim.rs`: crash and recover, onboarding, fast sync) and a 4-validator smoke test (`scripts/local-testnet.sh`). No fuzzing, property tests or Byzantine scenarios. ✅ Since: fuzzing, property tests and invariant checks after every test block (SEC-3); still no Byzantine scenarios. |
 | Review | Internal four-track review only (README.md "Status", docs/ONE_PAGER.md:32). |
 
 ## 2. Launch blockers
@@ -59,11 +59,11 @@ Legal review, the post-quantum handshake, supply-chain hardening and wallet reco
 | OPS-5 | No incident response; no exit from a deterministic halt | M | Team, Operators |
 | OPS-6 | Backups, disk growth, double-sign protection | M | Team, Operators |
 | OPS-7 | Builds aren't reproducible or signed; open supply chain | M | Team |
-| WAL-1 | Passkey path has no browser tests | M | Team |
+| ✅ WAL-1 | Passkey path has no browser tests | M | Team |
 | WAL-2 | No account recovery | L | Team |
 | WAL-3 | Web wallet origin security | M | Team, Auditor |
 | WAL-4 | Clients trust one RPC and can switch networks silently | S–M | Team, Operators |
-| WAL-5 | Signed txs never expire | S | Team |
+| ✅ WAL-5 | Signed txs never expire | S | Team |
 | LEG-1 | Token status and distribution | L | Counsel |
 | LEG-2 | Paying people for GitHub work | M | Counsel |
 | LEG-3 | Names, trademarks, personal data on chain | S–M | Counsel, Team |
@@ -88,6 +88,7 @@ Legal review, the post-quantum handshake, supply-chain hardening and wallet reco
   - SEC-1's scope explicitly covers our use of both libraries, or we switch to audited ones.
   - Crypto dependencies are pinned to exact versions.
 - **Effort:** M. **Who:** Team, Auditor.
+- ✅ **Wave 1:** ACVP and Wycheproof KATs for both implementations, Rust ⇄ TS cross vectors (v3 txs and their wire form, votes, PoP, handoff, `tboo` addresses) and exact pins, in CI (`.github/workflows/crypto.yml`; `kat.rs`, `sdk-ts/test/kat.ts`). Pending: the audit (SEC-1).
 
 **SEC-3. No fuzzing, invariant checks or Byzantine tests.**
 - **Missing:**
@@ -100,6 +101,7 @@ Legal review, the post-quantum handshake, supply-chain hardening and wallet reco
   - Conservation and nonce invariants are asserted after every block in the simulator.
   - Simulator scenarios use Commonware's deterministic runtime and simulated network to cover an equivocating leader, a wrong `exec_root`, junk-tx blocks (CV-5), withheld votes, partitions and clock skew.
 - **Effort:** L. **Who:** Team.
+- ✅ **Wave 1:** `node/fuzz` (8 targets: blocks, tx JSON and wire form, manifests, state records, sync batches, epoch registries, certificates; nightly in CI). Its two findings, FUZZ-1 and FUZZ-2 (epoch-0 panics in fast sync and in the epoch exchange), are fixed with regression tests. `State::check_invariants` runs after every block in tests and the simulator, plus property tests over random tx sequences. Pending: the 2-week soak, a state-machine fuzz target, the Byzantine scenarios.
 
 **SEC-4. Public HTTP reads can stall consensus.**
 - **Missing:**
@@ -121,7 +123,7 @@ Legal review, the post-quantum handshake, supply-chain hardening and wallet reco
 
 **SEC-5. No vulnerability disclosure program.**
 - **Missing:** CONTRIBUTING.md "Security" points to GitHub Security Advisories, and that's all. There's no SECURITY.md, no contact, no response timeline and no bounty.
-- **Done when:** a SECURITY.md gives scope, contact and timelines, and a funded bounty (self-run or through a platform) has been live on the incentivized testnet for at least a month before genesis. ✅ SECURITY.md exists (private advisories, response targets, testnet safe harbor); the bounty doesn't yet.
+- **Done when:** a SECURITY.md gives scope, contact and timelines, and a funded bounty (self-run or through a platform) has been live on the incentivized testnet for at least a month before genesis. ✅ SECURITY.md exists (private advisories, response targets, testnet safe harbor), and the program is written (docs/BUG_BOUNTY.md: scope, severities, safe harbor, disclosure). Pending: funding it and running it on the incentivized testnet.
 - **Effort:** S, plus a bounty budget. **Who:** Team.
 
 ### Cryptography & networking
@@ -181,6 +183,7 @@ Legal review, the post-quantum handshake, supply-chain hardening and wallet reco
   - Accounts, names and other records pay deposits or rent (DEC-6).
   - A benchmark at 10M accounts shows execute plus commit well under the block time on the reference validator spec.
 - **Effort:** XL. It's new storage and a new root, every module migrates, and it must land before the audit. **Who:** Team.
+- ✅ **Wave 1 (framework):** state maps are tracked `imbl` maps (O(1) clone), every record has a canonical borsh encoding, and the root is a sparse Merkle tree updated per block from the touched keys, with inclusion and exclusion proofs (`state/`). Snapshots are canonical records, decoded as a stream. Pending (P-STATE-B): persistence and restart without replay, the tx index on disk, `/api/proof`, deposits (DEC-6), the 10M-account benchmark.
 
 **CV-2. One vote per validator, and validators are an admin allowlist.** (known)
 - **Missing:** the quorum counts validators (`pq.rs:243-251`, `quorum::<N3f1>()`). The bond weights nothing. Validators join only through `approve_validator` (`chain.rs:820-831`). PLAN.md "Roadmap" lists permissionless staking for Phase 3.
@@ -216,6 +219,7 @@ Legal review, the post-quantum handshake, supply-chain hardening and wallet reco
 - **Why it blocks:** a leader can fill each of its blocks, up to 4 MiB (`consensus.rs:51`), with txs that never pay. With 32 validators, one bad validator adds ~10 GB a day that every node stores.
 - **Done when:** verifiers apply the proposal on top of their executed state plus not-yet-executed ancestors, as `propose` already does (`consensus.rs:288-330`), and reject blocks with unadmittable or non-canonical txs. Or such blocks become slashable. Covered by a simulator test with a junk-filling leader.
 - **Effort:** M. **Who:** Team.
+- ✅ **Encoding half (wave 1):** blocks carry canonical wire-form txs and tx JSON rejects unknown fields, so padding is gone. Pending: verify-side replay and the junk-tx charge (P-STAKE).
 
 **CV-6. Crash-safety gaps.**
 - **Missing:**
@@ -227,6 +231,8 @@ Legal review, the post-quantum handshake, supply-chain hardening and wallet reco
 - **Done when:** crash-injection tests (a kill at every write point, plus Commonware's deterministic storage faults) restart unaided, and each block commits atomically (this part folds into CV-1).
 - **Effort:** S for the torn line now, M as part of CV-1. **Who:** Team.
 - ✅ **Torn last line:** `Chain::open` now drops a torn, unparseable final line (that block was never acknowledged to consensus) and starts; a corrupt line elsewhere still refuses to start.
+
+✅ **Verify contract.** `verify` voted against valid blocks when it hadn't executed the cited checkpoint within ~3 block times, or couldn't look up the cited root (`consensus.rs:367-389`). It now returns `false` only for permanently invalid blocks and otherwise stays pending (MAINNET-DESIGN 3.2; test `lagging_verifier_waits_instead_of_rejecting`).
 
 ### Token economics & distribution
 
@@ -349,6 +355,7 @@ Legal review, the post-quantum handshake, supply-chain hardening and wallet reco
   - Every operator runs it.
   - There's a public status page and an on-call rotation with escalation.
 - **Effort:** M. **Who:** Team, Operators.
+- ✅ **Reference stack (wave 1):** `deploy/monitoring` (Prometheus, Alertmanager, Grafana, node_exporter) with promtool-tested alerts for head age, halts, execution lag, mempool, restarts, certificate vs quorum, disk, memory and clock skew. Pending: peer and missed-slot metrics, every operator running it, a status page and on-call.
 
 **OPS-5. No incident response, and no way out of a deterministic halt.**
 - **Missing:**
@@ -395,10 +402,11 @@ Legal review, the post-quantum handshake, supply-chain hardening and wallet reco
   - npm uses trusted publishing with provenance and 2FA, and crypto dependencies use exact versions.
   - CI runs dependency audits, with Renovate or Dependabot.
 - **Effort:** M. **Who:** Team.
+- ✅ **Wave 1:** pinned toolchain (1.98.1), images by digest and actions by SHA with least-privilege tokens (`scripts/check-pins.sh` in CI), reproducible release builds with an in-CI reproducer, SLSA provenance, an offline ML-DSA release signature that `install.sh` verifies, npm trusted publishing, exact crypto pins, cargo-deny, npm audit, Dependabot. Pending: independent builders reproducing a real release, and `install_node` (MCP) checking the signature.
 
 ### Wallets & clients
 
-**WAL-1. The passkey path has no browser tests.** (known)
+✅ **WAL-1. The passkey path has no browser tests.** (known)
 - **Missing:** PLAN.md "Known limits" says passkey.ts "typechecks but hasn't been exercised in a real browser yet", yet the deployed wallet calls it (`web/lib/keys.ts:24-33`). PRF support differs by platform. The key comes from one fixed PRF salt (`sdk-ts/src/passkey.ts:10`), so every device a passkey syncs to holds the same wallet key.
 - **Done when:**
   - Playwright tests run against a virtual authenticator with PRF.
@@ -406,6 +414,7 @@ Legal review, the post-quantum handshake, supply-chain hardening and wallet reco
   - The SDK and wallet share derivation test vectors.
   - Behavior without PRF is documented.
 - **Effort:** M. **Who:** Team.
+- ✅ **Done (wave 1):** Playwright on production builds with a PRF virtual authenticator (`web/e2e`, in CI), shared PRF → key vectors (`sdk-ts/test/passkey-vectors.json`), no-PRF behavior and the manual release matrix in `web/README.md` (recorded per release).
 
 **WAL-2. No account recovery.**
 - **Missing:** PLAN.md "Accounts" promises SLH-DSA recovery keys, guardians and a password fallback. None exist: `crypto.rs` is ML-DSA only, and the wallet's only safeguard is linking another device ahead of time (`web/app/devices/page.tsx`).
@@ -426,6 +435,7 @@ Legal review, the post-quantum handshake, supply-chain hardening and wallet reco
   - Local-key mode is off on mainnet.
   - The wallet is in audit scope.
 - **Effort:** M. **Who:** Team, Auditor.
+- ✅ **Code side (wave 1):** per-request nonce CSP (`strict-dynamic`), security headers, SRI on the framework chunks, local keys off on mainnet, and a mainnet build that refuses a shared-hosting rpId or missing pins (`web/proxy.ts`, `web/next.config.ts`, `web/lib/config.ts`). Pending: the domain (DEC-8), a locked-down production project, the audit.
 
 **WAL-4. Clients trust one RPC and can switch networks silently.**
 - **Missing:**
@@ -441,12 +451,14 @@ Legal review, the post-quantum handshake, supply-chain hardening and wallet reco
   - Every screen shows the network.
   - A distinct testnet address prefix has been decided (DEC-7).
 - **Effort:** S–M. **Who:** Team, Operators.
+- ✅ **Wave 1:** the wallet pins chain id, genesis hash and prefix per network and stamps the network on every screen; addresses carry the chain's prefix (`boo`/`tboo`, enforced at admission). Pending: the MCP's network handling, 3 mainnet RPC operators.
 
-**WAL-5. Signed txs never expire.**
+✅ **WAL-5. Signed txs never expire.**
 - **Missing:** a tx has no validity window (`types.rs:179-194`). The mempool drops a tx after 600 blocks, and `/api/tx` then reports it as "failed … expired" (`chain.rs:1888-1890`). But the signed tx stays valid until its nonce is used, so anyone who saw it can submit it later.
 - **Why it blocks:** a wallet or agent tells the user a payment failed, and it goes through hours later. Adding a field changes the signing bytes, so it has to happen before genesis.
 - **Done when:** a `valid_until` height is in the signing bytes, byte-identical in Rust and TS (`types.rs` ⇄ `sdk-ts/src/tx.ts`), and enforced at admission and execution. Wallets say "expired" only when the tx can no longer execute.
 - **Effort:** S. **Who:** Team.
+- ✅ **Done (wave 1):** Tx v3 signs `valid_until` on both sides; admission and execution require `height ≤ valid_until ≤ height + an hour of blocks`, and the node reports "expired" only past `valid_until`.
 
 ### Legal & compliance
 
@@ -486,10 +498,11 @@ Legal review, the post-quantum handshake, supply-chain hardening and wallet reco
 - **Done when:** operator docs require NTP, skew has a metric and an alert, and the tolerance is set using a simulator test with skewed clocks.
 - **Effort:** S.
 
-**SF-3. Binary tx and block encoding.**
+✅ **SF-3. Binary tx and block encoding.**
 - **Missing:** txs travel and are stored as hex JSON (`consensus.rs:71-86, 312`). That's about twice the binary size fees are priced on (`types.rs:592-594`), and the JSON isn't canonical (CV-5).
 - **Done when:** a canonical binary encoding replaces it. This is a consensus format: change it before the freeze or live with it.
 - **Effort:** M.
+- ✅ **Done (wave 1):** the Tx v3 wire form (`Tx::to_bytes`, strict `Tx::from_bytes`) in CBlock v2 blocks and gossip; fees price its length; JSON stays the API format.
 
 **SF-4. Execution holds the global lock through fsync and mempool revalidation.**
 - **Missing:** `execute` appends and fsyncs two files, recomputes the root and re-applies up to 5,000 mempool txs (`chain.rs:1735-1782, 1874-1905`). Every API call and every consensus verify waits for it.
@@ -541,10 +554,11 @@ Legal review, the post-quantum handshake, supply-chain hardening and wallet reco
 - **Done when:** the attestation fee payer is configurable (or attestations are fee-free with a cap), and each operator's token handling is documented.
 - **Effort:** S.
 
-**SF-14. Operator documentation.**
+✅ **SF-14. Operator documentation.**
 - **Missing:** there's no reference hardware spec, port and firewall guide, NTP requirement, disk sizing or sentry setup.
 - **Done when:** all of those are documented and the commands work.
 - **Effort:** S–M.
+- ✅ **Done (wave 1):** docs/OPERATIONS.md (hosting, hardware, bandwidth, disk sizing, ports and firewall, time, sentries, keys, upgrades, incidents, runbooks).
 
 **SF-15. The explorer has no CSP.**
 - **Missing:** the explorer is served from the API's origin (`api.rs:259`). It escapes on-chain strings consistently (`esc()` in `explorer.html`), but sets no CSP.
