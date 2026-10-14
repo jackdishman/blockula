@@ -254,7 +254,7 @@ impl State {
             t.take_changes(n, &mut records);
         }
         let mut updates: Vec<(Hash, Option<Hash>)> = records.iter().map(|r| (tree::key_hash(r.namespace, &r.key), r.value.as_deref().map(tree::value_hash))).collect();
-        updates.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        updates.sort_unstable_by_key(|(k, _)| *k);
         let root = self.tree.update(&updates)?;
         Ok(Commit { root, records })
     }
@@ -264,7 +264,7 @@ impl State {
     pub fn full_root(&self) -> Hash {
         let mut leaves = Vec::with_capacity(self.record_count());
         self.for_each_record(|n, k, v| leaves.push((tree::key_hash(n, k), tree::value_hash(v))));
-        leaves.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        leaves.sort_unstable_by_key(|(k, _)| *k);
         tree::root_of(&leaves)
     }
 
@@ -293,7 +293,7 @@ impl State {
         }
         let expected: Vec<(Vec<u8>, Vec<u8>)> = state.meta_records().into_iter().map(|(k, v)| (k.to_vec(), v)).collect();
         ensure!(scalars == expected, "missing or non-canonical scalar records");
-        leaves.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        leaves.sort_unstable_by_key(|(k, _)| *k);
         state.tree.update(&leaves)?;
         Ok(state)
     }

@@ -39,6 +39,13 @@ impl<K: Ord + std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for TMap<K, V
     }
 }
 
+/// Same JSON as the `BTreeMap` it replaced (API shapes don't change).
+impl<K: Ord + serde::Serialize, V: serde::Serialize> serde::Serialize for TMap<K, V> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.map.serialize(s)
+    }
+}
+
 impl<K, V> Deref for TMap<K, V> {
     type Target = OrdMap<K, V>;
     fn deref(&self) -> &OrdMap<K, V> {
@@ -205,6 +212,13 @@ mod tests {
         j.restore(&mut m);
         assert_eq!(m.get("c"), Some(&6));
         assert!(m.is_dirty("c"));
+    }
+
+    #[test]
+    fn json_matches_a_btreemap() {
+        let m: TMap<u64, String> = [(2, "b".to_string()), (1, "a".to_string())].into_iter().collect();
+        let b: std::collections::BTreeMap<u64, String> = m.iter().map(|(k, v)| (*k, v.clone())).collect();
+        assert_eq!(serde_json::to_string(&m).unwrap(), serde_json::to_string(&b).unwrap());
     }
 
     #[test]

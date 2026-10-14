@@ -224,7 +224,7 @@ impl NodeKey {
     }
 
     /// Binary form: `depth ‖ prefix[..⌈depth/8⌉]`. Byte order sorts parents before children.
-    pub fn to_bytes(&self) -> Vec<u8> {
+    pub fn to_bytes(self) -> Vec<u8> {
         let mut out = vec![self.depth];
         out.extend_from_slice(&self.prefix[..(self.depth as usize).div_ceil(8)]);
         out
@@ -294,7 +294,7 @@ impl Smt {
     /// Node changes not yet in the base store, in key order (`None`: delete).
     pub fn pending_changes(&self) -> Vec<(NodeKey, Option<Node>)> {
         let mut v: Vec<(NodeKey, Option<Node>)> = self.overlay.iter().map(|(k, n)| (*k, n.as_deref().copied())).collect();
-        v.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        v.sort_unstable_by_key(|(k, _)| *k);
         v
     }
 
@@ -369,10 +369,10 @@ impl Smt {
                 Ok(self.build(depth, prefix, &leaves))
             }
             Child::Leaf { key, value } => {
-                if let [(k, Some(v))] = ups {
-                    if (*k, *v) == (key, value) {
-                        return Ok(child);
-                    }
+                if let [(k, Some(v))] = ups
+                    && (*k, *v) == (key, value)
+                {
+                    return Ok(child);
                 }
                 // A lone leaf has no stored nodes below it: merge and build the subtree afresh.
                 let mut leaves: Vec<(Hash, Hash)> = ups.iter().filter_map(|(k, v)| v.map(|v| (*k, v))).collect();
