@@ -117,7 +117,7 @@ impl Machine<'_> {
         }
     }
 
-    /// Sets register columns `cols` of `row` to `value`, then applies cheats there.
+    /// Sets the cells of `row` from column `start` to `value`, then applies cheats there.
     fn set(&mut self, row: usize, start: usize, value: &[F]) {
         self.rows[row][start..start + value.len()].copy_from_slice(value);
         self.cheat(row, start..start + value.len());
@@ -166,6 +166,10 @@ fn first8(x: &[F; 16]) -> [F; 8] {
     x[..8].try_into().expect("8")
 }
 
+/// Spend register columns: `REG_NK..=DUMMY` (nk, cm, the two accumulators, the dummy flag).
+const REGS: usize = DUMMY + 1 - REG_NK;
+const _: () = assert!(REG_CM == REG_NK + 8 && PACC_LO == REG_CM + 8 && DUMMY == PACC_HI + 1);
+
 /// Register columns of a spend block. A cheat on a register cell holds from its row to the end
 /// of the block, overriding the definition (a prover choosing another value), so the
 /// definition and carry constraints are what must catch it.
@@ -176,9 +180,9 @@ struct Regs {
     /// Honest position accumulators at the current row.
     pacc: [F; 2],
     /// Overrides of the register cells, indexed by column − REG_NK.
-    over: [Option<F>; PACC_LO - REG_NK + 3],
+    over: [Option<F>; REGS],
     /// Value of every register cell and whether it was overridden, per row of the block.
-    rows: Vec<[(F, bool); PACC_LO - REG_NK + 3]>,
+    rows: Vec<[(F, bool); REGS]>,
 }
 
 impl Regs {
@@ -188,7 +192,7 @@ impl Regs {
             cm: None,
             dummy: F::from_bool(dummy),
             pacc: [F::ZERO; 2],
-            over: [None; PACC_LO - REG_NK + 3],
+            over: [None; REGS],
             rows: Vec::new(),
         }
     }
@@ -206,7 +210,7 @@ impl Regs {
 
     /// Picks up register cheats at `row`.
     fn enter(&mut self, m: &Machine, row: usize) {
-        for ch in m.cheats.iter().filter(|c| c.row == row && (REG_NK..=PACC_HI).contains(&c.col)) {
+        for ch in m.cheats.iter().filter(|c| c.row == row && (REG_NK..=DUMMY).contains(&c.col)) {
             // Accumulators shift; constant registers take the value.
             let v = match ch.col {
                 PACC_LO | PACC_HI => ch.value - self.honest(ch.col),
