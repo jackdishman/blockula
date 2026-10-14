@@ -51,3 +51,8 @@ Options (env vars):
 - Upgrades redeploy validators in parallel, so block production pauses briefly.
 - Each validator app must stay at exactly **one machine** (`--ha=false`). Never `fly scale count`, clone a validator machine, or restore a volume snapshot: two copies of a validator key double-sign. The entrypoint and node guard against the common cases, but don't rely on that.
 - If a validator's volume is lost, its key is gone from Fly by design. Re-seed it deliberately from your local backup (`printf 'VALIDATOR_KEY_B64=…' | fly secrets import -a blockula-vN`), then re-run launch.sh.
+
+## Monitoring and operations
+
+- [`monitoring/`](monitoring/README.md): the reference Prometheus, Alertmanager and Grafana stack every operator runs, with alert rules and a dashboard.
+- [docs/OPERATIONS.md](../docs/OPERATIONS.md): hardware, ports, time, sentries, keys and restores, upgrades, incident response, runbooks and releases. Mainnet validators follow it rather than this testnet setup (one org, keys generated on one laptop).

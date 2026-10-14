@@ -13,7 +13,7 @@ Include what you found, how to reproduce it (a deterministic repro, such as a fa
 - The node (`node/`): consensus integration, block and tx validation, state transitions (`chain.rs`, `poc.rs`), p2p, sync and snapshots, the HTTP API and explorer, the CLI.
 - Cryptography and its use: ML-DSA-65 signing and verification, address and key-id derivation, the Rust ⇄ TypeScript tx encoding (`node/src/types.rs` ⇄ `sdk-ts/src/tx.ts`), passkey key derivation (`sdk-ts/src/passkey.ts`).
 - The contribution machinery: GitHub links, claims and validator attestations, Séances, payouts and vesting.
-- `@blockula/sdk`, the passkey web wallet (`web/`), `@blockula/mcp`, `scripts/install.sh`, release workflows and `deploy/`.
+- `@blockula/sdk`, the passkey web wallet (`web/`), `@blockula/mcp`, `scripts/install.sh`, the release workflows and signature, and `deploy/`.
 
 Especially wanted: anything that halts or splits the chain, mints or moves FANG without authorization, bypasses a session key's limits, forges a signature or certificate, or makes nodes disagree on state.
 
@@ -26,7 +26,17 @@ These are targets, not guarantees:
 - An assessment (severity, whether we can reproduce it) within 10 business days.
 - A fix for critical and high issues as fast as we can ship one, then public credit in the advisory if you want it.
 
-There's no paid bug bounty yet; one will open on the incentivized testnet before mainnet.
+## Bug bounty
+
+[docs/BUG_BOUNTY.md](docs/BUG_BOUNTY.md) has the scope, severity tiers, rewards, rules and safe harbor. It opens, funded, on the incentivized testnet at least a month before mainnet; until the amounts are confirmed there, valid reports are rewarded under its table once it is.
+
+## Audits
+
+No third-party audit yet. The scope for the external audit of the mainnet code (SEC-1) is [docs/AUDIT_SCOPE.md](docs/AUDIT_SCOPE.md); reports will be published here when they're done.
+
+## Verifying releases
+
+Release archives carry SLSA build provenance, the Linux builds are reproducible, and `checksums.txt` is signed offline with the Blockula release key (ML-DSA-65). How to check all three: [docs/OPERATIONS.md "Releases"](docs/OPERATIONS.md#releases). Release key id: *not generated yet*; it will be published here, in OPERATIONS.md and in `scripts/install.sh`.
 
 ## Testing on the public testnet
 
