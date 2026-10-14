@@ -2,18 +2,20 @@
 //! and finalized blocks are executed in order by `Chain::execute` (deferred execution).
 //!
 //! Block flow:
-//! * **propose** (leader): wait until `parent.timestamp + block_time`, pick mempool txs that apply
-//!   on top of our executed state plus any not-yet-executed ancestors, and attach the latest state
-//!   root we've executed (`exec_height`, `exec_root`).
-//! * **verify** (everyone, before voting): structure, size limits, timestamps, proposer == leader,
-//!   stateless tx checks (chain id, ML-DSA signature, minimum fee), and the attached state root if
-//!   we've executed that height ourselves.
+//! * **propose** (leader): wait until `parent.timestamp + block_time`, pick mempool txs (highest
+//!   tip per byte first) that apply on top of our executed state plus any not-yet-executed
+//!   ancestors, and attach the latest state root we've executed (`exec_height`, `exec_root`).
+//! * **verify** (everyone, before voting): version, view and parent view against the consensus
+//!   context, structure, size limits, timestamps, proposer == leader, stateless tx checks
+//!   (canonical wire bytes, chain id, address prefix, validity window, ML-DSA signature, fee), and
+//!   the attached state root (waiting until we've executed that height). Only permanently invalid
+//!   blocks get `false`; anything that can still change keeps the verdict pending.
 //! * **finalize**: marshal delivers finalized blocks in order to [`Executor`], which executes them
 //!   (invalid txs are skipped) and acknowledges only after `blocks.jsonl` is synced to disk.
 
 use crate::chain::{Chain, Finalized, Genesis};
 use crate::pq::{MlDsaScheme, PrivateKey, PublicKey};
-use crate::types::{min_fee, Tx};
+use crate::types::Tx;
 use bytes::{Buf, BufMut};
 use commonware_broadcast::buffered;
 use commonware_codec::{Decode as _, EncodeSize, Error as CodecError, Read, Write, Encode};
@@ -68,28 +70,47 @@ pub fn namespace(chain_id: &str) -> Vec<u8> {
 
 // ------------------------------------------------------------------------------------ block
 
-/// The block consensus agrees on. Txs are carried as the exact JSON bytes the proposer chose,
-/// so the digest is over canonical bytes and every node parses the same thing.
+/// Protocol version this binary executes (MAINNET-DESIGN 3.9: the version in force at a height).
+pub const PROTOCOL_VERSION: u32 = 1;
+/// Newest protocol version this binary supports, signalled in every block it proposes.
+pub const SUPPORTED_PROTOCOL_VERSION: u32 = 1;
+
+/// The block consensus agrees on (CBlock v2). Txs are carried in their wire form
+/// (`Tx::to_bytes`), so the digest is over canonical bytes and every node parses the same thing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CBlock {
+    /// Protocol version in force at `height`.
+    pub version: u32,
     pub parent: Digest,
     pub height: u64,
+    /// The simplex view this block was proposed in, and its parent's view, both from the
+    /// consensus context (verifiers check them). Views in between were nullified.
+    pub view: u64,
+    pub parent_view: u64,
     pub timestamp_ms: u64,
-    /// `boo1…` address of the proposer (must be the round's leader). Tips go here.
+    /// Address of the proposer (must be the round's leader). Tips go here.
     pub proposer: String,
     /// Latest height the proposer had executed, and its state root (checked by verifiers that
     /// have executed it too).
     pub exec_height: u64,
     pub exec_root: [u8; 32],
+    /// Newest protocol version the proposer's binary supports (upgrade readiness, display only).
+    pub signal: u32,
     pub txs: Vec<Vec<u8>>,
     digest: Digest,
 }
 
 impl CBlock {
-    pub fn new(parent: Digest, height: u64, timestamp_ms: u64, proposer: String, exec_height: u64, exec_root: [u8; 32], txs: Vec<Vec<u8>>) -> Self {
-        let mut b = Self { parent, height, timestamp_ms, proposer, exec_height, exec_root, txs, digest: Digest([0; 32]) };
-        b.digest = Blake3::hash(&[b"BLOCKULA_CBLOCK_V1", &b.encode_body()]);
-        b
+    /// A block at `height` on `parent` under this binary's protocol version and signal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(parent: Digest, height: u64, view: u64, parent_view: u64, timestamp_ms: u64, proposer: String, exec_height: u64, exec_root: [u8; 32], txs: Vec<Vec<u8>>) -> Self {
+        Self { version: PROTOCOL_VERSION, parent, height, view, parent_view, timestamp_ms, proposer, exec_height, exec_root, signal: SUPPORTED_PROTOCOL_VERSION, txs, digest: Digest([0; 32]) }.sealed()
+    }
+
+    /// Computes the digest over everything else.
+    fn sealed(mut self) -> Self {
+        self.digest = Blake3::hash(&[b"BLOCKULA_CBLOCK_V2", &self.encode_body()]);
+        self
     }
 
     fn encode_body(&self) -> Vec<u8> {
@@ -99,17 +120,21 @@ impl CBlock {
     }
 
     fn body_size(&self) -> usize {
-        32 + 8 + 8 + 4 + self.proposer.len() + 8 + 32 + 4 + self.txs.iter().map(|t| 4 + t.len()).sum::<usize>()
+        4 + 32 + 8 * 4 + 4 + self.proposer.len() + 8 + 32 + 4 + 4 + self.txs.iter().map(|t| 4 + t.len()).sum::<usize>()
     }
 
     fn write_body(&self, buf: &mut impl BufMut) {
+        buf.put_u32(self.version);
         buf.put_slice(&self.parent.0);
         buf.put_u64(self.height);
+        buf.put_u64(self.view);
+        buf.put_u64(self.parent_view);
         buf.put_u64(self.timestamp_ms);
         buf.put_u32(self.proposer.len() as u32);
         buf.put_slice(self.proposer.as_bytes());
         buf.put_u64(self.exec_height);
         buf.put_slice(&self.exec_root);
+        buf.put_u32(self.signal);
         buf.put_u32(self.txs.len() as u32);
         for t in &self.txs {
             buf.put_u32(t.len() as u32);
@@ -125,8 +150,9 @@ impl CBlock {
         self.parent.0
     }
 
+    /// The block's txs, `None` where the bytes aren't a canonical wire-form tx.
     pub fn parse_txs(&self) -> Vec<Option<Tx>> {
-        self.txs.iter().map(|t| serde_json::from_slice(t).ok()).collect()
+        self.txs.iter().map(|t| Tx::from_bytes(t).ok()).collect()
     }
 }
 
@@ -146,22 +172,26 @@ impl Read for CBlock {
         fn need(buf: &impl Buf, n: usize) -> Result<(), CodecError> {
             if buf.remaining() < n { Err(CodecError::EndOfBuffer) } else { Ok(()) }
         }
-        need(buf, 32 + 8 + 8 + 4)?;
+        need(buf, 4 + 32 + 8 * 4 + 4)?;
+        let version = buf.get_u32();
         let mut parent = [0u8; 32];
         buf.copy_to_slice(&mut parent);
         let height = buf.get_u64();
+        let view = buf.get_u64();
+        let parent_view = buf.get_u64();
         let timestamp_ms = buf.get_u64();
         let plen = buf.get_u32() as usize;
         if plen > 128 {
             return Err(CodecError::Invalid("CBlock", "proposer too long"));
         }
-        need(buf, plen + 8 + 32 + 4)?;
+        need(buf, plen + 8 + 32 + 4 + 4)?;
         let mut p = vec![0u8; plen];
         buf.copy_to_slice(&mut p);
         let proposer = String::from_utf8(p).map_err(|_| CodecError::Invalid("CBlock", "proposer utf8"))?;
         let exec_height = buf.get_u64();
         let mut exec_root = [0u8; 32];
         buf.copy_to_slice(&mut exec_root);
+        let signal = buf.get_u32();
         let n = buf.get_u32() as usize;
         if n > MAX_BLOCK_TXS {
             return Err(CodecError::Invalid("CBlock", "too many txs"));
@@ -180,7 +210,7 @@ impl Read for CBlock {
             buf.copy_to_slice(&mut t);
             txs.push(t);
         }
-        Ok(CBlock::new(Digest(parent), height, timestamp_ms, proposer, exec_height, exec_root, txs))
+        Ok(CBlock { version, parent: Digest(parent), height, view, parent_view, timestamp_ms, proposer, exec_height, exec_root, signal, txs, digest: Digest([0; 32]) }.sealed())
     }
 }
 impl Digestible for CBlock {
@@ -202,9 +232,10 @@ impl Block for CBlock {
 
 /// Height-0 block every node derives from genesis.json.
 pub fn genesis_block(g: &Genesis) -> CBlock {
-    let seed = Blake3::hash(&[b"BLOCKULA_GENESIS", g.chain_id.as_bytes(), &g.created_at_ms.to_be_bytes(), serde_json::to_string(&g.validators).unwrap().as_bytes()]);
+    let (id, prefix) = (g.chain_id.as_bytes(), g.address_prefix.as_bytes());
+    let seed = Blake3::hash(&[b"BLOCKULA_GENESIS_V2", &(id.len() as u32).to_be_bytes(), id, &(prefix.len() as u32).to_be_bytes(), prefix, &g.created_at_ms.to_be_bytes(), serde_json::to_string(&g.validators).unwrap().as_bytes()]);
     let root = g.initial_state().root();
-    CBlock::new(seed, 0, g.created_at_ms, String::new(), 0, hex_32(&root), vec![])
+    CBlock::new(seed, 0, 0, 0, g.created_at_ms, String::new(), 0, hex_32(&root), vec![])
 }
 
 pub fn hex_32(s: &str) -> [u8; 32] {
@@ -231,17 +262,18 @@ fn ms(t: SystemTime) -> u64 {
 pub struct App {
     pub chain: Shared,
     pub block_time_ms: u64,
+    /// The chain's address prefix (proposer addresses use it).
+    pub address_prefix: String,
 }
 
-/// Stateless checks every tx in a proposed block must pass.
-pub fn check_tx_stateless(tx: &Tx, chain_id: &str) -> anyhow::Result<()> {
+/// Stateless checks every tx must pass: in a proposed block, over HTTP and from gossip.
+pub fn check_tx_stateless(tx: &Tx, chain_id: &str, prefix: &str) -> anyhow::Result<()> {
     if tx.chain_id != chain_id {
         anyhow::bail!("wrong chain id");
     }
     tx.check_format()?;
-    if tx.fee < min_fee(tx.size()) {
-        anyhow::bail!("fee below minimum");
-    }
+    tx.check_prefix(prefix)?;
+    crate::chain::check_fee(tx)?;
     tx.verify_signature()
 }
 
@@ -263,7 +295,8 @@ where
         }
         let timestamp_ms = ms(ctx.current()).max(target);
         let height = parent.height + 1;
-        let proposer = cctx.leader.address();
+        let (view, parent_view) = (cctx.round.view().get(), cctx.parent.0.get());
+        let proposer = cctx.leader.address(&self.address_prefix);
 
         // Blocks between what we've executed and the parent are ordered but not yet executed:
         // collect them so we don't re-propose (or overdraw) their txs.
@@ -278,7 +311,7 @@ where
                         return None;
                     }
                     let c = self.chain.lock();
-                    return Some(CBlock::new(parent.digest(), height, timestamp_ms, proposer, c.height(), hex_32(&c.state.root()), vec![]));
+                    return Some(CBlock::new(parent.digest(), height, view, parent_view, timestamp_ms, proposer, c.height(), hex_32(&c.state.root()), vec![]));
                 }
                 pending.push(ancestry.next().await?);
             }
@@ -302,15 +335,20 @@ where
                 let _ = c.state.apply_j(&mut j, &tx, &chain_id, &b.proposer, b.height, false);
             }
         }
-        let mempool = c.mempool.clone();
         let mut txs = vec![];
         let mut bytes = 0;
-        for tx in mempool {
+        // Senders whose earlier tx was left out: their later nonces can't apply.
+        let mut stuck = std::collections::HashSet::new();
+        for tx in c.proposal_order() {
             if txs.len() >= MAX_BLOCK_TXS {
                 break;
             }
-            let raw = serde_json::to_vec(&tx).expect("tx json");
-            if raw.len() > MAX_TX_BYTES || bytes + raw.len() > MAX_BLOCK_BYTES || included.contains(&tx.id()) {
+            if stuck.contains(&tx.from) || included.contains(&tx.id()) {
+                continue;
+            }
+            let raw = tx.to_bytes();
+            if raw.len() > MAX_TX_BYTES || bytes + raw.len() > MAX_BLOCK_BYTES {
+                stuck.insert(tx.from.clone());
                 continue;
             }
             // Only propose txs that will succeed; a tx that would just burn its fee waits/expires.
@@ -319,6 +357,7 @@ where
                 Ok(crate::chain::Outcome::Applied) => j.absorb_pub(tj),
                 Ok(crate::chain::Outcome::Failed(_)) | Err(_) => {
                     c.state.rollback(tj);
+                    stuck.insert(tx.from.clone());
                     continue;
                 }
             }
@@ -330,7 +369,7 @@ where
         };
         // Checkpoint rule: the block at C + CHECKPOINT_DELAY must commit to state_root(C).
         let (exec_height, exec_root) = match crate::snapshot::certifies(height) {
-            Some(cp) => match wait_executed(&ctx, &self.chain, cp, self.block_time_ms).await {
+            Some(cp) => match wait_executed(&ctx, &self.chain, cp, Some(Duration::from_millis(3 * self.block_time_ms.max(200)))).await {
                 Some(root) => (cp, root),
                 None => {
                     warn!(height, checkpoint = cp, "haven't executed the checkpoint yet; skipping this proposal");
@@ -339,16 +378,25 @@ where
             },
             None => (exec_height, exec_root),
         };
-        debug!(height, txs = txs.len(), "proposing");
-        Some(CBlock::new(parent.digest(), height, timestamp_ms, proposer, exec_height, exec_root, txs))
+        debug!(height, view, txs = txs.len(), "proposing");
+        Some(CBlock::new(parent.digest(), height, view, parent_view, timestamp_ms, proposer, exec_height, exec_root, txs))
     }
 
+    /// Returns `false` only for permanently invalid blocks (the `Application::verify` contract):
+    /// a lagging verifier keeps the verdict pending until it has executed what the block cites,
+    /// and simplex's timeouts cancel the future if that takes too long.
     async fn verify(&mut self, (ctx, cctx): (E, Self::Context), mut ancestry: impl Ancestry<CBlock>) -> bool {
         let (Some(block), Some(parent)) = (ancestry.next().await, ancestry.next().await) else { return false };
         let reject = |why: &str| {
             warn!(height = block.height, why, "rejecting block");
             false
         };
+        if block.version != PROTOCOL_VERSION {
+            return reject("unsupported protocol version");
+        }
+        if block.view != cctx.round.view().get() || block.parent_view != cctx.parent.0.get() {
+            return reject("view or parent_view doesn't match the consensus round");
+        }
         if block.parent != parent.digest() || block.height != parent.height + 1 {
             return reject("bad parent link");
         }
@@ -358,51 +406,47 @@ where
         if block.timestamp_ms > ms(ctx.current()) + MAX_CLOCK_DRIFT_MS {
             return reject("timestamp too far in the future");
         }
-        if block.proposer != cctx.leader.address() {
+        if block.proposer != cctx.leader.address(&self.address_prefix) {
             return reject("proposer is not the leader");
         }
         if block.exec_height >= block.height {
             return reject("exec_height not below block height");
         }
-        // Checkpoint rule: this block must commit to state_root(C), and we must have checked it
-        // ourselves before voting (wait briefly for execution rather than vote unchecked).
-        if let Some(cp) = crate::snapshot::certifies(block.height) {
-            if block.exec_height != cp {
-                return reject("checkpoint-certifying block must carry the checkpoint's exec_height");
-            }
-            match wait_executed(&ctx, &self.chain, cp, self.block_time_ms).await {
-                Some(root) if root == block.exec_root => {}
-                Some(_) => return reject("checkpoint state root mismatch"),
-                None => return reject("haven't executed the checkpoint yet; can't check its root"),
-            }
+        // Checkpoint rule: this block must commit to state_root(C).
+        let checkpoint = crate::snapshot::certifies(block.height);
+        if checkpoint.is_some_and(|cp| block.exec_height != cp) {
+            return reject("checkpoint-certifying block must carry the checkpoint's exec_height");
         }
-        let chain_id = {
+        let (chain_id, max_validity) = {
             let c = self.chain.lock();
+            // Our executed height only grows, so this stays true once it is.
             if block.exec_height + MAX_EXEC_LAG < c.height().min(parent.height) {
                 return reject("exec_height too far behind");
             }
-            if block.exec_height <= c.height() {
-                match c.root_at(block.exec_height) {
-                    Some(root) if hex_32(&root) == block.exec_root => {}
-                    _ => return reject("state root mismatch"),
-                }
-            }
-            c.genesis.chain_id.clone()
+            (c.genesis.chain_id.clone(), c.state.params.max_tx_validity_blocks())
         };
-        // Signature checks happen without holding the chain lock.
+        // Tx checks (signatures included) run without holding the chain lock.
         let mut seen = std::collections::HashSet::new();
         let mut ids = vec![];
         for raw in &block.txs {
-            let Ok(tx) = serde_json::from_slice::<Tx>(raw) else { return reject("unparseable tx") };
+            let Ok(tx) = Tx::from_bytes(raw) else { return reject("unparseable or non-canonical tx") };
             let id = tx.id();
             if !seen.insert(id.clone()) {
                 return reject("duplicate tx");
             }
-            if let Err(e) = check_tx_stateless(&tx, &chain_id) {
+            if let Err(e) = check_tx_stateless(&tx, &chain_id, &self.address_prefix).and_then(|_| crate::chain::check_validity(&tx, block.height, max_validity)) {
                 warn!(error = %e, "bad tx in block");
                 return reject("invalid tx");
             }
             ids.push(id);
+        }
+        // The cited state root, once we've executed that height ourselves (until then the
+        // verdict can still change, so we wait).
+        match wait_executed(&ctx, &self.chain, block.exec_height, None).await {
+            Some(root) if root == block.exec_root => {}
+            Some(_) => return reject(if checkpoint.is_some() { "checkpoint state root mismatch" } else { "state root mismatch" }),
+            // Below our history (we fast-synced past it): we can't check it, so we abstain.
+            None => return futures::future::pending().await,
         }
         let c = self.chain.lock();
         if ids.iter().any(|id| c.tx_index.contains_key(id)) {
@@ -412,9 +456,9 @@ where
     }
 }
 
-/// Waits (up to ~3 block times) until we've executed `height`; returns its state root.
-async fn wait_executed<E: Clock>(ctx: &E, chain: &Shared, height: u64, block_time_ms: u64) -> Option<[u8; 32]> {
-    let deadline = Duration::from_millis(3 * block_time_ms.max(200));
+/// Waits until we've executed `height` and returns its state root: `None` if we gave up after
+/// `deadline`, or can't know it (it's below the snapshot we fast-synced from).
+async fn wait_executed<E: Clock>(ctx: &E, chain: &Shared, height: u64, deadline: Option<Duration>) -> Option<[u8; 32]> {
     let step = Duration::from_millis(50);
     let mut waited = Duration::ZERO;
     loop {
@@ -424,7 +468,7 @@ async fn wait_executed<E: Clock>(ctx: &E, chain: &Shared, height: u64, block_tim
                 return c.root_at(height).map(|r| hex_32(&r));
             }
         }
-        if waited >= deadline {
+        if deadline.is_some_and(|d| waited >= d) {
             return None;
         }
         ctx.sleep(step).await;
@@ -471,6 +515,9 @@ pub fn finalized_from(b: &CBlock, certificate: Option<Vec<u8>>) -> Finalized {
         hash: hex::encode(b.digest.0),
         parent: hex::encode(b.parent.0),
         timestamp_ms: b.timestamp_ms,
+        view: b.view,
+        parent_view: b.parent_view,
+        version: b.version,
         proposer: b.proposer.clone(),
         txs: b.parse_txs().into_iter().flatten().collect(),
         cblock: b.encode().to_vec(),
@@ -699,14 +746,13 @@ where
         let executor = Executor { chain: chain.clone(), certs: certs.clone(), epochs: epoch_tx, marshal: Some(marshal.clone()) };
         marshal_actor.start(executor, buffer, resolver);
 
-        // Mempool gossip: push every locally accepted tx to all peers; accept theirs.
+        // Mempool gossip (wire-form txs): push every locally accepted tx to all peers; accept theirs.
         let (gossip_tx, mut gossip_rx) = futures::channel::mpsc::unbounded::<Tx>();
         chain.lock().gossip = Some(gossip_tx);
         let (mut mp_sender, mut mp_receiver) = mempool_net;
         context.child("mempool_out").spawn(move |_| async move {
             while let Some(tx) = gossip_rx.next().await {
-                let raw = serde_json::to_vec(&tx).expect("tx json");
-                let _ = mp_sender.send(Recipients::All, raw, false);
+                let _ = mp_sender.send(Recipients::All, tx.to_bytes(), false);
             }
         });
         let gossip_chain = chain.clone();
@@ -717,13 +763,16 @@ where
                 if raw.len() > MAX_TX_BYTES {
                     continue;
                 }
-                let Ok(tx) = serde_json::from_slice::<Tx>(&raw) else {
+                let Ok(tx) = Tx::from_bytes(&raw) else {
                     debug!(?from, "unparseable gossiped tx");
                     continue;
                 };
                 // Verify format + ML-DSA signature before taking the chain lock.
-                let chain_id = gossip_chain.lock().genesis.chain_id.clone();
-                if let Err(e) = check_tx_stateless(&tx, &chain_id) {
+                let (chain_id, prefix) = {
+                    let c = gossip_chain.lock();
+                    (c.genesis.chain_id.clone(), c.genesis.address_prefix.clone())
+                };
+                if let Err(e) = check_tx_stateless(&tx, &chain_id, &prefix) {
                     debug!(?from, error = %e, "dropping invalid gossiped tx");
                     continue;
                 }
@@ -745,7 +794,8 @@ where
         let (mux, mut resolver_mux) = Muxer::new(context.child("resolver_mux"), resolver_net.0, resolver_net.1, 1024);
         mux.start();
 
-        let app = Inline::new(context.child("inline"), App { chain: chain.clone(), block_time_ms }, marshal.clone(), FixedEpocher::new(epoch_len));
+        let address_prefix = chain.lock().genesis.address_prefix.clone();
+        let app = Inline::new(context.child("inline"), App { chain: chain.clone(), block_time_ms, address_prefix }, marshal.clone(), FixedEpocher::new(epoch_len));
         let bt = Duration::from_millis(block_time_ms);
         let (mut epoch, height) = {
             let c = chain.lock();
@@ -856,7 +906,7 @@ fn hint_behind(marshal: &MarshalMailbox, chain: &Shared, ours: u64, theirs: u64,
 /// checkpoint certificates keep serving history over HTTP).
 pub const MARSHAL_RETAIN: u64 = 2_000;
 /// Bumped when the on-disk consensus storage layout changes.
-pub const STORAGE_VERSION: &str = "prunable-v2";
+pub const STORAGE_VERSION: &str = "prunable-v3";
 
 fn archive_config<C>(prefix: &str, name: &str, page_cache: CacheRef, codec_config: C) -> prunable::Config<TwoCap, C> {
     prunable::Config {

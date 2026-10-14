@@ -70,9 +70,9 @@ impl PublicKey {
         let enc = EncodedVerifyingKey::<MlDsa65>::try_from(&raw[..]).ok()?;
         Some(Self { raw: Box::new(raw), vk: Arc::new(VerifyingKey::<MlDsa65>::decode(&enc)) })
     }
-    /// The `boo1…` address of this key.
-    pub fn address(&self) -> String {
-        crate::crypto::address_from_public_key(&self.raw[..])
+    /// This key's address on a chain whose addresses use `prefix`.
+    pub fn address(&self, prefix: &str) -> String {
+        crate::crypto::address_with_prefix(prefix, &self.raw[..])
     }
 }
 impl Read for PublicKey {
@@ -315,7 +315,7 @@ mod tests {
         let seed = [9u8; 32];
         let a = crate::crypto::Keys::from_seed(seed);
         let b = PrivateKey::from_seed_bytes(seed);
-        assert_eq!(a.address(), b.public_key().address());
+        assert_eq!(a.address(), b.public_key().address("boo"));
         let sig = b.sign(b"ns", b"msg");
         assert!(b.public_key().verify(b"ns", b"msg", &sig));
         assert!(!b.public_key().verify(b"other", b"msg", &sig));
