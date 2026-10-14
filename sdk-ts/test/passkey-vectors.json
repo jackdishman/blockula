@@ -1,0 +1,32 @@
+{
+  "description": "Passkey wallet derivation (sdk-ts/src/passkey.ts). The passkey's PRF extension is evaluated with `prf_salt` (UTF-8); its 32-byte output is fed to BLAKE3 derive_key(`context`) to get the ML-DSA-65 seed (FIPS 204 xi); key_id = BLAKE3(public key) and address = bech32m(prefix, key_id). Cross-checked against the node's crates (blake3 1.8, ml-dsa 0.1.1, bech32 0.12). Used by sdk-ts/test/passkey-vectors.ts and web/e2e/passkey.spec.ts.",
+  "prf_salt": "blockula/wallet/v1",
+  "context": "blockula passkey wallet v1",
+  "prefix": "boo",
+  "vectors": [
+    {
+      "prf": "0000000000000000000000000000000000000000000000000000000000000000",
+      "seed": "115cbc8102c9af2c6aef3c9ae159d0a75d7bcf27d86219fd95e98aa14fa0d241",
+      "key_id": "a1ff719368b2c93c34445099b49c51746262b259e1b5fe54af72ead935e923df",
+      "address": "boo158lhrymgktyncdzy2zvmf8z3w33x9vjeux6lu490wt4djd0fy00s7rqjhr"
+    },
+    {
+      "prf": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "seed": "a9cdd4e620c0721bd69638d8152a665b39f9bccc239d32101976bb001a5ed442",
+      "key_id": "9226ab38735d30fc4a7b0fc1db2751ada684cc0b356a5e1da36fe883eb86ac85",
+      "address": "boo1jgn2kwrnt5c0cjnmplqakf634kngfnqtx449u8drdl5g86ux4jzswyn4dr"
+    },
+    {
+      "prf": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "seed": "3b6103cfb7e5db23846a629619568fb73d8170f51de3930a2a5e82d2e1010a89",
+      "key_id": "f6e6fe3c388d0bdcd0d3bae4e87a7cf42b03c125f62d7eb141897956fcfb6176",
+      "address": "boo17mn0u0pc359ae5xnhtjws7nu7s4s8sf97ckhav2p39u4dl8mv9mqp7c6fw"
+    },
+    {
+      "prf": "9b6e1b5d2c3f4a7e8d0c1b2a39485766a5b4c3d2e1f0f9e8d7c6b5a493827160",
+      "seed": "011d6655313598b06dafd791811724cfb5bfb80bdc979b60ab8534413da6a1a2",
+      "key_id": "211c050d70d254d0f9c05e1f8a72c6d1dc1c4b934b80062ffcde91f6c86238fd",
+      "address": "boo1yywq2rts6f2dp7wqtc0c5ukx68wpcjunfwqqvtlum6gldjrz8r7sqp49c9"
+    }
+  ]
+}
