@@ -20,8 +20,8 @@ pub const ZERO_DIGEST: Digest = [F::ZERO; DIGEST_ELEMS];
 /// Encodes a digest as 8 little-endian u32s.
 pub fn digest_to_bytes(d: &Digest) -> [u8; DIGEST_BYTES] {
     let mut out = [0u8; DIGEST_BYTES];
-    for (chunk, x) in out.chunks_exact_mut(4).zip(d) {
-        chunk.copy_from_slice(&x.as_canonical_u32().to_le_bytes());
+    for (chunk, x) in out.as_chunks_mut::<4>().0.iter_mut().zip(d) {
+        *chunk = x.as_canonical_u32().to_le_bytes();
     }
     out
 }
@@ -30,8 +30,8 @@ pub fn digest_to_bytes(d: &Digest) -> [u8; DIGEST_BYTES] {
 /// encoding.
 pub fn digest_from_bytes(bytes: &[u8; DIGEST_BYTES]) -> Option<Digest> {
     let mut out = ZERO_DIGEST;
-    for (x, chunk) in out.iter_mut().zip(bytes.chunks_exact(4)) {
-        let v = u32::from_le_bytes(chunk.try_into().ok()?);
+    for (x, chunk) in out.iter_mut().zip(bytes.as_chunks::<4>().0) {
+        let v = u32::from_le_bytes(*chunk);
         if v >= P {
             return None;
         }

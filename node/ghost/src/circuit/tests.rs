@@ -56,9 +56,9 @@ fn satisfied(b: &Built) -> bool {
 /// a proof forced out of it anyway doesn't verify.
 fn assert_rejected(b: Built, what: &str) {
     assert!(!satisfied(&b), "{what}: the trace satisfies every constraint");
-    match prove_trace(b.trace, &b.public, [3; 32]) {
-        Ok(proof) => assert!(verify_raw(&b.public, &proof).is_err(), "{what}: forged proof verified"),
-        Err(_) => {} // the prover refused: also fine
+    // The prover may also refuse (an error), which is fine.
+    if let Ok(proof) = prove_trace(b.trace, &b.public, [3; 32]) {
+        assert!(verify_raw(&b.public, &proof).is_err(), "{what}: forged proof verified");
     }
 }
 

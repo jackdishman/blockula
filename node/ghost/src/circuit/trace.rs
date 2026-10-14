@@ -129,7 +129,6 @@ impl Machine<'_> {
 
     /// Writes the permutation input (`rate ‖ capacity`), applies input cheats, and returns
     /// `out`.
-    #[must_use]
     fn permute(&mut self, row: usize, rate: &[F; 8], capacity: &[F; 8]) -> [F; 16] {
         self.hash(row, rate, capacity);
         self.out(row)
@@ -342,8 +341,8 @@ pub(crate) fn build_with(raw: &RawAction, cheats: &[Cheat]) -> Built {
 
     // Value bits: the low 16 bits of each limb on value rows. A limb ≥ 2^16 has no valid
     // decomposition.
-    for r in 0..HEIGHT {
-        if periodic[sel::VALUE][r] == F::ONE {
+    for (r, &is_value) in periodic[sel::VALUE].iter().enumerate() {
+        if is_value == F::ONE {
             for k in 0..4 {
                 let v = m.rows[r][IN + k].as_canonical_u32();
                 for i in 0..16 {
@@ -356,12 +355,10 @@ pub(crate) fn build_with(raw: &RawAction, cheats: &[Cheat]) -> Built {
 
     // Balance accumulator: row r holds the sum over value rows before r.
     let mut acc = [F::ZERO; 4];
-    for r in 0..HEIGHT {
+    for (r, &sign) in periodic[sel::VSIGN].iter().enumerate() {
         m.set(r, ACC, &acc);
         let row = m.rows[r];
-        for k in 0..4 {
-            acc[k] = row[ACC + k] + periodic[sel::VSIGN][r] * row[IN + k];
-        }
+        acc = core::array::from_fn(|k| row[ACC + k] + sign * row[IN + k]);
     }
 
     // Carries for the claimed value balance: c_k = (acc_k − vb_k + c_{k−1}) / 2^16.

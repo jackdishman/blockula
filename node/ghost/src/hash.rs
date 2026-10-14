@@ -150,7 +150,7 @@ mod tests {
 
     #[test]
     fn sponge_is_input_sensitive() {
-        let x: Vec<F> = (0..8).map(|i| F::new(i)).collect();
+        let x: Vec<F> = (0..8).map(F::new).collect();
         let a = sponge(Domain::SpendAuth, &x);
         let b = sponge(Domain::NullifierKey, &x);
         assert_ne!(a, b);

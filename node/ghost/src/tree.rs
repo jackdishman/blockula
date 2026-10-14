@@ -108,12 +108,8 @@ impl Frontier {
     pub fn root(&self) -> Digest {
         let empty = empty_roots();
         let mut node = empty[0];
-        for h in 0..DEPTH {
-            node = if (self.size >> h) & 1 == 1 {
-                compress(&self.branch[h], &node)
-            } else {
-                compress(&node, &empty[h])
-            };
+        for (h, (branch, empty)) in self.branch.iter().zip(empty).enumerate() {
+            node = if (self.size >> h) & 1 == 1 { compress(branch, &node) } else { compress(&node, empty) };
         }
         node
     }
@@ -138,8 +134,8 @@ impl Frontier {
             return None;
         }
         let mut branch = [ZERO_DIGEST; DEPTH];
-        for (h, (slot, chunk)) in branch.iter_mut().zip(bytes[8..].chunks_exact(DIGEST_BYTES)).enumerate() {
-            *slot = digest_from_bytes(chunk.try_into().ok()?)?;
+        for (h, (slot, chunk)) in branch.iter_mut().zip(bytes[8..].as_chunks::<DIGEST_BYTES>().0).enumerate() {
+            *slot = digest_from_bytes(chunk)?;
             if (size >> h) & 1 == 0 && *slot != ZERO_DIGEST {
                 return None;
             }
@@ -210,10 +206,10 @@ impl FullTree {
         self.levels[0].push(leaf);
         let empty = empty_roots();
         let mut idx = position as usize;
-        for h in 0..DEPTH {
+        for (h, empty) in empty.iter().enumerate().take(DEPTH) {
             let left = idx & !1;
             let l = self.levels[h][left];
-            let r = self.levels[h].get(left + 1).copied().unwrap_or(empty[h]);
+            let r = self.levels[h].get(left + 1).copied().unwrap_or(*empty);
             let parent = compress(&l, &r);
             idx >>= 1;
             if idx < self.levels[h + 1].len() {
