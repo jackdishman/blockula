@@ -71,7 +71,7 @@ What earns the most, because it can be verified objectively:
 
 What earns nothing: PR floods, cosmetic churn, unverified changes. Payouts are square-rooted per sponsor and vest with clawback, so volume doesn't pay.
 
-Hunt bounties are live on the testnet now (`/api/hunts`, the explorer's 🏹 Hunts page, or MCP `list_hunts`).
+Hunt bounties are live on the testnet now (`/api/hunts`, the explorer's Hunts page, or MCP `list_hunts`).
 
 **The contribution pool** pays for merged PRs to pool repos, beyond Hunts:
 1. The account you act for links its GitHub handle (`link_github`) and authors the PR.

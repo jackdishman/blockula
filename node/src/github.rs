@@ -53,6 +53,9 @@ pub struct PullRequest {
     pub author: String,
     /// `owner/name` of the repo it was merged into.
     pub base_repo: String,
+    /// The branch it targets, and that repo's default branch.
+    pub base_branch: String,
+    pub default_branch: String,
     pub title: String,
     pub body: String,
     pub url: String,
@@ -66,9 +69,18 @@ pub fn parse_pr(v: &Value) -> PullRequest {
         merge_sha: v["merge_commit_sha"].as_str().filter(|h| h.len() == 40 && h.bytes().all(|b| b.is_ascii_hexdigit())).map(|h| h.to_ascii_lowercase()),
         author: s(&v["user"]["login"]),
         base_repo: s(&v["base"]["repo"]["full_name"]),
+        base_branch: s(&v["base"]["ref"]),
+        default_branch: s(&v["base"]["repo"]["default_branch"]),
         title: s(&v["title"]),
         body: s(&v["body"]),
         url: s(&v["html_url"]),
+    }
+}
+
+impl PullRequest {
+    /// Targets the repo's default branch. A merge into any other branch hasn't shipped.
+    pub fn on_default_branch(&self) -> bool {
+        !self.base_branch.is_empty() && self.base_branch == self.default_branch
     }
 }
 
@@ -81,7 +93,8 @@ pub async fn fetch_pr(repo: &str, pr: u64) -> Result<Option<PullRequest>> {
 /// What a validator attests about a claim.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Verdict {
-    /// Merged into the claimed repo, authored by the linked handle, and the gist proves the link.
+    /// Merged into the claimed repo's default branch, authored by the linked handle, and the gist
+    /// proves the link.
     Confirmed { merge_sha: String },
     Refuted(String),
     /// Still open: check again later (pending claims are refunded if never settled).
@@ -105,6 +118,9 @@ pub fn verdict(handle: &str, repo: &str, account: &str, pr: &PullRequest, gist: 
     if !pr.merged {
         return if pr.state == "open" { Verdict::Wait } else { Verdict::Refuted("the PR was closed without merging".into()) };
     }
+    if !pr.on_default_branch() {
+        return Verdict::Refuted(format!("the PR merged into {}, not {repo}'s default branch ({})", pr.base_branch, pr.default_branch));
+    }
     match &pr.merge_sha {
         Some(sha) => Verdict::Confirmed { merge_sha: sha.clone() },
         None => Verdict::Wait,
@@ -126,7 +142,11 @@ mod tests {
     use serde_json::json;
 
     fn pr(state: &str, merged: bool, author: &str, base: &str) -> PullRequest {
-        parse_pr(&json!({ "state": state, "merged": merged, "merge_commit_sha": if merged { Value::from("A".repeat(40)) } else { Value::Null }, "user": { "login": author }, "base": { "repo": { "full_name": base } }, "title": "t", "body": "Closes #1", "html_url": "https://github.com/x/y/pull/1" }))
+        pr_into(state, merged, author, base, "main")
+    }
+
+    fn pr_into(state: &str, merged: bool, author: &str, base: &str, branch: &str) -> PullRequest {
+        parse_pr(&json!({ "state": state, "merged": merged, "merge_commit_sha": if merged { Value::from("A".repeat(40)) } else { Value::Null }, "user": { "login": author }, "base": { "ref": branch, "repo": { "full_name": base, "default_branch": "main" } }, "title": "t", "body": "Closes #1", "html_url": "https://github.com/x/y/pull/1" }))
     }
 
     #[test]
@@ -140,5 +160,9 @@ mod tests {
         assert!(matches!(verdict("alice", "jackdishman/blockula", "boo1abc", &pr("closed", true, "alice", "fork/blockula"), &gist), Verdict::Refuted(r) if r.contains("fork/blockula")));
         assert!(matches!(verdict("alice", "jackdishman/blockula", "boo1xyz", &ok, &gist), Verdict::Refuted(r) if r.contains("address")));
         assert!(matches!(verdict("alice", "jackdishman/blockula", "boo1abc", &ok, &("bob".into(), gist.1.clone())), Verdict::Refuted(r) if r.contains("owned by")));
+        // Only merges into the default branch count. An open PR elsewhere may still be retargeted.
+        assert!(matches!(verdict("alice", "jackdishman/blockula", "boo1abc", &pr_into("closed", true, "alice", "jackdishman/blockula", "scratch"), &gist), Verdict::Refuted(r) if r.contains("merged into scratch, not jackdishman/blockula's default branch (main)")));
+        assert_eq!(verdict("alice", "jackdishman/blockula", "boo1abc", &pr_into("open", false, "alice", "jackdishman/blockula", "scratch"), &gist), Verdict::Wait);
+        assert!(matches!(verdict("alice", "jackdishman/blockula", "boo1abc", &parse_pr(&json!({ "state": "closed", "merged": true, "merge_commit_sha": "a".repeat(40), "user": { "login": "alice" }, "base": { "repo": { "full_name": "jackdishman/blockula" } } })), &gist), Verdict::Refuted(_)));
     }
 }

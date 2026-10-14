@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { Splash, useAccountResolution } from "@/components/Gate";
 import { NameClaim } from "@/components/NameClaim";
+import { Ornament, type OrnamentKind } from "@/components/Ornament";
 import { ErrorNote, Spinner, Tip } from "@/components/ui";
 import { friendly, isPrfUnsupported } from "@/lib/errors";
 import { createLocalKey, createPasskey, unlockPasskey } from "@/lib/keys";
@@ -13,19 +14,22 @@ import { useWallet } from "@/lib/wallet";
 
 type Step = 0 | 1 | 2 | "start" | "prf" | "fund" | "name" | "done";
 
-const INTRO = [
+const INTRO: { ornament: OrnamentKind; chapter: string; title: string; body: string }[] = [
   {
-    emoji: "🧛",
+    ornament: "bat",
+    chapter: "Chapter I",
     title: "A wallet is a key, not a vault",
     body: "Your FANG lives on the Blockula blockchain, a public ledger kept by many computers. A wallet holds the secret key that proves which coins are yours and lets you move them.",
   },
   {
-    emoji: "🔑",
+    ornament: "key",
+    chapter: "Chapter II",
     title: "No seed phrase. Just your passkey.",
     body: "Face ID, Touch ID or your password manager unlocks your wallet. There are no 24 words to write down or lose, and this site never sees or stores your key. Your passkey re-creates it each time.",
   },
   {
-    emoji: "🛡️",
+    ornament: "moon",
+    chapter: "Chapter III",
     title: "Safe from tomorrow's quantum computers",
     body: "A large quantum computer could forge the signatures Bitcoin and Ethereum use. Blockula signs with ML-DSA-65, a NIST post-quantum standard. Your passkey only unlocks that key; it never signs anything on-chain.",
   },
@@ -113,9 +117,10 @@ export default function Welcome() {
     const s = INTRO[step];
     return (
       <main className="narrow center onboarding">
-        <div className="hero-emoji">{s.emoji}</div>
+        <Ornament kind={s.ornament} className="hero-ornament" />
+        <span className="eyebrow">{s.chapter}</span>
         <h1>{s.title}</h1>
-        <p className="lead">{s.body}</p>
+        <p className="chapter-body">{s.body}</p>
         <div className="dots">{INTRO.map((_, i) => <span key={i} className={i === step ? "on" : ""} />)}</div>
         <button className="btn primary big" onClick={() => setStep(step < 2 ? ((step + 1) as Step) : "start")}>
           {step < 2 ? "Next" : "Let's go"}
@@ -129,7 +134,7 @@ export default function Welcome() {
     return (
       <main className="narrow stack-lg">
         <div className="center">
-          <div className="hero-emoji">🎃</div>
+          <span className="eyebrow">Your wallet</span>
           <h1>Create your wallet</h1>
           <p className="dim">One tap with your passkey. Takes about five seconds.</p>
         </div>
@@ -139,7 +144,7 @@ export default function Welcome() {
             <input value={nickname} onChange={(e) => setNickname(e.target.value)} placeholder="Blockula wallet" />
           </label>
           <button className="btn primary big" disabled={!!busy} onClick={create}>
-            {busy === "create" ? <Spinner>Waiting for your passkey…</Spinner> : "🔑 Create wallet with passkey"}
+            {busy === "create" ? <Spinner>Waiting for your passkey…</Spinner> : "Create wallet with passkey"}
           </button>
           <ErrorNote error={error} />
         </section>
@@ -159,7 +164,7 @@ export default function Welcome() {
     return (
       <main className="narrow stack-lg">
         <div className="center">
-          <div className="hero-emoji">🕯️</div>
+          <Ornament kind="candle" className="hero-ornament" />
           <h1>Your passkey can&apos;t unlock a wallet (yet)</h1>
         </div>
         <section className="card stack">
@@ -176,7 +181,7 @@ export default function Welcome() {
           <p className="dim">
             We can make a <b>browser-only key</b>: a random secret saved in this browser&apos;s storage. Anyone with access to this browser profile could read it, and clearing site data deletes it. Fine for a test chain, not for anything you care about.
           </p>
-          <button className="btn" onClick={local}>⚠️ Use a browser-only key (less secure, for testing)</button>
+          <button className="btn" onClick={local}>Use a browser-only key (less secure, for testing)</button>
         </section>
       </main>
     );
@@ -184,7 +189,7 @@ export default function Welcome() {
   if (step === "fund")
     return (
       <main className="narrow center stack-lg">
-        <div className="hero-emoji">🦇</div>
+        <Ornament kind="bat" className="hero-ornament" />
         <h1>{funded ? `${funded} landed!` : "Fetching some test FANG…"}</h1>
         <p className="lead">
           {funded
@@ -201,7 +206,7 @@ export default function Welcome() {
     return (
       <main className="narrow stack-lg">
         <div className="center">
-          <div className="hero-emoji">🏷️</div>
+          <span className="eyebrow">Your name</span>
           <h1>Claim your .boo name</h1>
           <p className="dim">
             Your address is a long string like boo1qx…k3. A name points to it, so friends can send to <b>vlad.boo</b> instead.
@@ -216,7 +221,7 @@ export default function Welcome() {
 
   return (
     <main className="narrow center stack-lg">
-      <div className="hero-emoji">🧛‍♀️</div>
+      <Ornament kind="moon" className="hero-ornament" />
       <h1>{claimed ? `Welcome to the night, ${claimed}` : "Your wallet is ready"}</h1>
       <p className="lead">
         You now own a quantum-safe account. Next time, just unlock with your passkey. There&apos;s nothing to back up, but linking a second device is a good idea.

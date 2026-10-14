@@ -223,6 +223,9 @@ fn award(dir: &Path, id: u64, pr: u64, to: Option<String>, familiar: Option<Stri
         if !p.merged {
             bail!("{repo}#{pr} isn't merged ({}). Award it once it merges, or pass --skip-github --to …", p.state);
         }
+        if !p.on_default_branch() {
+            bail!("{repo}#{pr} merged into {}, not the default branch ({}). Pass --skip-github --to … to award it anyway", p.base_branch, p.default_branch);
+        }
         let mention = format!("#{issue}");
         if !p.body.contains(&mention) && !p.title.contains(&mention) {
             println!("⚠️  PR #{pr} doesn't mention issue {mention}; double-check it's the right PR.");

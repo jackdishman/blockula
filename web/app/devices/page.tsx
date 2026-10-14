@@ -27,18 +27,18 @@ function Devices() {
   return (
     <main className="narrow stack-lg">
       <Link href="/" className="back">← Home</Link>
-      <h1>🔑 Devices &amp; agents</h1>
+      <h1>Devices &amp; agents</h1>
       <p className="dim">
         Your account isn&apos;t one key: it&apos;s a list of keys, each with its own permissions. Owners can do anything. Agents (session keys) can only send FANG, within a limit, until they expire.
       </p>
 
       <section className="card">
-        <h2>👑 Owner devices</h2>
+        <h2>Owner devices</h2>
         {owners.map((k) => <KeyRow key={k.key_id} k={k} canRevoke={owners.length > 1} />)}
       </section>
 
       <section className="card">
-        <h2>🤖 Agents with a budget</h2>
+        <h2>Agents with a budget</h2>
         {sessions.length ? sessions.map((k) => <KeyRow key={k.key_id} k={k} canRevoke />) : <p className="dim">No agents yet.</p>}
       </section>
 
@@ -90,7 +90,7 @@ function KeyRow({ k, canRevoke }: { k: KeyView; canRevoke: boolean }) {
   return (
     <div className="key-row">
       <div className="grow">
-        <b>{k.label}</b> {mine && <span className="pill">this device</span>}
+        <span className="key-label">{k.label}</span> {mine && <span className="pill">this device</span>}
         <span className="dim small block mono">{keyCode(k.key_id)} · added {k.added_at ? `at block #${k.added_at}` : "at creation"}</span>
         {detail}
         <ErrorNote error={error} />
@@ -131,7 +131,7 @@ function AddDevice() {
 
   return (
     <section className="card stack" id="device">
-      <h2>📲 Link a device</h2>
+      <h2>Link a device</h2>
       <ol className="steps">
         <li>On the new device, open this wallet and choose <b>Link this device to a wallet on another device</b>.</li>
         <li>It shows a key id. Paste it here.</li>
@@ -150,7 +150,7 @@ function AddDevice() {
         {busy ? <Spinner>Adding…</Spinner> : "Add as owner device"}
       </button>
       <ErrorNote error={error} />
-      {done && <p className="ok">✅ {done.summary}. <ExplorerLink href={explorer.tx(done.id)}>View ↗</ExplorerLink></p>}
+      {done && <p className="ok">✓ {done.summary}. <ExplorerLink href={explorer.tx(done.id)}>View ↗</ExplorerLink></p>}
       <Tip>The new device gets full control, just like this one. That&apos;s your backup: if you lose one device, the other still works, and you can revoke the lost one here.</Tip>
     </section>
   );
@@ -202,7 +202,7 @@ SDK:  await wallet.actAs("${me}");
 
   return (
     <section className="card stack" id="agent">
-      <h2>🤖 Give an agent a budget</h2>
+      <h2>Give an agent a budget</h2>
       <p className="dim">
         Let an AI agent pay for things without handing over your wallet. It gets its own key, a daily limit and an expiry date, and can only send FANG.
       </p>
@@ -246,7 +246,7 @@ SDK:  await wallet.actAs("${me}");
       <ErrorNote error={error} />
       {done && (
         <div className="stack">
-          <p className="ok">✅ {done.tx.summary}. <ExplorerLink href={explorer.tx(done.tx.id)}>View ↗</ExplorerLink></p>
+          <p className="ok">✓ {done.tx.summary}. <ExplorerLink href={explorer.tx(done.tx.id)}>View ↗</ExplorerLink></p>
           <span className="dim small">Tell your agent:</span>
           <pre className="snippet">{snippet}</pre>
           <Copy text={snippet} label="Copy for your agent" />
