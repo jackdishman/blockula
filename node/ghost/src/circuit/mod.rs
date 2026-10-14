@@ -30,14 +30,14 @@ use std::sync::OnceLock;
 use p3_air::check_all_constraints;
 use p3_field::PrimeCharacteristicRing;
 use p3_uni_stark::Proof;
-use rand::rngs::{StdRng, SysRng};
-use rand::{CryptoRng, Rng, SeedableRng};
+use rand::rngs::SysRng;
+use rand::{CryptoRng, TryRng};
 
 use crate::field::{Digest, F, u64_to_limbs, xof_to_digest};
 use crate::hash::{Domain, sponge};
 use crate::keys::SpendingKey;
 use crate::note::{Note, nullifier};
-use crate::tree::{DEPTH, MerklePath};
+use crate::tree::MerklePath;
 use air::ActionAir;
 use config::{Config, config};
 use layout::{LOG_HEIGHT, pv};
@@ -115,13 +115,13 @@ impl SpendWitness {
 
     /// The nullifier this spend reveals.
     pub fn nullifier(&self) -> Digest {
-        let fvk_nk = sponge(Domain::NullifierKey, &self.sk);
+        let nk = sponge(Domain::NullifierKey, &self.sk);
         let ak = sponge(Domain::SpendAuth, &self.sk);
         let mut own = [F::ZERO; 16];
         own[..8].copy_from_slice(&ak);
-        own[8..].copy_from_slice(&fvk_nk);
+        own[8..].copy_from_slice(&nk);
         let note = Note { owner: sponge(Domain::Owner, &own), ..self.note };
-        nullifier(&fvk_nk, &note.commitment(), self.path.position)
+        nullifier(&nk, &note.commitment(), self.path.position)
     }
 }
 
@@ -136,7 +136,7 @@ fn random_bytes<R: CryptoRng + ?Sized, const N: usize>(rng: &mut R) -> [u8; N] {
 pub struct ActionWitness {
     /// Exactly two spends (pad with [`SpendWitness::dummy`]).
     pub spends: [SpendWitness; 2],
-    /// Exactly two outputs (pad with zero-value notes to a random owner).
+    /// Exactly two outputs (pad with [`crate::encryption::dummy_output`]).
     pub outputs: [Note; 2],
     /// The tree root the real spends are in.
     pub anchor: Digest,
@@ -244,9 +244,7 @@ fn check_and_build(w: &ActionWitness) -> Result<(PublicInputs, trace::Built), Pr
 /// Proves an action with fresh OS randomness for the zero-knowledge masks.
 pub fn prove(w: &ActionWitness) -> Result<(PublicInputs, Vec<u8>), ProveError> {
     let mut seed = [0u8; 32];
-    StdRng::try_from_rng(&mut SysRng)
-        .map_err(|e| ProveError::Prover(format!("os randomness: {e}")))?
-        .fill_bytes(&mut seed);
+    SysRng.try_fill_bytes(&mut seed).map_err(|e| ProveError::Prover(format!("os randomness: {e}")))?;
     prove_with_seed(w, seed)
 }
 
@@ -304,6 +302,3 @@ fn verify_fields(fields: &[F], bytes: &[u8]) -> Result<(), VerifyError> {
     let proof = decode_proof(bytes)?;
     p3_uni_stark::verify(&config([0; 32]), action_air(), &proof, fields).map_err(|_| VerifyError::Invalid)
 }
-
-/// The tree depth the circuit proves membership at.
-pub const MERKLE_DEPTH: usize = DEPTH;

@@ -14,7 +14,7 @@ use super::trace::{Built, Cheat, RawAction, build, build_with};
 use super::*;
 use crate::field::P;
 use crate::hash::permute;
-use crate::tree::FullTree;
+use crate::tree::{DEPTH, FullTree};
 
 /// An action spending `ins` (`None` = dummy) from one wallet, in a tree with other people's
 /// notes, and creating `outs` for a random recipient.
