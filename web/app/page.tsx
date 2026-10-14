@@ -43,6 +43,12 @@ function Home() {
         </div>
       </section>
 
+      {hint.pendingKit && !account.keys.some((k) => k.key_id === hint.pendingKit?.keyId) && (
+        <div className="banner">
+          <b>Your recovery kit isn&apos;t active yet.</b> <Link href="/devices#recovery">Activate it</Link> once you have a little FANG for the fee.
+        </div>
+      )}
+
       <Tutorial state={tutorial} update={updateTutorial} />
 
       <section className="card">

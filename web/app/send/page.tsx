@@ -7,7 +7,7 @@ import { Suspense, useEffect, useState } from "react";
 import { RequireWallet } from "@/components/Gate";
 import { Ornament } from "@/components/Ornament";
 import { ErrorNote, ExplorerLink, Spinner, Tip } from "@/components/ui";
-import { explorer } from "@/lib/config";
+import { explorer, MAINNET_PREFIX, NETWORK } from "@/lib/config";
 import { friendly } from "@/lib/errors";
 import { shortAddr } from "@/lib/format";
 import type { NameView, TxView } from "@/lib/types";
@@ -37,7 +37,11 @@ function useRecipient(input: string): Recipient {
   useEffect(() => {
     const q = input.trim().toLowerCase();
     if (!q) return setR({ state: "empty" });
-    if (q.startsWith("boo1")) {
+    // This chain's address prefix (DEC-7): another network's address is refused, never "converted".
+    const hrp = client.pin.prefix ?? MAINNET_PREFIX;
+    const prefix = q.match(/^([a-z]+)1[a-z0-9]{40,}$/)?.[1];
+    if (prefix && prefix !== hrp) return setR({ state: "bad", msg: `That's an address on another network (${prefix}1…). ${NETWORK.label} addresses start with ${hrp}1.` });
+    if (q.startsWith(`${hrp}1`)) {
       if (!isAddress(q)) return setR({ state: "bad", msg: "That address doesn't look right. Check for typos." });
       const label = status?.validator.address === q ? "the validator" : "an address";
       return setR({ state: "ok", address: q, display: shortAddr(q), detail: label });
@@ -197,7 +201,7 @@ function Send() {
       <section className="card stack">
         <label className="field">
           <span>To</span>
-          <input value={to} onChange={(e) => setTo(e.target.value)} placeholder="alice.boo or boo1…" autoCapitalize="none" autoCorrect="off" spellCheck={false} />
+          <input value={to} onChange={(e) => setTo(e.target.value)} placeholder={`alice.boo or ${client.pin.prefix ?? MAINNET_PREFIX}1…`} autoCapitalize="none" autoCorrect="off" spellCheck={false} />
         </label>
         <div className="name-status" aria-live="polite">
           {recipient.state === "checking" && <Spinner>Looking up…</Spinner>}

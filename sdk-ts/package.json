@@ -17,7 +17,8 @@
   "scripts": {
     "build": "tsc",
     "test": "tsx test/e2e.ts",
-    "test:kat": "tsx test/kat.ts"
+    "test:kat": "tsx test/kat.ts",
+    "test:vectors": "tsx test/passkey-vectors.ts"
   },
   "license": "MIT",
   "dependencies": {

@@ -6,13 +6,15 @@ import { useEffect, useRef, useState } from "react";
 import { Splash, useAccountResolution } from "@/components/Gate";
 import { NameClaim } from "@/components/NameClaim";
 import { Ornament, type OrnamentKind } from "@/components/Ornament";
+import { RecoveryKitSetup } from "@/components/RecoveryKit";
 import { ErrorNote, Spinner, Tip } from "@/components/ui";
+import { localKeysAllowed } from "@/lib/config";
 import { friendly, isPrfUnsupported } from "@/lib/errors";
 import { createLocalKey, createPasskey, unlockPasskey } from "@/lib/keys";
 import type { Hint } from "@/lib/session";
 import { useWallet } from "@/lib/wallet";
 
-type Step = 0 | 1 | 2 | "start" | "prf" | "fund" | "name" | "done";
+type Step = 0 | 1 | 2 | "start" | "prf" | "fund" | "kit" | "name" | "done";
 
 const INTRO: { ornament: OrnamentKind; chapter: string; title: string; body: string }[] = [
   {
@@ -25,7 +27,7 @@ const INTRO: { ornament: OrnamentKind; chapter: string; title: string; body: str
     ornament: "key",
     chapter: "Chapter II",
     title: "No seed phrase. Just your passkey.",
-    body: "Face ID, Touch ID or your password manager unlocks your wallet. There are no 24 words to write down or lose, and this site never sees or stores your key. Your passkey re-creates it each time.",
+    body: "Face ID, Touch ID or your password manager unlocks your wallet. There's no seed phrase to type in, and this site never stores your key: your passkey re-creates it each time. A paper recovery kit is your backup if every device is lost.",
   },
   {
     ornament: "moon",
@@ -98,7 +100,7 @@ export default function Welcome() {
     if (step !== "fund" || !wallet || !status || fundStarted.current) return;
     fundStarted.current = true;
     if (!status.faucet) {
-      setStep("name");
+      setStep("kit");
       return;
     }
     wallet
@@ -153,6 +155,7 @@ export default function Welcome() {
             {busy === "existing" ? <Spinner>Waiting for your passkey…</Spinner> : "I already have a wallet"}
           </button>
           <Link className="btn ghost" href="/link">Link this device to a wallet on another device</Link>
+          <Link className="btn ghost" href="/recover">Restore with a recovery kit</Link>
           <p className="dim small">
             Passkeys sync through iCloud Keychain, Google Password Manager or 1Password, so your wallet usually just appears on your other devices. Use linking when they don&apos;t share a passkey provider.
           </p>
@@ -176,13 +179,15 @@ export default function Welcome() {
           </p>
           <button className="btn primary" onClick={() => setStep("start")}>← Try another passkey</button>
         </section>
-        <section className="card stack warn-card">
-          <h2>Just testing?</h2>
-          <p className="dim">
-            We can make a <b>browser-only key</b>: a random secret saved in this browser&apos;s storage. Anyone with access to this browser profile could read it, and clearing site data deletes it. Fine for a test chain, not for anything you care about.
-          </p>
-          <button className="btn" onClick={local}>Use a browser-only key (less secure, for testing)</button>
-        </section>
+        {localKeysAllowed(client.pin.chainId) && (
+          <section className="card stack warn-card">
+            <h2>Just testing?</h2>
+            <p className="dim">
+              We can make a <b>browser-only key</b>: a random secret saved in this browser&apos;s storage. Anyone with access to this browser profile could read it, and clearing site data deletes it. Fine for a test chain, not for anything you care about.
+            </p>
+            <button className="btn" onClick={local}>Use a browser-only key (less secure, for testing)</button>
+          </section>
+        )}
       </main>
     );
 
@@ -198,7 +203,19 @@ export default function Welcome() {
         </p>
         {!funded && !error && <Spinner>Waiting for the next block…</Spinner>}
         <ErrorNote error={error} />
-        {(funded || error) && <button className="btn primary big" onClick={() => { setError(null); setStep("name"); }}>Next: claim a name</button>}
+        {(funded || error) && <button className="btn primary big" onClick={() => { setError(null); setStep("kit"); }}>Next: your recovery kit</button>}
+      </main>
+    );
+
+  if (step === "kit")
+    return (
+      <main className="narrow stack-lg">
+        <div className="center">
+          <span className="eyebrow">Your backup</span>
+          <h1>Make a recovery kit</h1>
+          <p className="dim">Passkeys sync between your devices, but providers can lose them or lock you out. A kit on paper still gets you in.</p>
+        </div>
+        <RecoveryKitSetup onFinish={() => setStep("name")} finishLabel="Next: claim a name" onSkip={() => setStep("name")} />
       </main>
     );
 
@@ -224,7 +241,7 @@ export default function Welcome() {
       <Ornament kind="moon" className="hero-ornament" />
       <h1>{claimed ? `Welcome to the night, ${claimed}` : "Your wallet is ready"}</h1>
       <p className="lead">
-        You now own a quantum-safe account. Next time, just unlock with your passkey. There&apos;s nothing to back up, but linking a second device is a good idea.
+        You now own a quantum-safe account. Next time, just unlock with your passkey. Linking a second device is a good idea too, and if you skipped the recovery kit, make one from Devices &amp; agents.
       </p>
       <Tip>Your home screen has a short checklist that walks you through sending, the explorer, and giving an AI agent a budget.</Tip>
       <button className="btn primary big" onClick={() => router.replace("/")}>Open my wallet</button>

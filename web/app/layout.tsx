@@ -1,6 +1,8 @@
 import type { Metadata, Viewport } from "next";
 import { Courier_Prime, EB_Garamond, IM_Fell_English, IM_Fell_English_SC, UnifrakturMaguntia } from "next/font/google";
+import { connection } from "next/server";
 import type { ReactNode } from "react";
+import { ChainGate } from "@/components/ChainGate";
 import { Header } from "@/components/Header";
 import { Ornament } from "@/components/Ornament";
 import { WalletProvider } from "@/lib/wallet";
@@ -21,13 +23,15 @@ export const metadata: Metadata = {
 
 export const viewport: Viewport = { themeColor: "#ece3cd", width: "device-width", initialScale: 1 };
 
-export default function RootLayout({ children }: { children: ReactNode }) {
+export default async function RootLayout({ children }: { children: ReactNode }) {
+  // Render per request: the CSP nonce (proxy.ts) is new on every response, so no page is static.
+  await connection();
   return (
     <html lang="en" className={`${fell.variable} ${fellSc.variable} ${garamond.variable} ${courier.variable} ${fraktur.variable}`}>
       <body>
         <WalletProvider>
           <Header />
-          {children}
+          <ChainGate>{children}</ChainGate>
           <footer className="imprint">
             <Ornament kind="bat" />
             <span className="caps">Quantum-safe ML-DSA-65 keys · Unlocked by passkeys</span>

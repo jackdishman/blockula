@@ -4,10 +4,12 @@ import { formatFang, parseFang } from "@blockula/sdk";
 import Link from "next/link";
 import { useState } from "react";
 import { RequireWallet } from "@/components/Gate";
+import { RecoveryKitSetup } from "@/components/RecoveryKit";
 import { Copy, ErrorNote, ExplorerLink, Spinner, Tip } from "@/components/ui";
 import { BLOCKS_PER_DAY, explorer } from "@/lib/config";
 import { friendly } from "@/lib/errors";
 import { blocksToHuman, isKeyId, keyCode } from "@/lib/format";
+import { KIT_LABEL } from "@/lib/recovery";
 import type { KeyView, TxView } from "@/lib/types";
 import { useUnlocked } from "@/lib/wallet";
 
@@ -23,6 +25,7 @@ function Devices() {
   const { account } = useUnlocked();
   if (!account) return <main className="narrow"><Spinner>Loading…</Spinner></main>;
   const owners = account.keys.filter((k) => k.role.type === "owner");
+  const devices = owners.filter((k) => k.label !== KIT_LABEL);
   const sessions = account.keys.filter((k) => k.role.type === "session");
   return (
     <main className="narrow stack-lg">
@@ -34,8 +37,10 @@ function Devices() {
 
       <section className="card">
         <h2>Owner devices</h2>
-        {owners.map((k) => <KeyRow key={k.key_id} k={k} canRevoke={owners.length > 1} />)}
+        {devices.map((k) => <KeyRow key={k.key_id} k={k} canRevoke={owners.length > 1} />)}
       </section>
+
+      <RecoverySection kits={owners.filter((k) => k.label === KIT_LABEL)} canRevoke={owners.length > 1} />
 
       <section className="card">
         <h2>Agents with a budget</h2>
@@ -101,6 +106,56 @@ function KeyRow({ k, canRevoke }: { k: KeyView; canRevoke: boolean }) {
         </button>
       )}
     </div>
+  );
+}
+
+/** The account's recovery kits (owner keys kept on paper), a kit waiting for fee money, and making a new one. */
+function RecoverySection({ kits, canRevoke }: { kits: KeyView[]; canRevoke: boolean }) {
+  const { wallet, account, hint, updateHint, refresh } = useUnlocked();
+  const [making, setMaking] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const pending = hint.pendingKit && !account?.keys.some((k) => k.key_id === hint.pendingKit?.keyId) ? hint.pendingKit : null;
+
+  const activate = async () => {
+    if (!pending) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await wallet.addOwnerKey(pending.keyId, KIT_LABEL);
+      updateHint({ pendingKit: undefined });
+      await refresh();
+    } catch (e) {
+      setError(friendly(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <>
+      <section className="card stack" id="recovery">
+        <h2>Recovery kit</h2>
+        {kits.length ? (
+          kits.map((k) => <KeyRow key={k.key_id} k={k} canRevoke={canRevoke} />)
+        ) : (
+          <p className="dim">No recovery kit yet. If every device and passkey were lost, nothing could get you back in.</p>
+        )}
+        {pending && !making && (
+          <div className="stack warn-card card" data-testid="kit-pending">
+            <p>
+              The kit you made on {pending.created} (key <span className="mono">{keyCode(pending.keyId)}</span>) isn&apos;t on your account yet. Adding it needs a tiny fee.
+            </p>
+            <button className="btn primary" disabled={busy} onClick={activate}>{busy ? <Spinner>Activating…</Spinner> : "Activate my kit"}</button>
+            <button className="link" onClick={() => updateHint({ pendingKit: undefined })}>I lost it: forget this kit</button>
+            <ErrorNote error={error} />
+          </div>
+        )}
+        {!making && <button className="btn" onClick={() => setMaking(true)}>{kits.length ? "Make a new kit" : "Make a recovery kit"}</button>}
+        <Tip>A kit is 24 words on paper that act as an owner key. Made a new one? Revoke the old kit above, so a lost copy stops working.</Tip>
+      </section>
+      {making && <RecoveryKitSetup onFinish={() => setMaking(false)} onSkip={() => setMaking(false)} skipLabel="Cancel" />}
+    </>
   );
 }
 

@@ -1,19 +1,29 @@
 "use client";
 
-import { Client, Wallet } from "@blockula/sdk";
+import { Wallet } from "@blockula/sdk";
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { RPC } from "./config";
+import { ChainMismatchError, networkClient, type PinnedClient } from "./chain";
+import { ensureRpcCookie } from "./config";
+import { friendly } from "./errors";
 import { clearHint, loadHint, saveHint, type Hint } from "./session";
 import type { AccountView, Status } from "./types";
 
+/** Is the node on the chain this wallet is pinned to? A mismatch is final until reload. */
+export type ChainState =
+  | { state: "checking" }
+  | { state: "ok" }
+  | { state: "unreachable"; error: string }
+  | { state: "mismatch"; error: ChainMismatchError };
+
 interface Ctx {
-  client: Client;
+  client: PinnedClient;
   /** Has localStorage been read yet? (false during SSR/first paint) */
   ready: boolean;
   hint: Hint | null;
   wallet: Wallet | null;
   account: AccountView | null;
   status: Status | null;
+  chain: ChainState;
   refresh: () => Promise<void>;
   /** Store the unlocked wallet in memory and its non-secret hints on disk. */
   unlocked: (wallet: Wallet, hint: Hint) => void;
@@ -25,8 +35,10 @@ interface Ctx {
 const WalletCtx = createContext<Ctx | null>(null);
 
 export function WalletProvider({ children }: { children: ReactNode }) {
-  const client = useMemo(() => new Client(RPC), []);
+  const client = useMemo(() => networkClient(), []);
   const [ready, setReady] = useState(false);
+  const [chain, setChain] = useState<ChainState>({ state: "checking" });
+  const mismatch = useRef(false);
   const [hint, setHint] = useState<Hint | null>(null);
   const [wallet, setWallet] = useState<Wallet | null>(null);
   const [account, setAccount] = useState<AccountView | null>(null);
@@ -35,13 +47,27 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   walletRef.current = wallet;
 
   useEffect(() => {
+    ensureRpcCookie();
     setHint(loadHint());
     setReady(true);
   }, []);
 
   const refresh = useCallback(async () => {
-    const st = await client.status().catch(() => null);
-    if (st) setStatus(st as Status);
+    if (mismatch.current) return;
+    const st = await client.status().catch((e) => {
+      if (e instanceof ChainMismatchError) {
+        // Wrong chain: drop the key from memory and stop talking to this node.
+        mismatch.current = true;
+        walletRef.current = null;
+        setWallet(null);
+        setAccount(null);
+        setChain({ state: "mismatch", error: e });
+      } else setChain((c) => (c.state === "ok" ? c : { state: "unreachable", error: friendly(e) }));
+      return null;
+    });
+    if (!st) return;
+    setStatus(st);
+    setChain((c) => (c.state === "ok" ? c : { state: "ok" }));
     const w = walletRef.current;
     if (!w || !hintRef.current?.account) return;
     const a = (await client.account(w.account).catch(() => null)) as AccountView | null;
@@ -95,7 +121,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     setAccount(null);
   }, []);
 
-  const value = { client, ready, hint, wallet, account, status, refresh, unlocked, updateHint, lock, forget };
+  const value = { client, ready, hint, wallet, account, status, chain, refresh, unlocked, updateHint, lock, forget };
   // Render client-side only: the chosen network and hints live in this browser, so server HTML
   // would disagree with the client on first paint.
   return <WalletCtx.Provider value={value}>{ready ? children : null}</WalletCtx.Provider>;

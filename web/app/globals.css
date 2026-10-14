@@ -49,6 +49,14 @@ header nav { display: flex; gap: 22px; align-items: center; flex-wrap: wrap; fon
 header nav a { color: var(--ink-soft); text-decoration: none; padding: 2px 0; border-bottom: 2px solid transparent; }
 header nav a:hover { color: var(--ink); border-bottom-color: var(--hair); }
 header nav a.active { color: var(--ink); border-bottom-color: var(--blood); }
+/* The network, stamped beside the masthead on every screen: plain ink for mainnet, a red rubber stamp for anything else. */
+.masthead { display: inline-flex; align-items: center; gap: 8px 16px; flex-wrap: wrap; }
+.net-badge { display: inline-flex; align-items: baseline; gap: 8px; padding: 1px 9px 2px; border: 1.5px solid var(--ink); font: 400 14px/1.4 var(--caps); letter-spacing: 0.1em; text-transform: lowercase; white-space: nowrap; }
+.net-badge .net-chain { font: 400 13px var(--mono); letter-spacing: 0; text-transform: none; color: var(--dim); }
+.net-badge.test { border-style: dashed; border-color: var(--blood); color: var(--blood); transform: rotate(-1.5deg); }
+.net-badge.test .net-chain { color: var(--blood); }
+.net-badge.custom { background: var(--blood); border-color: var(--blood); color: var(--paper-hi); }
+.net-badge.custom .net-chain { color: var(--paper-hi); }
 .net-select { font: 400 15px var(--caps); letter-spacing: 0.04em; background: transparent; color: var(--ink); border: 1px solid var(--hair); border-radius: 0; padding: 3px 6px; cursor: pointer; }
 .net-select:hover { border-color: var(--ink); }
 main { flex: 1; width: 100%; padding: 44px 20px 64px; }
@@ -206,6 +214,18 @@ input.mono { font-family: var(--mono); font-size: 16px; }
 .section-head { display: flex; flex-direction: column; gap: 6px; }
 .section-head h1 { margin: 0; }
 
+/* Recovery kit: a printed certificate */
+.kit-sheet { display: flex; flex-direction: column; gap: 18px; }
+.kit-title { font: italic 400 30px/1.1 var(--display); letter-spacing: 0; margin: 0; word-break: break-all; }
+.kit-words { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(4, 1fr); gap: 0 14px; border-top: 1px solid var(--ink); border-bottom: 1px solid var(--ink); }
+.kit-words li { display: flex; align-items: baseline; gap: 8px; padding: 7px 2px; border-bottom: 1px solid var(--hair); }
+.kit-n { font: 400 13px var(--mono); color: var(--blood); min-width: 18px; text-align: right; }
+.kit-w { font: 700 17px var(--mono); }
+.kit-facts { font-size: 15px; }
+.kit-warning { font-style: italic; color: var(--blood); margin: 0; text-align: center; }
+textarea { width: 100%; padding: 10px; border: 1.5px solid var(--ink); border-radius: 0; background: var(--paper-hi); color: var(--ink); font: 400 17px/1.6 var(--mono); resize: vertical; }
+textarea:focus { outline: none; border-color: var(--blood); box-shadow: 0 0 0 1px var(--blood); }
+
 /* Onboarding: each intro step is a chapter opening */
 .onboarding { min-height: 62vh; justify-content: center; }
 .chapter-body { text-align: left; max-width: 500px; font-size: 20px; line-height: 1.55; color: var(--ink-soft); }
@@ -236,6 +256,17 @@ input.mono { font-family: var(--mono); font-size: 16px; }
   .activity-kind { grid-column: 1 / -1; margin-bottom: -10px; }
   .kv { grid-template-columns: 100px 1fr; }
   .chapter-body { font-size: 18px; }
+}
+@media (max-width: 520px) {
+  .kit-words { grid-template-columns: repeat(2, 1fr); }
+}
+/* Printing shows the recovery kit alone, in black ink on white. */
+@media print {
+  html, body { background: #fff; }
+  body * { visibility: hidden; }
+  .kit-sheet, .kit-sheet * { visibility: visible; }
+  .card.plate.kit-sheet { position: absolute; inset: 0 0 auto 0; background: #fff; }
+  .no-print { display: none !important; }
 }
 @media (prefers-reduced-motion: reduce) { .splash .ornament-bat, .spinner { animation: none; } }
 

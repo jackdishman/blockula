@@ -1,8 +1,10 @@
 "use client";
 
 import { Wallet } from "@blockula/sdk";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useState, type ReactNode } from "react";
+import { localKeysAllowed } from "@/lib/config";
 import { friendly, isPrfUnsupported } from "@/lib/errors";
 import { findAccounts, unlockPasskey, type AccountChoice } from "@/lib/keys";
 import type { Hint } from "@/lib/session";
@@ -69,12 +71,14 @@ export function Unlock() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const { resolve, picker } = useAccountResolution();
+  const localOk = localKeysAllowed(client.pin.chainId);
 
   const go = async () => {
     setBusy(true);
     setError(null);
     try {
       if (h.kind === "local") {
+        if (!localOk) throw new Error("Browser-only keys are disabled on mainnet. Switch to a test network to open this one.");
         const w = Wallet.fromSeed(h.seed as string, client);
         if (h.account) {
           await w.actAs(h.account);
@@ -92,7 +96,7 @@ export function Unlock() {
         await resolve(w, { v: 1, kind: "passkey", credentialId, keyId: w.keyId }, { waitingForLink: w.keyId === h.keyId });
       }
     } catch (e) {
-      setError(isPrfUnsupported(e) ? `${friendly(e)} Start over to use a browser-only key instead.` : friendly(e));
+      setError(isPrfUnsupported(e) && localOk ? `${friendly(e)} Start over to use a browser-only key instead.` : friendly(e));
     } finally {
       setBusy(false);
     }
@@ -100,7 +104,7 @@ export function Unlock() {
 
   // Browser-only keys have no prompt to wait for.
   useEffect(() => {
-    if (h.kind === "local") go();
+    if (h.kind === "local" && localOk) go();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -118,6 +122,7 @@ export function Unlock() {
         {busy ? <Spinner>Waiting for your passkey…</Spinner> : h.kind === "local" ? "Unlock browser-only key" : "Unlock with passkey"}
       </button>
       <ErrorNote error={error} />
+      {h.kind === "passkey" && <Link href="/recover" className="link">Lost your passkey? Restore with your recovery kit</Link>}
       <button
         className="link"
         onClick={() => {
