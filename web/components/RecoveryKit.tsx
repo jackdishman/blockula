@@ -13,7 +13,7 @@ type Stage =
   | { s: "intro" }
   | { s: "show"; kit: Kit }
   | { s: "confirm"; kit: Kit; ask: [number, number] }
-  | { s: "activate"; keyId: string; created: string }
+  | { s: "activate"; keyId: string }
   | { s: "done"; tx: TxView }
   | { s: "pending" };
 
@@ -57,7 +57,7 @@ export function RecoveryKitSetup({
     });
   };
 
-  const activate = async (keyId: string, created: string) => {
+  const activate = async (keyId: string) => {
     setBusy(true);
     setError(null);
     try {
@@ -67,11 +67,9 @@ export function RecoveryKitSetup({
       setStage({ s: "done", tx });
       await refresh();
     } catch (e) {
-      if (/insufficient balance/.test(e instanceof Error ? e.message : String(e))) {
-        // No FANG for the fee yet: remember the (public) key id and add it once there's some.
-        updateHint({ pendingKit: { keyId, created } });
-        setStage({ s: "pending" });
-      } else setError(friendly(e));
+      // The kit stays pending in the hint: Home and Devices offer to activate it later.
+      if (/insufficient balance/.test(e instanceof Error ? e.message : String(e))) setStage({ s: "pending" });
+      else setError(friendly(e));
     } finally {
       setBusy(false);
     }
@@ -83,9 +81,11 @@ export function RecoveryKitSetup({
     const wrong = ask.filter((p, i) => wordIndex(answers[i]) === undefined || wordIndex(answers[i]) !== wordIndex(kit.words[p]));
     if (wrong.length) return setError(`That isn't word #${wrong[0] + 1} on your kit. Check what you wrote down.`);
     setAnswers(["", ""]);
-    // The words have done their job: from here on only the key id is kept.
-    setStage({ s: "activate", keyId: kit.keyId, created: kit.created });
-    activate(kit.keyId, kit.created);
+    // The words have done their job: from here on only the (public) key id is kept, in the hint
+    // until the key is on-chain, so a kit written down is never silently lost.
+    updateHint({ pendingKit: { keyId: kit.keyId, created: kit.created } });
+    setStage({ s: "activate", keyId: kit.keyId });
+    activate(kit.keyId);
   };
 
   const skip = onSkip && (
@@ -163,7 +163,7 @@ export function RecoveryKitSetup({
       <section className="card stack">
         <h2>Adding the kit to your account</h2>
         {busy ? <Spinner>Sealing the kit&apos;s key into a block…</Spinner> : <ErrorNote error={error} />}
-        {!busy && error && <button className="btn primary" onClick={() => activate(stage.keyId, stage.created)}>Try again</button>}
+        {!busy && error && <button className="btn primary" onClick={() => activate(stage.keyId)}>Try again</button>}
       </section>
     );
 

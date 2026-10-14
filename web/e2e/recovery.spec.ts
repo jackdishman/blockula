@@ -75,6 +75,7 @@ test("makes a recovery kit during onboarding: print, download, confirm, activate
       const add = node.submitted.at(-1);
       expect(add?.action).toEqual({ type: "add_key", key_id: keyId, label: KIT_LABEL, role: { type: "owner" } });
       expect(add?.from).toBe(hint?.account);
+      expect(hint?.pendingKit).toBeUndefined();
       await p.getByRole("button", { name: "Next: claim a name" }).click();
     },
   });

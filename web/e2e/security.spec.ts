@@ -13,6 +13,7 @@ function directives(csp: string) {
 }
 
 test("every page gets a strict, nonce-based CSP and the security headers", async ({ request }) => {
+  test.skip(!!process.env.E2E_DEV, "next dev relaxes the CSP (eval, inline styles)");
   for (const path of ["/", "/welcome", "/devices", "/recover"]) {
     const res = await request.get(path);
     expect(res.status()).toBe(200);

@@ -141,7 +141,7 @@ function RecoverySection({ kits, canRevoke }: { kits: KeyView[]; canRevoke: bool
         ) : (
           <p className="dim">No recovery kit yet. If every device and passkey were lost, nothing could get you back in.</p>
         )}
-        {pending && (
+        {pending && !making && (
           <div className="stack warn-card card" data-testid="kit-pending">
             <p>
               The kit you made on {pending.created} (key <span className="mono">{keyCode(pending.keyId)}</span>) isn&apos;t on your account yet. Adding it needs a tiny fee.
