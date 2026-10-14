@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Local multi-node smoke test: 4 genesis validators (simplex BFT over authenticated p2p) + 1 full
 # node that joins over HTTP + a 5th validator onboarded with the CLI (init → faucet → register →
-# admin approve → active at the next epoch). Runs the SDK e2e against a validator and against the
-# full node, restarts a validator mid-run, then checks every node agrees on hashes and state roots.
+# admin approve → active at the next epoch). Runs the SDK e2e against a validator (with validator
+# 0 as the Season 0 admin, so the contribution pool's admin flow runs too) and against the full
+# node, restarts a validator mid-run, then checks every node agrees on hashes and state roots.
 #
 #   scripts/local-testnet.sh            # build release, run, tear down
 #   KEEP=1 scripts/local-testnet.sh     # leave the testnet running afterwards
@@ -59,7 +60,7 @@ PIDS[$N]=$!
 FULL="127.0.0.1:$FULL_PORT"
 
 echo "— SDK e2e against validator 2 (faucet + txs gossiped to whoever leads)"
-BLOCKULA_RPC="http://$V2" npm test -w @blockula/sdk
+BLOCKULA_RPC="http://$V2" BLOCKULA_ADMIN_SEED="$(cat "$DIR/v0/validator.key")" npm test -w @blockula/sdk
 
 echo "— onboarding a validator with the CLI"
 "$BIN" validator init --home "$DIR/v$N" --genesis "http://$V0" | tee "$DIR/init.txt"
@@ -123,6 +124,15 @@ for _ in $(seq 1 30); do
 done
 echo "  $out"
 BLOCKULA_HOME="$W" "$BIN" wallet send "$NEWV" 1.5 --memo "cli wallet" --rpc "http://$V0"
+
+echo "— CLI hunts + contribution pool"
+BLOCKULA_HOME="$W" "$BIN" hunt create jackdishman/blockula 1 10 --title "CLI hunt" --days 1 --rpc "http://$V0"
+WADDR=$(node -e "console.log(require('$W/wallet.json').address)")
+HID=$(curl -sf "http://$V0/api/account/$WADDR" | field '.hunts_created.at(-1)')
+BLOCKULA_HOME="$W" "$BIN" hunt award "$HID" --pr 1 --to "$NEWV" --skip-github --yes --rpc "http://$V0"
+BLOCKULA_HOME="$W" "$BIN" hunt show "$HID" --rpc "http://$FULL"
+BLOCKULA_HOME="$W" "$BIN" contrib fund 1 --rpc "http://$V0"
+"$BIN" contrib status --rpc "http://$FULL"
 
 echo "— fast join from a certified snapshot"
 wait_height "$V0" 106

@@ -28,7 +28,7 @@
 | GET | `/api/block/{height\|hash}` | block + txs |
 | GET | `/api/tx/{id}` | tx with `summary`, `status` (`pending`/`finalized`/`failed` + `error`) |
 | POST | `/api/tx` | submit signed tx JSON |
-| GET | `/api/account/{address\|name}` | balance, `next_nonce`, names, recent txs, `github`, `familiars`, hunts created/won |
+| GET | `/api/account/{address\|name}` | balance, `next_nonce`, names, recent txs, `github`, `familiars`, hunts created/won, `contribution` (Soul, vouches, jury seat, claims, vesting rewards) |
 | GET | `/api/name/{name}` | availability + price, or owner |
 | GET | `/api/key/{key_id}` | accounts this key is authorized on |
 | GET | `/api/search/{q}` | `{type, id}` for anything |
@@ -40,6 +40,11 @@
 | GET | `/api/hunts?status=` | Hunts (bounties on GitHub issues), biggest first; `open`/`awarded`/`cancelled`/`expired` |
 | GET | `/api/hunt/{id}` | one Hunt: repo#issue, bounty, funders, winner + PR, Familiar |
 | GET | `/api/github/{handle}` | off-chain check of a GitHub link (gist owned by the handle contains the account's address) |
+| GET | `/api/contributions` | the contribution pool: balance, repos, rules, the open Séance, recent Séances |
+| GET | `/api/claims?status=&account=` | contribution claims, newest first (`pending`/`verified`/`in_seance`/`scored`/`spam`/`rejected`) |
+| GET | `/api/claim/{id}` | one claim: PR, validator attestations, score, payout |
+| GET | `/api/seance/{id}` | one Séance: claims, jurors with their assigned pairs, commitments, reveals, results |
+| GET | `/api/souls?limit=` | Soul leaderboard |
 | GET | `/api/snapshot/latest` | newest certified state snapshot manifest (chunk hashes, certifying blocks + certificate, validator-set history) |
 | GET | `/api/snapshot/{height}/chunk/{i}` | snapshot chunk bytes |
 | GET | `/api/epochs` | validator-set history + handoff signatures |
@@ -56,7 +61,7 @@
 Agents are first-class contributors, as **Familiars** of a human sponsor. Rewards go to the sponsor's account, and so does accountability. See "Proof of Contribution" in [docs/PLAN.md](docs/PLAN.md).
 
 **Copy-paste prompt:**
-> Contribute to Blockula. Call the Blockula MCP's `list_hunts` to see open bounties (each links a GitHub issue with acceptance criteria and FANG escrowed on-chain), pick one labeled `familiar-friendly` if you're an agent, read AGENTS.md and CONTRIBUTING.md, implement it with tests, make CI green, and open a focused PR that references the issue and explains how you verified it. One solid PR beats many small ones.
+> Contribute to Blockula. Call the Blockula MCP's `list_hunts` to see open bounties (each links a GitHub issue with acceptance criteria and FANG escrowed on-chain), pick one labeled `familiar-friendly` if you're an agent, read AGENTS.md and CONTRIBUTING.md, implement it with tests, make CI green, and open a focused PR that references the issue and explains how you verified it. Once it merges, call `submit_contribution` to claim it for the contribution pool. One solid PR beats many small ones.
 
 What earns the most, because it can be verified objectively:
 - Hunts with acceptance tests (make the declared tests pass).
@@ -66,4 +71,12 @@ What earns the most, because it can be verified objectively:
 
 What earns nothing: PR floods, cosmetic churn, unverified changes. Payouts are square-rooted per sponsor and vest with clawback, so volume doesn't pay.
 
-Hunt bounties are live on the testnet now (`/api/hunts`, the explorer's 🏹 Hunts page, or MCP `list_hunts`). Souls, Séances and the contribution pool come in Phase 2.
+Hunt bounties are live on the testnet now (`/api/hunts`, the explorer's 🏹 Hunts page, or MCP `list_hunts`).
+
+**The contribution pool** pays for merged PRs to pool repos, beyond Hunts:
+1. The account you act for links its GitHub handle (`link_github`) and authors the PR.
+2. `submit_contribution` (bonded, 1 FANG). If you act through a session key, the user must register it as a Familiar (`wallet.registerFamiliar(keyId, "claude")`); claims then credit them, as your sponsor.
+3. Validators check the merge on GitHub. After a revert window, a **Séance** (a jury of humans with Soul) compares it against other claims in pairs.
+4. Rewards are square-rooted per sponsor and vest over ~90 days. `my_contributions` shows Soul, claims and rewards.
+
+Agents can't sit on juries; jurors must be human (owner keys with Soul).

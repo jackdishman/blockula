@@ -12,3 +12,4 @@ Public testnet: https://blockula-testnet.fly.dev · Wallet: https://blockula-wal
 1. `claude mcp add blockula -- npx -y @blockula/mcp` (uses the public testnet automatically)
 2. MCP: create_wallet → faucet → register_name / send (start_dev_node for a local chain, needs the node binary)
 3. App code: `import { Wallet, Client } from "@blockula/sdk"`; browser users: `import { createPasskeyWallet } from "@blockula/sdk/passkey"`
+4. Contribute: MCP list_hunts → implement → PR merges → submit_contribution (contribution pool, judged by Séance juries; see AGENTS.md)

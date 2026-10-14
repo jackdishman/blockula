@@ -1,11 +1,14 @@
 mod api;
 mod chain;
 mod consensus;
+mod contrib_cli;
 mod crypto;
 mod epochs;
+mod github;
 mod snapshot;
 mod node;
 mod pq;
+mod poc;
 mod types;
 mod validator_cli;
 
@@ -83,6 +86,15 @@ enum Cmd {
         /// Minimum validator bond in FANG (default: 50 with a faucet, 10000 without)
         #[arg(long)]
         min_bond: Option<String>,
+        /// Séance length in blocks (default: ~7 days)
+        #[arg(long)]
+        seance_blocks: Option<u64>,
+        /// Blocks a verified claim waits before it's judged (default: ~30 days)
+        #[arg(long)]
+        claim_maturity_blocks: Option<u64>,
+        /// Blocks contribution rewards vest over (default: ~90 days)
+        #[arg(long)]
+        vesting_blocks: Option<u64>,
     },
     /// Run a validator (a home with validator.key) or a joined full node
     Run {
@@ -117,6 +129,16 @@ enum Cmd {
     Wallet {
         #[command(subcommand)]
         cmd: validator_cli::WalletCmd,
+    },
+    /// 🏹 Hunts: bounties on GitHub issues (list, create, fund, award, cancel)
+    Hunt {
+        #[command(subcommand)]
+        cmd: contrib_cli::HuntCmd,
+    },
+    /// 🪦 Proof of Contribution: claim merged PRs, vouch, sit on Séance juries, withdraw rewards
+    Contrib {
+        #[command(subcommand)]
+        cmd: contrib_cli::ContribCmd,
     },
     /// Become (or manage) a validator
     Validator {
@@ -156,11 +178,12 @@ fn main() -> Result<()> {
                 std::fs::remove_dir_all(&home).ok();
             }
             if !home.join("genesis.json").exists() {
-                Chain::summon(&home, &SummonOpts { http_port: Some(port), ..SummonOpts::new("blockula-dev", 1) })?;
+                let dev = SummonOpts::new("blockula-dev", 1);
+                Chain::summon(&home, &SummonOpts { http_port: Some(port), contribution: Some(poc::PocTimes::dev(dev.block_time_ms)), ..dev })?;
             }
             node::run_validator(home, net_opts(net, Some(port), Some("local".into()), true))
         }
-        Cmd::Summon { chain_id, home, no_faucet, block_time_ms, validators, admins, epoch_blocks, min_bond } => {
+        Cmd::Summon { chain_id, home, no_faucet, block_time_ms, validators, admins, epoch_blocks, min_bond, seance_blocks, claim_maturity_blocks, vesting_blocks } => {
             let home = home.unwrap_or_else(|| blockula_dir().join(&chain_id));
             if home.join("genesis.json").exists() {
                 anyhow::bail!("{} already has a chain", home.display());
@@ -175,6 +198,10 @@ fn main() -> Result<()> {
                 admins,
                 epoch_blocks,
                 min_bond: min_bond.map(|b| validator_cli::parse_fang(&b)).transpose()?,
+                contribution: (seance_blocks.is_some() || claim_maturity_blocks.is_some() || vesting_blocks.is_some()).then(|| {
+                    let d = poc::PocTimes::for_block_time(block_time_ms);
+                    poc::PocTimes { seance_blocks: seance_blocks.unwrap_or(d.seance_blocks), claim_maturity_blocks: claim_maturity_blocks.unwrap_or(d.claim_maturity_blocks), vesting_blocks: vesting_blocks.unwrap_or(d.vesting_blocks), ..d }
+                }),
             };
             let homes = Chain::summon(&home, &opts)?;
             let g = chain::Genesis::load(&homes[0].join("genesis.json"))?;
@@ -200,6 +227,8 @@ fn main() -> Result<()> {
             node::run_full_node(home, net_opts(net, Some(port), None, false))
         }
         Cmd::Validator { cmd } => validator_cli::run(cmd),
+        Cmd::Hunt { cmd } => contrib_cli::hunt(cmd, &blockula_dir()),
+        Cmd::Contrib { cmd } => contrib_cli::contrib(cmd, &blockula_dir()),
         Cmd::Keygen => {
             let k = crypto::Keys::generate();
             println!("{}", serde_json::json!({ "address": k.address(), "seed": k.seed_hex() }));

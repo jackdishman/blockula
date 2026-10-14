@@ -25,6 +25,16 @@ import { createPasskeyWallet, unlockPasskeyWallet } from "@blockula/sdk/passkey"
 const wallet = await createPasskeyWallet({ username: "vlad" });
 ```
 
+Contribution pool (Proof of Contribution):
+
+```ts
+await wallet.submitClaim("jackdishman/blockula", 34);       // a merged PR by your linked GitHub handle
+const s = await client.seance((await client.contributions()).open_seance.id);   // jurors: your pairs
+const sealed = await juror.sealVotes(s.id, "ab=", [17]);  // a/b/= per pair, spam flags; keep sealed.salt
+await juror.revealVotes(s.id, sealed.votes, sealed.spam, sealed.salt);  // after the sealing phase
+await wallet.withdrawVested();
+```
+
 Amounts are FANG strings (`"1.5"`) or bigint drops (1 FANG = 10⁹ drops). Every transaction result includes a plain-English `summary`.
 
 - `send("alice.boo", …)` resolves the name first and signs the **address**, so whoever you checked is exactly who gets paid.

@@ -27,15 +27,15 @@
   - `blockula summon mychain --validators 4` creates your own network.
   - `blockula join` syncs a full node, with the explorer browsable while it syncs.
   - `blockula validator register` lets you apply to validate.
+- **Proof of Contribution** (Hunts are live; the contribution pool ships in the next testnet release): bounties (**Hunts**) on GitHub issues, and a contribution pool for any merged PR. Validators check claims against GitHub; random commit-reveal juries (**Séances**) score them; rewards are square-rooted per person and vest with clawback; reputation (**Souls**) can't be bought. Agents take part as **Familiars** of a human sponsor.
 - **Validators are added on-chain at epoch boundaries.** For Season 0 an admin allowlist approves them, and every approval is visible in the explorer.
 - **Reviewed before launch.** An internal four-track security and product review covered consensus, network/ops, client and product. Its findings were fixed and turned into regression tests. A third-party audit comes before mainnet.
 
 ## Where it's going
-1. **Proof of Contribution (Phase 1.5–2):**
-   - Rewards useful GitHub work, paid from a fixed per-epoch pool, scored by random staked review juries (**Séances**), with reputation that can't be bought (**Souls**) and vesting with clawback.
-   - Bounties (**Hunts**) carry acceptance tests that agents can satisfy.
-   - Agents contribute as **Familiars** of a human sponsor who is accountable for them.
-   - Designed so that farming doesn't pay.
+1. **Proof of Contribution, next steps:**
+   - Hunts with acceptance tests that validators re-run, so agents can be paid without anyone's sign-off.
+   - Jury-run sybil flags and revert checks, replacing the Season 0 admin levers.
+   - Covens (teams) and Seasons, plus a juror UI in the web wallet.
 2. **👻 Ghost Mode and 🪦 The Crypt (Phase 2):** private transfers and encrypted storage, built on hash-based STARKs and ML-KEM, so the privacy layer is quantum-safe too. Viewing keys allow selective disclosure.
 3. **Open validator set (Phase 3):** staking, slashing and governance (√stake + Soul voting weight, conviction voting, private ballots), then audits and mainnet.
 

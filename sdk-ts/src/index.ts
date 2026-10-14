@@ -2,7 +2,7 @@ import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex, hexToBytes, randomBytes, utf8ToBytes } from "@noble/hashes/utils.js";
 import { bech32m } from "@scure/base";
-import { minFee, parseFang, signingBytes, type Action, type KeyRole, type Tx, type UnsignedTx } from "./tx.js";
+import { minFee, parseFang, parseSoul, seanceCommitment, signingBytes, type Action, type KeyRole, type Tx, type UnsignedTx } from "./tx.js";
 
 export * from "./tx.js";
 
@@ -182,6 +182,80 @@ export class Wallet {
     return this.client.submit(await this.build({ type: "register_familiar", key_id: keyIdHex, label }));
   }
 
+  // ---- 🪦 Proof of Contribution ----
+
+  /** Claim a merged PR (authored by this account's linked GitHub handle) for the contribution pool. Bonded; validators check it on GitHub. */
+  async submitClaim(repo: string, pr: number, familiarKey?: string) {
+    return this.client.submit(await this.build({ type: "submit_claim", repo, pr, ...(familiarKey ? { familiar_key: familiarKey } : {}) }));
+  }
+
+  /** Stake 10 FANG on a newcomer being a real, distinct person (needs 10 Soul). */
+  async vouch(account: string) {
+    return this.client.submit(await this.build({ type: "vouch", account: await this.client.resolve(account) }));
+  }
+
+  /** Withdraw your vouch for `account` (after the lock), or pass your own account to decline one. */
+  async unvouch(account: string) {
+    return this.client.submit(await this.build({ type: "unvouch", account: await this.client.resolve(account) }));
+  }
+
+  /** Join (or top up) the Séance juror pool. Needs 5 Soul; owner keys only. */
+  async joinJury(bond: string | number | bigint = "10") {
+    return this.client.submit(await this.build({ type: "join_jury", bond: parseFang(bond).toString() }));
+  }
+
+  async leaveJury() {
+    return this.client.submit(await this.build({ type: "leave_jury" }));
+  }
+
+  /**
+   * Seal a Séance judgment: one of "a", "b" or "=" per assigned pair (see `client.seance(id)`),
+   * plus claim ids you think are spam. Keep the returned `salt`: `revealVotes` needs it.
+   */
+  async sealVotes(seanceId: number, votes: string, spam: number[] = [], salt: string = bytesToHex(randomBytes(16))) {
+    const commitment = seanceCommitment(seanceId, this.account, votes, spam, salt);
+    const tx = await this.client.submit(await this.build({ type: "commit_votes", seance_id: seanceId, commitment }));
+    return { tx, salt, votes, spam };
+  }
+
+  async revealVotes(seanceId: number, votes: string, spam: number[], salt: string) {
+    return this.client.submit(await this.build({ type: "reveal_votes", seance_id: seanceId, votes, spam, salt }));
+  }
+
+  async fundPool(amount: string | number | bigint) {
+    return this.client.submit(await this.build({ type: "fund_pool", amount: parseFang(amount).toString() }));
+  }
+
+  /** Withdraw every contribution reward that has vested so far. */
+  async withdrawVested() {
+    return this.client.submit(await this.build({ type: "withdraw_vested" }));
+  }
+
+  /** Season 0 admins only. Weight 1–100; 0 removes the repo. */
+  async setRepo(repo: string, weight: number) {
+    return this.client.submit(await this.build({ type: "set_repo", repo, weight }));
+  }
+
+  /** Season 0 admins only. `soul` in Soul ("2.5"), up to 100 per grant. */
+  async grantSoul(to: string, soul: string | number, reason: string) {
+    return this.client.submit(await this.build({ type: "grant_soul", to: await this.client.resolve(to), amount: parseSoul(soul), reason }));
+  }
+
+  /** Season 0 admins only. */
+  async rejectClaim(claimId: number, reason: string) {
+    return this.client.submit(await this.build({ type: "reject_claim", claim_id: claimId, reason }));
+  }
+
+  /** Season 0 admins only. */
+  async flagSybil(account: string, reason: string) {
+    return this.client.submit(await this.build({ type: "flag_sybil", account: await this.client.resolve(account), reason }));
+  }
+
+  /** Season 0 admins only. */
+  async clawback(account: string, reason: string) {
+    return this.client.submit(await this.build({ type: "clawback", account: await this.client.resolve(account), reason }));
+  }
+
   /** Reclaim the bond of a removed validator this account owns. */
   async unbond(validator: string) {
     return this.client.submit(await this.build({ type: "unbond", validator }));
@@ -245,6 +319,17 @@ export class Client {
   hunt(id: number) { return this.call(`/hunt/${id}`); }
   /** Off-chain check of a GitHub link (gist owned by the handle containing the address). */
   github(handle: string) { return this.call(`/github/${encodeURIComponent(handle)}`); }
+  /** The contribution pool: balance, repos, rules, the open Séance and recent results. */
+  contributions() { return this.call("/contributions"); }
+  claims(opts: { status?: "pending" | "verified" | "in_seance" | "scored" | "spam" | "rejected"; account?: string } = {}) {
+    const q = new URLSearchParams(Object.entries(opts).filter(([, v]) => v !== undefined) as [string, string][]).toString();
+    return this.call(`/claims${q ? `?${q}` : ""}`);
+  }
+  claim(id: number) { return this.call(`/claim/${id}`); }
+  /** A Séance, with each juror's assigned pairs (what they must judge). */
+  seance(id: number) { return this.call(`/seance/${id}`); }
+  /** Soul leaderboard. */
+  souls(limit = 50) { return this.call(`/souls?limit=${limit}`); }
 
   async resolve(nameOrAddress: string): Promise<string> {
     if (isAddress(nameOrAddress)) return nameOrAddress;

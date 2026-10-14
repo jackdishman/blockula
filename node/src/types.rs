@@ -94,6 +94,65 @@ pub enum Action {
     CancelHunt { hunt_id: u64 },
     /// Mark one of this account's session keys as an agent Familiar (shown on profiles/awards).
     RegisterFamiliar { key_id: String, label: String },
+
+    // ---- 🪦 Proof of Contribution (see poc.rs) ----
+    /// Season 0 admins: make a GitHub repo eligible for the contribution pool, with a weight
+    /// (1–100) for splitting it; weight 0 removes the repo.
+    SetRepo { repo: String, weight: u64 },
+    /// Season 0 admins: bootstrap Soul (milli-Soul, at most 100 Soul per grant). Governance
+    /// replaces this in Phase 3.
+    GrantSoul { to: String, amount: u64, reason: String },
+    /// Stake `VOUCH_BOND` on `account` (a newcomer: no Soul or judged work) being a real,
+    /// distinct person. Needs Soul. Lost (with Soul) if the account is flagged as a sybil.
+    Vouch { account: String },
+    /// The voucher withdraws a vouch (and its bond) once it has been locked for
+    /// `vouch_lock_blocks`; the account vouched for may decline it any time.
+    Unvouch { account: String },
+    /// Season 0 admins: mark an account as a sybil. Zeroes its Soul, rejects its open claims,
+    /// claws back its unvested rewards, and slashes whoever vouched for it.
+    FlagSybil { account: String, reason: String },
+    /// Claim a merged PR for the contribution pool. Needs a linked GitHub handle (the PR's
+    /// author) and Soul or a vouch. Bonded; validators check GitHub and attest. A registered
+    /// Familiar (agent session key) may sign this for its sponsor.
+    SubmitClaim {
+        repo: String,
+        pr: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        familiar_key: Option<String>,
+    },
+    /// Validators only: what GitHub says about a pending claim. `merge_sha` is the 40-hex merge
+    /// commit when `ok`; `note` says why when not.
+    AttestClaim {
+        claim_id: u64,
+        ok: bool,
+        merge_sha: String,
+        #[serde(default)]
+        note: String,
+    },
+    /// Season 0 admins: reject a claim (e.g. the PR was reverted). Slashes the bond; a scored
+    /// claim's unvested reward is clawed back.
+    RejectClaim { claim_id: u64, reason: String },
+    /// Join the Séance juror pool by bonding at least `JUROR_BOND`. Needs Soul.
+    JoinJury {
+        #[serde(with = "u64_str")]
+        bond: u64,
+    },
+    /// Leave the juror pool and get the bond back (not while serving on an open Séance).
+    LeaveJury {},
+    /// A juror's sealed judgment: hex BLAKE3 of `seance_commitment(...)`.
+    CommitVotes { seance_id: u64, commitment: String },
+    /// Open the sealed judgment: one of `a`, `b`, `=` per assigned pair, claims flagged as spam,
+    /// and the salt.
+    RevealVotes { seance_id: u64, votes: String, spam: Vec<u64>, salt: String },
+    /// Add FANG to the contribution pool.
+    FundPool {
+        #[serde(with = "u64_str")]
+        amount: u64,
+    },
+    /// Withdraw every reward that has vested so far.
+    WithdrawVested {},
+    /// Season 0 admins: return an account's unvested rewards to the pool.
+    Clawback { account: String, reason: String },
 }
 
 /// What a key is allowed to do on an account.
@@ -137,6 +196,25 @@ pub struct Tx {
 fn put_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(&(s.len() as u16).to_le_bytes());
     out.extend_from_slice(s.as_bytes());
+}
+
+fn put_ids(out: &mut Vec<u8>, ids: &[u64]) {
+    out.extend_from_slice(&(ids.len() as u16).to_le_bytes());
+    for id in ids {
+        out.extend_from_slice(&id.to_le_bytes());
+    }
+}
+
+/// What a juror commits to before revealing (hashed with BLAKE3). Mirrored in sdk-ts/src/tx.ts
+/// `seanceCommitment`.
+pub fn seance_commitment(seance_id: u64, juror: &str, votes: &str, spam: &[u64], salt: &str) -> String {
+    let mut out = b"BLOCKULA_SEANCE_V1".to_vec();
+    out.extend_from_slice(&seance_id.to_le_bytes());
+    put_str(&mut out, juror);
+    put_str(&mut out, votes);
+    put_ids(&mut out, spam);
+    put_str(&mut out, salt);
+    hex::encode(crypto::hash(&out))
 }
 
 impl Tx {
@@ -232,6 +310,75 @@ impl Tx {
                 out.push(14);
                 put_str(&mut out, key_id);
                 put_str(&mut out, label);
+            }
+            Action::SetRepo { repo, weight } => {
+                out.push(15);
+                put_str(&mut out, repo);
+                out.extend_from_slice(&weight.to_le_bytes());
+            }
+            Action::GrantSoul { to, amount, reason } => {
+                out.push(16);
+                put_str(&mut out, to);
+                out.extend_from_slice(&amount.to_le_bytes());
+                put_str(&mut out, reason);
+            }
+            Action::Vouch { account } => {
+                out.push(17);
+                put_str(&mut out, account);
+            }
+            Action::Unvouch { account } => {
+                out.push(18);
+                put_str(&mut out, account);
+            }
+            Action::FlagSybil { account, reason } => {
+                out.push(19);
+                put_str(&mut out, account);
+                put_str(&mut out, reason);
+            }
+            Action::SubmitClaim { repo, pr, familiar_key } => {
+                out.push(20);
+                put_str(&mut out, repo);
+                out.extend_from_slice(&pr.to_le_bytes());
+                put_str(&mut out, familiar_key.as_deref().unwrap_or(""));
+            }
+            Action::AttestClaim { claim_id, ok, merge_sha, note } => {
+                out.push(21);
+                out.extend_from_slice(&claim_id.to_le_bytes());
+                out.push(*ok as u8);
+                put_str(&mut out, merge_sha);
+                put_str(&mut out, note);
+            }
+            Action::RejectClaim { claim_id, reason } => {
+                out.push(22);
+                out.extend_from_slice(&claim_id.to_le_bytes());
+                put_str(&mut out, reason);
+            }
+            Action::JoinJury { bond } => {
+                out.push(23);
+                out.extend_from_slice(&bond.to_le_bytes());
+            }
+            Action::LeaveJury {} => out.push(24),
+            Action::CommitVotes { seance_id, commitment } => {
+                out.push(25);
+                out.extend_from_slice(&seance_id.to_le_bytes());
+                put_str(&mut out, commitment);
+            }
+            Action::RevealVotes { seance_id, votes, spam, salt } => {
+                out.push(26);
+                out.extend_from_slice(&seance_id.to_le_bytes());
+                put_str(&mut out, votes);
+                put_ids(&mut out, spam);
+                put_str(&mut out, salt);
+            }
+            Action::FundPool { amount } => {
+                out.push(27);
+                out.extend_from_slice(&amount.to_le_bytes());
+            }
+            Action::WithdrawVested {} => out.push(28),
+            Action::Clawback { account, reason } => {
+                out.push(29);
+                put_str(&mut out, account);
+                put_str(&mut out, reason);
             }
         }
         put_str(&mut out, &self.memo);
@@ -369,6 +516,64 @@ impl Tx {
                     bail!("familiar label must be 1–{MAX_LABEL} bytes");
                 }
             }
+            Action::SetRepo { repo, weight } => {
+                check_repo(repo)?;
+                if *weight > crate::poc::MAX_REPO_WEIGHT {
+                    bail!("repo weight must be 0–{} (0 removes the repo)", crate::poc::MAX_REPO_WEIGHT);
+                }
+            }
+            Action::GrantSoul { to, amount, reason } => {
+                check_account_ref("to", to)?;
+                if *amount == 0 || *amount > crate::poc::MAX_SOUL_GRANT {
+                    bail!("a Soul grant is 1–{} milli-Soul", crate::poc::MAX_SOUL_GRANT);
+                }
+                check_reason(reason)?;
+            }
+            Action::Vouch { account } | Action::Unvouch { account } => check_account_ref("account", account)?,
+            Action::FlagSybil { account, reason } | Action::Clawback { account, reason } => {
+                check_account_ref("account", account)?;
+                check_reason(reason)?;
+            }
+            Action::SubmitClaim { repo, pr, familiar_key } => {
+                check_repo(repo)?;
+                if *pr == 0 {
+                    bail!("pr must be a pull request number");
+                }
+                if let Some(k) = familiar_key {
+                    if !key_id_ok(k) {
+                        bail!("familiar_key must be a key id (32 bytes of lowercase hex)");
+                    }
+                }
+            }
+            Action::AttestClaim { ok, merge_sha, note, .. } => {
+                if *ok && (merge_sha.len() != 40 || !crypto::is_lower_hex(merge_sha)) {
+                    bail!("merge_sha must be the 40-hex merge commit");
+                }
+                if !*ok && !merge_sha.is_empty() {
+                    bail!("merge_sha must be empty when ok is false");
+                }
+                if note.len() > MAX_REASON || note.chars().any(|c| c.is_control()) {
+                    bail!("note must be at most {MAX_REASON} bytes with no control characters");
+                }
+            }
+            Action::RejectClaim { reason, .. } => check_reason(reason)?,
+            Action::CommitVotes { commitment, .. } => {
+                if commitment.len() != 64 || !crypto::is_lower_hex(commitment) {
+                    bail!("commitment must be 32 bytes of lowercase hex");
+                }
+            }
+            Action::RevealVotes { votes, spam, salt, .. } => {
+                if votes.len() > crate::poc::PAIRS_PER_JUROR || !votes.bytes().all(|b| b"ab=".contains(&b)) {
+                    bail!("votes must be up to {} of 'a', 'b' or '='", crate::poc::PAIRS_PER_JUROR);
+                }
+                if spam.len() > crate::poc::MAX_SEANCE_CLAIMS {
+                    bail!("too many spam flags");
+                }
+                if salt.is_empty() || salt.len() > 64 || salt.chars().any(|c| c.is_control()) {
+                    bail!("salt must be 1–64 bytes with no control characters");
+                }
+            }
+            Action::JoinJury { .. } | Action::LeaveJury {} | Action::FundPool { .. } | Action::WithdrawVested {} => {}
         }
         Ok(())
     }
@@ -448,6 +653,27 @@ pub fn check_title(t: &str) -> Result<()> {
     }
     Ok(())
 }
+
+pub const MAX_REASON: usize = 96;
+
+/// Why an admin did something (shown in the explorer).
+pub fn check_reason(r: &str) -> Result<()> {
+    if r.trim().is_empty() || r.len() > MAX_REASON || r.chars().any(|c| c.is_control()) {
+        bail!("reason must be 1–{MAX_REASON} bytes with no control characters");
+    }
+    Ok(())
+}
+
+/// A `boo1…` address or a `.boo` name.
+fn check_account_ref(field: &str, v: &str) -> Result<()> {
+    if v.len() > MAX_NAME_FIELD {
+        bail!("`{field}` too long (max {MAX_NAME_FIELD} bytes)");
+    }
+    if !crypto::is_address(v) {
+        normalize_name(v).with_context(|| format!("`{field}` must be a lowercase boo1… address or a .boo name"))?;
+    }
+    Ok(())
+}
 pub const MAX_MEMO: usize = 256;
 pub const MAX_LABEL: usize = 64;
 pub const MAX_NAME_FIELD: usize = 64;
@@ -523,6 +749,43 @@ pub struct Block {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The same vectors are computed by sdk-ts (test/e2e.ts): the encodings must match byte for byte.
+    #[test]
+    fn contribution_encodings_match_the_sdk() {
+        assert_eq!(seance_commitment(3, "boo1juror", "ab=", &[1, 2], "pepper"), "1f3071e1123a713836e2c9c27798dc74ed1fd1f97de6b5fd985c0dba8f9f7eae");
+        let actions = vec![
+            Action::SetRepo { repo: "a/b".into(), weight: 10 },
+            Action::GrantSoul { to: "x.boo".into(), amount: 2500, reason: "r".into() },
+            Action::Vouch { account: "x.boo".into() },
+            Action::Unvouch { account: "x.boo".into() },
+            Action::FlagSybil { account: "x.boo".into(), reason: "r".into() },
+            Action::SubmitClaim { repo: "a/b".into(), pr: 9, familiar_key: Some("ab".repeat(32)) },
+            Action::SubmitClaim { repo: "a/b".into(), pr: 9, familiar_key: None },
+            Action::AttestClaim { claim_id: 4, ok: true, merge_sha: "cd".repeat(20), note: String::new() },
+            Action::RejectClaim { claim_id: 4, reason: "r".into() },
+            Action::JoinJury { bond: 10 * DROPS_PER_FANG },
+            Action::LeaveJury {},
+            Action::CommitVotes { seance_id: 2, commitment: "ef".repeat(32) },
+            Action::RevealVotes { seance_id: 2, votes: "ab=".into(), spam: vec![5, 6], salt: "s".into() },
+            Action::FundPool { amount: 5 },
+            Action::WithdrawVested {},
+            Action::Clawback { account: "x.boo".into(), reason: "r".into() },
+        ];
+        let mut h = blake3::Hasher::new();
+        for action in actions {
+            let tx = Tx { chain_id: "vec".into(), from: "boo1from".into(), nonce: 7, fee: 12345, action, memo: "m".into(), public_key: String::new(), signature: String::new() };
+            h.update(&tx.signing_bytes());
+        }
+        assert_eq!(h.finalize().to_hex().to_string(), "d9892f8a34d814bfc73d942b527b585d22fd1620b02ad74a19edc478626299f8");
+        // And the JSON shapes the SDK sends parse.
+        let a: Action = serde_json::from_str(r#"{"type":"leave_jury"}"#).unwrap();
+        assert!(matches!(a, Action::LeaveJury {}));
+        let a: Action = serde_json::from_str(r#"{"type":"join_jury","bond":"10"}"#).unwrap();
+        assert!(matches!(a, Action::JoinJury { bond: 10 }));
+        let a: Action = serde_json::from_str(r#"{"type":"attest_claim","claim_id":1,"ok":false,"merge_sha":"","note":"x"}"#).unwrap();
+        assert!(matches!(a, Action::AttestClaim { ok: false, .. }));
+    }
 
     #[test]
     fn names_and_amounts() {
