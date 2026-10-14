@@ -68,7 +68,7 @@ Sentries and RPC nodes: 4 cores, 16 GB, 1 TB NVMe, and the same bandwidth (each 
 
 ### Bandwidth
 
-Certificates dominate. Simplex sends every vote and certificate to every connected peer, and each node re-broadcasts each certificate it holds once (`.context/research/commonware.md` §6, §7):
+Certificates dominate. Simplex sends every vote and certificate to every connected peer, and each node re-broadcasts each certificate it holds once (MAINNET-DESIGN DEC-3; in commonware-consensus 2026.9.0, `simplex/actors/voter/actor.rs` and `voter/round.rs`):
 
 - **Certificates:** a ⅔ certificate at n = 32 is ~73 KB (22 signatures × 3,309 B). Two per view (notarization, finalization) to 31 peers at one view per second: **~4.5 MB/s of egress per validator, ~12 TB/month**. At n = 64 it would be ~18 MB/s, which is why the cap is 32.
 - **Votes:** ~3.3 KB each, two per view, to 31 peers: ~0.2 MB/s.
