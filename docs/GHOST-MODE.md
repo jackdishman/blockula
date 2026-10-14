@@ -12,7 +12,8 @@ pairings, no elliptic curves.
 
 This document is the design contract for MAINNET-DESIGN.md §6 (DEC-2). Its library is the
 `blockula-ghost` crate in `node/ghost/` (P-GHOST-CORE). Node integration (tags 50–54, state,
-turnstile, fees) is a later package; section 8 is its plan.
+turnstile, fees) is a later package; section 8 is its plan. Background, prior art and the
+choice of stack: `.context/research/ghost-mode.md`.
 
 | | |
 |---|---|
@@ -91,7 +92,8 @@ u32s; decoding rejects any element ≥ p, so every digest has one encoding.
   Poseidon2's compression mode. The feed-forward means inverting `P` gives neither preimages nor
   collisions.
 
-Every name carries a version, so a later pool can change any of it without ambiguity. The
+Every IV, KDF context and domain is versioned (`v1`), so a later pool can change any of it
+without ambiguity. The
 Poseidon2 instance is the stock one; whether its round margin is enough given the 2026
 cryptanalysis (eprint 2026/1692 reaches 28 of 31 rounds of a KoalaBear width-24 instance in the
 CICO setting) is an activation gate (section 9).
@@ -246,9 +248,10 @@ salt elements per leaf.
 | **Conjectured security** | **110 bits** |
 
 Numbers from `p3_uni_stark::{ProvenSecurity, ConjecturedSecurity}` over the real AIR shape
-(`config::security_report`, checked by a test). The ceiling is the ~124-bit challenge field:
-across blowups 2²–2⁵, query counts up to 100 and grinding up to 20 bits, nothing exceeded ~110
-proven or ~111 conjectured. 128 bits would need a degree-8 extension (bigger proofs).
+(`config::security_report`, checked by a test). The ceiling comes from the ~124-bit challenge
+field: across blowups 2²–2⁵, query counts up to 100 and grinding up to 20 bits, nothing exceeded
+110 proven or 112 conjectured (100 queries would buy 110 proven bits for roughly twice the
+proof). 128 bits would need a degree-8 extension (bigger proofs).
 
 ### 5.6 Proof encoding and verification
 
@@ -261,8 +264,8 @@ Proof bytes are the postcard encoding of `p3_uni_stark::Proof`. `verify(public, 
    malformed proofs"; 0.8's transcript drivers yield to an in-flight panic, so it can be caught.
    The node's build must keep `panic = "unwind"`.
 
-Never panics on any input: 20,000 random and 20,000 mutated proofs, a bit flipped in every
-byte of a proof (section 10), none panicked. `prove` checks every constraint before proving, so
+No input tried so far makes it panic: 20,000 random and 20,000 mutated proofs and a bit flipped
+in every byte of a proof (section 11). `prove` checks every constraint before proving, so
 an invalid witness gets an error, not an invalid proof. It draws the masks from OS randomness
 each time; `prove_with_seed` exists for tests only.
 
@@ -325,7 +328,7 @@ The Crypt):
 | Tag | Action | Signed by | Value balance | Effect |
 |---|---|---|---|---|
 | 50 | `Shield { amount, bundle }` | `from` (normal Tx v3) | `−amount` | debit `amount` + fee transparently; `ghost_pool += amount`; fails above `pool_cap` |
-| 51 | `PrivateTransfer { bundle }` | nobody: the proof authorizes | `fee + verify_fee` | fee paid from the pool: `ghost_pool −= fee` |
+| 51 | `PrivateTransfer { bundle }` | nobody: the proof authorizes | `fee` | fee paid from the pool: `ghost_pool −= fee` |
 | 52 | `Unshield { to, amount, bundle }` | nobody | `amount + fee` | `ghost_pool −= amount + fee` (fails if it would go negative); credit `to` |
 | 53 | `SetGhostAddress { address }` | account owner key | | publish the 1,216-byte address under the name |
 | 54 | `GhostPause {}` | an active validator | | once f+1 distinct validators of the epoch have signed, ghost actions fail from the next block until `ActivateFeature { ghost }` |
@@ -350,9 +353,9 @@ shield); at most `ghost.max_block_bytes` = 1 MiB of ghost txs per block, i.e. ~7
 bounds verification at ~45 ms of one core per block and keeps transparent txs from being crowded
 out. The API needs the binary wire form on `/api/tx` (JSON hex would double the size).
 
-**Fees.** The usual byte fee (base burned, tip to the proposer) plus a flat `ghost.verify_fee`
-for verifier CPU (PLAN.md's "verification premium"). For 51–52 all of it comes out of shielded
-value through the value balance.
+**Fees.** `fee` = the usual byte fee (base burned, tip to the proposer) plus a flat
+`ghost.verify_fee` for verifier CPU (PLAN.md's "verification premium"). A shield pays it
+transparently; for 51–52 it comes out of shielded value through the value balance.
 
 **Pipeline.**
 - Admission: ghost active and not paused; size limits; `verify` once (on a blocking thread),
@@ -382,7 +385,7 @@ From MAINNET-DESIGN §6. `ActivateFeature { ghost }` only after all of:
 
 1. A dedicated external ZK and cryptography audit of this crate, the Plonky3 0.8 components it
    uses and the node integration, with no open high or critical findings.
-2. A clean under-constraint sweep and verifier fuzzing on the audited code (section 10), plus an
+2. A clean under-constraint sweep and verifier fuzzing on the audited code (section 11), plus an
    LLM-assisted adversarial circuit review (what found the Orchard bug).
 3. A cryptanalyst's sign-off on the Poseidon2 instance and its round margin.
 4. At least 4 weeks on a public testnet with a public bug bounty on the pool.
