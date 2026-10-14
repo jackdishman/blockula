@@ -14,7 +14,7 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex, hexToBytes, utf8ToBytes } from "@noble/hashes/utils.js";
 import { POP_CONTEXT, Wallet, popMessage, signingBytes, type Tx, type UnsignedTx } from "../src/index.js";
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any -- untyped vector JSON
+/** Vector files are plain JSON; fields are read by their upstream names. */
 type Json = any;
 
 const testdata = (rel: string) => new URL(`../../node/testdata/${rel}`, import.meta.url);

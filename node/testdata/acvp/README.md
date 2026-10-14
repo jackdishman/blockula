@@ -1,10 +1,10 @@
 # ML-DSA-65 known-answer vectors (SEC-2)
 
-Blockula signs every tx, vote, certificate, proof of possession and epoch handoff with ML-DSA-65 (FIPS 204), in two implementations: the node uses RustCrypto's `ml-dsa`, the SDK, MCP and wallet use `@noble/post-quantum`. Neither is independently audited. These vectors check both against NIST's and Wycheproof's known answers, through the same calls our code makes:
+Blockula signs every tx, vote, certificate, proof of possession and epoch handoff with ML-DSA-65 (FIPS 204), in two implementations: the node uses RustCrypto's `ml-dsa`; the SDK (and so the MCP and the wallet) uses `@noble/post-quantum`. Neither is independently audited. These vectors check both against NIST's and Wycheproof's known answers, through the same calls our code makes:
 
 - **Rust:** [`node/src/kat.rs`](../../src/kat.rs), part of `cargo test --manifest-path node/Cargo.toml` (or `cargo test --manifest-path node/Cargo.toml kat:: -- --nocapture` for the per-group report).
 - **TypeScript:** [`sdk-ts/test/kat.ts`](../../../sdk-ts/test/kat.ts), `npm run test:kat -w @blockula/sdk`. Offline; no node needed.
-- **CI:** `.github/workflows/crypto.yml` runs both on every PR that touches crypto code, vectors or dependencies.
+- **CI:** `.github/workflows/crypto.yml` runs both on every PR and push to main, and checks that the crypto dependencies stay pinned exactly.
 
 A failing known-answer test is a critical finding (a key-forgery or chain-split bug), not a flaky test. Report it, don't regenerate it away.
 
@@ -65,9 +65,9 @@ All checked on 2026-10-14. Each pinned version is the newest release.
 
 | Dependency | Pin | Audit status and advisories |
 |---|---|---|
-| `ml-dsa` (RustCrypto) | `=0.1.1` in `node/Cargo.toml` (released 2026-06-05) | README: "has never been independently audited". Advisories, all fixed before 0.1.0: [GHSA-hcp2-x6j4-29j7](https://github.com/advisories/GHSA-hcp2-x6j4-29j7) / CVE-2026-22705 (timing side channel in decomposition, ≤ rc.2), [GHSA-5x2r-hc65-25f9](https://github.com/advisories/GHSA-5x2r-hc65-25f9) / CVE-2026-24850 (repeated hint indices accepted, < rc.4), [GHSA-h37v-hp6w-2pp8](https://github.com/advisories/GHSA-h37v-hp6w-2pp8) (`UseHint` off by two when r0 = 0, ≤ rc.4). Its own dependencies (`module-lattice` 0.2.3, `hybrid-array` 0.4.15, `shake`, `signature` 3.0.0) are fixed by `node/Cargo.lock`. |
+| `ml-dsa` (RustCrypto) | `=0.1.1` in `node/Cargo.toml` (released 2026-06-05) | README: "has never been independently audited". Advisories, all fixed before 0.1.0: [GHSA-hcp2-x6j4-29j7](https://github.com/advisories/GHSA-hcp2-x6j4-29j7) / CVE-2026-22705 (timing side channel in decomposition, ≤ rc.2), [GHSA-5x2r-hc65-25f9](https://github.com/advisories/GHSA-5x2r-hc65-25f9) / CVE-2026-24850 (repeated hint indices accepted, < rc.4), [GHSA-h37v-hp6w-2pp8](https://github.com/advisories/GHSA-h37v-hp6w-2pp8) (`UseHint` off by two when r0 = 0, ≤ rc.4). Its own dependencies (`module-lattice` 0.2.3, `hybrid-array` 0.4.15, `shake` 0.1.0, `signature` 3.0.0) are fixed by `node/Cargo.lock`. |
 | `blake3` | `=1.8.7` | Addresses, key ids, block digests, state roots, long-namespace contexts. No advisories. |
-| `bech32` | `=0.12.0` | Address encoding (pinned for the same reason). |
+| `bech32` | `=0.12.0` | Address encoding, where a decoding bug would alias accounts. |
 | `@noble/post-quantum` | `0.7.1` in `sdk-ts/package.json` (released 2026-08-27) | README: "has not been independently audited yet"; self-audited at 0.6.1 (April 2026); no constant-time claim. No GitHub advisories. Pins its own dependencies exactly (`@noble/hashes`, `@noble/curves`, `@noble/ciphers` 2.4.0). |
 | `@noble/hashes` | `2.4.0` | Audited by Cure53 at 1.0.0 (January 2022), but that audit's scope excluded `blake3`, which the SDK uses for addresses and key ids. The cross-implementation vectors check its BLAKE3 against the Rust crate's. |
 | `@scure/base` | `2.4.0` | Address encoding. Audited by Cure53 at 1.0.0, self-audited at 2.2.0. |
