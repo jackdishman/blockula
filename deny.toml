@@ -51,6 +51,11 @@ exceptions = [
   # webpki-roots ships Mozilla's CA bundle as data under CDLA-Permissive-2.0 (a permissive data
   # license); reqwest's rustls backend embeds it for outbound HTTPS (GitHub checks).
   { crate = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
+  # imbl, the structural-sharing maps every state map is built on (MAINNET-DESIGN 3.3), and its
+  # chunk type are MPL-2.0: file-level copyleft, not viral to the binary. We use them unmodified
+  # from crates.io, which satisfies it; patching their files would mean publishing those patches.
+  { crate = "imbl", allow = ["MPL-2.0"] },
+  { crate = "imbl-sized-chunks", allow = ["MPL-2.0"] },
 ]
 
 [[licenses.clarify]]
