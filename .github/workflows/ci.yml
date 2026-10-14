@@ -3,6 +3,11 @@ on:
   push: { branches: [main] }
   pull_request:
 
+# A new push to a PR cancels its stale run. Runs on main always finish.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   node:
     name: Node (Rust tests + local multi-validator testnet)
