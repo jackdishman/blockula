@@ -2,8 +2,8 @@
 //! finalized blocks deterministically, in order, and keeps the mempool, indexes and `blocks.jsonl`.
 
 use crate::crypto::{self, Keys};
-use crate::types::*;
 use crate::state::{JMap, TMap};
+use crate::types::*;
 use anyhow::{anyhow, bail, Context, Result};
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
@@ -80,8 +80,9 @@ fn default_max_validators() -> usize {
 /// How many past epochs' validator sets the state keeps (for verifying recent certificates).
 pub const EPOCH_SETS_KEPT: u64 = 8;
 
-/// Genesis constants the state machine needs while applying txs.
-#[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+/// Genesis constants the state machine needs while applying txs (a state record, so the root
+/// commits to them).
+#[derive(Clone, Debug, Default, BorshSerialize, BorshDeserialize)]
 pub struct Params {
     pub block_time_ms: u64,
     pub epoch_blocks: u64,
