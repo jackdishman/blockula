@@ -1,0 +1,7 @@
+# The exact compiler for every build: CI, releases (reproducible only with the same rustc),
+# the Docker image (deploy/Dockerfile's rust tag must match; CI checks it) and local dev.
+# Bump deliberately, in its own PR, with `cargo test` and `cargo clippy` green.
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

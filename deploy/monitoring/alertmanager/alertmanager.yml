@@ -1,0 +1,58 @@
+# Routes Blockula alerts. REPLACE the two receivers' URLs before relying on this: until then,
+# every notification fails (and AlertmanagerNotificationsFailing says so in the UI).
+# Secrets go in files next to this one (*_file settings), never in the YAML itself.
+route:
+  receiver: operator
+  group_by: [alertname, node]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    # The heartbeat goes to an external dead man's switch (healthchecks.io, Dead Man's Snitch,
+    # Better Stack heartbeats, ...), which pages you when it stops arriving.
+    - matchers: [alertname = Watchdog]
+      receiver: deadman
+      group_wait: 0s
+      group_interval: 1m
+      repeat_interval: 1m
+    - matchers: [severity = critical]
+      receiver: operator
+      repeat_interval: 30m
+    - matchers: [severity = info]
+      receiver: operator
+      repeat_interval: 24h
+
+inhibit_rules:
+  # A halted chain explains every stale head; a down node explains its own silence.
+  - source_matchers: [alertname = BlockulaChainHalted]
+    target_matchers: [alertname = BlockulaHeadStale]
+  - source_matchers: [alertname = BlockulaNodeDown]
+    target_matchers: ['alertname =~ "BlockulaHeadStale|BlockulaRestarted"']
+    equal: [node]
+  # The critical twin of a warning replaces it.
+  - source_matchers: [alertname = BlockulaExecutionPastMaxLag]
+    target_matchers: [alertname = BlockulaExecutionLagging]
+    equal: [node]
+  - source_matchers: [alertname = HostDiskCritical]
+    target_matchers: [alertname = HostDiskAlmostFull]
+    equal: [node, mountpoint]
+  - source_matchers: [alertname = HostClockSkewCritical]
+    target_matchers: [alertname = HostClockSkew]
+    equal: [node]
+
+receivers:
+  - name: operator
+    webhook_configs:
+      # REPLACE with your paging/chat integration. Examples (pick one or several):
+      #   pagerduty_configs: [{ routing_key_file: /etc/alertmanager/pagerduty.key }]
+      #   telegram_configs: [{ bot_token_file: /etc/alertmanager/telegram.token, chat_id: -100123 }]
+      #   discord_configs: [{ webhook_url_file: /etc/alertmanager/discord.url }]
+      #   email_configs: [{ to: oncall@example.org, from: alerts@example.org, smarthost: smtp.example.org:587,
+      #                     auth_username: alerts@example.org, auth_password_file: /etc/alertmanager/smtp.pw }]
+      - url: http://127.0.0.1:9/replace-me
+        send_resolved: true
+  - name: deadman
+    webhook_configs:
+      # REPLACE with your heartbeat URL (e.g. https://hc-ping.com/<uuid>), via url_file.
+      - url: http://127.0.0.1:9/replace-me-heartbeat
+        send_resolved: false

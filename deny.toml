@@ -1,0 +1,79 @@
+# cargo-deny policy for the node (`node/Cargo.toml`). CI runs
+#   cargo deny --manifest-path node/Cargo.toml --locked check
+# and fails on any finding: a new advisory, a license outside the allowlist, a crate from an
+# unknown registry or git repo, or a banned crate. Every exception below says why it's here.
+# Local run: `cargo install cargo-deny --locked`, then the command above.
+
+[graph]
+# The targets we ship (release.yml). Windows-only crates don't count against us.
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+]
+all-features = false
+
+[advisories]
+version = 2
+# RustSec advisory database. `unmaintained` and `unsound` notices fail CI too: in a consensus
+# node, an unmaintained crypto or parsing dependency is a finding, not a warning.
+db-urls = ["https://github.com/rustsec/advisory-db"]
+unmaintained = "all"
+yanked = "deny"
+# Each entry says why it can't affect us and what removes it. Re-check them on every Commonware bump.
+ignore = [
+  # `paste` is archived (unmaintained, no vulnerability). It is a compile-time proc macro pulled in
+  # by commonware-codec (pinned =2026.9.0); nothing of it runs in the node. Goes away when
+  # Commonware drops it.
+  { id = "RUSTSEC-2024-0436", reason = "paste: unmaintained proc macro, compile-time only, via commonware-codec" },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+# Permissive licenses only: the node is MIT and ships as one binary.
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  "ISC",
+  "MIT",
+  "MIT-0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+exceptions = [
+  # webpki-roots ships Mozilla's CA bundle as data under CDLA-Permissive-2.0 (a permissive data
+  # license); reqwest's rustls backend embeds it for outbound HTTPS (GitHub checks).
+  { crate = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
+]
+
+[[licenses.clarify]]
+# Our own crate has no `license` field in node/Cargo.toml; the repo is MIT (LICENSE).
+crate = "blockula"
+expression = "MIT"
+license-files = []
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+# Path dependencies inside this repo may be unversioned.
+allow-wildcard-paths = true
+deny = [
+  # TLS goes through rustls. OpenSSL would add a C library and a second TLS stack to audit.
+  { crate = "openssl-sys", reason = "use rustls" },
+  { crate = "openssl", reason = "use rustls" },
+  { crate = "native-tls", reason = "use rustls" },
+]
+
+[sources]
+# crates.io only. A git dependency or another registry is a new trust root and needs review here.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

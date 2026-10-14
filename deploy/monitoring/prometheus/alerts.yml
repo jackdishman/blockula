@@ -1,0 +1,203 @@
+# Alert rules for Blockula nodes and their hosts. Severities: critical pages someone now,
+# warning goes to the operator channel, info is for the dashboard and the weekly review.
+# Every alert links its runbook in docs/OPERATIONS.md. Unit tests: alerts.test.yml
+# (`promtool test rules`, run by deploy/monitoring/check.sh in CI).
+#
+# Thresholds come from the protocol: 1 s blocks, MAX_EXEC_LAG = 16 and MAX_CLOCK_DRIFT_MS = 1000
+# (node/src/consensus.rs), MAX_MEMPOOL = 5000 (node/src/chain.rs). Change them with the code.
+#
+# Planned, once the node exports them (see the TODO panels in the dashboard):
+#   peer count below the active set; missed leader slots per validator (P-STAKE); this validator
+#   jailed; slashing-protection record not advancing or rolled back (P-UPGRADE); start time.
+groups:
+  - name: blockula-recording
+    rules:
+      # Votes needed for a certificate with n active validators: n - ⌊(n-1)/3⌋ (simplex N3f1).
+      - record: blockula:quorum
+        expr: blockula_active_validators - floor((blockula_active_validators - 1) / 3)
+
+  - name: blockula-chain
+    rules:
+      - alert: BlockulaNodeDown
+        expr: up{job="blockula"} == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.node }}: /metrics unreachable (process down or HTTP wedged)"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#node-down
+
+      # The executed head is older than 10 blocks: the same rule as /api/health.
+      - alert: BlockulaHeadStale
+        expr: blockula_head_age_seconds > 10
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }}: no new block executed for {{ $value | humanizeDuration }}"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#head-stale
+
+      # Not one scraped node has a fresh head: the chain itself has stopped (fewer than a quorum
+      # voting, or every validator failing the same block).
+      - alert: BlockulaChainHalted
+        expr: min(blockula_head_age_seconds) > 60
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "Chain halted: the freshest node's head is {{ $value | humanizeDuration }} old"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#chain-halted
+
+      # Finalized but not yet executed. Past MAX_EXEC_LAG this validator's proposals are invalid.
+      - alert: BlockulaExecutionLagging
+        expr: blockula_finalized_lag > 8
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }}: execution is {{ $value }} blocks behind finality"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#execution-lagging
+      - alert: BlockulaExecutionPastMaxLag
+        expr: blockula_finalized_lag > 16
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.node }}: execution is {{ $value }} blocks behind finality (max 16)"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#execution-lagging
+
+      - alert: BlockulaMempoolNearCap
+        expr: blockula_mempool_size > 4000
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }}: mempool at {{ $value }} of 5000; new txs are refused when full"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#mempool-full
+
+      - alert: BlockulaTxRejectionsHigh
+        expr: rate(blockula_tx_rejected_total[5m]) > 1 and rate(blockula_tx_rejected_total[5m]) > rate(blockula_tx_submitted_total[5m])
+        for: 10m
+        labels: { severity: info }
+        annotations:
+          summary: "{{ $labels.node }}: more txs rejected than accepted over HTTP (spam or a broken client)"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#mempool-full
+
+      # A restart resets the counters, and the height drops while the node replays.
+      - alert: BlockulaRestarted
+        expr: (resets(blockula_tx_submitted_total[15m]) + resets(blockula_tx_rejected_total[15m]) > 0) or (blockula_height < max_over_time(blockula_height[15m]))
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }}: the node restarted in the last 15 minutes"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#restarts
+
+      - alert: BlockulaVersionMismatch
+        expr: count(count by (version) (blockula_build_info)) > 1
+        for: 1h
+        labels: { severity: info }
+        annotations:
+          summary: "Your nodes run {{ $value }} different blockula versions"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#upgrades
+
+  - name: blockula-validators
+    rules:
+      # blockula_validators_online counts the signers on the newest finalization certificate.
+      # Certificates stop collecting at a quorum, so it's a lower bound on who is online, not a
+      # census: halts show up as BlockulaChainHalted. Below quorum means the node's active set and
+      # its certificates disagree.
+      - alert: BlockulaCertificateBelowQuorum
+        expr: blockula_validators_online < blockula:quorum
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.node }}: newest certificate has {{ $value }} signers, below quorum for its active set"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#validator-set
+
+      # NaN: no finalization certificate among the last 16 executed heights.
+      - alert: BlockulaNoRecentCertificate
+        expr: blockula_validators_online != blockula_validators_online
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }}: no recent finalization certificate (cut off from validators, or still syncing)"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#validator-set
+
+  - name: host
+    rules:
+      - alert: HostDiskAlmostFull
+        expr: 1 - node_filesystem_avail_bytes{fstype!~"tmpfs|ramfs|overlay|squashfs|nsfs|fuse.*"} / node_filesystem_size_bytes{fstype!~"tmpfs|ramfs|overlay|squashfs|nsfs|fuse.*"} > 0.80
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }}: {{ $labels.mountpoint }} is {{ $value | humanizePercentage }} full"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#disk
+      - alert: HostDiskCritical
+        expr: 1 - node_filesystem_avail_bytes{fstype!~"tmpfs|ramfs|overlay|squashfs|nsfs|fuse.*"} / node_filesystem_size_bytes{fstype!~"tmpfs|ramfs|overlay|squashfs|nsfs|fuse.*"} > 0.90
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.node }}: {{ $labels.mountpoint }} is {{ $value | humanizePercentage }} full"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#disk
+      - alert: HostDiskFillsWithinAWeek
+        expr: predict_linear(node_filesystem_avail_bytes{fstype!~"tmpfs|ramfs|overlay|squashfs|nsfs|fuse.*"}[6h], 7 * 86400) < 0
+        for: 1h
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }}: {{ $labels.mountpoint }} fills within 7 days at the current rate"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#disk
+
+      - alert: HostMemoryLow
+        expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.10
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }}: only {{ $value | humanizePercentage }} of memory available"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#memory
+      - alert: HostOomKill
+        expr: increase(node_vmstat_oom_kill[15m]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }}: the kernel OOM-killed a process"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#memory
+
+      # Verifiers reject blocks more than 1 s ahead of their own clock, so skew costs votes long
+      # before it reaches a second.
+      - alert: HostClockSkew
+        expr: abs(node_timex_offset_seconds) > 0.1
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }}: clock off by {{ $value | humanizeDuration }}"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#time
+      - alert: HostClockSkewCritical
+        expr: abs(node_timex_offset_seconds) > 0.25
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.node }}: clock off by {{ $value | humanizeDuration }}"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#time
+      - alert: HostClockNotSynchronising
+        expr: min_over_time(node_timex_sync_status[5m]) == 0 and node_timex_maxerror_seconds >= 16
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }}: the clock isn't synchronised (NTP down?)"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#time
+
+  - name: meta
+    rules:
+      # Always firing. Alertmanager sends it to an external dead man's switch, which pages when the
+      # heartbeat stops: that's how you learn this whole host (or its monitoring) is gone.
+      - alert: Watchdog
+        expr: vector(1)
+        labels: { severity: none }
+        annotations:
+          summary: "Heartbeat: the alerting pipeline works"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#alerting-pipeline
+      - alert: AlertmanagerNotificationsFailing
+        expr: rate(alertmanager_notifications_failed_total[5m]) > 0
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "Alertmanager can't deliver to {{ $labels.integration }}: alerts are going nowhere"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#alerting-pipeline
+      - alert: PrometheusRuleFailures
+        expr: increase(prometheus_rule_evaluation_failures_total[5m]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "Prometheus failed to evaluate alert rules"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#alerting-pipeline

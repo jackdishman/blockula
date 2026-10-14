@@ -1,0 +1,62 @@
+# Weekly, grouped dependency updates. Every new version waits a week before Dependabot proposes it
+# (cooldown), so a hijacked release is usually yanked before it reaches a PR. Security updates skip
+# the cooldown. Consensus and crypto crates get their own PRs: they can change block validity, so
+# review them alone and run the simulator and local testnet.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /node
+    schedule: { interval: weekly, day: monday }
+    cooldown: { default-days: 7 }
+    open-pull-requests-limit: 5
+    commit-message: { prefix: "deps(cargo)" }
+    groups:
+      consensus-and-crypto:
+        patterns: ["commonware-*", "ml-dsa", "blake3", "bech32", "getrandom", "rand_core"]
+      cargo:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /
+    schedule: { interval: weekly, day: monday }
+    cooldown: { default-days: 7 }
+    open-pull-requests-limit: 5
+    commit-message: { prefix: "deps(npm)" }
+    groups:
+      crypto:
+        patterns: ["@noble/*", "@scure/*"]
+      runtime:
+        dependency-type: production
+      dev:
+        dependency-type: development
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly, day: monday }
+    cooldown: { default-days: 7 }
+    commit-message: { prefix: "deps(actions)" }
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Digest bumps for the pinned images. The rust tag moves only with rust-toolchain.toml, by hand
+  # (scripts/check-pins.sh fails CI if they disagree).
+  - package-ecosystem: docker
+    directory: /deploy
+    schedule: { interval: weekly, day: monday }
+    commit-message: { prefix: "deps(docker)" }
+    ignore:
+      - dependency-name: rust
+        update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]
+    groups:
+      images:
+        patterns: ["*"]
+
+  - package-ecosystem: docker-compose
+    directory: /deploy/monitoring
+    schedule: { interval: weekly, day: monday }
+    cooldown: { default-days: 7 }
+    commit-message: { prefix: "deps(monitoring)" }
+    groups:
+      monitoring:
+        patterns: ["*"]

@@ -1,0 +1,43 @@
+# Scrapes one validator host (docker-compose.yml runs everything with host networking).
+# Running a separate monitoring host instead (recommended once you run more than one node, so
+# a dead host still pages): list each node's private address below and reach it over a private
+# link (WireGuard, a VPC), never the public internet. README.md has both layouts.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    operator: my-operator # REPLACE: your operator name, so alerts say whose node it is
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["127.0.0.1:9093"]
+
+scrape_configs:
+  # The node's /metrics (node/src/api.rs). Validators keep HTTP on 127.0.0.1 or a private
+  # interface; sentries and RPC nodes are scraped the same way. Blocks are 1 s, so scrape often.
+  - job_name: blockula
+    scrape_interval: 5s
+    scrape_timeout: 4s
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["127.0.0.1:7070"]
+        labels: { node: validator-1, role: validator } # REPLACE: one entry per node
+      # - targets: ["10.0.0.12:7171"]
+      #   labels: { node: sentry-1, role: sentry }
+
+  - job_name: node
+    static_configs:
+      - targets: ["127.0.0.1:9100"]
+        labels: { node: validator-1 } # the same `node` label as its blockula target
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["127.0.0.1:9090"]
+
+  - job_name: alertmanager
+    static_configs:
+      - targets: ["127.0.0.1:9093"]

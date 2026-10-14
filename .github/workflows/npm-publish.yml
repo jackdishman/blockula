@@ -1,0 +1,63 @@
+# Publishes @blockula/sdk, then @blockula/mcp (which depends on it), to npm with provenance via npm
+# trusted publishing (OIDC): no npm token exists anywhere. Manual only, run from a release tag
+# ("Use workflow from" → the vX.Y.Z tag). Defaults to a dry run.
+#
+# One-time setup by the maintainer (docs/OPERATIONS.md "npm packages"):
+#   npmjs.com → each package → Settings → Trusted publishing → GitHub Actions:
+#     owner jackdishman, repository blockula, workflow npm-publish.yml, environment npm.
+#   Then Settings → Publishing access → "Require two-factor authentication and disallow tokens".
+#   GitHub → Settings → Environments → npm: required reviewer = a maintainer, tags v* only.
+name: Publish npm packages
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Pack and check only; publish nothing"
+        type: boolean
+        default: true
+
+permissions: {}
+
+jobs:
+  publish:
+    name: Publish (${{ inputs.dry_run && 'dry run' || 'for real' }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write # npm trusted publishing and provenance (Sigstore)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      # No dependency cache: a poisoned cache would be published.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with: { node-version: 24, registry-url: "https://registry.npmjs.org" }
+      - name: npm supports trusted publishing (>= 11.5.1)
+        run: |
+          v=$(npm --version)
+          printf '11.5.1\n%s\n' "$v" | sort -V -C || { echo "npm $v is too old for trusted publishing" >&2; exit 1; }
+      - run: npm ci
+      - name: Package versions match the tag
+        run: |
+          want=${GITHUB_REF_NAME#v}
+          for p in sdk-ts mcp; do
+            got=$(node -p "require('./$p/package.json').version")
+            [ "$got" = "$want" ] || { echo "$p/package.json is $got, tag is $GITHUB_REF_NAME" >&2; exit 1; }
+          done
+      - run: npm run build -w @blockula/sdk && npm run build -w @blockula/mcp
+      - name: Publish @blockula/sdk, then @blockula/mcp
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          publish() {
+            if npm view "$1@$version" version >/dev/null 2>&1; then echo "$1@$version is already on npm"; return; fi
+            if [ "$DRY_RUN" = true ]; then npm publish -w "$1" --access public --provenance --dry-run; return; fi
+            npm publish -w "$1" --access public --provenance
+            # The MCP resolves the SDK from the registry: wait until it's visible.
+            for _ in $(seq 30); do npm view "$1@$version" version >/dev/null 2>&1 && return; sleep 10; done
+            echo "$1@$version didn't appear on the registry" >&2; exit 1
+          }
+          publish @blockula/sdk
+          publish @blockula/mcp

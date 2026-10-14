@@ -1,60 +1,134 @@
-# Tag vX.Y.Z → prebuilt `blockula` binaries for macOS + Linux, with SHA-256 checksums,
-# attached to a GitHub release. scripts/install.sh and the MCP's install_node tool use them.
+# Tag vX.Y.Z → reproducible `blockula` archives for Linux + macOS, install.sh, any committed
+# genesis files, checksums.txt, SLSA build provenance (GitHub artifact attestations) for every
+# file, and a DRAFT release. It stays a draft until a maintainer has reproduced the Linux build,
+# signed checksums.txt offline with the ML-DSA-65 release key and attached checksums.txt.sig
+# (docs/OPERATIONS.md "Releases"). scripts/install.sh and the MCP's install_node download from
+# the published release.
 name: Release
 on:
   push: { tags: ["v*"] }
 
-permissions:
-  contents: write
+# Nothing by default; each job asks for exactly what it needs.
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   build:
+    name: Build ${{ matrix.target }}
+    permissions: { contents: read }
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest, container: "rust:1-bookworm" }
-          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm, container: "rust:1-bookworm" }
-          - { target: aarch64-apple-darwin, os: macos-latest }
-          - { target: x86_64-apple-darwin, os: macos-latest }
+          # Linux builds run in the pinned image (glibc 2.36), so anyone can rebuild them bit for bit.
+          # The image must match scripts/reproduce-release.sh and rust-toolchain.toml (check-pins.sh).
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-24.04, container: "rust:1.98.1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e" }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm, container: "rust:1.98.1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e" }
+          - { target: aarch64-apple-darwin, os: macos-15 }
+          - { target: x86_64-apple-darwin, os: macos-15 }
     runs-on: ${{ matrix.os }}
     container: ${{ matrix.container }}
     steps:
-      - uses: actions/checkout@v4
-      - name: Rust toolchain
-        if: ${{ !matrix.container }}
-        uses: dtolnay/rust-toolchain@stable
-        with: { targets: "${{ matrix.target }}" }
-      - name: Build
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - name: Rust toolchain (rust-toolchain.toml)
         shell: bash
-        env: { BLOCKULA_GIT_SHA: "${{ github.sha }}" }
-        run: cargo build --release --locked --manifest-path node/Cargo.toml --target ${{ matrix.target }}
-      - name: Package
+        run: rustup toolchain install && rustup target add ${{ matrix.target }}
+      - name: GNU tar (macOS)
+        if: runner.os == 'macOS'
+        run: command -v gtar || brew install gnu-tar
+      # No caches in release builds: a poisoned cache would ship.
+      - name: Build and package (scripts/release-build.sh)
         shell: bash
-        run: |
-          name=blockula-${{ matrix.target }}
-          mkdir -p dist/$name
-          cp node/target/${{ matrix.target }}/release/blockula dist/$name/
-          cp LICENSE README.md dist/$name/
-          tar -C dist -czf dist/$name.tar.gz $name
-          (cd dist && (sha256sum $name.tar.gz 2>/dev/null || shasum -a 256 $name.tar.gz) > $name.tar.gz.sha256)
-      - uses: actions/upload-artifact@v4
+        run: scripts/release-build.sh ${{ matrix.target }} dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: blockula-${{ matrix.target }}
           path: dist/blockula-${{ matrix.target }}.tar.gz*
+          if-no-files-found: error
+
+  reproduce:
+    name: Reproduce x86_64-unknown-linux-gnu
+    # A second, independent build from a different directory on a fresh runner. The release is
+    # blocked unless it's byte-identical to the build job's archive.
+    needs: build
+    permissions: { contents: read }
+    runs-on: ubuntu-24.04
+    container: "rust:1.98.1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false, path: elsewhere/rebuild/blockula }
+      - name: Rebuild
+        shell: bash
+        working-directory: elsewhere/rebuild/blockula
+        run: rustup toolchain install && scripts/release-build.sh x86_64-unknown-linux-gnu "$GITHUB_WORKSPACE/rebuilt"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with: { name: blockula-x86_64-unknown-linux-gnu, path: released }
+      - name: Compare
+        shell: bash
+        run: |
+          cat released/*.sha256 rebuilt/*.sha256
+          cmp released/blockula-x86_64-unknown-linux-gnu.tar.gz rebuilt/blockula-x86_64-unknown-linux-gnu.tar.gz
+
+  attest:
+    name: Checksums + build provenance
+    needs: [build, reproduce]
+    permissions:
+      contents: read
+      id-token: write # Sigstore signing certificate for the attestation
+      attestations: write # store the attestation on the repo
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with: { pattern: blockula-*, path: dist, merge-multiple: true }
+      # release/ holds exactly what gets published: the archives, install.sh, any genesis files
+      # committed under genesis/<chain id>/genesis.json (docs/GENESIS_CEREMONY.md), checksums.txt.
+      - name: checksums.txt
+        id: files
+        run: |
+          shopt -s nullglob
+          (cd dist && sha256sum -c ./*.tar.gz.sha256)
+          mkdir release
+          cp dist/*.tar.gz scripts/install.sh release/
+          for g in genesis/*/genesis.json; do cp "$g" "release/genesis-$(basename "$(dirname "$g")").json"; done
+          (cd release && sha256sum -- * | sort -k2 > ../checksums.txt)
+          mv checksums.txt release/ && cat release/checksums.txt
+          { echo 'subjects<<EOF'; ls -1 release/*; echo EOF; } >> "$GITHUB_OUTPUT"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ steps.files.outputs.subjects }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-files
+          path: release/
+          if-no-files-found: error
 
   release:
-    needs: build
-    runs-on: ubuntu-latest
+    name: Draft release
+    needs: attest
+    permissions: { contents: write } # create the draft release and upload its assets
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with: { path: dist, merge-multiple: true }
-      - name: Checksums
-        run: cd dist && cat *.sha256 > checksums.txt && cat checksums.txt
-      - name: Publish release
-        env: { GH_TOKEN: "${{ github.token }}" }
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with: { name: release-files, path: release }
+      - name: Create the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/checksums.txt scripts/install.sh \
-            --title "Blockula $GITHUB_REF_NAME" --generate-notes \
-            --notes "Install: \`curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sh\`"
+          cat > notes.md <<EOF
+          Install: \`curl -fsSL https://github.com/$REPO/releases/download/$TAG/install.sh | sh\`
+
+          **Verify before you run it.** Every file has SLSA build provenance:
+          \`gh attestation verify blockula-<target>.tar.gz --repo $REPO\`.
+          \`checksums.txt\` is signed offline with the Blockula release key (ML-DSA-65):
+          \`checksums.txt.sig\`. The Linux archives rebuild bit for bit with
+          \`scripts/reproduce-release.sh $TAG\`. See docs/OPERATIONS.md "Releases".
+          EOF
+          gh release create "$TAG" release/* \
+            --repo "$REPO" --draft --verify-tag --title "Blockula $TAG" --notes-file notes.md --generate-notes

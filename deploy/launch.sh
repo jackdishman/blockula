@@ -27,7 +27,7 @@ APPS=("$RPC_APP"); for i in $(seq 0 $((N - 1))); do APPS+=("$PREFIX-v$i"); done
 
 fly auth whoami >/dev/null || { echo "Run: fly auth login" >&2; exit 1; }
 mkdir -p "$CONF" && chmod 700 "$CONF"
-cargo build --release --manifest-path node/Cargo.toml -q
+cargo build --release --locked --manifest-path node/Cargo.toml -q
 BIN=node/target/release/blockula
 
 if [ "${RESET:-}" = 1 ]; then

@@ -27,7 +27,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-[[ -n "${SKIP_BUILD:-}" ]] || cargo build --release --manifest-path node/Cargo.toml
+[[ -n "${SKIP_BUILD:-}" ]] || cargo build --release --locked --manifest-path node/Cargo.toml
 echo "📁 $DIR"
 
 EPOCH=${EPOCH:-20}
