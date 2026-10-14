@@ -163,7 +163,7 @@ Staking rewards are payment for validating and securing the network. They aren't
 
 **European Union (MiCA, Regulation 2023/1114, Title II applies from 2024-12-30).** The white-paper rules for offers to the public don't apply to crypto-assets offered for free or created automatically as validation rewards (Art. 4(3)). That exemption falls away if the offeror announces an intention to seek admission to trading (Art. 4(4)). An exchange that lists a token on its own initiative must write the white paper itself (Art. 5(2)). Open questions for EU counsel: whether Hunts and pool payouts (given for work) count as "free", and whether linking a GitHub handle is personal data given in exchange.
 
-**Where the real exposure is.** Not the 10% allocation, but operational control: today one person maintains the code, merges the PRs that earn pool rewards, signs releases, and runs the wallet domain, the RPC and the testnet validators. That has to be handed over before genesis: more maintainers with merge rights, more wallet frontends and RPCs, the domain owned by an entity, and at most 2 foundation validators.
+**Where the real exposure is.** Not the 10% allocation, but operational control: today one person maintains the code, merges the PRs that earn pool rewards, publishes releases, and runs the wallet domain, the RPC and the testnet validators. That has to be handed over before genesis: more maintainers with merge rights, more wallet frontends and RPCs, the domain owned by an entity, and at most 2 foundation validators.
 
 ### What the founder must not do
 

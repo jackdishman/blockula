@@ -30,7 +30,7 @@ Companion documents: [TOKENOMICS.md](TOKENOMICS.md) (supply, allocation, issuanc
 
 **Today** the founder is the repository owner and the only maintainer. He:
 - merges every PR, and so gates which PRs can earn testnet Hunts and pool rewards;
-- controls the GitHub repo, the npm packages, the release signing, and the wallet origin (`blockula-wallet.vercel.app`);
+- controls the GitHub repo and its releases, the npm packages, and the wallet origin (`blockula-wallet.vercel.app`);
 - runs all four testnet validators, the public RPC and the explorer in one Fly.io organization, and generated every testnet key on one laptop;
 - holds the testnet's single admin key ("Season 0"). It approves validators, grants Soul, sets repo weights, flags sybils, rejects claims and claws back rewards.
 
@@ -152,7 +152,7 @@ Genesis supply is 1,000,000,000 FANG. Nothing is sold (TOKENOMICS.md section 1).
 
 ## 12. Further open questions
 
-- **Operational control.** Which handovers must be complete before genesis for the founder not to be a "central party" with operational control (Release fn. 54)? Today that means merge rights, release signing, the wallet origin, the RPC and the explorer.
+- **Operational control.** Which handovers must be complete before genesis for the founder not to be a "central party" with operational control (Release fn. 54)? Today that means merge rights, releases, the wallet origin, the RPC and the explorer.
 - **The founder's pledges.** No votes, no pool claims, no juries while vesting runs. Should they be published as a binding undertaking, enforced in code, or both? Is a 10b5-1-style selling plan the right model for a founder with no issuer?
 - **Incentivized testnet.** Operators are to be paid from the 3% bucket under signed agreements for running testnet and genesis validators. How should those agreements be structured: in FANG locked at genesis, in fiat, or both? What can be said publicly when recruiting?
 - **Soul at genesis.** Soul affects payout boosts and jury eligibility. If the genesis Soul ledger is derived from testnet jury outcomes, is that a testnet incentive in substance? Should it start empty, or follow a rule that counsel approves?
