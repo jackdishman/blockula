@@ -3444,7 +3444,10 @@ mod audit {
         println!("revalidating 5,000 txs: {:?}", t.elapsed());
     }
 
-    /// 200k accounts and a full 512-tx block: no per-tx state clone.
+    /// 200k accounts and a full 512-tx block: no per-tx state clone. Timed is the execution
+    /// (applying the txs, the end-of-block steps, the state commit); writing the block (fsyncs
+    /// and the database commit) is printed but not bounded, since the parallel test suite's
+    /// other fsyncs make it as slow as the disk is busy.
     #[test]
     fn big_state_block_execution() {
         let (_h, mut c) = fresh("clone");
@@ -3456,11 +3459,17 @@ mod audit {
             c.state.accounts.insert(k.address(), Account { balance: 1_000 * DROPS_PER_FANG, ..Default::default() });
         }
         c.state.supply += 200_000 * DROPS_PER_FANG + 8 * 1_000 * DROPS_PER_FANG;
+        // The accounts were inserted behind the chain's back: an untimed block writes them to the
+        // state database (one 200k-record commit), so the timed one is a block over a big state.
+        c.produce_block_with(vec![]).unwrap();
         let txs: Vec<Tx> = (0..512u64).map(|i| unsigned("audit", &senders[(i % 8) as usize], i / 8, Action::Transfer { to: crypto::address_from_bytes(&crypto::hash(&i.to_le_bytes())), amount: 1 })).collect();
+        let f = c.test_block(txs);
         let t = Instant::now();
-        c.produce_block_with(txs).unwrap();
+        let mut e = c.execute_in_memory(f).unwrap();
         let took = t.elapsed();
-        println!("512-tx block over 200k accounts executed in {took:?}");
+        let written = c.writer.clone().lock().persist(&mut e);
+        c.finish(e, written).unwrap();
+        println!("512-tx block over 200k accounts executed in {took:?}, written in {:?}", t.elapsed() - took);
         assert_eq!(c.block(c.height()).unwrap().txs.len(), 512);
         assert!(took.as_secs_f64() < if cfg!(debug_assertions) { 10.0 } else { 1.0 }, "{took:?}");
     }
