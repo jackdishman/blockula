@@ -106,6 +106,12 @@ pub mod ix {
 /// Where a log's last committed entry ends: (segment, byte offset).
 pub type LogEnd = (u64, u64);
 
+/// A record as stored: (namespace, key, value).
+pub type Record = (u8, Vec<u8>, Vec<u8>);
+
+/// Where [`Store::reset`] receives records: `(namespace, key, value)`.
+pub type RecordSink<'a> = &'a mut dyn FnMut(u8, &[u8], &[u8]) -> Result<()>;
+
 /// What the store holds: the state after `height`, and how the home got there.
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct CommitPoint {
@@ -321,7 +327,7 @@ impl Store {
     }
 
     /// Every record, in canonical order (one read transaction, held while iterating).
-    pub fn records(&self) -> Result<impl Iterator<Item = Result<(u8, Vec<u8>, Vec<u8>)>> + use<>> {
+    pub fn records(&self) -> Result<impl Iterator<Item = Result<Record>> + use<>> {
         let tx = self.db.begin_read().map_err(storage)?;
         let table = tx.open_table(RECORDS).map_err(storage)?;
         let range = table.range::<&[u8]>(..).map_err(storage)?;
@@ -343,7 +349,7 @@ impl Store {
 
     /// Replaces everything with `records` and `nodes` (a whole state, built in memory) at
     /// `point`, in one transaction: a crash leaves the old contents or the new ones.
-    pub fn reset(&self, point: &mut CommitPoint, records: &mut dyn FnMut(&mut dyn FnMut(u8, &[u8], &[u8]) -> Result<()>) -> Result<()>, nodes: &[(NodeKey, Option<Node>)]) -> Result<()> {
+    pub fn reset(&self, point: &mut CommitPoint, records: &mut dyn FnMut(RecordSink) -> Result<()>, nodes: &[(NodeKey, Option<Node>)]) -> Result<()> {
         let tx = self.begin(true)?;
         for name in [RECORDS.name(), NODES.name(), META.name(), BLOCKS.name(), HASHES.name(), TXS.name(), HISTORY.name(), INDEX.name(), CERTS.name(), EPOCH_HEADS.name()] {
             let handle = tx.list_tables().map_err(storage)?.find(|h| h.name() == name);
@@ -834,7 +840,10 @@ pub struct SegLog {
 
 impl SegLog {
     pub fn open(dir: &Path, ext: &'static str, framing: Framing, seg_heights: u64) -> Result<SegLog> {
-        fs::create_dir_all(dir)?;
+        if !dir.exists() {
+            fs::create_dir_all(dir)?;
+            sync_dir(dir.parent().unwrap_or(Path::new(".")))?;
+        }
         let reader = Arc::new(SegReader { dir: dir.to_path_buf(), ext, framing, seg_heights, files: Mutex::new(vec![]) });
         Ok(SegLog { reader, cur: None, unsynced: false })
     }

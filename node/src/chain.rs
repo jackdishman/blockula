@@ -1340,7 +1340,7 @@ fn open_store(path: &Path) -> Result<Arc<Store>> {
 }
 
 /// Feeds every record of `state` to a store sink, stopping at the first error.
-fn state_records(state: &State) -> impl FnMut(&mut dyn FnMut(u8, &[u8], &[u8]) -> Result<()>) -> Result<()> + '_ {
+fn state_records(state: &State) -> impl FnMut(store::RecordSink) -> Result<()> + '_ {
     move |sink| {
         let mut err = Ok(());
         state.for_each_record(|n, k, v| {
@@ -1447,6 +1447,8 @@ impl Chain {
         let blocks = SegLog::open(&home.join("blocks"), "jsonl", Framing::Lines, layout.segment_heights)?;
         let cblocks = SegLog::open(&home.join("cblocks"), "bin", Framing::Records, layout.segment_heights)?;
         crate::snapshot::remove_partial(home);
+        // An interrupted fast-sync download (it starts over).
+        let _ = fs::remove_file(home.join("base.state.zst.part"));
         let genesis_state = genesis.initial_state();
         let genesis_root = genesis_state.root();
         let genesis_hash = hex::encode(crate::consensus::genesis_block(&genesis).digest_bytes());
@@ -1557,7 +1559,7 @@ impl Chain {
                 _ => None,
             };
             let height = block.height;
-            let durable = height % REPLAY_SYNC_EVERY == 0;
+            let durable = height.is_multiple_of(REPLAY_SYNC_EVERY);
             self.replay(block, e.pos, cpos, durable).with_context(|| format!("replaying block {height} from {}", self.home.join("blocks").display()))?;
             last_durable = durable;
             bend = e.pos.end();
@@ -1707,7 +1709,7 @@ impl Chain {
     #[cfg(test)]
     pub fn store_cert(&mut self, height: u64, cert: Vec<u8>) -> Result<()> {
         let boundary = self.state.params.is_boundary(height);
-        if (height % CERT_CHECKPOINT == 0 && height >= self.point.pruned_below) || boundary {
+        if (height.is_multiple_of(CERT_CHECKPOINT) && height >= self.point.pruned_below) || boundary {
             self.store.put_cert(height, &cert)?;
         }
         self.disk.remember_cert(height, cert);
@@ -1765,7 +1767,7 @@ impl Chain {
             point.cblocks_end = c.end();
         }
         let boundary = self.state.params.is_boundary(block.height);
-        let cert = cert.filter(|_| block.height % CERT_CHECKPOINT == 0 || boundary).map(|c| (block.height, c));
+        let cert = cert.filter(|_| block.height.is_multiple_of(CERT_CHECKPOINT) || boundary).map(|c| (block.height, c));
         let prune_below = self.keep_blocks.map(|k| (block.height + 1).saturating_sub(k)).unwrap_or(0);
         let nodes = self.state.tree.pending_changes();
         #[cfg(test)]
