@@ -1666,12 +1666,12 @@ pub struct Block {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use proptest::prelude::*;
 
     /// One action per tag (0–29), in tag order. Mirrored by `vectorActions` in sdk-ts/test/e2e.ts.
-    fn vector_actions() -> Vec<Action> {
+    pub(crate) fn vector_actions() -> Vec<Action> {
         vec![
             Action::Transfer { to: "x.boo".into(), amount: 5 },
             Action::RegisterName { name: "vlad".into() },
@@ -1712,7 +1712,7 @@ mod tests {
     /// Protocol v1 (MAINNET-DESIGN 3.1): one action per tag 30–49 (some twice, for optional or
     /// empty fields), with every `ProposalKind` and a multisig proposal, in tag order. Mirrored by
     /// `v1VectorActions` in sdk-ts/test/e2e.ts.
-    fn v1_vector_actions() -> Vec<Action> {
+    pub(crate) fn v1_vector_actions() -> Vec<Action> {
         let propose = |kind: ProposalKind| Action::Propose { kind, deposit: 1_000 * DROPS_PER_FANG, title: "t".into(), url: String::new() };
         vec![
             Action::Delegate { validator: "boo1v".into(), amount: 5 * DROPS_PER_FANG },

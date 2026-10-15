@@ -3548,6 +3548,22 @@ mod scaffold {
         fs::remove_dir_all(home).ok();
     }
 
+    /// Every action has a plain-English summary, starting with who acted.
+    #[test]
+    fn every_action_is_described() {
+        let st = genesis("scaffold-1").initial_state();
+        let owner = keys(22);
+        for action in crate::types::tests::vector_actions().into_iter().chain(crate::types::tests::v1_vector_actions()) {
+            let tx = Tx { chain_id: "c".into(), from: owner.address(), nonce: 0, fee: 0, tip: 0, valid_until: 0, action, memo: String::new(), public_key: hex::encode(owner.public_key()), signature: String::new() };
+            let summary = st.describe(&tx, Some(1));
+            assert!(summary.starts_with(&short(&owner.address())) && summary.len() > 30, "{:?}: “{summary}”", tx.action);
+        }
+        let vote = |conviction| Tx { chain_id: "c".into(), from: owner.address(), nonce: 0, fee: 0, tip: 0, valid_until: 0, action: Action::Vote { proposal_id: 3, aye: false, amount: 2 * FANG, conviction }, memo: String::new(), public_key: String::new(), signature: String::new() };
+        assert!(st.describe(&vote(0), None).ends_with("voted nay on proposal #3 with 2 FANG at 0.1× conviction"));
+        let spend = Tx { action: Action::Propose { kind: ProposalKind::TreasurySpend { to: keys(22).address(), amount: FANG }, deposit: 50 * FANG, title: "Grants".into(), url: String::new() }, ..vote(1) };
+        assert!(st.describe(&spend, None).ends_with(&format!("proposed “Grants”: pay 1 FANG from the treasury to {}, bonding 50 FANG", short(&owner.address()))));
+    }
+
     #[test]
     fn levers_run_without_signers_and_roll_back() {
         let (home, mut c) = open("levers", &genesis("scaffold-1"));
