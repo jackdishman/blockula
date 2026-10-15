@@ -427,6 +427,6 @@ mod tests {
         let s = signals(&active, blocks);
         assert_eq!(s.get("a"), Some(&(2, 10)));
         assert_eq!(s.get("b"), Some(&(1, 9)), "the newest block counts, not the highest signal");
-        assert!(s.get("c").is_none() && s.get("x").is_none(), "no block yet; not in the set");
+        assert!(!s.contains_key("c") && !s.contains_key("x"), "no block yet; not in the set");
     }
 }
