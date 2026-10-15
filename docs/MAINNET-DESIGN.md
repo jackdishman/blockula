@@ -118,6 +118,7 @@ CBlock { version: u32, parent, height, view: u64, parent_view: u64, timestamp_ms
 ### 3.6 Fees and issuance (TOK-1, TOK-2)
 
 - **Base fee per byte** for block `h` is fixed when block `h − 17` executes (`MAX_EXEC_LAG + 1`), so every proposer within the lag limit knows it exactly. Target fullness 50% of `MAX_BLOCK_BYTES`, max change 12.5% per block, floor = today's `min_fee` formula. The base part is burned.
+  - *As built (P-ECON, `econ.rs`):* the state keeps the fee slot (flat part, rate in milli-drops per byte, `max_block_bytes`) of the last executed height and the 17 after it; parameter changes reach slots 17 blocks later. A proposer more than 17 blocks ahead of its state proposes no txs; a block with txs must cite `exec_height ≥ height − 17`, so a verifier checks its size and every tx's fee exactly once it has executed that height. Statelessly a fee is only checked against the lowest base fee any parameters allow.
 - Proposals order mempool txs by tip per byte; the mempool evicts the lowest tip per byte when full.
 - **Issuance** is minted at each epoch boundary: `supply × rate_ppm(year) / epochs_per_year`, with the rate starting at 6% and decaying 15% a year to a 1.5% floor (integer ppm math). Split 70% to active validators' pools (pro rata to stake, none for jailed or tombstoned validators), 20% to the contribution pool, 10% to the treasury.
 - Account creation burns `account_creation_fee` (0.1 FANG at genesis).
@@ -126,6 +127,7 @@ CBlock { version: u32, parent, height, view: u64, parent_view: u64, timestamp_ms
 
 - Staking rewards earned by locked tokens are locked on the same curve (otherwise a vesting allocation yields liquid income before its cliff). An account with vesting locks can delegate at most `insider_delegation_cap` (1% of supply) to any one pool.
 - Accounts carry `locks: [Lock { id, amount(curve), reason }]`. A vesting lock is a curve (`start`, `cliff`, `end`, `total`): the locked amount at height `h` is the unvested part. Transferable balance = liquid − max(0, max_lock − staked − unbonding). Locked tokens can be staked and delegated, never transferred.
+  - *As built (P-ECON):* after every tx's action, each account it touched must hold transferable ≥ 0 (the sender: no less than it had, since fees may be paid from locked tokens), so every module's escrows and payments respect locks without checking them. The treasury's 4-year unlock and the endowment's 10-year stream are vesting locks on those keyless accounts; each epoch the endowment's vested part moves into the contribution pool.
 - `blockula genesis build --spec <spec.toml>` produces a byte-identical `genesis.json` and its hash from reviewed inputs (allocations with vesting, operators with their own keys and proofs of possession, parameters, reserved names, Soul ledger, `faucet: false`, `validator_admins: []` for mainnet). Several parties must reproduce the hash.
 
 ### 3.8 Randomness beacon and Proof of Contribution (CRY-3, GOV-3)

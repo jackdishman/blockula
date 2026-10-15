@@ -797,12 +797,13 @@ where
                     debug!(?from, "unparseable gossiped tx");
                     continue;
                 };
-                // Verify format + ML-DSA signature before taking the chain lock.
-                let (chain_id, prefix) = {
+                // Verify format + ML-DSA signature before taking the chain lock; a fee below the
+                // next block's base fee is refused first, before the signature costs anything.
+                let (chain_id, prefix, priced) = {
                     let c = gossip_chain.lock();
-                    (c.genesis.chain_id.clone(), c.genesis.address_prefix.clone())
+                    (c.genesis.chain_id.clone(), c.genesis.address_prefix.clone(), crate::econ::check_fee(&c.state, &tx, c.height() + 1))
                 };
-                if let Err(e) = check_tx_stateless(&tx, &chain_id, &prefix) {
+                if let Err(e) = priced.and_then(|_| check_tx_stateless(&tx, &chain_id, &prefix)) {
                     debug!(?from, error = %e, "dropping invalid gossiped tx");
                     continue;
                 }

@@ -636,9 +636,11 @@ async fn submit(State(n): State<Node>, ConnectInfo(peer): ConnectInfo<SocketAddr
 }
 
 async fn submit_inner(n: &Node, headers: &HeaderMap, client: Option<IpAddr>, tx: Tx) -> ApiResult {
-    // Format + ML-DSA signature checks run without the chain lock.
+    // Format + ML-DSA signature checks run without the chain lock, after the cheap check that the
+    // fee covers the next block's base fee.
     let (chain_id, prefix, role) = {
         let v = n.live.view();
+        crate::econ::check_fee(&v.state, &tx, crate::econ::now(&v.state))?;
         (v.genesis.chain_id.clone(), v.genesis.address_prefix.clone(), v.role)
     };
     crate::consensus::check_tx_stateless(&tx, &chain_id, &prefix)?;
