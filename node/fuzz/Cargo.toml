@@ -129,3 +129,10 @@ members = ["."]
 # Same hybrid p2p handshake as the node (docs/PQ-TRANSPORT.md).
 [patch.crates-io]
 commonware-stream = { path = "../vendor/commonware-stream" }
+
+[[bin]]
+name = "state_machine"
+path = "fuzz_targets/state_machine.rs"
+test = false
+doc = false
+bench = false
