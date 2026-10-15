@@ -196,11 +196,11 @@ fn hex32(field: &str, s: &str) -> Result<[u8; 32]> {
 
 // --------------------------------------------------------------------------------------- txs
 
-/// Whether validators may still attest that `c` was reverted at `height`: it's verified (or in
-/// a Séance) and at most `claim_maturity_blocks` past its verification. A PR that survives the
-/// window is paid for even if it's reverted later.
+/// Whether validators may still attest that `c` was reverted at `height`: it's verified and at
+/// most `claim_maturity_blocks` past its verification (Séances only take claims whose window is
+/// over). A PR that survives the window is paid for even if it's reverted later.
 pub fn revert_window_open(state: &State, c: &Claim, height: u64) -> bool {
-    matches!(c.status, ClaimStatus::Verified | ClaimStatus::InSeance) && c.verified_at.is_some_and(|v| height <= v.saturating_add(state.params.poc.claim_maturity_blocks))
+    c.status == ClaimStatus::Verified && c.verified_at.is_some_and(|v| height <= v.saturating_add(state.params.poc.claim_maturity_blocks))
 }
 
 /// Tags 37, 38 and 49: BeaconCommit, BeaconReveal, AttestRevert. Signed by a validator's
@@ -272,7 +272,7 @@ fn attest_revert(state: &mut State, j: &mut Journal, sender: &str, signer: &str,
     let quorum = n - (n - 1) / 3;
     let agree = state.beacon.reverts[&claim_id].iter().filter(|(val, a)| a.revert_sha == revert_sha && set.contains(*val)).count();
     if agree >= quorum {
-        let reason = format!("reverted by {} ({agree} of {n} validators attested)", &revert_sha[..10]);
+        let reason = format!("reverted by {} ({agree} of {n} validators attested)", revert_sha.get(..10).unwrap_or(revert_sha));
         state.exec_reject_claim(j, claim_id, &reason, height)?;
         state.beacon.reverts.remove(&claim_id);
     }

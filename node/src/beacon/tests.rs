@@ -43,7 +43,7 @@ impl Net {
         let tx = signed(&self.c, who, action);
         self.c.submit(tx).unwrap_err().to_string()
     }
-    fn to_height(&mut self, h: u64) {
+    fn advance_to(&mut self, h: u64) {
         while self.c.height() < h {
             self.c.produce_block_with(vec![]).unwrap();
         }
@@ -132,7 +132,7 @@ fn a_round_commits_reveals_and_records_who_missed() {
     assert!(t.refused(&v[1], commit(&t.c, &v[1], 2, secret(9))).contains("already committed"));
     // Reveals during epoch 1, not before.
     assert!(t.refused(&v[0], reveal(2, secret(1))).contains("reveal their beacon secrets for epoch 1"));
-    t.to_height(9);
+    t.advance_to(9);
     assert_eq!(value(&t.c.state, 1), Some(derive(&value(&t.c.state, 0).unwrap(), 1, &[])), "no round: the hash chain");
     assert_eq!(value(&t.c.state, 2), None);
     assert!(t.refused(&v[0], reveal(2, secret(9))).contains("doesn't match"));
@@ -144,9 +144,9 @@ fn a_round_commits_reveals_and_records_who_missed() {
     t.c.produce_block().unwrap();
     assert!(t.refused(&v[0], reveal(2, secret(1))).contains("already revealed"));
     // v[3] withholds. Nothing is known about epoch 2's value until the epoch ends.
-    t.to_height(18);
+    t.advance_to(18);
     assert_eq!(value(&t.c.state, 2), None);
-    t.to_height(19);
+    t.advance_to(19);
     let mut reveals: Vec<(String, [u8; 32])> = v.iter().take(3).enumerate().map(|(i, k)| (k.address(), secret(i as u8 + 1))).collect();
     reveals.sort();
     let got = t.c.state.beacon.values[&2].clone();
@@ -169,7 +169,7 @@ fn only_withholding_changes_the_value() {
         t.c.submit(signed(&t.c, k, commit(&t.c, k, 2, secret(i as u8 + 1)))).unwrap();
     }
     t.c.produce_block().unwrap();
-    t.to_height(9);
+    t.advance_to(9);
     let start = t.c.state.clone();
     let reveals: Vec<Tx> = v.iter().enumerate().map(|(i, k)| signed(&t.c, k, reveal(2, secret(i as u8 + 1)))).collect();
     let rev = |i: usize| reveals[i].clone();
@@ -193,7 +193,7 @@ fn only_withholding_changes_the_value() {
 #[test]
 fn without_reveals_the_beacon_is_a_hash_chain() {
     let mut t = net("chain", 1, None);
-    t.to_height(39);
+    t.advance_to(39);
     for e in 1..=4 {
         let got = &t.c.state.beacon.values[&e];
         assert_eq!(got, &Value { value: derive(&value(&t.c.state, e - 1).unwrap(), e, &[]), reveals: 0, missed: vec![] });
@@ -249,7 +249,7 @@ fn duties_commit_reveal_and_survive_a_restart() {
     let mut secrets = Secrets::open(&home).unwrap();
     assert_eq!(secrets.get(2), Some(s2));
     // A crash between writing a secret and sending its commitment: the same secret is committed.
-    t.to_height(9);
+    t.advance_to(9);
     let s3 = secrets.get_or_create(3).unwrap();
     while t.c.height() < 19 {
         step(&mut t, &mut secrets);
@@ -263,12 +263,12 @@ fn duties_commit_reveal_and_survive_a_restart() {
     // round with a fresh file), misses the reveal, and is jailed for it.
     std::fs::remove_file(&path).unwrap();
     let mut secrets = Secrets::open(&home).unwrap();
-    t.to_height(29);
+    t.advance_to(29);
     let err = duties(&mut t.c, &mut secrets).unwrap_err().to_string();
     assert!(err.contains("can't reveal"), "{err}");
     t.c.produce_block().unwrap();
     assert_eq!(t.c.state.beacon.rounds[&5][&me].commitment, commitment(&t.c.genesis.chain_id, 5, &me, &secrets.get(5).unwrap()));
-    t.to_height(39);
+    t.advance_to(39);
     assert_eq!(t.c.state.beacon.values[&3].reveals, 1);
     assert_eq!(t.c.state.beacon.values[&4], Value { value: derive(&value(&t.c.state, 3).unwrap(), 4, &[]), reveals: 0, missed: vec![me.clone()] });
     t.done();
@@ -352,14 +352,14 @@ fn the_revert_window_closes_after_maturity() {
     let id = t.verified_claim(&alice, 3);
     let until = t.c.state.poc.claims[&id].verified_at.unwrap() + 20;
     t.tx(&v[1], attest(id, &"cd".repeat(20))).unwrap();
-    t.to_height(until - 1);
+    t.advance_to(until - 1);
     t.tx(&v[2], attest(id, &"cd".repeat(20))).unwrap();
     assert_eq!(t.c.height(), until, "still open on its last block");
     assert!(t.refused(&v[3], attest(id, &"cd".repeat(20))).contains("isn't in its revert window"));
     assert!(t.c.state.beacon.reverts.contains_key(&id));
     // The next epoch boundary drops what can no longer reach a quorum.
     let boundary = t.c.state.params.last_of(t.c.state.params.epoch_of(t.c.height()));
-    t.to_height(boundary);
+    t.advance_to(boundary);
     assert!(!t.c.state.beacon.reverts.contains_key(&id));
     assert_eq!(t.c.state.poc.claims[&id].status, ClaimStatus::Verified);
     t.done();
