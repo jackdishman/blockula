@@ -322,7 +322,7 @@ impl Genesis {
         }
         // Operators own their validators: the self-bond moves from the owner's balance into the
         // validator's stake pool as the owner's shares (staking.rs). A validator without an
-        // operator (`check` refuses one) would get an empty pool.
+        // operator (dev and test chains only) gets an empty pool.
         let mut bonds: BTreeMap<String, u64> = BTreeMap::new();
         for o in &self.operators {
             let Some(address) = hex::decode(&o.consensus_key).ok().map(|pk| crypto::address_with_prefix(&prefix, &pk)) else { continue };
@@ -376,9 +376,11 @@ impl Genesis {
     }
 
     /// Everything a genesis must satisfy (`load` runs it): its addresses use its prefix; the
-    /// parameters, allocations and vesting schedules are in bounds; every validator has an
-    /// operator, which proves possession of its key and can fund its self-bond; reserved names,
-    /// the Soul ledger and features are well-formed; and mainnet has no admins and no faucet.
+    /// parameters, allocations and vesting schedules are in bounds; operators match validators,
+    /// prove possession of their keys and can fund their self-bonds; reserved names, the Soul
+    /// ledger and features are well-formed; and mainnet has no admins, no faucet, and an operator
+    /// for every validator. (Elsewhere a validator without an operator has no self-bond: it's
+    /// ineligible, so it leaves the set at the first boundary unless that would empty it.)
     pub fn check(&self) -> Result<()> {
         use std::collections::BTreeSet;
         self.check_prefix()?;
@@ -457,14 +459,10 @@ impl Genesis {
             ensure!(crate::upgrade::KNOWN_FEATURES.contains(&f.as_str()), "unknown feature {f} (known: {})", crate::upgrade::KNOWN_FEATURES.join(", "));
             ensure!(features.insert(f), "feature {f} is listed twice");
         }
-        // Every validator stakes (3.4): one without a self-bond is ineligible, so it would leave
-        // the set at the first boundary.
-        if let Some(v) = self.validators.iter().find(|v| !keys.contains(v.public_key.as_str())) {
-            bail!("validator {} needs an operator (owner, self-bond, commission): every validator stakes", v.address);
-        }
         if self.chain_id == MAINNET_CHAIN_ID {
             ensure!(self.validator_admins.is_empty(), "{MAINNET_CHAIN_ID} has no admin keys: validator_admins must be empty");
             ensure!(!self.faucet, "{MAINNET_CHAIN_ID} has no faucet");
+            ensure!(self.validators.iter().all(|v| keys.contains(v.public_key.as_str())), "every {MAINNET_CHAIN_ID} validator needs an operator (owner, self-bond, commission)");
         }
         Ok(())
     }
