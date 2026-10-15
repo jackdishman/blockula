@@ -272,8 +272,16 @@ fn write_secret(path: &Path, contents: &str) -> Result<()> {
 
 #[derive(Subcommand)]
 pub enum WalletCmd {
-    /// Create a wallet key (refuses to overwrite an existing one)
-    New,
+    /// Create a wallet key (refuses to overwrite an existing one). The address is printed with
+    /// the network's prefix: `--prefix`, else the one the node at `--rpc` reports, else `boo`
+    New {
+        /// A node of the network the wallet is for (its address prefix is used)
+        #[arg(long)]
+        rpc: Option<String>,
+        /// Address prefix: `boo` (mainnet) or `tboo` (public testnets)
+        #[arg(long, conflicts_with = "rpc")]
+        prefix: Option<String>,
+    },
     /// Show the wallet's balance
     Balance {
         #[arg(long, default_value = "http://localhost:7070")]
@@ -317,12 +325,19 @@ pub(crate) fn wallet_keys(dir: &Path) -> Result<Keys> {
 
 pub fn wallet(cmd: WalletCmd, dir: &Path) -> Result<()> {
     match cmd {
-        WalletCmd::New => {
+        WalletCmd::New { rpc, prefix } => {
+            // The same key is an account on every network; show the address this network uses.
+            let prefix = match (prefix, rpc) {
+                (Some(p), _) if crate::crypto::is_prefix(&p) => p,
+                (Some(p), _) => bail!("unknown address prefix {p:?} (boo or tboo)"),
+                (None, Some(rpc)) => rt()?.block_on(chain_prefix(&rpc))?,
+                (None, None) => crate::crypto::ADDRESS_HRP.to_string(),
+            };
             std::fs::create_dir_all(dir)?;
             let keys = Keys::generate();
-            let f = WalletFile { address: keys.address(), seed: keys.seed_hex() };
+            let f = WalletFile { address: keys.address_with(&prefix), seed: keys.seed_hex() };
             write_secret(&dir.join("wallet.json"), &serde_json::to_string_pretty(&f)?)?;
-            println!("🧛 New wallet {}", keys.address());
+            println!("🧛 New wallet {}", f.address);
             println!("   key saved to {} (mode 600 — back it up; anyone with it controls the funds)", dir.join("wallet.json").display());
             Ok(())
         }
@@ -392,6 +407,23 @@ mod tests {
         assert!(load_seed(&json).err().unwrap().to_string().contains("seed"));
         std::fs::write(&bare, "not hex").unwrap();
         assert!(load_seed(&bare).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `wallet new` writes and prints the address with the network's prefix (WAL-4).
+    #[test]
+    fn wallet_new_uses_the_network_prefix() {
+        let dir = std::env::temp_dir().join(format!("blockula-wallet-new-{}", std::process::id()));
+        for (prefix, want) in [(Some("tboo"), "tboo1"), (None, "boo1")] {
+            std::fs::remove_dir_all(&dir).ok();
+            wallet(WalletCmd::New { rpc: None, prefix: prefix.map(String::from) }, &dir).unwrap();
+            let f: WalletFile = serde_json::from_slice(&std::fs::read(dir.join("wallet.json")).unwrap()).unwrap();
+            assert!(f.address.starts_with(want), "{}", f.address);
+            assert_eq!(wallet_keys(&dir).unwrap().address_with(&f.address[..want.len() - 1]), f.address);
+        }
+        assert!(wallet(WalletCmd::New { rpc: None, prefix: None }, &dir).is_err(), "never overwrites a wallet");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(wallet(WalletCmd::New { rpc: None, prefix: Some("xboo".into()) }, &dir).unwrap_err().to_string().contains("unknown address prefix"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
