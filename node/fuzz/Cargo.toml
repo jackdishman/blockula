@@ -54,7 +54,7 @@ imbl = { version = "=7.0.2", features = ["serde"] }
 borsh = { version = "=1.8.1", features = ["derive", "de_strict_order"] }
 redb = "=4.4.0"
 arc-swap = "=1.9.2"
-blockula-ghost = { path = "../ghost" }
+blockula-ghost = { path = "../ghost", version = "=0.1.0" }
 
 # Like the node's release build: arithmetic overflow panics instead of wrapping.
 rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std", "tls12"] }

@@ -50,7 +50,7 @@ redb = "=4.4.0"
 arc-swap = "=1.9.2"
 # Ghost Mode's cryptographic core (keys, notes, the commitment tree, the Action STARK on Plonky3,
 # note encryption): its own workspace, pinned there. Disabled at genesis (src/ghost.rs).
-blockula-ghost = { path = "ghost" }
+blockula-ghost = { path = "ghost", version = "=0.1.0" }
 
 # ML-DSA and consensus are slow unoptimized; keep our crate debuggable but optimize deps.
 [profile.dev.package."*"]
