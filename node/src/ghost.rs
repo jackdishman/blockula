@@ -59,7 +59,6 @@
 //! | META `ghost` | [`GhostMeta`] | instance, frontier, anchor, pool, pause |
 
 use crate::chain::{check_validity, short, BlockInfo, Genesis, Journal, KeyRecord, Outcome, State, TipRate};
-use crate::params::ChainParams;
 use crate::state::codec::{decode, encode};
 use crate::state::{meta, ns, JMap, SubState, TMap, Table};
 use crate::types::*;

@@ -197,6 +197,15 @@ groups:
           summary: "{{ $labels.node }}: validator {{ $labels.validator }} missed {{ $value }} of its recent leader slots (jailed past {{ with printf `blockula_downtime_max_missed{node=\"%s\"}` $labels.node | query }}{{ . | first | value }}{{ end }})"
           runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#jailed-or-tombstoned
 
+      # The randomness beacon: this validator committed to a secret and didn't reveal it, so it
+      # was jailed and slashed (the secrets file, the fee payer or the node was down).
+      - alert: BlockulaBeaconRevealMissed
+        expr: blockula_beacon_own_missed == 1
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }}: this validator didn't reveal its randomness beacon secret this epoch (jailed for it)"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#jailed-or-tombstoned
+
       # NaN: no finalization certificate among the last 16 executed heights.
       - alert: BlockulaNoRecentCertificate
         expr: blockula_validators_online != blockula_validators_online

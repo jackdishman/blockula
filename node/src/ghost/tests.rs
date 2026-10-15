@@ -762,7 +762,7 @@ fn size_limits() {
     assert!(err(n.submit(&tx)).contains("ghost_max_tx_bytes"));
     assert_eq!(n.block(vec![tx.clone()]), vec![false]);
     // The block budget, with the default limits and the shield's real size.
-    let p = ChainParams { ghost_max_tx_bytes: 256 << 10, ghost_max_block_bytes: 300 << 10, ..Default::default() };
+    let p = crate::params::ChainParams { ghost_max_tx_bytes: 256 << 10, ghost_max_block_bytes: 300 << 10, ..Default::default() };
     let size = tx.to_bytes().len();
     let slot = crate::econ::FeeSlot::floor(&p);
     let mut budget = BlockBudget::new(Some(&slot));

@@ -68,6 +68,9 @@ From `node/src/api.rs` (`GET /metrics`):
 | `blockula_slashing_protection_voting` | gauge | Validators: 1 if in the current active set |
 | `blockula_slashing_protection_abstaining` | gauge | Validators: 1 while watching the network after a start, before signing |
 | `blockula_slashing_protection_refused_total` | counter | Validators: vote signatures refused (while watching, or conflicting with the record) |
+| `blockula_beacon_commitments`, `blockula_beacon_reveals_owed`, `blockula_beacon_reveals` | gauge | The randomness beacon's rounds: commitments for the epoch after next; validators owing a reveal for the next epoch, and reveals so far (`/api/beacon`) |
+| `blockula_beacon_last_reveals`, `blockula_beacon_last_missed` | gauge | Reveals in this epoch's beacon value (0: the hash chain alone), and committers that didn't reveal (jailed) |
+| `blockula_beacon_own_missed` | gauge | Validators: 1 if this validator missed its reveal for this epoch's beacon |
 
 A recording rule adds `blockula:quorum` = n − ⌊(n−1)/3⌋. Host metrics come from node_exporter; the clock alerts use its `timex` collector (`node_timex_offset_seconds`, `node_timex_sync_status`).
 
@@ -92,6 +95,7 @@ A recording rule adds `blockula:quorum` = n − ⌊(n−1)/3⌋. Host metrics co
 | `BlockulaValidatorNotSigning` | warning | In the active set, the chain advancing, and no new vote for 10 min |
 | `BlockulaWatchingAfterStart` | warning | Still watching the network after a start, 3 min on |
 | `BlockulaValidatorJailed`, `BlockulaValidatorTombstoned` | critical | This node's validator (`own="1"`) is jailed, or was tombstoned for double-signing |
+| `BlockulaBeaconRevealMissed` | warning | This node's validator committed to the randomness beacon and didn't reveal this epoch (it's jailed for it: check its beacon secrets file and fee payer) |
 | `BlockulaValidatorMissingSlots` | warning | This node's validator missed half the leader slots its downtime window allows, 2 min on |
 | `BlockulaCertificateBelowQuorum` | critical | The newest certificate has fewer signers than the active set's quorum |
 | `BlockulaNoRecentCertificate` | warning | No certificate among the last 16 heights for 5 min |

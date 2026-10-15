@@ -24,7 +24,8 @@ pub fn hash(data: &[u8]) -> [u8; 32] {
 
 /// An address is bech32m(prefix, BLAKE3(public_key)). A full 256-bit hash keeps
 /// collision resistance at ~128 bits even against quantum (BHT) attacks. This one uses `boo`
-/// (tests, CLI defaults); chain code uses [`address_with_prefix`].
+/// (tests); chain code uses [`address_with_prefix`].
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn address_from_public_key(public_key: &[u8]) -> String {
     address_with_prefix(ADDRESS_HRP, public_key)
 }
@@ -124,7 +125,8 @@ impl Keys {
         self.signing.verifying_key().encode().to_vec()
     }
 
-    /// This key's `boo1…` address (tests, CLI defaults).
+    /// This key's `boo1…` address (tests).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn address(&self) -> String {
         address_from_public_key(&self.public_key())
     }

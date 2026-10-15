@@ -74,7 +74,7 @@ Reads: `client.staking(account)`, `client.proposals()`, `client.proposal(id)`, `
 | GET | `/api/github/{handle}` | off-chain check of a GitHub link (gist owned by the handle contains the account's address) |
 | GET | `/api/contributions` | the contribution pool: balance, repos, rules, the open Séance, recent Séances |
 | GET | `/api/claims?status=&account=` | contribution claims, newest first (`pending`/`verified`/`in_seance`/`scored`/`spam`/`rejected`) |
-| GET | `/api/claim/{id}` | one claim: PR, validator attestations, score, payout |
+| GET | `/api/claim/{id}` | one claim: PR, validator attestations, score, payout, and while its revert window is open (`revert_window_until`) validators' `revert_attestations` against the set's quorum |
 | GET | `/api/seance/{id}` | one Séance: claims, jurors with their assigned pairs, commitments, reveals, results |
 | GET | `/api/souls?limit=` | Soul leaderboard |
 | GET | `/api/proposals?status=&limit=` | governance proposals, newest first (`voting`/`queued`/`rejected`/`executed`/`failed`), the rules (deposit, periods, quorum, council, spend height), treasury and community balances, `next_id` |
@@ -89,6 +89,7 @@ Reads: `client.staking(account)`, `client.proposals()`, `client.proposal(id)`, `
 | GET | `/api/ghost/address/{name\|address}` | an account's published Ghost Mode address (hex) and its fingerprint |
 | GET | `/api/health` | 200 if the head is fresh and synced, else 503 + `reason` (and `halted`: `halt_height` or `upgrade_required` when the node stopped executing on purpose) |
 | GET | `/api/upgrade` | protocol version in force, what this binary supports, the upgrade schedule and next activation, halt status, and readiness (each active validator's newest `signal`) |
+| GET | `/api/beacon` | the randomness beacon: this epoch's value (`reveals`, `missed`) and the next one's once derived, the commit round (for the epoch after next) and reveal round (for the next) with each active validator's part, recent misses |
 | GET | `/metrics` | Prometheus: height, finalized lag, mempool, epoch, validators, faucet, tx counters, peers, protocol version and upgrade schedule, halts and slashing protection, and staking liveness (`blockula_missed_leader_slots_total`, `blockula_downtime_max_missed`, per-validator `blockula_validator_missed_slots`, `blockula_validator_jailed`, `blockula_validator_tombstoned` labelled `validator` and `own`) |
 
 **Pruning.** Validators keep about two days of blocks by default (`--prune-blocks N` sets the window, `--archive` keeps everything); full nodes keep everything. A fast-synced node holds history from its snapshot on. Blocks, txs and account history below `history_from` are gone from that node: `/api/block` and `/api/sync` answer `410` with `{"error": …, "pruned": true}` (ask an archive node), and `/api/tx` answers `404` for a pruned tx. Reads are rate-limited per client IP (`429` with `Retry-After`; loopback is exempt).
