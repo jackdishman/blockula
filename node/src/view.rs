@@ -370,8 +370,19 @@ impl ReadView {
     }
 
     /// A finalized tx and its failure reason, if any.
+    /// Reads just that tx from the log (its span is indexed) unless the block is in memory.
     pub fn finalized_tx(&self, height: u64, idx: usize) -> Option<(Tx, Option<String>)> {
-        let b = self.block(height)?;
+        let in_memory = self.head.as_ref().filter(|b| b.height == height).cloned().or_else(|| self.disk.cached_block(height));
+        if let Some(b) = in_memory {
+            return Some((b.txs.get(idx)?.clone(), b.failed.get(&idx).cloned()));
+        }
+        let m = self.block_meta(height)?;
+        if let Some(&(off, len)) = m.tx_spans.get(idx) {
+            let bytes = self.disk.blocks.read_within(m.block, off, len).ok()?;
+            let tx: Tx = serde_json::from_slice(&bytes).ok()?;
+            return Some((tx, m.failed.iter().find(|(i, _)| *i as usize == idx).map(|(_, r)| r.clone())));
+        }
+        let b = self.disk.load_block(height, &m)?;
         Some((b.txs.get(idx)?.clone(), b.failed.get(&idx).cloned()))
     }
 

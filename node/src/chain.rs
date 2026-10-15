@@ -1315,7 +1315,9 @@ impl Writer {
             bail!("injected crash after the consensus block append");
         }
         self.cblocks.sync()?;
-        let bpos = self.blocks.append(e.block.height, &serde_json::to_vec(&*e.block)?)?;
+        let line = serde_json::to_vec(&*e.block)?;
+        e.meta.tx_spans = store::tx_spans(&line, &e.block.txs);
+        let bpos = self.blocks.append(e.block.height, &line)?;
         #[cfg(test)]
         if self.fail_at == Some(WritePoint::AfterBlockLine) {
             bail!("injected crash after the block append");
@@ -1673,7 +1675,8 @@ impl Chain {
             };
             let height = block.height;
             let durable = height.is_multiple_of(REPLAY_SYNC_EVERY);
-            self.replay(block, e.pos, cpos, durable).with_context(|| format!("replaying block {height} from {}", self.home.join("blocks").display()))?;
+            let spans = store::tx_spans(&e.payload, &block.txs);
+            self.replay(block, e.pos, cpos, spans, durable).with_context(|| format!("replaying block {height} from {}", self.home.join("blocks").display()))?;
             last_durable = durable;
             bend = e.pos.end();
             self.replayed += 1;
@@ -1874,6 +1877,8 @@ impl Chain {
             block: at,
             cblock,
             txs,
+            tx_spans: vec![],
+            failed: block.failed.iter().map(|(i, r)| (*i as u32, r.clone())).collect(),
             history,
         })
     }
@@ -1903,7 +1908,7 @@ impl Chain {
         self.point = point;
     }
 
-    fn replay(&mut self, block: Block, at: Pos, cblock: Option<Pos>, durable: bool) -> Result<()> {
+    fn replay(&mut self, block: Block, at: Pos, cblock: Option<Pos>, tx_spans: Vec<(u32, u32)>, durable: bool) -> Result<()> {
         if block.height != self.height() + 1 || block.prev_hash != self.last_hash() {
             bail!("the block log is not contiguous at height {}", block.height);
         }
@@ -1930,7 +1935,7 @@ impl Chain {
             bail!("state root mismatch at height {}", block.height);
         }
         let mut e = self.prepare_commit(Arc::new(block), None, commit.records, None)?;
-        (e.meta.block, e.meta.cblock) = (at, cblock);
+        (e.meta.block, e.meta.cblock, e.meta.tx_spans) = (at, cblock, tx_spans);
         let (snap, point) = self.writer.lock().commit(&e, durable)?;
         self.advance(&e.block);
         self.adopt(snap, point);
@@ -3391,6 +3396,12 @@ mod persistence {
         // The indexes and history came back from the database, not from a replay.
         assert_eq!(c.tx_location(&ids[0]), Some((height, 0)));
         let v = c.view();
+        // A tx is read alone from its span in the block's line (nothing is cached yet).
+        let m = v.block_meta(10).unwrap();
+        assert_eq!((m.tx_spans.len(), m.tx_count), (1, 1));
+        let (t, failed) = v.finalized_tx(10, 0).unwrap();
+        assert!(v.disk.cached_block(10).is_none(), "the block wasn't parsed");
+        assert_eq!((t, failed), (v.block(10).unwrap().txs[0].clone(), None));
         assert_eq!(v.history(&alice.address(), 100).len(), 40);
         assert_eq!(v.primary_name(&alice.address()).as_deref(), Some("alice.boo"));
         assert_eq!(v.block(1).unwrap().height, 1);
@@ -3482,6 +3493,7 @@ mod persistence {
         let c = Chain::open(&h).unwrap();
         assert_eq!((c.state.root(), c.height(), c.replayed), (root.clone(), height, height));
         assert_eq!(c.tx_location(&id), Some((10, 0)));
+        assert_eq!(c.view().block_meta(10).unwrap().tx_spans.len(), 1, "replayed blocks get spans too");
         assert_eq!(c.view().history(&alice.address(), 100).len() as u64, height);
         drop(c);
         // Garbage instead of a database: moved aside and rebuilt the same way.

@@ -42,7 +42,7 @@
 //! | `records` | namespace ‖ key | canonical record bytes |
 //! | `nodes` | `NodeKey::to_bytes` | `Node::encode` |
 //! | `meta` | `"commit"` | [`CommitPoint`] |
-//! | `blocks` | height | [`BlockMeta`] (header, log positions, tx ids, history rows) |
+//! | `blocks` | height | [`BlockMeta`] (header, log positions, tx ids and spans, failures, history rows) |
 //! | `block_hashes` | block hash | height |
 //! | `txs` | tx id | height ‖ index in the block (big-endian u64, u32) |
 //! | `history` | account ‖ 0 ‖ height ‖ index | () |
@@ -165,8 +165,42 @@ pub struct BlockMeta {
     pub cblock: Option<Pos>,
     /// Tx ids, in block order.
     pub txs: Vec<Hash>,
+    /// Where each tx's JSON sits in the block's line (offset, length), so a lookup reads one tx
+    /// instead of parsing the block. Empty if they couldn't be located.
+    pub tx_spans: Vec<(u32, u32)>,
+    /// Failure reasons by tx index (txs that paid their fee but whose action failed).
+    pub failed: Vec<(u32, String)>,
     /// The history rows written for this block: (tx index, account).
     pub history: Vec<(u32, String)>,
+}
+
+/// Where each tx's JSON sits in a block's JSON line: the compact serializer writes a nested
+/// value exactly as it writes it alone, so each tx's own encoding appears in order inside
+/// `"txs":[…]`. Every span is checked; if anything doesn't match, there are none (readers then
+/// parse the whole block).
+pub fn tx_spans(line: &[u8], txs: &[crate::types::Tx]) -> Vec<(u32, u32)> {
+    const MARKER: &[u8] = b"\"txs\":[";
+    let Some(start) = line.windows(MARKER.len()).position(|w| w == MARKER) else { return vec![] };
+    let mut at = start + MARKER.len();
+    let mut spans = Vec::with_capacity(txs.len());
+    for (i, tx) in txs.iter().enumerate() {
+        if i > 0 {
+            if line.get(at) != Some(&b',') {
+                return vec![];
+            }
+            at += 1;
+        }
+        let Ok(json) = serde_json::to_vec(tx) else { return vec![] };
+        if line.get(at..at + json.len()) != Some(&json[..]) {
+            return vec![];
+        }
+        spans.push((at as u32, json.len() as u32));
+        at += json.len();
+    }
+    if line.get(at) != Some(&b']') {
+        return vec![];
+    }
+    spans
 }
 
 /// Everything one block writes, in one transaction.
@@ -717,6 +751,17 @@ impl SegReader {
         self.files.lock().retain(|(s, _)| *s != seg);
     }
 
+    /// `len` bytes at `off` within the entry at `pos` (its payload: past the framing).
+    pub fn read_within(&self, pos: Pos, off: u32, len: u32) -> Result<Vec<u8>> {
+        let header = if self.framing == Framing::Records { RECORD_HEADER as u32 } else { 0 };
+        if off as u64 + len as u64 + header as u64 > pos.len as u64 {
+            bail!("span past the end of the log entry at {pos:?}");
+        }
+        let mut buf = vec![0u8; len as usize];
+        self.file(pos.seg)?.read_exact_at(&mut buf, pos.off + header as u64 + off as u64)?;
+        Ok(buf)
+    }
+
     /// The payload at `pos` (without its framing).
     pub fn read(&self, pos: Pos) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; pos.len as usize];
@@ -1027,6 +1072,24 @@ mod tests {
             assert_eq!(r.segments(), vec![7]);
         }
         fs::remove_dir_all(d).ok();
+    }
+
+    /// Tx spans point at each tx's own JSON inside the block's line, including txs whose memo
+    /// looks like the marker; a line laid out otherwise gets none.
+    #[test]
+    fn tx_spans_locate_each_tx_in_its_block_line() {
+        use crate::types::{Action, Block, Tx};
+        let tx = |memo: &str, nonce: u64| Tx { chain_id: "c".into(), from: "boo1x".into(), nonce, fee: 1, tip: 0, valid_until: 9, action: Action::Transfer { to: "a.boo".into(), amount: 2 }, memo: memo.into(), public_key: "ab".into(), signature: "cd".into() };
+        let txs = vec![tx("\"txs\":[", 0), tx("", 1), tx("]", 2)];
+        let block = Block { height: 3, prev_hash: "p".into(), timestamp_ms: 1, view: 3, parent_view: 2, version: 1, proposer: "boo1p".into(), state_root: "r".into(), txs: txs.clone(), hash: "h".into(), signature: String::new(), failed: [(1, "no".to_string())].into() };
+        let line = serde_json::to_vec(&block).unwrap();
+        let spans = tx_spans(&line, &block.txs);
+        assert_eq!(spans.len(), 3);
+        for (t, (off, len)) in txs.iter().zip(&spans) {
+            assert_eq!(&serde_json::from_slice::<Tx>(&line[*off as usize..(*off + *len) as usize]).unwrap(), t);
+        }
+        assert!(tx_spans(&line, &txs[..2]).is_empty(), "the wrong tx list");
+        assert!(tx_spans(b"{\"height\":1}", &txs).is_empty());
     }
 
     #[test]
