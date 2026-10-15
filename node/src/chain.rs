@@ -1630,7 +1630,7 @@ impl Chain {
             chain.save_epochs();
         }
         chain.reconcile_epochs()?;
-        chain.finalized_tip = chain.height();
+        chain.set_finalized_tip(chain.height());
         chain.publish();
         chain.live.publish_epochs(chain.epochs.clone());
         Ok(chain)

@@ -62,7 +62,8 @@ struct Net {
     /// Keep every block (an archive node), also on a validator
     #[arg(long)]
     archive: bool,
-    /// HTTP reads allowed per client IP per second (0: unlimited); loopback isn't limited
+    /// HTTP reads allowed per client IP per second (0: unlimited); loopback isn't limited.
+    /// Behind a reverse proxy, set --client-ip-header too, or every client shares the proxy's budget
     #[arg(long, default_value_t = api::READ_RPS)]
     read_rps: u32,
     /// Burst of HTTP reads a client IP may make at once

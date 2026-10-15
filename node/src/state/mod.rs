@@ -14,8 +14,8 @@
 //! Mainnet is a new chain: there are no compatibility roots for v0.4 testnet chains, whose
 //! `blocks.jsonl` won't replay under this binary.
 
-// Proofs, record lookups and the persistence hooks are exercised by tests now; `/api/proof` and
-// the redb store (P-STATE-B) are their callers in the node.
+// `tree::verify` (what light clients run), `full_root` and `check_invariants` are exercised by
+// tests and the fuzz harness rather than by the node itself.
 #![cfg_attr(not(test), allow(dead_code))]
 
 pub mod codec;
