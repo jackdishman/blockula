@@ -48,6 +48,7 @@ wallet.validForBlocks = 600;
 - A transaction is charged `minFee(tx)` (priced per byte, burned) plus its `tip` (paid to the block's proposer; blocks take the highest tip per byte first). The wallet sets `fee` to exactly that. `txCharge(tx)` computes it.
 - Every transaction carries `valid_until`, the last block it may execute in. The wallet sets it to the current height plus `validForBlocks` (default 600 blocks, at most the chain's `max_tx_validity_blocks`, an hour of blocks). A transaction past `valid_until` can never execute, so it's safe to report it as expired.
 - `txBytes(tx)` is the binary wire form nodes gossip and put in blocks, and `txId(tx)` its id, known before you submit.
+- Every transaction names the chain it's for by `chain_id` and `genesis_hash` (the chain instance, from `/api/status`), so it can't replay on a relaunched chain that reuses the id. `wallet.build` fills both in; to sign offline, put the chain's `genesis_hash` in the `UnsignedTx` you pass to `wallet.sign`.
 
 Addresses are bech32m with the chain's prefix: `boo1…` on mainnet, `tboo1…` on public testnets. `isAddress(s)` accepts any known prefix and `isAddress(s, "tboo")` exactly one; `addressFromPublicKey(pk, prefix)` renders one. A `Client` learns its chain's prefix from `/api/status` (`await client.addressPrefix()`), and wallets using that client sign with it (`wallet.address`, `wallet.account`). Pin it with `new Client(rpc, { prefix: "boo" })` to refuse a node on another network. Nodes reject addresses of another network's prefix.
 

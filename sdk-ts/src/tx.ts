@@ -114,6 +114,12 @@ export type ProposalKind =
 
 export interface UnsignedTx {
   chain_id: string;
+  /**
+   * The chain instance the tx is for: hex BLAKE3 digest of its genesis block (`genesis_hash` in
+   * `/api/status`). Signed right after `chain_id`, so the tx can't replay on another chain that
+   * reuses the id (e.g. a relaunched testnet). `Wallet.build` fills it in; offline signers pass it.
+   */
+  genesis_hash: string;
   /** The account acting; the signing key must be authorized on it. */
   from: string;
   nonce: number;
@@ -156,10 +162,19 @@ class Writer {
   done() { return Uint8Array.from(this.parts); }
 }
 
+/** A chain's genesis hash as its 32 bytes (`/api/status` `genesis_hash`, lowercase hex). */
+export function genesisHashBytes(genesisHash: string): Uint8Array {
+  if (typeof genesisHash !== "string" || !/^[0-9a-f]{64}$/.test(genesisHash)) {
+    throw new Error("genesis_hash must be the chain's genesis hash: 32 bytes of lowercase hex (genesis_hash in /api/status)");
+  }
+  return hexToBytes(genesisHash);
+}
+
 export function signingBytes(tx: UnsignedTx): Uint8Array {
   const w = new Writer();
   w.bytes(utf8.encode("BLOCKULA_TX_V3"));
   w.str(tx.chain_id);
+  w.bytes(genesisHashBytes(tx.genesis_hash));
   w.str(tx.from);
   w.u64(BigInt(tx.nonce));
   w.u64(BigInt(tx.fee));

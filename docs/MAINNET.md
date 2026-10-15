@@ -47,7 +47,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
 | Public testnet | Runs v0.4.0 (`b1f9614`), with the contribution pool active (one repo, 10,001 FANG). Its genesis was created 2026-10-14 12:19 UTC, so the longest continuous run on the current chain is a few hours (height ~11.3k when checked). |
 | Operators | 4 validators in one Fly.io org, in 4 regions. Every validator key and the one admin key were generated on one laptop (`deploy/launch.sh:44,71`). Nakamoto coefficient: 1. |
 | Supply | 1.1B FANG: 250M on each validator's hot consensus key, 100M on the keyless treasury (live `/api/genesis`; `chain.rs:1370-1372`). |
-| Tests | Unit tests, 3 deterministic simulator scenarios (`sim.rs`: crash and recover, onboarding, fast sync) and a 4-validator smoke test (`scripts/local-testnet.sh`). No fuzzing, property tests or Byzantine scenarios. ✅ Since: fuzzing, property tests and invariant checks after every test block (SEC-3); still no Byzantine scenarios. |
+| Tests | Unit tests, 3 deterministic simulator scenarios (`sim.rs`: crash and recover, onboarding, fast sync) and a 4-validator smoke test (`scripts/local-testnet.sh`). No fuzzing, property tests or Byzantine scenarios. ✅ Since: fuzzing (the state machine too), property tests, invariant checks after every test block, and Byzantine scenarios: partitions, clock skew, withheld votes (SEC-3). |
 | Review | Internal four-track review only (README.md "Status", docs/ONE_PAGER.md:32). |
 
 ## 2. Launch blockers
@@ -98,6 +98,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
 - **Why it blocks:** one consensus or accounting bug loses funds or splits the chain, and nobody outside the team has looked.
 - **Done when:** a firm with BFT and Rust experience has audited the frozen genesis commit (node, consensus integration, state machine, sync, crypto use). A separate review covers the wallet, SDK and MCP (WAL-3). All critical and high findings are fixed and re-verified, and the reports are published.
 - **Effort:** L. It takes 6–10 weeks of calendar time including fixes, and firms book 1–3 months ahead, so reserve a slot now. **Who:** Auditor.
+- ✅ **Early independent findings (wave 3):** of the 12, the Ghost Mode ones (#5, #6, #8, #9) are fixed in `node/ghost`. P-HARDEN fixed #10 (HIGH: txs that could never execute held mempool slots for free, see TOK-2), #11 (MEDIUM: an unbounded hunt record made every later snapshot unreadable; every nested collection is now capped and every record checked against the snapshot limit), #1/#3 (MEDIUM: nothing bound the node to the hybrid p2p transport, see CRY-1) and #7 (LOW: txs replayed on a relaunch that kept the chain id, see WAL-5), each with a regression test reproducing its PoC. #12 (INFO: fast sync rebuilds a peer-chosen state before the root check) is documented in PLAN.md "Known limits" until CRY-2 certifies the manifest. #2 (INFO: the p2p handshake and txs both sign with an empty ML-DSA context) and #4 (INFO: ml-kem leaves stack copies of KEM secrets) are accepted as notes for SEC-1's scope.
 
 **SEC-2. The PQ crypto libraries are unaudited.**
 - **Missing:**
@@ -125,6 +126,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
   - Simulator scenarios use Commonware's deterministic runtime and simulated network to cover an equivocating leader, a wrong `exec_root`, junk-tx blocks (CV-5), withheld votes, partitions and clock skew.
 - **Effort:** L. **Who:** Team.
 - ✅ **Wave 1:** `node/fuzz` (8 targets: blocks, tx JSON and wire form, manifests, state records, sync batches, epoch registries, certificates; nightly in CI). Its two findings, FUZZ-1 and FUZZ-2 (epoch-0 panics in fast sync and in the epoch exchange), are fixed with regression tests. `State::check_invariants` runs after every block in tests and the simulator, plus property tests over random tx sequences. Pending: the 2-week soak, a state-machine fuzz target, the Byzantine scenarios.
+- ✅ **Wave 3 (P-HARDEN):** a 9th target, `state_machine` (nightly in CI too): fuzzer-chosen sequences of txs of every tag (any wire-encodable action included) from users, agent session keys and the admin validator, in blocks across epoch ends and Séances. After every block the incremental root equals a full rebuild, a rolled-back dry run leaves no trace, and `check_invariants` holds (conservation, escrows, cross-references, and now every nested collection's cap and every record's size); the final state survives the snapshot encoding and replays to the same roots. About 120,000 executions in 27 minutes found nothing (node/fuzz/README.md). Simulator scenarios (`sim/byzantine.rs`): a 2–2 partition (no quorum: nothing finalizes for 30 s, then the chain resumes), a 1–3 partition (the majority goes on, the isolated validator catches up), clock skew within and beyond `MAX_CLOCK_DRIFT_MS` (SF-2), and one, then two validators withholding their votes and certificates (live without one; stalled until one returns with two). Every phase asserts identical blocks and state roots at every height. Pending: the 2-week soak, and the equivocating-leader, wrong-`exec_root` and junk-tx scenarios, which come with P-STAKE's evidence and junk-charge paths.
 
 **SEC-4. Public HTTP reads can stall consensus.**
 - **Missing:**
@@ -160,6 +162,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
   - Downgrade and interop tests pass, and the change is in SEC-1's scope.
   - Alternatively, a recorded decision (DEC-9) to launch without it, with README and ONE_PAGER corrected.
 - **Effort:** L. **Who:** Team, Upstream, Auditor.
+- ✅ **Bound to the build (audit #1/#3):** the node depends on the vendored `commonware-stream` directly and builds `/api/status`'s `crypto.p2p_transport` from constants only the hybrid module exports, so a build where the `[patch.crates-io]` stops applying fails to compile instead of linking the classical handshake; a test fails if the lockfile holds a second, registry copy.
 
 **CRY-2. Fast sync is weakly subjective, and the genesis keys sit on one laptop.** (known, plus the key detail)
 - **Missing:**
@@ -277,6 +280,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
   - The fee can only change by hard fork.
 - **Done when:** a per-byte base fee adjusts with block fullness (and is burned), and the tip buys priority. A spam load test shows honest txs confirm within a bounded number of blocks at a bounded cost. Fee parameters are either changeable by governance (GOV-1) or fixed by decision.
 - **Effort:** M. **Who:** Team.
+- ✅ **Admission (audit #10, wave 3):** the mempool dry-runs every tx after its sender's queued txs, as a block would, so txs that can never execute (behind a `RemoveKey`, past a session limit) no longer hold slots for free; each sender's simulation is cached, so admission stays one dry run per tx with a full mempool. Pending: the fee market itself (P-ECON).
 
 **TOK-3. The treasury can't spend.**
 - **Missing:** the treasury is a keyless system address (`chain.rs:14-16`). It receives name fees (`chain.rs:740`) and 100M FANG at genesis (`chain.rs:1372`). Nothing spends from it, though PLAN.md "Tokenomics" says it pays for sponsored onboarding, faucets, audits and grants.
@@ -485,6 +489,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
 - **Done when:** a `valid_until` height is in the signing bytes, byte-identical in Rust and TS (`types.rs` ⇄ `sdk-ts/src/tx.ts`), and enforced at admission and execution. Wallets say "expired" only when the tx can no longer execute.
 - **Effort:** S. **Who:** Team.
 - ✅ **Done (wave 1):** Tx v3 signs `valid_until` on both sides; admission and execution require `height ≤ valid_until ≤ height + an hour of blocks`, and the node reports "expired" only past `valid_until`.
+- ✅ **Chain instance (audit #7, wave 3):** txs also sign the chain's genesis hash after its id, checked at admission, gossip and block verification, so a tx signed on one instance of a chain id (a testnet re-summoned under the same id) can't replay on another.
 
 ### Legal & compliance
 
@@ -523,6 +528,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
 - **Missing:** a block more than 1 s ahead of the verifier's clock is rejected (`consensus.rs:54, 358-360`). A validator whose clock lags by over 1 s can't vote, and nothing measures skew.
 - **Done when:** operator docs require NTP, skew has a metric and an alert, and the tolerance is set using a simulator test with skewed clocks.
 - **Effort:** S.
+- ✅ **Simulator (wave 3):** `sim/byzantine.rs` runs one validator 600 ms ahead (its blocks are accepted), 3 s ahead (the others refuse its blocks) and 3 s behind (it refuses theirs, so it doesn't vote, yet keeps executing what the other three finalize); the chain stays live and agreed throughout. With 1 s blocks, a 1 s bound is about one block of tolerance.
 
 ✅ **SF-3. Binary tx and block encoding.**
 - **Missing:** txs travel and are stored as hex JSON (`consensus.rs:71-86, 312`). That's about twice the binary size fees are priced on (`types.rs:592-594`), and the JSON isn't canonical (CV-5).

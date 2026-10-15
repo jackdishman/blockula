@@ -48,11 +48,11 @@ const vectorActions: Action[] = [
   { type: "withdraw_vested" },
   { type: "clawback", account: "x.boo", reason: "r" },
 ];
-const vectorTx = (action: Action): Tx => ({ chain_id: "vec", from: "boo1from", nonce: 7, fee: "12345", tip: "3", valid_until: 99, action, memo: "m", public_key: "01".repeat(1952), signature: "02".repeat(3309) });
+const vectorTx = (action: Action): Tx => ({ chain_id: "vec", genesis_hash: "03".repeat(32), from: "boo1from", nonce: 7, fee: "12345", tip: "3", valid_until: 99, action, memo: "m", public_key: "01".repeat(1952), signature: "02".repeat(3309) });
 const all = vectorActions.map((a) => signingBytes(vectorTx(a)));
 const joined = new Uint8Array(all.reduce((n, b) => n + b.length, 0));
 all.reduce((at, b) => (joined.set(b, at), at + b.length), 0);
-assert.equal(bytesToHex(blake3(joined)), "67416fa0f99281aa382895815bea59d2a43b40f6865c500e4cb80611d8754875");
+assert.equal(bytesToHex(blake3(joined)), "3633490a583afa9a7aec72593fd29e9d5461b3a037abec251ca90c762e3b1b65");
 // Protocol v1 (tags 30–49, every proposal kind, a multisig proposal), hashed on its own: `v1_vector_actions` there.
 const propose = (kind: ProposalKind): Action => ({ type: "propose", kind, deposit: (1000n * 1_000_000_000n).toString(), title: "t" });
 const v1VectorActions: Action[] = [
@@ -96,13 +96,15 @@ const v1VectorActions: Action[] = [
 const v1 = v1VectorActions.map((a) => signingBytes(vectorTx(a)));
 const v1Joined = new Uint8Array(v1.reduce((n, b) => n + b.length, 0));
 v1.reduce((at, b) => (v1Joined.set(b, at), at + b.length), 0);
-assert.equal(bytesToHex(blake3(v1Joined)), "fecaa54305728b6a9192b18fbbdc03d74f2199c8721a670b73b72970b2d7ba6c");
+assert.equal(bytesToHex(blake3(v1Joined)), "0ffbf0b5bbb1a26f7abe720bae98d7f97581d5268bfbe75fe290605f16172398");
 assert.throws(() => signingBytes(vectorTx({ type: "multisig_propose", action: { type: "multisig_propose", action: { type: "unlock" } } })), /can't contain another/);
 const vt = vectorTx(vectorActions[0]);
-assert.equal(bytesToHex(blake3(txBytes(vt))), "f32398f98b16d95d4f68af7ee29524a274d5465476390d91b357633627712e39");
+assert.equal(bytesToHex(blake3(txBytes(vt))), "084ce40c9d406468f7373b0aced2b285ff77d353de986752050877e1953501e0");
 assert.equal(txBytes(vt).length, txSize(vt));
-assert.equal(txId(vt), "0a787dbaf66a3f5a3df1609272c68f5229397c418010ecd8453b1e7c7ff6617d");
+assert.equal(txId(vt), "250e5fc58d322d13ba15e01991885090daa4e8742cc1f68336a2ca37c8539a22");
 assert.equal(txCharge(vt), minFee(vt) + 3n);
+// The genesis hash is 32 bytes of lowercase hex, or nothing gets signed.
+for (const genesis_hash of ["", "03".repeat(31), "AB".repeat(32), "zz".repeat(32)]) assert.throws(() => signingBytes({ ...vt, genesis_hash }), /genesis_hash/);
 // Addresses: any known prefix is an address; `isAddress(s, prefix)` asks for one.
 const someKey = ml_dsa65.keygen(new Uint8Array(32).fill(4)).publicKey;
 const [mainAddr, testAddr] = [addressFromPublicKey(someKey), addressFromPublicKey(someKey, "tboo")];
@@ -133,7 +135,8 @@ assert.equal(viaName.account.address, alice.address);
 
 const bobTx = await bob.send(`${name}.boo`, "2");
 assert.equal(await bob.balance(), formatFang(parseFang("10.5") - BigInt(bobTx.fee)));
-assert.equal(BigInt(bobTx.fee), minFee({ chain_id: (await client.status()).chain_id, from: bob.address, nonce: 0, fee: "0", valid_until: bobTx.valid_until, action: bobTx.action, memo: "" }));
+const { chain_id, genesis_hash } = await client.status();
+assert.equal(BigInt(bobTx.fee), minFee({ chain_id, genesis_hash, from: bob.address, nonce: 0, fee: "0", valid_until: bobTx.valid_until, action: bobTx.action, memo: "" }));
 assert.equal(await client.addressPrefix(), "boo");
 console.log("✓", bobTx.summary);
 
@@ -149,11 +152,14 @@ const height = (await client.status()).height;
 await assert.rejects(client.submit(alice.sign({ ...unsigned, valid_until: height })), /expired at block/);
 await assert.rejects(client.submit(alice.sign({ ...unsigned, valid_until: height + 100_000 })), /too far ahead/);
 await assert.rejects(alice.send(bob.address, "1", { validForBlocks: 100_000 }), /at most/);
+// Signed for another instance of this chain id (a relaunch): refused, so old txs can't replay.
+assert.equal(unsigned.genesis_hash, genesis_hash);
+await assert.rejects(client.submit(alice.sign({ ...unsigned, genesis_hash: "00".repeat(32) })), /another instance/);
 // The node checks address prefixes, and JSON with unknown fields is refused.
 await assert.rejects(alice.send(testAddr, "1"), /tboo \(testnet\) address/);
 const extra = { ...(await alice.build({ type: "transfer", to: bob.address, amount: "1" })), padding: "x".repeat(100) };
 await assert.rejects(client.submit(extra as Tx), (e: unknown) => e instanceof ApiError && e.status === 422);
-console.log("✓ validity windows, prefixes and strict JSON enforced");
+console.log("✓ validity windows, the chain instance, prefixes and strict JSON enforced");
 
 // Account abstraction: alice lets an agent key spend up to 5 FANG per 100 blocks from her account.
 const agent = Wallet.generate(client);

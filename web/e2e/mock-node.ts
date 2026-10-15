@@ -168,6 +168,7 @@ export class MockNode {
 
   private submit(tx: Tx) {
     if (tx.chain_id !== this.chainId) throw new HttpError(400, `wrong chain id ${tx.chain_id}`);
+    if (tx.genesis_hash !== this.genesisHash) throw new HttpError(400, `signed for another instance of ${this.chainId}`);
     const pk = hexToBytes(tx.public_key);
     if (!ml_dsa65.verify(hexToBytes(tx.signature), signingBytes(tx), pk)) throw new HttpError(400, "bad signature");
     const signer = keyIdOf(pk);

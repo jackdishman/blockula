@@ -267,11 +267,29 @@ pub struct App {
     pub address_prefix: String,
 }
 
-/// Stateless checks every tx must pass: in a proposed block, over HTTP and from gossip.
-pub fn check_tx_stateless(tx: &Tx, chain_id: &str, prefix: &str) -> anyhow::Result<()> {
-    if tx.chain_id != chain_id {
-        anyhow::bail!("wrong chain id");
+/// Clock skew per validator for the simulator (test builds only): `(chain, ms)`, keyed by the
+/// address of the validator's `Shared` chain. `App::now_ms` shifts what that validator reads as
+/// now, as a skewed system clock would (sim.rs clock-skew scenarios).
+#[cfg(test)]
+pub(crate) static CLOCK_SKEW_MS: parking_lot::Mutex<Vec<(usize, i64)>> = parking_lot::Mutex::new(Vec::new());
+
+impl App {
+    /// The wall clock this validator reads (ms since the Unix epoch): the runtime's, skewed in
+    /// simulations.
+    fn now_ms(&self, ctx: &impl Clock) -> u64 {
+        let now = ms(ctx.current());
+        #[cfg(test)]
+        if let Some((_, skew)) = CLOCK_SKEW_MS.lock().iter().find(|(k, _)| *k == Arc::as_ptr(&self.chain) as usize) {
+            return now.saturating_add_signed(*skew);
+        }
+        now
     }
+}
+
+/// Stateless checks every tx must pass: in a proposed block, over HTTP and from gossip. The chain
+/// is named by its id and its genesis hash (the instance, audit #7).
+pub fn check_tx_stateless(tx: &Tx, chain_id: &str, genesis_hash: &str, prefix: &str) -> anyhow::Result<()> {
+    tx.check_chain(chain_id, genesis_hash)?;
     tx.check_format()?;
     tx.check_prefix(prefix)?;
     crate::chain::check_fee(tx)?;
@@ -290,11 +308,11 @@ where
     async fn propose(&mut self, (ctx, cctx): (E, Self::Context), mut ancestry: impl Ancestry<CBlock>, _: ()) -> Option<CBlock> {
         let parent = ancestry.next().await?;
         let target = parent.timestamp_ms + self.block_time_ms;
-        let now = ms(ctx.current());
+        let now = self.now_ms(&ctx);
         if target > now {
             ctx.sleep(Duration::from_millis(target - now)).await;
         }
-        let timestamp_ms = ms(ctx.current()).max(target);
+        let timestamp_ms = self.now_ms(&ctx).max(target);
         let height = parent.height + 1;
         let (view, parent_view) = (cctx.round.view().get(), cctx.parent.0.get());
         let proposer = cctx.leader.address(&self.address_prefix);
@@ -405,7 +423,7 @@ where
         if block.timestamp_ms < parent.timestamp_ms + self.block_time_ms {
             return reject("block too early");
         }
-        if block.timestamp_ms > ms(ctx.current()) + MAX_CLOCK_DRIFT_MS {
+        if block.timestamp_ms > self.now_ms(&ctx) + MAX_CLOCK_DRIFT_MS {
             return reject("timestamp too far in the future");
         }
         if block.proposer != cctx.leader.address(&self.address_prefix) {
@@ -419,13 +437,13 @@ where
         if checkpoint.is_some_and(|cp| block.exec_height != cp) {
             return reject("checkpoint-certifying block must carry the checkpoint's exec_height");
         }
-        let (chain_id, max_validity) = {
+        let (chain_id, genesis_hash, max_validity) = {
             let c = self.chain.lock();
             // Our executed height only grows, so this stays true once it is.
             if block.exec_height + MAX_EXEC_LAG < c.height().min(parent.height) {
                 return reject("exec_height too far behind");
             }
-            (c.genesis.chain_id.clone(), c.state.chain_params.max_tx_validity_blocks)
+            (c.genesis.chain_id.clone(), c.genesis_hash.clone(), c.state.chain_params.max_tx_validity_blocks)
         };
         // Tx checks (signatures included) run without holding the chain lock.
         let mut seen = std::collections::HashSet::new();
@@ -436,7 +454,7 @@ where
             if !seen.insert(id.clone()) {
                 return reject("duplicate tx");
             }
-            if let Err(e) = check_tx_stateless(&tx, &chain_id, &self.address_prefix).and_then(|_| crate::chain::check_validity(&tx, block.height, max_validity)) {
+            if let Err(e) = check_tx_stateless(&tx, &chain_id, &genesis_hash, &self.address_prefix).and_then(|_| crate::chain::check_validity(&tx, block.height, max_validity)) {
                 warn!(error = %e, "bad tx in block");
                 return reject("invalid tx");
             }
@@ -771,11 +789,11 @@ where
                     continue;
                 };
                 // Verify format + ML-DSA signature before taking the chain lock.
-                let (chain_id, prefix) = {
+                let (chain_id, genesis_hash, prefix) = {
                     let c = gossip_chain.lock();
-                    (c.genesis.chain_id.clone(), c.genesis.address_prefix.clone())
+                    (c.genesis.chain_id.clone(), c.genesis_hash.clone(), c.genesis.address_prefix.clone())
                 };
-                if let Err(e) = check_tx_stateless(&tx, &chain_id, &prefix) {
+                if let Err(e) = check_tx_stateless(&tx, &chain_id, &genesis_hash, &prefix) {
                     debug!(?from, error = %e, "dropping invalid gossiped tx");
                     continue;
                 }
@@ -1055,6 +1073,7 @@ mod tests {
         let (root100, root101) = (hex_32(&a.root_at(100).unwrap()), hex_32(&a.root_at(101).unwrap()));
         drop(a);
         let seed: [u8; 32] = hex::decode(std::fs::read_to_string(ahead.join("validator.key")).unwrap().trim()).unwrap().try_into().unwrap();
+        let genesis_hash = b.genesis_hash.clone();
         let chain: Shared = Arc::new(Mutex::new(b));
         deterministic::Runner::timed(Duration::from_secs(120)).start(|context| async move {
             let leader = PrivateKey::from_seed_bytes(seed).public_key();
@@ -1074,7 +1093,7 @@ mod tests {
             assert!(!verify(child(&p103, 7, 100, root100, vec![b"junk".to_vec()]), &p103).await, "junk tx bytes");
             let user = crate::crypto::Keys::from_seed([5; 32]);
             let tx = |valid_until: u64| {
-                let mut t = Tx { chain_id: "lag".into(), from: user.address(), nonce: 0, fee: 0, tip: 0, valid_until, action: crate::types::Action::Transfer { to: "xyz.boo".into(), amount: 1 }, memo: String::new(), public_key: hex::encode(user.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+                let mut t = Tx { chain_id: "lag".into(), genesis_hash: genesis_hash.clone(), from: user.address(), nonce: 0, fee: 0, tip: 0, valid_until, action: crate::types::Action::Transfer { to: "xyz.boo".into(), amount: 1 }, memo: String::new(), public_key: hex::encode(user.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
                 t.fee = t.charge().unwrap();
                 t.sign(&user)
             };

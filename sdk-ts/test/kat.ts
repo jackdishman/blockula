@@ -143,6 +143,7 @@ expectCases("wycheproof/mldsa_65_sign_seed_test.json", 105, () => {
 
 const rust = load("cross/rust-signed.json");
 const CHAIN: string = rust.chain_id;
+const GENESIS: string = rust.genesis_hash;
 const WRITE = process.argv.includes("--write");
 
 /** A client pinned to the testnet prefix (never contacted: `Wallet.address` reads its prefix). */
@@ -174,7 +175,7 @@ function tsSigned(): Json {
     ["tx/register_name", w, { type: "register_name", name: "vampire" }],
     ["tx/transfer-tboo", wt, { type: "transfer", to: Wallet.fromSeed("ff".repeat(32), testnet).address, amount: "7" }],
   ] as const) {
-    const tx = signer.sign({ chain_id: CHAIN, from: signer.address, nonce: 3, fee: "200000", tip: "1000", valid_until: 777, action, memo: "from the SDK" });
+    const tx = signer.sign({ chain_id: CHAIN, genesis_hash: GENESIS, from: signer.address, nonce: 3, fee: "200000", tip: "1000", valid_until: 777, action, memo: "from the SDK" });
     const msg = signingBytes(tx);
     push(label, owner, new Uint8Array(), msg, hx(tx.signature), { sig_det: det(owner, new Uint8Array(), msg), tx, wire: bytesToHex(txBytes(tx)) });
   }
@@ -198,6 +199,7 @@ function tsSigned(): Json {
   return {
     generator: "sdk-ts/test/kat.ts --write (@noble/post-quantum 0.7.1); see README.md",
     chain_id: CHAIN,
+    genesis_hash: GENESIS,
     keys: rust.keys.map((k: Json) => keyJson(k.seed)),
     cases: out,
   };

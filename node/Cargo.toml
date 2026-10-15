@@ -28,6 +28,10 @@ commonware-p2p = "=2026.9.0"
 commonware-parallel = "=2026.9.0"
 commonware-runtime = "=2026.9.0"
 commonware-storage = "=2026.9.0"
+# The p2p transport: the vendored hybrid copy ([patch.crates-io] below). A direct dependency so
+# the node can reference what only that copy exports (api.rs `p2p_transport`): an unapplied patch
+# then fails to compile instead of silently linking the classical handshake.
+commonware-stream = "=2026.9.0"
 commonware-utils = "=2026.9.0"
 bytes = "1"
 futures = "0.3"

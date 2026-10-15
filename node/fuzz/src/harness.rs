@@ -5,7 +5,7 @@
 //! from a stale one.
 
 use crate::{
-    chain::{Chain, Genesis, State},
+    chain::{BlockInfo, Chain, Genesis, Outcome, State},
     consensus::{self, CBlock, Shared},
     crypto::Keys,
     epochs::{self, EpochRegistry},
@@ -13,7 +13,7 @@ use crate::{
     pq::{self, MlDsaScheme, PrivateKey},
     snapshot,
     state::tree,
-    types::{self, Tx},
+    types::{self, Action, KeyRole, ProposalKind, Tx},
 };
 use commonware_codec::{Decode as _, DecodeExt as _, Encode as _};
 use commonware_consensus::{
@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 use std::sync::{Arc, OnceLock};
 
 /// The fuzz targets, by name (`fuzz_targets/<name>.rs`, `seeds/<name>/`).
-pub const TARGETS: [&str; 8] = ["cblock", "tx_json", "tx_wire", "snapshot_manifest", "state_snapshot", "sync_batch", "epochs_registry", "certificate"];
+pub const TARGETS: [&str; 9] = ["cblock", "tx_json", "tx_wire", "snapshot_manifest", "state_snapshot", "sync_batch", "epochs_registry", "certificate", "state_machine"];
 
 /// Runs target `name` on `data`.
 pub fn run(name: &str, data: &[u8]) -> bool {
@@ -41,6 +41,7 @@ pub fn run(name: &str, data: &[u8]) -> bool {
         "sync_batch" => sync_batch(data),
         "epochs_registry" => epochs_registry(data),
         "certificate" => certificate(data),
+        "state_machine" => state_machine(data),
         _ => panic!("unknown fuzz target {name}"),
     }
 }
@@ -77,6 +78,12 @@ fn open_chain(tag: &str) -> Shared {
     Arc::new(Mutex::new(Chain::open(&home).expect("open the fixture chain")))
 }
 
+/// The fixture chain's genesis hash (its instance, which every tx signs after the chain id).
+pub fn genesis_hash() -> &'static str {
+    static H: OnceLock<String> = OnceLock::new();
+    H.get_or_init(|| hex::encode(consensus::genesis_block(genesis()).digest_bytes()))
+}
+
 /// The fixture chain's address prefix (`boo`, the genesis default).
 fn prefix() -> &'static str {
     &genesis().address_prefix
@@ -107,7 +114,7 @@ pub fn cblock(data: &[u8]) -> bool {
     assert_eq!(block.encode().as_ref(), data, "CBlock decoding accepted a non-canonical encoding");
     let mut ok = true;
     for tx in block.parse_txs() {
-        ok &= tx.is_some_and(|tx| consensus::check_tx_stateless(&tx, CHAIN_ID, prefix()).is_ok());
+        ok &= tx.is_some_and(|tx| consensus::check_tx_stateless(&tx, CHAIN_ID, genesis_hash(), prefix()).is_ok());
     }
     ok
 }
@@ -119,7 +126,7 @@ pub fn cblock(data: &[u8]) -> bool {
 pub fn tx_json(data: &[u8]) -> bool {
     let Ok(tx) = serde_json::from_slice::<Tx>(data) else { return false };
     let _ = (tx.signing_bytes(), tx.id(), tx.size(), tx.charge());
-    let ok = consensus::check_tx_stateless(&tx, CHAIN_ID, prefix()).is_ok();
+    let ok = consensus::check_tx_stateless(&tx, CHAIN_ID, genesis_hash(), prefix()).is_ok();
     let back: Tx = serde_json::from_slice(&serde_json::to_vec(&tx).unwrap()).expect("a parsed tx must parse again after re-serializing");
     assert_eq!(back, tx, "the JSON round trip changed the tx");
     if tx.check_format().is_ok() {
@@ -137,7 +144,7 @@ pub fn tx_wire(data: &[u8]) -> bool {
     assert_eq!(tx.size(), data.len() as u64, "size() isn't the wire length");
     let back: Tx = serde_json::from_slice(&serde_json::to_vec(&tx).unwrap()).expect("a wire tx must survive its JSON form");
     assert_eq!(back, tx, "the JSON round trip changed a wire tx");
-    let ok = consensus::check_tx_stateless(&tx, CHAIN_ID, prefix()).is_ok();
+    let ok = consensus::check_tx_stateless(&tx, CHAIN_ID, genesis_hash(), prefix()).is_ok();
     if tx.check_format().is_ok() {
         genesis_state().describe(&tx, None);
     }
@@ -237,12 +244,368 @@ pub fn certificate(data: &[u8]) -> bool {
     decoded
 }
 
+// ------------------------------------------------------------------------------ state machine
+
+/// The state machine target's chain: one validator (the Season 0 admin too, so the admin levers
+/// are reachable), funded users (one with a vesting lock), 4-block epochs and Proof of
+/// Contribution timings of a few blocks, so epochs, Séances and vesting all happen.
+const SM_CHAIN: &str = "blockula-fuzz-sm";
+const SM_USERS: usize = 6;
+const SM_AGENTS: usize = 3;
+/// Ops past this many are ignored, so one input stays fast.
+const SM_MAX_OPS: usize = 300;
+/// Bytes per op: kind, a, b, then a little-endian u16 amount (the raw-action op takes more).
+const SM_OP: usize = 5;
+
+/// A key the state machine target signs (in name) with, precomputed: deriving an ML-DSA public
+/// key is slow, and the fuzzer builds thousands of txs a second.
+struct Who {
+    address: String,
+    public_key: String,
+    key_id: String,
+}
+
+impl Who {
+    fn of(k: &Keys) -> Who {
+        let pk = k.public_key();
+        Who { address: crate::crypto::address_from_public_key(&pk), key_id: types::key_id(&pk), public_key: hex::encode(pk) }
+    }
+}
+
+struct SmFixture {
+    state: State,
+    validator: Who,
+    users: Vec<Who>,
+    agents: Vec<Who>,
+    /// Per user: a consensus key it may register as a validator, and that key's PoP.
+    candidates: Vec<(String, String)>,
+    /// Addresses that hold nothing at genesis.
+    newcomers: Vec<String>,
+}
+
+fn sm_fixture() -> &'static SmFixture {
+    static F: OnceLock<SmFixture> = OnceLock::new();
+    F.get_or_init(|| {
+        let validator = Keys::from_seed(VALIDATOR_SEED);
+        let users: Vec<Keys> = (1..=SM_USERS as u8).map(|i| Keys::from_seed([i; 32])).collect();
+        let agents: Vec<Keys> = (0..SM_AGENTS as u8).map(|i| Keys::from_seed([100 + i; 32])).collect();
+        let mut allocations = vec![json!({ "address": validator.address(), "amount": "10000000000000000" })];
+        for (i, u) in users.iter().enumerate() {
+            let mut a = json!({ "address": u.address(), "amount": "100000000000000" });
+            if i == SM_USERS - 1 {
+                a["vesting"] = json!({ "start": 0, "cliff": 20, "end": 200 });
+            }
+            allocations.push(a);
+        }
+        let genesis: Genesis = serde_json::from_value(json!({
+            "chain_id": SM_CHAIN, "token": "FANG", "decimals": 9, "block_time_ms": 1000, "faucet": false, "created_at_ms": GENESIS_MS,
+            "validators": [{ "address": validator.address(), "public_key": hex::encode(validator.public_key()), "p2p_addr": "127.0.0.1:7071", "http_addr": "127.0.0.1:7070" }],
+            "allocations": allocations,
+            "epoch_blocks": 4,
+            "validator_admins": [validator.address()],
+            "contribution": { "seance_blocks": 6, "claim_maturity_blocks": 0, "vesting_blocks": 10, "vouch_lock_blocks": 5, "claim_ttl_blocks": 15, "soul_half_life_blocks": 100 },
+        }))
+        .expect("state machine genesis no longer parses: update harness::sm_fixture");
+        genesis.check().expect("state machine genesis is invalid: update harness::sm_fixture");
+        let candidates = users
+            .iter()
+            .enumerate()
+            .map(|(i, u)| {
+                let seed = [200 + i as u8; 32];
+                (hex::encode(Keys::from_seed(seed).public_key()), crate::chain::make_pop(seed, SM_CHAIN, &u.address(), "203.0.113.9:7071", "https://v.example"))
+            })
+            .collect();
+        let newcomers = (0..8u8).map(|i| Keys::from_seed([200 + i; 32]).address()).collect();
+        SmFixture { state: genesis.initial_state(), validator: Who::of(&validator), users: users.iter().map(Who::of).collect(), agents: agents.iter().map(Who::of).collect(), candidates, newcomers }
+    })
+}
+
+/// One fuzzed run of the state machine: the ops' txs in blocks, as execution applies them.
+struct Sm {
+    state: State,
+    height: u64,
+    txs: Vec<Tx>,
+    applied: usize,
+    /// Every block's root, for the determinism check.
+    roots: Vec<[u8; 32]>,
+    halted: bool,
+}
+
+impl Sm {
+    fn proposer(&self) -> String {
+        sm_fixture().validator.address.clone()
+    }
+
+    /// Queues a tx from `from` signed (in name: the state machine doesn't check signatures,
+    /// admission does) by `signer`, at that sender's next nonce in this block.
+    fn tx(&mut self, signer: &Who, from: &str, tip: u64, action: Action) {
+        let queued = self.txs.iter().filter(|t| t.from == from).count() as u64;
+        let nonce = self.state.account(from).nonce + queued;
+        let mut tx = Tx { chain_id: SM_CHAIN.into(), genesis_hash: "00".repeat(32), from: from.into(), nonce, fee: 0, tip, valid_until: self.height + 10, action, memo: String::new(), public_key: signer.public_key.clone(), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+        tx.fee = tx.charge().unwrap_or(u64::MAX);
+        self.txs.push(tx);
+        if self.txs.len() >= 16 {
+            self.end_block();
+        }
+    }
+
+    /// Executes the queued txs as the next block (after a dry run that's rolled back, as a
+    /// proposal's is), runs the end-of-block steps and commits, then checks the state.
+    fn end_block(&mut self) {
+        if self.halted {
+            return;
+        }
+        let height = self.height + 1;
+        let proposer = self.proposer();
+        let txs = std::mem::take(&mut self.txs);
+        // Dry run + rollback (proposals, mempool checks) must leave the state exactly as it was.
+        let before = self.state.full_root();
+        let mut j = crate::chain::Journal::default();
+        for tx in &txs {
+            let _ = self.state.apply_j(&mut j, tx, SM_CHAIN, &proposer, height, false);
+        }
+        self.state.rollback(j);
+        assert_eq!(self.state.full_root(), before, "a rolled-back dry run changed the state");
+        let mut skipped = vec![];
+        for tx in &txs {
+            match self.state.apply(tx, SM_CHAIN, &proposer, height) {
+                Ok(Outcome::Applied) => self.applied += 1,
+                Ok(Outcome::Failed(_)) => {}
+                Err(_) => skipped.push(tx.size()),
+            }
+        }
+        let hash = hex::encode(crate::crypto::hash(&height.to_le_bytes()));
+        self.state.end_block(&BlockInfo { height, hash: &hash, proposer: &proposer, view: height, parent_view: height - 1, skipped: &skipped });
+        let commit = self.state.commit_block().expect("an in-memory tree can't fail");
+        assert_eq!(commit.root, self.state.full_root(), "incremental state root diverged from a full rebuild at height {height}");
+        if let Err(e) = self.state.check_invariants().and_then(|_| self.state.check_record_sizes()) {
+            panic!("state invariant broken at height {height}: {e}");
+        }
+        self.roots.push(commit.root);
+        self.height = height;
+        // A binary that can't run the next height stops (upgrade::check_next), as the node does.
+        self.halted = crate::upgrade::check_next(&self.state, height + 1).is_err();
+    }
+
+    /// Interprets one op as a tx (or blocks). `amt` and the indexes come from the fuzzer.
+    fn op(&mut self, kind: u8, a: u8, b: u8, amt: u64, raw: &[u8]) {
+        let f = sm_fixture();
+        let (ai, bi) = (a as usize % SM_USERS, b as usize % SM_USERS);
+        let (user, other) = (&f.users[ai], f.users[bi].address.clone());
+        let me = user.address.clone();
+        let agent = &f.agents[b as usize % SM_AGENTS];
+        let admin = &f.validator;
+        let fang = |n: u64| n * types::DROPS_PER_FANG;
+        let h = self.height;
+        let tip = (a % 4) as u64;
+        let newcomer = f.newcomers[b as usize % 8].clone();
+        let hunt = amt % self.state.next_hunt_id.max(1);
+        let claim = amt % self.state.poc.next_claim_id.max(1);
+        let validator_addr = |s: &Self| s.state.validators.keys().nth(b as usize % s.state.validators.len().max(1)).cloned().unwrap_or_else(|| f.validator.address.clone());
+        let kind = match kind % 40 {
+            36 => 17,
+            37 => 18,
+            38 | 39 => 25,
+            k => k,
+        };
+        let action = match kind {
+            0 => Action::Transfer { to: other, amount: fang(amt % 50) + 1 },
+            1 => Action::Transfer { to: newcomer, amount: fang(1) },
+            2 => Action::RegisterName { name: format!("name{}", b % 8) },
+            3 => Action::AddKey { key_id: agent.key_id.clone(), label: "agent".into(), role: KeyRole::Session { limit: fang(amt % 20), period_blocks: 1 + amt % 10, expires_at: h + 50 } },
+            4 => Action::RemoveKey { key_id: agent.key_id.clone() },
+            5 => Action::RegisterFamiliar { key_id: agent.key_id.clone(), label: "claude".into() },
+            6 => return self.tx(agent, &me, tip, Action::Transfer { to: other, amount: fang(amt % 3) }),
+            7 => Action::CreateHunt { repo: "jackdishman/blockula".into(), issue: 1 + b as u64, amount: fang(10 + amt % 20), expires_at: h + 2 + amt % 10, title: "a hunt".into() },
+            8 => Action::FundHunt { hunt_id: hunt, amount: fang(1 + amt % 3) },
+            9 => Action::AwardHunt { hunt_id: hunt, to: other, pr: 1 + amt, familiar_key: (amt % 2 == 0).then(|| agent.key_id.clone()) },
+            10 if amt % 2 == 0 => return self.tx(admin, &admin.address.clone(), tip, Action::CancelHunt { hunt_id: hunt }),
+            10 => Action::CancelHunt { hunt_id: hunt },
+            11 => Action::LinkGithub { handle: format!("user{ai}"), gist_id: format!("abc{ai}") },
+            12 => Action::UnlinkGithub { handle: format!("user{}", if amt % 2 == 0 { ai } else { bi }) },
+            13 => return self.tx(admin, &admin.address.clone(), tip, Action::GrantSoul { to: other, amount: (1 + amt % 30) * crate::poc::SOUL, reason: "fuzz".into() }),
+            14 => return self.tx(admin, &admin.address.clone(), tip, Action::SetRepo { repo: "jackdishman/blockula".into(), weight: amt % 3 }),
+            15 => Action::Vouch { account: if amt % 3 == 0 { other } else { newcomer } },
+            16 => Action::Unvouch { account: if amt % 3 == 0 { other } else { newcomer } },
+            17 => Action::SubmitClaim { repo: "jackdishman/blockula".into(), pr: 1 + b as u64 + 10 * (amt % 4), familiar_key: None },
+            18 => {
+                // Mostly the oldest pending claim nobody attested (or will in this block), so
+                // attestations land.
+                let queued: Vec<u64> = self.txs.iter().filter_map(|t| if let Action::AttestClaim { claim_id, .. } = t.action { Some(claim_id) } else { None }).collect();
+                let pending = self.state.poc.claims.values().find(|c| c.status == crate::poc::ClaimStatus::Pending && !c.attestations.contains_key(&admin.address.clone()) && !queued.contains(&c.id)).map(|c| c.id);
+                let claim_id = pending.filter(|_| amt % 5 != 0).unwrap_or(claim);
+                let ok = amt % 6 != 0;
+                let (merge_sha, note) = if ok { ("ab".repeat(20), String::new()) } else { (String::new(), "closed".into()) };
+                return self.tx(admin, &admin.address.clone(), tip, Action::AttestClaim { claim_id, ok, merge_sha, note });
+            }
+            19 => Action::JoinJury { bond: crate::poc::JUROR_BOND },
+            20 => Action::LeaveJury {},
+            21 => Action::FundPool { amount: fang(1 + amt % 30) },
+            22 => Action::WithdrawVested {},
+            23 => return self.tx(admin, &admin.address.clone(), tip, Action::Clawback { account: other, reason: "fuzz".into() }),
+            24 if amt % 5 == 0 => return self.tx(admin, &admin.address.clone(), tip, Action::FlagSybil { account: other, reason: "fuzz".into() }),
+            24 => return self.tx(admin, &admin.address.clone(), tip, Action::RejectClaim { claim_id: claim, reason: "fuzz".into() }),
+            25 => {
+                // A seated juror seals, then reveals, mostly-'a' votes in the open Séance.
+                let Some(id) = self.state.poc.open_seance else { return self.end_block() };
+                let seance = &self.state.poc.seances[&id];
+                let Some(seat) = seance.jurors.get(&me) else { return };
+                let votes: String = seat.pairs.iter().enumerate().map(|(i, _)| if (amt >> (i % 16)) & 1 == 0 { 'a' } else { 'b' }).collect();
+                let spam: Vec<u64> = if amt % 7 == 0 { seance.claims.first().copied().into_iter().collect() } else { vec![] };
+                if seat.commitment.is_none() && h < seance.commit_until {
+                    Action::CommitVotes { seance_id: id, commitment: types::seance_commitment(id, &me, &votes, &spam, "salt") }
+                } else {
+                    Action::RevealVotes { seance_id: id, votes, spam, salt: "salt".into() }
+                }
+            }
+            26 => {
+                let (key, pop) = f.candidates[ai].clone();
+                Action::RegisterValidator { consensus_key: key, p2p_addr: "203.0.113.9:7071".into(), http_addr: "https://v.example".into(), bond: self.state.chain_params.min_self_bond + fang(amt % 5), pop }
+            }
+            27 => {
+                let v = validator_addr(self);
+                let action = match amt % 3 {
+                    0 => Action::ApproveValidator { validator: v },
+                    1 => Action::RemoveValidator { validator: v },
+                    _ => Action::Unbond { validator: v },
+                };
+                let (signer, from) = if amt % 3 == 2 { (user, me) } else { (admin, admin.address.clone()) };
+                return self.tx(signer, &from, tip, action);
+            }
+            // Protocol v1 (tags 30–49): whatever each module does with them.
+            28 => {
+                let v = validator_addr(self);
+                match amt % 6 {
+                    0 => Action::Delegate { validator: v, amount: fang(1 + amt % 50) },
+                    1 => Action::Undelegate { validator: v, shares: 1 + amt },
+                    2 => Action::Redelegate { from_validator: v, to_validator: f.validator.address.clone(), shares: 1 + amt },
+                    3 => Action::WithdrawUnbonded {},
+                    4 => Action::UpdateValidator { commission_bps: amt % 2_000, p2p_addr: String::new(), http_addr: String::new() },
+                    _ => Action::Unjail { validator: v },
+                }
+            }
+            29 => match amt % 3 {
+                0 => {
+                    let kinds = [
+                        ProposalKind::ParamChange { key: "max_validators".into(), value: 2 + amt % 10 },
+                        ProposalKind::TreasurySpend { to: other.clone(), amount: fang(1) },
+                        ProposalKind::SetRepo { repo: "jackdishman/blockula".into(), weight: 1 + amt % 3 },
+                        ProposalKind::GrantSoul { to: other, amount: crate::poc::SOUL, reason: "fuzz".into() },
+                        ProposalKind::RefundHunt { hunt_id: hunt },
+                        ProposalKind::ScheduleUpgrade { version: 2, activation_height: h + 1_000 },
+                        ProposalKind::ActivateFeature { feature: "ghost".into() },
+                        ProposalKind::Text {},
+                    ];
+                    let kind = kinds[b as usize % kinds.len()].clone();
+                    Action::Propose { kind, deposit: fang(1_000 + amt), title: "fuzz".into(), url: String::new() }
+                }
+                1 => Action::Vote { proposal_id: amt % 4, aye: b % 2 == 0, amount: fang(1 + amt % 100), conviction: (b % 7) as u8 },
+                _ => Action::Unlock {},
+            },
+            30 => match amt % 3 {
+                0 => Action::MultisigCreate { owners: vec![user.key_id.clone(), agent.key_id.clone()], threshold: 1 + (b % 2) },
+                1 => Action::MultisigPropose { action: Box::new(Action::Transfer { to: other, amount: fang(1) }) },
+                _ => Action::MultisigApprove { id: amt % 4 },
+            },
+            31 => match amt % 3 {
+                0 => Action::RenewName { name: format!("name{}", b % 8), years: 1 + (b % 3) },
+                1 => Action::TransferName { name: format!("name{}", b % 8), to: other },
+                _ => Action::ReleaseName { name: format!("name{}", b % 8) },
+            },
+            32 => {
+                let (signer, from) = (admin, admin.address.clone());
+                let epoch = self.state.params.epoch_of(h) + (amt % 3);
+                let action = match amt % 5 {
+                    0 => Action::BeaconCommit { epoch, commitment: hex::encode(crate::crypto::hash(&amt.to_le_bytes())) },
+                    1 => Action::BeaconReveal { epoch, secret: hex::encode((amt as u128).to_le_bytes().repeat(2)) },
+                    2 => Action::AttestRevert { claim_id: claim, revert_sha: "cd".repeat(20) },
+                    3 => Action::ClaimDistribution { distribution_id: amt % 3, amount: fang(1), proof: vec![] },
+                    _ => Action::ReportEquivocation { evidence: hex::encode(raw) },
+                };
+                return self.tx(signer, &from, tip, action);
+            }
+            33 => match Action::from_bytes(raw) {
+                // Any action the wire form can carry, with fuzzer-chosen fields.
+                Ok(action) => action,
+                Err(_) => return,
+            },
+            34 => {
+                self.end_block();
+                for _ in 0..amt % 4 {
+                    self.end_block();
+                }
+                return;
+            }
+            // A tx the state machine must refuse (a stranger's key, a stale nonce), not apply.
+            35 if amt % 2 == 0 => return self.tx(agent, &me, tip, Action::RegisterName { name: format!("sneaky{}", b % 4) }),
+            35 => {
+                let mut t = Tx { chain_id: SM_CHAIN.into(), genesis_hash: "00".repeat(32), from: me.clone(), nonce: self.state.account(&me).nonce.wrapping_sub(1), fee: 0, tip, valid_until: h + 10, action: Action::WithdrawVested {}, memo: String::new(), public_key: user.public_key.clone(), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+                t.fee = t.charge().unwrap_or(u64::MAX);
+                self.txs.push(t);
+                return;
+            }
+            _ => return,
+        };
+        self.tx(user, &me, tip, action);
+    }
+}
+
+/// Runs the ops in `data` from the state machine fixture's genesis: every block's root, and how
+/// many txs applied.
+fn sm_run(data: &[u8]) -> (Vec<[u8; 32]>, usize) {
+    let mut sm = Sm { state: sm_fixture().state.clone(), height: 0, txs: vec![], applied: 0, roots: vec![], halted: false };
+    let mut rest = data;
+    for _ in 0..SM_MAX_OPS {
+        let Some((op, tail)) = rest.split_first_chunk::<SM_OP>() else { break };
+        rest = tail;
+        let [kind, a, b, lo, hi] = *op;
+        let amt = u16::from_le_bytes([lo, hi]) as u64;
+        // The raw-action op (33) takes `b % 64 + 1` more bytes: an action's wire encoding.
+        let raw = if kind % 40 == 33 || kind % 40 == 32 {
+            let n = (b as usize % 64 + 1).min(rest.len());
+            let (raw, tail) = rest.split_at(n);
+            rest = tail;
+            raw
+        } else {
+            &[]
+        };
+        sm.op(kind, a, b, amt, raw);
+    }
+    sm.end_block();
+    // The final state survives the snapshot encoding (what fast sync rebuilds from).
+    let mut bytes = vec![];
+    snapshot::write_state(&sm.state, &mut bytes).unwrap();
+    let back = snapshot::read_state(&mut bytes.as_slice()).expect("a state the state machine built must decode from its snapshot");
+    assert_eq!(back.root_hash(), sm.state.root_hash(), "the snapshot of a state rebuilds another root");
+    (sm.roots, sm.applied)
+}
+
+/// The state machine (MAINNET-DESIGN 2, SEC-3): fuzzer-chosen sequences of txs of every kind (the
+/// raw-action op takes any action the wire form carries) from a few accounts, agents and an
+/// admin, in blocks across epoch ends and Séances. After every block the incremental root must
+/// equal a full rebuild, a rolled-back dry run must leave no trace, and the invariants (supply
+/// conservation, record bounds) must hold. One input in four runs twice: the same ops must give
+/// the same roots (nondeterminism, e.g. from hash-map order, splits a chain).
+pub fn state_machine(data: &[u8]) -> bool {
+    let (roots, applied) = sm_run(data);
+    if crate::crypto::hash(data)[0] % 4 == 0 {
+        let (again, _) = sm_run(data);
+        assert_eq!(roots, again, "the same txs from the same genesis gave different state roots");
+    }
+    applied > 0
+}
+
+/// A state machine input from `(kind, a, b, amt)` ops (and raw bytes after a raw-action op).
+fn sm_ops(ops: &[(u8, u8, u8, u16)]) -> Vec<u8> {
+    ops.iter().flat_map(|&(k, a, b, amt)| [k, a, b, amt.to_le_bytes()[0], amt.to_le_bytes()[1]]).collect()
+}
+
 // ------------------------------------------------------------------------------------ seeds
 
 /// A signed tx from `keys` paying exactly its charge (`min_fee + tip`), valid through
 /// `VALID_UNTIL`.
 fn signed_tx(keys: &Keys, nonce: u64, tip: u64, action: Value) -> Tx {
-    let mut v = json!({ "chain_id": CHAIN_ID, "from": keys.address(), "nonce": nonce, "fee": "0", "tip": tip.to_string(), "valid_until": VALID_UNTIL, "action": action, "memo": "", "public_key": "", "signature": "" });
+    let mut v = json!({ "chain_id": CHAIN_ID, "genesis_hash": genesis_hash(), "from": keys.address(), "nonce": nonce, "fee": "0", "tip": tip.to_string(), "valid_until": VALID_UNTIL, "action": action, "memo": "", "public_key": "", "signature": "" });
     let charge = serde_json::from_value::<Tx>(v.clone()).expect("tx JSON shape changed: update harness::signed_tx").sign(keys).charge().unwrap();
     v["fee"] = json!(charge.to_string());
     serde_json::from_value::<Tx>(v).unwrap().sign(keys)
@@ -405,5 +768,30 @@ pub fn seeds() -> Vec<(&'static str, &'static str, Vec<u8>)> {
     out.push(("certificate", "notarize-vote", prefixed(Vote::<_, Digest>::Notarize(notarizes[0].clone()).encode().to_vec())));
     out.push(("certificate", "nullify-vote", prefixed(Vote::<_, Digest>::Nullify(nullifies[1].clone()).encode().to_vec())));
     out.push(("certificate", "finalize-vote", prefixed(Vote::<_, Digest>::Finalize(finalizes[2].clone()).encode().to_vec())));
+
+    // State machine runs: a full Séance, hunts and agents, validators and the v1 tags, and raw
+    // actions (wire-encoded, after their op).
+    let users = 0..SM_USERS as u8;
+    let mut seance: Vec<(u8, u8, u8, u16)> = vec![(14, 0, 0, 1), (21, 0, 0, 29)];
+    seance.extend(users.clone().map(|i| (13, 0, i, 20)));
+    seance.extend(users.clone().flat_map(|i| [(11, i, 0, 0), (19, i, 0, 0)]));
+    seance.extend([(34, 0, 0, 0), (17, 0, 0, 0), (17, 1, 1, 0), (17, 2, 2, 0), (34, 0, 0, 0), (18, 0, 0, 1), (18, 0, 0, 1), (18, 0, 0, 1), (34, 0, 0, 3)]);
+    for _ in 0..4 {
+        seance.extend(users.clone().map(|i| (25, i, 0, 0)));
+        seance.push((34, 0, 0, 1));
+    }
+    seance.extend([(34, 0, 0, 3), (34, 0, 0, 3), (34, 0, 0, 3)]);
+    seance.extend(users.clone().map(|i| (22, i, 0, 0)));
+    out.push(("state_machine", "seance", sm_ops(&seance)));
+    out.push(("state_machine", "hunts-and-agents", sm_ops(&[(3, 0, 0, 15), (5, 0, 0, 0), (34, 0, 0, 0), (6, 0, 0, 2), (7, 1, 3, 4), (34, 0, 0, 0), (8, 2, 0, 0), (8, 3, 0, 1), (9, 1, 0, 0), (7, 2, 4, 1), (34, 0, 0, 3), (10, 2, 0, 1), (10, 0, 0, 0), (4, 0, 0, 0), (6, 0, 0, 1), (2, 1, 3, 0), (0, 1, 2, 7), (1, 3, 1, 0), (35, 2, 1, 0), (35, 2, 1, 1), (34, 0, 0, 2)])));
+    out.push(("state_machine", "validators-and-v1", sm_ops(&[(26, 0, 0, 0), (34, 0, 0, 0), (27, 0, 1, 0), (34, 0, 0, 3), (28, 1, 0, 0), (29, 1, 0, 0), (29, 2, 1, 1), (29, 3, 0, 2), (30, 0, 0, 0), (31, 0, 2, 0), (32, 0, 0, 0), (32, 0, 0, 1), (27, 0, 1, 1), (34, 0, 0, 3), (34, 0, 0, 3), (27, 0, 1, 2), (34, 0, 0, 1)])));
+    let mut raw = vec![];
+    for action in [Action::Transfer { to: Keys::from_seed([3; 32]).address(), amount: 7 }, Action::Vote { proposal_id: 0, aye: true, amount: 5, conviction: 2 }, Action::Delegate { validator: Keys::from_seed(VALIDATOR_SEED).address(), amount: 3 }] {
+        let enc = action.to_bytes();
+        raw.extend(sm_ops(&[(33, 1, (enc.len() - 1) as u8, 0)]));
+        raw.extend(enc);
+    }
+    raw.extend(sm_ops(&[(34, 0, 0, 0)]));
+    out.push(("state_machine", "raw-actions", raw));
     out
 }

@@ -21,7 +21,7 @@ Blockula signs everything with ML-DSA-65, and since protocol v1 its network traf
 - `node/vendor/commonware-stream` is Commonware's `commonware-stream` 2026.9.0 with a hybrid handshake (`src/hybrid.rs`, about 440 lines without comments) in place of `commonware-cryptography`'s X25519 one. `node/Cargo.toml` patches it in with `[patch.crates-io]`. Provenance, the exact diff and the re-port plan are in [VENDORED.md](../node/vendor/commonware-stream/VENDORED.md); `verify-vendor.sh` re-checks them.
 - `commonware-p2p` and `commonware-cryptography` are untouched. p2p only calls `encrypted::{dial, listen}` and their `Config`, `Sender` and `Receiver`, whose signatures didn't change. The AEAD, its counter nonces and the record framing are upstream's.
 - New dependency: RustCrypto `ml-kem` pinned `=0.3.2` with `zeroize` (the newest release on 2026-10-14; no advisories on OSV).
-- `/api/status` reports `crypto.p2p_transport: "hybrid X25519 + ML-KEM-768 key exchange, ChaCha20-Poly1305, ML-DSA-65 peer auth"`.
+- `/api/status` reports `crypto.p2p_transport: "hybrid X25519 + ML-KEM-768 key exchange, ChaCha20-Poly1305, ML-DSA-65 peer auth (_BLOCKULA_STREAM_HANDSHAKE_X25519MLKEM768_V1)"`. The node builds it from `SUITE` and `PROTOCOL`, which only the vendored `hybrid` module exports, and depends on `commonware-stream` directly: if the patch stops applying (say a `commonware-p2p` bump the vendored version no longer satisfies), the node fails to compile instead of linking the classical handshake with only a cargo warning. The test `api::tests::vendored_stream_is_linked` also fails if the lockfile holds a second, registry copy of `commonware-stream`.
 
 ## The handshake
 

@@ -60,8 +60,12 @@ mod mldsa;
 mod tests;
 
 /// Protocol label. Differs from upstream's `_COMMONWARE_CRYPTOGRAPHY_HANDSHAKE`, so no signature
-/// or key from one handshake is valid in the other.
-const PROTOCOL: &[u8] = b"_BLOCKULA_STREAM_HANDSHAKE_X25519MLKEM768_V1";
+/// or key from one handshake is valid in the other. Public so the node can report and pin it.
+pub const PROTOCOL: &[u8] = b"_BLOCKULA_STREAM_HANDSHAKE_X25519MLKEM768_V1";
+/// What [crate::encrypted] runs, in words. The node builds `/api/status`'s
+/// `crypto.p2p_transport` from this and [PROTOCOL]: neither exists in upstream's crate, so a node
+/// build that links upstream's (classical) stream instead of this copy fails to compile.
+pub const SUITE: &str = "hybrid X25519 + ML-KEM-768 key exchange, ChaCha20-Poly1305";
 const LABEL_CIPHER_L2D: &[u8] = b"cipher_l2d";
 const LABEL_CIPHER_D2L: &[u8] = b"cipher_d2l";
 const LABEL_CONFIRMATION_L2D: &[u8] = b"confirmation_l2d";

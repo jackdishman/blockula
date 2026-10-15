@@ -72,8 +72,8 @@ export function initialPin(net: Network): ChainPin {
 
 /**
  * The SDK client, except every status read must match the pinned chain. `Wallet.build` signs
- * against the chain id from `status()`, so no tx can be signed for a chain other than the one
- * the wallet shows. Unpinned fields are pinned from the first status seen, so a node can't
+ * the chain id and genesis hash from `status()`, so no tx can be signed for a chain other than
+ * the one the wallet shows. Unpinned fields are pinned from the first status seen, so a node can't
  * switch chains mid-session either.
  */
 export class PinnedClient extends Client {

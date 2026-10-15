@@ -12,8 +12,7 @@ Every decoder that takes bytes from a peer or an HTTP response is a way to crash
 | `sync_batch` | `GET /api/sync` | JSON → `SyncBatch` → `apply_batch` on a full node at genesis (certificate, links, execution); a batch that executes resets the node |
 | `epochs_registry` | `GET /api/epochs` | `merge_sigs` as `exchange_epochs` runs it, plus `verify_chain` (epoch 0 included) and `proven_through` |
 | `certificate` | finalization certificates; simplex votes and certificates (p2p) | `pq::Certificate` (bitmap plus signatures), `simplex::types::{Certificate, Vote}` for a 4-validator set, all canonical, all verified |
-
-Not covered yet: a "random txs → apply → `check_invariants`" fuzz target for the state machine (`state/tests.rs` property-tests random tx sequences in the meantime).
+| `state_machine` | every tx a proposer can put in a block | Up to 300 ops, 5 bytes each (kind, two account indexes, an amount; a raw-action op takes up to 64 more bytes, decoded with `Action::from_bytes`), become txs of every tag from 6 users (one with a vesting lock), 3 agent session keys and the admin validator, in blocks across 4-block epochs and Séances of a few blocks. Each block is first dry-run on a journal and rolled back (the state must be unchanged), then applied as execution does (`State::apply`, `end_block`, `commit_block`). After every block: incremental root == full rebuild, `check_invariants` (supply conservation, escrows, cross-references, nested-collection caps) and every record within the snapshot limits. At the end the state must survive the snapshot encoding; one input in four runs twice and must give the same roots |
 
 ## Running
 
@@ -25,6 +24,8 @@ cargo +nightly fuzz run cblock fuzz/corpus/cblock fuzz/seeds/cblock -- -max_tota
 
 Swap `cblock` for any target. The first directory is the working corpus (git-ignored); `fuzz/seeds/<target>` holds valid inputs built by `harness::seeds()`, so the fuzzer starts from blocks, txs, certificates and manifests that pass every check. Crashes land in `fuzz/artifacts/<target>/`. To reproduce one, run `cargo +nightly fuzz run <target> <file>`.
 
+`state_machine` is stateful and slow per input (tens of executions a second per core); run it with `-fork=N` for throughput.
+
 On stable, with no fuzzer, `cargo test --manifest-path node/fuzz/Cargo.toml` checks that every seed is still accepted (a format change otherwise leaves the fuzzers mutating dead input) and that open findings (`harness::open_findings()`, inputs in `regressions/`; none today) still reproduce. After a format change, regenerate the seeds with `cargo test --manifest-path node/fuzz/Cargo.toml -- --ignored write_seeds`.
 
 CI (`.github/workflows/fuzz.yml`) runs the stable checks on PRs that touch `node/`, and fuzzes each target for 5 minutes nightly (or on demand, with a chosen duration), keeping the corpus between runs. A crash fails that target's job and uploads the input.
@@ -32,6 +33,15 @@ CI (`.github/workflows/fuzz.yml`) runs the stable checks on PRs that touch `node
 ### How the crate builds
 
 The node is a binary crate with no library target, so `src/lib.rs` compiles its modules straight from `node/src` through a `#[path]` module and re-exports them, so the node's `crate::…` paths still resolve. The node crate itself doesn't change. In exchange, this crate repeats the node's module list and `[dependencies]`; `check-sync.sh` (run in CI) fails when they drift. If the node gains a `lib.rs`, this crate can depend on it and drop both copies.
+
+## Results (2026-10-15, local, Apple M-series): the state machine and the tx genesis hash
+
+| Target | Executions | Result |
+|---|---|---|
+| `state_machine` | 2,920 (7 min, 1 worker) + 116,778 (20 min, `-fork=6`), from the committed seeds; 13,783 edges, corpus 2,838 | no crash, no invariant or determinism failure |
+| `tx_wire` | 94,116 (60 s), after Txs gained `genesis_hash` | no crash |
+| `tx_json` | 143,749 (60 s) | no crash |
+| `cblock` | 27,614 (60 s) | no crash |
 
 ## Results (2026-10-14, local, Apple M-series, nightly-2026-10-13)
 

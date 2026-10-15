@@ -320,6 +320,15 @@ pub const GIT_SHA: &str = match option_env!("BLOCKULA_GIT_SHA") {
     None => "unknown",
 };
 
+/// `crypto.p2p_transport` in `/api/status`, which operators check at the genesis ceremony. Built
+/// from constants only the vendored hybrid handshake exports (node/vendor/commonware-stream), so a
+/// build that links upstream's classical stream (an unapplied `[patch.crates-io]`) doesn't
+/// compile instead of misreporting. `vendored_stream_is_linked` pins the rest (one copy, ours).
+pub fn p2p_transport() -> String {
+    let label = std::str::from_utf8(commonware_stream::hybrid::PROTOCOL).unwrap_or("?");
+    format!("{}, ML-DSA-65 peer auth ({label})", commonware_stream::hybrid::SUITE)
+}
+
 struct ApiError(StatusCode, String);
 
 impl IntoResponse for ApiError {
@@ -550,7 +559,7 @@ async fn status(State(n): State<Node>) -> ApiResult {
         "address_prefix": g.address_prefix,
         "max_tx_validity_blocks": st.chain_params.max_tx_validity_blocks,
         "protocol_version": crate::consensus::PROTOCOL_VERSION,
-        "crypto": { "signatures": "ML-DSA-65 (FIPS 204)", "hash": "BLAKE3-256", "addresses": format!("bech32m({}, BLAKE3(pubkey))", g.address_prefix), "p2p_transport": "hybrid X25519 + ML-KEM-768 key exchange, ChaCha20-Poly1305, ML-DSA-65 peer auth" },
+        "crypto": { "signatures": "ML-DSA-65 (FIPS 204)", "hash": "BLAKE3-256", "addresses": format!("bech32m({}, BLAKE3(pubkey))", g.address_prefix), "p2p_transport": p2p_transport() },
     })))
 }
 
@@ -624,11 +633,11 @@ async fn submit(State(n): State<Node>, ConnectInfo(peer): ConnectInfo<SocketAddr
 
 async fn submit_inner(n: &Node, headers: &HeaderMap, client: Option<IpAddr>, tx: Tx) -> ApiResult {
     // Format + ML-DSA signature checks run without the chain lock.
-    let (chain_id, prefix, role) = {
+    let (chain_id, genesis_hash, prefix, role) = {
         let v = n.live.view();
-        (v.genesis.chain_id.clone(), v.genesis.address_prefix.clone(), v.role)
+        (v.genesis.chain_id.clone(), v.genesis_hash.clone(), v.genesis.address_prefix.clone(), v.role)
     };
-    crate::consensus::check_tx_stateless(&tx, &chain_id, &prefix)?;
+    crate::consensus::check_tx_stateless(&tx, &chain_id, &genesis_hash, &prefix)?;
     if role == Role::FullNode {
         if forwarded(headers) {
             return Err(ApiError(StatusCode::LOOP_DETECTED, "forwarding loop: this full node was sent a forwarded tx".into()));
@@ -1349,6 +1358,19 @@ mod tests {
         let fake = headers(&[("fly-client-ip", "10.0.0.2"), ("x-blockula-client-ip", "9.9.9.9")]);
         assert_eq!(lan.resolve(peer, &fake), Some(peer.ip()));
     }
+
+    /// The p2p transport `/api/status` reports is the one linked (audit #1/#3). Compiling
+    /// `p2p_transport` already proves the node links the vendored crate; the lockfile check
+    /// proves nothing else (commonware-p2p) links a second, upstream copy, which an unapplied or
+    /// version-mismatched `[patch.crates-io]` would add with only a cargo warning.
+    #[test]
+    fn vendored_stream_is_linked() {
+        let t = p2p_transport();
+        assert!(t.starts_with("hybrid X25519 + ML-KEM-768") && t.contains("_BLOCKULA_STREAM_HANDSHAKE_X25519MLKEM768_V1"), "{t}");
+        let streams: Vec<&str> = include_str!("../Cargo.lock").split("[[package]]").filter(|p| p.contains("\nname = \"commonware-stream\"\n")).collect();
+        assert_eq!(streams.len(), 1, "exactly one commonware-stream in the build graph: {streams:?}");
+        assert!(!streams[0].contains("\nsource = "), "commonware-stream comes from node/vendor (a path dependency), not a registry: {}", streams[0]);
+    }
 }
 
 #[cfg(test)]
@@ -1397,6 +1419,7 @@ mod http_tests {
         assert!(status.get("data_dir").is_none(), "data_dir isn't exposed");
         assert_eq!(status["version"], VERSION);
         assert!(status["genesis_hash"].as_str().unwrap().len() == 64);
+        assert_eq!(status["crypto"]["p2p_transport"], p2p_transport());
         // No blocks yet: unhealthy.
         let (s, h, _) = call(&n, "GET", "/api/health", None, "127.0.0.1:1").await;
         assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
@@ -1495,7 +1518,7 @@ mod http_tests {
             let mut c = n.chain.lock();
             c.faucet(&alice.address(), 10 * DROPS_PER_FANG).unwrap();
             c.produce_block().unwrap();
-            let mut t = Tx { chain_id: "nolock".into(), from: alice.address(), nonce: 0, fee: 0, tip: 0, valid_until: 50, action: Action::RegisterName { name: "alice".into() }, memo: String::new(), public_key: hex::encode(alice.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+            let mut t = Tx { chain_id: "nolock".into(), genesis_hash: c.genesis_hash.clone(), from: alice.address(), nonce: 0, fee: 0, tip: 0, valid_until: 50, action: Action::RegisterName { name: "alice".into() }, memo: String::new(), public_key: hex::encode(alice.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
             t.fee = min_fee(t.size());
             c.submit(t.sign(&alice)).unwrap();
             c.produce_block().unwrap();
@@ -1622,8 +1645,9 @@ mod http_tests {
         n.chain.lock().produce_block().unwrap();
         let me = n.chain.lock().me().unwrap();
         let valid_until = n.chain.lock().height() + 100;
+        let genesis_hash = n.chain.lock().genesis_hash.clone();
         let mk = |nonce: u64| {
-            let mut tx = Tx { chain_id: "txfail".into(), from: k.address(), nonce, fee: 0, tip: 0, valid_until, action: Action::Transfer { to: me.clone(), amount: 6 * DROPS_PER_FANG }, memo: String::new(), public_key: hex::encode(k.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+            let mut tx = Tx { chain_id: "txfail".into(), genesis_hash: genesis_hash.clone(), from: k.address(), nonce, fee: 0, tip: 0, valid_until, action: Action::Transfer { to: me.clone(), amount: 6 * DROPS_PER_FANG }, memo: String::new(), public_key: hex::encode(k.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
             tx.fee = min_fee(tx.size());
             tx.sign(&k)
         };

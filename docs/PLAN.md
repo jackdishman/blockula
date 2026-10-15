@@ -171,6 +171,7 @@ Next:
 
 - Fast sync trusts the genesis validator set plus 2f+1 handoffs for every set change. Like any BFT chain without checkpoints in the client, this is weak subjectivity: keys of a long-removed set could forge an alternate history for a fresh joiner. Pin `--genesis-hash` and prefer known peers.
 - The anchor hash for the epoch a node fast-syncs into comes from the peer and isn't certified. It only seeds that epoch's consensus engine on validators.
+- Fast sync rebuilds before it can check. Only the snapshot's state root is certified, not the manifest's chunk list, so a malicious peer the joiner asks can serve chunks that decompress to up to `MAX_STATE_BYTES` (4 GiB) of tiny records (~140M), and the joiner builds the maps and the tree for all of them (tens of GB) before the root mismatch shows. A joiner with less memory dies and, restarted, tries the next peer. Until the checkpoint-certifying block also commits to a snapshot digest (the chunk-hash list and the record count, CRY-2), pin `--genesis-hash`, prefer known peers, and size joiners for the largest plausible state.
 - Hunts: awards are trusted to the creator (or an admin). `blockula hunt award` checks GitHub before signing, but the chain doesn't. GitHub links are claims plus a per-node off-chain gist check (cached 10 min, 30 GitHub calls a minute per node). Squatted handles need an admin to unlink.
 - Proof of Contribution v1:
   - **Season 0 trust.** Admins bootstrap Soul, set repo weights, flag sybils, reject reverted claims and claw back rewards. Validators are trusted to report GitHub honestly (a BFT quorum must agree). Phase 3 moves these to governance and juries.
@@ -181,7 +182,7 @@ Next:
   - **Funding:** until issuance starts (Phase 3), the pool only holds donations and slashed bonds.
   - **Cost:** the contribution state is hashed whole into every block's state root (like Hunts), and some lookups scan all claims or grants.
   - **Attestation fees** come from each validator's own (consensus-key) account. A validator registered from a separate owner account needs some FANG at its own address, or its attestations fail; if a third of the set can't attest, claims never reach quorum.
-  - **Mempool estimates:** admission reserves the base claim bond, not the escalating one, and the proposer's dry run of not-yet-executed blocks skips end-of-block Séance steps (like epoch ends). Both only delay or fail a tx (fee charged); neither affects consensus.
+  - **Mempool estimates:** the proposer's dry run of not-yet-executed blocks skips end-of-block Séance steps (like epoch ends). That only delays or fails a tx (fee charged); it doesn't affect consensus.
   - **Default timings are consensus rules.** Chains whose genesis omits `contribution` (the public testnet included) take them from code, as they do every constant in `poc.rs`, so changing them is a coordinated upgrade.
 
 - **The PQ p2p transport is a vendored fork.** The hybrid X25519 + ML-KEM-768 handshake lives in a patched copy of `commonware-stream` 2026.9.0 (`node/vendor/`) until Commonware ships a pluggable KEM (#5183), and nodes on the older X25519-only transport can't peer with it. The public RPC's TLS is only post-quantum behind an edge that negotiates `X25519MLKEM768` (Fly's didn't when measured), and HTTPS certificates are still classical ([PQ-TRANSPORT.md](PQ-TRANSPORT.md)).
@@ -195,7 +196,7 @@ Next:
 - The state root covers state *before* the block it's embedded in (deferred execution), so a block's own post-state root is in `blocks.jsonl`, not in the certified consensus block.
 - If `consensus/` is ahead of `blocks.jsonl` (e.g. `blocks.jsonl` deleted), the node logs an error; delete `consensus/` to resync.
 - The state root is a flat hash over all state, computed once per block (~10 ms per 100k accounts). Phase 1 moves to a Merkle tree for light-client proofs and incremental roots.
-- Txs apply through an undo journal; nothing clones the state per tx. Mempool admission is O(1) per tx using cached per-sender nonces and balance reservations.
+- Txs apply through an undo journal; nothing clones the state per tx. Mempool admission dry-runs a tx after its sender's queued txs (in nonce order, as a block runs them), so a tx that can't execute after them (behind a key removal, past a session limit) never takes a slot. Each recently active sender's simulation is kept (a structure-sharing copy of the state, rebuilt once per block), so admission costs one dry run per tx whatever the size of the mempool or of the queue.
 - Failed actions are charged their fee. A failed tx keeps its place in the block, flagged in `failed`.
 - Transfers that create a new account must carry at least 0.01 FANG.
 - `exec_root` is still a best-effort check. Each block must cite a state root at most 16 heights behind the verifier's executed height, and verifiers that have executed that height check it. A root that no honest verifier has executed yet goes unchecked until one has.

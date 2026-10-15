@@ -144,7 +144,8 @@ pub(crate) async fn send_memo(rpc: &str, keys: &Keys, from: &str, action: Action
     // Valid for 600 blocks (or the chain's maximum, if shorter).
     let validity = status["max_tx_validity_blocks"].as_u64().unwrap_or(600).min(600);
     let valid_until = status["height"].as_u64().unwrap_or(0) + validity;
-    let mut tx = Tx { chain_id: status["chain_id"].as_str().unwrap_or_default().into(), from: from.into(), nonce, fee: 0, tip: 0, valid_until, action, memo, public_key: hex::encode(keys.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+    let genesis_hash = status["genesis_hash"].as_str().ok_or_else(|| anyhow::anyhow!("{rpc} didn't report its genesis_hash"))?;
+    let mut tx = Tx { chain_id: status["chain_id"].as_str().unwrap_or_default().into(), genesis_hash: genesis_hash.into(), from: from.into(), nonce, fee: 0, tip: 0, valid_until, action, memo, public_key: hex::encode(keys.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
     tx.fee = min_fee(tx.size());
     let tx = tx.sign(keys);
     let res = reqwest::Client::new().post(format!("{}/api/tx", rpc.trim_end_matches('/'))).json(&tx).send().await?;

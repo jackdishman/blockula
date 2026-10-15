@@ -321,6 +321,10 @@ pub fn key_id(public_key: &[u8]) -> String {
 #[serde(deny_unknown_fields)]
 pub struct Tx {
     pub chain_id: String,
+    /// The chain instance: hex BLAKE3 digest of its genesis block (`/api/status` `genesis_hash`).
+    /// Signed right after `chain_id`, so a tx can't replay on another chain that reuses the id
+    /// (a relaunched testnet, audit #7). Checked statelessly at admission and in block verification.
+    pub genesis_hash: String,
     /// The account acting. The signing key must be authorized on it.
     pub from: String,
     pub nonce: u64,
@@ -1338,10 +1342,13 @@ impl ProposalKind {
 }
 
 impl Tx {
-    /// Canonical encoding that gets signed. Mirrored exactly in sdk-ts/src/tx.ts.
+    /// Canonical encoding that gets signed. Mirrored exactly in sdk-ts/src/tx.ts. The genesis hash
+    /// is its 32 raw bytes (malformed hex, which `check_format` refuses, as zeros).
     pub fn signing_bytes(&self) -> Vec<u8> {
         let mut out = TX_DOMAIN.to_vec();
         put_str(&mut out, &self.chain_id);
+        let genesis: [u8; 32] = hex::decode(&self.genesis_hash).ok().and_then(|b| b.try_into().ok()).unwrap_or_default();
+        out.extend_from_slice(&genesis);
         put_str(&mut out, &self.from);
         put_u64(&mut out, self.nonce);
         put_u64(&mut out, self.fee);
@@ -1376,6 +1383,7 @@ impl Tx {
         }
         let tx = Tx {
             chain_id: r.str("chain_id", MAX_CHAIN_ID)?,
+            genesis_hash: hex::encode(r.take(32)?),
             from: r.str("from", MAX_ADDRESS)?,
             nonce: r.u64()?,
             fee: r.u64()?,
@@ -1436,6 +1444,9 @@ impl Tx {
         if self.chain_id.len() > MAX_CHAIN_ID {
             bail!("chain_id too long");
         }
+        if self.genesis_hash.len() != 64 || !crypto::is_lower_hex(&self.genesis_hash) {
+            bail!("genesis_hash must be the chain's genesis hash (32 bytes of lowercase hex, from /api/status)");
+        }
         if !crypto::is_address(&self.from) {
             bail!("`from` must be a lowercase address (boo1… or tboo1…)");
         }
@@ -1455,6 +1466,17 @@ impl Tx {
             Ok(_) => bail!("transaction doesn't survive the wire encoding (an optional field is empty?)"),
             Err(e) => Err(e.context("transaction doesn't survive the wire encoding")),
         }
+    }
+
+    /// The tx was signed for this chain instance: its id and its genesis hash.
+    pub fn check_chain(&self, chain_id: &str, genesis_hash: &str) -> Result<()> {
+        if self.chain_id != chain_id {
+            bail!("wrong chain id: this is {chain_id}");
+        }
+        if self.genesis_hash != genesis_hash {
+            bail!("signed for another instance of {chain_id}: this chain's genesis hash is {genesis_hash}");
+        }
+        Ok(())
     }
 
     pub fn sender(&self) -> Result<String> {
@@ -1756,7 +1778,7 @@ pub(crate) mod tests {
 
     /// The vector tx around an action: fixed fields, and recognizable key and signature bytes.
     fn vector_tx(action: Action) -> Tx {
-        Tx { chain_id: "vec".into(), from: "boo1from".into(), nonce: 7, fee: 12345, tip: 3, valid_until: 99, action, memo: "m".into(), public_key: "01".repeat(crypto::PUBLIC_KEY_LEN), signature: "02".repeat(crypto::SIGNATURE_LEN) }
+        Tx { chain_id: "vec".into(), genesis_hash: "03".repeat(32), from: "boo1from".into(), nonce: 7, fee: 12345, tip: 3, valid_until: 99, action, memo: "m".into(), public_key: "01".repeat(crypto::PUBLIC_KEY_LEN), signature: "02".repeat(crypto::SIGNATURE_LEN) }
     }
 
     /// The same vectors are computed by sdk-ts (test/e2e.ts): the encodings must match byte for byte.
@@ -1767,12 +1789,12 @@ pub(crate) mod tests {
         for action in vector_actions() {
             h.update(&vector_tx(action).signing_bytes());
         }
-        assert_eq!(h.finalize().to_hex().to_string(), "67416fa0f99281aa382895815bea59d2a43b40f6865c500e4cb80611d8754875");
+        assert_eq!(h.finalize().to_hex().to_string(), "3633490a583afa9a7aec72593fd29e9d5461b3a037abec251ca90c762e3b1b65");
         // Wire form, size and id of one tx.
         let tx = vector_tx(Action::Transfer { to: "x.boo".into(), amount: 5 });
-        assert_eq!(hex::encode(crypto::hash(&tx.to_bytes())), "f32398f98b16d95d4f68af7ee29524a274d5465476390d91b357633627712e39");
+        assert_eq!(hex::encode(crypto::hash(&tx.to_bytes())), "084ce40c9d406468f7373b0aced2b285ff77d353de986752050877e1953501e0");
         assert_eq!(tx.size(), tx.to_bytes().len() as u64);
-        assert_eq!(tx.id(), "0a787dbaf66a3f5a3df1609272c68f5229397c418010ecd8453b1e7c7ff6617d");
+        assert_eq!(tx.id(), "250e5fc58d322d13ba15e01991885090daa4e8742cc1f68336a2ca37c8539a22");
         // And the JSON shapes the SDK sends parse.
         let a: Action = serde_json::from_str(r#"{"type":"leave_jury"}"#).unwrap();
         assert!(matches!(a, Action::LeaveJury {}));
@@ -1785,7 +1807,7 @@ pub(crate) mod tests {
         for action in v1_vector_actions() {
             h.update(&vector_tx(action).signing_bytes());
         }
-        assert_eq!(h.finalize().to_hex().to_string(), "fecaa54305728b6a9192b18fbbdc03d74f2199c8721a670b73b72970b2d7ba6c");
+        assert_eq!(h.finalize().to_hex().to_string(), "0ffbf0b5bbb1a26f7abe720bae98d7f97581d5268bfbe75fe290605f16172398");
         let p: Action = serde_json::from_str(r#"{"type":"propose","kind":{"type":"param_change","key":"max_validators","value":"40"},"deposit":"1000","title":"t"}"#).unwrap();
         assert_eq!(p, Action::Propose { kind: ProposalKind::ParamChange { key: "max_validators".into(), value: 40 }, deposit: 1000, title: "t".into(), url: String::new() });
         let m: Action = serde_json::from_str(r#"{"type":"multisig_propose","action":{"type":"vote","proposal_id":1,"aye":true,"amount":"5","conviction":2}}"#).unwrap();
@@ -1799,7 +1821,7 @@ pub(crate) mod tests {
             assert_eq!(json["type"], a.kind());
             assert_eq!(serde_json::from_value::<Action>(json).unwrap(), a);
         }
-        let t: Tx = serde_json::from_value(serde_json::json!({ "chain_id": "c", "from": "boo1from", "nonce": 1, "fee": "100", "tip": "2", "valid_until": 9, "action": { "type": "transfer", "to": "x.boo", "amount": "5" }, "memo": "", "public_key": "", "signature": "" })).unwrap();
+        let t: Tx = serde_json::from_value(serde_json::json!({ "chain_id": "c", "genesis_hash": "00".repeat(32), "from": "boo1from", "nonce": 1, "fee": "100", "tip": "2", "valid_until": 9, "action": { "type": "transfer", "to": "x.boo", "amount": "5" }, "memo": "", "public_key": "", "signature": "" })).unwrap();
         assert_eq!((t.fee, t.tip, t.valid_until), (100, 2, 9));
     }
 
@@ -1879,7 +1901,7 @@ pub(crate) mod tests {
         assert!(bad(Action::AttestRevert { claim_id: 0, revert_sha: "ab".repeat(32) }).contains("40-hex"));
         // Every account an action names is checked against the chain's prefix, nested ones too.
         let testnet = k.address_with(crypto::TESTNET_HRP);
-        let tx = |action: Action| Tx { chain_id: "c".into(), from: addr.clone(), nonce: 0, fee: 0, tip: 0, valid_until: 0, action, memo: String::new(), public_key: String::new(), signature: String::new() };
+        let tx = |action: Action| Tx { chain_id: "c".into(), genesis_hash: String::new(), from: addr.clone(), nonce: 0, fee: 0, tip: 0, valid_until: 0, action, memo: String::new(), public_key: String::new(), signature: String::new() };
         for a in [
             Action::Delegate { validator: testnet.clone(), amount: 1 },
             Action::Redelegate { from_validator: addr.clone(), to_validator: testnet.clone(), shares: 1 },
@@ -1894,7 +1916,7 @@ pub(crate) mod tests {
 
     #[test]
     fn json_rejects_unknown_fields() {
-        let ok = serde_json::json!({ "chain_id": "c", "from": "boo1from", "nonce": 1, "fee": "100", "valid_until": 9, "action": { "type": "transfer", "to": "x.boo", "amount": "5" }, "public_key": "", "signature": "" });
+        let ok = serde_json::json!({ "chain_id": "c", "genesis_hash": "00".repeat(32), "from": "boo1from", "nonce": 1, "fee": "100", "valid_until": 9, "action": { "type": "transfer", "to": "x.boo", "amount": "5" }, "public_key": "", "signature": "" });
         let t: Tx = serde_json::from_value(ok.clone()).unwrap();
         assert_eq!((t.tip, t.memo.as_str()), (0, ""), "tip and memo default");
         let mut extra = ok.clone();
@@ -1929,8 +1951,9 @@ pub(crate) mod tests {
         let mut v2 = good.clone();
         v2[..TX_DOMAIN.len()].copy_from_slice(b"BLOCKULA_TX_V2");
         assert!(err(&v2).contains("v3"));
-        // Field offsets: domain, chain_id, from, nonce, fee, tip, valid_until, then the tag.
-        let tag_at = TX_DOMAIN.len() + 2 + 3 + 2 + 8 + 4 * 8;
+        // Field offsets: domain, chain_id, genesis hash, from, nonce, fee, tip, valid_until, then
+        // the tag.
+        let tag_at = TX_DOMAIN.len() + 2 + 3 + 32 + 2 + 8 + 4 * 8;
         assert_eq!(good[tag_at], 21);
         let mut unknown = good.clone();
         unknown[tag_at] = 50;
@@ -1966,7 +1989,7 @@ pub(crate) mod tests {
     #[test]
     fn check_format_requires_an_exact_wire_round_trip() {
         let keys = crypto::Keys::from_seed([9; 32]);
-        let base = Tx { chain_id: "c".into(), from: keys.address(), nonce: 0, fee: 1, tip: 0, valid_until: 9, action: Action::SubmitClaim { repo: "a/b".into(), pr: 1, familiar_key: None }, memo: String::new(), public_key: String::new(), signature: String::new() }.sign(&keys);
+        let base = Tx { chain_id: "c".into(), genesis_hash: "00".repeat(32), from: keys.address(), nonce: 0, fee: 1, tip: 0, valid_until: 9, action: Action::SubmitClaim { repo: "a/b".into(), pr: 1, familiar_key: None }, memo: String::new(), public_key: String::new(), signature: String::new() }.sign(&keys);
         base.check_format().unwrap();
         // `Some("")` encodes like `None`, so it would change meaning on the wire.
         let empty = Tx { action: Action::SubmitClaim { repo: "a/b".into(), pr: 1, familiar_key: Some(String::new()) }, ..base.clone() }.sign(&keys);
@@ -1979,10 +2002,31 @@ pub(crate) mod tests {
         assert!(huge.check_format().unwrap_err().to_string().contains("too large"));
     }
 
+    /// Audit #7: the genesis hash is signed (right after the chain id), well-formed, and the chain
+    /// a tx names by id and genesis hash is checked.
+    #[test]
+    fn the_chain_instance_is_signed_and_checked() {
+        let keys = crypto::Keys::from_seed([9; 32]);
+        let (here, there) = ("aa".repeat(32), "bb".repeat(32));
+        let tx = Tx { chain_id: "c".into(), genesis_hash: here.clone(), from: keys.address(), nonce: 0, fee: 1, tip: 0, valid_until: 9, action: Action::Transfer { to: "vlad.boo".into(), amount: 1 }, memo: String::new(), public_key: String::new(), signature: String::new() }.sign(&keys);
+        tx.check_format().unwrap();
+        tx.verify_signature().unwrap();
+        assert_eq!(&tx.signing_bytes()[TX_DOMAIN.len() + 3..][..32], &[0xaa; 32]);
+        tx.check_chain("c", &here).unwrap();
+        assert!(tx.check_chain("c", &there).unwrap_err().to_string().contains("another instance of c"));
+        assert!(tx.check_chain("d", &here).unwrap_err().to_string().contains("wrong chain id"));
+        // Re-pointed at another instance, the signature no longer holds.
+        assert!(Tx { genesis_hash: there, ..tx.clone() }.verify_signature().is_err());
+        for bad in [String::new(), "aa".repeat(31), "AA".repeat(32), "zz".repeat(32), "aa".repeat(33)] {
+            let t = Tx { genesis_hash: bad.clone(), ..tx.clone() }.sign(&keys);
+            assert!(t.check_format().unwrap_err().to_string().contains("genesis_hash"), "{bad:?}");
+        }
+    }
+
     #[test]
     fn prefixes_are_checked_against_the_chain() {
         let k = crypto::Keys::from_seed([4; 32]);
-        let tx = |from: String, to: String| Tx { chain_id: "c".into(), from, nonce: 0, fee: 0, tip: 0, valid_until: 0, action: Action::Transfer { to, amount: 1 }, memo: String::new(), public_key: String::new(), signature: String::new() };
+        let tx = |from: String, to: String| Tx { chain_id: "c".into(), genesis_hash: String::new(), from, nonce: 0, fee: 0, tip: 0, valid_until: 0, action: Action::Transfer { to, amount: 1 }, memo: String::new(), public_key: String::new(), signature: String::new() };
         let (main, test) = (k.address(), k.address_with(crypto::TESTNET_HRP));
         tx(main.clone(), "x.boo".into()).check_prefix("boo").unwrap();
         tx(main.clone(), main.clone()).check_prefix("boo").unwrap();
@@ -2085,8 +2129,8 @@ pub(crate) mod tests {
     }
 
     fn arb_tx() -> impl Strategy<Value = Tx> {
-        (arb_str(16), arb_str(16), proptest::array::uniform4(any::<u64>()), arb_action(), arb_str(64), arb_hex(crypto::PUBLIC_KEY_LEN), arb_hex(crypto::SIGNATURE_LEN)).prop_map(
-            |(chain_id, from, [nonce, fee, tip, valid_until], action, memo, public_key, signature)| Tx { chain_id, from, nonce, fee, tip, valid_until, action, memo, public_key, signature },
+        (arb_str(16), arb_hex(32), arb_str(16), proptest::array::uniform4(any::<u64>()), arb_action(), arb_str(64), arb_hex(crypto::PUBLIC_KEY_LEN), arb_hex(crypto::SIGNATURE_LEN)).prop_map(
+            |(chain_id, genesis_hash, from, [nonce, fee, tip, valid_until], action, memo, public_key, signature)| Tx { chain_id, genesis_hash, from, nonce, fee, tip, valid_until, action, memo, public_key, signature },
         )
     }
 

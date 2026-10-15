@@ -344,6 +344,10 @@ fn long_namespaces_are_hashed_to_a_context() {
 // ------------------------------------------------------------------------------------ Rust ⇄ TS
 
 const CROSS_CHAIN: &str = "blockula-kat";
+/// The cross vectors' chain instance (the genesis hash every tx signs after the chain id).
+fn cross_genesis() -> String {
+    hex::encode(crypto::hash(b"blockula-kat genesis"))
+}
 /// Consensus keys of the 4-validator set used for the vote and certificate vectors.
 const VALIDATOR_SEEDS: [[u8; 32]; 4] = [[11; 32], [12; 32], [13; 32], [14; 32]];
 const POP: (&str, &str) = ("203.0.113.7:7071", "https://validator.example:7070");
@@ -388,8 +392,9 @@ fn case(label: &str, seed: [u8; 32], namespace: &[u8], msg: &[u8], sig: &[u8]) -
 /// Everything the node signs, made by the node's own code (`testdata/cross/rust-signed.json`).
 fn rust_signed() -> Value {
     let mut cases = vec![];
-    // Txs (v3): `Tx::sign` signs the signing bytes with an empty context. Each case also records
-    // the wire form (`Tx::to_bytes`) that blocks and gossip carry. One acts from a testnet address.
+    // Txs (v3, bound to a chain instance by its genesis hash): `Tx::sign` signs the signing bytes
+    // with an empty context. Each case also records the wire form (`Tx::to_bytes`) that blocks and
+    // gossip carry. One acts from a testnet address.
     let owner = crypto::Keys::from_seed([7; 32]);
     let testnet_to = crypto::Keys::from_seed([0xff; 32]).address_with(crypto::TESTNET_HRP);
     let actions = [
@@ -398,7 +403,7 @@ fn rust_signed() -> Value {
         ("tx/transfer-tboo", owner.address_with(crypto::TESTNET_HRP), json!({ "type": "transfer", "to": testnet_to, "amount": "42" })),
     ];
     for (label, from, action) in actions {
-        let unsigned = json!({ "chain_id": CROSS_CHAIN, "from": from, "nonce": 7, "fee": "123456", "tip": "250", "valid_until": 4242, "action": action, "memo": "🧛 kat", "public_key": "", "signature": "" });
+        let unsigned = json!({ "chain_id": CROSS_CHAIN, "genesis_hash": cross_genesis(), "from": from, "nonce": 7, "fee": "123456", "tip": "250", "valid_until": 4242, "action": action, "memo": "🧛 kat", "public_key": "", "signature": "" });
         let tx: types::Tx = serde_json::from_value(unsigned).unwrap_or_else(|e| panic!("tx JSON shape changed ({e}): update rust_signed() and regenerate testdata/cross"));
         let tx = tx.sign(&owner);
         let mut c = case(label, [7; 32], b"", &tx.signing_bytes(), &hex::decode(&tx.signature).unwrap());
@@ -436,6 +441,7 @@ fn rust_signed() -> Value {
     json!({
         "generator": "node/src/kat.rs `write_rust_signed` (ml-dsa 0.1.1); see README.md",
         "chain_id": CROSS_CHAIN,
+        "genesis_hash": cross_genesis(),
         "keys": cross_seeds().into_iter().map(key_json).collect::<Vec<_>>(),
         "cases": cases,
     })
