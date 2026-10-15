@@ -23,19 +23,19 @@
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/status` | chain id, height, supply, burned, version, git sha, genesis hash, epoch, sync state (`syncing`, `sync_progress`, verified `finalized_height`, display-only `network_height_claimed`, `history_from`) |
-| GET | `/api/blocks?limit=&before=` | recent blocks |
-| GET | `/api/block/{height\|hash}` | block + txs |
+| GET | `/api/status` | chain id, height, supply, burned, version, git sha, genesis hash, epoch, sync state (`syncing`, `sync_progress`, verified `finalized_height`, display-only `network_height_claimed`), `history_from` (first block this node holds), `pruning` (`{keep_blocks}` on a pruning node, `null` on an archive node) |
+| GET | `/api/blocks?limit=&before=` | recent blocks (from `history_from` on) |
+| GET | `/api/block/{height\|hash}` | block + txs; `410` `pruned` for a height this node no longer holds |
 | GET | `/api/tx/{id}` | tx with `summary`, `status` (`pending`/`finalized`/`failed` + `error`) |
 | POST | `/api/tx` | submit signed tx JSON |
-| GET | `/api/account/{address\|name}` | balance, `next_nonce`, names, recent txs, `github`, `familiars`, hunts created/won, `contribution` (Soul, vouches, jury seat, claims, vesting rewards) |
+| GET | `/api/account/{address\|name}` | balance, `next_nonce`, names, recent txs (sent by it or naming it), `github`, `familiars`, hunts created/won, `contribution` (Soul, vouches, jury seat, claims, vesting rewards) |
 | GET | `/api/name/{name}` | availability + price, or owner |
 | GET | `/api/key/{key_id}` | accounts this key is authorized on |
 | GET | `/api/search/{q}` | `{type, id}` for anything |
 | POST | `/api/faucet` `{to}` | 100 FANG on faucet chains (1 per address/hour, 1 per IP/10 min; unlimited from localhost) |
 | GET | `/api/validators` | epoch, blocks until the next one, active / next-epoch / pending / approved / removed validators, admins, min bond |
 | GET | `/api/genesis` | the chain's genesis.json |
-| GET | `/api/sync?from=&limit=` | finalized consensus blocks + a finalization certificate (served by every node; used by `blockula join`) |
+| GET | `/api/sync?from=&limit=` | finalized consensus blocks + a finalization certificate (served by every node; used by `blockula join`); `410` `pruned` when `from` is below `history_from` |
 | GET | `/api/mempool?limit=` | pending txs |
 | GET | `/api/hunts?status=` | Hunts (bounties on GitHub issues), biggest first; `open`/`awarded`/`cancelled`/`expired` |
 | GET | `/api/hunt/{id}` | one Hunt: repo#issue, bounty, funders, winner + PR, Familiar |
@@ -48,8 +48,11 @@
 | GET | `/api/snapshot/latest` | newest certified state snapshot manifest (chunk hashes, certifying blocks + certificate, validator-set history) |
 | GET | `/api/snapshot/{height}/chunk/{i}` | snapshot chunk bytes |
 | GET | `/api/epochs` | validator-set history + handoff signatures |
+| GET | `/api/proof/{namespace}/{key_hex}` | Merkle proof of one state record (inclusion, or exclusion when absent) against the current state root: `namespace`, `key`, `value` (hex or `null`), `proof`, `root`, `height`, `block_hash`. Namespaces are `state::ns` in `node/src/state/mod.rs` (0 scalars, 1 accounts, 2 names, …); an account's key is its address as hex bytes |
 | GET | `/api/health` | 200 if the head is fresh and synced, else 503 + `reason` |
 | GET | `/metrics` | Prometheus: height, finalized lag, mempool, epoch, validators, faucet, tx counters |
+
+**Pruning.** Validators keep about two days of blocks by default (`--prune-blocks N` sets the window, `--archive` keeps everything); full nodes keep everything. A fast-synced node holds history from its snapshot on. Blocks, txs and account history below `history_from` are gone from that node: `/api/block` and `/api/sync` answer `410` with `{"error": …, "pruned": true}` (ask an archive node), and `/api/tx` answers `404` for a pruned tx. Reads are rate-limited per client IP (`429` with `Retry-After`; loopback is exempt).
 
 ## Working in this repo
 
