@@ -136,7 +136,7 @@ pub fn is_active(state: &State, feature: &str) -> bool {
 /// Schedules protocol `version` from `activation_height` on: at least [`MIN_UPGRADE_LEAD`] blocks
 /// from now, after every scheduled upgrade, and a newer version than all of them.
 pub(crate) fn exec_schedule_upgrade(state: &mut State, j: &mut Journal, version: u32, activation_height: u64, height: u64) -> Result<()> {
-    if activation_height < height.saturating_add(MIN_UPGRADE_LEAD) {
+    if height.checked_add(MIN_UPGRADE_LEAD).is_none_or(|earliest| activation_height < earliest) {
         bail!("an upgrade must activate at least {MIN_UPGRADE_LEAD} blocks after block {height}");
     }
     if version <= version_at(state, activation_height) {
@@ -371,5 +371,62 @@ mod tests {
         check_next(&st, 99).unwrap();
         assert!(check_next(&st, 100).unwrap_err().to_string().contains("upgrade blockula"));
         assert!(check_feature_name("ghost").is_ok() && check_feature_name("Ghost").is_err() && check_feature_name("").is_err());
+    }
+
+    /// An upgrade activates at least `MIN_UPGRADE_LEAD` blocks out: that's what lets a verifier
+    /// within that many blocks of a height know its version for certain.
+    #[test]
+    fn upgrades_need_the_lead_time() {
+        let mut st = State::default();
+        let mut j = Journal::default();
+        let err = exec_schedule_upgrade(&mut st, &mut j, 2, 100 + MIN_UPGRADE_LEAD - 1, 100).unwrap_err().to_string();
+        assert!(err.contains("at least 64 blocks after block 100"), "{err}");
+        exec_schedule_upgrade(&mut st, &mut j, 2, 100 + MIN_UPGRADE_LEAD, 100).unwrap();
+        assert!(exec_schedule_upgrade(&mut st, &mut j, 2, 500, 100).unwrap_err().to_string().contains("isn't newer"));
+        assert!(exec_schedule_upgrade(&mut st, &mut j, 3, u64::MAX, u64::MAX - 1).is_err(), "the lead can't wrap");
+        assert_eq!((version_at(&st, 163), version_at(&st, 164)), (PROTOCOL_VERSION, 2));
+        assert_eq!(next_after(&st, 163).map(|u| u.version), Some(2));
+        assert!(next_after(&st, 164).is_none());
+        check_invariants(&st).unwrap();
+    }
+
+    #[test]
+    fn halts_say_why_with_distinct_exit_codes() {
+        let halts = [
+            Halt::AtHeight { height: 7 },
+            Halt::UpgradeRequired { height: 8, version: 3, supported: 2 },
+            Halt::DoubleSignRisk { reason: "x".into() },
+        ];
+        let codes: Vec<i32> = halts.iter().map(Halt::exit_code).collect();
+        assert_eq!(codes, [EXIT_HALT_HEIGHT, EXIT_UPGRADE_REQUIRED, EXIT_DOUBLE_SIGN_RISK]);
+        assert!(codes.iter().all(|c| ![0, 1, 2].contains(c)), "distinct from success, errors and usage errors");
+        assert_eq!(halts.iter().map(Halt::kind).collect::<Vec<_>>(), ["halt_height", "upgrade_required", "double_sign_risk"]);
+        assert!(halts[1].to_string().contains("block 8 runs protocol v3, but this binary supports up to v2"));
+        // The first reason sticks.
+        let signal = HaltSignal::default();
+        signal.set(halts[0].clone());
+        signal.set(halts[1].clone());
+        assert_eq!(signal.get(), Some(halts[0].clone()));
+        // What a node may vote on, propose or execute.
+        let mut st = State::default();
+        st.upgrade.schedule = vec![ScheduledUpgrade { version: SUPPORTED_PROTOCOL_VERSION + 1, activation_height: 50 }];
+        let mut c = HaltControl { halt_height: Some(30), ..Default::default() };
+        assert!(c.allows(&st, 30) && !c.allows(&st, 31));
+        c.halt_height = None;
+        assert!(c.allows(&st, 49) && !c.allows(&st, 50));
+        c.supported += 1;
+        assert!(c.allows(&st, 50));
+        c.signal.set(halts[2].clone());
+        assert!(!c.allows(&st, 1));
+    }
+
+    #[test]
+    fn readiness_is_each_active_validators_newest_signal() {
+        let active = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let blocks = [(10, "a", 2), (9, "b", 1), (8, "a", 1), (7, "x", 9), (6, "b", 2)];
+        let s = signals(&active, blocks);
+        assert_eq!(s.get("a"), Some(&(2, 10)));
+        assert_eq!(s.get("b"), Some(&(1, 9)), "the newest block counts, not the highest signal");
+        assert!(s.get("c").is_none() && s.get("x").is_none(), "no block yet; not in the set");
     }
 }

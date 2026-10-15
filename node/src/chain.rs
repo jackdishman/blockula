@@ -4108,7 +4108,7 @@ mod scaffold {
         assert!(crate::upgrade::exec_activate_feature(s, &mut j, "warp", h).is_err());
         assert!(crate::upgrade::exec_schedule_upgrade(s, &mut j, 9, h, h).is_err(), "only after now");
         crate::upgrade::exec_schedule_upgrade(s, &mut j, 9, 100, h).unwrap();
-        assert!(crate::upgrade::exec_schedule_upgrade(s, &mut j, 10, 50, h).is_err(), "only after the last one");
+        assert!(crate::upgrade::exec_schedule_upgrade(s, &mut j, 10, 80, h).unwrap_err().to_string().contains("must come after it"), "only after the last one");
         assert_eq!(crate::upgrade::version_at(s, 100), 9);
         s.check_invariants().unwrap();
         // Everything rolls back, dirty marks included.
