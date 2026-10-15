@@ -27,6 +27,7 @@ use commonware_consensus::{
         self,
         config::{ForwardPolicy, SkipBudget, SkipPolicy},
         elector::RoundRobin,
+        scheme::reporter::AttributableReporter,
         types::{Activity, Context as SimplexContext, Finalization},
     },
     types::{Epoch, FixedEpocher, Height, ViewDelta},
@@ -68,6 +69,16 @@ pub const CHANNELS: [u64; 6] = [CH_VOTES, CH_CERTS, CH_RESOLVER, CH_BACKFILL, CH
 pub fn namespace(chain_id: &str) -> Vec<u8> {
     format!("blockula/{chain_id}").into_bytes()
 }
+
+/// The leader elector every epoch's engine runs. The chain charges missed leader slots through
+/// the same one (`staking::leader_index`), so both name the same leaders.
+pub fn elector() -> RoundRobin<Blake3> {
+    RoundRobin::<Blake3>::default()
+}
+
+/// Most unexecuted ancestors `propose` and `verify` replay before building on a block or judging
+/// it: beyond that a proposer proposes an empty block and a verifier abstains.
+pub const MAX_REPLAY: usize = 64;
 
 // ------------------------------------------------------------------------------------ block
 
@@ -300,74 +311,61 @@ where
         let proposer = cctx.leader.address(&self.address_prefix);
 
         // Blocks between what we've executed and the parent are ordered but not yet executed:
-        // collect them so we don't re-propose (or overdraw) their txs.
-        let exec_height = self.chain.lock().height();
-        let mut pending = vec![parent.clone()];
-        if parent.height > exec_height {
-            while pending.last().unwrap().height > exec_height + 1 {
-                if pending.len() > 64 {
-                    // Far behind (still catching up): propose an empty block rather than guess
-                    // (but never at a checkpoint-certifying height, which needs the real root).
-                    if crate::snapshot::certifies(height).is_some() {
-                        return None;
-                    }
-                    let c = self.chain.lock();
-                    return Some(CBlock::new(parent.digest(), height, view, parent_view, timestamp_ms, proposer, c.height(), hex_32(&c.state.root()), vec![]));
+        // replay them exactly (as verifiers will), so we don't re-propose (or overdraw) their txs
+        // and every tx we pick is admittable on the parent's state.
+        let executed = self.chain.lock().height();
+        let Some(pending) = unexecuted(parent.clone(), &mut ancestry, executed).await else {
+            // Far behind (still catching up): propose an empty block rather than guess (but never
+            // at a checkpoint-certifying height, which needs the real root).
+            if crate::snapshot::certifies(height).is_some() {
+                return None;
+            }
+            let c = self.chain.lock();
+            return Some(CBlock::new(parent.digest(), height, view, parent_view, timestamp_ms, proposer, c.height(), hex_32(&c.state.root()), vec![]));
+        };
+        let tip = Tip::of(&self.chain.lock());
+        let (exec_height, exec_root, chain_id) = (tip.height, hex_32(&tip.state.root()), tip.chain_id.clone());
+        let Some(mut state) = replay(tip, &parent, pending.clone()) else {
+            warn!(height, "the parent doesn't extend our finalized chain; not proposing");
+            return None;
+        };
+        let included: std::collections::HashSet<String> = pending.iter().flat_map(|b| b.parse_txs().into_iter().flatten().map(|t| t.id())).collect();
+        let txs = {
+            let c = self.chain.lock();
+            let mut txs = vec![];
+            let mut bytes = 0;
+            // Senders whose earlier tx was left out: their later nonces can't apply.
+            let mut stuck = std::collections::HashSet::new();
+            for tx in crate::chain::proposal_order(&c.mempool) {
+                if txs.len() >= MAX_BLOCK_TXS {
+                    break;
                 }
-                pending.push(ancestry.next().await?);
-            }
-        } else {
-            pending.clear();
-        }
-        // Build on a journal over the live state (rolled back afterwards) — no state clone.
-        let (exec_height, exec_root, txs) = {
-        let mut c = self.chain.lock();
-        if c.height() != exec_height {
-            // We executed more blocks meanwhile; drop the ones now executed.
-            let h = c.height();
-            pending.retain(|b| b.height > h);
-        }
-        let (chain_id, exec_height, exec_root) = (c.genesis.chain_id.clone(), c.height(), hex_32(&c.state.root()));
-        let mut j = crate::chain::Journal::default();
-        let mut included = std::collections::HashSet::new();
-        for b in pending.iter().rev() {
-            for tx in b.parse_txs().into_iter().flatten() {
-                included.insert(tx.id());
-                let _ = c.state.apply_j(&mut j, &tx, &chain_id, &b.proposer, b.height, false);
-            }
-        }
-        let mut txs = vec![];
-        let mut bytes = 0;
-        // Senders whose earlier tx was left out: their later nonces can't apply.
-        let mut stuck = std::collections::HashSet::new();
-        let c = &mut *c; // borrow the mempool and the state separately
-        for tx in crate::chain::proposal_order(&c.mempool) {
-            if txs.len() >= MAX_BLOCK_TXS {
-                break;
-            }
-            if stuck.contains(&tx.from) || included.contains(&tx.id()) {
-                continue;
-            }
-            let raw = tx.to_bytes();
-            if raw.len() > MAX_TX_BYTES || bytes + raw.len() > MAX_BLOCK_BYTES {
-                stuck.insert(tx.from.clone());
-                continue;
-            }
-            // Only propose txs that will succeed; a tx that would just burn its fee waits/expires.
-            let mut tj = crate::chain::Journal::default();
-            match c.state.apply_j(&mut tj, tx, &chain_id, &proposer, height, false) {
-                Ok(crate::chain::Outcome::Applied) => j.absorb_pub(tj),
-                Ok(crate::chain::Outcome::Failed(_)) | Err(_) => {
-                    c.state.rollback(tj);
+                if stuck.contains(&tx.from) || included.contains(&tx.id()) {
+                    continue;
+                }
+                let raw = tx.to_bytes();
+                if raw.len() > MAX_TX_BYTES || bytes + raw.len() > MAX_BLOCK_BYTES {
                     stuck.insert(tx.from.clone());
                     continue;
                 }
+                // Only propose txs that will succeed; a tx that would just burn its fee waits/expires.
+                let mut tj = crate::chain::Journal::default();
+                match state.apply_j(&mut tj, tx, &chain_id, &proposer, height, false) {
+                    Ok(crate::chain::Outcome::Applied) => {}
+                    Ok(crate::chain::Outcome::Failed(_)) | Err(_) => {
+                        state.rollback(tj);
+                        stuck.insert(tx.from.clone());
+                        continue;
+                    }
+                }
+                bytes += raw.len();
+                txs.push(raw);
             }
-            bytes += raw.len();
-            txs.push(raw);
-        }
-        c.state.rollback(j);
-        (exec_height, exec_root, txs)
+            #[cfg(test)]
+            if c.junk_proposals {
+                txs.push(junk_tx(&chain_id, &self.address_prefix, height).to_bytes());
+            }
+            txs
         };
         // Checkpoint rule: the block at C + CHECKPOINT_DELAY must commit to state_root(C).
         let (exec_height, exec_root) = match crate::snapshot::certifies(height) {
@@ -419,28 +417,29 @@ where
         if checkpoint.is_some_and(|cp| block.exec_height != cp) {
             return reject("checkpoint-certifying block must carry the checkpoint's exec_height");
         }
-        let (chain_id, max_validity) = {
+        let chain_id = {
             let c = self.chain.lock();
             // Our executed height only grows, so this stays true once it is.
             if block.exec_height + MAX_EXEC_LAG < c.height().min(parent.height) {
                 return reject("exec_height too far behind");
             }
-            (c.genesis.chain_id.clone(), c.state.chain_params.max_tx_validity_blocks)
+            c.genesis.chain_id.clone()
         };
-        // Tx checks (signatures included) run without holding the chain lock.
+        // Tx checks (signatures included) run without holding the chain lock. The validity
+        // window's upper bound is a governance parameter, so the replay below checks it on the
+        // parent's state; expiry doesn't depend on any state.
         let mut seen = std::collections::HashSet::new();
-        let mut ids = vec![];
+        let mut txs = Vec::with_capacity(block.txs.len());
         for raw in &block.txs {
             let Ok(tx) = Tx::from_bytes(raw) else { return reject("unparseable or non-canonical tx") };
-            let id = tx.id();
-            if !seen.insert(id.clone()) {
+            if !seen.insert(tx.id()) {
                 return reject("duplicate tx");
             }
-            if let Err(e) = check_tx_stateless(&tx, &chain_id, &self.address_prefix).and_then(|_| crate::chain::check_validity(&tx, block.height, max_validity)) {
+            if let Err(e) = check_tx_stateless(&tx, &chain_id, &self.address_prefix).and_then(|_| crate::chain::check_validity(&tx, block.height, u64::MAX)) {
                 warn!(error = %e, "bad tx in block");
                 return reject("invalid tx");
             }
-            ids.push(id);
+            txs.push(tx);
         }
         // The cited state root, once we've executed that height ourselves (until then the
         // verdict can still change, so we wait).
@@ -450,12 +449,112 @@ where
             // Below our history (we fast-synced past it): we can't check it, so we abstain.
             None => return futures::future::pending().await,
         }
-        let c = self.chain.lock();
-        if ids.iter().any(|id| c.has_tx(id)) {
-            return reject("replays an already-finalized tx");
+        let executed = {
+            let c = self.chain.lock();
+            if let Some(known) = finalized_verdict(&c, &block) {
+                return known || reject("conflicts with a finalized block");
+            }
+            if seen.iter().any(|id| c.has_tx(id)) {
+                return reject("replays an already-finalized tx");
+            }
+            c.height()
+        };
+        // CV-5: replay the unexecuted ancestors exactly, then every tx must be admittable on the
+        // parent's state. Every honest verifier replays the same blocks from the same executed
+        // state, so they agree; beyond `MAX_REPLAY` ancestors we abstain.
+        let Some(pending) = unexecuted(parent.clone(), &mut ancestry, executed).await else { return futures::future::pending().await };
+        let tip = {
+            let c = self.chain.lock();
+            if let Some(known) = finalized_verdict(&c, &block) {
+                return known || reject("conflicts with a finalized block");
+            }
+            Tip::of(&c)
+        };
+        let Some(mut state) = replay(tip, &parent, pending) else { return reject("builds on a block that conflicts with the finalized chain") };
+        for tx in &txs {
+            if let Err(e) = state.apply(tx, &chain_id, &block.proposer, block.height) {
+                warn!(error = %e, tx = %tx.id(), "unadmittable tx in block");
+                return reject("carries a tx that can't be admitted");
+            }
         }
         true
     }
+}
+
+/// When we've executed `block`'s height already (we're late to vote): `Some(true)` if it's the
+/// block we executed, `Some(false)` if it conflicts with it, `None` if we haven't (or can't tell,
+/// pruned: then the caller's later checks abstain or decide).
+fn finalized_verdict(c: &Chain, block: &CBlock) -> Option<bool> {
+    if c.height() < block.height {
+        return None;
+    }
+    c.hash_at(block.height).map(|h| h == hex::encode(block.digest.0))
+}
+
+/// Our executed tip: height, hash and a copy of the state (O(1): its maps share structure).
+struct Tip {
+    height: u64,
+    hash: String,
+    state: crate::chain::State,
+    chain_id: String,
+}
+
+impl Tip {
+    fn of(c: &Chain) -> Self {
+        Self { height: c.height(), hash: c.last_hash().to_string(), state: c.state.clone(), chain_id: c.genesis.chain_id.clone() }
+    }
+}
+
+/// `parent` and its ancestors above `executed` (newest first): `None` if there are more than
+/// [`MAX_REPLAY`] of them, or the stream ends first.
+async fn unexecuted(parent: Arc<CBlock>, ancestry: &mut (impl Ancestry<CBlock> + Unpin), executed: u64) -> Option<Vec<Arc<CBlock>>> {
+    let mut pending = vec![];
+    let mut b = parent;
+    while b.height > executed {
+        if pending.len() >= MAX_REPLAY {
+            return None;
+        }
+        let h = b.height;
+        pending.push(b);
+        if h == executed + 1 {
+            break;
+        }
+        b = ancestry.next().await?;
+    }
+    Some(pending)
+}
+
+/// The state after `parent`: `tip`'s state with the unexecuted ancestors `pending` (newest first,
+/// from [`unexecuted`]) run through exactly the execute path (txs, then end-of-block and
+/// end-of-epoch steps: `State::run_block`), on a copy. `None` if they don't extend our executed
+/// chain (a fork that can never be finalized on top of it).
+fn replay(tip: Tip, parent: &CBlock, mut pending: Vec<Arc<CBlock>>) -> Option<crate::chain::State> {
+    // Blocks we executed since the ancestry was collected.
+    pending.retain(|b| b.height > tip.height);
+    let (below, link) = match pending.last() {
+        Some(oldest) => (oldest.height - 1, oldest.parent),
+        None => (parent.height, parent.digest),
+    };
+    if below != tip.height || hex::encode(link.0) != tip.hash {
+        return None;
+    }
+    let mut state = tip.state;
+    for b in pending.iter().rev() {
+        let txs: Vec<Tx> = b.parse_txs().into_iter().flatten().collect();
+        state.run_block(&tip.chain_id, b.height, &hex::encode(b.digest.0), &b.proposer, b.view, b.parent_view, &txs, |_, _| {});
+    }
+    Some(state)
+}
+
+/// Tests: a junk tx for a Byzantine proposer to stuff its blocks with: well-formed, signed and
+/// fee-paying on paper (stateless checks pass), from an account that holds nothing, so it can
+/// never be admitted.
+#[cfg(test)]
+pub fn junk_tx(chain_id: &str, prefix: &str, height: u64) -> Tx {
+    let k = crate::crypto::Keys::from_seed([0xee; 32]);
+    let mut tx = Tx { chain_id: chain_id.into(), from: k.address_with(prefix), nonce: 0, fee: 0, tip: 0, valid_until: height + 10, action: crate::types::Action::Transfer { to: k.address_with(prefix), amount: 1 }, memo: format!("junk {height}"), public_key: hex::encode(k.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+    tx.fee = tx.charge().unwrap();
+    tx.sign(&k)
 }
 
 /// Waits until we've executed `height` and returns its state root: `None` if we gave up after
@@ -497,6 +596,52 @@ impl Reporter for CertCapture {
             certs.insert(f.proposal.payload, f.encode().to_vec());
         }
         commonware_actor::Feedback::Ok
+    }
+}
+
+/// Whether an activity is fault evidence: two conflicting signed votes from one validator.
+pub fn is_fault(a: &Activity<MlDsaScheme, Digest>) -> bool {
+    matches!(a, Activity::ConflictingNotarize(_) | Activity::ConflictingFinalize(_) | Activity::NullifyFinalize(_))
+}
+
+/// Passes only fault evidence on (in front of `AttributableReporter`, which would otherwise
+/// verify every vote a second time).
+#[derive(Clone)]
+pub struct Faults<R>(pub R);
+
+impl<R: Reporter<Activity = Activity<MlDsaScheme, Digest>>> Reporter for Faults<R> {
+    type Activity = Activity<MlDsaScheme, Digest>;
+    fn report(&mut self, activity: Self::Activity) -> commonware_actor::Feedback {
+        if is_fault(&activity) { self.0.report(activity) } else { commonware_actor::Feedback::Ok }
+    }
+}
+
+/// Where verified fault evidence goes: encoded `Activity` bytes, the `evidence` of a
+/// `ReportEquivocation` tx, for the node's evidence task (`node::report_evidence`). Simplex
+/// doesn't persist the votes it compared, so that task keeps them until the chain has acted.
+#[derive(Clone)]
+pub struct EvidenceSink {
+    pub found: futures::channel::mpsc::UnboundedSender<Vec<u8>>,
+}
+
+impl Reporter for EvidenceSink {
+    type Activity = Activity<MlDsaScheme, Digest>;
+    fn report(&mut self, activity: Self::Activity) -> commonware_actor::Feedback {
+        if is_fault(&activity) {
+            warn!(epoch = ?activity_epoch(&activity), "a validator signed conflicting votes; reporting it");
+            let _ = self.found.unbounded_send(activity.encode().to_vec());
+        }
+        commonware_actor::Feedback::Ok
+    }
+}
+
+fn activity_epoch(a: &Activity<MlDsaScheme, Digest>) -> Option<u64> {
+    use commonware_consensus::Epochable as _;
+    match a {
+        Activity::ConflictingNotarize(c) => Some(c.epoch().get()),
+        Activity::ConflictingFinalize(c) => Some(c.epoch().get()),
+        Activity::NullifyFinalize(c) => Some(c.epoch().get()),
+        _ => None,
     }
 }
 
@@ -590,13 +735,12 @@ impl EpochProvider {
         keys_of(c.state.active_set(epoch)?.iter().map(|v| v.consensus_key.as_str()))
     }
 
-    /// Approved (and active) validators: allowed to connect as secondary peers, so an approved
-    /// validator that didn't fit under the cap can still sync. Pending registrations can't
-    /// connect (anyone can register, so they'd let strangers in).
-    pub fn candidates(&self) -> Set<PublicKey> {
-        use crate::chain::ValidatorStatus::{Active, Approved};
+    /// Secondary peers besides `epoch`'s set: the eligible candidates most likely to join next
+    /// (bonded, so not strangers), at most `limit` of them, so they sync before they vote. The
+    /// p2p layer panics on a peer set over its cap, so the list is capped here.
+    pub fn candidates(&self, epoch: u64, limit: usize) -> Set<PublicKey> {
         let c = self.chain.lock();
-        let keys: Vec<PublicKey> = c.state.validators.values().filter(|v| matches!(v.status, Approved | Active)).filter_map(|v| PublicKey::from_bytes(&hex::decode(&v.consensus_key).ok()?)).collect();
+        let keys: Vec<PublicKey> = crate::staking::likely_candidates(&c.state, epoch, limit).iter().filter_map(|a| c.state.validators.get(a)).filter_map(|v| PublicKey::from_bytes(&hex::decode(&v.consensus_key).ok()?)).collect();
         Set::from_iter_dedup(keys)
     }
 
@@ -745,6 +889,13 @@ where
         let _ = marshal_tx.send(marshal.clone());
 
         let certs = CertCapture::default();
+        // Equivocation evidence the engines verify goes to the evidence task, which submits it.
+        let (found_tx, found_rx) = futures::channel::mpsc::unbounded::<Vec<u8>>();
+        let evidence = EvidenceSink { found: found_tx };
+        context.child("evidence").spawn({
+            let chain = chain.clone();
+            move |ctx| crate::node::report_evidence(ctx, chain, found_rx)
+        });
         let (epoch_tx, mut epoch_rx) = futures::channel::mpsc::unbounded::<u64>();
         let executor = Executor { chain: chain.clone(), certs: certs.clone(), epochs: epoch_tx, marshal: Some(marshal.clone()) };
         marshal_actor.start(executor, buffer, resolver);
@@ -818,7 +969,7 @@ where
             };
             if tracked.is_none_or(|t| t < epoch) {
                 let primary = scheme.participants().clone();
-                let secondary = provider.candidates();
+                let secondary = provider.candidates(epoch, MAX_PEERS_PER_SET.saturating_sub(primary.len()));
                 let mut m = peers.clone();
                 let _ = m.track(epoch, TrackedPeers::new(primary, secondary));
                 tracked = Some(epoch);
@@ -835,11 +986,13 @@ where
                 context.child("simplex").with_attribute("epoch", epoch),
                 simplex::config::Config {
                     scheme: scheme.as_ref().clone(),
-                    elector: RoundRobin::<Blake3>::default(),
+                    elector: elector(),
                     blocker: blocker.clone(),
                     automaton: app.clone(),
                     relay: app.clone(),
-                    reporter: Reporters::from((marshal.clone(), certs.clone())),
+                    // Faults go through `AttributableReporter` (both votes verified) to the
+                    // evidence task; the filter in front keeps it from re-verifying every vote.
+                    reporter: Reporters::from((marshal.clone(), Reporters::from((certs.clone(), Faults(AttributableReporter::new(crate::staking::NoRng, scheme.as_ref().clone(), evidence.clone(), Sequential, true)))))),
                     strategy: Sequential,
                     partition: format!("{prefix}-simplex-{epoch}"),
                     mailbox_size: NZUsize!(1024),
@@ -855,7 +1008,9 @@ where
                     view_retention: ViewDelta::new(10),
                     skip: SkipPolicy::Enabled { timeout: bt * 10 + Duration::from_secs(10), budget: SkipBudget::Participants },
                     forward: ForwardPolicy::Disabled,
-                    track_historical_votes: false,
+                    // Keep full votes until their round is pruned, so a conflicting vote that
+                    // arrives after the certificate still yields evidence (CV-3).
+                    track_historical_votes: true,
                 },
             );
             let (Ok(v), Ok(c), Ok(r)) = (votes.register(epoch).await, certs_mux.register(epoch).await, resolver_mux.register(epoch).await) else {

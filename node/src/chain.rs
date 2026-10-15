@@ -183,8 +183,15 @@ fn default_address_prefix() -> String {
     crypto::ADDRESS_HRP.into()
 }
 
-/// How many past epochs' validator sets the state keeps (for verifying recent certificates).
-pub const EPOCH_SETS_KEPT: u64 = 8;
+/// Fewest past epochs' validator sets the state keeps (for verifying recent certificates).
+pub const MIN_EPOCH_SETS_KEPT: u64 = 8;
+
+/// Validator sets the state keeps: the evidence window's (equivocation evidence is checked
+/// against its epoch's set, `evidence_max_age_epochs` back) plus the next epoch's, and at least
+/// [`MIN_EPOCH_SETS_KEPT`].
+pub fn epoch_sets_kept(c: &ChainParams) -> u64 {
+    c.evidence_max_age_epochs.saturating_add(2).max(MIN_EPOCH_SETS_KEPT)
+}
 
 /// Genesis constants the state machine needs while applying txs (a state record, so the root
 /// commits to them). What governance can change is in `State::chain_params` instead.
@@ -220,43 +227,41 @@ impl Params {
     }
 }
 
+/// Where a validator stands (staking.rs). Its stake lives in its pool; jailing is a pool flag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ValidatorStatus {
-    /// Registered and bonded, waiting for an admin.
-    Pending,
-    /// Approved; joins the set at the next epoch boundary (if there's room).
-    Approved,
+    /// Registered, with a pool: selected at an epoch boundary if eligible and its stake ranks.
+    Candidate,
+    /// In the latest active set.
     Active,
-    /// Removed by an admin; leaves at the next boundary, bond claimable later.
+    /// Removed by an admin (dev and test chains): leaves at the next boundary, never selected
+    /// again. Its delegators undelegate as usual.
     Removed,
-    /// Bond returned.
-    Unbonded,
+    /// Double-signed: slashed, leaves at the next boundary, never selected again.
+    Tombstoned,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct ValidatorRecord {
     /// `boo1…` address of the consensus key (the validator's id).
     pub address: String,
-    /// Account that registered (and owns the bond).
+    /// Account that registered it (and owns its pool's self-bond and commission).
     pub owner: String,
     pub consensus_key: String,
     pub p2p_addr: String,
     pub http_addr: String,
-    #[serde(with = "u64_str")]
-    pub bond: u64,
     pub status: ValidatorStatus,
     pub registered_at: u64,
+    /// Dev and test chains: an admin pinned it (`ApproveValidator`), ranking it ahead of stake.
     pub approved_at: Option<u64>,
     pub approved_by: Option<String>,
-    /// First epoch it is (or was) in the active set.
+    /// First epoch of its latest stint in the active set.
     pub active_from: Option<u64>,
     pub removed_at: Option<u64>,
     pub removed_by: Option<String>,
     /// Last epoch in the active set (set when it leaves).
     pub active_until: Option<u64>,
-    /// Bond can be reclaimed from this epoch on.
-    pub unbond_epoch: Option<u64>,
     /// The owner's cut of its pool's rewards (genesis operators set it; `UpdateValidator` changes it).
     #[serde(default)]
     pub commission_bps: u64,
@@ -303,22 +308,22 @@ impl Genesis {
                     consensus_key: v.public_key.clone(),
                     p2p_addr: v.p2p_addr.clone(),
                     http_addr: v.http_addr.clone(),
-                    bond: 0,
                     status: ValidatorStatus::Active,
                     registered_at: 0,
-                    approved_at: Some(0),
+                    approved_at: None,
                     approved_by: None,
                     active_from: Some(0),
                     removed_at: None,
                     removed_by: None,
                     active_until: None,
-                    unbond_epoch: None,
                     commission_bps: 0,
                 },
             );
         }
         // Operators own their validators: the self-bond moves from the owner's balance into the
-        // validator's bond (an escrow), which is what its stake pool starts from (staking.rs).
+        // validator's stake pool as the owner's shares (staking.rs). A validator without an
+        // operator (`check` refuses one) would get an empty pool.
+        let mut bonds: BTreeMap<String, u64> = BTreeMap::new();
         for o in &self.operators {
             let Some(address) = hex::decode(&o.consensus_key).ok().map(|pk| crypto::address_with_prefix(&prefix, &pk)) else { continue };
             if !state.validators.contains_key(&address) {
@@ -330,10 +335,15 @@ impl Genesis {
             }
             let v = state.validators.get_mut(&address).expect("checked above");
             v.owner = o.owner.clone();
-            v.bond = bond;
             v.commission_bps = o.commission_bps;
+            bonds.insert(address, bond);
         }
-        state.active_sets.insert(0, self.validators.iter().map(|v| v.address.clone()).collect());
+        for v in &self.validators {
+            crate::staking::genesis_pool(&mut state, &v.address, bonds.get(&v.address).copied().unwrap_or(0));
+        }
+        let mut set: Vec<String> = self.validators.iter().map(|v| v.address.clone()).collect();
+        set.sort();
+        state.active_sets.insert(0, set);
         for n in &self.reserved_names {
             if let Ok(n) = normalize_name(n) {
                 state.econ.reserved_names.insert(n, crate::econ::ReservedName { reserved_at: 0 });
@@ -366,10 +376,9 @@ impl Genesis {
     }
 
     /// Everything a genesis must satisfy (`load` runs it): its addresses use its prefix; the
-    /// parameters, allocations and vesting schedules are in bounds; operators match validators,
-    /// prove possession of their keys and can fund their self-bonds; reserved names, the Soul
-    /// ledger and features are well-formed; and mainnet has no admins, no faucet, and an operator
-    /// for every validator.
+    /// parameters, allocations and vesting schedules are in bounds; every validator has an
+    /// operator, which proves possession of its key and can fund its self-bond; reserved names,
+    /// the Soul ledger and features are well-formed; and mainnet has no admins and no faucet.
     pub fn check(&self) -> Result<()> {
         use std::collections::BTreeSet;
         self.check_prefix()?;
@@ -448,10 +457,14 @@ impl Genesis {
             ensure!(crate::upgrade::KNOWN_FEATURES.contains(&f.as_str()), "unknown feature {f} (known: {})", crate::upgrade::KNOWN_FEATURES.join(", "));
             ensure!(features.insert(f), "feature {f} is listed twice");
         }
+        // Every validator stakes (3.4): one without a self-bond would be ineligible from the first
+        // boundary, and the set would hand over to whoever registered first.
+        if let Some(v) = self.validators.iter().find(|v| !keys.contains(v.public_key.as_str())) {
+            bail!("validator {} needs an operator (owner, self-bond, commission): every validator stakes", v.address);
+        }
         if self.chain_id == MAINNET_CHAIN_ID {
             ensure!(self.validator_admins.is_empty(), "{MAINNET_CHAIN_ID} has no admin keys: validator_admins must be empty");
             ensure!(!self.faucet, "{MAINNET_CHAIN_ID} has no faucet");
-            ensure!(self.validators.iter().all(|v| keys.contains(v.public_key.as_str())), "every {MAINNET_CHAIN_ID} validator needs an operator (owner, self-bond, commission)");
         }
         Ok(())
     }
@@ -543,6 +556,7 @@ pub struct Journal {
 }
 
 impl Journal {
+    #[allow(dead_code)] // the modules' nested journals
     pub fn absorb_pub(&mut self, other: Journal) {
         self.absorb(other)
     }
@@ -798,33 +812,17 @@ impl State {
         self.active_sets.get(&epoch).map(|s| s.iter().filter_map(|a| self.validators.get(a)).collect())
     }
 
-    /// The set epoch `epoch + 1` would get if the boundary were now: current members that
-    /// weren't removed, then approved validators in approval order, capped. Never empty.
-    pub fn next_set(&self, epoch: u64) -> Vec<String> {
-        let current = self.active_sets.get(&epoch).cloned().unwrap_or_default();
-        let mut next: Vec<String> = current.iter().filter(|a| self.validators.get(*a).is_some_and(|v| v.status == ValidatorStatus::Active)).cloned().collect();
-        let mut approved: Vec<&ValidatorRecord> = self.validators.values().filter(|v| v.status == ValidatorStatus::Approved).collect();
-        approved.sort_by_key(|v| (v.approved_at, v.address.clone()));
-        for v in approved {
-            if next.len() as u64 >= self.chain_params.max_validators.max(1) {
-                break;
-            }
-            next.push(v.address.clone());
-        }
-        if next.is_empty() { current } else { next }
-    }
-
-    /// The end-of-block steps, after a block's txs. Execution and replay both run exactly this,
-    /// in this order (the modules' hooks are no-ops until their packages land):
+    /// The end-of-block steps, after a block's txs. Execution, replay and verification's replay
+    /// of unexecuted ancestors all run exactly this, in this order:
     ///
     /// 1. `poc_end_block`: the PoC seed, Séances closing and opening.
     /// 2. `econ::end_block`: the base fee for a later block (3.6).
-    /// 3. `staking::end_block`: missed leader slots from `view`/`parent_view` (downtime), and the
-    ///    proposer's charge for the `skipped` txs (junk, 3.4).
+    /// 3. `staking::end_block`: the proposer's charge for the `skipped` txs (junk, CV-5), and
+    ///    missed leader slots from `view`/`parent_view` (downtime, jailing).
     /// 4. `governance::end_block`: proposals whose voting ended or whose timelock is over.
     /// 5. At an epoch boundary: `econ::issue` (rewards into the pools), `staking::end_epoch`
-    ///    (jailing, the next set by stake), `beacon::end_epoch`, then [`State::end_epoch`] (the
-    ///    set history and the legacy admin-approved set).
+    ///    (the next set by stake, churn-limited), `beacon::end_epoch`, then [`State::end_epoch`]
+    ///    (how much set history to keep).
     ///
     /// Then the caller commits the block and, last, runs `upgrade::check_next(height + 1)`, which
     /// stops the node before a height its binary can't execute (3.9).
@@ -842,32 +840,30 @@ impl State {
         }
     }
 
-    /// Runs after the last block of `epoch`: fixes the set for `epoch + 1`.
-    pub fn end_epoch(&mut self, epoch: u64) {
-        let next = self.next_set(epoch);
-        let current = self.active_sets.get(&epoch).cloned().unwrap_or_default();
-        for a in &next {
-            let v = self.validators.get_mut(a).expect("set member exists");
-            if v.status == ValidatorStatus::Approved {
-                v.status = ValidatorStatus::Active;
-                v.active_from = Some(epoch + 1);
-            }
-        }
-        for a in &current {
-            if !next.contains(a) {
-                if let Some(v) = self.validators.get_mut(a) {
-                    v.active_until = Some(epoch);
-                    if v.status == ValidatorStatus::Removed {
-                        v.unbond_epoch = Some(epoch + 2);
-                    }
-                }
-            }
-        }
-        self.active_sets.insert(epoch + 1, next);
-        while self.active_sets.len() as u64 > EPOCH_SETS_KEPT {
+    /// Runs after the last block of `epoch`, once `staking::end_epoch` has fixed the set for
+    /// `epoch + 1`: keeps the set history the evidence window needs ([`epoch_sets_kept`]).
+    pub fn end_epoch(&mut self, _epoch: u64) {
+        let keep = epoch_sets_kept(&self.chain_params);
+        while self.active_sets.len() as u64 > keep {
             let first = *self.active_sets.keys().next().unwrap();
             self.active_sets.remove(&first);
         }
+    }
+
+    /// Runs a block's txs, then its end-of-block steps: what execution and verification's replay
+    /// of unexecuted ancestors share, so both reach the same state. `each` gets every tx's result
+    /// (`Err`: not admittable, so skipped; the proposer pays for it at the end of the block).
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_block<'t>(&mut self, chain_id: &str, height: u64, hash: &str, proposer: &str, view: u64, parent_view: u64, txs: impl IntoIterator<Item = &'t Tx>, mut each: impl FnMut(&'t Tx, Result<Outcome>)) {
+        let mut skipped = vec![];
+        for tx in txs {
+            let r = self.apply(tx, chain_id, proposer, height);
+            if r.is_err() {
+                skipped.push(tx.size());
+            }
+            each(tx, r);
+        }
+        self.end_block(&BlockInfo { height, hash, proposer, view, parent_view, skipped: &skipped });
     }
 
     pub fn resolve(&self, to: &str) -> Result<String> {
@@ -906,9 +902,14 @@ impl State {
         self.accounts.entry(addr.to_string()).or_default()
     }
 
-    fn validator_mut(&mut self, j: &mut Journal, addr: &str) -> Option<&mut ValidatorRecord> {
+    pub(crate) fn validator_mut(&mut self, j: &mut Journal, addr: &str) -> Option<&mut ValidatorRecord> {
         j.validators.touch(&self.validators, addr);
         self.validators.get_mut(addr)
+    }
+
+    pub(crate) fn insert_validator(&mut self, j: &mut Journal, rec: ValidatorRecord) {
+        j.validators.touch(&self.validators, &rec.address);
+        self.validators.insert(rec.address.clone(), rec);
     }
 
     pub(crate) fn j_debit(&mut self, j: &mut Journal, addr: &str, amount: u64) -> Result<()> {
@@ -1020,7 +1021,11 @@ impl State {
         let sender = tx.sender()?;
         let signer = tx.signer_key_id()?;
         let keys = self.keys_of(&sender);
-        let key = keys.get(&signer).cloned().ok_or_else(|| anyhow!("this key isn't authorized on {}", short(&sender)))?;
+        let key = match keys.get(&signer) {
+            Some(k) => k.clone(),
+            // SF-13: a validator's consensus key may sign its system txs for its owner, who pays.
+            None => crate::staking::system_tx_key(self, tx, &sender, &signer).ok_or_else(|| anyhow!("this key isn't authorized on {}", short(&sender)))?,
+        };
         let charge = check_fee(tx)?;
         let acct = self.account(&sender);
         if tx.nonce != acct.nonce {
@@ -1174,89 +1179,12 @@ impl State {
                     }
                 }
             }
-            Action::RegisterValidator { consensus_key, p2p_addr, http_addr, bond, pop } => {
-                if key.role != KeyRole::Owner {
-                    bail!("only owner keys can register validators");
-                }
-                if !crypto::is_lower_hex(consensus_key) {
-                    bail!("consensus_key must be lowercase hex");
-                }
-                let pk = hex::decode(consensus_key).map_err(|_| anyhow!("consensus_key must be hex"))?;
-                if pk.len() != crypto::PUBLIC_KEY_LEN {
-                    bail!("consensus_key must be an ML-DSA-65 public key ({} bytes)", crypto::PUBLIC_KEY_LEN);
-                }
-                check_host_port(p2p_addr).context("p2p_addr")?;
-                check_http_addr(http_addr).context("http_addr")?;
-                if *bond < self.chain_params.min_self_bond {
-                    bail!("bond must be at least {}", fmt_fang(self.chain_params.min_self_bond));
-                }
-                let address = crypto::address_with_prefix(self.params.prefix(), &pk);
-                if let Some(v) = self.validators.get(&address) {
-                    if v.status != ValidatorStatus::Unbonded {
-                        bail!("that consensus key is already registered");
-                    }
-                }
-                verify_pop(&tx.chain_id, &sender, consensus_key, p2p_addr, http_addr, pop)?;
-                self.j_debit(j, &sender, *bond)?;
-                self.validator_mut(j, &address);
-                self.validators.insert(
-                    address.clone(),
-                    ValidatorRecord { address, owner: sender.clone(), consensus_key: consensus_key.clone(), p2p_addr: p2p_addr.clone(), http_addr: http_addr.clone(), bond: *bond, status: ValidatorStatus::Pending, registered_at: height, approved_at: None, approved_by: None, active_from: None, removed_at: None, removed_by: None, active_until: None, unbond_epoch: None, commission_bps: 0 },
-                );
-            }
-            Action::ApproveValidator { validator } => {
-                if !self.params.admins.contains(&sender) {
-                    bail!("only validator admins can approve validators");
-                }
-                let v = self.validator_mut(j, validator).ok_or_else(|| anyhow!("no such validator"))?;
-                if v.status != ValidatorStatus::Pending {
-                    bail!("validator is {:?}, not pending", v.status);
-                }
-                v.status = ValidatorStatus::Approved;
-                v.approved_at = Some(height);
-                v.approved_by = Some(sender.clone());
-            }
-            Action::RemoveValidator { validator } => {
-                if !self.params.admins.contains(&sender) {
-                    bail!("only validator admins can remove validators");
-                }
-                let epoch = self.params.epoch_of(height);
-                let v = self.validator_mut(j, validator).ok_or_else(|| anyhow!("no such validator"))?;
-                if !matches!(v.status, ValidatorStatus::Pending | ValidatorStatus::Approved | ValidatorStatus::Active) {
-                    bail!("validator is already {:?}", v.status);
-                }
-                let was_active = v.status == ValidatorStatus::Active;
-                v.status = ValidatorStatus::Removed;
-                v.removed_at = Some(height);
-                v.removed_by = Some(sender.clone());
-                if !was_active {
-                    v.unbond_epoch = Some(epoch + 1);
-                }
-                // Never let the set empty out.
-                if !self.validators.values().any(|v| matches!(v.status, ValidatorStatus::Active | ValidatorStatus::Approved)) {
-                    bail!("can't remove the last validator");
-                }
-            }
-            Action::Unbond { validator } => {
-                let epoch = self.params.epoch_of(height);
-                let v = self.validators.get(validator).ok_or_else(|| anyhow!("no such validator"))?;
-                if v.owner != sender {
-                    bail!("only the account that registered this validator can unbond it");
-                }
-                if v.status != ValidatorStatus::Removed {
-                    bail!("only removed validators can unbond");
-                }
-                match v.unbond_epoch {
-                    Some(e) if epoch >= e => {}
-                    Some(e) => bail!("bond unlocks at epoch {e} (now {epoch})"),
-                    None => bail!("validator hasn't left the active set yet"),
-                }
-                let v = self.validator_mut(j, validator).unwrap();
-                let bond = v.bond;
-                v.bond = 0;
-                v.status = ValidatorStatus::Unbonded;
-                self.j_credit(j, &sender, bond);
-            }
+            // Validators (staking.rs): registration is permissionless; admins' approve and remove
+            // survive only as dev and test overrides.
+            Action::RegisterValidator { .. } => crate::staking::register(self, j, tx, &sender, key, height)?,
+            Action::ApproveValidator { validator } => crate::staking::approve(self, j, &sender, validator, height)?,
+            Action::RemoveValidator { validator } => crate::staking::remove(self, j, &sender, validator, height)?,
+            Action::Unbond { .. } => bail!("Unbond is gone: a validator's bond is its owner's stake in its pool. Undelegate it, then WithdrawUnbonded once the unbonding period is over"),
             Action::LinkGithub { handle, gist_id } => {
                 if key.role != KeyRole::Owner {
                     bail!("only owner keys can link GitHub");
@@ -1486,14 +1414,14 @@ impl State {
             Action::RemoveKey { key_id } => format!("{from} revoked key {}…", &key_id[..key_id.len().min(10)]),
             Action::RegisterValidator { consensus_key, bond, .. } => {
                 let v = hex::decode(consensus_key).map(|pk| short(&crypto::address_with_prefix(self.params.prefix(), &pk))).unwrap_or_default();
-                format!("{from} bonded {} to run validator {v} (pending admin approval)", fmt_fang(*bond))
+                format!("{from} bonded {} to run validator {v}, a candidate for the active set from the next epoch", fmt_fang(*bond))
             }
             Action::ApproveValidator { validator } => {
                 let when = match self.validators.get(validator).and_then(|v| v.active_from) {
                     Some(e) => format!("active from epoch {e}"),
                     None => match height {
-                        Some(h) => format!("joins at epoch {} if there's room", self.params.epoch_of(h) + 1),
-                        None => "joins at the next epoch".into(),
+                        Some(h) => format!("ranked ahead of stake from epoch {}", self.params.epoch_of(h) + 1),
+                        None => "ranked ahead of stake from the next epoch".into(),
                     },
                 };
                 format!("{from} approved validator {}, {when}", who(validator))
@@ -1505,10 +1433,7 @@ impl State {
                 };
                 format!("{from} removed validator {}, {when}", who(validator))
             }
-            Action::Unbond { validator } => {
-                let amount = self.validators.get(validator).map(|_| String::new()).unwrap_or_default();
-                format!("{from} reclaimed the bond of validator {}{amount}", who(validator))
-            }
+            Action::Unbond { validator } => format!("{from} tried to reclaim validator {}'s bond the old way (stake now leaves by undelegating)", who(validator)),
             Action::LinkGithub { handle, .. } => format!("{from} linked GitHub @{handle}"),
             Action::UnlinkGithub { handle } => format!("{from} unlinked GitHub @{handle}"),
             Action::CreateHunt { repo, issue, amount, title, .. } => format!("{from} put {} on {repo}#{issue}: “{title}”", fmt_fang(*amount)),
@@ -1706,6 +1631,10 @@ pub struct Chain {
     broken: Option<String>,
     /// Blocks `open` executed again because they were past the store's commit point.
     pub replayed: u64,
+    /// Tests: this node's proposals carry a junk tx (stateless-valid, never admittable), like a
+    /// Byzantine leader filling blocks it doesn't pay for (CV-5).
+    #[cfg(test)]
+    pub junk_proposals: bool,
 }
 
 /// The block logs and the state database. One executor writes at a time; the consensus path
@@ -1956,7 +1885,7 @@ impl Chain {
             }
             None => {}
         }
-        let genesis = Genesis {
+        let mut genesis = Genesis {
             chain_id: chain_id.to_string(),
             token: "FANG".into(),
             decimals: DECIMALS,
@@ -1975,6 +1904,13 @@ impl Chain {
             soul_ledger: vec![],
             features: vec![],
         };
+        // Every validator stakes: each owns itself and bonds the minimum from its allocation.
+        let self_bond = genesis.chain_params()?.min_self_bond;
+        genesis.operators = keys
+            .iter()
+            .zip(&genesis.validators)
+            .map(|(k, v)| Operator { owner: v.address.clone(), consensus_key: v.public_key.clone(), pop: make_pop(k.seed(), chain_id, &v.address, &v.p2p_addr, &v.http_addr), p2p_addr: v.p2p_addr.clone(), http_addr: v.http_addr.clone(), self_bond, commission_bps: 0, provider: None, asn: None, country: None, entity: None })
+            .collect();
         genesis.check()?;
         let homes: Vec<PathBuf> = if validators == 1 { vec![home.to_path_buf()] } else { (0..validators).map(|i| home.join(format!("v{i}"))).collect() };
         for (h, k) in homes.iter().zip(&keys) {
@@ -2079,6 +2015,8 @@ impl Chain {
             keep_blocks: None,
             broken: None,
             replayed: 0,
+            #[cfg(test)]
+            junk_proposals: false,
         };
         chain.replay_logs()?;
         if rebuilt_epochs {
@@ -2476,8 +2414,11 @@ impl Chain {
         let mut txs = vec![];
         let mut failed = BTreeMap::new();
         let mut skipped = vec![];
-        for tx in f.txs {
-            match self.state.apply(&tx, &self.genesis.chain_id, &f.proposer, f.height) {
+        let mut results = Vec::with_capacity(f.txs.len());
+        let chain_id = self.genesis.chain_id.clone();
+        self.state.run_block(&chain_id, f.height, &f.hash, &f.proposer, f.view, f.parent_view, &f.txs, |_, r| results.push(r));
+        for (tx, r) in f.txs.into_iter().zip(results) {
+            match r {
                 Ok(Outcome::Applied) => txs.push(tx),
                 Ok(Outcome::Failed(r)) => {
                     failed.insert(txs.len(), r.clone());
@@ -2490,7 +2431,6 @@ impl Chain {
                 }
             }
         }
-        self.state.end_block(&BlockInfo { height: f.height, hash: &f.hash, proposer: &f.proposer, view: f.view, parent_view: f.parent_view, skipped: &skipped });
         if self.state.params.is_boundary(f.height) && self.record_epoch(f.height) {
             self.sign_handoffs();
         }
@@ -2831,7 +2771,6 @@ impl Chain {
         self.pending.get(addr).map(|p| p.0).unwrap_or(0)
     }
 
-    #[cfg(test)]
     pub fn in_mempool(&self, id: &str) -> bool {
         self.pool.contains(id)
     }
@@ -2864,8 +2803,32 @@ impl Chain {
 
     /// Signs `action` with this validator's key, from its own account, and queues it.
     pub fn submit_own(&mut self, action: Action, memo: &str) -> Result<Tx> {
+        let from = self.me().ok_or_else(|| anyhow!("this node has no validator key"))?;
+        self.submit_signed(action, memo, from)
+    }
+
+    /// Who pays for this validator's system txs (attestations, evidence, beacon): its owner when
+    /// that's another account (SF-13: the consensus key signs for it), else the consensus key's own
+    /// account. `BLOCKULA_SYSTEM_FEES=self` makes the consensus key's account pay regardless (an
+    /// owner whose account is busy elsewhere avoids nonce races with this node).
+    pub fn system_fee_payer(&self) -> Option<String> {
+        let me = self.me()?;
+        let owner = self.state.validators.get(&me).map(|r| r.owner.clone()).filter(|o| *o != me);
+        match owner {
+            Some(o) if std::env::var("BLOCKULA_SYSTEM_FEES").as_deref() != Ok("self") => Some(o),
+            _ => Some(me),
+        }
+    }
+
+    /// Signs a validator system tx with this validator's consensus key, from
+    /// [`Chain::system_fee_payer`], and queues it.
+    pub fn submit_system(&mut self, action: Action, memo: &str) -> Result<Tx> {
+        let from = self.system_fee_payer().ok_or_else(|| anyhow!("this node has no validator key"))?;
+        self.submit_signed(action, memo, from)
+    }
+
+    fn submit_signed(&mut self, action: Action, memo: &str, from: String) -> Result<Tx> {
         let keys = self.keys.as_ref().ok_or_else(|| anyhow!("this node has no validator key"))?;
-        let from = keys.address_with(self.state.params.prefix());
         let mut tx = Tx {
             chain_id: self.genesis.chain_id.clone(),
             nonce: self.next_nonce(&from),

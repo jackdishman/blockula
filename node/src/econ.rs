@@ -128,3 +128,10 @@ pub fn describe(state: &State, tx: &Tx, from: &str, primary_name: &dyn Fn(&str) 
         _ => String::new(),
     }
 }
+
+// STUB(owner P-ECON): replaced at merge
+/// The burned part of the charge for a tx of `size` bytes at `height` (3.6). Until the fee
+/// market lands, `min_fee(size)` (3.1).
+pub fn base_fee(_state: &State, _height: u64, size: u64) -> u64 {
+    min_fee(size)
+}

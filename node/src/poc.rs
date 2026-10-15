@@ -756,19 +756,19 @@ impl State {
                 self.set_claim_by_pr(j, &pr_key, Some(id));
             }
             Action::AttestClaim { claim_id, ok, merge_sha, note } => {
-                let set = self.active_sets.get(&self.params.epoch_of(height)).cloned().unwrap_or_default();
-                if !set.iter().any(|v| v == sender) {
-                    bail!("only active validators can attest claims");
-                }
+                let epoch = self.params.epoch_of(height);
+                let set = self.active_sets.get(&epoch).cloned().unwrap_or_default();
+                // The validator this signer acts for: itself, or (SF-13) its owner paying the fee.
+                let validator = crate::staking::validator_for_signer(self, sender, signer, epoch).ok_or_else(|| anyhow!("only active validators can attest claims"))?;
                 let c = self.poc.claims.get(claim_id).ok_or_else(|| anyhow!("no claim #{claim_id}"))?;
                 if c.status != ClaimStatus::Pending {
                     bail!("claim #{claim_id} is {:?}, not pending", c.status);
                 }
-                if c.attestations.contains_key(sender) {
+                if c.attestations.contains_key(&validator) {
                     bail!("this validator already attested claim #{claim_id}");
                 }
                 let c = self.claim_mut(j, *claim_id).unwrap();
-                c.attestations.insert(sender.to_string(), Attestation { ok: *ok, merge_sha: merge_sha.clone(), at: height, note: note.clone() });
+                c.attestations.insert(validator, Attestation { ok: *ok, merge_sha: merge_sha.clone(), at: height, note: note.clone() });
                 // A BFT quorum of the current set settles it either way.
                 let n = set.len();
                 let quorum = n - (n - 1) / 3;

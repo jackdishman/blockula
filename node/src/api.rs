@@ -358,6 +358,7 @@ pub fn router(node: Node) -> Router {
         .route("/api/genesis", get(genesis))
         .route("/api/sync", get(sync))
         .route("/api/validators", get(validators))
+        .route("/api/staking/{account}", get(staking))
         .route("/api/mempool", get(mempool))
         .route("/api/snapshot/latest", get(snapshot_latest))
         .route("/api/snapshot/{height}/chunk/{i}", get(snapshot_chunk))
@@ -984,6 +985,10 @@ async fn github(State(n): State<Node>, Path(handle): Path<String>) -> ApiResult 
 }
 
 fn validator_json(v: &ReadView, r: &crate::chain::ValidatorRecord) -> Value {
+    use crate::staking;
+    let st = &v.state;
+    let p = st.staking.pools.get(&r.address).cloned().unwrap_or_default();
+    let self_bond = staking::self_bond(st, &r.address);
     json!({
         "validator": label(v, &r.address),
         "owner": label(v, &r.owner),
@@ -991,8 +996,23 @@ fn validator_json(v: &ReadView, r: &crate::chain::ValidatorRecord) -> Value {
         "consensus_key": r.consensus_key,
         "p2p_addr": r.p2p_addr,
         "http_addr": r.http_addr,
-        "bond": r.bond.to_string(),
-        "bond_display": fmt_fang(r.bond),
+        "stake": p.stake.to_string(),
+        "stake_display": fmt_fang(p.stake),
+        // The pool's stake (older clients read `bond`).
+        "bond": p.stake.to_string(),
+        "bond_display": fmt_fang(p.stake),
+        "shares": p.shares.to_string(),
+        "self_bond": self_bond.to_string(),
+        "self_bond_display": fmt_fang(self_bond),
+        "commission_bps": r.commission_bps,
+        "commission_display": format!("{}%", staking::fmt_bps(r.commission_bps)),
+        "eligible": staking::eligible(st, &r.address),
+        "jailed": p.jail.as_ref().map(|j| json!({ "at": j.at, "until": j.until, "reason": j.reason })),
+        "tombstoned_at": p.tombstoned_at,
+        "slashed_display": fmt_fang(p.slashed),
+        "rewards_display": fmt_fang(p.rewards),
+        "junk_charged_display": fmt_fang(p.junk_charged),
+        "liveness": st.staking.liveness.get(&r.address).map(|l| json!({ "window": l.window, "recorded": l.filled, "missed": l.missed, "max_missed": st.chain_params.downtime_max_missed, "led": l.led, "missed_total": l.missed_total })),
         "registered_at": r.registered_at,
         "approved_at": r.approved_at,
         "approved_by": r.approved_by.as_ref().map(|a| label(v, a)),
@@ -1000,38 +1020,112 @@ fn validator_json(v: &ReadView, r: &crate::chain::ValidatorRecord) -> Value {
         "removed_at": r.removed_at,
         "removed_by": r.removed_by.as_ref().map(|a| label(v, a)),
         "active_until_epoch": r.active_until,
-        "unbond_epoch": r.unbond_epoch,
         "genesis": v.genesis.is_validator(&r.address),
     })
 }
 
-/// The validator set: who's active this epoch, who's next, who's waiting, and when it changes.
-/// (Registrations are bonded, so the validator map stays small.)
+/// The validator set: who's active this epoch, who joins and leaves at the next boundary, the
+/// candidates by stake, who's jailed, and the rules. (Registrations are bonded, so the validator
+/// map stays small.)
 async fn validators(State(n): State<Node>) -> ApiResult {
     use crate::chain::ValidatorStatus::*;
+    use crate::staking;
     let v = n.live.view();
     let st = &v.state;
-    let p = &st.params;
+    let (p, cp) = (&st.params, &st.chain_params);
     let next_height = v.height + 1;
     let epoch = p.epoch_of(next_height);
-    let ids = |set: Option<&Vec<String>>| -> Vec<Value> { set.map(|s| s.iter().filter_map(|a| st.validators.get(a)).map(|r| validator_json(&v, r)).collect()).unwrap_or_default() };
+    let ids = |set: &[String]| -> Vec<Value> { set.iter().filter_map(|a| st.validators.get(a)).map(|r| validator_json(&v, r)).collect() };
+    let current = st.active_sets.get(&epoch).cloned().unwrap_or_default();
+    let next = staking::select_next(st, epoch);
+    let candidates = staking::likely_candidates(st, epoch, usize::MAX);
+    let jailed: Vec<String> = st.staking.pools.iter().filter(|(_, p)| p.jail.is_some() && p.tombstoned_at.is_none()).map(|(a, _)| a.clone()).collect();
     let by_status = |s: crate::chain::ValidatorStatus| -> Vec<Value> { st.validators.values().filter(|r| r.status == s).map(|r| validator_json(&v, r)).collect() };
-    let next_set = st.next_set(epoch);
     Ok(Json(json!({
         "epoch": epoch,
         "epoch_blocks": p.epoch_blocks,
         "epoch_ends_at_height": p.last_of(epoch),
         "blocks_until_next_epoch": p.last_of(epoch) + 1 - next_height,
-        "active": ids(st.active_sets.get(&epoch)),
-        "next_epoch": ids(Some(&next_set)),
-        "pending": by_status(Pending),
-        "approved": by_status(Approved),
+        "active": ids(&current),
+        "next_epoch": ids(&next.next),
+        "joining": ids(&next.joining),
+        "leaving": ids(&next.leaving),
+        "candidates": ids(&candidates),
+        "jailed": ids(&jailed),
+        "tombstoned": by_status(Tombstoned),
         "removed": by_status(Removed),
         "admins": p.admins.iter().map(|a| label(&v, a)).collect::<Vec<_>>(),
-        "min_bond": st.chain_params.min_self_bond.to_string(),
-        "min_bond_display": fmt_fang(st.chain_params.min_self_bond),
-        "max_validators": st.chain_params.max_validators,
-        "explainer": "Validators take turns proposing blocks and vote to finalize them; a block is final once more than two-thirds of the active set have signed it (ML-DSA-65). The set can only change at epoch boundaries. In Season 0, admins approve new validators, who post a bond and join at the next epoch.",
+        "min_bond": cp.min_self_bond.to_string(),
+        "min_bond_display": fmt_fang(cp.min_self_bond),
+        "max_validators": cp.max_validators,
+        "churn_limit": staking::churn_limit(current.len()),
+        "unbonding_blocks": cp.unbonding_blocks,
+        "jail_blocks": cp.jail_blocks,
+        "evidence_max_age_epochs": cp.evidence_max_age_epochs,
+        "downtime_window": cp.downtime_window,
+        "downtime_max_missed": cp.downtime_max_missed,
+        "slash_double_sign_display": format!("{}%", staking::fmt_bps(cp.slash_double_sign_bps)),
+        "slash_downtime_display": format!("{}%", staking::fmt_bps(cp.slash_downtime_bps)),
+        "explainer": "Validators take turns proposing blocks and vote to finalize them; a block is final once more than two-thirds of the active set have signed it (ML-DSA-65), one vote each. Anyone can register a validator with a self-bond and anyone can delegate to one. At each epoch boundary the next set is the top validators by stake, changing at most a third of the seats at a time. Double-signing is slashed and banned for good; a validator that misses too many of its turns is jailed until it unjails.",
+    })))
+}
+
+/// One account's staking: what it delegated where, what's unbonding (and when it's free), and
+/// the validators it is or owns.
+async fn staking(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
+    use crate::staking::{self, Entry};
+    let v = n.live.view();
+    let st = &v.state;
+    let addr = st.resolve(&id)?;
+    let next_height = v.height + 1;
+    let (bonded, unbonding) = staking::holdings(st, &addr);
+    let delegations = staking::delegations_of(st, &addr);
+    let rows: Vec<Value> = delegations
+        .iter()
+        .map(|(val, d)| {
+            let value = staking::delegation_value(st, &addr, val);
+            let own = st.validators.get(val).is_some_and(|r| r.owner == addr);
+            json!({ "validator": label(&v, val), "shares": d.shares.to_string(), "value": value.to_string(), "value_display": fmt_fang(value), "principal": d.principal.to_string(), "earned_display": fmt_fang(value.saturating_sub(d.principal)), "self_bond": own })
+        })
+        .collect();
+    let mut ready = 0u64;
+    let entries: Vec<Value> = staking::entries_of_account(st, &addr)
+        .into_iter()
+        .map(|(id, e)| match e {
+            Entry::Unbonding { validator, amount, started_at, release_at } => {
+                if release_at <= next_height {
+                    ready += amount;
+                }
+                json!({ "id": id, "type": "unbonding", "validator": label(&v, &validator), "amount": amount.to_string(), "amount_display": fmt_fang(amount), "started_at": started_at, "release_at": release_at, "ready": release_at <= next_height })
+            }
+            Entry::Redelegation { from, to, amount, started_at, release_at } => json!({ "id": id, "type": "redelegation", "from": label(&v, &from), "to": label(&v, &to), "amount": amount.to_string(), "amount_display": fmt_fang(amount), "started_at": started_at, "release_at": release_at }),
+        })
+        .collect();
+    let validators: Vec<Value> = st.validators.values().filter(|r| r.address == addr || r.owner == addr).map(|r| validator_json(&v, r)).collect();
+    let who = label(&v, &addr)["name"].as_str().map(String::from).unwrap_or_else(|| short(&addr));
+    let summary = match (bonded, unbonding) {
+        (0, 0) => format!("{who} has nothing staked"),
+        _ => {
+            let pools = match delegations.len() {
+                1 => "1 validator".to_string(),
+                n => format!("{n} validators"),
+            };
+            let out = if unbonding == 0 { String::new() } else { format!(" and {} unbonding ({} ready to withdraw)", fmt_fang(unbonding), fmt_fang(ready)) };
+            format!("{who} has {} staked with {pools}{out}", fmt_fang(bonded))
+        }
+    };
+    Ok(Json(json!({
+        "account": label(&v, &addr),
+        "bonded": bonded.to_string(),
+        "bonded_display": fmt_fang(bonded),
+        "unbonding": unbonding.to_string(),
+        "unbonding_display": fmt_fang(unbonding),
+        "withdrawable": ready.to_string(),
+        "withdrawable_display": fmt_fang(ready),
+        "delegations": rows,
+        "entries": entries,
+        "validators": validators,
+        "summary": summary,
     })))
 }
 

@@ -1,5 +1,6 @@
-//! `blockula validator …`: set up a validator node, register it on-chain, and (for Season 0
-//! admins) approve or remove validators. Talks to any node's HTTP API.
+//! `blockula validator …`: set up a validator node, register it on-chain, stake with validators
+//! (delegate, undelegate, withdraw), unjail and set commission, and (on dev and test chains,
+//! for admins) pin or remove validators. Talks to any node's HTTP API.
 
 use crate::chain::Genesis;
 use crate::crypto::Keys;
@@ -29,23 +30,71 @@ pub enum ValidatorCmd {
         public_http_addr: Option<String>,
     },
     /// Bond FANG and register this validator (signed by the validator's own account, which
-    /// must already hold the bond plus fees — on testnets, use the faucet)
+    /// must already hold the bond plus fees — on testnets, use the faucet). It joins the active
+    /// set at an epoch boundary once its stake ranks (others can delegate to it)
     Register {
         #[arg(long)]
         home: PathBuf,
         /// Any node's HTTP URL
         #[arg(long)]
         rpc: String,
-        /// Bond in FANG (default: the chain's minimum)
+        /// Self-bond in FANG (default: the chain's minimum)
         #[arg(long)]
         bond: Option<String>,
     },
-    /// Season 0 admins: approve a pending validator (it joins at the next epoch)
+    /// Stake FANG with a validator (buys shares of its pool)
+    Delegate {
+        #[command(flatten)]
+        a: AdminArgs,
+        /// Amount in FANG, e.g. 1500
+        amount: String,
+    },
+    /// Start unbonding stake from a validator's pool (withdraw it once the unbonding period is over)
+    Undelegate {
+        #[command(flatten)]
+        a: AdminArgs,
+        /// Shares to sell (`blockula validator stake` shows them)
+        #[arg(long, conflicts_with = "all")]
+        shares: Option<String>,
+        /// Every share you hold in that pool
+        #[arg(long)]
+        all: bool,
+    },
+    /// Withdraw every unbonding entry that has finished
+    Withdraw {
+        /// File holding the signing key's 32-byte hex seed
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        rpc: String,
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// Bring a jailed validator back (once its jail time is over; signed by its owner)
+    Unjail(AdminArgs),
+    /// Set your validator's commission, in basis points (moves at most `commission_max_change_bps` per epoch)
+    Commission {
+        /// e.g. 500 for 5%
+        bps: u64,
+        /// File holding the signing key's 32-byte hex seed (the owner's, or the validator's consensus key)
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        rpc: String,
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// Show an account's stake: delegations, unbonding entries, validators it runs
+    Stake {
+        /// Address or .boo name
+        account: String,
+        #[arg(long)]
+        rpc: String,
+    },
+    /// Dev and test chain admins: pin a validator (ranked ahead of stake from the next epoch)
     Approve(AdminArgs),
-    /// Season 0 admins: remove a validator (it leaves at the next epoch)
+    /// Dev and test chain admins: remove a validator (it leaves at the next epoch, for good)
     Remove(AdminArgs),
-    /// Reclaim the bond of a removed validator (signed by the account that registered it)
-    Unbond(AdminArgs),
     /// Print the proof of possession another account needs to register this validator
     /// (for registering from a wallet/SDK instead of the validator's own account)
     Pop {
@@ -197,9 +246,8 @@ pub fn run(cmd: ValidatorCmd) -> Result<()> {
             println!("   advertised p2p {p2p} · http {http}");
             println!("\nNext:");
             println!("   1. Fund {me} with at least {} plus fees (testnets: POST /api/faucet {{\"to\": \"{me}\"}})", fmt_fang(g.chain_params()?.min_self_bond));
-            println!("   2. blockula validator register --home {} --rpc <node url>", home.display());
-            println!("   3. Ask a validator admin to approve {me}");
-            println!("   4. blockula run --home {} --bind 0.0.0.0   (syncs now, votes from its activation epoch)", home.display());
+            println!("   2. blockula run --home {} --bind 0.0.0.0   (syncs now, votes once it's in the active set)", home.display());
+            println!("   3. blockula validator register --home {} --rpc <node url>   (joins at an epoch boundary once its stake ranks)", home.display());
             Ok(())
         }
         ValidatorCmd::Register { home, rpc, bond } => {
@@ -220,12 +268,71 @@ pub fn run(cmd: ValidatorCmd) -> Result<()> {
             let action = Action::RegisterValidator { consensus_key: hex::encode(keys.public_key()), p2p_addr: addrs.p2p_addr, http_addr: addrs.http_addr, bond, pop };
             let tx = rt.block_on(send(&rpc, &keys, &me, action))?;
             println!("✓ {}", tx["summary"].as_str().unwrap_or_default());
-            println!("  Now ask a validator admin to run: blockula validator approve {me} --key <admin key file> --rpc {rpc}");
+            println!("  It joins the active set at an epoch boundary if its stake ranks in the top max_validators (a third of the seats change at most per epoch).");
+            println!("  Others can back it: blockula validator delegate {me} <FANG> --key <key file> --rpc {rpc}");
+            Ok(())
+        }
+        ValidatorCmd::Delegate { a, amount } => {
+            let amount = parse_fang(&amount)?;
+            admin(a, |v| Action::Delegate { validator: v, amount })
+        }
+        ValidatorCmd::Undelegate { a, shares, all } => {
+            let shares: u64 = match (shares, all) {
+                (Some(s), false) => s.parse().map_err(|_| anyhow!("--shares must be a whole number of shares"))?,
+                (None, true) => {
+                    let keys = load_seed(&a.key)?;
+                    let rt = rt()?;
+                    let from = match &a.from {
+                        Some(f) => f.clone(),
+                        None => rt.block_on(own_address(&a.rpc, &keys))?,
+                    };
+                    let stake = rt.block_on(get(&a.rpc, &format!("/staking/{from}")))?;
+                    let held = stake["delegations"].as_array().into_iter().flatten().find(|d| d["validator"]["address"].as_str() == Some(a.validator.as_str())).and_then(|d| d["shares"].as_str()).ok_or_else(|| anyhow!("{from} has no stake with {}", a.validator))?;
+                    held.parse::<u64>().map_err(|_| anyhow!("{held} shares is more than one tx can move; undelegate in parts with --shares"))?
+                }
+                _ => bail!("say how much: --shares N or --all"),
+            };
+            admin(a, |v| Action::Undelegate { validator: v, shares })
+        }
+        ValidatorCmd::Withdraw { key, rpc, from } => {
+            let keys = load_seed(&key)?;
+            let rt = rt()?;
+            let from = match from {
+                Some(f) => f,
+                None => rt.block_on(own_address(&rpc, &keys))?,
+            };
+            let tx = rt.block_on(send(&rpc, &keys, &from, Action::WithdrawUnbonded {}))?;
+            println!("✓ {}", tx["summary"].as_str().unwrap_or_default());
+            Ok(())
+        }
+        ValidatorCmd::Unjail(a) => admin(a, |v| Action::Unjail { validator: v }),
+        ValidatorCmd::Commission { bps, key, rpc, from } => {
+            let keys = load_seed(&key)?;
+            let rt = rt()?;
+            let from = match from {
+                Some(f) => f,
+                None => rt.block_on(own_address(&rpc, &keys))?,
+            };
+            let tx = rt.block_on(send(&rpc, &keys, &from, Action::UpdateValidator { commission_bps: bps, p2p_addr: String::new(), http_addr: String::new() }))?;
+            println!("✓ {}", tx["summary"].as_str().unwrap_or_default());
+            Ok(())
+        }
+        ValidatorCmd::Stake { account, rpc } => {
+            let v = rt()?.block_on(get(&rpc, &format!("/staking/{account}")))?;
+            println!("{}", v["summary"].as_str().unwrap_or_default());
+            for d in v["delegations"].as_array().into_iter().flatten() {
+                println!("   {}  {} shares  worth {}{}", d["validator"]["address"].as_str().unwrap_or_default(), d["shares"].as_str().unwrap_or_default(), d["value_display"].as_str().unwrap_or_default(), if d["self_bond"] == true { "  (self-bond)" } else { "" });
+            }
+            for e in v["entries"].as_array().into_iter().flatten() {
+                match e["type"].as_str() {
+                    Some("unbonding") => println!("   unbonding {} from {}: {}", e["amount_display"].as_str().unwrap_or_default(), e["validator"]["address"].as_str().unwrap_or_default(), if e["ready"] == true { "ready to withdraw".to_string() } else { format!("free at block {}", e["release_at"]) }),
+                    _ => println!("   redelegated {} from {} to {} (settles at block {})", e["amount_display"].as_str().unwrap_or_default(), e["from"]["address"].as_str().unwrap_or_default(), e["to"]["address"].as_str().unwrap_or_default(), e["release_at"]),
+                }
+            }
             Ok(())
         }
         ValidatorCmd::Approve(a) => admin(a, |v| Action::ApproveValidator { validator: v }),
         ValidatorCmd::Remove(a) => admin(a, |v| Action::RemoveValidator { validator: v }),
-        ValidatorCmd::Unbond(a) => admin(a, |v| Action::Unbond { validator: v }),
         ValidatorCmd::Pop { home, owner } => {
             let g = Genesis::load(&home.join("genesis.json"))?;
             let seed: [u8; 32] = hex::decode(std::fs::read_to_string(home.join("validator.key"))?.trim())?.try_into().map_err(|_| anyhow!("bad validator.key"))?;
@@ -239,12 +346,12 @@ pub fn run(cmd: ValidatorCmd) -> Result<()> {
         }
         ValidatorCmd::List { rpc } => {
             let v = rt()?.block_on(get(&rpc, "/validators"))?;
-            println!("epoch {} · {} blocks until the next epoch", v["epoch"], v["blocks_until_next_epoch"]);
-            for (title, key) in [("active", "active"), ("next epoch", "next_epoch"), ("pending approval", "pending"), ("approved", "approved"), ("removed", "removed")] {
+            println!("epoch {} · {} blocks until the next epoch · at most {} seats change per epoch", v["epoch"], v["blocks_until_next_epoch"], v["churn_limit"]);
+            for (title, key) in [("active", "active"), ("joining next epoch", "joining"), ("leaving next epoch", "leaving"), ("candidates", "candidates"), ("jailed", "jailed"), ("tombstoned", "tombstoned"), ("removed", "removed")] {
                 let list = v[key].as_array().cloned().unwrap_or_default();
                 println!("{title} ({}):", list.len());
                 for x in list {
-                    println!("   {}  {}  bond {}", x["validator"]["address"].as_str().unwrap_or_default(), x["p2p_addr"].as_str().unwrap_or_default(), x["bond_display"].as_str().unwrap_or_default());
+                    println!("   {}  {}  stake {}  self-bond {}  commission {}", x["validator"]["address"].as_str().unwrap_or_default(), x["p2p_addr"].as_str().unwrap_or_default(), x["stake_display"].as_str().unwrap_or_default(), x["self_bond_display"].as_str().unwrap_or_default(), x["commission_display"].as_str().unwrap_or_default());
                 }
             }
             Ok(())

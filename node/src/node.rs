@@ -138,12 +138,14 @@ async fn attest_claims(chain: Shared) {
         tick.tick().await;
         let todo: Vec<(u64, String, String, u64, String, Option<String>)> = {
             let c = chain.lock();
-            let Some(me) = c.me() else { return };
+            let (Some(me), Some(keys)) = (c.me(), c.keys.as_ref()) else { return };
             let epoch = c.state.params.epoch_of(c.height() + 1);
             if !c.state.active_sets.get(&epoch).is_some_and(|s| s.contains(&me)) || c.syncing() {
                 continue;
             }
-            let queued: std::collections::BTreeSet<u64> = c.mempool.iter().filter(|t| t.from == me).filter_map(|t| if let Action::AttestClaim { claim_id, .. } = t.action { Some(claim_id) } else { None }).collect();
+            // Ours whichever account pays for them (SF-13): signed by our consensus key.
+            let my_key = hex::encode(keys.public_key());
+            let queued: std::collections::BTreeSet<u64> = c.mempool.iter().filter(|t| t.public_key == my_key).filter_map(|t| if let Action::AttestClaim { claim_id, .. } = t.action { Some(claim_id) } else { None }).collect();
             c.state
                 .poc
                 .claims
@@ -184,10 +186,74 @@ async fn attest_claims(chain: Shared) {
                     continue;
                 }
             };
-            match chain.lock().submit_own(action, &memo) {
+            match chain.lock().submit_system(action, &memo) {
                 Ok(_) => tracing::info!(claim = id, %memo, "attested contribution claim"),
                 Err(e) => tracing::warn!(claim = id, error = %e, "couldn't submit an attestation"),
             }
+        }
+    }
+}
+
+/// Submits the equivocation evidence consensus verified (`consensus::EvidenceSink`) as
+/// `ReportEquivocation` txs, signed by this validator's consensus key and paid as SF-13 says
+/// (`Chain::submit_system`), until the chain has punished each fault or never will (too old,
+/// invalid). A fault another validator already reported (in our mempool) isn't reported twice.
+/// Simplex doesn't persist the votes it compared, so pending evidence waits in `evidence.json`
+/// across restarts. Runs on the consensus runtime (the deterministic one in the simulator).
+pub async fn report_evidence<E: commonware_runtime::Clock>(context: E, chain: Shared, mut found: futures::channel::mpsc::UnboundedReceiver<Vec<u8>>) {
+    use crate::staking::{decode_evidence, evidence_status, EvidenceStatus};
+    use crate::types::Action;
+    use futures::StreamExt as _;
+    let path = chain.lock().home.join("evidence.json");
+    // Evidence (hex) → the id of the tx we submitted for it, if any.
+    let mut pending: std::collections::BTreeMap<String, Option<String>> = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice::<Vec<String>>(&b).ok()).unwrap_or_default().into_iter().map(|e| (e, None)).collect();
+    let save = |pending: &std::collections::BTreeMap<String, Option<String>>| {
+        let list: Vec<&String> = pending.keys().collect();
+        if let Err(e) = serde_json::to_vec(&list).map_err(anyhow::Error::from).and_then(|b| crate::store::write_durably(&path, &b)) {
+            tracing::warn!(error = %e, "couldn't save evidence.json");
+        }
+    };
+    loop {
+        commonware_macros::select! {
+            e = found.next() => {
+                let Some(e) = e else { return };
+                if pending.insert(hex::encode(e), None).is_none() {
+                    save(&pending);
+                }
+            },
+            _ = context.sleep(Duration::from_secs(2)) => {},
+        }
+        let before = pending.len();
+        let mut c = chain.lock();
+        if c.syncing() {
+            continue;
+        }
+        let (height, chain_id) = (c.height() + 1, c.genesis.chain_id.clone());
+        let fault_of = |evidence: &str| hex::decode(evidence).ok().and_then(|b| decode_evidence(&b).ok()).map(|e| (e.epoch, e.view, e.signer));
+        pending.retain(|evidence, submitted| {
+            let Ok(bytes) = hex::decode(evidence) else { return false };
+            match evidence_status(&c.state, &chain_id, &bytes, height) {
+                EvidenceStatus::Punished | EvidenceStatus::Never => false,
+                EvidenceStatus::NotYet => true,
+                EvidenceStatus::Open(fault) => {
+                    let mine = fault_of(evidence);
+                    let reported = submitted.as_ref().is_some_and(|id| c.in_mempool(id)) || c.mempool.iter().any(|t| matches!(&t.action, Action::ReportEquivocation { evidence: other } if fault_of(other) == mine));
+                    if !reported {
+                        match c.submit_system(Action::ReportEquivocation { evidence: evidence.clone() }, "🧛 double-signing evidence") {
+                            Ok(tx) => {
+                                tracing::warn!(validator = %fault.validator, epoch = fault.epoch, view = fault.view, "reported a validator for double-signing");
+                                *submitted = Some(tx.id());
+                            }
+                            Err(e) => tracing::warn!(error = %e, "couldn't submit equivocation evidence; retrying"),
+                        }
+                    }
+                    true
+                }
+            }
+        });
+        drop(c);
+        if pending.len() != before {
+            save(&pending);
         }
     }
 }
