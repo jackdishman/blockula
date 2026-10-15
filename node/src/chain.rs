@@ -457,8 +457,8 @@ impl Genesis {
             ensure!(crate::upgrade::KNOWN_FEATURES.contains(&f.as_str()), "unknown feature {f} (known: {})", crate::upgrade::KNOWN_FEATURES.join(", "));
             ensure!(features.insert(f), "feature {f} is listed twice");
         }
-        // Every validator stakes (3.4): one without a self-bond would be ineligible from the first
-        // boundary, and the set would hand over to whoever registered first.
+        // Every validator stakes (3.4): one without a self-bond is ineligible, so it would leave
+        // the set at the first boundary.
         if let Some(v) = self.validators.iter().find(|v| !keys.contains(v.public_key.as_str())) {
             bail!("validator {} needs an operator (owner, self-bond, commission): every validator stakes", v.address);
         }

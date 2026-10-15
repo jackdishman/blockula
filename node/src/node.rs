@@ -217,7 +217,9 @@ pub async fn report_evidence<E: commonware_runtime::Clock>(context: E, chain: Sh
         commonware_macros::select! {
             e = found.next() => {
                 let Some(e) = e else { return };
-                if pending.insert(hex::encode(e), None).is_none() {
+                let e = hex::encode(e);
+                if !pending.contains_key(&e) {
+                    pending.insert(e, None);
                     save(&pending);
                 }
             },
