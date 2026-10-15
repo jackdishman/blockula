@@ -1053,6 +1053,41 @@ mod tests {
         assert_eq!(b.parse_txs(), vec![None, None]);
     }
 
+    /// Ghost txs in a proposed block: their proofs are checked before voting (a tx whose fee was
+    /// changed after proving is permanently invalid), and they're held to `ghost_max_tx_bytes`
+    /// each and `ghost_max_block_bytes` together (rejected at once, before any proof is checked).
+    #[test]
+    fn verify_checks_ghost_proofs_and_size_limits() {
+        let root_dir = std::env::temp_dir().join(format!("blockula-ghostverify-{}-{}", crate::chain::now_ms(), std::process::id()));
+        let mut o = SummonOpts::new("gv", 1);
+        o.params.insert("ghost_max_tx_bytes".into(), 150 << 10);
+        o.params.insert("ghost_max_block_bytes".into(), 200 << 10);
+        Chain::summon(&root_dir, &o).unwrap();
+        let c = Chain::open(&root_dir).unwrap();
+        let (instance, genesis_root) = (c.state.ghost.meta.instance, hex_32(&c.root_at(0).unwrap()));
+        let seed: [u8; 32] = hex::decode(std::fs::read_to_string(root_dir.join("validator.key")).unwrap().trim()).unwrap().try_into().unwrap();
+        let chain: Shared = Arc::new(Mutex::new(c));
+        let good = crate::ghost::tests::stateless_transfer("gv", instance, "a", 100);
+        let other = crate::ghost::tests::stateless_transfer("gv", instance, "b", 100);
+        let mut tampered = good.clone();
+        tampered.fee += 1;
+        deterministic::Runner::timed(Duration::from_secs(60)).start(|context| async move {
+            let leader = PrivateKey::from_seed_bytes(seed).public_key();
+            let mut app = App { chain: chain.clone(), block_time_ms: 1_000, address_prefix: "boo".into() };
+            let parent = CBlock::new(Digest([0; 32]), 0, 6, 5, 0, String::new(), 0, [0; 32], vec![]);
+            let child = |txs: Vec<&Tx>| CBlock::new(parent.digest(), 1, 7, 6, 1_000, leader.address("boo"), 0, genesis_root, txs.into_iter().map(Tx::to_bytes).collect());
+            let mut verify = async |block: CBlock| {
+                let cctx = SimplexContext { round: Round::new(Epoch::zero(), View::new(7)), leader: leader.clone(), parent: (View::new(6), parent.digest()) };
+                let ancestry = marshal::ancestry::from_iter([Arc::new(block), Arc::new(parent.clone())]);
+                Application::<deterministic::Context>::verify(&mut app, (context.child("verify"), cctx), ancestry).await
+            };
+            assert!(verify(child(vec![&good])).await, "a valid ghost tx within the limits");
+            assert!(!verify(child(vec![&tampered])).await, "its proof no longer verifies");
+            assert!(!verify(child(vec![&good, &other])).await, "two ~131 KiB ghost txs are over ghost_max_block_bytes");
+        });
+        std::fs::remove_dir_all(root_dir).ok();
+    }
+
     /// A verifier that hasn't executed the height a block cites keeps the verdict pending (it
     /// used to vote no after ~3 block times at checkpoints), then checks the root once it has.
     /// Mismatched views, versions and junk txs are still rejected at once.

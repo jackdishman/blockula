@@ -710,4 +710,4 @@ pub fn mempool_admit(queued: &[Tx], ids: &[String], tx: &Tx) -> Result<Vec<Strin
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

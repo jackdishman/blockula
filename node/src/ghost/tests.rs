@@ -254,6 +254,22 @@ fn balance(n: &Net, k: &Keys) -> u64 {
     n.c.state.account(&k.address()).balance
 }
 
+/// A private transfer that passes every stateless check on chain `chain_id` (signature-free,
+/// its proof valid), spending a note in a tree of its own (anchors are stateful): for tests of
+/// paths that only look at txs statelessly, like consensus `verify`.
+pub(crate) fn stateless_transfer(chain_id: &str, instance: [u8; 32], seed: &str, valid_until: u64) -> Tx {
+    let mut rng = TestRng::new(seed);
+    let key = SpendingKey::from_seed(rng.bytes());
+    let note = Note { value: 10 * FANG, owner: key.address().owner(), rseed: rng.bytes() };
+    let mut tree = FullTree::new();
+    let pos = tree.append(note.commitment()).unwrap();
+    let change = Note { value: 10 * FANG - FEE, owner: key.address().owner(), rseed: rng.bytes() };
+    let enc = encrypt_note(&change, &key.address(), &[0; MEMO_BYTES], None, &mut rng).unwrap();
+    let act = Act { spends: [SpendWitness::new(&key, note, tree.path(pos).unwrap()), SpendWitness::dummy(&mut rng)], outputs: [(change, enc), dummy_output(&mut rng)], anchor: tree.root() };
+    let tx = Tx { chain_id: chain_id.into(), from: String::new(), nonce: 0, fee: FEE, tip: 0, valid_until, action: Action::PrivateTransfer { bundle: Box::new(act.bundle(instance)) }, memo: String::new(), public_key: String::new(), signature: String::new() };
+    act.prove(tx)
+}
+
 /// Shield → private transfer (found by the recipient's trial decryption) → unshield, through the
 /// mempool and blocks; the pool, balances and supply add up at every step; the result survives a
 /// restart and a rebuild from the block logs.
@@ -265,6 +281,25 @@ fn shield_transfer_unshield_through_the_node() {
     n.fund(&[&alice], 300 * FANG);
     let verify_fee = n.c.state.chain_params.ghost_verify_fee;
     assert!(verify_fee > 0);
+
+    // Bob publishes his ghost address on his account; wallets find it by any of its names.
+    let bob = Keys::from_seed([2; 32]);
+    n.fund(&[&bob], 10 * FANG);
+    let mut publish = Tx { chain_id: n.c.genesis.chain_id.clone(), from: bob.address(), nonce: 0, fee: 0, tip: 0, valid_until: n.c.height() + 100, action: Action::SetGhostAddress { address: HexBytes(ghost_bob.address().to_bytes().to_vec()) }, memo: String::new(), public_key: hex::encode(bob.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+    publish.fee = min_fee(publish.size());
+    n.submit(&publish.sign(&bob)).unwrap();
+    n.c.produce_block().unwrap();
+    assert_eq!(n.c.state.ghost.addresses.get(&bob.address()), Some(&ghost_bob.address().to_bytes().to_vec()));
+    assert!(n.c.describe_last(0).contains(&ghost_bob.address().fingerprint()));
+    // Session keys can't shield (or spend shielded funds: that needs the spending key).
+    let agent = Keys::from_seed([4; 32]);
+    let mut add = Tx { chain_id: n.c.genesis.chain_id.clone(), from: alice.address(), nonce: n.c.next_nonce(&alice.address()), fee: 0, tip: 0, valid_until: n.c.height() + 100, action: Action::AddKey { key_id: key_id(&agent.public_key()), label: "agent".into(), role: KeyRole::Session { limit: 50 * FANG, period_blocks: 100, expires_at: 10_000 } }, memo: String::new(), public_key: hex::encode(alice.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+    add.fee = min_fee(add.size());
+    n.submit(&add.sign(&alice)).unwrap();
+    n.c.produce_block().unwrap();
+    let (by_agent, _) = n.shield(&alice, FANG, &ghost_alice);
+    let by_agent = Tx { public_key: hex::encode(agent.public_key()), ..by_agent }.sign(&agent);
+    assert!(err(n.submit(&by_agent)).contains("session keys can only send transfers"));
 
     // 1. Alice shields 100 FANG: her balance pays it, the verify fee and the byte fee.
     let (tx, note_a) = n.shield(&alice, 100 * FANG, &ghost_alice);
@@ -695,6 +730,25 @@ fn proofs_are_bound_to_their_chain() {
     assert_eq!(status_json(&n.c.state, n.c.height())["instance"], hex::encode(n.instance()));
     assert_eq!(n.instance(), chain_instance(&n.c.genesis));
     n.cleanup();
+}
+
+/// The mempool holds at most `MAX_MEMPOOL_GHOST` ghost txs, and one queued spend per note,
+/// which only a higher tip per byte replaces (even when the ghost share is full).
+#[test]
+fn mempool_bounds_ghost_txs() {
+    let mk = |i: u32, tip: u64| {
+        let mut b = crate::types::tests::vector_bundle(1);
+        b.nullifiers = [HexBytes([i.to_le_bytes(), [1; 4], [0; 4], [0; 4], [0; 4], [0; 4], [0; 4], [0; 4]].concat()), HexBytes([i.to_le_bytes(), [2; 4], [0; 4], [0; 4], [0; 4], [0; 4], [0; 4], [0; 4]].concat())];
+        Tx { chain_id: "c".into(), from: String::new(), nonce: 0, fee: FEE + tip, tip, valid_until: 9, action: Action::PrivateTransfer { bundle: b }, memo: String::new(), public_key: String::new(), signature: String::new() }
+    };
+    let queued: Vec<Tx> = (0..MAX_MEMPOOL_GHOST as u32).map(|i| mk(i, 0)).collect();
+    let ids: Vec<String> = queued.iter().map(Tx::id).collect();
+    assert!(mempool_admit(&queued[..10], &ids[..10], &mk(999, 0)).unwrap().is_empty(), "room, no conflict");
+    assert!(mempool_admit(&queued, &ids, &mk(999, 0)).unwrap_err().to_string().contains("maximum"));
+    assert!(mempool_admit(&queued, &ids, &mk(7, 0)).unwrap_err().to_string().contains("higher tip"));
+    assert_eq!(mempool_admit(&queued, &ids, &mk(7, 1_000)).unwrap(), vec![ids[7].clone()], "a better-paying spend of the same note replaces the queued one");
+    let transfer = Tx { action: Action::GhostPause {}, ..mk(1, 0) };
+    assert!(mempool_admit(&queued, &ids, &transfer).unwrap().is_empty(), "other txs aren't counted");
 }
 
 /// The node's release profile keeps overflow checks on in blockula-ghost and every Plonky3 crate

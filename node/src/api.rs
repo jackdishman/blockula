@@ -1664,6 +1664,61 @@ mod http_tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// `/api/ghost` and ghost txs over HTTP: the status (off by default), the wire form as
+    /// `application/octet-stream` (a ghost tx is bigger than the JSON body limit), refused while
+    /// Ghost Mode is off, without verifying its proof; a signed tx's wire form is accepted like its
+    /// JSON; a published ghost address is found by name.
+    #[tokio::test]
+    async fn ghost_status_and_binary_submission() {
+        let (root, n) = node("ghostapi");
+        let (s, g, _) = call(&n, "GET", "/api/ghost", None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!((g["active"].as_bool(), g["paused"].as_bool(), g["pool"].as_str(), g["frontier_size"].as_u64()), (Some(false), Some(false), Some("0"), Some(0)));
+        assert_eq!(g["instance"].as_str().map(str::len), Some(64));
+        assert_eq!(g["audited"], false);
+        let send = |bytes: Vec<u8>| {
+            let app = router(n.clone()).layer(MockConnectInfo("127.0.0.1:1".parse::<SocketAddr>().unwrap()));
+            async move {
+                let req = Request::builder().method("POST").uri("/api/tx").header("content-type", "application/octet-stream").body(Body::from(bytes)).unwrap();
+                let res = app.oneshot(req).await.unwrap();
+                let status = res.status();
+                let body = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+                (status, serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null))
+            }
+        };
+        // A ghost tx of real size (its proof is junk: it's never verified while Ghost Mode is off).
+        let mut bundle = crate::types::tests::vector_bundle(1);
+        bundle.proof = HexBytes(vec![1; 150_000]);
+        let ghost = Tx { chain_id: "ghostapi".into(), from: String::new(), nonce: 0, fee: 10_000_000, tip: 0, valid_until: 50, action: Action::PrivateTransfer { bundle }, memo: String::new(), public_key: String::new(), signature: String::new() };
+        assert!(ghost.to_bytes().len() > MAX_BODY_BYTES);
+        let (s, v) = send(ghost.to_bytes()).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("Ghost Mode is off"), "{v}");
+        let (s, v) = send(vec![0; 40]).await;
+        assert!(s == StatusCode::BAD_REQUEST && v["error"].as_str().unwrap().contains("v3"), "{v}");
+        // A signed transfer in its wire form.
+        let alice = crate::crypto::Keys::from_seed([6; 32]);
+        n.chain.lock().faucet(&alice.address(), 10 * DROPS_PER_FANG).unwrap();
+        n.chain.lock().produce_block().unwrap();
+        let mut t = Tx { chain_id: "ghostapi".into(), from: alice.address(), nonce: 0, fee: 0, tip: 0, valid_until: 50, action: Action::RegisterName { name: "alice".into() }, memo: String::new(), public_key: hex::encode(alice.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+        t.fee = min_fee(t.size());
+        let t = t.sign(&alice);
+        let (s, v) = send(t.to_bytes()).await;
+        assert_eq!((s, v["id"].as_str()), (StatusCode::OK, Some(t.id().as_str())), "{v}");
+        let (s, _, _) = call(&n, "GET", "/api/ghost/address/alice.boo", None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        // Published (as `SetGhostAddress` would), it's found by name, with its fingerprint.
+        n.chain.lock().produce_block().unwrap();
+        let addr = blockula_ghost::SpendingKey::from_seed([7; 32]).address();
+        n.chain.lock().state.ghost.addresses.insert(alice.address(), addr.to_bytes().to_vec());
+        n.chain.lock().produce_block().unwrap();
+        let (s, v, _) = call(&n, "GET", "/api/ghost/address/alice.boo", None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!((v["account"]["address"].as_str(), v["fingerprint"].as_str()), (Some(alice.address().as_str()), Some(addr.fingerprint().as_str())));
+        assert_eq!(v["address"].as_str().map(str::len), Some(2 * GHOST_ADDRESS_BYTES));
+        std::fs::remove_dir_all(root).ok();
+    }
+
     #[tokio::test]
     async fn failed_txs_report_status_instead_of_404() {
         let (root, n) = node("txfail");
