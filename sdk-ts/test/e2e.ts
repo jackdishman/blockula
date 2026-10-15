@@ -377,45 +377,64 @@ assert.ok(/^\d+$/.test(rules.proposal_deposit) && rules.voting_blocks > 0, "the 
 const paramsBefore = paramsOf(await client.params());
 const target = Number(paramsBefore.max_validators) === 31 ? 30 : 31;
 await assert.rejects(alice.propose(proposal.paramChange("max_validators", 65), { title: "too many", deposit: rules.proposal_deposit }), /max_validators/);
-const proposed = await alice.propose(proposal.paramChange("max_validators", target), { title: `e2e: max_validators ${target}`, url: "https://example.com/e2e" });
-console.log("✓", proposed.summary);
-const proposalId: number = (await client.proposals({ limit: 1 })).proposals[0].id;
-const opened = proposalSummary(await client.proposal(proposalId), rules);
-assert.deepEqual([opened.status, opened.title, opened.supermajority, opened.proposer], ["voting", `e2e: max_validators ${target}`, false, alice.address]);
-console.log("✓", (await alice.vote(proposalId, true, "1", 1)).summary);
-await assert.rejects(alice.vote(proposalId, true, "1000000", 1), /vote with up to/);
-// Voted tokens are locked: they can't be sent away (and voted again from another account) until
-// the lock lapses. Bob holds no stake, so the lock covers his liquid FANG.
-console.log("✓", (await bob.vote(proposalId, true, "5", 1)).summary);
-await assert.rejects(bob.send(alice.address, BigInt((await client.account(bob.address)).balance) - parseFang("1")), /is locked \(vote:/);
-const voted = proposalSummary(await client.proposal(proposalId), rules);
-assert.deepEqual([voted.aye_amount, voted.aye, voted.voters], [parseFang("6").toString(), parseFang("6").toString(), 2]);
-if (councilSeed) {
-  const council = Wallet.fromSeed(councilSeed.trim(), client);
-  console.log("✓", (await council.vote(proposalId, true, "1", 0)).summary);
-  assert.equal(proposalSummary(await client.proposal(proposalId)).council.ayes, 1, "the validator's vote counts in the council");
+// (A chain without dev durations asks a deposit the faucet doesn't cover: governance's refusals
+// below still run there.)
+let proposalId: number | undefined;
+let votingEnds = 0;
+if (BigInt(rules.proposal_deposit) + parseFang("5") <= BigInt((await client.account(alice.address)).balance)) {
+  const proposed = await alice.propose(proposal.paramChange("max_validators", target), { title: `e2e: max_validators ${target}`, url: "https://example.com/e2e" });
+  console.log("✓", proposed.summary);
+  const id: number = (await client.proposals({ limit: 1 })).proposals[0].id;
+  proposalId = id;
+  const opened = proposalSummary(await client.proposal(id), rules);
+  assert.deepEqual([opened.status, opened.title, opened.supermajority, opened.proposer], ["voting", `e2e: max_validators ${target}`, false, alice.address]);
+  console.log("✓", (await alice.vote(id, true, "1", 1)).summary);
+  await assert.rejects(alice.vote(id, true, "1000000", 1), /vote with up to/);
+  // Voted tokens are locked: they can't be sent away (and voted again from another account) until
+  // the lock lapses. Bob holds no stake, so the lock covers his liquid FANG.
+  console.log("✓", (await bob.vote(id, true, "5", 1)).summary);
+  await assert.rejects(bob.send(alice.address, BigInt((await client.account(bob.address)).balance) - parseFang("1")), /is locked \(vote:/);
+  const voted = proposalSummary(await client.proposal(id), rules);
+  assert.deepEqual([voted.aye_amount, voted.aye, voted.voters], [parseFang("6").toString(), parseFang("6").toString(), 2]);
+  votingEnds = voted.voting_ends_at;
+  if (councilSeed) {
+    const council = Wallet.fromSeed(councilSeed.trim(), client);
+    console.log("✓", (await council.vote(id, true, "1", 0)).summary);
+    assert.equal(proposalSummary(await client.proposal(id)).council.ayes, 1, "the validator's vote counts in the council");
+  }
+} else {
+  console.log(`(skipping a proposal: its ${formatFang(BigInt(rules.proposal_deposit))} deposit is more than the faucet gave)`);
 }
-// Staking, continued: once the unbonding period is over, withdraw.
-console.log(`  waiting for the unbonding entry (free at block #${unbonding.unbonding[0].completes_at})…`);
-await until("the unbonding entry", async () => stakeSummary(await client.staking(alice.address)).unbonding[0]?.ready);
-const beforeWithdraw = BigInt((await client.account(alice.address)).balance);
-const withdrawn = await alice.withdrawUnbonded();
-console.log("✓", withdrawn.summary);
-assert.equal(BigInt((await client.account(alice.address)).balance), beforeWithdraw + BigInt(unbonding.unbonding_total) - BigInt(withdrawn.fee));
-const afterWithdraw = stakeSummary(await client.staking(alice.address));
-assert.deepEqual([afterWithdraw.unbonding.length, afterWithdraw.withdrawable], [0, "0"]);
-console.log("✓ staking: delegated, unbonded, withdrew;", afterWithdraw.summary);
 
-if (councilSeed) {
-  console.log(`  waiting for the vote to close at block #${voted.voting_ends_at} and the timelock…`);
+// Staking, continued: once the unbonding period is over, withdraw (on chains with dev durations:
+// elsewhere unbonding takes weeks).
+const { height: nowHeight } = await client.status();
+if (unbonding.unbonding[0].completes_at - nowHeight <= 900) {
+  console.log(`  waiting for the unbonding entry (free at block #${unbonding.unbonding[0].completes_at})…`);
+  await until("the unbonding entry", async () => stakeSummary(await client.staking(alice.address)).unbonding[0]?.ready);
+  const beforeWithdraw = BigInt((await client.account(alice.address)).balance);
+  const withdrawn = await alice.withdrawUnbonded();
+  console.log("✓", withdrawn.summary);
+  assert.equal(BigInt((await client.account(alice.address)).balance), beforeWithdraw + BigInt(unbonding.unbonding_total) - BigInt(withdrawn.fee));
+  const afterWithdraw = stakeSummary(await client.staking(alice.address));
+  assert.deepEqual([afterWithdraw.unbonding.length, afterWithdraw.withdrawable], [0, "0"]);
+  console.log("✓ staking: delegated, unbonded, withdrew;", afterWithdraw.summary);
+} else {
+  console.log(`(not waiting ${unbonding.unbonding[0].completes_at - nowHeight} blocks for the unbonding to finish: this chain doesn't have dev durations)`);
+}
+
+// The council key passes the proposal alone only if its validator is the whole set (a dev chain).
+if (proposalId !== undefined && councilSeed && validators.active.length === 1 && votingEnds - (await client.status()).height <= 900) {
+  const id = proposalId;
+  console.log(`  waiting for the vote to close at block #${votingEnds} and the timelock…`);
   const done = await until("the proposal to execute", async () => {
-    const p = proposalSummary(await client.proposal(proposalId), rules);
+    const p = proposalSummary(await client.proposal(id), rules);
     return p.status === "executed" || p.status === "rejected" || p.status === "failed" ? p : undefined;
   });
   assert.equal(done.status, "executed", done.outcome);
   assert.equal(done.council.of, 1);
   assert.equal(paramsOf(await client.params()).max_validators, String(target));
-  console.log(`✓ governance: proposal #${proposalId} passed by the council and ran (${done.outcome}); max_validators is ${target}`);
+  console.log(`✓ governance: proposal #${id} passed by the council and ran (${done.outcome}); max_validators is ${target}`);
   // Unlock once the vote's lock has run out.
   await until("the vote lock to expire", async () => {
     try {
@@ -426,9 +445,10 @@ if (councilSeed) {
     }
   });
   console.log("✓ vote locks released");
-} else {
-  console.log("(skipping the council vote: set BLOCKULA_ADMIN_SEED or BLOCKULA_HOME to the dev chain's)");
+} else if (proposalId !== undefined) {
+  console.log("(not waiting for the proposal to run: that needs a dev chain's single validator as the council, via BLOCKULA_ADMIN_SEED or BLOCKULA_HOME)");
 }
+
 // Refused for their own reasons, not the encoding.
 const governance: [Action, RegExp][] = [
   [{ type: "vote", proposal_id: 1_000_000, aye: true, amount: "1", conviction: 1 }, /no proposal #1000000/],
