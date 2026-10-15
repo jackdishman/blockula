@@ -206,7 +206,7 @@ pub fn check_next_with(state: &State, next_height: u64, supported: u32) -> Resul
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Halt {
     /// `--halt-height`: `height` is executed, as asked.
-    HaltHeight { height: u64 },
+    AtHeight { height: u64 },
     /// Block `height` runs protocol `version`; this binary supports up to `supported`.
     UpgradeRequired { height: u64, version: u32, supported: u32 },
     /// Slashing protection saw this validator's key sign something this process didn't
@@ -218,7 +218,7 @@ impl Halt {
     /// The process exit code for this halt.
     pub fn exit_code(&self) -> i32 {
         match self {
-            Halt::HaltHeight { .. } => EXIT_HALT_HEIGHT,
+            Halt::AtHeight { .. } => EXIT_HALT_HEIGHT,
             Halt::UpgradeRequired { .. } => EXIT_UPGRADE_REQUIRED,
             Halt::DoubleSignRisk { .. } => EXIT_DOUBLE_SIGN_RISK,
         }
@@ -227,7 +227,7 @@ impl Halt {
     /// Short machine-readable kind (`/api/health`, `/metrics`).
     pub fn kind(&self) -> &'static str {
         match self {
-            Halt::HaltHeight { .. } => "halt_height",
+            Halt::AtHeight { .. } => "halt_height",
             Halt::UpgradeRequired { .. } => "upgrade_required",
             Halt::DoubleSignRisk { .. } => "double_sign_risk",
         }
@@ -237,7 +237,7 @@ impl Halt {
 impl std::fmt::Display for Halt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Halt::HaltHeight { height } => write!(f, "halted at block {height} (--halt-height): remove the flag, or raise it, to continue"),
+            Halt::AtHeight { height } => write!(f, "halted at block {height} (--halt-height): remove the flag, or raise it, to continue"),
             Halt::UpgradeRequired { height, version, supported } => {
                 write!(f, "block {height} runs protocol v{version}, but this binary supports up to v{supported}: upgrade blockula to keep following the chain")
             }
@@ -300,7 +300,7 @@ pub fn before_block(c: &Chain, height: u64) -> Result<()> {
         return Err(h.into());
     }
     if let Some(h) = c.halt.halt_height.filter(|h| height > *h) {
-        return Err(Halt::HaltHeight { height: h }.into());
+        return Err(Halt::AtHeight { height: h }.into());
     }
     check_next_with(&c.state, height, c.halt.supported)?;
     Ok(())
@@ -311,7 +311,7 @@ pub fn before_block(c: &Chain, height: u64) -> Result<()> {
 /// leaves the block unacknowledged so consensus delivers nothing more.
 pub fn after_block(c: &Chain, height: u64) -> Result<()> {
     let halt = match c.halt.halt_height {
-        Some(h) if height >= h => Some(Halt::HaltHeight { height }),
+        Some(h) if height >= h => Some(Halt::AtHeight { height }),
         _ => check_next_with(&c.state, height + 1, c.halt.supported).err(),
     };
     match halt {

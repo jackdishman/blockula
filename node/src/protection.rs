@@ -267,6 +267,7 @@ impl Protection {
     }
 
     /// A copy of the record as it stands.
+    #[cfg(test)]
     pub fn record(&self) -> Record {
         self.inner.lock().record.clone()
     }
@@ -382,10 +383,8 @@ impl Protection {
             }
         }
         std::fs::rename(&tmp, path)?;
-        if self.durable {
-            if let Some(dir) = path.parent() {
-                std::fs::File::open(dir)?.sync_all()?;
-            }
+        if let Some(dir) = path.parent().filter(|_| self.durable) {
+            std::fs::File::open(dir)?.sync_all()?;
         }
         Ok(())
     }
