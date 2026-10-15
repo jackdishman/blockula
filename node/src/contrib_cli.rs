@@ -1,6 +1,7 @@
-//! `blockula hunt …` (bounties on GitHub issues) and `blockula contrib …` (Proof of Contribution:
-//! claims, vouches, Séance jury duty, rewards, and the Season 0 admin levers). Talks to any
-//! node's HTTP API and signs with the CLI wallet or a key file.
+//! `blockula hunt …` (bounties on GitHub issues), `blockula contrib …` (Proof of Contribution:
+//! claims, vouches, Séance jury duty, rewards, and the Season 0 admin levers), `blockula name …`
+//! (renew, transfer, release) and `blockula stake …` (delegating to validator pools). Talks to
+//! any node's HTTP API and signs with the CLI wallet or a key file.
 
 use crate::crypto::{self, Keys};
 use crate::types::*;
@@ -573,9 +574,208 @@ pub fn contrib(cmd: ContribCmd, dir: &Path) -> Result<()> {
     }
 }
 
+// ------------------------------------------------------------------------------------- names
+
+#[derive(Subcommand)]
+pub enum NameCmd {
+    /// Who owns a name and until when, or what it costs
+    Show {
+        name: String,
+        #[command(flatten)]
+        rpc: Rpc,
+    },
+    /// Extend a name you own (1–10 years, paid at the renewal price per year, burned)
+    Renew {
+        name: String,
+        #[arg(long, default_value = "1")]
+        years: u8,
+        #[command(flatten)]
+        signer: Signer,
+    },
+    /// Give a name you own to another account (.boo name or address)
+    Transfer {
+        name: String,
+        to: String,
+        /// Don't ask for confirmation
+        #[arg(long)]
+        yes: bool,
+        #[command(flatten)]
+        signer: Signer,
+    },
+    /// Give up a name you own: anyone can register it afterwards
+    Release {
+        name: String,
+        /// Don't ask for confirmation
+        #[arg(long)]
+        yes: bool,
+        #[command(flatten)]
+        signer: Signer,
+    },
+}
+
+pub fn name(cmd: NameCmd, dir: &Path) -> Result<()> {
+    match cmd {
+        NameCmd::Show { name, rpc } => {
+            let v = rt()?.block_on(get(&rpc.rpc, &format!("/name/{name}")))?;
+            let n = v["name"].as_str().unwrap_or_default();
+            if v["available"] == true {
+                println!("{n} is available for {}", v["price_display"].as_str().unwrap_or_default());
+            } else {
+                println!("{n} belongs to {} (registered at block {})", v["owner"]["address"].as_str().unwrap_or_default(), v["registered_at"]);
+                // Expiry fields come with name renewals (DEC-11); older nodes don't report them.
+                if let Some(e) = v["expires_at"].as_u64() {
+                    println!("   expires at block {e}{}", v["grace_until"].as_u64().map(|g| format!(", renewable by its owner until block {g}")).unwrap_or_default());
+                }
+            }
+            Ok(())
+        }
+        NameCmd::Renew { name, years, signer } => {
+            if !(1..=MAX_RENEW_YEARS).contains(&years) {
+                bail!("renew for 1–{MAX_RENEW_YEARS} years");
+            }
+            submit(dir, &signer, Action::RenewName { name: normalize_name(&name)?, years }).map(|_| ())
+        }
+        NameCmd::Transfer { name, to, yes, signer } => {
+            let n = normalize_name(&name)?;
+            let to = rt()?.block_on(resolve(&signer.rpc, &to))?;
+            confirm(&format!("Give {n}{NAME_SUFFIX} to {to}? Only they can give it back."), yes)?;
+            submit(dir, &signer, Action::TransferName { name: n, to }).map(|_| ())
+        }
+        NameCmd::Release { name, yes, signer } => {
+            let n = normalize_name(&name)?;
+            confirm(&format!("Release {n}{NAME_SUFFIX}? Anyone can register it afterwards."), yes)?;
+            submit(dir, &signer, Action::ReleaseName { name: n }).map(|_| ())
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------------- stake
+
+#[derive(Subcommand)]
+pub enum StakeCmd {
+    /// An account's stake: pools, shares, value and unbonding entries
+    Show {
+        /// Name or address (default: the wallet's account)
+        #[arg(long)]
+        account: Option<String>,
+        #[command(flatten)]
+        signer: Signer,
+    },
+    /// Delegate FANG to a validator's pool (it earns issuance and is slashed with the pool)
+    Delegate {
+        /// The validator's address
+        validator: String,
+        /// FANG, e.g. 100
+        amount: String,
+        #[command(flatten)]
+        signer: Signer,
+    },
+    /// Start unbonding pool shares (withdraw them after the unbonding period)
+    Undelegate {
+        validator: String,
+        #[command(flatten)]
+        shares: Shares,
+        #[command(flatten)]
+        signer: Signer,
+    },
+    /// Move pool shares to another validator without unbonding
+    Redelegate {
+        from: String,
+        to: String,
+        #[command(flatten)]
+        shares: Shares,
+        #[command(flatten)]
+        signer: Signer,
+    },
+    /// Pay out unbonding entries that have finished
+    Withdraw {
+        #[command(flatten)]
+        signer: Signer,
+    },
+}
+
+#[derive(Args, Clone)]
+#[group(required = true, multiple = false)]
+pub struct Shares {
+    /// How many pool shares (see `blockula stake show`)
+    #[arg(long)]
+    shares: Option<u64>,
+    /// Every share you hold in that pool
+    #[arg(long)]
+    all: bool,
+}
+
+/// The delegations in a `/api/staking/{account}` response, as (validator address, shares). Tolerant
+/// of the field names the endpoint has used: a validator label or address, shares as a string or
+/// number.
+fn delegations(v: &Value) -> Vec<(String, u64)> {
+    let list = ["delegations", "stakes", "pools"].iter().find_map(|k| v[k].as_array()).cloned().unwrap_or_default();
+    list.iter()
+        .filter_map(|d| {
+            let val = if d["validator"].is_null() { &d["pool"] } else { &d["validator"] };
+            let addr = val.as_str().or(val["address"].as_str())?.to_string();
+            let shares = d["shares"].as_u64().or_else(|| d["shares"].as_str()?.parse().ok())?;
+            Some((addr, shares))
+        })
+        .collect()
+}
+
+/// `--shares N`, or with `--all` every share `account` holds with `validator`.
+async fn shares_of(rpc: &str, account: &str, validator: &str, s: &Shares) -> Result<u64> {
+    if let Some(n) = s.shares {
+        return Ok(n);
+    }
+    let v = get(rpc, &format!("/staking/{account}")).await.with_context(|| format!("{rpc} doesn't serve /api/staking (is staking active on this chain?)"))?;
+    delegations(&v).into_iter().find(|(a, _)| a == validator).map(|(_, n)| n).filter(|n| *n > 0).ok_or_else(|| anyhow!("{account} has no stake with {validator}"))
+}
+
+pub fn stake(cmd: StakeCmd, dir: &Path) -> Result<()> {
+    match cmd {
+        StakeCmd::Show { account, signer } => {
+            let rt = rt()?;
+            let who = match account.or(signer.from.clone()) {
+                Some(a) => rt.block_on(resolve(&signer.rpc, &a))?,
+                None => rt.block_on(own_address(&signer.rpc, &signer.keys(dir).map_err(|_| anyhow!("no wallet here; pass --account"))?))?,
+            };
+            let v = rt.block_on(get(&signer.rpc, &format!("/staking/{who}"))).with_context(|| format!("{} doesn't serve /api/staking (is staking active on this chain?)", signer.rpc))?;
+            let shown = |k: &str| v[format!("{k}_display")].as_str().map(String::from).or_else(|| v[k].as_str().map(|d| d.parse::<u64>().map(fmt_fang).unwrap_or_else(|_| d.to_string())));
+            println!("{who} · staked {} · unbonding {}", shown("bonded").unwrap_or_else(|| "?".into()), shown("unbonding_total").unwrap_or_else(|| "?".into()));
+            for (validator, shares) in delegations(&v) {
+                println!("   {validator}  {shares} shares");
+            }
+            Ok(())
+        }
+        StakeCmd::Delegate { validator, amount, signer } => submit(dir, &signer, Action::Delegate { validator, amount: parse_fang(&amount)? }).map(|_| ()),
+        StakeCmd::Undelegate { validator, shares, signer } => {
+            let keys = signer.keys(dir)?;
+            let rt = rt()?;
+            let me = rt.block_on(signer.from(&keys))?;
+            let shares = rt.block_on(shares_of(&signer.rpc, &me, &validator, &shares))?;
+            submit(dir, &signer, Action::Undelegate { validator, shares }).map(|_| ())
+        }
+        StakeCmd::Redelegate { from, to, shares, signer } => {
+            let keys = signer.keys(dir)?;
+            let rt = rt()?;
+            let me = rt.block_on(signer.from(&keys))?;
+            let shares = rt.block_on(shares_of(&signer.rpc, &me, &from, &shares))?;
+            submit(dir, &signer, Action::Redelegate { from_validator: from, to_validator: to, shares }).map(|_| ())
+        }
+        StakeCmd::Withdraw { signer } => submit(dir, &signer, Action::WithdrawUnbonded {}).map(|_| ()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/api/staking` is read tolerantly: labels or bare addresses, shares as strings or numbers.
+    #[test]
+    fn staking_responses_parse() {
+        let v = serde_json::json!({ "delegations": [{ "validator": { "address": "boo1v", "name": "v.boo" }, "shares": "40" }, { "validator": "boo1w", "shares": 7 }, { "validator": "boo1x" }] });
+        assert_eq!(delegations(&v), vec![("boo1v".to_string(), 40), ("boo1w".to_string(), 7)]);
+        assert_eq!(delegations(&serde_json::json!({ "pools": [{ "pool": "boo1p", "shares": 1 }] })), vec![("boo1p".to_string(), 1)]);
+        assert!(delegations(&serde_json::json!({})).is_empty());
+    }
 
     #[test]
     fn soul_amounts_parse() {
