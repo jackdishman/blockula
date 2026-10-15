@@ -66,10 +66,12 @@ async fn start_muteable(context: &deterministic::Context, oracle: &mut Oracle<Pu
         let (sender, receiver) = control.register(c, consensus::quota(c)).await.unwrap();
         channels.push((Muted { inner: sender, mute: (c == CH_VOTES || c == CH_CERTS).then(|| mute.clone()) }, receiver));
     }
-    let cfg = ValidatorConfig { chain: chain.clone(), key: key.clone(), genesis: consensus::genesis_block(genesis), block_time_ms: genesis.block_time_ms, epoch_blocks: genesis.epoch_blocks, partition: format!("v{idx}") };
+    // Honest validators run with slashing protection, as in `super::start`.
+    let protection = Protection::open(&home.join(crate::protection::RECORD_FILE), key.public_key().as_ref(), Timing::for_block_time(genesis.block_time_ms), false).unwrap();
+    let cfg = ValidatorConfig { chain: chain.clone(), key: key.clone(), genesis: consensus::genesis_block(genesis), block_time_ms: genesis.block_time_ms, epoch_blocks: genesis.epoch_blocks, partition: format!("v{idx}"), protection: Some(protection.clone()) };
     let ctx = context.child("validator").with_attribute("idx", idx).with_attribute("run", 0);
     let (handle, _marshal) = consensus::start_validator(ctx, cfg, oracle.manager(), control, channels).await;
-    Val { home, key, chain, handle: Some(handle) }
+    Val { home, key, chain, handle: Some(handle), protection }
 }
 
 /// The 4 genesis validators, each with a mute switch on its votes.

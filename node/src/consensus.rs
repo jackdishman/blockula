@@ -5,8 +5,10 @@
 //! * **propose** (leader): wait until `parent.timestamp + block_time`, pick mempool txs (highest
 //!   tip per byte first) that apply on top of our executed state plus any not-yet-executed
 //!   ancestors, and attach the latest state root we've executed (`exec_height`, `exec_root`).
-//! * **verify** (everyone, before voting): version, view and parent view against the consensus
-//!   context, structure, size limits, timestamps, proposer == leader, stateless tx checks
+//! * **verify** (everyone, before voting): view and parent view against the consensus context,
+//!   the protocol version in force at the height (`upgrade.rs`; no vote at all past a halt or for
+//!   a version this binary can't run), structure, size limits, timestamps, proposer == leader,
+//!   stateless tx checks
 //!   (canonical wire bytes, chain id, address prefix, validity window, ML-DSA signature, fee), and
 //!   the attached state root (waiting until we've executed that height). Only permanently invalid
 //!   blocks get `false`; anything that can still change keeps the verdict pending.
@@ -106,6 +108,15 @@ impl CBlock {
     #[allow(clippy::too_many_arguments)]
     pub fn new(parent: Digest, height: u64, view: u64, parent_view: u64, timestamp_ms: u64, proposer: String, exec_height: u64, exec_root: [u8; 32], txs: Vec<Vec<u8>>) -> Self {
         Self { version: PROTOCOL_VERSION, parent, height, view, parent_view, timestamp_ms, proposer, exec_height, exec_root, signal: SUPPORTED_PROTOCOL_VERSION, txs, digest: Digest([0; 32]) }.sealed()
+    }
+
+    /// This block under protocol `version`, signalling `signal` (re-sealed if either changes).
+    pub fn with_versions(mut self, version: u32, signal: u32) -> Self {
+        if (version, signal) == (self.version, self.signal) {
+            return self;
+        }
+        (self.version, self.signal) = (version, signal);
+        self.sealed()
     }
 
     /// Computes the digest over everything else.
@@ -316,6 +327,15 @@ where
         let height = parent.height + 1;
         let (view, parent_view) = (cctx.round.view().get(), cctx.parent.0.get());
         let proposer = cctx.leader.address(&self.address_prefix);
+        // Nothing past --halt-height, a halt or a version this binary can't run (3.9). Blocks
+        // carry the version in force at their height and signal what this binary supports.
+        let (version, signal) = {
+            let c = self.chain.lock();
+            if !c.halt.allows(&c.state, height) {
+                return None;
+            }
+            (crate::upgrade::version_at(&c.state, height), c.halt.supported)
+        };
 
         // Blocks between what we've executed and the parent are ordered but not yet executed:
         // collect them so we don't re-propose (or overdraw) their txs.
@@ -330,7 +350,7 @@ where
                         return None;
                     }
                     let c = self.chain.lock();
-                    return Some(CBlock::new(parent.digest(), height, view, parent_view, timestamp_ms, proposer, c.height(), hex_32(&c.state.root()), vec![]));
+                    return Some(CBlock::new(parent.digest(), height, view, parent_view, timestamp_ms, proposer, c.height(), hex_32(&c.state.root()), vec![]).with_versions(version, signal));
                 }
                 pending.push(ancestry.next().await?);
             }
@@ -399,7 +419,7 @@ where
             None => (exec_height, exec_root),
         };
         debug!(height, view, txs = txs.len(), "proposing");
-        Some(CBlock::new(parent.digest(), height, view, parent_view, timestamp_ms, proposer, exec_height, exec_root, txs))
+        Some(CBlock::new(parent.digest(), height, view, parent_view, timestamp_ms, proposer, exec_height, exec_root, txs).with_versions(version, signal))
     }
 
     /// Returns `false` only for permanently invalid blocks (the `Application::verify` contract):
@@ -411,11 +431,21 @@ where
             warn!(height = block.height, why, "rejecting block");
             false
         };
-        if block.version != PROTOCOL_VERSION {
-            return reject("unsupported protocol version");
-        }
         if block.view != cctx.round.view().get() || block.parent_view != cctx.parent.0.get() {
             return reject("view or parent_view doesn't match the consensus round");
+        }
+        // The protocol version in force at this height (3.9). An upgrade activates at least
+        // MIN_UPGRADE_LEAD blocks after the block that schedules it, so once we've executed
+        // `height - MIN_UPGRADE_LEAD` the version is certain (until then we wait).
+        wait_executed(&ctx, &self.chain, block.height.saturating_sub(crate::upgrade::MIN_UPGRADE_LEAD), None).await;
+        let expected = {
+            let c = self.chain.lock();
+            // Halted, past --halt-height, or a version this binary can't run: no vote either way.
+            (c.halt.allows(&c.state, block.height)).then(|| crate::upgrade::version_at(&c.state, block.height))
+        };
+        let Some(expected) = expected else { return futures::future::pending().await };
+        if block.version != expected {
+            return reject("wrong protocol version for this height");
         }
         if block.parent != parent.digest() || block.height != parent.height + 1 {
             return reject("bad parent link");
@@ -538,6 +568,7 @@ pub fn finalized_from(b: &CBlock, certificate: Option<Vec<u8>>) -> Finalized {
         view: b.view,
         parent_view: b.parent_view,
         version: b.version,
+        signal: b.signal,
         proposer: b.proposer.clone(),
         txs: b.parse_txs().into_iter().flatten().collect(),
         cblock: b.encode().to_vec(),
@@ -576,8 +607,12 @@ impl Reporter for Executor {
                             }
                             ack.acknowledge();
                         }
-                        // Not acknowledging makes marshal stop: better than diverging silently.
-                        Err(e) => error!(error = %e, height = block.height, "failed to execute finalized block"),
+                        // Not acknowledging makes marshal stop: better than diverging silently. A
+                        // halt (upgrade.rs) stops the same way, on purpose.
+                        Err(e) => match c.halt.signal.get() {
+                            Some(halt) => warn!(height = block.height, "{halt}"),
+                            None => error!(error = %e, height = block.height, "failed to execute finalized block"),
+                        },
                     }
                 }
             }
@@ -595,12 +630,20 @@ pub struct EpochProvider {
     key: Option<PrivateKey>,
     namespace: Vec<u8>,
     cache: Arc<Mutex<HashMap<u64, Arc<MlDsaScheme>>>>,
+    /// Every signature our schemes make passes it first.
+    protection: Option<Arc<crate::protection::Protection>>,
 }
 
 impl EpochProvider {
     pub fn new(chain: Shared, key: Option<PrivateKey>) -> Self {
         let namespace = namespace(&chain.lock().genesis.chain_id);
-        Self { chain, key, namespace, cache: Default::default() }
+        Self { chain, key, namespace, cache: Default::default(), protection: None }
+    }
+
+    /// Signs only what `protection` allows (validators).
+    pub fn with_protection(mut self, protection: Option<Arc<crate::protection::Protection>>) -> Self {
+        self.protection = protection;
+        self
     }
 
     pub fn participants(&self, epoch: u64) -> Option<Set<PublicKey>> {
@@ -624,7 +667,7 @@ impl EpochProvider {
         }
         let parts = self.participants(epoch)?;
         let scheme = match &self.key {
-            Some(k) if parts.position(&k.public_key()).is_some() => MlDsaScheme::signer(&self.namespace, parts, k.clone())?,
+            Some(k) if parts.position(&k.public_key()).is_some() => MlDsaScheme::signer(&self.namespace, parts, k.clone())?.with_protection(self.protection.clone()),
             _ => MlDsaScheme::verifier(&self.namespace, parts),
         };
         let scheme = Arc::new(scheme);
@@ -662,6 +705,8 @@ pub struct ValidatorConfig {
     pub epoch_blocks: u64,
     /// Prefix for all on-disk partitions (lets several validators share one runtime in tests).
     pub partition: String,
+    /// Slashing protection for this key (`protection.rs`); every vote passes it.
+    pub protection: Option<Arc<crate::protection::Protection>>,
 }
 
 pub type Channel<S, R> = (S, R);
@@ -687,7 +732,8 @@ where
     let votes_net = channels.pop().unwrap();
 
     let me = cfg.key.public_key();
-    let provider = EpochProvider::new(cfg.chain.clone(), Some(cfg.key.clone()));
+    let protection = cfg.protection.clone();
+    let provider = EpochProvider::new(cfg.chain.clone(), Some(cfg.key.clone())).with_protection(protection.clone());
     let page_cache = CacheRef::from_pooler(&context, NonZeroU16::new(PAGE_SIZE).unwrap(), NonZeroUsize::new(PAGE_CACHE_PAGES).unwrap());
     let prefix = cfg.partition.clone();
     let chain = cfg.chain.clone();
@@ -815,6 +861,23 @@ where
         let (mux, mut resolver_mux) = Muxer::new(context.child("resolver_mux"), resolver_net.0, resolver_net.1, 1024);
         mux.start();
 
+        // Slashing protection's clock (its startup rule waits on the network for a while), and the
+        // newest epoch the network has finalized a block in (no votes in epochs it has left).
+        if let Some(p) = protection.clone() {
+            let chain = chain.clone();
+            context.child("slashing_protection").spawn(move |ctx| async move {
+                loop {
+                    let finalized = {
+                        let c = chain.lock();
+                        c.state.params.epoch_of(c.finalized_tip.max(1))
+                    };
+                    p.note_finalized_epoch(finalized);
+                    p.tick(ms(ctx.current()));
+                    ctx.sleep(Duration::from_millis(250)).await;
+                }
+            });
+        }
+
         let address_prefix = chain.lock().genesis.address_prefix.clone();
         let app = Inline::new(context.child("inline"), App { chain: chain.clone(), block_time_ms, address_prefix }, marshal.clone(), FixedEpocher::new(epoch_len));
         let bt = Duration::from_millis(block_time_ms);
@@ -825,6 +888,8 @@ where
         let _ = height;
         let mut tracked = None;
         let mut active: Option<Handle<()>> = None;
+        // Simplex journals below this epoch are gone (a few more are swept after a restart).
+        let mut journals_from = epoch.saturating_sub(JOURNAL_EPOCHS_KEPT + 16);
         loop {
             // (Re)enter `epoch`.
             if let Some(h) = active.take() {
@@ -849,6 +914,9 @@ where
                 Digest(hex_32(&c.hash_at(h).unwrap_or_default()))
             };
             let voting = scheme.me().is_some();
+            if let Some(p) = &protection {
+                p.enter_epoch(epoch, scheme.me().map(|i| usize::from(i) as u32), scheme.participants().len(), ms(context.current()));
+            }
             let engine = simplex::Engine::new(
                 context.child("simplex").with_attribute("epoch", epoch),
                 simplex::config::Config {
@@ -857,9 +925,9 @@ where
                     blocker: blocker.clone(),
                     automaton: app.clone(),
                     relay: app.clone(),
-                    reporter: Reporters::from((marshal.clone(), certs.clone())),
+                    reporter: Reporters::from((marshal.clone(), Reporters::<_, _, crate::protection::Observer>::from((certs.clone(), protection.clone().map(crate::protection::Observer))))),
                     strategy: Sequential,
-                    partition: format!("{prefix}-simplex-{epoch}"),
+                    partition: simplex_partition(&prefix, epoch),
                     mailbox_size: NZUsize!(1024),
                     epoch: Epoch::new(epoch),
                     floor: simplex::config::Floor::Genesis(floor_digest),
@@ -882,6 +950,12 @@ where
             };
             active = Some(engine.start(v, c, r));
             info!(epoch, voting, validators = scheme.participants().len(), "entered epoch");
+            // Older epochs' simplex journals are never read again (OPS-6).
+            let keep_from = epoch.saturating_sub(JOURNAL_EPOCHS_KEPT);
+            for old in journals_from..keep_from {
+                let _ = context.remove(&simplex_partition(&prefix, old), None).await;
+            }
+            journals_from = journals_from.max(keep_from);
 
             // Wait for the boundary of this epoch (or hints that we're behind).
             loop {
@@ -921,6 +995,15 @@ fn hint_behind(marshal: &MarshalMailbox, chain: &Shared, ours: u64, theirs: u64,
     let last = chain.lock().state.params.last_of(ours);
     debug!(ours, theirs, last, "peer is in a later epoch; fetching boundary");
     marshal.hint_finalized(Height::new(last), commonware_utils::vec::NonEmptyVec::new(from));
+}
+
+/// Simplex journals kept: the current epoch's and the two before it (OPS-6). Older ones are
+/// deleted when an epoch starts, and at startup (`node::prune_epoch_journals`).
+pub const JOURNAL_EPOCHS_KEPT: u64 = 2;
+
+/// The storage partition of `epoch`'s simplex journal.
+pub fn simplex_partition(prefix: &str, epoch: u64) -> String {
+    format!("{prefix}-simplex-{epoch}")
 }
 
 /// Finalized blocks/certificates marshal keeps; older ones are pruned (our own `cblocks/` log and
@@ -1122,5 +1205,58 @@ mod tests {
             assert!(verify(child(&p102, 7, 101, root101, vec![tx(110).to_bytes()]), &p102).await);
         });
         std::fs::remove_dir_all(root_dir).ok();
+    }
+
+    /// Blocks must carry the protocol version in force at their height (3.9). A node votes on
+    /// nothing it couldn't execute: a version its binary doesn't run, or a height past
+    /// `--halt-height`. It proposes nothing there either, and signals its own supported version.
+    #[test]
+    fn verify_checks_the_version_in_force_and_abstains_past_a_halt() {
+        let home = std::env::temp_dir().join(format!("blockula-versions-{}-{}", crate::chain::now_ms(), std::process::id()));
+        Chain::summon(&home, &SummonOpts::new("versions", 1)).unwrap();
+        let mut c = Chain::open(&home).unwrap();
+        let v2 = SUPPORTED_PROTOCOL_VERSION + 1;
+        c.state.upgrade.schedule = vec![crate::upgrade::ScheduledUpgrade { version: v2, activation_height: 70 }];
+        for _ in 0..10 {
+            c.produce_block_with(vec![]).unwrap();
+        }
+        let root10 = hex_32(&c.root_at(10).unwrap());
+        let seed: [u8; 32] = hex::decode(std::fs::read_to_string(home.join("validator.key")).unwrap().trim()).unwrap().try_into().unwrap();
+        let chain: Shared = Arc::new(Mutex::new(c));
+        deterministic::Runner::timed(Duration::from_secs(120)).start(|context| async move {
+            let leader = PrivateKey::from_seed_bytes(seed).public_key();
+            let mut app = App { chain: chain.clone(), block_time_ms: 1_000, address_prefix: "boo".into() };
+            let parent_at = |height: u64| CBlock::new(Digest([height as u8; 32]), height, 6, 5, 0, String::new(), 9, [0; 32], vec![]);
+            let child = |parent: &CBlock, version: u32| CBlock::new(parent.digest(), parent.height + 1, 7, 6, 1_000, leader.address("boo"), 10, root10, vec![]).with_versions(version, 1);
+            let cctx = |parent: &CBlock| SimplexContext { round: Round::new(Epoch::zero(), View::new(7)), leader: leader.clone(), parent: (View::new(6), parent.digest()) };
+            // `Some(verdict)`, or `None` if it's still pending after 10 s.
+            let mut verify = async |block: CBlock, parent: &CBlock| {
+                let ancestry = marshal::ancestry::from_iter([Arc::new(block), Arc::new(parent.clone())]);
+                let verdict = Application::<deterministic::Context>::verify(&mut app, (context.child("verify"), cctx(parent)), ancestry);
+                commonware_macros::select! {
+                    v = verdict => Some(v),
+                    _ = context.sleep(Duration::from_secs(10)) => None,
+                }
+            };
+            let (p20, p73) = (parent_at(20), parent_at(73));
+            assert_eq!(verify(child(&p20, 1), &p20).await, Some(true), "v1 before the activation height");
+            assert_eq!(verify(child(&p20, 2), &p20).await, Some(false), "v2 too early");
+            // This binary runs v1 only: from the activation height on, no vote either way.
+            assert_eq!(verify(child(&p73, 2), &p73).await, None);
+            assert_eq!(verify(child(&p73, 1), &p73).await, None);
+            crate::upgrade::configure(&mut chain.lock(), v2, None);
+            assert_eq!(verify(child(&p73, 1), &p73).await, Some(false), "v1 after the activation height");
+            assert_eq!(verify(child(&p73, 2), &p73).await, Some(true));
+            // A block 64+ heights past what we executed waits until the version there is certain.
+            let p80 = parent_at(80);
+            assert_eq!(verify(child(&p80, 2), &p80).await, None);
+            // --halt-height 50: nothing past it gets a vote.
+            crate::upgrade::configure(&mut chain.lock(), v2, Some(50));
+            assert_eq!(verify(child(&p20, 1), &p20).await, Some(true));
+            assert_eq!(verify(child(&p73, 2), &p73).await, None);
+            let c = chain.lock();
+            assert!(c.halt.allows(&c.state, 50) && !c.halt.allows(&c.state, 51));
+        });
+        std::fs::remove_dir_all(home).ok();
     }
 }

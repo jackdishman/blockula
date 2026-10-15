@@ -1722,6 +1722,8 @@ pub struct Chain {
     broken: Option<String>,
     /// Blocks `open` executed again because they were past the store's commit point.
     pub replayed: u64,
+    /// What this binary supports, `--halt-height`, and whether the node halted (upgrade.rs).
+    pub halt: crate::upgrade::HaltControl,
 }
 
 /// The block logs and the state database. One executor writes at a time; the consensus path
@@ -1955,6 +1957,8 @@ pub struct Finalized {
     pub view: u64,
     pub parent_view: u64,
     pub version: u32,
+    /// Newest protocol version the proposer's binary supports (display only).
+    pub signal: u32,
     pub proposer: String,
     pub txs: Vec<Tx>,
     /// The exact consensus block bytes (stored so this node can serve `/api/sync`).
@@ -2172,6 +2176,7 @@ impl Chain {
             keep_blocks: None,
             broken: None,
             replayed: 0,
+            halt: Default::default(),
         };
         chain.replay_logs()?;
         if rebuilt_epochs {
@@ -2182,9 +2187,9 @@ impl Chain {
             chain.save_epochs();
         }
         chain.reconcile_epochs()?;
-        // A restart replays nothing, so the halt `replay` and `execute` run after every block is
-        // checked here too: a binary that can't run the next height doesn't start (3.9).
-        crate::upgrade::check_next(&chain.state, chain.height + 1)?;
+        // A restart replays nothing, so the check `execute` runs after every block runs here too: a
+        // binary that can't run the next height opens halted and executes nothing more (3.9).
+        let _ = crate::upgrade::after_block(&chain, chain.height);
         chain.set_finalized_tip(chain.height());
         chain.publish();
         chain.live.publish_epochs(chain.epochs.clone());
@@ -2428,6 +2433,8 @@ impl Chain {
             tx_spans: vec![],
             failed: block.failed.iter().map(|(i, r)| (*i as u32, r.clone())).collect(),
             history,
+            version: block.version,
+            signal: block.signal,
         })
     }
 
@@ -2461,6 +2468,8 @@ impl Chain {
         if block.height != self.height() + 1 || block.prev_hash != self.last_hash() {
             bail!("the block log is not contiguous at height {}", block.height);
         }
+        // A block this binary can't run was logged by a newer one (3.9).
+        crate::upgrade::check_next_with(&self.state, block.height, self.halt.supported)?;
         for (i, tx) in block.txs.iter().enumerate() {
             let outcome = self.state.apply(tx, &self.genesis.chain_id, &block.proposer, block.height).with_context(|| format!("replaying block {}", block.height))?;
             let expected = match block.failed.get(&i) {
@@ -2488,8 +2497,8 @@ impl Chain {
         let (snap, point) = self.writer.lock().commit(&e, durable)?;
         self.advance(&e.block);
         self.adopt(snap, point);
-        // As in `execute`: stop before a height this binary can't run (3.9).
-        crate::upgrade::check_next(&self.state, height + 1)
+        let _ = height;
+        Ok(())
     }
 
     fn note_failed(&mut self, id: String, reason: String, height: u64) {
@@ -2519,10 +2528,10 @@ impl Chain {
         let written = self.writer.clone().lock().persist(&mut e);
         self.finish(e, written)?;
         self.revalidate_mempool();
-        // The last end-of-block step: the block is executed and stored, but if this binary can't
-        // run the next height, stop here (the error leaves the block unacknowledged, so consensus
-        // stops delivering) instead of diverging. P-UPGRADE turns this into a clean exit.
-        crate::upgrade::check_next(&self.state, height + 1)
+        // The last step: the block is executed and stored, but if the node must stop here (it
+        // can't run the next height, or reached --halt-height) the error leaves the block
+        // unacknowledged, so consensus stops delivering; the node then exits or serves reads.
+        crate::upgrade::after_block(self, height)
     }
 
     /// [`Chain::execute`] for a chain that consensus and readers share: the chain lock is held
@@ -2540,8 +2549,8 @@ impl Chain {
         let dropped = check.run();
         let mut c = chain.lock();
         c.drop_from_mempool(dropped);
-        // As in `execute`: the block is stored, but the node stops before a height it can't run.
-        crate::upgrade::check_next(&c.state, height + 1)
+        // As in `execute`: the block is stored, but the node may have to stop here.
+        crate::upgrade::after_block(&c, height)
     }
 
     /// Applies a finalized block to the state in memory and prepares its commit. From here until
@@ -2551,6 +2560,8 @@ impl Chain {
         if let Some(why) = &self.broken {
             bail!("a block failed to persist ({why}); restart the node to recover from its logs");
         }
+        // Nothing executes past a halt, --halt-height or a version this binary doesn't run.
+        crate::upgrade::before_block(self, f.height)?;
         if f.height != self.height() + 1 {
             bail!("expected block {}, got {}", self.height() + 1, f.height);
         }
@@ -2591,7 +2602,7 @@ impl Chain {
         let state_root = hex::encode(commit.root);
         #[cfg(test)]
         self.state.debug_check(f.height);
-        let block = Arc::new(Block { height: f.height, prev_hash: f.parent, timestamp_ms: f.timestamp_ms, view: f.view, parent_view: f.parent_view, version: f.version, proposer: f.proposer, state_root, txs, hash: f.hash, signature: String::new(), failed, skipped });
+        let block = Arc::new(Block { height: f.height, prev_hash: f.parent, timestamp_ms: f.timestamp_ms, view: f.view, parent_view: f.parent_view, version: f.version, signal: f.signal, proposer: f.proposer, state_root, txs, hash: f.hash, signature: String::new(), failed, skipped });
         if let Some(cert) = &f.certificate {
             self.disk.remember_cert(f.height, cert.clone());
         }
@@ -3085,7 +3096,7 @@ impl Chain {
     #[cfg(test)]
     pub fn test_block(&self, txs: Vec<Tx>) -> Finalized {
         let height = self.height() + 1;
-        Finalized { height, hash: hex::encode(crypto::hash(format!("test-{}-{}", self.height(), self.last_hash()).as_bytes())), parent: self.last_hash().to_string(), timestamp_ms: now_ms(), view: height, parent_view: height - 1, version: crate::consensus::PROTOCOL_VERSION, proposer: self.fee_sink(), txs, cblock: vec![], certificate: None }
+        Finalized { height, hash: hex::encode(crypto::hash(format!("test-{}-{}", self.height(), self.last_hash()).as_bytes())), parent: self.last_hash().to_string(), timestamp_ms: now_ms(), view: height, parent_view: height - 1, version: crate::upgrade::version_at(&self.state, height), signal: self.halt.supported, proposer: self.fee_sink(), txs, cblock: vec![], certificate: None }
     }
 }
 
@@ -4556,7 +4567,7 @@ mod scaffold {
         assert!(crate::upgrade::exec_activate_feature(s, &mut j, "warp", h).is_err());
         assert!(crate::upgrade::exec_schedule_upgrade(s, &mut j, 9, h, h).is_err(), "only after now");
         crate::upgrade::exec_schedule_upgrade(s, &mut j, 9, 100, h).unwrap();
-        assert!(crate::upgrade::exec_schedule_upgrade(s, &mut j, 10, 50, h).is_err(), "only after the last one");
+        assert!(crate::upgrade::exec_schedule_upgrade(s, &mut j, 10, 80, h).unwrap_err().to_string().contains("must come after it"), "only after the last one");
         assert_eq!(crate::upgrade::version_at(s, 100), 9);
         s.check_invariants().unwrap();
         // Everything rolls back, dirty marks included.
@@ -4598,10 +4609,43 @@ mod scaffold {
         let err = c.produce_block_with(vec![]).unwrap_err().to_string();
         assert!(err.contains("block 3 runs protocol") && err.contains("upgrade blockula"), "{err}");
         assert_eq!(c.height(), 2);
+        assert_eq!(c.halt.signal.get().map(|h| h.exit_code()), Some(crate::upgrade::EXIT_UPGRADE_REQUIRED));
+        // Nothing executes past the halt.
+        assert!(c.produce_block_with(vec![]).unwrap_err().to_string().contains("block 3 runs protocol"));
         drop(c);
-        // A restart replays nothing, and still refuses to go on (the halt survives restarts).
-        let err = format!("{:#}", Chain::open(&home).err().expect("a halted node doesn't start"));
+        // A restart replays nothing and opens halted (the halt survives restarts): the API can
+        // serve reads, but the node executes nothing more.
+        let mut c = Chain::open(&home).unwrap();
+        let err = c.halt.signal.get().expect("opens halted").to_string();
         assert!(err.contains("block 3 runs protocol") && err.contains("upgrade blockula"), "{err}");
+        assert!(c.produce_block_with(vec![]).is_err());
+        assert_eq!(c.height(), 2);
+        // A binary that supports the version continues.
+        crate::upgrade::configure(&mut c, crate::consensus::SUPPORTED_PROTOCOL_VERSION + 1, None);
+        assert!(c.halt.signal.get().is_none());
+        c.produce_block_with(vec![]).unwrap();
+        assert_eq!((c.height(), c.block(3).unwrap().version), (3, crate::consensus::SUPPORTED_PROTOCOL_VERSION + 1));
+        fs::remove_dir_all(home).ok();
+    }
+
+    /// `--halt-height H` executes `H` and stops there, through restarts, until it's raised.
+    #[test]
+    fn halt_height_stops_after_executing_it() {
+        let (home, mut c) = open("halt-height", &genesis("scaffold-1"));
+        crate::upgrade::configure(&mut c, crate::consensus::SUPPORTED_PROTOCOL_VERSION, Some(2));
+        c.produce_block_with(vec![]).unwrap();
+        let err = c.produce_block_with(vec![]).unwrap_err().to_string();
+        assert!(err.contains("halted at block 2"), "{err}");
+        assert_eq!((c.height(), c.halt.signal.get().map(|h| h.exit_code())), (2, Some(crate::upgrade::EXIT_HALT_HEIGHT)));
+        assert!(c.produce_block_with(vec![]).is_err(), "block 3 never executes");
+        drop(c);
+        let mut c = Chain::open(&home).unwrap();
+        crate::upgrade::configure(&mut c, crate::consensus::SUPPORTED_PROTOCOL_VERSION, Some(2));
+        assert!(c.halt.signal.get().is_some(), "already at the halt height: halted at once");
+        crate::upgrade::configure(&mut c, crate::consensus::SUPPORTED_PROTOCOL_VERSION, Some(4));
+        c.produce_block_with(vec![]).unwrap();
+        assert!(c.produce_block_with(vec![]).is_err());
+        assert_eq!(c.height(), 4);
         fs::remove_dir_all(home).ok();
     }
 
@@ -4619,8 +4663,9 @@ mod scaffold {
         assert!(err.contains("block 3 runs protocol"), "{err}");
         let c = chain.into_inner();
         assert_eq!((c.height(), c.view().height), (2, 2));
+        assert!(c.halt.signal.get().is_some());
         drop(c);
-        assert!(Chain::open(&home).is_err());
+        assert!(Chain::open(&home).unwrap().halt.signal.get().is_some());
         fs::remove_dir_all(home).ok();
     }
 
@@ -4999,7 +5044,7 @@ mod persistence {
                 // The consensus block carries the txs' wire bytes, as in production.
                 let cblock: Vec<u8> = txs.iter().flat_map(|t| t.to_bytes()).collect();
                 let height = c.height() + 1;
-                let f = Finalized { height, hash: hex::encode(crypto::hash(&height.to_le_bytes())), parent: c.last_hash().to_string(), timestamp_ms: now_ms(), view: height, parent_view: height - 1, version: crate::consensus::PROTOCOL_VERSION, proposer: c.fee_sink(), txs, cblock: [vec![0u8; 170], cblock].concat(), certificate: None };
+                let f = Finalized { height, hash: hex::encode(crypto::hash(&height.to_le_bytes())), parent: c.last_hash().to_string(), timestamp_ms: now_ms(), view: height, parent_view: height - 1, version: crate::consensus::PROTOCOL_VERSION, signal: crate::consensus::SUPPORTED_PROTOCOL_VERSION, proposer: c.fee_sink(), txs, cblock: [vec![0u8; 170], cblock].concat(), certificate: None };
                 c.execute(f).unwrap();
             }
             let after = (size(&h.join("blocks")), size(&h.join("cblocks")), fs::metadata(h.join(store::DB_FILE)).unwrap().len());

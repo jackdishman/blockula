@@ -49,7 +49,7 @@ A validator's HTTP API locks the same state the consensus engine uses, so a publ
 - **Active-set cap: 32 at genesis** (DEC-3). Votes are equal-weight; the set is the top 32 candidates by pool stake (planned: P-STAKE). The cap rises by governance once certificates shrink: a ⅔ certificate is ~73 KB at n = 32 and every validator re-broadcasts two per view (see [Bandwidth](#bandwidth)).
 - **Genesis target: 21–32 independent operators.** Halting the chain takes ⌊(n−1)/3⌋+1 validators (11 of 32), so independence is the security budget.
 - **No hosting provider, ASN or jurisdiction above ¼ of the active set** (8 of 32), always below ⅓ (DEC-14). Operators declare provider, ASN and jurisdiction at registration and whenever they move; the foundation publishes the distribution monthly and asks operators in an over-represented provider, ASN or jurisdiction to move. Count by the ASN that actually routes the validator's IP (`whois -h whois.radb.net <ip>` or `curl ipinfo.io/<ip>/org`), not the reseller's brand.
-- **Foundation nodes stay small.** The founder runs **at most 3 validators**, on Fly.io: `performance-8x` machines (8 dedicated vCPUs, 32 GB; `performance-4x` with 16 GB is the floor), each with a dedicated IPv4 for p2p and a volume sized per [Disk sizing](#disk-sizing). Fly volumes top out at 500 GB at the time of writing: plenty for an empty chain for years, not for a sustained flood, so foundation validators must run with epoch-journal pruning (planned: P-UPGRADE) and watch `HostDiskFillsWithinAWeek`. The public RPC nodes and the foundation's sentries also run on Fly. The foundation's share of the set shrinks as independent operators join.
+- **Foundation nodes stay small.** The founder runs **at most 3 validators**, on Fly.io: `performance-8x` machines (8 dedicated vCPUs, 32 GB; `performance-4x` with 16 GB is the floor), each with a dedicated IPv4 for p2p and a volume sized per [Disk sizing](#disk-sizing). Fly volumes top out at 500 GB at the time of writing: plenty for an empty chain for years, not for a sustained flood, so foundation validators must run with block pruning (the validator default) and watch `HostDiskFillsWithinAWeek`. The public RPC nodes and the foundation's sentries also run on Fly. The foundation's share of the set shrinks as independent operators join.
 - **Recommended providers, mixed.** Bare metal and dedicated servers give unmetered or generously included bandwidth and predictable disks:
   - Latitude.sh, OVHcloud, Cherry Servers, Hetzner (dedicated). **Hetzner:** its terms have restricted crypto workloads before (mining is banned, and some blockchain node operators have been asked to leave); every operator must check the current terms and get written confirmation before running a validator there.
   - Regional and colocation providers spread ASNs and jurisdictions better than any big brand. They are welcome.
@@ -85,7 +85,8 @@ What a node's home holds (storage layout 4; the full layout and commit protocol 
 - `blocks/`: executed blocks, one JSON line each, in segment files of 10,000 heights. ~0.4 KB per empty block, ~10.8 KB per transfer (txs are hex in the JSON).
 - `cblocks/`: the exact consensus blocks, served to joining nodes by `/api/sync`. ~0.2 KB per empty block, ~5.4 KB per transfer (wire bytes).
 - `state.redb`: the state database. The state itself (records and Merkle tree nodes, ~0.5 KB per account: ~0.5 GB at a million accounts, whatever the history), plus index rows (~0.25 KB per block, ~0.75 KB per tx: tx ids, account history) and a finalization certificate every 100 heights and at each epoch's end. A certificate holds a quorum of 3,309-byte signatures.
-- `snapshots/`: the last two certified snapshots (compressed state). `consensus/`: marshal keeps the last 2,000 blocks and certificates (`MARSHAL_RETAIN`); old epochs' simplex journals are kept until journal pruning lands (planned: P-UPGRADE, OPS-6).
+- `snapshots/`: the last two certified snapshots (compressed state). `consensus/`: marshal keeps the last 2,000 blocks and certificates (`MARSHAL_RETAIN`), and simplex keeps the journals of the current epoch and the two before it (`blockula-simplex-<epoch>`; older ones are deleted when an epoch starts and when the node starts).
+- `slashing-protection.json` (validators): a few kilobytes, see [Slashing protection](#how-slashing-protection-works).
 
 An empty chain, everything kept:
 
@@ -239,6 +240,9 @@ EnvironmentFile=-/etc/blockula/env
 ExecStart=/usr/local/bin/blockula run --home /var/lib/blockula/val --bind 0.0.0.0 --p2p-preset recommended
 Restart=on-failure
 RestartSec=10
+# Deliberate stops stay stopped until an operator acts: 10 --halt-height reached, 11 a protocol
+# version this binary doesn't run is in force, 12 another instance is signing with this key.
+RestartPreventExitStatus=10 11 12
 LimitNOFILE=65536
 NoNewPrivileges=true
 ProtectSystem=strict
@@ -252,7 +256,12 @@ WantedBy=multi-user.target
 
 `/etc/blockula/env` (mode 600, root) holds `BLOCKULA_FORWARDER_SECRET=…` and a fine-grained, public-read-only `GITHUB_TOKEN=…` (validators check contribution claims against GitHub; without a token they hit the anonymous rate limit). Then `sudo systemctl enable --now blockula`, `journalctl -u blockula -f`, and `curl -s 127.0.0.1:7070/api/health`.
 
-The node guards against double-signing in two ways today: it refuses to start a home that has executed blocks but no consensus journal (a restored or copied home), and with `BLOCKULA_INSTANCE_ID` set it refuses a home last used by a different machine (`machine.lock`). `--i-know-this-key-is-not-running-elsewhere` overrides both. Use it only after you have *proven* the other copy is gone.
+Exit codes: `0` never for a validator (it runs until stopped), `1` an error (the log says what), `10`, `11` and `12` the deliberate stops in the unit above ([Halted](#halted), [Upgrade required](#upgrade-required), [Slashing protection](#slashing-protection)).
+
+Double-signing protection, in layers:
+
+- **Slashing protection** (always on, can't be turned off): the record next to the key, observe-before-signing after every start, and a halt (exit 12) if anything signed with this key shows up that this process didn't sign. See [Slashing protection](#how-slashing-protection-works).
+- Two startup guards: the node refuses a home that has executed blocks but no consensus journal (a restored or copied home), and with `BLOCKULA_INSTANCE_ID` set it refuses a home last used by a different machine (`machine.lock`). `--i-know-this-key-is-not-running-elsewhere` overrides these two (never slashing protection). Use it only after you have *proven* the other copy is gone.
 
 Then install [monitoring](#monitoring) and join the on-call rotation and the private operator channel ([Incident response](#incident-response)).
 
@@ -262,36 +271,58 @@ Then install [monitoring](#monitoring) and join the on-call rotation and the pri
 |---|---|---|
 | **Consensus key** (`validator.key`, a hex seed) | On the validator only (mode 600). Holds only a fee float once the fee payer is separate (OPS-1) | Offline, encrypted, two locations |
 | **Owner account** (bond, rewards, commission) | Cold: an offline machine | Offline, encrypted, two locations |
-| **Slashing-protection record** (last view signed per epoch; planned: P-UPGRADE) | Next to the consensus key | Never restored from backup; see below |
+| **Slashing-protection record** (`slashing-protection.json`: what the key signed in the newest views of its newest epoch) | Next to the consensus key | Never restored from backup; see below |
 | **Release key** (maintainers) | Offline machine | See [Releases](#releases) |
 
 Encrypt key backups with a passphrase you keep separately, for example with [age](https://age-encryption.org): `age -p -o validator.key.age validator.key`. Store copies in two places you control (a safe, a bank box), never on the validator, in a cloud drive, or in the same place as the passphrase. Test that you can decrypt them at every quarterly drill.
 
-**Never restore a volume snapshot onto a running validator, and never run two copies of a key.** Two copies sign conflicting votes in the same view, and in protocol v1 that's slashed (5% of the pool) and tombstoned for good (MAINNET-DESIGN 3.4). Chain data is replaceable from peers; keys and the slashing-protection record aren't. So back up keys, not the chain.
+**Never restore a volume snapshot onto a running validator, and never run two copies of a key.** Two copies sign conflicting votes in the same view, and in protocol v1 that's slashed (5% of the pool) and tombstoned for good (MAINNET-DESIGN 3.4). Chain data is replaceable from peers; keys and the slashing-protection record aren't. So back up keys, not the chain. Turn off provider volume snapshots on validators (on Fly: `--scheduled-snapshots=false`).
+
+### How slashing protection works
+
+`node/src/protection.rs`; MAINNET-DESIGN 3.9. Every vote passes three rules before its signature exists:
+
+1. **The record** (`slashing-protection.json` in the validator home). For the newest epoch the key signed in, the last 32 views: the notarize and finalize it signed (hashed) and whether it nullified. A vote that conflicts with it is refused (another block in a view, a finalize after a nullify or the reverse, an older epoch). The record is written and fsynced before the signature is released. A record for another key, or one that doesn't parse, stops the node at start.
+2. **Observe before signing.** A restored volume rolls the record back with it, so after every start the validator signs nothing in its first epoch until it has watched the network finish two more views than it saw once the start settled (about 5 s at 1 s blocks), and then only views above every certificate it saw. Its earlier run stopped before this one started, so none of its votes can be in those views. `blockula_slashing_protection_abstaining` is 1 meanwhile. If the network can't make progress without this node (every validator restarting at once, or too many down), it signs again after ~20 s on the record alone: the one case where a restored disk could still double-sign.
+3. **Another instance.** A vote or certificate carrying this key's signature on something this process never signed, in a view an earlier, stopped run can't have reached, means a second copy is running. The node stops signing at once and exits with code 12.
+
+What that means for you: a restart costs a validator a few seconds of votes; a restore is survivable if the network is live, but don't rely on it; never run two copies.
 
 **Restoring after losing a validator host:**
 
 1. **Make sure the old host can't sign.** Power it off from the provider's console and detach its volume, or revoke its network. If you can't prove it's down, stop here: wait for the next epoch boundary, then for the operator channel to confirm the old key went silent.
 2. Provision a new host (hardware, firewall, NTP, verified binary).
 3. Restore `validator.key` from the offline backup into a new home with the published `genesis.json`.
-4. **Slashing protection** (planned: P-UPGRADE): copy the record from the old disk if you still have it. If it's lost, the node must not sign in the current epoch: it starts with an empty record that refuses views below the network's current one, and you wait for the next epoch boundary before signing. Never restore an older copy of the record.
+4. **Slashing protection:** copy `slashing-protection.json` from the old disk if you still have it (the newest copy only; never an older one). If it's lost, start without it: the node watches the network before it signs (see above). Do this while the network is live (finalizing without you); if it's halted, wait until it isn't, or until the next epoch boundary.
 5. Sync state from peers (fast sync from a certified snapshot), not from a chain-data backup.
-6. Start the service. The double-sign guard will refuse the copied home on a new machine. Pass `--i-know-this-key-is-not-running-elsewhere` once, for this start only, after step 1.
+6. Start the service. The startup guards will refuse the copied home on a new machine. Pass `--i-know-this-key-is-not-running-elsewhere` once, for this start only, after step 1. If the node exits with code 12 ("another instance is running"), step 1 failed: find the other copy before anything else.
 
 **Quarterly restore drill** (OPS-6): on a testnet, restore a validator from its offline key backup onto a fresh host following the steps above, time it, and record the result in the operator log.
 
 ## Upgrades
 
-Upgrades are announced, released, signalled and activated at a height. Nobody restarts everything at once.
+Upgrades are announced, released, signalled, scheduled and activated at a height (`node/src/upgrade.rs`, MAINNET-DESIGN 3.9). Nobody restarts everything at once.
 
-1. **Announce** at least two weeks ahead for planned upgrades: version, what changes, whether it's consensus-breaking, the proposed activation height, and the release date. Post in the operator channel and publicly.
-2. **Release** a signed, reproducible build ([Releases](#releases)). Operators verify it themselves: provenance, the ML-DSA signature, and ideally a rebuild.
-3. **Install and signal.** Each operator restarts onto the new binary in their own maintenance window, one node at a time. The new binary runs the old rules until the activation height. Blocks carry `signal`, the newest protocol version the proposer's binary supports (MAINNET-DESIGN 3.2), so readiness is visible on chain and in the explorer. Wait for ≥ ⅔ of the active set to signal.
-4. **Activate.** A governance `ScheduleUpgrade` proposal (planned: P-GOV, P-UPGRADE) puts `(version, activation_height)` in state. At that height every upgraded node switches rules. A node whose binary doesn't support the scheduled version halts cleanly before executing that height, with a non-zero exit and the reason in `/api/health`, instead of diverging. Upgrade it and it continues.
+**What the protocol does.** Each block carries `version`, the protocol version in force at its height (verifiers reject any other), and `signal`, the newest version its proposer's binary supports. State holds the upgrade schedule `[(version, activation_height)]`, changed only by a governance `ScheduleUpgrade` proposal, and an upgrade activates at least 64 blocks after the block that schedules it. A new binary runs the old rules until the activation height. A node whose binary doesn't support the version in force at the next height executes nothing more: it stops after the last block it can run, doesn't vote on or propose later ones, and then
 
-Rolling restarts: keep fewer than ⌊(n−1)/3⌋ validators restarting at any moment across the whole network, so coordinate windows in the operator channel. Restarting your own validator takes it out for seconds: it loads the state database and executes at most the few blocks logged after its last commit.
+- a **validator exits with code 11** (systemd keeps it down, `RestartPreventExitStatus`), and does so again on every start until it's upgraded;
+- a **full node keeps serving reads** at that height, with `/api/health` 503 and `"halted": "upgrade_required"`, until it's upgraded.
 
-**Coordinated stop at a height** (incidents, emergency patches): `blockula run … --halt-height H` executes `H` and stops (planned: P-UPGRADE). Until that flag exists, watch `curl -s 127.0.0.1:7070/api/status | jq .height` and stop the service once it passes `H`.
+Install the new binary and start it: it executes the new version's blocks and catches up.
+
+**The hard-fork process.**
+
+1. **Announce** at least two weeks ahead (planned upgrades): the version number, what changes, the release date, and the proposed activation height. Post in the operator channel and publicly.
+2. **Release** a signed, reproducible build ([Releases](#releases)). Operators verify it themselves: provenance, the ML-DSA signature (`blockula release verify`), ideally a rebuild.
+3. **Install and signal.** Each operator restarts onto the new binary in their own maintenance window, one node at a time (fewer than ⌊(n−1)/3⌋ validators restarting at any moment across the network: coordinate in the operator channel). The new binary signals the new version in every block it proposes. `GET /api/upgrade` shows readiness: the newest signal from each active validator and whether ≥ ⅔ are ready.
+4. **Schedule.** Once ≥ ⅔ of the active set signal the version, a `ScheduleUpgrade { version, activation_height }` proposal goes to governance (a ⅔ supermajority; MAINNET-DESIGN 3.5; planned: P-GOV). Pick the height so the vote, the timelock and a margin for stragglers fit before it. Every node then shows `blockula_upgrade_next_version` and `…_next_height`; nodes without the new binary fire `BlockulaUpgradeRequired`, and `…Soon` a day before.
+5. **Activate.** At the height every upgraded node switches rules. Watch `/api/upgrade` and the explorer: blocks from the activation height on carry the new `version`. Stragglers halt cleanly (above) instead of diverging; they upgrade and continue.
+
+A restart costs a validator a few seconds: it loads the state database, executes at most the few blocks logged after its last commit, and watches the network before it votes again ([Slashing protection](#how-slashing-protection-works)).
+
+**On-disk formats** carry versions: `consensus.version` (`STORAGE_VERSION`, the consensus journals), the state database's format and state schema (`STORE_FORMAT`, `SCHEMA_VERSION`; a mismatch rebuilds the database from the block logs on start, which takes as long as replaying the history), and the snapshot schema. Release notes say when a format changes and what the first start will do.
+
+**Coordinated stop at a height** (incidents, emergency patches): `blockula run … --halt-height H` executes block `H` and stops. A validator doesn't vote on or propose anything above `H` and exits with code 10 (and again at once on every start with the same flag); a full node keeps serving reads at `H`. If at least ⅓ of the set runs with the same `H`, the chain itself stops at `H`. Remove the flag (or raise it) to continue.
 
 Today's testnet binary has no version gating: the testnet is upgraded by redeploying all validators (`deploy/launch.sh`). That's acceptable only because the testnet holds no value.
 
@@ -325,11 +356,13 @@ Today's testnet binary has no version gating: the testnet is upgraded by redeplo
 2. **Not enough voters** (validators down or partitioned): no node logs execution errors, and certificates stop. Get operators to bring nodes back. Nothing else needed.
 3. **Deterministic halt:** every validator fails the same finalized block (an execution error or a panic in end-of-block code), and does again on every restart (OPS-5). Logs on all nodes show the same height and error. Then:
    - Stop restarting. Collect logs, the failing block (`/api/block/{height}`) and a repro.
-   - Write the fix so it changes behaviour **only from the failing height on** (height-gated), so history replays identically.
-   - Ship it as an emergency release ([Patch distribution](#patch-distribution)), verified like any release.
+   - Write the fix so it changes behaviour **only from the failing height on** (height-gated in code: `if height >= H_fix`), so history replays identically. A fix that changes consensus rules for later blocks is a protocol upgrade: give the binary a higher `SUPPORTED_PROTOCOL_VERSION` and schedule it once the chain moves ([Upgrades](#upgrades)).
+   - Ship it as an emergency release ([Patch distribution](#patch-distribution)), verified like any release (`blockula release verify`).
    - Operators install it and start. The chain resumes when ≥ ⅔ of the set runs it.
 
-**Safety failure (SEV-1):** two certificates for different blocks at one height, or nodes reporting different state roots for the same height. Ask every operator to stop their validator at the current height (`--halt-height`, or stop the service), preserve disks and logs, and don't restart until the IC calls it. Equivocation evidence from the consensus journals (`track_historical_votes`) identifies the signers (planned: P-STAKE).
+**Safety failure (SEV-1):** two certificates for different blocks at one height, or nodes reporting different state roots for the same height. Ask every operator to stop their validator at once (stop the service; `--halt-height` only if a height in the near future is agreed), preserve disks and logs (copy them aside: the node deletes consensus journals older than two epochs), and don't restart until the IC calls it. Equivocation evidence from the consensus journals (`track_historical_votes`) identifies the signers (planned: P-STAKE).
+
+**A validator exited with code 12 ("another instance is running with this validator.key"):** slashing protection saw this key sign something the process didn't. Treat it as a key compromise until proven otherwise: keep the node stopped, find every machine that has the key (old hosts, restored volumes, a copy started by automation), and stop them. Only then start one copy. If you're certain no other copy exists (for example the node had just been restored from an old volume while the network was halted), wait for the next epoch boundary before starting it.
 
 **Key compromise:** the operator stops the validator at once. In protocol v1 the stake belongs to the cold owner account, so a stolen consensus key can't move it, but it can still equivocate and get the pool slashed. Protocol v1 has no consensus-key rotation: the owner undelegates the self-bond, registers a new validator with a fresh key generated offline, and asks delegators to redelegate (P-STAKE). Report it in the operator channel so others watch for votes from the old key.
 
@@ -348,9 +381,19 @@ For a vulnerability that's exploitable before a fix is widely deployed:
 ### Coordinated restart at a height
 
 1. The IC picks a halt height `H` (at least 30 minutes out, so everyone can act) and announces it with the reason.
-2. Each operator restarts with `--halt-height H` (or stops the service after `H` by hand) and confirms in the channel.
-3. Once every validator has stopped at `H` (same height and block hash on all nodes), operators install the new binary and start it. The chain resumes when ≥ ⅔ are back.
-4. The IC confirms finality is advancing and closes the step.
+2. Each operator restarts once with `--halt-height H` (a normal rolling restart: the node watches the network for a few seconds, then votes) and confirms in the channel. Their sentries and RPC nodes can take the same flag; they keep serving reads at `H`.
+3. At `H` the validators exit with code 10; once ⅓ have, the chain stops at `H`. Check that every node stopped at the same height and block hash (`curl -s 127.0.0.1:7070/api/block/H | jq .hash` on each, from their logs if the process is gone).
+4. Operators install the new binary and start it **without** `--halt-height`. Every validator restarting at once means nobody's votes are observed at first: they all sign again after ~20 s ([Slashing protection](#how-slashing-protection-works)). The chain resumes when ≥ ⅔ are back.
+5. The IC confirms finality is advancing (`BlockulaChainHalted` clears) and closes the step.
+
+### Emergency patch path
+
+For a deterministic halt, or a vulnerability that must be closed before it's public:
+
+1. Private fix with a regression test, height-gated (see the playbook above), reviewed by a second maintainer.
+2. Reproducible build, signed offline ([Patch distribution](#patch-distribution)): operators check `blockula release verify --key-id <release key id> --sig checksums.txt.sig checksums.txt` with their installed binary before anything else.
+3. If the chain is running: a coordinated restart at a height onto the patched binary (above). If it's halted: operators install and start; the chain resumes at ⅔.
+4. Afterwards: the public release, the advisory, the post-mortem.
 
 ### Communication templates
 
@@ -413,9 +456,33 @@ The node restarted in the last 15 minutes. Was it you? If not: `journalctl -u bl
 
 `BlockulaCertificateBelowQuorum`: the newest certificate has fewer signers than this node thinks the active set needs. That shouldn't happen: the node's view of the set disagrees with the certificates it holds. Compare `/api/validators` on several nodes and report in the operator channel with the output. `BlockulaNoRecentCertificate`: the node isn't receiving finalization certificates; it's syncing or cut off from the validators (check p2p, as in [Head stale](#head-stale)).
 
+### Peers
+
+`BlockulaFewPeers`: this validator is connected to fewer peers than a quorum needs besides itself, so its votes and proposals may not reach enough of the set. Check the firewall (p2p port open inbound), that the advertised `p2p_addr` is this host's public address, `ss -tnp | grep 30300` for established connections, and the clock. Other operators' nodes being down shows up here too: compare with the operator channel.
+
+### Halted
+
+`BlockulaHalted`: the node stopped executing on purpose. `curl -s 127.0.0.1:7171/api/health` (or `:7070`) says why:
+
+- `halt_height`: it was started with `--halt-height` and reached it. Expected during a coordinated restart; otherwise remove the flag.
+- `upgrade_required`: the protocol version in force at the next height isn't supported by this binary. Install the release for it ([Upgrades](#upgrades)) and restart.
+
+Validators exit instead (code 10 or 11, `BlockulaNodeDown`): `journalctl -u blockula -n 50` shows the same reason.
+
+### Upgrade required
+
+`BlockulaUpgradeRequired`: governance scheduled a protocol version this binary doesn't run (`curl -s 127.0.0.1:7070/api/upgrade | jq .next`). Install the announced, signed release before the activation height ([Upgrades](#upgrades)); the node will otherwise halt there. `…Soon` means it's within a day.
+
+### Slashing protection
+
+- `BlockulaSlashingProtectionRolledBack` (critical): the record went backwards, so the home was restored or copied. Stop the validator and follow [Keys, backups and restores](#keys-backups-and-restores) step 1: make sure no other copy runs.
+- `BlockulaWatchingAfterStart`: a started validator is still watching the network minutes later. It signs once the network has certified a few views without it, or after ~20 s if the network can't progress without it, so minutes means it isn't receiving certificates: check [Peers](#peers) and the logs (`slashing protection` lines).
+- `BlockulaValidatorNotSigning`: in the active set, blocks keep coming, and this validator signed nothing for 10 minutes. Look for `slashing protection refused a signature` (a conflict with the record: never delete the record to "fix" it) or `couldn't write the record` (disk full or read-only) in the logs.
+- Exit code 12: see the playbook in [Incident response](#playbooks).
+
 ### Disk
 
-Above 80%: grow the volume now (online resize: grow the block device, then `resize2fs` or `xfs_growfs`). Find what grew: `du -sh /var/lib/blockula/val/*`. `blocks/` and `cblocks/` stay within the pruning window (`--prune-blocks`; shorten it if the volume can't grow); old epochs' simplex journals under `consensus/` are kept until journal pruning lands (planned: P-UPGRADE). Don't delete files by hand from a running validator's home. Never let a validator's disk fill: a failed fsync stops the node.
+Above 80%: grow the volume now (online resize: grow the block device, then `resize2fs` or `xfs_growfs`). Find what grew: `du -sh /var/lib/blockula/val/*`. `blocks/` and `cblocks/` stay within the pruning window (`--prune-blocks`; shorten it if the volume can't grow); `consensus/` holds marshal's last 2,000 blocks and the current and two previous epochs' simplex journals. Don't delete files by hand from a running validator's home. Never let a validator's disk fill: a failed fsync stops the node.
 
 ### Memory
 
@@ -482,8 +549,10 @@ Every release is reproducible, carries SLSA build provenance, and is signed offl
 4. **Sign offline.** Carry `checksums.txt` (only that file) to the offline signing machine, which holds the release key and a checkout with `npm ci` already run:
 
    ```bash
+   blockula release sign --key release-key.json checksums.txt > checksums.txt.sig
+   blockula release verify --key-id <release key id> --sig checksums.txt.sig checksums.txt
+   # or, from a checkout after npm ci (same format, same known-answer vector):
    node scripts/release-sig.mjs sign --key release-key.json checksums.txt > checksums.txt.sig
-   node scripts/release-sig.mjs verify --key-id <release key id> --sig checksums.txt.sig checksums.txt
    ```
 
    Carry `checksums.txt.sig` back.
@@ -491,11 +560,11 @@ Every release is reproducible, carries SLSA build provenance, and is signed offl
 
 ### The release key
 
-- One ML-DSA-65 key, generated on an offline machine with a verified `blockula`: `blockula keygen > release-key.json`. Its **key id** is the hex BLAKE3 of the public key: `node scripts/release-sig.mjs keyid --key release-key.json`.
+- One ML-DSA-65 key, generated on an offline machine with a verified `blockula`: `blockula keygen > release-key.json`. Its **key id** is the hex BLAKE3 of the public key: `blockula release keyid --key release-key.json` (or `node scripts/release-sig.mjs keyid --key release-key.json`).
 - Publish the key id in SECURITY.md, this file, `scripts/install.sh` (`RELEASE_KEY_ID`), the website and the project's social accounts, so a single compromised channel can't swap it. **Release key id:** *not generated yet* (the maintainer fills this in at the key ceremony).
 - Back it up like a validator key (encrypted, offline, two locations). Rotation: sign a statement naming the new key id with the old key, publish it through the same channels, and update every place above.
-- Signature format: the message is `"BLOCKULA_RELEASE_V1"` followed by the exact bytes of `checksums.txt`, signed with FIPS 204 ML-DSA-65 (empty context, deterministic, as `crypto::Keys::sign`). `checksums.txt.sig` is one JSON line: `{"format":"blockula-release-signature-v1","key_id","public_key","signature"}` (hex). `node scripts/release-sig.mjs selftest` checks the implementation against a known-answer vector that the node's own `ml-dsa` crate reproduces.
-- A built-in `blockula release sign|verify` with the same format is planned (it's what `install.sh` calls to check the signature with an already-installed binary).
+- Signature format: the message is `"BLOCKULA_RELEASE_V1"` followed by the exact bytes of `checksums.txt`, signed with FIPS 204 ML-DSA-65 (empty context, deterministic, as `crypto::Keys::sign`). `checksums.txt.sig` is one JSON line: `{"format":"blockula-release-signature-v1","key_id","public_key","signature"}` (hex). Two implementations produce byte-identical signatures: `blockula release` (`node/src/release_cli.rs`) and `scripts/release-sig.mjs`; `blockula release selftest` and `node scripts/release-sig.mjs selftest` check the same known-answer vector.
+- `blockula release verify` is what `install.sh` calls to check a new release's signature with an already-installed binary.
 
 ### Verifying a release as a user or operator
 
@@ -505,8 +574,8 @@ gh release download $V --repo jackdishman/blockula --pattern "blockula-$T.tar.gz
 # 1. Provenance: built by this repo's release workflow from the tag.
 gh attestation verify blockula-$T.tar.gz --repo jackdishman/blockula \
   --signer-workflow jackdishman/blockula/.github/workflows/release.yml --source-ref refs/tags/$V
-# 2. The offline signature (from a checkout, after npm ci), with the published key id.
-node scripts/release-sig.mjs verify --key-id <release key id> --sig checksums.txt.sig checksums.txt
+# 2. The offline signature, with the published key id (an installed blockula, or the script from a checkout).
+blockula release verify --key-id <release key id> --sig checksums.txt.sig checksums.txt
 # 3. The archive matches the signed checksums.
 sha256sum --ignore-missing -c checksums.txt
 # 4. Optional, and recommended for validators: rebuild it.
@@ -545,7 +614,8 @@ Logs go to the journal (`journalctl -u blockula`). Keep at least 14 days (`Syste
 - [ ] chrony with NTS sources; offset < 10 ms.
 - [ ] Binary installed with `BLOCKULA_REQUIRE_VERIFY=1`; genesis hash checked.
 - [ ] Consensus key and owner key backed up offline, encrypted, two places; restore tested.
-- [ ] systemd unit with `BLOCKULA_INSTANCE_ID`; `GITHUB_TOKEN` set (public-read-only).
+- [ ] systemd unit with `BLOCKULA_INSTANCE_ID` and `RestartPreventExitStatus=10 11 12`; `GITHUB_TOKEN` set (public-read-only).
+- [ ] Provider volume snapshots off on the validator volume.
 - [ ] At least one sentry, registered as `http_addr`; validator HTTP private.
 - [ ] Monitoring stack running; receivers and heartbeat tested with a test alert.
 - [ ] Two contacts registered; in the operator channel and the on-call rotation.

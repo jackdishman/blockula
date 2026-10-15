@@ -58,6 +58,16 @@ From `node/src/api.rs` (`GET /metrics`):
 | `blockula_tx_submitted_total`, `blockula_tx_rejected_total` | counter | Txs accepted / rejected over HTTP |
 | `blockula_faucet_drips_total` | counter | Faucet drips (test chains) |
 | `blockula_build_info{version,git_sha}` | gauge | Always 1 |
+| `blockula_process_start_time_seconds` | gauge | When the process started (unix seconds) |
+| `blockula_protocol_version` | gauge | Protocol version in force at the next height |
+| `blockula_supported_protocol_version` | gauge | Newest protocol version this binary runs (its blocks signal it) |
+| `blockula_upgrade_next_version`, `blockula_upgrade_next_height` | gauge | The next scheduled upgrade (0 if none) |
+| `blockula_halted`, `blockula_halt_info{kind}` | gauge | 1 while the node has stopped executing (`halt_height`, `upgrade_required`); `/api/health` gives the reason |
+| `blockula_p2p_peers` | gauge | Validators: connected p2p peers |
+| `blockula_slashing_protection_epoch`, `…_last_view` | gauge | Validators: the newest epoch and view the key signed in (the record next to `validator.key`) |
+| `blockula_slashing_protection_voting` | gauge | Validators: 1 if in the current active set |
+| `blockula_slashing_protection_abstaining` | gauge | Validators: 1 while watching the network after a start, before signing |
+| `blockula_slashing_protection_refused_total` | counter | Validators: vote signatures refused (while watching, or conflicting with the record) |
 
 A recording rule adds `blockula:quorum` = n − ⌊(n−1)/3⌋. Host metrics come from node_exporter; the clock alerts use its `timex` collector (`node_timex_offset_seconds`, `node_timex_sync_status`).
 
@@ -73,8 +83,14 @@ A recording rule adds `blockula:quorum` = n − ⌊(n−1)/3⌋. Host metrics co
 | `BlockulaExecutionLagging` / `…PastMaxLag` | warning / critical | Execution > 8 / > 16 blocks behind finality |
 | `BlockulaMempoolNearCap` | warning | Mempool above 4,000 of 5,000 for 5 min |
 | `BlockulaTxRejectionsHigh` | info | More txs rejected than accepted, over 1/s, for 10 min |
-| `BlockulaRestarted` | warning | Counters reset or the height dropped in the last 15 min |
+| `BlockulaRestarted` | warning | The process started, or the height dropped, in the last 15 min |
 | `BlockulaVersionMismatch` | info | Your nodes run different versions for over an hour |
+| `BlockulaHalted` | critical | The node stopped executing (`--halt-height`, or a protocol version its binary doesn't run) for 1 min |
+| `BlockulaUpgradeRequired` / `…Soon` | warning / critical | A protocol version this binary doesn't run is scheduled / activates within a day |
+| `BlockulaFewPeers` | warning | Fewer p2p peers than quorum − 1 for 5 min |
+| `BlockulaSlashingProtectionRolledBack` | critical | The slashing-protection record went backwards (a restored or copied home) |
+| `BlockulaValidatorNotSigning` | warning | In the active set, the chain advancing, and no new vote for 10 min |
+| `BlockulaWatchingAfterStart` | warning | Still watching the network after a start, 3 min on |
 | `BlockulaCertificateBelowQuorum` | critical | The newest certificate has fewer signers than the active set's quorum |
 | `BlockulaNoRecentCertificate` | warning | No certificate among the last 16 heights for 5 min |
 | `HostDiskAlmostFull` / `HostDiskCritical` | warning / critical | A filesystem above 80% / 90% |
@@ -87,10 +103,7 @@ A recording rule adds `blockula:quorum` = n − ⌊(n−1)/3⌋. Host metrics co
 
 ## Planned (TODO)
 
-These need metrics the node doesn't export yet. The dashboard shows them as TODO panels; add the rules when the metrics land:
+These need metrics the node doesn't export yet (staking keeps no liveness or jail records until P-STAKE lands). The dashboard shows them as TODO panels; add the rules when the metrics land:
 
-- **Peers:** connected p2p peers vs the active set (`blockula_p2p_peers`). Alert below quorum − 1.
-- **Missed leader slots** per validator over the downtime window (P-STAKE, MAINNET-DESIGN 3.4). Warn well before the jail threshold.
-- **Jailed / tombstoned** for this operator's validators (P-STAKE).
-- **Slashing protection:** last signed view per epoch (P-UPGRADE, 3.9). Alert if it goes backwards or stalls while the chain advances.
-- **Process start time**, for an exact restart alert instead of counter resets.
+- **Missed leader slots** per validator over the downtime window (`blockula_missed_leader_slots_total{validator}`, MAINNET-DESIGN 3.4). Warn well before the jail threshold.
+- **Jailed / tombstoned** for this operator's validators (`blockula_validator_jailed`, `blockula_validator_tombstoned`).

@@ -81,15 +81,13 @@ tests:
               summary: "v1: mempool at 4500 of 5000; new txs are refused when full"
               runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#mempool-full
 
-  # A restart: counters reset and the height drops while the node replays.
+  # A restart at 4m: the process start time moves (unix seconds; the test clock starts at 0).
   - interval: 1m
     input_series:
       - series: 'blockula_height{job="blockula",instance="a",node="v1"}'
-        values: "100 160 220 280 3 60 120"
-      - series: 'blockula_tx_submitted_total{job="blockula",instance="a",node="v1"}'
-        values: "5 6 7 8 0 0 0"
-      - series: 'blockula_tx_rejected_total{job="blockula",instance="a",node="v1"}'
-        values: "0 0 0 0 0 0 0"
+        values: "100 160 220 280 340 400 460 520 580 640 700 760 820 880 940 1000 1060 1120 1180 1240 1300 1360"
+      - series: 'blockula_process_start_time_seconds{job="blockula",instance="a",node="v1"}'
+        values: "-3600 -3600 -3600 -3600 240x20"
     alert_rule_test:
       - eval_time: 3m
         alertname: BlockulaRestarted
@@ -101,6 +99,126 @@ tests:
             exp_annotations:
               summary: "v1: the node restarted in the last 15 minutes"
               runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#restarts
+      - eval_time: 20m
+        alertname: BlockulaRestarted
+        exp_alerts: []
+
+  # The height dropping (a replay) is a restart too, even before the start time is scraped.
+  - interval: 1m
+    input_series:
+      - series: 'blockula_height{job="blockula",instance="a",node="v1"}'
+        values: "100 160 220 280 3 60 120"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: BlockulaRestarted
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: BlockulaRestarted
+        exp_alerts:
+          - exp_labels: { severity: warning, job: blockula, instance: a, node: v1 }
+            exp_annotations:
+              summary: "v1: the node restarted in the last 15 minutes"
+              runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#restarts
+
+  # A full node halted at --halt-height keeps serving: BlockulaHalted. A scheduled version this
+  # binary doesn't run warns at once and pages within a day of its activation.
+  - interval: 1m
+    input_series:
+      - series: 'blockula_halted{job="blockula",instance="a",node="v1"}'
+        values: "0 0 1 1 1"
+      - series: 'blockula_height{job="blockula",instance="a",node="v1"}'
+        values: "100000 100060 100060 100060 100060 100060 100060 100060 100060 100060"
+      - series: 'blockula_upgrade_next_version{job="blockula",instance="a",node="v1"}'
+        values: "2x9"
+      - series: 'blockula_upgrade_next_height{job="blockula",instance="a",node="v1"}'
+        values: "200000x6 150000x3"
+      - series: 'blockula_supported_protocol_version{job="blockula",instance="a",node="v1"}'
+        values: "1x9"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: BlockulaHalted
+        exp_alerts:
+          - exp_labels: { severity: critical, job: blockula, instance: a, node: v1 }
+            exp_annotations:
+              summary: "v1: halted at block 100060 (/api/health says why)"
+              runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#halted
+      - eval_time: 6m
+        alertname: BlockulaUpgradeRequired
+        exp_alerts:
+          - exp_labels: { severity: warning, job: blockula, instance: a, node: v1 }
+            exp_annotations:
+              summary: "v1: protocol v2 is scheduled and this binary doesn't run it; upgrade before the activation height"
+              runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#upgrade-required
+      - eval_time: 6m
+        alertname: BlockulaUpgradeRequiredSoon
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: BlockulaUpgradeRequiredSoon
+        exp_alerts:
+          - exp_labels: { severity: critical, job: blockula, instance: a, node: v1 }
+            exp_annotations:
+              summary: "v1: protocol v2 activates within a day and this binary doesn't run it: the node will halt there"
+              runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#upgrade-required
+
+  # 4 validators: a quorum is 3, so a validator needs 2 peers.
+  - interval: 1m
+    input_series:
+      - series: 'blockula_active_validators{job="blockula",instance="a",node="v1"}'
+        values: "4x10"
+      - series: 'blockula_p2p_peers{job="blockula",instance="a",node="v1"}'
+        values: "3 3 1x8"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: BlockulaFewPeers
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: BlockulaFewPeers
+        exp_alerts:
+          - exp_labels: { severity: warning, job: blockula, instance: a, node: v1 }
+            exp_annotations:
+              summary: "v1: 1 p2p peers, fewer than a quorum needs"
+              runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#peers
+
+  # Slashing protection: the record moves forward, including into a new epoch (no alert); a
+  # restored home takes it back (critical, kept for 30 minutes). A validator in the set that
+  # signs nothing while blocks come, or keeps watching after a start, warns.
+  - interval: 1m
+    input_series:
+      - series: 'blockula_slashing_protection_epoch{job="blockula",instance="a",node="v1"}'
+        values: "4 4 4 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5"
+      - series: 'blockula_slashing_protection_last_view{job="blockula",instance="a",node="v1"}'
+        values: "3000 3060 3120 2 62 122 182 242 50 50 50 50 50 50 50 50 50 50 50 50 50 50 50 50 50"
+      - series: 'blockula_slashing_protection_voting{job="blockula",instance="a",node="v1"}'
+        values: "1x24"
+      - series: 'blockula_slashing_protection_abstaining{job="blockula",instance="a",node="v1"}'
+        values: "0x8 1x5 0x11"
+      - series: 'blockula_height{job="blockula",instance="a",node="v1"}'
+        values: "0+60x24"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: BlockulaSlashingProtectionRolledBack
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: BlockulaSlashingProtectionRolledBack
+        exp_alerts:
+          - exp_labels: { severity: critical, job: blockula, instance: a, node: v1 }
+            exp_annotations:
+              summary: "v1: the slashing-protection record went backwards (a restored or copied home?)"
+              runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#slashing-protection
+      - eval_time: 12m
+        alertname: BlockulaWatchingAfterStart
+        exp_alerts:
+          - exp_labels: { severity: warning, job: blockula, instance: a, node: v1 }
+            exp_annotations:
+              summary: "v1: still not signing, watching the network after a start"
+              runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#slashing-protection
+      - eval_time: 22m
+        alertname: BlockulaValidatorNotSigning
+        exp_alerts:
+          - exp_labels: { severity: warning, job: blockula, instance: a, node: v1 }
+            exp_annotations:
+              summary: "v1: in the active set but hasn't signed a vote for 10 minutes while the chain advanced"
+              runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#slashing-protection
 
   # 4 validators need 3 signatures; 2 is below quorum. NaN means no recent certificate.
   - interval: 1m

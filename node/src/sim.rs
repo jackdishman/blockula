@@ -5,6 +5,7 @@ use crate::chain::{Chain, Genesis, SummonOpts, ValidatorStatus};
 use crate::consensus::{self, Shared, ValidatorConfig, CHANNELS};
 use crate::crypto::Keys;
 use crate::pq::{PrivateKey, PublicKey};
+use crate::protection::{Protection, Timing};
 use crate::types::*;
 use commonware_p2p::simulated::{Config as NetConfig, Link, Network, Oracle};
 use commonware_runtime::{Clock as _, Handle, Runner as _, Supervisor as _, deterministic};
@@ -20,6 +21,8 @@ struct Val {
     key: PrivateKey,
     chain: Shared,
     handle: Option<Handle<()>>,
+    /// Its slashing protection (the record in its home, as on a real validator).
+    protection: Arc<Protection>,
 }
 
 async fn start(
@@ -31,8 +34,46 @@ async fn start(
     home: PathBuf,
     key: PrivateKey,
 ) -> Val {
-    let chain: Shared = Arc::new(Mutex::new(Chain::open(&home).unwrap()));
+    start_with(context, oracle, genesis, idx, run, home, key, Node::default()).await
+}
+
+/// How a simulated node differs from a stock one.
+#[derive(Clone)]
+struct Node {
+    /// Newest protocol version its binary runs.
+    supported: u32,
+    /// Upgrades in the state from block 1 on (put there before the first block, as a
+    /// `ScheduleUpgrade` proposal would; every node must get the same).
+    schedule: Vec<crate::upgrade::ScheduledUpgrade>,
+}
+
+impl Default for Node {
+    fn default() -> Self {
+        Self { supported: consensus::SUPPORTED_PROTOCOL_VERSION, schedule: vec![] }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_with(
+    context: &deterministic::Context,
+    oracle: &mut Oracle<PublicKey, deterministic::Context>,
+    genesis: &Genesis,
+    idx: usize,
+    run: usize,
+    home: PathBuf,
+    key: PrivateKey,
+    node: Node,
+) -> Val {
+    let mut c = Chain::open(&home).unwrap();
+    if c.height() == 0 {
+        // Committed with block 1, the same on every node.
+        c.state.upgrade.schedule = node.schedule.clone();
+    }
+    crate::upgrade::configure(&mut c, node.supported, None);
+    let chain: Shared = Arc::new(Mutex::new(c));
     let pk = commonware_cryptography::Signer::public_key(&key);
+    // The simulated disks don't crash, so the record isn't fsynced.
+    let protection = Protection::open(&home.join(crate::protection::RECORD_FILE), pk.as_ref(), Timing::for_block_time(genesis.block_time_ms), false).unwrap();
     let control = oracle.control(pk.clone());
     let mut channels = vec![];
     for c in CHANNELS {
@@ -45,10 +86,11 @@ async fn start(
         block_time_ms: genesis.block_time_ms,
         epoch_blocks: genesis.epoch_blocks,
         partition: format!("v{idx}"),
+        protection: Some(protection.clone()),
     };
     let ctx = context.child("validator").with_attribute("idx", idx).with_attribute("run", run);
     let (handle, _marshal) = consensus::start_validator(ctx, cfg, oracle.manager(), control, channels).await;
-    Val { home, key, chain, handle: Some(handle) }
+    Val { home, key, chain, handle: Some(handle), protection }
 }
 
 async fn wait_for_height(context: &deterministic::Context, vals: &[Val], height: u64) {
@@ -81,8 +123,12 @@ const EPOCH_BLOCKS: u64 = 10;
 
 /// Summons a 4-validator chain (epochs of `EPOCH_BLOCKS`) with genesis at the simulated epoch.
 fn summon(name: &str) -> (PathBuf, Vec<PathBuf>, Genesis, Vec<[u8; 32]>) {
+    summon_with(name, EPOCH_BLOCKS)
+}
+
+fn summon_with(name: &str, epoch_blocks: u64) -> (PathBuf, Vec<PathBuf>, Genesis, Vec<[u8; 32]>) {
     let root = std::env::temp_dir().join(format!("blockula-{name}-{}", crate::chain::now_ms()));
-    let homes = Chain::summon(&root, &SummonOpts { epoch_blocks: EPOCH_BLOCKS, ..SummonOpts::new("sim", 4) }).unwrap();
+    let homes = Chain::summon(&root, &SummonOpts { epoch_blocks, ..SummonOpts::new("sim", 4) }).unwrap();
     // The simulated clock starts at the Unix epoch, so genesis must too.
     for h in &homes {
         let mut g = Genesis::load(&h.join("genesis.json")).unwrap();
@@ -440,6 +486,171 @@ fn fast_sync_from_certified_snapshot_and_tamper_rejection() {
         assert_eq!((rebuilt.state.root(), rebuilt.height(), rebuilt.replayed), (root_now, h, h - m.height));
         assert_eq!(rebuilt.view().history_from(), m.height + 1);
         println!("✓ fast-synced at #{} and followed to #{h} with matching roots", m.height);
+    });
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// Waits until every node in `vals` has executed `height`.
+async fn wait_for(context: &deterministic::Context, vals: &[&Val], height: u64) {
+    for _ in 0..4_000 {
+        if vals.iter().all(|v| v.chain.lock().height() >= height) {
+            return;
+        }
+        context.sleep(Duration::from_millis(250)).await;
+    }
+    let heights: Vec<u64> = vals.iter().map(|v| v.chain.lock().height()).collect();
+    panic!("nodes stuck at {heights:?}, wanted {height}");
+}
+
+/// OPS-3: protocol v2 is scheduled at height 60. Validators restart onto a v2 binary one at a
+/// time well before it (and signal v2 in the blocks they propose), the network keeps finalizing
+/// across the activation height with v2 blocks, and the validator left on v1 halts after block 59
+/// without diverging. Upgraded, it rejoins. Old epochs' consensus journals are pruned meanwhile.
+#[test]
+fn validators_upgrade_one_at_a_time_and_a_laggard_halts_at_the_activation_height() {
+    let (root, homes, genesis, seeds) = summon("upgrade");
+    const AT: u64 = 60;
+    let (v1, v2) = (consensus::SUPPORTED_PROTOCOL_VERSION, consensus::SUPPORTED_PROTOCOL_VERSION + 1);
+    let schedule = vec![crate::upgrade::ScheduledUpgrade { version: v2, activation_height: AT }];
+    let executor = deterministic::Runner::timed(Duration::from_secs(1_800));
+    executor.start(|context| async move {
+        let mut oracle = network(&context, &genesis, &[]).await;
+        let old = Node { supported: v1, schedule: schedule.clone() };
+        let mut vals = vec![];
+        for (i, (home, seed)) in homes.iter().zip(&seeds).enumerate() {
+            vals.push(start_with(&context, &mut oracle, &genesis, i, 0, home.clone(), PrivateKey::from_seed_bytes(*seed), old.clone()).await);
+        }
+        wait_for_height(&context, &vals, 5).await;
+        // Each operator installs the v2 binary in their own window, one at a time.
+        for i in 0..3 {
+            let mut v = vals.remove(i);
+            v.handle.take().unwrap().abort();
+            let (home, key) = (v.home.clone(), v.key.clone());
+            drop(v);
+            let h = vals[0].chain.lock().height();
+            wait_for_height(&context, &vals, h + 2).await;
+            let upgraded = start_with(&context, &mut oracle, &genesis, i, 1, home, key, Node { supported: v2, schedule: vec![] }).await;
+            vals.insert(i, upgraded);
+            let h = vals[0].chain.lock().height();
+            wait_for_height(&context, &vals, h + 6).await;
+        }
+        // Readiness on chain: three of four validators signal v2 in the blocks they propose (the
+        // last one restarted proposes again once it has watched the network for a few views).
+        let ready = || {
+            let c = vals[3].chain.lock();
+            let active = c.state.active_sets[&c.state.params.epoch_of(c.height() + 1)].clone();
+            let signals = crate::upgrade::signals(&active, c.view().headers(u64::MAX, 40).iter().map(|(h, m)| (*h, m.proposer.as_str(), m.signal)));
+            signals.values().filter(|(s, _)| *s >= v2).count()
+        };
+        wait_until(&context, "three validators signalling v2", || ready() == 3).await;
+        assert!(vals[0].chain.lock().height() < AT - 10, "the upgrades finished well before the activation height");
+        assert_eq!(crate::upgrade::version_at(&vals[3].chain.lock().state, AT), v2);
+        // Across the activation height: the v1 node stops after AT - 1; the rest go on.
+        let upgraded: Vec<&Val> = vals[..3].iter().collect();
+        wait_for(&context, &upgraded, AT + 10).await;
+        let laggard = &vals[3];
+        wait_until(&context, "the v1 node halts", || laggard.chain.lock().halt.signal.get().is_some()).await;
+        let halt = laggard.chain.lock().halt.signal.get().unwrap();
+        assert_eq!(halt, crate::upgrade::Halt::UpgradeRequired { height: AT, version: v2, supported: v1 });
+        assert_eq!(halt.exit_code(), crate::upgrade::EXIT_UPGRADE_REQUIRED);
+        assert_eq!(laggard.chain.lock().height(), AT - 1, "it didn't execute the v2 block");
+        {
+            let (a, b) = (vals[0].chain.lock(), laggard.chain.lock());
+            assert_eq!(a.root_at(AT - 1), b.root_at(AT - 1), "no divergence up to the halt");
+            assert_eq!(a.block(AT - 1).unwrap().hash, b.block(AT - 1).unwrap().hash);
+            assert!((1..AT).all(|h| a.block(h).unwrap().version == v1) && (AT..=AT + 10).all(|h| a.block(h).unwrap().version == v2));
+        }
+        // Its operator upgrades it too (the process exited): it executes the v2 blocks and agrees.
+        let mut v = vals.pop().unwrap();
+        v.handle.take().unwrap().abort();
+        let (home, key) = (v.home.clone(), v.key.clone());
+        drop(v);
+        vals.push(start_with(&context, &mut oracle, &genesis, 3, 1, home, key, Node { supported: v2, schedule: vec![] }).await);
+        let target = vals[0].chain.lock().height() + 8;
+        wait_for_height(&context, &vals, target).await;
+        let h = vals.iter().map(|v| v.chain.lock().height()).min().unwrap();
+        let roots: Vec<String> = vals.iter().map(|v| v.chain.lock().root_at(h).unwrap()).collect();
+        assert!(roots.windows(2).all(|w| w[0] == w[1]), "state roots diverged at {h}: {roots:?}");
+        // Epochs older than the current one minus two lost their simplex journals.
+        let epoch = vals[0].chain.lock().state.params.epoch_of(h);
+        assert!(epoch >= 6);
+        for e in 0..=epoch {
+            let present = commonware_runtime::Storage::scan(&context, &consensus::simplex_partition("v0", e)).await.is_ok_and(|b| !b.is_empty());
+            assert_eq!(present, e + consensus::JOURNAL_EPOCHS_KEPT >= epoch, "epoch {e}'s journal (current epoch {epoch})");
+        }
+        println!("✓ upgraded across #{AT} one validator at a time; the v1 node halted at #{}, then caught up", AT - 1);
+    });
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// OPS-6: a validator whose volume is restored from an old snapshot (its slashing-protection
+/// record from earlier, its consensus journal empty) comes back while the network is still in the
+/// same epoch and close to the views it had signed. It never signs in a view its earlier run
+/// signed in: it watches the network first, then signs only views the network finished after.
+/// Then it votes normally again, and nothing it signed conflicts with its earlier run.
+#[test]
+fn a_validator_restored_from_an_old_snapshot_does_not_double_sign() {
+    let (root, homes, genesis, seeds) = summon_with("restore", 1_000);
+    let executor = deterministic::Runner::timed(Duration::from_secs(1_800));
+    executor.start(|context| async move {
+        let mut oracle = network(&context, &genesis, &[]).await;
+        let mut vals = vec![];
+        for (i, (home, seed)) in homes.iter().zip(&seeds).enumerate() {
+            vals.push(start(&context, &mut oracle, &genesis, i, 0, home.clone(), PrivateKey::from_seed_bytes(*seed)).await);
+        }
+        wait_for_height(&context, &vals, 10).await;
+        // The provider's snapshot of validator 1's volume.
+        let record = vals[1].home.join(crate::protection::RECORD_FILE);
+        let snapshot = std::fs::read(&record).unwrap();
+        let snapshot_view = vals[1].protection.record().last_view();
+        let h = vals[0].chain.lock().height();
+        wait_for_height(&context, &vals, h + 15).await;
+        // The machine dies. Its earlier run signed through `old_view`.
+        let mut v = vals.remove(1);
+        v.handle.take().unwrap().abort();
+        let earlier = v.protection.log();
+        let old_view = v.protection.record().last_view();
+        let (home, key) = (v.home.clone(), v.key.clone());
+        drop(v);
+        assert!(old_view > snapshot_view + 10, "it signed {} views after the snapshot", old_view - snapshot_view);
+        // Restored a second later from the snapshot: the record rolls back, the journal is gone.
+        context.sleep(Duration::from_secs(1)).await;
+        std::fs::write(&record, &snapshot).unwrap();
+        let _ = commonware_runtime::Storage::remove(&context, &consensus::simplex_partition("v1", 0), None).await;
+        let restored = start(&context, &mut oracle, &genesis, 1, 1, home, key).await;
+        assert_eq!(restored.protection.record().last_view(), snapshot_view, "the record rolled back");
+        vals.insert(1, restored);
+        let h = vals[0].chain.lock().height();
+        wait_for_height(&context, &vals, h + 25).await;
+        let restored = &vals[1];
+        let later = restored.protection.log();
+        assert!(later.len() > 20, "it votes again ({} signatures)", later.len());
+        assert!(later.iter().all(|(e, _, _, _)| *e == 0), "still the same epoch");
+        // Never a view the earlier run signed in, so nothing can conflict with it.
+        let first = later.iter().map(|(_, v, _, _)| *v).min().unwrap();
+        assert!(first > old_view, "first view signed after the restore: {first}, the earlier run signed through {old_view}");
+        for (e, v, k, hash) in &later {
+            for (e0, v0, k0, hash0) in &earlier {
+                if (e, v) == (e0, v0) {
+                    let conflict = (k == k0 && hash != hash0) || matches!((k, k0), (crate::protection::Kind::Nullify, crate::protection::Kind::Finalize) | (crate::protection::Kind::Finalize, crate::protection::Kind::Nullify));
+                    assert!(!conflict, "double-signed {k:?}/{k0:?} in view {v}");
+                }
+            }
+        }
+        assert!(restored.protection.halted().is_none(), "no other instance was running");
+        // Its signatures are back in finalization certificates, and everyone agrees.
+        let new_pk = commonware_cryptography::Signer::public_key(&restored.key);
+        let c = vals[0].chain.lock();
+        let mut signed_certs = 0;
+        for b in (h + 10..=c.height()).filter_map(|x| c.block(x)).filter(|b| c.cert_len(b.height) > 0) {
+            count_signed(&c, 0, &new_pk, &b, &mut signed_certs);
+        }
+        drop(c);
+        assert!(signed_certs > 0, "the restored validator signs certificates again");
+        let top = vals.iter().map(|v| v.chain.lock().height()).min().unwrap();
+        let roots: Vec<String> = vals.iter().map(|v| v.chain.lock().root_at(top).unwrap()).collect();
+        assert!(roots.windows(2).all(|w| w[0] == w[1]), "state roots diverged at {top}: {roots:?}");
+        println!("✓ restored validator resumed at view {first} (earlier run: through {old_view}, snapshot at {snapshot_view}); {} signatures, none conflicting; in {signed_certs} certificates", later.len());
     });
     std::fs::remove_dir_all(root).ok();
 }

@@ -51,6 +51,38 @@ pub struct Node {
     pub extra_metrics: Option<Arc<dyn Fn() -> String + Send + Sync>>,
     /// Height of the newest checkpoint this node trusts (`checkpoints::Trust::newest`; 0: genesis).
     pub checkpoint_height: u64,
+    /// Why the node stopped executing, if it did (upgrade.rs): /api/health and /metrics say so.
+    pub halt: crate::upgrade::HaltSignal,
+    /// Validators: slashing protection's state, for /metrics.
+    pub protection: Option<Arc<crate::protection::Protection>>,
+    /// Validators: connected p2p peers, for /metrics.
+    pub p2p_peers: Option<Arc<dyn Fn() -> Option<usize> + Send + Sync>>,
+}
+
+/// When this process started (unix seconds), for `blockula_process_start_time_seconds`.
+static STARTED: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+
+/// Records the process start time (`main` calls it first thing).
+pub fn mark_process_start() {
+    STARTED.get_or_init(|| crate::chain::now_ms() as f64 / 1000.0);
+}
+
+/// Connected p2p peers, from the runtime's Prometheus text: the series of the authenticated
+/// p2p tracker's `connected` family (`network_tracker_directory_connected`, one per peer; the
+/// network runs under the `network` label, node.rs).
+pub fn connected_peers(runtime_metrics: &str) -> Option<usize> {
+    let is_family = |name: &str| name.starts_with("network_tracker") && name.ends_with("_connected");
+    let mut found = false;
+    let mut n = 0;
+    for line in runtime_metrics.lines() {
+        if let Some(rest) = line.strip_prefix("# TYPE ") {
+            found |= rest.split(' ').next().is_some_and(is_family);
+        } else if !line.starts_with('#') && is_family(line.split(['{', ' ']).next().unwrap_or_default()) {
+            found = true;
+            n += 1;
+        }
+    }
+    found.then_some(n)
 }
 
 /// Counters for /metrics.
@@ -259,8 +291,11 @@ fn too_many(what: &str, wait: Duration) -> ApiError {
 
 impl Node {
     pub fn new(chain: Shared, marshal: Option<MarshalMailbox>, peers: Vec<String>, client_ip: ClientIpPolicy) -> Self {
-        let live = chain.lock().live.clone();
-        Self { chain, live, marshal, peers, client_ip, limits: Default::default(), reads: Arc::new(ReadLimiter::new(READ_RPS, READ_BURST)), timeout: HTTP_TIMEOUT, stats: Default::default(), extra_metrics: None, github_cache: Default::default(), checkpoint_height: 0 }
+        let (live, halt) = {
+            let c = chain.lock();
+            (c.live.clone(), c.halt.signal.clone())
+        };
+        Self { chain, live, marshal, peers, client_ip, limits: Default::default(), reads: Arc::new(ReadLimiter::new(READ_RPS, READ_BURST)), timeout: HTTP_TIMEOUT, stats: Default::default(), extra_metrics: None, github_cache: Default::default(), checkpoint_height: 0, halt, protection: None, p2p_peers: None }
     }
 
     /// Per-client read limits: `rps` per second, bursts of `burst` (`rps` 0: unlimited).
@@ -383,6 +418,7 @@ pub fn router(node: Node) -> Router {
         .route("/api/souls", get(souls))
         .route("/api/proof/{namespace}/{key}", get(proof))
         .route("/api/health", get(health))
+        .route("/api/upgrade", get(upgrade))
         .route("/metrics", get(metrics))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(axum::middleware::from_fn_with_state(node.clone(), limit_reads))
@@ -493,6 +529,8 @@ fn header_json(v: &ReadView, height: u64, m: &BlockMeta) -> Value {
         "proposer": label(v, &m.proposer),
         "state_root": hex::encode(m.state_root),
         "tx_count": m.tx_count,
+        "version": m.version,
+        "signal": m.signal,
         "summary": block_summary(height, m.tx_count as usize),
     })
 }
@@ -506,6 +544,10 @@ fn block_json(v: &ReadView, b: &Block) -> Value {
         "proposer": label(v, &b.proposer),
         "state_root": b.state_root,
         "tx_count": b.txs.len(),
+        "version": b.version,
+        "signal": b.signal,
+        "view": b.view,
+        "parent_view": b.parent_view,
         "summary": block_summary(b.height, b.txs.len()),
         "txs": b.txs.iter().enumerate().map(|(i, t)| tx_json_with(v, t, Some(b.height), b.failed.get(&i).map(|s| s.as_str()))).collect::<Vec<_>>(),
         "signature_bytes": v.cert_len(b.height),
@@ -520,6 +562,15 @@ fn sync_progress(live: &Live, height: u64) -> f64 {
 
 fn head_age_ms(v: &ReadView) -> Option<u64> {
     v.head_time_ms().map(|t| crate::chain::now_ms().saturating_sub(t))
+}
+
+/// `/api/status`'s summary of upgrades and halts (`/api/upgrade` has the details).
+fn upgrade_status(n: &Node, v: &ReadView) -> Value {
+    json!({
+        "supported_protocol_version": crate::consensus::SUPPORTED_PROTOCOL_VERSION,
+        "next": crate::upgrade::next_after(&v.state, v.height).map(|u| json!({ "version": u.version, "activation_height": u.activation_height })),
+        "halted": n.halt.get().map(|h| json!({ "kind": h.kind(), "reason": h.to_string() })),
+    })
 }
 
 async fn status(State(n): State<Node>) -> ApiResult {
@@ -563,7 +614,8 @@ async fn status(State(n): State<Node>) -> ApiResult {
         "weak_subjectivity_blocks": crate::checkpoints::ws_period_blocks(&st.chain_params, st.params.epoch_blocks),
         "address_prefix": g.address_prefix,
         "max_tx_validity_blocks": st.chain_params.max_tx_validity_blocks,
-        "protocol_version": crate::consensus::PROTOCOL_VERSION,
+        "protocol_version": crate::upgrade::version_at(st, h + 1),
+        "upgrade": upgrade_status(&n, &v),
         "crypto": { "signatures": "ML-DSA-65 (FIPS 204)", "hash": "BLAKE3-256", "addresses": format!("bech32m({}, BLAKE3(pubkey))", g.address_prefix), "p2p_transport": p2p_transport() },
     })))
 }
@@ -667,20 +719,58 @@ async fn mempool(State(n): State<Node>, Query(p): Query<Page>) -> ApiResult {
     Ok(Json(json!({ "count": mp.len(), "txs": txs })))
 }
 
-/// 200 when the head is fresh and we're not syncing; 503 with a reason otherwise.
+/// 200 when the head is fresh and we're not syncing; 503 with a reason otherwise. A halted node
+/// (upgrade.rs: an unsupported version next, `--halt-height`) says so first.
 async fn health(State(n): State<Node>) -> Response {
     let v = n.live.view();
     let bt = v.genesis.block_time_ms.max(1);
     let age = head_age_ms(&v);
+    let halt = n.halt.get();
     let reason = match age {
+        _ if halt.is_some() => halt.as_ref().map(|h| format!("halted: {h}")),
         _ if n.live.syncing(v.height) => Some(format!("syncing: {} of {}", v.height, n.live.network_height_claimed(v.height))),
         None => Some("no blocks yet".to_string()),
         Some(a) if a > 10 * bt => Some(format!("head is {}s old", a / 1000)),
         _ => None,
     };
-    let body = json!({ "ok": reason.is_none(), "reason": reason, "height": v.height, "head_age_ms": age, "finalized_height": n.live.finalized(v.height) });
+    let body = json!({ "ok": reason.is_none(), "reason": reason, "halted": halt.map(|h| h.kind()), "height": v.height, "head_age_ms": age, "finalized_height": n.live.finalized(v.height) });
     let code = if reason.is_none() { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
     (code, Json(body)).into_response()
+}
+
+/// Blocks `/api/upgrade` reads proposers' signals from (each active validator proposes about
+/// once every `n` blocks).
+const SIGNAL_WINDOW: usize = 200;
+
+/// The upgrade schedule, what this binary supports, whether the node halted, and readiness: the
+/// newest version each active validator signalled in the blocks it proposed recently.
+async fn upgrade(State(n): State<Node>) -> ApiResult {
+    let v = n.live.view();
+    let (st, h) = (&v.state, v.height);
+    let epoch = st.params.epoch_of(h + 1);
+    let active = st.active_sets.get(&epoch).cloned().unwrap_or_default();
+    let headers = v.headers(u64::MAX, SIGNAL_WINDOW);
+    let signals = crate::upgrade::signals(&active, headers.iter().map(|(height, m)| (*height, m.proposer.as_str(), m.signal)));
+    let next = crate::upgrade::next_after(st, h);
+    let target = next.map(|u| u.version).unwrap_or(crate::consensus::SUPPORTED_PROTOCOL_VERSION);
+    let ready = signals.values().filter(|(s, _)| *s >= target).count();
+    Ok(Json(json!({
+        "height": h,
+        "protocol_version": crate::upgrade::version_at(st, h + 1),
+        "supported_protocol_version": crate::consensus::SUPPORTED_PROTOCOL_VERSION,
+        "schedule": st.upgrade.schedule.iter().map(|u| json!({ "version": u.version, "activation_height": u.activation_height, "active": u.activation_height <= h + 1 })).collect::<Vec<_>>(),
+        "next": next.map(|u| json!({ "version": u.version, "activation_height": u.activation_height, "blocks_left": u.activation_height.saturating_sub(h + 1), "this_binary_supports_it": u.version <= crate::consensus::SUPPORTED_PROTOCOL_VERSION })),
+        "halted": n.halt.get().map(|h| json!({ "kind": h.kind(), "reason": h.to_string() })),
+        "readiness": {
+            "version": target,
+            "ready": ready,
+            "active": active.len(),
+            "two_thirds": ready * 3 >= active.len() * 2 && !active.is_empty(),
+            "window_blocks": headers.len(),
+            "validators": active.iter().map(|a| json!({ "validator": label(&v, a), "signal": signals.get(a).map(|s| s.0), "seen_at": signals.get(a).map(|s| s.1) })).collect::<Vec<_>>(),
+        },
+        "explainer": "Blocks carry the protocol version in force at their height and signal the newest version their proposer's binary supports. An upgrade is scheduled by governance once at least two-thirds of the active set signal it; a node whose binary doesn't support the version in force stops before that height instead of diverging.",
+    })))
 }
 
 /// Prometheus text format.
@@ -715,6 +805,42 @@ async fn metrics(State(n): State<Node>) -> Response {
             let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {val}");
         }
         let _ = writeln!(out, "# HELP blockula_build_info Version and git sha\n# TYPE blockula_build_info gauge\nblockula_build_info{{version=\"{VERSION}\",git_sha=\"{GIT_SHA}\"}} 1");
+        // Upgrades and halts (upgrade.rs).
+        let next = crate::upgrade::next_after(&v.state, h);
+        let halt = n.halt.get();
+        let mut gauges = vec![
+            ("blockula_protocol_version", "Protocol version in force at the next height", crate::upgrade::version_at(&v.state, h + 1) as f64),
+            ("blockula_supported_protocol_version", "Newest protocol version this binary runs", crate::consensus::SUPPORTED_PROTOCOL_VERSION as f64),
+            ("blockula_upgrade_next_version", "Next scheduled protocol version (0: none)", next.map(|u| u.version as f64).unwrap_or(0.0)),
+            ("blockula_upgrade_next_height", "Activation height of the next scheduled version (0: none)", next.map(|u| u.activation_height as f64).unwrap_or(0.0)),
+            ("blockula_halted", "1 while the node has stopped executing (see /api/health)", f64::from(u8::from(halt.is_some()))),
+        ];
+        if let Some(started) = STARTED.get() {
+            gauges.push(("blockula_process_start_time_seconds", "When this process started (unix seconds)", *started));
+        }
+        if let Some(peers) = n.p2p_peers.as_ref().and_then(|f| f()) {
+            gauges.push(("blockula_p2p_peers", "Connected p2p peers", peers as f64));
+        }
+        // Slashing protection (protection.rs).
+        if let Some(p) = &n.protection {
+            let st = p.status();
+            gauges.extend([
+                ("blockula_slashing_protection_epoch", "Newest epoch this validator's key signed in", st.epoch as f64),
+                ("blockula_slashing_protection_last_view", "Newest view this validator's key signed in that epoch", st.view as f64),
+                ("blockula_slashing_protection_voting", "1 if this validator is in the current active set", f64::from(u8::from(st.voting))),
+                ("blockula_slashing_protection_abstaining", "1 while it watches the network after a start before signing", f64::from(u8::from(st.abstaining))),
+                ("blockula_slashing_protection_refused_total", "Vote signatures slashing protection refused", st.refused as f64),
+            ]);
+        }
+        // TODO(P-STAKE): blockula_missed_leader_slots_total{validator}, blockula_validator_jailed
+        // and blockula_validator_tombstoned once staking keeps liveness and jail records.
+        for (name, help, val) in gauges {
+            let kind = if name.ends_with("_total") { "counter" } else { "gauge" };
+            let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {val}");
+        }
+        if let Some(h) = halt {
+            let _ = writeln!(out, "# HELP blockula_halt_info Why the node halted\n# TYPE blockula_halt_info gauge\nblockula_halt_info{{kind=\"{}\"}} 1", h.kind());
+        }
     }
     if let Some(extra) = &n.extra_metrics {
         out.push_str(&extra());
@@ -1451,6 +1577,64 @@ mod http_tests {
         assert_eq!(b["to"], 1);
         assert_eq!(b["finalization"], "010203");
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Upgrades and halts over HTTP: the schedule and readiness (`/api/upgrade`), blocks'
+    /// signals, a halted node's 503 with the reason, and the /metrics gauges operators alert on.
+    #[tokio::test]
+    async fn upgrade_status_signals_halts_and_their_metrics() {
+        let (root, mut n) = node("upgrade");
+        let v2 = crate::consensus::SUPPORTED_PROTOCOL_VERSION + 1;
+        {
+            let mut c = n.chain.lock();
+            c.state.upgrade.schedule = vec![crate::upgrade::ScheduledUpgrade { version: v2, activation_height: 4 }];
+            c.produce_block_with(vec![]).unwrap();
+            c.produce_block_with(vec![]).unwrap();
+        }
+        let (s, u, _) = call(&n, "GET", "/api/upgrade", None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!((u["height"].as_u64(), u["next"]["version"].as_u64(), u["next"]["blocks_left"].as_u64(), u["next"]["this_binary_supports_it"].as_bool()), (Some(2), Some(v2 as u64), Some(1), Some(false)));
+        // The one validator proposed both blocks, signalling what its binary supports.
+        assert_eq!((u["readiness"]["version"].as_u64(), u["readiness"]["ready"].as_u64(), u["readiness"]["active"].as_u64()), (Some(v2 as u64), Some(0), Some(1)));
+        assert_eq!(u["readiness"]["validators"][0]["signal"].as_u64(), Some(crate::consensus::SUPPORTED_PROTOCOL_VERSION as u64));
+        let (_, blocks, _) = call(&n, "GET", "/api/blocks", None, "127.0.0.1:1").await;
+        assert_eq!((blocks[0]["version"].as_u64(), blocks[0]["signal"].as_u64()), (Some(1), Some(crate::consensus::SUPPORTED_PROTOCOL_VERSION as u64)));
+        let (_, _, text) = call(&n, "GET", "/metrics", None, "127.0.0.1:1").await;
+        for want in ["blockula_upgrade_next_version 2", "blockula_upgrade_next_height 4", "blockula_supported_protocol_version 1", "blockula_protocol_version 1", "blockula_halted 0"] {
+            assert!(text.contains(want), "{want} in {text}");
+        }
+        // Block 3 executes; block 4 runs v2, which this binary doesn't: halted.
+        assert!(n.chain.lock().produce_block_with(vec![]).is_err());
+        let (s, h, _) = call(&n, "GET", "/api/health", None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(h["halted"], "upgrade_required");
+        assert!(h["reason"].as_str().unwrap().starts_with("halted: block 4 runs protocol v2"), "{h}");
+        let (_, status, _) = call(&n, "GET", "/api/status", None, "127.0.0.1:1").await;
+        assert_eq!(status["upgrade"]["halted"]["kind"], "upgrade_required");
+        // Reads keep working.
+        let (s, _, _) = call(&n, "GET", "/api/block/3", None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::OK);
+        // A validator's slashing-protection gauges.
+        let key = crate::crypto::Keys::from_seed([1; 32]).public_key();
+        let p = crate::protection::Protection::in_memory(&key, crate::protection::Timing::for_block_time(1_000));
+        p.enter_epoch(0, Some(0), 4, 0);
+        n.protection = Some(p);
+        n.p2p_peers = Some(Arc::new(|| Some(3)));
+        mark_process_start();
+        let (_, _, text) = call(&n, "GET", "/metrics", None, "127.0.0.1:1").await;
+        for want in ["blockula_halted 1", "blockula_halt_info{kind=\"upgrade_required\"} 1", "blockula_slashing_protection_abstaining 1", "blockula_slashing_protection_voting 1", "blockula_slashing_protection_last_view 0", "blockula_p2p_peers 3", "blockula_process_start_time_seconds"] {
+            assert!(text.contains(want), "{want} in {text}");
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn peer_count_from_the_runtime_metrics() {
+        // As commonware-p2p 2026.9.0 exports it (captured from a 4-validator local chain).
+        let text = "# HELP network_tracker_directory_connected Unix timestamp in milliseconds when each connected peer became active.\n# TYPE network_tracker_directory_connected gauge\nnetwork_tracker_directory_connected{peer=\"3de892cdf0a5\"} 1792045530601\nnetwork_tracker_directory_connected{peer=\"111ec16d2af5\"} 1792045529793\n# TYPE network_tracker_directory_tracked gauge\nnetwork_tracker_directory_tracked 3\nnode_validator_marshal_connected 1\n";
+        assert_eq!(connected_peers(text), Some(2));
+        assert_eq!(connected_peers("# HELP network_tracker_directory_connected x\n# TYPE network_tracker_directory_connected gauge\n"), Some(0));
+        assert_eq!(connected_peers("runtime_tasks_spawned_total 3\n"), None, "no p2p tracker");
     }
 
     #[tokio::test]

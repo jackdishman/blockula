@@ -6,9 +6,8 @@
 # Thresholds come from the protocol: 1 s blocks, MAX_EXEC_LAG = 16 and MAX_CLOCK_DRIFT_MS = 1000
 # (node/src/consensus.rs), MAX_MEMPOOL = 5000 (node/src/chain.rs). Change them with the code.
 #
-# Planned, once the node exports them (see the TODO panels in the dashboard):
-#   peer count below the active set; missed leader slots per validator (P-STAKE); this validator
-#   jailed; slashing-protection record not advancing or rolled back (P-UPGRADE); start time.
+# Planned, once the node exports them (see the TODO panels in the dashboard): missed leader
+# slots per validator and this validator jailed or tombstoned (P-STAKE).
 groups:
   - name: blockula-recording
     rules:
@@ -77,9 +76,9 @@ groups:
           summary: "{{ $labels.node }}: more txs rejected than accepted over HTTP (spam or a broken client)"
           runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#mempool-full
 
-      # A restart resets the counters, and the height drops while the node replays.
+      # The process start time is exact; a falling height also catches a restart before it.
       - alert: BlockulaRestarted
-        expr: (resets(blockula_tx_submitted_total[15m]) + resets(blockula_tx_rejected_total[15m]) > 0) or (blockula_height < max_over_time(blockula_height[15m]))
+        expr: (time() - blockula_process_start_time_seconds < 900) or (blockula_height < max_over_time(blockula_height[15m]))
         labels: { severity: warning }
         annotations:
           summary: "{{ $labels.node }}: the node restarted in the last 15 minutes"
@@ -92,6 +91,36 @@ groups:
         annotations:
           summary: "Your nodes run {{ $value }} different blockula versions"
           runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#upgrades
+
+  # Upgrades and halts (node/src/upgrade.rs, MAINNET-DESIGN 3.9).
+  - name: blockula-upgrades
+    rules:
+      # Stopped executing on purpose: --halt-height, or a protocol version this binary doesn't run.
+      # A full node keeps serving reads (this fires); a validator exits (BlockulaNodeDown fires).
+      - alert: BlockulaHalted
+        expr: blockula_halted == 1
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.node }}: halted at block {{ with printf `blockula_height{node=\"%s\"}` $labels.node | query }}{{ . | first | value }}{{ end }} (/api/health says why)"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#halted
+
+      # Governance scheduled a protocol version this binary doesn't run: the node will stop at its
+      # activation height. Install the release before then.
+      - alert: BlockulaUpgradeRequired
+        expr: blockula_upgrade_next_version > blockula_supported_protocol_version
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }}: protocol v{{ $value }} is scheduled and this binary doesn't run it; upgrade before the activation height"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#upgrade-required
+      - alert: BlockulaUpgradeRequiredSoon
+        expr: blockula_upgrade_next_version > blockula_supported_protocol_version and (blockula_upgrade_next_height - blockula_height) < 86400
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.node }}: protocol v{{ $value }} activates within a day and this binary doesn't run it: the node will halt there"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#upgrade-required
 
   - name: blockula-validators
     rules:
@@ -106,6 +135,43 @@ groups:
         annotations:
           summary: "{{ $labels.node }}: newest certificate has {{ $value }} signers, below quorum for its active set"
           runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#validator-set
+
+      # Fewer connected peers than a quorum needs besides this node: its votes and blocks may not
+      # reach enough of the set. Validators only (full nodes have no p2p).
+      - alert: BlockulaFewPeers
+        expr: blockula_p2p_peers < blockula:quorum - 1
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }}: {{ $value }} p2p peers, fewer than a quorum needs"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#peers
+
+      # Slashing protection (node/src/protection.rs). The record only moves forward: going back
+      # means the home was restored from a backup or copied. Stop the validator and investigate.
+      - alert: BlockulaSlashingProtectionRolledBack
+        expr: (blockula_slashing_protection_epoch < blockula_slashing_protection_epoch offset 1m) or (blockula_slashing_protection_last_view < blockula_slashing_protection_last_view offset 1m and blockula_slashing_protection_epoch == blockula_slashing_protection_epoch offset 1m)
+        keep_firing_for: 30m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.node }}: the slashing-protection record went backwards (a restored or copied home?)"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#slashing-protection
+      # In the active set, the chain advancing, and this validator signing nothing.
+      - alert: BlockulaValidatorNotSigning
+        expr: blockula_slashing_protection_voting == 1 and changes(blockula_slashing_protection_last_view[10m]) == 0 and changes(blockula_height[10m]) > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }}: in the active set but hasn't signed a vote for 10 minutes while the chain advanced"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#slashing-protection
+      # After a start a validator watches the network for a few seconds (up to ~20 s if the
+      # network can't progress without it) before it signs. Minutes means something is wrong.
+      - alert: BlockulaWatchingAfterStart
+        expr: blockula_slashing_protection_abstaining == 1
+        for: 3m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }}: still not signing, watching the network after a start"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#slashing-protection
 
       # NaN: no finalization certificate among the last 16 executed heights.
       - alert: BlockulaNoRecentCertificate
