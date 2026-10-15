@@ -16,6 +16,7 @@ mod node;
 mod params;
 mod pq;
 mod poc;
+mod protection;
 mod types;
 mod upgrade;
 mod validator_cli;
@@ -78,6 +79,10 @@ struct Net {
     /// Longest an HTTP request may take, in seconds
     #[arg(long, default_value_t = api::HTTP_TIMEOUT.as_secs())]
     http_timeout_secs: u64,
+    /// Execute this height, then stop: validators exit (code 10) and don't vote past it, full
+    /// nodes keep serving reads. For coordinated restarts and incidents (docs/OPERATIONS.md)
+    #[arg(long)]
+    halt_height: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -195,10 +200,11 @@ fn net_opts(net: Net, http_port: Option<u16>, p2p_preset: Option<String>, epheme
         (_, Some(n)) => node::Pruning::Keep(n),
         _ => node::Pruning::Default,
     };
-    NetOpts { bind: net.bind, http_port, p2p_preset, ephemeral_p2p, client_ip, peer_http: net.peer_http, force_key: net.force_key, full: net.full, pruning, http }
+    NetOpts { bind: net.bind, http_port, p2p_preset, ephemeral_p2p, client_ip, peer_http: net.peer_http, force_key: net.force_key, full: net.full, pruning, http, halt_height: net.halt_height }
 }
 
 fn main() -> Result<()> {
+    api::mark_process_start();
     // Outbound HTTPS uses rustls on aws-lc-rs, which offers the hybrid X25519MLKEM768 first.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     tracing_subscriber::fmt()

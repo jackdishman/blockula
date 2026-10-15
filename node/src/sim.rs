@@ -45,6 +45,7 @@ async fn start(
         block_time_ms: genesis.block_time_ms,
         epoch_blocks: genesis.epoch_blocks,
         partition: format!("v{idx}"),
+        protection: None,
     };
     let ctx = context.child("validator").with_attribute("idx", idx).with_attribute("run", run);
     let (handle, _marshal) = consensus::start_validator(ctx, cfg, oracle.manager(), control, channels).await;

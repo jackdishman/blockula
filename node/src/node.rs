@@ -5,6 +5,8 @@ use crate::api::{self, Node};
 use crate::chain::{Chain, Genesis};
 use crate::consensus::{self, CBlock, Shared, ValidatorConfig, CHANNELS, MAX_MESSAGE_SIZE};
 use crate::pq::{MlDsaScheme, PrivateKey};
+use crate::protection::Protection;
+use crate::upgrade::Halt;
 use anyhow::{anyhow, bail, Context, Result};
 use commonware_codec::{Decode, DecodeExt};
 use commonware_consensus::simplex::types::Finalization;
@@ -62,6 +64,8 @@ pub struct NetOpts {
     /// `--prune-blocks` / `--archive`.
     pub pruning: Pruning,
     pub http: HttpOpts,
+    /// `--halt-height`: execute this height, then stop (upgrade.rs).
+    pub halt_height: Option<u64>,
 }
 
 /// How many blocks a node keeps on disk.
@@ -106,6 +110,54 @@ fn http_node(chain: Shared, marshal: Option<consensus::MarshalMailbox>, peers: V
     let mut node = Node::new(chain, marshal, peers, net.client_ip.clone()).with_read_limits(net.http.read_rps, net.http.read_burst);
     node.timeout = net.http.timeout;
     node
+}
+
+/// A validator stops the process on a halt (upgrade.rs): the reason, then the halt's exit code
+/// (`RestartPreventExitStatus` keeps systemd from restarting it). Everything it executed is
+/// already durable: blocks are committed before consensus hears about them.
+fn exit_halted(halt: &Halt) -> ! {
+    use std::io::Write as _;
+    eprintln!("🛑 {halt}");
+    eprintln!("   exit code {} ({}): see docs/OPERATIONS.md, \"Upgrades\" and \"Incident response\"", halt.exit_code(), halt.kind());
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    std::process::exit(halt.exit_code())
+}
+
+/// Watches a validator for a reason to stop: a halt recorded by execution (--halt-height, an
+/// unsupported version) or another instance signing with its key (slashing protection).
+async fn watch_halts(chain: Shared, protection: Arc<Protection>) {
+    let signal = chain.lock().halt.signal.clone();
+    loop {
+        if let Some(reason) = protection.halted() {
+            signal.set(Halt::DoubleSignRisk { reason });
+        }
+        if let Some(halt) = signal.get() {
+            // The block that halted is stored; wait for the executor to let go of the chain.
+            drop(chain.lock());
+            exit_halted(&halt);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Deletes the simplex journals of epochs before `epoch - JOURNAL_EPOCHS_KEPT` from a consensus
+/// storage directory (OPS-6). The running node deletes them as epochs pass; this catches the
+/// ones left from before a restart. Returns how many it deleted.
+pub fn prune_epoch_journals(dir: &Path, prefix: &str, epoch: u64) -> Result<usize> {
+    let keep_from = epoch.saturating_sub(consensus::JOURNAL_EPOCHS_KEPT);
+    let Ok(entries) = std::fs::read_dir(dir) else { return Ok(0) };
+    let mut deleted = 0;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let old = name.to_str().and_then(|n| n.strip_prefix(prefix)).and_then(|n| n.strip_prefix("-simplex-")).and_then(|n| n.parse::<u64>().ok());
+        if old.is_some_and(|e| e < keep_from) && entry.file_type()?.is_dir() && consensus::simplex_partition(prefix, old.unwrap_or_default()) == name.to_string_lossy() {
+            std::fs::remove_dir_all(entry.path())?;
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
 }
 
 /// Pulls peers' validator-set handoff signatures every 30s (and signs our own, if we're a
@@ -314,11 +366,17 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
     let mut chain = Chain::open(&home)?;
     let keep = net.pruning.keep(true, &chain.state);
     chain.set_pruning(keep);
+    crate::upgrade::configure(&mut chain, consensus::SUPPORTED_PROTOCOL_VERSION, net.halt_height);
+    if let Some(halt) = chain.halt.signal.get() {
+        exit_halted(&halt);
+    }
     double_sign_guard(&home, chain.height(), net.force_key)?;
     check_storage_version(&home)?;
     let genesis = chain.genesis.clone();
     let seed: [u8; 32] = hex::decode(std::fs::read_to_string(home.join("validator.key"))?.trim())?.try_into().map_err(|_| anyhow!("bad validator.key"))?;
     let key = PrivateKey::from_seed_bytes(seed);
+    // Slashing protection: the record next to the key, and the restart rule (protection.rs).
+    let protection = Protection::open(&home.join(crate::protection::RECORD_FILE), commonware_cryptography::Signer::public_key(&key).as_ref(), crate::protection::Timing::for_block_time(genesis.block_time_ms), true)?;
     let me = commonware_cryptography::Signer::public_key(&key).address(&genesis.address_prefix);
     let addrs = match genesis.validators.iter().find(|v| v.address == me) {
         Some(v) => NodeAddrs { p2p_addr: v.p2p_addr.clone(), http_addr: v.http_addr.clone() },
@@ -362,9 +420,17 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
             catch_up(shared.clone(), peers.clone()).await;
         });
     }
+    if let Some(halt) = shared.lock().halt.signal.get() {
+        exit_halted(&halt);
+    }
     {
         let chain = shared.lock();
         let epoch = chain.state.params.epoch_of(chain.height() + 1);
+        match prune_epoch_journals(&home.join("consensus"), "blockula", epoch) {
+            Ok(0) => {}
+            Ok(n) => println!("🧹 deleted {n} old epochs' consensus journals"),
+            Err(e) => eprintln!("⚠️  couldn't prune old consensus journals: {e:#}"),
+        }
         let active = chain.state.active_sets.get(&epoch).map(|s| s.len()).unwrap_or(0);
         let voting = chain.state.active_sets.get(&epoch).is_some_and(|s| s.contains(&me));
         println!(
@@ -408,11 +474,16 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
         let channels: Vec<_> = CHANNELS.iter().map(|c| network.register(*c, consensus::quota(*c))).collect();
         network.start();
 
-        let vcfg = ValidatorConfig { chain: shared.clone(), key, genesis: genesis_block, block_time_ms, epoch_blocks: genesis.epoch_blocks, partition: "blockula".into() };
+        let vcfg = ValidatorConfig { chain: shared.clone(), key, genesis: genesis_block, block_time_ms, epoch_blocks: genesis.epoch_blocks, partition: "blockula".into(), protection: Some(protection.clone()) };
         let (handle, marshal) = consensus::start_validator(context.child("node"), vcfg, oracle.clone(), oracle.clone(), channels).await;
         tokio::spawn(exchange_epochs(shared.clone(), peers.clone()));
         tokio::spawn(attest_claims(shared.clone()));
-        tokio::spawn(serve_http(http_node(shared, Some(marshal), peers, &net), http_bind));
+        tokio::spawn(watch_halts(shared.clone(), protection.clone()));
+        let mut node = http_node(shared, Some(marshal), peers, &net);
+        node.protection = Some(protection);
+        let metrics = context.child("metrics");
+        node.p2p_peers = Some(Arc::new(move || api::connected_peers(&commonware_runtime::Metrics::encode(&metrics))));
+        tokio::spawn(serve_http(node, http_bind));
         if let Err(e) = handle.await {
             eprintln!("consensus stopped: {e:?}");
         }
@@ -479,6 +550,8 @@ pub fn run_full_node(home: PathBuf, net: NetOpts) -> Result<()> {
     let mut chain = Chain::open(&home)?;
     let keep = net.pruning.keep(false, &chain.state);
     chain.set_pruning(keep);
+    // A halted full node keeps serving reads at its height, with the reason in /api/health.
+    crate::upgrade::configure(&mut chain, consensus::SUPPORTED_PROTOCOL_VERSION, net.halt_height);
     let peers = if net.peer_http.is_empty() { jc.peers } else { http_peers(&chain.genesis, &net.peer_http, None) };
     println!("🦇 Full node for `{}` at height {} — syncing from {}", chain.genesis.chain_id, chain.height(), peers.join(", "));
     let shared: Shared = Arc::new(Mutex::new(chain));
@@ -563,7 +636,16 @@ async fn sync_loop(chain: Shared, peers: Vec<String>, stop_when_caught_up: bool)
     let mut peer = 0usize;
     let mut idle_rounds = 0usize;
     let mut failures = 0usize;
+    let halt = chain.lock().halt.signal.clone();
     loop {
+        if let Some(h) = halt.get() {
+            if stop_when_caught_up {
+                return; // a validator catching up: run_validator exits with the halt's code
+            }
+            // A full node stops following the chain but keeps serving reads (/api/health says why).
+            eprintln!("🛑 {h}\n   still serving reads at height {}; /api/health reports the halt", chain.lock().height());
+            return futures::future::pending().await;
+        }
         let url = &peers[peer % peers.len()];
         match sync_once(&chain, &provider, &client, url).await {
             Ok(true) => {
