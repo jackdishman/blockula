@@ -3865,9 +3865,12 @@ mod scaffold {
         assert_eq!((s.chain_params.max_validators, s.chain_params.proposal_deposit), (40, 50 * FANG));
         assert_eq!(s.chain_params.unbonding_blocks, 21 * 86_400);
         assert!(s.record(ns::META, crate::state::meta::CHAIN_PARAMS).is_some());
-        // The operator owns its validator; the self-bond left its balance for the bond (escrow).
+        // The operator owns its validator; the self-bond left its balance for the validator's
+        // stake pool (an escrow), as the owner's shares.
         let rec = &s.validators[&v];
-        assert_eq!((rec.owner.as_str(), rec.bond, rec.commission_bps, rec.status), (owner.as_str(), 10_000 * FANG, 500, ValidatorStatus::Active));
+        assert_eq!((rec.owner.as_str(), rec.commission_bps, rec.status), (owner.as_str(), 500, ValidatorStatus::Active));
+        assert_eq!((s.staking.pools[&v].stake, crate::staking::self_bond(s, &v)), (10_000 * FANG, 10_000 * FANG));
+        assert_eq!(crate::staking::holdings(s, &owner), (10_000 * FANG, 0));
         assert_eq!(s.account(&owner).balance, 10_000 * FANG);
         // Vesting allocations are locks on the account, released linearly after the cliff.
         let locks = s.account(&founder).locks;
@@ -3966,15 +3969,15 @@ mod scaffold {
         let (owner, bob) = (keys(22), keys(24));
         let v = Keys::from_seed(VALIDATOR).address();
         // Modules that haven't landed refuse their txs; a block carrying one charges its fee.
-        let delegate = signed(&c, &owner, Action::Delegate { validator: v.clone(), amount: FANG });
-        assert_eq!(c.submit(delegate.clone()).unwrap_err().to_string(), "not active yet");
-        for action in [Action::Propose { kind: ProposalKind::Text {}, deposit: FANG, title: "t".into(), url: String::new() }, Action::BeaconCommit { epoch: 1, commitment: "ab".repeat(32) }, Action::RenewName { name: "abc".into(), years: 1 }] {
+        let propose = signed(&c, &owner, Action::Propose { kind: ProposalKind::Text {}, deposit: FANG, title: "t".into(), url: String::new() });
+        assert_eq!(c.submit(propose.clone()).unwrap_err().to_string(), "not active yet");
+        for action in [Action::BeaconCommit { epoch: 1, commitment: "ab".repeat(32) }, Action::RenewName { name: "abc".into(), years: 1 }] {
             assert_eq!(c.submit(signed(&c, &owner, action)).unwrap_err().to_string(), "not active yet");
         }
         let before = c.state.account(&owner.address()).balance;
-        c.produce_block_with(vec![delegate.clone()]).unwrap();
-        assert_eq!(c.failure(&delegate.id()).unwrap().0, "not active yet");
-        assert_eq!(c.state.account(&owner.address()).balance, before - delegate.charge().unwrap());
+        c.produce_block_with(vec![propose.clone()]).unwrap();
+        assert_eq!(c.failure(&propose.id()).unwrap().0, "not active yet");
+        assert_eq!(c.state.account(&owner.address()).balance, before - propose.charge().unwrap());
         // Reserved names can't be registered; names transfer and release.
         assert!(c.submit(signed(&c, &owner, Action::RegisterName { name: "blockula".into() })).unwrap_err().to_string().contains("reserved"));
         c.submit(signed(&c, &owner, Action::RegisterName { name: "owner".into() })).unwrap();
@@ -4143,10 +4146,10 @@ mod scaffold {
         c.produce_block().unwrap();
         // A name changes hands, a module tx fails (and is charged), a stale tx is skipped.
         let give = signed(&c, &owner, Action::TransferName { name: "owner".into(), to: bob.address() });
-        let delegate = Tx { nonce: give.nonce + 1, ..signed(&c, &owner, Action::Delegate { validator: v.clone(), amount: FANG }) }.sign(&owner);
+        let delegate = Tx { nonce: give.nonce + 1, ..signed(&c, &owner, Action::Delegate { validator: v.clone(), amount: 1_000_000 * FANG }) }.sign(&owner);
         let stale = Tx { nonce: 40, ..signed(&c, &owner, Action::Transfer { to: bob.address(), amount: FANG }) }.sign(&owner);
         c.produce_block_with(vec![give.clone(), delegate.clone(), stale.clone()]).unwrap();
-        assert_eq!(c.failure(&delegate.id()).unwrap().0, "not active yet");
+        assert!(c.failure(&delegate.id()).unwrap().0.contains("insufficient balance"));
         for _ in 0..3 {
             c.produce_block_with(vec![]).unwrap();
         }
@@ -4171,7 +4174,9 @@ mod scaffold {
         assert_eq!((s.chain_params.max_validators, s.chain_params.proposal_deposit), (40, 50 * FANG));
         assert_eq!(s.chain_params, g.chain_params().unwrap());
         assert_eq!(s.account(&founder.address()).locks, vec![Lock { id: 0, amount: LockAmount::Vesting { total: 1_000_000 * FANG, start: 0, cliff: 100, end: 1_000 }, reason: "founder".into() }]);
-        assert_eq!((s.validators[&v].owner.as_str(), s.validators[&v].bond, s.validators[&v].commission_bps), (owner.address().as_str(), 10_000 * FANG, 500));
+        // The validator proposed the block that carried the stale tx and holds no balance of its
+        // own: its pool's self-bond paid for the junk (CV-5).
+        assert_eq!((s.validators[&v].owner.as_str(), crate::staking::self_bond(s, &v), s.validators[&v].commission_bps), (owner.address().as_str(), 10_000 * FANG - min_fee(stale.size()), 500));
         assert!(s.econ.reserved_names.contains_key("blockula") && s.econ.reserved_names.contains_key("foundation"));
         assert_eq!(s.soul_of(&owner.address(), height), 50 * SOUL);
         assert!(crate::upgrade::is_active(s, "ghost"));

@@ -1147,6 +1147,7 @@ mod memory_tests {
 mod tests {
     use super::*;
     use crate::chain::SummonOpts;
+    use crate::types::DROPS_PER_FANG;
     use commonware_codec::DecodeExt as _;
     use commonware_consensus::types::{Round, View};
     use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
@@ -1186,8 +1187,9 @@ mod tests {
     }
 
     /// A verifier that hasn't executed the height a block cites keeps the verdict pending (it
-    /// used to vote no after ~3 block times at checkpoints), then checks the root once it has.
-    /// Mismatched views, versions and junk txs are still rejected at once.
+    /// used to vote no after ~3 block times at checkpoints), then checks the root once it has,
+    /// and then (CV-5) replays the unexecuted ancestors to admit every tx. Mismatched views,
+    /// versions and junk tx bytes are still rejected at once.
     #[test]
     fn lagging_verifier_waits_instead_of_rejecting() {
         let root_dir = std::env::temp_dir().join(format!("blockula-lag-{}-{}", crate::chain::now_ms(), std::process::id()));
@@ -1208,35 +1210,41 @@ mod tests {
             b.produce_block_with(vec![]).unwrap();
         }
         let (root100, root101) = (hex_32(&a.root_at(100).unwrap()), hex_32(&a.root_at(101).unwrap()));
+        let (hash100, hash101) = (Digest(hex_32(&a.hash_at(100).unwrap())), Digest(hex_32(&a.hash_at(101).unwrap())));
         drop(a);
         let seed: [u8; 32] = hex::decode(std::fs::read_to_string(ahead.join("validator.key")).unwrap().trim()).unwrap().try_into().unwrap();
         let chain: Shared = Arc::new(Mutex::new(b));
         deterministic::Runner::timed(Duration::from_secs(120)).start(|context| async move {
             let leader = PrivateKey::from_seed_bytes(seed).public_key();
             let mut app = App { chain: chain.clone(), block_time_ms: 1_000, address_prefix: "boo".into() };
-            let parent_at = |height: u64| CBlock::new(Digest([height as u8; 32]), height, 6, 5, 0, String::new(), height - 4, [0; 32], vec![]);
+            // Ancestors the verifier hasn't executed, linked to the blocks it will execute.
+            let on = |parent: Digest, height: u64| CBlock::new(parent, height, 6, 5, 0, String::new(), height - 4, [0; 32], vec![]);
+            let p101 = on(hash100, 101);
+            let p102 = on(p101.digest(), 102);
+            let p103 = on(p102.digest(), 103);
+            let q102 = on(hash101, 102);
             let child = |parent: &CBlock, view: u64, exec_height: u64, root: [u8; 32], txs: Vec<Vec<u8>>| CBlock::new(parent.digest(), parent.height + 1, view, 6, 1_000, leader.address("boo"), exec_height, root, txs);
             let cctx = |parent: &CBlock| SimplexContext { round: Round::new(Epoch::zero(), View::new(7)), leader: leader.clone(), parent: (View::new(6), parent.digest()) };
-            let mut verify = async |block: CBlock, parent: &CBlock| {
-                let cctx = cctx(parent);
-                let ancestry = marshal::ancestry::from_iter([Arc::new(block), Arc::new(parent.clone())]);
+            let mut verify = async |block: CBlock, ancestors: &[&CBlock]| {
+                let cctx = cctx(ancestors[0]);
+                let ancestry = marshal::ancestry::from_iter(std::iter::once(Arc::new(block)).chain(ancestors.iter().map(|b| Arc::new((*b).clone()))));
                 Application::<deterministic::Context>::verify(&mut app, (context.child("verify"), cctx), ancestry).await
             };
-            let p103 = parent_at(103);
-            // Permanent failures don't wait.
-            assert!(!verify(child(&p103, 8, 100, root100, vec![]), &p103).await, "view isn't the round's");
-            assert!(!verify(CBlock { version: 2, ..child(&p103, 7, 100, root100, vec![]) }.sealed(), &p103).await, "unknown version");
-            assert!(!verify(child(&p103, 7, 100, root100, vec![b"junk".to_vec()]), &p103).await, "junk tx bytes");
-            let user = crate::crypto::Keys::from_seed([5; 32]);
-            let tx = |valid_until: u64| {
-                let mut t = Tx { chain_id: "lag".into(), from: user.address(), nonce: 0, fee: 0, tip: 0, valid_until, action: crate::types::Action::Transfer { to: "xyz.boo".into(), amount: 1 }, memo: String::new(), public_key: hex::encode(user.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+            let tx = |from: &crate::crypto::Keys, valid_until: u64| {
+                let mut t = Tx { chain_id: "lag".into(), from: from.address(), nonce: 0, fee: 0, tip: 0, valid_until, action: crate::types::Action::Transfer { to: "xyz.boo".into(), amount: 1 }, memo: String::new(), public_key: hex::encode(from.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
                 t.fee = t.charge().unwrap();
-                t.sign(&user)
+                t.sign(from)
             };
-            assert!(!verify(child(&p103, 7, 100, root100, vec![tx(50).to_bytes()]), &p103).await, "expired tx");
-            let mut padded = tx(110).to_bytes();
+            let (user, funded) = (crate::crypto::Keys::from_seed([5; 32]), crate::crypto::Keys::from_seed(seed));
+            let above = [&p103, &p102, &p101];
+            // Permanent failures don't wait.
+            assert!(!verify(child(&p103, 8, 100, root100, vec![]), &above).await, "view isn't the round's");
+            assert!(!verify(CBlock { version: 2, ..child(&p103, 7, 100, root100, vec![]) }.sealed(), &above).await, "unknown version");
+            assert!(!verify(child(&p103, 7, 100, root100, vec![b"junk".to_vec()]), &above).await, "junk tx bytes");
+            assert!(!verify(child(&p103, 7, 100, root100, vec![tx(&funded, 50).to_bytes()]), &above).await, "expired tx");
+            let mut padded = tx(&funded, 110).to_bytes();
             padded.push(0);
-            assert!(!verify(child(&p103, 7, 100, root100, vec![padded]), &p103).await, "non-canonical tx bytes");
+            assert!(!verify(child(&p103, 7, 100, root100, vec![padded]), &above).await, "non-canonical tx bytes");
             assert_eq!(context.current(), std::time::UNIX_EPOCH, "rejected without waiting");
 
             // The verifier catches up 10 s from now (well past 3 block times), then 10 s later.
@@ -1247,16 +1255,122 @@ mod tests {
                     catch_up.lock().produce_block_with(vec![]).unwrap();
                 }
             });
-            // Block 104 must certify checkpoint 100, which we haven't executed: wait, then accept.
-            assert!(verify(child(&p103, 7, 100, root100, vec![]), &p103).await);
+            // Block 104 must certify checkpoint 100, which we haven't executed: wait, then replay
+            // 101–103 on top of it and accept.
+            assert!(verify(child(&p103, 7, 100, root100, vec![]), &above).await);
             assert!(context.current() >= std::time::UNIX_EPOCH + Duration::from_secs(10), "waited for execution");
             // A block citing 101 (not executed yet) with the wrong root: rejected only once we
             // can check it (it used to be accepted unchecked).
-            let p102 = parent_at(102);
-            assert!(!verify(child(&p102, 7, 101, [9; 32], vec![]), &p102).await);
+            assert!(!verify(child(&q102, 7, 101, [9; 32], vec![]), &[&q102]).await);
             assert!(context.current() >= std::time::UNIX_EPOCH + Duration::from_secs(20));
-            assert!(verify(child(&p102, 7, 101, root101, vec![tx(110).to_bytes()]), &p102).await);
+            assert!(verify(child(&q102, 7, 101, root101, vec![tx(&funded, 110).to_bytes()]), &[&q102]).await);
+            // A tx nobody can pay for isn't admittable: the block is junk (CV-5).
+            assert!(!verify(child(&q102, 7, 101, root101, vec![tx(&user, 110).to_bytes()]), &[&q102]).await);
+            // Ancestors that don't extend what we executed can never be finalized on top of it.
+            assert!(!verify(child(&p102, 7, 101, root101, vec![]), &[&p102, &p101]).await, "a fork below our tip");
         });
         std::fs::remove_dir_all(root_dir).ok();
+    }
+
+    /// A one-validator home whose genesis starts at the simulated clock's zero.
+    fn home_at_zero(tag: &str) -> (std::path::PathBuf, Chain, [u8; 32]) {
+        let home = std::env::temp_dir().join(format!("blockula-{tag}-{}-{}", crate::chain::now_ms(), std::process::id()));
+        Chain::summon(&home, &SummonOpts::new(tag, 1)).unwrap();
+        let mut g = Genesis::load(&home.join("genesis.json")).unwrap();
+        g.created_at_ms = 0;
+        std::fs::write(home.join("genesis.json"), serde_json::to_string_pretty(&g).unwrap()).unwrap();
+        let seed = hex::decode(std::fs::read_to_string(home.join("validator.key")).unwrap().trim()).unwrap().try_into().unwrap();
+        (home.clone(), Chain::open(&home).unwrap(), seed)
+    }
+
+    /// CV-5: verification replays the unexecuted ancestors through the exact execute path (txs
+    /// and end-of-block steps), so a tx is judged on the parent's real state: nonces an ancestor
+    /// used, and balances its end-of-block steps moved (here, its proposer's charge for a junk tx),
+    /// count. Beyond `MAX_REPLAY` ancestors the verifier abstains.
+    #[test]
+    fn verify_replays_unexecuted_ancestors_exactly() {
+        let (home, mut c, seed) = home_at_zero("replay");
+        let chain_id = c.genesis.chain_id.clone();
+        let signed = move |from: &crate::crypto::Keys, nonce: u64, tip: u64, to: String, amount: u64| {
+            let mut t = Tx { chain_id: chain_id.clone(), from: from.address(), nonce, fee: 0, tip, valid_until: 50, action: crate::types::Action::Transfer { to, amount }, memo: String::new(), public_key: hex::encode(from.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+            t.fee = t.charge().unwrap();
+            t.sign(from)
+        };
+        let (me, p) = (crate::crypto::Keys::from_seed(seed), crate::crypto::Keys::from_seed([4; 32]));
+        // P holds 1 FANG: enough for one tx with a tip that leaves it 1,000 drops.
+        c.produce_block_with(vec![signed(&me, 0, 0, p.address(), DROPS_PER_FANG)]).unwrap();
+        let (tip, root) = (Digest(hex_32(c.last_hash())), hex_32(&c.state.root()));
+        assert_eq!(c.state.account(&p.address()).balance, DROPS_PER_FANG);
+        let chain_id = c.genesis.chain_id.clone();
+        let chain: Shared = Arc::new(Mutex::new(c));
+        deterministic::Runner::timed(Duration::from_secs(120)).start(|context| async move {
+            let pricey = |nonce: u64| {
+                let probe = signed(&p, nonce, 0, me.address(), 1);
+                signed(&p, nonce, DROPS_PER_FANG - probe.charge().unwrap() - 1_000, me.address(), 1)
+            };
+            assert_eq!(pricey(0).charge().unwrap(), DROPS_PER_FANG - 1_000);
+            let send = |nonce: u64| signed(&me, nonce, 0, p.address(), DROPS_PER_FANG);
+            let leader = PrivateKey::from_seed_bytes(seed).public_key();
+            let mut app = App { chain: chain.clone(), block_time_ms: 1_000, address_prefix: "boo".into() };
+            // Ancestor 2 (unexecuted), proposed by P; candidate 3, by the leader.
+            let a2 = |txs: Vec<Vec<u8>>| CBlock::new(tip, 2, 2, 1, 0, p.address(), 1, root, txs);
+            let b3 = |parent: &CBlock, txs: Vec<Tx>| CBlock::new(parent.digest(), parent.height + 1, parent.height + 1, parent.height, 1_000, leader.address("boo"), 1, root, txs.iter().map(Tx::to_bytes).collect());
+            let mut verify = async |block: CBlock, ancestors: Vec<CBlock>| {
+                let cctx = SimplexContext { round: Round::new(Epoch::zero(), View::new(block.view)), leader: leader.clone(), parent: (View::new(block.parent_view), ancestors[0].digest()) };
+                let ancestry = marshal::ancestry::from_iter(std::iter::once(block).chain(ancestors).map(Arc::new));
+                Application::<deterministic::Context>::verify(&mut app, (context.child("verify"), cctx), ancestry).await
+            };
+            // P can pay for its pricey tx on top of an empty ancestor…
+            let empty = a2(vec![]);
+            assert!(verify(b3(&empty, vec![pricey(0)]), vec![empty.clone()]).await);
+            // …but not once the ancestor's junk tx has cost P, its proposer (an end-of-block step).
+            let junky = a2(vec![junk_tx(&chain_id, "boo", 2).to_bytes()]);
+            assert!(!verify(b3(&junky, vec![pricey(0)]), vec![junky.clone()]).await);
+            assert!(verify(b3(&junky, vec![signed(&p, 0, 0, me.address(), 1)]), vec![junky.clone()]).await);
+            // An ancestor's tx used nonce 1: the next one must be 2.
+            let used = a2(vec![send(1).to_bytes()]);
+            assert!(!verify(b3(&used, vec![send(1)]), vec![used.clone()]).await);
+            assert!(verify(b3(&used, vec![send(2)]), vec![used.clone()]).await);
+            // More than MAX_REPLAY unexecuted ancestors: the verdict stays pending.
+            let mut line = vec![a2(vec![])];
+            while line.len() < MAX_REPLAY + 1 {
+                let last = line.last().unwrap();
+                line.push(CBlock::new(last.digest(), last.height + 1, last.height + 1, last.height, 0, p.address(), 1, root, vec![]));
+            }
+            line.reverse();
+            let far = b3(&line[0], vec![]);
+            let started = context.current();
+            commonware_macros::select! {
+                v = verify(far, line) => panic!("decided ({v}) without replaying"),
+                _ = context.sleep(Duration::from_secs(30)) => {},
+            }
+            assert!(context.current() >= started + Duration::from_secs(30));
+        });
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// A proposer replays the same way, and an honest one's blocks pass verification; a Byzantine
+    /// one that stuffs a junk tx in gets its block rejected (and, if it were finalized anyway,
+    /// charged for it: see `staking::tests`).
+    #[test]
+    fn honest_proposals_verify_and_junk_ones_dont() {
+        let (home, c, seed) = home_at_zero("junk");
+        let g = c.genesis.clone();
+        let chain: Shared = Arc::new(Mutex::new(c));
+        deterministic::Runner::timed(Duration::from_secs(120)).start(|context| async move {
+            let leader = PrivateKey::from_seed_bytes(seed).public_key();
+            let mut app = App { chain: chain.clone(), block_time_ms: 1_000, address_prefix: "boo".into() };
+            let parent = genesis_block(&g);
+            let cctx = SimplexContext { round: Round::new(Epoch::zero(), View::new(1)), leader: leader.clone(), parent: (View::new(0), parent.digest()) };
+            for junk in [false, true] {
+                chain.lock().junk_proposals = junk;
+                let ancestry = marshal::ancestry::from_iter([Arc::new(parent.clone())]);
+                let block = Application::<deterministic::Context>::propose(&mut app, (context.child("propose"), cctx.clone()), ancestry, ()).await.expect("proposes");
+                assert_eq!(block.txs.len(), junk as usize);
+                let ancestry = marshal::ancestry::from_iter([Arc::new(block), Arc::new(parent.clone())]);
+                assert_eq!(Application::<deterministic::Context>::verify(&mut app, (context.child("verify"), cctx.clone()), ancestry).await, !junk);
+            }
+        });
+        std::fs::remove_dir_all(home).ok();
     }
 }

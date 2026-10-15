@@ -243,7 +243,7 @@ fn validator_joins_at_epoch_boundary_and_genesis_validator_is_removed() {
         let stranger = Keys::from_seed(seeds[1]);
         assert!(vals[1].chain.lock().submit(signed("sim", &stranger, 0, Action::ApproveValidator { validator: me.clone() })).is_err());
         vals[1].chain.lock().submit(signed("sim", &newbie, 0, reg)).unwrap();
-        wait_until(&context, "registration", || vals[3].chain.lock().state.validators.get(&me).is_some_and(|v| v.status == ValidatorStatus::Pending)).await;
+        wait_until(&context, "registration", || vals[3].chain.lock().state.validators.get(&me).is_some_and(|v| v.status == ValidatorStatus::Candidate)).await;
         {
             let c = vals[0].chain.lock();
             let fees: u64 = (1..=c.height()).filter_map(|h| c.block(h)).flat_map(|b| b.txs).filter(|t| t.from == me).map(|t| t.fee).sum();
