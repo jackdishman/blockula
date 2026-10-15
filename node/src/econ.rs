@@ -115,11 +115,13 @@ pub fn describe(state: &State, tx: &Tx, from: &str) -> String {
     match &tx.action {
         Action::RenewName { name: n, years } => format!("{from} renewed {} for {years} year{}", name(n), if *years == 1 { "" } else { "s" }),
         Action::TransferName { name: n, to } => {
+            let n = name(n);
+            // Described after the fact too, when the name may already be the recipient's.
             let to = match state.resolve(to) {
-                Ok(a) => state.primary_name(&a).unwrap_or_else(|| short(&a)),
+                Ok(a) => state.primary_name(&a).filter(|p| *p != n).unwrap_or_else(|| short(&a)),
                 Err(_) => to.clone(),
             };
-            format!("{from} gave {} to {to}", name(n))
+            format!("{from} gave {n} to {to}")
         }
         Action::ReleaseName { name: n } => format!("{from} released {}", name(n)),
         _ => String::new(),
