@@ -38,6 +38,15 @@ pub const JURY_SIZE: usize = 7;
 /// Jurors needed to seat a Séance, and reveals needed to settle it (otherwise claims carry over).
 pub const MIN_JURY: usize = 3;
 pub const PAIRS_PER_JUROR: usize = 24;
+/// Most grants one account holds at once. Past it, the fully vested ones are paid out to make
+/// room (as `WithdrawVested` would), and a reward that still doesn't fit goes back to the pool.
+/// At the default timings an account gets at most ~1,700 grants per vesting period (64 claims,
+/// 64 vouch cuts and a jury seat per weekly Séance), so only odd genesis timings can reach it;
+/// it keeps the grants record far below `state::MAX_VALUE_BYTES` whatever the timings.
+pub const MAX_GRANTS: usize = 4_096;
+/// Most validator attestations one claim records (about twice the largest active set governance
+/// can set), so a claim that waits through many set changes still has a bounded record.
+pub const MAX_CLAIM_ATTESTATIONS: usize = 2_048;
 /// Share of the pool's balance each Séance distributes, in basis points.
 pub const SEANCE_POOL_BPS: u64 = 2_500;
 /// Share of a Séance's budget paid to jurors (by agreement).
@@ -570,13 +579,36 @@ impl State {
         };
     }
 
-    fn add_grant(&mut self, j: &mut Journal, account: &str, amount: u64, height: u64, source: GrantSource) -> u64 {
+    /// Grants `amount` to `account`, vesting from `height`. `None` if the account holds
+    /// `MAX_GRANTS` still-vesting grants: the amount went back to the pool instead.
+    fn add_grant(&mut self, j: &mut Journal, account: &str, amount: u64, height: u64, source: GrantSource) -> Option<u64> {
         self.pj(j);
+        if self.poc.grants.get(account).is_some_and(|g| g.len() >= MAX_GRANTS) {
+            // Make room: pay out what has fully vested.
+            let grants = self.grants_mut(j, account);
+            let mut paid = 0u64;
+            for g in grants.values_mut().filter(|g| g.vested(height) == g.amount) {
+                paid += g.amount - g.withdrawn;
+                g.withdrawn = g.amount;
+            }
+            grants.retain(|_, g| g.withdrawn < g.amount);
+            let full = grants.len() >= MAX_GRANTS;
+            if grants.is_empty() {
+                self.poc.grants.remove(account);
+            }
+            if paid > 0 {
+                self.j_credit(j, account, paid);
+            }
+            if full {
+                self.to_pool(j, amount);
+                return None;
+            }
+        }
         let id = self.poc.next_grant_id;
         self.poc.next_grant_id += 1;
         let end = height.saturating_add(self.params.poc.vesting_blocks);
         self.grants_mut(j, account).insert(id, Grant { id, amount, withdrawn: 0, start: height, end, source });
-        id
+        Some(id)
     }
 
     /// Returns `amount` to the pool account.
@@ -766,6 +798,9 @@ impl State {
                 }
                 if c.attestations.contains_key(sender) {
                     bail!("this validator already attested claim #{claim_id}");
+                }
+                if c.attestations.len() >= MAX_CLAIM_ATTESTATIONS {
+                    bail!("claim #{claim_id} has {MAX_CLAIM_ATTESTATIONS} attestations already");
                 }
                 let c = self.claim_mut(j, *claim_id).unwrap();
                 c.attestations.insert(sender.to_string(), Attestation { ok: *ok, merge_sha: merge_sha.clone(), at: height, note: note.clone() });
@@ -1336,7 +1371,7 @@ impl State {
                 let g = self.add_grant(&mut j, &who, p - cut, height, GrantSource::Claim { claim_id: c });
                 let cl = self.claim_mut(&mut j, c).unwrap();
                 cl.payout = p;
-                cl.grant = Some(g);
+                cl.grant = g;
                 paid += p;
             }
         }
@@ -1406,6 +1441,43 @@ mod tests {
         let (x, y, z) = (a.next(), b.next(), c.next());
         assert_eq!(x, y);
         assert_ne!(x, z);
+    }
+
+    /// Audit #11: an account's grants are capped. At the cap, what has fully vested is paid out
+    /// to make room; a reward that still doesn't fit goes back to the pool. Nothing is lost.
+    #[test]
+    fn grants_are_capped_and_vested_ones_make_room() {
+        let mut st = State::default();
+        st.params.poc.vesting_blocks = 100;
+        let who = crypto::address_from_bytes(&[7; 32]);
+        // MAX_GRANTS grants of 10 drops: the first 100 fully vested by height 1_000, the rest not.
+        let grants = (0..MAX_GRANTS as u64).map(|id| (id, Grant { id, amount: 10, withdrawn: if id == 0 { 4 } else { 0 }, start: if id < 100 { 0 } else { 1_000 }, end: if id < 100 { 100 } else { 1_100 }, source: GrantSource::Jury { seance_id: 0 } })).collect();
+        st.poc.grants.insert(who.clone(), grants);
+        st.poc.next_grant_id = MAX_GRANTS as u64;
+        st.supply = MAX_GRANTS as u64 * 10;
+        st.accounts.insert(who.clone(), crate::chain::Account { balance: 4, ..Default::default() });
+        st.check_invariants().unwrap();
+        // A reward released from an escrow (as a Séance's budget is), granted at height 1_000.
+        let reward = |st: &mut State, j: &mut Journal| {
+            st.supply += 50;
+            st.add_grant(j, &who, 50, 1_000, GrantSource::Claim { claim_id: 1 })
+        };
+        let mut j = Journal::default();
+        let id = reward(&mut st, &mut j).expect("room was made");
+        assert_eq!(st.poc.grants[&who].len(), MAX_GRANTS - 100 + 1);
+        assert_eq!(st.poc.grants[&who][&id].amount, 50);
+        assert_eq!(st.account(&who).balance, 4 + 100 * 10 - 4, "the vested grants were paid out");
+        st.check_invariants().unwrap();
+        // Fill it again with still-vesting grants: the next reward goes back to the pool.
+        let ids: Vec<u64> = (0..99).map(|_| reward(&mut st, &mut j).unwrap()).collect();
+        assert_eq!((st.poc.grants[&who].len(), ids.len()), (MAX_GRANTS, 99));
+        let pool = st.pool();
+        assert_eq!(reward(&mut st, &mut j), None);
+        assert_eq!((st.poc.grants[&who].len(), st.account(&pool).balance), (MAX_GRANTS, 50));
+        st.check_invariants().unwrap();
+        // And all of it rolls back.
+        st.rollback(j);
+        assert_eq!((st.poc.grants[&who].len(), st.account(&who).balance), (MAX_GRANTS, 4));
     }
 }
 

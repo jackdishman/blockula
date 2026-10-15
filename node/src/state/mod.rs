@@ -345,6 +345,8 @@ impl State {
         for (n, t) in self.tables_mut() {
             t.take_changes(n, &mut records);
         }
+        // The state machine's caps keep every record readable from a snapshot (`check_bounds`).
+        debug_assert!(records.iter().all(|r| r.key.len() <= MAX_KEY_BYTES && r.value.as_ref().is_none_or(|v| v.len() <= MAX_VALUE_BYTES)), "a record outgrew the snapshot limits");
         let mut updates: Vec<(Hash, Option<Hash>)> = records.iter().map(|r| (tree::key_hash(r.namespace, &r.key), r.value.as_deref().map(tree::value_hash))).collect();
         updates.sort_unstable_by_key(|(k, _)| *k);
         let root = self.tree.update(&updates)?;
@@ -506,7 +508,42 @@ impl State {
         for (to, v) in p.vouches.iter() {
             ensure!(v.voucher != *to, "{to} vouches for itself");
         }
-        Ok(())
+        self.check_bounds()
+    }
+
+    /// Every nested collection stays within the cap the state machine enforces for it, and so
+    /// every record within what a snapshot may carry ([`MAX_KEY_BYTES`], [`MAX_VALUE_BYTES`]):
+    /// a record past them would make every later snapshot unreadable (audit #11).
+    fn check_bounds(&self) -> Result<()> {
+        use crate::chain::{MAX_HUNT_FUNDERS, MAX_KEYS, MAX_LOCKS};
+        use crate::poc::{JURY_SIZE, MAX_CLAIM_ATTESTATIONS, MAX_GRANTS, MAX_SEANCE_CLAIMS, PAIRS_PER_JUROR};
+        let p = &self.poc;
+        for (a, acct) in self.accounts.iter() {
+            ensure!(acct.keys.len() <= MAX_KEYS && acct.locks.len() <= MAX_LOCKS, "{a} holds {} keys and {} locks (max {MAX_KEYS} and {MAX_LOCKS})", acct.keys.len(), acct.locks.len());
+        }
+        for (id, h) in self.hunts.iter() {
+            ensure!(h.funders.len() <= MAX_HUNT_FUNDERS, "hunt #{id} has {} funders (max {MAX_HUNT_FUNDERS})", h.funders.len());
+        }
+        for (a, gs) in p.grants.iter() {
+            ensure!(gs.len() <= MAX_GRANTS, "{a} holds {} grants (max {MAX_GRANTS})", gs.len());
+        }
+        for (id, c) in p.claims.iter() {
+            ensure!(c.attestations.len() <= MAX_CLAIM_ATTESTATIONS, "claim #{id} has {} attestations (max {MAX_CLAIM_ATTESTATIONS})", c.attestations.len());
+        }
+        for (id, s) in p.seances.iter() {
+            ensure!(s.claims.len() <= MAX_SEANCE_CLAIMS && s.jurors.len() <= JURY_SIZE, "Séance #{id} has {} claims and {} jurors", s.claims.len(), s.jurors.len());
+            ensure!(s.jurors.values().all(|seat| seat.pairs.len() <= PAIRS_PER_JUROR && seat.spam.len() <= MAX_SEANCE_CLAIMS), "Séance #{id} has an oversized jury seat");
+        }
+        let mut too_big = None;
+        self.for_each_record(|n, k, v| {
+            if too_big.is_none() && (k.len() > MAX_KEY_BYTES || v.len() > MAX_VALUE_BYTES) {
+                too_big = Some(format!("record ({n}, {}) is {} + {} bytes", hex::encode(&k[..k.len().min(16)]), k.len(), v.len()));
+            }
+        });
+        match too_big {
+            Some(e) => bail!("{e}, past the snapshot limits ({MAX_KEY_BYTES} + {MAX_VALUE_BYTES})"),
+            None => Ok(()),
+        }
     }
 
     /// Test builds run this after every block: the incremental root must equal a rebuild from

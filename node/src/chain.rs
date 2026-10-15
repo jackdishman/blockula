@@ -681,6 +681,9 @@ pub struct KeyRecord {
 }
 
 pub const MAX_KEYS: usize = 16;
+/// Most locks one account holds at once (econ.rs adds vote locks; `Unlock` clears expired ones).
+/// With `MAX_KEYS`, it bounds an account record well below `state::MAX_VALUE_BYTES`.
+pub const MAX_LOCKS: usize = 64;
 
 #[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct NameRecord {
@@ -736,6 +739,11 @@ pub struct GithubLink {
     pub gist_id: String,
     pub linked_at: u64,
 }
+
+/// Most distinct funders one hunt takes (the creator included); past it only they can add to it.
+/// Hunts stay in the state forever, so this bounds the record a snapshot has to carry (audit #11:
+/// ~210k funders made one record exceed `state::MAX_VALUE_BYTES` and broke snapshot restore).
+pub const MAX_HUNT_FUNDERS: usize = 128;
 
 /// Longest a hunt may run: ~1 year of blocks.
 pub fn max_hunt_blocks(block_time_ms: u64) -> u64 {
@@ -1318,6 +1326,9 @@ impl State {
                 }
                 if height > h.expires_at {
                     bail!("hunt #{hunt_id} expired at block {}", h.expires_at);
+                }
+                if !h.funders.contains_key(&sender) && h.funders.len() >= MAX_HUNT_FUNDERS {
+                    bail!("hunt #{hunt_id} has {MAX_HUNT_FUNDERS} funders already; only they can add to it");
                 }
                 let total = h.amount.checked_add(*amount).ok_or_else(|| anyhow!("bounty overflow"))?;
                 let mine = h.contribution(&sender).checked_add(*amount).ok_or_else(|| anyhow!("bounty overflow"))?;
@@ -3592,6 +3603,49 @@ mod hunts {
         let id2 = t.c.state.hunts.keys().next_back().copied().unwrap();
         let admin = t.admin.clone_keys();
         t.tx(&admin, Action::CancelHunt { hunt_id: id2 }).unwrap();
+        fs::remove_dir_all(&t.home).ok();
+    }
+
+    /// Audit #11: a hunt takes at most `MAX_HUNT_FUNDERS` distinct funders, so its record (which
+    /// stays in the state forever) can't outgrow what a snapshot may carry. Past the cap, the
+    /// funders it has (the creator included) can still add to it; refunds still reach everyone.
+    #[test]
+    fn funders_are_capped() {
+        let mut t = setup("cap");
+        let alice = Keys::from_seed([1; 32]);
+        t.tx(&alice, create("jackdishman/blockula", 7, 10 * DROPS_PER_FANG, t.c.height() + 1_000, "cap")).unwrap();
+        let id = *t.c.state.hunts.keys().next().unwrap();
+        // Fill it straight through the state machine (it doesn't check signatures; admission
+        // does), one new funder per tx, then commit that as a block.
+        let funders: Vec<Keys> = (0..MAX_HUNT_FUNDERS as u32).map(|i| Keys::from_seed(crypto::hash(&(i + 1_000).to_le_bytes()))).collect();
+        let (height, proposer) = (t.c.height() + 1, t.c.fee_sink());
+        let fund = |k: &Keys, nonce: u64, amount: u64| {
+            let mut tx = Tx { chain_id: "hunts".into(), from: k.address(), nonce, fee: 0, tip: 0, valid_until: height, action: Action::FundHunt { hunt_id: id, amount }, memo: String::new(), public_key: hex::encode(k.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+            tx.fee = min_fee(tx.size());
+            tx
+        };
+        for k in &funders {
+            t.c.state.accounts.insert(k.address(), Account { balance: 10 * DROPS_PER_FANG, ..Default::default() });
+            t.c.state.supply += 10 * DROPS_PER_FANG;
+        }
+        for k in &funders[..MAX_HUNT_FUNDERS - 1] {
+            assert_eq!(t.c.state.apply(&fund(k, 0, DROPS_PER_FANG), "hunts", &proposer, height).unwrap(), Outcome::Applied);
+        }
+        assert_eq!(t.c.state.hunts[&id].funders.len(), MAX_HUNT_FUNDERS);
+        let late = t.c.state.apply(&fund(&funders[MAX_HUNT_FUNDERS - 1], 0, DROPS_PER_FANG), "hunts", &proposer, height).unwrap();
+        assert_eq!(late, Outcome::Failed(format!("hunt #{id} has {MAX_HUNT_FUNDERS} funders already; only they can add to it")));
+        assert_eq!(t.c.state.apply(&fund(&funders[0], 1, DROPS_PER_FANG), "hunts", &proposer, height).unwrap(), Outcome::Applied, "an existing funder tops up");
+        t.c.produce_block_with(vec![]).unwrap();
+        t.tx(&alice, Action::FundHunt { hunt_id: id, amount: DROPS_PER_FANG }).unwrap();
+        assert_eq!(t.c.state.hunts[&id].funders.len(), MAX_HUNT_FUNDERS);
+        assert_eq!(t.c.state.hunts[&id].contribution(&funders[0].address()), 2 * DROPS_PER_FANG);
+        // The admin refunds everyone exactly.
+        let before: Vec<u64> = funders.iter().map(|k| t.c.state.account(&k.address()).balance).collect();
+        let admin = t.admin.clone_keys();
+        t.tx(&admin, Action::CancelHunt { hunt_id: id }).unwrap();
+        for (k, b) in funders.iter().zip(before) {
+            assert_eq!(t.c.state.account(&k.address()).balance, b + t.c.state.hunts[&id].contribution(&k.address()));
+        }
         fs::remove_dir_all(&t.home).ok();
     }
 

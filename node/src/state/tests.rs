@@ -499,3 +499,73 @@ fn bench_million_accounts() {
     println!("snapshot decode + tree rebuild: {:?}", t.elapsed());
     assert_eq!(back.root_hash(), st.root_hash());
 }
+
+/// Audit #11: the largest record of every type the state machine can build stays within what a
+/// snapshot may carry, with room to spare. Each one is filled to its caps: every string at its
+/// format bound, every nested collection at the cap the state machine enforces (`check_bounds`
+/// checks them after every test block). A new map must add its largest record here.
+#[test]
+fn largest_records_fit_in_a_snapshot() {
+    use crate::chain::*;
+    use crate::poc::*;
+    let addr = |i: u64| crypto::address_from_bytes(&crypto::hash(&i.to_le_bytes()));
+    let s = |n: usize| "x".repeat(n);
+    let hex32 = |i: u64| hex::encode(crypto::hash(&i.to_le_bytes()));
+    let mut st = State::default();
+    // An account with every key slot (session keys, longest labels) and every lock slot.
+    let session = KeyRole::Session { limit: u64::MAX, period_blocks: u64::MAX, expires_at: u64::MAX };
+    let keys = (0..MAX_KEYS as u64).map(|i| (hex32(i), KeyRecord { label: s(MAX_LABEL), role: session.clone(), added_at: u64::MAX, spent: u64::MAX, window_start: u64::MAX })).collect();
+    let locks = (0..MAX_LOCKS as u64).map(|id| Lock { id, amount: LockAmount::Vesting { total: u64::MAX, start: u64::MAX, cliff: u64::MAX, end: u64::MAX }, reason: s(MAX_LABEL) }).collect();
+    st.accounts.insert(addr(0), Account { balance: u64::MAX, nonce: u64::MAX, keys, locks });
+    st.names.insert(s(MAX_NAME_FIELD), NameRecord { name: s(MAX_NAME_FIELD), owner: addr(0), registered_at: 0 });
+    let vr = ValidatorRecord { address: addr(1), owner: addr(0), consensus_key: "ab".repeat(crypto::PUBLIC_KEY_LEN), p2p_addr: s(MAX_ADDR), http_addr: s(MAX_ADDR), bond: u64::MAX, status: ValidatorStatus::Removed, registered_at: 0, approved_at: Some(0), approved_by: Some(addr(2)), active_from: Some(0), removed_at: Some(0), removed_by: Some(addr(2)), active_until: Some(0), unbond_epoch: Some(0), commission_bps: 0 };
+    st.validators.insert(addr(1), vr);
+    // The largest set governance can configure (`max_validators` is bounded by params.rs).
+    let (_, max_set) = crate::params::ChainParams::bounds("max_validators", &st.params).unwrap();
+    st.active_sets.insert(0, (0..max_set).map(addr).collect());
+    let funders = (0..MAX_HUNT_FUNDERS as u64).map(|i| (addr(i), u64::MAX.to_string())).collect();
+    let hunt = Hunt { id: 0, creator: addr(0), repo: s(MAX_REPO), issue: u64::MAX, title: s(MAX_HUNT_TITLE), amount: u64::MAX, funders, created_at: 0, expires_at: 0, status: HuntStatus::Awarded, awarded_to: Some(addr(1)), awarded_by: Some(addr(2)), awarded_at: Some(0), pr: Some(0), familiar_key: Some(hex32(0)), cancelled_at: Some(0) };
+    st.hunts.insert(0, hunt);
+    st.github.insert(s(MAX_GITHUB_HANDLE), GithubLink { handle: s(MAX_GITHUB_HANDLE), account: addr(0), gist_id: s(64), linked_at: 0 });
+    st.github_by_account.insert(addr(0), s(MAX_GITHUB_HANDLE));
+    st.familiars.insert(addr(0), (0..MAX_KEYS as u64).map(|i| (hex32(i), s(MAX_LABEL))).collect());
+    let p = &mut st.poc;
+    p.repos.insert(s(MAX_REPO), MAX_REPO_WEIGHT);
+    p.souls.insert(addr(0), Soul { points: u64::MAX, at: u64::MAX, earned: u64::MAX });
+    p.vouches.insert(addr(0), Vouch { voucher: addr(1), bond: u64::MAX, at: 0 });
+    p.sybils.insert(addr(0), Sybil { at: 0, by: addr(1), reason: s(MAX_REASON) });
+    let attestations = (0..MAX_CLAIM_ATTESTATIONS as u64).map(|i| (addr(i), Attestation { ok: true, merge_sha: s(40), at: 0, note: s(MAX_REASON) })).collect();
+    // `reason` is a reject reason or one the state machine writes (a short sentence with a handle and an address).
+    let claim = Claim { id: 0, claimant: addr(0), handle: s(MAX_GITHUB_HANDLE), repo: s(MAX_REPO), pr: 0, familiar_key: Some(hex32(0)), bond: 0, submitted_at: 0, status: ClaimStatus::Rejected, attestations, merge_sha: Some(s(40)), verified_at: Some(0), seance: Some(0), score_ppm: Some(0), payout: 0, soul_awarded: 0, grant: Some(0), closed_at: Some(0), reason: Some(s(512)) };
+    p.claims.insert(0, claim);
+    p.claim_by_pr.insert(s(MAX_REPO + 21), 0);
+    p.handles.insert(s(MAX_GITHUB_HANDLE), addr(0));
+    p.jurors.insert(addr(0), Juror { bond: u64::MAX, joined_at: 0, active: true, served: u64::MAX });
+    let seat = JurySeat { pairs: vec![[u64::MAX; 2]; PAIRS_PER_JUROR], commitment: Some(hex32(0)), votes: Some(s(PAIRS_PER_JUROR)), spam: vec![u64::MAX; MAX_SEANCE_CLAIMS], agreement_ppm: Some(0), reward: u64::MAX, soul_delta: i64::MIN };
+    let results = SeanceResults { accepted: usize::MAX, below_threshold: usize::MAX, spam: usize::MAX, carried_over: usize::MAX, no_shows: usize::MAX, paid: u64::MAX, returned: u64::MAX };
+    let seance = Seance { id: 0, opened_at: 0, commit_until: 0, reveal_until: 0, seed: hex32(0), claims: vec![u64::MAX; MAX_SEANCE_CLAIMS], budget: 0, jurors: (0..JURY_SIZE as u64).map(|i| (addr(i), seat.clone())).collect(), closed: true, results: Some(results) };
+    p.seances.insert(0, seance);
+    let grant = |id: u64| Grant { id, amount: u64::MAX, withdrawn: 0, start: 0, end: u64::MAX, source: GrantSource::Vouch { claim_id: u64::MAX } };
+    p.grants.insert(addr(0), (0..MAX_GRANTS as u64).map(|i| (i, grant(i))).collect());
+    st.econ.reserved_names.insert(s(MAX_NAME_FIELD), crate::econ::ReservedName { reserved_at: u64::MAX });
+    st.upgrade.features.insert(s(MAX_FEATURE), crate::upgrade::Feature { activated_at: u64::MAX });
+
+    let mut largest = std::collections::BTreeMap::new();
+    st.for_each_record(|n, k, v| {
+        assert!(k.len() <= MAX_KEY_BYTES, "namespace {n}: a {}-byte key", k.len());
+        let e = largest.entry(n).or_insert(0);
+        *e = (*e).max(v.len());
+    });
+    println!("largest record per namespace (bytes): {largest:?}");
+    for (n, _) in st.tables() {
+        assert!(largest.contains_key(&n), "namespace {n} has no largest record in this test");
+    }
+    // A sixteenth of the limit: every cap could grow 16× (or a format bound loosen) and still fit.
+    for (n, size) in &largest {
+        assert!(*size <= MAX_VALUE_BYTES / 16, "namespace {n}'s largest record is {size} bytes");
+    }
+    st.check_bounds().unwrap();
+    // One funder too many is caught.
+    st.hunts.get_mut(&0).unwrap().funders.insert(addr(u64::MAX), "1".into());
+    assert!(st.check_bounds().unwrap_err().to_string().contains("funders"));
+}
