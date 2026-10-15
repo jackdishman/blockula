@@ -416,6 +416,13 @@ fn fast_sync_from_certified_snapshot_and_tamper_rejection() {
         let reopened = Chain::open(&joiner_home).unwrap();
         assert_eq!(reopened.state.root(), root_now);
         assert_eq!(reopened.height(), h);
+        assert_eq!(reopened.replayed, 0, "the state database holds everything; nothing is replayed");
+        // Without its database, the home rebuilds from base.state.zst and the logged blocks.
+        drop(reopened);
+        std::fs::remove_file(joiner_home.join(crate::store::DB_FILE)).unwrap();
+        let rebuilt = Chain::open(&joiner_home).unwrap();
+        assert_eq!((rebuilt.state.root(), rebuilt.height(), rebuilt.replayed), (root_now, h, h - m.height));
+        assert_eq!(rebuilt.view().history_from(), m.height + 1);
         println!("✓ fast-synced at #{} and followed to #{h} with matching roots", m.height);
     });
     std::fs::remove_dir_all(root).ok();

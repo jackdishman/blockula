@@ -232,7 +232,8 @@ impl ReadLimiter {
 /// proxy speaks for aren't limited.
 async fn limit_reads(State(n): State<Node>, req: Request, next: Next) -> Response {
     if matches!(*req.method(), Method::GET | Method::HEAD) {
-        let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
+        let ext = req.extensions();
+        let peer = ext.get::<ConnectInfo<SocketAddr>>().map(|c| c.0).or_else(|| ext.get::<axum::extract::connect_info::MockConnectInfo<SocketAddr>>().map(|c| c.0));
         if let Some(ip) = peer.and_then(|p| n.client_ip(p, req.headers())) {
             if let Err(wait) = n.reads.allow(&ip_key(ip)) {
                 bump(&n.stats.reads_limited);
@@ -1434,6 +1435,173 @@ mod http_tests {
         let (s, _, _) = call(&n, "POST", "/api/faucet", Some(json!({ "to": b })), "203.0.113.5:1").await;
         assert_eq!(s, StatusCode::OK, "quota wasn't consumed by the busy attempt");
         assert_eq!(ip_key("2001:db8:1:2:aaaa::1".parse().unwrap()), "2001:db8:1:2::/64");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// `/api/proof`: a record's value and Merkle proof against the latest state root, checked with
+    /// `state::tree::verify` exactly as a light client would; an absent key gets an exclusion
+    /// proof.
+    #[tokio::test]
+    async fn proofs_verify_against_the_state_root() {
+        use crate::state::{codec::decode, ns, tree};
+        let (root, n) = node("proof");
+        let alice = crate::crypto::Keys::from_seed([3; 32]);
+        n.chain.lock().faucet(&alice.address(), 10 * DROPS_PER_FANG).unwrap();
+        n.chain.lock().produce_block().unwrap();
+        let (_, status, _) = call(&n, "GET", "/api/status", None, "127.0.0.1:1").await;
+        let parse = |v: &Value| -> ([u8; 32], tree::Proof, Option<Vec<u8>>) {
+            let r: [u8; 32] = hex::decode(v["root"].as_str().unwrap()).unwrap().try_into().unwrap();
+            (r, serde_json::from_value(v["proof"].clone()).unwrap(), v["value"].as_str().map(|h| hex::decode(h).unwrap()))
+        };
+        let key = alice.address();
+        let (s, p, _) = call(&n, "GET", &format!("/api/proof/{}/{}", ns::ACCOUNTS, hex::encode(&key)), None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::OK, "{p}");
+        let (r, proof, value) = parse(&p);
+        assert_eq!((p["height"].as_u64(), p["root"].as_str()), (Some(1), status["state_root"].as_str()));
+        let value = value.expect("alice exists");
+        assert!(tree::verify(&r, ns::ACCOUNTS, key.as_bytes(), Some(&value), &proof));
+        assert_eq!(decode::<crate::chain::Account>(&value).unwrap().balance, 10 * DROPS_PER_FANG);
+        assert!(!tree::verify(&r, ns::ACCOUNTS, key.as_bytes(), Some(b"forged"), &proof));
+        // A scalar, and an absent account.
+        let (_, p, _) = call(&n, "GET", &format!("/api/proof/{}/{}", ns::META, hex::encode(crate::state::meta::SUPPLY)), None, "127.0.0.1:1").await;
+        let (r, proof, value) = parse(&p);
+        assert!(tree::verify(&r, ns::META, crate::state::meta::SUPPLY, value.as_deref(), &proof) && value.is_some());
+        let (_, p, _) = call(&n, "GET", &format!("/api/proof/{}/{}", ns::ACCOUNTS, hex::encode("boo1nobody")), None, "127.0.0.1:1").await;
+        let (r, proof, value) = parse(&p);
+        assert!(value.is_none() && tree::verify(&r, ns::ACCOUNTS, b"boo1nobody", None, &proof));
+        let (s, _, _) = call(&n, "GET", "/api/proof/1/not-hex", None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    const READS: [&str; 14] = ["/api/status", "/api/blocks", "/api/block/1", "/api/account/alice.boo", "/api/name/alice", "/api/search/alice", "/api/validators", "/api/hunts", "/api/contributions", "/api/claims", "/api/souls", "/api/mempool", "/api/epochs", "/api/health"];
+
+    /// Every read is served while consensus holds the chain (SEC-4): handlers read the published
+    /// view, never the `Mutex<Chain>`.
+    #[test]
+    fn reads_never_take_the_chain_lock() {
+        let (root, n) = node("nolock");
+        let alice = crate::crypto::Keys::from_seed([4; 32]);
+        {
+            let mut c = n.chain.lock();
+            c.faucet(&alice.address(), 10 * DROPS_PER_FANG).unwrap();
+            c.produce_block().unwrap();
+            let mut t = Tx { chain_id: "nolock".into(), from: alice.address(), nonce: 0, fee: 0, tip: 0, valid_until: 50, action: Action::RegisterName { name: "alice".into() }, memo: String::new(), public_key: hex::encode(alice.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+            t.fee = min_fee(t.size());
+            c.submit(t.sign(&alice)).unwrap();
+            c.produce_block().unwrap();
+        }
+        let id = n.chain.lock().block(2).unwrap().txs[0].id();
+        let held = n.chain.lock(); // as if a block were executing
+        let (tx, rx) = std::sync::mpsc::channel();
+        let n2 = n.clone();
+        let tx_uri = format!("/api/tx/{id}");
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            for uri in READS.iter().map(|u| u.to_string()).chain([tx_uri]) {
+                let (s, v, _) = rt.block_on(call(&n2, "GET", &uri, None, "127.0.0.1:1"));
+                tx.send((uri, s, v)).unwrap();
+            }
+        });
+        for _ in 0..=READS.len() {
+            let (uri, s, v) = rx.recv_timeout(Duration::from_secs(20)).expect("a read is waiting for the chain lock");
+            assert!(s == StatusCode::OK || (uri == "/api/health" && s == StatusCode::SERVICE_UNAVAILABLE), "{uri}: {s} {v}");
+            if uri.starts_with("/api/account") {
+                assert_eq!(v["names"][0], "alice.boo");
+                assert_eq!(v["recent_txs"].as_array().unwrap().len(), 2);
+            }
+        }
+        drop(held);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Readers hammering the API don't hold up execution: blocks keep executing at their own
+    /// pace while four threads read as fast as they can.
+    #[test]
+    fn heavy_reads_dont_slow_block_execution() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let (root, n) = node("hammer");
+        let stop = Arc::new(AtomicBool::new(false));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut threads = vec![];
+        for i in 0..4 {
+            let (n, stop, reads) = (n.clone(), stop.clone(), reads.clone());
+            threads.push(std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                while !stop.load(Ordering::Relaxed) {
+                    let uri = ["/api/status", "/api/blocks", "/api/mempool", "/api/validators"][i];
+                    let (s, _, _) = rt.block_on(call(&n, "GET", uri, None, "127.0.0.1:1"));
+                    assert_eq!(s, StatusCode::OK);
+                    reads.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        let mut took = vec![];
+        for _ in 0..40 {
+            let t = Instant::now();
+            n.chain.lock().produce_block_with(vec![]).unwrap();
+            took.push(t.elapsed());
+        }
+        stop.store(true, Ordering::Relaxed);
+        for t in threads {
+            t.join().unwrap();
+        }
+        took.sort();
+        let (median, worst) = (took[took.len() / 2], *took.last().unwrap());
+        println!("40 blocks under {} concurrent reads: median {median:?}, worst {worst:?}", reads.load(Ordering::Relaxed));
+        assert!(reads.load(Ordering::Relaxed) >= 40, "the readers ran alongside execution");
+        assert!(worst < Duration::from_secs(2), "a block took {worst:?} to execute under read load");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn reads_are_rate_limited_per_client() {
+        let (root, n) = node("readlimit");
+        let n = n.with_read_limits(1, 3);
+        for _ in 0..3 {
+            assert_eq!(call(&n, "GET", "/api/status", None, "203.0.113.9:1").await.0, StatusCode::OK);
+        }
+        let (s, v, _) = call(&n, "GET", "/api/status", None, "203.0.113.9:2").await;
+        assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{v}");
+        assert_eq!(call(&n, "GET", "/api/status", None, "203.0.113.10:1").await.0, StatusCode::OK, "another client has its own budget");
+        for _ in 0..10 {
+            assert_eq!(call(&n, "GET", "/api/status", None, "127.0.0.1:1").await.0, StatusCode::OK, "local callers aren't limited");
+        }
+        let (_, _, metrics) = call(&n, "GET", "/metrics", None, "127.0.0.1:1").await;
+        assert!(metrics.contains("blockula_http_reads_limited_total 1"), "{metrics}");
+        // Tokens come back at `rps`.
+        let l = ReadLimiter::new(1_000, 2);
+        assert!(l.allow("a").is_ok() && l.allow("a").is_ok() && l.allow("a").is_err());
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(l.allow("a").is_ok());
+        assert!(ReadLimiter::new(0, 0).allow("a").is_ok(), "0 turns the limit off");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A pruning node says "pruned" (410) for heights it no longer holds, on `/api/block` and
+    /// `/api/sync`.
+    #[tokio::test]
+    async fn pruned_heights_say_so() {
+        let root = std::env::temp_dir().join(format!("blockula-api-pruned-{}-{}", crate::chain::now_ms(), std::process::id()));
+        let homes = Chain::summon(&root, &SummonOpts { block_time_ms: 60_000, ..SummonOpts::new("pruned", 1) }).unwrap();
+        let mut c = Chain::open(&homes[0]).unwrap();
+        c.set_pruning(Some(1));
+        let keep = c.keep_blocks().unwrap();
+        for _ in 0..keep + 20 {
+            c.produce_block_with(vec![]).unwrap();
+        }
+        let n = Node::new(Arc::new(Mutex::new(c)), None, vec![], ClientIpPolicy::default());
+        for uri in ["/api/block/5", "/api/sync?from=5"] {
+            let (s, v, _) = call(&n, "GET", uri, None, "127.0.0.1:1").await;
+            assert_eq!(s, StatusCode::GONE, "{uri}: {v}");
+            assert!(v["pruned"] == true && v["error"].as_str().unwrap().contains("pruned"), "{v}");
+        }
+        let (_, status, _) = call(&n, "GET", "/api/status", None, "127.0.0.1:1").await;
+        assert_eq!(status["history_from"], 21);
+        assert_eq!(status["pruning"]["keep_blocks"], keep);
+        assert_eq!(call(&n, "GET", "/api/block/21", None, "127.0.0.1:1").await.0, StatusCode::OK);
+        let (s, b, _) = call(&n, "GET", "/api/blocks?limit=100", None, "127.0.0.1:1").await;
+        assert_eq!((s, b.as_array().unwrap().len()), (StatusCode::OK, 100));
         std::fs::remove_dir_all(root).ok();
     }
 

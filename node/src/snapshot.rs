@@ -531,4 +531,30 @@ mod tests {
         huge.extend_from_slice(&(crate::state::MAX_KEY_BYTES as u32 + 1).to_le_bytes());
         assert!(read_state(&mut huge.as_slice()).err().unwrap().to_string().contains("too large"));
     }
+
+    /// The writer cuts chunk files as the compressed stream fills them (several here), and this
+    /// node's own snapshot reads back, checked chunk by chunk and against its root.
+    #[test]
+    fn snapshots_stream_into_chunk_files_and_read_back() {
+        let home = std::env::temp_dir().join(format!("blockula-snapwrite-{}-{}", crate::chain::now_ms(), std::process::id()));
+        let mut st = State::default();
+        // Incompressible keys (hashes), enough for a few MiB of records.
+        for i in 0..60_000u64 {
+            st.accounts.insert(crate::crypto::address_from_bytes(&crate::crypto::hash(&i.to_le_bytes())), Account { balance: i, ..Default::default() });
+        }
+        st.supply = (0..60_000).sum();
+        st.commit_block().unwrap();
+        let meta = write(&home, 100, &st.root(), &st).unwrap();
+        assert!(meta.chunks.len() > 1, "{} chunks", meta.chunks.len());
+        assert!(meta.chunks[..meta.chunks.len() - 1].iter().all(|c| c.size == CHUNK_SIZE));
+        assert_eq!(list(&home), vec![100]);
+        assert_eq!(read_local(&home, 100).unwrap().root(), st.root());
+        // A damaged chunk is caught before decoding.
+        let p = dir(&home).join("100").join("chunk-1");
+        let mut b = std::fs::read(&p).unwrap();
+        b[0] ^= 1;
+        std::fs::write(&p, b).unwrap();
+        assert!(read_local(&home, 100).err().unwrap().to_string().contains("chunk 1"));
+        std::fs::remove_dir_all(home).ok();
+    }
 }
