@@ -2089,6 +2089,9 @@ impl Chain {
             chain.save_epochs();
         }
         chain.reconcile_epochs()?;
+        // A restart replays nothing, so the halt `replay` and `execute` run after every block is
+        // checked here too: a binary that can't run the next height doesn't start (3.9).
+        crate::upgrade::check_next(&chain.state, chain.height + 1)?;
         chain.set_finalized_tip(chain.height());
         chain.publish();
         chain.live.publish_epochs(chain.epochs.clone());
@@ -2302,26 +2305,21 @@ impl Chain {
         Ok(())
     }
 
-    /// Index rows for an executed block: its tx ids and the accounts whose history it joins.
+    /// Index rows for an executed block: its tx ids and the accounts whose history it joins (the
+    /// sender, and every account the action names: recipients, validators, the accounts a
+    /// proposal or a multisig proposal names; see [`Action::addresses`]).
     fn block_meta(&self, block: &Block, at: Pos, cblock: Option<Pos>) -> Result<BlockMeta> {
         let mut txs = Vec::with_capacity(block.txs.len());
         let mut history = vec![];
         for (i, tx) in block.txs.iter().enumerate() {
             txs.push(hash32(&tx.id())?);
-            let sender = tx.sender().ok();
-            if let Some(s) = &sender {
-                history.push((i as u32, s.clone()));
-            }
-            let other = match &tx.action {
-                Action::Transfer { to, .. } | Action::AwardHunt { to, .. } | Action::GrantSoul { to, .. } => Some(to),
-                Action::Vouch { account } | Action::FlagSybil { account, .. } | Action::Clawback { account, .. } => Some(account),
-                _ => None,
-            };
-            if let Some(to) = other.and_then(|t| self.state.resolve(t).ok()) {
-                if sender.as_ref() != Some(&to) {
-                    history.push((i as u32, to));
+            let mut joined: Vec<String> = tx.sender().ok().into_iter().collect();
+            for a in tx.action.addresses().into_iter().filter_map(|(_, named)| self.state.resolve(named).ok()) {
+                if !joined.contains(&a) {
+                    joined.push(a);
                 }
             }
+            history.extend(joined.into_iter().map(|a| (i as u32, a)));
         }
         Ok(BlockMeta {
             hash: hash32(&block.hash)?,
@@ -2346,7 +2344,8 @@ impl Chain {
         let meta = self.block_meta(&block, Pos::default(), None)?;
         let epoch_head = self.state.params.is_boundary(block.height);
         let cert = cert.filter(|_| block.height.is_multiple_of(CERT_CHECKPOINT) || epoch_head);
-        let prune_below = self.keep_blocks.map(|k| (block.height + 1).saturating_sub(k)).unwrap_or(0);
+        // Never below the minimum as of this block (governance may have widened the tx window).
+        let prune_below = self.keep_blocks.map(|k| (block.height + 1).saturating_sub(k.max(min_keep_blocks(&self.state)))).unwrap_or(0);
         Ok(Executed { meta, root: self.state.root_hash(), root_child: self.state.tree.root_child().encode(), nodes: self.state.tree.pending_changes(), records, cert, epoch_head, prune_below, cblock, block })
     }
 
@@ -4110,8 +4109,14 @@ mod scaffold {
         assert_eq!((b.txs.len(), b.skipped.clone()), (1, vec![stale.size()]));
         let root = c.state.root();
         drop(c);
+        // A restart reads the block back from the log; a rebuild replays it with its skipped txs.
         let c = Chain::open(&home).unwrap();
-        assert_eq!((c.state.root(), c.block(1).unwrap().skipped), (root, vec![stale.size()]));
+        assert_eq!((c.state.root(), c.block(1).unwrap().skipped, c.replayed), (root.clone(), vec![stale.size()], 0));
+        drop(c);
+        fs::remove_file(home.join(store::DB_FILE)).unwrap();
+        let c = Chain::open(&home).unwrap();
+        assert_eq!((c.state.root(), c.block(1).unwrap().skipped, c.replayed), (root, vec![stale.size()], 1));
+        drop(c);
         fs::remove_dir_all(home).ok();
     }
 
@@ -4125,6 +4130,92 @@ mod scaffold {
         let err = c.produce_block_with(vec![]).unwrap_err().to_string();
         assert!(err.contains("block 3 runs protocol") && err.contains("upgrade blockula"), "{err}");
         assert_eq!(c.height(), 2);
+        drop(c);
+        // A restart replays nothing, and still refuses to go on (the halt survives restarts).
+        let err = format!("{:#}", Chain::open(&home).err().expect("a halted node doesn't start"));
+        assert!(err.contains("block 3 runs protocol") && err.contains("upgrade blockula"), "{err}");
+        fs::remove_dir_all(home).ok();
+    }
+
+    /// The consensus path (`execute_shared`, which writes without the chain lock) halts the same
+    /// way: the block is stored and published, and the error leaves it unacknowledged.
+    #[test]
+    fn the_consensus_path_halts_too() {
+        let (home, c) = open("halt-shared", &genesis("scaffold-1"));
+        let chain = parking_lot::Mutex::new(c);
+        let f = chain.lock().test_block(vec![]);
+        Chain::execute_shared(&chain, f).unwrap();
+        chain.lock().state.upgrade.schedule = vec![crate::upgrade::ScheduledUpgrade { version: crate::consensus::SUPPORTED_PROTOCOL_VERSION + 1, activation_height: 3 }];
+        let f = chain.lock().test_block(vec![]);
+        let err = Chain::execute_shared(&chain, f).unwrap_err().to_string();
+        assert!(err.contains("block 3 runs protocol"), "{err}");
+        let c = chain.into_inner();
+        assert_eq!((c.height(), c.view().height), (2, 2));
+        drop(c);
+        assert!(Chain::open(&home).is_err());
+        fs::remove_dir_all(home).ok();
+    }
+
+    /// The scaffold's state (parameters, account locks, operators' bonds and commissions,
+    /// reserved names, the Soul ledger, features, the module namespaces and scalars) persists in
+    /// the state database like every other record: a restart loads it with the identical root
+    /// and replays nothing, and a rebuild from the block logs reaches the same root.
+    #[test]
+    fn v1_genesis_restarts_from_the_store_without_replay() {
+        let g = genesis("scaffold-1");
+        let (home, mut c) = open("restart", &g);
+        let (owner, founder, bob) = (keys(22), keys(23), keys(24));
+        let v = Keys::from_seed(VALIDATOR).address();
+        c.submit(signed(&c, &owner, Action::RegisterName { name: "owner".into() })).unwrap();
+        c.submit(signed(&c, &founder, Action::Transfer { to: bob.address(), amount: 5 * FANG })).unwrap();
+        c.produce_block().unwrap();
+        // A name changes hands, a module tx fails (and is charged), a stale tx is skipped.
+        let give = signed(&c, &owner, Action::TransferName { name: "owner".into(), to: bob.address() });
+        let delegate = Tx { nonce: give.nonce + 1, ..signed(&c, &owner, Action::Delegate { validator: v.clone(), amount: FANG }) }.sign(&owner);
+        let stale = Tx { nonce: 40, ..signed(&c, &owner, Action::Transfer { to: bob.address(), amount: FANG }) }.sign(&owner);
+        c.produce_block_with(vec![give.clone(), delegate.clone(), stale.clone()]).unwrap();
+        assert_eq!(c.failure(&delegate.id()).unwrap().0, "not active yet");
+        for _ in 0..3 {
+            c.produce_block_with(vec![]).unwrap();
+        }
+        let records = |c: &Chain| {
+            let mut all = vec![];
+            c.state.for_each_record(|n, k, v| all.push((n, k.to_vec(), v.to_vec())));
+            all
+        };
+        let (root, height, before) = (c.state.root(), c.height(), records(&c));
+        assert!(before.iter().any(|(n, _, _)| *n == ns::RESERVED_NAMES) && before.iter().any(|(n, _, _)| *n == ns::FEATURES));
+        // History names the accounts each tx names, not just senders.
+        let history = |c: &Chain, who: &str| -> Vec<String> { c.view().history(who, 10).into_iter().map(|(h, i)| c.block(h).unwrap().txs[i].id()).collect() };
+        assert_eq!(history(&c, &bob.address()), vec![give.id(), c.block(1).unwrap().txs[1].id()]);
+        assert_eq!(history(&c, &v), vec![delegate.id()]);
+        drop(c);
+
+        let c = Chain::open(&home).unwrap();
+        assert_eq!(c.replayed, 0, "nothing replayed");
+        assert_eq!((c.state.root(), c.height(), c.state.full_root()), (root.clone(), height, c.state.root_hash()));
+        assert_eq!(records(&c), before, "every record came back byte for byte");
+        let s = &c.state;
+        assert_eq!((s.chain_params.max_validators, s.chain_params.proposal_deposit), (40, 50 * FANG));
+        assert_eq!(s.chain_params, g.chain_params().unwrap());
+        assert_eq!(s.account(&founder.address()).locks, vec![Lock { id: 0, amount: LockAmount::Vesting { total: 1_000_000 * FANG, start: 0, cliff: 100, end: 1_000 }, reason: "founder".into() }]);
+        assert_eq!((s.validators[&v].owner.as_str(), s.validators[&v].bond, s.validators[&v].commission_bps), (owner.address().as_str(), 10_000 * FANG, 500));
+        assert!(s.econ.reserved_names.contains_key("blockula") && s.econ.reserved_names.contains_key("foundation"));
+        assert_eq!(s.soul_of(&owner.address(), height), 50 * SOUL);
+        assert!(crate::upgrade::is_active(s, "ghost"));
+        assert_eq!(s.resolve("owner.boo").unwrap(), bob.address());
+        assert_eq!(c.block(2).unwrap().skipped, vec![stale.size()]);
+        assert_eq!(history(&c, &v), vec![delegate.id()]);
+        s.check_invariants().unwrap();
+        drop(c);
+
+        // Without its database, the home replays the logs from genesis to the same state.
+        fs::remove_file(home.join(store::DB_FILE)).unwrap();
+        let c = Chain::open(&home).unwrap();
+        assert_eq!((c.state.root(), c.replayed), (root, height));
+        assert_eq!(records(&c), before);
+        assert_eq!(history(&c, &bob.address()), vec![give.id(), c.block(1).unwrap().txs[1].id()]);
+        drop(c);
         fs::remove_dir_all(home).ok();
     }
 }
@@ -4380,6 +4471,36 @@ mod persistence {
         let c = Chain::open(&h).unwrap();
         assert_eq!((c.state.root(), c.height()), (root, height));
         assert_eq!(c.replayed, height - 700, "rebuilt from snapshot 700, then the logged blocks after it");
+        drop(c);
+        fs::remove_dir_all(h).ok();
+    }
+
+    /// The kept window covers a tx's whole validity window as governance sets it now: widening
+    /// `max_tx_validity_blocks` pauses pruning until the window has grown to match.
+    #[test]
+    fn pruning_follows_the_tx_validity_parameter() {
+        let h = home("prune-param");
+        Chain::summon(&h, &SummonOpts { block_time_ms: 60_000, epoch_blocks: 100, ..SummonOpts::new("prune-param", 1) }).unwrap();
+        let mut c = Chain::open(&h).unwrap();
+        c.set_pruning(Some(1));
+        let keep = min_keep_blocks(&c.state);
+        while c.height() < keep + 40 {
+            c.produce_block_with(vec![]).unwrap();
+        }
+        let pruned = c.view().history_from();
+        assert_eq!(pruned, c.height() + 1 - keep);
+        // A ParamChange proposal executing (the lever it calls) widens the window by 100 blocks.
+        let wider = c.state.chain_params.max_tx_validity_blocks + 100;
+        c.state.exec_set_param(&mut Journal::default(), "max_tx_validity_blocks", wider).unwrap();
+        assert_eq!(min_keep_blocks(&c.state), keep + 100);
+        for _ in 0..50 {
+            c.produce_block_with(vec![]).unwrap();
+        }
+        assert_eq!(c.view().history_from(), pruned, "nothing more is pruned until the window is wide enough");
+        for _ in 0..100 {
+            c.produce_block_with(vec![]).unwrap();
+        }
+        assert_eq!(c.view().history_from(), c.height() + 1 - (keep + 100));
         drop(c);
         fs::remove_dir_all(h).ok();
     }
