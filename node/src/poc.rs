@@ -1965,7 +1965,6 @@ mod scenarios {
         for (juror, seat) in a.jurors.iter().filter(|(j, _)| **j != seated.address()) {
             assert_eq!(e.jurors[juror].pairs, seat.pairs, "the others keep their seats and pairs");
         }
-        drop(open);
         drop(pre);
         // The real chain opens the same Séance at that height.
         t.blocks(1);
