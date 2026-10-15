@@ -230,6 +230,33 @@ pub enum Action {
     },
     /// Validators only: a matured claim's PR was reverted, by the 40-hex commit `revert_sha`.
     AttestRevert { claim_id: u64, revert_sha: String },
+
+    // ---- 👻 Ghost Mode (tags 50–54, ghost.rs). Disabled until governance activates the `ghost`
+    // feature: until then every one of them is refused ("Ghost Mode is off"). ----
+    /// Move `amount` from the sender into the shielded pool, as the bundle's output notes (its
+    /// spends are dummies). Signed like any tx; also burns `ghost_verify_fee`.
+    Shield {
+        #[serde(with = "u64_str")]
+        amount: u64,
+        bundle: Box<GhostBundle>,
+    },
+    /// Unsigned (the proof authorizes it): spend notes, create notes. The tx's `fee` leaves the
+    /// pool and is burned (its `tip` goes to the proposer).
+    PrivateTransfer { bundle: Box<GhostBundle> },
+    /// Unsigned: spend notes and pay `amount` out of the pool to `to` (address or name), plus
+    /// the fee as for a private transfer.
+    Unshield {
+        to: String,
+        #[serde(with = "u64_str")]
+        amount: u64,
+        bundle: Box<GhostBundle>,
+    },
+    /// Publish this account's Ghost Mode address (1,216 bytes, hex in JSON), so wallets find it
+    /// under the account's `.boo` names. Owner keys only.
+    SetGhostAddress { address: HexBytes },
+    /// An active validator (its consensus key or owner) votes to pause Ghost Mode; it pauses
+    /// once f + 1 of the epoch's validators have.
+    GhostPause {},
 }
 
 /// What a `Propose` asks for: every former admin lever, plus parameters, spending, upgrades and
@@ -346,6 +373,145 @@ pub struct Tx {
 
 /// Domain separator that starts every tx's signing bytes (and so its wire form).
 pub const TX_DOMAIN: &[u8] = b"BLOCKULA_TX_V3";
+
+/// Domain separator of the unsigned ghost wire form (`PrivateTransfer`, `Unshield`): no key
+/// signs those, their Action proof authorizes them (see [`Tx::signing_bytes`] and ghost.rs).
+pub const GHOST_TX_DOMAIN: &[u8] = b"BLOCKULA_GHOST_V1";
+/// Codec bound on a tx that carries a ghost bundle (tags 50–52; a proof alone is up to 192 KiB).
+/// Admission and blocks hold them to the governance parameter `ghost_max_tx_bytes` (≤ this).
+pub const MAX_GHOST_TX_BYTES: usize = 1 << 20;
+/// A note commitment, nullifier, tree root or chain instance in a ghost bundle.
+pub const GHOST_DIGEST_BYTES: usize = 32;
+/// One output's note ciphertext (ML-KEM-768 ciphertext ‖ AEAD of the note and memo) …
+pub const GHOST_ENC_BYTES: usize = blockula_ghost::encryption::ENC_CIPHERTEXT_BYTES;
+/// … and its outgoing ciphertext (for the sender's outgoing viewing key).
+pub const GHOST_OUT_BYTES: usize = blockula_ghost::encryption::OUT_CIPHERTEXT_BYTES;
+/// A Ghost Mode address (`owner ‖ ML-KEM-768 encapsulation key`).
+pub const GHOST_ADDRESS_BYTES: usize = blockula_ghost::keys::ADDRESS_BYTES;
+
+/// Bytes that travel raw in the wire form and as lowercase hex in JSON (ghost bundles and
+/// addresses, which are too large to keep as hex strings). `Debug` shows the length and the
+/// first bytes only.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct HexBytes(pub Vec<u8>);
+
+impl HexBytes {
+    /// The bytes as a 32-byte array, if that's their length.
+    pub fn array32(&self) -> Option<[u8; 32]> {
+        self.0.as_slice().try_into().ok()
+    }
+}
+
+impl std::fmt::Debug for HexBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let head = hex::encode(&self.0[..self.0.len().min(8)]);
+        write!(f, "HexBytes({} bytes: {head}{})", self.0.len(), if self.0.len() > 8 { "…" } else { "" })
+    }
+}
+
+impl Serialize for HexBytes {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(&self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for HexBytes {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        if !crypto::is_lower_hex(&s) {
+            return Err(serde::de::Error::custom("expected lowercase hex"));
+        }
+        hex::decode(&s).map(HexBytes).map_err(serde::de::Error::custom)
+    }
+}
+
+/// What a ghost action (tags 50–52) carries (docs/GHOST-MODE.md section 8). Every field but the
+/// proof is bound to it through the sighash ([`Tx::ghost_sighash`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GhostBundle {
+    /// The chain instance the proof is for (`instance` in `/api/ghost`): carried, so proofs
+    /// verify without state, and checked against the chain's at admission and execution.
+    pub instance: HexBytes,
+    /// The commitment-tree root the real spends are in (a recent one).
+    pub anchor: HexBytes,
+    /// The two spends' nullifiers (dummies included) and the two outputs' note commitments:
+    /// canonical digests (8 little-endian u32s below the KoalaBear modulus).
+    pub nullifiers: [HexBytes; 2],
+    pub commitments: [HexBytes; 2],
+    /// Each output's note ciphertext (`GHOST_ENC_BYTES`) and outgoing ciphertext
+    /// (`GHOST_OUT_BYTES`).
+    pub enc: [HexBytes; 2],
+    pub out: [HexBytes; 2],
+    /// The Action proof (postcard-encoded Plonky3 proof, at most 192 KiB).
+    pub proof: HexBytes,
+}
+
+impl GhostBundle {
+    /// Everything but the proof, in wire order: what the sighash covers.
+    fn encode_public(&self, out: &mut Vec<u8>) {
+        let [n0, n1] = &self.nullifiers;
+        let [c0, c1] = &self.commitments;
+        let [e0, e1] = &self.enc;
+        let [o0, o1] = &self.out;
+        for b in [&self.instance, &self.anchor, n0, n1, c0, c1, e0, e1, o0, o1] {
+            out.extend_from_slice(&b.0);
+        }
+    }
+
+    /// Wire form: the fixed-size fields, then the proof with a u32 length.
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.encode_public(out);
+        out.extend_from_slice(&(self.proof.0.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.proof.0);
+    }
+
+    fn decode(r: &mut Reader) -> Result<GhostBundle> {
+        let mut take = |n: usize| -> Result<HexBytes> { Ok(HexBytes(r.take(n)?.to_vec())) };
+        let (instance, anchor) = (take(GHOST_DIGEST_BYTES)?, take(GHOST_DIGEST_BYTES)?);
+        let nullifiers = [take(GHOST_DIGEST_BYTES)?, take(GHOST_DIGEST_BYTES)?];
+        let commitments = [take(GHOST_DIGEST_BYTES)?, take(GHOST_DIGEST_BYTES)?];
+        let enc = [take(GHOST_ENC_BYTES)?, take(GHOST_ENC_BYTES)?];
+        let out = [take(GHOST_OUT_BYTES)?, take(GHOST_OUT_BYTES)?];
+        let len = r.u32()? as usize;
+        if len > blockula_ghost::MAX_PROOF_BYTES {
+            bail!("`proof` too long ({len} bytes, max {})", blockula_ghost::MAX_PROOF_BYTES);
+        }
+        let proof = HexBytes(r.take(len)?.to_vec());
+        Ok(GhostBundle { instance, anchor, nullifiers, commitments, enc, out, proof })
+    }
+
+    /// Sizes, canonical digests, distinct nullifiers, a proof within its bound.
+    fn check(&self) -> Result<()> {
+        let digest = |field: &str, b: &HexBytes| -> Result<()> {
+            let ok = b.array32().is_some_and(|a| blockula_ghost::field::digest_from_bytes(&a).is_some());
+            if !ok {
+                bail!("`{field}` must be a canonical 32-byte digest");
+            }
+            Ok(())
+        };
+        if self.instance.0.len() != GHOST_DIGEST_BYTES {
+            bail!("`instance` must be 32 bytes");
+        }
+        digest("anchor", &self.anchor)?;
+        for b in &self.nullifiers {
+            digest("nullifiers", b)?;
+        }
+        for b in &self.commitments {
+            digest("commitments", b)?;
+        }
+        if self.nullifiers[0] == self.nullifiers[1] {
+            bail!("the two spends have the same nullifier");
+        }
+        if self.enc.iter().any(|e| e.0.len() != GHOST_ENC_BYTES) || self.out.iter().any(|o| o.0.len() != GHOST_OUT_BYTES) {
+            bail!("each output needs a {GHOST_ENC_BYTES}-byte note ciphertext (`enc`) and an {GHOST_OUT_BYTES}-byte outgoing ciphertext (`out`)");
+        }
+        if self.proof.0.is_empty() || self.proof.0.len() > blockula_ghost::MAX_PROOF_BYTES {
+            bail!("`proof` must be 1–{} bytes", blockula_ghost::MAX_PROOF_BYTES);
+        }
+        Ok(())
+    }
+}
 
 /// Strings carry a u16 length. Longer ones can't occur in a valid tx: `check_format` caps the
 /// whole tx at `MAX_TX_BYTES` (counted on the real lengths) before anything relies on them.
@@ -730,6 +896,27 @@ impl Action {
                 put_u64(out, *claim_id);
                 put_str(out, revert_sha);
             }
+            Action::Shield { amount, bundle } => {
+                out.push(50);
+                put_u64(out, *amount);
+                bundle.encode(out);
+            }
+            Action::PrivateTransfer { bundle } => {
+                out.push(51);
+                bundle.encode(out);
+            }
+            Action::Unshield { to, amount, bundle } => {
+                out.push(52);
+                put_str(out, to);
+                put_u64(out, *amount);
+                bundle.encode(out);
+            }
+            // Raw and fixed-size (check_format enforces the size).
+            Action::SetGhostAddress { address } => {
+                out.push(53);
+                out.extend_from_slice(&address.0);
+            }
+            Action::GhostPause {} => out.push(54),
         }
     }
 
@@ -830,6 +1017,12 @@ impl Action {
             47 => Action::ReleaseName { name: r.str("name", MAX_NAME_FIELD)? },
             48 => Action::ClaimDistribution { distribution_id: r.u64()?, amount: r.u64()?, proof: r.strs("proof", MAX_PROOF, HEX_32)? },
             49 => Action::AttestRevert { claim_id: r.u64()?, revert_sha: r.str("revert_sha", 40)? },
+            50..=54 if nested => bail!("a multisig proposal can't hold a ghost action"),
+            50 => Action::Shield { amount: r.u64()?, bundle: Box::new(GhostBundle::decode(r)?) },
+            51 => Action::PrivateTransfer { bundle: Box::new(GhostBundle::decode(r)?) },
+            52 => Action::Unshield { to: r.str("to", MAX_NAME_FIELD)?, amount: r.u64()?, bundle: Box::new(GhostBundle::decode(r)?) },
+            53 => Action::SetGhostAddress { address: HexBytes(r.take(GHOST_ADDRESS_BYTES)?.to_vec()) },
+            54 => Action::GhostPause {},
             t => bail!("unknown action tag {t}"),
         })
     }
@@ -1069,6 +1262,9 @@ impl Action {
                 if nested || matches!(**action, Action::MultisigPropose { .. } | Action::MultisigApprove { .. }) {
                     bail!("a multisig proposal can't hold another multisig proposal or approval");
                 }
+                if action.is_ghost() {
+                    bail!("a multisig proposal can't hold a ghost action");
+                }
                 action.check_format(true).context("the proposed action")?;
             }
             Action::RenewName { name, years } => {
@@ -1098,8 +1294,47 @@ impl Action {
                     bail!("revert_sha must be the 40-hex revert commit");
                 }
             }
+            Action::Shield { amount, bundle } => {
+                if *amount == 0 {
+                    bail!("shield more than 0");
+                }
+                bundle.check()?;
+            }
+            Action::PrivateTransfer { bundle } => bundle.check()?,
+            Action::Unshield { to, amount, bundle } => {
+                check_account_ref("to", to)?;
+                if *amount == 0 {
+                    bail!("unshield more than 0");
+                }
+                bundle.check()?;
+            }
+            Action::SetGhostAddress { address } => {
+                // Its owner digest must be canonical and its ML-KEM key pass FIPS 203's checks.
+                if address.0.len() != GHOST_ADDRESS_BYTES || blockula_ghost::Address::from_bytes(&address.0).is_none() {
+                    bail!("address must be a valid {GHOST_ADDRESS_BYTES}-byte Ghost Mode address");
+                }
+            }
+            Action::GhostPause {} => {}
         }
         Ok(())
+    }
+
+    /// A Ghost Mode action (tags 50–54).
+    pub fn is_ghost(&self) -> bool {
+        matches!(self, Action::Shield { .. } | Action::PrivateTransfer { .. } | Action::Unshield { .. } | Action::SetGhostAddress { .. } | Action::GhostPause {})
+    }
+
+    /// Travels unsigned: `PrivateTransfer` and `Unshield`, whose proof authorizes them.
+    pub fn is_unsigned(&self) -> bool {
+        matches!(self, Action::PrivateTransfer { .. } | Action::Unshield { .. })
+    }
+
+    /// The ghost bundle, for the actions that carry one (tags 50–52).
+    pub fn ghost_bundle(&self) -> Option<&GhostBundle> {
+        match self {
+            Action::Shield { bundle, .. } | Action::PrivateTransfer { bundle } | Action::Unshield { bundle, .. } => Some(bundle),
+            _ => None,
+        }
     }
 
     /// The action's JSON `type` (snake_case), e.g. `"delegate"`.
@@ -1155,6 +1390,11 @@ impl Action {
             Action::ReleaseName { .. } => "release_name",
             Action::ClaimDistribution { .. } => "claim_distribution",
             Action::AttestRevert { .. } => "attest_revert",
+            Action::Shield { .. } => "shield",
+            Action::PrivateTransfer { .. } => "private_transfer",
+            Action::Unshield { .. } => "unshield",
+            Action::SetGhostAddress { .. } => "set_ghost_address",
+            Action::GhostPause {} => "ghost_pause",
         }
     }
 
@@ -1162,7 +1402,7 @@ impl Action {
     /// including those inside a proposal or a multisig proposal.
     pub fn addresses(&self) -> Vec<(&'static str, &str)> {
         match self {
-            Action::Transfer { to, .. } | Action::AwardHunt { to, .. } | Action::GrantSoul { to, .. } | Action::TransferName { to, .. } => vec![("to", to.as_str())],
+            Action::Transfer { to, .. } | Action::AwardHunt { to, .. } | Action::GrantSoul { to, .. } | Action::TransferName { to, .. } | Action::Unshield { to, .. } => vec![("to", to.as_str())],
             Action::ApproveValidator { validator } | Action::RemoveValidator { validator } | Action::Unbond { validator } | Action::Delegate { validator, .. } | Action::Undelegate { validator, .. } | Action::Unjail { validator } => vec![("validator", validator.as_str())],
             Action::Redelegate { from_validator, to_validator, .. } => vec![("from_validator", from_validator.as_str()), ("to_validator", to_validator.as_str())],
             Action::Vouch { account } | Action::Unvouch { account } | Action::FlagSybil { account, .. } | Action::Clawback { account, .. } => vec![("account", account.as_str())],
@@ -1339,7 +1579,20 @@ impl ProposalKind {
 
 impl Tx {
     /// Canonical encoding that gets signed. Mirrored exactly in sdk-ts/src/tx.ts.
+    ///
+    /// Unsigned ghost txs (`PrivateTransfer`, `Unshield`) have a form of their own, which is
+    /// their whole wire form: `GHOST_TX_DOMAIN ‖ chain_id ‖ fee ‖ tip ‖ valid_until ‖ action`
+    /// (no `from`, nonce, memo, key or signature: those stay empty and 0).
     pub fn signing_bytes(&self) -> Vec<u8> {
+        if self.is_unsigned() {
+            let mut out = GHOST_TX_DOMAIN.to_vec();
+            put_str(&mut out, &self.chain_id);
+            put_u64(&mut out, self.fee);
+            put_u64(&mut out, self.tip);
+            put_u64(&mut out, self.valid_until);
+            self.action.encode(&mut out);
+            return out;
+        }
         let mut out = TX_DOMAIN.to_vec();
         put_str(&mut out, &self.chain_id);
         put_str(&mut out, &self.from);
@@ -1352,9 +1605,10 @@ impl Tx {
         out
     }
 
-    /// Wire form: `signing_bytes ‖ public_key (1,952 B) ‖ signature (3,309 B)`. Blocks and
-    /// mempool gossip carry this; [`Tx::from_bytes`] is its strict inverse. Only txs that pass
-    /// [`Tx::check_format`] round-trip (malformed hex is written as zeros).
+    /// Wire form: `signing_bytes ‖ public_key (1,952 B) ‖ signature (3,309 B)`, or just the
+    /// signing bytes for an unsigned ghost tx. Blocks and mempool gossip carry this;
+    /// [`Tx::from_bytes`] is its strict inverse. Only txs that pass [`Tx::check_format`]
+    /// round-trip (malformed hex is written as zeros).
     pub fn to_bytes(&self) -> Vec<u8> {
         let raw = |h: &str| hex::decode(h).unwrap_or_else(|_| vec![0; h.len() / 2]);
         let mut out = self.signing_bytes();
@@ -1363,36 +1617,102 @@ impl Tx {
         out
     }
 
-    /// Parses the wire form. Strict: no trailing bytes, valid UTF-8, known tags, canonical
-    /// bools and options, fields within their bounds, and the bytes must be exactly what
+    /// Parses the wire form (signed, or the unsigned ghost form: the domain says which). Strict:
+    /// no trailing bytes, valid UTF-8, known tags, canonical bools and options, fields within
+    /// their bounds, the size bound of the tx's kind, and the bytes must be exactly what
     /// `to_bytes` produces for the result.
     pub fn from_bytes(bytes: &[u8]) -> Result<Tx> {
-        if bytes.len() > MAX_TX_BYTES {
-            bail!("transaction too large ({} bytes, max {MAX_TX_BYTES})", bytes.len());
+        if bytes.len() > MAX_GHOST_TX_BYTES {
+            bail!("transaction too large ({} bytes, max {MAX_GHOST_TX_BYTES})", bytes.len());
         }
         let mut r = Reader { buf: bytes };
-        if r.take(TX_DOMAIN.len())? != TX_DOMAIN {
-            bail!("not a v3 transaction");
-        }
-        let tx = Tx {
-            chain_id: r.str("chain_id", MAX_CHAIN_ID)?,
-            from: r.str("from", MAX_ADDRESS)?,
-            nonce: r.u64()?,
-            fee: r.u64()?,
-            tip: r.u64()?,
-            valid_until: r.u64()?,
-            action: Action::decode(&mut r)?,
-            memo: r.str("memo", MAX_MEMO)?,
-            public_key: hex::encode(r.take(crypto::PUBLIC_KEY_LEN)?),
-            signature: hex::encode(r.take(crypto::SIGNATURE_LEN)?),
+        let tx = if bytes.starts_with(GHOST_TX_DOMAIN) {
+            r.take(GHOST_TX_DOMAIN.len())?;
+            let (chain_id, fee, tip, valid_until) = (r.str("chain_id", MAX_CHAIN_ID)?, r.u64()?, r.u64()?, r.u64()?);
+            let action = Action::decode(&mut r)?;
+            if !action.is_unsigned() {
+                bail!("only private transfers and unshields travel unsigned");
+            }
+            Tx { chain_id, from: String::new(), nonce: 0, fee, tip, valid_until, action, memo: String::new(), public_key: String::new(), signature: String::new() }
+        } else {
+            if r.take(TX_DOMAIN.len())? != TX_DOMAIN {
+                bail!("not a v3 transaction");
+            }
+            let tx = Tx {
+                chain_id: r.str("chain_id", MAX_CHAIN_ID)?,
+                from: r.str("from", MAX_ADDRESS)?,
+                nonce: r.u64()?,
+                fee: r.u64()?,
+                tip: r.u64()?,
+                valid_until: r.u64()?,
+                action: Action::decode(&mut r)?,
+                memo: r.str("memo", MAX_MEMO)?,
+                public_key: hex::encode(r.take(crypto::PUBLIC_KEY_LEN)?),
+                signature: hex::encode(r.take(crypto::SIGNATURE_LEN)?),
+            };
+            if tx.action.is_unsigned() {
+                bail!("private transfers and unshields are unsigned: they travel in the BLOCKULA_GHOST_V1 form");
+            }
+            tx
         };
         if !r.buf.is_empty() {
             bail!("{} trailing bytes after the transaction", r.buf.len());
+        }
+        let max = tx.max_bytes();
+        if bytes.len() > max {
+            bail!("transaction too large ({} bytes, max {max})", bytes.len());
         }
         if tx.to_bytes() != bytes {
             bail!("non-canonical transaction encoding");
         }
         Ok(tx)
+    }
+
+    /// The codec's size bound for this tx: [`MAX_GHOST_TX_BYTES`] for one carrying a ghost
+    /// bundle, [`MAX_TX_BYTES`] for the rest.
+    pub fn max_bytes(&self) -> usize {
+        if self.action.ghost_bundle().is_some() { MAX_GHOST_TX_BYTES } else { MAX_TX_BYTES }
+    }
+
+    /// An unsigned ghost tx (`PrivateTransfer`, `Unshield`): no sender, nonce, key or signature;
+    /// its proof authorizes it (ghost.rs).
+    pub fn is_unsigned(&self) -> bool {
+        self.action.is_unsigned()
+    }
+
+    /// The 32 bytes a ghost tx's Action proof is bound to (tags 50–52; `None` for other txs):
+    /// `BLAKE3-KDF("blockula ghost v1 tx sighash", chain_id ‖ tag ‖ valid_until ‖ fee ‖ tip ‖
+    /// the tag's own fields (Shield: from, nonce, amount; Unshield: to, amount) ‖ the bundle
+    /// without its proof (instance, anchor, nullifiers, commitments, ciphertexts) ‖ CIRCUIT_ID)`.
+    /// So a proof can't be lifted into another tx, chain or fee, or have its ciphertexts swapped.
+    /// Mirrored in sdk-ts/src/tx.ts `ghostSighash`.
+    pub fn ghost_sighash(&self) -> Option<[u8; 32]> {
+        let bundle = self.action.ghost_bundle()?;
+        let mut fields = vec![];
+        let tag = match &self.action {
+            Action::Shield { amount, .. } => {
+                put_str(&mut fields, &self.from);
+                put_u64(&mut fields, self.nonce);
+                put_u64(&mut fields, *amount);
+                50
+            }
+            Action::Unshield { to, amount, .. } => {
+                put_str(&mut fields, to);
+                put_u64(&mut fields, *amount);
+                52
+            }
+            _ => 51,
+        };
+        let mut out = vec![];
+        put_str(&mut out, &self.chain_id);
+        out.push(tag);
+        put_u64(&mut out, self.valid_until);
+        put_u64(&mut out, self.fee);
+        put_u64(&mut out, self.tip);
+        out.extend_from_slice(&fields);
+        bundle.encode_public(&mut out);
+        out.extend_from_slice(&blockula_ghost::CIRCUIT_ID.to_le_bytes());
+        Some(blake3::derive_key("blockula ghost v1 tx sighash", &out))
     }
 
     /// What this tx is charged: the burned base fee for its size plus the proposer's tip
@@ -1429,24 +1749,30 @@ impl Tx {
     /// lowercase hex and addresses, capped string fields, the wire size limit, and an exact
     /// round trip through the wire form.
     pub fn check_format(&self) -> Result<()> {
-        let size = self.size() as usize;
-        if size > MAX_TX_BYTES {
-            bail!("transaction too large ({size} bytes, max {MAX_TX_BYTES})");
+        let (size, max) = (self.size() as usize, self.max_bytes());
+        if size > max {
+            bail!("transaction too large ({size} bytes, max {max})");
         }
         if self.chain_id.len() > MAX_CHAIN_ID {
             bail!("chain_id too long");
         }
-        if !crypto::is_address(&self.from) {
-            bail!("`from` must be a lowercase address (boo1… or tboo1…)");
-        }
-        if self.memo.len() > MAX_MEMO {
-            bail!("memo too long (max {MAX_MEMO} bytes)");
-        }
-        if !crypto::is_lower_hex(&self.public_key) || self.public_key.len() != crypto::PUBLIC_KEY_LEN * 2 {
-            bail!("public_key must be {} bytes of lowercase hex", crypto::PUBLIC_KEY_LEN);
-        }
-        if !crypto::is_lower_hex(&self.signature) || self.signature.len() != crypto::SIGNATURE_LEN * 2 {
-            bail!("signature must be {} bytes of lowercase hex", crypto::SIGNATURE_LEN);
+        if self.is_unsigned() {
+            if !self.from.is_empty() || self.nonce != 0 || !self.memo.is_empty() || !self.public_key.is_empty() || !self.signature.is_empty() {
+                bail!("private transfers and unshields are unsigned (their proof authorizes them): `from`, `memo`, `public_key` and `signature` must be empty and `nonce` 0");
+            }
+        } else {
+            if !crypto::is_address(&self.from) {
+                bail!("`from` must be a lowercase address (boo1… or tboo1…)");
+            }
+            if self.memo.len() > MAX_MEMO {
+                bail!("memo too long (max {MAX_MEMO} bytes)");
+            }
+            if !crypto::is_lower_hex(&self.public_key) || self.public_key.len() != crypto::PUBLIC_KEY_LEN * 2 {
+                bail!("public_key must be {} bytes of lowercase hex", crypto::PUBLIC_KEY_LEN);
+            }
+            if !crypto::is_lower_hex(&self.signature) || self.signature.len() != crypto::SIGNATURE_LEN * 2 {
+                bail!("signature must be {} bytes of lowercase hex", crypto::SIGNATURE_LEN);
+            }
         }
         self.action.check_format(false)?;
         // Whatever the wire form can't carry exactly (e.g. `familiar_key: Some("")`) is invalid.
@@ -1465,6 +1791,9 @@ impl Tx {
     }
 
     pub fn signer_key_id(&self) -> Result<String> {
+        if self.is_unsigned() {
+            bail!("an unsigned ghost transaction has no signing key");
+        }
         Ok(key_id(&hex::decode(&self.public_key).context("public_key hex")?))
     }
 
@@ -1473,7 +1802,12 @@ impl Tx {
         (self.signing_bytes().len() + self.public_key.len() / 2 + self.signature.len() / 2) as u64
     }
 
+    /// Checks the ML-DSA signature. Unsigned ghost txs have none, so they fail here: their
+    /// Action proof authorizes them instead (`ghost::verify_proof`).
     pub fn verify_signature(&self) -> Result<()> {
+        if self.is_unsigned() {
+            bail!("private transfers and unshields carry no signature: their Action proof authorizes them");
+        }
         if self.memo.len() > MAX_MEMO {
             bail!("memo too long (max {MAX_MEMO} bytes)");
         }
@@ -1960,7 +2294,7 @@ pub(crate) mod tests {
         let mut bad_role = role.to_bytes();
         bad_role[role.signing_bytes().len() - 2 - 1 - 1] = 2;
         assert!(err(&bad_role).contains("unknown key role"));
-        assert!(Tx::from_bytes(&vec![0u8; MAX_TX_BYTES + 1]).unwrap_err().to_string().contains("too large"));
+        assert!(Tx::from_bytes(&vec![0u8; MAX_GHOST_TX_BYTES + 1]).unwrap_err().to_string().contains("too large"));
     }
 
     #[test]

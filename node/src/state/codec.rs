@@ -17,8 +17,9 @@ use std::io::{Read, Write};
 
 /// Version of the state encoding (records, namespaces, tree). It is itself a record, so it is
 /// committed to by the root. 2: the protocol v1 scaffold (`chain_params`, account locks,
-/// validator commission, the module namespaces).
-pub const SCHEMA_VERSION: u32 = 2;
+/// validator commission, the module namespaces). 3: Ghost Mode (namespaces 48–52, the `ghost`
+/// scalar record, `ghost_anchor_window` and `ghost_verify_fee`).
+pub const SCHEMA_VERSION: u32 = 3;
 
 pub fn encode<T: BorshSerialize + ?Sized>(v: &T) -> Vec<u8> {
     borsh::to_vec(v).expect("encoding to memory can't fail")
@@ -50,6 +51,16 @@ impl RecordKey for u64 {
     }
     fn from_key_bytes(b: &[u8]) -> Result<Self> {
         Ok(u64::from_be_bytes(b.try_into().map_err(|_| anyhow!("record key isn't 8 bytes"))?))
+    }
+}
+
+/// Hashes and digests (Ghost Mode's nullifiers and roots), as their bytes.
+impl RecordKey for [u8; 32] {
+    fn key_bytes(&self) -> Cow<'_, [u8]> {
+        Cow::Borrowed(self)
+    }
+    fn from_key_bytes(b: &[u8]) -> Result<Self> {
+        b.try_into().map_err(|_| anyhow!("record key isn't 32 bytes"))
     }
 }
 

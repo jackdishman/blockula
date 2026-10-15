@@ -98,6 +98,15 @@ pub fn fmt_bps(bps: u64) -> String {
     if frac == 0 { whole.to_string() } else { format!("{whole}.{}", format!("{frac:02}").trim_end_matches('0')) }
 }
 
+// STUB(owner P-STAKE): replaced at merge
+/// The active validator of `epoch` that `account` speaks for when `signer_key_id` signs: the
+/// validator's own (consensus-key) account, or its owner. Stub: by account alone (the signer is
+/// already authorized on it) over the epoch's active set, first match.
+pub fn validator_for_signer(state: &State, account: &str, signer_key_id: &str, epoch: u64) -> Option<String> {
+    let _ = signer_key_id;
+    state.active_set(epoch)?.into_iter().find(|v| v.address == account || v.owner == account).map(|v| v.address.clone())
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

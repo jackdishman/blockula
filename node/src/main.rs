@@ -6,6 +6,7 @@ mod contrib_cli;
 mod crypto;
 mod econ;
 mod epochs;
+mod ghost;
 mod github;
 mod governance;
 mod snapshot;

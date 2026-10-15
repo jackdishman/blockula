@@ -345,6 +345,7 @@ impl Genesis {
         for f in &self.features {
             state.upgrade.features.insert(f.clone(), crate::upgrade::Feature { activated_at: 0 });
         }
+        state.ghost.meta.instance = crate::ghost::chain_instance(self);
         state.commit_block().expect("an in-memory tree can't fail");
         state
     }
@@ -452,6 +453,8 @@ impl Genesis {
             ensure!(self.validator_admins.is_empty(), "{MAINNET_CHAIN_ID} has no admin keys: validator_admins must be empty");
             ensure!(!self.faucet, "{MAINNET_CHAIN_ID} has no faucet");
             ensure!(self.validators.iter().all(|v| keys.contains(v.public_key.as_str())), "every {MAINNET_CHAIN_ID} validator needs an operator (owner, self-bond, commission)");
+            // DEC-2: Ghost Mode ships disabled; only governance switches it on, after its audit.
+            ensure!(!self.features.iter().any(|f| f == crate::ghost::FEATURE), "{MAINNET_CHAIN_ID} starts with Ghost Mode off: governance activates it after its audit");
         }
         Ok(())
     }
@@ -540,6 +543,7 @@ pub struct Journal {
     pub(crate) econ: crate::econ::EconJournal,
     pub(crate) beacon: crate::beacon::BeaconJournal,
     pub(crate) upgrade: crate::upgrade::UpgradeJournal,
+    pub(crate) ghost: crate::ghost::GhostJournal,
 }
 
 impl Journal {
@@ -549,7 +553,7 @@ impl Journal {
 
     /// Folds a nested journal in, keeping the oldest values. Exhaustive, like `State::rollback`.
     fn absorb(&mut self, other: Journal) {
-        let Journal { accounts, names, validators, hunts, github, github_by_account, familiars, scalars, next_hunt_id, chain_params, poc, staking, governance, econ, beacon, upgrade } = other;
+        let Journal { accounts, names, validators, hunts, github, github_by_account, familiars, scalars, next_hunt_id, chain_params, poc, staking, governance, econ, beacon, upgrade, ghost } = other;
         self.accounts.absorb(accounts);
         self.names.absorb(names);
         self.validators.absorb(validators);
@@ -572,6 +576,7 @@ impl Journal {
         self.econ.absorb(econ);
         self.beacon.absorb(beacon);
         self.upgrade.absorb(upgrade);
+        self.ghost.absorb(ghost);
     }
 }
 
@@ -774,6 +779,8 @@ pub struct State {
     pub econ: crate::econ::Econ,
     pub beacon: crate::beacon::Beacon,
     pub upgrade: crate::upgrade::Upgrades,
+    /// 👻 Ghost Mode's shielded pool (ghost.rs), off until governance activates it.
+    pub ghost: crate::ghost::Ghost,
     /// The authenticated tree over every record, as of the last `commit_block`.
     pub tree: crate::state::tree::Smt,
 }
@@ -822,7 +829,9 @@ impl State {
     /// 3. `staking::end_block`: missed leader slots from `view`/`parent_view` (downtime), and the
     ///    proposer's charge for the `skipped` txs (junk, 3.4).
     /// 4. `governance::end_block`: proposals whose voting ended or whose timelock is over.
-    /// 5. At an epoch boundary: `econ::issue` (rewards into the pools), `staking::end_epoch`
+    /// 5. `ghost::end_block`: the commitment tree's new root becomes the anchor; old anchors
+    ///    age out.
+    /// 6. At an epoch boundary: `econ::issue` (rewards into the pools), `staking::end_epoch`
     ///    (jailing, the next set by stake), `beacon::end_epoch`, then [`State::end_epoch`] (the
     ///    set history and the legacy admin-approved set).
     ///
@@ -833,6 +842,7 @@ impl State {
         crate::econ::end_block(self, b);
         crate::staking::end_block(self, b);
         crate::governance::end_block(self, b);
+        crate::ghost::end_block(self, b);
         if self.params.is_boundary(b.height) {
             let epoch = self.params.epoch_of(b.height);
             crate::econ::issue(self, epoch);
@@ -980,7 +990,7 @@ impl State {
 
     /// Undoes everything recorded in `j` (values, and the dirty marks of keys it cleans up).
     pub fn rollback(&mut self, j: Journal) {
-        let Journal { accounts, names, validators, hunts, github, github_by_account, familiars, scalars, next_hunt_id, chain_params, poc, staking, governance, econ, beacon, upgrade } = j;
+        let Journal { accounts, names, validators, hunts, github, github_by_account, familiars, scalars, next_hunt_id, chain_params, poc, staking, governance, econ, beacon, upgrade, ghost } = j;
         accounts.restore(&mut self.accounts);
         names.restore(&mut self.names);
         validators.restore(&mut self.validators);
@@ -1004,6 +1014,7 @@ impl State {
         econ.rollback(&mut self.econ);
         beacon.rollback(&mut self.beacon);
         upgrade.rollback(&mut self.upgrade);
+        ghost.rollback(&mut self.ghost);
     }
 
     /// Checks that decide whether a tx can be included at all (at `height`). No state changes.
@@ -1044,6 +1055,8 @@ impl State {
                 bail!("session key limit reached: {} per {period_blocks} blocks", fmt_fang(limit));
             }
         }
+        // Ghost Mode's own admission rules (on and unpaused; a shield's size, chain and proof).
+        crate::ghost::admit(self, tx, height)?;
         Ok((sender, signer, key, charge))
     }
 
@@ -1062,6 +1075,10 @@ impl State {
     /// `apply`, recording every change in `j` so the caller can roll back (dry runs, mempool
     /// checks, proposals) without cloning the state.
     pub fn apply_j(&mut self, j: &mut Journal, tx: &Tx, chain_id: &str, proposer: &str, height: u64, full_checks: bool) -> Result<Outcome> {
+        // Unsigned ghost txs have no sender, nonce or key: their proof authorizes them (ghost.rs).
+        if tx.is_unsigned() {
+            return crate::ghost::apply_unsigned(self, j, tx, chain_id, proposer, height, full_checks);
+        }
         let (sender, signer, key, charge) = self.admit(tx, chain_id, height, full_checks)?;
         let base = charge - tx.tip;
         // Fee phase (always sticks once admitted): the charge is debited (not the whole `fee`),
@@ -1386,6 +1403,7 @@ impl State {
             Action::BeaconCommit { .. } | Action::BeaconReveal { .. } | Action::AttestRevert { .. } => crate::beacon::apply(self, j, tx, &sender, signer, key, height)?,
             Action::Propose { .. } | Action::Vote { .. } | Action::Unlock {} | Action::MultisigCreate { .. } | Action::MultisigPropose { .. } | Action::MultisigApprove { .. } | Action::ClaimDistribution { .. } => crate::governance::apply(self, j, tx, &sender, signer, key, height)?,
             Action::RenewName { .. } | Action::TransferName { .. } | Action::ReleaseName { .. } => crate::econ::apply(self, j, tx, &sender, signer, key, height)?,
+            Action::Shield { .. } | Action::PrivateTransfer { .. } | Action::Unshield { .. } | Action::SetGhostAddress { .. } | Action::GhostPause {} => crate::ghost::apply(self, j, tx, &sender, signer, key, height)?,
             _ => self.apply_poc(j, tx, &sender, signer, key, height)?,
         }
         Ok(())
@@ -1450,6 +1468,7 @@ impl State {
             Action::Delegate { amount, .. } => *amount,
             Action::Propose { deposit, .. } => *deposit,
             Action::RenewName { name, years } => normalize_name(name).map(|n| self.chain_params.name_renewal_price(n.len(), *years as u64)).unwrap_or(0),
+            Action::Shield { amount, .. } => amount.saturating_add(self.chain_params.ghost_verify_fee),
             _ => 0,
         })
     }
@@ -1533,6 +1552,7 @@ impl State {
             Action::BeaconCommit { .. } | Action::BeaconReveal { .. } | Action::AttestRevert { .. } => crate::beacon::describe(self, tx, &from),
             Action::Propose { .. } | Action::Vote { .. } | Action::Unlock {} | Action::MultisigCreate { .. } | Action::MultisigPropose { .. } | Action::MultisigApprove { .. } | Action::ClaimDistribution { .. } => crate::governance::describe(self, tx, &from, primary_name),
             Action::RenewName { .. } | Action::TransferName { .. } | Action::ReleaseName { .. } => crate::econ::describe(self, tx, &from, primary_name),
+            Action::Shield { .. } | Action::PrivateTransfer { .. } | Action::Unshield { .. } | Action::SetGhostAddress { .. } | Action::GhostPause {} => crate::ghost::describe(self, tx, &from, primary_name),
             _ => self.describe_poc(tx, &from, primary_name),
         }
     }
@@ -2652,7 +2672,7 @@ impl Chain {
 
     fn rebuild_pending(&mut self) {
         self.pending.clear();
-        for tx in &self.mempool {
+        for tx in self.mempool.iter().filter(|t| !t.is_unsigned()) {
             let e = self.pending.entry(tx.from.clone()).or_default();
             e.0 += 1;
             e.1 = e.1.saturating_add(self.state.tx_debit(tx));
@@ -2723,13 +2743,16 @@ impl Chain {
         if self.pool.contains(&id) || self.has_tx(&id) {
             return Ok((id, false));
         }
-        let sender = tx.sender()?;
+        // Ghost Mode: a bounded share of the mempool, and one queued spend per note (a higher tip
+        // per byte replaces it). Unsigned ghost txs have no sender: nothing to count or reserve.
+        let replaces = crate::ghost::mempool_admit(&self.mempool, &self.mempool_ids, &tx)?;
+        let sender = if tx.is_unsigned() { String::new() } else { tx.sender()? };
         let (count, reserved) = self.pending.get(&sender).copied().unwrap_or_default();
         if count >= MAX_PENDING_PER_SENDER {
             bail!("too many pending transactions from {}; wait for some to finalize", short(&sender));
         }
         let expected = self.state.account(&sender).nonce + count as u64;
-        if tx.nonce != expected {
+        if !tx.is_unsigned() && tx.nonce != expected {
             bail!("bad nonce: expected {expected}, got {}", tx.nonce);
         }
         let next = self.height() + 1;
@@ -2748,6 +2771,15 @@ impl Chain {
         match result? {
             Outcome::Applied => {}
             Outcome::Failed(r) => bail!(r),
+        }
+        if !replaces.is_empty() {
+            self.remove_from_mempool(|i| replaces.iter().any(|r| r == i));
+            for r in replaces {
+                self.pool.remove(&r);
+                self.mp.remove(&r);
+                self.note_failed(r, "replaced by a transaction spending the same note with a higher tip".into(), next);
+            }
+            self.rebuild_pending();
         }
         if self.mempool.len() >= MAX_MEMPOOL {
             // Full: evict the lowest tip per byte if this one pays more, else refuse. Only the
@@ -2778,10 +2810,12 @@ impl Chain {
         if let Some(g) = &self.gossip {
             let _ = g.unbounded_send(tx.clone());
         }
-        let debit = self.state.tx_debit(&tx);
-        let e = self.pending.entry(sender.clone()).or_default();
-        e.0 += 1;
-        e.1 = e.1.saturating_add(debit);
+        if !tx.is_unsigned() {
+            let debit = self.state.tx_debit(&tx);
+            let e = self.pending.entry(sender.clone()).or_default();
+            e.0 += 1;
+            e.1 = e.1.saturating_add(debit);
+        }
         self.pool.insert(id.clone());
         self.mp.add(id.clone(), &tx, next);
         self.mempool.push(tx);
@@ -2799,14 +2833,17 @@ impl Chain {
         tx.check_format()?;
         let id = tx.id();
         if !self.pool.contains(&id) && !self.has_tx(&id) {
-            let sender = tx.sender()?;
-            if self.pending.get(&sender).is_some_and(|p| p.0 >= MAX_PENDING_PER_SENDER) || self.mempool.len() >= MAX_MEMPOOL {
+            // Unsigned ghost txs have no sender to count against.
+            let sender = if tx.is_unsigned() { String::new() } else { tx.sender()? };
+            if self.pending.get(&sender).is_some_and(|p| p.0 >= MAX_PENDING_PER_SENDER) || self.mempool.len() >= MAX_MEMPOOL || crate::ghost::mempool_admit(&self.mempool, &self.mempool_ids, &tx).is_err() {
                 return Ok(());
             }
-            let debit = self.state.tx_debit(&tx);
-            let e = self.pending.entry(sender.clone()).or_default();
-            e.0 += 1;
-            e.1 = e.1.saturating_add(debit);
+            if !tx.is_unsigned() {
+                let debit = self.state.tx_debit(&tx);
+                let e = self.pending.entry(sender.clone()).or_default();
+                e.0 += 1;
+                e.1 = e.1.saturating_add(debit);
+            }
             let next = self.height() + 1;
             self.pool.insert(id.clone());
             self.mp.add(id.clone(), &tx, next);
@@ -3065,6 +3102,11 @@ pub fn proposal_order(mempool: &[Tx]) -> Vec<&Tx> {
     let mut queues: Vec<VecDeque<usize>> = vec![];
     let mut by_sender: HashMap<&str, usize> = HashMap::new();
     for (i, t) in mempool.iter().enumerate() {
+        // Unsigned ghost txs have no sender (or nonce): each is a queue of its own.
+        if t.is_unsigned() {
+            queues.push(VecDeque::from([i]));
+            continue;
+        }
         let q = *by_sender.entry(t.from.as_str()).or_insert_with(|| {
             queues.push(VecDeque::new());
             queues.len() - 1

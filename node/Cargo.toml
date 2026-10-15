@@ -48,6 +48,9 @@ borsh = { version = "=1.8.1", features = ["derive", "de_strict_order"] }
 # the API serves from without the consensus lock (src/view.rs).
 redb = "=4.4.0"
 arc-swap = "=1.9.2"
+# Ghost Mode's cryptographic core (keys, notes, the commitment tree, the Action STARK on Plonky3,
+# note encryption): its own workspace, pinned there. Disabled at genesis (src/ghost.rs).
+blockula-ghost = { path = "ghost" }
 
 # ML-DSA and consensus are slow unoptimized; keep our crate debuggable but optimize deps.
 [profile.dev.package."*"]
@@ -56,6 +59,56 @@ opt-level = 2
 # Arithmetic overflow in the node panics in release builds too: halting beats silently wrapping
 # a balance or the supply.
 [profile.release.package.blockula]
+overflow-checks = true
+
+# Ghost Mode's verifier runs on untrusted proofs. Its robustness evidence (docs/GHOST-MODE.md
+# sections 7 and 11) was gathered with overflow checks on in blockula-ghost and every Plonky3
+# crate, where an overflow on a malformed proof panics (and `verify`'s catch_unwind turns that
+# into a rejection) instead of wrapping down an untested path. Cargo applies only this
+# workspace's profiles, so they're listed here; `ghost::tests::release_profile_covers_plonky3`
+# fails if a p3-* crate in Cargo.lock is missing. `panic` stays "unwind" (the default):
+# blockula-ghost refuses to compile with "abort".
+[profile.release.package.blockula-ghost]
+overflow-checks = true
+[profile.release.package.p3-air]
+overflow-checks = true
+[profile.release.package.p3-challenger]
+overflow-checks = true
+[profile.release.package.p3-commit]
+overflow-checks = true
+[profile.release.package.p3-dft]
+overflow-checks = true
+[profile.release.package.p3-field]
+overflow-checks = true
+[profile.release.package.p3-fri]
+overflow-checks = true
+[profile.release.package.p3-keccak]
+overflow-checks = true
+[profile.release.package.p3-koala-bear]
+overflow-checks = true
+[profile.release.package.p3-matrix]
+overflow-checks = true
+[profile.release.package.p3-maybe-rayon]
+overflow-checks = true
+[profile.release.package.p3-mds]
+overflow-checks = true
+[profile.release.package.p3-merkle-tree]
+overflow-checks = true
+[profile.release.package.p3-monty-31]
+overflow-checks = true
+[profile.release.package.p3-poseidon1]
+overflow-checks = true
+[profile.release.package.p3-poseidon2]
+overflow-checks = true
+[profile.release.package.p3-poseidon2-air]
+overflow-checks = true
+[profile.release.package.p3-security]
+overflow-checks = true
+[profile.release.package.p3-symmetric]
+overflow-checks = true
+[profile.release.package.p3-uni-stark]
+overflow-checks = true
+[profile.release.package.p3-util]
 overflow-checks = true
 
 [dev-dependencies]

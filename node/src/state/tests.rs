@@ -370,6 +370,11 @@ fn namespaces_and_meta_keys_are_unique() {
         (ns::BEACON_REVEALS, 44..=46),
         (ns::BEACON_VALUES, 44..=46),
         (ns::FEATURES, 47..=47),
+        (ns::GHOST_COMMITMENTS, 48..=55),
+        (ns::GHOST_ROOTS, 48..=55),
+        (ns::GHOST_RETIRED, 48..=55),
+        (ns::GHOST_NULLIFIERS, 48..=55),
+        (ns::GHOST_ADDRESSES, 48..=55),
     ];
     let mut seen = std::collections::BTreeSet::from([ns::META]);
     let st = State::default();
@@ -378,11 +383,11 @@ fn namespaces_and_meta_keys_are_unique() {
     }
     for (n, range) in reserved {
         assert!(range.contains(&n), "namespace {n} is outside its module's range");
-        assert!(!(1..=25).contains(&n) && !(48..=63).contains(&n), "namespace {n} collides with the base state or Ghost Mode");
+        assert!(!(1..=25).contains(&n), "namespace {n} collides with the base state");
         seen.insert(n);
     }
-    assert_eq!(seen.len(), 1 + 18 + 16, "every namespace is distinct");
-    let keys = [meta::BURNED, meta::CHAIN_PARAMS, meta::NEXT_HUNT_ID, meta::PARAMS, meta::POC, meta::SCHEMA, meta::SUPPLY, meta::STAKING, meta::GOVERNANCE, meta::ECON, meta::BEACON, meta::UPGRADE];
+    assert_eq!(seen.len(), 1 + 18 + 16 + 5, "every namespace is distinct");
+    let keys = [meta::BURNED, meta::CHAIN_PARAMS, meta::NEXT_HUNT_ID, meta::PARAMS, meta::POC, meta::SCHEMA, meta::SUPPLY, meta::STAKING, meta::GOVERNANCE, meta::ECON, meta::BEACON, meta::UPGRADE, meta::GHOST];
     assert_eq!(keys.iter().collect::<std::collections::BTreeSet<_>>().len(), keys.len());
     assert!(st.meta_records().iter().all(|(k, _)| keys.contains(k)), "every scalar record uses a declared key");
 }

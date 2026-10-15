@@ -47,7 +47,6 @@ pub type Shared = Arc<Mutex<Chain>>;
 pub type MarshalMailbox = marshal::core::Mailbox<MlDsaScheme, marshal::standard::Standard<CBlock>>;
 
 pub const MAX_BLOCK_TXS: usize = 512;
-pub use crate::types::MAX_TX_BYTES;
 /// A proposal's `exec_height` may trail the verifier's executed height by at most this much
 /// (so a proposer can't dodge the state-root check by citing an ancient height).
 pub const MAX_EXEC_LAG: u64 = 16;
@@ -203,7 +202,8 @@ impl Read for CBlock {
             need(buf, 4)?;
             let len = buf.get_u32() as usize;
             total += len;
-            if len > MAX_TX_BYTES || total > MAX_BLOCK_BYTES {
+            // A tx is bounded by its kind (`Tx::from_bytes`); ghost txs are the largest.
+            if len > crate::types::MAX_GHOST_TX_BYTES || total > MAX_BLOCK_BYTES {
                 return Err(CodecError::Invalid("CBlock", "tx too large"));
             }
             need(buf, len)?;
@@ -267,7 +267,9 @@ pub struct App {
     pub address_prefix: String,
 }
 
-/// Stateless checks every tx must pass: in a proposed block, over HTTP and from gossip.
+/// Stateless checks every tx must pass: in a proposed block, over HTTP and from gossip. A ghost
+/// tx's Action proof is one of them (it needs no state); unsigned ghost txs have no signature,
+/// their proof authorizes them (ghost.rs).
 pub fn check_tx_stateless(tx: &Tx, chain_id: &str, prefix: &str) -> anyhow::Result<()> {
     if tx.chain_id != chain_id {
         anyhow::bail!("wrong chain id");
@@ -275,7 +277,10 @@ pub fn check_tx_stateless(tx: &Tx, chain_id: &str, prefix: &str) -> anyhow::Resu
     tx.check_format()?;
     tx.check_prefix(prefix)?;
     crate::chain::check_fee(tx)?;
-    tx.verify_signature()
+    if !tx.is_unsigned() {
+        tx.verify_signature()?;
+    }
+    crate::ghost::verify_proof(tx)
 }
 
 impl<E> Application<E> for App
@@ -338,7 +343,9 @@ where
         }
         let mut txs = vec![];
         let mut bytes = 0;
-        // Senders whose earlier tx was left out: their later nonces can't apply.
+        let mut ghost = crate::ghost::BlockBudget::new(&c.state.chain_params);
+        // Senders whose earlier tx was left out: their later nonces can't apply. (Unsigned ghost
+        // txs have no sender or nonce: leaving one out holds nothing else back.)
         let mut stuck = std::collections::HashSet::new();
         let c = &mut *c; // borrow the mempool and the state separately
         for tx in crate::chain::proposal_order(&c.mempool) {
@@ -349,8 +356,11 @@ where
                 continue;
             }
             let raw = tx.to_bytes();
-            if raw.len() > MAX_TX_BYTES || bytes + raw.len() > MAX_BLOCK_BYTES {
-                stuck.insert(tx.from.clone());
+            let mut budget = ghost;
+            if raw.len() > tx.max_bytes() || bytes + raw.len() > MAX_BLOCK_BYTES || budget.take(tx, raw.len()).is_err() {
+                if !tx.is_unsigned() {
+                    stuck.insert(tx.from.clone());
+                }
                 continue;
             }
             // Only propose txs that will succeed; a tx that would just burn its fee waits/expires.
@@ -359,10 +369,13 @@ where
                 Ok(crate::chain::Outcome::Applied) => j.absorb_pub(tj),
                 Ok(crate::chain::Outcome::Failed(_)) | Err(_) => {
                     c.state.rollback(tj);
-                    stuck.insert(tx.from.clone());
+                    if !tx.is_unsigned() {
+                        stuck.insert(tx.from.clone());
+                    }
                     continue;
                 }
             }
+            ghost = budget;
             bytes += raw.len();
             txs.push(raw);
         }
@@ -419,15 +432,15 @@ where
         if checkpoint.is_some_and(|cp| block.exec_height != cp) {
             return reject("checkpoint-certifying block must carry the checkpoint's exec_height");
         }
-        let (chain_id, max_validity) = {
+        let (chain_id, max_validity, mut ghost) = {
             let c = self.chain.lock();
             // Our executed height only grows, so this stays true once it is.
             if block.exec_height + MAX_EXEC_LAG < c.height().min(parent.height) {
                 return reject("exec_height too far behind");
             }
-            (c.genesis.chain_id.clone(), c.state.chain_params.max_tx_validity_blocks)
+            (c.genesis.chain_id.clone(), c.state.chain_params.max_tx_validity_blocks, crate::ghost::BlockBudget::new(&c.state.chain_params))
         };
-        // Tx checks (signatures included) run without holding the chain lock.
+        // Tx checks (signatures and ghost proofs included) run without holding the chain lock.
         let mut seen = std::collections::HashSet::new();
         let mut ids = vec![];
         for raw in &block.txs {
@@ -435,6 +448,10 @@ where
             let id = tx.id();
             if !seen.insert(id.clone()) {
                 return reject("duplicate tx");
+            }
+            if let Err(e) = ghost.take(&tx, raw.len()) {
+                warn!(error = %e, "ghost txs over the block's limits");
+                return reject("ghost txs over the size limits");
             }
             if let Err(e) = check_tx_stateless(&tx, &chain_id, &self.address_prefix).and_then(|_| crate::chain::check_validity(&tx, block.height, max_validity)) {
                 warn!(error = %e, "bad tx in block");
@@ -763,7 +780,8 @@ where
             loop {
                 let Ok((from, msg)) = mp_receiver.recv().await else { break };
                 let raw: Vec<u8> = msg.as_ref().to_vec();
-                if raw.len() > MAX_TX_BYTES {
+                // The kind's own bound (`Tx::from_bytes`) applies next; ghost txs are the largest.
+                if raw.len() > crate::types::MAX_GHOST_TX_BYTES {
                     continue;
                 }
                 let Ok(tx) = Tx::from_bytes(&raw) else {
@@ -1024,7 +1042,12 @@ mod tests {
         assert!(CBlock::decode(&bytes[..bytes.len() - 1]).is_err());
         let many = CBlock::new(Digest([1; 32]), 5, 9, 7, 1_000, String::new(), 4, [2; 32], vec![vec![]; MAX_BLOCK_TXS + 1]);
         assert!(CBlock::decode(many.encode().as_ref()).is_err());
-        let big = CBlock::new(Digest([1; 32]), 5, 9, 7, 1_000, String::new(), 4, [2; 32], vec![vec![0; MAX_TX_BYTES + 1]]);
+        // A tx up to the ghost bound decodes (its kind's own bound applies when it's parsed);
+        // past it, the block doesn't.
+        let ghost_sized = CBlock::new(Digest([1; 32]), 5, 9, 7, 1_000, String::new(), 4, [2; 32], vec![vec![0; crate::types::MAX_GHOST_TX_BYTES]]);
+        assert!(CBlock::decode(ghost_sized.encode().as_ref()).is_ok());
+        assert_eq!(ghost_sized.parse_txs(), vec![None]);
+        let big = CBlock::new(Digest([1; 32]), 5, 9, 7, 1_000, String::new(), 4, [2; 32], vec![vec![0; crate::types::MAX_GHOST_TX_BYTES + 1]]);
         assert!(CBlock::decode(big.encode().as_ref()).is_err());
         // Txs that aren't canonical wire bytes don't parse.
         assert_eq!(b.parse_txs(), vec![None, None]);
