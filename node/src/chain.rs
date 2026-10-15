@@ -4007,7 +4007,7 @@ mod scaffold {
         // Modules that haven't landed refuse their txs; a block carrying one charges its fee.
         let delegate = signed(&c, &owner, Action::Delegate { validator: v.clone(), amount: FANG });
         assert_eq!(c.submit(delegate.clone()).unwrap_err().to_string(), "not active yet");
-        for action in [Action::Propose { kind: ProposalKind::Text {}, deposit: FANG, title: "t".into(), url: String::new() }, Action::BeaconCommit { epoch: 1, commitment: "ab".repeat(32) }, Action::RenewName { name: "abc".into(), years: 1 }] {
+        for action in [Action::Propose { kind: ProposalKind::Text {}, deposit: FANG, title: "t".into(), url: String::new() }, Action::RenewName { name: "abc".into(), years: 1 }] {
             assert_eq!(c.submit(signed(&c, &owner, action)).unwrap_err().to_string(), "not active yet");
         }
         let before = c.state.account(&owner.address()).balance;

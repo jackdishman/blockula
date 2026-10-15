@@ -151,6 +151,17 @@ impl Sim {
         self.block(txs);
     }
 
+    /// Runs empty blocks until a Séance opens (they open on epoch boundaries, on a cadence).
+    fn wait_for_seance(&mut self) -> Option<u64> {
+        for _ in 0..100 {
+            if self.c.state.poc.open_seance.is_some() {
+                break;
+            }
+            self.block(vec![]);
+        }
+        self.c.state.poc.open_seance
+    }
+
     /// If a Séance is open, every seated juror seals and then reveals, and it runs to its close.
     fn drive_seance(&mut self) {
         let Some(sid) = self.c.state.poc.open_seance else { return };
@@ -238,7 +249,7 @@ fn scripted_run_through_a_seance() {
     s.run(&[(18, 0, 0, 1), (18, 0, 0, 1), (18, 0, 0, 1)]);
     let failed: Vec<String> = (1..=s.c.height()).flat_map(|h| s.c.block(h).unwrap().failed.into_values()).collect();
     assert!(failed.is_empty(), "{failed:?}");
-    let sid = s.c.state.poc.open_seance.expect("3 verified claims and 6 jurors open a Séance");
+    let sid = s.wait_for_seance().expect("3 verified claims and 6 jurors open a Séance at the next opening");
     s.drive_seance();
     let r = s.c.state.poc.seances[&sid].results.clone().unwrap();
     assert!(r.accepted > 0 && r.no_shows == 0, "the Séance judged the claims: {r:?}");
@@ -389,8 +400,9 @@ fn namespaces_and_meta_keys_are_unique() {
 
 /// Format change detectors: a record's bytes and a fixed state's root. The root was also
 /// computed by an independent JS implementation of the record layout and tree (noble BLAKE3),
-/// recomputed when `Params` gained `address_prefix` (P-WIRE) and again for the protocol v1
-/// scaffold (schema 2: `chain_params`, the upgrade schedule, account locks).
+/// recomputed when `Params` gained `address_prefix` (P-WIRE), for the protocol v1 scaffold
+/// (schema 2: `chain_params`, the upgrade schedule, account locks) and for the beacon (schema 3:
+/// the PoC scalars without the block-hash seed).
 #[test]
 fn golden_encodings() {
     let acct = Account { balance: 5, nonce: 2, keys: Default::default(), locks: vec![] };
@@ -401,7 +413,7 @@ fn golden_encodings() {
     st.commit_block().unwrap();
     assert_eq!(st.root_hash(), st.full_root());
     assert_eq!(st.record_count(), 9);
-    assert_eq!(st.root(), "05ab46b414a130e4f2e2c742ed46320a0e469af8ac0a8d0d7aa9493772c22517");
+    assert_eq!(st.root(), "7d6ceaa88b90815fb334c8117b391a05e9276b495d33513f327116d8516a2bbf");
 }
 
 fn million_accounts() -> State {
@@ -499,3 +511,4 @@ fn bench_million_accounts() {
     println!("snapshot decode + tree rebuild: {:?}", t.elapsed());
     assert_eq!(back.root_hash(), st.root_hash());
 }
+

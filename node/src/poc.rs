@@ -1478,7 +1478,7 @@ mod scenarios {
 
     fn setup(tag: &str) -> T {
         let home = std::env::temp_dir().join(format!("blockula-poc-{tag}-{}-{}", now_ms(), std::process::id()));
-        Chain::summon(&home, &SummonOpts { contribution: Some(times()), ..SummonOpts::new("poc", 1) }).unwrap();
+        Chain::summon(&home, &SummonOpts { contribution: Some(times()), epoch_blocks: 10, ..SummonOpts::new("poc", 1) }).unwrap();
         let seed: [u8; 32] = hex::decode(std::fs::read_to_string(home.join("validator.key")).unwrap().trim()).unwrap().try_into().unwrap();
         let mut c = Chain::open(&home).unwrap();
         for i in 1..=12u8 {
@@ -1544,6 +1544,16 @@ mod scenarios {
                 self.c.submit(tx.sign(&self.admin)).unwrap();
             }
             self.c.produce_block().unwrap();
+        }
+        /// Runs empty blocks until a Séance opens (at most a few cadences).
+        fn wait_for_seance(&mut self) -> u64 {
+            for _ in 0..200 {
+                if let Some(id) = self.c.state.poc.open_seance {
+                    return id;
+                }
+                self.blocks(1);
+            }
+            panic!("no Séance opened by block {}", self.h());
         }
         fn reopen_same_root(self) {
             let root = self.c.state.root();
@@ -1699,13 +1709,8 @@ mod scenarios {
         t.attest_all(&[big, tiny, ok]);
         assert!(t.c.state.poc.claims.values().all(|c| c.status != ClaimStatus::Pending));
         conserved(&t.c.state);
-        for _ in 0..10 {
-            if t.c.state.poc.open_seance.is_some() {
-                break;
-            }
-            t.blocks(1);
-        }
-        let sid = t.c.state.poc.open_seance.expect("a Séance opens once there are claims and jurors");
+        let sid = t.wait_for_seance();
+        assert_eq!(t.h(), t.c.state.next_seance_height(t.h()), "Séances open on the cadence");
         let s = t.c.state.poc.seances[&sid].clone();
         assert_eq!(s.claims, vec![big, tiny, ok]);
         assert_eq!(s.jurors.len(), 5);
@@ -1841,7 +1846,7 @@ mod scenarios {
         t.tx(&vet, Action::FundPool { amount: 50 * DROPS_PER_FANG }).unwrap();
         let c2 = t.claim(&other, 3).unwrap();
         t.attest(c2, true).unwrap();
-        let sid = t.c.state.poc.open_seance.expect("2 claims + 3 jurors open a Séance");
+        let sid = t.wait_for_seance();
         let s = t.c.state.poc.seances[&sid].clone();
         let mut sealed = vec![];
         for jk in [&j1, &j2] {
