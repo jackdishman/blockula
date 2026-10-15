@@ -160,7 +160,7 @@ function PoolRow({ d, unbondingFor, run }: { d: StakeDelegation; unbondingFor: s
   return (
     <div className="pool-row" data-testid="pool">
       <span>
-        <b>{label(d)}</b> <span className="dim small">{d.shares} shares{d.commission_bps !== undefined ? ` · ${pct(d.commission_bps)} commission` : ""}{d.jailed ? " · jailed" : ""}</span>
+        <b>{label(d)}</b> <span className="dim small">{BigInt(d.shares).toLocaleString("en-US")} shares{d.commission_bps !== undefined ? ` · ${pct(d.commission_bps)} commission` : ""}{d.jailed ? " · jailed" : ""}</span>
       </span>
       <span className="row-gap">
         <span>{formatFang(BigInt(d.value))}</span>

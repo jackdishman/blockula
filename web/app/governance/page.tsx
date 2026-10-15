@@ -152,9 +152,13 @@ function ProposalCard({ p, lockPeriod, run, canVote = false }: { p: ProposalSumm
       <p>{p.summary}</p>
       <Tally p={p} />
       <div className="dim small">
-        {p.proposer && <>by {p.proposer_name ?? shortAddr(p.proposer)} · </>}
-        {p.voting_ends_at !== undefined && (p.voting_ends_at >= height ? `voting ends at block #${p.voting_ends_at} (in about ${blocksToHuman(p.voting_ends_at - height, bt)})` : `voting ended at block #${p.voting_ends_at}`)}
-        {p.executes_at !== undefined && ` · executes at block #${p.executes_at}`}
+        {[
+          p.proposer && `by ${p.proposer_name ?? shortAddr(p.proposer)}`,
+          p.voting_ends_at !== undefined && (p.voting_ends_at >= height ? `voting ends at block #${p.voting_ends_at} (in about ${blocksToHuman(p.voting_ends_at - height, bt)})` : `voting ended at block #${p.voting_ends_at}`),
+          p.executes_at !== undefined && `executes at block #${p.executes_at}`,
+        ]
+          .filter(Boolean)
+          .join(" · ")}
       </div>
       <div className="row-gap small">
         {url && <a href={url} target="_blank" rel="noreferrer nofollow">Full text ↗</a>}
