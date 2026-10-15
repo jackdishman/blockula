@@ -336,12 +336,14 @@ pub fn check_chunk(v: &Verified, i: usize, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Rebuilds the state (and its tree) from verified chunks and checks it against the certified
+/// Rebuilds the state (and its tree) from verified chunks held in memory (tests; a joiner streams
+/// them through a file, [`restore_file`]) and checks it against the certified
 /// root. The state carries its own parameters, so `_g` isn't needed (the manifest was checked
 /// against it already). Memory before the root check is bounded: the chunks (at most
 /// `MAX_SNAPSHOT_CHUNKS`) are decompressed as a stream, never into one buffer, each record is
 /// capped (`state::MAX_KEY_BYTES`, `state::MAX_VALUE_BYTES`) and so is the total
 /// (`MAX_STATE_BYTES`); what remains is the state being rebuilt.
+#[cfg(test)]
 pub fn restore(_g: &Genesis, v: &Verified, chunks: &[Vec<u8>]) -> Result<State> {
     if chunks.len() != v.chunks.len() {
         bail!("expected {} chunks", v.chunks.len());
@@ -367,6 +369,7 @@ pub fn restore_file(v: &Verified, packed: &Path) -> Result<State> {
 }
 
 /// Decompresses (up to `MAX_STATE_BYTES`) and decodes a packed snapshot.
+#[cfg(test)]
 pub fn decode_state(packed: &[u8]) -> Result<State> {
     decode_state_from(packed)
 }
@@ -422,12 +425,14 @@ fn decode_state_from(packed: impl Read) -> Result<State> {
 }
 
 /// Reads a list of chunks as one stream, without concatenating them.
+#[cfg(test)]
 struct Chunks<'a> {
     chunks: &'a [Vec<u8>],
     at: usize,
     off: usize,
 }
 
+#[cfg(test)]
 impl Read for Chunks<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         while let Some(c) = self.chunks.get(self.at) {

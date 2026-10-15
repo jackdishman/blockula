@@ -13,7 +13,7 @@
 
 use crate::chain::{Base, Genesis, HuntStatus, Role, State};
 use crate::epochs::EpochRegistry;
-use crate::store::{hash32, ix, BlockMeta, SegReader, Snap, Store};
+use crate::store::{hash32, ix, BlockMeta, SegReader, Snap};
 use crate::types::{Block, Tx, NAME_SUFFIX};
 use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
@@ -31,7 +31,6 @@ pub const RECENT_CERTS: usize = 1_024;
 /// The on-disk side of reads: the store and the block logs, plus bounded caches.
 pub struct Disk {
     pub home: PathBuf,
-    pub store: Arc<Store>,
     pub blocks: Arc<SegReader>,
     pub cblocks: Arc<SegReader>,
     certs: RwLock<BTreeMap<u64, Arc<Vec<u8>>>>,
@@ -46,8 +45,8 @@ struct BlockCache {
 }
 
 impl Disk {
-    pub fn new(home: PathBuf, store: Arc<Store>, blocks: Arc<SegReader>, cblocks: Arc<SegReader>) -> Self {
-        Self { home, store, blocks, cblocks, certs: Default::default(), cache: Default::default() }
+    pub fn new(home: PathBuf, blocks: Arc<SegReader>, cblocks: Arc<SegReader>) -> Self {
+        Self { home, blocks, cblocks, certs: Default::default(), cache: Default::default() }
     }
 
     pub fn cached_block(&self, height: u64) -> Option<Arc<Block>> {
@@ -66,11 +65,6 @@ impl Disk {
             c.map.remove(&h);
             c.bytes -= b;
         }
-    }
-
-    /// Forgets cached blocks above `height` (a rebuild replaces them).
-    pub fn clear_cache(&self) {
-        *self.cache.lock() = BlockCache::default();
     }
 
     /// The executed block at `meta`'s position, from the cache or the log.
@@ -181,8 +175,6 @@ pub struct ReadView {
     pub genesis_hash: String,
     pub genesis_root: String,
     pub role: Role,
-    /// This node's own account (validators).
-    pub me: Option<String>,
     pub base: Option<Base>,
     /// Heights below this were pruned from this node.
     pub pruned_below: u64,
@@ -232,12 +224,8 @@ fn status_name(s: crate::poc::ClaimStatus) -> String {
 
 impl ReadView {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(state: State, height: u64, last_hash: String, genesis: Arc<Genesis>, genesis_hash: String, genesis_root: String, role: Role, me: Option<String>, base: Option<Base>, pruned_below: u64, keep_blocks: Option<u64>, head: Option<Arc<Block>>, snap: Arc<Snap>, disk: Arc<Disk>) -> Self {
-        Self { state, height, last_hash, genesis, genesis_hash, genesis_root, role, me, base, pruned_below, keep_blocks, head, snap, disk, memo: Memo::default() }
-    }
-
-    pub fn height(&self) -> u64 {
-        self.height
+    pub fn new(state: State, height: u64, last_hash: String, genesis: Arc<Genesis>, genesis_hash: String, genesis_root: String, role: Role, base: Option<Base>, pruned_below: u64, keep_blocks: Option<u64>, head: Option<Arc<Block>>, snap: Arc<Snap>, disk: Arc<Disk>) -> Self {
+        Self { state, height, last_hash, genesis, genesis_hash, genesis_root, role, base, pruned_below, keep_blocks, head, snap, disk, memo: Memo::default() }
     }
 
     pub fn base_height(&self) -> u64 {

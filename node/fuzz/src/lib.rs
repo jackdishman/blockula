@@ -23,8 +23,10 @@ mod node_src {
     pub mod pq;
     pub mod snapshot;
     pub mod state;
+    pub mod store;
     pub mod types;
     pub mod validator_cli;
+    pub mod view;
 }
 pub use node_src::*;
 

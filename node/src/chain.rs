@@ -529,7 +529,9 @@ impl State {
         self.names.get(&n).map(|r| r.owner.clone()).ok_or_else(|| anyhow!("no one has claimed {n}{NAME_SUFFIX} yet"))
     }
 
-    /// First name an address registered — shown everywhere instead of the raw address.
+    /// First name an address registered — shown everywhere instead of the raw address. A scan of
+    /// every name: the API looks names up in the store's owner index instead (`ReadView`).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn primary_name(&self, addr: &str) -> Option<String> {
         self.names.values().filter(|r| r.owner == addr).min_by_key(|r| r.registered_at).map(|r| format!("{}{NAME_SUFFIX}", r.name))
     }
@@ -1022,6 +1024,8 @@ impl State {
         hex::encode(self.tree.root())
     }
 
+    /// The summary with names from a scan (the fuzz harness; the API uses `describe_with`).
+    #[allow(dead_code)]
     pub fn describe(&self, tx: &Tx, height: Option<u64>) -> String {
         self.describe_with(tx, height, &|a| self.primary_name(a))
     }
@@ -1458,15 +1462,14 @@ impl Chain {
             }
         };
         let Start { state, point, snap, epochs, rebuilt_epochs } = start;
-        let disk = Arc::new(Disk::new(home.to_path_buf(), store.clone(), blocks.reader(), cblocks.reader()));
+        let disk = Arc::new(Disk::new(home.to_path_buf(), blocks.reader(), cblocks.reader()));
         let genesis_arc = Arc::new(genesis.clone());
         let (height, last_hash) = (point.height, point.block_hash.clone());
         let head = match snap.block_meta(height)? {
             Some(m) => disk.load_block(height, &m),
             None => None,
         };
-        let me = keys.as_ref().map(|k| k.address_with(state.params.prefix()));
-        let view = ReadView::new(state.clone(), height, last_hash.clone(), genesis_arc.clone(), genesis_hash.clone(), genesis_root.clone(), role, me, base.clone(), point.pruned_below, None, head.clone(), snap.clone(), disk.clone());
+        let view = ReadView::new(state.clone(), height, last_hash.clone(), genesis_arc.clone(), genesis_hash.clone(), genesis_root.clone(), role, base.clone(), point.pruned_below, None, head.clone(), snap.clone(), disk.clone());
         let live = Arc::new(Live::new(view, epochs.clone(), disk.clone()));
         let mut chain = Chain {
             home: home.into(),
@@ -1609,6 +1612,7 @@ impl Chain {
         self.publish();
     }
 
+    #[cfg(test)]
     pub fn keep_blocks(&self) -> Option<u64> {
         self.keep_blocks
     }
@@ -1640,6 +1644,7 @@ impl Chain {
     }
 
     /// Height of the snapshot this node fast-synced from (0 = full history).
+    #[cfg(test)]
     pub fn base_height(&self) -> u64 {
         self.base.as_ref().map(|b| b.height).unwrap_or(0)
     }
@@ -1652,7 +1657,10 @@ impl Chain {
         self.head.as_deref()
     }
 
+    // Tests read through the chain; the API reads the published view directly.
+
     /// Executed block at `height`, if this node holds it.
+    #[cfg(test)]
     pub fn block(&self, height: u64) -> Option<Block> {
         self.view().block(height).map(|b| (*b).clone())
     }
@@ -1669,6 +1677,7 @@ impl Chain {
     }
 
     /// Exact consensus block bytes at `height`.
+    #[cfg(test)]
     pub fn cblock(&self, height: u64) -> Option<Vec<u8>> {
         self.view().cblock(height)
     }
@@ -1678,6 +1687,7 @@ impl Chain {
         self.view().cert(height)
     }
 
+    #[cfg(test)]
     pub fn cert_len(&self, height: u64) -> usize {
         self.view().cert_len(height)
     }
@@ -1693,7 +1703,8 @@ impl Chain {
     }
 
     /// Keeps a certificate that arrived after its block: in memory for recent heights, on disk at
-    /// checkpoints and epoch ends.
+    /// checkpoints and epoch ends. (Execution stores the certificates consensus hands it.)
+    #[cfg(test)]
     pub fn store_cert(&mut self, height: u64, cert: Vec<u8>) -> Result<()> {
         let boundary = self.state.params.is_boundary(height);
         if (height % CERT_CHECKPOINT == 0 && height >= self.point.pruned_below) || boundary {
@@ -1820,6 +1831,7 @@ impl Chain {
     }
 
     /// Why a tx failed or was dropped, if we remember.
+    #[cfg(test)]
     pub fn failure(&self, id: &str) -> Option<&(String, u64)> {
         self.mp.failure(id)
     }
@@ -1914,7 +1926,7 @@ impl Chain {
 
     /// Publishes the current state, head and mempool to readers.
     fn publish(&mut self) {
-        let view = ReadView::new(self.state.clone(), self.height, self.last_hash.clone(), self.genesis_arc.clone(), self.genesis_hash.clone(), self.genesis_root.clone(), self.role, self.me(), self.base.clone(), self.point.pruned_below, self.keep_blocks, self.head.clone(), self.snap.clone(), self.disk.clone());
+        let view = ReadView::new(self.state.clone(), self.height, self.last_hash.clone(), self.genesis_arc.clone(), self.genesis_hash.clone(), self.genesis_root.clone(), self.role, self.base.clone(), self.point.pruned_below, self.keep_blocks, self.head.clone(), self.snap.clone(), self.disk.clone());
         self.live.publish(view);
         self.publish_mempool();
     }
@@ -2197,6 +2209,7 @@ impl Chain {
         self.pending.get(addr).map(|p| p.0).unwrap_or(0)
     }
 
+    #[cfg(test)]
     pub fn in_mempool(&self, id: &str) -> bool {
         self.pool.contains_key(id)
     }

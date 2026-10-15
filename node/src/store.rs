@@ -268,7 +268,6 @@ fn storage(e: impl std::fmt::Display) -> anyhow::Error {
 /// The redb database of a home.
 pub struct Store {
     db: Database,
-    pub path: PathBuf,
 }
 
 impl Store {
@@ -279,7 +278,7 @@ impl Store {
         tx.set_quick_repair(true);
         Self::create_tables(&tx)?;
         tx.commit().map_err(storage)?;
-        Ok(Arc::new(Store { db, path: path.to_path_buf() }))
+        Ok(Arc::new(Store { db }))
     }
 
     fn create_tables(tx: &redb::WriteTransaction) -> Result<()> {
@@ -308,7 +307,6 @@ impl Store {
     pub fn snapshot(self: &Arc<Self>) -> Result<Snap> {
         let txn = self.db.begin_read().map_err(storage)?;
         Ok(Snap {
-            records: txn.open_table(RECORDS).map_err(storage)?,
             nodes: txn.open_table(NODES).map_err(storage)?,
             blocks: txn.open_table(BLOCKS).map_err(storage)?,
             hashes: txn.open_table(HASHES).map_err(storage)?,
@@ -476,6 +474,7 @@ impl Store {
     }
 
     /// Stores a certificate outside a block commit (one that arrived after its block).
+    #[cfg(test)]
     pub fn put_cert(&self, height: u64, cert: &[u8]) -> Result<()> {
         let tx = self.begin(true)?;
         tx.open_table(CERTS).map_err(storage)?.insert(height, cert).map_err(storage)?;
@@ -487,7 +486,6 @@ impl Store {
 /// store, and what API reads use, so both see exactly the committed block. It keeps the
 /// database open while it lives.
 pub struct Snap {
-    records: ReadOnlyTable<&'static [u8], &'static [u8]>,
     nodes: ReadOnlyTable<&'static [u8], &'static [u8]>,
     blocks: ReadOnlyTable<u64, &'static [u8]>,
     hashes: ReadOnlyTable<&'static [u8], u64>,
@@ -517,11 +515,6 @@ fn be_pair(v: &[u8]) -> Result<(u64, usize)> {
 }
 
 impl Snap {
-    /// A record's committed bytes.
-    pub fn record(&self, namespace: u8, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(self.records.get(record_key(namespace, key).as_slice()).map_err(storage)?.map(|v| v.value().to_vec()))
-    }
-
     pub fn block_meta(&self, height: u64) -> Result<Option<BlockMeta>> {
         self.blocks.get(height).map_err(storage)?.map(|v| decode(v.value())).transpose()
     }
