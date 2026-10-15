@@ -52,6 +52,7 @@ pub fn now_ms() -> u64 {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Allocation {
     pub address: String,
     #[serde(with = "u64_str")]
@@ -3318,6 +3319,313 @@ mod v1 {
         }
         let order: Vec<String> = proposal_order(&c.mempool).iter().map(|t| t.id()).collect();
         assert_eq!(order, [&b, &d, &e, &a0, &a1].map(|t| t.id()));
+        fs::remove_dir_all(home).ok();
+    }
+}
+
+/// The protocol v1 scaffold: genesis fields and parameters, the levers governance will call,
+/// dispatch of the new tags to their modules, and the end-of-block steps.
+#[cfg(test)]
+mod scaffold {
+    use super::*;
+    use crate::poc::SOUL;
+    use crate::state::ns;
+
+    const FANG: u64 = DROPS_PER_FANG;
+    const VALIDATOR: [u8; 32] = [21; 32];
+    const P2P: &str = "127.0.0.1:7001";
+    const HTTP: &str = "127.0.0.1:7000";
+
+    fn keys(seed: u8) -> Keys {
+        Keys::from_seed([seed; 32])
+    }
+
+    /// A protocol v1 genesis: one validator owned by an operator, a vesting founder, the
+    /// community bucket, reserved names, a Soul ledger, parameter overrides and Ghost Mode on.
+    fn genesis(chain_id: &str) -> Genesis {
+        let (v, owner, founder) = (Keys::from_seed(VALIDATOR), keys(22), keys(23));
+        let alloc = |address: String, amount: u64, vesting: Option<Vesting>, label: Option<&str>| Allocation { address, amount, vesting, label: label.map(String::from) };
+        Genesis {
+            chain_id: chain_id.into(),
+            token: "FANG".into(),
+            decimals: DECIMALS,
+            block_time_ms: 1000,
+            validators: vec![ValidatorInfo { address: v.address(), public_key: hex::encode(v.public_key()), p2p_addr: P2P.into(), http_addr: HTTP.into() }],
+            faucet: false,
+            created_at_ms: 1_750_000_000_000,
+            allocations: vec![
+                alloc(owner.address(), 20_000 * FANG, None, Some("genesis operator")),
+                alloc(founder.address(), 1_000_000 * FANG, Some(Vesting { start: 0, cliff: 100, end: 1_000 }), Some("founder")),
+                alloc(community("boo"), 5_000_000 * FANG, None, Some("community")),
+                alloc(treasury("boo"), 2_000_000 * FANG, Some(Vesting { start: 0, cliff: 0, end: 4_000 }), Some("treasury")),
+            ],
+            epoch_blocks: 600,
+            validator_admins: vec![],
+            contribution: None,
+            address_prefix: "boo".into(),
+            param_overrides: BTreeMap::from([("max_validators".into(), 40), ("proposal_deposit".into(), 50 * FANG)]),
+            operators: vec![Operator {
+                owner: owner.address(),
+                consensus_key: hex::encode(v.public_key()),
+                pop: make_pop(VALIDATOR, chain_id, &owner.address(), P2P, HTTP),
+                p2p_addr: P2P.into(),
+                http_addr: HTTP.into(),
+                self_bond: 10_000 * FANG,
+                commission_bps: 500,
+                provider: Some("OVHcloud".into()),
+                asn: Some(16_276),
+                country: Some("FR".into()),
+                entity: Some("Owner SAS".into()),
+            }],
+            reserved_names: vec!["blockula".into(), "foundation".into()],
+            soul_ledger: vec![SoulEntry { account: owner.address(), soul: 50 * SOUL, reason: "testnet contributor".into() }],
+            features: vec!["ghost".into()],
+        }
+    }
+
+    /// A home on `g`, opened as its validator.
+    fn open(tag: &str, g: &Genesis) -> (PathBuf, Chain) {
+        let home = std::env::temp_dir().join(format!("blockula-scaffold-{tag}-{}-{}", now_ms(), std::process::id()));
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("genesis.json"), serde_json::to_string_pretty(g).unwrap()).unwrap();
+        write_secret(&home.join("validator.key"), &hex::encode(VALIDATOR)).unwrap();
+        let c = Chain::open(&home).unwrap();
+        (home, c)
+    }
+
+    fn signed(c: &Chain, k: &Keys, action: Action) -> Tx {
+        let from = k.address_with(c.state.params.prefix());
+        let mut tx = Tx { chain_id: c.genesis.chain_id.clone(), nonce: c.next_nonce(&from), from, fee: 0, tip: 0, valid_until: c.height() + 100, action, memo: String::new(), public_key: hex::encode(k.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+        tx.fee = min_fee(tx.size());
+        tx.sign(k)
+    }
+
+    #[test]
+    fn genesis_fields_become_state_records() {
+        let g = genesis("scaffold-1");
+        g.check().unwrap();
+        let (home, c) = open("records", &g);
+        let s = &c.state;
+        let (v, owner, founder) = (Keys::from_seed(VALIDATOR).address(), keys(22).address(), keys(23).address());
+        // Parameters: the overrides, and defaults for the rest.
+        assert_eq!((s.chain_params.max_validators, s.chain_params.proposal_deposit), (40, 50 * FANG));
+        assert_eq!(s.chain_params.unbonding_blocks, 21 * 86_400);
+        assert!(s.record(ns::META, crate::state::meta::CHAIN_PARAMS).is_some());
+        // The operator owns its validator; the self-bond left its balance for the bond (escrow).
+        let rec = &s.validators[&v];
+        assert_eq!((rec.owner.as_str(), rec.bond, rec.commission_bps, rec.status), (owner.as_str(), 10_000 * FANG, 500, ValidatorStatus::Active));
+        assert_eq!(s.account(&owner).balance, 10_000 * FANG);
+        // Vesting allocations are locks on the account, released linearly after the cliff.
+        let locks = s.account(&founder).locks;
+        assert_eq!(locks, vec![Lock { id: 0, amount: LockAmount::Vesting { total: 1_000_000 * FANG, start: 0, cliff: 100, end: 1_000 }, reason: "founder".into() }]);
+        let f = s.account(&founder);
+        assert_eq!((f.locked_at(0), f.locked_at(99), f.locked_at(100), f.locked_at(550), f.locked_at(1_000)), (1_000_000 * FANG, 1_000_000 * FANG, 900_000 * FANG, 450_000 * FANG, 0));
+        assert_eq!(s.account(&s.treasury()).locked_at(1_000), 1_500_000 * FANG);
+        assert_eq!(system_account("boo", &community("boo")), Some("community"));
+        assert_eq!(system_account("boo", &owner), None);
+        // Reserved names, the Soul ledger and features are records too.
+        assert!(s.econ.reserved_names.contains_key("blockula") && s.record(ns::RESERVED_NAMES, b"foundation").is_some());
+        assert_eq!(s.soul_of(&owner, 0), 50 * SOUL);
+        assert!(crate::upgrade::is_active(s, "ghost") && s.record(ns::FEATURES, b"ghost").is_some());
+        s.check_invariants().unwrap();
+        assert_eq!(s.supply, 8_020_000 * FANG);
+        // The same genesis through its JSON gives the same state.
+        assert_eq!(Genesis::load(&home.join("genesis.json")).unwrap().initial_state().root(), c.genesis_root);
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn genesis_is_validated() {
+        let dir = std::env::temp_dir().join(format!("blockula-scaffold-check-{}-{}", now_ms(), std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("genesis.json");
+        let load = |v: &serde_json::Value| {
+            fs::write(&path, serde_json::to_vec(v).unwrap()).unwrap();
+            Genesis::load(&path).map(|_| ()).map_err(|e| format!("{e:#}"))
+        };
+        let good = serde_json::to_value(genesis("scaffold-1")).unwrap();
+        load(&good).unwrap();
+        let refused = |edit: &dyn Fn(&mut serde_json::Value), why: &str| {
+            let mut v = good.clone();
+            edit(&mut v);
+            let err = load(&v).expect_err(why);
+            assert!(err.contains(why), "expected “{why}”, got: {err}");
+        };
+        // Parameters: values as strings or numbers, within bounds, known keys only.
+        let mut v = good.clone();
+        v["params"]["quorum_floor"] = serde_json::json!("30000000000000000");
+        v["params"]["downtime_window"] = serde_json::json!(200);
+        load(&v).unwrap();
+        refused(&|v| v["params"]["max_validators"] = 0.into(), "`max_validators` must be 1–1000");
+        refused(&|v| v["params"]["issuance_floor_ppm"] = 4_999.into(), "issuance_floor_ppm");
+        refused(&|v| v["params"]["issuance_stakers_bps"] = 4_000.into(), "issuance_stakers_bps");
+        refused(&|v| v["params"]["max_block_bytes"] = (8u64 << 20).into(), "max_block_bytes");
+        refused(&|v| v["params"]["warp_speed"] = 1.into(), "unknown parameter `warp_speed`");
+        refused(&|v| v["min_bond"] = "1".into(), "moved to `params.min_self_bond`");
+        // Allocations and vesting.
+        refused(&|v| v["allocations"][1]["vesting"]["cliff"] = 2_000.into(), "start ≤ cliff ≤ end");
+        refused(&|v| v["allocations"][1]["vesting"]["extra"] = 1.into(), "unknown field");
+        refused(&|v| v["allocations"][0]["vestng"] = serde_json::json!({}), "unknown field");
+        refused(
+            &|v| {
+                let mut twice = v["allocations"][1].clone();
+                twice["amount"] = "1".into();
+                v["allocations"].as_array_mut().unwrap().push(twice);
+            },
+            "more than one vesting allocation",
+        );
+        // Operators: their validator, a proof of possession, a self-bond they can pay.
+        refused(&|v| v["operators"][0]["pop"] = "00".repeat(crypto::SIGNATURE_LEN).into(), "pop");
+        refused(&|v| v["operators"][0]["self_bond"] = "1".into(), "below min_self_bond");
+        refused(&|v| v["operators"][0]["self_bond"] = (30_000 * FANG).to_string().into(), "allocations hold");
+        refused(&|v| v["operators"][0]["commission_bps"] = 10_001.into(), "commission_max_bps");
+        refused(&|v| v["operators"][0]["consensus_key"] = hex::encode(keys(99).public_key()).into(), "isn't one of the genesis validators");
+        refused(&|v| v["operators"][0]["country"] = "France".into(), "ISO 3166-1");
+        refused(&|v| v["operators"][0]["owner"] = treasury("boo").into(), "can't own a validator");
+        // Reserved names, the Soul ledger and features.
+        refused(&|v| v["reserved_names"][0] = "blockula.boo".into(), "bare lowercase name");
+        refused(&|v| v["reserved_names"][1] = "blockula".into(), "listed twice");
+        refused(&|v| v["soul_ledger"][0]["soul"] = 0.into(), "milli-Soul");
+        refused(&|v| v["soul_ledger"][0]["account"] = community("boo").into(), "system account");
+        refused(&|v| v["features"][0] = "warp".into(), "unknown feature warp");
+        // Mainnet: no admin keys, no faucet, an operator for every validator.
+        let mut main = serde_json::to_value(genesis(MAINNET_CHAIN_ID)).unwrap();
+        load(&main).unwrap();
+        main["validator_admins"] = serde_json::json!([keys(22).address()]);
+        assert!(load(&main).unwrap_err().contains("no admin keys"));
+        let mut main = serde_json::to_value(genesis(MAINNET_CHAIN_ID)).unwrap();
+        main["faucet"] = true.into();
+        assert!(load(&main).unwrap_err().contains("no faucet"));
+        let mut main = serde_json::to_value(genesis(MAINNET_CHAIN_ID)).unwrap();
+        main["operators"] = serde_json::json!([]);
+        assert!(load(&main).unwrap_err().contains("needs an operator"));
+        // Other chains may keep admins (dev and test).
+        let mut test = good.clone();
+        test["validator_admins"] = serde_json::json!([keys(22).address()]);
+        load(&test).unwrap();
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn new_tags_dispatch_to_their_modules() {
+        let (home, mut c) = open("dispatch", &genesis("scaffold-1"));
+        let (owner, bob) = (keys(22), keys(24));
+        let v = Keys::from_seed(VALIDATOR).address();
+        // Modules that haven't landed refuse their txs; a block carrying one charges its fee.
+        let delegate = signed(&c, &owner, Action::Delegate { validator: v.clone(), amount: FANG });
+        assert_eq!(c.submit(delegate.clone()).unwrap_err().to_string(), "not active yet");
+        for action in [Action::Propose { kind: ProposalKind::Text {}, deposit: FANG, title: "t".into(), url: String::new() }, Action::BeaconCommit { epoch: 1, commitment: "ab".repeat(32) }, Action::RenewName { name: "abc".into(), years: 1 }] {
+            assert_eq!(c.submit(signed(&c, &owner, action)).unwrap_err().to_string(), "not active yet");
+        }
+        let before = c.state.account(&owner.address()).balance;
+        c.produce_block_with(vec![delegate.clone()]).unwrap();
+        assert_eq!(c.failure(&delegate.id()).unwrap().0, "not active yet");
+        assert_eq!(c.state.account(&owner.address()).balance, before - delegate.charge().unwrap());
+        // Reserved names can't be registered; names transfer and release.
+        assert!(c.submit(signed(&c, &owner, Action::RegisterName { name: "blockula".into() })).unwrap_err().to_string().contains("reserved"));
+        c.submit(signed(&c, &owner, Action::RegisterName { name: "owner".into() })).unwrap();
+        c.produce_block().unwrap();
+        let give = signed(&c, &owner, Action::TransferName { name: "owner.boo".into(), to: bob.address() });
+        assert_eq!(c.state.describe(&give, None), format!("owner.boo gave owner.boo to {}", short(&bob.address())));
+        c.submit(give).unwrap();
+        c.produce_block().unwrap();
+        assert_eq!(c.state.resolve("owner.boo").unwrap(), bob.address());
+        // Bob holds nothing yet: his release can't even pay its fee.
+        assert!(c.submit(signed(&c, &bob, Action::ReleaseName { name: "owner".into() })).unwrap_err().to_string().contains("insufficient balance"));
+        assert!(c.submit(signed(&c, &owner, Action::ReleaseName { name: "owner".into() })).unwrap_err().to_string().contains("belongs to"));
+        // Without admins, the admin levers are closed.
+        for action in [Action::SetRepo { repo: "a/b".into(), weight: 1 }, Action::GrantSoul { to: bob.address(), amount: SOUL, reason: "r".into() }] {
+            assert!(c.submit(signed(&c, &owner, action)).unwrap_err().to_string().contains("only validator admins"));
+        }
+        // What admitting a tx reserves: amounts that leave the balance, not vote locks.
+        let reserve = |a: Action| c.state.tx_debit(&signed(&c, &owner, a)) - signed(&c, &owner, Action::Unlock {}).charge().unwrap();
+        assert!(reserve(Action::Delegate { validator: v.clone(), amount: 7 * FANG }) >= 7 * FANG);
+        assert!(reserve(Action::Propose { kind: ProposalKind::Text {}, deposit: 9 * FANG, title: "t".into(), url: String::new() }) >= 9 * FANG);
+        assert!(reserve(Action::Vote { proposal_id: 0, aye: true, amount: 1_000 * FANG, conviction: 6 }) < FANG);
+        let root = c.state.root();
+        drop(c);
+        assert_eq!(Chain::open(&home).unwrap().state.root(), root, "replays");
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn levers_run_without_signers_and_roll_back() {
+        let (home, mut c) = open("levers", &genesis("scaffold-1"));
+        let (owner, bob) = (keys(22), keys(24));
+        // A hunt for the refund lever (anyone can create one).
+        c.submit(signed(&c, &owner, Action::CreateHunt { repo: "a/b".into(), issue: 1, amount: 10 * FANG, expires_at: 1_000, title: "t".into() })).unwrap();
+        c.produce_block().unwrap();
+        let s = &mut c.state;
+        let h = 5;
+        let (root, supply, burned, params) = (s.full_root(), s.supply, s.burned, s.chain_params.clone());
+        let mut j = Journal::default();
+        // Parameters, within bounds only.
+        s.exec_set_param(&mut j, "max_validators", 64).unwrap();
+        assert!(s.exec_set_param(&mut j, "issuance_floor_ppm", 1).is_err());
+        assert!(s.exec_set_param(&mut j, "nope", 1).is_err());
+        assert_eq!(s.chain_params.max_validators, 64);
+        // Supply.
+        s.j_mint(&mut j, 5);
+        s.j_credit(&mut j, &bob.address(), 5);
+        s.j_debit(&mut j, &bob.address(), 2).unwrap();
+        s.j_burn(&mut j, 2);
+        assert_eq!((s.supply, s.burned), (supply + 3, burned + 2));
+        // The PoC levers, no admin needed.
+        s.exec_set_repo(&mut j, "a/b", 10, h).unwrap();
+        s.exec_grant_soul(&mut j, &bob.address(), 5 * SOUL, h).unwrap();
+        assert!(s.exec_grant_soul(&mut j, &bob.address(), crate::poc::MAX_SOUL_GRANT + 1, h).is_err());
+        s.exec_flag_sybil(&mut j, &bob.address(), "proposal #1", "same person", h).unwrap();
+        assert_eq!(s.soul_of(&bob.address(), h), 0);
+        assert!(s.exec_clawback(&mut j, &bob.address(), h).unwrap_err().to_string().contains("no unvested rewards"));
+        assert!(s.exec_reject_claim(&mut j, 0, "r", h).unwrap_err().to_string().contains("no claim"));
+        assert!(s.exec_unlink_github(&mut j, "nobody").unwrap_err().to_string().contains("isn't linked"));
+        let funded = s.account(&owner.address()).balance;
+        s.exec_refund_hunt(&mut j, 0, h).unwrap();
+        assert_eq!(s.account(&owner.address()).balance, funded + 10 * FANG);
+        assert!(s.exec_refund_hunt(&mut j, 0, h).unwrap_err().to_string().contains("already Cancelled"));
+        // Upgrades and features.
+        crate::upgrade::exec_deactivate_feature(s, &mut j, "ghost").unwrap();
+        assert!(crate::upgrade::exec_deactivate_feature(s, &mut j, "ghost").is_err());
+        crate::upgrade::exec_activate_feature(s, &mut j, "ghost", h).unwrap();
+        assert!(crate::upgrade::exec_activate_feature(s, &mut j, "warp", h).is_err());
+        assert!(crate::upgrade::exec_schedule_upgrade(s, &mut j, 9, h, h).is_err(), "only after now");
+        crate::upgrade::exec_schedule_upgrade(s, &mut j, 9, 100, h).unwrap();
+        assert!(crate::upgrade::exec_schedule_upgrade(s, &mut j, 10, 50, h).is_err(), "only after the last one");
+        assert_eq!(crate::upgrade::version_at(s, 100), 9);
+        s.check_invariants().unwrap();
+        // Everything rolls back, dirty marks included.
+        s.rollback(j);
+        assert_eq!((s.full_root(), s.supply, s.burned, &s.chain_params), (root, supply, burned, &params));
+        assert_eq!(s.commit_block().unwrap().records, vec![], "nothing left to commit");
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn skipped_txs_are_recorded_and_replayed() {
+        let (home, mut c) = open("skipped", &genesis("scaffold-1"));
+        let owner = keys(22);
+        let ok = signed(&c, &owner, Action::Transfer { to: keys(24).address(), amount: FANG });
+        let stale = Tx { nonce: 7, ..signed(&c, &owner, Action::Transfer { to: keys(24).address(), amount: FANG }) }.sign(&owner);
+        c.produce_block_with(vec![ok, stale.clone()]).unwrap();
+        let b = c.last_block().unwrap();
+        assert_eq!((b.txs.len(), b.skipped.clone()), (1, vec![stale.size()]));
+        let root = c.state.root();
+        drop(c);
+        let c = Chain::open(&home).unwrap();
+        assert_eq!((c.state.root(), c.block(1).unwrap().skipped), (root, vec![stale.size()]));
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn a_binary_stops_before_a_version_it_cant_run() {
+        let (home, mut c) = open("halt", &genesis("scaffold-1"));
+        c.produce_block_with(vec![]).unwrap();
+        let unsupported = crate::consensus::SUPPORTED_PROTOCOL_VERSION + 1;
+        c.state.upgrade.schedule = vec![crate::upgrade::ScheduledUpgrade { version: unsupported, activation_height: 3 }];
+        // Block 2 executes (and is stored); the check for block 3 stops the node.
+        let err = c.produce_block_with(vec![]).unwrap_err().to_string();
+        assert!(err.contains("block 3 runs protocol") && err.contains("upgrade blockula"), "{err}");
+        assert_eq!(c.height(), 2);
         fs::remove_dir_all(home).ok();
     }
 }

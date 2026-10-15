@@ -349,6 +349,44 @@ fn snapshots_reject_tampering() {
     std::fs::remove_dir_all(&s.home).ok();
 }
 
+/// Namespaces are never shared, and each protocol v1 module's sit in its reserved range (the
+/// maps a state lists are checked against them too); META keys are distinct.
+#[test]
+fn namespaces_and_meta_keys_are_unique() {
+    let reserved = [
+        (ns::STAKE_POOLS, 32..=36),
+        (ns::STAKE_DELEGATIONS, 32..=36),
+        (ns::STAKE_UNBONDING, 32..=36),
+        (ns::STAKE_EVIDENCE, 32..=36),
+        (ns::STAKE_LIVENESS, 32..=36),
+        (ns::GOV_PROPOSALS, 37..=42),
+        (ns::GOV_VOTES, 37..=42),
+        (ns::GOV_MULTISIGS, 37..=42),
+        (ns::GOV_MULTISIG_PROPOSALS, 37..=42),
+        (ns::GOV_DISTRIBUTIONS, 37..=42),
+        (ns::GOV_DISTRIBUTION_CLAIMS, 37..=42),
+        (ns::RESERVED_NAMES, 43..=43),
+        (ns::BEACON_COMMITS, 44..=46),
+        (ns::BEACON_REVEALS, 44..=46),
+        (ns::BEACON_VALUES, 44..=46),
+        (ns::FEATURES, 47..=47),
+    ];
+    let mut seen = std::collections::BTreeSet::from([ns::META]);
+    let st = State::default();
+    for (n, _) in st.tables() {
+        assert!(seen.insert(n) || reserved.iter().any(|(r, _)| *r == n), "namespace {n} is used twice");
+    }
+    for (n, range) in reserved {
+        assert!(range.contains(&n), "namespace {n} is outside its module's range");
+        assert!(!(1..=25).contains(&n) && !(48..=63).contains(&n), "namespace {n} collides with the base state or Ghost Mode");
+        seen.insert(n);
+    }
+    assert_eq!(seen.len(), 1 + 18 + 16, "every namespace is distinct");
+    let keys = [meta::BURNED, meta::CHAIN_PARAMS, meta::NEXT_HUNT_ID, meta::PARAMS, meta::POC, meta::SCHEMA, meta::SUPPLY, meta::STAKING, meta::GOVERNANCE, meta::ECON, meta::BEACON, meta::UPGRADE];
+    assert_eq!(keys.iter().collect::<std::collections::BTreeSet<_>>().len(), keys.len());
+    assert!(st.meta_records().iter().all(|(k, _)| keys.contains(k)), "every scalar record uses a declared key");
+}
+
 /// Format change detectors: a record's bytes and a fixed state's root. The root was also
 /// computed by an independent JS implementation of the record layout and tree (noble BLAKE3),
 /// recomputed when `Params` gained `address_prefix` (P-WIRE) and again for the protocol v1
