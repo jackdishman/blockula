@@ -816,12 +816,26 @@ pub fn max_hunt_blocks(block_time_ms: u64) -> u64 {
     365 * 86_400 * 1000 / block_time_ms.max(1)
 }
 
+/// What `State::accounts` keeps up to date as it changes: Σ balance, and the accounts holding a
+/// vesting lock (only genesis allocations create one). Governance's quorum base reads both
+/// instead of walking every account (`governance::unlocked_supply`).
+pub struct AccountTotals;
+
+impl crate::state::Aggregate<Account> for AccountTotals {
+    fn weight(a: &Account) -> u128 {
+        a.balance as u128
+    }
+    fn indexed(a: &Account) -> bool {
+        a.locks.iter().any(|l| matches!(l.amount, LockAmount::Vesting { .. }))
+    }
+}
+
 /// The chain state. Maps are `TMap`s: cloning a `State` is O(1) (structure is shared), and
 /// changed keys are tracked so `commit_block` updates the root from just those. How it maps to
 /// records and the root is in `state/mod.rs`.
 #[derive(Clone, Default)]
 pub struct State {
-    pub accounts: TMap<String, Account>,
+    pub accounts: TMap<String, Account, AccountTotals>,
     pub names: TMap<String, NameRecord>,
     pub supply: u64,
     pub burned: u64,

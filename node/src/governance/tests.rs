@@ -222,8 +222,7 @@ fn without_quorum_the_deposit_is_burned() {
     assert_eq!((t.p(id).status, t.p(id).tally.as_ref().unwrap().quorum), (ProposalStatus::Rejected, (20_000 * FANG) as u128));
 }
 
-/// The O(accounts) unlocked-supply sum runs once an epoch: votes closing later in the epoch
-/// reuse it.
+/// The unlocked supply is taken once an epoch: votes closing later in the epoch reuse it.
 #[test]
 fn the_unlocked_supply_is_taken_once_an_epoch() {
     let mut t = T::new(&[]);
@@ -244,6 +243,64 @@ fn the_unlocked_supply_is_taken_once_an_epoch() {
     let later = t.p(c).tally.as_ref().unwrap().unlocked;
     assert_eq!((later, t.st.governance.quorum_base), (unlocked_supply(&t.st, end), Some((1, later))));
     assert!(later < first - 9_999 * FANG as u128);
+}
+
+/// The quorum base is running totals (balances, pool stake, unbonding) less what the few vesting
+/// accounts still hold, not a walk over every account, and it follows every change exactly:
+/// transfers and fees, new accounts, delegating, unbonding, rewards, moves to keyless accounts and
+/// the vesting curve. (`check_invariants` also compares it with a walk after every block.)
+#[test]
+fn the_unlocked_supply_is_kept_exact_without_walking_the_accounts() {
+    let mut t = T::new(&[]);
+    let at = |t: &T, h: u64| {
+        let u = unlocked_supply(&t.st, h);
+        assert_eq!(u, unlocked_supply_by_walk(&t.st, h), "running total vs walk at {h}");
+        u
+    };
+    let u0 = at(&t, t.h);
+    // Users, validators and the operator (its bond included); not the founder's unvested
+    // million, not the system accounts.
+    assert_eq!(u0, 164_000 * FANG as u128);
+    // A transfer that opens an account burns its fee and the creation fee; the rest still votes.
+    let creation = t.st.chain_params.account_creation_fee as u128;
+    let fee = t.tx(ALICE, Action::Transfer { to: addr(DAVE), amount: 1_000 * FANG }).unwrap() as u128;
+    let u1 = at(&t, t.h);
+    assert_eq!(u1, u0 - fee - creation);
+    // Delegating and unbonding move FANG between balance, pool and entry: only the fees go.
+    let v3 = addr(VALIDATORS[2]);
+    let fee = t.tx(DAVE, Action::Delegate { validator: v3.clone(), amount: 500 * FANG }).unwrap() as u128;
+    let u2 = at(&t, t.h);
+    assert_eq!(u2, u1 - fee);
+    let shares = t.st.staking.delegations.get(&format!("{}/{v3}", addr(DAVE))).unwrap().shares as u64;
+    let fee = t.tx(DAVE, Action::Undelegate { validator: v3.clone(), shares: shares / 2 }).unwrap() as u128;
+    t.next();
+    let u3 = at(&t, t.h);
+    assert_eq!(u3, u2 - fee);
+    assert!(t.st.staking.entries.total() > 0);
+    // FANG sent to a keyless account stops counting.
+    let fee = t.tx(BOB, Action::Transfer { to: community("boo"), amount: 2_000 * FANG }).unwrap() as u128;
+    let u4 = at(&t, t.h);
+    assert_eq!(u4, u3 - fee - 2_000 * FANG as u128);
+    // Issuance at the epoch boundary: the stakers' share lands in the pools and counts; the
+    // pool's and the treasury's shares don't.
+    let staked = t.st.staking.pools.total();
+    t.through(600);
+    let rewards = t.st.staking.pools.total() - staked;
+    assert!(rewards > 0);
+    assert_eq!(at(&t, t.h), u4 + rewards);
+    // The founder's allocation counts as it vests (linearly from 0 to 20,000, nothing before the
+    // cliff at 10,000), with the walk agreeing at each height.
+    let before = at(&t, 9_999);
+    assert_eq!(at(&t, 10_000), before + 500_000 * FANG as u128);
+    assert_eq!(at(&t, 15_000), before + 750_000 * FANG as u128);
+    assert_eq!(at(&t, 20_000), before + 1_000_000 * FANG as u128);
+    // Locked tokens the founder stakes stay unvested: only its liquid 10 FANG (less fees) vote.
+    let fee = t.tx(ALICE, Action::Transfer { to: addr(FOUNDER), amount: 10 * FANG }).unwrap() as u128;
+    let u5 = at(&t, t.h);
+    assert_eq!(u5, u4 + rewards - fee);
+    let fee = t.tx(FOUNDER, Action::Delegate { validator: v3, amount: 100_000 * FANG }).unwrap() as u128;
+    t.next();
+    assert_eq!(at(&t, t.h), u5 - fee);
 }
 
 #[test]

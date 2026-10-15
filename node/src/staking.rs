@@ -216,12 +216,33 @@ pub struct Punished {
     pub slashed: u64,
 }
 
+/// Running total of pool stake (`Staking::pools`), so governance's quorum base is O(1).
+pub struct PoolStake;
+
+impl crate::state::Aggregate<Pool> for PoolStake {
+    fn weight(p: &Pool) -> u128 {
+        p.stake as u128
+    }
+}
+
+/// Running total of unbonding entries' amounts (`Staking::entries`).
+pub struct UnbondingTotal;
+
+impl crate::state::Aggregate<Entry> for UnbondingTotal {
+    fn weight(e: &Entry) -> u128 {
+        match e {
+            Entry::Unbonding { amount, .. } => *amount as u128,
+            Entry::Redelegation { .. } => 0,
+        }
+    }
+}
+
 /// Staking's slice of the state (namespaces `state::ns` 32–36, META key `staking`).
 #[derive(Clone, Debug, Default)]
 pub struct Staking {
-    pub pools: TMap<String, Pool>,
+    pub pools: TMap<String, Pool, PoolStake>,
     pub delegations: TMap<String, Delegation>,
-    pub entries: TMap<String, Entry>,
+    pub entries: TMap<String, Entry, UnbondingTotal>,
     pub punished: TMap<String, Punished>,
     pub liveness: TMap<String, Liveness>,
     /// Id of the next unbonding or redelegation entry.
@@ -305,7 +326,7 @@ fn pkey(validator: &str, epoch: u64, view: u64) -> String {
 
 /// The records of a map keyed `account/…`, in key order. Addresses never contain `/`, and `0`
 /// follows `/`, so the range holds exactly `account`'s keys.
-fn owned_by<'m, V: Clone>(map: &'m TMap<String, V>, account: &str) -> impl Iterator<Item = (&'m String, &'m V)> + 'm {
+fn owned_by<'m, V: Clone, A>(map: &'m TMap<String, V, A>, account: &str) -> impl Iterator<Item = (&'m String, &'m V)> + 'm {
     map.range(format!("{account}/")..format!("{account}0"))
 }
 

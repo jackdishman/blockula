@@ -322,6 +322,16 @@ impl Grant {
     }
 }
 
+/// What `Poc::claims` indexes as it changes: claims still pending or verified (not yet in a
+/// Séance or settled), so the epoch-boundary steps walk those instead of every claim ever made.
+pub struct OpenClaims;
+
+impl crate::state::Aggregate<Claim> for OpenClaims {
+    fn indexed(c: &Claim) -> bool {
+        matches!(c.status, ClaimStatus::Pending | ClaimStatus::Verified)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Poc {
     /// Lowercase `owner/name` → weight.
@@ -330,7 +340,7 @@ pub struct Poc {
     /// Vouchee → the vouch.
     pub vouches: TMap<String, Vouch>,
     pub sybils: TMap<String, Sybil>,
-    pub claims: TMap<u64, Claim>,
+    pub claims: TMap<u64, Claim, OpenClaims>,
     /// `repo#pr` → claim id, so a PR is claimed once (cleared when validators reject it).
     pub claim_by_pr: TMap<String, u64>,
     /// Lowercase GitHub handle → the account its first verified claim credited. A handle's work
@@ -1179,7 +1189,9 @@ impl State {
     fn refund_stale_claims(&mut self, height: u64) {
         let mut j = Journal::default();
         let ttl = self.params.poc.claim_ttl_blocks;
-        let stale: Vec<(u64, String)> = self.poc.claims.values().filter(|c| c.status == ClaimStatus::Pending && height >= c.submitted_at.saturating_add(ttl)).map(|c| (c.id, format!("{}#{}", c.repo, c.pr))).collect();
+        // Open claims only (an index, `OpenClaims`), in id order like the claims themselves.
+        let open = self.poc.claims.indexed();
+        let stale: Vec<(u64, String)> = open.iter().filter_map(|id| self.poc.claims.get(id)).filter(|c| c.status == ClaimStatus::Pending && height >= c.submitted_at.saturating_add(ttl)).map(|c| (c.id, format!("{}#{}", c.repo, c.pr))).collect();
         for (id, pr_key) in stale {
             self.settle_bond(&mut j, id, true);
             self.set_status(&mut j, id, ClaimStatus::Rejected, height, Some("validators didn't settle it in time; bond refunded".into()));
@@ -1200,10 +1212,10 @@ impl State {
         let mut j = Journal::default();
         let times = self.params.poc.clone();
         let cutoff = self.seance_cutoff(epoch);
-        let claims: Vec<(u64, String)> = self
-            .poc
-            .claims
-            .values()
+        let open = self.poc.claims.indexed();
+        let claims: Vec<(u64, String)> = open
+            .iter()
+            .filter_map(|id| self.poc.claims.get(id))
             .filter(|c| c.status == ClaimStatus::Verified && c.verified_at.is_some_and(|v| v.saturating_add(times.claim_maturity_blocks) < cutoff) && !self.is_sybil(&c.claimant) && self.poc.repos.contains_key(&c.repo))
             .take(MAX_SEANCE_CLAIMS)
             .map(|c| (c.id, c.claimant.clone()))
