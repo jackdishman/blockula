@@ -1,6 +1,6 @@
 // Canonical transaction encoding. Must stay byte-identical to node/src/types.rs `Tx::signing_bytes`.
 import { blake3 } from "@noble/hashes/blake3.js";
-import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
+import { bytesToHex, concatBytes, hexToBytes } from "@noble/hashes/utils.js";
 
 export type KeyRole =
   | { type: "owner" }
@@ -69,7 +69,7 @@ export type Action =
   | { type: "unjail"; validator: string }
   /** Two conflicting signed votes, hex (at most 16 KiB decoded). */
   | { type: "report_equivocation"; evidence: string }
-  /** Hex BLAKE3 of a 32-byte secret, for the randomness beacon of `epoch`. */
+  /** A validator's commitment to its secret for the randomness beacon of `epoch`: `beaconCommitment(...)`. */
   | { type: "beacon_commit"; epoch: number; commitment: string }
   | { type: "beacon_reveal"; epoch: number; secret: string }
   /** Put `kind` to a vote, bonding `deposit` drops; `url` (https) links the full text. */
@@ -409,6 +409,27 @@ export function seanceCommitment(seanceId: number, juror: string, votes: string,
   w.ids(spam);
   w.str(salt);
   return bytesToHex(blake3(w.done()));
+}
+
+/**
+ * A validator's randomness-beacon commitment (node/src/beacon.rs `commitment`): hex BLAKE3 in
+ * derive-key mode ("blockula beacon commitment v1") over the chain id, the target epoch, the
+ * validator's address and its 32-byte hex secret. Strings are u64-length-prefixed, integers
+ * u64 little-endian.
+ */
+export function beaconCommitment(chainId: string, epoch: number, validator: string, secret: string): string {
+  const u64 = (n: number) => {
+    const b = new Uint8Array(8);
+    new DataView(b.buffer).setBigUint64(0, BigInt(n), true);
+    return b;
+  };
+  const str = (s: string) => {
+    const b = utf8.encode(s);
+    return concatBytes(u64(b.length), b);
+  };
+  const key = hexToBytes(secret);
+  if (key.length !== 32) throw new Error("a beacon secret is 32 bytes");
+  return bytesToHex(blake3(concatBytes(str(chainId), u64(epoch), str(validator), key), { context: utf8.encode("blockula beacon commitment v1") }));
 }
 
 /** "2.5" Soul → 2500 milli-Soul. */

@@ -186,10 +186,15 @@ impl T {
 
     /// Runs blocks until `victim` has missed `n` more of its leader slots: its views are
     /// nullified, everyone else's produce blocks.
-    fn starve(&mut self, victim: &str, n: u64) {
+    /// Runs blocks in which `victim` misses its leader slots: `n` of them, or fewer if it leaves
+    /// the set first. Returns how many it missed.
+    fn starve(&mut self, victim: &str, n: u64) -> u64 {
         let mut missed = 0;
         while missed < n {
             let epoch = self.st.params.epoch_of(self.height);
+            if !self.set(epoch).iter().any(|v| v == victim) {
+                break;
+            }
             let mut view = if epoch != self.epoch { 1 } else { self.view + 1 };
             while missed < n && self.leader(epoch, view) == victim {
                 self.skip += 1;
@@ -198,11 +203,16 @@ impl T {
             }
             self.block();
         }
+        missed
+    }
+
+    /// The leader's index in `leaders(epoch)`, elected as consensus does (the beacon's shuffle).
+    fn idx(&self, epoch: u64, view: u64) -> usize {
+        leader_index(crate::beacon::elector_seed(&self.st, epoch), epoch, view, leaders(&self.st, epoch).len())
     }
 
     fn leader(&self, epoch: u64, view: u64) -> String {
-        let order = leaders(&self.st, epoch);
-        order[leader_index(epoch, view, order.len())].clone()
+        leaders(&self.st, epoch)[self.idx(epoch, view)].clone()
     }
 
     fn set(&self, epoch: u64) -> Vec<String> {
@@ -721,8 +731,31 @@ fn leaders_come_from_simplex_round_robin() {
     for n in [1usize, 2, 4, 7, 31] {
         for e in [0u64, 1, 5, 1_000] {
             for v in [1u64, 2, 3, 30, 31, 1_000_003] {
-                assert_eq!(leader_index(e, v, n), ((e + v) % n as u64) as usize);
+                assert_eq!(leader_index(None, e, v, n), ((e + v) % n as u64) as usize);
             }
+        }
+        // Shuffled by a beacon seed (SF-1): still a rotation, so any n consecutive views lead
+        // each validator once, in the order the seeded elector itself gives.
+        let seed = Some([7u8; 32]);
+        let mut seen: Vec<usize> = (0..n as u64).map(|v| leader_index(seed, 3, 100 + v, n)).collect();
+        seen.sort();
+        assert_eq!(seen, (0..n).collect::<Vec<_>>());
+    }
+}
+
+/// Downtime charges the leaders consensus elects: `leader_index` with the epoch's beacon seed
+/// names the same validator as `consensus::leader` (which builds the elector from the real set),
+/// in the genesis epoch, the hash-chain epoch after it and a beacon-derived epoch.
+#[test]
+fn downtime_elects_the_leaders_consensus_elects() {
+    let mut t = Setup::default().start();
+    for _ in 0..3 {
+        t.finish_epoch();
+    }
+    for epoch in [0, 1, t.epoch] {
+        assert!(crate::beacon::elector_seed(&t.st, epoch).is_some());
+        for view in 1..12 {
+            assert_eq!(Some(t.leader(epoch, view)), crate::consensus::leader(&t.st, epoch, view), "epoch {epoch}, view {view}");
         }
     }
 }
@@ -737,16 +770,18 @@ fn missed_leader_slots_jail_and_the_validator_may_unjail_later() {
     t.block();
     let order = leaders(&t.st, epoch);
     for x in [from + 1, from + 2] {
-        let l = &order[leader_index(epoch, x, 4)];
+        let l = &order[t.idx(epoch, x)];
         assert_eq!(t.st.staking.liveness[l].missed, 1, "view {x}'s leader missed it");
     }
     assert_eq!(t.st.staking.liveness[&t.leader(epoch, t.view)].missed, 0);
     // One validator stays offline: past 3 misses in its window it's jailed, slashed 1% once,
     // and leaves at the boundary; nobody else is charged.
-    let victim = order[leader_index(epoch, t.view + 1, 4)].clone();
+    let victim = order[t.idx(epoch, t.view + 1)].clone();
     let before = t.st.staking.liveness.get(&victim).map_or(0, |l| l.missed);
     let stake = t.stake(&victim);
-    t.starve(&victim, 4 - before);
+    assert_eq!(t.starve(&victim, 4 - before), 4 - before);
+    // It stays away (for as long as it's still in the set: the leader order is the beacon's
+    // shuffle, so how many more slots it gets before the boundary varies).
     t.starve(&victim, 2);
     let jail = t.st.staking.pools[&victim].jail.clone().expect("jailed");
     assert!(jail.reason.contains("missed 4 of its last"), "{}", jail.reason);
@@ -807,7 +842,7 @@ fn long_outages_are_charged_per_lap() {
     t.skip = 9; // views from+1 ..= from+9: two laps of 4, and one more
     t.block();
     let order = leaders(&t.st, epoch);
-    let extra = &order[leader_index(epoch, from + 9, 4)];
+    let extra = &order[t.idx(epoch, from + 9)];
     for v in &order {
         let want = if v == extra { 3 } else { 2 };
         assert_eq!(t.st.staking.liveness[v].missed, want, "{v}");

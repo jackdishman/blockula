@@ -1047,19 +1047,26 @@ fn charge_junk(state: &mut State, j: &mut Journal, b: &BlockInfo) {
 }
 
 /// The leader of `(epoch, view)` among `n` participants: an index into the epoch's sorted
-/// consensus keys, from simplex's own `RoundRobin` elector (the one the engines run), so the
-/// chain charges exactly the validators consensus waited for. Electors depend only on the set's
-/// size; one is built per size and kept.
-pub fn leader_index(epoch: u64, view: u64, n: usize) -> usize {
+/// consensus keys, from simplex's own `RoundRobin` elector shuffled by the epoch's beacon
+/// (`consensus::elector(seed)`, the one the engines run; `seed` is `beacon::elector_seed`), so
+/// the chain charges exactly the validators consensus waited for. Electors depend only on the
+/// seed and the set's size; they're built once and kept (a few epochs' worth).
+pub fn leader_index(seed: Option<[u8; 32]>, epoch: u64, view: u64, n: usize) -> usize {
     use commonware_consensus::simplex::elector::{Config as _, Elector as _, RoundRobinElector};
     use commonware_consensus::types::{Epoch, Round, View};
-    static ELECTORS: std::sync::Mutex<BTreeMap<usize, RoundRobinElector<MlDsaScheme>>> = std::sync::Mutex::new(BTreeMap::new());
+    type Electors = BTreeMap<(Option<[u8; 32]>, usize), RoundRobinElector<MlDsaScheme>>;
+    static KEYS: std::sync::Mutex<BTreeMap<usize, commonware_utils::ordered::Set<crate::pq::PublicKey>>> = std::sync::Mutex::new(BTreeMap::new());
+    static ELECTORS: std::sync::Mutex<Electors> = std::sync::Mutex::new(BTreeMap::new());
     assert!(n > 0, "no participants");
     let mut electors = ELECTORS.lock().unwrap_or_else(|e| e.into_inner());
-    let elector = electors.entry(n).or_insert_with(|| {
+    if electors.len() >= 64 && !electors.contains_key(&(seed, n)) {
+        electors.clear();
+    }
+    let elector = electors.entry((seed, n)).or_insert_with(|| {
         // Any n distinct keys: a round-robin elector only looks at how many there are.
-        let keys: Vec<crate::pq::PublicKey> = (0..n).map(|i| commonware_cryptography::Signer::public_key(&crate::pq::PrivateKey::from_seed_bytes(crate::crypto::hash(&(i as u64).to_le_bytes())))).collect();
-        crate::consensus::elector().build(&commonware_utils::ordered::Set::from_iter_dedup(keys))
+        let mut keys = KEYS.lock().unwrap_or_else(|e| e.into_inner());
+        let set = keys.entry(n).or_insert_with(|| commonware_utils::ordered::Set::from_iter_dedup((0..n).map(|i| commonware_cryptography::Signer::public_key(&crate::pq::PrivateKey::from_seed_bytes(crate::crypto::hash(&(i as u64).to_le_bytes()))))));
+        crate::consensus::elector(seed).build(set)
     });
     usize::from(elector.elect(Round::new(Epoch::new(epoch), View::new(view)), None))
 }
@@ -1086,6 +1093,7 @@ fn score_leader_slots(state: &mut State, j: &mut Journal, b: &BlockInfo) {
     if n == 0 {
         return;
     }
+    let seed = crate::beacon::elector_seed(state, epoch);
     let mut misses = vec![0u64; n];
     let gap = b.view - b.parent_view - 1;
     let (laps, rest) = (gap / n as u64, gap % n as u64);
@@ -1093,9 +1101,9 @@ fn score_leader_slots(state: &mut State, j: &mut Journal, b: &BlockInfo) {
         *m = laps;
     }
     for x in b.view - rest..b.view {
-        misses[leader_index(epoch, x, n)] += 1;
+        misses[leader_index(seed, epoch, x, n)] += 1;
     }
-    let hit = leader_index(epoch, b.view, n);
+    let hit = leader_index(seed, epoch, b.view, n);
     let (window, max_missed) = (state.chain_params.downtime_window.max(1), state.chain_params.downtime_max_missed);
     for (i, v) in order.iter().enumerate() {
         if misses[i] == 0 && i != hit {

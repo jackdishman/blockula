@@ -151,6 +151,17 @@ impl Sim {
         self.block(txs);
     }
 
+    /// Runs empty blocks until a Séance opens (they open on epoch boundaries, on a cadence).
+    fn wait_for_seance(&mut self) -> Option<u64> {
+        for _ in 0..100 {
+            if self.c.state.poc.open_seance.is_some() {
+                break;
+            }
+            self.block(vec![]);
+        }
+        self.c.state.poc.open_seance
+    }
+
     /// If a Séance is open, every seated juror seals and then reveals, and it runs to its close.
     fn drive_seance(&mut self) {
         let Some(sid) = self.c.state.poc.open_seance else { return };
@@ -238,7 +249,7 @@ fn scripted_run_through_a_seance() {
     s.run(&[(18, 0, 0, 1), (18, 0, 0, 1), (18, 0, 0, 1)]);
     let failed: Vec<String> = (1..=s.c.height()).flat_map(|h| s.c.block(h).unwrap().failed.into_values()).collect();
     assert!(failed.is_empty(), "{failed:?}");
-    let sid = s.c.state.poc.open_seance.expect("3 verified claims and 6 jurors open a Séance");
+    let sid = s.wait_for_seance().expect("3 verified claims and 6 jurors open a Séance at the next opening");
     s.drive_seance();
     let r = s.c.state.poc.seances[&sid].results.clone().unwrap();
     assert!(r.accepted > 0 && r.no_shows == 0, "the Séance judged the claims: {r:?}");
@@ -367,7 +378,7 @@ fn namespaces_and_meta_keys_are_unique() {
         (ns::GOV_DISTRIBUTION_CLAIMS, 37..=42),
         (ns::RESERVED_NAMES, 43..=43),
         (ns::BEACON_COMMITS, 44..=46),
-        (ns::BEACON_REVEALS, 44..=46),
+        (ns::BEACON_REVERTS, 44..=46),
         (ns::BEACON_VALUES, 44..=46),
         (ns::FEATURES, 47..=47),
     ];
@@ -392,7 +403,8 @@ fn namespaces_and_meta_keys_are_unique() {
 /// recomputed when `Params` gained `address_prefix` (P-WIRE) and again for the protocol v1
 /// scaffold (schema 2: `chain_params`, the upgrade schedule, account locks). Schema 3 (P-ECON:
 /// the `econ` scalar record; P-STAKE: staking's scalar; P-GOV: the `governance` scalars,
-/// `multisig_expiry_blocks`) changed it again; that value is from this implementation only.
+/// `multisig_expiry_blocks`; P-BEACON: the PoC scalars without the block-hash seed) changed it
+/// again; that value is from this implementation only.
 #[test]
 fn golden_encodings() {
     let acct = Account { balance: 5, nonce: 2, keys: Default::default(), locks: vec![] };
@@ -403,7 +415,7 @@ fn golden_encodings() {
     st.commit_block().unwrap();
     assert_eq!(st.root_hash(), st.full_root());
     assert_eq!(st.record_count(), 12);
-    assert_eq!(st.root(), "75a05f23c64acdac9fc75b26e8e30d65dfc617508d9841ca7683d9f139831cf6");
+    assert_eq!(st.root(), "3e9ebc1453e5b550247711884c8de1c8aeb27b8d4709cbbfe2b7d67a5fed6173");
 }
 
 fn million_accounts() -> State {
@@ -582,6 +594,15 @@ fn largest_records_fit_in_a_snapshot() {
         g.multisig_proposals.insert(u64::MAX, MultisigProposal { id: u64::MAX, account: addr(0), action, proposed_by: hex32(0), approvals: (0..MAX_KEYS as u64).map(hex32).collect(), created_at: 0, expires_at: 0 });
         g.distributions.insert(u64::MAX, Distribution { id: u64::MAX, merkle_root: hex32(0), total: u64::MAX, claimed: u64::MAX, claims: u64::MAX, opened_at: 0, claim_until: 0, closed_at: Some(0), returned: u64::MAX });
         g.distribution_claims.insert(IdKey::new(u64::MAX, &addr(0)), DistributionClaim { amount: u64::MAX, at: 0 });
+    }
+    // Beacon: a round, a revert quorum and a value's misses, each with the whole largest set.
+    {
+        use crate::beacon::*;
+        let set = st.active_sets[&0].clone();
+        let entry = Entry { commitment: [0xff; 32], committed_at: u64::MAX, secret: Some([0xff; 32]), revealed_at: Some(u64::MAX) };
+        st.beacon.rounds.insert(u64::MAX, set.iter().map(|v| (v.clone(), entry.clone())).collect());
+        st.beacon.reverts.insert(u64::MAX, set.iter().map(|v| (v.clone(), RevertAttestation { revert_sha: s(40), at: u64::MAX })).collect());
+        st.beacon.values.insert(u64::MAX, Value { value: [0xff; 32], reveals: u32::MAX, missed: set.clone() });
     }
 
     let mut largest = std::collections::BTreeMap::new();

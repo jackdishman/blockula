@@ -3,9 +3,16 @@
 //! contribution pool, paid per sponsor as a square root and vested with clawback.
 //!
 //! Lifecycle of a claim: `submit_claim` (bonded) → validators attest what GitHub says → verified
-//! once a BFT quorum agrees on the merge commit → after `claim_maturity_blocks` it enters the next
-//! Séance → jurors compare pairs of claims ("which mattered more?"), commit, then reveal → the
-//! Séance closes: scores, Soul, rewards (vesting) and bonds are settled.
+//! once a BFT quorum agrees on the merge commit → for `claim_maturity_blocks` validators watch for
+//! a revert (a quorum rejects it, beacon.rs) → then it enters the next Séance → jurors compare
+//! pairs of claims ("which mattered more?"), commit, then reveal → the Séance closes: scores,
+//! Soul, rewards (vesting) and bonds are settled.
+//!
+//! Séances open only at the last block of every `n`th epoch (`State::next_seance_height`, fixed
+//! in advance), and draw their jury and pairs from the randomness beacon (`beacon::seance_seed`)
+//! over jurors and claims that were eligible before anyone could know it
+//! (`State::seance_cutoff`). So neither the opening block's proposer nor anyone who joins,
+//! leaves or times a claim can steer the draw.
 //!
 //! Everything here is deterministic integer math over ordered maps; the open/close of Séances runs
 //! in `end_block`, after a block's txs, on every node. The constants below (and the default
@@ -126,11 +133,6 @@ impl PocTimes {
     }
     pub fn reveal_blocks(&self) -> u64 {
         self.seance_blocks.saturating_sub(self.commit_blocks()).max(1)
-    }
-    /// How long to wait before trying again when a Séance can't open (too few claims/jurors):
-    /// about an hour for a week-long Séance.
-    pub fn retry_blocks(&self) -> u64 {
-        (self.seance_blocks / 168).max(1)
     }
 }
 
@@ -341,18 +343,17 @@ pub struct Poc {
     pub next_claim_id: u64,
     pub next_seance_id: u64,
     pub next_grant_id: u64,
-    /// BLAKE3 chain over every block hash since Proof of Contribution was first used.
-    pub seed: String,
     pub open_seance: Option<u64>,
-    /// Earliest height the next Séance may open.
+    /// The next height on the cadence where a Séance may open (display; see
+    /// `State::next_seance_height`).
     pub next_seance_at: u64,
 }
 
 impl Poc {
     /// False until Proof of Contribution is first used; until then the end-of-block step
-    /// (randomness, Séances) doesn't run.
+    /// (Séances) doesn't run.
     pub fn is_active(&self) -> bool {
-        !(self.seed.is_empty() && self.repos.is_empty() && self.souls.is_empty() && self.vouches.is_empty() && self.sybils.is_empty() && self.claims.is_empty() && self.jurors.is_empty() && self.grants.is_empty() && self.handles.is_empty())
+        !(self.repos.is_empty() && self.souls.is_empty() && self.vouches.is_empty() && self.sybils.is_empty() && self.claims.is_empty() && self.jurors.is_empty() && self.grants.is_empty() && self.handles.is_empty() && self.seances.is_empty())
     }
 
     pub fn has_open_claims(&self, account: &str) -> usize {
@@ -362,7 +363,7 @@ impl Poc {
 
 // ------------------------------------------------------------------------------------ journal
 
-type Scalars = (u64, u64, u64, String, Option<u64>, u64);
+type Scalars = (u64, u64, u64, Option<u64>, u64);
 
 #[derive(Default)]
 pub struct PocJournal {
@@ -407,15 +408,15 @@ impl PocJournal {
         self.jurors.restore(&mut p.jurors);
         self.seances.restore(&mut p.seances);
         self.grants.restore(&mut p.grants);
-        if let Some((a, b, c, seed, open, next)) = self.scalars {
-            (p.next_claim_id, p.next_seance_id, p.next_grant_id, p.seed, p.open_seance, p.next_seance_at) = (a, b, c, seed, open, next);
+        if let Some((a, b, c, open, next)) = self.scalars {
+            (p.next_claim_id, p.next_seance_id, p.next_grant_id, p.open_seance, p.next_seance_at) = (a, b, c, open, next);
         }
     }
 }
 
 // ------------------------------------------------------------------------------- randomness
 
-/// Deterministic stream from the Séance seed (BLAKE3 XOF, domain-separated per use).
+/// Deterministic stream from a Séance's seed (BLAKE3 XOF, domain-separated per use).
 struct Rng(blake3::OutputReader);
 
 impl Rng {
@@ -517,7 +518,7 @@ impl State {
     fn pj<'j>(&self, j: &'j mut Journal) -> &'j mut PocJournal {
         if j.poc.scalars.is_none() {
             let p = &self.poc;
-            j.poc.scalars = Some((p.next_claim_id, p.next_seance_id, p.next_grant_id, p.seed.clone(), p.open_seance, p.next_seance_at));
+            j.poc.scalars = Some((p.next_claim_id, p.next_seance_id, p.next_grant_id, p.open_seance, p.next_seance_at));
         }
         &mut j.poc
     }
@@ -873,7 +874,11 @@ impl State {
                 self.pj(j).jurors.touch(&self.poc.jurors, &key);
                 let r = self.poc.jurors.entry(key).or_insert(Juror { bond: 0, joined_at: height, active: true, served: 0 });
                 r.bond = total;
-                r.active = true;
+                if !r.active {
+                    // A benched juror coming back is new to the draw (`State::seance_cutoff`).
+                    r.joined_at = height;
+                    r.active = true;
+                }
             }
             Action::LeaveJury {} => {
                 need_owner("leave the jury pool")?;
@@ -1125,22 +1130,60 @@ impl State {
 
     // ------------------------------------------------------------------------------ Séances
 
-    /// After every block's txs: advance the randomness, then close and open Séances.
-    pub fn poc_end_block(&mut self, height: u64, block_hash: &str) {
+    /// Séances may open every this many epochs: the fewest a Séance fits in, so each one closes
+    /// by the next opening.
+    pub fn seance_every_epochs(&self) -> u64 {
+        self.params.poc.seance_blocks.div_ceil(self.params.epoch_blocks.max(2)).max(1)
+    }
+
+    /// The first height at or after `height` where a Séance may open: the last block of every
+    /// [`State::seance_every_epochs`]th epoch. Fixed in advance; nothing on chain moves it.
+    pub fn next_seance_height(&self, height: u64) -> u64 {
+        let n = self.seance_every_epochs();
+        let epoch = (self.params.epoch_of(height) + 1).div_ceil(n) * n - 1;
+        self.params.last_of(epoch)
+    }
+
+    /// Jurors and claims a Séance opening at the end of `epoch` may draw on became eligible
+    /// before this height (joined; revert window over): the start of `epoch - 1`. The Séance's
+    /// seed, `value(epoch)`, comes from the reveals of `epoch - 1`, so whoever could still add a
+    /// juror or time a claim couldn't know how they'd be drawn. Before epoch 2 nothing is.
+    pub fn seance_cutoff(&self, epoch: u64) -> u64 {
+        epoch.saturating_sub(1).saturating_mul(self.params.epoch_blocks.max(2))
+    }
+
+    /// After every block's txs: close the open Séance once its reveals are over; at an epoch
+    /// boundary, refund stale claims and, on the cadence, open the next Séance.
+    pub fn poc_end_block(&mut self, height: u64) {
         if !self.poc.is_active() {
             return;
         }
-        let mut h = blake3::Hasher::new_derive_key("blockula poc seed v1");
-        h.update(self.poc.seed.as_bytes());
-        h.update(block_hash.as_bytes());
-        self.poc.seed = h.finalize().to_hex().to_string();
         if let Some(id) = self.poc.open_seance {
             if self.poc.seances.get(&id).is_some_and(|s| height >= s.reveal_until) {
                 self.close_seance(id, height);
             }
         }
-        if self.poc.open_seance.is_none() && height >= self.poc.next_seance_at {
-            self.open_seance(height);
+        if self.params.is_boundary(height) {
+            self.refund_stale_claims(height);
+            if self.poc.open_seance.is_none() && self.next_seance_height(height) == height {
+                self.open_seance(height, self.params.epoch_of(height));
+            }
+        }
+        if self.poc.next_seance_at <= height {
+            self.poc.next_seance_at = self.next_seance_height(height + 1);
+        }
+    }
+
+    /// Claims claimants can't help (validators never settled them) are refunded after
+    /// `claim_ttl_blocks`.
+    fn refund_stale_claims(&mut self, height: u64) {
+        let mut j = Journal::default();
+        let ttl = self.params.poc.claim_ttl_blocks;
+        let stale: Vec<(u64, String)> = self.poc.claims.values().filter(|c| c.status == ClaimStatus::Pending && height >= c.submitted_at.saturating_add(ttl)).map(|c| (c.id, format!("{}#{}", c.repo, c.pr))).collect();
+        for (id, pr_key) in stale {
+            self.settle_bond(&mut j, id, true);
+            self.set_status(&mut j, id, ClaimStatus::Rejected, height, Some("validators didn't settle it in time; bond refunded".into()));
+            self.set_claim_by_pr(&mut j, &pr_key, None);
         }
     }
 
@@ -1150,35 +1193,38 @@ impl State {
         juror == claimant || self.poc.vouches.get(claimant).is_some_and(|v| v.voucher == juror) || self.poc.vouches.get(juror).is_some_and(|v| v.voucher == claimant)
     }
 
-    fn open_seance(&mut self, height: u64) {
+    /// Opens a Séance at the end of `epoch` if at least 2 claims and `MIN_JURY` jurors are
+    /// eligible (see [`State::seance_cutoff`]); otherwise the next chance is the next opening on
+    /// the cadence.
+    fn open_seance(&mut self, height: u64, epoch: u64) {
         let mut j = Journal::default();
         let times = self.params.poc.clone();
-        // Pending claims validators never settled are refunded (not the claimant's fault).
-        let stale: Vec<(u64, String)> = self.poc.claims.values().filter(|c| c.status == ClaimStatus::Pending && height >= c.submitted_at.saturating_add(times.claim_ttl_blocks)).map(|c| (c.id, format!("{}#{}", c.repo, c.pr))).collect();
-        for (id, pr_key) in stale {
-            self.settle_bond(&mut j, id, true);
-            self.set_status(&mut j, id, ClaimStatus::Rejected, height, Some("validators didn't settle it in time; bond refunded".into()));
-            self.set_claim_by_pr(&mut j, &pr_key, None);
-        }
+        let cutoff = self.seance_cutoff(epoch);
         let claims: Vec<(u64, String)> = self
             .poc
             .claims
             .values()
-            .filter(|c| c.status == ClaimStatus::Verified && c.verified_at.is_some_and(|v| height >= v.saturating_add(times.claim_maturity_blocks)) && !self.is_sybil(&c.claimant) && self.poc.repos.contains_key(&c.repo))
+            .filter(|c| c.status == ClaimStatus::Verified && c.verified_at.is_some_and(|v| v.saturating_add(times.claim_maturity_blocks) < cutoff) && !self.is_sybil(&c.claimant) && self.poc.repos.contains_key(&c.repo))
             .take(MAX_SEANCE_CLAIMS)
             .map(|c| (c.id, c.claimant.clone()))
             .collect();
-        let retry = |s: &mut State| s.poc.next_seance_at = height + times.retry_blocks();
         if claims.len() < 2 {
-            return retry(self);
+            return;
         }
-        let seed = self.poc.seed.clone();
-        let mut pool: Vec<String> = self.poc.jurors.iter().filter(|(a, r)| r.active && !self.is_sybil(a) && self.soul_of(a, height) >= JUROR_MIN_SOUL).map(|(a, _)| a.clone()).collect();
         let id = self.poc.next_seance_id;
-        let mut rng = Rng::new(&seed, &[b"jury".as_slice(), &id.to_le_bytes()].concat());
-        rng.shuffle(&mut pool);
+        let Some(seed) = crate::beacon::seance_seed(self, epoch, id).map(hex::encode) else { return };
+        // Sortition: each eligible juror gets its own rank from the seed and the best-ranked who
+        // can judge a pair sit, so a juror joining or leaving can't reshuffle anyone else.
+        let mut pool: Vec<(u64, String)> = self
+            .poc
+            .jurors
+            .iter()
+            .filter(|(a, r)| r.active && r.joined_at < cutoff && !self.is_sybil(a) && self.soul_of(a, height) >= JUROR_MIN_SOUL)
+            .map(|(a, _)| (Rng::new(&seed, &[b"jury".as_slice(), a.as_bytes()].concat()).next(), a.clone()))
+            .collect();
+        pool.sort();
         let mut seats = BTreeMap::new();
-        for juror in pool {
+        for (_, juror) in pool {
             if seats.len() >= JURY_SIZE {
                 break;
             }
@@ -1203,7 +1249,7 @@ impl State {
             seats.insert(juror, JurySeat { pairs, ..Default::default() });
         }
         if seats.len() < MIN_JURY {
-            return retry(self);
+            return;
         }
         let pool_addr = self.pool();
         let budget = (bps(self.account(&pool_addr).balance, SEANCE_POOL_BPS) as u128 * (claims.len() as u64).min(FULL_BUDGET_CLAIMS) as u128 / FULL_BUDGET_CLAIMS as u128) as u64;
@@ -1408,7 +1454,6 @@ impl State {
         s.closed = true;
         s.results = Some(results);
         self.poc.open_seance = None;
-        self.poc.next_seance_at = height + 1;
     }
 }
 
@@ -1491,7 +1536,7 @@ mod tests {
 #[cfg(test)]
 mod scenarios {
     use super::*;
-    use crate::chain::{now_ms, Chain, SummonOpts};
+    use crate::chain::{now_ms, BlockInfo, Chain, Outcome, SummonOpts};
     use crate::crypto::Keys;
     use std::path::PathBuf;
 
@@ -1511,7 +1556,10 @@ mod scenarios {
 
     fn setup(tag: &str) -> T {
         let home = std::env::temp_dir().join(format!("blockula-poc-{tag}-{}-{}", now_ms(), std::process::id()));
-        Chain::summon(&home, &SummonOpts { contribution: Some(times()), ..SummonOpts::new("poc", 1) }).unwrap();
+        // The contribution pool holds only what these tests put in: issuance's pool share (P-ECON's
+        // to test) is off, so Séance budgets are exact.
+        let params = [("issuance_pool_bps".to_string(), 0)].into_iter().collect();
+        Chain::summon(&home, &SummonOpts { contribution: Some(times()), epoch_blocks: 10, params, ..SummonOpts::new("poc", 1) }).unwrap();
         let seed: [u8; 32] = hex::decode(std::fs::read_to_string(home.join("validator.key")).unwrap().trim()).unwrap().try_into().unwrap();
         let mut c = Chain::open(&home).unwrap();
         for i in 1..=12u8 {
@@ -1522,10 +1570,13 @@ mod scenarios {
     }
 
     impl T {
-        fn tx_as(&mut self, key: &Keys, from: &str, action: Action) -> Result<String> {
+        fn signed_as(&self, key: &Keys, from: &str, action: Action) -> Tx {
             let mut tx = Tx { chain_id: "poc".into(), genesis_hash: self.c.genesis_hash.clone(), nonce: self.c.next_nonce(from), from: from.into(), fee: 0, tip: 0, valid_until: self.c.height() + 100, action, memo: String::new(), public_key: hex::encode(key.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
             tx.fee = min_fee(tx.size());
-            let id = self.c.submit(tx.sign(key))?;
+            tx.sign(key)
+        }
+        fn tx_as(&mut self, key: &Keys, from: &str, action: Action) -> Result<String> {
+            let id = self.c.submit(self.signed_as(key, from, action))?;
             self.c.produce_block()?;
             match self.c.failure(&id) {
                 Some((r, _)) => bail!(r.clone()),
@@ -1577,6 +1628,16 @@ mod scenarios {
                 self.c.submit(tx.sign(&self.admin)).unwrap();
             }
             self.c.produce_block().unwrap();
+        }
+        /// Runs empty blocks until a Séance opens (at most a few cadences).
+        fn wait_for_seance(&mut self) -> u64 {
+            for _ in 0..200 {
+                if let Some(id) = self.c.state.poc.open_seance {
+                    return id;
+                }
+                self.blocks(1);
+            }
+            panic!("no Séance opened by block {}", self.h());
         }
         fn reopen_same_root(self) {
             let root = self.c.state.root();
@@ -1732,13 +1793,8 @@ mod scenarios {
         t.attest_all(&[big, tiny, ok]);
         assert!(t.c.state.poc.claims.values().all(|c| c.status != ClaimStatus::Pending));
         conserved(&t.c.state);
-        for _ in 0..10 {
-            if t.c.state.poc.open_seance.is_some() {
-                break;
-            }
-            t.blocks(1);
-        }
-        let sid = t.c.state.poc.open_seance.expect("a Séance opens once there are claims and jurors");
+        let sid = t.wait_for_seance();
+        assert_eq!(t.h(), t.c.state.next_seance_height(t.h()), "Séances open on the cadence");
         let s = t.c.state.poc.seances[&sid].clone();
         assert_eq!(s.claims, vec![big, tiny, ok]);
         assert_eq!(s.jurors.len(), 5);
@@ -1874,7 +1930,7 @@ mod scenarios {
         t.tx(&vet, Action::FundPool { amount: 50 * DROPS_PER_FANG }).unwrap();
         let c2 = t.claim(&other, 3).unwrap();
         t.attest(c2, true).unwrap();
-        let sid = t.c.state.poc.open_seance.expect("2 claims + 3 jurors open a Séance");
+        let sid = t.wait_for_seance();
         let s = t.c.state.poc.seances[&sid].clone();
         let mut sealed = vec![];
         for jk in [&j1, &j2] {
@@ -1914,6 +1970,88 @@ mod scenarios {
         t.admin(Action::RejectClaim { claim_id: c4, reason: "squatted".into() }).unwrap();
         t.claim(&other, 4).unwrap();
         conserved(&t.c.state);
+        t.reopen_same_root();
+    }
+
+    /// CRY-3: Séances open on a fixed cadence, seeded from the beacon, over jurors and claims
+    /// that were eligible before its value could be known. Whatever the opening block's proposer
+    /// does (reorder, censor or add txs, pick its block hash) the draw is the same, and a juror
+    /// leaving frees only its own seat.
+    #[test]
+    fn seance_draw_is_fixed_before_the_opening_block() {
+        let mut t = setup("draw");
+        t.admin(Action::SetRepo { repo: "jackdishman/blockula".into(), weight: 10 }).unwrap();
+        let jurors: Vec<Keys> = (1..=9).map(k).collect();
+        for j in &jurors {
+            t.grant(j, 10);
+            t.tx(j, Action::JoinJury { bond: JUROR_BOND }).unwrap();
+        }
+        let late = k(12);
+        t.grant(&late, 10);
+        let mut claims = vec![];
+        for (who, handle) in [(k(10), "ten"), (k(11), "eleven")] {
+            t.grant(&who, 1);
+            t.link(&who, handle);
+            claims.push(t.claim(&who, claims.len() as u64 + 1).unwrap());
+        }
+        t.attest_all(&claims);
+        // Openings are the last blocks of every 3rd epoch (30-block Séances, 10-block epochs); the
+        // first that may draw on these claims has its cutoff past their verification.
+        let st = &t.c.state;
+        assert_eq!(st.seance_every_epochs(), 3);
+        let mut at = st.next_seance_height(t.h() + 1);
+        while st.seance_cutoff(st.params.epoch_of(at)) <= t.h() {
+            at = st.next_seance_height(at + 1);
+        }
+        while t.h() < at - 1 {
+            t.blocks(1);
+        }
+        assert!(t.c.state.poc.open_seance.is_none() && t.c.state.poc.next_seance_at == at);
+        // Alternative opening blocks, each on a copy of the state (dropped before the restart check).
+        let pre = t.c.state.clone();
+        let epoch = pre.params.epoch_of(at);
+        let open = |txs: &[Tx], proposer: &str, hash: &str| -> Seance {
+            let mut st = pre.clone();
+            for tx in txs {
+                assert_eq!(st.apply(tx, "poc", proposer, at).unwrap(), Outcome::Applied);
+            }
+            let tx_bytes = txs.iter().map(Tx::size).sum();
+            st.end_block(&BlockInfo { height: at, hash, proposer, view: at, parent_view: at - 1, skipped: &[], tx_bytes });
+            st.check_invariants().unwrap();
+            let id = st.poc.open_seance.expect("a Séance opens on the cadence");
+            assert_eq!(st.poc.seances[&id].seed, hex::encode(crate::beacon::seance_seed(&st, epoch, id).unwrap()), "seeded from the beacon");
+            st.poc.seances[&id].clone()
+        };
+        let json = |s: &Seance| serde_json::to_value(s).unwrap();
+        fn draw(s: &Seance) -> serde_json::Value {
+            serde_json::to_value((&s.seed, &s.claims, &s.jurors)).unwrap()
+        }
+        let join = t.signed_as(&late, &late.address(), Action::JoinJury { bond: JUROR_BOND });
+        let fund = t.signed_as(&jurors[0], &jurors[0].address(), Action::FundPool { amount: 5 * DROPS_PER_FANG });
+        let pay = t.signed_as(&jurors[1], &jurors[1].address(), Action::Transfer { to: jurors[2].address(), amount: DROPS_PER_FANG });
+        let me = t.c.me().unwrap();
+        let a = open(&[join.clone(), fund.clone(), pay.clone()], &me, "a");
+        let b = open(&[pay, fund, join], &jurors[3].address(), "b");
+        let c = open(&[], &me, "c");
+        assert_eq!(a.opened_at, at);
+        assert_eq!((a.claims.clone(), a.jurors.len()), (claims.clone(), JURY_SIZE));
+        assert!(!a.jurors.contains_key(&late.address()), "joined after the cutoff");
+        assert_eq!(json(&a), json(&b), "reordering the opening block, another proposer, another hash: the same Séance");
+        assert_eq!(draw(&a), draw(&c), "censoring the opening block's txs changes nothing either");
+        // Sortition: an unseated juror leaving changes nothing; a seated one frees only its seat.
+        let unseated = jurors.iter().find(|j| !a.jurors.contains_key(&j.address())).unwrap();
+        assert_eq!(draw(&open(&[t.signed_as(unseated, &unseated.address(), Action::LeaveJury {})], &me, "d")), draw(&a));
+        let seated = jurors.iter().find(|j| a.jurors.contains_key(&j.address())).unwrap();
+        let e = open(&[t.signed_as(seated, &seated.address(), Action::LeaveJury {})], &me, "e");
+        assert!(!e.jurors.contains_key(&seated.address()) && e.jurors.len() == JURY_SIZE);
+        for (juror, seat) in a.jurors.iter().filter(|(j, _)| **j != seated.address()) {
+            assert_eq!(e.jurors[juror].pairs, seat.pairs, "the others keep their seats and pairs");
+        }
+        drop(pre);
+        // The real chain opens the same Séance at that height.
+        t.blocks(1);
+        let id = t.c.state.poc.open_seance.unwrap();
+        assert_eq!(draw(&t.c.state.poc.seances[&id]), draw(&c));
         t.reopen_same_root();
     }
 

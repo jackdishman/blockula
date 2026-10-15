@@ -179,7 +179,6 @@ async fn exchange_epochs(chain: Shared, peers: Vec<String>) {
     }
 }
 
-/// Fast sync an empty home from peers' certified snapshots (falls back to full replay).
 /// Validators check pending contribution claims against GitHub (the PR and the claimant's gist)
 /// and attest what they find. A quorum of attestations settles a claim on-chain.
 async fn attest_claims(chain: Shared) {
@@ -310,6 +309,101 @@ pub async fn report_evidence<E: commonware_runtime::Clock>(context: E, chain: Sh
         drop(c);
         if pending.len() != before {
             save(&pending);
+        }
+    }
+}
+
+/// Validators take part in the randomness beacon every block (`beacon::duties`): reveal the
+/// secret committed to for the next epoch, commit to a fresh one for the epoch after. Secrets
+/// live in `beacon-secrets.json` (0600) under the home, written before a commitment is sent, so
+/// a restart can still reveal.
+async fn beacon_duties(chain: Shared, home: PathBuf, block_time: Duration) {
+    let mut secrets = match crate::beacon::Secrets::open(&home) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "can't read the beacon secrets; this validator won't take part in the beacon");
+            return;
+        }
+    };
+    let mut tick = tokio::time::interval(block_time.max(Duration::from_millis(500)));
+    let mut last_error = String::new();
+    loop {
+        tick.tick().await;
+        let mut c = chain.lock();
+        if c.syncing() {
+            continue;
+        }
+        match crate::beacon::duties(&mut c, &mut secrets) {
+            Ok(done) => {
+                for d in done {
+                    tracing::info!("🎲 {d}");
+                }
+                last_error.clear();
+            }
+            // Once per distinct problem, not every block.
+            Err(e) if e.to_string() != last_error => {
+                tracing::warn!(error = %e, "beacon duty failed");
+                last_error = e.to_string();
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+/// How often a validator re-checks a claim in its revert window, and retries after GitHub errors.
+const REVERT_RECHECK: Duration = Duration::from_secs(3600);
+const REVERT_RETRY: Duration = Duration::from_secs(600);
+
+/// Validators re-check verified claims during their revert window (`beacon::revert_window_open`)
+/// for a revert on GitHub, and attest it (`AttestRevert`). A quorum on the same revert commit
+/// rejects the claim.
+async fn attest_reverts(chain: Shared) {
+    use crate::types::Action;
+    use std::time::Instant;
+    let mut tick = tokio::time::interval(Duration::from_secs(60));
+    let mut next_check: std::collections::HashMap<u64, Instant> = Default::default();
+    loop {
+        tick.tick().await;
+        let todo: Vec<(u64, String, u64, String)> = {
+            let c = chain.lock();
+            let (Some(me), Some(keys)) = (c.me(), c.keys.as_ref()) else { return };
+            let next = c.height() + 1;
+            let epoch = c.state.params.epoch_of(next);
+            if c.syncing() || crate::staking::validator_for_signer(&c.state, &me, &crate::types::key_id(&keys.public_key()), epoch).is_none() {
+                continue;
+            }
+            let pk = hex::encode(keys.public_key());
+            let queued: std::collections::BTreeSet<u64> = c.mempool.iter().filter(|t| t.public_key == pk).filter_map(|t| if let Action::AttestRevert { claim_id, .. } = t.action { Some(claim_id) } else { None }).collect();
+            let st = &c.state;
+            next_check.retain(|id, _| st.poc.claims.get(id).is_some_and(|cl| crate::beacon::revert_window_open(st, cl, next)));
+            st.poc
+                .claims
+                .values()
+                .filter(|cl| crate::beacon::revert_window_open(st, cl, next) && !queued.contains(&cl.id))
+                .filter(|cl| !st.beacon.reverts.get(&cl.id).is_some_and(|r| r.contains_key(&me)))
+                .filter(|cl| next_check.get(&cl.id).is_none_or(|t| Instant::now() >= *t))
+                .filter_map(|cl| Some((cl.id, cl.repo.clone(), cl.pr, cl.merge_sha.clone()?)))
+                .take(4)
+                .collect()
+        };
+        for (id, repo, pr, merge_sha) in todo {
+            match crate::github::find_revert(&repo, pr, &merge_sha).await {
+                Ok(Some(r)) => {
+                    let memo = format!("↩️ {repo}#{pr}: {}", r.how);
+                    match chain.lock().submit_system(Action::AttestRevert { claim_id: id, revert_sha: r.sha }, &memo) {
+                        Ok(_) => tracing::info!(claim = id, %memo, "attested a revert"),
+                        Err(e) => tracing::warn!(claim = id, error = %e, "couldn't submit a revert attestation"),
+                    }
+                    next_check.insert(id, Instant::now() + REVERT_RECHECK);
+                }
+                Ok(None) => {
+                    next_check.insert(id, Instant::now() + REVERT_RECHECK);
+                }
+                Err(e) => {
+                    tracing::warn!(claim = id, error = %e, "couldn't check a claim for reverts on GitHub; retrying later");
+                    next_check.insert(id, Instant::now() + REVERT_RETRY);
+                }
+            }
         }
     }
 }
@@ -566,6 +660,8 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
         let (handle, marshal) = consensus::start_validator(context.child("node"), vcfg, oracle.clone(), oracle.clone(), channels).await;
         tokio::spawn(exchange_epochs(shared.clone(), peers.clone()));
         tokio::spawn(attest_claims(shared.clone()));
+        tokio::spawn(beacon_duties(shared.clone(), home.clone(), Duration::from_millis(block_time_ms)));
+        tokio::spawn(attest_reverts(shared.clone()));
         tokio::spawn(watch_halts(shared.clone(), protection.clone()));
         let mut node = http_node(shared, Some(marshal), peers, &net, &trust);
         node.protection = Some(protection);

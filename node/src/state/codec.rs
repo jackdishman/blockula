@@ -20,8 +20,9 @@ use std::io::{Read, Write};
 /// validator commission, the module namespaces). 3: economics (P-ECON: name expiry, lock ids and
 /// vote locks, the `econ` scalars: fee ring, issuance year, name sweep), staking (P-STAKE:
 /// pools, delegations, unbonding entries, punished faults and liveness under namespaces 32–36, its
-/// META scalar; validator records without a bond, statuses candidate/active/removed/tombstoned)
-/// and governance (P-GOV: its records and `multisig_expiry_blocks`).
+/// META scalar; validator records without a bond, statuses candidate/active/removed/tombstoned),
+/// governance (P-GOV: its records and `multisig_expiry_blocks`) and the randomness beacon (its
+/// rounds, values and revert attestations; the PoC scalars lose the block-hash seed).
 pub const SCHEMA_VERSION: u32 = 3;
 
 pub fn encode<T: BorshSerialize + ?Sized>(v: &T) -> Vec<u8> {

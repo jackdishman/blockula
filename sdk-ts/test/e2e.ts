@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex, randomBytes } from "@noble/hashes/utils.js";
-import { ApiError, Client, POP_CONTEXT, Wallet, addressFromPublicKey, addressPrefix, baseFee, formatFang, isAddress, minFee, parseFang, parseSoul, popMessage, seanceCommitment, signingBytes, txBytes, txCharge, txId, txSize, type Action, type ProposalKind, type Tx } from "../src/index.js";
+import { ApiError, Client, POP_CONTEXT, Wallet, addressFromPublicKey, addressPrefix, baseFee, beaconCommitment, formatFang, isAddress, minFee, parseFang, parseSoul, popMessage, seanceCommitment, signingBytes, txBytes, txCharge, txId, txSize, type Action, type ProposalKind, type Tx } from "../src/index.js";
 
 const client = new Client(process.env.BLOCKULA_RPC ?? "http://localhost:7070");
 
@@ -239,6 +239,8 @@ console.log("✓ hunts, Familiars and GitHub links work");
 // 🪦 Proof of Contribution. Same vector as node/src/types.rs `contribution_encodings_match_the_sdk`.
 assert.equal(seanceCommitment(3, "boo1juror", "ab=", [1, 2], "pepper"), "1f3071e1123a713836e2c9c27798dc74ed1fd1f97de6b5fd985c0dba8f9f7eae");
 assert.equal(parseSoul("2.5"), 2500);
+// Same vector as node/src/beacon/tests.rs `hashes_are_domain_separated_and_stable`.
+assert.equal(beaconCommitment("beacon", 2, "boo1v", "07".repeat(32)), "04a492304d681e4905279135f0a7120f14ef2ea203f0b0dfdfa289c12f2e2f8a");
 // Every new action is signed by the SDK and verified by the node; these fail on the rules, not the signature.
 await assert.rejects(alice.joinJury("10"), /jurors need at least 5 Soul/);
 await assert.rejects(alice.vouch(bob.address), /at least 10 Soul/);
@@ -282,9 +284,9 @@ if (process.env.BLOCKULA_ADMIN_SEED) {
 }
 console.log("✓ Proof of Contribution txs verify and enforce their rules");
 
-// Protocol v1 (tags 30–49): the SDK signs them and the node verifies them; modules that haven't
-// shipped yet refuse them with "not active yet". Staking works; names renew, transfer and
-// release; governance txs (P-GOV) are live, so they're refused for their own reasons here.
+// Protocol v1 (tags 30–49): the SDK signs them and the node verifies them; every module is live.
+// Staking works; names renew, transfer and release; governance, beacon and revert txs are
+// refused here for their own reasons.
 const validator: string = (await client.validators()).active[0].validator.address;
 // Staking: delegate to the dev validator, start unbonding part of it; nothing is free yet.
 console.log("✓", (await client.submit(await alice.build({ type: "delegate", validator, amount: parseFang("2").toString() }))).summary);
@@ -295,12 +297,6 @@ const staking = await (await fetch(`${process.env.BLOCKULA_RPC ?? "http://localh
 assert.equal(staking.delegations.find((d: any) => d.validator.address === validator).value, parseFang("1").toString());
 assert.equal(staking.unbonding, parseFang("1").toString());
 console.log("✓", staking.summary);
-const notYet: Action[] = [
-  { type: "beacon_commit", epoch: 1, commitment: "ab".repeat(32) },
-];
-for (const action of notYet) {
-  await assert.rejects(client.submit(await alice.build(action)), /not active yet/, action.type);
-}
 const before = await client.name(name);
 assert.equal(before.status, "active");
 const renewed = await client.submit(await alice.build({ type: "renew_name", name, years: 1 }));
@@ -316,6 +312,10 @@ const governance: [Action, RegExp][] = [
 for (const [action, why] of governance) {
   await assert.rejects(client.submit(await alice.build(action)), why, action.type);
 }
+// The randomness beacon and revert attestations are live, for validators only.
+const epoch2 = (await client.status()).epoch + 2;
+await assert.rejects(client.submit(await alice.build({ type: "beacon_commit", epoch: epoch2, commitment: beaconCommitment("blockula-dev", epoch2, alice.address, "07".repeat(32)) })), /commit to the beacon/);
+await assert.rejects(client.submit(await alice.build({ type: "attest_revert", claim_id: 0, revert_sha: "cd".repeat(20) })), /only active validators attest reverts/);
 const moved = await client.submit(await alice.build({ type: "transfer_name", name: `${name}.boo`, to: bob.address }));
 console.log("✓", moved.summary);
 assert.equal(await client.resolve(`${name}.boo`), bob.address);

@@ -184,6 +184,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
 - **Missing:** the Séance seed chains block hashes (`poc.rs:1076-1092`). The proposer of the block that opens a Séance can reorder its txs to choose the jurors (PLAN.md "Known limits"). Commonware's `Random` elector needs BLS threshold signatures, which aren't post-quantum, so there's no beacon to borrow.
 - **Why it blocks:** a validator that is also a claimant can choose its own jury and pay itself from the pool.
 - **Done when:** jury draws are seeded by a PQ-safe beacon (for example, per-epoch commit-reveal among validators with slashing for withholding, or a hash-based VRF). The opening height is fixed in advance. Tests show a proposer can't change the jury.
+- ✅ **Wave 3 (P-BEACON):** a per-epoch commit-reveal beacon among the active validators (`beacon.rs`: commit during e for e + 2, reveal during e + 1, value = BLAKE3 over the previous value and the sorted reveals; non-revealers are jailed with `beacon_miss_slash_bps`; nodes keep their secrets on disk, 0600, written before committing). Séances open only at the last block of every n-th epoch, seeded from that epoch's value, over jurors and claims fixed before it could be known, with per-juror sortition. Tests: reordering or censoring the opening block, another proposer or block hash, and unseated jurors leaving don't change the jury (`seance_draw_is_fixed_before_the_opening_block`); reveal order and placement don't change the value, withholding does and is recorded (`only_withholding_changes_the_value`); a 4-validator simulator run. The remaining influence is the withholding bit (PLAN.md "Known limits"). Pending: jailing and its slash land with P-STAKE (`staking::jail`), the audit.
 - **Effort:** L. **Who:** Team, Auditor.
 
 ### Consensus, state & validator set
@@ -341,6 +342,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
   PLAN.md "Known limits": "Phase 3 moves these to governance and juries."
 - **Why it blocks:** whoever holds the key decides who earns from the pool. If Soul feeds voting weight, as PLAN.md plans, it also decides governance.
 - **Done when:** either the pool is off at genesis and turned on at an activation height once jury-run flags and revert checks exist (DEC-1), or every lever goes through governance with a timelock and an appeal path. Either way, Soul is bootstrapped by a one-time, published genesis ledger, not an ongoing grant power.
+- ✅ **Revert checks (wave 3, P-BEACON):** validators re-check verified claims on GitHub during their ~30-day revert window and sign `AttestRevert`; a BFT quorum of the current set naming the same revert commit rejects the claim through the `RejectClaim` lever (bond slashed into the pool, rewards and Soul clawed back). Non-validators and claims outside their window are refused (`a_quorum_on_one_revert_rejects_the_claim`, `the_revert_window_closes_after_maturity`; GitHub parsing on recorded responses in `github.rs`). Pending: the governance levers (P-GOV), jury-run sybil flags.
 - **Effort:** L. **Who:** Team.
 - ✅ **Levers (P-GOV):** Soul starts from the genesis `soul_ledger`; afterwards only juries and `GrantSoul` proposals (≤ 100 Soul each, timelocked) change it. `SetRepo`, `GrantSoul`, `FlagSybil`, `RejectClaim` and `Clawback` txs work only on chains with admins (dev and test); on mainnet each is a proposal, and a later proposal is the appeal path. Pending: revert attestations replacing admin rejection (P-BEACON).
 
@@ -538,6 +540,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
 **SF-1. Predictable leaders.**
 - **Missing:** `RoundRobin` (`consensus.rs:785`) publishes the leader schedule, and validator p2p addresses are public in genesis. That makes it cheap to DoS whoever leads next.
 - **Done when:** the leader order is seeded per epoch from CRY-3's beacon, and sentry nodes hide validator IPs.
+- ✅ **Leader order (wave 3, P-BEACON):** each epoch's elector is Commonware's `RoundRobin::shuffled` with a seed derived from that epoch's beacon value (`consensus::elector`). Validators reveal in the second half of the previous epoch, so the order is known at most half an epoch ahead. `consensus::leader` elects the same way from state, for downtime accounting; the simulator checks every proposer against it (`beacon_rounds_seed_the_leader_order`). Pending: sentries.
 - **Effort:** M.
 
 **SF-2. Clock skew.**
