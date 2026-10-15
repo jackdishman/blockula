@@ -34,6 +34,15 @@ CI (`.github/workflows/fuzz.yml`) runs the stable checks on PRs that touch `node
 
 The node is a binary crate with no library target, so `src/lib.rs` compiles its modules straight from `node/src` through a `#[path]` module and re-exports them, so the node's `crate::…` paths still resolve. The node crate itself doesn't change. In exchange, this crate repeats the node's module list and `[dependencies]`; `check-sync.sh` (run in CI) fails when they drift. If the node gains a `lib.rs`, this crate can depend on it and drop both copies.
 
+## Results (2026-10-15, local, Apple M-series): the state machine and the tx genesis hash
+
+| Target | Executions | Result |
+|---|---|---|
+| `state_machine` | 2,920 (7 min, 1 worker) + 116,778 (20 min, `-fork=6`), from the committed seeds; 13,783 edges, corpus 2,838 | no crash, no invariant or determinism failure |
+| `tx_wire` | 94,116 (60 s), after Txs gained `genesis_hash` | no crash |
+| `tx_json` | 143,749 (60 s) | no crash |
+| `cblock` | 27,614 (60 s) | no crash |
+
 ## Results (2026-10-14, local, Apple M-series, nightly-2026-10-13)
 
 Protocol v1 formats (Tx v3, CBlock v2, state records), after the FUZZ-1/FUZZ-2 fixes, from the committed seeds:
