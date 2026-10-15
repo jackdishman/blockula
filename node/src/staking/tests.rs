@@ -744,6 +744,45 @@ fn missed_leader_slots_jail_and_the_validator_may_unjail_later() {
     assert!(t.set(t.epoch + 1).contains(&victim), "back at the next boundary");
 }
 
+#[test]
+fn liveness_rings_slide_and_saturate() {
+    let mut l = Liveness::new(10);
+    assert_eq!(l.bits.len(), 2);
+    for i in 0..10 {
+        l.push(i % 3 == 0); // misses at 0, 3, 6, 9
+    }
+    assert_eq!((l.filled, l.missed, l.led, l.missed_total), (10, 4, 6, 4));
+    // The window slides: the oldest slot (a miss) falls out as a hit comes in.
+    l.push(false);
+    assert_eq!((l.filled, l.missed), (10, 3));
+    l.miss(2);
+    assert_eq!(l.missed, 5, "two hits fell out, two misses came in");
+    // A long outage fills the window, whatever its alignment.
+    l.miss(25);
+    assert_eq!((l.filled, l.missed, l.next, l.missed_total), (10, 10, 0, 4 + 2 + 25));
+    assert_eq!(l.bits, vec![0xff, 0b11]);
+    l.push(false);
+    assert_eq!(l.missed, 9);
+}
+
+/// A long stall: every validator is charged once per lap of the views that were nullified, and
+/// the leftover views' leaders once more.
+#[test]
+fn long_outages_are_charged_per_lap() {
+    let mut t = Setup { params: vec![("downtime_window", 100), ("downtime_max_missed", 50)], ..Default::default() }.start();
+    t.block();
+    let (epoch, from) = (t.epoch, t.view);
+    t.skip = 9; // views from+1 ..= from+9: two laps of 4, and one more
+    t.block();
+    let order = leaders(&t.st, epoch);
+    let extra = &order[leader_index(epoch, from + 9, 4)];
+    for v in &order {
+        let want = if v == extra { 3 } else { 2 };
+        assert_eq!(t.st.staking.liveness[v].missed, want, "{v}");
+    }
+    assert!(order.iter().all(|v| t.st.staking.pools[v].jail.is_none()));
+}
+
 // ----------------------------------------------------------------------------- junk charge
 
 #[test]
@@ -852,6 +891,13 @@ fn consensus_keys_sign_system_txs_for_their_owners() {
     assert!(t.apply(&other).unwrap_err().to_string().contains("isn't authorized"));
     let not_mine = t.tx_from(&keys(vseed(3)), &o.address(), Action::ReportEquivocation { evidence: double_notarize(&t, 2, 1, 2) });
     assert!(t.apply(&not_mine).is_err());
+    // Attestations too: the consensus key's claim check counts as validator 1's (it gets to the
+    // claim, which doesn't exist here), while a stranger isn't a validator at all.
+    let attest = |t: &T, k: &Keys, from: &str| t.tx_from(k, from, Action::AttestClaim { claim_id: 0, ok: false, merge_sha: String::new(), note: String::new() });
+    let tx = attest(&t, &ck, &o.address());
+    assert_eq!(t.apply(&tx).unwrap(), Outcome::Failed("no claim #0".into()));
+    let tx = attest(&t, &stranger, &stranger.address());
+    assert_eq!(t.apply(&tx).unwrap(), Outcome::Failed("only active validators can attest claims".into()));
     // It also picks which validator an owner's `UpdateValidator` means.
     let upd = t.tx_from(&ck, &o.address(), Action::UpdateValidator { commission_bps: 1_050, p2p_addr: String::new(), http_addr: String::new() });
     assert_eq!(t.apply(&upd).unwrap(), Outcome::Applied);
