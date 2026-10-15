@@ -187,26 +187,32 @@ blockula wallet balance --rpc https://<node>
 
 ## Become a validator
 
-Season 0 is allowlisted: anyone can bond and register, and a validator admin listed in genesis approves. Everything is on-chain and visible in the explorer's Validators page.
+Validators are permissionless: anyone can register one with a self-bond, anyone can delegate to it, and at each epoch boundary the top `max_validators` by stake make the set (newcomers at most a third of it). Double-signing is slashed and banned for good; missing too many turns gets a validator jailed until it unjails. Everything is on-chain and visible in the explorer's Validators page.
 
 ```bash
 # 1. Create a validator home: fetches genesis, generates the ML-DSA-65 key, records your public addresses
 blockula validator init --home ~/val --genesis https://<any node> \
   --public-p2p-addr <your-ip>:30300 --public-http-addr <your-ip>:7070
-# 2. Fund the printed address with the minimum bond plus fees (testnets: the faucet, POST /api/faucet)
-# 3. Bond and register, signed by the validator's own account. The consensus key also signs a
+# 2. Fund the printed address with the minimum self-bond plus fees (testnets: the faucet, POST /api/faucet)
+# 3. Start the node: it syncs now and votes once it's in the active set
+blockula run --home ~/val --bind 0.0.0.0
+# 4. Bond and register, signed by the validator's own account. The consensus key also signs a
 #    proof of possession, so nobody can register a key they don't hold.
-#    (Registering from another account? `blockula validator pop --home ~/val --owner boo1…`
+#    (Registering from another owner account? `blockula validator pop --home ~/val --owner boo1…`
 #    prints the `pop` field for the SDK's `registerValidator`.)
 blockula validator register --home ~/val --rpc https://<any node>
-# 4. Start the node: it syncs now and starts voting from its activation epoch
-blockula run --home ~/val --bind 0.0.0.0
-# Admin (Season 0): approve, remove, list
+# Stake: delegate, start unbonding, withdraw what's free, see an account's stake
+blockula validator delegate boo1… 1000 --key wallet.json --rpc https://<any node>
+blockula validator undelegate boo1… --all --key wallet.json --rpc https://<any node>
+blockula validator withdraw --key wallet.json --rpc https://<any node>
+blockula validator stake <address or name> --rpc https://<any node>
+# Operators: commission (moves a little per epoch), unjail after downtime
+blockula validator commission 500 --key ~/val/validator.key --rpc https://<any node>
+blockula validator unjail boo1… --key ~/val/validator.key --rpc https://<any node>
+blockula validator list --rpc https://<any node>
+# Dev and test chains only (admins): pin a validator ahead of stake, or remove one
 blockula validator approve boo1… --key admin.key --rpc https://<any node>
 blockula validator remove  boo1… --key admin.key --rpc https://<any node>
-blockula validator list --rpc https://<any node>
-# After removal, the owner reclaims the bond one epoch after the validator left
-blockula validator unbond boo1… --key ~/val/validator.key --rpc https://<any node>
 ```
 
 The p2p transport authenticates peers with ML-DSA-65 and derives its ChaCha20-Poly1305 keys from a

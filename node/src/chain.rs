@@ -1414,7 +1414,7 @@ impl State {
             Action::RemoveKey { key_id } => format!("{from} revoked key {}…", &key_id[..key_id.len().min(10)]),
             Action::RegisterValidator { consensus_key, bond, .. } => {
                 let v = hex::decode(consensus_key).map(|pk| short(&crypto::address_with_prefix(self.params.prefix(), &pk))).unwrap_or_default();
-                format!("{from} bonded {} to run validator {v}, a candidate for the active set from the next epoch", fmt_fang(*bond))
+                format!("{from} bonded {} to run validator {v}, a candidate for the active set (chosen by stake at each epoch boundary)", fmt_fang(*bond))
             }
             Action::ApproveValidator { validator } => {
                 let when = match self.validators.get(validator).and_then(|v| v.active_from) {
