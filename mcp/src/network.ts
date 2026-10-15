@@ -45,8 +45,10 @@ export const KNOWN_GENESIS: Record<string, string> = {};
 /** The networks the MCP knows by name. */
 export const KNOWN_NETWORKS: Record<Exclude<NetworkKey, "custom">, Omit<Network, "rpc"> & { rpc?: string }> = {
   mainnet: { key: "mainnet", label: "Blockula mainnet", rpc: MAINNET_RPCS[0], pin: { chainId: "blockula-1", prefix: "boo" }, mainnet: true, remember: true },
-  // Today's public testnet predates the `tboo` prefix (DEC-7); a protocol v1 testnet will pin it here.
-  testnet: { key: "testnet", label: "public testnet", rpc: TESTNET_RPC, pin: { chainId: "blockula-testnet" }, mainnet: false, remember: true },
+  // The protocol v1 public testnet (deploy/launch.sh): its own chain id (never reused) and the
+  // testnet prefix (DEC-7). Its genesis hash exists only once it launches: until a release adds it
+  // to KNOWN_GENESIS, the first status the node reports pins it (trust on first use, remembered).
+  testnet: { key: "testnet", label: "public testnet", rpc: TESTNET_RPC, pin: { chainId: "blockula-testnet-2", prefix: "tboo" }, mainnet: false, remember: true },
   local: { key: "local", label: "local dev node", rpc: LOCAL_RPC, pin: {}, mainnet: false, remember: false },
 };
 
@@ -180,10 +182,13 @@ export class KnownChains {
 /**
  * The pin to enforce for a network: its configured pin, filled from what was remembered for it.
  * A remembered field never overrides a configured one; a contradiction means the configuration
- * changed, and the configuration wins.
+ * changed, and the configuration wins. What was remembered for another chain id (the network was
+ * relaunched under a new one, which this release pins) isn't used at all: the new chain is
+ * pinned on first use instead of refused for the old one's genesis.
  */
 export function effectivePin(net: Network, remembered?: Pin): Pin {
-  return { chainId: net.pin.chainId ?? remembered?.chainId, genesisHash: net.pin.genesisHash ?? remembered?.genesisHash, prefix: net.pin.prefix ?? remembered?.prefix };
+  const r = remembered && (!net.pin.chainId || !remembered.chainId || remembered.chainId === net.pin.chainId) ? remembered : undefined;
+  return { chainId: net.pin.chainId ?? r?.chainId, genesisHash: net.pin.genesisHash ?? r?.genesisHash, prefix: net.pin.prefix ?? r?.prefix };
 }
 
 /** The error an agent sees when a node is on the wrong chain: what happened and what the user can do. */

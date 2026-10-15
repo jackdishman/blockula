@@ -29,7 +29,7 @@ const G2 = "22".repeat(32);
 
 assert.deepEqual(
   [resolveNetwork({}).key, resolveNetwork({}).rpc, resolveNetwork({}).pin.chainId],
-  ["testnet", TESTNET_RPC, "blockula-testnet"],
+  ["testnet", TESTNET_RPC, "blockula-testnet-2"],
   "nothing configured: the public testnet, never a local node",
 );
 assert.equal(resolveNetwork({}, ["--network", "local"]).rpc, LOCAL_RPC);
@@ -86,6 +86,12 @@ known.save(custom, { chainId: "a", genesisHash: G1 });
 assert.deepEqual(new KnownChains(known.file).get(custom), { chainId: "a", genesisHash: G1 });
 assert.deepEqual(effectivePin(custom, known.get(custom)), { chainId: "a", genesisHash: G1, prefix: undefined });
 assert.deepEqual(effectivePin(pinned, { chainId: "other", genesisHash: G2 }), { chainId: "x", genesisHash: G1, prefix: undefined }, "configuration beats memory");
+// The testnet relaunched under a new chain id: what was remembered for the old one (its genesis)
+// isn't held against the new one, which is pinned on first use.
+const testnet = resolveNetwork({});
+assert.deepEqual([testnet.pin.chainId, testnet.pin.prefix, testnet.pin.genesisHash], ["blockula-testnet-2", "tboo", undefined], "its genesis exists only once it launches");
+assert.deepEqual(effectivePin(testnet, { chainId: "blockula-testnet", genesisHash: G2, prefix: "boo" }), { chainId: "blockula-testnet-2", genesisHash: undefined, prefix: "tboo" });
+assert.deepEqual(effectivePin(testnet, { chainId: "blockula-testnet-2", genesisHash: G1, prefix: "tboo" }), { chainId: "blockula-testnet-2", genesisHash: G1, prefix: "tboo" });
 const local = resolveNetwork({}, ["--network", "local"]);
 known.save(local, { chainId: "blockula-dev", genesisHash: G1 });
 assert.equal(known.get(local), undefined, "dev chains are re-pinned each session (a reset makes a new genesis)");
