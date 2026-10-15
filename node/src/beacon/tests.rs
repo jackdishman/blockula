@@ -99,7 +99,8 @@ fn hashes_are_domain_separated_and_stable() {
     assert_ne!(derive(&prev, 5, &[]), derive(&prev, 6, &[]), "the fallback still moves each epoch");
     assert_ne!(derive(&prev, 5, &[]), derive(&[2; 32], 5, &[]), "and chains the previous value");
     // Format change detectors (consensus rules: every node must derive the same values), checked
-    // against an independent JS implementation (noble BLAKE3 in derive-key mode).
+    // against an independent JS implementation (noble BLAKE3 in derive-key mode). The SDK's
+    // `beaconCommitment` asserts the same commitment vector (sdk-ts/test/e2e.ts).
     assert_eq!(hex::encode(c), "04a492304d681e4905279135f0a7120f14ef2ea203f0b0dfdfa289c12f2e2f8a");
     assert_eq!(hex::encode(derive(&prev, 5, &r)), "ed4f87836e1cd56f7f119978d4c0e7decaa543e1b0e1d5a0a6f553fb95c25fa7");
     assert_eq!(hex::encode(genesis_value("blockula-1", 0)), "69e2aac3ae73a4d4e673feaa07488c61ea4ac584c63942d6f5e8f1319bb0ed7e");

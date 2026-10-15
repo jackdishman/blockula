@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex, randomBytes } from "@noble/hashes/utils.js";
-import { ApiError, Client, POP_CONTEXT, Wallet, addressFromPublicKey, addressPrefix, formatFang, isAddress, minFee, parseFang, parseSoul, popMessage, seanceCommitment, signingBytes, txBytes, txCharge, txId, txSize, type Action, type ProposalKind, type Tx } from "../src/index.js";
+import { ApiError, Client, POP_CONTEXT, Wallet, addressFromPublicKey, addressPrefix, beaconCommitment, formatFang, isAddress, minFee, parseFang, parseSoul, popMessage, seanceCommitment, signingBytes, txBytes, txCharge, txId, txSize, type Action, type ProposalKind, type Tx } from "../src/index.js";
 
 const client = new Client(process.env.BLOCKULA_RPC ?? "http://localhost:7070");
 
@@ -228,6 +228,8 @@ console.log("✓ hunts, Familiars and GitHub links work");
 // 🪦 Proof of Contribution. Same vector as node/src/types.rs `contribution_encodings_match_the_sdk`.
 assert.equal(seanceCommitment(3, "boo1juror", "ab=", [1, 2], "pepper"), "1f3071e1123a713836e2c9c27798dc74ed1fd1f97de6b5fd985c0dba8f9f7eae");
 assert.equal(parseSoul("2.5"), 2500);
+// Same vector as node/src/beacon/tests.rs `hashes_are_domain_separated_and_stable`.
+assert.equal(beaconCommitment("beacon", 2, "boo1v", "07".repeat(32)), "04a492304d681e4905279135f0a7120f14ef2ea203f0b0dfdfa289c12f2e2f8a");
 // Every new action is signed by the SDK and verified by the node; these fail on the rules, not the signature.
 await assert.rejects(alice.joinJury("10"), /jurors need at least 5 Soul/);
 await assert.rejects(alice.vouch(bob.address), /at least 10 Soul/);
@@ -282,13 +284,16 @@ const notYet: Action[] = [
   { type: "vote", proposal_id: 0, aye: true, amount: "1", conviction: 1 },
   { type: "unlock" },
   { type: "multisig_propose", action: { type: "transfer", to: bob.address, amount: "1" } },
-  { type: "beacon_commit", epoch: 1, commitment: "ab".repeat(32) },
   { type: "claim_distribution", distribution_id: 0, amount: "1", proof: ["cd".repeat(32)] },
   { type: "renew_name", name, years: 1 },
 ];
 for (const action of notYet) {
   await assert.rejects(client.submit(await alice.build(action)), /not active yet/, action.type);
 }
+// The randomness beacon and revert attestations are live, for validators only.
+const epoch2 = (await client.status()).epoch + 2;
+await assert.rejects(client.submit(await alice.build({ type: "beacon_commit", epoch: epoch2, commitment: beaconCommitment("blockula-dev", epoch2, alice.address, "07".repeat(32)) })), /commit to the beacon/);
+await assert.rejects(client.submit(await alice.build({ type: "attest_revert", claim_id: 0, revert_sha: "cd".repeat(20) })), /only active validators attest reverts/);
 const moved = await client.submit(await alice.build({ type: "transfer_name", name: `${name}.boo`, to: bob.address }));
 console.log("✓", moved.summary);
 assert.equal(await client.resolve(`${name}.boo`), bob.address);
