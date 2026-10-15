@@ -286,6 +286,8 @@ export function proposalSummary(raw: unknown): ProposalSummary {
   const kind = first(p, "kind", "action");
   const proposer = first(p, "proposer", "from", "by");
   const cAyes = num(first(council, "ayes", "aye", "approvals"));
+  const turnout = first(tally, "turnout", "locked") ?? first(p, "turnout");
+  const quorum = first(tally, "quorum") ?? first(p, "quorum");
   return {
     id: num(p.id) ?? -1,
     title: String(p.title ?? ""),
@@ -298,8 +300,8 @@ export function proposalSummary(raw: unknown): ProposalSummary {
     deposit: drops(first(p, "deposit")),
     aye: drops(first(tally, "aye", "ayes", "aye_weight") ?? first(p, "aye", "ayes", "aye_weight")),
     nay: drops(first(tally, "nay", "nays", "nay_weight") ?? first(p, "nay", "nays", "nay_weight")),
-    turnout: first(tally, "turnout", "locked") ?? first(p, "turnout") ? drops(first(tally, "turnout", "locked") ?? first(p, "turnout")) : undefined,
-    quorum: first(tally, "quorum") ?? first(p, "quorum") ? drops(first(tally, "quorum") ?? first(p, "quorum")) : undefined,
+    turnout: turnout === undefined ? undefined : drops(turnout),
+    quorum: quorum === undefined ? undefined : drops(quorum),
     council: cAyes !== undefined ? { ayes: cAyes, nays: num(first(council, "nays", "nay", "rejections")) ?? 0, of: num(first(council, "of", "active", "set_size", "validators")) ?? 0, needed: num(first(council, "needed", "threshold")) } : undefined,
     voting_ends_at: num(first(p, "voting_ends_at", "voting_until", "ends_at", "end")),
     executes_at: num(first(p, "executes_at", "timelock_until", "execute_at")),

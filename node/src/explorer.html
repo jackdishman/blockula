@@ -450,7 +450,7 @@ views.validators = async function () {
     if (self && stake) bits.push(`self-bond ${esc(self)}`);
     if (x.commission_bps != null) bits.push(`${term("commission", "commission")} ${pct(x.commission_bps)}`);
     const delegators = pick(x, "delegators", "delegator_count");
-    if (delegators != null) bits.push(plural(Array.isArray(delegators) ? delegators.length : delegators, "delegator"));
+    if (delegators != null) bits.push(plural(Number(Array.isArray(delegators) ? delegators.length : delegators), "delegator"));
     const missed = pick(x, "missed", "missed_slots");
     if (missed != null) bits.push(`missed ${esc(missed)} of its last turns`);
     const pills = [x.tombstoned ? `<span class="pill failed">tombstoned</span>` : "", jailed(x) ? `<span class="pill failed" title="${esc(x.jailed_until != null ? `can unjail from block #${x.jailed_until}` : "")}">${term("jailed", "jailed")}</span>` : "", `<span class="pill">${esc(x.status)}</span>`].filter(Boolean).join(" ");
