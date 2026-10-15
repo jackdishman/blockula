@@ -5,8 +5,10 @@
 #                   ONLY when this volume has never held a key. launch.sh removes that secret after
 #                   the first boot, so a cloned/scaled/replacement machine with an empty volume
 #                   can't come up signing with the same key (double-signing).
-#   ROLE=rpc:       public full node; joins once, then restarts with `blockula run`.
-# Optional env (fly.toml): P2P_PRESET, CLIENT_IP_HEADER, PEER_HTTP (space-separated URLs), BIND.
+#   ROLE=rpc:       public full node; joins once (pinning GENESIS_HASH, which `join` requires for
+#                   a chain this binary doesn't know), then restarts with `blockula run`.
+# Optional env (fly.toml): P2P_PRESET, CLIENT_IP_HEADER, PEER_HTTP (space-separated URLs), BIND,
+# GENESIS_HASH.
 set -eu
 bind=${BIND:-::}
 set -- --bind "$bind"
@@ -38,7 +40,7 @@ case "${ROLE:-}" in
       as_node blockula run --home "$home" --port 7171 "$@"
     fi
     install -d -o blockula -g blockula -m 700 "$home"
-    as_node blockula join --genesis /etc/blockula/genesis.json --home "$home" --port 7171 "$@"
+    as_node blockula join --genesis /etc/blockula/genesis.json ${GENESIS_HASH:+--genesis-hash "$GENESIS_HASH"} --home "$home" --port 7171 "$@"
     ;;
   *) echo "set ROLE=validator or ROLE=rpc" >&2; exit 1 ;;
 esac

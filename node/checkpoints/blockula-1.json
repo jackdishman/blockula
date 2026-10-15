@@ -1,0 +1,6 @@
+{
+  "chain_id": "blockula-1",
+  "genesis_hash": "",
+  "checkpoints": [],
+  "note": "TODO(ceremony): placeholder. Set genesis_hash to the hash every genesis builder reproduced (docs/GENESIS_CEREMONY.md) in the release that launches mainnet; until then this binary refuses to run or join blockula-1. Every later release appends a checkpoint (docs/OPERATIONS.md, Weak subjectivity)."
+}

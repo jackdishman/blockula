@@ -139,8 +139,9 @@ blockula summon mynet --validators 4
 blockula run --home ~/.blockula/mynet/v0     # repeat for v1, v2, v3 (each prints its URL)
 
 # a full node: serves the API + explorer right away, fast-syncs from the newest certified
-# snapshot (add --full to replay from genesis), then follows finalized blocks
-blockula join --genesis http://127.0.0.1:<v0 http port> --home ~/.blockula/mynet-full --port 7171
+# snapshot (add --full to replay from genesis), then follows finalized blocks. It pins the
+# genesis hash `summon` printed (required for chains this binary doesn't know)
+blockula join --genesis http://127.0.0.1:<v0 http port> --genesis-hash <hash> --home ~/.blockula/mynet-full --port 7171
 ```
 
 **On public servers:**
@@ -150,7 +151,7 @@ blockula join --genesis http://127.0.0.1:<v0 http port> --home ~/.blockula/mynet
    - The node listens on the bind address and advertises its genesis addresses.
    - Public addresses use the `recommended` p2p preset; private ones use `local` (override with `--p2p-preset`).
 
-Full nodes: `blockula join --genesis genesis.json --home full --bind 0.0.0.0 --port 7171`.
+Full nodes: `blockula join --genesis genesis.json --genesis-hash <hash> --home full --bind 0.0.0.0 --port 7171` (`blockula checkpoint --genesis genesis.json` prints the hash). On a chain older than ~10 days, also pass a recent `--checkpoint` ([OPERATIONS.md, Weak subjectivity](docs/OPERATIONS.md#weak-subjectivity)).
 
 Any node accepts txs, which are gossiped to the leader. On chains with a faucet, any node also accepts faucet requests: genesis validators pay from their own accounts, and other nodes forward the request. A forwarded request is never forwarded again.
 

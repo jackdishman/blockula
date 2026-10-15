@@ -136,7 +136,7 @@ Each builder posts, in the ceremony issue and signed (a signed commit adding `ge
 ## 6. Publish
 
 - `genesis.json` is committed as `genesis/blockula-1/genesis.json` before the release is tagged. The release workflow attaches it as `genesis-blockula-1.json`, attests it and lists it in `checksums.txt`, so the offline ML-DSA release signature covers it.
-- The mainnet genesis hash is compiled into the binary as the known hash for `blockula-1` (CRY-2, P-SYNC), so `blockula join` refuses any other genesis without `--genesis-hash`.
+- The mainnet genesis hash is compiled into the binary as the known hash for `blockula-1` (CRY-2): the launch release sets `genesis_hash` in `node/checkpoints/blockula-1.json`, a placeholder until then, so earlier binaries refuse `blockula-1` altogether. `blockula join` and `blockula run` refuse any other genesis for that chain id, `--genesis-hash` or not.
 - The hash is also published on the website, the project's social accounts and in the operator channel, so no single channel can substitute it.
 - Each operator checks before starting: `sha256sum genesis.json` against the published value, and the hash the node prints at startup against the genesis hash.
 

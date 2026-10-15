@@ -10,6 +10,7 @@
 //! state.redb             records, tree nodes, the commit point, indexes, kept certificates
 //! epochs.json            validator-set history with handoff proofs
 //! base.json, base.state.zst   the certified snapshot a fast-synced home started from
+//! anchor.json            its epoch anchor's block and certificate (`snapshot::Anchor`)
 //! snapshots/{height}/    this node's certified snapshots (chunks + meta.json)
 //! consensus/, consensus.version   simplex and marshal journals
 //! ```

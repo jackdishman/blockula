@@ -1,6 +1,7 @@
 mod api;
 mod beacon;
 mod chain;
+mod checkpoints;
 mod consensus;
 mod contrib_cli;
 mod crypto;
@@ -149,11 +150,36 @@ enum Cmd {
         home: PathBuf,
         #[arg(long, default_value = "7171")]
         port: u16,
-        /// Refuse to join unless genesis hashes to this (printed by `summon`, in /api/genesis)
+        /// Refuse to join unless genesis hashes to this (printed by `summon`, in /api/status).
+        /// Required unless this release knows the chain id
         #[arg(long)]
         genesis_hash: Option<String>,
+        /// Trusted checkpoint HEIGHT:HASH[:SET_HASH] (repeatable): snapshots and blocks that
+        /// contradict it are refused. Get one from sources you trust (`blockula checkpoint`)
+        #[arg(long = "checkpoint", value_parser = checkpoints::Checkpoint::parse)]
+        checkpoints: Vec<checkpoints::Checkpoint>,
+        /// Sync even when the newest trusted checkpoint is older than the weak-subjectivity
+        /// period (OPERATIONS.md "Weak subjectivity")
+        #[arg(long)]
+        allow_stale_checkpoint: bool,
         #[command(flatten)]
         net: Net,
+    },
+    /// Print a checkpoint (HEIGHT:HASH:SET_HASH) that several nodes agree on, for `join
+    /// --checkpoint` and node/checkpoints/*.json; or, with --genesis, a genesis file's hash
+    Checkpoint {
+        /// A node's HTTP URL (repeat it: ask nodes run by independent operators)
+        #[arg(long = "peer", required_unless_present = "genesis")]
+        peers: Vec<String>,
+        /// Height (default: the newest epoch boundary every peer has finalized)
+        #[arg(long)]
+        height: Option<u64>,
+        /// Print the genesis hash of this genesis.json instead
+        #[arg(long, conflicts_with_all = ["peers", "height"])]
+        genesis: Option<PathBuf>,
+        /// Print the JSON entry for node/checkpoints/<chain id>.json
+        #[arg(long)]
+        json: bool,
     },
     /// A simple command-line wallet (key in ~/.blockula/wallet.json, mode 600)
     Wallet {
@@ -263,9 +289,25 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Wallet { cmd } => validator_cli::wallet(cmd, &blockula_dir()),
-        Cmd::Join { genesis, home, port, genesis_hash, net } => {
-            node::join(&genesis, &home, genesis_hash.as_deref(), !net.full)?;
+        Cmd::Join { genesis, home, port, genesis_hash, checkpoints: pinned, allow_stale_checkpoint, net } => {
+            let pins = checkpoints::Pins { genesis_hash, checkpoints: pinned, allow_stale_checkpoint };
+            node::join(&genesis, &home, &pins, !net.full)?;
             node::run_full_node(home, net_opts(net, Some(port), None, false))
+        }
+        Cmd::Checkpoint { peers, height, genesis, json } => {
+            if let Some(path) = genesis {
+                println!("{}", checkpoints::genesis_hash(&chain::Genesis::load(&path)?));
+                return Ok(());
+            }
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+            let (g, cp) = rt.block_on(checkpoints::fetch(&peers, height))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&cp)?);
+            } else {
+                println!("{}", cp.to_flag());
+            }
+            eprintln!("`{}` #{} as {} node{} report it: check it against other sources before you trust it", g.chain_id, cp.height, peers.len(), if peers.len() == 1 { "" } else { "s" });
+            Ok(())
         }
         Cmd::Validator { cmd } => validator_cli::run(cmd),
         Cmd::Hunt { cmd } => contrib_cli::hunt(cmd, &blockula_dir()),
