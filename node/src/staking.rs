@@ -98,14 +98,6 @@ pub fn fmt_bps(bps: u64) -> String {
     if frac == 0 { whole.to_string() } else { format!("{whole}.{}", format!("{frac:02}").trim_end_matches('0')) }
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn bps_render_as_percentages() {
-        assert_eq!((super::fmt_bps(250), super::fmt_bps(500), super::fmt_bps(1), super::fmt_bps(10_000)), ("2.5".into(), "5".into(), "0.01".into(), "100".into()));
-    }
-}
-
 // STUB(owner P-STAKE): replaced at merge. Bonded value (the self-bonds of validators `account`
 // owns; pool shares come with P-STAKE) and unbonding total (none yet).
 pub fn holdings(state: &State, account: &str) -> (u64, u64) {
@@ -118,4 +110,12 @@ pub fn holdings(state: &State, account: &str) -> (u64, u64) {
 pub fn validator_for_signer(state: &State, account: &str, _signer_key_id: &str, epoch: u64) -> Option<String> {
     let set = state.active_sets.get(&epoch)?;
     set.iter().find(|v| *v == account).or_else(|| set.iter().find(|v| state.validators.get(*v).is_some_and(|r| r.owner == account))).cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn bps_render_as_percentages() {
+        assert_eq!((super::fmt_bps(250), super::fmt_bps(500), super::fmt_bps(1), super::fmt_bps(10_000)), ("2.5".into(), "5".into(), "0.01".into(), "100".into()));
+    }
 }

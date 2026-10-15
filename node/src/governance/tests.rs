@@ -217,6 +217,30 @@ fn without_quorum_the_deposit_is_burned() {
     assert_eq!((t.p(id).status, t.p(id).tally.as_ref().unwrap().quorum), (ProposalStatus::Rejected, (20_000 * FANG) as u128));
 }
 
+/// The O(accounts) unlocked-supply sum runs once an epoch: votes closing later in the epoch
+/// reuse it.
+#[test]
+fn the_unlocked_supply_is_taken_once_an_epoch() {
+    let mut t = T::new(&[]);
+    let a = t.propose(ALICE, text());
+    t.through(5);
+    let b = t.propose(ALICE, text());
+    t.through(t.p(a).voting_end);
+    let first = t.p(a).tally.as_ref().unwrap().unlocked;
+    assert_eq!(t.st.governance.quorum_base, Some((0, first)));
+    // 10,000 FANG move to a keyless account, out of the unlocked supply: not seen until epoch 1.
+    t.tx(ALICE, Action::Transfer { to: community("boo"), amount: 10_000 * FANG }).unwrap();
+    t.through(t.p(b).voting_end);
+    assert_eq!(t.p(b).tally.as_ref().unwrap().unlocked, first);
+    t.through(599);
+    let c = t.propose(ALICE, text());
+    let end = t.p(c).voting_end;
+    t.through(end);
+    let later = t.p(c).tally.as_ref().unwrap().unlocked;
+    assert_eq!((later, t.st.governance.quorum_base), (unlocked_supply(&t.st, end), Some((1, later))));
+    assert!(later < first - 9_999 * FANG as u128);
+}
+
 #[test]
 fn majorities_supermajorities_and_conviction() {
     let mut t = T::new(&[]);
@@ -748,7 +772,9 @@ fn random_governance_sequences_keep_the_invariants() {
         rng ^= rng << 17;
         rng
     };
-    let mut trees: Vec<(u64, Vec<(String, u64)>, Vec<Vec<[u8; 32]>>)> = vec![];
+    // (distribution id, entries, proofs)
+    type Tree = (u64, Vec<(String, u64)>, Vec<MerklePath>);
+    let mut trees: Vec<Tree> = vec![];
     for _ in 0..400 {
         let r = next();
         let who = users[(r % users.len() as u64) as usize];

@@ -402,7 +402,7 @@ fn golden_encodings() {
     st.commit_block().unwrap();
     assert_eq!(st.root_hash(), st.full_root());
     assert_eq!(st.record_count(), 10);
-    assert_eq!(st.root(), "631ff6aab04834cf29449f766592daa979a58d62a25a652ad01a070cd6231974");
+    assert_eq!(st.root(), "f8aa2c5d6df95b85f73c23bb806d01867bd73afc214731e98c9ba00b96292af6");
 }
 
 fn million_accounts() -> State {

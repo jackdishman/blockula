@@ -251,24 +251,28 @@ pub struct Governance {
     /// Proposals voting or queued, and distributions still open: all `end_block` looks at.
     pub open_proposals: BTreeSet<u64>,
     pub open_distributions: BTreeSet<u64>,
+    /// `(epoch, unlocked supply)`: quorums in an epoch use the unlocked supply as of the first
+    /// vote that closed in it, so the O(accounts) sum runs at most once an epoch, however many
+    /// proposals close.
+    pub quorum_base: Option<(u64, u128)>,
 }
 
-type Scalars = (u64, u64, BTreeSet<u64>, BTreeSet<u64>);
+type Scalars = (u64, u64, BTreeSet<u64>, BTreeSet<u64>, Option<(u64, u128)>);
 
 impl Governance {
     fn scalars(&self) -> Scalars {
-        (self.next_proposal_id, self.next_multisig_id, self.open_proposals.clone(), self.open_distributions.clone())
+        (self.next_proposal_id, self.next_multisig_id, self.open_proposals.clone(), self.open_distributions.clone(), self.quorum_base)
     }
 }
 
 impl SubState for Governance {
     fn tables(&self) -> Vec<(u8, &dyn Table)> {
-        let Governance { proposals, votes, multisigs, multisig_proposals, distributions, distribution_claims, next_proposal_id: _, next_multisig_id: _, open_proposals: _, open_distributions: _ } = self;
+        let Governance { proposals, votes, multisigs, multisig_proposals, distributions, distribution_claims, next_proposal_id: _, next_multisig_id: _, open_proposals: _, open_distributions: _, quorum_base: _ } = self;
         vec![(ns::GOV_PROPOSALS, proposals), (ns::GOV_VOTES, votes), (ns::GOV_MULTISIGS, multisigs), (ns::GOV_MULTISIG_PROPOSALS, multisig_proposals), (ns::GOV_DISTRIBUTIONS, distributions), (ns::GOV_DISTRIBUTION_CLAIMS, distribution_claims)]
     }
 
     fn tables_mut(&mut self) -> Vec<(u8, &mut dyn Table)> {
-        let Governance { proposals, votes, multisigs, multisig_proposals, distributions, distribution_claims, next_proposal_id: _, next_multisig_id: _, open_proposals: _, open_distributions: _ } = self;
+        let Governance { proposals, votes, multisigs, multisig_proposals, distributions, distribution_claims, next_proposal_id: _, next_multisig_id: _, open_proposals: _, open_distributions: _, quorum_base: _ } = self;
         vec![(ns::GOV_PROPOSALS, proposals), (ns::GOV_VOTES, votes), (ns::GOV_MULTISIGS, multisigs), (ns::GOV_MULTISIG_PROPOSALS, multisig_proposals), (ns::GOV_DISTRIBUTIONS, distributions), (ns::GOV_DISTRIBUTION_CLAIMS, distribution_claims)]
     }
 
@@ -280,7 +284,7 @@ impl SubState for Governance {
         if key != meta::GOVERNANCE {
             return Ok(false);
         }
-        (self.next_proposal_id, self.next_multisig_id, self.open_proposals, self.open_distributions) = decode::<Scalars>(value)?;
+        (self.next_proposal_id, self.next_multisig_id, self.open_proposals, self.open_distributions, self.quorum_base) = decode::<Scalars>(value)?;
         Ok(true)
     }
 }
@@ -320,7 +324,7 @@ impl GovernanceJournal {
         distributions.restore(&mut g.distributions);
         distribution_claims.restore(&mut g.distribution_claims);
         if let Some(s) = scalars {
-            (g.next_proposal_id, g.next_multisig_id, g.open_proposals, g.open_distributions) = s;
+            (g.next_proposal_id, g.next_multisig_id, g.open_proposals, g.open_distributions, g.quorum_base) = s;
         }
     }
 }
@@ -524,10 +528,10 @@ fn vote(state: &mut State, j: &mut Journal, sender: &str, signer: &str, key: &Ke
         *amt -= v.amount as u128;
         *w -= v.weight;
         p.voters -= 1;
-        if let Some(val) = &v.council {
-            if p.council.get(val).is_some_and(|c| c.voter == sender) {
-                p.council.remove(val);
-            }
+        if let Some(val) = &v.council
+            && p.council.get(val).is_some_and(|c| c.voter == sender)
+        {
+            p.council.remove(val);
         }
     }
     let (amt, w) = if aye { (&mut p.aye_amount, &mut p.aye_weight) } else { (&mut p.nay_amount, &mut p.nay_weight) };
@@ -543,7 +547,7 @@ fn vote(state: &mut State, j: &mut Journal, sender: &str, signer: &str, key: &Ke
 }
 
 /// What could vote at `height`: Σ `econ::voting_balance` over every account except the keyless
-/// system accounts. O(accounts); computed once per block that closes a vote.
+/// system accounts. O(accounts): `end_block` computes it at most once an epoch (`quorum_base`).
 pub fn unlocked_supply(state: &State, height: u64) -> u128 {
     let prefix = state.params.prefix();
     let system: BTreeSet<String> = [crate::chain::treasury(prefix), community(prefix), crate::chain::endowment(prefix), crate::chain::bootstrap_delegation(prefix), crate::poc::pool_address(prefix)].into();
@@ -724,12 +728,19 @@ fn run_kind(state: &mut State, j: &mut Journal, p: &Proposal, height: u64) -> Re
 /// `claim_until` to the community account.
 pub fn end_block(state: &mut State, b: &BlockInfo) {
     let height = b.height;
-    let mut unlocked = None;
     for id in state.governance.open_proposals.clone() {
         let p = &state.governance.proposals[&id];
         match p.status {
             ProposalStatus::Voting if height >= p.voting_end => {
-                let u = *unlocked.get_or_insert_with(|| unlocked_supply(state, height));
+                let epoch = state.params.epoch_of(height);
+                let u = match state.governance.quorum_base {
+                    Some((e, u)) if e == epoch => u,
+                    _ => {
+                        let u = unlocked_supply(state, height);
+                        state.governance.quorum_base = Some((epoch, u));
+                        u
+                    }
+                };
                 close_vote(state, id, height, u);
             }
             ProposalStatus::Queued if p.execute_at.is_some_and(|at| height >= at) => execute(state, id, height),
@@ -780,10 +791,13 @@ pub fn root_from_proof(leaf: [u8; 32], proof: &[[u8; 32]]) -> [u8; 32] {
     proof.iter().fold(leaf, |acc, s| merkle_parent(&acc, s))
 }
 
+/// A distribution proof: sibling hashes from the leaf up.
+pub type MerklePath = Vec<[u8; 32]>;
+
 /// Builds a distribution tree (what proposers publish with a `Distribution`): the leaves sorted,
 /// paired left to right, an odd last node carried up unchanged. Returns the root and each
 /// entry's proof, in input order. Addresses must be distinct.
-pub fn build_distribution(distribution_id: u64, entries: &[(String, u64)]) -> Result<([u8; 32], Vec<Vec<[u8; 32]>>)> {
+pub fn build_distribution(distribution_id: u64, entries: &[(String, u64)]) -> Result<([u8; 32], Vec<MerklePath>)> {
     ensure!(!entries.is_empty(), "a distribution needs at least one entry");
     let mut seen = BTreeSet::new();
     for (a, amount) in entries {
