@@ -373,6 +373,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
   - On-disk formats are versioned, with migrations.
   - A simulator test upgrades validators one at a time across an activation height.
 - **Effort:** L. **Who:** Team.
+- ✅ **Code side (wave 3, P-UPGRADE):** blocks carry the version in force at their height (verifiers reject any other once they've executed within `MIN_UPGRADE_LEAD` = 64 blocks of it, and wait until then) and `signal`, the proposer binary's newest version (`/api/blocks`, readiness in `/api/upgrade`). The schedule is state, changed by `ScheduleUpgrade` (activation ≥ 64 blocks out). A node whose binary can't run the next height executes nothing more and doesn't vote on or propose it: a validator exits with code 11, a full node keeps serving reads with the reason in `/api/health`; it opens halted again on every restart until it's upgraded. The simulator upgrades three validators one at a time across an activation height while the fourth, left on v1, halts at the block before without diverging, then rejoins once upgraded (`validators_upgrade_one_at_a_time_and_a_laggard_halts_at_the_activation_height`). On-disk formats are versioned (`STORAGE_VERSION`, `STORE_FORMAT`, `SCHEMA_VERSION`); the state database rebuilds from the logs when its format changes. The process is in OPERATIONS.md "Upgrades" (announce, release, signal ≥ ⅔, schedule, activate). Pending: the `ScheduleUpgrade` proposal path (P-GOV), migrations that don't need a rebuild, two upgrades on the incentivized testnet.
 
 **OPS-4. Monitoring is an endpoint, not a setup.**
 - **Missing:** `/metrics` and `/api/health` exist (`api.rs:516-566`). There are no dashboards, alert rules, on-call rotation or status page. There are no metrics for per-validator missed votes, peer count, clock skew, disk or memory. Logs only go to stderr (`main.rs:166-169`).
@@ -381,7 +382,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
   - Every operator runs it.
   - There's a public status page and an on-call rotation with escalation.
 - **Effort:** M. **Who:** Team, Operators.
-- ✅ **Reference stack (wave 1):** `deploy/monitoring` (Prometheus, Alertmanager, Grafana, node_exporter) with promtool-tested alerts for head age, halts, execution lag, mempool, restarts, certificate vs quorum, disk, memory and clock skew. Pending: peer and missed-slot metrics, every operator running it, a status page and on-call.
+- ✅ **Reference stack (wave 1):** `deploy/monitoring` (Prometheus, Alertmanager, Grafana, node_exporter) with promtool-tested alerts for head age, halts, execution lag, mempool, restarts, certificate vs quorum, disk, memory and clock skew. Wave 3 (P-UPGRADE) adds peer count, process start time, protocol version and upgrade schedule, halts and slashing protection, with alerts. Pending: missed-slot and jail metrics (P-STAKE), every operator running it, a status page and on-call.
 
 **OPS-5. No incident response, and no way out of a deterministic halt.**
 - **Missing:**
@@ -395,6 +396,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
   - Every operator runbook has been run end to end on the testnet.
   - One tabletop exercise has been held.
 - **Effort:** M. **Who:** Team, Operators.
+- ✅ **Code side (wave 3, P-UPGRADE):** `--halt-height H` executes `H` and stops: validators vote on and propose nothing above `H` (so the chain itself stops there once ⅓ run it) and exit with code 10; full nodes keep serving reads. Halts have distinct exit codes (10 halt height, 11 upgrade required, 12 another instance signing) for `RestartPreventExitStatus`, and an unexpected consensus stop is now an error exit instead of 0. OPERATIONS.md has the coordinated restart at a height, the emergency patch path and the playbooks; `blockula release sign|verify` checks a patch's signature with the installed binary. Tests: `halt_height_stops_after_executing_it`, `verify_checks_the_version_in_force_and_abstains_past_a_halt`, and a 4-validator local run halting at a height and resuming. Pending: the runbooks run end to end on a testnet, the tabletop.
 
 **OPS-6. Backups, disk growth and double-sign protection.**
 - **Missing:**
@@ -410,6 +412,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
   - Disk sizing is published per validator count, and old epoch journals are pruned.
   - Restore drills run quarterly.
 - **Effort:** M. **Who:** Team, Operators.
+- ✅ **Code side (wave 3, P-UPGRADE):** slashing protection that survives restores (`protection.rs`, MAINNET-DESIGN 3.9). A record next to the key (the newest epoch's last 32 views: notarize and finalize hashes, nullifies) is fsynced before each vote signature exists and refuses equivocation. Because a restore rolls it back, every start also watches the network: no vote in the first epoch until the network has certified two more views than it had once the start settled, and then only views above every certificate seen (~20 s on the record alone if the network can't progress without this node). A vote or certificate carrying the key's signature on something the process never signed, beyond what a stopped earlier instance could reach, halts the node (exit 12). The simulator restores a validator from an old snapshot (rolled-back record, empty journal) next to a live network: it never signs a view its earlier run signed in, and votes normally again (`a_validator_restored_from_an_old_snapshot_does_not_double_sign`). Simplex journals of epochs before the current one minus two are deleted as epochs start and at startup. Metrics and alerts: the record going backwards, a validator not signing, watching too long, peers, halts. Pending: offline key backups and quarterly restore drills (operators), restore-from-peers drills on a testnet, and the residual case (a restored disk while the network can't progress without it), which only "never restore a validator volume" closes.
 
 **OPS-7. Builds aren't reproducible or signed, and the supply chain is open.**
 - **Missing:**
