@@ -1445,7 +1445,8 @@ pub fn describe(state: &State, tx: &Tx, from: &str, primary_name: &dyn Fn(&str) 
     match &tx.action {
         Action::Delegate { validator, amount } => format!("{from} delegated {} to validator {}", fmt_fang(*amount), v(validator)),
         Action::Undelegate { validator, shares } => {
-            let worth = state.staking.pools.get(validator).map(|p| format!(" (about {})", fmt_fang(p.value(*shares as u128)))).unwrap_or_default();
+            // At the pool's current price (none once a sale emptied it).
+            let worth = state.staking.pools.get(validator).filter(|p| p.shares > 0).map(|p| format!(" (about {})", fmt_fang(p.value(*shares as u128)))).unwrap_or_default();
             format!("{from} started unbonding {shares} shares{worth} of validator {}'s pool", v(validator))
         }
         Action::Redelegate { from_validator, to_validator, shares } => format!("{from} moved {shares} shares from validator {} to {}", v(from_validator), v(to_validator)),

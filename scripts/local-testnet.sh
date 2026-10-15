@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Local multi-node smoke test: 4 genesis validators (simplex BFT over authenticated p2p) + 1 full
-# node that joins over HTTP + a 5th validator onboarded with the CLI (init → faucet → register →
-# admin approve → active at the next epoch). Runs the SDK e2e against a validator (with validator
+# node that joins over HTTP + a 5th validator onboarded with the CLI (init → faucet → register with
+# a self-bond → selected by stake at the next epoch boundary, no admin step). Runs the SDK e2e
+# against a validator (with validator
 # 0 as the Season 0 admin, so the contribution pool's admin flow runs too) and against the full
 # node, restarts a validator mid-run, then checks every node agrees on hashes and state roots.
 #
@@ -73,7 +74,6 @@ done
 "$BIN" validator register --home "$DIR/v$N" --rpc "http://$V2"
 "$BIN" run --home "$DIR/v$N" >>"$DIR/v$N.log" 2>&1 &
 PIDS[$((N + 1))]=$!
-"$BIN" validator approve "$NEWV" --key "$DIR/v0/validator.key" --rpc "http://$V0"
 active=""
 for _ in $(seq 1 $((EPOCH * 3 + 30))); do
   active=$(curl -sf "http://$V0/api/validators" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).active.some(v=>v.validator.address==='$NEWV')))")
@@ -88,7 +88,7 @@ for _ in $(seq 1 60); do
   [[ "$proposed" -gt 0 ]] && break; sleep 1
 done
 [[ "$proposed" -gt 0 ]] || { echo "❌ new validator never proposed a block" >&2; exit 1; }
-echo "✓ validator $NEWV joined at an epoch boundary and is proposing blocks"
+echo "✓ validator $NEWV joined by stake at an epoch boundary and is proposing blocks"
 
 echo "— restarting validator 1"
 kill "${PIDS[1]}"; wait "${PIDS[1]}" 2>/dev/null || true

@@ -57,7 +57,7 @@ export type Action =
   | { type: "fund_pool"; amount: string }
   | { type: "withdraw_vested" }
   | { type: "clawback"; account: string; reason: string }
-  // ---- protocol v1 (tags 30–49, MAINNET-DESIGN 3.1). Until a module ships, the node includes these and fails them with "not active yet". ----
+  // ---- protocol v1 (tags 30–49, MAINNET-DESIGN 3.1): staking, governance, the beacon, names and distributions. Older nodes, built before these modules, fail them with "not active yet". ----
   /** Stake `amount` drops in a validator's pool (validators are named by address). */
   | { type: "delegate"; validator: string; amount: string }
   /** Start unbonding `shares` of a pool; `withdraw_unbonded` pays them out after the unbonding period. */

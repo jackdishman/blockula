@@ -115,10 +115,10 @@ Staking rewards are payment for validating and securing the network. They aren't
 ## 5. Governance
 
 - **No admin keys.** Every former admin lever is a proposal: parameter changes, treasury spends, repo registration, bounded Soul grants, sybil flags, claim rejections, clawbacks of contribution grants, refunds of Hunts, upgrades, feature activation (for example Ghost Mode) and text.
-- **Process.** A proposal bonds a deposit (refunded once it reaches quorum, burned if it doesn't). Voting lasts 7 days, then a 2-day timelock, then it executes. Upgrades and large treasury spends need ⅔; everything else a simple majority.
+- **Process.** A proposal bonds a deposit (refunded once it reaches quorum, burned if it doesn't). Voting lasts 7 days, then a 2-day timelock, then it executes. Upgrades, feature activation, issuance changes and large treasury spends need ⅔; everything else a simple majority.
 - **Voting weight** is the FANG a voter locks in the vote × a conviction multiplier: 0.1× with no lock, and 1× to 6× for locks of 1, 2, 4, 8, 16 or 32 lock periods. Liquid, staked and unbonding FANG can all be locked. Locks block transfers out until they expire and the voter calls `Unlock`.
 - **Unvested tokens can't vote.** Soul doesn't vote at genesis.
-- **Launch safety.** At genesis almost nothing can vote, so quorum has an absolute floor in FANG as well as a share of votable supply, and treasury spends are rejected until about 6 months after genesis.
+- **Launch safety.** At genesis almost nothing can vote, so quorum has an absolute floor in FANG as well as a share of votable supply, and treasury spends are rejected until about 6 months after genesis. For the first year a **bootstrap council** can also pass a proposal: ⅔ of the active validator set, provided token-weighted Nay doesn't exceed Aye, with the timelock still applying.
 - **Multisig accounts.** Any account can become an M-of-N multisig of its owner keys. The foundation's account is one.
 
 ## 6. Vesting rules
@@ -185,7 +185,7 @@ Staking rewards are payment for validating and securing the network. They aren't
 
 These are open in the design and are settled in the governance and economics work before genesis:
 
-- **How the first distribution is executed.** The 32% bucket is keyless, and at launch almost nothing can vote: insider tokens are locked and the founder and foundation don't vote. A distribution that waits for an ordinary governance quorum could wait forever, and one that a single party can trigger makes that party the distributor. The mechanism has to avoid both.
+- ✅ **How the first distribution is executed (settled).** The 32% bucket is keyless, and at launch almost nothing can vote: insider tokens are locked and the founder and foundation don't vote. A distribution that waits for an ordinary governance quorum could wait forever, and one that a single party can trigger makes that party the distributor. So the first community distribution executes through the **bootstrap council**: a `Distribution` proposal (Merkle root, total, claim deadline) passes once ⅔ of the active validator set (22–31 independent operators, the founder at most 2 seats) votes for it and token-weighted Nay doesn't exceed Aye. It then waits out the 2-day timelock, and nothing is distributed before `governance_spend_height` (≈ 6 months). Recipients claim with a Merkle proof (`ClaimDistribution`, `blockula gov claim`), and unclaimed amounts return to the community bucket after the deadline. The criteria stay open: they're published with the proposal, never before mainnet works.
 - **First FANG for fees.** With no sale and no faucet, liquid FANG at launch is little more than validator commission. How new users pay their first fees (for example treasury-sponsored onboarding transactions, as PLAN.md describes) is open.
 - **Governance numbers:** the quorum floor, the length of a conviction lock period, the proposal deposit, and the threshold for a "large" treasury spend.
 - **The majority for issuance changes** (⅔ is the plan; the code-enforced bounds above are built).

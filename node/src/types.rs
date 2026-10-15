@@ -155,8 +155,8 @@ pub enum Action {
     /// Season 0 admins: return an account's unvested rewards to the pool.
     Clawback { account: String, reason: String },
 
-    // ---- protocol v1 (MAINNET-DESIGN 3.1, tags 30–49; until a module lands they fail with
-    // "not active yet") ----
+    // ---- protocol v1 (MAINNET-DESIGN 3.1, tags 30–49: staking.rs, governance.rs, beacon.rs,
+    // econ.rs) ----
     /// Stake `amount` in a validator's pool (staking.rs).
     Delegate {
         validator: String,

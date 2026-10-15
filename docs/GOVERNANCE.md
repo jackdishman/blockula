@@ -17,7 +17,7 @@ Every number below is a governance parameter (`node/src/params.rs`), shown with 
 | `bootstrap_end_height` | 1 year | the council exists until then |
 | `multisig_expiry_blocks` | 7 days | how long a multisig proposal waits for approvals |
 
-`blockula dev` shortens the periods to minutes and opens spending at once (`ChainParams::dev_overrides`).
+`blockula dev` shortens the periods to minutes and opens spending at once (`ChainParams::dev_overrides`): with its 1 s blocks and 60-block epochs, votes last 60 blocks, the timelock and the lock period 20, unbonding 120 and jail 60, and the deposit is 10 FANG. A dev chain's single validator is the whole bootstrap council, so its key passes a proposal alone (the SDK e2e does).
 
 ## Proposals
 

@@ -208,7 +208,9 @@ await assert.rejects(agent.send(bob.address, "0.1"), /isn't authorized/);
 console.log("✓ second device revoked the agent");
 
 // Validator onboarding: anyone can bond and register (a candidate, selected by stake at an epoch
-// boundary); on dev and test chains only admins may pin or remove validators.
+// boundary); on dev and test chains only admins may pin or remove validators. The stand-in runs no
+// node, so its owner (an operator account alice funds) retires it at once by unbonding its
+// self-bond: it never joins a multi-validator set.
 const vinfo = await client.validators();
 // Stands in for a validator node's consensus key; it proves possession by signing the registration.
 const nodeKeys = ml_dsa65.keygen(randomBytes(32));
@@ -216,19 +218,26 @@ const node = { address: addressFromPublicKey(nodeKeys.publicKey) };
 const consensusKey = Buffer.from(nodeKeys.publicKey).toString("hex");
 const p2pAddr = "203.0.113.7:30300", httpAddr = "203.0.113.7:7070";
 const chainId = (await client.status()).chain_id;
-const pop = Buffer.from(ml_dsa65.sign(popMessage(chainId, alice.address, p2pAddr, httpAddr), nodeKeys.secretKey, { context: POP_CONTEXT })).toString("hex");
+const operator = Wallet.generate(client);
+const pop = Buffer.from(ml_dsa65.sign(popMessage(chainId, operator.address, p2pAddr, httpAddr), nodeKeys.secretKey, { context: POP_CONTEXT })).toString("hex");
 const minBond = BigInt(vinfo.min_bond);
-if (minBond + parseFang("1") <= BigInt((await client.account(alice.address)).balance)) {
-    // A PoP for someone else's key (or another owner) is rejected.
+if (minBond + parseFang("2") <= BigInt((await client.account(alice.address)).balance)) {
+  await alice.send(operator.address, minBond + parseFang("1"));
+  // A PoP for someone else's key (or another owner) is rejected.
   const badPop = Buffer.from(ml_dsa65.sign(popMessage(chainId, bob.address, p2pAddr, httpAddr), nodeKeys.secretKey, { context: POP_CONTEXT })).toString("hex");
-  await assert.rejects(alice.registerValidator({ consensusKey, p2pAddr, httpAddr, bond: minBond, pop: badPop }), /pop/);
-  const reg = await alice.registerValidator({ consensusKey, p2pAddr, httpAddr, bond: minBond, pop });
+  await assert.rejects(operator.registerValidator({ consensusKey, p2pAddr, httpAddr, bond: minBond, pop: badPop }), /pop/);
+  const reg = await operator.registerValidator({ consensusKey, p2pAddr, httpAddr, bond: minBond, pop });
   console.log("✓", reg.summary);
   const after = await client.validators();
   assert.ok(after.candidates.some((v: any) => v.validator.address === node.address), "a registered validator is a candidate");
-  await assert.rejects(alice.approveValidator(node.address), /only validator admins/);
-  await assert.rejects(alice.unbond(node.address), /Unbond is gone/);
+  await assert.rejects(operator.approveValidator(node.address), /only validator admins/);
+  await assert.rejects(operator.unbond(node.address), /Unbond is gone/);
   console.log(`✓ validator registered as a candidate (epoch ${after.epoch}, ${after.blocks_until_next_epoch} blocks to the next one)`);
+  console.log("✓", (await operator.undelegate(node.address, "all")).summary);
+  const retired = await client.validators();
+  assert.ok(![...retired.candidates, ...retired.joining].some((v: any) => v.validator.address === node.address), "a validator below the minimum self-bond isn't a candidate");
+  assert.equal(stakeSummary(await client.staking(operator.address)).unbonding.length, 1);
+  console.log("✓ validator retired: under the minimum self-bond it can't be selected");
 } else {
   console.log(`(skipping validator registration: min bond ${vinfo.min_bond_display} exceeds the faucet drip)`);
 }
@@ -376,12 +385,12 @@ const rules = (await client.proposals({ limit: 1 })).params;
 assert.ok(/^\d+$/.test(rules.proposal_deposit) && rules.voting_blocks > 0, "the governance rules are served");
 const paramsBefore = paramsOf(await client.params());
 const target = Number(paramsBefore.max_validators) === 31 ? 30 : 31;
-await assert.rejects(alice.propose(proposal.paramChange("max_validators", 65), { title: "too many", deposit: rules.proposal_deposit }), /max_validators/);
 // (A chain without dev durations asks a deposit the faucet doesn't cover: governance's refusals
 // below still run there.)
 let proposalId: number | undefined;
 let votingEnds = 0;
 if (BigInt(rules.proposal_deposit) + parseFang("5") <= BigInt((await client.account(alice.address)).balance)) {
+  await assert.rejects(alice.propose(proposal.paramChange("max_validators", 65), { title: "too many", deposit: BigInt(rules.proposal_deposit) }), /max_validators/);
   const proposed = await alice.propose(proposal.paramChange("max_validators", target), { title: `e2e: max_validators ${target}`, url: "https://example.com/e2e" });
   console.log("✓", proposed.summary);
   const id: number = (await client.proposals({ limit: 1 })).proposals[0].id;

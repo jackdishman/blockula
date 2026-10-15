@@ -30,7 +30,7 @@ Options (env vars):
 
 ## Keys and secrets
 
-- **Season 0 admin key:** `~/.config/blockula/admin.json` approves and removes validators. It exists only on your laptop. Back it up.
+- **Season 0 admin key:** `~/.config/blockula/admin.json` pins (approves) and removes validators on the testnet; validators also join by stake without it. It exists only on your laptop. Back it up.
 - **Validator keys:** generated once in `~/.config/blockula/testnet/v*/validator.key` (dir mode 700). Each one is uploaded only to its own app, as the Fly secret `VALIDATOR_KEY_B64` (through stdin, never argv). On first boot it's copied onto that app's volume, and then **launch.sh deletes the secret from Fly**. A cloned, scaled or replacement machine with an empty volume refuses to start instead of double-signing. The local copies are your backup.
 - **Containers** run as an unprivileged `blockula` user.
 - **Genesis:** `~/.config/blockula/testnet/genesis.json`. It's public, and identical on every node.
@@ -44,8 +44,8 @@ Options (env vars):
 | Logs | `fly logs -a blockula-v0` |
 | Status | `curl https://blockula-testnet.fly.dev/api/status` |
 | Give validators a GitHub token (contribution claims, link checks) | `pbpaste \| deploy/set-github-token.sh` (fine-grained, public-read-only token; restarts apps one at a time) |
-| Approve a validator | `node/target/release/blockula validator approve <boo1…> --key ~/.config/blockula/admin.json --rpc https://blockula-testnet.fly.dev` |
-| Add one of *our* validators later | `fly apps create`, a volume and a dedicated IPv4, then the normal "Become a validator" flow (register + approve). No new genesis needed |
+| Pin a validator ahead of stake (optional: registered validators join by stake) | `node/target/release/blockula validator approve <boo1…> --key ~/.config/blockula/admin.json --rpc https://blockula-testnet.fly.dev` |
+| Add one of *our* validators later | `fly apps create`, a volume and a dedicated IPv4, then the normal "Become a validator" flow (register; it joins by stake at an epoch boundary, or `approve` pins it). No new genesis needed |
 
 ## Caveats
 - Upgrades redeploy validators in parallel, so block production pauses briefly.

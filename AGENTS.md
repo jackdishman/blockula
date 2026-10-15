@@ -25,7 +25,7 @@
 
 ## Protocol v1 actions (tags 30–49)
 
-Every action has an SDK `Wallet` helper that builds, signs and submits it (and waits for it). Until a module ships on a chain, the node includes these txs and fails them with "not active yet".
+Every action has an SDK `Wallet` helper that builds, signs and submits it (and waits for it). All of them run on chains with this release. Ghost Mode's actions (tags 50–54: `shield`, `private_transfer`, `unshield`, `set_ghost_address`, `ghost_pause`; [docs/GHOST-MODE.md](docs/GHOST-MODE.md)) are built but off: nodes refuse them with "Ghost Mode is off" until governance activates the `ghost` feature (an `ActivateFeature` proposal, ⅔ supermajority).
 
 | Tag | Action | SDK (`Wallet`) | MCP tool | CLI |
 |---|---|---|---|---|
@@ -33,20 +33,20 @@ Every action has an SDK `Wallet` helper that builds, signs and submits it (and w
 | 31 | `undelegate` | `undelegate(validator, shares \| "all")` | `unstake` (FANG or `all`) | `blockula stake undelegate --shares N \| --all` |
 | 32 | `redelegate` | `redelegate(from, to, shares \| "all")` | | `blockula stake redelegate` |
 | 33 | `withdraw_unbonded` | `withdrawUnbonded()` | `withdraw_stake` | `blockula stake withdraw` |
-| 34 | `update_validator` | `updateValidator({ commissionBps, p2pAddr?, httpAddr? })` | | |
-| 35 | `unjail` | `unjail(validator)` | | |
+| 34 | `update_validator` | `updateValidator({ commissionBps, p2pAddr?, httpAddr? })` | | `blockula validator commission` |
+| 35 | `unjail` | `unjail(validator)` | | `blockula validator unjail` |
 | 36 | `report_equivocation` | `reportEquivocation(evidenceHex)` (nodes do this) | | |
 | 37, 38 | `beacon_commit`, `beacon_reveal` | `beaconCommit(epoch, hex)`, `beaconReveal(epoch, hex)` (validator nodes do this) | | |
 | 39 | `propose` | `propose(proposal.paramChange("max_validators", 40), { title, url?, deposit? })`; builders for every kind in `proposal.*` | | `blockula gov propose` |
 | 40 | `vote` | `vote(proposalId, aye, amount, conviction)` | `vote` | `blockula gov vote` |
 | 41 | `unlock` | `unlock()` | | `blockula gov unlock` |
-| 42–44 | `multisig_create`, `multisig_propose`, `multisig_approve` | `multisigCreate(ownerKeyIds, threshold)`, `multisigPropose(action)`, `multisigApprove(id)` | | `blockula multisig …` |
+| 42–44 | `multisig_create`, `multisig_propose`, `multisig_approve` | `multisigCreate(ownerKeyIds, threshold)`, `multisigPropose(action)`, `multisigApprove(id)` | | `blockula multisig create`, `propose`, `approve` (`show` reads) |
 | 45 | `renew_name` | `renewName(name, years)` | `renew_name` | `blockula name renew` |
 | 46, 47 | `transfer_name`, `release_name` | `transferName(name, to)`, `releaseName(name)` | | `blockula name transfer`, `blockula name release` |
-| 48 | `claim_distribution` | `claimDistribution(id, amount, proof)` | | |
+| 48 | `claim_distribution` | `claimDistribution(id, amount, proof)` | | `blockula gov claim` (`blockula gov tree` builds the proofs) |
 | 49 | `attest_revert` | `attestRevert(claimId, revertSha)` (validator nodes do this) | | |
 
-Reads: `client.staking(account)`, `client.proposals()`, `client.proposal(id)`, `client.params()`, `client.fees()`, `client.distribution(id)`, `client.multisig(account)`; `stakeSummary`, `proposalSummary` and `paramsOf` normalize them. The MCP also has `my_stake` and `list_proposals`.
+Reads: `client.staking(account)`, `client.proposals()`, `client.proposal(id)`, `client.params()`, `client.fees()`, `client.validators()`, `client.distribution(id)`, `client.multisig(account)`. `stakeSummary(raw)` (delegations with `value` and `principal`, unbonding entries with `completes_at` and `ready`, totals), `proposalSummary(raw, rules?)` (tallies, turnout, quorum, council votes, outcome) and `paramsOf(raw)` turn the node's JSON into typed objects, and `sharesFor(delegation, "2")` converts FANG into pool shares for `undelegate`/`redelegate`. The MCP also has `my_stake` and `list_proposals`. On the CLI, `blockula stake show`, `blockula gov list|show`, `blockula name show` and `blockula validator list` read the same endpoints.
 
 ## HTTP API (node, default `http://localhost:7070`)
 
@@ -54,8 +54,8 @@ Reads: `client.staking(account)`, `client.proposals()`, `client.proposal(id)`, `
 |---|---|---|
 | GET | `/api/status` | chain id, height, supply, burned, version, git sha, genesis hash, epoch, sync state (`syncing`, `sync_progress`, verified `finalized_height`, display-only `network_height_claimed`), `history_from` (first block this node holds), `pruning` (`{keep_blocks}` on a pruning node, `null` on an archive node), sync trust (`checkpoint_height`: newest trusted checkpoint; `weak_subjectivity_blocks`) |
 | GET | `/api/blocks?limit=&before=` | recent blocks (from `history_from` on) |
-| GET | `/api/block/{height\|hash}` | block + txs; `410` `pruned` for a height this node no longer holds |
-| GET | `/api/tx/{id}` | tx with `summary`, `status` (`pending`/`finalized`/`failed` + `error`) |
+| GET | `/api/block/{height\|hash}` | block + txs, the protocol `version` and `signal`, and once executed the `base_fee` it charged (`flat`, `rate`, `max_block_bytes`); `410` `pruned` for a height this node no longer holds |
+| GET | `/api/tx/{id}` | tx with `summary`, `status` (`pending`/`finalized`/`failed` + `error`); once executed, `fee` is what it was charged (the block's base fee for `size_bytes`, plus `tip`) out of its `max_fee` |
 | POST | `/api/tx` | submit a signed tx: JSON, or its wire form as `application/octet-stream` (how ghost txs should travel; they're ~135 KiB) |
 | GET | `/api/account/{address\|name}` | balance, `next_nonce`, names, recent txs (sent by it or naming it), `github`, `familiars`, hunts created/won, `contribution` (Soul, vouches, jury seat, claims, vesting rewards) |
 | GET | `/api/name/{name}` | `status` (`active`, `grace` (expired, only the owner can renew), `reserved`, `available`), owner, `expires_at`, `grace_until`, price and yearly renewal price |
@@ -89,7 +89,7 @@ Reads: `client.staking(account)`, `client.proposals()`, `client.proposal(id)`, `
 | GET | `/api/ghost/address/{name\|address}` | an account's published Ghost Mode address (hex) and its fingerprint |
 | GET | `/api/health` | 200 if the head is fresh and synced, else 503 + `reason` (and `halted`: `halt_height` or `upgrade_required` when the node stopped executing on purpose) |
 | GET | `/api/upgrade` | protocol version in force, what this binary supports, the upgrade schedule and next activation, halt status, and readiness (each active validator's newest `signal`) |
-| GET | `/metrics` | Prometheus: height, finalized lag, mempool, epoch, validators, faucet, tx counters |
+| GET | `/metrics` | Prometheus: height, finalized lag, mempool, epoch, validators, faucet, tx counters, peers, protocol version and upgrade schedule, halts and slashing protection, and staking liveness (`blockula_missed_leader_slots_total`, `blockula_downtime_max_missed`, per-validator `blockula_validator_missed_slots`, `blockula_validator_jailed`, `blockula_validator_tombstoned` labelled `validator` and `own`) |
 
 **Pruning.** Validators keep about two days of blocks by default (`--prune-blocks N` sets the window, `--archive` keeps everything); full nodes keep everything. A fast-synced node holds history from its snapshot on. Blocks, txs and account history below `history_from` are gone from that node: `/api/block` and `/api/sync` answer `410` with `{"error": …, "pruned": true}` (ask an archive node), and `/api/tx` answers `404` for a pruned tx. Reads are rate-limited per client IP (`429` with `Retry-After`; loopback is exempt).
 

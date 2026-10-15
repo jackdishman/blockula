@@ -238,7 +238,7 @@ pub fn run(cmd: ValidatorCmd) -> Result<()> {
             let tx = rt.block_on(send(&rpc, &keys, &me, action))?;
             println!("✓ {}", tx["summary"].as_str().unwrap_or_default());
             println!("  It joins the active set at an epoch boundary if its stake ranks in the top max_validators (newcomers are at most a third of a set).");
-            println!("  Others can back it: blockula validator delegate {me} <FANG> --key <key file> --rpc {rpc}");
+            println!("  Others can back it: blockula stake delegate {me} <FANG> --key <key file> --rpc {rpc}");
             Ok(())
         }
         ValidatorCmd::Unjail(a) => admin(a, |v| Action::Unjail { validator: v }),

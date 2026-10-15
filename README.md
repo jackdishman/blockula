@@ -205,10 +205,10 @@ blockula run --home ~/val --bind 0.0.0.0
 #    prints the `pop` field for the SDK's `registerValidator`.)
 blockula validator register --home ~/val --rpc https://<any node>
 # Stake: delegate, start unbonding, withdraw what's free, see an account's stake
-blockula validator delegate boo1… 1000 --key wallet.json --rpc https://<any node>
-blockula validator undelegate boo1… --all --key wallet.json --rpc https://<any node>
-blockula validator withdraw --key wallet.json --rpc https://<any node>
-blockula validator stake <address or name> --rpc https://<any node>
+blockula stake delegate boo1… 1000 --key wallet.json --rpc https://<any node>
+blockula stake undelegate boo1… --all --key wallet.json --rpc https://<any node>
+blockula stake withdraw --key wallet.json --rpc https://<any node>
+blockula stake show --account <address or name> --rpc https://<any node>
 # Operators: commission (moves a little per epoch), unjail after downtime
 blockula validator commission 500 --key ~/val/validator.key --rpc https://<any node>
 blockula validator unjail boo1… --key ~/val/validator.key --rpc https://<any node>
