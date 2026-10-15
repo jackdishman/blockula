@@ -109,7 +109,7 @@ Agents are first-class contributors, but every agent is the **Familiar of a huma
 ### Forks and governance
 - **Code forks:** a share (e.g. 10%) of a fork's rewards flows back to the original repo's contributors.
 - **Chain forks:** `blockula summon` can start from a Soul-ledger snapshot, so a forked network keeps its community. Forking stays a credible exit.
-- **Voting weight:** about √stake + Soul. **Conviction voting** for treasury and repo budgets. Protocol upgrades go through a vote, then a timelock, then validators signal adoption. **Private ballots** via Ghost Mode later (tallies public, votes hidden).
+- **Voting weight:** about √stake + Soul. **Conviction voting** for treasury and repo budgets. Protocol upgrades: validators signal readiness in the blocks they propose, then a vote and a timelock schedule the activation height (OPERATIONS.md "Upgrades"). **Private ballots** via Ghost Mode later (tallies public, votes hidden).
 - **Issuance split:** 70% stakers / 20% contribution pool / 10% treasury. The pool is fixed per epoch, so contribution rewards never add inflation.
 
 ## Network and sync
@@ -188,7 +188,7 @@ Next:
 - Validator onboarding is a Season 0 allowlist (admin approval), not permissionless staking. The bond isn't slashable yet: simplex reports attributable faults, but nothing acts on them. Voting power is one vote per validator.
 - An approved validator can't connect over p2p until approval (pending registrations aren't admitted as peers). It syncs from genesis via marshal once it's admitted, and votes once caught up. Until then it counts as offline, so approve at most ⌊(n−1)/3⌋ new validators per epoch.
 - If every genesis validator is removed, new nodes still bootstrap from genesis addresses plus the active validators in their *local* state. A brand-new node then needs at least one genesis validator to be reachable, or to start from a peer's copy of the chain.
-- Old epochs' simplex journals stay on disk. Only the last 8 epochs' sets are kept in state, so `/api/sync` can only certify batches from recent epochs for nodes that are far behind.
+- Simplex journals are kept for the current epoch and the two before it (older ones are deleted). Only the last 8 epochs' sets are kept in state, so `/api/sync` can only certify batches from recent epochs for nodes that are far behind.
 - Rate limits are in-memory and per node, so restarting a node resets them, and each node in a pool counts separately. No proxy header is trusted by default.
 - `join` fully backfills from genesis over HTTP and trusts no single peer (certificates are verified), but there's no snapshot sync yet. Full nodes don't serve `/api/sync` themselves.
 - Behind NAT (e.g. Fly dedicated IPs), peers see the NATed source address. If the recommended preset rejects such peers, run with `--p2p-preset local`.
