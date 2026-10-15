@@ -197,8 +197,9 @@ pub fn slot(state: &State, height: u64) -> Option<FeeSlot> {
 }
 
 /// The burned part of the charge for a tx of `size` bytes in block `height`. Exact for the
-/// heights [`slot`] knows; past them, the most the rate can have reached by then (the last
-/// fixed rate raised by the full step each block); before them, the floor.
+/// heights [`slot`] knows; past them, the most the rate can reach by then under the current
+/// parameters (the last fixed rate raised by a full block's step each block); before them, the
+/// floor.
 pub fn base_fee(state: &State, height: u64, size: u64) -> u64 {
     if let Some(s) = slot(state, height) {
         return s.fee(size);
@@ -209,12 +210,15 @@ pub fn base_fee(state: &State, height: u64, size: u64) -> u64 {
     if height < last_height {
         return FeeSlot::floor(cp).fee(size);
     }
-    let mut rate = last.rate as u128;
-    for _ in 0..height - last_height {
-        if rate >= MAX_RATE as u128 {
-            break;
+    let (mut rate, step) = (last.rate as u128, cp.base_fee_max_change_bps as u128);
+    if step > 0 {
+        // At most ~150 steps reach the cap from the floor.
+        for _ in 0..(height - last_height).min(1_000) {
+            if rate >= MAX_RATE as u128 {
+                break;
+            }
+            rate += (rate * step / 10_000).max(1);
         }
-        rate += (rate * cp.base_fee_max_change_bps as u128 / 10_000).max(1);
     }
     FeeSlot { flat: last.flat.max(cp.base_fee_floor_flat), rate: rate.min(MAX_RATE as u128) as u64, max_block_bytes: last.max_block_bytes }.fee(size)
 }
@@ -327,10 +331,18 @@ pub fn issue(state: &mut State, epoch: u64) {
     let year = epoch / epy + 1;
     let (cp, supply) = (state.chain_params.clone(), state.supply);
     let iss = &mut state.econ.issuance;
-    while iss.year < year {
-        iss.rate_ppm = if iss.year == 0 { cp.issuance_initial_ppm } else { next_rate(iss.rate_ppm, &cp) };
-        iss.year += 1;
-        iss.base_supply = supply;
+    if iss.year < year {
+        // The rate of year `iss.year + 1`, then one decay per year skipped (none on a live chain,
+        // which issues every epoch) until it stops moving.
+        let mut rate = if iss.year == 0 { cp.issuance_initial_ppm } else { next_rate(iss.rate_ppm, &cp) };
+        for _ in iss.year + 1..year {
+            let next = next_rate(rate, &cp);
+            if next == rate {
+                break;
+            }
+            rate = next;
+        }
+        *iss = Issuance { year, base_supply: supply, rate_ppm: rate };
     }
     let height = state.params.last_of(epoch);
     let mint = epoch_mint(&state.econ.issuance, epy).min(u64::MAX - state.supply);
@@ -962,6 +974,19 @@ mod tests {
         let at_year_two = b.supply;
         issue(&mut b, epy);
         assert_eq!(b.econ.issuance.base_supply, at_year_two);
+        // A state that starts issuing late (unit tests) gets that year's rate; far-off years and
+        // heights cost nothing to compute.
+        let mut late = State { params: st.params.clone(), ..Default::default() };
+        issue(&mut late, 3 * epy);
+        assert_eq!((late.econ.issuance.year, late.econ.issuance.rate_ppm), (4, 36_847));
+        issue(&mut late, 1_000 * epy);
+        assert_eq!(late.econ.issuance.rate_ppm, 15_000);
+        let mut frozen = State::default();
+        init_genesis(&mut frozen);
+        frozen.chain_params.base_fee_max_change_bps = 0;
+        assert_eq!(base_fee(&frozen, u64::MAX, 100), FeeSlot::floor(&frozen.chain_params).fee(100));
+        frozen.chain_params.base_fee_max_change_bps = 1_250;
+        assert_eq!(base_fee(&frozen, u64::MAX, 1_000), 10_000 + MAX_RATE, "capped");
         // Governance moves the curve from the next year on, within bounds: no decay, or a higher floor.
         let cp = ChainParams { issuance_decay_ppm: 0, ..ChainParams::default() };
         assert_eq!(next_rate(43_350, &cp), 43_350);
