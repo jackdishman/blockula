@@ -208,7 +208,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
   - A benchmark at 10M accounts shows execute plus commit well under the block time on the reference validator spec.
 - **Effort:** XL. It's new storage and a new root, every module migrates, and it must land before the audit. **Who:** Team.
 - ✅ **Wave 1 (framework):** state maps are tracked `imbl` maps (O(1) clone), every record has a canonical borsh encoding, and the root is a sparse Merkle tree updated per block from the touched keys, with inclusion and exclusion proofs (`state/`). Snapshots are canonical records, decoded as a stream.
-- ✅ **Wave 2 (persistence, P-STATE-B):** records, tree nodes, indexes and the commit point are written per block in one redb transaction, after the block logs are fsynced and before consensus is acknowledged (`store.rs`). A restart loads the database and checks it against the tree and the log, then executes only blocks logged past its commit point: ~0.7 s at 1M accounts, whatever the history (`restart_time_at_1m_accounts`). The tx index and account history are on disk; `/api/proof/{namespace}/{key}` serves inclusion and exclusion proofs; snapshots stream both ways (the writer cuts chunk files as it compresses, a joiner checks each chunk and decodes from a file). Pending: deposits (DEC-6), the 10M-account execute-plus-commit benchmark.
+- ✅ **Wave 2 (persistence, P-STATE-B):** records, tree nodes, indexes and the commit point are written per block in one redb transaction, after the block logs are fsynced and before consensus is acknowledged (`store.rs`). A restart loads the database and checks it against the tree and the log, then executes only blocks logged past its commit point: ~0.7 s at 1M accounts, whatever the history (`restart_time_at_1m_accounts`). The tx index and account history are on disk; `/api/proof/{namespace}/{key}` serves inclusion and exclusion proofs; snapshots stream both ways (the writer cuts chunk files as it compresses, a joiner checks each chunk and decodes from a file). Pending: the 10M-account execute-plus-commit benchmark. ✅ DEC-6 (P-ECON): opening an account burns `account_creation_fee` (0.1 FANG), and names renew yearly.
 
 **CV-2. One vote per validator, and validators are an admin allowlist.** (known)
 - **Missing:** the quorum counts validators (`pq.rs:243-251`, `quorum::<N3f1>()`). The bond weights nothing. Validators join only through `approve_validator` (`chain.rs:820-831`). PLAN.md "Roadmap" lists permissionless staking for Phase 3.
@@ -267,6 +267,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
 - **Why it blocks:** nobody has a reason to run a validator except goodwill. There's no yield behind staking (CV-2), and the contribution pool has no inflow.
 - **Done when:** issuance runs in integer math with the decided parameters (DEC-5) and pays stakers, the pool and the treasury each epoch. Tests show total supply follows the schedule exactly. Or: a recorded decision to launch with zero issuance and another way to pay validators.
 - **Effort:** L. **Who:** Team.
+- ✅ **Wave 3 (P-ECON):** every epoch boundary mints `S(y) × rate_ppm(y) / (10⁶ × epochs_per_year)` in integer math, `S(y)` being the supply when the year's first epoch ends; the rate starts at 6% and decays 15% a year to 1.5%. 70% goes to `staking::distribute_rewards` (what it can't place goes to the treasury), 20% to the contribution pool, the rest to the treasury (`econ::issue`). A test reproduces TOKENOMICS.md's ten-year table to the drop (`issuance_matches_the_tokenomics_table`), and the endowment streams its vested part into the pool each epoch. Tips buy priority (proposals take the highest tip per byte first, wave 1). Pending: pools that receive the stakers' share (P-STAKE).
 
 **TOK-2. The fee market is a fixed price with first-come ordering.**
 - **Missing:** the minimum fee is a constant, `10_000 + 10 × bytes` (`types.rs:613-615`). Blocks fill in arrival order. Each validator keeps its own 5,000-tx mempool and evicts by fee per byte only when full (`chain.rs:1943-1955, 2067`).
@@ -277,6 +278,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
   - The fee can only change by hard fork.
 - **Done when:** a per-byte base fee adjusts with block fullness (and is burned), and the tip buys priority. A spam load test shows honest txs confirm within a bounded number of blocks at a bounded cost. Fee parameters are either changeable by governance (GOV-1) or fixed by decision.
 - **Effort:** M. **Who:** Team.
+- ✅ **Wave 3 (P-ECON):** a per-byte base fee, burned, that moves with block fullness (target 50% of `max_block_bytes`, at most 12.5% per block, never below today's `min_fee`) and is fixed 17 blocks ahead, so proposers within the exec lag price txs exactly (`econ.rs`). `max_block_bytes` (2 MiB) is fixed per height the same way and enforced in propose and verify; a block with txs must cite a state within the lag, and verifiers check its size and every tx's fee against the exact base fee once they've executed that state. Every fee parameter is a governance parameter. Wallets price at `/api/fees`' `suggested` and pay only their block's base fee plus the tip. Pending: the spam load test.
 
 **TOK-3. The treasury can't spend.**
 - **Missing:** the treasury is a keyless system address (`chain.rs:14-16`). It receives name fees (`chain.rs:740`) and 100M FANG at genesis (`chain.rs:1372`). Nothing spends from it, though PLAN.md "Tokenomics" says it pays for sponsored onboarding, faucets, audits and grants.
@@ -292,6 +294,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
   - A deterministic genesis builder takes a reviewed allocation file.
   - The allocation table is published alongside the genesis hash.
 - **Effort:** M. **Who:** Team, Counsel.
+- ✅ **Wave 3 (P-ECON):** vesting locks are enforced (`econ.rs`): transferable = liquid − max(0, largest lock − staked − unbonding), checked after every tx's action for every account it touched, so locked tokens can be bonded and delegated but never moved out (fees may come from them); staking rewards credited to a vesting account join its lock (`lock_rewards`); vote locks (`lock`, `release_expired`) and `voting_balance` (unvested tokens don't vote) are ready for P-GOV. The deterministic genesis builder (`blockula genesis build`, OPS-2) takes the DEC-5 buckets with their curves; `deploy/mainnet/genesis-spec.example.toml` encodes them. Pending: counsel's review (LEG-1), the insider delegation cap (P-STAKE), treasury spends within its lock (P-GOV), publishing the allocation table with the genesis hash.
 
 ### Governance (replacing the Season 0 admin levers)
 
@@ -356,6 +359,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
   - The mainnet hash is compiled into the binary (CRY-2).
   - A full dry run happens on a throwaway chain id.
 - **Effort:** S–M. **Who:** Team, Operators.
+- ✅ **Wave 3 (P-ECON):** `blockula genesis operator` writes an operator's public entry offline (consensus key, owner, addresses, independence fields, proof of possession); `blockula genesis build --spec` writes a byte-identical `genesis.json` and prints its hash, refusing allocations that don't add up, keyless buckets with addresses, bad PoPs and out-of-bounds parameters, and (strict, always for `blockula-1`) the DEC-5 table and the DEC-3/DEC-14 independence policy broken; `faucet: false` and no admins on mainnet. Tests build the example spec twice to the same bytes. Pending: the multi-party rebuild and the dry run (docs/GENESIS_CEREMONY.md), the mainnet hash in the binary (CRY-2).
 
 **OPS-3. No upgrade or hard-fork mechanism.** (known)
 - **Missing:**
@@ -560,6 +564,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
 - **Missing:** there's no renewal, though PLAN.md "Tokenomics" promised it for Phase 1. There's no action to transfer or release a name (`types.rs:32-156`). Prices are fixed in FANG (`types.rs:618-624`). Adding renewal after genesis changes the terms for existing holders.
 - **Done when:** renewal, transfer and pricing are decided (DEC-11) and built before genesis.
 - **Effort:** M.
+- ✅ **Wave 3 (P-ECON):** names cost `name_price_3/4/5` (100, 25, 5 FANG, to the treasury) and last a year; `RenewName` adds years at 20% of the price each, at most 10 years ahead; an expired name doesn't resolve, and for 30 days only its owner can renew it, then anyone can register it; lapsed records are swept a few per block. `TransferName` and `ReleaseName` work; genesis reserved names can't be registered. Pending: assigning reserved names by governance (DEC-11).
 
 **SF-10. Full nodes can't use p2p.**
 - **Missing:** discovery only admits tracked validators (PLAN.md "Network and sync"), so full nodes sync and forward over HTTP. Every testnet validator's `http_addr` is the one public RPC (`deploy/launch.sh:74-76`).

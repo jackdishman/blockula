@@ -4,7 +4,7 @@ How mainnet (`blockula-1`, prefix `boo`) gets its first validator set and its `g
 
 The testnet did all of this on one laptop (`deploy/launch.sh`). Mainnet must not: **no private key in this ceremony is ever generated, seen or held by anyone but its owner.**
 
-The genesis builder (`blockula genesis …`) comes from P-ECON. This document fixes the process and what the builder must support; command names marked *(builder)* follow its final interface.
+The genesis builder is `blockula genesis operator` and `blockula genesis build` (P-ECON, `node/src/genesis_builder.rs`); `deploy/mainnet/genesis-spec.example.toml` is a complete example spec (the DEC-5 allocation on a throwaway chain).
 
 ## Roles
 
@@ -34,7 +34,8 @@ The genesis builder (`blockula genesis …`) comes from P-ECON. This document fi
 Each operator is one legal entity (or one individual) with its own staff, machines and keys. Operators under common control or ownership count as one. When selecting and at every later change, the coordinator checks that:
 
 - No hosting provider, ASN or jurisdiction hosts more than ¼ of the set (8 of 32), measured by the ASN that announces the validator's IP and the country of its data center.
-- No entity runs more than one validator. The foundation runs at most 3 (DEC-14).
+- No facility (data center) hosts more than 15% of the set.
+- No entity runs more than one validator. The founder and the foundation run at most 2 between them (DEC-3, DEC-14).
 - The distribution table (operator, entity jurisdiction, provider, ASN, data-center country) is published with the spec.
 
 ## 2. Offline key generation (each operator, alone)
@@ -61,10 +62,13 @@ Each operator generates two keys on a machine that has never been and will never
    ```bash
    blockula genesis operator --chain-id blockula-1 --key validator.key \
      --owner <owner boo1…> --p2p-addr <public-ip>:30300 --http-addr https://<your sentry> \
-     > operator.toml                                  # (builder)
+     --commission-bps 500 --self-bond 10000 --name "<operator>" \
+     --legal-entity "<entity>" --entity-jurisdiction DE --hosting-provider "<provider>" \
+     --asn <asn> --datacenter-country FI --datacenter "<facility>" \
+     > operator.toml                                  # add --json for JSON
    ```
 
-   It prints the public operator entry (public key, PoP, owner, addresses) and nothing secret.
+   It prints the public operator entry (public key, PoP, owner, addresses, the fields above) and nothing secret. Fields left out come out empty for you to fill in; the builder flags empty independence fields.
 5. **Back up both keys** before anything else: encrypt them (`age -p -o consensus.json.age consensus.json`, the same for `owner.json`) and store copies in two places you control. Decrypt one copy to prove it works. Write the passphrase down separately.
 6. **Carry out only public data:** `operator.toml` and the two addresses, on a fresh USB stick (or as QR codes). Nothing else leaves the machine.
 7. **The consensus key moves once** to the validator host, by hand: an encrypted copy on a USB stick, decrypted on the host into `validator.key` (mode 600, owned by the service user). Check the address matches. The owner key never moves.
@@ -79,7 +83,7 @@ Each operator opens a pull request adding `genesis/blockula-1/operators/<operato
 name = "Example Validators GmbH"
 contact = ["ops@example.org", "+49 …"]            # two reachable contacts
 
-[keys]                                              # from `blockula genesis operator` (builder)
+[keys]                                              # from `blockula genesis operator`
 consensus_public_key = "…"                          # hex, 1,952 bytes
 consensus_address = "boo1…"
 owner = "boo1…"                                     # the cold owner account
@@ -100,6 +104,8 @@ beneficial_owners = ["…"]
 hosting_provider = "…"
 asn = 0                                             # the ASN announcing p2p_addr
 datacenter_country = "FI"
+datacenter = "…"                                    # the facility itself
+founder_or_foundation = false                       # true only for the founder's or foundation's seats
 affiliations = []                                   # other validators, operators or the foundation you're tied to
 statement = "We generated these keys offline on hardware we control. Nobody else has had access to the private keys. We control no other genesis validator."
 ```
@@ -108,12 +114,12 @@ The coordinator checks every submission: the PoP verifies for `blockula-1`; keys
 
 ## 4. The spec
 
-`genesis/blockula-1/spec.toml` (format: the builder's) collects everything the genesis is made from, as reviewed text:
+`genesis/blockula-1/spec.toml` (format: `deploy/mainnet/genesis-spec.example.toml`) collects everything the genesis is made from, as reviewed text:
 
 - `chain_id = "blockula-1"`, address prefix `boo`, and a fixed `genesis_time` (UTC milliseconds), never "now";
 - protocol parameters (block time, epoch length, `max_validators = 32`, staking, slashing, fees, issuance, governance; MAINNET-DESIGN section 3);
-- allocations with their vesting curves, as signed off by counsel (TOK-4, DEC-5);
-- the operators, from the merged submissions;
+- allocations, as signed off by counsel (TOK-4, DEC-5): each `[[allocation]]` names its DEC-5 bucket, recipient and amount, and the builder gives it the bucket's vesting curve (keyless buckets get their system account); every bucket must hold exactly its share and the total must be exactly `total_supply`;
+- the operators: `operators = [...]`, the merged submission files;
 - the reserved names (DEC-11) and the Soul ledger (3.5);
 - `faucet = false` and `validator_admins = []`; the builder refuses anything else for `blockula-1` (DEC-10).
 
@@ -127,7 +133,7 @@ Each builder, independently, on their own machine:
 git clone https://github.com/jackdishman/blockula && cd blockula && git checkout <release tag>
 scripts/reproduce-release.sh <release tag>          # the binary they'll use matches the release
 sha256sum genesis/blockula-1/spec.toml
-blockula genesis build --spec genesis/blockula-1/spec.toml --out genesis.json   # (builder) prints the genesis hash
+blockula genesis build --spec genesis/blockula-1/spec.toml --out genesis.json   # prints the genesis hash
 sha256sum genesis.json
 ```
 
@@ -161,8 +167,9 @@ The recorder keeps, and publishes in `genesis/blockula-1/ceremony/` the day afte
 - the final independence table;
 - anything that went wrong and how it was resolved.
 
-## What the builder must provide (P-ECON)
+## What the builder does (P-ECON)
 
-- `blockula genesis operator`: offline; consensus key file, chain id, owner and addresses in, a public `operator.toml` entry (public key, PoP) out.
-- `blockula genesis build --spec <toml> --out genesis.json`: byte-identical output and hash on any machine for the same spec and binary; refuses `faucet = true` or a non-empty `validator_admins` for `blockula-1`; verifies every operator's PoP; checks allocation totals.
-- A spec format that keeps operators in separate files (one PR per operator) and records the independence fields, even though only the keys, addresses and stake enter genesis.
+- `blockula genesis operator`: offline; consensus key file, chain id, owner, addresses, commission, self-bond and independence fields in; the public operator entry (TOML, or JSON with `--json`) with its proof of possession out.
+- `blockula genesis build --spec <toml> [--out genesis.json] [--strict]`: byte-identical output and genesis hash on any machine for the same spec and binary (validators in address order whatever order the files are listed in). It refuses allocations that don't add up to `total_supply`, unknown buckets, addresses on keyless buckets, bad PoPs, mismatched keys and addresses, a p2p host used twice, self-bonds the owner's allocation can't cover, out-of-bounds parameters, and `faucet = true` or `validator_admins` on `blockula-1`.
+- Policy findings (a bucket off its DEC-5 share; fewer than 22 operators; more than ⌊n/4⌋ per provider, ASN or country; more than 15% per facility; an entity with two seats; more than 2 founder or foundation seats; empty independence fields) are warnings on a dry run and errors with `strict = true` or `--strict`, always on `blockula-1`.
+- Operators stay in separate files (one PR each) with the independence fields; only the keys, addresses, stake and the provider, ASN, country and entity enter genesis.
