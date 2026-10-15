@@ -15,7 +15,10 @@
 //! **Epoch anchor.** Consensus starts each epoch's engine from the hash of the previous epoch's
 //! last block. When that block is before C, the manifest carries it with its finalization
 //! certificate, signed by the set of the epoch it ends (epoch-end certificates are kept forever,
-//! see `store.rs`), so nothing in a manifest is taken from the peer on trust.
+//! see `store.rs`), so nothing in a manifest is taken from the peer on trust. A pruning node's
+//! window always reaches back to it (`chain::min_keep_blocks` covers an epoch plus both kept
+//! snapshots), and a certificate execution didn't get from consensus is filled in from marshal
+//! afterwards (`consensus::fill_late_certs`).
 //!
 //! Both directions stream: the writer encodes records straight into the compressor and cuts
 //! chunk files as they fill; a joiner checks each chunk as it arrives, appends it to
