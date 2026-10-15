@@ -1025,10 +1025,8 @@ fn charge_junk(state: &mut State, j: &mut Journal, b: &BlockInfo) {
         state.j_debit(j, b.proposer, from_balance).expect("checked the balance");
     }
     let mut taken = from_balance;
-    if taken < due {
-        if let Some(owner) = state.validators.get(b.proposer).map(|r| r.owner.clone()) {
-            taken += take_from_delegation(state, j, &owner, b.proposer, due - taken);
-        }
+    if let Some(owner) = state.validators.get(b.proposer).map(|r| r.owner.clone()).filter(|_| taken < due) {
+        taken += take_from_delegation(state, j, &owner, b.proposer, due - taken);
     }
     if let Some(p) = pool_mut(state, j, b.proposer) {
         p.junk_charged = p.junk_charged.saturating_add(taken);

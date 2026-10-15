@@ -345,7 +345,7 @@ fn delegate_undelegate_and_withdraw() {
     assert_eq!(holdings(&t.st, &a), (300 * FANG + 1, 0));
     assert!(t.fails(&alice, Action::WithdrawUnbonded {}).contains("nothing unbonding"));
     // Selling everything removes the delegation.
-    t.ok(&alice, Action::Undelegate { validator: v.clone(), shares: (300 * FANG + 1) as u64 });
+    t.ok(&alice, Action::Undelegate { validator: v.clone(), shares: 300 * FANG + 1 });
     assert!(!t.st.staking.delegations.contains_key(&dkey(&a, &v)));
     t.block();
 }
@@ -556,7 +556,7 @@ fn evidence_is_verified_strictly() {
 fn evidence_encoding_golden_vector() {
     // Four fixed consensus keys; validator index 0 of the sorted set double-notarizes.
     let keys: Vec<PrivateKey> = (1..=4u8).map(|i| PrivateKey::from_seed_bytes([i; 32])).collect();
-    let set = commonware_utils::ordered::Set::try_from(keys.iter().map(|k| commonware_cryptography::Signer::public_key(k)).collect::<Vec<_>>()).unwrap();
+    let set = commonware_utils::ordered::Set::try_from(keys.iter().map(commonware_cryptography::Signer::public_key).collect::<Vec<_>>()).unwrap();
     let first = keys.iter().find(|k| set.position(&commonware_cryptography::Signer::public_key(*k)) == Some(0)).unwrap().clone();
     let s = MlDsaScheme::signer(b"blockula/golden", set.clone(), first).unwrap();
     let p = |d: u8| Proposal::new(Round::new(Epoch::new(3), View::new(300)), View::new(299), Digest([d; 32]));
@@ -600,7 +600,7 @@ fn the_set_is_the_top_stake_with_ties_by_address() {
     assert!(t.set(3).contains(&nv.address()) && t.set(3).contains(&v1), "{:?}", t.set(3));
     assert_eq!(t.st.validators[&nv.address()].status, ValidatorStatus::Active);
     // Under-bonded validators (the owner sold its self-bond) leave regardless.
-    t.ok(&owner(1), Action::Undelegate { validator: v1.clone(), shares: (19_500 * FANG) as u64 });
+    t.ok(&owner(1), Action::Undelegate { validator: v1.clone(), shares: 19_500 * FANG });
     assert!(!eligible(&t.st, &v1));
     t.finish_epoch();
     assert!(!t.set(4).contains(&v1));

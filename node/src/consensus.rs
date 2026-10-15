@@ -507,7 +507,7 @@ impl Tip {
 
 /// `parent` and its ancestors above `executed` (newest first): `None` if there are more than
 /// [`MAX_REPLAY`] of them, or the stream ends first.
-async fn unexecuted(parent: Arc<CBlock>, ancestry: &mut (impl Ancestry<CBlock> + Unpin), executed: u64) -> Option<Vec<Arc<CBlock>>> {
+async fn unexecuted(parent: Arc<CBlock>, ancestry: &mut impl Ancestry<CBlock>, executed: u64) -> Option<Vec<Arc<CBlock>>> {
     let mut pending = vec![];
     let mut b = parent;
     while b.height > executed {
