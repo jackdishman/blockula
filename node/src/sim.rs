@@ -518,17 +518,17 @@ fn validators_upgrade_one_at_a_time_and_a_laggard_halts_at_the_activation_height
             let h = vals[0].chain.lock().height();
             wait_for_height(&context, &vals, h + 6).await;
         }
-        assert!(vals[0].chain.lock().height() < AT - 10, "the upgrades finished well before the activation height");
-        // Readiness on chain: three of four validators signal v2 in the blocks they propose.
-        {
+        // Readiness on chain: three of four validators signal v2 in the blocks they propose (the
+        // last one restarted proposes again once it has watched the network for a few views).
+        let ready = || {
             let c = vals[3].chain.lock();
-            let view = c.view();
             let active = c.state.active_sets[&c.state.params.epoch_of(c.height() + 1)].clone();
-            let signals = crate::upgrade::signals(&active, view.headers(u64::MAX, 40).iter().map(|(h, m)| (*h, m.proposer.as_str(), m.signal)));
-            let ready = signals.values().filter(|(s, _)| *s >= v2).count();
-            assert_eq!(ready, 3, "{signals:?}");
-            assert_eq!(crate::upgrade::version_at(&c.state, AT), v2);
-        }
+            let signals = crate::upgrade::signals(&active, c.view().headers(u64::MAX, 40).iter().map(|(h, m)| (*h, m.proposer.as_str(), m.signal)));
+            signals.values().filter(|(s, _)| *s >= v2).count()
+        };
+        wait_until(&context, "three validators signalling v2", || ready() == 3).await;
+        assert!(vals[0].chain.lock().height() < AT - 10, "the upgrades finished well before the activation height");
+        assert_eq!(crate::upgrade::version_at(&vals[3].chain.lock().state, AT), v2);
         // Across the activation height: the v1 node stops after AT - 1; the rest go on.
         let upgraded: Vec<&Val> = vals[..3].iter().collect();
         wait_for(&context, &upgraded, AT + 10).await;

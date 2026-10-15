@@ -289,8 +289,10 @@ fn too_many(what: &str, wait: Duration) -> ApiError {
 
 impl Node {
     pub fn new(chain: Shared, marshal: Option<MarshalMailbox>, peers: Vec<String>, client_ip: ClientIpPolicy) -> Self {
-        let live = chain.lock().live.clone();
-        let halt = chain.lock().halt.signal.clone();
+        let (live, halt) = {
+            let c = chain.lock();
+            (c.live.clone(), c.halt.signal.clone())
+        };
         Self { chain, live, marshal, peers, client_ip, limits: Default::default(), reads: Arc::new(ReadLimiter::new(READ_RPS, READ_BURST)), timeout: HTTP_TIMEOUT, stats: Default::default(), extra_metrics: None, github_cache: Default::default(), halt, protection: None, p2p_peers: None }
     }
 

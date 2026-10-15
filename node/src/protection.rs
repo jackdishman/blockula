@@ -299,7 +299,9 @@ impl Protection {
         g.me.insert(epoch, me);
         g.newest_epoch = g.newest_epoch.max(epoch);
         if !g.gates.contains_key(&epoch) {
-            let gate = if g.current || participants <= 1 { Gate::Open { above: 0 } } else { Gate::Watching { since: now_ms, baseline: None } };
+            // A set of one has nobody to watch (and nobody to double-sign against).
+            g.current |= participants <= 1;
+            let gate = if g.current { Gate::Open { above: 0 } } else { Gate::Watching { since: now_ms, baseline: None } };
             if matches!(gate, Gate::Watching { .. }) && me.is_some() {
                 info!(epoch, "slashing protection: watching the network before signing (restart rule)");
             }
