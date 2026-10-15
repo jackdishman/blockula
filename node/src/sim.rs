@@ -263,11 +263,12 @@ fn candidates_join_by_stake_within_the_churn_limit() {
         wait_until(&context, "funding", || vals[2].chain.lock().state.account(&b.address()).balance > 0).await;
         let next_epoch = (vals[0].chain.lock().height() / EPOCH_BLOCKS + 1) * EPOCH_BLOCKS;
         wait_for_height(&context, &vals[..1], next_epoch).await;
-        vals[1].chain.lock().submit(register("sim", &a, 0, 2 * min, 30_400)).unwrap();
-        vals[2].chain.lock().submit(register("sim", &b, 0, 3 * min, 30_500)).unwrap();
+        // (Genesis validators bonded twice the minimum.)
+        vals[1].chain.lock().submit(register("sim", &a, 0, 3 * min, 30_400)).unwrap();
+        vals[2].chain.lock().submit(register("sim", &b, 0, 4 * min, 30_500)).unwrap();
         wait_until(&context, "registration", || vals[3].chain.lock().state.validators.get(&b.address()).is_some_and(|v| v.status == ValidatorStatus::Candidate)).await;
         vals[3].chain.lock().submit(signed("sim", &admin, 2, Action::Delegate { validator: b.address(), amount: 100 * DROPS_PER_FANG })).unwrap();
-        wait_until(&context, "delegation", || vals[0].chain.lock().state.staking.pools[&b.address()].stake > 3 * min).await;
+        wait_until(&context, "delegation", || vals[0].chain.lock().state.staking.pools[&b.address()].stake > 4 * min).await;
         let same_epoch = {
             let c = vals[0].chain.lock();
             let e = |v: &str| c.state.params.epoch_of(c.state.validators[v].registered_at);
@@ -542,6 +543,83 @@ fn an_equivocating_validator_is_slashed_identically_everywhere() {
         assert_eq!(c.state.active_sets[&boundary].len(), 3);
         let reports = (1..=c.height()).filter_map(|h| c.block(h)).flat_map(|b| b.txs).filter(|t| matches!(t.action, Action::ReportEquivocation { .. })).count();
         println!("✓ the double-signer was slashed {} drops on every node ({} report tx(s), {} fault(s)); 3 nodes agree at height {h}", p.slashed, reports, c.state.staking.punished.len());
+    });
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// CV-5 and downtime (CV-3) end to end. A Byzantine leader stuffs every proposal with a junk tx:
+/// honest verifiers replay the parent's state, find it unadmittable and reject the block, so none
+/// of its blocks finalize and nothing it stuffed is stored; its empty slots count as missed and
+/// it's jailed, leaves the set, and (behaving again) unjails and rejoins. Then a validator goes
+/// offline: jailed, out at the boundary, back after a restart and `Unjail`. Every node agrees.
+#[test]
+fn junk_leaders_and_offline_validators_are_jailed_and_come_back() {
+    let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_env("BLOCKULA_LOG").unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off"))).with_test_writer().try_init();
+    let (root, homes, genesis, seeds) = summon_with("jail", &[("downtime_window", 8), ("downtime_max_missed", 3), ("jail_blocks", 15)]);
+    let executor = deterministic::Runner::timed(Duration::from_secs(6_000));
+    executor.start(|context| async move {
+        let mut oracle = network(&context, &genesis, &[]).await;
+        let mut vals = vec![];
+        for (i, (home, seed)) in homes.iter().zip(&seeds).enumerate() {
+            vals.push(start(&context, &mut oracle, &genesis, i, 0, home.clone(), PrivateKey::from_seed_bytes(*seed)).await);
+        }
+        wait_for_height(&context, &vals, 3).await;
+        let addr = |i: usize| Keys::from_seed(seeds[i]).address();
+        let jailed = |vals: &[Val], who: &str| vals.iter().all(|v| v.chain.lock().state.staking.pools[who].jail.is_some());
+        let in_set = |vals: &[Val], who: &str| vals.iter().all(|v| v.chain.lock().state.validators[who].status == ValidatorStatus::Active);
+        let unjail = |vals: &[Val], i: usize| {
+            let k = Keys::from_seed(seeds[i]);
+            let mut c = vals[0].chain.lock();
+            let nonce = c.next_nonce(&k.address());
+            c.submit(signed("sim", &k, nonce, Action::Unjail { validator: k.address() })).unwrap();
+        };
+
+        // The junk leader.
+        let (junk, from) = (addr(2), vals[2].chain.lock().height() + 1);
+        vals[2].chain.lock().junk_proposals = true;
+        wait_until(&context, "the junk leader's jailing", || jailed(&vals, &junk)).await;
+        wait_until(&context, "its exit", || !in_set(&vals, &junk)).await;
+        vals[2].chain.lock().junk_proposals = false;
+        let until = vals[0].chain.lock().state.staking.pools[&junk].jail.as_ref().unwrap().until;
+        {
+            let c = vals[0].chain.lock();
+            let p = &c.state.staking.pools[&junk];
+            assert!(p.jail.as_ref().unwrap().reason.contains("leader slots"), "{:?}", p.jail);
+            assert_eq!(p.junk_charged, 0, "none of its blocks was finalized, so it never paid for junk");
+            let later: Vec<Block> = (from + 1..=c.height()).filter_map(|h| c.block(h)).collect();
+            assert!(later.iter().all(|b| b.skipped.is_empty() && b.txs.iter().all(|t| !t.memo.starts_with("junk"))), "no junk was stored");
+            let p2 = later.iter().filter(|b| b.proposer == junk).count();
+            assert!(p2 <= 1, "its stuffed blocks were rejected ({p2} finalized)");
+        }
+        wait_for_height(&context, &vals, until).await;
+        unjail(&vals, 2);
+        wait_until(&context, "the junk leader's return", || in_set(&vals, &junk) && !jailed(&vals[..1], &junk)).await;
+
+        // The offline validator.
+        let gone = addr(1);
+        let mut v = vals.remove(1);
+        v.handle.take().unwrap().abort();
+        let (home, key) = (v.home.clone(), v.key.clone());
+        drop(v);
+        wait_until(&context, "the offline validator's jailing", || jailed(&vals, &gone)).await;
+        wait_until(&context, "its exit", || !in_set(&vals, &gone)).await;
+        let until = vals[0].chain.lock().state.staking.pools[&gone].jail.as_ref().unwrap().until;
+        wait_for_height(&context, &vals, until).await;
+        let restarted = start(&context, &mut oracle, &genesis, 1, 1, home, key).await;
+        vals.insert(1, restarted);
+        unjail(&vals, 1);
+        wait_until(&context, "the offline validator's return", || in_set(&vals, &gone)).await;
+        let target = vals[0].chain.lock().height() + 2 * EPOCH_BLOCKS;
+        wait_for_height(&context, &vals, target).await;
+        let h = vals.iter().map(|v| v.chain.lock().height()).min().unwrap();
+        let roots: Vec<String> = vals.iter().map(|v| v.chain.lock().root_at(h).unwrap().to_string()).collect();
+        assert!(roots.windows(2).all(|w| w[0] == w[1]), "state roots diverged at {h}: {roots:?}");
+        let c = vals[0].chain.lock();
+        for who in [&junk, &gone] {
+            let p = &c.state.staking.pools[who];
+            assert!(p.jail.is_none() && p.slashed > 0 && c.state.active_sets[&c.state.params.epoch_of(h)].contains(who));
+        }
+        println!("✓ a junk leader and an offline validator were jailed, slashed, and came back; 4 nodes agree at height {h}");
     });
     std::fs::remove_dir_all(root).ok();
 }

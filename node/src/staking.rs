@@ -653,6 +653,11 @@ pub(crate) fn apply(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, s
             if height < jail.until {
                 bail!("validator {} is jailed until block {}", short(validator), jail.until);
             }
+            // Unjailed but under-bonded, it would never be selected: say so now.
+            let (bond, min) = (self_bond(state, validator), state.chain_params.min_self_bond);
+            if bond < min {
+                bail!("validator {}'s self-bond ({}) is below the minimum ({}): its owner must delegate to it first", short(validator), fmt_fang(bond), fmt_fang(min));
+            }
             pool_mut(state, j, validator).expect("checked above").jail = None;
             // A fresh window: its old misses don't jail it again at once.
             put_liveness(state, j, validator, None);

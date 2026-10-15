@@ -707,6 +707,11 @@ fn missed_leader_slots_jail_and_the_validator_may_unjail_later() {
     while t.height < jail.until {
         t.block();
     }
+    // Under-bonded, it would never be selected: the owner tops up first.
+    let held = t.shares(&owner(i).address(), &victim) as u64;
+    t.ok(&owner(i), Action::Undelegate { validator: victim.clone(), shares: held - 500 * FANG });
+    assert!(t.fails(&owner(i), Action::Unjail { validator: victim.clone() }).contains("below the minimum"));
+    t.ok(&owner(i), Action::Delegate { validator: victim.clone(), amount: 900 * FANG });
     t.ok(&owner(i), Action::Unjail { validator: victim.clone() });
     assert!(t.st.staking.liveness.get(&victim).is_none(), "a fresh window");
     assert!(t.fails(&owner(i), Action::Unjail { validator: victim.clone() }).contains("isn't jailed"));

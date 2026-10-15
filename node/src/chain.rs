@@ -1904,8 +1904,9 @@ impl Chain {
             soul_ledger: vec![],
             features: vec![],
         };
-        // Every validator stakes: each owns itself and bonds the minimum from its allocation.
-        let self_bond = genesis.chain_params()?.min_self_bond;
+        // Every validator stakes: each owns itself and bonds twice the minimum from its
+        // allocation, so a light slash (downtime) doesn't leave it under-bonded.
+        let self_bond = genesis.chain_params()?.min_self_bond.saturating_mul(2);
         genesis.operators = keys
             .iter()
             .zip(&genesis.validators)
