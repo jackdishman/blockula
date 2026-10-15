@@ -11,7 +11,7 @@
 // Scaffold: P-UPGRADE and P-GOV call into this.
 #![cfg_attr(not(test), allow(dead_code))]
 
-use crate::chain::State;
+use crate::chain::{Journal, State};
 use crate::consensus::{PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSION};
 use crate::state::codec::{decode, encode};
 use crate::state::{meta, ns, JMap, SubState, TMap, Table};
@@ -105,6 +105,51 @@ impl UpgradeJournal {
 /// Whether a feature is switched on.
 pub fn is_active(state: &State, feature: &str) -> bool {
     state.upgrade.features.contains_key(feature)
+}
+
+// ---- levers (`ProposalKind::ScheduleUpgrade`, `ActivateFeature`, `DeactivateFeature`): no
+// signer checks, governance (P-GOV) calls them when a proposal executes.
+
+/// Schedules protocol `version` from `activation_height` on: later than now and than every
+/// scheduled upgrade, and a newer version than all of them.
+pub(crate) fn exec_schedule_upgrade(state: &mut State, j: &mut Journal, version: u32, activation_height: u64, height: u64) -> Result<()> {
+    if activation_height <= height {
+        bail!("an upgrade must activate after block {height}");
+    }
+    if version <= version_at(state, activation_height) {
+        bail!("protocol v{version} isn't newer than v{} (in force at block {activation_height})", version_at(state, activation_height));
+    }
+    if let Some(last) = state.upgrade.schedule.last().filter(|u| u.activation_height >= activation_height) {
+        bail!("v{} is already scheduled at block {}; a new upgrade must come after it", last.version, last.activation_height);
+    }
+    if j.upgrade.schedule.is_none() {
+        j.upgrade.schedule = Some(state.upgrade.schedule.clone());
+    }
+    state.upgrade.schedule.push(ScheduledUpgrade { version, activation_height });
+    Ok(())
+}
+
+/// Switches a known feature on.
+pub(crate) fn exec_activate_feature(state: &mut State, j: &mut Journal, feature: &str, height: u64) -> Result<()> {
+    if !KNOWN_FEATURES.contains(&feature) {
+        bail!("unknown feature {feature} (known: {})", KNOWN_FEATURES.join(", "));
+    }
+    if is_active(state, feature) {
+        bail!("{feature} is already on");
+    }
+    j.upgrade.features.touch(&state.upgrade.features, feature);
+    state.upgrade.features.insert(feature.to_string(), Feature { activated_at: height });
+    Ok(())
+}
+
+/// Switches a feature off.
+pub(crate) fn exec_deactivate_feature(state: &mut State, j: &mut Journal, feature: &str) -> Result<()> {
+    if !is_active(state, feature) {
+        bail!("{feature} isn't on");
+    }
+    j.upgrade.features.touch(&state.upgrade.features, feature);
+    state.upgrade.features.remove(feature);
+    Ok(())
 }
 
 /// The protocol version in force at `height`.

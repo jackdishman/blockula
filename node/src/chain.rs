@@ -39,6 +39,14 @@ pub fn bootstrap_delegation(prefix: &str) -> String {
     crypto::system_address(prefix, "bootstrap-delegation")
 }
 
+/// What a keyless system account is (`"treasury"`, `"community"`, `"endowment"`,
+/// `"bootstrap delegation"`, `"contribution pool"`), if `addr` is one on a chain with `prefix`.
+/// Nobody holds a key for them: only the protocol moves their funds.
+pub fn system_account(prefix: &str, addr: &str) -> Option<&'static str> {
+    let roles: [(&'static str, fn(&str) -> String); 5] = [("treasury", treasury), ("community", community), ("endowment", endowment), ("bootstrap delegation", bootstrap_delegation), ("contribution pool", crate::poc::pool_address)];
+    roles.into_iter().find(|(_, f)| f(prefix) == addr).map(|(role, _)| role)
+}
+
 pub fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
 }
@@ -389,6 +397,7 @@ impl Genesis {
         for o in &self.operators {
             let who = format!("operator {}", o.owner);
             ensure!(crypto::parse_address(&o.owner).map(|(p, _)| p) == Some(prefix), "{who}: the owner must be a {prefix}1… address");
+            ensure!(system_account(prefix, &o.owner).is_none(), "{who}: a keyless system account can't own a validator");
             ensure!(crypto::is_lower_hex(&o.consensus_key) && o.consensus_key.len() == crypto::PUBLIC_KEY_LEN * 2, "{who}: consensus_key must be an ML-DSA-65 public key in lowercase hex");
             ensure!(keys.insert(o.consensus_key.as_str()), "{who}: another operator has the same consensus key");
             let v = self.validators.iter().find(|v| v.public_key == o.consensus_key).ok_or_else(|| anyhow!("{who}: its consensus key isn't one of the genesis validators"))?;
@@ -421,6 +430,7 @@ impl Genesis {
         let mut souls = BTreeSet::new();
         for e in &self.soul_ledger {
             ensure!(crypto::parse_address(&e.account).map(|(p, _)| p) == Some(prefix), "soul_ledger: {} isn't a {prefix}1… address", e.account);
+            ensure!(system_account(prefix, &e.account).is_none(), "soul_ledger: {} is a keyless system account", e.account);
             ensure!((1..=MAX_GENESIS_SOUL).contains(&e.soul), "soul_ledger: {} gets 1–{MAX_GENESIS_SOUL} milli-Soul", e.account);
             check_reason(&e.reason).with_context(|| format!("soul_ledger: {}", e.account))?;
             ensure!(souls.insert(&e.account), "soul_ledger lists {} twice", e.account);
@@ -560,6 +570,8 @@ impl Journal {
 
 /// The block the end-of-block steps close ([`State::end_block`]). Execution and replay build the
 /// same one from the block (replay from `blocks.jsonl`), so the hooks see identical inputs.
+// The hooks that read every field land with their packages (staking reads view, skipped…).
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub struct BlockInfo<'a> {
     pub height: u64,
@@ -600,7 +612,8 @@ pub struct Account {
 
 impl Account {
     /// What its locks hold at `height`: they overlap, so the largest applies (MAINNET-DESIGN
-    /// 3.7: transferable = liquid − max(0, that − staked − unbonding)).
+    /// 3.7: transferable = liquid − max(0, that − staked − unbonding)). econ.rs enforces it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn locked_at(&self, height: u64) -> u64 {
         self.locks.iter().map(|l| l.amount.locked_at(height)).max().unwrap_or(0)
     }
@@ -633,6 +646,7 @@ pub enum LockAmount {
 }
 
 impl LockAmount {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn locked_at(&self, height: u64) -> u64 {
         match *self {
             LockAmount::Vesting { total, start, cliff, end } => {
@@ -923,6 +937,7 @@ impl State {
     }
 
     /// Burns `amount` from the supply (it must already be out of every balance and escrow).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn j_burn(&mut self, j: &mut Journal, amount: u64) {
         self.j_scalars(j);
         self.supply -= amount;
@@ -930,6 +945,7 @@ impl State {
     }
 
     /// Mints `amount` into the supply (the caller credits it to a balance or an escrow).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn j_mint(&mut self, j: &mut Journal, amount: u64) {
         self.j_scalars(j);
         self.supply += amount;
@@ -1402,6 +1418,7 @@ impl State {
     }
 
     /// Sets a governance-adjustable parameter, within its bounds (`ParamChange`).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn exec_set_param(&mut self, j: &mut Journal, key: &str, value: u64) -> Result<()> {
         let params = self.params.clone();
         let mut next = self.chain_params.clone();
@@ -3213,7 +3230,7 @@ mod v1 {
         let h = c.height();
         let send = |c: &Chain, valid_until: u64| tx(c, &a, &a.address(), 0, 0, valid_until, Action::Transfer { to: friend.clone(), amount: DROPS_PER_FANG });
         // Admission wants `next <= valid_until <= next + an hour of blocks`.
-        let max = c.state.params.max_tx_validity_blocks();
+        let max = c.state.chain_params.max_tx_validity_blocks;
         assert_eq!(max, 3_600, "an hour of 1 s blocks");
         assert_eq!(c.submit(send(&c, h)).unwrap_err().to_string(), format!("expired at block {h}"));
         assert!(c.submit(send(&c, h + 1 + max + 1)).unwrap_err().to_string().contains("too far ahead"));

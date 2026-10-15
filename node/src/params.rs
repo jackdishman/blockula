@@ -230,6 +230,7 @@ impl ChainParams {
     }
 
     /// Every parameter by key (for the API: amounts can exceed 2^53, so render them as strings).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn to_map(&self) -> BTreeMap<&'static str, u64> {
         Self::KEYS.iter().map(|k| (*k, self.get(k).expect("every key has a value"))).collect()
     }

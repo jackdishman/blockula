@@ -735,6 +735,7 @@ impl Action {
 
     /// The action's encoding on its own (tag and fields, as inside the signing bytes): how state
     /// records store actions, e.g. pending multisig proposals.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = vec![];
         self.encode(&mut out);
@@ -742,6 +743,7 @@ impl Action {
     }
 
     /// Strict inverse of [`Action::to_bytes`].
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn from_bytes(bytes: &[u8]) -> Result<Action> {
         let mut r = Reader { buf: bytes };
         let a = Action::decode(&mut r)?;
@@ -1266,6 +1268,7 @@ impl ProposalKind {
     }
 
     /// The kind's encoding on its own (tag and fields): how proposal records store it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = vec![];
         self.encode(&mut out);
@@ -1273,6 +1276,7 @@ impl ProposalKind {
     }
 
     /// Strict inverse of [`ProposalKind::to_bytes`].
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn from_bytes(bytes: &[u8]) -> Result<ProposalKind> {
         let mut r = Reader { buf: bytes };
         let k = ProposalKind::decode(&mut r)?;

@@ -354,7 +354,7 @@ fn snapshots_reject_tampering() {
 /// recomputed when `Params` gained `address_prefix` (P-WIRE).
 #[test]
 fn golden_encodings() {
-    let acct = Account { balance: 5, nonce: 2, keys: Default::default() };
+    let acct = Account { balance: 5, nonce: 2, keys: Default::default(), locks: vec![] };
     assert_eq!(hex::encode(codec::encode(&acct)), "0500000000000000020000000000000000000000");
     let mut st = State::default();
     st.accounts.insert("boo1alice".into(), acct);
@@ -368,7 +368,7 @@ fn golden_encodings() {
 fn million_accounts() -> State {
     let mut st = State::default();
     for i in 0..1_000_000u64 {
-        st.accounts.insert(crypto::address_from_bytes(&crypto::hash(&i.to_le_bytes())), Account { balance: DROPS_PER_FANG, nonce: i % 7, keys: Default::default() });
+        st.accounts.insert(crypto::address_from_bytes(&crypto::hash(&i.to_le_bytes())), Account { balance: DROPS_PER_FANG, nonce: i % 7, ..Default::default() });
     }
     st.supply = 1_000_000 * DROPS_PER_FANG;
     st

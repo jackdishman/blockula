@@ -290,7 +290,12 @@ pub fn router(node: Node) -> Router {
 }
 
 fn label(c: &Chain, addr: &str) -> Value {
-    let name = if addr == c.state.treasury() { Some("🏛️ treasury".to_string()) } else if addr == c.state.pool() { Some("🪦 contribution pool".to_string()) } else if c.state.validators.get(addr).is_some_and(|v| v.status == crate::chain::ValidatorStatus::Active) { c.state.primary_name(addr).or(Some("🧛 validator".into())) } else { c.state.primary_name(addr) };
+    let system = crate::chain::system_account(c.state.params.prefix(), addr).map(|role| match role {
+        "treasury" => "🏛️ treasury".to_string(),
+        "contribution pool" => "🪦 contribution pool".to_string(),
+        other => format!("🏦 {other}"),
+    });
+    let name = if system.is_some() { system } else if c.state.validators.get(addr).is_some_and(|v| v.status == crate::chain::ValidatorStatus::Active) { c.state.primary_name(addr).or(Some("🧛 validator".into())) } else { c.state.primary_name(addr) };
     json!({ "address": addr, "name": name, "short": short(addr) })
 }
 
