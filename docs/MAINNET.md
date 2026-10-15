@@ -217,6 +217,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
   - **(a) Staking:** stake-weighted voting with permissionless registration, delegation rules decided (DEC-4), a cap on the active set, and stake-weighted quorum certificates.
   - **(b) Permissioned launch:** equal weights, with the operator list set and changed by governance (GOV-1), operators meeting published independence criteria (DEC-3), and docs that say so plainly.
 - **Effort:** XL for (a). M for (b), on top of GOV-1. **Who:** Team, Operators.
+- ✅ **Wave 3 (P-STAKE), path (a) with equal-weight votes (DEC-3):** registration is permissionless (self-bond ≥ `min_self_bond`, proof of possession) and anyone can delegate: every validator owns a stake pool with share accounting (`staking.rs`: rewards compound, commission is minted to the owner as shares and moves at most `commission_max_change_bps` per epoch, accounts with unvested tokens hold at most `insider_delegation_cap_bps` of the supply per pool and what they earn vests with them). At each boundary the next set is the top `max_validators` eligible pools by stake, ties by address, churn-limited (CV-4). Votes stay one per validator: simplex's quorum counts signers, so stake buys a seat, not weight (DEC-3, no fork). Admin approval survives only on dev and test chains (`approve` pins a validator ahead of stake, `remove` takes it out for good); chains without admins refuse both, and `unbond` is gone (`undelegate`, then `withdraw_unbonded`). Simulator: `candidates_join_by_stake_within_the_churn_limit`. Pending: rewards flow once issuance (P-ECON) calls `staking::distribute_rewards`.
 
 **CV-3. No slashing, no evidence, and a ten-minute unbonding period.** (known, plus the unbonding detail)
 - **Missing:**
@@ -230,12 +231,14 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
   - Unbonding lasts at least as long as the evidence window and the weak-subjectivity period (e.g. 14–21 days, DEC-4).
   - The simulator runs an equivocating validator and checks that every node slashes it identically.
 - **Effort:** L. **Who:** Team, Auditor.
+- ✅ **Wave 3 (P-STAKE):** simplex keeps full votes until rounds are pruned (`track_historical_votes`), and an `AttributableReporter`-wrapped sink hands verified `ConflictingNotarize`, `ConflictingFinalize` and `NullifyFinalize` reports to each validator's evidence task, which submits `report_equivocation` and keeps the evidence in `evidence.json` until the chain acts on it. The chain decodes it with Commonware's codec (a consensus format now, pinned by a golden vector), verifies both votes against that epoch's set under the chain's namespace (sets are kept for `evidence_max_age_epochs`, not 8 epochs), and slashes `slash_double_sign_bps` of the pool and of the unbonding and redelegation entries started since that epoch began, once per (validator, epoch, view); the reporter gets `reporter_reward_bps` of it, the rest is burned, and the validator is tombstoned. Downtime comes from missed leader slots (`view`/`parent_view`, leaders named by simplex's own `RoundRobin` elector): more than `downtime_max_missed` of the last `downtime_window` jails the validator (`slash_downtime_bps`), it leaves at the boundary and may `unjail` after `jail_blocks`. Unbonding lasts `unbonding_blocks` (21 days). Simulator: `an_equivocating_validator_is_slashed_identically_everywhere` (a real double-signer, caught, reported and slashed on every node) and `junk_leaders_and_offline_validators_are_jailed_and_come_back`. Slashing isn't behind a flag: it ships with P-UPGRADE's slashing protection (OPS-6) in the same release. Pending: conflicts derived from certificates (a direct vote against a certificate's copy of it), so an equivocator that splits the network is caught too.
 
 **CV-4. Validator-set churn isn't limited in code.**
 - **Missing:** `next_set` adds every approved validator up to `max_validators` (`chain.rs:442-454`). PLAN.md "Known limits" says to approve at most ⌊(n−1)/3⌋ per epoch, because newcomers count as offline until synced, but nothing enforces it. Removals stop only at "never empty" (`chain.rs:848-851`).
 - **Why it blocks:** one batch of approvals or removals can halt the chain by adding too many unsynced members. With a compromised admin key, it can also hand over a 2/3 majority in one epoch (GOV-1).
 - **Done when:** adds and removals are capped per epoch (by count, or by weight after CV-2) so each new set overlaps the old one by more than 2/3. Covered by a simulator test.
 - **Effort:** S. **Who:** Team.
+- ✅ **Wave 3 (P-STAKE):** at most ⌊(n−1)/3⌋ seats (at least one, so tiny dev sets can grow) change per epoch for stake: a newcomer filling a free seat, a newcomer replacing a lower-ranked member, or a member over a lowered cap leaving, highest stake first. Ineligible members (jailed, tombstoned, removed, under-bonded) always leave, and the set never empties. Unit test `the_churn_limit_bounds_each_epoch`; simulator `candidates_join_by_stake_within_the_churn_limit`.
 
 **CV-5. Byzantine leaders get free block space.**
 - **Missing:**
@@ -244,7 +247,8 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
 - **Why it blocks:** a leader can fill each of its blocks, up to 4 MiB (`consensus.rs:51`), with txs that never pay. With 32 validators, one bad validator adds ~10 GB a day that every node stores.
 - **Done when:** verifiers apply the proposal on top of their executed state plus not-yet-executed ancestors, as `propose` already does (`consensus.rs:288-330`), and reject blocks with unadmittable or non-canonical txs. Or such blocks become slashable. Covered by a simulator test with a junk-filling leader.
 - **Effort:** M. **Who:** Team.
-- ✅ **Encoding half (wave 1):** blocks carry canonical wire-form txs and tx JSON rejects unknown fields, so padding is gone. Pending: verify-side replay and the junk-tx charge (P-STAKE).
+- ✅ **Encoding half (wave 1):** blocks carry canonical wire-form txs and tx JSON rejects unknown fields, so padding is gone.
+- ✅ **Replay and charge (wave 3, P-STAKE):** `propose` and `verify` replay a block's unexecuted ancestors (at most 64; beyond that a verifier abstains) through the exact execute path (`State::run_block`: txs, then the end-of-block and end-of-epoch steps) on an O(1) copy of the state, and verifiers reject a block carrying any tx that can't be admitted on its parent's state. At execution, each skipped tx costs its proposer `econ::base_fee` for its size, from its account and then its self-bond, burned. Tests: `verify_replays_unexecuted_ancestors_exactly`, `honest_proposals_verify_and_junk_ones_dont`; simulator: a junk-stuffing leader's blocks are all rejected and it's jailed for the slots it wasted.
 
 **CV-6. Crash-safety gaps.**
 - **Missing:**
@@ -580,6 +584,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
 - **Missing:** attestation fees come from each validator's consensus-key account. If a third of the set can't pay, claims never settle (PLAN.md "Known limits"). Each validator also needs a `GITHUB_TOKEN` (`github.rs:15-17`). For the testnet, `deploy/set-github-token.sh` sets it on every app (public-read-only tokens only).
 - **Done when:** the attestation fee payer is configurable (or attestations are fee-free with a cap), and each operator's token handling is documented.
 - **Effort:** S.
+- ✅ **Wave 3 (P-STAKE):** a validator's consensus key may sign its system txs (`attest_claim`, `attest_revert`, `beacon_commit`/`beacon_reveal`, `report_equivocation`, and `update_validator`, whose target only the signer can name) with `from` = its owner, who pays; admission allows exactly that (`staking::system_tx_key`). Nodes pay from the owner when it's a separate account and from the consensus key's own account otherwise; `BLOCKULA_SYSTEM_FEES=self` forces the latter. The GitHub token is in OPERATIONS.md (a public-read-only `GITHUB_TOKEN` in `/etc/blockula/env`).
 
 ✅ **SF-14. Operator documentation.**
 - **Missing:** there's no reference hardware spec, port and firewall guide, NTP requirement, disk sizing or sentry setup.

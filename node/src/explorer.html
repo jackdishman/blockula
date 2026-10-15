@@ -192,7 +192,7 @@ const views = {
         </div>
         <div class="health">
           <span><b class="${health.ok ? "ok" : "bad"}">${health.ok ? "● The network is healthy" : "● " + esc(health.reason || "unhealthy")}</b></span>
-          ${v ? `<span>${plural(v.blocks_until_next_epoch, "block")} until epoch ${v.epoch + 1}${v.pending.length ? ` · ${plural(v.pending.length, "validator")} awaiting approval` : ""}</span>` : ""}
+          ${v ? `<span>${plural(v.blocks_until_next_epoch, "block")} until epoch ${v.epoch + 1}${v.joining.length ? ` · ${plural(v.joining.length, "validator")} joining` : ""}</span>` : ""}
         </div>
         ${s.history_from > 1 ? `<div class="dim">This node fast-synced from a certified snapshot at #${s.fast_synced_from}; history before #${s.history_from} isn't available here.</div>` : ""}
       </section>
@@ -393,17 +393,20 @@ views.mempool = async function () {
 
 views.validators = async function () {
   const v = await api("/validators");
-  const row = (x) => `<div class="row"><div>${who(x.validator)} <span class="dim">${esc(x.p2p_addr)}${x.genesis ? " · genesis" : ""}${x.bond !== "0" ? " · " + term("bond", "bond") + " " + esc(x.bond_display) : ""}</span></div><span class="pill">${esc(x.status)}</span></div>`;
+  const status = (x) => (x.tombstoned_at != null ? "tombstoned" : x.jailed ? "jailed" : x.status);
+  const row = (x) => `<div class="row"><div>${who(x.validator)} <span class="dim">${esc(x.p2p_addr)}${x.genesis ? " · genesis" : ""} · stake ${esc(x.stake_display)} · self-bond ${esc(x.self_bond_display)} · commission ${esc(x.commission_display)}${x.jailed ? ` · jailed until block ${x.jailed.until}: ${esc(x.jailed.reason)}` : ""}</span></div><span class="pill ${["jailed", "tombstoned", "removed"].includes(status(x)) ? "failed" : x.status === "candidate" ? "pending" : ""}">${esc(status(x))}</span></div>`;
   const list = (title, xs, empty) => card(`<h2>${title} (${xs.length})</h2>${xs.length ? `<div class="rows">${xs.map(row).join("")}</div>` : `<p class="empty">${empty}</p>`}`);
-  const all = [...v.active, ...v.pending, ...v.approved, ...v.removed];
+  const all = [...v.active, ...v.candidates, ...v.jailed, ...v.tombstoned, ...v.removed];
   const seen = new Set();
   const events = [];
   for (const x of all) {
     if (seen.has(x.validator.address)) continue;
     seen.add(x.validator.address);
-    if (x.registered_at && !x.genesis) events.push([x.registered_at, `${who(x.owner)} bonded ${esc(x.bond_display)} and registered validator ${who(x.validator)}`]);
-    if (x.approved_by) events.push([x.approved_at, `${who(x.approved_by)} approved validator ${who(x.validator)}${x.active_from_epoch != null ? `, active from ${term("epoch")} ${x.active_from_epoch}` : ", joining at the next epoch"}`]);
+    if (x.registered_at && !x.genesis) events.push([x.registered_at, `${who(x.owner)} registered validator ${who(x.validator)}${x.active_from_epoch != null ? `, active from ${term("epoch")} ${x.active_from_epoch}` : ""}`]);
+    if (x.approved_by) events.push([x.approved_at, `${who(x.approved_by)} pinned validator ${who(x.validator)} ahead of stake (test chains)`]);
     if (x.removed_by) events.push([x.removed_at, `${who(x.removed_by)} removed validator ${who(x.validator)}${x.active_until_epoch != null ? `, last active in epoch ${x.active_until_epoch}` : ", leaving at the next epoch"}`]);
+    if (x.jailed) events.push([x.jailed.at, `validator ${who(x.validator)} was jailed: ${esc(x.jailed.reason)}`]);
+    if (x.tombstoned_at != null) events.push([x.tombstoned_at, `validator ${who(x.validator)} double-signed: slashed ${esc(x.slashed_display)} and banned for good`]);
   }
   events.sort((a, b) => b[0] - a[0]);
   return `<div class="stack">
@@ -412,17 +415,18 @@ views.validators = async function () {
       ${stat(v.epoch, term("epoch", "current epoch"))}
       ${stat(v.active.length, "active validators")}
       ${stat(v.blocks_until_next_epoch, "blocks until the next epoch")}
-      ${stat(fang(v.min_bond_display), term("bond", "minimum bond"))}
+      ${stat(fang(v.min_bond_display), term("bond", "minimum self-bond"))}
     </div>
     ${card(`<h2>What validators do</h2>
       <p>Validators take turns proposing blocks and vote to finalize them. A block is final once more than two-thirds of the active validators have signed it with ML-DSA-65, a post-quantum signature. There are no confirmations to wait for.</p>
-      <p>The set only changes between ${term("epoch", "epochs")} (every ${v.epoch_blocks} blocks). In Season 0, anyone can bond FANG and register, and an admin (${v.admins.map(who).join(", ")}) approves them. Approved validators join when the next epoch starts.</p>`, "learn")}
+      <p>Anyone can run one: register with a self-bond of at least ${esc(v.min_bond_display)}, and anyone can delegate FANG to it. At the end of each ${term("epoch")} (every ${v.epoch_blocks} blocks) the top ${v.max_validators} by stake make the next set, with at most ${v.churn_limit} seat${v.churn_limit === 1 ? "" : "s"} changing at a time. Signing two different blocks costs ${esc(v.slash_double_sign_display)} of the stake and a permanent ban; missing too many turns gets a validator jailed (${esc(v.slash_downtime_display)}) until it unjails.</p>`, "learn")}
     ${list("Active this epoch", v.active, "—")}
-    ${list("Next epoch", v.next_epoch, "—")}
-    ${list("Waiting for approval", v.pending, "Nobody is waiting. Run <span class=\"mono\">blockula validator init</span> to become a validator.")}
-    ${v.approved.length ? list("Approved, joining soon", v.approved, "") : ""}
+    ${v.joining.length || v.leaving.length ? list("Changing at the next epoch", [...v.joining, ...v.leaving], "") : ""}
+    ${list("Candidates", v.candidates, "Nobody is waiting. Run <span class=\"mono\">blockula validator init</span> to become a validator.")}
+    ${v.jailed.length ? list("Jailed", v.jailed, "") : ""}
+    ${v.tombstoned.length ? list("Tombstoned", v.tombstoned, "") : ""}
     ${v.removed.length ? list("Removed", v.removed, "") : ""}
-    ${card(`<h2>Admin actions</h2>${events.length ? `<div class="rows">${events.map(([h, t]) => `<div class="row"><div>${t}</div><a class="dim" href="#/block/${h}">block #${h}</a></div>`).join("")}</div>` : '<p class="empty">No changes since genesis.</p>'}`)}
+    ${card(`<h2>Changes</h2>${events.length ? `<div class="rows">${events.map(([h, t]) => `<div class="row"><div>${t}</div><a class="dim" href="#/block/${h}">block #${h}</a></div>`).join("")}</div>` : '<p class="empty">No changes since genesis.</p>'}`)}
   </div>`;
 };
 
