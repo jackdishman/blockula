@@ -58,9 +58,9 @@ A validator's HTTP API locks the same state the consensus engine uses, so a publ
 
 | | Minimum | Recommended | Why |
 |---|---|---|---|
-| CPU | 4 dedicated cores, x86-64 (AVX2) or arm64 | 8 cores / 16 threads, recent EPYC, Xeon or Ryzen | Signatures are cheap: ML-DSA-65 verifies in ~25–50 µs on a modern core, so a full block (~400 txs) plus a view's votes and certificates is 10–25 ms of one core. Cores buy headroom for the rest: today's node re-executes history from genesis on restart (until CV-1), verifiers will replay up to 64 unexecuted ancestors (CV-5, planned), p2p encryption runs over ~10 MB/s, and sentries pull sync batches. Execution is sequential, so single-thread speed matters more than core count. No shared or burstable vCPUs. |
-| Memory | 16 GB | 32 GB | State is in memory until CV-1 (accounts, names, Hunts, claims, indexes), plus marshal's caches and a 5,000-tx mempool. |
-| Disk | 1 TB NVMe SSD | 2 TB NVMe SSD, expandable online | The node fsyncs its block logs and consensus journals on every block (and, with CV-1, commits state before acknowledging consensus): low-latency local NVMe, not network storage with burst credits. Size: [Disk sizing](#disk-sizing). |
+| CPU | 4 dedicated cores, x86-64 (AVX2) or arm64 | 8 cores / 16 threads, recent EPYC, Xeon or Ryzen | Signatures are cheap: ML-DSA-65 verifies in ~25–50 µs on a modern core, so a full block (~400 txs) plus a view's votes and certificates is 10–25 ms of one core. Cores buy headroom for the rest: restarts load the state database (under a second per million records) instead of replaying history, verifiers will replay up to 64 unexecuted ancestors (CV-5, planned), p2p encryption runs over ~10 MB/s, and sentries pull sync batches. Execution is sequential, so single-thread speed matters more than core count. No shared or burstable vCPUs. |
+| Memory | 16 GB | 32 GB | The state (accounts, names, Hunts, claims) is held in memory as well as in the state database, so memory grows with the number of records, not with history (the tx index and account history are on disk). Plus redb's 256 MB page cache, marshal's caches and a 5,000-tx mempool. |
+| Disk | 1 TB NVMe SSD | 2 TB NVMe SSD, expandable online | The node fsyncs its block logs and consensus journals on every block and commits the state database before acknowledging consensus: low-latency local NVMe, not network storage with burst credits. Size: [Disk sizing](#disk-sizing). |
 | Network | 1 Gbit/s, ≥ 15 TB/month included | 1 Gbit/s unmetered (or 10 Gbit/s) | [Bandwidth](#bandwidth). |
 | Other | Dedicated public IPv4 | Plus IPv6 | p2p is raw TCP; NAT and shared IPs break dialing. |
 
@@ -79,28 +79,38 @@ Budget **≥ 15 TB/month of egress per validator, unmetered or included in the p
 
 ### Disk sizing
 
-What a node stores per block today: ~330 B in `blocks.jsonl` and ~170 B in `cblocks.bin` for an empty block, plus a finalization certificate on disk every 100 heights and at each epoch's end (MAINNET.md appendix). A certificate holds a quorum of 3,309-byte signatures. Marshal keeps only the last 2,000 blocks and certificates (`MARSHAL_RETAIN`).
+What a node's home holds (storage layout 4; the full layout and commit protocol are in `node/src/store.rs`):
 
-| Active validators n | Quorum | Certificate | Empty chain per block | Per day | Per year |
+- `blocks/`: executed blocks, one JSON line each, in segment files of 10,000 heights. ~0.4 KB per empty block, ~10.8 KB per transfer (txs are hex in the JSON).
+- `cblocks/`: the exact consensus blocks, served to joining nodes by `/api/sync`. ~0.2 KB per empty block, ~5.4 KB per transfer (wire bytes).
+- `state.redb`: the state database. The state itself (records and Merkle tree nodes, ~0.5 KB per account: ~0.5 GB at a million accounts, whatever the history), plus index rows (~0.25 KB per block, ~0.75 KB per tx: tx ids, account history) and a finalization certificate every 100 heights and at each epoch's end. A certificate holds a quorum of 3,309-byte signatures.
+- `snapshots/`: the last two certified snapshots (compressed state). `consensus/`: marshal keeps the last 2,000 blocks and certificates (`MARSHAL_RETAIN`); old epochs' simplex journals are kept until journal pruning lands (planned: P-UPGRADE, OPS-6).
+
+An empty chain, everything kept:
+
+| Active validators n | Quorum | Certificate | Per block | Per day | Per year |
 |---|---|---|---|---|---|
-| 4 | 3 | ~10 KB | ~0.60 KB | ~52 MB | ~19 GB |
-| 8 | 6 | ~20 KB | ~0.70 KB | ~60 MB | ~22 GB |
-| 16 | 11 | ~36 KB | ~0.86 KB | ~75 MB | ~27 GB |
-| 21 | 15 | ~50 KB | ~1.0 KB | ~86 MB | ~31 GB |
-| 32 | 22 | ~73 KB | ~1.2 KB | ~106 MB | ~39 GB |
+| 4 | 3 | ~10 KB | ~0.95 KB | ~82 MB | ~30 GB |
+| 8 | 6 | ~20 KB | ~1.05 KB | ~91 MB | ~33 GB |
+| 16 | 11 | ~36 KB | ~1.2 KB | ~104 MB | ~38 GB |
+| 21 | 15 | ~50 KB | ~1.35 KB | ~117 MB | ~43 GB |
+| 32 | 22 | ~73 KB | ~1.6 KB | ~136 MB | ~50 GB |
 
-Transactions add far more than an idle chain. A transfer is stored twice today (hex JSON in `blocks.jsonl`, ~10.8 KB; wire bytes in `cblocks.bin`, ~5.4 KB), so **~16 KB per tx**:
+Transactions add far more than an idle chain: a transfer is stored in both logs plus its index rows, **~17 KB per tx**:
 
-| Sustained load | Per day | Per year |
-|---|---|---|
-| 1 tx/s | ~1.4 GB | ~0.5 TB |
-| 10 tx/s | ~14 GB | ~5 TB |
-| Every block full (~388 tx/s) | ~0.5 TB | n/a: a flood, not a load |
+| Sustained load | Per day | Per year (archive) | Validator, default 2-day window |
+|---|---|---|---|
+| 1 tx/s | ~1.5 GB | ~0.54 TB | ~3 GB |
+| 10 tx/s | ~15 GB | ~5.4 TB | ~30 GB |
+| Every block full (`max_block_bytes` 2 MiB, ~388 tx/s) | ~0.57 TB | n/a: a flood, not a load | ~1.15 TB |
 
-A block-filling flood costs ~2,200 FANG a day at today's minimum fee (MAINNET.md appendix) until the fee market (TOK-2) prices it. Old epochs' simplex journals are also kept until pruning lands (planned: P-UPGRADE, OPS-6). So:
+**Pruning.** Validators keep a window of recent blocks: about two days by default (`--prune-blocks N` sets the window in blocks; `--archive` keeps everything; full nodes keep everything unless given `--prune-blocks`). The window never goes below two snapshot intervals plus a tx's validity window (~3,800 blocks at 1 s), so the node can always serve its snapshots' manifests and still recognize any replayed tx. Older index rows go a few heights per block, then whole log segments are deleted; epoch boundaries' hashes, state roots and certificates are kept forever. `/api/block`, `/api/sync` and `/api/status` (`history_from`) say what was pruned; `/api/tx` no longer finds txs from pruned heights. A flood can't fill a pruning validator's disk faster than the window allows: size the volume for the window at full load, or shorten the window.
 
-- **Validators at genesis: 2 TB NVMe** (1 TB minimum), on a volume you can grow without downtime. `HostDiskAlmostFull` (80%) and `HostDiskFillsWithinAWeek` give you time to grow it.
-- Validators don't need history once state lives in the store and snapshots are certified (CV-1, CRY-2). Archival RPC nodes keep everything and need the most disk.
+So:
+
+- **Validators at genesis: 2 TB NVMe** (1 TB minimum, with `--prune-blocks 43200`, half a day), on a volume you can grow without downtime. `HostDiskAlmostFull` (80%) and `HostDiskFillsWithinAWeek` give you time to grow it.
+- **Archival RPC nodes** (`--archive`, or full nodes' default) keep everything and need the most disk: plan from the archive column above.
+- Losing `state.redb` costs no data: the node rebuilds it on start, by replaying its block logs from genesis (or from `base.state.zst` after a fast sync, or, on a pruned validator, from its newest local snapshot). That takes as long as the history; restarts otherwise take seconds.
 
 ## Ports and firewall
 
@@ -278,7 +288,7 @@ Upgrades are announced, released, signalled and activated at a height. Nobody re
 3. **Install and signal.** Each operator restarts onto the new binary in their own maintenance window, one node at a time. The new binary runs the old rules until the activation height. Blocks carry `signal`, the newest protocol version the proposer's binary supports (MAINNET-DESIGN 3.2), so readiness is visible on chain and in the explorer. Wait for ≥ ⅔ of the active set to signal.
 4. **Activate.** A governance `ScheduleUpgrade` proposal (planned: P-GOV, P-UPGRADE) puts `(version, activation_height)` in state. At that height every upgraded node switches rules. A node whose binary doesn't support the scheduled version halts cleanly before executing that height, with a non-zero exit and the reason in `/api/health`, instead of diverging. Upgrade it and it continues.
 
-Rolling restarts: keep fewer than ⌊(n−1)/3⌋ validators restarting at any moment across the whole network, so coordinate windows in the operator channel. Restarting your own validator takes it out for the replay (minutes today; seconds once CV-1 lands).
+Rolling restarts: keep fewer than ⌊(n−1)/3⌋ validators restarting at any moment across the whole network, so coordinate windows in the operator channel. Restarting your own validator takes it out for seconds: it loads the state database and executes at most the few blocks logged after its last commit.
 
 **Coordinated stop at a height** (incidents, emergency patches): `blockula run … --halt-height H` executes `H` and stops (planned: P-UPGRADE). Until that flag exists, watch `curl -s 127.0.0.1:7070/api/status | jq .height` and stop the service once it passes `H`.
 
@@ -404,11 +414,11 @@ The node restarted in the last 15 minutes. Was it you? If not: `journalctl -u bl
 
 ### Disk
 
-Above 80%: grow the volume now (online resize: grow the block device, then `resize2fs` or `xfs_growfs`). Find what grew: `du -sh /var/lib/blockula/val/*`. Old epochs' simplex journals under `consensus/` are kept until pruning lands (planned: P-UPGRADE); don't delete files by hand from a running validator's home. Never let a validator's disk fill: a failed fsync stops the node.
+Above 80%: grow the volume now (online resize: grow the block device, then `resize2fs` or `xfs_growfs`). Find what grew: `du -sh /var/lib/blockula/val/*`. `blocks/` and `cblocks/` stay within the pruning window (`--prune-blocks`; shorten it if the volume can't grow); old epochs' simplex journals under `consensus/` are kept until journal pruning lands (planned: P-UPGRADE). Don't delete files by hand from a running validator's home. Never let a validator's disk fill: a failed fsync stops the node.
 
 ### Memory
 
-Less than 10% available or an OOM kill. State is in memory until CV-1, so memory grows with the chain. Check `ps -o rss,cmd -u blockula`; move to the recommended 32 GB. Don't run other services on a validator.
+Less than 10% available or an OOM kill. The state is in memory (history isn't), so memory grows with the number of accounts and records. Check `ps -o rss,cmd -u blockula`; move to the recommended 32 GB. Don't run other services on a validator.
 
 ### Alerting pipeline
 

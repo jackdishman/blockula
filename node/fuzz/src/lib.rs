@@ -28,9 +28,11 @@ mod node_src {
     pub mod snapshot;
     pub mod staking;
     pub mod state;
+    pub mod store;
     pub mod types;
     pub mod upgrade;
     pub mod validator_cli;
+    pub mod view;
 }
 pub use node_src::*;
 

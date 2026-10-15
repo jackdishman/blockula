@@ -59,6 +59,53 @@ pub struct NetOpts {
     pub force_key: bool,
     /// `--full`: replay from genesis instead of fast-syncing from a certified snapshot.
     pub full: bool,
+    /// `--prune-blocks` / `--archive`.
+    pub pruning: Pruning,
+    pub http: HttpOpts,
+}
+
+/// How many blocks a node keeps on disk.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Pruning {
+    /// Validators keep `chain::default_keep_blocks` (about two days); full nodes keep all.
+    #[default]
+    Default,
+    /// Keep the last N blocks (at least `chain::min_keep_blocks`).
+    Keep(u64),
+    /// Keep everything.
+    Archive,
+}
+
+impl Pruning {
+    /// Blocks to keep (`None`: all) for a node of this role.
+    pub fn keep(self, validator: bool, state: &crate::chain::State) -> Option<u64> {
+        match self {
+            Pruning::Default if validator => Some(crate::chain::default_keep_blocks(state)),
+            Pruning::Default | Pruning::Archive => None,
+            Pruning::Keep(n) => Some(n.max(crate::chain::min_keep_blocks(state))),
+        }
+    }
+}
+
+/// HTTP limits: per-client reads (token bucket) and the request timeout.
+#[derive(Clone, Debug)]
+pub struct HttpOpts {
+    pub read_rps: u32,
+    pub read_burst: u32,
+    pub timeout: Duration,
+}
+
+impl Default for HttpOpts {
+    fn default() -> Self {
+        Self { read_rps: api::READ_RPS, read_burst: api::READ_BURST, timeout: api::HTTP_TIMEOUT }
+    }
+}
+
+/// The HTTP API for `chain`, with this node's limits.
+fn http_node(chain: Shared, marshal: Option<consensus::MarshalMailbox>, peers: Vec<String>, net: &NetOpts) -> Node {
+    let mut node = Node::new(chain, marshal, peers, net.client_ip.clone()).with_read_limits(net.http.read_rps, net.http.read_burst);
+    node.timeout = net.http.timeout;
+    node
 }
 
 /// Pulls peers' validator-set handoff signatures every 30s (and signs our own, if we're a
@@ -264,7 +311,9 @@ pub fn dev_is_stale(home: &Path) -> bool {
 }
 
 pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
-    let chain = Chain::open(&home)?;
+    let mut chain = Chain::open(&home)?;
+    let keep = net.pruning.keep(true, &chain.state);
+    chain.set_pruning(keep);
     double_sign_guard(&home, chain.height(), net.force_key)?;
     check_storage_version(&home)?;
     let genesis = chain.genesis.clone();
@@ -332,10 +381,13 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
         println!("🔗 p2p: listening on {listen}, advertised as {} ({preset} preset)", addrs.p2p_addr);
     }
     consensus::log_memory_budget(bootstrappers.len());
+    match keep {
+        Some(k) => println!("🗄️  keeping the last {k} blocks on disk (--archive keeps all)"),
+        None => println!("🗄️  archive node: keeping every block"),
+    }
     let block_time_ms = genesis.block_time_ms;
     let genesis_block = consensus::genesis_block(&genesis);
     let chain_id = genesis.chain_id.clone();
-    let client_ip = net.client_ip.clone();
 
     let cfg = cw_tokio::Config::new().with_storage_directory(home.join("consensus"));
     cw_tokio::Runner::new(cfg).start(|context| async move {
@@ -360,7 +412,7 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
         let (handle, marshal) = consensus::start_validator(context.child("node"), vcfg, oracle.clone(), oracle.clone(), channels).await;
         tokio::spawn(exchange_epochs(shared.clone(), peers.clone()));
         tokio::spawn(attest_claims(shared.clone()));
-        tokio::spawn(serve_http(Node::new(shared, Some(marshal), peers, client_ip), http_bind));
+        tokio::spawn(serve_http(http_node(shared, Some(marshal), peers, &net), http_bind));
         if let Err(e) = handle.await {
             eprintln!("consensus stopped: {e:?}");
         }
@@ -424,7 +476,9 @@ pub fn join(genesis: &str, home: &Path, genesis_hash: Option<&str>, fast: bool) 
 pub fn run_full_node(home: PathBuf, net: NetOpts) -> Result<()> {
     let bind = socket(&net.bind, net.http_port.unwrap_or(7171))?;
     let jc: JoinConfig = serde_json::from_slice(&std::fs::read(home.join("join.json")).context("not a joined home — use `blockula join`")?)?;
-    let chain = Chain::open(&home)?;
+    let mut chain = Chain::open(&home)?;
+    let keep = net.pruning.keep(false, &chain.state);
+    chain.set_pruning(keep);
     let peers = if net.peer_http.is_empty() { jc.peers } else { http_peers(&chain.genesis, &net.peer_http, None) };
     println!("🦇 Full node for `{}` at height {} — syncing from {}", chain.genesis.chain_id, chain.height(), peers.join(", "));
     let shared: Shared = Arc::new(Mutex::new(chain));
@@ -432,7 +486,7 @@ pub fn run_full_node(home: PathBuf, net: NetOpts) -> Result<()> {
     let fast = jc.fast && !net.full;
     rt.block_on(async move {
         // The API and explorer come up immediately, while syncing.
-        tokio::spawn(serve_http(Node::new(shared.clone(), None, peers.clone(), net.client_ip.clone()), bind));
+        tokio::spawn(serve_http(http_node(shared.clone(), None, peers.clone(), &net), bind));
         maybe_fast_sync(&shared, &peers, !fast).await;
         tokio::spawn(exchange_epochs(shared.clone(), peers.clone()));
         sync_loop(shared, peers, false).await;
@@ -567,9 +621,10 @@ pub(crate) fn apply_batch(chain: &Shared, verifier: &MlDsaScheme, epoch: u64, ba
     if !fin.verify(&mut commonware_utils::sys_rng(), verifier, &commonware_parallel::Sequential) {
         bail!("invalid finalization certificate");
     }
-    let mut c = chain.lock();
-    let mut prev = c.last_hash().to_string();
-    let mut height = c.height();
+    let (mut prev, mut height) = {
+        let c = chain.lock();
+        (c.last_hash().to_string(), c.height())
+    };
     for b in &blocks {
         if b.height != height + 1 || hex::encode(b.parent_bytes()) != prev {
             bail!("batch does not extend our chain at height {}", b.height);
@@ -577,9 +632,11 @@ pub(crate) fn apply_batch(chain: &Shared, verifier: &MlDsaScheme, epoch: u64, ba
         prev = hex::encode(b.digest_bytes());
         height = b.height;
     }
+    // One block at a time, the chain lock held only for the in-memory parts (sync is this
+    // node's only executor, so nothing else extends the chain in between).
     for b in &blocks {
         let cert = (b.height == last.height).then(|| fin_bytes.clone());
-        c.execute(consensus::finalized_from(b, cert))?;
+        Chain::execute_shared(chain, consensus::finalized_from(b, cert))?;
     }
     Ok(())
 }

@@ -1,17 +1,23 @@
 //! Chain state and execution. Consensus (`consensus.rs`) orders blocks; this module executes
-//! finalized blocks deterministically, in order, and keeps the mempool, indexes and `blocks.jsonl`.
+//! finalized blocks deterministically, in order, persists each one (block logs, then the state
+//! database: see `store.rs`), publishes what readers see (`view.rs`) and keeps the mempool.
 
 use crate::crypto::{self, Keys};
 use crate::params::ChainParams;
-use crate::state::{JMap, TMap};
+use crate::state::codec::SCHEMA_VERSION;
+use crate::state::tree::{Child, Hash, Node, NodeKey, NodeStore, Smt};
+use crate::state::{JMap, RecordChange, TMap};
+use crate::store::{self, hash32, BlockMeta, CommitPoint, Framing, Layout, Pos, SegLog, Snap, Store};
 use crate::types::*;
+use crate::view::{Disk, Live, MempoolView, ReadView};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Mainnet's chain id. Its genesis may not have admins or a faucet (DEC-10).
@@ -570,7 +576,7 @@ impl Journal {
 }
 
 /// The block the end-of-block steps close ([`State::end_block`]). Execution and replay build the
-/// same one from the block (replay from `blocks.jsonl`), so the hooks see identical inputs.
+/// same one from the block (replay from the block log), so the hooks see identical inputs.
 // The hooks that read every field land with their packages (staking reads view, skipped…).
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
@@ -872,7 +878,9 @@ impl State {
         self.names.get(&n).map(|r| r.owner.clone()).ok_or_else(|| anyhow!("no one has claimed {n}{NAME_SUFFIX} yet"))
     }
 
-    /// First name an address registered — shown everywhere instead of the raw address.
+    /// First name an address registered — shown everywhere instead of the raw address. A scan of
+    /// every name: the API looks names up in the store's owner index instead (`ReadView`).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn primary_name(&self, addr: &str) -> Option<String> {
         self.names.values().filter(|r| r.owner == addr).min_by_key(|r| r.registered_at).map(|r| format!("{}{NAME_SUFFIX}", r.name))
     }
@@ -1451,8 +1459,16 @@ impl State {
         hex::encode(self.tree.root())
     }
 
+    /// The summary with names from a scan (the fuzz harness; the API uses `describe_with`).
+    #[allow(dead_code)]
     pub fn describe(&self, tx: &Tx, height: Option<u64>) -> String {
-        let who = |a: &str| self.primary_name(a).unwrap_or_else(|| short(a));
+        self.describe_with(tx, height, &|a| self.primary_name(a))
+    }
+
+    /// [`State::describe`] with the primary-name lookup supplied (the API's comes from the
+    /// store's owner index instead of a scan of every name).
+    pub fn describe_with(&self, tx: &Tx, height: Option<u64>, primary_name: &dyn Fn(&str) -> Option<String>) -> String {
+        let who = |a: &str| primary_name(a).unwrap_or_else(|| short(a));
         let from = tx.sender().map(|s| who(&s)).unwrap_or_default();
         match &tx.action {
             Action::Transfer { to, amount } => {
@@ -1513,11 +1529,11 @@ impl State {
                 format!("{from} cancelled the hunt on {what}; funders were refunded")
             }
             Action::RegisterFamiliar { label, .. } => format!("{from} registered the Familiar “{label}”"),
-            Action::Delegate { .. } | Action::Undelegate { .. } | Action::Redelegate { .. } | Action::WithdrawUnbonded {} | Action::UpdateValidator { .. } | Action::Unjail { .. } | Action::ReportEquivocation { .. } => crate::staking::describe(self, tx, &from),
+            Action::Delegate { .. } | Action::Undelegate { .. } | Action::Redelegate { .. } | Action::WithdrawUnbonded {} | Action::UpdateValidator { .. } | Action::Unjail { .. } | Action::ReportEquivocation { .. } => crate::staking::describe(self, tx, &from, primary_name),
             Action::BeaconCommit { .. } | Action::BeaconReveal { .. } | Action::AttestRevert { .. } => crate::beacon::describe(self, tx, &from),
-            Action::Propose { .. } | Action::Vote { .. } | Action::Unlock {} | Action::MultisigCreate { .. } | Action::MultisigPropose { .. } | Action::MultisigApprove { .. } | Action::ClaimDistribution { .. } => crate::governance::describe(self, tx, &from),
-            Action::RenewName { .. } | Action::TransferName { .. } | Action::ReleaseName { .. } => crate::econ::describe(self, tx, &from),
-            _ => self.describe_poc(tx, &from),
+            Action::Propose { .. } | Action::Vote { .. } | Action::Unlock {} | Action::MultisigCreate { .. } | Action::MultisigPropose { .. } | Action::MultisigApprove { .. } | Action::ClaimDistribution { .. } => crate::governance::describe(self, tx, &from, primary_name),
+            Action::RenewName { .. } | Action::TransferName { .. } | Action::ReleaseName { .. } => crate::econ::describe(self, tx, &from, primary_name),
+            _ => self.describe_poc(tx, &from, primary_name),
         }
     }
 }
@@ -1581,14 +1597,11 @@ impl SummonOpts {
     }
 }
 
-/// Blocks kept in memory; older ones are read from `blocks.jsonl` on demand.
-pub const RECENT_BLOCKS: usize = 2_048;
 /// How far behind the (claimed) network height still counts as synced.
 pub const SYNC_SLACK: u64 = 3;
-/// Certificates are stored on disk for these heights (plus every epoch's last block) …
+/// Certificates are stored on disk for these heights (plus every epoch's last block); the last
+/// `view::RECENT_CERTS` heights' are kept in memory.
 pub const CERT_CHECKPOINT: u64 = 100;
-/// … and kept in memory for this many recent heights.
-pub const RECENT_CERTS: usize = 1_024;
 /// Mempool txs not included within this many blocks are dropped (they stay valid until their
 /// `valid_until`, so a holder could resubmit them).
 pub const MEMPOOL_TTL_BLOCKS: u64 = 600;
@@ -1598,68 +1611,50 @@ pub const OWN_TX_VALIDITY: u64 = 600;
 pub const RECENT_FAILED: usize = 10_000;
 /// Max faucet drips waiting in the mempool (kept below `MAX_PENDING_PER_SENDER`).
 pub const FAUCET_MAX_PENDING: usize = 32;
+/// Blocks a validator keeps by default (`--prune-blocks`): about two days' worth.
+pub const PRUNE_DAYS: u64 = 2;
+/// A rebuild (or a replay after a crash) syncs the store at least this often.
+const REPLAY_SYNC_EVERY: u64 = 1_000;
 
-/// Append-only file of length-prefixed records with an in-memory offset index.
-struct RecordFile {
-    file: File,
-    len: u64,
+/// The fewest heights a pruning node keeps: both kept snapshots' manifests (checkpoint +
+/// certifying blocks), every ancestor a proposal may still cite, and a tx's whole validity
+/// window (so the tx index still catches a replayed tx). The validity window is a governance
+/// parameter (`max_tx_validity_blocks`), so this is re-read from the state at every commit.
+pub fn min_keep_blocks(state: &State) -> u64 {
+    use crate::snapshot::{CHECKPOINT_DELAY, CHECKPOINT_INTERVAL};
+    2 * CHECKPOINT_INTERVAL + 2 * CHECKPOINT_DELAY + crate::consensus::MAX_EXEC_LAG + state.chain_params.max_tx_validity_blocks
 }
 
-impl RecordFile {
-    fn open(path: &Path) -> Result<(Self, Vec<(u64, u64, u32)>)> {
-        let mut file = OpenOptions::new().create(true).read(true).append(true).open(path)?;
-        let mut index = vec![];
-        let mut buf = vec![];
-        use std::io::{Read, Seek, SeekFrom};
-        file.seek(SeekFrom::Start(0))?;
-        file.read_to_end(&mut buf)?;
-        let mut pos = 0usize;
-        while pos + 12 <= buf.len() {
-            let key = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap());
-            let len = u32::from_le_bytes(buf[pos + 8..pos + 12].try_into().unwrap());
-            if pos + 12 + len as usize > buf.len() {
-                break; // torn write at the tail
-            }
-            index.push((key, (pos + 12) as u64, len));
-            pos += 12 + len as usize;
-        }
-        if pos != buf.len() {
-            file.set_len(pos as u64)?;
-        }
-        Ok((Self { file, len: pos as u64 }, index))
-    }
-
-    fn append(&mut self, key: u64, bytes: &[u8]) -> Result<(u64, u32)> {
-        let mut rec = Vec::with_capacity(12 + bytes.len());
-        rec.extend_from_slice(&key.to_le_bytes());
-        rec.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-        rec.extend_from_slice(bytes);
-        self.file.write_all(&rec)?;
-        let at = self.len + 12;
-        self.len += rec.len() as u64;
-        Ok((at, bytes.len() as u32))
-    }
-
-    fn read(&self, at: u64, len: u32) -> Option<Vec<u8>> {
-        use std::os::unix::fs::FileExt;
-        let mut buf = vec![0u8; len as usize];
-        self.file.read_exact_at(&mut buf, at).ok()?;
-        Some(buf)
-    }
-
-    fn sync(&self) -> Result<()> {
-        Ok(self.file.sync_data()?)
-    }
+/// What a pruning validator keeps by default: `PRUNE_DAYS` of blocks at this block time.
+pub fn default_keep_blocks(state: &State) -> u64 {
+    (PRUNE_DAYS * 86_400_000 / state.params.block_time_ms.max(1)).max(min_keep_blocks(state))
 }
 
-#[derive(Clone, Debug)]
-struct PoolEntry {
-    added_at: u64,
+/// How `Chain::open_with` lays out a new home (existing homes keep theirs).
+#[derive(Clone, Debug, Default)]
+pub struct OpenOpts {
+    /// Heights per log segment (default `store::SEGMENT_HEIGHTS`).
+    pub segment_heights: Option<u64>,
+}
+
+/// Where a test makes `execute` stop, as if the process died there (crash-injection tests).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WritePoint {
+    /// The consensus block is appended (not synced); the executed block isn't.
+    AfterCblock,
+    /// Both logs are appended; the block line isn't synced.
+    AfterBlockLine,
+    /// Both logs are synced; the store isn't committed.
+    BeforeStoreCommit,
+    /// The store is committed; consensus hasn't been acknowledged.
+    AfterStoreCommit,
 }
 
 pub struct Chain {
     pub home: PathBuf,
     pub genesis: Genesis,
+    genesis_arc: Arc<Genesis>,
     /// Validator key (also the faucet key on testnets). `None` on full nodes.
     pub keys: Option<Keys>,
     pub role: Role,
@@ -1667,33 +1662,33 @@ pub struct Chain {
     pub genesis_root: String,
     /// Hash of the genesis consensus block (parent of block 1).
     pub genesis_hash: String,
-    /// Executed blocks: the last `RECENT_BLOCKS` in memory, the rest on disk.
-    recent: std::collections::VecDeque<Block>,
-    block_offsets: Vec<u64>,
-    block_by_hash: HashMap<u64, u64>,
     height: u64,
     last_hash: String,
-    /// Exact consensus block bytes per height (served to joining nodes).
-    cblocks: RecordFile,
-    cblock_index: Vec<(u64, u32)>,
-    /// Finalization certificates: checkpoints on disk, recent ones in memory.
-    certs: RecordFile,
-    cert_index: BTreeMap<u64, (u64, u32)>,
-    recent_certs: BTreeMap<u64, Vec<u8>>,
-    pub tx_index: HashMap<String, (u64, usize)>,
-    pub history: HashMap<String, Vec<String>>,
+    /// The last executed block (older ones are read from the log, through a bounded cache), and
+    /// its tx ids.
+    head: Option<Arc<Block>>,
+    head_ids: std::collections::HashSet<String>,
+    /// The block logs and the database, behind their own lock (see [`Writer`]).
+    writer: Arc<parking_lot::Mutex<Writer>>,
+    /// The database's commit point and a snapshot of it as of that commit (the tree's node store;
+    /// readers get it with the view).
+    store: Arc<Store>,
+    point: CommitPoint,
+    snap: Arc<Snap>,
+    disk: Arc<Disk>,
     pub mempool: Vec<Tx>,
-    pool: HashMap<String, PoolEntry>,
+    /// Ids of `mempool`'s txs, index for index (so upkeep never rehashes them).
+    mempool_ids: Vec<String>,
+    /// Ids in the mempool.
+    pool: std::collections::HashSet<String>,
     pending: HashMap<String, (usize, u64)>,
-    /// id → (reason, height) for txs that failed at execution or were dropped from the mempool.
-    recent_failed: HashMap<String, (String, u64)>,
+    /// Mirror of the mempool and of recent failures, published for readers.
+    mp: MempoolView,
     failed_order: std::collections::VecDeque<String>,
     /// Highest finalized height proven by a certificate we verified or saw from consensus.
     pub finalized_tip: u64,
     /// Outbound mempool gossip (validators) — every accepted tx is pushed here.
     pub gossip: Option<futures::channel::mpsc::UnboundedSender<Tx>>,
-    log: File,
-    log_len: u64,
     /// Validator-set history + handoff proofs (`epochs.json`).
     pub epochs: crate::epochs::EpochRegistry,
     /// Set when this node fast-synced: history starts after this height.
@@ -1702,6 +1697,148 @@ pub struct Chain {
     claims: HashMap<String, u64>,
     /// Set while a snapshot is being written, so slow disks can't pile up writer threads.
     snapshot_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// What readers (the HTTP API) see: published after every block and mempool change.
+    pub live: Arc<Live>,
+    /// Blocks kept on disk (`None`: all of them, an archive node).
+    keep_blocks: Option<u64>,
+    /// Set when persisting a block failed: memory is ahead of the disk, so this instance executes
+    /// nothing more (a restart recovers from the logs).
+    broken: Option<String>,
+    /// Blocks `open` executed again because they were past the store's commit point.
+    pub replayed: u64,
+}
+
+/// The block logs and the state database. One executor writes at a time; the consensus path
+/// does it without holding the chain lock (`Chain::execute_shared`), so votes, proposals and
+/// mempool admission don't wait for fsyncs.
+pub struct Writer {
+    store: Arc<Store>,
+    /// Executed blocks (JSON lines) and the exact consensus block bytes, segmented by height.
+    blocks: SegLog,
+    cblocks: SegLog,
+    /// The commit point as of the last commit.
+    point: CommitPoint,
+    /// Log segments below this height are deleted.
+    files_pruned_below: u64,
+    #[cfg(test)]
+    fail_at: Option<WritePoint>,
+    /// A slow disk, for tests.
+    #[cfg(test)]
+    delay: Option<std::time::Duration>,
+}
+
+/// A block executed in memory, and everything its commit writes.
+pub struct Executed {
+    block: Arc<Block>,
+    /// The consensus block bytes to log (`None`: a replay, already logged).
+    cblock: Option<Vec<u8>>,
+    records: Vec<RecordChange>,
+    nodes: Vec<(NodeKey, Option<Node>)>,
+    /// Index rows; the writer fills in the log positions.
+    meta: BlockMeta,
+    root: Hash,
+    root_child: Vec<u8>,
+    /// A certificate to keep on disk (checkpoints and epoch ends).
+    cert: Option<Vec<u8>>,
+    epoch_head: bool,
+    prune_below: u64,
+}
+
+impl Writer {
+    /// The commit protocol (see `store.rs`): the consensus block, then the executed block, each
+    /// appended and fsynced, then one durable database transaction.
+    fn persist(&mut self, e: &mut Executed) -> Result<(Arc<Snap>, CommitPoint)> {
+        #[cfg(test)]
+        if let Some(d) = self.delay {
+            std::thread::sleep(d);
+        }
+        let cpos = self.cblocks.append(e.block.height, e.cblock.as_deref().unwrap_or_default())?;
+        #[cfg(test)]
+        if self.fail_at == Some(WritePoint::AfterCblock) {
+            bail!("injected crash after the consensus block append");
+        }
+        self.cblocks.sync()?;
+        let line = serde_json::to_vec(&*e.block)?;
+        e.meta.tx_spans = store::tx_spans(&line, &e.block.txs);
+        let bpos = self.blocks.append(e.block.height, &line)?;
+        #[cfg(test)]
+        if self.fail_at == Some(WritePoint::AfterBlockLine) {
+            bail!("injected crash after the block append");
+        }
+        self.blocks.sync()?;
+        (e.meta.block, e.meta.cblock) = (bpos, Some(cpos));
+        let done = self.commit(e, true)?;
+        #[cfg(test)]
+        if self.fail_at == Some(WritePoint::AfterStoreCommit) {
+            bail!("injected crash after the store commit");
+        }
+        Ok(done)
+    }
+
+    /// One database transaction for a block whose log positions are known, then a snapshot of
+    /// the result. Whole log segments go once their heights' rows are pruned.
+    fn commit(&mut self, e: &Executed, durable: bool) -> Result<(Arc<Snap>, CommitPoint)> {
+        let mut point = self.point.clone();
+        point.height = e.block.height;
+        point.block_hash = e.block.hash.clone();
+        point.root = e.root;
+        point.root_child = e.root_child.clone();
+        point.blocks_end = e.meta.block.end();
+        if let Some(c) = e.meta.cblock {
+            point.cblocks_end = c.end();
+        }
+        #[cfg(test)]
+        if self.fail_at == Some(WritePoint::BeforeStoreCommit) {
+            bail!("injected crash before the store commit");
+        }
+        let cert = e.cert.as_deref().map(|c| (e.block.height, c));
+        self.store.commit(store::Commit { point: &mut point, records: &e.records, nodes: &e.nodes, block: Some(&e.meta), epoch_head: e.epoch_head, cert, prune_below: e.prune_below, durable })?;
+        self.point = point.clone();
+        if point.pruned_below >= self.files_pruned_below.saturating_add(self.blocks.reader().seg_heights) {
+            self.blocks.prune_below(point.pruned_below)?;
+            self.cblocks.prune_below(point.pruned_below)?;
+            self.files_pruned_below = point.pruned_below;
+        }
+        Ok((Arc::new(self.store.snapshot()?), point))
+    }
+}
+
+/// The mempool checked against a new state, without the chain lock: a copy of the state (O(1))
+/// and of the pending txs (shared, with their ids).
+pub struct MempoolCheck {
+    state: State,
+    txs: MempoolView,
+    next: u64,
+    proposer: String,
+    chain_id: String,
+}
+
+impl MempoolCheck {
+    /// Txs to drop, with why: expired, past the mempool TTL, or no longer applying (each
+    /// sender's earlier txs applied first, as a proposal would).
+    pub fn run(mut self) -> (u64, Vec<(String, String)>) {
+        let next = self.next;
+        let mut j = Journal::default();
+        let mut dropped = vec![];
+        for p in self.txs.in_order() {
+            let tx = &p.tx;
+            if tx.valid_until < next {
+                dropped.push((p.id.clone(), format!("expired at block {}", tx.valid_until)));
+                continue;
+            }
+            if p.added_at + MEMPOOL_TTL_BLOCKS < next {
+                // Not expired: anyone holding it may resubmit it until `valid_until`.
+                dropped.push((p.id.clone(), format!("dropped from the mempool: not included within {MEMPOOL_TTL_BLOCKS} blocks (it stays valid until block {} if resubmitted)", tx.valid_until)));
+                continue;
+            }
+            match self.state.apply_j(&mut j, tx, &self.chain_id, &self.proposer, next, false) {
+                Ok(Outcome::Applied) => {}
+                Ok(Outcome::Failed(r)) => dropped.push((p.id.clone(), format!("dropped from the mempool: {r}"))),
+                Err(e) => dropped.push((p.id.clone(), format!("dropped from the mempool: {e}"))),
+            }
+        }
+        (next, dropped)
+    }
 }
 
 /// The certified snapshot a fast-synced node started from (`base.json` + `base.state.zst`).
@@ -1747,6 +1884,29 @@ pub fn write_secret(path: &Path, contents: &str) -> Result<()> {
     f.write_all(contents.as_bytes())?;
     f.sync_all()?;
     Ok(())
+}
+
+/// Where `open` gets its state from, and where replay starts.
+struct Start {
+    state: State,
+    point: CommitPoint,
+    snap: Arc<Snap>,
+    epochs: crate::epochs::EpochRegistry,
+    /// The epoch registry comes from replaying (it's merged with `epochs.json` afterwards).
+    rebuilt_epochs: bool,
+}
+
+/// Feeds every record of `state` to a store sink, stopping at the first error.
+fn state_records(state: &State) -> impl FnMut(store::RecordSink) -> Result<()> + '_ {
+    move |sink| {
+        let mut err = Ok(());
+        state.for_each_record(|n, k, v| {
+            if err.is_ok() {
+                err = sink(n, k, v);
+            }
+        });
+        err
+    }
 }
 
 impl Chain {
@@ -1828,9 +1988,16 @@ impl Chain {
         Ok(homes)
     }
 
-    /// Opens a chain home and replays `blocks.jsonl`, re-executing every block and checking
-    /// state roots and hash links. `validator.key` is optional (full nodes don't have one).
+    /// Opens a chain home: the state from the database as of its last commit, then the blocks
+    /// logged after that commit point (if a crash came between the two) executed again.
+    /// Without a usable database (missing, another format, damaged), it is rebuilt by
+    /// replaying the logs from genesis, `base.state.zst` or a local snapshot. `validator.key`
+    /// is optional (full nodes don't have one).
     pub fn open(home: &Path) -> Result<Self> {
+        Self::open_with(home, &OpenOpts::default())
+    }
+
+    pub fn open_with(home: &Path, opts: &OpenOpts) -> Result<Self> {
         let genesis = Genesis::load(&home.join("genesis.json"))?;
         let key_path = home.join("validator.key");
         let keys = if key_path.exists() {
@@ -1840,113 +2007,164 @@ impl Chain {
             None
         };
         let role = if keys.is_some() { Role::Validator } else { Role::FullNode };
+        if home.join("blocks.jsonl").exists() || home.join("cblocks.bin").exists() {
+            bail!("{} was written by an older Blockula (blocks.jsonl, storage layout 3), whose chains this binary can't replay; summon or join the chain again in a fresh home", home.display());
+        }
         let base: Option<Base> = match fs::read(home.join("base.json")) {
-            Ok(b) => Some(serde_json::from_slice(&b)?),
+            Ok(b) => Some(serde_json::from_slice(&b).context("base.json")?),
             Err(_) => None,
         };
-        let state = match &base {
-            Some(b) => {
-                let st = crate::snapshot::decode_state(&fs::read(home.join("base.state.zst")).context("base.state.zst missing")?)?;
-                if st.root() != b.state_root {
-                    bail!("base.state.zst doesn't match base.json's state root");
-                }
-                st
-            }
-            None => genesis.initial_state(),
-        };
-        let genesis_root = genesis.initial_state().root();
+        let layout = Layout::load_or_create(home, opts.segment_heights.unwrap_or(store::SEGMENT_HEIGHTS))?;
+        let blocks = SegLog::open(&home.join("blocks"), "jsonl", Framing::Lines, layout.segment_heights)?;
+        let cblocks = SegLog::open(&home.join("cblocks"), "bin", Framing::Records, layout.segment_heights)?;
+        crate::snapshot::remove_partial(home);
+        // An interrupted fast-sync download (it starts over).
+        let _ = fs::remove_file(home.join("base.state.zst.part"));
+        let genesis_state = genesis.initial_state();
+        let genesis_root = genesis_state.root();
         let genesis_hash = hex::encode(crate::consensus::genesis_block(&genesis).digest_bytes());
-        let path = home.join("blocks.jsonl");
-        let log = OpenOptions::new().create(true).append(true).open(&path)?;
-        let (cblocks, cidx) = RecordFile::open(&home.join("cblocks.bin"))?;
-        let (certs, certidx) = RecordFile::open(&home.join("certs.bin"))?;
-        let genesis_for_epochs = genesis.clone();
+        let store = Store::open(&home.join(store::DB_FILE))?;
+        let saved_epochs: Option<crate::epochs::EpochRegistry> = fs::read(home.join("epochs.json")).ok().and_then(|b| serde_json::from_slice(&b).ok());
+        let ctx = OpenCtx { home, genesis: &genesis, genesis_hash: &genesis_hash, genesis_root: &genesis_root, base: base.as_ref(), saved_epochs: saved_epochs.as_ref(), blocks: &blocks };
+        let start = match ctx.load(&store) {
+            Ok(Some(s)) => s,
+            Ok(None) => ctx.rebuild(&store, genesis_state)?,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "the state database doesn't match the block logs; rebuilding it");
+                ctx.rebuild(&store, genesis_state)?
+            }
+        };
+        let Start { state, point, snap, epochs, rebuilt_epochs } = start;
+        let disk = Arc::new(Disk::new(home.to_path_buf(), blocks.reader(), cblocks.reader()));
+        let writer = Writer { store: store.clone(), blocks, cblocks, point: point.clone(), files_pruned_below: 0, #[cfg(test)] fail_at: None, #[cfg(test)] delay: None };
+        let genesis_arc = Arc::new(genesis.clone());
+        let (height, last_hash) = (point.height, point.block_hash.clone());
+        let head = match snap.block_meta(height)? {
+            Some(m) => disk.load_block(height, &m),
+            None => None,
+        };
+        let view = ReadView::new(state.clone(), height, last_hash.clone(), genesis_arc.clone(), genesis_hash.clone(), genesis_root.clone(), role, base.clone(), point.pruned_below, None, head.clone(), snap.clone(), disk.clone());
+        let live = Arc::new(Live::new(view, epochs.clone(), disk.clone()));
         let mut chain = Chain {
             home: home.into(),
             genesis,
+            genesis_arc,
             keys,
             role,
             state,
             genesis_root,
-            last_hash: genesis_hash.clone(),
             genesis_hash,
-            recent: Default::default(),
-            block_offsets: vec![],
-            block_by_hash: HashMap::new(),
-            height: 0,
-            cblocks,
-            cblock_index: vec![],
-            certs,
-            cert_index: certidx.into_iter().map(|(h, at, len)| (h, (at, len))).collect(),
-            recent_certs: BTreeMap::new(),
-            tx_index: HashMap::new(),
-            history: HashMap::new(),
+            height,
+            last_hash,
+            head_ids: head.as_ref().map(|b| b.txs.iter().map(Tx::id).collect()).unwrap_or_default(),
+            head,
+            writer: Arc::new(parking_lot::Mutex::new(writer)),
+            store,
+            point,
+            snap,
+            disk,
             mempool: vec![],
-            pool: HashMap::new(),
+            mempool_ids: vec![],
+            pool: Default::default(),
             pending: HashMap::new(),
-            recent_failed: HashMap::new(),
+            mp: MempoolView::default(),
             failed_order: Default::default(),
             finalized_tip: 0,
             gossip: None,
-            log,
-            log_len: 0,
-            epochs: crate::epochs::EpochRegistry::genesis(&genesis_for_epochs),
-            base: base.clone(),
+            epochs,
+            base,
             claims: HashMap::new(),
             snapshot_busy: Default::default(),
+            live,
+            keep_blocks: None,
+            broken: None,
+            replayed: 0,
         };
-        if let Some(b) = &base {
-            chain.height = b.height;
-            chain.last_hash = b.hash.clone();
-        }
-        let saved_epochs: Option<crate::epochs::EpochRegistry> = fs::read(home.join("epochs.json")).ok().and_then(|b| serde_json::from_slice(&b).ok());
-        if base.is_some() {
-            // Fast-synced: the set history came verified with the snapshot.
-            chain.epochs = saved_epochs.clone().ok_or_else(|| anyhow!("epochs.json missing for a fast-synced home"))?;
-        }
-        let mut offset = 0u64;
-        let mut reader = BufReader::new(File::open(&path)?);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let n = reader.read_line(&mut line)?;
-            if n == 0 {
-                break;
+        chain.replay_logs()?;
+        if rebuilt_epochs {
+            if let Some(saved) = &saved_epochs {
+                let chain_id = chain.genesis.chain_id.clone();
+                chain.epochs.merge_sigs(&chain_id, saved);
             }
-            if line.trim().is_empty() {
-                offset += n as u64;
+            chain.save_epochs();
+        }
+        chain.reconcile_epochs()?;
+        chain.set_finalized_tip(chain.height());
+        chain.publish();
+        chain.live.publish_epochs(chain.epochs.clone());
+        Ok(chain)
+    }
+
+    /// Executes the blocks logged past the commit point again (a crash came between the logs
+    /// and the database), then cuts off anything after the last complete block: a torn entry, or
+    /// a consensus block whose executed block never made it to the log. Neither was acknowledged
+    /// to consensus, so it delivers them again.
+    fn replay_logs(&mut self) -> Result<()> {
+        let (mut bend, mut cend) = (self.point.blocks_end, self.point.cblocks_end);
+        let (breader, creader) = {
+            let w = self.writer.lock();
+            (w.blocks.reader(), w.cblocks.reader())
+        };
+        let mut cit = creader.iter_from(cend);
+        let mut cnext = cit.next().transpose()?;
+        let mut last_durable = true;
+        for e in breader.iter_from(bend) {
+            let e = e?;
+            let block: Block = serde_json::from_slice(&e.payload).with_context(|| format!("the block log has a bad entry at {:?}", e.pos))?;
+            if block.height <= self.height {
+                // Below a snapshot this rebuild started from.
+                bend = e.pos.end();
                 continue;
             }
-            // A crash mid-append can leave a torn last line. That block was never acknowledged to
-            // consensus (blocks.jsonl is synced first), so drop it: it's delivered again.
-            if !line.ends_with('\n') && serde_json::from_str::<Block>(&line).is_err() {
-                tracing::warn!(offset, bytes = n, "dropping a torn last line in blocks.jsonl (crash during a write)");
-                OpenOptions::new().write(true).open(&path)?.set_len(offset)?;
-                break;
+            // Its consensus block: entries are in height order, like the blocks.
+            while cnext.as_ref().is_some_and(|c| c.height < block.height) {
+                cend = cnext.as_ref().unwrap().pos.end();
+                cnext = cit.next().transpose()?;
             }
-            let block: Block = serde_json::from_str(&line)?;
-            chain.replay(block, offset)?;
-            offset += n as u64;
+            let cpos = match &cnext {
+                Some(c) if c.height == block.height => {
+                    let p = c.pos;
+                    cend = p.end();
+                    cnext = cit.next().transpose()?;
+                    Some(p)
+                }
+                _ => None,
+            };
+            let height = block.height;
+            let durable = height.is_multiple_of(REPLAY_SYNC_EVERY);
+            let spans = store::tx_spans(&e.payload, &block.txs);
+            self.replay(block, e.pos, cpos, spans, durable).with_context(|| format!("replaying block {height} from {}", self.home.join("blocks").display()))?;
+            last_durable = durable;
+            bend = e.pos.end();
+            self.replayed += 1;
         }
-        chain.log_len = offset;
-        if let Some(last) = chain.recent.back() {
-            if chain.state.root() != last.state_root {
-                bail!("state root mismatch at height {} (blocks.jsonl doesn't replay)", last.height);
-            }
+        if !last_durable {
+            self.store.commit(store::Commit { point: &mut self.point.clone(), records: &[], nodes: &[], block: None, epoch_head: false, cert: None, prune_below: 0, durable: true })?;
         }
-        // Consensus block bytes: keep exactly one per executed height.
-        let first = chain.base_height() + 1;
-        for (h, at, len) in cidx {
-            if h == first + chain.cblock_index.len() as u64 && h <= chain.height {
-                chain.cblock_index.push((at, len));
-            }
+        if self.replayed > 0 {
+            tracing::info!(blocks = self.replayed, height = self.height, "executed the blocks logged past the state database's commit point");
         }
-        if let Some(saved) = saved_epochs {
-            let chain_id = chain.genesis.chain_id.clone();
-            chain.epochs.merge_sigs(&chain_id, &saved);
+        let mut w = self.writer.lock();
+        w.blocks.truncate(bend)?;
+        w.cblocks.truncate(cend)?;
+        (w.point.blocks_end, w.point.cblocks_end) = (bend, cend);
+        (self.point.blocks_end, self.point.cblocks_end) = (bend, cend);
+        Ok(())
+    }
+
+    /// Brings the validator-set history up to the next height's epoch from the sets in state
+    /// (it can trail when `epochs.json` was saved before a crash).
+    fn reconcile_epochs(&mut self) -> Result<()> {
+        let want = self.state.params.epoch_of(self.height + 1);
+        if self.epochs.known_through >= want {
+            return Ok(());
         }
-        chain.finalized_tip = chain.height();
-        Ok(chain)
+        for e in self.epochs.known_through + 1..=want {
+            let keys: Vec<String> = self.state.active_set(e).map(|s| s.iter().map(|v| v.consensus_key.clone()).collect()).ok_or_else(|| anyhow!("epochs.json is missing epoch {e}, and the state no longer holds its set"))?;
+            self.epochs.record(e, keys);
+        }
+        self.save_epochs();
+        Ok(())
     }
 
     /// The validator's own address (fee recipient, faucet account).
@@ -1958,18 +2176,36 @@ impl Chain {
         self.height
     }
 
+    /// What readers see: the state, history and indexes as of the last executed block.
+    pub fn view(&self) -> Arc<ReadView> {
+        self.live.view()
+    }
+
+    /// Keeps only the last `keep` blocks on disk (`None`: keep everything). Never fewer than
+    /// [`min_keep_blocks`].
+    pub fn set_pruning(&mut self, keep: Option<u64>) {
+        self.keep_blocks = keep.map(|k| k.max(min_keep_blocks(&self.state)));
+        self.publish();
+    }
+
+    #[cfg(test)]
+    pub fn keep_blocks(&self) -> Option<u64> {
+        self.keep_blocks
+    }
+
     /// Records a peer's claimed tip (display only).
     pub fn note_claim(&mut self, peer: &str, tip: u64) {
         self.claims.insert(peer.to_string(), tip);
+        let mut v: Vec<u64> = self.claims.values().copied().collect();
+        v.sort_unstable();
+        let median = if v.is_empty() { 0 } else { v[(v.len() - 1) / 2] };
+        self.live.claimed.store(median, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The network height peers claim: the median of their latest claims, so one lying peer
     /// can't move it. Display-only (status/health); verified heights come from certificates.
     pub fn network_height_claimed(&self) -> u64 {
-        let mut v: Vec<u64> = self.claims.values().copied().collect();
-        v.sort_unstable();
-        let median = if v.is_empty() { 0 } else { v[(v.len() - 1) / 2] };
-        median.max(self.finalized_tip).max(self.height)
+        self.live.claimed.load(std::sync::atomic::Ordering::Relaxed).max(self.finalized_tip).max(self.height)
     }
 
     /// Behind the network by more than a few blocks (verified or claimed).
@@ -1977,7 +2213,14 @@ impl Chain {
         self.height + SYNC_SLACK < self.network_height_claimed()
     }
 
+    /// A finalized height consensus told us about (certificates, marshal tips).
+    pub fn set_finalized_tip(&mut self, height: u64) {
+        self.finalized_tip = self.finalized_tip.max(height);
+        self.live.finalized_tip.fetch_max(self.finalized_tip, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Height of the snapshot this node fast-synced from (0 = full history).
+    #[cfg(test)]
     pub fn base_height(&self) -> u64 {
         self.base.as_ref().map(|b| b.height).unwrap_or(0)
     }
@@ -1987,114 +2230,87 @@ impl Chain {
     }
 
     pub fn last_block(&self) -> Option<&Block> {
-        self.recent.back()
+        self.head.as_deref()
     }
 
-    /// Executed block at `height`, from memory or disk.
+    // Tests read through the chain; the API reads the published view directly.
+
+    /// Executed block at `height`, if this node holds it.
+    #[cfg(test)]
     pub fn block(&self, height: u64) -> Option<Block> {
-        if height == 0 || height > self.height {
-            return None;
-        }
-        let first_recent = self.height + 1 - self.recent.len() as u64;
-        if height >= first_recent {
-            return self.recent.get((height - first_recent) as usize).cloned();
-        }
-        if height <= self.base_height() {
-            return None;
-        }
-        let at = *self.block_offsets.get((height - self.base_height()) as usize - 1)?;
-        use std::io::{Seek, SeekFrom};
-        let mut f = File::open(self.home.join("blocks.jsonl")).ok()?;
-        f.seek(SeekFrom::Start(at)).ok()?;
-        let mut line = String::new();
-        BufReader::new(f).read_line(&mut line).ok()?;
-        serde_json::from_str(&line).ok()
+        self.view().block(height).map(|b| (*b).clone())
     }
 
-    pub fn block_by_hash(&self, hash: &str) -> Option<Block> {
-        let key = u64::from_str_radix(hash.get(..16)?, 16).ok()?;
-        let b = self.block(*self.block_by_hash.get(&key)?)?;
-        (b.hash == hash).then_some(b)
-    }
-
-    /// Newest-first blocks below `before`.
-    pub fn blocks_before(&self, before: u64, limit: usize) -> Vec<Block> {
-        let top = before.saturating_sub(1).min(self.height);
-        (self.base_height() + 1..=top).rev().take(limit).filter_map(|h| self.block(h)).collect()
-    }
-
-    /// State root after executing `height` (0 = genesis).
+    /// State root after executing `height` (0 = genesis). The latest block's comes from memory
+    /// (it may still be being written while readers see the previous one).
     pub fn root_at(&self, height: u64) -> Option<String> {
-        if height == 0 {
-            return Some(self.genesis_root.clone());
+        if height == self.height {
+            return Some(self.state.root());
         }
-        if let Some(b) = self.base.as_ref().filter(|b| b.height == height) {
-            return Some(b.state_root.clone());
-        }
-        self.block(height).map(|b| b.state_root)
+        self.view().root_at(height)
     }
 
-    /// Hash of the executed block at `height`, including the fast-sync base and the anchor of
-    /// the epoch we fast-synced into.
+    /// Hash of the executed block at `height`, including the fast-sync base, the anchor of the
+    /// epoch we fast-synced into, and epochs' last blocks (kept through pruning).
     pub fn hash_at(&self, height: u64) -> Option<String> {
-        if height == 0 {
-            return Some(self.genesis_hash.clone());
+        if height == self.height {
+            return Some(self.last_hash.clone());
         }
-        if let Some(b) = &self.base {
-            if b.height == height {
-                return Some(b.hash.clone());
-            }
-            if let Some((h, hash)) = &b.epoch_start {
-                if *h == height {
-                    return Some(hash.clone());
-                }
-            }
-        }
-        self.block(height).map(|b| b.hash)
+        self.view().hash_at(height)
     }
 
     /// Exact consensus block bytes at `height`.
+    #[cfg(test)]
     pub fn cblock(&self, height: u64) -> Option<Vec<u8>> {
-        let (at, len) = *self.cblock_index.get(height.checked_sub(self.base_height() + 1)? as usize)?;
-        self.cblocks.read(at, len)
+        self.view().cblock(height)
     }
 
     /// Encoded finalization certificate for `height`, if stored.
     pub fn cert(&self, height: u64) -> Option<Vec<u8>> {
-        if let Some(c) = self.recent_certs.get(&height) {
-            return Some(c.clone());
-        }
-        let (at, len) = *self.cert_index.get(&height)?;
-        self.certs.read(at, len)
+        self.view().cert(height)
     }
 
+    #[cfg(test)]
     pub fn cert_len(&self, height: u64) -> usize {
-        self.recent_certs.get(&height).map(|c| c.len()).or_else(|| self.cert_index.get(&height).map(|(_, l)| *l as usize)).unwrap_or(0)
+        self.view().cert_len(height)
     }
 
-    /// Stores a certificate: always in the recent window, on disk at checkpoints/epoch ends.
+    /// Whether a tx is finalized (in a block this node still indexes).
+    pub fn has_tx(&self, id: &str) -> bool {
+        self.tx_location(id).is_some()
+    }
+
+    /// Where a finalized tx is: (height, index in the block).
+    pub fn tx_location(&self, id: &str) -> Option<(u64, usize)> {
+        if self.head_ids.contains(id) {
+            let b = self.head.as_ref()?;
+            return Some((b.height, b.txs.iter().position(|t| t.id() == id)?));
+        }
+        self.snap.tx(&hash32(id).ok()?).ok()?
+    }
+
+    /// Keeps a certificate that arrived after its block: in memory for recent heights, on disk at
+    /// checkpoints and epoch ends. (Execution stores the certificates consensus hands it.)
+    #[cfg(test)]
     pub fn store_cert(&mut self, height: u64, cert: Vec<u8>) -> Result<()> {
-        if (height % CERT_CHECKPOINT == 0 || self.state.params.is_boundary(height)) && !self.cert_index.contains_key(&height) {
-            let (at, len) = self.certs.append(height, &cert)?;
-            self.certs.sync()?;
-            self.cert_index.insert(height, (at, len));
+        let boundary = self.state.params.is_boundary(height);
+        if (height.is_multiple_of(CERT_CHECKPOINT) && height >= self.point.pruned_below) || boundary {
+            self.store.put_cert(height, &cert)?;
         }
-        self.recent_certs.insert(height, cert);
-        while self.recent_certs.len() > RECENT_CERTS {
-            let first = *self.recent_certs.keys().next().unwrap();
-            self.recent_certs.remove(&first);
-        }
-        self.finalized_tip = self.finalized_tip.max(height);
+        self.disk.remember_cert(height, cert);
+        self.set_finalized_tip(height);
         Ok(())
     }
 
-    fn index(&mut self, block: &Block) {
+    /// Index rows for an executed block: its tx ids and the accounts whose history it joins.
+    fn block_meta(&self, block: &Block, at: Pos, cblock: Option<Pos>) -> Result<BlockMeta> {
+        let mut txs = Vec::with_capacity(block.txs.len());
+        let mut history = vec![];
         for (i, tx) in block.txs.iter().enumerate() {
-            let id = tx.id();
-            self.tx_index.insert(id.clone(), (block.height, i));
+            txs.push(hash32(&tx.id())?);
             let sender = tx.sender().ok();
             if let Some(s) = &sender {
-                self.history.entry(s.clone()).or_default().push(id.clone());
+                history.push((i as u32, s.clone()));
             }
             let other = match &tx.action {
                 Action::Transfer { to, .. } | Action::AwardHunt { to, .. } | Action::GrantSoul { to, .. } => Some(to),
@@ -2103,29 +2319,55 @@ impl Chain {
             };
             if let Some(to) = other.and_then(|t| self.state.resolve(t).ok()) {
                 if sender.as_ref() != Some(&to) {
-                    self.history.entry(to).or_default().push(id.clone());
+                    history.push((i as u32, to));
                 }
             }
         }
+        Ok(BlockMeta {
+            hash: hash32(&block.hash)?,
+            prev_hash: hash32(&block.prev_hash)?,
+            state_root: hash32(&block.state_root)?,
+            timestamp_ms: block.timestamp_ms,
+            proposer: block.proposer.clone(),
+            tx_count: block.txs.len() as u32,
+            failed_count: block.failed.len() as u32,
+            block: at,
+            cblock,
+            txs,
+            tx_spans: vec![],
+            failed: block.failed.iter().map(|(i, r)| (*i as u32, r.clone())).collect(),
+            history,
+        })
     }
 
-    fn push_block(&mut self, block: Block, offset: u64) {
-        debug_assert_eq!(self.block_offsets.len() as u64 + self.base_height() + 1, block.height);
-        self.block_offsets.push(offset);
-        if let Ok(key) = u64::from_str_radix(&block.hash[..16.min(block.hash.len())], 16) {
-            self.block_by_hash.insert(key, block.height);
-        }
+    /// Everything the commit of `block` writes, as of the state now in memory (the writer fills
+    /// in where the block lands in the logs).
+    fn prepare_commit(&self, block: Arc<Block>, cblock: Option<Vec<u8>>, records: Vec<RecordChange>, cert: Option<Vec<u8>>) -> Result<Executed> {
+        let meta = self.block_meta(&block, Pos::default(), None)?;
+        let epoch_head = self.state.params.is_boundary(block.height);
+        let cert = cert.filter(|_| block.height.is_multiple_of(CERT_CHECKPOINT) || epoch_head);
+        let prune_below = self.keep_blocks.map(|k| (block.height + 1).saturating_sub(k)).unwrap_or(0);
+        Ok(Executed { meta, root: self.state.root_hash(), root_child: self.state.tree.root_child().encode(), nodes: self.state.tree.pending_changes(), records, cert, epoch_head, prune_below, cblock, block })
+    }
+
+    /// The executed block becomes the head (readers keep seeing the previous one until `finish`).
+    fn advance(&mut self, block: &Arc<Block>) {
         self.height = block.height;
         self.last_hash = block.hash.clone();
-        self.recent.push_back(block);
-        while self.recent.len() > RECENT_BLOCKS {
-            self.recent.pop_front();
-        }
+        self.head_ids = block.txs.iter().map(Tx::id).collect();
+        self.head = Some(block.clone());
     }
 
-    fn replay(&mut self, block: Block, offset: u64) -> Result<()> {
+    /// The tree moves onto the database snapshot that now holds its nodes.
+    fn adopt(&mut self, snap: Arc<Snap>, point: CommitPoint) {
+        self.state.tree.rebase(snap.clone());
+        self.snap = snap;
+        self.point = point;
+    }
+
+    fn replay(&mut self, block: Block, at: Pos, cblock: Option<Pos>, tx_spans: Vec<(u32, u32)>, durable: bool) -> Result<()> {
         if block.height != self.height() + 1 || block.prev_hash != self.last_hash() {
-            bail!("blocks.jsonl is not contiguous at height {}", block.height);
+            bail!("the block log is not contiguous at height {}", block.height);
         }
         for (i, tx) in block.txs.iter().enumerate() {
             let outcome = self.state.apply(tx, &self.genesis.chain_id, &block.proposer, block.height).with_context(|| format!("replaying block {}", block.height))?;
@@ -2141,45 +2383,97 @@ impl Chain {
         if self.state.params.is_boundary(block.height) {
             self.record_epoch(block.height);
         }
-        let root = hex::encode(self.state.commit_block()?.root);
+        let commit = self.state.commit_block()?;
+        let root = hex::encode(commit.root);
         #[cfg(test)]
         self.state.debug_check(block.height);
         if root != block.state_root {
             bail!("state root mismatch at height {}", block.height);
         }
         let height = block.height;
-        self.index(&block);
-        self.push_block(block, offset);
+        let mut e = self.prepare_commit(Arc::new(block), None, commit.records, None)?;
+        (e.meta.block, e.meta.cblock, e.meta.tx_spans) = (at, cblock, tx_spans);
+        let (snap, point) = self.writer.lock().commit(&e, durable)?;
+        self.advance(&e.block);
+        self.adopt(snap, point);
         // As in `execute`: stop before a height this binary can't run (3.9).
         crate::upgrade::check_next(&self.state, height + 1)
     }
 
     fn note_failed(&mut self, id: String, reason: String, height: u64) {
-        if self.recent_failed.insert(id.clone(), (reason, height)).is_none() {
-            self.failed_order.push_back(id);
+        if !self.mp.has_failure(&id) {
+            self.failed_order.push_back(id.clone());
         }
+        self.mp.fail(id, reason, height);
         while self.failed_order.len() > RECENT_FAILED {
             if let Some(old) = self.failed_order.pop_front() {
-                self.recent_failed.remove(&old);
+                self.mp.unfail(&old);
             }
         }
     }
 
     /// Why a tx failed or was dropped, if we remember.
+    #[cfg(test)]
     pub fn failure(&self, id: &str) -> Option<&(String, u64)> {
-        self.recent_failed.get(id)
+        self.mp.failure(id)
     }
 
     /// Executes a finalized block: applies its txs in order (invalid ones are skipped; ones whose
-    /// action fails are charged their fee), appends it durably to `blocks.jsonl`, then prunes the
-    /// mempool.
+    /// action fails are charged their fee), persists it (block logs, then the state database),
+    /// then prunes the mempool and publishes the new view. Returning `Ok` acknowledges the block.
     pub fn execute(&mut self, f: Finalized) -> Result<()> {
+        let height = f.height;
+        let mut e = self.execute_in_memory(f)?;
+        let written = self.writer.clone().lock().persist(&mut e);
+        self.finish(e, written)?;
+        self.revalidate_mempool();
+        // The last end-of-block step: the block is executed and stored, but if this binary can't
+        // run the next height, stop here (the error leaves the block unacknowledged, so consensus
+        // stops delivering) instead of diverging. P-UPGRADE turns this into a clean exit.
+        crate::upgrade::check_next(&self.state, height + 1)
+    }
+
+    /// [`Chain::execute`] for a chain that consensus and readers share: the chain lock is held
+    /// only while the block is applied in memory and adopted. Writing and fsyncing the logs, the
+    /// database commit and the mempool check run without it (SF-4). One executor at a time.
+    pub fn execute_shared(chain: &parking_lot::Mutex<Chain>, f: Finalized) -> Result<()> {
+        let (mut e, writer) = {
+            let mut c = chain.lock();
+            (c.execute_in_memory(f)?, c.writer.clone())
+        };
+        let height = e.block.height;
+        let written = writer.lock().persist(&mut e);
+        chain.lock().finish(e, written)?;
+        let check = chain.lock().mempool_check();
+        let dropped = check.run();
+        let mut c = chain.lock();
+        c.drop_from_mempool(dropped);
+        // As in `execute`: the block is stored, but the node stops before a height it can't run.
+        crate::upgrade::check_next(&c.state, height + 1)
+    }
+
+    /// Applies a finalized block to the state in memory and prepares its commit. From here until
+    /// `finish`, memory is ahead of the disk: a failure leaves this instance unusable until a
+    /// restart (which recovers from the logs).
+    fn execute_in_memory(&mut self, f: Finalized) -> Result<Executed> {
+        if let Some(why) = &self.broken {
+            bail!("a block failed to persist ({why}); restart the node to recover from its logs");
+        }
         if f.height != self.height() + 1 {
             bail!("expected block {}, got {}", self.height() + 1, f.height);
         }
         if f.parent != self.last_hash() {
             bail!("block {} does not extend our chain", f.height);
         }
+        let height = f.height;
+        let result = self.apply_block(f);
+        if let Err(e) = &result {
+            self.broken = Some(format!("block {height}: {e:#}"));
+        }
+        result
+    }
+
+    fn apply_block(&mut self, f: Finalized) -> Result<Executed> {
         let mut txs = vec![];
         let mut failed = BTreeMap::new();
         let mut skipped = vec![];
@@ -2201,43 +2495,63 @@ impl Chain {
         if self.state.params.is_boundary(f.height) && self.record_epoch(f.height) {
             self.sign_handoffs();
         }
-        let state_root = hex::encode(self.state.commit_block()?.root);
+        let commit = self.state.commit_block()?;
+        let state_root = hex::encode(commit.root);
         #[cfg(test)]
         self.state.debug_check(f.height);
-        let block = Block { height: f.height, prev_hash: f.parent, timestamp_ms: f.timestamp_ms, view: f.view, parent_view: f.parent_view, version: f.version, proposer: f.proposer, state_root, txs, hash: f.hash, signature: String::new(), failed, skipped };
-        let (at, len) = self.cblocks.append(f.height, &f.cblock)?;
-        self.cblock_index.push((at, len));
-        let line = serde_json::to_string(&block)? + "\n";
-        self.log.write_all(line.as_bytes())?;
-        self.cblocks.sync()?;
-        self.log.sync_data()?;
-        let offset = self.log_len;
-        self.log_len += line.len() as u64;
-        self.index(&block);
-        self.push_block(block, offset);
-        if let Some(cert) = f.certificate {
-            self.store_cert(f.height, cert)?;
+        let block = Arc::new(Block { height: f.height, prev_hash: f.parent, timestamp_ms: f.timestamp_ms, view: f.view, parent_view: f.parent_view, version: f.version, proposer: f.proposer, state_root, txs, hash: f.hash, signature: String::new(), failed, skipped });
+        if let Some(cert) = &f.certificate {
+            self.disk.remember_cert(f.height, cert.clone());
         }
-        self.finalized_tip = self.finalized_tip.max(f.height);
-        if crate::snapshot::is_checkpoint(f.height) {
-            self.take_snapshot();
-        }
-        self.revalidate_mempool();
-        // The last end-of-block step: the block is executed and stored, but if this binary can't
-        // run the next height, stop here (the error leaves the block unacknowledged, so consensus
-        // stops delivering) instead of diverging. P-UPGRADE turns this into a clean exit.
-        crate::upgrade::check_next(&self.state, f.height + 1)
+        let e = self.prepare_commit(block, Some(f.cblock), commit.records, f.certificate)?;
+        self.advance(&e.block);
+        Ok(e)
     }
 
-    /// After executing an epoch's last block: remember the next epoch's set. Returns whether it
+    /// After the writer committed the block: the tree adopts the new database snapshot, readers
+    /// get the new view, the mempool sheds the block's txs, and checkpoints get a snapshot.
+    fn finish(&mut self, e: Executed, written: Result<(Arc<Snap>, CommitPoint)>) -> Result<()> {
+        let (snap, point) = match written {
+            Ok(w) if self.height == e.block.height => w,
+            Ok(_) => {
+                self.broken = Some(format!("block {} was written after the chain moved on", e.block.height));
+                bail!("block {} was written after the chain moved on", e.block.height);
+            }
+            Err(err) => {
+                self.broken = Some(format!("block {}: {err:#}", e.block.height));
+                return Err(err);
+            }
+        };
+        self.adopt(snap, point);
+        self.disk.cache_block(e.block.clone(), e.meta.block.len as usize);
+        self.set_finalized_tip(e.block.height);
+        if crate::snapshot::is_checkpoint(e.block.height) {
+            self.take_snapshot();
+        }
+        self.drop_included();
+        self.publish();
+        Ok(())
+    }
+
+    /// Publishes the current state, head and mempool to readers.
+    fn publish(&mut self) {
+        let view = ReadView::new(self.state.clone(), self.height, self.last_hash.clone(), self.genesis_arc.clone(), self.genesis_hash.clone(), self.genesis_root.clone(), self.role, self.base.clone(), self.point.pruned_below, self.keep_blocks, self.head.clone(), self.snap.clone(), self.disk.clone());
+        self.live.publish(view);
+        self.publish_mempool();
+    }
+
+    fn publish_mempool(&self) {
+        self.live.publish_mempool(self.mp.clone());
+    }
+
+    /// After executing an epoch's last block: remember the next epoch's set (saved every epoch,
+    /// so `epochs.json` keeps up with the state database without a replay). Returns whether it
     /// changed (then the outgoing validators sign a handoff).
     fn record_epoch(&mut self, boundary: u64) -> bool {
         let next = self.state.params.epoch_of(boundary) + 1;
         let keys: Vec<String> = self.state.active_set(next).map(|s| s.iter().map(|v| v.consensus_key.clone()).collect()).unwrap_or_default();
         let changed = self.epochs.record(next, keys);
-        if changed {
-            self.save_epochs();
-        }
+        self.save_epochs();
         changed
     }
 
@@ -2261,13 +2575,18 @@ impl Chain {
         n
     }
 
+    /// Writes `epochs.json` durably (temp file, fsync, rename, fsync the directory) and publishes
+    /// the registry. A failure is logged: the registry is rebuilt from state on the next start.
     fn save_epochs(&self) {
-        if let Ok(json) = serde_json::to_vec(&self.epochs) {
-            let tmp = self.home.join("epochs.json.tmp");
-            if fs::write(&tmp, json).is_ok() {
-                let _ = fs::rename(tmp, self.home.join("epochs.json"));
-            }
+        if let Err(e) = self.try_save_epochs() {
+            tracing::warn!(error = %format!("{e:#}"), "couldn't save epochs.json");
         }
+    }
+
+    fn try_save_epochs(&self) -> Result<()> {
+        store::write_durably(&self.home.join("epochs.json"), &serde_json::to_vec(&self.epochs)?)?;
+        self.live.publish_epochs(self.epochs.clone());
+        Ok(())
     }
 
     /// Writes a snapshot of the current state in the background.
@@ -2277,7 +2596,11 @@ impl Chain {
             tracing::warn!(height = self.height, "skipping a snapshot: the previous one is still being written");
             return;
         }
-        let (home, height, root, state, busy) = (self.home.clone(), self.height, self.state.root(), self.state.clone(), self.snapshot_busy.clone());
+        // The records are all the writer reads; without the tree the clone doesn't pin a
+        // database snapshot for as long as the writer runs.
+        let mut state = self.state.clone();
+        state.tree = Default::default();
+        let (home, height, root, busy) = (self.home.clone(), self.height, self.state.root(), self.snapshot_busy.clone());
         std::thread::spawn(move || {
             if let Err(e) = crate::snapshot::write(&home, height, &root, &state) {
                 tracing::warn!(height, error = %e, "snapshot failed");
@@ -2287,26 +2610,35 @@ impl Chain {
     }
 
     /// Installs a verified snapshot into an empty home, then executes the manifest's blocks.
-    /// Installs a restored snapshot: `chunks` (the packed state, in order) become `base.state.zst`.
-    pub fn install_snapshot(&mut self, v: &crate::snapshot::Verified, state: State, chunks: &[Vec<u8>], epoch_start: Option<(u64, String)>) -> Result<()> {
+    /// `packed` (the verified chunks, concatenated) becomes `base.state.zst`; `state` is what
+    /// it decodes to (root already checked). Each file is in place durably before the next, and
+    /// `base.json` (the switch) comes last but one: a crash before it leaves a genesis home, a
+    /// crash after it a fast-synced home whose database is rebuilt from `base.state.zst`.
+    pub fn install_snapshot(&mut self, v: &crate::snapshot::Verified, state: State, packed: &Path, epoch_start: Option<(u64, String)>) -> Result<()> {
         if self.height != 0 || self.base.is_some() {
             bail!("fast sync needs an empty home");
         }
         let base_hash = hex::encode(v.blocks[0].parent_bytes());
-        let mut packed = File::create(self.home.join("base.state.zst"))?;
-        for c in chunks {
-            packed.write_all(c)?;
-        }
-        packed.sync_all()?;
-        let base = Base { height: v.height, hash: base_hash.clone(), state_root: v.state_root.clone(), epoch_start };
+        store::install_durably(packed, &self.home.join("base.state.zst"))?;
         self.epochs = v.epochs.clone();
-        self.save_epochs();
-        fs::write(self.home.join("base.json"), serde_json::to_vec_pretty(&base)?)?;
+        self.try_save_epochs()?;
+        let base = Base { height: v.height, hash: base_hash.clone(), state_root: v.state_root.clone(), epoch_start };
+        store::write_durably(&self.home.join("base.json"), &serde_json::to_vec_pretty(&base)?)?;
+        let mut w = self.writer.lock();
+        let start = (v.height + 1, w.blocks.reader().seg_of(v.height + 1));
+        let mut point = CommitPoint { height: v.height, block_hash: base_hash.clone(), root: state.root_hash(), root_child: state.tree.root_child().encode(), base: v.height, pruned_below: start.0, blocks_end: (start.1, 0), cblocks_end: (start.1, 0), ..self.point.clone() };
+        self.store.reset(&mut point, &mut state_records(&state), &state.tree.pending_changes())?;
+        w.point = point.clone();
+        drop(w);
         self.state = state;
+        self.adopt(Arc::new(self.store.snapshot()?), point);
         self.height = v.height;
         self.last_hash = base_hash;
+        self.head = None;
+        self.head_ids.clear();
         self.base = Some(base);
-        self.finalized_tip = v.height;
+        self.set_finalized_tip(v.height);
+        self.publish();
         let last = v.blocks.len() - 1;
         for (i, b) in v.blocks.iter().enumerate() {
             let cert = (i == last).then(|| v.finalization.clone());
@@ -2328,44 +2660,58 @@ impl Chain {
         }
     }
 
-    /// Drops mempool txs that were included, expired, or can no longer apply. Uses a journal
-    /// over the live state (rolled back afterwards) instead of cloning it.
-    fn revalidate_mempool(&mut self) {
-        let next = self.height() + 1;
-        let proposer = self.fee_sink();
-        let chain_id = self.genesis.chain_id.clone();
-        let mut j = Journal::default();
-        let mut keep = Vec::with_capacity(self.mempool.len());
-        let mut dropped = vec![];
-        for tx in std::mem::take(&mut self.mempool) {
-            let id = tx.id();
-            if self.tx_index.contains_key(&id) {
-                self.pool.remove(&id);
-                continue;
-            }
-            if tx.valid_until < next {
-                dropped.push((id, format!("expired at block {}", tx.valid_until)));
-                continue;
-            }
-            let added = self.pool.get(&id).map(|e| e.added_at).unwrap_or(next);
-            if added + MEMPOOL_TTL_BLOCKS < next {
-                // Not expired: anyone holding it may resubmit it until `valid_until`.
-                dropped.push((id, format!("dropped from the mempool: not included within {MEMPOOL_TTL_BLOCKS} blocks (it stays valid until block {} if resubmitted)", tx.valid_until)));
-                continue;
-            }
-            match self.state.apply_j(&mut j, &tx, &chain_id, &proposer, next, false) {
-                Ok(Outcome::Applied) => keep.push(tx),
-                Ok(Outcome::Failed(r)) => dropped.push((id, format!("dropped from the mempool: {r}"))),
-                Err(e) => dropped.push((id, format!("dropped from the mempool: {e}"))),
+    /// Removes the txs the head block included from the mempool (cheap: ids are kept).
+    fn drop_included(&mut self) {
+        if self.head_ids.is_empty() {
+            return;
+        }
+        let included = std::mem::take(&mut self.head_ids);
+        self.remove_from_mempool(|id| included.contains(id));
+        for id in &included {
+            self.pool.remove(id);
+            self.mp.remove(id);
+        }
+        self.head_ids = included;
+        self.rebuild_pending();
+    }
+
+    /// Removes the mempool txs whose ids match, keeping `mempool` and `mempool_ids` aligned.
+    fn remove_from_mempool(&mut self, gone: impl Fn(&str) -> bool) {
+        let txs = std::mem::take(&mut self.mempool);
+        let ids = std::mem::take(&mut self.mempool_ids);
+        for (tx, id) in txs.into_iter().zip(ids) {
+            if !gone(&id) {
+                self.mempool.push(tx);
+                self.mempool_ids.push(id);
             }
         }
-        self.state.rollback(j);
-        self.mempool = keep;
-        for (id, r) in dropped {
+    }
+
+    /// A copy of the state and the mempool to check against each other without the lock.
+    pub fn mempool_check(&self) -> MempoolCheck {
+        MempoolCheck { state: self.state.clone(), txs: self.mp.clone(), next: self.height() + 1, proposer: self.fee_sink(), chain_id: self.genesis.chain_id.clone() }
+    }
+
+    /// Drops what a [`MempoolCheck`] found (if still queued) and remembers why.
+    pub fn drop_from_mempool(&mut self, (height, dropped): (u64, Vec<(String, String)>)) {
+        if dropped.is_empty() {
+            return;
+        }
+        let gone: HashMap<String, String> = dropped.into_iter().filter(|(id, _)| self.pool.contains(id)).collect();
+        self.remove_from_mempool(|id| gone.contains_key(id));
+        for (id, why) in gone {
             self.pool.remove(&id);
-            self.note_failed(id, r, next);
+            self.mp.remove(&id);
+            self.note_failed(id, why, height);
         }
         self.rebuild_pending();
+        self.publish_mempool();
+    }
+
+    /// Drops mempool txs that expired or can no longer apply (included ones went already).
+    fn revalidate_mempool(&mut self) {
+        let dropped = self.mempool_check().run();
+        self.drop_from_mempool(dropped);
     }
 
     /// Checks a tx against current state plus what the sender already has queued, then queues
@@ -2375,7 +2721,7 @@ impl Chain {
     pub fn submit_tx(&mut self, tx: Tx) -> Result<(String, bool)> {
         tx.check_format()?;
         let id = tx.id();
-        if self.tx_index.contains_key(&id) || self.pool.contains_key(&id) {
+        if self.pool.contains(&id) || self.has_tx(&id) {
             return Ok((id, false));
         }
         let sender = tx.sender()?;
@@ -2423,9 +2769,10 @@ impl Chain {
                 }
                 None => bail!("mempool is full; try again shortly"),
             };
-            let evicted = self.mempool.remove(idx);
-            let eid = evicted.id();
+            self.mempool.remove(idx);
+            let eid = self.mempool_ids.remove(idx);
             self.pool.remove(&eid);
+            self.mp.remove(&eid);
             self.note_failed(eid, "evicted from a full mempool by a transaction with a higher tip".into(), next);
             self.rebuild_pending();
         }
@@ -2436,8 +2783,11 @@ impl Chain {
         let e = self.pending.entry(sender.clone()).or_default();
         e.0 += 1;
         e.1 = e.1.saturating_add(debit);
-        self.pool.insert(id.clone(), PoolEntry { added_at: next });
+        self.pool.insert(id.clone());
+        self.mp.add(id.clone(), &tx, next);
         self.mempool.push(tx);
+        self.mempool_ids.push(id.clone());
+        self.publish_mempool();
         Ok((id, true))
     }
 
@@ -2449,7 +2799,7 @@ impl Chain {
     pub fn track_pending(&mut self, tx: Tx) -> Result<()> {
         tx.check_format()?;
         let id = tx.id();
-        if !self.tx_index.contains_key(&id) && !self.pool.contains_key(&id) {
+        if !self.pool.contains(&id) && !self.has_tx(&id) {
             let sender = tx.sender()?;
             if self.pending.get(&sender).is_some_and(|p| p.0 >= MAX_PENDING_PER_SENDER) || self.mempool.len() >= MAX_MEMPOOL {
                 return Ok(());
@@ -2458,17 +2808,23 @@ impl Chain {
             let e = self.pending.entry(sender.clone()).or_default();
             e.0 += 1;
             e.1 = e.1.saturating_add(debit);
-            self.pool.insert(id, PoolEntry { added_at: self.height() + 1 });
+            let next = self.height() + 1;
+            self.pool.insert(id.clone());
+            self.mp.add(id.clone(), &tx, next);
             self.mempool.push(tx);
+            self.mempool_ids.push(id);
+            self.publish_mempool();
         }
         Ok(())
     }
 
     /// Removes a tx we queued locally (e.g. a full node whose forward failed).
     pub fn drop_pending(&mut self, id: &str) {
-        if self.pool.remove(id).is_some() {
-            self.mempool.retain(|t| t.id() != id);
+        if self.pool.remove(id) {
+            self.remove_from_mempool(|x| x == id);
+            self.mp.remove(id);
             self.rebuild_pending();
+            self.publish_mempool();
         }
     }
 
@@ -2476,8 +2832,9 @@ impl Chain {
         self.pending.get(addr).map(|p| p.0).unwrap_or(0)
     }
 
+    #[cfg(test)]
     pub fn in_mempool(&self, id: &str) -> bool {
-        self.pool.contains_key(id)
+        self.pool.contains(id)
     }
 
     /// Next nonce for an address, counting txs already waiting in the mempool.
@@ -2537,9 +2894,164 @@ impl Chain {
 
     #[cfg(test)]
     pub fn produce_block_with(&mut self, txs: Vec<Tx>) -> Result<()> {
-        let height = self.height() + 1;
-        let f = Finalized { height, hash: hex::encode(crypto::hash(format!("test-{}-{}", self.height(), self.last_hash()).as_bytes())), parent: self.last_hash().to_string(), timestamp_ms: now_ms(), view: height, parent_view: height - 1, version: crate::consensus::PROTOCOL_VERSION, proposer: self.fee_sink(), txs, cblock: vec![], certificate: None };
+        let f = self.test_block(txs);
         self.execute(f)
+    }
+
+    /// The next block with `txs`, as consensus would hand it over (tests).
+    #[cfg(test)]
+    pub fn test_block(&self, txs: Vec<Tx>) -> Finalized {
+        let height = self.height() + 1;
+        Finalized { height, hash: hex::encode(crypto::hash(format!("test-{}-{}", self.height(), self.last_hash()).as_bytes())), parent: self.last_hash().to_string(), timestamp_ms: now_ms(), view: height, parent_view: height - 1, version: crate::consensus::PROTOCOL_VERSION, proposer: self.fee_sink(), txs, cblock: vec![], certificate: None }
+    }
+}
+
+/// What `Chain::open` needs to pick a starting state.
+struct OpenCtx<'a> {
+    home: &'a Path,
+    genesis: &'a Genesis,
+    genesis_hash: &'a str,
+    genesis_root: &'a str,
+    base: Option<&'a Base>,
+    saved_epochs: Option<&'a crate::epochs::EpochRegistry>,
+    blocks: &'a SegLog,
+}
+
+impl OpenCtx<'_> {
+    fn base_height(&self) -> u64 {
+        self.base.map(|b| b.height).unwrap_or(0)
+    }
+
+    /// The state as of the database's commit point, checked against the tree, the records' own
+    /// root and the block log. `None`: there is no usable database (none yet, another format or
+    /// schema, another chain, another base).
+    fn load(&self, store: &Arc<Store>) -> Result<Option<Start>> {
+        let Some(p) = store.commit_point()? else { return Ok(None) };
+        if p.format != store::STORE_FORMAT || p.schema != SCHEMA_VERSION || p.genesis_hash != self.genesis_hash || p.base != self.base_height() {
+            tracing::info!(format = p.format, schema = p.schema, base = p.base, "the state database was written for another format, chain or base; rebuilding it");
+            return Ok(None);
+        }
+        let epochs = match self.saved_epochs {
+            Some(e) => e.clone(),
+            None if p.height == 0 => crate::epochs::EpochRegistry::genesis(self.genesis),
+            None => bail!("epochs.json is missing"),
+        };
+        let snap = Arc::new(store.snapshot()?);
+        let root_child = Child::decode(&p.root_child)?;
+        ensure!(root_child.hash() == p.root, "the stored root slot doesn't hash to the commit point's root");
+        if let Child::Node(h) = root_child {
+            let node = snap.get(&NodeKey { depth: 0, prefix: [0; 32] })?.ok_or_else(|| anyhow!("the tree's root node is missing"))?;
+            ensure!(node.hash() == h, "the tree's stored root node doesn't hash to its root");
+        }
+        let tree = Smt::open(root_child, snap.clone());
+        let (state, records_root) = State::from_stored_records(store.records()?, tree)?;
+        ensure!(records_root == p.root, "the stored records don't hash to the stored root");
+        ensure!(state.record_count() as u64 == p.records, "the database holds {} records, its commit point says {}", state.record_count(), p.records);
+        // The commit point agrees with the block log (or the base, or genesis).
+        let root = hex::encode(p.root);
+        if p.height > self.base_height() {
+            let meta = snap.block_meta(p.height)?.ok_or_else(|| anyhow!("no index row for the committed block {}", p.height))?;
+            let line = self.blocks.reader().read(meta.block).with_context(|| format!("reading block {} from the log", p.height))?;
+            let b: Block = serde_json::from_slice(&line)?;
+            ensure!(b.height == p.height && b.hash == p.block_hash && b.state_root == root, "block {} in the log isn't the one the database committed", p.height);
+        } else if let Some(base) = self.base {
+            ensure!(p.height == base.height && p.block_hash == base.hash && root == base.state_root, "the database doesn't hold base.json's state");
+        } else {
+            ensure!(p.height == 0 && root == self.genesis_root && p.block_hash == self.genesis_hash, "the database doesn't hold the genesis state");
+        }
+        Ok(Some(Start { state, point: p, snap, epochs, rebuilt_epochs: false }))
+    }
+
+    /// A fresh database with the state the logs start from: `base.state.zst`, genesis, or (logs
+    /// pruned past both) the newest local snapshot they continue from. `open` then replays the
+    /// logs over it.
+    fn rebuild(&self, store: &Arc<Store>, genesis_state: State) -> Result<Start> {
+        let first = self.first_logged_height()?;
+        let (state, height, hash, epochs) = match self.base {
+            Some(b) => {
+                let st = crate::snapshot::decode_state_file(&self.home.join("base.state.zst")).context("base.state.zst")?;
+                ensure!(st.root() == b.state_root, "base.state.zst doesn't match base.json's state root");
+                (st, b.height, b.hash.clone(), self.saved_epochs.cloned().ok_or_else(|| anyhow!("epochs.json missing for a fast-synced home"))?)
+            }
+            None => (genesis_state, 0, self.genesis_hash.to_string(), crate::epochs::EpochRegistry::genesis(self.genesis)),
+        };
+        let (state, height, hash, epochs, rebuilt) = match first {
+            Some(f) if f > height + 1 => {
+                let (st, h, hash) = self.local_snapshot(f).with_context(|| format!("the block logs start at #{f} (older blocks were pruned), the state database is unusable, and no local snapshot continues them; join the chain again in a fresh home"))?;
+                let epochs = self.saved_epochs.cloned().ok_or_else(|| anyhow!("epochs.json is missing"))?;
+                (st, h, hash, epochs, false)
+            }
+            _ => {
+                let rebuilt = self.base.is_none();
+                (state, height, hash, epochs, rebuilt)
+            }
+        };
+        tracing::info!(from = height, "rebuilding the state database from the block logs");
+        let mut point = CommitPoint {
+            format: store::STORE_FORMAT,
+            schema: SCHEMA_VERSION,
+            genesis_hash: self.genesis_hash.to_string(),
+            height,
+            block_hash: hash,
+            root: state.root_hash(),
+            root_child: state.tree.root_child().encode(),
+            base: self.base_height(),
+            pruned_below: height + 1,
+            records: 0,
+            // From the first segment (a rebuild from a local snapshot skips what it covers).
+            blocks_end: (0, 0),
+            cblocks_end: (0, 0),
+        };
+        store.reset(&mut point, &mut state_records(&state), &state.tree.pending_changes())?;
+        let snap = Arc::new(store.snapshot()?);
+        let mut state = state;
+        state.tree.rebase(snap.clone());
+        Ok(Start { state, point, snap, epochs, rebuilt_epochs: rebuilt })
+    }
+
+    /// Height of the first block in the log, if any.
+    fn first_logged_height(&self) -> Result<Option<u64>> {
+        match self.blocks.reader().iter_from((0, 0)).next().transpose()? {
+            Some(e) => Ok(Some(serde_json::from_slice::<Block>(&e.payload).context("the first entry of the block log")?.height)),
+            None => Ok(None),
+        }
+    }
+
+    /// The newest local snapshot the logs continue from (its height + 1 is logged), with its
+    /// block hash.
+    fn local_snapshot(&self, first_logged: u64) -> Result<(State, u64, String)> {
+        for h in crate::snapshot::list(self.home) {
+            if h + 1 < first_logged {
+                continue;
+            }
+            let Some(hash) = self.logged_hash(h)? else { continue };
+            match crate::snapshot::read_local(self.home, h) {
+                Ok(st) => {
+                    tracing::warn!(height = h, "rebuilding from this node's own snapshot (older blocks were pruned)");
+                    return Ok((st, h, hash));
+                }
+                Err(e) => tracing::warn!(height = h, error = %format!("{e:#}"), "local snapshot unusable"),
+            }
+        }
+        bail!("no usable local snapshot")
+    }
+
+    /// The hash of block `height`, from the log (its own line, or the next one's parent).
+    fn logged_hash(&self, height: u64) -> Result<Option<String>> {
+        let reader = self.blocks.reader();
+        for e in reader.iter_from((reader.seg_of(height), 0)) {
+            let b: Block = serde_json::from_slice(&e?.payload)?;
+            if b.height == height {
+                return Ok(Some(b.hash));
+            }
+            if b.height == height + 1 {
+                return Ok(Some(b.prev_hash));
+            }
+            if b.height > height + 1 {
+                break;
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -2626,36 +3138,6 @@ mod tests {
         let c = Chain::open(&home).unwrap();
         assert_eq!(c.height(), 2);
         assert_eq!(c.state.primary_name(&alice.address()).unwrap(), "alice.boo");
-        fs::remove_dir_all(home).ok();
-    }
-
-    /// A crash mid-append leaves a torn last line; the node drops it and starts, instead of
-    /// needing manual repair. A corrupt line in the middle still refuses to start.
-    #[test]
-    fn torn_last_line_in_blocks_jsonl_is_dropped() {
-        let home = std::env::temp_dir().join(format!("blockula-torn-{}-{}", now_ms(), std::process::id()));
-        Chain::summon(&home, &SummonOpts::new("torn", 1)).unwrap();
-        let alice = Keys::from_seed([1u8; 32]);
-        let root = {
-            let mut c = Chain::open(&home).unwrap();
-            c.faucet(&alice.address(), 50 * DROPS_PER_FANG).unwrap();
-            c.produce_block().unwrap();
-            c.produce_block_with(vec![]).unwrap();
-            c.state.root()
-        };
-        let log = home.join("blocks.jsonl");
-        let good = fs::read(&log).unwrap();
-        let mut f = OpenOptions::new().append(true).open(&log).unwrap();
-        f.write_all(br#"{"height":3,"prev_hash":"ab"#).unwrap();
-        drop(f);
-        let c = Chain::open(&home).unwrap();
-        assert_eq!((c.height(), c.state.root()), (2, root));
-        assert_eq!(fs::read(&log).unwrap(), good, "the torn tail was truncated");
-        drop(c);
-        let mut bad = b"{not json}\n".to_vec();
-        bad.extend_from_slice(&good);
-        fs::write(&log, bad).unwrap();
-        assert!(Chain::open(&home).is_err());
         fs::remove_dir_all(home).ok();
     }
 
@@ -2786,7 +3268,7 @@ mod audit {
         assert!(c.submit(m).is_err());
         c.submit(tx).unwrap();
         c.produce_block().unwrap();
-        assert!(c.tx_index.contains_key(&orig_id));
+        assert!(c.has_tx(&orig_id));
     }
 
     #[test]
@@ -2860,7 +3342,7 @@ mod audit {
         assert_eq!(acct.nonce, 2, "failed tx used its nonce");
         assert_eq!(acct.balance, 10 * DROPS_PER_FANG - 6 * DROPS_PER_FANG - fees, "failed tx paid its fee");
         assert!(c.failure(&t2.id()).unwrap().0.contains("insufficient"));
-        let (h, i) = c.tx_index[&t2.id()];
+        let (h, i) = c.tx_location(&t2.id()).unwrap();
         assert!(c.block(h).unwrap().failed.contains_key(&i));
         // New accounts need a minimum transfer.
         let dust = signed_fee(&c, &a.address(), &a, 2, Action::Transfer { to: Keys::from_seed([77; 32]).address(), amount: 1 }, None);
@@ -3249,7 +3731,7 @@ mod v1 {
         assert!(c.submit(t.clone()).unwrap_err().to_string().contains("expired"));
         // Even a proposer that includes it can't execute it: the nonce stays unused.
         c.produce_block_with(vec![t.clone()]).unwrap();
-        assert!(!c.tx_index.contains_key(&t.id()));
+        assert!(!c.has_tx(&t.id()));
         assert_eq!(c.state.account(&a.address()).nonce, 0);
         assert!(c.failure(&t.id()).unwrap().0.contains("expired at block"));
         fs::remove_dir_all(home).ok();
@@ -3276,7 +3758,7 @@ mod v1 {
         assert!(c.submit(pay_main.clone()).unwrap_err().to_string().contains("`to` is a boo (mainnet) address"));
         assert!(crate::consensus::check_tx_stateless(&pay_main, "v1", "tboo").is_err(), "verify, gossip and HTTP refuse it too");
         c.produce_block_with(vec![pay_main.clone()]).unwrap();
-        assert!(!c.tx_index.contains_key(&pay_main.id()), "and it can't execute");
+        assert!(!c.has_tx(&pay_main.id()), "and it can't execute");
         // Native addresses and names work.
         c.submit(tx(&c, &a, &test, 0, 0, vu, Action::RegisterName { name: "tessa".into() })).unwrap();
         c.produce_block().unwrap();
@@ -3644,5 +4126,365 @@ mod scaffold {
         assert!(err.contains("block 3 runs protocol") && err.contains("upgrade blockula"), "{err}");
         assert_eq!(c.height(), 2);
         fs::remove_dir_all(home).ok();
+    }
+}
+
+/// Persistence (CV-1, CV-6): restarts read the state database instead of replaying history, a
+/// crash at any write point recovers on the next start without help, and pruning keeps a window.
+#[cfg(test)]
+mod persistence {
+    use super::*;
+    use std::time::Instant;
+
+    fn home(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("blockula-persist-{tag}-{}-{}", now_ms(), std::process::id()))
+    }
+
+    fn tx(c: &Chain, keys: &Keys, action: Action) -> Tx {
+        let from = keys.address();
+        let mut tx = Tx { chain_id: c.genesis.chain_id.clone(), nonce: c.next_nonce(&from), from, fee: 0, tip: 0, valid_until: c.height() + 50, action, memo: String::new(), public_key: hex::encode(keys.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+        tx.fee = min_fee(tx.size());
+        tx.sign(keys)
+    }
+
+    /// A chain with some history: faucet drips, a name, transfers, empty blocks.
+    fn active(tag: &str, blocks: u64) -> (PathBuf, Chain, Keys) {
+        let h = home(tag);
+        Chain::summon(&h, &SummonOpts::new(tag, 1)).unwrap();
+        let mut c = Chain::open(&h).unwrap();
+        let alice = Keys::from_seed([1; 32]);
+        c.faucet(&alice.address(), 100 * DROPS_PER_FANG).unwrap();
+        c.produce_block().unwrap();
+        c.submit(tx(&c, &alice, Action::RegisterName { name: "alice".into() })).unwrap();
+        c.produce_block().unwrap();
+        while c.height() < blocks {
+            let to = Keys::from_seed([(c.height() % 200) as u8 + 2; 32]).address();
+            c.submit(tx(&c, &alice, Action::Transfer { to, amount: DROPS_PER_FANG / 10 })).unwrap();
+            c.produce_block().unwrap();
+        }
+        (h, c, alice)
+    }
+
+    /// Entries in the block log (`cblocks`: the consensus block log), from the start.
+    fn entries(c: &Chain, cblocks: bool) -> Vec<store::Entry> {
+        let w = c.writer.lock();
+        let log = if cblocks { &w.cblocks } else { &w.blocks };
+        log.reader().iter_from((0, 0)).collect::<Result<Vec<_>>>().unwrap()
+    }
+
+    #[test]
+    fn restart_reads_the_store_and_replays_nothing() {
+        let (h, c, alice) = active("restart", 40);
+        let (root, height, hash) = (c.state.root(), c.height(), c.last_hash().to_string());
+        let ids: Vec<String> = c.block(height).unwrap().txs.iter().map(Tx::id).collect();
+        drop(c);
+        let c = Chain::open(&h).unwrap();
+        assert_eq!(c.replayed, 0, "every block was committed; restart executes nothing");
+        assert_eq!((c.state.root(), c.height(), c.last_hash()), (root, height, hash.as_str()));
+        assert_eq!(c.state.full_root(), c.state.root_hash(), "records and tree agree");
+        // The indexes and history came back from the database, not from a replay.
+        assert_eq!(c.tx_location(&ids[0]), Some((height, 0)));
+        let v = c.view();
+        // A tx is read alone from its span in the block's line (nothing is cached yet).
+        let m = v.block_meta(10).unwrap();
+        assert_eq!((m.tx_spans.len(), m.tx_count), (1, 1));
+        let (t, failed) = v.finalized_tx(10, 0).unwrap();
+        assert!(v.disk.cached_block(10).is_none(), "the block wasn't parsed");
+        assert_eq!((t, failed), (v.block(10).unwrap().txs[0].clone(), None));
+        assert_eq!(v.history(&alice.address(), 100).len(), 40);
+        assert_eq!(v.primary_name(&alice.address()).as_deref(), Some("alice.boo"));
+        assert_eq!(v.block(1).unwrap().height, 1);
+        assert_eq!(c.last_block().unwrap().height, height);
+        assert_eq!(c.root_at(7), Some(c.block(7).unwrap().state_root));
+        drop((v, c));
+        fs::remove_dir_all(h).ok();
+    }
+
+    #[test]
+    fn crash_at_every_write_point_recovers_unaided() {
+        for point in [WritePoint::AfterCblock, WritePoint::AfterBlockLine, WritePoint::BeforeStoreCommit, WritePoint::AfterStoreCommit] {
+            let (h, mut c, alice) = active(&format!("crash-{point:?}"), 6);
+            let (height, before) = (c.height(), c.state.root());
+            let t = tx(&c, &alice, Action::Transfer { to: c.me().unwrap(), amount: 7 });
+            c.submit(t.clone()).unwrap();
+            c.writer.lock().fail_at = Some(point);
+            assert!(c.produce_block().is_err(), "{point:?}");
+            let after = c.state.root(); // memory ran ahead of the disk
+            c.writer.lock().fail_at = None;
+            assert!(c.produce_block().unwrap_err().to_string().contains("restart"), "a broken instance executes nothing more");
+            drop(c);
+            let mut c = Chain::open(&h).unwrap();
+            if point == WritePoint::AfterCblock {
+                // The block never reached the block log: it's gone, and so is its consensus block.
+                assert_eq!((c.height(), c.state.root(), c.replayed), (height, before, 0));
+                assert_eq!(entries(&c, true).len() as u64, height, "the orphaned consensus block was cut off");
+                // Consensus delivers it again.
+                c.produce_block_with(vec![t.clone()]).unwrap();
+                assert_eq!(c.state.root(), after);
+            } else {
+                assert_eq!((c.height(), c.state.root()), (height + 1, after), "{point:?}");
+                assert_eq!(c.replayed, if point == WritePoint::AfterStoreCommit { 0 } else { 1 }, "{point:?}");
+            }
+            assert!(c.has_tx(&t.id()));
+            assert_eq!(c.cblock(height + 1), Some(vec![]));
+            assert_eq!(entries(&c, true).len(), entries(&c, false).len());
+            // It carries on, and the next restart is clean.
+            c.produce_block_with(vec![]).unwrap();
+            let root = c.state.root();
+            drop(c);
+            let c = Chain::open(&h).unwrap();
+            assert_eq!((c.state.root(), c.replayed), (root, 0));
+            drop(c);
+            fs::remove_dir_all(h).ok();
+        }
+    }
+
+    /// A crash mid-append leaves a torn last entry; the node cuts it off and starts. A damaged
+    /// entry in the middle of the log only matters to a rebuild, which refuses.
+    #[test]
+    fn torn_tails_are_cut_and_damaged_history_refuses_a_rebuild() {
+        let (h, mut c, alice) = active("torn", 5);
+        let (height, root) = (c.height(), c.state.root());
+        c.submit(tx(&c, &alice, Action::Transfer { to: c.me().unwrap(), amount: 7 })).unwrap();
+        c.writer.lock().fail_at = Some(WritePoint::AfterBlockLine);
+        assert!(c.produce_block().is_err());
+        drop(c);
+        let seg = h.join("blocks").join(format!("{:012}.jsonl", 1));
+        let len = fs::metadata(&seg).unwrap().len();
+        OpenOptions::new().write(true).open(&seg).unwrap().set_len(len - 5).unwrap();
+        let c = Chain::open(&h).unwrap();
+        assert_eq!((c.height(), c.state.root(), c.replayed), (height, root.clone(), 0));
+        let logged = entries(&c, false);
+        assert_eq!(logged.len() as u64, height);
+        assert_eq!(fs::metadata(&seg).unwrap().len(), logged.last().unwrap().pos.end().1, "the torn tail is gone");
+        assert_eq!(entries(&c, true).len() as u64, height);
+        drop(c);
+        // Damage block 2's line: a normal restart never reads it…
+        let mut bytes = fs::read(&seg).unwrap();
+        let at = logged[1].pos.off as usize + 10;
+        bytes[at] = b'#';
+        fs::write(&seg, &bytes).unwrap();
+        assert_eq!(Chain::open(&h).unwrap().state.root(), root);
+        // …but rebuilding the database from the log stops there.
+        fs::remove_file(h.join(store::DB_FILE)).unwrap();
+        let err = format!("{:#}", Chain::open(&h).err().unwrap());
+        assert!(err.contains("bad entry"), "{err}");
+        fs::remove_dir_all(h).ok();
+    }
+
+    #[test]
+    fn a_missing_or_damaged_database_is_rebuilt_from_the_logs() {
+        let (h, c, alice) = active("rebuild", 30);
+        let (root, height) = (c.state.root(), c.height());
+        let id = c.block(10).unwrap().txs[0].id();
+        drop(c);
+        fs::remove_file(h.join(store::DB_FILE)).unwrap();
+        let c = Chain::open(&h).unwrap();
+        assert_eq!((c.state.root(), c.height(), c.replayed), (root.clone(), height, height));
+        assert_eq!(c.tx_location(&id), Some((10, 0)));
+        assert_eq!(c.view().block_meta(10).unwrap().tx_spans.len(), 1, "replayed blocks get spans too");
+        assert_eq!(c.view().history(&alice.address(), 100).len() as u64, height);
+        drop(c);
+        // Garbage instead of a database: moved aside and rebuilt the same way.
+        fs::write(h.join(store::DB_FILE), b"not a database").unwrap();
+        let c = Chain::open(&h).unwrap();
+        assert_eq!((c.state.root(), c.replayed), (root.clone(), height));
+        assert_eq!(fs::read(h.join("state.redb.unreadable")).unwrap(), b"not a database");
+        drop(c);
+        // A database another process holds is an error, never a rebuild.
+        let held = Store::open(&h.join(store::DB_FILE)).unwrap();
+        assert!(format!("{:#}", Chain::open(&h).err().unwrap()).contains("already open"));
+        drop(held);
+        // A database left from another chain (another genesis) is rebuilt too.
+        let other = home("other");
+        Chain::summon(&other, &SummonOpts::new("other", 1)).unwrap();
+        drop(Chain::open(&other).unwrap());
+        fs::copy(other.join(store::DB_FILE), h.join(store::DB_FILE)).unwrap();
+        let c = Chain::open(&h).unwrap();
+        assert_eq!((c.state.root(), c.replayed), (root, height));
+        drop(c);
+        fs::remove_dir_all(other).ok();
+        fs::remove_dir_all(h).ok();
+    }
+
+    #[test]
+    fn half_written_snapshots_and_temp_files_are_cleaned_up() {
+        let (h, c, _) = active("snap", 3);
+        let root = c.state.root();
+        drop(c);
+        let partial = crate::snapshot::dir(&h).join("100.tmp");
+        fs::create_dir_all(&partial).unwrap();
+        fs::write(partial.join("chunk-0"), b"half a chunk").unwrap();
+        fs::write(h.join("epochs.json.tmp"), b"{").unwrap();
+        let c = Chain::open(&h).unwrap();
+        assert_eq!(c.state.root(), root);
+        assert!(!partial.exists(), "the half-written snapshot was removed");
+        assert!(crate::snapshot::list(&h).is_empty());
+        assert!(crate::snapshot::build_manifest(&c.live).is_err());
+        drop(c);
+        fs::remove_dir_all(h).ok();
+    }
+
+    /// A validator keeps a window of blocks: older index rows, certificates and whole log
+    /// segments go; epoch boundaries' hashes and certificates stay. Restarts still replay
+    /// nothing, and a lost database is rebuilt from the node's own snapshot.
+    #[test]
+    fn pruning_keeps_a_window_and_rebuilds_from_a_local_snapshot() {
+        let h = home("prune");
+        // Minute blocks: an hour of tx validity is 60 blocks, so the minimum window is small.
+        Chain::summon(&h, &SummonOpts { block_time_ms: 60_000, epoch_blocks: 100, ..SummonOpts::new("prune", 1) }).unwrap();
+        let mut c = Chain::open_with(&h, &OpenOpts { segment_heights: Some(50) }).unwrap();
+        c.set_pruning(Some(1));
+        let keep = min_keep_blocks(&c.state);
+        assert_eq!(c.keep_blocks(), Some(keep));
+        let alice = Keys::from_seed([1; 32]);
+        c.faucet(&alice.address(), 100 * DROPS_PER_FANG).unwrap();
+        c.produce_block().unwrap();
+        let old_tx = c.block(1).unwrap().txs[0].id();
+        for _ in 0..708 {
+            c.produce_block_with(vec![]).unwrap();
+            if c.height() == 200 {
+                c.store_cert(99, vec![9]).unwrap(); // an epoch's last block
+                c.store_cert(200, vec![2]).unwrap(); // a checkpoint
+            }
+        }
+        let height = c.height();
+        let v = c.view();
+        let from = height + 1 - keep;
+        assert_eq!(v.history_from(), from);
+        assert!(v.block(from).is_some() && v.block(from - 1).is_none() && v.is_pruned(10));
+        assert!(!c.has_tx(&old_tx), "pruned heights leave the tx index");
+        assert!(v.history(&alice.address(), 10).is_empty());
+        assert!(v.hash_at(99).is_some() && v.root_at(199).is_some(), "epoch boundaries stay");
+        assert!(v.hash_at(150).is_none());
+        assert_eq!((v.snap.cert(99).unwrap(), v.snap.cert(200).unwrap()), (Some(vec![9]), None));
+        let (segs, csegs) = {
+            let w = c.writer.lock();
+            (w.blocks.reader().segments(), w.cblocks.reader().segments())
+        };
+        assert!(segs[0] > 1 && segs[0] <= from && segs[0] + 50 > from - 50, "segments below the window are deleted: {segs:?}");
+        assert_eq!(csegs, segs);
+        drop(v);
+        let root = c.state.root();
+        drop(c);
+        let c = Chain::open(&h).unwrap();
+        assert_eq!((c.state.root(), c.replayed, c.view().history_from()), (root.clone(), 0, from));
+        // The snapshot writer runs in the background: wait for the latest checkpoint's.
+        let t = Instant::now();
+        while !crate::snapshot::list(&h).contains(&700) {
+            assert!(t.elapsed().as_secs() < 30, "no snapshot at 700");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        drop(c);
+        fs::remove_file(h.join(store::DB_FILE)).unwrap();
+        let c = Chain::open(&h).unwrap();
+        assert_eq!((c.state.root(), c.height()), (root, height));
+        assert_eq!(c.replayed, height - 700, "rebuilt from snapshot 700, then the logged blocks after it");
+        drop(c);
+        fs::remove_dir_all(h).ok();
+    }
+
+    /// Disk per block (docs/OPERATIONS.md, Disk sizing): block logs and the state database's
+    /// index rows, for empty blocks and for blocks of transfers.
+    /// `cargo test --release disk_per_block -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark"]
+    fn disk_per_block() {
+        fn size(p: &Path) -> u64 {
+            fs::read_dir(p).map(|d| d.flatten().map(|e| if e.path().is_dir() { size(&e.path()) } else { e.metadata().map(|m| m.len()).unwrap_or(0) }).sum()).unwrap_or(0)
+        }
+        for per_block in [0u64, 10] {
+            let (h, mut c, alice) = active(&format!("disk-{per_block}"), 3);
+            let mut keys = vec![];
+            for i in 0..per_block {
+                let k = Keys::from_seed(crypto::hash(&i.to_le_bytes()));
+                c.state.accounts.insert(k.address(), Account { balance: 1_000 * DROPS_PER_FANG, ..Default::default() });
+                c.state.supply += 1_000 * DROPS_PER_FANG;
+                keys.push(k);
+            }
+            c.produce_block_with(vec![]).unwrap();
+            let before = (size(&h.join("blocks")), size(&h.join("cblocks")), fs::metadata(h.join(store::DB_FILE)).unwrap().len());
+            let n = 1_000;
+            for _ in 0..n {
+                let txs: Vec<Tx> = keys.iter().map(|k| tx(&c, k, Action::Transfer { to: alice.address(), amount: 1 })).collect();
+                // The consensus block carries the txs' wire bytes, as in production.
+                let cblock: Vec<u8> = txs.iter().flat_map(|t| t.to_bytes()).collect();
+                let height = c.height() + 1;
+                let f = Finalized { height, hash: hex::encode(crypto::hash(&height.to_le_bytes())), parent: c.last_hash().to_string(), timestamp_ms: now_ms(), view: height, parent_view: height - 1, version: crate::consensus::PROTOCOL_VERSION, proposer: c.fee_sink(), txs, cblock: [vec![0u8; 170], cblock].concat(), certificate: None };
+                c.execute(f).unwrap();
+            }
+            let after = (size(&h.join("blocks")), size(&h.join("cblocks")), fs::metadata(h.join(store::DB_FILE)).unwrap().len());
+            println!("{per_block} transfers per block: blocks/ {} B, cblocks/ {} B, state.redb {} B per block", (after.0 - before.0) / n, (after.1 - before.1) / n, after.2.saturating_sub(before.2) / n);
+            drop(c);
+            fs::remove_dir_all(h).ok();
+        }
+    }
+
+    /// SF-4: on the consensus path the chain lock isn't held while a block is written and
+    /// fsynced (here, a disk that takes 300 ms). Meanwhile consensus sees the new height and
+    /// root, the mempool takes txs, and readers see the previous block until it's on disk.
+    #[test]
+    fn blocks_are_written_without_the_chain_lock() {
+        let (h, c, alice) = active("sf4", 3);
+        let t = tx(&c, &alice, Action::Transfer { to: c.me().unwrap(), amount: 7 });
+        let f = c.test_block(vec![t.clone()]);
+        let chain = Arc::new(parking_lot::Mutex::new(c));
+        chain.lock().writer.lock().delay = Some(std::time::Duration::from_millis(300));
+        let shared = chain.clone();
+        let started = Instant::now();
+        let exec = std::thread::spawn(move || Chain::execute_shared(&shared, f));
+        while chain.lock().height() < 4 {
+            assert!(started.elapsed().as_secs() < 10);
+            std::thread::yield_now();
+        }
+        let waited = Instant::now();
+        {
+            let mut c = chain.lock();
+            assert_eq!(c.root_at(4), Some(c.state.root()), "consensus can check the new root");
+            assert!(c.has_tx(&t.id()) && c.tx_location(&t.id()) == Some((4, 0)));
+            assert_eq!(c.view().height, 3, "readers see the block once it's on disk");
+            let next = tx(&c, &alice, Action::Transfer { to: c.me().unwrap(), amount: 8 });
+            c.submit(next).unwrap();
+        }
+        let held = waited.elapsed();
+        assert!(!exec.is_finished(), "still writing");
+        assert!(held < std::time::Duration::from_millis(250), "the chain lock was free during the write ({held:?})");
+        exec.join().unwrap().unwrap();
+        let total = started.elapsed();
+        let c = chain.lock();
+        assert_eq!((c.view().height, c.mempool.len()), (4, 1));
+        println!("block written in {total:?}; the chain lock was free throughout the 300 ms write");
+        drop(c);
+        drop(chain);
+        fs::remove_dir_all(h).ok();
+    }
+
+    /// Restart time at 1M accounts: loading the records is O(state), never O(history).
+    /// `cargo test --release restart_time_at_1m_accounts -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark"]
+    fn restart_time_at_1m_accounts() {
+        let h = home("bench");
+        Chain::summon(&h, &SummonOpts::new("bench", 1)).unwrap();
+        let mut c = Chain::open(&h).unwrap();
+        for i in 0..1_000_000u64 {
+            c.state.accounts.insert(crypto::address_from_bytes(&crypto::hash(&i.to_le_bytes())), Account { balance: DROPS_PER_FANG, ..Default::default() });
+        }
+        c.state.supply += 1_000_000 * DROPS_PER_FANG;
+        let t = Instant::now();
+        c.produce_block_with(vec![]).unwrap();
+        println!("committed 1M new accounts in one block: {:?}", t.elapsed());
+        for _ in 0..100 {
+            c.produce_block_with(vec![]).unwrap();
+        }
+        let root = c.state.root();
+        drop(c);
+        let t = Instant::now();
+        let c = Chain::open(&h).unwrap();
+        let took = t.elapsed();
+        println!("restart with {} records: {took:?} ({} blocks replayed); state.redb is {} MB", c.state.record_count(), c.replayed, fs::metadata(h.join(store::DB_FILE)).unwrap().len() >> 20);
+        assert_eq!((c.state.root(), c.replayed), (root, 0));
+        drop(c);
+        fs::remove_dir_all(h).ok();
     }
 }

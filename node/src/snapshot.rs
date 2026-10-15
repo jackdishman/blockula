@@ -10,8 +10,13 @@
 //! finalization certificate, and the validator-set history (handoff proofs) needed to check that
 //! certificate. A joining node verifies everything, rebuilds the state and its tree from the
 //! records, checks the root against the certified one, executes C+1..=F and carries on syncing.
+//!
+//! Both directions stream: the writer encodes records straight into the compressor and cuts
+//! chunk files as they fill; a joiner checks each chunk as it arrives, appends it to
+//! `base.state.zst.part`, and decodes that file as a stream. Neither ever holds the encoded state
+//! in memory, only the state itself.
 
-use crate::chain::{Chain, Genesis, State};
+use crate::chain::{Genesis, State};
 use crate::consensus::{self, CBlock};
 use crate::epochs::{self, EpochRegistry};
 use crate::pq::MlDsaScheme;
@@ -128,26 +133,74 @@ pub fn read_state(r: &mut impl Read) -> Result<State> {
     Ok(state)
 }
 
-/// Serializes and writes the state at `height` (call from a background thread with a clone).
+/// Cuts a byte stream into `CHUNK_SIZE` chunk files (`chunk-{i}`), fsynced, hashing each.
+struct ChunkWriter {
+    dir: PathBuf,
+    buf: Vec<u8>,
+    chunks: Vec<ChunkInfo>,
+}
+
+impl ChunkWriter {
+    fn cut(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let mut f = std::fs::File::create(self.dir.join(format!("chunk-{}", self.chunks.len())))?;
+        f.write_all(&self.buf)?;
+        f.sync_all()?;
+        self.chunks.push(ChunkInfo { hash: hex::encode(crate::crypto::hash(&self.buf)), size: self.buf.len() });
+        self.buf.clear();
+        Ok(())
+    }
+}
+
+impl Write for ChunkWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let n = data.len().min(CHUNK_SIZE - self.buf.len());
+        self.buf.extend_from_slice(&data[..n]);
+        if self.buf.len() == CHUNK_SIZE {
+            self.cut()?;
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Writes the state at `height` as chunk files (call from a background thread with a clone).
+/// Streams: records → zstd → chunks, so memory stays at a chunk plus the compressor's window.
+/// The snapshot appears atomically (a `.tmp` directory renamed into place, then fsynced).
 pub fn write(home: &Path, height: u64, state_root: &str, state: &State) -> Result<SnapshotMeta> {
-    let mut enc = zstd::Encoder::new(vec![], 3)?;
-    write_state(state, &mut enc)?;
-    let packed = enc.finish()?;
     let tmp = dir(home).join(format!("{height}.tmp"));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
-    let mut chunks = vec![];
-    for (i, c) in packed.chunks(CHUNK_SIZE).enumerate() {
-        std::fs::write(tmp.join(format!("chunk-{i}")), c)?;
-        chunks.push(ChunkInfo { hash: hex::encode(crate::crypto::hash(c)), size: c.len() });
+    let mut chunks = ChunkWriter { dir: tmp.clone(), buf: Vec::with_capacity(CHUNK_SIZE), chunks: vec![] };
+    {
+        let mut enc = std::io::BufWriter::with_capacity(1 << 16, zstd::Encoder::new(&mut chunks, 3)?);
+        write_state(state, &mut enc)?;
+        enc.into_inner().map_err(|e| e.into_error())?.finish()?;
     }
-    let meta = SnapshotMeta { height, state_root: state_root.to_string(), chunks };
-    std::fs::write(tmp.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
+    chunks.cut()?;
+    let meta = SnapshotMeta { height, state_root: state_root.to_string(), chunks: chunks.chunks };
+    crate::store::write_durably(&tmp.join("meta.json"), &serde_json::to_vec_pretty(&meta)?)?;
     let final_dir = dir(home).join(height.to_string());
     let _ = std::fs::remove_dir_all(&final_dir);
     std::fs::rename(&tmp, &final_dir)?;
+    crate::store::sync_dir(&dir(home))?;
     prune(home);
     Ok(meta)
+}
+
+/// Removes snapshots a crash left half-written (`{height}.tmp`).
+pub fn remove_partial(home: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir(home)) else { return };
+    for e in entries.flatten() {
+        if e.file_name().to_str().is_some_and(|n| n.ends_with(".tmp")) {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
 }
 
 /// Snapshot heights on disk, newest first.
@@ -186,25 +239,28 @@ pub struct Manifest {
     pub epochs: EpochRegistry,
 }
 
-/// Builds the manifest for the newest snapshot this node can prove.
-pub fn build_manifest(c: &Chain) -> Result<Manifest> {
-    for height in list(&c.home) {
-        let Some(meta) = meta(&c.home, height) else { continue };
+/// Builds the manifest for the newest snapshot this node can prove, from what it has published
+/// (no consensus lock).
+pub fn build_manifest(live: &crate::view::Live) -> Result<Manifest> {
+    let v = live.view();
+    let home = &v.disk.home;
+    for height in list(home) {
+        let Some(meta) = meta(home, height) else { continue };
         let certifier = height + CHECKPOINT_DELAY;
         let mut blocks = vec![];
         let mut fin = None;
-        for h in height + 1..=c.height().min(height + 2 * CHECKPOINT_INTERVAL) {
-            let Some(b) = c.cblock(h) else { break };
+        for h in height + 1..=v.height.min(height + 2 * CHECKPOINT_INTERVAL) {
+            let Some(b) = v.cblock(h) else { break };
             blocks.push(hex::encode(&b));
             if h >= certifier {
-                if let Some(cert) = c.cert(h) {
+                if let Some(cert) = v.cert(h) {
                     fin = Some(hex::encode(cert));
                     break;
                 }
             }
         }
         let Some(finalization) = fin else { continue };
-        return Ok(Manifest { chain_id: c.genesis.chain_id.clone(), height, state_root: meta.state_root, chunks: meta.chunks, blocks, finalization, epochs: c.epochs.clone() });
+        return Ok(Manifest { chain_id: v.genesis.chain_id.clone(), height, state_root: meta.state_root, chunks: meta.chunks, blocks, finalization, epochs: (*live.epochs()).clone() });
     }
     bail!("no certified snapshot yet (one is taken every {CHECKPOINT_INTERVAL} blocks and certified {CHECKPOINT_DELAY} blocks later)")
 }
@@ -280,12 +336,14 @@ pub fn check_chunk(v: &Verified, i: usize, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Rebuilds the state (and its tree) from verified chunks and checks it against the certified
+/// Rebuilds the state (and its tree) from verified chunks held in memory (tests; a joiner streams
+/// them through a file, [`restore_file`]) and checks it against the certified
 /// root. The state carries its own parameters, so `_g` isn't needed (the manifest was checked
 /// against it already). Memory before the root check is bounded: the chunks (at most
 /// `MAX_SNAPSHOT_CHUNKS`) are decompressed as a stream, never into one buffer, each record is
 /// capped (`state::MAX_KEY_BYTES`, `state::MAX_VALUE_BYTES`) and so is the total
 /// (`MAX_STATE_BYTES`); what remains is the state being rebuilt.
+#[cfg(test)]
 pub fn restore(_g: &Genesis, v: &Verified, chunks: &[Vec<u8>]) -> Result<State> {
     if chunks.len() != v.chunks.len() {
         bail!("expected {} chunks", v.chunks.len());
@@ -300,9 +358,65 @@ pub fn restore(_g: &Genesis, v: &Verified, chunks: &[Vec<u8>]) -> Result<State> 
     Ok(state)
 }
 
+/// Rebuilds the state from a packed file whose chunks were checked already (a joiner's
+/// download), streaming, and checks it against the certified root.
+pub fn restore_file(v: &Verified, packed: &Path) -> Result<State> {
+    let state = decode_state_file(packed)?;
+    if state.root() != v.state_root {
+        bail!("rebuilt state root doesn't match the certified root");
+    }
+    Ok(state)
+}
+
 /// Decompresses (up to `MAX_STATE_BYTES`) and decodes a packed snapshot.
+#[cfg(test)]
 pub fn decode_state(packed: &[u8]) -> Result<State> {
     decode_state_from(packed)
+}
+
+/// [`decode_state`] from a file, as a stream (`base.state.zst`).
+pub fn decode_state_file(path: &Path) -> Result<State> {
+    decode_state_from(std::io::BufReader::with_capacity(1 << 20, std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?))
+}
+
+/// One of this node's own snapshots (a rebuild after pruning): every chunk checked against its
+/// `meta.json`, then decoded as a stream and checked against the root it records.
+pub fn read_local(home: &Path, height: u64) -> Result<State> {
+    let meta = meta(home, height).ok_or_else(|| anyhow!("snapshot {height} has no meta.json"))?;
+    let snap = dir(home).join(height.to_string());
+    for (i, c) in meta.chunks.iter().enumerate() {
+        let bytes = std::fs::read(snap.join(format!("chunk-{i}")))?;
+        if bytes.len() != c.size || hex::encode(crate::crypto::hash(&bytes)) != c.hash {
+            bail!("chunk {i} of snapshot {height} doesn't match its meta.json");
+        }
+    }
+    let files = (0..meta.chunks.len()).map(|i| snap.join(format!("chunk-{i}"))).collect();
+    let state = decode_state_from(ChunkFiles { files, cur: None })?;
+    if state.root() != meta.state_root {
+        bail!("snapshot {height} doesn't decode to its state root");
+    }
+    Ok(state)
+}
+
+/// Chunk files read in order as one stream.
+struct ChunkFiles {
+    files: std::collections::VecDeque<PathBuf>,
+    cur: Option<std::fs::File>,
+}
+
+impl Read for ChunkFiles {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.cur.is_none() {
+                let Some(p) = self.files.pop_front() else { return Ok(0) };
+                self.cur = Some(std::fs::File::open(p)?);
+            }
+            match self.cur.as_mut().unwrap().read(buf)? {
+                0 => self.cur = None,
+                n => return Ok(n),
+            }
+        }
+    }
 }
 
 /// [`decode_state`] from a stream of packed bytes.
@@ -311,12 +425,14 @@ fn decode_state_from(packed: impl Read) -> Result<State> {
 }
 
 /// Reads a list of chunks as one stream, without concatenating them.
+#[cfg(test)]
 struct Chunks<'a> {
     chunks: &'a [Vec<u8>],
     at: usize,
     off: usize,
 }
 
+#[cfg(test)]
 impl Read for Chunks<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         while let Some(c) = self.chunks.get(self.at) {
@@ -354,7 +470,10 @@ async fn fast_sync_from(client: &reqwest::Client, g: &Genesis, chain: &crate::co
     let m: Manifest = serde_json::from_slice(&body)?;
     let v = verify_manifest(g, &m)?;
     println!("📦 snapshot #{} ({} chunks) certified by validators; downloading…", v.height, v.chunks.len());
-    let mut chunks = vec![];
+    // Each chunk is checked as it arrives and appended to a file: memory holds a few chunks at
+    // most, never the whole snapshot.
+    let part = chain.lock().home.join("base.state.zst.part");
+    let mut file = std::io::BufWriter::new(std::fs::File::create(&part)?);
     for batch in (0..v.chunks.len()).collect::<Vec<_>>().chunks(4) {
         let futs = batch.iter().map(|i| {
             let url = format!("{peer}/api/snapshot/{}/chunk/{i}", v.height);
@@ -364,10 +483,11 @@ async fn fast_sync_from(client: &reqwest::Client, g: &Genesis, chain: &crate::co
         for (i, r) in batch.iter().zip(futures::future::join_all(futs).await) {
             let bytes = r?;
             check_chunk(&v, *i, &bytes)?;
-            chunks.push(bytes);
+            file.write_all(&bytes)?;
         }
     }
-    let state = restore(g, &v, &chunks)?;
+    file.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+    let state = restore_file(&v, &part)?;
     // Consensus anchors each epoch at the previous epoch's last block; if that's before the
     // snapshot, ask the peer for its hash (only used to seed this epoch's engine).
     let params = g.params();
@@ -381,7 +501,7 @@ async fn fast_sync_from(client: &reqwest::Client, g: &Genesis, chain: &crate::co
         _ => None,
     };
     let mut c = chain.lock();
-    c.install_snapshot(&v, state, &chunks, epoch_start)?;
+    c.install_snapshot(&v, state, &part, epoch_start)?;
     Ok(c.height())
 }
 
@@ -415,5 +535,31 @@ mod tests {
         huge.push(crate::state::ns::META);
         huge.extend_from_slice(&(crate::state::MAX_KEY_BYTES as u32 + 1).to_le_bytes());
         assert!(read_state(&mut huge.as_slice()).err().unwrap().to_string().contains("too large"));
+    }
+
+    /// The writer cuts chunk files as the compressed stream fills them (several here), and this
+    /// node's own snapshot reads back, checked chunk by chunk and against its root.
+    #[test]
+    fn snapshots_stream_into_chunk_files_and_read_back() {
+        let home = std::env::temp_dir().join(format!("blockula-snapwrite-{}-{}", crate::chain::now_ms(), std::process::id()));
+        let mut st = State::default();
+        // Incompressible keys (hashes), enough for a few MiB of records.
+        for i in 0..60_000u64 {
+            st.accounts.insert(crate::crypto::address_from_bytes(&crate::crypto::hash(&i.to_le_bytes())), Account { balance: i, ..Default::default() });
+        }
+        st.supply = (0..60_000).sum();
+        st.commit_block().unwrap();
+        let meta = write(&home, 100, &st.root(), &st).unwrap();
+        assert!(meta.chunks.len() > 1, "{} chunks", meta.chunks.len());
+        assert!(meta.chunks[..meta.chunks.len() - 1].iter().all(|c| c.size == CHUNK_SIZE));
+        assert_eq!(list(&home), vec![100]);
+        assert_eq!(read_local(&home, 100).unwrap().root(), st.root());
+        // A damaged chunk is caught before decoding.
+        let p = dir(&home).join("100").join("chunk-1");
+        let mut b = std::fs::read(&p).unwrap();
+        b[0] ^= 1;
+        std::fs::write(&p, b).unwrap();
+        assert!(read_local(&home, 100).err().unwrap().to_string().contains("chunk 1"));
+        std::fs::remove_dir_all(home).ok();
     }
 }

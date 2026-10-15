@@ -167,7 +167,7 @@ impl Sim {
         }
     }
 
-    /// Replaying `blocks.jsonl` from genesis reaches the same state (replay checks every root),
+    /// A restart reaches the same state (the database is checked against the root and the log),
     /// and the snapshot encoding round-trips it.
     fn check_restart_and_snapshot(self) {
         let (root, height) = (self.c.state.root(), self.c.height());

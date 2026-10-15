@@ -30,7 +30,7 @@ parking_lot = "0.12.5"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tokio = { version = "1.53.3", features = ["full"] }
-tower-http = { version = "0.7.1", features = ["cors"] }
+tower-http = { version = "0.7.1", features = ["cors", "timeout"] }
 commonware-actor = "=2026.9.0"
 commonware-broadcast = "=2026.9.0"
 commonware-codec = "=2026.9.0"
@@ -52,6 +52,8 @@ zstd = "0.13"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 imbl = { version = "=7.0.2", features = ["serde"] }
 borsh = { version = "=1.8.1", features = ["derive", "de_strict_order"] }
+redb = "=4.4.0"
+arc-swap = "=1.9.2"
 
 # Like the node's release build: arithmetic overflow panics instead of wrapping.
 rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std", "tls12"] }

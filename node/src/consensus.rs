@@ -11,7 +11,8 @@
 //!   the attached state root (waiting until we've executed that height). Only permanently invalid
 //!   blocks get `false`; anything that can still change keeps the verdict pending.
 //! * **finalize**: marshal delivers finalized blocks in order to [`Executor`], which executes them
-//!   (invalid txs are skipped) and acknowledges only after `blocks.jsonl` is synced to disk.
+//!   (invalid txs are skipped) and acknowledges only once the block logs are fsynced and the
+//!   state database has committed the block (`store.rs`).
 
 use crate::chain::{Chain, Finalized, Genesis};
 use crate::pq::{MlDsaScheme, PrivateKey, PublicKey};
@@ -450,7 +451,7 @@ where
             None => return futures::future::pending().await,
         }
         let c = self.chain.lock();
-        if ids.iter().any(|id| c.tx_index.contains_key(id)) {
+        if ids.iter().any(|id| c.has_tx(id)) {
             return reject("replays an already-finalized tx");
         }
         true
@@ -532,16 +533,17 @@ impl Reporter for Executor {
         use commonware_utils::Acknowledgement as _;
         match activity {
             Update::Tip(_, height, _) => {
-                let mut c = self.chain.lock();
-                c.finalized_tip = c.finalized_tip.max(height.get());
+                self.chain.lock().set_finalized_tip(height.get());
             }
             Update::Block(block, ack) => {
-                let mut c = self.chain.lock();
-                if block.height <= c.height() {
+                if block.height <= self.chain.lock().height() {
                     ack.acknowledge(); // redelivery after restart: already executed
                 } else {
                     let cert = self.certs.certs.lock().remove(&block.digest);
-                    match c.execute(finalized_from(&block, cert)) {
+                    // Holds the chain lock only for the in-memory parts, not the fsyncs.
+                    let executed = Chain::execute_shared(&self.chain, finalized_from(&block, cert));
+                    let c = self.chain.lock();
+                    match executed {
                         Ok(()) => {
                             debug!(height = block.height, txs = c.last_block().map(|b| b.txs.len()).unwrap_or(0), "executed");
                             if block.height % 100 == 0 && block.height > MARSHAL_RETAIN {
@@ -725,7 +727,7 @@ where
         let processed = floor.height().map(|h| h.get()).unwrap_or(0);
         let ours = chain.lock().height();
         if processed > ours {
-            error!(marshal = processed, ours, "consensus storage is ahead of blocks.jsonl; delete the `consensus` dir to resync");
+            error!(marshal = processed, ours, "consensus storage is ahead of the block logs; delete the `consensus` dir to resync");
         } else if ours > processed {
             // We executed past marshal (HTTP catch-up): anchor marshal at our latest certified
             // block so it doesn't try to backfill what peers may have pruned.
@@ -903,11 +905,12 @@ fn hint_behind(marshal: &MarshalMailbox, chain: &Shared, ours: u64, theirs: u64,
     marshal.hint_finalized(Height::new(last), commonware_utils::vec::NonEmptyVec::new(from));
 }
 
-/// Finalized blocks/certificates marshal keeps; older ones are pruned (our own `cblocks.bin` and
+/// Finalized blocks/certificates marshal keeps; older ones are pruned (our own `cblocks/` log and
 /// checkpoint certificates keep serving history over HTTP).
 pub const MARSHAL_RETAIN: u64 = 2_000;
-/// Bumped when the on-disk consensus storage layout changes.
-pub const STORAGE_VERSION: &str = "prunable-v3";
+/// Bumped when the on-disk storage layout changes (consensus journals, or the home's own files:
+/// v4 is the segmented block logs and the state database, see `store.rs`).
+pub const STORAGE_VERSION: &str = "prunable-v4";
 
 fn archive_config<C>(prefix: &str, name: &str, page_cache: CacheRef, codec_config: C) -> prunable::Config<TwoCap, C> {
     prunable::Config {

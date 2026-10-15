@@ -11,6 +11,7 @@ mod governance;
 mod snapshot;
 mod staking;
 mod state;
+mod store;
 mod node;
 mod params;
 mod pq;
@@ -18,6 +19,7 @@ mod poc;
 mod types;
 mod upgrade;
 mod validator_cli;
+mod view;
 
 #[cfg(test)]
 mod sim;
@@ -59,6 +61,23 @@ struct Net {
     /// Replay the whole chain from genesis instead of fast-syncing from a certified snapshot
     #[arg(long)]
     full: bool,
+    /// Keep only the last N blocks (and their certificates) on disk; older log segments are
+    /// deleted. Validators keep about two days by default; full nodes keep everything.
+    #[arg(long, conflicts_with = "archive")]
+    prune_blocks: Option<u64>,
+    /// Keep every block (an archive node), also on a validator
+    #[arg(long)]
+    archive: bool,
+    /// HTTP reads allowed per client IP per second (0: unlimited); loopback isn't limited.
+    /// Behind a reverse proxy, set --client-ip-header too, or every client shares the proxy's budget
+    #[arg(long, default_value_t = api::READ_RPS)]
+    read_rps: u32,
+    /// Burst of HTTP reads a client IP may make at once
+    #[arg(long, default_value_t = api::READ_BURST)]
+    read_burst: u32,
+    /// Longest an HTTP request may take, in seconds
+    #[arg(long, default_value_t = api::HTTP_TIMEOUT.as_secs())]
+    http_timeout_secs: u64,
 }
 
 #[derive(Subcommand)]
@@ -170,7 +189,13 @@ fn net_opts(net: Net, http_port: Option<u16>, p2p_preset: Option<String>, epheme
         forwarder_secret: std::env::var("BLOCKULA_FORWARDER_SECRET").ok().filter(|s| s.len() >= 32),
         header: net.client_ip_header.map(|h| h.to_lowercase()),
     };
-    NetOpts { bind: net.bind, http_port, p2p_preset, ephemeral_p2p, client_ip, peer_http: net.peer_http, force_key: net.force_key, full: net.full }
+    let http = node::HttpOpts { read_rps: net.read_rps, read_burst: net.read_burst, timeout: std::time::Duration::from_secs(net.http_timeout_secs.max(1)) };
+    let pruning = match (net.archive, net.prune_blocks) {
+        (true, _) => node::Pruning::Archive,
+        (_, Some(n)) => node::Pruning::Keep(n),
+        _ => node::Pruning::Default,
+    };
+    NetOpts { bind: net.bind, http_port, p2p_preset, ephemeral_p2p, client_ip, peer_http: net.peer_http, force_key: net.force_key, full: net.full, pruning, http }
 }
 
 fn main() -> Result<()> {

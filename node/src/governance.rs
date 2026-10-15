@@ -83,10 +83,11 @@ pub fn check_invariants(_state: &State) -> Result<()> {
     Ok(())
 }
 
-/// Plain-English summary of a governance tx (see `State::describe`).
-pub fn describe(state: &State, tx: &Tx, from: &str) -> String {
+/// Plain-English summary of a governance tx (see `State::describe_with`; `primary_name` looks
+/// up names).
+pub fn describe(state: &State, tx: &Tx, from: &str, primary_name: &dyn Fn(&str) -> Option<String>) -> String {
     match &tx.action {
-        Action::Propose { kind, deposit, title, .. } => format!("{from} proposed “{title}”: {}, bonding {}", describe_kind(state, kind), fmt_fang(*deposit)),
+        Action::Propose { kind, deposit, title, .. } => format!("{from} proposed “{title}”: {}, bonding {}", describe_kind(state, kind, primary_name), fmt_fang(*deposit)),
         Action::Vote { proposal_id, aye, amount, conviction } => {
             let side = if *aye { "aye" } else { "nay" };
             let x = match conviction {
@@ -99,7 +100,7 @@ pub fn describe(state: &State, tx: &Tx, from: &str) -> String {
         Action::MultisigCreate { owners, threshold } => format!("{from} became a {threshold}-of-{} multisig", owners.len()),
         Action::MultisigPropose { action } => {
             let inner = Tx { action: (**action).clone(), ..tx.clone() };
-            format!("{from} proposed a multisig action: {}", state.describe(&inner, None))
+            format!("{from} proposed a multisig action: {}", state.describe_with(&inner, None, primary_name))
         }
         Action::MultisigApprove { id } => format!("{from} approved multisig action #{id}"),
         Action::ClaimDistribution { distribution_id, amount, .. } => format!("{from} claimed {} from community distribution #{distribution_id}", fmt_fang(*amount)),
@@ -108,9 +109,9 @@ pub fn describe(state: &State, tx: &Tx, from: &str) -> String {
 }
 
 /// What a proposal would do, in a clause ("pay 5 FANG from the treasury to alice.boo").
-pub fn describe_kind(state: &State, kind: &ProposalKind) -> String {
+pub fn describe_kind(state: &State, kind: &ProposalKind, primary_name: &dyn Fn(&str) -> Option<String>) -> String {
     let who = |a: &str| match state.resolve(a) {
-        Ok(addr) => state.primary_name(&addr).unwrap_or_else(|| short(&addr)),
+        Ok(addr) => primary_name(&addr).unwrap_or_else(|| short(&addr)),
         Err(_) => a.to_string(),
     };
     match kind {

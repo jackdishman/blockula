@@ -1651,7 +1651,7 @@ pub struct Block {
     pub state_root: String,
     pub txs: Vec<Tx>,
     pub hash: String,
-    /// Kept for compatibility; certificates live in `certs.bin` now (see chain.rs).
+    /// Kept for compatibility; certificates live in the state database now (see store.rs).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub signature: String,
     /// Txs (by index into `txs`) that were included and charged their fee, but whose action

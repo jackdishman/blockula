@@ -73,9 +73,10 @@ pub fn check_invariants(_state: &State) -> Result<()> {
     Ok(())
 }
 
-/// Plain-English summary of a staking tx (see `State::describe`).
-pub fn describe(state: &State, tx: &Tx, from: &str) -> String {
-    let v = |a: &str| state.primary_name(a).unwrap_or_else(|| short(a));
+/// Plain-English summary of a staking tx (see `State::describe_with`; `primary_name` looks up
+/// names).
+pub fn describe(_state: &State, tx: &Tx, from: &str, primary_name: &dyn Fn(&str) -> Option<String>) -> String {
+    let v = |a: &str| primary_name(a).unwrap_or_else(|| short(a));
     match &tx.action {
         Action::Delegate { validator, amount } => format!("{from} delegated {} to validator {}", fmt_fang(*amount), v(validator)),
         Action::Undelegate { validator, shares } => format!("{from} started unbonding {shares} shares of validator {}'s pool", v(validator)),

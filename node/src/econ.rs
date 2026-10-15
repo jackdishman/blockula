@@ -109,8 +109,9 @@ pub fn check_invariants(state: &State) -> Result<()> {
     Ok(())
 }
 
-/// Plain-English summary of a names tx (see `State::describe`).
-pub fn describe(state: &State, tx: &Tx, from: &str) -> String {
+/// Plain-English summary of a names tx (see `State::describe_with`; `primary_name` looks up
+/// names).
+pub fn describe(state: &State, tx: &Tx, from: &str, primary_name: &dyn Fn(&str) -> Option<String>) -> String {
     let name = |n: &str| format!("{}{NAME_SUFFIX}", normalize_name(n).unwrap_or_else(|_| n.to_string()));
     match &tx.action {
         Action::RenewName { name: n, years } => format!("{from} renewed {} for {years} year{}", name(n), if *years == 1 { "" } else { "s" }),
@@ -118,7 +119,7 @@ pub fn describe(state: &State, tx: &Tx, from: &str) -> String {
             let n = name(n);
             // Described after the fact too, when the name may already be the recipient's.
             let to = match state.resolve(to) {
-                Ok(a) => state.primary_name(&a).filter(|p| *p != n).unwrap_or_else(|| short(&a)),
+                Ok(a) => primary_name(&a).filter(|p| *p != n).unwrap_or_else(|| short(&a)),
                 Err(_) => to.clone(),
             };
             format!("{from} gave {n} to {to}")

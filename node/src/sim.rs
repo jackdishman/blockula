@@ -151,7 +151,7 @@ fn four_validators_finalize_gossip_crash_and_recover() {
             context.sleep(Duration::from_millis(150)).await;
             for v in &vals[..3] {
                 let c = v.chain.lock();
-                assert!(c.mempool.iter().any(|t| t.id() == id) || c.tx_index.contains_key(&id), "tx gossiped to every validator");
+                assert!(c.mempool.iter().any(|t| t.id() == id) || c.has_tx(&id), "tx gossiped to every validator");
             }
             ids.push(id);
             let h = vals[0].chain.lock().height();
@@ -164,7 +164,7 @@ fn four_validators_finalize_gossip_crash_and_recover() {
         for v in &vals {
             let c = v.chain.lock();
             for id in &ids {
-                let (h, _) = c.tx_index.get(id).copied().expect("tx finalized on every validator");
+                let (h, _) = c.tx_location(id).expect("tx finalized on every validator");
                 proposers.push(c.block(h).unwrap().proposer);
             }
             assert_eq!(c.state.account(&alice.address()).balance, 6 * DROPS_PER_FANG);
@@ -186,7 +186,7 @@ fn four_validators_finalize_gossip_crash_and_recover() {
         let late_id = vals[0].chain.lock().submit(tx).unwrap();
 
         let restarted = start(&context, &mut oracle, &genesis, crashed, 1, home, key).await;
-        assert_eq!(restarted.chain.lock().height(), crashed_at, "replayed blocks.jsonl on restart");
+        assert_eq!(restarted.chain.lock().height(), crashed_at, "restarted from the state database at its height");
         vals.insert(crashed, restarted);
         let target = vals[0].chain.lock().height() + 5;
         wait_for_height(&context, &vals, target).await;
@@ -197,7 +197,7 @@ fn four_validators_finalize_gossip_crash_and_recover() {
         assert!(roots.windows(2).all(|w| w[0] == w[1]), "state roots diverged at {h}: {roots:?}");
         let hashes: Vec<String> = vals.iter().map(|v| v.chain.lock().block(h).unwrap().hash).collect();
         assert!(hashes.windows(2).all(|w| w[0] == w[1]));
-        assert!(vals[crashed].chain.lock().tx_index.contains_key(&late_id));
+        assert!(vals[crashed].chain.lock().has_tx(&late_id));
         println!("✓ 4 validators agree at height {h}, root {}", roots[0]);
     });
     std::fs::remove_dir_all(root).ok();
@@ -339,7 +339,7 @@ fn fast_sync_from_certified_snapshot_and_tamper_rejection() {
         // Wait for validator 0's snapshot writer and certificate, then build the manifest.
         let mut manifest = None;
         for _ in 0..400 {
-            if let Ok(m) = snapshot::build_manifest(&vals[0].chain.lock()) {
+            if let Ok(m) = snapshot::build_manifest(&vals[0].chain.lock().live) {
                 if m.height >= 300 {
                     manifest = Some(m);
                     break;
@@ -385,7 +385,9 @@ fn fast_sync_from_certified_snapshot_and_tamper_rejection() {
         // The honest manifest installs and the node follows the chain.
         let state = snapshot::restore(&genesis, &v, &chunks).unwrap();
         let joiner: Shared = Arc::new(Mutex::new(Chain::open(&joiner_home).unwrap()));
-        joiner.lock().install_snapshot(&v, state, &chunks, None).unwrap();
+        let packed = joiner_home.join("base.state.zst.part");
+        std::fs::write(&packed, chunks.concat()).unwrap();
+        joiner.lock().install_snapshot(&v, state, &packed, None).unwrap();
         assert_eq!(joiner.lock().base_height(), m.height);
         assert!(joiner.lock().block(m.height).is_none(), "no history before the snapshot");
         let target = vals[0].chain.lock().height() + 20;
@@ -408,10 +410,19 @@ fn fast_sync_from_certified_snapshot_and_tamper_rejection() {
         assert_eq!(joiner.lock().state.account(&Keys::from_seed([104; 32]).address()).balance, DROPS_PER_FANG);
         // Restart: the fast-synced home reopens from its base and replays what it executed since.
         let root_now = joiner.lock().state.root();
+        // The home's database takes a lock: every handle on the old chain must be gone first.
+        drop(provider);
         drop(joiner);
         let reopened = Chain::open(&joiner_home).unwrap();
         assert_eq!(reopened.state.root(), root_now);
         assert_eq!(reopened.height(), h);
+        assert_eq!(reopened.replayed, 0, "the state database holds everything; nothing is replayed");
+        // Without its database, the home rebuilds from base.state.zst and the logged blocks.
+        drop(reopened);
+        std::fs::remove_file(joiner_home.join(crate::store::DB_FILE)).unwrap();
+        let rebuilt = Chain::open(&joiner_home).unwrap();
+        assert_eq!((rebuilt.state.root(), rebuilt.height(), rebuilt.replayed), (root_now, h, h - m.height));
+        assert_eq!(rebuilt.view().history_from(), m.height + 1);
         println!("✓ fast-synced at #{} and followed to #{h} with matching roots", m.height);
     });
     std::fs::remove_dir_all(root).ok();
