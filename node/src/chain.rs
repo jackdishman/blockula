@@ -2150,6 +2150,7 @@ impl Chain {
         let height = block.height;
         self.index(&block);
         self.push_block(block, offset);
+        // As in `execute`: stop before a height this binary can't run (3.9).
         crate::upgrade::check_next(&self.state, height + 1)
     }
 
