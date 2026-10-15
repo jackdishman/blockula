@@ -73,13 +73,13 @@ async function open(page: Page, hash: string, missing: string[] = []) {
 test("validators show pools, stake, commission and jail", async ({ page }) => {
   await open(page, "#/validators");
   const app = page.locator("#app");
-  await expect(app).toContainText("Anyone can register a validator with a self-bond of at least 10000 FANG");
+  await expect(app).toContainText("Anyone can run one: register with a self-bond of at least 10000 FANG");
   await expect(app).toContainText("stake 2000000 FANG · self-bond 10000 FANG · commission 5%");
   await expect(app).toContainText("commission 10% · missed 7 of its last 40 turns");
   await expect(app).toContainText("jailed until block 4000: missed 51 of its last 100 leader slots");
   await expect(app).toContainText("Jailed (1)");
   await expect(app.locator(".pill.failed")).toHaveText(["jailed"]);
-  await expect(app).toContainText("3000000 FANG");
+  await expect(app).toContainText("3,000,000FANGstaked in the active set");
   await expect(app).toContainText("of 31");
   await expect(app).not.toContainText("test chain");
   // Not a test chain: the footer says nothing about test chains.
@@ -91,7 +91,7 @@ test("governance lists proposals with tallies, council votes and timelock, and e
   const app = page.locator("#app");
   await expect(app).toContainText("Raise the active set to 40");
   await expect(app).toContainText("aye 300 FANG · nay 100 FANG · turnout 400 FANG of 1000 FANG quorum · council: 15 validators approve, 1 reject (of 22) · executes at block #6000 · passed by the bootstrap council");
-  await expect(app).toContainText("250000000 FANG");
+  await expect(app).toContainText("250,000,000FANGtreasury");
   await expect(app).toContainText(HOSTILE);
   await expect(app.locator("img")).toHaveCount(0);
   await expect(app.locator("b", { hasText: "bold" })).toHaveCount(0);

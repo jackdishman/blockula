@@ -40,7 +40,8 @@ function Stake() {
     try {
       const [raw, vals, params] = await Promise.all([client.staking(wallet.account), client.validators() as Promise<ValidatorsView>, client.params().catch(() => null)]);
       const unbonding = Number(paramsOf(params).unbonding_blocks) || undefined;
-      setData({ raw, validators: [...vals.active, ...vals.candidates], unbonding });
+      // Jailed ones too, so a pool you're in still shows its commission and why it's out.
+      setData({ raw, validators: [...vals.active, ...vals.candidates, ...(vals.jailed ?? [])], unbonding });
     } catch (e) {
       // Nodes without staking (before protocol v1) don't serve /api/staking.
       if (e instanceof ApiError && e.status === 404) setData("inactive");
@@ -113,7 +114,7 @@ function Stake() {
 
       <section className="card">
         <h2>Your pools</h2>
-        {stake.delegations.length ? stake.delegations.map((d) => <PoolRow key={d.validator} d={d} unbondingFor={unbondingFor} run={run} />) : <p className="dim">You haven&apos;t staked yet.</p>}
+        {stake.delegations.length ? stake.delegations.map((d) => <PoolRow key={d.validator} d={d} v={validators.find((x) => x.validator.address === d.validator)} unbondingFor={unbondingFor} run={run} />) : <p className="dim">You haven&apos;t staked yet.</p>}
       </section>
 
       {stake.unbonding.length > 0 && (
@@ -140,7 +141,7 @@ function Stake() {
   );
 }
 
-function PoolRow({ d, unbondingFor, run }: { d: StakeDelegation; unbondingFor: string; run: (f: () => Promise<TxView>) => Promise<void> }) {
+function PoolRow({ d, v, unbondingFor, run }: { d: StakeDelegation; v?: ValidatorView; unbondingFor: string; run: (f: () => Promise<TxView>) => Promise<void> }) {
   const { wallet } = useUnlocked();
   const [open, setOpen] = useState(false);
   const [amount, setAmount] = useState("");
@@ -162,7 +163,7 @@ function PoolRow({ d, unbondingFor, run }: { d: StakeDelegation; unbondingFor: s
   return (
     <div className="pool-row" data-testid="pool">
       <span>
-        <b>{label(d)}</b> <span className="dim small">{BigInt(d.shares).toLocaleString("en-US")} shares{BigInt(d.value) > BigInt(d.principal) ? ` · earned ${formatFang(BigInt(d.value) - BigInt(d.principal))}` : ""}{d.self_bond ? " · self-bond" : ""}</span>
+        <b>{label(d)}</b> <span className="dim small">{BigInt(d.shares).toLocaleString("en-US")} shares{BigInt(d.value) > BigInt(d.principal) ? ` · earned ${formatFang(BigInt(d.value) - BigInt(d.principal))}` : ""}{d.self_bond ? " · self-bond" : ""}{v ? ` · ${pct(v.commission_bps)} commission` : ""}{v?.jailed ? ` · jailed until block #${v.jailed.until}` : ""}</span>
       </span>
       <span className="row-gap">
         <span>{formatFang(BigInt(d.value))}</span>
