@@ -616,6 +616,25 @@ fn the_set_is_the_top_stake_with_ties_by_address() {
     assert_eq!(t.st.validators[&v1].status, ValidatorStatus::Candidate);
 }
 
+/// Dev and test genesis files may list a validator without an operator: it has no self-bond, so
+/// it leaves at the first boundary, unless it's all there is (the set never empties).
+#[test]
+fn genesis_validators_without_operators_have_no_self_bond() {
+    let mut g = Setup::default().genesis();
+    g.operators.pop();
+    g.check().unwrap();
+    let mut t = T { st: g.initial_state(), height: 1, epoch: 0, view: 0, skip: 0, skipped: vec![] };
+    assert_eq!((t.st.staking.pools[&vaddr(3)].stake, eligible(&t.st, &vaddr(3))), (0, false));
+    t.finish_epoch();
+    assert_eq!(t.set(1).len(), 3);
+    assert!(!t.set(1).contains(&vaddr(3)));
+    let mut g = Setup { validators: vec![FANG], ..Default::default() }.genesis();
+    g.operators.clear();
+    let mut t = T { st: g.initial_state(), height: 1, epoch: 0, view: 0, skip: 0, skipped: vec![] };
+    t.finish_epoch();
+    assert_eq!(t.set(1), vec![vaddr(0)]);
+}
+
 /// The churn limit protects small sets: a stranger's registration can't make itself needed for
 /// a one-validator chain's quorum. An admin of a test chain may still pin it in.
 #[test]
