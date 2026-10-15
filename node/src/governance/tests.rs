@@ -168,7 +168,7 @@ fn a_proposal_passes_waits_out_its_timelock_and_runs() {
     assert_eq!(t.bal(ALICE), before - 60 * FANG - fee, "the whole deposit is escrowed");
     assert_eq!(escrow(&t.st), 60 * FANG as u128);
     assert!(t.err(BOB, Action::Propose { kind: text(), deposit: 49 * FANG, title: "cheap".into(), url: String::new() }).contains("at least 50 FANG"));
-    assert!(t.err(BOB, Action::Propose { kind: param("max_validators", 0), deposit: 50 * FANG, title: "zero".into(), url: String::new() }).contains("must be 1–1000"), "out-of-bounds parameters are refused up front");
+    assert!(t.err(BOB, Action::Propose { kind: param("max_validators", 0), deposit: 50 * FANG, title: "zero".into(), url: String::new() }).contains("must be 1–64"), "out-of-bounds parameters are refused up front");
     let end = t.p(0).voting_end;
     assert_eq!((t.p(0).status, end, t.p(0).proposer.clone()), (ProposalStatus::Voting, t.h + 10, addr(ALICE)));
     t.vote(ALICE, 0, true, 10_000, 1).unwrap();

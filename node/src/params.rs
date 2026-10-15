@@ -79,8 +79,11 @@ chain_params! { |day, epoch|
     // ---- staking (3.4) ----
     /// Least self-bond a validator candidate needs (`RegisterValidator`, and to stay eligible).
     min_self_bond: 10_000 * FANG, [FANG, 100_000_000 * FANG];
-    /// Active-set cap (DEC-3: 3f+1 = 31 until certificates shrink).
-    max_validators: 31, [1, 1_000];
+    /// Active-set cap (DEC-3: 3f+1 = 31 until certificates shrink). At most the p2p layer's peer
+    /// set (`consensus::MAX_PEERS_PER_SET`, 64): the active set is the primary peer set, and
+    /// candidates only get the slots it leaves (consensus.rs caps them), so primary + candidate
+    /// peers can never exceed it (the p2p layer panics past it).
+    max_validators: 31, [1, crate::consensus::MAX_PEERS_PER_SET as u64];
     /// At least one epoch, so evidence for the current epoch can always land.
     unbonding_blocks: (21 * day).max(epoch), [10, 365 * day];
     slash_double_sign_bps: 500, [0, 10_000];
@@ -360,7 +363,8 @@ mod tests {
         assert_eq!(c.max_validators, 64);
         // Bounds, unknown keys and cross-parameter rules; a refused change leaves everything as it was.
         let before = c.clone();
-        assert!(c.set("max_validators", 0, &p).unwrap_err().to_string().contains("1–1000"));
+        assert!(c.set("max_validators", 0, &p).unwrap_err().to_string().contains("1–64"));
+        assert!(c.set("max_validators", 65, &p).is_err(), "never more than the p2p peer set holds");
         assert!(c.set("issuance_floor_ppm", 4_999, &p).is_err(), "the issuance floor can't go below 0.5%");
         assert!(c.set("issuance_stakers_bps", 4_999, &p).is_err(), "stakers keep at least half");
         assert!(c.set("max_block_bytes", CODEC_MAX_BLOCK_BYTES + 1, &p).is_err());

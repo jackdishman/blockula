@@ -414,6 +414,9 @@ impl Genesis {
                 ensure!(vesting.insert(&a.address), "{} has more than one vesting allocation", a.address);
             }
         }
+        // Epoch 0's set is every genesis validator: within the cap like any later set (the p2p
+        // peer set can't hold more than `max_validators`' bound).
+        ensure!(!self.validators.is_empty() && self.validators.len() as u64 <= cp.max_validators, "a genesis needs 1–{} validators (max_validators)", cp.max_validators);
         let mut keys = BTreeSet::new();
         let mut bonds: BTreeMap<&str, u64> = BTreeMap::new();
         for o in &self.operators {
@@ -1468,29 +1471,6 @@ impl State {
             Ok(a) if !self.accounts.contains_key(&a) && system_account(self.params.prefix(), &a).is_none() => self.chain_params.account_creation_fee,
             _ => 0,
         }
-    }
-
-    /// The most this tx takes out of the sender's balance (the most it can be charged at the next
-    /// heights + the amount moved out); votes take nothing, they lock tokens the voter keeps. An
-    /// estimate: mempool admission doesn't reserve it any more, it applies the sender's queued
-    /// txs (`Chain::submit_tx`).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn tx_debit(&self, tx: &Tx) -> u64 {
-        let charge = crate::econ::max_fee(self, tx.size()).saturating_add(tx.tip).min(tx.fee);
-        charge.saturating_add(match &tx.action {
-            Action::Transfer { amount, to } => amount.saturating_add(self.creation_fee_for(to)),
-            Action::RegisterName { name } => normalize_name(name).map(|n| self.chain_params.name_price(n.len())).unwrap_or(0),
-            Action::RegisterValidator { bond, .. } => *bond,
-            Action::CreateHunt { amount, .. } | Action::FundHunt { amount, .. } => *amount,
-            Action::FundPool { amount } | Action::JoinJury { bond: amount } => *amount,
-            Action::Vouch { .. } => crate::poc::VOUCH_BOND,
-            Action::SubmitClaim { .. } => crate::poc::CLAIM_BOND,
-            Action::Delegate { amount, .. } => *amount,
-            Action::Propose { deposit, .. } => *deposit,
-            Action::RenewName { name, years } => normalize_name(name).map(|n| self.chain_params.name_renewal_price(n.len(), *years as u64)).unwrap_or(0),
-            Action::Shield { amount, .. } => amount.saturating_add(self.chain_params.ghost_verify_fee),
-            _ => 0,
-        })
     }
 
     /// State root (hex) as of the last `commit_block`: the sparse Merkle tree over every record.
@@ -4525,7 +4505,7 @@ mod scaffold {
         v["params"]["quorum_floor"] = serde_json::json!("30000000000000000");
         v["params"]["downtime_window"] = serde_json::json!(200);
         load(&v).unwrap();
-        refused(&|v| v["params"]["max_validators"] = 0.into(), "`max_validators` must be 1–1000");
+        refused(&|v| v["params"]["max_validators"] = 0.into(), "`max_validators` must be 1–64");
         refused(&|v| v["params"]["issuance_floor_ppm"] = 4_999.into(), "issuance_floor_ppm");
         refused(&|v| v["params"]["issuance_stakers_bps"] = 4_000.into(), "issuance_stakers_bps");
         refused(&|v| v["params"]["max_block_bytes"] = (8u64 << 20).into(), "max_block_bytes");
@@ -4583,7 +4563,6 @@ mod scaffold {
     fn new_tags_dispatch_to_their_modules() {
         let (home, mut c) = open("dispatch", &genesis("scaffold-1"));
         let (owner, bob) = (keys(22), keys(24));
-        let v = Keys::from_seed(VALIDATOR).address();
         // Every tag reaches its module. One the module refuses (a reveal for epoch 1, whose beacon
         // follows from genesis) is refused at submission, and a block carrying it charges its fee
         // anyway.
@@ -4609,11 +4588,6 @@ mod scaffold {
         for action in [Action::SetRepo { repo: "a/b".into(), weight: 1 }, Action::GrantSoul { to: bob.address(), amount: SOUL, reason: "r".into() }] {
             assert!(c.submit(signed(&c, &owner, action)).unwrap_err().to_string().contains("only validator admins"));
         }
-        // What admitting a tx reserves: amounts that leave the balance, not vote locks.
-        let reserve = |a: Action| c.state.tx_debit(&signed(&c, &owner, a)) - signed(&c, &owner, Action::Unlock {}).charge().unwrap();
-        assert!(reserve(Action::Delegate { validator: v.clone(), amount: 7 * FANG }) >= 7 * FANG);
-        assert!(reserve(Action::Propose { kind: ProposalKind::Text {}, deposit: 9 * FANG, title: "t".into(), url: String::new() }) >= 9 * FANG);
-        assert!(reserve(Action::Vote { proposal_id: 0, aye: true, amount: 1_000 * FANG, conviction: 6 }) < FANG);
         let root = c.state.root();
         drop(c);
         assert_eq!(Chain::open(&home).unwrap().state.root(), root, "replays");

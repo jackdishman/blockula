@@ -1181,7 +1181,7 @@ mod tests {
 
     /// DEC-6: an action that opens an account burns the creation fee from the sender, on top of
     /// what it moves; existing accounts, names and keyless system accounts don't pay it; a sender
-    /// that can't cover it fails (paying its fee); the mempool reserves it.
+    /// that can't cover it fails (paying its fee); admission's dry run counts it.
     #[test]
     fn opening_an_account_burns_the_creation_fee() {
         let (a, poor, x, y, z) = (keys(1), keys(2), keys(3), keys(4), keys(5));
@@ -1199,9 +1199,8 @@ mod tests {
             let tx = t.ok(&a, Action::Transfer { to: to.clone(), amount: FANG });
             assert_eq!(a0 - t.bal(&a.address()), FANG + base_fee(&t.c.state, t.c.height(), tx.size()), "{to}");
         }
-        // The mempool reserves it; a sender that can't cover it fails and pays its fee.
+        // Admission's dry run counts it; a sender that can't cover it fails and pays its fee.
         let to_y = t.tx(&poor, Action::Transfer { to: y.address(), amount: FANG });
-        assert_eq!(t.c.state.tx_debit(&to_y), to_y.fee + FANG + open);
         assert!(t.c.submit(to_y.clone()).unwrap_err().to_string().contains("opening 1 account burns 0.1 FANG"));
         t.c.produce_block_with(vec![to_y.clone()]).unwrap();
         assert!(t.c.failure(&to_y.id()).unwrap().0.contains("insufficient balance"));
