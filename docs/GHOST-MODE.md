@@ -470,7 +470,10 @@ mempool (and replacement by tip); stale anchors; the turnstile against a counter
 the pause by f + 1 of 4 validators, across epochs, and governance's resume; disabled by default
 (every tag refused with the same error, at the mempool and in blocks); size limits and the block
 budget; another chain instance; the mempool's ghost bounds; session keys; the release profile.
-Also: consensus `verify` (`verify_checks_ghost_proofs_and_size_limits`), the HTTP API, wire-form
+Also: a 4-validator simulation (`sim::ghost_txs_finalize_through_consensus`: the three
+transfers submitted to different validators, gossiped, proposed under the block budget,
+proof-checked by every verifier and executed to the same root), consensus `verify`
+(`verify_checks_ghost_proofs_and_size_limits`), the HTTP API, wire-form
 and bound tests and shared Rust/TypeScript vectors in `types.rs`, and the `ghost_tx` fuzz target
 with real-proof seeds (`node/fuzz`).
 

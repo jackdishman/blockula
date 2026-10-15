@@ -788,11 +788,15 @@ where
                     debug!(?from, "unparseable gossiped tx");
                     continue;
                 };
-                // Verify format + ML-DSA signature before taking the chain lock.
-                let (chain_id, prefix) = {
+                // Verify format + ML-DSA signature (and a ghost tx's proof) before taking the chain
+                // lock; ghost txs are dropped unverified while Ghost Mode is off or paused.
+                let (chain_id, prefix, ghost_off) = {
                     let c = gossip_chain.lock();
-                    (c.genesis.chain_id.clone(), c.genesis.address_prefix.clone())
+                    (c.genesis.chain_id.clone(), c.genesis.address_prefix.clone(), tx.action.is_ghost() && crate::ghost::check_enabled(&c.state, c.height() + 1).is_err())
                 };
+                if ghost_off {
+                    continue;
+                }
                 if let Err(e) = check_tx_stateless(&tx, &chain_id, &prefix) {
                     debug!(?from, error = %e, "dropping invalid gossiped tx");
                     continue;

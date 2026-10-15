@@ -13,11 +13,11 @@ use std::path::PathBuf;
 const FANG: u64 = DROPS_PER_FANG;
 /// An unsigned tx's fee in these tests: the base fee of a tx well above a real one's size, plus
 /// the default verify fee (the excess is burned).
-const FEE: u64 = 10_000 + 200_000 * 10 + FANG / 1_000;
+pub(crate) const FEE: u64 = 10_000 + 200_000 * 10 + FANG / 1_000;
 
 /// Deterministic randomness for test wallets (BLAKE3's XOF). Provers draw their masks from the
 /// OS regardless.
-struct TestRng(blake3::OutputReader);
+pub(crate) struct TestRng(blake3::OutputReader);
 
 impl TestRng {
     fn new(seed: &str) -> Self {
@@ -51,15 +51,112 @@ impl rand_core::TryRng for TestRng {
 
 impl rand_core::TryCryptoRng for TestRng {}
 
-/// A test chain (this node is its first validator) and a wallet's randomness.
+/// A test wallet: it builds and proves ghost txs against a chain's current state, the way a real
+/// wallet would (rebuilding the commitment tree from the chain's records).
+pub(crate) struct Wallet {
+    pub(crate) rng: TestRng,
+}
+
+impl Wallet {
+    pub(crate) fn new(seed: &str) -> Self {
+        Wallet { rng: TestRng::new(seed) }
+    }
+
+    pub(crate) fn output(&mut self, value: u64, to: &SpendingKey, from: &SpendingKey) -> (Note, EncryptedNote) {
+        let note = Note { value, owner: to.address().owner(), rseed: self.rng.bytes() };
+        let enc = encrypt_note(&note, &to.address(), &[0; MEMO_BYTES], Some(&from.full_viewing_key().outgoing()), &mut self.rng).unwrap();
+        (note, enc)
+    }
+
+    pub(crate) fn dummy_spend(&mut self) -> SpendWitness {
+        SpendWitness::dummy(&mut self.rng)
+    }
+
+    pub(crate) fn dummy_output(&mut self) -> (Note, EncryptedNote) {
+        dummy_output(&mut self.rng)
+    }
+
+    /// A shield of `amount` from `from` (its next nonce) to the ghost key `to`, proved and signed.
+    /// Returns the note.
+    pub(crate) fn shield(&mut self, c: &Chain, from: &Keys, amount: u64, to: &SpendingKey) -> (Tx, Note) {
+        let out = self.output(amount, to, to);
+        let note = out.0;
+        let act = Act { spends: [self.dummy_spend(), self.dummy_spend()], outputs: [out, self.dummy_output()], anchor: anchor(c) };
+        let mut tx = Tx { chain_id: c.genesis.chain_id.clone(), from: from.address(), nonce: c.next_nonce(&from.address()), fee: FEE, tip: 0, valid_until: c.height() + 100, action: Action::Shield { amount, bundle: Box::new(act.bundle(instance(c))) }, memo: String::new(), public_key: hex::encode(from.public_key()), signature: String::new() };
+        tx = act.prove(tx);
+        tx.signature = "00".repeat(crypto::SIGNATURE_LEN);
+        (tx.sign(from), note)
+    }
+
+    /// A private transfer spending `note` (of `key`) into `outputs`, with fee `FEE`.
+    pub(crate) fn transfer(&mut self, c: &Chain, key: &SpendingKey, note: Note, outputs: [(Note, EncryptedNote); 2]) -> Tx {
+        let act = Act { spends: [spend(c, key, note), self.dummy_spend()], outputs, anchor: anchor(c) };
+        let tx = unsigned(c, Action::PrivateTransfer { bundle: Box::new(act.bundle(instance(c))) }, FEE, 0);
+        act.prove(tx)
+    }
+
+    /// An unshield of `amount` to `to` from `note` (of `key`), the rest back to `key`, with fee
+    /// `FEE`.
+    pub(crate) fn unshield(&mut self, c: &Chain, key: &SpendingKey, note: Note, to: &str, amount: u64) -> Tx {
+        let change = self.output(note.value - amount - FEE, key, key);
+        let act = Act { spends: [spend(c, key, note), self.dummy_spend()], outputs: [change, self.dummy_output()], anchor: anchor(c) };
+        let tx = unsigned(c, Action::Unshield { to: to.into(), amount, bundle: Box::new(act.bundle(instance(c))) }, FEE, 0);
+        act.prove(tx)
+    }
+}
+
+fn instance(c: &Chain) -> [u8; 32] {
+    c.state.ghost.meta.instance
+}
+
+/// The chain's current anchor.
+fn anchor(c: &Chain) -> Digest {
+    digest_from_bytes(&c.state.ghost.meta.root).unwrap()
+}
+
+/// A wallet's view of the commitment tree, rebuilt from the state's commitments.
+fn tree(c: &Chain) -> FullTree {
+    let mut t = FullTree::new();
+    for (pos, cm) in c.state.ghost.commitments.iter() {
+        assert_eq!(u64::from(t.append(digest_from_bytes(cm).unwrap()).unwrap()), *pos);
+    }
+    assert_eq!(t.root(), anchor(c), "the wallet's tree and the chain's anchor agree");
+    t
+}
+
+/// A spend of `note` (owned by `key`) at its position in the tree.
+fn spend(c: &Chain, key: &SpendingKey, note: Note) -> SpendWitness {
+    let t = tree(c);
+    let cm = digest_to_bytes(&note.commitment());
+    let pos = c.state.ghost.commitments.iter().find(|(_, x)| **x == cm).map(|(p, _)| *p as u32).expect("the note is in the tree");
+    SpendWitness::new(key, note, t.path(pos).unwrap())
+}
+
+/// An unsigned tx around a ghost action whose proof is still empty, valid for 100 blocks.
+fn unsigned(c: &Chain, action: Action, fee: u64, tip: u64) -> Tx {
+    Tx { chain_id: c.genesis.chain_id.clone(), from: String::new(), nonce: 0, fee, tip, valid_until: c.height() + 100, action, memo: String::new(), public_key: String::new(), signature: String::new() }
+}
+
+/// A test chain (this node is its first validator) and a wallet.
 struct Net {
     root: PathBuf,
     home: PathBuf,
     c: Chain,
     validators: Vec<Keys>,
-    rng: TestRng,
+    w: Wallet,
 }
 
+/// Turns Ghost Mode on in a summoned chain's genesis files (and sets `params`).
+pub(crate) fn enable_in_genesis(files: &[PathBuf], params: &[(&str, u64)]) {
+    for f in files {
+        let mut g: serde_json::Value = serde_json::from_slice(&std::fs::read(f).unwrap()).unwrap();
+        g["features"] = json!([FEATURE]);
+        for (k, v) in params {
+            g["params"][*k] = json!(v.to_string());
+        }
+        std::fs::write(f, serde_json::to_vec_pretty(&g).unwrap()).unwrap();
+    }
+}
 
 /// A chain of `validators` validators with 20-block epochs, Ghost Mode on at genesis when `on`,
 /// a 1,000 FANG pool cap, and `params` overriding chain parameters.
@@ -72,15 +169,13 @@ fn net(tag: &str, on: bool, validators: usize, params: &[(&str, u64)]) -> Net {
         o.params.insert(k.to_string(), *v);
     }
     let homes = Chain::summon(&root, &o).unwrap();
-    let files: Vec<PathBuf> = homes.iter().map(|h| h.join("genesis.json")).chain((validators > 1).then(|| root.join("genesis.json"))).collect();
-    for f in files.iter().filter(|_| on) {
-        let mut g: serde_json::Value = serde_json::from_slice(&std::fs::read(f).unwrap()).unwrap();
-        g["features"] = json!([FEATURE]);
-        std::fs::write(f, serde_json::to_vec_pretty(&g).unwrap()).unwrap();
+    if on {
+        let files: Vec<PathBuf> = homes.iter().map(|h| h.join("genesis.json")).chain((validators > 1).then(|| root.join("genesis.json"))).collect();
+        enable_in_genesis(&files, &[]);
     }
     let validators = homes.iter().map(|h| Keys::from_seed(hex::decode(std::fs::read_to_string(h.join("validator.key")).unwrap().trim()).unwrap().try_into().unwrap())).collect();
     let c = Chain::open(&homes[0]).unwrap();
-    Net { root, home: homes[0].clone(), c, validators, rng: TestRng::new(tag) }
+    Net { root, home: homes[0].clone(), c, validators, w: Wallet::new(tag) }
 }
 
 impl Net {
@@ -92,10 +187,10 @@ impl Net {
 
     /// Closes the chain and opens its home again.
     fn reopen(self) -> Net {
-        let Net { root, home, c, validators, rng } = self;
+        let Net { root, home, c, validators, w } = self;
         drop(c);
         let c = Chain::open(&home).unwrap();
-        Net { root, home, c, validators, rng }
+        Net { root, home, c, validators, w }
     }
 
     /// Funds transparent accounts from the faucet (one block).
@@ -128,75 +223,43 @@ impl Net {
     }
 
     fn instance(&self) -> [u8; 32] {
-        self.c.state.ghost.meta.instance
+        instance(&self.c)
     }
 
-    /// The current anchor.
     fn anchor(&self) -> Digest {
-        digest_from_bytes(&self.c.state.ghost.meta.root).unwrap()
+        anchor(&self.c)
     }
 
-    /// The wallet's view of the commitment tree, rebuilt from the state's commitments.
-    fn tree(&self) -> FullTree {
-        let mut t = FullTree::new();
-        for (pos, cm) in self.c.state.ghost.commitments.iter() {
-            assert_eq!(u64::from(t.append(digest_from_bytes(cm).unwrap()).unwrap()), *pos);
-        }
-        assert_eq!(t.root(), self.anchor(), "the wallet's tree and the chain's anchor agree");
-        t
-    }
-
-    /// A spend of `note` (owned by `key`) at its position in the tree.
     fn spend(&self, key: &SpendingKey, note: Note) -> SpendWitness {
-        let t = self.tree();
-        let cm = digest_to_bytes(&note.commitment());
-        let pos = self.c.state.ghost.commitments.iter().find(|(_, c)| **c == cm).map(|(p, _)| *p as u32).expect("the note is in the tree");
-        SpendWitness::new(key, note, t.path(pos).unwrap())
+        spend(&self.c, key, note)
     }
 
     fn output(&mut self, value: u64, to: &SpendingKey, from: &SpendingKey) -> (Note, EncryptedNote) {
-        let note = Note { value, owner: to.address().owner(), rseed: self.rng.bytes() };
-        let enc = encrypt_note(&note, &to.address(), &[0; MEMO_BYTES], Some(&from.full_viewing_key().outgoing()), &mut self.rng).unwrap();
-        (note, enc)
+        self.w.output(value, to, from)
     }
 
     fn dummy_spend(&mut self) -> SpendWitness {
-        SpendWitness::dummy(&mut self.rng)
+        self.w.dummy_spend()
     }
 
     fn dummy_output(&mut self) -> (Note, EncryptedNote) {
-        dummy_output(&mut self.rng)
+        self.w.dummy_output()
     }
 
-    /// A shield of `amount` from `from` to the ghost key `to`, proved and signed. Returns the note.
     fn shield(&mut self, from: &Keys, amount: u64, to: &SpendingKey) -> (Tx, Note) {
-        let out = self.output(amount, to, to);
-        let note = out.0;
-        let act = Act { spends: [self.dummy_spend(), self.dummy_spend()], outputs: [out, self.dummy_output()], anchor: self.anchor() };
-        let mut tx = Tx { chain_id: self.c.genesis.chain_id.clone(), from: from.address(), nonce: self.c.next_nonce(&from.address()), fee: FEE, tip: 0, valid_until: self.c.height() + 100, action: Action::Shield { amount, bundle: Box::new(act.bundle(self.instance())) }, memo: String::new(), public_key: hex::encode(from.public_key()), signature: String::new() };
-        tx = act.prove(tx);
-        tx.signature = "00".repeat(crypto::SIGNATURE_LEN);
-        (tx.sign(from), note)
+        self.w.shield(&self.c, from, amount, to)
     }
 
-    /// An unsigned tx around a ghost action whose proof is still empty, valid for 100 blocks.
     fn unsigned(&self, action: Action, fee: u64, tip: u64) -> Tx {
-        Tx { chain_id: self.c.genesis.chain_id.clone(), from: String::new(), nonce: 0, fee, tip, valid_until: self.c.height() + 100, action, memo: String::new(), public_key: String::new(), signature: String::new() }
+        unsigned(&self.c, action, fee, tip)
     }
 
-    /// A private transfer spending `note` (of `key`) into `outputs`, with fee `FEE`.
     fn transfer(&mut self, key: &SpendingKey, note: Note, outputs: [(Note, EncryptedNote); 2]) -> Tx {
-        let act = Act { spends: [self.spend(key, note), self.dummy_spend()], outputs, anchor: self.anchor() };
-        let tx = self.unsigned(Action::PrivateTransfer { bundle: Box::new(act.bundle(self.instance())) }, FEE, 0);
-        act.prove(tx)
+        self.w.transfer(&self.c, key, note, outputs)
     }
 
-    /// An unshield of `amount` to `to` from `note` (of `key`), the rest back to `key`, with fee `FEE`.
     fn unshield(&mut self, key: &SpendingKey, note: Note, to: &str, amount: u64) -> Tx {
-        let change = self.output(note.value - amount - FEE, key, key);
-        let act = Act { spends: [self.spend(key, note), self.dummy_spend()], outputs: [change, self.dummy_output()], anchor: self.anchor() };
-        let tx = self.unsigned(Action::Unshield { to: to.into(), amount, bundle: Box::new(act.bundle(self.instance())) }, FEE, 0);
-        act.prove(tx)
+        self.w.unshield(&self.c, key, note, to, amount)
     }
 }
 
@@ -502,7 +565,7 @@ fn the_turnstile_bounds_a_counterfeit_note() {
     n.c.produce_block().unwrap();
     // A note worth 500 FANG in a tree the chain never had, and its root accepted as an anchor
     // (as if membership proofs were broken).
-    let fake = Note { value: 500 * FANG, owner: thief.address().owner(), rseed: n.rng.bytes() };
+    let fake = Note { value: 500 * FANG, owner: thief.address().owner(), rseed: n.w.rng.bytes() };
     let mut elsewhere = FullTree::new();
     let pos = elsewhere.append(fake.commitment()).unwrap();
     let fake_root = digest_to_bytes(&elsewhere.root());

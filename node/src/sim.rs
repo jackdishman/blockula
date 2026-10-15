@@ -427,3 +427,54 @@ fn fast_sync_from_certified_snapshot_and_tamper_rejection() {
     });
     std::fs::remove_dir_all(root).ok();
 }
+
+/// 👻 Ghost Mode through real consensus: a shield, an unsigned private transfer and an unshield,
+/// each submitted to one validator, gossiped (the unsigned ones carry no sender at all), proposed
+/// by whoever leads, proof-checked by every verifier before it votes and executed by every node
+/// to the same state root.
+#[test]
+fn ghost_txs_finalize_through_consensus() {
+    use crate::ghost::tests::{enable_in_genesis, Wallet, FEE};
+    use blockula_ghost::SpendingKey;
+    let (root, homes, _, seeds) = summon("ghost");
+    let files: Vec<PathBuf> = homes.iter().map(|h| h.join("genesis.json")).collect();
+    enable_in_genesis(&files, &[("ghost_pool_cap", 1_000 * DROPS_PER_FANG)]);
+    let genesis = Genesis::load(&files[0]).unwrap();
+    let executor = deterministic::Runner::timed(Duration::from_secs(900));
+    executor.start(|context| async move {
+        let mut oracle = network(&context, &genesis, &[]).await;
+        let mut vals = vec![];
+        for (i, (home, seed)) in homes.iter().zip(&seeds).enumerate() {
+            vals.push(start(&context, &mut oracle, &genesis, i, 0, home.clone(), PrivateKey::from_seed_bytes(*seed)).await);
+        }
+        wait_for_height(&context, &vals, 3).await;
+        let funder = Keys::from_seed(seeds[3]);
+        let (alice, bob) = (SpendingKey::from_seed([71; 32]), SpendingKey::from_seed([72; 32]));
+        let carol = Keys::from_seed([73; 32]).address();
+        let mut w = Wallet::new("sim");
+        let pool = |v: &Val| v.chain.lock().state.ghost.meta.pool;
+
+        let (shield, note) = w.shield(&vals[3].chain.lock(), &funder, 100 * DROPS_PER_FANG, &alice);
+        vals[3].chain.lock().submit(shield).unwrap();
+        wait_until(&context, "the shield", || vals.iter().all(|v| pool(v) == 100 * DROPS_PER_FANG)).await;
+
+        let outputs = [w.output(60 * DROPS_PER_FANG, &bob, &alice), w.output(40 * DROPS_PER_FANG - FEE, &alice, &alice)];
+        let to_bob = outputs[0].0;
+        let transfer = w.transfer(&vals[0].chain.lock(), &alice, note, outputs);
+        let id = vals[1].chain.lock().submit(transfer).unwrap();
+        wait_until(&context, "the private transfer", || vals.iter().all(|v| pool(v) == 100 * DROPS_PER_FANG - FEE)).await;
+        let (h, _) = vals[2].chain.lock().tx_location(&id).unwrap();
+        assert!(vals[2].chain.lock().block(h).unwrap().txs.iter().any(|t| t.is_unsigned()));
+
+        let unshield = w.unshield(&vals[0].chain.lock(), &bob, to_bob, &carol, 50 * DROPS_PER_FANG);
+        vals[2].chain.lock().submit(unshield).unwrap();
+        wait_until(&context, "the unshield", || vals.iter().all(|v| v.chain.lock().state.account(&carol).balance == 50 * DROPS_PER_FANG)).await;
+
+        let h = vals.iter().map(|v| v.chain.lock().height()).min().unwrap();
+        let roots: Vec<String> = vals.iter().map(|v| v.chain.lock().root_at(h).unwrap().to_string()).collect();
+        assert!(roots.windows(2).all(|w| w[0] == w[1]), "state roots diverged at {h}: {roots:?}");
+        assert!(vals.iter().all(|v| pool(v) == 100 * DROPS_PER_FANG - 50 * DROPS_PER_FANG - 2 * FEE && v.chain.lock().mempool.is_empty()));
+        println!("✓ shield, private transfer and unshield finalized; 4 validators agree at height {h}");
+    });
+    std::fs::remove_dir_all(root).ok();
+}
