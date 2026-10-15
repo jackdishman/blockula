@@ -5,6 +5,7 @@
 
 use anyhow::{bail, Result};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 pub const GITHUB_MAX_BYTES: usize = 1 << 20;
@@ -193,33 +194,63 @@ pub fn references_pr(text: &str, repo: &str, pr: u64) -> bool {
     bare || text.match_indices(&format!("github.com/{repo}/pull/{num}")).any(|(i, m)| ends(&text[i + m.len()..]))
 }
 
-/// The revert of PR `pr` (merged into `repo` as `merge_sha`), if `commits` (the default branch
-/// since the merge, newest first as GitHub lists them) or `pulls` (recently closed PRs) hold
-/// one. Validators must name the same commit, so it's always the oldest of the first rule that
-/// matches:
-/// 1. a commit whose message reverts `merge_sha` (`git revert` writes "This reverts commit
-///    <sha>."; a revert PR merged with a merge commit brings that commit along);
-/// 2. a PR merged into the default branch, titled "Revert …", whose body references the PR
-///    (GitHub's revert button writes "Reverts owner/repo#123"): its merge commit.
-pub fn find_revert_in(repo: &str, pr: u64, merge_sha: &str, commits: &[Commit], pulls: &[PullRequest]) -> Option<Revert> {
-    let merge_sha = merge_sha.to_ascii_lowercase();
-    let by_commit = commits.iter().rev().find(|c| {
-        let m = c.message.to_ascii_lowercase();
-        c.sha != merge_sha && m.contains("revert") && m.contains(&merge_sha)
-    });
-    if let Some(c) = by_commit {
-        return Some(Revert { sha: c.sha.clone(), how: format!("commit {} reverts {}", &c.sha[..12], &merge_sha[..12.min(merge_sha.len())]) });
-    }
-    pulls
-        .iter()
-        .filter(|p| p.merged && p.number != pr && p.on_default_branch() && p.base_repo.eq_ignore_ascii_case(repo) && p.title.trim_start().to_ascii_lowercase().starts_with("revert") && references_pr(&p.body, repo, pr))
-        .filter_map(|p| Some((p.merged_at.clone(), p.number, p.merge_sha.clone()?)))
-        .min()
-        .map(|(_, number, sha)| Revert { how: format!("{repo}#{number} reverts #{pr}, merged as {}", &sha[..12]), sha })
+/// Whether `p` is a merged PR into `repo`'s default branch that reverts PR `pr` (merged as
+/// `merge_sha`): titled "Revert …" with a body that references the PR or names the merge commit
+/// (GitHub's revert button writes "Reverts owner/repo#123").
+fn reverts_pr(p: &PullRequest, repo: &str, pr: u64, merge_sha: &str) -> bool {
+    p.merged && p.number != pr && p.on_default_branch() && p.base_repo.eq_ignore_ascii_case(repo) && p.title.trim_start().to_ascii_lowercase().starts_with("revert") && (references_pr(&p.body, repo, pr) || p.body.to_ascii_lowercase().contains(merge_sha))
 }
 
-/// Most pages of commits since the merge a revert check reads (100 each).
+/// PRs worth fetching because a commit looks like their revert landing: a squash merge titled
+/// "Revert … (#N)", or "Merge pull request #N from owner/revert-…" (GitHub's revert branches).
+/// Oldest first, without repeats.
+pub fn revert_pr_candidates(commits: &[Commit]) -> Vec<u64> {
+    let mut out: Vec<u64> = vec![];
+    for c in commits.iter().rev() {
+        let subject = c.message.lines().next().unwrap_or_default().trim().to_ascii_lowercase();
+        let n = if subject.starts_with("revert") {
+            subject.strip_suffix(')').and_then(|s| s.rsplit_once("(#")).and_then(|(_, n)| n.parse().ok())
+        } else if let Some(rest) = subject.strip_prefix("merge pull request #") {
+            rest.split_once(" from ").filter(|(_, branch)| branch.contains("/revert-")).and_then(|(n, _)| n.parse().ok())
+        } else {
+            None
+        };
+        if let Some(n) = n.filter(|n| !out.contains(n)) {
+            out.push(n);
+        }
+    }
+    out
+}
+
+/// The revert of PR `pr` (merged into `repo` as `merge_sha`), given `commits` (the default
+/// branch since the merge, newest first as GitHub lists them) and `pulls` (closed PRs: the recent
+/// ones and the [`revert_pr_candidates`]). Validators must name the same commit, so it's the
+/// oldest on the branch that either
+/// * says it reverts `merge_sha` (`git revert` writes "This reverts commit <sha>."; a revert PR
+///   merged with a merge commit brings that commit along), or
+/// * is the merge of a revert PR ([`reverts_pr`]; a squash merge's message may name neither);
+///
+/// failing both, the earliest-merged revert PR (its merge older than the commits read).
+pub fn find_revert_in(repo: &str, pr: u64, merge_sha: &str, commits: &[Commit], pulls: &[PullRequest]) -> Option<Revert> {
+    let merge_sha = merge_sha.to_ascii_lowercase();
+    let short = |sha: &str| sha.chars().take(12).collect::<String>();
+    let revert_prs: BTreeMap<&str, &PullRequest> = pulls.iter().filter(|p| reverts_pr(p, repo, pr, &merge_sha)).filter_map(|p| Some((p.merge_sha.as_deref()?, p))).collect();
+    for c in commits.iter().rev().filter(|c| c.sha != merge_sha) {
+        let m = c.message.to_ascii_lowercase();
+        if m.contains("revert") && m.contains(&merge_sha) {
+            return Some(Revert { sha: c.sha.clone(), how: format!("commit {} reverts {}", short(&c.sha), short(&merge_sha)) });
+        }
+        if let Some(p) = revert_prs.get(c.sha.as_str()) {
+            return Some(Revert { sha: c.sha.clone(), how: format!("{repo}#{} reverts #{pr}, merged as {}", p.number, short(&c.sha)) });
+        }
+    }
+    revert_prs.values().map(|p| (p.merged_at.clone(), p.number, p.merge_sha.clone().unwrap_or_default())).min().map(|(_, number, sha)| Revert { how: format!("{repo}#{number} reverts #{pr}, merged as {}", short(&sha)), sha })
+}
+
+/// Most pages of commits since the merge a revert check reads (100 each), and most revert-looking
+/// PRs it fetches.
 pub const REVERT_COMMIT_PAGES: u32 = 10;
+pub const REVERT_PR_FETCHES: usize = 10;
 
 /// Looks for a revert of a claim's PR on GitHub (see [`find_revert_in`]). `Err`: couldn't tell
 /// (GitHub unreachable, the PR gone or never merged).
@@ -239,7 +270,13 @@ pub async fn find_revert(repo: &str, pr: u64, merge_sha: &str) -> Result<Option<
             break;
         }
     }
-    let pulls = get_json_capped(&format!("/repos/{repo}/pulls?state=closed&sort=updated&direction=desc&per_page=100"), GITHUB_MAX_LIST_BYTES).await?.map(|v| parse_pulls(&v)).unwrap_or_default();
+    let mut pulls = get_json_capped(&format!("/repos/{repo}/pulls?state=closed&sort=updated&direction=desc&per_page=100"), GITHUB_MAX_LIST_BYTES).await?.map(|v| parse_pulls(&v)).unwrap_or_default();
+    let known: Vec<u64> = pulls.iter().map(|p| p.number).collect();
+    for n in revert_pr_candidates(&commits).into_iter().filter(|n| *n != pr && !known.contains(n)).take(REVERT_PR_FETCHES) {
+        if let Some(p) = fetch_pr(repo, n).await? {
+            pulls.push(p);
+        }
+    }
     Ok(find_revert_in(repo, pr, merge_sha, &commits, &pulls))
 }
 
@@ -315,6 +352,45 @@ mod tests {
         assert_eq!(find_revert_in("jackdishman/blockula", 42, MERGE, &quiet, &not), None);
         assert_eq!(find_revert_in("jackdishman/blockula", 61, MERGE, &quiet, &pulls[1..2]), None);
         assert_eq!(find_revert_in("jackdishman/blockula", 42, MERGE, &[], &[]), None);
+    }
+
+    /// Recorded from tokio-rs/axum (trimmed): #3168 merged as `e09cc59…` was reverted by #3287, a
+    /// squash merge whose commit message is only its title. Its PR is found by following the
+    /// commit, and it wins over a later `git revert` of the same merge (validators must agree).
+    #[test]
+    fn squash_merged_revert_prs_are_followed() {
+        let merge = "e09cc593655de82d01971b55130a83842ac46684";
+        let mut commits = parse_commits(&json!([
+            { "sha": "8d2b1f6e0a4c3d5e7f9a1b2c3d4e5f60718293a4", "commit": { "message": "Remove the `__private_docs` feature (#3290)" } },
+            { "sha": "3525a1345987a1f3cead86a995cb3ca39a72b629", "commit": { "message": "Revert \"Make `status` a const function in rejection handling\" (#3287)" } },
+            { "sha": "a0a1a2a3a4a5a6a7a8a9b0b1b2b3b4b5b6b7b8b9", "commit": { "message": "Merge pull request #3200 from someone/revert-3100-other\n\nRevert \"Other\"" } },
+            { "sha": merge, "commit": { "message": "Make `status` a const function in rejection handling (#3168)" } }
+        ]));
+        assert_eq!(revert_pr_candidates(&commits), vec![3200, 3287]);
+        assert!(revert_pr_candidates(&parse_commits(&json!([{ "sha": merge, "commit": { "message": "Fix the thing (#12)" } }, { "sha": merge, "commit": { "message": "Revert \"x\"" } }]))).is_empty());
+        let base = json!({ "ref": "main", "repo": { "full_name": "tokio-rs/axum", "default_branch": "main" } });
+        let reverted = parse_pr(&json!({ "number": 3287, "state": "closed", "title": "Revert \"Make `status` a const function in rejection handling\"", "body": "This reverts commit e09cc593655de82d01971b55130a83842ac46684 / PR #3168.\r\n\r\nAlso updates changelogs to note the crate yanks.", "merged_at": "2025-03-27T07:31:19Z", "merge_commit_sha": "3525a1345987a1f3cead86a995cb3ca39a72b629", "base": base }));
+        let other = parse_pr(&json!({ "number": 3200, "state": "closed", "title": "Revert \"Other\"", "body": "Reverts tokio-rs/axum#3100", "merged_at": "2025-02-01T00:00:00Z", "merge_commit_sha": "a0a1a2a3a4a5a6a7a8a9b0b1b2b3b4b5b6b7b8b9", "base": base }));
+        let pulls = [other, reverted.clone()];
+        let r = find_revert_in("tokio-rs/axum", 3168, merge, &commits, &pulls).unwrap();
+        assert_eq!(r.sha, "3525a1345987a1f3cead86a995cb3ca39a72b629");
+        assert_eq!(find_revert_in("tokio-rs/axum", 3168, merge, &commits, &[]), None, "a title alone isn't a revert of #3168");
+        // A body naming only the merge commit is enough too.
+        let by_sha = PullRequest { body: "This reverts commit e09cc593655de82d01971b55130a83842ac46684.".into(), ..reverted };
+        assert_eq!(find_revert_in("tokio-rs/axum", 3168, merge, &commits, &[by_sha]).unwrap().sha, r.sha);
+        commits.insert(0, Commit { sha: "f".repeat(40), message: format!("Revert again\n\nThis reverts commit {merge}.") });
+        assert_eq!(find_revert_in("tokio-rs/axum", 3168, merge, &commits, &pulls).unwrap().sha, r.sha, "the oldest revert on the branch");
+    }
+
+    /// Against GitHub itself (network, so ignored): `cargo test live_revert -- --ignored`.
+    /// tokio-rs/axum#3168 was reverted by #3287 ("This reverts commit e09cc59… / PR #3168").
+    #[tokio::test]
+    #[ignore]
+    async fn live_revert_lookup() {
+        let pr = fetch_pr("tokio-rs/axum", 3168).await.unwrap().unwrap();
+        let r = find_revert("tokio-rs/axum", 3168, pr.merge_sha.as_deref().unwrap()).await.unwrap();
+        println!("#3168 merged as {:?} at {}: {r:?}", pr.merge_sha, pr.merged_at);
+        assert!(r.is_some());
     }
 
     #[test]
