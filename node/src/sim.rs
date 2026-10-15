@@ -7,7 +7,7 @@ use crate::crypto::Keys;
 use crate::pq::{PrivateKey, PublicKey};
 use crate::types::*;
 use commonware_p2p::simulated::{Config as NetConfig, Link, Network, Oracle};
-use commonware_runtime::{Clock as _, Handle, Runner as _, Supervisor as _, deterministic};
+use commonware_runtime::{Clock as _, Handle, Runner as _, Spawner as _, Supervisor as _, deterministic};
 use commonware_codec::{Decode as _, DecodeExt as _};
 use commonware_consensus::simplex::types::Finalization;
 use commonware_cryptography::blake3::Digest;
@@ -289,6 +289,59 @@ fn validator_joins_at_epoch_boundary_and_genesis_validator_is_removed() {
         let roots: Vec<String> = vals.iter().map(|v| v.chain.lock().root_at(h).unwrap().to_string()).collect();
         assert!(roots.windows(2).all(|w| w[0] == w[1]), "state roots diverged at {h}: {roots:?}");
         println!("✓ 5 nodes agree at height {h} after a join and a removal");
+    });
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// CRY-3 and SF-1 end to end: every validator runs its beacon duties (as node.rs does), so from
+/// epoch 2 on each value mixes all 4 reveals and nobody misses one. Each epoch's leaders follow
+/// the permutation seeded from its value, and `consensus::leader` (what downtime accounting
+/// uses) names exactly the proposers simplex elected.
+#[test]
+fn beacon_rounds_seed_the_leader_order() {
+    let (root, homes, genesis, seeds) = summon("beacon");
+    let executor = deterministic::Runner::timed(Duration::from_secs(900));
+    executor.start(|context| async move {
+        let mut oracle = network(&context, &genesis, &[]).await;
+        let mut vals = vec![];
+        for (i, (home, seed)) in homes.iter().zip(&seeds).enumerate() {
+            vals.push(start(&context, &mut oracle, &genesis, i, 0, home.clone(), PrivateKey::from_seed_bytes(*seed)).await);
+        }
+        for (v, seed) in vals.iter().zip(&seeds) {
+            let (chain, home, seed) = (v.chain.clone(), v.home.clone(), *seed);
+            context.child("beacon").spawn(move |ctx| async move {
+                let mut secrets = crate::beacon::Secrets::open_deterministic(&home, seed).unwrap();
+                loop {
+                    ctx.sleep(Duration::from_millis(500)).await;
+                    let _ = crate::beacon::duties(&mut chain.lock(), &mut secrets);
+                }
+            });
+        }
+        wait_for_height(&context, &vals, 6 * EPOCH_BLOCKS).await;
+        let c = vals[0].chain.lock();
+        for e in 2..=5 {
+            let v = &c.state.beacon.values[&e];
+            assert_eq!((v.reveals, v.missed.len()), (4, 0), "epoch {e}'s beacon");
+        }
+        let mut shuffled = 0;
+        for e in 0..=5 {
+            let set = c.state.active_set(e).and_then(|s| consensus::keys_of(s.iter().map(|v| v.consensus_key.as_str()))).unwrap();
+            let rotation: Vec<String> = (1..=4).map(|v| set[((e + v) % 4) as usize].address("boo")).collect();
+            if (1..=4).map(|v| consensus::leader(&c.state, e, v).unwrap()).collect::<Vec<_>>() != rotation {
+                shuffled += 1;
+            }
+        }
+        assert!(shuffled > 0, "seeded orders differ from the plain rotation");
+        for h in 1..=c.height() {
+            let b = c.block(h).unwrap();
+            let e = c.state.params.epoch_of(h);
+            assert_eq!(consensus::leader(&c.state, e, b.view).as_deref(), Some(b.proposer.as_str()), "block {h} (epoch {e}, view {})", b.view);
+        }
+        println!("✓ beacon values from 4 reveals each; {} blocks proposed by their seeded leaders ({shuffled} of 6 epochs reordered)", c.height());
+        drop(c);
+        let h = vals.iter().map(|v| v.chain.lock().height()).min().unwrap();
+        let roots: Vec<String> = vals.iter().map(|v| v.chain.lock().root_at(h).unwrap().to_string()).collect();
+        assert!(roots.windows(2).all(|w| w[0] == w[1]), "state roots diverged at {h}: {roots:?}");
     });
     std::fs::remove_dir_all(root).ok();
 }
