@@ -6,6 +6,7 @@ mod contrib_cli;
 mod crypto;
 mod econ;
 mod epochs;
+mod genesis_builder;
 mod github;
 mod governance;
 mod snapshot;
@@ -175,6 +176,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: validator_cli::ValidatorCmd,
     },
+    /// The genesis ceremony: an operator's entry (offline), and a reproducible genesis.json
+    Genesis {
+        #[command(subcommand)]
+        cmd: genesis_builder::GenesisCmd,
+    },
     /// Generate an ML-DSA-65 keypair
     Keygen,
 }
@@ -268,6 +274,7 @@ fn main() -> Result<()> {
             node::run_full_node(home, net_opts(net, Some(port), None, false))
         }
         Cmd::Validator { cmd } => validator_cli::run(cmd),
+        Cmd::Genesis { cmd } => genesis_builder::run(cmd),
         Cmd::Hunt { cmd } => contrib_cli::hunt(cmd, &blockula_dir()),
         Cmd::Contrib { cmd } => contrib_cli::contrib(cmd, &blockula_dir()),
         Cmd::Keygen => {

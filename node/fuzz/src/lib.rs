@@ -19,6 +19,7 @@ mod node_src {
     pub mod crypto;
     pub mod econ;
     pub mod epochs;
+    pub mod genesis_builder;
     pub mod github;
     pub mod governance;
     pub mod node;

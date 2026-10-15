@@ -1,0 +1,121 @@
+# Example genesis spec: the DEC-5 allocation (docs/TOKENOMICS.md) on a throwaway chain.
+#
+#   blockula genesis build --spec deploy/mainnet/genesis-spec.example.toml --out genesis.json
+#
+# The real one is genesis/blockula-1/spec.toml, reviewed and frozen as docs/GENESIS_CEREMONY.md
+# describes. Every builder must get the same genesis.json (byte for byte) and genesis hash from
+# the same spec and binary. Addresses marked PLACEHOLDER are keyless stand-ins that the ceremony
+# replaces with the recipients' real accounts; the operators (operators/*.toml) use throwaway keys.
+#
+# With 4 operators this dry run breaks the mainnet policy on purpose, so the build prints
+# warnings: fewer than 22 operators (DEC-3), the two foundation seats share a provider and an ASN
+# (Fly regions count as one failure domain), and with fewer than 7 operators any facility holds
+# more than 15% of the set (DEC-14). `strict = true` (always on for blockula-1) refuses them.
+
+chain_id = "blockula-dryrun-1"
+address_prefix = "tboo"
+# UTC milliseconds, fixed in the spec (2027-01-01T00:00:00Z), never "now".
+genesis_time_ms = 1798761600000
+block_time_ms = 1000
+epoch_blocks = 3600
+faucet = false
+validator_admins = []
+# FANG. The allocations below must add up to exactly this.
+total_supply = "1000000000"
+strict = false
+
+operators = [
+  "operators/example-1.toml",
+  "operators/example-2.toml",
+  "operators/example-3.toml",
+  "operators/example-4.toml",
+]
+
+# Names nobody can register (DEC-11); governance may assign them later.
+reserved_names = ["blockula", "boo", "foundation", "treasury", "community", "validator", "admin", "support", "security", "official"]
+
+# Features on from genesis. Ghost Mode ships off (DEC-2).
+features = []
+
+# Governance parameters (node/src/params.rs) that differ from their defaults, as numbers or
+# strings. The defaults are mainnet's: 31 validators, 2 MiB blocks, 6% issuance falling 15% a year
+# to 1.5%, a 0.1 FANG account creation fee, one-year names…
+[params]
+# max_validators = 31
+
+# ---- DEC-5. Each allocation names its bucket; the builder gives it the bucket's vesting curve
+# (in blocks at block_time_ms) and, for keyless buckets, their system account. Each bucket must
+# hold exactly its share.
+
+# 32%: community distributions (keyless; criteria announced only after mainnet works).
+[[allocation]]
+bucket = "community"
+amount = "320000000"
+
+# 25%: the treasury (keyless; unlocks over 4 years; only TreasurySpend moves it).
+[[allocation]]
+bucket = "treasury"
+amount = "250000000"
+
+# 15%: the contribution endowment (keyless; streams into the pool over 10 years).
+[[allocation]]
+bucket = "endowment"
+amount = "150000000"
+
+# 10%: the validator bootstrap delegation (keyless; delegated by formula).
+[[allocation]]
+bucket = "bootstrap"
+amount = "100000000"
+
+# 10%: the founder (1-year cliff, 4-year vest). PLACEHOLDER: the founder's account.
+[[allocation]]
+bucket = "founder"
+address = "tboo10une7t3u48xlwqpcskt47gsm5mzvcxennfwnf856perxhv5pvchqww54jr"
+amount = "100000000"
+label = "founder"
+
+# 5%: the foundation's multisig (4-year vest). PLACEHOLDER: the multisig account.
+[[allocation]]
+bucket = "foundation"
+address = "tboo17uy3u8lrkprha85mdqegae0r0vfudm40ntapc4hxw9yspdt6wc0qmendfx"
+amount = "50000000"
+label = "foundation"
+
+# 3%: genesis operators and security grants (6-month cliff, 2-year vest). Each operator's
+# self-bond comes out of its own allocation (locked tokens can be bonded).
+[[allocation]]
+bucket = "operators"
+address = "tboo1nrums87rrekxgpyglfxme94vsxp3fccazza7k3ynm9apksl08sfqhn7kd5"
+amount = "1000000"
+label = "genesis operator: Foundation validator A"
+
+[[allocation]]
+bucket = "operators"
+address = "tboo1ysrdknzd3l5yd6z4m5m8suvvnaxrfzp353g704cvhrnt6hcvj6vs5q7axy"
+amount = "1000000"
+label = "genesis operator: Foundation validator B"
+
+[[allocation]]
+bucket = "operators"
+address = "tboo1r4lmujqn2wqlm60tj6jwkyr8hvxdlmvlmw0p8x4rmuy8f7jphtcqysz4v6"
+amount = "1000000"
+label = "genesis operator: Example Validators GmbH"
+
+[[allocation]]
+bucket = "operators"
+address = "tboo1q6788utvxgxlnka23vufu6rfh0mvya29vn8wyy3r4rfmvau4nn0qklfrt3"
+amount = "1000000"
+label = "genesis operator: Example Staking Ltd"
+
+# PLACEHOLDER: security grants (auditors who accept FANG), one allocation per recipient.
+[[allocation]]
+bucket = "operators"
+address = "tboo1yvjkg24e34v6m3aglt922un8ge32k4zk4jtda5mnh255xfut3mrs5v4d95"
+amount = "26000000"
+label = "security grants"
+
+# ---- The Soul ledger (MAINNET-DESIGN 3.5): published contributors' starting Soul, if any.
+# [[soul]]
+# account = "tboo1…"
+# soul = "12.5"
+# reason = "testnet contributor"
