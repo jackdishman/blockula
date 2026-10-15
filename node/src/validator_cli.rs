@@ -167,7 +167,7 @@ pub(crate) async fn send_memo(rpc: &str, keys: &Keys, from: &str, action: Action
     // The highest base fee fixed for the next blocks (`/api/fees`); only the actual one is charged.
     let fees = get(rpc, "/fees").await?;
     let part = |k: &str| fees["suggested"][k].as_str().and_then(|v| v.parse().ok()).ok_or_else(|| anyhow!("{rpc}/api/fees has no suggested {k}"));
-    tx.fee = crate::econ::FeeSlot { flat: part("flat")?, rate: part("rate")?, max_block_bytes: 0 }.fee(tx.size());
+    tx.fee = crate::econ::FeeSlot::pricing(part("flat")?, part("rate")?).fee(tx.size());
     let tx = tx.sign(keys);
     let res = reqwest::Client::new().post(format!("{}/api/tx", rpc.trim_end_matches('/'))).json(&tx).send().await?;
     let ok = res.status().is_success();

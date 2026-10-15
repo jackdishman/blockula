@@ -24,8 +24,9 @@ use std::io::{Read, Write};
 /// without a bond, statuses candidate/active/removed/tombstoned), governance (its records and
 /// `multisig_expiry_blocks`), the randomness beacon (its rounds, values and revert attestations;
 /// the PoC scalars lose the block-hash seed) and Ghost Mode (namespaces 48–52, the `ghost` scalar
-/// record, `ghost_anchor_window` and `ghost_verify_fee`).
-pub const SCHEMA_VERSION: u32 = 4;
+/// record, `ghost_anchor_window` and `ghost_verify_fee`). 5: the fee ring's slots also fix Ghost
+/// Mode's per-block limits (`econ::FeeSlot`), so they're known `FEE_LAG` blocks ahead.
+pub const SCHEMA_VERSION: u32 = 5;
 
 pub fn encode<T: BorshSerialize + ?Sized>(v: &T) -> Vec<u8> {
     borsh::to_vec(v).expect("encoding to memory can't fail")

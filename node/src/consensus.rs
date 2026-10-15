@@ -371,9 +371,10 @@ where
         // This height's base fee and size limit are fixed once `height − FEE_LAG` has executed
         // (econ.rs). Further behind than that we can't price txs, so the block stays empty
         // (verifiers refuse txs in a block whose cited state can't price them).
-        let limit = crate::econ::slot(&tip.state, height).map_or(0, |s| s.max_block_bytes as usize);
-        // Ghost txs' own size limits, from the executed state as verifiers read them.
-        let mut ghost = crate::ghost::BlockBudget::new(&tip.state.chain_params);
+        let slot = crate::econ::slot(&tip.state, height);
+        let limit = slot.map_or(0, |s| s.max_block_bytes as usize);
+        // Ghost txs' own size limits, fixed in the same slot.
+        let mut ghost = crate::ghost::BlockBudget::new(slot.as_ref());
         let Some(mut state) = replay(tip, &parent, pending.clone()) else {
             warn!(height, "the parent doesn't extend our finalized chain; not proposing");
             return None;
@@ -485,22 +486,19 @@ where
         if checkpoint.is_some_and(|cp| block.exec_height != cp) {
             return reject("checkpoint-certifying block must carry the checkpoint's exec_height");
         }
-        let (chain_id, genesis_hash, mut ghost) = {
+        let (chain_id, genesis_hash) = {
             let c = self.chain.lock();
             // Our executed height only grows, so this stays true once it is.
             if block.exec_height + MAX_EXEC_LAG < c.height().min(parent.height) {
                 return reject("exec_height too far behind");
             }
-            (c.genesis.chain_id.clone(), c.genesis_hash.clone(), crate::ghost::BlockBudget::new(&c.state.chain_params))
+            (c.genesis.chain_id.clone(), c.genesis_hash.clone())
         };
         // Txs need a cited state that fixed this height's base fee (econ.rs): the proposer could
         // price them, and we can check them once we've executed it.
         if !block.txs.is_empty() && block.exec_height + crate::econ::FEE_LAG < block.height {
             return reject("txs in a block whose cited state can't price them");
         }
-        // Tx checks (signatures and ghost proofs included) run without holding the chain lock. The
-        // validity window's upper bound is a governance parameter, so the replay below checks it
-        // on the parent's state; expiry doesn't depend on any state.
         let mut seen = std::collections::HashSet::new();
         let mut txs = Vec::with_capacity(block.txs.len());
         for raw in &block.txs {
@@ -508,15 +506,36 @@ where
             if !seen.insert(tx.id()) {
                 return reject("duplicate tx");
             }
-            if let Err(e) = ghost.take(&tx, raw.len()) {
-                warn!(error = %e, "ghost txs over the block's limits");
-                return reject("ghost txs over the size limits");
+            txs.push(tx);
+        }
+        // Ghost txs' size limits come from this height's fee slot, fixed once `height − FEE_LAG`
+        // executed (the same for every verifier, whatever parameter change executes after it), and
+        // are checked before any proof is.
+        if !txs.is_empty() {
+            wait_executed(&ctx, &self.chain, block.height.saturating_sub(crate::econ::FEE_LAG), None).await;
+            let slot = {
+                let c = self.chain.lock();
+                (c.height() < block.height).then(|| crate::econ::slot(&c.state, block.height)).flatten()
+            };
+            // Executed past this height already: whether it's the finalized block decides below.
+            if let Some(slot) = slot {
+                let mut ghost = crate::ghost::BlockBudget::new(Some(&slot));
+                for (tx, raw) in txs.iter().zip(&block.txs) {
+                    if let Err(e) = ghost.take(tx, raw.len()) {
+                        warn!(error = %e, "ghost txs over the block's limits");
+                        return reject("ghost txs over the size limits");
+                    }
+                }
             }
-            if let Err(e) = check_tx_stateless(&tx, &chain_id, &genesis_hash, &self.address_prefix).and_then(|_| crate::chain::check_validity(&tx, block.height, u64::MAX)) {
+        }
+        // Tx checks (signatures and ghost proofs included) run without holding the chain lock. The
+        // validity window's upper bound is a governance parameter, so the replay below checks it
+        // on the parent's state; expiry doesn't depend on any state.
+        for tx in &txs {
+            if let Err(e) = check_tx_stateless(tx, &chain_id, &genesis_hash, &self.address_prefix).and_then(|_| crate::chain::check_validity(tx, block.height, u64::MAX)) {
                 warn!(error = %e, "bad tx in block");
                 return reject("invalid tx");
             }
-            txs.push(tx);
         }
         // The cited state root, once we've executed that height ourselves (until then the
         // verdict can still change, so we wait).
@@ -1308,9 +1327,9 @@ pub fn simplex_partition(prefix: &str, epoch: u64) -> String {
 pub const MARSHAL_RETAIN: u64 = 2_000;
 /// Bumped when the on-disk storage layout changes (consensus journals, or the home's own files:
 /// v4 is the segmented block logs and the state database, see `store.rs`; v5 the integrated
-/// protocol v1: txs signed for a genesis hash, state schema 4, block metadata with signals). Dev
-/// chains from an older layout reset themselves (`node::dev_is_stale`).
-pub const STORAGE_VERSION: &str = "prunable-v5";
+/// protocol v1: txs signed for a genesis hash, state schema 4, block metadata with signals; v6
+/// state schema 5). Dev chains from an older layout reset themselves (`node::dev_is_stale`).
+pub const STORAGE_VERSION: &str = "prunable-v6";
 
 fn archive_config<C>(prefix: &str, name: &str, page_cache: CacheRef, codec_config: C) -> prunable::Config<TwoCap, C> {
     prunable::Config {
@@ -1456,7 +1475,7 @@ mod tests {
         let mut tampered = good.clone();
         tampered.fee += 1;
         check_tx_stateless(&good, "gv", &genesis_hash, "boo").unwrap();
-        let mut budget = crate::ghost::BlockBudget::new(&chain.lock().state.chain_params);
+        let mut budget = crate::ghost::BlockBudget::new(crate::econ::slot(&chain.lock().state, 1).as_ref());
         budget.take(&good, good.size() as usize).unwrap();
         assert!(budget.take(&other, other.size() as usize).is_err(), "two ~131 KiB ghost txs are over ghost_max_block_bytes");
         deterministic::Runner::timed(Duration::from_secs(60)).start(|context| async move {

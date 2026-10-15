@@ -1074,7 +1074,7 @@ async fn fees(State(n): State<Node>) -> ApiResult {
     let v = n.live.view();
     let st = &v.state;
     let cp = &st.chain_params;
-    let slot = |h: u64, s: &crate::econ::FeeSlot| json!({ "height": h, "flat": s.flat.to_string(), "rate": s.rate.to_string(), "max_block_bytes": s.max_block_bytes });
+    let slot = |h: u64, s: &crate::econ::FeeSlot| json!({ "height": h, "flat": s.flat.to_string(), "rate": s.rate.to_string(), "max_block_bytes": s.max_block_bytes, "ghost_max_tx_bytes": s.ghost_max_tx_bytes, "ghost_max_block_bytes": s.ghost_max_block_bytes });
     let slots: Vec<Value> = st.econ.fees.iter().enumerate().map(|(i, s)| slot(st.econ.height + i as u64, s)).collect();
     let s = crate::econ::suggested(st);
     Ok(Json(json!({
