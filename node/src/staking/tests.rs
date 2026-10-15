@@ -334,10 +334,16 @@ fn delegate_undelegate_and_withdraw() {
     t.ok(&alice, Action::Undelegate { validator: v.clone(), shares: 200 * FANG });
     let started = t.height;
     assert_eq!(holdings(&t.st, &a), (300 * FANG + 1, 200 * FANG));
-    assert!(t.fails(&alice, Action::WithdrawUnbonded {}).contains(&format!("released at block {}", started + 100)));
-    while t.height < started + 100 {
+    // 100 blocks of unbonding, stretched to when evidence against epoch 0 stops being accepted
+    // (10 epochs back: through epoch 10, which ends at block 109).
+    let release = (started + 100).max(110);
+    assert_eq!(release, 110);
+    assert!(t.fails(&alice, Action::WithdrawUnbonded {}).contains(&format!("released at block {release}")));
+    while t.height < release - 1 {
         t.block();
     }
+    assert!(t.fails(&alice, Action::WithdrawUnbonded {}).contains("released at block"));
+    t.block();
     let before = t.balance(&a);
     let withdraw = t.tx_from(&alice, &a, Action::WithdrawUnbonded {});
     assert_eq!(t.apply(&withdraw).unwrap(), Outcome::Applied);

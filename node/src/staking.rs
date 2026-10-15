@@ -23,6 +23,9 @@
 //! may still pin a validator (`ApproveValidator`: ranked ahead of stake) or remove one
 //! (`RemoveValidator`); elsewhere both are refused.
 //!
+//! Unbonding lasts `unbonding_blocks`, stretched (by at most an epoch) so that it never ends
+//! before evidence against the epoch it began in stops being accepted.
+//!
 //! **Slashing.** `ReportEquivocation` carries simplex's own evidence (an encoded
 //! `ConflictingNotarize`, `ConflictingFinalize` or `NullifyFinalize` activity), verified against
 //! that epoch's set and namespace ([`verify_evidence`]). The pool loses `slash_double_sign_bps`
@@ -537,6 +540,15 @@ fn lock_gains(state: &mut State, j: &mut Journal, account: &str, gain: u64, heig
     }
 }
 
+/// When stake leaving at `height` is free: after `unbonding_blocks`, and never before evidence
+/// against the epoch it left in can no longer arrive (it answers for that epoch's faults: at
+/// most one more epoch, since `evidence_max_age_epochs` epochs fit in the unbonding period).
+fn release_height(state: &State, height: u64) -> u64 {
+    let e = state.params.epoch_blocks.max(2);
+    let window_closes = (state.params.epoch_of(height).saturating_add(state.chain_params.evidence_max_age_epochs).saturating_add(1)).saturating_mul(e);
+    height.saturating_add(state.chain_params.unbonding_blocks).max(window_closes)
+}
+
 fn entries_of<'s>(state: &'s State, delegator: &str) -> impl Iterator<Item = (&'s String, &'s Entry)> + 's {
     owned_by(&state.staking.entries, delegator)
 }
@@ -568,7 +580,7 @@ pub(crate) fn apply(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, s
             let (value, principal) = unbond(state, j, sender, validator, *shares as u128)?;
             lock_gains(state, j, sender, value.saturating_sub(principal), height);
             if value > 0 {
-                let release_at = height.saturating_add(state.chain_params.unbonding_blocks);
+                let release_at = release_height(state, height);
                 add_entry(state, j, sender, Entry::Unbonding { validator: validator.clone(), amount: value, started_at: height, release_at });
             }
             Ok(())
@@ -588,7 +600,7 @@ pub(crate) fn apply(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, s
             }
             bond(state, j, sender, to, value, principal)?;
             check_insider_cap(state, sender, to, height)?;
-            let release_at = height.saturating_add(state.chain_params.unbonding_blocks);
+            let release_at = release_height(state, height);
             add_entry(state, j, sender, Entry::Redelegation { from: from.clone(), to: to.clone(), amount: value, started_at: height, release_at });
             Ok(())
         }
