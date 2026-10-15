@@ -428,7 +428,8 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
   - npm uses trusted publishing with provenance and 2FA, and crypto dependencies use exact versions.
   - CI runs dependency audits, with Renovate or Dependabot.
 - **Effort:** M. **Who:** Team.
-- ✅ **Wave 1:** pinned toolchain (1.98.1), images by digest and actions by SHA with least-privilege tokens (`scripts/check-pins.sh` in CI), reproducible release builds with an in-CI reproducer, SLSA provenance, an offline ML-DSA release signature that `install.sh` verifies, npm trusted publishing, exact crypto pins, cargo-deny, npm audit, Dependabot. Pending: independent builders reproducing a real release, and `install_node` (MCP) checking the signature.
+- ✅ **Wave 1:** pinned toolchain (1.98.1), images by digest and actions by SHA with least-privilege tokens (`scripts/check-pins.sh` in CI), reproducible release builds with an in-CI reproducer, SLSA provenance, an offline ML-DSA release signature that `install.sh` verifies, npm trusted publishing, exact crypto pins, cargo-deny, npm audit, Dependabot. Pending: independent builders reproducing a real release.
+- ✅ **Wave 3 (P-CLIENTS):** the MCP's `install_node` runs the same checks as `install.sh`: checksum, provenance with a logged-in `gh`, and the release signature through the SDK (`verifyReleaseSignature`, same known-answer vector as `scripts/release-sig.mjs`); `BLOCKULA_REQUIRE_VERIFY=1` refuses checksum-only installs.
 
 ### Wallets & clients
 
@@ -477,7 +478,8 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
   - Every screen shows the network.
   - A distinct testnet address prefix has been decided (DEC-7).
 - **Effort:** S–M. **Who:** Team, Operators.
-- ✅ **Wave 1:** the wallet pins chain id, genesis hash and prefix per network and stamps the network on every screen; addresses carry the chain's prefix (`boo`/`tboo`, enforced at admission). Pending: the MCP's network handling, 3 mainnet RPC operators.
+- ✅ **Wave 1:** the wallet pins chain id, genesis hash and prefix per network and stamps the network on every screen; addresses carry the chain's prefix (`boo`/`tboo`, enforced at admission).
+- ✅ **Wave 3 (P-CLIENTS):** the MCP takes its network only from its configuration (`--network`, `BLOCKULA_RPC`; it never probes localhost and no tool switches it), pins chain id and genesis hash (a built-in table, `BLOCKULA_CHAIN_ID`/`BLOCKULA_GENESIS_HASH`, else trust on first use remembered in `known-chains.json`) and refuses mismatches before signing (`mcp/src/network.ts`, tested against the built server). The SDK `Client` takes the same pins. Light clients: `sdk-ts/src/proof.ts` ports `state::tree::verify` (checked against vectors the node writes and a live `/api/proof`), and `provenAccount`/`provenName` require independent nodes (`witnesses`) to agree on the state root. `blockula wallet new` prints the network's prefix. Pending: 3 mainnet RPC operators; `blockula-1`'s genesis hash in the MCP's and wallet's tables after the ceremony; roots certified by a finalization certificate rather than by witnesses.
 
 ✅ **WAL-5. Signed txs never expire.**
 - **Missing:** a tx has no validity window (`types.rs:179-194`). The mempool drops a tx after 600 blocks, and `/api/tx` then reports it as "failed … expired" (`chain.rs:1888-1890`). But the signed tx stays valid until its nonce is used, so anyone who saw it can submit it later.
