@@ -1,15 +1,22 @@
-//! GitHub facts, fetched off-chain: gists (prove a handle ↔ account link) and pull requests
-//! (prove a claim, or pick a hunt's winner). Only ever calls api.github.com, with path segments
-//! the chain already validated, and caps response sizes. `GITHUB_TOKEN` raises rate limits.
+//! GitHub facts, fetched off-chain: gists (prove a handle ↔ account link), pull requests (prove a
+//! claim, or pick a hunt's winner) and reverts (undo a claim, beacon.rs). Only ever calls
+//! api.github.com, with path segments the chain already validated, and caps response sizes.
+//! `GITHUB_TOKEN` raises rate limits.
 
 use anyhow::{bail, Result};
 use serde_json::Value;
 use std::time::Duration;
 
 pub const GITHUB_MAX_BYTES: usize = 1 << 20;
+/// Lists (commits, pull requests) are bigger: a page of 100 PRs runs to a few MB.
+pub const GITHUB_MAX_LIST_BYTES: usize = 8 << 20;
 
 /// `Ok(None)` when GitHub says it doesn't exist (a definite answer, unlike errors).
 async fn get_json(path: &str) -> Result<Option<Value>> {
+    get_json_capped(path, GITHUB_MAX_BYTES).await
+}
+
+async fn get_json_capped(path: &str, cap: usize) -> Result<Option<Value>> {
     let client = reqwest::Client::builder().timeout(Duration::from_secs(8)).redirect(reqwest::redirect::Policy::none()).user_agent("blockula-node").build()?;
     let mut req = client.get(format!("https://api.github.com{path}")).header("accept", "application/vnd.github+json");
     if let Ok(token) = std::env::var("GITHUB_TOKEN") {
@@ -25,7 +32,7 @@ async fn get_json(path: &str) -> Result<Option<Value>> {
     let mut body = vec![];
     while let Some(chunk) = res.chunk().await? {
         body.extend_from_slice(&chunk);
-        if body.len() > GITHUB_MAX_BYTES {
+        if body.len() > cap {
             bail!("GitHub response too large");
         }
     }
@@ -46,9 +53,12 @@ pub async fn fetch_gist(gist_id: &str) -> Result<Option<(String, Vec<String>)>> 
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PullRequest {
+    pub number: u64,
     /// "open" or "closed".
     pub state: String,
     pub merged: bool,
+    /// ISO 8601 (`2026-10-12T09:00:00Z`), empty if unmerged.
+    pub merged_at: String,
     pub merge_sha: Option<String>,
     pub author: String,
     /// `owner/name` of the repo it was merged into.
@@ -64,8 +74,10 @@ pub struct PullRequest {
 pub fn parse_pr(v: &Value) -> PullRequest {
     let s = |v: &Value| v.as_str().unwrap_or_default().to_string();
     PullRequest {
+        number: v["number"].as_u64().unwrap_or(0),
         state: s(&v["state"]),
         merged: v["merged"].as_bool().unwrap_or(false) || !v["merged_at"].is_null(),
+        merged_at: s(&v["merged_at"]),
         merge_sha: v["merge_commit_sha"].as_str().filter(|h| h.len() == 40 && h.bytes().all(|b| b.is_ascii_hexdigit())).map(|h| h.to_ascii_lowercase()),
         author: s(&v["user"]["login"]),
         base_repo: s(&v["base"]["repo"]["full_name"]),
@@ -134,6 +146,101 @@ pub async fn check_claim(handle: &str, repo: &str, pr: u64, account: &str, gist_
         (_, None) => Verdict::Refuted(format!("@{handle}'s linked gist doesn't exist")),
         (Some(p), Some(g)) => verdict(handle, repo, account, &p, &g),
     })
+}
+
+// ------------------------------------------------------------------------------------ reverts
+
+/// A commit as `GET /repos/{repo}/commits` lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Commit {
+    pub sha: String,
+    pub message: String,
+}
+
+fn is_sha(h: &str) -> bool {
+    h.len() == 40 && h.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// A commit list (entries without a 40-hex sha are skipped).
+pub fn parse_commits(v: &Value) -> Vec<Commit> {
+    let list = v.as_array().map(Vec::as_slice).unwrap_or_default();
+    list.iter().filter_map(|c| Some(Commit { sha: c["sha"].as_str().filter(|h| is_sha(h))?.to_ascii_lowercase(), message: c["commit"]["message"].as_str().unwrap_or_default().to_string() })).collect()
+}
+
+/// A pull request list (`GET /repos/{repo}/pulls`).
+pub fn parse_pulls(v: &Value) -> Vec<PullRequest> {
+    v.as_array().map(|a| a.iter().map(parse_pr).collect()).unwrap_or_default()
+}
+
+/// What undid a merged PR.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Revert {
+    /// The commit validators attest (`AttestRevert::revert_sha`).
+    pub sha: String,
+    /// How it was found (logs).
+    pub how: String,
+}
+
+/// Whether `text` refers to PR `pr` of `repo`: `#123` (bare or as `owner/repo#123`) or its URL,
+/// never `#1234` or another repo's `#123`.
+pub fn references_pr(text: &str, repo: &str, pr: u64) -> bool {
+    let (text, repo, num) = (text.to_ascii_lowercase(), repo.to_ascii_lowercase(), pr.to_string());
+    let ends = |rest: &str| !rest.starts_with(|c: char| c.is_ascii_alphanumeric());
+    let bare = text.match_indices(&format!("#{num}")).any(|(i, m)| {
+        let owner = text[..i].rsplit(|c: char| c.is_whitespace() || "([{,;:\"'".contains(c)).next().unwrap_or_default();
+        ends(&text[i + m.len()..]) && (owner.is_empty() || owner == repo)
+    });
+    bare || text.match_indices(&format!("github.com/{repo}/pull/{num}")).any(|(i, m)| ends(&text[i + m.len()..]))
+}
+
+/// The revert of PR `pr` (merged into `repo` as `merge_sha`), if `commits` (the default branch
+/// since the merge, newest first as GitHub lists them) or `pulls` (recently closed PRs) hold
+/// one. Validators must name the same commit, so it's always the oldest of the first rule that
+/// matches:
+/// 1. a commit whose message reverts `merge_sha` (`git revert` writes "This reverts commit
+///    <sha>."; a revert PR merged with a merge commit brings that commit along);
+/// 2. a PR merged into the default branch, titled "Revert …", whose body references the PR
+///    (GitHub's revert button writes "Reverts owner/repo#123"): its merge commit.
+pub fn find_revert_in(repo: &str, pr: u64, merge_sha: &str, commits: &[Commit], pulls: &[PullRequest]) -> Option<Revert> {
+    let merge_sha = merge_sha.to_ascii_lowercase();
+    let by_commit = commits.iter().rev().find(|c| {
+        let m = c.message.to_ascii_lowercase();
+        c.sha != merge_sha && m.contains("revert") && m.contains(&merge_sha)
+    });
+    if let Some(c) = by_commit {
+        return Some(Revert { sha: c.sha.clone(), how: format!("commit {} reverts {}", &c.sha[..12], &merge_sha[..12.min(merge_sha.len())]) });
+    }
+    pulls
+        .iter()
+        .filter(|p| p.merged && p.number != pr && p.on_default_branch() && p.base_repo.eq_ignore_ascii_case(repo) && p.title.trim_start().to_ascii_lowercase().starts_with("revert") && references_pr(&p.body, repo, pr))
+        .filter_map(|p| Some((p.merged_at.clone(), p.number, p.merge_sha.clone()?)))
+        .min()
+        .map(|(_, number, sha)| Revert { how: format!("{repo}#{number} reverts #{pr}, merged as {}", &sha[..12]), sha })
+}
+
+/// Most pages of commits since the merge a revert check reads (100 each).
+pub const REVERT_COMMIT_PAGES: u32 = 10;
+
+/// Looks for a revert of a claim's PR on GitHub (see [`find_revert_in`]). `Err`: couldn't tell
+/// (GitHub unreachable, the PR gone or never merged).
+pub async fn find_revert(repo: &str, pr: u64, merge_sha: &str) -> Result<Option<Revert>> {
+    let Some(p) = fetch_pr(repo, pr).await? else { bail!("{repo}#{pr} doesn't exist") };
+    // Goes into a query string: GitHub's own timestamp format only.
+    if p.merged_at.len() != 20 || !p.merged_at.bytes().all(|b| b.is_ascii_digit() || b"-:TZ".contains(&b)) {
+        bail!("{repo}#{pr} has no merge time");
+    }
+    let mut commits = vec![];
+    for page in 1..=REVERT_COMMIT_PAGES {
+        let Some(v) = get_json_capped(&format!("/repos/{repo}/commits?since={}&per_page=100&page={page}", p.merged_at), GITHUB_MAX_LIST_BYTES).await? else { break };
+        let batch = parse_commits(&v);
+        let full = v.as_array().is_some_and(|a| a.len() == 100);
+        commits.extend(batch);
+        if !full {
+            break;
+        }
+    }
+    let pulls = get_json_capped(&format!("/repos/{repo}/pulls?state=closed&sort=updated&direction=desc&per_page=100"), GITHUB_MAX_LIST_BYTES).await?.map(|v| parse_pulls(&v)).unwrap_or_default();
+    Ok(find_revert_in(repo, pr, merge_sha, &commits, &pulls))
 }
 
 #[cfg(test)]

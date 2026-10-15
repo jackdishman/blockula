@@ -367,7 +367,7 @@ fn namespaces_and_meta_keys_are_unique() {
         (ns::GOV_DISTRIBUTION_CLAIMS, 37..=42),
         (ns::RESERVED_NAMES, 43..=43),
         (ns::BEACON_COMMITS, 44..=46),
-        (ns::BEACON_REVEALS, 44..=46),
+        (ns::BEACON_REVERTS, 44..=46),
         (ns::BEACON_VALUES, 44..=46),
         (ns::FEATURES, 47..=47),
     ];

@@ -625,6 +625,30 @@ pub fn keys_of<'a>(hex_keys: impl Iterator<Item = &'a str>) -> Option<Set<Public
     Set::try_from(keys?).ok()
 }
 
+/// An epoch's leader election (SF-1): simplex's round robin over the epoch's sorted set, its
+/// order shuffled by `seed` (`beacon::elector_seed`). Without a seed it's the plain rotation,
+/// `sorted_set[(epoch + view) mod n]`. The shuffle is Commonware's (sorting indices by
+/// BLAKE3(seed ‖ index)), so it is part of the consensus rules at the pinned version.
+pub fn elector(seed: Option<[u8; 32]>) -> RoundRobin<Blake3> {
+    match seed {
+        Some(seed) => RoundRobin::shuffled(&seed),
+        None => RoundRobin::default(),
+    }
+}
+
+/// The address of the leader of `view` in `epoch`, as consensus elects it: the epoch's set and
+/// beacon from `state`. Downtime accounting (missed leader slots, MAINNET-DESIGN 3.4) must use
+/// this, so it charges the validators simplex actually waited for. `None`: no set for `epoch`.
+#[cfg_attr(not(test), allow(dead_code))] // staking.rs (P-STAKE)
+pub fn leader(state: &crate::chain::State, epoch: u64, view: u64) -> Option<String> {
+    use commonware_consensus::simplex::elector::{Config, Elector};
+    use commonware_consensus::types::{Round, View};
+    let set = keys_of(state.active_set(epoch)?.iter().map(|v| v.consensus_key.as_str()))?;
+    let e = <RoundRobin<Blake3> as Config<MlDsaScheme>>::build(elector(crate::beacon::elector_seed(state, epoch)), &set);
+    let idx = Elector::<MlDsaScheme>::elect(&e, Round::new(Epoch::new(epoch), View::new(view)), None);
+    Some(set.get(idx.get() as usize)?.address(state.params.prefix()))
+}
+
 impl certificate::Provider for EpochProvider {
     type Scope = Epoch;
     type Scheme = MlDsaScheme;
@@ -831,11 +855,13 @@ where
                 Digest(hex_32(&c.hash_at(h).unwrap_or_default()))
             };
             let voting = scheme.me().is_some();
+            // SF-1: the leader order is a permutation seeded from this epoch's beacon.
+            let seed = crate::beacon::elector_seed(&chain.lock().state, epoch);
             let engine = simplex::Engine::new(
                 context.child("simplex").with_attribute("epoch", epoch),
                 simplex::config::Config {
                     scheme: scheme.as_ref().clone(),
-                    elector: RoundRobin::<Blake3>::default(),
+                    elector: elector(seed),
                     blocker: blocker.clone(),
                     automaton: app.clone(),
                     relay: app.clone(),

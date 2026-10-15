@@ -98,6 +98,20 @@ pub fn fmt_bps(bps: u64) -> String {
     if frac == 0 { whole.to_string() } else { format!("{whole}.{}", format!("{frac:02}").trim_end_matches('0')) }
 }
 
+// STUB(owner P-STAKE): replaced at merge. The active validator of `epoch` that `account`
+// controls: itself when it's in that epoch's set, otherwise the first member it owns.
+pub fn validator_for_signer(state: &State, account: &str, _signer_key_id: &str, epoch: u64) -> Option<String> {
+    let set = state.active_sets.get(&epoch)?;
+    if set.iter().any(|v| v == account) {
+        return Some(account.to_string());
+    }
+    set.iter().find(|v| state.validators.get(*v).is_some_and(|r| r.owner == account)).cloned()
+}
+
+// STUB(owner P-STAKE): replaced at merge. Jailing (and its slash) lands with P-STAKE; until then
+// it does nothing.
+pub fn jail(_state: &mut State, _j: &mut Journal, _validator: &str, _height: u64, _slash_bps: u64, _reason: &str) {}
+
 #[cfg(test)]
 mod tests {
     #[test]

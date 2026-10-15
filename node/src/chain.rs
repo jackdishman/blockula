@@ -345,6 +345,7 @@ impl Genesis {
         for f in &self.features {
             state.upgrade.features.insert(f.clone(), crate::upgrade::Feature { activated_at: 0 });
         }
+        crate::beacon::init_genesis(&mut state, &self.chain_id, self.created_at_ms);
         state.commit_block().expect("an in-memory tree can't fail");
         state
     }
@@ -817,19 +818,20 @@ impl State {
     /// The end-of-block steps, after a block's txs. Execution and replay both run exactly this,
     /// in this order (the modules' hooks are no-ops until their packages land):
     ///
-    /// 1. `poc_end_block`: the PoC seed, Séances closing and opening.
+    /// 1. `poc_end_block`: Séances closing, and opening on their epoch-boundary cadence.
     /// 2. `econ::end_block`: the base fee for a later block (3.6).
     /// 3. `staking::end_block`: missed leader slots from `view`/`parent_view` (downtime), and the
     ///    proposer's charge for the `skipped` txs (junk, 3.4).
     /// 4. `governance::end_block`: proposals whose voting ended or whose timelock is over.
     /// 5. At an epoch boundary: `econ::issue` (rewards into the pools), `staking::end_epoch`
-    ///    (jailing, the next set by stake), `beacon::end_epoch`, then [`State::end_epoch`] (the
-    ///    set history and the legacy admin-approved set).
+    ///    (jailing, the next set by stake), `beacon::end_epoch` (the next epoch's beacon value,
+    ///    jailing non-revealers), then [`State::end_epoch`] (the set history and the legacy
+    ///    admin-approved set).
     ///
     /// Then the caller commits the block and, last, runs `upgrade::check_next(height + 1)`, which
     /// stops the node before a height its binary can't execute (3.9).
     pub fn end_block(&mut self, b: &BlockInfo) {
-        self.poc_end_block(b.height, b.hash);
+        self.poc_end_block(b.height);
         crate::econ::end_block(self, b);
         crate::staking::end_block(self, b);
         crate::governance::end_block(self, b);

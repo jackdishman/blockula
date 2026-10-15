@@ -73,9 +73,10 @@ pub mod ns {
     pub const GOV_DISTRIBUTION_CLAIMS: u8 = 42;
     /// econ.rs (P-ECON): 43, the genesis reserved-name list.
     pub const RESERVED_NAMES: u8 = 43;
-    /// beacon.rs (P-BEACON): 44–46.
+    /// beacon.rs (P-BEACON): 44–46. Commitments and reveals share a record per epoch (44); 45
+    /// holds validators' revert attestations on contribution claims.
     pub const BEACON_COMMITS: u8 = 44;
-    pub const BEACON_REVEALS: u8 = 45;
+    pub const BEACON_REVERTS: u8 = 45;
     pub const BEACON_VALUES: u8 = 46;
     /// upgrade.rs (P-UPGRADE): 47, the active feature flags.
     pub const FEATURES: u8 = 47;
@@ -89,7 +90,7 @@ pub mod meta {
     pub const NEXT_HUNT_ID: &[u8] = b"next_hunt_id";
     /// Genesis constants (`chain::Params`).
     pub const PARAMS: &[u8] = b"params";
-    /// `(next_claim_id, next_seance_id, next_grant_id, seed, open_seance, next_seance_at)`.
+    /// `(next_claim_id, next_seance_id, next_grant_id, open_seance, next_seance_at)`.
     pub const POC: &[u8] = b"poc";
     pub const SCHEMA: &[u8] = b"schema";
     pub const SUPPLY: &[u8] = b"supply";
@@ -199,7 +200,7 @@ impl State {
     /// scalar that `meta_records` covers, so nothing escapes the root.
     fn tables(&self) -> Vec<(u8, &dyn Table)> {
         let State { accounts, names, supply: _, burned: _, validators, active_sets, params: _, chain_params: _, hunts, next_hunt_id: _, github, github_by_account, familiars, poc, staking, governance, econ, beacon, upgrade, tree: _ } = self;
-        let Poc { repos, souls, vouches, sybils, claims, claim_by_pr, handles, jurors, seances, grants, next_claim_id: _, next_seance_id: _, next_grant_id: _, seed: _, open_seance: _, next_seance_at: _ } = poc;
+        let Poc { repos, souls, vouches, sybils, claims, claim_by_pr, handles, jurors, seances, grants, next_claim_id: _, next_seance_id: _, next_grant_id: _, open_seance: _, next_seance_at: _ } = poc;
         let mut t: Vec<(u8, &dyn Table)> = vec![
             (ns::ACCOUNTS, accounts),
             (ns::NAMES, names),
@@ -231,7 +232,7 @@ impl State {
     /// [`State::tables`], mutably (same list, same order).
     fn tables_mut(&mut self) -> Vec<(u8, &mut dyn Table)> {
         let State { accounts, names, supply: _, burned: _, validators, active_sets, params: _, chain_params: _, hunts, next_hunt_id: _, github, github_by_account, familiars, poc, staking, governance, econ, beacon, upgrade, tree: _ } = self;
-        let Poc { repos, souls, vouches, sybils, claims, claim_by_pr, handles, jurors, seances, grants, next_claim_id: _, next_seance_id: _, next_grant_id: _, seed: _, open_seance: _, next_seance_at: _ } = poc;
+        let Poc { repos, souls, vouches, sybils, claims, claim_by_pr, handles, jurors, seances, grants, next_claim_id: _, next_seance_id: _, next_grant_id: _, open_seance: _, next_seance_at: _ } = poc;
         let mut t: Vec<(u8, &mut dyn Table)> = vec![
             (ns::ACCOUNTS, accounts),
             (ns::NAMES, names),
@@ -264,13 +265,13 @@ impl State {
     /// like [`State::tables`].
     fn meta_records(&self) -> Vec<(&'static [u8], Vec<u8>)> {
         let State { supply, burned, params, chain_params, next_hunt_id, poc, accounts: _, names: _, validators: _, active_sets: _, hunts: _, github: _, github_by_account: _, familiars: _, staking: _, governance: _, econ: _, beacon: _, upgrade: _, tree: _ } = self;
-        let Poc { next_claim_id, next_seance_id, next_grant_id, seed, open_seance, next_seance_at, repos: _, souls: _, vouches: _, sybils: _, claims: _, claim_by_pr: _, handles: _, jurors: _, seances: _, grants: _ } = poc;
+        let Poc { next_claim_id, next_seance_id, next_grant_id, open_seance, next_seance_at, repos: _, souls: _, vouches: _, sybils: _, claims: _, claim_by_pr: _, handles: _, jurors: _, seances: _, grants: _ } = poc;
         let mut m = vec![
             (meta::BURNED, encode(burned)),
             (meta::CHAIN_PARAMS, encode(chain_params)),
             (meta::NEXT_HUNT_ID, encode(next_hunt_id)),
             (meta::PARAMS, encode(params)),
-            (meta::POC, encode(&(next_claim_id, next_seance_id, next_grant_id, seed, open_seance, next_seance_at))),
+            (meta::POC, encode(&(next_claim_id, next_seance_id, next_grant_id, open_seance, next_seance_at))),
             (meta::SCHEMA, encode(&SCHEMA_VERSION)),
             (meta::SUPPLY, encode(supply)),
         ];
@@ -289,7 +290,7 @@ impl State {
             meta::PARAMS => self.params = decode(v)?,
             meta::POC => {
                 let p = &mut self.poc;
-                (p.next_claim_id, p.next_seance_id, p.next_grant_id, p.seed, p.open_seance, p.next_seance_at) = decode(v)?;
+                (p.next_claim_id, p.next_seance_id, p.next_grant_id, p.open_seance, p.next_seance_at) = decode(v)?;
             }
             meta::SCHEMA => {
                 let schema: u32 = decode(v)?;
