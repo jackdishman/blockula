@@ -39,10 +39,12 @@
 //! miss for that view's leader and the block's own view a hit, with simplex's `RoundRobin`
 //! elector naming the leaders. A validator that missed more than `downtime_max_missed` of its
 //! last `downtime_window` slots is jailed ([`jail`], `slash_downtime_bps`), leaves at the next
-//! boundary, and may `Unjail` after `jail_blocks`.
+//! boundary, and may `Unjail` after `jail_blocks` (with its self-bond at the minimum again).
 //!
-//! **Junk** (CV-5). At execution, every tx a block carried that couldn't be admitted costs its
-//! proposer `econ::base_fee` for its size, from its account and then its pool's self-bond, burned.
+//! **Junk** (CV-5). Verifiers replay a proposal's unexecuted ancestors exactly and reject it if
+//! any of its txs can't be admitted (consensus.rs). A block finalized anyway (verifiers that
+//! couldn't replay abstain) still costs its proposer `econ::base_fee` for each such tx's size at
+//! execution, from its account and then its pool's self-bond, burned.
 //!
 //! **Locked tokens** (3.7). Vesting-locked tokens can be staked. What staking earns on them stays
 //! locked on the same curve: when an account with an unvested vesting lock undelegates more than
