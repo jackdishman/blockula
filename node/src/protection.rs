@@ -26,7 +26,9 @@
 //!    (`upgrade::Halt::DoubleSignRisk`, exit code 12).
 //!
 //! The network is observed through simplex's reporter ([`Observer`]): only certificates (quorum
-//! proofs, verified) move the views this node waits for, so no single peer can silence it.
+//! proofs, verified) move the views this node waits for, so no single peer can silence it. And
+//! nothing is ever signed in an epoch the network has finalized past (a node catching up after a
+//! long stop doesn't vote in epochs it's replaying).
 
 use crate::pq::MlDsaScheme;
 use anyhow::{bail, Context, Result};
@@ -312,6 +314,14 @@ impl Protection {
         g.gates.retain(|e, _| *e >= keep);
         g.observed.retain(|e, _| *e >= keep);
         g.me.retain(|e, _| *e >= keep);
+    }
+
+    /// The network has finalized a block of `epoch` (a certificate this node verified): nothing
+    /// is signed in an earlier epoch any more, escape or not. A node catching up after a long
+    /// stop (or a restore) never votes in epochs the network has left.
+    pub fn note_finalized_epoch(&self, epoch: u64) {
+        let mut g = self.inner.lock();
+        g.newest_epoch = g.newest_epoch.max(epoch);
     }
 
     /// Advances the clock the startup rule runs on (a runtime task calls it a few times a second).
@@ -626,6 +636,13 @@ mod tests {
         p.tick(20_000);
         assert!(!p.check_and_record(2, 10, Kind::Nullify, b""));
         assert!(p.check_and_record(2, 11, Kind::Nullify, b""));
+        // Far behind: the network finalized a later epoch, so this one gets nothing, even after
+        // the escape time.
+        let behind = Protection::in_memory(&public_key(1), T);
+        behind.enter_epoch(2, Some(0), 4, 0);
+        behind.note_finalized_epoch(7);
+        behind.tick(60_000);
+        assert!(!behind.check_and_record(2, 11, Kind::Nullify, b""));
         // Every validator restarting at once: nothing to observe at all.
         let q = Protection::in_memory(&public_key(1), T);
         q.enter_epoch(0, Some(0), 4, 0);
