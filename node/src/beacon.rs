@@ -465,10 +465,10 @@ pub fn duties(chain: &mut Chain, secrets: &mut Secrets) -> Result<Vec<String>> {
     let reveal = epoch + 1;
     let due = next % epoch_blocks >= epoch_blocks / 2;
     if let Some(e) = chain.state.beacon.rounds.get(&reveal).and_then(|r| r.get(&me)).filter(|e| due && e.secret.is_none()) {
-        let commitment_ = e.commitment;
+        let committed_to = e.commitment;
         if !queued(chain, &|a| matches!(a, Action::BeaconReveal { epoch, .. } if *epoch == reveal)) {
             match secrets.get(reveal) {
-                Some(s) if commitment(&chain_id, reveal, &me, &s) == commitment_ => {
+                Some(s) if commitment(&chain_id, reveal, &me, &s) == committed_to => {
                     chain.submit_own(Action::BeaconReveal { epoch: reveal, secret: hex::encode(s) }, &format!("🎲 beacon reveal for epoch {reveal}"))?;
                     notes.push(format!("revealed the beacon secret for epoch {reveal}"));
                 }
