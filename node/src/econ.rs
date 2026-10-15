@@ -642,3 +642,629 @@ pub fn describe(state: &State, tx: &Tx, from: &str, primary_name: &dyn Fn(&str) 
         _ => String::new(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chain::{community, make_pop, now_ms, write_secret, Account, Allocation, Chain, Genesis, ValidatorInfo, Vesting};
+    use crate::crypto::Keys;
+    use std::path::PathBuf;
+
+    const FANG: u64 = DROPS_PER_FANG;
+    const VALIDATOR: [u8; 32] = [41; 32];
+    const CHAIN_ID: &str = "econ-test";
+
+    fn keys(seed: u8) -> Keys {
+        Keys::from_seed([seed; 32])
+    }
+
+    fn alloc(k: &Keys, amount: u64, vesting: Option<(u64, u64, u64)>, label: &str) -> Allocation {
+        Allocation { address: k.address(), amount, vesting: vesting.map(|(start, cliff, end)| Vesting { start, cliff, end }), label: Some(label.into()) }
+    }
+
+    /// A one-validator chain (the validator holds 1M FANG and collects the tips) with these
+    /// allocations and parameter overrides.
+    struct T {
+        home: PathBuf,
+        c: Chain,
+    }
+
+    fn chain(tag: &str, mut allocations: Vec<Allocation>, params: &[(&str, u64)], epoch_blocks: u64) -> T {
+        let v = Keys::from_seed(VALIDATOR);
+        allocations.push(Allocation { address: v.address(), amount: 1_000_000 * FANG, vesting: None, label: None });
+        let g = Genesis {
+            chain_id: CHAIN_ID.into(),
+            token: "FANG".into(),
+            decimals: DECIMALS,
+            block_time_ms: 1000,
+            validators: vec![ValidatorInfo { address: v.address(), public_key: hex::encode(v.public_key()), p2p_addr: "127.0.0.1:1".into(), http_addr: "127.0.0.1:2".into() }],
+            faucet: false,
+            created_at_ms: 1,
+            allocations,
+            epoch_blocks,
+            validator_admins: vec![],
+            contribution: None,
+            address_prefix: "boo".into(),
+            param_overrides: params.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            operators: vec![],
+            reserved_names: vec!["reserved".into()],
+            soul_ledger: vec![],
+            features: vec![],
+        };
+        let home = std::env::temp_dir().join(format!("blockula-econ-{tag}-{}-{}", now_ms(), std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("genesis.json"), serde_json::to_string_pretty(&g).unwrap()).unwrap();
+        write_secret(&home.join("validator.key"), &hex::encode(VALIDATOR)).unwrap();
+        let c = Chain::open(&home).unwrap();
+        T { home, c }
+    }
+
+    impl T {
+        /// `k`'s tx at its next nonce, unsigned (execution doesn't check signatures), paying the
+        /// highest base fee fixed for the next blocks.
+        fn unsigned(&self, k: &Keys, action: Action) -> Tx {
+            let from = k.address();
+            let mut tx = Tx { chain_id: CHAIN_ID.into(), nonce: self.c.next_nonce(&from), from, fee: 0, tip: 0, valid_until: self.c.height() + 100, action, memo: String::new(), public_key: hex::encode(k.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+            tx.fee = max_fee(&self.c.state, tx.size());
+            tx
+        }
+
+        fn tx(&self, k: &Keys, action: Action) -> Tx {
+            self.unsigned(k, action).sign(k)
+        }
+
+        /// Submits and executes `action` from `k`.
+        fn ok(&mut self, k: &Keys, action: Action) -> Tx {
+            let tx = self.tx(k, action);
+            self.c.submit(tx.clone()).unwrap_or_else(|e| panic!("{:?}: {e}", tx.action));
+            self.c.produce_block().unwrap();
+            tx
+        }
+
+        /// What admitting `action` from `k` fails with.
+        fn err(&mut self, k: &Keys, action: Action) -> String {
+            let tx = self.tx(k, action);
+            self.c.submit(tx.clone()).map(|_| panic!("should be refused: {:?}", tx.action)).unwrap_err().to_string()
+        }
+
+        fn bal(&self, a: &str) -> u64 {
+            self.c.state.account(a).balance
+        }
+
+        fn blocks(&mut self, n: u64) {
+            for _ in 0..n {
+                self.c.produce_block_with(vec![]).unwrap();
+            }
+        }
+
+        fn now(&self) -> u64 {
+            now(&self.c.state)
+        }
+
+        fn done(self) {
+            std::fs::remove_dir_all(&self.home).ok();
+        }
+
+        /// Restarting from the store, and rebuilding from the logs, reach the same state.
+        fn replays(self) {
+            let T { home, c } = self;
+            let root = c.state.root();
+            drop(c);
+            assert_eq!(Chain::open(&home).unwrap().state.root(), root, "restart");
+            std::fs::remove_file(home.join(crate::store::DB_FILE)).unwrap();
+            assert_eq!(Chain::open(&home).unwrap().state.root(), root, "rebuild from the logs");
+            std::fs::remove_dir_all(home).ok();
+        }
+    }
+
+    fn info(height: u64, tx_bytes: u64) -> BlockInfo<'static> {
+        BlockInfo { height, hash: "", proposer: "", view: height, parent_view: height - 1, skipped: &[], tx_bytes }
+    }
+
+    /// One block's step: a full block raises the rate by the whole step, an empty one lowers it
+    /// as much, linearly around the target; never below the floor or above the cap; the next
+    /// slot takes the current flat part, floor and size limit.
+    #[test]
+    fn fee_steps_follow_fullness() {
+        let cp = ChainParams::default();
+        let max = cp.max_block_bytes;
+        assert_eq!((cp.base_fee_max_change_bps, cp.target_fullness_bps, max), (1_250, 5_000, 2 << 20));
+        let floor = FeeSlot::floor(&cp);
+        assert_eq!(floor, FeeSlot { flat: 10_000, rate: 10_000, max_block_bytes: max });
+        assert_eq!(floor.fee(5_400), min_fee(5_400), "the floor is today's min_fee");
+        let at = |rate: u64, used: u64| next_slot(&FeeSlot { rate, ..floor }, used, max, &cp).rate;
+        assert_eq!(at(100_000, max), 112_500, "full: +12.5%");
+        assert_eq!(at(100_000, 0), 87_500, "empty: −12.5%");
+        assert_eq!(at(100_000, max / 2), 100_000, "at the target");
+        assert_eq!(at(100_000, max / 4 * 3), 106_250);
+        assert_eq!(at(100_000, max / 4), 93_750);
+        assert_eq!(at(100_000, 10 * max), 112_500, "more than the limit counts as full");
+        assert_eq!(at(10_000, 0), 10_000, "never below the floor");
+        assert_eq!(at(10_000, max), 11_250);
+        assert_eq!(at(MAX_RATE, max), MAX_RATE, "capped");
+        assert_eq!(next_slot(&FeeSlot { rate: MAX_RATE, ..floor }, max, max, &cp).fee(MAX_TX_BYTES as u64), 10_000 + (MAX_RATE as u128 * MAX_TX_BYTES as u128 / 1_000) as u64, "the largest fee fits");
+        // Fullness is measured against the limit the block was built under.
+        assert_eq!(next_slot(&FeeSlot { rate: 100_000, ..floor }, max / 2, max / 2, &cp).rate, 112_500);
+        // A zero step freezes the rate; a 100% target only ever lowers it.
+        let frozen = ChainParams { base_fee_max_change_bps: 0, ..cp.clone() };
+        assert_eq!((next_slot(&FeeSlot { rate: 50_000, ..floor }, max, max, &frozen).rate, next_slot(&FeeSlot { rate: 50_000, ..floor }, 0, max, &frozen).rate), (50_000, 50_000));
+        let full_target = ChainParams { target_fullness_bps: 10_000, ..cp.clone() };
+        assert_eq!((next_slot(&FeeSlot { rate: 50_000, ..floor }, max, max, &full_target).rate, next_slot(&FeeSlot { rate: 50_000, ..floor }, 0, max, &full_target).rate), (50_000, 43_750));
+        // New parameters reach the next slot: a higher floor lifts the rate to it at once, and
+        // the flat part and size limit are the current ones.
+        let raised = ChainParams { base_fee_floor_per_byte: 20, base_fee_floor_flat: 7, max_block_bytes: 1 << 20, ..cp.clone() };
+        assert_eq!(next_slot(&floor, 0, max, &raised), FeeSlot { flat: 7, rate: 20_000, max_block_bytes: 1 << 20 });
+        // Fees round down, per tx.
+        assert_eq!(FeeSlot { flat: 0, rate: 10_999, max_block_bytes: 1 }.fee(1), 10);
+        assert_eq!(lowest_base_fee(5_400), 5_400, "the bounds allow 0 flat and 1 drop per byte");
+    }
+
+    /// The fee for block `h` is fixed by block `h − 17`'s execution, from the rate before it and
+    /// that block's fullness: the ring always holds the last executed height and the 17 after.
+    #[test]
+    fn base_fee_is_fixed_17_blocks_ahead() {
+        let mut st = State::default();
+        init_genesis(&mut st);
+        let cp = st.chain_params.clone();
+        let (max, floor) = (cp.max_block_bytes, FeeSlot::floor(&cp));
+        assert_eq!(st.econ.fees.len(), 18);
+        assert!((0..=17).all(|h| slot(&st, h) == Some(floor)) && slot(&st, 18).is_none());
+        // Five full blocks: each raises the rate 17 blocks later, compounding.
+        for h in 1..=5 {
+            end_block(&mut st, &info(h, max));
+            assert_eq!(st.econ.height, h);
+            assert!(slot(&st, h - 1).is_none() && slot(&st, h + FEE_LAG).is_some() && slot(&st, h + FEE_LAG + 1).is_none());
+        }
+        let rates: Vec<u64> = (5..=22).map(|h| slot(&st, h).unwrap().rate).collect();
+        assert_eq!(&rates[..13], &[10_000; 13], "heights 5–17 were fixed at genesis");
+        assert_eq!(&rates[13..], &[11_250, 12_656, 14_238, 16_017, 18_019]);
+        assert_eq!(base_fee(&st, 18, 5_400), 10_000 + 11_250 * 5_400 / 1_000);
+        assert_eq!(base_fee(&st, 17, 5_400), min_fee(5_400));
+        // Before the ring: the floor. Past it: the most the rate can reach by then, which bounds
+        // whatever actually happens.
+        assert_eq!(base_fee(&st, 2, 5_400), min_fee(5_400));
+        let bound: Vec<u64> = (23..=30).map(|h| base_fee(&st, h, 5_400)).collect();
+        assert_eq!(bound[0], 10_000 + (18_019 + 18_019 * 1_250 / 10_000) * 5_400 / 1_000);
+        let mut later = st.clone();
+        for h in 6..=13 {
+            end_block(&mut later, &info(h, max));
+        }
+        assert_eq!((23..=30).map(|h| base_fee(&later, h, 5_400)).collect::<Vec<_>>(), bound, "full blocks reach the bound exactly");
+        // What wallets pay to cover any of the next 17 blocks.
+        assert_eq!(suggested(&st).rate, 18_019);
+        assert_eq!(max_fee(&st, 5_400), 10_000 + 18_019 * 5_400 / 1_000);
+        // Two histories that agree through block 10 agree on every fee through height 27, and
+        // differ from 28 on.
+        let (mut a, mut b) = (st.clone(), st.clone());
+        for h in 6..=10 {
+            end_block(&mut a, &info(h, h * 1_000));
+            end_block(&mut b, &info(h, h * 1_000));
+        }
+        end_block(&mut a, &info(11, max));
+        end_block(&mut b, &info(11, 0));
+        assert!((11..=27).all(|h| slot(&a, h) == slot(&b, h)));
+        assert!(slot(&a, 28).unwrap().rate > slot(&b, 28).unwrap().rate);
+        // Empty blocks bring it back to the floor, and no lower.
+        for h in 12..=200 {
+            end_block(&mut a, &info(h, 0));
+        }
+        assert!(a.econ.fees.iter().all(|s| *s == floor));
+        check_invariants(&a).unwrap();
+        // A state that didn't start from a genesis (unit tests) starts its ring at the first block.
+        let mut fresh = State::default();
+        assert_eq!(base_fee(&fresh, 7, 100), FeeSlot::floor(&cp).fee(100));
+        end_block(&mut fresh, &info(7, max));
+        assert_eq!((fresh.econ.height, slot(&fresh, 24).unwrap().rate), (7, 11_250));
+    }
+
+    /// On a chain: txs fill blocks (the limit is lowered to 64 KiB), the base fee climbs 17
+    /// blocks later exactly as computed, txs are charged and burn exactly their block's base fee,
+    /// a tx priced at the old floor is refused, blocks record what they charged, and it all
+    /// replays.
+    #[test]
+    fn full_blocks_raise_the_base_fee() {
+        let senders: Vec<Keys> = (1..=11).map(keys).collect();
+        let allocations = senders.iter().map(|k| alloc(k, 1_000 * FANG, None, "user")).collect();
+        let mut t = chain("fullness", allocations, &[("max_block_bytes", MAX_TX_BYTES as u64)], 600);
+        let me = t.c.me().unwrap();
+        let limit = MAX_TX_BYTES as u64;
+        for _ in 0..20 {
+            let h = t.c.height() + 1;
+            let txs: Vec<Tx> = senders.iter().map(|k| t.unsigned(k, Action::Transfer { to: me.clone(), amount: FANG })).collect();
+            let used: u64 = txs.iter().map(Tx::size).sum();
+            assert!(used > limit / 2 && used <= limit);
+            let (expected, this) = (next_slot(t.c.state.econ.fees.last().unwrap(), used, limit, &t.c.state.chain_params), slot(&t.c.state, h).unwrap());
+            let charged: u64 = txs.iter().map(|tx| this.fee(tx.size())).sum();
+            let burned = t.c.state.burned;
+            t.c.produce_block_with(txs).unwrap();
+            assert_eq!(t.c.state.burned - burned, charged, "block {h} burned its base fees");
+            assert_eq!(slot(&t.c.state, h + FEE_LAG), Some(expected));
+            assert_eq!(t.c.block(h).unwrap().base_fee, Some(this));
+        }
+        let next = t.now();
+        let rate = slot(&t.c.state, next).unwrap().rate;
+        assert!(rate > 10_000, "busy blocks 17 back raised the fee: {rate}");
+        // Priced at the floor, a tx is refused (and skipped if a proposer includes it anyway);
+        // priced at `max_fee` it goes through and pays the block's base fee.
+        let mut cheap = t.unsigned(&senders[0], Action::Transfer { to: me.clone(), amount: FANG });
+        cheap.fee = min_fee(cheap.size());
+        let cheap = cheap.sign(&senders[0]);
+        assert!(t.c.submit(cheap.clone()).unwrap_err().to_string().contains("fee too low"));
+        t.c.produce_block_with(vec![cheap.clone()]).unwrap();
+        assert!(!t.c.has_tx(&cheap.id()) && t.c.last_block().unwrap().skipped == vec![cheap.size()]);
+        let before = t.bal(&senders[0].address());
+        let tx = t.ok(&senders[0], Action::Transfer { to: me.clone(), amount: FANG });
+        let h = t.c.height();
+        assert_eq!(before - t.bal(&senders[0].address()), FANG + slot(&t.c.state, h).unwrap().fee(tx.size()));
+        // Empty blocks bring it back down to the floor.
+        t.blocks(80);
+        assert_eq!(max_fee(&t.c.state, 5_400), min_fee(5_400));
+        t.replays();
+    }
+
+    /// Issuance follows docs/TOKENOMICS.md's table exactly for ten years: the year's rate on
+    /// the supply at its first epoch, 8,766 mints a year at 1 s blocks and 1-hour epochs, the
+    /// rate decaying 15% a year to its 1.5% floor; and the split.
+    #[test]
+    fn issuance_matches_the_tokenomics_table() {
+        // (rate ppm, mint per epoch, supply at year end), in drops.
+        let table: [(u64, u64, u64); 10] = [
+            (60_000, 6_844_626_967_830, 1_059_999_999_999_997_780),
+            (51_000, 6_167_008_898_015, 1_114_059_999_999_997_270),
+            (43_350, 5_509_297_399_041, 1_162_354_500_999_990_676),
+            (36_847, 4_885_840_326_071, 1_205_183_777_298_329_062),
+            (31_319, 4_305_857_942_186, 1_242_928_928_019_531_538),
+            (26_621, 3_774_584_872_553, 1_276_016_939_012_331_136),
+            (22_627, 3_293_684_152_296, 1_304_889_374_291_357_872),
+            (19_232, 2_862_837_376_953, 1_329_985_006_737_727_870),
+            (16_347, 2_480_180_801_407, 1_351_726_271_642_861_632),
+            (15_000, 2_313_015_523_002, 1_372_002_165_717_497_164),
+        ];
+        let mut st = State { params: Params { block_time_ms: 1_000, epoch_blocks: 3_600, ..Default::default() }, ..Default::default() };
+        st.accounts.insert(keys(1).address(), Account { balance: MAX_SUPPLY_DROPS, ..Default::default() });
+        st.supply = MAX_SUPPLY_DROPS;
+        let epy = epochs_per_year(&st.params);
+        assert_eq!(epy, 8_766);
+        let (treasury, pool) = (st.treasury(), st.pool());
+        for (y, (rate, per_epoch, supply_at_end)) in table.into_iter().enumerate() {
+            for e in 0..epy {
+                let before = st.supply;
+                issue(&mut st, y as u64 * epy + e);
+                assert_eq!(st.supply - before, per_epoch, "year {} epoch {e}", y + 1);
+                if y == 0 && e == 0 {
+                    // Year 1, per epoch: 70% to validators' pools (none yet: the treasury), 20%
+                    // to the contribution pool, 10% (and the rounding) to the treasury.
+                    assert_eq!(st.account(&pool).balance, 1_368_925_393_566);
+                    assert_eq!(st.account(&treasury).balance, 4_791_238_877_481 + 684_462_696_783);
+                }
+            }
+            assert_eq!((st.econ.issuance.year, st.econ.issuance.rate_ppm), (y as u64 + 1, rate));
+            assert_eq!(st.supply, supply_at_end, "supply at the end of year {}", y + 1);
+        }
+        st.check_invariants().unwrap();
+        assert_eq!(next_rate(15_000, &st.chain_params), 15_000, "the floor holds");
+        // The year's base is its supply when its first epoch ends (after burns), before the mint.
+        let mut b = State { params: st.params.clone(), ..Default::default() };
+        b.accounts.insert(keys(1).address(), Account { balance: MAX_SUPPLY_DROPS, ..Default::default() });
+        b.supply = MAX_SUPPLY_DROPS;
+        issue(&mut b, 0);
+        let mut j = Journal::default();
+        b.j_debit(&mut j, &keys(1).address(), 1_000 * FANG).unwrap();
+        b.j_burn(&mut j, 1_000 * FANG);
+        let at_year_two = b.supply;
+        issue(&mut b, epy);
+        assert_eq!(b.econ.issuance.base_supply, at_year_two);
+        // Governance moves the curve from the next year on, within bounds: no decay, or a higher floor.
+        let cp = ChainParams { issuance_decay_ppm: 0, ..ChainParams::default() };
+        assert_eq!(next_rate(43_350, &cp), 43_350);
+        let cp = ChainParams { issuance_floor_ppm: 50_000, ..ChainParams::default() };
+        assert_eq!(next_rate(43_350, &cp), 50_000);
+        // Other chain shapes.
+        assert_eq!(epochs_per_year(&Params { block_time_ms: 1_000, epoch_blocks: 600, ..Default::default() }), 52_596);
+        assert_eq!(epochs_per_year(&Params { block_time_ms: 250, epoch_blocks: 3_600, ..Default::default() }), 35_064);
+    }
+
+    const MAX_SUPPLY_DROPS: u64 = crate::params::MAX_SUPPLY;
+
+    /// On a chain with 10-block epochs: each boundary mints the epoch's issuance (the treasury
+    /// takes the stakers' share while no pool can, the contribution pool its 20%), and the
+    /// endowment streams what has vested into the pool. Supply accounts for every drop.
+    #[test]
+    fn epochs_mint_and_stream_the_endowment() {
+        let endow = Allocation { address: crate::chain::endowment("boo"), amount: 1_000_000 * FANG, vesting: Some(Vesting { start: 0, cliff: 0, end: 100 }), label: Some("endowment".into()) };
+        let mut t = chain("issue", vec![endow], &[], 10);
+        let (pool, treasury, endowment) = (t.c.state.pool(), t.c.state.treasury(), crate::chain::endowment("boo"));
+        let epy = epochs_per_year(&t.c.state.params);
+        assert_eq!(epy, 3_155_760);
+        let genesis_supply = t.c.state.supply;
+        t.blocks(8);
+        assert_eq!((t.c.state.supply, t.bal(&pool)), (genesis_supply, 0), "nothing before the first boundary");
+        t.blocks(1); // block 9 ends epoch 0
+        let mint = (genesis_supply as u128 * 60_000 / (1_000_000 * epy as u128)) as u64;
+        assert!(mint > 0);
+        let to_pool = mint * 2_000 / 10_000;
+        assert_eq!(t.c.state.supply, genesis_supply + mint);
+        assert_eq!(t.bal(&treasury), mint - to_pool);
+        assert_eq!(t.bal(&pool), to_pool + 90_000 * FANG, "9% of the endowment vested by block 9");
+        assert_eq!(t.bal(&endowment), 910_000 * FANG);
+        t.blocks(10); // block 19 ends epoch 1: the same year, the same mint
+        assert_eq!(t.c.state.supply, genesis_supply + 2 * mint);
+        assert_eq!(t.bal(&pool), 2 * to_pool + 190_000 * FANG);
+        // Past its end the endowment has streamed out entirely.
+        t.blocks(90);
+        assert_eq!(t.bal(&endowment), 0);
+        assert_eq!(t.c.state.econ.issuance, Issuance { year: 1, base_supply: genesis_supply, rate_ppm: 60_000 });
+        t.replays();
+    }
+
+    /// Vesting locks: before the cliff only unlocked tokens can leave (transfers, escrows,
+    /// names, pool funding), fees can still be paid, locked tokens can be bonded, the lock
+    /// shrinks linearly after the cliff and is gone at the end.
+    #[test]
+    fn vesting_locks_hold_transfers_but_not_stake() {
+        let (f, bob, node) = (keys(1), keys(2), keys(3));
+        let mut t = chain("vesting", vec![alloc(&f, 1_000 * FANG, Some((0, 20, 120)), "founder"), alloc(&f, 50 * FANG, None, "grant")], &[("min_self_bond", 100 * FANG)], 600);
+        let fa = f.address();
+        assert_eq!(transferable(&t.c.state, &fa, t.now()), 50 * FANG, "only the unlocked grant");
+        t.ok(&f, Action::Transfer { to: bob.address(), amount: 40 * FANG });
+        let left = transferable(&t.c.state, &fa, t.now());
+        assert!(left < 10 * FANG && left > 9 * FANG);
+        // Moving locked tokens out is refused, whatever the action…
+        for action in [
+            Action::Transfer { to: bob.address(), amount: 10 * FANG },
+            Action::CreateHunt { repo: "a/b".into(), issue: 1, amount: 10 * FANG, expires_at: 500, title: "t".into() },
+            Action::FundPool { amount: 10 * FANG },
+            Action::RegisterName { name: "abc".into() },
+        ] {
+            let e = t.err(&f, action);
+            assert!(e.contains("locked (founder)") && e.contains("can be staked but not moved out"), "{e}");
+        }
+        // …and in a block it fails but pays its fee (fees may come from locked tokens).
+        let stuck = t.tx(&f, Action::Transfer { to: bob.address(), amount: 10 * FANG });
+        let before = t.bal(&fa);
+        t.c.produce_block_with(vec![stuck.clone()]).unwrap();
+        assert!(t.c.failure(&stuck.id()).unwrap().0.contains("locked"));
+        assert_eq!(before - t.bal(&fa), base_fee(&t.c.state, t.c.height(), stuck.size()));
+        // Bonding locked tokens is fine: the self-bond stays covered by the lock.
+        let free0 = free(&t.c.state, &fa, t.now());
+        let (p2p, http) = ("1.2.3.4:5", "1.2.3.4:6");
+        let pop = make_pop(node.seed(), CHAIN_ID, &fa, p2p, http);
+        let reg = t.ok(&f, Action::RegisterValidator { consensus_key: hex::encode(node.public_key()), p2p_addr: p2p.into(), http_addr: http.into(), bond: 100 * FANG, pop });
+        assert_eq!(crate::staking::holdings(&t.c.state, &fa), (100 * FANG, 0));
+        assert_eq!(free(&t.c.state, &fa, t.now()), free0 - base_fee(&t.c.state, t.c.height(), reg.size()) as i128, "the bond came out of locked tokens");
+        // Past the cliff it vests linearly: at block 60, half the allocation is locked, and the
+        // bond counts against it.
+        t.blocks(59 - t.c.height());
+        let liquid = t.bal(&fa);
+        assert_eq!(t.c.state.account(&fa).locked_at(60), 500 * FANG);
+        assert_eq!(transferable(&t.c.state, &fa, 60), liquid - 400 * FANG);
+        t.ok(&f, Action::Transfer { to: bob.address(), amount: liquid - 401 * FANG });
+        // One block later another 8.3 FANG has vested, not 10.
+        assert!(t.err(&f, Action::Transfer { to: bob.address(), amount: 10 * FANG }).contains("locked"));
+        // At the end nothing is locked; the finished lock can be dropped (`Unlock`, P-GOV).
+        t.blocks(120 - t.c.height());
+        assert_eq!(transferable(&t.c.state, &fa, 121), t.bal(&fa));
+        {
+            // A copy (it shares the store's snapshot, so it goes before the restart below).
+            let mut s = t.c.state.clone();
+            assert_eq!(release_expired(&mut s, &mut Journal::default(), &fa, 121), 1);
+            assert!(s.account(&fa).locks.is_empty());
+        }
+        t.ok(&f, Action::Transfer { to: bob.address(), amount: 10 * FANG });
+        t.replays();
+    }
+
+    /// Vote locks (P-GOV's): they overlap (the largest applies), only grow while they hold,
+    /// expire on their own, and `Unlock` drops them; voting weight leaves unvested tokens out but
+    /// not vote-locked ones; everything rolls back with the journal.
+    #[test]
+    fn vote_locks_overlap_and_expire() {
+        let (a, v) = (keys(1).address(), keys(2).address());
+        let mut st = State::default();
+        st.accounts.insert(a.clone(), Account { balance: 100 * FANG, ..Default::default() });
+        st.supply = 100 * FANG;
+        let mut j = Journal::default();
+        lock(&mut st, &mut j, &a, "vote:1".into(), 60 * FANG, 50).unwrap();
+        assert_eq!(transferable(&st, &a, 10), 40 * FANG);
+        lock(&mut st, &mut j, &a, "vote:2".into(), 80 * FANG, 30).unwrap();
+        assert_eq!((transferable(&st, &a, 10), transferable(&st, &a, 30), transferable(&st, &a, 50)), (20 * FANG, 40 * FANG, 100 * FANG));
+        // Locking an id again only extends it.
+        lock(&mut st, &mut j, &a, "vote:1".into(), 10 * FANG, 20).unwrap();
+        assert_eq!(transferable(&st, &a, 40), 40 * FANG);
+        lock(&mut st, &mut j, &a, "vote:1".into(), 70 * FANG, 60).unwrap();
+        assert_eq!(transferable(&st, &a, 55), 30 * FANG);
+        assert_eq!(voting_balance(&st, &a, 10), 100 * FANG, "vote locks don't reduce voting weight");
+        // Bounds.
+        assert!(lock(&mut st, &mut j, &a, "vote:3".into(), 101 * FANG, 60).unwrap_err().to_string().contains("can't lock"));
+        assert!(lock(&mut st, &mut j, &a, VESTING_LOCK.into(), FANG, 60).is_err());
+        assert!(lock(&mut st, &mut j, &a, String::new(), FANG, 60).is_err());
+        assert!(lock(&mut st, &mut j, &v, "vote:1".into(), 0, 60).unwrap_err().to_string().contains("no account"));
+        for i in 2..MAX_LOCKS as u64 {
+            lock(&mut st, &mut j, &a, format!("vote:{}", i + 1), FANG, 10).unwrap();
+        }
+        assert!(lock(&mut st, &mut j, &a, "vote:999".into(), FANG, 10).unwrap_err().to_string().contains("locks"));
+        check_invariants(&st).unwrap();
+        // Expired locks go with `Unlock`; the live one stays.
+        assert_eq!(release_expired(&mut st, &mut j, &a, 30), MAX_LOCKS as u64 - 1);
+        assert_eq!(st.account(&a).locks.iter().map(|l| l.id.as_str()).collect::<Vec<_>>(), ["vote:1"]);
+        assert_eq!(release_expired(&mut st, &mut j, &a, 30), 0);
+        // Unvested tokens don't vote; staked (bonded) ones do.
+        st.acct_mut(&mut j, &a).locks.push(Lock { id: VESTING_LOCK.into(), amount: LockAmount::Vesting { total: 90 * FANG, start: 0, cliff: 100, end: 200 }, reason: "founder".into() });
+        assert_eq!((voting_balance(&st, &a, 10), voting_balance(&st, &a, 150), voting_balance(&st, &a, 200)), (10 * FANG, 77 * FANG + FANG / 2, 100 * FANG));
+        assert_eq!(voting_balance(&st, &v, 10), 0);
+        // All of it under one journal: rolled back, nothing is left.
+        st.rollback(j);
+        assert!(st.account(&a).locks.is_empty());
+    }
+
+    /// Rewards credited to a vesting account vest on its curve: all locked before the cliff,
+    /// the unvested share of them later, none after the end or without a vesting lock.
+    #[test]
+    fn rewards_earned_by_locked_tokens_stay_locked() {
+        let (a, plain) = (keys(1).address(), keys(2).address());
+        let mut st = State::default();
+        st.accounts.insert(a.clone(), Account { balance: 1_000 * FANG, locks: vec![Lock { id: VESTING_LOCK.into(), amount: LockAmount::Vesting { total: 1_000 * FANG, start: 0, cliff: 100, end: 200 }, reason: "founder".into() }], ..Default::default() });
+        st.accounts.insert(plain.clone(), Account { balance: 10 * FANG, ..Default::default() });
+        let mut j = Journal::default();
+        // Before the cliff: a 50 FANG reward is locked entirely.
+        st.j_credit(&mut j, &a, 50 * FANG);
+        lock_rewards(&mut st, &mut j, &a, 50 * FANG, 50);
+        assert_eq!(transferable(&st, &a, 50), 0);
+        // Three-quarters vested: a 100 FANG reward adds 25 FANG to what's locked.
+        let before = st.account(&a).locked_at(150);
+        st.j_credit(&mut j, &a, 100 * FANG);
+        lock_rewards(&mut st, &mut j, &a, 100 * FANG, 150);
+        assert_eq!(st.account(&a).locked_at(150) - before, 25 * FANG);
+        // After the end, and without a vesting lock: nothing to lock.
+        let total = |st: &State| match st.account(&a).locks[0].amount {
+            LockAmount::Vesting { total, .. } => total,
+            _ => unreachable!(),
+        };
+        let t0 = total(&st);
+        lock_rewards(&mut st, &mut j, &a, 100 * FANG, 200);
+        assert_eq!(total(&st), t0);
+        lock_rewards(&mut st, &mut j, &plain, 100 * FANG, 50);
+        assert!(st.account(&plain).locks.is_empty());
+    }
+
+    /// The lock check on accounts other than the sender (a multisig's action executed by an
+    /// approver, P-GOV): a touched account may not end up moving locked tokens.
+    #[test]
+    fn lock_checks_cover_every_touched_account() {
+        let (sender, other) = (keys(1).address(), keys(2).address());
+        let mut st = State::default();
+        let locked = |balance: u64| Account { balance, locks: vec![Lock { id: "vote:1".into(), amount: LockAmount::Until { amount: 50 * FANG, until: 100 }, reason: "vote on proposal #1".into() }], ..Default::default() };
+        st.accounts.insert(sender.clone(), Account { balance: FANG, ..Default::default() });
+        st.accounts.insert(other.clone(), locked(40 * FANG));
+        // `other` went from 60 to 40 FANG with 50 locked: refused. Receiving is always fine.
+        let e = check_locks(&st, &[(other.clone(), Some(60 * FANG))], &sender, FANG as i128, 10).unwrap_err().to_string();
+        assert!(e.contains("is locked (vote on proposal #1)"), "{e}");
+        check_locks(&st, &[(other.clone(), Some(30 * FANG))], &sender, FANG as i128, 10).unwrap();
+        check_locks(&st, &[(other.clone(), Some(60 * FANG))], &sender, FANG as i128, 100).unwrap();
+        // The sender may not go further below zero than fees took it.
+        st.accounts.insert(sender.clone(), locked(49 * FANG));
+        check_locks(&st, &[(sender.clone(), Some(49 * FANG))], &sender, -(FANG as i128), 10).unwrap();
+        assert!(check_locks(&st, &[(sender.clone(), Some(50 * FANG))], &sender, 0, 10).is_err());
+    }
+
+    /// DEC-6: an action that opens an account burns the creation fee from the sender, on top of
+    /// what it moves; existing accounts, names and keyless system accounts don't pay it; a sender
+    /// that can't cover it fails (paying its fee); the mempool reserves it.
+    #[test]
+    fn opening_an_account_burns_the_creation_fee() {
+        let (a, poor, x, y, z) = (keys(1), keys(2), keys(3), keys(4), keys(5));
+        let mut t = chain("open", vec![alloc(&a, 1_000 * FANG, None, "a"), alloc(&poor, FANG + FANG / 20, None, "poor")], &[], 600);
+        let open = t.c.state.chain_params.account_creation_fee;
+        assert_eq!(open, FANG / 10);
+        let (a0, supply0) = (t.bal(&a.address()), t.c.state.supply);
+        let tx = t.ok(&a, Action::Transfer { to: x.address(), amount: FANG });
+        let base = base_fee(&t.c.state, t.c.height(), tx.size());
+        assert_eq!((a0 - t.bal(&a.address()), t.bal(&x.address())), (FANG + base + open, FANG));
+        assert_eq!(supply0 - t.c.state.supply, base + open, "the creation fee is burned");
+        // An existing account, and a keyless system account (the protocol's), cost nothing to pay.
+        for to in [x.address(), community("boo")] {
+            let a0 = t.bal(&a.address());
+            let tx = t.ok(&a, Action::Transfer { to: to.clone(), amount: FANG });
+            assert_eq!(a0 - t.bal(&a.address()), FANG + base_fee(&t.c.state, t.c.height(), tx.size()), "{to}");
+        }
+        // The mempool reserves it; a sender that can't cover it fails and pays its fee.
+        let to_y = t.tx(&poor, Action::Transfer { to: y.address(), amount: FANG });
+        assert_eq!(t.c.state.tx_debit(&to_y), to_y.fee + FANG + open);
+        assert!(t.c.submit(to_y.clone()).unwrap_err().to_string().contains("opening 1 account burns 0.1 FANG"));
+        t.c.produce_block_with(vec![to_y.clone()]).unwrap();
+        assert!(t.c.failure(&to_y.id()).unwrap().0.contains("insufficient balance"));
+        assert!(!t.c.state.accounts.contains_key(&y.address()));
+        // A hunt awarded to a new account: its creator pays for opening it.
+        t.ok(&a, Action::CreateHunt { repo: "a/b".into(), issue: 1, amount: 10 * FANG, expires_at: 500, title: "t".into() });
+        let a0 = t.bal(&a.address());
+        let award = t.ok(&a, Action::AwardHunt { hunt_id: 0, to: z.address(), pr: 1, familiar_key: None });
+        assert_eq!(a0 - t.bal(&a.address()), base_fee(&t.c.state, t.c.height(), award.size()) + open);
+        assert_eq!(t.bal(&z.address()), 10 * FANG);
+        // Transfers that open an account still carry at least MIN_NEW_ACCOUNT.
+        assert!(t.err(&a, Action::Transfer { to: keys(6).address(), amount: MIN_NEW_ACCOUNT - 1 }).contains("new account"));
+        t.replays();
+        // Governance can set it to zero.
+        let mut free = chain("open-free", vec![alloc(&a, 10 * FANG, None, "a")], &[("account_creation_fee", 0)], 600);
+        let s0 = free.c.state.supply;
+        let tx = free.ok(&a, Action::Transfer { to: x.address(), amount: FANG });
+        assert_eq!(s0 - free.c.state.supply, base_fee(&free.c.state, free.c.height(), tx.size()));
+        free.done();
+    }
+
+    /// DEC-11 names: priced by length into the treasury; a year (here 10 blocks) of
+    /// registration; renewals by the owner at 20% a year, from the old expiry, at most 10 years
+    /// ahead; an expired name doesn't resolve or transfer; in grace (5 blocks) only the owner can
+    /// renew; then anyone can register it; lapsed names are swept; reserved names stay reserved.
+    #[test]
+    fn names_expire_renew_and_lapse() {
+        let (alice, bob) = (keys(1), keys(2));
+        let mut t = chain("names", vec![alloc(&alice, 1_000 * FANG, None, "alice"), alloc(&bob, 1_000 * FANG, None, "bob")], &[("name_registration_blocks", 10), ("name_grace_blocks", 5)], 600);
+        let (a, b, treasury) = (alice.address(), bob.address(), t.c.state.treasury());
+        assert!(t.err(&bob, Action::RegisterName { name: "reserved".into() }).contains("is reserved"));
+        let tr0 = t.bal(&treasury);
+        t.ok(&alice, Action::RegisterName { name: "alice".into() });
+        let h = t.c.height();
+        assert_eq!(t.bal(&treasury) - tr0, 5 * FANG, "5+ characters: 5 FANG");
+        let rec = t.c.state.names["alice"].clone();
+        assert_eq!((rec.registered_at, rec.expires_at), (h, h + 10));
+        t.ok(&alice, Action::RegisterName { name: "abc".into() });
+        assert_eq!(t.bal(&treasury) - tr0, 105 * FANG, "3 characters: 100 FANG");
+        assert!(t.err(&bob, Action::RegisterName { name: "alice".into() }).contains("already taken"));
+        // Renewing: the owner only, 20% of the price a year, from the current expiry.
+        assert!(t.err(&bob, Action::RenewName { name: "alice".into(), years: 1 }).contains("belongs to"));
+        let tr1 = t.bal(&treasury);
+        t.ok(&alice, Action::RenewName { name: "alice.boo".into(), years: 2 });
+        assert_eq!((t.bal(&treasury) - tr1, t.c.state.names["alice"].expires_at), (2 * FANG, h + 30));
+        let renew_all = Action::RenewName { name: "alice".into(), years: MAX_RENEW_YEARS };
+        assert!(t.err(&alice, renew_all).contains("at most 10 years ahead"));
+        // Expired: it no longer resolves, transfers or shows as a primary name.
+        t.blocks(h + 31 - t.c.height());
+        assert_eq!(t.now(), h + 32);
+        assert!(t.c.state.resolve("alice.boo").unwrap_err().to_string().contains(&format!("expired at block {}", h + 30)));
+        assert!(t.err(&bob, Action::Transfer { to: "alice.boo".into(), amount: FANG }).contains("expired"));
+        assert!(t.err(&alice, Action::TransferName { name: "alice".into(), to: b.clone() }).contains("renew it first"));
+        assert_eq!(t.c.state.primary_name(&a), None, "abc expired too");
+        assert_eq!(t.c.view().primary_name(&a), None);
+        // In grace: only the owner can renew, and the renewal counts from the old expiry.
+        let e = t.err(&bob, Action::RegisterName { name: "alice".into() });
+        assert!(e.contains(&format!("its owner can renew it until block {}", h + 35)), "{e}");
+        t.ok(&alice, Action::RenewName { name: "alice".into(), years: 1 });
+        assert_eq!(t.c.state.names["alice"].expires_at, h + 40);
+        assert_eq!(t.c.state.resolve("alice").unwrap(), a);
+        assert_eq!(t.c.view().primary_name(&a).as_deref(), Some("alice.boo"));
+        // Past grace (abc's ran out at h + 16): anyone can register it, at full price.
+        t.ok(&bob, Action::RegisterName { name: "abc".into() });
+        assert_eq!((t.c.state.names["abc"].owner.as_str(), t.c.state.names["abc"].registered_at), (b.as_str(), t.c.height()));
+        assert!(t.err(&alice, Action::RenewName { name: "abc".into(), years: 1 }).contains("belongs to"));
+        // Transfer and release.
+        t.ok(&alice, Action::TransferName { name: "alice".into(), to: b.clone() });
+        assert_eq!(t.c.state.resolve("alice.boo").unwrap(), b);
+        t.ok(&bob, Action::ReleaseName { name: "alice".into() });
+        assert!(!t.c.state.names.contains_key("alice"));
+        t.ok(&alice, Action::RegisterName { name: "alice".into() });
+        // A name nobody renews or re-registers is swept once its grace is over.
+        t.ok(&bob, Action::RegisterName { name: "carol".into() });
+        let carol = t.c.state.names["carol"].clone();
+        t.blocks(carol.expires_at + 5 - t.c.height());
+        assert!(t.c.state.names.contains_key("carol"), "still in grace");
+        t.blocks(2);
+        assert!(!t.c.state.names.contains_key("carol"), "swept");
+        t.replays();
+    }
+
+    /// The sweep visits every name, a batch per block, and wraps around.
+    #[test]
+    fn the_name_sweep_wraps_around() {
+        let mut st = State::default();
+        for i in 0..100 {
+            let n = format!("name{i:03}");
+            st.names.insert(n.clone(), NameRecord { name: n, owner: keys(1).address(), registered_at: 0, expires_at: if i % 3 == 0 { 0 } else { 1_000 } });
+        }
+        let grace = st.chain_params.name_grace_blocks;
+        for h in 0..4 {
+            sweep_names(&mut st, grace + 1 + h);
+        }
+        assert_eq!(st.names.len(), 66, "every lapsed name is gone after one pass");
+        assert_eq!(st.econ.name_cursor, "", "and the next pass starts over");
+    }
+}
