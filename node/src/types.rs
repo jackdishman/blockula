@@ -1644,9 +1644,12 @@ pub struct Block {
     pub view: u64,
     #[serde(default)]
     pub parent_view: u64,
-    /// Protocol version the block was made under (`consensus::PROTOCOL_VERSION`).
+    /// Protocol version the block was made under (`upgrade::version_at` its height).
     #[serde(default)]
     pub version: u32,
+    /// Newest protocol version the proposer's binary supports (upgrade readiness, display only).
+    #[serde(default)]
+    pub signal: u32,
     pub proposer: String,
     pub state_root: String,
     pub txs: Vec<Tx>,

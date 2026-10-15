@@ -520,6 +520,7 @@ pub fn finalized_from(b: &CBlock, certificate: Option<Vec<u8>>) -> Finalized {
         view: b.view,
         parent_view: b.parent_view,
         version: b.version,
+        signal: b.signal,
         proposer: b.proposer.clone(),
         txs: b.parse_txs().into_iter().flatten().collect(),
         cblock: b.encode().to_vec(),

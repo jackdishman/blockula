@@ -1,23 +1,46 @@
-//! Upgrades and feature flags (P-UPGRADE, MAINNET-DESIGN 3.9, DEC-2): the protocol-version
-//! schedule that `ScheduleUpgrade` proposals change, the check that halts a node before a height
-//! its binary can't execute, and the feature flags `ActivateFeature`/`DeactivateFeature` flip
-//! (Ghost Mode ships off).
+//! Upgrades, halts and feature flags (P-UPGRADE, MAINNET-DESIGN 3.9, DEC-2): the protocol-version
+//! schedule that `ScheduleUpgrade` proposals change, the feature flags `ActivateFeature` and
+//! `DeactivateFeature` flip (Ghost Mode ships off), and the node-local side of upgrades: what
+//! this binary supports, the operator's `--halt-height`, and why a node stopped.
 //!
-//! Scaffold: the schedule and the flags (from genesis `features`) as state records,
-//! [`version_at`] and [`check_next`]. A map is added by declaring it in [`Upgrades`] under this
-//! module's namespace (`state::ns` 47; take more from 64 up) and journaling it in
-//! [`UpgradeJournal`].
+//! How a node follows the schedule:
+//! * Every block carries the version in force at its height ([`version_at`]); verifiers reject
+//!   any other (`consensus.rs`). An upgrade activates at least [`MIN_UPGRADE_LEAD`] blocks after
+//!   the block that schedules it, so a node within that many blocks of a height knows its version
+//!   for certain.
+//! * Blocks also carry `signal`, the newest version the proposer's binary supports, so readiness
+//!   is visible on chain (`/api/upgrade`).
+//! * A node never executes a height whose version its binary doesn't support: it stops after the
+//!   block before, abstains from voting on later blocks, and exits ([`Halt::exit_code`]) or, as a
+//!   full node, keeps serving reads with the reason in `/api/health` (docs/OPERATIONS.md
+//!   "Upgrades"). `--halt-height H` takes the same path after executing `H`.
+//!
+//! State: the schedule (META key `upgrade`) and the flags (namespace `state::ns::FEATURES`).
 
-// Scaffold: P-UPGRADE and P-GOV call into this.
+// The governance levers are called by P-GOV.
 #![cfg_attr(not(test), allow(dead_code))]
 
-use crate::chain::{Journal, State};
+use crate::chain::{Chain, Journal, State};
 use crate::consensus::{PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSION};
 use crate::state::codec::{decode, encode};
 use crate::state::{meta, ns, JMap, SubState, TMap, Table};
 use anyhow::{bail, ensure, Result};
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+/// An upgrade activates at least this many blocks after the block that schedules it. Proposers
+/// and verifiers within this many blocks of a height (`consensus.rs` waits until it is) therefore
+/// know the version in force there, whatever executes in between. Above `MAX_EXEC_LAG` and the
+/// 64 ancestors a proposer replays; a code bound, not a parameter, because lowering it would let
+/// a verifier reject a valid block.
+pub const MIN_UPGRADE_LEAD: u64 = 64;
+
+/// Exit codes of a node that stops on purpose (docs/OPERATIONS.md: systemd's
+/// `RestartPreventExitStatus=10 11 12` keeps it down until an operator acts).
+pub const EXIT_HALT_HEIGHT: i32 = 10;
+pub const EXIT_UPGRADE_REQUIRED: i32 = 11;
+pub const EXIT_DOUBLE_SIGN_RISK: i32 = 12;
 
 /// Features governance can switch on and off. A name outside this list can't be activated.
 pub const KNOWN_FEATURES: &[&str] = &["ghost"];
@@ -110,11 +133,11 @@ pub fn is_active(state: &State, feature: &str) -> bool {
 // ---- levers (`ProposalKind::ScheduleUpgrade`, `ActivateFeature`, `DeactivateFeature`): no
 // signer checks, governance (P-GOV) calls them when a proposal executes.
 
-/// Schedules protocol `version` from `activation_height` on: later than now and than every
-/// scheduled upgrade, and a newer version than all of them.
+/// Schedules protocol `version` from `activation_height` on: at least [`MIN_UPGRADE_LEAD`] blocks
+/// from now, after every scheduled upgrade, and a newer version than all of them.
 pub(crate) fn exec_schedule_upgrade(state: &mut State, j: &mut Journal, version: u32, activation_height: u64, height: u64) -> Result<()> {
-    if activation_height <= height {
-        bail!("an upgrade must activate after block {height}");
+    if activation_height < height.saturating_add(MIN_UPGRADE_LEAD) {
+        bail!("an upgrade must activate at least {MIN_UPGRADE_LEAD} blocks after block {height}");
     }
     if version <= version_at(state, activation_height) {
         bail!("protocol v{version} isn't newer than v{} (in force at block {activation_height})", version_at(state, activation_height));
@@ -157,14 +180,170 @@ pub fn version_at(state: &State, height: u64) -> u32 {
     state.upgrade.schedule.iter().filter(|u| u.activation_height <= height).map(|u| u.version).next_back().unwrap_or(PROTOCOL_VERSION)
 }
 
-/// The last end-of-block step: `Err` when this binary can't execute `next_height` (a version it
-/// doesn't support is scheduled), so the node halts cleanly instead of diverging.
+/// The next scheduled upgrade after `height`, if any.
+pub fn next_after(state: &State, height: u64) -> Option<&ScheduledUpgrade> {
+    state.upgrade.schedule.iter().find(|u| u.activation_height > height)
+}
+
+/// `Err` when this binary can't execute `next_height` (a version it doesn't support is
+/// scheduled there), so the node halts cleanly instead of diverging.
 pub fn check_next(state: &State, next_height: u64) -> Result<()> {
-    let v = version_at(state, next_height);
-    if v > SUPPORTED_PROTOCOL_VERSION {
-        bail!("block {next_height} runs protocol v{v}, but this binary supports up to v{SUPPORTED_PROTOCOL_VERSION}: upgrade blockula to keep following the chain");
+    check_next_with(state, next_height, SUPPORTED_PROTOCOL_VERSION).map_err(Into::into)
+}
+
+/// [`check_next`] for a node that supports protocol versions up to `supported`.
+pub fn check_next_with(state: &State, next_height: u64, supported: u32) -> Result<(), Halt> {
+    let version = version_at(state, next_height);
+    if version > supported {
+        return Err(Halt::UpgradeRequired { height: next_height, version, supported });
     }
     Ok(())
+}
+
+// ---- halts (node-local, never state)
+
+/// Why a node stopped executing blocks on purpose.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Halt {
+    /// `--halt-height`: `height` is executed, as asked.
+    HaltHeight { height: u64 },
+    /// Block `height` runs protocol `version`; this binary supports up to `supported`.
+    UpgradeRequired { height: u64, version: u32, supported: u32 },
+    /// Slashing protection saw this validator's key sign something this process didn't
+    /// (`protection.rs`): another instance runs with the same key.
+    DoubleSignRisk { reason: String },
+}
+
+impl Halt {
+    /// The process exit code for this halt.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Halt::HaltHeight { .. } => EXIT_HALT_HEIGHT,
+            Halt::UpgradeRequired { .. } => EXIT_UPGRADE_REQUIRED,
+            Halt::DoubleSignRisk { .. } => EXIT_DOUBLE_SIGN_RISK,
+        }
+    }
+
+    /// Short machine-readable kind (`/api/health`, `/metrics`).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Halt::HaltHeight { .. } => "halt_height",
+            Halt::UpgradeRequired { .. } => "upgrade_required",
+            Halt::DoubleSignRisk { .. } => "double_sign_risk",
+        }
+    }
+}
+
+impl std::fmt::Display for Halt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Halt::HaltHeight { height } => write!(f, "halted at block {height} (--halt-height): remove the flag, or raise it, to continue"),
+            Halt::UpgradeRequired { height, version, supported } => {
+                write!(f, "block {height} runs protocol v{version}, but this binary supports up to v{supported}: upgrade blockula to keep following the chain")
+            }
+            Halt::DoubleSignRisk { reason } => write!(f, "stopped to avoid double-signing: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for Halt {}
+
+/// The halt a node is in, shared with its HTTP API (which reports it without the chain lock).
+#[derive(Clone, Debug, Default)]
+pub struct HaltSignal(Arc<parking_lot::Mutex<Option<Halt>>>);
+
+impl HaltSignal {
+    pub fn get(&self) -> Option<Halt> {
+        self.0.lock().clone()
+    }
+
+    /// Records `halt` unless the node already halted (the first reason sticks).
+    pub fn set(&self, halt: Halt) {
+        self.0.lock().get_or_insert(halt);
+    }
+
+    fn clear(&self) {
+        *self.0.lock() = None;
+    }
+}
+
+/// A node's upgrade and halt settings (`Chain::halt`): not state, and not the same on every node.
+#[derive(Clone, Debug)]
+pub struct HaltControl {
+    /// Newest protocol version this node runs: [`SUPPORTED_PROTOCOL_VERSION`] (the simulator sets
+    /// others to model nodes running other binaries).
+    pub supported: u32,
+    /// `--halt-height`: execute this height, then stop.
+    pub halt_height: Option<u64>,
+    /// Set once the node stops executing.
+    pub signal: HaltSignal,
+}
+
+impl Default for HaltControl {
+    fn default() -> Self {
+        Self { supported: SUPPORTED_PROTOCOL_VERSION, halt_height: None, signal: HaltSignal::default() }
+    }
+}
+
+impl HaltControl {
+    /// Whether this node may still vote for, propose or execute a block at `height` given the
+    /// state it has executed: not halted, not past `--halt-height`, and a version it supports.
+    pub fn allows(&self, state: &State, height: u64) -> bool {
+        self.signal.get().is_none() && self.halt_height.is_none_or(|h| height <= h) && version_at(state, height) <= self.supported
+    }
+}
+
+/// Before executing `height`: refuses if the node halted, `height` is past `--halt-height`, or
+/// its version isn't supported (whatever the caller did, nothing past a halt executes).
+pub fn before_block(c: &Chain, height: u64) -> Result<()> {
+    if let Some(h) = c.halt.signal.get() {
+        return Err(h.into());
+    }
+    if let Some(h) = c.halt.halt_height.filter(|h| height > *h) {
+        return Err(Halt::HaltHeight { height: h }.into());
+    }
+    check_next_with(&c.state, height, c.halt.supported)?;
+    Ok(())
+}
+
+/// The last step after `height` is executed and stored: if the node must stop here (it reached
+/// `--halt-height`, or can't run the next height), records why and returns it as the error, which
+/// leaves the block unacknowledged so consensus delivers nothing more.
+pub fn after_block(c: &Chain, height: u64) -> Result<()> {
+    let halt = match c.halt.halt_height {
+        Some(h) if height >= h => Some(Halt::HaltHeight { height }),
+        _ => check_next_with(&c.state, height + 1, c.halt.supported).err(),
+    };
+    match halt {
+        Some(h) => {
+            c.halt.signal.set(h.clone());
+            Err(h.into())
+        }
+        None => Ok(()),
+    }
+}
+
+/// Sets this node's supported version and halt height and re-checks where it stands (at open,
+/// and whenever they change): a node already at its halt point is halted at once, which the
+/// caller reports (validators exit; full nodes serve reads).
+pub fn configure(c: &mut Chain, supported: u32, halt_height: Option<u64>) {
+    c.halt.supported = supported;
+    c.halt.halt_height = halt_height;
+    c.halt.signal.clear();
+    let height = c.height();
+    let _ = after_block(c, height);
+}
+
+/// What `/api/upgrade` reports about readiness: for each active validator, the newest version it
+/// signalled in the blocks it proposed among `blocks` (height, proposer, signal), newest first.
+pub fn signals<'a>(active: &[String], blocks: impl IntoIterator<Item = (u64, &'a str, u32)>) -> std::collections::BTreeMap<String, (u32, u64)> {
+    let mut out = std::collections::BTreeMap::new();
+    for (height, proposer, signal) in blocks {
+        if active.iter().any(|a| a == proposer) && !out.contains_key(proposer) {
+            out.insert(proposer.to_string(), (signal, height));
+        }
+    }
+    out
 }
 
 /// The upgrade module's consistency rules (part of `State::check_invariants`).

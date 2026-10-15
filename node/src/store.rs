@@ -74,8 +74,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Version of the tables and their encodings. A store of another format (or state schema) is
-/// rebuilt from the logs on open.
-pub const STORE_FORMAT: u32 = 1;
+/// rebuilt from the logs on open. 2: block rows carry `version` and `signal`.
+pub const STORE_FORMAT: u32 = 2;
 pub const DB_FILE: &str = "state.redb";
 /// redb's page cache.
 pub const CACHE_BYTES: usize = 256 << 20;
@@ -176,6 +176,10 @@ pub struct BlockMeta {
     pub failed: Vec<(u32, String)>,
     /// The history rows written for this block: (tx index, account).
     pub history: Vec<(u32, String)>,
+    /// The protocol version the block ran under, and the newest one its proposer's binary
+    /// supports (upgrade readiness, `/api/blocks` and `/api/upgrade`).
+    pub version: u32,
+    pub signal: u32,
 }
 
 /// Where each tx's JSON sits in a block's JSON line: the compact serializer writes a nested
@@ -1085,7 +1089,7 @@ mod tests {
         use crate::types::{Action, Block, Tx};
         let tx = |memo: &str, nonce: u64| Tx { chain_id: "c".into(), from: "boo1x".into(), nonce, fee: 1, tip: 0, valid_until: 9, action: Action::Transfer { to: "a.boo".into(), amount: 2 }, memo: memo.into(), public_key: "ab".into(), signature: "cd".into() };
         let txs = vec![tx("\"txs\":[", 0), tx("", 1), tx("]", 2)];
-        let block = Block { height: 3, prev_hash: "p".into(), timestamp_ms: 1, view: 3, parent_view: 2, version: 1, proposer: "boo1p".into(), state_root: "r".into(), txs: txs.clone(), hash: "h".into(), signature: String::new(), failed: [(1, "no".to_string())].into(), skipped: vec![7, 9] };
+        let block = Block { height: 3, prev_hash: "p".into(), timestamp_ms: 1, view: 3, parent_view: 2, version: 1, signal: 1, proposer: "boo1p".into(), state_root: "r".into(), txs: txs.clone(), hash: "h".into(), signature: String::new(), failed: [(1, "no".to_string())].into(), skipped: vec![7, 9] };
         let line = serde_json::to_vec(&block).unwrap();
         let spans = tx_spans(&line, &block.txs);
         assert_eq!(spans.len(), 3);
