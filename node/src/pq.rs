@@ -337,4 +337,27 @@ mod tests {
         assert!(!b.public_key().verify(b"other", b"msg", &sig));
         assert_eq!(sig, b.sign(b"ns", b"msg"), "deterministic");
     }
+
+    /// Votes go through slashing protection: a conflicting one is never signed at all.
+    #[test]
+    fn the_scheme_signs_only_what_slashing_protection_allows() {
+        use commonware_consensus::simplex::types::{Notarize, Nullify, Proposal};
+        use commonware_consensus::types::{Epoch, Round, View};
+        use commonware_cryptography::{blake3::Digest, certificate::Scheme as _};
+        let key = PrivateKey::from_seed_bytes([3; 32]);
+        let set = Set::try_from(vec![key.public_key()]).unwrap();
+        let p = crate::protection::Protection::in_memory(key.public_key().as_ref(), crate::protection::Timing::for_block_time(1_000));
+        p.enter_epoch(1, Some(0), 1, 0);
+        let scheme = MlDsaScheme::signer(b"ns", set, key).unwrap().with_protection(Some(p.clone()));
+        let round = Round::new(Epoch::new(1), View::new(4));
+        let proposal = |d: u8| Proposal::new(round, View::new(3), Digest([d; 32]));
+        let a = Notarize::sign(&scheme, proposal(1)).expect("first notarize");
+        assert!(Notarize::sign(&scheme, proposal(1)) == Some(a), "the identical vote again (deterministic)");
+        assert!(Notarize::sign(&scheme, proposal(2)).is_none(), "a conflicting notarize is never signed");
+        assert!(Nullify::sign::<Digest>(&scheme, round).is_some());
+        let recorded = hex::encode(crate::crypto::hash(&Subject::Notarize { proposal: &proposal(1) }.message()));
+        assert_eq!(p.record().votes[&4].notarize, Some(recorded));
+        // A verifier-only scheme never consults it.
+        assert!(MlDsaScheme::verifier(b"ns", Set::try_from(vec![PrivateKey::from_seed_bytes([4; 32]).public_key()]).unwrap()).sign::<Digest>(Subject::Nullify { round }).is_none());
+    }
 }

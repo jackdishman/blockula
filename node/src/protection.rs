@@ -483,3 +483,249 @@ pub fn subject_parts<D: commonware_cryptography::Digest>(subject: &Subject<'_, D
         Subject::Finalize { proposal } => (Kind::Finalize, proposal.round),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pq::PrivateKey;
+    use commonware_consensus::simplex::types::{Finalization, Notarization, Notarize, Proposal};
+    use commonware_consensus::types::{Epoch, View};
+    use commonware_cryptography::{certificate::Scheme as _, Signer as _};
+    use commonware_utils::{iter::NonEmpty, ordered::Set};
+
+    const T: Timing = Timing { settle_ms: 2_000, watch_ms: 5_000, escape_ms: 20_000, views: 2 };
+
+    fn public_key(seed: u8) -> Vec<u8> {
+        PrivateKey::from_seed_bytes([seed; 32]).public_key().as_ref().to_vec()
+    }
+
+    fn round(epoch: u64, view: u64) -> Round {
+        Round::new(Epoch::new(epoch), View::new(view))
+    }
+
+    /// A certificate by `signers` (indices) for `(epoch, view)` over `msg`.
+    fn cert(p: &Protection, epoch: u64, view: u64, kind: Kind, msg: &[u8], signers: &[u32]) {
+        p.observe_certificate(round(epoch, view), kind, || msg.to_vec(), signers.iter().copied());
+    }
+
+    /// The network finishing views `from..=to` of `epoch` (signed by validators 1–3), one every
+    /// 500 ms from `t` on; returns the time after the last.
+    fn progress(p: &Protection, epoch: u64, from: u64, to: u64, mut t: u64) -> u64 {
+        for v in from..=to {
+            cert(p, epoch, v, Kind::Notarize, format!("block {v}").as_bytes(), &[1, 2, 3]);
+            t += 500;
+            p.tick(t);
+        }
+        t
+    }
+
+    #[test]
+    fn the_record_refuses_equivocation_and_allows_signing_again() {
+        let p = Protection::in_memory(&public_key(1), T);
+        p.enter_epoch(3, Some(0), 1, 0); // alone in the set: nothing to watch
+        let sign = |e, v, k, m: &str| p.check_and_record(e, v, k, m.as_bytes());
+        assert!(sign(3, 5, Kind::Notarize, "a"));
+        assert!(sign(3, 5, Kind::Notarize, "a"), "the identical vote again");
+        assert!(!sign(3, 5, Kind::Notarize, "b"), "ConflictingNotarize");
+        assert!(sign(3, 5, Kind::Nullify, ""), "notarize then nullify is allowed");
+        assert!(sign(3, 5, Kind::Nullify, ""));
+        assert!(!sign(3, 5, Kind::Finalize, "a"), "NullifyFinalize");
+        assert!(sign(3, 6, Kind::Notarize, "x") && sign(3, 6, Kind::Finalize, "x"));
+        assert!(!sign(3, 6, Kind::Nullify, ""), "nullify after finalize");
+        assert!(!sign(3, 6, Kind::Finalize, "y"), "ConflictingFinalize");
+        assert!(sign(3, 6, Kind::Finalize, "x"));
+        assert_eq!(p.status().refused, 4);
+        // A new epoch starts a new record; the old epoch is closed.
+        p.enter_epoch(4, Some(0), 1, 0);
+        assert!(!sign(3, 7, Kind::Notarize, "a"), "an older epoch");
+        assert!(sign(4, 1, Kind::Notarize, "a"));
+        assert_eq!((p.record().epoch, p.record().votes.len()), (4, 1));
+        // The window: views that fell out of it are refused.
+        for v in 2..=(RECORD_VIEWS as u64 + 9) {
+            assert!(sign(4, v, Kind::Notarize, "z"));
+        }
+        let r = p.record();
+        assert_eq!((r.votes.len(), r.floor, r.last_view()), (RECORD_VIEWS, 9, RECORD_VIEWS as u64 + 9));
+        assert!(!sign(4, 9, Kind::Nullify, ""), "below the window");
+        assert!(sign(4, 10, Kind::Nullify, ""));
+        assert_eq!((p.status().epoch, p.status().view), (4, RECORD_VIEWS as u64 + 9));
+    }
+
+    #[test]
+    fn the_record_is_on_disk_before_the_signature_and_bound_to_its_key() {
+        let dir = std::env::temp_dir().join(format!("blockula-protection-{}-{}", crate::chain::now_ms(), std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(RECORD_FILE);
+        let p = Protection::open(&path, &public_key(1), T, true).unwrap();
+        p.enter_epoch(2, Some(0), 1, 0);
+        assert!(p.check_and_record(2, 7, Kind::Finalize, b"block"));
+        let on_disk: Record = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(on_disk, p.record());
+        assert_eq!(on_disk.votes[&7].finalize.as_deref(), Some(hex::encode(crate::crypto::hash(b"block")).as_str()));
+        assert!(!dir.join("slashing-protection.json.tmp").exists());
+        drop(p);
+        // A restart refuses what conflicts with the record.
+        let p = Protection::open(&path, &public_key(1), T, true).unwrap();
+        p.enter_epoch(2, Some(0), 1, 0);
+        assert!(!p.check_and_record(2, 7, Kind::Nullify, b""));
+        assert!(p.check_and_record(2, 7, Kind::Finalize, b"block"));
+        // Another key's record, or a broken one, stops the node instead of being ignored.
+        assert!(Protection::open(&path, &public_key(2), T, true).unwrap_err().to_string().contains("protects key"));
+        std::fs::write(&path, b"{\"format\":").unwrap();
+        assert!(Protection::open(&path, &public_key(1), T, true).unwrap_err().to_string().contains("isn't a valid"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// After a start, nothing is signed until the network has finished two more views than it
+    /// had once the start settled, and then only views above every certificate seen.
+    #[test]
+    fn a_start_watches_the_network_before_signing() {
+        let p = Protection::in_memory(&public_key(1), T);
+        p.enter_epoch(5, Some(0), 4, 1_000);
+        assert!(p.status().abstaining);
+        assert!(!p.check_and_record(5, 1, Kind::Nullify, b""), "watching");
+        // Certificates replayed or caught up on: the network had reached view 40.
+        cert(&p, 5, 39, Kind::Notarize, b"39", &[0, 1, 2]);
+        cert(&p, 5, 40, Kind::Notarize, b"40", &[1, 2, 3]);
+        p.tick(3_000); // settled: baseline 40
+        p.tick(6_500); // watched long enough, but no progress yet
+        assert!(!p.check_and_record(5, 41, Kind::Notarize, b"41"));
+        let t = progress(&p, 5, 41, 41, 6_500);
+        assert!(p.status().abstaining, "one view isn't enough");
+        progress(&p, 5, 42, 42, t);
+        assert!(!p.status().abstaining);
+        assert!(!p.check_and_record(5, 42, Kind::Nullify, b""), "at or below what the network certified");
+        assert!(!p.check_and_record(5, 30, Kind::Notarize, b"old"));
+        assert!(p.check_and_record(5, 43, Kind::Notarize, b"43"));
+        // Later epochs need no watching (the earlier instance never reached them) ...
+        p.enter_epoch(6, Some(0), 4, 9_000);
+        assert!(p.check_and_record(6, 1, Kind::Notarize, b"e6"));
+        // ... and the previous epoch is over.
+        assert!(!p.check_and_record(5, 44, Kind::Notarize, b"44"));
+        assert_eq!(p.status().refused, 5);
+    }
+
+    /// A network that can't progress without this node (every validator restarting, or a halt)
+    /// gets its vote back after the escape time, with the record as the only guard.
+    #[test]
+    fn a_stalled_network_gets_this_node_back_after_the_escape_time() {
+        let p = Protection::in_memory(&public_key(1), T);
+        p.enter_epoch(2, Some(0), 4, 0);
+        cert(&p, 2, 10, Kind::Nullify, b"", &[1, 2, 3]);
+        for t in (0..20_000).step_by(250) {
+            p.tick(t);
+            assert!(!p.check_and_record(2, 11, Kind::Nullify, b""), "{t}");
+        }
+        p.tick(20_000);
+        assert!(!p.check_and_record(2, 10, Kind::Nullify, b""));
+        assert!(p.check_and_record(2, 11, Kind::Nullify, b""));
+        // Every validator restarting at once: nothing to observe at all.
+        let q = Protection::in_memory(&public_key(1), T);
+        q.enter_epoch(0, Some(0), 4, 0);
+        q.tick(19_999);
+        assert!(!q.check_and_record(0, 1, Kind::Notarize, b"b"));
+        q.tick(20_000);
+        assert!(q.check_and_record(0, 1, Kind::Notarize, b"b"));
+    }
+
+    /// The case the restart rule exists for: a volume restored from a snapshot taken at view 10,
+    /// after the old instance had signed through view 20. The record alone (rolled back) would
+    /// let it nullify view 15, which it had finalized: slashable. Watching the network doesn't.
+    #[test]
+    fn a_restored_record_alone_would_double_sign_but_watching_the_network_does_not() {
+        let old = Protection::in_memory(&public_key(1), T);
+        old.enter_epoch(1, Some(0), 1, 0);
+        let mut snapshot = None;
+        for v in 1..=20 {
+            assert!(old.check_and_record(1, v, Kind::Notarize, format!("{v}").as_bytes()) && old.check_and_record(1, v, Kind::Finalize, format!("{v}").as_bytes()));
+            if v == 10 {
+                snapshot = Some(old.record());
+            }
+        }
+        let snapshot = snapshot.unwrap();
+        let restored = |participants| {
+            let p = Protection::with_record(None, false, T, snapshot.clone());
+            p.enter_epoch(1, Some(0), participants, 0);
+            p
+        };
+        // Record only (nobody to watch): the stale record lets the conflicting vote through.
+        assert!(restored(1).check_and_record(1, 15, Kind::Nullify, b""), "the rolled-back record knows nothing of view 15");
+        // With the restart rule, the restored node first sees the network move on from view 21.
+        let p = restored(4);
+        cert(&p, 1, 21, Kind::Finalize, b"21", &[1, 2, 3]);
+        p.tick(2_000);
+        progress(&p, 1, 22, 23, 4_000);
+        assert!(!p.check_and_record(1, 15, Kind::Nullify, b""));
+        assert!(!p.check_and_record(1, 20, Kind::Nullify, b""));
+        assert!(p.check_and_record(1, 24, Kind::Nullify, b""));
+    }
+
+    #[test]
+    fn a_signature_this_process_never_made_halts_it() {
+        // Open at view 30 after watching (this node is validator 0).
+        let p = Protection::in_memory(&public_key(1), T);
+        p.enter_epoch(1, Some(0), 4, 0);
+        cert(&p, 1, 26, Kind::Notarize, b"26", &[1, 2, 3]);
+        p.tick(2_000);
+        let t = progress(&p, 1, 27, 30, 2_000);
+        p.tick(t + 1_000);
+        assert!(p.check_and_record(1, 31, Kind::Notarize, b"ours"));
+        // Our own vote coming back, in a certificate or as a vote: fine.
+        cert(&p, 1, 31, Kind::Notarize, b"ours", &[0, 2, 3]);
+        p.observe_vote(round(1, 31), Kind::Notarize, || b"ours".to_vec(), 0);
+        // An earlier instance's signature in a view the network had certified: not proof.
+        cert(&p, 1, 29, Kind::Finalize, b"29", &[0, 1, 2]);
+        assert!(p.halted().is_none());
+        // Our key on something we never signed, past what an earlier instance could reach.
+        cert(&p, 1, 32, Kind::Notarize, b"theirs", &[1, 2, 3]);
+        assert!(p.halted().is_none(), "not our index");
+        cert(&p, 1, 32, Kind::Notarize, b"theirs", &[0, 2, 3]);
+        assert!(p.halted().unwrap().contains("another instance"));
+        assert!(!p.check_and_record(1, 33, Kind::Notarize, b"next"), "signs nothing more");
+        // While watching: a vote under our key far past the baseline is a running clone.
+        let q = Protection::in_memory(&public_key(1), T);
+        q.enter_epoch(1, Some(0), 4, 0);
+        cert(&q, 1, 50, Kind::Notarize, b"50", &[1, 2, 3]);
+        q.tick(2_000);
+        q.observe_vote(round(1, 52), Kind::Nullify, Vec::new, 0);
+        assert!(q.halted().is_none(), "within reach of a stopped instance");
+        q.observe_vote(round(1, 53), Kind::Nullify, Vec::new, 0);
+        assert!(q.halted().is_some());
+        // Before the start settles there's no baseline to judge against.
+        let r = Protection::in_memory(&public_key(1), T);
+        r.enter_epoch(1, Some(0), 4, 0);
+        r.observe_vote(round(1, 500), Kind::Nullify, Vec::new, 0);
+        assert!(r.halted().is_none());
+    }
+
+    /// The observer reads real simplex certificates and votes (ML-DSA, assembled by the scheme).
+    #[test]
+    fn the_observer_reads_simplex_activity() {
+        let keys: Vec<PrivateKey> = (1..=4).map(|s| PrivateKey::from_seed_bytes([s; 32])).collect();
+        let set = Set::try_from(keys.iter().map(|k| k.public_key()).collect::<Vec<_>>()).unwrap();
+        let schemes: Vec<MlDsaScheme> = keys.iter().map(|k| MlDsaScheme::signer(b"blockula/test", set.clone(), k.clone()).unwrap()).collect();
+        let index = |k: &PrivateKey| set.position(&k.public_key()).unwrap() as u32;
+        let (me, others): (Vec<&MlDsaScheme>, Vec<&MlDsaScheme>) = schemes.iter().partition(|s| s.me().map(|i| usize::from(i) as u32) == Some(index(&keys[0])));
+        let p = Protection::in_memory(keys[0].public_key().as_ref(), T);
+        p.enter_epoch(1, Some(index(&keys[0])), 4, 0);
+        let mut observer = Observer(p.clone());
+        let notarization = |view: u64, signers: &[&MlDsaScheme], payload: u8| {
+            let proposal = Proposal::new(round(1, view), View::new(view - 1), Digest([payload; 32]));
+            let votes: Vec<Notarize<MlDsaScheme, Digest>> = signers.iter().map(|s| Notarize::sign(*s, proposal.clone()).unwrap()).collect();
+            Notarization::from_notarizes(signers[0], NonEmpty::try_new(votes.iter()).unwrap(), &commonware_parallel::Sequential).unwrap()
+        };
+        for v in 10..=14 {
+            let n = notarization(v, &others, v as u8);
+            observer.report(Activity::Notarization(n));
+            p.tick(v * 1_000);
+        }
+        assert!(!p.status().abstaining, "watched views 10–14 go by");
+        // A finalization including our signature on a block we never notarized or finalized.
+        let proposal = Proposal::new(round(1, 15), View::new(14), Digest([7; 32]));
+        let finalizes: Vec<_> = [me[0], others[0], others[1]].iter().map(|s| commonware_consensus::simplex::types::Finalize::sign(*s, proposal.clone()).unwrap()).collect();
+        let f = Finalization::from_finalizes(me[0], NonEmpty::try_new(finalizes.iter()).unwrap(), &commonware_parallel::Sequential).unwrap();
+        assert!(p.halted().is_none());
+        observer.report(Activity::Finalization(f));
+        assert!(p.halted().unwrap().contains("Finalize vote in epoch 1, view 15"));
+    }
+}
