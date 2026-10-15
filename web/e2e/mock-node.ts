@@ -64,8 +64,8 @@ export class MockNode {
   ]);
   /** Shares by account, then validator. */
   shares = new Map<string, Map<string, bigint>>();
-  unbonding = new Map<string, { validator: string; amount: bigint; completes_at: number }[]>();
-  /** Governance proposals as the node serves them (tolerantly read by the wallet). */
+  unbonding = new Map<string, { id: number; validator: string; amount: bigint; started_at: number; release_at: number }[]>();
+  /** Governance proposals as node/src/api.rs serves them (`proposal_json`), before this mock adds its votes. */
   proposals: Record<string, unknown>[] = [];
   votes: { proposal_id: number; voter: string; aye: boolean; amount: bigint; conviction: number }[] = [];
 
@@ -239,14 +239,15 @@ export class MockNode {
       pool.stake -= value;
       pool.shares -= shares;
       mine.set(act.validator, held - shares);
-      this.unbonding.set(tx.from, [...(this.unbonding.get(tx.from) ?? []), { validator: act.validator, amount: value, completes_at: this.height + 10 }]);
+      const entries = this.unbonding.get(tx.from) ?? [];
+      this.unbonding.set(tx.from, [...entries, { id: entries.length, validator: act.validator, amount: value, started_at: this.height + 1, release_at: this.height + 10 }]);
       summary = `${this.label(tx.from).short} started unbonding ${shares} shares of validator ${this.label(act.validator).short}'s pool`;
     } else if (act.type === "withdraw_unbonded") {
       const entries = this.unbonding.get(tx.from) ?? [];
-      const ready = entries.filter((u) => u.completes_at <= this.height);
+      const ready = entries.filter((u) => u.release_at <= this.height + 1);
       if (!ready.length) throw new HttpError(400, "nothing has finished unbonding");
       a.balance += ready.reduce((t, u) => t + u.amount, 0n);
-      this.unbonding.set(tx.from, entries.filter((u) => u.completes_at > this.height));
+      this.unbonding.set(tx.from, entries.filter((u) => u.release_at > this.height + 1));
       summary = `${this.label(tx.from).short} withdrew their unbonded stake`;
     } else if (act.type === "vote") {
       if (!this.governance) throw new HttpError(400, "not active yet");
@@ -264,30 +265,45 @@ export class MockNode {
     return this.record({ tx, kind: act.type, from: tx.from, to, amount: act.type === "transfer" ? amount : null, fee, memo: tx.memo, summary });
   }
 
+  /** `/api/validators` as node/src/api.rs serves it (`validator_json`). */
   private validators() {
-    const active = [...this.pools].map(([address, p]) => ({ validator: { ...this.label(address), name: p.name }, status: "active", p2p_addr: "203.0.113.1:30300", bond: "0", stake: p.stake.toString(), stake_display: formatFang(p.stake), commission_bps: p.commission_bps, jailed: false }));
-    return { epoch: 3, active, next_epoch: active, max_validators: 31 };
+    const active = [...this.pools].map(([address, p]) => ({
+      validator: { ...this.label(address), name: p.name }, owner: this.label(address), status: "active", consensus_key: "", p2p_addr: "203.0.113.1:30300", http_addr: "",
+      stake: p.stake.toString(), stake_display: formatFang(p.stake), bond: p.stake.toString(), bond_display: formatFang(p.stake), shares: p.shares.toString(),
+      self_bond: p.stake.toString(), self_bond_display: formatFang(p.stake), commission_bps: p.commission_bps, commission_display: `${p.commission_bps / 100}%`,
+      eligible: true, jailed: null, tombstoned_at: null, slashed_display: "0 FANG", liveness: null, genesis: true,
+    }));
+    return { epoch: 3, epoch_blocks: 3600, blocks_until_next_epoch: 100, active, next_epoch: active, joining: [], leaving: [], candidates: [], jailed: [], tombstoned: [], removed: [], admins: [], min_bond: "10000000000000", min_bond_display: "10000 FANG", max_validators: 31, churn_limit: 0 };
   }
 
+  /** `/api/staking/{account}` as node/src/api.rs serves it. */
   private stakingOf(account: string) {
     const mine = this.shares.get(account) ?? new Map<string, bigint>();
     const delegations = [...mine].filter(([, s]) => s > 0n).map(([v, shares]) => {
-      const p = this.pools.get(v) as { stake: bigint; shares: bigint; commission_bps: number };
-      return { validator: this.label(v), shares: shares.toString(), value: ((shares * p.stake) / p.shares).toString(), commission_bps: p.commission_bps };
+      const p = this.pools.get(v) as { stake: bigint; shares: bigint };
+      const value = (shares * p.stake) / p.shares;
+      return { validator: this.label(v), shares: shares.toString(), value: value.toString(), value_display: formatFang(value), principal: value.toString(), earned_display: "0 FANG", self_bond: false };
     });
-    const unbonding = (this.unbonding.get(account) ?? []).map((u) => ({ validator: u.validator, amount: u.amount.toString(), completes_at: u.completes_at }));
-    return { account, delegations, unbonding };
+    const next = this.height + 1;
+    const entries = (this.unbonding.get(account) ?? []).map((u) => ({ id: u.id, type: "unbonding", validator: this.label(u.validator), amount: u.amount.toString(), amount_display: formatFang(u.amount), started_at: u.started_at, release_at: u.release_at, ready: u.release_at <= next }));
+    const sum = (xs: bigint[]) => xs.reduce((t, x) => t + x, 0n);
+    const bonded = sum(delegations.map((d) => BigInt(d.value)));
+    const unbonding = sum((this.unbonding.get(account) ?? []).map((u) => u.amount));
+    const withdrawable = sum((this.unbonding.get(account) ?? []).filter((u) => u.release_at <= next).map((u) => u.amount));
+    return { account: this.label(account), bonded: bonded.toString(), unbonding: unbonding.toString(), withdrawable: withdrawable.toString(), delegations, entries, validators: [], summary: `${this.label(account).short} has ${formatFang(bonded)} staked` };
   }
 
-  /** A proposal with its tally from the votes cast so far (weights at 0.1× … 6× conviction). */
+  /** A proposal (`proposal_json`) with the votes cast here added to its tallies (weights at 0.1× … 6× conviction). */
   private proposalView(p: Record<string, unknown>) {
     const tenths = [1n, 10n, 20n, 30n, 40n, 50n, 60n];
     const mine = this.votes.filter((v) => v.proposal_id === p.id);
-    const sum = (aye: boolean) => mine.filter((v) => v.aye === aye).reduce((t, v) => t + (v.amount * tenths[v.conviction]) / 10n, 0n);
-    const base = (p.tally ?? {}) as Record<string, string>;
-    const aye = BigInt(base.aye ?? "0") + sum(true);
-    const nay = BigInt(base.nay ?? "0") + sum(false);
-    return { ...p, tally: { ...base, aye: aye.toString(), nay: nay.toString() } };
+    const big = (d: bigint) => ({ drops: d.toString(), display: formatFang(d) });
+    const side = (aye: boolean, base: unknown) => {
+      const b = (base ?? {}) as { amount?: { drops: string }; weight?: { drops: string } };
+      const votes = mine.filter((v) => v.aye === aye);
+      return { amount: big(BigInt(b.amount?.drops ?? "0") + votes.reduce((t, v) => t + v.amount, 0n)), weight: big(BigInt(b.weight?.drops ?? "0") + votes.reduce((t, v) => t + (v.amount * tenths[v.conviction]) / 10n, 0n)) };
+    };
+    return { ...p, ayes: side(true, p.ayes), nays: side(false, p.nays), voters: Number(p.voters ?? 0) + mine.length };
   }
 
   private async handle(route: Route) {
@@ -306,7 +322,8 @@ export class MockNode {
       if (req.method() === "GET" && (m = path.match(/^\/name\/(.+)$/))) {
         const n = m[1].toLowerCase().replace(/\.boo$/, "");
         const owner = this.names.get(n);
-        return reply(200, owner ? { name: `${n}.boo`, available: false, owner: this.label(owner) } : { name: `${n}.boo`, available: true, price: parseFang("5").toString(), price_display: "5 FANG" });
+        const prices = { price: parseFang("5").toString(), price_display: "5 FANG", renewal_price: parseFang("1").toString(), renewal_price_display: "1 FANG", registration_blocks: 31_557_600, grace_blocks: 2_592_000 };
+        return reply(200, owner ? { name: `${n}.boo`, ...prices, owner: this.label(owner), registered_at: 1, expires_at: 31_557_601, grace_until: 34_149_601, status: "active", available: false } : { name: `${n}.boo`, ...prices, status: "available", available: true });
       }
       if (req.method() === "GET" && (m = path.match(/^\/tx\/([0-9a-f]{64})$/))) {
         const r = this.txs.get(m[1]);
@@ -321,8 +338,10 @@ export class MockNode {
       if (req.method() === "POST" && path === "/tx") return reply(200, { id: this.submit(JSON.parse(body ?? "{}") as Tx) });
       if (req.method() === "GET" && path === "/validators") return reply(200, this.validators());
       if (req.method() === "GET" && this.staking && (m = path.match(/^\/staking\/(.+)$/))) return reply(200, this.stakingOf(this.resolve(m[1])));
-      if (req.method() === "GET" && this.governance && path.startsWith("/proposals")) return reply(200, { proposals: this.proposals.map((p) => this.proposalView(p)) });
-      if (req.method() === "GET" && (this.staking || this.governance) && path === "/params") return reply(200, { params: { unbonding_blocks: "1814400", lock_period_blocks: "604800", proposal_deposit: (1000n * 10n ** 9n).toString() } });
+      if (req.method() === "GET" && this.governance && path.startsWith("/proposals")) return reply(200, { count: this.proposals.length, next_id: this.proposals.length, council_active: true, spending_open: false, params: { supermajority_bps: 6667, voting_blocks: 604_800, timelock_blocks: 172_800, lock_period_blocks: 604_800 }, proposals: this.proposals.map((p) => this.proposalView(p)) });
+      if (req.method() === "GET" && path === "/params") return reply(200, { params: { unbonding_blocks: "1814400", lock_period_blocks: "604800", proposal_deposit: (1000n * 10n ** 9n).toString(), max_validators: "31" }, genesis: { block_time_ms: 1000, epoch_blocks: 3600, address_prefix: "tboo", epochs_per_year: 8766 }, issuance: { year: 1, rate_ppm: 60000 } });
+      // The base fee at its genesis floor (node/src/api.rs `fees`): what Wallet.build prices at.
+      if (req.method() === "GET" && path === "/fees") return reply(200, { height: this.height, lag: 17, rate_scale: 1000, slots: [], suggested: { flat: "10000", rate: "10000" }, floor: { flat: "10000", per_byte: "10" }, target_fullness_bps: 5000, max_change_bps: 1250, account_creation_fee: "100000000", account_creation_fee_display: "0.1 FANG" });
       return reply(404, { error: `mock node: no route for ${req.method()} ${path}` });
     } catch (e) {
       return reply(e instanceof HttpError ? e.status : 500, { error: e instanceof Error ? e.message : String(e) });

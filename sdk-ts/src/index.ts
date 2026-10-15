@@ -152,16 +152,13 @@ export const proposal = {
   },
 };
 
-// ---- Tolerant readers for the protocol v1 endpoints: they accept the shapes the node has used
-// and fill what's missing, so wallets and agents don't break on a renamed field. ----
+// ---- Readers for the protocol v1 endpoints: they take what the node serves (node/src/api.rs)
+// and return plain shapes with amounts as decimal strings of drops. They don't throw on a
+// missing field (an older node, or a page that hasn't loaded): it reads as empty or zero. ----
 
 /** A JSON object, or an empty one. */
 const obj = (v: unknown): Record<string, any> => (v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, any>) : {});
-/** The first of `keys` that `o` has (not null). */
-const first = (o: Record<string, any>, ...keys: string[]) => {
-  for (const k of keys) if (o[k] !== undefined && o[k] !== null) return o[k];
-  return undefined;
-};
+const arr = (v: unknown): any[] => (Array.isArray(v) ? v : []);
 /** Drops as a decimal string: from a string or number of drops, or "0". */
 const drops = (v: unknown): string => {
   if (typeof v === "bigint") return v.toString();
@@ -174,7 +171,7 @@ const addressOf = (v: unknown): string => (typeof v === "string" ? v : String(ob
 const nameOf = (v: unknown): string | null => (typeof v === "object" && v ? (obj(v).name ?? null) : null);
 const num = (v: unknown): number | undefined => (typeof v === "number" ? v : typeof v === "string" && /^\d+$/.test(v) ? Number(v) : undefined);
 
-/** One pool an account has stake in. */
+/** One pool an account has stake in (`/api/staking/{account}` `delegations[]`). */
 export interface StakeDelegation {
   validator: string;
   validator_name: string | null;
@@ -182,56 +179,56 @@ export interface StakeDelegation {
   shares: string;
   /** Their current value, in drops. */
   value: string;
-  commission_bps?: number;
-  jailed?: boolean;
+  /** What went in, less what sales and slashes took (value above it is earnings). */
+  principal: string;
+  /** This is the validator's owner's self-bond. */
+  self_bond: boolean;
 }
 
-/** An account's stake, normalized from `/api/staking/{account}`. */
+/** Stake on its way out (`entries[]` of type `unbonding`): paid out by `withdrawUnbonded` from `completes_at`. */
+export interface StakeUnbonding {
+  id: number;
+  validator: string;
+  amount: string;
+  started_at: number;
+  completes_at: number;
+  ready: boolean;
+}
+
+/** Stake moved between pools (`entries[]` of type `redelegation`): slashable by `from` until `completes_at`. */
+export interface StakeRedelegation {
+  id: number;
+  from: string;
+  to: string;
+  amount: string;
+  completes_at: number;
+}
+
+/** An account's stake, from `/api/staking/{account}`. */
 export interface StakeSummary {
   delegations: StakeDelegation[];
-  unbonding: { validator: string | null; amount: string; completes_at?: number }[];
+  unbonding: StakeUnbonding[];
+  redelegations: StakeRedelegation[];
   /** Total value staked, in drops. */
   bonded: string;
   /** Total unbonding, in drops. */
   unbonding_total: string;
-  /** Unbonding entries that have completed (what `withdrawUnbonded` pays now), in drops, when the node says. */
-  withdrawable?: string;
+  /** Unbonding that has finished (what `withdrawUnbonded` pays now), in drops. */
+  withdrawable: string;
+  /** The node's plain-English summary. */
+  summary: string;
 }
 
-export function stakeSummary(raw: unknown, height?: number): StakeSummary {
+export function stakeSummary(raw: unknown): StakeSummary {
   const r = obj(raw);
-  const list = (v: unknown) => (Array.isArray(v) ? v : []);
-  const delegations: StakeDelegation[] = list(first(r, "delegations", "stakes", "pools")).map((d0) => {
+  const delegations: StakeDelegation[] = arr(r.delegations).map((d0) => {
     const d = obj(d0);
-    const v = first(d, "validator", "pool");
-    return {
-      validator: addressOf(v),
-      validator_name: nameOf(v),
-      shares: drops(first(d, "shares")),
-      value: drops(first(d, "value", "amount", "stake", "bonded")),
-      commission_bps: num(first(d, "commission_bps")),
-      jailed: typeof d.jailed === "boolean" ? d.jailed : undefined,
-    };
+    return { validator: addressOf(d.validator), validator_name: nameOf(d.validator), shares: drops(d.shares), value: drops(d.value), principal: drops(d.principal), self_bond: d.self_bond === true };
   });
-  const unbonding = list(first(r, "unbonding", "unbonding_entries", "unbondings")).map((u0) => {
-    const u = obj(u0);
-    const v = first(u, "validator", "pool");
-    return { validator: v === undefined ? null : addressOf(v), amount: drops(first(u, "amount", "value")), completes_at: num(first(u, "completes_at", "release_at", "unlocks_at", "matures_at", "until")) };
-  });
-  const sum = (xs: string[]) => xs.reduce((a, x) => a + BigInt(x), 0n).toString();
-  const bonded = first(r, "bonded", "staked", "total_bonded");
-  const unb = first(r, "unbonding_total", "total_unbonding");
-  let withdrawable: string | undefined = first(r, "withdrawable") !== undefined ? drops(first(r, "withdrawable")) : undefined;
-  if (withdrawable === undefined && height !== undefined && unbonding.every((u) => u.completes_at !== undefined)) {
-    withdrawable = sum(unbonding.filter((u) => (u.completes_at as number) <= height).map((u) => u.amount));
-  }
-  return {
-    delegations,
-    unbonding,
-    bonded: bonded !== undefined ? drops(bonded) : sum(delegations.map((d) => d.value)),
-    unbonding_total: unb !== undefined ? drops(unb) : sum(unbonding.map((u) => u.amount)),
-    withdrawable,
-  };
+  const entries = arr(r.entries).map(obj);
+  const unbonding: StakeUnbonding[] = entries.filter((e) => e.type === "unbonding").map((e) => ({ id: num(e.id) ?? 0, validator: addressOf(e.validator), amount: drops(e.amount), started_at: num(e.started_at) ?? 0, completes_at: num(e.release_at) ?? 0, ready: e.ready === true }));
+  const redelegations: StakeRedelegation[] = entries.filter((e) => e.type === "redelegation").map((e) => ({ id: num(e.id) ?? 0, from: addressOf(e.from), to: addressOf(e.to), amount: drops(e.amount), completes_at: num(e.release_at) ?? 0 }));
+  return { delegations, unbonding, redelegations, bonded: drops(r.bonded), unbonding_total: drops(r.unbonding), withdrawable: drops(r.withdrawable), summary: String(r.summary ?? "") };
 }
 
 /** Shares worth about `value` drops in a delegation (rounded down, at most all of them). */
@@ -242,70 +239,85 @@ export function sharesFor(d: StakeDelegation, value: Amount): bigint {
   return (want * shares) / worth;
 }
 
-/** `/api/params` as a key → value map (values as strings: amounts can exceed 2^53). */
+/** `/api/params`' governance parameters as a key → value map (values as strings: amounts can exceed 2^53). */
 export function paramsOf(raw: unknown): Record<string, string> {
-  const r = obj(raw);
-  const p = obj(first(r, "params", "chain_params") ?? r);
   const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(p)) {
-    const x = typeof v === "object" && v !== null ? first(obj(v), "value") : v;
-    if ((typeof x === "number" && Number.isSafeInteger(x)) || (typeof x === "string" && /^\d+$/.test(x))) out[k] = String(x);
+  for (const [k, v] of Object.entries(obj(obj(raw).params))) {
+    if ((typeof v === "number" && Number.isSafeInteger(v)) || (typeof v === "string" && /^\d+$/.test(v))) out[k] = String(v);
   }
   return out;
 }
 
-/** A proposal, normalized from `/api/proposals` or `/api/proposal/{id}`. Weights are in drops. */
+/** A proposal, from `/api/proposals` (`proposals[]`) or `/api/proposal/{id}`. Amounts are in drops. */
 export interface ProposalSummary {
   id: number;
   title: string;
   url: string;
-  /** What it does, in plain English (the node's summary), else the kind's type. */
+  /** What it does, in plain English (the node's summary). */
   summary: string;
-  kind: unknown;
+  kind: ProposalKind | null;
   proposer: string | null;
   proposer_name: string | null;
+  /** `voting`, `queued`, `rejected`, `executed` or `failed`. */
   status: string;
   deposit: string;
+  /** Conviction-weighted ayes and nays (what the majority counts) … */
   aye: string;
   nay: string;
-  /** Raw FANG locked in votes (what quorum counts), when reported. */
-  turnout?: string;
+  /** … and the raw FANG behind them (what quorum counts). */
+  aye_amount: string;
+  nay_amount: string;
+  /** aye_amount + nay_amount. */
+  turnout: string;
+  voters: number;
+  /** The quorum it had to reach and whether it did: known once voting closed. */
   quorum?: string;
-  /** Bootstrap council: active validators approving / rejecting, and the set size. */
-  council?: { ayes: number; nays: number; of: number; needed?: number };
-  voting_ends_at?: number;
+  quorum_reached?: boolean;
+  /** Bootstrap-council votes so far (one per validator); `of` is the set's size at the close. */
+  council: { ayes: number; nays: number; of?: number };
+  /** Whether it needs `supermajority_bps` of the weight (upgrades, feature activations, issuance parameters, large spends). */
+  supermajority: boolean;
+  /** Last block votes count in, and when a passed proposal runs (after the timelock). */
+  voting_ends_at: number;
   executes_at?: number;
-  /** Supermajority in basis points, when this kind needs one. */
+  /** Why it was rejected or failed, or what it did. */
+  outcome: string;
+  /** With `rules` (`/api/proposals`' `params`): the share of the weight its ayes need, in basis points. */
   threshold_bps?: number;
 }
 
-export function proposalSummary(raw: unknown): ProposalSummary {
+export function proposalSummary(raw: unknown, rules?: { supermajority_bps?: number }): ProposalSummary {
   const p = obj(raw);
-  const tally = obj(first(p, "tally", "votes"));
-  const council = obj(first(p, "council"));
-  const kind = first(p, "kind", "action");
-  const proposer = first(p, "proposer", "from", "by");
-  const cAyes = num(first(council, "ayes", "aye", "approvals"));
-  const turnout = first(tally, "turnout", "locked") ?? first(p, "turnout");
-  const quorum = first(tally, "quorum") ?? first(p, "quorum");
+  const weight = (side: unknown) => drops(obj(obj(side).weight).drops);
+  const amount = (side: unknown) => drops(obj(obj(side).amount).drops);
+  const tally = p.tally ? obj(p.tally) : null;
+  const council = arr(p.council).map(obj);
+  const [ayeAmount, nayAmount] = [amount(p.ayes), amount(p.nays)];
+  const supermajority = p.supermajority === true;
   return {
     id: num(p.id) ?? -1,
     title: String(p.title ?? ""),
     url: typeof p.url === "string" ? p.url : "",
-    summary: String(first(p, "summary", "description") ?? obj(kind).type ?? ""),
-    kind,
-    proposer: proposer === undefined ? null : addressOf(proposer),
-    proposer_name: nameOf(proposer),
-    status: String(first(p, "status", "phase") ?? "unknown"),
-    deposit: drops(first(p, "deposit")),
-    aye: drops(first(tally, "aye", "ayes", "aye_weight") ?? first(p, "aye", "ayes", "aye_weight")),
-    nay: drops(first(tally, "nay", "nays", "nay_weight") ?? first(p, "nay", "nays", "nay_weight")),
-    turnout: turnout === undefined ? undefined : drops(turnout),
-    quorum: quorum === undefined ? undefined : drops(quorum),
-    council: cAyes !== undefined ? { ayes: cAyes, nays: num(first(council, "nays", "nay", "rejections")) ?? 0, of: num(first(council, "of", "active", "set_size", "validators")) ?? 0, needed: num(first(council, "needed", "threshold")) } : undefined,
-    voting_ends_at: num(first(p, "voting_ends_at", "voting_until", "ends_at", "end")),
-    executes_at: num(first(p, "executes_at", "timelock_until", "execute_at")),
-    threshold_bps: num(first(p, "threshold_bps", "supermajority_bps")),
+    summary: String(p.summary ?? ""),
+    kind: p.kind && typeof p.kind === "object" ? (p.kind as ProposalKind) : null,
+    proposer: p.proposer === undefined ? null : addressOf(p.proposer),
+    proposer_name: nameOf(p.proposer),
+    status: String(p.status ?? "unknown"),
+    deposit: drops(p.deposit),
+    aye: weight(p.ayes),
+    nay: weight(p.nays),
+    aye_amount: ayeAmount,
+    nay_amount: nayAmount,
+    turnout: (BigInt(ayeAmount) + BigInt(nayAmount)).toString(),
+    voters: num(p.voters) ?? 0,
+    quorum: tally ? drops(obj(tally.quorum).drops) : undefined,
+    quorum_reached: tally ? tally.quorum_reached === true : undefined,
+    council: { ayes: council.filter((c) => c.aye === true).length, nays: council.filter((c) => c.aye === false).length, of: tally ? num(tally.council_size) : undefined },
+    supermajority,
+    voting_ends_at: num(p.voting_end) ?? 0,
+    executes_at: num(p.execute_at),
+    outcome: String(p.outcome ?? ""),
+    threshold_bps: supermajority ? rules?.supermajority_bps : undefined,
   };
 }
 
@@ -448,19 +460,21 @@ export class Wallet {
   }
 
   /**
-   * Offer a validator: bonds `bond` FANG from this account. `consensusKeyHex` is the validator
-   * node's ML-DSA-65 public key (see `blockula validator init`). Pending until an admin approves.
+   * Register a validator owned by this account, self-bonding `bond` FANG into its stake pool (at
+   * least the chain's `min_self_bond`). `consensusKey` is the validator node's ML-DSA-65 public
+   * key and `pop` its proof of possession (see `blockula validator init`). It's a candidate: at
+   * each epoch boundary the top `max_validators` pools by stake form the next active set.
    */
   async registerValidator(opts: { consensusKey: string; p2pAddr: string; httpAddr: string; bond: string | number | bigint; pop: string }) {
     return this.client.submit(await this.build({ type: "register_validator", consensus_key: opts.consensusKey, p2p_addr: opts.p2pAddr, http_addr: opts.httpAddr, bond: parseFang(opts.bond).toString(), pop: opts.pop }));
   }
 
-  /** Season 0 admins only. */
+  /** Dev and test chains with admins only: pin a validator into the set ahead of stake. */
   async approveValidator(validator: string) {
     return this.client.submit(await this.build({ type: "approve_validator", validator }));
   }
 
-  /** Season 0 admins only. */
+  /** Dev and test chains with admins only: take a validator out of the set for good. */
   async removeValidator(validator: string) {
     return this.client.submit(await this.build({ type: "remove_validator", validator }));
   }
@@ -549,27 +563,27 @@ export class Wallet {
     return this.client.submit(await this.build({ type: "withdraw_vested" }));
   }
 
-  /** Season 0 admins only. Weight 1–100; 0 removes the repo. */
+  /** Admins of dev and test chains only (elsewhere: a governance proposal). Weight 1–100; 0 removes the repo. */
   async setRepo(repo: string, weight: number) {
     return this.client.submit(await this.build({ type: "set_repo", repo, weight }));
   }
 
-  /** Season 0 admins only. `soul` in Soul ("2.5"), up to 100 per grant. */
+  /** Admins of dev and test chains only (elsewhere: a governance proposal). `soul` in Soul ("2.5"), up to 100 per grant. */
   async grantSoul(to: string, soul: string | number, reason: string) {
     return this.client.submit(await this.build({ type: "grant_soul", to: await this.client.resolve(to), amount: parseSoul(soul), reason }));
   }
 
-  /** Season 0 admins only. */
+  /** Admins of dev and test chains only (elsewhere: a governance proposal). */
   async rejectClaim(claimId: number, reason: string) {
     return this.client.submit(await this.build({ type: "reject_claim", claim_id: claimId, reason }));
   }
 
-  /** Season 0 admins only. */
+  /** Admins of dev and test chains only (elsewhere: a governance proposal). */
   async flagSybil(account: string, reason: string) {
     return this.client.submit(await this.build({ type: "flag_sybil", account: await this.client.resolve(account), reason }));
   }
 
-  /** Season 0 admins only. */
+  /** Admins of dev and test chains only (elsewhere: a governance proposal). */
   async clawback(account: string, reason: string) {
     return this.client.submit(await this.build({ type: "clawback", account: await this.client.resolve(account), reason }));
   }
@@ -866,7 +880,7 @@ export class Client {
   /** Accounts a key is authorized on (its own address, plus any it was added to). */
   keyAccounts(keyIdHex: string) { return this.call(`/key/${keyIdHex}`); }
   search(q: string) { return this.call(`/search/${encodeURIComponent(q)}`); }
-  /** Active set for the current epoch, pending/approved validators, next-epoch set, epoch timing. */
+  /** The validator set: `active` this epoch, `next_epoch` (with `joining`/`leaving`), `candidates`, `jailed`, `tombstoned` and `removed`, each with stake, self-bond, commission, jail and liveness; epoch timing; the churn limit and slashing parameters. */
   validators() { return this.call("/validators"); }
   /** Hunts (bounties on GitHub issues), biggest first. */
   hunts(status?: "open" | "awarded" | "cancelled" | "expired") { return this.call(`/hunts${status ? `?status=${status}` : ""}`); }
@@ -885,15 +899,16 @@ export class Client {
   /** Soul leaderboard. */
   souls(limit = 50) { return this.call(`/souls?limit=${limit}`); }
 
-  // ---- protocol v1 reads. Shapes are the node's; `stakeSummary` / `proposalSummary` / `paramsOf` normalize them. ----
+  // ---- protocol v1 reads, as the node serves them; `stakeSummary` / `proposalSummary` / `paramsOf` read them into plain shapes. ----
 
-  /** An account's stake: delegations by pool (shares and their value), unbonding entries, totals. */
+  /** An account's stake: `delegations` (shares, value, principal), `entries` (unbonding and redelegations, with `release_at`), `bonded`, `unbonding` and `withdrawable` totals, the `validators` it runs, a `summary`. */
   staking(account: string) { return this.call(`/staking/${encodeURIComponent(account)}`); }
-  /** Governance proposals, newest first, with tallies, council votes and timelock (`status`: e.g. "voting", "passed", "rejected", "executed"). */
+  /** Governance proposals, newest first (`status`: `voting`, `queued`, `rejected`, `executed`, `failed`), the rules (`params`), treasury and community balances. */
   proposals(opts: { status?: string; limit?: number } = {}) {
     const q = new URLSearchParams(Object.entries(opts).filter(([, v]) => v !== undefined).map(([k, v]) => [k, String(v)])).toString();
     return this.call(`/proposals${q ? `?${q}` : ""}`);
   }
+  /** One proposal with its votes. */
   proposal(id: number) { return this.call(`/proposal/${id}`); }
   /** A community distribution: Merkle root, total, claimed so far, claim deadline. */
   distribution(id: number) { return this.call(`/distribution/${id}`); }

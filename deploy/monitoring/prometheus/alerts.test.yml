@@ -317,6 +317,47 @@ tests:
               summary: "v1: only 6.25% of memory available"
               runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#memory
 
+  # Staking: this node's validator (own="1") misses slots, then is jailed; another validator's
+  # series (own="0") never alerts here.
+  - interval: 1m
+    input_series:
+      - series: 'blockula_validator_missed_slots{job="blockula",instance="a",node="v1",validator="boo1me",own="1"}'
+        values: "0 10 30 30 30 30"
+      - series: 'blockula_validator_missed_slots{job="blockula",instance="a",node="v1",validator="boo1other",own="0"}'
+        values: "60x5"
+      - series: 'blockula_downtime_max_missed{job="blockula",instance="a",node="v1"}'
+        values: "50x5"
+      - series: 'blockula_validator_jailed{job="blockula",instance="a",node="v1",validator="boo1me",own="1"}'
+        values: "0 0 0 0 1 1"
+      - series: 'blockula_validator_jailed{job="blockula",instance="a",node="v1",validator="boo1other",own="0"}'
+        values: "1x5"
+      - series: 'blockula_validator_tombstoned{job="blockula",instance="a",node="v1",validator="boo1me",own="1"}'
+        values: "0x5"
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: BlockulaValidatorMissingSlots
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: BlockulaValidatorMissingSlots
+        exp_alerts:
+          - exp_labels: { severity: warning, job: blockula, instance: a, node: v1, validator: boo1me, own: "1" }
+            exp_annotations:
+              summary: "v1: validator boo1me missed 30 of its recent leader slots (jailed past 50)"
+              runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#jailed-or-tombstoned
+      - eval_time: 3m
+        alertname: BlockulaValidatorJailed
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: BlockulaValidatorJailed
+        exp_alerts:
+          - exp_labels: { severity: critical, job: blockula, instance: a, node: v1, validator: boo1me, own: "1" }
+            exp_annotations:
+              summary: "v1: validator boo1me is jailed"
+              runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#jailed-or-tombstoned
+      - eval_time: 5m
+        alertname: BlockulaValidatorTombstoned
+        exp_alerts: []
+
   - interval: 1m
     input_series: []
     alert_rule_test:

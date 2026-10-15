@@ -6,8 +6,8 @@
 # Thresholds come from the protocol: 1 s blocks, MAX_EXEC_LAG = 16 and MAX_CLOCK_DRIFT_MS = 1000
 # (node/src/consensus.rs), MAX_MEMPOOL = 5000 (node/src/chain.rs). Change them with the code.
 #
-# Planned, once the node exports them (see the TODO panels in the dashboard): missed leader
-# slots per validator and this validator jailed or tombstoned (P-STAKE).
+# Staking (node/src/staking.rs): the node exports leader-slot misses, jail and tombstone flags
+# per validator; its own validator's series carry `own="1"`, which is what these alerts watch.
 groups:
   - name: blockula-recording
     rules:
@@ -172,6 +172,30 @@ groups:
         annotations:
           summary: "{{ $labels.node }}: still not signing, watching the network after a start"
           runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#slashing-protection
+
+      # Staking: this node's validator was jailed (missed too many leader slots, or a beacon
+      # reveal) or tombstoned (double-signed). Jailed: it left the set and lost a light slash;
+      # tombstoned: it's out for good. Both page.
+      - alert: BlockulaValidatorJailed
+        expr: blockula_validator_jailed{own="1"} == 1
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.node }}: validator {{ $labels.validator }} is jailed"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#jailed-or-tombstoned
+      - alert: BlockulaValidatorTombstoned
+        expr: blockula_validator_tombstoned{own="1"} == 1
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.node }}: validator {{ $labels.validator }} was tombstoned for double-signing"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#jailed-or-tombstoned
+      # Half the misses its downtime window allows: act before it's jailed.
+      - alert: BlockulaValidatorMissingSlots
+        expr: blockula_validator_missed_slots{own="1"} > on(job, instance, node) group_left blockula_downtime_max_missed / 2
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }}: validator {{ $labels.validator }} missed {{ $value }} of its recent leader slots (jailed past {{ with printf `blockula_downtime_max_missed{node=\"%s\"}` $labels.node | query }}{{ . | first | value }}{{ end }})"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#jailed-or-tombstoned
 
       # NaN: no finalization certificate among the last 16 executed heights.
       - alert: BlockulaNoRecentCertificate

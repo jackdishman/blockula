@@ -24,7 +24,9 @@ const GENESIS = "6e".repeat(32);
 interface Host { status: Record<string, unknown>; routes: Record<string, unknown>; posted: Tx[]; blocks: Record<number, string> }
 const hosts = new Map<string, Host>();
 function host(rpc: string, status: Record<string, unknown> = {}): Host {
-  const h: Host = { status: { chain_id: "unit", genesis_hash: GENESIS, address_prefix: "boo", height: 50, max_tx_validity_blocks: 3600, ...status }, routes: {}, posted: [], blocks: {} };
+  // Every node serves its base fee (node/src/api.rs `fees`); at the floor here.
+  const fees = { height: 50, lag: 17, rate_scale: 1000, slots: [], suggested: { flat: "10000", rate: "10000" }, floor: { flat: "10000", per_byte: "10" }, account_creation_fee: "100000000" };
+  const h: Host = { status: { chain_id: "unit", genesis_hash: GENESIS, address_prefix: "boo", height: 50, max_tx_validity_blocks: 3600, ...status }, routes: { "/fees": fees }, posted: [], blocks: {} };
   hosts.set(new URL(rpc).host, h);
   return h;
 }
@@ -58,8 +60,9 @@ globalThis.fetch = (async (input: string | URL, init?: RequestInit) => {
 const node = host(RPC);
 const client = new Client(RPC);
 const me = Wallet.fromSeed("07".repeat(32), client);
-node.routes["/params"] = { params: { proposal_deposit: "1000000000000", max_validators: 31 } };
-node.routes[`/staking/${me.address}`] = { account: me.address, delegations: [{ validator: { address: VALIDATOR, name: "vlad.boo" }, shares: "4000", value: "5000000000" }], unbonding: [] };
+// Shapes as node/src/api.rs serves them.
+node.routes["/params"] = { params: { proposal_deposit: "1000000000000", max_validators: "31" }, genesis: { block_time_ms: 1000, epoch_blocks: 3600 }, issuance: { year: 0 } };
+node.routes[`/staking/${me.address}`] = { account: { address: me.address, name: null }, bonded: "5000000000", unbonding: "0", withdrawable: "0", delegations: [{ validator: { address: VALIDATOR, name: "vlad.boo" }, shares: "4000", value: "5000000000", principal: "5000000000", self_bond: false }], entries: [], validators: [], summary: "has 5 FANG staked with 1 validator" };
 
 /** Runs a helper and returns the one tx it submitted, after checking what every tx must satisfy. */
 async function signed(run: () => Promise<unknown>): Promise<Tx> {
@@ -160,23 +163,39 @@ assert.throws(() => new Client(RPC, { genesisHash: "abc" }), /64 hex/);
 assert.throws(() => new Client(RPC, { prefix: "xboo" }), /unknown address prefix/);
 console.log("✓ pinned clients refuse another chain id, genesis or prefix");
 
-// ---- tolerant readers ----
+// ---- readers of the module endpoints, on the node's own shapes ----
 
-const s = stakeSummary({ delegations: [{ validator: { address: VALIDATOR, name: "vlad.boo" }, shares: "10", value: "30", commission_bps: 500, jailed: false }], unbonding: [{ validator: VALIDATOR, amount: "7", completes_at: 40 }, { amount: 5, completes_at: 90 }] }, 50);
-assert.deepEqual(s, { delegations: [{ validator: VALIDATOR, validator_name: "vlad.boo", shares: "10", value: "30", commission_bps: 500, jailed: false }], unbonding: [{ validator: VALIDATOR, amount: "7", completes_at: 40 }, { validator: null, amount: "5", completes_at: 90 }], bonded: "30", unbonding_total: "12", withdrawable: "7" });
-assert.deepEqual(stakeSummary({ stakes: [{ pool: VALIDATOR, shares: 3, amount: "9" }], bonded: "100", unbonding_total: "4", withdrawable: "2" }), { delegations: [{ validator: VALIDATOR, validator_name: null, shares: "3", value: "9", commission_bps: undefined, jailed: undefined }], unbonding: [], bonded: "100", unbonding_total: "4", withdrawable: "2" });
-assert.deepEqual(stakeSummary(null), { delegations: [], unbonding: [], bonded: "0", unbonding_total: "0", withdrawable: undefined });
+const s = stakeSummary({
+  bonded: "30", unbonding: "12", withdrawable: "7",
+  delegations: [{ validator: { address: VALIDATOR, name: "vlad.boo" }, shares: "10", value: "30", value_display: "0.00000003 FANG", principal: "25", earned_display: "0.000000005 FANG", self_bond: false }],
+  entries: [
+    { id: 1, type: "unbonding", validator: { address: VALIDATOR, name: "vlad.boo" }, amount: "7", amount_display: "", started_at: 10, release_at: 40, ready: true },
+    { id: 2, type: "unbonding", validator: { address: OTHER_VALIDATOR, name: null }, amount: "5", started_at: 60, release_at: 90, ready: false },
+    { id: 3, type: "redelegation", from: { address: VALIDATOR, name: "vlad.boo" }, to: { address: OTHER_VALIDATOR, name: null }, amount: "2", started_at: 60, release_at: 95 },
+  ],
+  validators: [], summary: "vlad.boo has …",
+});
+assert.deepEqual(s, {
+  delegations: [{ validator: VALIDATOR, validator_name: "vlad.boo", shares: "10", value: "30", principal: "25", self_bond: false }],
+  unbonding: [{ id: 1, validator: VALIDATOR, amount: "7", started_at: 10, completes_at: 40, ready: true }, { id: 2, validator: OTHER_VALIDATOR, amount: "5", started_at: 60, completes_at: 90, ready: false }],
+  redelegations: [{ id: 3, from: VALIDATOR, to: OTHER_VALIDATOR, amount: "2", completes_at: 95 }],
+  bonded: "30", unbonding_total: "12", withdrawable: "7", summary: "vlad.boo has …",
+});
+assert.deepEqual(stakeSummary(null), { delegations: [], unbonding: [], redelegations: [], bonded: "0", unbonding_total: "0", withdrawable: "0", summary: "" });
 assert.equal(sharesFor(s.delegations[0], 15n), 5n);
 assert.equal(sharesFor(s.delegations[0], 999n), 10n, "at most all of them");
-assert.deepEqual(paramsOf({ params: { a: "1", b: 2, c: { value: "3", min: "0" }, d: "x", e: 1.5 } }), { a: "1", b: "2", c: "3" });
-assert.deepEqual(paramsOf({ a: "5" }), { a: "5" });
-const p = proposalSummary({ id: 4, title: "t", kind: { type: "text" }, proposer: { address: BOB, name: "bob.boo" }, status: "voting", deposit: "9", tally: { aye: "30", nay: "10", turnout: "25", quorum: "20" }, council: { ayes: 15, nays: 1, of: 22 }, voting_ends_at: 99, executes_at: 120 });
-assert.deepEqual([p.id, p.summary, p.proposer, p.proposer_name, p.aye, p.nay, p.turnout, p.quorum, p.council, p.voting_ends_at, p.executes_at], [4, "text", BOB, "bob.boo", "30", "10", "25", "20", { ayes: 15, nays: 1, of: 22, needed: undefined }, 99, 120]);
-assert.deepEqual([proposalSummary({}).status, proposalSummary({}).aye, proposalSummary({}).council], ["unknown", "0", undefined]);
+assert.deepEqual(paramsOf({ params: { a: "1", b: 2, c: { value: "3" }, d: "x", e: 1.5 }, genesis: { epoch_blocks: 600 } }), { a: "1", b: "2" });
+const big = (d: string) => ({ drops: d, display: "" });
+const voting = { id: 4, title: "t", url: "", kind: { type: "text" }, summary: "a signal", proposer: { address: BOB, name: "bob.boo" }, deposit: "9", status: "voting", created_at: 80, voting_end: 99, execute_at: null, supermajority: false, ayes: { amount: big("25"), weight: big("30") }, nays: { amount: big("5"), weight: big("10") }, voters: 3, council: [{ validator: { address: VALIDATOR, name: "vlad.boo" }, aye: true, voter: { address: VALIDATOR, name: "vlad.boo" } }, { validator: { address: OTHER_VALIDATOR, name: null }, aye: false, voter: { address: BOB, name: "bob.boo" } }], tally: null, outcome: "" };
+const p = proposalSummary(voting);
+assert.deepEqual([p.id, p.summary, p.proposer, p.proposer_name, p.aye, p.nay, p.aye_amount, p.nay_amount, p.turnout, p.quorum, p.council, p.voting_ends_at, p.executes_at, p.supermajority], [4, "a signal", BOB, "bob.boo", "30", "10", "25", "5", "30", undefined, { ayes: 1, nays: 1, of: undefined }, 99, undefined, false]);
+const closed = proposalSummary({ ...voting, status: "queued", execute_at: 120, supermajority: true, tally: { unlocked_supply: big("1000"), quorum: big("20"), quorum_reached: true, supermajority: true, council_size: 22, council_ayes: 1, council_nays: 1 } }, { supermajority_bps: 6667 });
+assert.deepEqual([closed.status, closed.quorum, closed.quorum_reached, closed.council.of, closed.executes_at, closed.threshold_bps], ["queued", "20", true, 22, 120, 6667]);
+assert.deepEqual([proposalSummary({}).status, proposalSummary({}).aye, proposalSummary({}).council], ["unknown", "0", { ayes: 0, nays: 0, of: undefined }]);
 assert.equal(convictionWeight("10", 0), FANG);
 assert.equal(convictionWeight("10", 6), 60n * FANG);
 assert.throws(() => convictionWeight("1", 7), /conviction/);
-console.log("✓ tolerant readers for staking, params and proposals");
+console.log("✓ readers for staking, params and proposals");
 
 // ---- proven reads: the proof checks out, and witnesses must agree on the root ----
 

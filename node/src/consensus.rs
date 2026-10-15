@@ -1269,8 +1269,10 @@ pub fn simplex_partition(prefix: &str, epoch: u64) -> String {
 /// checkpoint certificates keep serving history over HTTP).
 pub const MARSHAL_RETAIN: u64 = 2_000;
 /// Bumped when the on-disk storage layout changes (consensus journals, or the home's own files:
-/// v4 is the segmented block logs and the state database, see `store.rs`).
-pub const STORAGE_VERSION: &str = "prunable-v4";
+/// v4 is the segmented block logs and the state database, see `store.rs`; v5 the integrated
+/// protocol v1: txs signed for a genesis hash, state schema 4, block metadata with signals). Dev
+/// chains from an older layout reset themselves (`node::dev_is_stale`).
+pub const STORAGE_VERSION: &str = "prunable-v5";
 
 fn archive_config<C>(prefix: &str, name: &str, page_cache: CacheRef, codec_config: C) -> prunable::Config<TwoCap, C> {
     prunable::Config {

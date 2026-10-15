@@ -708,15 +708,13 @@ pub struct Shares {
 /// The delegations in a `/api/staking/{account}` response, as (validator address, shares). Tolerant
 /// of the field names the endpoint has used: a validator label or address, shares as a string or
 /// number.
+/// `(validator, shares)` of each delegation in a `/api/staking/{account}` answer.
 fn delegations(v: &Value) -> Vec<(String, u64)> {
-    let list = ["delegations", "stakes", "pools"].iter().find_map(|k| v[k].as_array()).cloned().unwrap_or_default();
-    list.iter()
-        .filter_map(|d| {
-            let val = if d["validator"].is_null() { &d["pool"] } else { &d["validator"] };
-            let addr = val.as_str().or(val["address"].as_str())?.to_string();
-            let shares = d["shares"].as_u64().or_else(|| d["shares"].as_str()?.parse().ok())?;
-            Some((addr, shares))
-        })
+    v["delegations"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|d| Some((d["validator"]["address"].as_str()?.to_string(), d["shares"].as_str()?.parse().ok()?)))
         .collect()
 }
 
@@ -738,10 +736,15 @@ pub fn stake(cmd: StakeCmd, dir: &Path) -> Result<()> {
                 None => rt.block_on(own_address(&signer.rpc, &signer.keys(dir).map_err(|_| anyhow!("no wallet here; pass --account"))?))?,
             };
             let v = rt.block_on(get(&signer.rpc, &format!("/staking/{who}"))).with_context(|| format!("{} doesn't serve /api/staking (is staking active on this chain?)", signer.rpc))?;
-            let shown = |k: &str| v[format!("{k}_display")].as_str().map(String::from).or_else(|| v[k].as_str().map(|d| d.parse::<u64>().map(fmt_fang).unwrap_or_else(|_| d.to_string())));
-            println!("{who} · staked {} · unbonding {}", shown("bonded").unwrap_or_else(|| "?".into()), shown("unbonding_total").unwrap_or_else(|| "?".into()));
-            for (validator, shares) in delegations(&v) {
-                println!("   {validator}  {shares} shares");
+            println!("{}", v["summary"].as_str().unwrap_or_default());
+            for d in v["delegations"].as_array().into_iter().flatten() {
+                println!("   {}  {} shares  worth {}{}", name_of(&d["validator"]), d["shares"].as_str().unwrap_or_default(), d["value_display"].as_str().unwrap_or_default(), if d["self_bond"] == true { "  (self-bond)" } else { "" });
+            }
+            for e in v["entries"].as_array().into_iter().flatten() {
+                match e["type"].as_str() {
+                    Some("unbonding") => println!("   unbonding {} from {}: {}", e["amount_display"].as_str().unwrap_or_default(), name_of(&e["validator"]), if e["ready"] == true { "ready to withdraw".to_string() } else { format!("free at block {}", e["release_at"]) }),
+                    _ => println!("   redelegated {} from {} to {} (slashable by the first until block {})", e["amount_display"].as_str().unwrap_or_default(), name_of(&e["from"]), name_of(&e["to"]), e["release_at"]),
+                }
             }
             Ok(())
         }
@@ -771,9 +774,9 @@ mod tests {
     /// `/api/staking` is read tolerantly: labels or bare addresses, shares as strings or numbers.
     #[test]
     fn staking_responses_parse() {
-        let v = serde_json::json!({ "delegations": [{ "validator": { "address": "boo1v", "name": "v.boo" }, "shares": "40" }, { "validator": "boo1w", "shares": 7 }, { "validator": "boo1x" }] });
+        // As node/src/api.rs serves it (`api::http_tests::validators_and_staking` checks the node's side).
+        let v = serde_json::json!({ "bonded": "47", "delegations": [{ "validator": { "address": "boo1v", "name": "v.boo" }, "shares": "40", "value": "40", "self_bond": false }, { "validator": { "address": "boo1w", "name": null }, "shares": "7", "value": "7", "self_bond": true }], "entries": [] });
         assert_eq!(delegations(&v), vec![("boo1v".to_string(), 40), ("boo1w".to_string(), 7)]);
-        assert_eq!(delegations(&serde_json::json!({ "pools": [{ "pool": "boo1p", "shares": 1 }] })), vec![("boo1p".to_string(), 1)]);
         assert!(delegations(&serde_json::json!({})).is_empty());
     }
 

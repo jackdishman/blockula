@@ -57,6 +57,8 @@ pub struct Node {
     pub protection: Option<Arc<crate::protection::Protection>>,
     /// Validators: connected p2p peers, for /metrics.
     pub p2p_peers: Option<Arc<dyn Fn() -> Option<usize> + Send + Sync>>,
+    /// This node's validator address (its key's), if it has one: /metrics marks its series `own="1"`.
+    pub me: Option<String>,
 }
 
 /// When this process started (unix seconds), for `blockula_process_start_time_seconds`.
@@ -294,11 +296,11 @@ fn too_many(what: &str, wait: Duration) -> ApiError {
 
 impl Node {
     pub fn new(chain: Shared, marshal: Option<MarshalMailbox>, peers: Vec<String>, client_ip: ClientIpPolicy) -> Self {
-        let (live, halt) = {
+        let (live, halt, me) = {
             let c = chain.lock();
-            (c.live.clone(), c.halt.signal.clone())
+            (c.live.clone(), c.halt.signal.clone(), c.me())
         };
-        Self { chain, live, marshal, peers, client_ip, limits: Default::default(), reads: Arc::new(ReadLimiter::new(READ_RPS, READ_BURST)), timeout: HTTP_TIMEOUT, stats: Default::default(), extra_metrics: None, github_cache: Default::default(), checkpoint_height: 0, halt, protection: None, p2p_peers: None }
+        Self { chain, live, marshal, peers, client_ip, limits: Default::default(), reads: Arc::new(ReadLimiter::new(READ_RPS, READ_BURST)), timeout: HTTP_TIMEOUT, stats: Default::default(), extra_metrics: None, github_cache: Default::default(), checkpoint_height: 0, halt, protection: None, p2p_peers: None, me }
     }
 
     /// Per-client read limits: `rps` per second, bursts of `burst` (`rps` 0: unlimited).
@@ -891,12 +893,34 @@ async fn metrics(State(n): State<Node>) -> Response {
                 ("blockula_slashing_protection_refused_total", "Vote signatures slashing protection refused", st.refused as f64),
             ]);
         }
-        // TODO(P-STAKE): blockula_missed_leader_slots_total{validator}, blockula_validator_jailed
-        // and blockula_validator_tombstoned once staking keeps liveness and jail records.
+        gauges.push(("blockula_downtime_max_missed", "Leader slots a validator may miss in its downtime window before it's jailed", v.state.chain_params.downtime_max_missed as f64));
         for (name, help, val) in gauges {
             let kind = if name.ends_with("_total") { "counter" } else { "gauge" };
             let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {val}");
         }
+        // Staking (staking.rs), per validator: leader-slot liveness over the downtime window, and
+        // jail and tombstone flags. For the active set, every jailed validator, validators
+        // tombstoned within the unbonding period (bounded: the set is at most 64) and this node's
+        // own, which is labelled `own="1"` (what its operator alerts on).
+        let st = &v.state;
+        let mut shown: std::collections::BTreeSet<&String> = st.active_sets.get(&epoch).map(|s| s.iter().collect()).unwrap_or_default();
+        let recent = h.saturating_sub(st.chain_params.unbonding_blocks);
+        shown.extend(st.staking.pools.iter().filter(|(_, p)| p.jail.is_some() || p.tombstoned_at.is_some_and(|t| t >= recent)).map(|(a, _)| a));
+        shown.extend(n.me.iter().filter(|a| st.validators.contains_key(*a)));
+        let series = |name: &str, help: &str, kind: &str, val: &dyn Fn(&str) -> f64| {
+            let mut s = format!("# HELP {name} {help}\n# TYPE {name} {kind}\n");
+            for a in &shown {
+                let own = u8::from(n.me.as_deref() == Some(a.as_str()));
+                let _ = writeln!(s, "{name}{{validator=\"{a}\",own=\"{own}\"}} {}", val(a));
+            }
+            s
+        };
+        let liveness = |a: &str| st.staking.liveness.get(a);
+        let pool = |a: &str| st.staking.pools.get(a);
+        out.push_str(&series("blockula_missed_leader_slots_total", "Leader slots the validator missed since its liveness record started (it restarts on unjail)", "counter", &|a| liveness(a).map_or(0.0, |l| l.missed_total as f64)));
+        out.push_str(&series("blockula_validator_missed_slots", "Leader slots the validator missed in its current downtime window (jailed past blockula_downtime_max_missed)", "gauge", &|a| liveness(a).map_or(0.0, |l| l.missed as f64)));
+        out.push_str(&series("blockula_validator_jailed", "1 while the validator is jailed", "gauge", &|a| f64::from(u8::from(pool(a).is_some_and(|p| p.jail.is_some())))));
+        out.push_str(&series("blockula_validator_tombstoned", "1 once the validator was tombstoned for double-signing (never active again)", "gauge", &|a| f64::from(u8::from(pool(a).is_some_and(|p| p.tombstoned_at.is_some())))));
         if let Some(h) = halt {
             let _ = writeln!(out, "# HELP blockula_halt_info Why the node halted\n# TYPE blockula_halt_info gauge\nblockula_halt_info{{kind=\"{}\"}} 1", h.kind());
         }
@@ -2139,6 +2163,11 @@ mod http_tests {
         assert_eq!(mine["delegations"][0]["self_bond"], true);
         let (s, _, _) = call(&n, "GET", "/api/staking/nobody.boo", None, "127.0.0.1:1").await;
         assert!(s.is_client_error());
+        // The staking series operators alert on (deploy/monitoring), for the active set.
+        let (_, _, text) = call(&n, "GET", "/metrics", None, "127.0.0.1:1").await;
+        for want in [format!("blockula_missed_leader_slots_total{{validator=\"{me}\",own=\"1\"}} 0"), format!("blockula_validator_missed_slots{{validator=\"{me}\",own=\"1\"}} 0"), format!("blockula_validator_jailed{{validator=\"{me}\",own=\"1\"}} 0"), format!("blockula_validator_tombstoned{{validator=\"{me}\",own=\"1\"}} 0"), "blockula_downtime_max_missed ".into()] {
+            assert!(text.contains(&want), "{want} in {text}");
+        }
         std::fs::remove_dir_all(root).ok();
     }
 

@@ -7,22 +7,33 @@ import { createWallet, cspViolations, expect, test, watchCsp } from "./helpers";
 const FANG = 10n ** 9n;
 
 test("lists proposals and votes with conviction", async ({ page, node }) => {
+  // As node/src/api.rs `proposal_json` serves them.
+  const big = (fang: bigint) => ({ drops: (fang * FANG).toString(), display: `${fang} FANG` });
+  const label = (address: string, name: string | null = null) => ({ address, name });
+  const council = [...Array(16)].map((_, i) => ({ validator: label(`boo1validator${i}`), aye: i < 15, voter: label(`boo1validator${i}`) }));
   node.proposals = [
     {
       id: 7,
       title: "Raise the active set to 40",
-      summary: "set max_validators to 40",
-      kind: { type: "param_change", key: "max_validators", value: "40" },
-      proposer: { address: "boo1proposer", name: "vlad.boo", short: "boo1pro…" },
-      status: "voting",
-      deposit: (1000n * FANG).toString(),
-      tally: { aye: (300n * FANG).toString(), nay: (100n * FANG).toString(), turnout: (400n * FANG).toString(), quorum: (1000n * FANG).toString() },
-      council: { ayes: 15, nays: 1, of: 22 },
-      voting_ends_at: node.height + 5000,
       url: "https://forum.blockula.test/p/7",
+      kind: { type: "param_change", key: "max_validators", value: "40" },
+      summary: "set max_validators to 40",
+      proposer: label("boo1proposer", "vlad.boo"),
+      deposit: (1000n * FANG).toString(),
+      status: "voting",
+      created_at: node.height - 10,
+      voting_end: node.height + 5000,
+      execute_at: null,
+      supermajority: false,
+      ayes: { amount: big(300n), weight: big(300n) },
+      nays: { amount: big(100n), weight: big(100n) },
+      voters: 4,
+      council,
+      tally: null,
+      outcome: "",
     },
     // On-chain strings are attacker-controlled: they must render as text, and only https links work.
-    { id: 6, title: '<img src=x onerror="window.__pwned=1">', summary: "<b>bold</b>", status: "rejected", url: "javascript:window.__pwned=2", tally: { aye: "0", nay: "5" } },
+    { id: 6, title: '<img src=x onerror="window.__pwned=1">', url: "javascript:window.__pwned=2", kind: { type: "text" }, summary: "<b>bold</b>", proposer: label("boo1proposer"), deposit: "0", status: "rejected", created_at: 1, voting_end: 2, execute_at: null, supermajority: false, ayes: { amount: big(0n), weight: big(0n) }, nays: { amount: big(5n), weight: big(5n) }, voters: 1, council: [], tally: { unlocked_supply: big(1000n), quorum: big(40n), quorum_reached: false, supermajority: false, council_size: 22, council_ayes: 0, council_nays: 0 }, outcome: "quorum not reached" },
   ];
   await watchCsp(page);
   await createWallet(page);
@@ -31,8 +42,8 @@ test("lists proposals and votes with conviction", async ({ page, node }) => {
 
   const open = page.getByTestId("proposal").filter({ hasText: "Raise the active set to 40" });
   await expect(open).toContainText("300 FANG aye · 100 FANG nay");
-  await expect(open).toContainText("400 FANG of 1000 FANG quorum");
-  await expect(open).toContainText("council: 15 of 22 validators approve");
+  await expect(open).toContainText("400 FANG voted");
+  await expect(open).toContainText("council: 15 validators approve, 1 reject");
   await expect(open).toContainText("by vlad.boo");
   await expect(open.getByRole("link", { name: "Full text ↗" })).toHaveAttribute("href", "https://forum.blockula.test/p/7");
 

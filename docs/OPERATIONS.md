@@ -480,6 +480,16 @@ Validators exit instead (code 10 or 11, `BlockulaNodeDown`): `journalctl -u bloc
 - `BlockulaValidatorNotSigning`: in the active set, blocks keep coming, and this validator signed nothing for 10 minutes. Look for `slashing protection refused a signature` (a conflict with the record: never delete the record to "fix" it) or `couldn't write the record` (disk full or read-only) in the logs.
 - Exit code 12: see the playbook in [Incident response](#playbooks).
 
+### Jailed or tombstoned
+
+`/metrics` exports, per validator, the leader slots it missed in its downtime window (`blockula_validator_missed_slots`, jailed past `blockula_downtime_max_missed`) and its jail and tombstone flags; this node's own validator carries `own="1"`.
+
+- `BlockulaValidatorMissingSlots`: it has missed half the slots its window allows. It's proposing nothing when its turn comes: check [Peers](#peers), [Time](#time), CPU, and that its blocks aren't refused (`rejecting block` lines on other nodes mean its proposals are invalid, for example a stale binary).
+- `BlockulaValidatorJailed`: it missed too many slots (or committed to the randomness beacon and didn't reveal, so check that `beacon-secrets.json` survived), lost a light slash, and leaves the set at the next epoch boundary. Fix the cause, wait out `jail_blocks` (`curl -s 127.0.0.1:7070/api/validators | jq '.jailed'` shows `until`), make sure the self-bond is still at least `min_self_bond`, then have the owner send `Unjail` (`blockula validator unjail <validator address> --key <owner seed file> --rpc …`). It rejoins at a boundary once its stake ranks.
+- `BlockulaValidatorTombstoned`: it signed two conflicting votes. Its pool was slashed and it can never be active again. Treat it as a key compromise or a copied home ([Keys, backups and restores](#keys-backups-and-restores)): stop every copy, find out how two instances signed, and register a new validator with a new key. Delegators should move their stake (`blockula stake undelegate`, then `withdraw` after unbonding).
+
+Validators pay for their own system transactions (attestations, beacon commits and reveals, equivocation reports) from the owner account when the owner is a separate account (SF-13); `BLOCKULA_SYSTEM_FEES=self` makes the consensus key's own account pay instead. Keep a fee float there. Pending equivocation evidence waits in `evidence.json` across restarts.
+
 ### Disk
 
 Above 80%: grow the volume now (online resize: grow the block device, then `resize2fs` or `xfs_growfs`). Find what grew: `du -sh /var/lib/blockula/val/*`. `blocks/` and `cblocks/` stay within the pruning window (`--prune-blocks`; shorten it if the volume can't grow); `consensus/` holds marshal's last 2,000 blocks and the current and two previous epochs' simplex journals. Don't delete files by hand from a running validator's home. Never let a validator's disk fill: a failed fsync stops the node.

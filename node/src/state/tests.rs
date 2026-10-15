@@ -405,12 +405,11 @@ fn namespaces_and_meta_keys_are_unique() {
 
 /// Format change detectors: a record's bytes and a fixed state's root. The root was also
 /// computed by an independent JS implementation of the record layout and tree (noble BLAKE3),
-/// recomputed when `Params` gained `address_prefix` (P-WIRE) and again for the protocol v1
-/// scaffold (schema 2: `chain_params`, the upgrade schedule, account locks). Schema 3 (P-ECON:
-/// the `econ` scalar record; P-STAKE: staking's scalar; P-GOV: the `governance` scalars,
-/// `multisig_expiry_blocks`; P-BEACON: the PoC scalars without the block-hash seed; P-GHOST: the
-/// `ghost` scalar record, two more parameters) changed it again; that value is from this
-/// implementation only.
+/// recomputed when `Params` gained `address_prefix` (P-WIRE), for the protocol v1 scaffold
+/// (schema 2: `chain_params`, the upgrade schedule, account locks), and for the integrated
+/// protocol v1 state (schema 4: the econ, staking, governance and ghost scalars, the PoC scalars
+/// without the block-hash seed; 13 records): the JS side re-derived the simple records' bytes
+/// (scalars, the account) and rebuilt the tree from the node's dump of the rest.
 #[test]
 fn golden_encodings() {
     let acct = Account { balance: 5, nonce: 2, keys: Default::default(), locks: vec![] };
@@ -421,7 +420,7 @@ fn golden_encodings() {
     st.commit_block().unwrap();
     assert_eq!(st.root_hash(), st.full_root());
     assert_eq!(st.record_count(), 13);
-    assert_eq!(st.root(), "57faf42588eddfbd78042b875c532a013cc4c7d47a5ed6f8fda58f5ae5de0746");
+    assert_eq!(st.root(), "f18ad48ebe9c7bc03ac6d75f3208ce91e0c58c14a560eff895ecce96d7935b48");
 }
 
 fn million_accounts() -> State {

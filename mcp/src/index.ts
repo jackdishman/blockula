@@ -344,7 +344,7 @@ tool("register_name", "Claim a .boo name for this agent's wallet (3–32 chars, 
 tool("renew_name", "Extend a .boo name the account this agent acts for owns, by 1–10 years (paid at the chain's renewal price per year, which is burned). Names that aren't renewed expire after a grace period and anyone can register them.", { name: z.string(), years: z.number().int().min(1).max(10).default(1) }, async ({ name, years }) => {
   const w = await requireWallet();
   const info = await w.client.name(name).catch(() => null);
-  const perYear = info?.renewal_price ?? info?.renew_price;
+  const perYear = info?.renewal_price;
   const cost = /^\d+$/.test(String(perYear ?? "")) ? BigInt(perYear) * BigInt(years) : 0n;
   checkBudget(cost, "the renewal");
   const tx = await w.renewName(name, years);
@@ -397,15 +397,17 @@ tool("my_stake", "The stake of the account this agent acts for: each pool (valid
   const w = await requireWallet();
   await w.client.addressPrefix();
   const [raw, status] = await Promise.all([moduleRead("staking", w.client.staking(w.account)), w.client.status()]);
-  const s = stakeSummary(raw, status.height);
+  const s = stakeSummary(raw);
   return {
     account: w.account,
     height: status.height,
+    summary: s.summary,
     staked: formatFang(BigInt(s.bonded)),
     unbonding: formatFang(BigInt(s.unbonding_total)),
-    withdrawable_now: s.withdrawable !== undefined ? formatFang(BigInt(s.withdrawable)) : "unknown",
-    pools: s.delegations.map((d) => ({ validator: d.validator_name ?? d.validator, address: d.validator, shares: d.shares, value: formatFang(BigInt(d.value)), ...(d.commission_bps !== undefined ? { commission: `${d.commission_bps / 100}%` } : {}), ...(d.jailed ? { jailed: true } : {}) })),
-    unbonding_entries: s.unbonding.map((u) => ({ validator: u.validator, amount: formatFang(BigInt(u.amount)), completes_at_block: u.completes_at })),
+    withdrawable_now: formatFang(BigInt(s.withdrawable)),
+    pools: s.delegations.map((d) => ({ validator: d.validator_name ?? d.validator, address: d.validator, shares: d.shares, value: formatFang(BigInt(d.value)), earned: formatFang(BigInt(d.value) > BigInt(d.principal) ? BigInt(d.value) - BigInt(d.principal) : 0n), ...(d.self_bond ? { self_bond: true } : {}) })),
+    unbonding_entries: s.unbonding.map((u) => ({ validator: u.validator, amount: formatFang(BigInt(u.amount)), completes_at_block: u.completes_at, ready: u.ready })),
+    ...(s.redelegations.length ? { redelegations: s.redelegations.map((r) => ({ from: r.from, to: r.to, amount: formatFang(BigInt(r.amount)), slashable_by_from_until_block: r.completes_at })) } : {}),
   };
 });
 
@@ -417,21 +419,23 @@ const proposalView = (p: ProposalSummary) => ({
   does: p.summary,
   status: p.status,
   proposer: p.proposer_name ?? p.proposer,
-  aye: formatFang(BigInt(p.aye)),
-  nay: formatFang(BigInt(p.nay)),
-  ...(p.turnout !== undefined ? { turnout: formatFang(BigInt(p.turnout)) } : {}),
-  ...(p.quorum !== undefined ? { quorum: formatFang(BigInt(p.quorum)) } : {}),
-  ...(p.council ? { council: `${p.council.ayes} of ${p.council.of} validators approve${p.council.nays ? `, ${p.council.nays} reject` : ""}` } : {}),
-  ...(p.voting_ends_at !== undefined ? { voting_ends_at_block: p.voting_ends_at } : {}),
+  aye_weight: formatFang(BigInt(p.aye)),
+  nay_weight: formatFang(BigInt(p.nay)),
+  turnout: formatFang(BigInt(p.turnout)),
+  ...(p.quorum !== undefined ? { quorum: formatFang(BigInt(p.quorum)), quorum_reached: p.quorum_reached } : {}),
+  ...(p.council.ayes || p.council.nays ? { council: `${p.council.ayes} validator${p.council.ayes === 1 ? "" : "s"} approve${p.council.nays ? `, ${p.council.nays} reject` : ""}${p.council.of ? ` (of ${p.council.of})` : ""}` } : {}),
+  ...(p.supermajority ? { needs: p.threshold_bps ? `${p.threshold_bps / 100}% of the weight` : "a supermajority" } : {}),
+  voting_ends_at_block: p.voting_ends_at,
   ...(p.executes_at !== undefined ? { executes_at_block: p.executes_at } : {}),
+  ...(p.outcome ? { outcome: p.outcome } : {}),
   ...(p.url ? { details: p.url } : {}),
   explorer: explorer(`proposal/${p.id}`),
 });
 
 tool("list_proposals", "On-chain governance proposals (parameter changes, treasury spends, upgrades, distributions …): what each does, its status, token-weighted tallies, the bootstrap validator council's votes, and when voting ends and the timelock lets it execute.", { status: z.string().optional().describe("e.g. \"voting\"; default: all, newest first"), limit: z.number().int().min(1).max(50).default(20) }, async ({ status, limit }) => {
   const res = await moduleRead("governance proposals", (await chain()).proposals({ status, limit }));
-  const list = (Array.isArray(res) ? res : (res.proposals ?? [])) as unknown[];
-  return list.slice(0, limit).map((p) => proposalView(proposalSummary(p)));
+  const list = (res.proposals ?? []) as unknown[];
+  return list.slice(0, limit).map((p) => proposalView(proposalSummary(p, res.params)));
 });
 
 tool("vote", "Vote on a governance proposal for the account this agent acts for. `amount` FANG of its unlocked holdings is locked: conviction 0 locks nothing and counts 0.1×; 1–6 lock for 1, 2, 4, 8, 16 or 32 lock periods (a week each on mainnet) after voting ends and count 1×–6×. Voting again replaces the vote. Session keys can't vote. Ask the user before locking their FANG.", { proposal_id: z.number().int().min(0), vote: z.enum(["aye", "nay"]), amount: z.string().describe("FANG to lock"), conviction: z.number().int().min(0).max(6).default(1) }, async ({ proposal_id, vote, amount, conviction }) => {

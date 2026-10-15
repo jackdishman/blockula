@@ -42,34 +42,6 @@ pub enum ValidatorCmd {
         #[arg(long)]
         bond: Option<String>,
     },
-    /// Stake FANG with a validator (buys shares of its pool)
-    Delegate {
-        #[command(flatten)]
-        a: AdminArgs,
-        /// Amount in FANG, e.g. 1500
-        amount: String,
-    },
-    /// Start unbonding stake from a validator's pool (withdraw it once the unbonding period is over)
-    Undelegate {
-        #[command(flatten)]
-        a: AdminArgs,
-        /// Shares to sell (`blockula validator stake` shows them)
-        #[arg(long, conflicts_with = "all")]
-        shares: Option<String>,
-        /// Every share you hold in that pool
-        #[arg(long)]
-        all: bool,
-    },
-    /// Withdraw every unbonding entry that has finished
-    Withdraw {
-        /// File holding the signing key's 32-byte hex seed
-        #[arg(long)]
-        key: PathBuf,
-        #[arg(long)]
-        rpc: String,
-        #[arg(long)]
-        from: Option<String>,
-    },
     /// Bring a jailed validator back (once its jail time is over; signed by its owner)
     Unjail(AdminArgs),
     /// Set your validator's commission, in basis points (moves at most `commission_max_change_bps` per epoch)
@@ -83,13 +55,6 @@ pub enum ValidatorCmd {
         rpc: String,
         #[arg(long)]
         from: Option<String>,
-    },
-    /// Show an account's stake: delegations, unbonding entries, validators it runs
-    Stake {
-        /// Address or .boo name
-        account: String,
-        #[arg(long)]
-        rpc: String,
     },
     /// Dev and test chain admins: pin a validator (ranked ahead of stake from the next epoch)
     Approve(AdminArgs),
@@ -276,39 +241,6 @@ pub fn run(cmd: ValidatorCmd) -> Result<()> {
             println!("  Others can back it: blockula validator delegate {me} <FANG> --key <key file> --rpc {rpc}");
             Ok(())
         }
-        ValidatorCmd::Delegate { a, amount } => {
-            let amount = parse_fang(&amount)?;
-            admin(a, |v| Action::Delegate { validator: v, amount })
-        }
-        ValidatorCmd::Undelegate { a, shares, all } => {
-            let shares: u64 = match (shares, all) {
-                (Some(s), false) => s.parse().map_err(|_| anyhow!("--shares must be a whole number of shares"))?,
-                (None, true) => {
-                    let keys = load_seed(&a.key)?;
-                    let rt = rt()?;
-                    let from = match &a.from {
-                        Some(f) => f.clone(),
-                        None => rt.block_on(own_address(&a.rpc, &keys))?,
-                    };
-                    let stake = rt.block_on(get(&a.rpc, &format!("/staking/{from}")))?;
-                    let held = stake["delegations"].as_array().into_iter().flatten().find(|d| d["validator"]["address"].as_str() == Some(a.validator.as_str())).and_then(|d| d["shares"].as_str()).ok_or_else(|| anyhow!("{from} has no stake with {}", a.validator))?;
-                    held.parse::<u64>().map_err(|_| anyhow!("{held} shares is more than one tx can move; undelegate in parts with --shares"))?
-                }
-                _ => bail!("say how much: --shares N or --all"),
-            };
-            admin(a, |v| Action::Undelegate { validator: v, shares })
-        }
-        ValidatorCmd::Withdraw { key, rpc, from } => {
-            let keys = load_seed(&key)?;
-            let rt = rt()?;
-            let from = match from {
-                Some(f) => f,
-                None => rt.block_on(own_address(&rpc, &keys))?,
-            };
-            let tx = rt.block_on(send(&rpc, &keys, &from, Action::WithdrawUnbonded {}))?;
-            println!("✓ {}", tx["summary"].as_str().unwrap_or_default());
-            Ok(())
-        }
         ValidatorCmd::Unjail(a) => admin(a, |v| Action::Unjail { validator: v }),
         ValidatorCmd::Commission { bps, key, rpc, from } => {
             let keys = load_seed(&key)?;
@@ -319,20 +251,6 @@ pub fn run(cmd: ValidatorCmd) -> Result<()> {
             };
             let tx = rt.block_on(send(&rpc, &keys, &from, Action::UpdateValidator { commission_bps: bps, p2p_addr: String::new(), http_addr: String::new() }))?;
             println!("✓ {}", tx["summary"].as_str().unwrap_or_default());
-            Ok(())
-        }
-        ValidatorCmd::Stake { account, rpc } => {
-            let v = rt()?.block_on(get(&rpc, &format!("/staking/{account}")))?;
-            println!("{}", v["summary"].as_str().unwrap_or_default());
-            for d in v["delegations"].as_array().into_iter().flatten() {
-                println!("   {}  {} shares  worth {}{}", d["validator"]["address"].as_str().unwrap_or_default(), d["shares"].as_str().unwrap_or_default(), d["value_display"].as_str().unwrap_or_default(), if d["self_bond"] == true { "  (self-bond)" } else { "" });
-            }
-            for e in v["entries"].as_array().into_iter().flatten() {
-                match e["type"].as_str() {
-                    Some("unbonding") => println!("   unbonding {} from {}: {}", e["amount_display"].as_str().unwrap_or_default(), e["validator"]["address"].as_str().unwrap_or_default(), if e["ready"] == true { "ready to withdraw".to_string() } else { format!("free at block {}", e["release_at"]) }),
-                    _ => println!("   redelegated {} from {} to {} (settles at block {})", e["amount_display"].as_str().unwrap_or_default(), e["from"]["address"].as_str().unwrap_or_default(), e["to"]["address"].as_str().unwrap_or_default(), e["release_at"]),
-                }
-            }
             Ok(())
         }
         ValidatorCmd::Approve(a) => admin(a, |v| Action::ApproveValidator { validator: v }),

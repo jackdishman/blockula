@@ -414,9 +414,10 @@ impl Genesis {
                 ensure!(vesting.insert(&a.address), "{} has more than one vesting allocation", a.address);
             }
         }
-        // Epoch 0's set is every genesis validator: within the cap like any later set (the p2p
-        // peer set can't hold more than `max_validators`' bound).
-        ensure!(!self.validators.is_empty() && self.validators.len() as u64 <= cp.max_validators, "a genesis needs 1–{} validators (max_validators)", cp.max_validators);
+        // Epoch 0's set is every genesis validator (a set over `max_validators` shrinks at the
+        // first boundaries), so it must fit the p2p layer's peer set like any later one.
+        let max_set = crate::consensus::MAX_PEERS_PER_SET;
+        ensure!(!self.validators.is_empty() && self.validators.len() <= max_set, "a genesis needs 1–{max_set} validators (the p2p peer set's bound)");
         let mut keys = BTreeSet::new();
         let mut bonds: BTreeMap<&str, u64> = BTreeMap::new();
         for o in &self.operators {

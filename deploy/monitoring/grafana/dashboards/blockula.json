@@ -1311,33 +1311,154 @@
       }
     },
     {
-      "type": "text",
-      "title": "TODO · Missed leader slots",
+      "type": "timeseries",
+      "title": "Missed leader slots",
       "id": 21,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Leader slots each active validator missed in its downtime window (MAINNET-DESIGN 3.4). Past blockula_downtime_max_missed it's jailed; BlockulaValidatorMissingSlots warns at half of it for this node's validator (own=\"1\").",
       "gridPos": {
         "h": 7,
         "w": 6,
         "x": 6,
         "y": 42
       },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (validator) (blockula_validator_missed_slots{node=~\"$node\"})",
+          "legendFormat": "{{validator}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(blockula_downtime_max_missed{node=~\"$node\"})",
+          "legendFormat": "jailed past",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisSoftMin": 0,
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
       "options": {
-        "mode": "markdown",
-        "content": "Missed leader slots per validator over the downtime window (MAINNET-DESIGN 3.4).\n\n**Planned metric:** `blockula_missed_leader_slots_total{validator}` (P-STAKE). Alert on this validator's misses before it's jailed."
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
       }
     },
     {
-      "type": "text",
-      "title": "TODO · Jailed / tombstoned",
+      "type": "stat",
+      "title": "Jailed / tombstoned",
       "id": 22,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "This node's validator (own=\"1\"): jailed (left the set, unjail after jail_blocks) or tombstoned (double-signed, out for good). Both page.",
       "gridPos": {
         "h": 7,
         "w": 6,
         "x": 12,
         "y": 42
       },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(blockula_validator_jailed{node=~\"$node\",own=\"1\"})",
+          "legendFormat": "jailed",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(blockula_validator_tombstoned{node=~\"$node\",own=\"1\"})",
+          "legendFormat": "tombstoned",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
       "options": {
-        "mode": "markdown",
-        "content": "This operator's validators that are jailed or tombstoned.\n\n**Planned metrics:** `blockula_validator_jailed{validator}`, `blockula_validator_tombstoned{validator}` (P-STAKE). Critical alert when 1."
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "textMode": "value_and_name",
+        "orientation": "auto",
+        "wideLayout": true,
+        "showPercentChange": false
       }
     },
     {

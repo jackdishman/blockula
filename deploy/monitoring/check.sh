@@ -17,7 +17,6 @@ jq -e '.uid == "blockula-node" and (.panels | length) > 0' grafana/dashboards/bl
 exported=$(grep -oE 'blockula_[a-z0-9_]+' ../../node/src/api.rs | sort -u)
 missing=0
 while read -r m; do
-  case $m in blockula_missed_* | blockula_validator_jailed | blockula_validator_tombstoned) continue ;; esac # planned (TODO panels, P-STAKE)
   grep -qx "$m" <<< "$exported" || { echo "✗ $m isn't exported by node/src/api.rs" >&2; missing=1; }
 done < <(grep -ohE 'blockula_[a-z0-9_]+' prometheus/alerts.yml grafana/dashboards/blockula.json | sort -u)
 [ $missing = 0 ]

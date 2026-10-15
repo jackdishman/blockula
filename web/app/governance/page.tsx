@@ -25,8 +25,8 @@ interface Loaded {
   lockPeriod?: number;
 }
 
-/** Proposals still taking votes: by status, or by height when the node sends no status. */
-const isOpen = (p: ProposalSummary, height: number) => /voting|open|active/.test(p.status) || (p.status === "unknown" && p.voting_ends_at !== undefined && p.voting_ends_at >= height);
+/** Proposals still taking votes (through `voting_ends_at`). */
+const isOpen = (p: ProposalSummary, height: number) => p.status === "voting" && p.voting_ends_at >= height;
 /** Only https links from the chain become hrefs. */
 const safeUrl = (u: string) => (/^https:\/\/[^\s"'<>]+$/.test(u) ? u : null);
 const explorerProposal = (id: number) => `${RPC}/#/proposal/${id}`;
@@ -40,8 +40,8 @@ function Governance() {
   const load = useCallback(async () => {
     try {
       const [raw, params] = await Promise.all([client.proposals({ limit: 50 }), client.params().catch(() => null)]);
-      const list = (Array.isArray(raw) ? raw : (raw.proposals ?? [])) as unknown[];
-      setData({ proposals: list.map(proposalSummary), lockPeriod: Number(paramsOf(params).lock_period_blocks) || undefined });
+      const list = (raw.proposals ?? []) as unknown[];
+      setData({ proposals: list.map((p) => proposalSummary(p, raw.params)), lockPeriod: Number(paramsOf(params).lock_period_blocks) || undefined });
     } catch (e) {
       if (e instanceof ApiError && e.status === 404) setData("inactive");
       else setError(friendly(e));
@@ -129,9 +129,10 @@ function Tally({ p }: { p: ProposalSummary }) {
       )}
       <div className="dim small">
         {formatFang(aye)} aye · {formatFang(nay)} nay
-        {p.turnout !== undefined && p.quorum !== undefined && ` · ${formatFang(BigInt(p.turnout))} of ${formatFang(BigInt(p.quorum))} quorum`}
-        {p.threshold_bps !== undefined && ` · needs ${p.threshold_bps / 100}% aye`}
-        {p.council && p.council.of > 0 && ` · council: ${p.council.ayes} of ${p.council.of} validators approve`}
+        {` · ${formatFang(BigInt(p.turnout))} voted`}
+        {p.quorum !== undefined && ` of ${formatFang(BigInt(p.quorum))} quorum${p.quorum_reached ? " ✓" : ""}`}
+        {p.supermajority && (p.threshold_bps !== undefined ? ` · needs ${p.threshold_bps / 100}% aye` : " · needs a supermajority")}
+        {(p.council.ayes > 0 || p.council.nays > 0) && ` · council: ${p.council.ayes} validator${p.council.ayes === 1 ? "" : "s"} approve${p.council.nays ? `, ${p.council.nays} reject` : ""}${p.council.of ? ` (of ${p.council.of})` : ""}`}
       </div>
     </div>
   );
@@ -154,8 +155,9 @@ function ProposalCard({ p, lockPeriod, run, canVote = false }: { p: ProposalSumm
       <div className="dim small">
         {[
           p.proposer && `by ${p.proposer_name ?? shortAddr(p.proposer)}`,
-          p.voting_ends_at !== undefined && (p.voting_ends_at >= height ? `voting ends at block #${p.voting_ends_at} (in about ${blocksToHuman(p.voting_ends_at - height, bt)})` : `voting ended at block #${p.voting_ends_at}`),
-          p.executes_at !== undefined && `executes at block #${p.executes_at}`,
+          p.voting_ends_at >= height ? `voting ends at block #${p.voting_ends_at} (in about ${blocksToHuman(p.voting_ends_at - height, bt)})` : `voting ended at block #${p.voting_ends_at}`,
+          p.executes_at !== undefined && (p.status === "queued" ? `executes at block #${p.executes_at}` : `ran at block #${p.executes_at}`),
+          p.outcome && p.status !== "voting" && p.outcome,
         ]
           .filter(Boolean)
           .join(" · ")}

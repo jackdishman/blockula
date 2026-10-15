@@ -197,7 +197,7 @@ const list = (r, ...keys) => (Array.isArray(r) ? r : (keys.map((k) => r && r[k])
 const expiryText = (r, s) => {
   if (r.expires_at == null) return "";
   const left = Number(r.expires_at) - Number(s.height);
-  const grace = pick(r, "grace_until", "grace_ends_at");
+  const grace = r.grace_until;
   if (left > 0) return `${term("expiry", "expires")} at block #${esc(r.expires_at)} (in about ${span(left, s.block_time_ms)})`;
   return `<span class="err">expired at block #${esc(r.expires_at)}</span>${grace != null ? `; its owner can renew it until block #${esc(grace)}` : ""}`;
 };
@@ -311,11 +311,11 @@ const views = {
         <dt>Owner</dt><dd>${who(r.owner)}</dd>
         <dt>Registered</dt><dd>block <a href="#/block/${esc(r.registered_at)}">#${esc(r.registered_at)}</a></dd>
         ${r.expires_at != null ? `<dt>${term("expiry", "Expires")}</dt><dd>${expiryText(r, s)}</dd>` : ""}
-        ${amount(r, "renewal_price", "renew_price") ? `<dt>Renewal</dt><dd>${esc(amount(r, "renewal_price", "renew_price"))} a year</dd>` : ""}
+        ${r.renewal_price_display ? `<dt>Renewal</dt><dd>${esc(r.renewal_price_display)} a year</dd>` : ""}
       </dl>`);
     }
     return card(`<span class="eyebrow">Unclaimed name</span><h1>${esc(r.name)}</h1><p>Anyone can register it for <b>${esc(r.price_display)}</b>${r.expires_at != null || r.registration_blocks ? " a year" : ""}. Shorter names cost more because they're scarcer.</p>
-      ${r.reserved ? `<p class="err">This name is reserved: only governance can assign it.</p>` : ""}
+      ${r.status === "reserved" ? `<p class="err">This name is reserved at genesis: nobody can register it.</p>` : ""}
       <p class="dim">Register it with the SDK: <span class="mono">await wallet.registerName("${esc(r.name)}")</span></p>`);
   },
   async learn() {
@@ -483,69 +483,80 @@ views.validators = async function () {
   </div>`;
 };
 
-// ---- Governance (MAINNET-DESIGN 3.5). Fields are read tolerantly: the node may send labels or
-// addresses, nested tallies or flat ones. ----
+// ---- Governance (MAINNET-DESIGN 3.5), as node/src/api.rs `proposal_json` serves it. ----
 
-const proposalOf = (p) => {
-  const t = p.tally || p.votes_summary || {};
-  const c = p.council || null;
+const proposalOf = (p, rules) => {
+  const t = p.tally || null;
+  const council = list(p.council);
+  const aye = (p.ayes && p.ayes.weight) || { drops: "0", display: "0 FANG" };
+  const nay = (p.nays && p.nays.weight) || { drops: "0", display: "0 FANG" };
+  const turnout = BigInt((p.ayes && p.ayes.amount && p.ayes.amount.drops) || "0") + BigInt((p.nays && p.nays.amount && p.nays.amount.drops) || "0");
   return {
-    id: p.id, title: p.title || `Proposal #${p.id}`, url: p.url || "", status: String(pick(p, "status", "phase") ?? "unknown"),
-    summary: pick(p, "summary", "description") || (p.kind && p.kind.type) || "",
-    proposer: pick(p, "proposer", "from", "by"),
-    deposit: amount(p, "deposit"),
-    aye: pick(t, "aye", "ayes", "aye_weight") ?? pick(p, "aye", "ayes", "aye_weight") ?? "0",
-    nay: pick(t, "nay", "nays", "nay_weight") ?? pick(p, "nay", "nays", "nay_weight") ?? "0",
-    ayeShown: amount(t, "aye", "ayes", "aye_weight") || amount(p, "aye", "ayes", "aye_weight"),
-    nayShown: amount(t, "nay", "nays", "nay_weight") || amount(p, "nay", "nays", "nay_weight"),
-    turnout: amount(t, "turnout", "locked") || amount(p, "turnout"), quorum: amount(t, "quorum") || amount(p, "quorum"),
-    council: c ? { ayes: Number(pick(c, "ayes", "aye", "approvals") ?? 0), nays: Number(pick(c, "nays", "nay", "rejections") ?? 0), of: Number(pick(c, "of", "active", "set_size", "validators") ?? 0), needed: pick(c, "needed", "threshold") } : null,
-    endsAt: pick(p, "voting_ends_at", "voting_until", "ends_at"), executesAt: pick(p, "executes_at", "timelock_until", "execute_at"),
-    threshold: pick(p, "threshold_bps", "supermajority_bps"),
+    id: p.id, title: p.title || `Proposal #${p.id}`, url: p.url || "", status: String(p.status || "unknown"),
+    summary: p.summary || (p.kind && p.kind.type) || "",
+    proposer: p.proposer,
+    deposit: p.deposit_display || null,
+    aye: aye.drops, nay: nay.drops, ayeShown: aye.display, nayShown: nay.display,
+    turnout: fmtDrops(turnout.toString()),
+    quorum: t ? t.quorum.display : null, quorumReached: t ? t.quorum_reached : null,
+    council: { ayes: council.filter((c) => c.aye).length, nays: council.filter((c) => !c.aye).length, of: t ? t.council_size : null },
+    endsAt: p.voting_end, executesAt: p.execute_at,
+    threshold: p.supermajority ? (rules && rules.supermajority_bps) || "supermajority" : null,
+    outcome: p.outcome || "",
   };
 };
-const statusPill = (st) => `<span class="pill ${/reject|fail|expired|burn/.test(st) ? "failed" : /voting|queued|timelock|pending/.test(st) ? "pending" : ""}">${esc(st.replace(/_/g, " "))}</span>`;
+const statusPill = (st) => `<span class="pill ${/reject|fail/.test(st) ? "failed" : /voting|queued/.test(st) ? "pending" : ""}">${esc(st.replace(/_/g, " "))}</span>`;
 const tallyBar = (p) => {
   const [a, n] = [BigInt(/^\d+$/.test(String(p.aye)) ? p.aye : 0), BigInt(/^\d+$/.test(String(p.nay)) ? p.nay : 0)];
   const total = a + n;
   const w = total > 0n ? Number((a * 1000n) / total) / 10 : 0;
   return total > 0n ? `<div class="tally" title="aye ${esc(p.ayeShown || "")} · nay ${esc(p.nayShown || "")}"><span class="aye" style="width:${w}%"></span><span class="nay" style="width:${100 - w}%"></span></div>` : "";
 };
-const councilText = (c) => c && c.of ? `${term("council", "council")}: ${c.ayes} of ${c.of} validators approve${c.nays ? `, ${c.nays} reject` : ""}${c.needed != null ? ` (${esc(c.needed)} needed)` : ""}` : "";
+const councilText = (c) => c && (c.ayes || c.nays) ? `${term("council", "council")}: ${c.ayes} validator${c.ayes === 1 ? "" : "s"} approve${c.nays ? `, ${c.nays} reject` : ""}${c.of ? ` (of ${c.of})` : ""}` : "";
+const thresholdText = (p) => (p.threshold == null ? "a simple majority" : typeof p.threshold === "number" ? `${pct(p.threshold)} of the weight` : "a supermajority");
 
 views.governance = async function () {
   let r;
   try { r = await api("/proposals?limit=50"); }
   catch (e) { return card(`<span class="eyebrow">Governance</span><h1>Proposals</h1><p class="empty">This node doesn't serve proposals (${esc(e.message)}). On-chain governance arrives with protocol v1.</p>`, "learn"); }
-  const ps = list(r, "proposals").map(proposalOf);
+  const rules = r.params || {};
+  const ps = list(r, "proposals").map((p) => proposalOf(p, rules));
   const row = (p) => `<div class="row"><div><a href="#/proposal/${esc(p.id)}"><b>#${esc(p.id)}</b> ${esc(p.title)}</a> <span class="dim">· ${esc(p.summary)}</span>
-    ${tallyBar(p)}<span class="dim">${[p.ayeShown && `aye ${esc(p.ayeShown)}`, p.nayShown && `nay ${esc(p.nayShown)}`, p.turnout && p.quorum && `turnout ${esc(p.turnout)} of ${esc(p.quorum)} quorum`, councilText(p.council), p.endsAt != null && `voting ends at block #${esc(p.endsAt)}`, p.executesAt != null && `executes at block #${esc(p.executesAt)}`].filter(Boolean).join(" · ")}</span></div>${statusPill(p.status)}</div>`;
+    ${tallyBar(p)}<span class="dim">${[`aye ${esc(p.ayeShown)}`, `nay ${esc(p.nayShown)}`, p.quorum ? `turnout ${esc(p.turnout)} of ${esc(p.quorum)} quorum` : `turnout ${esc(p.turnout)}`, councilText(p.council), p.status === "voting" ? `voting ends at block #${esc(p.endsAt)}` : "", p.executesAt != null ? `${p.status === "queued" ? "executes" : "ran"} at block #${esc(p.executesAt)}` : "", p.status !== "voting" && p.outcome ? esc(p.outcome) : ""].filter(Boolean).join(" · ")}</span></div>${statusPill(p.status)}</div>`;
   return `<div class="stack">
-    ${card(`<span class="eyebrow">Governance</span><h1>Proposals</h1><p>There are no admin keys: parameter changes, treasury spends, upgrades and community distributions are ${term("proposal", "proposals")} that FANG holders vote on, locking what they vote with (${term("conviction", "conviction")}). Passed proposals wait out a ${term("timelock", "timelock")} before they execute.</p>
+    ${card(`<span class="eyebrow">Governance</span><h1>Proposals</h1><p>There are no admin keys: parameter changes, treasury spends, upgrades and community distributions are ${term("proposal", "proposals")} that FANG holders vote on, locking what they vote with (${term("conviction", "conviction")}). Voting lasts ${esc(span(rules.voting_blocks, 1000))}; passed proposals wait out a ${term("timelock", "timelock")} before they execute. ${r.council_active ? `Until block #${esc(rules.bootstrap_end_height)} a proposal also passes if two-thirds of the active validators approve it (the ${term("council", "bootstrap council")}) and token-weighted nays don't outweigh the ayes.` : ""}</p>
       <p class="dim">Vote from the wallet, the SDK (<span class="mono">wallet.vote(id, true, "10", 2)</span>), the MCP's <span class="mono">vote</span> tool, or <span class="mono">blockula gov vote</span>.</p>`, "learn")}
+    <div class="figures">
+      ${stat(fang(r.treasury ? r.treasury.balance_display : "—"), "treasury")}
+      ${stat(fang(r.community ? r.community.balance_display : "—"), "community distributions")}
+      ${stat(fang(rules.proposal_deposit_display || "—"), "deposit to propose")}
+    </div>
     ${card(`<h2>All proposals (${ps.length})</h2>${ps.length ? `<div class="rows">${ps.map(row).join("")}</div>` : '<p class="empty">No proposals yet.</p>'}`)}
   </div>`;
 };
 
 views.proposal = async function (id) {
-  const raw = await api("/proposal/" + encodeURIComponent(id));
-  const p = proposalOf(raw);
-  const votes = list(raw.votes ?? raw, "votes", "ballots");
-  const council = list(raw.council && raw.council.votes ? raw.council.votes : raw.council_votes);
-  const voteRow = (x) => `<div class="row"><div>${whoAny(pick(x, "voter", "account", "from"))} <span class="dim">· ${x.aye === true || x.vote === "aye" ? "aye" : "nay"}${amount(x, "amount") ? ` with ${esc(amount(x, "amount"))}` : ""}${x.conviction != null ? ` at ${x.conviction == 0 ? "0.1" : esc(x.conviction)}× ${term("conviction", "conviction")}` : ""}${amount(x, "weight") ? ` = ${esc(amount(x, "weight"))} of weight` : ""}</span></div>${x.locked_until != null ? `<span class="dim">locked until #${esc(x.locked_until)}</span>` : ""}</div>`;
+  const [raw, r] = await Promise.all([api("/proposal/" + encodeURIComponent(id)), api("/proposals?limit=1").catch(() => ({}))]);
+  const p = proposalOf(raw, r.params);
+  const votes = list(raw.votes);
+  const council = list(raw.council);
+  const voteRow = (x) => `<div class="row"><div>${whoAny(x.voter)} <span class="dim">· ${x.aye ? "aye" : "nay"} with ${esc(x.amount_display)} at ${x.conviction == 0 ? "0.1" : esc(x.conviction)}× ${term("conviction", "conviction")} = ${esc(x.weight.display)} of weight${x.council ? ` (also validator ${whoAny(x.council)}'s council vote)` : ""}</span></div><span class="dim">locked until #${esc(x.locked_until)}</span></div>`;
+  const councilRow = (x) => `<div class="row"><div>validator ${whoAny(x.validator)} <span class="dim">· ${x.aye ? "aye" : "nay"} (cast by ${whoAny(x.voter)})</span></div></div>`;
   return `<div class="stack">
     ${card(`<span class="eyebrow">Proposal #${esc(p.id)}</span><div class="summary">${esc(p.title)}</div><p>${esc(p.summary)}</p>${statusPill(p.status)} ${p.url ? `<span class="dim">· full text: ${link(p.url)}</span>` : ""}`)}
     ${card(`<dl>
-      <dt>Proposed by</dt><dd>${whoAny(p.proposer)}${raw.created_at != null ? ` at block <a href="#/block/${esc(raw.created_at)}">#${esc(raw.created_at)}</a>` : ""}</dd>
+      <dt>Proposed by</dt><dd>${whoAny(p.proposer)} at block <a href="#/block/${esc(raw.created_at)}">#${esc(raw.created_at)}</a></dd>
       ${p.deposit ? `<dt>Deposit</dt><dd>${esc(p.deposit)} <span class="dim">(refunded once it reaches quorum, burned if it doesn't)</span></dd>` : ""}
-      <dt>Tally</dt><dd>${tallyBar(p)}${esc(p.ayeShown || "0 FANG")} aye · ${esc(p.nayShown || "0 FANG")} nay${p.threshold ? ` · needs ${pct(p.threshold)} aye` : " · needs a simple majority"}</dd>
-      ${p.turnout || p.quorum ? `<dt>Quorum</dt><dd>${esc(p.turnout || "0 FANG")} locked of ${esc(p.quorum || "?")} needed</dd>` : ""}
-      ${p.council ? `<dt>${term("council", "Bootstrap council")}</dt><dd>${councilText(p.council)}</dd>` : ""}
-      ${p.endsAt != null ? `<dt>Voting ends</dt><dd>block #${esc(p.endsAt)}</dd>` : ""}
-      ${p.executesAt != null ? `<dt>${term("timelock", "Executes")}</dt><dd>block #${esc(p.executesAt)}</dd>` : ""}
+      <dt>Tally</dt><dd>${tallyBar(p)}${esc(p.ayeShown)} aye · ${esc(p.nayShown)} nay <span class="dim">(conviction-weighted) · needs ${thresholdText(p)}</span></dd>
+      <dt>Quorum</dt><dd>${esc(p.turnout)} voted${p.quorum ? ` of ${esc(p.quorum)} needed${p.quorumReached ? " ✓" : ""}` : " <span class=\"dim\">(the quorum is set when voting closes)</span>"}</dd>
+      ${councilText(p.council) ? `<dt>${term("council", "Bootstrap council")}</dt><dd>${councilText(p.council)}</dd>` : ""}
+      <dt>Voting ends</dt><dd>block #${esc(p.endsAt)}</dd>
+      ${p.executesAt != null ? `<dt>${term("timelock", p.status === "queued" ? "Executes" : "Ran")}</dt><dd>block #${esc(p.executesAt)}</dd>` : ""}
+      ${p.outcome ? `<dt>Outcome</dt><dd>${esc(p.outcome)}</dd>` : ""}
+      ${raw.distribution ? `<dt>Distribution</dt><dd><span class="mono">${esc(raw.distribution)}</span></dd>` : ""}
     </dl>
-    <details><summary>What exactly it does</summary><pre class="mono">${esc(JSON.stringify(raw.kind ?? raw.action ?? null, null, 2))}</pre></details>`)}
-    ${council.length ? card(`<h2>Council votes (${council.length})</h2><div class="rows">${council.map(voteRow).join("")}</div>`) : ""}
+    <details><summary>What exactly it does</summary><pre class="mono">${esc(JSON.stringify(raw.kind ?? null, null, 2))}</pre></details>`)}
+    ${council.length ? card(`<h2>Council votes (${council.length})</h2><div class="rows">${council.map(councilRow).join("")}</div>`) : ""}
     ${card(`<h2>Votes (${votes.length})</h2>${votes.length ? `<div class="rows">${votes.map(voteRow).join("")}</div>` : '<p class="empty">No votes yet.</p>'}`)}
   </div>`;
 };
@@ -567,13 +578,14 @@ const paramValue = (k, v, ms) => {
 views.params = async function () {
   const [r, s, fees] = await Promise.all([api("/params").catch(() => null), api("/status"), api("/fees").catch(() => null)]);
   if (!r) return card(`<span class="eyebrow">Chain parameters</span><h1>Parameters</h1><p class="empty">This node doesn't serve its parameters yet (protocol v1).</p>`, "learn");
-  const all = r.params && typeof r.params === "object" ? r.params : r;
-  const entries = Object.entries(all).map(([k, v]) => [k, v && typeof v === "object" ? pick(v, "value") : v]).filter(([, v]) => v != null && typeof v !== "object");
+  const entries = Object.entries(r.params || {});
   const groups = PARAM_GROUPS.map(([g, re]) => [g, entries.filter(([k]) => re.test(k))]);
   const other = entries.filter(([k]) => !PARAM_GROUPS.some(([, re]) => re.test(k)));
   if (other.length) groups.push(["other", other]);
-  const perByte = fees && pick(fees, "base_fee_per_byte", "per_byte");
-  const feeLine = fees ? [perByte != null && `base fee ${esc(perByte)} drops per byte`, amount(fees, "typical_transfer_fee", "transfer_fee") && `a transfer costs about ${esc(amount(fees, "typical_transfer_fee", "transfer_fee"))}`].filter(Boolean).join(" · ") : "";
+  // The base fee fixed for the next blocks (`suggested` covers any of them): flat drops plus a rate in milli-drops per byte.
+  const sug = fees && fees.suggested;
+  const transfer = sug ? BigInt(sug.flat) + (BigInt(sug.rate) * 5400n) / 1000n : null;
+  const feeLine = sug ? [`base fee ${esc(fmtDrops(sug.flat))} + ${esc((Number(sug.rate) / 1000).toLocaleString("en-US"))} drops per byte`, `a transfer (~5.4 KB) costs about ${esc(fmtDrops(transfer.toString()))}`, `opening an account burns ${esc(fees.account_creation_fee_display)}`].join(" · ") : "";
   return `<div class="stack">
     ${card(`<span class="eyebrow">Chain parameters</span><h1>Parameters</h1><p>The rules of <b>${esc(s.chain_id)}</b> that can change without new software: only a ${term("proposal", "ParamChange proposal")} that passes changes one, within bounds written into the code. Durations are in blocks of ${esc(s.block_time_ms)} ms.</p>${feeLine ? `<p class="dim">Right now: ${feeLine}.</p>` : ""}`, "learn")}
     ${groups.filter(([, xs]) => xs.length).map(([g, xs]) => card(`<h2>${esc(g)}</h2><table class="params">${xs.map(([k, v]) => `<tr><td>${esc(k)}</td><td>${paramValue(k, v, s.block_time_ms)}</td></tr>`).join("")}</table>`)).join("")}

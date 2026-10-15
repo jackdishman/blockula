@@ -17,15 +17,15 @@ use std::io::{Read, Write};
 
 /// Version of the state encoding (records, namespaces, tree). It is itself a record, so it is
 /// committed to by the root. 2: the protocol v1 scaffold (`chain_params`, account locks,
-/// validator commission, the module namespaces). 3: economics (P-ECON: name expiry, lock ids and
-/// vote locks, the `econ` scalars: fee ring, issuance year, name sweep), staking (P-STAKE:
-/// pools, delegations, unbonding entries, punished faults and liveness under namespaces 32–36, its
-/// META scalar; validator records without a bond, statuses candidate/active/removed/tombstoned),
-/// governance (P-GOV: its records and `multisig_expiry_blocks`), the randomness beacon (its
-/// rounds, values and revert attestations; the PoC scalars lose the block-hash seed) and Ghost
-/// Mode (namespaces 48–52, the `ghost` scalar record, `ghost_anchor_window` and
-/// `ghost_verify_fee`).
-pub const SCHEMA_VERSION: u32 = 3;
+/// validator commission, the module namespaces). 3 was each wave-3 package's own bump; 4 is the
+/// integrated protocol v1 state: economics (name expiry, lock ids and vote locks, the `econ`
+/// scalars: fee ring, issuance year, name sweep), staking (pools, delegations, unbonding entries,
+/// punished faults and liveness under namespaces 32–36, its META scalar; validator records
+/// without a bond, statuses candidate/active/removed/tombstoned), governance (its records and
+/// `multisig_expiry_blocks`), the randomness beacon (its rounds, values and revert attestations;
+/// the PoC scalars lose the block-hash seed) and Ghost Mode (namespaces 48–52, the `ghost` scalar
+/// record, `ghost_anchor_window` and `ghost_verify_fee`).
+pub const SCHEMA_VERSION: u32 = 4;
 
 pub fn encode<T: BorshSerialize + ?Sized>(v: &T) -> Vec<u8> {
     borsh::to_vec(v).expect("encoding to memory can't fail")

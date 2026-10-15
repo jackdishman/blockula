@@ -1,6 +1,6 @@
 "use client";
 
-import { ApiError, formatFang, paramsOf, parseFang, sharesFor, stakeSummary, type StakeDelegation, type StakeSummary } from "@blockula/sdk";
+import { ApiError, formatFang, paramsOf, parseFang, sharesFor, stakeSummary, type StakeDelegation, type StakeSummary, type StakeUnbonding } from "@blockula/sdk";
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import { RequireWallet } from "@/components/Gate";
@@ -20,7 +20,7 @@ export default function StakePage() {
 }
 
 interface Loaded {
-  /** `/api/staking` as served; summarized at render time, so what's withdrawable follows the head. */
+  /** `/api/staking` as served. */
   raw: unknown;
   validators: ValidatorView[];
   /** Blocks unbonding takes, if the node says. */
@@ -40,7 +40,7 @@ function Stake() {
     try {
       const [raw, vals, params] = await Promise.all([client.staking(wallet.account), client.validators() as Promise<ValidatorsView>, client.params().catch(() => null)]);
       const unbonding = Number(paramsOf(params).unbonding_blocks) || undefined;
-      setData({ raw, validators: [...(vals.active ?? []), ...(vals.candidates ?? [])], unbonding });
+      setData({ raw, validators: [...vals.active, ...vals.candidates], unbonding });
     } catch (e) {
       // Nodes without staking (before protocol v1) don't serve /api/staking.
       if (e instanceof ApiError && e.status === 404) setData("inactive");
@@ -77,8 +77,10 @@ function Stake() {
     );
 
   const { validators, unbonding } = data;
-  const stake: StakeSummary = stakeSummary(data.raw, status?.height);
-  const withdrawable = stake.withdrawable !== undefined ? BigInt(stake.withdrawable) : null;
+  const stake: StakeSummary = stakeSummary(data.raw);
+  // Ready from the next block on (`release_at`): follows the head between reloads.
+  const ready = (u: StakeUnbonding) => u.ready || (!!status && u.completes_at <= status.height + 1);
+  const withdrawable = stake.unbonding.filter(ready).reduce((t, u) => t + BigInt(u.amount), 0n);
   const unbondingFor = unbonding ? blocksToHuman(unbonding, status?.block_time_ms) : "the unbonding period";
   return (
     <main className="narrow stack-lg">
@@ -117,14 +119,14 @@ function Stake() {
       {stake.unbonding.length > 0 && (
         <section className="card stack">
           <h2>Unbonding</h2>
-          {stake.unbonding.map((u, i) => (
-            <div className="pool-row" key={i}>
-              <span>{formatFang(BigInt(u.amount))}{u.validator && <span className="dim"> from {shortAddr(u.validator)}</span>}</span>
-              <span className="dim small">{u.completes_at === undefined ? "" : status && u.completes_at <= status.height ? "ready to withdraw" : `ready at block #${u.completes_at}${status ? ` (in about ${blocksToHuman(u.completes_at - status.height, status.block_time_ms)})` : ""}`}</span>
+          {stake.unbonding.map((u) => (
+            <div className="pool-row" key={u.id}>
+              <span>{formatFang(BigInt(u.amount))}<span className="dim"> from {shortAddr(u.validator)}</span></span>
+              <span className="dim small">{ready(u) ? "ready to withdraw" : `ready at block #${u.completes_at}${status ? ` (in about ${blocksToHuman(Math.max(0, u.completes_at - status.height), status.block_time_ms)})` : ""}`}</span>
             </div>
           ))}
           <button className="btn" disabled={withdrawable === 0n} onClick={() => run(() => wallet.withdrawUnbonded())}>
-            {withdrawable !== null && withdrawable > 0n ? `Withdraw ${formatFang(withdrawable)}` : "Withdraw what's finished unbonding"}
+            {withdrawable > 0n ? `Withdraw ${formatFang(withdrawable)}` : "Withdraw what's finished unbonding"}
           </button>
         </section>
       )}
@@ -160,7 +162,7 @@ function PoolRow({ d, unbondingFor, run }: { d: StakeDelegation; unbondingFor: s
   return (
     <div className="pool-row" data-testid="pool">
       <span>
-        <b>{label(d)}</b> <span className="dim small">{BigInt(d.shares).toLocaleString("en-US")} shares{d.commission_bps !== undefined ? ` · ${pct(d.commission_bps)} commission` : ""}{d.jailed ? " · jailed" : ""}</span>
+        <b>{label(d)}</b> <span className="dim small">{BigInt(d.shares).toLocaleString("en-US")} shares{BigInt(d.value) > BigInt(d.principal) ? ` · earned ${formatFang(BigInt(d.value) - BigInt(d.principal))}` : ""}{d.self_bond ? " · self-bond" : ""}</span>
       </span>
       <span className="row-gap">
         <span>{formatFang(BigInt(d.value))}</span>
@@ -189,7 +191,7 @@ function Delegate({ validators, run }: { validators: ValidatorView[]; run: (f: (
   const [to, setTo] = useState("");
   const [amount, setAmount] = useState("");
   const [busy, setBusy] = useState(false);
-  const eligible = validators.filter((v) => !v.jailed && !v.tombstoned);
+  const eligible = validators.filter((v) => v.eligible);
   let drops: bigint | null = null;
   let amountErr: string | null = null;
   try {
@@ -220,7 +222,7 @@ function Delegate({ validators, run }: { validators: ValidatorView[]; run: (f: (
             <option key={x.validator.address} value={x.validator.address}>
               {x.validator.name ?? shortAddr(x.validator.address)}
               {x.stake_display ? ` · ${x.stake_display} staked` : ""}
-              {x.commission_bps !== undefined ? ` · ${pct(x.commission_bps)} commission` : ""}
+              {` · ${pct(x.commission_bps)} commission`}
             </option>
           ))}
         </select>

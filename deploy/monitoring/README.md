@@ -91,6 +91,8 @@ A recording rule adds `blockula:quorum` = n − ⌊(n−1)/3⌋. Host metrics co
 | `BlockulaSlashingProtectionRolledBack` | critical | The slashing-protection record went backwards (a restored or copied home) |
 | `BlockulaValidatorNotSigning` | warning | In the active set, the chain advancing, and no new vote for 10 min |
 | `BlockulaWatchingAfterStart` | warning | Still watching the network after a start, 3 min on |
+| `BlockulaValidatorJailed`, `BlockulaValidatorTombstoned` | critical | This node's validator (`own="1"`) is jailed, or was tombstoned for double-signing |
+| `BlockulaValidatorMissingSlots` | warning | This node's validator missed half the leader slots its downtime window allows, 2 min on |
 | `BlockulaCertificateBelowQuorum` | critical | The newest certificate has fewer signers than the active set's quorum |
 | `BlockulaNoRecentCertificate` | warning | No certificate among the last 16 heights for 5 min |
 | `HostDiskAlmostFull` / `HostDiskCritical` | warning / critical | A filesystem above 80% / 90% |
@@ -101,9 +103,3 @@ A recording rule adds `blockula:quorum` = n − ⌊(n−1)/3⌋. Host metrics co
 | `Watchdog` | none | Always (heartbeat) |
 | `AlertmanagerNotificationsFailing`, `PrometheusRuleFailures` | critical / warning | The pipeline itself is broken |
 
-## Planned (TODO)
-
-These need metrics the node doesn't export yet (staking keeps no liveness or jail records until P-STAKE lands). The dashboard shows them as TODO panels; add the rules when the metrics land:
-
-- **Missed leader slots** per validator over the downtime window (`blockula_missed_leader_slots_total{validator}`, MAINNET-DESIGN 3.4). Warn well before the jail threshold.
-- **Jailed / tombstoned** for this operator's validators (`blockula_validator_jailed`, `blockula_validator_tombstoned`).
