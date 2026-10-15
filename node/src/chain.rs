@@ -303,7 +303,7 @@ impl Genesis {
             );
         }
         // Operators own their validators: the self-bond moves from the owner's balance into the
-        // validator's bond (an escrow), which is what its stake pool starts from.
+        // validator's bond (an escrow), which is what its stake pool starts from (staking.rs).
         for o in &self.operators {
             let Some(address) = hex::decode(&o.consensus_key).ok().map(|pk| crypto::address_with_prefix(&prefix, &pk)) else { continue };
             if !state.validators.contains_key(&address) {
@@ -339,6 +339,11 @@ impl Genesis {
         let v: serde_json::Value = serde_json::from_slice(&bytes)?;
         if v.get("validators").is_none() {
             bail!("{} was created by an older single-validator Blockula; re-summon it (or `blockula dev --reset`)", path.display());
+        }
+        for (old, new) in [("min_bond", "min_self_bond"), ("max_validators", "max_validators")] {
+            if v.get(old).is_some() {
+                bail!("{}: `{old}` moved to `params.{new}` (protocol v1); re-summon the chain (or `blockula dev --reset`)", path.display());
+            }
         }
         let g: Genesis = serde_json::from_value(v)?;
         g.check().with_context(|| format!("{}", path.display()))?;
@@ -525,31 +530,48 @@ impl Journal {
         self.absorb(other)
     }
 
-    /// Folds a nested journal in, keeping the oldest values.
+    /// Folds a nested journal in, keeping the oldest values. Exhaustive, like `State::rollback`.
     fn absorb(&mut self, other: Journal) {
-        self.accounts.absorb(other.accounts);
-        self.names.absorb(other.names);
-        self.validators.absorb(other.validators);
-        self.hunts.absorb(other.hunts);
-        self.github.absorb(other.github);
-        self.github_by_account.absorb(other.github_by_account);
-        self.familiars.absorb(other.familiars);
+        let Journal { accounts, names, validators, hunts, github, github_by_account, familiars, scalars, next_hunt_id, chain_params, poc, staking, governance, econ, beacon, upgrade } = other;
+        self.accounts.absorb(accounts);
+        self.names.absorb(names);
+        self.validators.absorb(validators);
+        self.hunts.absorb(hunts);
+        self.github.absorb(github);
+        self.github_by_account.absorb(github_by_account);
+        self.familiars.absorb(familiars);
         if self.scalars.is_none() {
-            self.scalars = other.scalars;
+            self.scalars = scalars;
         }
         if self.next_hunt_id.is_none() {
-            self.next_hunt_id = other.next_hunt_id;
+            self.next_hunt_id = next_hunt_id;
         }
         if self.chain_params.is_none() {
-            self.chain_params = other.chain_params;
+            self.chain_params = chain_params;
         }
-        self.poc.absorb(other.poc);
-        self.staking.absorb(other.staking);
-        self.governance.absorb(other.governance);
-        self.econ.absorb(other.econ);
-        self.beacon.absorb(other.beacon);
-        self.upgrade.absorb(other.upgrade);
+        self.poc.absorb(poc);
+        self.staking.absorb(staking);
+        self.governance.absorb(governance);
+        self.econ.absorb(econ);
+        self.beacon.absorb(beacon);
+        self.upgrade.absorb(upgrade);
     }
+}
+
+/// The block the end-of-block steps close ([`State::end_block`]). Execution and replay build the
+/// same one from the block (replay from `blocks.jsonl`), so the hooks see identical inputs.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockInfo<'a> {
+    pub height: u64,
+    pub hash: &'a str,
+    /// Paid the block's tips; pays for its skipped txs.
+    pub proposer: &'a str,
+    /// The consensus view the block was proposed in and its parent's view (0 for an epoch's
+    /// first block): every view in between was a missed leader slot (MAINNET-DESIGN 3.4).
+    pub view: u64,
+    pub parent_view: u64,
+    /// Wire sizes of the txs the block carried that couldn't be admitted (skipped).
+    pub skipped: &'a [u64],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -763,12 +785,40 @@ impl State {
         let mut approved: Vec<&ValidatorRecord> = self.validators.values().filter(|v| v.status == ValidatorStatus::Approved).collect();
         approved.sort_by_key(|v| (v.approved_at, v.address.clone()));
         for v in approved {
-            if next.len() >= self.params.max_validators.max(1) {
+            if next.len() as u64 >= self.chain_params.max_validators.max(1) {
                 break;
             }
             next.push(v.address.clone());
         }
         if next.is_empty() { current } else { next }
+    }
+
+    /// The end-of-block steps, after a block's txs. Execution and replay both run exactly this,
+    /// in this order (the modules' hooks are no-ops until their packages land):
+    ///
+    /// 1. `poc_end_block`: the PoC seed, Séances closing and opening.
+    /// 2. `econ::end_block`: the base fee for a later block (3.6).
+    /// 3. `staking::end_block`: missed leader slots from `view`/`parent_view` (downtime), and the
+    ///    proposer's charge for the `skipped` txs (junk, 3.4).
+    /// 4. `governance::end_block`: proposals whose voting ended or whose timelock is over.
+    /// 5. At an epoch boundary: `econ::issue` (rewards into the pools), `staking::end_epoch`
+    ///    (jailing, the next set by stake), `beacon::end_epoch`, then [`State::end_epoch`] (the
+    ///    set history and the legacy admin-approved set).
+    ///
+    /// Then the caller commits the block and, last, runs `upgrade::check_next(height + 1)`, which
+    /// stops the node before a height its binary can't execute (3.9).
+    pub fn end_block(&mut self, b: &BlockInfo) {
+        self.poc_end_block(b.height, b.hash);
+        crate::econ::end_block(self, b);
+        crate::staking::end_block(self, b);
+        crate::governance::end_block(self, b);
+        if self.params.is_boundary(b.height) {
+            let epoch = self.params.epoch_of(b.height);
+            crate::econ::issue(self, epoch);
+            crate::staking::end_epoch(self, epoch);
+            crate::beacon::end_epoch(self, epoch);
+            self.end_epoch(epoch);
+        }
     }
 
     /// Runs after the last block of `epoch`: fixes the set for `epoch + 1`.
@@ -866,29 +916,69 @@ impl State {
         self.familiars.entry(account.to_string()).or_default()
     }
 
-    fn j_scalars(&mut self, j: &mut Journal) {
+    pub(crate) fn j_scalars(&mut self, j: &mut Journal) {
         if j.scalars.is_none() {
             j.scalars = Some((self.supply, self.burned));
         }
     }
 
+    /// Burns `amount` from the supply (it must already be out of every balance and escrow).
+    pub(crate) fn j_burn(&mut self, j: &mut Journal, amount: u64) {
+        self.j_scalars(j);
+        self.supply -= amount;
+        self.burned += amount;
+    }
+
+    /// Mints `amount` into the supply (the caller credits it to a balance or an escrow).
+    pub(crate) fn j_mint(&mut self, j: &mut Journal, amount: u64) {
+        self.j_scalars(j);
+        self.supply += amount;
+    }
+
+    pub(crate) fn name_mut(&mut self, j: &mut Journal, name: &str) -> Option<&mut NameRecord> {
+        j.names.touch(&self.names, name);
+        self.names.get_mut(name)
+    }
+
+    pub(crate) fn remove_name(&mut self, j: &mut Journal, name: &str) -> Option<NameRecord> {
+        j.names.touch(&self.names, name);
+        self.names.remove(name)
+    }
+
+    /// The governance-adjustable parameters, journaled (see [`State::exec_set_param`]).
+    pub(crate) fn chain_params_mut(&mut self, j: &mut Journal) -> &mut ChainParams {
+        if j.chain_params.is_none() {
+            j.chain_params = Some(self.chain_params.clone());
+        }
+        &mut self.chain_params
+    }
+
     /// Undoes everything recorded in `j` (values, and the dirty marks of keys it cleans up).
     pub fn rollback(&mut self, j: Journal) {
-        j.accounts.restore(&mut self.accounts);
-        j.names.restore(&mut self.names);
-        j.validators.restore(&mut self.validators);
-        if let Some((supply, burned)) = j.scalars {
+        let Journal { accounts, names, validators, hunts, github, github_by_account, familiars, scalars, next_hunt_id, chain_params, poc, staking, governance, econ, beacon, upgrade } = j;
+        accounts.restore(&mut self.accounts);
+        names.restore(&mut self.names);
+        validators.restore(&mut self.validators);
+        if let Some((supply, burned)) = scalars {
             self.supply = supply;
             self.burned = burned;
         }
-        j.hunts.restore(&mut self.hunts);
-        j.github.restore(&mut self.github);
-        j.github_by_account.restore(&mut self.github_by_account);
-        j.familiars.restore(&mut self.familiars);
-        if let Some(n) = j.next_hunt_id {
+        hunts.restore(&mut self.hunts);
+        github.restore(&mut self.github);
+        github_by_account.restore(&mut self.github_by_account);
+        familiars.restore(&mut self.familiars);
+        if let Some(n) = next_hunt_id {
             self.next_hunt_id = n;
         }
-        j.poc.rollback(&mut self.poc);
+        if let Some(c) = chain_params {
+            self.chain_params = c;
+        }
+        poc.rollback(&mut self.poc);
+        staking.rollback(&mut self.staking);
+        governance.rollback(&mut self.governance);
+        econ.rollback(&mut self.econ);
+        beacon.rollback(&mut self.beacon);
+        upgrade.rollback(&mut self.upgrade);
     }
 
     /// Checks that decide whether a tx can be included at all (at `height`). No state changes.
@@ -901,7 +991,7 @@ impl State {
             tx.check_format()?;
         }
         tx.check_prefix(self.params.prefix())?;
-        check_validity(tx, height, self.params.max_tx_validity_blocks())?;
+        check_validity(tx, height, self.chain_params.max_tx_validity_blocks)?;
         let sender = tx.sender()?;
         let signer = tx.signer_key_id()?;
         let keys = self.keys_of(&sender);
@@ -1004,6 +1094,9 @@ impl State {
                 if self.names.contains_key(&n) {
                     bail!("{n}{NAME_SUFFIX} is already taken");
                 }
+                if self.econ.reserved_names.contains_key(&n) {
+                    bail!("{n}{NAME_SUFFIX} is reserved");
+                }
                 self.j_debit(j, &sender, name_price(&n))?;
                 let treasury = self.treasury();
                 self.j_credit(j, &treasury, name_price(&n));
@@ -1069,8 +1162,8 @@ impl State {
                 }
                 check_host_port(p2p_addr).context("p2p_addr")?;
                 check_http_addr(http_addr).context("http_addr")?;
-                if *bond < self.params.min_bond {
-                    bail!("bond must be at least {}", fmt_fang(self.params.min_bond));
+                if *bond < self.chain_params.min_self_bond {
+                    bail!("bond must be at least {}", fmt_fang(self.chain_params.min_self_bond));
                 }
                 let address = crypto::address_with_prefix(self.params.prefix(), &pk);
                 if let Some(v) = self.validators.get(&address) {
@@ -1083,7 +1176,7 @@ impl State {
                 self.validator_mut(j, &address);
                 self.validators.insert(
                     address.clone(),
-                    ValidatorRecord { address, owner: sender.clone(), consensus_key: consensus_key.clone(), p2p_addr: p2p_addr.clone(), http_addr: http_addr.clone(), bond: *bond, status: ValidatorStatus::Pending, registered_at: height, approved_at: None, approved_by: None, active_from: None, removed_at: None, removed_by: None, active_until: None, unbond_epoch: None },
+                    ValidatorRecord { address, owner: sender.clone(), consensus_key: consensus_key.clone(), p2p_addr: p2p_addr.clone(), http_addr: http_addr.clone(), bond: *bond, status: ValidatorStatus::Pending, registered_at: height, approved_at: None, approved_by: None, active_from: None, removed_at: None, removed_by: None, active_until: None, unbond_epoch: None, commission_bps: 0 },
                 );
             }
             Action::ApproveValidator { validator } => {
@@ -1155,8 +1248,7 @@ impl State {
                 self.github_by_account.insert(sender.clone(), lower);
             }
             Action::UnlinkGithub { handle } => {
-                let lower = handle.to_ascii_lowercase();
-                let link = self.github.get(&lower).cloned().ok_or_else(|| anyhow!("@{handle} isn't linked"))?;
+                let link = self.github.get(&handle.to_ascii_lowercase()).cloned().ok_or_else(|| anyhow!("@{handle} isn't linked"))?;
                 let admin = self.params.admins.contains(&sender);
                 if link.account != sender && !admin {
                     bail!("only the linked account or a validator admin can unlink @{handle}");
@@ -1164,9 +1256,7 @@ impl State {
                 if link.account == sender && key.role != KeyRole::Owner {
                     bail!("only owner keys can unlink GitHub");
                 }
-                self.j_github(j, &lower, &link.account);
-                self.github.remove(&lower);
-                self.github_by_account.remove(&link.account);
+                self.exec_unlink_github(j, handle)?;
             }
             Action::CreateHunt { repo, issue, amount, expires_at, title } => {
                 if key.role != KeyRole::Owner {
@@ -1253,17 +1343,7 @@ impl State {
                         bail!("hunt #{hunt_id} can be cancelled by its creator after block {}", h.expires_at);
                     }
                 }
-                let refunds: Vec<(String, u64)> = h.funders.iter().map(|(a, v)| (a.clone(), v.parse().unwrap_or(0))).collect();
-                let total: u64 = refunds.iter().try_fold(0u64, |acc, (_, v)| acc.checked_add(*v)).ok_or_else(|| anyhow!("escrow overflow"))?;
-                if total != h.amount {
-                    bail!("escrow accounting mismatch on hunt #{hunt_id}");
-                }
-                for (who, v) in refunds {
-                    self.j_credit(j, &who, v);
-                }
-                let h = self.hunt_mut(j, *hunt_id).unwrap();
-                h.status = HuntStatus::Cancelled;
-                h.cancelled_at = Some(height);
+                self.exec_refund_hunt(j, *hunt_id, height)?;
             }
             Action::RegisterFamiliar { key_id, label } => {
                 if key.role != KeyRole::Owner {
@@ -1276,13 +1356,63 @@ impl State {
                 }
                 self.familiars_mut(j, &sender).insert(key_id.clone(), label.clone());
             }
+            // Protocol v1 (MAINNET-DESIGN 3.1): each module applies its own tags.
+            Action::Delegate { .. } | Action::Undelegate { .. } | Action::Redelegate { .. } | Action::WithdrawUnbonded {} | Action::UpdateValidator { .. } | Action::Unjail { .. } | Action::ReportEquivocation { .. } => crate::staking::apply(self, j, tx, &sender, signer, key, height)?,
+            Action::BeaconCommit { .. } | Action::BeaconReveal { .. } | Action::AttestRevert { .. } => crate::beacon::apply(self, j, tx, &sender, signer, key, height)?,
+            Action::Propose { .. } | Action::Vote { .. } | Action::Unlock {} | Action::MultisigCreate { .. } | Action::MultisigPropose { .. } | Action::MultisigApprove { .. } | Action::ClaimDistribution { .. } => crate::governance::apply(self, j, tx, &sender, signer, key, height)?,
+            Action::RenewName { .. } | Action::TransferName { .. } | Action::ReleaseName { .. } => crate::econ::apply(self, j, tx, &sender, signer, key, height)?,
             _ => self.apply_poc(j, tx, &sender, signer, key, height)?,
         }
         Ok(())
     }
 
+    // ---- levers: what the former admin actions do, without any signer check. Admin-signed txs
+    // (dev and test chains) call them after checking the signer; governance (P-GOV) calls them
+    // when a proposal executes. The PoC ones are in poc.rs, features and upgrades in upgrade.rs.
+
+    /// Drops a GitHub link (both directions).
+    pub(crate) fn exec_unlink_github(&mut self, j: &mut Journal, handle: &str) -> Result<()> {
+        let lower = handle.to_ascii_lowercase();
+        let link = self.github.get(&lower).cloned().ok_or_else(|| anyhow!("@{handle} isn't linked"))?;
+        self.j_github(j, &lower, &link.account);
+        self.github.remove(&lower);
+        self.github_by_account.remove(&link.account);
+        Ok(())
+    }
+
+    /// Cancels an open hunt and refunds every funder what they put in. Nobody can redirect a
+    /// hunt's escrow: it goes back exactly where it came from.
+    pub(crate) fn exec_refund_hunt(&mut self, j: &mut Journal, hunt_id: u64, height: u64) -> Result<()> {
+        let h = self.hunts.get(&hunt_id).ok_or_else(|| anyhow!("no hunt #{hunt_id}"))?;
+        if h.status != HuntStatus::Open {
+            bail!("hunt #{hunt_id} is already {:?}", h.status);
+        }
+        let refunds: Vec<(String, u64)> = h.funders.iter().map(|(a, v)| (a.clone(), v.parse().unwrap_or(0))).collect();
+        let total: u64 = refunds.iter().try_fold(0u64, |acc, (_, v)| acc.checked_add(*v)).ok_or_else(|| anyhow!("escrow overflow"))?;
+        if total != h.amount {
+            bail!("escrow accounting mismatch on hunt #{hunt_id}");
+        }
+        for (who, v) in refunds {
+            self.j_credit(j, &who, v);
+        }
+        let h = self.hunt_mut(j, hunt_id).unwrap();
+        h.status = HuntStatus::Cancelled;
+        h.cancelled_at = Some(height);
+        Ok(())
+    }
+
+    /// Sets a governance-adjustable parameter, within its bounds (`ParamChange`).
+    pub(crate) fn exec_set_param(&mut self, j: &mut Journal, key: &str, value: u64) -> Result<()> {
+        let params = self.params.clone();
+        let mut next = self.chain_params.clone();
+        next.set(key, value, &params)?;
+        *self.chain_params_mut(j) = next;
+        Ok(())
+    }
+
     /// What admitting this tx reserves from the sender's balance (charge + amount moved out).
-    pub fn tx_debit(tx: &Tx) -> u64 {
+    /// Votes reserve nothing: they lock tokens the voter keeps.
+    pub fn tx_debit(&self, tx: &Tx) -> u64 {
         tx.charge().unwrap_or(u64::MAX).saturating_add(match &tx.action {
             Action::Transfer { amount, .. } => *amount,
             Action::RegisterName { name } => normalize_name(name).map(|n| name_price(&n)).unwrap_or(0),
@@ -1291,6 +1421,9 @@ impl State {
             Action::FundPool { amount } | Action::JoinJury { bond: amount } => *amount,
             Action::Vouch { .. } => crate::poc::VOUCH_BOND,
             Action::SubmitClaim { .. } => crate::poc::CLAIM_BOND,
+            Action::Delegate { amount, .. } => *amount,
+            Action::Propose { deposit, .. } => *deposit,
+            Action::RenewName { name, years } => normalize_name(name).map(|n| self.chain_params.name_renewal_price(n.len(), *years as u64)).unwrap_or(0),
             _ => 0,
         })
     }
@@ -1362,6 +1495,10 @@ impl State {
                 format!("{from} cancelled the hunt on {what}; funders were refunded")
             }
             Action::RegisterFamiliar { label, .. } => format!("{from} registered the Familiar “{label}”"),
+            Action::Delegate { .. } | Action::Undelegate { .. } | Action::Redelegate { .. } | Action::WithdrawUnbonded {} | Action::UpdateValidator { .. } | Action::Unjail { .. } | Action::ReportEquivocation { .. } => crate::staking::describe(self, tx, &from),
+            Action::BeaconCommit { .. } | Action::BeaconReveal { .. } | Action::AttestRevert { .. } => crate::beacon::describe(self, tx, &from),
+            Action::Propose { .. } | Action::Vote { .. } | Action::Unlock {} | Action::MultisigCreate { .. } | Action::MultisigPropose { .. } | Action::MultisigApprove { .. } | Action::ClaimDistribution { .. } => crate::governance::describe(self, tx, &from),
+            Action::RenewName { .. } | Action::TransferName { .. } | Action::ReleaseName { .. } => crate::econ::describe(self, tx, &from),
             _ => self.describe_poc(tx, &from),
         }
     }
@@ -1408,18 +1545,21 @@ pub struct SummonOpts {
     /// Season 0 validator admins; defaults to the first validator's account.
     pub admins: Vec<String>,
     pub epoch_blocks: u64,
-    /// Minimum validator bond in drops. `None`: 50 FANG on faucet chains (one faucet drip
-    /// covers it), 10,000 FANG otherwise.
+    /// Minimum validator self-bond in drops (`params.min_self_bond`). `None`: 50 FANG on faucet
+    /// chains (one faucet drip covers it), the `ChainParams` default otherwise.
     pub min_bond: Option<u64>,
     /// Proof of Contribution timings (`None`: derived from the block time).
     pub contribution: Option<crate::poc::PocTimes>,
     /// Address prefix: `boo` (mainnet, dev) or `tboo` (public testnets).
     pub address_prefix: String,
+    /// Genesis `params` overrides (`blockula dev` shortens durations with
+    /// `ChainParams::dev_overrides`). `min_bond`, when set, wins for `min_self_bond`.
+    pub params: BTreeMap<String, u64>,
 }
 
 impl SummonOpts {
     pub fn new(chain_id: &str, validators: usize) -> Self {
-        Self { chain_id: chain_id.into(), faucet: true, block_time_ms: 1000, validators, http_port: None, admins: vec![], epoch_blocks: default_epoch_blocks(), min_bond: None, contribution: None, address_prefix: default_address_prefix() }
+        Self { chain_id: chain_id.into(), faucet: true, block_time_ms: 1000, validators, http_port: None, admins: vec![], epoch_blocks: default_epoch_blocks(), min_bond: None, contribution: None, address_prefix: default_address_prefix(), params: BTreeMap::new() }
     }
 }
 
@@ -1625,9 +1765,19 @@ impl Chain {
             infos.push(ValidatorInfo { address: k.address_with(prefix), public_key: hex::encode(k.public_key()), p2p_addr: format!("127.0.0.1:{}", free_port()?), http_addr: format!("127.0.0.1:{http}") });
         }
         let per_validator = 1_000_000_000 * DROPS_PER_FANG / validators as u64;
-        let mut allocations: Vec<Allocation> = keys.iter().map(|k| Allocation { address: k.address_with(prefix), amount: per_validator }).collect();
-        allocations.push(Allocation { address: treasury(prefix), amount: 100_000_000 * DROPS_PER_FANG });
+        let mut allocations: Vec<Allocation> = keys.iter().map(|k| Allocation { address: k.address_with(prefix), amount: per_validator, vesting: None, label: None }).collect();
+        allocations.push(Allocation { address: treasury(prefix), amount: 100_000_000 * DROPS_PER_FANG, vesting: None, label: Some("treasury".into()) });
         let validator_admins = if o.admins.is_empty() { vec![keys[0].address_with(prefix)] } else { o.admins.clone() };
+        let mut param_overrides = o.params.clone();
+        match o.min_bond {
+            Some(b) => {
+                param_overrides.insert("min_self_bond".into(), b);
+            }
+            None if faucet => {
+                param_overrides.entry("min_self_bond".into()).or_insert(50 * DROPS_PER_FANG);
+            }
+            None => {}
+        }
         let genesis = Genesis {
             chain_id: chain_id.to_string(),
             token: "FANG".into(),
@@ -1639,11 +1789,15 @@ impl Chain {
             allocations,
             epoch_blocks: o.epoch_blocks,
             validator_admins,
-            min_bond: o.min_bond.unwrap_or(if faucet { 50 * DROPS_PER_FANG } else { default_min_bond() }),
-            max_validators: default_max_validators(),
             contribution: o.contribution.clone(),
             address_prefix: prefix.into(),
+            param_overrides,
+            operators: vec![],
+            reserved_names: vec![],
+            soul_ledger: vec![],
+            features: vec![],
         };
+        genesis.check()?;
         let homes: Vec<PathBuf> = if validators == 1 { vec![home.to_path_buf()] } else { (0..validators).map(|i| home.join(format!("v{i}"))).collect() };
         for (h, k) in homes.iter().zip(&keys) {
             fs::create_dir_all(h)?;
@@ -1965,9 +2119,8 @@ impl Chain {
                 bail!("replaying block {}: tx {i} gave {outcome:?}, recorded {expected:?}", block.height);
             }
         }
-        self.state.poc_end_block(block.height, &block.hash);
+        self.state.end_block(&BlockInfo { height: block.height, hash: &block.hash, proposer: &block.proposer, view: block.view, parent_view: block.parent_view, skipped: &block.skipped });
         if self.state.params.is_boundary(block.height) {
-            self.state.end_epoch(self.state.params.epoch_of(block.height));
             self.record_epoch(block.height);
         }
         let root = hex::encode(self.state.commit_block()?.root);
@@ -1976,9 +2129,10 @@ impl Chain {
         if root != block.state_root {
             bail!("state root mismatch at height {}", block.height);
         }
+        let height = block.height;
         self.index(&block);
         self.push_block(block, offset);
-        Ok(())
+        crate::upgrade::check_next(&self.state, height + 1)
     }
 
     fn note_failed(&mut self, id: String, reason: String, height: u64) {
@@ -2009,6 +2163,7 @@ impl Chain {
         }
         let mut txs = vec![];
         let mut failed = BTreeMap::new();
+        let mut skipped = vec![];
         for tx in f.txs {
             match self.state.apply(&tx, &self.genesis.chain_id, &f.proposer, f.height) {
                 Ok(Outcome::Applied) => txs.push(tx),
@@ -2017,20 +2172,20 @@ impl Chain {
                     self.note_failed(tx.id(), r, f.height);
                     txs.push(tx);
                 }
-                Err(e) => self.note_failed(tx.id(), format!("not included: {e}"), f.height),
+                Err(e) => {
+                    skipped.push(tx.size());
+                    self.note_failed(tx.id(), format!("not included: {e}"), f.height);
+                }
             }
         }
-        self.state.poc_end_block(f.height, &f.hash);
-        if self.state.params.is_boundary(f.height) {
-            self.state.end_epoch(self.state.params.epoch_of(f.height));
-            if self.record_epoch(f.height) {
-                self.sign_handoffs();
-            }
+        self.state.end_block(&BlockInfo { height: f.height, hash: &f.hash, proposer: &f.proposer, view: f.view, parent_view: f.parent_view, skipped: &skipped });
+        if self.state.params.is_boundary(f.height) && self.record_epoch(f.height) {
+            self.sign_handoffs();
         }
         let state_root = hex::encode(self.state.commit_block()?.root);
         #[cfg(test)]
         self.state.debug_check(f.height);
-        let block = Block { height: f.height, prev_hash: f.parent, timestamp_ms: f.timestamp_ms, view: f.view, parent_view: f.parent_view, version: f.version, proposer: f.proposer, state_root, txs, hash: f.hash, signature: String::new(), failed };
+        let block = Block { height: f.height, prev_hash: f.parent, timestamp_ms: f.timestamp_ms, view: f.view, parent_view: f.parent_view, version: f.version, proposer: f.proposer, state_root, txs, hash: f.hash, signature: String::new(), failed, skipped };
         let (at, len) = self.cblocks.append(f.height, &f.cblock)?;
         self.cblock_index.push((at, len));
         let line = serde_json::to_string(&block)? + "\n";
@@ -2049,7 +2204,10 @@ impl Chain {
             self.take_snapshot();
         }
         self.revalidate_mempool();
-        Ok(())
+        // The last end-of-block step: the block is executed and stored, but if this binary can't
+        // run the next height, stop here (the error leaves the block unacknowledged, so consensus
+        // stops delivering) instead of diverging. P-UPGRADE turns this into a clean exit.
+        crate::upgrade::check_next(&self.state, f.height + 1)
     }
 
     /// After executing an epoch's last block: remember the next epoch's set. Returns whether it
@@ -2147,7 +2305,7 @@ impl Chain {
         for tx in &self.mempool {
             let e = self.pending.entry(tx.from.clone()).or_default();
             e.0 += 1;
-            e.1 = e.1.saturating_add(State::tx_debit(tx));
+            e.1 = e.1.saturating_add(self.state.tx_debit(tx));
         }
     }
 
@@ -2255,7 +2413,7 @@ impl Chain {
         if let Some(g) = &self.gossip {
             let _ = g.unbounded_send(tx.clone());
         }
-        let debit = State::tx_debit(&tx);
+        let debit = self.state.tx_debit(&tx);
         let e = self.pending.entry(sender.clone()).or_default();
         e.0 += 1;
         e.1 = e.1.saturating_add(debit);
@@ -2277,7 +2435,7 @@ impl Chain {
             if self.pending.get(&sender).is_some_and(|p| p.0 >= MAX_PENDING_PER_SENDER) || self.mempool.len() >= MAX_MEMPOOL {
                 return Ok(());
             }
-            let debit = State::tx_debit(&tx);
+            let debit = self.state.tx_debit(&tx);
             let e = self.pending.entry(sender.clone()).or_default();
             e.0 += 1;
             e.1 = e.1.saturating_add(debit);
@@ -2339,7 +2497,7 @@ impl Chain {
             from,
             fee: 0,
             tip: 0,
-            valid_until: self.height() + OWN_TX_VALIDITY.min(self.state.params.max_tx_validity_blocks()),
+            valid_until: self.height() + OWN_TX_VALIDITY.min(self.state.chain_params.max_tx_validity_blocks),
             action,
             memo: memo.into(),
             public_key: hex::encode(keys.public_key()),

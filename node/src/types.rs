@@ -1051,7 +1051,7 @@ impl Action {
                     bail!("conviction must be 0–{}", crate::governance::MAX_CONVICTION);
                 }
             }
-            Action::Unlock {} | Action::MultisigApprove { .. } => {}
+            Action::WithdrawUnbonded {} | Action::Unlock {} | Action::MultisigApprove { .. } => {}
             Action::MultisigCreate { owners, threshold } => {
                 if owners.is_empty() || owners.len() > crate::chain::MAX_KEYS || !owners.iter().all(|k| key_id_ok(k)) {
                     bail!("owners must be 1–{} key ids (32 bytes of lowercase hex)", crate::chain::MAX_KEYS);
@@ -1098,6 +1098,62 @@ impl Action {
             }
         }
         Ok(())
+    }
+
+    /// The action's JSON `type` (snake_case), e.g. `"delegate"`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Action::Transfer { .. } => "transfer",
+            Action::RegisterName { .. } => "register_name",
+            Action::AddKey { .. } => "add_key",
+            Action::RemoveKey { .. } => "remove_key",
+            Action::RegisterValidator { .. } => "register_validator",
+            Action::ApproveValidator { .. } => "approve_validator",
+            Action::RemoveValidator { .. } => "remove_validator",
+            Action::Unbond { .. } => "unbond",
+            Action::LinkGithub { .. } => "link_github",
+            Action::UnlinkGithub { .. } => "unlink_github",
+            Action::CreateHunt { .. } => "create_hunt",
+            Action::FundHunt { .. } => "fund_hunt",
+            Action::AwardHunt { .. } => "award_hunt",
+            Action::CancelHunt { .. } => "cancel_hunt",
+            Action::RegisterFamiliar { .. } => "register_familiar",
+            Action::SetRepo { .. } => "set_repo",
+            Action::GrantSoul { .. } => "grant_soul",
+            Action::Vouch { .. } => "vouch",
+            Action::Unvouch { .. } => "unvouch",
+            Action::FlagSybil { .. } => "flag_sybil",
+            Action::SubmitClaim { .. } => "submit_claim",
+            Action::AttestClaim { .. } => "attest_claim",
+            Action::RejectClaim { .. } => "reject_claim",
+            Action::JoinJury { .. } => "join_jury",
+            Action::LeaveJury {} => "leave_jury",
+            Action::CommitVotes { .. } => "commit_votes",
+            Action::RevealVotes { .. } => "reveal_votes",
+            Action::FundPool { .. } => "fund_pool",
+            Action::WithdrawVested {} => "withdraw_vested",
+            Action::Clawback { .. } => "clawback",
+            Action::Delegate { .. } => "delegate",
+            Action::Undelegate { .. } => "undelegate",
+            Action::Redelegate { .. } => "redelegate",
+            Action::WithdrawUnbonded {} => "withdraw_unbonded",
+            Action::UpdateValidator { .. } => "update_validator",
+            Action::Unjail { .. } => "unjail",
+            Action::ReportEquivocation { .. } => "report_equivocation",
+            Action::BeaconCommit { .. } => "beacon_commit",
+            Action::BeaconReveal { .. } => "beacon_reveal",
+            Action::Propose { .. } => "propose",
+            Action::Vote { .. } => "vote",
+            Action::Unlock {} => "unlock",
+            Action::MultisigCreate { .. } => "multisig_create",
+            Action::MultisigPropose { .. } => "multisig_propose",
+            Action::MultisigApprove { .. } => "multisig_approve",
+            Action::RenewName { .. } => "renew_name",
+            Action::TransferName { .. } => "transfer_name",
+            Action::ReleaseName { .. } => "release_name",
+            Action::ClaimDistribution { .. } => "claim_distribution",
+            Action::AttestRevert { .. } => "attest_revert",
+        }
     }
 
     /// Fields that name an account and may hold a raw address (names resolve on this chain),

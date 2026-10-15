@@ -12,18 +12,24 @@
 #[path = "../../src"]
 mod node_src {
     pub mod api;
+    pub mod beacon;
     pub mod chain;
     pub mod consensus;
     pub mod contrib_cli;
     pub mod crypto;
+    pub mod econ;
     pub mod epochs;
     pub mod github;
+    pub mod governance;
     pub mod node;
+    pub mod params;
     pub mod poc;
     pub mod pq;
     pub mod snapshot;
+    pub mod staking;
     pub mod state;
     pub mod types;
+    pub mod upgrade;
     pub mod validator_cli;
 }
 pub use node_src::*;

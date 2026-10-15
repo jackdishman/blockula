@@ -424,7 +424,7 @@ where
             if block.exec_height + MAX_EXEC_LAG < c.height().min(parent.height) {
                 return reject("exec_height too far behind");
             }
-            (c.genesis.chain_id.clone(), c.state.params.max_tx_validity_blocks())
+            (c.genesis.chain_id.clone(), c.state.chain_params.max_tx_validity_blocks)
         };
         // Tx checks (signatures included) run without holding the chain lock.
         let mut seen = std::collections::HashSet::new();

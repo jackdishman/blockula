@@ -170,6 +170,14 @@ fn blocks_per_day(block_time_ms: u64) -> u64 {
     (86_400_000 / block_time_ms.max(1)).max(1)
 }
 
+/// Mainnet's shape (1 s blocks, 3,600-block epochs). Only `State::default()` uses it (tests, and
+/// a state about to load its records); chains derive theirs from genesis.
+impl Default for ChainParams {
+    fn default() -> Self {
+        Self::defaults_for(86_400, 3_600)
+    }
+}
+
 impl ChainParams {
     /// The defaults for a chain with these genesis constants.
     pub fn defaults(p: &Params) -> Self {

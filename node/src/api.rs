@@ -331,6 +331,12 @@ fn tx_json_with(c: &Chain, tx: &Tx, height: Option<u64>, error: Option<&str>) ->
         Action::FundPool { amount } => ("fund_pool", Some(c.state.pool()), Some(*amount)),
         Action::WithdrawVested {} => ("withdraw_vested", None, None),
         Action::Clawback { account, .. } => ("clawback", c.state.resolve(account).ok(), None),
+        Action::Delegate { validator, amount } => ("delegate", Some(validator.clone()), Some(*amount)),
+        Action::Propose { deposit, .. } => ("propose", None, Some(*deposit)),
+        Action::Vote { amount, .. } => ("vote", None, Some(*amount)),
+        Action::TransferName { to, .. } => ("transfer_name", c.state.resolve(to).ok(), None),
+        Action::ClaimDistribution { amount, .. } => ("claim_distribution", None, Some(*amount)),
+        a => (a.kind(), None, None),
     };
     json!({
         "id": tx.id(),
@@ -416,7 +422,7 @@ async fn status(State(n): State<Node>) -> ApiResult {
         "history_from": c.base_height() + 1,
         "fast_synced_from": c.base.as_ref().map(|b| b.height),
         "address_prefix": c.genesis.address_prefix,
-        "max_tx_validity_blocks": c.state.params.max_tx_validity_blocks(),
+        "max_tx_validity_blocks": c.state.chain_params.max_tx_validity_blocks,
         "protocol_version": crate::consensus::PROTOCOL_VERSION,
         "crypto": { "signatures": "ML-DSA-65 (FIPS 204)", "hash": "BLAKE3-256", "addresses": format!("bech32m({}, BLAKE3(pubkey))", c.genesis.address_prefix), "p2p_transport": "hybrid X25519 + ML-KEM-768 key exchange, ChaCha20-Poly1305, ML-DSA-65 peer auth" },
     })))
@@ -856,9 +862,9 @@ async fn validators(State(n): State<Node>) -> ApiResult {
         "approved": by_status(Approved),
         "removed": by_status(Removed),
         "admins": p.admins.iter().map(|a| label(&c, a)).collect::<Vec<_>>(),
-        "min_bond": p.min_bond.to_string(),
-        "min_bond_display": fmt_fang(p.min_bond),
-        "max_validators": p.max_validators,
+        "min_bond": c.state.chain_params.min_self_bond.to_string(),
+        "min_bond_display": fmt_fang(c.state.chain_params.min_self_bond),
+        "max_validators": c.state.chain_params.max_validators,
         "explainer": "Validators take turns proposing blocks and vote to finalize them; a block is final once more than two-thirds of the active set have signed it (ML-DSA-65). The set can only change at epoch boundaries. In Season 0, admins approve new validators, who post a bond and join at the next epoch.",
     })))
 }
