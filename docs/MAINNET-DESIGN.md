@@ -136,9 +136,9 @@ CBlock { version: u32, parent, height, view: u64, parent_view: u64, timestamp_ms
 
 ### 3.9 Upgrades and halts (OPS-3, OPS-5, OPS-6)
 
-- State holds an upgrade schedule `[(version, activation_height)]`, changed only by `ScheduleUpgrade` proposals. `params.version_at(h)` gates behavior. A node whose binary doesn't support the version scheduled at the next height halts cleanly before executing it (exit code, `/api/health` says why) instead of diverging.
-- `--halt-height H` stops after executing `H` (coordinated restarts, incidents).
-- **Slashing protection that survives restores:** besides a last-signed-view record checked before each signature, a validator that starts up only signs views later than the newest view it observes from the network for its epoch (a few views of abstention per restart), and halts if it sees a vote under its own key that it didn't produce in this run. A restored volume therefore can't double-sign even though its record rolled back with it.
+- State holds an upgrade schedule `[(version, activation_height)]`, changed only by `ScheduleUpgrade` proposals; an upgrade activates at least `MIN_UPGRADE_LEAD` (64) blocks after the block that schedules it, so a verifier that has executed within 64 blocks of a height knows its version (and waits until then). `upgrade::version_at(h)` gates behavior. A node whose binary doesn't support the version scheduled at the next height halts cleanly before executing it instead of diverging: it doesn't vote on or propose later blocks; validators exit (code 11), full nodes keep serving reads and `/api/health` says why.
+- `--halt-height H` stops after executing `H` (coordinated restarts, incidents): no votes or proposals above `H`, exit code 10 on validators.
+- **Slashing protection that survives restores:** besides a last-signed-view record checked before each signature, a validator that starts up only signs views later than the newest view it observes from the network for its epoch (a few views of abstention per restart), and halts if it sees a vote under its own key that it didn't produce in this run. A restored volume therefore can't double-sign even though its record rolled back with it. Only certificates (quorum proofs) count as observations, so no single peer can silence a validator; if the network makes no progress without it (a full restart), it signs again after ~20 s on its record alone (`protection.rs`).
 - On-disk formats carry a schema version and migrations.
 
 ### 3.10 Sync trust (CRY-2)
