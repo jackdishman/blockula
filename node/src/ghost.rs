@@ -237,7 +237,7 @@ pub fn pause_threshold(validators: usize) -> usize {
 
 /// Ghost actions can run at `height`, or why not.
 pub fn check_enabled(state: &State, height: u64) -> Result<()> {
-    if activation(state).is_none() {
+    if !crate::upgrade::is_active(state, FEATURE) {
         bail!("Ghost Mode is off: it ships disabled, and only governance can switch it on (ActivateFeature {{ ghost }}), after its audit");
     }
     if let Some(p) = pause_of(state).filter(|_| paused(state, height)) {
