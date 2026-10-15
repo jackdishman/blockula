@@ -41,6 +41,8 @@ Added files:
   (2026.9.0, `src/handshake.rs` and `key_exchange.rs`) with the key exchange replaced by
   ML-KEM-768 + X25519, both identities committed before the dialer signs, transcript framing V1
   and a new protocol label. The AEAD (`SendCipher`/`RecvCipher`) and `Error` are still upstream's.
+  It exports `SUITE` and `PROTOCOL`, which the node's `/api/status` is built from, so a node that
+  doesn't link this copy fails to compile (keep them when re-porting).
 - `src/hybrid/tests.rs`, `src/hybrid/mldsa.rs` (a test-only ML-DSA-65 signer matching
   `node/src/pq.rs`), `src/hybrid/ml_kem_vectors.rs`, and `testdata/` (NIST ACVP and Wycheproof
   ML-KEM-768 vectors, trimmed by `testdata/trim.py`; sources and their sha256 are inside the JSON).

@@ -335,6 +335,7 @@ dependencies = [
  "commonware-parallel",
  "commonware-runtime",
  "commonware-storage",
+ "commonware-stream",
  "commonware-utils",
  "futures",
  "getrandom 0.3.4",
