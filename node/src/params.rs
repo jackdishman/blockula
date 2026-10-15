@@ -98,7 +98,7 @@ chain_params! { |day, epoch|
     /// Most an account with vesting locks may delegate to one pool, in bps of the supply (3.7).
     insider_delegation_cap_bps: 100, [0, 10_000];
     /// Oldest equivocation evidence accepted; at most `unbonding_blocks` of epochs.
-    evidence_max_age_epochs: ((21 * day).max(epoch) / epoch).max(1), [1, 1_000_000];
+    evidence_max_age_epochs: ((21 * day).max(epoch) / epoch).max(1), [1, 365 * day];
 
     // ---- fees (3.6) ----
     /// The base fee's floor, per tx and per byte (today's `min_fee`).
@@ -163,6 +163,20 @@ chain_params! { |day, epoch|
     ghost_pool_cap: 0, [0, MAX_SUPPLY];
     ghost_max_tx_bytes: 256 * KIB, [0, MIB];
     ghost_max_block_bytes: MIB, [0, CODEC_MAX_BLOCK_BYTES];
+}
+
+/// Highest `Vote::conviction`.
+pub const MAX_CONVICTION: u8 = 6;
+/// Lock periods (`lock_period_blocks`) a vote at each conviction locks its amount for: none at 0,
+/// then 1, 2, 4, 8, 16 and 32 …
+pub const CONVICTION_PERIODS: [u64; 7] = [0, 1, 2, 4, 8, 16, 32];
+/// … and its weight, in tenths of the amount: 0.1× with no lock, then 1×–6×.
+pub const CONVICTION_TENTHS: [u64; 7] = [1, 10, 20, 30, 40, 50, 60];
+
+/// A vote's weight: `amount` × the conviction multiplier (`None` past [`MAX_CONVICTION`]).
+#[cfg_attr(not(test), allow(dead_code))] // governance.rs (P-GOV)
+pub fn vote_weight(amount: u64, conviction: u8) -> Option<u128> {
+    CONVICTION_TENTHS.get(conviction as usize).map(|t| amount as u128 * *t as u128 / 10)
 }
 
 /// Blocks per day at a block time (at least 1).
@@ -235,9 +249,10 @@ impl ChainParams {
         Self::KEYS.iter().map(|k| (*k, self.get(k).expect("every key has a value"))).collect()
     }
 
-    /// Short durations for `blockula dev` (written into its genesis `params`): unbonding, jail,
-    /// voting, timelock and conviction periods in minutes, spending open from the start. Names,
-    /// fees and issuance keep their real values.
+    /// Short durations for `blockula dev` (written into its genesis `params`, like
+    /// `PocTimes::dev`): unbonding, jail, voting, timelock and conviction periods in minutes,
+    /// spending open from the start, and a deposit one faucet drip covers. Names, fees and
+    /// issuance keep their real values. `blockula summon` (testnets) keeps the real durations.
     pub fn dev_overrides(block_time_ms: u64, epoch_blocks: u64) -> BTreeMap<String, u64> {
         let minute = (60_000 / block_time_ms.max(1)).max(1);
         let unbonding = (10 * minute).max(epoch_blocks.max(1)).max(10);
@@ -249,10 +264,17 @@ impl ChainParams {
             ("timelock_blocks", minute),
             ("lock_period_blocks", minute),
             ("governance_spend_height", 0),
+            ("proposal_deposit", 10 * FANG),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
         .collect()
+    }
+
+    /// How long a vote at `conviction` locks its amount (`None` past [`MAX_CONVICTION`]).
+    #[cfg_attr(not(test), allow(dead_code))] // governance.rs (P-GOV)
+    pub fn vote_lock_blocks(&self, conviction: u8) -> Option<u64> {
+        CONVICTION_PERIODS.get(conviction as usize).map(|p| p.saturating_mul(self.lock_period_blocks))
     }
 
     /// What registering a name of `len` characters costs.
@@ -347,6 +369,19 @@ mod tests {
         // Name prices.
         assert_eq!((c.name_price(3), c.name_price(4), c.name_price(9)), (100 * FANG, 25 * FANG, 5 * FANG));
         assert_eq!(c.name_renewal_price(5, 2), 2 * FANG);
+    }
+
+    #[test]
+    fn conviction_ladder() {
+        assert_eq!(vote_weight(100, 0), Some(10), "0.1× with no lock");
+        assert_eq!(vote_weight(100, 1), Some(100));
+        assert_eq!(vote_weight(100, 6), Some(600));
+        assert_eq!(vote_weight(100, 7), None);
+        assert_eq!(vote_weight(u64::MAX, 6), Some(u64::MAX as u128 * 6), "no overflow");
+        let c = ChainParams { lock_period_blocks: 10, ..ChainParams::defaults(&params()) };
+        let locks: Vec<Option<u64>> = (0..=7).map(|k| c.vote_lock_blocks(k)).collect();
+        assert_eq!(locks, [Some(0), Some(10), Some(20), Some(40), Some(80), Some(160), Some(320), None]);
+        assert_eq!(ChainParams::defaults(&params()).vote_lock_blocks(6), Some(32 * 7 * 86_400), "32 weeks at 6×");
     }
 
     #[test]

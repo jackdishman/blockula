@@ -351,18 +351,19 @@ fn snapshots_reject_tampering() {
 
 /// Format change detectors: a record's bytes and a fixed state's root. The root was also
 /// computed by an independent JS implementation of the record layout and tree (noble BLAKE3),
-/// recomputed when `Params` gained `address_prefix` (P-WIRE).
+/// recomputed when `Params` gained `address_prefix` (P-WIRE) and again for the protocol v1
+/// scaffold (schema 2: `chain_params`, the upgrade schedule, account locks).
 #[test]
 fn golden_encodings() {
     let acct = Account { balance: 5, nonce: 2, keys: Default::default(), locks: vec![] };
-    assert_eq!(hex::encode(codec::encode(&acct)), "0500000000000000020000000000000000000000");
+    assert_eq!(hex::encode(codec::encode(&acct)), "050000000000000002000000000000000000000000000000");
     let mut st = State::default();
     st.accounts.insert("boo1alice".into(), acct);
     st.supply = 5;
     st.commit_block().unwrap();
     assert_eq!(st.root_hash(), st.full_root());
-    assert_eq!(st.record_count(), 7);
-    assert_eq!(st.root(), "6148e605ea145c9f5e3432953ca3090be9bf495b9ac4c3ba3af13227f0e664fb");
+    assert_eq!(st.record_count(), 9);
+    assert_eq!(st.root(), "05ab46b414a130e4f2e2c742ed46320a0e469af8ac0a8d0d7aa9493772c22517");
 }
 
 fn million_accounts() -> State {

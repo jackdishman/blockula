@@ -3,12 +3,14 @@
 //! Merkle claims, and M-of-N multisig accounts.
 //!
 //! Scaffold: the sub-state and its record plumbing, a journal, the tx dispatch (every action
-//! fails with "not active yet"), the end-of-block hook (a no-op) and the conviction ladder.
+//! fails with "not active yet") and the end-of-block hook (a no-op). The parameters (deposit,
+//! voting and timelock periods, quorum, the conviction ladder) are in params.rs.
 //! Proposal kinds that replace admin levers call the signer-free bodies the admin txs use:
 //!
 //! | `ProposalKind` | executes |
 //! |---|---|
-//! | `ParamChange` | `state.chain_params.set(key, value, &state.params)` |
+//! | `ParamChange` | `State::exec_set_param` (bounds in params.rs) |
+//! | `TreasurySpend`, `Distribution` | this module (from the keyless treasury / community accounts) |
 //! | `SetRepo` | `State::exec_set_repo` |
 //! | `GrantSoul` | `State::exec_grant_soul` |
 //! | `FlagSybil` | `State::exec_flag_sybil` |
@@ -16,7 +18,8 @@
 //! | `Clawback` | `State::exec_clawback` |
 //! | `UnlinkGithub` | `State::exec_unlink_github` |
 //! | `RefundHunt` | `State::exec_refund_hunt` |
-//! | `ScheduleUpgrade`, `ActivateFeature`, `DeactivateFeature` | upgrade.rs |
+//! | `ScheduleUpgrade`, `ActivateFeature`, `DeactivateFeature` | `upgrade::exec_schedule_upgrade`, `exec_activate_feature`, `exec_deactivate_feature` |
+//! | `Text` | nothing |
 //!
 //! A map is added by declaring it in [`Governance`] under one of this module's namespaces
 //! (`state::ns` 37–42) and journaling it in [`GovernanceJournal`].
@@ -29,24 +32,6 @@ use crate::poc::fmt_soul;
 use crate::state::{SubState, Table};
 use crate::types::*;
 use anyhow::{bail, Result};
-
-/// Highest `Vote::conviction`.
-pub const MAX_CONVICTION: u8 = 6;
-/// Lock periods (`lock_period_blocks`) a vote at each conviction locks for: none at 0, then
-/// 1, 2, 4, 8, 16 and 32.
-pub const CONVICTION_PERIODS: [u64; 7] = [0, 1, 2, 4, 8, 16, 32];
-/// Vote weight per conviction, in tenths of the amount: 0.1× with no lock, then 1×–6×.
-pub const CONVICTION_TENTHS: [u64; 7] = [1, 10, 20, 30, 40, 50, 60];
-
-/// A vote's weight: `amount` × the conviction multiplier (`None` past `MAX_CONVICTION`).
-pub fn vote_weight(amount: u64, conviction: u8) -> Option<u128> {
-    CONVICTION_TENTHS.get(conviction as usize).map(|t| amount as u128 * *t as u128 / 10)
-}
-
-/// How long a vote at `conviction` locks its amount.
-pub fn lock_blocks(conviction: u8, lock_period_blocks: u64) -> Option<u64> {
-    CONVICTION_PERIODS.get(conviction as usize).map(|p| p.saturating_mul(lock_period_blocks))
-}
 
 /// Governance's slice of the state (namespaces `state::ns` 37–42, META key `governance`).
 #[derive(Clone, Debug, Default)]
@@ -147,18 +132,3 @@ pub fn describe_kind(state: &State, kind: &ProposalKind) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn conviction_ladder() {
-        assert_eq!(vote_weight(100, 0), Some(10));
-        assert_eq!(vote_weight(100, 1), Some(100));
-        assert_eq!(vote_weight(100, 6), Some(600));
-        assert_eq!(vote_weight(100, 7), None);
-        assert_eq!(vote_weight(u64::MAX, 6), Some(u64::MAX as u128 * 6));
-        assert_eq!((lock_blocks(0, 10), lock_blocks(1, 10), lock_blocks(6, 10), lock_blocks(7, 10)), (Some(0), Some(10), Some(320), None));
-        assert_eq!(CONVICTION_PERIODS.len(), MAX_CONVICTION as usize + 1);
-    }
-}

@@ -56,7 +56,61 @@ export type Action =
   | { type: "reveal_votes"; seance_id: number; votes: string; spam: number[]; salt: string }
   | { type: "fund_pool"; amount: string }
   | { type: "withdraw_vested" }
-  | { type: "clawback"; account: string; reason: string };
+  | { type: "clawback"; account: string; reason: string }
+  // ---- protocol v1 (tags 30–49, MAINNET-DESIGN 3.1). Until a module ships, the node includes these and fails them with "not active yet". ----
+  /** Stake `amount` drops in a validator's pool (validators are named by address). */
+  | { type: "delegate"; validator: string; amount: string }
+  /** Start unbonding `shares` of a pool; `withdraw_unbonded` pays them out after the unbonding period. */
+  | { type: "undelegate"; validator: string; shares: string }
+  | { type: "redelegate"; from_validator: string; to_validator: string; shares: string }
+  | { type: "withdraw_unbonded" }
+  /** A validator's owner: commission (bps) and, when non-empty, new addresses. */
+  | { type: "update_validator"; commission_bps: number; p2p_addr: string; http_addr: string }
+  | { type: "unjail"; validator: string }
+  /** Two conflicting signed votes, hex (at most 16 KiB decoded). */
+  | { type: "report_equivocation"; evidence: string }
+  /** Hex BLAKE3 of a 32-byte secret, for the randomness beacon of `epoch`. */
+  | { type: "beacon_commit"; epoch: number; commitment: string }
+  | { type: "beacon_reveal"; epoch: number; secret: string }
+  /** Put `kind` to a vote, bonding `deposit` drops; `url` (https) links the full text. */
+  | { type: "propose"; kind: ProposalKind; deposit: string; title: string; url?: string }
+  /** Lock `amount` drops for `conviction` (0–6) lock periods: weight 0.1× with no lock, then 1×–6× for 1, 2, 4, 8, 16, 32 periods. */
+  | { type: "vote"; proposal_id: number; aye: boolean; amount: string; conviction: number }
+  /** Release expired vote locks. */
+  | { type: "unlock" }
+  /** Make this account an M-of-N multisig of its owner keys (key ids). */
+  | { type: "multisig_create"; owners: string[]; threshold: number }
+  /** Propose an action for a multisig account (never another multisig proposal or approval). */
+  | { type: "multisig_propose"; action: Action }
+  | { type: "multisig_approve"; id: number }
+  | { type: "renew_name"; name: string; years: number }
+  | { type: "transfer_name"; name: string; to: string }
+  | { type: "release_name"; name: string }
+  /** `proof`: hex 32-byte hashes from the leaf (distribution_id, address, amount) to the distribution's Merkle root. */
+  | { type: "claim_distribution"; distribution_id: number; amount: string; proof: string[] }
+  /** Validators: a matured claim's PR was reverted by commit `revert_sha` (40 hex). */
+  | { type: "attest_revert"; claim_id: number; revert_sha: string };
+
+/** What a `propose` asks for (node/src/types.rs `ProposalKind`): every former admin lever, parameters, spending, upgrades and features. */
+export type ProposalKind =
+  /** Set a governance parameter (`/api/params` keys), within its bounds. */
+  | { type: "param_change"; key: string; value: string }
+  | { type: "treasury_spend"; to: string; amount: string }
+  /** Open a community distribution of `total` drops, claimable with Merkle proofs until block `claim_until`. */
+  | { type: "distribution"; merkle_root: string; total: string; claim_until: number }
+  | { type: "set_repo"; repo: string; weight: number }
+  /** milli-Soul, at most 100 Soul. */
+  | { type: "grant_soul"; to: string; amount: number; reason: string }
+  | { type: "flag_sybil"; account: string; reason: string }
+  | { type: "reject_claim"; claim_id: number; reason: string }
+  | { type: "clawback"; account: string; reason: string }
+  | { type: "unlink_github"; handle: string }
+  | { type: "refund_hunt"; hunt_id: number }
+  | { type: "schedule_upgrade"; version: number; activation_height: number }
+  | { type: "activate_feature"; feature: string }
+  | { type: "deactivate_feature"; feature: string }
+  /** No on-chain effect: a signal. */
+  | { type: "text" };
 
 export interface UnsignedTx {
   chain_id: string;
@@ -89,6 +143,7 @@ class Writer {
   bytes(b: Uint8Array) { for (const x of b) this.parts.push(x); }
   u8(n: number) { this.parts.push(n & 0xff); }
   u16(n: number) { this.u8(n); this.u8(n >> 8); }
+  u32(n: number) { this.u16(n & 0xffff); this.u16(n >>> 16); }
   u64(n: bigint) { for (let i = 0n; i < 8n; i++) this.u8(Number((n >> (8n * i)) & 0xffn)); }
   str(s: string) {
     const b = utf8.encode(s);
@@ -97,6 +152,7 @@ class Writer {
     this.bytes(b);
   }
   ids(xs: number[]) { this.u16(xs.length); for (const x of xs) this.u64(BigInt(x)); }
+  strs(xs: string[]) { this.u16(xs.length); for (const x of xs) this.str(x); }
   done() { return Uint8Array.from(this.parts); }
 }
 
@@ -109,7 +165,13 @@ export function signingBytes(tx: UnsignedTx): Uint8Array {
   w.u64(BigInt(tx.fee));
   w.u64(BigInt(tx.tip ?? "0"));
   w.u64(BigInt(tx.valid_until));
-  const a = tx.action;
+  encodeAction(w, tx.action);
+  w.str(tx.memo);
+  return w.done();
+}
+
+/** An action's tag and fields, as inside the signing bytes (node/src/types.rs `Action::encode`). */
+function encodeAction(w: Writer, a: Action) {
   switch (a.type) {
     case "transfer":
       w.u8(0); w.str(a.to); w.u64(BigInt(a.amount));
@@ -203,9 +265,120 @@ export function signingBytes(tx: UnsignedTx): Uint8Array {
     case "clawback":
       w.u8(29); w.str(a.account); w.str(a.reason);
       break;
+    case "delegate":
+      w.u8(30); w.str(a.validator); w.u64(BigInt(a.amount));
+      break;
+    case "undelegate":
+      w.u8(31); w.str(a.validator); w.u64(BigInt(a.shares));
+      break;
+    case "redelegate":
+      w.u8(32); w.str(a.from_validator); w.str(a.to_validator); w.u64(BigInt(a.shares));
+      break;
+    case "withdraw_unbonded":
+      w.u8(33);
+      break;
+    case "update_validator":
+      w.u8(34); w.u64(BigInt(a.commission_bps)); w.str(a.p2p_addr); w.str(a.http_addr);
+      break;
+    case "unjail":
+      w.u8(35); w.str(a.validator);
+      break;
+    case "report_equivocation":
+      w.u8(36); w.str(a.evidence);
+      break;
+    case "beacon_commit":
+      w.u8(37); w.u64(BigInt(a.epoch)); w.str(a.commitment);
+      break;
+    case "beacon_reveal":
+      w.u8(38); w.u64(BigInt(a.epoch)); w.str(a.secret);
+      break;
+    case "propose":
+      w.u8(39); encodeProposalKind(w, a.kind); w.u64(BigInt(a.deposit)); w.str(a.title); w.str(a.url ?? "");
+      break;
+    case "vote":
+      w.u8(40); w.u64(BigInt(a.proposal_id)); w.u8(a.aye ? 1 : 0); w.u64(BigInt(a.amount)); w.u8(a.conviction);
+      break;
+    case "unlock":
+      w.u8(41);
+      break;
+    case "multisig_create":
+      w.u8(42); w.strs(a.owners); w.u8(a.threshold);
+      break;
+    case "multisig_propose":
+      if (a.action.type === "multisig_propose") throw new Error("a multisig proposal can't contain another");
+      w.u8(43); encodeAction(w, a.action);
+      break;
+    case "multisig_approve":
+      w.u8(44); w.u64(BigInt(a.id));
+      break;
+    case "renew_name":
+      w.u8(45); w.str(a.name); w.u8(a.years);
+      break;
+    case "transfer_name":
+      w.u8(46); w.str(a.name); w.str(a.to);
+      break;
+    case "release_name":
+      w.u8(47); w.str(a.name);
+      break;
+    case "claim_distribution":
+      w.u8(48); w.u64(BigInt(a.distribution_id)); w.u64(BigInt(a.amount)); w.strs(a.proof);
+      break;
+    case "attest_revert":
+      w.u8(49); w.u64(BigInt(a.claim_id)); w.str(a.revert_sha);
+      break;
+    default:
+      throw new Error(`unknown action type ${(a as { type: string }).type}`);
   }
-  w.str(tx.memo);
-  return w.done();
+}
+
+/** A proposal kind's own tag and fields (node/src/types.rs `ProposalKind::encode`). */
+function encodeProposalKind(w: Writer, k: ProposalKind) {
+  switch (k.type) {
+    case "param_change":
+      w.u8(0); w.str(k.key); w.u64(BigInt(k.value));
+      break;
+    case "treasury_spend":
+      w.u8(1); w.str(k.to); w.u64(BigInt(k.amount));
+      break;
+    case "distribution":
+      w.u8(2); w.str(k.merkle_root); w.u64(BigInt(k.total)); w.u64(BigInt(k.claim_until));
+      break;
+    case "set_repo":
+      w.u8(3); w.str(k.repo); w.u64(BigInt(k.weight));
+      break;
+    case "grant_soul":
+      w.u8(4); w.str(k.to); w.u64(BigInt(k.amount)); w.str(k.reason);
+      break;
+    case "flag_sybil":
+      w.u8(5); w.str(k.account); w.str(k.reason);
+      break;
+    case "reject_claim":
+      w.u8(6); w.u64(BigInt(k.claim_id)); w.str(k.reason);
+      break;
+    case "clawback":
+      w.u8(7); w.str(k.account); w.str(k.reason);
+      break;
+    case "unlink_github":
+      w.u8(8); w.str(k.handle);
+      break;
+    case "refund_hunt":
+      w.u8(9); w.u64(BigInt(k.hunt_id));
+      break;
+    case "schedule_upgrade":
+      w.u8(10); w.u32(k.version); w.u64(BigInt(k.activation_height));
+      break;
+    case "activate_feature":
+      w.u8(11); w.str(k.feature);
+      break;
+    case "deactivate_feature":
+      w.u8(12); w.str(k.feature);
+      break;
+    case "text":
+      w.u8(13);
+      break;
+    default:
+      throw new Error(`unknown proposal kind ${(k as { type: string }).type}`);
+  }
 }
 
 /**

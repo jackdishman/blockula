@@ -1049,8 +1049,8 @@ impl Action {
                 if *amount == 0 {
                     bail!("vote with more than 0");
                 }
-                if *conviction > crate::governance::MAX_CONVICTION {
-                    bail!("conviction must be 0–{}", crate::governance::MAX_CONVICTION);
+                if *conviction > crate::params::MAX_CONVICTION {
+                    bail!("conviction must be 0–{}", crate::params::MAX_CONVICTION);
                 }
             }
             Action::WithdrawUnbonded {} | Action::Unlock {} | Action::MultisigApprove { .. } => {}
@@ -1709,6 +1709,51 @@ mod tests {
         ]
     }
 
+    /// Protocol v1 (MAINNET-DESIGN 3.1): one action per tag 30–49 (some twice, for optional or
+    /// empty fields), with every `ProposalKind` and a multisig proposal, in tag order. Mirrored by
+    /// `v1VectorActions` in sdk-ts/test/e2e.ts.
+    fn v1_vector_actions() -> Vec<Action> {
+        let propose = |kind: ProposalKind| Action::Propose { kind, deposit: 1_000 * DROPS_PER_FANG, title: "t".into(), url: String::new() };
+        vec![
+            Action::Delegate { validator: "boo1v".into(), amount: 5 * DROPS_PER_FANG },
+            Action::Undelegate { validator: "boo1v".into(), shares: 7 },
+            Action::Redelegate { from_validator: "boo1v".into(), to_validator: "boo1w".into(), shares: 8 },
+            Action::WithdrawUnbonded {},
+            Action::UpdateValidator { commission_bps: 500, p2p_addr: "1.2.3.4:5".into(), http_addr: "https://v.example".into() },
+            Action::UpdateValidator { commission_bps: 0, p2p_addr: String::new(), http_addr: String::new() },
+            Action::Unjail { validator: "boo1v".into() },
+            Action::ReportEquivocation { evidence: "0a0b".into() },
+            Action::BeaconCommit { epoch: 3, commitment: "ab".repeat(32) },
+            Action::BeaconReveal { epoch: 3, secret: "cd".repeat(32) },
+            Action::Propose { kind: ProposalKind::ParamChange { key: "max_validators".into(), value: 40 }, deposit: 1_000 * DROPS_PER_FANG, title: "More validators".into(), url: "https://x.example/p/1".into() },
+            propose(ProposalKind::TreasurySpend { to: "x.boo".into(), amount: 9 }),
+            propose(ProposalKind::Distribution { merkle_root: "ef".repeat(32), total: 100, claim_until: 5_000 }),
+            propose(ProposalKind::SetRepo { repo: "a/b".into(), weight: 10 }),
+            propose(ProposalKind::GrantSoul { to: "x.boo".into(), amount: 2500, reason: "r".into() }),
+            propose(ProposalKind::FlagSybil { account: "x.boo".into(), reason: "r".into() }),
+            propose(ProposalKind::RejectClaim { claim_id: 4, reason: "r".into() }),
+            propose(ProposalKind::Clawback { account: "x.boo".into(), reason: "r".into() }),
+            propose(ProposalKind::UnlinkGithub { handle: "vlad".into() }),
+            propose(ProposalKind::RefundHunt { hunt_id: 1 }),
+            propose(ProposalKind::ScheduleUpgrade { version: 2, activation_height: 100_000 }),
+            propose(ProposalKind::ActivateFeature { feature: "ghost".into() }),
+            propose(ProposalKind::DeactivateFeature { feature: "ghost".into() }),
+            propose(ProposalKind::Text {}),
+            Action::Vote { proposal_id: 1, aye: true, amount: 10, conviction: 6 },
+            Action::Vote { proposal_id: 1, aye: false, amount: 10, conviction: 0 },
+            Action::Unlock {},
+            Action::MultisigCreate { owners: vec!["ab".repeat(32), "cd".repeat(32)], threshold: 2 },
+            Action::MultisigPropose { action: Box::new(Action::Transfer { to: "x.boo".into(), amount: 5 }) },
+            Action::MultisigApprove { id: 3 },
+            Action::RenewName { name: "vlad".into(), years: 2 },
+            Action::TransferName { name: "vlad".into(), to: "x.boo".into() },
+            Action::ReleaseName { name: "vlad".into() },
+            Action::ClaimDistribution { distribution_id: 1, amount: 50, proof: vec!["ab".repeat(32), "cd".repeat(32)] },
+            Action::ClaimDistribution { distribution_id: 1, amount: 50, proof: vec![] },
+            Action::AttestRevert { claim_id: 4, revert_sha: "ef".repeat(20) },
+        ]
+    }
+
     /// The vector tx around an action: fixed fields, and recognizable key and signature bytes.
     fn vector_tx(action: Action) -> Tx {
         Tx { chain_id: "vec".into(), from: "boo1from".into(), nonce: 7, fee: 12345, tip: 3, valid_until: 99, action, memo: "m".into(), public_key: "01".repeat(crypto::PUBLIC_KEY_LEN), signature: "02".repeat(crypto::SIGNATURE_LEN) }
@@ -1735,6 +1780,25 @@ mod tests {
         assert!(matches!(a, Action::JoinJury { bond: 10 }));
         let a: Action = serde_json::from_str(r#"{"type":"attest_claim","claim_id":1,"ok":false,"merge_sha":"","note":"x"}"#).unwrap();
         assert!(matches!(a, Action::AttestClaim { ok: false, .. }));
+        // Protocol v1 (tags 30–49), hashed separately so the 0–29 vector above stays put.
+        let mut h = blake3::Hasher::new();
+        for action in v1_vector_actions() {
+            h.update(&vector_tx(action).signing_bytes());
+        }
+        assert_eq!(h.finalize().to_hex().to_string(), "fecaa54305728b6a9192b18fbbdc03d74f2199c8721a670b73b72970b2d7ba6c");
+        let p: Action = serde_json::from_str(r#"{"type":"propose","kind":{"type":"param_change","key":"max_validators","value":"40"},"deposit":"1000","title":"t"}"#).unwrap();
+        assert_eq!(p, Action::Propose { kind: ProposalKind::ParamChange { key: "max_validators".into(), value: 40 }, deposit: 1000, title: "t".into(), url: String::new() });
+        let m: Action = serde_json::from_str(r#"{"type":"multisig_propose","action":{"type":"vote","proposal_id":1,"aye":true,"amount":"5","conviction":2}}"#).unwrap();
+        assert_eq!(m, Action::MultisigPropose { action: Box::new(Action::Vote { proposal_id: 1, aye: true, amount: 5, conviction: 2 }) });
+        for a in [r#"{"type":"withdraw_unbonded"}"#, r#"{"type":"unlock"}"#, r#"{"type":"propose","kind":{"type":"text"},"deposit":"1","title":"t","url":""}"#] {
+            serde_json::from_str::<Action>(a).unwrap();
+        }
+        assert!(serde_json::from_str::<Action>(r#"{"type":"propose","kind":{"type":"text","x":1},"deposit":"1","title":"t"}"#).is_err(), "proposal kinds reject unknown fields too");
+        for a in v1_vector_actions() {
+            let json = serde_json::to_value(&a).unwrap();
+            assert_eq!(json["type"], a.kind());
+            assert_eq!(serde_json::from_value::<Action>(json).unwrap(), a);
+        }
         let t: Tx = serde_json::from_value(serde_json::json!({ "chain_id": "c", "from": "boo1from", "nonce": 1, "fee": "100", "tip": "2", "valid_until": 9, "action": { "type": "transfer", "to": "x.boo", "amount": "5" }, "memo": "", "public_key": "", "signature": "" })).unwrap();
         assert_eq!((t.fee, t.tip, t.valid_until), (100, 2, 9));
     }
@@ -1742,14 +1806,90 @@ mod tests {
     #[test]
     fn every_tag_round_trips_through_the_wire_form() {
         let mut tags = std::collections::BTreeSet::new();
-        for action in vector_actions() {
-            let mut enc = vec![];
-            action.encode(&mut enc);
+        let mut kinds = std::collections::BTreeSet::new();
+        for action in vector_actions().into_iter().chain(v1_vector_actions()) {
+            let enc = action.to_bytes();
             tags.insert(enc[0]);
+            if let Action::Propose { kind, .. } = &action {
+                kinds.insert(enc[1]);
+                assert_eq!(ProposalKind::from_bytes(&kind.to_bytes()).unwrap(), *kind);
+            }
+            assert_eq!(Action::from_bytes(&enc).unwrap(), action);
             let tx = vector_tx(action);
             assert_eq!(Tx::from_bytes(&tx.to_bytes()).unwrap(), tx);
         }
-        assert_eq!(tags, (0..=29).collect(), "the vectors cover every action tag");
+        assert_eq!(tags, (0..=49).collect(), "the vectors cover every action tag");
+        assert_eq!(kinds, (0..=13).collect(), "and every proposal kind");
+    }
+
+    #[test]
+    fn v1_actions_are_bounded() {
+        let ok = |a: Action| a.check_format(false).unwrap_or_else(|e| panic!("{a:?}: {e}"));
+        let bad = |a: Action| match a.check_format(false) {
+            Ok(()) => panic!("{a:?} should be refused"),
+            Err(e) => format!("{e:#}"),
+        };
+        let k = crypto::Keys::from_seed([7; 32]);
+        let (addr, hex32) = (k.address(), "ab".repeat(32));
+        let propose = |kind: ProposalKind| Action::Propose { kind, deposit: 1, title: "t".into(), url: String::new() };
+        ok(Action::Delegate { validator: addr.clone(), amount: 1 });
+        assert!(bad(Action::Delegate { validator: "x.boo".into(), amount: 1 }).contains("address"), "validators are named by address");
+        assert!(bad(Action::Delegate { validator: addr.clone(), amount: 0 }).contains("more than 0"));
+        assert!(bad(Action::Redelegate { from_validator: addr.clone(), to_validator: addr.clone(), shares: 1 }).contains("different"));
+        assert!(bad(Action::UpdateValidator { commission_bps: 10_001, p2p_addr: String::new(), http_addr: String::new() }).contains("0–10000"));
+        // Evidence: at most 16 KiB decoded, as lowercase hex.
+        ok(Action::ReportEquivocation { evidence: "ab".repeat(MAX_EVIDENCE_BYTES) });
+        assert!(bad(Action::ReportEquivocation { evidence: "ab".repeat(MAX_EVIDENCE_BYTES + 1) }).contains("16384"));
+        assert!(bad(Action::ReportEquivocation { evidence: "AB".into() }).contains("lowercase hex"));
+        assert!(bad(Action::ReportEquivocation { evidence: String::new() }).contains("1–"));
+        assert!(bad(Action::BeaconCommit { epoch: 1, commitment: "ab".into() }).contains("32 bytes"));
+        // Votes: conviction 0–6.
+        ok(Action::Vote { proposal_id: 0, aye: true, amount: 1, conviction: 6 });
+        assert!(bad(Action::Vote { proposal_id: 0, aye: true, amount: 1, conviction: 7 }).contains("0–6"));
+        assert!(bad(Action::Vote { proposal_id: 0, aye: true, amount: 0, conviction: 1 }).contains("more than 0"));
+        // Proposals: the kind's own rules, a deposit, a title, an https link or nothing.
+        ok(propose(ProposalKind::ParamChange { key: "quorum_bps".into(), value: 1 }));
+        assert!(bad(propose(ProposalKind::ParamChange { key: "nope".into(), value: 1 })).contains("unknown parameter"));
+        assert!(bad(propose(ProposalKind::GrantSoul { to: addr.clone(), amount: crate::poc::MAX_SOUL_GRANT + 1, reason: "r".into() })).contains("milli-Soul"));
+        assert!(bad(propose(ProposalKind::Distribution { merkle_root: hex32.clone(), total: 0, claim_until: 1 })).contains("total"));
+        assert!(bad(propose(ProposalKind::ActivateFeature { feature: "Ghost Mode".into() })).contains("feature"));
+        assert!(bad(propose(ProposalKind::ScheduleUpgrade { version: 0, activation_height: 5 })).contains("version"));
+        assert!(bad(Action::Propose { kind: ProposalKind::Text {}, deposit: 0, title: "t".into(), url: String::new() }).contains("deposit"));
+        assert!(bad(Action::Propose { kind: ProposalKind::Text {}, deposit: 1, title: " ".into(), url: String::new() }).contains("title"));
+        assert!(bad(Action::Propose { kind: ProposalKind::Text {}, deposit: 1, title: "t".into(), url: "http://x".into() }).contains("https"));
+        // Multisig: distinct key ids, 1 ≤ threshold ≤ owners, and proposals don't nest.
+        ok(Action::MultisigCreate { owners: vec![hex32.clone()], threshold: 1 });
+        assert!(bad(Action::MultisigCreate { owners: vec![hex32.clone(), hex32.clone()], threshold: 1 }).contains("distinct"));
+        assert!(bad(Action::MultisigCreate { owners: vec![hex32.clone()], threshold: 2 }).contains("threshold"));
+        assert!(bad(Action::MultisigCreate { owners: vec![], threshold: 0 }).contains("owners"));
+        let inner = Action::Transfer { to: addr.clone(), amount: 1 };
+        ok(Action::MultisigPropose { action: Box::new(inner.clone()) });
+        let nested = Action::MultisigPropose { action: Box::new(Action::MultisigPropose { action: Box::new(inner.clone()) }) };
+        assert!(bad(nested.clone()).contains("can't hold another"));
+        assert!(bad(Action::MultisigPropose { action: Box::new(Action::MultisigApprove { id: 1 }) }).contains("can't hold another"));
+        assert!(bad(Action::MultisigPropose { action: Box::new(Action::Transfer { to: "x".into(), amount: 1 }) }).contains("proposed action"));
+        // … nor do they decode nested.
+        assert!(Action::from_bytes(&nested.to_bytes()).unwrap_err().to_string().contains("can't contain another"));
+        // Names and distributions.
+        assert!(bad(Action::RenewName { name: "vlad".into(), years: 0 }).contains("1–10"));
+        assert!(bad(Action::RenewName { name: "vlad".into(), years: MAX_RENEW_YEARS + 1 }).contains("1–10"));
+        assert!(bad(Action::TransferName { name: "vlad".into(), to: "b".into() }).contains("`to`"));
+        assert!(bad(Action::ClaimDistribution { distribution_id: 0, amount: 1, proof: vec![hex32.clone(); MAX_PROOF + 1] }).contains("proof too long"));
+        assert!(bad(Action::ClaimDistribution { distribution_id: 0, amount: 1, proof: vec!["ab".into()] }).contains("32 bytes"));
+        assert!(bad(Action::AttestRevert { claim_id: 0, revert_sha: "ab".repeat(32) }).contains("40-hex"));
+        // Every account an action names is checked against the chain's prefix, nested ones too.
+        let testnet = k.address_with(crypto::TESTNET_HRP);
+        let tx = |action: Action| Tx { chain_id: "c".into(), from: addr.clone(), nonce: 0, fee: 0, tip: 0, valid_until: 0, action, memo: String::new(), public_key: String::new(), signature: String::new() };
+        for a in [
+            Action::Delegate { validator: testnet.clone(), amount: 1 },
+            Action::Redelegate { from_validator: addr.clone(), to_validator: testnet.clone(), shares: 1 },
+            Action::TransferName { name: "vlad".into(), to: testnet.clone() },
+            propose(ProposalKind::TreasurySpend { to: testnet.clone(), amount: 1 }),
+            propose(ProposalKind::Clawback { account: testnet.clone(), reason: "r".into() }),
+            Action::MultisigPropose { action: Box::new(Action::Transfer { to: testnet.clone(), amount: 1 }) },
+        ] {
+            assert!(tx(a.clone()).check_prefix("boo").unwrap_err().to_string().contains("tboo"), "{a:?}");
+        }
     }
 
     #[test]
@@ -1793,8 +1933,17 @@ mod tests {
         let tag_at = TX_DOMAIN.len() + 2 + 3 + 2 + 8 + 4 * 8;
         assert_eq!(good[tag_at], 21);
         let mut unknown = good.clone();
-        unknown[tag_at] = 30;
-        assert!(err(&unknown).contains("unknown action tag 30"));
+        unknown[tag_at] = 50;
+        assert!(err(&unknown).contains("unknown action tag 50"));
+        // A proposal kind past the last one.
+        let text = vector_tx(Action::Propose { kind: ProposalKind::Text {}, deposit: 1, title: "t".into(), url: String::new() }).to_bytes();
+        let mut bad_kind = text.clone();
+        assert_eq!((bad_kind[tag_at], bad_kind[tag_at + 1]), (39, 13));
+        bad_kind[tag_at + 1] = 14;
+        assert!(err(&bad_kind).contains("unknown proposal kind 14"));
+        let mut bad_aye = vector_tx(Action::Vote { proposal_id: 1, aye: true, amount: 1, conviction: 1 }).to_bytes();
+        bad_aye[tag_at + 1 + 8] = 2;
+        assert!(err(&bad_aye).contains("`aye` must be 0 or 1"));
         let mut bad_bool = good.clone();
         bad_bool[tag_at + 1 + 8] = 2;
         assert!(err(&bad_bool).contains("0 or 1"));
@@ -1851,13 +2000,36 @@ mod tests {
         proptest::collection::vec(any::<u8>(), bytes).prop_map(hex::encode)
     }
 
+    /// A proposal kind, by its tag, from the same kind of field bag.
+    fn proposal_kind(tag: u8, [a, b]: [String; 2], [w, x]: [u64; 2]) -> ProposalKind {
+        match tag {
+            0 => ProposalKind::ParamChange { key: a, value: w },
+            1 => ProposalKind::TreasurySpend { to: a, amount: w },
+            2 => ProposalKind::Distribution { merkle_root: a, total: w, claim_until: x },
+            3 => ProposalKind::SetRepo { repo: a, weight: w },
+            4 => ProposalKind::GrantSoul { to: a, amount: w, reason: b },
+            5 => ProposalKind::FlagSybil { account: a, reason: b },
+            6 => ProposalKind::RejectClaim { claim_id: w, reason: a },
+            7 => ProposalKind::Clawback { account: a, reason: b },
+            8 => ProposalKind::UnlinkGithub { handle: a },
+            9 => ProposalKind::RefundHunt { hunt_id: w },
+            10 => ProposalKind::ScheduleUpgrade { version: w as u32, activation_height: x },
+            11 => ProposalKind::ActivateFeature { feature: a },
+            12 => ProposalKind::DeactivateFeature { feature: a },
+            13 => ProposalKind::Text {},
+            _ => unreachable!(),
+        }
+    }
+
     /// Any action, by tag, from a bag of random fields (strings of up to 6 chars fit every bound).
+    /// A multisig proposal wraps a transfer or a vote (they don't nest).
     fn arb_action() -> impl Strategy<Value = Action> {
         let strs = proptest::array::uniform4(arb_str(6));
         let nums = proptest::array::uniform3(any::<u64>());
         let opt = proptest::option::of(arb_str(6).prop_filter("Some is never empty", |s| !s.is_empty()));
         let ids = proptest::collection::vec(any::<u64>(), 0..4);
-        (0u8..30, strs, nums, any::<bool>(), opt, ids).prop_map(|(tag, [a, b, c, d], [w, x, y], ok, familiar_key, spam)| match tag {
+        let list = proptest::collection::vec(arb_str(6), 0..4);
+        (0u8..50, strs, nums, any::<bool>(), opt, ids, list, 0u8..14, any::<u8>()).prop_map(|(tag, [a, b, c, d], [w, x, y], ok, familiar_key, spam, list, kind, small)| match tag {
             0 => Action::Transfer { to: a, amount: w },
             1 => Action::RegisterName { name: a },
             2 => Action::AddKey { key_id: a, label: b, role: if ok { KeyRole::Owner } else { KeyRole::Session { limit: w, period_blocks: x, expires_at: y } } },
@@ -1888,6 +2060,26 @@ mod tests {
             27 => Action::FundPool { amount: w },
             28 => Action::WithdrawVested {},
             29 => Action::Clawback { account: a, reason: b },
+            30 => Action::Delegate { validator: a, amount: w },
+            31 => Action::Undelegate { validator: a, shares: w },
+            32 => Action::Redelegate { from_validator: a, to_validator: b, shares: w },
+            33 => Action::WithdrawUnbonded {},
+            34 => Action::UpdateValidator { commission_bps: w, p2p_addr: a, http_addr: b },
+            35 => Action::Unjail { validator: a },
+            36 => Action::ReportEquivocation { evidence: a },
+            37 => Action::BeaconCommit { epoch: w, commitment: a },
+            38 => Action::BeaconReveal { epoch: w, secret: a },
+            39 => Action::Propose { kind: proposal_kind(kind, [c, d], [x, y]), deposit: w, title: a, url: b },
+            40 => Action::Vote { proposal_id: w, aye: ok, amount: x, conviction: small },
+            41 => Action::Unlock {},
+            42 => Action::MultisigCreate { owners: list, threshold: small },
+            43 => Action::MultisigPropose { action: Box::new(if ok { Action::Transfer { to: a, amount: w } } else { Action::Vote { proposal_id: w, aye: small % 2 == 0, amount: x, conviction: small } }) },
+            44 => Action::MultisigApprove { id: w },
+            45 => Action::RenewName { name: a, years: small },
+            46 => Action::TransferName { name: a, to: b },
+            47 => Action::ReleaseName { name: a },
+            48 => Action::ClaimDistribution { distribution_id: w, amount: x, proof: list },
+            49 => Action::AttestRevert { claim_id: w, revert_sha: a },
             _ => unreachable!(),
         })
     }
