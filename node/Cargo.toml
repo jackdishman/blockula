@@ -16,7 +16,7 @@ parking_lot = "0.12.5"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tokio = { version = "1.53.3", features = ["full"] }
-tower-http = { version = "0.7.1", features = ["cors"] }
+tower-http = { version = "0.7.1", features = ["cors", "timeout"] }
 commonware-actor = "=2026.9.0"
 commonware-broadcast = "=2026.9.0"
 commonware-codec = "=2026.9.0"
@@ -43,6 +43,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # consensus format, so pinned exactly).
 imbl = { version = "=7.0.2", features = ["serde"] }
 borsh = { version = "=1.8.1", features = ["derive", "de_strict_order"] }
+# Persistence (src/store.rs): the embedded database holding records, tree nodes, the commit point
+# and indexes (its file format is ours to keep, so pinned exactly), and the per-block read view
+# the API serves from without the consensus lock (src/view.rs).
+redb = "=4.4.0"
+arc-swap = "=1.9.2"
 
 # ML-DSA and consensus are slow unoptimized; keep our crate debuggable but optimize deps.
 [profile.dev.package."*"]

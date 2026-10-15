@@ -1,16 +1,22 @@
 //! Chain state and execution. Consensus (`consensus.rs`) orders blocks; this module executes
-//! finalized blocks deterministically, in order, and keeps the mempool, indexes and `blocks.jsonl`.
+//! finalized blocks deterministically, in order, persists each one (block logs, then the state
+//! database: see `store.rs`), publishes what readers see (`view.rs`) and keeps the mempool.
 
 use crate::crypto::{self, Keys};
-use crate::state::{JMap, TMap};
+use crate::state::codec::SCHEMA_VERSION;
+use crate::state::tree::{Child, Hash, Smt};
+use crate::state::{JMap, RecordChange, TMap};
+use crate::store::{self, hash32, BlockMeta, CommitPoint, Framing, Layout, Pos, SegLog, Snap, Store};
 use crate::types::*;
+use crate::view::{Disk, Live, MempoolView, ReadView};
 use anyhow::{anyhow, bail, Context, Result};
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The treasury's system account on a chain whose addresses use `prefix`.
@@ -1139,14 +1145,11 @@ impl SummonOpts {
     }
 }
 
-/// Blocks kept in memory; older ones are read from `blocks.jsonl` on demand.
-pub const RECENT_BLOCKS: usize = 2_048;
 /// How far behind the (claimed) network height still counts as synced.
 pub const SYNC_SLACK: u64 = 3;
-/// Certificates are stored on disk for these heights (plus every epoch's last block) …
+/// Certificates are stored on disk for these heights (plus every epoch's last block); the last
+/// `view::RECENT_CERTS` heights' are kept in memory.
 pub const CERT_CHECKPOINT: u64 = 100;
-/// … and kept in memory for this many recent heights.
-pub const RECENT_CERTS: usize = 1_024;
 /// Mempool txs not included within this many blocks are dropped (they stay valid until their
 /// `valid_until`, so a holder could resubmit them).
 pub const MEMPOOL_TTL_BLOCKS: u64 = 600;
@@ -1156,58 +1159,15 @@ pub const OWN_TX_VALIDITY: u64 = 600;
 pub const RECENT_FAILED: usize = 10_000;
 /// Max faucet drips waiting in the mempool (kept below `MAX_PENDING_PER_SENDER`).
 pub const FAUCET_MAX_PENDING: usize = 32;
+/// Default block retention for validators (`--prune-blocks`): about two days of blocks.
+pub const PRUNE_DAYS: u64 = 2;
+/// The fewest heights a pruning node keeps: the last two snapshots' manifests (checkpoint +
+/// certifying blocks), and every ancestor a proposal may still cite.
+pub const MIN_KEEP_BLOCKS: u64 = 2 * crate::snapshot::CHECKPOINT_INTERVAL + 2 * crate::snapshot::CHECKPOINT_DELAY + crate::consensus::MAX_EXEC_LAG;
 
-/// Append-only file of length-prefixed records with an in-memory offset index.
-struct RecordFile {
-    file: File,
-    len: u64,
-}
-
-impl RecordFile {
-    fn open(path: &Path) -> Result<(Self, Vec<(u64, u64, u32)>)> {
-        let mut file = OpenOptions::new().create(true).read(true).append(true).open(path)?;
-        let mut index = vec![];
-        let mut buf = vec![];
-        use std::io::{Read, Seek, SeekFrom};
-        file.seek(SeekFrom::Start(0))?;
-        file.read_to_end(&mut buf)?;
-        let mut pos = 0usize;
-        while pos + 12 <= buf.len() {
-            let key = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap());
-            let len = u32::from_le_bytes(buf[pos + 8..pos + 12].try_into().unwrap());
-            if pos + 12 + len as usize > buf.len() {
-                break; // torn write at the tail
-            }
-            index.push((key, (pos + 12) as u64, len));
-            pos += 12 + len as usize;
-        }
-        if pos != buf.len() {
-            file.set_len(pos as u64)?;
-        }
-        Ok((Self { file, len: pos as u64 }, index))
-    }
-
-    fn append(&mut self, key: u64, bytes: &[u8]) -> Result<(u64, u32)> {
-        let mut rec = Vec::with_capacity(12 + bytes.len());
-        rec.extend_from_slice(&key.to_le_bytes());
-        rec.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-        rec.extend_from_slice(bytes);
-        self.file.write_all(&rec)?;
-        let at = self.len + 12;
-        self.len += rec.len() as u64;
-        Ok((at, bytes.len() as u32))
-    }
-
-    fn read(&self, at: u64, len: u32) -> Option<Vec<u8>> {
-        use std::os::unix::fs::FileExt;
-        let mut buf = vec![0u8; len as usize];
-        self.file.read_exact_at(&mut buf, at).ok()?;
-        Some(buf)
-    }
-
-    fn sync(&self) -> Result<()> {
-        Ok(self.file.sync_data()?)
-    }
+/// Blocks to keep by default on a validator: `PRUNE_DAYS` of blocks at this block time.
+pub fn default_keep_blocks(block_time_ms: u64) -> u64 {
+    (PRUNE_DAYS * 86_400_000 / block_time_ms.max(1)).max(MIN_KEEP_BLOCKS)
 }
 
 #[derive(Clone, Debug)]
@@ -1215,9 +1175,31 @@ struct PoolEntry {
     added_at: u64,
 }
 
+/// How `Chain::open_with` lays out a new home (existing homes keep theirs).
+#[derive(Clone, Debug, Default)]
+pub struct OpenOpts {
+    /// Heights per log segment (default `store::SEGMENT_HEIGHTS`).
+    pub segment_heights: Option<u64>,
+}
+
+/// Where a test makes `execute` stop, as if the process died there (crash-injection tests).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WritePoint {
+    /// The consensus block is appended (not synced); the executed block isn't.
+    AfterCblock,
+    /// Both logs are appended, not yet synced.
+    AfterBlockLine,
+    /// Both logs are synced; the store isn't committed.
+    BeforeStoreCommit,
+    /// The store is committed; consensus hasn't been acknowledged.
+    AfterStoreCommit,
+}
+
 pub struct Chain {
     pub home: PathBuf,
     pub genesis: Genesis,
+    genesis_arc: Arc<Genesis>,
     /// Validator key (also the faucet key on testnets). `None` on full nodes.
     pub keys: Option<Keys>,
     pub role: Role,
@@ -1225,33 +1207,28 @@ pub struct Chain {
     pub genesis_root: String,
     /// Hash of the genesis consensus block (parent of block 1).
     pub genesis_hash: String,
-    /// Executed blocks: the last `RECENT_BLOCKS` in memory, the rest on disk.
-    recent: std::collections::VecDeque<Block>,
-    block_offsets: Vec<u64>,
-    block_by_hash: HashMap<u64, u64>,
     height: u64,
     last_hash: String,
-    /// Exact consensus block bytes per height (served to joining nodes).
-    cblocks: RecordFile,
-    cblock_index: Vec<(u64, u32)>,
-    /// Finalization certificates: checkpoints on disk, recent ones in memory.
-    certs: RecordFile,
-    cert_index: BTreeMap<u64, (u64, u32)>,
-    recent_certs: BTreeMap<u64, Vec<u8>>,
-    pub tx_index: HashMap<String, (u64, usize)>,
-    pub history: HashMap<String, Vec<String>>,
+    /// The last executed block (older ones are read from the log, through a bounded cache).
+    head: Option<Arc<Block>>,
+    /// State database (records, tree nodes, indexes) and its commit point.
+    store: Arc<Store>,
+    point: CommitPoint,
+    /// Snapshot of the store as of the last commit: the tree's node store, and readers' view.
+    snap: Arc<Snap>,
+    /// Executed blocks (JSON lines) and the exact consensus block bytes, segmented by height.
+    blocks: SegLog,
+    cblocks: SegLog,
     pub mempool: Vec<Tx>,
     pool: HashMap<String, PoolEntry>,
     pending: HashMap<String, (usize, u64)>,
-    /// id → (reason, height) for txs that failed at execution or were dropped from the mempool.
-    recent_failed: HashMap<String, (String, u64)>,
+    /// Mirror of the mempool (and of recent failures) that readers get a copy of.
+    mp: MempoolView,
     failed_order: std::collections::VecDeque<String>,
     /// Highest finalized height proven by a certificate we verified or saw from consensus.
     pub finalized_tip: u64,
     /// Outbound mempool gossip (validators) — every accepted tx is pushed here.
     pub gossip: Option<futures::channel::mpsc::UnboundedSender<Tx>>,
-    log: File,
-    log_len: u64,
     /// Validator-set history + handoff proofs (`epochs.json`).
     pub epochs: crate::epochs::EpochRegistry,
     /// Set when this node fast-synced: history starts after this height.
@@ -1260,6 +1237,16 @@ pub struct Chain {
     claims: HashMap<String, u64>,
     /// Set while a snapshot is being written, so slow disks can't pile up writer threads.
     snapshot_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// What readers (the HTTP API) see: published after every block and mempool change.
+    pub live: Arc<Live>,
+    /// Blocks kept on disk (`None`: all of them, an archive node).
+    keep_blocks: Option<u64>,
+    /// Log segments are deleted up to here.
+    files_pruned_below: u64,
+    /// Blocks `open` executed again because they were past the store's commit point.
+    pub replayed: u64,
+    #[cfg(test)]
+    pub fail_at: Option<WritePoint>,
 }
 
 /// The certified snapshot a fast-synced node started from (`base.json` + `base.state.zst`).
