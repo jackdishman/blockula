@@ -226,7 +226,8 @@ pub(crate) fn apply(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, s
             }
             // It committed during the previous epoch, so it must have been active then (it may
             // have left the set since; it still owes the reveal).
-            let v = epoch.checked_sub(1).and_then(|e| crate::staking::validator_for_signer(state, sender, signer, e)).ok_or_else(|| anyhow!("only validators that committed during epoch {} reveal for epoch {target}", epoch.saturating_sub(1)))?;
+            let Some(prev) = epoch.checked_sub(1) else { bail!("epoch 1 has no round: its beacon follows from genesis") };
+            let v = crate::staking::validator_for_signer(state, sender, signer, prev).ok_or_else(|| anyhow!("only validators that committed during epoch {prev} reveal for epoch {target}"))?;
             let entry = state.beacon.rounds.get(target).and_then(|r| r.get(&v)).ok_or_else(|| anyhow!("validator {} didn't commit to the beacon for epoch {target}", short(&v)))?;
             if entry.secret.is_some() {
                 bail!("validator {} already revealed its secret for epoch {target}", short(&v));
