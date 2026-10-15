@@ -43,7 +43,9 @@
 //! **Distributions** move `total` from the community account into an escrow claimable until
 //! `claim_until` with Merkle proofs: BLAKE3 leaves over `(distribution_id, address, amount)`
 //! (the id is the proposal's), sorted-pair inner nodes ([`distribution_leaf`], [`merkle_parent`]).
-//! What's unclaimed returns to the community account after `claim_until`.
+//! What's unclaimed returns to the community account after `claim_until`. A claimant with
+//! nothing to pay the fee with pays it (and its new account's creation fee) out of the claim
+//! ([`claim_toward_fee`]).
 //!
 //! **Multisig (SF-11).** `MultisigCreate` makes an account M-of-N over its owner keys. From then
 //! on its owner keys may only sign `MultisigPropose` and `MultisigApprove` (admission refuses
@@ -861,13 +863,14 @@ pub fn build_distribution(distribution_id: u64, entries: &[(String, u64)]) -> Re
     Ok((level[0], proofs))
 }
 
-fn claim_distribution(state: &mut State, j: &mut Journal, sender: &str, id: u64, amount: u64, proof: &[String], height: u64) -> Result<()> {
+/// Everything that decides whether `sender` may claim `amount` from distribution `id` at
+/// `height`: open, not claimed yet, the proof leads to the stored root, enough left.
+fn check_claim(state: &State, sender: &str, id: u64, amount: u64, proof: &[String], height: u64) -> Result<()> {
     let d = state.governance.distributions.get(&id).ok_or_else(|| anyhow!("no distribution #{id}"))?;
     if d.closed_at.is_some() || height > d.claim_until {
         bail!("distribution #{id} closed at block {}", d.claim_until);
     }
-    let ck = IdKey::new(id, sender);
-    if state.governance.distribution_claims.contains_key(&ck) {
+    if state.governance.distribution_claims.contains_key(&IdKey::new(id, sender)) {
         bail!("{} already claimed from distribution #{id}", short(sender));
     }
     let siblings: Vec<[u8; 32]> = proof.iter().map(|h| hex::decode(h).ok().and_then(|b| b.try_into().ok())).collect::<Option<_>>().ok_or_else(|| anyhow!("proof hashes must be 32 bytes of hex"))?;
@@ -878,6 +881,24 @@ fn claim_distribution(state: &mut State, j: &mut Journal, sender: &str, id: u64,
     if amount > left {
         bail!("distribution #{id} has only {} left", fmt_fang(left));
     }
+    Ok(())
+}
+
+/// What a `ClaimDistribution` tx would credit its sender at `height`, if the claim checks out
+/// ([`check_claim`]): admission counts it toward the fee of a claimant that can't pay it yet (a
+/// new or empty account), and the fee phase then runs the claim first (`State::apply_j`). An
+/// invalid claim is no help, so it stays unadmittable rather than free.
+pub fn claim_toward_fee(state: &State, tx: &Tx, sender: &str, height: u64) -> Result<u64> {
+    let Action::ClaimDistribution { distribution_id, amount, proof } = &tx.action else { bail!("only a distribution claim pays its fee out of what it claims") };
+    check_claim(state, sender, *distribution_id, *amount, proof, height)?;
+    Ok(*amount)
+}
+
+/// Runs a checked `ClaimDistribution` (the action, or the fee phase of a claim paying its own
+/// fee).
+pub(crate) fn claim_distribution(state: &mut State, j: &mut Journal, sender: &str, id: u64, amount: u64, proof: &[String], height: u64) -> Result<()> {
+    check_claim(state, sender, id, amount, proof, height)?;
+    let ck = IdKey::new(id, sender);
     j.governance.distributions.touch(&state.governance.distributions, &id);
     let d = state.governance.distributions.get_mut(&id).expect("checked above");
     d.claimed += amount;

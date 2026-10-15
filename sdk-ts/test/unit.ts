@@ -8,8 +8,9 @@ import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex, hexToBytes, utf8ToBytes } from "@noble/hashes/utils.js";
 import {
-  ChainMismatchError, Client, RELEASE_SIGNATURE_FORMAT, Wallet, addressFromPublicKey, bareName, convictionWeight, keyId, minFee, paramsOf, proposal,
-  proposalSummary, releaseMessage, sharesFor, signingBytes, stakeSummary, verifyReleaseSignature, type Action, type Tx,
+  ChainMismatchError, Client, RELEASE_SIGNATURE_FORMAT, Wallet, addressFromPublicKey, bareName, buildDistribution, convictionWeight, distributionLeaf, distributionNode,
+  keyId, minFee, paramsOf, proposal, proposalSummary, releaseMessage, sharesFor, signingBytes, stakeSummary, verifyDistributionProof, verifyReleaseSignature, type Action,
+  type Tx,
 } from "../src/index.js";
 
 // ---- a fake node behind fetch ----
@@ -246,3 +247,27 @@ const bad: [string, () => void, RegExp][] = [
 ];
 for (const [label, run, re] of bad) assert.throws(run, re, label);
 console.log(`✓ release signatures: known-answer vector, ${bad.length} forgeries refused`);
+
+// ---- community distribution trees (docs/GOVERNANCE.md; vectors written by the node's
+// `governance::tests::distribution_vectors_match_the_sdk_file`) ----
+
+const DV = JSON.parse(readFileSync(new URL("./distribution-vectors.json", import.meta.url), "utf8")) as { trees: { distribution_id: number; root: string; entries: { address: string; amount: string; leaf: string; proof: string[] }[] }[] };
+for (const t of DV.trees) {
+  const entries = t.entries.map((e) => ({ address: e.address, amount: BigInt(e.amount) }));
+  const built = buildDistribution(t.distribution_id, entries);
+  assert.equal(built.root, t.root, `tree ${t.distribution_id}'s root`);
+  t.entries.forEach((e, i) => {
+    assert.equal(bytesToHex(distributionLeaf(t.distribution_id, e.address, BigInt(e.amount))), e.leaf);
+    assert.deepEqual(built.proofs[i], e.proof, `tree ${t.distribution_id}, entry ${i}`);
+    assert.ok(verifyDistributionProof(t.root, t.distribution_id, e.address, BigInt(e.amount), e.proof));
+    assert.ok(!verifyDistributionProof(t.root, t.distribution_id, e.address, BigInt(e.amount) + 1n, e.proof), "another amount");
+    assert.ok(!verifyDistributionProof(t.root, t.distribution_id + 1, e.address, BigInt(e.amount), e.proof), "the id is in the leaf");
+  });
+}
+const [l, r] = [distributionLeaf(1, "boo1a", 1n), distributionLeaf(1, "boo1b", 1n)];
+assert.deepEqual(distributionNode(l, r), distributionNode(r, l), "sorted pairs");
+assert.throws(() => buildDistribution(1, [{ address: "boo1a", amount: 1n }, { address: "boo1a", amount: 2n }]), /twice/);
+assert.throws(() => buildDistribution(1, []), /at least one/);
+assert.throws(() => buildDistribution(1, [{ address: "boo1a", amount: 0n }]), /gets 0/);
+assert.ok(!verifyDistributionProof(DV.trees[0].root, 7, DV.trees[0].entries[0].address, 1_000_000_000n, ["zz"]), "malformed proofs don't verify");
+console.log(`✓ ${DV.trees.length} distribution trees (leaves, roots, proofs) match the node`);

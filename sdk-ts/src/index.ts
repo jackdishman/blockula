@@ -7,6 +7,7 @@ import { NAMESPACES, checkProofResponse, decodeAccount, decodeName, type ProofRe
 
 export * from "./tx.js";
 export * from "./proof.js";
+export * from "./distribution.js";
 export * from "./release.js";
 
 export const DEFAULT_RPC = "http://localhost:7070";

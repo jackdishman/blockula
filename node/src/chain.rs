@@ -1130,7 +1130,17 @@ impl State {
             bail!("bad nonce: expected {}, got {}", acct.nonce, tx.nonce);
         }
         if acct.balance < charge {
-            bail!("insufficient balance for the fee: has {}, needs {}", fmt_fang(acct.balance), fmt_fang(charge));
+            // A distribution claim may pay its fee, and the creation fee of the account it opens,
+            // out of what it claims, once the claim itself checks out (governance.rs).
+            let claim = match crate::governance::claim_toward_fee(self, tx, &sender, height) {
+                Ok(amount) => amount,
+                Err(e) if matches!(tx.action, Action::ClaimDistribution { .. }) => bail!("insufficient balance for the fee: has {}, needs {}, and the claim can't pay it: {e}", fmt_fang(acct.balance), fmt_fang(charge)),
+                Err(_) => bail!("insufficient balance for the fee: has {}, needs {}", fmt_fang(acct.balance), fmt_fang(charge)),
+            };
+            let need = charge.saturating_add(self.creation_fee_for(&sender));
+            if acct.balance.saturating_add(claim) < need {
+                bail!("insufficient balance for the fee: has {} and claims {}, needs {}", fmt_fang(acct.balance), fmt_fang(claim), fmt_fang(need));
+            }
         }
         if let KeyRole::Session { limit, period_blocks, expires_at } = key.role {
             if height > expires_at {
@@ -1180,6 +1190,27 @@ impl State {
         }
         let (sender, signer, key, charge) = self.admit(tx, chain_id, height, full_checks)?;
         let base = charge - tx.tip;
+        // A distribution claim its sender can't pay for pays out of the claim (admission checked
+        // the claim covers the fee and the new account's creation fee): the claim runs first, here.
+        let prepaid = self.account(&sender).balance < charge;
+        if prepaid {
+            let Action::ClaimDistribution { distribution_id, amount, proof } = &tx.action else { bail!("insufficient balance for the fee") };
+            let opening = self.creation_fee_for(&sender);
+            let mut cj = Journal::default();
+            let claimed = crate::governance::claim_distribution(self, &mut cj, &sender, *distribution_id, *amount, proof, height).and_then(|()| {
+                if opening > 0 {
+                    self.j_debit(&mut cj, &sender, opening)?;
+                    self.j_burn(&mut cj, opening);
+                }
+                ensure!(self.account(&sender).balance >= charge, "insufficient balance for the fee, even with the claim");
+                Ok(())
+            });
+            if let Err(e) = claimed {
+                self.rollback(cj);
+                return Err(e);
+            }
+            j.absorb(cj);
+        }
         // Fee phase (always sticks once admitted): the charge is debited (not the whole `fee`),
         // its base part burned and the tip paid to the proposer.
         if let KeyRole::Session { period_blocks, .. } = key.role {
@@ -1202,7 +1233,9 @@ impl State {
         // account may end up moving tokens its locks hold (fees above may: they're paid first).
         let free = crate::econ::free(self, &sender, height);
         let mut aj = Journal::default();
-        let result = self.apply_action(&mut aj, tx, &sender, &signer, &key, height).and_then(|()| {
+        // A prepaid claim already ran.
+        let action = if prepaid { Ok(()) } else { self.apply_action(&mut aj, tx, &sender, &signer, &key, height) };
+        let result = action.and_then(|()| {
             let touched = aj.touched_accounts();
             crate::econ::charge_new_accounts(self, &mut aj, &touched, &sender, &signer, &key)?;
             crate::econ::check_locks(self, &touched, &sender, free, height)

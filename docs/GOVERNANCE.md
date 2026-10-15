@@ -66,7 +66,7 @@ Even at conviction 0 the tokens stay locked until voting ends, so they can't vot
 
 The treasury and the community account are keyless system accounts. Only a passed `TreasurySpend` moves treasury funds, and only `Distribution` proposals move community funds. Both are refused before `governance_spend_height`, because at launch almost nothing can vote.
 
-A distribution escrows `total` from the community account. Each recipient claims once with `ClaimDistribution { distribution_id, amount, proof }` until block `claim_until`, as the account the tree names (the tx's `from`); claims can't add up to more than `total`. At the end of the first block after `claim_until`, what's left goes back to the community account. Recipients need a little FANG for the claim's fee.
+A distribution escrows `total` from the community account. Each recipient claims once with `ClaimDistribution { distribution_id, amount, proof }` until block `claim_until`, as the account the tree names (the tx's `from`); claims can't add up to more than `total`. At the end of the first block after `claim_until`, what's left goes back to the community account. A recipient with nothing to pay the fee with (a new or empty account) pays it out of the claim: admission counts the claim toward the fee once it checks out against the stored root (open, not claimed yet, the proof leads to `merkle_root`, enough left), the claim runs first in the fee phase, and a claim that opens the account also burns `account_creation_fee` from it (`governance::claim_toward_fee`). A claim that doesn't check out is no help, so from an empty account it isn't admitted at all: a bad proof is never free.
 
 ### Merkle tree format
 
@@ -74,7 +74,7 @@ A distribution escrows `total` from the community account. Each recipient claims
 - **Node:** `BLAKE3("BLOCKULA_DISTRIBUTION_NODE_V1" ‖ min(a, b) ‖ max(a, b))`, comparing the two 32-byte children as byte strings. Sorted pairs make a proof just the sibling hashes from the leaf up, with no positions; the two domain strings keep a node from passing as a leaf.
 - **Building** (`governance::build_distribution`, `blockula gov tree`): sort the leaf hashes ascending, then pair them left to right level by level, carrying an odd last node up unchanged; one leaf is its own root. Addresses must be distinct and amounts non-zero. Any tree shape verifies; this one is the reference so independent builders agree on the root.
 - **Verifying:** fold the proof: `h = leaf; for s in proof: h = node(h, s)`; the claim is valid if `h == merkle_root`. Proofs are at most 64 hashes (`MAX_PROOF`).
-- **The id is in the leaf**, so a proof for one distribution never verifies in another. Build the tree for the id the proposal will get (`next_id` in `/api/proposals`) just before proposing; `blockula gov propose distribution` refuses a tree built for another id.
+- **The id is in the leaf**, so a proof for one distribution never verifies in another. Build the tree for the id the proposal will get (`next_id` in `/api/proposals`) just before proposing; `blockula gov propose distribution` refuses a tree built for another id. `Distribution` carries no id of its own (adding one would change the tx encoding on both sides): if another proposal takes the id between building the tree and inclusion, nobody can claim from that distribution and its `total` returns to the community account after `claim_until`, so propose again with a tree for the new id.
 
 Vectors (`governance::tests::merkle_trees_build_and_verify`), distribution 7:
 
@@ -86,9 +86,9 @@ Vectors (`governance::tests::merkle_trees_build_and_verify`), distribution 7:
 
 Root `f1ccd2c1386b5f7bcffeb39b226cbef621a1f11c3ee919109d05bd8b5aeced3b`. Proofs, in the table's order: `[52da68dc…84364, b60bfc85…b32c2]`, `[ab68c5cbdeed677ec1daf469d1fe2818daca608866456091bef5c1382f186333]`, `[17031a8f…b9515, b60bfc85…b32c2]`.
 
-### SDK helper (spec for P-CLIENTS)
+### SDK helper
 
-`@blockula/sdk` should export, with `@noble/hashes/blake3`, and test against the vectors above:
+`@blockula/sdk` exports these (`sdk-ts/src/distribution.ts`, with `@noble/hashes/blake3`); `npm run test:vectors` checks them against `sdk-ts/test/distribution-vectors.json` (distribution 7 above and trees of 1–9 entries), which the node's `governance::tests::distribution_vectors_match_the_sdk_file` checks too:
 
 ```ts
 /** The leaf of `address`'s `amount` (drops) in distribution `id`. */
@@ -97,6 +97,8 @@ export function distributionLeaf(id: bigint | number, address: string, amount: b
 export function distributionNode(a: Uint8Array, b: Uint8Array): Uint8Array;
 /** Root and per-entry proofs (hex), entries in input order; the reference shape above. */
 export function buildDistribution(id: bigint | number, entries: { address: string; amount: bigint }[]): { root: string; proofs: string[][] };
+/** The root (hex) a leaf and its proof lead to. */
+export function distributionRoot(id: bigint | number, address: string, amount: bigint, proof: string[]): string;
 /** Whether `proof` leads from the leaf to `root` (hex). */
 export function verifyDistributionProof(root: string, id: bigint | number, address: string, amount: bigint, proof: string[]): boolean;
 // Wallet: claimDistribution(id, amount, proof) builds { type: "claim_distribution", distribution_id, amount: String(amount), proof }.
