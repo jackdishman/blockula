@@ -750,6 +750,25 @@ mod tests {
         std::fs::remove_dir_all(h).ok();
     }
 
+    /// OPS-6: at startup, simplex journals of epochs before the current one minus two go; the
+    /// rest of the consensus storage (marshal, other prefixes, look-alikes) stays.
+    #[test]
+    fn old_epoch_journals_are_pruned_at_startup() {
+        let dir = home("journals");
+        for d in ["blockula-simplex-0", "blockula-simplex-7", "blockula-simplex-8", "blockula-simplex-9", "blockula-simplex-10", "blockula-marshal-x", "blockula-finalizations-key", "other-simplex-1", "blockula-simplex-07x"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+            std::fs::write(dir.join(d).join("blob"), b"x").unwrap();
+        }
+        std::fs::write(dir.join("blockula-simplex-3"), b"a file, not a partition").unwrap();
+        assert_eq!(prune_epoch_journals(&dir, "blockula", 10).unwrap(), 2);
+        let mut left: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, ["blockula-finalizations-key", "blockula-marshal-x", "blockula-simplex-07x", "blockula-simplex-10", "blockula-simplex-3", "blockula-simplex-8", "blockula-simplex-9", "other-simplex-1"]);
+        assert_eq!(prune_epoch_journals(&dir, "blockula", 10).unwrap(), 0);
+        assert_eq!(prune_epoch_journals(&dir.join("missing"), "blockula", 10).unwrap(), 0);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn peer_http_replaces_genesis_list_and_urls_are_accepted() {
         let root = home("peers");

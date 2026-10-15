@@ -68,13 +68,15 @@ pub fn mark_process_start() {
 /// Connected p2p peers, from the runtime's Prometheus text: the series of the authenticated
 /// p2p tracker's `connected` family (one per connected peer).
 pub fn connected_peers(runtime_metrics: &str) -> Option<usize> {
+    let is_family = |name: &str| name.ends_with("tracker_connected");
     let mut found = false;
     let mut n = 0;
     for line in runtime_metrics.lines() {
-        let name = line.split(['{', ' ']).next().unwrap_or_default();
-        if name.ends_with("tracker_connected") {
+        if let Some(rest) = line.strip_prefix("# TYPE ") {
+            found |= rest.split(' ').next().is_some_and(is_family);
+        } else if !line.starts_with('#') && is_family(line.split(['{', ' ']).next().unwrap_or_default()) {
             found = true;
-            n += usize::from(!line.starts_with('#'));
+            n += 1;
         }
     }
     found.then_some(n)
@@ -1543,6 +1545,63 @@ mod http_tests {
         assert_eq!(b["to"], 1);
         assert_eq!(b["finalization"], "010203");
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Upgrades and halts over HTTP: the schedule and readiness (`/api/upgrade`), blocks'
+    /// signals, a halted node's 503 with the reason, and the /metrics gauges operators alert on.
+    #[tokio::test]
+    async fn upgrade_status_signals_halts_and_their_metrics() {
+        let (root, mut n) = node("upgrade");
+        let v2 = crate::consensus::SUPPORTED_PROTOCOL_VERSION + 1;
+        {
+            let mut c = n.chain.lock();
+            c.state.upgrade.schedule = vec![crate::upgrade::ScheduledUpgrade { version: v2, activation_height: 4 }];
+            c.produce_block_with(vec![]).unwrap();
+            c.produce_block_with(vec![]).unwrap();
+        }
+        let (s, u, _) = call(&n, "GET", "/api/upgrade", None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!((u["height"].as_u64(), u["next"]["version"].as_u64(), u["next"]["blocks_left"].as_u64(), u["next"]["this_binary_supports_it"].as_bool()), (Some(2), Some(v2 as u64), Some(1), Some(false)));
+        // The one validator proposed both blocks, signalling what its binary supports.
+        assert_eq!((u["readiness"]["version"].as_u64(), u["readiness"]["ready"].as_u64(), u["readiness"]["active"].as_u64()), (Some(v2 as u64), Some(0), Some(1)));
+        assert_eq!(u["readiness"]["validators"][0]["signal"].as_u64(), Some(crate::consensus::SUPPORTED_PROTOCOL_VERSION as u64));
+        let (_, blocks, _) = call(&n, "GET", "/api/blocks", None, "127.0.0.1:1").await;
+        assert_eq!((blocks[0]["version"].as_u64(), blocks[0]["signal"].as_u64()), (Some(1), Some(crate::consensus::SUPPORTED_PROTOCOL_VERSION as u64)));
+        let (_, _, text) = call(&n, "GET", "/metrics", None, "127.0.0.1:1").await;
+        for want in ["blockula_upgrade_next_version 2", "blockula_upgrade_next_height 4", "blockula_supported_protocol_version 1", "blockula_protocol_version 1", "blockula_halted 0"] {
+            assert!(text.contains(want), "{want} in {text}");
+        }
+        // Block 3 executes; block 4 runs v2, which this binary doesn't: halted.
+        assert!(n.chain.lock().produce_block_with(vec![]).is_err());
+        let (s, h, _) = call(&n, "GET", "/api/health", None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(h["halted"], "upgrade_required");
+        assert!(h["reason"].as_str().unwrap().starts_with("halted: block 4 runs protocol v2"), "{h}");
+        let (_, status, _) = call(&n, "GET", "/api/status", None, "127.0.0.1:1").await;
+        assert_eq!(status["upgrade"]["halted"]["kind"], "upgrade_required");
+        // Reads keep working.
+        let (s, _, _) = call(&n, "GET", "/api/block/3", None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::OK);
+        // A validator's slashing-protection gauges.
+        let key = crate::crypto::Keys::from_seed([1; 32]).public_key();
+        let p = crate::protection::Protection::in_memory(&key, crate::protection::Timing::for_block_time(1_000));
+        p.enter_epoch(0, Some(0), 4, 0);
+        n.protection = Some(p);
+        n.p2p_peers = Some(Arc::new(|| Some(3)));
+        mark_process_start();
+        let (_, _, text) = call(&n, "GET", "/metrics", None, "127.0.0.1:1").await;
+        for want in ["blockula_halted 1", "blockula_halt_info{kind=\"upgrade_required\"} 1", "blockula_slashing_protection_abstaining 1", "blockula_slashing_protection_voting 1", "blockula_slashing_protection_last_view 0", "blockula_p2p_peers 3", "blockula_process_start_time_seconds"] {
+            assert!(text.contains(want), "{want} in {text}");
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn peer_count_from_the_runtime_metrics() {
+        let text = "# HELP network_tracker_connected Unix timestamp in milliseconds when each connected peer became active.\n# TYPE network_tracker_connected gauge\nnetwork_tracker_connected{peer=\"ab12\"} 1700000000000\nnetwork_tracker_connected{peer=\"cd34\"} 1700000000001\nnetwork_tracker_tracked 4\n";
+        assert_eq!(connected_peers(text), Some(2));
+        assert_eq!(connected_peers("# HELP network_tracker_connected x\n# TYPE network_tracker_connected gauge\n"), Some(0));
+        assert_eq!(connected_peers("runtime_tasks_spawned_total 3\n"), None, "no p2p tracker");
     }
 
     #[tokio::test]

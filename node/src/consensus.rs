@@ -1180,4 +1180,57 @@ mod tests {
         });
         std::fs::remove_dir_all(root_dir).ok();
     }
+
+    /// Blocks must carry the protocol version in force at their height (3.9). A node votes on
+    /// nothing it couldn't execute: a version its binary doesn't run, or a height past
+    /// `--halt-height`. It proposes nothing there either, and signals its own supported version.
+    #[test]
+    fn verify_checks_the_version_in_force_and_abstains_past_a_halt() {
+        let home = std::env::temp_dir().join(format!("blockula-versions-{}-{}", crate::chain::now_ms(), std::process::id()));
+        Chain::summon(&home, &SummonOpts::new("versions", 1)).unwrap();
+        let mut c = Chain::open(&home).unwrap();
+        let v2 = SUPPORTED_PROTOCOL_VERSION + 1;
+        c.state.upgrade.schedule = vec![crate::upgrade::ScheduledUpgrade { version: v2, activation_height: 70 }];
+        for _ in 0..10 {
+            c.produce_block_with(vec![]).unwrap();
+        }
+        let root10 = hex_32(&c.root_at(10).unwrap());
+        let seed: [u8; 32] = hex::decode(std::fs::read_to_string(home.join("validator.key")).unwrap().trim()).unwrap().try_into().unwrap();
+        let chain: Shared = Arc::new(Mutex::new(c));
+        deterministic::Runner::timed(Duration::from_secs(120)).start(|context| async move {
+            let leader = PrivateKey::from_seed_bytes(seed).public_key();
+            let mut app = App { chain: chain.clone(), block_time_ms: 1_000, address_prefix: "boo".into() };
+            let parent_at = |height: u64| CBlock::new(Digest([height as u8; 32]), height, 6, 5, 0, String::new(), 9, [0; 32], vec![]);
+            let child = |parent: &CBlock, version: u32| CBlock::new(parent.digest(), parent.height + 1, 7, 6, 1_000, leader.address("boo"), 10, root10, vec![]).with_versions(version, 1);
+            let cctx = |parent: &CBlock| SimplexContext { round: Round::new(Epoch::zero(), View::new(7)), leader: leader.clone(), parent: (View::new(6), parent.digest()) };
+            // `Some(verdict)`, or `None` if it's still pending after 10 s.
+            let mut verify = async |block: CBlock, parent: &CBlock| {
+                let ancestry = marshal::ancestry::from_iter([Arc::new(block), Arc::new(parent.clone())]);
+                let verdict = Application::<deterministic::Context>::verify(&mut app, (context.child("verify"), cctx(parent)), ancestry);
+                commonware_macros::select! {
+                    v = verdict => Some(v),
+                    _ = context.sleep(Duration::from_secs(10)) => None,
+                }
+            };
+            let (p20, p73) = (parent_at(20), parent_at(73));
+            assert_eq!(verify(child(&p20, 1), &p20).await, Some(true), "v1 before the activation height");
+            assert_eq!(verify(child(&p20, 2), &p20).await, Some(false), "v2 too early");
+            // This binary runs v1 only: from the activation height on, no vote either way.
+            assert_eq!(verify(child(&p73, 2), &p73).await, None);
+            assert_eq!(verify(child(&p73, 1), &p73).await, None);
+            crate::upgrade::configure(&mut chain.lock(), v2, None);
+            assert_eq!(verify(child(&p73, 1), &p73).await, Some(false), "v1 after the activation height");
+            assert_eq!(verify(child(&p73, 2), &p73).await, Some(true));
+            // A block 64+ heights past what we executed waits until the version there is certain.
+            let p80 = parent_at(80);
+            assert_eq!(verify(child(&p80, 2), &p80).await, None);
+            // --halt-height 50: nothing past it gets a vote.
+            crate::upgrade::configure(&mut chain.lock(), v2, Some(50));
+            assert_eq!(verify(child(&p20, 1), &p20).await, Some(true));
+            assert_eq!(verify(child(&p73, 2), &p73).await, None);
+            let c = chain.lock();
+            assert!(c.halt.allows(&c.state, 50) && !c.halt.allows(&c.state, 51));
+        });
+        std::fs::remove_dir_all(home).ok();
+    }
 }
