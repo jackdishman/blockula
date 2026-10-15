@@ -32,8 +32,8 @@
 //! bond is slashed into the pool, any reward and Soul clawed back).
 //!
 //! **Validator side.** [`Secrets`] keeps a validator's secrets under its home, written (0600,
-//! fsynced) before a commitment leaves the node; [`duties`] commits and reveals (node.rs runs it
-//! every block).
+//! fsynced) before a commitment leaves the node; [`duties`] commits early in each epoch and
+//! reveals in its second half (node.rs runs it every block).
 
 use crate::chain::{short, Chain, Journal, KeyRecord, State};
 use crate::poc::{Claim, ClaimStatus};
