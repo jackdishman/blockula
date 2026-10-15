@@ -21,7 +21,12 @@ use crate::chain::{Account, KeyRecord};
 use crate::types::KeyRole;
 use serde_json::{json, Value};
 
-const FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../sdk-ts/test/proof-vectors.json");
+/// `sdk-ts/test/proof-vectors.json`, found from the crate's directory (`node/`, or `node/fuzz/`,
+/// which compiles these modules too).
+fn file() -> std::path::PathBuf {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    dir.ancestors().map(|d| d.join("sdk-ts/test/proof-vectors.json")).find(|p| p.exists()).unwrap_or_else(|| dir.join("../sdk-ts/test/proof-vectors.json"))
+}
 
 fn case(root: &Hash, namespace: u8, key: &[u8], value: Option<&[u8]>, proof: &Proof, valid: bool, label: &str) -> Value {
     assert_eq!(verify(root, namespace, key, value, proof), valid, "{label}");
@@ -144,7 +149,7 @@ fn check_section(section: &Value, label: &str) {
 
 #[test]
 fn proof_vectors_match_the_node() {
-    let file: Value = serde_json::from_str(&std::fs::read_to_string(FILE).expect("sdk-ts/test/proof-vectors.json")).unwrap();
+    let file: Value = serde_json::from_str(&std::fs::read_to_string(file()).expect("sdk-ts/test/proof-vectors.json")).unwrap();
     let fresh = vectors();
     let regen = "regenerate sdk-ts/test/proof-vectors.json (see node/src/state/proof_vectors.rs)";
     assert_eq!(file["tree_golden"], fresh["tree_golden"], "the tree format changed (a consensus change): {regen}");
@@ -161,5 +166,5 @@ fn proof_vectors_match_the_node() {
 #[test]
 #[ignore = "generator, run by hand (see the module docs)"]
 fn write() {
-    std::fs::write(FILE, serde_json::to_string_pretty(&vectors()).unwrap() + "\n").unwrap();
+    std::fs::write(file(), serde_json::to_string_pretty(&vectors()).unwrap() + "\n").unwrap();
 }

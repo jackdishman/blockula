@@ -190,6 +190,8 @@ export function effectivePin(net: Network, remembered?: Pin): Pin {
 export function mismatchError(net: Network, why: string, knownChainsFile: string) {
   const fix = net.remember
     ? ` If this network was relaunched on purpose, the user can remove its entry ("${KnownChains.id(net)}") from ${knownChainsFile}, or set BLOCKULA_GENESIS_HASH.`
-    : "";
+    : net.key === "local"
+      ? " A reset dev chain starts from a new genesis: call start_dev_node to use the one running now."
+      : "";
   return new Error(`Refusing ${net.rpc} (${net.label}): ${why}. Nothing was signed or sent.${fix}`);
 }

@@ -19,7 +19,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { Client, Wallet, formatFang, parseFang, proposalSummary, sharesFor, stakeSummary, type ProposalSummary } from "@blockula/sdk";
+import { ApiError, Client, Wallet, formatFang, parseFang, proposalSummary, sharesFor, stakeSummary, type ProposalSummary } from "@blockula/sdk";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -91,6 +91,16 @@ async function reachable(url: string) {
 }
 
 const explorer = (path: string) => `${RPC}/#/${path}`;
+
+/** A protocol v1 read, with a plain answer on nodes whose chain doesn't have the module yet. */
+async function moduleRead<T>(what: string, read: Promise<T>): Promise<T> {
+  try {
+    return await read;
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404 && /404|not found/i.test(e.message)) throw new Error(`${RPC} doesn't serve ${what}: it isn't active on this chain yet`);
+    throw e;
+  }
+}
 
 // ---- spending caps (BLOCKULA_MAX_SEND per call, BLOCKULA_MAX_DAILY per UTC day) ----
 
@@ -181,7 +191,11 @@ tool("start_dev_node", "Start a local Blockula dev chain (faucet + built-in expl
   const net = network();
   const target = net.key === "local" ? net.rpc : "http://localhost:7070";
   const using = net.key === "local" ? "This MCP is on the local network, so it uses it now." : `This MCP stays on the ${net.label} (${net.rpc}): the network never changes while it runs. To use the dev chain, the user restarts the MCP with --network local (or BLOCKULA_NETWORK=local).`;
-  if (!reset && (await reachable(target))) return `A node is already running at ${target} (explorer: ${target}). ${using}`;
+  if (!reset && (await reachable(target))) {
+    // Asked for the dev chain explicitly: pin whichever one runs now (a reset makes a new genesis).
+    if (net.key === "local") pinned = null;
+    return `A node is already running at ${target} (explorer: ${target}). ${using}`;
+  }
   const port = new URL(target).port || "7070";
   mkdirSync(HOME, { recursive: true });
   const log = openSync(join(HOME, "dev-node.log"), "a");
@@ -365,7 +379,7 @@ tool("unstake", "Start unbonding stake from a validator's pool: an amount in FAN
   const v = await w.client.resolve(validator);
   let shares: bigint | "all" = "all";
   if (amount !== "all") {
-    const d = stakeSummary(await w.client.staking(w.account)).delegations.find((x) => x.validator === v);
+    const d = stakeSummary(await moduleRead("staking", w.client.staking(w.account))).delegations.find((x) => x.validator === v);
     if (!d) throw new Error(`${w.account} has no stake with ${validator}`);
     shares = sharesFor(d, amount);
     if (shares <= 0n) throw new Error(`${amount} FANG is less than one share of this pool`);
@@ -382,7 +396,7 @@ tool("withdraw_stake", "Pay out every unbonding entry of the account this agent 
 tool("my_stake", "The stake of the account this agent acts for: each pool (validator, shares, value), unbonding entries and when they complete, and what can be withdrawn now.", {}, async () => {
   const w = await requireWallet();
   await w.client.addressPrefix();
-  const [raw, status] = await Promise.all([w.client.staking(w.account), w.client.status()]);
+  const [raw, status] = await Promise.all([moduleRead("staking", w.client.staking(w.account)), w.client.status()]);
   const s = stakeSummary(raw, status.height);
   return {
     account: w.account,
@@ -415,7 +429,7 @@ const proposalView = (p: ProposalSummary) => ({
 });
 
 tool("list_proposals", "On-chain governance proposals (parameter changes, treasury spends, upgrades, distributions …): what each does, its status, token-weighted tallies, the bootstrap validator council's votes, and when voting ends and the timelock lets it execute.", { status: z.string().optional().describe("e.g. \"voting\"; default: all, newest first"), limit: z.number().int().min(1).max(50).default(20) }, async ({ status, limit }) => {
-  const res = await (await chain()).proposals({ status, limit });
+  const res = await moduleRead("governance proposals", (await chain()).proposals({ status, limit }));
   const list = (Array.isArray(res) ? res : (res.proposals ?? [])) as unknown[];
   return list.slice(0, limit).map((p) => proposalView(proposalSummary(p)));
 });
