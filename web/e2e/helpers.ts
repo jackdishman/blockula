@@ -48,6 +48,15 @@ export interface StoredHint {
   pendingKit?: { keyId: string; created: string };
 }
 
+/** Records CSP violations in the page from now on; `cspViolations` reads them. */
+export const watchCsp = (page: Page) =>
+  page.addInitScript(() => {
+    const w = window as unknown as { __csp: string[] };
+    w.__csp = [];
+    document.addEventListener("securitypolicyviolation", (e) => w.__csp.push(`${e.violatedDirective} ${e.blockedURI}`));
+  });
+export const cspViolations = (page: Page) => page.evaluate(() => (window as unknown as { __csp?: string[] }).__csp ?? []);
+
 /** The wallet's non-secret hints in localStorage. */
 export const storedHint = (page: Page) => page.evaluate(() => JSON.parse(localStorage.getItem("blockula.wallet") ?? "null")) as Promise<StoredHint | null>;
 

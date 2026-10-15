@@ -271,3 +271,19 @@ textarea:focus { outline: none; border-color: var(--blood); box-shadow: 0 0 0 1p
 @media (prefers-reduced-motion: reduce) { .splash .ornament-bat, .spinner { animation: none; } }
 
 .break { word-break: break-all; }
+
+/* Stake and governance */
+.figures-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); border-top: 3px solid var(--ink); border-bottom: 1px solid var(--ink); }
+.figures-row > div { padding: 10px 14px 8px; border-right: 1px solid var(--hair); }
+.figures-row > div:last-child { border-right: 0; }
+.figure { font: 500 26px/1.15 var(--serif); font-variant-numeric: lining-nums tabular-nums; }
+.figure-k { color: var(--dim); font: 400 15px var(--caps); letter-spacing: 0.06em; }
+.pool-row { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--hair); flex-wrap: wrap; }
+.pool-row:last-child { border-bottom: 0; }
+.tally { display: flex; height: 10px; border: 1px solid var(--ink); background: var(--paper-hi); margin: 6px 0 2px; }
+.tally .aye { background: var(--moss); }
+.tally .nay { background: var(--blood); }
+.vote-choice { display: flex; gap: 10px; }
+.vote-choice .btn.on { background: var(--ink); color: var(--paper-hi); }
+select.field-select { font: 400 18px var(--serif); background: transparent; color: var(--ink); border: 0; border-bottom: 1.5px solid var(--ink); padding: 6px 2px; }
+

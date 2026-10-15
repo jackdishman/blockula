@@ -38,6 +38,8 @@ export function Header() {
           {open && (
             <>
               <Link href="/" className={path === "/" ? "active" : ""}>Home</Link>
+              <Link href="/stake" className={path === "/stake" ? "active" : ""}>Stake</Link>
+              <Link href="/governance" className={path === "/governance" ? "active" : ""}>Governance</Link>
               <Link href="/devices" className={path === "/devices" ? "active" : ""}>Devices &amp; agents</Link>
             </>
           )}

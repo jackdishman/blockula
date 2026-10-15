@@ -15,7 +15,8 @@ interface Acct { balance: bigint; nonce: number; keys?: Map<string, KeyRec> }
 interface TxRec { id: string; tx: Tx | null; kind: string; from: string; to: string | null; amount: bigint | null; fee: bigint; memo: string; height: number; summary: string }
 
 const FAUCET = addressOf("fa".repeat(32));
-const VALIDATOR = addressOf("7a".repeat(32));
+export const VALIDATOR = addressOf("7a".repeat(32));
+export const OTHER_VALIDATOR = addressOf("7b".repeat(32));
 
 export function addressOf(keyIdHex: string) {
   return bech32m.encode("boo", bech32m.toWords(hexToBytes(keyIdHex)));
@@ -53,6 +54,20 @@ export class MockNode {
   submitted: Tx[] = [];
   /** Every request body the wallet sent to the node, to prove secrets never leave the page. */
   bodies: string[] = [];
+  /** Protocol v1 modules: off, the node answers 404 like a node without them. */
+  staking = true;
+  governance = true;
+  /** Validator pools: stake in drops and commission. */
+  pools = new Map<string, { name: string | null; stake: bigint; shares: bigint; commission_bps: number }>([
+    [VALIDATOR, { name: null, stake: 1_000_000n * 10n ** 9n, shares: 1_000_000n * 10n ** 9n, commission_bps: 500 }],
+    [OTHER_VALIDATOR, { name: null, stake: 500_000n * 10n ** 9n, shares: 500_000n * 10n ** 9n, commission_bps: 1000 }],
+  ]);
+  /** Shares by account, then validator. */
+  shares = new Map<string, Map<string, bigint>>();
+  unbonding = new Map<string, { validator: string; amount: bigint; completes_at: number }[]>();
+  /** Governance proposals as the node serves them (tolerantly read by the wallet). */
+  proposals: Record<string, unknown>[] = [];
+  votes: { proposal_id: number; voter: string; aye: boolean; amount: bigint; conviction: number }[] = [];
 
   /** A node of one of the e2e chains, optionally at another URL (a "custom node"). */
   constructor(chain: keyof typeof CHAINS = "testnet", rpc?: string) {
@@ -200,11 +215,78 @@ export class MockNode {
     } else if (act.type === "register_name") {
       this.names.set(act.name, tx.from);
       summary = `${this.label(tx.from).short} claimed ${act.name}.boo`;
+    } else if (act.type === "delegate") {
+      const pool = this.pools.get(act.validator);
+      if (!pool || !this.staking) throw new HttpError(400, "not active yet");
+      const value = BigInt(act.amount);
+      if (a.balance < value + fee) throw new HttpError(400, `insufficient balance: has ${formatFang(a.balance)}, needs ${formatFang(value + fee)}`);
+      const shares = (value * pool.shares) / pool.stake;
+      pool.stake += value;
+      pool.shares += shares;
+      const mine = this.shares.get(tx.from) ?? new Map<string, bigint>();
+      mine.set(act.validator, (mine.get(act.validator) ?? 0n) + shares);
+      this.shares.set(tx.from, mine);
+      a.balance -= value;
+      summary = `${this.label(tx.from).short} delegated ${formatFang(value)} to validator ${this.label(act.validator).short}`;
+    } else if (act.type === "undelegate") {
+      const pool = this.pools.get(act.validator);
+      const mine = this.shares.get(tx.from);
+      const held = mine?.get(act.validator) ?? 0n;
+      const shares = BigInt(act.shares);
+      if (!pool || !mine || shares > held) throw new HttpError(400, `you hold ${held} shares of that pool`);
+      const value = (shares * pool.stake) / pool.shares;
+      pool.stake -= value;
+      pool.shares -= shares;
+      mine.set(act.validator, held - shares);
+      this.unbonding.set(tx.from, [...(this.unbonding.get(tx.from) ?? []), { validator: act.validator, amount: value, completes_at: this.height + 10 }]);
+      summary = `${this.label(tx.from).short} started unbonding ${shares} shares of validator ${this.label(act.validator).short}'s pool`;
+    } else if (act.type === "withdraw_unbonded") {
+      const entries = this.unbonding.get(tx.from) ?? [];
+      const ready = entries.filter((u) => u.completes_at <= this.height);
+      if (!ready.length) throw new HttpError(400, "nothing has finished unbonding");
+      a.balance += ready.reduce((t, u) => t + u.amount, 0n);
+      this.unbonding.set(tx.from, entries.filter((u) => u.completes_at > this.height));
+      summary = `${this.label(tx.from).short} withdrew their unbonded stake`;
+    } else if (act.type === "vote") {
+      if (!this.governance) throw new HttpError(400, "not active yet");
+      const p = this.proposals.find((x) => x.id === act.proposal_id);
+      if (!p) throw new HttpError(400, `no proposal #${act.proposal_id}`);
+      this.votes = this.votes.filter((v) => !(v.proposal_id === act.proposal_id && v.voter === tx.from));
+      this.votes.push({ proposal_id: act.proposal_id, voter: tx.from, aye: act.aye, amount: BigInt(act.amount), conviction: act.conviction });
+      summary = `${this.label(tx.from).short} voted ${act.aye ? "aye" : "nay"} on proposal #${act.proposal_id} with ${formatFang(BigInt(act.amount))}`;
+    } else if (act.type === "unlock") {
+      summary = `${this.label(tx.from).short} unlocked their expired vote locks`;
     } else throw new HttpError(400, `the mock node doesn't do ${act.type}`);
     a.balance -= amount + fee;
     a.nonce += 1;
     this.submitted.push(tx);
     return this.record({ tx, kind: act.type, from: tx.from, to, amount: act.type === "transfer" ? amount : null, fee, memo: tx.memo, summary });
+  }
+
+  private validators() {
+    const active = [...this.pools].map(([address, p]) => ({ validator: { ...this.label(address), name: p.name }, status: "active", p2p_addr: "203.0.113.1:30300", bond: "0", stake: p.stake.toString(), stake_display: formatFang(p.stake), commission_bps: p.commission_bps, jailed: false }));
+    return { epoch: 3, active, next_epoch: active, max_validators: 31 };
+  }
+
+  private stakingOf(account: string) {
+    const mine = this.shares.get(account) ?? new Map<string, bigint>();
+    const delegations = [...mine].filter(([, s]) => s > 0n).map(([v, shares]) => {
+      const p = this.pools.get(v) as { stake: bigint; shares: bigint; commission_bps: number };
+      return { validator: this.label(v), shares: shares.toString(), value: ((shares * p.stake) / p.shares).toString(), commission_bps: p.commission_bps };
+    });
+    const unbonding = (this.unbonding.get(account) ?? []).map((u) => ({ validator: u.validator, amount: u.amount.toString(), completes_at: u.completes_at }));
+    return { account, delegations, unbonding };
+  }
+
+  /** A proposal with its tally from the votes cast so far (weights at 0.1× … 6× conviction). */
+  private proposalView(p: Record<string, unknown>) {
+    const tenths = [1n, 10n, 20n, 30n, 40n, 50n, 60n];
+    const mine = this.votes.filter((v) => v.proposal_id === p.id);
+    const sum = (aye: boolean) => mine.filter((v) => v.aye === aye).reduce((t, v) => t + (v.amount * tenths[v.conviction]) / 10n, 0n);
+    const base = (p.tally ?? {}) as Record<string, string>;
+    const aye = BigInt(base.aye ?? "0") + sum(true);
+    const nay = BigInt(base.nay ?? "0") + sum(false);
+    return { ...p, tally: { ...base, aye: aye.toString(), nay: nay.toString() } };
   }
 
   private async handle(route: Route) {
@@ -236,6 +318,10 @@ export class MockNode {
         return reply(200, { id: this.record({ tx: null, kind: "transfer", from: FAUCET, to, amount: parseFang("100"), fee: 0n, memo: "faucet", summary: `faucet sent 100 FANG to ${this.label(to).short}` }) });
       }
       if (req.method() === "POST" && path === "/tx") return reply(200, { id: this.submit(JSON.parse(body ?? "{}") as Tx) });
+      if (req.method() === "GET" && path === "/validators") return reply(200, this.validators());
+      if (req.method() === "GET" && this.staking && (m = path.match(/^\/staking\/(.+)$/))) return reply(200, this.stakingOf(this.resolve(m[1])));
+      if (req.method() === "GET" && this.governance && path.startsWith("/proposals")) return reply(200, { proposals: this.proposals.map((p) => this.proposalView(p)) });
+      if (req.method() === "GET" && (this.staking || this.governance) && path === "/params") return reply(200, { params: { unbonding_blocks: "1814400", lock_period_blocks: "604800", proposal_deposit: (1000n * 10n ** 9n).toString() } });
       return reply(404, { error: `mock node: no route for ${req.method()} ${path}` });
     } catch (e) {
       return reply(e instanceof HttpError ? e.status : 500, { error: e instanceof Error ? e.message : String(e) });

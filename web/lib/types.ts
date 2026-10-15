@@ -73,3 +73,26 @@ export interface KeyAccounts {
   key_id: string;
   accounts: { account: Label; role: Role; label: string }[];
 }
+
+/** A validator in `/api/validators` (active, next_epoch, …). Pool fields come with staking (protocol v1). */
+export interface ValidatorView {
+  validator: Label;
+  owner?: Label;
+  status: string;
+  bond?: string;
+  bond_display?: string;
+  /** The pool's total stake, in drops. */
+  stake?: string;
+  stake_display?: string;
+  commission_bps?: number;
+  jailed?: boolean;
+  tombstoned?: boolean;
+}
+
+export interface ValidatorsView {
+  epoch: number;
+  active: ValidatorView[];
+  next_epoch?: ValidatorView[];
+  candidates?: ValidatorView[];
+  max_validators?: number;
+}
