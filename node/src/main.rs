@@ -1,16 +1,22 @@
 mod api;
+mod beacon;
 mod chain;
 mod consensus;
 mod contrib_cli;
 mod crypto;
+mod econ;
 mod epochs;
 mod github;
+mod governance;
 mod snapshot;
+mod staking;
 mod state;
 mod node;
+mod params;
 mod pq;
 mod poc;
 mod types;
+mod upgrade;
 mod validator_cli;
 
 #[cfg(test)]
@@ -186,7 +192,8 @@ fn main() -> Result<()> {
             }
             if !home.join("genesis.json").exists() {
                 let dev = SummonOpts::new("blockula-dev", 1);
-                Chain::summon(&home, &SummonOpts { http_port: Some(port), contribution: Some(poc::PocTimes::dev(dev.block_time_ms)), ..dev })?;
+                let params = params::ChainParams::dev_overrides(dev.block_time_ms, dev.epoch_blocks);
+                Chain::summon(&home, &SummonOpts { http_port: Some(port), contribution: Some(poc::PocTimes::dev(dev.block_time_ms)), params, ..dev })?;
             }
             node::run_validator(home, net_opts(net, Some(port), Some("local".into()), true))
         }
@@ -210,6 +217,7 @@ fn main() -> Result<()> {
                     poc::PocTimes { seance_blocks: seance_blocks.unwrap_or(d.seance_blocks), claim_maturity_blocks: claim_maturity_blocks.unwrap_or(d.claim_maturity_blocks), vesting_blocks: vesting_blocks.unwrap_or(d.vesting_blocks), ..d }
                 }),
                 address_prefix,
+                params: Default::default(),
             };
             let homes = Chain::summon(&home, &opts)?;
             let g = chain::Genesis::load(&homes[0].join("genesis.json"))?;
@@ -218,7 +226,7 @@ fn main() -> Result<()> {
                 println!("   blockula run --home {}    # http://{}  p2p {}", h.display(), v.http_addr, v.p2p_addr);
             }
             println!("   genesis hash: {}  (joiners can pin it with --genesis-hash)", hex::encode(consensus::genesis_block(&g).digest_bytes()));
-            println!("   epochs: {} blocks · min bond: {} · validator admins: {}", g.epoch_blocks, types::fmt_fang(g.min_bond), g.validator_admins.join(", "));
+            println!("   epochs: {} blocks · min self-bond: {} · validator admins: {}", g.epoch_blocks, types::fmt_fang(g.chain_params()?.min_self_bond), g.validator_admins.join(", "));
             println!("   (Edit validators[].p2p_addr / http_addr in genesis.json before the first start if nodes will be reached at other addresses; every node must use the same file.)");
             Ok(())
         }

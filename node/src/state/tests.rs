@@ -349,26 +349,65 @@ fn snapshots_reject_tampering() {
     std::fs::remove_dir_all(&s.home).ok();
 }
 
+/// Namespaces are never shared, and each protocol v1 module's sit in its reserved range (the
+/// maps a state lists are checked against them too); META keys are distinct.
+#[test]
+fn namespaces_and_meta_keys_are_unique() {
+    let reserved = [
+        (ns::STAKE_POOLS, 32..=36),
+        (ns::STAKE_DELEGATIONS, 32..=36),
+        (ns::STAKE_UNBONDING, 32..=36),
+        (ns::STAKE_EVIDENCE, 32..=36),
+        (ns::STAKE_LIVENESS, 32..=36),
+        (ns::GOV_PROPOSALS, 37..=42),
+        (ns::GOV_VOTES, 37..=42),
+        (ns::GOV_MULTISIGS, 37..=42),
+        (ns::GOV_MULTISIG_PROPOSALS, 37..=42),
+        (ns::GOV_DISTRIBUTIONS, 37..=42),
+        (ns::GOV_DISTRIBUTION_CLAIMS, 37..=42),
+        (ns::RESERVED_NAMES, 43..=43),
+        (ns::BEACON_COMMITS, 44..=46),
+        (ns::BEACON_REVEALS, 44..=46),
+        (ns::BEACON_VALUES, 44..=46),
+        (ns::FEATURES, 47..=47),
+    ];
+    let mut seen = std::collections::BTreeSet::from([ns::META]);
+    let st = State::default();
+    for (n, _) in st.tables() {
+        assert!(seen.insert(n) || reserved.iter().any(|(r, _)| *r == n), "namespace {n} is used twice");
+    }
+    for (n, range) in reserved {
+        assert!(range.contains(&n), "namespace {n} is outside its module's range");
+        assert!(!(1..=25).contains(&n) && !(48..=63).contains(&n), "namespace {n} collides with the base state or Ghost Mode");
+        seen.insert(n);
+    }
+    assert_eq!(seen.len(), 1 + 18 + 16, "every namespace is distinct");
+    let keys = [meta::BURNED, meta::CHAIN_PARAMS, meta::NEXT_HUNT_ID, meta::PARAMS, meta::POC, meta::SCHEMA, meta::SUPPLY, meta::STAKING, meta::GOVERNANCE, meta::ECON, meta::BEACON, meta::UPGRADE];
+    assert_eq!(keys.iter().collect::<std::collections::BTreeSet<_>>().len(), keys.len());
+    assert!(st.meta_records().iter().all(|(k, _)| keys.contains(k)), "every scalar record uses a declared key");
+}
+
 /// Format change detectors: a record's bytes and a fixed state's root. The root was also
 /// computed by an independent JS implementation of the record layout and tree (noble BLAKE3),
-/// recomputed when `Params` gained `address_prefix` (P-WIRE).
+/// recomputed when `Params` gained `address_prefix` (P-WIRE) and again for the protocol v1
+/// scaffold (schema 2: `chain_params`, the upgrade schedule, account locks).
 #[test]
 fn golden_encodings() {
-    let acct = Account { balance: 5, nonce: 2, keys: Default::default() };
-    assert_eq!(hex::encode(codec::encode(&acct)), "0500000000000000020000000000000000000000");
+    let acct = Account { balance: 5, nonce: 2, keys: Default::default(), locks: vec![] };
+    assert_eq!(hex::encode(codec::encode(&acct)), "050000000000000002000000000000000000000000000000");
     let mut st = State::default();
     st.accounts.insert("boo1alice".into(), acct);
     st.supply = 5;
     st.commit_block().unwrap();
     assert_eq!(st.root_hash(), st.full_root());
-    assert_eq!(st.record_count(), 7);
-    assert_eq!(st.root(), "6148e605ea145c9f5e3432953ca3090be9bf495b9ac4c3ba3af13227f0e664fb");
+    assert_eq!(st.record_count(), 9);
+    assert_eq!(st.root(), "05ab46b414a130e4f2e2c742ed46320a0e469af8ac0a8d0d7aa9493772c22517");
 }
 
 fn million_accounts() -> State {
     let mut st = State::default();
     for i in 0..1_000_000u64 {
-        st.accounts.insert(crypto::address_from_bytes(&crypto::hash(&i.to_le_bytes())), Account { balance: DROPS_PER_FANG, nonce: i % 7, keys: Default::default() });
+        st.accounts.insert(crypto::address_from_bytes(&crypto::hash(&i.to_le_bytes())), Account { balance: DROPS_PER_FANG, nonce: i % 7, ..Default::default() });
     }
     st.supply = 1_000_000 * DROPS_PER_FANG;
     st

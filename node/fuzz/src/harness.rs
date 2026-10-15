@@ -317,10 +317,16 @@ pub fn seeds() -> Vec<(&'static str, &'static str, Vec<u8>)> {
         signed_tx(&funded, 5, 0, json!({ "type": "create_hunt", "repo": "jackdishman/blockula", "issue": 7, "amount": "10000000000", "expires_at": 9000, "title": "Fuzz the decoders" })),
         signed_tx(&funded, 6, 0, json!({ "type": "reveal_votes", "seance_id": 2, "votes": "ab=", "spam": [5, 6], "salt": "pepper" })),
         signed_tx(&funded, 7, 0, json!({ "type": "attest_claim", "claim_id": 1, "ok": true, "merge_sha": "cd".repeat(20), "note": "" })),
+        // Protocol v1 tags (30–49): nested proposal kinds and actions, lists, conviction.
+        signed_tx(&funded, 8, 0, json!({ "type": "propose", "kind": { "type": "treasury_spend", "to": "alice.boo", "amount": "5000000000" }, "deposit": "1000000000000", "title": "Fund the fuzzers", "url": "https://example.com/p/1" })),
+        signed_tx(&funded, 9, 0, json!({ "type": "vote", "proposal_id": 0, "aye": true, "amount": "1000000000", "conviction": 3 })),
+        signed_tx(&funded, 10, 0, json!({ "type": "multisig_propose", "action": { "type": "delegate", "validator": funded.address(), "amount": "10000000000" } })),
+        signed_tx(&funded, 11, 0, json!({ "type": "claim_distribution", "distribution_id": 1, "amount": "7", "proof": ["ab".repeat(32), "cd".repeat(32)] })),
+        signed_tx(&funded, 12, 0, json!({ "type": "report_equivocation", "evidence": "0a".repeat(512) })),
     ];
     let wire: Vec<Vec<u8>> = txs.iter().map(Tx::to_bytes).collect();
     let mut out: Vec<(&'static str, &'static str, Vec<u8>)> = vec![];
-    for ((name, tx), bytes) in ["transfer", "transfer-to-name", "register-name", "add-session-key", "register-validator", "create-hunt", "reveal-votes", "attest-claim"].into_iter().zip(&txs).zip(&wire) {
+    for ((name, tx), bytes) in ["transfer", "transfer-to-name", "register-name", "add-session-key", "register-validator", "create-hunt", "reveal-votes", "attest-claim", "propose-treasury-spend", "vote", "multisig-propose", "claim-distribution", "report-equivocation"].into_iter().zip(&txs).zip(&wire) {
         out.push(("tx_json", name, serde_json::to_vec(tx).unwrap()));
         out.push(("tx_wire", name, bytes.clone()));
     }
@@ -329,7 +335,7 @@ pub fn seeds() -> Vec<(&'static str, &'static str, Vec<u8>)> {
     let genesis_block = consensus::genesis_block(g);
     let root = consensus::hex_32(&g.initial_state().root());
     let mut chain = vec![genesis_block.clone()];
-    for (h, txs) in [(1, wire[..2].to_vec()), (2, vec![]), (3, vec![wire[2].clone()]), (4, wire[3..].to_vec())] {
+    for (h, txs) in [(1, wire[..2].to_vec()), (2, vec![]), (3, vec![wire[2].clone()]), (4, wire[3..8].to_vec())] {
         let parent = chain.last().unwrap();
         chain.push(CBlock::new(parent.digest(), h, h, h - 1, GENESIS_MS + 1000 * h, funded.address(), 0, root, txs));
     }

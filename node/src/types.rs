@@ -154,6 +154,123 @@ pub enum Action {
     WithdrawVested {},
     /// Season 0 admins: return an account's unvested rewards to the pool.
     Clawback { account: String, reason: String },
+
+    // ---- protocol v1 (MAINNET-DESIGN 3.1, tags 30–49; until a module lands they fail with
+    // "not active yet") ----
+    /// Stake `amount` in a validator's pool (staking.rs).
+    Delegate {
+        validator: String,
+        #[serde(with = "u64_str")]
+        amount: u64,
+    },
+    /// Start unbonding `shares` of a pool; `WithdrawUnbonded` pays them out after `unbonding_blocks`.
+    Undelegate {
+        validator: String,
+        #[serde(with = "u64_str")]
+        shares: u64,
+    },
+    /// Move `shares` from one pool to another without unbonding.
+    Redelegate {
+        from_validator: String,
+        to_validator: String,
+        #[serde(with = "u64_str")]
+        shares: u64,
+    },
+    /// Withdraw every unbonding entry that has finished.
+    WithdrawUnbonded {},
+    /// A validator's owner sets its commission and, when non-empty, its addresses.
+    UpdateValidator { commission_bps: u64, p2p_addr: String, http_addr: String },
+    /// Return a jailed validator to the candidates once `jail_blocks` have passed.
+    Unjail { validator: String },
+    /// Two conflicting signed votes by one validator: hex, at most `MAX_EVIDENCE_BYTES` bytes.
+    ReportEquivocation { evidence: String },
+    /// An active validator's commitment (hex BLAKE3 of its secret) to the beacon for `epoch` (beacon.rs).
+    BeaconCommit { epoch: u64, commitment: String },
+    /// The 32-byte hex secret behind an earlier commitment.
+    BeaconReveal { epoch: u64, secret: String },
+    /// Put `kind` to a vote, bonding `deposit` (governance.rs). `url` links the full text.
+    Propose {
+        kind: ProposalKind,
+        #[serde(with = "u64_str")]
+        deposit: u64,
+        title: String,
+        #[serde(default)]
+        url: String,
+    },
+    /// Vote with `amount` of the voter's own unlocked holdings, locked for `conviction` (0–6)
+    /// lock periods: weight is amount × 0.1 with no lock, then 1×–6× for 1–32 periods.
+    Vote {
+        proposal_id: u64,
+        aye: bool,
+        #[serde(with = "u64_str")]
+        amount: u64,
+        conviction: u8,
+    },
+    /// Release the vote locks that have expired.
+    Unlock {},
+    /// Make this account an M-of-N multisig of its owner keys (`owners` are key ids).
+    MultisigCreate { owners: Vec<String>, threshold: u8 },
+    /// A multisig owner proposes an action for the account (never another multisig proposal);
+    /// it runs once `threshold` owners approve.
+    MultisigPropose { action: Box<Action> },
+    MultisigApprove { id: u64 },
+    /// Extend a name you own by `years` (econ.rs).
+    RenewName { name: String, years: u8 },
+    /// Give a name you own to another account (address or name).
+    TransferName { name: String, to: String },
+    /// Give up a name you own; anyone may register it again.
+    ReleaseName { name: String },
+    /// Claim `amount` from a community distribution: `proof` is the Merkle path (hex 32-byte
+    /// hashes) from the leaf `(distribution_id, address, amount)` to the distribution's root.
+    ClaimDistribution {
+        distribution_id: u64,
+        #[serde(with = "u64_str")]
+        amount: u64,
+        proof: Vec<String>,
+    },
+    /// Validators only: a matured claim's PR was reverted, by the 40-hex commit `revert_sha`.
+    AttestRevert { claim_id: u64, revert_sha: String },
+}
+
+/// What a `Propose` asks for: every former admin lever, plus parameters, spending, upgrades and
+/// features (MAINNET-DESIGN 3.5). Encoded after its own tag byte, in this order.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProposalKind {
+    /// Set a `ChainParams` key (params.rs), within its bounds.
+    ParamChange {
+        key: String,
+        #[serde(with = "u64_str")]
+        value: u64,
+    },
+    /// Pay `amount` from the treasury to `to` (address or name).
+    TreasurySpend {
+        to: String,
+        #[serde(with = "u64_str")]
+        amount: u64,
+    },
+    /// Open a community distribution of `total` from the community account, claimable with
+    /// Merkle proofs against `merkle_root` until `claim_until`.
+    Distribution {
+        merkle_root: String,
+        #[serde(with = "u64_str")]
+        total: u64,
+        claim_until: u64,
+    },
+    SetRepo { repo: String, weight: u64 },
+    /// Bounded like the admin grant (milli-Soul, at most `MAX_SOUL_GRANT`).
+    GrantSoul { to: String, amount: u64, reason: String },
+    FlagSybil { account: String, reason: String },
+    RejectClaim { claim_id: u64, reason: String },
+    Clawback { account: String, reason: String },
+    UnlinkGithub { handle: String },
+    /// Refund an open hunt's funders (nobody can redirect its escrow).
+    RefundHunt { hunt_id: u64 },
+    ScheduleUpgrade { version: u32, activation_height: u64 },
+    ActivateFeature { feature: String },
+    DeactivateFeature { feature: String },
+    /// No on-chain effect: a signal.
+    Text {},
 }
 
 /// What a key is allowed to do on an account.
@@ -248,6 +365,13 @@ fn put_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
+fn put_strs(out: &mut Vec<u8>, xs: &[String]) {
+    out.extend_from_slice(&(xs.len() as u16).to_le_bytes());
+    for x in xs {
+        put_str(out, x);
+    }
+}
+
 /// Bounds-checked cursor over a tx's wire bytes (the inverse of `put_*`).
 struct Reader<'a> {
     buf: &'a [u8],
@@ -269,6 +393,10 @@ impl<'a> Reader<'a> {
 
     fn u16(&mut self) -> Result<u16> {
         Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
 
     fn u64(&mut self) -> Result<u64> {
@@ -304,6 +432,14 @@ impl<'a> Reader<'a> {
         }
         (0..n).map(|_| self.u64()).collect()
     }
+
+    fn strs(&mut self, field: &str, max: usize, max_len: usize) -> Result<Vec<String>> {
+        let n = self.u16()? as usize;
+        if n > max {
+            bail!("`{field}` has too many entries ({n}, max {max})");
+        }
+        (0..n).map(|_| self.str(field, max_len)).collect()
+    }
 }
 
 /// Longest `chain_id`.
@@ -316,6 +452,18 @@ pub const MAX_GITHUB_HANDLE: usize = 39;
 pub const MAX_REPO: usize = 140;
 /// Hex key ids, commitments and the like (32 bytes).
 const HEX_32: usize = 64;
+/// Largest equivocation evidence (decoded bytes): two signed votes fit with room to spare.
+pub const MAX_EVIDENCE_BYTES: usize = 16 << 10;
+pub const MAX_PROPOSAL_TITLE: usize = 96;
+pub const MAX_URL: usize = 200;
+/// Longest Merkle proof a distribution claim may carry (a tree of up to 2^64 leaves).
+pub const MAX_PROOF: usize = 64;
+/// Longest feature name (`ActivateFeature`).
+pub const MAX_FEATURE: usize = 32;
+/// Longest `ChainParams` key.
+pub const MAX_PARAM_KEY: usize = 64;
+/// `RenewName` renews for 1 to this many years at once.
+pub const MAX_RENEW_YEARS: u8 = 10;
 
 /// What a juror commits to before revealing (hashed with BLAKE3). Mirrored in sdk-ts/src/tx.ts
 /// `seanceCommitment`.
@@ -488,12 +636,131 @@ impl Action {
                 put_str(out, account);
                 put_str(out, reason);
             }
+            Action::Delegate { validator, amount } => {
+                out.push(30);
+                put_str(out, validator);
+                put_u64(out, *amount);
+            }
+            Action::Undelegate { validator, shares } => {
+                out.push(31);
+                put_str(out, validator);
+                put_u64(out, *shares);
+            }
+            Action::Redelegate { from_validator, to_validator, shares } => {
+                out.push(32);
+                put_str(out, from_validator);
+                put_str(out, to_validator);
+                put_u64(out, *shares);
+            }
+            Action::WithdrawUnbonded {} => out.push(33),
+            Action::UpdateValidator { commission_bps, p2p_addr, http_addr } => {
+                out.push(34);
+                put_u64(out, *commission_bps);
+                put_str(out, p2p_addr);
+                put_str(out, http_addr);
+            }
+            Action::Unjail { validator } => {
+                out.push(35);
+                put_str(out, validator);
+            }
+            Action::ReportEquivocation { evidence } => {
+                out.push(36);
+                put_str(out, evidence);
+            }
+            Action::BeaconCommit { epoch, commitment } => {
+                out.push(37);
+                put_u64(out, *epoch);
+                put_str(out, commitment);
+            }
+            Action::BeaconReveal { epoch, secret } => {
+                out.push(38);
+                put_u64(out, *epoch);
+                put_str(out, secret);
+            }
+            Action::Propose { kind, deposit, title, url } => {
+                out.push(39);
+                kind.encode(out);
+                put_u64(out, *deposit);
+                put_str(out, title);
+                put_str(out, url);
+            }
+            Action::Vote { proposal_id, aye, amount, conviction } => {
+                out.push(40);
+                put_u64(out, *proposal_id);
+                out.push(*aye as u8);
+                put_u64(out, *amount);
+                out.push(*conviction);
+            }
+            Action::Unlock {} => out.push(41),
+            Action::MultisigCreate { owners, threshold } => {
+                out.push(42);
+                put_strs(out, owners);
+                out.push(*threshold);
+            }
+            Action::MultisigPropose { action } => {
+                out.push(43);
+                action.encode(out);
+            }
+            Action::MultisigApprove { id } => {
+                out.push(44);
+                put_u64(out, *id);
+            }
+            Action::RenewName { name, years } => {
+                out.push(45);
+                put_str(out, name);
+                out.push(*years);
+            }
+            Action::TransferName { name, to } => {
+                out.push(46);
+                put_str(out, name);
+                put_str(out, to);
+            }
+            Action::ReleaseName { name } => {
+                out.push(47);
+                put_str(out, name);
+            }
+            Action::ClaimDistribution { distribution_id, amount, proof } => {
+                out.push(48);
+                put_u64(out, *distribution_id);
+                put_u64(out, *amount);
+                put_strs(out, proof);
+            }
+            Action::AttestRevert { claim_id, revert_sha } => {
+                out.push(49);
+                put_u64(out, *claim_id);
+                put_str(out, revert_sha);
+            }
         }
+    }
+
+    /// The action's encoding on its own (tag and fields, as inside the signing bytes): how state
+    /// records store actions, e.g. pending multisig proposals.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = vec![];
+        self.encode(&mut out);
+        out
+    }
+
+    /// Strict inverse of [`Action::to_bytes`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn from_bytes(bytes: &[u8]) -> Result<Action> {
+        let mut r = Reader { buf: bytes };
+        let a = Action::decode(&mut r)?;
+        if !r.buf.is_empty() {
+            bail!("{} trailing bytes after the action", r.buf.len());
+        }
+        Ok(a)
     }
 
     /// Strict inverse of [`Action::encode`]: unknown tags, non-0/1 bools and over-long fields
     /// are errors.
     fn decode(r: &mut Reader) -> Result<Action> {
+        Self::decode_at(r, false)
+    }
+
+    /// `nested`: inside a `MultisigPropose`, which can't hold another one.
+    fn decode_at(r: &mut Reader, nested: bool) -> Result<Action> {
         use crate::poc::{MAX_SEANCE_CLAIMS, PAIRS_PER_JUROR};
         let hex_pk = crypto::PUBLIC_KEY_LEN * 2;
         let hex_sig = crypto::SIGNATURE_LEN * 2;
@@ -542,132 +809,33 @@ impl Action {
             27 => Action::FundPool { amount: r.u64()? },
             28 => Action::WithdrawVested {},
             29 => Action::Clawback { account: r.str("account", MAX_NAME_FIELD)?, reason: r.str("reason", MAX_REASON)? },
+            30 => Action::Delegate { validator: r.str("validator", MAX_ADDRESS)?, amount: r.u64()? },
+            31 => Action::Undelegate { validator: r.str("validator", MAX_ADDRESS)?, shares: r.u64()? },
+            32 => Action::Redelegate { from_validator: r.str("from_validator", MAX_ADDRESS)?, to_validator: r.str("to_validator", MAX_ADDRESS)?, shares: r.u64()? },
+            33 => Action::WithdrawUnbonded {},
+            34 => Action::UpdateValidator { commission_bps: r.u64()?, p2p_addr: r.str("p2p_addr", MAX_ADDR)?, http_addr: r.str("http_addr", MAX_ADDR)? },
+            35 => Action::Unjail { validator: r.str("validator", MAX_ADDRESS)? },
+            36 => Action::ReportEquivocation { evidence: r.str("evidence", 2 * MAX_EVIDENCE_BYTES)? },
+            37 => Action::BeaconCommit { epoch: r.u64()?, commitment: r.str("commitment", HEX_32)? },
+            38 => Action::BeaconReveal { epoch: r.u64()?, secret: r.str("secret", HEX_32)? },
+            39 => Action::Propose { kind: ProposalKind::decode(r)?, deposit: r.u64()?, title: r.str("title", MAX_PROPOSAL_TITLE)?, url: r.str("url", MAX_URL)? },
+            40 => Action::Vote { proposal_id: r.u64()?, aye: r.bool("aye")?, amount: r.u64()?, conviction: r.u8()? },
+            41 => Action::Unlock {},
+            42 => Action::MultisigCreate { owners: r.strs("owners", crate::chain::MAX_KEYS, HEX_32)?, threshold: r.u8()? },
+            43 if nested => bail!("a multisig proposal can't contain another"),
+            43 => Action::MultisigPropose { action: Box::new(Action::decode_at(r, true)?) },
+            44 => Action::MultisigApprove { id: r.u64()? },
+            45 => Action::RenewName { name: r.str("name", MAX_NAME_FIELD)?, years: r.u8()? },
+            46 => Action::TransferName { name: r.str("name", MAX_NAME_FIELD)?, to: r.str("to", MAX_NAME_FIELD)? },
+            47 => Action::ReleaseName { name: r.str("name", MAX_NAME_FIELD)? },
+            48 => Action::ClaimDistribution { distribution_id: r.u64()?, amount: r.u64()?, proof: r.strs("proof", MAX_PROOF, HEX_32)? },
+            49 => Action::AttestRevert { claim_id: r.u64()?, revert_sha: r.str("revert_sha", 40)? },
             t => bail!("unknown action tag {t}"),
         })
     }
 
-    /// Fields that name an account and may hold a raw address (names resolve on this chain).
-    pub fn addresses(&self) -> Vec<(&'static str, &str)> {
-        match self {
-            Action::Transfer { to, .. } | Action::AwardHunt { to, .. } | Action::GrantSoul { to, .. } => vec![("to", to.as_str())],
-            Action::ApproveValidator { validator } | Action::RemoveValidator { validator } | Action::Unbond { validator } => vec![("validator", validator.as_str())],
-            Action::Vouch { account } | Action::Unvouch { account } | Action::FlagSybil { account, .. } | Action::Clawback { account, .. } => vec![("account", account.as_str())],
-            _ => vec![],
-        }
-    }
-}
-
-impl Tx {
-    /// Canonical encoding that gets signed. Mirrored exactly in sdk-ts/src/tx.ts.
-    pub fn signing_bytes(&self) -> Vec<u8> {
-        let mut out = TX_DOMAIN.to_vec();
-        put_str(&mut out, &self.chain_id);
-        put_str(&mut out, &self.from);
-        put_u64(&mut out, self.nonce);
-        put_u64(&mut out, self.fee);
-        put_u64(&mut out, self.tip);
-        put_u64(&mut out, self.valid_until);
-        self.action.encode(&mut out);
-        put_str(&mut out, &self.memo);
-        out
-    }
-
-    /// Wire form: `signing_bytes ‖ public_key (1,952 B) ‖ signature (3,309 B)`. Blocks and
-    /// mempool gossip carry this; [`Tx::from_bytes`] is its strict inverse. Only txs that pass
-    /// [`Tx::check_format`] round-trip (malformed hex is written as zeros).
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let raw = |h: &str| hex::decode(h).unwrap_or_else(|_| vec![0; h.len() / 2]);
-        let mut out = self.signing_bytes();
-        out.extend_from_slice(&raw(&self.public_key));
-        out.extend_from_slice(&raw(&self.signature));
-        out
-    }
-
-    /// Parses the wire form. Strict: no trailing bytes, valid UTF-8, known tags, canonical
-    /// bools and options, fields within their bounds, and the bytes must be exactly what
-    /// `to_bytes` produces for the result.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Tx> {
-        if bytes.len() > MAX_TX_BYTES {
-            bail!("transaction too large ({} bytes, max {MAX_TX_BYTES})", bytes.len());
-        }
-        let mut r = Reader { buf: bytes };
-        if r.take(TX_DOMAIN.len())? != TX_DOMAIN {
-            bail!("not a v3 transaction");
-        }
-        let tx = Tx {
-            chain_id: r.str("chain_id", MAX_CHAIN_ID)?,
-            from: r.str("from", MAX_ADDRESS)?,
-            nonce: r.u64()?,
-            fee: r.u64()?,
-            tip: r.u64()?,
-            valid_until: r.u64()?,
-            action: Action::decode(&mut r)?,
-            memo: r.str("memo", MAX_MEMO)?,
-            public_key: hex::encode(r.take(crypto::PUBLIC_KEY_LEN)?),
-            signature: hex::encode(r.take(crypto::SIGNATURE_LEN)?),
-        };
-        if !r.buf.is_empty() {
-            bail!("{} trailing bytes after the transaction", r.buf.len());
-        }
-        if tx.to_bytes() != bytes {
-            bail!("non-canonical transaction encoding");
-        }
-        Ok(tx)
-    }
-
-    /// What this tx is charged: the burned base fee for its size plus the proposer's tip
-    /// (`None` on overflow). It must be at most `fee`. Until the fee market (MAINNET-DESIGN
-    /// 3.6) lands, the base fee is `min_fee(size)`.
-    pub fn charge(&self) -> Option<u64> {
-        min_fee(self.size()).checked_add(self.tip)
-    }
-
-    /// `from` and every account the action names by address must use this chain's prefix.
-    pub fn check_prefix(&self, prefix: &str) -> Result<()> {
-        for (field, addr) in std::iter::once(("from", self.from.as_str())).chain(self.action.addresses()) {
-            if let Some((p, _)) = crypto::parse_address(addr) {
-                if p != prefix {
-                    bail!("`{field}` is a {p} ({}) address, but this chain's addresses start with {prefix}1", crypto::network_of(p));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// BLAKE3 over the signed bytes and the *decoded* signature, so re-encoding the hex
-    /// (e.g. uppercase) can't produce a different id for the same tx.
-    pub fn id(&self) -> String {
-        let mut b = self.signing_bytes();
-        match hex::decode(&self.signature) {
-            Ok(sig) => b.extend_from_slice(&sig),
-            Err(_) => b.extend_from_slice(self.signature.as_bytes()),
-        }
-        hex::encode(crypto::hash(&b))
-    }
-
-    /// Size/format rules every tx must meet before anything else looks at it: canonical
-    /// lowercase hex and addresses, capped string fields, the wire size limit, and an exact
-    /// round trip through the wire form.
-    pub fn check_format(&self) -> Result<()> {
-        let size = self.size() as usize;
-        if size > MAX_TX_BYTES {
-            bail!("transaction too large ({size} bytes, max {MAX_TX_BYTES})");
-        }
-        if self.chain_id.len() > MAX_CHAIN_ID {
-            bail!("chain_id too long");
-        }
-        if !crypto::is_address(&self.from) {
-            bail!("`from` must be a lowercase address (boo1… or tboo1…)");
-        }
-        if self.memo.len() > MAX_MEMO {
-            bail!("memo too long (max {MAX_MEMO} bytes)");
-        }
-        if !crypto::is_lower_hex(&self.public_key) || self.public_key.len() != crypto::PUBLIC_KEY_LEN * 2 {
-            bail!("public_key must be {} bytes of lowercase hex", crypto::PUBLIC_KEY_LEN);
-        }
-        if !crypto::is_lower_hex(&self.signature) || self.signature.len() != crypto::SIGNATURE_LEN * 2 {
-            bail!("signature must be {} bytes of lowercase hex", crypto::SIGNATURE_LEN);
-        }
+    /// The action's own format rules (`Tx::check_format`). `nested`: inside a `MultisigPropose`.
+    fn check_format(&self, nested: bool) -> Result<()> {
         let key_id_ok = |k: &str| k.len() == 64 && crypto::is_lower_hex(k);
         let addr = |field: &str, v: &str| -> Result<()> {
             if v.len() > MAX_ADDR {
@@ -675,7 +843,7 @@ impl Tx {
             }
             crate::chain::check_host_port(v).with_context(|| field.to_string())
         };
-        match &self.action {
+        match self {
             Action::Transfer { to, .. } => {
                 if to.len() > MAX_NAME_FIELD {
                     bail!("`to` too long (max {MAX_NAME_FIELD} bytes)");
@@ -824,7 +992,463 @@ impl Tx {
                 }
             }
             Action::JoinJury { .. } | Action::LeaveJury {} | Action::FundPool { .. } | Action::WithdrawVested {} => {}
+            Action::Delegate { validator, amount } => {
+                check_address("validator", validator)?;
+                if *amount == 0 {
+                    bail!("delegate more than 0");
+                }
+            }
+            Action::Undelegate { validator, shares } => {
+                check_address("validator", validator)?;
+                if *shares == 0 {
+                    bail!("undelegate more than 0 shares");
+                }
+            }
+            Action::Redelegate { from_validator, to_validator, shares } => {
+                check_address("from_validator", from_validator)?;
+                check_address("to_validator", to_validator)?;
+                if from_validator == to_validator {
+                    bail!("redelegate to a different validator");
+                }
+                if *shares == 0 {
+                    bail!("redelegate more than 0 shares");
+                }
+            }
+            Action::Unjail { validator } => check_address("validator", validator)?,
+            Action::UpdateValidator { commission_bps, p2p_addr, http_addr } => {
+                if *commission_bps > 10_000 {
+                    bail!("commission_bps must be 0–10000");
+                }
+                if !p2p_addr.is_empty() {
+                    addr("p2p_addr", p2p_addr)?;
+                }
+                if !http_addr.is_empty() {
+                    crate::chain::check_http_addr(http_addr).context("http_addr")?;
+                }
+            }
+            Action::ReportEquivocation { evidence } => {
+                if evidence.is_empty() || evidence.len() > 2 * MAX_EVIDENCE_BYTES || !crypto::is_lower_hex(evidence) {
+                    bail!("evidence must be 1–{MAX_EVIDENCE_BYTES} bytes of lowercase hex");
+                }
+            }
+            Action::BeaconCommit { commitment, .. } => check_hex_32("commitment", commitment)?,
+            Action::BeaconReveal { secret, .. } => check_hex_32("secret", secret)?,
+            Action::Propose { kind, deposit, title, url } => {
+                kind.check()?;
+                if *deposit == 0 {
+                    bail!("a proposal bonds a deposit");
+                }
+                if title.trim().is_empty() || title.len() > MAX_PROPOSAL_TITLE || title.chars().any(|c| c.is_control()) {
+                    bail!("title must be 1–{MAX_PROPOSAL_TITLE} bytes with no control characters");
+                }
+                if !url.is_empty() && (url.len() > MAX_URL || !url.starts_with("https://") || url.chars().any(|c| c.is_control() || c.is_whitespace())) {
+                    bail!("url must be empty or an https:// link of at most {MAX_URL} bytes");
+                }
+            }
+            Action::Vote { amount, conviction, .. } => {
+                if *amount == 0 {
+                    bail!("vote with more than 0");
+                }
+                if *conviction > crate::params::MAX_CONVICTION {
+                    bail!("conviction must be 0–{}", crate::params::MAX_CONVICTION);
+                }
+            }
+            Action::WithdrawUnbonded {} | Action::Unlock {} | Action::MultisigApprove { .. } => {}
+            Action::MultisigCreate { owners, threshold } => {
+                if owners.is_empty() || owners.len() > crate::chain::MAX_KEYS || !owners.iter().all(|k| key_id_ok(k)) {
+                    bail!("owners must be 1–{} key ids (32 bytes of lowercase hex)", crate::chain::MAX_KEYS);
+                }
+                if owners.iter().collect::<std::collections::BTreeSet<_>>().len() != owners.len() {
+                    bail!("owners must be distinct");
+                }
+                if *threshold == 0 || *threshold as usize > owners.len() {
+                    bail!("threshold must be 1–{} (the number of owners)", owners.len());
+                }
+            }
+            Action::MultisigPropose { action } => {
+                if nested || matches!(**action, Action::MultisigPropose { .. } | Action::MultisigApprove { .. }) {
+                    bail!("a multisig proposal can't hold another multisig proposal or approval");
+                }
+                action.check_format(true).context("the proposed action")?;
+            }
+            Action::RenewName { name, years } => {
+                check_name_field(name)?;
+                if *years == 0 || *years > MAX_RENEW_YEARS {
+                    bail!("renew for 1–{MAX_RENEW_YEARS} years");
+                }
+            }
+            Action::TransferName { name, to } => {
+                check_name_field(name)?;
+                check_account_ref("to", to)?;
+            }
+            Action::ReleaseName { name } => check_name_field(name)?,
+            Action::ClaimDistribution { amount, proof, .. } => {
+                if *amount == 0 {
+                    bail!("claim more than 0");
+                }
+                if proof.len() > MAX_PROOF {
+                    bail!("proof too long (max {MAX_PROOF} hashes)");
+                }
+                for h in proof {
+                    check_hex_32("proof", h)?;
+                }
+            }
+            Action::AttestRevert { revert_sha, .. } => {
+                if revert_sha.len() != 40 || !crypto::is_lower_hex(revert_sha) {
+                    bail!("revert_sha must be the 40-hex revert commit");
+                }
+            }
         }
+        Ok(())
+    }
+
+    /// The action's JSON `type` (snake_case), e.g. `"delegate"`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Action::Transfer { .. } => "transfer",
+            Action::RegisterName { .. } => "register_name",
+            Action::AddKey { .. } => "add_key",
+            Action::RemoveKey { .. } => "remove_key",
+            Action::RegisterValidator { .. } => "register_validator",
+            Action::ApproveValidator { .. } => "approve_validator",
+            Action::RemoveValidator { .. } => "remove_validator",
+            Action::Unbond { .. } => "unbond",
+            Action::LinkGithub { .. } => "link_github",
+            Action::UnlinkGithub { .. } => "unlink_github",
+            Action::CreateHunt { .. } => "create_hunt",
+            Action::FundHunt { .. } => "fund_hunt",
+            Action::AwardHunt { .. } => "award_hunt",
+            Action::CancelHunt { .. } => "cancel_hunt",
+            Action::RegisterFamiliar { .. } => "register_familiar",
+            Action::SetRepo { .. } => "set_repo",
+            Action::GrantSoul { .. } => "grant_soul",
+            Action::Vouch { .. } => "vouch",
+            Action::Unvouch { .. } => "unvouch",
+            Action::FlagSybil { .. } => "flag_sybil",
+            Action::SubmitClaim { .. } => "submit_claim",
+            Action::AttestClaim { .. } => "attest_claim",
+            Action::RejectClaim { .. } => "reject_claim",
+            Action::JoinJury { .. } => "join_jury",
+            Action::LeaveJury {} => "leave_jury",
+            Action::CommitVotes { .. } => "commit_votes",
+            Action::RevealVotes { .. } => "reveal_votes",
+            Action::FundPool { .. } => "fund_pool",
+            Action::WithdrawVested {} => "withdraw_vested",
+            Action::Clawback { .. } => "clawback",
+            Action::Delegate { .. } => "delegate",
+            Action::Undelegate { .. } => "undelegate",
+            Action::Redelegate { .. } => "redelegate",
+            Action::WithdrawUnbonded {} => "withdraw_unbonded",
+            Action::UpdateValidator { .. } => "update_validator",
+            Action::Unjail { .. } => "unjail",
+            Action::ReportEquivocation { .. } => "report_equivocation",
+            Action::BeaconCommit { .. } => "beacon_commit",
+            Action::BeaconReveal { .. } => "beacon_reveal",
+            Action::Propose { .. } => "propose",
+            Action::Vote { .. } => "vote",
+            Action::Unlock {} => "unlock",
+            Action::MultisigCreate { .. } => "multisig_create",
+            Action::MultisigPropose { .. } => "multisig_propose",
+            Action::MultisigApprove { .. } => "multisig_approve",
+            Action::RenewName { .. } => "renew_name",
+            Action::TransferName { .. } => "transfer_name",
+            Action::ReleaseName { .. } => "release_name",
+            Action::ClaimDistribution { .. } => "claim_distribution",
+            Action::AttestRevert { .. } => "attest_revert",
+        }
+    }
+
+    /// Fields that name an account and may hold a raw address (names resolve on this chain),
+    /// including those inside a proposal or a multisig proposal.
+    pub fn addresses(&self) -> Vec<(&'static str, &str)> {
+        match self {
+            Action::Transfer { to, .. } | Action::AwardHunt { to, .. } | Action::GrantSoul { to, .. } | Action::TransferName { to, .. } => vec![("to", to.as_str())],
+            Action::ApproveValidator { validator } | Action::RemoveValidator { validator } | Action::Unbond { validator } | Action::Delegate { validator, .. } | Action::Undelegate { validator, .. } | Action::Unjail { validator } => vec![("validator", validator.as_str())],
+            Action::Redelegate { from_validator, to_validator, .. } => vec![("from_validator", from_validator.as_str()), ("to_validator", to_validator.as_str())],
+            Action::Vouch { account } | Action::Unvouch { account } | Action::FlagSybil { account, .. } | Action::Clawback { account, .. } => vec![("account", account.as_str())],
+            Action::Propose { kind, .. } => match kind {
+                ProposalKind::TreasurySpend { to, .. } | ProposalKind::GrantSoul { to, .. } => vec![("kind.to", to.as_str())],
+                ProposalKind::FlagSybil { account, .. } | ProposalKind::Clawback { account, .. } => vec![("kind.account", account.as_str())],
+                _ => vec![],
+            },
+            Action::MultisigPropose { action } => action.addresses(),
+            _ => vec![],
+        }
+    }
+}
+
+impl ProposalKind {
+    fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            ProposalKind::ParamChange { key, value } => {
+                out.push(0);
+                put_str(out, key);
+                put_u64(out, *value);
+            }
+            ProposalKind::TreasurySpend { to, amount } => {
+                out.push(1);
+                put_str(out, to);
+                put_u64(out, *amount);
+            }
+            ProposalKind::Distribution { merkle_root, total, claim_until } => {
+                out.push(2);
+                put_str(out, merkle_root);
+                put_u64(out, *total);
+                put_u64(out, *claim_until);
+            }
+            ProposalKind::SetRepo { repo, weight } => {
+                out.push(3);
+                put_str(out, repo);
+                put_u64(out, *weight);
+            }
+            ProposalKind::GrantSoul { to, amount, reason } => {
+                out.push(4);
+                put_str(out, to);
+                put_u64(out, *amount);
+                put_str(out, reason);
+            }
+            ProposalKind::FlagSybil { account, reason } => {
+                out.push(5);
+                put_str(out, account);
+                put_str(out, reason);
+            }
+            ProposalKind::RejectClaim { claim_id, reason } => {
+                out.push(6);
+                put_u64(out, *claim_id);
+                put_str(out, reason);
+            }
+            ProposalKind::Clawback { account, reason } => {
+                out.push(7);
+                put_str(out, account);
+                put_str(out, reason);
+            }
+            ProposalKind::UnlinkGithub { handle } => {
+                out.push(8);
+                put_str(out, handle);
+            }
+            ProposalKind::RefundHunt { hunt_id } => {
+                out.push(9);
+                put_u64(out, *hunt_id);
+            }
+            ProposalKind::ScheduleUpgrade { version, activation_height } => {
+                out.push(10);
+                out.extend_from_slice(&version.to_le_bytes());
+                put_u64(out, *activation_height);
+            }
+            ProposalKind::ActivateFeature { feature } => {
+                out.push(11);
+                put_str(out, feature);
+            }
+            ProposalKind::DeactivateFeature { feature } => {
+                out.push(12);
+                put_str(out, feature);
+            }
+            ProposalKind::Text {} => out.push(13),
+        }
+    }
+
+    fn decode(r: &mut Reader) -> Result<ProposalKind> {
+        Ok(match r.u8()? {
+            0 => ProposalKind::ParamChange { key: r.str("key", MAX_PARAM_KEY)?, value: r.u64()? },
+            1 => ProposalKind::TreasurySpend { to: r.str("to", MAX_NAME_FIELD)?, amount: r.u64()? },
+            2 => ProposalKind::Distribution { merkle_root: r.str("merkle_root", HEX_32)?, total: r.u64()?, claim_until: r.u64()? },
+            3 => ProposalKind::SetRepo { repo: r.str("repo", MAX_REPO)?, weight: r.u64()? },
+            4 => ProposalKind::GrantSoul { to: r.str("to", MAX_NAME_FIELD)?, amount: r.u64()?, reason: r.str("reason", MAX_REASON)? },
+            5 => ProposalKind::FlagSybil { account: r.str("account", MAX_NAME_FIELD)?, reason: r.str("reason", MAX_REASON)? },
+            6 => ProposalKind::RejectClaim { claim_id: r.u64()?, reason: r.str("reason", MAX_REASON)? },
+            7 => ProposalKind::Clawback { account: r.str("account", MAX_NAME_FIELD)?, reason: r.str("reason", MAX_REASON)? },
+            8 => ProposalKind::UnlinkGithub { handle: r.str("handle", MAX_GITHUB_HANDLE)? },
+            9 => ProposalKind::RefundHunt { hunt_id: r.u64()? },
+            10 => ProposalKind::ScheduleUpgrade { version: r.u32()?, activation_height: r.u64()? },
+            11 => ProposalKind::ActivateFeature { feature: r.str("feature", MAX_FEATURE)? },
+            12 => ProposalKind::DeactivateFeature { feature: r.str("feature", MAX_FEATURE)? },
+            13 => ProposalKind::Text {},
+            t => bail!("unknown proposal kind {t}"),
+        })
+    }
+
+    /// The kind's encoding on its own (tag and fields): how proposal records store it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = vec![];
+        self.encode(&mut out);
+        out
+    }
+
+    /// Strict inverse of [`ProposalKind::to_bytes`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn from_bytes(bytes: &[u8]) -> Result<ProposalKind> {
+        let mut r = Reader { buf: bytes };
+        let k = ProposalKind::decode(&mut r)?;
+        if !r.buf.is_empty() {
+            bail!("{} trailing bytes after the proposal kind", r.buf.len());
+        }
+        Ok(k)
+    }
+
+    /// Stateless rules (stateful ones, like a parameter's bounds, apply when it executes).
+    pub fn check(&self) -> Result<()> {
+        match self {
+            ProposalKind::ParamChange { key, .. } => {
+                if !crate::params::ChainParams::KEYS.contains(&key.as_str()) {
+                    bail!("unknown parameter `{key}`");
+                }
+            }
+            ProposalKind::TreasurySpend { to, amount } => {
+                check_account_ref("to", to)?;
+                if *amount == 0 {
+                    bail!("a treasury spend must move more than 0");
+                }
+            }
+            ProposalKind::Distribution { merkle_root, total, claim_until } => {
+                check_hex_32("merkle_root", merkle_root)?;
+                if *total == 0 || *claim_until == 0 {
+                    bail!("a distribution needs a total and a claim deadline");
+                }
+            }
+            ProposalKind::SetRepo { repo, weight } => {
+                check_repo(repo)?;
+                if *weight > crate::poc::MAX_REPO_WEIGHT {
+                    bail!("repo weight must be 0–{} (0 removes the repo)", crate::poc::MAX_REPO_WEIGHT);
+                }
+            }
+            ProposalKind::GrantSoul { to, amount, reason } => {
+                check_account_ref("to", to)?;
+                if *amount == 0 || *amount > crate::poc::MAX_SOUL_GRANT {
+                    bail!("a Soul grant is 1–{} milli-Soul", crate::poc::MAX_SOUL_GRANT);
+                }
+                check_reason(reason)?;
+            }
+            ProposalKind::FlagSybil { account, reason } | ProposalKind::Clawback { account, reason } => {
+                check_account_ref("account", account)?;
+                check_reason(reason)?;
+            }
+            ProposalKind::RejectClaim { reason, .. } => check_reason(reason)?,
+            ProposalKind::UnlinkGithub { handle } => check_github_handle(handle)?,
+            ProposalKind::RefundHunt { .. } | ProposalKind::Text {} => {}
+            ProposalKind::ScheduleUpgrade { version, activation_height } => {
+                if *version == 0 || *activation_height == 0 {
+                    bail!("an upgrade needs a protocol version and an activation height");
+                }
+            }
+            ProposalKind::ActivateFeature { feature } | ProposalKind::DeactivateFeature { feature } => crate::upgrade::check_feature_name(feature)?,
+        }
+        Ok(())
+    }
+}
+
+impl Tx {
+    /// Canonical encoding that gets signed. Mirrored exactly in sdk-ts/src/tx.ts.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut out = TX_DOMAIN.to_vec();
+        put_str(&mut out, &self.chain_id);
+        put_str(&mut out, &self.from);
+        put_u64(&mut out, self.nonce);
+        put_u64(&mut out, self.fee);
+        put_u64(&mut out, self.tip);
+        put_u64(&mut out, self.valid_until);
+        self.action.encode(&mut out);
+        put_str(&mut out, &self.memo);
+        out
+    }
+
+    /// Wire form: `signing_bytes ‖ public_key (1,952 B) ‖ signature (3,309 B)`. Blocks and
+    /// mempool gossip carry this; [`Tx::from_bytes`] is its strict inverse. Only txs that pass
+    /// [`Tx::check_format`] round-trip (malformed hex is written as zeros).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let raw = |h: &str| hex::decode(h).unwrap_or_else(|_| vec![0; h.len() / 2]);
+        let mut out = self.signing_bytes();
+        out.extend_from_slice(&raw(&self.public_key));
+        out.extend_from_slice(&raw(&self.signature));
+        out
+    }
+
+    /// Parses the wire form. Strict: no trailing bytes, valid UTF-8, known tags, canonical
+    /// bools and options, fields within their bounds, and the bytes must be exactly what
+    /// `to_bytes` produces for the result.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Tx> {
+        if bytes.len() > MAX_TX_BYTES {
+            bail!("transaction too large ({} bytes, max {MAX_TX_BYTES})", bytes.len());
+        }
+        let mut r = Reader { buf: bytes };
+        if r.take(TX_DOMAIN.len())? != TX_DOMAIN {
+            bail!("not a v3 transaction");
+        }
+        let tx = Tx {
+            chain_id: r.str("chain_id", MAX_CHAIN_ID)?,
+            from: r.str("from", MAX_ADDRESS)?,
+            nonce: r.u64()?,
+            fee: r.u64()?,
+            tip: r.u64()?,
+            valid_until: r.u64()?,
+            action: Action::decode(&mut r)?,
+            memo: r.str("memo", MAX_MEMO)?,
+            public_key: hex::encode(r.take(crypto::PUBLIC_KEY_LEN)?),
+            signature: hex::encode(r.take(crypto::SIGNATURE_LEN)?),
+        };
+        if !r.buf.is_empty() {
+            bail!("{} trailing bytes after the transaction", r.buf.len());
+        }
+        if tx.to_bytes() != bytes {
+            bail!("non-canonical transaction encoding");
+        }
+        Ok(tx)
+    }
+
+    /// What this tx is charged: the burned base fee for its size plus the proposer's tip
+    /// (`None` on overflow). It must be at most `fee`. Until the fee market (MAINNET-DESIGN
+    /// 3.6) lands, the base fee is `min_fee(size)`.
+    pub fn charge(&self) -> Option<u64> {
+        min_fee(self.size()).checked_add(self.tip)
+    }
+
+    /// `from` and every account the action names by address must use this chain's prefix.
+    pub fn check_prefix(&self, prefix: &str) -> Result<()> {
+        for (field, addr) in std::iter::once(("from", self.from.as_str())).chain(self.action.addresses()) {
+            if let Some((p, _)) = crypto::parse_address(addr) {
+                if p != prefix {
+                    bail!("`{field}` is a {p} ({}) address, but this chain's addresses start with {prefix}1", crypto::network_of(p));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// BLAKE3 over the signed bytes and the *decoded* signature, so re-encoding the hex
+    /// (e.g. uppercase) can't produce a different id for the same tx.
+    pub fn id(&self) -> String {
+        let mut b = self.signing_bytes();
+        match hex::decode(&self.signature) {
+            Ok(sig) => b.extend_from_slice(&sig),
+            Err(_) => b.extend_from_slice(self.signature.as_bytes()),
+        }
+        hex::encode(crypto::hash(&b))
+    }
+
+    /// Size/format rules every tx must meet before anything else looks at it: canonical
+    /// lowercase hex and addresses, capped string fields, the wire size limit, and an exact
+    /// round trip through the wire form.
+    pub fn check_format(&self) -> Result<()> {
+        let size = self.size() as usize;
+        if size > MAX_TX_BYTES {
+            bail!("transaction too large ({size} bytes, max {MAX_TX_BYTES})");
+        }
+        if self.chain_id.len() > MAX_CHAIN_ID {
+            bail!("chain_id too long");
+        }
+        if !crypto::is_address(&self.from) {
+            bail!("`from` must be a lowercase address (boo1… or tboo1…)");
+        }
+        if self.memo.len() > MAX_MEMO {
+            bail!("memo too long (max {MAX_MEMO} bytes)");
+        }
+        if !crypto::is_lower_hex(&self.public_key) || self.public_key.len() != crypto::PUBLIC_KEY_LEN * 2 {
+            bail!("public_key must be {} bytes of lowercase hex", crypto::PUBLIC_KEY_LEN);
+        }
+        if !crypto::is_lower_hex(&self.signature) || self.signature.len() != crypto::SIGNATURE_LEN * 2 {
+            bail!("signature must be {} bytes of lowercase hex", crypto::SIGNATURE_LEN);
+        }
+        self.action.check_format(false)?;
         // Whatever the wire form can't carry exactly (e.g. `familiar_key: Some("")`) is invalid.
         match Tx::from_bytes(&self.to_bytes()) {
             Ok(back) if back == *self => Ok(()),
@@ -920,6 +1544,31 @@ pub fn check_reason(r: &str) -> Result<()> {
     Ok(())
 }
 
+/// A raw address (validators are always named by address).
+fn check_address(field: &str, v: &str) -> Result<()> {
+    if !crypto::is_address(v) {
+        bail!("`{field}` must be a lowercase boo1… address");
+    }
+    Ok(())
+}
+
+/// 32 bytes of lowercase hex.
+fn check_hex_32(field: &str, v: &str) -> Result<()> {
+    if v.len() != 64 || !crypto::is_lower_hex(v) {
+        bail!("`{field}` must be 32 bytes of lowercase hex");
+    }
+    Ok(())
+}
+
+/// A name ("jack" or "jack.boo") within the field cap.
+fn check_name_field(v: &str) -> Result<()> {
+    if v.len() > MAX_NAME_FIELD {
+        bail!("name too long");
+    }
+    normalize_name(v)?;
+    Ok(())
+}
+
 /// A `boo1…` address or a `.boo` name.
 fn check_account_ref(field: &str, v: &str) -> Result<()> {
     if v.len() > MAX_NAME_FIELD {
@@ -1009,15 +1658,20 @@ pub struct Block {
     /// failed at execution (e.g. the balance was spent by an earlier tx in the block).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub failed: std::collections::BTreeMap<usize, String>,
+    /// Wire sizes of the txs the consensus block carried that couldn't be admitted (skipped,
+    /// not in `txs`). Replay hands them to the end-of-block steps exactly as execution did
+    /// (the proposer pays for junk, MAINNET-DESIGN 3.4).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<u64>,
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use proptest::prelude::*;
 
     /// One action per tag (0–29), in tag order. Mirrored by `vectorActions` in sdk-ts/test/e2e.ts.
-    fn vector_actions() -> Vec<Action> {
+    pub(crate) fn vector_actions() -> Vec<Action> {
         vec![
             Action::Transfer { to: "x.boo".into(), amount: 5 },
             Action::RegisterName { name: "vlad".into() },
@@ -1055,6 +1709,51 @@ mod tests {
         ]
     }
 
+    /// Protocol v1 (MAINNET-DESIGN 3.1): one action per tag 30–49 (some twice, for optional or
+    /// empty fields), with every `ProposalKind` and a multisig proposal, in tag order. Mirrored by
+    /// `v1VectorActions` in sdk-ts/test/e2e.ts.
+    pub(crate) fn v1_vector_actions() -> Vec<Action> {
+        let propose = |kind: ProposalKind| Action::Propose { kind, deposit: 1_000 * DROPS_PER_FANG, title: "t".into(), url: String::new() };
+        vec![
+            Action::Delegate { validator: "boo1v".into(), amount: 5 * DROPS_PER_FANG },
+            Action::Undelegate { validator: "boo1v".into(), shares: 7 },
+            Action::Redelegate { from_validator: "boo1v".into(), to_validator: "boo1w".into(), shares: 8 },
+            Action::WithdrawUnbonded {},
+            Action::UpdateValidator { commission_bps: 500, p2p_addr: "1.2.3.4:5".into(), http_addr: "https://v.example".into() },
+            Action::UpdateValidator { commission_bps: 0, p2p_addr: String::new(), http_addr: String::new() },
+            Action::Unjail { validator: "boo1v".into() },
+            Action::ReportEquivocation { evidence: "0a0b".into() },
+            Action::BeaconCommit { epoch: 3, commitment: "ab".repeat(32) },
+            Action::BeaconReveal { epoch: 3, secret: "cd".repeat(32) },
+            Action::Propose { kind: ProposalKind::ParamChange { key: "max_validators".into(), value: 40 }, deposit: 1_000 * DROPS_PER_FANG, title: "More validators".into(), url: "https://x.example/p/1".into() },
+            propose(ProposalKind::TreasurySpend { to: "x.boo".into(), amount: 9 }),
+            propose(ProposalKind::Distribution { merkle_root: "ef".repeat(32), total: 100, claim_until: 5_000 }),
+            propose(ProposalKind::SetRepo { repo: "a/b".into(), weight: 10 }),
+            propose(ProposalKind::GrantSoul { to: "x.boo".into(), amount: 2500, reason: "r".into() }),
+            propose(ProposalKind::FlagSybil { account: "x.boo".into(), reason: "r".into() }),
+            propose(ProposalKind::RejectClaim { claim_id: 4, reason: "r".into() }),
+            propose(ProposalKind::Clawback { account: "x.boo".into(), reason: "r".into() }),
+            propose(ProposalKind::UnlinkGithub { handle: "vlad".into() }),
+            propose(ProposalKind::RefundHunt { hunt_id: 1 }),
+            propose(ProposalKind::ScheduleUpgrade { version: 2, activation_height: 100_000 }),
+            propose(ProposalKind::ActivateFeature { feature: "ghost".into() }),
+            propose(ProposalKind::DeactivateFeature { feature: "ghost".into() }),
+            propose(ProposalKind::Text {}),
+            Action::Vote { proposal_id: 1, aye: true, amount: 10, conviction: 6 },
+            Action::Vote { proposal_id: 1, aye: false, amount: 10, conviction: 0 },
+            Action::Unlock {},
+            Action::MultisigCreate { owners: vec!["ab".repeat(32), "cd".repeat(32)], threshold: 2 },
+            Action::MultisigPropose { action: Box::new(Action::Transfer { to: "x.boo".into(), amount: 5 }) },
+            Action::MultisigApprove { id: 3 },
+            Action::RenewName { name: "vlad".into(), years: 2 },
+            Action::TransferName { name: "vlad".into(), to: "x.boo".into() },
+            Action::ReleaseName { name: "vlad".into() },
+            Action::ClaimDistribution { distribution_id: 1, amount: 50, proof: vec!["ab".repeat(32), "cd".repeat(32)] },
+            Action::ClaimDistribution { distribution_id: 1, amount: 50, proof: vec![] },
+            Action::AttestRevert { claim_id: 4, revert_sha: "ef".repeat(20) },
+        ]
+    }
+
     /// The vector tx around an action: fixed fields, and recognizable key and signature bytes.
     fn vector_tx(action: Action) -> Tx {
         Tx { chain_id: "vec".into(), from: "boo1from".into(), nonce: 7, fee: 12345, tip: 3, valid_until: 99, action, memo: "m".into(), public_key: "01".repeat(crypto::PUBLIC_KEY_LEN), signature: "02".repeat(crypto::SIGNATURE_LEN) }
@@ -1081,6 +1780,25 @@ mod tests {
         assert!(matches!(a, Action::JoinJury { bond: 10 }));
         let a: Action = serde_json::from_str(r#"{"type":"attest_claim","claim_id":1,"ok":false,"merge_sha":"","note":"x"}"#).unwrap();
         assert!(matches!(a, Action::AttestClaim { ok: false, .. }));
+        // Protocol v1 (tags 30–49), hashed separately so the 0–29 vector above stays put.
+        let mut h = blake3::Hasher::new();
+        for action in v1_vector_actions() {
+            h.update(&vector_tx(action).signing_bytes());
+        }
+        assert_eq!(h.finalize().to_hex().to_string(), "fecaa54305728b6a9192b18fbbdc03d74f2199c8721a670b73b72970b2d7ba6c");
+        let p: Action = serde_json::from_str(r#"{"type":"propose","kind":{"type":"param_change","key":"max_validators","value":"40"},"deposit":"1000","title":"t"}"#).unwrap();
+        assert_eq!(p, Action::Propose { kind: ProposalKind::ParamChange { key: "max_validators".into(), value: 40 }, deposit: 1000, title: "t".into(), url: String::new() });
+        let m: Action = serde_json::from_str(r#"{"type":"multisig_propose","action":{"type":"vote","proposal_id":1,"aye":true,"amount":"5","conviction":2}}"#).unwrap();
+        assert_eq!(m, Action::MultisigPropose { action: Box::new(Action::Vote { proposal_id: 1, aye: true, amount: 5, conviction: 2 }) });
+        for a in [r#"{"type":"withdraw_unbonded"}"#, r#"{"type":"unlock"}"#, r#"{"type":"propose","kind":{"type":"text"},"deposit":"1","title":"t","url":""}"#] {
+            serde_json::from_str::<Action>(a).unwrap();
+        }
+        assert!(serde_json::from_str::<Action>(r#"{"type":"propose","kind":{"type":"text","x":1},"deposit":"1","title":"t"}"#).is_err(), "proposal kinds reject unknown fields too");
+        for a in v1_vector_actions() {
+            let json = serde_json::to_value(&a).unwrap();
+            assert_eq!(json["type"], a.kind());
+            assert_eq!(serde_json::from_value::<Action>(json).unwrap(), a);
+        }
         let t: Tx = serde_json::from_value(serde_json::json!({ "chain_id": "c", "from": "boo1from", "nonce": 1, "fee": "100", "tip": "2", "valid_until": 9, "action": { "type": "transfer", "to": "x.boo", "amount": "5" }, "memo": "", "public_key": "", "signature": "" })).unwrap();
         assert_eq!((t.fee, t.tip, t.valid_until), (100, 2, 9));
     }
@@ -1088,14 +1806,90 @@ mod tests {
     #[test]
     fn every_tag_round_trips_through_the_wire_form() {
         let mut tags = std::collections::BTreeSet::new();
-        for action in vector_actions() {
-            let mut enc = vec![];
-            action.encode(&mut enc);
+        let mut kinds = std::collections::BTreeSet::new();
+        for action in vector_actions().into_iter().chain(v1_vector_actions()) {
+            let enc = action.to_bytes();
             tags.insert(enc[0]);
+            if let Action::Propose { kind, .. } = &action {
+                kinds.insert(enc[1]);
+                assert_eq!(ProposalKind::from_bytes(&kind.to_bytes()).unwrap(), *kind);
+            }
+            assert_eq!(Action::from_bytes(&enc).unwrap(), action);
             let tx = vector_tx(action);
             assert_eq!(Tx::from_bytes(&tx.to_bytes()).unwrap(), tx);
         }
-        assert_eq!(tags, (0..=29).collect(), "the vectors cover every action tag");
+        assert_eq!(tags, (0..=49).collect(), "the vectors cover every action tag");
+        assert_eq!(kinds, (0..=13).collect(), "and every proposal kind");
+    }
+
+    #[test]
+    fn v1_actions_are_bounded() {
+        let ok = |a: Action| a.check_format(false).unwrap_or_else(|e| panic!("{a:?}: {e}"));
+        let bad = |a: Action| match a.check_format(false) {
+            Ok(()) => panic!("{a:?} should be refused"),
+            Err(e) => format!("{e:#}"),
+        };
+        let k = crypto::Keys::from_seed([7; 32]);
+        let (addr, hex32) = (k.address(), "ab".repeat(32));
+        let propose = |kind: ProposalKind| Action::Propose { kind, deposit: 1, title: "t".into(), url: String::new() };
+        ok(Action::Delegate { validator: addr.clone(), amount: 1 });
+        assert!(bad(Action::Delegate { validator: "x.boo".into(), amount: 1 }).contains("address"), "validators are named by address");
+        assert!(bad(Action::Delegate { validator: addr.clone(), amount: 0 }).contains("more than 0"));
+        assert!(bad(Action::Redelegate { from_validator: addr.clone(), to_validator: addr.clone(), shares: 1 }).contains("different"));
+        assert!(bad(Action::UpdateValidator { commission_bps: 10_001, p2p_addr: String::new(), http_addr: String::new() }).contains("0–10000"));
+        // Evidence: at most 16 KiB decoded, as lowercase hex.
+        ok(Action::ReportEquivocation { evidence: "ab".repeat(MAX_EVIDENCE_BYTES) });
+        assert!(bad(Action::ReportEquivocation { evidence: "ab".repeat(MAX_EVIDENCE_BYTES + 1) }).contains("16384"));
+        assert!(bad(Action::ReportEquivocation { evidence: "AB".into() }).contains("lowercase hex"));
+        assert!(bad(Action::ReportEquivocation { evidence: String::new() }).contains("1–"));
+        assert!(bad(Action::BeaconCommit { epoch: 1, commitment: "ab".into() }).contains("32 bytes"));
+        // Votes: conviction 0–6.
+        ok(Action::Vote { proposal_id: 0, aye: true, amount: 1, conviction: 6 });
+        assert!(bad(Action::Vote { proposal_id: 0, aye: true, amount: 1, conviction: 7 }).contains("0–6"));
+        assert!(bad(Action::Vote { proposal_id: 0, aye: true, amount: 0, conviction: 1 }).contains("more than 0"));
+        // Proposals: the kind's own rules, a deposit, a title, an https link or nothing.
+        ok(propose(ProposalKind::ParamChange { key: "quorum_bps".into(), value: 1 }));
+        assert!(bad(propose(ProposalKind::ParamChange { key: "nope".into(), value: 1 })).contains("unknown parameter"));
+        assert!(bad(propose(ProposalKind::GrantSoul { to: addr.clone(), amount: crate::poc::MAX_SOUL_GRANT + 1, reason: "r".into() })).contains("milli-Soul"));
+        assert!(bad(propose(ProposalKind::Distribution { merkle_root: hex32.clone(), total: 0, claim_until: 1 })).contains("total"));
+        assert!(bad(propose(ProposalKind::ActivateFeature { feature: "Ghost Mode".into() })).contains("feature"));
+        assert!(bad(propose(ProposalKind::ScheduleUpgrade { version: 0, activation_height: 5 })).contains("version"));
+        assert!(bad(Action::Propose { kind: ProposalKind::Text {}, deposit: 0, title: "t".into(), url: String::new() }).contains("deposit"));
+        assert!(bad(Action::Propose { kind: ProposalKind::Text {}, deposit: 1, title: " ".into(), url: String::new() }).contains("title"));
+        assert!(bad(Action::Propose { kind: ProposalKind::Text {}, deposit: 1, title: "t".into(), url: "http://x".into() }).contains("https"));
+        // Multisig: distinct key ids, 1 ≤ threshold ≤ owners, and proposals don't nest.
+        ok(Action::MultisigCreate { owners: vec![hex32.clone()], threshold: 1 });
+        assert!(bad(Action::MultisigCreate { owners: vec![hex32.clone(), hex32.clone()], threshold: 1 }).contains("distinct"));
+        assert!(bad(Action::MultisigCreate { owners: vec![hex32.clone()], threshold: 2 }).contains("threshold"));
+        assert!(bad(Action::MultisigCreate { owners: vec![], threshold: 0 }).contains("owners"));
+        let inner = Action::Transfer { to: addr.clone(), amount: 1 };
+        ok(Action::MultisigPropose { action: Box::new(inner.clone()) });
+        let nested = Action::MultisigPropose { action: Box::new(Action::MultisigPropose { action: Box::new(inner.clone()) }) };
+        assert!(bad(nested.clone()).contains("can't hold another"));
+        assert!(bad(Action::MultisigPropose { action: Box::new(Action::MultisigApprove { id: 1 }) }).contains("can't hold another"));
+        assert!(bad(Action::MultisigPropose { action: Box::new(Action::Transfer { to: "x".into(), amount: 1 }) }).contains("proposed action"));
+        // … nor do they decode nested.
+        assert!(Action::from_bytes(&nested.to_bytes()).unwrap_err().to_string().contains("can't contain another"));
+        // Names and distributions.
+        assert!(bad(Action::RenewName { name: "vlad".into(), years: 0 }).contains("1–10"));
+        assert!(bad(Action::RenewName { name: "vlad".into(), years: MAX_RENEW_YEARS + 1 }).contains("1–10"));
+        assert!(bad(Action::TransferName { name: "vlad".into(), to: "b".into() }).contains("`to`"));
+        assert!(bad(Action::ClaimDistribution { distribution_id: 0, amount: 1, proof: vec![hex32.clone(); MAX_PROOF + 1] }).contains("proof too long"));
+        assert!(bad(Action::ClaimDistribution { distribution_id: 0, amount: 1, proof: vec!["ab".into()] }).contains("32 bytes"));
+        assert!(bad(Action::AttestRevert { claim_id: 0, revert_sha: "ab".repeat(32) }).contains("40-hex"));
+        // Every account an action names is checked against the chain's prefix, nested ones too.
+        let testnet = k.address_with(crypto::TESTNET_HRP);
+        let tx = |action: Action| Tx { chain_id: "c".into(), from: addr.clone(), nonce: 0, fee: 0, tip: 0, valid_until: 0, action, memo: String::new(), public_key: String::new(), signature: String::new() };
+        for a in [
+            Action::Delegate { validator: testnet.clone(), amount: 1 },
+            Action::Redelegate { from_validator: addr.clone(), to_validator: testnet.clone(), shares: 1 },
+            Action::TransferName { name: "vlad".into(), to: testnet.clone() },
+            propose(ProposalKind::TreasurySpend { to: testnet.clone(), amount: 1 }),
+            propose(ProposalKind::Clawback { account: testnet.clone(), reason: "r".into() }),
+            Action::MultisigPropose { action: Box::new(Action::Transfer { to: testnet.clone(), amount: 1 }) },
+        ] {
+            assert!(tx(a.clone()).check_prefix("boo").unwrap_err().to_string().contains("tboo"), "{a:?}");
+        }
     }
 
     #[test]
@@ -1139,8 +1933,17 @@ mod tests {
         let tag_at = TX_DOMAIN.len() + 2 + 3 + 2 + 8 + 4 * 8;
         assert_eq!(good[tag_at], 21);
         let mut unknown = good.clone();
-        unknown[tag_at] = 30;
-        assert!(err(&unknown).contains("unknown action tag 30"));
+        unknown[tag_at] = 50;
+        assert!(err(&unknown).contains("unknown action tag 50"));
+        // A proposal kind past the last one.
+        let text = vector_tx(Action::Propose { kind: ProposalKind::Text {}, deposit: 1, title: "t".into(), url: String::new() }).to_bytes();
+        let mut bad_kind = text.clone();
+        assert_eq!((bad_kind[tag_at], bad_kind[tag_at + 1]), (39, 13));
+        bad_kind[tag_at + 1] = 14;
+        assert!(err(&bad_kind).contains("unknown proposal kind 14"));
+        let mut bad_aye = vector_tx(Action::Vote { proposal_id: 1, aye: true, amount: 1, conviction: 1 }).to_bytes();
+        bad_aye[tag_at + 1 + 8] = 2;
+        assert!(err(&bad_aye).contains("`aye` must be 0 or 1"));
         let mut bad_bool = good.clone();
         bad_bool[tag_at + 1 + 8] = 2;
         assert!(err(&bad_bool).contains("0 or 1"));
@@ -1197,13 +2000,36 @@ mod tests {
         proptest::collection::vec(any::<u8>(), bytes).prop_map(hex::encode)
     }
 
+    /// A proposal kind, by its tag, from the same kind of field bag.
+    fn proposal_kind(tag: u8, [a, b]: [String; 2], [w, x]: [u64; 2]) -> ProposalKind {
+        match tag {
+            0 => ProposalKind::ParamChange { key: a, value: w },
+            1 => ProposalKind::TreasurySpend { to: a, amount: w },
+            2 => ProposalKind::Distribution { merkle_root: a, total: w, claim_until: x },
+            3 => ProposalKind::SetRepo { repo: a, weight: w },
+            4 => ProposalKind::GrantSoul { to: a, amount: w, reason: b },
+            5 => ProposalKind::FlagSybil { account: a, reason: b },
+            6 => ProposalKind::RejectClaim { claim_id: w, reason: a },
+            7 => ProposalKind::Clawback { account: a, reason: b },
+            8 => ProposalKind::UnlinkGithub { handle: a },
+            9 => ProposalKind::RefundHunt { hunt_id: w },
+            10 => ProposalKind::ScheduleUpgrade { version: w as u32, activation_height: x },
+            11 => ProposalKind::ActivateFeature { feature: a },
+            12 => ProposalKind::DeactivateFeature { feature: a },
+            13 => ProposalKind::Text {},
+            _ => unreachable!(),
+        }
+    }
+
     /// Any action, by tag, from a bag of random fields (strings of up to 6 chars fit every bound).
+    /// A multisig proposal wraps a transfer or a vote (they don't nest).
     fn arb_action() -> impl Strategy<Value = Action> {
         let strs = proptest::array::uniform4(arb_str(6));
         let nums = proptest::array::uniform3(any::<u64>());
         let opt = proptest::option::of(arb_str(6).prop_filter("Some is never empty", |s| !s.is_empty()));
         let ids = proptest::collection::vec(any::<u64>(), 0..4);
-        (0u8..30, strs, nums, any::<bool>(), opt, ids).prop_map(|(tag, [a, b, c, d], [w, x, y], ok, familiar_key, spam)| match tag {
+        let list = proptest::collection::vec(arb_str(6), 0..4);
+        (0u8..50, strs, nums, any::<bool>(), opt, ids, list, 0u8..14, any::<u8>()).prop_map(|(tag, [a, b, c, d], [w, x, y], ok, familiar_key, spam, list, kind, small)| match tag {
             0 => Action::Transfer { to: a, amount: w },
             1 => Action::RegisterName { name: a },
             2 => Action::AddKey { key_id: a, label: b, role: if ok { KeyRole::Owner } else { KeyRole::Session { limit: w, period_blocks: x, expires_at: y } } },
@@ -1234,6 +2060,26 @@ mod tests {
             27 => Action::FundPool { amount: w },
             28 => Action::WithdrawVested {},
             29 => Action::Clawback { account: a, reason: b },
+            30 => Action::Delegate { validator: a, amount: w },
+            31 => Action::Undelegate { validator: a, shares: w },
+            32 => Action::Redelegate { from_validator: a, to_validator: b, shares: w },
+            33 => Action::WithdrawUnbonded {},
+            34 => Action::UpdateValidator { commission_bps: w, p2p_addr: a, http_addr: b },
+            35 => Action::Unjail { validator: a },
+            36 => Action::ReportEquivocation { evidence: a },
+            37 => Action::BeaconCommit { epoch: w, commitment: a },
+            38 => Action::BeaconReveal { epoch: w, secret: a },
+            39 => Action::Propose { kind: proposal_kind(kind, [c, d], [x, y]), deposit: w, title: a, url: b },
+            40 => Action::Vote { proposal_id: w, aye: ok, amount: x, conviction: small },
+            41 => Action::Unlock {},
+            42 => Action::MultisigCreate { owners: list, threshold: small },
+            43 => Action::MultisigPropose { action: Box::new(if ok { Action::Transfer { to: a, amount: w } } else { Action::Vote { proposal_id: w, aye: small % 2 == 0, amount: x, conviction: small } }) },
+            44 => Action::MultisigApprove { id: w },
+            45 => Action::RenewName { name: a, years: small },
+            46 => Action::TransferName { name: a, to: b },
+            47 => Action::ReleaseName { name: a },
+            48 => Action::ClaimDistribution { distribution_id: w, amount: x, proof: list },
+            49 => Action::AttestRevert { claim_id: w, revert_sha: a },
             _ => unreachable!(),
         })
     }

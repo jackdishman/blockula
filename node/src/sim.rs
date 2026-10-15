@@ -236,7 +236,7 @@ fn validator_joins_at_epoch_boundary_and_genesis_validator_is_removed() {
         // Fund it, register (bond = chain minimum), approve. Each tx goes to a different node.
         vals[0].chain.lock().submit(signed("sim", &admin, 0, Action::Transfer { to: me.clone(), amount: 100 * DROPS_PER_FANG })).unwrap();
         wait_until(&context, "funding", || vals[2].chain.lock().state.account(&me).balance > 0).await;
-        let bond = genesis.min_bond;
+        let bond = genesis.chain_params().unwrap().min_self_bond;
         let pop = crate::chain::make_pop(new_seed, "sim", &me, "127.0.0.1:30304", "127.0.0.1:7074");
         let reg = Action::RegisterValidator { consensus_key: hex::encode(newbie.public_key()), p2p_addr: "127.0.0.1:30304".into(), http_addr: "127.0.0.1:7074".into(), bond, pop };
         // A stranger can't approve; the admin can.

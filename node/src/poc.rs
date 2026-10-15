@@ -641,28 +641,11 @@ impl State {
         match &tx.action {
             Action::SetRepo { repo, weight } => {
                 need_admin("set pool repos")?;
-                let k = repo.to_ascii_lowercase();
-                self.pj(j).repos.touch(&self.poc.repos, &k);
-                if *weight == 0 {
-                    self.poc.repos.remove(&k).ok_or_else(|| anyhow!("{repo} isn't in the contribution pool"))?;
-                    // Claims waiting on it would be stuck: refund and close them.
-                    let stuck: Vec<(u64, u64)> = self.poc.claims.values().filter(|c| c.repo == k && matches!(c.status, ClaimStatus::Pending | ClaimStatus::Verified)).map(|c| (c.id, c.pr)).collect();
-                    for (id, pr) in stuck {
-                        self.settle_bond(j, id, true);
-                        self.set_status(j, id, ClaimStatus::Rejected, height, Some("the repo left the contribution pool; bond refunded".into()));
-                        self.set_claim_by_pr(j, &format!("{k}#{pr}"), None);
-                    }
-                } else {
-                    self.poc.repos.insert(k, *weight);
-                }
+                self.exec_set_repo(j, repo, *weight, height)?;
             }
             Action::GrantSoul { to, amount, .. } => {
                 need_admin("grant Soul")?;
-                let to = self.resolve(to)?;
-                if self.is_sybil(&to) {
-                    bail!("{} is flagged as a sybil", short(&to));
-                }
-                self.add_soul(j, &to, *amount as i64, height);
+                self.exec_grant_soul(j, to, *amount, height)?;
             }
             Action::Vouch { account } => {
                 need_owner("vouch")?;
@@ -712,14 +695,10 @@ impl State {
             }
             Action::FlagSybil { account, reason } => {
                 need_admin("flag sybils")?;
-                let who = self.resolve(account)?;
-                if self.is_sybil(&who) {
-                    bail!("{} is already flagged", short(&who));
-                }
-                if self.params.admins.contains(&who) {
+                if self.params.admins.contains(&self.resolve(account)?) {
                     bail!("admins can't be flagged");
                 }
-                self.flag_sybil(j, &who, sender, reason, height);
+                self.exec_flag_sybil(j, account, sender, reason, height)?;
             }
             Action::SubmitClaim { repo, pr, familiar_key } => {
                 if self.is_sybil(sender) {
@@ -833,27 +812,7 @@ impl State {
             }
             Action::RejectClaim { claim_id, reason } => {
                 need_admin("reject claims")?;
-                let c = self.poc.claims.get(claim_id).cloned().ok_or_else(|| anyhow!("no claim #{claim_id}"))?;
-                match c.status {
-                    // Never verified: the PR wasn't proven to be theirs, so its author can still claim it.
-                    ClaimStatus::Pending => {
-                        self.settle_bond(j, *claim_id, false);
-                        self.set_claim_by_pr(j, &format!("{}#{}", c.repo, c.pr), None);
-                    }
-                    ClaimStatus::Verified | ClaimStatus::InSeance => self.settle_bond(j, *claim_id, false),
-                    ClaimStatus::Scored => {
-                        if let Some(g) = c.grant {
-                            self.claw_back(j, &c.claimant, Some(g), height);
-                        }
-                        let cuts: Vec<(String, u64)> = self.poc.grants.iter().flat_map(|(a, gs)| gs.values().filter(|g| g.source == GrantSource::Vouch { claim_id: *claim_id }).map(move |g| (a.clone(), g.id))).collect();
-                        for (voucher, g) in cuts {
-                            self.claw_back(j, &voucher, Some(g), height);
-                        }
-                        self.add_soul(j, &c.claimant, -(c.soul_awarded as i64), height);
-                    }
-                    ClaimStatus::Spam | ClaimStatus::Rejected => bail!("claim #{claim_id} is already {:?}", c.status),
-                }
-                self.set_status(j, *claim_id, ClaimStatus::Rejected, height, Some(reason.clone()));
+                self.exec_reject_claim(j, *claim_id, reason, height)?;
             }
             Action::JoinJury { bond } => {
                 need_owner("join the jury pool")?;
@@ -960,14 +919,98 @@ impl State {
             }
             Action::Clawback { account, .. } => {
                 need_admin("claw back rewards")?;
-                let who = self.resolve(account)?;
-                if self.claw_back(j, &who, None, height) == 0 {
-                    bail!("{} has no unvested rewards", short(&who));
-                }
+                self.exec_clawback(j, account, height)?;
             }
             _ => bail!("not a contribution action"),
         }
         Ok(())
+    }
+
+    // ---- levers: the bodies of the former admin actions, with no signer checks. Admin-signed
+    // txs (dev and test chains) call them after checking the signer; governance proposals
+    // (`ProposalKind`, P-GOV) call them when they execute. See chain.rs for the others.
+
+    /// Puts a repo in the contribution pool with `weight` (1–`MAX_REPO_WEIGHT`), or with 0 takes
+    /// it out, refunding and closing the claims that waited on it.
+    pub(crate) fn exec_set_repo(&mut self, j: &mut Journal, repo: &str, weight: u64, height: u64) -> Result<()> {
+        if weight > MAX_REPO_WEIGHT {
+            bail!("repo weight must be 0–{MAX_REPO_WEIGHT} (0 removes the repo)");
+        }
+        let k = repo.to_ascii_lowercase();
+        self.pj(j).repos.touch(&self.poc.repos, &k);
+        if weight == 0 {
+            self.poc.repos.remove(&k).ok_or_else(|| anyhow!("{repo} isn't in the contribution pool"))?;
+            // Claims waiting on it would be stuck: refund and close them.
+            let stuck: Vec<(u64, u64)> = self.poc.claims.values().filter(|c| c.repo == k && matches!(c.status, ClaimStatus::Pending | ClaimStatus::Verified)).map(|c| (c.id, c.pr)).collect();
+            for (id, pr) in stuck {
+                self.settle_bond(j, id, true);
+                self.set_status(j, id, ClaimStatus::Rejected, height, Some("the repo left the contribution pool; bond refunded".into()));
+                self.set_claim_by_pr(j, &format!("{k}#{pr}"), None);
+            }
+        } else {
+            self.poc.repos.insert(k, weight);
+        }
+        Ok(())
+    }
+
+    /// Grants Soul (milli-Soul, 1–`MAX_SOUL_GRANT` per grant). Sybils get none.
+    pub(crate) fn exec_grant_soul(&mut self, j: &mut Journal, to: &str, amount: u64, height: u64) -> Result<()> {
+        if amount == 0 || amount > MAX_SOUL_GRANT {
+            bail!("a Soul grant is 1–{MAX_SOUL_GRANT} milli-Soul");
+        }
+        let to = self.resolve(to)?;
+        if self.is_sybil(&to) {
+            bail!("{} is flagged as a sybil", short(&to));
+        }
+        self.add_soul(j, &to, amount as i64, height);
+        Ok(())
+    }
+
+    /// Flags an account as a sybil (`by`: who decided, e.g. an admin or a proposal): zeroes its
+    /// Soul, rejects its open claims, claws back its unvested rewards, slashes whoever vouched.
+    pub(crate) fn exec_flag_sybil(&mut self, j: &mut Journal, account: &str, by: &str, reason: &str, height: u64) -> Result<()> {
+        let who = self.resolve(account)?;
+        if self.is_sybil(&who) {
+            bail!("{} is already flagged", short(&who));
+        }
+        self.flag_sybil(j, &who, by, reason, height);
+        Ok(())
+    }
+
+    /// Rejects a claim (say, its PR was reverted): slashes the bond, or for a scored claim claws
+    /// back its unvested reward (and its vouchers' cuts) and the Soul it earned.
+    pub(crate) fn exec_reject_claim(&mut self, j: &mut Journal, claim_id: u64, reason: &str, height: u64) -> Result<()> {
+        let c = self.poc.claims.get(&claim_id).cloned().ok_or_else(|| anyhow!("no claim #{claim_id}"))?;
+        match c.status {
+            // Never verified: the PR wasn't proven to be theirs, so its author can still claim it.
+            ClaimStatus::Pending => {
+                self.settle_bond(j, claim_id, false);
+                self.set_claim_by_pr(j, &format!("{}#{}", c.repo, c.pr), None);
+            }
+            ClaimStatus::Verified | ClaimStatus::InSeance => self.settle_bond(j, claim_id, false),
+            ClaimStatus::Scored => {
+                if let Some(g) = c.grant {
+                    self.claw_back(j, &c.claimant, Some(g), height);
+                }
+                let cuts: Vec<(String, u64)> = self.poc.grants.iter().flat_map(|(a, gs)| gs.values().filter(|g| g.source == GrantSource::Vouch { claim_id }).map(move |g| (a.clone(), g.id))).collect();
+                for (voucher, g) in cuts {
+                    self.claw_back(j, &voucher, Some(g), height);
+                }
+                self.add_soul(j, &c.claimant, -(c.soul_awarded as i64), height);
+            }
+            ClaimStatus::Spam | ClaimStatus::Rejected => bail!("claim #{claim_id} is already {:?}", c.status),
+        }
+        self.set_status(j, claim_id, ClaimStatus::Rejected, height, Some(reason.to_string()));
+        Ok(())
+    }
+
+    /// Returns an account's unvested rewards to the pool. Returns what came back (never 0).
+    pub(crate) fn exec_clawback(&mut self, j: &mut Journal, account: &str, height: u64) -> Result<u64> {
+        let who = self.resolve(account)?;
+        match self.claw_back(j, &who, None, height) {
+            0 => bail!("{} has no unvested rewards", short(&who)),
+            back => Ok(back),
+        }
     }
 
     fn flag_sybil(&mut self, j: &mut Journal, who: &str, by: &str, reason: &str, height: u64) {

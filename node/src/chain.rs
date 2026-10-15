@@ -2,9 +2,10 @@
 //! finalized blocks deterministically, in order, and keeps the mempool, indexes and `blocks.jsonl`.
 
 use crate::crypto::{self, Keys};
+use crate::params::ChainParams;
 use crate::state::{JMap, TMap};
 use crate::types::*;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -13,9 +14,37 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// The treasury's system account on a chain whose addresses use `prefix`.
+/// Mainnet's chain id. Its genesis may not have admins or a faucet (DEC-10).
+pub const MAINNET_CHAIN_ID: &str = "blockula-1";
+
+/// The treasury's system account on a chain whose addresses use `prefix`. Keyless: only
+/// `TreasurySpend` proposals move funds out.
 pub fn treasury(prefix: &str) -> String {
     crypto::system_address(prefix, "treasury")
+}
+
+/// The keyless community account: `Distribution` proposals pay out of it (DEC-5, 3.5).
+pub fn community(prefix: &str) -> String {
+    crypto::system_address(prefix, "community")
+}
+
+/// The keyless contribution endowment, which streams into the contribution pool (DEC-5).
+pub fn endowment(prefix: &str) -> String {
+    crypto::system_address(prefix, "endowment")
+}
+
+/// The keyless validator bootstrap delegation (DEC-5): delegated by formula, returned to the
+/// treasury in years 2–4. (The foundation is an ordinary multisig account.)
+pub fn bootstrap_delegation(prefix: &str) -> String {
+    crypto::system_address(prefix, "bootstrap-delegation")
+}
+
+/// What a keyless system account is (`"treasury"`, `"community"`, `"endowment"`,
+/// `"bootstrap delegation"`, `"contribution pool"`), if `addr` is one on a chain with `prefix`.
+/// Nobody holds a key for them: only the protocol moves their funds.
+pub fn system_account(prefix: &str, addr: &str) -> Option<&'static str> {
+    let accounts = [("treasury", treasury(prefix)), ("community", community(prefix)), ("endowment", endowment(prefix)), ("bootstrap delegation", bootstrap_delegation(prefix)), ("contribution pool", crate::poc::pool_address(prefix))];
+    accounts.into_iter().find(|(_, a)| a == addr).map(|(role, _)| role)
 }
 
 pub fn now_ms() -> u64 {
@@ -23,11 +52,71 @@ pub fn now_ms() -> u64 {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Allocation {
     pub address: String,
     #[serde(with = "u64_str")]
     pub amount: u64,
+    /// Locks the amount on a vesting curve (a lock on the account, MAINNET-DESIGN 3.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vesting: Option<Vesting>,
+    /// What the allocation is ("founder", "treasury"…): display, and the vesting lock's reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
+
+/// A vesting schedule, in block heights: nothing vests before `cliff`, then the amount vests
+/// linearly from `start` to `end` (so the cliff releases what accrued since `start`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Vesting {
+    pub start: u64,
+    pub cliff: u64,
+    pub end: u64,
+}
+
+/// A genesis validator's economic side (MAINNET-DESIGN 3.7): who owns it, its self-bond (moved
+/// from the owner's allocations into the validator's bond) and commission. Its consensus key
+/// must be one of `validators`, with the same addresses. Staking builds its pool from these.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Operator {
+    pub owner: String,
+    /// hex ML-DSA-65 public key.
+    pub consensus_key: String,
+    /// Proof of possession, as for `RegisterValidator`: the consensus key's signature over
+    /// `pop_message(chain_id, owner, p2p_addr, http_addr)`.
+    pub pop: String,
+    pub p2p_addr: String,
+    pub http_addr: String,
+    #[serde(with = "u64_str")]
+    pub self_bond: u64,
+    pub commission_bps: u64,
+    // Display only (hosting diversity, DEC-14): not state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asn: Option<u32>,
+    /// ISO 3166-1 alpha-2 (`"DE"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity: Option<String>,
+}
+
+/// Soul bootstrapped at genesis (3.5: the published ledger; afterwards only juries and bounded
+/// `GrantSoul` proposals change Soul).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SoulEntry {
+    pub account: String,
+    /// milli-Soul (`poc::SOUL` per Soul).
+    pub soul: u64,
+    pub reason: String,
+}
+
+/// Most Soul one genesis ledger entry may grant.
+pub const MAX_GENESIS_SOUL: u64 = 1_000 * crate::poc::SOUL;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ValidatorInfo {
@@ -54,21 +143,31 @@ pub struct Genesis {
     /// Blocks per epoch. The validator set can only change at epoch boundaries.
     #[serde(default = "default_epoch_blocks")]
     pub epoch_blocks: u64,
-    /// Season 0 allowlist: accounts that may approve/remove validators.
+    /// Season 0 allowlist: accounts that may approve/remove validators and pull the admin
+    /// levers. Dev and test chains only: mainnet (`blockula-1`) refuses any.
     #[serde(default)]
     pub validator_admins: Vec<String>,
-    /// Minimum bond (drops) for `register_validator`.
-    #[serde(default = "default_min_bond", with = "u64_str")]
-    pub min_bond: u64,
-    /// Cap on the active set.
-    #[serde(default = "default_max_validators")]
-    pub max_validators: usize,
     /// Proof of Contribution timings. Absent: derived from `block_time_ms` (weeks, not minutes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contribution: Option<crate::poc::PocTimes>,
     /// bech32m prefix of this chain's addresses: `boo` (mainnet, dev) or `tboo` (public testnets).
     #[serde(default = "default_address_prefix")]
     pub address_prefix: String,
+    /// Overrides of the governance-adjustable parameters (`params::ChainParams`), by key; the
+    /// rest take their defaults. JSON values are strings or numbers.
+    #[serde(rename = "params", default, skip_serializing_if = "BTreeMap::is_empty", with = "crate::params::u64_map")]
+    pub param_overrides: BTreeMap<String, u64>,
+    /// Owners, self-bonds and commissions of genesis validators.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operators: Vec<Operator>,
+    /// Names nobody can register (bare, as `normalize_name` returns them).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reserved_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub soul_ledger: Vec<SoulEntry>,
+    /// Features on from genesis (`upgrade::KNOWN_FEATURES`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
 }
 
 fn default_epoch_blocks() -> u64 {
@@ -77,25 +176,17 @@ fn default_epoch_blocks() -> u64 {
 fn default_address_prefix() -> String {
     crypto::ADDRESS_HRP.into()
 }
-fn default_min_bond() -> u64 {
-    10_000 * DROPS_PER_FANG
-}
-fn default_max_validators() -> usize {
-    32
-}
 
 /// How many past epochs' validator sets the state keeps (for verifying recent certificates).
 pub const EPOCH_SETS_KEPT: u64 = 8;
 
 /// Genesis constants the state machine needs while applying txs (a state record, so the root
-/// commits to them).
+/// commits to them). What governance can change is in `State::chain_params` instead.
 #[derive(Clone, Debug, Default, BorshSerialize, BorshDeserialize)]
 pub struct Params {
     pub block_time_ms: u64,
     pub epoch_blocks: u64,
     pub admins: Vec<String>,
-    pub min_bond: u64,
-    pub max_validators: usize,
     pub poc: crate::poc::PocTimes,
     /// The chain's address prefix (see [`Params::prefix`]).
     pub address_prefix: String,
@@ -105,11 +196,6 @@ impl Params {
     /// The chain's address prefix (`boo` when unset, e.g. in a default `Params`).
     pub fn prefix(&self) -> &str {
         if self.address_prefix.is_empty() { crypto::ADDRESS_HRP } else { &self.address_prefix }
-    }
-
-    /// How far ahead a tx's `valid_until` may be: one hour of blocks.
-    pub fn max_tx_validity_blocks(&self) -> u64 {
-        (3_600_000 / self.block_time_ms.max(1)).max(1)
     }
 
     /// Longest a session key may stay valid: ~400 days of blocks.
@@ -165,6 +251,9 @@ pub struct ValidatorRecord {
     pub active_until: Option<u64>,
     /// Bond can be reclaimed from this epoch on.
     pub unbond_epoch: Option<u64>,
+    /// The owner's cut of its pool's rewards (genesis operators set it; `UpdateValidator` changes it).
+    #[serde(default)]
+    pub commission_bps: u64,
 }
 
 impl Genesis {
@@ -174,15 +263,30 @@ impl Genesis {
 
     pub fn params(&self) -> Params {
         let poc = self.contribution.clone().unwrap_or_else(|| crate::poc::PocTimes::for_block_time(self.block_time_ms));
-        Params { block_time_ms: self.block_time_ms, epoch_blocks: self.epoch_blocks, admins: self.validator_admins.clone(), min_bond: self.min_bond, max_validators: self.max_validators, poc, address_prefix: self.address_prefix.clone() }
+        Params { block_time_ms: self.block_time_ms, epoch_blocks: self.epoch_blocks, admins: self.validator_admins.clone(), poc, address_prefix: self.address_prefix.clone() }
     }
 
-    /// The state before block 1, committed (its root is the genesis state root).
+    /// The governance-adjustable parameters at genesis: the defaults with `params` applied.
+    pub fn chain_params(&self) -> Result<ChainParams> {
+        ChainParams::with_overrides(&self.params(), &self.param_overrides)
+    }
+
+    /// The state before block 1, committed (its root is the genesis state root). Expects a
+    /// genesis that passes [`Genesis::check`] (`load` runs it); anything that doesn't is skipped
+    /// or clamped instead of panicking, and such a genesis never opens anyway.
     pub fn initial_state(&self) -> State {
-        let mut state = State { params: self.params(), ..Default::default() };
+        let params = self.params();
+        let chain_params = self.chain_params().unwrap_or_else(|_| ChainParams::defaults(&params));
+        let prefix = params.prefix().to_string();
+        let mut state = State { params, chain_params, ..Default::default() };
         for a in &self.allocations {
             state.credit(&a.address, a.amount);
             state.supply += a.amount;
+            if let Some(v) = &a.vesting {
+                let acct = state.accounts.entry(a.address.clone()).or_default();
+                let lock = Lock { id: acct.locks.len() as u64, amount: LockAmount::Vesting { total: a.amount, start: v.start, cliff: v.cliff, end: v.end }, reason: a.label.clone().unwrap_or_else(|| "genesis allocation".into()) };
+                acct.locks.push(lock);
+            }
         }
         for v in &self.validators {
             state.validators.insert(
@@ -203,10 +307,38 @@ impl Genesis {
                     removed_by: None,
                     active_until: None,
                     unbond_epoch: None,
+                    commission_bps: 0,
                 },
             );
         }
+        // Operators own their validators: the self-bond moves from the owner's balance into the
+        // validator's bond (an escrow), which is what its stake pool starts from (staking.rs).
+        for o in &self.operators {
+            let Some(address) = hex::decode(&o.consensus_key).ok().map(|pk| crypto::address_with_prefix(&prefix, &pk)) else { continue };
+            if !state.validators.contains_key(&address) {
+                continue;
+            }
+            let bond = o.self_bond.min(state.account(&o.owner).balance);
+            if let Some(acct) = state.accounts.get_mut(&o.owner) {
+                acct.balance -= bond;
+            }
+            let v = state.validators.get_mut(&address).expect("checked above");
+            v.owner = o.owner.clone();
+            v.bond = bond;
+            v.commission_bps = o.commission_bps;
+        }
         state.active_sets.insert(0, self.validators.iter().map(|v| v.address.clone()).collect());
+        for n in &self.reserved_names {
+            if let Ok(n) = normalize_name(n) {
+                state.econ.reserved_names.insert(n, crate::econ::ReservedName { reserved_at: 0 });
+            }
+        }
+        for e in &self.soul_ledger {
+            state.poc.souls.insert(e.account.clone(), crate::poc::Soul { points: e.soul, at: 0, earned: e.soul });
+        }
+        for f in &self.features {
+            state.upgrade.features.insert(f.clone(), crate::upgrade::Feature { activated_at: 0 });
+        }
         state.commit_block().expect("an in-memory tree can't fail");
         state
     }
@@ -217,12 +349,105 @@ impl Genesis {
         if v.get("validators").is_none() {
             bail!("{} was created by an older single-validator Blockula; re-summon it (or `blockula dev --reset`)", path.display());
         }
-        let g: Genesis = serde_json::from_value(v)?;
-        if let Some(t) = &g.contribution {
-            t.check().with_context(|| format!("{}", path.display()))?;
+        for (old, new) in [("min_bond", "min_self_bond"), ("max_validators", "max_validators")] {
+            if v.get(old).is_some() {
+                bail!("{}: `{old}` moved to `params.{new}` (protocol v1); re-summon the chain (or `blockula dev --reset`)", path.display());
+            }
         }
-        g.check_prefix().with_context(|| format!("{}", path.display()))?;
+        let g: Genesis = serde_json::from_value(v)?;
+        g.check().with_context(|| format!("{}", path.display()))?;
         Ok(g)
+    }
+
+    /// Everything a genesis must satisfy (`load` runs it): its addresses use its prefix; the
+    /// parameters, allocations and vesting schedules are in bounds; operators match validators,
+    /// prove possession of their keys and can fund their self-bonds; reserved names, the Soul
+    /// ledger and features are well-formed; and mainnet has no admins, no faucet, and an operator
+    /// for every validator.
+    pub fn check(&self) -> Result<()> {
+        use std::collections::BTreeSet;
+        self.check_prefix()?;
+        if let Some(t) = &self.contribution {
+            t.check()?;
+        }
+        ensure!(self.epoch_blocks >= 2 && self.block_time_ms >= 1, "epoch_blocks must be at least 2 and block_time_ms at least 1");
+        let params = self.params();
+        let prefix = params.prefix();
+        let cp = self.chain_params().context("params")?;
+        let display = |what: &str, v: &str| -> Result<()> {
+            ensure!(!v.trim().is_empty() && v.len() <= MAX_LABEL && !v.chars().any(|c| c.is_control()), "{what} must be 1–{MAX_LABEL} bytes with no control characters");
+            Ok(())
+        };
+        let mut supply = 0u64;
+        let mut held: BTreeMap<&str, u64> = BTreeMap::new();
+        let mut vesting = BTreeSet::new();
+        for a in &self.allocations {
+            supply = supply.checked_add(a.amount).ok_or_else(|| anyhow!("allocations add up to more than u64 drops"))?;
+            *held.entry(&a.address).or_default() += a.amount;
+            if let Some(l) = &a.label {
+                display("allocation label", l)?;
+            }
+            if let Some(v) = &a.vesting {
+                ensure!(v.start <= v.cliff && v.cliff <= v.end && v.start < v.end, "vesting of {}: needs start ≤ cliff ≤ end and start < end", a.address);
+                // One vesting lock per account: locks overlap (the largest applies), they don't add.
+                ensure!(vesting.insert(&a.address), "{} has more than one vesting allocation", a.address);
+            }
+        }
+        let mut keys = BTreeSet::new();
+        let mut bonds: BTreeMap<&str, u64> = BTreeMap::new();
+        for o in &self.operators {
+            let who = format!("operator {}", o.owner);
+            ensure!(crypto::parse_address(&o.owner).map(|(p, _)| p) == Some(prefix), "{who}: the owner must be a {prefix}1… address");
+            ensure!(system_account(prefix, &o.owner).is_none(), "{who}: a keyless system account can't own a validator");
+            ensure!(crypto::is_lower_hex(&o.consensus_key) && o.consensus_key.len() == crypto::PUBLIC_KEY_LEN * 2, "{who}: consensus_key must be an ML-DSA-65 public key in lowercase hex");
+            ensure!(keys.insert(o.consensus_key.as_str()), "{who}: another operator has the same consensus key");
+            let v = self.validators.iter().find(|v| v.public_key == o.consensus_key).ok_or_else(|| anyhow!("{who}: its consensus key isn't one of the genesis validators"))?;
+            let pk = hex::decode(&o.consensus_key)?;
+            ensure!(v.address == crypto::address_with_prefix(prefix, &pk), "{who}: validator {} isn't its consensus key's address", v.address);
+            ensure!(v.p2p_addr == o.p2p_addr && v.http_addr == o.http_addr, "{who}: p2p_addr and http_addr must match its entry in validators");
+            verify_pop(&self.chain_id, &o.owner, &o.consensus_key, &o.p2p_addr, &o.http_addr, &o.pop).with_context(|| who.clone())?;
+            ensure!(o.self_bond >= cp.min_self_bond, "{who}: self_bond is below min_self_bond ({})", fmt_fang(cp.min_self_bond));
+            ensure!(o.commission_bps <= cp.commission_max_bps, "{who}: commission_bps is above commission_max_bps ({})", cp.commission_max_bps);
+            for (what, v) in [("provider", &o.provider), ("entity", &o.entity)] {
+                if let Some(v) = v {
+                    display(what, v).with_context(|| who.clone())?;
+                }
+            }
+            if let Some(c) = &o.country {
+                ensure!(c.len() == 2 && c.bytes().all(|b| b.is_ascii_uppercase()), "{who}: country must be an ISO 3166-1 alpha-2 code (\"DE\")");
+            }
+            let b = bonds.entry(&o.owner).or_default();
+            *b = b.checked_add(o.self_bond).ok_or_else(|| anyhow!("{who}: self-bonds overflow"))?;
+        }
+        for (owner, bond) in bonds {
+            let has = held.get(owner).copied().unwrap_or(0);
+            ensure!(has >= bond, "operator {owner} self-bonds {} but its allocations hold {}", fmt_fang(bond), fmt_fang(has));
+        }
+        let mut names = BTreeSet::new();
+        for n in &self.reserved_names {
+            ensure!(normalize_name(n).ok().as_deref() == Some(n.as_str()), "reserved name {n:?} must be a bare lowercase name (no {NAME_SUFFIX})");
+            ensure!(names.insert(n), "reserved name {n} is listed twice");
+        }
+        let mut souls = BTreeSet::new();
+        for e in &self.soul_ledger {
+            ensure!(crypto::parse_address(&e.account).map(|(p, _)| p) == Some(prefix), "soul_ledger: {} isn't a {prefix}1… address", e.account);
+            ensure!(system_account(prefix, &e.account).is_none(), "soul_ledger: {} is a keyless system account", e.account);
+            ensure!((1..=MAX_GENESIS_SOUL).contains(&e.soul), "soul_ledger: {} gets 1–{MAX_GENESIS_SOUL} milli-Soul", e.account);
+            check_reason(&e.reason).with_context(|| format!("soul_ledger: {}", e.account))?;
+            ensure!(souls.insert(&e.account), "soul_ledger lists {} twice", e.account);
+        }
+        let mut features = BTreeSet::new();
+        for f in &self.features {
+            crate::upgrade::check_feature_name(f)?;
+            ensure!(crate::upgrade::KNOWN_FEATURES.contains(&f.as_str()), "unknown feature {f} (known: {})", crate::upgrade::KNOWN_FEATURES.join(", "));
+            ensure!(features.insert(f), "feature {f} is listed twice");
+        }
+        if self.chain_id == MAINNET_CHAIN_ID {
+            ensure!(self.validator_admins.is_empty(), "{MAINNET_CHAIN_ID} has no admin keys: validator_admins must be empty");
+            ensure!(!self.faucet, "{MAINNET_CHAIN_ID} has no faucet");
+            ensure!(self.validators.iter().all(|v| keys.contains(v.public_key.as_str())), "every {MAINNET_CHAIN_ID} validator needs an operator (owner, self-bond, commission)");
+        }
+        Ok(())
     }
 
     /// The prefix is a known one, and every genesis address uses it.
@@ -302,7 +527,13 @@ pub struct Journal {
     familiars: JMap<String, BTreeMap<String, String>>,
     scalars: Option<(u64, u64)>,
     next_hunt_id: Option<u64>,
+    chain_params: Option<ChainParams>,
     pub(crate) poc: crate::poc::PocJournal,
+    pub(crate) staking: crate::staking::StakingJournal,
+    pub(crate) governance: crate::governance::GovernanceJournal,
+    pub(crate) econ: crate::econ::EconJournal,
+    pub(crate) beacon: crate::beacon::BeaconJournal,
+    pub(crate) upgrade: crate::upgrade::UpgradeJournal,
 }
 
 impl Journal {
@@ -310,23 +541,50 @@ impl Journal {
         self.absorb(other)
     }
 
-    /// Folds a nested journal in, keeping the oldest values.
+    /// Folds a nested journal in, keeping the oldest values. Exhaustive, like `State::rollback`.
     fn absorb(&mut self, other: Journal) {
-        self.accounts.absorb(other.accounts);
-        self.names.absorb(other.names);
-        self.validators.absorb(other.validators);
-        self.hunts.absorb(other.hunts);
-        self.github.absorb(other.github);
-        self.github_by_account.absorb(other.github_by_account);
-        self.familiars.absorb(other.familiars);
+        let Journal { accounts, names, validators, hunts, github, github_by_account, familiars, scalars, next_hunt_id, chain_params, poc, staking, governance, econ, beacon, upgrade } = other;
+        self.accounts.absorb(accounts);
+        self.names.absorb(names);
+        self.validators.absorb(validators);
+        self.hunts.absorb(hunts);
+        self.github.absorb(github);
+        self.github_by_account.absorb(github_by_account);
+        self.familiars.absorb(familiars);
         if self.scalars.is_none() {
-            self.scalars = other.scalars;
+            self.scalars = scalars;
         }
         if self.next_hunt_id.is_none() {
-            self.next_hunt_id = other.next_hunt_id;
+            self.next_hunt_id = next_hunt_id;
         }
-        self.poc.absorb(other.poc);
+        if self.chain_params.is_none() {
+            self.chain_params = chain_params;
+        }
+        self.poc.absorb(poc);
+        self.staking.absorb(staking);
+        self.governance.absorb(governance);
+        self.econ.absorb(econ);
+        self.beacon.absorb(beacon);
+        self.upgrade.absorb(upgrade);
     }
+}
+
+/// The block the end-of-block steps close ([`State::end_block`]). Execution and replay build the
+/// same one from the block (replay from `blocks.jsonl`), so the hooks see identical inputs.
+// The hooks that read every field land with their packages (staking reads view, skipped…).
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+pub struct BlockInfo<'a> {
+    pub height: u64,
+    pub hash: &'a str,
+    /// Paid the block's tips; pays for its skipped txs.
+    pub proposer: &'a str,
+    /// The consensus view the block was proposed in and its parent's view (0 for an epoch's
+    /// first block): every view in between was a missed leader slot (MAINNET-DESIGN 3.4).
+    pub view: u64,
+    pub parent_view: u64,
+    /// Wire sizes of the txs the block carried that couldn't be admitted (skipped).
+    pub skipped: &'a [u64],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -348,6 +606,61 @@ pub struct Account {
     pub nonce: u64,
     /// Authorized keys by key id. Empty means "only the key the address was derived from".
     pub keys: BTreeMap<String, KeyRecord>,
+    /// Tokens the account holds but can't transfer out (vesting allocations; vote locks).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub locks: Vec<Lock>,
+}
+
+impl Account {
+    /// What its locks hold at `height`: they overlap, so the largest applies (MAINNET-DESIGN
+    /// 3.7: transferable = liquid − max(0, that − staked − unbonding)). econ.rs enforces it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn locked_at(&self, height: u64) -> u64 {
+        self.locks.iter().map(|l| l.amount.locked_at(height)).max().unwrap_or(0)
+    }
+}
+
+/// A lock on an account's tokens (MAINNET-DESIGN 3.7). Locked tokens stay in the balance and can
+/// be staked, delegated and (vested) voted with, never transferred. econ.rs enforces them;
+/// governance adds vote locks.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+pub struct Lock {
+    /// Unique among the account's locks.
+    pub id: u64,
+    pub amount: LockAmount,
+    pub reason: String,
+}
+
+/// How much a lock holds, over time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LockAmount {
+    /// The unvested part of `total`: all of it before `cliff`, then less linearly from `start`
+    /// to `end` (see [`Vesting`]), nothing from `end` on.
+    Vesting {
+        #[serde(with = "u64_str")]
+        total: u64,
+        start: u64,
+        cliff: u64,
+        end: u64,
+    },
+}
+
+impl LockAmount {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn locked_at(&self, height: u64) -> u64 {
+        match *self {
+            LockAmount::Vesting { total, start, cliff, end } => {
+                if height < cliff {
+                    total
+                } else if height >= end || end <= start {
+                    0
+                } else {
+                    total - (total as u128 * (height - start) as u128 / (end - start) as u128) as u64
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
@@ -447,6 +760,14 @@ pub struct State {
     pub familiars: TMap<String, BTreeMap<String, String>>,
     /// 🪦 Proof of Contribution: Souls, vouches, claims, Séances, the pool's grants.
     pub poc: crate::poc::Poc,
+    /// What governance can change (params.rs); genesis constants are in `params`.
+    pub chain_params: ChainParams,
+    // The protocol v1 modules (MAINNET-DESIGN 3.4–3.9), each owning its slice of the state.
+    pub staking: crate::staking::Staking,
+    pub governance: crate::governance::Governance,
+    pub econ: crate::econ::Econ,
+    pub beacon: crate::beacon::Beacon,
+    pub upgrade: crate::upgrade::Upgrades,
     /// The authenticated tree over every record, as of the last `commit_block`.
     pub tree: crate::state::tree::Smt,
 }
@@ -479,12 +800,40 @@ impl State {
         let mut approved: Vec<&ValidatorRecord> = self.validators.values().filter(|v| v.status == ValidatorStatus::Approved).collect();
         approved.sort_by_key(|v| (v.approved_at, v.address.clone()));
         for v in approved {
-            if next.len() >= self.params.max_validators.max(1) {
+            if next.len() as u64 >= self.chain_params.max_validators.max(1) {
                 break;
             }
             next.push(v.address.clone());
         }
         if next.is_empty() { current } else { next }
+    }
+
+    /// The end-of-block steps, after a block's txs. Execution and replay both run exactly this,
+    /// in this order (the modules' hooks are no-ops until their packages land):
+    ///
+    /// 1. `poc_end_block`: the PoC seed, Séances closing and opening.
+    /// 2. `econ::end_block`: the base fee for a later block (3.6).
+    /// 3. `staking::end_block`: missed leader slots from `view`/`parent_view` (downtime), and the
+    ///    proposer's charge for the `skipped` txs (junk, 3.4).
+    /// 4. `governance::end_block`: proposals whose voting ended or whose timelock is over.
+    /// 5. At an epoch boundary: `econ::issue` (rewards into the pools), `staking::end_epoch`
+    ///    (jailing, the next set by stake), `beacon::end_epoch`, then [`State::end_epoch`] (the
+    ///    set history and the legacy admin-approved set).
+    ///
+    /// Then the caller commits the block and, last, runs `upgrade::check_next(height + 1)`, which
+    /// stops the node before a height its binary can't execute (3.9).
+    pub fn end_block(&mut self, b: &BlockInfo) {
+        self.poc_end_block(b.height, b.hash);
+        crate::econ::end_block(self, b);
+        crate::staking::end_block(self, b);
+        crate::governance::end_block(self, b);
+        if self.params.is_boundary(b.height) {
+            let epoch = self.params.epoch_of(b.height);
+            crate::econ::issue(self, epoch);
+            crate::staking::end_epoch(self, epoch);
+            crate::beacon::end_epoch(self, epoch);
+            self.end_epoch(epoch);
+        }
     }
 
     /// Runs after the last block of `epoch`: fixes the set for `epoch + 1`.
@@ -582,29 +931,71 @@ impl State {
         self.familiars.entry(account.to_string()).or_default()
     }
 
-    fn j_scalars(&mut self, j: &mut Journal) {
+    pub(crate) fn j_scalars(&mut self, j: &mut Journal) {
         if j.scalars.is_none() {
             j.scalars = Some((self.supply, self.burned));
         }
     }
 
+    /// Burns `amount` from the supply (it must already be out of every balance and escrow).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn j_burn(&mut self, j: &mut Journal, amount: u64) {
+        self.j_scalars(j);
+        self.supply -= amount;
+        self.burned += amount;
+    }
+
+    /// Mints `amount` into the supply (the caller credits it to a balance or an escrow).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn j_mint(&mut self, j: &mut Journal, amount: u64) {
+        self.j_scalars(j);
+        self.supply += amount;
+    }
+
+    pub(crate) fn name_mut(&mut self, j: &mut Journal, name: &str) -> Option<&mut NameRecord> {
+        j.names.touch(&self.names, name);
+        self.names.get_mut(name)
+    }
+
+    pub(crate) fn remove_name(&mut self, j: &mut Journal, name: &str) -> Option<NameRecord> {
+        j.names.touch(&self.names, name);
+        self.names.remove(name)
+    }
+
+    /// The governance-adjustable parameters, journaled (see [`State::exec_set_param`]).
+    pub(crate) fn chain_params_mut(&mut self, j: &mut Journal) -> &mut ChainParams {
+        if j.chain_params.is_none() {
+            j.chain_params = Some(self.chain_params.clone());
+        }
+        &mut self.chain_params
+    }
+
     /// Undoes everything recorded in `j` (values, and the dirty marks of keys it cleans up).
     pub fn rollback(&mut self, j: Journal) {
-        j.accounts.restore(&mut self.accounts);
-        j.names.restore(&mut self.names);
-        j.validators.restore(&mut self.validators);
-        if let Some((supply, burned)) = j.scalars {
+        let Journal { accounts, names, validators, hunts, github, github_by_account, familiars, scalars, next_hunt_id, chain_params, poc, staking, governance, econ, beacon, upgrade } = j;
+        accounts.restore(&mut self.accounts);
+        names.restore(&mut self.names);
+        validators.restore(&mut self.validators);
+        if let Some((supply, burned)) = scalars {
             self.supply = supply;
             self.burned = burned;
         }
-        j.hunts.restore(&mut self.hunts);
-        j.github.restore(&mut self.github);
-        j.github_by_account.restore(&mut self.github_by_account);
-        j.familiars.restore(&mut self.familiars);
-        if let Some(n) = j.next_hunt_id {
+        hunts.restore(&mut self.hunts);
+        github.restore(&mut self.github);
+        github_by_account.restore(&mut self.github_by_account);
+        familiars.restore(&mut self.familiars);
+        if let Some(n) = next_hunt_id {
             self.next_hunt_id = n;
         }
-        j.poc.rollback(&mut self.poc);
+        if let Some(c) = chain_params {
+            self.chain_params = c;
+        }
+        poc.rollback(&mut self.poc);
+        staking.rollback(&mut self.staking);
+        governance.rollback(&mut self.governance);
+        econ.rollback(&mut self.econ);
+        beacon.rollback(&mut self.beacon);
+        upgrade.rollback(&mut self.upgrade);
     }
 
     /// Checks that decide whether a tx can be included at all (at `height`). No state changes.
@@ -617,7 +1008,7 @@ impl State {
             tx.check_format()?;
         }
         tx.check_prefix(self.params.prefix())?;
-        check_validity(tx, height, self.params.max_tx_validity_blocks())?;
+        check_validity(tx, height, self.chain_params.max_tx_validity_blocks)?;
         let sender = tx.sender()?;
         let signer = tx.signer_key_id()?;
         let keys = self.keys_of(&sender);
@@ -720,6 +1111,9 @@ impl State {
                 if self.names.contains_key(&n) {
                     bail!("{n}{NAME_SUFFIX} is already taken");
                 }
+                if self.econ.reserved_names.contains_key(&n) {
+                    bail!("{n}{NAME_SUFFIX} is reserved");
+                }
                 self.j_debit(j, &sender, name_price(&n))?;
                 let treasury = self.treasury();
                 self.j_credit(j, &treasury, name_price(&n));
@@ -785,8 +1179,8 @@ impl State {
                 }
                 check_host_port(p2p_addr).context("p2p_addr")?;
                 check_http_addr(http_addr).context("http_addr")?;
-                if *bond < self.params.min_bond {
-                    bail!("bond must be at least {}", fmt_fang(self.params.min_bond));
+                if *bond < self.chain_params.min_self_bond {
+                    bail!("bond must be at least {}", fmt_fang(self.chain_params.min_self_bond));
                 }
                 let address = crypto::address_with_prefix(self.params.prefix(), &pk);
                 if let Some(v) = self.validators.get(&address) {
@@ -799,7 +1193,7 @@ impl State {
                 self.validator_mut(j, &address);
                 self.validators.insert(
                     address.clone(),
-                    ValidatorRecord { address, owner: sender.clone(), consensus_key: consensus_key.clone(), p2p_addr: p2p_addr.clone(), http_addr: http_addr.clone(), bond: *bond, status: ValidatorStatus::Pending, registered_at: height, approved_at: None, approved_by: None, active_from: None, removed_at: None, removed_by: None, active_until: None, unbond_epoch: None },
+                    ValidatorRecord { address, owner: sender.clone(), consensus_key: consensus_key.clone(), p2p_addr: p2p_addr.clone(), http_addr: http_addr.clone(), bond: *bond, status: ValidatorStatus::Pending, registered_at: height, approved_at: None, approved_by: None, active_from: None, removed_at: None, removed_by: None, active_until: None, unbond_epoch: None, commission_bps: 0 },
                 );
             }
             Action::ApproveValidator { validator } => {
@@ -871,8 +1265,7 @@ impl State {
                 self.github_by_account.insert(sender.clone(), lower);
             }
             Action::UnlinkGithub { handle } => {
-                let lower = handle.to_ascii_lowercase();
-                let link = self.github.get(&lower).cloned().ok_or_else(|| anyhow!("@{handle} isn't linked"))?;
+                let link = self.github.get(&handle.to_ascii_lowercase()).cloned().ok_or_else(|| anyhow!("@{handle} isn't linked"))?;
                 let admin = self.params.admins.contains(&sender);
                 if link.account != sender && !admin {
                     bail!("only the linked account or a validator admin can unlink @{handle}");
@@ -880,9 +1273,7 @@ impl State {
                 if link.account == sender && key.role != KeyRole::Owner {
                     bail!("only owner keys can unlink GitHub");
                 }
-                self.j_github(j, &lower, &link.account);
-                self.github.remove(&lower);
-                self.github_by_account.remove(&link.account);
+                self.exec_unlink_github(j, handle)?;
             }
             Action::CreateHunt { repo, issue, amount, expires_at, title } => {
                 if key.role != KeyRole::Owner {
@@ -969,17 +1360,7 @@ impl State {
                         bail!("hunt #{hunt_id} can be cancelled by its creator after block {}", h.expires_at);
                     }
                 }
-                let refunds: Vec<(String, u64)> = h.funders.iter().map(|(a, v)| (a.clone(), v.parse().unwrap_or(0))).collect();
-                let total: u64 = refunds.iter().try_fold(0u64, |acc, (_, v)| acc.checked_add(*v)).ok_or_else(|| anyhow!("escrow overflow"))?;
-                if total != h.amount {
-                    bail!("escrow accounting mismatch on hunt #{hunt_id}");
-                }
-                for (who, v) in refunds {
-                    self.j_credit(j, &who, v);
-                }
-                let h = self.hunt_mut(j, *hunt_id).unwrap();
-                h.status = HuntStatus::Cancelled;
-                h.cancelled_at = Some(height);
+                self.exec_refund_hunt(j, *hunt_id, height)?;
             }
             Action::RegisterFamiliar { key_id, label } => {
                 if key.role != KeyRole::Owner {
@@ -992,13 +1373,64 @@ impl State {
                 }
                 self.familiars_mut(j, &sender).insert(key_id.clone(), label.clone());
             }
+            // Protocol v1 (MAINNET-DESIGN 3.1): each module applies its own tags.
+            Action::Delegate { .. } | Action::Undelegate { .. } | Action::Redelegate { .. } | Action::WithdrawUnbonded {} | Action::UpdateValidator { .. } | Action::Unjail { .. } | Action::ReportEquivocation { .. } => crate::staking::apply(self, j, tx, &sender, signer, key, height)?,
+            Action::BeaconCommit { .. } | Action::BeaconReveal { .. } | Action::AttestRevert { .. } => crate::beacon::apply(self, j, tx, &sender, signer, key, height)?,
+            Action::Propose { .. } | Action::Vote { .. } | Action::Unlock {} | Action::MultisigCreate { .. } | Action::MultisigPropose { .. } | Action::MultisigApprove { .. } | Action::ClaimDistribution { .. } => crate::governance::apply(self, j, tx, &sender, signer, key, height)?,
+            Action::RenewName { .. } | Action::TransferName { .. } | Action::ReleaseName { .. } => crate::econ::apply(self, j, tx, &sender, signer, key, height)?,
             _ => self.apply_poc(j, tx, &sender, signer, key, height)?,
         }
         Ok(())
     }
 
+    // ---- levers: what the former admin actions do, without any signer check. Admin-signed txs
+    // (dev and test chains) call them after checking the signer; governance (P-GOV) calls them
+    // when a proposal executes. The PoC ones are in poc.rs, features and upgrades in upgrade.rs.
+
+    /// Drops a GitHub link (both directions).
+    pub(crate) fn exec_unlink_github(&mut self, j: &mut Journal, handle: &str) -> Result<()> {
+        let lower = handle.to_ascii_lowercase();
+        let link = self.github.get(&lower).cloned().ok_or_else(|| anyhow!("@{handle} isn't linked"))?;
+        self.j_github(j, &lower, &link.account);
+        self.github.remove(&lower);
+        self.github_by_account.remove(&link.account);
+        Ok(())
+    }
+
+    /// Cancels an open hunt and refunds every funder what they put in. Nobody can redirect a
+    /// hunt's escrow: it goes back exactly where it came from.
+    pub(crate) fn exec_refund_hunt(&mut self, j: &mut Journal, hunt_id: u64, height: u64) -> Result<()> {
+        let h = self.hunts.get(&hunt_id).ok_or_else(|| anyhow!("no hunt #{hunt_id}"))?;
+        if h.status != HuntStatus::Open {
+            bail!("hunt #{hunt_id} is already {:?}", h.status);
+        }
+        let refunds: Vec<(String, u64)> = h.funders.iter().map(|(a, v)| (a.clone(), v.parse().unwrap_or(0))).collect();
+        let total: u64 = refunds.iter().try_fold(0u64, |acc, (_, v)| acc.checked_add(*v)).ok_or_else(|| anyhow!("escrow overflow"))?;
+        if total != h.amount {
+            bail!("escrow accounting mismatch on hunt #{hunt_id}");
+        }
+        for (who, v) in refunds {
+            self.j_credit(j, &who, v);
+        }
+        let h = self.hunt_mut(j, hunt_id).unwrap();
+        h.status = HuntStatus::Cancelled;
+        h.cancelled_at = Some(height);
+        Ok(())
+    }
+
+    /// Sets a governance-adjustable parameter, within its bounds (`ParamChange`).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn exec_set_param(&mut self, j: &mut Journal, key: &str, value: u64) -> Result<()> {
+        let params = self.params.clone();
+        let mut next = self.chain_params.clone();
+        next.set(key, value, &params)?;
+        *self.chain_params_mut(j) = next;
+        Ok(())
+    }
+
     /// What admitting this tx reserves from the sender's balance (charge + amount moved out).
-    pub fn tx_debit(tx: &Tx) -> u64 {
+    /// Votes reserve nothing: they lock tokens the voter keeps.
+    pub fn tx_debit(&self, tx: &Tx) -> u64 {
         tx.charge().unwrap_or(u64::MAX).saturating_add(match &tx.action {
             Action::Transfer { amount, .. } => *amount,
             Action::RegisterName { name } => normalize_name(name).map(|n| name_price(&n)).unwrap_or(0),
@@ -1007,6 +1439,9 @@ impl State {
             Action::FundPool { amount } | Action::JoinJury { bond: amount } => *amount,
             Action::Vouch { .. } => crate::poc::VOUCH_BOND,
             Action::SubmitClaim { .. } => crate::poc::CLAIM_BOND,
+            Action::Delegate { amount, .. } => *amount,
+            Action::Propose { deposit, .. } => *deposit,
+            Action::RenewName { name, years } => normalize_name(name).map(|n| self.chain_params.name_renewal_price(n.len(), *years as u64)).unwrap_or(0),
             _ => 0,
         })
     }
@@ -1078,6 +1513,10 @@ impl State {
                 format!("{from} cancelled the hunt on {what}; funders were refunded")
             }
             Action::RegisterFamiliar { label, .. } => format!("{from} registered the Familiar “{label}”"),
+            Action::Delegate { .. } | Action::Undelegate { .. } | Action::Redelegate { .. } | Action::WithdrawUnbonded {} | Action::UpdateValidator { .. } | Action::Unjail { .. } | Action::ReportEquivocation { .. } => crate::staking::describe(self, tx, &from),
+            Action::BeaconCommit { .. } | Action::BeaconReveal { .. } | Action::AttestRevert { .. } => crate::beacon::describe(self, tx, &from),
+            Action::Propose { .. } | Action::Vote { .. } | Action::Unlock {} | Action::MultisigCreate { .. } | Action::MultisigPropose { .. } | Action::MultisigApprove { .. } | Action::ClaimDistribution { .. } => crate::governance::describe(self, tx, &from),
+            Action::RenewName { .. } | Action::TransferName { .. } | Action::ReleaseName { .. } => crate::econ::describe(self, tx, &from),
             _ => self.describe_poc(tx, &from),
         }
     }
@@ -1124,18 +1563,21 @@ pub struct SummonOpts {
     /// Season 0 validator admins; defaults to the first validator's account.
     pub admins: Vec<String>,
     pub epoch_blocks: u64,
-    /// Minimum validator bond in drops. `None`: 50 FANG on faucet chains (one faucet drip
-    /// covers it), 10,000 FANG otherwise.
+    /// Minimum validator self-bond in drops (`params.min_self_bond`). `None`: 50 FANG on faucet
+    /// chains (one faucet drip covers it), the `ChainParams` default otherwise.
     pub min_bond: Option<u64>,
     /// Proof of Contribution timings (`None`: derived from the block time).
     pub contribution: Option<crate::poc::PocTimes>,
     /// Address prefix: `boo` (mainnet, dev) or `tboo` (public testnets).
     pub address_prefix: String,
+    /// Genesis `params` overrides (`blockula dev` shortens durations with
+    /// `ChainParams::dev_overrides`). `min_bond`, when set, wins for `min_self_bond`.
+    pub params: BTreeMap<String, u64>,
 }
 
 impl SummonOpts {
     pub fn new(chain_id: &str, validators: usize) -> Self {
-        Self { chain_id: chain_id.into(), faucet: true, block_time_ms: 1000, validators, http_port: None, admins: vec![], epoch_blocks: default_epoch_blocks(), min_bond: None, contribution: None, address_prefix: default_address_prefix() }
+        Self { chain_id: chain_id.into(), faucet: true, block_time_ms: 1000, validators, http_port: None, admins: vec![], epoch_blocks: default_epoch_blocks(), min_bond: None, contribution: None, address_prefix: default_address_prefix(), params: BTreeMap::new() }
     }
 }
 
@@ -1341,9 +1783,19 @@ impl Chain {
             infos.push(ValidatorInfo { address: k.address_with(prefix), public_key: hex::encode(k.public_key()), p2p_addr: format!("127.0.0.1:{}", free_port()?), http_addr: format!("127.0.0.1:{http}") });
         }
         let per_validator = 1_000_000_000 * DROPS_PER_FANG / validators as u64;
-        let mut allocations: Vec<Allocation> = keys.iter().map(|k| Allocation { address: k.address_with(prefix), amount: per_validator }).collect();
-        allocations.push(Allocation { address: treasury(prefix), amount: 100_000_000 * DROPS_PER_FANG });
+        let mut allocations: Vec<Allocation> = keys.iter().map(|k| Allocation { address: k.address_with(prefix), amount: per_validator, vesting: None, label: None }).collect();
+        allocations.push(Allocation { address: treasury(prefix), amount: 100_000_000 * DROPS_PER_FANG, vesting: None, label: Some("treasury".into()) });
         let validator_admins = if o.admins.is_empty() { vec![keys[0].address_with(prefix)] } else { o.admins.clone() };
+        let mut param_overrides = o.params.clone();
+        match o.min_bond {
+            Some(b) => {
+                param_overrides.insert("min_self_bond".into(), b);
+            }
+            None if faucet => {
+                param_overrides.entry("min_self_bond".into()).or_insert(50 * DROPS_PER_FANG);
+            }
+            None => {}
+        }
         let genesis = Genesis {
             chain_id: chain_id.to_string(),
             token: "FANG".into(),
@@ -1355,11 +1807,15 @@ impl Chain {
             allocations,
             epoch_blocks: o.epoch_blocks,
             validator_admins,
-            min_bond: o.min_bond.unwrap_or(if faucet { 50 * DROPS_PER_FANG } else { default_min_bond() }),
-            max_validators: default_max_validators(),
             contribution: o.contribution.clone(),
             address_prefix: prefix.into(),
+            param_overrides,
+            operators: vec![],
+            reserved_names: vec![],
+            soul_ledger: vec![],
+            features: vec![],
         };
+        genesis.check()?;
         let homes: Vec<PathBuf> = if validators == 1 { vec![home.to_path_buf()] } else { (0..validators).map(|i| home.join(format!("v{i}"))).collect() };
         for (h, k) in homes.iter().zip(&keys) {
             fs::create_dir_all(h)?;
@@ -1681,9 +2137,8 @@ impl Chain {
                 bail!("replaying block {}: tx {i} gave {outcome:?}, recorded {expected:?}", block.height);
             }
         }
-        self.state.poc_end_block(block.height, &block.hash);
+        self.state.end_block(&BlockInfo { height: block.height, hash: &block.hash, proposer: &block.proposer, view: block.view, parent_view: block.parent_view, skipped: &block.skipped });
         if self.state.params.is_boundary(block.height) {
-            self.state.end_epoch(self.state.params.epoch_of(block.height));
             self.record_epoch(block.height);
         }
         let root = hex::encode(self.state.commit_block()?.root);
@@ -1692,9 +2147,11 @@ impl Chain {
         if root != block.state_root {
             bail!("state root mismatch at height {}", block.height);
         }
+        let height = block.height;
         self.index(&block);
         self.push_block(block, offset);
-        Ok(())
+        // As in `execute`: stop before a height this binary can't run (3.9).
+        crate::upgrade::check_next(&self.state, height + 1)
     }
 
     fn note_failed(&mut self, id: String, reason: String, height: u64) {
@@ -1725,6 +2182,7 @@ impl Chain {
         }
         let mut txs = vec![];
         let mut failed = BTreeMap::new();
+        let mut skipped = vec![];
         for tx in f.txs {
             match self.state.apply(&tx, &self.genesis.chain_id, &f.proposer, f.height) {
                 Ok(Outcome::Applied) => txs.push(tx),
@@ -1733,20 +2191,20 @@ impl Chain {
                     self.note_failed(tx.id(), r, f.height);
                     txs.push(tx);
                 }
-                Err(e) => self.note_failed(tx.id(), format!("not included: {e}"), f.height),
+                Err(e) => {
+                    skipped.push(tx.size());
+                    self.note_failed(tx.id(), format!("not included: {e}"), f.height);
+                }
             }
         }
-        self.state.poc_end_block(f.height, &f.hash);
-        if self.state.params.is_boundary(f.height) {
-            self.state.end_epoch(self.state.params.epoch_of(f.height));
-            if self.record_epoch(f.height) {
-                self.sign_handoffs();
-            }
+        self.state.end_block(&BlockInfo { height: f.height, hash: &f.hash, proposer: &f.proposer, view: f.view, parent_view: f.parent_view, skipped: &skipped });
+        if self.state.params.is_boundary(f.height) && self.record_epoch(f.height) {
+            self.sign_handoffs();
         }
         let state_root = hex::encode(self.state.commit_block()?.root);
         #[cfg(test)]
         self.state.debug_check(f.height);
-        let block = Block { height: f.height, prev_hash: f.parent, timestamp_ms: f.timestamp_ms, view: f.view, parent_view: f.parent_view, version: f.version, proposer: f.proposer, state_root, txs, hash: f.hash, signature: String::new(), failed };
+        let block = Block { height: f.height, prev_hash: f.parent, timestamp_ms: f.timestamp_ms, view: f.view, parent_view: f.parent_view, version: f.version, proposer: f.proposer, state_root, txs, hash: f.hash, signature: String::new(), failed, skipped };
         let (at, len) = self.cblocks.append(f.height, &f.cblock)?;
         self.cblock_index.push((at, len));
         let line = serde_json::to_string(&block)? + "\n";
@@ -1765,7 +2223,10 @@ impl Chain {
             self.take_snapshot();
         }
         self.revalidate_mempool();
-        Ok(())
+        // The last end-of-block step: the block is executed and stored, but if this binary can't
+        // run the next height, stop here (the error leaves the block unacknowledged, so consensus
+        // stops delivering) instead of diverging. P-UPGRADE turns this into a clean exit.
+        crate::upgrade::check_next(&self.state, f.height + 1)
     }
 
     /// After executing an epoch's last block: remember the next epoch's set. Returns whether it
@@ -1863,7 +2324,7 @@ impl Chain {
         for tx in &self.mempool {
             let e = self.pending.entry(tx.from.clone()).or_default();
             e.0 += 1;
-            e.1 = e.1.saturating_add(State::tx_debit(tx));
+            e.1 = e.1.saturating_add(self.state.tx_debit(tx));
         }
     }
 
@@ -1971,7 +2432,7 @@ impl Chain {
         if let Some(g) = &self.gossip {
             let _ = g.unbounded_send(tx.clone());
         }
-        let debit = State::tx_debit(&tx);
+        let debit = self.state.tx_debit(&tx);
         let e = self.pending.entry(sender.clone()).or_default();
         e.0 += 1;
         e.1 = e.1.saturating_add(debit);
@@ -1993,7 +2454,7 @@ impl Chain {
             if self.pending.get(&sender).is_some_and(|p| p.0 >= MAX_PENDING_PER_SENDER) || self.mempool.len() >= MAX_MEMPOOL {
                 return Ok(());
             }
-            let debit = State::tx_debit(&tx);
+            let debit = self.state.tx_debit(&tx);
             let e = self.pending.entry(sender.clone()).or_default();
             e.0 += 1;
             e.1 = e.1.saturating_add(debit);
@@ -2055,7 +2516,7 @@ impl Chain {
             from,
             fee: 0,
             tip: 0,
-            valid_until: self.height() + OWN_TX_VALIDITY.min(self.state.params.max_tx_validity_blocks()),
+            valid_until: self.height() + OWN_TX_VALIDITY.min(self.state.chain_params.max_tx_validity_blocks),
             action,
             memo: memo.into(),
             public_key: hex::encode(keys.public_key()),
@@ -2771,7 +3232,7 @@ mod v1 {
         let h = c.height();
         let send = |c: &Chain, valid_until: u64| tx(c, &a, &a.address(), 0, 0, valid_until, Action::Transfer { to: friend.clone(), amount: DROPS_PER_FANG });
         // Admission wants `next <= valid_until <= next + an hour of blocks`.
-        let max = c.state.params.max_tx_validity_blocks();
+        let max = c.state.chain_params.max_tx_validity_blocks;
         assert_eq!(max, 3_600, "an hour of 1 s blocks");
         assert_eq!(c.submit(send(&c, h)).unwrap_err().to_string(), format!("expired at block {h}"));
         assert!(c.submit(send(&c, h + 1 + max + 1)).unwrap_err().to_string().contains("too far ahead"));
@@ -2859,6 +3320,329 @@ mod v1 {
         }
         let order: Vec<String> = proposal_order(&c.mempool).iter().map(|t| t.id()).collect();
         assert_eq!(order, [&b, &d, &e, &a0, &a1].map(|t| t.id()));
+        fs::remove_dir_all(home).ok();
+    }
+}
+
+/// The protocol v1 scaffold: genesis fields and parameters, the levers governance will call,
+/// dispatch of the new tags to their modules, and the end-of-block steps.
+#[cfg(test)]
+mod scaffold {
+    use super::*;
+    use crate::poc::SOUL;
+    use crate::state::ns;
+
+    const FANG: u64 = DROPS_PER_FANG;
+    const VALIDATOR: [u8; 32] = [21; 32];
+    const P2P: &str = "127.0.0.1:7001";
+    const HTTP: &str = "127.0.0.1:7000";
+
+    fn keys(seed: u8) -> Keys {
+        Keys::from_seed([seed; 32])
+    }
+
+    /// A protocol v1 genesis: one validator owned by an operator, a vesting founder, the
+    /// community bucket, reserved names, a Soul ledger, parameter overrides and Ghost Mode on.
+    fn genesis(chain_id: &str) -> Genesis {
+        let (v, owner, founder) = (Keys::from_seed(VALIDATOR), keys(22), keys(23));
+        let alloc = |address: String, amount: u64, vesting: Option<Vesting>, label: Option<&str>| Allocation { address, amount, vesting, label: label.map(String::from) };
+        Genesis {
+            chain_id: chain_id.into(),
+            token: "FANG".into(),
+            decimals: DECIMALS,
+            block_time_ms: 1000,
+            validators: vec![ValidatorInfo { address: v.address(), public_key: hex::encode(v.public_key()), p2p_addr: P2P.into(), http_addr: HTTP.into() }],
+            faucet: false,
+            created_at_ms: 1_750_000_000_000,
+            allocations: vec![
+                alloc(owner.address(), 20_000 * FANG, None, Some("genesis operator")),
+                alloc(founder.address(), 1_000_000 * FANG, Some(Vesting { start: 0, cliff: 100, end: 1_000 }), Some("founder")),
+                alloc(community("boo"), 5_000_000 * FANG, None, Some("community")),
+                alloc(treasury("boo"), 2_000_000 * FANG, Some(Vesting { start: 0, cliff: 0, end: 4_000 }), Some("treasury")),
+            ],
+            epoch_blocks: 600,
+            validator_admins: vec![],
+            contribution: None,
+            address_prefix: "boo".into(),
+            param_overrides: BTreeMap::from([("max_validators".into(), 40), ("proposal_deposit".into(), 50 * FANG)]),
+            operators: vec![Operator {
+                owner: owner.address(),
+                consensus_key: hex::encode(v.public_key()),
+                pop: make_pop(VALIDATOR, chain_id, &owner.address(), P2P, HTTP),
+                p2p_addr: P2P.into(),
+                http_addr: HTTP.into(),
+                self_bond: 10_000 * FANG,
+                commission_bps: 500,
+                provider: Some("OVHcloud".into()),
+                asn: Some(16_276),
+                country: Some("FR".into()),
+                entity: Some("Owner SAS".into()),
+            }],
+            reserved_names: vec!["blockula".into(), "foundation".into()],
+            soul_ledger: vec![SoulEntry { account: owner.address(), soul: 50 * SOUL, reason: "testnet contributor".into() }],
+            features: vec!["ghost".into()],
+        }
+    }
+
+    /// A home on `g`, opened as its validator.
+    fn open(tag: &str, g: &Genesis) -> (PathBuf, Chain) {
+        let home = std::env::temp_dir().join(format!("blockula-scaffold-{tag}-{}-{}", now_ms(), std::process::id()));
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("genesis.json"), serde_json::to_string_pretty(g).unwrap()).unwrap();
+        write_secret(&home.join("validator.key"), &hex::encode(VALIDATOR)).unwrap();
+        let c = Chain::open(&home).unwrap();
+        (home, c)
+    }
+
+    fn signed(c: &Chain, k: &Keys, action: Action) -> Tx {
+        let from = k.address_with(c.state.params.prefix());
+        let mut tx = Tx { chain_id: c.genesis.chain_id.clone(), nonce: c.next_nonce(&from), from, fee: 0, tip: 0, valid_until: c.height() + 100, action, memo: String::new(), public_key: hex::encode(k.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+        tx.fee = min_fee(tx.size());
+        tx.sign(k)
+    }
+
+    #[test]
+    fn genesis_fields_become_state_records() {
+        let g = genesis("scaffold-1");
+        g.check().unwrap();
+        let (home, c) = open("records", &g);
+        let s = &c.state;
+        let (v, owner, founder) = (Keys::from_seed(VALIDATOR).address(), keys(22).address(), keys(23).address());
+        // Parameters: the overrides, and defaults for the rest.
+        assert_eq!((s.chain_params.max_validators, s.chain_params.proposal_deposit), (40, 50 * FANG));
+        assert_eq!(s.chain_params.unbonding_blocks, 21 * 86_400);
+        assert!(s.record(ns::META, crate::state::meta::CHAIN_PARAMS).is_some());
+        // The operator owns its validator; the self-bond left its balance for the bond (escrow).
+        let rec = &s.validators[&v];
+        assert_eq!((rec.owner.as_str(), rec.bond, rec.commission_bps, rec.status), (owner.as_str(), 10_000 * FANG, 500, ValidatorStatus::Active));
+        assert_eq!(s.account(&owner).balance, 10_000 * FANG);
+        // Vesting allocations are locks on the account, released linearly after the cliff.
+        let locks = s.account(&founder).locks;
+        assert_eq!(locks, vec![Lock { id: 0, amount: LockAmount::Vesting { total: 1_000_000 * FANG, start: 0, cliff: 100, end: 1_000 }, reason: "founder".into() }]);
+        let f = s.account(&founder);
+        assert_eq!((f.locked_at(0), f.locked_at(99), f.locked_at(100), f.locked_at(550), f.locked_at(1_000)), (1_000_000 * FANG, 1_000_000 * FANG, 900_000 * FANG, 450_000 * FANG, 0));
+        assert_eq!(s.account(&s.treasury()).locked_at(1_000), 1_500_000 * FANG);
+        assert_eq!(system_account("boo", &community("boo")), Some("community"));
+        assert_eq!(system_account("boo", &owner), None);
+        // Reserved names, the Soul ledger and features are records too.
+        assert!(s.econ.reserved_names.contains_key("blockula") && s.record(ns::RESERVED_NAMES, b"foundation").is_some());
+        assert_eq!(s.soul_of(&owner, 0), 50 * SOUL);
+        assert!(crate::upgrade::is_active(s, "ghost") && s.record(ns::FEATURES, b"ghost").is_some());
+        s.check_invariants().unwrap();
+        assert_eq!(s.supply, 8_020_000 * FANG);
+        // The same genesis through its JSON gives the same state.
+        assert_eq!(Genesis::load(&home.join("genesis.json")).unwrap().initial_state().root(), c.genesis_root);
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn genesis_is_validated() {
+        let dir = std::env::temp_dir().join(format!("blockula-scaffold-check-{}-{}", now_ms(), std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("genesis.json");
+        let load = |v: &serde_json::Value| {
+            fs::write(&path, serde_json::to_vec(v).unwrap()).unwrap();
+            Genesis::load(&path).map(|_| ()).map_err(|e| format!("{e:#}"))
+        };
+        let good = serde_json::to_value(genesis("scaffold-1")).unwrap();
+        load(&good).unwrap();
+        let refused = |edit: &dyn Fn(&mut serde_json::Value), why: &str| {
+            let mut v = good.clone();
+            edit(&mut v);
+            let err = load(&v).expect_err(why);
+            assert!(err.contains(why), "expected “{why}”, got: {err}");
+        };
+        // Parameters: values as strings or numbers, within bounds, known keys only.
+        let mut v = good.clone();
+        v["params"]["quorum_floor"] = serde_json::json!("30000000000000000");
+        v["params"]["downtime_window"] = serde_json::json!(200);
+        load(&v).unwrap();
+        refused(&|v| v["params"]["max_validators"] = 0.into(), "`max_validators` must be 1–1000");
+        refused(&|v| v["params"]["issuance_floor_ppm"] = 4_999.into(), "issuance_floor_ppm");
+        refused(&|v| v["params"]["issuance_stakers_bps"] = 4_000.into(), "issuance_stakers_bps");
+        refused(&|v| v["params"]["max_block_bytes"] = (8u64 << 20).into(), "max_block_bytes");
+        refused(&|v| v["params"]["warp_speed"] = 1.into(), "unknown parameter `warp_speed`");
+        refused(&|v| v["min_bond"] = "1".into(), "moved to `params.min_self_bond`");
+        // Allocations and vesting.
+        refused(&|v| v["allocations"][1]["vesting"]["cliff"] = 2_000.into(), "start ≤ cliff ≤ end");
+        refused(&|v| v["allocations"][1]["vesting"]["extra"] = 1.into(), "unknown field");
+        refused(&|v| v["allocations"][0]["vestng"] = serde_json::json!({}), "unknown field");
+        refused(
+            &|v| {
+                let mut twice = v["allocations"][1].clone();
+                twice["amount"] = "1".into();
+                v["allocations"].as_array_mut().unwrap().push(twice);
+            },
+            "more than one vesting allocation",
+        );
+        // Operators: their validator, a proof of possession, a self-bond they can pay.
+        refused(&|v| v["operators"][0]["pop"] = "00".repeat(crypto::SIGNATURE_LEN).into(), "pop");
+        refused(&|v| v["operators"][0]["self_bond"] = "1".into(), "below min_self_bond");
+        refused(&|v| v["operators"][0]["self_bond"] = (30_000 * FANG).to_string().into(), "allocations hold");
+        refused(&|v| v["operators"][0]["commission_bps"] = 10_001.into(), "commission_max_bps");
+        refused(&|v| v["operators"][0]["consensus_key"] = hex::encode(keys(99).public_key()).into(), "isn't one of the genesis validators");
+        refused(&|v| v["operators"][0]["country"] = "France".into(), "ISO 3166-1");
+        refused(&|v| v["operators"][0]["owner"] = treasury("boo").into(), "can't own a validator");
+        // Reserved names, the Soul ledger and features.
+        refused(&|v| v["reserved_names"][0] = "blockula.boo".into(), "bare lowercase name");
+        refused(&|v| v["reserved_names"][1] = "blockula".into(), "listed twice");
+        refused(&|v| v["soul_ledger"][0]["soul"] = 0.into(), "milli-Soul");
+        refused(&|v| v["soul_ledger"][0]["account"] = community("boo").into(), "system account");
+        refused(&|v| v["features"][0] = "warp".into(), "unknown feature warp");
+        // Mainnet: no admin keys, no faucet, an operator for every validator.
+        let mut main = serde_json::to_value(genesis(MAINNET_CHAIN_ID)).unwrap();
+        load(&main).unwrap();
+        main["validator_admins"] = serde_json::json!([keys(22).address()]);
+        assert!(load(&main).unwrap_err().contains("no admin keys"));
+        let mut main = serde_json::to_value(genesis(MAINNET_CHAIN_ID)).unwrap();
+        main["faucet"] = true.into();
+        assert!(load(&main).unwrap_err().contains("no faucet"));
+        let mut main = serde_json::to_value(genesis(MAINNET_CHAIN_ID)).unwrap();
+        main["operators"] = serde_json::json!([]);
+        assert!(load(&main).unwrap_err().contains("needs an operator"));
+        // Other chains may keep admins (dev and test).
+        let mut test = good.clone();
+        test["validator_admins"] = serde_json::json!([keys(22).address()]);
+        load(&test).unwrap();
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn new_tags_dispatch_to_their_modules() {
+        let (home, mut c) = open("dispatch", &genesis("scaffold-1"));
+        let (owner, bob) = (keys(22), keys(24));
+        let v = Keys::from_seed(VALIDATOR).address();
+        // Modules that haven't landed refuse their txs; a block carrying one charges its fee.
+        let delegate = signed(&c, &owner, Action::Delegate { validator: v.clone(), amount: FANG });
+        assert_eq!(c.submit(delegate.clone()).unwrap_err().to_string(), "not active yet");
+        for action in [Action::Propose { kind: ProposalKind::Text {}, deposit: FANG, title: "t".into(), url: String::new() }, Action::BeaconCommit { epoch: 1, commitment: "ab".repeat(32) }, Action::RenewName { name: "abc".into(), years: 1 }] {
+            assert_eq!(c.submit(signed(&c, &owner, action)).unwrap_err().to_string(), "not active yet");
+        }
+        let before = c.state.account(&owner.address()).balance;
+        c.produce_block_with(vec![delegate.clone()]).unwrap();
+        assert_eq!(c.failure(&delegate.id()).unwrap().0, "not active yet");
+        assert_eq!(c.state.account(&owner.address()).balance, before - delegate.charge().unwrap());
+        // Reserved names can't be registered; names transfer and release.
+        assert!(c.submit(signed(&c, &owner, Action::RegisterName { name: "blockula".into() })).unwrap_err().to_string().contains("reserved"));
+        c.submit(signed(&c, &owner, Action::RegisterName { name: "owner".into() })).unwrap();
+        c.produce_block().unwrap();
+        let give = signed(&c, &owner, Action::TransferName { name: "owner.boo".into(), to: bob.address() });
+        assert_eq!(c.state.describe(&give, None), format!("owner.boo gave owner.boo to {}", short(&bob.address())));
+        c.submit(give).unwrap();
+        c.produce_block().unwrap();
+        assert_eq!(c.state.resolve("owner.boo").unwrap(), bob.address());
+        // Bob holds nothing yet: his release can't even pay its fee.
+        assert!(c.submit(signed(&c, &bob, Action::ReleaseName { name: "owner".into() })).unwrap_err().to_string().contains("insufficient balance"));
+        assert!(c.submit(signed(&c, &owner, Action::ReleaseName { name: "owner".into() })).unwrap_err().to_string().contains("belongs to"));
+        // Without admins, the admin levers are closed.
+        for action in [Action::SetRepo { repo: "a/b".into(), weight: 1 }, Action::GrantSoul { to: bob.address(), amount: SOUL, reason: "r".into() }] {
+            assert!(c.submit(signed(&c, &owner, action)).unwrap_err().to_string().contains("only validator admins"));
+        }
+        // What admitting a tx reserves: amounts that leave the balance, not vote locks.
+        let reserve = |a: Action| c.state.tx_debit(&signed(&c, &owner, a)) - signed(&c, &owner, Action::Unlock {}).charge().unwrap();
+        assert!(reserve(Action::Delegate { validator: v.clone(), amount: 7 * FANG }) >= 7 * FANG);
+        assert!(reserve(Action::Propose { kind: ProposalKind::Text {}, deposit: 9 * FANG, title: "t".into(), url: String::new() }) >= 9 * FANG);
+        assert!(reserve(Action::Vote { proposal_id: 0, aye: true, amount: 1_000 * FANG, conviction: 6 }) < FANG);
+        let root = c.state.root();
+        drop(c);
+        assert_eq!(Chain::open(&home).unwrap().state.root(), root, "replays");
+        fs::remove_dir_all(home).ok();
+    }
+
+    /// Every action has a plain-English summary, starting with who acted.
+    #[test]
+    fn every_action_is_described() {
+        let st = genesis("scaffold-1").initial_state();
+        let owner = keys(22);
+        for action in crate::types::tests::vector_actions().into_iter().chain(crate::types::tests::v1_vector_actions()) {
+            let tx = Tx { chain_id: "c".into(), from: owner.address(), nonce: 0, fee: 0, tip: 0, valid_until: 0, action, memo: String::new(), public_key: hex::encode(owner.public_key()), signature: String::new() };
+            let summary = st.describe(&tx, Some(1));
+            assert!(summary.starts_with(&short(&owner.address())) && summary.len() > 30, "{:?}: “{summary}”", tx.action);
+        }
+        let vote = |conviction| Tx { chain_id: "c".into(), from: owner.address(), nonce: 0, fee: 0, tip: 0, valid_until: 0, action: Action::Vote { proposal_id: 3, aye: false, amount: 2 * FANG, conviction }, memo: String::new(), public_key: String::new(), signature: String::new() };
+        assert!(st.describe(&vote(0), None).ends_with("voted nay on proposal #3 with 2 FANG at 0.1× conviction"));
+        let spend = Tx { action: Action::Propose { kind: ProposalKind::TreasurySpend { to: keys(22).address(), amount: FANG }, deposit: 50 * FANG, title: "Grants".into(), url: String::new() }, ..vote(1) };
+        assert!(st.describe(&spend, None).ends_with(&format!("proposed “Grants”: pay 1 FANG from the treasury to {}, bonding 50 FANG", short(&owner.address()))));
+    }
+
+    #[test]
+    fn levers_run_without_signers_and_roll_back() {
+        let (home, mut c) = open("levers", &genesis("scaffold-1"));
+        let (owner, bob) = (keys(22), keys(24));
+        // A hunt for the refund lever (anyone can create one).
+        c.submit(signed(&c, &owner, Action::CreateHunt { repo: "a/b".into(), issue: 1, amount: 10 * FANG, expires_at: 1_000, title: "t".into() })).unwrap();
+        c.produce_block().unwrap();
+        let s = &mut c.state;
+        let h = 5;
+        let (root, supply, burned, params) = (s.full_root(), s.supply, s.burned, s.chain_params.clone());
+        let mut j = Journal::default();
+        // Parameters, within bounds only.
+        s.exec_set_param(&mut j, "max_validators", 64).unwrap();
+        assert!(s.exec_set_param(&mut j, "issuance_floor_ppm", 1).is_err());
+        assert!(s.exec_set_param(&mut j, "nope", 1).is_err());
+        assert_eq!(s.chain_params.max_validators, 64);
+        // Supply.
+        s.j_mint(&mut j, 5);
+        s.j_credit(&mut j, &bob.address(), 5);
+        s.j_debit(&mut j, &bob.address(), 2).unwrap();
+        s.j_burn(&mut j, 2);
+        assert_eq!((s.supply, s.burned), (supply + 3, burned + 2));
+        // The PoC levers, no admin needed.
+        s.exec_set_repo(&mut j, "a/b", 10, h).unwrap();
+        s.exec_grant_soul(&mut j, &bob.address(), 5 * SOUL, h).unwrap();
+        assert!(s.exec_grant_soul(&mut j, &bob.address(), crate::poc::MAX_SOUL_GRANT + 1, h).is_err());
+        s.exec_flag_sybil(&mut j, &bob.address(), "proposal #1", "same person", h).unwrap();
+        assert_eq!(s.soul_of(&bob.address(), h), 0);
+        assert!(s.exec_clawback(&mut j, &bob.address(), h).unwrap_err().to_string().contains("no unvested rewards"));
+        assert!(s.exec_reject_claim(&mut j, 0, "r", h).unwrap_err().to_string().contains("no claim"));
+        assert!(s.exec_unlink_github(&mut j, "nobody").unwrap_err().to_string().contains("isn't linked"));
+        let funded = s.account(&owner.address()).balance;
+        s.exec_refund_hunt(&mut j, 0, h).unwrap();
+        assert_eq!(s.account(&owner.address()).balance, funded + 10 * FANG);
+        assert!(s.exec_refund_hunt(&mut j, 0, h).unwrap_err().to_string().contains("already Cancelled"));
+        // Upgrades and features.
+        crate::upgrade::exec_deactivate_feature(s, &mut j, "ghost").unwrap();
+        assert!(crate::upgrade::exec_deactivate_feature(s, &mut j, "ghost").is_err());
+        crate::upgrade::exec_activate_feature(s, &mut j, "ghost", h).unwrap();
+        assert!(crate::upgrade::exec_activate_feature(s, &mut j, "warp", h).is_err());
+        assert!(crate::upgrade::exec_schedule_upgrade(s, &mut j, 9, h, h).is_err(), "only after now");
+        crate::upgrade::exec_schedule_upgrade(s, &mut j, 9, 100, h).unwrap();
+        assert!(crate::upgrade::exec_schedule_upgrade(s, &mut j, 10, 50, h).is_err(), "only after the last one");
+        assert_eq!(crate::upgrade::version_at(s, 100), 9);
+        s.check_invariants().unwrap();
+        // Everything rolls back, dirty marks included.
+        s.rollback(j);
+        assert_eq!((s.full_root(), s.supply, s.burned, &s.chain_params), (root, supply, burned, &params));
+        assert_eq!(s.commit_block().unwrap().records, vec![], "nothing left to commit");
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn skipped_txs_are_recorded_and_replayed() {
+        let (home, mut c) = open("skipped", &genesis("scaffold-1"));
+        let owner = keys(22);
+        let ok = signed(&c, &owner, Action::Transfer { to: keys(24).address(), amount: FANG });
+        let stale = Tx { nonce: 7, ..signed(&c, &owner, Action::Transfer { to: keys(24).address(), amount: FANG }) }.sign(&owner);
+        c.produce_block_with(vec![ok, stale.clone()]).unwrap();
+        let b = c.last_block().unwrap();
+        assert_eq!((b.txs.len(), b.skipped.clone()), (1, vec![stale.size()]));
+        let root = c.state.root();
+        drop(c);
+        let c = Chain::open(&home).unwrap();
+        assert_eq!((c.state.root(), c.block(1).unwrap().skipped), (root, vec![stale.size()]));
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn a_binary_stops_before_a_version_it_cant_run() {
+        let (home, mut c) = open("halt", &genesis("scaffold-1"));
+        c.produce_block_with(vec![]).unwrap();
+        let unsupported = crate::consensus::SUPPORTED_PROTOCOL_VERSION + 1;
+        c.state.upgrade.schedule = vec![crate::upgrade::ScheduledUpgrade { version: unsupported, activation_height: 3 }];
+        // Block 2 executes (and is stored); the check for block 3 stops the node.
+        let err = c.produce_block_with(vec![]).unwrap_err().to_string();
+        assert!(err.contains("block 3 runs protocol") && err.contains("upgrade blockula"), "{err}");
+        assert_eq!(c.height(), 2);
         fs::remove_dir_all(home).ok();
     }
 }

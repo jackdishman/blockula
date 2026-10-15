@@ -196,7 +196,7 @@ pub fn run(cmd: ValidatorCmd) -> Result<()> {
             println!("   consensus key: ML-DSA-65, {}…", &hex::encode(keys.public_key())[..32]);
             println!("   advertised p2p {p2p} · http {http}");
             println!("\nNext:");
-            println!("   1. Fund {me} with at least {} plus fees (testnets: POST /api/faucet {{\"to\": \"{me}\"}})", fmt_fang(g.min_bond));
+            println!("   1. Fund {me} with at least {} plus fees (testnets: POST /api/faucet {{\"to\": \"{me}\"}})", fmt_fang(g.chain_params()?.min_self_bond));
             println!("   2. blockula validator register --home {} --rpc <node url>", home.display());
             println!("   3. Ask a validator admin to approve {me}");
             println!("   4. blockula run --home {} --bind 0.0.0.0   (syncs now, votes from its activation epoch)", home.display());
@@ -213,7 +213,7 @@ pub fn run(cmd: ValidatorCmd) -> Result<()> {
             let rt = rt()?;
             let bond = match bond {
                 Some(b) => parse_fang(&b)?,
-                None => rt.block_on(get(&rpc, "/validators"))?["min_bond"].as_str().and_then(|s| s.parse().ok()).unwrap_or(g.min_bond),
+                None => rt.block_on(get(&rpc, "/validators"))?["min_bond"].as_str().and_then(|s| s.parse().ok()).unwrap_or(g.chain_params()?.min_self_bond),
             };
             let seed: [u8; 32] = hex::decode(std::fs::read_to_string(home.join("validator.key"))?.trim())?.try_into().map_err(|_| anyhow!("bad validator.key"))?;
             let pop = crate::chain::make_pop(seed, &g.chain_id, &me, &addrs.p2p_addr, &addrs.http_addr);

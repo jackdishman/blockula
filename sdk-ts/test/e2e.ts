@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex, randomBytes } from "@noble/hashes/utils.js";
-import { ApiError, Client, POP_CONTEXT, Wallet, addressFromPublicKey, addressPrefix, formatFang, isAddress, minFee, parseFang, parseSoul, popMessage, seanceCommitment, signingBytes, txBytes, txCharge, txId, txSize, type Action, type Tx } from "../src/index.js";
+import { ApiError, Client, POP_CONTEXT, Wallet, addressFromPublicKey, addressPrefix, formatFang, isAddress, minFee, parseFang, parseSoul, popMessage, seanceCommitment, signingBytes, txBytes, txCharge, txId, txSize, type Action, type ProposalKind, type Tx } from "../src/index.js";
 
 const client = new Client(process.env.BLOCKULA_RPC ?? "http://localhost:7070");
 
@@ -12,7 +12,7 @@ assert.equal(parseFang("1.5"), 1_500_000_000n);
 assert.equal(formatFang(1_500_000_000n), "1.5 FANG");
 
 // Shared vectors: node/src/types.rs `encodings_match_the_sdk` asserts the same hashes.
-// One action per tag (0–29), in tag order (`vector_actions` there).
+// One action per tag 0–29, in tag order (`vector_actions` there).
 const vectorActions: Action[] = [
   { type: "transfer", to: "x.boo", amount: "5" },
   { type: "register_name", name: "vlad" },
@@ -53,6 +53,51 @@ const all = vectorActions.map((a) => signingBytes(vectorTx(a)));
 const joined = new Uint8Array(all.reduce((n, b) => n + b.length, 0));
 all.reduce((at, b) => (joined.set(b, at), at + b.length), 0);
 assert.equal(bytesToHex(blake3(joined)), "67416fa0f99281aa382895815bea59d2a43b40f6865c500e4cb80611d8754875");
+// Protocol v1 (tags 30–49, every proposal kind, a multisig proposal), hashed on its own: `v1_vector_actions` there.
+const propose = (kind: ProposalKind): Action => ({ type: "propose", kind, deposit: (1000n * 1_000_000_000n).toString(), title: "t" });
+const v1VectorActions: Action[] = [
+  { type: "delegate", validator: "boo1v", amount: (5n * 1_000_000_000n).toString() },
+  { type: "undelegate", validator: "boo1v", shares: "7" },
+  { type: "redelegate", from_validator: "boo1v", to_validator: "boo1w", shares: "8" },
+  { type: "withdraw_unbonded" },
+  { type: "update_validator", commission_bps: 500, p2p_addr: "1.2.3.4:5", http_addr: "https://v.example" },
+  { type: "update_validator", commission_bps: 0, p2p_addr: "", http_addr: "" },
+  { type: "unjail", validator: "boo1v" },
+  { type: "report_equivocation", evidence: "0a0b" },
+  { type: "beacon_commit", epoch: 3, commitment: "ab".repeat(32) },
+  { type: "beacon_reveal", epoch: 3, secret: "cd".repeat(32) },
+  { type: "propose", kind: { type: "param_change", key: "max_validators", value: "40" }, deposit: (1000n * 1_000_000_000n).toString(), title: "More validators", url: "https://x.example/p/1" },
+  propose({ type: "treasury_spend", to: "x.boo", amount: "9" }),
+  propose({ type: "distribution", merkle_root: "ef".repeat(32), total: "100", claim_until: 5000 }),
+  propose({ type: "set_repo", repo: "a/b", weight: 10 }),
+  propose({ type: "grant_soul", to: "x.boo", amount: 2500, reason: "r" }),
+  propose({ type: "flag_sybil", account: "x.boo", reason: "r" }),
+  propose({ type: "reject_claim", claim_id: 4, reason: "r" }),
+  propose({ type: "clawback", account: "x.boo", reason: "r" }),
+  propose({ type: "unlink_github", handle: "vlad" }),
+  propose({ type: "refund_hunt", hunt_id: 1 }),
+  propose({ type: "schedule_upgrade", version: 2, activation_height: 100_000 }),
+  propose({ type: "activate_feature", feature: "ghost" }),
+  propose({ type: "deactivate_feature", feature: "ghost" }),
+  propose({ type: "text" }),
+  { type: "vote", proposal_id: 1, aye: true, amount: "10", conviction: 6 },
+  { type: "vote", proposal_id: 1, aye: false, amount: "10", conviction: 0 },
+  { type: "unlock" },
+  { type: "multisig_create", owners: ["ab".repeat(32), "cd".repeat(32)], threshold: 2 },
+  { type: "multisig_propose", action: { type: "transfer", to: "x.boo", amount: "5" } },
+  { type: "multisig_approve", id: 3 },
+  { type: "renew_name", name: "vlad", years: 2 },
+  { type: "transfer_name", name: "vlad", to: "x.boo" },
+  { type: "release_name", name: "vlad" },
+  { type: "claim_distribution", distribution_id: 1, amount: "50", proof: ["ab".repeat(32), "cd".repeat(32)] },
+  { type: "claim_distribution", distribution_id: 1, amount: "50", proof: [] },
+  { type: "attest_revert", claim_id: 4, revert_sha: "ef".repeat(20) },
+];
+const v1 = v1VectorActions.map((a) => signingBytes(vectorTx(a)));
+const v1Joined = new Uint8Array(v1.reduce((n, b) => n + b.length, 0));
+v1.reduce((at, b) => (v1Joined.set(b, at), at + b.length), 0);
+assert.equal(bytesToHex(blake3(v1Joined)), "fecaa54305728b6a9192b18fbbdc03d74f2199c8721a670b73b72970b2d7ba6c");
+assert.throws(() => signingBytes(vectorTx({ type: "multisig_propose", action: { type: "multisig_propose", action: { type: "unlock" } } })), /can't contain another/);
 const vt = vectorTx(vectorActions[0]);
 assert.equal(bytesToHex(blake3(txBytes(vt))), "f32398f98b16d95d4f68af7ee29524a274d5465476390d91b357633627712e39");
 assert.equal(txBytes(vt).length, txSize(vt));
@@ -225,6 +270,32 @@ if (process.env.BLOCKULA_ADMIN_SEED) {
   console.log("✓ contribution pool admin flow (validators will check the claim on GitHub)");
 }
 console.log("✓ Proof of Contribution txs verify and enforce their rules");
+
+// Protocol v1 (tags 30–49): the SDK signs them and the node verifies them; modules that haven't
+// shipped yet refuse them with "not active yet". Name transfers and releases already work.
+const validator: string = (await client.validators()).active[0].validator.address;
+const notYet: Action[] = [
+  { type: "delegate", validator, amount: "1" },
+  { type: "undelegate", validator, shares: "1" },
+  { type: "withdraw_unbonded" },
+  { type: "propose", kind: { type: "param_change", key: "max_validators", value: "40" }, deposit: "1", title: "e2e" },
+  { type: "vote", proposal_id: 0, aye: true, amount: "1", conviction: 1 },
+  { type: "unlock" },
+  { type: "multisig_propose", action: { type: "transfer", to: bob.address, amount: "1" } },
+  { type: "beacon_commit", epoch: 1, commitment: "ab".repeat(32) },
+  { type: "claim_distribution", distribution_id: 0, amount: "1", proof: ["cd".repeat(32)] },
+  { type: "renew_name", name, years: 1 },
+];
+for (const action of notYet) {
+  await assert.rejects(client.submit(await alice.build(action)), /not active yet/, action.type);
+}
+const moved = await client.submit(await alice.build({ type: "transfer_name", name: `${name}.boo`, to: bob.address }));
+console.log("✓", moved.summary);
+assert.equal(await client.resolve(`${name}.boo`), bob.address);
+await assert.rejects(client.submit(await alice.build({ type: "release_name", name })), /belongs to/);
+console.log("✓", (await client.submit(await bob.build({ type: "release_name", name }))).summary);
+assert.equal((await client.name(name)).available, true);
+console.log("✓ protocol v1 txs verify; names transfer and release");
 
 const status = await client.status();
 console.log(`✓ all good at height ${status.height}, burned so far: ${status.burned_display}`);
