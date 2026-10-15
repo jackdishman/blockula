@@ -20,6 +20,7 @@
 //! outgoing viewing key decrypts what this wallet sent.
 
 use ml_kem::{KeyExport, Seed, ml_kem_768};
+use zeroize::Zeroize;
 
 use crate::field::{DIGEST_BYTES, Digest, digest_from_bytes, digest_to_bytes, xof_bytes, xof_to_digest};
 use crate::hash::{Domain, sponge};
@@ -177,8 +178,9 @@ impl IncomingViewingKey {
         self.owner
     }
 
-    /// The ML-KEM-768 decapsulation key.
-    pub fn decapsulation_key(&self) -> ml_kem_768::DecapsulationKey {
+    /// The ML-KEM-768 decapsulation key. Crate-private: `ml-kem` derives `Debug` for it, which
+    /// prints the secret key, so it is only handed out inside [`crate::encryption::TrialDecryptor`].
+    pub(crate) fn decapsulation_key(&self) -> ml_kem_768::DecapsulationKey {
         ml_kem_768::DecapsulationKey::from_seed(Seed::from(self.kem_seed))
     }
 
@@ -273,18 +275,35 @@ impl core::fmt::Debug for Address {
     }
 }
 
-/// Secrets print as their type name only.
-macro_rules! redacted_debug {
-    ($($t:ident),*) => {$(
-        impl core::fmt::Debug for $t {
-            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-                f.write_str(concat!(stringify!($t), "(..)"))
-            }
-        }
-    )*};
+redacted_debug!(SpendingKey, FullViewingKey, IncomingViewingKey, OutgoingViewingKey);
+
+// Each key wipes its own secret bytes when dropped (best effort: copies a caller makes with
+// `seed()`, `Clone` or `.0`, and the derived field elements `sk`, `ak`, `nk`, aren't wiped;
+// docs/GHOST-MODE.md section 12).
+impl Drop for SpendingKey {
+    fn drop(&mut self) {
+        self.seed.zeroize();
+    }
 }
 
-redacted_debug!(SpendingKey, FullViewingKey, IncomingViewingKey, OutgoingViewingKey);
+impl Drop for FullViewingKey {
+    fn drop(&mut self) {
+        // `ovk` wipes itself.
+        self.kem_seed.zeroize();
+    }
+}
+
+impl Drop for IncomingViewingKey {
+    fn drop(&mut self) {
+        self.kem_seed.zeroize();
+    }
+}
+
+impl Drop for OutgoingViewingKey {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
 
 #[cfg(test)]
 mod tests {

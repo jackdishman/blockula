@@ -26,7 +26,10 @@ p3-symmetric = "=0.8.0"
 p3-uni-stark = "=0.8.0"
 p3-security = "=0.8.0"
 blake3 = "1.8.7"
-ml-kem = "=0.3.2"
+# `zeroize`: the expanded decapsulation key (held by `TrialDecryptor`) wipes itself on drop.
+ml-kem = { version = "=0.3.2", features = ["zeroize"] }
+# Wipes the key types' secret bytes on drop (ml-kem's `zeroize` feature needs it anyway).
+zeroize = { version = "=1.9.1", default-features = false }
 chacha20poly1305 = { version = "0.11.0", features = ["alloc"] }
 rand = { version = "0.10", default-features = false, features = ["std", "std_rng", "sys_rng"] }
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
@@ -45,6 +48,20 @@ debug-assertions = false
 [profile.test]
 opt-level = 2
 
-# Value arithmetic must never wrap silently.
+# Value arithmetic must never wrap silently, here or in Plonky3's verifier.
+#
+# These profiles apply only while this crate is its own workspace root (tests, fuzzing, the
+# measurements in docs/GHOST-MODE.md). A crate that depends on it, like the node, builds it with
+# ITS OWN profile, so the node's Cargo.toml must set, to match what was tested:
+#
+#     [profile.release]
+#     overflow-checks = true    # blockula-ghost and every p3-* crate, not just `blockula`
+#     # and keep panic = "unwind" (the default): `verify` relies on catch_unwind.
+#
+# (Or at least `[profile.release.package.blockula-ghost] overflow-checks = true` plus one entry
+# per p3-* crate.) The crate refuses to compile with panic = "abort" (src/lib.rs), and its own
+# arithmetic on untrusted sizes, positions and values is checked explicitly, so it doesn't
+# depend on overflow checks for correctness; Plonky3's robustness evidence was gathered with
+# them on.
 [profile.release]
 overflow-checks = true

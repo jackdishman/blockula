@@ -15,8 +15,8 @@ use super::{ActionWitness, CIRCUIT_ID, ValueBalance, sighash_fields};
 use crate::field::{Digest, F, P, ZERO_DIGEST, u64_to_limbs};
 use crate::hash::{Domain, permute};
 
-/// A spend at the field level.
-#[derive(Clone, Debug)]
+/// A spend at the field level. Holds the witness, so no `Debug`.
+#[derive(Clone)]
 pub(crate) struct RawSpend {
     pub sk: Digest,
     pub limbs: [F; 4],
@@ -27,7 +27,7 @@ pub(crate) struct RawSpend {
 }
 
 /// An output at the field level.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct RawOutput {
     pub owner: Digest,
     pub limbs: [F; 4],
@@ -35,7 +35,7 @@ pub(crate) struct RawOutput {
 }
 
 /// An action at the field level, with the public values that aren't outputs of the trace.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct RawAction {
     pub spends: [RawSpend; 2],
     pub outputs: [RawOutput; 2],

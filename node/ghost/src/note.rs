@@ -7,7 +7,8 @@ use crate::hash::{Domain, sponge};
 pub const NOTE_VERSION: u8 = 1;
 
 /// A shielded note: `value` drops owned by `owner`, hidden by randomness derived from `rseed`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Its contents are what the pool hides, so `Debug` prints `Note(..)`.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Note {
     /// Amount in drops.
     pub value: u64,
@@ -16,6 +17,8 @@ pub struct Note {
     /// Fresh randomness; the commitment's `rcm` derives from it.
     pub rseed: [u8; 32],
 }
+
+redacted_debug!(Note);
 
 impl Note {
     /// The commitment randomness: 8 field elements (~248 bits) from BLAKE3 of `rseed`.

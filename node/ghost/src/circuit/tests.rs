@@ -665,3 +665,65 @@ fn explore_security_parameters() {
     }
     eprintln!("{:?}", config::security_report());
 }
+
+// ---- Hygiene ------------------------------------------------------------------------------
+
+/// `{:?}` (logs, panics, `dbg!`) must never show a spending key, note contents or which note a
+/// spend is (audit findings: the witnesses used to print `sk` verbatim, enough to spend).
+#[test]
+fn debug_output_redacts_secrets() {
+    use crate::encryption::{MEMO_BYTES, TrialDecryptor, encrypt_note};
+
+    let mut r = rng(11);
+    let mut w = action(&mut r, [Some(123_456_789_012), None], [100_000_000_000, 23_456_789_012]);
+    let key = SpendingKey::from_seed(random_bytes(&mut r));
+    let fvk = key.full_viewing_key();
+    let note = Note { value: 987_654_321_098, owner: fvk.owner(), rseed: random_bytes(&mut r) };
+    w.spends[0] = SpendWitness::new(&key, note, w.spends[0].path.clone());
+
+    // Everything a log line must not contain, in the forms `Debug`/`Display` would print it.
+    let mut secrets: Vec<String> = Vec::new();
+    for s in &w.spends {
+        for x in s.sk.iter().chain(&s.note.rcm()).chain(&s.nullifier()) {
+            secrets.extend([format!("{x:?}"), format!("{x}")]);
+        }
+        secrets.extend([format!("{:?}", s.note.rseed), s.note.value.to_string()]);
+        secrets.extend(s.path.siblings.iter().flatten().map(|x| x.to_string()));
+    }
+    secrets.push(w.spends[1].path.position.to_string()); // the dummy's: random, so distinctive
+    for n in &w.outputs {
+        secrets.extend([format!("{:?}", n.rseed), n.value.to_string()]);
+        secrets.extend(n.owner.iter().map(|x| x.to_string()));
+    }
+    let seed = key.seed();
+    secrets.extend([format!("{seed:?}"), format!("{:?}", fvk.outgoing().0), format!("{:?}", fvk.to_bytes())]);
+    secrets.extend(fvk.nk().iter().chain(&fvk.ak()).map(|x| x.to_string()));
+    secrets.retain(|s| s.len() >= 6); // short numbers turn up anywhere
+    assert!(secrets.len() > 300);
+
+    let enc = encrypt_note(&note, &key.address(), &[7; MEMO_BYTES], Some(&fvk.outgoing()), &mut r).unwrap();
+    let scanner = TrialDecryptor::new(&fvk.incoming());
+    let decrypted = scanner.try_decrypt(&note.commitment(), &enc.enc).unwrap();
+
+    let printed = [
+        format!("{w:?}"),
+        format!("{w:#?}"),
+        format!("{:?}", w.spends),
+        format!("{:#?}", w.outputs),
+        format!("{:?}", w.spends[0].path),
+        format!("{key:?} {fvk:?} {:?} {:?}", fvk.incoming(), fvk.outgoing()),
+        format!("{decrypted:#?} {scanner:?}"),
+    ];
+    for p in &printed {
+        for s in &secrets {
+            assert!(!p.contains(s.as_str()), "{s} leaks into {p}");
+        }
+    }
+    assert_eq!(format!("{:?}", w.spends[0]), "SpendWitness(..)");
+    assert_eq!(format!("{note:?}"), "Note(..)");
+    assert_eq!(format!("{:?}", w.spends[1].path), "MerklePath(..)");
+    assert_eq!(format!("{decrypted:?} {scanner:?}"), "DecryptedNote(..) TrialDecryptor(..)");
+    // The public parts still print, for debugging.
+    assert!(printed[0].starts_with("ActionWitness { anchor: ["));
+    assert!(printed[0].contains(&format!("{:?}", w.sighash)));
+}
