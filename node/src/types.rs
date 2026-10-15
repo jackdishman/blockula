@@ -184,7 +184,8 @@ pub enum Action {
     Unjail { validator: String },
     /// Two conflicting signed votes by one validator: hex, at most `MAX_EVIDENCE_BYTES` bytes.
     ReportEquivocation { evidence: String },
-    /// An active validator's commitment (hex BLAKE3 of its secret) to the beacon for `epoch` (beacon.rs).
+    /// An active validator's commitment to its secret for the beacon of `epoch` (hex
+    /// `beacon::commitment`, which binds the chain, epoch and validator too; beacon.rs).
     BeaconCommit { epoch: u64, commitment: String },
     /// The 32-byte hex secret behind an earlier commitment.
     BeaconReveal { epoch: u64, secret: String },
@@ -228,7 +229,8 @@ pub enum Action {
         amount: u64,
         proof: Vec<String>,
     },
-    /// Validators only: a matured claim's PR was reverted, by the 40-hex commit `revert_sha`.
+    /// Validators only: a claim's PR was reverted during its revert window, by the 40-hex commit
+    /// `revert_sha`.
     AttestRevert { claim_id: u64, revert_sha: String },
 }
 

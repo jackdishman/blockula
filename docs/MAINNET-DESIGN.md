@@ -130,9 +130,9 @@ CBlock { version: u32, parent, height, view: u64, parent_view: u64, timestamp_ms
 
 ### 3.8 Randomness beacon and Proof of Contribution (CRY-3, GOV-3)
 
-- Each active validator commits `BLAKE3(secret)` for epoch `e + 2` during epoch `e` and reveals during `e + 1`. The beacon for `e + 2` is `BLAKE3` of the sorted reveals plus the previous beacon. Validators that commit but don't reveal are jailed and lightly slashed.
-- Séances open only at epoch boundaries on a fixed cadence, seeded from that epoch's beacon; the opening block's proposer has no influence. Leader order for an epoch can also be shuffled from the beacon (SF-1).
-- Validators re-check matured claims for reverts and attest (`AttestRevert`); a quorum rejects the claim and claws back its rewards. Admin rejection is gone.
+- Each active validator commits `BLAKE3(chain_id, e + 2, validator, secret)` for epoch `e + 2` during epoch `e` and reveals during `e + 1`. The beacon for `e + 2` is `BLAKE3` of the previous beacon, the epoch and the reveals sorted by validator (with none, of the previous beacon and the epoch: a hash chain). Validators that commit but don't reveal are jailed and slashed `beacon_miss_slash_bps`. Epoch 0's value comes from genesis. The one remaining lever is withholding a reveal (one bit per validator, paid for with jail).
+- Séances open only at the last block of every n-th epoch (n = the epochs a Séance spans), seeded from that epoch's beacon and the Séance id, over jurors who joined and claims whose revert window ended before the previous epoch began (so before anyone could know the value); jurors are ranked individually by the seed. The opening block's proposer has no influence. Each epoch's leader order is `RoundRobin` shuffled by a seed from its beacon (SF-1); downtime accounting elects leaders the same way (`consensus::leader`).
+- Validators re-check verified claims for reverts during their revert window (`claim_maturity_blocks` after verification) and attest the revert commit (`AttestRevert`); a quorum of the current set on the same commit rejects the claim and claws back its rewards. Admin rejection is gone.
 
 ### 3.9 Upgrades and halts (OPS-3, OPS-5, OPS-6)
 
