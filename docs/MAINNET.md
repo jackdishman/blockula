@@ -143,6 +143,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
   - Reads have per-client rate limits and timeouts.
   - A load test shows finalization is unaffected at a stated request rate.
 - **Effort:** M. **Who:** Team.
+- ✅ **Code side (wave 2):** every read handler serves the view the chain publishes after each block (an O(1) state clone plus a database snapshot), never the consensus lock; nothing scans state per request (owner, key, creator, claimant and voucher indexes in the database; rankings computed once per block); per-IP token buckets on reads (`--read-rps`, `--read-burst`) and a timeout on every route (`--http-timeout-secs`). Tests show every read completes while the chain lock is held and blocks execute normally under thousands of concurrent reads. Pending: validators' HTTP private by default behind sentries, and the load test against a running network.
 
 **SEC-5. No vulnerability disclosure program.**
 - **Missing:** CONTRIBUTING.md "Security" points to GitHub Security Advisories, and that's all. There's no SECURITY.md, no contact, no response timeline and no bounty.
@@ -206,7 +207,8 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
   - Accounts, names and other records pay deposits or rent (DEC-6).
   - A benchmark at 10M accounts shows execute plus commit well under the block time on the reference validator spec.
 - **Effort:** XL. It's new storage and a new root, every module migrates, and it must land before the audit. **Who:** Team.
-- ✅ **Wave 1 (framework):** state maps are tracked `imbl` maps (O(1) clone), every record has a canonical borsh encoding, and the root is a sparse Merkle tree updated per block from the touched keys, with inclusion and exclusion proofs (`state/`). Snapshots are canonical records, decoded as a stream. Pending (P-STATE-B): persistence and restart without replay, the tx index on disk, `/api/proof`, deposits (DEC-6), the 10M-account benchmark.
+- ✅ **Wave 1 (framework):** state maps are tracked `imbl` maps (O(1) clone), every record has a canonical borsh encoding, and the root is a sparse Merkle tree updated per block from the touched keys, with inclusion and exclusion proofs (`state/`). Snapshots are canonical records, decoded as a stream.
+- ✅ **Wave 2 (persistence, P-STATE-B):** records, tree nodes, indexes and the commit point are written per block in one redb transaction, after the block logs are fsynced and before consensus is acknowledged (`store.rs`). A restart loads the database and checks it against the tree and the log, then executes only blocks logged past its commit point: ~0.7 s at 1M accounts, whatever the history (`restart_time_at_1m_accounts`). The tx index and account history are on disk; `/api/proof/{namespace}/{key}` serves inclusion and exclusion proofs; snapshots stream both ways (the writer cuts chunk files as it compresses, a joiner checks each chunk and decodes from a file). Pending: deposits (DEC-6), the 10M-account execute-plus-commit benchmark.
 
 **CV-2. One vote per validator, and validators are an admin allowlist.** (known)
 - **Missing:** the quorum counts validators (`pq.rs:243-251`, `quorum::<N3f1>()`). The bond weights nothing. Validators join only through `approve_validator` (`chain.rs:820-831`). PLAN.md "Roadmap" lists permissionless staking for Phase 3.
@@ -254,6 +256,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
 - **Done when:** crash-injection tests (a kill at every write point, plus Commonware's deterministic storage faults) restart unaided, and each block commits atomically (this part folds into CV-1).
 - **Effort:** S for the torn line now, M as part of CV-1. **Who:** Team.
 - ✅ **Torn last line:** `Chain::open` now drops a torn, unparseable final line (that block was never acknowledged to consensus) and starts; a corrupt line elsewhere still refuses to start.
+- ✅ **Wave 2:** each block commits atomically (logs fsynced, then one durable database transaction); `epochs.json`, `base.json` and `base.state.zst` are written to a temp file, fsynced, renamed and the directory fsynced; crash-injection tests kill execution at each write point (after the consensus block, after the block line, before and after the database commit), tear log tails and leave half-written snapshots, and `Chain::open` recovers unaided with the right root; a missing or unreadable database is rebuilt from the logs. Pending: Commonware's deterministic storage faults, and `consensus/` ahead of the logs still needs an operator.
 
 ✅ **Verify contract.** `verify` voted against valid blocks when it hadn't executed the cited checkpoint within ~3 block times, or couldn't look up the cited root (`consensus.rs:367-389`). It now returns `false` only for permanently invalid blocks and otherwise stays pending (MAINNET-DESIGN 3.2; test `lagging_verifier_waits_instead_of_rejecting`).
 
@@ -531,6 +534,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
 - **Missing:** `execute` appends and fsyncs two files, recomputes the root and re-applies up to 5,000 mempool txs (`chain.rs:1735-1782, 1874-1905`). Every API call and every consensus verify waits for it.
 - **Done when:** I/O and revalidation run outside the lock, and latency is measured.
 - **Effort:** M (overlaps CV-1 and SEC-4).
+- ✅ **Done (wave 2):** on the consensus path the chain lock covers only in-memory execution; appending and fsyncing the logs, the database commit and the mempool check (on an O(1) state copy) run without it, and readers never take it (`blocks_are_written_without_the_chain_lock`, `heavy_reads_dont_slow_block_execution`). Validators also prune: they keep about two days of blocks (`--prune-blocks`, `--archive`), deleting whole log segments behind the window (OPERATIONS.md, Disk sizing).
 
 ✅ **SF-5. Snapshot threads can pile up.**
 - **Missing:** each checkpoint spawns a new thread holding a full state clone (`chain.rs:1826-1833`). If writing takes longer than 100 blocks, threads accumulate.

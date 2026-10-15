@@ -1451,20 +1451,6 @@ struct Start {
     rebuilt_epochs: bool,
 }
 
-/// Opens the database, or deletes and recreates it if it can't be opened (it is rebuilt from
-/// the logs).
-fn open_store(path: &Path) -> Result<Arc<Store>> {
-    match Store::open(path) {
-        Ok(s) => Ok(s),
-        Err(e) if path.exists() && !format!("{e:#}").contains("already open") => {
-            tracing::warn!(error = %format!("{e:#}"), "the state database doesn't open; rebuilding it from the block logs");
-            fs::remove_file(path)?;
-            Store::open(path)
-        }
-        Err(e) => Err(e),
-    }
-}
-
 /// Feeds every record of `state` to a store sink, stopping at the first error.
 fn state_records(state: &State) -> impl FnMut(store::RecordSink) -> Result<()> + '_ {
     move |sink| {
@@ -1578,7 +1564,7 @@ impl Chain {
         let genesis_state = genesis.initial_state();
         let genesis_root = genesis_state.root();
         let genesis_hash = hex::encode(crate::consensus::genesis_block(&genesis).digest_bytes());
-        let store = open_store(&home.join(store::DB_FILE))?;
+        let store = Store::open(&home.join(store::DB_FILE))?;
         let saved_epochs: Option<crate::epochs::EpochRegistry> = fs::read(home.join("epochs.json")).ok().and_then(|b| serde_json::from_slice(&b).ok());
         let ctx = OpenCtx { home, genesis: &genesis, genesis_hash: &genesis_hash, genesis_root: &genesis_root, base: base.as_ref(), saved_epochs: saved_epochs.as_ref(), blocks: &blocks };
         let start = match ctx.load(&store) {
@@ -3498,11 +3484,16 @@ mod persistence {
         assert_eq!(c.tx_location(&id), Some((10, 0)));
         assert_eq!(c.view().history(&alice.address(), 100).len() as u64, height);
         drop(c);
-        // Garbage instead of a database: deleted and rebuilt the same way.
+        // Garbage instead of a database: moved aside and rebuilt the same way.
         fs::write(h.join(store::DB_FILE), b"not a database").unwrap();
         let c = Chain::open(&h).unwrap();
         assert_eq!((c.state.root(), c.replayed), (root.clone(), height));
+        assert_eq!(fs::read(h.join("state.redb.unreadable")).unwrap(), b"not a database");
         drop(c);
+        // A database another process holds is an error, never a rebuild.
+        let held = Store::open(&h.join(store::DB_FILE)).unwrap();
+        assert!(format!("{:#}", Chain::open(&h).err().unwrap()).contains("already open"));
+        drop(held);
         // A database left from another chain (another genesis) is rebuilt too.
         let other = home("other");
         Chain::summon(&other, &SummonOpts::new("other", 1)).unwrap();

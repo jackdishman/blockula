@@ -271,15 +271,37 @@ fn storage(e: impl std::fmt::Display) -> anyhow::Error {
     anyhow!("state database: {e}")
 }
 
+/// Whether redb can't make sense of the file (as opposed to not being able to get at it).
+fn unreadable(e: &redb::DatabaseError) -> bool {
+    use redb::{DatabaseError as D, StorageError as S};
+    match e {
+        D::UpgradeRequired(_) | D::RepairAborted | D::Storage(S::Corrupted(_)) => true,
+        D::Storage(S::Io(io)) => matches!(io.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::InvalidData),
+        _ => false,
+    }
+}
+
 /// The redb database of a home.
 pub struct Store {
     db: Database,
 }
 
 impl Store {
-    /// Opens (or creates) the database at `path`, with every table present.
+    /// Opens (or creates) the database at `path`, with every table present. A file redb can't
+    /// read (corrupt, or not a database) is moved aside to `{path}.unreadable` and a new one
+    /// created: the caller rebuilds it from the block logs. Other errors (I/O, permissions, a
+    /// second process holding it) are returned.
     pub fn open(path: &Path) -> Result<Arc<Store>> {
-        let db = Database::builder().set_cache_size(CACHE_BYTES).create(path).map_err(storage).with_context(|| format!("opening {}", path.display()))?;
+        let db = match Database::builder().set_cache_size(CACHE_BYTES).create(path) {
+            Ok(db) => db,
+            Err(e) if unreadable(&e) => {
+                let aside = path.with_extension("redb.unreadable");
+                tracing::warn!(error = %e, file = %path.display(), "the state database can't be read; moving it aside and rebuilding it from the block logs");
+                fs::rename(path, &aside)?;
+                Database::builder().set_cache_size(CACHE_BYTES).create(path).map_err(storage)?
+            }
+            Err(e) => return Err(storage(e)).with_context(|| format!("opening {}", path.display())),
+        };
         let mut tx = db.begin_write().map_err(storage)?;
         tx.set_quick_repair(true);
         Self::create_tables(&tx)?;
