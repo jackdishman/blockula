@@ -557,7 +557,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
 **SF-1. Predictable leaders.**
 - **Missing:** `RoundRobin` (`consensus.rs:785`) publishes the leader schedule, and validator p2p addresses are public in genesis. That makes it cheap to DoS whoever leads next.
 - **Done when:** the leader order is seeded per epoch from CRY-3's beacon, and sentry nodes hide validator IPs.
-- ✅ **Leader order (wave 3, P-BEACON):** each epoch's elector is Commonware's `RoundRobin::shuffled` with a seed derived from that epoch's beacon value (`consensus::elector`). Validators reveal in the second half of the previous epoch, so the order is known at most half an epoch ahead. `consensus::leader` elects the same way from state, for downtime accounting; the simulator checks every proposer against it (`beacon_rounds_seed_the_leader_order`). Pending: sentries.
+- ✅ **Leader order (wave 3, P-BEACON):** each epoch's elector is Commonware's `RoundRobin::shuffled` with a seed derived from that epoch's beacon value (`consensus::elector`). Validators reveal in the second half of the previous epoch, so the order is known at most half an epoch ahead. `consensus::leader` elects the same way from state, for downtime accounting; the simulator checks every proposer against it (`beacon_rounds_seed_the_leader_order`). The shuffle is the pinned Commonware's (`=2026.9.0`), and downtime slashing depends on it, so a Commonware upgrade that changes `RoundRobin::shuffled` is a hard fork. Pending: sentries.
 - **Effort:** M.
 
 **SF-2. Clock skew.**
