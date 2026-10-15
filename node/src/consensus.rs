@@ -3,15 +3,19 @@
 //!
 //! Block flow:
 //! * **propose** (leader): wait until `parent.timestamp + block_time`, pick mempool txs (highest
-//!   tip per byte first) that apply on top of our executed state plus any not-yet-executed
-//!   ancestors, and attach the latest state root we've executed (`exec_height`, `exec_root`).
+//!   tip per byte first, up to the height's `max_block_bytes`) that apply on top of our executed
+//!   state plus any not-yet-executed ancestors, and attach the latest state root we've executed
+//!   (`exec_height`, `exec_root`). A leader more than `econ::FEE_LAG` blocks behind can't price
+//!   txs (the base fee isn't fixed in its state yet) and proposes an empty block.
 //! * **verify** (everyone, before voting): view and parent view against the consensus context,
 //!   the protocol version in force at the height (`upgrade.rs`; no vote at all past a halt or for
 //!   a version this binary can't run), structure, size limits, timestamps, proposer == leader,
-//!   stateless tx checks
-//!   (canonical wire bytes, chain id, address prefix, validity window, ML-DSA signature, fee), and
-//!   the attached state root (waiting until we've executed that height). Only permanently invalid
-//!   blocks get `false`; anything that can still change keeps the verdict pending.
+//!   stateless tx checks (canonical wire bytes, chain id and genesis hash, address prefix,
+//!   validity window, ML-DSA signature, the lowest possible fee), and the attached state root
+//!   (waiting until we've executed that height). A block with txs must cite a height within
+//!   `econ::FEE_LAG` of its own, so once we've executed it we check the block's size and every
+//!   tx's fee against the height's exact base fee. Only permanently invalid blocks get `false`;
+//!   anything that can still change keeps the verdict pending.
 //! * **finalize**: marshal delivers finalized blocks in order to [`Executor`], which executes them
 //!   (invalid txs are skipped) and acknowledges only once the block logs are fsynced and the
 //!   state database has committed the block (`store.rs`).
@@ -53,6 +57,8 @@ pub use crate::types::MAX_TX_BYTES;
 /// A proposal's `exec_height` may trail the verifier's executed height by at most this much
 /// (so a proposer can't dodge the state-root check by citing an ancient height).
 pub const MAX_EXEC_LAG: u64 = 16;
+/// The codec's bound on a block's tx bytes. The limit blocks are held to is the governance
+/// parameter `max_block_bytes` (2 MiB at genesis), fixed per height like the base fee (econ.rs).
 pub const MAX_BLOCK_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_MESSAGE_SIZE: u32 = 8 * 1024 * 1024;
 /// How far in the future (by our clock) a block timestamp may be.
@@ -378,16 +384,19 @@ where
         let mut bytes = 0;
         // Senders whose earlier tx was left out: their later nonces can't apply.
         let mut stuck = std::collections::HashSet::new();
+        // This height's base fee and size limit are fixed once `height − FEE_LAG` has executed
+        // (econ.rs). Further behind than that we can't price txs, so the block stays empty.
+        let limit = crate::econ::slot(&c.state, height).map_or(0, |s| s.max_block_bytes as usize);
         let c = &mut *c; // borrow the mempool and the state separately
         for tx in crate::chain::proposal_order(&c.mempool) {
-            if txs.len() >= MAX_BLOCK_TXS {
+            if limit == 0 || txs.len() >= MAX_BLOCK_TXS {
                 break;
             }
             if stuck.contains(&tx.from) || included.contains(&tx.id()) {
                 continue;
             }
             let raw = tx.to_bytes();
-            if raw.len() > MAX_TX_BYTES || bytes + raw.len() > MAX_BLOCK_BYTES {
+            if raw.len() > MAX_TX_BYTES || bytes + raw.len() > limit {
                 stuck.insert(tx.from.clone());
                 continue;
             }
@@ -475,9 +484,15 @@ where
             }
             (c.genesis.chain_id.clone(), c.genesis_hash.clone(), c.state.chain_params.max_tx_validity_blocks)
         };
+        // Txs need a cited state that fixed this height's base fee (econ.rs): the proposer could
+        // price them, and we can check them once we've executed it.
+        if !block.txs.is_empty() && block.exec_height + crate::econ::FEE_LAG < block.height {
+            return reject("txs in a block whose cited state can't price them");
+        }
         // Tx checks (signatures included) run without holding the chain lock.
         let mut seen = std::collections::HashSet::new();
         let mut ids = vec![];
+        let mut charges = vec![];
         for raw in &block.txs {
             let Ok(tx) = Tx::from_bytes(raw) else { return reject("unparseable or non-canonical tx") };
             let id = tx.id();
@@ -489,6 +504,7 @@ where
                 return reject("invalid tx");
             }
             ids.push(id);
+            charges.push((tx.size(), tx.tip, tx.fee));
         }
         // The cited state root, once we've executed that height ourselves (until then the
         // verdict can still change, so we wait).
@@ -501,6 +517,16 @@ where
         let c = self.chain.lock();
         if ids.iter().any(|id| c.has_tx(id)) {
             return reject("replays an already-finalized tx");
+        }
+        // This height's size limit and base fee, exactly (we've executed the cited state, at most
+        // FEE_LAG back). Unknown only if we already executed past this height.
+        if let Some(slot) = crate::econ::slot(&c.state, block.height) {
+            if block.txs.iter().map(|t| t.len() as u64).sum::<u64>() > slot.max_block_bytes {
+                return reject("block exceeds max_block_bytes");
+            }
+            if charges.iter().any(|&(size, tip, fee)| slot.fee(size).checked_add(tip).is_none_or(|c| c > fee)) {
+                return reject("a tx's fee doesn't cover the block's base fee");
+            }
         }
         true
     }
@@ -834,12 +860,13 @@ where
                     debug!(?from, "unparseable gossiped tx");
                     continue;
                 };
-                // Verify format + ML-DSA signature before taking the chain lock.
-                let (chain_id, genesis_hash, prefix) = {
+                // Verify format + ML-DSA signature before taking the chain lock; a fee below the
+                // next block's base fee is refused first, before the signature costs anything.
+                let (chain_id, genesis_hash, prefix, priced) = {
                     let c = gossip_chain.lock();
-                    (c.genesis.chain_id.clone(), c.genesis_hash.clone(), c.genesis.address_prefix.clone())
+                    (c.genesis.chain_id.clone(), c.genesis_hash.clone(), c.genesis.address_prefix.clone(), crate::econ::check_fee(&c.state, &tx, c.height() + 1))
                 };
-                if let Err(e) = check_tx_stateless(&tx, &chain_id, &genesis_hash, &prefix) {
+                if let Err(e) = priced.and_then(|_| check_tx_stateless(&tx, &chain_id, &genesis_hash, &prefix)) {
                     debug!(?from, error = %e, "dropping invalid gossiped tx");
                     continue;
                 }
@@ -1256,6 +1283,92 @@ mod tests {
             assert_eq!(verify(child(&p73, 2), &p73).await, None);
             let c = chain.lock();
             assert!(c.halt.allows(&c.state, 50) && !c.halt.allows(&c.state, 51));
+        });
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// The fee market in consensus (P-ECON): a proposer fills blocks only up to the height's
+    /// `max_block_bytes` and proposes no txs at a height whose base fee its state hasn't fixed
+    /// (more than `econ::FEE_LAG` ahead); a verifier refuses a block with txs that cites a state
+    /// that can't price them, and, once it has executed the cited state, blocks over the size
+    /// limit and txs that don't pay the height's exact base fee (which the stateless check can't
+    /// see). Here the limit is lowered to 64 KiB (~12 transfers).
+    #[test]
+    fn blocks_are_sized_and_priced_by_the_fee_market() {
+        let home = std::env::temp_dir().join(format!("blockula-feemarket-{}-{}", crate::chain::now_ms(), std::process::id()));
+        let params = [("max_block_bytes".to_string(), MAX_TX_BYTES as u64)].into_iter().collect();
+        Chain::summon(&home, &SummonOpts { params, ..SummonOpts::new("fees", 1) }).unwrap();
+        let mut c = Chain::open(&home).unwrap();
+        let users: Vec<crate::crypto::Keys> = (1..=14u8).map(|i| crate::crypto::Keys::from_seed([i; 32])).collect();
+        for u in &users {
+            c.faucet(&u.address(), 100 * crate::types::DROPS_PER_FANG).unwrap();
+        }
+        c.produce_block().unwrap();
+        let e = c.height();
+        let me = c.me().unwrap();
+        // Fees for the next block, or one drop short of its base fee.
+        let transfer = |u: &crate::crypto::Keys, short: bool| {
+            let mut t = Tx { chain_id: "fees".into(), genesis_hash: c.genesis_hash.clone(), from: u.address(), nonce: 0, fee: 0, tip: 0, valid_until: e + 50, action: crate::types::Action::Transfer { to: me.clone(), amount: 1 }, memo: String::new(), public_key: hex::encode(u.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+            t.fee = if short { crate::econ::base_fee(&c.state, e + 1, t.size()) - 1 } else { crate::econ::max_fee(&c.state, t.size()) };
+            t.sign(u)
+        };
+        let paid: Vec<Tx> = users.iter().map(|u| transfer(u, false)).collect();
+        let underpaid = transfer(&users[0], true);
+        for t in &paid {
+            c.submit(t.clone()).unwrap();
+        }
+        let root_e = hex_32(&c.root_at(e).unwrap());
+        let genesis_hash = c.genesis_hash.clone();
+        let seed: [u8; 32] = hex::decode(std::fs::read_to_string(home.join("validator.key")).unwrap().trim()).unwrap().try_into().unwrap();
+        let chain: Shared = Arc::new(Mutex::new(c));
+        deterministic::Runner::timed(Duration::from_secs(60)).start(|context| async move {
+            let leader = PrivateKey::from_seed_bytes(seed).public_key();
+            let mut app = App { chain: chain.clone(), block_time_ms: 1_000, address_prefix: "boo".into() };
+            // Contiguous empty blocks at heights from..=to, newest first.
+            let run = |from: u64, to: u64| {
+                let mut blocks = vec![CBlock::new(Digest([7; 32]), from, 1, 0, 0, String::new(), 0, [0; 32], vec![])];
+                for h in from + 1..=to {
+                    let parent = blocks.last().unwrap();
+                    blocks.push(CBlock::new(parent.digest(), h, 1, 0, 0, String::new(), 0, [0; 32], vec![]));
+                }
+                blocks.reverse();
+                blocks
+            };
+            let cctx = |parent: &CBlock| SimplexContext { round: Round::new(Epoch::zero(), View::new(7)), leader: leader.clone(), parent: (View::new(6), parent.digest()) };
+            let mut propose = async |ancestors: Vec<CBlock>| {
+                let cctx = cctx(&ancestors[0]);
+                let ancestry = marshal::ancestry::from_iter(ancestors.into_iter().map(Arc::new));
+                Application::<deterministic::Context>::propose(&mut app, (context.child("propose"), cctx), ancestry, ()).await.unwrap()
+            };
+            // On our executed head: as many txs as fit the limit, citing our state.
+            let b = propose(run(e, e)).await;
+            let bytes: usize = b.txs.iter().map(Vec::len).sum();
+            assert!(b.txs.len() >= 10 && b.txs.len() < paid.len() && bytes <= MAX_TX_BYTES, "{} txs, {bytes} bytes", b.txs.len());
+            assert_eq!(b.exec_height, e);
+            // Seventeen blocks ahead of our state we can still price txs; eighteen we can't.
+            assert!(!propose(run(e + 1, e + 16)).await.txs.is_empty());
+            let far = propose(run(e + 1, e + 17)).await;
+            assert!(far.txs.is_empty() && far.height == e + 18);
+
+            let mut app = App { chain: chain.clone(), block_time_ms: 1_000, address_prefix: "boo".into() };
+            let mut verify = async |block: CBlock, parent: &CBlock| {
+                let cctx = cctx(parent);
+                let ancestry = marshal::ancestry::from_iter([Arc::new(block), Arc::new(parent.clone())]);
+                Application::<deterministic::Context>::verify(&mut app, (context.child("verify"), cctx), ancestry).await
+            };
+            let child = |parent: &CBlock, exec_height: u64, root: [u8; 32], txs: &[&Tx]| CBlock::new(parent.digest(), parent.height + 1, 7, 6, 1_000, leader.address("boo"), exec_height, root, txs.iter().map(|t| t.to_bytes()).collect());
+            let head = run(e, e).remove(0);
+            assert!(verify(child(&head, e, root_e, &[&paid[0], &paid[1]]), &head).await);
+            // Underpaying by one drop passes every stateless check, not the exact one.
+            check_tx_stateless(&underpaid, "fees", &genesis_hash, "boo").unwrap();
+            assert!(!verify(child(&head, e, root_e, &[&underpaid]), &head).await);
+            // Over the height's limit (but well under the codec's bound).
+            assert!(!verify(child(&head, e, root_e, &paid.iter().collect::<Vec<_>>()), &head).await);
+            // Txs in a block whose cited state is more than FEE_LAG back: refused at once.
+            let ahead = run(e + 1, e + 30).remove(0);
+            let t0 = context.current();
+            assert!(!verify(child(&ahead, e + 10, [0; 32], &[&paid[0]]), &ahead).await);
+            assert_eq!(context.current(), t0, "without waiting");
         });
         std::fs::remove_dir_all(home).ok();
     }

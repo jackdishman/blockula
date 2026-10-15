@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex, randomBytes } from "@noble/hashes/utils.js";
-import { ApiError, Client, POP_CONTEXT, Wallet, addressFromPublicKey, addressPrefix, formatFang, isAddress, minFee, parseFang, parseSoul, popMessage, seanceCommitment, signingBytes, txBytes, txCharge, txId, txSize, type Action, type ProposalKind, type Tx } from "../src/index.js";
+import { ApiError, Client, POP_CONTEXT, Wallet, addressFromPublicKey, addressPrefix, baseFee, formatFang, isAddress, minFee, parseFang, parseSoul, popMessage, seanceCommitment, signingBytes, txBytes, txCharge, txId, txSize, type Action, type ProposalKind, type Tx } from "../src/index.js";
 
 const client = new Client(process.env.BLOCKULA_RPC ?? "http://localhost:7070");
 
@@ -105,6 +105,10 @@ assert.equal(txId(vt), "250e5fc58d322d13ba15e01991885090daa4e8742cc1f68336a2ca37
 assert.equal(txCharge(vt), minFee(vt) + 3n);
 // The genesis hash is 32 bytes of lowercase hex, or nothing gets signed.
 for (const genesis_hash of ["", "03".repeat(31), "AB".repeat(32), "zz".repeat(32)]) assert.throws(() => signingBytes({ ...vt, genesis_hash }), /genesis_hash/);
+// Same vector as node/src/econ.rs `fee_slots_match_the_sdk`: this tx at 12,656 milli-drops a byte.
+assert.equal(txSize(vt), 5_373);
+assert.equal(baseFee(vt, { flat: "10000", rate: "12656" }), 78_000n);
+assert.equal(minFee(vt), 10_000n + 10n * 5_373n);
 // Addresses: any known prefix is an address; `isAddress(s, prefix)` asks for one.
 const someKey = ml_dsa65.keygen(new Uint8Array(32).fill(4)).publicKey;
 const [mainAddr, testAddr] = [addressFromPublicKey(someKey), addressFromPublicKey(someKey, "tboo")];
@@ -278,7 +282,7 @@ if (process.env.BLOCKULA_ADMIN_SEED) {
 console.log("✓ Proof of Contribution txs verify and enforce their rules");
 
 // Protocol v1 (tags 30–49): the SDK signs them and the node verifies them; modules that haven't
-// shipped yet refuse them with "not active yet". Name transfers and releases already work.
+// shipped yet refuse them with "not active yet". Names renew, transfer and release.
 const validator: string = (await client.validators()).active[0].validator.address;
 const notYet: Action[] = [
   { type: "delegate", validator, amount: "1" },
@@ -290,18 +294,22 @@ const notYet: Action[] = [
   { type: "multisig_propose", action: { type: "transfer", to: bob.address, amount: "1" } },
   { type: "beacon_commit", epoch: 1, commitment: "ab".repeat(32) },
   { type: "claim_distribution", distribution_id: 0, amount: "1", proof: ["cd".repeat(32)] },
-  { type: "renew_name", name, years: 1 },
 ];
 for (const action of notYet) {
   await assert.rejects(client.submit(await alice.build(action)), /not active yet/, action.type);
 }
+const before = await client.name(name);
+assert.equal(before.status, "active");
+const renewed = await client.submit(await alice.build({ type: "renew_name", name, years: 1 }));
+console.log("✓", renewed.summary);
+assert.equal((await client.name(name)).expires_at, before.expires_at + before.registration_blocks);
 const moved = await client.submit(await alice.build({ type: "transfer_name", name: `${name}.boo`, to: bob.address }));
 console.log("✓", moved.summary);
 assert.equal(await client.resolve(`${name}.boo`), bob.address);
 await assert.rejects(client.submit(await alice.build({ type: "release_name", name })), /belongs to/);
 console.log("✓", (await client.submit(await bob.build({ type: "release_name", name }))).summary);
 assert.equal((await client.name(name)).available, true);
-console.log("✓ protocol v1 txs verify; names transfer and release");
+console.log("✓ protocol v1 txs verify; names renew, transfer and release");
 
 const status = await client.status();
 console.log(`✓ all good at height ${status.height}, burned so far: ${status.burned_display}`);

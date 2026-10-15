@@ -328,8 +328,8 @@ pub struct Tx {
     /// The account acting. The signing key must be authorized on it.
     pub from: String,
     pub nonce: u64,
-    /// The most the sender will pay. The tx is charged `min_fee(size) + tip` (see [`Tx::charge`]),
-    /// which must fit; nothing above the charge is debited.
+    /// The most the sender will pay. The tx is charged the block's base fee for its size plus
+    /// `tip` (`econ::charge`), which must fit; nothing above the charge is debited.
     #[serde(with = "u64_str")]
     pub fee: u64,
     /// Paid to the block's proposer on top of the burned base fee. Proposals take the highest
@@ -1403,9 +1403,11 @@ impl Tx {
         Ok(tx)
     }
 
-    /// What this tx is charged: the burned base fee for its size plus the proposer's tip
-    /// (`None` on overflow). It must be at most `fee`. Until the fee market (MAINNET-DESIGN
-    /// 3.6) lands, the base fee is `min_fee(size)`.
+    /// What this tx is charged while the base fee is at its genesis floor: `min_fee(size)` plus
+    /// the proposer's tip (`None` on overflow). The base fee moves with block fullness, so the
+    /// exact charge depends on the block (`econ::charge`); this is what wallets and tests pay
+    /// on an idle chain.
+    #[cfg_attr(not(test), allow(dead_code))] // tests and the fuzz harness
     pub fn charge(&self) -> Option<u64> {
         min_fee(self.size()).checked_add(self.tip)
     }
@@ -1511,18 +1513,11 @@ impl Tx {
     }
 }
 
-/// Base fee is priced by bytes because post-quantum signatures are big. It's burned 🔥.
+/// The base fee at its genesis floor (`base_fee_floor_flat + base_fee_floor_per_byte × size`
+/// with the default parameters): priced by bytes because post-quantum signatures are big, and
+/// burned 🔥. The base fee a block charges moves with fullness (`econ::base_fee`).
 pub fn min_fee(tx_size: u64) -> u64 {
     10_000 + tx_size * 10
-}
-
-/// Short names are scarce, so they cost more. Paid to the treasury.
-pub fn name_price(name: &str) -> u64 {
-    match name.len() {
-        3 => 100 * DROPS_PER_FANG,
-        4 => 25 * DROPS_PER_FANG,
-        _ => 5 * DROPS_PER_FANG,
-    }
 }
 
 pub const MAX_TX_BYTES: usize = 64 * 1024;
@@ -1688,6 +1683,11 @@ pub struct Block {
     /// (the proposer pays for junk, MAINNET-DESIGN 3.4).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<u64>,
+    /// The base fee its txs paid and its size limit (fixed when the block 17 earlier executed,
+    /// `econ::FeeSlot`), so explorers show what a tx was charged. Display only: replay
+    /// recomputes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_fee: Option<crate::econ::FeeSlot>,
 }
 
 #[cfg(test)]
@@ -1780,7 +1780,7 @@ pub(crate) mod tests {
     }
 
     /// The vector tx around an action: fixed fields, and recognizable key and signature bytes.
-    fn vector_tx(action: Action) -> Tx {
+    pub(crate) fn vector_tx(action: Action) -> Tx {
         Tx { chain_id: "vec".into(), genesis_hash: "03".repeat(32), from: "boo1from".into(), nonce: 7, fee: 12345, tip: 3, valid_until: 99, action, memo: "m".into(), public_key: "01".repeat(crypto::PUBLIC_KEY_LEN), signature: "02".repeat(crypto::SIGNATURE_LEN) }
     }
 

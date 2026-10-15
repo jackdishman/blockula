@@ -390,7 +390,8 @@ fn namespaces_and_meta_keys_are_unique() {
 /// Format change detectors: a record's bytes and a fixed state's root. The root was also
 /// computed by an independent JS implementation of the record layout and tree (noble BLAKE3),
 /// recomputed when `Params` gained `address_prefix` (P-WIRE) and again for the protocol v1
-/// scaffold (schema 2: `chain_params`, the upgrade schedule, account locks).
+/// scaffold (schema 2: `chain_params`, the upgrade schedule, account locks). Schema 3 (P-ECON:
+/// the `econ` scalar record) changed it again; that value is from this implementation only.
 #[test]
 fn golden_encodings() {
     let acct = Account { balance: 5, nonce: 2, keys: Default::default(), locks: vec![] };
@@ -400,8 +401,8 @@ fn golden_encodings() {
     st.supply = 5;
     st.commit_block().unwrap();
     assert_eq!(st.root_hash(), st.full_root());
-    assert_eq!(st.record_count(), 9);
-    assert_eq!(st.root(), "05ab46b414a130e4f2e2c742ed46320a0e469af8ac0a8d0d7aa9493772c22517");
+    assert_eq!(st.record_count(), 10);
+    assert_eq!(st.root(), "2cc96e7acb21b120b7a7cd28ac49f66da171b45d348c308885939f973b0f245a");
 }
 
 fn million_accounts() -> State {
@@ -515,9 +516,10 @@ fn largest_records_fit_in_a_snapshot() {
     // An account with every key slot (session keys, longest labels) and every lock slot.
     let session = KeyRole::Session { limit: u64::MAX, period_blocks: u64::MAX, expires_at: u64::MAX };
     let keys = (0..MAX_KEYS as u64).map(|i| (hex32(i), KeyRecord { label: s(MAX_LABEL), role: session.clone(), added_at: u64::MAX, spent: u64::MAX, window_start: u64::MAX })).collect();
-    let locks = (0..MAX_LOCKS as u64).map(|id| Lock { id, amount: LockAmount::Vesting { total: u64::MAX, start: u64::MAX, cliff: u64::MAX, end: u64::MAX }, reason: s(MAX_LABEL) }).collect();
+    // Lock ids at `econ::lock`'s bound (`MAX_LABEL` bytes), distinct.
+    let locks = (0..MAX_LOCKS as u64).map(|id| Lock { id: format!("{id:0>MAX_LABEL$}"), amount: LockAmount::Vesting { total: u64::MAX, start: u64::MAX, cliff: u64::MAX, end: u64::MAX }, reason: s(MAX_LABEL) }).collect();
     st.accounts.insert(addr(0), Account { balance: u64::MAX, nonce: u64::MAX, keys, locks });
-    st.names.insert(s(MAX_NAME_FIELD), NameRecord { name: s(MAX_NAME_FIELD), owner: addr(0), registered_at: 0 });
+    st.names.insert(s(MAX_NAME_FIELD), NameRecord { name: s(MAX_NAME_FIELD), owner: addr(0), registered_at: 0, expires_at: u64::MAX });
     let vr = ValidatorRecord { address: addr(1), owner: addr(0), consensus_key: "ab".repeat(crypto::PUBLIC_KEY_LEN), p2p_addr: s(MAX_ADDR), http_addr: s(MAX_ADDR), bond: u64::MAX, status: ValidatorStatus::Removed, registered_at: 0, approved_at: Some(0), approved_by: Some(addr(2)), active_from: Some(0), removed_at: Some(0), removed_by: Some(addr(2)), active_until: Some(0), unbond_epoch: Some(0), commission_bps: 0 };
     st.validators.insert(addr(1), vr);
     // The largest set governance can configure (`max_validators` is bounded by params.rs).

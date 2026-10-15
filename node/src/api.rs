@@ -398,6 +398,8 @@ pub fn router(node: Node) -> Router {
         .route("/api/tx", post(submit))
         .route("/api/account/{id}", get(account))
         .route("/api/name/{name}", get(name))
+        .route("/api/params", get(params))
+        .route("/api/fees", get(fees))
         .route("/api/key/{key_id}", get(key_accounts))
         .route("/api/search/{q}", get(search))
         .route("/api/faucet", post(faucet))
@@ -501,8 +503,8 @@ fn tx_json_with(v: &ReadView, tx: &Tx, height: Option<u64>, error: Option<&str>)
         "amount": amount.map(|a| a.to_string()),
         "amount_display": amount.map(fmt_fang),
         // What the tx is charged (base fee burned + tip); `max_fee` is what it allowed.
-        "fee": tx.charge().unwrap_or(tx.fee).to_string(),
-        "fee_display": fmt_fang(tx.charge().unwrap_or(tx.fee)),
+        "fee": charged(v, tx, height).to_string(),
+        "fee_display": fmt_fang(charged(v, tx, height)),
         "max_fee": tx.fee.to_string(),
         "tip": tx.tip.to_string(),
         "valid_until": tx.valid_until,
@@ -513,6 +515,17 @@ fn tx_json_with(v: &ReadView, tx: &Tx, height: Option<u64>, error: Option<&str>)
         "action": tx.action,
         "signature_scheme": "ML-DSA-65 (FIPS 204)",
     })
+}
+
+/// What a tx was (or, pending, would next be) charged: its block's base fee for its size plus
+/// its tip, at most its `fee`. Blocks record their base fee (P-ECON); a pending tx is priced at
+/// the next block's.
+fn charged(v: &ReadView, tx: &Tx, height: Option<u64>) -> u64 {
+    let charge = match height.and_then(|h| v.block(h)).and_then(|b| b.base_fee) {
+        Some(slot) => slot.fee(tx.size()).checked_add(tx.tip),
+        None => crate::econ::charge(&v.state, tx, height.unwrap_or_else(|| crate::econ::now(&v.state))),
+    };
+    charge.unwrap_or(tx.fee).min(tx.fee)
 }
 
 fn block_summary(height: u64, txs: usize) -> String {
@@ -689,9 +702,11 @@ async fn submit(State(n): State<Node>, ConnectInfo(peer): ConnectInfo<SocketAddr
 }
 
 async fn submit_inner(n: &Node, headers: &HeaderMap, client: Option<IpAddr>, tx: Tx) -> ApiResult {
-    // Format + ML-DSA signature checks run without the chain lock.
+    // Format + ML-DSA signature checks run without the chain lock, after the cheap check that the
+    // fee covers the next block's base fee.
     let (chain_id, genesis_hash, prefix, role) = {
         let v = n.live.view();
+        crate::econ::check_fee(&v.state, &tx, crate::econ::now(&v.state))?;
         (v.genesis.chain_id.clone(), v.genesis_hash.clone(), v.genesis.address_prefix.clone(), v.role)
     };
     crate::consensus::check_tx_stateless(&tx, &chain_id, &genesis_hash, &prefix)?;
@@ -915,13 +930,96 @@ async fn key_accounts(State(n): State<Node>, Path(key_id): Path<String>) -> ApiR
     Ok(Json(json!({ "key_id": key_id, "accounts": accounts })))
 }
 
+/// A name (DEC-11): its `status` (`active`; `grace`, when only its owner can renew it;
+/// `reserved`; or `available`), its owner and expiry, and what registering it or renewing it for
+/// a year costs.
 async fn name(State(node): State<Node>, Path(n): Path<String>) -> ApiResult {
     let v = node.live.view();
+    let st = &v.state;
     let n = normalize_name(&n)?;
-    match v.state.names.get(&n) {
-        Some(r) => Ok(Json(json!({ "name": format!("{n}{NAME_SUFFIX}"), "available": false, "owner": label(&v, &r.owner), "registered_at": r.registered_at }))),
-        None => Ok(Json(json!({ "name": format!("{n}{NAME_SUFFIX}"), "available": true, "price": name_price(&n).to_string(), "price_display": fmt_fang(name_price(&n)) }))),
-    }
+    let cp = &st.chain_params;
+    let (price, renewal) = (cp.name_price(n.len()), cp.name_renewal_price(n.len(), 1));
+    let mut out = json!({
+        "name": format!("{n}{NAME_SUFFIX}"),
+        "price": price.to_string(),
+        "price_display": fmt_fang(price),
+        "renewal_price": renewal.to_string(),
+        "renewal_price_display": fmt_fang(renewal),
+        "registration_blocks": cp.name_registration_blocks,
+        "grace_blocks": cp.name_grace_blocks,
+    });
+    let now = crate::econ::now(st);
+    let status = match st.names.get(&n) {
+        Some(r) => {
+            let grace = crate::econ::grace_until(st, r);
+            out["owner"] = label(&v, &r.owner);
+            out["registered_at"] = r.registered_at.into();
+            out["expires_at"] = r.expires_at.into();
+            out["grace_until"] = grace.into();
+            if now <= r.expires_at {
+                "active"
+            } else if now <= grace {
+                "grace"
+            } else {
+                "available"
+            }
+        }
+        None if st.econ.reserved_names.contains_key(&n) => "reserved",
+        None => "available",
+    };
+    out["status"] = status.into();
+    out["available"] = (status == "available").into();
+    Ok(Json(out))
+}
+
+/// The governance-adjustable parameters (amounts as strings), the genesis constants, and the
+/// issuance year under way.
+async fn params(State(n): State<Node>) -> ApiResult {
+    let v = n.live.view();
+    let st = &v.state;
+    let params: serde_json::Map<String, Value> = st.chain_params.to_map().into_iter().map(|(k, v)| (k.to_string(), v.to_string().into())).collect();
+    let epy = crate::econ::epochs_per_year(&st.params);
+    let iss = st.econ.issuance;
+    Ok(Json(json!({
+        "params": params,
+        "genesis": { "block_time_ms": st.params.block_time_ms, "epoch_blocks": st.params.epoch_blocks, "address_prefix": st.params.prefix(), "epochs_per_year": epy },
+        "issuance": {
+            "year": iss.year,
+            "rate_ppm": iss.rate_ppm,
+            "base_supply": iss.base_supply.to_string(),
+            "per_epoch": crate::econ::epoch_mint(&iss, epy).to_string(),
+            "per_epoch_display": fmt_fang(crate::econ::epoch_mint(&iss, epy)),
+        },
+        "supply": st.supply.to_string(),
+        "burned": st.burned.to_string(),
+    })))
+}
+
+/// The base fee (MAINNET-DESIGN 3.6): every block's slot from the last executed one to `lag`
+/// blocks ahead (flat drops, `rate` in milli-drops per byte, the block's tx-byte limit), and
+/// `suggested`, the highest flat part and rate among the upcoming ones: a tx whose `fee` covers
+/// `flat + rate × size / 1000 + tip` is accepted in any of the next `lag` blocks, and is charged
+/// only its block's base fee plus its tip.
+async fn fees(State(n): State<Node>) -> ApiResult {
+    use crate::econ::{FEE_LAG, RATE_SCALE};
+    let v = n.live.view();
+    let st = &v.state;
+    let cp = &st.chain_params;
+    let slot = |h: u64, s: &crate::econ::FeeSlot| json!({ "height": h, "flat": s.flat.to_string(), "rate": s.rate.to_string(), "max_block_bytes": s.max_block_bytes });
+    let slots: Vec<Value> = st.econ.fees.iter().enumerate().map(|(i, s)| slot(st.econ.height + i as u64, s)).collect();
+    let s = crate::econ::suggested(st);
+    Ok(Json(json!({
+        "height": st.econ.height,
+        "lag": FEE_LAG,
+        "rate_scale": RATE_SCALE,
+        "slots": slots,
+        "suggested": { "flat": s.flat.to_string(), "rate": s.rate.to_string() },
+        "floor": { "flat": cp.base_fee_floor_flat.to_string(), "per_byte": cp.base_fee_floor_per_byte.to_string() },
+        "target_fullness_bps": cp.target_fullness_bps,
+        "max_change_bps": cp.base_fee_max_change_bps,
+        "account_creation_fee": cp.account_creation_fee.to_string(),
+        "account_creation_fee_display": fmt_fang(cp.account_creation_fee),
+    })))
 }
 
 async fn search(State(n): State<Node>, Path(q): Path<String>) -> ApiResult {
@@ -1635,6 +1733,47 @@ mod http_tests {
         assert_eq!(connected_peers(text), Some(2));
         assert_eq!(connected_peers("# HELP network_tracker_directory_connected x\n# TYPE network_tracker_directory_connected gauge\n"), Some(0));
         assert_eq!(connected_peers("runtime_tasks_spawned_total 3\n"), None, "no p2p tracker");
+    }
+
+    /// P-ECON's reads: the fee ring and what wallets should pay, the parameters and the
+    /// issuance year, a name's status, prices and expiry, and a tx's actual charge.
+    #[tokio::test]
+    async fn fees_params_and_names() {
+        let (root, n) = node("econ");
+        let (s, f, _) = call(&n, "GET", "/api/fees", None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!((f["lag"].as_u64(), f["slots"].as_array().unwrap().len()), (Some(17), 18));
+        assert_eq!((f["slots"][17]["height"].as_u64(), f["slots"][0]["rate"].as_str()), (Some(17), Some("10000")));
+        assert_eq!((f["suggested"]["flat"].as_str(), f["suggested"]["rate"].as_str(), f["rate_scale"].as_u64()), (Some("10000"), Some("10000"), Some(1_000)));
+        assert_eq!((f["floor"]["per_byte"].as_str(), f["account_creation_fee"].as_str()), (Some("10"), Some("100000000")));
+        let (_, p, _) = call(&n, "GET", "/api/params", None, "127.0.0.1:1").await;
+        assert_eq!((p["params"]["max_block_bytes"].as_str(), p["params"]["name_price_5"].as_str()), (Some("2097152"), Some("5000000000")));
+        assert_eq!((p["genesis"]["epochs_per_year"].as_u64(), p["issuance"]["year"].as_u64()), (Some(52_596), Some(0)));
+        let (_, a, _) = call(&n, "GET", "/api/name/alice.boo", None, "127.0.0.1:1").await;
+        assert_eq!((a["status"].as_str(), a["available"].as_bool(), a["price"].as_str(), a["renewal_price"].as_str()), (Some("available"), Some(true), Some("5000000000"), Some("1000000000")));
+        // Register it; the name shows its owner and expiry, and the tx what it was charged.
+        let alice = crate::crypto::Keys::from_seed([3; 32]);
+        let id = {
+            let mut c = n.chain.lock();
+            c.faucet(&alice.address(), 10 * DROPS_PER_FANG).unwrap();
+            c.produce_block().unwrap();
+            let mut tx = Tx { chain_id: "econ".into(), genesis_hash: c.genesis_hash.clone(), from: alice.address(), nonce: 0, fee: 0, tip: 25, valid_until: c.height() + 10, action: Action::RegisterName { name: "alice".into() }, memo: String::new(), public_key: hex::encode(alice.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+            tx.fee = 3 * min_fee(tx.size());
+            let tx = tx.sign(&alice);
+            let id = c.submit(tx).unwrap();
+            c.produce_block().unwrap();
+            id
+        };
+        let (_, a, _) = call(&n, "GET", "/api/name/alice", None, "127.0.0.1:1").await;
+        let h = n.chain.lock().height();
+        let year = n.chain.lock().state.chain_params.name_registration_blocks;
+        assert_eq!((a["status"].as_str(), a["available"].as_bool(), a["owner"]["address"].as_str()), (Some("active"), Some(false), Some(alice.address().as_str())));
+        assert_eq!((a["expires_at"].as_u64(), a["grace_until"].as_u64()), (Some(h + year), Some(h + year + n.chain.lock().state.chain_params.name_grace_blocks)));
+        let (_, t, _) = call(&n, "GET", &format!("/api/tx/{id}"), None, "127.0.0.1:1").await;
+        let size = t["size_bytes"].as_u64().unwrap();
+        assert_eq!(t["fee"].as_str().unwrap(), (min_fee(size) + 25).to_string(), "charged: the block's base fee + the tip, not the max fee");
+        assert_eq!(t["max_fee"].as_str().unwrap(), (3 * min_fee(size)).to_string());
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[tokio::test]

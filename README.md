@@ -153,6 +153,8 @@ blockula join --genesis http://127.0.0.1:<v0 http port> --genesis-hash <hash> --
 
 Full nodes: `blockula join --genesis genesis.json --genesis-hash <hash> --home full --bind 0.0.0.0 --port 7171` (`blockula checkpoint --genesis genesis.json` prints the hash). On a chain older than ~10 days, also pass a recent `--checkpoint` ([OPERATIONS.md, Weak subjectivity](docs/OPERATIONS.md#weak-subjectivity)).
 
+**A real genesis** (mainnet, dry runs) isn't summoned: each operator runs `blockula genesis operator` offline to write its public entry (consensus key, owner, addresses, proof of possession), and `blockula genesis build --spec spec.toml --out genesis.json` turns a reviewed spec (allocations by bucket with their vesting, the operators, parameters, reserved names) into the same `genesis.json` and hash on every machine. See `deploy/mainnet/genesis-spec.example.toml` and [docs/GENESIS_CEREMONY.md](docs/GENESIS_CEREMONY.md).
+
 Any node accepts txs, which are gossiped to the leader. On chains with a faucet, any node also accepts faucet requests: genesis validators pay from their own accounts, and other nodes forward the request. A forwarded request is never forwarded again.
 
 Exposed HTTP is hardened:

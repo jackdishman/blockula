@@ -397,9 +397,11 @@ impl ReadView {
         rows.into_iter().filter_map(|r| String::from_utf8(r.get(8..)?.to_vec()).ok()).collect()
     }
 
-    /// The first name an account registered (shown instead of its address).
+    /// The first name an account registered that still resolves (shown instead of its address;
+    /// expired names, DEC-11, are skipped).
     pub fn primary_name(&self, owner: &str) -> Option<String> {
-        self.names_of(owner, 1).pop().map(|n| format!("{n}{NAME_SUFFIX}"))
+        let active = |n: &String| self.state.names.get(n).is_some_and(|r| crate::econ::name_active(&self.state, r));
+        self.names_of(owner, 8).into_iter().find(active).map(|n| format!("{n}{NAME_SUFFIX}"))
     }
 
     /// Accounts that hold the key `key_id` (hex), from the key index.

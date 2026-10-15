@@ -123,7 +123,7 @@ export interface UnsignedTx {
   /** The account acting; the signing key must be authorized on it. */
   from: string;
   nonce: number;
-  /** The most the sender will pay, in drops. The tx is charged `minFee + tip` (see `txCharge`). */
+  /** The most the sender will pay, in drops. The tx is charged its block's base fee + `tip` (see `txCharge`). */
   fee: string;
   /** Drops paid to the block's proposer on top of the burned base fee (default "0"). Blocks take the highest tip per byte first. */
   tip?: string;
@@ -435,14 +435,32 @@ export function txSize(tx: UnsignedTx): number {
   return signingBytes(tx).length + PUBLIC_KEY_LEN + SIGNATURE_LEN;
 }
 
-/** Mirrors `min_fee` in node/src/types.rs: base fee is priced per byte and burned. */
-export function minFee(tx: UnsignedTx): bigint {
-  return 10_000n + BigInt(txSize(tx)) * 10n;
+/**
+ * A block's base fee (node/src/econ.rs `FeeSlot`): `flat` drops per tx plus `rate` milli-drops per
+ * byte. It moves with block fullness and is fixed 17 blocks ahead; `/api/fees` serves the upcoming
+ * ones and `suggested`, the highest of them (what `Wallet.build` prices txs at).
+ */
+export interface BaseFee {
+  flat: string | bigint;
+  rate: string | bigint;
 }
 
-/** What the tx is charged (node/src/types.rs `Tx::charge`): `minFee + tip`. Its `fee` must cover it; nothing more is debited. */
-export function txCharge(tx: UnsignedTx): bigint {
-  return minFee(tx) + BigInt(tx.tip ?? "0");
+/** The base fee at its genesis floor: 10,000 drops + 10 per byte (`min_fee`). */
+export const FLOOR_BASE_FEE: BaseFee = { flat: 10_000n, rate: 10_000n };
+
+/** Mirrors `FeeSlot::fee` in node/src/econ.rs: `flat + rate × size / 1000`, rounded down. Burned. */
+export function baseFee(tx: UnsignedTx, fee: BaseFee = FLOOR_BASE_FEE): bigint {
+  return BigInt(fee.flat) + (BigInt(fee.rate) * BigInt(txSize(tx))) / 1000n;
+}
+
+/** Mirrors `min_fee` in node/src/types.rs: the base fee at its floor (an idle chain's). */
+export function minFee(tx: UnsignedTx): bigint {
+  return baseFee(tx, FLOOR_BASE_FEE);
+}
+
+/** What the tx is charged in a block with this base fee (node/src/econ.rs `charge`): base fee + tip. Its `fee` must cover it; nothing more is debited. */
+export function txCharge(tx: UnsignedTx, fee: BaseFee = FLOOR_BASE_FEE): bigint {
+  return baseFee(tx, fee) + BigInt(tx.tip ?? "0");
 }
 
 /** Wire form (node/src/types.rs `Tx::to_bytes`): signing bytes ‖ public key (1,952 B) ‖ signature (3,309 B). Blocks and gossip carry this. */

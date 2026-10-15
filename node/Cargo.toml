@@ -52,6 +52,8 @@ borsh = { version = "=1.8.1", features = ["derive", "de_strict_order"] }
 # the API serves from without the consensus lock (src/view.rs).
 redb = "=4.4.0"
 arc-swap = "=1.9.2"
+# Genesis specs and operator files (src/genesis_builder.rs).
+toml = "1.1"
 
 # ML-DSA and consensus are slow unoptimized; keep our crate debuggable but optimize deps.
 [profile.dev.package."*"]

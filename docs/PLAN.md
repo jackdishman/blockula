@@ -38,10 +38,10 @@ Native account abstraction (Phase 1). Each account holds a list of authorized ke
 
 ## Tokenomics (FANG)
 
-- **Fees:** the per-byte base fee is **burned** 🔥 (live in Phase 0); tips go to the proposer. Priced by bytes because post-quantum signatures are about 3.3 KB.
-- **Issuance:** starts at ~6% a year, decays to a permanent **1.5% tail emission** so security never depends on fees alone. Split 70% stakers / 20% contribution pool / 10% treasury (see Proof of Contribution).
-- **Names:** length-based price (3 chars: 100, 4 chars: 25, 5+ chars: 5 FANG) to the treasury (live). Phase 1 adds annual renewal at 20% of price so squatters bleed.
-- **State rent:** stored data and names hold a refundable deposit, which caps state growth.
+- **Fees:** the per-byte base fee is **burned** 🔥; tips go to the proposer. Priced by bytes because post-quantum signatures are about 3.3 KB. Protocol v1: it moves with block fullness (12.5% a block at most, never below the old minimum) and is fixed 17 blocks ahead (MAINNET-DESIGN 3.6).
+- **Issuance:** starts at 6% a year, decays 15% a year to a permanent **1.5% tail emission** so security never depends on fees alone, minted every epoch. Split 70% stakers / 20% contribution pool / 10% treasury (see Proof of Contribution and [TOKENOMICS.md](TOKENOMICS.md)).
+- **Names:** length-based price (3 chars: 100, 4 chars: 25, 5+ chars: 5 FANG) to the treasury, for a year; renewal costs 20% of the price a year, with a 30-day grace, so squatters bleed (protocol v1, DEC-11).
+- **State growth:** opening an account burns 0.1 FANG and names renew yearly; every other record is bonded (DEC-6).
 - **Treasury:** 10% of issuance plus name fees. Pays for sponsored onboarding txs (new users need zero FANG), faucets, audits and grants.
 - **Ghost Mode:** a small verification premium, partly offset by aggregation.
 - **Health targets:** ≥50% staked, Nakamoto coefficient ≥10, slashing for double-signing (heavy) and downtime (light).

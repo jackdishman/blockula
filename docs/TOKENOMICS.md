@@ -46,6 +46,8 @@ Locks are measured in blocks, not wall-clock time (1 s blocks; a year is 31,557,
 | Contribution endowment | 0 | none | 315,576,000 (10 years) |
 | Bootstrap return to the treasury | 31,557,600 | none | 126,230,400 |
 
+The treasury's and the endowment's curves are vesting locks on their keyless accounts: a treasury spend can't exceed what has unlocked (inflows such as issuance and name fees are free at once), and at every epoch boundary whatever of the endowment has vested moves into the contribution pool. The bootstrap delegation's return is part of its delegation formula, not a lock.
+
 ### Released by the schedule (end of each year, FANG)
 
 Distributions from the 32% bucket aren't on a schedule, so they aren't shown. Treasury funds count as released when they become spendable by governance, not when they're spent.
@@ -66,11 +68,11 @@ New FANG is minted at every epoch boundary (an epoch is 1 hour, 3,600 blocks) an
 
 - **Year length:** an issuance year is 8,766 epochs (365.25 days at 1 s blocks). Year *y* covers epochs 8,766·(*y*−1) to 8,766·*y* − 1.
 - **Rate:** `rate_ppm(1) = 60_000` (6%), then `rate_ppm(y+1) = max(15_000, rate_ppm(y) × 85 / 100)`, rounded down. The floor, 15,000 ppm (1.5%), is reached in year 10 and stays.
-- **Per epoch:** `mint = S(y) × rate_ppm(y) / (1_000_000 × 8_766)`, in u128 and rounded down, where `S(y)` is total supply snapshotted at the first block of year *y*. Using the year-start snapshot keeps each year's issuance at exactly the stated rate; minting on the current supply every epoch would compound 6% into 6.18%.
+- **Per epoch:** `mint = S(y) × rate_ppm(y) / (1_000_000 × 8_766)`, in u128 and rounded down, where `S(y)` is total supply snapshotted when year *y*'s first epoch ends, before that epoch's mint (without burns, the supply at the year's first block). Using the year-start snapshot keeps each year's issuance at exactly the stated rate; minting on the current supply every epoch would compound 6% into 6.18%.
 - **Split:** validators `mint × 7_000 / 10_000`, the contribution pool `mint × 2_000 / 10_000`, the treasury the remainder (10% plus rounding dust, so the parts sum exactly). The validators' share goes to active validators' pools in proportion to stake; jailed and tombstoned validators get none.
 - **Insiders get none of it.** No part of issuance or fees goes to the founder, the foundation or any named person.
 
-The rates and the split are governance parameters. The plan is to require a ⅔ majority to change them and to enforce bounds in code (for example a floor of at least 0.5% and at least 50% to validators), so a low-turnout vote can't switch off security.
+The rates and the split are governance parameters, bounded in code (a floor of at least 0.5%, at least 50% to validators). A new rate, decay or floor applies from the next issuance year, a new split from the next epoch. The plan is to require a ⅔ majority to change them, so a low-turnout vote can't switch off security.
 
 ### The first ten years
 
@@ -94,10 +96,10 @@ Year 1 per epoch: 4,791.238877481 FANG to validator pools, 1,368.925393566 to th
 ## 3. Fees, burns and names
 
 - **Fees.** Each transaction names the most it will pay (`fee`). It's charged `base_fee × size + tip`. The base part is burned and the tip goes to the block proposer, and proposals order transactions by tip per byte.
-- **Base fee.** Priced per byte, because post-quantum signatures make a transfer ~5.4 KB. It moves with block fullness: the target is 50% full, it changes at most 12.5% per block, and it never drops below today's minimum (10,000 drops + 10 drops per byte, about 0.000064 FANG for a transfer). Each block's base fee is fixed 17 blocks ahead, so every proposer knows it exactly.
+- **Base fee.** Priced per byte, because post-quantum signatures make a transfer ~5.4 KB. It moves with block fullness: the target is 50% of the 2 MiB block limit, a full block raises it 12.5% and an empty one lowers it 12.5%, and it never drops below today's minimum (10,000 drops + 10 drops per byte, about 0.000064 FANG for a transfer). Each block's base fee (and its size limit) is fixed 17 blocks ahead, so every proposer knows it exactly. Wallets read the upcoming ones at `/api/fees` and set `fee` to the highest; only the block's own base fee and the tip are charged.
 - **Why burn it.** Burning prices block space: spam costs the spammer, and a proposer can't fill its own blocks for free. It isn't a mechanism to manage the token's price.
-- **Account creation.** Creating an account burns 0.1 FANG (governance can change it). Every other record on chain is already bonded.
-- **Names.** Registration costs depend on length: 3 characters 100 FANG, 4 characters 25 FANG, 5 or more 5 FANG, paid to the treasury. A registration lasts a year; renewal costs 20% of the price per year, with a 30-day grace period. Names can be transferred and released. A reserved list in genesis is assignable only by governance.
+- **Account creation.** Opening an account burns 0.1 FANG (governance can change it), paid by whoever opens it on top of what they send. Every other record on chain is already bonded.
+- **Names.** Registration costs depend on length: 3 characters 100 FANG, 4 characters 25 FANG, 5 or more 5 FANG, paid to the treasury. A registration lasts a year; renewal costs 20% of the price per year (at most 10 years paid ahead). An expired name stops resolving; for 30 days only its owner can renew it, then anyone can register it. Names can be transferred and released. A reserved list in genesis is assignable only by governance.
 - **Other burns.** A proposal deposit is burned if the proposal doesn't reach quorum. A slash pays the reporter a share and burns the rest.
 
 ## 4. Staking
@@ -122,8 +124,8 @@ Staking rewards are payment for validating and securing the network. They aren't
 ## 6. Vesting rules
 
 - A vesting lock is a curve (`start`, `cliff`, `end`, `total`). Before the cliff nothing has vested; after it, `vested = total × (h − start) / (end − start)`, capped at `total`. The locked amount at height `h` is `total − vested`.
-- Transferable balance = liquid − max(0, largest lock − staked − unbonding). Locked tokens can be staked and delegated, never transferred.
-- **Rewards earned by locked stake are locked on the same curve.** Otherwise a vesting allocation would pay liquid income before its cliff.
+- Transferable balance = liquid − max(0, largest lock − staked − unbonding). Locked tokens can be staked and delegated, never transferred (nor escrowed, spent on names or given to the pool); fees can be paid from them.
+- **Rewards earned by locked stake are locked on the same curve.** Staking rewards paid to an account with a vesting lock join that lock: what's still unvested of them stays locked, so a vesting allocation can't pay liquid income before its cliff.
 - **Insider delegation cap.** An account with a vesting lock may delegate at most 1% of supply (10M FANG) to any one pool, so locked insider stake can't take over seats while staking is thin.
 - Unvested tokens don't vote (section 5).
 
@@ -186,5 +188,5 @@ These are open in the design and are settled in the governance and economics wor
 - **How the first distribution is executed.** The 32% bucket is keyless, and at launch almost nothing can vote: insider tokens are locked and the founder and foundation don't vote. A distribution that waits for an ordinary governance quorum could wait forever, and one that a single party can trigger makes that party the distributor. The mechanism has to avoid both.
 - **First FANG for fees.** With no sale and no faucet, liquid FANG at launch is little more than validator commission. How new users pay their first fees (for example treasury-sponsored onboarding transactions, as PLAN.md describes) is open.
 - **Governance numbers:** the quorum floor, the length of a conviction lock period, the proposal deposit, and the threshold for a "large" treasury spend.
-- **Bounds on issuance changes** (the ⅔ majority and code-enforced limits above are the plan, not yet built).
+- **The majority for issuance changes** (⅔ is the plan; the code-enforced bounds above are built).
 - **Clawback scope.** The recommendation is that `Clawback` applies to contribution-pool grants only, never to a genesis allocation.

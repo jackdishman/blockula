@@ -45,7 +45,7 @@ wallet.tip = 0n;                 // defaults for every tx this wallet builds
 wallet.validForBlocks = 600;
 ```
 
-- A transaction is charged `minFee(tx)` (priced per byte, burned) plus its `tip` (paid to the block's proposer; blocks take the highest tip per byte first). The wallet sets `fee` to exactly that. `txCharge(tx)` computes it.
+- A transaction is charged its block's base fee (`baseFee(tx, slot)`: priced per byte, burned; it rises while blocks are full and is fixed 17 blocks ahead) plus its `tip` (paid to the block's proposer; blocks take the highest tip per byte first). The wallet sets `fee` to the base fee at `client.fees()`'s `suggested` plus the tip; only the actual charge (`txCharge(tx, slot)`) is debited. On an idle chain the base fee is `minFee(tx)`.
 - Every transaction carries `valid_until`, the last block it may execute in. The wallet sets it to the current height plus `validForBlocks` (default 600 blocks, at most the chain's `max_tx_validity_blocks`, an hour of blocks). A transaction past `valid_until` can never execute, so it's safe to report it as expired.
 - `txBytes(tx)` is the binary wire form nodes gossip and put in blocks, and `txId(tx)` its id, known before you submit.
 - Every transaction names the chain it's for by `chain_id` and `genesis_hash` (the chain instance, from `/api/status`), so it can't replay on a relaunched chain that reuses the id. `wallet.build` fills both in; to sign offline, put the chain's `genesis_hash` in the `UnsignedTx` you pass to `wallet.sign`.

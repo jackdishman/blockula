@@ -2,7 +2,7 @@ import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex, hexToBytes, randomBytes, utf8ToBytes } from "@noble/hashes/utils.js";
 import { bech32m } from "@scure/base";
-import { minFee, parseFang, parseSoul, seanceCommitment, signingBytes, type Action, type KeyRole, type Tx, type UnsignedTx } from "./tx.js";
+import { baseFee, parseFang, parseSoul, seanceCommitment, signingBytes, type Action, type BaseFee, type KeyRole, type Tx, type UnsignedTx } from "./tx.js";
 
 export * from "./tx.js";
 
@@ -124,13 +124,15 @@ export class Wallet {
   }
 
   /**
-   * Builds and signs a tx: `fee` = `minFee + tip` (exactly what's charged), `valid_until` = the
-   * current height + `validForBlocks`, and the chain's id and genesis hash from `/api/status`.
-   * To sign offline, build an `UnsignedTx` yourself (with the chain's `genesis_hash`) and `sign` it.
+   * Builds and signs a tx: `fee` = the highest base fee already fixed for the next blocks
+   * (`/api/fees` `suggested`) + `tip`, `valid_until` = the current height + `validForBlocks`, and
+   * the chain's id and genesis hash from `/api/status`. Only the base fee of the block that
+   * includes it (+ the tip) is charged. To sign offline, build an `UnsignedTx` yourself (with the
+   * chain's `genesis_hash`) and `sign` it.
    */
   async build(action: Action, memo = "", opts: TxOptions = {}): Promise<Tx> {
     await this.client.addressPrefix(); // so `this.account` uses the chain's prefix
-    const [status, account] = await Promise.all([this.client.status(), this.client.account(this.account).catch(() => null)]);
+    const [status, account, fees] = await Promise.all([this.client.status(), this.client.account(this.account).catch(() => null), this.client.fees()]);
     const max: number = status.max_tx_validity_blocks ?? Number.MAX_SAFE_INTEGER;
     const validFor = opts.validForBlocks ?? Math.min(this.validForBlocks, max);
     if (!Number.isSafeInteger(validFor) || validFor < 1) throw new Error("validForBlocks must be a positive whole number of blocks");
@@ -139,7 +141,7 @@ export class Wallet {
     if (typeof status.genesis_hash !== "string") throw new Error(`${this.client.rpc} doesn't report a genesis_hash; it's too old for this SDK`);
     // Binds the tx to this chain instance (not just its id), so it can't replay on a relaunch.
     const unsigned: UnsignedTx = { chain_id: status.chain_id, genesis_hash: status.genesis_hash, from: this.account, nonce: account?.next_nonce ?? 0, fee: "0", tip: tip.toString(), valid_until: status.height + validFor, action, memo };
-    unsigned.fee = (minFee(unsigned) + tip).toString();
+    unsigned.fee = (baseFee(unsigned, fees.suggested) + tip).toString();
     return this.sign(unsigned);
   }
 
@@ -385,7 +387,12 @@ export class Client {
   block(heightOrHash: number | string) { return this.call(`/block/${heightOrHash}`); }
   tx(id: string) { return this.call(`/tx/${id}`); }
   account(addressOrName: string) { return this.call(`/account/${encodeURIComponent(addressOrName)}`); }
+  /** A name: `status` (`active`, `grace` (expired; only its owner can renew it), `reserved` or `available`), owner, `expires_at`, prices. */
   name(name: string) { return this.call(`/name/${encodeURIComponent(name)}`); }
+  /** The base fee: each upcoming block's (`slots`) and `suggested`, which covers any of the next 17 blocks. */
+  fees(): Promise<{ height: number; lag: number; slots: ({ height: number; max_block_bytes: number } & BaseFee)[]; suggested: BaseFee; account_creation_fee: string; [k: string]: unknown }> { return this.call("/fees"); }
+  /** The governance parameters (amounts as strings), genesis constants and the issuance year. */
+  params() { return this.call("/params"); }
   /** Accounts a key is authorized on (its own address, plus any it was added to). */
   keyAccounts(keyIdHex: string) { return this.call(`/key/${keyIdHex}`); }
   search(q: string) { return this.call(`/search/${encodeURIComponent(q)}`); }
@@ -412,7 +419,8 @@ export class Client {
     if (isAddress(nameOrAddress)) return nameOrAddress;
     if (/^t?boo1/i.test(nameOrAddress.trim())) throw new Error(`${nameOrAddress} isn't a valid address (check for typos; addresses are lowercase)`);
     const r = await this.name(nameOrAddress);
-    if (r.available) throw new Error(`${r.name} isn't registered`);
+    if (r.status === "grace") throw new Error(`${r.name} has expired (at block ${r.expires_at})`);
+    if (r.available || !r.owner) throw new Error(`${r.name} isn't registered`);
     return r.owner.address;
   }
 
