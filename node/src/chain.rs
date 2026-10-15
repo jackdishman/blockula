@@ -290,7 +290,7 @@ impl Genesis {
             state.supply += a.amount;
             if let Some(v) = &a.vesting {
                 let acct = state.accounts.entry(a.address.clone()).or_default();
-                let lock = Lock { id: acct.locks.len() as u64, amount: LockAmount::Vesting { total: a.amount, start: v.start, cliff: v.cliff, end: v.end }, reason: a.label.clone().unwrap_or_else(|| "genesis allocation".into()) };
+                let lock = Lock { id: crate::econ::VESTING_LOCK.into(), amount: LockAmount::Vesting { total: a.amount, start: v.start, cliff: v.cliff, end: v.end }, reason: a.label.clone().unwrap_or_else(|| "genesis allocation".into()) };
                 acct.locks.push(lock);
             }
         }
@@ -345,6 +345,8 @@ impl Genesis {
         for f in &self.features {
             state.upgrade.features.insert(f.clone(), crate::upgrade::Feature { activated_at: 0 });
         }
+        // P-ECON: the base fee and block-size limit for the first blocks (at the floor).
+        crate::econ::init_genesis(&mut state);
         state.commit_block().expect("an in-memory tree can't fail");
         state
     }
@@ -547,6 +549,14 @@ impl Journal {
         self.absorb(other)
     }
 
+    /// Accounts this journal touched, by address, with their balance before (`None`: the account
+    /// didn't exist). The account-creation fee and lock checks run over these (econ.rs).
+    pub(crate) fn touched_accounts(&self) -> Vec<(String, Option<u64>)> {
+        let mut v: Vec<(String, Option<u64>)> = self.accounts.touched().map(|(a, old)| (a.clone(), old.map(|o| o.balance))).collect();
+        v.sort_unstable();
+        v
+    }
+
     /// Folds a nested journal in, keeping the oldest values. Exhaustive, like `State::rollback`.
     fn absorb(&mut self, other: Journal) {
         let Journal { accounts, names, validators, hunts, github, github_by_account, familiars, scalars, next_hunt_id, chain_params, poc, staking, governance, econ, beacon, upgrade } = other;
@@ -591,6 +601,9 @@ pub struct BlockInfo<'a> {
     pub parent_view: u64,
     /// Wire sizes of the txs the block carried that couldn't be admitted (skipped).
     pub skipped: &'a [u64],
+    /// Wire bytes of every tx the block carried, skipped ones included: its fullness, which
+    /// moves the base fee (econ.rs).
+    pub tx_bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -620,20 +633,27 @@ pub struct Account {
 impl Account {
     /// What its locks hold at `height`: they overlap, so the largest applies (MAINNET-DESIGN
     /// 3.7: transferable = liquid − max(0, that − staked − unbonding)). econ.rs enforces it.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn locked_at(&self, height: u64) -> u64 {
         self.locks.iter().map(|l| l.amount.locked_at(height)).max().unwrap_or(0)
+    }
+
+    /// What its vesting locks hold at `height` (unvested tokens: they don't vote).
+    #[cfg_attr(not(test), allow(dead_code))] // econ::voting_balance (P-GOV)
+    pub fn unvested_at(&self, height: u64) -> u64 {
+        self.locks.iter().filter(|l| matches!(l.amount, LockAmount::Vesting { .. })).map(|l| l.amount.locked_at(height)).max().unwrap_or(0)
     }
 }
 
 /// A lock on an account's tokens (MAINNET-DESIGN 3.7). Locked tokens stay in the balance and can
-/// be staked, delegated and (vested) voted with, never transferred. econ.rs enforces them;
-/// governance adds vote locks.
+/// be staked, delegated and (vested) voted with, never transferred. econ.rs enforces them
+/// (`econ::transferable`); governance adds vote locks (`econ::lock`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Lock {
-    /// Unique among the account's locks.
-    pub id: u64,
+    /// Unique among the account's locks: `"vesting"` for a genesis allocation's, `"vote:<id>"`
+    /// for a vote's, and so on.
+    pub id: String,
     pub amount: LockAmount,
+    /// What it's for, in words ("founder", "vote on proposal #3").
     pub reason: String,
 }
 
@@ -650,10 +670,15 @@ pub enum LockAmount {
         cliff: u64,
         end: u64,
     },
+    /// `amount` until (not including) height `until`: a vote's conviction lock.
+    Until {
+        #[serde(with = "u64_str")]
+        amount: u64,
+        until: u64,
+    },
 }
 
 impl LockAmount {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn locked_at(&self, height: u64) -> u64 {
         match *self {
             LockAmount::Vesting { total, start, cliff, end } => {
@@ -665,6 +690,22 @@ impl LockAmount {
                     total - (total as u128 * (height - start) as u128 / (end - start) as u128) as u64
                 }
             }
+            LockAmount::Until { amount, until } => {
+                if height < until {
+                    amount
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    /// Holds nothing from `height` on, for good (`Unlock` may drop it).
+    #[cfg_attr(not(test), allow(dead_code))] // econ::release_expired (P-GOV)
+    pub fn expired_at(&self, height: u64) -> bool {
+        match *self {
+            LockAmount::Vesting { end, .. } => height >= end,
+            LockAmount::Until { until, .. } => height >= until,
         }
     }
 }
@@ -687,6 +728,9 @@ pub struct NameRecord {
     pub name: String,
     pub owner: String,
     pub registered_at: u64,
+    /// Last height it resolves (DEC-11: a year after registering, extended by `RenewName`).
+    /// Then `name_grace_blocks` in which only the owner can renew it, then anyone can register it.
+    pub expires_at: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
@@ -870,19 +914,25 @@ impl State {
         }
     }
 
+    /// An address as is, or a name's owner. Expired names (DEC-11) don't resolve.
     pub fn resolve(&self, to: &str) -> Result<String> {
         if crypto::is_address(to) {
             return Ok(to.to_string());
         }
         let n = normalize_name(to)?;
-        self.names.get(&n).map(|r| r.owner.clone()).ok_or_else(|| anyhow!("no one has claimed {n}{NAME_SUFFIX} yet"))
+        match self.names.get(&n) {
+            Some(r) if crate::econ::name_active(self, r) => Ok(r.owner.clone()),
+            Some(r) => bail!("{n}{NAME_SUFFIX} expired at block {}", r.expires_at),
+            None => bail!("no one has claimed {n}{NAME_SUFFIX} yet"),
+        }
     }
 
-    /// First name an address registered — shown everywhere instead of the raw address. A scan of
-    /// every name: the API looks names up in the store's owner index instead (`ReadView`).
+    /// First name an address registered that still resolves — shown everywhere instead of the
+    /// raw address. A scan of every name: the API looks names up in the store's owner index
+    /// instead (`ReadView`).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn primary_name(&self, addr: &str) -> Option<String> {
-        self.names.values().filter(|r| r.owner == addr).min_by_key(|r| r.registered_at).map(|r| format!("{}{NAME_SUFFIX}", r.name))
+        self.names.values().filter(|r| r.owner == addr && crate::econ::name_active(self, r)).min_by_key(|r| r.registered_at).map(|r| format!("{}{NAME_SUFFIX}", r.name))
     }
 
     /// Keys on an account, including the implicit original key for accounts that never added one.
@@ -970,6 +1020,12 @@ impl State {
         self.names.remove(name)
     }
 
+    /// Files a name record (a registration), replacing a lapsed one.
+    pub(crate) fn insert_name(&mut self, j: &mut Journal, rec: NameRecord) {
+        j.names.touch(&self.names, rec.name.as_str());
+        self.names.insert(rec.name.clone(), rec);
+    }
+
     /// The governance-adjustable parameters, journaled (see [`State::exec_set_param`]).
     pub(crate) fn chain_params_mut(&mut self, j: &mut Journal) -> &mut ChainParams {
         if j.chain_params.is_none() {
@@ -1021,7 +1077,8 @@ impl State {
         let signer = tx.signer_key_id()?;
         let keys = self.keys_of(&sender);
         let key = keys.get(&signer).cloned().ok_or_else(|| anyhow!("this key isn't authorized on {}", short(&sender)))?;
-        let charge = check_fee(tx)?;
+        // The block's base fee, fixed 17 blocks ahead (econ.rs), plus the tip.
+        let charge = crate::econ::check_fee(self, tx, height)?;
         let acct = self.account(&sender);
         if tx.nonce != acct.nonce {
             bail!("bad nonce: expected {}, got {}", acct.nonce, tx.nonce);
@@ -1034,7 +1091,8 @@ impl State {
                 bail!("session key expired at block {expires_at}");
             }
             let amount = match &tx.action {
-                Action::Transfer { amount, .. } => *amount,
+                // Opening the recipient's account burns the creation fee from the same budget.
+                Action::Transfer { amount, to } => amount.saturating_add(self.creation_fee_for(to)),
                 // An agent registered as a Familiar may claim its work for its sponsor.
                 Action::SubmitClaim { .. } if self.familiars.get(&sender).is_some_and(|f| f.contains_key(&signer)) => self.claim_bond(&sender),
                 _ => bail!("session keys can only send transfers (and claims, for registered Familiars)"),
@@ -1082,9 +1140,16 @@ impl State {
         self.supply -= base;
         self.j_credit(j, proposer, tx.tip);
         self.acct_mut(j, &sender).nonce += 1;
-        // Action phase (rolled back on failure).
+        // Action phase (rolled back on failure). Accounts it opens pay the creation fee, and no
+        // account may end up moving tokens its locks hold (fees above may: they're paid first).
+        let free = crate::econ::free(self, &sender, height);
         let mut aj = Journal::default();
-        match self.apply_action(&mut aj, tx, &sender, &signer, &key, height) {
+        let result = self.apply_action(&mut aj, tx, &sender, &signer, &key, height).and_then(|()| {
+            let touched = aj.touched_accounts();
+            crate::econ::charge_new_accounts(self, &mut aj, &touched, &sender, &signer, &key)?;
+            crate::econ::check_locks(self, &touched, &sender, free, height)
+        });
+        match result {
             Ok(()) => {
                 j.absorb(aj);
                 Ok(Outcome::Applied)
@@ -1114,20 +1179,8 @@ impl State {
                 self.j_debit(j, &sender, *amount)?;
                 self.j_credit(j, &to, *amount);
             }
-            Action::RegisterName { name } => {
-                let n = normalize_name(name)?;
-                if self.names.contains_key(&n) {
-                    bail!("{n}{NAME_SUFFIX} is already taken");
-                }
-                if self.econ.reserved_names.contains_key(&n) {
-                    bail!("{n}{NAME_SUFFIX} is reserved");
-                }
-                self.j_debit(j, &sender, name_price(&n))?;
-                let treasury = self.treasury();
-                self.j_credit(j, &treasury, name_price(&n));
-                j.names.touch(&self.names, &n);
-                self.names.insert(n.clone(), NameRecord { name: n, owner: sender.clone(), registered_at: height });
-            }
+            // Prices, expiry and the reserved list: econ.rs (DEC-11).
+            Action::RegisterName { name } => crate::econ::register_name(self, j, &sender, name, height)?,
             Action::AddKey { key_id, label, role } => {
                 if key.role != KeyRole::Owner {
                     bail!("only owner keys can add keys");
@@ -1436,12 +1489,23 @@ impl State {
         Ok(())
     }
 
-    /// What admitting this tx reserves from the sender's balance (charge + amount moved out).
-    /// Votes reserve nothing: they lock tokens the voter keeps.
+    /// What creating `to`'s account would burn: `account_creation_fee` if `to` is an address
+    /// with no account yet (and not a keyless system account), else nothing.
+    pub fn creation_fee_for(&self, to: &str) -> u64 {
+        match self.resolve(to) {
+            Ok(a) if !self.accounts.contains_key(&a) && system_account(self.params.prefix(), &a).is_none() => self.chain_params.account_creation_fee,
+            _ => 0,
+        }
+    }
+
+    /// What admitting this tx reserves from the sender's balance (the most it can be charged at
+    /// the next heights + the amount moved out). Votes reserve nothing: they lock tokens the
+    /// voter keeps.
     pub fn tx_debit(&self, tx: &Tx) -> u64 {
-        tx.charge().unwrap_or(u64::MAX).saturating_add(match &tx.action {
-            Action::Transfer { amount, .. } => *amount,
-            Action::RegisterName { name } => normalize_name(name).map(|n| name_price(&n)).unwrap_or(0),
+        let charge = crate::econ::max_fee(self, tx.size()).saturating_add(tx.tip).min(tx.fee);
+        charge.saturating_add(match &tx.action {
+            Action::Transfer { amount, to } => amount.saturating_add(self.creation_fee_for(to)),
+            Action::RegisterName { name } => normalize_name(name).map(|n| self.chain_params.name_price(n.len())).unwrap_or(0),
             Action::RegisterValidator { bond, .. } => *bond,
             Action::CreateHunt { amount, .. } | Action::FundHunt { amount, .. } => *amount,
             Action::FundPool { amount } | Action::JoinJury { bond: amount } => *amount,
@@ -1550,11 +1614,14 @@ pub fn check_validity(tx: &Tx, height: u64, max_validity: u64) -> Result<()> {
     Ok(())
 }
 
-/// The tx's charge (`min_fee(size) + tip`), which `fee` must cover.
-pub fn check_fee(tx: &Tx) -> Result<u64> {
-    match tx.charge() {
-        Some(charge) if charge <= tx.fee => Ok(charge),
-        _ => bail!("fee too low: this tx costs {} drops (minimum {} + tip {}), but its fee allows {}", min_fee(tx.size()).saturating_add(tx.tip), min_fee(tx.size()), tx.tip, tx.fee),
+/// The stateless part of the fee check (HTTP, gossip, block verification before the state is
+/// at hand): `fee` covers the tip plus the lowest base fee any parameters allow
+/// (`econ::lowest_base_fee`). The exact check needs the block's base fee: `econ::check_fee`.
+pub fn check_fee(tx: &Tx) -> Result<()> {
+    let least = crate::econ::lowest_base_fee(tx.size());
+    match least.checked_add(tx.tip) {
+        Some(c) if c <= tx.fee => Ok(()),
+        _ => bail!("fee too low: this tx costs at least {} drops (base fee at least {least} + tip {}), but its fee allows {}", least.saturating_add(tx.tip), tx.tip, tx.fee),
     }
 }
 
@@ -2378,7 +2445,8 @@ impl Chain {
                 bail!("replaying block {}: tx {i} gave {outcome:?}, recorded {expected:?}", block.height);
             }
         }
-        self.state.end_block(&BlockInfo { height: block.height, hash: &block.hash, proposer: &block.proposer, view: block.view, parent_view: block.parent_view, skipped: &block.skipped });
+        let tx_bytes = block.txs.iter().map(Tx::size).chain(block.skipped.iter().copied()).sum();
+        self.state.end_block(&BlockInfo { height: block.height, hash: &block.hash, proposer: &block.proposer, view: block.view, parent_view: block.parent_view, skipped: &block.skipped, tx_bytes });
         if self.state.params.is_boundary(block.height) {
             self.record_epoch(block.height);
         }
@@ -2476,6 +2544,8 @@ impl Chain {
         let mut txs = vec![];
         let mut failed = BTreeMap::new();
         let mut skipped = vec![];
+        let base_fee = crate::econ::slot(&self.state, f.height);
+        let tx_bytes = f.txs.iter().map(Tx::size).sum();
         for tx in f.txs {
             match self.state.apply(&tx, &self.genesis.chain_id, &f.proposer, f.height) {
                 Ok(Outcome::Applied) => txs.push(tx),
@@ -2490,7 +2560,7 @@ impl Chain {
                 }
             }
         }
-        self.state.end_block(&BlockInfo { height: f.height, hash: &f.hash, proposer: &f.proposer, view: f.view, parent_view: f.parent_view, skipped: &skipped });
+        self.state.end_block(&BlockInfo { height: f.height, hash: &f.hash, proposer: &f.proposer, view: f.view, parent_view: f.parent_view, skipped: &skipped, tx_bytes });
         if self.state.params.is_boundary(f.height) && self.record_epoch(f.height) {
             self.sign_handoffs();
         }
@@ -2498,7 +2568,7 @@ impl Chain {
         let state_root = hex::encode(commit.root);
         #[cfg(test)]
         self.state.debug_check(f.height);
-        let block = Arc::new(Block { height: f.height, prev_hash: f.parent, timestamp_ms: f.timestamp_ms, view: f.view, parent_view: f.parent_view, version: f.version, proposer: f.proposer, state_root, txs, hash: f.hash, signature: String::new(), failed, skipped });
+        let block = Arc::new(Block { height: f.height, prev_hash: f.parent, timestamp_ms: f.timestamp_ms, view: f.view, parent_view: f.parent_view, version: f.version, proposer: f.proposer, state_root, txs, hash: f.hash, signature: String::new(), failed, skipped, base_fee });
         if let Some(cert) = &f.certificate {
             self.disk.remember_cert(f.height, cert.clone());
         }
@@ -2878,7 +2948,8 @@ impl Chain {
             public_key: hex::encode(keys.public_key()),
             signature: "00".repeat(crypto::SIGNATURE_LEN),
         };
-        tx.fee = min_fee(tx.size());
+        // The highest base fee already fixed for the next blocks (only the actual one is charged).
+        tx.fee = crate::econ::max_fee(&self.state, tx.size());
         let tx = tx.sign(keys);
         self.submit(tx.clone())?;
         Ok(tx)
@@ -3666,18 +3737,25 @@ mod v1 {
         let mut t = tx(&c, &a, &a.address(), 0, 7_000, c.height() + 10, Action::Transfer { to: friend.clone(), amount: DROPS_PER_FANG });
         t.fee += 1_000_000;
         let t = t.sign(&a);
-        let base = min_fee(t.size());
+        // An idle chain's base fee is the floor (`min_fee`); opening `friend`'s account burns the
+        // creation fee on top.
+        let (base, open) = (min_fee(t.size()), c.state.chain_params.account_creation_fee);
+        assert_eq!(crate::econ::base_fee(&c.state, c.height() + 1, t.size()), base);
         c.submit(t.clone()).unwrap();
         c.produce_block().unwrap();
-        assert_eq!(bal(&c, &a.address()), a0 - DROPS_PER_FANG - base - 7_000);
+        assert_eq!(bal(&c, &a.address()), a0 - DROPS_PER_FANG - base - 7_000 - open);
         assert_eq!(bal(&c, &me), me0 + 7_000, "the tip goes to the proposer");
-        assert_eq!((c.state.supply, c.state.burned), (supply0 - base, burned0 + base), "the base fee is burned");
-        // A fee that doesn't cover min_fee + tip isn't admittable: not in the mempool, not in a block.
+        assert_eq!((c.state.supply, c.state.burned), (supply0 - base - open, burned0 + base + open), "the base fee is burned");
+        // A fee that doesn't cover the base fee + tip isn't admittable: not in the mempool, not in
+        // a block. Statelessly it only has to cover the lowest base fee any parameters allow.
         let mut short = tx(&c, &a, &a.address(), 1, 5_000, c.height() + 10, Action::Transfer { to: friend.clone(), amount: DROPS_PER_FANG });
         short.fee -= 1;
         let short = short.sign(&a);
         assert!(c.submit(short.clone()).unwrap_err().to_string().contains("fee too low"));
-        assert!(crate::consensus::check_tx_stateless(&short, "v1", "boo").unwrap_err().to_string().contains("fee too low"));
+        crate::consensus::check_tx_stateless(&short, "v1", "boo").unwrap();
+        let mut shorter = short.clone();
+        shorter.fee = crate::econ::lowest_base_fee(shorter.size()) + shorter.tip - 1;
+        assert!(crate::consensus::check_tx_stateless(&shorter.sign(&a), "v1", "boo").unwrap_err().to_string().contains("fee too low"));
         c.produce_block_with(vec![short.clone()]).unwrap();
         assert!(c.failure(&short.id()).unwrap().0.contains("fee too low"));
         assert_eq!(c.state.account(&a.address()).nonce, 1);
@@ -3702,14 +3780,16 @@ mod v1 {
         let role = KeyRole::Session { limit, period_blocks: 100, expires_at: c.height() + 1_000 };
         c.submit(tx(&c, &owner, &acct, 0, 0, c.height() + 10, Action::AddKey { key_id: key_id(&agent.public_key()), label: "claude".into(), role })).unwrap();
         c.produce_block().unwrap();
-        // An amount that fits with the base fee alone, but not with a tip on top.
+        // An amount that fits with the base fee (and the fee for opening `friend`'s account)
+        // alone, but not with a tip on top.
         let charge0 = min_fee(tx(&c, &agent, &acct, 1, 0, c.height() + 10, Action::Transfer { to: friend.clone(), amount: 1 }).size());
-        let amount = limit - charge0 - 10;
+        let open = c.state.chain_params.account_creation_fee;
+        let amount = limit - charge0 - open - 10;
         let tipped = tx(&c, &agent, &acct, 1, 100, c.height() + 10, Action::Transfer { to: friend.clone(), amount });
         assert!(c.submit(tipped).unwrap_err().to_string().contains("limit reached"));
         c.submit(tx(&c, &agent, &acct, 1, 0, c.height() + 10, Action::Transfer { to: friend, amount })).unwrap();
         c.produce_block().unwrap();
-        assert_eq!(c.state.keys_of(&acct)[&key_id(&agent.public_key())].spent, amount + charge0, "spent = amount + charged fee");
+        assert_eq!(c.state.keys_of(&acct)[&key_id(&agent.public_key())].spent, amount + charge0 + open, "spent = amount + charged fee + the account it opened");
         fs::remove_dir_all(home).ok();
     }
 
@@ -3771,7 +3851,7 @@ mod v1 {
         c.submit(tx(&c, &a, &test, 0, 0, vu, Action::RegisterName { name: "tessa".into() })).unwrap();
         c.produce_block().unwrap();
         assert_eq!(c.state.resolve("tessa.boo").unwrap(), test);
-        assert_eq!(bal(&c, &c.state.treasury()), 100_000_000 * DROPS_PER_FANG + name_price("tessa"));
+        assert_eq!(bal(&c, &c.state.treasury()), 100_000_000 * DROPS_PER_FANG + c.state.chain_params.name_price(5));
         // A genesis whose addresses don't match its prefix (or an unknown prefix) doesn't load.
         let path = home.join("other.json");
         for (prefix, why) in [("boo", "doesn't use this chain's prefix"), ("xyz", "must be one of")] {
@@ -3908,7 +3988,7 @@ mod scaffold {
         assert_eq!(s.account(&owner).balance, 10_000 * FANG);
         // Vesting allocations are locks on the account, released linearly after the cliff.
         let locks = s.account(&founder).locks;
-        assert_eq!(locks, vec![Lock { id: 0, amount: LockAmount::Vesting { total: 1_000_000 * FANG, start: 0, cliff: 100, end: 1_000 }, reason: "founder".into() }]);
+        assert_eq!(locks, vec![Lock { id: crate::econ::VESTING_LOCK.into(), amount: LockAmount::Vesting { total: 1_000_000 * FANG, start: 0, cliff: 100, end: 1_000 }, reason: "founder".into() }]);
         let f = s.account(&founder);
         assert_eq!((f.locked_at(0), f.locked_at(99), f.locked_at(100), f.locked_at(550), f.locked_at(1_000)), (1_000_000 * FANG, 1_000_000 * FANG, 900_000 * FANG, 450_000 * FANG, 0));
         assert_eq!(s.account(&s.treasury()).locked_at(1_000), 1_500_000 * FANG);
@@ -4005,7 +4085,7 @@ mod scaffold {
         // Modules that haven't landed refuse their txs; a block carrying one charges its fee.
         let delegate = signed(&c, &owner, Action::Delegate { validator: v.clone(), amount: FANG });
         assert_eq!(c.submit(delegate.clone()).unwrap_err().to_string(), "not active yet");
-        for action in [Action::Propose { kind: ProposalKind::Text {}, deposit: FANG, title: "t".into(), url: String::new() }, Action::BeaconCommit { epoch: 1, commitment: "ab".repeat(32) }, Action::RenewName { name: "abc".into(), years: 1 }] {
+        for action in [Action::Propose { kind: ProposalKind::Text {}, deposit: FANG, title: "t".into(), url: String::new() }, Action::BeaconCommit { epoch: 1, commitment: "ab".repeat(32) }] {
             assert_eq!(c.submit(signed(&c, &owner, action)).unwrap_err().to_string(), "not active yet");
         }
         let before = c.state.account(&owner.address()).balance;
@@ -4176,7 +4256,9 @@ mod scaffold {
         let (owner, founder, bob) = (keys(22), keys(23), keys(24));
         let v = Keys::from_seed(VALIDATOR).address();
         c.submit(signed(&c, &owner, Action::RegisterName { name: "owner".into() })).unwrap();
-        c.submit(signed(&c, &founder, Action::Transfer { to: bob.address(), amount: 5 * FANG })).unwrap();
+        // The founder's allocation is locked before its cliff (econ.rs); the operator's isn't.
+        assert!(c.submit(signed(&c, &founder, Action::Transfer { to: bob.address(), amount: 5 * FANG })).unwrap_err().to_string().contains("locked (founder)"));
+        c.submit(signed(&c, &owner, Action::Transfer { to: bob.address(), amount: 5 * FANG })).unwrap();
         c.produce_block().unwrap();
         // A name changes hands, a module tx fails (and is charged), a stale tx is skipped.
         let give = signed(&c, &owner, Action::TransferName { name: "owner".into(), to: bob.address() });
@@ -4207,7 +4289,7 @@ mod scaffold {
         let s = &c.state;
         assert_eq!((s.chain_params.max_validators, s.chain_params.proposal_deposit), (40, 50 * FANG));
         assert_eq!(s.chain_params, g.chain_params().unwrap());
-        assert_eq!(s.account(&founder.address()).locks, vec![Lock { id: 0, amount: LockAmount::Vesting { total: 1_000_000 * FANG, start: 0, cliff: 100, end: 1_000 }, reason: "founder".into() }]);
+        assert_eq!(s.account(&founder.address()).locks, vec![Lock { id: crate::econ::VESTING_LOCK.into(), amount: LockAmount::Vesting { total: 1_000_000 * FANG, start: 0, cliff: 100, end: 1_000 }, reason: "founder".into() }]);
         assert_eq!((s.validators[&v].owner.as_str(), s.validators[&v].bond, s.validators[&v].commission_bps), (owner.address().as_str(), 10_000 * FANG, 500));
         assert!(s.econ.reserved_names.contains_key("blockula") && s.econ.reserved_names.contains_key("foundation"));
         assert_eq!(s.soul_of(&owner.address(), height), 50 * SOUL);

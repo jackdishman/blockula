@@ -17,8 +17,9 @@ use std::io::{Read, Write};
 
 /// Version of the state encoding (records, namespaces, tree). It is itself a record, so it is
 /// committed to by the root. 2: the protocol v1 scaffold (`chain_params`, account locks,
-/// validator commission, the module namespaces).
-pub const SCHEMA_VERSION: u32 = 2;
+/// validator commission, the module namespaces). 3: economics (P-ECON: name expiry, lock ids and
+/// vote locks, the `econ` scalars: fee ring, issuance year, name sweep).
+pub const SCHEMA_VERSION: u32 = 3;
 
 pub fn encode<T: BorshSerialize + ?Sized>(v: &T) -> Vec<u8> {
     borsh::to_vec(v).expect("encoding to memory can't fail")

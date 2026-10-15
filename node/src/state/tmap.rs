@@ -150,6 +150,12 @@ impl<K: Ord + std::hash::Hash + Clone, V: Clone> JMap<K, V> {
         }
     }
 
+    /// Every touched key with the value it had before (`None`: absent). Unordered: sort before
+    /// anything order-dependent.
+    pub fn touched(&self) -> impl Iterator<Item = (&K, Option<&V>)> {
+        self.0.iter().map(|(k, (old, _))| (k, old.as_ref()))
+    }
+
     /// Folds a nested journal in, keeping the oldest values.
     pub fn absorb(&mut self, other: Self) {
         for (k, v) in other.0 {

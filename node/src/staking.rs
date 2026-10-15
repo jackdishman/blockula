@@ -105,3 +105,18 @@ mod tests {
         assert_eq!((super::fmt_bps(250), super::fmt_bps(500), super::fmt_bps(1), super::fmt_bps(10_000)), ("2.5".into(), "5".into(), "0.01".into(), "100".into()));
     }
 }
+
+// STUB(owner P-STAKE): replaced at merge. P-ECON's lock checks and issuance call these; until
+// pools exist, an account's stake is the self-bond of the validators it owns, and issuance places
+// nothing (the stakers' share goes to the treasury).
+
+/// `(bonded value incl. pool share value, unbonding total)` of `account`.
+pub fn holdings(state: &State, account: &str) -> (u64, u64) {
+    let bonded = state.validators.values().filter(|v| v.owner == account).fold(0u64, |s, v| s.saturating_add(v.bond));
+    (bonded, 0)
+}
+
+/// Pays `amount` of issuance into active validators' pools; returns how much it placed.
+pub fn distribute_rewards(_state: &mut State, _j: &mut Journal, _amount: u64, _height: u64) -> u64 {
+    0
+}

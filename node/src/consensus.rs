@@ -3,13 +3,18 @@
 //!
 //! Block flow:
 //! * **propose** (leader): wait until `parent.timestamp + block_time`, pick mempool txs (highest
-//!   tip per byte first) that apply on top of our executed state plus any not-yet-executed
-//!   ancestors, and attach the latest state root we've executed (`exec_height`, `exec_root`).
+//!   tip per byte first, up to the height's `max_block_bytes`) that apply on top of our executed
+//!   state plus any not-yet-executed ancestors, and attach the latest state root we've executed
+//!   (`exec_height`, `exec_root`). A leader more than `econ::FEE_LAG` blocks behind can't price
+//!   txs (the base fee isn't fixed in its state yet) and proposes an empty block.
 //! * **verify** (everyone, before voting): version, view and parent view against the consensus
 //!   context, structure, size limits, timestamps, proposer == leader, stateless tx checks
-//!   (canonical wire bytes, chain id, address prefix, validity window, ML-DSA signature, fee), and
-//!   the attached state root (waiting until we've executed that height). Only permanently invalid
-//!   blocks get `false`; anything that can still change keeps the verdict pending.
+//!   (canonical wire bytes, chain id, address prefix, validity window, ML-DSA signature, the
+//!   lowest possible fee), and the attached state root (waiting until we've executed that
+//!   height). A block with txs must cite a height within `econ::FEE_LAG` of its own, so once we've
+//!   executed it we check the block's size and every tx's fee against the height's exact base
+//!   fee. Only permanently invalid blocks get `false`; anything that can still change keeps the
+//!   verdict pending.
 //! * **finalize**: marshal delivers finalized blocks in order to [`Executor`], which executes them
 //!   (invalid txs are skipped) and acknowledges only once the block logs are fsynced and the
 //!   state database has committed the block (`store.rs`).
@@ -51,6 +56,8 @@ pub use crate::types::MAX_TX_BYTES;
 /// A proposal's `exec_height` may trail the verifier's executed height by at most this much
 /// (so a proposer can't dodge the state-root check by citing an ancient height).
 pub const MAX_EXEC_LAG: u64 = 16;
+/// The codec's bound on a block's tx bytes. The limit blocks are held to is the governance
+/// parameter `max_block_bytes` (2 MiB at genesis), fixed per height like the base fee (econ.rs).
 pub const MAX_BLOCK_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_MESSAGE_SIZE: u32 = 8 * 1024 * 1024;
 /// How far in the future (by our clock) a block timestamp may be.
@@ -340,16 +347,19 @@ where
         let mut bytes = 0;
         // Senders whose earlier tx was left out: their later nonces can't apply.
         let mut stuck = std::collections::HashSet::new();
+        // This height's base fee and size limit are fixed once `height − FEE_LAG` has executed
+        // (econ.rs). Further behind than that we can't price txs, so the block stays empty.
+        let limit = crate::econ::slot(&c.state, height).map_or(0, |s| s.max_block_bytes as usize);
         let c = &mut *c; // borrow the mempool and the state separately
         for tx in crate::chain::proposal_order(&c.mempool) {
-            if txs.len() >= MAX_BLOCK_TXS {
+            if limit == 0 || txs.len() >= MAX_BLOCK_TXS {
                 break;
             }
             if stuck.contains(&tx.from) || included.contains(&tx.id()) {
                 continue;
             }
             let raw = tx.to_bytes();
-            if raw.len() > MAX_TX_BYTES || bytes + raw.len() > MAX_BLOCK_BYTES {
+            if raw.len() > MAX_TX_BYTES || bytes + raw.len() > limit {
                 stuck.insert(tx.from.clone());
                 continue;
             }
@@ -427,9 +437,15 @@ where
             }
             (c.genesis.chain_id.clone(), c.state.chain_params.max_tx_validity_blocks)
         };
+        // Txs need a cited state that fixed this height's base fee (econ.rs): the proposer could
+        // price them, and we can check them once we've executed it.
+        if !block.txs.is_empty() && block.exec_height + crate::econ::FEE_LAG < block.height {
+            return reject("txs in a block whose cited state can't price them");
+        }
         // Tx checks (signatures included) run without holding the chain lock.
         let mut seen = std::collections::HashSet::new();
         let mut ids = vec![];
+        let mut charges = vec![];
         for raw in &block.txs {
             let Ok(tx) = Tx::from_bytes(raw) else { return reject("unparseable or non-canonical tx") };
             let id = tx.id();
@@ -441,6 +457,7 @@ where
                 return reject("invalid tx");
             }
             ids.push(id);
+            charges.push((tx.size(), tx.tip, tx.fee));
         }
         // The cited state root, once we've executed that height ourselves (until then the
         // verdict can still change, so we wait).
@@ -453,6 +470,16 @@ where
         let c = self.chain.lock();
         if ids.iter().any(|id| c.has_tx(id)) {
             return reject("replays an already-finalized tx");
+        }
+        // This height's size limit and base fee, exactly (we've executed the cited state, at most
+        // FEE_LAG back). Unknown only if we already executed past this height.
+        if let Some(slot) = crate::econ::slot(&c.state, block.height) {
+            if block.txs.iter().map(|t| t.len() as u64).sum::<u64>() > slot.max_block_bytes {
+                return reject("block exceeds max_block_bytes");
+            }
+            if charges.iter().any(|&(size, tip, fee)| slot.fee(size).checked_add(tip).is_none_or(|c| c > fee)) {
+                return reject("a tx's fee doesn't cover the block's base fee");
+            }
         }
         true
     }

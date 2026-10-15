@@ -352,6 +352,8 @@ pub fn router(node: Node) -> Router {
         .route("/api/tx", post(submit))
         .route("/api/account/{id}", get(account))
         .route("/api/name/{name}", get(name))
+        .route("/api/params", get(params))
+        .route("/api/fees", get(fees))
         .route("/api/key/{key_id}", get(key_accounts))
         .route("/api/search/{q}", get(search))
         .route("/api/faucet", post(faucet))
@@ -454,8 +456,8 @@ fn tx_json_with(v: &ReadView, tx: &Tx, height: Option<u64>, error: Option<&str>)
         "amount": amount.map(|a| a.to_string()),
         "amount_display": amount.map(fmt_fang),
         // What the tx is charged (base fee burned + tip); `max_fee` is what it allowed.
-        "fee": tx.charge().unwrap_or(tx.fee).to_string(),
-        "fee_display": fmt_fang(tx.charge().unwrap_or(tx.fee)),
+        "fee": charged(v, tx, height).to_string(),
+        "fee_display": fmt_fang(charged(v, tx, height)),
         "max_fee": tx.fee.to_string(),
         "tip": tx.tip.to_string(),
         "valid_until": tx.valid_until,
@@ -466,6 +468,17 @@ fn tx_json_with(v: &ReadView, tx: &Tx, height: Option<u64>, error: Option<&str>)
         "action": tx.action,
         "signature_scheme": "ML-DSA-65 (FIPS 204)",
     })
+}
+
+/// What a tx was (or, pending, would next be) charged: its block's base fee for its size plus
+/// its tip, at most its `fee`. Blocks record their base fee (P-ECON); a pending tx is priced at
+/// the next block's.
+fn charged(v: &ReadView, tx: &Tx, height: Option<u64>) -> u64 {
+    let base = match height.and_then(|h| v.block(h)).and_then(|b| b.base_fee) {
+        Some(slot) => slot.fee(tx.size()),
+        None => crate::econ::base_fee(&v.state, height.unwrap_or(crate::econ::now(&v.state)), tx.size()),
+    };
+    base.saturating_add(tx.tip).min(tx.fee)
 }
 
 fn block_summary(height: u64, txs: usize) -> String {
@@ -775,13 +788,96 @@ async fn key_accounts(State(n): State<Node>, Path(key_id): Path<String>) -> ApiR
     Ok(Json(json!({ "key_id": key_id, "accounts": accounts })))
 }
 
+/// A name (DEC-11): its `status` (`active`; `grace`, when only its owner can renew it;
+/// `reserved`; or `available`), its owner and expiry, and what registering it or renewing it for
+/// a year costs.
 async fn name(State(node): State<Node>, Path(n): Path<String>) -> ApiResult {
     let v = node.live.view();
+    let st = &v.state;
     let n = normalize_name(&n)?;
-    match v.state.names.get(&n) {
-        Some(r) => Ok(Json(json!({ "name": format!("{n}{NAME_SUFFIX}"), "available": false, "owner": label(&v, &r.owner), "registered_at": r.registered_at }))),
-        None => Ok(Json(json!({ "name": format!("{n}{NAME_SUFFIX}"), "available": true, "price": name_price(&n).to_string(), "price_display": fmt_fang(name_price(&n)) }))),
-    }
+    let cp = &st.chain_params;
+    let (price, renewal) = (cp.name_price(n.len()), cp.name_renewal_price(n.len(), 1));
+    let mut out = json!({
+        "name": format!("{n}{NAME_SUFFIX}"),
+        "price": price.to_string(),
+        "price_display": fmt_fang(price),
+        "renewal_price": renewal.to_string(),
+        "renewal_price_display": fmt_fang(renewal),
+        "registration_blocks": cp.name_registration_blocks,
+        "grace_blocks": cp.name_grace_blocks,
+    });
+    let now = crate::econ::now(st);
+    let status = match st.names.get(&n) {
+        Some(r) => {
+            let grace = crate::econ::grace_until(st, r);
+            out["owner"] = label(&v, &r.owner);
+            out["registered_at"] = r.registered_at.into();
+            out["expires_at"] = r.expires_at.into();
+            out["grace_until"] = grace.into();
+            if now <= r.expires_at {
+                "active"
+            } else if now <= grace {
+                "grace"
+            } else {
+                "available"
+            }
+        }
+        None if st.econ.reserved_names.contains_key(&n) => "reserved",
+        None => "available",
+    };
+    out["status"] = status.into();
+    out["available"] = (status == "available").into();
+    Ok(Json(out))
+}
+
+/// The governance-adjustable parameters (amounts as strings), the genesis constants, and the
+/// issuance year under way.
+async fn params(State(n): State<Node>) -> ApiResult {
+    let v = n.live.view();
+    let st = &v.state;
+    let params: serde_json::Map<String, Value> = st.chain_params.to_map().into_iter().map(|(k, v)| (k.to_string(), v.to_string().into())).collect();
+    let epy = crate::econ::epochs_per_year(&st.params);
+    let iss = st.econ.issuance;
+    Ok(Json(json!({
+        "params": params,
+        "genesis": { "block_time_ms": st.params.block_time_ms, "epoch_blocks": st.params.epoch_blocks, "address_prefix": st.params.prefix(), "epochs_per_year": epy },
+        "issuance": {
+            "year": iss.year,
+            "rate_ppm": iss.rate_ppm,
+            "base_supply": iss.base_supply.to_string(),
+            "per_epoch": crate::econ::epoch_mint(&iss, epy).to_string(),
+            "per_epoch_display": fmt_fang(crate::econ::epoch_mint(&iss, epy)),
+        },
+        "supply": st.supply.to_string(),
+        "burned": st.burned.to_string(),
+    })))
+}
+
+/// The base fee (MAINNET-DESIGN 3.6): every block's slot from the last executed one to `lag`
+/// blocks ahead (flat drops, `rate` in milli-drops per byte, the block's tx-byte limit), and
+/// `suggested`, the highest flat part and rate among the upcoming ones: a tx whose `fee` covers
+/// `flat + rate × size / 1000 + tip` is accepted in any of the next `lag` blocks, and is charged
+/// only its block's base fee plus its tip.
+async fn fees(State(n): State<Node>) -> ApiResult {
+    use crate::econ::{FEE_LAG, RATE_SCALE};
+    let v = n.live.view();
+    let st = &v.state;
+    let cp = &st.chain_params;
+    let slot = |h: u64, s: &crate::econ::FeeSlot| json!({ "height": h, "flat": s.flat.to_string(), "rate": s.rate.to_string(), "max_block_bytes": s.max_block_bytes });
+    let slots: Vec<Value> = st.econ.fees.iter().enumerate().map(|(i, s)| slot(st.econ.height + i as u64, s)).collect();
+    let s = crate::econ::suggested(st);
+    Ok(Json(json!({
+        "height": st.econ.height,
+        "lag": FEE_LAG,
+        "rate_scale": RATE_SCALE,
+        "slots": slots,
+        "suggested": { "flat": s.flat.to_string(), "rate": s.rate.to_string() },
+        "floor": { "flat": cp.base_fee_floor_flat.to_string(), "per_byte": cp.base_fee_floor_per_byte.to_string() },
+        "target_fullness_bps": cp.target_fullness_bps,
+        "max_change_bps": cp.base_fee_max_change_bps,
+        "account_creation_fee": cp.account_creation_fee.to_string(),
+        "account_creation_fee_display": fmt_fang(cp.account_creation_fee),
+    })))
 }
 
 async fn search(State(n): State<Node>, Path(q): Path<String>) -> ApiResult {
