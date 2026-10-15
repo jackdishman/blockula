@@ -30,6 +30,10 @@
 //!    the logs end).
 //! 3. Only then does execution return, and consensus get its acknowledgement.
 //!
+//! The logs and the database belong to `chain::Writer`, behind its own lock: on the consensus
+//! path the block is applied in memory under the chain lock, written without it, then adopted
+//! (the tree moves onto the new database snapshot, readers get the new view).
+//!
 //! A crash before 2 leaves bytes in the logs past the commit point: `Chain::open` executes the
 //! complete blocks among them again (they're finalized, so the result is the same) and cuts the
 //! rest off. A crash after 2 leaves nothing to do. Restart time depends on the size of the state
