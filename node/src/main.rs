@@ -17,6 +17,7 @@ mod params;
 mod pq;
 mod poc;
 mod protection;
+mod release_cli;
 mod types;
 mod upgrade;
 mod validator_cli;
@@ -182,6 +183,11 @@ enum Cmd {
     },
     /// Generate an ML-DSA-65 keypair
     Keygen,
+    /// Sign or verify release checksums with the offline ML-DSA-65 release key
+    Release {
+        #[command(subcommand)]
+        cmd: release_cli::ReleaseCmd,
+    },
 }
 
 fn blockula_dir() -> PathBuf {
@@ -276,6 +282,7 @@ fn main() -> Result<()> {
         Cmd::Validator { cmd } => validator_cli::run(cmd),
         Cmd::Hunt { cmd } => contrib_cli::hunt(cmd, &blockula_dir()),
         Cmd::Contrib { cmd } => contrib_cli::contrib(cmd, &blockula_dir()),
+        Cmd::Release { cmd } => release_cli::run(cmd),
         Cmd::Keygen => {
             let k = crypto::Keys::generate();
             println!("{}", serde_json::json!({ "address": k.address(), "seed": k.seed_hex() }));
