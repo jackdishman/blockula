@@ -54,7 +54,6 @@ pub type Shared = Arc<Mutex<Chain>>;
 pub type MarshalMailbox = marshal::core::Mailbox<MlDsaScheme, marshal::standard::Standard<CBlock>>;
 
 pub const MAX_BLOCK_TXS: usize = 512;
-pub use crate::types::MAX_TX_BYTES;
 /// A proposal's `exec_height` may trail the verifier's executed height by at most this much
 /// (so a proposer can't dodge the state-root check by citing an ancient height).
 pub const MAX_EXEC_LAG: u64 = 16;
@@ -225,7 +224,8 @@ impl Read for CBlock {
             need(buf, 4)?;
             let len = buf.get_u32() as usize;
             total += len;
-            if len > MAX_TX_BYTES || total > MAX_BLOCK_BYTES {
+            // A tx is bounded by its kind (`Tx::from_bytes`); ghost txs are the largest.
+            if len > crate::types::MAX_GHOST_TX_BYTES || total > MAX_BLOCK_BYTES {
                 return Err(CodecError::Invalid("CBlock", "tx too large"));
             }
             need(buf, len)?;
@@ -309,13 +309,18 @@ impl App {
 }
 
 /// Stateless checks every tx must pass: in a proposed block, over HTTP and from gossip. The chain
-/// is named by its id and its genesis hash (the instance, audit #7).
+/// is named by its id and its genesis hash (the instance, audit #7). A ghost tx's Action proof is
+/// one of them (it needs no state); unsigned ghost txs have no signature, their proof authorizes
+/// them (ghost.rs).
 pub fn check_tx_stateless(tx: &Tx, chain_id: &str, genesis_hash: &str, prefix: &str) -> anyhow::Result<()> {
     tx.check_chain(chain_id, genesis_hash)?;
     tx.check_format()?;
     tx.check_prefix(prefix)?;
     crate::chain::check_fee(tx)?;
-    tx.verify_signature()
+    if !tx.is_unsigned() {
+        tx.verify_signature()?;
+    }
+    crate::ghost::verify_proof(tx)
 }
 
 impl<E> Application<E> for App
@@ -367,6 +372,8 @@ where
         // (econ.rs). Further behind than that we can't price txs, so the block stays empty
         // (verifiers refuse txs in a block whose cited state can't price them).
         let limit = crate::econ::slot(&tip.state, height).map_or(0, |s| s.max_block_bytes as usize);
+        // Ghost txs' own size limits, from the executed state as verifiers read them.
+        let mut ghost = crate::ghost::BlockBudget::new(&tip.state.chain_params);
         let Some(mut state) = replay(tip, &parent, pending.clone()) else {
             warn!(height, "the parent doesn't extend our finalized chain; not proposing");
             return None;
@@ -386,8 +393,13 @@ where
                     continue;
                 }
                 let raw = tx.to_bytes();
-                if raw.len() > MAX_TX_BYTES || bytes + raw.len() > limit {
-                    stuck.insert(tx.from.clone());
+                let mut budget = ghost;
+                if raw.len() > tx.max_bytes() || bytes + raw.len() > limit || budget.take(tx, raw.len()).is_err() {
+                    // Unsigned ghost txs have no sender or nonce: leaving one out holds nothing
+                    // else back.
+                    if !tx.is_unsigned() {
+                        stuck.insert(tx.from.clone());
+                    }
                     continue;
                 }
                 // Only propose txs that will succeed (judged as verifiers and execution will judge
@@ -397,10 +409,13 @@ where
                     Ok(crate::chain::Outcome::Applied) => {}
                     Ok(crate::chain::Outcome::Failed(_)) | Err(_) => {
                         state.rollback(tj);
-                        stuck.insert(tx.from.clone());
+                        if !tx.is_unsigned() {
+                            stuck.insert(tx.from.clone());
+                        }
                         continue;
                     }
                 }
+                ghost = budget;
                 bytes += raw.len();
                 txs.push(raw);
             }
@@ -470,28 +485,32 @@ where
         if checkpoint.is_some_and(|cp| block.exec_height != cp) {
             return reject("checkpoint-certifying block must carry the checkpoint's exec_height");
         }
-        let (chain_id, genesis_hash) = {
+        let (chain_id, genesis_hash, mut ghost) = {
             let c = self.chain.lock();
             // Our executed height only grows, so this stays true once it is.
             if block.exec_height + MAX_EXEC_LAG < c.height().min(parent.height) {
                 return reject("exec_height too far behind");
             }
-            (c.genesis.chain_id.clone(), c.genesis_hash.clone())
+            (c.genesis.chain_id.clone(), c.genesis_hash.clone(), crate::ghost::BlockBudget::new(&c.state.chain_params))
         };
         // Txs need a cited state that fixed this height's base fee (econ.rs): the proposer could
         // price them, and we can check them once we've executed it.
         if !block.txs.is_empty() && block.exec_height + crate::econ::FEE_LAG < block.height {
             return reject("txs in a block whose cited state can't price them");
         }
-        // Tx checks (signatures included) run without holding the chain lock. The validity
-        // window's upper bound is a governance parameter, so the replay below checks it on the
-        // parent's state; expiry doesn't depend on any state.
+        // Tx checks (signatures and ghost proofs included) run without holding the chain lock. The
+        // validity window's upper bound is a governance parameter, so the replay below checks it
+        // on the parent's state; expiry doesn't depend on any state.
         let mut seen = std::collections::HashSet::new();
         let mut txs = Vec::with_capacity(block.txs.len());
         for raw in &block.txs {
             let Ok(tx) = Tx::from_bytes(raw) else { return reject("unparseable or non-canonical tx") };
             if !seen.insert(tx.id()) {
                 return reject("duplicate tx");
+            }
+            if let Err(e) = ghost.take(&tx, raw.len()) {
+                warn!(error = %e, "ghost txs over the block's limits");
+                return reject("ghost txs over the size limits");
             }
             if let Err(e) = check_tx_stateless(&tx, &chain_id, &genesis_hash, &self.address_prefix).and_then(|_| crate::chain::check_validity(&tx, block.height, u64::MAX)) {
                 warn!(error = %e, "bad tx in block");
@@ -1042,19 +1061,26 @@ where
             loop {
                 let Ok((from, msg)) = mp_receiver.recv().await else { break };
                 let raw: Vec<u8> = msg.as_ref().to_vec();
-                if raw.len() > MAX_TX_BYTES {
+                // The kind's own bound (`Tx::from_bytes`) applies next; ghost txs are the largest.
+                if raw.len() > crate::types::MAX_GHOST_TX_BYTES {
                     continue;
                 }
                 let Ok(tx) = Tx::from_bytes(&raw) else {
                     debug!(?from, "unparseable gossiped tx");
                     continue;
                 };
-                // Verify format + ML-DSA signature before taking the chain lock; a fee below the
-                // next block's base fee is refused first, before the signature costs anything.
-                let (chain_id, genesis_hash, prefix, priced) = {
+                // Verify format + ML-DSA signature (and a ghost tx's proof) before taking the chain
+                // lock; a fee below the next block's base fee is refused first, before the
+                // signature costs anything, and ghost txs are dropped unverified while Ghost Mode
+                // is off or paused.
+                let (chain_id, genesis_hash, prefix, priced, ghost_off) = {
                     let c = gossip_chain.lock();
-                    (c.genesis.chain_id.clone(), c.genesis_hash.clone(), c.genesis.address_prefix.clone(), crate::econ::check_fee(&c.state, &tx, c.height() + 1))
+                    let next = c.height() + 1;
+                    (c.genesis.chain_id.clone(), c.genesis_hash.clone(), c.genesis.address_prefix.clone(), crate::econ::check_fee(&c.state, &tx, next), tx.action.is_ghost() && crate::ghost::check_enabled(&c.state, next).is_err())
                 };
+                if ghost_off {
+                    continue;
+                }
                 if let Err(e) = priced.and_then(|_| check_tx_stateless(&tx, &chain_id, &genesis_hash, &prefix)) {
                     debug!(?from, error = %e, "dropping invalid gossiped tx");
                     continue;
@@ -1359,10 +1385,55 @@ mod tests {
         assert!(CBlock::decode(&bytes[..bytes.len() - 1]).is_err());
         let many = CBlock::new(Digest([1; 32]), 5, 9, 7, 1_000, String::new(), 4, [2; 32], vec![vec![]; MAX_BLOCK_TXS + 1]);
         assert!(CBlock::decode(many.encode().as_ref()).is_err());
-        let big = CBlock::new(Digest([1; 32]), 5, 9, 7, 1_000, String::new(), 4, [2; 32], vec![vec![0; MAX_TX_BYTES + 1]]);
+        // A tx up to the ghost bound decodes (its kind's own bound applies when it's parsed);
+        // past it, the block doesn't.
+        let ghost_sized = CBlock::new(Digest([1; 32]), 5, 9, 7, 1_000, String::new(), 4, [2; 32], vec![vec![0; crate::types::MAX_GHOST_TX_BYTES]]);
+        assert!(CBlock::decode(ghost_sized.encode().as_ref()).is_ok());
+        assert_eq!(ghost_sized.parse_txs(), vec![None]);
+        let big = CBlock::new(Digest([1; 32]), 5, 9, 7, 1_000, String::new(), 4, [2; 32], vec![vec![0; crate::types::MAX_GHOST_TX_BYTES + 1]]);
         assert!(CBlock::decode(big.encode().as_ref()).is_err());
         // Txs that aren't canonical wire bytes don't parse.
         assert_eq!(b.parse_txs(), vec![None, None]);
+    }
+
+    /// Ghost txs in a proposed block: their proofs are checked before voting (a tx whose fee was
+    /// changed after proving is permanently invalid), and they're held to `ghost_max_tx_bytes`
+    /// each and `ghost_max_block_bytes` together (rejected at once, before any proof is checked).
+    /// A tx that passes all of that still has to be admittable on the parent's state (CV-5): this
+    /// one spends a note from a tree of its own on a chain with Ghost Mode off, so it isn't (the
+    /// simulator's `ghost` scenario has blocks of admittable ghost txs voted through).
+    #[test]
+    fn verify_checks_ghost_proofs_and_size_limits() {
+        let mut o = SummonOpts::new("gv", 1);
+        o.params.insert("ghost_max_tx_bytes".into(), 150 << 10);
+        o.params.insert("ghost_max_block_bytes".into(), 200 << 10);
+        let (root_dir, c, seed) = home_at_zero_with("gv", o);
+        let (instance, genesis_root, genesis_hash) = (c.state.ghost.meta.instance, hex_32(&c.root_at(0).unwrap()), c.genesis_hash.clone());
+        let parent = genesis_block(&c.genesis);
+        let chain: Shared = Arc::new(Mutex::new(c));
+        let good = crate::ghost::tests::stateless_transfer("gv", &genesis_hash, instance, "a", 100);
+        let other = crate::ghost::tests::stateless_transfer("gv", &genesis_hash, instance, "b", 100);
+        let mut tampered = good.clone();
+        tampered.fee += 1;
+        check_tx_stateless(&good, "gv", &genesis_hash, "boo").unwrap();
+        let mut budget = crate::ghost::BlockBudget::new(&chain.lock().state.chain_params);
+        budget.take(&good, good.size() as usize).unwrap();
+        assert!(budget.take(&other, other.size() as usize).is_err(), "two ~131 KiB ghost txs are over ghost_max_block_bytes");
+        deterministic::Runner::timed(Duration::from_secs(60)).start(|context| async move {
+            let leader = PrivateKey::from_seed_bytes(seed).public_key();
+            let mut app = App { chain: chain.clone(), block_time_ms: 1_000, address_prefix: "boo".into() };
+            let child = |txs: Vec<&Tx>| CBlock::new(parent.digest(), 1, 1, 0, 1_000, leader.address("boo"), 0, genesis_root, txs.into_iter().map(Tx::to_bytes).collect());
+            let mut verify = async |block: CBlock| {
+                let cctx = SimplexContext { round: Round::new(Epoch::zero(), View::new(1)), leader: leader.clone(), parent: (View::new(0), parent.digest()) };
+                let ancestry = marshal::ancestry::from_iter([Arc::new(block), Arc::new(parent.clone())]);
+                Application::<deterministic::Context>::verify(&mut app, (context.child("verify"), cctx), ancestry).await
+            };
+            assert!(verify(child(vec![])).await, "the empty block is fine");
+            assert!(!verify(child(vec![&tampered])).await, "its proof no longer verifies");
+            assert!(!verify(child(vec![&good, &other])).await, "over ghost_max_block_bytes");
+            assert!(!verify(child(vec![&good])).await, "not admittable here (Ghost Mode is off)");
+        });
+        std::fs::remove_dir_all(root_dir).ok();
     }
 
     /// A verifier that hasn't executed the height a block cites keeps the verdict pending (it
@@ -1528,7 +1599,7 @@ mod tests {
     #[test]
     fn blocks_are_sized_and_priced_by_the_fee_market() {
         let home = std::env::temp_dir().join(format!("blockula-feemarket-{}-{}", crate::chain::now_ms(), std::process::id()));
-        let params = [("max_block_bytes".to_string(), MAX_TX_BYTES as u64)].into_iter().collect();
+        let params = [("max_block_bytes".to_string(), crate::types::MAX_TX_BYTES as u64)].into_iter().collect();
         Chain::summon(&home, &SummonOpts { params, ..SummonOpts::new("fees", 1) }).unwrap();
         let mut c = Chain::open(&home).unwrap();
         let users: Vec<crate::crypto::Keys> = (1..=14u8).map(|i| crate::crypto::Keys::from_seed([i; 32])).collect();
@@ -1569,7 +1640,7 @@ mod tests {
             // On one unexecuted block: as many txs as fit the limit, citing our state.
             let b = propose(run(e + 1)).await;
             let bytes: usize = b.txs.iter().map(Vec::len).sum();
-            assert!(b.txs.len() >= 10 && b.txs.len() < paid.len() && bytes <= MAX_TX_BYTES, "{} txs, {bytes} bytes", b.txs.len());
+            assert!(b.txs.len() >= 10 && b.txs.len() < paid.len() && bytes <= crate::types::MAX_TX_BYTES, "{} txs, {bytes} bytes", b.txs.len());
             assert_eq!(b.exec_height, e);
             // Seventeen blocks ahead of our state we can still price txs; eighteen we can't.
             assert!(!propose(run(e + 16)).await.txs.is_empty());
@@ -1601,8 +1672,12 @@ mod tests {
 
     /// A one-validator home whose genesis starts at the simulated clock's zero.
     fn home_at_zero(tag: &str) -> (std::path::PathBuf, Chain, [u8; 32]) {
+        home_at_zero_with(tag, SummonOpts::new(tag, 1))
+    }
+
+    fn home_at_zero_with(tag: &str, opts: SummonOpts) -> (std::path::PathBuf, Chain, [u8; 32]) {
         let home = std::env::temp_dir().join(format!("blockula-{tag}-{}-{}", crate::chain::now_ms(), std::process::id()));
-        Chain::summon(&home, &SummonOpts::new(tag, 1)).unwrap();
+        Chain::summon(&home, &opts).unwrap();
         let mut g = Genesis::load(&home.join("genesis.json")).unwrap();
         g.created_at_ms = 0;
         std::fs::write(home.join("genesis.json"), serde_json::to_string_pretty(&g).unwrap()).unwrap();

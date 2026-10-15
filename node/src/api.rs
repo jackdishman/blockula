@@ -283,6 +283,9 @@ pub const TX_PER_IP_PER_MINUTE: usize = 120;
 pub const FAUCET_IP_WINDOW: Duration = Duration::from_secs(600);
 pub const FAUCET_ADDRESS_WINDOW: Duration = Duration::from_secs(3600);
 pub const MAX_BODY_BYTES: usize = 128 * 1024;
+/// `POST /api/tx` takes more: a ghost tx (up to `MAX_GHOST_TX_BYTES`), as wire bytes or as hex
+/// JSON (twice the size), with room for the JSON around it.
+pub const MAX_TX_BODY_BYTES: usize = 2 * MAX_GHOST_TX_BYTES + 64 * 1024;
 
 fn too_many(what: &str, wait: Duration) -> ApiError {
     let mins = wait.as_secs().div_ceil(60);
@@ -395,7 +398,7 @@ pub fn router(node: Node) -> Router {
         .route("/api/blocks", get(blocks))
         .route("/api/block/{id}", get(block))
         .route("/api/tx/{id}", get(tx))
-        .route("/api/tx", post(submit))
+        .route("/api/tx", post(submit).layer(DefaultBodyLimit::max(MAX_TX_BODY_BYTES)))
         .route("/api/account/{id}", get(account))
         .route("/api/name/{name}", get(name))
         .route("/api/params", get(params))
@@ -424,6 +427,8 @@ pub fn router(node: Node) -> Router {
         .route("/api/distribution/{id}", get(distribution))
         .route("/api/multisig/{account}", get(multisig))
         .route("/api/proof/{namespace}/{key}", get(proof))
+        .route("/api/ghost", get(ghost))
+        .route("/api/ghost/address/{id}", get(ghost_address))
         .route("/api/health", get(health))
         .route("/api/upgrade", get(upgrade))
         .route("/metrics", get(metrics))
@@ -494,8 +499,13 @@ fn tx_json_with(v: &ReadView, tx: &Tx, height: Option<u64>, error: Option<&str>)
         Action::Vote { amount, .. } => ("vote", None, Some(*amount)),
         Action::TransferName { to, .. } => ("transfer_name", st.resolve(to).ok(), None),
         Action::ClaimDistribution { amount, .. } => ("claim_distribution", None, Some(*amount)),
+        Action::Shield { amount, .. } => ("shield", None, Some(*amount)),
+        Action::Unshield { to, amount, .. } => ("unshield", st.resolve(to).ok(), Some(*amount)),
         a => (a.kind(), None, None),
     };
+    // An unsigned ghost tx pays exactly its fee (it's in the proof's value balance).
+    // An unsigned ghost tx pays exactly its fee (it's in its proof's value balance).
+    let charged = if tx.is_unsigned() { tx.fee } else { charged(v, tx, height) };
     json!({
         "id": tx.id(),
         "summary": v.describe(tx, height),
@@ -503,13 +513,14 @@ fn tx_json_with(v: &ReadView, tx: &Tx, height: Option<u64>, error: Option<&str>)
         "status": match (height, error) { (_, Some(_)) => "failed", (Some(_), None) => "finalized", (None, None) => "pending" },
         "error": error,
         "height": height,
-        "from": label(v, &sender),
+        // Unsigned ghost txs have no sender to show.
+        "from": (!tx.is_unsigned()).then(|| label(v, &sender)),
         "to": to.map(|t| label(v, &t)),
         "amount": amount.map(|a| a.to_string()),
         "amount_display": amount.map(fmt_fang),
         // What the tx is charged (base fee burned + tip); `max_fee` is what it allowed.
-        "fee": charged(v, tx, height).to_string(),
-        "fee_display": fmt_fang(charged(v, tx, height)),
+        "fee": charged.to_string(),
+        "fee_display": fmt_fang(charged),
         "max_fee": tx.fee.to_string(),
         "tip": tx.tip.to_string(),
         "valid_until": tx.valid_until,
@@ -517,8 +528,9 @@ fn tx_json_with(v: &ReadView, tx: &Tx, height: Option<u64>, error: Option<&str>)
         "nonce": tx.nonce,
         "signer_key": tx.signer_key_id().ok(),
         "memo": tx.memo,
-        "action": tx.action,
-        "signature_scheme": "ML-DSA-65 (FIPS 204)",
+        // Ghost bundles without their ~130 KiB proof (its size and hash instead).
+        "action": crate::ghost::action_json(&tx.action).unwrap_or_else(|| json!(tx.action)),
+        "signature_scheme": if tx.is_unsigned() { "none: a Plonky3 STARK (the Action proof) authorizes it" } else { "ML-DSA-65 (FIPS 204)" },
     })
 }
 
@@ -696,25 +708,52 @@ async fn tx(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
     Err(not_found("transaction"))
 }
 
-async fn submit(State(n): State<Node>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Json(tx): Json<Tx>) -> ApiResult {
+async fn submit(State(n): State<Node>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, body: axum::body::Bytes) -> ApiResult {
     let client = n.client_ip(peer, &headers);
     if let Some(ip) = client {
         n.limits.allow(&[(format!("tx:{}", ip_key(ip)), TX_PER_IP_PER_MINUTE, Duration::from_secs(60))]).map_err(|w| too_many("too many transactions from your IP", w))?;
     }
-    let result = submit_inner(&n, &headers, client, tx).await;
+    let result = match parse_tx(&headers, &body) {
+        Ok(tx) => submit_inner(&n, &headers, client, tx).await,
+        Err(e) => Err(e),
+    };
     bump(if result.is_ok() { &n.stats.tx_submitted } else { &n.stats.tx_rejected });
     result
+}
+
+/// A submitted tx: JSON (the API format), or its wire form (`Tx::to_bytes`) with
+/// `Content-Type: application/octet-stream`, which is how ghost txs (~135 KiB) should travel.
+fn parse_tx(headers: &HeaderMap, body: &[u8]) -> Result<Tx, ApiError> {
+    let content_type = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or_default();
+    if content_type.starts_with("application/octet-stream") {
+        return Ok(Tx::from_bytes(body)?);
+    }
+    serde_json::from_slice(body).map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, format!("bad transaction JSON: {e}")))
 }
 
 async fn submit_inner(n: &Node, headers: &HeaderMap, client: Option<IpAddr>, tx: Tx) -> ApiResult {
     // Format + ML-DSA signature checks run without the chain lock, after the cheap check that the
     // fee covers the next block's base fee.
-    let (chain_id, genesis_hash, prefix, role) = {
+    let (chain_id, genesis_hash, prefix, role, ghost_off) = {
         let v = n.live.view();
-        crate::econ::check_fee(&v.state, &tx, crate::econ::now(&v.state))?;
-        (v.genesis.chain_id.clone(), v.genesis_hash.clone(), v.genesis.address_prefix.clone(), v.role)
+        // Ghost txs are refused before their proof is verified while Ghost Mode is off or paused.
+        let ghost_off = if tx.action.is_ghost() { crate::ghost::check_enabled(&v.state, v.height + 1).err() } else { None };
+        if ghost_off.is_none() {
+            crate::econ::check_fee(&v.state, &tx, crate::econ::now(&v.state))?;
+        }
+        (v.genesis.chain_id.clone(), v.genesis_hash.clone(), v.genesis.address_prefix.clone(), v.role, ghost_off)
     };
-    crate::consensus::check_tx_stateless(&tx, &chain_id, &genesis_hash, &prefix)?;
+    if let Some(e) = ghost_off {
+        return Err(e.into());
+    }
+    let tx = if tx.action.ghost_bundle().is_some() {
+        // A proof takes ~6 ms to verify: off the async workers.
+        let (c, g, p) = (chain_id.clone(), genesis_hash.clone(), prefix.clone());
+        tokio::task::spawn_blocking(move || crate::consensus::check_tx_stateless(&tx, &c, &g, &p).map(|_| tx)).await.map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??
+    } else {
+        crate::consensus::check_tx_stateless(&tx, &chain_id, &genesis_hash, &prefix)?;
+        tx
+    };
     if role == Role::FullNode {
         if forwarded(headers) {
             return Err(ApiError(StatusCode::LOOP_DETECTED, "forwarding loop: this full node was sent a forwarded tx".into()));
@@ -1135,6 +1174,21 @@ async fn proof(State(n): State<Node>, Path((namespace, key_hex)): Path<(u8, Stri
         "height": v.height,
         "block_hash": v.last_hash,
     })))
+}
+
+/// 👻 Ghost Mode: on or off, paused, the pool's balance and cap, the commitment tree's size and
+/// recent anchors, the limits, and the chain instance wallets bind proofs to (ghost.rs).
+async fn ghost(State(n): State<Node>) -> ApiResult {
+    let v = n.live.view();
+    Ok(Json(crate::ghost::status_json(&v.state, v.height)))
+}
+
+/// The Ghost Mode address an account published (`SetGhostAddress`), by address or `.boo` name.
+async fn ghost_address(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
+    let v = n.live.view();
+    let account = v.state.resolve(&id).map_err(|_| not_found("account"))?;
+    let address = v.state.ghost.addresses.get(&account).ok_or_else(|| not_found("ghost address"))?;
+    Ok(Json(json!({ "account": label(&v, &account), "address": hex::encode(address), "fingerprint": crate::ghost::fingerprint(address) })))
 }
 
 fn hunt_json(v: &ReadView, h: &crate::chain::Hunt) -> Value {
@@ -2275,6 +2329,62 @@ mod http_tests {
         assert_eq!(call(&n, "GET", "/api/block/21", None, "127.0.0.1:1").await.0, StatusCode::OK);
         let (s, b, _) = call(&n, "GET", "/api/blocks?limit=100", None, "127.0.0.1:1").await;
         assert_eq!((s, b.as_array().unwrap().len()), (StatusCode::OK, 100));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// `/api/ghost` and ghost txs over HTTP: the status (off by default), the wire form as
+    /// `application/octet-stream` (a ghost tx is bigger than the JSON body limit), refused while
+    /// Ghost Mode is off, without verifying its proof; a signed tx's wire form is accepted like its
+    /// JSON; a published ghost address is found by name.
+    #[tokio::test]
+    async fn ghost_status_and_binary_submission() {
+        let (root, n) = node("ghostapi");
+        let (s, g, _) = call(&n, "GET", "/api/ghost", None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!((g["active"].as_bool(), g["paused"].as_bool(), g["pool"].as_str(), g["frontier_size"].as_u64()), (Some(false), Some(false), Some("0"), Some(0)));
+        assert_eq!(g["instance"].as_str().map(str::len), Some(64));
+        assert_eq!(g["audited"], false);
+        let send = |bytes: Vec<u8>| {
+            let app = router(n.clone()).layer(MockConnectInfo("127.0.0.1:1".parse::<SocketAddr>().unwrap()));
+            async move {
+                let req = Request::builder().method("POST").uri("/api/tx").header("content-type", "application/octet-stream").body(Body::from(bytes)).unwrap();
+                let res = app.oneshot(req).await.unwrap();
+                let status = res.status();
+                let body = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+                (status, serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null))
+            }
+        };
+        // A ghost tx of real size (its proof is junk: it's never verified while Ghost Mode is off).
+        let mut bundle = crate::types::tests::vector_bundle(1);
+        bundle.proof = HexBytes(vec![1; 150_000]);
+        let genesis_hash = n.chain.lock().genesis_hash.clone();
+        let ghost = Tx { chain_id: "ghostapi".into(), genesis_hash: genesis_hash.clone(), from: String::new(), nonce: 0, fee: 10_000_000, tip: 0, valid_until: 50, action: Action::PrivateTransfer { bundle }, memo: String::new(), public_key: String::new(), signature: String::new() };
+        assert!(ghost.to_bytes().len() > MAX_BODY_BYTES);
+        let (s, v) = send(ghost.to_bytes()).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("Ghost Mode is off"), "{v}");
+        let (s, v) = send(vec![0; 40]).await;
+        assert!(s == StatusCode::BAD_REQUEST && v["error"].as_str().unwrap().contains("v3"), "{v}");
+        // A signed transfer in its wire form.
+        let alice = crate::crypto::Keys::from_seed([6; 32]);
+        n.chain.lock().faucet(&alice.address(), 10 * DROPS_PER_FANG).unwrap();
+        n.chain.lock().produce_block().unwrap();
+        let mut t = Tx { chain_id: "ghostapi".into(), genesis_hash, from: alice.address(), nonce: 0, fee: 0, tip: 0, valid_until: 50, action: Action::RegisterName { name: "alice".into() }, memo: String::new(), public_key: hex::encode(alice.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+        t.fee = min_fee(t.size());
+        let t = t.sign(&alice);
+        let (s, v) = send(t.to_bytes()).await;
+        assert_eq!((s, v["id"].as_str()), (StatusCode::OK, Some(t.id().as_str())), "{v}");
+        let (s, _, _) = call(&n, "GET", "/api/ghost/address/alice.boo", None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        // Published (as `SetGhostAddress` would), it's found by name, with its fingerprint.
+        n.chain.lock().produce_block().unwrap();
+        let addr = blockula_ghost::SpendingKey::from_seed([7; 32]).address();
+        n.chain.lock().state.ghost.addresses.insert(alice.address(), addr.to_bytes().to_vec());
+        n.chain.lock().produce_block().unwrap();
+        let (s, v, _) = call(&n, "GET", "/api/ghost/address/alice.boo", None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!((v["account"]["address"].as_str(), v["fingerprint"].as_str()), (Some(alice.address().as_str()), Some(addr.fingerprint().as_str())));
+        assert_eq!(v["address"].as_str().map(str::len), Some(2 * GHOST_ADDRESS_BYTES));
         std::fs::remove_dir_all(root).ok();
     }
 

@@ -10,6 +10,7 @@ use crate::{
     consensus::{self, CBlock, Shared},
     crypto::Keys,
     epochs::{self, EpochRegistry},
+    ghost,
     node::{self, SyncBatch},
     pq::{self, MlDsaScheme, PrivateKey},
     snapshot,
@@ -29,7 +30,7 @@ use serde_json::{Value, json};
 use std::sync::{Arc, OnceLock};
 
 /// The fuzz targets, by name (`fuzz_targets/<name>.rs`, `seeds/<name>/`).
-pub const TARGETS: [&str; 9] = ["cblock", "tx_json", "tx_wire", "snapshot_manifest", "state_snapshot", "sync_batch", "epochs_registry", "certificate", "state_machine"];
+pub const TARGETS: [&str; 10] = ["cblock", "tx_json", "tx_wire", "ghost_tx", "snapshot_manifest", "state_snapshot", "sync_batch", "epochs_registry", "certificate", "state_machine"];
 
 /// Runs target `name` on `data`.
 pub fn run(name: &str, data: &[u8]) -> bool {
@@ -37,6 +38,7 @@ pub fn run(name: &str, data: &[u8]) -> bool {
         "cblock" => cblock(data),
         "tx_json" => tx_json(data),
         "tx_wire" => tx_wire(data),
+        "ghost_tx" => ghost_tx(data),
         "snapshot_manifest" => snapshot_manifest(data),
         "state_snapshot" => state_snapshot(data),
         "sync_batch" => sync_batch(data),
@@ -150,6 +152,89 @@ pub fn tx_wire(data: &[u8]) -> bool {
         genesis_state().describe(&tx, None);
     }
     ok
+}
+
+/// Ghost Mode's txs (tags 50–52) in their wire forms, as gossip and blocks carry them: the
+/// unsigned `BLOCKULA_GHOST_V1` form and signed shields. Only canonical bytes parse; the
+/// statement the proof is checked against comes from the tx alone; and the stateless checks,
+/// Action proof included, never panic whatever the bytes (Plonky3's verifier runs under
+/// `catch_unwind`). Accepted: a well-formed ghost tx whose proof verifies.
+pub fn ghost_tx(data: &[u8]) -> bool {
+    let Ok(tx) = Tx::from_bytes(data) else { return false };
+    assert_eq!(tx.to_bytes(), data, "Tx::from_bytes accepted a non-canonical ghost tx");
+    assert_eq!(tx.size(), data.len() as u64, "size() isn't the wire length");
+    if tx.action.ghost_bundle().is_none() {
+        return false;
+    }
+    let back: Tx = serde_json::from_slice(&serde_json::to_vec(&tx).unwrap()).expect("a ghost tx must survive its JSON form");
+    assert_eq!(back, tx, "the JSON round trip changed a ghost tx");
+    let _ = (tx.ghost_sighash(), ghost::statement(&tx), ghost::action_json(&tx.action));
+    let ok = consensus::check_tx_stateless(&tx, CHAIN_ID, genesis_hash(), prefix()).is_ok();
+    if tx.check_format().is_ok() {
+        genesis_state().describe(&tx, None);
+    }
+    ok
+}
+
+/// A shield, a private transfer and an unshield on the fixture chain, with real proofs (the
+/// `blockula-ghost` prover, as a wallet runs it). The spends' anchor is a tree of their own:
+/// stateless checks don't look at anchors.
+fn ghost_seed_txs(funded: &Keys) -> Vec<(&'static str, Tx)> {
+    use blockula_ghost::field::{digest_to_bytes, Digest};
+    use blockula_ghost::{dummy_output, encrypt_note, ActionWitness, EncryptedNote, FullTree, Note, SpendWitness, SpendingKey};
+    let mut rng = commonware_utils::sys_rng();
+    let key = SpendingKey::from_seed([0x47; 32]);
+    let instance = types::HexBytes(ghost::chain_instance(genesis()).to_vec());
+    let output = |rng: &mut _, value: u64| -> (Note, EncryptedNote) {
+        let mut rseed = [0; 32];
+        rand_core::Rng::fill_bytes(rng, &mut rseed);
+        let note = Note { value, owner: key.address().owner(), rseed };
+        (note, encrypt_note(&note, &key.address(), &[0; 256], Some(&key.full_viewing_key().outgoing()), rng).unwrap())
+    };
+    // Proves `spends` → `outputs` for `tx` (whose action holds a bundle with an empty proof).
+    let finish = |mut tx: Tx, spends: [SpendWitness; 2], outputs: [(Note, EncryptedNote); 2], anchor: Digest| -> Tx {
+        let h = |d: &Digest| types::HexBytes(digest_to_bytes(d).to_vec());
+        let bundle = types::GhostBundle {
+            instance: instance.clone(),
+            anchor: h(&anchor),
+            nullifiers: [h(&spends[0].nullifier()), h(&spends[1].nullifier())],
+            commitments: [h(&outputs[0].0.commitment()), h(&outputs[1].0.commitment())],
+            enc: [types::HexBytes(outputs[0].1.enc.clone()), types::HexBytes(outputs[1].1.enc.clone())],
+            out: [types::HexBytes(outputs[0].1.out.clone()), types::HexBytes(outputs[1].1.out.clone())],
+            proof: types::HexBytes::default(),
+        };
+        let slot = match &mut tx.action {
+            types::Action::Shield { bundle: b, .. } | types::Action::PrivateTransfer { bundle: b } | types::Action::Unshield { bundle: b, .. } => b,
+            _ => unreachable!(),
+        };
+        **slot = bundle;
+        let w = ActionWitness { spends, outputs: [outputs[0].0, outputs[1].0], anchor, sighash: tx.ghost_sighash().unwrap() };
+        let proof = blockula_ghost::prove(&w).expect("prove a seed action").1;
+        match &mut tx.action {
+            types::Action::Shield { bundle, .. } | types::Action::PrivateTransfer { bundle } | types::Action::Unshield { bundle, .. } => bundle.proof = types::HexBytes(proof),
+            _ => unreachable!(),
+        }
+        tx
+    };
+    let empty = || Box::new(types::GhostBundle { instance: types::HexBytes::default(), anchor: types::HexBytes::default(), nullifiers: Default::default(), commitments: Default::default(), enc: Default::default(), out: Default::default(), proof: types::HexBytes::default() });
+    // A shield of 5 FANG (dummy spends).
+    let mut shield = signed_tx(funded, 13, 0, json!({ "type": "transfer", "to": "alice.boo", "amount": "1" }));
+    shield.action = types::Action::Shield { amount: 5_000_000_000, bundle: empty() };
+    shield.fee = 3_000_000;
+    let outputs = [output(&mut rng, 5_000_000_000), dummy_output(&mut rng)];
+    let shield = finish(shield, [SpendWitness::dummy(&mut rng), SpendWitness::dummy(&mut rng)], outputs, blockula_ghost::Frontier::new().root()).sign(funded);
+    // A 5 FANG note in a tree, spent by a private transfer and by an unshield (fee 0.003 FANG).
+    let note = output(&mut rng, 5_000_000_000).0;
+    let mut tree = FullTree::new();
+    let pos = tree.append(note.commitment()).unwrap();
+    let spend = || SpendWitness::new(&key, note, tree.path(pos).unwrap());
+    let fee = 3_000_000;
+    let unsigned = |action: types::Action| Tx { chain_id: CHAIN_ID.into(), genesis_hash: genesis_hash().into(), from: String::new(), nonce: 0, fee, tip: 0, valid_until: VALID_UNTIL, action, memo: String::new(), public_key: String::new(), signature: String::new() };
+    let outputs = [output(&mut rng, 5_000_000_000 - fee), dummy_output(&mut rng)];
+    let transfer = finish(unsigned(types::Action::PrivateTransfer { bundle: empty() }), [spend(), SpendWitness::dummy(&mut rng)], outputs, tree.root());
+    let outputs = [output(&mut rng, 3_000_000_000 - fee), dummy_output(&mut rng)];
+    let unshield = finish(unsigned(types::Action::Unshield { to: "alice.boo".into(), amount: 2_000_000_000, bundle: empty() }), [spend(), SpendWitness::dummy(&mut rng)], outputs, tree.root());
+    vec![("shield", shield), ("private-transfer", transfer), ("unshield", unshield)]
 }
 
 /// `GET /api/snapshot/latest` as fast sync reads it: JSON, then `verify_manifest` (hex blocks,
@@ -700,6 +785,10 @@ pub fn seeds() -> Vec<(&'static str, &'static str, Vec<u8>)> {
     for ((name, tx), bytes) in ["transfer", "transfer-to-name", "register-name", "add-session-key", "register-validator", "create-hunt", "reveal-votes", "attest-claim", "propose-treasury-spend", "vote", "multisig-propose", "claim-distribution", "report-equivocation"].into_iter().zip(&txs).zip(&wire) {
         out.push(("tx_json", name, serde_json::to_vec(tx).unwrap()));
         out.push(("tx_wire", name, bytes.clone()));
+    }
+    // Ghost Mode (tags 50–52): real proofs, in both wire forms (`tx_wire` takes them too).
+    for (name, tx) in ghost_seed_txs(&funded) {
+        out.push(("ghost_tx", name, tx.to_bytes()));
     }
 
     // Blocks extending the fixture genesis, carrying real txs (wire form). View = height.

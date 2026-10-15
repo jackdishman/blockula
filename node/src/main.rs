@@ -11,6 +11,7 @@ mod crypto;
 mod econ;
 mod epochs;
 mod genesis_builder;
+mod ghost;
 mod github;
 mod gov_cli;
 mod governance;

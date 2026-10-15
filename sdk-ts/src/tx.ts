@@ -89,7 +89,35 @@ export type Action =
   /** `proof`: hex 32-byte hashes from the leaf (distribution_id, address, amount) to the distribution's Merkle root. */
   | { type: "claim_distribution"; distribution_id: number; amount: string; proof: string[] }
   /** Validators: a matured claim's PR was reverted by commit `revert_sha` (40 hex). */
-  | { type: "attest_revert"; claim_id: number; revert_sha: string };
+  | { type: "attest_revert"; claim_id: number; revert_sha: string }
+  // ---- 👻 Ghost Mode (tags 50–54). Disabled until governance activates it: nodes refuse these with "Ghost Mode is off". ----
+  /** Move `amount` drops into the shielded pool as the bundle's output notes. Signed; also burns the chain's `ghost_verify_fee`. */
+  | { type: "shield"; amount: string; bundle: GhostBundle }
+  /** Unsigned (the proof authorizes it): send it with `from`, `memo`, `public_key`, `signature` empty and `nonce` 0. Its `fee` leaves the pool. */
+  | { type: "private_transfer"; bundle: GhostBundle }
+  /** Unsigned: pay `amount` drops out of the pool to `to` (address or name), plus the fee. */
+  | { type: "unshield"; to: string; amount: string; bundle: GhostBundle }
+  /** Publish this account's 1,216-byte Ghost Mode address (hex) so wallets find it under the account's names. */
+  | { type: "set_ghost_address"; address: string }
+  /** Validators: vote to pause Ghost Mode (it pauses once f + 1 of the epoch's validators have). */
+  | { type: "ghost_pause" };
+
+/**
+ * What a ghost action carries (node/src/types.rs `GhostBundle`), every field lowercase hex: the
+ * chain `instance` (from `/api/ghost`), the `anchor` root, two 32-byte `nullifiers` and
+ * `commitments`, two note ciphertexts `enc` (1,401 bytes each) and outgoing ciphertexts `out`
+ * (80 bytes each), and the Action `proof`. Proofs come from the `blockula-ghost` prover; this SDK
+ * only encodes.
+ */
+export interface GhostBundle {
+  instance: string;
+  anchor: string;
+  nullifiers: [string, string];
+  commitments: [string, string];
+  enc: [string, string];
+  out: [string, string];
+  proof: string;
+}
 
 /** What a `propose` asks for (node/src/types.rs `ProposalKind`): every former admin lever, parameters, spending, upgrades and features. */
 export type ProposalKind =
@@ -140,6 +168,13 @@ export interface Tx extends UnsignedTx {
 
 export const PUBLIC_KEY_LEN = 1952;
 export const SIGNATURE_LEN = 3309;
+/** Domain of the unsigned ghost wire form (`private_transfer`, `unshield`). */
+export const GHOST_TX_DOMAIN = "BLOCKULA_GHOST_V1";
+export const GHOST_ENC_BYTES = 1401;
+export const GHOST_OUT_BYTES = 80;
+export const GHOST_ADDRESS_BYTES = 1216;
+/** The Action circuit the node verifies proofs against (blockula-ghost `CIRCUIT_ID`). */
+export const GHOST_CIRCUIT_ID = 1;
 export const DROPS_PER_FANG = 1_000_000_000n;
 
 const utf8 = new TextEncoder();
@@ -158,6 +193,12 @@ class Writer {
     this.bytes(b);
   }
   ids(xs: number[]) { this.u16(xs.length); for (const x of xs) this.u64(BigInt(x)); }
+  /** Raw bytes of exactly `len` bytes, from hex. */
+  fixed(hex: string, len: number) {
+    const b = hexToBytes(hex);
+    if (b.length !== len) throw new Error(`expected ${len} bytes, got ${b.length}`);
+    this.bytes(b);
+  }
   strs(xs: string[]) { this.u16(xs.length); for (const x of xs) this.str(x); }
   done() { return Uint8Array.from(this.parts); }
 }
@@ -170,8 +211,27 @@ export function genesisHashBytes(genesisHash: string): Uint8Array {
   return hexToBytes(genesisHash);
 }
 
+/** Unsigned ghost txs (`private_transfer`, `unshield`): no key signs them, their proof authorizes them. */
+export function isUnsignedAction(a: Action): boolean {
+  return a.type === "private_transfer" || a.type === "unshield";
+}
+
+/**
+ * The bytes a key signs (node/src/types.rs `Tx::signing_bytes`). For an unsigned ghost tx this is
+ * its whole wire form instead: `BLOCKULA_GHOST_V1 ‖ chain_id ‖ genesis hash ‖ fee ‖ tip ‖ valid_until ‖ action`.
+ */
 export function signingBytes(tx: UnsignedTx): Uint8Array {
   const w = new Writer();
+  if (isUnsignedAction(tx.action)) {
+    w.bytes(utf8.encode(GHOST_TX_DOMAIN));
+    w.str(tx.chain_id);
+    w.bytes(genesisHashBytes(tx.genesis_hash));
+    w.u64(BigInt(tx.fee));
+    w.u64(BigInt(tx.tip ?? "0"));
+    w.u64(BigInt(tx.valid_until));
+    encodeAction(w, tx.action);
+    return w.done();
+  }
   w.bytes(utf8.encode("BLOCKULA_TX_V3"));
   w.str(tx.chain_id);
   w.bytes(genesisHashBytes(tx.genesis_hash));
@@ -341,9 +401,65 @@ function encodeAction(w: Writer, a: Action) {
     case "attest_revert":
       w.u8(49); w.u64(BigInt(a.claim_id)); w.str(a.revert_sha);
       break;
+    case "shield":
+      w.u8(50); w.u64(BigInt(a.amount)); encodeBundle(w, a.bundle);
+      break;
+    case "private_transfer":
+      w.u8(51); encodeBundle(w, a.bundle);
+      break;
+    case "unshield":
+      w.u8(52); w.str(a.to); w.u64(BigInt(a.amount)); encodeBundle(w, a.bundle);
+      break;
+    case "set_ghost_address":
+      w.u8(53); w.fixed(a.address, GHOST_ADDRESS_BYTES);
+      break;
+    case "ghost_pause":
+      w.u8(54);
+      break;
     default:
       throw new Error(`unknown action type ${(a as { type: string }).type}`);
   }
+}
+
+/** A bundle without its proof, raw and in wire order: what the sighash covers. */
+function encodeBundlePublic(w: Writer, b: GhostBundle) {
+  w.fixed(b.instance, 32);
+  w.fixed(b.anchor, 32);
+  for (const x of [...b.nullifiers, ...b.commitments]) w.fixed(x, 32);
+  for (const x of b.enc) w.fixed(x, GHOST_ENC_BYTES);
+  for (const x of b.out) w.fixed(x, GHOST_OUT_BYTES);
+}
+
+/** node/src/types.rs `GhostBundle::encode`: the fixed fields, then the proof with a u32 length. */
+function encodeBundle(w: Writer, b: GhostBundle) {
+  encodeBundlePublic(w, b);
+  const proof = hexToBytes(b.proof);
+  w.u32(proof.length);
+  w.bytes(proof);
+}
+
+/**
+ * What a ghost tx's Action proof is bound to (node/src/types.rs `Tx::ghost_sighash`):
+ * BLAKE3-KDF("blockula ghost v1 tx sighash", chain_id ‖ genesis hash ‖ tag ‖ valid_until ‖ fee ‖
+ * tip ‖ the tag's own fields (shield: from, nonce, amount; unshield: to, amount) ‖ the bundle
+ * without its proof ‖ circuit id). A wallet proves with this as the witness's sighash, then fills
+ * in the proof.
+ */
+export function ghostSighash(tx: UnsignedTx): Uint8Array {
+  const a = tx.action;
+  if (a.type !== "shield" && a.type !== "private_transfer" && a.type !== "unshield") throw new Error("not a ghost transfer");
+  const w = new Writer();
+  w.str(tx.chain_id);
+  w.bytes(genesisHashBytes(tx.genesis_hash));
+  w.u8(a.type === "shield" ? 50 : a.type === "private_transfer" ? 51 : 52);
+  w.u64(BigInt(tx.valid_until));
+  w.u64(BigInt(tx.fee));
+  w.u64(BigInt(tx.tip ?? "0"));
+  if (a.type === "shield") { w.str(tx.from); w.u64(BigInt(tx.nonce)); w.u64(BigInt(a.amount)); }
+  if (a.type === "unshield") { w.str(a.to); w.u64(BigInt(a.amount)); }
+  encodeBundlePublic(w, a.bundle);
+  w.u32(GHOST_CIRCUIT_ID);
+  return blake3(w.done(), { context: utf8.encode("blockula ghost v1 tx sighash") });
 }
 
 /** A proposal kind's own tag and fields (node/src/types.rs `ProposalKind::encode`). */
@@ -451,9 +567,9 @@ export function popMessage(chainId: string, owner: string, p2pAddr: string, http
   return w.done();
 }
 
-/** Wire size in bytes (node/src/types.rs `Tx::size`): signing bytes plus the key and signature. Fees are priced on it. */
+/** Wire size in bytes (node/src/types.rs `Tx::size`): signing bytes plus the key and signature (none for an unsigned ghost tx). Fees are priced on it. */
 export function txSize(tx: UnsignedTx): number {
-  return signingBytes(tx).length + PUBLIC_KEY_LEN + SIGNATURE_LEN;
+  return signingBytes(tx).length + (isUnsignedAction(tx.action) ? 0 : PUBLIC_KEY_LEN + SIGNATURE_LEN);
 }
 
 /**
@@ -484,9 +600,13 @@ export function txCharge(tx: UnsignedTx, fee: BaseFee = FLOOR_BASE_FEE): bigint 
   return baseFee(tx, fee) + BigInt(tx.tip ?? "0");
 }
 
-/** Wire form (node/src/types.rs `Tx::to_bytes`): signing bytes ‖ public key (1,952 B) ‖ signature (3,309 B). Blocks and gossip carry this. */
+/**
+ * Wire form (node/src/types.rs `Tx::to_bytes`): signing bytes ‖ public key (1,952 B) ‖ signature (3,309 B), or just the
+ * unsigned form for an unsigned ghost tx. Blocks and gossip carry this; `POST /api/tx` takes it as `application/octet-stream`.
+ */
 export function txBytes(tx: Tx): Uint8Array {
   const sb = signingBytes(tx);
+  if (isUnsignedAction(tx.action)) return sb;
   const out = new Uint8Array(sb.length + PUBLIC_KEY_LEN + SIGNATURE_LEN);
   out.set(sb);
   out.set(hexToBytes(tx.public_key), sb.length);

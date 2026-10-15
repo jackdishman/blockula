@@ -3,7 +3,8 @@
 # and its exact [dependencies]. Fails, with the difference, when either drifts from node/.
 set -euo pipefail
 cd "$(dirname "$0")"
-deps() { awk '/^\[dependencies\]/{f=1;next} /^\[/{f=0} f' "$1" | grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' -e '^libfuzzer-sys' | sort; }
+# Path dependencies are relative to each manifest: this crate's `../ghost` is the node's `ghost`.
+deps() { awk '/^\[dependencies\]/{f=1;next} /^\[/{f=0} f' "$1" | grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' -e '^libfuzzer-sys' | sed 's#path = "\.\./#path = "#' | sort; }
 # Non-test modules declared in main.rs (a `#[cfg(test)]` line skips the next declaration).
 node_mods() { awk '/^#\[cfg\(test\)\]$/{skip=1; next} /^(pub )?mod [a-z_0-9]+;/{ if (!skip) { sub(/^(pub )?mod /, ""); sub(/;.*/, ""); print } } {skip=0}' ../src/main.rs | sort; }
 fuzz_mods() { sed -n 's/^    pub mod \([a-z_0-9]*\);$/\1/p' src/lib.rs | sort; }

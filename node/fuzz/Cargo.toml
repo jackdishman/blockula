@@ -56,6 +56,7 @@ borsh = { version = "=1.8.1", features = ["derive", "de_strict_order"] }
 redb = "=4.4.0"
 arc-swap = "=1.9.2"
 toml = "1.1"
+blockula-ghost = { path = "../ghost", version = "=0.1.0" }
 
 # Like the node's release build: arithmetic overflow panics instead of wrapping.
 rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std", "tls12"] }
@@ -120,6 +121,13 @@ bench = false
 [[bin]]
 name = "state_snapshot"
 path = "fuzz_targets/state_snapshot.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ghost_tx"
+path = "fuzz_targets/ghost_tx.rs"
 test = false
 doc = false
 bench = false

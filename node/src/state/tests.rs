@@ -381,6 +381,11 @@ fn namespaces_and_meta_keys_are_unique() {
         (ns::BEACON_REVERTS, 44..=46),
         (ns::BEACON_VALUES, 44..=46),
         (ns::FEATURES, 47..=47),
+        (ns::GHOST_COMMITMENTS, 48..=55),
+        (ns::GHOST_ROOTS, 48..=55),
+        (ns::GHOST_RETIRED, 48..=55),
+        (ns::GHOST_NULLIFIERS, 48..=55),
+        (ns::GHOST_ADDRESSES, 48..=55),
     ];
     let mut seen = std::collections::BTreeSet::from([ns::META]);
     let st = State::default();
@@ -389,11 +394,11 @@ fn namespaces_and_meta_keys_are_unique() {
     }
     for (n, range) in reserved {
         assert!(range.contains(&n), "namespace {n} is outside its module's range");
-        assert!(!(1..=25).contains(&n) && !(48..=63).contains(&n), "namespace {n} collides with the base state or Ghost Mode");
+        assert!(!(1..=25).contains(&n), "namespace {n} collides with the base state");
         seen.insert(n);
     }
-    assert_eq!(seen.len(), 1 + 18 + 16, "every namespace is distinct");
-    let keys = [meta::BURNED, meta::CHAIN_PARAMS, meta::NEXT_HUNT_ID, meta::PARAMS, meta::POC, meta::SCHEMA, meta::SUPPLY, meta::STAKING, meta::GOVERNANCE, meta::ECON, meta::BEACON, meta::UPGRADE];
+    assert_eq!(seen.len(), 1 + 18 + 16 + 5, "every namespace is distinct");
+    let keys = [meta::BURNED, meta::CHAIN_PARAMS, meta::NEXT_HUNT_ID, meta::PARAMS, meta::POC, meta::SCHEMA, meta::SUPPLY, meta::STAKING, meta::GOVERNANCE, meta::ECON, meta::BEACON, meta::UPGRADE, meta::GHOST];
     assert_eq!(keys.iter().collect::<std::collections::BTreeSet<_>>().len(), keys.len());
     assert!(st.meta_records().iter().all(|(k, _)| keys.contains(k)), "every scalar record uses a declared key");
 }
@@ -403,8 +408,9 @@ fn namespaces_and_meta_keys_are_unique() {
 /// recomputed when `Params` gained `address_prefix` (P-WIRE) and again for the protocol v1
 /// scaffold (schema 2: `chain_params`, the upgrade schedule, account locks). Schema 3 (P-ECON:
 /// the `econ` scalar record; P-STAKE: staking's scalar; P-GOV: the `governance` scalars,
-/// `multisig_expiry_blocks`; P-BEACON: the PoC scalars without the block-hash seed) changed it
-/// again; that value is from this implementation only.
+/// `multisig_expiry_blocks`; P-BEACON: the PoC scalars without the block-hash seed; P-GHOST: the
+/// `ghost` scalar record, two more parameters) changed it again; that value is from this
+/// implementation only.
 #[test]
 fn golden_encodings() {
     let acct = Account { balance: 5, nonce: 2, keys: Default::default(), locks: vec![] };
@@ -414,8 +420,8 @@ fn golden_encodings() {
     st.supply = 5;
     st.commit_block().unwrap();
     assert_eq!(st.root_hash(), st.full_root());
-    assert_eq!(st.record_count(), 12);
-    assert_eq!(st.root(), "3e9ebc1453e5b550247711884c8de1c8aeb27b8d4709cbbfe2b7d67a5fed6173");
+    assert_eq!(st.record_count(), 13);
+    assert_eq!(st.root(), "57faf42588eddfbd78042b875c532a013cc4c7d47a5ed6f8fda58f5ae5de0746");
 }
 
 fn million_accounts() -> State {
@@ -603,6 +609,15 @@ fn largest_records_fit_in_a_snapshot() {
         st.beacon.rounds.insert(u64::MAX, set.iter().map(|v| (v.clone(), entry.clone())).collect());
         st.beacon.reverts.insert(u64::MAX, set.iter().map(|v| (v.clone(), RevertAttestation { revert_sha: s(40), at: u64::MAX })).collect());
         st.beacon.values.insert(u64::MAX, Value { value: [0xff; 32], reveals: u32::MAX, missed: set.clone() });
+    }
+    // Ghost Mode: fixed-size records, and a published address (its exact size).
+    {
+        let g = &mut st.ghost;
+        g.commitments.insert(u64::MAX, [0xff; 32]);
+        g.roots.insert([0xff; 32], u64::MAX);
+        g.retired.insert(u64::MAX, [0xff; 32]);
+        g.nullifiers.insert([0xff; 32], u64::MAX);
+        g.addresses.insert(addr(0), vec![0xff; crate::types::GHOST_ADDRESS_BYTES]);
     }
 
     let mut largest = std::collections::BTreeMap::new();

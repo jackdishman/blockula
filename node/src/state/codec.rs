@@ -21,8 +21,10 @@ use std::io::{Read, Write};
 /// vote locks, the `econ` scalars: fee ring, issuance year, name sweep), staking (P-STAKE:
 /// pools, delegations, unbonding entries, punished faults and liveness under namespaces 32–36, its
 /// META scalar; validator records without a bond, statuses candidate/active/removed/tombstoned),
-/// governance (P-GOV: its records and `multisig_expiry_blocks`) and the randomness beacon (its
-/// rounds, values and revert attestations; the PoC scalars lose the block-hash seed).
+/// governance (P-GOV: its records and `multisig_expiry_blocks`), the randomness beacon (its
+/// rounds, values and revert attestations; the PoC scalars lose the block-hash seed) and Ghost
+/// Mode (namespaces 48–52, the `ghost` scalar record, `ghost_anchor_window` and
+/// `ghost_verify_fee`).
 pub const SCHEMA_VERSION: u32 = 3;
 
 pub fn encode<T: BorshSerialize + ?Sized>(v: &T) -> Vec<u8> {
@@ -55,6 +57,16 @@ impl RecordKey for u64 {
     }
     fn from_key_bytes(b: &[u8]) -> Result<Self> {
         Ok(u64::from_be_bytes(b.try_into().map_err(|_| anyhow!("record key isn't 8 bytes"))?))
+    }
+}
+
+/// Hashes and digests (Ghost Mode's nullifiers and roots), as their bytes.
+impl RecordKey for [u8; 32] {
+    fn key_bytes(&self) -> Cow<'_, [u8]> {
+        Cow::Borrowed(self)
+    }
+    fn from_key_bytes(b: &[u8]) -> Result<Self> {
+        b.try_into().map_err(|_| anyhow!("record key isn't 32 bytes"))
     }
 }
 

@@ -11,8 +11,9 @@ contents are encrypted to the recipient with ML-KEM-768. Everything is post-quan
 pairings, no elliptic curves.
 
 This document is the design contract for MAINNET-DESIGN.md §6 (DEC-2). Its library is the
-`blockula-ghost` crate in `node/ghost/` (P-GHOST-CORE). Node integration (tags 50–54, state,
-turnstile, fees) is a later package; section 8 is its plan. Background, prior art and the
+`blockula-ghost` crate in `node/ghost/` (P-GHOST-CORE). The node integrates it in
+`node/src/ghost.rs` (P-GHOST-INT: tags 50–54, state, turnstile, fees, pause), switched off until
+governance activates it; section 8 describes what was built. Background, prior art and the
 choice of stack: `.context/research/ghost-mode.md`.
 
 | | |
@@ -132,7 +133,9 @@ Bit `h` of a leaf's position says whether its ancestor at height `h` is a right 
   reported the empty tree's). And since 2³² is even, an action's two appends either both fit
   or the first fails, so an action is never half-appended. Refusing leaf 2³² − 1 instead would
   make the usable size odd: the last action could fit one output but not the other.
-- `RootHistory`: the last `ghost_anchor_window` roots; a spend's anchor must be one of them.
+- `RootHistory`: the last N roots; a spend's anchor must be one of them. (The node keeps the
+  equivalent by age instead: a root stays usable for `ghost_anchor_window` blocks after a newer one
+  replaces it, section 8.)
 - `FullTree` (wallets, tests): keeps every node and serves authentication paths.
 
 ## 5. The Action circuit
@@ -337,85 +340,150 @@ overflow-checks = true   # blockula, blockula-ghost and Plonky3; at minimum
 # panic stays "unwind" (the default); blockula-ghost won't compile with "abort"
 ```
 
-and the proof-robustness soaks should be re-run from the node workspace. The crate's own
+and the proof-robustness soaks should be re-run from the node workspace. The node now has this,
+per crate (`[profile.release.package.blockula-ghost]` and one entry for each of the 20 `p3-*`
+crates in its lockfile), and `ghost::tests::release_profile_covers_plonky3` fails if a Plonky3
+upgrade brings a crate that isn't listed or if `panic = "abort"` appears. The crate's own
 correctness doesn't depend on the profile: its arithmetic on untrusted input (tree sizes and
 positions, value balances, proof and ciphertext lengths) is explicit (`try_from`, `i128` sums,
 length checks before slicing), so nothing in it can wrap in either profile.
 
-## 8. Node integration plan (later package)
+## 8. Node integration (built, disabled)
 
-**State** (all in the authenticated store, so in the state root):
+`node/src/ghost.rs`, with hooks in `types.rs` (encodings), `chain.rs` (admission, execution,
+mempool), `consensus.rs` (size limits, proofs before voting), `state/` (records) and `api.rs`.
+Every ghost action is refused ("Ghost Mode is off") until governance runs
+`ActivateFeature { ghost }` (upgrade.rs); a mainnet genesis can't list the feature
+(`Genesis::check`), and `ghost_pool_cap` starts at 0, so an activated pool still takes no
+deposits until governance raises the cap too.
+
+**State** (all in the authenticated store, so in the state root; schema 3):
 
 | Namespace | Key → value | Notes |
 |---|---|---|
-| `ghost/cm` | position → `cm` | append-only, for wallet sync |
-| `ghost/frontier` | () → `Frontier` bytes | O(32) per append |
-| `ghost/root` | root → height | the last `ghost_anchor_window` (e.g. 1,024) blocks' roots |
-| `ghost/nf` | nullifier → height | grows forever; spends prepay it through fees |
-| `ghost/pool` | () → u128 | the turnstile |
-| `features/ghost` | () → `{ active, paused, circuit_id, pool_cap, max_block_bytes, verify_fee, pause_votes }` | governance and validators |
-| account | + optional `ghost_address` (1,216 B) | `SetGhostAddress` |
+| 48 `GHOST_COMMITMENTS` | position → `cm` | append-only, for wallet sync |
+| 49 `GHOST_ROOTS` | replaced root → height it was replaced | usable anchors besides the current one |
+| 50 `GHOST_RETIRED` | height → root replaced then | the same records by age, for expiry |
+| 51 `GHOST_NULLIFIERS` | nullifier → height spent | grows forever; spends prepay it through fees |
+| 52 `GHOST_ADDRESSES` | account → 1,216-byte address | `SetGhostAddress` |
+| 53–55 | | reserved for Ghost Mode; 56–63 kept for a migration to a new pool |
+| META `ghost` | `GhostMeta { instance, frontier, root, pool, pause, votes }` | the chain instance, the `Frontier` bytes, the current anchor, the turnstile (u64 drops), the validators' pause |
 
-**Actions** (tags reserved in MAINNET-DESIGN §3.1; 55–59 stay reserved for a pool migration and
-The Crypt):
+The governance knobs are `ChainParams` (params.rs), not a feature record: `ghost_pool_cap`,
+`ghost_max_tx_bytes` (256 KiB), `ghost_max_block_bytes` (1 MiB), `ghost_anchor_window` (1,024
+blocks) and `ghost_verify_fee` (0.001 FANG). The flag itself is upgrade.rs's `features` map.
+
+**Actions:**
 
 | Tag | Action | Signed by | Value balance | Effect |
 |---|---|---|---|---|
-| 50 | `Shield { amount, bundle }` | `from` (normal Tx v3) | `−amount` | debit `amount` + fee transparently; `ghost_pool += amount`; fails above `pool_cap` |
-| 51 | `PrivateTransfer { bundle }` | nobody: the proof authorizes | `fee` | fee paid from the pool: `ghost_pool −= fee` |
-| 52 | `Unshield { to, amount, bundle }` | nobody | `amount + fee` | `ghost_pool −= amount + fee` (fails if it would go negative); credit `to` |
-| 53 | `SetGhostAddress { address }` | account owner key | | publish the 1,216-byte address under the name |
-| 54 | `GhostPause {}` | an active validator | | once f+1 distinct validators of the epoch have signed, ghost actions fail from the next block until `ActivateFeature { ghost }` |
+| 50 | `Shield { amount, bundle }` | `from`'s owner key (normal Tx v3) | `−amount` | debit `amount` + `ghost_verify_fee` (burned) besides the usual charge; `pool += amount`; fails (charged) above `ghost_pool_cap` |
+| 51 | `PrivateTransfer { bundle }` | nobody: the proof authorizes | `fee` | `pool −= fee`; tip to the proposer, the rest burned |
+| 52 | `Unshield { to, amount, bundle }` | nobody | `amount + fee` | `pool −= amount + fee`; credit `to` (address or name) |
+| 53 | `SetGhostAddress { address }` | the account's owner key | | the address is filed under the account, so wallets find it under each of its `.boo` names (and it follows the account, not a name that changes hands) |
+| 54 | `GhostPause {}` | an active validator (its consensus key or owner) | | once f + 1 distinct validators of the epoch's active set have signed, ghost actions fail from the next block |
 
-`bundle = { anchor, nf[2], cm[2], enc[2] (1,401 B each), out[2] (80 B each), proof }`. The node
-derives the public `ValueBalance` from the tag and fees, never from the sender.
+`bundle = { instance, anchor, nf[2], cm[2], enc[2] (1,401 B each), out[2] (80 B each), proof }`
+(`types::GhostBundle`; hex in JSON, raw in the wire form, the proof after a u32 length). Digests
+must be canonical and the nullifiers distinct (`check_format`). Ghost actions can't sit inside a
+multisig proposal. Session keys can't shield (they only send transfers), and nothing they hold can
+spend notes.
 
-**Sighash** (proposal for P-WIRE): `BLAKE3-KDF("blockula ghost v1 sighash", chain_id ‖ tag ‖
-valid_until ‖ fee ‖ tip ‖ tag fields (from, nonce, amount, to) ‖ anchor ‖ nf ‖ cm ‖ enc ‖ out ‖
-CIRCUIT_ID)`: everything in the transaction except the proof. Binding the ciphertexts stops a
-relayer from swapping them (which would make a note unfindable).
+**Unsigned transactions.** 51 and 52 are the same `Tx` type with `from`, `memo`, `public_key`
+and `signature` empty and `nonce` 0, in a wire form of their own: `BLOCKULA_GHOST_V1 ‖ chain_id ‖
+genesis hash ‖ fee ‖ tip ‖ valid_until ‖ action` (`Tx::signing_bytes`, and the whole wire form). `Tx::from_bytes`
+dispatches on the domain and accepts exactly these two tags unsigned (and neither in the signed
+form). Keeping one type means blocks, gossip, the mempool, the API and the explorer carry them
+unchanged, and no signed-tx path changed: `State::apply_j` hands unsigned txs to
+`ghost::apply_unsigned` before it looks for a sender, `verify_signature` refuses them, and the
+stateless checks skip the signature for them only. An unsigned tx's id is the hash of its wire
+form. Replay protection is the nullifier set; `valid_until` is in the sighash.
 
-**Unsigned transactions (51, 52).** No `from`, nonce, public key or signature; `check_format`
-accepts exactly these tags unsigned. Replay protection is the nullifiers; `valid_until` lives in
-the sighash. The mempool de-duplicates by nullifier, keeping the higher tip per byte. A proposer
-that includes a ghost tx that then fails pays `base_fee × size` (CV-5), which is what stops free
-junk.
+**Sighash** (`Tx::ghost_sighash`, mirrored in `sdk-ts` `ghostSighash`, shared vectors):
+`BLAKE3-KDF("blockula ghost v1 tx sighash", chain_id ‖ genesis hash ‖ tag ‖ valid_until ‖ fee ‖
+tip ‖ tag fields (Shield: from, nonce, amount; Unshield: to, amount) ‖ instance ‖ anchor ‖ nf ‖
+cm ‖ enc ‖ out ‖ CIRCUIT_ID)`. The genesis hash (the 32 raw bytes, as signed txs carry it since
+audit #7) and `instance` (`ghost::chain_instance`: BLAKE3-KDF over the consensus genesis seed's
+inputs) both identify the chain, so chains that share a chain id (a restarted testnet, a fork)
+don't accept each other's proofs. The tx carries it, so a proof verifies without state;
+admission and execution check it equals the chain's (`/api/ghost` serves it).
 
-**Limits.** Ghost txs (tags 50–52) up to `MAX_GHOST_TX_BYTES` = 256 KiB (a full Action is
-~135 KiB: proof ≤ 132 KiB + 2,962 bytes of ciphertexts + header, + 5.3 KB of ML-DSA for a
-shield); at most `ghost.max_block_bytes` = 1 MiB of ghost txs per block, i.e. ~7 per block. That
-bounds verification at ~45 ms of one core per block and keeps transparent txs from being crowded
-out. The API needs the binary wire form on `/api/tx` (JSON hex would double the size).
+**Limits.** Ghost txs (50–52) up to `MAX_GHOST_TX_BYTES` = 1 MiB in the codec, and
+`ghost_max_tx_bytes` at admission and in blocks; at most `ghost_max_block_bytes` of them per
+block (`ghost::BlockBudget`, in consensus `propose` and `verify`). At most 256 queued in the
+mempool; a tx spending a nullifier a queued tx spends replaces it only with a higher tip per byte.
+`POST /api/tx` takes the wire form as `application/octet-stream` (and JSON up to twice
+`MAX_GHOST_TX_BYTES`).
 
-**Fees.** `fee` = the usual byte fee (base burned, tip to the proposer) plus a flat
-`ghost.verify_fee` for verifier CPU (PLAN.md's "verification premium"). A shield pays it
-transparently; for 51–52 it comes out of shielded value through the value balance.
+**Fees.** A shield pays the usual byte fee and tip transparently, plus `ghost_verify_fee`. An
+unsigned tx's `fee` is exact (it's in the value balance) and must cover the base fee for its
+size (`econ::base_fee`), its tip and `ghost_verify_fee`; the tip goes to the proposer, the rest is
+burned. A ghost tx that can't be included is skipped, and P-STAKE charges the proposer for it
+(CV-5).
 
 **Pipeline.**
-- Admission: ghost active and not paused; size limits; `verify` once (on a blocking thread),
-  cached by tx id; anchor in `ghost/root`; nullifiers distinct, not in `ghost/nf` or the mempool;
-  value balance matches the tag; turnstile and pool cap.
-- Consensus `verify`: proofs not already cached. Stateful checks run at execution and through
-  CV-5's ancestor replay.
-- Value balances: compute `amount + fee` and the like in `i128` (or checked `u64`) and pass them
-  to `ValueBalance::new`, which rejects anything outside `±(2⁶⁴ − 1)`; never add in wrapping
-  `u64`.
-- Execution: re-check, append both output commitments (dummies too) to the frontier (a full tree
-  fails the first append, so check `size() + 2 ≤ CAPACITY` or apply to a copy), insert both
-  nullifiers, move value, update `ghost_pool`, record the root at end of block.
-- `State::check_invariants()`: `supply = Σ balances + escrows + stakes + pools + ghost_pool`.
+- **Before the chain lock** (HTTP submission, on a blocking thread, after a cheap "is Ghost Mode
+  on" check; gossip; consensus `verify`): `check_tx_stateless` checks format, prefix, fee floor,
+  the signature (not for 51 and 52) and the proof against the statement derived from the tx
+  alone (`ghost::statement`: digests from the bundle, the value balance from the tag and fields
+  in `i128` through `ValueBalance::new`, the sighash). A block with an invalid proof is
+  permanently invalid and gets a no.
+- **Admission and execution**, deterministically: the feature on and unpaused, the size limit,
+  the instance, the fee floor, the turnstile (`pool ≥ value leaving`), the recipient, a usable
+  anchor, unspent nullifiers, room for two leaves (`size + 2 ≤ CAPACITY`), and the proof again.
+  Verdicts are remembered (4,096) by a hash of the verifier's whole input (public values,
+  circuit id, proof bytes), and `verify` is a pure function of it, so a hit is exactly a repeat:
+  the cache changes how long execution takes, never what it does. For a signed shield these are
+  admission checks (can't be included) except the cap, the anchor and the nullifiers, which fail
+  the action with the fee charged, like any signed tx. An unsigned tx applies in full or not at
+  all (it has no account to charge).
+- **Effects**: both nullifiers recorded, both commitments (dummies too) appended, value moved
+  through the journaled helpers. At the end of the block (`ghost::end_block`, after governance's
+  step) the tree's new root becomes the anchor and the root it replaced stays usable for
+  `ghost_anchor_window` blocks.
+- `State::check_invariants()`: `supply = Σ balances + escrows + stakes + … + pool`; the
+  commitments are exactly the frontier's leaves; the anchor is the frontier's root; retired
+  anchors are filed both ways.
 
 **Turnstile and pause.** The turnstile (ZIP 209's rule) bounds a soundness bug to theft of
-honest shielded deposits rather than unbounded supply; the pool cap bounds those. `GhostPause`
-gives a fast stop without an admin key: f+1 validators can already halt the chain, so it adds
-no power, and it can only stop the pool, never move funds. Recovery from a suspected bug follows
-Zcash: freeze the pool to withdraw-only and migrate to a new versioned pool through the
-turnstile.
+honest shielded deposits rather than unbounded supply; the pool cap bounds those
+(`the_turnstile_bounds_a_counterfeit_note` spends a counterfeit note whose root was forced into the
+anchor set). `GhostPause` gives a fast stop without an admin key: f + 1 validators can already
+halt the chain, so it adds no power, and it can only stop the pool, never move funds. Signatures
+count within one epoch. A pause belongs to the activation it was voted under, so governance
+resumes the pool with `DeactivateFeature { ghost }` then `ActivateFeature { ghost }` (in one block
+or two). Recovery from a suspected bug follows Zcash: freeze the pool (pause, or switch it off)
+and migrate to a new versioned pool through the turnstile (not built).
 
-**Clients.** CLI `blockula ghost shield|send|unshield|scan|export-viewing-key`; SDK
-`@blockula/sdk/ghost` via a WASM build of this crate; MCP `ghost_balance`, `ghost_send` (capped by
-`BLOCKULA_MAX_SEND`). No delegated proving by default (the prover sees the witness). The explorer
-shows "👻 a ghost transaction happened" with nullifiers, fee, proof size and the pool balance.
+**API.** `GET /api/ghost`: on or off, paused (since, by whom, signatures so far and the
+threshold), pool and cap, frontier size, the current anchor and recent replaced ones, the window,
+nullifier count, the instance, the circuit id and the limits. `GET /api/ghost/address/{name or
+address}`: a published address and its fingerprint. Tx JSON shows ghost bundles without their
+proof (its size and hash instead) but with the commitments and ciphertexts wallets scan; an
+unsigned tx's summary is "👻 a ghost transaction happened".
+
+**Tests** (`node/src/ghost/tests.rs`, real proofs from the crate's prover, through the mempool
+and blocks, with the incremental root checked against a rebuild and the invariants after every
+block): shield → private transfer (found by trial decryption) → unshield, with a restart, a
+rebuild from the block logs and a records round trip giving the same root; the proof bound to
+fee, recipient and ciphertexts; double spends refused in one block, across blocks and in the
+mempool (and replacement by tip); stale anchors; the turnstile against a counterfeit note; the cap;
+the pause by f + 1 of 4 validators, across epochs, and governance's resume; disabled by default
+(every tag refused with the same error, at the mempool and in blocks); size limits and the block
+budget; another chain instance; the mempool's ghost bounds; session keys; the release profile.
+Also: a 4-validator simulation (`sim::ghost_txs_finalize_through_consensus`: the three
+transfers submitted to different validators, gossiped, proposed under the block budget,
+proof-checked by every verifier and executed to the same root), consensus `verify`
+(`verify_checks_ghost_proofs_and_size_limits`), the HTTP API, wire-form
+and bound tests and shared Rust/TypeScript vectors in `types.rs`, and the `ghost_tx` fuzz target
+with real-proof seeds (`node/fuzz`).
+
+**Not built yet.** Clients: the CLI (`blockula ghost shield|send|unshield|scan|export-viewing-key`),
+`@blockula/sdk/ghost` on a WASM build of the crate (the SDK encodes ghost txs and their sighash but
+can't prove), the MCP tools (`ghost_balance`, `ghost_send`, capped by `BLOCKULA_MAX_SEND`), and the
+explorer's ghost view. No delegated proving by default (the prover sees the witness). Also open:
+a withdraw-only mode and the migration path, `/api/ghost` commitment paging for wallet sync, and
+2-in/2-out only (no multi-action bundles).
 
 ## 9. Activation gates
 
@@ -522,5 +590,6 @@ of a more complex AIR.
   `OutgoingViewingKey.0`), field-element secrets (`sk`, `ak`, `nk`, witness values: KoalaBear
   elements can't be reliably wiped without `unsafe` volatile writes), the prover's trace and
   Plonky3's buffers, and the shared secrets and plaintexts inside encryption and ML-KEM.
-- **No WASM or TypeScript yet**; the KATs are the contract for them.
+- **No WASM yet**, so no prover in TypeScript: the SDK encodes ghost txs and their sighash
+  (vectors shared with the node) but can't prove. The KATs are the contract for a port.
 - **Timing side channels** in proving and trial decryption haven't been analyzed.

@@ -163,8 +163,14 @@ chain_params! { |day, epoch|
     // ---- Ghost Mode (section 6) ----
     /// Most FANG the shielded pool may hold (0 while Ghost Mode is off).
     ghost_pool_cap: 0, [0, MAX_SUPPLY];
+    /// Largest ghost tx (tags 50–52; the codec bound is `types::MAX_GHOST_TX_BYTES`) …
     ghost_max_tx_bytes: 256 * KIB, [0, MIB];
+    /// … and most ghost tx bytes per block (bounds proof verification per block).
     ghost_max_block_bytes: MIB, [0, CODEC_MAX_BLOCK_BYTES];
+    /// A spend's anchor stays usable this many blocks after a newer root replaced it.
+    ghost_anchor_window: 1_024, [1, 30 * day];
+    /// Flat fee on top of the byte fee for verifying a ghost tx's proof, burned.
+    ghost_verify_fee: FANG / 1_000, [0, FANG];
 }
 
 /// Highest `Vote::conviction`.

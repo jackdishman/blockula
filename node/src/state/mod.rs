@@ -80,6 +80,13 @@ pub mod ns {
     pub const BEACON_VALUES: u8 = 46;
     /// upgrade.rs (P-UPGRADE): 47, the active feature flags.
     pub const FEATURES: u8 = 47;
+    /// ghost.rs (Ghost Mode): 48–52 in use, 53–55 reserved for it, 56–63 kept for a pool
+    /// migration (a new versioned pool next to this one).
+    pub const GHOST_COMMITMENTS: u8 = 48;
+    pub const GHOST_ROOTS: u8 = 49;
+    pub const GHOST_RETIRED: u8 = 50;
+    pub const GHOST_NULLIFIERS: u8 = 51;
+    pub const GHOST_ADDRESSES: u8 = 52;
 }
 
 /// Keys of the scalar records (namespace [`ns::META`]). They're emitted sorted by key.
@@ -101,6 +108,8 @@ pub mod meta {
     pub const BEACON: &[u8] = b"beacon";
     /// The upgrade schedule (`upgrade::Upgrades::schedule`).
     pub const UPGRADE: &[u8] = b"upgrade";
+    /// Ghost Mode's scalars (`ghost::GhostMeta`).
+    pub const GHOST: &[u8] = b"ghost";
 }
 
 /// Largest record key and value a snapshot may contain (bounds allocations while decoding).
@@ -190,8 +199,8 @@ where
 
 impl State {
     /// The protocol v1 modules, whose maps and scalars are records too.
-    fn modules(&self) -> [&dyn SubState; 5] {
-        [&self.staking, &self.governance, &self.econ, &self.beacon, &self.upgrade]
+    fn modules(&self) -> [&dyn SubState; 6] {
+        [&self.staking, &self.governance, &self.econ, &self.beacon, &self.upgrade, &self.ghost]
     }
 
     /// Every map, by namespace, in namespace order. The destructuring is exhaustive on purpose:
@@ -199,7 +208,7 @@ impl State {
     /// namespace), as a module (whose own `tables` destructure exhaustively), or skipped as a
     /// scalar that `meta_records` covers, so nothing escapes the root.
     fn tables(&self) -> Vec<(u8, &dyn Table)> {
-        let State { accounts, names, supply: _, burned: _, validators, active_sets, params: _, chain_params: _, hunts, next_hunt_id: _, github, github_by_account, familiars, poc, staking, governance, econ, beacon, upgrade, tree: _ } = self;
+        let State { accounts, names, supply: _, burned: _, validators, active_sets, params: _, chain_params: _, hunts, next_hunt_id: _, github, github_by_account, familiars, poc, staking, governance, econ, beacon, upgrade, ghost, tree: _ } = self;
         let Poc { repos, souls, vouches, sybils, claims, claim_by_pr, handles, jurors, seances, grants, next_claim_id: _, next_seance_id: _, next_grant_id: _, open_seance: _, next_seance_at: _ } = poc;
         let mut t: Vec<(u8, &dyn Table)> = vec![
             (ns::ACCOUNTS, accounts),
@@ -221,7 +230,7 @@ impl State {
             (ns::SEANCES, seances),
             (ns::GRANTS, grants),
         ];
-        let modules: [&dyn SubState; 5] = [staking, governance, econ, beacon, upgrade];
+        let modules: [&dyn SubState; 6] = [staking, governance, econ, beacon, upgrade, ghost];
         for m in modules {
             t.extend(m.tables());
         }
@@ -231,7 +240,7 @@ impl State {
 
     /// [`State::tables`], mutably (same list, same order).
     fn tables_mut(&mut self) -> Vec<(u8, &mut dyn Table)> {
-        let State { accounts, names, supply: _, burned: _, validators, active_sets, params: _, chain_params: _, hunts, next_hunt_id: _, github, github_by_account, familiars, poc, staking, governance, econ, beacon, upgrade, tree: _ } = self;
+        let State { accounts, names, supply: _, burned: _, validators, active_sets, params: _, chain_params: _, hunts, next_hunt_id: _, github, github_by_account, familiars, poc, staking, governance, econ, beacon, upgrade, ghost, tree: _ } = self;
         let Poc { repos, souls, vouches, sybils, claims, claim_by_pr, handles, jurors, seances, grants, next_claim_id: _, next_seance_id: _, next_grant_id: _, open_seance: _, next_seance_at: _ } = poc;
         let mut t: Vec<(u8, &mut dyn Table)> = vec![
             (ns::ACCOUNTS, accounts),
@@ -253,7 +262,7 @@ impl State {
             (ns::SEANCES, seances),
             (ns::GRANTS, grants),
         ];
-        let modules: [&mut dyn SubState; 5] = [staking, governance, econ, beacon, upgrade];
+        let modules: [&mut dyn SubState; 6] = [staking, governance, econ, beacon, upgrade, ghost];
         for m in modules {
             t.extend(m.tables_mut());
         }
@@ -264,7 +273,7 @@ impl State {
     /// The scalar records, sorted by key. Cheap, so every commit re-checks them all. Exhaustive
     /// like [`State::tables`].
     fn meta_records(&self) -> Vec<(&'static [u8], Vec<u8>)> {
-        let State { supply, burned, params, chain_params, next_hunt_id, poc, accounts: _, names: _, validators: _, active_sets: _, hunts: _, github: _, github_by_account: _, familiars: _, staking: _, governance: _, econ: _, beacon: _, upgrade: _, tree: _ } = self;
+        let State { supply, burned, params, chain_params, next_hunt_id, poc, accounts: _, names: _, validators: _, active_sets: _, hunts: _, github: _, github_by_account: _, familiars: _, staking: _, governance: _, econ: _, beacon: _, upgrade: _, ghost: _, tree: _ } = self;
         let Poc { next_claim_id, next_seance_id, next_grant_id, open_seance, next_seance_at, repos: _, souls: _, vouches: _, sybils: _, claims: _, claim_by_pr: _, handles: _, jurors: _, seances: _, grants: _ } = poc;
         let mut m = vec![
             (meta::BURNED, encode(burned)),
@@ -298,7 +307,7 @@ impl State {
             }
             meta::SUPPLY => self.supply = decode(v)?,
             _ => {
-                let modules: [&mut dyn SubState; 5] = [&mut self.staking, &mut self.governance, &mut self.econ, &mut self.beacon, &mut self.upgrade];
+                let modules: [&mut dyn SubState; 6] = [&mut self.staking, &mut self.governance, &mut self.econ, &mut self.beacon, &mut self.upgrade, &mut self.ghost];
                 for m in modules {
                     if m.load_meta(key, v)? {
                         return Ok(());
@@ -454,14 +463,16 @@ impl State {
             }
         }
         held += p.seances.values().filter(|s| !s.closed).map(|s| s.budget as u128).sum::<u128>();
-        // The protocol v1 modules' escrows: stake and unbonding, proposal deposits, open distributions.
-        held += crate::staking::escrow(self) + crate::governance::escrow(self);
+        // The protocol v1 modules' escrows: stake and unbonding, proposal deposits, open
+        // distributions, the shielded pool.
+        held += crate::staking::escrow(self) + crate::governance::escrow(self) + crate::ghost::escrow(self);
         ensure!(held == self.supply as u128, "supply is {} drops but balances and escrows hold {held}", self.supply);
         crate::staking::check_invariants(self)?;
         crate::governance::check_invariants(self)?;
         crate::econ::check_invariants(self)?;
         crate::beacon::check_invariants(self)?;
         crate::upgrade::check_invariants(self)?;
+        crate::ghost::check_invariants(self)?;
 
         for h in open_hunts {
             let funded = h.funders.values().map(|v| v.parse::<u128>().unwrap_or(u128::MAX)).sum::<u128>();
