@@ -276,7 +276,7 @@ if (process.env.BLOCKULA_ADMIN_SEED) {
 console.log("✓ Proof of Contribution txs verify and enforce their rules");
 
 // Protocol v1 (tags 30–49): the SDK signs them and the node verifies them; modules that haven't
-// shipped yet refuse them with "not active yet". Name transfers and releases already work.
+// shipped yet refuse them with "not active yet". Names renew, transfer and release.
 const validator: string = (await client.validators()).active[0].validator.address;
 const notYet: Action[] = [
   { type: "delegate", validator, amount: "1" },
@@ -288,18 +288,22 @@ const notYet: Action[] = [
   { type: "multisig_propose", action: { type: "transfer", to: bob.address, amount: "1" } },
   { type: "beacon_commit", epoch: 1, commitment: "ab".repeat(32) },
   { type: "claim_distribution", distribution_id: 0, amount: "1", proof: ["cd".repeat(32)] },
-  { type: "renew_name", name, years: 1 },
 ];
 for (const action of notYet) {
   await assert.rejects(client.submit(await alice.build(action)), /not active yet/, action.type);
 }
+const before = await client.name(name);
+assert.equal(before.status, "active");
+const renewed = await client.submit(await alice.build({ type: "renew_name", name, years: 1 }));
+console.log("✓", renewed.summary);
+assert.equal((await client.name(name)).expires_at, before.expires_at + before.registration_blocks);
 const moved = await client.submit(await alice.build({ type: "transfer_name", name: `${name}.boo`, to: bob.address }));
 console.log("✓", moved.summary);
 assert.equal(await client.resolve(`${name}.boo`), bob.address);
 await assert.rejects(client.submit(await alice.build({ type: "release_name", name })), /belongs to/);
 console.log("✓", (await client.submit(await bob.build({ type: "release_name", name }))).summary);
 assert.equal((await client.name(name)).available, true);
-console.log("✓ protocol v1 txs verify; names transfer and release");
+console.log("✓ protocol v1 txs verify; names renew, transfer and release");
 
 const status = await client.status();
 console.log(`✓ all good at height ${status.height}, burned so far: ${status.burned_display}`);
