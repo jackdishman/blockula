@@ -449,27 +449,33 @@ where
             // Below our history (we fast-synced past it): we can't check it, so we abstain.
             None => return futures::future::pending().await,
         }
-        let executed = {
+        let (seen_already, replays, executed) = {
             let c = self.chain.lock();
-            if let Some(known) = finalized_verdict(&c, &block) {
-                return known || reject("conflicts with a finalized block");
-            }
-            if seen.iter().any(|id| c.has_tx(id)) {
-                return reject("replays an already-finalized tx");
-            }
-            c.height()
+            (finalized(&c, &block), seen.iter().any(|id| c.has_tx(id)), c.height())
         };
+        match seen_already {
+            Seen::Not => {}
+            Seen::This => return true,
+            Seen::Other => return reject("conflicts with a finalized block"),
+            Seen::Unknown => return futures::future::pending().await,
+        }
+        if replays {
+            return reject("replays an already-finalized tx");
+        }
         // CV-5: replay the unexecuted ancestors exactly, then every tx must be admittable on the
         // parent's state. Every honest verifier replays the same blocks from the same executed
         // state, so they agree; beyond `MAX_REPLAY` ancestors we abstain.
         let Some(pending) = unexecuted(parent.clone(), &mut ancestry, executed).await else { return futures::future::pending().await };
-        let tip = {
+        let (seen_already, tip) = {
             let c = self.chain.lock();
-            if let Some(known) = finalized_verdict(&c, &block) {
-                return known || reject("conflicts with a finalized block");
-            }
-            Tip::of(&c)
+            (finalized(&c, &block), Tip::of(&c))
         };
+        match seen_already {
+            Seen::Not => {}
+            Seen::This => return true,
+            Seen::Other => return reject("conflicts with a finalized block"),
+            Seen::Unknown => return futures::future::pending().await,
+        }
         let Some(mut state) = replay(tip, &parent, pending) else { return reject("builds on a block that conflicts with the finalized chain") };
         for tx in &txs {
             if let Err(e) = state.apply(tx, &chain_id, &block.proposer, block.height) {
@@ -481,14 +487,26 @@ where
     }
 }
 
-/// When we've executed `block`'s height already (we're late to vote): `Some(true)` if it's the
-/// block we executed, `Some(false)` if it conflicts with it, `None` if we haven't (or can't tell,
-/// pruned: then the caller's later checks abstain or decide).
-fn finalized_verdict(c: &Chain, block: &CBlock) -> Option<bool> {
+/// Whether we've executed a block at `block`'s height already (we're late to vote).
+enum Seen {
+    Not,
+    /// This very block: valid.
+    This,
+    /// Another one: `block` can never be finalized.
+    Other,
+    /// We have, but no longer know its hash (pruned): abstain.
+    Unknown,
+}
+
+fn finalized(c: &Chain, block: &CBlock) -> Seen {
     if c.height() < block.height {
-        return None;
+        return Seen::Not;
     }
-    c.hash_at(block.height).map(|h| h == hex::encode(block.digest.0))
+    match c.hash_at(block.height) {
+        Some(h) if h == hex::encode(block.digest.0) => Seen::This,
+        Some(_) => Seen::Other,
+        None => Seen::Unknown,
+    }
 }
 
 /// Our executed tip: height, hash and a copy of the state (O(1): its maps share structure).
@@ -1362,13 +1380,22 @@ mod tests {
             let mut app = App { chain: chain.clone(), block_time_ms: 1_000, address_prefix: "boo".into() };
             let parent = genesis_block(&g);
             let cctx = SimplexContext { round: Round::new(Epoch::zero(), View::new(1)), leader: leader.clone(), parent: (View::new(0), parent.digest()) };
+            let mut blocks = vec![];
             for junk in [false, true] {
                 chain.lock().junk_proposals = junk;
                 let ancestry = marshal::ancestry::from_iter([Arc::new(parent.clone())]);
                 let block = Application::<deterministic::Context>::propose(&mut app, (context.child("propose"), cctx.clone()), ancestry, ()).await.expect("proposes");
                 assert_eq!(block.txs.len(), junk as usize);
-                let ancestry = marshal::ancestry::from_iter([Arc::new(block), Arc::new(parent.clone())]);
+                let ancestry = marshal::ancestry::from_iter([Arc::new(block.clone()), Arc::new(parent.clone())]);
                 assert_eq!(Application::<deterministic::Context>::verify(&mut app, (context.child("verify"), cctx.clone()), ancestry).await, !junk);
+                blocks.push(block);
+            }
+            // A late voter that already executed the honest block: it's valid; the other one at
+            // that height can never be finalized.
+            chain.lock().execute(finalized_from(&blocks[0], None)).unwrap();
+            for (block, valid) in [(&blocks[0], true), (&blocks[1], false)] {
+                let ancestry = marshal::ancestry::from_iter([Arc::new(block.clone()), Arc::new(parent.clone())]);
+                assert_eq!(Application::<deterministic::Context>::verify(&mut app, (context.child("verify"), cctx.clone()), ancestry).await, valid);
             }
         });
         std::fs::remove_dir_all(home).ok();
