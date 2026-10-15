@@ -419,6 +419,10 @@ pub fn router(node: Node) -> Router {
         .route("/api/claim/{id}", get(claim))
         .route("/api/seance/{id}", get(seance))
         .route("/api/souls", get(souls))
+        .route("/api/proposals", get(proposals))
+        .route("/api/proposal/{id}", get(proposal))
+        .route("/api/distribution/{id}", get(distribution))
+        .route("/api/multisig/{account}", get(multisig))
         .route("/api/proof/{namespace}/{key}", get(proof))
         .route("/api/health", get(health))
         .route("/api/upgrade", get(upgrade))
@@ -1644,6 +1648,183 @@ async fn souls(State(n): State<Node>, Query(q): Query<LimitQuery>) -> ApiResult 
     Ok(Json(json!({ "souls": rows })))
 }
 
+// ---------------------------------------------------------------- 🏛️ Governance
+
+/// A u128 amount (vote tallies) as a string, with its display.
+fn big_amount(drops: u128) -> Value {
+    json!({ "drops": drops.to_string(), "display": fmt_fang(drops.min(u64::MAX as u128) as u64) })
+}
+
+fn proposal_json(v: &ReadView, p: &crate::governance::Proposal) -> Value {
+    let st = &v.state;
+    json!({
+        "id": p.id,
+        "title": p.title,
+        "url": p.url,
+        "kind": p.kind,
+        "summary": crate::governance::describe_kind(st, &p.kind, &|a| v.primary_name(a)),
+        "proposer": label(v, &p.proposer),
+        "deposit": p.deposit.to_string(),
+        "deposit_display": fmt_fang(p.deposit),
+        "status": p.status,
+        "created_at": p.created_at,
+        "voting_end": p.voting_end,
+        "execute_at": p.execute_at,
+        // Decided at the close; until then, what it would need now.
+        "supermajority": p.tally.as_ref().map(|t| t.supermajority).unwrap_or_else(|| crate::governance::needs_supermajority(st, &p.kind)),
+        "ayes": { "amount": big_amount(p.aye_amount), "weight": big_amount(p.aye_weight) },
+        "nays": { "amount": big_amount(p.nay_amount), "weight": big_amount(p.nay_weight) },
+        "voters": p.voters,
+        "council": p.council.iter().map(|(val, c)| json!({ "validator": label(v, val), "aye": c.aye, "voter": label(v, &c.voter) })).collect::<Vec<_>>(),
+        "tally": p.tally.as_ref().map(|t| json!({
+            "unlocked_supply": big_amount(t.unlocked),
+            "quorum": big_amount(t.quorum),
+            "quorum_reached": t.quorum_reached,
+            "supermajority": t.supermajority,
+            "council_size": t.council_size,
+            "council_ayes": t.council_ayes,
+            "council_nays": t.council_nays,
+        })),
+        "outcome": p.outcome,
+    })
+}
+
+#[derive(Deserialize)]
+struct ProposalQuery {
+    status: Option<String>,
+    limit: Option<usize>,
+}
+
+/// Proposals, newest first (`?status=voting|queued|rejected|executed|failed`), with the rules
+/// they're judged by. Proposals are few (each bonds a deposit), so this walks their map.
+async fn proposals(State(n): State<Node>, Query(q): Query<ProposalQuery>) -> ApiResult {
+    let v = n.live.view();
+    let st = &v.state;
+    let (g, cp) = (&st.governance, &st.chain_params);
+    let list: Vec<Value> = g.proposals.values().rev().filter(|p| q.status.as_deref().is_none_or(|s| p.status.as_str() == s)).take(q.limit.unwrap_or(50).min(500)).map(|p| proposal_json(&v, p)).collect();
+    let balance = |a: &str| st.account(a).balance;
+    let community = crate::chain::community(st.params.prefix());
+    Ok(Json(json!({
+        "count": g.proposals.len(),
+        "next_id": g.next_proposal_id,
+        "council_active": v.height < cp.bootstrap_end_height,
+        "spending_open": v.height >= cp.governance_spend_height,
+        "params": {
+            "proposal_deposit": cp.proposal_deposit.to_string(),
+            "proposal_deposit_display": fmt_fang(cp.proposal_deposit),
+            "voting_blocks": cp.voting_blocks,
+            "timelock_blocks": cp.timelock_blocks,
+            "lock_period_blocks": cp.lock_period_blocks,
+            "quorum_bps": cp.quorum_bps,
+            "quorum_floor": cp.quorum_floor.to_string(),
+            "quorum_floor_display": fmt_fang(cp.quorum_floor),
+            "supermajority_bps": cp.supermajority_bps,
+            "treasury_large_bps": cp.treasury_large_bps,
+            "governance_spend_height": cp.governance_spend_height,
+            "bootstrap_end_height": cp.bootstrap_end_height,
+            "multisig_expiry_blocks": cp.multisig_expiry_blocks,
+        },
+        "treasury": { "account": label(&v, &st.treasury()), "balance": balance(&st.treasury()).to_string(), "balance_display": fmt_fang(balance(&st.treasury())) },
+        "community": { "account": label(&v, &community), "balance": balance(&community).to_string(), "balance_display": fmt_fang(balance(&community)) },
+        "proposals": list,
+    })))
+}
+
+/// One proposal and its votes (up to 500, by voter).
+async fn proposal(State(n): State<Node>, Path(id): Path<u64>) -> ApiResult {
+    let v = n.live.view();
+    let g = &v.state.governance;
+    let p = g.proposals.get(&id).ok_or_else(|| not_found("proposal"))?;
+    let votes: Vec<Value> = g
+        .votes
+        .range(crate::governance::IdKey::new(id, "")..)
+        .take_while(|(k, _)| k.id == id)
+        .take(500)
+        .map(|(k, r)| json!({ "voter": label(&v, &k.account), "aye": r.aye, "amount": r.amount.to_string(), "amount_display": fmt_fang(r.amount), "conviction": r.conviction, "weight": big_amount(r.weight), "locked_until": r.locked_until, "council": r.council.as_ref().map(|c| label(&v, c)), "at": r.at }))
+        .collect();
+    let mut out = proposal_json(&v, p);
+    out["votes"] = json!(votes);
+    out["distribution"] = json!(g.distributions.contains_key(&id).then(|| format!("/api/distribution/{id}")));
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+struct DistributionQuery {
+    /// Whether this account (address or name) has claimed.
+    address: Option<String>,
+}
+
+/// A community distribution: what's left, until when, and (with `?address=`) one claim.
+async fn distribution(State(n): State<Node>, Path(id): Path<u64>, Query(q): Query<DistributionQuery>) -> ApiResult {
+    let v = n.live.view();
+    let st = &v.state;
+    let d = st.governance.distributions.get(&id).ok_or_else(|| not_found("distribution"))?;
+    let claim = match &q.address {
+        Some(a) => {
+            let addr = st.resolve(a)?;
+            let c = st.governance.distribution_claims.get(&crate::governance::IdKey::new(id, &addr));
+            Some(json!({ "account": label(&v, &addr), "claimed": c.map(|c| json!({ "amount": c.amount.to_string(), "amount_display": fmt_fang(c.amount), "at": c.at })) }))
+        }
+        None => None,
+    };
+    let remaining = d.total - d.claimed;
+    Ok(Json(json!({
+        "id": d.id,
+        "proposal": d.id,
+        "merkle_root": d.merkle_root,
+        "total": d.total.to_string(),
+        "total_display": fmt_fang(d.total),
+        "claimed": d.claimed.to_string(),
+        "claimed_display": fmt_fang(d.claimed),
+        "remaining": remaining.to_string(),
+        "remaining_display": fmt_fang(remaining),
+        "claims": d.claims,
+        "opened_at": d.opened_at,
+        "claim_until": d.claim_until,
+        "open": d.closed_at.is_none() && v.height <= d.claim_until,
+        "closed_at": d.closed_at,
+        "returned": d.returned.to_string(),
+        "returned_display": fmt_fang(d.returned),
+        "claim": claim,
+    })))
+}
+
+/// A multisig account: its threshold, owner keys and open proposals.
+async fn multisig(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
+    let v = n.live.view();
+    let st = &v.state;
+    let addr = st.resolve(&id)?;
+    let m = st.governance.multisigs.get(&addr).ok_or_else(|| not_found("multisig account"))?;
+    let owners = crate::governance::owner_keys(st, &addr);
+    let keys = st.keys_of(&addr);
+    let pending: Vec<Value> = m
+        .pending
+        .iter()
+        .filter_map(|pid| st.governance.multisig_proposals.get(pid))
+        .map(|p| {
+            let tx = Tx { chain_id: String::new(), genesis_hash: String::new(), from: addr.clone(), nonce: 0, fee: 0, tip: 0, valid_until: 0, action: p.action.clone(), memo: String::new(), public_key: String::new(), signature: String::new() };
+            json!({
+                "id": p.id,
+                "action": p.action,
+                "summary": v.describe(&tx, None),
+                "proposed_by": p.proposed_by,
+                "approvals": p.approvals,
+                "valid_approvals": p.approvals.iter().filter(|k| owners.contains(*k)).count(),
+                "created_at": p.created_at,
+                "expires_at": p.expires_at,
+                "expired": v.height > p.expires_at,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "account": label(&v, &addr),
+        "threshold": m.threshold,
+        "owners": owners.iter().map(|k| json!({ "key_id": k, "label": keys.get(k).map(|r| r.label.clone()) })).collect::<Vec<_>>(),
+        "created_at": m.created_at,
+        "pending": pending,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2124,6 +2305,73 @@ mod http_tests {
         assert_eq!(s, StatusCode::OK);
         assert_eq!(v["status"], "failed");
         assert!(v["error"].as_str().unwrap().contains("insufficient"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Governance reads: a proposal with its tally and votes, the distribution it opened and a
+    /// claim on it, a multisig account with an open proposal.
+    #[tokio::test]
+    async fn governance_endpoints() {
+        const FANG: u64 = DROPS_PER_FANG;
+        let root = std::env::temp_dir().join(format!("blockula-api-gov-{}-{}", crate::chain::now_ms(), std::process::id()));
+        let params = [("voting_blocks", 10), ("timelock_blocks", 1), ("governance_spend_height", 0), ("proposal_deposit", 10 * FANG)].into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+        let homes = Chain::summon(&root, &SummonOpts { params, ..SummonOpts::new("govapi", 1) }).unwrap();
+        // The community account, which distributions pay out of.
+        let path = homes[0].join("genesis.json");
+        let mut g = crate::chain::Genesis::load(&path).unwrap();
+        g.allocations.push(crate::chain::Allocation { address: crate::chain::community("boo"), amount: 1_000 * FANG, vesting: None, label: None });
+        std::fs::write(&path, serde_json::to_string_pretty(&g).unwrap()).unwrap();
+        let n = Node::new(Arc::new(Mutex::new(Chain::open(&homes[0]).unwrap())), None, vec![], ClientIpPolicy::default());
+        let (k, k2) = (crate::crypto::Keys::from_seed([9; 32]), crate::crypto::Keys::from_seed([10; 32]));
+        let (tree_root, proofs) = crate::governance::build_distribution(0, &[(k.address(), 3 * FANG)]).unwrap();
+        let me = {
+            let mut c = n.chain.lock();
+            c.faucet(&k.address(), 10 * FANG).unwrap();
+            let claim_until = c.height() + 100;
+            c.submit_own(Action::Propose { kind: ProposalKind::Distribution { merkle_root: hex::encode(tree_root), total: 3 * FANG, claim_until }, deposit: 10 * FANG, title: "First drop".into(), url: String::new() }, "").unwrap();
+            c.produce_block().unwrap();
+            c.submit_own(Action::Vote { proposal_id: 0, aye: true, amount: 100_000_000 * FANG, conviction: 1 }, "").unwrap();
+            for _ in 0..13 {
+                c.produce_block().unwrap();
+            }
+            let signed = |c: &Chain, signer: &crate::crypto::Keys, nonce: u64, action: Action| {
+                let mut tx = Tx { chain_id: "govapi".into(), genesis_hash: c.genesis_hash.clone(), from: k.address(), nonce, fee: 0, tip: 0, valid_until: c.height() + 50, action, memo: String::new(), public_key: hex::encode(signer.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+                tx.fee = min_fee(tx.size());
+                tx.sign(signer)
+            };
+            let k2_id = key_id(&k2.public_key());
+            let txs = vec![
+                signed(&c, &k, 0, Action::ClaimDistribution { distribution_id: 0, amount: 3 * FANG, proof: proofs[0].iter().map(hex::encode).collect() }),
+                signed(&c, &k, 1, Action::AddKey { key_id: k2_id.clone(), label: "laptop".into(), role: KeyRole::Owner }),
+                signed(&c, &k, 2, Action::MultisigCreate { owners: vec![key_id(&k.public_key()), k2_id], threshold: 2 }),
+                signed(&c, &k2, 3, Action::MultisigPropose { action: Box::new(Action::Transfer { to: c.me().unwrap(), amount: FANG }) }),
+            ];
+            c.produce_block_with(txs).unwrap();
+            c.me().unwrap()
+        };
+        let get = |uri: String| {
+            let n = n.clone();
+            async move { call(&n, "GET", &uri, None, "127.0.0.1:1").await }
+        };
+        let (s, v, _) = get("/api/proposals".into()).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!((v["count"].as_u64(), v["next_id"].as_u64(), v["params"]["voting_blocks"].as_u64(), v["council_active"].as_bool()), (Some(1), Some(1), Some(10), Some(true)));
+        let p = &v["proposals"][0];
+        assert_eq!((p["status"].as_str(), p["kind"]["type"].as_str(), p["deposit_display"].as_str()), (Some("executed"), Some("distribution"), Some("10 FANG")));
+        assert!(p["summary"].as_str().unwrap().starts_with("distribute 3 FANG from the community account"), "{p}");
+        assert_eq!(get("/api/proposals?status=voting".into()).await.1["proposals"], json!([]));
+        let (_, p, _) = get("/api/proposal/0".into()).await;
+        assert_eq!((p["votes"][0]["voter"]["address"].as_str(), p["votes"][0]["conviction"].as_u64(), p["tally"]["quorum_reached"].as_bool()), (Some(me.as_str()), Some(1), Some(true)));
+        assert_eq!((p["ayes"]["weight"]["display"].as_str(), p["distribution"].as_str()), (Some("100000000 FANG"), Some("/api/distribution/0")));
+        assert_eq!(get("/api/proposal/9".into()).await.0, StatusCode::NOT_FOUND);
+        let (_, d, _) = get(format!("/api/distribution/0?address={}", k.address())).await;
+        assert_eq!((d["claimed"].as_str(), d["remaining"].as_str(), d["claims"].as_u64(), d["open"].as_bool()), (Some("3000000000"), Some("0"), Some(1), Some(true)));
+        assert_eq!(d["claim"]["claimed"]["amount_display"], "3 FANG");
+        let (s, m, _) = get(format!("/api/multisig/{}", k.address())).await;
+        assert_eq!(s, StatusCode::OK, "{m}");
+        assert_eq!((m["threshold"].as_u64(), m["owners"].as_array().map(Vec::len), m["pending"][0]["valid_approvals"].as_u64()), (Some(2), Some(2), Some(1)));
+        assert!(m["pending"][0]["summary"].as_str().unwrap().contains("sent 1 FANG to"), "{m}");
+        assert_eq!(get(format!("/api/multisig/{me}")).await.0, StatusCode::NOT_FOUND);
         std::fs::remove_dir_all(root).ok();
     }
 }

@@ -18,9 +18,10 @@ use std::io::{Read, Write};
 /// Version of the state encoding (records, namespaces, tree). It is itself a record, so it is
 /// committed to by the root. 2: the protocol v1 scaffold (`chain_params`, account locks,
 /// validator commission, the module namespaces). 3: economics (P-ECON: name expiry, lock ids and
-/// vote locks, the `econ` scalars: fee ring, issuance year, name sweep) and staking (P-STAKE:
+/// vote locks, the `econ` scalars: fee ring, issuance year, name sweep), staking (P-STAKE:
 /// pools, delegations, unbonding entries, punished faults and liveness under namespaces 32–36, its
-/// META scalar; validator records without a bond, statuses candidate/active/removed/tombstoned).
+/// META scalar; validator records without a bond, statuses candidate/active/removed/tombstoned)
+/// and governance (P-GOV: its records and `multisig_expiry_blocks`).
 pub const SCHEMA_VERSION: u32 = 3;
 
 pub fn encode<T: BorshSerialize + ?Sized>(v: &T) -> Vec<u8> {

@@ -12,6 +12,7 @@ mod econ;
 mod epochs;
 mod genesis_builder;
 mod github;
+mod gov_cli;
 mod governance;
 mod snapshot;
 mod staking;
@@ -206,6 +207,16 @@ enum Cmd {
         #[command(subcommand)]
         cmd: contrib_cli::ContribCmd,
     },
+    /// 🏛️ Governance: propose, vote (with conviction), unlock, community distributions
+    Gov {
+        #[command(subcommand)]
+        cmd: gov_cli::GovCmd,
+    },
+    /// M-of-N accounts: create, propose, approve, show
+    Multisig {
+        #[command(subcommand)]
+        cmd: gov_cli::MultisigCmd,
+    },
     /// Become (or manage) a validator
     Validator {
         #[command(subcommand)]
@@ -335,6 +346,8 @@ fn main() -> Result<()> {
         Cmd::Hunt { cmd } => contrib_cli::hunt(cmd, &blockula_dir()),
         Cmd::Contrib { cmd } => contrib_cli::contrib(cmd, &blockula_dir()),
         Cmd::Release { cmd } => release_cli::run(cmd),
+        Cmd::Gov { cmd } => gov_cli::gov(cmd, &blockula_dir()),
+        Cmd::Multisig { cmd } => gov_cli::multisig(cmd, &blockula_dir()),
         Cmd::Keygen => {
             let k = crypto::Keys::generate();
             println!("{}", serde_json::json!({ "address": k.address(), "seed": k.seed_hex() }));

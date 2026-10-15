@@ -219,7 +219,7 @@ const created = await bob.createHunt({ repo: "jackdishman/blockula", issue: 1, a
 console.log("✓", created.summary);
 const huntId = (await client.account(bob.address)).hunts_created.at(-1);
 console.log("✓", (await alice.fundHunt(huntId, "1")).summary);
-await assert.rejects(alice.awardHunt(huntId, alice.address, 7), /creator or a validator admin/);
+await assert.rejects(alice.awardHunt(huntId, alice.address, 7), /only the hunt's creator/);
 const awarded = await bob.awardHunt(huntId, `${name}.boo`, 42, agent2.keyId);
 console.log("✓", awarded.summary);
 const h = await client.hunt(huntId);
@@ -283,7 +283,8 @@ if (process.env.BLOCKULA_ADMIN_SEED) {
 console.log("✓ Proof of Contribution txs verify and enforce their rules");
 
 // Protocol v1 (tags 30–49): the SDK signs them and the node verifies them; modules that haven't
-// shipped yet refuse them with "not active yet". Staking works; names renew, transfer and release.
+// shipped yet refuse them with "not active yet". Staking works; names renew, transfer and
+// release; governance txs (P-GOV) are live, so they're refused for their own reasons here.
 const validator: string = (await client.validators()).active[0].validator.address;
 // Staking: delegate to the dev validator, start unbonding part of it; nothing is free yet.
 console.log("✓", (await client.submit(await alice.build({ type: "delegate", validator, amount: parseFang("2").toString() }))).summary);
@@ -295,12 +296,7 @@ assert.equal(staking.delegations.find((d: any) => d.validator.address === valida
 assert.equal(staking.unbonding, parseFang("1").toString());
 console.log("✓", staking.summary);
 const notYet: Action[] = [
-  { type: "propose", kind: { type: "param_change", key: "max_validators", value: "40" }, deposit: "1", title: "e2e" },
-  { type: "vote", proposal_id: 0, aye: true, amount: "1", conviction: 1 },
-  { type: "unlock" },
-  { type: "multisig_propose", action: { type: "transfer", to: bob.address, amount: "1" } },
   { type: "beacon_commit", epoch: 1, commitment: "ab".repeat(32) },
-  { type: "claim_distribution", distribution_id: 0, amount: "1", proof: ["cd".repeat(32)] },
 ];
 for (const action of notYet) {
   await assert.rejects(client.submit(await alice.build(action)), /not active yet/, action.type);
@@ -310,6 +306,16 @@ assert.equal(before.status, "active");
 const renewed = await client.submit(await alice.build({ type: "renew_name", name, years: 1 }));
 console.log("✓", renewed.summary);
 assert.equal((await client.name(name)).expires_at, before.expires_at + before.registration_blocks);
+const governance: [Action, RegExp][] = [
+  [{ type: "propose", kind: { type: "param_change", key: "max_validators", value: "40" }, deposit: "1", title: "e2e" }, /a proposal bonds at least/],
+  [{ type: "vote", proposal_id: 1_000_000, aye: true, amount: "1", conviction: 1 }, /no proposal #1000000/],
+  [{ type: "unlock" }, /no expired vote locks/],
+  [{ type: "multisig_propose", action: { type: "transfer", to: bob.address, amount: "1" } }, /isn't a multisig account/],
+  [{ type: "claim_distribution", distribution_id: 1_000_000, amount: "1", proof: ["cd".repeat(32)] }, /no distribution #1000000/],
+];
+for (const [action, why] of governance) {
+  await assert.rejects(client.submit(await alice.build(action)), why, action.type);
+}
 const moved = await client.submit(await alice.build({ type: "transfer_name", name: `${name}.boo`, to: bob.address }));
 console.log("✓", moved.summary);
 assert.equal(await client.resolve(`${name}.boo`), bob.address);

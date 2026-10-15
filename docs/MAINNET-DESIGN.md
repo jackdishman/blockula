@@ -111,10 +111,12 @@ CBlock { version: u32, parent, height, view: u64, parent_view: u64, timestamp_ms
 - **Bootstrap council.** At genesis almost nothing can vote (insider allocations are locked and locked tokens don't vote; the treasury, community and endowment buckets are keyless). Until `bootstrap_end_height` (12 months), a proposal also passes if ⅔ of the active validator set approves it (`Vote` signed by a validator's consensus key or owner counts as that validator's council vote), provided token-weighted Nay doesn't exceed token-weighted Aye. The timelock still applies. Validators are 22–31 independent operators and the founder holds at most 2 seats, so no single party distributes or spends.
 - **Community distributions** come from the keyless community account through `Distribution { merkle_root, total, claim_until }` proposals; recipients `ClaimDistribution` with a Merkle proof (BLAKE3 leaves `(distribution_id, address, amount)`); unclaimed amounts return to the community account after `claim_until`. Criteria are published with the proposal, never before mainnet.
 - Issuance parameters can only change within code bounds (floor ≥ 0.5%, stakers' share ≥ 50%) and with a ⅔ supermajority.
+- `ActivateFeature` (security-critical switches such as Ghost Mode) also needs the ⅔ supermajority; `DeactivateFeature` takes a simple majority, so switching a feature off is never harder than switching it on.
 - The treasury is a keyless system account; only `TreasurySpend` moves funds out. Quorum has an absolute floor (`quorum_floor`, in FANG) as well as `quorum_bps`, and spending proposals are rejected before `governance_spend_height` (≈ 6 months), because almost nothing can vote at launch.
 - `MultisigCreate` turns an account into an M-of-N multisig of its owner keys: owner-only actions then need `MultisigPropose` plus approvals; session keys keep working within their limits.
 - Hunts: only the creator awards. Governance can refund a hunt's funders; nobody can redirect escrow.
 - Soul: bootstrapped by a published `soul_ledger` in genesis; after that only juries and bounded `GrantSoul` proposals change it.
+- The full rules (tally, council, deposits, the distribution Merkle format and its SDK helper, multisig) are in [GOVERNANCE.md](GOVERNANCE.md).
 
 ### 3.6 Fees and issuance (TOK-1, TOK-2)
 

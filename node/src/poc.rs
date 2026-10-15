@@ -657,6 +657,7 @@ impl State {
     /// Applies a Proof of Contribution action.
     pub(crate) fn apply_poc(&mut self, j: &mut Journal, tx: &Tx, sender: &str, signer: &str, key: &crate::chain::KeyRecord, height: u64) -> Result<()> {
         let admin = self.params.admins.iter().any(|a| a == sender);
+        let no_admins = self.params.admins.is_empty();
         let owner = key.role == KeyRole::Owner;
         let need_owner = |what: &str| -> Result<()> {
             if !owner {
@@ -664,7 +665,12 @@ impl State {
             }
             Ok(())
         };
+        // GOV-3: the admin levers exist only on chains with admins (dev and test); elsewhere they
+        // are governance proposals.
         let need_admin = |what: &str| -> Result<()> {
+            if no_admins {
+                bail!("only validator admins can {what}, and this chain has none: put it to a governance proposal");
+            }
             if !admin {
                 bail!("only validator admins can {what} (Season 0)");
             }

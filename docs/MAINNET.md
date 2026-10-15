@@ -70,10 +70,10 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
 | CV-6 | Crash-safety gaps | S, then M | Team |
 | TOK-1 | No issuance; tips buy nothing | L | Team |
 | TOK-2 | Fixed fee, first-come ordering | M | Team |
-| TOK-3 | Treasury can't spend | M | Team |
+| ✅ TOK-3 | Treasury can't spend | M | Team |
 | TOK-4 | No real genesis allocation or vesting | M | Team, Counsel |
 | GOV-1 | One admin key controls the validator set | L / XL | Team, Auditor |
-| GOV-2 | Admins can move users' escrowed bounties | S | Team |
+| ✅ GOV-2 | Admins can move users' escrowed bounties | S | Team |
 | GOV-3 | Proof of Contribution runs on admin judgment | L | Team |
 | OPS-1 | No key ceremony; no operator independence | M | Operators, Team |
 | OPS-2 | Genesis is hand-built | S–M | Team, Operators |
@@ -294,6 +294,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
 - **Why it blocks:** today it's a burn with a misleading label. If a spend path gets bolted on later, that's an unbounded power nobody designed.
 - **Done when:** spending goes through a governed action that is timelocked, approved by quorum or multisig, and publicly queued. Or the genesis allocation leaves the treasury out.
 - **Effort:** M, after GOV-1. **Who:** Team.
+- ✅ **Done (P-GOV):** only a passed `TreasurySpend` proposal moves treasury funds (after the vote, a 2-day timelock, publicly queued in `/api/proposals`), within the treasury's vesting; spends above 1% of the treasury need a ⅔ supermajority, and spending proposals are refused before `governance_spend_height` (≈ 6 months). The community bucket pays out only through `Distribution` proposals with Merkle claims; unclaimed FANG returns to it. Spec: [GOVERNANCE.md](GOVERNANCE.md).
 
 **TOK-4. No real genesis allocation or vesting.**
 - **Missing:** `summon` gives 1e9/N FANG to each validator's consensus key and 100M to the treasury (`chain.rs:1370-1372`). Nothing vests or locks up except contribution grants (`poc.rs:290-310`). The only genesis tooling is hand-editing JSON (README.md "Run your own chain").
@@ -320,12 +321,14 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
   - The admin set itself can be changed through that process.
   - Churn limits (CV-4) bound what any one approval can do.
 - **Effort:** L for multisig plus timelock, XL for full governance. **Who:** Team, Auditor.
+- ✅ **Code side (P-GOV):** mainnet has no admin keys (the genesis check refuses any), and every former lever is a proposal kind: parameters, treasury and distributions, the PoC levers, hunt refunds, upgrades and feature flags. Proposals bond a deposit (burned without quorum), take conviction-weighted votes of unlocked FANG (unvested tokens don't vote) for 7 days, then wait out a 2-day timelock; upgrades, issuance parameters and large spends need ⅔. Until the bootstrap ends (1 year), ⅔ of the active validators can pass a proposal unless token nays outweigh token ayes. M-of-N multisig accounts exist (SF-11). Every lifecycle, tally rule, kind and adversarial case is tested (`governance/tests.rs`). Spec: [GOVERNANCE.md](GOVERNANCE.md). Pending: the audit, and the validator set moving to stake (CV-2, CV-4: P-STAKE).
 
 **GOV-2. Admins can move users' escrowed bounties.**
 - **Missing:** an admin's `award_hunt` pays any open hunt's whole escrow to any address (`chain.rs:945-972`, admin check at 950-953). Admins can also cancel any hunt (`chain.rs:973-998`) and unlink any GitHub handle (`chain.rs:888-901`).
 - **Why it blocks:** one key has custody of other people's money.
 - **Done when:** only the creator, or a mechanism funders agreed to (e.g. acceptance-test Hunts), can award. Admin intervention is limited to refunding funders, via governance with a timelock.
 - **Effort:** S. **Who:** Team.
+- ✅ **Done (P-GOV):** only a hunt's creator can award it, on every chain (admins included). Without admins (mainnet), a hunt is cancelled only by its creator after expiry or by a `RefundHunt` proposal, which refunds every funder exactly; GitHub links are unlinked by their account or an `UnlinkGithub` proposal.
 
 **GOV-3. Proof of Contribution runs on admin judgment.**
 - **Missing:** Season 0 admins can:
@@ -339,6 +342,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
 - **Why it blocks:** whoever holds the key decides who earns from the pool. If Soul feeds voting weight, as PLAN.md plans, it also decides governance.
 - **Done when:** either the pool is off at genesis and turned on at an activation height once jury-run flags and revert checks exist (DEC-1), or every lever goes through governance with a timelock and an appeal path. Either way, Soul is bootstrapped by a one-time, published genesis ledger, not an ongoing grant power.
 - **Effort:** L. **Who:** Team.
+- ✅ **Levers (P-GOV):** Soul starts from the genesis `soul_ledger`; afterwards only juries and `GrantSoul` proposals (≤ 100 Soul each, timelocked) change it. `SetRepo`, `GrantSoul`, `FlagSybil`, `RejectClaim` and `Clawback` txs work only on chains with admins (dev and test); on mainnet each is a proposal, and a later proposal is the appeal path. Pending: revert attestations replacing admin rejection (P-BEACON).
 
 ### Operations
 
@@ -589,6 +593,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
 - **Missing:** any one owner key fully controls its account (`chain.rs:628-666`). Session keys can't be limited to particular modules (PLAN.md "Accounts"). Treasuries, foundations and exchanges need M-of-N.
 - **Done when:** M-of-N accounts exist (GOV-1 needs a minimal version anyway) and session keys can be scoped.
 - **Effort:** M.
+- ✅ **M-of-N (P-GOV):** `MultisigCreate` makes an account M-of-N over its owner keys; its owner keys then only sign `MultisigPropose`/`MultisigApprove` (enforced at admission), the threshold-th approval runs the action as the account, proposals expire, and key changes can't drop the owners below the threshold. Session keys keep working within their limits. Pending: module-scoped session keys.
 
 **SF-12. Secret material isn't zeroized.**
 - **Missing:** seeds sit in plain byte arrays (`crypto.rs:55-58`; `pq.rs:124-128`).

@@ -54,7 +54,7 @@ Prebuilt for macOS (Apple Silicon and Intel) and Linux (x64 and arm64), with SHA
 
 Open **Hunts** are [issues labeled `hunt`](https://github.com/jackdishman/blockula/issues?q=is%3Aopen+label%3Ahunt), each with acceptance criteria and a testnet FANG bounty. Agents are welcome as Familiars. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-Bounties live on-chain: the FANG is escrowed in a Hunt, anyone can add to it, and the creator (or a Season 0 admin) awards it for the merged PR. Browse them in the explorer's Hunts page or `GET /api/hunts`.
+Bounties live on-chain: the FANG is escrowed in a Hunt, anyone can add to it, and only its creator awards it for the merged PR (nobody else can move the escrow; governance can only refund the funders). Browse them in the explorer's Hunts page or `GET /api/hunts`.
 
 ```ts
 await wallet.linkGithub("vlad", "<gist id>");  // a public gist by @vlad containing your boo1 address verifies it
@@ -67,7 +67,7 @@ Awarding from the CLI checks GitHub first: the PR must be merged into the hunt's
 
 ```bash
 blockula hunt award 3 --pr 34 --rpc https://blockula-testnet.fly.dev            # signs with ~/.blockula/wallet.json
-blockula hunt award 3 --pr 34 --key admin.key --rpc …                           # or a Season 0 admin key
+blockula hunt award 3 --pr 34 --key creator.key --rpc …                         # or the creator's key file
 blockula hunt list | show | create | fund | cancel
 ```
 

@@ -1088,10 +1088,10 @@ impl State {
         let sender = tx.sender()?;
         let signer = tx.signer_key_id()?;
         let keys = self.keys_of(&sender);
-        let key = match keys.get(&signer) {
-            Some(k) => k.clone(),
+        let (key, consensus_key) = match keys.get(&signer) {
+            Some(k) => (k.clone(), false),
             // SF-13: a validator's consensus key may sign its system txs for its owner, who pays.
-            None => crate::staking::system_tx_key(self, tx, &sender, &signer).ok_or_else(|| anyhow!("this key isn't authorized on {}", short(&sender)))?,
+            None => (crate::staking::system_tx_key(self, tx, &sender, &signer).ok_or_else(|| anyhow!("this key isn't authorized on {}", short(&sender)))?, true),
         };
         // The block's base fee, fixed 17 blocks ahead (econ.rs), plus the tip.
         let charge = crate::econ::check_fee(self, tx, height)?;
@@ -1117,6 +1117,12 @@ impl State {
             if spent.saturating_add(amount).saturating_add(charge) > limit {
                 bail!("session key limit reached: {} per {period_blocks} blocks", fmt_fang(limit));
             }
+        }
+        // SF-11: a multisig account's owner keys only propose and approve (governance.rs). A
+        // validator's consensus key isn't one of them: it keeps signing its system txs for a
+        // multisig owner, except `UpdateValidator` (the pool's terms are the owner's call).
+        if !consensus_key || matches!(tx.action, Action::UpdateValidator { .. }) {
+            crate::governance::check_multisig_admission(self, &sender, &key, &tx.action)?;
         }
         Ok((sender, signer, key, charge))
     }
@@ -1177,7 +1183,9 @@ impl State {
         }
     }
 
-    fn apply_action(&mut self, j: &mut Journal, tx: &Tx, sender: &str, signer: &str, key: &KeyRecord, height: u64) -> Result<()> {
+    /// The action phase of `apply_j` (no fee, nonce or admission). Multisig accounts run their
+    /// approved actions through it too (governance.rs).
+    pub(crate) fn apply_action(&mut self, j: &mut Journal, tx: &Tx, sender: &str, signer: &str, key: &KeyRecord, height: u64) -> Result<()> {
         let sender = sender.to_string();
         match &tx.action {
             Action::Transfer { to, amount } => {
@@ -1326,11 +1334,12 @@ impl State {
                 if h.status != HuntStatus::Open {
                     bail!("hunt #{hunt_id} is already {:?}", h.status);
                 }
-                let admin = self.params.admins.contains(&sender);
-                if h.creator != sender && !admin {
-                    bail!("only the hunt's creator or a validator admin can award it");
+                // GOV-2: only the creator awards; nobody else can direct a hunt's escrow (governance
+                // can only refund its funders, `RefundHunt`).
+                if h.creator != sender {
+                    bail!("only the hunt's creator can award it");
                 }
-                if h.creator == sender && key.role != KeyRole::Owner {
+                if key.role != KeyRole::Owner {
                     bail!("only owner keys can award hunts");
                 }
                 let to = self.resolve(to)?;
@@ -1354,10 +1363,12 @@ impl State {
                 if h.status != HuntStatus::Open {
                     bail!("hunt #{hunt_id} is already {:?}", h.status);
                 }
+                // Cancelling refunds every funder exactly (it can't redirect escrow). Admins exist only
+                // on dev and test chains; elsewhere governance refunds (`RefundHunt`).
                 let admin = self.params.admins.contains(&sender);
                 if !admin {
                     if h.creator != sender {
-                        bail!("only the hunt's creator (after it expires) or a validator admin can cancel it");
+                        bail!("only the hunt's creator (after it expires) or a governance refund can cancel it");
                     }
                     if height <= h.expires_at {
                         bail!("hunt #{hunt_id} can be cancelled by its creator after block {}", h.expires_at);
@@ -4009,8 +4020,10 @@ mod hunts {
         assert_eq!(t.c.state.hunts[&id].amount, 57 * DROPS_PER_FANG);
         assert_eq!(t.c.state.hunts[&id].contribution(&bob.address()), 7 * DROPS_PER_FANG);
         assert!(t.tx(&bob, Action::FundHunt { hunt_id: id, amount: 1 }).is_err(), "min funding");
-        // Only the creator or an admin awards.
-        assert!(t.tx(&bob, Action::AwardHunt { hunt_id: id, to: bob.address(), pr: 9, familiar_key: None }).unwrap_err().to_string().contains("creator or a validator admin"));
+        // Only the creator awards (GOV-2): not a funder, not an admin.
+        assert!(t.tx(&bob, Action::AwardHunt { hunt_id: id, to: bob.address(), pr: 9, familiar_key: None }).unwrap_err().to_string().contains("only the hunt's creator"));
+        let admin = t.admin.clone_keys();
+        assert!(t.tx(&admin, Action::AwardHunt { hunt_id: id, to: admin.address(), pr: 9, familiar_key: None }).unwrap_err().to_string().contains("only the hunt's creator"));
         let c0 = t.bal(&carol);
         t.tx(&alice, Action::AwardHunt { hunt_id: id, to: carol.address(), pr: 9, familiar_key: None }).unwrap();
         assert_eq!(t.bal(&carol), c0 + 57 * DROPS_PER_FANG);
@@ -4523,15 +4536,15 @@ mod scaffold {
         let (owner, bob) = (keys(22), keys(24));
         let v = Keys::from_seed(VALIDATOR).address();
         // Modules that haven't landed refuse their txs; a block carrying one charges its fee.
-        let propose = signed(&c, &owner, Action::Propose { kind: ProposalKind::Text {}, deposit: FANG, title: "t".into(), url: String::new() });
-        assert_eq!(c.submit(propose.clone()).unwrap_err().to_string(), "not active yet");
-        for action in [Action::BeaconCommit { epoch: 1, commitment: "ab".repeat(32) }] {
+        let pending = signed(&c, &owner, Action::BeaconCommit { epoch: 1, commitment: "ab".repeat(32) });
+        assert_eq!(c.submit(pending.clone()).unwrap_err().to_string(), "not active yet");
+        for action in [Action::BeaconReveal { epoch: 1, secret: "ab".repeat(32) }] {
             assert_eq!(c.submit(signed(&c, &owner, action)).unwrap_err().to_string(), "not active yet");
         }
         let before = c.state.account(&owner.address()).balance;
-        c.produce_block_with(vec![propose.clone()]).unwrap();
-        assert_eq!(c.failure(&propose.id()).unwrap().0, "not active yet");
-        assert_eq!(c.state.account(&owner.address()).balance, before - propose.charge().unwrap());
+        c.produce_block_with(vec![pending.clone()]).unwrap();
+        assert_eq!(c.failure(&pending.id()).unwrap().0, "not active yet");
+        assert_eq!(c.state.account(&owner.address()).balance, before - pending.charge().unwrap());
         // Reserved names can't be registered; names transfer and release.
         assert!(c.submit(signed(&c, &owner, Action::RegisterName { name: "blockula".into() })).unwrap_err().to_string().contains("reserved"));
         c.submit(signed(&c, &owner, Action::RegisterName { name: "owner".into() })).unwrap();

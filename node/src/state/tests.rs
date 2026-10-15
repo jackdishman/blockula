@@ -391,8 +391,8 @@ fn namespaces_and_meta_keys_are_unique() {
 /// computed by an independent JS implementation of the record layout and tree (noble BLAKE3),
 /// recomputed when `Params` gained `address_prefix` (P-WIRE) and again for the protocol v1
 /// scaffold (schema 2: `chain_params`, the upgrade schedule, account locks). Schema 3 (P-ECON:
-/// the `econ` scalar record; P-STAKE: staking's scalar) changed it again; that value is from this
-/// implementation only.
+/// the `econ` scalar record; P-STAKE: staking's scalar; P-GOV: the `governance` scalars,
+/// `multisig_expiry_blocks`) changed it again; that value is from this implementation only.
 #[test]
 fn golden_encodings() {
     let acct = Account { balance: 5, nonce: 2, keys: Default::default(), locks: vec![] };
@@ -402,8 +402,8 @@ fn golden_encodings() {
     st.supply = 5;
     st.commit_block().unwrap();
     assert_eq!(st.root_hash(), st.full_root());
-    assert_eq!(st.record_count(), 11);
-    assert_eq!(st.root(), "6f696b8a7d1eefaa0471cbd9c186366ef8456f1d2787277344f4c6ce53444ad4");
+    assert_eq!(st.record_count(), 12);
+    assert_eq!(st.root(), "75a05f23c64acdac9fc75b26e8e30d65dfc617508d9841ca7683d9f139831cf6");
 }
 
 fn million_accounts() -> State {
@@ -564,6 +564,24 @@ fn largest_records_fit_in_a_snapshot() {
         sk.entries.insert(format!("{}/{:020}", addr(0), u64::MAX), Entry::Redelegation { from: addr(1), to: addr(2), amount: u64::MAX, started_at: u64::MAX, release_at: u64::MAX });
         sk.punished.insert(format!("{}/{:020}/{:020}", addr(1), u64::MAX, u64::MAX), Punished { kind: u8::MAX, height: u64::MAX, reporter: addr(2), slashed: u64::MAX });
         sk.liveness.insert(addr(1), Liveness { window, bits: vec![0xff; window.div_ceil(8) as usize], next: u64::MAX, filled: u64::MAX, missed: u64::MAX, led: u64::MAX, missed_total: u64::MAX });
+    }
+    // Governance: a proposal with a full council and every string at its bound, a vote, a
+    // multisig with every pending slot, its proposal carrying the largest action an owner can
+    // propose (evidence at its bound) approved by every key, a distribution and a claim.
+    {
+        use crate::governance::*;
+        let council = st.active_sets[&0].iter().map(|v| (v.clone(), CouncilVote { aye: true, voter: addr(0) })).collect();
+        let tally = Tally { unlocked: u128::MAX, quorum: u128::MAX, quorum_reached: true, supermajority: true, council_size: u64::MAX, council_ayes: u64::MAX, council_nays: u64::MAX };
+        let kind = ProposalKind::GrantSoul { to: addr(1), amount: u64::MAX, reason: s(MAX_REASON) };
+        let proposal = Proposal { id: u64::MAX, proposer: addr(0), kind, title: s(MAX_PROPOSAL_TITLE), url: s(MAX_URL), deposit: u64::MAX, created_at: 0, voting_end: 0, execute_at: Some(0), status: ProposalStatus::Failed, aye_amount: u128::MAX, nay_amount: u128::MAX, aye_weight: u128::MAX, nay_weight: u128::MAX, voters: u64::MAX, council, tally: Some(tally), outcome: s(512) };
+        let g = &mut st.governance;
+        g.proposals.insert(u64::MAX, proposal);
+        g.votes.insert(IdKey::new(u64::MAX, &addr(0)), VoteRecord { aye: true, amount: u64::MAX, conviction: u8::MAX, weight: u128::MAX, lock_amount: u64::MAX, locked_until: u64::MAX, council: Some(addr(1)), at: 0 });
+        g.multisigs.insert(addr(0), Multisig { threshold: u8::MAX, created_at: 0, pending: (0..MAX_MULTISIG_PENDING as u64).collect() });
+        let action = Action::ReportEquivocation { evidence: "ab".repeat(MAX_EVIDENCE_BYTES) };
+        g.multisig_proposals.insert(u64::MAX, MultisigProposal { id: u64::MAX, account: addr(0), action, proposed_by: hex32(0), approvals: (0..MAX_KEYS as u64).map(hex32).collect(), created_at: 0, expires_at: 0 });
+        g.distributions.insert(u64::MAX, Distribution { id: u64::MAX, merkle_root: hex32(0), total: u64::MAX, claimed: u64::MAX, claims: u64::MAX, opened_at: 0, claim_until: 0, closed_at: Some(0), returned: u64::MAX });
+        g.distribution_claims.insert(IdKey::new(u64::MAX, &addr(0)), DistributionClaim { amount: u64::MAX, at: 0 });
     }
 
     let mut largest = std::collections::BTreeMap::new();

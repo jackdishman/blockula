@@ -24,6 +24,7 @@ mod node_src {
     pub mod epochs;
     pub mod genesis_builder;
     pub mod github;
+    pub mod gov_cli;
     pub mod governance;
     pub mod node;
     pub mod params;
