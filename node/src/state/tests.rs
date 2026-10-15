@@ -42,7 +42,7 @@ fn sim(tag: &str) -> Sim {
 /// An unsigned tx (the state machine doesn't check signatures; admission and block verification
 /// do), so random sequences don't pay for ML-DSA. Valid for the next 100 blocks.
 fn tx(c: &Chain, signer: &Keys, from: &str, action: Action) -> Tx {
-    let mut tx = Tx { chain_id: c.genesis.chain_id.clone(), from: from.into(), nonce: c.state.account(from).nonce, fee: 0, tip: 0, valid_until: c.height() + 100, action, memo: String::new(), public_key: hex::encode(signer.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+    let mut tx = Tx { chain_id: c.genesis.chain_id.clone(), genesis_hash: c.genesis_hash.clone(), from: from.into(), nonce: c.state.account(from).nonce, fee: 0, tip: 0, valid_until: c.height() + 100, action, memo: String::new(), public_key: hex::encode(signer.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
     tx.fee = min_fee(tx.size());
     tx
 }

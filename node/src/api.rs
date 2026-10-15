@@ -633,11 +633,11 @@ async fn submit(State(n): State<Node>, ConnectInfo(peer): ConnectInfo<SocketAddr
 
 async fn submit_inner(n: &Node, headers: &HeaderMap, client: Option<IpAddr>, tx: Tx) -> ApiResult {
     // Format + ML-DSA signature checks run without the chain lock.
-    let (chain_id, prefix, role) = {
+    let (chain_id, genesis_hash, prefix, role) = {
         let v = n.live.view();
-        (v.genesis.chain_id.clone(), v.genesis.address_prefix.clone(), v.role)
+        (v.genesis.chain_id.clone(), v.genesis_hash.clone(), v.genesis.address_prefix.clone(), v.role)
     };
-    crate::consensus::check_tx_stateless(&tx, &chain_id, &prefix)?;
+    crate::consensus::check_tx_stateless(&tx, &chain_id, &genesis_hash, &prefix)?;
     if role == Role::FullNode {
         if forwarded(headers) {
             return Err(ApiError(StatusCode::LOOP_DETECTED, "forwarding loop: this full node was sent a forwarded tx".into()));
@@ -1518,7 +1518,7 @@ mod http_tests {
             let mut c = n.chain.lock();
             c.faucet(&alice.address(), 10 * DROPS_PER_FANG).unwrap();
             c.produce_block().unwrap();
-            let mut t = Tx { chain_id: "nolock".into(), from: alice.address(), nonce: 0, fee: 0, tip: 0, valid_until: 50, action: Action::RegisterName { name: "alice".into() }, memo: String::new(), public_key: hex::encode(alice.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+            let mut t = Tx { chain_id: "nolock".into(), genesis_hash: c.genesis_hash.clone(), from: alice.address(), nonce: 0, fee: 0, tip: 0, valid_until: 50, action: Action::RegisterName { name: "alice".into() }, memo: String::new(), public_key: hex::encode(alice.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
             t.fee = min_fee(t.size());
             c.submit(t.sign(&alice)).unwrap();
             c.produce_block().unwrap();
@@ -1645,8 +1645,9 @@ mod http_tests {
         n.chain.lock().produce_block().unwrap();
         let me = n.chain.lock().me().unwrap();
         let valid_until = n.chain.lock().height() + 100;
+        let genesis_hash = n.chain.lock().genesis_hash.clone();
         let mk = |nonce: u64| {
-            let mut tx = Tx { chain_id: "txfail".into(), from: k.address(), nonce, fee: 0, tip: 0, valid_until, action: Action::Transfer { to: me.clone(), amount: 6 * DROPS_PER_FANG }, memo: String::new(), public_key: hex::encode(k.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+            let mut tx = Tx { chain_id: "txfail".into(), genesis_hash: genesis_hash.clone(), from: k.address(), nonce, fee: 0, tip: 0, valid_until, action: Action::Transfer { to: me.clone(), amount: 6 * DROPS_PER_FANG }, memo: String::new(), public_key: hex::encode(k.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
             tx.fee = min_fee(tx.size());
             tx.sign(&k)
         };

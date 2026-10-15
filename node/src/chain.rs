@@ -2857,6 +2857,7 @@ impl Chain {
     }
 
     fn admit_to_mempool(&mut self, tx: Tx, evict: bool) -> Result<(String, bool)> {
+        tx.check_chain(&self.genesis.chain_id, &self.genesis_hash)?;
         tx.check_format()?;
         let id = tx.id();
         if self.pool.contains(&id) || self.has_tx(&id) {
@@ -3048,6 +3049,7 @@ impl Chain {
         let from = keys.address_with(self.state.params.prefix());
         let mut tx = Tx {
             chain_id: self.genesis.chain_id.clone(),
+            genesis_hash: self.genesis_hash.clone(),
             nonce: self.next_nonce(&from),
             from,
             fee: 0,
@@ -3307,7 +3309,7 @@ mod tests {
             let mut c = Chain::open(&home).unwrap();
             c.faucet(&alice.address(), 50 * DROPS_PER_FANG).unwrap();
             c.produce_block().unwrap();
-            let mut tx = Tx { chain_id: "test-1".into(), from: alice.address(), nonce: 0, fee: 0, tip: 0, valid_until: c.height() + 100, action: Action::RegisterName { name: "alice".into() }, memo: String::new(), public_key: String::new(), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+            let mut tx = Tx { chain_id: "test-1".into(), genesis_hash: c.genesis_hash.clone(), from: alice.address(), nonce: 0, fee: 0, tip: 0, valid_until: c.height() + 100, action: Action::RegisterName { name: "alice".into() }, memo: String::new(), public_key: String::new(), signature: "00".repeat(crypto::SIGNATURE_LEN) };
             tx.public_key = hex::encode(alice.public_key());
             tx.fee = min_fee(tx.size());
             c.submit(tx.sign(&alice)).unwrap();
@@ -3321,7 +3323,7 @@ mod tests {
     }
 
     fn signed(c: &Chain, from: &str, keys: &Keys, nonce: u64, action: Action) -> Tx {
-        let mut tx = Tx { chain_id: c.genesis.chain_id.clone(), from: from.into(), nonce, fee: 0, tip: 0, valid_until: c.height() + 100, action, memo: String::new(), public_key: hex::encode(keys.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+        let mut tx = Tx { chain_id: c.genesis.chain_id.clone(), genesis_hash: c.genesis_hash.clone(), from: from.into(), nonce, fee: 0, tip: 0, valid_until: c.height() + 100, action, memo: String::new(), public_key: hex::encode(keys.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
         tx.fee = min_fee(tx.size());
         tx.sign(keys)
     }
@@ -3385,15 +3387,16 @@ mod audit {
     }
 
     fn signed_fee(c: &Chain, from: &str, keys: &Keys, nonce: u64, action: Action, fee: Option<u64>) -> Tx {
-        let mut tx = Tx { chain_id: c.genesis.chain_id.clone(), from: from.into(), nonce, fee: 0, tip: 0, valid_until: c.height() + 1_000, action, memo: String::new(), public_key: hex::encode(keys.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+        let mut tx = Tx { chain_id: c.genesis.chain_id.clone(), genesis_hash: c.genesis_hash.clone(), from: from.into(), nonce, fee: 0, tip: 0, valid_until: c.height() + 1_000, action, memo: String::new(), public_key: hex::encode(keys.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
         tx.fee = fee.unwrap_or_else(|| min_fee(tx.size()));
         tx.sign(keys)
     }
 
-    /// Unsigned (zero signature) tx: the state machine doesn't verify signatures (admission and
-    /// block verification do), so benchmarks can skip ML-DSA signing. Valid through block 1,000.
-    fn unsigned(chain_id: &str, from: &Keys, nonce: u64, action: Action) -> Tx {
-        let mut tx = Tx { chain_id: chain_id.into(), from: from.address(), nonce, fee: 0, tip: 0, valid_until: 1_000, action, memo: String::new(), public_key: hex::encode(from.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+    /// Unsigned (zero signature) tx on the `audit` chain whose genesis hash is given: the state
+    /// machine doesn't verify signatures (admission and block verification do), so benchmarks can
+    /// skip ML-DSA signing. Valid through block 1,000.
+    fn unsigned(genesis_hash: &str, from: &Keys, nonce: u64, action: Action) -> Tx {
+        let mut tx = Tx { chain_id: "audit".into(), genesis_hash: genesis_hash.into(), from: from.address(), nonce, fee: 0, tip: 0, valid_until: 1_000, action, memo: String::new(), public_key: hex::encode(from.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
         tx.fee = min_fee(tx.size());
         tx
     }
@@ -3443,7 +3446,7 @@ mod audit {
         let mut m = tx.clone();
         m.signature = m.signature.to_uppercase();
         assert_eq!(m.id(), orig_id, "id is over the decoded signature bytes");
-        assert!(crate::consensus::check_tx_stateless(&m, "audit", "boo").is_err(), "uppercase hex is rejected");
+        assert!(crate::consensus::check_tx_stateless(&m, "audit", &c.genesis_hash, "boo").is_err(), "uppercase hex is rejected");
         assert!(c.submit(m).is_err());
         c.submit(tx).unwrap();
         c.produce_block().unwrap();
@@ -3579,6 +3582,7 @@ mod audit {
     #[test]
     fn mempool_admission_stays_fast_when_full() {
         let (_h, mut c) = fresh("mp");
+        let gh = c.genesis_hash.clone();
         let senders: Vec<Keys> = (0..79u32).map(|i| Keys::from_seed(crypto::hash(&i.to_le_bytes()))).collect();
         for k in &senders {
             c.state.accounts.insert(k.address(), Account { balance: 1_000 * DROPS_PER_FANG, ..Default::default() });
@@ -3591,7 +3595,7 @@ mod audit {
                 if c.mempool.len() >= MAX_MEMPOOL {
                     break 'fill;
                 }
-                c.submit(unsigned("audit", k, n, Action::Transfer { to: me.clone(), amount: 1 })).unwrap();
+                c.submit(unsigned(&gh, k, n, Action::Transfer { to: me.clone(), amount: 1 })).unwrap();
             }
         }
         let fill = t.elapsed();
@@ -3599,7 +3603,7 @@ mod audit {
         let x = Keys::from_seed([77u8; 32]);
         c.state.accounts.insert(x.address(), Account { balance: 100 * DROPS_PER_FANG, ..Default::default() });
         c.state.supply += 100 * DROPS_PER_FANG;
-        let mut tx = unsigned("audit", &x, 0, Action::Transfer { to: me.clone(), amount: 1 });
+        let mut tx = unsigned(&gh, &x, 0, Action::Transfer { to: me.clone(), amount: 1 });
         let lowball = Tx { tip: 0, ..tx.clone() };
         assert!(c.submit(lowball).unwrap_err().to_string().contains("mempool is full; resubmit with a tip of at least 1 drops"));
         tx.tip = 1; // outbids the cheapest (no tip), so it evicts one
@@ -3625,8 +3629,8 @@ mod audit {
     }
 
     /// An unsigned tx `from` an account, by `signer`, paying `tip` (fee = the exact charge).
-    fn unsigned_as(from: &str, signer: &Keys, nonce: u64, tip: u64, action: Action) -> Tx {
-        let mut tx = Tx { chain_id: "audit".into(), from: from.into(), nonce, fee: 0, tip, valid_until: 1_000, action, memo: String::new(), public_key: hex::encode(signer.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+    fn unsigned_as(genesis_hash: &str, from: &str, signer: &Keys, nonce: u64, tip: u64, action: Action) -> Tx {
+        let mut tx = Tx { chain_id: "audit".into(), genesis_hash: genesis_hash.into(), from: from.into(), nonce, fee: 0, tip, valid_until: 1_000, action, memo: String::new(), public_key: hex::encode(signer.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
         tx.fee = tx.charge().unwrap();
         tx
     }
@@ -3646,6 +3650,32 @@ mod audit {
         c.state.supply += balance;
     }
 
+    /// Audit #7: a relaunched chain that keeps its id (the testnet re-summoned) has another genesis,
+    /// so txs signed on the old instance don't replay on it, though nonces and balances line up.
+    #[test]
+    fn txs_dont_replay_on_a_relaunch_with_the_same_chain_id() {
+        let (_h1, mut old) = fresh("relaunch-old");
+        let (_h2, mut new) = fresh("relaunch-new");
+        assert_eq!(old.genesis.chain_id, new.genesis.chain_id);
+        assert_ne!(old.genesis_hash, new.genesis_hash);
+        let a = Keys::from_seed([3; 32]);
+        for c in [&mut old, &mut new] {
+            fund(c, &a, 10 * DROPS_PER_FANG);
+            c.produce_block_with(vec![]).unwrap();
+        }
+        let pay = Action::Transfer { to: Keys::from_seed([4; 32]).address(), amount: DROPS_PER_FANG };
+        let tx = signed_fee(&old, &a.address(), &a, 0, pay, None);
+        crate::consensus::check_tx_stateless(&tx, "audit", &old.genesis_hash, "boo").unwrap();
+        old.submit(tx.clone()).unwrap();
+        // HTTP, gossip and block verification run check_tx_stateless; the mempool checks too.
+        let err = crate::consensus::check_tx_stateless(&tx, "audit", &new.genesis_hash, "boo").unwrap_err().to_string();
+        assert!(err.contains("another instance of audit"), "{err}");
+        assert!(new.submit(tx.clone()).unwrap_err().to_string().contains("another instance"));
+        // Pointing it at the new instance breaks its signature.
+        let moved = Tx { genesis_hash: new.genesis_hash.clone(), ..tx };
+        assert!(crate::consensus::check_tx_stateless(&moved, "audit", &new.genesis_hash, "boo").is_err());
+    }
+
     /// Audit #10, PoC 1: the owner queues `RemoveKey(agent)`, then the agent queues transfers.
     /// Admission used to check them against the state before the removal (it only reserved
     /// balance and bumped the nonce), so 63 of 64 got in though none could ever execute. Now the
@@ -3654,16 +3684,17 @@ mod audit {
     #[test]
     fn txs_behind_a_key_removal_are_refused() {
         let (_h, mut c) = fresh("rmkey");
+        let gh = c.genesis_hash.clone();
         let (owner, agent) = (Keys::from_seed([1; 32]), Keys::from_seed([2; 32]));
         let acct = with_agent(&mut c, &owner, &agent, 1_000 * DROPS_PER_FANG, 1_000 * DROPS_PER_FANG);
         c.produce_block_with(vec![]).unwrap();
         let me = c.me().unwrap();
-        let pay = |signer: &Keys, n: u64| unsigned_as(&acct, signer, n, 1, Action::Transfer { to: me.clone(), amount: 0 });
+        let pay = |signer: &Keys, n: u64| unsigned_as(&gh, &acct, signer, n, 1, Action::Transfer { to: me.clone(), amount: 0 });
         let (agent_kid, remove) = (key_id(&agent.public_key()), Action::RemoveKey { key_id: key_id(&agent.public_key()) });
-        c.submit(unsigned_as(&acct, &owner, 0, 0, remove.clone())).unwrap();
+        c.submit(unsigned_as(&gh, &acct, &owner, 0, 0, remove.clone())).unwrap();
         // None gets in (each is a different tx for the next nonce).
         for amount in 0..MAX_PENDING_PER_SENDER as u64 - 1 {
-            let err = c.submit(unsigned_as(&acct, &agent, 1, 1, Action::Transfer { to: me.clone(), amount })).unwrap_err().to_string();
+            let err = c.submit(unsigned_as(&gh, &acct, &agent, 1, 1, Action::Transfer { to: me.clone(), amount })).unwrap_err().to_string();
             assert!(err.contains("isn't authorized"), "{err}");
         }
         // A full node tracking a forwarded tx runs the same check.
@@ -3676,12 +3707,12 @@ mod audit {
         // The agent again, then 62 of its transfers and the owner's removal behind them: all in,
         // all executed.
         let add = Action::AddKey { key_id: agent_kid, label: "agent".into(), role: KeyRole::Session { limit: 1_000 * DROPS_PER_FANG, period_blocks: 100, expires_at: 10_000 } };
-        c.submit(unsigned_as(&acct, &owner, 2, 0, add)).unwrap();
+        c.submit(unsigned_as(&gh, &acct, &owner, 2, 0, add)).unwrap();
         c.produce_block().unwrap();
         for n in 3..65 {
             c.submit(pay(&agent, n)).unwrap();
         }
-        c.submit(unsigned_as(&acct, &owner, 65, 0, remove)).unwrap();
+        c.submit(unsigned_as(&gh, &acct, &owner, 65, 0, remove)).unwrap();
         assert_eq!(c.mempool.len(), 63);
         c.produce_block().unwrap();
         let b = c.block(c.height()).unwrap();
@@ -3693,9 +3724,10 @@ mod audit {
     #[test]
     fn txs_past_a_session_limit_are_refused() {
         let (_h, mut c) = fresh("limit");
+        let gh = c.genesis_hash.clone();
         let (owner, agent) = (Keys::from_seed([1; 32]), Keys::from_seed([2; 32]));
         let me = c.me().unwrap();
-        let pay = |n: u64, tip: u64| unsigned_as(&owner.address(), &agent, n, tip, Action::Transfer { to: me.clone(), amount: 0 });
+        let pay = |n: u64, tip: u64| unsigned_as(&gh, &owner.address(), &agent, n, tip, Action::Transfer { to: me.clone(), amount: 0 });
         with_agent(&mut c, &owner, &agent, pay(0, 1).charge().unwrap(), 100 * DROPS_PER_FANG);
         c.produce_block_with(vec![]).unwrap();
         c.submit(pay(0, 1)).unwrap();
@@ -3717,9 +3749,10 @@ mod audit {
     #[test]
     fn phantom_txs_cannot_fill_the_mempool() {
         let (_h, mut c) = fresh("fill");
+        let gh = c.genesis_hash.clone();
         let me = c.me().unwrap();
         let accounts: Vec<(Keys, Keys)> = (0..79u32).map(|i| (Keys::from_seed(crypto::hash(&i.to_le_bytes())), Keys::from_seed(crypto::hash(&(i + 500).to_le_bytes())))).collect();
-        let pay = |(owner, agent): &(Keys, Keys), n: u64| unsigned_as(&owner.address(), agent, n, 1, Action::Transfer { to: me.clone(), amount: 0 });
+        let pay = |(owner, agent): &(Keys, Keys), n: u64| unsigned_as(&gh, &owner.address(), agent, n, 1, Action::Transfer { to: me.clone(), amount: 0 });
         let limit = pay(&accounts[0], 0).charge().unwrap();
         for (owner, agent) in &accounts {
             with_agent(&mut c, owner, agent, limit, 10 * DROPS_PER_FANG);
@@ -3735,7 +3768,7 @@ mod audit {
         }
         assert_eq!((admitted, c.mempool.len()), (79, 79));
         for n in 0..MAX_PENDING_PER_SENDER as u64 {
-            c.submit(unsigned("audit", &honest, n, Action::Transfer { to: me.clone(), amount: 1 })).unwrap();
+            c.submit(unsigned(&gh, &honest, n, Action::Transfer { to: me.clone(), amount: 1 })).unwrap();
         }
         assert_eq!(c.mempool.len(), 79 + 64, "nothing was evicted");
         let burned = c.state.burned;
@@ -3751,12 +3784,13 @@ mod audit {
     #[test]
     fn dropped_txs_take_their_successors() {
         let (_h, mut c) = fresh("gap");
+        let gh = c.genesis_hash.clone();
         let (a, b) = (Keys::from_seed([5; 32]), Keys::from_seed([6; 32]));
         fund(&mut c, &a, 100 * DROPS_PER_FANG);
         fund(&mut c, &b, 100 * DROPS_PER_FANG);
         c.produce_block_with(vec![]).unwrap();
         let me = c.me().unwrap();
-        let pay = |n: u64, amount: u64| unsigned("audit", &a, n, Action::Transfer { to: me.clone(), amount });
+        let pay = |n: u64, amount: u64| unsigned(&gh, &a, n, Action::Transfer { to: me.clone(), amount });
         let ids: Vec<String> = (0..3).map(|n| c.submit(pay(n, 1)).unwrap()).collect();
         // A full node whose forward failed drops the first: all three go.
         c.drop_pending(&ids[0]);
@@ -3770,9 +3804,9 @@ mod audit {
         assert_eq!(c.mempool.iter().map(|t| t.nonce).collect::<Vec<_>>(), vec![1, 2]);
         // Nonce 1 registers a name someone else takes first: it can't run, so nonce 2 goes too.
         c.drop_pending(&c.mempool_ids[0].clone());
-        c.submit(unsigned("audit", &a, 1, Action::RegisterName { name: "taken".into() })).unwrap();
+        c.submit(unsigned(&gh, &a, 1, Action::RegisterName { name: "taken".into() })).unwrap();
         c.submit(pay(2, 1)).unwrap();
-        c.produce_block_with(vec![unsigned("audit", &b, 0, Action::RegisterName { name: "taken".into() })]).unwrap();
+        c.produce_block_with(vec![unsigned(&gh, &b, 0, Action::RegisterName { name: "taken".into() })]).unwrap();
         assert!(c.mempool.is_empty());
         let (h, _) = (c.height(), ());
         assert!(c.failure(&pay(2, 1).id()).unwrap().0.contains("an earlier transaction from the same account was dropped"), "at {h}");
@@ -3784,12 +3818,13 @@ mod audit {
     #[test]
     fn admission_cost_doesnt_grow_with_the_queue() {
         let (_h, mut c) = fresh("flat");
+        let gh = c.genesis_hash.clone();
         let me = c.me().unwrap();
         let (x, y) = (Keys::from_seed([40; 32]), Keys::from_seed([41; 32]));
         fund(&mut c, &x, 100 * DROPS_PER_FANG);
         fund(&mut c, &y, 100 * DROPS_PER_FANG);
         c.produce_block_with(vec![]).unwrap();
-        let pay = |k: &Keys, n: u64| unsigned("audit", k, n, Action::Transfer { to: me.clone(), amount: 1 });
+        let pay = |k: &Keys, n: u64| unsigned(&gh, k, n, Action::Transfer { to: me.clone(), amount: 1 });
         let mut times = vec![];
         for n in 0..MAX_PENDING_PER_SENDER as u64 {
             let tx = pay(&x, n);
@@ -3829,6 +3864,7 @@ mod audit {
     #[test]
     fn big_state_block_execution() {
         let (_h, mut c) = fresh("clone");
+        let gh = c.genesis_hash.clone();
         for i in 0..200_000u64 {
             c.state.accounts.insert(crypto::address_from_bytes(&crypto::hash(&i.to_le_bytes())), Account { balance: DROPS_PER_FANG, ..Default::default() });
         }
@@ -3840,7 +3876,7 @@ mod audit {
         // The accounts were inserted behind the chain's back: an untimed block writes them to the
         // state database (one 200k-record commit), so the timed one is a block over a big state.
         c.produce_block_with(vec![]).unwrap();
-        let txs: Vec<Tx> = (0..512u64).map(|i| unsigned("audit", &senders[(i % 8) as usize], i / 8, Action::Transfer { to: crypto::address_from_bytes(&crypto::hash(&i.to_le_bytes())), amount: 1 })).collect();
+        let txs: Vec<Tx> = (0..512u64).map(|i| unsigned(&gh, &senders[(i % 8) as usize], i / 8, Action::Transfer { to: crypto::address_from_bytes(&crypto::hash(&i.to_le_bytes())), amount: 1 })).collect();
         let f = c.test_block(txs);
         let t = Instant::now();
         let mut e = c.execute_in_memory(f).unwrap();
@@ -3878,7 +3914,7 @@ mod hunts {
     impl T {
         fn tx(&mut self, who: &Keys, action: Action) -> Result<String> {
             let from = who.address();
-            let mut tx = Tx { chain_id: "hunts".into(), nonce: self.c.next_nonce(&from), from, fee: 0, tip: 0, valid_until: self.c.height() + 100, action, memo: String::new(), public_key: hex::encode(who.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+            let mut tx = Tx { chain_id: "hunts".into(), genesis_hash: self.c.genesis_hash.clone(), nonce: self.c.next_nonce(&from), from, fee: 0, tip: 0, valid_until: self.c.height() + 100, action, memo: String::new(), public_key: hex::encode(who.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
             tx.fee = min_fee(tx.size());
             let id = self.c.submit(tx.sign(who))?;
             self.c.produce_block()?;
@@ -3985,9 +4021,9 @@ mod hunts {
         // Fill it straight through the state machine (it doesn't check signatures; admission
         // does), one new funder per tx, then commit that as a block.
         let funders: Vec<Keys> = (0..MAX_HUNT_FUNDERS as u32).map(|i| Keys::from_seed(crypto::hash(&(i + 1_000).to_le_bytes()))).collect();
-        let (height, proposer) = (t.c.height() + 1, t.c.fee_sink());
+        let (height, proposer, genesis_hash) = (t.c.height() + 1, t.c.fee_sink(), t.c.genesis_hash.clone());
         let fund = |k: &Keys, nonce: u64, amount: u64| {
-            let mut tx = Tx { chain_id: "hunts".into(), from: k.address(), nonce, fee: 0, tip: 0, valid_until: height, action: Action::FundHunt { hunt_id: id, amount }, memo: String::new(), public_key: hex::encode(k.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+            let mut tx = Tx { chain_id: "hunts".into(), genesis_hash: genesis_hash.clone(), from: k.address(), nonce, fee: 0, tip: 0, valid_until: height, action: Action::FundHunt { hunt_id: id, amount }, memo: String::new(), public_key: hex::encode(k.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
             tx.fee = min_fee(tx.size());
             tx
         };
@@ -4066,7 +4102,7 @@ mod v1 {
 
     /// `keys` acting for `from`, paying exactly the charge (`min_fee + tip`).
     fn tx(c: &Chain, keys: &Keys, from: &str, nonce: u64, tip: u64, valid_until: u64, action: Action) -> Tx {
-        let mut tx = Tx { chain_id: c.genesis.chain_id.clone(), from: from.into(), nonce, fee: 0, tip, valid_until, action, memo: String::new(), public_key: hex::encode(keys.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+        let mut tx = Tx { chain_id: c.genesis.chain_id.clone(), genesis_hash: c.genesis_hash.clone(), from: from.into(), nonce, fee: 0, tip, valid_until, action, memo: String::new(), public_key: hex::encode(keys.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
         tx.fee = tx.charge().unwrap();
         tx.sign(keys)
     }
@@ -4098,7 +4134,7 @@ mod v1 {
         short.fee -= 1;
         let short = short.sign(&a);
         assert!(c.submit(short.clone()).unwrap_err().to_string().contains("fee too low"));
-        assert!(crate::consensus::check_tx_stateless(&short, "v1", "boo").unwrap_err().to_string().contains("fee too low"));
+        assert!(crate::consensus::check_tx_stateless(&short, "v1", &c.genesis_hash, "boo").unwrap_err().to_string().contains("fee too low"));
         c.produce_block_with(vec![short.clone()]).unwrap();
         assert!(c.failure(&short.id()).unwrap().0.contains("fee too low"));
         assert_eq!(c.state.account(&a.address()).nonce, 1);
@@ -4185,7 +4221,7 @@ mod v1 {
         assert!(err.contains("`from` is a boo (mainnet) address, but this chain's addresses start with tboo1"), "{err}");
         let pay_main = tx(&c, &a, &test, 0, 0, vu, Action::Transfer { to: Keys::from_seed([2; 32]).address(), amount: DROPS_PER_FANG });
         assert!(c.submit(pay_main.clone()).unwrap_err().to_string().contains("`to` is a boo (mainnet) address"));
-        assert!(crate::consensus::check_tx_stateless(&pay_main, "v1", "tboo").is_err(), "verify, gossip and HTTP refuse it too");
+        assert!(crate::consensus::check_tx_stateless(&pay_main, "v1", &c.genesis_hash, "tboo").is_err(), "verify, gossip and HTTP refuse it too");
         c.produce_block_with(vec![pay_main.clone()]).unwrap();
         assert!(!c.has_tx(&pay_main.id()), "and it can't execute");
         // Native addresses and names work.
@@ -4307,7 +4343,7 @@ mod scaffold {
 
     fn signed(c: &Chain, k: &Keys, action: Action) -> Tx {
         let from = k.address_with(c.state.params.prefix());
-        let mut tx = Tx { chain_id: c.genesis.chain_id.clone(), nonce: c.next_nonce(&from), from, fee: 0, tip: 0, valid_until: c.height() + 100, action, memo: String::new(), public_key: hex::encode(k.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+        let mut tx = Tx { chain_id: c.genesis.chain_id.clone(), genesis_hash: c.genesis_hash.clone(), nonce: c.next_nonce(&from), from, fee: 0, tip: 0, valid_until: c.height() + 100, action, memo: String::new(), public_key: hex::encode(k.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
         tx.fee = min_fee(tx.size());
         tx.sign(k)
     }
@@ -4466,11 +4502,11 @@ mod scaffold {
         let st = genesis("scaffold-1").initial_state();
         let owner = keys(22);
         for action in crate::types::tests::vector_actions().into_iter().chain(crate::types::tests::v1_vector_actions()) {
-            let tx = Tx { chain_id: "c".into(), from: owner.address(), nonce: 0, fee: 0, tip: 0, valid_until: 0, action, memo: String::new(), public_key: hex::encode(owner.public_key()), signature: String::new() };
+            let tx = Tx { chain_id: "c".into(), genesis_hash: String::new(), from: owner.address(), nonce: 0, fee: 0, tip: 0, valid_until: 0, action, memo: String::new(), public_key: hex::encode(owner.public_key()), signature: String::new() };
             let summary = st.describe(&tx, Some(1));
             assert!(summary.starts_with(&short(&owner.address())) && summary.len() > 30, "{:?}: “{summary}”", tx.action);
         }
-        let vote = |conviction| Tx { chain_id: "c".into(), from: owner.address(), nonce: 0, fee: 0, tip: 0, valid_until: 0, action: Action::Vote { proposal_id: 3, aye: false, amount: 2 * FANG, conviction }, memo: String::new(), public_key: String::new(), signature: String::new() };
+        let vote = |conviction| Tx { chain_id: "c".into(), genesis_hash: String::new(), from: owner.address(), nonce: 0, fee: 0, tip: 0, valid_until: 0, action: Action::Vote { proposal_id: 3, aye: false, amount: 2 * FANG, conviction }, memo: String::new(), public_key: String::new(), signature: String::new() };
         assert!(st.describe(&vote(0), None).ends_with("voted nay on proposal #3 with 2 FANG at 0.1× conviction"));
         let spend = Tx { action: Action::Propose { kind: ProposalKind::TreasurySpend { to: keys(22).address(), amount: FANG }, deposit: 50 * FANG, title: "Grants".into(), url: String::new() }, ..vote(1) };
         assert!(st.describe(&spend, None).ends_with(&format!("proposed “Grants”: pay 1 FANG from the treasury to {}, bonding 50 FANG", short(&owner.address()))));
@@ -4663,7 +4699,7 @@ mod persistence {
 
     fn tx(c: &Chain, keys: &Keys, action: Action) -> Tx {
         let from = keys.address();
-        let mut tx = Tx { chain_id: c.genesis.chain_id.clone(), nonce: c.next_nonce(&from), from, fee: 0, tip: 0, valid_until: c.height() + 50, action, memo: String::new(), public_key: hex::encode(keys.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+        let mut tx = Tx { chain_id: c.genesis.chain_id.clone(), genesis_hash: c.genesis_hash.clone(), nonce: c.next_nonce(&from), from, fee: 0, tip: 0, valid_until: c.height() + 50, action, memo: String::new(), public_key: hex::encode(keys.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
         tx.fee = min_fee(tx.size());
         tx.sign(keys)
     }

@@ -1517,7 +1517,7 @@ mod scenarios {
 
     impl T {
         fn tx_as(&mut self, key: &Keys, from: &str, action: Action) -> Result<String> {
-            let mut tx = Tx { chain_id: "poc".into(), nonce: self.c.next_nonce(from), from: from.into(), fee: 0, tip: 0, valid_until: self.c.height() + 100, action, memo: String::new(), public_key: hex::encode(key.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+            let mut tx = Tx { chain_id: "poc".into(), genesis_hash: self.c.genesis_hash.clone(), nonce: self.c.next_nonce(from), from: from.into(), fee: 0, tip: 0, valid_until: self.c.height() + 100, action, memo: String::new(), public_key: hex::encode(key.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
             tx.fee = min_fee(tx.size());
             let id = self.c.submit(tx.sign(key))?;
             self.c.produce_block()?;
@@ -1566,7 +1566,7 @@ mod scenarios {
         fn attest_all(&mut self, ids: &[u64]) {
             let me = self.admin.address();
             for id in ids {
-                let mut tx = Tx { chain_id: "poc".into(), nonce: self.c.next_nonce(&me), from: me.clone(), fee: 0, tip: 0, valid_until: self.c.height() + 100, action: Action::AttestClaim { claim_id: *id, ok: true, merge_sha: "cd".repeat(20), note: String::new() }, memo: String::new(), public_key: hex::encode(self.admin.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+                let mut tx = Tx { chain_id: "poc".into(), genesis_hash: self.c.genesis_hash.clone(), nonce: self.c.next_nonce(&me), from: me.clone(), fee: 0, tip: 0, valid_until: self.c.height() + 100, action: Action::AttestClaim { claim_id: *id, ok: true, merge_sha: "cd".repeat(20), note: String::new() }, memo: String::new(), public_key: hex::encode(self.admin.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
                 tx.fee = min_fee(tx.size());
                 self.c.submit(tx.sign(&self.admin)).unwrap();
             }

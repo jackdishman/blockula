@@ -65,8 +65,14 @@ async fn wait_for_height(context: &deterministic::Context, vals: &[Val], height:
 /// Sim txs are valid through this height (every scenario stays within an hour of blocks of it).
 const VALID_UNTIL: u64 = 3_000;
 
-fn transfer(chain_id: &str, from: &Keys, nonce: u64, to: &str, amount: u64) -> Tx {
-    let mut tx = Tx { chain_id: chain_id.into(), from: from.address(), nonce, fee: 0, tip: 0, valid_until: VALID_UNTIL, action: Action::Transfer { to: to.into(), amount }, memo: "sim".into(), public_key: hex::encode(from.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+/// The chain id and genesis hash a sim tx is signed for.
+fn ident(g: &Genesis) -> (String, String) {
+    (g.chain_id.clone(), hex::encode(consensus::genesis_block(g).digest_bytes()))
+}
+
+fn transfer(g: &Genesis, from: &Keys, nonce: u64, to: &str, amount: u64) -> Tx {
+    let (chain_id, genesis_hash) = ident(g);
+    let mut tx = Tx { chain_id, genesis_hash, from: from.address(), nonce, fee: 0, tip: 0, valid_until: VALID_UNTIL, action: Action::Transfer { to: to.into(), amount }, memo: "sim".into(), public_key: hex::encode(from.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
     tx.fee = min_fee(tx.size());
     tx.sign(from)
 }
@@ -112,8 +118,9 @@ async fn network(context: &deterministic::Context, genesis: &Genesis, extra: &[P
     oracle
 }
 
-fn signed(chain_id: &str, from: &Keys, nonce: u64, action: Action) -> Tx {
-    let mut tx = Tx { chain_id: chain_id.into(), from: from.address(), nonce, fee: 0, tip: 0, valid_until: VALID_UNTIL, action, memo: String::new(), public_key: hex::encode(from.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+fn signed(g: &Genesis, from: &Keys, nonce: u64, action: Action) -> Tx {
+    let (chain_id, genesis_hash) = ident(g);
+    let mut tx = Tx { chain_id, genesis_hash, from: from.address(), nonce, fee: 0, tip: 0, valid_until: VALID_UNTIL, action, memo: String::new(), public_key: hex::encode(from.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
     tx.fee = min_fee(tx.size());
     tx.sign(from)
 }
@@ -145,7 +152,7 @@ fn four_validators_finalize_gossip_crash_and_recover() {
         let alice = Keys::from_seed([42; 32]);
         let mut ids = vec![];
         for n in 0..3 {
-            let tx = transfer("sim", &funder, n, &alice.address(), (n + 1) * DROPS_PER_FANG);
+            let tx = transfer(&genesis, &funder, n, &alice.address(), (n + 1) * DROPS_PER_FANG);
             let id = vals[3].chain.lock().submit(tx).unwrap();
             // Gossip: the other validators see it in their mempools well before the next block.
             context.sleep(Duration::from_millis(150)).await;
@@ -182,7 +189,7 @@ fn four_validators_finalize_gossip_crash_and_recover() {
         let later = vals[0].chain.lock().height() + 30;
         wait_for_height(&context, &vals, later).await;
         // A tx sent while validator 1 is down.
-        let tx = transfer("sim", &alice, 0, &funder.address(), DROPS_PER_FANG / 2);
+        let tx = transfer(&genesis, &alice, 0, &funder.address(), DROPS_PER_FANG / 2);
         let late_id = vals[0].chain.lock().submit(tx).unwrap();
 
         let restarted = start(&context, &mut oracle, &genesis, crashed, 1, home, key).await;
@@ -234,22 +241,22 @@ fn validator_joins_at_epoch_boundary_and_genesis_validator_is_removed() {
         let newbie = Keys::from_seed(new_seed);
         let me = newbie.address();
         // Fund it, register (bond = chain minimum), approve. Each tx goes to a different node.
-        vals[0].chain.lock().submit(signed("sim", &admin, 0, Action::Transfer { to: me.clone(), amount: 100 * DROPS_PER_FANG })).unwrap();
+        vals[0].chain.lock().submit(signed(&genesis, &admin, 0, Action::Transfer { to: me.clone(), amount: 100 * DROPS_PER_FANG })).unwrap();
         wait_until(&context, "funding", || vals[2].chain.lock().state.account(&me).balance > 0).await;
         let bond = genesis.chain_params().unwrap().min_self_bond;
         let pop = crate::chain::make_pop(new_seed, "sim", &me, "127.0.0.1:30304", "127.0.0.1:7074");
         let reg = Action::RegisterValidator { consensus_key: hex::encode(newbie.public_key()), p2p_addr: "127.0.0.1:30304".into(), http_addr: "127.0.0.1:7074".into(), bond, pop };
         // A stranger can't approve; the admin can.
         let stranger = Keys::from_seed(seeds[1]);
-        assert!(vals[1].chain.lock().submit(signed("sim", &stranger, 0, Action::ApproveValidator { validator: me.clone() })).is_err());
-        vals[1].chain.lock().submit(signed("sim", &newbie, 0, reg)).unwrap();
+        assert!(vals[1].chain.lock().submit(signed(&genesis, &stranger, 0, Action::ApproveValidator { validator: me.clone() })).is_err());
+        vals[1].chain.lock().submit(signed(&genesis, &newbie, 0, reg)).unwrap();
         wait_until(&context, "registration", || vals[3].chain.lock().state.validators.get(&me).is_some_and(|v| v.status == ValidatorStatus::Pending)).await;
         {
             let c = vals[0].chain.lock();
             let fees: u64 = (1..=c.height()).filter_map(|h| c.block(h)).flat_map(|b| b.txs).filter(|t| t.from == me).map(|t| t.fee).sum();
             assert_eq!(c.state.account(&me).balance, 100 * DROPS_PER_FANG - bond - fees, "bond moved out of the balance");
         }
-        vals[2].chain.lock().submit(signed("sim", &admin, 1, Action::ApproveValidator { validator: me.clone() })).unwrap();
+        vals[2].chain.lock().submit(signed(&genesis, &admin, 1, Action::ApproveValidator { validator: me.clone() })).unwrap();
         wait_until(&context, "activation", || vals.iter().all(|v| v.chain.lock().state.validators.get(&me).is_some_and(|r| r.status == ValidatorStatus::Active))).await;
         let active_from = vals[0].chain.lock().state.validators[&me].active_from.unwrap();
         let first_height = active_from * EPOCH_BLOCKS;
@@ -274,7 +281,7 @@ fn validator_joins_at_epoch_boundary_and_genesis_validator_is_removed() {
 
         // Remove a genesis validator; the network must keep finalizing without it.
         let removed = Keys::from_seed(seeds[3]).address();
-        vals[4].chain.lock().submit(signed("sim", &admin, 2, Action::RemoveValidator { validator: removed.clone() })).unwrap();
+        vals[4].chain.lock().submit(signed(&genesis, &admin, 2, Action::RemoveValidator { validator: removed.clone() })).unwrap();
         wait_until(&context, "removal", || vals.iter().all(|v| v.chain.lock().state.validators.get(&removed).is_some_and(|r| r.active_until.is_some()))).await;
         let gone_after = vals[0].chain.lock().state.validators[&removed].active_until.unwrap();
         let target = (gone_after + 3) * EPOCH_BLOCKS;
@@ -324,7 +331,7 @@ fn fast_sync_from_certified_snapshot_and_tamper_rejection() {
         // Some activity so the snapshot isn't just genesis.
         let funder = Keys::from_seed(seeds[0]);
         for n in 0..5u64 {
-            vals[1].chain.lock().submit(transfer("sim", &funder, n, &Keys::from_seed([100 + n as u8; 32]).address(), DROPS_PER_FANG)).unwrap();
+            vals[1].chain.lock().submit(transfer(&genesis, &funder, n, &Keys::from_seed([100 + n as u8; 32]).address(), DROPS_PER_FANG)).unwrap();
         }
         wait_for_height(&context, &vals, 3 * snapshot::CHECKPOINT_INTERVAL + snapshot::CHECKPOINT_DELAY + 2).await;
         // Every checkpoint-certifying block committed to its checkpoint's root.

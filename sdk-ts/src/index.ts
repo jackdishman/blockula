@@ -124,8 +124,9 @@ export class Wallet {
   }
 
   /**
-   * Builds and signs a tx: `fee` = `minFee + tip` (exactly what's charged) and `valid_until` =
-   * the current height + `validForBlocks`.
+   * Builds and signs a tx: `fee` = `minFee + tip` (exactly what's charged), `valid_until` = the
+   * current height + `validForBlocks`, and the chain's id and genesis hash from `/api/status`.
+   * To sign offline, build an `UnsignedTx` yourself (with the chain's `genesis_hash`) and `sign` it.
    */
   async build(action: Action, memo = "", opts: TxOptions = {}): Promise<Tx> {
     await this.client.addressPrefix(); // so `this.account` uses the chain's prefix
@@ -135,7 +136,9 @@ export class Wallet {
     if (!Number.isSafeInteger(validFor) || validFor < 1) throw new Error("validForBlocks must be a positive whole number of blocks");
     if (validFor > max) throw new Error(`validForBlocks can be at most ${max} (an hour of blocks)`);
     const tip = opts.tip === undefined ? this.tip : parseFang(opts.tip);
-    const unsigned: UnsignedTx = { chain_id: status.chain_id, from: this.account, nonce: account?.next_nonce ?? 0, fee: "0", tip: tip.toString(), valid_until: status.height + validFor, action, memo };
+    if (typeof status.genesis_hash !== "string") throw new Error(`${this.client.rpc} doesn't report a genesis_hash; it's too old for this SDK`);
+    // Binds the tx to this chain instance (not just its id), so it can't replay on a relaunch.
+    const unsigned: UnsignedTx = { chain_id: status.chain_id, genesis_hash: status.genesis_hash, from: this.account, nonce: account?.next_nonce ?? 0, fee: "0", tip: tip.toString(), valid_until: status.height + validFor, action, memo };
     unsigned.fee = (minFee(unsigned) + tip).toString();
     return this.sign(unsigned);
   }

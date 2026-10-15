@@ -37,9 +37,10 @@ Mainnet is a **new chain**. Nothing here has to replay the current public testne
 ### 3.1 Transactions (Tx v3)
 
 ```
-Tx { chain_id, from, nonce, fee, tip, valid_until, action, memo, public_key, signature }
+Tx { chain_id, genesis_hash, from, nonce, fee, tip, valid_until, action, memo, public_key, signature }
 ```
-- Signing bytes: domain `BLOCKULA_TX_V3`, then `chain_id, from, nonce, fee, tip, valid_until`, the action tag and fields, `memo`.
+- Signing bytes: domain `BLOCKULA_TX_V3`, then `chain_id`, `genesis_hash` (32 raw bytes), `from, nonce, fee, tip, valid_until`, the action tag and fields, `memo`.
+- `genesis_hash` is the digest of the chain's genesis block (`/api/status`), so a tx names the chain *instance*, not just its id: a relaunch that keeps the id (a re-summoned testnet) is another chain, and txs signed on the old one don't replay on it (audit #7). Admission, gossip and block verification check it statelessly with `chain_id` (`check_tx_stateless`); `Wallet.build` fills it in from `/api/status`, offline signers pass it.
 - `fee` is the most the sender will pay. The tx is charged `base_fee(height) × size + tip`, which must be ≤ `fee`; the base part is burned, the tip goes to the proposer. Until 3.6 lands, `base_fee × size` is `min_fee(size)`.
 - `valid_until` is the last height at which the tx may execute. Admission and execution require `height ≤ valid_until ≤ height + max_validity` (1 hour of blocks). A tx past `valid_until` can never execute, so wallets may report it as expired.
 - **Wire form:** `signing_bytes ‖ public_key (1,952 B) ‖ signature (3,309 B)`. Blocks and mempool gossip carry this form; `Tx::from_bytes` is its strict inverse (no trailing bytes, valid UTF-8, known tags, canonical bools and options). `size()` is its length. JSON stays the API format and rejects unknown fields.

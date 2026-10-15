@@ -77,6 +77,12 @@ fn open_chain(tag: &str) -> Shared {
     Arc::new(Mutex::new(Chain::open(&home).expect("open the fixture chain")))
 }
 
+/// The fixture chain's genesis hash (its instance, which every tx signs after the chain id).
+pub fn genesis_hash() -> &'static str {
+    static H: OnceLock<String> = OnceLock::new();
+    H.get_or_init(|| hex::encode(consensus::genesis_block(genesis()).digest_bytes()))
+}
+
 /// The fixture chain's address prefix (`boo`, the genesis default).
 fn prefix() -> &'static str {
     &genesis().address_prefix
@@ -107,7 +113,7 @@ pub fn cblock(data: &[u8]) -> bool {
     assert_eq!(block.encode().as_ref(), data, "CBlock decoding accepted a non-canonical encoding");
     let mut ok = true;
     for tx in block.parse_txs() {
-        ok &= tx.is_some_and(|tx| consensus::check_tx_stateless(&tx, CHAIN_ID, prefix()).is_ok());
+        ok &= tx.is_some_and(|tx| consensus::check_tx_stateless(&tx, CHAIN_ID, genesis_hash(), prefix()).is_ok());
     }
     ok
 }
@@ -119,7 +125,7 @@ pub fn cblock(data: &[u8]) -> bool {
 pub fn tx_json(data: &[u8]) -> bool {
     let Ok(tx) = serde_json::from_slice::<Tx>(data) else { return false };
     let _ = (tx.signing_bytes(), tx.id(), tx.size(), tx.charge());
-    let ok = consensus::check_tx_stateless(&tx, CHAIN_ID, prefix()).is_ok();
+    let ok = consensus::check_tx_stateless(&tx, CHAIN_ID, genesis_hash(), prefix()).is_ok();
     let back: Tx = serde_json::from_slice(&serde_json::to_vec(&tx).unwrap()).expect("a parsed tx must parse again after re-serializing");
     assert_eq!(back, tx, "the JSON round trip changed the tx");
     if tx.check_format().is_ok() {
@@ -137,7 +143,7 @@ pub fn tx_wire(data: &[u8]) -> bool {
     assert_eq!(tx.size(), data.len() as u64, "size() isn't the wire length");
     let back: Tx = serde_json::from_slice(&serde_json::to_vec(&tx).unwrap()).expect("a wire tx must survive its JSON form");
     assert_eq!(back, tx, "the JSON round trip changed a wire tx");
-    let ok = consensus::check_tx_stateless(&tx, CHAIN_ID, prefix()).is_ok();
+    let ok = consensus::check_tx_stateless(&tx, CHAIN_ID, genesis_hash(), prefix()).is_ok();
     if tx.check_format().is_ok() {
         genesis_state().describe(&tx, None);
     }
@@ -242,7 +248,7 @@ pub fn certificate(data: &[u8]) -> bool {
 /// A signed tx from `keys` paying exactly its charge (`min_fee + tip`), valid through
 /// `VALID_UNTIL`.
 fn signed_tx(keys: &Keys, nonce: u64, tip: u64, action: Value) -> Tx {
-    let mut v = json!({ "chain_id": CHAIN_ID, "from": keys.address(), "nonce": nonce, "fee": "0", "tip": tip.to_string(), "valid_until": VALID_UNTIL, "action": action, "memo": "", "public_key": "", "signature": "" });
+    let mut v = json!({ "chain_id": CHAIN_ID, "genesis_hash": genesis_hash(), "from": keys.address(), "nonce": nonce, "fee": "0", "tip": tip.to_string(), "valid_until": VALID_UNTIL, "action": action, "memo": "", "public_key": "", "signature": "" });
     let charge = serde_json::from_value::<Tx>(v.clone()).expect("tx JSON shape changed: update harness::signed_tx").sign(keys).charge().unwrap();
     v["fee"] = json!(charge.to_string());
     serde_json::from_value::<Tx>(v).unwrap().sign(keys)
