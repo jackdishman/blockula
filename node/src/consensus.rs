@@ -535,12 +535,14 @@ impl Reporter for Executor {
                 self.chain.lock().set_finalized_tip(height.get());
             }
             Update::Block(block, ack) => {
-                let mut c = self.chain.lock();
-                if block.height <= c.height() {
+                if block.height <= self.chain.lock().height() {
                     ack.acknowledge(); // redelivery after restart: already executed
                 } else {
                     let cert = self.certs.certs.lock().remove(&block.digest);
-                    match c.execute(finalized_from(&block, cert)) {
+                    // Holds the chain lock only for the in-memory parts, not the fsyncs.
+                    let executed = Chain::execute_shared(&self.chain, finalized_from(&block, cert));
+                    let c = self.chain.lock();
+                    match executed {
                         Ok(()) => {
                             debug!(height = block.height, txs = c.last_block().map(|b| b.txs.len()).unwrap_or(0), "executed");
                             if block.height % 100 == 0 && block.height > MARSHAL_RETAIN {

@@ -621,9 +621,10 @@ pub(crate) fn apply_batch(chain: &Shared, verifier: &MlDsaScheme, epoch: u64, ba
     if !fin.verify(&mut commonware_utils::sys_rng(), verifier, &commonware_parallel::Sequential) {
         bail!("invalid finalization certificate");
     }
-    let mut c = chain.lock();
-    let mut prev = c.last_hash().to_string();
-    let mut height = c.height();
+    let (mut prev, mut height) = {
+        let c = chain.lock();
+        (c.last_hash().to_string(), c.height())
+    };
     for b in &blocks {
         if b.height != height + 1 || hex::encode(b.parent_bytes()) != prev {
             bail!("batch does not extend our chain at height {}", b.height);
@@ -631,9 +632,11 @@ pub(crate) fn apply_batch(chain: &Shared, verifier: &MlDsaScheme, epoch: u64, ba
         prev = hex::encode(b.digest_bytes());
         height = b.height;
     }
+    // One block at a time, the chain lock held only for the in-memory parts (sync is this
+    // node's only executor, so nothing else extends the chain in between).
     for b in &blocks {
         let cert = (b.height == last.height).then(|| fin_bytes.clone());
-        c.execute(consensus::finalized_from(b, cert))?;
+        Chain::execute_shared(chain, consensus::finalized_from(b, cert))?;
     }
     Ok(())
 }

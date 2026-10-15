@@ -93,11 +93,20 @@ impl Disk {
     }
 }
 
+/// A pending tx, its id and the height it arrived for.
+#[derive(Clone)]
+pub struct Pending {
+    pub id: String,
+    pub tx: Arc<Tx>,
+    pub added_at: u64,
+}
+
 /// Pending txs and recent failures, as of the last mempool change. Persistent maps: cloning is
-/// O(1), so every change publishes a new one.
+/// O(1), so every change publishes a new one (and the chain checks the mempool against a block
+/// from a copy, without its lock).
 #[derive(Clone, Default)]
 pub struct MempoolView {
-    txs: imbl::OrdMap<u64, Arc<Tx>>,
+    txs: imbl::OrdMap<u64, Pending>,
     ids: imbl::HashMap<String, u64>,
     senders: imbl::HashMap<String, usize>,
     failed: imbl::HashMap<String, (String, u64)>,
@@ -114,12 +123,17 @@ impl MempoolView {
     }
 
     pub fn get(&self, id: &str) -> Option<&Arc<Tx>> {
-        self.txs.get(self.ids.get(id)?)
+        self.txs.get(self.ids.get(id)?).map(|p| &p.tx)
     }
 
     /// Pending txs, newest first.
     pub fn newest(&self) -> impl Iterator<Item = &Arc<Tx>> {
-        self.txs.values().rev()
+        self.txs.values().rev().map(|p| &p.tx)
+    }
+
+    /// Pending txs in arrival order.
+    pub fn in_order(&self) -> impl Iterator<Item = &Pending> {
+        self.txs.values()
     }
 
     pub fn pending_count(&self, sender: &str) -> usize {
@@ -131,20 +145,20 @@ impl MempoolView {
         self.failed.get(id)
     }
 
-    pub(crate) fn add(&mut self, id: String, tx: &Tx) {
+    pub(crate) fn add(&mut self, id: String, tx: &Tx, added_at: u64) {
         if self.ids.contains_key(&id) {
             return;
         }
         let seq = self.next;
         self.next += 1;
         *self.senders.entry(tx.from.clone()).or_default() += 1;
-        self.txs.insert(seq, Arc::new(tx.clone()));
+        self.txs.insert(seq, Pending { id: id.clone(), tx: Arc::new(tx.clone()), added_at });
         self.ids.insert(id, seq);
     }
 
     pub(crate) fn remove(&mut self, id: &str) {
         let Some(seq) = self.ids.remove(id) else { return };
-        let Some(tx) = self.txs.remove(&seq) else { return };
+        let Some(Pending { tx, .. }) = self.txs.remove(&seq) else { return };
         if let Some(n) = self.senders.get_mut(&tx.from) {
             *n -= 1;
             if *n == 0 {
