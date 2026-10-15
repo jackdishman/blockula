@@ -11,7 +11,8 @@
 //!   the attached state root (waiting until we've executed that height). Only permanently invalid
 //!   blocks get `false`; anything that can still change keeps the verdict pending.
 //! * **finalize**: marshal delivers finalized blocks in order to [`Executor`], which executes them
-//!   (invalid txs are skipped) and acknowledges only after `blocks.jsonl` is synced to disk.
+//!   (invalid txs are skipped) and acknowledges only once the block logs are fsynced and the
+//!   state database has committed the block (`store.rs`).
 
 use crate::chain::{Chain, Finalized, Genesis};
 use crate::pq::{MlDsaScheme, PrivateKey, PublicKey};
@@ -726,7 +727,7 @@ where
         let processed = floor.height().map(|h| h.get()).unwrap_or(0);
         let ours = chain.lock().height();
         if processed > ours {
-            error!(marshal = processed, ours, "consensus storage is ahead of blocks.jsonl; delete the `consensus` dir to resync");
+            error!(marshal = processed, ours, "consensus storage is ahead of the block logs; delete the `consensus` dir to resync");
         } else if ours > processed {
             // We executed past marshal (HTTP catch-up): anchor marshal at our latest certified
             // block so it doesn't try to backfill what peers may have pruned.
@@ -904,7 +905,7 @@ fn hint_behind(marshal: &MarshalMailbox, chain: &Shared, ours: u64, theirs: u64,
     marshal.hint_finalized(Height::new(last), commonware_utils::vec::NonEmptyVec::new(from));
 }
 
-/// Finalized blocks/certificates marshal keeps; older ones are pruned (our own `cblocks.bin` and
+/// Finalized blocks/certificates marshal keeps; older ones are pruned (our own `cblocks/` log and
 /// checkpoint certificates keep serving history over HTTP).
 pub const MARSHAL_RETAIN: u64 = 2_000;
 /// Bumped when the on-disk storage layout changes (consensus journals, or the home's own files:

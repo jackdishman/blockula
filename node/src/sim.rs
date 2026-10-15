@@ -186,7 +186,7 @@ fn four_validators_finalize_gossip_crash_and_recover() {
         let late_id = vals[0].chain.lock().submit(tx).unwrap();
 
         let restarted = start(&context, &mut oracle, &genesis, crashed, 1, home, key).await;
-        assert_eq!(restarted.chain.lock().height(), crashed_at, "replayed blocks.jsonl on restart");
+        assert_eq!(restarted.chain.lock().height(), crashed_at, "restarted from the state database at its height");
         vals.insert(crashed, restarted);
         let target = vals[0].chain.lock().height() + 5;
         wait_for_height(&context, &vals, target).await;
