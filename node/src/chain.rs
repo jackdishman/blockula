@@ -2,9 +2,10 @@
 //! finalized blocks deterministically, in order, and keeps the mempool, indexes and `blocks.jsonl`.
 
 use crate::crypto::{self, Keys};
+use crate::params::ChainParams;
 use crate::state::{JMap, TMap};
 use crate::types::*;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -13,9 +14,29 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// The treasury's system account on a chain whose addresses use `prefix`.
+/// Mainnet's chain id. Its genesis may not have admins or a faucet (DEC-10).
+pub const MAINNET_CHAIN_ID: &str = "blockula-1";
+
+/// The treasury's system account on a chain whose addresses use `prefix`. Keyless: only
+/// `TreasurySpend` proposals move funds out.
 pub fn treasury(prefix: &str) -> String {
     crypto::system_address(prefix, "treasury")
+}
+
+/// The keyless community account: `Distribution` proposals pay out of it (DEC-5, 3.5).
+pub fn community(prefix: &str) -> String {
+    crypto::system_address(prefix, "community")
+}
+
+/// The keyless contribution endowment, which streams into the contribution pool (DEC-5).
+pub fn endowment(prefix: &str) -> String {
+    crypto::system_address(prefix, "endowment")
+}
+
+/// The keyless validator bootstrap delegation (DEC-5): delegated by formula, returned to the
+/// treasury in years 2–4. (The foundation is an ordinary multisig account.)
+pub fn bootstrap_delegation(prefix: &str) -> String {
+    crypto::system_address(prefix, "bootstrap-delegation")
 }
 
 pub fn now_ms() -> u64 {
@@ -27,7 +48,66 @@ pub struct Allocation {
     pub address: String,
     #[serde(with = "u64_str")]
     pub amount: u64,
+    /// Locks the amount on a vesting curve (a lock on the account, MAINNET-DESIGN 3.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vesting: Option<Vesting>,
+    /// What the allocation is ("founder", "treasury"…): display, and the vesting lock's reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
+
+/// A vesting schedule, in block heights: nothing vests before `cliff`, then the amount vests
+/// linearly from `start` to `end` (so the cliff releases what accrued since `start`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Vesting {
+    pub start: u64,
+    pub cliff: u64,
+    pub end: u64,
+}
+
+/// A genesis validator's economic side (MAINNET-DESIGN 3.7): who owns it, its self-bond (moved
+/// from the owner's allocations into the validator's bond) and commission. Its consensus key
+/// must be one of `validators`, with the same addresses. Staking builds its pool from these.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Operator {
+    pub owner: String,
+    /// hex ML-DSA-65 public key.
+    pub consensus_key: String,
+    /// Proof of possession, as for `RegisterValidator`: the consensus key's signature over
+    /// `pop_message(chain_id, owner, p2p_addr, http_addr)`.
+    pub pop: String,
+    pub p2p_addr: String,
+    pub http_addr: String,
+    #[serde(with = "u64_str")]
+    pub self_bond: u64,
+    pub commission_bps: u64,
+    // Display only (hosting diversity, DEC-14): not state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asn: Option<u32>,
+    /// ISO 3166-1 alpha-2 (`"DE"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity: Option<String>,
+}
+
+/// Soul bootstrapped at genesis (3.5: the published ledger; afterwards only juries and bounded
+/// `GrantSoul` proposals change Soul).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SoulEntry {
+    pub account: String,
+    /// milli-Soul (`poc::SOUL` per Soul).
+    pub soul: u64,
+    pub reason: String,
+}
+
+/// Most Soul one genesis ledger entry may grant.
+pub const MAX_GENESIS_SOUL: u64 = 1_000 * crate::poc::SOUL;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ValidatorInfo {
@@ -54,21 +134,31 @@ pub struct Genesis {
     /// Blocks per epoch. The validator set can only change at epoch boundaries.
     #[serde(default = "default_epoch_blocks")]
     pub epoch_blocks: u64,
-    /// Season 0 allowlist: accounts that may approve/remove validators.
+    /// Season 0 allowlist: accounts that may approve/remove validators and pull the admin
+    /// levers. Dev and test chains only: mainnet (`blockula-1`) refuses any.
     #[serde(default)]
     pub validator_admins: Vec<String>,
-    /// Minimum bond (drops) for `register_validator`.
-    #[serde(default = "default_min_bond", with = "u64_str")]
-    pub min_bond: u64,
-    /// Cap on the active set.
-    #[serde(default = "default_max_validators")]
-    pub max_validators: usize,
     /// Proof of Contribution timings. Absent: derived from `block_time_ms` (weeks, not minutes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contribution: Option<crate::poc::PocTimes>,
     /// bech32m prefix of this chain's addresses: `boo` (mainnet, dev) or `tboo` (public testnets).
     #[serde(default = "default_address_prefix")]
     pub address_prefix: String,
+    /// Overrides of the governance-adjustable parameters (`params::ChainParams`), by key; the
+    /// rest take their defaults. JSON values are strings or numbers.
+    #[serde(rename = "params", default, skip_serializing_if = "BTreeMap::is_empty", with = "crate::params::u64_map")]
+    pub param_overrides: BTreeMap<String, u64>,
+    /// Owners, self-bonds and commissions of genesis validators.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operators: Vec<Operator>,
+    /// Names nobody can register (bare, as `normalize_name` returns them).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reserved_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub soul_ledger: Vec<SoulEntry>,
+    /// Features on from genesis (`upgrade::KNOWN_FEATURES`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
 }
 
 fn default_epoch_blocks() -> u64 {
@@ -77,25 +167,17 @@ fn default_epoch_blocks() -> u64 {
 fn default_address_prefix() -> String {
     crypto::ADDRESS_HRP.into()
 }
-fn default_min_bond() -> u64 {
-    10_000 * DROPS_PER_FANG
-}
-fn default_max_validators() -> usize {
-    32
-}
 
 /// How many past epochs' validator sets the state keeps (for verifying recent certificates).
 pub const EPOCH_SETS_KEPT: u64 = 8;
 
 /// Genesis constants the state machine needs while applying txs (a state record, so the root
-/// commits to them).
+/// commits to them). What governance can change is in `State::chain_params` instead.
 #[derive(Clone, Debug, Default, BorshSerialize, BorshDeserialize)]
 pub struct Params {
     pub block_time_ms: u64,
     pub epoch_blocks: u64,
     pub admins: Vec<String>,
-    pub min_bond: u64,
-    pub max_validators: usize,
     pub poc: crate::poc::PocTimes,
     /// The chain's address prefix (see [`Params::prefix`]).
     pub address_prefix: String,
@@ -105,11 +187,6 @@ impl Params {
     /// The chain's address prefix (`boo` when unset, e.g. in a default `Params`).
     pub fn prefix(&self) -> &str {
         if self.address_prefix.is_empty() { crypto::ADDRESS_HRP } else { &self.address_prefix }
-    }
-
-    /// How far ahead a tx's `valid_until` may be: one hour of blocks.
-    pub fn max_tx_validity_blocks(&self) -> u64 {
-        (3_600_000 / self.block_time_ms.max(1)).max(1)
     }
 
     /// Longest a session key may stay valid: ~400 days of blocks.
@@ -165,6 +242,9 @@ pub struct ValidatorRecord {
     pub active_until: Option<u64>,
     /// Bond can be reclaimed from this epoch on.
     pub unbond_epoch: Option<u64>,
+    /// The owner's cut of its pool's rewards (genesis operators set it; `UpdateValidator` changes it).
+    #[serde(default)]
+    pub commission_bps: u64,
 }
 
 impl Genesis {
@@ -174,15 +254,30 @@ impl Genesis {
 
     pub fn params(&self) -> Params {
         let poc = self.contribution.clone().unwrap_or_else(|| crate::poc::PocTimes::for_block_time(self.block_time_ms));
-        Params { block_time_ms: self.block_time_ms, epoch_blocks: self.epoch_blocks, admins: self.validator_admins.clone(), min_bond: self.min_bond, max_validators: self.max_validators, poc, address_prefix: self.address_prefix.clone() }
+        Params { block_time_ms: self.block_time_ms, epoch_blocks: self.epoch_blocks, admins: self.validator_admins.clone(), poc, address_prefix: self.address_prefix.clone() }
     }
 
-    /// The state before block 1, committed (its root is the genesis state root).
+    /// The governance-adjustable parameters at genesis: the defaults with `params` applied.
+    pub fn chain_params(&self) -> Result<ChainParams> {
+        ChainParams::with_overrides(&self.params(), &self.param_overrides)
+    }
+
+    /// The state before block 1, committed (its root is the genesis state root). Expects a
+    /// genesis that passes [`Genesis::check`] (`load` runs it); anything that doesn't is skipped
+    /// or clamped instead of panicking, and such a genesis never opens anyway.
     pub fn initial_state(&self) -> State {
-        let mut state = State { params: self.params(), ..Default::default() };
+        let params = self.params();
+        let chain_params = self.chain_params().unwrap_or_else(|_| ChainParams::defaults(&params));
+        let prefix = params.prefix().to_string();
+        let mut state = State { params, chain_params, ..Default::default() };
         for a in &self.allocations {
             state.credit(&a.address, a.amount);
             state.supply += a.amount;
+            if let Some(v) = &a.vesting {
+                let acct = state.accounts.entry(a.address.clone()).or_default();
+                let lock = Lock { id: acct.locks.len() as u64, amount: LockAmount::Vesting { total: a.amount, start: v.start, cliff: v.cliff, end: v.end }, reason: a.label.clone().unwrap_or_else(|| "genesis allocation".into()) };
+                acct.locks.push(lock);
+            }
         }
         for v in &self.validators {
             state.validators.insert(
@@ -203,10 +298,38 @@ impl Genesis {
                     removed_by: None,
                     active_until: None,
                     unbond_epoch: None,
+                    commission_bps: 0,
                 },
             );
         }
+        // Operators own their validators: the self-bond moves from the owner's balance into the
+        // validator's bond (an escrow), which is what its stake pool starts from.
+        for o in &self.operators {
+            let Some(address) = hex::decode(&o.consensus_key).ok().map(|pk| crypto::address_with_prefix(&prefix, &pk)) else { continue };
+            if !state.validators.contains_key(&address) {
+                continue;
+            }
+            let bond = o.self_bond.min(state.account(&o.owner).balance);
+            if let Some(acct) = state.accounts.get_mut(&o.owner) {
+                acct.balance -= bond;
+            }
+            let v = state.validators.get_mut(&address).expect("checked above");
+            v.owner = o.owner.clone();
+            v.bond = bond;
+            v.commission_bps = o.commission_bps;
+        }
         state.active_sets.insert(0, self.validators.iter().map(|v| v.address.clone()).collect());
+        for n in &self.reserved_names {
+            if let Ok(n) = normalize_name(n) {
+                state.econ.reserved_names.insert(n, crate::econ::ReservedName { reserved_at: 0 });
+            }
+        }
+        for e in &self.soul_ledger {
+            state.poc.souls.insert(e.account.clone(), crate::poc::Soul { points: e.soul, at: 0, earned: e.soul });
+        }
+        for f in &self.features {
+            state.upgrade.features.insert(f.clone(), crate::upgrade::Feature { activated_at: 0 });
+        }
         state.commit_block().expect("an in-memory tree can't fail");
         state
     }
@@ -218,11 +341,97 @@ impl Genesis {
             bail!("{} was created by an older single-validator Blockula; re-summon it (or `blockula dev --reset`)", path.display());
         }
         let g: Genesis = serde_json::from_value(v)?;
-        if let Some(t) = &g.contribution {
-            t.check().with_context(|| format!("{}", path.display()))?;
-        }
-        g.check_prefix().with_context(|| format!("{}", path.display()))?;
+        g.check().with_context(|| format!("{}", path.display()))?;
         Ok(g)
+    }
+
+    /// Everything a genesis must satisfy (`load` runs it): its addresses use its prefix; the
+    /// parameters, allocations and vesting schedules are in bounds; operators match validators,
+    /// prove possession of their keys and can fund their self-bonds; reserved names, the Soul
+    /// ledger and features are well-formed; and mainnet has no admins, no faucet, and an operator
+    /// for every validator.
+    pub fn check(&self) -> Result<()> {
+        use std::collections::BTreeSet;
+        self.check_prefix()?;
+        if let Some(t) = &self.contribution {
+            t.check()?;
+        }
+        ensure!(self.epoch_blocks >= 2 && self.block_time_ms >= 1, "epoch_blocks must be at least 2 and block_time_ms at least 1");
+        let params = self.params();
+        let prefix = params.prefix();
+        let cp = self.chain_params().context("params")?;
+        let display = |what: &str, v: &str| -> Result<()> {
+            ensure!(!v.trim().is_empty() && v.len() <= MAX_LABEL && !v.chars().any(|c| c.is_control()), "{what} must be 1–{MAX_LABEL} bytes with no control characters");
+            Ok(())
+        };
+        let mut supply = 0u64;
+        let mut held: BTreeMap<&str, u64> = BTreeMap::new();
+        let mut vesting = BTreeSet::new();
+        for a in &self.allocations {
+            supply = supply.checked_add(a.amount).ok_or_else(|| anyhow!("allocations add up to more than u64 drops"))?;
+            *held.entry(&a.address).or_default() += a.amount;
+            if let Some(l) = &a.label {
+                display("allocation label", l)?;
+            }
+            if let Some(v) = &a.vesting {
+                ensure!(v.start <= v.cliff && v.cliff <= v.end && v.start < v.end, "vesting of {}: needs start ≤ cliff ≤ end and start < end", a.address);
+                // One vesting lock per account: locks overlap (the largest applies), they don't add.
+                ensure!(vesting.insert(&a.address), "{} has more than one vesting allocation", a.address);
+            }
+        }
+        let mut keys = BTreeSet::new();
+        let mut bonds: BTreeMap<&str, u64> = BTreeMap::new();
+        for o in &self.operators {
+            let who = format!("operator {}", o.owner);
+            ensure!(crypto::parse_address(&o.owner).map(|(p, _)| p) == Some(prefix), "{who}: the owner must be a {prefix}1… address");
+            ensure!(crypto::is_lower_hex(&o.consensus_key) && o.consensus_key.len() == crypto::PUBLIC_KEY_LEN * 2, "{who}: consensus_key must be an ML-DSA-65 public key in lowercase hex");
+            ensure!(keys.insert(o.consensus_key.as_str()), "{who}: another operator has the same consensus key");
+            let v = self.validators.iter().find(|v| v.public_key == o.consensus_key).ok_or_else(|| anyhow!("{who}: its consensus key isn't one of the genesis validators"))?;
+            let pk = hex::decode(&o.consensus_key)?;
+            ensure!(v.address == crypto::address_with_prefix(prefix, &pk), "{who}: validator {} isn't its consensus key's address", v.address);
+            ensure!(v.p2p_addr == o.p2p_addr && v.http_addr == o.http_addr, "{who}: p2p_addr and http_addr must match its entry in validators");
+            verify_pop(&self.chain_id, &o.owner, &o.consensus_key, &o.p2p_addr, &o.http_addr, &o.pop).with_context(|| who.clone())?;
+            ensure!(o.self_bond >= cp.min_self_bond, "{who}: self_bond is below min_self_bond ({})", fmt_fang(cp.min_self_bond));
+            ensure!(o.commission_bps <= cp.commission_max_bps, "{who}: commission_bps is above commission_max_bps ({})", cp.commission_max_bps);
+            for (what, v) in [("provider", &o.provider), ("entity", &o.entity)] {
+                if let Some(v) = v {
+                    display(what, v).with_context(|| who.clone())?;
+                }
+            }
+            if let Some(c) = &o.country {
+                ensure!(c.len() == 2 && c.bytes().all(|b| b.is_ascii_uppercase()), "{who}: country must be an ISO 3166-1 alpha-2 code (\"DE\")");
+            }
+            let b = bonds.entry(&o.owner).or_default();
+            *b = b.checked_add(o.self_bond).ok_or_else(|| anyhow!("{who}: self-bonds overflow"))?;
+        }
+        for (owner, bond) in bonds {
+            let has = held.get(owner).copied().unwrap_or(0);
+            ensure!(has >= bond, "operator {owner} self-bonds {} but its allocations hold {}", fmt_fang(bond), fmt_fang(has));
+        }
+        let mut names = BTreeSet::new();
+        for n in &self.reserved_names {
+            ensure!(normalize_name(n).ok().as_deref() == Some(n.as_str()), "reserved name {n:?} must be a bare lowercase name (no {NAME_SUFFIX})");
+            ensure!(names.insert(n), "reserved name {n} is listed twice");
+        }
+        let mut souls = BTreeSet::new();
+        for e in &self.soul_ledger {
+            ensure!(crypto::parse_address(&e.account).map(|(p, _)| p) == Some(prefix), "soul_ledger: {} isn't a {prefix}1… address", e.account);
+            ensure!((1..=MAX_GENESIS_SOUL).contains(&e.soul), "soul_ledger: {} gets 1–{MAX_GENESIS_SOUL} milli-Soul", e.account);
+            check_reason(&e.reason).with_context(|| format!("soul_ledger: {}", e.account))?;
+            ensure!(souls.insert(&e.account), "soul_ledger lists {} twice", e.account);
+        }
+        let mut features = BTreeSet::new();
+        for f in &self.features {
+            crate::upgrade::check_feature_name(f)?;
+            ensure!(crate::upgrade::KNOWN_FEATURES.contains(&f.as_str()), "unknown feature {f} (known: {})", crate::upgrade::KNOWN_FEATURES.join(", "));
+            ensure!(features.insert(f), "feature {f} is listed twice");
+        }
+        if self.chain_id == MAINNET_CHAIN_ID {
+            ensure!(self.validator_admins.is_empty(), "{MAINNET_CHAIN_ID} has no admin keys: validator_admins must be empty");
+            ensure!(!self.faucet, "{MAINNET_CHAIN_ID} has no faucet");
+            ensure!(self.validators.iter().all(|v| keys.contains(v.public_key.as_str())), "every {MAINNET_CHAIN_ID} validator needs an operator (owner, self-bond, commission)");
+        }
+        Ok(())
     }
 
     /// The prefix is a known one, and every genesis address uses it.
@@ -302,7 +511,13 @@ pub struct Journal {
     familiars: JMap<String, BTreeMap<String, String>>,
     scalars: Option<(u64, u64)>,
     next_hunt_id: Option<u64>,
+    chain_params: Option<ChainParams>,
     pub(crate) poc: crate::poc::PocJournal,
+    pub(crate) staking: crate::staking::StakingJournal,
+    pub(crate) governance: crate::governance::GovernanceJournal,
+    pub(crate) econ: crate::econ::EconJournal,
+    pub(crate) beacon: crate::beacon::BeaconJournal,
+    pub(crate) upgrade: crate::upgrade::UpgradeJournal,
 }
 
 impl Journal {
@@ -325,7 +540,15 @@ impl Journal {
         if self.next_hunt_id.is_none() {
             self.next_hunt_id = other.next_hunt_id;
         }
+        if self.chain_params.is_none() {
+            self.chain_params = other.chain_params;
+        }
         self.poc.absorb(other.poc);
+        self.staking.absorb(other.staking);
+        self.governance.absorb(other.governance);
+        self.econ.absorb(other.econ);
+        self.beacon.absorb(other.beacon);
+        self.upgrade.absorb(other.upgrade);
     }
 }
 
@@ -348,6 +571,59 @@ pub struct Account {
     pub nonce: u64,
     /// Authorized keys by key id. Empty means "only the key the address was derived from".
     pub keys: BTreeMap<String, KeyRecord>,
+    /// Tokens the account holds but can't transfer out (vesting allocations; vote locks).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub locks: Vec<Lock>,
+}
+
+impl Account {
+    /// What its locks hold at `height`: they overlap, so the largest applies (MAINNET-DESIGN
+    /// 3.7: transferable = liquid − max(0, that − staked − unbonding)).
+    pub fn locked_at(&self, height: u64) -> u64 {
+        self.locks.iter().map(|l| l.amount.locked_at(height)).max().unwrap_or(0)
+    }
+}
+
+/// A lock on an account's tokens (MAINNET-DESIGN 3.7). Locked tokens stay in the balance and can
+/// be staked, delegated and (vested) voted with, never transferred. econ.rs enforces them;
+/// governance adds vote locks.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+pub struct Lock {
+    /// Unique among the account's locks.
+    pub id: u64,
+    pub amount: LockAmount,
+    pub reason: String,
+}
+
+/// How much a lock holds, over time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LockAmount {
+    /// The unvested part of `total`: all of it before `cliff`, then less linearly from `start`
+    /// to `end` (see [`Vesting`]), nothing from `end` on.
+    Vesting {
+        #[serde(with = "u64_str")]
+        total: u64,
+        start: u64,
+        cliff: u64,
+        end: u64,
+    },
+}
+
+impl LockAmount {
+    pub fn locked_at(&self, height: u64) -> u64 {
+        match *self {
+            LockAmount::Vesting { total, start, cliff, end } => {
+                if height < cliff {
+                    total
+                } else if height >= end || end <= start {
+                    0
+                } else {
+                    total - (total as u128 * (height - start) as u128 / (end - start) as u128) as u64
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
@@ -447,6 +723,14 @@ pub struct State {
     pub familiars: TMap<String, BTreeMap<String, String>>,
     /// 🪦 Proof of Contribution: Souls, vouches, claims, Séances, the pool's grants.
     pub poc: crate::poc::Poc,
+    /// What governance can change (params.rs); genesis constants are in `params`.
+    pub chain_params: ChainParams,
+    // The protocol v1 modules (MAINNET-DESIGN 3.4–3.9), each owning its slice of the state.
+    pub staking: crate::staking::Staking,
+    pub governance: crate::governance::Governance,
+    pub econ: crate::econ::Econ,
+    pub beacon: crate::beacon::Beacon,
+    pub upgrade: crate::upgrade::Upgrades,
     /// The authenticated tree over every record, as of the last `commit_block`.
     pub tree: crate::state::tree::Smt,
 }

@@ -53,17 +53,53 @@ pub mod ns {
     pub const JURORS: u8 = 23;
     pub const SEANCES: u8 = 24;
     pub const GRANTS: u8 = 25;
+
+    // 32–47: the protocol v1 modules, each in its own range so they're built in parallel without
+    // colliding. Names say the intended use; a module may repurpose a number in its own range
+    // before launch, never after. A module that needs more takes the next free number from 64 up
+    // (48–63 are Ghost Mode's).
+    /// staking.rs (P-STAKE): 32–36.
+    pub const STAKE_POOLS: u8 = 32;
+    pub const STAKE_DELEGATIONS: u8 = 33;
+    pub const STAKE_UNBONDING: u8 = 34;
+    pub const STAKE_EVIDENCE: u8 = 35;
+    pub const STAKE_LIVENESS: u8 = 36;
+    /// governance.rs (P-GOV): 37–42.
+    pub const GOV_PROPOSALS: u8 = 37;
+    pub const GOV_VOTES: u8 = 38;
+    pub const GOV_MULTISIGS: u8 = 39;
+    pub const GOV_MULTISIG_PROPOSALS: u8 = 40;
+    pub const GOV_DISTRIBUTIONS: u8 = 41;
+    pub const GOV_DISTRIBUTION_CLAIMS: u8 = 42;
+    /// econ.rs (P-ECON): 43, the genesis reserved-name list.
+    pub const RESERVED_NAMES: u8 = 43;
+    /// beacon.rs (P-BEACON): 44–46.
+    pub const BEACON_COMMITS: u8 = 44;
+    pub const BEACON_REVEALS: u8 = 45;
+    pub const BEACON_VALUES: u8 = 46;
+    /// upgrade.rs (P-UPGRADE): 47, the active feature flags.
+    pub const FEATURES: u8 = 47;
 }
 
-/// Keys of the scalar records (namespace [`ns::META`]), in canonical (byte) order.
+/// Keys of the scalar records (namespace [`ns::META`]). They're emitted sorted by key.
 pub mod meta {
     pub const BURNED: &[u8] = b"burned";
+    /// The governance-adjustable parameters (`params::ChainParams`).
+    pub const CHAIN_PARAMS: &[u8] = b"chain_params";
     pub const NEXT_HUNT_ID: &[u8] = b"next_hunt_id";
+    /// Genesis constants (`chain::Params`).
     pub const PARAMS: &[u8] = b"params";
     /// `(next_claim_id, next_seance_id, next_grant_id, seed, open_seance, next_seance_at)`.
     pub const POC: &[u8] = b"poc";
     pub const SCHEMA: &[u8] = b"schema";
     pub const SUPPLY: &[u8] = b"supply";
+    // One key per protocol v1 module, for its scalars (if it has any) as one record.
+    pub const STAKING: &[u8] = b"staking";
+    pub const GOVERNANCE: &[u8] = b"governance";
+    pub const ECON: &[u8] = b"econ";
+    pub const BEACON: &[u8] = b"beacon";
+    /// The upgrade schedule (`upgrade::Upgrades::schedule`).
+    pub const UPGRADE: &[u8] = b"upgrade";
 }
 
 /// Largest record key and value a snapshot may contain (bounds allocations while decoding).
@@ -96,6 +132,22 @@ pub trait Table {
     fn take_changes(&mut self, namespace: u8, out: &mut Vec<RecordChange>);
     /// Adds a record the tree already has (snapshot restore). Rejects non-canonical bytes.
     fn load(&mut self, key: &[u8], value: &[u8]) -> Result<()>;
+}
+
+/// A protocol v1 module's slice of the state (staking.rs, governance.rs, econ.rs, beacon.rs,
+/// upgrade.rs) as records: its maps, each under a namespace from the module's range in [`ns`],
+/// and its scalars as META records under the module's key in [`meta`]. `State` lists the modules
+/// once, so a module adds a map or a scalar by editing only its own file.
+pub trait SubState {
+    fn tables(&self) -> Vec<(u8, &dyn Table)>;
+    fn tables_mut(&mut self) -> Vec<(u8, &mut dyn Table)>;
+    fn meta_records(&self) -> Vec<(&'static [u8], Vec<u8>)> {
+        vec![]
+    }
+    /// Loads one of the module's scalar records: `Ok(false)` if `key` isn't one of them.
+    fn load_meta(&mut self, _key: &[u8], _value: &[u8]) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 impl<K, V> Table for TMap<K, V>
@@ -136,13 +188,19 @@ where
 }
 
 impl State {
+    /// The protocol v1 modules, whose maps and scalars are records too.
+    fn modules(&self) -> [&dyn SubState; 5] {
+        [&self.staking, &self.governance, &self.econ, &self.beacon, &self.upgrade]
+    }
+
     /// Every map, by namespace, in namespace order. The destructuring is exhaustive on purpose:
     /// a new `State` or `Poc` field doesn't compile until it is listed here as a map (with a new
-    /// namespace) or skipped as a scalar that `meta_records` covers, so nothing escapes the root.
-    fn tables(&self) -> [(u8, &dyn Table); 18] {
-        let State { accounts, names, supply: _, burned: _, validators, active_sets, params: _, hunts, next_hunt_id: _, github, github_by_account, familiars, poc, tree: _ } = self;
+    /// namespace), as a module (whose own `tables` destructure exhaustively), or skipped as a
+    /// scalar that `meta_records` covers, so nothing escapes the root.
+    fn tables(&self) -> Vec<(u8, &dyn Table)> {
+        let State { accounts, names, supply: _, burned: _, validators, active_sets, params: _, chain_params: _, hunts, next_hunt_id: _, github, github_by_account, familiars, poc, staking, governance, econ, beacon, upgrade, tree: _ } = self;
         let Poc { repos, souls, vouches, sybils, claims, claim_by_pr, handles, jurors, seances, grants, next_claim_id: _, next_seance_id: _, next_grant_id: _, seed: _, open_seance: _, next_seance_at: _ } = poc;
-        [
+        let mut t: Vec<(u8, &dyn Table)> = vec![
             (ns::ACCOUNTS, accounts),
             (ns::NAMES, names),
             (ns::VALIDATORS, validators),
@@ -161,14 +219,20 @@ impl State {
             (ns::JURORS, jurors),
             (ns::SEANCES, seances),
             (ns::GRANTS, grants),
-        ]
+        ];
+        let modules: [&dyn SubState; 5] = [staking, governance, econ, beacon, upgrade];
+        for m in modules {
+            t.extend(m.tables());
+        }
+        t.sort_by_key(|(n, _)| *n);
+        t
     }
 
     /// [`State::tables`], mutably (same list, same order).
-    fn tables_mut(&mut self) -> [(u8, &mut dyn Table); 18] {
-        let State { accounts, names, supply: _, burned: _, validators, active_sets, params: _, hunts, next_hunt_id: _, github, github_by_account, familiars, poc, tree: _ } = self;
+    fn tables_mut(&mut self) -> Vec<(u8, &mut dyn Table)> {
+        let State { accounts, names, supply: _, burned: _, validators, active_sets, params: _, chain_params: _, hunts, next_hunt_id: _, github, github_by_account, familiars, poc, staking, governance, econ, beacon, upgrade, tree: _ } = self;
         let Poc { repos, souls, vouches, sybils, claims, claim_by_pr, handles, jurors, seances, grants, next_claim_id: _, next_seance_id: _, next_grant_id: _, seed: _, open_seance: _, next_seance_at: _ } = poc;
-        [
+        let mut t: Vec<(u8, &mut dyn Table)> = vec![
             (ns::ACCOUNTS, accounts),
             (ns::NAMES, names),
             (ns::VALIDATORS, validators),
@@ -187,27 +251,40 @@ impl State {
             (ns::JURORS, jurors),
             (ns::SEANCES, seances),
             (ns::GRANTS, grants),
-        ]
+        ];
+        let modules: [&mut dyn SubState; 5] = [staking, governance, econ, beacon, upgrade];
+        for m in modules {
+            t.extend(m.tables_mut());
+        }
+        t.sort_by_key(|(n, _)| *n);
+        t
     }
 
-    /// The scalar records, in key order. Cheap, so every commit re-checks them all. Exhaustive
+    /// The scalar records, sorted by key. Cheap, so every commit re-checks them all. Exhaustive
     /// like [`State::tables`].
-    fn meta_records(&self) -> [(&'static [u8], Vec<u8>); 6] {
-        let State { supply, burned, params, next_hunt_id, poc, accounts: _, names: _, validators: _, active_sets: _, hunts: _, github: _, github_by_account: _, familiars: _, tree: _ } = self;
+    fn meta_records(&self) -> Vec<(&'static [u8], Vec<u8>)> {
+        let State { supply, burned, params, chain_params, next_hunt_id, poc, accounts: _, names: _, validators: _, active_sets: _, hunts: _, github: _, github_by_account: _, familiars: _, staking: _, governance: _, econ: _, beacon: _, upgrade: _, tree: _ } = self;
         let Poc { next_claim_id, next_seance_id, next_grant_id, seed, open_seance, next_seance_at, repos: _, souls: _, vouches: _, sybils: _, claims: _, claim_by_pr: _, handles: _, jurors: _, seances: _, grants: _ } = poc;
-        [
+        let mut m = vec![
             (meta::BURNED, encode(burned)),
+            (meta::CHAIN_PARAMS, encode(chain_params)),
             (meta::NEXT_HUNT_ID, encode(next_hunt_id)),
             (meta::PARAMS, encode(params)),
             (meta::POC, encode(&(next_claim_id, next_seance_id, next_grant_id, seed, open_seance, next_seance_at))),
             (meta::SCHEMA, encode(&SCHEMA_VERSION)),
             (meta::SUPPLY, encode(supply)),
-        ]
+        ];
+        for module in self.modules() {
+            m.extend(module.meta_records());
+        }
+        m.sort_by(|a, b| a.0.cmp(b.0));
+        m
     }
 
     fn load_meta(&mut self, key: &[u8], v: &[u8]) -> Result<()> {
         match key {
             meta::BURNED => self.burned = decode(v)?,
+            meta::CHAIN_PARAMS => self.chain_params = decode(v)?,
             meta::NEXT_HUNT_ID => self.next_hunt_id = decode(v)?,
             meta::PARAMS => self.params = decode(v)?,
             meta::POC => {
@@ -219,7 +296,15 @@ impl State {
                 ensure!(schema == SCHEMA_VERSION, "state schema {schema}, this binary reads {SCHEMA_VERSION}");
             }
             meta::SUPPLY => self.supply = decode(v)?,
-            _ => bail!("unknown scalar record {}", String::from_utf8_lossy(key)),
+            _ => {
+                let modules: [&mut dyn SubState; 5] = [&mut self.staking, &mut self.governance, &mut self.econ, &mut self.beacon, &mut self.upgrade];
+                for m in modules {
+                    if m.load_meta(key, v)? {
+                        return Ok(());
+                    }
+                }
+                bail!("unknown scalar record {}", String::from_utf8_lossy(key))
+            }
         }
         Ok(())
     }
@@ -236,7 +321,7 @@ impl State {
     }
 
     pub fn record_count(&self) -> usize {
-        6 + self.tables().iter().map(|(_, t)| t.record_count()).sum::<usize>()
+        self.meta_records().len() + self.tables().iter().map(|(_, t)| t.record_count()).sum::<usize>()
     }
 
     /// The current encoded value of a record.
@@ -283,21 +368,35 @@ impl State {
         let mut last: Option<(u8, Vec<u8>)> = None;
         let mut scalars = vec![];
         let mut leaves = vec![];
-        for r in records {
-            let (n, key, value) = r?;
+        let mut in_order = |n: u8, key: &[u8], value: &[u8]| -> Result<()> {
             if let Some(prev) = &last {
-                ensure!((prev.0, prev.1.as_slice()) < (n, key.as_slice()), "records out of order at namespace {n}");
+                ensure!((prev.0, prev.1.as_slice()) < (n, key), "records out of order at namespace {n}");
             }
-            if n == ns::META {
-                state.load_meta(&key, &value)?;
-                scalars.push((key.clone(), value.clone()));
-            } else {
-                let Some((_, t)) = state.tables_mut().into_iter().find(|(m, _)| *m == n) else { bail!("unknown record namespace {n}") };
-                t.load(&key, &value)?;
+            leaves.push((tree::key_hash(n, key), Some(tree::value_hash(value))));
+            last = Some((n, key.to_vec()));
+            Ok(())
+        };
+        // The scalars come first (namespace 0), then the maps' records.
+        let mut records = records.into_iter();
+        let mut first_map_record = None;
+        for r in records.by_ref() {
+            let (n, key, value) = r?;
+            if n != ns::META {
+                first_map_record = Some((n, key, value));
+                break;
             }
-            leaves.push((tree::key_hash(n, &key), Some(tree::value_hash(&value))));
-            last = Some((n, key));
+            in_order(n, &key, &value)?;
+            state.load_meta(&key, &value)?;
+            scalars.push((key, value));
         }
+        let mut tables = state.tables_mut();
+        for r in first_map_record.map(Ok).into_iter().chain(records) {
+            let (n, key, value) = r?;
+            in_order(n, &key, &value)?;
+            let Some((_, t)) = tables.iter_mut().find(|(m, _)| *m == n) else { bail!("unknown record namespace {n}") };
+            t.load(&key, &value)?;
+        }
+        drop(tables);
         let expected: Vec<(Vec<u8>, Vec<u8>)> = state.meta_records().into_iter().map(|(k, v)| (k.to_vec(), v)).collect();
         ensure!(scalars == expected, "missing or non-canonical scalar records");
         leaves.sort_unstable_by_key(|(k, _)| *k);
@@ -336,7 +435,14 @@ impl State {
             }
         }
         held += p.seances.values().filter(|s| !s.closed).map(|s| s.budget as u128).sum::<u128>();
+        // The protocol v1 modules' escrows: stake and unbonding, proposal deposits, open distributions.
+        held += crate::staking::escrow(self) + crate::governance::escrow(self);
         ensure!(held == self.supply as u128, "supply is {} drops but balances and escrows hold {held}", self.supply);
+        crate::staking::check_invariants(self)?;
+        crate::governance::check_invariants(self)?;
+        crate::econ::check_invariants(self)?;
+        crate::beacon::check_invariants(self)?;
+        crate::upgrade::check_invariants(self)?;
 
         for h in open_hunts {
             let funded = h.funders.values().map(|v| v.parse::<u128>().unwrap_or(u128::MAX)).sum::<u128>();
