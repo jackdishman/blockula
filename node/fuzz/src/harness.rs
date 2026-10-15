@@ -13,13 +13,13 @@ use crate::{
     ghost,
     node::{self, SyncBatch},
     pq::{self, MlDsaScheme, PrivateKey},
-    snapshot,
+    snapshot, staking,
     state::tree,
     types::{self, Action, KeyRole, ProposalKind, Tx},
 };
 use commonware_codec::{Decode as _, DecodeExt as _, Encode as _};
 use commonware_consensus::{
-    simplex::types::{Certificate, Finalization, Finalize, Notarization, Notarize, Nullification, Nullify, Proposal, Vote},
+    simplex::types::{Activity, Certificate, ConflictingFinalize, ConflictingNotarize, Finalization, Finalize, Notarization, Notarize, Nullification, Nullify, NullifyFinalize, Proposal, Vote},
     types::{Epoch, Round, View},
 };
 use commonware_cryptography::{Digestible as _, Signer as _, blake3::Digest, certificate::Verifier as _};
@@ -30,7 +30,7 @@ use serde_json::{Value, json};
 use std::sync::{Arc, OnceLock};
 
 /// The fuzz targets, by name (`fuzz_targets/<name>.rs`, `seeds/<name>/`).
-pub const TARGETS: [&str; 10] = ["cblock", "tx_json", "tx_wire", "ghost_tx", "snapshot_manifest", "state_snapshot", "sync_batch", "epochs_registry", "certificate", "state_machine"];
+pub const TARGETS: [&str; 11] = ["cblock", "tx_json", "tx_wire", "ghost_tx", "snapshot_manifest", "state_snapshot", "sync_batch", "epochs_registry", "certificate", "state_machine", "evidence"];
 
 /// Runs target `name` on `data`.
 pub fn run(name: &str, data: &[u8]) -> bool {
@@ -45,6 +45,7 @@ pub fn run(name: &str, data: &[u8]) -> bool {
         "epochs_registry" => epochs_registry(data),
         "certificate" => certificate(data),
         "state_machine" => state_machine(data),
+        "evidence" => evidence(data),
         _ => panic!("unknown fuzz target {name}"),
     }
 }
@@ -335,6 +336,95 @@ pub fn certificate(data: &[u8]) -> bool {
         };
     }
     decoded
+}
+
+// ---------------------------------------------------------------------------------- evidence
+
+/// Epochs the evidence fixture's 4-validator set (`SET_SEEDS`) is active in: 0 through this one.
+const EVIDENCE_EPOCHS: u64 = 3;
+const EVIDENCE_EPOCH_BLOCKS: u64 = 10;
+/// Owns the fixture validators' pools (so slashes take real stake) and reports the evidence.
+const EVIDENCE_OWNER: [u8; 32] = [0x61; 32];
+
+/// The state `evidence` verifies against: the `SET_SEEDS` validators, bonded by one owner, active
+/// in epochs 0–`EVIDENCE_EPOCHS`, at the last block of that epoch.
+fn evidence_state() -> &'static (State, u64) {
+    static S: OnceLock<(State, u64)> = OnceLock::new();
+    S.get_or_init(|| {
+        let owner = Keys::from_seed(EVIDENCE_OWNER);
+        let validators: Vec<Value> = SET_SEEDS.iter().enumerate().map(|(i, s)| {
+            let k = PrivateKey::from_seed_bytes(*s).public_key();
+            json!({ "address": k.address(prefix()), "public_key": hex::encode(k.as_ref()), "p2p_addr": format!("127.0.0.1:{}", 7101 + i), "http_addr": format!("127.0.0.1:{}", 7201 + i) })
+        }).collect();
+        let operators: Vec<Value> = SET_SEEDS.iter().zip(&validators).map(|(s, v)| {
+            let (p2p, http) = (v["p2p_addr"].as_str().unwrap(), v["http_addr"].as_str().unwrap());
+            json!({ "owner": owner.address(), "consensus_key": v["public_key"], "pop": crate::chain::make_pop(*s, CHAIN_ID, &owner.address(), p2p, http), "p2p_addr": p2p, "http_addr": http, "self_bond": "10000000000000", "commission_bps": 0 })
+        }).collect();
+        let g: Genesis = serde_json::from_value(json!({
+            "chain_id": CHAIN_ID, "token": "FANG", "decimals": 9, "block_time_ms": 1000, "faucet": false, "created_at_ms": GENESIS_MS, "epoch_blocks": EVIDENCE_EPOCH_BLOCKS,
+            "validators": validators, "operators": operators,
+            "allocations": [{ "address": owner.address(), "amount": "1000000000000000" }],
+        }))
+        .expect("evidence fixture genesis no longer parses: update harness::evidence_state");
+        let mut st = g.initial_state();
+        let set = st.active_sets[&0].clone();
+        for e in 1..=EVIDENCE_EPOCHS {
+            st.active_sets.insert(e, set.clone());
+        }
+        let height = st.params.last_of(EVIDENCE_EPOCHS);
+        (st, height)
+    })
+}
+
+/// `ReportEquivocation` evidence, which any account may send: `staking::decode_evidence` accepts
+/// only canonical encodings of the three fault kinds, and it, `verify_evidence`,
+/// `evidence_status` and the explorer's description never panic. Evidence that verifies is
+/// reported in a tx against a fixture with the 4-validator set: it applies, slashes and
+/// tombstones once (the state's invariants hold after), and the same fault reported again fails.
+pub fn evidence(data: &[u8]) -> bool {
+    if let Ok(e) = staking::decode_evidence(data) {
+        assert_eq!(e.activity.encode().as_ref(), data, "decode_evidence accepted a non-canonical encoding");
+        assert!((staking::CONFLICTING_NOTARIZE..=staking::NULLIFY_FINALIZE).contains(&e.kind));
+    }
+    let (st, height) = evidence_state();
+    let _ = staking::evidence_status(st, CHAIN_ID, data, *height);
+    let Ok(fault) = staking::verify_evidence(st, CHAIN_ID, data, *height) else { return false };
+    assert!(st.active_sets[&fault.epoch].contains(&fault.validator), "verified evidence names a validator outside its epoch's set");
+    let owner = Keys::from_seed(EVIDENCE_OWNER);
+    let report = |st: &State, nonce: u64| {
+        let mut tx = Tx { chain_id: CHAIN_ID.into(), genesis_hash: "00".repeat(32), from: owner.address(), nonce, fee: 0, tip: 0, valid_until: height + 10, action: Action::ReportEquivocation { evidence: hex::encode(data) }, memo: String::new(), public_key: hex::encode(owner.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+        tx.fee = crate::econ::base_fee(st, *height, tx.size());
+        tx
+    };
+    let mut st = st.clone();
+    let proposer = st.active_sets[&0][0].clone();
+    let tx = report(&st, 0);
+    let _ = st.describe_with(&tx, None, &|_| None);
+    let supply = st.supply;
+    assert_eq!(st.apply(&tx, CHAIN_ID, &proposer, *height).expect("verified evidence is admitted"), Outcome::Applied, "verified evidence must apply");
+    assert!(st.supply <= supply, "a slash minted FANG");
+    assert!(st.validators[&fault.validator].status == crate::chain::ValidatorStatus::Tombstoned, "the offender isn't tombstoned");
+    if let Err(e) = st.check_invariants() {
+        panic!("invariant broken after a slash: {e}");
+    }
+    assert!(matches!(st.apply(&report(&st, 1), CHAIN_ID, &proposer, *height), Ok(Outcome::Failed(_))), "a fault is punished once");
+    true
+}
+
+/// Fault evidence by the `SET_SEEDS` validator at index `signer` of the sorted set, in `epoch`
+/// at `view`: both votes really signed.
+fn evidence_seed(kind: u8, signer: usize, epoch: u64, view: u64) -> Vec<u8> {
+    let set = four_validators();
+    let key = SET_SEEDS.iter().map(|s| PrivateKey::from_seed_bytes(*s)).find(|k| set.position(&k.public_key()) == Some(signer)).unwrap();
+    let s = MlDsaScheme::signer(&consensus::namespace(CHAIN_ID), set, key).unwrap();
+    let round = Round::new(Epoch::new(epoch), View::new(view));
+    let p = |d: u8| Proposal::new(round, View::new(view - 1), Digest([d; 32]));
+    let activity = match kind {
+        staking::CONFLICTING_NOTARIZE => Activity::ConflictingNotarize(ConflictingNotarize::new(Notarize::sign(&s, p(1)).unwrap(), Notarize::sign(&s, p(2)).unwrap())),
+        staking::CONFLICTING_FINALIZE => Activity::ConflictingFinalize(ConflictingFinalize::new(Finalize::sign(&s, p(1)).unwrap(), Finalize::sign(&s, p(2)).unwrap())),
+        _ => Activity::NullifyFinalize(NullifyFinalize::new(Nullify::sign::<Digest>(&s, round).unwrap(), Finalize::sign(&s, p(1)).unwrap())),
+    };
+    activity.encode().to_vec()
 }
 
 // ------------------------------------------------------------------------------ state machine
@@ -890,5 +980,10 @@ pub fn seeds() -> Vec<(&'static str, &'static str, Vec<u8>)> {
     }
     raw.extend(sm_ops(&[(34, 0, 0, 0)]));
     out.push(("state_machine", "raw-actions", raw));
+
+    // Equivocation evidence of each kind, from different members, epochs and views.
+    out.push(("evidence", "conflicting-notarize", evidence_seed(staking::CONFLICTING_NOTARIZE, 0, 1, 4)));
+    out.push(("evidence", "conflicting-finalize", evidence_seed(staking::CONFLICTING_FINALIZE, 2, 3, 9)));
+    out.push(("evidence", "nullify-finalize", evidence_seed(staking::NULLIFY_FINALIZE, 3, 0, 1)));
     out
 }
