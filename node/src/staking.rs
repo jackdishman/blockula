@@ -105,3 +105,17 @@ mod tests {
         assert_eq!((super::fmt_bps(250), super::fmt_bps(500), super::fmt_bps(1), super::fmt_bps(10_000)), ("2.5".into(), "5".into(), "0.01".into(), "100".into()));
     }
 }
+
+// STUB(owner P-STAKE): replaced at merge. Bonded value (the self-bonds of validators `account`
+// owns; pool shares come with P-STAKE) and unbonding total (none yet).
+pub fn holdings(state: &State, account: &str) -> (u64, u64) {
+    let bonded = state.validators.values().filter(|v| v.owner == account).map(|v| v.bond as u128).sum::<u128>();
+    (bonded.min(u64::MAX as u128) as u64, 0)
+}
+
+// STUB(owner P-STAKE): replaced at merge. The validator in `epoch`'s active set that `account`
+// is (its consensus key's account) or owns. `signer_key_id` is already authorized on `account`.
+pub fn validator_for_signer(state: &State, account: &str, _signer_key_id: &str, epoch: u64) -> Option<String> {
+    let set = state.active_sets.get(&epoch)?;
+    set.iter().find(|v| *v == account).or_else(|| set.iter().find(|v| state.validators.get(*v).is_some_and(|r| r.owner == account))).cloned()
+}

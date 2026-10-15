@@ -143,6 +143,8 @@ chain_params! { |day, epoch|
     governance_spend_height: 182 * day, [0, 3_650 * day];
     /// Until this height ⅔ of the active validators can pass a proposal (the bootstrap council).
     bootstrap_end_height: 365 * day, [0, 3_650 * day];
+    /// How long a multisig proposal (`MultisigPropose`) waits for its approvals.
+    multisig_expiry_blocks: 7 * day, [10, 90 * day];
 
     // ---- names (DEC-11) ----
     /// Registration price by name length: 3 characters, 4, and 5 or more.

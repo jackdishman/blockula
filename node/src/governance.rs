@@ -1,10 +1,28 @@
-//! On-chain governance (P-GOV, MAINNET-DESIGN 3.5): proposals with deposits, conviction voting,
-//! the bootstrap validator council, the timelock, treasury spends, community distributions with
-//! Merkle claims, and M-of-N multisig accounts.
+//! On-chain governance (P-GOV, MAINNET-DESIGN 3.5, docs/GOVERNANCE.md): proposals with deposits,
+//! conviction voting, the bootstrap validator council, the timelock, treasury spends, community
+//! distributions with Merkle claims, and M-of-N multisig accounts.
 //!
-//! Scaffold: the sub-state and its record plumbing, a journal, the tx dispatch (every action
-//! fails with "not active yet") and the end-of-block hook (a no-op). The parameters (deposit,
-//! voting and timelock periods, quorum, the conviction ladder) are in params.rs.
+//! **Lifecycle.** `Propose` escrows a deposit (at least `proposal_deposit`) and opens a vote that
+//! takes `Vote`s through block `voting_end = created_at + voting_blocks`. At the end of that
+//! block the vote closes ([`end_block`]): the deposit is refunded if the vote reached quorum
+//! (or, during the bootstrap, ⅔ of the council voted) and burned otherwise; a proposal that
+//! passed is queued and runs at the end of block `voting_end + timelock_blocks`. A proposal whose
+//! action fails when it runs changes nothing and is marked failed.
+//!
+//! **Tally.** Quorum is `max(quorum_floor, quorum_bps × unlocked supply)` on the raw FANG voted
+//! (aye + nay), where the unlocked supply is what could vote: Σ `econ::voting_balance` over every
+//! account but the keyless system ones. A proposal passes on tokens if it reached quorum and its
+//! conviction-weighted ayes beat the nays: by a simple majority, or by `supermajority_bps` of the
+//! weight for upgrades, issuance parameters and treasury spends above `treasury_large_bps` of the
+//! treasury. Until `bootstrap_end_height` it also passes if ⅔ of the active set approve
+//! (a validator's council vote is any `Vote` its consensus key or owner signs) and the
+//! token-weighted nays don't exceed the ayes.
+//!
+//! **Votes** lock `amount` of the voter's unlocked holdings (`econ::lock`, id `vote:<proposal>`)
+//! until `conviction` lock periods after voting ends; weight is `amount` × 0.1 at conviction 0,
+//! then 1×–6× (params.rs). Locks overlap across proposals. A re-vote replaces the voter's vote;
+//! its lock only ever grows. `Unlock` releases expired locks.
+//!
 //! Proposal kinds that replace admin levers call the signer-free bodies the admin txs use:
 //!
 //! | `ProposalKind` | executes |
@@ -21,65 +39,987 @@
 //! | `ScheduleUpgrade`, `ActivateFeature`, `DeactivateFeature` | `upgrade::exec_schedule_upgrade`, `exec_activate_feature`, `exec_deactivate_feature` |
 //! | `Text` | nothing |
 //!
-//! A map is added by declaring it in [`Governance`] under one of this module's namespaces
-//! (`state::ns` 37–42) and journaling it in [`GovernanceJournal`].
+//! **Distributions** move `total` from the community account into an escrow claimable until
+//! `claim_until` with Merkle proofs: BLAKE3 leaves over `(distribution_id, address, amount)`
+//! (the id is the proposal's), sorted-pair inner nodes ([`distribution_leaf`], [`merkle_parent`]).
+//! What's unclaimed returns to the community account after `claim_until`.
+//!
+//! **Multisig (SF-11).** `MultisigCreate` makes an account M-of-N over its owner keys. From then
+//! on its owner keys may only sign `MultisigPropose` and `MultisigApprove` (admission refuses
+//! anything else, [`check_multisig_admission`]); an action runs, as the account, in the tx that
+//! brings it to `threshold` approvals. Session keys keep working within their limits. Proposals
+//! expire after `multisig_expiry_blocks`.
 
-// Scaffold: the hooks and records are filled in by P-GOV.
-#![cfg_attr(not(test), allow(dead_code))]
-
-use crate::chain::{short, BlockInfo, Journal, KeyRecord, State};
+use crate::chain::{community, short, system_account, BlockInfo, Journal, KeyRecord, State};
+use crate::crypto;
+use crate::params::vote_weight;
 use crate::poc::fmt_soul;
-use crate::state::{SubState, Table};
+use crate::state::codec::{decode, encode, RecordKey};
+use crate::state::{meta, ns, JMap, SubState, TMap, Table};
 use crate::types::*;
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, ensure, Result};
+use borsh::{BorshDeserialize, BorshSerialize};
+use serde::Serialize;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
+
+/// Most open proposals one multisig account may have at once.
+pub const MAX_MULTISIG_PENDING: usize = 32;
+/// Domain separators of distribution Merkle trees (docs/GOVERNANCE.md).
+pub const LEAF_DOMAIN: &[u8] = b"BLOCKULA_DISTRIBUTION_LEAF_V1";
+pub const NODE_DOMAIN: &[u8] = b"BLOCKULA_DISTRIBUTION_NODE_V1";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalStatus {
+    /// Taking votes through `voting_end`.
+    Voting,
+    /// Passed; runs at `execute_at` (the timelock).
+    Queued,
+    /// Didn't pass (`outcome` says why).
+    Rejected,
+    Executed,
+    /// Passed, but its action failed when it ran (`outcome` says why); nothing changed.
+    Failed,
+}
+
+impl ProposalStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProposalStatus::Voting => "voting",
+            ProposalStatus::Queued => "queued",
+            ProposalStatus::Rejected => "rejected",
+            ProposalStatus::Executed => "executed",
+            ProposalStatus::Failed => "failed",
+        }
+    }
+}
+
+/// A validator's bootstrap-council vote, and the account whose `Vote` cast it.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct CouncilVote {
+    pub aye: bool,
+    pub voter: String,
+}
+
+/// How a vote went, recorded when voting closes.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct Tally {
+    /// Σ `econ::voting_balance` (what could have voted) and the quorum it set.
+    pub unlocked: u128,
+    pub quorum: u128,
+    pub quorum_reached: bool,
+    /// Whether the ayes needed `supermajority_bps` of the weight.
+    pub supermajority: bool,
+    /// The council at the close (0 after the bootstrap): active-set size, ayes and nays in it.
+    pub council_size: u64,
+    pub council_ayes: u64,
+    pub council_nays: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct Proposal {
+    pub id: u64,
+    pub proposer: String,
+    /// What it does. Accounts named by `.boo` name are resolved when it's proposed, so the
+    /// account voters saw is the one it acts on.
+    pub kind: ProposalKind,
+    pub title: String,
+    pub url: String,
+    /// Escrowed while voting; refunded or burned when voting closes.
+    pub deposit: u64,
+    pub created_at: u64,
+    /// Last block votes count in.
+    pub voting_end: u64,
+    /// When a passed proposal runs (`voting_end + timelock_blocks`).
+    pub execute_at: Option<u64>,
+    pub status: ProposalStatus,
+    /// Raw FANG behind the ayes and nays (quorum counts these) …
+    pub aye_amount: u128,
+    pub nay_amount: u128,
+    /// … and their conviction weights (the majority counts these).
+    pub aye_weight: u128,
+    pub nay_weight: u128,
+    pub voters: u64,
+    /// Bootstrap council votes, by validator.
+    pub council: BTreeMap<String, CouncilVote>,
+    pub tally: Option<Tally>,
+    /// Why it was rejected or failed, or what it did.
+    pub outcome: String,
+}
+
+/// One account's vote on one proposal.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct VoteRecord {
+    pub aye: bool,
+    pub amount: u64,
+    pub conviction: u8,
+    pub weight: u128,
+    /// The vote lock (`vote:<proposal>`): `lock_amount` stays locked while the height is below
+    /// `locked_until`. Re-votes only ever grow it.
+    pub lock_amount: u64,
+    pub locked_until: u64,
+    /// The validator this vote also counted for in the bootstrap council.
+    pub council: Option<String>,
+    pub at: u64,
+}
+
+/// `(id, account)` record keys: votes by (proposal, voter), distribution claims by
+/// (distribution, claimant). Key bytes: the id big-endian, then the account, so they sort like
+/// the pair.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct IdKey {
+    pub id: u64,
+    pub account: String,
+}
+
+impl IdKey {
+    pub fn new(id: u64, account: &str) -> Self {
+        Self { id, account: account.to_string() }
+    }
+}
+
+impl RecordKey for IdKey {
+    fn key_bytes(&self) -> Cow<'_, [u8]> {
+        let mut b = self.id.to_be_bytes().to_vec();
+        b.extend_from_slice(self.account.as_bytes());
+        Cow::Owned(b)
+    }
+    fn from_key_bytes(b: &[u8]) -> Result<Self> {
+        ensure!(b.len() >= 8, "record key too short");
+        let (id, account) = b.split_at(8);
+        Ok(Self { id: u64::from_be_bytes(id.try_into().expect("8 bytes")), account: String::from_key_bytes(account)? })
+    }
+}
+
+/// An M-of-N account. Its owners are its owner keys, whatever they are at the time.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct Multisig {
+    pub threshold: u8,
+    pub created_at: u64,
+    /// Open proposals (ids), at most [`MAX_MULTISIG_PENDING`].
+    pub pending: BTreeSet<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct MultisigProposal {
+    pub id: u64,
+    pub account: String,
+    pub action: Action,
+    /// Key ids: the proposer's first.
+    pub proposed_by: String,
+    pub approvals: BTreeSet<String>,
+    pub created_at: u64,
+    /// Last block it can be approved in.
+    pub expires_at: u64,
+}
+
+/// A community distribution (its id is the proposal's).
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct Distribution {
+    pub id: u64,
+    /// Hex BLAKE3 root of the tree of `(id, address, amount)` leaves.
+    pub merkle_root: String,
+    pub total: u64,
+    pub claimed: u64,
+    pub claims: u64,
+    pub opened_at: u64,
+    /// Last block a claim can land in.
+    pub claim_until: u64,
+    /// When the rest went back to the community account, and how much.
+    pub closed_at: Option<u64>,
+    pub returned: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct DistributionClaim {
+    pub amount: u64,
+    pub at: u64,
+}
 
 /// Governance's slice of the state (namespaces `state::ns` 37–42, META key `governance`).
 #[derive(Clone, Debug, Default)]
-pub struct Governance {}
+pub struct Governance {
+    pub proposals: TMap<u64, Proposal>,
+    pub votes: TMap<IdKey, VoteRecord>,
+    pub multisigs: TMap<String, Multisig>,
+    pub multisig_proposals: TMap<u64, MultisigProposal>,
+    pub distributions: TMap<u64, Distribution>,
+    pub distribution_claims: TMap<IdKey, DistributionClaim>,
+    pub next_proposal_id: u64,
+    pub next_multisig_id: u64,
+    /// Proposals voting or queued, and distributions still open: all `end_block` looks at.
+    pub open_proposals: BTreeSet<u64>,
+    pub open_distributions: BTreeSet<u64>,
+}
+
+type Scalars = (u64, u64, BTreeSet<u64>, BTreeSet<u64>);
+
+impl Governance {
+    fn scalars(&self) -> Scalars {
+        (self.next_proposal_id, self.next_multisig_id, self.open_proposals.clone(), self.open_distributions.clone())
+    }
+}
 
 impl SubState for Governance {
     fn tables(&self) -> Vec<(u8, &dyn Table)> {
-        let Governance {} = self;
-        vec![]
+        let Governance { proposals, votes, multisigs, multisig_proposals, distributions, distribution_claims, next_proposal_id: _, next_multisig_id: _, open_proposals: _, open_distributions: _ } = self;
+        vec![(ns::GOV_PROPOSALS, proposals), (ns::GOV_VOTES, votes), (ns::GOV_MULTISIGS, multisigs), (ns::GOV_MULTISIG_PROPOSALS, multisig_proposals), (ns::GOV_DISTRIBUTIONS, distributions), (ns::GOV_DISTRIBUTION_CLAIMS, distribution_claims)]
     }
 
     fn tables_mut(&mut self) -> Vec<(u8, &mut dyn Table)> {
-        let Governance {} = self;
-        vec![]
+        let Governance { proposals, votes, multisigs, multisig_proposals, distributions, distribution_claims, next_proposal_id: _, next_multisig_id: _, open_proposals: _, open_distributions: _ } = self;
+        vec![(ns::GOV_PROPOSALS, proposals), (ns::GOV_VOTES, votes), (ns::GOV_MULTISIGS, multisigs), (ns::GOV_MULTISIG_PROPOSALS, multisig_proposals), (ns::GOV_DISTRIBUTIONS, distributions), (ns::GOV_DISTRIBUTION_CLAIMS, distribution_claims)]
+    }
+
+    fn meta_records(&self) -> Vec<(&'static [u8], Vec<u8>)> {
+        vec![(meta::GOVERNANCE, encode(&self.scalars()))]
+    }
+
+    fn load_meta(&mut self, key: &[u8], value: &[u8]) -> Result<bool> {
+        if key != meta::GOVERNANCE {
+            return Ok(false);
+        }
+        (self.next_proposal_id, self.next_multisig_id, self.open_proposals, self.open_distributions) = decode::<Scalars>(value)?;
+        Ok(true)
     }
 }
 
 /// Undo log for [`Governance`] (part of `chain::Journal`).
 #[derive(Default)]
-pub struct GovernanceJournal {}
+pub struct GovernanceJournal {
+    proposals: JMap<u64, Proposal>,
+    votes: JMap<IdKey, VoteRecord>,
+    multisigs: JMap<String, Multisig>,
+    multisig_proposals: JMap<u64, MultisigProposal>,
+    distributions: JMap<u64, Distribution>,
+    distribution_claims: JMap<IdKey, DistributionClaim>,
+    scalars: Option<Scalars>,
+}
 
 impl GovernanceJournal {
     pub fn absorb(&mut self, other: GovernanceJournal) {
-        let GovernanceJournal {} = other;
+        let GovernanceJournal { proposals, votes, multisigs, multisig_proposals, distributions, distribution_claims, scalars } = other;
+        self.proposals.absorb(proposals);
+        self.votes.absorb(votes);
+        self.multisigs.absorb(multisigs);
+        self.multisig_proposals.absorb(multisig_proposals);
+        self.distributions.absorb(distributions);
+        self.distribution_claims.absorb(distribution_claims);
+        if self.scalars.is_none() {
+            self.scalars = scalars;
+        }
     }
 
-    pub fn rollback(self, governance: &mut Governance) {
-        let Governance {} = governance;
+    pub fn rollback(self, g: &mut Governance) {
+        let GovernanceJournal { proposals, votes, multisigs, multisig_proposals, distributions, distribution_claims, scalars } = self;
+        proposals.restore(&mut g.proposals);
+        votes.restore(&mut g.votes);
+        multisigs.restore(&mut g.multisigs);
+        multisig_proposals.restore(&mut g.multisig_proposals);
+        distributions.restore(&mut g.distributions);
+        distribution_claims.restore(&mut g.distribution_claims);
+        if let Some(s) = scalars {
+            (g.next_proposal_id, g.next_multisig_id, g.open_proposals, g.open_distributions) = s;
+        }
     }
+}
+
+// Records store a proposal kind and a multisig action in their tx encoding (types.rs), which is
+// canonical and strictly decoded, as a length-prefixed byte string.
+impl BorshSerialize for ProposalKind {
+    fn serialize<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        BorshSerialize::serialize(&self.to_bytes(), w)
+    }
+}
+
+impl BorshDeserialize for ProposalKind {
+    fn deserialize_reader<R: std::io::Read>(r: &mut R) -> std::io::Result<Self> {
+        ProposalKind::from_bytes(&Vec::<u8>::deserialize_reader(r)?).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+    }
+}
+
+impl BorshSerialize for Action {
+    fn serialize<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        BorshSerialize::serialize(&self.to_bytes(), w)
+    }
+}
+
+impl BorshDeserialize for Action {
+    fn deserialize_reader<R: std::io::Read>(r: &mut R) -> std::io::Result<Self> {
+        Action::from_bytes(&Vec::<u8>::deserialize_reader(r)?).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+    }
+}
+
+// ---- journaled access
+
+fn save_scalars(state: &State, j: &mut Journal) {
+    if j.governance.scalars.is_none() {
+        j.governance.scalars = Some(state.governance.scalars());
+    }
+}
+
+fn proposal_mut<'a>(state: &'a mut State, j: &mut Journal, id: u64) -> &'a mut Proposal {
+    j.governance.proposals.touch(&state.governance.proposals, &id);
+    state.governance.proposals.get_mut(&id).expect("the caller checked the proposal exists")
+}
+
+fn put_multisig(state: &mut State, j: &mut Journal, account: &str, m: Multisig) {
+    j.governance.multisigs.touch(&state.governance.multisigs, account);
+    state.governance.multisigs.insert(account.to_string(), m);
+}
+
+fn put_multisig_proposal(state: &mut State, j: &mut Journal, p: Option<MultisigProposal>, id: u64) {
+    j.governance.multisig_proposals.touch(&state.governance.multisig_proposals, &id);
+    match p {
+        Some(p) => state.governance.multisig_proposals.insert(id, p),
+        None => state.governance.multisig_proposals.remove(&id),
+    };
+}
+
+fn owner_only(key: &KeyRecord, what: &str) -> Result<()> {
+    if key.role != KeyRole::Owner {
+        bail!("only owner keys can {what}");
+    }
+    Ok(())
+}
+
+/// The key ids of an account's owner keys.
+pub fn owner_keys(state: &State, account: &str) -> BTreeSet<String> {
+    state.keys_of(account).into_iter().filter(|(_, k)| k.role == KeyRole::Owner).map(|(id, _)| id).collect()
 }
 
 /// Tags 39–44 and 48: Propose, Vote, Unlock, MultisigCreate, MultisigPropose, MultisigApprove,
 /// ClaimDistribution.
-pub(crate) fn apply(_state: &mut State, _j: &mut Journal, _tx: &Tx, _sender: &str, _signer: &str, _key: &KeyRecord, _height: u64) -> Result<()> {
-    bail!("not active yet")
+pub(crate) fn apply(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, signer: &str, key: &KeyRecord, height: u64) -> Result<()> {
+    match &tx.action {
+        Action::Propose { kind, deposit, title, url } => propose(state, j, sender, key, kind, *deposit, title, url, height),
+        Action::Vote { proposal_id, aye, amount, conviction } => vote(state, j, sender, signer, key, *proposal_id, *aye, *amount, *conviction, height),
+        Action::Unlock {} => {
+            owner_only(key, "unlock votes")?;
+            if crate::econ::release_expired(state, j, sender, height) == 0 {
+                bail!("no expired vote locks to release");
+            }
+            Ok(())
+        }
+        Action::MultisigCreate { owners, threshold } => multisig_create(state, j, sender, key, owners, *threshold, height),
+        Action::MultisigPropose { action } => multisig_propose(state, j, tx, sender, signer, key, action, height),
+        Action::MultisigApprove { id } => multisig_approve(state, j, tx, sender, signer, key, *id, height),
+        Action::ClaimDistribution { distribution_id, amount, proof } => claim_distribution(state, j, sender, *distribution_id, *amount, proof, height),
+        _ => bail!("not a governance action"),
+    }
 }
 
-/// After `staking::end_block`, every block: close voting on proposals that ended, refund or burn
-/// deposits, and execute those whose timelock is over; expire distributions.
-pub fn end_block(_state: &mut State, _b: &BlockInfo) {}
+// ---- proposals and votes
 
-/// FANG governance holds outside balances (proposal deposits, open distributions).
-pub fn escrow(_state: &State) -> u128 {
-    0
+/// Spending proposals are refused before `governance_spend_height` (3.5).
+fn spend_gate(state: &State, height: u64) -> Result<()> {
+    let open = state.chain_params.governance_spend_height;
+    if height < open {
+        bail!("spending proposals open at block {open} (governance_spend_height)");
+    }
+    Ok(())
 }
 
-/// Governance's consistency rules (part of `State::check_invariants`).
-pub fn check_invariants(_state: &State) -> Result<()> {
+/// The kind as it will be stored: account names resolved to addresses, and what can already be
+/// known to fail refused (it's checked again when it runs).
+fn prepare_kind(state: &State, kind: &ProposalKind, height: u64) -> Result<ProposalKind> {
+    let cp = &state.chain_params;
+    let runs_at = height.saturating_add(cp.voting_blocks).saturating_add(cp.timelock_blocks);
+    let mut k = kind.clone();
+    match &mut k {
+        ProposalKind::ParamChange { key, value } => {
+            cp.clone().set(key, *value, &state.params)?;
+        }
+        ProposalKind::TreasurySpend { to, .. } => {
+            spend_gate(state, height)?;
+            *to = state.resolve(to)?;
+        }
+        ProposalKind::Distribution { claim_until, .. } => {
+            spend_gate(state, height)?;
+            if *claim_until <= runs_at {
+                bail!("claim_until must be after the vote and the timelock (block {runs_at})");
+            }
+        }
+        ProposalKind::GrantSoul { to, .. } => *to = state.resolve(to)?,
+        ProposalKind::FlagSybil { account, .. } | ProposalKind::Clawback { account, .. } => *account = state.resolve(account)?,
+        ProposalKind::RejectClaim { claim_id, .. } => {
+            if !state.poc.claims.contains_key(claim_id) {
+                bail!("no claim #{claim_id}");
+            }
+        }
+        ProposalKind::UnlinkGithub { handle } => {
+            if !state.github.contains_key(&handle.to_ascii_lowercase()) {
+                bail!("@{handle} isn't linked");
+            }
+        }
+        ProposalKind::RefundHunt { hunt_id } => match state.hunts.get(hunt_id) {
+            Some(h) if h.status == crate::chain::HuntStatus::Open => {}
+            Some(h) => bail!("hunt #{hunt_id} is already {:?}", h.status),
+            None => bail!("no hunt #{hunt_id}"),
+        },
+        ProposalKind::ScheduleUpgrade { activation_height, .. } => {
+            if *activation_height <= runs_at {
+                bail!("activation_height must be after the vote and the timelock (block {runs_at})");
+            }
+        }
+        ProposalKind::ActivateFeature { feature } | ProposalKind::DeactivateFeature { feature } => {
+            if !crate::upgrade::KNOWN_FEATURES.contains(&feature.as_str()) {
+                bail!("unknown feature {feature} (known: {})", crate::upgrade::KNOWN_FEATURES.join(", "));
+            }
+        }
+        ProposalKind::SetRepo { .. } | ProposalKind::Text {} => {}
+    }
+    Ok(k)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn propose(state: &mut State, j: &mut Journal, sender: &str, key: &KeyRecord, kind: &ProposalKind, deposit: u64, title: &str, url: &str, height: u64) -> Result<()> {
+    owner_only(key, "make proposals")?;
+    let min = state.chain_params.proposal_deposit;
+    if deposit < min {
+        bail!("a proposal bonds at least {}", fmt_fang(min));
+    }
+    let kind = prepare_kind(state, kind, height)?;
+    state.j_debit(j, sender, deposit)?;
+    save_scalars(state, j);
+    let g = &mut state.governance;
+    let id = g.next_proposal_id;
+    g.next_proposal_id = id.checked_add(1).ok_or_else(|| anyhow!("proposal ids exhausted"))?;
+    g.open_proposals.insert(id);
+    let voting_end = height.saturating_add(state.chain_params.voting_blocks);
+    let p = Proposal { id, proposer: sender.to_string(), kind, title: title.to_string(), url: url.to_string(), deposit, created_at: height, voting_end, execute_at: None, status: ProposalStatus::Voting, aye_amount: 0, nay_amount: 0, aye_weight: 0, nay_weight: 0, voters: 0, council: BTreeMap::new(), tally: None, outcome: String::new() };
+    j.governance.proposals.touch(&state.governance.proposals, &id);
+    state.governance.proposals.insert(id, p);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn vote(state: &mut State, j: &mut Journal, sender: &str, signer: &str, key: &KeyRecord, id: u64, aye: bool, amount: u64, conviction: u8, height: u64) -> Result<()> {
+    owner_only(key, "vote")?;
+    let p = state.governance.proposals.get(&id).ok_or_else(|| anyhow!("no proposal #{id}"))?;
+    if p.status != ProposalStatus::Voting || height > p.voting_end {
+        bail!("voting on proposal #{id} closed at block {}", p.voting_end);
+    }
+    let voting_end = p.voting_end;
+    let cp = &state.chain_params;
+    let (weight, lock_blocks) = vote_weight(amount, conviction).zip(cp.vote_lock_blocks(conviction)).ok_or_else(|| anyhow!("conviction must be 0–{}", crate::params::MAX_CONVICTION))?;
+    let available = crate::econ::voting_balance(state, sender, height);
+    if amount > available {
+        bail!("you can vote with up to {} (liquid, staked and unbonding FANG; unvested tokens don't vote)", fmt_fang(available));
+    }
+    // Locked through every block a vote can still land in, then the conviction's lock periods.
+    let until = voting_end.saturating_add(1).saturating_add(lock_blocks);
+    let vk = IdKey::new(id, sender);
+    let prev = state.governance.votes.get(&vk).cloned();
+    let (lock_amount, locked_until) = match &prev {
+        Some(v) => (v.lock_amount.max(amount), v.locked_until.max(until)),
+        None => (amount, until),
+    };
+    let council = if height < cp.bootstrap_end_height { crate::staking::validator_for_signer(state, sender, signer, state.params.epoch_of(height)) } else { None };
+    crate::econ::lock(state, j, sender, format!("vote:{id}"), lock_amount, locked_until)?;
+    let p = proposal_mut(state, j, id);
+    if let Some(v) = &prev {
+        let (amt, w) = if v.aye { (&mut p.aye_amount, &mut p.aye_weight) } else { (&mut p.nay_amount, &mut p.nay_weight) };
+        *amt -= v.amount as u128;
+        *w -= v.weight;
+        p.voters -= 1;
+        if let Some(val) = &v.council {
+            if p.council.get(val).is_some_and(|c| c.voter == sender) {
+                p.council.remove(val);
+            }
+        }
+    }
+    let (amt, w) = if aye { (&mut p.aye_amount, &mut p.aye_weight) } else { (&mut p.nay_amount, &mut p.nay_weight) };
+    *amt += amount as u128;
+    *w += weight;
+    p.voters += 1;
+    if let Some(val) = &council {
+        p.council.insert(val.clone(), CouncilVote { aye, voter: sender.to_string() });
+    }
+    j.governance.votes.touch(&state.governance.votes, &vk);
+    state.governance.votes.insert(vk, VoteRecord { aye, amount, conviction, weight, lock_amount, locked_until, council, at: height });
+    Ok(())
+}
+
+/// What could vote at `height`: Σ `econ::voting_balance` over every account except the keyless
+/// system accounts. O(accounts); computed once per block that closes a vote.
+pub fn unlocked_supply(state: &State, height: u64) -> u128 {
+    let prefix = state.params.prefix();
+    let system: BTreeSet<String> = [crate::chain::treasury(prefix), community(prefix), crate::chain::endowment(prefix), crate::chain::bootstrap_delegation(prefix), crate::poc::pool_address(prefix)].into();
+    state.accounts.keys().filter(|a| !system.contains(*a)).map(|a| crate::econ::voting_balance(state, a, height) as u128).sum()
+}
+
+/// Whether a kind needs `supermajority_bps` of the weight: upgrades, issuance parameters, and
+/// treasury spends above `treasury_large_bps` of the treasury's balance.
+pub fn needs_supermajority(state: &State, kind: &ProposalKind) -> bool {
+    match kind {
+        ProposalKind::ScheduleUpgrade { .. } => true,
+        ProposalKind::ParamChange { key, .. } => key.starts_with("issuance_"),
+        ProposalKind::TreasurySpend { amount, .. } => {
+            let treasury = state.account(&state.treasury()).balance as u128;
+            *amount as u128 * 10_000 > state.chain_params.treasury_large_bps as u128 * treasury
+        }
+        _ => false,
+    }
+}
+
+/// Closes voting on proposal `id` at `height`: tally, settle the deposit, queue or reject.
+fn close_vote(state: &mut State, id: u64, height: u64, unlocked: u128) {
+    let mut j = Journal::default();
+    let p = state.governance.proposals[&id].clone();
+    let cp = state.chain_params.clone();
+    let quorum = (cp.quorum_floor as u128).max(unlocked * cp.quorum_bps as u128 / 10_000);
+    let turnout = p.aye_amount + p.nay_amount;
+    let quorum_reached = turnout > 0 && turnout >= quorum;
+    let supermajority = needs_supermajority(state, &p.kind);
+    let majority = if supermajority { p.aye_weight > 0 && p.aye_weight * 10_000 >= cp.supermajority_bps as u128 * (p.aye_weight + p.nay_weight) } else { p.aye_weight > p.nay_weight };
+    let by_tokens = quorum_reached && majority;
+    // The bootstrap council: ⅔ of the active set at the close approve, and token nays don't
+    // outweigh token ayes.
+    let set: BTreeSet<String> = if height < cp.bootstrap_end_height { state.active_sets.get(&state.params.epoch_of(height)).map(|s| s.iter().cloned().collect()).unwrap_or_default() } else { BTreeSet::new() };
+    let n = set.len() as u64;
+    let in_set = p.council.iter().filter(|(v, _)| set.contains(*v));
+    let (ayes, nays) = in_set.fold((0u64, 0u64), |(a, b), (_, c)| if c.aye { (a + 1, b) } else { (a, b + 1) });
+    let by_council = n > 0 && ayes * 3 >= 2 * n && p.nay_weight <= p.aye_weight;
+    let council_quorum = n > 0 && (ayes + nays) * 3 >= 2 * n;
+    // Deposit: back if the proposal drew a quorum (of tokens, or of the council), burned if not.
+    if quorum_reached || council_quorum {
+        state.j_credit(&mut j, &p.proposer, p.deposit);
+    } else {
+        state.j_burn(&mut j, p.deposit);
+    }
+    let passed = by_tokens || by_council;
+    let outcome = if passed {
+        let at = p.voting_end.saturating_add(cp.timelock_blocks).max(height + 1);
+        let how = if by_tokens { "by token vote" } else { "by the bootstrap council" };
+        format!("passed {how}; runs at block {at}")
+    } else if !quorum_reached && !council_quorum {
+        format!("no quorum: {} of {} needed voted; deposit burned", fmt_fang(clamp(turnout)), fmt_fang(clamp(quorum)))
+    } else if supermajority {
+        format!("fewer than {}% of the vote weight said aye", crate::staking::fmt_bps(cp.supermajority_bps))
+    } else {
+        "the ayes didn't outweigh the nays".to_string()
+    };
+    save_scalars(state, &mut j);
+    let p = proposal_mut(state, &mut j, id);
+    p.tally = Some(Tally { unlocked, quorum, quorum_reached, supermajority, council_size: n, council_ayes: ayes, council_nays: nays });
+    p.outcome = outcome;
+    if passed {
+        p.status = ProposalStatus::Queued;
+        p.execute_at = Some(p.voting_end.saturating_add(cp.timelock_blocks).max(height + 1));
+    } else {
+        p.status = ProposalStatus::Rejected;
+        state.governance.open_proposals.remove(&id);
+    }
+}
+
+fn clamp(v: u128) -> u64 {
+    v.min(u64::MAX as u128) as u64
+}
+
+/// Runs a queued proposal's action. On error nothing it did stays.
+fn execute(state: &mut State, id: u64, height: u64) {
+    let p = state.governance.proposals[&id].clone();
+    let mut j = Journal::default();
+    let result = run_kind(state, &mut j, &p, height);
+    let (status, outcome) = match result {
+        Ok(what) => (ProposalStatus::Executed, what),
+        Err(e) => {
+            state.rollback(j);
+            (ProposalStatus::Failed, format!("failed when it ran: {e}"))
+        }
+    };
+    let mut j = Journal::default();
+    save_scalars(state, &mut j);
+    let p = proposal_mut(state, &mut j, id);
+    p.status = status;
+    p.outcome = outcome;
+    state.governance.open_proposals.remove(&id);
+}
+
+/// A passed proposal's action (the levers have no signer checks: the vote was the check).
+fn run_kind(state: &mut State, j: &mut Journal, p: &Proposal, height: u64) -> Result<String> {
+    let name = |state: &State, a: &str| state.primary_name(a).unwrap_or_else(|| short(a));
+    Ok(match &p.kind {
+        ProposalKind::ParamChange { key, value } => {
+            state.exec_set_param(j, key, *value)?;
+            format!("{key} is now {value}")
+        }
+        ProposalKind::TreasurySpend { to, amount } => {
+            spend_gate(state, height)?;
+            let treasury = state.treasury();
+            let available = crate::econ::transferable(state, &treasury, height);
+            if *amount > available {
+                bail!("the treasury can spend {} now", fmt_fang(available));
+            }
+            state.j_debit(j, &treasury, *amount)?;
+            state.j_credit(j, to, *amount);
+            format!("paid {} to {}", fmt_fang(*amount), name(state, to))
+        }
+        ProposalKind::Distribution { merkle_root, total, claim_until } => {
+            spend_gate(state, height)?;
+            if *claim_until < height {
+                bail!("its claim window ended at block {claim_until}");
+            }
+            let from = community(state.params.prefix());
+            let available = crate::econ::transferable(state, &from, height);
+            if *total > available {
+                bail!("the community account holds {} it can move", fmt_fang(available));
+            }
+            state.j_debit(j, &from, *total)?;
+            save_scalars(state, j);
+            state.governance.open_distributions.insert(p.id);
+            j.governance.distributions.touch(&state.governance.distributions, &p.id);
+            state.governance.distributions.insert(p.id, Distribution { id: p.id, merkle_root: merkle_root.clone(), total: *total, claimed: 0, claims: 0, opened_at: height, claim_until: *claim_until, closed_at: None, returned: 0 });
+            format!("opened distribution #{} of {}, claimable until block {claim_until}", p.id, fmt_fang(*total))
+        }
+        ProposalKind::SetRepo { repo, weight } => {
+            state.exec_set_repo(j, repo, *weight, height)?;
+            if *weight == 0 { format!("removed {repo} from the pool") } else { format!("{repo} has weight {weight}") }
+        }
+        ProposalKind::GrantSoul { to, amount, .. } => {
+            state.exec_grant_soul(j, to, *amount, height)?;
+            format!("granted {} {} Soul", name(state, to), fmt_soul(*amount))
+        }
+        ProposalKind::FlagSybil { account, reason } => {
+            state.exec_flag_sybil(j, account, &format!("proposal #{}", p.id), reason, height)?;
+            format!("flagged {} as a sybil", name(state, account))
+        }
+        ProposalKind::RejectClaim { claim_id, reason } => {
+            state.exec_reject_claim(j, *claim_id, reason, height)?;
+            format!("rejected claim #{claim_id}")
+        }
+        ProposalKind::Clawback { account, .. } => {
+            let back = state.exec_clawback(j, account, height)?;
+            format!("clawed back {} from {}", fmt_fang(back), name(state, account))
+        }
+        ProposalKind::UnlinkGithub { handle } => {
+            state.exec_unlink_github(j, handle)?;
+            format!("unlinked @{handle}")
+        }
+        ProposalKind::RefundHunt { hunt_id } => {
+            state.exec_refund_hunt(j, *hunt_id, height)?;
+            format!("refunded hunt #{hunt_id}'s funders")
+        }
+        ProposalKind::ScheduleUpgrade { version, activation_height } => {
+            crate::upgrade::exec_schedule_upgrade(state, j, *version, *activation_height, height)?;
+            format!("protocol v{version} activates at block {activation_height}")
+        }
+        ProposalKind::ActivateFeature { feature } => {
+            crate::upgrade::exec_activate_feature(state, j, feature, height)?;
+            format!("{feature} is on")
+        }
+        ProposalKind::DeactivateFeature { feature } => {
+            crate::upgrade::exec_deactivate_feature(state, j, feature)?;
+            format!("{feature} is off")
+        }
+        ProposalKind::Text {} => "recorded (no on-chain effect)".into(),
+    })
+}
+
+/// After `staking::end_block`, every block: close voting on proposals whose vote ended, run
+/// those whose timelock is over, and return what's unclaimed of distributions past
+/// `claim_until` to the community account.
+pub fn end_block(state: &mut State, b: &BlockInfo) {
+    let height = b.height;
+    let mut unlocked = None;
+    for id in state.governance.open_proposals.clone() {
+        let p = &state.governance.proposals[&id];
+        match p.status {
+            ProposalStatus::Voting if height >= p.voting_end => {
+                let u = *unlocked.get_or_insert_with(|| unlocked_supply(state, height));
+                close_vote(state, id, height, u);
+            }
+            ProposalStatus::Queued if p.execute_at.is_some_and(|at| height >= at) => execute(state, id, height),
+            _ => {}
+        }
+    }
+    for id in state.governance.open_distributions.clone() {
+        let d = &state.governance.distributions[&id];
+        if height <= d.claim_until {
+            continue;
+        }
+        let rest = d.total - d.claimed;
+        let mut j = Journal::default();
+        state.j_credit(&mut j, &community(state.params.prefix()), rest);
+        save_scalars(state, &mut j);
+        state.governance.open_distributions.remove(&id);
+        let d = state.governance.distributions.get_mut(&id).expect("listed as open");
+        d.closed_at = Some(height);
+        d.returned = rest;
+    }
+}
+
+// ---- community distributions
+
+/// A distribution tree's leaf: BLAKE3(`LEAF_DOMAIN` ‖ id u64 LE ‖ address length u16 LE ‖
+/// address ‖ amount u64 LE). The address is the claimant's, as its tx's `from` spells it.
+pub fn distribution_leaf(distribution_id: u64, address: &str, amount: u64) -> [u8; 32] {
+    let mut b = LEAF_DOMAIN.to_vec();
+    b.extend_from_slice(&distribution_id.to_le_bytes());
+    b.extend_from_slice(&(address.len() as u16).to_le_bytes());
+    b.extend_from_slice(address.as_bytes());
+    b.extend_from_slice(&amount.to_le_bytes());
+    crypto::hash(&b)
+}
+
+/// An inner node: BLAKE3(`NODE_DOMAIN` ‖ the smaller child ‖ the larger), so a proof is just
+/// the siblings, with no positions.
+pub fn merkle_parent(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let mut buf = NODE_DOMAIN.to_vec();
+    buf.extend_from_slice(lo);
+    buf.extend_from_slice(hi);
+    crypto::hash(&buf)
+}
+
+/// The root a leaf and its proof (siblings from the leaf up) lead to.
+pub fn root_from_proof(leaf: [u8; 32], proof: &[[u8; 32]]) -> [u8; 32] {
+    proof.iter().fold(leaf, |acc, s| merkle_parent(&acc, s))
+}
+
+/// Builds a distribution tree (what proposers publish with a `Distribution`): the leaves sorted,
+/// paired left to right, an odd last node carried up unchanged. Returns the root and each
+/// entry's proof, in input order. Addresses must be distinct.
+pub fn build_distribution(distribution_id: u64, entries: &[(String, u64)]) -> Result<([u8; 32], Vec<Vec<[u8; 32]>>)> {
+    ensure!(!entries.is_empty(), "a distribution needs at least one entry");
+    let mut seen = BTreeSet::new();
+    for (a, amount) in entries {
+        ensure!(seen.insert(a.as_str()), "{a} is listed twice");
+        ensure!(*amount > 0, "{a} gets 0");
+    }
+    let mut leaves: Vec<([u8; 32], usize)> = entries.iter().enumerate().map(|(i, (a, amt))| (distribution_leaf(distribution_id, a, *amt), i)).collect();
+    leaves.sort();
+    let mut level: Vec<[u8; 32]> = leaves.iter().map(|(h, _)| *h).collect();
+    // Each entry's position in the current level.
+    let mut pos: Vec<usize> = vec![0; entries.len()];
+    for (p, (_, i)) in leaves.iter().enumerate() {
+        pos[*i] = p;
+    }
+    let mut proofs = vec![vec![]; entries.len()];
+    while level.len() > 1 {
+        for (i, p) in pos.iter_mut().enumerate() {
+            let sibling = *p ^ 1;
+            if sibling < level.len() {
+                proofs[i].push(level[sibling]);
+            }
+            *p /= 2;
+        }
+        level = level.chunks(2).map(|c| if c.len() == 2 { merkle_parent(&c[0], &c[1]) } else { c[0] }).collect();
+    }
+    Ok((level[0], proofs))
+}
+
+fn claim_distribution(state: &mut State, j: &mut Journal, sender: &str, id: u64, amount: u64, proof: &[String], height: u64) -> Result<()> {
+    let d = state.governance.distributions.get(&id).ok_or_else(|| anyhow!("no distribution #{id}"))?;
+    if d.closed_at.is_some() || height > d.claim_until {
+        bail!("distribution #{id} closed at block {}", d.claim_until);
+    }
+    let ck = IdKey::new(id, sender);
+    if state.governance.distribution_claims.contains_key(&ck) {
+        bail!("{} already claimed from distribution #{id}", short(sender));
+    }
+    let siblings: Vec<[u8; 32]> = proof.iter().map(|h| hex::decode(h).ok().and_then(|b| b.try_into().ok())).collect::<Option<_>>().ok_or_else(|| anyhow!("proof hashes must be 32 bytes of hex"))?;
+    if hex::encode(root_from_proof(distribution_leaf(id, sender, amount), &siblings)) != d.merkle_root {
+        bail!("the proof doesn't lead to distribution #{id}'s Merkle root (wrong address, amount or proof)");
+    }
+    let left = d.total - d.claimed;
+    if amount > left {
+        bail!("distribution #{id} has only {} left", fmt_fang(left));
+    }
+    j.governance.distributions.touch(&state.governance.distributions, &id);
+    let d = state.governance.distributions.get_mut(&id).expect("checked above");
+    d.claimed += amount;
+    d.claims += 1;
+    j.governance.distribution_claims.touch(&state.governance.distribution_claims, &ck);
+    state.governance.distribution_claims.insert(ck, DistributionClaim { amount, at: height });
+    state.j_credit(j, sender, amount);
+    Ok(())
+}
+
+// ---- multisig accounts (SF-11)
+
+/// Admission rule for multisig accounts (`State::admit`): their owner keys may only sign
+/// `MultisigPropose` and `MultisigApprove`. Session keys are unaffected.
+pub fn check_multisig_admission(state: &State, sender: &str, key: &KeyRecord, action: &Action) -> Result<()> {
+    if key.role != KeyRole::Owner || matches!(action, Action::MultisigPropose { .. } | Action::MultisigApprove { .. }) {
+        return Ok(());
+    }
+    if let Some(m) = state.governance.multisigs.get(sender) {
+        bail!("{} is a {}-of-{} multisig: propose this with multisig_propose", short(sender), m.threshold, owner_keys(state, sender).len());
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn multisig_create(state: &mut State, j: &mut Journal, sender: &str, key: &KeyRecord, owners: &[String], threshold: u8, height: u64) -> Result<()> {
+    owner_only(key, "set up a multisig")?;
+    let current = owner_keys(state, sender);
+    if owners.iter().cloned().collect::<BTreeSet<_>>() != current {
+        bail!("owners must be exactly this account's {} owner key(s); add or remove keys first", current.len());
+    }
+    if threshold == 0 || threshold as usize > current.len() {
+        bail!("threshold must be 1–{}", current.len());
+    }
+    // A multisig account changes its threshold the same way, through its own approvals (admission
+    // only lets this through as a multisig action then).
+    let m = match state.governance.multisigs.get(sender) {
+        Some(m) => Multisig { threshold, ..m.clone() },
+        None => Multisig { threshold, created_at: height, pending: BTreeSet::new() },
+    };
+    put_multisig(state, j, sender, m);
+    Ok(())
+}
+
+/// How many of a proposal's approvals are (still) owner keys.
+fn approvals(state: &State, p: &MultisigProposal) -> usize {
+    let owners = owner_keys(state, &p.account);
+    p.approvals.iter().filter(|k| owners.contains(*k)).count()
+}
+
+/// Runs an approved action as the account, signed (for the action's own checks) by `signer`.
+/// The account can't end up with fewer owner keys than its threshold.
+fn run_multisig(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, signer: &str, p: &MultisigProposal, height: u64) -> Result<()> {
+    let inner = Tx { action: p.action.clone(), ..tx.clone() };
+    let key = state.keys_of(sender).get(signer).cloned().ok_or_else(|| anyhow!("this key isn't on {}", short(sender)))?;
+    state.apply_action(j, &inner, sender, signer, &key, height).map_err(|e| anyhow!("multisig action #{}: {e}", p.id))?;
+    if let Some(m) = state.governance.multisigs.get(sender) {
+        let n = owner_keys(state, sender).len();
+        ensure!(n >= m.threshold as usize, "multisig action #{} would leave {n} owner key(s), fewer than the threshold ({})", p.id, m.threshold);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn multisig_propose(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, signer: &str, key: &KeyRecord, action: &Action, height: u64) -> Result<()> {
+    owner_only(key, "propose multisig actions")?;
+    let mut m = state.governance.multisigs.get(sender).cloned().ok_or_else(|| anyhow!("{} isn't a multisig account (multisig_create first)", short(sender)))?;
+    // Expired proposals make room.
+    let expired: Vec<u64> = m.pending.iter().copied().filter(|id| state.governance.multisig_proposals.get(id).is_none_or(|p| height > p.expires_at)).collect();
+    for id in expired {
+        m.pending.remove(&id);
+        put_multisig_proposal(state, j, None, id);
+    }
+    if m.pending.len() >= MAX_MULTISIG_PENDING {
+        bail!("{} has {MAX_MULTISIG_PENDING} open multisig proposals; approve or let some expire first", short(sender));
+    }
+    save_scalars(state, j);
+    let id = state.governance.next_multisig_id;
+    state.governance.next_multisig_id = id.checked_add(1).ok_or_else(|| anyhow!("multisig ids exhausted"))?;
+    let p = MultisigProposal { id, account: sender.to_string(), action: action.clone(), proposed_by: signer.to_string(), approvals: BTreeSet::from([signer.to_string()]), created_at: height, expires_at: height.saturating_add(state.chain_params.multisig_expiry_blocks) };
+    put_multisig(state, j, sender, m.clone());
+    if approvals(state, &p) >= m.threshold as usize {
+        return run_multisig(state, j, tx, sender, signer, &p, height);
+    }
+    m.pending.insert(id);
+    put_multisig(state, j, sender, m);
+    put_multisig_proposal(state, j, Some(p), id);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn multisig_approve(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, signer: &str, key: &KeyRecord, id: u64, height: u64) -> Result<()> {
+    owner_only(key, "approve multisig actions")?;
+    let mut m = state.governance.multisigs.get(sender).cloned().ok_or_else(|| anyhow!("{} isn't a multisig account", short(sender)))?;
+    let mut p = state.governance.multisig_proposals.get(&id).cloned().ok_or_else(|| anyhow!("no open multisig action #{id}"))?;
+    if p.account != sender {
+        bail!("multisig action #{id} belongs to {}", short(&p.account));
+    }
+    if height > p.expires_at {
+        bail!("multisig action #{id} expired at block {}", p.expires_at);
+    }
+    if !p.approvals.insert(signer.to_string()) {
+        bail!("this key already approved multisig action #{id}");
+    }
+    if approvals(state, &p) < m.threshold as usize {
+        put_multisig_proposal(state, j, Some(p), id);
+        return Ok(());
+    }
+    // The last approval runs it; if the action fails, so does this approval (it can be retried
+    // until the proposal expires).
+    m.pending.remove(&id);
+    put_multisig(state, j, sender, m);
+    put_multisig_proposal(state, j, None, id);
+    run_multisig(state, j, tx, sender, signer, &p, height)
+}
+
+// ---- accounting
+
+/// FANG governance holds outside balances: deposits of proposals still voting, and what's left
+/// in open distributions.
+pub fn escrow(state: &State) -> u128 {
+    let g = &state.governance;
+    let deposits: u128 = g.open_proposals.iter().filter_map(|id| g.proposals.get(id)).filter(|p| p.status == ProposalStatus::Voting).map(|p| p.deposit as u128).sum();
+    let distributions: u128 = g.open_distributions.iter().filter_map(|id| g.distributions.get(id)).map(|d| (d.total - d.claimed) as u128).sum();
+    deposits + distributions
+}
+
+/// Governance's consistency rules (part of `State::check_invariants`): records are filed under
+/// their ids, the open lists match the statuses, tallies are the sums of the votes, council
+/// votes match their voters' votes, multisigs keep at least `threshold` owner keys and their
+/// pending lists match the proposals, and distributions' totals match their claims.
+pub fn check_invariants(state: &State) -> Result<()> {
+    let g = &state.governance;
+    let mut sums: BTreeMap<u64, (u128, u128, u128, u128, u64)> = BTreeMap::new();
+    for (k, v) in g.votes.iter() {
+        ensure!(g.proposals.contains_key(&k.id), "a vote on unknown proposal #{}", k.id);
+        ensure!(vote_weight(v.amount, v.conviction) == Some(v.weight) && v.amount > 0, "{}'s vote on #{} has the wrong weight", k.account, k.id);
+        ensure!(v.lock_amount >= v.amount, "{}'s vote on #{} locks less than it votes", k.account, k.id);
+        let s = sums.entry(k.id).or_default();
+        if v.aye {
+            (s.0, s.2) = (s.0 + v.amount as u128, s.2 + v.weight);
+        } else {
+            (s.1, s.3) = (s.1 + v.amount as u128, s.3 + v.weight);
+        }
+        s.4 += 1;
+    }
+    for (id, p) in g.proposals.iter() {
+        ensure!(*id == p.id && *id < g.next_proposal_id, "proposal #{id} is misfiled");
+        let open = matches!(p.status, ProposalStatus::Voting | ProposalStatus::Queued);
+        ensure!(open == g.open_proposals.contains(id), "proposal #{id} is {:?} but the open list disagrees", p.status);
+        ensure!(p.deposit > 0, "proposal #{id} has no deposit");
+        ensure!((p.status == ProposalStatus::Voting) == p.tally.is_none(), "proposal #{id} is {:?} with{} a tally", p.status, if p.tally.is_some() { "" } else { "out" });
+        ensure!(p.status != ProposalStatus::Queued || p.execute_at.is_some(), "queued proposal #{id} has no execution height");
+        let s = sums.get(id).copied().unwrap_or_default();
+        ensure!(s == (p.aye_amount, p.nay_amount, p.aye_weight, p.nay_weight, p.voters), "proposal #{id}'s tallies aren't the sum of its votes");
+        for (validator, c) in &p.council {
+            let v = g.votes.get(&IdKey::new(*id, &c.voter));
+            ensure!(v.is_some_and(|v| v.aye == c.aye && v.council.as_deref() == Some(validator.as_str())), "proposal #{id}'s council vote for {validator} doesn't match {}'s vote", c.voter);
+        }
+    }
+    for id in &g.open_proposals {
+        ensure!(g.proposals.contains_key(id), "open proposal #{id} doesn't exist");
+    }
+    for (account, m) in g.multisigs.iter() {
+        let owners = owner_keys(state, account).len();
+        ensure!(m.threshold >= 1 && m.threshold as usize <= owners, "{account} is a {}-of-{owners} multisig", m.threshold);
+        ensure!(m.pending.len() <= MAX_MULTISIG_PENDING, "{account} has too many multisig proposals");
+        for id in &m.pending {
+            ensure!(g.multisig_proposals.get(id).is_some_and(|p| p.account == *account), "{account}'s multisig proposal #{id} is missing");
+        }
+    }
+    for (id, p) in g.multisig_proposals.iter() {
+        ensure!(*id == p.id && *id < g.next_multisig_id, "multisig proposal #{id} is misfiled");
+        ensure!(g.multisigs.get(&p.account).is_some_and(|m| m.pending.contains(id)), "multisig proposal #{id} isn't pending on {}", p.account);
+        ensure!(p.approvals.contains(&p.proposed_by), "multisig proposal #{id} lacks its proposer's approval");
+    }
+    let mut claimed: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+    for (k, c) in g.distribution_claims.iter() {
+        ensure!(g.distributions.contains_key(&k.id), "a claim on unknown distribution #{}", k.id);
+        let s = claimed.entry(k.id).or_default();
+        *s = (s.0 + c.amount, s.1 + 1);
+    }
+    for (id, d) in g.distributions.iter() {
+        ensure!(*id == d.id && g.proposals.contains_key(id), "distribution #{id} is misfiled");
+        ensure!(d.claimed <= d.total, "distribution #{id} paid out more than it holds");
+        ensure!(claimed.get(id).copied().unwrap_or_default() == (d.claimed, d.claims), "distribution #{id}'s total isn't the sum of its claims");
+        ensure!(d.closed_at.is_none() == g.open_distributions.contains(id), "distribution #{id}'s open flag disagrees");
+        ensure!(d.closed_at.is_none() || d.returned == d.total - d.claimed, "closed distribution #{id} returned the wrong amount");
+    }
+    for id in &g.open_distributions {
+        ensure!(g.distributions.contains_key(id), "open distribution #{id} doesn't exist");
+    }
     Ok(())
 }
 
@@ -133,3 +1073,10 @@ pub fn describe_kind(state: &State, kind: &ProposalKind, primary_name: &dyn Fn(&
     }
 }
 
+/// Whether `addr` is a keyless system account on this chain (they can't vote or sign).
+pub fn is_system(state: &State, addr: &str) -> bool {
+    system_account(state.params.prefix(), addr).is_some()
+}
+
+#[cfg(test)]
+mod tests;
