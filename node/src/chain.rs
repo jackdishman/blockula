@@ -1652,12 +1652,14 @@ pub const PRUNE_DAYS: u64 = 2;
 const REPLAY_SYNC_EVERY: u64 = 1_000;
 
 /// The fewest heights a pruning node keeps: both kept snapshots' manifests (checkpoint +
-/// certifying blocks), every ancestor a proposal may still cite, and a tx's whole validity
-/// window (so the tx index still catches a replayed tx). The validity window is a governance
-/// parameter (`max_tx_validity_blocks`), so this is re-read from the state at every commit.
+/// certifying blocks) and their epoch anchor (the last block of the epoch before, up to an epoch
+/// before the snapshot: `snapshot::anchor_height`), every ancestor a proposal may still cite, and
+/// a tx's whole validity window (so the tx index still catches a replayed tx). The validity
+/// window is a governance parameter (`max_tx_validity_blocks`), so this is re-read from the
+/// state at every commit.
 pub fn min_keep_blocks(state: &State) -> u64 {
     use crate::snapshot::{CHECKPOINT_DELAY, CHECKPOINT_INTERVAL};
-    2 * CHECKPOINT_INTERVAL + 2 * CHECKPOINT_DELAY + crate::consensus::MAX_EXEC_LAG + state.chain_params.max_tx_validity_blocks
+    state.params.epoch_blocks.max(2) + 2 * CHECKPOINT_INTERVAL + 2 * CHECKPOINT_DELAY + crate::consensus::MAX_EXEC_LAG + state.chain_params.max_tx_validity_blocks
 }
 
 /// What a pruning validator keeps by default: `PRUNE_DAYS` of blocks at this block time.
@@ -2425,6 +2427,30 @@ impl Chain {
             return Some((b.height, b.txs.iter().position(|t| t.id() == id)?));
         }
         self.snap.tx(&hash32(id).ok()?).ok()?
+    }
+
+    /// Keeps a certificate that arrived after its block, if its block is one whose certificate
+    /// stays on disk (an epoch's last block, or a checkpoint still in the window) and it isn't
+    /// stored yet: execution stores the certificates consensus hands it, and this fills in what
+    /// it missed (`consensus::fill_late_certs` reads them from marshal), so the epoch anchor of a
+    /// fast-sync manifest stays servable. `digest` must be the executed block's hash. The
+    /// database write holds the writer's lock, not the chain's. Returns whether it stored it.
+    pub fn store_late_cert(chain: &parking_lot::Mutex<Chain>, height: u64, digest: &str, cert: Vec<u8>) -> Result<bool> {
+        let (store, writer) = {
+            let c = chain.lock();
+            let kept = c.state.params.is_boundary(height) || (height.is_multiple_of(CERT_CHECKPOINT) && height >= c.point.pruned_below);
+            if height > c.height() || !kept || c.view().cert(height).is_some() {
+                return Ok(false);
+            }
+            ensure!(c.hash_at(height).as_deref() == Some(digest), "the certificate at #{height} is for another block");
+            (c.store.clone(), c.writer.clone())
+        };
+        {
+            let _commits = writer.lock();
+            store.put_cert(height, &cert)?;
+        }
+        chain.lock().disk.remember_cert(height, cert);
+        Ok(true)
     }
 
     /// Keeps a certificate that arrived after its block: in memory for recent heights, on disk at
@@ -5088,6 +5114,72 @@ mod persistence {
         let c = Chain::open(&h).unwrap();
         assert_eq!((c.state.root(), c.height()), (root, height));
         assert_eq!(c.replayed, height - 700, "rebuilt from snapshot 700, then the logged blocks after it");
+        drop(c);
+        fs::remove_dir_all(h).ok();
+    }
+
+    /// The smallest window still holds the epoch anchor of every manifest the node serves, at
+    /// the worst point: from the end of an epoch, the newest snapshot (late in that epoch) needs
+    /// the previous epoch's last block, an epoch back. Minute blocks make the tx validity window
+    /// small (60 blocks), so the epoch (300 blocks) is what the window has to cover.
+    #[test]
+    fn the_smallest_window_keeps_the_epoch_anchor() {
+        let h = home("prune-anchor");
+        Chain::summon(&h, &SummonOpts { block_time_ms: 60_000, epoch_blocks: 300, ..SummonOpts::new("prune-anchor", 1) }).unwrap();
+        let mut c = Chain::open_with(&h, &OpenOpts { segment_heights: Some(50) }).unwrap();
+        c.set_pruning(Some(1));
+        let keep = min_keep_blocks(&c.state);
+        assert!(keep >= 300 + 2 * crate::snapshot::CHECKPOINT_INTERVAL + crate::snapshot::CHECKPOINT_DELAY, "{keep}");
+        // Consensus hands over certificates for epoch ends and checkpoints' certifying blocks.
+        while c.height() < 899 {
+            c.produce_block_with(vec![]).unwrap();
+            let height = c.height();
+            if c.state.params.is_boundary(height) || crate::snapshot::certifies(height).is_some() {
+                c.store_cert(height, vec![(height % 251) as u8]).unwrap();
+            }
+        }
+        let t = Instant::now();
+        while !crate::snapshot::list(&h).contains(&800) {
+            assert!(t.elapsed().as_secs() < 30, "no snapshot at 800");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let v = c.view();
+        assert!(v.history_from() > 299, "the node prunes: history from #{}", v.history_from());
+        let m = crate::snapshot::build_manifest(&c.live).expect("a manifest with its anchor");
+        assert_eq!(m.height, 800);
+        let anchor = m.anchor.expect("snapshot 800 is in epoch 2, after #599");
+        assert_eq!(anchor.finalization, hex::encode([(599 % 251) as u8]));
+        assert!(v.cblock(599).is_some());
+        drop(v);
+        drop(c);
+        fs::remove_dir_all(h).ok();
+    }
+
+    /// A certificate execution didn't get (consensus missed it) is kept afterwards for the
+    /// heights that keep one: an epoch's last block, a checkpoint. Only for the block executed
+    /// there, once, and not for heights that keep none.
+    #[test]
+    fn late_certificates_fill_in_epoch_ends() {
+        let h = home("late-cert");
+        Chain::summon(&h, &SummonOpts { epoch_blocks: 10, ..SummonOpts::new("late-cert", 1) }).unwrap();
+        let chain = parking_lot::Mutex::new(Chain::open(&h).unwrap());
+        while chain.lock().height() < 25 {
+            chain.lock().produce_block_with(vec![]).unwrap();
+        }
+        let hash = |height: u64| chain.lock().hash_at(height).unwrap();
+        assert_eq!(chain.lock().cert(19), None);
+        assert!(Chain::store_late_cert(&chain, 19, &hash(18), vec![19]).unwrap_err().to_string().contains("another block"));
+        assert!(!Chain::store_late_cert(&chain, 15, &hash(15), vec![15]).unwrap(), "#15 keeps no certificate");
+        assert!(!Chain::store_late_cert(&chain, 29, &"00".repeat(32), vec![29]).unwrap(), "not executed yet");
+        assert!(Chain::store_late_cert(&chain, 19, &hash(19), vec![19]).unwrap());
+        assert!(!Chain::store_late_cert(&chain, 19, &hash(19), vec![1, 9]).unwrap(), "already kept");
+        assert_eq!(chain.lock().cert(19), Some(vec![19]));
+        // On disk: the next published snapshot of the store has it, and so does a restart.
+        chain.lock().produce_block_with(vec![]).unwrap();
+        assert_eq!(chain.lock().view().snap.cert(19).unwrap(), Some(vec![19]));
+        drop(chain);
+        let c = Chain::open(&h).unwrap();
+        assert_eq!(c.view().snap.cert(19).unwrap(), Some(vec![19]));
         drop(c);
         fs::remove_dir_all(h).ok();
     }

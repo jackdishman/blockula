@@ -760,6 +760,33 @@ pub struct Executor {
     pub epochs: futures::channel::mpsc::UnboundedSender<u64>,
     /// For pruning old finalized data out of marshal's archives.
     pub marshal: Option<MarshalMailbox>,
+    /// Blocks executed without the certificate their height keeps on disk (epoch ends,
+    /// checkpoints): [`fill_late_certs`] looks for it in marshal.
+    pub late_certs: Option<futures::channel::mpsc::UnboundedSender<(u64, Digest)>>,
+}
+
+/// Fills in certificates [`CertCapture`] missed (it only sees finalizations simplex reports
+/// while the node runs: not ones marshal fetched from peers to catch up, nor any from before a
+/// restart, and it forgets them if execution falls 4,096 behind): marshal keeps the
+/// finalizations it stored, so the certificate an epoch's last block needs (the anchor of every
+/// fast-sync manifest in the next epoch) is read from there. Blocks marshal only backfilled
+/// through a later finalization have no certificate of their own; those stay without.
+pub async fn fill_late_certs(marshal: MarshalMailbox, chain: Shared, mut heights: futures::channel::mpsc::UnboundedReceiver<(u64, Digest)>) {
+    while let Some((height, digest)) = heights.next().await {
+        let Some(f) = marshal.get_finalization(Height::new(height)).await else {
+            debug!(height, "no finalization of its own in marshal (backfilled through a later one)");
+            continue;
+        };
+        if f.proposal.payload != digest {
+            warn!(height, "marshal's finalization at this height is for another block");
+            continue;
+        }
+        match Chain::store_late_cert(&chain, height, &hex::encode(digest.0), f.encode().to_vec()) {
+            Ok(true) => info!(height, "kept a finalization certificate from marshal that execution missed"),
+            Ok(false) => {}
+            Err(e) => warn!(height, error = %e, "couldn't keep a late certificate"),
+        }
+    }
 }
 
 pub fn finalized_from(b: &CBlock, certificate: Option<Vec<u8>>) -> Finalized {
@@ -792,11 +819,17 @@ impl Reporter for Executor {
                     ack.acknowledge(); // redelivery after restart: already executed
                 } else {
                     let cert = self.certs.certs.lock().remove(&block.digest);
+                    let missed = cert.is_none();
                     // Holds the chain lock only for the in-memory parts, not the fsyncs.
                     let executed = Chain::execute_shared(&self.chain, finalized_from(&block, cert));
                     let c = self.chain.lock();
                     match executed {
                         Ok(()) => {
+                            if missed && (c.state.params.is_boundary(block.height) || block.height.is_multiple_of(crate::chain::CERT_CHECKPOINT)) {
+                                if let Some(late) = &self.late_certs {
+                                    let _ = late.unbounded_send((block.height, block.digest));
+                                }
+                            }
                             debug!(height = block.height, txs = c.last_block().map(|b| b.txs.len()).unwrap_or(0), "executed");
                             if block.height % 100 == 0 && block.height > MARSHAL_RETAIN {
                                 if let Some(m) = &self.marshal {
@@ -1044,7 +1077,12 @@ where
             move |ctx| crate::node::report_evidence(ctx, chain, found_rx)
         });
         let (epoch_tx, mut epoch_rx) = futures::channel::mpsc::unbounded::<u64>();
-        let executor = Executor { chain: chain.clone(), certs: certs.clone(), epochs: epoch_tx, marshal: Some(marshal.clone()) };
+        let (late_tx, late_rx) = futures::channel::mpsc::unbounded::<(u64, Digest)>();
+        context.child("late_certs").spawn({
+            let (marshal, chain) = (marshal.clone(), chain.clone());
+            move |_| fill_late_certs(marshal, chain, late_rx)
+        });
+        let executor = Executor { chain: chain.clone(), certs: certs.clone(), epochs: epoch_tx, marshal: Some(marshal.clone()), late_certs: Some(late_tx) };
         marshal_actor.start(executor, buffer, resolver);
 
         // Mempool gossip (wire-form txs): push every locally accepted tx to all peers; accept theirs.
