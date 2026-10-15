@@ -1447,8 +1447,10 @@ impl State {
         Ok(())
     }
 
-    /// What admitting this tx reserves from the sender's balance (charge + amount moved out).
-    /// Votes reserve nothing: they lock tokens the voter keeps.
+    /// The most this tx takes out of the sender's balance (charge + amount moved out); votes take
+    /// nothing, they lock tokens the voter keeps. An estimate: mempool admission doesn't reserve
+    /// it any more, it applies the sender's queued txs (`Chain::submit_tx`).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn tx_debit(&self, tx: &Tx) -> u64 {
         tx.charge().unwrap_or(u64::MAX).saturating_add(match &tx.action {
             Action::Transfer { amount, .. } => *amount,
@@ -1692,7 +1694,10 @@ pub struct Chain {
     mempool_ids: Vec<String>,
     /// Ids in the mempool.
     pool: std::collections::HashSet<String>,
-    pending: HashMap<String, (usize, u64)>,
+    /// Each sender's queued txs: their indexes in `mempool`, in nonce order.
+    pending: HashMap<String, Vec<usize>>,
+    /// Admission's simulated state per recently active sender (see [`Chain::submit_tx`]).
+    sims: Sims,
     /// Mirror of the mempool and of recent failures, published for readers.
     mp: MempoolView,
     failed_order: std::collections::VecDeque<String>,
@@ -1826,31 +1831,107 @@ pub struct MempoolCheck {
 
 impl MempoolCheck {
     /// Txs to drop, with why: expired, past the mempool TTL, or no longer applying (each
-    /// sender's earlier txs applied first, as a proposal would).
+    /// sender's earlier txs applied first, as a proposal would). Once a sender's tx goes from its
+    /// nonce slot, so do its later ones: they'd wait behind a nonce gap, never executing. (A tx
+    /// whose nonce another tx used already goes alone.)
     pub fn run(mut self) -> (u64, Vec<(String, String)>) {
         let next = self.next;
-        let mut j = Journal::default();
         let mut dropped = vec![];
+        let mut broken = std::collections::HashSet::new();
         for p in self.txs.in_order() {
             let tx = &p.tx;
-            if tx.valid_until < next {
-                dropped.push((p.id.clone(), format!("expired at block {}", tx.valid_until)));
-                continue;
-            }
-            if p.added_at + MEMPOOL_TTL_BLOCKS < next {
+            let stale = tx.nonce < self.state.account(&tx.from).nonce;
+            let why = if broken.contains(&tx.from) && !stale {
+                Some("dropped from the mempool: an earlier transaction from the same account was dropped".to_string())
+            } else if tx.valid_until < next {
+                Some(format!("expired at block {}", tx.valid_until))
+            } else if p.added_at + MEMPOOL_TTL_BLOCKS < next {
                 // Not expired: anyone holding it may resubmit it until `valid_until`.
-                dropped.push((p.id.clone(), format!("dropped from the mempool: not included within {MEMPOOL_TTL_BLOCKS} blocks (it stays valid until block {} if resubmitted)", tx.valid_until)));
-                continue;
-            }
-            match self.state.apply_j(&mut j, tx, &self.chain_id, &self.proposer, next, false) {
-                Ok(Outcome::Applied) => {}
-                Ok(Outcome::Failed(r)) => dropped.push((p.id.clone(), format!("dropped from the mempool: {r}"))),
-                Err(e) => dropped.push((p.id.clone(), format!("dropped from the mempool: {e}"))),
+                Some(format!("dropped from the mempool: not included within {MEMPOOL_TTL_BLOCKS} blocks (it stays valid until block {} if resubmitted)", tx.valid_until))
+            } else {
+                // Kept txs stay applied (this is a private copy of the state); dropped ones don't.
+                let mut j = Journal::default();
+                let outcome = self.state.apply_j(&mut j, tx, &self.chain_id, &self.proposer, next, false);
+                let why = match outcome {
+                    Ok(Outcome::Applied) => None,
+                    Ok(Outcome::Failed(r)) => Some(format!("dropped from the mempool: {r}")),
+                    Err(e) => Some(format!("dropped from the mempool: {e}")),
+                };
+                if why.is_some() {
+                    self.state.rollback(j);
+                }
+                why
+            };
+            if let Some(why) = why {
+                if !stale {
+                    broken.insert(tx.from.clone());
+                }
+                dropped.push((p.id.clone(), why));
             }
         }
         (next, dropped)
     }
 }
+
+/// Most senders whose simulated state admission keeps (the most recently active ones). Each is
+/// a copy of the state sharing everything but the records its sender's queued txs touched, so
+/// this bounds the cache's memory; a sender past it is simulated again from its queue.
+pub const MAX_SENDER_SIMS: usize = 128;
+
+/// Admission's per-sender simulations ([`Chain::submit_tx`]), valid until the next block.
+#[derive(Default)]
+struct Sims {
+    by_sender: HashMap<String, SenderSim>,
+    /// The executed height they were built on.
+    height: u64,
+    clock: u64,
+    /// Queued txs re-applied to build simulations (cache misses), for tests.
+    rebuilt: u64,
+}
+
+/// A copy of the state with one sender's queued txs applied in nonce order (O(1) to take: the
+/// maps share structure).
+struct SenderSim {
+    state: State,
+    /// How many of the sender's queued txs `state` has applied.
+    applied: usize,
+    used: u64,
+}
+
+impl Sims {
+    /// The sender's simulation, if it's current: built at `height` over exactly its `queued` txs.
+    fn take(&mut self, sender: &str, height: u64, queued: usize) -> Option<SenderSim> {
+        if self.height != height {
+            self.by_sender.clear();
+            self.height = height;
+        }
+        self.by_sender.remove(sender).filter(|s| s.applied == queued)
+    }
+
+    /// Keeps a simulation, dropping the least recently used one if the cache is full.
+    fn keep(&mut self, sender: String, mut sim: SenderSim) {
+        if self.by_sender.len() >= MAX_SENDER_SIMS && !self.by_sender.contains_key(&sender) {
+            if let Some(oldest) = self.by_sender.iter().min_by_key(|(_, s)| s.used).map(|(k, _)| k.clone()) {
+                self.by_sender.remove(&oldest);
+            }
+        }
+        self.clock += 1;
+        sim.used = self.clock;
+        self.by_sender.insert(sender, sim);
+    }
+
+    fn forget(&mut self, sender: &str) {
+        self.by_sender.remove(sender);
+    }
+
+    fn clear(&mut self) {
+        self.by_sender.clear();
+    }
+}
+
+/// What a mempool dry run left to keep: the sender's simulation with the new tx applied, and the
+/// journal that takes it back out.
+type Simulated = Option<(SenderSim, Journal)>;
 
 /// The certified snapshot a fast-synced node started from (`base.json` + `base.state.zst`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2078,6 +2159,7 @@ impl Chain {
             mempool_ids: vec![],
             pool: Default::default(),
             pending: HashMap::new(),
+            sims: Sims::default(),
             mp: MempoolView::default(),
             failed_order: Default::default(),
             finalized_tip: 0,
@@ -2663,15 +2745,15 @@ impl Chain {
 
     fn rebuild_pending(&mut self) {
         self.pending.clear();
-        for tx in &self.mempool {
-            let e = self.pending.entry(tx.from.clone()).or_default();
-            e.0 += 1;
-            e.1 = e.1.saturating_add(self.state.tx_debit(tx));
+        for (i, tx) in self.mempool.iter().enumerate() {
+            self.pending.entry(tx.from.clone()).or_default().push(i);
         }
     }
 
-    /// Removes the txs the head block included from the mempool (cheap: ids are kept).
+    /// Removes the txs the head block included from the mempool (cheap: ids are kept). A new
+    /// head also makes every admission simulation stale.
     fn drop_included(&mut self) {
+        self.sims.clear();
         if self.head_ids.is_empty() {
             return;
         }
@@ -2702,17 +2784,38 @@ impl Chain {
         MempoolCheck { state: self.state.clone(), txs: self.mp.clone(), next: self.height() + 1, proposer: self.fee_sink(), chain_id: self.genesis.chain_id.clone() }
     }
 
-    /// Drops what a [`MempoolCheck`] found (if still queued) and remembers why.
+    /// Drops what a [`MempoolCheck`] found (if still queued) and remembers why, with the same
+    /// senders' later txs (queued since the check ran), which would wait behind a nonce gap.
     pub fn drop_from_mempool(&mut self, (height, dropped): (u64, Vec<(String, String)>)) {
         if dropped.is_empty() {
             return;
         }
-        let gone: HashMap<String, String> = dropped.into_iter().filter(|(id, _)| self.pool.contains(id)).collect();
+        let mut gone: HashMap<String, String> = dropped.into_iter().filter(|(id, _)| self.pool.contains(id)).collect();
+        // The first nonce slot each sender lost (a tx whose nonce is used already leaves no gap).
+        let mut first_gone: HashMap<String, u64> = HashMap::new();
+        for (t, id) in self.mempool.iter().zip(&self.mempool_ids) {
+            if gone.contains_key(id) && t.nonce >= self.state.account(&t.from).nonce {
+                let n = first_gone.entry(t.from.clone()).or_insert(t.nonce);
+                *n = (*n).min(t.nonce);
+            }
+        }
+        let mut senders = std::collections::HashSet::new();
+        for (t, id) in self.mempool.iter().zip(&self.mempool_ids) {
+            if first_gone.get(&t.from).is_some_and(|n| t.nonce > *n) && !gone.contains_key(id) {
+                gone.insert(id.clone(), "dropped from the mempool: an earlier transaction from the same account was dropped".into());
+            }
+            if gone.contains_key(id) {
+                senders.insert(t.from.clone());
+            }
+        }
         self.remove_from_mempool(|id| gone.contains_key(id));
         for (id, why) in gone {
             self.pool.remove(&id);
             self.mp.remove(&id);
             self.note_failed(id, why, height);
+        }
+        for sender in &senders {
+            self.sims.forget(sender);
         }
         self.rebuild_pending();
         self.publish_mempool();
@@ -2724,18 +2827,43 @@ impl Chain {
         self.drop_from_mempool(dropped);
     }
 
-    /// Checks a tx against current state plus what the sender already has queued, then queues
-    /// it. The caller must have verified the signature (outside the chain lock). Cost doesn't
-    /// grow with the mempool: pending nonces and balance reservations are cached per sender.
-    /// Returns the id and whether it was new (already-known txs are accepted idempotently).
+    /// Checks a tx against the current state and what its sender already has queued, then queues
+    /// it (evicting the cheapest tail if the mempool is full). The caller must have verified the
+    /// signature (outside the chain lock). Returns the id and whether it was new (already-known
+    /// txs are accepted idempotently).
+    ///
+    /// The dry run applies the sender's queued txs first, in nonce order, exactly as a block
+    /// would, so a tx that can't execute after them is refused instead of holding a slot it can
+    /// never pay for (audit #10: an agent's transfers behind the owner's `RemoveKey`, transfers
+    /// past a session key's limit). Only the sender's own txs count: nothing another account
+    /// sends can make a tx unadmittable. The sender's simulated state is kept between its txs
+    /// ([`Sims`]), so a tx costs one dry run whatever the size of the mempool or of the queue.
     pub fn submit_tx(&mut self, tx: Tx) -> Result<(String, bool)> {
+        self.admit_to_mempool(tx, true)
+    }
+
+    pub fn submit(&mut self, tx: Tx) -> Result<String> {
+        self.submit_tx(tx).map(|(id, _)| id)
+    }
+
+    /// Adds a tx that another node already accepted (full nodes track what they forwarded). The
+    /// same checks as [`Chain::submit_tx`], but it never evicts: if the mempool or the sender's
+    /// queue is full, it isn't tracked.
+    pub fn track_pending(&mut self, tx: Tx) -> Result<()> {
+        if self.mempool.len() >= MAX_MEMPOOL || tx.sender().is_ok_and(|s| self.pending_count(&s) >= MAX_PENDING_PER_SENDER) {
+            return Ok(());
+        }
+        self.admit_to_mempool(tx, false).map(|_| ())
+    }
+
+    fn admit_to_mempool(&mut self, tx: Tx, evict: bool) -> Result<(String, bool)> {
         tx.check_format()?;
         let id = tx.id();
         if self.pool.contains(&id) || self.has_tx(&id) {
             return Ok((id, false));
         }
         let sender = tx.sender()?;
-        let (count, reserved) = self.pending.get(&sender).copied().unwrap_or_default();
+        let count = self.pending_count(&sender);
         if count >= MAX_PENDING_PER_SENDER {
             bail!("too many pending transactions from {}; wait for some to finalize", short(&sender));
         }
@@ -2744,55 +2872,28 @@ impl Chain {
             bail!("bad nonce: expected {expected}, got {}", tx.nonce);
         }
         let next = self.height() + 1;
-        let proposer = self.fee_sink();
-        let chain_id = self.genesis.chain_id.clone();
-        // Dry run on the live state as if the sender's queued txs had already gone through.
-        let mut j = Journal::default();
-        let result = (|| -> Result<Outcome> {
-            if count > 0 {
-                self.state.j_debit(&mut j, &sender, reserved).map_err(|_| anyhow!("insufficient balance once your pending transactions go through"))?;
-                self.state.acct_mut(&mut j, &sender).nonce = tx.nonce;
-            }
-            self.state.apply_j(&mut j, &tx, &chain_id, &proposer, next, false)
-        })();
-        self.state.rollback(j);
-        match result? {
-            Outcome::Applied => {}
-            Outcome::Failed(r) => bail!(r),
-        }
+        let sim = self.dry_run(&tx, &sender, count)?;
         if self.mempool.len() >= MAX_MEMPOOL {
-            // Full: evict the lowest tip per byte if this one pays more, else refuse. Only the
-            // last queued tx of another sender can go, so no sender is left with a nonce gap.
-            let mut last = HashMap::new();
-            for (i, t) in self.mempool.iter().enumerate() {
-                last.insert(t.from.as_str(), i);
-            }
-            last.remove(sender.as_str());
-            // Lowest rate; among equals, the newest arrival.
-            let lowest = last.into_values().min_by(|&a, &b| TipRate::of(&self.mempool[a]).cmp(&TipRate::of(&self.mempool[b])).then(b.cmp(&a)));
-            let idx = match lowest {
-                Some(i) if TipRate::of(&tx) > TipRate::of(&self.mempool[i]) => i,
-                Some(i) => {
-                    let low = TipRate::of(&self.mempool[i]);
-                    let need = (low.tip as u128 * tx.size() as u128 / low.size.max(1) as u128 + 1).min(u64::MAX as u128);
-                    bail!("mempool is full; resubmit with a tip of at least {need} drops (and the fee to cover it), or try again shortly");
+            let victim = if evict { self.eviction_victim(&tx, &sender) } else { Err(anyhow!("mempool is full")) };
+            match victim {
+                Ok(idx) => self.evict(idx, next),
+                Err(e) => {
+                    if let Some((mut sim, j)) = sim {
+                        sim.state.rollback(j);
+                        self.sims.keep(sender, sim);
+                    }
+                    return Err(e);
                 }
-                None => bail!("mempool is full; try again shortly"),
-            };
-            self.mempool.remove(idx);
-            let eid = self.mempool_ids.remove(idx);
-            self.pool.remove(&eid);
-            self.mp.remove(&eid);
-            self.note_failed(eid, "evicted from a full mempool by a transaction with a higher tip".into(), next);
-            self.rebuild_pending();
+            }
+        }
+        if let Some((mut sim, _)) = sim {
+            sim.applied += 1;
+            self.sims.keep(sender.clone(), sim);
         }
         if let Some(g) = &self.gossip {
             let _ = g.unbounded_send(tx.clone());
         }
-        let debit = self.state.tx_debit(&tx);
-        let e = self.pending.entry(sender.clone()).or_default();
-        e.0 += 1;
-        e.1 = e.1.saturating_add(debit);
+        self.pending.entry(sender).or_default().push(self.mempool.len());
         self.pool.insert(id.clone());
         self.mp.add(id.clone(), &tx, next);
         self.mempool.push(tx);
@@ -2801,45 +2902,113 @@ impl Chain {
         Ok((id, true))
     }
 
-    pub fn submit(&mut self, tx: Tx) -> Result<String> {
-        self.submit_tx(tx).map(|(id, _)| id)
-    }
-
-    /// Adds a tx that another node already accepted (full nodes track what they forwarded).
-    pub fn track_pending(&mut self, tx: Tx) -> Result<()> {
-        tx.check_format()?;
-        let id = tx.id();
-        if !self.pool.contains(&id) && !self.has_tx(&id) {
-            let sender = tx.sender()?;
-            if self.pending.get(&sender).is_some_and(|p| p.0 >= MAX_PENDING_PER_SENDER) || self.mempool.len() >= MAX_MEMPOOL {
-                return Ok(());
+    /// Dry-runs `tx` (from `sender`, at the next height) after the sender's `queued` txs; `Err`
+    /// says why it can't be included. With nothing queued it runs on the live state and is
+    /// rolled back (`None`). Otherwise it runs on the sender's simulation (from the cache, or
+    /// built from its queue), which is returned with `tx` applied and the journal that undoes it.
+    fn dry_run(&mut self, tx: &Tx, sender: &str, queued: usize) -> Result<Simulated> {
+        let (next, proposer, chain_id) = (self.height() + 1, self.fee_sink(), self.genesis.chain_id.clone());
+        let try_apply = |state: &mut State| -> Result<Journal> {
+            let mut j = Journal::default();
+            let outcome = state.apply_j(&mut j, tx, &chain_id, &proposer, next, false);
+            match outcome {
+                Ok(Outcome::Applied) => Ok(j),
+                Ok(Outcome::Failed(r)) => {
+                    state.rollback(j);
+                    Err(anyhow!(r))
+                }
+                Err(e) => {
+                    state.rollback(j);
+                    Err(e)
+                }
             }
-            let debit = self.state.tx_debit(&tx);
-            let e = self.pending.entry(sender.clone()).or_default();
-            e.0 += 1;
-            e.1 = e.1.saturating_add(debit);
-            let next = self.height() + 1;
-            self.pool.insert(id.clone());
-            self.mp.add(id.clone(), &tx, next);
-            self.mempool.push(tx);
-            self.mempool_ids.push(id);
-            self.publish_mempool();
+        };
+        if queued == 0 {
+            let j = try_apply(&mut self.state)?;
+            self.state.rollback(j);
+            return Ok(None);
         }
-        Ok(())
+        let mut sim = match self.sims.take(sender, self.height(), queued) {
+            Some(sim) => sim,
+            None => {
+                let sim = self.simulate_queue(sender, next, &proposer, &chain_id)?;
+                self.sims.rebuilt += sim.applied as u64;
+                sim
+            }
+        };
+        match try_apply(&mut sim.state) {
+            Ok(j) => Ok(Some((sim, j))),
+            Err(e) => {
+                self.sims.keep(sender.to_string(), sim);
+                Err(e)
+            }
+        }
     }
 
-    /// Removes a tx we queued locally (e.g. a full node whose forward failed).
-    pub fn drop_pending(&mut self, id: &str) {
-        if self.pool.remove(id) {
-            self.remove_from_mempool(|x| x == id);
-            self.mp.remove(id);
-            self.rebuild_pending();
-            self.publish_mempool();
+    /// A copy of the state with `sender`'s queued txs applied in nonce order, as the block at
+    /// `next` would apply them. `Err` if one no longer applies (a block changed the state since
+    /// it was queued; the post-block check drops it and the txs behind it).
+    fn simulate_queue(&self, sender: &str, next: u64, proposer: &str, chain_id: &str) -> Result<SenderSim> {
+        let mut state = self.state.clone();
+        let queue = self.pending.get(sender).map(Vec::as_slice).unwrap_or_default();
+        for &i in queue {
+            let t = &self.mempool[i];
+            let mut j = Journal::default();
+            let why = match state.apply_j(&mut j, t, chain_id, proposer, next, false) {
+                Ok(Outcome::Applied) => continue,
+                Ok(Outcome::Failed(r)) => r,
+                Err(e) => e.to_string(),
+            };
+            bail!("your pending transaction with nonce {} no longer applies ({why}); wait for it to be dropped", t.nonce);
         }
+        Ok(SenderSim { state, applied: queue.len(), used: 0 })
+    }
+
+    /// The tx a full mempool gives up for `tx`: the lowest tip per byte if `tx` pays more (among
+    /// equals, the newest arrival). Only another sender's last queued tx can go, so nobody is
+    /// left with a nonce gap, and every queued tx still applies after its predecessors.
+    fn eviction_victim(&self, tx: &Tx, sender: &str) -> Result<usize> {
+        let tails = self.pending.iter().filter(|(s, _)| s.as_str() != sender).filter_map(|(_, q)| q.last().copied());
+        let lowest = tails.min_by(|&a, &b| TipRate::of(&self.mempool[a]).cmp(&TipRate::of(&self.mempool[b])).then(b.cmp(&a)));
+        match lowest {
+            Some(i) if TipRate::of(tx) > TipRate::of(&self.mempool[i]) => Ok(i),
+            Some(i) => {
+                let low = TipRate::of(&self.mempool[i]);
+                let need = (low.tip as u128 * tx.size() as u128 / low.size.max(1) as u128 + 1).min(u64::MAX as u128);
+                bail!("mempool is full; resubmit with a tip of at least {need} drops (and the fee to cover it), or try again shortly")
+            }
+            None => bail!("mempool is full; try again shortly"),
+        }
+    }
+
+    fn evict(&mut self, idx: usize, next: u64) {
+        let gone = self.mempool.remove(idx);
+        let eid = self.mempool_ids.remove(idx);
+        self.pool.remove(&eid);
+        self.mp.remove(&eid);
+        self.sims.forget(&gone.from);
+        self.note_failed(eid, "evicted from a full mempool by a transaction with a higher tip".into(), next);
+        self.rebuild_pending();
+    }
+
+    /// Removes a tx we queued locally (e.g. a full node whose forward failed), and its sender's
+    /// later txs, which can't execute without it.
+    pub fn drop_pending(&mut self, id: &str) {
+        let Some(i) = self.mempool_ids.iter().position(|x| x == id) else { return };
+        let (from, nonce) = (self.mempool[i].from.clone(), self.mempool[i].nonce);
+        let gone: std::collections::HashSet<String> = self.mempool.iter().zip(&self.mempool_ids).filter(|(t, _)| t.from == from && t.nonce >= nonce).map(|(_, id)| id.clone()).collect();
+        self.remove_from_mempool(|x| gone.contains(x));
+        for id in &gone {
+            self.pool.remove(id);
+            self.mp.remove(id);
+        }
+        self.sims.forget(&from);
+        self.rebuild_pending();
+        self.publish_mempool();
     }
 
     pub fn pending_count(&self, addr: &str) -> usize {
-        self.pending.get(addr).map(|p| p.0).unwrap_or(0)
+        self.pending.get(addr).map_or(0, Vec::len)
     }
 
     #[cfg(test)]
@@ -3453,6 +3622,204 @@ mod audit {
         let t = Instant::now();
         c.revalidate_mempool();
         println!("revalidating 5,000 txs: {:?}", t.elapsed());
+    }
+
+    /// An unsigned tx `from` an account, by `signer`, paying `tip` (fee = the exact charge).
+    fn unsigned_as(from: &str, signer: &Keys, nonce: u64, tip: u64, action: Action) -> Tx {
+        let mut tx = Tx { chain_id: "audit".into(), from: from.into(), nonce, fee: 0, tip, valid_until: 1_000, action, memo: String::new(), public_key: hex::encode(signer.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+        tx.fee = tx.charge().unwrap();
+        tx
+    }
+
+    /// Funds `owner`'s account straight in the state, with `agent` as a session key spending up
+    /// to `limit` per 10,000 blocks.
+    fn with_agent(c: &mut Chain, owner: &Keys, agent: &Keys, limit: u64, balance: u64) -> String {
+        let rec = |label: &str, role| KeyRecord { label: label.into(), role, added_at: 0, spent: 0, window_start: 0 };
+        let keys = BTreeMap::from([(key_id(&owner.public_key()), rec("owner", KeyRole::Owner)), (key_id(&agent.public_key()), rec("agent", KeyRole::Session { limit, period_blocks: 10_000, expires_at: 10_000 }))]);
+        c.state.accounts.insert(owner.address(), Account { balance, keys, ..Default::default() });
+        c.state.supply += balance;
+        owner.address()
+    }
+
+    fn fund(c: &mut Chain, k: &Keys, balance: u64) {
+        c.state.accounts.insert(k.address(), Account { balance, ..Default::default() });
+        c.state.supply += balance;
+    }
+
+    /// Audit #10, PoC 1: the owner queues `RemoveKey(agent)`, then the agent queues transfers.
+    /// Admission used to check them against the state before the removal (it only reserved
+    /// balance and bumped the nonce), so 63 of 64 got in though none could ever execute. Now the
+    /// dry run applies the removal first and refuses them. In the other order everything the
+    /// agent queued before the removal executes.
+    #[test]
+    fn txs_behind_a_key_removal_are_refused() {
+        let (_h, mut c) = fresh("rmkey");
+        let (owner, agent) = (Keys::from_seed([1; 32]), Keys::from_seed([2; 32]));
+        let acct = with_agent(&mut c, &owner, &agent, 1_000 * DROPS_PER_FANG, 1_000 * DROPS_PER_FANG);
+        c.produce_block_with(vec![]).unwrap();
+        let me = c.me().unwrap();
+        let pay = |signer: &Keys, n: u64| unsigned_as(&acct, signer, n, 1, Action::Transfer { to: me.clone(), amount: 0 });
+        let (agent_kid, remove) = (key_id(&agent.public_key()), Action::RemoveKey { key_id: key_id(&agent.public_key()) });
+        c.submit(unsigned_as(&acct, &owner, 0, 0, remove.clone())).unwrap();
+        // None gets in (each is a different tx for the next nonce).
+        for amount in 0..MAX_PENDING_PER_SENDER as u64 - 1 {
+            let err = c.submit(unsigned_as(&acct, &agent, 1, 1, Action::Transfer { to: me.clone(), amount })).unwrap_err().to_string();
+            assert!(err.contains("isn't authorized"), "{err}");
+        }
+        // A full node tracking a forwarded tx runs the same check.
+        assert!(c.track_pending(pay(&agent, 1)).unwrap_err().to_string().contains("isn't authorized"));
+        assert_eq!(c.mempool.len(), 1);
+        c.submit(pay(&owner, 1)).unwrap();
+        c.produce_block().unwrap();
+        let b = c.block(c.height()).unwrap();
+        assert_eq!((b.txs.len(), b.skipped.len(), b.failed.len()), (2, 0, 0));
+        // The agent again, then 62 of its transfers and the owner's removal behind them: all in,
+        // all executed.
+        let add = Action::AddKey { key_id: agent_kid, label: "agent".into(), role: KeyRole::Session { limit: 1_000 * DROPS_PER_FANG, period_blocks: 100, expires_at: 10_000 } };
+        c.submit(unsigned_as(&acct, &owner, 2, 0, add)).unwrap();
+        c.produce_block().unwrap();
+        for n in 3..65 {
+            c.submit(pay(&agent, n)).unwrap();
+        }
+        c.submit(unsigned_as(&acct, &owner, 65, 0, remove)).unwrap();
+        assert_eq!(c.mempool.len(), 63);
+        c.produce_block().unwrap();
+        let b = c.block(c.height()).unwrap();
+        assert_eq!((b.txs.len(), b.skipped.len(), b.failed.len()), (63, 0, 0));
+    }
+
+    /// Audit #10, PoC 2: a session key whose limit covers one tx's charge queues 64. They used to
+    /// be admitted on the account's balance alone; now the second sees the first's spending.
+    #[test]
+    fn txs_past_a_session_limit_are_refused() {
+        let (_h, mut c) = fresh("limit");
+        let (owner, agent) = (Keys::from_seed([1; 32]), Keys::from_seed([2; 32]));
+        let me = c.me().unwrap();
+        let pay = |n: u64, tip: u64| unsigned_as(&owner.address(), &agent, n, tip, Action::Transfer { to: me.clone(), amount: 0 });
+        with_agent(&mut c, &owner, &agent, pay(0, 1).charge().unwrap(), 100 * DROPS_PER_FANG);
+        c.produce_block_with(vec![]).unwrap();
+        c.submit(pay(0, 1)).unwrap();
+        // None of the next nonce's candidates gets in, whatever it tips.
+        for tip in 1..MAX_PENDING_PER_SENDER as u64 {
+            let err = c.submit(pay(1, tip)).unwrap_err().to_string();
+            assert!(err.contains("limit reached"), "{err}");
+        }
+        assert_eq!(c.mempool.len(), 1);
+        c.produce_block().unwrap();
+        let b = c.block(c.height()).unwrap();
+        assert_eq!((b.txs.len(), b.skipped.len()), (1, 0));
+    }
+
+    /// Audit #10, PoC 3: 79 accounts with one-charge session keys used to hold all 5,000 slots
+    /// with txs that could never execute: the next block collected fees for 79 of them, the
+    /// mempool emptied, and the attacker refilled it for free. Now each account gets one slot,
+    /// honest senders get in without evicting anyone, and every queued tx executes and pays.
+    #[test]
+    fn phantom_txs_cannot_fill_the_mempool() {
+        let (_h, mut c) = fresh("fill");
+        let me = c.me().unwrap();
+        let accounts: Vec<(Keys, Keys)> = (0..79u32).map(|i| (Keys::from_seed(crypto::hash(&i.to_le_bytes())), Keys::from_seed(crypto::hash(&(i + 500).to_le_bytes())))).collect();
+        let pay = |(owner, agent): &(Keys, Keys), n: u64| unsigned_as(&owner.address(), agent, n, 1, Action::Transfer { to: me.clone(), amount: 0 });
+        let limit = pay(&accounts[0], 0).charge().unwrap();
+        for (owner, agent) in &accounts {
+            with_agent(&mut c, owner, agent, limit, 10 * DROPS_PER_FANG);
+        }
+        let honest = Keys::from_seed([99; 32]);
+        fund(&mut c, &honest, 100 * DROPS_PER_FANG);
+        c.produce_block_with(vec![]).unwrap();
+        let mut admitted = 0;
+        for a in &accounts {
+            for n in 0..MAX_PENDING_PER_SENDER as u64 {
+                admitted += c.submit(pay(a, n)).is_ok() as usize;
+            }
+        }
+        assert_eq!((admitted, c.mempool.len()), (79, 79));
+        for n in 0..MAX_PENDING_PER_SENDER as u64 {
+            c.submit(unsigned("audit", &honest, n, Action::Transfer { to: me.clone(), amount: 1 })).unwrap();
+        }
+        assert_eq!(c.mempool.len(), 79 + 64, "nothing was evicted");
+        let burned = c.state.burned;
+        c.produce_block().unwrap();
+        let b = c.block(c.height()).unwrap();
+        assert_eq!((b.txs.len(), b.skipped.len(), b.failed.len()), (79 + 64, 0, 0));
+        assert_eq!(c.state.burned - burned, b.txs.iter().map(|t| t.charge().unwrap() - t.tip).sum::<u64>(), "every queued tx paid");
+        assert!(c.mempool.is_empty());
+    }
+
+    /// Dropping a queued tx takes its sender's later txs along (they'd wait behind a nonce gap
+    /// forever), but a tx whose nonce another tx used goes alone.
+    #[test]
+    fn dropped_txs_take_their_successors() {
+        let (_h, mut c) = fresh("gap");
+        let (a, b) = (Keys::from_seed([5; 32]), Keys::from_seed([6; 32]));
+        fund(&mut c, &a, 100 * DROPS_PER_FANG);
+        fund(&mut c, &b, 100 * DROPS_PER_FANG);
+        c.produce_block_with(vec![]).unwrap();
+        let me = c.me().unwrap();
+        let pay = |n: u64, amount: u64| unsigned("audit", &a, n, Action::Transfer { to: me.clone(), amount });
+        let ids: Vec<String> = (0..3).map(|n| c.submit(pay(n, 1)).unwrap()).collect();
+        // A full node whose forward failed drops the first: all three go.
+        c.drop_pending(&ids[0]);
+        assert!(c.mempool.is_empty());
+        assert_eq!(c.next_nonce(&a.address()), 0);
+        // Another tx used nonce 0: the queued nonce-0 tx goes, the ones after it stay.
+        for n in 0..3 {
+            c.submit(pay(n, 1)).unwrap();
+        }
+        c.produce_block_with(vec![pay(0, 2)]).unwrap();
+        assert_eq!(c.mempool.iter().map(|t| t.nonce).collect::<Vec<_>>(), vec![1, 2]);
+        // Nonce 1 registers a name someone else takes first: it can't run, so nonce 2 goes too.
+        c.drop_pending(&c.mempool_ids[0].clone());
+        c.submit(unsigned("audit", &a, 1, Action::RegisterName { name: "taken".into() })).unwrap();
+        c.submit(pay(2, 1)).unwrap();
+        c.produce_block_with(vec![unsigned("audit", &b, 0, Action::RegisterName { name: "taken".into() })]).unwrap();
+        assert!(c.mempool.is_empty());
+        let (h, _) = (c.height(), ());
+        assert!(c.failure(&pay(2, 1).id()).unwrap().0.contains("an earlier transaction from the same account was dropped"), "at {h}");
+    }
+
+    /// Admission applies a sender's queued txs before the new one, from a cached simulation:
+    /// the 64th tx from a sender costs one dry run, like the first. After a block the cache is
+    /// rebuilt once per sender, from its queue (at most 63 dry runs).
+    #[test]
+    fn admission_cost_doesnt_grow_with_the_queue() {
+        let (_h, mut c) = fresh("flat");
+        let me = c.me().unwrap();
+        let (x, y) = (Keys::from_seed([40; 32]), Keys::from_seed([41; 32]));
+        fund(&mut c, &x, 100 * DROPS_PER_FANG);
+        fund(&mut c, &y, 100 * DROPS_PER_FANG);
+        c.produce_block_with(vec![]).unwrap();
+        let pay = |k: &Keys, n: u64| unsigned("audit", k, n, Action::Transfer { to: me.clone(), amount: 1 });
+        let mut times = vec![];
+        for n in 0..MAX_PENDING_PER_SENDER as u64 {
+            let tx = pay(&x, n);
+            let t = Instant::now();
+            c.submit(tx).unwrap();
+            times.push(t.elapsed());
+        }
+        assert_eq!(c.sims.rebuilt, 1, "only the second tx simulated the queue (of one)");
+        let median = |t: &[std::time::Duration]| {
+            let mut t = t.to_vec();
+            t.sort();
+            t[t.len() / 2]
+        };
+        let (early, late) = (median(&times[1..9]), median(&times[56..64]));
+        println!("admission: txs 2-9 of a sender {early:?} each (median), txs 57-64 {late:?}");
+        for n in 0..63 {
+            c.submit(pay(&y, n)).unwrap();
+        }
+        // A block (with neither sender's txs) makes the simulations stale: y's next tx rebuilds
+        // its own from its 63 queued txs, once.
+        c.produce_block_with(vec![]).unwrap();
+        let rebuilt = c.sims.rebuilt;
+        let t = Instant::now();
+        let err = c.submit(pay(&x, 64)).unwrap_err().to_string();
+        assert!(err.contains("too many pending"), "{err}");
+        c.submit(pay(&y, 63)).unwrap();
+        let miss = t.elapsed();
+        assert_eq!(c.sims.rebuilt - rebuilt, 63);
+        println!("after a block: a tx behind 63 queued ones took {miss:?} (the queue simulated once)");
+        assert!(miss.as_millis() < 1_000, "{miss:?}");
     }
 
     /// 200k accounts and a full 512-tx block: no per-tx state clone. Timed is the execution

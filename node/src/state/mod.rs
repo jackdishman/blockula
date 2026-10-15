@@ -511,9 +511,10 @@ impl State {
         self.check_bounds()
     }
 
-    /// Every nested collection stays within the cap the state machine enforces for it, and so
-    /// every record within what a snapshot may carry ([`MAX_KEY_BYTES`], [`MAX_VALUE_BYTES`]):
-    /// a record past them would make every later snapshot unreadable (audit #11).
+    /// Every nested collection stays within the cap the state machine enforces for it, which
+    /// keeps every record within what a snapshot may carry (audit #11: a record past
+    /// [`MAX_VALUE_BYTES`] would make every later snapshot unreadable). [`State::check_record_sizes`]
+    /// checks the records themselves.
     fn check_bounds(&self) -> Result<()> {
         use crate::chain::{MAX_HUNT_FUNDERS, MAX_KEYS, MAX_LOCKS};
         use crate::poc::{JURY_SIZE, MAX_CLAIM_ATTESTATIONS, MAX_GRANTS, MAX_SEANCE_CLAIMS, PAIRS_PER_JUROR};
@@ -534,6 +535,12 @@ impl State {
             ensure!(s.claims.len() <= MAX_SEANCE_CLAIMS && s.jurors.len() <= JURY_SIZE, "Séance #{id} has {} claims and {} jurors", s.claims.len(), s.jurors.len());
             ensure!(s.jurors.values().all(|seat| seat.pairs.len() <= PAIRS_PER_JUROR && seat.spam.len() <= MAX_SEANCE_CLAIMS), "Séance #{id} has an oversized jury seat");
         }
+        Ok(())
+    }
+
+    /// Every record fits what a snapshot may carry ([`MAX_KEY_BYTES`], [`MAX_VALUE_BYTES`]).
+    /// O(state): it encodes every record.
+    pub fn check_record_sizes(&self) -> Result<()> {
         let mut too_big = None;
         self.for_each_record(|n, k, v| {
             if too_big.is_none() && (k.len() > MAX_KEY_BYTES || v.len() > MAX_VALUE_BYTES) {
@@ -547,12 +554,15 @@ impl State {
     }
 
     /// Test builds run this after every block: the incremental root must equal a rebuild from
-    /// scratch (skipped past 50k records, which only the benchmarks build) and the invariants
-    /// must hold.
+    /// scratch and every record must fit a snapshot (both skipped past 50k records, which only
+    /// the benchmarks build), and the invariants must hold.
     #[cfg(test)]
     pub fn debug_check(&self, height: u64) {
         if self.record_count() <= 50_000 {
             assert_eq!(hex::encode(self.tree.root()), hex::encode(self.full_root()), "incremental state root diverged from a full rebuild at height {height}");
+            if let Err(e) = self.check_record_sizes() {
+                panic!("record too large at height {height}: {e}");
+            }
         }
         if let Err(e) = self.check_invariants() {
             panic!("state invariant broken at height {height}: {e}");

@@ -565,6 +565,7 @@ fn largest_records_fit_in_a_snapshot() {
         assert!(*size <= MAX_VALUE_BYTES / 16, "namespace {n}'s largest record is {size} bytes");
     }
     st.check_bounds().unwrap();
+    st.check_record_sizes().unwrap();
     // One funder too many is caught.
     st.hunts.get_mut(&0).unwrap().funders.insert(addr(u64::MAX), "1".into());
     assert!(st.check_bounds().unwrap_err().to_string().contains("funders"));
