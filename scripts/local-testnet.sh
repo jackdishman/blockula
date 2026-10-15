@@ -64,7 +64,7 @@ echo "— SDK e2e against validator 2 (faucet + txs gossiped to whoever leads)"
 BLOCKULA_RPC="http://$V2" BLOCKULA_ADMIN_SEED="$(cat "$DIR/v0/validator.key")" npm test -w @blockula/sdk
 
 echo "— onboarding a validator with the CLI"
-"$BIN" validator init --home "$DIR/v$N" --genesis "http://$V0" | tee "$DIR/init.txt"
+"$BIN" validator init --home "$DIR/v$N" --genesis "http://$V0" --genesis-hash "$GHASH" | tee "$DIR/init.txt"
 NEWV=$(grep -o 'boo1[0-9a-z]*' "$DIR/init.txt" | head -1)
 curl -sf -X POST -H 'content-type: application/json' -d "{\"to\":\"$NEWV\"}" "http://$V0/api/faucet" >/dev/null
 for _ in $(seq 1 60); do

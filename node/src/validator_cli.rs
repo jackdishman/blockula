@@ -22,6 +22,10 @@ pub enum ValidatorCmd {
         /// genesis.json path, or any node's HTTP URL
         #[arg(long)]
         genesis: String,
+        /// Refuse a genesis that doesn't hash to this (printed by `summon`, in /api/status).
+        /// Required with a URL unless this release knows the chain id
+        #[arg(long)]
+        genesis_hash: Option<String>,
         /// host:port other validators dial for p2p (default: 127.0.0.1 with a free port)
         #[arg(long)]
         public_p2p_addr: Option<String>,
@@ -188,18 +192,22 @@ pub(crate) async fn send_memo(rpc: &str, keys: &Keys, from: &str, action: Action
 
 pub fn run(cmd: ValidatorCmd) -> Result<()> {
     match cmd {
-        ValidatorCmd::Init { home, genesis, public_p2p_addr, public_http_addr } => {
+        ValidatorCmd::Init { home, genesis, genesis_hash, public_p2p_addr, public_http_addr } => {
             if home.join("validator.key").exists() {
                 bail!("{} already has a validator.key", home.display());
             }
-            std::fs::create_dir_all(&home)?;
-            let g: Genesis = if genesis.starts_with("http://") || genesis.starts_with("https://") {
+            let remote = genesis.starts_with("http://") || genesis.starts_with("https://");
+            let g: Genesis = if remote {
                 let g: Genesis = serde_json::from_value(rt()?.block_on(get(&genesis, "/genesis"))?)?;
                 g.check_prefix().context("genesis")?;
                 g
             } else {
                 Genesis::load(Path::new(&genesis))?
             };
+            // As `join` does: a known chain's genesis must match this release, a pin must match,
+            // and a genesis fetched from a node must be pinned (a local file is the operator's own).
+            crate::checkpoints::Trust::new(&g, &crate::checkpoints::Pins { genesis_hash, ..Default::default() }, remote)?;
+            std::fs::create_dir_all(&home)?;
             let p2p = match public_p2p_addr { Some(a) => a, None => format!("127.0.0.1:{}", crate::chain::free_port()?) };
             let http = match public_http_addr { Some(a) => a, None => format!("127.0.0.1:{}", crate::chain::free_port()?) };
             crate::chain::check_host_port(&p2p).context("--public-p2p-addr")?;
@@ -459,6 +467,24 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         assert!(wallet(WalletCmd::New { rpc: None, prefix: Some("xboo".into()) }, &dir).unwrap_err().to_string().contains("unknown address prefix"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `validator init` checks the genesis like `join`: a pin must match, and a home is only
+    /// created for a genesis that passed.
+    #[test]
+    fn validator_init_checks_the_genesis_pin() {
+        let root = std::env::temp_dir().join(format!("blockula-vinit-{}-{}", crate::chain::now_ms(), std::process::id()));
+        let homes = crate::chain::Chain::summon(&root, &crate::chain::SummonOpts::new("vinit", 1)).unwrap();
+        let file = homes[0].join("genesis.json").display().to_string();
+        let hash = crate::checkpoints::genesis_hash(&Genesis::load(Path::new(&file)).unwrap());
+        let init = |home: &str, pin: Option<String>| run(ValidatorCmd::Init { home: root.join(home), genesis: file.clone(), genesis_hash: pin, public_p2p_addr: None, public_http_addr: None });
+        assert!(init("wrong", Some("00".repeat(32))).unwrap_err().to_string().contains("genesis hash mismatch"));
+        assert!(!root.join("wrong").exists(), "no home for a refused genesis");
+        init("pinned", Some(hash)).unwrap();
+        assert!(root.join("pinned/validator.key").exists());
+        // A local file is the operator's own: no pin needed.
+        init("local", None).unwrap();
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// `--rpc https://…` must work for the CLI (wallet, validator register/approve).

@@ -194,7 +194,7 @@ Validators are permissionless: anyone can register one with a self-bond, anyone 
 
 ```bash
 # 1. Create a validator home: fetches genesis, generates the ML-DSA-65 key, records your public addresses
-blockula validator init --home ~/val --genesis https://<any node> \
+blockula validator init --home ~/val --genesis https://<any node> --genesis-hash <the chain's genesis hash> \
   --public-p2p-addr <your-ip>:30300 --public-http-addr <your-ip>:7070
 # 2. Fund the printed address with the minimum self-bond plus fees (testnets: the faucet, POST /api/faucet)
 # 3. Start the node: it syncs now and votes once it's in the active set
