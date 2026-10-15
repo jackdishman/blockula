@@ -742,8 +742,8 @@ pub(crate) fn register(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str
 /// shares, and the operator's commission. Genesis only (no journal).
 pub fn genesis_pool(state: &mut State, validator: &str, self_bond: u64) {
     let mut j = Journal::default();
-    let owner = state.validators[validator].owner.clone();
-    put_pool(state, &mut j, validator, Pool::default());
+    let (owner, commission) = state.validators.get(validator).map(|r| (r.owner.clone(), r.commission_bps)).expect("a genesis validator");
+    put_pool(state, &mut j, validator, Pool { commission_base: commission, ..Default::default() });
     if self_bond > 0 {
         bond(state, &mut j, &owner, validator, self_bond, self_bond).expect("an empty pool takes any amount");
     }
