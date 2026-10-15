@@ -1,10 +1,11 @@
 // End-to-end against a running node: `blockula dev --reset` then `npm test`.
 // Proves TS-signed ML-DSA transactions verify in the Rust node.
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex, hexToBytes, randomBytes } from "@noble/hashes/utils.js";
-import { ApiError, Client, NAMESPACES, POP_CONTEXT, TxFailedError, Wallet, addressFromPublicKey, addressPrefix, baseFee, beaconCommitment, formatFang, ghostSighash, isAddress, minFee, paramsOf, parseFang, parseSoul, popMessage, proposal, proposalSummary, seanceCommitment, signingBytes, stakeSummary, txBytes, txCharge, txId, txSize, verifyProof, type Action, type GhostBundle, type ProposalKind, type Tx } from "../src/index.js";
+import { ApiError, Client, NAMESPACES, POP_CONTEXT, TxFailedError, Wallet, addressFromPublicKey, addressPrefix, baseFee, beaconCommitment, formatFang, ghostSighash, isAddress, minFee, paramsOf, parseFang, parseSoul, popMessage, proposal, proposalSummary, seanceCommitment, sharesFor, signingBytes, stakeSummary, txBytes, txCharge, txId, txSize, verifyProof, type Action, type GhostBundle, type ProposalKind, type Tx } from "../src/index.js";
 
 const client = new Client(process.env.BLOCKULA_RPC ?? "http://localhost:7070");
 
@@ -278,7 +279,8 @@ for (const admin of [() => alice.setRepo("a/b", 1), () => alice.grantSoul(bob.ad
 }
 const poolBefore = BigInt((await client.contributions()).pool.balance);
 console.log("✓", (await alice.fundPool("1")).summary);
-assert.equal(BigInt((await client.contributions()).pool.balance), poolBefore + parseFang("1"));
+// (Issuance also pays the pool its share at every epoch boundary.)
+assert.ok(BigInt((await client.contributions()).pool.balance) >= poolBefore + parseFang("1"));
 await assert.rejects(client.seance(999_999), /not found/);
 assert.ok(Array.isArray((await client.souls()).souls));
 
@@ -306,38 +308,147 @@ if (process.env.BLOCKULA_ADMIN_SEED) {
 }
 console.log("✓ Proof of Contribution txs verify and enforce their rules");
 
-// Protocol v1 (tags 30–49): the SDK signs them and the node verifies them; every module is live.
-// Staking works; names renew, transfer and release; governance, beacon and revert txs are
-// refused here for their own reasons.
-const validator: string = (await client.validators()).active[0].validator.address;
-// Staking: delegate to the dev validator, start unbonding part of it; nothing is free yet.
-console.log("✓", (await client.submit(await alice.build({ type: "delegate", validator, amount: parseFang("2").toString() }))).summary);
-console.log("✓", (await client.submit(await alice.build({ type: "undelegate", validator, shares: parseFang("1").toString() }))).summary);
-await assert.rejects(client.submit(await alice.build({ type: "withdraw_unbonded" })), /nothing has finished unbonding/);
-await assert.rejects(client.submit(await alice.build({ type: "unjail", validator })), /only validator .*'s owner|isn't jailed/);
-const staking = await (await fetch(`${process.env.BLOCKULA_RPC ?? "http://localhost:7070"}/api/staking/${alice.address}`)).json();
-assert.equal(staking.delegations.find((d: any) => d.validator.address === validator).value, parseFang("1").toString());
-assert.equal(staking.unbonding, parseFang("1").toString());
-console.log("✓", staking.summary);
+// Protocol v1 (tags 30–49): every module is live, and each flow below runs to its end on the dev
+// chain's short durations (`blockula dev`: 1-minute epochs, unbonding in ~2–3 minutes, votes in a
+// minute, a 20-second timelock). Responses are read with the SDK's readers, so this also checks
+// that they read what the node serves.
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+async function until<T>(what: string, f: () => Promise<T | undefined | null | false>, timeoutMs = 600_000): Promise<T> {
+  const start = Date.now();
+  for (;;) {
+    const v = await f();
+    if (v) return v;
+    if (Date.now() - start > timeoutMs) throw new Error(`timed out waiting for ${what}`);
+    await sleep(2_000);
+  }
+}
+const validators = await client.validators();
+const validator: string = validators.active[0].validator.address;
+assert.equal(validators.active[0].status, "active");
+assert.ok(/^\d+$/.test(validators.active[0].stake) && validators.active[0].eligible === true, "pools are served with stake and eligibility");
+
+// The fee market: each upcoming block's base fee is fixed 17 blocks ahead; a tx is charged its
+// block's base fee for its size (burned) plus its tip, never more than its fee.
+const feeView = await client.fees();
+assert.equal(feeView.lag, 17);
+assert.equal(feeView.slots.length, 18);
+const priced = await alice.send(bob.address, "1", { tip: "0.000002" });
+const pricedBlock = await client.block(priced.height);
+assert.ok(pricedBlock.base_fee, "executed blocks show the base fee they charged");
+const slot = pricedBlock.base_fee;
+assert.equal(BigInt(priced.fee), BigInt(slot.flat) + (BigInt(slot.rate) * BigInt(priced.size_bytes)) / 1000n + BigInt(priced.tip), "charged: the block's base fee for its size + the tip");
+assert.ok(BigInt(priced.fee) <= BigInt(priced.max_fee));
+console.log(`✓ fee market: charged ${priced.fee_display} (base ${pricedBlock.base_fee.flat} + ${pricedBlock.base_fee.rate}‰ per byte, plus the tip) of a ${formatFang(BigInt(priced.max_fee))} max fee`);
+
+// Staking: delegate to the dev validator, unbond part of it, wait out the unbonding period, withdraw.
+console.log("✓", (await alice.delegate(validator, "3")).summary);
+const staked = stakeSummary(await client.staking(alice.address));
+const pool = staked.delegations.find((d) => d.validator === validator);
+if (!pool) throw new Error("the delegation isn't served");
+// Worth at least what went in (share rounding is in the pool's favour by under a drop a share,
+// and issuance may have paid the pool since: on a dev chain the pool is a sliver of the supply,
+// so its share price climbs fast).
+assert.ok(BigInt(pool.principal) === parseFang("3") && BigInt(pool.value) + 1_000n >= parseFang("3") && pool.self_bond === false, `the delegation is served with its value: ${JSON.stringify(pool)}`);
+console.log("✓", (await alice.undelegate(validator, sharesFor(pool, "2"))).summary);
+const unbonding = stakeSummary(await client.staking(alice.address));
+assert.equal(unbonding.unbonding.length, 1);
+assert.equal(unbonding.unbonding[0].validator, validator);
+assert.ok(BigInt(unbonding.unbonding_total) > 0n && unbonding.unbonding_total === unbonding.unbonding[0].amount, JSON.stringify(unbonding));
+assert.ok(unbonding.delegations.some((d) => d.validator === validator && BigInt(d.principal) < parseFang("3")), "the sale took principal out");
+await assert.rejects(alice.withdrawUnbonded(), /nothing has finished unbonding/);
+await assert.rejects(alice.unjail(validator), /only validator .*'s owner|isn't jailed/);
+console.log(`✓ unbonding until block #${unbonding.unbonding[0].completes_at} (withdrawn below)`);
+
+// Names renew (from the old expiry), and the name endpoint says when they lapse.
 const before = await client.name(name);
 assert.equal(before.status, "active");
-const renewed = await client.submit(await alice.build({ type: "renew_name", name, years: 1 }));
+assert.ok(/^\d+$/.test(before.renewal_price));
+const renewed = await alice.renewName(name, 1);
 console.log("✓", renewed.summary);
 assert.equal((await client.name(name)).expires_at, before.expires_at + before.registration_blocks);
+
+// Governance: a ParamChange proposal, voted through and executed after its timelock. Nothing on
+// a dev chain can reach the token quorum (the validator holds nearly all the supply), so the
+// bootstrap council passes it: the dev validator's key (BLOCKULA_ADMIN_SEED, or the dev home's
+// validator.key) votes for its validator.
+const councilSeed = process.env.BLOCKULA_ADMIN_SEED ?? (process.env.BLOCKULA_HOME ? readFileSync(`${process.env.BLOCKULA_HOME}/dev/validator.key`, "utf8") : undefined);
+const rules = (await client.proposals({ limit: 1 })).params;
+assert.ok(/^\d+$/.test(rules.proposal_deposit) && rules.voting_blocks > 0, "the governance rules are served");
+const paramsBefore = paramsOf(await client.params());
+const target = Number(paramsBefore.max_validators) === 31 ? 30 : 31;
+await assert.rejects(alice.propose(proposal.paramChange("max_validators", 65), { title: "too many", deposit: rules.proposal_deposit }), /max_validators/);
+const proposed = await alice.propose(proposal.paramChange("max_validators", target), { title: `e2e: max_validators ${target}`, url: "https://example.com/e2e" });
+console.log("✓", proposed.summary);
+const proposalId: number = (await client.proposals({ limit: 1 })).proposals[0].id;
+const opened = proposalSummary(await client.proposal(proposalId), rules);
+assert.deepEqual([opened.status, opened.title, opened.supermajority, opened.proposer], ["voting", `e2e: max_validators ${target}`, false, alice.address]);
+console.log("✓", (await alice.vote(proposalId, true, "1", 1)).summary);
+await assert.rejects(alice.vote(proposalId, true, "1000000", 1), /vote with up to/);
+// Voted tokens are locked: they can't be sent away (and voted again from another account) until
+// the lock lapses. Bob holds no stake, so the lock covers his liquid FANG.
+console.log("✓", (await bob.vote(proposalId, true, "5", 1)).summary);
+await assert.rejects(bob.send(alice.address, BigInt((await client.account(bob.address)).balance) - parseFang("1")), /is locked \(vote:/);
+const voted = proposalSummary(await client.proposal(proposalId), rules);
+assert.deepEqual([voted.aye_amount, voted.aye, voted.voters], [parseFang("6").toString(), parseFang("6").toString(), 2]);
+if (councilSeed) {
+  const council = Wallet.fromSeed(councilSeed.trim(), client);
+  console.log("✓", (await council.vote(proposalId, true, "1", 0)).summary);
+  assert.equal(proposalSummary(await client.proposal(proposalId)).council.ayes, 1, "the validator's vote counts in the council");
+}
+// Staking, continued: once the unbonding period is over, withdraw.
+console.log(`  waiting for the unbonding entry (free at block #${unbonding.unbonding[0].completes_at})…`);
+await until("the unbonding entry", async () => stakeSummary(await client.staking(alice.address)).unbonding[0]?.ready);
+const beforeWithdraw = BigInt((await client.account(alice.address)).balance);
+const withdrawn = await alice.withdrawUnbonded();
+console.log("✓", withdrawn.summary);
+assert.equal(BigInt((await client.account(alice.address)).balance), beforeWithdraw + BigInt(unbonding.unbonding_total) - BigInt(withdrawn.fee));
+const afterWithdraw = stakeSummary(await client.staking(alice.address));
+assert.deepEqual([afterWithdraw.unbonding.length, afterWithdraw.withdrawable], [0, "0"]);
+console.log("✓ staking: delegated, unbonded, withdrew;", afterWithdraw.summary);
+
+if (councilSeed) {
+  console.log(`  waiting for the vote to close at block #${voted.voting_ends_at} and the timelock…`);
+  const done = await until("the proposal to execute", async () => {
+    const p = proposalSummary(await client.proposal(proposalId), rules);
+    return p.status === "executed" || p.status === "rejected" || p.status === "failed" ? p : undefined;
+  });
+  assert.equal(done.status, "executed", done.outcome);
+  assert.equal(done.council.of, 1);
+  assert.equal(paramsOf(await client.params()).max_validators, String(target));
+  console.log(`✓ governance: proposal #${proposalId} passed by the council and ran (${done.outcome}); max_validators is ${target}`);
+  // Unlock once the vote's lock has run out.
+  await until("the vote lock to expire", async () => {
+    try {
+      return await alice.unlock();
+    } catch (e) {
+      if (/no expired vote locks/.test((e as Error).message)) return undefined;
+      throw e;
+    }
+  });
+  console.log("✓ vote locks released");
+} else {
+  console.log("(skipping the council vote: set BLOCKULA_ADMIN_SEED or BLOCKULA_HOME to the dev chain's)");
+}
+// Refused for their own reasons, not the encoding.
 const governance: [Action, RegExp][] = [
-  [{ type: "propose", kind: { type: "param_change", key: "max_validators", value: "40" }, deposit: "1", title: "e2e" }, /a proposal bonds at least/],
   [{ type: "vote", proposal_id: 1_000_000, aye: true, amount: "1", conviction: 1 }, /no proposal #1000000/],
-  [{ type: "unlock" }, /no expired vote locks/],
   [{ type: "multisig_propose", action: { type: "transfer", to: bob.address, amount: "1" } }, /isn't a multisig account/],
   [{ type: "claim_distribution", distribution_id: 1_000_000, amount: "1", proof: ["cd".repeat(32)] }, /no distribution #1000000/],
 ];
 for (const [action, why] of governance) {
   await assert.rejects(client.submit(await alice.build(action)), why, action.type);
 }
+await assert.rejects(client.multisig(alice.address), (e: unknown) => e instanceof ApiError && e.status === 404);
+await assert.rejects(client.distribution(1_000_000), (e: unknown) => e instanceof ApiError && e.status === 404);
 // The randomness beacon and revert attestations are live, for validators only.
 const epoch2 = (await client.status()).epoch + 2;
 await assert.rejects(client.submit(await alice.build({ type: "beacon_commit", epoch: epoch2, commitment: beaconCommitment("blockula-dev", epoch2, alice.address, "07".repeat(32)) })), /commit to the beacon/);
 await assert.rejects(client.submit(await alice.build({ type: "attest_revert", claim_id: 0, revert_sha: "cd".repeat(20) })), /only active validators attest reverts/);
+// Ghost Mode ships off: its txs are refused until governance activates it.
+assert.equal((await (await fetch(`${client.rpc}/api/ghost`)).json()).active, false);
+await assert.rejects(alice.client.submit(await alice.build({ type: "set_ghost_address", address: "00".repeat(1216) })), /Ghost Mode is off|valid 1216-byte/);
+
+// Every v1 helper signs a tx the node verifies (refusals come from the rules, not the signature).
 async function verifiedByNode(label: string, run: () => Promise<unknown>) {
   try {
     await run();
@@ -348,23 +459,14 @@ async function verifiedByNode(label: string, run: () => Promise<unknown>) {
   }
 }
 const helpers: [string, () => Promise<unknown>][] = [
-  ["delegate", () => alice.delegate(validator, "1")],
-  ["undelegate", () => alice.undelegate(validator, 1n)],
   ["redelegate", () => alice.redelegate(validator, bob.address, 1n)],
-  ["withdrawUnbonded", () => alice.withdrawUnbonded()],
   ["updateValidator", () => alice.updateValidator({ commissionBps: 500 })],
-  ["unjail", () => alice.unjail(validator)],
-  ["propose", () => alice.propose(proposal.paramChange("max_validators", 40), { title: "e2e", deposit: "1" })],
-  ["vote", () => alice.vote(0, true, "1", 1)],
-  ["unlock", () => alice.unlock()],
-  ["multisigPropose", () => alice.multisigPropose({ type: "transfer", to: bob.address, amount: "1" })],
   ["multisigApprove", () => alice.multisigApprove(0)],
   ["beaconCommit", () => alice.beaconCommit(1, "ab".repeat(32))],
   ["claimDistribution", () => alice.claimDistribution(0, "1", ["cd".repeat(32)])],
-  ["renewName", () => alice.renewName(name, 1)],
 ];
 for (const [label, run] of helpers) await verifiedByNode(label, run);
-console.log(`✓ ${helpers.length} protocol v1 helpers sign txs the node verifies`);
+console.log(`✓ ${helpers.length} more protocol v1 helpers sign txs the node verifies`);
 
 // Proven reads: /api/proof answers check out against the state root, and the node agrees with
 // itself as a witness. Names and accounts that don't exist are proven absent.
@@ -380,14 +482,6 @@ const raw = await client.proof(NAMESPACES.ACCOUNTS, alice.address);
 assert.ok(verifyProof(raw.root, NAMESPACES.ACCOUNTS, alice.address, hexToBytes(raw.value as string), raw.proof));
 assert.ok(!verifyProof(raw.root, NAMESPACES.ACCOUNTS, bob.address, hexToBytes(raw.value as string), raw.proof));
 console.log(`✓ proven reads: ${provenAlice.balance} drops at block #${provenAlice.height}, root ${provenAlice.root.slice(0, 12)}…`);
-
-// The module reads, where this node serves them, parse with the tolerant readers.
-const optional = <T>(p: Promise<T>) => p.catch((e) => (e instanceof ApiError && e.status === 404 ? null : Promise.reject(e)));
-const [params, stakeRead, proposals] = await Promise.all([optional(client.params()), optional(client.staking(alice.address)), optional(client.proposals())]);
-if (params) assert.ok(paramsOf(params).max_tx_validity_blocks, "params include max_tx_validity_blocks");
-if (stakeRead) assert.ok(Array.isArray(stakeSummary(stakeRead).delegations));
-if (proposals) assert.ok((Array.isArray(proposals) ? proposals : proposals.proposals ?? []).map(proposalSummary).every((p: { id: number }) => p.id >= 0));
-console.log(`✓ module reads: params ${params ? "✓" : "(not served yet)"}, staking ${stakeRead ? "✓" : "(not served yet)"}, proposals ${proposals ? "✓" : "(not served yet)"}`);
 
 const moved = await alice.transferName(`${name}.boo`, bob.address);
 console.log("✓", moved.summary);

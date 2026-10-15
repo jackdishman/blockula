@@ -505,7 +505,6 @@ fn tx_json_with(v: &ReadView, tx: &Tx, height: Option<u64>, error: Option<&str>)
         Action::Unshield { to, amount, .. } => ("unshield", st.resolve(to).ok(), Some(*amount)),
         a => (a.kind(), None, None),
     };
-    // An unsigned ghost tx pays exactly its fee (it's in the proof's value balance).
     // An unsigned ghost tx pays exactly its fee (it's in its proof's value balance).
     let charged = if tx.is_unsigned() { tx.fee } else { charged(v, tx, height) };
     json!({
@@ -580,6 +579,8 @@ fn block_json(v: &ReadView, b: &Block) -> Value {
         "signal": b.signal,
         "view": b.view,
         "parent_view": b.parent_view,
+        // The base fee its txs paid (flat drops + `rate` milli-drops per byte, econ.rs).
+        "base_fee": b.base_fee.map(|s| json!({ "flat": s.flat.to_string(), "rate": s.rate.to_string(), "max_block_bytes": s.max_block_bytes })),
         "summary": block_summary(b.height, b.txs.len()),
         "txs": b.txs.iter().enumerate().map(|(i, t)| tx_json_with(v, t, Some(b.height), b.failed.get(&i).map(|s| s.as_str()))).collect::<Vec<_>>(),
         "signature_bytes": v.cert_len(b.height),
@@ -2120,6 +2121,8 @@ mod http_tests {
         let (_, t, _) = call(&n, "GET", &format!("/api/tx/{id}"), None, "127.0.0.1:1").await;
         let size = t["size_bytes"].as_u64().unwrap();
         assert_eq!(t["fee"].as_str().unwrap(), (min_fee(size) + 25).to_string(), "charged: the block's base fee + the tip, not the max fee");
+        let (_, b, _) = call(&n, "GET", &format!("/api/block/{}", t["height"]), None, "127.0.0.1:1").await;
+        assert_eq!((b["base_fee"]["flat"].as_str(), b["base_fee"]["rate"].as_str()), (Some("10000"), Some("10000")), "the block shows the base fee it charged");
         assert_eq!(t["max_fee"].as_str().unwrap(), (3 * min_fee(size)).to_string());
         std::fs::remove_dir_all(root).ok();
     }

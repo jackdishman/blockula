@@ -266,14 +266,14 @@ impl ChainParams {
     /// issuance keep their real values. `blockula summon` (testnets) keeps the real durations.
     pub fn dev_overrides(block_time_ms: u64, epoch_blocks: u64) -> BTreeMap<String, u64> {
         let minute = (60_000 / block_time_ms.max(1)).max(1);
-        let unbonding = (10 * minute).max(epoch_blocks.max(1)).max(10);
+        let unbonding = (2 * minute).max(epoch_blocks.max(1)).max(10);
         [
             ("unbonding_blocks", unbonding),
             ("evidence_max_age_epochs", (unbonding / epoch_blocks.max(1)).max(1)),
-            ("jail_blocks", 2 * minute),
-            ("voting_blocks", (5 * minute).max(10)),
-            ("timelock_blocks", minute),
-            ("lock_period_blocks", minute),
+            ("jail_blocks", minute),
+            ("voting_blocks", minute.max(10)),
+            ("timelock_blocks", (minute / 3).max(1)),
+            ("lock_period_blocks", (minute / 3).max(1)),
             ("governance_spend_height", 0),
             ("proposal_deposit", 10 * FANG),
         ]

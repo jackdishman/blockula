@@ -285,7 +285,8 @@ fn main() -> Result<()> {
                 std::fs::remove_dir_all(&home).ok();
             }
             if !home.join("genesis.json").exists() {
-                let dev = SummonOpts::new("blockula-dev", 1);
+                // One-minute epochs: unbonding, jail, Séances and the beacon move in minutes.
+                let dev = SummonOpts { epoch_blocks: 60, ..SummonOpts::new("blockula-dev", 1) };
                 let params = params::ChainParams::dev_overrides(dev.block_time_ms, dev.epoch_blocks);
                 Chain::summon(&home, &SummonOpts { http_port: Some(port), contribution: Some(poc::PocTimes::dev(dev.block_time_ms)), params, ..dev })?;
             }
