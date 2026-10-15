@@ -114,7 +114,7 @@ if [ ! -f "$NET/genesis.json" ]; then
   FOUNDER=$(key "$NET/founder.json"); FOUNDATION=$(key "$NET/foundation.json"); GRANTS=$(key "$NET/grants.json")
   ops="" ; allocs=""
   for i in $(seq 0 $((N - 1))); do
-    mkdir -p "$NET/v$i"
+    (umask 077; mkdir -p "$NET/v$i")
     CONSENSUS=$(key "$NET/v$i/consensus.json")
     [ -f "$NET/v$i/validator.key" ] || (umask 077; jq -r .seed "$NET/v$i/consensus.json" > "$NET/v$i/validator.key")
     OWNER=$(key "$NET/owner-$i.json")
@@ -184,12 +184,15 @@ address = "$FOUNDATION"
 amount = "50000000"
 label = "foundation (testnet stand-in)"
 
-$(printf "%b" "$allocs")[[allocation]]
+[[allocation]]
 bucket = "operators"
 address = "$GRANTS"
 amount = "$((30000000 - N * 1000000))"
 label = "security grants (testnet stand-in)"
+
 SPEC
+  # Each operator's allocation (its self-bond comes out of it) and its validator's faucet float.
+  printf "%b" "$allocs" >> "$NET/spec.toml"
   # Warnings are expected: a testnet breaks mainnet's independence policy (DEC-3, DEC-14).
   $BIN genesis build --spec "$NET/spec.toml" --out "$NET/genesis.json"
   for i in $(seq 0 $((N - 1))); do cp "$NET/genesis.json" "$NET/v$i/genesis.json"; done
