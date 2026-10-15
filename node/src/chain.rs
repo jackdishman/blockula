@@ -43,8 +43,8 @@ pub fn bootstrap_delegation(prefix: &str) -> String {
 /// `"bootstrap delegation"`, `"contribution pool"`), if `addr` is one on a chain with `prefix`.
 /// Nobody holds a key for them: only the protocol moves their funds.
 pub fn system_account(prefix: &str, addr: &str) -> Option<&'static str> {
-    let roles: [(&'static str, fn(&str) -> String); 5] = [("treasury", treasury), ("community", community), ("endowment", endowment), ("bootstrap delegation", bootstrap_delegation), ("contribution pool", crate::poc::pool_address)];
-    roles.into_iter().find(|(_, f)| f(prefix) == addr).map(|(role, _)| role)
+    let accounts = [("treasury", treasury(prefix)), ("community", community(prefix)), ("endowment", endowment(prefix)), ("bootstrap delegation", bootstrap_delegation(prefix)), ("contribution pool", crate::poc::pool_address(prefix))];
+    accounts.into_iter().find(|(_, a)| a == addr).map(|(role, _)| role)
 }
 
 pub fn now_ms() -> u64 {

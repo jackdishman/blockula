@@ -93,7 +93,7 @@ export type Action =
 
 /** What a `propose` asks for (node/src/types.rs `ProposalKind`): every former admin lever, parameters, spending, upgrades and features. */
 export type ProposalKind =
-  /** Set a governance parameter (`/api/params` keys), within its bounds. */
+  /** Set a governance parameter (a key of node/src/params.rs `ChainParams`, e.g. "max_validators"), within its bounds. */
   | { type: "param_change"; key: string; value: string }
   | { type: "treasury_spend"; to: string; amount: string }
   /** Open a community distribution of `total` drops, claimable with Merkle proofs until block `claim_until`. */
