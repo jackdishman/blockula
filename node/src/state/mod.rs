@@ -525,3 +525,6 @@ impl State {
 
 #[cfg(test)]
 mod tests;
+// The SDK's light-client vectors (P-CLIENTS).
+#[cfg(test)]
+mod proof_vectors;
