@@ -434,3 +434,5 @@ fn fast_sync_from_certified_snapshot_and_tamper_rejection() {
     });
     std::fs::remove_dir_all(root).ok();
 }
+
+mod byzantine;

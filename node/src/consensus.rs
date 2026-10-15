@@ -267,6 +267,25 @@ pub struct App {
     pub address_prefix: String,
 }
 
+/// Clock skew per validator for the simulator (test builds only): `(chain, ms)`, keyed by the
+/// address of the validator's `Shared` chain. `App::now_ms` shifts what that validator reads as
+/// now, as a skewed system clock would (sim.rs clock-skew scenarios).
+#[cfg(test)]
+pub(crate) static CLOCK_SKEW_MS: parking_lot::Mutex<Vec<(usize, i64)>> = parking_lot::Mutex::new(Vec::new());
+
+impl App {
+    /// The wall clock this validator reads (ms since the Unix epoch): the runtime's, skewed in
+    /// simulations.
+    fn now_ms(&self, ctx: &impl Clock) -> u64 {
+        let now = ms(ctx.current());
+        #[cfg(test)]
+        if let Some((_, skew)) = CLOCK_SKEW_MS.lock().iter().find(|(k, _)| *k == Arc::as_ptr(&self.chain) as usize) {
+            return now.saturating_add_signed(*skew);
+        }
+        now
+    }
+}
+
 /// Stateless checks every tx must pass: in a proposed block, over HTTP and from gossip. The chain
 /// is named by its id and its genesis hash (the instance, audit #7).
 pub fn check_tx_stateless(tx: &Tx, chain_id: &str, genesis_hash: &str, prefix: &str) -> anyhow::Result<()> {
@@ -289,11 +308,11 @@ where
     async fn propose(&mut self, (ctx, cctx): (E, Self::Context), mut ancestry: impl Ancestry<CBlock>, _: ()) -> Option<CBlock> {
         let parent = ancestry.next().await?;
         let target = parent.timestamp_ms + self.block_time_ms;
-        let now = ms(ctx.current());
+        let now = self.now_ms(&ctx);
         if target > now {
             ctx.sleep(Duration::from_millis(target - now)).await;
         }
-        let timestamp_ms = ms(ctx.current()).max(target);
+        let timestamp_ms = self.now_ms(&ctx).max(target);
         let height = parent.height + 1;
         let (view, parent_view) = (cctx.round.view().get(), cctx.parent.0.get());
         let proposer = cctx.leader.address(&self.address_prefix);
@@ -404,7 +423,7 @@ where
         if block.timestamp_ms < parent.timestamp_ms + self.block_time_ms {
             return reject("block too early");
         }
-        if block.timestamp_ms > ms(ctx.current()) + MAX_CLOCK_DRIFT_MS {
+        if block.timestamp_ms > self.now_ms(&ctx) + MAX_CLOCK_DRIFT_MS {
             return reject("timestamp too far in the future");
         }
         if block.proposer != cctx.leader.address(&self.address_prefix) {
