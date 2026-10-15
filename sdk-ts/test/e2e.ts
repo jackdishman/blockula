@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex, randomBytes } from "@noble/hashes/utils.js";
-import { ApiError, Client, POP_CONTEXT, Wallet, addressFromPublicKey, addressPrefix, formatFang, isAddress, minFee, parseFang, parseSoul, popMessage, seanceCommitment, signingBytes, txBytes, txCharge, txId, txSize, type Action, type ProposalKind, type Tx } from "../src/index.js";
+import { ApiError, Client, POP_CONTEXT, Wallet, addressFromPublicKey, addressPrefix, baseFee, formatFang, isAddress, minFee, parseFang, parseSoul, popMessage, seanceCommitment, signingBytes, txBytes, txCharge, txId, txSize, type Action, type ProposalKind, type Tx } from "../src/index.js";
 
 const client = new Client(process.env.BLOCKULA_RPC ?? "http://localhost:7070");
 
@@ -103,6 +103,10 @@ assert.equal(bytesToHex(blake3(txBytes(vt))), "f32398f98b16d95d4f68af7ee29524a27
 assert.equal(txBytes(vt).length, txSize(vt));
 assert.equal(txId(vt), "0a787dbaf66a3f5a3df1609272c68f5229397c418010ecd8453b1e7c7ff6617d");
 assert.equal(txCharge(vt), minFee(vt) + 3n);
+// Same vector as node/src/econ.rs `fee_slots_match_the_sdk`: this tx at 12,656 milli-drops a byte.
+assert.equal(txSize(vt), 5_341);
+assert.equal(baseFee(vt, { flat: "10000", rate: "12656" }), 77_595n);
+assert.equal(minFee(vt), 10_000n + 10n * 5_341n);
 // Addresses: any known prefix is an address; `isAddress(s, prefix)` asks for one.
 const someKey = ml_dsa65.keygen(new Uint8Array(32).fill(4)).publicKey;
 const [mainAddr, testAddr] = [addressFromPublicKey(someKey), addressFromPublicKey(someKey, "tboo")];

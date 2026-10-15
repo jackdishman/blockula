@@ -431,10 +431,10 @@ pub fn lock_rewards(state: &mut State, j: &mut Journal, account: &str, amount: u
         return;
     }
     for l in state.acct_mut(j, account).locks.iter_mut() {
-        if let LockAmount::Vesting { total, end, .. } = &mut l.amount {
-            if height < *end {
-                *total = total.saturating_add(amount);
-            }
+        if let LockAmount::Vesting { total, end, .. } = &mut l.amount
+            && height < *end
+        {
+            *total = total.saturating_add(amount);
         }
     }
 }
@@ -796,6 +796,15 @@ mod tests {
         // Fees round down, per tx.
         assert_eq!(FeeSlot { flat: 0, rate: 10_999, max_block_bytes: 1 }.fee(1), 10);
         assert_eq!(lowest_base_fee(5_400), 5_400, "the bounds allow 0 flat and 1 drop per byte");
+    }
+
+    /// The same vector is computed by sdk-ts (test/e2e.ts `baseFee`): the shared transfer vector at
+    /// 12,656 milli-drops a byte.
+    #[test]
+    fn fee_slots_match_the_sdk() {
+        let tx = crate::types::tests::vector_tx(Action::Transfer { to: "x.boo".into(), amount: 5 });
+        assert_eq!(tx.size(), 5_341);
+        assert_eq!(FeeSlot { flat: 10_000, rate: 12_656, max_block_bytes: 0 }.fee(tx.size()), 77_595);
     }
 
     /// The fee for block `h` is fixed by block `h − 17`'s execution, from the rate before it and

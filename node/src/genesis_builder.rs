@@ -352,8 +352,8 @@ pub fn build_from(spec: &Spec, operators: &[OperatorFile], strict: bool) -> Resu
     }
     findings.extend(independence_findings(operators));
     // Canonical order, whatever order the files were listed in.
-    validators.sort_by(|a, b| a.address.cmp(&b.address));
-    entries.sort_by(|a, b| crypto::address_with_prefix(prefix, &hex::decode(&a.consensus_key).unwrap_or_default()).cmp(&crypto::address_with_prefix(prefix, &hex::decode(&b.consensus_key).unwrap_or_default())));
+    validators.sort_by_key(|v| v.address.clone());
+    entries.sort_by_key(|o| crypto::address_with_prefix(prefix, &hex::decode(&o.consensus_key).unwrap_or_default()));
 
     let mut param_overrides = BTreeMap::new();
     for (k, v) in &spec.params {
@@ -449,64 +449,68 @@ pub fn operator_file(keys: &crypto::Keys, chain_id: &str, owner: &str, p2p_addr:
     })
 }
 
+/// `blockula genesis operator`'s inputs.
+#[derive(clap::Args)]
+pub struct OperatorArgs {
+    /// The chain the proof of possession is for (blockula-1)
+    #[arg(long)]
+    pub chain_id: String,
+    /// The consensus key: a validator.key (32-byte hex seed) or `blockula keygen` JSON
+    #[arg(long)]
+    pub key: PathBuf,
+    /// The cold owner account (bond, rewards, commission)
+    #[arg(long)]
+    pub owner: String,
+    /// Public host:port other validators dial
+    #[arg(long)]
+    pub p2p_addr: String,
+    /// The HTTP endpoint you publish (your sentry, never the validator)
+    #[arg(long)]
+    pub http_addr: String,
+    /// Commission on the pool's rewards, in basis points
+    #[arg(long, default_value_t = 500)]
+    pub commission_bps: u64,
+    /// Self-bond in FANG, out of the owner's allocation
+    #[arg(long, default_value = "10000")]
+    pub self_bond: String,
+    /// The operator's name
+    #[arg(long, default_value = "")]
+    pub name: String,
+    /// A reachable contact (repeatable)
+    #[arg(long)]
+    pub contact: Vec<String>,
+    #[arg(long, default_value = "")]
+    pub legal_entity: String,
+    /// ISO 3166-1 alpha-2 of the entity ("DE")
+    #[arg(long, default_value = "")]
+    pub entity_jurisdiction: String,
+    #[arg(long, default_value = "")]
+    pub hosting_provider: String,
+    /// The ASN announcing the p2p address
+    #[arg(long, default_value_t = 0)]
+    pub asn: u32,
+    /// ISO 3166-1 alpha-2 of the data center ("FI")
+    #[arg(long, default_value = "")]
+    pub datacenter_country: String,
+    /// The facility (data center)
+    #[arg(long, default_value = "")]
+    pub datacenter: String,
+    /// This seat is run by the founder or the foundation
+    #[arg(long)]
+    pub founder_or_foundation: bool,
+    /// JSON instead of TOML
+    #[arg(long)]
+    pub json: bool,
+    /// Write here instead of stdout
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+}
+
 #[derive(Subcommand)]
 pub enum GenesisCmd {
     /// Offline, on the operator's key machine: write this validator's public genesis entry
     /// (consensus key, owner, addresses, proof of possession, independence fields)
-    Operator {
-        /// The chain the proof of possession is for (blockula-1)
-        #[arg(long)]
-        chain_id: String,
-        /// The consensus key: a validator.key (32-byte hex seed) or `blockula keygen` JSON
-        #[arg(long)]
-        key: PathBuf,
-        /// The cold owner account (bond, rewards, commission)
-        #[arg(long)]
-        owner: String,
-        /// Public host:port other validators dial
-        #[arg(long)]
-        p2p_addr: String,
-        /// The HTTP endpoint you publish (your sentry, never the validator)
-        #[arg(long)]
-        http_addr: String,
-        /// Commission on the pool's rewards, in basis points
-        #[arg(long, default_value_t = 500)]
-        commission_bps: u64,
-        /// Self-bond in FANG, out of the owner's allocation
-        #[arg(long, default_value = "10000")]
-        self_bond: String,
-        /// The operator's name
-        #[arg(long, default_value = "")]
-        name: String,
-        /// A reachable contact (repeatable)
-        #[arg(long)]
-        contact: Vec<String>,
-        #[arg(long, default_value = "")]
-        legal_entity: String,
-        /// ISO 3166-1 alpha-2 of the entity ("DE")
-        #[arg(long, default_value = "")]
-        entity_jurisdiction: String,
-        #[arg(long, default_value = "")]
-        hosting_provider: String,
-        /// The ASN announcing the p2p address
-        #[arg(long, default_value_t = 0)]
-        asn: u32,
-        /// ISO 3166-1 alpha-2 of the data center ("FI")
-        #[arg(long, default_value = "")]
-        datacenter_country: String,
-        /// The facility (data center)
-        #[arg(long, default_value = "")]
-        datacenter: String,
-        /// This seat is run by the founder or the foundation
-        #[arg(long)]
-        founder_or_foundation: bool,
-        /// JSON instead of TOML
-        #[arg(long)]
-        json: bool,
-        /// Write here instead of stdout
-        #[arg(long)]
-        out: Option<PathBuf>,
-    },
+    Operator(Box<OperatorArgs>),
     /// Build genesis.json from a spec (byte-identical for the same spec and binary) and print its
     /// genesis hash
     Build {
@@ -524,7 +528,8 @@ pub enum GenesisCmd {
 
 pub fn run(cmd: GenesisCmd) -> Result<()> {
     match cmd {
-        GenesisCmd::Operator { chain_id, key, owner, p2p_addr, http_addr, commission_bps, self_bond, name, contact, legal_entity, entity_jurisdiction, hosting_provider, asn, datacenter_country, datacenter, founder_or_foundation, json, out } => {
+        GenesisCmd::Operator(args) => {
+            let OperatorArgs { chain_id, key, owner, p2p_addr, http_addr, commission_bps, self_bond, name, contact, legal_entity, entity_jurisdiction, hosting_provider, asn, datacenter_country, datacenter, founder_or_foundation, json, out } = *args;
             let keys = crate::validator_cli::load_seed(&key)?;
             let independence = Independence { legal_entity, entity_jurisdiction, hosting_provider, asn, datacenter_country, datacenter, founder_or_foundation, ..Default::default() };
             let file = operator_file(&keys, &chain_id, &owner, &p2p_addr, &http_addr, commission_bps, &self_bond, OperatorInfo { name, contact }, independence)?;
@@ -579,9 +584,12 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../deploy/mainnet/genesis-spec.example.toml")
     }
 
-    /// The example spec's operators: (seed byte, name, entity, provider, ASN, country, facility,
+    /// One example operator: (seed byte, name, entity, provider, ASN, country, facility,
     /// founder or foundation).
-    const EXAMPLE_OPERATORS: [(u8, &str, &str, &str, u32, &str, &str, bool); 4] = [
+    type ExampleOperator = (u8, &'static str, &'static str, &'static str, u32, &'static str, &'static str, bool);
+
+    /// The example spec's operators.
+    const EXAMPLE_OPERATORS: [ExampleOperator; 4] = [
         (0xe1, "Foundation validator A", "Blockula Foundation", "Fly.io", 40_509, "US", "fly-iad", true),
         (0xe2, "Foundation validator B", "Blockula Foundation", "Fly.io", 40_509, "DE", "fly-fra", true),
         (0xe3, "Example Validators GmbH", "Example Validators GmbH", "OVHcloud", 16_276, "FR", "ovh-gra3", false),

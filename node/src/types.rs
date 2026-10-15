@@ -1755,7 +1755,7 @@ pub(crate) mod tests {
     }
 
     /// The vector tx around an action: fixed fields, and recognizable key and signature bytes.
-    fn vector_tx(action: Action) -> Tx {
+    pub(crate) fn vector_tx(action: Action) -> Tx {
         Tx { chain_id: "vec".into(), from: "boo1from".into(), nonce: 7, fee: 12345, tip: 3, valid_until: 99, action, memo: "m".into(), public_key: "01".repeat(crypto::PUBLIC_KEY_LEN), signature: "02".repeat(crypto::SIGNATURE_LEN) }
     }
 
