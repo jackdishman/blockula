@@ -582,23 +582,26 @@ fn evidence_encoding_golden_vector() {
 #[test]
 fn the_set_is_the_top_stake_with_ties_by_address() {
     let alice = keys(200);
-    let mut t = Setup { validators: vec![10_000 * FANG, 20_000 * FANG, 10_000 * FANG], accounts: vec![(alice.address(), 100_000 * FANG, None)], params: vec![("max_validators", 2)], ..Default::default() }.start();
-    // Genesis seats all three (over the new cap): one leaves per epoch, lowest stake, ties by address.
-    let (v0, v1, v2) = (vaddr(0), vaddr(1), vaddr(2));
-    let tie_loser = if v0 > v2 { &v0 } else { &v2 };
+    let mut t = Setup { validators: vec![10_000 * FANG, 20_000 * FANG, 10_000 * FANG, 10_000 * FANG, 10_000 * FANG], accounts: vec![(alice.address(), 100_000 * FANG, None)], params: vec![("max_validators", 4)], ..Default::default() }.start();
+    // Genesis seats all five (over the new cap): one leaves, the lowest stake, ties by address.
+    let v1 = vaddr(1);
+    let tie_loser = [0u8, 2, 3, 4].map(vaddr).into_iter().max().unwrap();
     t.finish_epoch();
     let s1 = t.set(1);
-    assert!(s1.len() == 2 && s1.contains(&v1) && !s1.contains(tie_loser), "{s1:?}");
-    // Delegation decides: the loser overtakes the other one.
+    assert!(s1.len() == 4 && s1.contains(&v1) && !s1.contains(&tie_loser), "{s1:?}");
+    // Delegation decides: the one that left overtakes the weakest member.
     t.ok(&alice, Action::Delegate { validator: tie_loser.clone(), amount: 1_000 * FANG });
     t.finish_epoch();
-    assert!(t.set(2).contains(tie_loser));
-    assert_eq!(t.st.validators[tie_loser].active_from, Some(2));
+    assert!(t.set(2).contains(&tie_loser) && t.set(2).len() == 4);
+    assert_eq!(t.st.validators[&tie_loser].active_from, Some(2));
     // A permissionless candidate with enough stake joins too, in place of the weakest member.
     let (nv, no) = (keys(50), keys(150));
     t.ok(&alice, Action::Transfer { to: no.address(), amount: 60_000 * FANG });
     let pop = crate::chain::make_pop([50; 32], CHAIN, &no.address(), "127.0.0.1:7999", "127.0.0.1:7998");
     let reg = Action::RegisterValidator { consensus_key: hex::encode(nv.public_key()), p2p_addr: "127.0.0.1:7999".into(), http_addr: "127.0.0.1:7998".into(), bond: 50_000 * FANG, pop: pop.clone() };
+    assert!(t.fails(&no, Action::RegisterValidator { consensus_key: hex::encode(nv.public_key()), p2p_addr: "127.0.0.1:7999".into(), http_addr: "127.0.0.1:7998".into(), bond: 999 * FANG, pop: pop.clone() }).contains("at least"));
+    let bad_pop = crate::chain::make_pop([50; 32], CHAIN, &alice.address(), "127.0.0.1:7999", "127.0.0.1:7998");
+    assert!(t.fails(&no, Action::RegisterValidator { consensus_key: hex::encode(nv.public_key()), p2p_addr: "127.0.0.1:7999".into(), http_addr: "127.0.0.1:7998".into(), bond: 50_000 * FANG, pop: bad_pop }).contains("pop"));
     t.ok(&no, reg.clone());
     assert_eq!(t.st.validators[&nv.address()].status, ValidatorStatus::Candidate);
     assert!(t.fails(&no, reg).contains("already registered"));
@@ -613,6 +616,21 @@ fn the_set_is_the_top_stake_with_ties_by_address() {
     assert_eq!(t.st.validators[&v1].status, ValidatorStatus::Candidate);
 }
 
+/// The churn limit protects small sets: a stranger's registration can't make itself needed for
+/// a one-validator chain's quorum. An admin of a test chain may still pin it in.
+#[test]
+fn small_sets_take_no_newcomers_unless_an_admin_pins_one() {
+    let (admin, newbie, nk) = (keys(230), keys(150), keys(50));
+    let mut t = Setup { validators: vec![10_000 * FANG], accounts: vec![(admin.address(), 100 * FANG, None), (newbie.address(), 100_000 * FANG, None)], admins: vec![admin.address()], ..Default::default() }.start();
+    let pop = crate::chain::make_pop([50; 32], CHAIN, &newbie.address(), "127.0.0.1:7999", "127.0.0.1:7998");
+    t.ok(&newbie, Action::RegisterValidator { consensus_key: hex::encode(nk.public_key()), p2p_addr: "127.0.0.1:7999".into(), http_addr: "127.0.0.1:7998".into(), bond: 50_000 * FANG, pop });
+    t.finish_epoch();
+    assert_eq!(t.set(1), vec![vaddr(0)], "a set of 2 needs both to vote: no newcomer");
+    t.ok(&admin, Action::ApproveValidator { validator: nk.address() });
+    t.finish_epoch();
+    assert_eq!(t.set(2).len(), 2, "pinned in by the admin");
+}
+
 /// CV-4: at most ⌊(n−1)/3⌋ seats change per epoch for stake (highest stake first), while
 /// ineligible members always leave; the set never empties.
 #[test]
@@ -620,7 +638,7 @@ fn the_churn_limit_bounds_each_epoch() {
     let whale = keys(200);
     let mut t = Setup { validators: vec![2_000 * FANG; 7], accounts: vec![(whale.address(), 10_000_000 * FANG, None)], params: vec![("max_validators", 7)], ..Default::default() }.start();
     assert_eq!(churn_limit(7), 2);
-    assert_eq!((churn_limit(1), churn_limit(3), churn_limit(4), churn_limit(31)), (1, 1, 1, 10));
+    assert_eq!((churn_limit(1), churn_limit(3), churn_limit(4), churn_limit(31)), (0, 0, 1, 10));
     // Five bigger candidates register.
     let mut newcomers = vec![];
     for i in 0..5u8 {
@@ -642,15 +660,16 @@ fn the_churn_limit_bounds_each_epoch() {
     t.finish_epoch();
     t.finish_epoch();
     assert!(newcomers.iter().all(|v| t.set(3).contains(v)), "all in after three epochs");
-    // Mandatory exits ignore the budget: jail four members at once; they all leave, and only two
-    // of the free seats refill (from the displaced candidates).
+    // Mandatory exits ignore the limit: jail four members at once; they all leave, and of the
+    // free seats only one refills (from the displaced candidates): 3 carried over must stay a
+    // quorum of the new set.
     let jailed: Vec<String> = t.set(3).into_iter().take(4).collect();
     let mut j = Journal::default();
     for v in &jailed {
         jail(&mut t.st, &mut j, v, t.height, 0, "test");
     }
     t.finish_epoch();
-    assert_eq!(t.set(4).len(), 3 + 2);
+    assert_eq!(t.set(4).len(), 3 + 1);
     assert!(jailed.iter().all(|v| !t.set(4).contains(v)));
     // Never empty: with every validator jailed, nobody is eligible and the set stays as it is.
     let mut j = Journal::default();
@@ -858,18 +877,21 @@ fn admin_levers_exist_only_on_dev_and_test_chains() {
     assert!(t.fails(&admin, Action::RemoveValidator { validator: vaddr(0) }).contains("join and leave by stake"));
     assert!(t.fails(&owner(0), Action::Unbond { validator: vaddr(0) }).contains("Undelegate it"));
     // With admins: a pin outranks stake, and a removal is final.
-    let mut t = Setup { validators: vec![10_000 * FANG, 20_000 * FANG, 30_000 * FANG], accounts: vec![(admin.address(), 100 * FANG, None)], params: vec![("max_validators", 2)], admins: vec![admin.address()] }.start();
+    let stakes = [10_000, 20_000, 30_000, 40_000, 50_000].map(|f| f * FANG).to_vec();
+    let mut t = Setup { validators: stakes, accounts: vec![(admin.address(), 100 * FANG, None)], params: vec![("max_validators", 4)], admins: vec![admin.address()] }.start();
     assert!(t.fails(&owner(0), Action::ApproveValidator { validator: vaddr(0) }).contains("only validator admins"));
     t.ok(&admin, Action::ApproveValidator { validator: vaddr(0) });
     assert!(t.fails(&admin, Action::ApproveValidator { validator: vaddr(0) }).contains("already approved"));
     t.finish_epoch();
-    assert!(t.set(1).contains(&vaddr(0)) && !t.set(1).contains(&vaddr(1)), "{:?}", t.set(1));
+    assert!(t.set(1).contains(&vaddr(0)) && !t.set(1).contains(&vaddr(1)), "the pinned least stake stays: {:?}", t.set(1));
     t.ok(&admin, Action::RemoveValidator { validator: vaddr(2) });
     assert_eq!(t.st.validators[&vaddr(2)].status, ValidatorStatus::Removed);
     assert!(t.fails(&admin, Action::RemoveValidator { validator: vaddr(2) }).contains("already Removed"));
     t.finish_epoch();
-    assert!(!t.set(2).contains(&vaddr(2)));
-    t.ok(&admin, Action::RemoveValidator { validator: vaddr(1) });
+    assert!(!t.set(2).contains(&vaddr(2)) && t.set(2).contains(&vaddr(1)), "a removal is a mandatory exit; a candidate takes the seat");
+    for i in [1u8, 3, 4] {
+        t.ok(&admin, Action::RemoveValidator { validator: vaddr(i) });
+    }
     assert!(t.fails(&admin, Action::RemoveValidator { validator: vaddr(0) }).contains("last validator"));
     t.block();
 }

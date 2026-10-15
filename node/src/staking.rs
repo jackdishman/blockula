@@ -15,13 +15,16 @@
 //! **The set.** Registration is permissionless (a self-bond of at least `min_self_bond` and a
 //! proof of possession). At each epoch boundary [`select_next`] picks the next set from eligible
 //! validators (not jailed, tombstoned or removed, self-bond at least `min_self_bond`), ranked by
-//! pool stake, ties by address, at most `max_validators`. Ineligible members always leave; at
-//! most ⌊(n−1)/3⌋ (and at least one) other seats change per epoch: a newcomer filling a free
-//! seat, a newcomer replacing a lower-ranked member, or a member over the cap leaving, highest
-//! stake first. So each set keeps more than two thirds of the last one's eligible members, and
-//! it never empties. Votes are equal-weight within the set (DEC-3). On dev and test chains admins
-//! may still pin a validator (`ApproveValidator`: ranked ahead of stake) or remove one
-//! (`RemoveValidator`); elsewhere both are refused.
+//! pool stake, ties by address, at most `max_validators`. Ineligible members always leave.
+//! Newcomers, highest stake first, fill free seats or replace lower-ranked members, but make up
+//! at most ⌊(m−1)/3⌋ of the new set of `m` ([`churn_limit`]): the members carried over are a
+//! quorum on their own, so newcomers that are still syncing can't stall it, and each set
+//! overlaps the last by more than two thirds (for a full set: ⌊(n−1)/3⌋ replacements per
+//! epoch; a set of one or two takes none). Members over a lowered cap leave ⌊(n−1)/3⌋ (at least
+//! one) per epoch. The set never empties. Votes are equal-weight within the set (DEC-3). On dev
+//! and test chains admins may still pin a validator (`ApproveValidator`: ranked ahead of stake,
+//! and past the churn limit, at the admin's risk) or remove one (`RemoveValidator`); elsewhere
+//! both are refused.
 //!
 //! Unbonding lasts `unbonding_blocks`, stretched (by at most an epoch) so that it never ends
 //! before evidence against the epoch it began in stops being accepted.
@@ -1159,43 +1162,50 @@ pub struct Selection {
     pub leaving: Vec<String>,
 }
 
-/// Most seats that change per epoch other than mandatory exits: ⌊(n−1)/3⌋ of a set of `n`, and
-/// at least one (so one- to three-validator dev chains can grow).
-pub fn churn_limit(n: usize) -> usize {
-    (n.saturating_sub(1) / 3).max(1)
+/// The churn limit (CV-4): most members of a set of `m` that may be newcomers, ⌊(m−1)/3⌋, so the
+/// members it carries over (a quorum, m − ⌊(m−1)/3⌋) finalize on their own while newcomers
+/// sync. For a full set that's ⌊(n−1)/3⌋ replacements per epoch; a set of 1 or 2 takes none.
+pub fn churn_limit(m: usize) -> usize {
+    m.saturating_sub(1) / 3
 }
 
 /// Picks the next set (see the module docs). Pure: the API previews it.
 pub fn select_next(state: &State, epoch: u64) -> Selection {
     let current: Vec<String> = state.active_sets.get(&epoch).cloned().unwrap_or_default();
     let cap = state.chain_params.max_validators.max(1) as usize;
-    let mut budget = churn_limit(current.len());
     let by_rank = |a: &String, b: &String| rank(state, b).cmp(&rank(state, a));
-    // Members that may stay; the ineligible leave whatever the budget.
+    let pinned = |v: &str| state.validators.get(v).is_some_and(|r| r.approved_at.is_some());
+    // Members that may stay; the ineligible leave whatever the limit.
     let mut keep: Vec<String> = current.iter().filter(|v| eligible(state, v)).cloned().collect();
     keep.sort_by(by_rank);
-    // Over the cap (governance lowered it): the lowest-ranked leave, within the budget.
-    while keep.len() > cap && budget > 0 {
+    // Over the cap (governance lowered it): the lowest-ranked leave, ⌊(n−1)/3⌋ (at least one)
+    // per epoch.
+    let mut shrink = churn_limit(current.len()).max(1);
+    while keep.len() > cap && shrink > 0 {
         keep.pop();
-        budget -= 1;
+        shrink -= 1;
     }
-    // Newcomers, best first: into free seats, then in place of lower-ranked members.
+    // Newcomers, best first: into a free seat, or in place of the lowest-ranked member they
+    // outrank, while newcomers stay within the churn limit of the resulting set. Admin-pinned
+    // validators (dev and test chains) skip the limit: that's the admin's call.
     let mut newcomers: Vec<String> = state.validators.keys().filter(|v| !current.contains(v) && eligible(state, v)).cloned().collect();
     newcomers.sort_by(by_rank);
+    let mut joined = 0;
     for c in newcomers {
-        if budget == 0 {
+        let free = keep.len() < cap;
+        if !free && !keep.last().is_some_and(|last| rank(state, &c) > rank(state, last)) {
             break;
         }
-        if keep.len() < cap {
-            keep.push(c);
-        } else if keep.last().is_some_and(|last| rank(state, &c) > rank(state, last)) {
+        let size = if free { keep.len() + 1 } else { keep.len() };
+        if !pinned(&c) && joined + 1 > churn_limit(size) {
+            break;
+        }
+        if !free {
             keep.pop();
-            keep.push(c);
-        } else {
-            break;
         }
+        keep.push(c);
         keep.sort_by(by_rank);
-        budget -= 1;
+        joined += 1;
     }
     if keep.is_empty() {
         keep = current.clone();

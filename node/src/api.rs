@@ -1066,7 +1066,7 @@ async fn validators(State(n): State<Node>) -> ApiResult {
         "downtime_max_missed": cp.downtime_max_missed,
         "slash_double_sign_display": format!("{}%", staking::fmt_bps(cp.slash_double_sign_bps)),
         "slash_downtime_display": format!("{}%", staking::fmt_bps(cp.slash_downtime_bps)),
-        "explainer": "Validators take turns proposing blocks and vote to finalize them; a block is final once more than two-thirds of the active set have signed it (ML-DSA-65), one vote each. Anyone can register a validator with a self-bond and anyone can delegate to one. At each epoch boundary the next set is the top validators by stake, changing at most a third of the seats at a time. Double-signing is slashed and banned for good; a validator that misses too many of its turns is jailed until it unjails.",
+        "explainer": "Validators take turns proposing blocks and vote to finalize them; a block is final once more than two-thirds of the active set have signed it (ML-DSA-65), one vote each. Anyone can register a validator with a self-bond and anyone can delegate to one. At each epoch boundary the next set is the top validators by stake, with newcomers at most a third of it, so the rest can always finalize while they sync. Double-signing is slashed and banned for good; a validator that misses too many of its turns is jailed until it unjails.",
     })))
 }
 
@@ -1523,7 +1523,7 @@ mod http_tests {
         let active = &v["active"][0];
         assert_eq!((active["validator"]["address"].as_str(), active["status"].as_str(), active["eligible"].as_bool()), (Some(me.as_str()), Some("active"), Some(true)));
         assert_eq!(active["self_bond"], active["stake"]);
-        assert_eq!((v["churn_limit"].as_u64(), v["candidates"].as_array().map(Vec::len)), (Some(1), Some(0)));
+        assert_eq!((v["churn_limit"].as_u64(), v["candidates"].as_array().map(Vec::len)), (Some(0), Some(0)), "a set of one takes no newcomers");
         assert_eq!(v["next_epoch"][0]["validator"]["address"], me.as_str());
         // A delegator: its stake, then its way out.
         let alice = crate::crypto::Keys::from_seed([1; 32]);

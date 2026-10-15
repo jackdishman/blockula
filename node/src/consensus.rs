@@ -348,9 +348,10 @@ where
                     stuck.insert(tx.from.clone());
                     continue;
                 }
-                // Only propose txs that will succeed; a tx that would just burn its fee waits/expires.
+                // Only propose txs that will succeed (judged as verifiers and execution will judge
+                // them); a tx that would just burn its fee waits or expires.
                 let mut tj = crate::chain::Journal::default();
-                match state.apply_j(&mut tj, tx, &chain_id, &proposer, height, false) {
+                match state.apply_j(&mut tj, tx, &chain_id, &proposer, height, true) {
                     Ok(crate::chain::Outcome::Applied) => {}
                     Ok(crate::chain::Outcome::Failed(_)) | Err(_) => {
                         state.rollback(tj);

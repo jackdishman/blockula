@@ -268,7 +268,7 @@ pub fn run(cmd: ValidatorCmd) -> Result<()> {
             let action = Action::RegisterValidator { consensus_key: hex::encode(keys.public_key()), p2p_addr: addrs.p2p_addr, http_addr: addrs.http_addr, bond, pop };
             let tx = rt.block_on(send(&rpc, &keys, &me, action))?;
             println!("✓ {}", tx["summary"].as_str().unwrap_or_default());
-            println!("  It joins the active set at an epoch boundary if its stake ranks in the top max_validators (a third of the seats change at most per epoch).");
+            println!("  It joins the active set at an epoch boundary if its stake ranks in the top max_validators (newcomers are at most a third of a set).");
             println!("  Others can back it: blockula validator delegate {me} <FANG> --key <key file> --rpc {rpc}");
             Ok(())
         }
@@ -346,8 +346,12 @@ pub fn run(cmd: ValidatorCmd) -> Result<()> {
         }
         ValidatorCmd::List { rpc } => {
             let v = rt()?.block_on(get(&rpc, "/validators"))?;
-            let churn = v["churn_limit"].as_u64().unwrap_or(1);
-            println!("epoch {} · {} blocks until the next epoch · at most {churn} seat{} change per epoch", v["epoch"], v["blocks_until_next_epoch"], if churn == 1 { "" } else { "s" });
+            let churn = match v["churn_limit"].as_u64().unwrap_or(0) {
+                0 => "too small a set to take newcomers".to_string(),
+                1 => "at most 1 newcomer per epoch".to_string(),
+                n => format!("at most {n} newcomers per epoch"),
+            };
+            println!("epoch {} · {} blocks until the next epoch · {churn}", v["epoch"], v["blocks_until_next_epoch"]);
             for (title, key) in [("active", "active"), ("joining next epoch", "joining"), ("leaving next epoch", "leaving"), ("candidates", "candidates"), ("jailed", "jailed"), ("tombstoned", "tombstoned"), ("removed", "removed")] {
                 let list = v[key].as_array().cloned().unwrap_or_default();
                 println!("{title} ({}):", list.len());
