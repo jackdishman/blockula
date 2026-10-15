@@ -456,7 +456,9 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
     let chain_id = genesis.chain_id.clone();
 
     let cfg = cw_tokio::Config::new().with_storage_directory(home.join("consensus"));
-    cw_tokio::Runner::new(cfg).start(|context| async move {
+    let halt = shared.lock().halt.signal.clone();
+    let watched = protection.clone();
+    let stopped = cw_tokio::Runner::new(cfg).start(|context| async move {
         let ns = [consensus::namespace(&chain_id).as_slice(), b"/p2p"].concat();
         let max_peers = NonZeroUsize::new(consensus::MAX_PEERS_PER_SET).unwrap();
         let mut p2p_cfg = if preset == "local" {
@@ -484,11 +486,19 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
         let metrics = context.child("metrics");
         node.p2p_peers = Some(Arc::new(move || api::connected_peers(&commonware_runtime::Metrics::encode(&metrics))));
         tokio::spawn(serve_http(node, http_bind));
-        if let Err(e) = handle.await {
-            eprintln!("consensus stopped: {e:?}");
-        }
+        handle.await
     });
-    Ok(())
+    // A halt stops consensus too (the halting block is never acknowledged): its exit code wins.
+    if let Some(reason) = watched.halted() {
+        halt.set(Halt::DoubleSignRisk { reason });
+    }
+    if let Some(h) = halt.get() {
+        exit_halted(&h);
+    }
+    match stopped {
+        Ok(()) => bail!("consensus stopped (a finalized block failed to execute? see the log above)"),
+        Err(e) => bail!("consensus stopped: {e:?}"),
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -662,7 +672,7 @@ async fn sync_loop(chain: Shared, peers: Vec<String>, stop_when_caught_up: bool)
             }
             Err(e) => {
                 tracing::debug!(peer = %url, error = %e, "sync round failed");
-                if !e.to_string().contains("sent nothing") {
+                if !e.to_string().contains("sent nothing") && halt.get().is_none() {
                     eprintln!("⚠️  sync from {url}: {e:#}");
                 }
                 peer += 1;

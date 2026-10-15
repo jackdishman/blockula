@@ -42,11 +42,13 @@ use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// The record's file in a validator home.
 pub const RECORD_FILE: &str = "slashing-protection.json";
 const FORMAT: &str = "blockula-slashing-protection-v1";
+/// Why a signature waits while the restart rule watches the network (expected, logged quietly).
+const WATCHING: &str = "watching the network after a start";
 /// Views of the newest epoch the record keeps. Simplex votes only in views near its current one;
 /// a vote below the window is refused (a missed vote, never a double-sign).
 pub const RECORD_VIEWS: usize = 32;
@@ -359,7 +361,11 @@ impl Protection {
             }
             Err(why) => {
                 g.refused += 1;
-                warn!(epoch, view, ?kind, why, "slashing protection refused a signature");
+                if why == WATCHING {
+                    debug!(epoch, view, ?kind, "slashing protection: not signing yet (watching the network after a start)");
+                } else {
+                    warn!(epoch, view, ?kind, why, "slashing protection refused a signature");
+                }
                 false
             }
         }
@@ -423,8 +429,8 @@ impl Inner {
         }
         match self.gates.get(&epoch) {
             Some(Gate::Open { above }) if view <= *above => return Err("at or below views the network certified before this node signed again"),
-            Some(Gate::Watching { .. }) => return Err("watching the network after a start"),
-            None if !self.current => return Err("watching the network after a start"),
+            Some(Gate::Watching { .. }) => return Err(WATCHING),
+            None if !self.current => return Err(WATCHING),
             _ => {}
         }
         self.record.with(epoch, view, kind, hash)

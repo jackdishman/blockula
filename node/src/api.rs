@@ -66,9 +66,10 @@ pub fn mark_process_start() {
 }
 
 /// Connected p2p peers, from the runtime's Prometheus text: the series of the authenticated
-/// p2p tracker's `connected` family (one per connected peer).
+/// p2p tracker's `connected` family (`network_tracker_directory_connected`, one per peer; the
+/// network runs under the `network` label, node.rs).
 pub fn connected_peers(runtime_metrics: &str) -> Option<usize> {
-    let is_family = |name: &str| name.ends_with("tracker_connected");
+    let is_family = |name: &str| name.starts_with("network_tracker") && name.ends_with("_connected");
     let mut found = false;
     let mut n = 0;
     for line in runtime_metrics.lines() {
@@ -1598,9 +1599,10 @@ mod http_tests {
 
     #[test]
     fn peer_count_from_the_runtime_metrics() {
-        let text = "# HELP network_tracker_connected Unix timestamp in milliseconds when each connected peer became active.\n# TYPE network_tracker_connected gauge\nnetwork_tracker_connected{peer=\"ab12\"} 1700000000000\nnetwork_tracker_connected{peer=\"cd34\"} 1700000000001\nnetwork_tracker_tracked 4\n";
+        // As commonware-p2p 2026.9.0 exports it (captured from a 4-validator local chain).
+        let text = "# HELP network_tracker_directory_connected Unix timestamp in milliseconds when each connected peer became active.\n# TYPE network_tracker_directory_connected gauge\nnetwork_tracker_directory_connected{peer=\"3de892cdf0a5\"} 1792045530601\nnetwork_tracker_directory_connected{peer=\"111ec16d2af5\"} 1792045529793\n# TYPE network_tracker_directory_tracked gauge\nnetwork_tracker_directory_tracked 3\nnode_validator_marshal_connected 1\n";
         assert_eq!(connected_peers(text), Some(2));
-        assert_eq!(connected_peers("# HELP network_tracker_connected x\n# TYPE network_tracker_connected gauge\n"), Some(0));
+        assert_eq!(connected_peers("# HELP network_tracker_directory_connected x\n# TYPE network_tracker_directory_connected gauge\n"), Some(0));
         assert_eq!(connected_peers("runtime_tasks_spawned_total 3\n"), None, "no p2p tracker");
     }
 
