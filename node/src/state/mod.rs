@@ -279,6 +279,23 @@ impl State {
     /// them), building its tree from scratch. Rejects unknown, duplicate, out-of-order or
     /// non-canonical records and missing scalars; the caller compares the root with a trusted one.
     pub fn from_records(records: impl IntoIterator<Item = Result<(u8, Vec<u8>, Vec<u8>)>>) -> Result<State> {
+        let (mut state, leaves) = Self::load_records(records)?;
+        state.tree.update(&leaves.into_iter().map(|(k, v)| (k, Some(v))).collect::<Vec<_>>())?;
+        Ok(state)
+    }
+
+    /// [`State::from_records`] for records whose tree is persisted already (the redb store): loads
+    /// them into the maps and takes `tree` as it is instead of building one. Returns the state and
+    /// the root of the loaded records computed from scratch, which the caller compares with the
+    /// tree's.
+    pub fn from_stored_records(records: impl IntoIterator<Item = Result<(u8, Vec<u8>, Vec<u8>)>>, tree: tree::Smt) -> Result<(State, Hash)> {
+        let (mut state, leaves) = Self::load_records(records)?;
+        state.tree = tree;
+        Ok((state, tree::root_of(&leaves)))
+    }
+
+    /// Loads canonical records into a state (no tree yet) and returns it with its leaves, sorted.
+    fn load_records(records: impl IntoIterator<Item = Result<(u8, Vec<u8>, Vec<u8>)>>) -> Result<(State, Vec<(Hash, Hash)>)> {
         let mut state = State::default();
         let mut last: Option<(u8, Vec<u8>)> = None;
         let mut scalars = vec![];
@@ -295,14 +312,13 @@ impl State {
                 let Some((_, t)) = state.tables_mut().into_iter().find(|(m, _)| *m == n) else { bail!("unknown record namespace {n}") };
                 t.load(&key, &value)?;
             }
-            leaves.push((tree::key_hash(n, &key), Some(tree::value_hash(&value))));
+            leaves.push((tree::key_hash(n, &key), tree::value_hash(&value)));
             last = Some((n, key));
         }
         let expected: Vec<(Vec<u8>, Vec<u8>)> = state.meta_records().into_iter().map(|(k, v)| (k.to_vec(), v)).collect();
         ensure!(scalars == expected, "missing or non-canonical scalar records");
         leaves.sort_unstable_by_key(|(k, _)| *k);
-        state.tree.update(&leaves)?;
-        Ok(state)
+        Ok((state, leaves))
     }
 
     pub fn root_hash(&self) -> Hash {

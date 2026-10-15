@@ -1,10 +1,19 @@
+//! The HTTP API. Reads come from the view the chain publishes after each block (`view.rs`):
+//! no read handler takes the consensus lock, and none scans the state (lookups go through the
+//! store's indexes, rankings are computed once per block). Writes (submitting a tx, the faucet)
+//! take the lock briefly. Every route has a timeout; reads are rate limited per client
+//! (token bucket), writes by their own windows.
+
 use crate::chain::{short, Chain, Role};
 use crate::consensus::MarshalMailbox;
 use crate::crypto;
+use crate::store::{ix, BlockMeta};
 use crate::types::*;
+use crate::view::{hunt_status, Live, ReadView};
 use axum::{
-    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State},
+    http::{HeaderMap, Method, StatusCode},
+    middleware::Next,
     response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -22,7 +31,10 @@ pub type Shared = Arc<Mutex<Chain>>;
 /// Everything the HTTP handlers need.
 #[derive(Clone)]
 pub struct Node {
+    /// The chain, for writes (submit, faucet). Reads use `live`.
     pub chain: Shared,
+    /// What the chain published: the latest executed block's view, the mempool, the epochs.
+    pub live: Arc<Live>,
     /// Validators: marshal, to serve finalized blocks + certificates to joining nodes.
     pub marshal: Option<MarshalMailbox>,
     /// Full nodes (and validators without a faucet account): validator HTTP endpoints that txs
@@ -30,6 +42,9 @@ pub struct Node {
     pub peers: Vec<String>,
     pub client_ip: ClientIpPolicy,
     limits: Arc<Limits>,
+    reads: Arc<ReadLimiter>,
+    /// Longest any request may take.
+    pub timeout: Duration,
     pub stats: Arc<Stats>,
     github_cache: Arc<Mutex<HashMap<String, (Instant, Value)>>>,
     /// Extra Prometheus text (e.g. Commonware's runtime/p2p metrics on validators).
@@ -42,6 +57,7 @@ pub struct Stats {
     pub tx_submitted: std::sync::atomic::AtomicU64,
     pub tx_rejected: std::sync::atomic::AtomicU64,
     pub faucet_drips: std::sync::atomic::AtomicU64,
+    pub reads_limited: std::sync::atomic::AtomicU64,
 }
 
 fn bump(c: &std::sync::atomic::AtomicU64) {
@@ -166,6 +182,68 @@ impl Limits {
     }
 }
 
+/// Per-client read budget: a token bucket refilled at `rps` per second, holding up to `burst`.
+pub struct ReadLimiter {
+    rps: u32,
+    burst: u32,
+    buckets: Mutex<HashMap<String, (u64, Instant)>>,
+}
+
+/// Default read limits per client IP (IPv6: per /64): generous for an explorer or a wallet, not
+/// for a scraper hammering the node. `--read-rps 0` turns them off.
+pub const READ_RPS: u32 = 50;
+pub const READ_BURST: u32 = 200;
+/// Default request timeout (`--http-timeout-secs`).
+pub const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+impl ReadLimiter {
+    pub fn new(rps: u32, burst: u32) -> Self {
+        Self { rps, burst: burst.max(1), buckets: Mutex::new(HashMap::new()) }
+    }
+
+    /// Takes a token for `key`, or says how long until one is there. Tokens are counted in
+    /// thousandths, so refills are exact integers.
+    fn allow(&self, key: &str) -> Result<(), Duration> {
+        if self.rps == 0 {
+            return Ok(());
+        }
+        let now = Instant::now();
+        let full = self.burst as u64 * 1000;
+        let mut buckets = self.buckets.lock();
+        if buckets.len() > 100_000 {
+            // Idle buckets are full again anyway.
+            let refill = Duration::from_millis(full / self.rps as u64 + 1);
+            buckets.retain(|_, (_, at)| now.duration_since(*at) < refill);
+        }
+        let (tokens, at) = buckets.entry(key.to_string()).or_insert((full, now));
+        let earned = (now.duration_since(*at).as_millis() as u64).saturating_mul(self.rps as u64);
+        *tokens = tokens.saturating_add(earned).min(full);
+        *at = now;
+        if *tokens >= 1000 {
+            *tokens -= 1000;
+            Ok(())
+        } else {
+            Err(Duration::from_millis((1000 - *tokens).div_ceil(self.rps as u64)))
+        }
+    }
+}
+
+/// Rate-limits GETs per client (writes have their own limits). Loopback callers that no trusted
+/// proxy speaks for aren't limited.
+async fn limit_reads(State(n): State<Node>, req: Request, next: Next) -> Response {
+    if matches!(*req.method(), Method::GET | Method::HEAD) {
+        let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
+        if let Some(ip) = peer.and_then(|p| n.client_ip(p, req.headers())) {
+            if let Err(wait) = n.reads.allow(&ip_key(ip)) {
+                bump(&n.stats.reads_limited);
+                let secs = wait.as_secs().max(1).to_string();
+                return (StatusCode::TOO_MANY_REQUESTS, [(axum::http::header::RETRY_AFTER, secs)], Json(json!({ "error": "too many requests from your IP; slow down" }))).into_response();
+            }
+        }
+    }
+    next.run(req).await
+}
+
 pub const TX_PER_IP_PER_MINUTE: usize = 120;
 pub const FAUCET_IP_WINDOW: Duration = Duration::from_secs(600);
 pub const FAUCET_ADDRESS_WINDOW: Duration = Duration::from_secs(3600);
@@ -178,7 +256,14 @@ fn too_many(what: &str, wait: Duration) -> ApiError {
 
 impl Node {
     pub fn new(chain: Shared, marshal: Option<MarshalMailbox>, peers: Vec<String>, client_ip: ClientIpPolicy) -> Self {
-        Self { chain, marshal, peers, client_ip, limits: Default::default(), stats: Default::default(), extra_metrics: None, github_cache: Default::default() }
+        let live = chain.lock().live.clone();
+        Self { chain, live, marshal, peers, client_ip, limits: Default::default(), reads: Arc::new(ReadLimiter::new(READ_RPS, READ_BURST)), timeout: HTTP_TIMEOUT, stats: Default::default(), extra_metrics: None, github_cache: Default::default() }
+    }
+
+    /// Per-client read limits: `rps` per second, bursts of `burst` (`rps` 0: unlimited).
+    pub fn with_read_limits(mut self, rps: u32, burst: u32) -> Self {
+        self.reads = Arc::new(ReadLimiter::new(rps, burst));
+        self
     }
 
     /// The client's IP for rate limiting, or `None` for local (loopback, un-proxied) callers.
@@ -238,7 +323,9 @@ struct ApiError(StatusCode, String);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, Json(json!({ "error": self.1 }))).into_response()
+        // 410: history this node pruned (or never held, after a fast sync).
+        let body = if self.0 == StatusCode::GONE { json!({ "error": self.1, "pruned": true }) } else { json!({ "error": self.1 }) };
+        (self.0, Json(body)).into_response()
     }
 }
 
@@ -282,26 +369,39 @@ pub fn router(node: Node) -> Router {
         .route("/api/claim/{id}", get(claim))
         .route("/api/seance/{id}", get(seance))
         .route("/api/souls", get(souls))
+        .route("/api/proof/{namespace}/{key}", get(proof))
         .route("/api/health", get(health))
         .route("/metrics", get(metrics))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(axum::middleware::from_fn_with_state(node.clone(), limit_reads))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, node.timeout))
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(node)
 }
 
-fn label(c: &Chain, addr: &str) -> Value {
-    let name = if addr == c.state.treasury() { Some("🏛️ treasury".to_string()) } else if addr == c.state.pool() { Some("🪦 contribution pool".to_string()) } else if c.state.validators.get(addr).is_some_and(|v| v.status == crate::chain::ValidatorStatus::Active) { c.state.primary_name(addr).or(Some("🧛 validator".into())) } else { c.state.primary_name(addr) };
+fn label(v: &ReadView, addr: &str) -> Value {
+    let st = &v.state;
+    let name = if addr == st.treasury() {
+        Some("🏛️ treasury".to_string())
+    } else if addr == st.pool() {
+        Some("🪦 contribution pool".to_string())
+    } else if st.validators.get(addr).is_some_and(|r| r.status == crate::chain::ValidatorStatus::Active) {
+        v.primary_name(addr).or(Some("🧛 validator".into()))
+    } else {
+        v.primary_name(addr)
+    };
     json!({ "address": addr, "name": name, "short": short(addr) })
 }
 
-fn tx_json(c: &Chain, tx: &Tx, height: Option<u64>) -> Value {
-    tx_json_with(c, tx, height, None)
+fn tx_json(v: &ReadView, tx: &Tx, height: Option<u64>) -> Value {
+    tx_json_with(v, tx, height, None)
 }
 
-fn tx_json_with(c: &Chain, tx: &Tx, height: Option<u64>, error: Option<&str>) -> Value {
+fn tx_json_with(v: &ReadView, tx: &Tx, height: Option<u64>, error: Option<&str>) -> Value {
+    let st = &v.state;
     let sender = tx.sender().unwrap_or_default();
     let (kind, to, amount) = match &tx.action {
-        Action::Transfer { to, amount } => ("transfer", c.state.resolve(to).ok(), Some(*amount)),
+        Action::Transfer { to, amount } => ("transfer", st.resolve(to).ok(), Some(*amount)),
         Action::RegisterName { .. } => ("register_name", None, None),
         Action::AddKey { .. } => ("add_key", None, None),
         Action::RemoveKey { .. } => ("remove_key", None, None),
@@ -313,14 +413,14 @@ fn tx_json_with(c: &Chain, tx: &Tx, height: Option<u64>, error: Option<&str>) ->
         Action::UnlinkGithub { .. } => ("unlink_github", None, None),
         Action::CreateHunt { amount, .. } => ("create_hunt", None, Some(*amount)),
         Action::FundHunt { amount, .. } => ("fund_hunt", None, Some(*amount)),
-        Action::AwardHunt { to, .. } => ("award_hunt", c.state.resolve(to).ok(), None),
+        Action::AwardHunt { to, .. } => ("award_hunt", st.resolve(to).ok(), None),
         Action::CancelHunt { .. } => ("cancel_hunt", None, None),
         Action::RegisterFamiliar { .. } => ("register_familiar", None, None),
         Action::SetRepo { .. } => ("set_repo", None, None),
-        Action::GrantSoul { to, .. } => ("grant_soul", c.state.resolve(to).ok(), None),
-        Action::Vouch { account } => ("vouch", c.state.resolve(account).ok(), Some(crate::poc::VOUCH_BOND)),
-        Action::Unvouch { account } => ("unvouch", c.state.resolve(account).ok(), None),
-        Action::FlagSybil { account, .. } => ("flag_sybil", c.state.resolve(account).ok(), None),
+        Action::GrantSoul { to, .. } => ("grant_soul", st.resolve(to).ok(), None),
+        Action::Vouch { account } => ("vouch", st.resolve(account).ok(), Some(crate::poc::VOUCH_BOND)),
+        Action::Unvouch { account } => ("unvouch", st.resolve(account).ok(), None),
+        Action::FlagSybil { account, .. } => ("flag_sybil", st.resolve(account).ok(), None),
         Action::SubmitClaim { .. } => ("submit_claim", None, None),
         Action::AttestClaim { .. } => ("attest_claim", None, None),
         Action::RejectClaim { .. } => ("reject_claim", None, None),
@@ -328,19 +428,19 @@ fn tx_json_with(c: &Chain, tx: &Tx, height: Option<u64>, error: Option<&str>) ->
         Action::LeaveJury {} => ("leave_jury", None, None),
         Action::CommitVotes { .. } => ("commit_votes", None, None),
         Action::RevealVotes { .. } => ("reveal_votes", None, None),
-        Action::FundPool { amount } => ("fund_pool", Some(c.state.pool()), Some(*amount)),
+        Action::FundPool { amount } => ("fund_pool", Some(st.pool()), Some(*amount)),
         Action::WithdrawVested {} => ("withdraw_vested", None, None),
-        Action::Clawback { account, .. } => ("clawback", c.state.resolve(account).ok(), None),
+        Action::Clawback { account, .. } => ("clawback", st.resolve(account).ok(), None),
     };
     json!({
         "id": tx.id(),
-        "summary": c.state.describe(tx, height),
+        "summary": v.describe(tx, height),
         "kind": kind,
         "status": match (height, error) { (_, Some(_)) => "failed", (Some(_), None) => "finalized", (None, None) => "pending" },
         "error": error,
         "height": height,
-        "from": label(c, &sender),
-        "to": to.map(|t| label(c, &t)),
+        "from": label(v, &sender),
+        "to": to.map(|t| label(v, &t)),
         "amount": amount.map(|a| a.to_string()),
         "amount_display": amount.map(fmt_fang),
         // What the tx is charged (base fee burned + tip); `max_fee` is what it allowed.
@@ -358,67 +458,89 @@ fn tx_json_with(c: &Chain, tx: &Tx, height: Option<u64>, error: Option<&str>) ->
     })
 }
 
-fn block_json(c: &Chain, b: &Block, full: bool) -> Value {
-    let mut v = json!({
+fn block_summary(height: u64, txs: usize) -> String {
+    format!("Block #{height} sealed with {txs} transaction{}", if txs == 1 { "" } else { "s" })
+}
+
+/// A block's header as the explorer lists it, from the index row alone.
+fn header_json(v: &ReadView, height: u64, m: &BlockMeta) -> Value {
+    json!({
+        "height": height,
+        "hash": hex::encode(m.hash),
+        "prev_hash": hex::encode(m.prev_hash),
+        "timestamp_ms": m.timestamp_ms,
+        "proposer": label(v, &m.proposer),
+        "state_root": hex::encode(m.state_root),
+        "tx_count": m.tx_count,
+        "summary": block_summary(height, m.tx_count as usize),
+    })
+}
+
+fn block_json(v: &ReadView, b: &Block) -> Value {
+    json!({
         "height": b.height,
         "hash": b.hash,
         "prev_hash": b.prev_hash,
         "timestamp_ms": b.timestamp_ms,
-        "proposer": label(c, &b.proposer),
+        "proposer": label(v, &b.proposer),
         "state_root": b.state_root,
         "tx_count": b.txs.len(),
-        "summary": format!("Block #{} sealed with {} transaction{}", b.height, b.txs.len(), if b.txs.len() == 1 { "" } else { "s" }),
-    });
-    if full {
-        v["txs"] = b.txs.iter().enumerate().map(|(i, t)| tx_json_with(c, t, Some(b.height), b.failed.get(&i).map(|s| s.as_str()))).collect();
-        v["signature_bytes"] = json!(c.cert_len(b.height));
-        v["failed_count"] = json!(b.failed.len());
-    }
-    v
+        "summary": block_summary(b.height, b.txs.len()),
+        "txs": b.txs.iter().enumerate().map(|(i, t)| tx_json_with(v, t, Some(b.height), b.failed.get(&i).map(|s| s.as_str()))).collect::<Vec<_>>(),
+        "signature_bytes": v.cert_len(b.height),
+        "failed_count": b.failed.len(),
+    })
 }
 
-fn sync_progress(c: &Chain) -> f64 {
-    let t = c.network_height_claimed();
-    if t == 0 { 1.0 } else { (c.height() as f64 / t as f64).min(1.0) }
+fn sync_progress(live: &Live, height: u64) -> f64 {
+    let t = live.network_height_claimed(height);
+    if t == 0 { 1.0 } else { (height as f64 / t as f64).min(1.0) }
+}
+
+fn head_age_ms(v: &ReadView) -> Option<u64> {
+    v.head_time_ms().map(|t| crate::chain::now_ms().saturating_sub(t))
 }
 
 async fn status(State(n): State<Node>) -> ApiResult {
-    let c = n.chain.lock();
+    let v = n.live.view();
+    let (st, g, h) = (&v.state, &v.genesis, v.height);
+    let epoch = st.params.epoch_of(h + 1);
     Ok(Json(json!({
-        "chain_id": c.genesis.chain_id,
-        "token": c.genesis.token,
-        "decimals": c.genesis.decimals,
-        "height": c.height(),
-        "block_time_ms": c.genesis.block_time_ms,
-        "validator": label(&c, &c.genesis.validators[0].address),
-        "validators": c.state.active_sets.get(&c.state.params.epoch_of(c.height() + 1)).map(|s| s.iter().map(|a| label(&c, a)).collect::<Vec<_>>()).unwrap_or_default(),
-        "role": c.role,
-        "finalized_height": c.finalized_tip.max(c.height()),
-        "network_height_claimed": c.network_height_claimed(),
-        "syncing": c.syncing(),
-        "sync_progress": sync_progress(&c),
-        "state_root": c.state.root(),
+        "chain_id": g.chain_id,
+        "token": g.token,
+        "decimals": g.decimals,
+        "height": h,
+        "block_time_ms": g.block_time_ms,
+        "validator": label(&v, &g.validators[0].address),
+        "validators": st.active_sets.get(&epoch).map(|s| s.iter().map(|a| label(&v, a)).collect::<Vec<_>>()).unwrap_or_default(),
+        "role": v.role,
+        "finalized_height": n.live.finalized(h),
+        "network_height_claimed": n.live.network_height_claimed(h),
+        "syncing": n.live.syncing(h),
+        "sync_progress": sync_progress(&n.live, h),
+        "state_root": st.root(),
         "consensus": "simplex BFT",
-        "epoch": c.state.params.epoch_of(c.height() + 1),
-        "active_validators": c.state.active_sets.get(&c.state.params.epoch_of(c.height() + 1)).map(|s| s.len()).unwrap_or(0),
-        "faucet": c.genesis.faucet,
-        "supply": c.state.supply.to_string(),
-        "supply_display": fmt_fang(c.state.supply),
-        "burned": c.state.burned.to_string(),
-        "burned_display": fmt_fang(c.state.burned),
-        "accounts": c.state.accounts.len(),
-        "names": c.state.names.len(),
-        "mempool": c.mempool.len(),
+        "epoch": epoch,
+        "active_validators": st.active_sets.get(&epoch).map(|s| s.len()).unwrap_or(0),
+        "faucet": g.faucet,
+        "supply": st.supply.to_string(),
+        "supply_display": fmt_fang(st.supply),
+        "burned": st.burned.to_string(),
+        "burned_display": fmt_fang(st.burned),
+        "accounts": st.accounts.len(),
+        "names": st.names.len(),
+        "mempool": n.live.mempool().len(),
         "version": VERSION,
         "git_sha": GIT_SHA,
-        "genesis_hash": c.genesis_hash,
-        "head_age_ms": c.last_block().map(|b| crate::chain::now_ms().saturating_sub(b.timestamp_ms)),
-        "history_from": c.base_height() + 1,
-        "fast_synced_from": c.base.as_ref().map(|b| b.height),
-        "address_prefix": c.genesis.address_prefix,
-        "max_tx_validity_blocks": c.state.params.max_tx_validity_blocks(),
+        "genesis_hash": v.genesis_hash,
+        "head_age_ms": head_age_ms(&v),
+        "history_from": v.history_from(),
+        "pruning": v.keep_blocks.map(|k| json!({ "keep_blocks": k })),
+        "fast_synced_from": v.base.as_ref().map(|b| b.height),
+        "address_prefix": g.address_prefix,
+        "max_tx_validity_blocks": st.params.max_tx_validity_blocks(),
         "protocol_version": crate::consensus::PROTOCOL_VERSION,
-        "crypto": { "signatures": "ML-DSA-65 (FIPS 204)", "hash": "BLAKE3-256", "addresses": format!("bech32m({}, BLAKE3(pubkey))", c.genesis.address_prefix), "p2p_transport": "hybrid X25519 + ML-KEM-768 key exchange, ChaCha20-Poly1305, ML-DSA-65 peer auth" },
+        "crypto": { "signatures": "ML-DSA-65 (FIPS 204)", "hash": "BLAKE3-256", "addresses": format!("bech32m({}, BLAKE3(pubkey))", g.address_prefix), "p2p_transport": "hybrid X25519 + ML-KEM-768 key exchange, ChaCha20-Poly1305, ML-DSA-65 peer auth" },
     })))
 }
 
@@ -429,51 +551,52 @@ struct Page {
 }
 
 async fn blocks(State(n): State<Node>, Query(p): Query<Page>) -> ApiResult {
-    let c = n.chain.lock();
+    let v = n.live.view();
     let limit = p.limit.unwrap_or(20).min(100);
     let before = p.before.unwrap_or(u64::MAX);
-    let out: Vec<Value> = c.blocks_before(before, limit).iter().map(|b| block_json(&c, b, false)).collect();
+    let out: Vec<Value> = v.headers(before, limit).iter().map(|(h, m)| header_json(&v, *h, m)).collect();
     Ok(Json(json!(out)))
 }
 
-fn find_block(c: &Chain, id: &str) -> Option<Block> {
+fn find_block(v: &ReadView, id: &str) -> Option<Arc<Block>> {
     match id.parse::<u64>() {
-        Ok(h) if h >= 1 => c.block(h),
-        _ => c.block_by_hash(id),
+        Ok(h) if h >= 1 => v.block(h),
+        _ => v.block_by_hash(id),
     }
 }
 
-/// A finalized tx and its failure reason, if any.
-fn finalized_tx(c: &Chain, h: u64, i: usize) -> Option<(Tx, Option<String>)> {
-    let b = c.block(h)?;
-    let err = b.failed.get(&i).cloned();
-    b.txs.into_iter().nth(i).map(|t| (t, err))
+/// 410 for a height this node executed but no longer holds.
+fn pruned(v: &ReadView, height: u64) -> ApiError {
+    let why = match &v.base {
+        Some(b) if height <= b.height => format!("it fast-synced from a certified snapshot at #{}", b.height),
+        _ => "it keeps only recent blocks (ask an archive node)".to_string(),
+    };
+    ApiError(StatusCode::GONE, format!("block #{height} is pruned on this node: history starts at #{} ({why})", v.history_from()))
 }
 
 async fn block(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
-    let c = n.chain.lock();
+    let v = n.live.view();
     if let Ok(h) = id.parse::<u64>() {
-        if h >= 1 && h <= c.base_height() {
-            return Err(ApiError(StatusCode::NOT_FOUND, format!("history before #{} isn't available on this node (it fast-synced from a certified snapshot at #{})", c.base_height() + 1, c.base_height())));
+        if v.is_pruned(h) {
+            return Err(pruned(&v, h));
         }
     }
-    let b = find_block(&c, &id).ok_or_else(|| not_found("block"))?;
-    Ok(Json(block_json(&c, &b, true)))
+    let b = find_block(&v, &id).ok_or_else(|| not_found("block"))?;
+    Ok(Json(block_json(&v, &b)))
 }
 
 async fn tx(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
-    let c = n.chain.lock();
-    if let Some(&(h, i)) = c.tx_index.get(&id) {
-        if let Some((t, err)) = finalized_tx(&c, h, i) {
-            return Ok(Json(tx_json_with(&c, &t, Some(h), err.as_deref())));
+    let v = n.live.view();
+    if let Some((h, i)) = v.tx_location(&id) {
+        if let Some((t, err)) = v.finalized_tx(h, i) {
+            return Ok(Json(tx_json_with(&v, &t, Some(h), err.as_deref())));
         }
     }
-    if c.in_mempool(&id) {
-        if let Some(pending) = c.mempool.iter().find(|t| t.id() == id) {
-            return Ok(Json(tx_json(&c, pending, None)));
-        }
+    let mp = n.live.mempool();
+    if let Some(pending) = mp.get(&id) {
+        return Ok(Json(tx_json(&v, pending, None)));
     }
-    if let Some((reason, height)) = c.failure(&id) {
+    if let Some((reason, height)) = mp.failure(&id) {
         return Ok(Json(json!({ "id": id, "status": "failed", "error": reason, "height": height, "summary": format!("Transaction failed: {reason}") })));
     }
     Err(not_found("transaction"))
@@ -490,10 +613,10 @@ async fn submit(State(n): State<Node>, ConnectInfo(peer): ConnectInfo<SocketAddr
 }
 
 async fn submit_inner(n: &Node, headers: &HeaderMap, client: Option<IpAddr>, tx: Tx) -> ApiResult {
-    // Format + ML-DSA signature checks run without holding the chain lock.
+    // Format + ML-DSA signature checks run without the chain lock.
     let (chain_id, prefix, role) = {
-        let c = n.chain.lock();
-        (c.genesis.chain_id.clone(), c.genesis.address_prefix.clone(), c.role)
+        let v = n.live.view();
+        (v.genesis.chain_id.clone(), v.genesis.address_prefix.clone(), v.role)
     };
     crate::consensus::check_tx_stateless(&tx, &chain_id, &prefix)?;
     if role == Role::FullNode {
@@ -514,25 +637,24 @@ async fn submit_inner(n: &Node, headers: &HeaderMap, client: Option<IpAddr>, tx:
 
 /// Pending transactions (newest first).
 async fn mempool(State(n): State<Node>, Query(p): Query<Page>) -> ApiResult {
-    let c = n.chain.lock();
+    let (v, mp) = (n.live.view(), n.live.mempool());
     let limit = p.limit.unwrap_or(50).min(200);
-    let txs: Vec<Value> = c.mempool.iter().rev().take(limit).map(|t| tx_json(&c, t, None)).collect();
-    Ok(Json(json!({ "count": c.mempool.len(), "txs": txs })))
+    let txs: Vec<Value> = mp.newest().take(limit).map(|t| tx_json(&v, t, None)).collect();
+    Ok(Json(json!({ "count": mp.len(), "txs": txs })))
 }
 
 /// 200 when the head is fresh and we're not syncing; 503 with a reason otherwise.
 async fn health(State(n): State<Node>) -> Response {
-    let c = n.chain.lock();
-    let bt = c.genesis.block_time_ms.max(1);
-    let age = c.last_block().map(|b| crate::chain::now_ms().saturating_sub(b.timestamp_ms));
-    let syncing = c.syncing();
+    let v = n.live.view();
+    let bt = v.genesis.block_time_ms.max(1);
+    let age = head_age_ms(&v);
     let reason = match age {
-        _ if syncing => Some(format!("syncing: {} of {}", c.height(), c.network_height_claimed())),
+        _ if n.live.syncing(v.height) => Some(format!("syncing: {} of {}", v.height, n.live.network_height_claimed(v.height))),
         None => Some("no blocks yet".to_string()),
         Some(a) if a > 10 * bt => Some(format!("head is {}s old", a / 1000)),
         _ => None,
     };
-    let body = json!({ "ok": reason.is_none(), "reason": reason, "height": c.height(), "head_age_ms": age, "finalized_height": c.finalized_tip.max(c.height()) });
+    let body = json!({ "ok": reason.is_none(), "reason": reason, "height": v.height, "head_age_ms": age, "finalized_height": n.live.finalized(v.height) });
     let code = if reason.is_none() { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
     (code, Json(body)).into_response()
 }
@@ -543,26 +665,30 @@ async fn metrics(State(n): State<Node>) -> Response {
     use std::sync::atomic::Ordering::Relaxed;
     let mut out = String::new();
     {
-        let c = n.chain.lock();
-        let epoch = c.state.params.epoch_of(c.height() + 1);
-        let active = c.state.active_sets.get(&epoch).map(|s| s.len()).unwrap_or(0);
-        let head_age = c.last_block().map(|b| crate::chain::now_ms().saturating_sub(b.timestamp_ms)).unwrap_or(0);
-        let online = online_validators(&c);
-        for (name, help, v) in [
-            ("blockula_height", "Executed height", c.height() as f64),
-            ("blockula_finalized_height", "Highest certified finalized height", c.finalized_tip.max(c.height()) as f64),
-            ("blockula_finalized_lag", "Finalized height minus executed height", c.finalized_tip.saturating_sub(c.height()) as f64),
+        let v = n.live.view();
+        let h = v.height;
+        let epoch = v.state.params.epoch_of(h + 1);
+        let active = v.state.active_sets.get(&epoch).map(|s| s.len()).unwrap_or(0);
+        let head_age = head_age_ms(&v).unwrap_or(0);
+        let online = online_validators(&v);
+        let finalized = n.live.finalized(h);
+        for (name, help, val) in [
+            ("blockula_height", "Executed height", h as f64),
+            ("blockula_finalized_height", "Highest certified finalized height", finalized as f64),
+            ("blockula_finalized_lag", "Finalized height minus executed height", finalized.saturating_sub(h) as f64),
             ("blockula_head_age_seconds", "Seconds since the head block's timestamp", head_age as f64 / 1000.0),
-            ("blockula_mempool_size", "Pending transactions", c.mempool.len() as f64),
+            ("blockula_mempool_size", "Pending transactions", n.live.mempool().len() as f64),
             ("blockula_epoch", "Current epoch", epoch as f64),
             ("blockula_active_validators", "Validators in the active set", active as f64),
             ("blockula_validators_online", "Signers on the latest finalization certificate", online.map(|o| o as f64).unwrap_or(f64::NAN)),
+            ("blockula_history_from", "First height whose block this node holds", v.history_from() as f64),
             ("blockula_faucet_drips_total", "Faucet drips served", n.stats.faucet_drips.load(Relaxed) as f64),
             ("blockula_tx_submitted_total", "Transactions accepted over HTTP", n.stats.tx_submitted.load(Relaxed) as f64),
             ("blockula_tx_rejected_total", "Transactions rejected over HTTP", n.stats.tx_rejected.load(Relaxed) as f64),
+            ("blockula_http_reads_limited_total", "HTTP reads refused by the per-client rate limit", n.stats.reads_limited.load(Relaxed) as f64),
         ] {
             let kind = if name.ends_with("_total") { "counter" } else { "gauge" };
-            let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {v}");
+            let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {val}");
         }
         let _ = writeln!(out, "# HELP blockula_build_info Version and git sha\n# TYPE blockula_build_info gauge\nblockula_build_info{{version=\"{VERSION}\",git_sha=\"{GIT_SHA}\"}} 1");
     }
@@ -573,56 +699,66 @@ async fn metrics(State(n): State<Node>) -> Response {
 }
 
 /// How many validators signed the most recent finalization certificate we hold.
-pub fn online_validators(c: &Chain) -> Option<usize> {
+pub fn online_validators(v: &ReadView) -> Option<usize> {
     use commonware_codec::Decode as _;
-    let h = (c.height().saturating_sub(16)..=c.height()).rev().find(|h| c.cert_len(*h) > 0)?;
-    let bytes = c.cert(h)?;
+    let h = (v.height.saturating_sub(16)..=v.height).rev().find(|h| v.cert_len(*h) > 0)?;
+    let bytes = v.cert(h)?;
     let f = commonware_consensus::simplex::types::Finalization::<crate::pq::MlDsaScheme, commonware_cryptography::blake3::Digest>::decode_cfg(bytes.as_slice(), &1024usize).ok()?;
     Some(f.certificate.signers.count())
 }
 
+/// Entries per list in `/api/account` (names, Hunts, claims, vouches).
+pub const ACCOUNT_LIST_LIMIT: usize = 100;
+
 async fn account(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
-    let c = n.chain.lock();
-    let addr = c.state.resolve(&id)?;
-    let acct = c.state.account(&addr);
-    let names: Vec<String> = c.state.names.values().filter(|r| r.owner == addr).map(|r| format!("{}{NAME_SUFFIX}", r.name)).collect();
-    let mut recent: Vec<Value> = c
-        .mempool
-        .iter()
-        .filter(|t| t.from == addr || matches!(&t.action, Action::Transfer { to, .. } if c.state.resolve(to).ok().as_deref() == Some(addr.as_str())))
-        .rev()
-        .map(|t| tx_json(&c, t, None))
-        .collect();
-    recent.extend(c.history.get(&addr).map(|ids| {
-        ids.iter().rev().take(25).filter_map(|id| c.tx_index.get(id)).filter_map(|&(h, i)| finalized_tx(&c, h, i).map(|(t, e)| tx_json_with(&c, &t, Some(h), e.as_deref()))).collect::<Vec<_>>()
-    }).unwrap_or_default());
+    let v = n.live.view();
+    let st = &v.state;
+    let addr = st.resolve(&id)?;
+    let acct = st.account(&addr);
+    let names: Vec<String> = v.names_of(&addr, ACCOUNT_LIST_LIMIT).into_iter().map(|n| format!("{n}{NAME_SUFFIX}")).collect();
+    let mp = n.live.mempool();
+    // The mempool is capped (`MAX_MEMPOOL`), so this scan is bounded.
+    let mut recent: Vec<Value> = mp.newest().filter(|t| t.from == addr || matches!(&t.action, Action::Transfer { to, .. } if st.resolve(to).ok().as_deref() == Some(addr.as_str()))).map(|t| tx_json(&v, t, None)).collect();
+    recent.extend(v.history(&addr, 25).into_iter().filter_map(|(h, i)| v.finalized_tx(h, i).map(|(t, e)| tx_json_with(&v, &t, Some(h), e.as_deref()))));
+    let hunts_created: Vec<u64> = v.ids(ix::HUNT_CREATOR, &addr, false, ACCOUNT_LIST_LIMIT);
+    let hunts_won: Vec<Value> = v.ids(ix::HUNT_WINNER, &addr, false, ACCOUNT_LIST_LIMIT).into_iter().filter_map(|id| st.hunts.get(&id)).map(|h| json!({ "id": h.id, "repo": h.repo, "issue": h.issue, "amount_display": fmt_fang(h.amount), "pr": h.pr, "self_awarded": h.self_awarded() })).collect();
+    let keys = st.keys_of(&addr);
     Ok(Json(json!({
-        "account": label(&c, &addr),
+        "account": label(&v, &addr),
         "balance": acct.balance.to_string(),
         "balance_display": fmt_fang(acct.balance),
         "nonce": acct.nonce,
-        "next_nonce": c.next_nonce(&addr),
+        "next_nonce": acct.nonce + mp.pending_count(&addr) as u64,
         "names": names,
-        "keys": c.state.keys_of(&addr).into_iter().map(|(id, k)| json!({ "key_id": id, "label": k.label, "role": k.role, "added_at": k.added_at, "spent_this_period": k.spent.to_string(), "window_start": k.window_start })).collect::<Vec<_>>(),
+        "keys": keys.iter().map(|(id, k)| json!({ "key_id": id, "label": k.label, "role": k.role, "added_at": k.added_at, "spent_this_period": k.spent.to_string(), "window_start": k.window_start })).collect::<Vec<_>>(),
         "recent_txs": recent,
-        "github": c.state.github_by_account.get(&addr).and_then(|h| c.state.github.get(h)).map(|l| json!({ "handle": l.handle, "gist_id": l.gist_id, "linked_at": l.linked_at, "verify_url": format!("/api/github/{}", l.handle) })),
-        "familiars": c.state.familiars.get(&addr).map(|f| f.iter().filter(|(k, _)| c.state.keys_of(&addr).contains_key(*k)).map(|(k, l)| json!({ "key_id": k, "label": l })).collect::<Vec<_>>()).unwrap_or_default(),
-        "hunts_created": c.state.hunts.values().filter(|h| h.creator == addr).map(|h| h.id).collect::<Vec<_>>(),
-        "hunts_won": c.state.hunts.values().filter(|h| h.awarded_to.as_deref() == Some(addr.as_str())).map(|h| json!({ "id": h.id, "repo": h.repo, "issue": h.issue, "amount_display": fmt_fang(h.amount), "pr": h.pr, "self_awarded": h.self_awarded() })).collect::<Vec<_>>(),
-        "contribution": contribution_profile(&c, &addr),
+        "github": st.github_by_account.get(&addr).and_then(|h| st.github.get(h)).map(|l| json!({ "handle": l.handle, "gist_id": l.gist_id, "linked_at": l.linked_at, "verify_url": format!("/api/github/{}", l.handle) })),
+        "familiars": st.familiars.get(&addr).map(|f| f.iter().filter(|(k, _)| keys.contains_key(*k)).map(|(k, l)| json!({ "key_id": k, "label": l })).collect::<Vec<_>>()).unwrap_or_default(),
+        "hunts_created": hunts_created,
+        "hunts_won": hunts_won,
+        "contribution": contribution_profile(&v, &addr),
     })))
 }
 
-/// Which accounts a key may act for — lets a newly linked device find its account.
+/// Which accounts a key may act for — lets a newly linked device find its account. From the
+/// store's key index, not a scan of every account.
 async fn key_accounts(State(n): State<Node>, Path(key_id): Path<String>) -> ApiResult {
-    let c = n.chain.lock();
-    let mut accounts: Vec<Value> = c.state.accounts.iter().filter(|(_, a)| a.keys.contains_key(&key_id)).map(|(addr, a)| json!({ "account": label(&c, addr), "role": a.keys[&key_id].role, "label": a.keys[&key_id].label })).collect();
+    let v = n.live.view();
+    let st = &v.state;
+    let mut accounts: Vec<Value> = v
+        .accounts_with_key(&key_id, ACCOUNT_LIST_LIMIT)
+        .into_iter()
+        .filter_map(|addr| {
+            let k = st.accounts.get(&addr)?.keys.get(&key_id)?.clone();
+            Some(json!({ "account": label(&v, &addr), "role": k.role, "label": k.label }))
+        })
+        .collect();
     if let Ok(bytes) = hex::decode(&key_id) {
         if let Ok(bytes) = <[u8; 32]>::try_from(bytes) {
-            let own = crypto::render_address(c.state.params.prefix(), &bytes);
+            let own = crypto::render_address(st.params.prefix(), &bytes);
             let listed = accounts.iter().any(|a| a["account"]["address"] == own.as_str());
-            if !listed && c.state.keys_of(&own).contains_key(&key_id) {
-                accounts.insert(0, json!({ "account": label(&c, &own), "role": { "type": "owner" }, "label": "original key" }));
+            if !listed && st.keys_of(&own).contains_key(&key_id) {
+                accounts.insert(0, json!({ "account": label(&v, &own), "role": { "type": "owner" }, "label": "original key" }));
             }
         }
     }
@@ -630,25 +766,26 @@ async fn key_accounts(State(n): State<Node>, Path(key_id): Path<String>) -> ApiR
 }
 
 async fn name(State(node): State<Node>, Path(n): Path<String>) -> ApiResult {
-    let c = node.chain.lock();
+    let v = node.live.view();
     let n = normalize_name(&n)?;
-    match c.state.names.get(&n) {
-        Some(r) => Ok(Json(json!({ "name": format!("{n}{NAME_SUFFIX}"), "available": false, "owner": label(&c, &r.owner), "registered_at": r.registered_at }))),
+    match v.state.names.get(&n) {
+        Some(r) => Ok(Json(json!({ "name": format!("{n}{NAME_SUFFIX}"), "available": false, "owner": label(&v, &r.owner), "registered_at": r.registered_at }))),
         None => Ok(Json(json!({ "name": format!("{n}{NAME_SUFFIX}"), "available": true, "price": name_price(&n).to_string(), "price_display": fmt_fang(name_price(&n)) }))),
     }
 }
 
 async fn search(State(n): State<Node>, Path(q): Path<String>) -> ApiResult {
-    let c = n.chain.lock();
+    let v = n.live.view();
+    let mp = n.live.mempool();
     let q = q.trim().to_lowercase();
-    let hit = if find_block(&c, &q).is_some() {
+    let hit = if find_block(&v, &q).is_some() {
         json!({ "type": "block", "id": q })
-    } else if c.tx_index.contains_key(&q) || c.in_mempool(&q) || c.failure(&q).is_some() {
+    } else if v.tx_location(&q).is_some() || mp.contains(&q) || mp.failure(&q).is_some() {
         json!({ "type": "tx", "id": q })
     } else if crypto::is_address(&q) {
         json!({ "type": "account", "id": q })
     } else if let Ok(n) = normalize_name(&q) {
-        if c.state.names.contains_key(&n) { json!({ "type": "account", "id": format!("{n}{NAME_SUFFIX}") }) } else { json!({ "type": "name", "id": n }) }
+        if v.state.names.contains_key(&n) { json!({ "type": "account", "id": format!("{n}{NAME_SUFFIX}") }) } else { json!({ "type": "name", "id": n }) }
     } else {
         return Err(not_found("nothing matching that"));
     };
@@ -705,13 +842,12 @@ async fn faucet(State(n): State<Node>, ConnectInfo(peer): ConnectInfo<SocketAddr
 
 /// Manifest of the newest certified state snapshot (for `join --fast`).
 async fn snapshot_latest(State(n): State<Node>) -> ApiResult {
-    let c = n.chain.lock();
-    let m = crate::snapshot::build_manifest(&c).map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
+    let m = crate::snapshot::build_manifest(&n.live).map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
     Ok(Json(serde_json::to_value(m).unwrap()))
 }
 
 async fn snapshot_chunk(State(n): State<Node>, Path((height, i)): Path<(u64, usize)>) -> Response {
-    let home = n.chain.lock().home.clone();
+    let home = n.live.disk.home.clone();
     match crate::snapshot::chunk(&home, height, i) {
         Some(bytes) => ([(axum::http::header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response(),
         None => not_found("snapshot chunk").into_response(),
@@ -720,15 +856,36 @@ async fn snapshot_chunk(State(n): State<Node>, Path((height, i)): Path<(u64, usi
 
 /// Validator-set history with handoff proofs.
 async fn epochs(State(n): State<Node>) -> ApiResult {
-    let c = n.chain.lock();
-    let mut v = serde_json::to_value(&c.epochs).unwrap();
-    v["proven_through"] = json!(c.epochs.proven_through());
+    let e = n.live.epochs();
+    let mut v = serde_json::to_value(&*e).unwrap();
+    v["proven_through"] = json!(e.proven_through());
     Ok(Json(v))
 }
 
-fn hunt_json(c: &Chain, h: &crate::chain::Hunt) -> Value {
-    let expired = h.status == crate::chain::HuntStatus::Open && c.height() > h.expires_at;
-    let familiar = h.familiar_key.as_ref().and_then(|k| h.awarded_to.as_ref().and_then(|a| c.state.familiars.get(a)?.get(k).cloned()));
+/// A record and its Merkle proof against the state root of the latest executed block:
+/// `/api/proof/{namespace}/{key as hex}`. Check it with `state::tree::verify` (the SDK has the
+/// same 20 lines): `verify(root, namespace, key, value, proof)`.
+async fn proof(State(n): State<Node>, Path((namespace, key_hex)): Path<(u8, String)>) -> ApiResult {
+    let key = hex::decode(&key_hex).map_err(|_| ApiError(StatusCode::BAD_REQUEST, "the key must be hex".into()))?;
+    if key.len() > crate::state::MAX_KEY_BYTES {
+        return Err(ApiError(StatusCode::BAD_REQUEST, format!("keys are at most {} bytes", crate::state::MAX_KEY_BYTES)));
+    }
+    let v = n.live.view();
+    let value = v.state.record(namespace, &key);
+    let proof = v.state.prove(namespace, &key).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(json!({
+        "namespace": namespace,
+        "key": hex::encode(&key),
+        "value": value.as_deref().map(hex::encode),
+        "proof": proof,
+        "root": hex::encode(v.state.root_hash()),
+        "height": v.height,
+        "block_hash": v.last_hash,
+    })))
+}
+
+fn hunt_json(v: &ReadView, h: &crate::chain::Hunt) -> Value {
+    let familiar = h.familiar_key.as_ref().and_then(|k| h.awarded_to.as_ref().and_then(|a| v.state.familiars.get(a)?.get(k).cloned()));
     json!({
         "id": h.id,
         "repo": h.repo,
@@ -737,13 +894,13 @@ fn hunt_json(c: &Chain, h: &crate::chain::Hunt) -> Value {
         "title": h.title,
         "amount": h.amount.to_string(),
         "amount_display": fmt_fang(h.amount),
-        "creator": label(c, &h.creator),
-        "funders": h.funders.iter().map(|(a, v)| json!({ "account": label(c, a), "amount": v, "amount_display": fmt_fang(v.parse().unwrap_or(0)) })).collect::<Vec<_>>(),
-        "status": if expired { "expired" } else { match h.status { crate::chain::HuntStatus::Open => "open", crate::chain::HuntStatus::Awarded => "awarded", crate::chain::HuntStatus::Cancelled => "cancelled" } },
+        "creator": label(v, &h.creator),
+        "funders": h.funders.iter().map(|(a, amt)| json!({ "account": label(v, a), "amount": amt, "amount_display": fmt_fang(amt.parse().unwrap_or(0)) })).collect::<Vec<_>>(),
+        "status": hunt_status(h, v.height),
         "created_at": h.created_at,
         "expires_at": h.expires_at,
-        "awarded_to": h.awarded_to.as_ref().map(|a| label(c, a)),
-        "awarded_by": h.awarded_by.as_ref().map(|a| label(c, a)),
+        "awarded_to": h.awarded_to.as_ref().map(|a| label(v, a)),
+        "awarded_by": h.awarded_by.as_ref().map(|a| label(v, a)),
         "awarded_at": h.awarded_at,
         "pr": h.pr,
         "pr_url": h.pr.map(|p| format!("https://github.com/{}/pull/{}", h.repo, p)),
@@ -759,20 +916,23 @@ struct HuntQuery {
     limit: Option<usize>,
 }
 
-/// Hunts, biggest bounty first. `?status=open|awarded|cancelled|expired`.
+/// Hunts, biggest bounty first. `?status=open|awarded|cancelled|expired`. The order is computed
+/// once per block (`ReadView::hunts`), then each request takes `limit` from it.
 async fn hunts(State(n): State<Node>, Query(q): Query<HuntQuery>) -> ApiResult {
-    let c = n.chain.lock();
-    let mut list: Vec<Value> = c.state.hunts.values().map(|h| hunt_json(&c, h)).filter(|h| q.status.as_deref().is_none_or(|s| h["status"] == s)).collect();
-    list.sort_by_key(|h| std::cmp::Reverse(h["amount"].as_str().and_then(|a| a.parse::<u64>().ok()).unwrap_or(0)));
-    list.truncate(q.limit.unwrap_or(100).min(500));
-    let open_total: u64 = c.state.hunts.values().filter(|h| h.status == crate::chain::HuntStatus::Open && c.height() <= h.expires_at).map(|h| h.amount).sum();
-    Ok(Json(json!({ "count": c.state.hunts.len(), "open_bounties": open_total.to_string(), "open_bounties_display": fmt_fang(open_total), "hunts": list })))
+    let v = n.live.view();
+    let memo = v.hunts();
+    let ids: &[u64] = match q.status.as_deref() {
+        None => &memo.all,
+        Some(s) => memo.by_status.get(s).map(Vec::as_slice).unwrap_or(&[]),
+    };
+    let list: Vec<Value> = ids.iter().take(q.limit.unwrap_or(100).min(500)).filter_map(|id| v.state.hunts.get(id)).map(|h| hunt_json(&v, h)).collect();
+    Ok(Json(json!({ "count": v.state.hunts.len(), "open_bounties": memo.open_total.to_string(), "open_bounties_display": fmt_fang(memo.open_total), "hunts": list })))
 }
 
 async fn hunt(State(n): State<Node>, Path(id): Path<u64>) -> ApiResult {
-    let c = n.chain.lock();
-    let h = c.state.hunts.get(&id).ok_or_else(|| not_found("hunt"))?;
-    Ok(Json(hunt_json(&c, h)))
+    let v = n.live.view();
+    let h = v.state.hunts.get(&id).ok_or_else(|| not_found("hunt"))?;
+    Ok(Json(hunt_json(&v, h)))
 }
 
 /// Upstream GitHub calls allowed per minute (per node), and how long results are cached.
@@ -784,7 +944,7 @@ pub const GITHUB_CACHE: Duration = Duration::from_secs(600);
 async fn github(State(n): State<Node>, Path(handle): Path<String>) -> ApiResult {
     check_github_handle(&handle)?;
     let lower = handle.to_ascii_lowercase();
-    let link = n.chain.lock().state.github.get(&lower).cloned().ok_or_else(|| not_found("GitHub link"))?;
+    let link = n.live.view().state.github.get(&lower).cloned().ok_or_else(|| not_found("GitHub link"))?;
     let key = format!("{lower}:{}:{}", link.account, link.gist_id);
     if let Some((at, v)) = n.github_cache.lock().get(&key) {
         if at.elapsed() < GITHUB_CACHE {
@@ -806,56 +966,58 @@ async fn github(State(n): State<Node>, Path(handle): Path<String>) -> ApiResult 
         Err(e) => (false, format!("couldn't check the gist: {e}")),
     };
     let v = {
-        let c = n.chain.lock();
-        json!({ "handle": link.handle, "account": label(&c, &link.account), "gist_id": link.gist_id, "gist_url": format!("https://gist.github.com/{}", link.gist_id), "linked_at": link.linked_at, "verified": verified, "reason": reason, "attested_by": "this node (off-chain check; validators re-check it for every contribution claim)" })
+        let view = n.live.view();
+        json!({ "handle": link.handle, "account": label(&view, &link.account), "gist_id": link.gist_id, "gist_url": format!("https://gist.github.com/{}", link.gist_id), "linked_at": link.linked_at, "verified": verified, "reason": reason, "attested_by": "this node (off-chain check; validators re-check it for every contribution claim)" })
     };
     n.github_cache.lock().insert(key, (Instant::now(), v.clone()));
     Ok(Json(v))
 }
 
-fn validator_json(c: &Chain, v: &crate::chain::ValidatorRecord) -> Value {
+fn validator_json(v: &ReadView, r: &crate::chain::ValidatorRecord) -> Value {
     json!({
-        "validator": label(c, &v.address),
-        "owner": label(c, &v.owner),
-        "status": v.status,
-        "consensus_key": v.consensus_key,
-        "p2p_addr": v.p2p_addr,
-        "http_addr": v.http_addr,
-        "bond": v.bond.to_string(),
-        "bond_display": fmt_fang(v.bond),
-        "registered_at": v.registered_at,
-        "approved_at": v.approved_at,
-        "approved_by": v.approved_by.as_ref().map(|a| label(c, a)),
-        "active_from_epoch": v.active_from,
-        "removed_at": v.removed_at,
-        "removed_by": v.removed_by.as_ref().map(|a| label(c, a)),
-        "active_until_epoch": v.active_until,
-        "unbond_epoch": v.unbond_epoch,
-        "genesis": c.genesis.is_validator(&v.address),
+        "validator": label(v, &r.address),
+        "owner": label(v, &r.owner),
+        "status": r.status,
+        "consensus_key": r.consensus_key,
+        "p2p_addr": r.p2p_addr,
+        "http_addr": r.http_addr,
+        "bond": r.bond.to_string(),
+        "bond_display": fmt_fang(r.bond),
+        "registered_at": r.registered_at,
+        "approved_at": r.approved_at,
+        "approved_by": r.approved_by.as_ref().map(|a| label(v, a)),
+        "active_from_epoch": r.active_from,
+        "removed_at": r.removed_at,
+        "removed_by": r.removed_by.as_ref().map(|a| label(v, a)),
+        "active_until_epoch": r.active_until,
+        "unbond_epoch": r.unbond_epoch,
+        "genesis": v.genesis.is_validator(&r.address),
     })
 }
 
 /// The validator set: who's active this epoch, who's next, who's waiting, and when it changes.
+/// (Registrations are bonded, so the validator map stays small.)
 async fn validators(State(n): State<Node>) -> ApiResult {
     use crate::chain::ValidatorStatus::*;
-    let c = n.chain.lock();
-    let p = &c.state.params;
-    let next_height = c.height() + 1;
+    let v = n.live.view();
+    let st = &v.state;
+    let p = &st.params;
+    let next_height = v.height + 1;
     let epoch = p.epoch_of(next_height);
-    let ids = |set: Option<&Vec<String>>| -> Vec<Value> { set.map(|s| s.iter().filter_map(|a| c.state.validators.get(a)).map(|v| validator_json(&c, v)).collect()).unwrap_or_default() };
-    let by_status = |st: crate::chain::ValidatorStatus| -> Vec<Value> { c.state.validators.values().filter(|v| v.status == st).map(|v| validator_json(&c, v)).collect() };
-    let next_set = c.state.next_set(epoch);
+    let ids = |set: Option<&Vec<String>>| -> Vec<Value> { set.map(|s| s.iter().filter_map(|a| st.validators.get(a)).map(|r| validator_json(&v, r)).collect()).unwrap_or_default() };
+    let by_status = |s: crate::chain::ValidatorStatus| -> Vec<Value> { st.validators.values().filter(|r| r.status == s).map(|r| validator_json(&v, r)).collect() };
+    let next_set = st.next_set(epoch);
     Ok(Json(json!({
         "epoch": epoch,
         "epoch_blocks": p.epoch_blocks,
         "epoch_ends_at_height": p.last_of(epoch),
         "blocks_until_next_epoch": p.last_of(epoch) + 1 - next_height,
-        "active": ids(c.state.active_sets.get(&epoch)),
+        "active": ids(st.active_sets.get(&epoch)),
         "next_epoch": ids(Some(&next_set)),
         "pending": by_status(Pending),
         "approved": by_status(Approved),
         "removed": by_status(Removed),
-        "admins": p.admins.iter().map(|a| label(&c, a)).collect::<Vec<_>>(),
+        "admins": p.admins.iter().map(|a| label(&v, a)).collect::<Vec<_>>(),
         "min_bond": p.min_bond.to_string(),
         "min_bond_display": fmt_fang(p.min_bond),
         "max_validators": p.max_validators,
@@ -864,10 +1026,10 @@ async fn validators(State(n): State<Node>) -> ApiResult {
 }
 
 async fn genesis(State(n): State<Node>) -> ApiResult {
-    let c = n.chain.lock();
-    let mut v = serde_json::to_value(&c.genesis).unwrap();
-    v["genesis_hash"] = json!(c.genesis_hash);
-    Ok(Json(v))
+    let v = n.live.view();
+    let mut g = serde_json::to_value(&*v.genesis).unwrap();
+    g["genesis_hash"] = json!(v.genesis_hash);
+    Ok(Json(g))
 }
 
 #[derive(Deserialize)]
@@ -876,60 +1038,59 @@ struct SyncQuery {
     limit: Option<u64>,
 }
 
-/// Finalized consensus blocks `[from, to]` plus the finalization certificate of block `to`, so a
-/// joining node can verify the whole batch (hash links + one ML-DSA quorum certificate).
 /// Bytes of block data per `/api/sync` response (the joiner caps what it reads, too).
 pub const SYNC_BATCH_BYTES: usize = 8 << 20;
 
 /// Finalized consensus blocks `[from, to]` plus the finalization certificate of block `to`, so a
 /// joining node can verify the whole batch (hash links + one ML-DSA quorum certificate).
-/// Served by validators and full nodes from their own block/certificate stores.
+/// Served by validators and full nodes from their own block/certificate stores; heights a node
+/// pruned get a 410.
 async fn sync(State(n): State<Node>, Query(q): Query<SyncQuery>) -> ApiResult {
     use commonware_codec::Encode;
     use commonware_consensus::types::Height;
-    let (tip, from, range_end) = {
-        let c = n.chain.lock();
-        let from = q.from.max(1);
-        let epoch_end = c.state.params.last_of(c.state.params.epoch_of(from));
-        (c.height(), from, c.height().min(epoch_end)) // never mix epochs (different validator sets)
-    };
+    let v = n.live.view();
+    let tip = v.height;
+    let from = q.from.max(1);
+    let epoch_end = v.state.params.last_of(v.state.params.epoch_of(from));
+    let range_end = tip.min(epoch_end); // never mix epochs (different validator sets)
     if from > tip {
         return Ok(Json(json!({ "tip": tip, "blocks": [], "to": null, "finalization": null })));
+    }
+    if v.is_pruned(from) {
+        return Err(pruned(&v, from));
     }
     let want = (from + q.limit.unwrap_or(100).clamp(1, 500) - 1).min(range_end);
     // Blocks up to `want`, cut at the byte budget, and the highest certified height among them.
     let (mut blocks, mut cert) = (vec![], None);
     let mut bytes = 0usize;
     let mut last_cert_len = 0usize;
-    {
-        let c = n.chain.lock();
-        for h in from..=want {
-            let Some(b) = c.cblock(h) else { break };
-            bytes += b.len() * 2;
-            if bytes > SYNC_BATCH_BYTES && !blocks.is_empty() {
-                break;
-            }
-            blocks.push(hex::encode(&b));
-            if let Some(f) = c.cert(h) {
-                cert = Some((h, hex::encode(f)));
-                last_cert_len = blocks.len();
-            }
+    for h in from..=want {
+        let Some(b) = v.cblock(h) else { break };
+        bytes += b.len() * 2;
+        if bytes > SYNC_BATCH_BYTES && !blocks.is_empty() {
+            break;
         }
-        // No certificate in range: extend to the next certified height (still within the epoch).
-        if cert.is_none() && bytes <= SYNC_BATCH_BYTES {
-            let mut h = from + blocks.len() as u64;
-            while h <= range_end && h < from + 600 {
-                let Some(b) = c.cblock(h) else { break };
-                blocks.push(hex::encode(&b));
-                if let Some(f) = c.cert(h) {
-                    cert = Some((h, hex::encode(f)));
-                    last_cert_len = blocks.len();
-                    break;
-                }
-                h += 1;
-            }
+        blocks.push(hex::encode(&b));
+        if let Some(f) = v.cert(h) {
+            cert = Some((h, hex::encode(f)));
+            last_cert_len = blocks.len();
         }
     }
+    // No certificate in range: extend to the next certified height (still within the epoch).
+    if cert.is_none() && bytes <= SYNC_BATCH_BYTES {
+        let mut h = from + blocks.len() as u64;
+        while h <= range_end && h < from + 600 {
+            let Some(b) = v.cblock(h) else { break };
+            blocks.push(hex::encode(&b));
+            if let Some(f) = v.cert(h) {
+                cert = Some((h, hex::encode(f)));
+                last_cert_len = blocks.len();
+                break;
+            }
+            h += 1;
+        }
+    }
+    drop(v);
     // Validators can fall back to marshal's archive for the certificate.
     if cert.is_none() {
         if let Some(m) = &n.marshal {
@@ -952,10 +1113,9 @@ async fn sync(State(n): State<Node>, Query(q): Query<SyncQuery>) -> ApiResult {
 
 // ---------------------------------------------------------------- 🪦 Proof of Contribution
 
-fn soul_json(c: &Chain, addr: &str) -> Value {
-    let h = c.height();
-    let soul = c.state.soul_of(addr, h);
-    let earned = c.state.poc.souls.get(addr).map(|s| s.earned).unwrap_or(0);
+fn soul_json(v: &ReadView, addr: &str) -> Value {
+    let soul = v.state.soul_of(addr, v.height);
+    let earned = v.state.poc.souls.get(addr).map(|s| s.earned).unwrap_or(0);
     json!({ "points": soul, "display": crate::poc::fmt_soul(soul), "earned_display": crate::poc::fmt_soul(earned) })
 }
 
@@ -963,12 +1123,12 @@ fn ppm_display(ppm: u64) -> String {
     format!("{}%", (ppm + 5_000) / 10_000)
 }
 
-fn claim_json(c: &Chain, cl: &crate::poc::Claim) -> Value {
-    let p = &c.state.params.poc;
-    let familiar = cl.familiar_key.as_ref().and_then(|k| c.state.familiars.get(&cl.claimant)?.get(k).cloned());
+fn claim_json(v: &ReadView, cl: &crate::poc::Claim) -> Value {
+    let p = &v.state.params.poc;
+    let familiar = cl.familiar_key.as_ref().and_then(|k| v.state.familiars.get(&cl.claimant)?.get(k).cloned());
     json!({
         "id": cl.id,
-        "claimant": label(c, &cl.claimant),
+        "claimant": label(v, &cl.claimant),
         "handle": cl.handle,
         "repo": cl.repo,
         "pr": cl.pr,
@@ -978,10 +1138,10 @@ fn claim_json(c: &Chain, cl: &crate::poc::Claim) -> Value {
         "bond_display": fmt_fang(cl.bond),
         "status": cl.status,
         "submitted_at": cl.submitted_at,
-        "attestations": cl.attestations.iter().map(|(v, a)| json!({ "validator": label(c, v), "ok": a.ok, "merge_sha": a.merge_sha, "note": a.note, "at": a.at })).collect::<Vec<_>>(),
+        "attestations": cl.attestations.iter().map(|(a, at)| json!({ "validator": label(v, a), "ok": at.ok, "merge_sha": at.merge_sha, "note": at.note, "at": at.at })).collect::<Vec<_>>(),
         "merge_sha": cl.merge_sha,
         "verified_at": cl.verified_at,
-        "eligible_at": cl.verified_at.map(|v| v + p.claim_maturity_blocks),
+        "eligible_at": cl.verified_at.map(|x| x + p.claim_maturity_blocks),
         "expires_at": (cl.status == crate::poc::ClaimStatus::Pending).then(|| cl.submitted_at + p.claim_ttl_blocks),
         "seance": cl.seance,
         "score_ppm": cl.score_ppm,
@@ -994,15 +1154,15 @@ fn claim_json(c: &Chain, cl: &crate::poc::Claim) -> Value {
     })
 }
 
-fn seance_json(c: &Chain, s: &crate::poc::Seance, full: bool) -> Value {
-    let h = c.height();
+fn seance_json(v: &ReadView, s: &crate::poc::Seance, full: bool) -> Value {
+    let h = v.height;
     let phase = if s.closed { "closed" } else if h <= s.commit_until { "sealing" } else { "revealing" };
     let jurors: Vec<Value> = s
         .jurors
         .iter()
         .map(|(j, seat)| {
-            let mut v = json!({
-                "juror": label(c, j),
+            let mut out = json!({
+                "juror": label(v, j),
                 "pairs": seat.pairs.len(),
                 "committed": seat.commitment.is_some(),
                 "revealed": seat.votes.is_some(),
@@ -1012,12 +1172,12 @@ fn seance_json(c: &Chain, s: &crate::poc::Seance, full: bool) -> Value {
                 "soul_delta_display": format!("{}{}", if seat.soul_delta < 0 { "−" } else if seat.soul_delta > 0 { "+" } else { "" }, crate::poc::fmt_soul(seat.soul_delta.unsigned_abs())),
             });
             if full {
-                v["assigned_pairs"] = json!(seat.pairs);
-                v["commitment"] = json!(seat.commitment);
-                v["votes"] = json!(seat.votes);
-                v["spam"] = json!(seat.spam);
+                out["assigned_pairs"] = json!(seat.pairs);
+                out["commitment"] = json!(seat.commitment);
+                out["votes"] = json!(seat.votes);
+                out["spam"] = json!(seat.spam);
             }
-            v
+            out
         })
         .collect();
     json!({
@@ -1029,7 +1189,7 @@ fn seance_json(c: &Chain, s: &crate::poc::Seance, full: bool) -> Value {
         "seed": s.seed,
         "budget": s.budget.to_string(),
         "budget_display": fmt_fang(s.budget),
-        "claims": s.claims.iter().filter_map(|id| c.state.poc.claims.get(id)).map(|cl| claim_json(c, cl)).collect::<Vec<_>>(),
+        "claims": s.claims.iter().filter_map(|id| v.state.poc.claims.get(id)).map(|cl| claim_json(v, cl)).collect::<Vec<_>>(),
         "jurors": jurors,
         "results": s.results,
         "results_display": s.results.as_ref().map(|r| json!({ "paid": fmt_fang(r.paid), "returned": fmt_fang(r.returned) })),
@@ -1037,20 +1197,20 @@ fn seance_json(c: &Chain, s: &crate::poc::Seance, full: bool) -> Value {
 }
 
 /// Soul, vouches, jury seat, claims and vesting rewards for an account (`/api/account`).
-fn contribution_profile(c: &Chain, addr: &str) -> Value {
-    let h = c.height();
-    let p = &c.state.poc;
-    let (total, withdrawable, unvested) = c.state.grant_totals(addr, h);
+fn contribution_profile(v: &ReadView, addr: &str) -> Value {
+    let (st, h) = (&v.state, v.height);
+    let p = &st.poc;
+    let (total, withdrawable, unvested) = st.grant_totals(addr, h);
     json!({
-        "soul": soul_json(c, addr),
-        "sybil": p.sybils.get(addr).map(|s| json!({ "at": s.at, "by": label(c, &s.by), "reason": s.reason })),
-        "vouched_by": p.vouches.get(addr).map(|v| json!({ "voucher": label(c, &v.voucher), "at": v.at, "bond_display": fmt_fang(v.bond) })),
-        "vouching_for": p.vouches.iter().filter(|(_, v)| v.voucher == addr).map(|(to, v)| json!({ "account": label(c, to), "at": v.at, "unlocks_at": v.at + c.state.params.poc.vouch_lock_blocks })).collect::<Vec<_>>(),
+        "soul": soul_json(v, addr),
+        "sybil": p.sybils.get(addr).map(|s| json!({ "at": s.at, "by": label(v, &s.by), "reason": s.reason })),
+        "vouched_by": p.vouches.get(addr).map(|x| json!({ "voucher": label(v, &x.voucher), "at": x.at, "bond_display": fmt_fang(x.bond) })),
+        "vouching_for": v.vouching_for(addr, ACCOUNT_LIST_LIMIT).into_iter().filter_map(|to| p.vouches.get(&to).map(|x| json!({ "account": label(v, &to), "at": x.at, "unlocks_at": x.at + st.params.poc.vouch_lock_blocks }))).collect::<Vec<_>>(),
         "juror": p.jurors.get(addr).map(|r| json!({ "bond_display": fmt_fang(r.bond), "active": r.active, "served": r.served, "joined_at": r.joined_at })),
-        "claims": p.claims.values().filter(|cl| cl.claimant == addr).rev().take(50).map(|cl| claim_json(c, cl)).collect::<Vec<_>>(),
-        "next_claim_bond": c.state.claim_bond(addr).to_string(),
-        "next_claim_bond_display": fmt_fang(c.state.claim_bond(addr)),
-        "max_open_claims": c.state.max_open_claims(addr, h),
+        "claims": v.ids(ix::CLAIMANT, addr, true, 50).into_iter().filter_map(|id| p.claims.get(&id)).map(|cl| claim_json(v, cl)).collect::<Vec<_>>(),
+        "next_claim_bond": st.claim_bond(addr).to_string(),
+        "next_claim_bond_display": fmt_fang(st.claim_bond(addr)),
+        "max_open_claims": st.max_open_claims(addr, h),
         "rewards": {
             "total_display": fmt_fang(total),
             "withdrawable": withdrawable.to_string(),
@@ -1063,24 +1223,22 @@ fn contribution_profile(c: &Chain, addr: &str) -> Value {
 
 /// The contribution pool at a glance: balance, repos, rules, the open Séance, recent ones.
 async fn contributions(State(n): State<Node>) -> ApiResult {
-    let c = n.chain.lock();
-    let p = &c.state.poc;
-    let t = &c.state.params.poc;
-    let pool = c.state.account(&c.state.pool()).balance;
-    let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
-    for cl in p.claims.values() {
-        *counts.entry(serde_json::to_value(cl.status).unwrap().as_str().unwrap_or_default().to_string()).or_default() += 1;
-    }
+    let v = n.live.view();
+    let st = &v.state;
+    let p = &st.poc;
+    let t = &st.params.poc;
+    let pool = st.account(&st.pool()).balance;
+    let claims = v.claims();
     use crate::poc::*;
     Ok(Json(json!({
         "active": p.is_active(),
-        "pool": { "account": label(&c, &c.state.pool()), "balance": pool.to_string(), "balance_display": fmt_fang(pool), "next_budget_display": fmt_fang((pool as u128 * SEANCE_POOL_BPS as u128 / 10_000) as u64) },
+        "pool": { "account": label(&v, &st.pool()), "balance": pool.to_string(), "balance_display": fmt_fang(pool), "next_budget_display": fmt_fang((pool as u128 * SEANCE_POOL_BPS as u128 / 10_000) as u64) },
         "repos": p.repos.iter().map(|(r, w)| json!({ "repo": r, "weight": w })).collect::<Vec<_>>(),
-        "open_seance": p.open_seance.and_then(|id| p.seances.get(&id)).map(|s| seance_json(&c, s, false)),
+        "open_seance": p.open_seance.and_then(|id| p.seances.get(&id)).map(|s| seance_json(&v, s, false)),
         "next_seance_at": p.next_seance_at,
         "recent_seances": p.seances.values().rev().filter(|s| s.closed).take(10).map(|s| json!({ "id": s.id, "opened_at": s.opened_at, "closed_at": s.reveal_until, "claims": s.claims.len(), "jurors": s.jurors.len(), "budget_display": fmt_fang(s.budget), "results": s.results })).collect::<Vec<_>>(),
-        "claims": counts,
-        "jurors": { "pool": p.jurors.len(), "active": p.jurors.values().filter(|r| r.active).count() },
+        "claims": claims.counts,
+        "jurors": { "pool": claims.jurors, "active": claims.active_jurors },
         "rules": {
             "seance_blocks": t.seance_blocks, "commit_blocks": t.commit_blocks(), "reveal_blocks": t.reveal_blocks(),
             "claim_maturity_blocks": t.claim_maturity_blocks, "claim_ttl_blocks": t.claim_ttl_blocks, "vesting_blocks": t.vesting_blocks,
@@ -1101,34 +1259,34 @@ struct ClaimQuery {
 }
 
 /// Claims, newest first. `?status=pending|verified|in_seance|scored|spam|rejected&account=`.
+/// By account from the claimant index; by status from the per-block memo.
 async fn claims(State(n): State<Node>, Query(q): Query<ClaimQuery>) -> ApiResult {
-    let c = n.chain.lock();
-    let who = q.account.as_deref().map(|a| c.state.resolve(a)).transpose()?;
-    let list: Vec<Value> = c
-        .state
-        .poc
-        .claims
-        .values()
-        .rev()
-        .filter(|cl| who.as_ref().is_none_or(|w| &cl.claimant == w))
-        .filter(|cl| q.status.as_deref().is_none_or(|s| serde_json::to_value(cl.status).unwrap() == s))
-        .take(q.limit.unwrap_or(100).min(500))
-        .map(|cl| claim_json(&c, cl))
-        .collect();
-    Ok(Json(json!({ "count": c.state.poc.claims.len(), "claims": list })))
+    let v = n.live.view();
+    let st = &v.state;
+    let limit = q.limit.unwrap_or(100).min(500);
+    let all = &st.poc.claims;
+    let status_ok = |cl: &crate::poc::Claim| q.status.as_deref().is_none_or(|s| serde_json::to_value(cl.status).unwrap() == s);
+    let list: Vec<Value> = match q.account.as_deref().map(|a| st.resolve(a)).transpose()? {
+        Some(who) => v.ids(ix::CLAIMANT, &who, true, usize::MAX).into_iter().filter_map(|id| all.get(&id)).filter(|cl| status_ok(cl)).take(limit).map(|cl| claim_json(&v, cl)).collect(),
+        None => match q.status.as_deref() {
+            Some(s) => v.claims().by_status.get(s).map(Vec::as_slice).unwrap_or(&[]).iter().take(limit).filter_map(|id| all.get(id)).map(|cl| claim_json(&v, cl)).collect(),
+            None => all.values().rev().take(limit).map(|cl| claim_json(&v, cl)).collect(),
+        },
+    };
+    Ok(Json(json!({ "count": all.len(), "claims": list })))
 }
 
 async fn claim(State(n): State<Node>, Path(id): Path<u64>) -> ApiResult {
-    let c = n.chain.lock();
-    let cl = c.state.poc.claims.get(&id).ok_or_else(|| not_found("claim"))?;
-    Ok(Json(claim_json(&c, cl)))
+    let v = n.live.view();
+    let cl = v.state.poc.claims.get(&id).ok_or_else(|| not_found("claim"))?;
+    Ok(Json(claim_json(&v, cl)))
 }
 
 /// A Séance with every juror's assigned pairs (what they must judge), commitments and reveals.
 async fn seance(State(n): State<Node>, Path(id): Path<u64>) -> ApiResult {
-    let c = n.chain.lock();
-    let s = c.state.poc.seances.get(&id).ok_or_else(|| not_found("Séance"))?;
-    Ok(Json(seance_json(&c, s, true)))
+    let v = n.live.view();
+    let s = v.state.poc.seances.get(&id).ok_or_else(|| not_found("Séance"))?;
+    Ok(Json(seance_json(&v, s, true)))
 }
 
 #[derive(Deserialize)]
@@ -1136,16 +1294,15 @@ struct LimitQuery {
     limit: Option<usize>,
 }
 
-/// Soul leaderboard (effective Soul, after decay).
+/// Soul leaderboard (effective Soul, after decay), ranked once per block.
 async fn souls(State(n): State<Node>, Query(q): Query<LimitQuery>) -> ApiResult {
-    let c = n.chain.lock();
-    let h = c.height();
-    let mut list: Vec<(u64, &String)> = c.state.poc.souls.keys().map(|a| (c.state.soul_of(a, h), a)).filter(|(s, _)| *s > 0).collect();
-    list.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
-    let rows: Vec<Value> = list
-        .into_iter()
+    let v = n.live.view();
+    let st = &v.state;
+    let rows: Vec<Value> = v
+        .souls()
+        .iter()
         .take(q.limit.unwrap_or(50).min(500))
-        .map(|(_, a)| json!({ "account": label(&c, a), "soul": soul_json(&c, a), "github": c.state.github_by_account.get(a), "juror": c.state.poc.jurors.get(a).is_some_and(|r| r.active), "vouched_by": c.state.poc.vouches.get(a).map(|v| label(&c, &v.voucher)) }))
+        .map(|(_, a)| json!({ "account": label(&v, a), "soul": soul_json(&v, a), "github": st.github_by_account.get(a), "juror": st.poc.jurors.get(a).is_some_and(|r| r.active), "vouched_by": st.poc.vouches.get(a).map(|x| label(&v, &x.voucher)) }))
         .collect();
     Ok(Json(json!({ "souls": rows })))
 }

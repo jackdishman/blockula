@@ -13,7 +13,6 @@
 
 use crate::chain::{Base, Genesis, HuntStatus, Role, State};
 use crate::epochs::EpochRegistry;
-use crate::state::tree::Hash;
 use crate::store::{hash32, ix, BlockMeta, SegReader, Snap, Store};
 use crate::types::{Block, Tx, NAME_SUFFIX};
 use arc_swap::ArcSwap;
@@ -187,6 +186,8 @@ pub struct ReadView {
     pub base: Option<Base>,
     /// Heights below this were pruned from this node.
     pub pruned_below: u64,
+    /// Blocks this node keeps (`None`: an archive node).
+    pub keep_blocks: Option<u64>,
     pub head: Option<Arc<Block>>,
     pub snap: Arc<Snap>,
     pub disk: Arc<Disk>,
@@ -231,8 +232,8 @@ fn status_name(s: crate::poc::ClaimStatus) -> String {
 
 impl ReadView {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(state: State, height: u64, last_hash: String, genesis: Arc<Genesis>, genesis_hash: String, genesis_root: String, role: Role, me: Option<String>, base: Option<Base>, pruned_below: u64, head: Option<Arc<Block>>, snap: Arc<Snap>, disk: Arc<Disk>) -> Self {
-        Self { state, height, last_hash, genesis, genesis_hash, genesis_root, role, me, base, pruned_below, head, snap, disk, memo: Memo::default() }
+    pub fn new(state: State, height: u64, last_hash: String, genesis: Arc<Genesis>, genesis_hash: String, genesis_root: String, role: Role, me: Option<String>, base: Option<Base>, pruned_below: u64, keep_blocks: Option<u64>, head: Option<Arc<Block>>, snap: Arc<Snap>, disk: Arc<Disk>) -> Self {
+        Self { state, height, last_hash, genesis, genesis_hash, genesis_root, role, me, base, pruned_below, keep_blocks, head, snap, disk, memo: Memo::default() }
     }
 
     pub fn height(&self) -> u64 {
@@ -254,7 +255,17 @@ impl ReadView {
     }
 
     pub fn block_meta(&self, height: u64) -> Option<BlockMeta> {
+        if height < self.history_from() || height > self.height {
+            return None;
+        }
         self.snap.block_meta(height).ok()?
+    }
+
+    /// Headers of the newest blocks below `before`, newest first (from the index: no block is
+    /// read from the log).
+    pub fn headers(&self, before: u64, limit: usize) -> Vec<(u64, BlockMeta)> {
+        let top = before.saturating_sub(1).min(self.height);
+        (self.history_from()..=top).rev().take(limit).filter_map(|h| Some((h, self.block_meta(h)?))).collect()
     }
 
     /// Executed block at `height`.
@@ -322,6 +333,11 @@ impl ReadView {
             return Some(hex::encode(m.hash));
         }
         self.snap.epoch_head(height).ok()?.map(|(h, _)| hex::encode(h))
+    }
+
+    /// The latest executed block's timestamp.
+    pub fn head_time_ms(&self) -> Option<u64> {
+        self.head.as_ref().map(|b| b.timestamp_ms)
     }
 
     /// Exact consensus block bytes at `height`, if held.
@@ -490,9 +506,4 @@ impl Live {
     pub fn syncing(&self, height: u64) -> bool {
         height + crate::chain::SYNC_SLACK < self.network_height_claimed(height)
     }
-}
-
-/// `hash32` for block hashes held as hex (the view's and the chain's).
-pub fn block_hash(hex_hash: &str) -> Option<Hash> {
-    hash32(hex_hash).ok()
 }

@@ -1005,9 +1005,9 @@ impl State {
     }
 
     /// Plain-English summary of a contribution tx (see `State::describe`).
-    pub fn describe_poc(&self, tx: &Tx, from: &str) -> String {
+    pub fn describe_poc(&self, tx: &Tx, from: &str, primary_name: &dyn Fn(&str) -> Option<String>) -> String {
         let who = |a: &str| match self.resolve(a) {
-            Ok(addr) => self.primary_name(&addr).unwrap_or_else(|| short(&addr)),
+            Ok(addr) => primary_name(&addr).unwrap_or_else(|| short(&addr)),
             Err(_) => a.to_string(),
         };
         let claim = |id: &u64| self.poc.claims.get(id).map(|c| format!("claim #{id} ({}#{})", c.repo, c.pr)).unwrap_or_else(|| format!("claim #{id}"));

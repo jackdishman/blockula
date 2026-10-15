@@ -450,7 +450,7 @@ where
             None => return futures::future::pending().await,
         }
         let c = self.chain.lock();
-        if ids.iter().any(|id| c.tx_index.contains_key(id)) {
+        if ids.iter().any(|id| c.has_tx(id)) {
             return reject("replays an already-finalized tx");
         }
         true
@@ -532,8 +532,7 @@ impl Reporter for Executor {
         use commonware_utils::Acknowledgement as _;
         match activity {
             Update::Tip(_, height, _) => {
-                let mut c = self.chain.lock();
-                c.finalized_tip = c.finalized_tip.max(height.get());
+                self.chain.lock().set_finalized_tip(height.get());
             }
             Update::Block(block, ack) => {
                 let mut c = self.chain.lock();
@@ -906,8 +905,9 @@ fn hint_behind(marshal: &MarshalMailbox, chain: &Shared, ours: u64, theirs: u64,
 /// Finalized blocks/certificates marshal keeps; older ones are pruned (our own `cblocks.bin` and
 /// checkpoint certificates keep serving history over HTTP).
 pub const MARSHAL_RETAIN: u64 = 2_000;
-/// Bumped when the on-disk consensus storage layout changes.
-pub const STORAGE_VERSION: &str = "prunable-v3";
+/// Bumped when the on-disk storage layout changes (consensus journals, or the home's own files:
+/// v4 is the segmented block logs and the state database, see `store.rs`).
+pub const STORAGE_VERSION: &str = "prunable-v4";
 
 fn archive_config<C>(prefix: &str, name: &str, page_cache: CacheRef, codec_config: C) -> prunable::Config<TwoCap, C> {
     prunable::Config {
