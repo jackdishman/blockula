@@ -252,6 +252,13 @@ fn duties_commit_reveal_and_survive_a_restart() {
     // A crash between writing a secret and sending its commitment: the same secret is committed.
     t.advance_to(9);
     let s3 = secrets.get_or_create(3).unwrap();
+    // The reveal waits for the second half of the epoch (block 15 of 10–19).
+    while t.c.height() < 14 {
+        step(&mut t, &mut secrets);
+    }
+    assert_eq!(t.c.state.beacon.rounds[&2][&me].revealed_at, None);
+    step(&mut t, &mut secrets);
+    assert_eq!(t.c.state.beacon.rounds[&2][&me].revealed_at, Some(15));
     while t.c.height() < 19 {
         step(&mut t, &mut secrets);
     }
@@ -260,18 +267,19 @@ fn duties_commit_reveal_and_survive_a_restart() {
     assert!(secrets.get(2).is_some(), "kept through the epoch it's revealed in");
     step(&mut t, &mut secrets);
     assert_eq!((secrets.get(2), secrets.get(3).is_some(), secrets.get(4).is_some()), (None, true, true), "then pruned");
-    // Losing the secrets file before a reveal: the node says so (and still commits for the next
-    // round with a fresh file), misses the reveal, and is jailed for it.
+    // Losing the secrets file before a reveal: the node says so once the reveal is due, misses
+    // it and is jailed for it, and keeps going with a fresh file.
     std::fs::remove_file(&path).unwrap();
     let mut secrets = Secrets::open(&home).unwrap();
-    t.advance_to(29);
+    assert!(duties(&mut t.c, &mut secrets).unwrap().is_empty(), "nothing due before the middle of the epoch");
+    t.advance_to(24);
     let err = duties(&mut t.c, &mut secrets).unwrap_err().to_string();
     assert!(err.contains("can't reveal"), "{err}");
+    t.advance_to(29);
+    assert_eq!(t.c.state.beacon.values[&3], Value { value: derive(&value(&t.c.state, 2).unwrap(), 3, &[]), reveals: 0, missed: vec![me.clone()] });
+    assert_eq!(duties(&mut t.c, &mut secrets).unwrap(), vec!["committed to the beacon for epoch 5".to_string()]);
     t.c.produce_block().unwrap();
     assert_eq!(t.c.state.beacon.rounds[&5][&me].commitment, commitment(&t.c.genesis.chain_id, 5, &me, &secrets.get(5).unwrap()));
-    t.advance_to(39);
-    assert_eq!(t.c.state.beacon.values[&3].reveals, 1);
-    assert_eq!(t.c.state.beacon.values[&4], Value { value: derive(&value(&t.c.state, 3).unwrap(), 4, &[]), reveals: 0, missed: vec![me.clone()] });
     t.done();
 }
 

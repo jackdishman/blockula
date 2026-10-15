@@ -445,21 +445,26 @@ impl Secrets {
 }
 
 /// One round of a validator's beacon duties against its chain (node.rs runs it every block):
-/// reveal the secret committed to for the next epoch, then, while active, commit to a fresh one
-/// for the epoch after. Each tx is submitted once (on-chain records and the mempool are checked
-/// first). Returns what it did; a reveal it can't make (its secret is gone) is an error.
+/// while active, commit to a fresh secret for the epoch after next; in the second half of the
+/// epoch, reveal the secret committed to for the next one (the next epoch's value, and so its
+/// leader order, stays unknown until the last reveal, and half an epoch is plenty to land one).
+/// Each tx is submitted once (on-chain records and the mempool are checked first). Returns what
+/// it did; a reveal it can't make (its secret is gone) is an error.
 pub fn duties(chain: &mut Chain, secrets: &mut Secrets) -> Result<Vec<String>> {
     let Some(keys) = chain.keys.as_ref() else { return Ok(vec![]) };
     let me = keys.address_with(chain.state.params.prefix());
     let signer = key_id(&keys.public_key());
     let chain_id = chain.genesis.chain_id.clone();
     // Our txs land in the next block at the earliest.
-    let epoch = chain.state.params.epoch_of(chain.height() + 1);
+    let next = chain.height() + 1;
+    let epoch = chain.state.params.epoch_of(next);
+    let epoch_blocks = chain.state.params.epoch_blocks.max(2);
     let queued = |chain: &Chain, f: &dyn Fn(&Action) -> bool| chain.mempool.iter().any(|t| t.from == me && f(&t.action));
     let mut notes = vec![];
     let mut error = None;
     let reveal = epoch + 1;
-    if let Some(e) = chain.state.beacon.rounds.get(&reveal).and_then(|r| r.get(&me)).filter(|e| e.secret.is_none()) {
+    let due = next % epoch_blocks >= epoch_blocks / 2;
+    if let Some(e) = chain.state.beacon.rounds.get(&reveal).and_then(|r| r.get(&me)).filter(|e| due && e.secret.is_none()) {
         let commitment_ = e.commitment;
         if !queued(chain, &|a| matches!(a, Action::BeaconReveal { epoch, .. } if *epoch == reveal)) {
             match secrets.get(reveal) {
