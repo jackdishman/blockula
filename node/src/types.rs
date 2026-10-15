@@ -2088,9 +2088,31 @@ pub(crate) mod tests {
         ]
     }
 
+    /// Ghost Mode (tags 50–54): one action per tag, around a fixed bundle (bytes chosen to be
+    /// canonical digests). Mirrored by `ghostVectorActions` in sdk-ts/test/e2e.ts.
+    pub(crate) fn ghost_vector_actions() -> Vec<Action> {
+        vec![
+            Action::Shield { amount: 5 * DROPS_PER_FANG, bundle: vector_bundle(11) },
+            Action::PrivateTransfer { bundle: vector_bundle(12) },
+            Action::Unshield { to: "x.boo".into(), amount: 7, bundle: vector_bundle(13) },
+            Action::SetGhostAddress { address: HexBytes(vec![14; GHOST_ADDRESS_BYTES]) },
+            Action::GhostPause {},
+        ]
+    }
+
+    /// A bundle whose fields are `[1; 32]`, `[2; 32]` … in wire order and whose 300-byte proof is
+    /// `[proof; 300]`.
+    pub(crate) fn vector_bundle(proof: u8) -> Box<GhostBundle> {
+        let b = |n: u8, len: usize| HexBytes(vec![n; len]);
+        let d = GHOST_DIGEST_BYTES;
+        Box::new(GhostBundle { instance: b(1, d), anchor: b(2, d), nullifiers: [b(3, d), b(4, d)], commitments: [b(5, d), b(6, d)], enc: [b(7, GHOST_ENC_BYTES), b(8, GHOST_ENC_BYTES)], out: [b(9, GHOST_OUT_BYTES), b(10, GHOST_OUT_BYTES)], proof: b(proof, 300) })
+    }
+
     /// The vector tx around an action: fixed fields, and recognizable key and signature bytes.
+    /// Unsigned ghost actions get the unsigned form's empty fields.
     fn vector_tx(action: Action) -> Tx {
-        Tx { chain_id: "vec".into(), from: "boo1from".into(), nonce: 7, fee: 12345, tip: 3, valid_until: 99, action, memo: "m".into(), public_key: "01".repeat(crypto::PUBLIC_KEY_LEN), signature: "02".repeat(crypto::SIGNATURE_LEN) }
+        let tx = Tx { chain_id: "vec".into(), from: "boo1from".into(), nonce: 7, fee: 12345, tip: 3, valid_until: 99, action, memo: "m".into(), public_key: "01".repeat(crypto::PUBLIC_KEY_LEN), signature: "02".repeat(crypto::SIGNATURE_LEN) };
+        if tx.is_unsigned() { Tx { from: String::new(), nonce: 0, memo: String::new(), public_key: String::new(), signature: String::new(), ..tx } } else { tx }
     }
 
     /// The same vectors are computed by sdk-ts (test/e2e.ts): the encodings must match byte for byte.
@@ -2135,13 +2157,116 @@ pub(crate) mod tests {
         }
         let t: Tx = serde_json::from_value(serde_json::json!({ "chain_id": "c", "from": "boo1from", "nonce": 1, "fee": "100", "tip": "2", "valid_until": 9, "action": { "type": "transfer", "to": "x.boo", "amount": "5" }, "memo": "", "public_key": "", "signature": "" })).unwrap();
         assert_eq!((t.fee, t.tip, t.valid_until), (100, 2, 9));
+        // Ghost Mode (tags 50–54): signing bytes (the unsigned wire form for 51 and 52) and the
+        // sighashes of 50–52, hashed on their own.
+        let mut h = blake3::Hasher::new();
+        for action in ghost_vector_actions() {
+            let tx = vector_tx(action);
+            h.update(&tx.signing_bytes());
+            if let Some(sighash) = tx.ghost_sighash() {
+                h.update(&sighash);
+            }
+        }
+        assert_eq!(h.finalize().to_hex().to_string(), "7fc29e9c7f5a11f78428950f6d83faf43392f826e39eab887ed68cb6b8f4d164");
+        let pt = vector_tx(ghost_vector_actions().remove(1));
+        assert_eq!(hex::encode(pt.ghost_sighash().unwrap()), "dc27774805347ef4af44bffea4b746f5e63b5acf82ca161dd436efe2ecb8e1dd");
+        assert_eq!(pt.id(), hex::encode(crypto::hash(&pt.to_bytes())), "an unsigned tx's id is the hash of its wire form");
+        let json = serde_json::to_value(&pt.action).unwrap();
+        assert_eq!((json["type"].as_str(), json["bundle"]["anchor"].as_str()), (Some("private_transfer"), Some("02".repeat(32).as_str())));
+        assert_eq!(serde_json::from_value::<Action>(json).unwrap(), pt.action);
+        for a in ghost_vector_actions() {
+            let json = serde_json::to_value(&a).unwrap();
+            assert_eq!(json["type"], a.kind());
+            assert_eq!(serde_json::from_value::<Action>(json).unwrap(), a);
+        }
+    }
+
+    /// Unsigned ghost txs (51, 52) travel in their own wire form; nothing else does, and they
+    /// travel in no other. Ghost actions don't nest in multisig proposals; bundles and addresses
+    /// are checked for size and canonical digests.
+    #[test]
+    fn ghost_wire_forms_and_bounds() {
+        let pt = vector_tx(ghost_vector_actions().remove(1));
+        let wire = pt.to_bytes();
+        assert!(wire.starts_with(GHOST_TX_DOMAIN));
+        assert_eq!((Tx::from_bytes(&wire).unwrap(), wire.len() as u64), (pt.clone(), pt.size()));
+        pt.check_format().unwrap();
+        assert!(pt.verify_signature().unwrap_err().to_string().contains("no signature"));
+        assert!(pt.signer_key_id().is_err() && pt.sender().is_err());
+        let err = |b: &[u8]| Tx::from_bytes(b).unwrap_err().to_string();
+        // Fields an unsigned tx can't have.
+        for bad in [Tx { from: "boo1from".into(), ..pt.clone() }, Tx { nonce: 1, ..pt.clone() }, Tx { memo: "m".into(), ..pt.clone() }, Tx { signature: "02".into(), ..pt.clone() }] {
+            assert!(bad.check_format().unwrap_err().to_string().contains("unsigned"));
+        }
+        // An unsigned action in the signed form, and a signed one in the unsigned form.
+        let mut signed_form = TX_DOMAIN.to_vec();
+        put_str(&mut signed_form, "vec");
+        put_str(&mut signed_form, "boo1from");
+        for v in [7, 12345, 3, 99] {
+            put_u64(&mut signed_form, v);
+        }
+        pt.action.encode(&mut signed_form);
+        put_str(&mut signed_form, "");
+        signed_form.extend_from_slice(&[1; crypto::PUBLIC_KEY_LEN]);
+        signed_form.extend_from_slice(&[2; crypto::SIGNATURE_LEN]);
+        assert!(err(&signed_form).contains("BLOCKULA_GHOST_V1 form"));
+        let mut unsigned_form = GHOST_TX_DOMAIN.to_vec();
+        put_str(&mut unsigned_form, "vec");
+        for v in [12345, 3, 99] {
+            put_u64(&mut unsigned_form, v);
+        }
+        unsigned_form.push(54);
+        assert!(err(&unsigned_form).contains("only private transfers and unshields"));
+        let mut trailing = wire.clone();
+        trailing.push(0);
+        assert!(err(&trailing).contains("trailing"));
+        // Ghost txs are bounded by MAX_GHOST_TX_BYTES, everything else by MAX_TX_BYTES.
+        let shield = vector_tx(ghost_vector_actions().remove(0));
+        assert_eq!(shield.max_bytes(), MAX_GHOST_TX_BYTES);
+        assert_eq!(vector_tx(Action::GhostPause {}).max_bytes(), MAX_TX_BYTES);
+        let mut big = pt.clone();
+        if let Action::PrivateTransfer { bundle } = &mut big.action {
+            bundle.proof = HexBytes(vec![1; blockula_ghost::MAX_PROOF_BYTES]);
+        }
+        assert!(big.size() as usize > MAX_TX_BYTES);
+        assert_eq!(Tx::from_bytes(&big.to_bytes()).unwrap(), big);
+        // No ghost action in a multisig proposal, in either direction.
+        for a in ghost_vector_actions() {
+            let m = Action::MultisigPropose { action: Box::new(a) };
+            assert!(m.check_format(false).unwrap_err().to_string().contains("ghost action"));
+            assert!(Action::from_bytes(&m.to_bytes()).unwrap_err().to_string().contains("ghost action"));
+        }
+        // Bundles: canonical digests, distinct nullifiers, exact ciphertext sizes, a proof.
+        let bad = |edit: &dyn Fn(&mut GhostBundle)| {
+            let mut b = vector_bundle(1);
+            edit(&mut b);
+            Action::PrivateTransfer { bundle: b }.check_format(false).unwrap_err().to_string()
+        };
+        assert!(bad(&|b| b.anchor = HexBytes(vec![0xff; 32])).contains("canonical"));
+        assert!(bad(&|b| b.commitments[1] = HexBytes(vec![0; 31])).contains("canonical"));
+        assert!(bad(&|b| b.nullifiers[1] = b.nullifiers[0].clone()).contains("same nullifier"));
+        assert!(bad(&|b| b.enc[0].0.push(0)).contains("note ciphertext"));
+        assert!(bad(&|b| b.out[1].0.pop().map(drop).unwrap_or(())).contains("outgoing ciphertext"));
+        assert!(bad(&|b| b.proof = HexBytes::default()).contains("proof"));
+        assert!(bad(&|b| b.instance = HexBytes(vec![1; 33])).contains("instance"));
+        let amount = |a: Action| a.check_format(false).unwrap_err().to_string();
+        assert!(amount(Action::Shield { amount: 0, bundle: vector_bundle(1) }).contains("more than 0"));
+        assert!(amount(Action::Unshield { to: "carol.boo".into(), amount: 0, bundle: vector_bundle(1) }).contains("more than 0"));
+        assert!(amount(Action::Unshield { to: "x".into(), amount: 1, bundle: vector_bundle(1) }).contains("`to`"));
+        // Addresses: a real one passes; the vector's filler doesn't (no valid ML-KEM key).
+        let real = blockula_ghost::SpendingKey::from_seed([9; 32]).address().to_bytes().to_vec();
+        Action::SetGhostAddress { address: HexBytes(real) }.check_format(false).unwrap();
+        assert!(amount(ghost_vector_actions().remove(3)).contains("valid 1216-byte"));
+        // JSON: lowercase hex only.
+        assert!(serde_json::from_str::<HexBytes>("\"AB\"").is_err());
+        assert_eq!(serde_json::from_str::<HexBytes>("\"ab\"").unwrap(), HexBytes(vec![0xab]));
     }
 
     #[test]
     fn every_tag_round_trips_through_the_wire_form() {
         let mut tags = std::collections::BTreeSet::new();
         let mut kinds = std::collections::BTreeSet::new();
-        for action in vector_actions().into_iter().chain(v1_vector_actions()) {
+        for action in vector_actions().into_iter().chain(v1_vector_actions()).chain(ghost_vector_actions()) {
             let enc = action.to_bytes();
             tags.insert(enc[0]);
             if let Action::Propose { kind, .. } = &action {
@@ -2152,7 +2277,7 @@ pub(crate) mod tests {
             let tx = vector_tx(action);
             assert_eq!(Tx::from_bytes(&tx.to_bytes()).unwrap(), tx);
         }
-        assert_eq!(tags, (0..=49).collect(), "the vectors cover every action tag");
+        assert_eq!(tags, (0..=54).collect(), "the vectors cover every action tag");
         assert_eq!(kinds, (0..=13).collect(), "and every proposal kind");
     }
 
@@ -2267,8 +2392,8 @@ pub(crate) mod tests {
         let tag_at = TX_DOMAIN.len() + 2 + 3 + 2 + 8 + 4 * 8;
         assert_eq!(good[tag_at], 21);
         let mut unknown = good.clone();
-        unknown[tag_at] = 50;
-        assert!(err(&unknown).contains("unknown action tag 50"));
+        unknown[tag_at] = 55;
+        assert!(err(&unknown).contains("unknown action tag 55"));
         // A proposal kind past the last one.
         let text = vector_tx(Action::Propose { kind: ProposalKind::Text {}, deposit: 1, title: "t".into(), url: String::new() }).to_bytes();
         let mut bad_kind = text.clone();
@@ -2363,7 +2488,7 @@ pub(crate) mod tests {
         let opt = proptest::option::of(arb_str(6).prop_filter("Some is never empty", |s| !s.is_empty()));
         let ids = proptest::collection::vec(any::<u64>(), 0..4);
         let list = proptest::collection::vec(arb_str(6), 0..4);
-        (0u8..50, strs, nums, any::<bool>(), opt, ids, list, 0u8..14, any::<u8>()).prop_map(|(tag, [a, b, c, d], [w, x, y], ok, familiar_key, spam, list, kind, small)| match tag {
+        (0u8..55, strs, nums, any::<bool>(), opt, ids, list, 0u8..14, any::<u8>()).prop_map(|(tag, [a, b, c, d], [w, x, y], ok, familiar_key, spam, list, kind, small)| match tag {
             0 => Action::Transfer { to: a, amount: w },
             1 => Action::RegisterName { name: a },
             2 => Action::AddKey { key_id: a, label: b, role: if ok { KeyRole::Owner } else { KeyRole::Session { limit: w, period_blocks: x, expires_at: y } } },
@@ -2414,13 +2539,23 @@ pub(crate) mod tests {
             47 => Action::ReleaseName { name: a },
             48 => Action::ClaimDistribution { distribution_id: w, amount: x, proof: list },
             49 => Action::AttestRevert { claim_id: w, revert_sha: a },
+            50 => Action::Shield { amount: w, bundle: vector_bundle(small) },
+            51 => Action::PrivateTransfer { bundle: vector_bundle(small) },
+            52 => Action::Unshield { to: a, amount: w, bundle: vector_bundle(small) },
+            53 => Action::SetGhostAddress { address: HexBytes(vec![small; GHOST_ADDRESS_BYTES]) },
+            54 => Action::GhostPause {},
             _ => unreachable!(),
         })
     }
 
     fn arb_tx() -> impl Strategy<Value = Tx> {
         (arb_str(16), arb_str(16), proptest::array::uniform4(any::<u64>()), arb_action(), arb_str(64), arb_hex(crypto::PUBLIC_KEY_LEN), arb_hex(crypto::SIGNATURE_LEN)).prop_map(
-            |(chain_id, from, [nonce, fee, tip, valid_until], action, memo, public_key, signature)| Tx { chain_id, from, nonce, fee, tip, valid_until, action, memo, public_key, signature },
+            |(chain_id, from, [nonce, fee, tip, valid_until], action, memo, public_key, signature)| {
+                // The unsigned form carries no sender, nonce, memo, key or signature.
+                let unsigned = action.is_unsigned();
+                let (from, nonce, memo, public_key, signature) = if unsigned { (String::new(), 0, String::new(), String::new(), String::new()) } else { (from, nonce, memo, public_key, signature) };
+                Tx { chain_id, from, nonce, fee, tip, valid_until, action, memo, public_key, signature }
+            },
         )
     }
 

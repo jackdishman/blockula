@@ -3874,7 +3874,8 @@ mod scaffold {
     }
 
     /// A protocol v1 genesis: one validator owned by an operator, a vesting founder, the
-    /// community bucket, reserved names, a Soul ledger, parameter overrides and Ghost Mode on.
+    /// community bucket, reserved names, a Soul ledger, parameter overrides and Ghost Mode on
+    /// (except on mainnet, which starts with it off).
     fn genesis(chain_id: &str) -> Genesis {
         let (v, owner, founder) = (Keys::from_seed(VALIDATOR), keys(22), keys(23));
         let alloc = |address: String, amount: u64, vesting: Option<Vesting>, label: Option<&str>| Allocation { address, amount, vesting, label: label.map(String::from) };
@@ -3912,7 +3913,7 @@ mod scaffold {
             }],
             reserved_names: vec!["blockula".into(), "foundation".into()],
             soul_ledger: vec![SoulEntry { account: owner.address(), soul: 50 * SOUL, reason: "testnet contributor".into() }],
-            features: vec!["ghost".into()],
+            features: if chain_id == MAINNET_CHAIN_ID { vec![] } else { vec!["ghost".into()] },
         }
     }
 
@@ -4032,6 +4033,10 @@ mod scaffold {
         let mut main = serde_json::to_value(genesis(MAINNET_CHAIN_ID)).unwrap();
         main["operators"] = serde_json::json!([]);
         assert!(load(&main).unwrap_err().contains("needs an operator"));
+        // … and Ghost Mode off (DEC-2: governance switches it on after its audit).
+        let mut main = serde_json::to_value(genesis(MAINNET_CHAIN_ID)).unwrap();
+        main["features"] = serde_json::json!(["ghost"]);
+        assert!(load(&main).unwrap_err().contains("Ghost Mode off"));
         // Other chains may keep admins (dev and test).
         let mut test = good.clone();
         test["validator_admins"] = serde_json::json!([keys(22).address()]);

@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex, randomBytes } from "@noble/hashes/utils.js";
-import { ApiError, Client, POP_CONTEXT, Wallet, addressFromPublicKey, addressPrefix, formatFang, isAddress, minFee, parseFang, parseSoul, popMessage, seanceCommitment, signingBytes, txBytes, txCharge, txId, txSize, type Action, type ProposalKind, type Tx } from "../src/index.js";
+import { ApiError, Client, POP_CONTEXT, Wallet, addressFromPublicKey, addressPrefix, formatFang, ghostSighash, isAddress, minFee, parseFang, parseSoul, popMessage, seanceCommitment, signingBytes, txBytes, txCharge, txId, txSize, type Action, type GhostBundle, type ProposalKind, type Tx } from "../src/index.js";
 
 const client = new Client(process.env.BLOCKULA_RPC ?? "http://localhost:7070");
 
@@ -98,6 +98,28 @@ const v1Joined = new Uint8Array(v1.reduce((n, b) => n + b.length, 0));
 v1.reduce((at, b) => (v1Joined.set(b, at), at + b.length), 0);
 assert.equal(bytesToHex(blake3(v1Joined)), "fecaa54305728b6a9192b18fbbdc03d74f2199c8721a670b73b72970b2d7ba6c");
 assert.throws(() => signingBytes(vectorTx({ type: "multisig_propose", action: { type: "multisig_propose", action: { type: "unlock" } } })), /can't contain another/);
+// Ghost Mode (tags 50–54): signing bytes (the unsigned wire form for 51 and 52) and the sighashes of 50–52, hashed on their own:
+// `ghost_vector_actions` there.
+const fill = (n: number, len: number) => n.toString(16).padStart(2, "0").repeat(len);
+const vectorBundle = (proof: number): GhostBundle => ({ instance: fill(1, 32), anchor: fill(2, 32), nullifiers: [fill(3, 32), fill(4, 32)], commitments: [fill(5, 32), fill(6, 32)], enc: [fill(7, 1401), fill(8, 1401)], out: [fill(9, 80), fill(10, 80)], proof: fill(proof, 300) });
+const ghostVectorActions: Action[] = [
+  { type: "shield", amount: (5n * 1_000_000_000n).toString(), bundle: vectorBundle(11) },
+  { type: "private_transfer", bundle: vectorBundle(12) },
+  { type: "unshield", to: "x.boo", amount: "7", bundle: vectorBundle(13) },
+  { type: "set_ghost_address", address: fill(14, 1216) },
+  { type: "ghost_pause" },
+];
+const isGhostTransfer = (a: Action) => a.type === "shield" || a.type === "private_transfer" || a.type === "unshield";
+const ghostVectorTx = (action: Action): Tx =>
+  action.type === "private_transfer" || action.type === "unshield" ? { chain_id: "vec", from: "", nonce: 0, fee: "12345", tip: "3", valid_until: 99, action, memo: "", public_key: "", signature: "" } : vectorTx(action);
+const ghostParts = ghostVectorActions.flatMap((a) => (isGhostTransfer(a) ? [signingBytes(ghostVectorTx(a)), ghostSighash(ghostVectorTx(a))] : [signingBytes(ghostVectorTx(a))]));
+const ghostJoined = new Uint8Array(ghostParts.reduce((n, b) => n + b.length, 0));
+ghostParts.reduce((at, b) => (ghostJoined.set(b, at), at + b.length), 0);
+assert.equal(bytesToHex(blake3(ghostJoined)), "7fc29e9c7f5a11f78428950f6d83faf43392f826e39eab887ed68cb6b8f4d164");
+const pt = ghostVectorTx(ghostVectorActions[1]);
+assert.equal(bytesToHex(ghostSighash(pt)), "dc27774805347ef4af44bffea4b746f5e63b5acf82ca161dd436efe2ecb8e1dd");
+assert.equal(txId(pt), bytesToHex(blake3(txBytes(pt))));
+assert.equal(txSize(pt), txBytes(pt).length);
 const vt = vectorTx(vectorActions[0]);
 assert.equal(bytesToHex(blake3(txBytes(vt))), "f32398f98b16d95d4f68af7ee29524a274d5465476390d91b357633627712e39");
 assert.equal(txBytes(vt).length, txSize(vt));
