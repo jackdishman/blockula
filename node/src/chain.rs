@@ -1695,7 +1695,8 @@ impl Chain {
     /// Keeps a certificate that arrived after its block: in memory for recent heights, on disk at
     /// checkpoints and epoch ends.
     pub fn store_cert(&mut self, height: u64, cert: Vec<u8>) -> Result<()> {
-        if height % CERT_CHECKPOINT == 0 || self.state.params.is_boundary(height) {
+        let boundary = self.state.params.is_boundary(height);
+        if (height % CERT_CHECKPOINT == 0 && height >= self.point.pruned_below) || boundary {
             self.store.put_cert(height, &cert)?;
         }
         self.disk.remember_cert(height, cert);
@@ -1922,15 +1923,14 @@ impl Chain {
         self.live.publish_mempool(self.mp.clone());
     }
 
-    /// After executing an epoch's last block: remember the next epoch's set. Returns whether it
+    /// After executing an epoch's last block: remember the next epoch's set (saved every epoch,
+    /// so `epochs.json` keeps up with the state database without a replay). Returns whether it
     /// changed (then the outgoing validators sign a handoff).
     fn record_epoch(&mut self, boundary: u64) -> bool {
         let next = self.state.params.epoch_of(boundary) + 1;
         let keys: Vec<String> = self.state.active_set(next).map(|s| s.iter().map(|v| v.consensus_key.clone()).collect()).unwrap_or_default();
         let changed = self.epochs.record(next, keys);
-        if changed {
-            self.save_epochs();
-        }
+        self.save_epochs();
         changed
     }
 
@@ -2496,36 +2496,6 @@ mod tests {
         let c = Chain::open(&home).unwrap();
         assert_eq!(c.height(), 2);
         assert_eq!(c.state.primary_name(&alice.address()).unwrap(), "alice.boo");
-        fs::remove_dir_all(home).ok();
-    }
-
-    /// A crash mid-append leaves a torn last line; the node drops it and starts, instead of
-    /// needing manual repair. A corrupt line in the middle still refuses to start.
-    #[test]
-    fn torn_last_line_in_blocks_jsonl_is_dropped() {
-        let home = std::env::temp_dir().join(format!("blockula-torn-{}-{}", now_ms(), std::process::id()));
-        Chain::summon(&home, &SummonOpts::new("torn", 1)).unwrap();
-        let alice = Keys::from_seed([1u8; 32]);
-        let root = {
-            let mut c = Chain::open(&home).unwrap();
-            c.faucet(&alice.address(), 50 * DROPS_PER_FANG).unwrap();
-            c.produce_block().unwrap();
-            c.produce_block_with(vec![]).unwrap();
-            c.state.root()
-        };
-        let log = home.join("blocks.jsonl");
-        let good = fs::read(&log).unwrap();
-        let mut f = OpenOptions::new().append(true).open(&log).unwrap();
-        f.write_all(br#"{"height":3,"prev_hash":"ab"#).unwrap();
-        drop(f);
-        let c = Chain::open(&home).unwrap();
-        assert_eq!((c.height(), c.state.root()), (2, root));
-        assert_eq!(fs::read(&log).unwrap(), good, "the torn tail was truncated");
-        drop(c);
-        let mut bad = b"{not json}\n".to_vec();
-        bad.extend_from_slice(&good);
-        fs::write(&log, bad).unwrap();
-        assert!(Chain::open(&home).is_err());
         fs::remove_dir_all(home).ok();
     }
 
@@ -3191,5 +3161,273 @@ mod v1 {
         let order: Vec<String> = proposal_order(&c.mempool).iter().map(|t| t.id()).collect();
         assert_eq!(order, [&b, &d, &e, &a0, &a1].map(|t| t.id()));
         fs::remove_dir_all(home).ok();
+    }
+}
+
+/// Persistence (CV-1, CV-6): restarts read the state database instead of replaying history, a
+/// crash at any write point recovers on the next start without help, and pruning keeps a window.
+#[cfg(test)]
+mod persistence {
+    use super::*;
+    use std::time::Instant;
+
+    fn home(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("blockula-persist-{tag}-{}-{}", now_ms(), std::process::id()))
+    }
+
+    fn tx(c: &Chain, keys: &Keys, action: Action) -> Tx {
+        let from = keys.address();
+        let mut tx = Tx { chain_id: c.genesis.chain_id.clone(), nonce: c.next_nonce(&from), from, fee: 0, tip: 0, valid_until: c.height() + 50, action, memo: String::new(), public_key: hex::encode(keys.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+        tx.fee = min_fee(tx.size());
+        tx.sign(keys)
+    }
+
+    /// A chain with some history: faucet drips, a name, transfers, empty blocks.
+    fn active(tag: &str, blocks: u64) -> (PathBuf, Chain, Keys) {
+        let h = home(tag);
+        Chain::summon(&h, &SummonOpts::new(tag, 1)).unwrap();
+        let mut c = Chain::open(&h).unwrap();
+        let alice = Keys::from_seed([1; 32]);
+        c.faucet(&alice.address(), 100 * DROPS_PER_FANG).unwrap();
+        c.produce_block().unwrap();
+        c.submit(tx(&c, &alice, Action::RegisterName { name: "alice".into() })).unwrap();
+        c.produce_block().unwrap();
+        while c.height() < blocks {
+            let to = Keys::from_seed([(c.height() % 200) as u8 + 2; 32]).address();
+            c.submit(tx(&c, &alice, Action::Transfer { to, amount: DROPS_PER_FANG / 10 })).unwrap();
+            c.produce_block().unwrap();
+        }
+        (h, c, alice)
+    }
+
+    /// Entries in a log, from the start.
+    fn entries(log: &SegLog) -> Vec<store::Entry> {
+        log.reader().iter_from((0, 0)).collect::<Result<Vec<_>>>().unwrap()
+    }
+
+    #[test]
+    fn restart_reads_the_store_and_replays_nothing() {
+        let (h, c, alice) = active("restart", 40);
+        let (root, height, hash) = (c.state.root(), c.height(), c.last_hash().to_string());
+        let ids: Vec<String> = c.block(height).unwrap().txs.iter().map(Tx::id).collect();
+        drop(c);
+        let c = Chain::open(&h).unwrap();
+        assert_eq!(c.replayed, 0, "every block was committed; restart executes nothing");
+        assert_eq!((c.state.root(), c.height(), c.last_hash()), (root, height, hash.as_str()));
+        assert_eq!(c.state.full_root(), c.state.root_hash(), "records and tree agree");
+        // The indexes and history came back from the database, not from a replay.
+        assert_eq!(c.tx_location(&ids[0]), Some((height, 0)));
+        let v = c.view();
+        assert_eq!(v.history(&alice.address(), 100).len(), 40);
+        assert_eq!(v.primary_name(&alice.address()).as_deref(), Some("alice.boo"));
+        assert_eq!(v.block(1).unwrap().height, 1);
+        assert_eq!(c.last_block().unwrap().height, height);
+        assert_eq!(c.root_at(7), Some(c.block(7).unwrap().state_root));
+        drop((v, c));
+        fs::remove_dir_all(h).ok();
+    }
+
+    #[test]
+    fn crash_at_every_write_point_recovers_unaided() {
+        for point in [WritePoint::AfterCblock, WritePoint::AfterBlockLine, WritePoint::BeforeStoreCommit, WritePoint::AfterStoreCommit] {
+            let (h, mut c, alice) = active(&format!("crash-{point:?}"), 6);
+            let (height, before) = (c.height(), c.state.root());
+            let t = tx(&c, &alice, Action::Transfer { to: c.me().unwrap(), amount: 7 });
+            c.submit(t.clone()).unwrap();
+            c.fail_at = Some(point);
+            assert!(c.produce_block().is_err(), "{point:?}");
+            let after = c.state.root(); // memory ran ahead of the disk
+            c.fail_at = None;
+            assert!(c.produce_block().unwrap_err().to_string().contains("restart"), "a broken instance executes nothing more");
+            drop(c);
+            let mut c = Chain::open(&h).unwrap();
+            if point == WritePoint::AfterCblock {
+                // The block never reached the block log: it's gone, and so is its consensus block.
+                assert_eq!((c.height(), c.state.root(), c.replayed), (height, before, 0));
+                assert_eq!(entries(&c.cblocks).len() as u64, height, "the orphaned consensus block was cut off");
+                // Consensus delivers it again.
+                c.produce_block_with(vec![t.clone()]).unwrap();
+                assert_eq!(c.state.root(), after);
+            } else {
+                assert_eq!((c.height(), c.state.root()), (height + 1, after), "{point:?}");
+                assert_eq!(c.replayed, if point == WritePoint::AfterStoreCommit { 0 } else { 1 }, "{point:?}");
+            }
+            assert!(c.has_tx(&t.id()));
+            assert_eq!(c.cblock(height + 1), Some(vec![]));
+            assert_eq!(entries(&c.cblocks).len(), entries(&c.blocks).len());
+            // It carries on, and the next restart is clean.
+            c.produce_block_with(vec![]).unwrap();
+            let root = c.state.root();
+            drop(c);
+            let c = Chain::open(&h).unwrap();
+            assert_eq!((c.state.root(), c.replayed), (root, 0));
+            drop(c);
+            fs::remove_dir_all(h).ok();
+        }
+    }
+
+    /// A crash mid-append leaves a torn last entry; the node cuts it off and starts. A damaged
+    /// entry in the middle of the log only matters to a rebuild, which refuses.
+    #[test]
+    fn torn_tails_are_cut_and_damaged_history_refuses_a_rebuild() {
+        let (h, mut c, alice) = active("torn", 5);
+        let (height, root) = (c.height(), c.state.root());
+        c.submit(tx(&c, &alice, Action::Transfer { to: c.me().unwrap(), amount: 7 })).unwrap();
+        c.fail_at = Some(WritePoint::AfterBlockLine);
+        assert!(c.produce_block().is_err());
+        drop(c);
+        let seg = h.join("blocks").join(format!("{:012}.jsonl", 1));
+        let len = fs::metadata(&seg).unwrap().len();
+        OpenOptions::new().write(true).open(&seg).unwrap().set_len(len - 5).unwrap();
+        let c = Chain::open(&h).unwrap();
+        assert_eq!((c.height(), c.state.root(), c.replayed), (height, root.clone(), 0));
+        let logged = entries(&c.blocks);
+        assert_eq!(logged.len() as u64, height);
+        assert_eq!(fs::metadata(&seg).unwrap().len(), logged.last().unwrap().pos.end().1, "the torn tail is gone");
+        assert_eq!(entries(&c.cblocks).len() as u64, height);
+        drop(c);
+        // Damage block 2's line: a normal restart never reads it…
+        let mut bytes = fs::read(&seg).unwrap();
+        let at = logged[1].pos.off as usize + 10;
+        bytes[at] = b'#';
+        fs::write(&seg, &bytes).unwrap();
+        assert_eq!(Chain::open(&h).unwrap().state.root(), root);
+        // …but rebuilding the database from the log stops there.
+        fs::remove_file(h.join(store::DB_FILE)).unwrap();
+        let err = format!("{:#}", Chain::open(&h).err().unwrap());
+        assert!(err.contains("bad entry"), "{err}");
+        fs::remove_dir_all(h).ok();
+    }
+
+    #[test]
+    fn a_missing_or_damaged_database_is_rebuilt_from_the_logs() {
+        let (h, c, alice) = active("rebuild", 30);
+        let (root, height) = (c.state.root(), c.height());
+        let id = c.block(10).unwrap().txs[0].id();
+        drop(c);
+        fs::remove_file(h.join(store::DB_FILE)).unwrap();
+        let c = Chain::open(&h).unwrap();
+        assert_eq!((c.state.root(), c.height(), c.replayed), (root.clone(), height, height));
+        assert_eq!(c.tx_location(&id), Some((10, 0)));
+        assert_eq!(c.view().history(&alice.address(), 100).len() as u64, height);
+        drop(c);
+        // Garbage instead of a database: deleted and rebuilt the same way.
+        fs::write(h.join(store::DB_FILE), b"not a database").unwrap();
+        let c = Chain::open(&h).unwrap();
+        assert_eq!((c.state.root(), c.replayed), (root.clone(), height));
+        drop(c);
+        // A database left from another chain (another genesis) is rebuilt too.
+        let other = home("other");
+        Chain::summon(&other, &SummonOpts::new("other", 1)).unwrap();
+        drop(Chain::open(&other).unwrap());
+        fs::copy(other.join(store::DB_FILE), h.join(store::DB_FILE)).unwrap();
+        let c = Chain::open(&h).unwrap();
+        assert_eq!((c.state.root(), c.replayed), (root, height));
+        drop(c);
+        fs::remove_dir_all(other).ok();
+        fs::remove_dir_all(h).ok();
+    }
+
+    #[test]
+    fn half_written_snapshots_and_temp_files_are_cleaned_up() {
+        let (h, c, _) = active("snap", 3);
+        let root = c.state.root();
+        drop(c);
+        let partial = crate::snapshot::dir(&h).join("100.tmp");
+        fs::create_dir_all(&partial).unwrap();
+        fs::write(partial.join("chunk-0"), b"half a chunk").unwrap();
+        fs::write(h.join("epochs.json.tmp"), b"{").unwrap();
+        let c = Chain::open(&h).unwrap();
+        assert_eq!(c.state.root(), root);
+        assert!(!partial.exists(), "the half-written snapshot was removed");
+        assert!(crate::snapshot::list(&h).is_empty());
+        assert!(crate::snapshot::build_manifest(&c.live).is_err());
+        drop(c);
+        fs::remove_dir_all(h).ok();
+    }
+
+    /// A validator keeps a window of blocks: older index rows, certificates and whole log
+    /// segments go; epoch boundaries' hashes and certificates stay. Restarts still replay
+    /// nothing, and a lost database is rebuilt from the node's own snapshot.
+    #[test]
+    fn pruning_keeps_a_window_and_rebuilds_from_a_local_snapshot() {
+        let h = home("prune");
+        // Minute blocks: an hour of tx validity is 60 blocks, so the minimum window is small.
+        Chain::summon(&h, &SummonOpts { block_time_ms: 60_000, epoch_blocks: 100, ..SummonOpts::new("prune", 1) }).unwrap();
+        let mut c = Chain::open_with(&h, &OpenOpts { segment_heights: Some(50) }).unwrap();
+        c.set_pruning(Some(1));
+        let keep = min_keep_blocks(&c.state.params);
+        assert_eq!(c.keep_blocks(), Some(keep));
+        let alice = Keys::from_seed([1; 32]);
+        c.faucet(&alice.address(), 100 * DROPS_PER_FANG).unwrap();
+        c.produce_block().unwrap();
+        let old_tx = c.block(1).unwrap().txs[0].id();
+        for _ in 0..708 {
+            c.produce_block_with(vec![]).unwrap();
+            if c.height() == 200 {
+                c.store_cert(99, vec![9]).unwrap(); // an epoch's last block
+                c.store_cert(200, vec![2]).unwrap(); // a checkpoint
+            }
+        }
+        let height = c.height();
+        let v = c.view();
+        let from = height + 1 - keep;
+        assert_eq!(v.history_from(), from);
+        assert!(v.block(from).is_some() && v.block(from - 1).is_none() && v.is_pruned(10));
+        assert!(!c.has_tx(&old_tx), "pruned heights leave the tx index");
+        assert!(v.history(&alice.address(), 10).is_empty());
+        assert!(v.hash_at(99).is_some() && v.root_at(199).is_some(), "epoch boundaries stay");
+        assert!(v.hash_at(150).is_none());
+        assert_eq!((v.snap.cert(99).unwrap(), v.snap.cert(200).unwrap()), (Some(vec![9]), None));
+        let segs = c.blocks.reader().segments();
+        assert!(segs[0] > 1 && segs[0] <= from && segs[0] + 50 > from - 50, "segments below the window are deleted: {segs:?}");
+        assert_eq!(c.cblocks.reader().segments(), segs);
+        drop(v);
+        let root = c.state.root();
+        drop(c);
+        let c = Chain::open(&h).unwrap();
+        assert_eq!((c.state.root(), c.replayed, c.view().history_from()), (root.clone(), 0, from));
+        // The snapshot writer runs in the background: wait for the latest checkpoint's.
+        let t = Instant::now();
+        while !crate::snapshot::list(&h).contains(&700) {
+            assert!(t.elapsed().as_secs() < 30, "no snapshot at 700");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        drop(c);
+        fs::remove_file(h.join(store::DB_FILE)).unwrap();
+        let c = Chain::open(&h).unwrap();
+        assert_eq!((c.state.root(), c.height()), (root, height));
+        assert_eq!(c.replayed, height - 700, "rebuilt from snapshot 700, then the logged blocks after it");
+        drop(c);
+        fs::remove_dir_all(h).ok();
+    }
+
+    /// Restart time at 1M accounts: loading the records is O(state), never O(history).
+    /// `cargo test --release restart_time_at_1m_accounts -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark"]
+    fn restart_time_at_1m_accounts() {
+        let h = home("bench");
+        Chain::summon(&h, &SummonOpts::new("bench", 1)).unwrap();
+        let mut c = Chain::open(&h).unwrap();
+        for i in 0..1_000_000u64 {
+            c.state.accounts.insert(crypto::address_from_bytes(&crypto::hash(&i.to_le_bytes())), Account { balance: DROPS_PER_FANG, ..Default::default() });
+        }
+        c.state.supply += 1_000_000 * DROPS_PER_FANG;
+        let t = Instant::now();
+        c.produce_block_with(vec![]).unwrap();
+        println!("committed 1M new accounts in one block: {:?}", t.elapsed());
+        for _ in 0..100 {
+            c.produce_block_with(vec![]).unwrap();
+        }
+        let root = c.state.root();
+        drop(c);
+        let t = Instant::now();
+        let c = Chain::open(&h).unwrap();
+        let took = t.elapsed();
+        println!("restart with {} records: {took:?} ({} blocks replayed)", c.state.record_count(), c.replayed);
+        assert_eq!((c.state.root(), c.replayed), (root, 0));
+        drop(c);
+        fs::remove_dir_all(h).ok();
     }
 }

@@ -410,6 +410,8 @@ fn fast_sync_from_certified_snapshot_and_tamper_rejection() {
         assert_eq!(joiner.lock().state.account(&Keys::from_seed([104; 32]).address()).balance, DROPS_PER_FANG);
         // Restart: the fast-synced home reopens from its base and replays what it executed since.
         let root_now = joiner.lock().state.root();
+        // The home's database takes a lock: every handle on the old chain must be gone first.
+        drop(provider);
         drop(joiner);
         let reopened = Chain::open(&joiner_home).unwrap();
         assert_eq!(reopened.state.root(), root_now);
