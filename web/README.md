@@ -25,6 +25,12 @@ Everything is a build-time `NEXT_PUBLIC_*` variable.
 | `NEXT_PUBLIC_TESTNET_GENESIS_HASH` | (unset) | Pins the testnet's genesis too. |
 | `NEXT_PUBLIC_TESTNET_PREFIX` | `boo` | The testnet's address prefix. Protocol v1 testnets use `tboo` (DEC-7). |
 
+## Stake and Governance (protocol v1)
+
+- **Stake** (`/stake`): what the account has staked and unbonding, each pool (value, shares, commission), unstaking an amount or everything, withdrawing what has finished unbonding, and delegating to a validator of the active set. Amounts become pool shares at the pool's current rate (`sharesFor`).
+- **Governance** (`/governance`): open and earlier proposals with their token tallies, quorum, bootstrap-council votes and timelock; voting aye or nay with a conviction (its weight and lock time shown before signing); releasing expired vote locks.
+- Both use the SDK helpers (`wallet.delegate`, `wallet.vote`, …) through the pinned client, read the module endpoints tolerantly (`stakeSummary`, `proposalSummary`), and say so plainly on a node that doesn't serve them yet. Text and links from the chain render as text; only `https://` links become links.
+
 ## Which chain am I on? (WAL-4)
 
 - Each network in `lib/config.ts` pins a chain id, and optionally a genesis hash and address prefix. Every `/api/status` the wallet reads goes through `PinnedClient` (`lib/chain.ts`), including the one `Wallet.build` signs against, so the wallet can't sign for a chain it isn't showing.
@@ -66,7 +72,10 @@ Everything is a build-time `NEXT_PUBLIC_*` variable.
 | `security.spec.ts` | CSP and headers on every page, fresh nonces, nonce'd and SRI'd scripts only, the custom-node cookie, zero CSP violations through onboarding, injected script and exfiltration blocked |
 | `recovery.spec.ts` | Kit creation (print, download, confirmation, activation), restore on a second device and revoking the lost one, mistyped kits, pending kits on a chain without a faucet, no secret in requests, storage or the page |
 | `recovery-phrase.spec.ts` | BIP39 256-bit vectors, wordlist hash, round trips, abbreviations, error messages |
-| `mainnet.spec.ts` | Mainnet default and badge, pinned genesis, no browser-only keys, the build refusing a borrowed rpId or missing pins |
+| `mainnet.spec.ts` | Mainnet default and badge, pinned genesis, no browser-only keys, the build refusing a borrowed rpId or missing pins, a footer that doesn't call mainnet a test chain |
+| `stake.spec.ts` | Delegate, unstake an amount and the rest, withdraw once unbonded (each tx checked by the mock node), no CSP violations, a node without staking |
+| `governance.spec.ts` | Proposals with tallies, quorum and council votes; voting with conviction and changing the vote; releasing locks; hostile on-chain titles and links rendered inert; a node without governance |
+| `explorer.spec.ts` | The node's built-in explorer (`node/src/explorer.html`) on a mocked protocol v1 API: validator pools, Governance and proposal pages, parameters, name expiry, escaping |
 
 ## Manual release test matrix
 

@@ -22,6 +22,8 @@ export function friendly(e: unknown): string {
     [/at most \d+ keys/, "This account already has the maximum number of keys. Revoke one first."],
     [/key_id must be 32 bytes hex/, "That doesn't look like a key id. It should be 64 hex characters."],
     [/memo too long/, "That memo is too long (max 256 bytes)."],
+    [/not active yet/, "This isn't active on this network yet."],
+    [/no stake with/, "You don't have stake with that validator."],
     [/invalid FANG amount/, "Enter an amount like 1 or 0.5 (up to 9 decimal places)."],
     [/names must be 3/, "Names must be 3 to 32 characters."],
     [/names may only use/, "Names can only use a–z, 0–9 and dashes."],

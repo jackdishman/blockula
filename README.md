@@ -37,7 +37,7 @@ claude mcp add blockula -- npx -y @blockula/mcp   # MCP server for coding agents
 | [`@blockula/sdk`](https://www.npmjs.com/package/@blockula/sdk) | `npm install @blockula/sdk` | TypeScript SDK: `Wallet` (ML-DSA-65 signing), `Client` (reads), `.boo` names, session keys, Hunts. Passkey wallets for the browser live at `@blockula/sdk/passkey`. |
 | [`@blockula/mcp`](https://www.npmjs.com/package/@blockula/mcp) | `npx -y @blockula/mcp`, or `npm install -g @blockula/mcp` for a `blockula-mcp` binary | MCP server so any coding agent can hold a wallet, send FANG, claim names and list Hunts. |
 
-Both need Node 20 or newer. The MCP server finds the public testnet on its own when no local node is running. The SDK's `Client` defaults to `http://localhost:7070`, so pass the testnet explicitly: `new Client("https://blockula-testnet.fly.dev")`.
+Both need Node 20 or newer. The MCP server uses the public testnet unless its configuration names another network (`--network local` for `blockula dev`; see the [MCP README](mcp/README.md)), and it never switches networks on its own. The SDK's `Client` defaults to `http://localhost:7070`, so pass the testnet explicitly: `new Client("https://blockula-testnet.fly.dev")`.
 
 ## Install the node (no Rust needed)
 

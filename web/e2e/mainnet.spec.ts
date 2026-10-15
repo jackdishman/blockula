@@ -18,6 +18,12 @@ test("defaults to mainnet, pinned to blockula-1, with a plain badge", async ({ p
   expect(csp).not.toContain("blockula-testnet.fly.dev");
 });
 
+test("the footer doesn't call mainnet a test chain", async ({ page }) => {
+  await page.goto("/welcome");
+  await expect(page.getByTestId("imprint-note")).toHaveText(/Self-custodial/);
+  await expect(page.locator("footer")).not.toContainText("test chains");
+});
+
 test("creates passkey wallets on mainnet", async ({ page, node }) => {
   node.faucet = false;
   const hint = await createWallet(page);

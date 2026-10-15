@@ -11,7 +11,7 @@
 Public testnet: https://blockula-testnet.fly.dev · Wallet: https://blockula-wallet.vercel.app · One-pager: docs/ONE_PAGER.md
 
 ## Fastest path
-1. `claude mcp add blockula -- npx -y @blockula/mcp` (uses the public testnet automatically)
-2. MCP: create_wallet → faucet → register_name / send (start_dev_node for a local chain, needs the node binary)
-3. App code: `import { Wallet, Client } from "@blockula/sdk"`; browser users: `import { createPasskeyWallet } from "@blockula/sdk/passkey"`
-4. Contribute: MCP list_hunts → implement → PR merges → submit_contribution (contribution pool, judged by Séance juries; see AGENTS.md)
+1. `claude mcp add blockula -- npx -y @blockula/mcp` (the public testnet; `--network local` for a `blockula dev` chain, `--network mainnet` with `BLOCKULA_RPC` for mainnet). The network is pinned (chain id + genesis hash) and never switches on its own.
+2. MCP: create_wallet → faucet → register_name / send; stake / unstake / my_stake; list_proposals / vote; renew_name (start_dev_node for a local chain, needs the node binary from install_node)
+3. App code: `import { Wallet, Client } from "@blockula/sdk"`; browser users: `import { createPasskeyWallet } from "@blockula/sdk/passkey"`. Helpers for every protocol v1 action (staking, governance, multisig, names); `client.provenAccount` / `provenName` check Merkle proofs against independent nodes.
+4. Contribute: MCP list_hunts → implement → PR merges → submit_contribution (contribution pool, judged by Séance juries; see AGENTS.md). Testnet FANG, Hunts and Soul have no monetary value.

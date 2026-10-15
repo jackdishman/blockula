@@ -3,8 +3,8 @@
 import assert from "node:assert/strict";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
-import { bytesToHex, randomBytes } from "@noble/hashes/utils.js";
-import { ApiError, Client, POP_CONTEXT, Wallet, addressFromPublicKey, addressPrefix, baseFee, beaconCommitment, formatFang, ghostSighash, isAddress, minFee, parseFang, parseSoul, popMessage, seanceCommitment, signingBytes, txBytes, txCharge, txId, txSize, type Action, type GhostBundle, type ProposalKind, type Tx } from "../src/index.js";
+import { bytesToHex, hexToBytes, randomBytes } from "@noble/hashes/utils.js";
+import { ApiError, Client, NAMESPACES, POP_CONTEXT, TxFailedError, Wallet, addressFromPublicKey, addressPrefix, baseFee, beaconCommitment, formatFang, ghostSighash, isAddress, minFee, paramsOf, parseFang, parseSoul, popMessage, proposal, proposalSummary, seanceCommitment, signingBytes, stakeSummary, txBytes, txCharge, txId, txSize, verifyProof, type Action, type GhostBundle, type ProposalKind, type Tx } from "../src/index.js";
 
 const client = new Client(process.env.BLOCKULA_RPC ?? "http://localhost:7070");
 
@@ -338,11 +338,62 @@ for (const [action, why] of governance) {
 const epoch2 = (await client.status()).epoch + 2;
 await assert.rejects(client.submit(await alice.build({ type: "beacon_commit", epoch: epoch2, commitment: beaconCommitment("blockula-dev", epoch2, alice.address, "07".repeat(32)) })), /commit to the beacon/);
 await assert.rejects(client.submit(await alice.build({ type: "attest_revert", claim_id: 0, revert_sha: "cd".repeat(20) })), /only active validators attest reverts/);
-const moved = await client.submit(await alice.build({ type: "transfer_name", name: `${name}.boo`, to: bob.address }));
+async function verifiedByNode(label: string, run: () => Promise<unknown>) {
+  try {
+    await run();
+  } catch (e) {
+    const msg = (e as Error).message;
+    assert.ok(e instanceof TxFailedError || (e instanceof ApiError && e.status === 400), `${label}: ${msg}`);
+    assert.ok(!/signature|signing bytes|unknown field|wire form|decode/i.test(msg), `${label} was refused before the rules: ${msg}`);
+  }
+}
+const helpers: [string, () => Promise<unknown>][] = [
+  ["delegate", () => alice.delegate(validator, "1")],
+  ["undelegate", () => alice.undelegate(validator, 1n)],
+  ["redelegate", () => alice.redelegate(validator, bob.address, 1n)],
+  ["withdrawUnbonded", () => alice.withdrawUnbonded()],
+  ["updateValidator", () => alice.updateValidator({ commissionBps: 500 })],
+  ["unjail", () => alice.unjail(validator)],
+  ["propose", () => alice.propose(proposal.paramChange("max_validators", 40), { title: "e2e", deposit: "1" })],
+  ["vote", () => alice.vote(0, true, "1", 1)],
+  ["unlock", () => alice.unlock()],
+  ["multisigPropose", () => alice.multisigPropose({ type: "transfer", to: bob.address, amount: "1" })],
+  ["multisigApprove", () => alice.multisigApprove(0)],
+  ["beaconCommit", () => alice.beaconCommit(1, "ab".repeat(32))],
+  ["claimDistribution", () => alice.claimDistribution(0, "1", ["cd".repeat(32)])],
+  ["renewName", () => alice.renewName(name, 1)],
+];
+for (const [label, run] of helpers) await verifiedByNode(label, run);
+console.log(`✓ ${helpers.length} protocol v1 helpers sign txs the node verifies`);
+
+// Proven reads: /api/proof answers check out against the state root, and the node agrees with
+// itself as a witness. Names and accounts that don't exist are proven absent.
+const provenAlice = await client.provenAccount(alice.address, { witnesses: [new Client(client.rpc)] });
+assert.ok(provenAlice, "alice's account is proven");
+assert.equal(provenAlice.balance.toString(), (await client.account(alice.address)).balance);
+assert.equal(provenAlice.nonce, (await client.account(alice.address)).nonce);
+assert.ok(provenAlice.keys.some((k) => k.key_id === agent2.keyId && k.role.type === "session"), "alice's session key is proven");
+assert.equal((await client.provenName(name))?.owner, alice.address);
+assert.equal(await client.provenAccount(Wallet.generate(client).address), null);
+assert.equal(await client.provenName(`nobody${Date.now() % 100000}`), null);
+const raw = await client.proof(NAMESPACES.ACCOUNTS, alice.address);
+assert.ok(verifyProof(raw.root, NAMESPACES.ACCOUNTS, alice.address, hexToBytes(raw.value as string), raw.proof));
+assert.ok(!verifyProof(raw.root, NAMESPACES.ACCOUNTS, bob.address, hexToBytes(raw.value as string), raw.proof));
+console.log(`✓ proven reads: ${provenAlice.balance} drops at block #${provenAlice.height}, root ${provenAlice.root.slice(0, 12)}…`);
+
+// The module reads, where this node serves them, parse with the tolerant readers.
+const optional = <T>(p: Promise<T>) => p.catch((e) => (e instanceof ApiError && e.status === 404 ? null : Promise.reject(e)));
+const [params, stakeRead, proposals] = await Promise.all([optional(client.params()), optional(client.staking(alice.address)), optional(client.proposals())]);
+if (params) assert.ok(paramsOf(params).max_tx_validity_blocks, "params include max_tx_validity_blocks");
+if (stakeRead) assert.ok(Array.isArray(stakeSummary(stakeRead).delegations));
+if (proposals) assert.ok((Array.isArray(proposals) ? proposals : proposals.proposals ?? []).map(proposalSummary).every((p: { id: number }) => p.id >= 0));
+console.log(`✓ module reads: params ${params ? "✓" : "(not served yet)"}, staking ${stakeRead ? "✓" : "(not served yet)"}, proposals ${proposals ? "✓" : "(not served yet)"}`);
+
+const moved = await alice.transferName(`${name}.boo`, bob.address);
 console.log("✓", moved.summary);
 assert.equal(await client.resolve(`${name}.boo`), bob.address);
-await assert.rejects(client.submit(await alice.build({ type: "release_name", name })), /belongs to/);
-console.log("✓", (await client.submit(await bob.build({ type: "release_name", name }))).summary);
+await assert.rejects(alice.releaseName(name), /belongs to/);
+console.log("✓", (await bob.releaseName(name)).summary);
 assert.equal((await client.name(name)).available, true);
 console.log("✓ protocol v1 txs verify; names renew, transfer and release");
 

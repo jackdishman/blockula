@@ -56,8 +56,10 @@ jobs:
       - run: npm run build -w @blockula/sdk && npm run build -w @blockula/mcp && npm run build -w @blockula/web
       - name: ML-DSA-65 KATs and Rust ⇄ TS cross vectors (SDK)
         run: npm run test:kat -w @blockula/sdk
-      - name: Passkey PRF → key derivation vectors (SDK)
+      - name: Passkey, state-proof and protocol v1 helper vectors (SDK)
         run: npm run test:vectors -w @blockula/sdk
+      - name: MCP network pinning and release checks
+        run: npm test -w @blockula/mcp
 
   wallet-e2e:
     name: Wallet e2e (Playwright, Chromium)

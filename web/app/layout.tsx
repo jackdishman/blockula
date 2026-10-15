@@ -5,6 +5,7 @@ import type { ReactNode } from "react";
 import { ChainGate } from "@/components/ChainGate";
 import { Header } from "@/components/Header";
 import { Ornament } from "@/components/Ornament";
+import { IS_MAINNET_BUILD } from "@/lib/config";
 import { WalletProvider } from "@/lib/wallet";
 import "./globals.css";
 
@@ -35,7 +36,8 @@ export default async function RootLayout({ children }: { children: ReactNode }) 
           <footer className="imprint">
             <Ornament kind="bat" />
             <span className="caps">Quantum-safe ML-DSA-65 keys · Unlocked by passkeys</span>
-            <span>Not audited. For test chains only.</span>
+            {/* Mainnet builds are for real money (after the audit, WAL-3); test builds say what they are. */}
+            <span data-testid="imprint-note">{IS_MAINNET_BUILD ? "Self-custodial: your key is derived on this device and never leaves it." : "Not audited. For test chains only."}</span>
           </footer>
         </WalletProvider>
       </body>

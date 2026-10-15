@@ -2,7 +2,7 @@
 
 ## Copy-paste prompt (for users)
 
-> Add Blockula to this project. Install the MCP server with `claude mcp add blockula -- npx -y @blockula/mcp` (it uses the public testnet at https://blockula-testnet.fly.dev unless a local node is running), then call `create_wallet` and `faucet`. Use `@blockula/sdk` in the app: `Wallet` for signing, `Client` for reads, and `@blockula/sdk/passkey` for user wallets in the browser. Show balances and recipients by `.boo` name, never raw addresses.
+> Add Blockula to this project. Install the MCP server with `claude mcp add blockula -- npx -y @blockula/mcp` (it uses the public testnet at https://blockula-testnet.fly.dev; add `--network local` for a `blockula dev` chain), then call `create_wallet` and `faucet`. Use `@blockula/sdk` in the app: `Wallet` for signing, `Client` for reads, and `@blockula/sdk/passkey` for user wallets in the browser. Show balances and recipients by `.boo` name, never raw addresses.
 
 ## Rules of the road
 
@@ -17,7 +17,36 @@
   The MCP also caps each send at `BLOCKULA_MAX_SEND` (default 100 FANG).
 - **Accounts hold many keys.** `owner` keys (each passkey device, recovery keys) have full control. `session` keys are spend-limited. Every tx says which account it acts `from`; the signing key must be on that account.
 - **Every tx returns a `summary`** in plain English, so show it to users as-is.
-- **Explorer links:** `{rpc}/#/tx/{id}`, `{rpc}/#/account/{name}`, `{rpc}/#/block/{height}`.
+- **The network is the user's choice, and it's pinned.** The MCP talks to the network its configuration names (`--network mainnet|testnet|local|custom`, `BLOCKULA_RPC`); nothing switches it while it runs, and it never falls back to whatever answers on localhost. It pins the chain id and genesis hash (built in for known networks, `BLOCKULA_CHAIN_ID` / `BLOCKULA_GENESIS_HASH`, or the first ones a node reports, remembered in `~/.blockula/known-chains.json`) and refuses a node that reports anything else. In code, `new Client(rpc, { chainId, genesisHash, prefix })` does the same for every status it reads, including the one each signature is made against.
+- **Don't trust one RPC for what matters.** `client.provenAccount(address, { witnesses })` and `client.provenName(name, { witnesses })` check the node's Merkle proof (`/api/proof`) against its state root, and the witnesses (clients for independent nodes) must report the same root for that block.
+- **Staking and voting lock the user's FANG.** Stake (`stake`, `wallet.delegate`) takes the unbonding period (21 days on mainnet) to come back; a vote at conviction 1–6 locks its amount for 1–32 lock periods (a week each on mainnet) after voting ends. Ask the user before either. Session keys can't stake or vote: only transfers.
+- **Names expire.** `.boo` names are registered for a year at a time; renew with `renew_name` / `wallet.renewName(name, years)`. After a grace period anyone can register an expired name.
+- **Explorer links:** `{rpc}/#/tx/{id}`, `{rpc}/#/account/{name}`, `{rpc}/#/block/{height}`, `{rpc}/#/name/{name}`, `{rpc}/#/proposal/{id}`, `{rpc}/#/validators`, `{rpc}/#/governance`, `{rpc}/#/params`.
+
+## Protocol v1 actions (tags 30–49)
+
+Every action has an SDK `Wallet` helper that builds, signs and submits it (and waits for it). Until a module ships on a chain, the node includes these txs and fails them with "not active yet".
+
+| Tag | Action | SDK (`Wallet`) | MCP tool | CLI |
+|---|---|---|---|---|
+| 30 | `delegate` | `delegate(validator, amount)` | `stake` | `blockula stake delegate` |
+| 31 | `undelegate` | `undelegate(validator, shares \| "all")` | `unstake` (FANG or `all`) | `blockula stake undelegate --shares N \| --all` |
+| 32 | `redelegate` | `redelegate(from, to, shares \| "all")` | | `blockula stake redelegate` |
+| 33 | `withdraw_unbonded` | `withdrawUnbonded()` | `withdraw_stake` | `blockula stake withdraw` |
+| 34 | `update_validator` | `updateValidator({ commissionBps, p2pAddr?, httpAddr? })` | | |
+| 35 | `unjail` | `unjail(validator)` | | |
+| 36 | `report_equivocation` | `reportEquivocation(evidenceHex)` (nodes do this) | | |
+| 37, 38 | `beacon_commit`, `beacon_reveal` | `beaconCommit(epoch, hex)`, `beaconReveal(epoch, hex)` (validator nodes do this) | | |
+| 39 | `propose` | `propose(proposal.paramChange("max_validators", 40), { title, url?, deposit? })`; builders for every kind in `proposal.*` | | `blockula gov propose` |
+| 40 | `vote` | `vote(proposalId, aye, amount, conviction)` | `vote` | `blockula gov vote` |
+| 41 | `unlock` | `unlock()` | | `blockula gov unlock` |
+| 42–44 | `multisig_create`, `multisig_propose`, `multisig_approve` | `multisigCreate(ownerKeyIds, threshold)`, `multisigPropose(action)`, `multisigApprove(id)` | | `blockula multisig …` |
+| 45 | `renew_name` | `renewName(name, years)` | `renew_name` | `blockula name renew` |
+| 46, 47 | `transfer_name`, `release_name` | `transferName(name, to)`, `releaseName(name)` | | `blockula name transfer`, `blockula name release` |
+| 48 | `claim_distribution` | `claimDistribution(id, amount, proof)` | | |
+| 49 | `attest_revert` | `attestRevert(claimId, revertSha)` (validator nodes do this) | | |
+
+Reads: `client.staking(account)`, `client.proposals()`, `client.proposal(id)`, `client.params()`, `client.fees()`, `client.distribution(id)`, `client.multisig(account)`; `stakeSummary`, `proposalSummary` and `paramsOf` normalize them. The MCP also has `my_stake` and `list_proposals`.
 
 ## HTTP API (node, default `http://localhost:7070`)
 
@@ -68,6 +97,7 @@
 
 - `npm run build` builds everything. `npm test` runs the Rust unit tests plus the SDK e2e (needs `blockula dev` running).
 - The tx signing encoding lives in **two places that must match byte-for-byte**: `node/src/types.rs` (`Tx::signing_bytes`) and `sdk-ts/src/tx.ts` (`signingBytes`). Change both, then run the e2e.
+- The state tree's proof format lives in `node/src/state/tree.rs` and its light-client port `sdk-ts/src/proof.ts`; `sdk-ts/test/proof-vectors.json` (written by `node/src/state/proof_vectors.rs`) keeps them in step. `npm run test:vectors -w @blockula/sdk` and `npm test -w @blockula/mcp` run offline.
 
 ## 🐈‍⬛ Contribute to Blockula (agents welcome)
 

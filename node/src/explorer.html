@@ -91,6 +91,11 @@
   .empty { font-style:italic; color:var(--dim); }
   details summary { cursor:pointer; color:var(--dim); margin-top:14px; font:400 16px var(--caps); letter-spacing:.06em; }
   pre.mono { background:var(--paper-hi); border:1px solid var(--hair); padding:12px; white-space:pre-wrap; }
+  .tally { display:flex; height:10px; border:1px solid var(--ink); margin:8px 0 4px; background:var(--paper-hi); }
+  .tally .aye { background:var(--moss); } .tally .nay { background:var(--blood); }
+  table.params { width:100%; border-collapse:collapse; font-size:16px; }
+  table.params td { padding:7px 8px 7px 0; border-bottom:1px solid var(--hair); vertical-align:baseline; }
+  table.params td:first-child { font-family:var(--mono); font-size:14px; word-break:break-all; width:42%; }
 
   @media (max-width:640px) {
     header { padding:12px 16px 10px; }
@@ -113,10 +118,10 @@
 <header>
   <a class="brand" href="#/"><span class="wordmark">Blockula</span><span class="edition">The Explorer</span></a>
   <form id="search" role="search"><input id="q" aria-label="Search" placeholder="Search names, addresses, blocks or transactions" autocomplete="off" /></form>
-  <nav><a href="#/">Blocks</a><a href="#/validators">Validators</a><a href="#/mempool">Mempool</a><a href="#/hunts">Hunts</a><a href="#/contribute">Contribute</a><a href="#/learn">Learn</a></nav>
+  <nav><a href="#/">Blocks</a><a href="#/validators">Validators</a><a href="#/governance">Governance</a><a href="#/mempool">Mempool</a><a href="#/hunts">Hunts</a><a href="#/contribute">Contribute</a><a href="#/params">Parameters</a><a href="#/learn">Learn</a></nav>
 </header>
 <main id="app"><div class="loading">Rising from the grave…</div></main>
-<footer>Post-quantum signatures · ML-DSA-65 · Not audited, test chains only</footer>
+<footer id="imprint">Post-quantum signatures · ML-DSA-65 · Not audited, test chains only</footer>
 <script>
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
@@ -147,6 +152,14 @@ const GLOSSARY = {
   claim: "A merged PR submitted for the contribution pool. Validators check GitHub that it's merged and authored by the claimant's linked handle, then a Séance judges it.",
   vesting: "Rewards unlock gradually (about 90 days). Until then they can be clawed back, e.g. if the PR is reverted or the account turns out to be fake.",
   pool: "FANG set aside to reward useful work. Each Séance pays out a quarter of it, split by jury scores, square-rooted per person so volume doesn't pay.",
+  stake: "FANG delegated to a validator's pool. The pool's stake decides whether it's in the active set; stakers share its rewards and its slashes.",
+  commission: "The share of a pool's rewards its validator keeps before the rest goes to everyone staked in it.",
+  jailed: "Taken out of the active set for missing too many of its turns (or for a missed beacon reveal). Its owner can unjail it after the jail period.",
+  proposal: "A change put to an on-chain vote: a parameter, a treasury spend, an upgrade, a distribution… The proposer bonds a deposit, returned once the proposal reaches quorum.",
+  conviction: "Voters lock the FANG they vote with. Locking longer counts more: 0.1× with no lock, then 1× to 6× for 1 to 32 lock periods.",
+  council: "Until the bootstrap period ends, a proposal also passes if two-thirds of the active validators approve it and token-weighted nays don't outweigh ayes.",
+  timelock: "A passed proposal waits this long before it executes, so anyone affected can see it coming.",
+  expiry: "Names are registered for a year at a time. After expiry there's a grace period when only the owner can renew; then anyone can register the name.",
 };
 const term = (key, text) => `<span class="term" data-tip="${esc(GLOSSARY[key])}">${esc(text ?? key)}</span>`;
 // The node labels unnamed system accounts ("🧛 validator", "🏛️ treasury"); show those as an italic label.
@@ -168,6 +181,26 @@ const fang = (display) => {
 const stat = (v, k) => `<div class="stat"><div class="v">${v}</div><div class="k">${k}</div></div>`;
 const card = (inner, cls = "") => `<section class="card ${cls}">${inner}</section>`;
 const plural = (n, one, many = one + "s") => `${n} ${n == 1 ? one : many}`;
+// Drops ("1500000000") → "1.5 FANG", for fields the node sends without a *_display twin.
+const fmtDrops = (d) => { if (!/^\d+$/.test(String(d ?? ""))) return "—"; const b = BigInt(d); const f = (b % 1000000000n).toString().padStart(9, "0").replace(/0+$/, ""); return `${b / 1000000000n}${f ? "." + f : ""} FANG`; };
+/** `o.k_display`, else `o.k` as drops; null when the node doesn't send it. Fields are read tolerantly: modules may add them later. */
+const amount = (o, ...keys) => { for (const k of keys) { if (o && o[k + "_display"] != null) return String(o[k + "_display"]); if (o && /^\d+$/.test(String(o[k] ?? ""))) return fmtDrops(o[k]); } return null; };
+const pick = (o, ...keys) => { for (const k of keys) if (o && o[k] != null) return o[k]; return undefined; };
+const pct = (bps) => `${(Number(bps) / 100).toLocaleString("en-US", { maximumFractionDigits: 2 })}%`;
+const span = (blocks, ms = 1000) => { const s = (Number(blocks) * ms) / 1000; return s < 90 ? `${Math.round(s)} seconds` : s < 5400 ? `${Math.round(s / 60)} minutes` : s < 172800 ? `${Math.round(s / 3600)} hours` : `${Math.round(s / 86400)} days`; };
+// Only https links from the chain become hrefs (never javascript: or data:).
+const link = (u, text) => /^https:\/\/[^\s"'<>]+$/.test(String(u ?? "")) ? `<a href="${esc(u)}" rel="noreferrer nofollow">${esc(text ?? u)}</a>` : esc(text ?? u ?? "");
+/** A label ({address, name, short}) or a bare address. */
+const whoAny = (x) => (x && typeof x === "object" ? who(x) : x ? `<a href="#/account/${esc(x)}" class="mono">${esc(String(x).slice(0, 12))}…</a>` : "—");
+const list = (r, ...keys) => (Array.isArray(r) ? r : (keys.map((k) => r && r[k]).find(Array.isArray) || []));
+/** "expires at block #N (in about 300 days)", with the grace period once it has passed. */
+const expiryText = (r, s) => {
+  if (r.expires_at == null) return "";
+  const left = Number(r.expires_at) - Number(s.height);
+  const grace = pick(r, "grace_until", "grace_ends_at");
+  if (left > 0) return `${term("expiry", "expires")} at block #${esc(r.expires_at)} (in about ${span(left, s.block_time_ms)})`;
+  return `<span class="err">expired at block #${esc(r.expires_at)}</span>${grace != null ? `; its owner can renew it until block #${esc(grace)}` : ""}`;
+};
 
 const views = {
   async home() {
@@ -240,7 +273,9 @@ const views = {
     </div>`;
   },
   async account(id) {
-    const a = await api("/account/" + encodeURIComponent(id));
+    const [a, s] = await Promise.all([api("/account/" + encodeURIComponent(id)), api("/status")]);
+    // Expiry comes with name renewals; ask for the first few names only.
+    const nameInfo = await Promise.all(a.names.slice(0, 12).map((n) => api("/name/" + encodeURIComponent(n)).catch(() => null)));
     let gh = null;
     if (a.github) gh = await api("/github/" + encodeURIComponent(a.github.handle)).catch(() => null);
     const name = a.account.name ? (a.account.name.includes(" ") ? `<i>${esc(plain(a.account.name))}</i>` : esc(a.account.name)) : "Unnamed account";
@@ -261,7 +296,7 @@ const views = {
         ${stat(a.names.length, term("name", "names owned"))}
       </div>
       ${pc && (pc.soul.points > 0 || pc.claims.length || pc.juror || pc.vouched_by || pc.vouching_for.length || pc.rewards.total_display !== "0 FANG") ? contributionCard(pc) : ""}
-      ${a.names.length ? card(`<h2>Names</h2>${a.names.map((n) => `<span class="pill">${esc(n)}</span>`).join(" ")}`) : ""}
+      ${a.names.length ? card(`<h2>Names</h2><div class="rows">${a.names.map((n, i) => `<div class="row"><div><a href="#/name/${esc(n)}">${esc(n)}</a></div><span class="dim">${nameInfo[i] ? expiryText(nameInfo[i], s) : ""}</span></div>`).join("")}</div>`) : ""}
       ${a.hunts_won.length || a.familiars.length || a.hunts_created.length ? card(`<h2>Hunts</h2><div class="rows">
         ${a.hunts_won.map((h) => `<div class="row"><div><a href="#/hunt/${h.id}">${esc(h.repo)}#${h.issue}</a> won ${esc(h.amount_display)} for PR #${h.pr}${h.self_awarded ? ' <span class="pill pending">self-awarded</span>' : ""}</div></div>`).join("")}
         ${a.hunts_created.length ? `<div class="row dim"><div>Created ${a.hunts_created.map((id) => `<a href="#/hunt/${id}">#${id}</a>`).join(", ")}</div></div>` : ""}
@@ -270,8 +305,17 @@ const views = {
     </div>`;
   },
   async name(n) {
-    const r = await api("/name/" + n);
-    return card(`<span class="eyebrow">Unclaimed name</span><h1>${esc(r.name)}</h1><p>Anyone can register it for <b>${esc(r.price_display)}</b>. Shorter names cost more because they're scarcer. The fee goes to the community treasury.</p>
+    const [r, s] = await Promise.all([api("/name/" + encodeURIComponent(n)), api("/status")]);
+    if (!r.available) {
+      return card(`<span class="eyebrow">Name</span><h1>${esc(r.name)}</h1><dl>
+        <dt>Owner</dt><dd>${who(r.owner)}</dd>
+        <dt>Registered</dt><dd>block <a href="#/block/${esc(r.registered_at)}">#${esc(r.registered_at)}</a></dd>
+        ${r.expires_at != null ? `<dt>${term("expiry", "Expires")}</dt><dd>${expiryText(r, s)}</dd>` : ""}
+        ${amount(r, "renewal_price", "renew_price") ? `<dt>Renewal</dt><dd>${esc(amount(r, "renewal_price", "renew_price"))} a year</dd>` : ""}
+      </dl>`);
+    }
+    return card(`<span class="eyebrow">Unclaimed name</span><h1>${esc(r.name)}</h1><p>Anyone can register it for <b>${esc(r.price_display)}</b>${r.expires_at != null || r.registration_blocks ? " a year" : ""}. Shorter names cost more because they're scarcer.</p>
+      ${r.reserved ? `<p class="err">This name is reserved: only governance can assign it.</p>` : ""}
       <p class="dim">Register it with the SDK: <span class="mono">await wallet.registerName("${esc(r.name)}")</span></p>`);
   },
   async learn() {
@@ -394,8 +438,15 @@ views.mempool = async function () {
 views.validators = async function () {
   const v = await api("/validators");
   const status = (x) => (x.tombstoned_at != null ? "tombstoned" : x.jailed ? "jailed" : x.status);
-  const row = (x) => `<div class="row"><div>${who(x.validator)} <span class="dim">${esc(x.p2p_addr)}${x.genesis ? " · genesis" : ""} · stake ${esc(x.stake_display)} · self-bond ${esc(x.self_bond_display)} · commission ${esc(x.commission_display)}${x.jailed ? ` · jailed until block ${x.jailed.until}: ${esc(x.jailed.reason)}` : ""}</span></div><span class="pill ${["jailed", "tombstoned", "removed"].includes(status(x)) ? "failed" : x.status === "candidate" ? "pending" : ""}">${esc(status(x))}</span></div>`;
-  const list = (title, xs, empty) => card(`<h2>${title} (${xs.length})</h2>${xs.length ? `<div class="rows">${xs.map(row).join("")}</div>` : `<p class="empty">${empty}</p>`}`);
+  const row = (x) => {
+    const bits = [esc(x.p2p_addr)];
+    if (x.genesis) bits.push("genesis");
+    bits.push(`${term("stake", "stake")} ${esc(x.stake_display)}`, `self-bond ${esc(x.self_bond_display)}`, `${term("commission", "commission")} ${esc(x.commission_display)}`);
+    if (x.liveness && x.liveness.recorded) bits.push(`missed ${esc(x.liveness.missed)} of its last ${esc(x.liveness.recorded)} turns`);
+    if (x.jailed) bits.push(`${term("jailed", "jailed")} until block ${esc(x.jailed.until)}: ${esc(x.jailed.reason)}`);
+    return `<div class="row"><div>${who(x.validator)} <span class="dim">${bits.join(" · ")}</span></div><span class="pill ${["jailed", "tombstoned", "removed"].includes(status(x)) ? "failed" : x.status === "candidate" ? "pending" : ""}">${esc(status(x))}</span></div>`;
+  };
+  const section = (title, xs, empty) => card(`<h2>${title} (${xs.length})</h2>${xs.length ? `<div class="rows">${xs.map(row).join("")}</div>` : `<p class="empty">${empty}</p>`}`);
   const all = [...v.active, ...v.candidates, ...v.jailed, ...v.tombstoned, ...v.removed];
   const seen = new Set();
   const events = [];
@@ -409,24 +460,123 @@ views.validators = async function () {
     if (x.tombstoned_at != null) events.push([x.tombstoned_at, `validator ${who(x.validator)} double-signed: slashed ${esc(x.slashed_display)} and banned for good`]);
   }
   events.sort((a, b) => b[0] - a[0]);
+  const totalStake = v.active.reduce((t, x) => (/^\d+$/.test(String(x.stake ?? "")) ? t + BigInt(x.stake) : t), 0n);
   return `<div class="stack">
     <div><span class="eyebrow">Consensus</span><h1>Validators</h1></div>
     <div class="figures">
       ${stat(v.epoch, term("epoch", "current epoch"))}
-      ${stat(v.active.length, "active validators")}
+      ${stat(`${v.active.length}${v.max_validators ? `<small>of ${esc(v.max_validators)}</small>` : ""}`, "active validators")}
       ${stat(v.blocks_until_next_epoch, "blocks until the next epoch")}
+      ${stat(fang(fmtDrops(totalStake)), term("stake", "staked in the active set"))}
       ${stat(fang(v.min_bond_display), term("bond", "minimum self-bond"))}
     </div>
     ${card(`<h2>What validators do</h2>
-      <p>Validators take turns proposing blocks and vote to finalize them. A block is final once more than two-thirds of the active validators have signed it with ML-DSA-65, a post-quantum signature. There are no confirmations to wait for.</p>
-      <p>Anyone can run one: register with a self-bond of at least ${esc(v.min_bond_display)}, and anyone can delegate FANG to it. At the end of each ${term("epoch")} (every ${v.epoch_blocks} blocks) the top ${v.max_validators} by stake make the next set, ${v.churn_limit ? `with at most ${v.churn_limit} newcomer${v.churn_limit === 1 ? "" : "s"} at a time (the rest must reach a quorum on their own)` : "though a set this small takes no newcomers (they'd be needed for a quorum before they've synced)"}. Signing two different blocks costs ${esc(v.slash_double_sign_display)} of the stake and a permanent ban; missing too many turns gets a validator jailed (${esc(v.slash_downtime_display)}) until it unjails.</p>`, "learn")}
-    ${list("Active this epoch", v.active, "—")}
-    ${v.joining.length || v.leaving.length ? list("Changing at the next epoch", [...v.joining, ...v.leaving], "") : ""}
-    ${list("Candidates", v.candidates, "Nobody is waiting. Run <span class=\"mono\">blockula validator init</span> to become a validator.")}
-    ${v.jailed.length ? list("Jailed", v.jailed, "") : ""}
-    ${v.tombstoned.length ? list("Tombstoned", v.tombstoned, "") : ""}
-    ${v.removed.length ? list("Removed", v.removed, "") : ""}
+      <p>Validators take turns proposing blocks and vote to finalize them. A block is final once more than two-thirds of the active validators have signed it with ML-DSA-65, a post-quantum signature. There are no confirmations to wait for. Every active validator's vote counts the same.</p>
+      <p>Anyone can run one: register with a self-bond of at least ${esc(v.min_bond_display)}, and anyone can ${term("stake", "delegate")} FANG to its pool. At the end of each ${term("epoch")} (every ${v.epoch_blocks} blocks) the top ${v.max_validators} by stake make the next set, ${v.churn_limit ? `with at most ${v.churn_limit} newcomer${v.churn_limit === 1 ? "" : "s"} at a time (the rest must reach a quorum on their own)` : "though a set this small takes no newcomers (they'd be needed for a quorum before they've synced)"}. Signing two different blocks costs ${esc(v.slash_double_sign_display)} of the stake and a permanent ban; missing too many turns gets a validator ${term("jailed")} (${esc(v.slash_downtime_display)}) until it unjails.${v.admins.length ? ` On this test chain an admin (${v.admins.map(who).join(", ")}) may also pin or remove validators.` : ""}</p>`, "learn")}
+    ${section("Active this epoch", v.active, "—")}
+    ${v.joining.length || v.leaving.length ? section("Changing at the next epoch", [...v.joining, ...v.leaving], "") : ""}
+    ${section("Candidates", v.candidates, "Nobody is waiting. Run <span class=\"mono\">blockula validator init</span> to become a validator.")}
+    ${v.jailed.length ? section("Jailed", v.jailed, "") : ""}
+    ${v.tombstoned.length ? section("Tombstoned", v.tombstoned, "") : ""}
+    ${v.removed.length ? section("Removed", v.removed, "") : ""}
     ${card(`<h2>Changes</h2>${events.length ? `<div class="rows">${events.map(([h, t]) => `<div class="row"><div>${t}</div><a class="dim" href="#/block/${h}">block #${h}</a></div>`).join("")}</div>` : '<p class="empty">No changes since genesis.</p>'}`)}
+  </div>`;
+};
+
+// ---- Governance (MAINNET-DESIGN 3.5). Fields are read tolerantly: the node may send labels or
+// addresses, nested tallies or flat ones. ----
+
+const proposalOf = (p) => {
+  const t = p.tally || p.votes_summary || {};
+  const c = p.council || null;
+  return {
+    id: p.id, title: p.title || `Proposal #${p.id}`, url: p.url || "", status: String(pick(p, "status", "phase") ?? "unknown"),
+    summary: pick(p, "summary", "description") || (p.kind && p.kind.type) || "",
+    proposer: pick(p, "proposer", "from", "by"),
+    deposit: amount(p, "deposit"),
+    aye: pick(t, "aye", "ayes", "aye_weight") ?? pick(p, "aye", "ayes", "aye_weight") ?? "0",
+    nay: pick(t, "nay", "nays", "nay_weight") ?? pick(p, "nay", "nays", "nay_weight") ?? "0",
+    ayeShown: amount(t, "aye", "ayes", "aye_weight") || amount(p, "aye", "ayes", "aye_weight"),
+    nayShown: amount(t, "nay", "nays", "nay_weight") || amount(p, "nay", "nays", "nay_weight"),
+    turnout: amount(t, "turnout", "locked") || amount(p, "turnout"), quorum: amount(t, "quorum") || amount(p, "quorum"),
+    council: c ? { ayes: Number(pick(c, "ayes", "aye", "approvals") ?? 0), nays: Number(pick(c, "nays", "nay", "rejections") ?? 0), of: Number(pick(c, "of", "active", "set_size", "validators") ?? 0), needed: pick(c, "needed", "threshold") } : null,
+    endsAt: pick(p, "voting_ends_at", "voting_until", "ends_at"), executesAt: pick(p, "executes_at", "timelock_until", "execute_at"),
+    threshold: pick(p, "threshold_bps", "supermajority_bps"),
+  };
+};
+const statusPill = (st) => `<span class="pill ${/reject|fail|expired|burn/.test(st) ? "failed" : /voting|queued|timelock|pending/.test(st) ? "pending" : ""}">${esc(st.replace(/_/g, " "))}</span>`;
+const tallyBar = (p) => {
+  const [a, n] = [BigInt(/^\d+$/.test(String(p.aye)) ? p.aye : 0), BigInt(/^\d+$/.test(String(p.nay)) ? p.nay : 0)];
+  const total = a + n;
+  const w = total > 0n ? Number((a * 1000n) / total) / 10 : 0;
+  return total > 0n ? `<div class="tally" title="aye ${esc(p.ayeShown || "")} · nay ${esc(p.nayShown || "")}"><span class="aye" style="width:${w}%"></span><span class="nay" style="width:${100 - w}%"></span></div>` : "";
+};
+const councilText = (c) => c && c.of ? `${term("council", "council")}: ${c.ayes} of ${c.of} validators approve${c.nays ? `, ${c.nays} reject` : ""}${c.needed != null ? ` (${esc(c.needed)} needed)` : ""}` : "";
+
+views.governance = async function () {
+  let r;
+  try { r = await api("/proposals?limit=50"); }
+  catch (e) { return card(`<span class="eyebrow">Governance</span><h1>Proposals</h1><p class="empty">This node doesn't serve proposals (${esc(e.message)}). On-chain governance arrives with protocol v1.</p>`, "learn"); }
+  const ps = list(r, "proposals").map(proposalOf);
+  const row = (p) => `<div class="row"><div><a href="#/proposal/${esc(p.id)}"><b>#${esc(p.id)}</b> ${esc(p.title)}</a> <span class="dim">· ${esc(p.summary)}</span>
+    ${tallyBar(p)}<span class="dim">${[p.ayeShown && `aye ${esc(p.ayeShown)}`, p.nayShown && `nay ${esc(p.nayShown)}`, p.turnout && p.quorum && `turnout ${esc(p.turnout)} of ${esc(p.quorum)} quorum`, councilText(p.council), p.endsAt != null && `voting ends at block #${esc(p.endsAt)}`, p.executesAt != null && `executes at block #${esc(p.executesAt)}`].filter(Boolean).join(" · ")}</span></div>${statusPill(p.status)}</div>`;
+  return `<div class="stack">
+    ${card(`<span class="eyebrow">Governance</span><h1>Proposals</h1><p>There are no admin keys: parameter changes, treasury spends, upgrades and community distributions are ${term("proposal", "proposals")} that FANG holders vote on, locking what they vote with (${term("conviction", "conviction")}). Passed proposals wait out a ${term("timelock", "timelock")} before they execute.</p>
+      <p class="dim">Vote from the wallet, the SDK (<span class="mono">wallet.vote(id, true, "10", 2)</span>), the MCP's <span class="mono">vote</span> tool, or <span class="mono">blockula gov vote</span>.</p>`, "learn")}
+    ${card(`<h2>All proposals (${ps.length})</h2>${ps.length ? `<div class="rows">${ps.map(row).join("")}</div>` : '<p class="empty">No proposals yet.</p>'}`)}
+  </div>`;
+};
+
+views.proposal = async function (id) {
+  const raw = await api("/proposal/" + encodeURIComponent(id));
+  const p = proposalOf(raw);
+  const votes = list(raw.votes ?? raw, "votes", "ballots");
+  const council = list(raw.council && raw.council.votes ? raw.council.votes : raw.council_votes);
+  const voteRow = (x) => `<div class="row"><div>${whoAny(pick(x, "voter", "account", "from"))} <span class="dim">· ${x.aye === true || x.vote === "aye" ? "aye" : "nay"}${amount(x, "amount") ? ` with ${esc(amount(x, "amount"))}` : ""}${x.conviction != null ? ` at ${x.conviction == 0 ? "0.1" : esc(x.conviction)}× ${term("conviction", "conviction")}` : ""}${amount(x, "weight") ? ` = ${esc(amount(x, "weight"))} of weight` : ""}</span></div>${x.locked_until != null ? `<span class="dim">locked until #${esc(x.locked_until)}</span>` : ""}</div>`;
+  return `<div class="stack">
+    ${card(`<span class="eyebrow">Proposal #${esc(p.id)}</span><div class="summary">${esc(p.title)}</div><p>${esc(p.summary)}</p>${statusPill(p.status)} ${p.url ? `<span class="dim">· full text: ${link(p.url)}</span>` : ""}`)}
+    ${card(`<dl>
+      <dt>Proposed by</dt><dd>${whoAny(p.proposer)}${raw.created_at != null ? ` at block <a href="#/block/${esc(raw.created_at)}">#${esc(raw.created_at)}</a>` : ""}</dd>
+      ${p.deposit ? `<dt>Deposit</dt><dd>${esc(p.deposit)} <span class="dim">(refunded once it reaches quorum, burned if it doesn't)</span></dd>` : ""}
+      <dt>Tally</dt><dd>${tallyBar(p)}${esc(p.ayeShown || "0 FANG")} aye · ${esc(p.nayShown || "0 FANG")} nay${p.threshold ? ` · needs ${pct(p.threshold)} aye` : " · needs a simple majority"}</dd>
+      ${p.turnout || p.quorum ? `<dt>Quorum</dt><dd>${esc(p.turnout || "0 FANG")} locked of ${esc(p.quorum || "?")} needed</dd>` : ""}
+      ${p.council ? `<dt>${term("council", "Bootstrap council")}</dt><dd>${councilText(p.council)}</dd>` : ""}
+      ${p.endsAt != null ? `<dt>Voting ends</dt><dd>block #${esc(p.endsAt)}</dd>` : ""}
+      ${p.executesAt != null ? `<dt>${term("timelock", "Executes")}</dt><dd>block #${esc(p.executesAt)}</dd>` : ""}
+    </dl>
+    <details><summary>What exactly it does</summary><pre class="mono">${esc(JSON.stringify(raw.kind ?? raw.action ?? null, null, 2))}</pre></details>`)}
+    ${council.length ? card(`<h2>Council votes (${council.length})</h2><div class="rows">${council.map(voteRow).join("")}</div>`) : ""}
+    ${card(`<h2>Votes (${votes.length})</h2>${votes.length ? `<div class="rows">${votes.map(voteRow).join("")}</div>` : '<p class="empty">No votes yet.</p>'}`)}
+  </div>`;
+};
+
+// ---- Chain parameters (node/src/params.rs), changeable only by ParamChange proposals. ----
+
+const PARAM_GROUPS = [["staking", /^(min_self_bond|max_validators|unbonding|slash|downtime|jail|reporter|commission|insider|evidence)/], ["fees", /^(base_fee|target_fullness|max_block_bytes|account_creation|max_tx_validity)/], ["issuance", /^issuance/], ["governance", /^(proposal|voting|timelock|quorum|supermajority|treasury|lock_period|governance|bootstrap)/], ["names", /^name_/], ["beacon", /^beacon/], ["Ghost Mode", /^ghost/]];
+const paramValue = (k, v, ms) => {
+  if (!/^\d+$/.test(String(v))) return esc(v);
+  const n = Number(v);
+  if (/_bps$/.test(k)) return `${pct(v)} <span class="dim">(${esc(v)} bps)</span>`;
+  if (/_ppm$/.test(k)) return `${(n / 10000).toLocaleString("en-US", { maximumFractionDigits: 4 })}% <span class="dim">(${esc(v)} ppm)</span>`;
+  if (/_bytes$/.test(k)) return `${n >= 1048576 ? `${n / 1048576} MiB` : n >= 1024 ? `${n / 1024} KiB` : `${n} bytes`}`;
+  if (/(_blocks|_height)$/.test(k)) return `${n.toLocaleString("en-US")} blocks <span class="dim">(${k.endsWith("_height") ? "≈ " : ""}${span(n, ms)})</span>`;
+  if (/^(min_self_bond|account_creation_fee|proposal_deposit|quorum_floor|name_price_\d|ghost_pool_cap|base_fee_floor_flat)$/.test(k)) return esc(fmtDrops(v));
+  return n.toLocaleString("en-US");
+};
+
+views.params = async function () {
+  const [r, s, fees] = await Promise.all([api("/params").catch(() => null), api("/status"), api("/fees").catch(() => null)]);
+  if (!r) return card(`<span class="eyebrow">Chain parameters</span><h1>Parameters</h1><p class="empty">This node doesn't serve its parameters yet (protocol v1).</p>`, "learn");
+  const all = r.params && typeof r.params === "object" ? r.params : r;
+  const entries = Object.entries(all).map(([k, v]) => [k, v && typeof v === "object" ? pick(v, "value") : v]).filter(([, v]) => v != null && typeof v !== "object");
+  const groups = PARAM_GROUPS.map(([g, re]) => [g, entries.filter(([k]) => re.test(k))]);
+  const other = entries.filter(([k]) => !PARAM_GROUPS.some(([, re]) => re.test(k)));
+  if (other.length) groups.push(["other", other]);
+  const perByte = fees && pick(fees, "base_fee_per_byte", "per_byte");
+  const feeLine = fees ? [perByte != null && `base fee ${esc(perByte)} drops per byte`, amount(fees, "typical_transfer_fee", "transfer_fee") && `a transfer costs about ${esc(amount(fees, "typical_transfer_fee", "transfer_fee"))}`].filter(Boolean).join(" · ") : "";
+  return `<div class="stack">
+    ${card(`<span class="eyebrow">Chain parameters</span><h1>Parameters</h1><p>The rules of <b>${esc(s.chain_id)}</b> that can change without new software: only a ${term("proposal", "ParamChange proposal")} that passes changes one, within bounds written into the code. Durations are in blocks of ${esc(s.block_time_ms)} ms.</p>${feeLine ? `<p class="dim">Right now: ${feeLine}.</p>` : ""}`, "learn")}
+    ${groups.filter(([, xs]) => xs.length).map(([g, xs]) => card(`<h2>${esc(g)}</h2><table class="params">${xs.map(([k, v]) => `<tr><td>${esc(k)}</td><td>${paramValue(k, v, s.block_time_ms)}</td></tr>`).join("")}</table>`)).join("")}
   </div>`;
 };
 
@@ -438,7 +588,7 @@ async function route() {
   const [, view = "", id = ""] = location.hash.split("/");
   const fn = views[view] || views.home;
   // Detail pages (a block, tx, account, name) don't belong to one section; a single hunt does.
-  const section = { block: null, tx: null, account: null, name: null, hunt: "hunts", claim: "contribute", seance: "contribute" }[view];
+  const section = { block: null, tx: null, account: null, name: null, hunt: "hunts", claim: "contribute", seance: "contribute", proposal: "governance" }[view];
   const current = section === undefined ? view : section;
   document.querySelectorAll("nav a").forEach((a) => a.toggleAttribute("aria-current", current !== null && a.getAttribute("href") === `#/${current}`));
   try { $("#app").innerHTML = await fn(decodeURIComponent(id)); }
@@ -452,6 +602,8 @@ $("#search").addEventListener("submit", async (e) => {
 });
 window.addEventListener("hashchange", route);
 route();
+// Test chains say so in the footer; mainnet doesn't.
+api("/status").then((s) => { if (s.chain_id === "blockula-1") $("#imprint").textContent = "Post-quantum signatures · ML-DSA-65"; }).catch(() => {});
 setInterval(() => { if (!location.hash || location.hash === "#/") route(); }, 3000);
 </script>
 </body>

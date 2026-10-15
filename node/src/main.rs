@@ -218,6 +218,16 @@ enum Cmd {
         #[command(subcommand)]
         cmd: gov_cli::MultisigCmd,
     },
+    /// 🪪 .boo names: show, renew, transfer, release
+    Name {
+        #[command(subcommand)]
+        cmd: contrib_cli::NameCmd,
+    },
+    /// 🥩 Stake: delegate to validator pools, unbond, withdraw
+    Stake {
+        #[command(subcommand)]
+        cmd: contrib_cli::StakeCmd,
+    },
     /// Become (or manage) a validator
     Validator {
         #[command(subcommand)]
@@ -349,6 +359,8 @@ fn main() -> Result<()> {
         Cmd::Release { cmd } => release_cli::run(cmd),
         Cmd::Gov { cmd } => gov_cli::gov(cmd, &blockula_dir()),
         Cmd::Multisig { cmd } => gov_cli::multisig(cmd, &blockula_dir()),
+        Cmd::Name { cmd } => contrib_cli::name(cmd, &blockula_dir()),
+        Cmd::Stake { cmd } => contrib_cli::stake(cmd, &blockula_dir()),
         Cmd::Keygen => {
             let k = crypto::Keys::generate();
             println!("{}", serde_json::json!({ "address": k.address(), "seed": k.seed_hex() }));
