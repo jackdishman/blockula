@@ -121,17 +121,19 @@ What runs today (Commonware `=2026.9.0`: consensus, p2p, broadcast, storage, run
 - **p2p:** `authenticated::discovery` over tokio with ML-DSA-65 identities (the validator's account seed). The genesis lists every genesis validator's `public_key`, `p2p_addr` and `http_addr`.
   - `--bind` sets the local interface (127.0.0.1 by default; 0.0.0.0 or :: on servers). Peers dial the advertised address, which comes from genesis or from a registration.
   - The `recommended` preset is used for public advertised addresses and `local` for private ones.
-- **Epochs and validator onboarding (Season 0 allowlist):**
-  - Genesis has `epoch_blocks`, `validator_admins`, `min_bond` and `max_validators` (32).
-  - Txs: `register_validator` (bonds FANG, creates a *pending* validator owned by the sender), `approve_validator` / `remove_validator` (admins only), and `unbond` (one full epoch after the validator left).
-  - After executing the last block of epoch *e*, every node computes the set for *e+1* from state: current members minus removed ones, plus approved ones in approval order, capped. It is never empty, and removals that would leave no validator are rejected.
+- **Epochs and validators (permissionless staking, `node/src/staking.rs`, MAINNET-DESIGN 3.4):**
+  - Genesis has `epoch_blocks`, an operator (owner, self-bond, commission) for every validator, and the staking parameters (`min_self_bond`, `max_validators`, unbonding, slashing, downtime). Dev and test chains may keep `validator_admins`.
+  - Every validator owns a stake pool with share accounting: `delegate`, `undelegate` (unbonding for `unbonding_blocks`, then `withdraw_unbonded`), `redelegate`; rewards raise every share's value and the owner's commission is minted to it as shares. `register_validator` is permissionless (self-bond ≥ `min_self_bond`, proof of possession).
+  - After executing the last block of epoch *e*, every node computes the set for *e+1* from state: the top `max_validators` eligible validators by pool stake (not jailed, tombstoned or removed; self-bond at least the minimum), ties by address; newcomers make up at most ⌊(m−1)/3⌋ of the new set (the members carried over finalize on their own while newcomers sync), ineligible members always leave, and it is never empty. Votes are one per validator.
+  - Double-signing (simplex's own evidence, `report_equivocation`) slashes the pool and the stake that left it since that epoch began, pays the reporter a share, and tombstones the validator. Missing more than `downtime_max_missed` of its last `downtime_window` leader slots jails it until `unjail`. A block's unadmittable txs cost its proposer (CV-5), and verifiers replay unexecuted ancestors exactly before voting.
+  - On dev and test chains, `approve_validator` pins a validator ahead of stake and `remove_validator` takes it out for good (admins only).
   - The set is part of state and of the state root.
   - At the boundary, the node `track`s the new peer set and starts a new simplex engine and scheme for *e+1*, with the boundary block as its floor. This follows the Commonware reshare orchestrator, minus the DKG.
   - Vote, certificate and resolver channels are muxed by epoch. A node that sees votes from a later epoch hints marshal to fetch our epoch's boundary finalization, so it catches up epoch by epoch.
   - Marshal spans epochs through an epoch-scoped scheme provider.
   - Nodes outside the active set observe (verify-only scheme) until their activation epoch.
-  - CLI: `blockula validator init|register|approve|remove|unbond|list`.
-  - API: `/api/validators`. The explorer has a Validators page with every admin action.
+  - CLI: `blockula validator init|register|delegate|undelegate|withdraw|unjail|commission|stake|approve|remove|list`.
+  - API: `/api/validators`, `/api/staking/{account}`. The explorer has a Validators page with the set, candidates, jailings and slashes.
 - **Mempool:** a tx submitted to any validator is checked against state + mempool, then gossiped to all validators on its own channel and de-duplicated by id. After each finalized block, included or now-invalid txs are evicted.
 - **Faucet (testnets):** each validator's genesis-funded account pays its own faucet drips, so there's no shared secret and no nonce races. Full nodes forward faucet requests.
 - `blockula summon <id> [--validators N]`, `blockula run --home`, `blockula dev` (one-validator simplex).
@@ -180,15 +182,16 @@ Next:
   - **GitHub rate limits:** each validator makes 2 GitHub calls per pending claim (set `GITHUB_TOKEN` on validators). If GitHub is unreachable, claims stay pending and are refunded after ~7 days.
   - **Funding:** until issuance starts (Phase 3), the pool only holds donations and slashed bonds.
   - **Cost:** the contribution state is hashed whole into every block's state root (like Hunts), and some lookups scan all claims or grants.
-  - **Attestation fees** come from each validator's own (consensus-key) account. A validator registered from a separate owner account needs some FANG at its own address, or its attestations fail; if a third of the set can't attest, claims never reach quorum.
-  - **Mempool estimates:** the proposer's dry run of not-yet-executed blocks skips end-of-block Séance steps (like epoch ends). That only delays or fails a tx (fee charged); it doesn't affect consensus.
+  - **Attestation fees** come from the validator's owner when it has a separate one (SF-13: the consensus key signs with `from` = the owner), else from the consensus key's own account. `BLOCKULA_SYSTEM_FEES=self` makes the consensus key's account pay regardless (the owner's nonce is shared with whatever else signs for it).
+  - **Mempool estimates:** admission dry-runs a tx after its sender's queued txs on the executed state, not through the end-of-block steps of blocks still being finalized. That only delays or fails a tx (fee charged); it doesn't affect consensus. (Proposals and verification replay unexecuted blocks exactly, end-of-block steps included.)
   - **Default timings are consensus rules.** Chains whose genesis omits `contribution` (the public testnet included) take them from code, as they do every constant in `poc.rs`, so changing them is a coordinated upgrade.
 
 - **The PQ p2p transport is a vendored fork.** The hybrid X25519 + ML-KEM-768 handshake lives in a patched copy of `commonware-stream` 2026.9.0 (`node/vendor/`) until Commonware ships a pluggable KEM (#5183), and nodes on the older X25519-only transport can't peer with it. The public RPC's TLS is only post-quantum behind an edge that negotiates `X25519MLKEM768` (Fly's didn't when measured), and HTTPS certificates are still classical ([PQ-TRANSPORT.md](PQ-TRANSPORT.md)).
-- Validator onboarding is a Season 0 allowlist (admin approval), not permissionless staking. The bond isn't slashable yet: simplex reports attributable faults, but nothing acts on them. Voting power is one vote per validator.
-- An approved validator can't connect over p2p until approval (pending registrations aren't admitted as peers). It syncs from genesis via marshal once it's admitted, and votes once caught up. Until then it counts as offline, so approve at most ⌊(n−1)/3⌋ new validators per epoch.
+- Voting power is one vote per validator (stake decides who gets a seat, not how much it weighs: simplex's quorum counts signers, DEC-3).
+- A candidate connects over p2p as a secondary peer once it's eligible and among the likeliest to join (capped, so the peer set stays under the p2p layer's limit). It syncs via marshal and votes once caught up; until then it counts as offline, which the churn limit bounds.
+- Equivocation is caught only if some honest node sees both votes; reports are best effort (each node keeps its evidence in `evidence.json` until the chain acts on it).
 - If every genesis validator is removed, new nodes still bootstrap from genesis addresses plus the active validators in their *local* state. A brand-new node then needs at least one genesis validator to be reachable, or to start from a peer's copy of the chain.
-- Simplex journals are kept for the current epoch and the two before it (older ones are deleted). Only the last 8 epochs' sets are kept in state, so `/api/sync` can only certify batches from recent epochs for nodes that are far behind.
+- Simplex journals are kept for the current epoch and the two before it (older ones are deleted). State keeps the validator sets of the evidence window (`evidence_max_age_epochs`, at least 8 epochs), so `/api/sync` can only certify batches from those epochs for nodes that are far behind.
 - Rate limits are in-memory and per node, so restarting a node resets them, and each node in a pool counts separately. No proxy header is trusted by default.
 - `join` fully backfills from genesis over HTTP and trusts no single peer (certificates are verified), but there's no snapshot sync yet. Full nodes don't serve `/api/sync` themselves.
 - Behind NAT (e.g. Fly dedicated IPs), peers see the NATed source address. If the recommended preset rejects such peers, run with `--p2p-preset local`.

@@ -184,7 +184,8 @@ await phone.removeKey(agent.keyId);
 await assert.rejects(agent.send(bob.address, "0.1"), /isn't authorized/);
 console.log("✓ second device revoked the agent");
 
-// Validator onboarding (Season 0): anyone can bond and register; only admins approve.
+// Validator onboarding: anyone can bond and register (a candidate, selected by stake at an epoch
+// boundary); on dev and test chains only admins may pin or remove validators.
 const vinfo = await client.validators();
 // Stands in for a validator node's consensus key; it proves possession by signing the registration.
 const nodeKeys = ml_dsa65.keygen(randomBytes(32));
@@ -201,10 +202,10 @@ if (minBond + parseFang("1") <= BigInt((await client.account(alice.address)).bal
   const reg = await alice.registerValidator({ consensusKey, p2pAddr, httpAddr, bond: minBond, pop });
   console.log("✓", reg.summary);
   const after = await client.validators();
-  assert.ok(after.pending.some((v: any) => v.validator.address === node.address), "registered validator is pending");
+  assert.ok(after.candidates.some((v: any) => v.validator.address === node.address), "a registered validator is a candidate");
   await assert.rejects(alice.approveValidator(node.address), /only validator admins/);
-  await assert.rejects(alice.unbond(node.address), /only removed validators/);
-  console.log(`✓ validator pending admin approval (epoch ${after.epoch}, ${after.blocks_until_next_epoch} blocks to the next one)`);
+  await assert.rejects(alice.unbond(node.address), /Unbond is gone/);
+  console.log(`✓ validator registered as a candidate (epoch ${after.epoch}, ${after.blocks_until_next_epoch} blocks to the next one)`);
 } else {
   console.log(`(skipping validator registration: min bond ${vinfo.min_bond_display} exceeds the faucet drip)`);
 }
@@ -282,12 +283,18 @@ if (process.env.BLOCKULA_ADMIN_SEED) {
 console.log("✓ Proof of Contribution txs verify and enforce their rules");
 
 // Protocol v1 (tags 30–49): the SDK signs them and the node verifies them; modules that haven't
-// shipped yet refuse them with "not active yet". Names renew, transfer and release.
+// shipped yet refuse them with "not active yet". Staking works; names renew, transfer and release.
 const validator: string = (await client.validators()).active[0].validator.address;
+// Staking: delegate to the dev validator, start unbonding part of it; nothing is free yet.
+console.log("✓", (await client.submit(await alice.build({ type: "delegate", validator, amount: parseFang("2").toString() }))).summary);
+console.log("✓", (await client.submit(await alice.build({ type: "undelegate", validator, shares: parseFang("1").toString() }))).summary);
+await assert.rejects(client.submit(await alice.build({ type: "withdraw_unbonded" })), /nothing has finished unbonding/);
+await assert.rejects(client.submit(await alice.build({ type: "unjail", validator })), /only validator .*'s owner|isn't jailed/);
+const staking = await (await fetch(`${process.env.BLOCKULA_RPC ?? "http://localhost:7070"}/api/staking/${alice.address}`)).json();
+assert.equal(staking.delegations.find((d: any) => d.validator.address === validator).value, parseFang("1").toString());
+assert.equal(staking.unbonding, parseFang("1").toString());
+console.log("✓", staking.summary);
 const notYet: Action[] = [
-  { type: "delegate", validator, amount: "1" },
-  { type: "undelegate", validator, shares: "1" },
-  { type: "withdraw_unbonded" },
   { type: "propose", kind: { type: "param_change", key: "max_validators", value: "40" }, deposit: "1", title: "e2e" },
   { type: "vote", proposal_id: 0, aye: true, amount: "1", conviction: 1 },
   { type: "unlock" },

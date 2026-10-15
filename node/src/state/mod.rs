@@ -433,14 +433,14 @@ impl State {
     }
 
     /// Accounting and consistency: every drop of the supply sits in a balance or an escrow
-    /// (open hunts, validator bonds, vouches, jurors, claim bonds, unwithdrawn grants, open
-    /// Séance budgets), and records that refer to each other agree. `Err` names the first problem.
+    /// (open hunts, stake pools and unbonding entries, vouches, jurors, claim bonds, unwithdrawn
+    /// grants, open Séance budgets), and records that refer to each other agree. `Err` names the
+    /// first problem.
     pub fn check_invariants(&self) -> Result<()> {
         let p = &self.poc;
         let mut held: u128 = self.accounts.values().map(|a| a.balance as u128).sum();
         let open_hunts: Vec<&crate::chain::Hunt> = self.hunts.values().filter(|h| h.status == HuntStatus::Open).collect();
         held += open_hunts.iter().map(|h| h.amount as u128).sum::<u128>();
-        held += self.validators.values().map(|v| v.bond as u128).sum::<u128>();
         held += p.vouches.values().map(|v| v.bond as u128).sum::<u128>();
         held += p.jurors.values().map(|r| r.bond as u128).sum::<u128>();
         held += p.claims.values().map(|c| c.bond as u128).sum::<u128>();

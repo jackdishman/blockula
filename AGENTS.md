@@ -35,7 +35,8 @@
 | GET | `/api/key/{key_id}` | accounts this key is authorized on |
 | GET | `/api/search/{q}` | `{type, id}` for anything |
 | POST | `/api/faucet` `{to}` | 100 FANG on faucet chains (1 per address/hour, 1 per IP/10 min; unlimited from localhost) |
-| GET | `/api/validators` | epoch, blocks until the next one, active / next-epoch / pending / approved / removed validators, admins, min bond |
+| GET | `/api/validators` | epoch, blocks until the next one, active / next-epoch (joining, leaving) / candidate / jailed / tombstoned / removed validators with stake, self-bond, commission, jail and liveness; the churn limit, min self-bond, slashing and downtime parameters |
+| GET | `/api/staking/{address\|name}` | an account's delegations (shares, value, earnings), unbonding and redelegation entries (and when they're free), the validators it runs, a `summary` |
 | GET | `/api/genesis` | the chain's genesis.json |
 | GET | `/api/sync?from=&limit=` | finalized consensus blocks + a finalization certificate (served by every node; used by `blockula join`); `410` `pruned` when `from` is below `history_from` |
 | GET | `/api/mempool?limit=` | pending txs |

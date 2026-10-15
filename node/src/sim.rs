@@ -123,12 +123,14 @@ const EPOCH_BLOCKS: u64 = 10;
 
 /// Summons a 4-validator chain (epochs of `EPOCH_BLOCKS`) with genesis at the simulated epoch.
 fn summon(name: &str) -> (PathBuf, Vec<PathBuf>, Genesis, Vec<[u8; 32]>) {
-    summon_with(name, EPOCH_BLOCKS)
+    summon_with(name, EPOCH_BLOCKS, &[])
 }
 
-fn summon_with(name: &str, epoch_blocks: u64) -> (PathBuf, Vec<PathBuf>, Genesis, Vec<[u8; 32]>) {
+/// [`summon`] with another epoch length and genesis parameter overrides.
+fn summon_with(name: &str, epoch_blocks: u64, params: &[(&str, u64)]) -> (PathBuf, Vec<PathBuf>, Genesis, Vec<[u8; 32]>) {
     let root = std::env::temp_dir().join(format!("blockula-{name}-{}", crate::chain::now_ms()));
-    let homes = Chain::summon(&root, &SummonOpts { epoch_blocks, ..SummonOpts::new("sim", 4) }).unwrap();
+    let params = params.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+    let homes = Chain::summon(&root, &SummonOpts { epoch_blocks, params, ..SummonOpts::new("sim", 4) }).unwrap();
     // The simulated clock starts at the Unix epoch, so genesis must too.
     for h in &homes {
         let mut g = Genesis::load(&h.join("genesis.json")).unwrap();
@@ -256,92 +258,128 @@ fn four_validators_finalize_gossip_crash_and_recover() {
     std::fs::remove_dir_all(root).ok();
 }
 
-/// Season 0 onboarding: a 5th validator registers (bonding FANG), an admin approves it, it
-/// becomes active at the next epoch boundary and proposes + signs finalizations; then an admin
-/// removes a genesis validator and the network keeps finalizing with everyone agreeing.
-#[test]
-fn validator_joins_at_epoch_boundary_and_genesis_validator_is_removed() {
-    let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_env("BLOCKULA_LOG").unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off"))).with_test_writer().try_init();
-    let (root, homes, genesis, seeds) = summon("epochs");
-    let new_seed = [77u8; 32];
-    let new_home = root.join("v4");
-    std::fs::create_dir_all(&new_home).unwrap();
-    std::fs::copy(homes[0].join("genesis.json"), new_home.join("genesis.json")).unwrap();
-    std::fs::write(new_home.join("validator.key"), hex::encode(new_seed)).unwrap();
+/// A home for a would-be validator: the chain's genesis and its own key.
+fn newcomer_home(root: &std::path::Path, genesis_from: &std::path::Path, name: &str, seed: [u8; 32]) -> PathBuf {
+    let home = root.join(name);
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::copy(genesis_from.join("genesis.json"), home.join("genesis.json")).unwrap();
+    std::fs::write(home.join("validator.key"), hex::encode(seed)).unwrap();
+    home
+}
 
-    let executor = deterministic::Runner::timed(Duration::from_secs(1800));
+fn register(g: &Genesis, keys: &Keys, nonce: u64, bond: u64, port: u16) -> Tx {
+    let (p2p, http) = (format!("127.0.0.1:{port}"), format!("127.0.0.1:{}", port + 1));
+    let pop = crate::chain::make_pop(keys.seed(), &g.chain_id, &keys.address(), &p2p, &http);
+    signed(g, keys, nonce, Action::RegisterValidator { consensus_key: hex::encode(keys.public_key()), p2p_addr: p2p, http_addr: http, bond, pop })
+}
+
+/// CV-2 and CV-4 on the real consensus path: the set is full (max 4); two candidates register
+/// permissionlessly with more stake than the genesis validators (one also gets a delegation) and
+/// each replaces the weakest member, one per epoch (⌊(4−1)/3⌋ = 1), then proposes and signs
+/// finalizations. An admin of this test chain then removes a member; a displaced candidate
+/// takes its seat. Every node agrees throughout.
+#[test]
+fn candidates_join_by_stake_within_the_churn_limit() {
+    let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_env("BLOCKULA_LOG").unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off"))).with_test_writer().try_init();
+    let (root, homes, genesis, seeds) = summon_with("churn", EPOCH_BLOCKS, &[("max_validators", 4)]);
+    let new_seeds = [[77u8; 32], [78u8; 32]];
+    let new_homes: Vec<PathBuf> = new_seeds.iter().enumerate().map(|(i, s)| newcomer_home(&root, &homes[0], &format!("n{i}"), *s)).collect();
+
+    let executor = deterministic::Runner::timed(Duration::from_secs(3_000));
     executor.start(|context| async move {
-        let new_key = PrivateKey::from_seed_bytes(new_seed);
-        let new_pk = commonware_cryptography::Signer::public_key(&new_key);
-        let mut oracle = network(&context, &genesis, &[new_pk.clone()]).await;
+        let new_keys: Vec<PrivateKey> = new_seeds.iter().map(|s| PrivateKey::from_seed_bytes(*s)).collect();
+        let new_pks: Vec<PublicKey> = new_keys.iter().map(commonware_cryptography::Signer::public_key).collect();
+        let mut oracle = network(&context, &genesis, &new_pks).await;
         let mut vals = vec![];
         for (i, (home, seed)) in homes.iter().zip(&seeds).enumerate() {
             vals.push(start(&context, &mut oracle, &genesis, i, 0, home.clone(), PrivateKey::from_seed_bytes(*seed)).await);
         }
-        // The would-be validator runs from the start: it observes (and syncs) until it's active.
-        vals.push(start(&context, &mut oracle, &genesis, 4, 0, new_home.clone(), new_key.clone()).await);
+        // The candidates run from the start: they observe (and sync) until they're in the set.
+        for (i, (home, key)) in new_homes.iter().zip(&new_keys).enumerate() {
+            vals.push(start(&context, &mut oracle, &genesis, 4 + i, 0, home.clone(), key.clone()).await);
+        }
         wait_for_height(&context, &vals, 2).await;
 
         let admin = Keys::from_seed(seeds[0]);
         assert_eq!(genesis.validator_admins, vec![admin.address()]);
-        let newbie = Keys::from_seed(new_seed);
-        let me = newbie.address();
-        // Fund it, register (bond = chain minimum), approve. Each tx goes to a different node.
-        vals[0].chain.lock().submit(signed(&genesis, &admin, 0, Action::Transfer { to: me.clone(), amount: 100 * DROPS_PER_FANG })).unwrap();
-        wait_until(&context, "funding", || vals[2].chain.lock().state.account(&me).balance > 0).await;
-        let bond = genesis.chain_params().unwrap().min_self_bond;
-        let pop = crate::chain::make_pop(new_seed, "sim", &me, "127.0.0.1:30304", "127.0.0.1:7074");
-        let reg = Action::RegisterValidator { consensus_key: hex::encode(newbie.public_key()), p2p_addr: "127.0.0.1:30304".into(), http_addr: "127.0.0.1:7074".into(), bond, pop };
-        // A stranger can't approve; the admin can.
-        let stranger = Keys::from_seed(seeds[1]);
-        assert!(vals[1].chain.lock().submit(signed(&genesis, &stranger, 0, Action::ApproveValidator { validator: me.clone() })).is_err());
-        vals[1].chain.lock().submit(signed(&genesis, &newbie, 0, reg)).unwrap();
-        wait_until(&context, "registration", || vals[3].chain.lock().state.validators.get(&me).is_some_and(|v| v.status == ValidatorStatus::Pending)).await;
-        {
+        let min = genesis.chain_params().unwrap().min_self_bond;
+        let (a, b) = (Keys::from_seed(new_seeds[0]), Keys::from_seed(new_seeds[1]));
+        // Fund them; at the start of an epoch, both register with more than the genesis
+        // validators' self-bond, `b` with more than `a`, and `b` also gets a delegation. No
+        // approval anywhere.
+        vals[0].chain.lock().submit(signed(&genesis, &admin, 0, Action::Transfer { to: a.address(), amount: 1_000 * DROPS_PER_FANG })).unwrap();
+        vals[0].chain.lock().submit(signed(&genesis, &admin, 1, Action::Transfer { to: b.address(), amount: 1_000 * DROPS_PER_FANG })).unwrap();
+        wait_until(&context, "funding", || vals[2].chain.lock().state.account(&b.address()).balance > 0).await;
+        let next_epoch = (vals[0].chain.lock().height() / EPOCH_BLOCKS + 1) * EPOCH_BLOCKS;
+        wait_for_height(&context, &vals[..1], next_epoch).await;
+        // (Genesis validators bonded twice the minimum.)
+        vals[1].chain.lock().submit(register(&genesis, &a, 0, 3 * min, 30_400)).unwrap();
+        vals[2].chain.lock().submit(register(&genesis, &b, 0, 4 * min, 30_500)).unwrap();
+        wait_until(&context, "registration", || vals[3].chain.lock().state.validators.get(&b.address()).is_some_and(|v| v.status == ValidatorStatus::Candidate)).await;
+        vals[3].chain.lock().submit(signed(&genesis, &admin, 2, Action::Delegate { validator: b.address(), amount: 100 * DROPS_PER_FANG })).unwrap();
+        wait_until(&context, "delegation", || vals[0].chain.lock().state.staking.pools[&b.address()].stake > 4 * min).await;
+        let same_epoch = {
             let c = vals[0].chain.lock();
-            let fees: u64 = (1..=c.height()).filter_map(|h| c.block(h)).flat_map(|b| b.txs).filter(|t| t.from == me).map(|t| t.fee).sum();
-            assert_eq!(c.state.account(&me).balance, 100 * DROPS_PER_FANG - bond - fees, "bond moved out of the balance");
-        }
-        vals[2].chain.lock().submit(signed(&genesis, &admin, 1, Action::ApproveValidator { validator: me.clone() })).unwrap();
-        wait_until(&context, "activation", || vals.iter().all(|v| v.chain.lock().state.validators.get(&me).is_some_and(|r| r.status == ValidatorStatus::Active))).await;
-        let active_from = vals[0].chain.lock().state.validators[&me].active_from.unwrap();
-        let first_height = active_from * EPOCH_BLOCKS;
-        println!("✓ new validator active from epoch {active_from} (height {first_height})");
-        // Run a couple of epochs with 5 validators.
-        wait_for_height(&context, &vals, first_height + 2 * EPOCH_BLOCKS).await;
-        {
-            let c = vals[0].chain.lock();
-            assert_eq!(c.state.active_sets[&active_from].len(), 5);
-            let later: Vec<Block> = (first_height + 1..=c.height()).filter_map(|h| c.block(h)).collect();
-            let proposed = later.iter().filter(|b| b.proposer == me).count();
-            assert!(proposed > 0, "new validator proposed blocks");
-            // It signs finalization certificates: find its index in each epoch's set.
-            let mut signed_certs = 0;
-            for b in later.iter().filter(|b| c.cert_len(b.height) > 0) {
-                let epoch = c.state.params.epoch_of(b.height);
-                count_signed(&c, epoch, &new_pk, b, &mut signed_certs);
-            }
-            assert!(signed_certs > 0, "new validator's signature appears in finalization certificates");
-            println!("✓ new validator proposed {proposed} blocks and signed {signed_certs} finalization certificates");
-        }
+            let e = |v: &str| c.state.params.epoch_of(c.state.validators[v].registered_at);
+            e(&a.address()) == e(&b.address())
+        };
 
-        // Remove a genesis validator; the network must keep finalizing without it.
-        let removed = Keys::from_seed(seeds[3]).address();
-        vals[4].chain.lock().submit(signed(&genesis, &admin, 2, Action::RemoveValidator { validator: removed.clone() })).unwrap();
-        wait_until(&context, "removal", || vals.iter().all(|v| v.chain.lock().state.validators.get(&removed).is_some_and(|r| r.active_until.is_some()))).await;
+        // One seat changes per epoch: `b` first (more stake), then `a`.
+        let active = |addr: &str| vals.iter().all(|v| v.chain.lock().state.validators[addr].status == ValidatorStatus::Active);
+        wait_until(&context, "both activations", || active(&a.address()) && active(&b.address())).await;
+        let (ea, eb) = {
+            let c = vals[0].chain.lock();
+            (c.state.validators[&a.address()].active_from.unwrap(), c.state.validators[&b.address()].active_from.unwrap())
+        };
+        assert_eq!(ea.abs_diff(eb), 1, "one seat per epoch: they joined in consecutive epochs");
+        if same_epoch {
+            assert_eq!(ea, eb + 1, "b ranked first");
+        }
+        let (eb, ea) = (eb.min(ea), ea.max(eb));
+        assert_eq!(vals[0].chain.lock().state.active_sets[&eb].len(), 4);
+        {
+            let c = vals[0].chain.lock();
+            for e in eb.saturating_sub(1)..ea {
+                let (prev, next) = (&c.state.active_sets[&e], &c.state.active_sets[&(e + 1)]);
+                let replaced = prev.iter().filter(|v| !next.contains(v)).count();
+                assert!(replaced <= crate::staking::churn_limit(prev.len()), "epoch {e}: {replaced} replaced");
+            }
+            let displaced: Vec<String> = genesis.validators.iter().map(|v| v.address.clone()).filter(|v| !c.state.active_sets[&ea].contains(v)).collect();
+            assert_eq!(displaced.len(), 2);
+            assert!(displaced.iter().all(|v| c.state.validators[v].status == ValidatorStatus::Candidate && c.state.validators[v].active_until.is_some()));
+        }
+        // Both propose and sign finalizations.
+        let first = ea * EPOCH_BLOCKS;
+        wait_for_height(&context, &vals, first + 2 * EPOCH_BLOCKS).await;
+        {
+            let c = vals[0].chain.lock();
+            let later: Vec<Block> = (first + 1..=c.height()).filter_map(|h| c.block(h)).collect();
+            for (k, pk) in [(&a, &new_pks[0]), (&b, &new_pks[1])] {
+                assert!(later.iter().any(|blk| blk.proposer == k.address()), "{} proposed", k.address());
+                let mut signed_certs = 0;
+                for blk in later.iter().filter(|blk| c.cert_len(blk.height) > 0) {
+                    count_signed(&c, c.state.params.epoch_of(blk.height), pk, blk, &mut signed_certs);
+                }
+                assert!(signed_certs > 0, "{} signed finalizations", k.address());
+            }
+        }
+        // The admin lever of test chains: a removal is a mandatory exit, and a displaced
+        // candidate (still running) takes the seat.
+        let set_now = vals[0].chain.lock().state.active_sets[&ea].clone();
+        let removed = set_now.iter().find(|v| **v != a.address() && **v != b.address() && **v != admin.address()).unwrap().clone();
+        vals[4].chain.lock().submit(signed(&genesis, &admin, 3, Action::RemoveValidator { validator: removed.clone() })).unwrap();
+        wait_until(&context, "removal", || vals.iter().all(|v| v.chain.lock().state.validators[&removed].active_until.is_some_and(|e| e >= ea))).await;
         let gone_after = vals[0].chain.lock().state.validators[&removed].active_until.unwrap();
-        let target = (gone_after + 3) * EPOCH_BLOCKS;
-        wait_for_height(&context, &vals, target).await;
+        wait_for_height(&context, &vals, (gone_after + 3) * EPOCH_BLOCKS).await;
         let c0 = vals[0].chain.lock();
-        assert!(!c0.state.active_sets[&(gone_after + 1)].contains(&removed));
-        assert_eq!(c0.state.active_sets[&(gone_after + 1)].len(), 4);
-        assert!(((gone_after + 1) * EPOCH_BLOCKS + 1..=c0.height()).filter_map(|h| c0.block(h)).all(|b| b.proposer != removed));
+        let after = &c0.state.active_sets[&(gone_after + 1)];
+        assert!(!after.contains(&removed) && after.len() == 4, "{after:?}");
+        assert_eq!(c0.state.validators[&removed].status, ValidatorStatus::Removed);
         drop(c0);
-        // Can't unbond until a full epoch after leaving; nobody but the owner can.
         let h = vals.iter().map(|v| v.chain.lock().height()).min().unwrap();
         let roots: Vec<String> = vals.iter().map(|v| v.chain.lock().root_at(h).unwrap().to_string()).collect();
         assert!(roots.windows(2).all(|w| w[0] == w[1]), "state roots diverged at {h}: {roots:?}");
-        println!("✓ 5 nodes agree at height {h} after a join and a removal");
+        println!("✓ two candidates joined one per epoch (epochs {eb} and {ea}); 6 nodes agree at height {h} after a removal");
     });
     std::fs::remove_dir_all(root).ok();
 }
@@ -583,6 +621,84 @@ fn validators_upgrade_one_at_a_time_and_a_laggard_halts_at_the_activation_height
     std::fs::remove_dir_all(root).ok();
 }
 
+/// A Byzantine validator that equivocates instead of running consensus (like simplex's own
+/// `Conflicter` mock, on our muxed vote channel): it answers every notarize it hears with two of
+/// its own for that round, one for a made-up block and one for the real one.
+async fn conflicter(context: &deterministic::Context, oracle: &mut Oracle<PublicKey, deterministic::Context>, genesis: &Genesis, key: PrivateKey) -> Handle<()> {
+    use commonware_codec::{Encode as _, ReadExt as _, varint::UInt};
+    use commonware_consensus::simplex::types::{Notarize, Proposal, Vote};
+    use commonware_p2p::{Receiver as _, Recipients, Sender as _};
+    use commonware_runtime::Spawner as _;
+    let control = oracle.control(commonware_cryptography::Signer::public_key(&key));
+    let mut channels = vec![];
+    for c in CHANNELS {
+        channels.push(control.register(c, consensus::quota(c)).await.unwrap());
+    }
+    let scheme = crate::pq::MlDsaScheme::signer(&consensus::namespace(&genesis.chain_id), consensus::participants(genesis).unwrap(), key).unwrap();
+    context.child("conflicter").spawn(move |_| async move {
+        let (mut sender, mut receiver) = channels.remove(consensus::CH_VOTES as usize);
+        let mut fake = 0u8;
+        while let Ok((_, msg)) = receiver.recv().await {
+            let mut buf = msg.as_ref();
+            let Ok(epoch) = UInt::<u64>::read(&mut buf).map(u64::from) else { continue };
+            let Ok(Vote::Notarize(theirs)) = Vote::<crate::pq::MlDsaScheme, Digest>::decode(buf) else { continue };
+            fake = fake.wrapping_add(1);
+            let made_up = Proposal::new(theirs.round(), theirs.proposal.parent, Digest([fake; 32]));
+            for p in [made_up, theirs.proposal.clone()] {
+                let vote = Vote::Notarize(Notarize::sign(&scheme, p).unwrap());
+                let out = [UInt(epoch).encode().to_vec(), vote.encode().to_vec()].concat();
+                let _ = sender.send(Recipients::All, out, true);
+            }
+        }
+        drop(channels);
+    })
+}
+
+/// CV-3 end to end: a validator double-signs; the honest nodes' engines catch it (historical
+/// votes kept), their evidence reporters verify it, their evidence tasks submit
+/// `ReportEquivocation`, and every node slashes and tombstones it identically. It leaves the set
+/// at the next boundary and the chain goes on without it.
+#[test]
+fn an_equivocating_validator_is_slashed_identically_everywhere() {
+    let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_env("BLOCKULA_LOG").unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off"))).with_test_writer().try_init();
+    let (root, homes, genesis, seeds) = summon("equivocate");
+    let executor = deterministic::Runner::timed(Duration::from_secs(3_000));
+    executor.start(|context| async move {
+        let mut oracle = network(&context, &genesis, &[]).await;
+        let mut vals = vec![];
+        for (i, (home, seed)) in homes.iter().zip(&seeds).enumerate().take(3) {
+            vals.push(start(&context, &mut oracle, &genesis, i, 0, home.clone(), PrivateKey::from_seed_bytes(*seed)).await);
+        }
+        let bad = Keys::from_seed(seeds[3]).address();
+        let _byzantine = conflicter(&context, &mut oracle, &genesis, PrivateKey::from_seed_bytes(seeds[3])).await;
+        let stake = vals[0].chain.lock().state.staking.pools[&bad].stake;
+        // Issuance mints every epoch, so the burn is what shows the slash.
+        let burned = vals[0].chain.lock().state.burned;
+        wait_until(&context, "the double-signer's slash", || vals.iter().all(|v| v.chain.lock().state.validators[&bad].status == ValidatorStatus::Tombstoned)).await;
+        let tombstoned_at = vals[0].chain.lock().state.staking.pools[&bad].tombstoned_at.unwrap();
+        // Out at the next boundary; three honest validators carry on.
+        let boundary = vals[0].chain.lock().state.params.epoch_of(tombstoned_at) + 1;
+        wait_for_height(&context, &vals, (boundary + 2) * EPOCH_BLOCKS).await;
+        let h = vals.iter().map(|v| v.chain.lock().height()).min().unwrap();
+        let roots: Vec<String> = vals.iter().map(|v| v.chain.lock().root_at(h).unwrap().to_string()).collect();
+        assert!(roots.windows(2).all(|w| w[0] == w[1]), "state roots diverged at {h}: {roots:?}");
+        let c = vals[0].chain.lock();
+        let p = &c.state.staking.pools[&bad];
+        assert!(p.stake < stake && p.slashed > 0, "slashed: {} of {stake}", p.slashed);
+        assert!(!c.state.staking.punished.is_empty());
+        for (key, rec) in c.state.staking.punished.iter() {
+            assert!(key.starts_with(&bad) && rec.kind == crate::staking::CONFLICTING_NOTARIZE && rec.slashed > 0);
+            assert!(genesis.validators.iter().any(|v| v.address == rec.reporter), "an honest validator reported it");
+        }
+        assert!(c.state.burned - burned >= p.slashed - p.slashed / 10, "the slash (less the reporters' 10%) was burned");
+        assert!(!c.state.active_sets[&boundary].contains(&bad));
+        assert_eq!(c.state.active_sets[&boundary].len(), 3);
+        let reports = (1..=c.height()).filter_map(|h| c.block(h)).flat_map(|b| b.txs).filter(|t| matches!(t.action, Action::ReportEquivocation { .. })).count();
+        println!("✓ the double-signer was slashed {} drops on every node ({} report tx(s), {} fault(s)); 3 nodes agree at height {h}", p.slashed, reports, c.state.staking.punished.len());
+    });
+    std::fs::remove_dir_all(root).ok();
+}
+
 /// OPS-6: a validator whose volume is restored from an old snapshot (its slashing-protection
 /// record from earlier, its consensus journal empty) comes back while the network is still in the
 /// same epoch and close to the views it had signed. It never signs in a view its earlier run
@@ -590,7 +706,7 @@ fn validators_upgrade_one_at_a_time_and_a_laggard_halts_at_the_activation_height
 /// Then it votes normally again, and nothing it signed conflicts with its earlier run.
 #[test]
 fn a_validator_restored_from_an_old_snapshot_does_not_double_sign() {
-    let (root, homes, genesis, seeds) = summon_with("restore", 1_000);
+    let (root, homes, genesis, seeds) = summon_with("restore", 1_000, &[]);
     let executor = deterministic::Runner::timed(Duration::from_secs(1_800));
     executor.start(|context| async move {
         let mut oracle = network(&context, &genesis, &[]).await;
@@ -651,6 +767,83 @@ fn a_validator_restored_from_an_old_snapshot_does_not_double_sign() {
         let roots: Vec<String> = vals.iter().map(|v| v.chain.lock().root_at(top).unwrap()).collect();
         assert!(roots.windows(2).all(|w| w[0] == w[1]), "state roots diverged at {top}: {roots:?}");
         println!("✓ restored validator resumed at view {first} (earlier run: through {old_view}, snapshot at {snapshot_view}); {} signatures, none conflicting; in {signed_certs} certificates", later.len());
+    });
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// CV-5 and downtime (CV-3) end to end. A Byzantine leader stuffs every proposal with a junk tx:
+/// honest verifiers replay the parent's state, find it unadmittable and reject the block, so none
+/// of its blocks finalize and nothing it stuffed is stored; its empty slots count as missed and
+/// it's jailed, leaves the set, and (behaving again) unjails and rejoins. Then a validator goes
+/// offline: jailed, out at the boundary, back after a restart and `Unjail`. Every node agrees.
+#[test]
+fn junk_leaders_and_offline_validators_are_jailed_and_come_back() {
+    let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_env("BLOCKULA_LOG").unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off"))).with_test_writer().try_init();
+    let (root, homes, genesis, seeds) = summon_with("jail", EPOCH_BLOCKS, &[("downtime_window", 8), ("downtime_max_missed", 3), ("jail_blocks", 15)]);
+    let executor = deterministic::Runner::timed(Duration::from_secs(6_000));
+    executor.start(|context| async move {
+        let mut oracle = network(&context, &genesis, &[]).await;
+        let mut vals = vec![];
+        for (i, (home, seed)) in homes.iter().zip(&seeds).enumerate() {
+            vals.push(start(&context, &mut oracle, &genesis, i, 0, home.clone(), PrivateKey::from_seed_bytes(*seed)).await);
+        }
+        wait_for_height(&context, &vals, 3).await;
+        let addr = |i: usize| Keys::from_seed(seeds[i]).address();
+        let jailed = |vals: &[Val], who: &str| vals.iter().all(|v| v.chain.lock().state.staking.pools[who].jail.is_some());
+        let in_set = |vals: &[Val], who: &str| vals.iter().all(|v| v.chain.lock().state.validators[who].status == ValidatorStatus::Active);
+        let unjail = |vals: &[Val], i: usize| {
+            let k = Keys::from_seed(seeds[i]);
+            let mut c = vals[0].chain.lock();
+            let nonce = c.next_nonce(&k.address());
+            c.submit(signed(&genesis, &k, nonce, Action::Unjail { validator: k.address() })).unwrap();
+        };
+
+        // The junk leader.
+        let (junk, from) = (addr(2), vals[2].chain.lock().height() + 1);
+        vals[2].chain.lock().junk_proposals = true;
+        wait_until(&context, "the junk leader's jailing", || jailed(&vals, &junk)).await;
+        wait_until(&context, "its exit", || !in_set(&vals, &junk)).await;
+        vals[2].chain.lock().junk_proposals = false;
+        let until = vals[0].chain.lock().state.staking.pools[&junk].jail.as_ref().unwrap().until;
+        {
+            let c = vals[0].chain.lock();
+            let p = &c.state.staking.pools[&junk];
+            assert!(p.jail.as_ref().unwrap().reason.contains("leader slots"), "{:?}", p.jail);
+            assert_eq!(p.junk_charged, 0, "none of its blocks was finalized, so it never paid for junk");
+            let later: Vec<Block> = (from + 1..=c.height()).filter_map(|h| c.block(h)).collect();
+            assert!(later.iter().all(|b| b.skipped.is_empty() && b.txs.iter().all(|t| !t.memo.starts_with("junk"))), "no junk was stored");
+            let p2 = later.iter().filter(|b| b.proposer == junk).count();
+            assert!(p2 <= 1, "its stuffed blocks were rejected ({p2} finalized)");
+        }
+        wait_for_height(&context, &vals, until).await;
+        unjail(&vals, 2);
+        wait_until(&context, "the junk leader's return", || in_set(&vals, &junk) && !jailed(&vals[..1], &junk)).await;
+
+        // The offline validator.
+        let gone = addr(1);
+        let mut v = vals.remove(1);
+        v.handle.take().unwrap().abort();
+        let (home, key) = (v.home.clone(), v.key.clone());
+        drop(v);
+        wait_until(&context, "the offline validator's jailing", || jailed(&vals, &gone)).await;
+        wait_until(&context, "its exit", || !in_set(&vals, &gone)).await;
+        let until = vals[0].chain.lock().state.staking.pools[&gone].jail.as_ref().unwrap().until;
+        wait_for_height(&context, &vals, until).await;
+        let restarted = start(&context, &mut oracle, &genesis, 1, 1, home, key).await;
+        vals.insert(1, restarted);
+        unjail(&vals, 1);
+        wait_until(&context, "the offline validator's return", || in_set(&vals, &gone)).await;
+        let target = vals[0].chain.lock().height() + 2 * EPOCH_BLOCKS;
+        wait_for_height(&context, &vals, target).await;
+        let h = vals.iter().map(|v| v.chain.lock().height()).min().unwrap();
+        let roots: Vec<String> = vals.iter().map(|v| v.chain.lock().root_at(h).unwrap().to_string()).collect();
+        assert!(roots.windows(2).all(|w| w[0] == w[1]), "state roots diverged at {h}: {roots:?}");
+        let c = vals[0].chain.lock();
+        for who in [&junk, &gone] {
+            let p = &c.state.staking.pools[who];
+            assert!(p.jail.is_none() && p.slashed > 0 && c.state.active_sets[&c.state.params.epoch_of(h)].contains(who));
+        }
+        println!("✓ a junk leader and an offline validator were jailed, slashed, and came back; 4 nodes agree at height {h}");
     });
     std::fs::remove_dir_all(root).ok();
 }

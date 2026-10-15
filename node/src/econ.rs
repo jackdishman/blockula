@@ -436,7 +436,6 @@ pub fn release_expired(state: &mut State, j: &mut Journal, account: &str, height
 /// Staking rewards credited to `account` at `height` vest like its allocation (3.7): they join
 /// its vesting lock's total, so what's still unvested of them stays locked and the rest is free.
 /// No vesting lock (or a finished one): nothing to do. Staking calls it when it pays rewards out.
-#[cfg_attr(not(test), allow(dead_code))] // P-STAKE (rewards paid out)
 pub fn lock_rewards(state: &mut State, j: &mut Journal, account: &str, amount: u64, height: u64) {
     let vesting = |l: &Lock| matches!(l.amount, LockAmount::Vesting { end, .. } if height < end);
     if amount == 0 || !state.accounts.get(account).is_some_and(|a| a.locks.iter().any(vesting)) {

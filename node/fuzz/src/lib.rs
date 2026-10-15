@@ -8,6 +8,8 @@
 //! [`harness`] has one entry point per fuzz target (`fuzz_targets/`); `tests/seeds.rs` runs them
 //! over the committed seeds on stable Rust.
 #![allow(dead_code, unused_imports, unused_macros, unused_variables, clippy::all)]
+// As in node/src/main.rs: `/api/status` and friends are large `json!` literals.
+#![recursion_limit = "256"]
 
 #[path = "../../src"]
 mod node_src {

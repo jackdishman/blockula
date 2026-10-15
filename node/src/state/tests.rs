@@ -391,7 +391,8 @@ fn namespaces_and_meta_keys_are_unique() {
 /// computed by an independent JS implementation of the record layout and tree (noble BLAKE3),
 /// recomputed when `Params` gained `address_prefix` (P-WIRE) and again for the protocol v1
 /// scaffold (schema 2: `chain_params`, the upgrade schedule, account locks). Schema 3 (P-ECON:
-/// the `econ` scalar record) changed it again; that value is from this implementation only.
+/// the `econ` scalar record; P-STAKE: staking's scalar) changed it again; that value is from this
+/// implementation only.
 #[test]
 fn golden_encodings() {
     let acct = Account { balance: 5, nonce: 2, keys: Default::default(), locks: vec![] };
@@ -401,8 +402,8 @@ fn golden_encodings() {
     st.supply = 5;
     st.commit_block().unwrap();
     assert_eq!(st.root_hash(), st.full_root());
-    assert_eq!(st.record_count(), 10);
-    assert_eq!(st.root(), "2cc96e7acb21b120b7a7cd28ac49f66da171b45d348c308885939f973b0f245a");
+    assert_eq!(st.record_count(), 11);
+    assert_eq!(st.root(), "6f696b8a7d1eefaa0471cbd9c186366ef8456f1d2787277344f4c6ce53444ad4");
 }
 
 fn million_accounts() -> State {
@@ -520,7 +521,7 @@ fn largest_records_fit_in_a_snapshot() {
     let locks = (0..MAX_LOCKS as u64).map(|id| Lock { id: format!("{id:0>MAX_LABEL$}"), amount: LockAmount::Vesting { total: u64::MAX, start: u64::MAX, cliff: u64::MAX, end: u64::MAX }, reason: s(MAX_LABEL) }).collect();
     st.accounts.insert(addr(0), Account { balance: u64::MAX, nonce: u64::MAX, keys, locks });
     st.names.insert(s(MAX_NAME_FIELD), NameRecord { name: s(MAX_NAME_FIELD), owner: addr(0), registered_at: 0, expires_at: u64::MAX });
-    let vr = ValidatorRecord { address: addr(1), owner: addr(0), consensus_key: "ab".repeat(crypto::PUBLIC_KEY_LEN), p2p_addr: s(MAX_ADDR), http_addr: s(MAX_ADDR), bond: u64::MAX, status: ValidatorStatus::Removed, registered_at: 0, approved_at: Some(0), approved_by: Some(addr(2)), active_from: Some(0), removed_at: Some(0), removed_by: Some(addr(2)), active_until: Some(0), unbond_epoch: Some(0), commission_bps: 0 };
+    let vr = ValidatorRecord { address: addr(1), owner: addr(0), consensus_key: "ab".repeat(crypto::PUBLIC_KEY_LEN), p2p_addr: s(MAX_ADDR), http_addr: s(MAX_ADDR), status: ValidatorStatus::Removed, registered_at: 0, approved_at: Some(0), approved_by: Some(addr(2)), active_from: Some(0), removed_at: Some(0), removed_by: Some(addr(2)), active_until: Some(0), commission_bps: 0 };
     st.validators.insert(addr(1), vr);
     // The largest set governance can configure (`max_validators` is bounded by params.rs).
     let (_, max_set) = crate::params::ChainParams::bounds("max_validators", &st.params).unwrap();
@@ -551,6 +552,19 @@ fn largest_records_fit_in_a_snapshot() {
     p.grants.insert(addr(0), (0..MAX_GRANTS as u64).map(|i| (i, grant(i))).collect());
     st.econ.reserved_names.insert(s(MAX_NAME_FIELD), crate::econ::ReservedName { reserved_at: u64::MAX });
     st.upgrade.features.insert(s(MAX_FEATURE), crate::upgrade::Feature { activated_at: u64::MAX });
+    // Staking: a jailed and tombstoned pool, a delegation, the larger entry kind, a punished
+    // fault, and liveness over the longest `downtime_window` governance can set.
+    {
+        use crate::staking::*;
+        let (_, window) = crate::params::ChainParams::bounds("downtime_window", &st.params).unwrap();
+        let sk = &mut st.staking;
+        let jail = Some(Jail { at: u64::MAX, until: u64::MAX, reason: s(MAX_REASON) });
+        sk.pools.insert(addr(1), Pool { stake: u64::MAX, shares: u128::MAX, commission_base: u64::MAX, commission_epoch: u64::MAX, jail, tombstoned_at: Some(u64::MAX), slashed: u64::MAX, rewards: u64::MAX, junk_charged: u64::MAX });
+        sk.delegations.insert(format!("{}/{}", addr(0), addr(1)), Delegation { shares: u128::MAX, principal: u64::MAX });
+        sk.entries.insert(format!("{}/{:020}", addr(0), u64::MAX), Entry::Redelegation { from: addr(1), to: addr(2), amount: u64::MAX, started_at: u64::MAX, release_at: u64::MAX });
+        sk.punished.insert(format!("{}/{:020}/{:020}", addr(1), u64::MAX, u64::MAX), Punished { kind: u8::MAX, height: u64::MAX, reporter: addr(2), slashed: u64::MAX });
+        sk.liveness.insert(addr(1), Liveness { window, bits: vec![0xff; window.div_ceil(8) as usize], next: u64::MAX, filled: u64::MAX, missed: u64::MAX, led: u64::MAX, missed_total: u64::MAX });
+    }
 
     let mut largest = std::collections::BTreeMap::new();
     st.for_each_record(|n, k, v| {

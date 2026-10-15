@@ -5,7 +5,7 @@
 //! from a stale one.
 
 use crate::{
-    chain::{BlockInfo, Chain, Genesis, Outcome, State},
+    chain::{Chain, Genesis, Outcome, State},
     checkpoints,
     consensus::{self, CBlock, Shared},
     crypto::Keys,
@@ -374,16 +374,11 @@ impl Sm {
         }
         self.state.rollback(j);
         assert_eq!(self.state.full_root(), before, "a rolled-back dry run changed the state");
-        let mut skipped = vec![];
-        for tx in &txs {
-            match self.state.apply(tx, SM_CHAIN, &proposer, height) {
-                Ok(Outcome::Applied) => self.applied += 1,
-                Ok(Outcome::Failed(_)) => {}
-                Err(_) => skipped.push(tx.size()),
-            }
-        }
+        // Exactly as execution runs a block (`State::run_block`).
         let hash = hex::encode(crate::crypto::hash(&height.to_le_bytes()));
-        self.state.end_block(&BlockInfo { height, hash: &hash, proposer: &proposer, view: height, parent_view: height - 1, skipped: &skipped });
+        let mut applied = 0;
+        self.state.run_block(SM_CHAIN, height, &hash, &proposer, height, height - 1, &txs, |_, r| applied += matches!(r, Ok(Outcome::Applied)) as usize);
+        self.applied += applied;
         let commit = self.state.commit_block().expect("an in-memory tree can't fail");
         assert_eq!(commit.root, self.state.full_root(), "incremental state root diverged from a full rebuild at height {height}");
         if let Err(e) = self.state.check_invariants().and_then(|_| self.state.check_record_sizes()) {
