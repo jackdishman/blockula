@@ -639,8 +639,9 @@ fn execute(state: &mut State, id: u64, height: u64) {
 }
 
 /// A passed proposal's action (the levers have no signer checks: the vote was the check).
+/// Returns what it did, for `Proposal::outcome` (accounts shortened: names are looked up by
+/// readers, not scanned for in end-of-block code).
 fn run_kind(state: &mut State, j: &mut Journal, p: &Proposal, height: u64) -> Result<String> {
-    let name = |state: &State, a: &str| state.primary_name(a).unwrap_or_else(|| short(a));
     Ok(match &p.kind {
         ProposalKind::ParamChange { key, value } => {
             state.exec_set_param(j, key, *value)?;
@@ -655,7 +656,7 @@ fn run_kind(state: &mut State, j: &mut Journal, p: &Proposal, height: u64) -> Re
             }
             state.j_debit(j, &treasury, *amount)?;
             state.j_credit(j, to, *amount);
-            format!("paid {} to {}", fmt_fang(*amount), name(state, to))
+            format!("paid {} to {}", fmt_fang(*amount), short(to))
         }
         ProposalKind::Distribution { merkle_root, total, claim_until } => {
             spend_gate(state, height)?;
@@ -680,11 +681,11 @@ fn run_kind(state: &mut State, j: &mut Journal, p: &Proposal, height: u64) -> Re
         }
         ProposalKind::GrantSoul { to, amount, .. } => {
             state.exec_grant_soul(j, to, *amount, height)?;
-            format!("granted {} {} Soul", name(state, to), fmt_soul(*amount))
+            format!("granted {} {} Soul", short(to), fmt_soul(*amount))
         }
         ProposalKind::FlagSybil { account, reason } => {
             state.exec_flag_sybil(j, account, &format!("proposal #{}", p.id), reason, height)?;
-            format!("flagged {} as a sybil", name(state, account))
+            format!("flagged {} as a sybil", short(account))
         }
         ProposalKind::RejectClaim { claim_id, reason } => {
             state.exec_reject_claim(j, *claim_id, reason, height)?;
@@ -692,7 +693,7 @@ fn run_kind(state: &mut State, j: &mut Journal, p: &Proposal, height: u64) -> Re
         }
         ProposalKind::Clawback { account, .. } => {
             let back = state.exec_clawback(j, account, height)?;
-            format!("clawed back {} from {}", fmt_fang(back), name(state, account))
+            format!("clawed back {} from {}", fmt_fang(back), short(account))
         }
         ProposalKind::UnlinkGithub { handle } => {
             state.exec_unlink_github(j, handle)?;

@@ -143,7 +143,10 @@ pub enum KindCmd {
     },
     /// Set a chain parameter (see /api/proposals for the current values)
     Param {
-        key: String,
+        /// The parameter's key, e.g. max_validators
+        #[arg(value_name = "KEY")]
+        param: String,
+        /// A whole number (blocks, bps, ppm, drops), or FANG for amounts (e.g. 1000.5)
         value: String,
         #[command(flatten)]
         meta: Meta,
@@ -359,9 +362,9 @@ fn propose(dir: &Path, kind: KindCmd) -> Result<()> {
     let rt = rt()?;
     let (kind, meta) = match kind {
         KindCmd::Text { meta } => (ProposalKind::Text {}, meta),
-        KindCmd::Param { key, value, meta } => {
+        KindCmd::Param { param, value, meta } => {
             let value = value.parse::<u64>().or_else(|_| parse_fang(&value).map_err(|_| anyhow!("value must be a whole number, or FANG for amounts (e.g. 1000.5)")))?;
-            (ProposalKind::ParamChange { key, value }, meta)
+            (ProposalKind::ParamChange { key: param, value }, meta)
         }
         KindCmd::Spend { to, amount, meta } => (ProposalKind::TreasurySpend { to: rt.block_on(resolve(&meta.signer.rpc, &to))?, amount: parse_fang(&amount)? }, meta),
         KindCmd::Distribution { tree, days, meta } => {
@@ -456,5 +459,39 @@ pub fn multisig(cmd: MultisigCmd, dir: &Path) -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::{CommandFactory, Parser};
+
+    #[derive(Parser)]
+    struct Gov {
+        #[command(subcommand)]
+        cmd: GovCmd,
+    }
+
+    #[derive(Parser)]
+    struct Ms {
+        #[command(subcommand)]
+        cmd: MultisigCmd,
+    }
+
+    /// The commands are well-formed (clap's own checks) and parse what the docs show.
+    #[test]
+    fn commands_parse() {
+        Gov::command().debug_assert();
+        Ms::command().debug_assert();
+        let gov = |args: &str| Gov::try_parse_from(std::iter::once("gov").chain(args.split(' '))).map(|g| g.cmd);
+        assert!(matches!(gov("propose param max_validators 40 --title t --key k.json").unwrap(), GovCmd::Propose { kind: KindCmd::Param { param, value, meta } } if param == "max_validators" && value == "40" && meta.signer.key.is_some()));
+        assert!(matches!(gov("vote 3 aye 1.5 --conviction 6").unwrap(), GovCmd::Vote { id: 3, conviction: 6, .. }));
+        assert!(matches!(gov("propose spend alice.boo 10 --title t --deposit 50").unwrap(), GovCmd::Propose { kind: KindCmd::Spend { .. } }));
+        assert!(gov("propose text").is_err(), "a title is required");
+        let ms = Ms::try_parse_from(["multisig", "create", "--owners", "aa,bb", "--threshold", "2"]).unwrap();
+        assert!(matches!(ms.cmd, MultisigCmd::Create { owners, threshold: 2, .. } if owners == ["aa", "bb"]));
+        assert_eq!((parse_soul("2.5").unwrap(), parse_soul("10").unwrap()), (2_500, 10_000));
+        assert!(parse_soul("1.2345").is_err());
     }
 }
