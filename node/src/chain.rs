@@ -3417,6 +3417,42 @@ mod persistence {
         fs::remove_dir_all(h).ok();
     }
 
+    /// Disk per block (docs/OPERATIONS.md, Disk sizing): block logs and the state database's
+    /// index rows, for empty blocks and for blocks of transfers.
+    /// `cargo test --release disk_per_block -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark"]
+    fn disk_per_block() {
+        fn size(p: &Path) -> u64 {
+            fs::read_dir(p).map(|d| d.flatten().map(|e| if e.path().is_dir() { size(&e.path()) } else { e.metadata().map(|m| m.len()).unwrap_or(0) }).sum()).unwrap_or(0)
+        }
+        for per_block in [0u64, 10] {
+            let (h, mut c, alice) = active(&format!("disk-{per_block}"), 3);
+            let mut keys = vec![];
+            for i in 0..per_block {
+                let k = Keys::from_seed(crypto::hash(&i.to_le_bytes()));
+                c.state.accounts.insert(k.address(), Account { balance: 1_000 * DROPS_PER_FANG, ..Default::default() });
+                c.state.supply += 1_000 * DROPS_PER_FANG;
+                keys.push(k);
+            }
+            c.produce_block_with(vec![]).unwrap();
+            let before = (size(&h.join("blocks")), size(&h.join("cblocks")), fs::metadata(h.join(store::DB_FILE)).unwrap().len());
+            let n = 1_000;
+            for _ in 0..n {
+                let txs: Vec<Tx> = keys.iter().map(|k| tx(&c, k, Action::Transfer { to: alice.address(), amount: 1 })).collect();
+                // The consensus block carries the txs' wire bytes, as in production.
+                let cblock: Vec<u8> = txs.iter().flat_map(|t| t.to_bytes()).collect();
+                let height = c.height() + 1;
+                let f = Finalized { height, hash: hex::encode(crypto::hash(&height.to_le_bytes())), parent: c.last_hash().to_string(), timestamp_ms: now_ms(), view: height, parent_view: height - 1, version: crate::consensus::PROTOCOL_VERSION, proposer: c.fee_sink(), txs, cblock: [vec![0u8; 170], cblock].concat(), certificate: None };
+                c.execute(f).unwrap();
+            }
+            let after = (size(&h.join("blocks")), size(&h.join("cblocks")), fs::metadata(h.join(store::DB_FILE)).unwrap().len());
+            println!("{per_block} transfers per block: blocks/ {} B, cblocks/ {} B, state.redb {} B per block", (after.0 - before.0) / n, (after.1 - before.1) / n, after.2.saturating_sub(before.2) / n);
+            drop(c);
+            fs::remove_dir_all(h).ok();
+        }
+    }
+
     /// Restart time at 1M accounts: loading the records is O(state), never O(history).
     /// `cargo test --release restart_time_at_1m_accounts -- --ignored --nocapture`
     #[test]
@@ -3440,7 +3476,7 @@ mod persistence {
         let t = Instant::now();
         let c = Chain::open(&h).unwrap();
         let took = t.elapsed();
-        println!("restart with {} records: {took:?} ({} blocks replayed)", c.state.record_count(), c.replayed);
+        println!("restart with {} records: {took:?} ({} blocks replayed); state.redb is {} MB", c.state.record_count(), c.replayed, fs::metadata(h.join(store::DB_FILE)).unwrap().len() >> 20);
         assert_eq!((c.state.root(), c.replayed), (root, 0));
         drop(c);
         fs::remove_dir_all(h).ok();
