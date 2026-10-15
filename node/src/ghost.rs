@@ -629,6 +629,28 @@ pub fn describe(state: &State, tx: &Tx, from: &str, primary_name: &dyn Fn(&str) 
     }
 }
 
+/// A ghost transfer as the API shows it: the bundle without its ~130 KiB proof (its size and
+/// BLAKE3 hash instead), so blocks of ghost txs aren't megabytes of hex. Wallets scan the
+/// commitments and ciphertexts, which stay. `None` for other actions.
+pub fn action_json(action: &Action) -> Option<Value> {
+    let b = action.ghost_bundle()?;
+    let bundle = json!({
+        "instance": b.instance,
+        "anchor": b.anchor,
+        "nullifiers": b.nullifiers,
+        "commitments": b.commitments,
+        "enc": b.enc,
+        "out": b.out,
+        "proof_bytes": b.proof.0.len(),
+        "proof_hash": blake3::hash(&b.proof.0).to_hex().to_string(),
+    });
+    Some(match action {
+        Action::Shield { amount, .. } => json!({ "type": "shield", "amount": amount.to_string(), "bundle": bundle }),
+        Action::Unshield { to, amount, .. } => json!({ "type": "unshield", "to": to, "amount": amount.to_string(), "bundle": bundle }),
+        _ => json!({ "type": "private_transfer", "bundle": bundle }),
+    })
+}
+
 /// `/api/ghost`: whether the pool is on or paused, its balance and cap, the tree, recent anchors,
 /// the limits and the chain instance wallets bind proofs to. `height`: the executed height.
 pub fn status_json(state: &State, height: u64) -> Value {
