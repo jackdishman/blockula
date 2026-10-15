@@ -1343,7 +1343,8 @@ fn proposal_json(v: &ReadView, p: &crate::governance::Proposal) -> Value {
         "created_at": p.created_at,
         "voting_end": p.voting_end,
         "execute_at": p.execute_at,
-        "supermajority": crate::governance::needs_supermajority(st, &p.kind),
+        // Decided at the close; until then, what it would need now.
+        "supermajority": p.tally.as_ref().map(|t| t.supermajority).unwrap_or_else(|| crate::governance::needs_supermajority(st, &p.kind)),
         "ayes": { "amount": big_amount(p.aye_amount), "weight": big_amount(p.aye_weight) },
         "nays": { "amount": big_amount(p.nay_amount), "weight": big_amount(p.nay_weight) },
         "voters": p.voters,
