@@ -18,10 +18,12 @@ Every decoder that takes bytes from a peer or an HTTP response is a way to crash
 ## Running
 
 ```sh
-rustup toolchain install nightly && cargo install cargo-fuzz --locked
+rustup toolchain install nightly-2026-10-06 && cargo install cargo-fuzz --locked
 cd node
-cargo +nightly fuzz run cblock fuzz/corpus/cblock fuzz/seeds/cblock -- -max_total_time=300
+cargo +nightly-2026-10-06 fuzz run cblock fuzz/corpus/cblock fuzz/seeds/cblock -- -max_total_time=300
 ```
+
+Use the nightly CI pins (`FUZZ_NIGHTLY` in `.github/workflows/fuzz.yml`). Since Ghost Mode's prover joined the dependencies, nightly-2026-10-13 panics compiling `p3-monty-31` (a rustc ICE in `compare_impl_item`), so the pin moved back to nightly-2026-10-06.
 
 Swap `cblock` for any target. The first directory is the working corpus (git-ignored); `fuzz/seeds/<target>` holds valid inputs built by `harness::seeds()`, so the fuzzer starts from blocks, txs, certificates and manifests that pass every check. Crashes land in `fuzz/artifacts/<target>/`. To reproduce one, run `cargo +nightly fuzz run <target> <file>`.
 
@@ -34,6 +36,17 @@ CI (`.github/workflows/fuzz.yml`) runs the stable checks on PRs that touch `node
 ### How the crate builds
 
 The node is a binary crate with no library target, so `src/lib.rs` compiles its modules straight from `node/src` through a `#[path]` module and re-exports them, so the node's `crate::…` paths still resolve. The node crate itself doesn't change. In exchange, this crate repeats the node's module list and `[dependencies]`; `check-sync.sh` (run in CI) fails when they drift. If the node gains a `lib.rs`, this crate can depend on it and drop both copies.
+
+## Results (2026-10-15, local, Apple M-series, nightly-2026-10-06): the integrated node
+
+After all nine wave 3 packages were merged (schema 4: staking, governance, econ, beacon, upgrade and Ghost Mode state), from the committed seeds:
+
+| Target | Executions | Result |
+|---|---|---|
+| `state_machine` | 6,417 (300 s, 1 worker); 17,167 edges, corpus 1,397 | no crash, no invariant or determinism failure |
+| `tx_wire` | 106,704 (60 s) | no crash |
+| `state_snapshot` | 107,997 (60 s) | no crash |
+| `ghost_tx` | 12,167 (60 s), its first run | no crash |
 
 ## Results (2026-10-15, local, Apple M-series): the state machine and the tx genesis hash
 
