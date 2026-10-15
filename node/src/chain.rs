@@ -862,11 +862,12 @@ impl State {
     /// in this order (the modules' hooks are no-ops until their packages land):
     ///
     /// 1. `poc_end_block`: the PoC seed, Séances closing and opening.
-    /// 2. `econ::end_block`: the base fee for a later block (3.6).
+    /// 2. `econ::end_block`: the base fee and size limit 17 blocks ahead (3.6), lapsed names.
     /// 3. `staking::end_block`: missed leader slots from `view`/`parent_view` (downtime), and the
     ///    proposer's charge for the `skipped` txs (junk, 3.4).
     /// 4. `governance::end_block`: proposals whose voting ended or whose timelock is over.
-    /// 5. At an epoch boundary: `econ::issue` (rewards into the pools), `staking::end_epoch`
+    /// 5. At an epoch boundary: `econ::issue` (issuance into the pools, the contribution pool and
+    ///    the treasury; the endowment's vested part into the contribution pool), `staking::end_epoch`
     ///    (jailing, the next set by stake), `beacon::end_epoch`, then [`State::end_epoch`] (the
     ///    set history and the legacy admin-approved set).
     ///
