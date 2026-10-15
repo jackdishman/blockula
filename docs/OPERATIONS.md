@@ -1,6 +1,6 @@
 # Operating Blockula
 
-For validator operators, sentry and RPC operators, and the release and incident teams. It closes the documentation side of OPS-1, OPS-4, OPS-5, OPS-6, OPS-7 and SF-14 in [MAINNET.md](MAINNET.md), and follows the decisions in [MAINNET-DESIGN.md](MAINNET-DESIGN.md) (DEC-3, DEC-14, section 3.9).
+For validator operators, sentry and RPC operators, and the release and incident teams. It closes the documentation side of OPS-1, OPS-4, OPS-5, OPS-6, OPS-7, SF-14 and CRY-2 (weak subjectivity) in [MAINNET.md](MAINNET.md), and follows the decisions in [MAINNET-DESIGN.md](MAINNET-DESIGN.md) (DEC-3, DEC-14, section 3.9).
 
 Some of what's below needs protocol v1 code that is still landing. Those parts are marked **(planned: P-…)** with the package that delivers them; everything else works with today's binary.
 
@@ -15,9 +15,10 @@ Some of what's below needs protocol v1 code that is still landing. Those parts a
 7. [Upgrades](#upgrades)
 8. [Incident response](#incident-response)
 9. [Runbooks](#runbooks) (one per alert)
-10. [Releases](#releases) and [npm packages](#npm-packages)
-11. [Monitoring](#monitoring)
-12. [Checklists](#checklists)
+10. [Weak subjectivity](#weak-subjectivity): what a joining node trusts, and checkpoints in releases
+11. [Releases](#releases) and [npm packages](#npm-packages)
+12. [Monitoring](#monitoring)
+13. [Checklists](#checklists)
 
 ## Roles and topology
 
@@ -424,6 +425,39 @@ Less than 10% available or an OOM kill. The state is in memory (history isn't), 
 
 The alerting pipeline itself: `Watchdog` should always reach your heartbeat service; `AlertmanagerNotificationsFailing` means a receiver is misconfigured or down (check `docker compose logs alertmanager`); `PrometheusRuleFailures` means a rule broke (check Prometheus's /rules page). See [deploy/monitoring/README.md](../deploy/monitoring/README.md).
 
+## Weak subjectivity
+
+A joining node checks every block, snapshot and certificate against a validator set, and learns each set from the one before it: 2f+1 of the outgoing set sign a handoff to the next, back to the genesis (MAINNET-DESIGN 3.10). That chain has a weak point. Handoffs can be signed at any time and aren't slashable, and a set whose stake has unbonded has nothing left to lose: its keys can sign a handoff to a set they made up, retroactively, and that set can then certify any history. A node that trusts only the genesis can't tell the difference. Every proof-of-stake chain has this property; the answer is to start from a recent root instead of the genesis.
+
+**The period.** Stake stays slashable for the evidence window: `evidence_max_age_epochs` epochs, never more than `unbonding_blocks` (21 days at genesis). The weak-subjectivity period is half of that: **907,200 blocks, about 10.5 days**, at genesis parameters. The other half leaves time to notice a forgery, submit the equivocation evidence and slash before the forgers' stake is gone. `/api/status` shows the period as `weak_subjectivity_blocks` (with the current parameters) and the newest checkpoint the node trusts as `checkpoint_height`.
+
+**What a node trusts:**
+- **The genesis hash.** `join` refuses a genesis nobody pinned: either this release knows the chain id (the hash is compiled in from `node/checkpoints/<chain id>.json`) or you pass `--genesis-hash`. A known chain's genesis must match the compiled-in hash, for validators too. `node/checkpoints/blockula-1.json` is a placeholder until the genesis ceremony, so every binary refuses `blockula-1` until the release that launches mainnet fills in the hash the genesis builders reproduced ([GENESIS_CEREMONY.md](GENESIS_CEREMONY.md), section 6).
+- **Checkpoints**, `(height, block hash, validator-set hash)`: compiled into each release, plus your own with `join --checkpoint HEIGHT:HASH[:SET_HASH]` (repeatable; saved in the home's `join.json` and enforced on every start). The set hash is of the set that certifies the block after `height`. Pinning it is what defeats a forged history, since every later set must descend from it. A node refuses a genesis, snapshot, epoch anchor or sync batch that contradicts a checkpoint. It also refuses a snapshot it can't check against one: a checkpoint older than the snapshot that pins no set.
+- **Freshness.** A node with an empty home (`join`, or `run` before its first sync) refuses to sync when its newest root (the newest checkpoint, or the genesis) is older than the period. Age is measured against the height the chain should have reached by the wall clock, so missed slots only make a root look older. `--allow-stale-checkpoint` overrides the refusal. A node with history only warns: its own head is its root, and after an outage longer than the period it's in the same position as a joiner.
+- **A checkpoint newer than every snapshot** (you took it a minute ago): the joiner waits up to 5 minutes for the next snapshot (one every 100 blocks) before it falls back to replaying from the genesis.
+
+**Getting a checkpoint.** Take it from several sources that don't depend on each other: the latest release (compiled in, and attached as `checkpoints-<chain id>.json`), the signed weekly checkpoint (below), operators you know. Or compute it from nodes run by independent operators:
+
+```bash
+blockula checkpoint --peer https://rpc.op-a.example --peer https://rpc.op-b.example --peer https://rpc.op-c.example
+# 3600599:4f1c…:9a0e…        HEIGHT:HASH:SET_HASH
+blockula join --genesis https://rpc.op-a.example --home /var/lib/blockula/full --checkpoint 3600599:4f1c…:9a0e…
+```
+
+`blockula checkpoint` reads each node's genesis, the block at the height (default: the newest epoch boundary every peer has finalized; `--height` picks another) and its validator-set history, verified from the genesis, and fails unless every node agrees. Agreement among independent operators is what a checkpoint attests; one node's word is worth no more than its own snapshot. `blockula checkpoint --genesis genesis.json` prints a genesis file's hash for `--genesis-hash`.
+
+### Checkpoints in releases
+
+Every release carries a fresh checkpoint for each live chain it knows, in `node/checkpoints/<chain id>.json`. It's compiled into the binary and attached to the release as `checkpoints-<chain id>.json`, listed in `checksums.txt`, so the offline release signature covers both.
+
+1. In the release PR, take the checkpoint from at least three nodes run by different operators, not only the project's: `blockula checkpoint --json --peer … --peer … --peer …`. Append it to the file's `checkpoints` (keep the earlier ones) and note in the PR which operators' nodes you asked and when.
+2. Two reviewers rerun it against nodes they pick, with `--height <H>`, and must get the same entry.
+3. Tag and release as in [Releases](#releases). A release's checkpoint is only useful to joiners for the period after it was taken, so take it within a day or two of the tag.
+4. **Between releases**, roots still go stale after ~10.5 days. Every week the release team takes a checkpoint the same way (steps 1 and 2) and signs it on the offline machine like `checksums.txt`: `node scripts/release-sig.mjs sign --key release-key.json checkpoint-<chain id>-<height>.txt > checkpoint-<chain id>-<height>.txt.sig`, where the file holds the `HEIGHT:HASH:SET_HASH` line. It's published with the signature through the same channels as the release key id; joiners verify it with `release-sig.mjs verify` and pass it with `--checkpoint`.
+
+A new chain gets its own file (and a line in `EMBEDDED`, `node/src/checkpoints.rs`) in the first release after its genesis, with the genesis hash and no checkpoints yet.
+
 ## Releases
 
 Every release is reproducible, carries SLSA build provenance, and is signed offline with the ML-DSA-65 release key before it's published (OPS-7).
@@ -433,7 +467,7 @@ Every release is reproducible, carries SLSA build provenance, and is signed offl
 1. A maintainer tags `vX.Y.Z` on `main` and pushes the tag. `.github/workflows/release.yml`:
    - builds the four targets with `scripts/release-build.sh`: the toolchain pinned in `rust-toolchain.toml`, Linux in a digest-pinned `rust` image, `--locked`, `SOURCE_DATE_EPOCH` from the commit, build paths remapped, deterministic archives;
    - rebuilds the x86_64 Linux archive on a fresh runner from a different directory and fails unless it's byte-identical;
-   - writes `checksums.txt` (archives and `install.sh`) and attests every file with GitHub artifact attestations (SLSA provenance, `actions/attest-build-provenance`);
+   - writes `checksums.txt` (archives, `install.sh`, committed genesis files and the checkpoint files `node/checkpoints/*.json`, see [Checkpoints in releases](#checkpoints-in-releases)) and attests every file with GitHub artifact attestations (SLSA provenance, `actions/attest-build-provenance`);
    - creates a **draft** release. Only that last job can write to the repo.
 2. **Reproduce.** At least two people rebuild the Linux archives independently and compare against the draft:
 

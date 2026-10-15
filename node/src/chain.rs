@@ -1848,7 +1848,7 @@ pub struct Base {
     pub hash: String,
     pub state_root: String,
     /// Hash of the block before the current epoch's first block, when that's before `height`
-    /// (consensus anchors each epoch's engine there). From the peer, not certified.
+    /// (consensus anchors each epoch's engine there), certified by the manifest's anchor.
     #[serde(default)]
     pub epoch_start: Option<(u64, String)>,
 }
@@ -2613,7 +2613,7 @@ impl Chain {
     /// it decodes to (root already checked). Each file is in place durably before the next, and
     /// `base.json` (the switch) comes last but one: a crash before it leaves a genesis home, a
     /// crash after it a fast-synced home whose database is rebuilt from `base.state.zst`.
-    pub fn install_snapshot(&mut self, v: &crate::snapshot::Verified, state: State, packed: &Path, epoch_start: Option<(u64, String)>) -> Result<()> {
+    pub fn install_snapshot(&mut self, v: &crate::snapshot::Verified, state: State, packed: &Path) -> Result<()> {
         if self.height != 0 || self.base.is_some() {
             bail!("fast sync needs an empty home");
         }
@@ -2621,7 +2621,9 @@ impl Chain {
         store::install_durably(packed, &self.home.join("base.state.zst"))?;
         self.epochs = v.epochs.clone();
         self.try_save_epochs()?;
-        let base = Base { height: v.height, hash: base_hash.clone(), state_root: v.state_root.clone(), epoch_start };
+        // The anchor's proof, for this node's own manifests (P-SYNC).
+        crate::snapshot::save_anchor(&self.home, v.anchor.as_ref())?;
+        let base = Base { height: v.height, hash: base_hash.clone(), state_root: v.state_root.clone(), epoch_start: v.epoch_start.clone() };
         store::write_durably(&self.home.join("base.json"), &serde_json::to_vec_pretty(&base)?)?;
         let mut w = self.writer.lock();
         let start = (v.height + 1, w.blocks.reader().seg_of(v.height + 1));

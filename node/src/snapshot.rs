@@ -7,9 +7,15 @@
 //!
 //! Each node writes the state at its latest checkpoints (canonical records → zstd → 1 MiB
 //! chunks, each BLAKE3-hashed) and serves a manifest: chunk hashes, the blocks C+1..=F, F's
-//! finalization certificate, and the validator-set history (handoff proofs) needed to check that
-//! certificate. A joining node verifies everything, rebuilds the state and its tree from the
+//! finalization certificate, the validator-set history (handoff proofs) needed to check that
+//! certificate, and the epoch anchor (below). A joining node verifies everything, checks it
+//! against the checkpoints it trusts (`checkpoints.rs`), rebuilds the state and its tree from the
 //! records, checks the root against the certified one, executes C+1..=F and carries on syncing.
+//!
+//! **Epoch anchor.** Consensus starts each epoch's engine from the hash of the previous epoch's
+//! last block. When that block is before C, the manifest carries it with its finalization
+//! certificate, signed by the set of the epoch it ends (epoch-end certificates are kept forever,
+//! see `store.rs`), so nothing in a manifest is taken from the peer on trust.
 //!
 //! Both directions stream: the writer encodes records straight into the compressor and cuts
 //! chunk files as they fill; a joiner checks each chunk as it arrives, appends it to
@@ -237,6 +243,55 @@ pub struct Manifest {
     pub finalization: String,
     /// Validator-set history with handoff proofs.
     pub epochs: EpochRegistry,
+    /// The epoch anchor, when it's before `height` (and only then).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<Anchor>,
+}
+
+/// The last block of the epoch before the one a joiner enters, certified by that epoch's set.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Anchor {
+    /// The consensus block (hex): its height is what makes it the anchor.
+    pub block: String,
+    /// Its finalization certificate (hex).
+    pub finalization: String,
+}
+
+/// The epoch anchor a manifest ending at `last` must certify: the previous epoch's last block,
+/// unless it's the snapshot's own block or one of the manifest's (hash links cover those).
+pub fn anchor_height(params: &crate::chain::Params, snapshot: u64, last: u64) -> Option<u64> {
+    match params.epoch_of(last.saturating_add(1)) {
+        0 => None,
+        e => Some(params.last_of(e - 1)).filter(|a| *a < snapshot),
+    }
+}
+
+/// The epoch anchor a fast-synced home started from, as its manifest proved it (written before
+/// `base.json`, so it's there whenever the home is fast-synced).
+fn anchor_file(home: &Path) -> PathBuf {
+    home.join("anchor.json")
+}
+
+/// Saves (or, with `None`, clears) the anchor proof [`build_manifest`] serves on.
+pub fn save_anchor(home: &Path, anchor: Option<&Anchor>) -> Result<()> {
+    match anchor {
+        Some(a) => crate::store::write_durably(&anchor_file(home), &serde_json::to_vec(a)?),
+        None => match std::fs::remove_file(anchor_file(home)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        },
+    }
+}
+
+/// The anchor at height `a` as this node can prove it: the block and certificate it executed, or
+/// the anchor its own fast sync verified (`anchor.json`), which is all a fast-synced node has.
+fn anchor_proof(home: &Path, a: u64, cblock: impl Fn(u64) -> Option<Vec<u8>>, cert: impl Fn(u64) -> Option<Vec<u8>>) -> Option<Anchor> {
+    if let (Some(b), Some(f)) = (cblock(a), cert(a)) {
+        return Some(Anchor { block: hex::encode(b), finalization: hex::encode(f) });
+    }
+    let saved: Anchor = serde_json::from_slice(&std::fs::read(anchor_file(home)).ok()?).ok()?;
+    let block = CBlock::decode(hex::decode(&saved.block).ok()?.as_slice()).ok()?;
+    (block.height == a).then_some(saved)
 }
 
 /// Builds the manifest for the newest snapshot this node can prove, from what it has published
@@ -244,6 +299,7 @@ pub struct Manifest {
 pub fn build_manifest(live: &crate::view::Live) -> Result<Manifest> {
     let v = live.view();
     let home = &v.disk.home;
+    let params = &v.state.params;
     for height in list(home) {
         let Some(meta) = meta(home, height) else { continue };
         let certifier = height + CHECKPOINT_DELAY;
@@ -254,18 +310,26 @@ pub fn build_manifest(live: &crate::view::Live) -> Result<Manifest> {
             blocks.push(hex::encode(&b));
             if h >= certifier {
                 if let Some(cert) = v.cert(h) {
-                    fin = Some(hex::encode(cert));
+                    fin = Some((h, hex::encode(cert)));
                     break;
                 }
             }
         }
-        let Some(finalization) = fin else { continue };
-        return Ok(Manifest { chain_id: v.genesis.chain_id.clone(), height, state_root: meta.state_root, chunks: meta.chunks, blocks, finalization, epochs: (*live.epochs()).clone() });
+        let Some((last, finalization)) = fin else { continue };
+        let anchor = match anchor_height(params, height, last) {
+            None => None,
+            // Without the anchor's proof this snapshot can't be served; an older one may be.
+            Some(a) => match anchor_proof(home, a, |h| v.cblock(h), |h| v.cert(h)) {
+                Some(p) => Some(p),
+                None => continue,
+            },
+        };
+        return Ok(Manifest { chain_id: v.genesis.chain_id.clone(), height, state_root: meta.state_root, chunks: meta.chunks, blocks, finalization, epochs: (*live.epochs()).clone(), anchor });
     }
-    bail!("no certified snapshot yet (one is taken every {CHECKPOINT_INTERVAL} blocks and certified {CHECKPOINT_DELAY} blocks later)")
+    bail!("no certified snapshot yet (one is taken every {CHECKPOINT_INTERVAL} blocks and certified {CHECKPOINT_DELAY} blocks later, and the epoch anchor before it must be certified too)")
 }
 
-/// A manifest whose certificate, block links and checkpoint commitment all check out.
+/// A manifest whose certificate, block links, checkpoint commitment and epoch anchor all check out.
 pub struct Verified {
     pub height: u64,
     pub state_root: String,
@@ -273,6 +337,108 @@ pub struct Verified {
     pub blocks: Vec<CBlock>,
     pub finalization: Vec<u8>,
     pub epochs: EpochRegistry,
+    /// The epoch anchor's height and hash, when it's before the snapshot (certified) ...
+    pub epoch_start: Option<(u64, String)>,
+    /// ... and its proof, which this node serves on in its own manifests.
+    pub anchor: Option<Anchor>,
+}
+
+impl Verified {
+    /// Hash of the block at `height`, if the manifest proves it: the snapshot's block, the epoch
+    /// anchor, or one of the manifest's blocks.
+    pub fn hash_at(&self, height: u64) -> Option<String> {
+        if height == self.height {
+            return self.blocks.first().map(|b| hex::encode(b.parent_bytes()));
+        }
+        if let Some((_, hash)) = self.epoch_start.as_ref().filter(|(a, _)| *a == height) {
+            return Some(hash.clone());
+        }
+        let i = height.checked_sub(self.height.saturating_add(1))?;
+        self.blocks.get(usize::try_from(i).ok()?).map(|b| hex::encode(b.digest_bytes()))
+    }
+
+    /// Checks the snapshot against the checkpoints this node trusts (`checkpoints.rs`). The
+    /// manifest proves blocks from the snapshot on (and the anchor), and the validator sets up to
+    /// its last block's epoch: a checkpoint is checked against whichever of those it names. One
+    /// that's newer than all of it means the peer is behind ([`SnapshotBehind`]). One that's older
+    /// and pins no set can't be checked, so it's refused rather than ignored, unless a newer pinned
+    /// set checked out (history before that set no longer matters).
+    pub fn check_trust(&self, trust: &crate::checkpoints::Trust) -> Result<()> {
+        let last = self.blocks.last().map(|b| b.height).unwrap_or(self.height);
+        let last_epoch = trust.epoch_of(last);
+        let (mut unchecked, mut newest_pin) = (vec![], None);
+        for cp in trust.checkpoints().filter(|c| c.height > 0) {
+            if cp.height > last {
+                return Err(anyhow::Error::new(SnapshotBehind { certified: last, checkpoint: cp.height }));
+            }
+            let mut checked = false;
+            if let Some(hash) = self.hash_at(cp.height) {
+                trust.check_block(cp.height, &hash)?;
+                checked = true;
+            }
+            let pinned = trust.pinned_epoch(cp);
+            if cp.set_hash.is_some() && pinned <= last_epoch {
+                // `verify_manifest` verified every set change through `last_epoch`.
+                let set = self.epochs.set(pinned).ok_or_else(|| anyhow!("the manifest's history doesn't reach epoch {pinned}"))?;
+                trust.check_set(pinned, set)?;
+                (checked, newest_pin) = (true, Some(cp.height));
+            }
+            if !checked {
+                unchecked.push(cp.height);
+            }
+        }
+        if let Some(h) = unchecked.into_iter().find(|h| newest_pin.is_none_or(|p| *h > p)) {
+            bail!(
+                "trusted checkpoint #{h} is older than this snapshot (#{}) and pins no validator set, so the snapshot can't be checked against it: pass its set hash too (HEIGHT:HASH:SET_HASH, `blockula checkpoint` prints it), or sync from genesis with --full",
+                self.height
+            );
+        }
+        Ok(())
+    }
+}
+
+/// A trusted checkpoint is newer than everything a peer's manifest certifies: the peer is behind
+/// (or its snapshots are older than the checkpoint), so another peer or a later snapshot may do.
+#[derive(Debug)]
+pub struct SnapshotBehind {
+    pub certified: u64,
+    pub checkpoint: u64,
+}
+
+impl std::fmt::Display for SnapshotBehind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the snapshot is certified through #{}, before trusted checkpoint #{}", self.certified, self.checkpoint)
+    }
+}
+
+impl std::error::Error for SnapshotBehind {}
+
+/// The verifier for a validator set (hex consensus keys) on `g`'s chain.
+fn verifier_for(g: &Genesis, set: &[String]) -> Result<MlDsaScheme> {
+    let participants = consensus::keys_of(set.iter().map(|s| s.as_str())).ok_or_else(|| anyhow!("bad validator keys"))?;
+    Ok(MlDsaScheme::verifier(&consensus::namespace(&g.chain_id), participants))
+}
+
+/// Checks the epoch anchor at height `a`: the block's height, and a valid finalization of it by
+/// the set of its epoch (`set`). Returns its hash.
+fn verify_anchor(g: &Genesis, set: &[String], a: u64, p: &Anchor) -> Result<String> {
+    let block = CBlock::decode(hex::decode(&p.block)?.as_slice())?;
+    if block.height != a {
+        bail!("the anchor block is #{}, expected #{a}", block.height);
+    }
+    let epoch = g.params().epoch_of(a);
+    let verifier = verifier_for(g, set)?;
+    let fin = Finalization::<MlDsaScheme, Digest>::decode_cfg(hex::decode(&p.finalization)?.as_slice(), &verifier.certificate_codec_config())?;
+    if fin.proposal.payload != block.digest() {
+        bail!("the anchor certificate is for another block");
+    }
+    if fin.proposal.round.epoch().get() != epoch {
+        bail!("the anchor certificate is from epoch {}, expected {epoch}", fin.proposal.round.epoch().get());
+    }
+    if !fin.verify(&mut commonware_utils::sys_rng(), &verifier, &commonware_parallel::Sequential) {
+        bail!("invalid anchor certificate");
+    }
+    Ok(hex::encode(block.digest_bytes()))
 }
 
 pub fn verify_manifest(g: &Genesis, m: &Manifest) -> Result<Verified> {
@@ -300,7 +466,8 @@ pub fn verify_manifest(g: &Genesis, m: &Manifest) -> Result<Verified> {
         if b.height != expect {
             bail!("manifest blocks aren't contiguous at {}", b.height);
         }
-        expect += 1;
+        // A peer's heights near u64::MAX must not overflow (overflow checks panic in release).
+        expect = expect.checked_add(1).ok_or_else(|| anyhow!("manifest block heights overflow"))?;
     }
     // The block at C + d commits to the checkpoint's state root.
     let certifier = blocks.iter().find(|b| b.height == m.height + CHECKPOINT_DELAY).ok_or_else(|| anyhow!("manifest doesn't include the certifying block"))?;
@@ -310,9 +477,9 @@ pub fn verify_manifest(g: &Genesis, m: &Manifest) -> Result<Verified> {
     let last = blocks.last().unwrap();
     let params = g.params();
     let epoch = params.epoch_of(last.height);
+    // Verifies every set change through `epoch`, so `m.epochs.set(e)` is trusted for e ≤ epoch.
     let set = epochs::verify_chain(g, &m.epochs, epoch).context("validator set history")?;
-    let participants = consensus::keys_of(set.iter().map(|s| s.as_str())).ok_or_else(|| anyhow!("bad validator keys"))?;
-    let verifier = MlDsaScheme::verifier(&consensus::namespace(&g.chain_id), participants);
+    let verifier = verifier_for(g, &set)?;
     let fin_bytes = hex::decode(&m.finalization)?;
     let fin = Finalization::<MlDsaScheme, Digest>::decode_cfg(fin_bytes.as_slice(), &verifier.certificate_codec_config())?;
     if fin.proposal.payload != last.digest() {
@@ -324,7 +491,24 @@ pub fn verify_manifest(g: &Genesis, m: &Manifest) -> Result<Verified> {
     if !fin.verify(&mut commonware_utils::sys_rng(), &verifier, &commonware_parallel::Sequential) {
         bail!("invalid finalization certificate");
     }
-    Ok(Verified { height: m.height, state_root: m.state_root.clone(), chunks: m.chunks.clone(), blocks, finalization: fin_bytes, epochs: m.epochs.clone() })
+    let epoch_start = match anchor_height(&params, m.height, last.height) {
+        None if m.anchor.is_some() => bail!("manifest carries an epoch anchor it doesn't need"),
+        None => None,
+        Some(a) => {
+            let p = m.anchor.as_ref().ok_or_else(|| anyhow!("manifest doesn't certify the epoch anchor #{a}"))?;
+            // a < m.height < last, so its epoch's set was verified above.
+            let set = m.epochs.set(params.epoch_of(a)).ok_or_else(|| anyhow!("no validator set for the anchor's epoch"))?;
+            Some((a, verify_anchor(g, set, a, p).context("epoch anchor")?))
+        }
+    };
+    Ok(Verified { height: m.height, state_root: m.state_root.clone(), chunks: m.chunks.clone(), blocks, finalization: fin_bytes, epochs: m.epochs.clone(), anchor: m.anchor.clone().filter(|_| epoch_start.is_some()), epoch_start })
+}
+
+/// [`verify_manifest`], then [`Verified::check_trust`]: what a joiner runs on a peer's manifest.
+pub fn verify_manifest_trusted(g: &Genesis, m: &Manifest, trust: &crate::checkpoints::Trust) -> Result<Verified> {
+    let v = verify_manifest(g, m)?;
+    v.check_trust(trust)?;
+    Ok(v)
 }
 
 /// Checks one downloaded chunk against the manifest.
@@ -448,27 +632,35 @@ impl Read for Chunks<'_> {
     }
 }
 
-/// Fetches, verifies and installs the newest certified snapshot from `peers` into an empty chain.
-pub async fn fast_sync(chain: &crate::consensus::Shared, peers: &[String]) -> Result<u64> {
+/// Fetches, verifies and installs the newest certified snapshot from `peers` into an empty chain,
+/// refusing any that contradicts `trust`.
+pub async fn fast_sync(chain: &crate::consensus::Shared, peers: &[String], trust: &crate::checkpoints::Trust) -> Result<u64> {
     let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(60)).build()?;
     let g = chain.lock().genesis.clone();
     let mut last_err = anyhow!("no peers");
+    // A peer that's only behind a checkpoint says a later snapshot will do: report that one.
+    let mut behind = None;
     for peer in peers {
-        match fast_sync_from(&client, &g, chain, peer).await {
+        match fast_sync_from(&client, &g, chain, peer, trust).await {
             Ok(h) => return Ok(h),
             Err(e) => {
                 tracing::debug!(peer = %peer, error = %e, "fast sync failed");
-                last_err = e.context(format!("from {peer}"));
+                let e = e.context(format!("from {peer}"));
+                if e.chain().any(|c| c.is::<SnapshotBehind>()) {
+                    behind = Some(e);
+                } else {
+                    last_err = e;
+                }
             }
         }
     }
-    Err(last_err)
+    Err(behind.unwrap_or(last_err))
 }
 
-async fn fast_sync_from(client: &reqwest::Client, g: &Genesis, chain: &crate::consensus::Shared, peer: &str) -> Result<u64> {
+async fn fast_sync_from(client: &reqwest::Client, g: &Genesis, chain: &crate::consensus::Shared, peer: &str, trust: &crate::checkpoints::Trust) -> Result<u64> {
     let body = crate::node::get_capped(client, &format!("{peer}/api/snapshot/latest"), 64 << 20).await?;
     let m: Manifest = serde_json::from_slice(&body)?;
-    let v = verify_manifest(g, &m)?;
+    let v = verify_manifest_trusted(g, &m, trust)?;
     println!("📦 snapshot #{} ({} chunks) certified by validators; downloading…", v.height, v.chunks.len());
     // Each chunk is checked as it arrives and appended to a file: memory holds a few chunks at
     // most, never the whole snapshot.
@@ -488,20 +680,9 @@ async fn fast_sync_from(client: &reqwest::Client, g: &Genesis, chain: &crate::co
     }
     file.into_inner().map_err(|e| e.into_error())?.sync_all()?;
     let state = restore_file(&v, &part)?;
-    // Consensus anchors each epoch at the previous epoch's last block; if that's before the
-    // snapshot, ask the peer for its hash (only used to seed this epoch's engine).
-    let params = g.params();
-    let epoch = params.epoch_of(v.blocks.last().map(|b| b.height).unwrap_or(v.height) + 1);
-    let anchor = if epoch == 0 { None } else { Some(params.last_of(epoch - 1)) };
-    let epoch_start = match anchor {
-        Some(h) if h < v.height => {
-            let b = crate::node::get_capped(client, &format!("{peer}/api/block/{h}"), 1 << 20).await.ok();
-            b.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).and_then(|v| v["hash"].as_str().map(|s| (h, s.to_string())))
-        }
-        _ => None,
-    };
+    // The epoch anchor (if it's before the snapshot) came certified in the manifest.
     let mut c = chain.lock();
-    c.install_snapshot(&v, state, &part, epoch_start)?;
+    c.install_snapshot(&v, state, &part)?;
     Ok(c.height())
 }
 
@@ -509,6 +690,204 @@ async fn fast_sync_from(client: &reqwest::Client, g: &Genesis, chain: &crate::co
 mod tests {
     use super::*;
     use crate::chain::Account;
+    use crate::checkpoints::{Checkpoint, Pins, Trust};
+    use crate::pq::PrivateKey;
+    use commonware_codec::Encode as _;
+    use commonware_consensus::simplex::types::{Finalize, Proposal};
+    use commonware_consensus::types::{Epoch, Round, View};
+    use commonware_cryptography::Signer as _;
+
+    /// A 4-validator chain with 10-block epochs (so a snapshot at 100 sits in epoch 10, and its
+    /// anchor, #99, ends epoch 9), and its validators' seeds.
+    fn four_validators(tag: &str) -> (PathBuf, Genesis, Vec<[u8; 32]>) {
+        let root = std::env::temp_dir().join(format!("blockula-anchor-{tag}-{}-{}", crate::chain::now_ms(), std::process::id()));
+        let homes = crate::chain::Chain::summon(&root, &crate::chain::SummonOpts { epoch_blocks: 10, ..crate::chain::SummonOpts::new(tag, 4) }).unwrap();
+        let g = Genesis::load(&homes[0].join("genesis.json")).unwrap();
+        let seeds = homes.iter().map(|h| hex::decode(std::fs::read_to_string(h.join("validator.key")).unwrap().trim()).unwrap().try_into().unwrap()).collect();
+        (root, g, seeds)
+    }
+
+    fn keys(seeds: &[[u8; 32]]) -> Vec<String> {
+        let mut k: Vec<String> = seeds.iter().map(|s| hex::encode(PrivateKey::from_seed_bytes(*s).public_key().as_ref())).collect();
+        k.sort();
+        k
+    }
+
+    /// A finalization of `block` in `epoch` by 3 of the 4 `seeds` (a quorum), hex.
+    fn finalization(g: &Genesis, seeds: &[[u8; 32]], block: &CBlock, epoch: u64) -> String {
+        let participants = consensus::keys_of(keys(seeds).iter().map(String::as_str)).unwrap();
+        let ns = consensus::namespace(&g.chain_id);
+        let p = Proposal::new(Round::new(Epoch::new(epoch), View::new(block.height)), View::new(block.height - 1), block.digest());
+        let votes: Vec<_> = seeds.iter().take(3).map(|s| Finalize::sign(&MlDsaScheme::signer(&ns, participants.clone(), PrivateKey::from_seed_bytes(*s)).unwrap(), p.clone()).unwrap()).collect();
+        let fin = Finalization::from_finalizes(&MlDsaScheme::verifier(&ns, participants), commonware_utils::iter::NonEmpty::try_new(votes.iter()).unwrap(), &commonware_parallel::Sequential).unwrap();
+        hex::encode(fin.encode())
+    }
+
+    fn anchor_block(height: u64) -> CBlock {
+        CBlock::new(Digest(crate::crypto::hash(b"before the anchor")), height, height, height - 1, 1000 * height, String::new(), 0, [0; 32], vec![])
+    }
+
+    /// A manifest for a snapshot at 100 with blocks 101..=`last` (104 certifies the state root),
+    /// signed by `seeds` (the set of every epoch in `epochs`), with the epoch anchor if it needs one.
+    fn manifest(g: &Genesis, seeds: &[[u8; 32]], epochs: EpochRegistry, last: u64) -> Manifest {
+        let state_root = crate::crypto::hash(b"the state at 100");
+        let mut blocks = vec![];
+        let mut parent = Digest(crate::crypto::hash(b"block 100"));
+        for h in 101..=last {
+            let (exec_height, exec_root) = if h == 104 { (100, state_root) } else { (99, [7; 32]) };
+            let b = CBlock::new(parent, h, h, h - 1, 1000 * h, String::new(), exec_height, exec_root, vec![]);
+            parent = b.digest();
+            blocks.push(b);
+        }
+        let params = g.params();
+        let anchor = anchor_height(&params, 100, last).map(|a| {
+            let b = anchor_block(a);
+            Anchor { block: hex::encode(b.encode()), finalization: finalization(g, seeds, &b, params.epoch_of(a)) }
+        });
+        Manifest {
+            chain_id: g.chain_id.clone(),
+            height: 100,
+            state_root: hex::encode(state_root),
+            chunks: vec![ChunkInfo { hash: hex::encode(crate::crypto::hash(b"c")), size: 1 }],
+            blocks: blocks.iter().map(|b| hex::encode(b.encode())).collect(),
+            finalization: finalization(g, seeds, blocks.last().unwrap(), params.epoch_of(last)),
+            epochs,
+            anchor,
+        }
+    }
+
+    /// The genesis set through `through`, unchanged.
+    fn steady(g: &Genesis, through: u64) -> EpochRegistry {
+        let mut reg = EpochRegistry::genesis(g);
+        let set = reg.sets[&0].clone();
+        for e in 1..=through {
+            reg.record(e, set.clone());
+        }
+        reg
+    }
+
+    fn err(r: Result<Verified>) -> String {
+        format!("{:#}", r.err().expect("refused"))
+    }
+
+    /// CRY-2: the epoch anchor before a snapshot comes with a finalization by its epoch's set, and
+    /// the joiner checks the block's height, that the certificate is for it, from that epoch, and
+    /// valid. A manifest that doesn't need an anchor can't carry one.
+    #[test]
+    fn epoch_anchor_is_certified_by_the_previous_epochs_set() {
+        let (root, g, seeds) = four_validators("anchor");
+        let m = manifest(&g, &seeds, steady(&g, 10), 104);
+        let v = verify_manifest(&g, &m).unwrap();
+        let anchor_hash = hex::encode(anchor_block(99).digest_bytes());
+        assert_eq!(v.epoch_start, Some((99, anchor_hash.clone())));
+        assert_eq!(v.anchor, m.anchor);
+        assert_eq!((v.hash_at(99), v.hash_at(100)), (Some(anchor_hash), Some(hex::encode(v.blocks[0].parent_bytes()))));
+        assert_eq!((v.hash_at(103), v.hash_at(98), v.hash_at(105)), (Some(hex::encode(v.blocks[2].digest_bytes())), None, None));
+        let mut missing = m.clone();
+        missing.anchor = None;
+        assert!(err(verify_manifest(&g, &missing)).contains("doesn't certify the epoch anchor #99"));
+        let mut tampered = m.clone();
+        let mut f = hex::decode(&tampered.anchor.as_ref().unwrap().finalization).unwrap();
+        let n = f.len();
+        f[n - 100] ^= 0xff;
+        tampered.anchor.as_mut().unwrap().finalization = hex::encode(f);
+        assert!(err(verify_manifest(&g, &tampered)).contains("epoch anchor"));
+        let with = |block: &CBlock, epoch: u64| {
+            let mut m = m.clone();
+            m.anchor = Some(Anchor { block: hex::encode(block.encode()), finalization: finalization(&g, &seeds, block, epoch) });
+            m
+        };
+        assert!(err(verify_manifest(&g, &with(&anchor_block(99), 10))).contains("from epoch 10, expected 9"));
+        assert!(err(verify_manifest(&g, &with(&anchor_block(98), 9))).contains("is #98, expected #99"));
+        let mut swapped = with(&anchor_block(99), 9);
+        swapped.anchor.as_mut().unwrap().finalization = finalization(&g, &seeds, &CBlock::new(Digest([1; 32]), 99, 99, 98, 0, String::new(), 0, [0; 32], vec![]), 9);
+        assert!(err(verify_manifest(&g, &swapped)).contains("for another block"));
+        // Signed by a set that isn't epoch 9's.
+        let strangers: Vec<[u8; 32]> = (0..4u8).map(|i| [200 + i; 32]).collect();
+        let mut forged = m.clone();
+        forged.anchor.as_mut().unwrap().finalization = finalization(&g, &strangers, &anchor_block(99), 9);
+        assert!(verify_manifest(&g, &forged).is_err());
+        // Blocks through 109 end epoch 10: the anchor is the manifest's own last block.
+        let through = manifest(&g, &seeds, steady(&g, 10), 109);
+        assert!(through.anchor.is_none());
+        assert_eq!(verify_manifest(&g, &through).unwrap().epoch_start, None);
+        let mut extra = through.clone();
+        extra.anchor = m.anchor.clone();
+        assert!(err(verify_manifest(&g, &extra)).contains("doesn't need"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A joiner checks the manifest against what it trusts: block hashes where the manifest proves
+    /// them, pinned sets where its history reaches, and it never ignores a checkpoint it can't
+    /// check. A checkpoint past the manifest means the peer is behind.
+    #[test]
+    fn manifests_are_checked_against_trusted_checkpoints() {
+        let (root, g, seeds) = four_validators("trusted");
+        let v = verify_manifest(&g, &manifest(&g, &seeds, steady(&g, 10), 104)).unwrap();
+        let real_set = crate::checkpoints::genesis_checkpoint(&g).set_hash;
+        let trust = |cps: Vec<Checkpoint>| Trust::new(&g, &Pins { checkpoints: cps, ..Default::default() }, false).unwrap();
+        let cp = |height: u64, hash: &str, set_hash: Option<String>| Checkpoint { height, hash: hash.into(), set_hash };
+        let (other, at) = ("ab".repeat(32), |h: u64| v.hash_at(h).unwrap());
+        for h in [99, 100, 103] {
+            v.check_trust(&trust(vec![cp(h, &at(h), None)])).unwrap();
+            assert!(v.check_trust(&trust(vec![cp(h, &other, None)])).unwrap_err().to_string().contains("another chain"), "#{h}");
+        }
+        let behind = v.check_trust(&trust(vec![cp(150, &other, None)])).unwrap_err();
+        assert!(behind.is::<SnapshotBehind>(), "{behind}");
+        // Older than the snapshot: only a pinned set can be checked.
+        assert!(v.check_trust(&trust(vec![cp(50, &other, None)])).unwrap_err().to_string().contains("pins no validator set"));
+        v.check_trust(&trust(vec![cp(50, &other, real_set.clone())])).unwrap();
+        assert!(v.check_trust(&trust(vec![cp(50, &other, Some("cd".repeat(32)))])).unwrap_err().to_string().contains("forged"));
+        // An unpinned one before a pinned set that checked out no longer matters; after it, it does.
+        v.check_trust(&trust(vec![cp(40, &other, None), cp(50, &other, real_set.clone())])).unwrap();
+        assert!(v.check_trust(&trust(vec![cp(50, &other, real_set.clone()), cp(60, &other, None)])).unwrap_err().to_string().contains("#60"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Weak subjectivity, concretely: the genesis keys (long unbonded, say) sign a retroactive
+    /// handoff to a set they made up at epoch 6, which then certifies a whole fake snapshot. Its
+    /// history checks out from the genesis, so a joiner trusting only the genesis would take it; a
+    /// checkpoint that pins the real set of epoch 7 refuses it.
+    #[test]
+    fn a_retroactive_handoff_forgery_needs_only_old_keys_and_a_checkpoint_stops_it() {
+        let (root, g, seeds) = four_validators("forgery");
+        let evil: Vec<[u8; 32]> = (0..4u8).map(|i| [200 + i; 32]).collect();
+        let mut reg = steady(&g, 5);
+        assert!(reg.record(6, keys(&evil)));
+        for s in &seeds[..3] {
+            reg.sign_missing(&g.chain_id, *s);
+        }
+        for e in 7..=10 {
+            reg.record(e, keys(&evil));
+        }
+        let forged = manifest(&g, &evil, reg, 104);
+        let v = verify_manifest(&g, &forged).expect("the history verifies from the genesis: that's the attack");
+        let pinned = |set_hash: Option<String>| Trust::new(&g, &Pins { checkpoints: vec![Checkpoint { height: 75, hash: "ab".repeat(32), set_hash }], ..Default::default() }, false).unwrap();
+        let err = v.check_trust(&pinned(crate::checkpoints::genesis_checkpoint(&g).set_hash)).unwrap_err().to_string();
+        assert!(err.contains("epoch 7") && err.contains("forged"), "{err}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A node serves the anchor it executed (block and certificate), or, having fast-synced past
+    /// it, the one its own manifest proved (`anchor.json`).
+    #[test]
+    fn anchors_come_from_the_store_or_the_fast_sync() {
+        let home = std::env::temp_dir().join(format!("blockula-anchorfile-{}-{}", crate::chain::now_ms(), std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let proof = Anchor { block: hex::encode(anchor_block(99).encode()), finalization: "f1".into() };
+        let none = |_: u64| None;
+        assert_eq!(anchor_proof(&home, 99, none, none), None);
+        save_anchor(&home, Some(&proof)).unwrap();
+        assert_eq!(anchor_proof(&home, 99, none, none), Some(proof));
+        assert_eq!(anchor_proof(&home, 89, none, none), None, "the saved anchor is for another epoch");
+        let stored = anchor_proof(&home, 89, |h| Some(vec![h as u8]), |_| Some(vec![0xce]));
+        assert_eq!(stored, Some(Anchor { block: "59".into(), finalization: "ce".into() }));
+        assert_eq!(anchor_proof(&home, 89, |h| Some(vec![h as u8]), none), None, "no certificate, no anchor");
+        save_anchor(&home, None).unwrap();
+        save_anchor(&home, None).unwrap();
+        assert_eq!(anchor_proof(&home, 99, none, none), None);
+        std::fs::remove_dir_all(home).ok();
+    }
 
     /// Restore decompresses the chunks as one stream, whatever the split, and a record's length
     /// prefix can't promise more than the stream holds.

@@ -84,6 +84,9 @@ if [ ! -f "$NET/genesis.json" ]; then
   printf 'BLOCKULA_FORWARDER_SECRET=%s\n' "$(cat "$NET/forwarder-secret")" | fly secrets import -a "$RPC_APP" --stage >/dev/null
 fi
 
+# The public node's `join` pins this genesis (CRY-2: joins without a pinned genesis are refused).
+GENESIS_HASH=$($BIN checkpoint --genesis "$NET/genesis.json")
+
 TAG=$(git rev-parse --short HEAD)$(git diff --quiet -- node deploy || echo -dirty)-$(date +%s)
 IMAGE=registry.fly.io/$RPC_APP:$TAG
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
@@ -139,6 +142,7 @@ app = "$RPC_APP"
 primary_region = "$RPC_REGION"
 [env]
   ROLE = "rpc"
+  GENESIS_HASH = "$GENESIS_HASH"
   CLIENT_IP_HEADER = "fly-client-ip"
   PEER_HTTP = "${PEERS# }"
   BLOCKULA_LOG = "warn,blockula=info"

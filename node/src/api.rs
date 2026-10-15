@@ -49,6 +49,8 @@ pub struct Node {
     github_cache: Arc<Mutex<HashMap<String, (Instant, Value)>>>,
     /// Extra Prometheus text (e.g. Commonware's runtime/p2p metrics on validators).
     pub extra_metrics: Option<Arc<dyn Fn() -> String + Send + Sync>>,
+    /// Height of the newest checkpoint this node trusts (`checkpoints::Trust::newest`; 0: genesis).
+    pub checkpoint_height: u64,
 }
 
 /// Counters for /metrics.
@@ -258,7 +260,7 @@ fn too_many(what: &str, wait: Duration) -> ApiError {
 impl Node {
     pub fn new(chain: Shared, marshal: Option<MarshalMailbox>, peers: Vec<String>, client_ip: ClientIpPolicy) -> Self {
         let live = chain.lock().live.clone();
-        Self { chain, live, marshal, peers, client_ip, limits: Default::default(), reads: Arc::new(ReadLimiter::new(READ_RPS, READ_BURST)), timeout: HTTP_TIMEOUT, stats: Default::default(), extra_metrics: None, github_cache: Default::default() }
+        Self { chain, live, marshal, peers, client_ip, limits: Default::default(), reads: Arc::new(ReadLimiter::new(READ_RPS, READ_BURST)), timeout: HTTP_TIMEOUT, stats: Default::default(), extra_metrics: None, github_cache: Default::default(), checkpoint_height: 0 }
     }
 
     /// Per-client read limits: `rps` per second, bursts of `burst` (`rps` 0: unlimited).
@@ -547,6 +549,9 @@ async fn status(State(n): State<Node>) -> ApiResult {
         "history_from": v.history_from(),
         "pruning": v.keep_blocks.map(|k| json!({ "keep_blocks": k })),
         "fast_synced_from": v.base.as_ref().map(|b| b.height),
+        // Sync trust (CRY-2): the newest trusted checkpoint, and how old one may be for a joiner.
+        "checkpoint_height": n.checkpoint_height,
+        "weak_subjectivity_blocks": crate::checkpoints::ws_period_blocks(&st.chain_params, st.params.epoch_blocks),
         "address_prefix": g.address_prefix,
         "max_tx_validity_blocks": st.chain_params.max_tx_validity_blocks,
         "protocol_version": crate::consensus::PROTOCOL_VERSION,
@@ -1396,6 +1401,7 @@ mod http_tests {
         assert_eq!(s, StatusCode::OK);
         assert!(status.get("data_dir").is_none(), "data_dir isn't exposed");
         assert_eq!(status["version"], VERSION);
+        assert_eq!((status["checkpoint_height"].as_u64(), status["weak_subjectivity_blocks"].as_u64()), (Some(0), Some(21 * 86_400 / 2)), "only the genesis; half of 21 days");
         assert!(status["genesis_hash"].as_str().unwrap().len() == 64);
         // No blocks yet: unhealthy.
         let (s, h, _) = call(&n, "GET", "/api/health", None, "127.0.0.1:1").await;

@@ -14,6 +14,7 @@ mod node_src {
     pub mod api;
     pub mod beacon;
     pub mod chain;
+    pub mod checkpoints;
     pub mod consensus;
     pub mod contrib_cli;
     pub mod crypto;

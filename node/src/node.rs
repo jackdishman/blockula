@@ -3,6 +3,7 @@
 
 use crate::api::{self, Node};
 use crate::chain::{Chain, Genesis};
+use crate::checkpoints::{Pins, Trust};
 use crate::consensus::{self, CBlock, Shared, ValidatorConfig, CHANNELS, MAX_MESSAGE_SIZE};
 use crate::pq::{MlDsaScheme, PrivateKey};
 use anyhow::{anyhow, bail, Context, Result};
@@ -101,10 +102,11 @@ impl Default for HttpOpts {
     }
 }
 
-/// The HTTP API for `chain`, with this node's limits.
-fn http_node(chain: Shared, marshal: Option<consensus::MarshalMailbox>, peers: Vec<String>, net: &NetOpts) -> Node {
+/// The HTTP API for `chain`, with this node's limits and trust.
+fn http_node(chain: Shared, marshal: Option<consensus::MarshalMailbox>, peers: Vec<String>, net: &NetOpts, trust: &Trust) -> Node {
     let mut node = Node::new(chain, marshal, peers, net.client_ip.clone()).with_read_limits(net.http.read_rps, net.http.read_burst);
     node.timeout = net.http.timeout;
+    node.checkpoint_height = trust.newest();
     node
 }
 
@@ -192,7 +194,11 @@ async fn attest_claims(chain: Shared) {
     }
 }
 
-async fn maybe_fast_sync(chain: &Shared, peers: &[String], full: bool) {
+/// How often (every 10 s) fast sync waits for a snapshot newer than a trusted checkpoint
+/// before it falls back to syncing from genesis.
+const SNAPSHOT_WAITS: usize = 30;
+
+async fn maybe_fast_sync(chain: &Shared, peers: &[String], full: bool, trust: &Trust) {
     let empty = {
         let c = chain.lock();
         c.height() == 0 && c.base.is_none()
@@ -200,9 +206,16 @@ async fn maybe_fast_sync(chain: &Shared, peers: &[String], full: bool) {
     if !empty || full || peers.is_empty() {
         return;
     }
-    match crate::snapshot::fast_sync(chain, peers).await {
-        Ok(h) => println!("⚡ fast-synced to #{h} from a certified snapshot; history before it isn't stored on this node"),
-        Err(e) => println!("ℹ️  no usable snapshot ({e:#}); syncing from genesis instead"),
+    for wait in 0.. {
+        match crate::snapshot::fast_sync(chain, peers, trust).await {
+            Ok(h) => return println!("⚡ fast-synced to #{h} from a certified snapshot; history before it isn't stored on this node"),
+            // A checkpoint newer than every peer's snapshot: one is taken every 100 blocks.
+            Err(e) if wait < SNAPSHOT_WAITS && e.chain().any(|c| c.is::<crate::snapshot::SnapshotBehind>()) => {
+                println!("⏳ {e:#}; waiting for a newer snapshot");
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+            Err(e) => return println!("ℹ️  no usable snapshot ({e:#}); syncing from genesis instead"),
+        }
     }
 }
 
@@ -312,6 +325,8 @@ pub fn dev_is_stale(home: &Path) -> bool {
 
 pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
     let mut chain = Chain::open(&home)?;
+    // Validators take their genesis from the signed release; a known chain's must match it.
+    let trust = Arc::new(Trust::new(&chain.genesis, &Pins::default(), false)?);
     let keep = net.pruning.keep(true, &chain.state);
     chain.set_pruning(keep);
     double_sign_guard(&home, chain.height(), net.force_key)?;
@@ -352,14 +367,17 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
         None if net.ephemeral_p2p || is_private_host(&addrs.p2p_addr) => "local".into(),
         None => "recommended".into(),
     };
+    if let Some(why) = trust.stale(chain.height(), crate::chain::now_ms()).filter(|_| !peers.is_empty()) {
+        eprintln!("⚠️  {why}. Validators get recent checkpoints with each release: run the latest one.");
+    }
     let shared: Shared = Arc::new(Mutex::new(chain));
     // Far behind (new validator, long downtime)? Catch up over HTTP first: verified batches,
     // much faster than consensus backfill, and peers prune old consensus data.
     if !peers.is_empty() {
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
         rt.block_on(async {
-            maybe_fast_sync(&shared, &peers, net.full).await;
-            catch_up(shared.clone(), peers.clone()).await;
+            maybe_fast_sync(&shared, &peers, net.full, &trust).await;
+            catch_up(shared.clone(), peers.clone(), trust.clone()).await;
         });
     }
     {
@@ -412,7 +430,7 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
         let (handle, marshal) = consensus::start_validator(context.child("node"), vcfg, oracle.clone(), oracle.clone(), channels).await;
         tokio::spawn(exchange_epochs(shared.clone(), peers.clone()));
         tokio::spawn(attest_claims(shared.clone()));
-        tokio::spawn(serve_http(http_node(shared, Some(marshal), peers, &net), http_bind));
+        tokio::spawn(serve_http(http_node(shared, Some(marshal), peers, &net, &trust), http_bind));
         if let Err(e) = handle.await {
             eprintln!("consensus stopped: {e:?}");
         }
@@ -426,6 +444,10 @@ struct JoinConfig {
     /// Start from a certified snapshot (default) instead of replaying from genesis.
     #[serde(default = "yes")]
     fast: bool,
+    /// What the operator pinned (`--genesis-hash`, `--checkpoint`, `--allow-stale-checkpoint`),
+    /// enforced on every start.
+    #[serde(default, flatten)]
+    pins: Pins,
 }
 
 fn yes() -> bool {
@@ -433,9 +455,10 @@ fn yes() -> bool {
 }
 
 /// Prepares a full-node home: genesis.json (copied or fetched from a node) + join.json.
-/// `genesis_hash` pins the chain: the join fails unless genesis hashes to it.
-pub fn join(genesis: &str, home: &Path, genesis_hash: Option<&str>, fast: bool) -> Result<()> {
-    std::fs::create_dir_all(home)?;
+/// The genesis must be pinned: by `pins.genesis_hash`, or by this binary for a known chain id
+/// (`checkpoints.rs`). Checkpoints must agree with it, and the newest root must be younger than
+/// the weak-subjectivity period unless `pins.allow_stale_checkpoint`.
+pub fn join(genesis: &str, home: &Path, pins: &Pins, fast: bool) -> Result<()> {
     if home.join("validator.key").exists() {
         bail!("{} is a validator home", home.display());
     }
@@ -447,14 +470,13 @@ pub fn join(genesis: &str, home: &Path, genesis_hash: Option<&str>, fast: bool) 
     } else {
         (Genesis::load(Path::new(genesis))?, vec![])
     };
-    let hash = hex::encode(consensus::genesis_block(&g).digest_bytes());
-    if let Some(want) = genesis_hash {
-        if want.to_lowercase() != hash {
-            bail!("genesis hash mismatch: expected {want}, got {hash} — wrong chain or tampered genesis");
-        }
-    } else {
-        println!("⚠️  genesis hash {hash} (pin it next time with --genesis-hash)");
+    let trust = Trust::new(&g, pins, true)?;
+    trust.check_fresh(0, crate::chain::now_ms())?;
+    match trust.newest() {
+        0 => println!("🔐 genesis {} pinned", trust.genesis_hash),
+        h => println!("🔐 genesis {} pinned; newest trusted checkpoint #{h}", trust.genesis_hash),
     }
+    std::fs::create_dir_all(home)?;
     for u in http_peers(&g, &[], None) {
         if !peers.contains(&u) {
             peers.push(u);
@@ -469,7 +491,7 @@ pub fn join(genesis: &str, home: &Path, genesis_hash: Option<&str>, fast: bool) 
     } else {
         std::fs::write(&path, serde_json::to_string_pretty(&g)?)?;
     }
-    std::fs::write(home.join("join.json"), serde_json::to_string_pretty(&JoinConfig { peers, fast })?)?;
+    std::fs::write(home.join("join.json"), serde_json::to_string_pretty(&JoinConfig { peers, fast, pins: pins.clone() })?)?;
     Ok(())
 }
 
@@ -477,6 +499,12 @@ pub fn run_full_node(home: PathBuf, net: NetOpts) -> Result<()> {
     let bind = socket(&net.bind, net.http_port.unwrap_or(7171))?;
     let jc: JoinConfig = serde_json::from_slice(&std::fs::read(home.join("join.json")).context("not a joined home — use `blockula join`")?)?;
     let mut chain = Chain::open(&home)?;
+    // The pins were checked at `join`; they (and the embedded checkpoints) apply on every start.
+    let trust = Arc::new(Trust::new(&chain.genesis, &jc.pins, false)?);
+    // An empty home is where a stale root bites (a fresh sync); a synced one trusts its own head.
+    if let Some(why) = trust.check_fresh(chain.height(), crate::chain::now_ms())? {
+        eprintln!("⚠️  {why}");
+    }
     let keep = net.pruning.keep(false, &chain.state);
     chain.set_pruning(keep);
     let peers = if net.peer_http.is_empty() { jc.peers } else { http_peers(&chain.genesis, &net.peer_http, None) };
@@ -486,10 +514,10 @@ pub fn run_full_node(home: PathBuf, net: NetOpts) -> Result<()> {
     let fast = jc.fast && !net.full;
     rt.block_on(async move {
         // The API and explorer come up immediately, while syncing.
-        tokio::spawn(serve_http(http_node(shared.clone(), None, peers.clone(), &net), bind));
-        maybe_fast_sync(&shared, &peers, !fast).await;
+        tokio::spawn(serve_http(http_node(shared.clone(), None, peers.clone(), &net, &trust), bind));
+        maybe_fast_sync(&shared, &peers, !fast, &trust).await;
         tokio::spawn(exchange_epochs(shared.clone(), peers.clone()));
-        sync_loop(shared, peers, false).await;
+        sync_loop(shared, peers, false, trust).await;
     });
     Ok(())
 }
@@ -527,7 +555,7 @@ pub async fn get_capped(client: &reqwest::Client, url: &str, cap: usize) -> Resu
 }
 
 /// One sync round against `peer`. Ok(true) = applied blocks, Ok(false) = peer had nothing new.
-async fn sync_once(chain: &Shared, provider: &consensus::EpochProvider, client: &reqwest::Client, peer: &str) -> Result<bool> {
+async fn sync_once(chain: &Shared, provider: &consensus::EpochProvider, client: &reqwest::Client, peer: &str, trust: &Trust) -> Result<bool> {
     // Batches never cross an epoch boundary: each is verified with that epoch's validator set,
     // which we learn by executing the previous epoch's last block.
     let (from, limit, epoch) = {
@@ -546,13 +574,13 @@ async fn sync_once(chain: &Shared, provider: &consensus::EpochProvider, client: 
         }
         return Ok(false);
     }
-    apply_batch(chain, &verifier, epoch, &batch)?;
+    apply_batch_trusted(chain, &verifier, epoch, &batch, Some(trust))?;
     Ok(true)
 }
 
 /// Follows peers forever (full nodes). Peers rotate on errors, bad batches and empty replies,
 /// so one stalling or lying peer can't hold the node back.
-async fn sync_loop(chain: Shared, peers: Vec<String>, stop_when_caught_up: bool) {
+async fn sync_loop(chain: Shared, peers: Vec<String>, stop_when_caught_up: bool, trust: Arc<Trust>) {
     let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build().unwrap();
     let provider = consensus::EpochProvider::new(chain.clone(), None);
     let block_time = Duration::from_millis(chain.lock().genesis.block_time_ms);
@@ -565,7 +593,7 @@ async fn sync_loop(chain: Shared, peers: Vec<String>, stop_when_caught_up: bool)
     let mut failures = 0usize;
     loop {
         let url = &peers[peer % peers.len()];
-        match sync_once(&chain, &provider, &client, url).await {
+        match sync_once(&chain, &provider, &client, url, &trust).await {
             Ok(true) => {
                 idle_rounds = 0;
                 failures = 0;
@@ -595,9 +623,9 @@ async fn sync_loop(chain: Shared, peers: Vec<String>, stop_when_caught_up: bool)
 }
 
 /// Validators: sync over HTTP until no peer has anything newer (or none answer).
-async fn catch_up(chain: Shared, peers: Vec<String>) {
+async fn catch_up(chain: Shared, peers: Vec<String>, trust: Arc<Trust>) {
     let start = chain.lock().height();
-    sync_loop(chain.clone(), peers, true).await;
+    sync_loop(chain.clone(), peers, true, trust).await;
     let end = chain.lock().height();
     if end > start {
         println!("⏩ caught up over HTTP: {start} → {end}");
@@ -605,8 +633,20 @@ async fn catch_up(chain: Shared, peers: Vec<String>) {
 }
 
 /// Verifies a batch (contiguous heights, hash-linked to our tip, quorum finalization over the
-/// last block) and executes it.
+/// last block) and executes it. (The simulator and the fuzz harness; nodes check their trust.)
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn apply_batch(chain: &Shared, verifier: &MlDsaScheme, epoch: u64, batch: &SyncBatch) -> Result<()> {
+    apply_batch_trusted(chain, verifier, epoch, batch, None)
+}
+
+/// [`apply_batch`], refusing a batch that contradicts `trust`: a block at a checkpoint's height
+/// with another hash, or an epoch whose validator set (learned by executing up to it) isn't the
+/// one a checkpoint pins. Both are checked before anything executes.
+pub(crate) fn apply_batch_trusted(chain: &Shared, verifier: &MlDsaScheme, epoch: u64, batch: &SyncBatch, trust: Option<&Trust>) -> Result<()> {
+    if let Some(t) = trust {
+        let keys: Vec<String> = chain.lock().state.active_set(epoch).map(|s| s.iter().map(|v| v.consensus_key.clone()).collect()).unwrap_or_default();
+        t.check_set(epoch, &keys)?;
+    }
     let blocks: Vec<CBlock> = batch.blocks.iter().map(|h| Ok(CBlock::decode(hex::decode(h)?.as_slice())?)).collect::<Result<_>>()?;
     let fin_hex = batch.finalization.as_ref().ok_or_else(|| anyhow!("missing finalization"))?;
     let fin_bytes = hex::decode(fin_hex)?;
@@ -631,6 +671,9 @@ pub(crate) fn apply_batch(chain: &Shared, verifier: &MlDsaScheme, epoch: u64, ba
         }
         prev = hex::encode(b.digest_bytes());
         height = b.height;
+        if let Some(t) = trust {
+            t.check_block(height, &prev)?;
+        }
     }
     // One block at a time, the chain lock held only for the in-memory parts (sync is this
     // node's only executor, so nothing else extends the chain in between).
@@ -683,15 +726,81 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// CRY-2: `join` needs a pinned genesis (no more warn-only), checkpoints that agree with it,
+    /// and a root younger than the weak-subjectivity period; the pins outlive the command.
     #[test]
-    fn join_pins_the_genesis_hash() {
+    fn join_pins_the_genesis_and_refuses_stale_roots() {
+        use crate::checkpoints::Checkpoint;
         let root = home("pin");
         let homes = Chain::summon(&root, &SummonOpts::new("pin", 1)).unwrap();
-        let g = Genesis::load(&homes[0].join("genesis.json")).unwrap();
-        let hash = hex::encode(consensus::genesis_block(&g).digest_bytes());
         let gpath = homes[0].join("genesis.json");
-        assert!(join(gpath.to_str().unwrap(), &root.join("full-bad"), Some(&"00".repeat(32)), true).unwrap_err().to_string().contains("mismatch"));
-        join(gpath.to_str().unwrap(), &root.join("full-ok"), Some(&hash), true).unwrap();
+        let g = Genesis::load(&gpath).unwrap();
+        let hash = hex::encode(consensus::genesis_block(&g).digest_bytes());
+        let pin = |h: &str| Pins { genesis_hash: Some(h.to_string()), ..Default::default() };
+        let try_join = |path: &Path, name: &str, pins: &Pins| join(path.to_str().unwrap(), &root.join(name), pins, true);
+        let err = try_join(&gpath, "full-none", &Pins::default()).unwrap_err().to_string();
+        assert!(err.contains("--genesis-hash") && err.contains(&hash), "{err}");
+        assert!(!root.join("full-none").exists(), "a refused join writes nothing");
+        assert!(try_join(&gpath, "full-bad", &pin(&"00".repeat(32))).unwrap_err().to_string().contains("mismatch"));
+        let wrong_genesis = Pins { checkpoints: vec![Checkpoint { height: 0, hash: "ab".repeat(32), set_hash: None }], ..pin(&hash) };
+        assert!(try_join(&gpath, "full-cp0", &wrong_genesis).unwrap_err().to_string().contains("checkpoint #0"));
+        // Pinned: joined, and `run` finds the pins in join.json.
+        let pins = Pins { checkpoints: vec![Checkpoint { height: 5, hash: "cd".repeat(32), set_hash: None }], ..pin(&hash) };
+        try_join(&gpath, "full-ok", &pins).unwrap();
+        let jc: JoinConfig = serde_json::from_slice(&std::fs::read(root.join("full-ok").join("join.json")).unwrap()).unwrap();
+        assert_eq!(jc.pins, pins);
+        // A month-old chain with nothing newer than its genesis: refused unless the operator says so.
+        let mut old = g.clone();
+        old.created_at_ms -= 30 * 86_400_000;
+        let old_path = root.join("old-genesis.json");
+        std::fs::write(&old_path, serde_json::to_string(&old).unwrap()).unwrap();
+        let old_hash = hex::encode(consensus::genesis_block(&old).digest_bytes());
+        let err = try_join(&old_path, "full-stale", &pin(&old_hash)).unwrap_err().to_string();
+        assert!(err.contains("weak-subjectivity") && err.contains("--allow-stale-checkpoint"), "{err}");
+        try_join(&old_path, "full-stale", &Pins { allow_stale_checkpoint: true, ..pin(&old_hash) }).unwrap();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Sync batches that contradict a trusted checkpoint are refused before anything executes: a
+    /// block at the checkpoint's height with another hash, or another set for the epoch it pins.
+    #[test]
+    fn sync_batches_must_match_trusted_checkpoints() {
+        use crate::checkpoints::Checkpoint;
+        use commonware_codec::Encode as _;
+        use commonware_consensus::simplex::types::{Finalize, Proposal};
+        use commonware_consensus::types::{Epoch, Round, View};
+        let root = home("cpbatch");
+        let homes = Chain::summon(&root, &SummonOpts::new("cpbatch", 1)).unwrap();
+        let g = Genesis::load(&homes[0].join("genesis.json")).unwrap();
+        let seed: [u8; 32] = hex::decode(std::fs::read_to_string(homes[0].join("validator.key")).unwrap().trim()).unwrap().try_into().unwrap();
+        let full = root.join("full");
+        std::fs::create_dir_all(&full).unwrap();
+        std::fs::copy(homes[0].join("genesis.json"), full.join("genesis.json")).unwrap();
+        let chain: Shared = Arc::new(Mutex::new(Chain::open(&full).unwrap()));
+        // Blocks 1..=3 on the genesis, the last certified by the one validator.
+        let root_hash = consensus::hex_32(&g.initial_state().root());
+        let mut blocks = vec![consensus::genesis_block(&g)];
+        for h in 1..=3u64 {
+            let parent = blocks.last().unwrap().digest();
+            blocks.push(CBlock::new(parent, h, h, h - 1, g.created_at_ms + 1000 * h, g.validators[0].address.clone(), 0, root_hash, vec![]));
+        }
+        let scheme = MlDsaScheme::signer(&consensus::namespace(&g.chain_id), consensus::participants(&g).unwrap(), PrivateKey::from_seed_bytes(seed)).unwrap();
+        let last = &blocks[3];
+        let vote = Finalize::sign(&scheme, Proposal::new(Round::new(Epoch::new(0), View::new(3)), View::new(2), last.digest())).unwrap();
+        let fin = Finalization::from_finalizes(&scheme, commonware_utils::iter::NonEmpty::try_new([vote].iter()).unwrap(), &commonware_parallel::Sequential).unwrap();
+        let batch = SyncBatch { tip: 3, blocks: blocks[1..].iter().map(|b| hex::encode(b.encode())).collect(), to: Some(3), finalization: Some(hex::encode(fin.encode())) };
+        let verifier = consensus::EpochProvider::new(chain.clone(), None).epoch_scheme(0).unwrap();
+        let hash2 = hex::encode(blocks[2].digest_bytes());
+        let genesis_set = crate::checkpoints::genesis_checkpoint(&g).set_hash;
+        let trust = |hash: &str, set: Option<String>| Trust::new(&g, &Pins { checkpoints: vec![Checkpoint { height: 2, hash: hash.into(), set_hash: set }], ..Default::default() }, false).unwrap();
+        let err = apply_batch_trusted(&chain, &verifier, 0, &batch, Some(&trust(&"ab".repeat(32), None))).unwrap_err().to_string();
+        assert!(err.contains("another chain"), "{err}");
+        let err = apply_batch_trusted(&chain, &verifier, 0, &batch, Some(&trust(&hash2, Some("cd".repeat(32))))).unwrap_err().to_string();
+        assert!(err.contains("forged validator-set history"), "{err}");
+        assert_eq!(chain.lock().height(), 0, "nothing executed");
+        apply_batch_trusted(&chain, &verifier, 0, &batch, Some(&trust(&hash2, genesis_set))).unwrap();
+        assert_eq!(chain.lock().hash_at(2), Some(hash2));
+        drop(chain);
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -711,9 +820,10 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let client = reqwest::Client::new();
         let provider = consensus::EpochProvider::new(chain.clone(), None);
-        let liar = sync_once(&chain, &provider, &client, &format!("http://{addr}/liar")).await.unwrap_err().to_string();
+        let trust = Trust::new(&chain.lock().genesis, &Pins::default(), false).unwrap();
+        let liar = sync_once(&chain, &provider, &client, &format!("http://{addr}/liar"), &trust).await.unwrap_err().to_string();
         assert!(liar.contains("sent nothing"), "{liar}");
-        let huge = sync_once(&chain, &provider, &client, &format!("http://{addr}/huge")).await.unwrap_err().to_string();
+        let huge = sync_once(&chain, &provider, &client, &format!("http://{addr}/huge"), &trust).await.unwrap_err().to_string();
         assert!(huge.contains("too large"), "{huge}");
         // Claims never move our finalized tip; only verified certificates do.
         assert_eq!(chain.lock().finalized_tip, 0);

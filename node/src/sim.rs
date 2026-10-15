@@ -353,6 +353,11 @@ fn fast_sync_from_certified_snapshot_and_tamper_rejection() {
 
         // Tampering is caught.
         let v = snapshot::verify_manifest(&genesis, &m).unwrap();
+        // So is a manifest that contradicts a trusted checkpoint (here at the epoch anchor, #299).
+        let real = crate::checkpoints::Checkpoint { height: 299, hash: vals[0].chain.lock().hash_at(299).unwrap(), set_hash: None };
+        let trusting = |cp| crate::checkpoints::Trust::new(&genesis, &crate::checkpoints::Pins { checkpoints: vec![cp], ..Default::default() }, false).unwrap();
+        snapshot::verify_manifest_trusted(&genesis, &m, &trusting(real.clone())).unwrap();
+        assert!(snapshot::verify_manifest_trusted(&genesis, &m, &trusting(crate::checkpoints::Checkpoint { hash: "ab".repeat(32), ..real })).is_err());
         let mut bad = chunks.clone();
         bad[0][10] ^= 1;
         assert!(snapshot::restore(&genesis, &v, &bad).err().unwrap().to_string().contains("doesn't match"));
@@ -387,8 +392,12 @@ fn fast_sync_from_certified_snapshot_and_tamper_rejection() {
         let joiner: Shared = Arc::new(Mutex::new(Chain::open(&joiner_home).unwrap()));
         let packed = joiner_home.join("base.state.zst.part");
         std::fs::write(&packed, chunks.concat()).unwrap();
-        joiner.lock().install_snapshot(&v, state, &packed, None).unwrap();
+        joiner.lock().install_snapshot(&v, state, &packed).unwrap();
         assert_eq!(joiner.lock().base_height(), m.height);
+        // The epoch anchor (#299, before the snapshot) came certified by epoch 29's set.
+        let (a, hash) = v.epoch_start.clone().expect("the epoch anchor is before the snapshot");
+        assert_eq!((a, Some(hash)), (299, vals[0].chain.lock().hash_at(299)));
+        assert_eq!(joiner.lock().hash_at(a), vals[0].chain.lock().hash_at(a));
         assert!(joiner.lock().block(m.height).is_none(), "no history before the snapshot");
         let target = vals[0].chain.lock().height() + 20;
         wait_for_height(&context, &vals, target).await;

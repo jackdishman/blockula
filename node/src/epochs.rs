@@ -6,6 +6,12 @@
 //! `HANDOFF_CONTEXT`). A quorum (2f+1) of the outgoing set makes the new set trusted. Epochs
 //! where the set doesn't change need no proof: hiding a change can't make a joiner accept a fake
 //! state, only fail to verify (it then tries another peer).
+//!
+//! Handoffs can be signed at any time, also retroactively, and nothing slashes a handoff. So keys
+//! of a set that has since unbonded can hand off to a made-up set, and a joiner that trusts only
+//! the genesis would follow it. That's weak subjectivity: joiners also pin a recent validator set
+//! (a checkpoint's `set_hash`, `checkpoints.rs`), which every later set must descend from, and
+//! refuse roots older than the weak-subjectivity period.
 
 use crate::chain::Genesis;
 use crate::pq::{PrivateKey, PublicKey, Signature};
@@ -22,6 +28,7 @@ pub fn quorum(n: usize) -> usize {
     n - n.saturating_sub(1) / 3
 }
 
+/// The hash a handoff signs and a checkpoint pins: of the sorted consensus keys (hex).
 pub fn set_hash(keys: &[String]) -> [u8; 32] {
     crate::crypto::hash(format!("BLOCKULA_SET_V1:{}", keys.join(",")).as_bytes())
 }

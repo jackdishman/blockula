@@ -6,6 +6,7 @@
 
 use crate::{
     chain::{Chain, Genesis, State},
+    checkpoints,
     consensus::{self, CBlock, Shared},
     crypto::Keys,
     epochs::{self, EpochRegistry},
@@ -150,6 +151,13 @@ pub fn snapshot_manifest(data: &[u8]) -> bool {
     let Ok(m) = serde_json::from_slice::<snapshot::Manifest>(data) else { return false };
     let Ok(v) = snapshot::verify_manifest(genesis(), &m) else { return false };
     let _ = snapshot::check_chunk(&v, 0, data);
+    // And against trusted checkpoints, as `join` checks it: one the manifest proves, one it can't.
+    let set_hash = checkpoints::genesis_checkpoint(genesis()).set_hash;
+    for (height, set_hash) in [(m.height, None), (m.height / 2, set_hash), (u64::MAX, None)] {
+        let cp = checkpoints::Checkpoint { height, hash: v.hash_at(height).unwrap_or_else(|| "ab".repeat(32)), set_hash };
+        let pins = checkpoints::Pins { checkpoints: vec![cp], ..Default::default() };
+        let _ = v.check_trust(&checkpoints::Trust::new(genesis(), &pins, false).expect("the fixture chain is unknown, so any checkpoint past #0 is accepted"));
+    }
     true
 }
 
@@ -261,7 +269,8 @@ fn finalize_fixture(block: &CBlock, epoch: u64, view: u64) -> Vec<u8> {
 }
 
 /// A fast-sync manifest for `checkpoint`: blocks `checkpoint + 1 ..= checkpoint + 4`, the last one
-/// committing to the checkpoint's state root and certified by the fixture validator.
+/// committing to the checkpoint's state root and certified by the fixture validator, and the epoch
+/// anchor when it's before the checkpoint (the previous epoch's last block, certified in that epoch).
 fn manifest(checkpoint: u64) -> Vec<u8> {
     let g = genesis();
     let proposer = Keys::from_seed(VALIDATOR_SEED).address();
@@ -282,13 +291,17 @@ fn manifest(checkpoint: u64) -> Vec<u8> {
     for e in 1..=epoch {
         epochs.record(e, set.clone());
     }
-    let m = json!({
+    let mut m = json!({
         "chain_id": CHAIN_ID, "height": checkpoint, "state_root": hex::encode(state_root),
         "chunks": [{ "hash": hex::encode(crate::crypto::hash(&chunk)), "size": chunk.len() }],
         "blocks": blocks.iter().map(|b| hex::encode(b.encode())).collect::<Vec<_>>(),
         "finalization": hex::encode(finalize_fixture(last, epoch, last.height)),
         "epochs": epochs,
     });
+    if let Some(a) = snapshot::anchor_height(&g.params(), checkpoint, last.height) {
+        let anchor = CBlock::new(Digest(crate::crypto::hash(b"before the anchor")), a, a, a - 1, GENESIS_MS + 1000 * a, proposer.clone(), 0, [0; 32], vec![]);
+        m["anchor"] = json!({ "block": hex::encode(anchor.encode()), "finalization": hex::encode(finalize_fixture(&anchor, g.params().epoch_of(a), a)) });
+    }
     serde_json::to_vec(&m).unwrap()
 }
 
