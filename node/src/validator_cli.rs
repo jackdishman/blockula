@@ -346,7 +346,8 @@ pub fn run(cmd: ValidatorCmd) -> Result<()> {
         }
         ValidatorCmd::List { rpc } => {
             let v = rt()?.block_on(get(&rpc, "/validators"))?;
-            println!("epoch {} · {} blocks until the next epoch · at most {} seats change per epoch", v["epoch"], v["blocks_until_next_epoch"], v["churn_limit"]);
+            let churn = v["churn_limit"].as_u64().unwrap_or(1);
+            println!("epoch {} · {} blocks until the next epoch · at most {churn} seat{} change per epoch", v["epoch"], v["blocks_until_next_epoch"], if churn == 1 { "" } else { "s" });
             for (title, key) in [("active", "active"), ("joining next epoch", "joining"), ("leaving next epoch", "leaving"), ("candidates", "candidates"), ("jailed", "jailed"), ("tombstoned", "tombstoned"), ("removed", "removed")] {
                 let list = v[key].as_array().cloned().unwrap_or_default();
                 println!("{title} ({}):", list.len());

@@ -1103,17 +1103,12 @@ async fn staking(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
         .collect();
     let validators: Vec<Value> = st.validators.values().filter(|r| r.address == addr || r.owner == addr).map(|r| validator_json(&v, r)).collect();
     let who = label(&v, &addr)["name"].as_str().map(String::from).unwrap_or_else(|| short(&addr));
-    let summary = match (bonded, unbonding) {
-        (0, 0) => format!("{who} has nothing staked"),
-        _ => {
-            let pools = match delegations.len() {
-                1 => "1 validator".to_string(),
-                n => format!("{n} validators"),
-            };
-            let out = if unbonding == 0 { String::new() } else { format!(" and {} unbonding ({} ready to withdraw)", fmt_fang(unbonding), fmt_fang(ready)) };
-            format!("{who} has {} staked with {pools}{out}", fmt_fang(bonded))
-        }
+    let staked = match delegations.len() {
+        0 => "nothing staked".to_string(),
+        1 => format!("{} staked with 1 validator", fmt_fang(bonded)),
+        n => format!("{} staked with {n} validators", fmt_fang(bonded)),
     };
+    let summary = if unbonding == 0 { format!("{who} has {staked}") } else { format!("{who} has {staked}, and {} unbonding ({} ready to withdraw)", fmt_fang(unbonding), fmt_fang(ready)) };
     Ok(Json(json!({
         "account": label(&v, &addr),
         "bonded": bonded.to_string(),
@@ -1515,6 +1510,48 @@ mod http_tests {
         assert_eq!(s, StatusCode::OK);
         assert_eq!(b["to"], 1);
         assert_eq!(b["finalization"], "010203");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The validator set and one account's staking, as the explorer and the CLI read them.
+    #[tokio::test]
+    async fn validators_and_staking() {
+        let (root, n) = node("stake");
+        let me = n.chain.lock().me().unwrap();
+        let (s, v, _) = call(&n, "GET", "/api/validators", None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::OK);
+        let active = &v["active"][0];
+        assert_eq!((active["validator"]["address"].as_str(), active["status"].as_str(), active["eligible"].as_bool()), (Some(me.as_str()), Some("active"), Some(true)));
+        assert_eq!(active["self_bond"], active["stake"]);
+        assert_eq!((v["churn_limit"].as_u64(), v["candidates"].as_array().map(Vec::len)), (Some(1), Some(0)));
+        assert_eq!(v["next_epoch"][0]["validator"]["address"], me.as_str());
+        // A delegator: its stake, then its way out.
+        let alice = crate::crypto::Keys::from_seed([1; 32]);
+        n.chain.lock().faucet(&alice.address(), 50 * DROPS_PER_FANG).unwrap();
+        n.chain.lock().produce_block().unwrap();
+        let tx = |c: &Chain, nonce: u64, action: Action| {
+            let mut t = Tx { chain_id: c.genesis.chain_id.clone(), from: alice.address(), nonce, fee: 0, tip: 0, valid_until: c.height() + 10, action, memo: String::new(), public_key: hex::encode(alice.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+            t.fee = t.charge().unwrap();
+            t.sign(&alice)
+        };
+        let delegate = tx(&n.chain.lock(), 0, Action::Delegate { validator: me.clone(), amount: 20 * DROPS_PER_FANG });
+        n.chain.lock().submit(delegate).unwrap();
+        n.chain.lock().produce_block().unwrap();
+        let undelegate = tx(&n.chain.lock(), 1, Action::Undelegate { validator: me.clone(), shares: 5 * DROPS_PER_FANG });
+        n.chain.lock().submit(undelegate).unwrap();
+        n.chain.lock().produce_block().unwrap();
+        let (s, st, _) = call(&n, "GET", &format!("/api/staking/{}", alice.address()), None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!((st["bonded"].as_str(), st["unbonding"].as_str(), st["withdrawable"].as_str()), (Some("15000000000"), Some("5000000000"), Some("0")));
+        assert_eq!(st["delegations"][0]["validator"]["address"], me.as_str());
+        assert_eq!((st["entries"][0]["type"].as_str(), st["entries"][0]["ready"].as_bool()), (Some("unbonding"), Some(false)));
+        assert!(st["summary"].as_str().unwrap().ends_with("has 15 FANG staked with 1 validator, and 5 FANG unbonding (0 FANG ready to withdraw)"), "{}", st["summary"]);
+        // The validator's own account: its pool, and its self-bond as a delegation.
+        let (_, mine, _) = call(&n, "GET", &format!("/api/staking/{me}"), None, "127.0.0.1:1").await;
+        assert_eq!(mine["validators"][0]["stake"].as_str().map(|s| s.parse::<u64>().unwrap()), Some(crate::staking::self_bond(&n.chain.lock().state, &me) + 15 * DROPS_PER_FANG));
+        assert_eq!(mine["delegations"][0]["self_bond"], true);
+        let (s, _, _) = call(&n, "GET", "/api/staking/nobody.boo", None, "127.0.0.1:1").await;
+        assert!(s.is_client_error());
         std::fs::remove_dir_all(root).ok();
     }
 
