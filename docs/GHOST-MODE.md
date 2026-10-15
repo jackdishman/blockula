@@ -118,8 +118,20 @@ Depth 32 (2³² notes), leaves are note commitments, empty leaves are
 `BLAKE3-KDF("blockula ghost v1 uncommitted leaf")`, and empty subtrees hash up from it.
 Bit `h` of a leaf's position says whether its ancestor at height `h` is a right child.
 
-- `Frontier` (what the node stores): the leaf count and one pending left node per level, O(32)
-  work per append. Its encoding (`8 + 32 × 32` bytes) zeroes unused slots, so it's canonical.
+- `Frontier` (what the node stores): the leaf count and one pending left node per height
+  0..=32, O(32) work per append. Slot `h` is set exactly when bit `h` of the count is, so slot
+  32 is set only in a full tree (2³² leaves) and holds its root: the last append folds every
+  pending node into it. Its encoding (`8 + 33 × 32` = 1,064 bytes) requires the unused slots to
+  be zero, so it's canonical; a count above 2³² is rejected.
+- **A full tree.** Every action appends exactly two commitments (dummies included), so once the
+  tree is full the pool is frozen: every further action fails with `TreeFull`. A migration to a
+  new pool through the turnstile has to happen well before that (2³¹ actions). The frontier
+  still reports the full tree's true root rather than refusing the last leaf, because that
+  keeps node and wallets on one rule: `Frontier` and `FullTree` hold the same 2³² leaves and
+  agree on the root at every size (an earlier version dropped the root on the last append and
+  reported the empty tree's). And since 2³² is even, an action's two appends either both fit
+  or the first fails, so an action is never half-appended. Refusing leaf 2³² − 1 instead would
+  make the usable size odd: the last action could fit one output but not the other.
 - `RootHistory`: the last `ghost_anchor_window` roots; a spend's anchor must be one of them.
 - `FullTree` (wallets, tests): keeps every node and serves authentication paths.
 
@@ -262,7 +274,8 @@ Proof bytes are the postcard encoding of `p3_uni_stark::Proof`. `verify(public, 
    themselves (no trailing bytes, no overlong varints), and the height must be ours;
 3. runs Plonky3's verifier under `catch_unwind`. Plonky3 says its verifier "may panic on certain
    malformed proofs"; 0.8's transcript drivers yield to an in-flight panic, so it can be caught.
-   The node's build must keep `panic = "unwind"`.
+   The node's build must keep `panic = "unwind"`: the crate refuses to compile otherwise
+   (`compile_error!` on `cfg(panic)`; WASM, used only by wallets, is exempt).
 
 No input tried so far makes it panic: 20,000 random and 20,000 mutated proofs and a bit flipped
 in every byte of a proof (section 11). `prove` checks every constraint before proving, so
@@ -306,7 +319,28 @@ out           = XChaCha20-Poly1305(ock, nonce', aad = cm, owner ‖ ss)      80 
 | `encrypt_note`, `TrialDecryptor`, `try_decrypt_incoming`, `try_decrypt_outgoing`, `dummy_output` | encryption (section 6) |
 | `circuit::config::security_report` | the soundness numbers |
 
-The crate is its own workspace; the node will depend on it by path. Plonky3 is `=`-pinned.
+The crate is its own workspace; the node will depend on it by path. Plonky3 is `=`-pinned, and
+so is `zeroize`.
+
+**Build profile.** Cargo applies only the root workspace's profiles, so the crate's own
+`[profile.release] overflow-checks = true` stops applying the moment the node depends on it:
+the node's profile governs `blockula-ghost` and every `p3-*` crate, and the node today turns
+overflow checks on for `blockula` only. Every robustness number in section 11 was measured with
+overflow checks on everywhere, Plonky3 included, where an overflow on a malformed proof panics
+and `verify` returns `Panicked`; without them it would wrap and run on down an untested path.
+So `node/Cargo.toml` must have, when it adds the dependency:
+
+```toml
+[profile.release]
+overflow-checks = true   # blockula, blockula-ghost and Plonky3; at minimum
+                         # [profile.release.package.blockula-ghost] plus each p3-* crate
+# panic stays "unwind" (the default); blockula-ghost won't compile with "abort"
+```
+
+and the proof-robustness soaks should be re-run from the node workspace. The crate's own
+correctness doesn't depend on the profile: its arithmetic on untrusted input (tree sizes and
+positions, value balances, proof and ciphertext lengths) is explicit (`try_from`, `i128` sums,
+length checks before slicing), so nothing in it can wrap in either profile.
 
 ## 8. Node integration plan (later package)
 
@@ -363,7 +397,11 @@ transparently; for 51–52 it comes out of shielded value through the value bala
   value balance matches the tag; turnstile and pool cap.
 - Consensus `verify`: proofs not already cached. Stateful checks run at execution and through
   CV-5's ancestor replay.
-- Execution: re-check, append both output commitments (dummies too) to the frontier, insert both
+- Value balances: compute `amount + fee` and the like in `i128` (or checked `u64`) and pass them
+  to `ValueBalance::new`, which rejects anything outside `±(2⁶⁴ − 1)`; never add in wrapping
+  `u64`.
+- Execution: re-check, append both output commitments (dummies too) to the frontier (a full tree
+  fails the first append, so check `size() + 2 ≤ CAPACITY` or apply to a copy), insert both
   nullifiers, move value, update `ghost_pool`, record the root at end of block.
 - `State::check_invariants()`: `supply = Σ balances + escrows + stakes + pools + ghost_pool`.
 
@@ -449,6 +487,11 @@ of a more complex AIR.
   between statements, random byte strings and structured mutations. `GHOST_FUZZ_ITERS=20000`
   soaks: 20,000 + 20,000 inputs, 0 panics. `every_byte_flip_is_rejected` (ignored, slow) flips a
   bit in every byte of a proof: 128,807 flips, all rejected, 0 panics (11 minutes in release).
+- **Tree**: frontier against `FullTree` at every size up to 2¹⁰ + 1, and at 2³² − 1 leaves and
+  at capacity (states built with `from_bytes`) against a hand fold and against authentication
+  paths; the strict decoding rules, including the full tree's root slot.
+- **Secret hygiene**: `{:?}` of witnesses, notes, paths, keys, decrypted notes and the trial
+  decryptor contains no key, note or position material (`debug_output_redacts_secrets`).
 - **Encryption** (`tests/encryption.rs`): round trip, sizes, other keys, tampering in each
   region, wrong `cm`, outgoing recovery, no-ovk noise, wrong recipient, freshness, random garbage.
 - **Lifecycle** (`tests/lifecycle.rs`): through the public API with a toy node (frontier, root
@@ -469,6 +512,15 @@ of a more complex AIR.
 - **2-in/2-out only.** Larger payments need several actions (and the node a bundle format whose
   value balances add up).
 - **Scanning** costs every wallet ~1.5 KB and one decapsulation per output.
-- **Memory hygiene**: secrets aren't zeroized.
+- **Memory hygiene**: partial. `Debug` never prints secrets: key types, `SpendWitness`, `Note`,
+  `MerklePath` (the position identifies the note), `DecryptedNote` and `TrialDecryptor` print
+  `Type(..)`, and `ActionWitness` shows only its public anchor and sighash. Nothing implements
+  `Display`. ML-KEM's own decapsulation key type derives a `Debug` that prints the key, so the
+  crate never hands one out (`IncomingViewingKey::decapsulation_key` is crate-private). On
+  drop, `SpendingKey`, the viewing keys and `TrialDecryptor`'s expanded ML-KEM key wipe their
+  bytes (`zeroize`). Not wiped: copies a caller makes (`seed()`, `Clone`,
+  `OutgoingViewingKey.0`), field-element secrets (`sk`, `ak`, `nk`, witness values: KoalaBear
+  elements can't be reliably wiped without `unsafe` volatile writes), the prover's trace and
+  Plonky3's buffers, and the shared secrets and plaintexts inside encryption and ML-KEM.
 - **No WASM or TypeScript yet**; the KATs are the contract for them.
 - **Timing side channels** in proving and trial decryption haven't been analyzed.

@@ -45,14 +45,16 @@ pub struct EncryptedNote {
     pub out: Vec<u8>,
 }
 
-/// A decrypted note and its memo.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A decrypted note and its memo. `Debug` prints `DecryptedNote(..)`.
+#[derive(Clone, PartialEq, Eq)]
 pub struct DecryptedNote {
     /// The note (its commitment matched).
     pub note: Note,
     /// The memo.
     pub memo: [u8; MEMO_BYTES],
 }
+
+redacted_debug!(DecryptedNote, TrialDecryptor);
 
 /// Encryption failed because the note isn't addressed to `recipient`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,7 +177,8 @@ fn open_note(ss: &[u8], owner: Digest, cm: &Digest, enc: &[u8]) -> Option<Decryp
 }
 
 /// Trial decryption for one incoming viewing key. Holds the expanded ML-KEM key, so scanning
-/// many outputs doesn't re-run key generation.
+/// many outputs doesn't re-run key generation. The key is wiped on drop, and `Debug` prints
+/// `TrialDecryptor(..)`.
 pub struct TrialDecryptor {
     owner: Digest,
     dk: ml_kem_768::DecapsulationKey,

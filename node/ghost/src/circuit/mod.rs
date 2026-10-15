@@ -84,8 +84,9 @@ impl ValueBalance {
     }
 }
 
-/// What one spend proves knowledge of.
-#[derive(Clone, Debug)]
+/// What one spend proves knowledge of. Everything in it is secret (`sk` alone is enough to
+/// spend the key's notes), so `Debug` prints `SpendWitness(..)`.
+#[derive(Clone)]
 pub struct SpendWitness {
     /// The spending key's field elements ([`SpendingKey::sk`]).
     pub sk: Digest,
@@ -126,8 +127,8 @@ fn random_bytes<R: CryptoRng + ?Sized, const N: usize>(rng: &mut R) -> [u8; N] {
     out
 }
 
-/// Everything the prover knows.
-#[derive(Clone, Debug)]
+/// Everything the prover knows. `Debug` shows only the public `anchor` and `sighash`.
+#[derive(Clone)]
 pub struct ActionWitness {
     /// Exactly two spends (pad with [`SpendWitness::dummy`]).
     pub spends: [SpendWitness; 2],
@@ -137,6 +138,17 @@ pub struct ActionWitness {
     pub anchor: Digest,
     /// The transaction's sighash (computed by the node from everything else in the tx).
     pub sighash: [u8; 32],
+}
+
+redacted_debug!(SpendWitness);
+
+impl core::fmt::Debug for ActionWitness {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ActionWitness")
+            .field("anchor", &self.anchor)
+            .field("sighash", &self.sighash)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The public statement of one Action proof.
