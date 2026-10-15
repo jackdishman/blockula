@@ -382,6 +382,12 @@ fn shield_transfer_unshield_through_the_node() {
     let change = n.output(40 * FANG - FEE, &ghost_alice, &ghost_alice);
     let tx = n.transfer(&ghost_alice, note_a, [to_bob, change]);
     assert!(tx.is_unsigned() && tx.to_bytes().starts_with(GHOST_TX_DOMAIN));
+    // The API shows it without its proof (size and hash instead), ciphertexts included.
+    let shown = action_json(&tx.action).unwrap();
+    let proof_len = tx.action.ghost_bundle().unwrap().proof.0.len();
+    assert_eq!((shown["type"].as_str(), shown["bundle"]["proof_bytes"].as_u64()), (Some("private_transfer"), Some(proof_len as u64)));
+    assert!(shown["bundle"].get("proof").is_none() && shown["bundle"]["enc"][0].as_str().map(str::len) == Some(2 * GHOST_ENC_BYTES));
+    assert!(serde_json::to_vec(&shown).unwrap().len() < 20_000, "not the ~260 KB of a hex proof");
     let proposer = n.c.me().unwrap();
     let (supply, proposer_before) = (n.c.state.supply, n.c.state.account(&proposer).balance);
     n.submit(&tx).unwrap();

@@ -458,7 +458,8 @@ fn tx_json_with(v: &ReadView, tx: &Tx, height: Option<u64>, error: Option<&str>)
         "status": match (height, error) { (_, Some(_)) => "failed", (Some(_), None) => "finalized", (None, None) => "pending" },
         "error": error,
         "height": height,
-        "from": label(v, &sender),
+        // Unsigned ghost txs have no sender to show.
+        "from": (!tx.is_unsigned()).then(|| label(v, &sender)),
         "to": to.map(|t| label(v, &t)),
         "amount": amount.map(|a| a.to_string()),
         "amount_display": amount.map(fmt_fang),
