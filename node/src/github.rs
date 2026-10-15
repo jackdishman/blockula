@@ -272,4 +272,55 @@ mod tests {
         assert_eq!(verdict("alice", "jackdishman/blockula", "boo1abc", &pr_into("open", false, "alice", "jackdishman/blockula", "scratch"), &gist), Verdict::Wait);
         assert!(matches!(verdict("alice", "jackdishman/blockula", "boo1abc", &parse_pr(&json!({ "state": "closed", "merged": true, "merge_commit_sha": "a".repeat(40), "user": { "login": "alice" }, "base": { "repo": { "full_name": "jackdishman/blockula" } } })), &gist), Verdict::Refuted(_)));
     }
+
+    const MERGE: &str = "3a5e0c1d9b7f4e2a8c6d0b1f3e5a7c9d2b4f6e8a";
+
+    /// `GET /repos/jackdishman/blockula/commits?since=…` after PR #42 merged as `MERGE` (trimmed:
+    /// fields we don't read are cut, the shape is GitHub's). Newest first.
+    const COMMITS: &str = r#"[
+      { "sha": "9f1c2e3d4b5a69788796a5b4c3d2e1f00f1e2d3c", "commit": { "author": { "name": "alice", "date": "2026-10-13T09:12:44Z" }, "committer": { "name": "GitHub", "date": "2026-10-13T09:12:44Z" }, "message": "Revert \"Add the thing\" (#61)\n\n* Revert \"Add the thing\"\n\nThis reverts commit 3a5e0c1d9b7f4e2a8c6d0b1f3e5a7c9d2b4f6e8a.", "comment_count": 0 }, "parents": [{ "sha": "1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e" }] },
+      { "sha": "1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e", "commit": { "author": { "name": "bob", "date": "2026-10-12T17:01:02Z" }, "committer": { "name": "GitHub", "date": "2026-10-12T17:01:02Z" }, "message": "Fix typo in README (#60)", "comment_count": 0 }, "parents": [{ "sha": "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00" }] },
+      { "sha": "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00", "commit": { "author": { "name": "carol", "date": "2026-10-12T10:00:00Z" }, "committer": { "name": "carol", "date": "2026-10-12T10:00:00Z" }, "message": "Revert \"Add the thing\"\n\nThis reverts commit 3a5e0c1d9b7f4e2a8c6d0b1f3e5a7c9d2b4f6e8a, reversing\nchanges made to 77aa88bb99cc00dd11ee22ff33aa44bb55cc66dd.", "comment_count": 0 }, "parents": [{ "sha": "3a5e0c1d9b7f4e2a8c6d0b1f3e5a7c9d2b4f6e8a" }] },
+      { "sha": "3a5e0c1d9b7f4e2a8c6d0b1f3e5a7c9d2b4f6e8a", "commit": { "author": { "name": "alice", "date": "2026-10-11T08:30:00Z" }, "committer": { "name": "GitHub", "date": "2026-10-11T08:30:00Z" }, "message": "Add the thing (#42)\n\nReverts nothing; see 3a5e0c1d for history.", "comment_count": 0 }, "parents": [{ "sha": "77aa88bb99cc00dd11ee22ff33aa44bb55cc66dd" }] },
+      { "sha": "not-a-sha", "commit": { "message": "This reverts commit 3a5e0c1d9b7f4e2a8c6d0b1f3e5a7c9d2b4f6e8a." } }
+    ]"#;
+
+    /// `GET /repos/jackdishman/blockula/pulls?state=closed&sort=updated&direction=desc` (trimmed).
+    const PULLS: &str = r#"[
+      { "number": 63, "state": "closed", "title": "Revert \"Add the thing\"", "body": "Reverts jackdishman/blockula#42", "merged_at": "2026-10-14T12:00:00Z", "merge_commit_sha": "6363636363636363636363636363636363636363", "user": { "login": "dave" }, "base": { "ref": "main", "repo": { "full_name": "jackdishman/blockula", "default_branch": "main" } }, "html_url": "https://github.com/jackdishman/blockula/pull/63" },
+      { "number": 61, "state": "closed", "title": "Revert \"Add the thing\"", "body": "Reverts jackdishman/blockula#42\r\n\r\nBroke the build.", "merged_at": "2026-10-13T09:12:44Z", "merge_commit_sha": "9f1c2e3d4b5a69788796a5b4c3d2e1f00f1e2d3c", "user": { "login": "alice" }, "base": { "ref": "main", "repo": { "full_name": "jackdishman/blockula", "default_branch": "main" } }, "html_url": "https://github.com/jackdishman/blockula/pull/61" },
+      { "number": 59, "state": "closed", "title": "Revert \"Add the thing\"", "body": "Reverts jackdishman/blockula#42", "merged_at": null, "merge_commit_sha": "5959595959595959595959595959595959595959", "user": { "login": "mallory" }, "base": { "ref": "main", "repo": { "full_name": "jackdishman/blockula", "default_branch": "main" } }, "html_url": "https://github.com/jackdishman/blockula/pull/59" },
+      { "number": 58, "state": "closed", "title": "revert: drop the thing", "body": "Undoes #420 and otherorg/blockula#42", "merged_at": "2026-10-12T00:00:00Z", "merge_commit_sha": "5858585858585858585858585858585858585858", "user": { "login": "erin" }, "base": { "ref": "main", "repo": { "full_name": "jackdishman/blockula", "default_branch": "main" } }, "html_url": "https://github.com/jackdishman/blockula/pull/58" },
+      { "number": 57, "state": "closed", "title": "Revert \"Add the thing\" on the release branch", "body": "Reverts #42", "merged_at": "2026-10-11T23:00:00Z", "merge_commit_sha": "5757575757575757575757575757575757575757", "user": { "login": "erin" }, "base": { "ref": "release", "repo": { "full_name": "jackdishman/blockula", "default_branch": "main" } }, "html_url": "https://github.com/jackdishman/blockula/pull/57" },
+      { "number": 56, "state": "closed", "title": "Follow-up to #42", "body": "Reverts nothing, builds on #42", "merged_at": "2026-10-11T22:00:00Z", "merge_commit_sha": "5656565656565656565656565656565656565656", "user": { "login": "erin" }, "base": { "ref": "main", "repo": { "full_name": "jackdishman/blockula", "default_branch": "main" } }, "html_url": "https://github.com/jackdishman/blockula/pull/56" }
+    ]"#;
+
+    #[test]
+    fn reverts_found_in_commits_and_pull_requests() {
+        let commits = parse_commits(&serde_json::from_str(COMMITS).unwrap());
+        let pulls = parse_pulls(&serde_json::from_str(PULLS).unwrap());
+        assert_eq!(commits.len(), 4, "entries without a sha are skipped");
+        assert_eq!((pulls[1].number, pulls[1].merged_at.as_str(), pulls[2].merged), (61, "2026-10-13T09:12:44Z", false));
+        // `git revert` (and a revert PR merged with a merge commit): the oldest commit that names
+        // the merge, never the merge commit itself.
+        let r = find_revert_in("jackdishman/blockula", 42, MERGE, &commits, &pulls).unwrap();
+        assert_eq!(r.sha, "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00");
+        assert_eq!(find_revert_in("JackDishman/Blockula", 42, &MERGE.to_uppercase(), &commits, &[]).unwrap().sha, r.sha, "case doesn't matter");
+        // A squash-merged revert PR whose message doesn't name the merge: the PR's merge commit,
+        // the earliest merged "Revert …" PR into the default branch that references #42.
+        let quiet: Vec<Commit> = commits.iter().filter(|c| c.sha == MERGE || !c.message.contains("This reverts")).cloned().collect();
+        assert_eq!(find_revert_in("jackdishman/blockula", 42, MERGE, &quiet, &pulls).unwrap().sha, "9f1c2e3d4b5a69788796a5b4c3d2e1f00f1e2d3c");
+        // Not reverts: unmerged, another branch, another PR or repo, no "Revert" title, the PR itself.
+        let not: Vec<PullRequest> = pulls.iter().filter(|p| ![61, 63].contains(&p.number)).cloned().collect();
+        assert_eq!(find_revert_in("jackdishman/blockula", 42, MERGE, &quiet, &not), None);
+        assert_eq!(find_revert_in("jackdishman/blockula", 61, MERGE, &quiet, &pulls[1..2]), None);
+        assert_eq!(find_revert_in("jackdishman/blockula", 42, MERGE, &[], &[]), None);
+    }
+
+    #[test]
+    fn pr_references() {
+        let r = |t: &str| references_pr(t, "jackdishman/blockula", 42);
+        assert!(r("Reverts jackdishman/blockula#42") && r("Reverts #42") && r("(#42)") && r("see #42.") && r("https://github.com/jackdishman/blockula/pull/42") && r("JackDishman/Blockula#42"));
+        assert!(!r("#420") && !r("#4") && !r("otherorg/blockula#42") && !r("https://github.com/jackdishman/blockula/pull/420") && !r("issue 42") && !r("abc#42"));
+    }
 }

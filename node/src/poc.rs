@@ -1458,7 +1458,7 @@ mod tests {
 #[cfg(test)]
 mod scenarios {
     use super::*;
-    use crate::chain::{now_ms, Chain, SummonOpts};
+    use crate::chain::{now_ms, BlockInfo, Chain, Outcome, SummonOpts};
     use crate::crypto::Keys;
     use std::path::PathBuf;
 
@@ -1489,10 +1489,13 @@ mod scenarios {
     }
 
     impl T {
-        fn tx_as(&mut self, key: &Keys, from: &str, action: Action) -> Result<String> {
+        fn signed_as(&self, key: &Keys, from: &str, action: Action) -> Tx {
             let mut tx = Tx { chain_id: "poc".into(), nonce: self.c.next_nonce(from), from: from.into(), fee: 0, tip: 0, valid_until: self.c.height() + 100, action, memo: String::new(), public_key: hex::encode(key.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
             tx.fee = min_fee(tx.size());
-            let id = self.c.submit(tx.sign(key))?;
+            tx.sign(key)
+        }
+        fn tx_as(&mut self, key: &Keys, from: &str, action: Action) -> Result<String> {
+            let id = self.c.submit(self.signed_as(key, from, action))?;
             self.c.produce_block()?;
             match self.c.failure(&id) {
                 Some((r, _)) => bail!(r.clone()),
@@ -1886,6 +1889,88 @@ mod scenarios {
         t.admin(Action::RejectClaim { claim_id: c4, reason: "squatted".into() }).unwrap();
         t.claim(&other, 4).unwrap();
         conserved(&t.c.state);
+        t.reopen_same_root();
+    }
+
+    /// CRY-3: Séances open on a fixed cadence, seeded from the beacon, over jurors and claims
+    /// that were eligible before its value could be known. Whatever the opening block's proposer
+    /// does (reorder, censor or add txs, pick its block hash) the draw is the same, and a juror
+    /// leaving frees only its own seat.
+    #[test]
+    fn seance_draw_is_fixed_before_the_opening_block() {
+        let mut t = setup("draw");
+        t.admin(Action::SetRepo { repo: "jackdishman/blockula".into(), weight: 10 }).unwrap();
+        let jurors: Vec<Keys> = (1..=9).map(k).collect();
+        for j in &jurors {
+            t.grant(j, 10);
+            t.tx(j, Action::JoinJury { bond: JUROR_BOND }).unwrap();
+        }
+        let late = k(12);
+        t.grant(&late, 10);
+        let mut claims = vec![];
+        for (who, handle) in [(k(10), "ten"), (k(11), "eleven")] {
+            t.grant(&who, 1);
+            t.link(&who, handle);
+            claims.push(t.claim(&who, claims.len() as u64 + 1).unwrap());
+        }
+        t.attest_all(&claims);
+        // Openings are the last blocks of every 3rd epoch (30-block Séances, 10-block epochs); the
+        // first that may draw on these claims has its cutoff past their verification.
+        let st = &t.c.state;
+        assert_eq!(st.seance_every_epochs(), 3);
+        let mut at = st.next_seance_height(t.h() + 1);
+        while st.seance_cutoff(st.params.epoch_of(at)) <= t.h() {
+            at = st.next_seance_height(at + 1);
+        }
+        while t.h() < at - 1 {
+            t.blocks(1);
+        }
+        assert!(t.c.state.poc.open_seance.is_none() && t.c.state.poc.next_seance_at == at);
+        // Alternative opening blocks, each on a copy of the state (dropped before the restart check).
+        let pre = t.c.state.clone();
+        let epoch = pre.params.epoch_of(at);
+        let open = |txs: &[Tx], proposer: &str, hash: &str| -> Seance {
+            let mut st = pre.clone();
+            for tx in txs {
+                assert_eq!(st.apply(tx, "poc", proposer, at).unwrap(), Outcome::Applied);
+            }
+            st.end_block(&BlockInfo { height: at, hash, proposer, view: at, parent_view: at - 1, skipped: &[] });
+            st.check_invariants().unwrap();
+            let id = st.poc.open_seance.expect("a Séance opens on the cadence");
+            assert_eq!(st.poc.seances[&id].seed, hex::encode(crate::beacon::seance_seed(&st, epoch, id).unwrap()), "seeded from the beacon");
+            st.poc.seances[&id].clone()
+        };
+        let json = |s: &Seance| serde_json::to_value(s).unwrap();
+        fn draw(s: &Seance) -> serde_json::Value {
+            serde_json::to_value((&s.seed, &s.claims, &s.jurors)).unwrap()
+        }
+        let join = t.signed_as(&late, &late.address(), Action::JoinJury { bond: JUROR_BOND });
+        let fund = t.signed_as(&jurors[0], &jurors[0].address(), Action::FundPool { amount: 5 * DROPS_PER_FANG });
+        let pay = t.signed_as(&jurors[1], &jurors[1].address(), Action::Transfer { to: jurors[2].address(), amount: DROPS_PER_FANG });
+        let me = t.c.me().unwrap();
+        let a = open(&[join.clone(), fund.clone(), pay.clone()], &me, "a");
+        let b = open(&[pay, fund, join], &jurors[3].address(), "b");
+        let c = open(&[], &me, "c");
+        assert_eq!(a.opened_at, at);
+        assert_eq!((a.claims.clone(), a.jurors.len()), (claims.clone(), JURY_SIZE));
+        assert!(!a.jurors.contains_key(&late.address()), "joined after the cutoff");
+        assert_eq!(json(&a), json(&b), "reordering the opening block, another proposer, another hash: the same Séance");
+        assert_eq!(draw(&a), draw(&c), "censoring the opening block's txs changes nothing either");
+        // Sortition: an unseated juror leaving changes nothing; a seated one frees only its seat.
+        let unseated = jurors.iter().find(|j| !a.jurors.contains_key(&j.address())).unwrap();
+        assert_eq!(draw(&open(&[t.signed_as(unseated, &unseated.address(), Action::LeaveJury {})], &me, "d")), draw(&a));
+        let seated = jurors.iter().find(|j| a.jurors.contains_key(&j.address())).unwrap();
+        let e = open(&[t.signed_as(seated, &seated.address(), Action::LeaveJury {})], &me, "e");
+        assert!(!e.jurors.contains_key(&seated.address()) && e.jurors.len() == JURY_SIZE);
+        for (juror, seat) in a.jurors.iter().filter(|(j, _)| **j != seated.address()) {
+            assert_eq!(e.jurors[juror].pairs, seat.pairs, "the others keep their seats and pairs");
+        }
+        drop(open);
+        drop(pre);
+        // The real chain opens the same Séance at that height.
+        t.blocks(1);
+        let id = t.c.state.poc.open_seance.unwrap();
+        assert_eq!(draw(&t.c.state.poc.seances[&id]), draw(&c));
         t.reopen_same_root();
     }
 
