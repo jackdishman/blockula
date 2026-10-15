@@ -50,7 +50,7 @@
 //! brings it to `threshold` approvals. Session keys keep working within their limits. Proposals
 //! expire after `multisig_expiry_blocks`.
 
-use crate::chain::{community, short, system_account, BlockInfo, Journal, KeyRecord, State};
+use crate::chain::{community, short, BlockInfo, Journal, KeyRecord, State};
 use crate::crypto;
 use crate::params::vote_weight;
 use crate::poc::fmt_soul;
@@ -1071,11 +1071,6 @@ pub fn describe_kind(state: &State, kind: &ProposalKind, primary_name: &dyn Fn(&
         ProposalKind::DeactivateFeature { feature } => format!("turn off {feature}"),
         ProposalKind::Text {} => "a text proposal (no on-chain effect)".into(),
     }
-}
-
-/// Whether `addr` is a keyless system account on this chain (they can't vote or sign).
-pub fn is_system(state: &State, addr: &str) -> bool {
-    system_account(state.params.prefix(), addr).is_some()
 }
 
 #[cfg(test)]

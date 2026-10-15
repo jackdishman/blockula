@@ -389,8 +389,9 @@ fn namespaces_and_meta_keys_are_unique() {
 
 /// Format change detectors: a record's bytes and a fixed state's root. The root was also
 /// computed by an independent JS implementation of the record layout and tree (noble BLAKE3),
-/// recomputed when `Params` gained `address_prefix` (P-WIRE) and again for the protocol v1
-/// scaffold (schema 2: `chain_params`, the upgrade schedule, account locks).
+/// recomputed when `Params` gained `address_prefix` (P-WIRE), for the protocol v1 scaffold
+/// (schema 2: `chain_params`, the upgrade schedule, account locks), and for governance (schema
+/// 3: the `governance` scalars, `multisig_expiry_blocks`).
 #[test]
 fn golden_encodings() {
     let acct = Account { balance: 5, nonce: 2, keys: Default::default(), locks: vec![] };
@@ -400,8 +401,8 @@ fn golden_encodings() {
     st.supply = 5;
     st.commit_block().unwrap();
     assert_eq!(st.root_hash(), st.full_root());
-    assert_eq!(st.record_count(), 9);
-    assert_eq!(st.root(), "05ab46b414a130e4f2e2c742ed46320a0e469af8ac0a8d0d7aa9493772c22517");
+    assert_eq!(st.record_count(), 10);
+    assert_eq!(st.root(), "631ff6aab04834cf29449f766592daa979a58d62a25a652ad01a070cd6231974");
 }
 
 fn million_accounts() -> State {

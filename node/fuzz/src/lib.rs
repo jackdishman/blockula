@@ -20,6 +20,7 @@ mod node_src {
     pub mod econ;
     pub mod epochs;
     pub mod github;
+    pub mod gov_cli;
     pub mod governance;
     pub mod node;
     pub mod params;
