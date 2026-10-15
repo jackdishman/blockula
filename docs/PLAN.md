@@ -64,7 +64,7 @@ Native account abstraction (Phase 1). Each account holds a list of authorized ke
 
 ### Status: Hunts v0 and Proof of Contribution v1 are live on the testnet
 **Hunts**
-- `create_hunt` escrows a bounty on a GitHub issue (min 10 FANG, ≤ ~1 year). `fund_hunt` lets anyone add to it. `award_hunt` (creator or Season 0 admin) pays it out once and records the PR; self-awards are allowed but flagged. `cancel_hunt` (creator after expiry, admin any time) refunds every funder exactly what they put in.
+- `create_hunt` escrows a bounty on a GitHub issue (min 10 FANG, ≤ ~1 year). `fund_hunt` lets anyone add to it. `award_hunt` (the creator only) pays it out once and records the PR; self-awards are allowed but flagged. `cancel_hunt` (creator after expiry; an admin any time on dev and test chains; a `RefundHunt` proposal on mainnet) refunds every funder exactly what they put in.
 - `blockula hunt award <id> --pr <n>` checks on GitHub that the PR merged into the hunt's repo's default branch, looks up the account its author linked, confirms, and signs the award (`--to` names a recipient instead, `--familiar` credits their agent). `hunt list|show|create|fund|cancel` cover the rest.
 - `link_github` is an on-chain claim: one handle per account, one account per handle. The holder or an admin can unlink, so admins can clear squatters. Nodes check it off-chain: a public gist owned by the handle must contain the account's address (`/api/github/{handle}`). Validators re-check it for every contribution claim.
 - `register_familiar` marks a session key as an agent Familiar. Awards can credit it, and profiles show "won by vlad.boo's Familiar 'claude'".
@@ -171,7 +171,7 @@ Next:
 
 - Fast sync trusts the genesis validator set plus 2f+1 handoffs for every set change. Like any BFT chain without checkpoints in the client, this is weak subjectivity: keys of a long-removed set could forge an alternate history for a fresh joiner. Pin `--genesis-hash` and prefer known peers.
 - The anchor hash for the epoch a node fast-syncs into comes from the peer and isn't certified. It only seeds that epoch's consensus engine on validators.
-- Hunts: awards are trusted to the creator (or an admin). `blockula hunt award` checks GitHub before signing, but the chain doesn't. GitHub links are claims plus a per-node off-chain gist check (cached 10 min, 30 GitHub calls a minute per node). Squatted handles need an admin to unlink.
+- Hunts: awards are trusted to the creator. `blockula hunt award` checks GitHub before signing, but the chain doesn't. GitHub links are claims plus a per-node off-chain gist check (cached 10 min, 30 GitHub calls a minute per node). Squatted handles need an admin to unlink.
 - Proof of Contribution v1:
   - **Season 0 trust.** Admins bootstrap Soul, set repo weights, flag sybils, reject reverted claims and claw back rewards. Validators are trusted to report GitHub honestly (a BFT quorum must agree). Phase 3 moves these to governance and juries.
   - **Jury randomness** chains block hashes, so the proposer of the block that opens a Séance can grind its hash (by reordering txs) to bias which jurors are drawn. A VRF or threshold beacon comes later.

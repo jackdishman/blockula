@@ -208,7 +208,7 @@ const created = await bob.createHunt({ repo: "jackdishman/blockula", issue: 1, a
 console.log("✓", created.summary);
 const huntId = (await client.account(bob.address)).hunts_created.at(-1);
 console.log("✓", (await alice.fundHunt(huntId, "1")).summary);
-await assert.rejects(alice.awardHunt(huntId, alice.address, 7), /creator or a validator admin/);
+await assert.rejects(alice.awardHunt(huntId, alice.address, 7), /only the hunt's creator/);
 const awarded = await bob.awardHunt(huntId, `${name}.boo`, 42, agent2.keyId);
 console.log("✓", awarded.summary);
 const h = await client.hunt(huntId);

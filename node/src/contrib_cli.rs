@@ -128,7 +128,7 @@ pub enum HuntCmd {
         #[command(flatten)]
         signer: Signer,
     },
-    /// Pay a hunt's bounty for a merged PR (the hunt's creator or a Season 0 admin). Checks on
+    /// Pay a hunt's bounty for a merged PR (only the hunt's creator can). Checks on
     /// GitHub that the PR merged into the hunt's repo, and pays the account its author linked
     /// with `link_github`, unless you name a recipient with --to.
     Award {
@@ -152,7 +152,7 @@ pub enum HuntCmd {
         #[command(flatten)]
         signer: Signer,
     },
-    /// Refund every funder (the creator after expiry, or an admin any time)
+    /// Refund every funder (the creator after expiry; on dev and test chains an admin any time)
     Cancel {
         id: u64,
         #[command(flatten)]

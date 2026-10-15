@@ -114,6 +114,7 @@ CBlock { version: u32, parent, height, view: u64, parent_view: u64, timestamp_ms
 - `MultisigCreate` turns an account into an M-of-N multisig of its owner keys: owner-only actions then need `MultisigPropose` plus approvals; session keys keep working within their limits.
 - Hunts: only the creator awards. Governance can refund a hunt's funders; nobody can redirect escrow.
 - Soul: bootstrapped by a published `soul_ledger` in genesis; after that only juries and bounded `GrantSoul` proposals change it.
+- The full rules (tally, council, deposits, the distribution Merkle format and its SDK helper, multisig) are in [GOVERNANCE.md](GOVERNANCE.md).
 
 ### 3.6 Fees and issuance (TOK-1, TOK-2)
 

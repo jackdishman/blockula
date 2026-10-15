@@ -45,6 +45,10 @@
 | GET | `/api/claim/{id}` | one claim: PR, validator attestations, score, payout |
 | GET | `/api/seance/{id}` | one Séance: claims, jurors with their assigned pairs, commitments, reveals, results |
 | GET | `/api/souls?limit=` | Soul leaderboard |
+| GET | `/api/proposals?status=&limit=` | governance proposals, newest first (`voting`/`queued`/`rejected`/`executed`/`failed`), the rules (deposit, periods, quorum, council, spend height), treasury and community balances, `next_id` |
+| GET | `/api/proposal/{id}` | one proposal: kind and summary, tallies (raw and conviction-weighted), council votes, the tally at the close, outcome, votes |
+| GET | `/api/distribution/{id}?address=` | a community distribution: Merkle root, total, claimed, claim deadline; with `address`, that account's claim |
+| GET | `/api/multisig/{address\|name}` | a multisig account: threshold, owner keys, open proposals with their approvals |
 | GET | `/api/snapshot/latest` | newest certified state snapshot manifest (chunk hashes, certifying blocks + certificate, validator-set history) |
 | GET | `/api/snapshot/{height}/chunk/{i}` | snapshot chunk bytes |
 | GET | `/api/epochs` | validator-set history + handoff signatures |

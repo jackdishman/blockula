@@ -69,7 +69,7 @@ Genesis supply is 1,000,000,000 FANG. Nothing is sold (TOKENOMICS.md section 1).
 
 **Hunts** are FANG bounties on GitHub issues.
 - The creator escrows the bounty on-chain and anyone can add to it.
-- On mainnet only the creator can award it. (On the testnet a Season 0 admin can too.)
+- Only the creator can award it. Governance can only refund its funders.
 - An award requires a PR merged into the repo's default branch, and pays the account the PR's author linked.
 - Governance can refund a Hunt's funders, but nobody can redirect its escrow.
 - **The payer is the Hunt's creator and funders,** not the protocol or any entity.
