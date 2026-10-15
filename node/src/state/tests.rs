@@ -511,4 +511,3 @@ fn bench_million_accounts() {
     println!("snapshot decode + tree rebuild: {:?}", t.elapsed());
     assert_eq!(back.root_hash(), st.root_hash());
 }
-
