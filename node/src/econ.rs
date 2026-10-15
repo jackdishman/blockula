@@ -220,7 +220,6 @@ pub fn base_fee(state: &State, height: u64, size: u64) -> u64 {
 }
 
 /// What `tx` is charged in block `height`: the base fee plus its tip (`None` on overflow).
-#[cfg_attr(not(test), allow(dead_code))] // P-STAKE (junk charges) and clients
 pub fn charge(state: &State, tx: &Tx, height: u64) -> Option<u64> {
     base_fee(state, height, tx.size()).checked_add(tx.tip)
 }

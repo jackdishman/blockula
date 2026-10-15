@@ -1131,4 +1131,89 @@ mod tests {
         });
         std::fs::remove_dir_all(root_dir).ok();
     }
+
+    /// The fee market in consensus (P-ECON): a proposer fills blocks only up to the height's
+    /// `max_block_bytes` and proposes no txs at a height whose base fee its state hasn't fixed
+    /// (more than `econ::FEE_LAG` ahead); a verifier refuses a block with txs that cites a state
+    /// that can't price them, and, once it has executed the cited state, blocks over the size
+    /// limit and txs that don't pay the height's exact base fee (which the stateless check can't
+    /// see). Here the limit is lowered to 64 KiB (~12 transfers).
+    #[test]
+    fn blocks_are_sized_and_priced_by_the_fee_market() {
+        let home = std::env::temp_dir().join(format!("blockula-feemarket-{}-{}", crate::chain::now_ms(), std::process::id()));
+        let params = [("max_block_bytes".to_string(), MAX_TX_BYTES as u64)].into_iter().collect();
+        Chain::summon(&home, &SummonOpts { params, ..SummonOpts::new("fees", 1) }).unwrap();
+        let mut c = Chain::open(&home).unwrap();
+        let users: Vec<crate::crypto::Keys> = (1..=14u8).map(|i| crate::crypto::Keys::from_seed([i; 32])).collect();
+        for u in &users {
+            c.faucet(&u.address(), 100 * crate::types::DROPS_PER_FANG).unwrap();
+        }
+        c.produce_block().unwrap();
+        let e = c.height();
+        let me = c.me().unwrap();
+        // Fees for the next block, or one drop short of its base fee.
+        let transfer = |u: &crate::crypto::Keys, short: bool| {
+            let mut t = Tx { chain_id: "fees".into(), from: u.address(), nonce: 0, fee: 0, tip: 0, valid_until: e + 50, action: crate::types::Action::Transfer { to: me.clone(), amount: 1 }, memo: String::new(), public_key: hex::encode(u.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+            t.fee = if short { crate::econ::base_fee(&c.state, e + 1, t.size()) - 1 } else { crate::econ::max_fee(&c.state, t.size()) };
+            t.sign(u)
+        };
+        let paid: Vec<Tx> = users.iter().map(|u| transfer(u, false)).collect();
+        let underpaid = transfer(&users[0], true);
+        for t in &paid {
+            c.submit(t.clone()).unwrap();
+        }
+        let root_e = hex_32(&c.root_at(e).unwrap());
+        let seed: [u8; 32] = hex::decode(std::fs::read_to_string(home.join("validator.key")).unwrap().trim()).unwrap().try_into().unwrap();
+        let chain: Shared = Arc::new(Mutex::new(c));
+        deterministic::Runner::timed(Duration::from_secs(60)).start(|context| async move {
+            let leader = PrivateKey::from_seed_bytes(seed).public_key();
+            let mut app = App { chain: chain.clone(), block_time_ms: 1_000, address_prefix: "boo".into() };
+            // Contiguous empty blocks at heights from..=to, newest first.
+            let run = |from: u64, to: u64| {
+                let mut blocks = vec![CBlock::new(Digest([7; 32]), from, 1, 0, 0, String::new(), 0, [0; 32], vec![])];
+                for h in from + 1..=to {
+                    let parent = blocks.last().unwrap();
+                    blocks.push(CBlock::new(parent.digest(), h, 1, 0, 0, String::new(), 0, [0; 32], vec![]));
+                }
+                blocks.reverse();
+                blocks
+            };
+            let cctx = |parent: &CBlock| SimplexContext { round: Round::new(Epoch::zero(), View::new(7)), leader: leader.clone(), parent: (View::new(6), parent.digest()) };
+            let mut propose = async |ancestors: Vec<CBlock>| {
+                let cctx = cctx(&ancestors[0]);
+                let ancestry = marshal::ancestry::from_iter(ancestors.into_iter().map(Arc::new));
+                Application::<deterministic::Context>::propose(&mut app, (context.child("propose"), cctx), ancestry, ()).await.unwrap()
+            };
+            // On our executed head: as many txs as fit the limit, citing our state.
+            let b = propose(run(e, e)).await;
+            let bytes: usize = b.txs.iter().map(Vec::len).sum();
+            assert!(b.txs.len() >= 10 && b.txs.len() < paid.len() && bytes <= MAX_TX_BYTES, "{} txs, {bytes} bytes", b.txs.len());
+            assert_eq!(b.exec_height, e);
+            // Seventeen blocks ahead of our state we can still price txs; eighteen we can't.
+            assert!(!propose(run(e + 1, e + 16)).await.txs.is_empty());
+            let far = propose(run(e + 1, e + 17)).await;
+            assert!(far.txs.is_empty() && far.height == e + 18);
+
+            let mut app = App { chain: chain.clone(), block_time_ms: 1_000, address_prefix: "boo".into() };
+            let mut verify = async |block: CBlock, parent: &CBlock| {
+                let cctx = cctx(parent);
+                let ancestry = marshal::ancestry::from_iter([Arc::new(block), Arc::new(parent.clone())]);
+                Application::<deterministic::Context>::verify(&mut app, (context.child("verify"), cctx), ancestry).await
+            };
+            let child = |parent: &CBlock, exec_height: u64, root: [u8; 32], txs: &[&Tx]| CBlock::new(parent.digest(), parent.height + 1, 7, 6, 1_000, leader.address("boo"), exec_height, root, txs.iter().map(|t| t.to_bytes()).collect());
+            let head = run(e, e).remove(0);
+            assert!(verify(child(&head, e, root_e, &[&paid[0], &paid[1]]), &head).await);
+            // Underpaying by one drop passes every stateless check, not the exact one.
+            check_tx_stateless(&underpaid, "fees", "boo").unwrap();
+            assert!(!verify(child(&head, e, root_e, &[&underpaid]), &head).await);
+            // Over the height's limit (but well under the codec's bound).
+            assert!(!verify(child(&head, e, root_e, &paid.iter().collect::<Vec<_>>()), &head).await);
+            // Txs in a block whose cited state is more than FEE_LAG back: refused at once.
+            let ahead = run(e + 1, e + 30).remove(0);
+            let t0 = context.current();
+            assert!(!verify(child(&ahead, e + 10, [0; 32], &[&paid[0]]), &ahead).await);
+            assert_eq!(context.current(), t0, "without waiting");
+        });
+        std::fs::remove_dir_all(home).ok();
+    }
 }

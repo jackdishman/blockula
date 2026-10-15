@@ -474,11 +474,11 @@ fn tx_json_with(v: &ReadView, tx: &Tx, height: Option<u64>, error: Option<&str>)
 /// its tip, at most its `fee`. Blocks record their base fee (P-ECON); a pending tx is priced at
 /// the next block's.
 fn charged(v: &ReadView, tx: &Tx, height: Option<u64>) -> u64 {
-    let base = match height.and_then(|h| v.block(h)).and_then(|b| b.base_fee) {
-        Some(slot) => slot.fee(tx.size()),
-        None => crate::econ::base_fee(&v.state, height.unwrap_or(crate::econ::now(&v.state)), tx.size()),
+    let charge = match height.and_then(|h| v.block(h)).and_then(|b| b.base_fee) {
+        Some(slot) => slot.fee(tx.size()).checked_add(tx.tip),
+        None => crate::econ::charge(&v.state, tx, height.unwrap_or_else(|| crate::econ::now(&v.state))),
     };
-    base.saturating_add(tx.tip).min(tx.fee)
+    charge.unwrap_or(tx.fee).min(tx.fee)
 }
 
 fn block_summary(height: u64, txs: usize) -> String {
@@ -1517,6 +1517,47 @@ mod http_tests {
         assert_eq!(s, StatusCode::OK);
         assert_eq!(b["to"], 1);
         assert_eq!(b["finalization"], "010203");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// P-ECON's reads: the fee ring and what wallets should pay, the parameters and the
+    /// issuance year, a name's status, prices and expiry, and a tx's actual charge.
+    #[tokio::test]
+    async fn fees_params_and_names() {
+        let (root, n) = node("econ");
+        let (s, f, _) = call(&n, "GET", "/api/fees", None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!((f["lag"].as_u64(), f["slots"].as_array().unwrap().len()), (Some(17), 18));
+        assert_eq!((f["slots"][17]["height"].as_u64(), f["slots"][0]["rate"].as_str()), (Some(17), Some("10000")));
+        assert_eq!((f["suggested"]["flat"].as_str(), f["suggested"]["rate"].as_str(), f["rate_scale"].as_u64()), (Some("10000"), Some("10000"), Some(1_000)));
+        assert_eq!((f["floor"]["per_byte"].as_str(), f["account_creation_fee"].as_str()), (Some("10"), Some("100000000")));
+        let (_, p, _) = call(&n, "GET", "/api/params", None, "127.0.0.1:1").await;
+        assert_eq!((p["params"]["max_block_bytes"].as_str(), p["params"]["name_price_5"].as_str()), (Some("2097152"), Some("5000000000")));
+        assert_eq!((p["genesis"]["epochs_per_year"].as_u64(), p["issuance"]["year"].as_u64()), (Some(52_596), Some(0)));
+        let (_, a, _) = call(&n, "GET", "/api/name/alice.boo", None, "127.0.0.1:1").await;
+        assert_eq!((a["status"].as_str(), a["available"].as_bool(), a["price"].as_str(), a["renewal_price"].as_str()), (Some("available"), Some(true), Some("5000000000"), Some("1000000000")));
+        // Register it; the name shows its owner and expiry, and the tx what it was charged.
+        let alice = crate::crypto::Keys::from_seed([3; 32]);
+        let id = {
+            let mut c = n.chain.lock();
+            c.faucet(&alice.address(), 10 * DROPS_PER_FANG).unwrap();
+            c.produce_block().unwrap();
+            let mut tx = Tx { chain_id: "econ".into(), from: alice.address(), nonce: 0, fee: 0, tip: 25, valid_until: c.height() + 10, action: Action::RegisterName { name: "alice".into() }, memo: String::new(), public_key: hex::encode(alice.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+            tx.fee = 3 * min_fee(tx.size());
+            let tx = tx.sign(&alice);
+            let id = c.submit(tx).unwrap();
+            c.produce_block().unwrap();
+            id
+        };
+        let (_, a, _) = call(&n, "GET", "/api/name/alice", None, "127.0.0.1:1").await;
+        let h = n.chain.lock().height();
+        let year = n.chain.lock().state.chain_params.name_registration_blocks;
+        assert_eq!((a["status"].as_str(), a["available"].as_bool(), a["owner"]["address"].as_str()), (Some("active"), Some(false), Some(alice.address().as_str())));
+        assert_eq!((a["expires_at"].as_u64(), a["grace_until"].as_u64()), (Some(h + year), Some(h + year + n.chain.lock().state.chain_params.name_grace_blocks)));
+        let (_, t, _) = call(&n, "GET", &format!("/api/tx/{id}"), None, "127.0.0.1:1").await;
+        let size = t["size_bytes"].as_u64().unwrap();
+        assert_eq!(t["fee"].as_str().unwrap(), (min_fee(size) + 25).to_string(), "charged: the block's base fee + the tip, not the max fee");
+        assert_eq!(t["max_fee"].as_str().unwrap(), (3 * min_fee(size)).to_string());
         std::fs::remove_dir_all(root).ok();
     }
 
