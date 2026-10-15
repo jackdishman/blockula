@@ -24,7 +24,7 @@ The decisions in section 6 have been made. [MAINNET-DESIGN.md](MAINNET-DESIGN.md
 | ID | Decision |
 |---|---|
 | DEC-1 | Everything that can be made safe is on at genesis, contribution pool included. Admin levers become governance; the jury draw uses a randomness beacon. |
-| DEC-2 | Ghost Mode ships at genesis but disabled. Governance switches it on after its own ZK audit, testnet time and counsel. |
+| DEC-2 | Ghost Mode ships at genesis but disabled. Governance switches it on after its own ZK audit, testnet time and counsel. ✅ Built and integrated, disabled: [GHOST-MODE.md](GHOST-MODE.md) section 8. |
 | DEC-3 | Permissionless, stake-ranked validators with equal-weight votes. Cap 31; genesis floor 22, target 28–31; the founder runs at most 2 seats. |
 | DEC-4 | Self-custodial delegation to share-accounted pools, 21-day unbonding, slashing for double-signing (heavy) and downtime (light, jail first). |
 | DEC-5 | 1B FANG, no sale: community 32%, treasury 25%, contribution endowment 15%, bootstrap delegation 10%, founder 10% (1-year cliff, 4-year vest), foundation 5%, operators and security grants 3%. See [TOKENOMICS.md](TOKENOMICS.md). |
@@ -598,7 +598,8 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
 - Light-client mode, once CV-1 provides proofs.
 - Background history backfill behind fast-synced nodes, and STARK history proofs (PLAN.md "Network and sync", "Next").
 - WASM/RISC-V contracts.
-- Ghost Mode and The Crypt, if DEC-2 says launch without them.
+- The Crypt. Ghost Mode is built and ships disabled (DEC-2): turning it on after launch takes its audit, testnet time and counsel (GHOST-MODE.md section 9), not code.
+- Ghost Mode's clients: the CLI, a WASM prover for the SDK and wallets, MCP tools and the explorer view (GHOST-MODE.md section 8, "Not built yet").
 - Covens, Seasons, the juror UI, acceptance-test Hunts, fork royalties, conviction-voting refinements and private ballots. This assumes the pool is off or governed at genesis.
 - More SDKs, explorer polish, and indexer features beyond what wallets need.
 
@@ -629,7 +630,7 @@ Tracks A and B set the date. Scope cuts shorten B and D, but not A: no contribut
 | ID | Decision | Options and notes | Needed by |
 |---|---|---|---|
 | DEC-1 | Scope at genesis | (a) Transfers, names and session keys only. (b) Plus Hunts. (c) Plus the contribution pool. The pool brings GOV-3, CRY-3, GitHub-as-oracle and LEG-2. Suggest (a), or (b) with creator-only awards, then turn on the pool at an activation height once juries replace the admin levers. | Phase 0 |
-| DEC-2 | Ghost Mode | It's Phase 2 and not started. Suggest launching without it and saying so. Adding it later is a new module plus its own legal review. | Phase 0 |
+| DEC-2 | Ghost Mode | It's Phase 2 and not started. Suggest launching without it and saying so. Adding it later is a new module plus its own legal review. ✅ Decided: built and shipped disabled (see "Decisions taken"). | Phase 0 |
 | DEC-3 | Validator set composition | Genesis size, the cap (`max_validators` is 32), independence criteria and a Nakamoto target. With equal weights, halting the chain takes ⌊(n−1)/3⌋+1 validators, so PLAN.md's target of ≥ 10 needs ≥ 28 independent operators. With no signature aggregation, a 32-validator certificate is ~22 × 3.3 KB ≈ 73 KB. | Phase 0 (recruiting takes months) |
 | DEC-4 | Staking model | Stake-weighted or permissioned equal-weight (CV-2); delegation; minimum bond (10,000 FANG by default without a faucet, `chain.rs:71-73`); unbonding period (≥ the evidence and weak-subjectivity window); epoch length (600 blocks = 10 minutes today); slashing amounts (PLAN.md: heavy for double-signing, light for downtime). | Phase 0 |
 | DEC-5 | Supply and allocation | Initial supply (the testnet uses 1.1B). The split: foundation and treasury, team with vesting, operators, community, pool. Whether there's any sale (counsel). Issuance parameters (6% → 1.5% tail; 70/20/10). Fee parameters. | Phase 0; final in phase 4 |

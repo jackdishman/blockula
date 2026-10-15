@@ -535,17 +535,17 @@ pub(crate) fn apply_unsigned(state: &mut State, j: &mut Journal, tx: &Tx, chain_
     };
     check_spends(state, b, height)?;
     verify_proof(tx)?;
-    let mut gj = Journal::default();
-    let applied = (|| -> Result<()> {
-        meta_mut(state, &mut gj).pool = pool;
+    let effects = |state: &mut State, j: &mut Journal| -> Result<()> {
+        meta_mut(state, j).pool = pool;
         if let Some((to, amount)) = &payee {
-            state.j_credit(&mut gj, to, *amount);
+            state.j_credit(j, to, *amount);
         }
-        state.j_credit(&mut gj, proposer, tx.tip);
-        state.j_burn(&mut gj, tx.fee - tx.tip);
-        record(state, &mut gj, b, height)
-    })();
-    match applied {
+        state.j_credit(j, proposer, tx.tip);
+        state.j_burn(j, tx.fee - tx.tip);
+        record(state, j, b, height)
+    };
+    let mut gj = Journal::default();
+    match effects(state, &mut gj) {
         Ok(()) => {
             j.absorb_pub(gj);
             Ok(Outcome::Applied)

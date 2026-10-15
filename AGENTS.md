@@ -27,7 +27,7 @@
 | GET | `/api/blocks?limit=&before=` | recent blocks (from `history_from` on) |
 | GET | `/api/block/{height\|hash}` | block + txs; `410` `pruned` for a height this node no longer holds |
 | GET | `/api/tx/{id}` | tx with `summary`, `status` (`pending`/`finalized`/`failed` + `error`) |
-| POST | `/api/tx` | submit signed tx JSON |
+| POST | `/api/tx` | submit a signed tx: JSON, or its wire form as `application/octet-stream` (how ghost txs should travel; they're ~135 KiB) |
 | GET | `/api/account/{address\|name}` | balance, `next_nonce`, names, recent txs (sent by it or naming it), `github`, `familiars`, hunts created/won, `contribution` (Soul, vouches, jury seat, claims, vesting rewards) |
 | GET | `/api/name/{name}` | availability + price, or owner |
 | GET | `/api/key/{key_id}` | accounts this key is authorized on |
@@ -49,6 +49,8 @@
 | GET | `/api/snapshot/{height}/chunk/{i}` | snapshot chunk bytes |
 | GET | `/api/epochs` | validator-set history + handoff signatures |
 | GET | `/api/proof/{namespace}/{key_hex}` | Merkle proof of one state record (inclusion, or exclusion when absent) against the current state root: `namespace`, `key`, `value` (hex or `null`), `proof`, `root`, `height`, `block_hash`. Namespaces are `state::ns` in `node/src/state/mod.rs` (0 scalars, 1 accounts, 2 names, …); an account's key is its address as hex bytes |
+| GET | `/api/ghost` | 👻 Ghost Mode (off at genesis): `active`, `paused` (+ by whom, signatures, threshold), `pool` and `pool_cap`, `frontier_size`, the anchor `root` and `recent_roots`, `anchor_window`, `nullifiers`, the chain `instance` proofs bind, `circuit_id`, size limits, `verify_fee` |
+| GET | `/api/ghost/address/{name\|address}` | an account's published Ghost Mode address (hex) and its fingerprint |
 | GET | `/api/health` | 200 if the head is fresh and synced, else 503 + `reason` |
 | GET | `/metrics` | Prometheus: height, finalized lag, mempool, epoch, validators, faucet, tx counters |
 
