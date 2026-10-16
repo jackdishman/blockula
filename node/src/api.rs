@@ -1903,7 +1903,8 @@ async fn proposals(State(n): State<Node>, Query(q): Query<ProposalQuery>) -> Api
     })))
 }
 
-/// One proposal and its votes (up to 500, by voter).
+/// One proposal and its votes (up to 500, by voter). Once a vote closes its tally is final and
+/// its vote records are swept over the next blocks (`votes_swept`; the txs stay in history).
 async fn proposal(State(n): State<Node>, Path(id): Path<u64>) -> ApiResult {
     let v = n.live.view();
     let g = &v.state.governance;
@@ -1917,6 +1918,7 @@ async fn proposal(State(n): State<Node>, Path(id): Path<u64>) -> ApiResult {
         .collect();
     let mut out = proposal_json(&v, p);
     out["votes"] = json!(votes);
+    out["votes_swept"] = json!(p.status != crate::governance::ProposalStatus::Voting && !g.closed_votes.contains(&id));
     out["distribution"] = json!(g.distributions.contains_key(&id).then(|| format!("/api/distribution/{id}")));
     Ok(Json(out))
 }
@@ -2643,7 +2645,8 @@ mod http_tests {
         assert!(p["summary"].as_str().unwrap().starts_with("distribute 3 FANG from the community account"), "{p}");
         assert_eq!(get("/api/proposals?status=voting".into()).await.1["proposals"], json!([]));
         let (_, p, _) = get("/api/proposal/0".into()).await;
-        assert_eq!((p["votes"][0]["voter"]["address"].as_str(), p["votes"][0]["conviction"].as_u64(), p["tally"]["quorum_reached"].as_bool()), (Some(me.as_str()), Some(1), Some(true)));
+        // Closed: the tally stays, the vote records were swept.
+        assert_eq!((p["voters"].as_u64(), p["votes"].as_array().map(Vec::len), p["votes_swept"].as_bool(), p["tally"]["quorum_reached"].as_bool()), (Some(1), Some(0), Some(true), Some(true)));
         assert_eq!((p["ayes"]["weight"]["display"].as_str(), p["distribution"].as_str()), (Some("100000000 FANG"), Some("/api/distribution/0")));
         assert_eq!(get("/api/proposal/9".into()).await.0, StatusCode::NOT_FOUND);
         let (_, d, _) = get(format!("/api/distribution/0?address={}", k.address())).await;

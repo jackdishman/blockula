@@ -42,7 +42,8 @@
 //!
 //! **Distributions** move `total` from the community account into an escrow claimable until
 //! `claim_until` with Merkle proofs: BLAKE3 leaves over `(distribution_id, address, amount)`
-//! (the id is the proposal's), sorted-pair inner nodes ([`distribution_leaf`], [`merkle_parent`]).
+//! (the id is the proposal's, which the kind names: a proposal whose tree was built for another
+//! id is refused), sorted-pair inner nodes ([`distribution_leaf`], [`merkle_parent`]).
 //! What's unclaimed returns to the community account after `claim_until`. A claimant with
 //! nothing to pay the fee with pays it (and its new account's creation fee) out of the claim
 //! ([`claim_toward_fee`]).
@@ -472,8 +473,14 @@ fn prepare_kind(state: &State, kind: &ProposalKind, height: u64) -> Result<Propo
             spend_gate(state, height)?;
             *to = state.resolve(to)?;
         }
-        ProposalKind::Distribution { claim_until, .. } => {
+        ProposalKind::Distribution { distribution_id, claim_until, .. } => {
             spend_gate(state, height)?;
+            // Its tree's leaves bind the id it was built for: refused unless that's the id it
+            // gets, so a proposal that lands first can't leave it unclaimable (audit F45).
+            let next = state.governance.next_proposal_id;
+            if *distribution_id != next {
+                bail!("the distribution's tree was built for id {distribution_id}, but this proposal gets id {next}: rebuild the tree for it (blockula gov tree) and propose again");
+            }
             if *claim_until <= runs_at {
                 bail!("claim_until must be after the vote and the timelock (block {runs_at})");
             }
@@ -764,7 +771,8 @@ fn run_kind(state: &mut State, j: &mut Journal, p: &Proposal, height: u64) -> Re
             state.j_credit(j, to, *amount);
             format!("paid {} to {}", fmt_fang(*amount), short(to))
         }
-        ProposalKind::Distribution { merkle_root, total, claim_until } => {
+        ProposalKind::Distribution { distribution_id, merkle_root, total, claim_until } => {
+            ensure!(*distribution_id == p.id, "the tree was built for distribution #{distribution_id}, not #{}", p.id);
             spend_gate(state, height)?;
             if *claim_until < height {
                 bail!("its claim window ended at block {claim_until}");
