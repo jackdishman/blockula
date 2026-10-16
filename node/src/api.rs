@@ -1529,8 +1529,17 @@ struct SyncQuery {
     limit: Option<u64>,
 }
 
-/// Bytes of block data per `/api/sync` response (the joiner caps what it reads, too).
+/// Block bytes (hex) per `/api/sync` batch: a batch ends at the last certified height inside it.
 pub const SYNC_BATCH_BYTES: usize = 8 << 20;
+/// A batch with no certified height inside the budget (or the `limit`) goes on to the next one,
+/// but never past this (blocks as hex), below the joiner's `MAX_SYNC_RESPONSE` with room for the
+/// certificate and the JSON. Certificates are stored at least every `CERT_SPACING_BYTES` of
+/// blocks, so an honest node's stretches fit with lots to spare (F09).
+pub const SYNC_MAX_BYTES: usize = crate::node::MAX_SYNC_RESPONSE - (4 << 20);
+
+fn no_cert(from: u64, to: u64) -> ApiError {
+    ApiError(StatusCode::SERVICE_UNAVAILABLE, format!("no finalization certificate stored for heights {from}..={to} within one response; try another peer"))
+}
 
 /// Finalized consensus blocks `[from, to]` plus the finalization certificate of block `to`, so a
 /// joining node can verify the whole batch (hash links + one ML-DSA quorum certificate).
@@ -1542,44 +1551,47 @@ async fn sync(State(n): State<Node>, Query(q): Query<SyncQuery>) -> ApiResult {
     let v = n.live.view();
     let tip = v.height;
     let from = q.from.max(1);
-    let epoch_end = v.state.params.last_of(v.state.params.epoch_of(from));
-    let range_end = tip.min(epoch_end); // never mix epochs (different validator sets)
+    // Before any arithmetic on `from` (a caller's u64::MAX overflowed the epoch math, F61).
     if from > tip {
         return Ok(Json(json!({ "tip": tip, "blocks": [], "to": null, "finalization": null })));
     }
+    let epoch_end = v.state.params.last_of(v.state.params.epoch_of(from));
+    let range_end = tip.min(epoch_end); // never mix epochs (different validator sets)
     if v.is_pruned(from) {
         return Err(pruned(&v, from));
     }
     let want = (from + q.limit.unwrap_or(100).clamp(1, 500) - 1).min(range_end);
-    // Blocks up to `want`, cut at the byte budget, and the highest certified height among them.
+    // Blocks up to `want` within the byte budget, ending at the highest certified height among
+    // them; without one, on to the next certified height (if this node holds one in the epoch),
+    // within `SYNC_MAX_BYTES`. Either way the bytes read and sent are bounded.
+    let next_cert = v.next_cert(from..=range_end);
+    if next_cert.is_none() && n.marshal.is_none() {
+        return Err(no_cert(from, range_end));
+    }
     let (mut blocks, mut cert) = (vec![], None);
     let mut bytes = 0usize;
     let mut last_cert_len = 0usize;
-    for h in from..=want {
-        let Some(b) = v.cblock(h) else { break };
-        bytes += b.len() * 2;
-        if bytes > SYNC_BATCH_BYTES && !blocks.is_empty() {
+    let mut h = from;
+    while h <= next_cert.map_or(want, |c| c.max(want)) {
+        if cert.is_some() && h > want {
             break;
         }
+        let Some(b) = v.cblock(h) else { break };
+        let size = b.len() * 2;
+        let within = h <= want && bytes + size <= SYNC_BATCH_BYTES;
+        if !blocks.is_empty() && !within && (cert.is_some() || bytes + size > SYNC_MAX_BYTES) {
+            break;
+        }
+        bytes += size;
         blocks.push(hex::encode(&b));
         if let Some(f) = v.cert(h) {
             cert = Some((h, hex::encode(f)));
             last_cert_len = blocks.len();
-        }
-    }
-    // No certificate in range: extend to the next certified height (still within the epoch).
-    if cert.is_none() && bytes <= SYNC_BATCH_BYTES {
-        let mut h = from + blocks.len() as u64;
-        while h <= range_end && h < from + 600 {
-            let Some(b) = v.cblock(h) else { break };
-            blocks.push(hex::encode(&b));
-            if let Some(f) = v.cert(h) {
-                cert = Some((h, hex::encode(f)));
-                last_cert_len = blocks.len();
+            if !within {
                 break;
             }
-            h += 1;
         }
+        h += 1;
     }
     drop(v);
     // Validators can fall back to marshal's archive for the certificate.
@@ -1595,9 +1607,7 @@ async fn sync(State(n): State<Node>, Query(q): Query<SyncQuery>) -> ApiResult {
             }
         }
     }
-    let Some((to, finalization)) = cert else {
-        return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, format!("no finalization certificate stored for heights {from}..={range_end}; try another peer")));
-    };
+    let Some((to, finalization)) = cert else { return Err(no_cert(from, range_end)) };
     blocks.truncate(last_cert_len);
     Ok(Json(json!({ "tip": tip, "blocks": blocks, "to": to, "finalization": finalization })))
 }
@@ -2080,6 +2090,94 @@ mod http_tests {
         assert_eq!(err.0, StatusCode::BAD_GATEWAY);
         assert!(!err.1.contains("scheme"), "{}", err.1);
         assert!(err.1.contains("couldn't reach"), "{}", err.1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// `call` for big responses: the status and the body's size, and the JSON when it parses.
+    async fn get_big(n: &Node, uri: &str) -> (StatusCode, usize, Value) {
+        let app = router(n.clone()).layer(MockConnectInfo("127.0.0.1:1".parse::<SocketAddr>().unwrap()));
+        let res = app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), 256 << 20).await.unwrap();
+        (status, bytes.len(), serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    /// Executes a block whose consensus bytes are `size` long, with a certificate if `cert`.
+    fn big_block(n: &Node, size: usize, cert: bool) {
+        let mut c = n.chain.lock();
+        let mut f = c.test_block(vec![]);
+        f.cblock = vec![7; size];
+        f.certificate = cert.then(|| vec![0xce; 64]);
+        c.execute(f).unwrap();
+    }
+
+    /// F61/F65: `from` near u64::MAX used to overflow the epoch math before the `from > tip`
+    /// check (a panic per request); the epoch helpers saturate too.
+    #[tokio::test]
+    async fn sync_from_u64_max_is_an_empty_batch() {
+        let (root, n) = node("syncmax");
+        n.chain.lock().produce_block_with(vec![]).unwrap();
+        for from in [u64::MAX, u64::MAX - 1, 1 << 63, 2] {
+            let (s, b, _) = call(&n, "GET", &format!("/api/sync?from={from}&limit=500"), None, "127.0.0.1:1").await;
+            assert_eq!((s, b["tip"].as_u64(), b["blocks"].as_array().map(Vec::len)), (StatusCode::OK, Some(1), Some(0)), "from={from}");
+        }
+        let p = n.chain.lock().state.params.clone();
+        assert_eq!(p.last_of(p.epoch_of(u64::MAX)), u64::MAX);
+        assert_eq!((p.last_of(0), p.last_of(1)), (p.epoch_blocks - 1, 2 * p.epoch_blocks - 1));
+        assert!(p.is_boundary(p.epoch_blocks - 1) && !p.is_boundary(p.epoch_blocks));
+        assert_eq!(p.is_boundary(u64::MAX), u64::MAX % p.epoch_blocks == p.epoch_blocks - 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// F09: a full node (no marshal fallback) stores a certificate at least every
+    /// `CERT_SPACING_BYTES` of blocks, so a joiner's batch over big blocks always has one (after a
+    /// restart too, from disk); a stretch with no certificate inside the byte budget is extended to
+    /// the next stored one within `SYNC_MAX_BYTES` instead of answering 503; and no response, not
+    /// even `limit=1`'s, goes past `SYNC_MAX_BYTES` of blocks.
+    #[tokio::test]
+    async fn sync_batches_over_big_blocks_end_at_a_stored_certificate_within_the_cap() {
+        let (root, n) = node("syncbig");
+        let size = 300_000;
+        // Certificates for every block: kept on disk by bytes (every 4th block here), not only at
+        // multiples of 100.
+        for _ in 0..40 {
+            big_block(&n, size, true);
+        }
+        let home = n.chain.lock().home.clone();
+        drop(n);
+        let chain = Arc::new(Mutex::new(Chain::open(&home).unwrap()));
+        let n = Node::new(chain, None, vec![], ClientIpPolicy::default());
+        let stored: Vec<u64> = (1..=40).filter(|h| n.chain.lock().cert(*h).is_some()).collect();
+        assert!(stored.windows(2).all(|w| (w[1] - w[0]) * size as u64 <= crate::chain::CERT_SPACING_BYTES + size as u64), "{stored:?}");
+        let (s, len, b) = get_big(&n, "/api/sync?from=1&limit=200").await;
+        assert_eq!(s, StatusCode::OK);
+        let to = b["to"].as_u64().unwrap();
+        assert!(stored.contains(&to) && len <= SYNC_BATCH_BYTES + (1 << 20), "to {to}, {len} bytes");
+        // A stretch whose blocks pass the budget, its only certificate at its end (what CERT_CHECKPOINT
+        // spacing left before): served up to it, for the joiner's request and for `limit=1`.
+        for _ in 41..=60 {
+            big_block(&n, size, false);
+        }
+        big_block(&n, size, true);
+        for limit in [200, 1] {
+            let (s, len, b) = get_big(&n, &format!("/api/sync?from=41&limit={limit}")).await;
+            assert_eq!((s, b["to"].as_u64()), (StatusCode::OK, Some(61)), "limit={limit}");
+            assert!(len > SYNC_BATCH_BYTES && len <= SYNC_MAX_BYTES + (1 << 20), "{len} bytes");
+        }
+        // Past the hard cap there is no batch to give: 503, the joiner tries another peer.
+        for _ in 62..=120 {
+            big_block(&n, size, false);
+        }
+        big_block(&n, size, true);
+        let (s, len, _) = get_big(&n, "/api/sync?from=62&limit=1").await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(len < 1024);
+        // No certificate ahead at all (and no marshal): 503 without reading the stretch.
+        let (s, _, _) = get_big(&n, "/api/sync?from=122").await;
+        assert_eq!(s, StatusCode::OK, "past the tip");
+        big_block(&n, size, false);
+        let (s, _, b) = get_big(&n, "/api/sync?from=122").await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{b}");
         std::fs::remove_dir_all(root).ok();
     }
 

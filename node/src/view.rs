@@ -84,6 +84,11 @@ impl Disk {
         self.certs.read().get(&height).cloned()
     }
 
+    /// The lowest height in `range` whose certificate is in memory.
+    pub fn next_recent_cert(&self, range: std::ops::RangeInclusive<u64>) -> Option<u64> {
+        self.certs.read().range(range).next().map(|(h, _)| *h)
+    }
+
     pub fn remember_cert(&self, height: u64, cert: Vec<u8>) {
         let mut certs = self.certs.write();
         certs.insert(height, Arc::new(cert));
@@ -355,6 +360,15 @@ impl ReadView {
             return Some((*c).clone());
         }
         self.snap.cert(height).ok()?
+    }
+
+    /// The lowest height in `range` with a certificate this node holds (memory or disk).
+    pub fn next_cert(&self, range: std::ops::RangeInclusive<u64>) -> Option<u64> {
+        let disk = self.snap.next_cert(range.clone()).ok().flatten();
+        match (self.disk.next_recent_cert(range), disk) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     pub fn cert_len(&self, height: u64) -> usize {

@@ -220,10 +220,14 @@ impl Params {
         height / self.epoch_blocks.max(2)
     }
     pub fn is_boundary(&self, height: u64) -> bool {
-        (height + 1) % self.epoch_blocks.max(2) == 0
+        let e = self.epoch_blocks.max(2);
+        height % e == e - 1
     }
+    /// The epoch's last height (saturating: an epoch past the last whole one ends at u64::MAX,
+    /// so a caller's height near u64::MAX can't overflow it).
     pub fn last_of(&self, epoch: u64) -> u64 {
-        (epoch + 1) * self.epoch_blocks.max(2) - 1
+        let e = self.epoch_blocks.max(2);
+        epoch.saturating_mul(e).saturating_add(e - 1)
     }
 }
 
@@ -1667,9 +1671,15 @@ impl SummonOpts {
 
 /// How far behind the (claimed) network height still counts as synced.
 pub const SYNC_SLACK: u64 = 3;
-/// Certificates are stored on disk for these heights (plus every epoch's last block); the last
-/// `view::RECENT_CERTS` heights' are kept in memory.
+/// Certificates are stored on disk for these heights (plus every epoch's last block, and see
+/// [`CERT_SPACING_BYTES`]); the last `view::RECENT_CERTS` heights' are kept in memory.
 pub const CERT_CHECKPOINT: u64 = 100;
+/// ... and once this many consensus-block bytes have gone by since the last one stored, so a
+/// stretch between two stored certificates stays well inside one `/api/sync` response however
+/// full its blocks are (at most this plus one block; F09). An empty chain stores one every
+/// `CERT_CHECKPOINT` heights, a full one about every 1 MiB of blocks (a certificate is ~5-7%
+/// of that).
+pub const CERT_SPACING_BYTES: u64 = 1 << 20;
 /// Mempool txs not included within this many blocks are dropped (they stay valid until their
 /// `valid_until`, so a holder could resubmit them).
 pub const MEMPOOL_TTL_BLOCKS: u64 = 600;
@@ -1779,6 +1789,9 @@ pub struct Chain {
     broken: Option<String>,
     /// Blocks `open` executed again because they were past the store's commit point.
     pub replayed: u64,
+    /// Consensus-block bytes executed since the last certificate stored on disk
+    /// ([`CERT_SPACING_BYTES`]; starts full, so the first certificate after a start is kept).
+    cert_bytes: u64,
     /// What this binary supports, `--halt-height`, and whether the node halted (upgrade.rs).
     pub halt: crate::upgrade::HaltControl,
     /// Tests: this node's proposals carry a junk tx (stateless-valid, never admittable), like a
@@ -2250,6 +2263,7 @@ impl Chain {
             keep_blocks: None,
             broken: None,
             replayed: 0,
+            cert_bytes: CERT_SPACING_BYTES,
             halt: Default::default(),
             #[cfg(test)]
             junk_proposals: false,
@@ -2545,7 +2559,8 @@ impl Chain {
     fn prepare_commit(&self, block: Arc<Block>, cblock: Option<Vec<u8>>, records: Vec<RecordChange>, cert: Option<Vec<u8>>) -> Result<Executed> {
         let meta = self.block_meta(&block, Pos::default(), None)?;
         let epoch_head = self.state.params.is_boundary(block.height);
-        let cert = cert.filter(|_| block.height.is_multiple_of(CERT_CHECKPOINT) || epoch_head);
+        let spaced = self.cert_bytes.saturating_add(cblock.as_ref().map_or(0, |b| b.len() as u64)) >= CERT_SPACING_BYTES;
+        let cert = cert.filter(|_| block.height.is_multiple_of(CERT_CHECKPOINT) || epoch_head || spaced);
         // Never below the minimum as of this block (governance may have widened the tx window).
         let prune_below = self.keep_blocks.map(|k| (block.height + 1).saturating_sub(k.max(min_keep_blocks(&self.state)))).unwrap_or(0);
         Ok(Executed { meta, root: self.state.root_hash(), root_child: self.state.tree.root_child().encode(), nodes: self.state.tree.pending_changes(), records, cert, epoch_head, prune_below, cblock, block })
@@ -2713,7 +2728,9 @@ impl Chain {
         if let Some(cert) = &f.certificate {
             self.disk.remember_cert(f.height, cert.clone());
         }
+        let cblock_bytes = f.cblock.len() as u64;
         let e = self.prepare_commit(block, Some(f.cblock), commit.records, f.certificate)?;
+        self.cert_bytes = if e.cert.is_some() { 0 } else { self.cert_bytes.saturating_add(cblock_bytes) };
         self.advance(&e.block);
         Ok(e)
     }

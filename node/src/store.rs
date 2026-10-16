@@ -633,6 +633,11 @@ impl Snap {
         Ok(self.certs.get(height).map_err(storage)?.map(|v| v.value().to_vec()))
     }
 
+    /// The lowest height in `range` with a stored certificate.
+    pub fn next_cert(&self, range: std::ops::RangeInclusive<u64>) -> Result<Option<u64>> {
+        Ok(self.certs.range(range).map_err(storage)?.next().transpose().map_err(storage)?.map(|(h, _)| h.value()))
+    }
+
     /// (hash, state root) of an epoch's last block, kept through pruning.
     pub fn epoch_head(&self, height: u64) -> Result<Option<(Hash, Hash)>> {
         let Some(v) = self.heads.get(height).map_err(storage)? else { return Ok(None) };
