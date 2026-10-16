@@ -5388,6 +5388,58 @@ mod persistence {
         fs::remove_dir_all(h).ok();
     }
 
+    /// F63: a big state is served from the newest long-lived snapshot (every 200 blocks at
+    /// 4.5 s blocks: `snapshot::long_interval`), and a joiner that took its manifest still finds
+    /// its chunks and the blocks after it once newer snapshots have replaced the newest twice
+    /// over, on a node keeping the smallest window. A joiner's checkpoint skips what's older.
+    #[test]
+    fn a_served_snapshot_outlives_newer_ones() {
+        use crate::snapshot::{build_manifest_with, chunk, list, long_interval, CHECKPOINT_DELAY};
+        let h = home("long-snap");
+        let params = BTreeMap::from([("max_tx_validity_blocks".to_string(), 10)]);
+        Chain::summon(&h, &SummonOpts { block_time_ms: 4_500, epoch_blocks: 100, params, ..SummonOpts::new("long-snap", 1) }).unwrap();
+        let mut c = Chain::open_with(&h, &OpenOpts { segment_heights: Some(50) }).unwrap();
+        c.set_pruning(Some(1));
+        assert_eq!(long_interval(&c.state.params), 200);
+        let keep = min_keep_blocks(&c.state);
+        assert_eq!(keep, 100 + 2 * 200 + 2 * CHECKPOINT_DELAY + crate::consensus::MAX_EXEC_LAG + 10);
+        // Consensus hands over certificates for epoch ends and checkpoints' certifying blocks.
+        let run_to = |c: &mut Chain, to: u64, gone: u64| {
+            while c.height() < to {
+                c.produce_block_with(vec![]).unwrap();
+                let height = c.height();
+                if c.state.params.is_boundary(height) || crate::snapshot::certifies(height).is_some() {
+                    c.store_cert(height, vec![(height % 251) as u8]).unwrap();
+                }
+            }
+            let t = Instant::now();
+            while !list(&h).contains(&(to / 100 * 100)) || list(&h).contains(&gone) {
+                assert!(t.elapsed().as_secs() < 30, "snapshots: {:?}", list(&h));
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        };
+        run_to(&mut c, 999, 700);
+        assert_eq!(list(&h), vec![900, 800, 600]);
+        let big = build_manifest_with(&c.live, 0, 0).unwrap();
+        assert_eq!((big.height, big.anchor.as_ref().map(|a| a.finalization.clone())), (800, Some(hex::encode([(799 % 251) as u8]))));
+        assert_eq!(crate::snapshot::build_manifest(&c.live).unwrap().height, 900, "a small state: the newest");
+        // Two checkpoints later the newest (900) is gone; the long-lived 800 isn't, nor are the
+        // blocks after its manifest, which the joiner syncs next.
+        run_to(&mut c, 1_199, 900);
+        assert_eq!(list(&h), vec![1_100, 1_000, 800]);
+        assert!(chunk(&h, 800, 0).is_some());
+        let v = c.view();
+        assert_eq!(v.history_from(), 1_200 - keep);
+        assert!(v.cblock(805).is_some() && v.block(805).is_some());
+        assert_eq!(build_manifest_with(&c.live, 0, 0).unwrap().height, 1_000);
+        // A joiner whose checkpoint is past 1000's manifest gets the newest that reaches it.
+        assert_eq!(build_manifest_with(&c.live, 1_005, 0).unwrap().height, 1_100);
+        assert!(build_manifest_with(&c.live, 1_105, 0).is_err());
+        drop(v);
+        drop(c);
+        fs::remove_dir_all(h).ok();
+    }
+
     /// A certificate execution didn't get (consensus missed it) is kept afterwards for the
     /// heights that keep one: an epoch's last block, a checkpoint. Only for the block executed
     /// there, once, and not for heights that keep none.
