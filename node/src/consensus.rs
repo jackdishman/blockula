@@ -437,6 +437,14 @@ where
             },
             None => (exec_height, exec_root),
         };
+        #[cfg(test)]
+        let exec_root = {
+            let mut r = exec_root;
+            if self.chain.lock().wrong_exec_root {
+                r[0] ^= 1;
+            }
+            r
+        };
         debug!(height, view, txs = txs.len(), "proposing");
         Some(CBlock::new(parent.digest(), height, view, parent_view, timestamp_ms, proposer, exec_height, exec_root, txs).with_versions(version, signal))
     }

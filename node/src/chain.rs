@@ -1785,6 +1785,10 @@ pub struct Chain {
     /// Byzantine leader filling blocks it doesn't pay for (CV-5).
     #[cfg(test)]
     pub junk_proposals: bool,
+    /// Tests: this node's proposals cite a wrong `exec_root` (a Byzantine leader lying about the
+    /// state it executed, or one that diverged).
+    #[cfg(test)]
+    pub wrong_exec_root: bool,
 }
 
 /// The block logs and the state database. One executor writes at a time; the consensus path
@@ -2249,6 +2253,8 @@ impl Chain {
             halt: Default::default(),
             #[cfg(test)]
             junk_proposals: false,
+            #[cfg(test)]
+            wrong_exec_root: false,
         };
         chain.replay_logs()?;
         if rebuilt_epochs {
