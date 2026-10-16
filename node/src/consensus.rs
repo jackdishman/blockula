@@ -1520,11 +1520,11 @@ where
                     },
                     msg = votes_backup.recv() => {
                         let Some((their, (from, _))) = msg else { return };
-                        hint_behind(&marshal, &chain, epoch, their, from);
+                        hint_behind(&marshal, &chain, protection.as_deref(), epoch, their, from);
                     },
                     msg = certs_backup.recv() => {
                         let Some((their, (from, _))) = msg else { return };
-                        hint_behind(&marshal, &chain, epoch, their, from);
+                        hint_behind(&marshal, &chain, protection.as_deref(), epoch, their, from);
                     },
                 }
             }
@@ -1536,9 +1536,14 @@ where
 
 /// A peer is voting in a later epoch: we're behind. Ask marshal for the finalization of our
 /// epoch's last block (from that peer); backfill + execution then drive the transition.
-fn hint_behind(marshal: &MarshalMailbox, chain: &Shared, ours: u64, theirs: u64, from: PublicKey) {
+fn hint_behind(marshal: &MarshalMailbox, chain: &Shared, protection: Option<&crate::protection::Protection>, ours: u64, theirs: u64, from: PublicKey) {
     if theirs <= ours {
         return;
+    }
+    // Unverified, so it only keeps slashing protection's restart rule from escaping in an epoch
+    // the network may have left (audit F18).
+    if let Some(p) = protection {
+        p.note_later_epoch(theirs);
     }
     let last = chain.lock().state.params.last_of(ours);
     debug!(ours, theirs, last, "peer is in a later epoch; fetching boundary");

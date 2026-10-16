@@ -20,6 +20,13 @@
 //!    network makes no progress without this node (a halted chain, or every validator restarting
 //!    at once), it signs again after [`Timing::escape_ms`], relying on the record: the one case a
 //!    restored disk could still double-sign, which is why OPERATIONS.md says never to restore one.
+//!    Silence alone isn't that case (audit F18): a node stuck in an epoch the network has left, or
+//!    cut off from it, sees no certificates either. So the escape also needs a recent
+//!    confirmation that the network stands where this node does ([`Protection::confirm_network`]:
+//!    every peer that answers over HTTP reports a tip at or behind this node's, see
+//!    [`network_view`], or the operator names the height the network halted at), and no sign of a
+//!    later epoch ([`Protection::note_later_epoch`]: peers' consensus traffic or tips). Without
+//!    them the node keeps abstaining: a missed vote, never a double-sign.
 //! 3. **Doppelganger detection.** A vote or certificate carrying this key's signature on a
 //!    message the record doesn't have, in a view an earlier, stopped instance can't have reached,
 //!    means another instance is signing with this key. The node then signs nothing more and halts
@@ -168,8 +175,9 @@ impl Timing {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Gate {
     /// Watching the network since `since` (ms); `baseline` is the newest certificate view seen
-    /// once the startup settled.
-    Watching { since: u64, baseline: Option<u64> },
+    /// once the startup settled. `stuck`: the escape time passed without the network confirmed
+    /// (logged once).
+    Watching { since: u64, baseline: Option<u64>, stuck: bool },
     /// Signing views above `above`.
     Open { above: u64 },
 }
@@ -197,6 +205,11 @@ struct Inner {
     observed: BTreeMap<u64, u64>,
     /// Newest epoch entered or seen certified.
     newest_epoch: u64,
+    /// Newest epoch unverified signals put the network in (peers' traffic, tips): no escape in
+    /// earlier epochs.
+    hinted_epoch: u64,
+    /// The latest confirmation that the network stands where this node does: `(epoch, at ms)`.
+    confirmed: Option<(u64, u64)>,
     /// This key's signer index per epoch (`None`: not in the set).
     me: BTreeMap<u64, Option<u32>>,
     now: u64,
@@ -258,6 +271,8 @@ impl Protection {
             current: false,
             observed: BTreeMap::new(),
             newest_epoch: 0,
+            hinted_epoch: 0,
+            confirmed: None,
             me: BTreeMap::new(),
             now: 0,
             halt: None,
@@ -303,7 +318,7 @@ impl Protection {
         if !g.gates.contains_key(&epoch) {
             // A set of one has nobody to watch (and nobody to double-sign against).
             g.current |= participants <= 1;
-            let gate = if g.current { Gate::Open { above: 0 } } else { Gate::Watching { since: now_ms, baseline: None } };
+            let gate = if g.current { Gate::Open { above: 0 } } else { Gate::Watching { since: now_ms, baseline: None, stuck: false } };
             if matches!(gate, Gate::Watching { .. }) && me.is_some() {
                 info!(epoch, "slashing protection: watching the network before signing (restart rule)");
             }
@@ -324,22 +339,58 @@ impl Protection {
         g.newest_epoch = g.newest_epoch.max(epoch);
     }
 
+    /// Peers outside consensus report that the network stands where this node does in `epoch`
+    /// (every one that answered is at or behind its tip: [`network_view`]), or the operator says
+    /// the network halted at this node's height. The escape needs this, received after its watch
+    /// began and within [`Timing::escape_ms`].
+    pub fn confirm_network(&self, epoch: u64, now_ms: u64) {
+        let mut g = self.inner.lock();
+        g.confirmed = Some((epoch, now_ms));
+    }
+
+    /// Something unverified (a peer's consensus traffic, peers' tips) puts the network in `epoch`:
+    /// no escape in an earlier one. It never stops the watch itself (certificates, which are
+    /// verified, still open the gate), so a lying peer can only keep a node from escaping.
+    pub fn note_later_epoch(&self, epoch: u64) {
+        let mut g = self.inner.lock();
+        if epoch > g.hinted_epoch {
+            debug!(epoch, "slashing protection: the network is said to be in a later epoch");
+            g.hinted_epoch = epoch;
+        }
+    }
+
+    /// Whether the restart rule is watching the network in an epoch this key votes in (when
+    /// [`Protection::confirm_network`] is worth asking peers for).
+    pub fn watching(&self) -> bool {
+        let g = self.inner.lock();
+        g.gates.iter().any(|(e, gate)| matches!(gate, Gate::Watching { .. }) && *e >= g.newest_epoch && g.me.get(e).copied().flatten().is_some())
+    }
+
     /// Advances the clock the startup rule runs on (a runtime task calls it a few times a second).
     pub fn tick(&self, now_ms: u64) {
         let t = self.timing;
         let mut g = self.inner.lock();
         g.now = g.now.max(now_ms);
         let now = g.now;
-        let watching: Vec<(u64, u64, Option<u64>)> = g.gates.iter().filter_map(|(e, gate)| if let Gate::Watching { since, baseline } = gate { Some((*e, *since, *baseline)) } else { None }).collect();
-        for (epoch, since, baseline) in watching {
+        let watching: Vec<(u64, u64, Option<u64>, bool)> = g.gates.iter().filter_map(|(e, gate)| if let Gate::Watching { since, baseline, stuck } = gate { Some((*e, *since, *baseline, *stuck)) } else { None }).collect();
+        for (epoch, since, baseline, mut stuck) in watching {
             let seen = g.observed.get(&epoch).copied();
             let baseline = baseline.or(if now >= since + t.settle_ms { seen } else { None });
             let open = match (baseline, seen) {
                 (Some(b), Some(m)) if now >= since + t.watch_ms && m >= b + t.views => Some(m),
-                _ if now >= since + t.escape_ms => {
-                    warn!(epoch, "slashing protection: the network made no progress without this node; signing again on the local record alone");
-                    Some(seen.unwrap_or(0))
-                }
+                _ if now >= since + t.escape_ms => match g.escape(epoch, since, now, t) {
+                    Ok(()) => {
+                        warn!(epoch, "slashing protection: the network made no progress without this node, and peers confirm it stands where this node does; signing again on the local record alone");
+                        Some(seen.unwrap_or(0))
+                    }
+                    Err(why) => {
+                        if !stuck && g.me.get(&epoch).copied().flatten().is_some() {
+                            warn!(epoch, why, "slashing protection: no certificates for this epoch since the start, and nothing confirms the network is halted here, so still not signing (a node behind or cut off from the network sees no certificates either). If the whole network is halted at this node's height, restart with --network-halted-at <height> (docs/OPERATIONS.md)");
+                        }
+                        stuck = true;
+                        None
+                    }
+                },
                 _ => None,
             };
             let gate = match open {
@@ -348,7 +399,7 @@ impl Protection {
                     g.current = true;
                     Gate::Open { above }
                 }
-                None => Gate::Watching { since, baseline },
+                None => Gate::Watching { since, baseline, stuck },
             };
             g.gates.insert(epoch, gate);
         }
@@ -431,6 +482,19 @@ impl Protection {
 }
 
 impl Inner {
+    /// Whether the restart rule may escape in `epoch` (watched since `since`, no progress for
+    /// the escape time): the network was confirmed to stand where this node does, recently and
+    /// after the watch began, and nothing says it's in a later epoch.
+    fn escape(&self, epoch: u64, since: u64, now: u64, t: Timing) -> Result<(), &'static str> {
+        if self.hinted_epoch > epoch || self.newest_epoch > epoch {
+            return Err("the network is in a later epoch");
+        }
+        match self.confirmed {
+            Some((e, at)) if e == epoch && at >= since && now.saturating_sub(at) <= t.escape_ms => Ok(()),
+            _ => Err("no peer confirms the network stands where this node does"),
+        }
+    }
+
     fn permit(&self, epoch: u64, view: u64, kind: Kind, hash: &str) -> Result<Option<Record>, &'static str> {
         if self.halt.is_some() {
             return Err("another instance signs with this key");
@@ -489,6 +553,56 @@ impl Reporter for Observer {
             _ => {}
         }
         commonware_actor::Feedback::Ok
+    }
+}
+
+/// What peers outside consensus say about where the network is, for the restart rule's escape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetworkView {
+    /// Every peer that answered is at or within `chain::SYNC_SLACK` blocks of this node's tip, in
+    /// this epoch: the network stands where this node does.
+    Here(u64),
+    /// A peer is in this later epoch.
+    Later(u64),
+}
+
+/// Reads the tips (heights) peers reported, for a node whose executed height is `height`:
+/// [`NetworkView::Later`] if any of them is in a later epoch than this node's next block,
+/// [`NetworkView::Here`] if at least one answered and none is ahead by more than
+/// `chain::SYNC_SLACK`, and nothing otherwise (no answers, or ahead within this epoch: this node
+/// is catching up).
+pub fn network_view(params: &crate::chain::Params, height: u64, tips: &[u64]) -> Option<NetworkView> {
+    let epoch = params.epoch_of(height + 1);
+    let top = *tips.iter().max()?;
+    let theirs = params.epoch_of(top.saturating_add(1));
+    if theirs > epoch {
+        Some(NetworkView::Later(theirs))
+    } else if top <= height + crate::chain::SYNC_SLACK {
+        Some(NetworkView::Here(epoch))
+    } else {
+        None
+    }
+}
+
+impl Protection {
+    /// Feeds the tips peers reported at `now_ms` to a node whose executed height is `height`
+    /// ([`network_view`]). `halted_at`: the operator's `--network-halted-at`, which confirms the
+    /// network while this node's height is that one and no peer answers (peers that do answer
+    /// decide).
+    ///
+    /// Each call replaces the last: a confirmation stands only until peers say otherwise (a
+    /// network that was here a moment ago and has moved on isn't halted).
+    pub fn note_network(&self, params: &crate::chain::Params, height: u64, tips: &[u64], halted_at: Option<u64>, now_ms: u64) {
+        match network_view(params, height, tips) {
+            Some(NetworkView::Here(e)) => self.confirm_network(e, now_ms),
+            None if tips.is_empty() && halted_at == Some(height) => self.confirm_network(params.epoch_of(height + 1), now_ms),
+            view => {
+                self.inner.lock().confirmed = None;
+                if let Some(NetworkView::Later(e)) = view {
+                    self.note_later_epoch(e);
+                }
+            }
+        }
     }
 }
 
@@ -623,7 +737,8 @@ mod tests {
     }
 
     /// A network that can't progress without this node (every validator restarting, or a halt)
-    /// gets its vote back after the escape time, with the record as the only guard.
+    /// gets its vote back after the escape time, with the record as the only guard, once peers
+    /// confirm the network stands where this node does (audit F18: silence alone doesn't).
     #[test]
     fn a_stalled_network_gets_this_node_back_after_the_escape_time() {
         let p = Protection::in_memory(&public_key(1), T);
@@ -631,6 +746,7 @@ mod tests {
         cert(&p, 2, 10, Kind::Nullify, b"", &[1, 2, 3]);
         for t in (0..20_000).step_by(250) {
             p.tick(t);
+            p.confirm_network(2, t);
             assert!(!p.check_and_record(2, 11, Kind::Nullify, b""), "{t}");
         }
         p.tick(20_000);
@@ -641,15 +757,126 @@ mod tests {
         let behind = Protection::in_memory(&public_key(1), T);
         behind.enter_epoch(2, Some(0), 4, 0);
         behind.note_finalized_epoch(7);
+        behind.confirm_network(2, 59_000);
         behind.tick(60_000);
         assert!(!behind.check_and_record(2, 11, Kind::Nullify, b""));
-        // Every validator restarting at once: nothing to observe at all.
+        // Every validator restarting at once: nothing to observe at all, but the peers' tips are
+        // this node's.
         let q = Protection::in_memory(&public_key(1), T);
         q.enter_epoch(0, Some(0), 4, 0);
+        q.confirm_network(0, 1_000);
         q.tick(19_999);
         assert!(!q.check_and_record(0, 1, Kind::Notarize, b"b"));
         q.tick(20_000);
         assert!(q.check_and_record(0, 1, Kind::Notarize, b"b"));
+    }
+
+    /// Audit F18: a volume restored from an old snapshot, whose node is stuck in an epoch the
+    /// network has left (or can't reach the network at all), sees no certificates for its epoch
+    /// past the ones it replays. That silence isn't a halted network: without a confirmation
+    /// that the network stands where it does, it never escapes, so it can't sign a view its
+    /// earlier run finalized. Unverified signs of a later epoch, stale confirmations and ones for
+    /// another epoch don't open it either.
+    #[test]
+    fn silence_alone_never_opens_the_escape() {
+        // The earlier run signed views 1..=120 of epoch 4; the volume was snapshotted at 100.
+        let old = Protection::in_memory(&public_key(1), T);
+        old.enter_epoch(4, Some(0), 1, 0);
+        let mut snapshot = None;
+        for v in 1..=120 {
+            assert!(old.check_and_record(4, v, Kind::Notarize, format!("{v}").as_bytes()) && old.check_and_record(4, v, Kind::Finalize, format!("{v}").as_bytes()));
+            if v == 100 {
+                snapshot = Some(old.record());
+            }
+        }
+        let restored = || {
+            let p = Protection::with_record(None, false, T, snapshot.clone().unwrap());
+            p.enter_epoch(4, Some(0), 4, 0);
+            // The rolled-back journal replays certificates up to view 100.
+            for v in 90..=100 {
+                cert(&p, 4, v, Kind::Finalize, format!("{v}").as_bytes(), &[0, 1, 2]);
+            }
+            p.note_finalized_epoch(4);
+            p
+        };
+        let ticks = |p: &Protection, from: u64, to: u64| (from..=to).step_by(250).for_each(|t| p.tick(t));
+
+        // Nothing confirms: a minute (or an hour) on, it still abstains.
+        let p = restored();
+        ticks(&p, 0, 60_000);
+        assert!(!p.check_and_record(4, 101, Kind::Nullify, b""), "the earlier run finalized view 101");
+        assert!(p.status().abstaining && p.watching() && p.halted().is_none());
+        ticks(&p, 60_000, 3_600_000);
+        assert!(!p.check_and_record(4, 101, Kind::Nullify, b""));
+        // A peer's traffic for a later epoch: a confirmation doesn't help any more.
+        p.note_later_epoch(5);
+        p.confirm_network(4, 3_600_000);
+        p.tick(3_600_250);
+        assert!(!p.check_and_record(4, 101, Kind::Nullify, b""));
+        // Certificates (verified) still open it the usual way: the network moves on from 101.
+        let t = progress(&p, 4, 101, 103, 3_600_250);
+        p.tick(t);
+        assert!(!p.check_and_record(4, 101, Kind::Nullify, b"") && p.check_and_record(4, 104, Kind::Nullify, b""));
+
+        // Confirmations that don't count: from before the watch, for another epoch, or stale.
+        let p = Protection::with_record(None, false, T, snapshot.clone().unwrap());
+        p.confirm_network(4, 0);
+        p.enter_epoch(4, Some(0), 4, 1_000);
+        ticks(&p, 1_000, 30_000);
+        assert!(!p.check_and_record(4, 101, Kind::Nullify, b""), "confirmed before the watch began");
+        p.confirm_network(3, 30_000);
+        p.tick(30_250);
+        assert!(!p.check_and_record(4, 101, Kind::Nullify, b""), "another epoch");
+        p.confirm_network(4, 30_500);
+        p.tick(30_500 + T.escape_ms + 1);
+        assert!(!p.check_and_record(4, 101, Kind::Nullify, b""), "stale");
+        // A fresh one for this epoch: the halted-network case, on the record alone.
+        p.confirm_network(4, 60_000);
+        p.tick(60_000);
+        assert!(p.check_and_record(4, 101, Kind::Nullify, b""));
+    }
+
+    /// What peers' tips (and the operator's `--network-halted-at`) say, for a node at height 25
+    /// of a chain with 10-block epochs (its next block, 26, is in epoch 2).
+    #[test]
+    fn peers_tips_confirm_only_a_network_that_stands_here() {
+        let params = crate::chain::Params { epoch_blocks: 10, ..Default::default() };
+        assert_eq!(network_view(&params, 25, &[]), None, "nobody answered");
+        assert_eq!(network_view(&params, 25, &[25, 24, 0]), Some(NetworkView::Here(2)), "at or behind this node");
+        assert_eq!(network_view(&params, 25, &[25, 25 + crate::chain::SYNC_SLACK]), Some(NetworkView::Here(2)));
+        assert_eq!(network_view(&params, 25, &[25, 26 + crate::chain::SYNC_SLACK]), None, "ahead in this epoch: catching up");
+        assert_eq!(network_view(&params, 25, &[25, 29]), Some(NetworkView::Later(3)), "a tip at 29 means the network votes in epoch 3");
+        assert_eq!(network_view(&params, 25, &[25, 1_000]), Some(NetworkView::Later(100)), "one peer far ahead is enough");
+        let p = Protection::in_memory(&public_key(1), T);
+        p.enter_epoch(2, Some(0), 4, 0);
+        // The operator's word counts only at that height, and only when no peer answers.
+        p.note_network(&params, 25, &[], Some(24), 1_000);
+        p.note_network(&params, 25, &[40], Some(25), 1_000);
+        p.tick(20_000);
+        assert!(!p.check_and_record(2, 1, Kind::Nullify, b""));
+        p.note_network(&params, 25, &[], Some(25), 20_000);
+        p.tick(20_250);
+        assert!(p.check_and_record(2, 1, Kind::Nullify, b""));
+        // A confirmation stands only until the next answer: peers that moved on since (or stopped
+        // answering) withdraw it.
+        for later in [&[25, 30][..], &[]] {
+            let r = Protection::in_memory(&public_key(1), T);
+            r.enter_epoch(2, Some(0), 4, 0);
+            r.note_network(&params, 25, &[25], None, 2_000);
+            r.note_network(&params, 25, later, None, 18_000);
+            r.tick(20_000);
+            assert!(!r.check_and_record(2, 1, Kind::Nullify, b""), "{later:?}");
+            r.note_network(&params, 25, &[24, 25], None, 20_000);
+            r.tick(20_250);
+            assert!(r.check_and_record(2, 1, Kind::Nullify, b""));
+        }
+        // Peers ahead in a later epoch block the escape of an earlier one.
+        let q = Protection::in_memory(&public_key(1), T);
+        q.enter_epoch(2, Some(0), 4, 0);
+        q.note_network(&params, 25, &[25], None, 19_000);
+        q.note_network(&params, 25, &[25, 31], None, 19_500);
+        q.tick(20_000);
+        assert!(!q.check_and_record(2, 1, Kind::Nullify, b""));
     }
 
     /// The case the restart rule exists for: a volume restored from a snapshot taken at view 10,

@@ -67,6 +67,9 @@ pub struct NetOpts {
     pub http: HttpOpts,
     /// `--halt-height`: execute this height, then stop (upgrade.rs).
     pub halt_height: Option<u64>,
+    /// `--network-halted-at`: the operator says the network halted at this height, which lets
+    /// slashing protection's restart rule escape there when no HTTP peer answers (protection.rs).
+    pub network_halted_at: Option<u64>,
 }
 
 /// How many blocks a node keeps on disk.
@@ -177,6 +180,37 @@ async fn exchange_epochs(chain: Shared, peers: Vec<String>) {
         }
         tokio::time::sleep(Duration::from_secs(30)).await;
     }
+}
+
+/// Slashing protection's view of the network from outside consensus (protection.rs, audit F18):
+/// while its restart rule watches, every HTTP peer is asked for its tip every couple of seconds.
+/// Only a network that stands where this node does (halted, or every validator restarting) lets
+/// the rule's escape fire; a peer in a later epoch keeps it shut (`protection::network_view`).
+async fn watch_network(chain: Shared, peers: Vec<String>, protection: Arc<Protection>, halted_at: Option<u64>) {
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(3)).build().unwrap();
+    let genesis_hash = chain.lock().genesis_hash.clone();
+    loop {
+        if protection.watching() {
+            let tips: Vec<u64> = futures::future::join_all(peers.iter().map(|p| peer_tip(&client, p, &genesis_hash))).await.into_iter().flatten().collect();
+            let (params, height) = {
+                let c = chain.lock();
+                (c.state.params.clone(), c.height())
+            };
+            protection.note_network(&params, height, &tips, halted_at, crate::chain::now_ms());
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// A peer's tip as its `/api/status` reports it (the highest of its executed, finalized and
+/// claimed heights), if it answers for this chain instance.
+async fn peer_tip(client: &reqwest::Client, peer: &str, genesis_hash: &str) -> Option<u64> {
+    let body = get_capped(client, &format!("{peer}/api/status"), 1 << 20).await.ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
+    if v["genesis_hash"].as_str() != Some(genesis_hash) {
+        return None;
+    }
+    ["height", "finalized_height", "network_height_claimed"].iter().filter_map(|k| v[*k].as_u64()).max()
 }
 
 /// Validators check pending contribution claims against GitHub (the PR and the claimant's gist)
@@ -663,6 +697,7 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
         tokio::spawn(beacon_duties(shared.clone(), home.clone(), Duration::from_millis(block_time_ms)));
         tokio::spawn(attest_reverts(shared.clone()));
         tokio::spawn(watch_halts(shared.clone(), protection.clone()));
+        tokio::spawn(watch_network(shared.clone(), peers.clone(), protection.clone(), net.network_halted_at));
         let mut node = http_node(shared, Some(marshal), peers, &net, &trust);
         node.protection = Some(protection);
         let metrics = context.child("metrics");
