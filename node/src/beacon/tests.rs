@@ -433,3 +433,69 @@ fn leader_order_is_seeded_per_epoch() {
     assert!(shuffled >= 6, "seeded orders differ from the rotation ({shuffled} of 8 epochs)");
     assert_eq!(crate::consensus::leader(&st, 99, 1), None, "no set, no leader");
 }
+
+/// Audit F32/F56: a validator's duties carry no tip, so a mempool full of tipping txs used to
+/// refuse its beacon commitment and reveal ("mempool is full"), any 1-drop tip evicted them,
+/// and proposals ranked them last: a congested half epoch jailed and slashed every validator.
+/// Duties now queue in a lane of their own (outside `MAX_MEMPOOL`, never evicted for a tip) and
+/// proposals take them first.
+#[test]
+fn a_full_mempool_doesnt_starve_the_validators_duties() {
+    use crate::chain::{Account, MAX_MEMPOOL, MAX_PENDING_PER_SENDER};
+    let mut t = net("full", 1, None);
+    let home = t.homes[0].clone();
+    let me = t.c.me().unwrap();
+    let my_key = hex::encode(t.vals[0].public_key());
+    let mut secrets = Secrets::open(&home).unwrap();
+    // 80 accounts tip 1 drop a tx; the state machine doesn't check signatures (admission over
+    // HTTP and gossip does), so these carry dummy ones.
+    let senders: Vec<Keys> = (0..80u32).map(|i| Keys::from_seed(crypto::hash(&i.to_le_bytes()))).collect();
+    for k in &senders {
+        t.c.state.accounts.insert(k.address(), Account { balance: 1_000 * DROPS_PER_FANG, ..Default::default() });
+        t.c.state.supply += 1_000 * DROPS_PER_FANG;
+    }
+    let pay = |c: &Chain, k: &Keys, nonce: u64, tip: u64| {
+        let mut tx = Tx { chain_id: c.genesis.chain_id.clone(), genesis_hash: c.genesis_hash.clone(), from: k.address(), nonce, fee: 0, tip, valid_until: c.height() + 100, action: Action::Transfer { to: me.clone(), amount: 1 }, memo: String::new(), public_key: hex::encode(k.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+        tx.fee = 2 * min_fee(tx.size()) + tip;
+        tx
+    };
+    'fill: for k in &senders[..79] {
+        for n in 0..MAX_PENDING_PER_SENDER as u64 {
+            if t.c.mempool.len() >= MAX_MEMPOOL {
+                break 'fill;
+            }
+            t.c.submit(pay(&t.c, k, n, 1)).unwrap();
+        }
+    }
+    assert_eq!(t.c.mempool.len(), MAX_MEMPOOL);
+    let is_duty = |tx: &Tx, commit: bool| tx.public_key == my_key && matches!((&tx.action, commit), (Action::BeaconCommit { .. }, true) | (Action::BeaconReveal { .. }, false));
+    // The commitment for epoch 2 gets in anyway, and outbidding the cheapest tail never evicts it.
+    assert_eq!(duties(&mut t.c, &mut secrets).unwrap(), vec!["committed to the beacon for epoch 2".to_string()]);
+    assert_eq!(t.c.mempool.len(), MAX_MEMPOOL + 1);
+    let late = &senders[79];
+    for n in 0..20 {
+        t.c.submit(pay(&t.c, late, n, 2)).unwrap();
+    }
+    assert_eq!(t.c.mempool.len(), MAX_MEMPOOL + 1, "each outbidding tx evicted a tail");
+    assert!(t.c.mempool.iter().any(|tx| is_duty(tx, true)), "never the duty");
+    // A full block (the head of the proposal order) carries it.
+    let order = t.c.proposal_txs();
+    assert!(is_duty(order[0], true), "the duty leads, though tipped txs outrank it on tips");
+    let block: Vec<Tx> = order.into_iter().take(20).cloned().collect();
+    t.c.produce_block_with(block).unwrap();
+    assert!(t.c.state.beacon.rounds[&2].contains_key(&me), "committed during epoch 0 for epoch 2");
+    // The reveal (second half of epoch 1), under the same load.
+    t.advance_to(14);
+    assert!(t.c.mempool.len() >= MAX_MEMPOOL - 20, "still congested: {}", t.c.mempool.len());
+    for n in 20..40 {
+        t.c.submit(pay(&t.c, late, n, 2)).unwrap();
+    }
+    assert_eq!(duties(&mut t.c, &mut secrets).unwrap(), vec!["revealed the beacon secret for epoch 2".to_string(), "committed to the beacon for epoch 3".to_string()]);
+    let order = t.c.proposal_txs();
+    assert!(is_duty(order[0], false) && is_duty(order[1], true), "both duties lead, in nonce order");
+    let block: Vec<Tx> = order.into_iter().take(20).cloned().collect();
+    t.c.produce_block_with(block).unwrap();
+    assert_eq!(t.c.state.beacon.rounds[&2][&me].revealed_at, Some(15));
+    assert!(t.c.state.beacon.rounds[&3].contains_key(&me));
+    std::fs::remove_dir_all(&t.root).ok();
+}
