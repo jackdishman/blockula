@@ -2570,8 +2570,8 @@ pub(crate) mod tests {
         let text = vector_tx(Action::Propose { kind: ProposalKind::Text {}, deposit: 1, title: "t".into(), url: String::new() }).to_bytes();
         let mut bad_kind = text.clone();
         assert_eq!((bad_kind[tag_at], bad_kind[tag_at + 1]), (39, 13));
-        bad_kind[tag_at + 1] = 15;
-        assert!(err(&bad_kind).contains("unknown proposal kind 15"));
+        bad_kind[tag_at + 1] = 16;
+        assert!(err(&bad_kind).contains("unknown proposal kind 16"));
         let mut bad_aye = vector_tx(Action::Vote { proposal_id: 1, aye: true, amount: 1, conviction: 1 }).to_bytes();
         bad_aye[tag_at + 1 + 8] = 2;
         assert!(err(&bad_aye).contains("`aye` must be 0 or 1"));
