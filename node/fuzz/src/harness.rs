@@ -673,6 +673,11 @@ impl Sm {
                         ProposalKind::ScheduleUpgrade { version: 2, activation_height: h + 1_000 },
                         ProposalKind::ActivateFeature { feature: "ghost".into() },
                         ProposalKind::Text {},
+                        // What's scheduled, if anything (else refused when proposed).
+                        match self.state.upgrade.schedule.last() {
+                            Some(u) => ProposalKind::CancelUpgrade { version: u.version, activation_height: u.activation_height },
+                            None => ProposalKind::CancelUpgrade { version: 2, activation_height: h + 1_000 },
+                        },
                     ];
                     let kind = kinds[b as usize % kinds.len()].clone();
                     Action::Propose { kind, deposit: fang(1_000 + amt), title: "fuzz".into(), url: String::new() }

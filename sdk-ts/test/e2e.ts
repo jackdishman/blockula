@@ -98,6 +98,8 @@ const v1 = v1VectorActions.map((a) => signingBytes(vectorTx(a)));
 const v1Joined = new Uint8Array(v1.reduce((n, b) => n + b.length, 0));
 v1.reduce((at, b) => (v1Joined.set(b, at), at + b.length), 0);
 assert.equal(bytesToHex(blake3(v1Joined)), "0ffbf0b5bbb1a26f7abe720bae98d7f97581d5268bfbe75fe290605f16172398");
+// Proposal kinds added after that vector froze, each on its own: `cancel_upgrade` (tag 15, audit F50).
+assert.equal(bytesToHex(blake3(signingBytes(vectorTx(propose({ type: "cancel_upgrade", version: 2, activation_height: 100_000 }))))), "199d2455419f738528317187cdbfa72e5430308b096c2c8741f5801290d3d156");
 assert.throws(() => signingBytes(vectorTx({ type: "multisig_propose", action: { type: "multisig_propose", action: { type: "unlock" } } })), /can't contain another/);
 // Ghost Mode (tags 50–54): signing bytes (the unsigned wire form for 51 and 52) and the sighashes of 50–52, hashed on their own:
 // `ghost_vector_actions` there.
@@ -466,6 +468,8 @@ const governance: [Action, RegExp][] = [
   [{ type: "vote", proposal_id: 1_000_000, aye: true, amount: "1", conviction: 1 }, /no proposal #1000000/],
   [{ type: "multisig_propose", action: { type: "transfer", to: bob.address, amount: "1" } }, /isn't a multisig account/],
   [{ type: "claim_distribution", distribution_id: 1_000_000, amount: "1", proof: ["cd".repeat(32)] }, /no distribution #1000000/],
+  // `cancel_upgrade` (F50): the node decodes the SDK's encoding and refuses what isn't scheduled.
+  [{ type: "propose", kind: proposal.cancelUpgrade(2, 1_000_000), deposit: rules.proposal_deposit, title: "e2e: cancel an upgrade" }, /no upgrade to v2 at block 1000000 is scheduled/],
 ];
 for (const [action, why] of governance) {
   await assert.rejects(client.submit(await alice.build(action)), why, action.type);

@@ -832,7 +832,7 @@ async fn upgrade(State(n): State<Node>) -> ApiResult {
             "window_blocks": headers.len(),
             "validators": active.iter().map(|a| json!({ "validator": label(&v, a), "signal": signals.get(a).map(|s| s.0), "seen_at": signals.get(a).map(|s| s.1) })).collect::<Vec<_>>(),
         },
-        "explainer": "Blocks carry the protocol version in force at their height and signal the newest version their proposer's binary supports. An upgrade is scheduled by governance once at least two-thirds of the active set signal it; a node whose binary doesn't support the version in force stops before that height instead of diverging.",
+        "explainer": "Blocks carry the protocol version in force at their height and signal the newest version their proposer's binary supports. An upgrade is scheduled by governance once at least two-thirds of the active set signal it, and can be withdrawn by governance (CancelUpgrade) until 64 blocks before it activates; a node whose binary doesn't support the version in force stops before that height instead of diverging.",
     })))
 }
 

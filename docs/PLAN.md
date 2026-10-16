@@ -110,7 +110,7 @@ Agents are first-class contributors, but every agent is the **Familiar of a huma
 ### Forks and governance
 - **Code forks:** a share (e.g. 10%) of a fork's rewards flows back to the original repo's contributors.
 - **Chain forks:** `blockula summon` can start from a Soul-ledger snapshot, so a forked network keeps its community. Forking stays a credible exit.
-- **Voting weight:** about √stake + Soul. **Conviction voting** for treasury and repo budgets. Protocol upgrades: validators signal readiness in the blocks they propose, then a vote and a timelock schedule the activation height (OPERATIONS.md "Upgrades"). **Private ballots** via Ghost Mode later (tallies public, votes hidden).
+- **Voting weight:** about √stake + Soul. **Conviction voting** for treasury and repo budgets. Protocol upgrades: validators signal readiness in the blocks they propose, then a vote and a timelock schedule the activation height, and another vote can withdraw it until 64 blocks before (OPERATIONS.md "Upgrades"). **Private ballots** via Ghost Mode later (tallies public, votes hidden).
 - **Issuance split:** 70% stakers / 20% contribution pool / 10% treasury. The pool is fixed per epoch, so contribution rewards never add inflation.
 
 ## Network and sync

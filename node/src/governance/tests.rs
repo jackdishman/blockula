@@ -566,15 +566,112 @@ fn every_proposal_kind_executes() {
     // Round two: the claim Alice can now make, rejected; a clawback with nothing to claw back
     // fails when it runs and changes nothing; the feature goes off.
     t.tx(ALICE, Action::SubmitClaim { repo: "jackdishman/blockula".into(), pr: 12, familiar_key: None }).unwrap();
-    let ids = [ProposalKind::RejectClaim { claim_id: 0, reason: "reverted".into() }, ProposalKind::Clawback { account: addr(ALICE), reason: "x".into() }, ProposalKind::DeactivateFeature { feature: "ghost".into() }].map(|k| t.propose(ALICE, k));
+    let cancel = ProposalKind::CancelUpgrade { version: crate::consensus::PROTOCOL_VERSION + 1, activation_height: 100_000 };
+    let ids = [ProposalKind::RejectClaim { claim_id: 0, reason: "reverted".into() }, ProposalKind::Clawback { account: addr(ALICE), reason: "x".into() }, ProposalKind::DeactivateFeature { feature: "ghost".into() }, cancel].map(|k| t.propose(ALICE, k));
     for id in ids {
         t.vote(ALICE, id, true, 50_000, 1).unwrap();
     }
     t.finish(ids[2]);
-    assert_eq!(ids.map(|id| t.p(id).status), [ProposalStatus::Executed, ProposalStatus::Failed, ProposalStatus::Executed]);
+    assert_eq!(ids.map(|id| t.p(id).status), [ProposalStatus::Executed, ProposalStatus::Failed, ProposalStatus::Executed, ProposalStatus::Executed]);
+    assert_eq!(crate::upgrade::version_at(&t.st, 100_000), crate::consensus::PROTOCOL_VERSION, "the upgrade is withdrawn");
     assert_eq!(t.st.poc.claims[&0].status, crate::poc::ClaimStatus::Rejected);
     assert!(t.p(ids[1]).outcome.contains("no unvested rewards"), "{}", t.p(ids[1]).outcome);
     assert!(!crate::upgrade::is_active(&t.st, "ghost"));
+}
+
+/// F50: governance can withdraw a scheduled upgrade before it activates (a release pulled for a
+/// bug, a slipped release). `CancelUpgrade` names the exact schedule entry, needs the
+/// supermajority, runs the block after its vote with no timelock, and must land at least
+/// `MIN_UPGRADE_LEAD` blocks before the activation; every `ScheduleUpgrade` leaves room for one
+/// proposed the block after it runs. A stale or repeated cancellation fails cleanly.
+#[test]
+fn a_scheduled_upgrade_can_be_cancelled_before_it_activates() {
+    let mut t = T::new(&[]);
+    let lead = crate::upgrade::MIN_UPGRADE_LEAD;
+    let v = crate::consensus::PROTOCOL_VERSION + 1;
+    let (voting, timelock) = (t.st.chain_params.voting_blocks, t.st.chain_params.timelock_blocks);
+    let refused = |t: &mut T, kind: ProposalKind, why: &str| {
+        let e = t.err(ALICE, Action::Propose { kind: kind.clone(), deposit: 50 * FANG, title: "x".into(), url: String::new() });
+        assert!(e.contains(why), "{kind:?}: {e}");
+    };
+    // The earliest activation leaves, after the schedule runs, a block to propose a cancellation,
+    // its vote, the block it runs in and the lead.
+    let runs_at = t.h + voting + timelock;
+    let earliest = runs_at + 1 + voting + 1 + lead;
+    let cancel = ProposalKind::CancelUpgrade { version: v, activation_height: earliest };
+    assert!(needs_supermajority(&t.st, &cancel));
+    refused(&mut t, cancel.clone(), &format!("no upgrade to v{v} at block {earliest} is scheduled"));
+    refused(&mut t, ProposalKind::ScheduleUpgrade { version: v, activation_height: earliest - 1 }, &format!("then for a CancelUpgrade's vote and 64 blocks: block {earliest} or later"));
+    let schedule = t.propose(ALICE, ProposalKind::ScheduleUpgrade { version: v, activation_height: earliest });
+    t.vote(ALICE, schedule, true, 50_000, 1).unwrap();
+    // Until it has run there's nothing to cancel: while it's voted on, the remedy is a nay; once
+    // it has passed, the error says when a cancellation can be proposed.
+    refused(&mut t, cancel.clone(), &format!("proposal #{schedule}, which would schedule it, is still being voted on"));
+    let closes = t.p(schedule).voting_end;
+    t.through(closes);
+    refused(&mut t, cancel.clone(), &format!("isn't scheduled yet: proposal #{schedule} schedules it at block {runs_at}"));
+    t.through(runs_at);
+    assert_eq!((t.p(schedule).status, crate::upgrade::version_at(&t.st, earliest)), (ProposalStatus::Executed, v));
+    // The block after, a cancellation for another height is refused; the exact one is accepted.
+    refused(&mut t, ProposalKind::CancelUpgrade { version: v, activation_height: earliest + 1 }, &format!("v{v} is scheduled at block {earliest}, not {}", earliest + 1));
+    let c = t.propose(BOB, cancel.clone());
+    assert_eq!(describe_kind(&t.st, &cancel, &|_| None), format!("cancel the upgrade to protocol v{v} at block {earliest}"));
+    t.vote(ALICE, c, true, 50_000, 1).unwrap();
+    // It closes and runs the very next block (no timelock), exactly the lead before the upgrade.
+    let end = t.p(c).voting_end;
+    t.through(end);
+    assert_eq!((t.p(c).status, t.p(c).execute_at), (ProposalStatus::Queued, Some(end + 1)));
+    assert!(t.p(c).outcome.contains(&format!("runs at block {}", end + 1)), "{}", t.p(c).outcome);
+    assert_eq!(end + 1 + lead, earliest);
+    t.through(end + 1);
+    assert_eq!(t.p(c).status, ProposalStatus::Executed, "{}", t.p(c).outcome);
+    assert_eq!(t.p(c).outcome, format!("cancelled the upgrade to protocol v{v} at block {earliest}"));
+    assert!(t.st.upgrade.schedule.is_empty());
+    assert_eq!(crate::upgrade::version_at(&t.st, earliest), crate::consensus::PROTOCOL_VERSION);
+    // Nothing left to cancel, and the version can be scheduled again.
+    refused(&mut t, cancel, "no upgrade to");
+    let again = t.h + voting + timelock + 1 + voting + 1 + lead + 100;
+    let cancel = ProposalKind::CancelUpgrade { version: v, activation_height: again };
+    let s = t.propose(ALICE, ProposalKind::ScheduleUpgrade { version: v, activation_height: again });
+    t.vote(ALICE, s, true, 50_000, 1).unwrap();
+    t.finish(s);
+    assert_eq!(crate::upgrade::version_at(&t.st, again), v);
+    // 60% isn't enough: it's the supermajority that scheduled it.
+    let c = t.propose(BOB, cancel.clone());
+    t.vote(ALICE, c, true, 6_000, 1).unwrap();
+    t.vote(CAROL, c, false, 4_000, 1).unwrap();
+    let end = t.p(c).voting_end;
+    t.through(end);
+    assert_eq!(t.p(c).status, ProposalStatus::Rejected, "{}", t.p(c).outcome);
+    assert!(t.p(c).outcome.contains("fewer than"), "{}", t.p(c).outcome);
+    // Two cancellations both pass: the first withdraws it, the second fails cleanly when it runs
+    // (it can't re-cancel anything), and nothing else changes.
+    let (c1, c2) = (t.propose(BOB, cancel.clone()), t.propose(CAROL, cancel.clone()));
+    t.vote(ALICE, c1, true, 50_000, 1).unwrap();
+    t.vote(ALICE, c2, true, 50_000, 1).unwrap();
+    let end = t.p(c2).voting_end;
+    t.through(end + 1);
+    assert_eq!((t.p(c1).status, t.p(c2).status), (ProposalStatus::Executed, ProposalStatus::Failed));
+    assert_eq!(t.p(c2).outcome, format!("failed when it ran: no upgrade to v{v} at block {again} is scheduled"));
+    assert!(t.st.upgrade.schedule.is_empty());
+    // Scheduled once more: once a cancellation could no longer land 64 blocks before the
+    // activation, it's refused up front, and the operational path (OPERATIONS.md "Upgrades") is
+    // what's left; after the activation it's refused too.
+    let last = t.h + voting + timelock + 1 + voting + 1 + lead + 10;
+    let cancel = ProposalKind::CancelUpgrade { version: v, activation_height: last };
+    let s = t.propose(ALICE, ProposalKind::ScheduleUpgrade { version: v, activation_height: last });
+    t.vote(ALICE, s, true, 50_000, 1).unwrap();
+    t.finish(s);
+    t.through(last - lead - voting - 2);
+    let c = t.propose(BOB, cancel.clone());
+    assert_eq!(t.p(c).voting_end + 1 + lead, last, "the last block a cancellation can be proposed in");
+    t.next();
+    refused(&mut t, cancel.clone(), "less than 64 blocks before it");
+    t.through(last);
+    refused(&mut t, cancel, "less than 64 blocks before it");
+    assert_eq!(crate::upgrade::version_at(&t.st, t.h), v);
+    // The one proposed in time, which nobody voted for, changed nothing either.
+    assert_eq!(t.p(c).status, ProposalStatus::Rejected, "{}", t.p(c).outcome);
 }
 
 #[test]
@@ -588,7 +685,7 @@ fn proposals_are_checked_when_they_are_made() {
     refused(&mut t, ProposalKind::UnlinkGithub { handle: "nobody".into() }, "isn't linked");
     refused(&mut t, ProposalKind::RefundHunt { hunt_id: 0 }, "no hunt #0");
     refused(&mut t, ProposalKind::ActivateFeature { feature: "warp".into() }, "unknown feature warp");
-    refused(&mut t, ProposalKind::ScheduleUpgrade { version: 9, activation_height: 10 }, "after the vote and the timelock");
+    refused(&mut t, ProposalKind::ScheduleUpgrade { version: 9, activation_height: 10 }, "room for the vote and the timelock");
     refused(&mut t, ProposalKind::Distribution { merkle_root: "ab".repeat(32), total: FANG, claim_until: 14 }, "after the vote and the timelock");
     refused(&mut t, ProposalKind::TreasurySpend { to: "nobody.boo".into(), amount: FANG }, "no one has claimed nobody.boo");
     refused(&mut t, param("warp_speed", 1), "unknown parameter");

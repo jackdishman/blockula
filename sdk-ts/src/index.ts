@@ -140,6 +140,17 @@ export const proposal = {
     if (!Number.isInteger(version) || version < 1 || version > 0xffffffff) throw new Error("version must be a positive 32-bit number");
     return { type: "schedule_upgrade", version, activation_height: wholeNumber(activationHeight, "activationHeight") };
   },
+  /**
+   * Withdraw the upgrade to protocol `version` scheduled at block `activationHeight` (see
+   * `client.upgrade()`), and any scheduled after it, before it activates. Needs a supermajority;
+   * there's no timelock (it runs the block after its vote), and it must run at least 64 blocks
+   * before the activation height, so propose it at least `voting_blocks + 65` blocks ahead.
+   */
+  cancelUpgrade(version: number, activationHeight: number): ProposalKind {
+    if (!Number.isInteger(version) || version < 1 || version > 0xffffffff) throw new Error("version must be a positive 32-bit number");
+    if (wholeNumber(activationHeight, "activationHeight") < 1) throw new Error("activationHeight is the block the upgrade is scheduled at");
+    return { type: "cancel_upgrade", version, activation_height: activationHeight };
+  },
   /** Turn on a feature flag (e.g. "ghost"). */
   activateFeature(feature: string): ProposalKind {
     return { type: "activate_feature", feature };
@@ -878,6 +889,8 @@ export class Client {
   fees(): Promise<{ height: number; lag: number; slots: ({ height: number; max_block_bytes: number } & BaseFee)[]; suggested: BaseFee; account_creation_fee: string; [k: string]: unknown }> { return this.call("/fees"); }
   /** The governance parameters (node/src/params.rs `ChainParams`; amounts as strings) under `params`, genesis constants under `genesis`, and the issuance year. `paramsOf` flattens it. */
   params() { return this.call("/params"); }
+  /** Upgrades: the protocol version in force, what the node's binary supports, the `schedule` (`[{ version, activation_height, active }]`, what `proposal.cancelUpgrade` names), halts and each validator's readiness signal. */
+  upgrade() { return this.call("/upgrade"); }
   /** Accounts a key is authorized on (its own address, plus any it was added to). */
   keyAccounts(keyIdHex: string) { return this.call(`/key/${keyIdHex}`); }
   search(q: string) { return this.call(`/search/${encodeURIComponent(q)}`); }
