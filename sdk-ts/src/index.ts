@@ -105,9 +105,14 @@ export const proposal = {
   treasurySpend(to: string, amount: Amount): ProposalKind {
     return { type: "treasury_spend", to, amount: positive(parseFang(amount), "spend").toString() };
   },
-  /** Open a community distribution of `total`, claimable with Merkle proofs against `merkleRoot` until block `claimUntil`. */
-  distribution(merkleRoot: string, total: Amount, claimUntil: number): ProposalKind {
-    return { type: "distribution", merkle_root: hexArg(merkleRoot, "merkleRoot"), total: positive(parseFang(total), "distribute").toString(), claim_until: wholeNumber(claimUntil, "claimUntil") };
+  /**
+   * Open a community distribution of `total`, claimable with Merkle proofs against `merkleRoot` until block `claimUntil`.
+   * `distributionId` is the id the tree was built for (`buildDistribution(id, …)`), which must be the id this proposal
+   * gets (`client.proposals()`'s `next_id`): if another proposal takes it first, the node refuses this one (nothing is
+   * escrowed), so rebuild the tree for the new `next_id` and propose again.
+   */
+  distribution(distributionId: number, merkleRoot: string, total: Amount, claimUntil: number): ProposalKind {
+    return { type: "distribution", distribution_id: wholeNumber(distributionId, "distributionId"), merkle_root: hexArg(merkleRoot, "merkleRoot"), total: positive(parseFang(total), "distribute").toString(), claim_until: wholeNumber(claimUntil, "claimUntil") };
   },
   /** Put a repo in the contribution pool (weight 1–100; 0 removes it). */
   setRepo(repo: string, weight: number): ProposalKind {

@@ -596,7 +596,7 @@ fn governance_safety_parameters_need_tokens_and_keep_their_floors() {
 fn spending_waits_for_the_spend_height_and_vested_treasury_funds() {
     let mut t = T::new(&[("governance_spend_height", 30)]);
     let spend = |to: u8, fang: u64| ProposalKind::TreasurySpend { to: addr(to), amount: fang * FANG };
-    let dist = ProposalKind::Distribution { merkle_root: "ab".repeat(32), total: FANG, claim_until: 1_000 };
+    let dist = ProposalKind::Distribution { distribution_id: t.st.governance.next_proposal_id, merkle_root: "ab".repeat(32), total: FANG, claim_until: 1_000 };
     for kind in [spend(CAROL, 1), dist.clone()] {
         assert!(t.err(ALICE, Action::Propose { kind, deposit: 50 * FANG, title: "early".into(), url: String::new() }).contains("open at block 30"));
     }
@@ -631,7 +631,7 @@ fn every_proposal_kind_executes() {
     let kinds = vec![
         param("quorum_bps", 500),
         ProposalKind::TreasurySpend { to: addr(CAROL), amount: 1_000 * FANG },
-        ProposalKind::Distribution { merkle_root: hex::encode(root), total: 7 * FANG, claim_until: 200 },
+        ProposalKind::Distribution { distribution_id: next + 2, merkle_root: hex::encode(root), total: 7 * FANG, claim_until: 200 },
         ProposalKind::SetRepo { repo: "jackdishman/blockula".into(), weight: 5 },
         ProposalKind::GrantSoul { to: addr(ALICE), amount: 50 * SOUL, reason: "bootstrap".into() },
         ProposalKind::FlagSybil { account: addr(DAVE), reason: "same person".into() },
@@ -696,7 +696,8 @@ fn proposals_are_checked_when_they_are_made() {
     refused(&mut t, ProposalKind::ScheduleUpgrade { version: v + 1, activation_height: runs_at + crate::upgrade::MIN_UPGRADE_LEAD - 1 }, &format!("at least 64 blocks after block {runs_at}"));
     refused(&mut t, ProposalKind::ScheduleUpgrade { version: v, activation_height: runs_at + 1_000 }, "isn't newer than");
     t.propose(ALICE, ProposalKind::ScheduleUpgrade { version: v + 1, activation_height: runs_at + crate::upgrade::MIN_UPGRADE_LEAD });
-    refused(&mut t, ProposalKind::Distribution { merkle_root: "ab".repeat(32), total: FANG, claim_until: 14 }, "after the vote and the timelock");
+    let next = t.st.governance.next_proposal_id;
+    refused(&mut t, ProposalKind::Distribution { distribution_id: next, merkle_root: "ab".repeat(32), total: FANG, claim_until: 14 }, "after the vote and the timelock");
     refused(&mut t, ProposalKind::TreasurySpend { to: "nobody.boo".into(), amount: FANG }, "no one has claimed nobody.boo");
     refused(&mut t, param("warp_speed", 1), "unknown parameter");
     // Names resolve when proposed: the account voters saw is the one paid.
@@ -806,7 +807,7 @@ fn distributions_pay_valid_claims_once_and_return_the_rest() {
     let proof = |i: usize| proofs[i].iter().map(hex::encode).collect::<Vec<_>>();
     let claim = |amount: u64, proof: Vec<String>| Action::ClaimDistribution { distribution_id: id, amount: amount * FANG, proof };
     let claim_until = t.h + 40;
-    t.propose(ALICE, ProposalKind::Distribution { merkle_root: hex::encode(root), total: 185 * FANG, claim_until });
+    t.propose(ALICE, ProposalKind::Distribution { distribution_id: id, merkle_root: hex::encode(root), total: 185 * FANG, claim_until });
     t.vote(ALICE, id, true, 50_000, 1).unwrap();
     assert!(t.err(ALICE, claim(100, proof(0))).contains("no distribution"));
     let community_before = t.st.account(&community("boo")).balance;
@@ -839,12 +840,43 @@ fn distributions_pay_valid_claims_once_and_return_the_rest() {
     let id = t.st.governance.next_proposal_id;
     let entries = vec![(addr(ALICE), 150 * FANG), (addr(BOB), 150 * FANG)];
     let (root, proofs) = build_distribution(id, &entries).unwrap();
-    t.propose(ALICE, ProposalKind::Distribution { merkle_root: hex::encode(root), total: 200 * FANG, claim_until: t.h + 100 });
+    t.propose(ALICE, ProposalKind::Distribution { distribution_id: id, merkle_root: hex::encode(root), total: 200 * FANG, claim_until: t.h + 100 });
     t.vote(ALICE, id, true, 50_000, 1).unwrap();
     t.finish(id);
     let claim = |amount: u64, p: &Vec<[u8; 32]>| Action::ClaimDistribution { distribution_id: id, amount, proof: p.iter().map(hex::encode).collect() };
     t.tx(ALICE, claim(150 * FANG, &proofs[0])).unwrap();
     assert!(t.err(BOB, claim(150 * FANG, &proofs[1])).contains("has only 50 FANG left"));
+}
+
+/// Audit F45: a distribution's leaves bind the id its tree was built for, and the kind names that
+/// id. A proposal that lands first (a front-running text proposal, or anyone's) used to shift the
+/// id silently, so the distribution passed, escrowed its total and nobody could claim; now the
+/// late proposal is refused before it takes a deposit, and a tree rebuilt for the new id goes
+/// through and pays.
+#[test]
+fn a_distribution_built_for_another_id_is_refused_up_front() {
+    let mut t = T::new(&[]);
+    let id = t.st.governance.next_proposal_id;
+    let entries = vec![(addr(CAROL), 11 * FANG)];
+    let (root, _) = build_distribution(id, &entries).unwrap();
+    let dist = |id: u64, root: [u8; 32]| ProposalKind::Distribution { distribution_id: id, merkle_root: hex::encode(root), total: 11 * FANG, claim_until: 500 };
+    // Someone else's proposal takes id 0 first.
+    assert_eq!(t.propose(BOB, text()), id);
+    let (alice, community_before) = (t.bal(ALICE), t.st.account(&community("boo")).balance);
+    let e = t.err(ALICE, Action::Propose { kind: dist(id, root), deposit: 50 * FANG, title: "drop".into(), url: String::new() });
+    assert!(e.contains(&format!("built for id {id}, but this proposal gets id {}", id + 1)), "{e}");
+    assert!(alice - t.bal(ALICE) < FANG, "only the fee: no deposit taken");
+    assert_eq!(t.st.governance.next_proposal_id, id + 1);
+    // Rebuilt for the id it gets, it passes and pays.
+    let (root, proofs) = build_distribution(id + 1, &entries).unwrap();
+    assert_eq!(t.propose(ALICE, dist(id + 1, root)), id + 1);
+    t.vote(ALICE, id + 1, true, 50_000, 1).unwrap();
+    t.finish(id + 1);
+    assert_eq!(t.p(id + 1).status, ProposalStatus::Executed, "{}", t.p(id + 1).outcome);
+    assert_eq!(t.st.account(&community("boo")).balance, community_before - 11 * FANG);
+    let carol = t.bal(CAROL);
+    let fee = t.tx(CAROL, Action::ClaimDistribution { distribution_id: id + 1, amount: 11 * FANG, proof: proofs[0].iter().map(hex::encode).collect() }).unwrap();
+    assert_eq!(t.bal(CAROL), carol + 11 * FANG - fee);
 }
 
 /// A claimant with nothing to pay the fee with (a new account) pays it, and its account's
@@ -860,7 +892,7 @@ fn claims_pay_their_own_fee_out_of_the_claim() {
     let (root, proofs) = build_distribution(id, &entries).unwrap();
     let proof = |i: usize| proofs[i].iter().map(hex::encode).collect::<Vec<_>>();
     let claim = |amount: u64, proof: Vec<String>| Action::ClaimDistribution { distribution_id: id, amount, proof };
-    t.propose(ALICE, ProposalKind::Distribution { merkle_root: hex::encode(root), total: 10 * FANG + 1_000, claim_until: t.h + 100 });
+    t.propose(ALICE, ProposalKind::Distribution { distribution_id: id, merkle_root: hex::encode(root), total: 10 * FANG + 1_000, claim_until: t.h + 100 });
     t.vote(ALICE, id, true, 50_000, 1).unwrap();
     t.finish(id);
     assert!(!t.st.accounts.contains_key(&dave), "DAVE has never held anything");
@@ -1133,7 +1165,7 @@ fn records_round_trip_and_journals_roll_back() {
     let mut t = T::new(&[("bootstrap_end_height", 1_000)]);
     let id = t.st.governance.next_proposal_id;
     let (root, proofs) = build_distribution(id, &[(addr(BOB), 5 * FANG), (addr(CAROL), 5 * FANG)]).unwrap();
-    t.propose(ALICE, ProposalKind::Distribution { merkle_root: hex::encode(root), total: 10 * FANG, claim_until: 500 });
+    t.propose(ALICE, ProposalKind::Distribution { distribution_id: id, merkle_root: hex::encode(root), total: 10 * FANG, claim_until: 500 });
     t.vote(ALICE, id, true, 50_000, 3).unwrap();
     t.vote(VALIDATORS[0], id, true, 1, 0).unwrap();
     t.finish(id);
@@ -1205,7 +1237,7 @@ fn random_governance_sequences_keep_the_invariants() {
                 let entries: Vec<(String, u64)> = users.iter().take(1 + (r >> 20) as usize % 6).map(|s| (addr(*s), (1 + (r >> 30) % 9) * FANG)).collect();
                 let (root, proofs) = build_distribution(id, &entries).unwrap();
                 let total = entries.iter().map(|e| e.1).sum::<u64>() - (r >> 50) % 2 * FANG;
-                let res = t.tx(ALICE, Action::Propose { kind: ProposalKind::Distribution { merkle_root: hex::encode(root), total, claim_until: t.h + 20 + (r >> 33) % 40 }, deposit: 50 * FANG, title: "drop".into(), url: String::new() });
+                let res = t.tx(ALICE, Action::Propose { kind: ProposalKind::Distribution { distribution_id: id, merkle_root: hex::encode(root), total, claim_until: t.h + 20 + (r >> 33) % 40 }, deposit: 50 * FANG, title: "drop".into(), url: String::new() });
                 if res.is_ok() {
                     trees.push((id, entries, proofs));
                 }

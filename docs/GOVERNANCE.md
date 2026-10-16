@@ -43,7 +43,7 @@ A passed proposal is queued and runs at the end of block `voting_end + timelock_
 |---|---|
 | `ParamChange { key, value }` | `State::exec_set_param` (bounds and cross-parameter rules in params.rs) |
 | `TreasurySpend { to, amount }` | pays from the keyless treasury, at most what it can transfer (its vesting) |
-| `Distribution { merkle_root, total, claim_until }` | moves `total` from the community account into a distribution (below) |
+| `Distribution { distribution_id, merkle_root, total, claim_until }` | moves `total` from the community account into a distribution (below); `distribution_id` must be the id the proposal gets |
 | `SetRepo`, `GrantSoul` (≤ 100 Soul), `FlagSybil`, `RejectClaim`, `Clawback`, `UnlinkGithub` | the former admin levers (`poc.rs`, `chain.rs`) |
 | `RefundHunt { hunt_id }` | refunds every funder of an open hunt exactly what they put in |
 | `ScheduleUpgrade`, `ActivateFeature`, `DeactivateFeature` | `upgrade.rs` (Ghost Mode switches on this way) |
@@ -74,7 +74,7 @@ A distribution escrows `total` from the community account. Each recipient claims
 - **Node:** `BLAKE3("BLOCKULA_DISTRIBUTION_NODE_V1" ‖ min(a, b) ‖ max(a, b))`, comparing the two 32-byte children as byte strings. Sorted pairs make a proof just the sibling hashes from the leaf up, with no positions; the two domain strings keep a node from passing as a leaf.
 - **Building** (`governance::build_distribution`, `blockula gov tree`): sort the leaf hashes ascending, then pair them left to right level by level, carrying an odd last node up unchanged; one leaf is its own root. Addresses must be distinct and amounts non-zero. Any tree shape verifies; this one is the reference so independent builders agree on the root.
 - **Verifying:** fold the proof: `h = leaf; for s in proof: h = node(h, s)`; the claim is valid if `h == merkle_root`. Proofs are at most 64 hashes (`MAX_PROOF`).
-- **The id is in the leaf**, so a proof for one distribution never verifies in another. Build the tree for the id the proposal will get (`next_id` in `/api/proposals`) just before proposing; `blockula gov propose distribution` refuses a tree built for another id. `Distribution` carries no id of its own (adding one would change the tx encoding on both sides): if another proposal takes the id between building the tree and inclusion, nobody can claim from that distribution and its `total` returns to the community account after `claim_until`, so propose again with a tree for the new id.
+- **The id is in the leaf**, so a proof for one distribution never verifies in another. Build the tree for the id the proposal will get (`next_id` in `/api/proposals`) and name that id in the kind: `Distribution { distribution_id, merkle_root, total, claim_until }`. The node refuses a `Propose` whose `distribution_id` isn't the id it would get (the tx fails before any deposit is taken), so a proposal that lands first (anyone's, or a front-running one) can't leave a passed distribution unclaimable; rebuild the tree for the new `next_id` and propose again (`blockula gov propose distribution` checks before sending). It's checked again when the proposal runs.
 
 Vectors (`governance::tests::merkle_trees_build_and_verify`), distribution 7:
 
@@ -102,6 +102,7 @@ export function distributionRoot(id: bigint | number, address: string, amount: b
 /** Whether `proof` leads from the leaf to `root` (hex). */
 export function verifyDistributionProof(root: string, id: bigint | number, address: string, amount: bigint, proof: string[]): boolean;
 // Wallet: claimDistribution(id, amount, proof) builds { type: "claim_distribution", distribution_id, amount: String(amount), proof }.
+// proposal.distribution(id, root, total, claimUntil) builds the proposal kind for a tree built for `id` (the node's `next_id`).
 ```
 
 The tree file `blockula gov tree` writes (`{ distribution_id, merkle_root, total, claims: [{ address, amount, proof }] }`, amounts in drops as strings) is what proposals publish; wallets look the user's address up in it.

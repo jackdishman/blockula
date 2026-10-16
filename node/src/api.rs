@@ -2612,7 +2612,7 @@ mod http_tests {
             let mut c = n.chain.lock();
             c.faucet(&k.address(), 10 * FANG).unwrap();
             let claim_until = c.height() + 100;
-            c.submit_own(Action::Propose { kind: ProposalKind::Distribution { merkle_root: hex::encode(tree_root), total: 3 * FANG, claim_until }, deposit: 10 * FANG, title: "First drop".into(), url: String::new() }, "").unwrap();
+            c.submit_own(Action::Propose { kind: ProposalKind::Distribution { distribution_id: 0, merkle_root: hex::encode(tree_root), total: 3 * FANG, claim_until }, deposit: 10 * FANG, title: "First drop".into(), url: String::new() }, "").unwrap();
             c.produce_block().unwrap();
             c.submit_own(Action::Vote { proposal_id: 0, aye: true, amount: 100_000_000 * FANG, conviction: 1 }, "").unwrap();
             for _ in 0..13 {

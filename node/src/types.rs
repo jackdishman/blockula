@@ -2191,7 +2191,7 @@ pub(crate) mod tests {
         for action in v1_vector_actions() {
             h.update(&vector_tx(action).signing_bytes());
         }
-        assert_eq!(h.finalize().to_hex().to_string(), "0ffbf0b5bbb1a26f7abe720bae98d7f97581d5268bfbe75fe290605f16172398");
+        assert_eq!(h.finalize().to_hex().to_string(), "fa975d440a66418e791d1cb415eb19479e544948ca449897fa7bad2e1d94bde0");
         let p: Action = serde_json::from_str(r#"{"type":"propose","kind":{"type":"param_change","key":"max_validators","value":"40"},"deposit":"1000","title":"t"}"#).unwrap();
         assert_eq!(p, Action::Propose { kind: ProposalKind::ParamChange { key: "max_validators".into(), value: 40 }, deposit: 1000, title: "t".into(), url: String::new() });
         let m: Action = serde_json::from_str(r#"{"type":"multisig_propose","action":{"type":"vote","proposal_id":1,"aye":true,"amount":"5","conviction":2}}"#).unwrap();
