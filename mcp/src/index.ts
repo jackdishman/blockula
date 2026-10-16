@@ -188,15 +188,21 @@ async function submitCapped(w: Wallet, action: Action, spend: Spend, memo = ""):
   }
 }
 
-/** What opening `to`'s account would burn on top of a transfer (0 if it exists). */
+/**
+ * What opening `to`'s account would burn on top of a transfer (0 if it exists). `/api/account`
+ * answers for any address, with a zero balance and the address's own "original key" when it has
+ * no account, so an account counts as existing only by what a missing one can't have: a balance
+ * or a nonce. An existing account with neither is counted as new: the cap errs high, never low.
+ */
 async function openingFee(client: Client, to: string): Promise<bigint> {
+  let a: any = null;
   try {
-    await client.account(to);
-    return 0n;
+    a = await client.account(to);
   } catch (e) {
     if (!(e instanceof ApiError && e.status === 404)) throw e;
-    return reported((await client.fees()).account_creation_fee, "the account creation fee");
   }
+  const exists = (/^\d+$/.test(String(a?.balance ?? "")) && BigInt(a.balance) > 0n) || (Number.isSafeInteger(a?.nonce) && a.nonce > 0);
+  return exists ? 0n : reported((await client.fees()).account_creation_fee, "the account creation fee");
 }
 
 /** A drops amount the node reports, which must be there for a spend to be priced. */

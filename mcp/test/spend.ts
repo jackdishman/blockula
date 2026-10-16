@@ -110,8 +110,10 @@ const fake: Server = createServer((req, res) => {
       const charged = (BigInt(t.fee) / 2n).toString();
       return reply(200, { id: tx[1], status: mode.tx, error: mode.tx === "failed" ? "insufficient balance" : null, summary: `sent ${t.action.type}`, fee: charged, fee_display: "fee", max_fee: t.fee, height: mode.tx === "finalized" ? 11 : null, valid_until: t.valid_until });
     }
-    if (path === `/account/${BOB}`) return reply(200, { account: { address: BOB, name: "bob.boo" }, balance: "5", next_nonce: 0 });
-    if (path.startsWith("/account/")) return reply(404, { error: "account not found" });
+    if (path === `/account/${BOB}`) return reply(200, { account: { address: BOB, name: "bob.boo" }, balance: "5", nonce: 0, next_nonce: 0, keys: [] });
+    // Like node/src/api.rs: any address answers; without an account, with a zero balance and nonce
+    // and the address's own key (`keys_of` lists it for every address).
+    if (path.startsWith("/account/")) return reply(200, { account: { address: path.slice(9), name: null }, balance: "0", nonce: 0, next_nonce: 0, keys: [{ key_id: "ee".repeat(32), label: "original key", role: { type: "owner" }, added_at: 0, spent_this_period: "0", window_start: 0 }], recent_txs: [] });
     if (path === "/fees") return reply(200, { height: 10, suggested: { flat: "10000", rate: "10000" }, account_creation_fee: "100000000" });
     if (path === "/params") return reply(200, { params: mode.prices.params ? { name_price_3: "100000000000", name_price_4: "25000000000", name_price_5: "5000000000", name_renewal_bps: "2000" } : {} });
     if (path === "/name/bob.boo" || path === "/name/bob") return reply(200, { name: "bob.boo", status: "active", available: false, owner: { address: BOB, name: "bob.boo" }, ...mode.prices });
