@@ -209,4 +209,5 @@ Next:
   - Only the last 2,048 executed blocks and 1,024 certificates stay in memory.
   - A node whose consensus storage predates this layout must re-sync (`consensus.version`).
 - The faucet is rate limited per address and per client (/64 for IPv6), but a determined attacker with many IPs can still drain it slowly. It's for testnets only.
+- The CLI pins the chain a node is on (chain id, genesis hash, prefix; `node/src/cli_net.rs`), but within that chain it still trusts the one node it signs through for name resolution (it prints the address it resolved), the nonce, the fee quote and the height its tx's validity window starts from. A hostile node on the right chain can misdirect a send to a name, or hold a signed tx and release it later within the window it chose; use addresses, and nodes you trust, for anything that matters. (The SDK's `provenName` with witnesses is the light-client path.)
 - `sdk-ts/src/passkey.ts` typechecks but hasn't been exercised in a real browser yet.

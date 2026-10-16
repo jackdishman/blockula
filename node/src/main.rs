@@ -5,6 +5,7 @@ mod api;
 mod beacon;
 mod chain;
 mod checkpoints;
+mod cli_net;
 mod consensus;
 mod contrib_cli;
 mod crypto;

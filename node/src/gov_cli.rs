@@ -34,12 +34,14 @@ async fn acting_for(s: &Signer, keys: &Keys) -> Result<String> {
     }
 }
 
-/// Signs and submits `action`, waits for it, and prints the summary and explorer link.
+/// Signs and submits `action` for the chain `s` pins, waits for it, and prints the summary and
+/// explorer link.
 fn submit(dir: &Path, s: &Signer, action: Action) -> Result<Value> {
     let keys = keys_of(s, dir)?;
     let tx = rt()?.block_on(async {
-        let from = acting_for(s, &keys).await?;
-        send_memo(&s.rpc, &keys, &from, action, String::new()).await
+        let remote = s.connect(dir).await?;
+        let from = s.acting_for(&remote, &keys).await?;
+        send_memo(&remote, &keys, &from, action, String::new()).await
     })?;
     println!("✓ {}", tx["summary"].as_str().unwrap_or_default());
     println!("  {}/#/tx/{}", s.rpc.trim_end_matches('/'), tx["id"].as_str().unwrap_or_default());

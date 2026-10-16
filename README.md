@@ -188,6 +188,8 @@ blockula wallet name vlad --rpc https://<node>
 blockula wallet balance --rpc https://<node>
 ```
 
+Every command that signs (`wallet send|name`, `stake`, `gov`, `multisig`, `name`, `hunt`, `contrib`, `validator`) first checks which chain the node at `--rpc` is on, as the MCP does: `--network testnet` (or the public testnet's URL) and `--network mainnet` pin their chain id and prefix, `--chain-id` and `--genesis-hash` (or `BLOCKULA_NETWORK`, `BLOCKULA_CHAIN_ID`, `BLOCKULA_GENESIS_HASH`) pin any node, and whatever isn't pinned is pinned on first use and remembered in `~/.blockula/known-chains.json` (not for a node on this machine). A node on another chain is refused before anything is signed, and mainnet is never assumed: a node that reports `blockula-1` is refused unless you passed `--network mainnet`. Plain `http://` only works for this machine or a private network. Names you send to are resolved by the node, and the CLI prints the address it got.
+
 ## Become a validator
 
 Validators are permissionless: anyone can register one with a self-bond, anyone can delegate to it, and at each epoch boundary the top `max_validators` by stake make the set (newcomers at most a third of it). Double-signing is slashed and banned for good; missing too many turns gets a validator jailed until it unjails. Everything is on-chain and visible in the explorer's Validators page.
