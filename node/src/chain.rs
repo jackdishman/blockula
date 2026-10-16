@@ -1806,10 +1806,11 @@ pub struct Chain {
     pub wrong_exec_root: bool,
 }
 
-/// Epochs of validator-set history a node keeps and serves: the weak-subjectivity period (no
-/// joiner may start from an older root, `checkpoints::ws_period_blocks`) under the genesis
+/// Epochs of validator-set history a node always keeps and serves: the weak-subjectivity period
+/// (no joiner may start from an older root, `checkpoints::ws_period_blocks`) under the genesis
 /// parameters and the current ones, whichever is longer, plus a quarter for slow blocks and late
-/// joiners. Older changes and their proofs are dropped (F10).
+/// joiners. Older changes and their proofs are dropped once the history passes
+/// `epochs::KEEP_BYTES` (F10).
 pub fn registry_keep_epochs(g: &Genesis, state: &State) -> u64 {
     let eb = state.params.epoch_blocks.max(2);
     let genesis = g.chain_params().map(|cp| crate::checkpoints::ws_period_blocks(&cp, eb)).unwrap_or(0);
@@ -2437,10 +2438,18 @@ impl Chain {
     }
 
     /// Brings the validator-set history up to the next height's epoch from the sets in state
-    /// (it can trail when `epochs.json` was saved before a crash).
+    /// (it can trail when `epochs.json` was saved before a crash), and forgets anything recorded
+    /// past it: this node hasn't executed that far, so nothing there is its own (F08; a registry
+    /// an older binary adopted whole from a fast-sync peer could run ahead).
     fn reconcile_epochs(&mut self) -> Result<()> {
         let want = self.state.params.epoch_of(self.height + 1);
-        if self.epochs.known_through >= want {
+        if self.epochs.known_through > want {
+            tracing::info!(known_through = self.epochs.known_through, executed = want, "dropping validator-set history past the executed epoch");
+            self.epochs.truncate(want);
+            self.save_epochs();
+            return Ok(());
+        }
+        if self.epochs.known_through == want {
             return Ok(());
         }
         for e in self.epochs.known_through + 1..=want {
@@ -2869,8 +2878,8 @@ impl Chain {
         let next = self.state.params.epoch_of(boundary) + 1;
         let keys: Vec<String> = self.state.active_set(next).map(|s| s.iter().map(|v| v.consensus_key.clone()).collect()).unwrap_or_default();
         let changed = self.epochs.record(next, keys);
-        // Only the window a joiner may start from is kept and served (F10).
-        self.epochs.rebase(next.saturating_sub(registry_keep_epochs(&self.genesis, &self.state)));
+        // Older than the window a joiner may start from is dropped once the history is big (F10).
+        self.epochs.trim(next.saturating_sub(registry_keep_epochs(&self.genesis, &self.state)), crate::epochs::KEEP_BYTES);
         self.save_epochs();
         changed
     }
@@ -5235,6 +5244,29 @@ mod persistence {
         fs::write(h.join("epochs.json"), serde_json::to_vec(&planted).unwrap()).unwrap();
         let mut c = Chain::open(&h).unwrap();
         assert_eq!(c.epochs, genesis);
+        assert_eq!(c.sign_handoffs(), 0);
+        drop(c);
+        fs::remove_dir_all(h).ok();
+    }
+
+    /// F08: a home that executed blocks forgets whatever its `epochs.json` records past the epoch
+    /// it executed (an older binary adopted a fast-sync peer's registry whole), so a planted
+    /// change neither stays in what it serves nor gets signed when its epoch comes.
+    #[test]
+    fn history_past_the_executed_epoch_is_dropped_on_open() {
+        let (h, c, _) = active("ahead", 3);
+        let executed = c.epochs.clone();
+        let want = c.state.params.epoch_of(c.height() + 1);
+        assert_eq!(executed.known_through, want);
+        drop(c);
+        let mut planted = executed.clone();
+        let evil = hex::encode(commonware_cryptography::Signer::public_key(&crate::pq::PrivateKey::from_seed_bytes([200; 32])).as_ref());
+        assert!(planted.record(want + 3, vec![evil]));
+        planted.format = crate::epochs::HANDOFF_FORMAT;
+        fs::write(h.join("epochs.json"), serde_json::to_vec(&planted).unwrap()).unwrap();
+        let mut c = Chain::open(&h).unwrap();
+        assert_eq!((c.epochs.known_through, c.epochs.sets.keys().next_back().copied()), (want, executed.sets.keys().next_back().copied()));
+        assert_eq!(*c.live.epochs(), c.epochs, "and that's what it serves");
         assert_eq!(c.sign_handoffs(), 0);
         drop(c);
         fs::remove_dir_all(h).ok();

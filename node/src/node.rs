@@ -165,11 +165,21 @@ pub fn prune_epoch_journals(dir: &Path, prefix: &str, epoch: u64) -> Result<usiz
 /// Handoff signatures checked per peer per round, at most (a peer can only offer ones we lack, for
 /// changes still short of a quorum; this bounds what a lying one costs us each round).
 const HANDOFF_VERIFIES_PER_ROUND: usize = 512;
+/// `/api/epochs` pages read per peer per round, at most: past a change nobody has a quorum for,
+/// the next pages may still hold signatures we lack.
+const HANDOFF_PAGES_PER_ROUND: usize = 4;
+
+/// Where the next `/api/epochs` page starts (`null` after the last).
+#[derive(serde::Deserialize)]
+struct PageNext {
+    #[serde(default)]
+    next: Option<u64>,
+}
 
 /// Pulls peers' validator-set handoff signatures every 30s (and signs our own, if we're a
 /// validator), so this node can serve complete proofs to fast-syncing joiners. Incremental
-/// (F19, F26): it asks only while some set change lacks a quorum here, only for the page from the
-/// first such change, and verifies only signatures it lacks, without the chain lock.
+/// (F19, F26): it asks only while some set change lacks a quorum here, only for pages from the
+/// first such change on, and verifies only signatures it lacks, without the chain lock.
 async fn exchange_epochs(chain: Shared, peers: Vec<String>) {
     let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
     let (live, chain_id) = {
@@ -184,15 +194,24 @@ async fn exchange_epochs(chain: Shared, peers: Vec<String>) {
             if from >= ours.known_through {
                 break; // every change has its quorum: nothing to ask anyone for
             }
-            let url = format!("{peer}/api/epochs?from={from}");
-            let page = match get_capped(&client, &url, crate::epochs::MAX_PAGE_BYTES).await.and_then(|b| Ok(serde_json::from_slice::<crate::epochs::EpochRegistry>(&b)?)) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::debug!(peer = %peer, error = %format!("{e:#}"), "couldn't fetch handoff proofs");
-                    continue;
+            let mut wanted = vec![];
+            let mut at = Some(from);
+            for _ in 0..HANDOFF_PAGES_PER_ROUND {
+                let Some(from) = at.filter(|a| *a < ours.known_through) else { break };
+                let url = format!("{peer}/api/epochs?from={from}");
+                let (page, next) = match get_capped(&client, &url, crate::epochs::MAX_PAGE_BYTES).await.and_then(|b| Ok((serde_json::from_slice::<crate::epochs::EpochRegistry>(&b)?, serde_json::from_slice::<PageNext>(&b)?.next))) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::debug!(peer = %peer, error = %format!("{e:#}"), "couldn't fetch handoff proofs");
+                        break;
+                    }
+                };
+                wanted = ours.candidates(&chain_id, &page, HANDOFF_VERIFIES_PER_ROUND);
+                if !wanted.is_empty() {
+                    break;
                 }
-            };
-            let wanted = ours.candidates(&chain_id, &page, HANDOFF_VERIFIES_PER_ROUND);
+                at = next.filter(|n| *n > from);
+            }
             if wanted.is_empty() {
                 continue;
             }

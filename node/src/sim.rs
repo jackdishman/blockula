@@ -496,8 +496,9 @@ fn fast_sync_from_certified_snapshot_and_tamper_rejection() {
         let chunks: Vec<Vec<u8>> = (0..m.chunks.len()).map(|i| snapshot::chunk(&home0, m.height, i).unwrap()).collect();
 
         // The validator-set history comes from /api/epochs pages (the node's whole registry
-        // here, which runs past the snapshot's epoch: only what's verified is kept, F08).
-        let history = {
+        // here); a peer's may run past the snapshot's epoch, with a change nobody signed planted
+        // there: only what's verified is kept (F08).
+        let mut history = {
             let live = vals[0].chain.lock().live.clone();
             let page = |from: u64| -> (crate::epochs::EpochRegistry, Option<u64>) {
                 let v: serde_json::Value = serde_json::from_slice(&live.epoch_page(from)).unwrap();
@@ -512,7 +513,13 @@ fn fast_sync_from_certified_snapshot_and_tamper_rejection() {
             h
         };
         let last_epoch = genesis.params().epoch_of(m.height + m.blocks.len() as u64);
-        assert!(history.known_through > last_epoch, "the node knows sets past the snapshot's epoch");
+        assert!(history.known_through >= last_epoch, "the node knows the snapshot's epoch's set");
+        let planted: Vec<String> = {
+            let mut k: Vec<String> = (0..4u8).map(|i| hex::encode(commonware_cryptography::Signer::public_key(&PrivateKey::from_seed_bytes([210 + i; 32])).as_ref())).collect();
+            k.sort();
+            k
+        };
+        assert!(history.record(history.known_through + 3, planted));
         // Tampering is caught.
         let v = snapshot::verify_manifest(&genesis, &m, &history).unwrap();
         assert_eq!((v.epochs.base, v.epochs.known_through), (0, last_epoch), "nothing past the certified epoch is adopted");

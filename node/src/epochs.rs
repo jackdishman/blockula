@@ -34,6 +34,10 @@ pub const PAGE_BYTES: usize = 2 << 20;
 pub const MAX_PAGE_BYTES: usize = 16 << 20;
 /// The most a joiner assembles from pages before it gives up on a peer.
 pub const MAX_HISTORY_BYTES: usize = 512 << 20;
+/// A node trims history older than its window (`chain::registry_keep_epochs`) only once the
+/// registry passes this size, so a small history stays whole (a joiner trusting an older root,
+/// e.g. the genesis on a young chain, still finds it) and a big one stays bounded.
+pub const KEEP_BYTES: usize = 8 << 20;
 
 /// Byzantine quorum for `n` validators (n − f, f = ⌊(n−1)/3⌋).
 pub fn quorum(n: usize) -> usize {
@@ -222,11 +226,16 @@ impl EpochRegistry {
     /// Returns how many were new.
     pub fn add_verified(&mut self, chain_id: &str, verified: Vec<Candidate>) -> usize {
         let mut added = 0;
+        // The message of each change, computed once (it hashes both sets).
+        let mut msgs: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
         for c in verified {
             // Nothing hands off to the base (or the genesis) set.
             let Some(before) = c.epoch.checked_sub(1).filter(|_| c.epoch > self.base) else { continue };
             let (Some(new), Some(prev)) = (self.sets.get(&c.epoch), self.set(before)) else { continue };
-            if prev.get(c.signer as usize) != Some(&c.key) || handoff_message(chain_id, c.epoch, prev, new) != c.msg {
+            if prev.get(c.signer as usize) != Some(&c.key) {
+                continue;
+            }
+            if *msgs.entry(c.epoch).or_insert_with(|| handoff_message(chain_id, c.epoch, prev, new)) != c.msg {
                 continue;
             }
             if self.proofs.entry(c.epoch).or_default().insert(c.signer, c.sig).is_none() {
@@ -254,6 +263,24 @@ impl EpochRegistry {
             }
         }
         self.known_through
+    }
+
+    /// About what the registry takes as JSON (keys and signatures as hex, plus a little framing).
+    pub fn approx_bytes(&self) -> usize {
+        let sets: usize = self.sets.values().map(|s| s.iter().map(|k| k.len() + 3).sum::<usize>() + 16).sum();
+        let proofs: usize = self.proofs.values().map(|p| p.values().map(|s| s.len() + 16).sum::<usize>() + 16).sum();
+        sets + proofs
+    }
+
+    /// Drops history before `keep_from` (see [`EpochRegistry::rebase`]), but only once the
+    /// registry is bigger than `budget`. Returns whether it did.
+    pub fn trim(&mut self, keep_from: u64, budget: usize) -> bool {
+        if keep_from <= self.base || self.approx_bytes() <= budget {
+            return false;
+        }
+        let base = self.base;
+        self.rebase(keep_from);
+        self.base != base
     }
 
     /// Starts the registry at `at` (the set in effect then becomes the base), dropping what's
@@ -552,6 +579,11 @@ mod tests {
         assert_eq!((kept.base, kept.set(159), kept.set(160)), (160, None, full.set(160)));
         assert!(verify_from(&g, &kept, &pin(150), 300).unwrap_err().to_string().contains("--checkpoint"));
         assert!(verify_from(&g, &kept, &pin(170), 300).is_ok());
+        // A node trims to its window only once the history is big: a small one stays whole.
+        let mut small = full.clone();
+        assert!(!small.trim(160, small.approx_bytes()) && small.base == 0);
+        assert!(small.trim(160, small.approx_bytes() - 1) && small == kept);
+        assert!(serde_json::to_vec(&full).unwrap().len().abs_diff(full.approx_bytes()) < full.approx_bytes() / 10, "approx_bytes is close to the JSON size");
         // A root the history contradicts is a forgery.
         let wrong = Root { epoch: 170, set_hash: set_hash(full.set(171).unwrap()) };
         assert!(verify_from(&g, &kept, &wrong, 300).unwrap_err().to_string().contains("forged"));

@@ -83,7 +83,7 @@ Reads: `client.staking(account)`, `client.proposals()`, `client.proposal(id)`, `
 | GET | `/api/multisig/{address\|name}` | a multisig account: threshold, owner keys, open proposals with their approvals |
 | GET | `/api/snapshot/latest` | newest certified state snapshot manifest (chunk hashes, certifying blocks + certificate, validator-set history, the certified epoch anchor) |
 | GET | `/api/snapshot/{height}/chunk/{i}` | snapshot chunk bytes |
-| GET | `/api/epochs` | validator-set history + handoff signatures |
+| GET | `/api/epochs?from=` | validator-set history + handoff signatures, a page (~2 MiB) at a time: the set in effect at `from` (default: the oldest epoch kept, `base`), the changes after it with a quorum of their handoff signatures each, `proven_through`, and `next` (the next page's `from`, `null` at the end). Nodes keep about the weak-subjectivity window |
 | GET | `/api/proof/{namespace}/{key_hex}` | Merkle proof of one state record (inclusion, or exclusion when absent) against the current state root: `namespace`, `key`, `value` (hex or `null`), `proof`, `root`, `height`, `block_hash`. Namespaces are `state::ns` in `node/src/state/mod.rs` (0 scalars, 1 accounts, 2 names, …); an account's key is its address as hex bytes |
 | GET | `/api/ghost` | 👻 Ghost Mode (off at genesis): `active`, `paused` (+ by whom, signatures, threshold), `pool` and `pool_cap`, `frontier_size`, the anchor `root` and `recent_roots`, `anchor_window`, `nullifiers`, the chain `instance` proofs bind, `circuit_id`, size limits, `verify_fee` |
 | GET | `/api/ghost/address/{name\|address}` | an account's published Ghost Mode address (hex) and its fingerprint |
