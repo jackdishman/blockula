@@ -6,15 +6,16 @@
 //! takes `Vote`s through block `voting_end = created_at + voting_blocks`. At the end of that
 //! block the vote closes ([`end_block`]): the deposit is refunded if the vote reached quorum
 //! (or, during the bootstrap, ⅔ of the council voted) and burned otherwise; a proposal that
-//! passed is queued and runs at the end of block `voting_end + timelock_blocks`. A proposal whose
-//! action fails when it runs changes nothing and is marked failed.
+//! passed is queued and runs at the end of block `voting_end + timelock_blocks` (a
+//! `CancelUpgrade`, which keeps the rules in force, at `voting_end + 1`). A proposal whose action
+//! fails when it runs changes nothing and is marked failed.
 //!
 //! **Tally.** Quorum is `max(quorum_floor, quorum_bps × unlocked supply)` on the raw FANG voted
 //! (aye + nay), where the unlocked supply is what could vote: what every account but the keyless
 //! system ones holds (liquid, staked at its pool's value, unbonding) less what vesting locks still
 //! hold of it ([`unlocked_supply`], O(vesting accounts) from running totals). A proposal passes on tokens if it reached quorum and its
 //! conviction-weighted ayes beat the nays: by a simple majority, or by `supermajority_bps` of the
-//! weight for upgrades, feature activations, issuance parameters and treasury spends above
+//! weight for upgrades (and cancelling them), feature activations, issuance parameters and treasury spends above
 //! `treasury_large_bps` of the treasury. Until `bootstrap_end_height` it also passes if ⅔ of the active set approve
 //! (a validator's council vote is any `Vote` its consensus key or owner signs) and the
 //! token-weighted nays don't exceed the ayes.
@@ -38,7 +39,7 @@
 //! | `Clawback` | `State::exec_clawback` |
 //! | `UnlinkGithub` | `State::exec_unlink_github` |
 //! | `RefundHunt` | `State::exec_refund_hunt` |
-//! | `ScheduleUpgrade`, `ActivateFeature`, `DeactivateFeature` | `upgrade::exec_schedule_upgrade`, `exec_activate_feature`, `exec_deactivate_feature` |
+//! | `ScheduleUpgrade`, `CancelUpgrade`, `ActivateFeature`, `DeactivateFeature` | `upgrade::exec_schedule_upgrade`, `exec_cancel_upgrade`, `exec_activate_feature`, `exec_deactivate_feature` |
 //! | `Text` | nothing |
 //!
 //! **Distributions** move `total` from the community account into an escrow claimable until
@@ -148,7 +149,8 @@ pub struct Proposal {
     pub created_at: u64,
     /// Last block votes count in.
     pub voting_end: u64,
-    /// When a passed proposal runs (`voting_end + timelock_blocks`).
+    /// When a passed proposal runs (`voting_end + timelock_blocks`; a `CancelUpgrade`,
+    /// `voting_end + 1`).
     pub execute_at: Option<u64>,
     pub status: ProposalStatus,
     /// Raw FANG behind the ayes and nays (quorum counts these) …
@@ -509,8 +511,35 @@ fn prepare_kind(state: &State, kind: &ProposalKind, height: u64) -> Result<Propo
             Some(h) => bail!("hunt #{hunt_id} is already {:?}", h.status),
             None => bail!("no hunt #{hunt_id}"),
         },
-        // What it could run into at the earliest block it runs in (audit F46); checked again then.
-        ProposalKind::ScheduleUpgrade { version, activation_height } => crate::upgrade::check_schedule_upgrade(state, *version, *activation_height, runs_at).map_err(|e| anyhow!("{e} (the vote and the timelock end at block {runs_at})"))?,
+        ProposalKind::ScheduleUpgrade { version, activation_height } => {
+            // What it could run into at the earliest block it runs in (audit F46); checked again then.
+            crate::upgrade::check_schedule_upgrade(state, *version, *activation_height, runs_at).map_err(|e| anyhow!("{e} (the vote and the timelock end at block {runs_at})"))?;
+            // Late enough that a `CancelUpgrade` proposed the block after this one runs still
+            // lands (its vote, no timelock) `MIN_UPGRADE_LEAD` blocks before it (audit F50).
+            let lead = crate::upgrade::MIN_UPGRADE_LEAD;
+            let earliest = runs_at.saturating_add(cp.voting_blocks).saturating_add(lead).saturating_add(2);
+            if *activation_height < earliest {
+                bail!("activation_height must leave room for the vote and the timelock (it would run at block {runs_at}), then for a CancelUpgrade's vote and {lead} blocks: block {earliest} or later");
+            }
+        }
+        ProposalKind::CancelUpgrade { version, activation_height } => {
+            // Only an upgrade that's scheduled, and only if the cancellation runs (the block after
+            // its vote closes: there's no timelock) at least `MIN_UPGRADE_LEAD` blocks before it.
+            if let Err(e) = crate::upgrade::scheduled(state, *version, *activation_height) {
+                let open = state.governance.open_proposals.iter().filter_map(|id| state.governance.proposals.get(id));
+                let pending = open.filter(|p| p.kind == (ProposalKind::ScheduleUpgrade { version: *version, activation_height: *activation_height })).map(|p| (p.id, p.execute_at)).next();
+                match pending {
+                    Some((id, Some(at))) => bail!("v{version} at block {activation_height} isn't scheduled yet: proposal #{id} schedules it at block {at}; propose the cancellation after that"),
+                    Some((id, None)) => bail!("v{version} at block {activation_height} isn't scheduled: proposal #{id}, which would schedule it, is still being voted on (vote nay on it)"),
+                    None => return Err(e),
+                }
+            }
+            let lead = crate::upgrade::MIN_UPGRADE_LEAD;
+            let lands_at = height.saturating_add(cp.voting_blocks).saturating_add(1);
+            if lands_at.saturating_add(lead) > *activation_height {
+                bail!("v{version} activates at block {activation_height}: a cancellation proposed now would run at block {lands_at}, less than {lead} blocks before it. Stop it operationally instead (OPERATIONS.md \"Upgrades\")");
+            }
+        }
         ProposalKind::ActivateFeature { feature } | ProposalKind::DeactivateFeature { feature } => {
             if !crate::upgrade::KNOWN_FEATURES.contains(&feature.as_str()) {
                 bail!("unknown feature {feature} (known: {})", crate::upgrade::KNOWN_FEATURES.join(", "));
@@ -639,13 +668,14 @@ pub fn unlocked_supply_by_walk(state: &State, height: u64) -> u128 {
     liquid + staked + unbonding - system_staked - system_unbonding - vesting
 }
 
-/// Whether a kind needs `supermajority_bps` of the weight: upgrades, feature activations
+/// Whether a kind needs `supermajority_bps` of the weight: upgrades and their cancellations (a
+/// simple majority can't undo what a supermajority scheduled), feature activations
 /// (security-critical switches such as Ghost Mode), issuance parameters, governance's own safety
 /// parameters (`params::GOVERNANCE_KEYS`), and treasury spends above `treasury_large_bps` of the
 /// treasury's balance. Turning a feature off takes a simple majority.
 pub fn needs_supermajority(state: &State, kind: &ProposalKind) -> bool {
     match kind {
-        ProposalKind::ScheduleUpgrade { .. } | ProposalKind::ActivateFeature { .. } => true,
+        ProposalKind::ScheduleUpgrade { .. } | ProposalKind::CancelUpgrade { .. } | ProposalKind::ActivateFeature { .. } => true,
         ProposalKind::ParamChange { key, .. } => key.starts_with("issuance_") || crate::params::GOVERNANCE_KEYS.contains(&key.as_str()),
         ProposalKind::TreasurySpend { amount, .. } => {
             let treasury = state.account(&state.treasury()).balance as u128;
@@ -703,8 +733,9 @@ fn close_vote(state: &mut State, id: u64, height: u64, unlocked: u128) {
         state.j_burn(&mut j, p.deposit);
     }
     let passed = by_tokens || by_council;
+    let runs_at = p.voting_end.saturating_add(timelock(&cp, &p.kind)).max(height + 1);
     let outcome = if passed {
-        let at = p.voting_end.saturating_add(cp.timelock_blocks).max(height + 1);
+        let at = runs_at;
         let how = if by_tokens { "by token vote" } else { "by the bootstrap council" };
         format!("passed {how}; runs at block {at}")
     } else if !quorum_reached && !council_quorum {
@@ -731,10 +762,20 @@ fn close_vote(state: &mut State, id: u64, height: u64, unlocked: u128) {
     p.outcome = outcome;
     if passed {
         p.status = ProposalStatus::Queued;
-        p.execute_at = Some(p.voting_end.saturating_add(cp.timelock_blocks).max(height + 1));
+        p.execute_at = Some(runs_at);
     } else {
         p.status = ProposalStatus::Rejected;
         state.governance.open_proposals.remove(&id);
+    }
+}
+
+/// Blocks a passed proposal waits before it runs: `timelock_blocks`, so whoever disagrees can act
+/// before it takes effect, except for a `CancelUpgrade`, which keeps the rules in force and has
+/// to land before the upgrade it stops.
+fn timelock(cp: &crate::params::ChainParams, kind: &ProposalKind) -> u64 {
+    match kind {
+        ProposalKind::CancelUpgrade { .. } => 0,
+        _ => cp.timelock_blocks,
     }
 }
 
@@ -846,6 +887,15 @@ fn run_kind(state: &mut State, j: &mut Journal, p: &Proposal, height: u64) -> Re
         ProposalKind::DeactivateFeature { feature } => {
             crate::upgrade::exec_deactivate_feature(state, j, feature)?;
             format!("{feature} is off")
+        }
+        ProposalKind::CancelUpgrade { version, activation_height } => {
+            let withdrawn = crate::upgrade::exec_cancel_upgrade(state, j, *version, *activation_height, height)?;
+            let after: Vec<String> = withdrawn[1..].iter().map(|u| format!("v{} at block {}", u.version, u.activation_height)).collect();
+            if after.is_empty() {
+                format!("cancelled the upgrade to protocol v{version} at block {activation_height}")
+            } else {
+                format!("cancelled the upgrade to protocol v{version} at block {activation_height}, and {} scheduled after it", after.join(", "))
+            }
         }
         ProposalKind::Text {} => "recorded (no on-chain effect)".into(),
     })
@@ -1317,6 +1367,11 @@ pub fn describe_kind(state: &State, kind: &ProposalKind, primary_name: &dyn Fn(&
         ProposalKind::ScheduleUpgrade { version, activation_height } => format!("upgrade to protocol v{version} at block {activation_height}"),
         ProposalKind::ActivateFeature { feature } => format!("turn on {feature}"),
         ProposalKind::DeactivateFeature { feature } => format!("turn off {feature}"),
+        ProposalKind::CancelUpgrade { version, activation_height } => {
+            let after: Vec<String> = state.upgrade.schedule.iter().filter(|u| u.activation_height > *activation_height).map(|u| format!("v{} at block {}", u.version, u.activation_height)).collect();
+            let and = if after.is_empty() { String::new() } else { format!(", and {} scheduled after it", after.join(", ")) };
+            format!("cancel the upgrade to protocol v{version} at block {activation_height}{and}")
+        }
         ProposalKind::Text {} => "a text proposal (no on-chain effect)".into(),
     }
 }

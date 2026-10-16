@@ -140,7 +140,9 @@ export type ProposalKind =
   /** No on-chain effect: a signal. */
   | { type: "text" }
   /** Lift a sybil flag (`flag_sybil`'s appeal path): the account can earn again; nothing the flag took comes back. */
-  | { type: "unflag_sybil"; account: string; reason: string };
+  | { type: "unflag_sybil"; account: string; reason: string }
+  /** Withdraw the upgrade to `version` scheduled at `activation_height` (and any after it) before it activates (a supermajority, no timelock). Tag 15. */
+  | { type: "cancel_upgrade"; version: number; activation_height: number };
 
 export interface UnsignedTx {
   chain_id: string;
@@ -511,6 +513,9 @@ function encodeProposalKind(w: Writer, k: ProposalKind) {
       break;
     case "unflag_sybil":
       w.u8(14); w.str(k.account); w.str(k.reason);
+      break;
+    case "cancel_upgrade":
+      w.u8(15); w.u32(k.version); w.u64(BigInt(k.activation_height));
       break;
     default:
       throw new Error(`unknown proposal kind ${(k as { type: string }).type}`);

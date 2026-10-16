@@ -1,13 +1,14 @@
 //! Upgrades, halts and feature flags (P-UPGRADE, MAINNET-DESIGN 3.9, DEC-2): the protocol-version
-//! schedule that `ScheduleUpgrade` proposals change, the feature flags `ActivateFeature` and
-//! `DeactivateFeature` flip (Ghost Mode ships off), and the node-local side of upgrades: what
-//! this binary supports, the operator's `--halt-height`, and why a node stopped.
+//! schedule that `ScheduleUpgrade` proposals extend and `CancelUpgrade` proposals cut back, the
+//! feature flags `ActivateFeature` and `DeactivateFeature` flip (Ghost Mode ships off), and the
+//! node-local side of upgrades: what this binary supports, the operator's `--halt-height`, and
+//! why a node stopped.
 //!
 //! How a node follows the schedule:
 //! * Every block carries the version in force at its height ([`version_at`]); verifiers reject
 //!   any other (`consensus.rs`). An upgrade activates at least [`MIN_UPGRADE_LEAD`] blocks after
-//!   the block that schedules it, so a node within that many blocks of a height knows its version
-//!   for certain.
+//!   the block that schedules it, and can only be cancelled until that many blocks before it, so
+//!   a node within that many blocks of a height knows its version for certain.
 //! * Blocks also carry `signal`, the newest version the proposer's binary supports, so readiness
 //!   is visible on chain (`/api/upgrade`).
 //! * A node never executes a height whose version its binary doesn't support: it stops after the
@@ -130,8 +131,8 @@ pub fn is_active(state: &State, feature: &str) -> bool {
     state.upgrade.features.contains_key(feature)
 }
 
-// ---- levers (`ProposalKind::ScheduleUpgrade`, `ActivateFeature`, `DeactivateFeature`): no
-// signer checks, governance (P-GOV) calls them when a proposal executes.
+// ---- levers (`ProposalKind::ScheduleUpgrade`, `CancelUpgrade`, `ActivateFeature`,
+// `DeactivateFeature`): no signer checks, governance (P-GOV) calls them when a proposal executes.
 
 /// Whether protocol `version` could be scheduled from `activation_height` on by a lever that runs
 /// at `height`: at least [`MIN_UPGRADE_LEAD`] blocks later, after every scheduled upgrade, and a
@@ -158,6 +159,35 @@ pub(crate) fn exec_schedule_upgrade(state: &mut State, j: &mut Journal, version:
     }
     state.upgrade.schedule.push(ScheduledUpgrade { version, activation_height });
     Ok(())
+}
+
+/// Withdraws the upgrade to `version` scheduled at `activation_height`
+/// (`ProposalKind::CancelUpgrade`, audit F50), and every upgrade scheduled after it, which was
+/// scheduled to follow it. Only while it is still at least [`MIN_UPGRADE_LEAD`] blocks away, as
+/// scheduling one is: a verifier within that many blocks of a height still knows its version
+/// for certain, and nothing that already activated (or is about to) is ever rewritten. Returns
+/// what it withdrew. The schedule stays strictly increasing (a prefix of it is kept), and the
+/// versions can be scheduled again.
+pub(crate) fn exec_cancel_upgrade(state: &mut State, j: &mut Journal, version: u32, activation_height: u64, height: u64) -> Result<Vec<ScheduledUpgrade>> {
+    let i = scheduled(state, version, activation_height)?;
+    if height.checked_add(MIN_UPGRADE_LEAD).is_none_or(|earliest| activation_height < earliest) {
+        bail!("v{version} activates at block {activation_height}, less than {MIN_UPGRADE_LEAD} blocks after block {height}: too late to cancel on chain");
+    }
+    if j.upgrade.schedule.is_none() {
+        j.upgrade.schedule = Some(state.upgrade.schedule.clone());
+    }
+    Ok(state.upgrade.schedule.split_off(i))
+}
+
+/// Where the upgrade to `version` at `activation_height` is in the schedule.
+pub(crate) fn scheduled(state: &State, version: u32, activation_height: u64) -> Result<usize> {
+    if let Some(i) = state.upgrade.schedule.iter().position(|u| u.version == version && u.activation_height == activation_height) {
+        return Ok(i);
+    }
+    match state.upgrade.schedule.iter().find(|u| u.version == version) {
+        Some(u) => bail!("v{version} is scheduled at block {}, not {activation_height}", u.activation_height),
+        None => bail!("no upgrade to v{version} at block {activation_height} is scheduled"),
+    }
 }
 
 /// Switches a known feature on.
@@ -396,6 +426,40 @@ mod tests {
         assert_eq!(next_after(&st, 163).map(|u| u.version), Some(2));
         assert!(next_after(&st, 164).is_none());
         check_invariants(&st).unwrap();
+    }
+
+    /// F50: a `CancelUpgrade` withdraws exactly the entry it names, and whatever was scheduled to
+    /// follow it, only while it's at least `MIN_UPGRADE_LEAD` blocks away: never one that already
+    /// activated, never one inside the window a verifier relies on.
+    #[test]
+    fn cancelling_withdraws_an_upgrade_and_those_after_it() {
+        let mut st = State::default();
+        let mut j = Journal::default();
+        exec_schedule_upgrade(&mut st, &mut j, 2, 200, 100).unwrap();
+        exec_schedule_upgrade(&mut st, &mut j, 3, 400, 100).unwrap();
+        exec_schedule_upgrade(&mut st, &mut j, 4, 600, 100).unwrap();
+        let before = st.upgrade.schedule.clone();
+        // Only the exact entry, only at least the lead before it, and nothing past it.
+        assert!(exec_cancel_upgrade(&mut st, &mut j, 3, 401, 100).unwrap_err().to_string().contains("scheduled at block 400, not 401"));
+        assert!(exec_cancel_upgrade(&mut st, &mut j, 5, 700, 100).unwrap_err().to_string().contains("no upgrade to v5"));
+        assert!(exec_cancel_upgrade(&mut st, &mut j, 2, 200, 200 - MIN_UPGRADE_LEAD + 1).unwrap_err().to_string().contains("too late"));
+        assert!(exec_cancel_upgrade(&mut st, &mut j, 2, 200, 250).unwrap_err().to_string().contains("too late"), "it already activated");
+        assert!(exec_cancel_upgrade(&mut st, &mut j, 4, 600, u64::MAX).is_err(), "the lead can't wrap");
+        assert_eq!(st.upgrade.schedule, before, "refusals change nothing");
+        // v3 goes, and v4, which was scheduled to follow it; v2 (already in force) stays.
+        let withdrawn = exec_cancel_upgrade(&mut st, &mut j, 3, 400, 400 - MIN_UPGRADE_LEAD).unwrap();
+        assert_eq!(withdrawn, before[1..]);
+        assert_eq!(st.upgrade.schedule, before[..1]);
+        assert_eq!((version_at(&st, 399), version_at(&st, 400), version_at(&st, 600)), (2, 2, 2));
+        check_invariants(&st).unwrap();
+        // Nothing left to re-cancel, and the versions can be scheduled again.
+        assert!(exec_cancel_upgrade(&mut st, &mut j, 3, 400, 300).unwrap_err().to_string().contains("no upgrade to v3"));
+        exec_schedule_upgrade(&mut st, &mut j, 3, 500, 400).unwrap();
+        assert_eq!(version_at(&st, 500), 3);
+        check_invariants(&st).unwrap();
+        // The journal restores the schedule as it was before the first change.
+        j.upgrade.rollback(&mut st.upgrade);
+        assert!(st.upgrade.schedule.is_empty());
     }
 
     #[test]

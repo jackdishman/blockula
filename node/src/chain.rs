@@ -5201,6 +5201,19 @@ mod scaffold {
         assert!(crate::upgrade::exec_schedule_upgrade(s, &mut j, 10, 80, h).unwrap_err().to_string().contains("must come after it"), "only after the last one");
         assert_eq!(crate::upgrade::version_at(s, 100), 9);
         s.check_invariants().unwrap();
+        // Cancelling (F50): only what's scheduled, only `MIN_UPGRADE_LEAD` blocks ahead of it,
+        // and the version can be scheduled again.
+        let lead = crate::upgrade::MIN_UPGRADE_LEAD;
+        assert!(crate::upgrade::exec_cancel_upgrade(s, &mut j, 8, 100, h).unwrap_err().to_string().contains("no upgrade to v8"));
+        assert!(crate::upgrade::exec_cancel_upgrade(s, &mut j, 9, 101, h).unwrap_err().to_string().contains("scheduled at block 100, not 101"));
+        assert!(crate::upgrade::exec_cancel_upgrade(s, &mut j, 9, 100, 100 - lead + 1).unwrap_err().to_string().contains("too late"));
+        assert_eq!(crate::upgrade::version_at(s, 100), 9, "a refused cancellation changes nothing");
+        let withdrawn = crate::upgrade::exec_cancel_upgrade(s, &mut j, 9, 100, 100 - lead).unwrap();
+        assert_eq!(withdrawn, [crate::upgrade::ScheduledUpgrade { version: 9, activation_height: 100 }]);
+        assert_eq!((crate::upgrade::version_at(s, 100), s.upgrade.schedule.len()), (crate::consensus::PROTOCOL_VERSION, 0));
+        s.check_invariants().unwrap();
+        crate::upgrade::exec_schedule_upgrade(s, &mut j, 9, 100, h).unwrap();
+        assert_eq!(crate::upgrade::version_at(s, 100), 9);
         // Everything rolls back, dirty marks included.
         s.rollback(j);
         assert_eq!((s.full_root(), s.supply, s.burned, &s.chain_params), (root, supply, burned, &params));

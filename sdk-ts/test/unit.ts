@@ -149,6 +149,9 @@ assert.throws(() => proposal.setRepo("not a repo", 1), /owner\/name/);
 assert.throws(() => proposal.paramChange("Bad Key", 1), /parameter keys/);
 assert.throws(() => proposal.grantSoul(BOB, "1.2345", "r"), /Soul/);
 assert.throws(() => proposal.scheduleUpgrade(0, 10), /version/);
+assert.throws(() => proposal.cancelUpgrade(0, 100), /version/);
+assert.throws(() => proposal.cancelUpgrade(2, 0), /activationHeight/);
+assert.throws(() => proposal.cancelUpgrade(2, -1), /activationHeight/);
 assert.deepEqual(proposal.grantSoul("bob.boo", "2.5", "r"), { type: "grant_soul", to: "bob.boo", amount: 2500, reason: "r" });
 console.log(`✓ ${refused.length} bad calls refused before signing`);
 
@@ -174,6 +177,13 @@ console.log(`✓ ${refused.length} bad calls refused before signing`);
   delete fees.lowest;
   console.log("✓ tips above tip_cap_multiple × the lowest upcoming base fee are refused before signing");
 }
+
+// `CancelUpgrade` (proposal kind 15, audit F50): the same signing bytes as node/src/types.rs
+// `encodings_match_the_sdk` (and e2e.ts).
+const cancelVector: Tx = { chain_id: "vec", genesis_hash: "03".repeat(32), from: "boo1from", nonce: 7, fee: "12345", tip: "3", valid_until: 99, action: { type: "propose", kind: proposal.cancelUpgrade(2, 100_000), deposit: (1000n * 1_000_000_000n).toString(), title: "t" }, memo: "m", public_key: "01".repeat(1952), signature: "02".repeat(3309) };
+assert.deepEqual(proposal.cancelUpgrade(2, 100_000), { type: "cancel_upgrade", version: 2, activation_height: 100_000 });
+assert.equal(bytesToHex(blake3(signingBytes(cancelVector))), "199d2455419f738528317187cdbfa72e5430308b096c2c8741f5801290d3d156");
+console.log("✓ cancel_upgrade encodes as the node does");
 
 // ---- chain pinning: every status (and so every signature) is checked ----
 

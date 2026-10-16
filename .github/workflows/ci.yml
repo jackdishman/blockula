@@ -143,3 +143,5 @@ jobs:
       - run: npm ci
       - name: Release signature tool (known-answer vector, tamper checks)
         run: node scripts/release-sig.mjs selftest
+      - name: install.sh verification policy (offline fake release)
+        run: bash scripts/test-install.sh

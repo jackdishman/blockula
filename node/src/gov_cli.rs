@@ -34,12 +34,14 @@ async fn acting_for(s: &Signer, keys: &Keys) -> Result<String> {
     }
 }
 
-/// Signs and submits `action`, waits for it, and prints the summary and explorer link.
+/// Signs and submits `action` for the chain `s` pins, waits for it, and prints the summary and
+/// explorer link.
 fn submit(dir: &Path, s: &Signer, action: Action) -> Result<Value> {
     let keys = keys_of(s, dir)?;
     let tx = rt()?.block_on(async {
-        let from = acting_for(s, &keys).await?;
-        send_memo(&s.rpc, &keys, &from, action, String::new()).await
+        let remote = s.connect(dir).await?;
+        let from = s.acting_for(&remote, &keys).await?;
+        send_memo(&remote, &keys, &from, action, String::new()).await
     })?;
     println!("✓ {}", tx["summary"].as_str().unwrap_or_default());
     println!("  {}/#/tx/{}", s.rpc.trim_end_matches('/'), tx["id"].as_str().unwrap_or_default());
@@ -235,6 +237,17 @@ pub enum KindCmd {
         #[command(flatten)]
         meta: Meta,
     },
+    /// Withdraw a scheduled protocol upgrade (and any scheduled after it) before it activates.
+    /// Needs the supermajority and runs right after its vote (no timelock), at least 64 blocks
+    /// before the activation height
+    CancelUpgrade {
+        version: u32,
+        /// The activation height it's scheduled at (default: looked up in /api/upgrade)
+        #[arg(long)]
+        at: Option<u64>,
+        #[command(flatten)]
+        meta: Meta,
+    },
     /// Switch a feature on (e.g. ghost)
     Activate {
         feature: String,
@@ -247,6 +260,12 @@ pub enum KindCmd {
         #[command(flatten)]
         meta: Meta,
     },
+}
+
+/// The activation height of the upgrade to `version` in `/api/upgrade`'s schedule.
+fn scheduled_at(upgrade: &Value, version: u32) -> Result<u64> {
+    let schedule = upgrade["schedule"].as_array().into_iter().flatten();
+    schedule.filter(|u| u["version"].as_u64() == Some(version as u64)).find_map(|u| u["activation_height"].as_u64()).ok_or_else(|| anyhow!("no upgrade to v{version} is scheduled (see /api/upgrade)"))
 }
 
 fn parse_soul(s: &str) -> Result<u64> {
@@ -397,6 +416,13 @@ fn propose(dir: &Path, kind: KindCmd) -> Result<()> {
         KindCmd::UnlinkGithub { handle, meta } => (ProposalKind::UnlinkGithub { handle }, meta),
         KindCmd::RefundHunt { hunt, meta } => (ProposalKind::RefundHunt { hunt_id: hunt }, meta),
         KindCmd::Upgrade { version, activation_height, meta } => (ProposalKind::ScheduleUpgrade { version, activation_height }, meta),
+        KindCmd::CancelUpgrade { version, at, meta } => {
+            let activation_height = match at {
+                Some(h) => h,
+                None => scheduled_at(&rt.block_on(get(&meta.signer.rpc, "/upgrade"))?, version)?,
+            };
+            (ProposalKind::CancelUpgrade { version, activation_height }, meta)
+        }
         KindCmd::Activate { feature, meta } => (ProposalKind::ActivateFeature { feature }, meta),
         KindCmd::Deactivate { feature, meta } => (ProposalKind::DeactivateFeature { feature }, meta),
     };
@@ -498,6 +524,11 @@ mod tests {
         assert!(matches!(gov("vote 3 aye 1.5 --conviction 6").unwrap(), GovCmd::Vote { id: 3, conviction: 6, .. }));
         assert!(matches!(gov("propose spend alice.boo 10 --title t --deposit 50").unwrap(), GovCmd::Propose { kind: KindCmd::Spend { .. } }));
         assert!(gov("propose text").is_err(), "a title is required");
+        assert!(matches!(gov("propose cancel-upgrade 2 --at 90000 --title t").unwrap(), GovCmd::Propose { kind: KindCmd::CancelUpgrade { version: 2, at: Some(90_000), .. } }));
+        assert!(matches!(gov("propose cancel-upgrade 2 --title t").unwrap(), GovCmd::Propose { kind: KindCmd::CancelUpgrade { version: 2, at: None, .. } }));
+        let upgrade = json!({ "schedule": [{ "version": 2, "activation_height": 500, "active": true }, { "version": 3, "activation_height": 9_000, "active": false }] });
+        assert_eq!(scheduled_at(&upgrade, 3).unwrap(), 9_000);
+        assert!(scheduled_at(&upgrade, 4).unwrap_err().to_string().contains("no upgrade to v4"));
         let ms = Ms::try_parse_from(["multisig", "create", "--owners", "aa,bb", "--threshold", "2"]).unwrap();
         assert!(matches!(ms.cmd, MultisigCmd::Create { owners, threshold: 2, .. } if owners == ["aa", "bb"]));
         assert_eq!((parse_soul("2.5").unwrap(), parse_soul("10").unwrap()), (2_500, 10_000));

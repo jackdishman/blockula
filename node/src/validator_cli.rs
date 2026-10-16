@@ -3,6 +3,7 @@
 //! for admins) pin or remove validators. Talks to any node's HTTP API.
 
 use crate::chain::Genesis;
+use crate::cli_net::{ChainPin, Remote};
 use crate::crypto::Keys;
 use crate::node::NodeAddrs;
 use crate::types::*;
@@ -59,6 +60,8 @@ pub enum ValidatorCmd {
         rpc: String,
         #[arg(long)]
         from: Option<String>,
+        #[command(flatten)]
+        pin: ChainPin,
     },
     /// Dev and test chain admins: pin a validator (ranked ahead of stake from the next epoch)
     Approve(AdminArgs),
@@ -93,6 +96,8 @@ pub struct AdminArgs {
     /// Account to act for, if the key is an added key on another account (default: the key's own address)
     #[arg(long)]
     pub from: Option<String>,
+    #[command(flatten)]
+    pub pin: ChainPin,
 }
 
 pub fn parse_fang(s: &str) -> Result<u64> {
@@ -149,12 +154,14 @@ pub(crate) async fn own_address(rpc: &str, keys: &Keys) -> Result<String> {
 }
 
 /// Builds, signs, submits and waits for a tx; returns the finalized tx JSON.
-async fn send(rpc: &str, keys: &Keys, from: &str, action: Action) -> Result<Value> {
-    send_memo(rpc, keys, from, action, String::new()).await
+async fn send(remote: &Remote, keys: &Keys, from: &str, action: Action) -> Result<Value> {
+    send_memo(remote, keys, from, action, String::new()).await
 }
 
-pub(crate) async fn send_memo(rpc: &str, keys: &Keys, from: &str, action: Action, memo: String) -> Result<Value> {
-    let status = get(rpc, "/status").await?;
+/// Signs for the chain `remote` was pinned to (`cli_net`), from a status checked against it.
+pub(crate) async fn send_memo(remote: &Remote, keys: &Keys, from: &str, action: Action, memo: String) -> Result<Value> {
+    let rpc = remote.rpc.as_str();
+    let status = remote.status().await?;
     let nonce = match get(rpc, &format!("/account/{from}")).await {
         Ok(a) => a["next_nonce"].as_u64().unwrap_or(0),
         Err(_) => 0,
@@ -162,8 +169,7 @@ pub(crate) async fn send_memo(rpc: &str, keys: &Keys, from: &str, action: Action
     // Valid for 600 blocks (or the chain's maximum, if shorter).
     let validity = status["max_tx_validity_blocks"].as_u64().unwrap_or(600).min(600);
     let valid_until = status["height"].as_u64().unwrap_or(0) + validity;
-    let genesis_hash = status["genesis_hash"].as_str().ok_or_else(|| anyhow!("{rpc} didn't report its genesis_hash"))?;
-    let mut tx = Tx { chain_id: status["chain_id"].as_str().unwrap_or_default().into(), genesis_hash: genesis_hash.into(), from: from.into(), nonce, fee: 0, tip: 0, valid_until, action, memo, public_key: hex::encode(keys.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+    let mut tx = Tx { chain_id: remote.chain_id.clone(), genesis_hash: remote.genesis_hash.clone(), from: from.into(), nonce, fee: 0, tip: 0, valid_until, action, memo, public_key: hex::encode(keys.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
     // The highest base fee fixed for the next blocks (`/api/fees`); only the actual one is charged.
     let fees = get(rpc, "/fees").await?;
     let part = |k: &str| fees["suggested"][k].as_str().and_then(|v| v.parse().ok()).ok_or_else(|| anyhow!("{rpc}/api/fees has no suggested {k}"));
@@ -243,21 +249,25 @@ pub fn run(cmd: ValidatorCmd) -> Result<()> {
             let seed: [u8; 32] = hex::decode(std::fs::read_to_string(home.join("validator.key"))?.trim())?.try_into().map_err(|_| anyhow!("bad validator.key"))?;
             let pop = crate::chain::make_pop(seed, &g.chain_id, &me, &addrs.p2p_addr, &addrs.http_addr);
             let action = Action::RegisterValidator { consensus_key: hex::encode(keys.public_key()), p2p_addr: addrs.p2p_addr, http_addr: addrs.http_addr, bond, pop };
-            let tx = rt.block_on(send(&rpc, &keys, &me, action))?;
+            // The node must be on the home's chain: its genesis pins it.
+            let pin = ChainPin { network: None, chain_id: Some(g.chain_id.clone()), genesis_hash: Some(crate::checkpoints::genesis_hash(&g)) };
+            let tx = rt.block_on(async { send(&Remote::connect_in(&crate::cli_net::blockula_dir(), &rpc, &pin).await?, &keys, &me, action).await })?;
             println!("✓ {}", tx["summary"].as_str().unwrap_or_default());
             println!("  It joins the active set at an epoch boundary if its stake ranks in the top max_validators (newcomers are at most a third of a set).");
             println!("  Others can back it: blockula stake delegate {me} <FANG> --key <key file> --rpc {rpc}");
             Ok(())
         }
         ValidatorCmd::Unjail(a) => admin(a, |v| Action::Unjail { validator: v }),
-        ValidatorCmd::Commission { bps, key, rpc, from } => {
+        ValidatorCmd::Commission { bps, key, rpc, from, pin } => {
             let keys = load_seed(&key)?;
-            let rt = rt()?;
-            let from = match from {
-                Some(f) => f,
-                None => rt.block_on(own_address(&rpc, &keys))?,
-            };
-            let tx = rt.block_on(send(&rpc, &keys, &from, Action::UpdateValidator { commission_bps: bps, p2p_addr: String::new(), http_addr: String::new() }))?;
+            let tx = rt()?.block_on(async {
+                let remote = Remote::connect(&crate::cli_net::blockula_dir(), &rpc, &pin).await?;
+                let from = match from {
+                    Some(f) => remote.resolve(&f).await?,
+                    None => remote.address(&keys),
+                };
+                send(&remote, &keys, &from, Action::UpdateValidator { commission_bps: bps, p2p_addr: String::new(), http_addr: String::new() }).await
+            })?;
             println!("✓ {}", tx["summary"].as_str().unwrap_or_default());
             Ok(())
         }
@@ -296,12 +306,14 @@ pub fn run(cmd: ValidatorCmd) -> Result<()> {
 
 fn admin(a: AdminArgs, action: impl FnOnce(String) -> Action) -> Result<()> {
     let keys = load_seed(&a.key)?;
-    let rt = rt()?;
-    let from = match a.from {
-        Some(f) => f,
-        None => rt.block_on(own_address(&a.rpc, &keys))?,
-    };
-    let tx = rt.block_on(send(&a.rpc, &keys, &from, action(a.validator)))?;
+    let tx = rt()?.block_on(async {
+        let remote = Remote::connect(&crate::cli_net::blockula_dir(), &a.rpc, &a.pin).await?;
+        let from = match a.from {
+            Some(f) => remote.resolve(&f).await?,
+            None => remote.address(&keys),
+        };
+        send(&remote, &keys, &from, action(a.validator)).await
+    })?;
     println!("✓ {}", tx["summary"].as_str().unwrap_or_default());
     Ok(())
 }
@@ -338,12 +350,16 @@ pub enum WalletCmd {
         memo: String,
         #[arg(long, default_value = "http://localhost:7070")]
         rpc: String,
+        #[command(flatten)]
+        pin: ChainPin,
     },
     /// Claim a .boo name
     Name {
         name: String,
         #[arg(long, default_value = "http://localhost:7070")]
         rpc: String,
+        #[command(flatten)]
+        pin: ChainPin,
     },
     /// Testnets: get 100 FANG from the faucet
     Faucet {
@@ -391,22 +407,24 @@ pub fn wallet(cmd: WalletCmd, dir: &Path) -> Result<()> {
             println!("{me}  {}", a["balance_display"].as_str().unwrap_or("0 FANG"));
             Ok(())
         }
-        WalletCmd::Send { to, amount, memo, rpc } => {
+        WalletCmd::Send { to, amount, memo, rpc, pin } => {
             let keys = wallet_keys(dir)?;
             let amount = parse_fang(&amount)?;
-            let rt = rt()?;
-            // Resolve names locally so we sign the exact recipient address.
-            let to = if crate::crypto::is_address(&to) { to } else { rt.block_on(get(&rpc, &format!("/account/{to}")))?["account"]["address"].as_str().ok_or_else(|| anyhow!("can't resolve {to}"))?.to_string() };
-            let me = rt.block_on(own_address(&rpc, &keys))?;
-            let tx = rt.block_on(send_memo(&rpc, &keys, &me, Action::Transfer { to, amount }, memo))?;
+            let tx = rt()?.block_on(async {
+                let remote = Remote::connect(dir, &rpc, &pin).await?;
+                // Resolve names here so we sign the exact recipient address (and show it).
+                let to = remote.resolve(&to).await?;
+                send_memo(&remote, &keys, &remote.address(&keys), Action::Transfer { to, amount }, memo).await
+            })?;
             println!("✓ {}", tx["summary"].as_str().unwrap_or_default());
             Ok(())
         }
-        WalletCmd::Name { name, rpc } => {
+        WalletCmd::Name { name, rpc, pin } => {
             let keys = wallet_keys(dir)?;
-            let rt = rt()?;
-            let me = rt.block_on(own_address(&rpc, &keys))?;
-            let tx = rt.block_on(send(&rpc, &keys, &me, Action::RegisterName { name }))?;
+            let tx = rt()?.block_on(async {
+                let remote = Remote::connect(dir, &rpc, &pin).await?;
+                send(&remote, &keys, &remote.address(&keys), Action::RegisterName { name }).await
+            })?;
             println!("✓ {}", tx["summary"].as_str().unwrap_or_default());
             Ok(())
         }

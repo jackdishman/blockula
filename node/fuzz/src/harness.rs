@@ -704,11 +704,18 @@ impl Sm {
                         ProposalKind::ParamChange { key: "max_validators".into(), value: 2 + amt % 10 },
                         ProposalKind::TreasurySpend { to: other.clone(), amount: fang(1) },
                         ProposalKind::SetRepo { repo: "jackdishman/blockula".into(), weight: 1 + amt % 3 },
-                        ProposalKind::GrantSoul { to: other, amount: crate::poc::SOUL, reason: "fuzz".into() },
+                        ProposalKind::GrantSoul { to: other.clone(), amount: crate::poc::SOUL, reason: "fuzz".into() },
                         ProposalKind::RefundHunt { hunt_id: hunt },
                         ProposalKind::ScheduleUpgrade { version: 2, activation_height: h + 1_000 },
                         ProposalKind::ActivateFeature { feature: "ghost".into() },
                         ProposalKind::Text {},
+                        // What's scheduled, if anything (else refused when proposed).
+                        match self.state.upgrade.schedule.last() {
+                            Some(u) => ProposalKind::CancelUpgrade { version: u.version, activation_height: u.activation_height },
+                            None => ProposalKind::CancelUpgrade { version: 2, activation_height: h + 1_000 },
+                        },
+                        // Refused unless the account is flagged (the appeal path, tag 14).
+                        ProposalKind::UnflagSybil { account: other, reason: "fuzz".into() },
                     ];
                     let kind = kinds[b as usize % kinds.len()].clone();
                     Action::Propose { kind, deposit: fang(1_000 + amt), title: "fuzz".into(), url: String::new() }

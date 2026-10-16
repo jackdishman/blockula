@@ -307,6 +307,11 @@ pub enum ProposalKind {
     /// Lift a sybil flag: `FlagSybil`'s appeal path. The account can vouch, be vouched for,
     /// claim, earn Soul and join juries again; nothing the flag took comes back.
     UnflagSybil { account: String, reason: String },
+    /// Withdraw the scheduled upgrade to protocol `version` at `activation_height` (and any
+    /// scheduled after it) before it activates: it must run at least `upgrade::MIN_UPGRADE_LEAD`
+    /// blocks before that height. A supermajority kind, like `ScheduleUpgrade`, but with no
+    /// timelock: it keeps the rules in force. Tag 15.
+    CancelUpgrade { version: u32, activation_height: u64 },
 }
 
 /// What a key is allowed to do on an account.
@@ -1511,6 +1516,11 @@ impl ProposalKind {
                 put_str(out, account);
                 put_str(out, reason);
             }
+            ProposalKind::CancelUpgrade { version, activation_height } => {
+                out.push(15);
+                out.extend_from_slice(&version.to_le_bytes());
+                put_u64(out, *activation_height);
+            }
         }
     }
 
@@ -1531,6 +1541,7 @@ impl ProposalKind {
             12 => ProposalKind::DeactivateFeature { feature: r.str("feature", MAX_FEATURE)? },
             13 => ProposalKind::Text {},
             14 => ProposalKind::UnflagSybil { account: r.str("account", MAX_NAME_FIELD)?, reason: r.str("reason", MAX_REASON)? },
+            15 => ProposalKind::CancelUpgrade { version: r.u32()?, activation_height: r.u64()? },
             t => bail!("unknown proposal kind {t}"),
         })
     }
@@ -1597,6 +1608,11 @@ impl ProposalKind {
             ProposalKind::ScheduleUpgrade { version, activation_height } => {
                 if *version == 0 || *activation_height == 0 {
                     bail!("an upgrade needs a protocol version and an activation height");
+                }
+            }
+            ProposalKind::CancelUpgrade { version, activation_height } => {
+                if *version == 0 || *activation_height == 0 {
+                    bail!("a cancellation names the scheduled upgrade it withdraws: its protocol version and activation height");
                 }
             }
             ProposalKind::ActivateFeature { feature } | ProposalKind::DeactivateFeature { feature } => crate::upgrade::check_feature_name(feature)?,
@@ -2202,12 +2218,25 @@ pub(crate) mod tests {
         }
         assert_eq!(h.finalize().to_hex().to_string(), "fa975d440a66418e791d1cb415eb19479e544948ca449897fa7bad2e1d94bde0");
         // Proposal kinds added after that vector froze, each on its own (mirrored in e2e.ts):
-        // `UnflagSybil` (tag 14, audit F54).
+        // `UnflagSybil` (tag 14, audit F54), then `CancelUpgrade` (tag 15, audit F50; unit.ts too).
         let unflag = Action::Propose { kind: ProposalKind::UnflagSybil { account: "x.boo".into(), reason: "r".into() }, deposit: 1_000 * DROPS_PER_FANG, title: "t".into(), url: String::new() };
         assert_eq!(blake3::hash(&vector_tx(unflag.clone()).signing_bytes()).to_hex().to_string(), "225aa5b8e4df8e8d27fe796992dfd02e5e402c14a9bbc3873d41d63dd07dc2cf");
         assert_eq!(serde_json::to_value(&unflag).unwrap()["kind"], serde_json::json!({ "type": "unflag_sybil", "account": "x.boo", "reason": "r" }));
         let k = ProposalKind::UnflagSybil { account: "x.boo".into(), reason: "r".into() };
         assert_eq!(ProposalKind::from_bytes(&k.to_bytes()).unwrap(), k);
+        // `CancelUpgrade`:
+        let k = ProposalKind::CancelUpgrade { version: 2, activation_height: 100_000 };
+        let cancel = Action::Propose { kind: k.clone(), deposit: 1_000 * DROPS_PER_FANG, title: "t".into(), url: String::new() };
+        assert_eq!(blake3::hash(&vector_tx(cancel.clone()).signing_bytes()).to_hex().to_string(), "199d2455419f738528317187cdbfa72e5430308b096c2c8741f5801290d3d156");
+        assert_eq!(serde_json::to_value(&cancel).unwrap()["kind"], serde_json::json!({ "type": "cancel_upgrade", "version": 2, "activation_height": 100_000 }));
+        assert_eq!(serde_json::from_value::<Action>(serde_json::to_value(&cancel).unwrap()).unwrap(), cancel);
+        assert_eq!(k.to_bytes(), [15, 2, 0, 0, 0, 0xa0, 0x86, 0x01, 0, 0, 0, 0, 0]);
+        assert_eq!(ProposalKind::from_bytes(&k.to_bytes()).unwrap(), k);
+        assert_eq!(Action::from_bytes(&cancel.to_bytes()).unwrap(), cancel);
+        assert!(ProposalKind::from_bytes(&[15, 2, 0, 0, 0]).is_err(), "the activation height is part of it");
+        assert!(ProposalKind::CancelUpgrade { version: 0, activation_height: 5 }.check().is_err());
+        assert!(ProposalKind::CancelUpgrade { version: 2, activation_height: 0 }.check().is_err());
+        assert!(ProposalKind::from_bytes(&[16]).unwrap_err().to_string().contains("unknown proposal kind 16"));
         let p: Action = serde_json::from_str(r#"{"type":"propose","kind":{"type":"param_change","key":"max_validators","value":"40"},"deposit":"1000","title":"t"}"#).unwrap();
         assert_eq!(p, Action::Propose { kind: ProposalKind::ParamChange { key: "max_validators".into(), value: 40 }, deposit: 1000, title: "t".into(), url: String::new() });
         let m: Action = serde_json::from_str(r#"{"type":"multisig_propose","action":{"type":"vote","proposal_id":1,"aye":true,"amount":"5","conviction":2}}"#).unwrap();
@@ -2573,6 +2602,7 @@ pub(crate) mod tests {
             12 => ProposalKind::DeactivateFeature { feature: a },
             13 => ProposalKind::Text {},
             14 => ProposalKind::UnflagSybil { account: a, reason: b },
+            15 => ProposalKind::CancelUpgrade { version: w as u32, activation_height: x },
             _ => unreachable!(),
         }
     }
@@ -2585,7 +2615,7 @@ pub(crate) mod tests {
         let opt = proptest::option::of(arb_str(6).prop_filter("Some is never empty", |s| !s.is_empty()));
         let ids = proptest::collection::vec(any::<u64>(), 0..4);
         let list = proptest::collection::vec(arb_str(6), 0..4);
-        (0u8..55, strs, nums, any::<bool>(), opt, ids, list, 0u8..15, any::<u8>()).prop_map(|(tag, [a, b, c, d], [w, x, y], ok, familiar_key, spam, list, kind, small)| match tag {
+        (0u8..55, strs, nums, any::<bool>(), opt, ids, list, 0u8..16, any::<u8>()).prop_map(|(tag, [a, b, c, d], [w, x, y], ok, familiar_key, spam, list, kind, small)| match tag {
             0 => Action::Transfer { to: a, amount: w },
             1 => Action::RegisterName { name: a },
             2 => Action::AddKey { key_id: a, label: b, role: if ok { KeyRole::Owner } else { KeyRole::Session { limit: w, period_blocks: x, expires_at: y } } },

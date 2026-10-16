@@ -14,8 +14,10 @@
 # needs a newer binary, 12 when slashing protection sees its key signing elsewhere. Restarting
 # would only stop again (or, for 12, risk a double-sign), so this script then idles instead of
 # exiting: the machine stays up without the node and no restart policy loops it. Deploying a new
-# image or `fly machine restart` starts the node again, once the operator has acted. Any other
-# exit is passed on, so crashes restart as usual.
+# image or `fly machine restart` starts the node again, once the operator has acted; for 12 the
+# node itself also stays stopped (it records the stop in $home/double-sign-halt.json and exits 12
+# at every start until that file is deleted). Any other exit is passed on, so crashes restart as
+# usual.
 set -eu
 bind=${BIND:-::}
 set -- --bind "$bind"
@@ -41,7 +43,7 @@ run_node() {
       case "$code" in
         10) why="it reached --halt-height (HALT_HEIGHT): unset it and restart once the network agrees to resume" ;;
         11) why="the chain needs a newer binary: deploy the release that supports it" ;;
-        12) why="slashing protection saw this validator's key sign elsewhere: find the other instance before restarting (OPERATIONS.md)" ;;
+        12) why="slashing protection saw this validator's key sign elsewhere: find the other instance (OPERATIONS.md), then delete /data/home/double-sign-halt.json and restart" ;;
       esac
       echo "blockula exited $code: staying down, $why" >&2
       # Idle until the machine is stopped or restarted (the node is down; nothing to forward).

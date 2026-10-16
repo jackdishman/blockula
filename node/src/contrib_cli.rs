@@ -3,6 +3,7 @@
 //! (renew, transfer, release) and `blockula stake …` (delegating to validator pools). Talks to
 //! any node's HTTP API and signs with the CLI wallet or a key file.
 
+use crate::cli_net::{ChainPin, Remote};
 use crate::crypto::{self, Keys};
 use crate::types::*;
 use crate::validator_cli::{get, load_seed, own_address, parse_fang, rt, send_memo, wallet_keys};
@@ -24,6 +25,9 @@ pub struct Signer {
     pub from: Option<String>,
     #[arg(long, default_value = "http://localhost:7070")]
     pub rpc: String,
+    /// The chain the node at --rpc must be on (WAL-4)
+    #[command(flatten)]
+    pub pin: ChainPin,
 }
 
 #[derive(Args, Clone)]
@@ -46,6 +50,19 @@ impl Signer {
             None => own_address(&self.rpc, keys).await,
         }
     }
+
+    /// The node at `--rpc`, checked to be on the chain this command is for.
+    pub(crate) async fn connect(&self, dir: &Path) -> Result<Remote> {
+        Remote::connect(dir, &self.rpc, &self.pin).await
+    }
+
+    /// The account to sign for on `remote`'s chain: `--from`, or the key's own address.
+    pub(crate) async fn acting_for(&self, remote: &Remote, keys: &Keys) -> Result<String> {
+        match &self.from {
+            Some(a) => remote.resolve(a).await,
+            None => Ok(remote.address(keys)),
+        }
+    }
 }
 
 async fn resolve(rpc: &str, who: &str) -> Result<String> {
@@ -55,13 +72,15 @@ async fn resolve(rpc: &str, who: &str) -> Result<String> {
     get(rpc, &format!("/account/{who}")).await?["account"]["address"].as_str().map(String::from).ok_or_else(|| anyhow!("can't resolve {who}"))
 }
 
-/// Signs and submits `action`, waits for it, and prints the summary and explorer link.
+/// Signs and submits `action` for the chain `s` pins, waits for it, and prints the summary and
+/// explorer link.
 fn submit(dir: &Path, s: &Signer, action: Action) -> Result<Value> {
     let keys = s.keys(dir)?;
     let rt = rt()?;
     let tx = rt.block_on(async {
-        let from = s.from(&keys).await?;
-        send_memo(&s.rpc, &keys, &from, action, String::new()).await
+        let remote = s.connect(dir).await?;
+        let from = s.acting_for(&remote, &keys).await?;
+        send_memo(&remote, &keys, &from, action, String::new()).await
     })?;
     println!("✓ {}", tx["summary"].as_str().unwrap_or_default());
     println!("  {}/#/tx/{}", s.rpc.trim_end_matches('/'), tx["id"].as_str().unwrap_or_default());

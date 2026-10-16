@@ -5,6 +5,7 @@ mod api;
 mod beacon;
 mod chain;
 mod checkpoints;
+mod cli_net;
 mod consensus;
 mod contrib_cli;
 mod crypto;
@@ -37,6 +38,7 @@ mod sim;
 use anyhow::Result;
 use chain::{Chain, SummonOpts};
 use clap::{Args, Parser, Subcommand};
+use cli_net::blockula_dir;
 use node::NetOpts;
 use std::path::PathBuf;
 
@@ -69,7 +71,9 @@ struct Net {
     /// genesis validators' http addresses entirely (e.g. http://blockula-v0.internal:7070).
     #[arg(long = "peer-http")]
     peer_http: Vec<String>,
-    /// Skip the double-signing guards (missing consensus journal, machine.lock mismatch).
+    /// Skip the double-signing guards (missing consensus journal, machine.lock mismatch) and
+    /// clear a recorded slashing-protection stop (double-sign-halt.json). Only after you've
+    /// proven no other copy of this validator.key is running.
     #[arg(long = "i-know-this-key-is-not-running-elsewhere")]
     force_key: bool,
     /// Replay the whole chain from genesis instead of fast-syncing from a certified snapshot
@@ -265,10 +269,6 @@ enum Cmd {
         #[command(subcommand)]
         cmd: release_cli::ReleaseCmd,
     },
-}
-
-fn blockula_dir() -> PathBuf {
-    std::env::var_os("BLOCKULA_HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap()).join(".blockula"))
 }
 
 fn net_opts(net: Net, http_port: Option<u16>, p2p_preset: Option<String>, ephemeral_p2p: bool) -> NetOpts {

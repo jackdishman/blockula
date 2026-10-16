@@ -110,7 +110,7 @@ Agents are first-class contributors, but every agent is the **Familiar of a huma
 ### Forks and governance
 - **Code forks:** a share (e.g. 10%) of a fork's rewards flows back to the original repo's contributors.
 - **Chain forks:** `blockula summon` can start from a Soul-ledger snapshot, so a forked network keeps its community. Forking stays a credible exit.
-- **Voting weight:** about √stake + Soul. **Conviction voting** for treasury and repo budgets. Protocol upgrades: validators signal readiness in the blocks they propose, then a vote and a timelock schedule the activation height (OPERATIONS.md "Upgrades"). **Private ballots** via Ghost Mode later (tallies public, votes hidden).
+- **Voting weight:** about √stake + Soul. **Conviction voting** for treasury and repo budgets. Protocol upgrades: validators signal readiness in the blocks they propose, then a vote and a timelock schedule the activation height, and another vote can withdraw it until 64 blocks before (OPERATIONS.md "Upgrades"). **Private ballots** via Ghost Mode later (tallies public, votes hidden).
 - **Issuance split:** 70% stakers / 20% contribution pool / 10% treasury. The pool is fixed per epoch, so contribution rewards never add inflation.
 
 ## Network and sync
@@ -217,4 +217,5 @@ Next:
   - Only the last 2,048 executed blocks and 1,024 certificates stay in memory.
   - A node whose consensus storage predates this layout must re-sync (`consensus.version`).
 - The faucet is rate limited per address and per client (/64 for IPv6), checked and recorded in one step (parallel requests can't slip through), but a determined attacker with many IPs can still drain it slowly. CORS stays open because the wallet and SDK call it from other origins, so a web page can spend its visitors' per-IP budgets (each drip still needs a fresh address). It's for testnets only (no faucet on mainnet, DEC-10).
+- The CLI pins the chain a node is on (chain id, genesis hash, prefix; `node/src/cli_net.rs`), but within that chain it still trusts the one node it signs through for name resolution (it prints the address it resolved), the nonce, the fee quote and the height its tx's validity window starts from. A hostile node on the right chain can misdirect a send to a name, or hold a signed tx and release it later within the window it chose; use addresses, and nodes you trust, for anything that matters. (The SDK's `provenName` with witnesses is the light-client path.)
 - `sdk-ts/src/passkey.ts` typechecks but hasn't been exercised in a real browser yet.
