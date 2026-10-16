@@ -557,7 +557,7 @@ views.proposal = async function (id) {
     </dl>
     <details><summary>What exactly it does</summary><pre class="mono">${esc(JSON.stringify(raw.kind ?? null, null, 2))}</pre></details>`)}
     ${council.length ? card(`<h2>Council votes (${council.length})</h2><div class="rows">${council.map(councilRow).join("")}</div>`) : ""}
-    ${card(`<h2>Votes (${votes.length})</h2>${votes.length ? `<div class="rows">${votes.map(voteRow).join("")}</div>` : '<p class="empty">No votes yet.</p>'}`)}
+    ${card(`<h2>Votes (${votes.length})</h2>${votes.length ? `<div class="rows">${votes.map(voteRow).join("")}</div>` : raw.votes_swept && raw.voters ? `<p class="empty">Voting closed: the tally above is final, and the ${esc(raw.voters)} vote records were cleared from the state (each vote's tx stays in its block).</p>` : '<p class="empty">No votes yet.</p>'}`)}
   </div>`;
 };
 
