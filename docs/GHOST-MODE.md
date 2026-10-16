@@ -612,7 +612,12 @@ of a more complex AIR.
 - **Network-level privacy** isn't provided. The node a wallet submits to sees its IP. A full node
   forwards an unsigned ghost tx to a validator without the client's IP (it does for signed txs, so
   the validator's per-IP limits see the end client), but it still knows it, and so does anything
-  between the wallet and it. Submitting through Tor or a relay is the user's part.
+  between the wallet and it. Submitting through Tor or a relay is the user's part. The price: the
+  validator counts the unsigned txs a full node forwards against that full node's IP
+  (`TX_PER_IP_PER_MINUTE`, 120 a minute), so one full node relays at most that many ghost txs a
+  minute whoever sends them (each client is still held to its own limit at the full node), and a
+  sender of valid ghost txs can use that allowance up; wallets that need more submit to another
+  node or to a validator directly.
 - **Metadata.** The fee grid and the canonical fee leave a few fee values per base-fee level, not
   one; a tip (only when the ghost share is full), `valid_until` and the time a tx appears still say
   something about when and how it was built, and an unshield's amount and recipient are public.
