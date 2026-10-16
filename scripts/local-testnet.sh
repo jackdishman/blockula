@@ -156,7 +156,10 @@ BLOCKULA_HOME="$W" "$BIN" contrib fund 1 --rpc "http://$V0"
 echo "— fast join from a certified snapshot"
 wait_height "$V0" 106
 FAST="127.0.0.1:$((FULL_PORT + 1))"
-"$BIN" join --genesis "http://$V0" --genesis-hash "$GHASH" --home "$DIR/fast" --port "$((FULL_PORT + 1))" >"$DIR/fast.log" 2>&1 &
+# Dev durations shrink the weak-subjectivity period (half the evidence window, at most the
+# unbonding period) to a minute of blocks, so trusting only the genesis is "stale" by now: this
+# smoke test accepts that risk explicitly instead of fetching a checkpoint (OPERATIONS.md).
+"$BIN" join --genesis "http://$V0" --genesis-hash "$GHASH" --allow-stale-checkpoint --home "$DIR/fast" --port "$((FULL_PORT + 1))" >"$DIR/fast.log" 2>&1 &
 PIDS[$((N + 2))]=$!
 wait_height "$FAST" "$(status "$V0" | field .height)"
 from=$(status "$FAST" | field .fast_synced_from)
