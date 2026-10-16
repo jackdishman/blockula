@@ -575,6 +575,20 @@ fn every_proposal_kind_executes() {
     assert_eq!(t.st.poc.claims[&0].status, crate::poc::ClaimStatus::Rejected);
     assert!(t.p(ids[1]).outcome.contains("no unvested rewards"), "{}", t.p(ids[1]).outcome);
     assert!(!crate::upgrade::is_active(&t.st, "ghost"));
+    // Round three (audit F54): the appeal path. A sybil flag is lifted by a later proposal, and
+    // the account can earn again; one that isn't flagged can't be the subject of one.
+    let e = t.err(ALICE, Action::Propose { kind: ProposalKind::UnflagSybil { account: addr(BOB), reason: "x".into() }, deposit: 50 * FANG, title: "x".into(), url: String::new() });
+    assert!(e.contains("isn't flagged"), "{e}");
+    assert!(t.st.is_sybil(&addr(DAVE)));
+    let id = t.propose(ALICE, ProposalKind::UnflagSybil { account: addr(DAVE), reason: "mistaken identity".into() });
+    assert_eq!(describe_kind(&t.st, &t.p(id).kind, &|_| None), format!("lift {}'s sybil flag", short(&addr(DAVE))));
+    t.vote(ALICE, id, true, 50_000, 1).unwrap();
+    t.finish(id);
+    assert_eq!(t.p(id).status, ProposalStatus::Executed, "{}", t.p(id).outcome);
+    assert!(!t.st.is_sybil(&addr(DAVE)));
+    let mut j = crate::chain::Journal::default();
+    t.st.exec_grant_soul(&mut j, &addr(DAVE), SOUL, t.h).unwrap();
+    assert_eq!(t.st.soul_of(&addr(DAVE), t.h), SOUL, "it earns Soul again");
 }
 
 #[test]

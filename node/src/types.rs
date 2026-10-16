@@ -300,6 +300,9 @@ pub enum ProposalKind {
     DeactivateFeature { feature: String },
     /// No on-chain effect: a signal.
     Text {},
+    /// Lift a sybil flag: `FlagSybil`'s appeal path. The account can vouch, be vouched for,
+    /// claim, earn Soul and join juries again; nothing the flag took comes back.
+    UnflagSybil { account: String, reason: String },
 }
 
 /// What a key is allowed to do on an account.
@@ -1414,7 +1417,7 @@ impl Action {
             Action::Vouch { account } | Action::Unvouch { account } | Action::FlagSybil { account, .. } | Action::Clawback { account, .. } => vec![("account", account.as_str())],
             Action::Propose { kind, .. } => match kind {
                 ProposalKind::TreasurySpend { to, .. } | ProposalKind::GrantSoul { to, .. } => vec![("kind.to", to.as_str())],
-                ProposalKind::FlagSybil { account, .. } | ProposalKind::Clawback { account, .. } => vec![("kind.account", account.as_str())],
+                ProposalKind::FlagSybil { account, .. } | ProposalKind::Clawback { account, .. } | ProposalKind::UnflagSybil { account, .. } => vec![("kind.account", account.as_str())],
                 _ => vec![],
             },
             Action::MultisigPropose { action } => action.addresses(),
@@ -1490,6 +1493,11 @@ impl ProposalKind {
                 put_str(out, feature);
             }
             ProposalKind::Text {} => out.push(13),
+            ProposalKind::UnflagSybil { account, reason } => {
+                out.push(14);
+                put_str(out, account);
+                put_str(out, reason);
+            }
         }
     }
 
@@ -1509,6 +1517,7 @@ impl ProposalKind {
             11 => ProposalKind::ActivateFeature { feature: r.str("feature", MAX_FEATURE)? },
             12 => ProposalKind::DeactivateFeature { feature: r.str("feature", MAX_FEATURE)? },
             13 => ProposalKind::Text {},
+            14 => ProposalKind::UnflagSybil { account: r.str("account", MAX_NAME_FIELD)?, reason: r.str("reason", MAX_REASON)? },
             t => bail!("unknown proposal kind {t}"),
         })
     }
@@ -1565,7 +1574,7 @@ impl ProposalKind {
                 }
                 check_reason(reason)?;
             }
-            ProposalKind::FlagSybil { account, reason } | ProposalKind::Clawback { account, reason } => {
+            ProposalKind::FlagSybil { account, reason } | ProposalKind::Clawback { account, reason } | ProposalKind::UnflagSybil { account, reason } => {
                 check_account_ref("account", account)?;
                 check_reason(reason)?;
             }
@@ -2179,6 +2188,13 @@ pub(crate) mod tests {
             h.update(&vector_tx(action).signing_bytes());
         }
         assert_eq!(h.finalize().to_hex().to_string(), "0ffbf0b5bbb1a26f7abe720bae98d7f97581d5268bfbe75fe290605f16172398");
+        // Proposal kinds added after that vector froze, each on its own (mirrored in e2e.ts):
+        // `UnflagSybil` (tag 14, audit F54).
+        let unflag = Action::Propose { kind: ProposalKind::UnflagSybil { account: "x.boo".into(), reason: "r".into() }, deposit: 1_000 * DROPS_PER_FANG, title: "t".into(), url: String::new() };
+        assert_eq!(blake3::hash(&vector_tx(unflag.clone()).signing_bytes()).to_hex().to_string(), "225aa5b8e4df8e8d27fe796992dfd02e5e402c14a9bbc3873d41d63dd07dc2cf");
+        assert_eq!(serde_json::to_value(&unflag).unwrap()["kind"], serde_json::json!({ "type": "unflag_sybil", "account": "x.boo", "reason": "r" }));
+        let k = ProposalKind::UnflagSybil { account: "x.boo".into(), reason: "r".into() };
+        assert_eq!(ProposalKind::from_bytes(&k.to_bytes()).unwrap(), k);
         let p: Action = serde_json::from_str(r#"{"type":"propose","kind":{"type":"param_change","key":"max_validators","value":"40"},"deposit":"1000","title":"t"}"#).unwrap();
         assert_eq!(p, Action::Propose { kind: ProposalKind::ParamChange { key: "max_validators".into(), value: 40 }, deposit: 1000, title: "t".into(), url: String::new() });
         let m: Action = serde_json::from_str(r#"{"type":"multisig_propose","action":{"type":"vote","proposal_id":1,"aye":true,"amount":"5","conviction":2}}"#).unwrap();
@@ -2444,8 +2460,8 @@ pub(crate) mod tests {
         let text = vector_tx(Action::Propose { kind: ProposalKind::Text {}, deposit: 1, title: "t".into(), url: String::new() }).to_bytes();
         let mut bad_kind = text.clone();
         assert_eq!((bad_kind[tag_at], bad_kind[tag_at + 1]), (39, 13));
-        bad_kind[tag_at + 1] = 14;
-        assert!(err(&bad_kind).contains("unknown proposal kind 14"));
+        bad_kind[tag_at + 1] = 15;
+        assert!(err(&bad_kind).contains("unknown proposal kind 15"));
         let mut bad_aye = vector_tx(Action::Vote { proposal_id: 1, aye: true, amount: 1, conviction: 1 }).to_bytes();
         bad_aye[tag_at + 1 + 8] = 2;
         assert!(err(&bad_aye).contains("`aye` must be 0 or 1"));
@@ -2543,6 +2559,7 @@ pub(crate) mod tests {
             11 => ProposalKind::ActivateFeature { feature: a },
             12 => ProposalKind::DeactivateFeature { feature: a },
             13 => ProposalKind::Text {},
+            14 => ProposalKind::UnflagSybil { account: a, reason: b },
             _ => unreachable!(),
         }
     }
@@ -2555,7 +2572,7 @@ pub(crate) mod tests {
         let opt = proptest::option::of(arb_str(6).prop_filter("Some is never empty", |s| !s.is_empty()));
         let ids = proptest::collection::vec(any::<u64>(), 0..4);
         let list = proptest::collection::vec(arb_str(6), 0..4);
-        (0u8..55, strs, nums, any::<bool>(), opt, ids, list, 0u8..14, any::<u8>()).prop_map(|(tag, [a, b, c, d], [w, x, y], ok, familiar_key, spam, list, kind, small)| match tag {
+        (0u8..55, strs, nums, any::<bool>(), opt, ids, list, 0u8..15, any::<u8>()).prop_map(|(tag, [a, b, c, d], [w, x, y], ok, familiar_key, spam, list, kind, small)| match tag {
             0 => Action::Transfer { to: a, amount: w },
             1 => Action::RegisterName { name: a },
             2 => Action::AddKey { key_id: a, label: b, role: if ok { KeyRole::Owner } else { KeyRole::Session { limit: w, period_blocks: x, expires_at: y } } },

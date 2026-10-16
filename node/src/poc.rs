@@ -1048,6 +1048,20 @@ impl State {
         Ok(())
     }
 
+    /// Lifts a sybil flag (`UnflagSybil`, the appeal path for `FlagSybil`, audit F54): the account
+    /// can vouch, be vouched for, claim (its GitHub handle stays credited to it), earn Soul and
+    /// join juries again. Nothing the flag took comes back (Soul, bonds, rejected claims,
+    /// clawed-back rewards, voided vouches); governance can grant Soul separately.
+    pub(crate) fn exec_unflag_sybil(&mut self, j: &mut Journal, account: &str) -> Result<()> {
+        let who = self.resolve(account)?;
+        if !self.is_sybil(&who) {
+            bail!("{} isn't flagged as a sybil", short(&who));
+        }
+        self.pj(j).sybils.touch(&self.poc.sybils, &who);
+        self.poc.sybils.remove(&who);
+        Ok(())
+    }
+
     /// Rejects a claim (say, its PR was reverted): slashes the bond, or for a scored claim claws
     /// back its unvested reward (and its vouchers' cuts) and the Soul it earned.
     pub(crate) fn exec_reject_claim(&mut self, j: &mut Journal, claim_id: u64, reason: &str, height: u64) -> Result<()> {

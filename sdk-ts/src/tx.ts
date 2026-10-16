@@ -138,7 +138,9 @@ export type ProposalKind =
   | { type: "activate_feature"; feature: string }
   | { type: "deactivate_feature"; feature: string }
   /** No on-chain effect: a signal. */
-  | { type: "text" };
+  | { type: "text" }
+  /** Lift a sybil flag (`flag_sybil`'s appeal path): the account can earn again; nothing the flag took comes back. */
+  | { type: "unflag_sybil"; account: string; reason: string };
 
 export interface UnsignedTx {
   chain_id: string;
@@ -506,6 +508,9 @@ function encodeProposalKind(w: Writer, k: ProposalKind) {
       break;
     case "text":
       w.u8(13);
+      break;
+    case "unflag_sybil":
+      w.u8(14); w.str(k.account); w.str(k.reason);
       break;
     default:
       throw new Error(`unknown proposal kind ${(k as { type: string }).type}`);

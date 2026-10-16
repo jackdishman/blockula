@@ -33,6 +33,7 @@
 //! | `SetRepo` | `State::exec_set_repo` |
 //! | `GrantSoul` | `State::exec_grant_soul` |
 //! | `FlagSybil` | `State::exec_flag_sybil` |
+//! | `UnflagSybil` | `State::exec_unflag_sybil` (the appeal path: lifts the flag, restores nothing) |
 //! | `RejectClaim` | `State::exec_reject_claim` |
 //! | `Clawback` | `State::exec_clawback` |
 //! | `UnlinkGithub` | `State::exec_unlink_github` |
@@ -449,6 +450,12 @@ fn prepare_kind(state: &State, kind: &ProposalKind, height: u64) -> Result<Propo
         }
         ProposalKind::GrantSoul { to, .. } => *to = state.resolve(to)?,
         ProposalKind::FlagSybil { account, .. } | ProposalKind::Clawback { account, .. } => *account = state.resolve(account)?,
+        ProposalKind::UnflagSybil { account, .. } => {
+            *account = state.resolve(account)?;
+            if !state.is_sybil(account) {
+                bail!("{} isn't flagged as a sybil", short(account));
+            }
+        }
         ProposalKind::RejectClaim { claim_id, .. } => {
             if !state.poc.claims.contains_key(claim_id) {
                 bail!("no claim #{claim_id}");
@@ -731,6 +738,10 @@ fn run_kind(state: &mut State, j: &mut Journal, p: &Proposal, height: u64) -> Re
         ProposalKind::RejectClaim { claim_id, reason } => {
             state.exec_reject_claim(j, *claim_id, reason, height)?;
             format!("rejected claim #{claim_id}")
+        }
+        ProposalKind::UnflagSybil { account, .. } => {
+            state.exec_unflag_sybil(j, account)?;
+            format!("lifted {}'s sybil flag", short(account))
         }
         ProposalKind::Clawback { account, .. } => {
             let back = state.exec_clawback(j, account, height)?;
@@ -1141,6 +1152,7 @@ pub fn describe_kind(state: &State, kind: &ProposalKind, primary_name: &dyn Fn(&
         ProposalKind::SetRepo { repo, weight } => format!("put {repo} in the contribution pool (weight {weight})"),
         ProposalKind::GrantSoul { to, amount, .. } => format!("grant {} {} Soul", who(to), fmt_soul(*amount)),
         ProposalKind::FlagSybil { account, .. } => format!("flag {} as a sybil", who(account)),
+        ProposalKind::UnflagSybil { account, .. } => format!("lift {}'s sybil flag", who(account)),
         ProposalKind::RejectClaim { claim_id, .. } => format!("reject claim #{claim_id}"),
         ProposalKind::Clawback { account, .. } => format!("claw back {}'s unvested rewards", who(account)),
         ProposalKind::UnlinkGithub { handle } => format!("unlink GitHub @{handle}"),

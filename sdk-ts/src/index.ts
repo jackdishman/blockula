@@ -122,6 +122,10 @@ export const proposal = {
   flagSybil(account: string, reason: string): ProposalKind {
     return { type: "flag_sybil", account, reason };
   },
+  /** Lift a sybil flag: the appeal path for `flagSybil` (nothing the flag took comes back). */
+  unflagSybil(account: string, reason: string): ProposalKind {
+    return { type: "unflag_sybil", account, reason };
+  },
   rejectClaim(claimId: number, reason: string): ProposalKind {
     return { type: "reject_claim", claim_id: wholeNumber(claimId, "claimId"), reason };
   },
@@ -767,6 +771,7 @@ export class Wallet {
       case "grant_soul":
         return { ...kind, to: await this.client.resolve(kind.to) };
       case "flag_sybil":
+      case "unflag_sybil":
       case "clawback":
         return { ...kind, account: await this.client.resolve(kind.account) };
       default:
