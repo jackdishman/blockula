@@ -1477,7 +1477,8 @@ async fn staking(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
         .map(|(val, d)| {
             let value = staking::delegation_value(st, &addr, val);
             let own = st.validators.get(val).is_some_and(|r| r.owner == addr);
-            json!({ "validator": label(&v, val), "shares": d.shares.to_string(), "value": value.to_string(), "value_display": fmt_fang(value), "principal": d.principal.to_string(), "earned_display": fmt_fang(value.saturating_sub(d.principal)), "self_bond": own })
+            let principal = st.staking.pools.get(val).map_or(d.principal, |p| staking::principal_of(p, d));
+            json!({ "validator": label(&v, val), "shares": d.shares.to_string(), "value": value.to_string(), "value_display": fmt_fang(value), "principal": principal.to_string(), "earned_display": fmt_fang(value.saturating_sub(principal)), "self_bond": own })
         })
         .collect();
     let mut ready = 0u64;

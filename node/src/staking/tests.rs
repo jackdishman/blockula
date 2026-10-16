@@ -325,8 +325,8 @@ fn share_math_never_creates_fang() {
                 minted += paid;
             }
             _ => {
-                let cut = slash(&mut t.st, &mut j, &v, t.height, 1 + rnd(300));
-                t.st.j_burn(&mut j, cut);
+                let cut = slash(&mut t.st, &mut j, &v, t.height, None, true, 1 + rnd(300));
+                t.st.j_burn(&mut j, cut.total);
                 let taken = take_from_delegation(&mut t.st, &mut j, &owner(0).address(), &v, rnd(FANG));
                 t.st.j_burn(&mut j, taken);
             }
@@ -468,11 +468,12 @@ fn double_signing_slashes_the_pool_its_exits_and_pays_the_reporter() {
     assert_eq!(t.st.burned, burned + min_fee(report.size()) + slashed - slashed / 10);
     assert_eq!(t.st.validators[&v].status, ValidatorStatus::Tombstoned);
     assert!(!eligible(&t.st, &v));
-    // Once per (validator, epoch, view): the same fault again is refused; another view slashes again.
+    // Once: the same fault again is refused, and so is another fault of the same validator in
+    // that epoch or a later one (the stake that answers for it already did).
     assert!(t.fails(&reporter, Action::ReportEquivocation { evidence }).contains("already punished"));
     let pool1 = t.stake(&v);
-    t.ok(&reporter, Action::ReportEquivocation { evidence: double_notarize(&t, 2, 1, 5) });
-    assert_eq!(t.stake(&v), pool1 - pool1 / 20);
+    assert!(t.fails(&reporter, Action::ReportEquivocation { evidence: double_notarize(&t, 2, 1, 5) }).contains("already slashed"));
+    assert_eq!(t.stake(&v), pool1);
     // Tombstoned: no new stake, no unjailing, out at the boundary (and never back).
     assert!(t.fails(&alice, Action::Delegate { validator: v.clone(), amount: FANG }).contains("tombstoned"));
     assert!(t.fails(&owner(2), Action::Unjail { validator: v.clone() }).contains("can never return"));

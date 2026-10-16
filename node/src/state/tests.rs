@@ -386,6 +386,8 @@ fn namespaces_and_meta_keys_are_unique() {
         (ns::GHOST_RETIRED, 48..=55),
         (ns::GHOST_NULLIFIERS, 48..=55),
         (ns::GHOST_ADDRESSES, 48..=55),
+        (ns::STAKE_ENTRIES_BY_VALIDATOR, 64..=255),
+        (ns::STAKE_VIEWS, 64..=255),
     ];
     let mut seen = std::collections::BTreeSet::from([ns::META]);
     let st = State::default();
@@ -397,7 +399,7 @@ fn namespaces_and_meta_keys_are_unique() {
         assert!(!(1..=25).contains(&n), "namespace {n} collides with the base state");
         seen.insert(n);
     }
-    assert_eq!(seen.len(), 1 + 18 + 16 + 5, "every namespace is distinct");
+    assert_eq!(seen.len(), 1 + 18 + 16 + 5 + 2, "every namespace is distinct");
     let keys = [meta::BURNED, meta::CHAIN_PARAMS, meta::NEXT_HUNT_ID, meta::PARAMS, meta::POC, meta::SCHEMA, meta::SUPPLY, meta::STAKING, meta::GOVERNANCE, meta::ECON, meta::BEACON, meta::UPGRADE, meta::GHOST];
     assert_eq!(keys.iter().collect::<std::collections::BTreeSet<_>>().len(), keys.len());
     assert!(st.meta_records().iter().all(|(k, _)| keys.contains(k)), "every scalar record uses a declared key");
@@ -410,8 +412,9 @@ fn namespaces_and_meta_keys_are_unique() {
 /// protocol v1 state (schema 4: the econ, staking, governance and ghost scalars, the PoC scalars
 /// without the block-hash seed; 13 records): the JS side re-derived the simple records' bytes
 /// (scalars, the account) and rebuilt the tree from the node's dump of the rest. Schema 5 (the
-/// fee slots' ghost limits) changes only the `schema` record here (the default state's fee ring
-/// is empty); the SDK's vector test re-checks the regenerated root and proofs.
+/// fee slots' ghost limits) and schema 6 (staking's slash bookkeeping and its two new maps, empty
+/// here) change only the `schema` record; the SDK's vector test re-checks the regenerated root
+/// and proofs.
 #[test]
 fn golden_encodings() {
     let acct = Account { balance: 5, nonce: 2, keys: Default::default(), locks: vec![] };
@@ -422,7 +425,7 @@ fn golden_encodings() {
     st.commit_block().unwrap();
     assert_eq!(st.root_hash(), st.full_root());
     assert_eq!(st.record_count(), 13);
-    assert_eq!(st.root(), "2a47baa1686f29adfe7693211d2087518ebb2d922e339e5f61c89906e9ad87e3");
+    assert_eq!(st.root(), "ba1a822b22f082a42294f82621d9a140a24cf0c61225f49dd167d1ebbfce4d74");
 }
 
 fn million_accounts() -> State {
@@ -578,9 +581,11 @@ fn largest_records_fit_in_a_snapshot() {
         let (_, window) = crate::params::ChainParams::bounds("downtime_window", &st.params).unwrap();
         let sk = &mut st.staking;
         let jail = Some(Jail { at: u64::MAX, until: u64::MAX, reason: s(MAX_REASON) });
-        sk.pools.insert(addr(1), Pool { stake: u64::MAX, shares: u128::MAX, commission_base: u64::MAX, commission_epoch: u64::MAX, jail, tombstoned_at: Some(u64::MAX), slashed: u64::MAX, rewards: u64::MAX, junk_charged: u64::MAX });
-        sk.delegations.insert(format!("{}/{}", addr(0), addr(1)), Delegation { shares: u128::MAX, principal: u64::MAX });
+        sk.pools.insert(addr(1), Pool { stake: u64::MAX, shares: u128::MAX, commission_base: u64::MAX, commission_epoch: u64::MAX, jail, tombstoned_at: Some(u64::MAX), slashed: u64::MAX, rewards: u64::MAX, junk_charged: u64::MAX, kept: u128::MAX, slashed_from: Some(u64::MAX) });
+        sk.delegations.insert(format!("{}/{}", addr(0), addr(1)), Delegation { shares: u128::MAX, principal: u64::MAX, kept_at: u128::MAX });
         sk.entries.insert(format!("{}/{:020}", addr(0), u64::MAX), Entry::Redelegation { from: addr(1), to: addr(2), amount: u64::MAX, started_at: u64::MAX, release_at: u64::MAX });
+        sk.by_validator.insert(format!("{}/{:020}/{}/{:020}", addr(1), u64::MAX, addr(0), u64::MAX), ());
+        sk.views.insert(u64::MAX, u64::MAX);
         sk.punished.insert(format!("{}/{:020}/{:020}", addr(1), u64::MAX, u64::MAX), Punished { kind: u8::MAX, height: u64::MAX, reporter: addr(2), slashed: u64::MAX });
         sk.liveness.insert(addr(1), Liveness { window, bits: vec![0xff; window.div_ceil(8) as usize], next: u64::MAX, filled: u64::MAX, missed: u64::MAX, led: u64::MAX, missed_total: u64::MAX });
     }

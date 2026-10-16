@@ -87,6 +87,12 @@ pub mod ns {
     pub const GHOST_RETIRED: u8 = 50;
     pub const GHOST_NULLIFIERS: u8 = 51;
     pub const GHOST_ADDRESSES: u8 = 52;
+
+    // 64 on: modules that outgrew their range.
+    /// staking.rs: its unbonding and redelegation entries by the validator they left (so a slash
+    /// reads only that validator's), and the highest view executed per epoch (evidence bounds).
+    pub const STAKE_ENTRIES_BY_VALIDATOR: u8 = 64;
+    pub const STAKE_VIEWS: u8 = 65;
 }
 
 /// Keys of the scalar records (namespace [`ns::META`]). They're emitted sorted by key.
