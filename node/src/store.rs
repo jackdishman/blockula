@@ -75,8 +75,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Version of the tables and their encodings. A store of another format (or state schema) is
-/// rebuilt from the logs on open. 2: block rows carry `version` and `signal`.
-pub const STORE_FORMAT: u32 = 2;
+/// rebuilt from the logs on open. 2: block rows carry `version` and `signal`. 3: and the block's
+/// `base_fee`.
+pub const STORE_FORMAT: u32 = 3;
 pub const DB_FILE: &str = "state.redb";
 /// redb's page cache.
 pub const CACHE_BYTES: usize = 256 << 20;
@@ -181,6 +182,9 @@ pub struct BlockMeta {
     /// supports (upgrade readiness, `/api/blocks` and `/api/upgrade`).
     pub version: u32,
     pub signal: u32,
+    /// The base fee the block charged (`Block::base_fee`), so a tx's charge is read from this row
+    /// instead of parsing the whole block (F66).
+    pub base_fee: Option<crate::econ::FeeSlot>,
 }
 
 /// Where each tx's JSON sits in a block's JSON line: the compact serializer writes a nested

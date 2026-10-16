@@ -581,7 +581,7 @@ fn tx_json_with(v: &ReadView, tx: &Tx, height: Option<u64>, error: Option<&str>)
 /// its tip, at most its `fee`. Blocks record their base fee (P-ECON); a pending tx is priced at
 /// the next block's.
 fn charged(v: &ReadView, tx: &Tx, height: Option<u64>) -> u64 {
-    let charge = match height.and_then(|h| v.block(h)).and_then(|b| b.base_fee) {
+    let charge = match height.and_then(|h| v.base_fee(h)) {
         Some(slot) => slot.fee(tx.size()).checked_add(tx.tip),
         None => crate::econ::charge(&v.state, tx, height.unwrap_or_else(|| crate::econ::now(&v.state))),
     };
@@ -2852,6 +2852,40 @@ mod http_tests {
         assert_eq!(s, StatusCode::OK);
         assert_eq!(v["status"], "failed");
         assert!(v["error"].as_str().unwrap().contains("insufficient"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// F66: a finalized tx's charge comes from its block's index row, so `/api/tx` and
+    /// `/api/account` read one tx's span, never parse (and cache) the whole block.
+    #[tokio::test]
+    async fn tx_and_account_reads_dont_parse_whole_blocks() {
+        let root = std::env::temp_dir().join(format!("blockula-api-txspan-{}-{}", crate::chain::now_ms(), std::process::id()));
+        let homes = Chain::summon(&root, &SummonOpts::new("txspan", 1)).unwrap();
+        let k = crate::crypto::Keys::from_seed([9; 32]);
+        let (id, at, fee) = {
+            let mut c = Chain::open(&homes[0]).unwrap();
+            c.faucet(&k.address(), 10 * DROPS_PER_FANG).unwrap();
+            c.produce_block().unwrap();
+            let mut tx = Tx { chain_id: "txspan".into(), genesis_hash: c.genesis_hash.clone(), from: k.address(), nonce: 0, fee: 0, tip: 7, valid_until: c.height() + 100, action: Action::Transfer { to: c.me().unwrap(), amount: DROPS_PER_FANG }, memo: String::new(), public_key: hex::encode(k.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+            tx.fee = min_fee(tx.size()) + 1_000_000;
+            let tx = tx.sign(&k);
+            c.produce_block_with(vec![tx.clone()]).unwrap();
+            let at = c.height();
+            let slot = c.view().block(at).unwrap().base_fee.expect("blocks record their base fee");
+            c.produce_block().unwrap();
+            (tx.id(), at, slot.fee(tx.size()) + 7)
+        };
+        // A fresh start: nothing cached, and the tx's block isn't the head.
+        let chain = Arc::new(Mutex::new(Chain::open(&homes[0]).unwrap()));
+        let n = Node::new(chain, None, vec![], ClientIpPolicy::default());
+        assert!(n.live.view().disk.cached_block(at).is_none());
+        let (s, v, _) = call(&n, "GET", &format!("/api/tx/{id}"), None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!((v["status"].as_str(), v["fee"].as_str()), (Some("finalized"), Some(fee.to_string().as_str())), "{v}");
+        let (s, a, _) = call(&n, "GET", &format!("/api/account/{}", k.address()), None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(a["recent_txs"].as_array().unwrap().iter().any(|t| t["id"] == json!(id) && t["fee"] == v["fee"]), "{a}");
+        assert!(n.live.view().disk.cached_block(at).is_none(), "the block was parsed for its base fee");
         std::fs::remove_dir_all(root).ok();
     }
 

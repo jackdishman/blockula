@@ -275,6 +275,15 @@ impl ReadView {
         (self.history_from()..=top).rev().take(limit).filter_map(|h| Some((h, self.block_meta(h)?))).collect()
     }
 
+    /// The base fee block `height` charged: from memory if the block is there, else from its
+    /// index row (never by parsing the block, F66).
+    pub fn base_fee(&self, height: u64) -> Option<crate::econ::FeeSlot> {
+        if let Some(b) = self.head.as_ref().filter(|b| b.height == height).cloned().or_else(|| self.disk.cached_block(height)) {
+            return b.base_fee;
+        }
+        self.block_meta(height)?.base_fee
+    }
+
     /// Executed block at `height`.
     pub fn block(&self, height: u64) -> Option<Arc<Block>> {
         if height == 0 || height > self.height || height < self.history_from() {

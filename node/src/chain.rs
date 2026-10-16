@@ -2651,6 +2651,7 @@ impl Chain {
             history,
             version: block.version,
             signal: block.signal,
+            base_fee: block.base_fee,
         })
     }
 
