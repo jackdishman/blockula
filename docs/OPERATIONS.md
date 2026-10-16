@@ -614,6 +614,8 @@ scripts/reproduce-release.sh $V
 
 The OIDC credential would let any code running beside it publish a backdoored package with valid provenance, so it never meets third-party code: a `build` job without `id-token` installs the lockfile with `npm ci --ignore-scripts`, builds, and packs both tarballs (their SHA-256s go to the next job as an output); the `publish` job, the only one with `id-token: write` and the only one behind the `npm` environment's approval, installs and builds nothing: it checks the tarballs against those checksums and runs `npm publish <tarball> --provenance --ignore-scripts`. Keep it that way: never add `npm ci`, a build step or a third-party action to `publish`.
 
+The MCP tarball carries `npm-shrinkwrap.json` (audit F75), so `npx -y @blockula/mcp@<version>` installs exactly the tree CI tested. The `build` job packs the SDK first and writes the shrinkwrap from the reviewed lockfile (`scripts/mcp-shrinkwrap.mjs --check`), with every entry pinned by its registry integrity and the SDK entry by the integrity of the SDK tarball it just packed; it refuses an MCP tarball without the file. Before publishing the MCP, `publish` checks that the SDK on npm has that integrity (it's the same tarball), so the shrinkwrap can't point at another SDK.
+
 One-time setup by the maintainer:
 1. npmjs.com → each package → Settings → **Trusted publishing** → GitHub Actions: owner `jackdishman`, repository `blockula`, workflow `npm-publish.yml`, environment `npm`.
 2. Each package → Settings → Publishing access → **Require two-factor authentication and disallow tokens**. Revoke any old automation tokens.
