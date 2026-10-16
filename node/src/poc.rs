@@ -746,11 +746,13 @@ impl State {
                 // A vouch keeps its two accounts off each other's juries (`conflicted`, checked
                 // when a Séance opens). Its beacon seed is public an epoch before that, so
                 // dropping the vouch then would seat a juror on a claim it mustn't judge (audit
-                // F53): it stays while either side has a claim open.
-                for who in [&to, &v.voucher] {
+                // F53): it stays while one side has a claim open and the other is in the jury
+                // pool. Outside the pool nobody is drawn (and rejoining is new to the draw,
+                // `seance_cutoff`), so a newcomer can still decline an unwanted vouch.
+                for (who, other) in [(&to, &v.voucher), (&v.voucher, &to)] {
                     let open = self.poc.has_open_claims(who);
-                    if open > 0 {
-                        bail!("{} has {open} open claim{}: a vouch keeps its two accounts off each other's juries, so it stays until they're settled", short(who), if open == 1 { "" } else { "s" });
+                    if open > 0 && self.poc.jurors.contains_key(other.as_str()) {
+                        bail!("{} has {open} open claim{} and {} is in the jury pool: a vouch keeps its two accounts off each other's juries, so it stays until the claims are settled (or {} leaves the pool)", short(who), if open == 1 { "" } else { "s" }, short(other), short(other));
                     }
                 }
                 self.pj(j).vouches.touch(&self.poc.vouches, &to);
@@ -2108,15 +2110,24 @@ mod scenarios {
     }
 
     /// Audit F53: a vouch keeps its accounts off each other's juries, and the Séance seed is
-    /// public an epoch before the opening, so neither side can withdraw the vouch while either
-    /// has a claim open (the vouchee could otherwise drop it for free once the seed showed its
-    /// voucher would sit). Settled, it can go.
+    /// public an epoch before the opening, so neither side can withdraw the vouch while one has a
+    /// claim open and the other is in the jury pool (the vouchee could otherwise drop it for free
+    /// once the seed showed its voucher would sit). Settled, or with the would-be juror out of the
+    /// pool, it can go; a newcomer outside the pool can always decline.
     #[test]
     fn a_vouch_stays_while_either_side_has_a_claim_open() {
         let mut t = setup("vouchlock");
         t.admin(Action::SetRepo { repo: "jackdishman/blockula".into(), weight: 10 }).unwrap();
-        let (juror, newbie) = (k(1), k(6));
+        let (juror, newbie, other) = (k(1), k(6), k(7));
         t.grant(&juror, 20);
+        t.tx(&juror, Action::JoinJury { bond: JUROR_BOND }).unwrap();
+        // An unsolicited vouch from a juror with a claim open: the newcomer (no claims, not in
+        // the pool) declines it all the same.
+        t.link(&juror, "juror");
+        let mine = t.claim(&juror, 2).unwrap();
+        t.attest(mine, true).unwrap();
+        t.tx(&juror, Action::Vouch { account: other.address() }).unwrap();
+        t.tx(&other, Action::Unvouch { account: other.address() }).unwrap();
         t.tx(&juror, Action::Vouch { account: newbie.address() }).unwrap();
         t.link(&newbie, "newbie");
         let c = t.claim(&newbie, 1).unwrap();
@@ -2124,14 +2135,16 @@ mod scenarios {
         assert!(t.tx(&newbie, Action::Unvouch { account: newbie.address() }).unwrap_err().to_string().contains("1 open claim"));
         t.blocks(100);
         assert!(t.tx(&juror, Action::Unvouch { account: newbie.address() }).unwrap_err().to_string().contains("1 open claim"), "past the lock too");
-        // The voucher's own open claims hold it as well.
-        t.link(&juror, "juror");
+        // The voucher's own open claims hold it as well, once the vouchee could judge them.
         t.admin(Action::RejectClaim { claim_id: c, reason: "test".into() }).unwrap();
-        let mine = t.claim(&juror, 2).unwrap();
+        t.grant(&newbie, 10);
+        t.tx(&newbie, Action::JoinJury { bond: JUROR_BOND }).unwrap();
         assert!(t.tx(&newbie, Action::Unvouch { account: newbie.address() }).unwrap_err().to_string().contains("1 open claim"));
-        t.admin(Action::RejectClaim { claim_id: mine, reason: "test".into() }).unwrap();
+        // Out of the pool, it can't be drawn: the vouch can go.
+        t.tx(&newbie, Action::LeaveJury {}).unwrap();
         t.tx(&newbie, Action::Unvouch { account: newbie.address() }).unwrap();
         assert!(!t.c.state.poc.vouches.contains_key(&newbie.address()));
+        t.admin(Action::RejectClaim { claim_id: mine, reason: "test".into() }).unwrap();
         conserved(&t.c.state);
         t.reopen_same_root();
     }
