@@ -193,7 +193,7 @@ Next:
 - Equivocation is caught only if some honest node sees both votes; reports are best effort (each node keeps its evidence in `evidence.json` until the chain acts on it).
 - If every genesis validator is removed, new nodes still bootstrap from genesis addresses plus the active validators in their *local* state. A brand-new node then needs at least one genesis validator to be reachable, or to start from a peer's copy of the chain.
 - Simplex journals are kept for the current epoch and the two before it (older ones are deleted). State keeps the validator sets of the evidence window (`evidence_max_age_epochs`, at least 8 epochs), so `/api/sync` can only certify batches from those epochs for nodes that are far behind.
-- Rate limits are in-memory and per node, so restarting a node resets them, and each node in a pool counts separately. No proxy header is trusted by default.
+- Rate limits are in-memory and per node, so restarting a node resets them, and each node in a pool counts separately. No proxy header is trusted by default. A configured `--client-ip-header` is read from the right (`--client-ip-hops` appending proxies), and a request without a usable one is limited as the proxy itself, never as an unlimited local caller.
 - `join` fully backfills from genesis over HTTP and trusts no single peer (certificates are verified), but there's no snapshot sync yet. Full nodes don't serve `/api/sync` themselves.
 - Behind NAT (e.g. Fly dedicated IPs), peers see the NATed source address. If the recommended preset rejects such peers, run with `--p2p-preset local`.
 - The state root covers state *before* the block it's embedded in (deferred execution), so a block's own post-state root is in `blocks.jsonl`, not in the certified consensus block.
@@ -205,8 +205,8 @@ Next:
 - `exec_root` is still a best-effort check. Each block must cite a state root at most 16 heights behind the verifier's executed height, and verifiers that have executed that height check it. A root that no honest verifier has executed yet goes unchecked until one has.
 - Storage:
   - Marshal keeps 2,000 heights of blocks and certificates and prunes the rest.
-  - Every node keeps all consensus blocks (`cblocks.bin`) plus finalization certificates every 100 heights and at epoch ends (`certs.bin`), so it can serve verified `/api/sync` batches.
+  - Every node keeps all consensus blocks (`cblocks.bin`) plus finalization certificates every 100 heights, at epoch ends, and once 1 MiB of blocks has gone by since the last one kept (`CERT_SPACING_BYTES`), so it can serve verified `/api/sync` batches however full the blocks are.
   - Only the last 2,048 executed blocks and 1,024 certificates stay in memory.
   - A node whose consensus storage predates this layout must re-sync (`consensus.version`).
-- The faucet is rate limited per address and per client (/64 for IPv6), but a determined attacker with many IPs can still drain it slowly. It's for testnets only.
+- The faucet is rate limited per address and per client (/64 for IPv6), checked and recorded in one step (parallel requests can't slip through), but a determined attacker with many IPs can still drain it slowly. CORS stays open because the wallet and SDK call it from other origins, so a web page can spend its visitors' per-IP budgets (each drip still needs a fresh address). It's for testnets only (no faucet on mainnet, DEC-10).
 - `sdk-ts/src/passkey.ts` typechecks but hasn't been exercised in a real browser yet.

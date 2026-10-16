@@ -123,9 +123,14 @@ pub struct ClientIpPolicy {
     /// Shared secret a forwarding full node sends in `X-Blockula-Forwarder-Key`; proves the
     /// forwarder when its IP isn't stable (e.g. on Fly). Also sent by `forward()`.
     pub forwarder_secret: Option<String>,
-    /// Header set by the reverse proxy in front of this node (`fly-client-ip`, `x-forwarded-for`).
-    /// Only enable it when every request comes through that proxy.
+    /// Header set by the reverse proxy in front of this node (`fly-client-ip`, `x-real-ip`,
+    /// `x-forwarded-for`). Only enable it when every request comes through that proxy.
     pub header: Option<String>,
+    /// Trusted proxies that append to `header` (`--client-ip-hops`, default 1). Appending proxies
+    /// (`X-Forwarded-For`) keep what the client sent first and add the address they saw last,
+    /// so the client is this many entries from the right; anything left of it is the client's
+    /// own say. Headers a proxy overwrites have one entry.
+    pub hops: usize,
 }
 
 impl std::fmt::Debug for ClientIpPolicy {
@@ -134,25 +139,35 @@ impl std::fmt::Debug for ClientIpPolicy {
             .field("trusted_forwarders", &self.trusted_forwarders)
             .field("forwarder_secret", &self.forwarder_secret.as_ref().map(|_| "<redacted>"))
             .field("header", &self.header)
+            .field("hops", &self.hops)
             .finish()
     }
 }
 
 impl ClientIpPolicy {
+    /// The client's IP, or `None` for a local caller (loopback, nothing configured speaks for it).
     pub fn resolve(&self, peer: SocketAddr, h: &HeaderMap) -> Option<IpAddr> {
-        let header_ip = |name: &str| h.get(name).and_then(|v| v.to_str().ok()).and_then(|v| v.split(',').next()).and_then(|v| v.trim().parse::<IpAddr>().ok());
+        // The entry `hops` from the right of a (possibly comma-separated) header (F29: the
+        // leftmost one is whatever the client sent).
+        let header_ip = |name: &str, hops: usize| {
+            let v = h.get(name)?.to_str().ok()?;
+            let entries: Vec<&str> = v.split(',').collect();
+            entries.len().checked_sub(hops.max(1)).and_then(|i| entries[i].trim().parse::<IpAddr>().ok())
+        };
         let policy = self;
         let by_secret = match (&policy.forwarder_secret, h.get("x-blockula-forwarder-key")) {
             (Some(secret), Some(given)) => ct_eq(secret.as_bytes(), given.as_bytes()),
             _ => false,
         };
         if by_secret || policy.trusted_forwarders.contains(&peer.ip()) {
-            if let Some(ip) = header_ip("x-blockula-client-ip") {
+            if let Some(ip) = header_ip("x-blockula-client-ip", 1) {
                 return Some(ip);
             }
         }
-        if let Some(ip) = policy.header.as_deref().and_then(header_ip) {
-            return Some(ip);
+        if let Some(name) = policy.header.as_deref() {
+            // Configured but missing or unreadable: limited as the proxy itself, never as a
+            // local caller (which isn't limited at all).
+            return Some(header_ip(name, policy.hops).unwrap_or(peer.ip()));
         }
         if peer.ip().is_loopback() { None } else { Some(peer.ip()) }
     }
@@ -169,34 +184,22 @@ struct Limits {
 }
 
 impl Limits {
-    /// Whether every `(key, max, window)` has room (nothing recorded).
-    fn check(&self, rules: &[(String, usize, Duration)]) -> Result<(), Duration> {
-        let now = Instant::now();
+    /// Gives back a hit [`Limits::allow`] recorded at `at` (the action it reserved failed).
+    fn refund(&self, rules: &[(String, usize, Duration)], at: Instant) {
         let mut hits = self.hits.lock();
-        for (key, max, window) in rules {
+        for (key, _, _) in rules {
             if let Some(q) = hits.get_mut(key) {
-                while q.front().is_some_and(|t| now.duration_since(*t) >= *window) {
-                    q.pop_front();
-                }
-                if q.len() >= *max {
-                    return Err(*window - now.duration_since(*q.front().unwrap()));
+                if let Some(i) = q.iter().rposition(|t| *t == at) {
+                    q.remove(i);
                 }
             }
         }
-        Ok(())
     }
 
-    /// Records a hit on each rule (after the action succeeded).
-    fn record(&self, rules: &[(String, usize, Duration)]) {
-        let now = Instant::now();
-        let mut hits = self.hits.lock();
-        for (key, _, _) in rules {
-            hits.entry(key.clone()).or_default().push_back(now);
-        }
-    }
-
-    /// Allows only if every `(key, max, window)` has room; then records a hit on each.
-    fn allow(&self, rules: &[(String, usize, Duration)]) -> Result<(), Duration> {
+    /// Allows only if every `(key, max, window)` has room; then records a hit on each, in the
+    /// same critical section (so concurrent callers can't all pass before any records: F28).
+    /// Returns the hit's time, for a [`Limits::refund`].
+    fn allow(&self, rules: &[(String, usize, Duration)]) -> Result<Instant, Duration> {
         let now = Instant::now();
         let mut hits = self.hits.lock();
         if hits.len() > 100_000 {
@@ -214,7 +217,7 @@ impl Limits {
         for (key, _, _) in rules {
             hits.get_mut(key).unwrap().push_back(now);
         }
-        Ok(())
+        Ok(now)
     }
 }
 
@@ -1239,29 +1242,37 @@ async fn faucet(State(n): State<Node>, ConnectInfo(peer): ConnectInfo<SocketAddr
     }
     // Loopback callers (local dev, tests) aren't limited at all.
     let limited = client.is_some() || !peer.ip().is_loopback();
-    if limited {
-        n.limits.check(&rules).map_err(|w| too_many("the faucet already dripped for you", w))?;
+    // The slot is taken before the drip (atomically: parallel requests can't all pass a check
+    // first, F28) and given back if the drip doesn't go out.
+    let reserved = if limited { Some(n.limits.allow(&rules).map_err(|w| too_many("the faucet already dripped for you", w))?) } else { None };
+    let dripped = async {
+        if !faucet_here {
+            if forwarded(&headers) {
+                return Err(ApiError(StatusCode::LOOP_DETECTED, "forwarding loop: no faucet here".into()));
+            }
+            let v = n.forward("/faucet", &json!({ "to": to }), client).await?;
+            if let Ok(tx) = serde_json::from_value::<Tx>(v["tx"].clone()) {
+                let _ = n.chain.lock().track_pending(tx);
+            }
+            Ok(v)
+        } else {
+            let tx = n.chain.lock().faucet(to, 100 * DROPS_PER_FANG).map_err(|e| {
+                let msg = e.to_string();
+                ApiError(if msg.contains("faucet busy") { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::BAD_REQUEST }, msg)
+            })?;
+            Ok(json!({ "id": tx.id(), "amount_display": "100 FANG", "tx": tx }))
+        }
     }
-    // Quota is only consumed once the drip actually went out.
-    let v = if !faucet_here {
-        if forwarded(&headers) {
-            return Err(ApiError(StatusCode::LOOP_DETECTED, "forwarding loop: no faucet here".into()));
+    .await;
+    let v = match dripped {
+        Ok(v) => v,
+        Err(e) => {
+            if let Some(at) = reserved {
+                n.limits.refund(&rules, at);
+            }
+            return Err(e);
         }
-        let v = n.forward("/faucet", &json!({ "to": to }), client).await?;
-        if let Ok(tx) = serde_json::from_value::<Tx>(v["tx"].clone()) {
-            let _ = n.chain.lock().track_pending(tx);
-        }
-        v
-    } else {
-        let tx = n.chain.lock().faucet(to, 100 * DROPS_PER_FANG).map_err(|e| {
-            let msg = e.to_string();
-            ApiError(if msg.contains("faucet busy") { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::BAD_REQUEST }, msg)
-        })?;
-        json!({ "id": tx.id(), "amount_display": "100 FANG", "tx": tx })
     };
-    if limited {
-        n.limits.record(&rules);
-    }
     bump(&n.stats.faucet_drips);
     Ok(Json(v))
 }
@@ -2067,6 +2078,19 @@ mod tests {
         // Behind Fly: only the configured header counts.
         let fly = ClientIpPolicy { header: Some("fly-client-ip".into()), ..Default::default() };
         assert_eq!(fly.resolve(peer, &spoof), Some("1.2.3.4".parse().unwrap()));
+        // F29: an appending proxy's header is read from the right (what the proxy saw), never
+        // the client's own leftmost entries; with two proxies, the second entry from the right.
+        let local: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let xff = ClientIpPolicy { header: Some("x-forwarded-for".into()), ..Default::default() };
+        let forged = headers(&[("x-forwarded-for", "9.9.9.9, 203.0.113.7")]);
+        assert_eq!(xff.resolve(local, &forged), Some("203.0.113.7".parse().unwrap()));
+        let two = ClientIpPolicy { hops: 2, ..xff.clone() };
+        assert_eq!(two.resolve(local, &headers(&[("x-forwarded-for", "9.9.9.9, 203.0.113.7, 10.0.0.9")])), Some("203.0.113.7".parse().unwrap()));
+        // Unparseable or missing: limited as the proxy, never treated as a local, unlimited caller.
+        assert_eq!(xff.resolve(local, &headers(&[("x-forwarded-for", "203.0.113.7, nope")])), Some(local.ip()));
+        assert_eq!(xff.resolve(local, &HeaderMap::new()), Some(local.ip()));
+        assert_eq!(two.resolve(local, &headers(&[("x-forwarded-for", "203.0.113.7")])), Some(local.ip()), "fewer entries than proxies");
+        assert_eq!(ClientIpPolicy::default().resolve(local, &forged), None, "no header configured: loopback is local");
         // Forwarder secret: wrong key is ignored, right key is honored.
         let secret = ClientIpPolicy { forwarder_secret: Some("s".repeat(32)), ..Default::default() };
         let wrong = headers(&[("x-blockula-forwarder-key", "nope"), ("x-blockula-client-ip", "9.9.9.9")]);
@@ -2536,6 +2560,35 @@ mod http_tests {
         let (s, _, _) = call(&n, "POST", "/api/faucet", Some(json!({ "to": b })), "203.0.113.5:1").await;
         assert_eq!(s, StatusCode::OK, "quota wasn't consumed by the busy attempt");
         assert_eq!(ip_key("2001:db8:1:2:aaaa::1".parse().unwrap()), "2001:db8:1:2::/64");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// F28: the faucet takes its rate-limit slot atomically before dripping, so a burst of
+    /// parallel requests from one IP to one address gets one drip, not one per request that
+    /// passed a check before any recorded; a drip that fails gives the slot back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn faucet_limits_hold_under_concurrent_requests() {
+        let (root, n) = node("faucetrace");
+        let a = crate::crypto::Keys::from_seed([5; 32]).address();
+        let tasks: Vec<_> = (0..32).map(|_| {
+            let (n, a) = (n.clone(), a.clone());
+            tokio::spawn(async move { call(&n, "POST", "/api/faucet", Some(json!({ "to": a })), "203.0.113.5:1").await.0 })
+        }).collect();
+        let mut ok = 0;
+        for t in tasks {
+            match t.await.unwrap() {
+                StatusCode::OK => ok += 1,
+                s => assert_eq!(s, StatusCode::TOO_MANY_REQUESTS),
+            }
+        }
+        assert_eq!(ok, 1, "one drip per IP and address window");
+        // A reserved slot that's given back is free again; others' hits stay.
+        let rules = vec![("k".to_string(), 1, Duration::from_secs(60))];
+        let at = n.limits.allow(&rules).unwrap();
+        assert!(n.limits.allow(&rules).is_err());
+        n.limits.refund(&rules, at);
+        n.limits.allow(&rules).unwrap();
+        assert!(n.limits.allow(&rules).is_err());
         std::fs::remove_dir_all(root).ok();
     }
 
