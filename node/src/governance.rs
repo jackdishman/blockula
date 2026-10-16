@@ -523,7 +523,7 @@ fn vote(state: &mut State, j: &mut Journal, sender: &str, signer: &str, key: &Ke
         None => (amount, until),
     };
     let council = if height < cp.bootstrap_end_height { crate::staking::validator_for_signer(state, sender, signer, state.params.epoch_of(height)) } else { None };
-    crate::econ::lock(state, j, sender, format!("vote:{id}"), lock_amount, locked_until)?;
+    crate::econ::lock(state, j, sender, format!("vote:{id}"), lock_amount, locked_until, height)?;
     let p = proposal_mut(state, j, id);
     if let Some(v) = &prev {
         let (amt, w) = if v.aye { (&mut p.aye_amount, &mut p.aye_weight) } else { (&mut p.nay_amount, &mut p.nay_weight) };

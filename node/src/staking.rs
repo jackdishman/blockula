@@ -587,7 +587,7 @@ fn room_for_entry(state: &State, delegator: &str) -> Result<()> {
 /// ReportEquivocation. Session keys never get here (admission lets them send transfers only).
 pub(crate) fn apply(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, signer: &str, _key: &KeyRecord, height: u64) -> Result<()> {
     match &tx.action {
-        Action::Delegate { validator, amount } => {
+        Action::Delegate { validator, amount } => own_move(state, j, sender, height, |state, j| {
             accepting(state, validator)?;
             if !state.staking.delegations.contains_key(&dkey(sender, validator)) && *amount < MIN_DELEGATION {
                 bail!("a new delegation is at least {}", fmt_fang(MIN_DELEGATION));
@@ -595,8 +595,8 @@ pub(crate) fn apply(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, s
             state.j_debit(j, sender, *amount)?;
             bond(state, j, sender, validator, *amount, *amount)?;
             check_insider_cap(state, sender, validator, height)
-        }
-        Action::Undelegate { validator, shares } => {
+        }),
+        Action::Undelegate { validator, shares } => own_move(state, j, sender, height, |state, j| {
             room_for_entry(state, sender)?;
             let (value, principal) = unbond(state, j, sender, validator, *shares as u128)?;
             lock_gains(state, j, sender, value.saturating_sub(principal), height);
@@ -605,8 +605,8 @@ pub(crate) fn apply(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, s
                 add_entry(state, j, sender, Entry::Unbonding { validator: validator.clone(), amount: value, started_at: height, release_at });
             }
             Ok(())
-        }
-        Action::Redelegate { from_validator: from, to_validator: to, shares } => {
+        }),
+        Action::Redelegate { from_validator: from, to_validator: to, shares } => own_move(state, j, sender, height, |state, j| {
             accepting(state, to)?;
             if let Some(e) = entries_of(state, sender).find_map(|(_, e)| match e {
                 Entry::Redelegation { to: t, release_at, .. } if t == from && *release_at > height => Some(*release_at),
@@ -624,7 +624,7 @@ pub(crate) fn apply(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, s
             let release_at = release_height(state, height);
             add_entry(state, j, sender, Entry::Redelegation { from: from.clone(), to: to.clone(), amount: value, started_at: height, release_at });
             Ok(())
-        }
+        }),
         Action::WithdrawUnbonded {} => {
             let ready: Vec<(String, Entry)> = entries_of(state, sender).filter(|(_, e)| e.release_at() <= height).map(|(k, e)| (k.clone(), e.clone())).collect();
             if ready.is_empty() {
@@ -767,13 +767,31 @@ pub(crate) fn register(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str
         bail!("that consensus key is already registered (its owner can delegate to it to bond more)");
     }
     crate::chain::verify_pop(&tx.chain_id, sender, consensus_key, p2p_addr, http_addr, pop)?;
-    state.j_debit(j, sender, *self_bond)?;
-    let epoch = state.params.epoch_of(height);
-    let rec = ValidatorRecord { address: address.clone(), owner: sender.to_string(), consensus_key: consensus_key.clone(), p2p_addr: p2p_addr.clone(), http_addr: http_addr.clone(), status: ValidatorStatus::Candidate, registered_at: height, approved_at: None, approved_by: None, active_from: None, removed_at: None, removed_by: None, active_until: None, commission_bps: 0 };
-    state.insert_validator(j, rec);
-    put_pool(state, j, &address, Pool { commission_epoch: epoch, ..Default::default() });
-    bond(state, j, sender, &address, *self_bond, *self_bond)?;
-    check_insider_cap(state, sender, &address, height)
+    own_move(state, j, sender, height, |state, j| {
+        state.j_debit(j, sender, *self_bond)?;
+        let epoch = state.params.epoch_of(height);
+        let rec = ValidatorRecord { address: address.clone(), owner: sender.to_string(), consensus_key: consensus_key.clone(), p2p_addr: p2p_addr.clone(), http_addr: http_addr.clone(), status: ValidatorStatus::Candidate, registered_at: height, approved_at: None, approved_by: None, active_from: None, removed_at: None, removed_by: None, active_until: None, commission_bps: 0 };
+        state.insert_validator(j, rec);
+        put_pool(state, j, &address, Pool { commission_epoch: epoch, ..Default::default() });
+        bond(state, j, sender, &address, *self_bond, *self_bond)?;
+        check_insider_cap(state, sender, &address, height)
+    })
+}
+
+/// Runs one of `sender`'s own staking moves (delegating, unbonding, redelegating, registering a
+/// validator) and records how far it took the sender's transferable balance down in
+/// `Journal::lock_slack`. The tokens stay in the sender's holdings: liquid ones become stake,
+/// stake becomes an unbonding entry or other stake, and gains being sold join the vesting lock
+/// (`lock_gains`); only rounding dust of under a share's worth stays in a pool, since rounding
+/// favours the pool. So the lock check (`econ::check_locks`) doesn't count that drop as moving
+/// locked tokens out: an account whose tokens are all locked can still stake them at any share
+/// price.
+fn own_move(state: &mut State, j: &mut Journal, sender: &str, height: u64, f: impl FnOnce(&mut State, &mut Journal) -> Result<()>) -> Result<()> {
+    let before = crate::econ::free(state, sender, height);
+    f(state, j)?;
+    let drop = before - crate::econ::free(state, sender, height);
+    j.lock_slack = j.lock_slack.saturating_add(drop.clamp(0, u64::MAX as i128) as u64);
+    Ok(())
 }
 
 /// A genesis operator's pool: the self-bond (already out of the owner's balance) as the owner's
@@ -1300,7 +1318,20 @@ pub fn entries_of_account(state: &State, account: &str) -> Vec<(u64, Entry)> {
 
 /// What `account` has staked: its shares' value across pools, and its unbonding entries' total.
 pub fn holdings(state: &State, account: &str) -> (u64, u64) {
-    let bonded = owned_by(&state.staking.delegations, account).filter_map(|(k, d)| state.staking.pools.get(k.split_once('/')?.1).map(|p| p.value(d.shares))).fold(0u64, u64::saturating_add);
+    holdings_valued(state, account, false)
+}
+
+/// [`holdings`], each delegation counted at most at its principal (what was put in): what covers
+/// a vesting account's locks (econ.rs). Gains not sold yet are rewards earned by locked tokens,
+/// which vest with them (3.7: `lock_gains` adds them to the vesting lock when they're sold), so
+/// they can't cover the lock before that.
+pub fn holdings_at_cost(state: &State, account: &str) -> (u64, u64) {
+    holdings_valued(state, account, true)
+}
+
+fn holdings_valued(state: &State, account: &str, at_cost: bool) -> (u64, u64) {
+    let worth = |p: &Pool, d: &Delegation| if at_cost { p.value(d.shares).min(d.principal) } else { p.value(d.shares) };
+    let bonded = owned_by(&state.staking.delegations, account).filter_map(|(k, d)| state.staking.pools.get(k.split_once('/')?.1).map(|p| worth(p, d))).fold(0u64, u64::saturating_add);
     let unbonding = entries_of(state, account)
         .filter_map(|(_, e)| match e {
             Entry::Unbonding { amount, .. } => Some(*amount),

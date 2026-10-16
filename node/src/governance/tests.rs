@@ -434,6 +434,48 @@ fn unvested_tokens_dont_vote() {
     assert!(u < 170_000 * FANG as u128);
 }
 
+/// Audit F03: a vote lock holds vested tokens, on top of what's still vesting, so a vesting
+/// account (the founder here) can't vote, move the same tokens to another account and vote them
+/// again; a plain account can't either. Before the fix the founder's 1M FANG vesting lock
+/// swallowed its 99 FANG vote lock (the larger applied), and 98 FANG voted twice.
+#[test]
+fn a_vesting_account_cant_vote_and_move_the_same_tokens() {
+    let mut t = T::new(&[]);
+    let id = t.propose(ALICE, text());
+    let founder = addr(FOUNDER);
+    t.tx(ALICE, Action::Transfer { to: founder.clone(), amount: 100 * FANG }).unwrap();
+    let before = crate::econ::transferable(&t.st, &founder, t.h);
+    t.vote(FOUNDER, id, true, 99, 1).unwrap();
+    let after = crate::econ::transferable(&t.st, &founder, t.h);
+    assert!(after < FANG && before > 99 * FANG, "the vote locks 99 of its ~100 liquid FANG: {before} → {after}");
+    let e = t.err(FOUNDER, Action::Transfer { to: addr(DAVE), amount: 98 * FANG });
+    assert!(e.contains("is locked"), "{e}");
+    assert_eq!(t.p(id).aye_amount, (99 * FANG) as u128);
+    // Once the lock lapses the tokens move.
+    let until = t.st.governance.votes[&IdKey::new(id, &founder)].locked_until;
+    t.through(until - 1);
+    t.tx(FOUNDER, Action::Transfer { to: addr(DAVE), amount: 98 * FANG }).unwrap();
+}
+
+/// Audit F42: a voter who voted everything it could can still change its vote (the re-vote's
+/// fee took its holdings below the lock, which only needs to cover what grows it).
+#[test]
+fn a_full_balance_voter_can_change_its_vote() {
+    let mut t = T::new(&[]);
+    let id = t.propose(ALICE, text());
+    let all = crate::econ::voting_balance(&t.st, &addr(CAROL), t.h);
+    // What's left once this vote's own fee is paid: everything.
+    let fee = min_fee(Tx { chain_id: CHAIN.into(), genesis_hash: "00".repeat(32), from: addr(CAROL), nonce: 0, fee: 0, tip: 0, valid_until: 0, action: Action::Vote { proposal_id: id, aye: true, amount: all, conviction: 0 }, memo: String::new(), public_key: hex::encode(keys(CAROL).public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) }.size());
+    t.tx(CAROL, Action::Vote { proposal_id: id, aye: true, amount: all - fee, conviction: 0 }).unwrap();
+    assert_eq!(crate::econ::transferable(&t.st, &addr(CAROL), t.h), 0);
+    t.vote(CAROL, id, false, 1, 0).unwrap();
+    t.tx(CAROL, Action::Vote { proposal_id: id, aye: false, amount: 1, conviction: 1 }).unwrap();
+    let p = t.p(id);
+    assert_eq!((p.aye_amount, p.nay_amount, p.voters), (0, 1, 1));
+    let v = &t.st.governance.votes[&IdKey::new(id, &addr(CAROL))];
+    assert_eq!((v.amount, v.lock_amount), (1, all - fee), "the lock never shrinks");
+}
+
 #[test]
 fn the_bootstrap_council_passes_proposals_until_the_bootstrap_ends() {
     let mut t = T::new(&[("bootstrap_end_height", 1_000)]);

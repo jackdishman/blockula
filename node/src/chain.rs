@@ -562,6 +562,11 @@ pub struct Journal {
     pub(crate) beacon: crate::beacon::BeaconJournal,
     pub(crate) upgrade: crate::upgrade::UpgradeJournal,
     pub(crate) ghost: crate::ghost::GhostJournal,
+    /// Not an undo record: how far the sender's own staking moves (delegating, unbonding,
+    /// redelegating) took its transferable balance down (`staking::own_move`). They keep its
+    /// tokens in its holdings, short of rounding dust that stays in a pool, so the lock check
+    /// doesn't count that drop as moving locked tokens out (`econ::check_locks`).
+    pub(crate) lock_slack: u64,
 }
 
 impl Journal {
@@ -580,7 +585,8 @@ impl Journal {
 
     /// Folds a nested journal in, keeping the oldest values. Exhaustive, like `State::rollback`.
     fn absorb(&mut self, other: Journal) {
-        let Journal { accounts, names, validators, hunts, github, github_by_account, familiars, scalars, next_hunt_id, chain_params, poc, staking, governance, econ, beacon, upgrade, ghost } = other;
+        let Journal { accounts, names, validators, hunts, github, github_by_account, familiars, scalars, next_hunt_id, chain_params, poc, staking, governance, econ, beacon, upgrade, ghost, lock_slack } = other;
+        self.lock_slack = self.lock_slack.saturating_add(lock_slack);
         self.accounts.absorb(accounts);
         self.names.absorb(names);
         self.validators.absorb(validators);
@@ -653,16 +659,24 @@ pub struct Account {
 }
 
 impl Account {
-    /// What its locks hold at `height`: they overlap, so the largest applies (MAINNET-DESIGN
-    /// 3.7: transferable = liquid − max(0, that − staked − unbonding)). econ.rs enforces it.
+    /// What its locks hold at `height`: what's still vesting, plus the largest vote lock
+    /// (MAINNET-DESIGN 3.7: transferable = liquid − max(0, that − staked − unbonding)). econ.rs
+    /// enforces it. Vote locks overlap each other (the same tokens vote on many proposals), but
+    /// they hold vested tokens only (unvested ones don't vote, `econ::voting_balance`), so they
+    /// come on top of the vesting lock rather than inside it: a vote can't free its tokens to
+    /// vote again from another account (audit F03).
     pub fn locked_at(&self, height: u64) -> u64 {
-        self.locks.iter().map(|l| l.amount.locked_at(height)).max().unwrap_or(0)
+        self.unvested_at(height).saturating_add(self.vote_locked_at(height))
     }
 
     /// What its vesting locks hold at `height` (unvested tokens: they don't vote).
-    #[cfg_attr(not(test), allow(dead_code))] // econ::voting_balance (P-GOV)
     pub fn unvested_at(&self, height: u64) -> u64 {
         self.locks.iter().filter(|l| matches!(l.amount, LockAmount::Vesting { .. })).map(|l| l.amount.locked_at(height)).max().unwrap_or(0)
+    }
+
+    /// What its vote locks hold at `height`: they overlap, so the largest.
+    pub fn vote_locked_at(&self, height: u64) -> u64 {
+        self.locks.iter().filter(|l| matches!(l.amount, LockAmount::Until { .. })).map(|l| l.amount.locked_at(height)).max().unwrap_or(0)
     }
 }
 
@@ -1077,7 +1091,7 @@ impl State {
 
     /// Undoes everything recorded in `j` (values, and the dirty marks of keys it cleans up).
     pub fn rollback(&mut self, j: Journal) {
-        let Journal { accounts, names, validators, hunts, github, github_by_account, familiars, scalars, next_hunt_id, chain_params, poc, staking, governance, econ, beacon, upgrade, ghost } = j;
+        let Journal { accounts, names, validators, hunts, github, github_by_account, familiars, scalars, next_hunt_id, chain_params, poc, staking, governance, econ, beacon, upgrade, ghost, lock_slack: _ } = j;
         accounts.restore(&mut self.accounts);
         names.restore(&mut self.names);
         validators.restore(&mut self.validators);
@@ -1238,7 +1252,7 @@ impl State {
         let result = action.and_then(|()| {
             let touched = aj.touched_accounts();
             crate::econ::charge_new_accounts(self, &mut aj, &touched, &sender, &signer, &key)?;
-            crate::econ::check_locks(self, &touched, &sender, free, height)
+            crate::econ::check_locks(self, &touched, &sender, free, aj.lock_slack, height)
         });
         match result {
             Ok(()) => {

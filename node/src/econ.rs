@@ -29,12 +29,17 @@
 //! the contribution pool. The treasury's lock limits what `TreasurySpend` may move
 //! ([`transferable`]); its inflows (issuance, name fees) are free at once.
 //!
-//! **Locks.** `Account::locks` overlap: the largest applies. Transferable balance = liquid −
-//! max(0, largest lock − staked − unbonding), so locked tokens can be staked and delegated, never
-//! moved out. Every tx's action phase is checked ([`check_locks`]): an account may not end it
-//! with less transferable than zero (or less than it had, if fees already took it below). Fees
-//! may come from locked tokens. Staking rewards credited to a vesting account join its lock
-//! ([`lock_rewards`]). Votes lock with [`lock`]; [`voting_balance`] leaves unvested tokens out.
+//! **Locks.** What an account's locks hold is what's still vesting plus the largest vote lock
+//! (`Account::locked_at`): vote locks overlap each other, but votes only use vested tokens, so a
+//! vote lock comes on top of the vesting lock (audit F03). Transferable balance = liquid −
+//! max(0, locked − staked − unbonding), so locked tokens can be staked and delegated, never moved
+//! out; a vesting account's stake covers its locks at cost (each delegation at most its
+//! principal: gains not sold yet vest with the allocation, `staking::holdings_at_cost`). Every
+//! tx's action phase is checked ([`check_locks`]): an account may not end it with less
+//! transferable than zero (or less than it had, if fees already took it below), the sender's own
+//! staking moves aside (`Journal::lock_slack`: they keep its tokens). Fees may come from locked
+//! tokens. Staking rewards credited to a vesting account join its lock ([`lock_rewards`]). Votes
+//! lock with [`lock`]; [`voting_balance`] leaves unvested tokens out.
 //!
 //! **Accounts.** An action that opens an account (a transfer to a new address, a hunt awarded to
 //! one…) burns `account_creation_fee` per account from the sender, on top of what it moves
@@ -389,25 +394,28 @@ pub fn issue(state: &mut State, epoch: u64) {
 
 // ---- locks (3.7) ----
 
-/// What `account` can move out at `height`: liquid − max(0, largest lock − staked − unbonding).
+/// What `account` can move out at `height`: liquid − max(0, locked − staked − unbonding), where
+/// locked is what's still vesting plus the largest vote lock (`Account::locked_at`).
 pub fn transferable(state: &State, account: &str, height: u64) -> u64 {
     free(state, account, height).clamp(0, u64::MAX as i128) as u64
 }
 
-/// [`transferable`] before clamping: negative when fees (or a slash) took locked tokens.
+/// [`transferable`] before clamping: negative when fees (or a slash) took locked tokens. An
+/// account that's still vesting counts its stake at cost (`staking::holdings_at_cost`): what
+/// staking earned on locked tokens vests with them, so it can't free liquid tokens before it
+/// does (3.7).
 pub fn free(state: &State, account: &str, height: u64) -> i128 {
     let Some(a) = state.accounts.get(account) else { return 0 };
     let locked = a.locked_at(height);
     if locked == 0 {
         return a.balance as i128;
     }
-    let (staked, unbonding) = crate::staking::holdings(state, account);
+    let (staked, unbonding) = if a.unvested_at(height) > 0 { crate::staking::holdings_at_cost(state, account) } else { crate::staking::holdings(state, account) };
     a.balance as i128 - (locked as i128 - staked as i128 - unbonding as i128).max(0)
 }
 
 /// What `account` may vote with at `height`: its holdings (liquid + staked + unbonding) minus
 /// what its vesting locks still hold. Vote locks don't count: one stake votes on many proposals.
-#[cfg_attr(not(test), allow(dead_code))] // P-GOV (votes)
 pub fn voting_balance(state: &State, account: &str, height: u64) -> u64 {
     let Some(a) = state.accounts.get(account) else { return 0 };
     let (staked, unbonding) = crate::staking::holdings(state, account);
@@ -415,17 +423,24 @@ pub fn voting_balance(state: &State, account: &str, height: u64) -> u64 {
     held.saturating_sub(a.unvested_at(height) as u128).min(u64::MAX as u128) as u64
 }
 
-/// Locks `amount` of `account`'s holdings until (not including) height `until` under `id` (e.g.
-/// `"vote:<proposal>"`). Locks overlap: the largest applies. Locking an id again only extends it
-/// (the larger amount, the later end), so a lock never shrinks before it expires.
-#[cfg_attr(not(test), allow(dead_code))] // P-GOV (vote locks)
-pub fn lock(state: &mut State, j: &mut Journal, account: &str, id: String, amount: u64, until: u64) -> Result<()> {
+/// Locks `amount` of `account`'s vested holdings ([`voting_balance`]) until (not including)
+/// height `until` under `id` (e.g. `"vote:<proposal>"`). Vote locks overlap each other (the
+/// largest applies) and come on top of what's still vesting. Locking an id again only extends it
+/// (the larger amount, the later end), so a lock never shrinks before it expires; only the part
+/// that grows it must be held now, so a re-vote never fails over what the lock already holds,
+/// even after fees took the holdings below it (audit F42).
+pub fn lock(state: &mut State, j: &mut Journal, account: &str, id: String, amount: u64, until: u64, height: u64) -> Result<()> {
     ensure!(!id.is_empty() && id.len() <= MAX_LABEL && id != VESTING_LOCK, "lock ids are 1–{MAX_LABEL} bytes (not “{VESTING_LOCK}”)");
     let a = state.accounts.get(account).ok_or_else(|| anyhow!("{} has no account", short(account)))?;
-    let (staked, unbonding) = crate::staking::holdings(state, account);
-    let held = a.balance as u128 + staked as u128 + unbonding as u128;
-    ensure!(amount as u128 <= held, "can't lock {}: {} holds {}", fmt_fang(amount), short(account), fmt_fang(held.min(u64::MAX as u128) as u64));
     let existing = a.locks.iter().position(|l| l.id == id);
+    let holds = existing.map_or(0, |i| match a.locks[i].amount {
+        LockAmount::Until { .. } => a.locks[i].amount.locked_at(height),
+        LockAmount::Vesting { .. } => 0,
+    });
+    if amount > holds {
+        let can = voting_balance(state, account, height);
+        ensure!(amount <= can, "can't lock {}: {} holds {} it could lock (vested liquid, staked and unbonding FANG)", fmt_fang(amount), short(account), fmt_fang(can));
+    }
     ensure!(existing.is_some() || a.locks.len() < MAX_LOCKS, "{} already has {MAX_LOCKS} locks; unlock expired ones first", short(account));
     let locks = &mut state.acct_mut(j, account).locks;
     match existing {
@@ -472,16 +487,18 @@ pub fn lock_rewards(state: &mut State, j: &mut Journal, account: &str, amount: u
 /// After a tx's action: no account it touched may hold less transferable than zero, and the
 /// sender none less than it had (`free_before`, which fees may have taken below zero). Moving
 /// liquid tokens into stake keeps the lock covered, so staking locked tokens passes; moving them
-/// out doesn't. `touched` comes from the action's journal (sorted, so the first error is the
-/// same everywhere).
-pub fn check_locks(state: &State, touched: &[(String, Option<u64>)], sender: &str, free_before: i128, height: u64) -> Result<()> {
+/// out doesn't. `slack` is how far the sender's own staking moves took its transferable balance
+/// down (`Journal::lock_slack`): they keep its tokens (short of a pool's rounding dust), so they
+/// pass even when every token is locked. `touched` comes from the action's journal (sorted, so
+/// the first error is the same everywhere).
+pub fn check_locks(state: &State, touched: &[(String, Option<u64>)], sender: &str, free_before: i128, slack: u64, height: u64) -> Result<()> {
     for (addr, old_balance) in touched {
         let Some(a) = state.accounts.get(addr) else { continue };
         if a.locks.is_empty() {
             continue;
         }
         let after = free(state, addr, height);
-        let (ok, could) = if addr == sender { (after >= free_before.min(0), free_before) } else { (a.balance >= old_balance.unwrap_or(0) || after >= 0, 0) };
+        let (ok, could) = if addr == sender { (after + slack as i128 >= free_before.min(0), free_before) } else { (a.balance >= old_balance.unwrap_or(0) || after >= 0, 0) };
         if !ok {
             let reason = a.locks.iter().max_by_key(|l| l.amount.locked_at(height)).map(|l| l.reason.clone()).unwrap_or_default();
             bail!("{} of {}'s FANG is locked ({reason}): locked tokens can be staked but not moved out, and it can move {} now", fmt_fang(a.locked_at(height)), short(addr), fmt_fang(could.clamp(0, u64::MAX as i128) as u64));
@@ -1144,25 +1161,25 @@ mod tests {
         st.accounts.insert(a.clone(), Account { balance: 100 * FANG, ..Default::default() });
         st.supply = 100 * FANG;
         let mut j = Journal::default();
-        lock(&mut st, &mut j, &a, "vote:1".into(), 60 * FANG, 50).unwrap();
+        lock(&mut st, &mut j, &a, "vote:1".into(), 60 * FANG, 50, 1).unwrap();
         assert_eq!(transferable(&st, &a, 10), 40 * FANG);
-        lock(&mut st, &mut j, &a, "vote:2".into(), 80 * FANG, 30).unwrap();
+        lock(&mut st, &mut j, &a, "vote:2".into(), 80 * FANG, 30, 1).unwrap();
         assert_eq!((transferable(&st, &a, 10), transferable(&st, &a, 30), transferable(&st, &a, 50)), (20 * FANG, 40 * FANG, 100 * FANG));
         // Locking an id again only extends it.
-        lock(&mut st, &mut j, &a, "vote:1".into(), 10 * FANG, 20).unwrap();
+        lock(&mut st, &mut j, &a, "vote:1".into(), 10 * FANG, 20, 1).unwrap();
         assert_eq!(transferable(&st, &a, 40), 40 * FANG);
-        lock(&mut st, &mut j, &a, "vote:1".into(), 70 * FANG, 60).unwrap();
+        lock(&mut st, &mut j, &a, "vote:1".into(), 70 * FANG, 60, 1).unwrap();
         assert_eq!(transferable(&st, &a, 55), 30 * FANG);
         assert_eq!(voting_balance(&st, &a, 10), 100 * FANG, "vote locks don't reduce voting weight");
         // Bounds.
-        assert!(lock(&mut st, &mut j, &a, "vote:3".into(), 101 * FANG, 60).unwrap_err().to_string().contains("can't lock"));
-        assert!(lock(&mut st, &mut j, &a, VESTING_LOCK.into(), FANG, 60).is_err());
-        assert!(lock(&mut st, &mut j, &a, String::new(), FANG, 60).is_err());
-        assert!(lock(&mut st, &mut j, &v, "vote:1".into(), 0, 60).unwrap_err().to_string().contains("no account"));
+        assert!(lock(&mut st, &mut j, &a, "vote:3".into(), 101 * FANG, 60, 1).unwrap_err().to_string().contains("can't lock"));
+        assert!(lock(&mut st, &mut j, &a, VESTING_LOCK.into(), FANG, 60, 1).is_err());
+        assert!(lock(&mut st, &mut j, &a, String::new(), FANG, 60, 1).is_err());
+        assert!(lock(&mut st, &mut j, &v, "vote:1".into(), 0, 60, 1).unwrap_err().to_string().contains("no account"));
         for i in 2..MAX_LOCKS as u64 {
-            lock(&mut st, &mut j, &a, format!("vote:{}", i + 1), FANG, 10).unwrap();
+            lock(&mut st, &mut j, &a, format!("vote:{}", i + 1), FANG, 10, 1).unwrap();
         }
-        assert!(lock(&mut st, &mut j, &a, "vote:999".into(), FANG, 10).unwrap_err().to_string().contains("locks"));
+        assert!(lock(&mut st, &mut j, &a, "vote:999".into(), FANG, 10, 1).unwrap_err().to_string().contains("locks"));
         check_invariants(&st).unwrap();
         // Expired locks go with `Unlock`; the live one stays.
         assert_eq!(release_expired(&mut st, &mut j, &a, 30), MAX_LOCKS as u64 - 1);
@@ -1172,6 +1189,17 @@ mod tests {
         st.acct_mut(&mut j, &a).locks.push(Lock { id: VESTING_LOCK.into(), amount: LockAmount::Vesting { total: 90 * FANG, start: 0, cliff: 100, end: 200 }, reason: "founder".into() });
         assert_eq!((voting_balance(&st, &a, 10), voting_balance(&st, &a, 150), voting_balance(&st, &a, 200)), (10 * FANG, 77 * FANG + FANG / 2, 100 * FANG));
         assert_eq!(voting_balance(&st, &v, 10), 0);
+        // A vote lock holds vested tokens, so it comes on top of the vesting lock (F03): 90
+        // unvested + 70 voted is more than the 100 held until the vote lock ends at 60.
+        assert_eq!(st.account(&a).locked_at(55), 160 * FANG);
+        assert_eq!((transferable(&st, &a, 55), transferable(&st, &a, 60), transferable(&st, &a, 150)), (0, 10 * FANG, 77 * FANG + FANG / 2));
+        // Re-locking an id only needs the part that grows it (F42): with fees having taken the
+        // holdings below the lock, the same lock (or a smaller ask) still goes through.
+        st.acct_mut(&mut j, &a).balance = 75 * FANG;
+        lock(&mut st, &mut j, &a, "vote:1".into(), 70 * FANG, 60, 55).unwrap();
+        lock(&mut st, &mut j, &a, "vote:1".into(), FANG, 60, 55).unwrap();
+        assert!(lock(&mut st, &mut j, &a, "vote:1".into(), 71 * FANG, 60, 55).unwrap_err().to_string().contains("can't lock"));
+        assert!(lock(&mut st, &mut j, &a, "vote:4".into(), FANG, 60, 55).unwrap_err().to_string().contains("can't lock"), "75 held, 90 unvested: nothing to vote with");
         // All of it under one journal: rolled back, nothing is left.
         st.rollback(j);
         assert!(st.account(&a).locks.is_empty());
@@ -1217,14 +1245,14 @@ mod tests {
         st.accounts.insert(sender.clone(), Account { balance: FANG, ..Default::default() });
         st.accounts.insert(other.clone(), locked(40 * FANG));
         // `other` went from 60 to 40 FANG with 50 locked: refused. Receiving is always fine.
-        let e = check_locks(&st, &[(other.clone(), Some(60 * FANG))], &sender, FANG as i128, 10).unwrap_err().to_string();
+        let e = check_locks(&st, &[(other.clone(), Some(60 * FANG))], &sender, FANG as i128, 0, 10).unwrap_err().to_string();
         assert!(e.contains("is locked (vote on proposal #1)"), "{e}");
-        check_locks(&st, &[(other.clone(), Some(30 * FANG))], &sender, FANG as i128, 10).unwrap();
-        check_locks(&st, &[(other.clone(), Some(60 * FANG))], &sender, FANG as i128, 100).unwrap();
+        check_locks(&st, &[(other.clone(), Some(30 * FANG))], &sender, FANG as i128, 0, 10).unwrap();
+        check_locks(&st, &[(other.clone(), Some(60 * FANG))], &sender, FANG as i128, 0, 100).unwrap();
         // The sender may not go further below zero than fees took it.
         st.accounts.insert(sender.clone(), locked(49 * FANG));
-        check_locks(&st, &[(sender.clone(), Some(49 * FANG))], &sender, -(FANG as i128), 10).unwrap();
-        assert!(check_locks(&st, &[(sender.clone(), Some(50 * FANG))], &sender, 0, 10).is_err());
+        check_locks(&st, &[(sender.clone(), Some(49 * FANG))], &sender, -(FANG as i128), 0, 10).unwrap();
+        assert!(check_locks(&st, &[(sender.clone(), Some(50 * FANG))], &sender, 0, 0, 10).is_err());
     }
 
     /// DEC-6: an action that opens an account burns the creation fee from the sender, on top of

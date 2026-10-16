@@ -937,6 +937,45 @@ fn vesting_accounts_have_a_cap_per_pool_and_their_rewards_vest() {
     t.ok(&founder, Action::Delegate { validator: vaddr(2), amount: cap + FANG });
 }
 
+/// An account whose every token is locked can stake them at any share price: a delegation to a
+/// pool whose shares are worth more than a drop loses a drop of rounding to the pool, and that
+/// isn't moving locked tokens out (`Journal::lock_slack`). Unbonding and redelegating likewise.
+/// Meanwhile what the stake earned (not sold yet) doesn't cover the lock: it can't free liquid
+/// tokens before the cliff (3.7; audit F03's unrealized-gains case).
+#[test]
+fn fully_locked_accounts_stake_at_any_share_price_and_gains_dont_unlock() {
+    let founder = keys(211);
+    let mut t = Setup { accounts: vec![(founder.address(), 1_000_000 * FANG, Some(Vesting { start: 0, cliff: 1_000, end: 2_000 }))], ..Default::default() }.start();
+    let (v, f) = (vaddr(0), founder.address());
+    // Rewards make validator 0's shares worth more than a drop each.
+    let mut j = Journal::default();
+    t.st.j_mint(&mut j, 777_777 * FANG + 7);
+    let paid = distribute_rewards(&mut t.st, &mut j, 777_777 * FANG + 7, t.height);
+    t.st.j_burn(&mut j, 777_777 * FANG + 7 - paid);
+    let pool = t.st.staking.pools[&v].clone();
+    assert!(pool.stake as u128 > pool.shares);
+    assert_eq!(crate::econ::transferable(&t.st, &f, t.height), 0, "every token is locked");
+    // 1,000 FANG and 3 drops buys shares worth a drop less: still fine.
+    let amount = 1_000 * FANG + 3;
+    let shares = pool.shares_for(amount).unwrap();
+    assert!(Pool { stake: pool.stake + amount, shares: pool.shares + shares, ..pool.clone() }.value(shares) < amount, "the purchase loses rounding to the pool");
+    t.ok(&founder, Action::Delegate { validator: v.clone(), amount });
+    t.ok(&founder, Action::Delegate { validator: vaddr(1), amount: 500 * FANG });
+    t.ok(&founder, Action::Redelegate { from_validator: v.clone(), to_validator: vaddr(2), shares: (t.shares(&f, &v) / 3) as u64 });
+    t.ok(&founder, Action::Undelegate { validator: v.clone(), shares: (t.shares(&f, &v) / 7) as u64 });
+    assert!(t.fails(&founder, Action::Transfer { to: keys(250).address(), amount: FANG }).contains("locked"));
+    // Stake earns; the gain stays locked until it's sold, then vests with the allocation.
+    let mut j = Journal::default();
+    t.st.j_mint(&mut j, 1_000_000 * FANG);
+    let paid = distribute_rewards(&mut t.st, &mut j, 1_000_000 * FANG, t.height);
+    t.st.j_burn(&mut j, 1_000_000 * FANG - paid);
+    let gain = delegation_value(&t.st, &f, &vaddr(1)) - t.st.staking.delegations[&dkey(&f, &vaddr(1))].principal;
+    assert!(gain > 10 * FANG, "{gain}");
+    assert_eq!(crate::econ::transferable(&t.st, &f, t.height), 0, "unrealized gains don't cover the vesting lock");
+    assert!(t.fails(&founder, Action::Transfer { to: keys(250).address(), amount: 10 * FANG }).contains("locked"));
+    t.block();
+}
+
 // ------------------------------------------------------------------------------- SF-13
 
 #[test]
