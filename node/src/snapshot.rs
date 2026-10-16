@@ -416,21 +416,22 @@ impl std::fmt::Display for SnapshotBehind {
 
 impl std::error::Error for SnapshotBehind {}
 
-/// The verifier for a validator set (hex consensus keys) on `g`'s chain.
-fn verifier_for(g: &Genesis, set: &[String]) -> Result<MlDsaScheme> {
+/// The verifier for a validator set (hex consensus keys) on the chain instance whose consensus
+/// namespace is `ns` (`consensus::genesis_namespace`).
+fn verifier_for(ns: &[u8], set: &[String]) -> Result<MlDsaScheme> {
     let participants = consensus::keys_of(set.iter().map(|s| s.as_str())).ok_or_else(|| anyhow!("bad validator keys"))?;
-    Ok(MlDsaScheme::verifier(&consensus::namespace(&g.chain_id), participants))
+    Ok(MlDsaScheme::verifier(ns, participants))
 }
 
 /// Checks the epoch anchor at height `a`: the block's height, and a valid finalization of it by
 /// the set of its epoch (`set`). Returns its hash.
-fn verify_anchor(g: &Genesis, set: &[String], a: u64, p: &Anchor) -> Result<String> {
+fn verify_anchor(g: &Genesis, ns: &[u8], set: &[String], a: u64, p: &Anchor) -> Result<String> {
     let block = CBlock::decode(hex::decode(&p.block)?.as_slice())?;
     if block.height != a {
         bail!("the anchor block is #{}, expected #{a}", block.height);
     }
     let epoch = g.params().epoch_of(a);
-    let verifier = verifier_for(g, set)?;
+    let verifier = verifier_for(ns, set)?;
     let fin = Finalization::<MlDsaScheme, Digest>::decode_cfg(hex::decode(&p.finalization)?.as_slice(), &verifier.certificate_codec_config())?;
     if fin.proposal.payload != block.digest() {
         bail!("the anchor certificate is for another block");
@@ -482,7 +483,9 @@ pub fn verify_manifest(g: &Genesis, m: &Manifest) -> Result<Verified> {
     let epoch = params.epoch_of(last.height);
     // Verifies every set change through `epoch`, so `m.epochs.set(e)` is trusted for e ≤ epoch.
     let set = epochs::verify_chain(g, &m.epochs, epoch).context("validator set history")?;
-    let verifier = verifier_for(g, &set)?;
+    // Certificates of this chain instance only (another genesis under the same id never verifies).
+    let ns = consensus::genesis_namespace(g);
+    let verifier = verifier_for(&ns, &set)?;
     let fin_bytes = hex::decode(&m.finalization)?;
     let fin = Finalization::<MlDsaScheme, Digest>::decode_cfg(fin_bytes.as_slice(), &verifier.certificate_codec_config())?;
     if fin.proposal.payload != last.digest() {
@@ -501,7 +504,7 @@ pub fn verify_manifest(g: &Genesis, m: &Manifest) -> Result<Verified> {
             let p = m.anchor.as_ref().ok_or_else(|| anyhow!("manifest doesn't certify the epoch anchor #{a}"))?;
             // a < m.height < last, so its epoch's set was verified above.
             let set = m.epochs.set(params.epoch_of(a)).ok_or_else(|| anyhow!("no validator set for the anchor's epoch"))?;
-            Some((a, verify_anchor(g, set, a, p).context("epoch anchor")?))
+            Some((a, verify_anchor(g, &ns, set, a, p).context("epoch anchor")?))
         }
     };
     Ok(Verified { height: m.height, state_root: m.state_root.clone(), chunks: m.chunks.clone(), blocks, finalization: fin_bytes, epochs: m.epochs.clone(), anchor: m.anchor.clone().filter(|_| epoch_start.is_some()), epoch_start })
@@ -719,7 +722,7 @@ mod tests {
     /// A finalization of `block` in `epoch` by 3 of the 4 `seeds` (a quorum), hex.
     fn finalization(g: &Genesis, seeds: &[[u8; 32]], block: &CBlock, epoch: u64) -> String {
         let participants = consensus::keys_of(keys(seeds).iter().map(String::as_str)).unwrap();
-        let ns = consensus::namespace(&g.chain_id);
+        let ns = consensus::genesis_namespace(g);
         let p = Proposal::new(Round::new(Epoch::new(epoch), View::new(block.height)), View::new(block.height - 1), block.digest());
         let votes: Vec<_> = seeds.iter().take(3).map(|s| Finalize::sign(&MlDsaScheme::signer(&ns, participants.clone(), PrivateKey::from_seed_bytes(*s)).unwrap(), p.clone()).unwrap()).collect();
         let fin = Finalization::from_finalizes(&MlDsaScheme::verifier(&ns, participants), commonware_utils::iter::NonEmpty::try_new(votes.iter()).unwrap(), &commonware_parallel::Sequential).unwrap();

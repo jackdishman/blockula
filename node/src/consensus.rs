@@ -73,8 +73,24 @@ pub const CH_BLOCKS: u64 = 4;
 pub const CH_MEMPOOL: u64 = 5;
 pub const CHANNELS: [u64; 6] = [CH_VOTES, CH_CERTS, CH_RESOLVER, CH_BACKFILL, CH_BLOCKS, CH_MEMPOOL];
 
-pub fn namespace(chain_id: &str) -> Vec<u8> {
-    format!("blockula/{chain_id}").into_bytes()
+/// The consensus signing domain of one chain *instance*: its id and its genesis hash (hex), as
+/// `Tx::signing_bytes` binds txs (audit #7). Every vote and certificate is signed under it, so a
+/// relaunch that keeps the chain id (same validator keys, another genesis) shares no valid
+/// signature with the old chain: its certificates can't be replayed here, or paired with this
+/// chain's votes into equivocation evidence.
+pub fn namespace(chain_id: &str, genesis_hash: &str) -> Vec<u8> {
+    format!("blockula/{chain_id}/{genesis_hash}").into_bytes()
+}
+
+/// [`namespace`] of `g`'s chain (computes its genesis hash).
+pub fn genesis_namespace(g: &crate::chain::Genesis) -> Vec<u8> {
+    namespace(&g.chain_id, &crate::checkpoints::genesis_hash(g))
+}
+
+/// The p2p handshake's namespace: per chain id (`docs/PQ-TRANSPORT.md`), unchanged by the
+/// consensus domain above.
+pub fn p2p_namespace(chain_id: &str) -> Vec<u8> {
+    format!("blockula/{chain_id}/p2p").into_bytes()
 }
 
 /// Most unexecuted ancestors `propose` and `verify` replay before building on a block or judging
@@ -313,14 +329,235 @@ impl App {
 /// one of them (it needs no state); unsigned ghost txs have no signature, their proof authorizes
 /// them (ghost.rs).
 pub fn check_tx_stateless(tx: &Tx, chain_id: &str, genesis_hash: &str, prefix: &str) -> anyhow::Result<()> {
+    check_tx_unproven(tx, chain_id, genesis_hash, prefix)?;
+    crate::ghost::verify_proof(tx)
+}
+
+/// A tx's signature didn't verify (as opposed to a format error, which a peer on another release
+/// could relay in good faith).
+#[derive(Debug)]
+pub struct BadSignature(anyhow::Error);
+
+impl std::fmt::Display for BadSignature {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for BadSignature {}
+
+/// [`check_tx_stateless`] without the ghost proof: the cheap part, which gossip runs before it
+/// spends a proof verification on the tx. A bad signature is a [`BadSignature`].
+pub fn check_tx_unproven(tx: &Tx, chain_id: &str, genesis_hash: &str, prefix: &str) -> anyhow::Result<()> {
     tx.check_chain(chain_id, genesis_hash)?;
     tx.check_format()?;
     tx.check_prefix(prefix)?;
     crate::chain::check_fee(tx)?;
     if !tx.is_unsigned() {
-        tx.verify_signature()?;
+        tx.verify_signature().map_err(|e| anyhow::Error::new(BadSignature(e)))?;
     }
-    crate::ghost::verify_proof(tx)
+    Ok(())
+}
+
+// --------------------------------------------------------------------------- mempool gossip
+
+/// Ghost proofs one peer may have verified per second, and at once. Above the chain's own ghost
+/// throughput (`ghost_max_block_bytes` holds about seven a block), so honest relays never reach it.
+pub const GOSSIP_PROOFS_PER_SEC: u64 = 8;
+pub const GOSSIP_PROOF_BURST: u64 = 32;
+/// Ghost proof verifications in flight at once, over every peer.
+pub const GOSSIP_PROOFS_IN_FLIGHT: usize = 16;
+/// How long a peer's mempool gossip is dropped unread after it relayed a tx whose signature or
+/// proof doesn't verify. Honest nodes verify every tx before they relay it (HTTP and their own
+/// system txs), so that never happens by accident; votes and blocks from the peer are unaffected.
+pub const GOSSIP_MUTE_MS: u64 = 5 * 60_000;
+/// Gossiped txs (hashes of their wire bytes) remembered as invalid: the same bytes are never
+/// verified twice.
+const REMEMBERED_REJECTS: usize = 4_096;
+/// Peers whose budgets are remembered (only tracked peers connect: far fewer).
+const REMEMBERED_PEERS: usize = 1_024;
+
+/// Audit F30: keeps gossiped txs from costing verification out of proportion. The ingest loop
+/// drops duplicates (by id, against the mempool and finalized txs) and remembered rejects before
+/// any signature or proof work, verifies ghost proofs within a per-peer token bucket (and a cap
+/// in flight) off the loop, and mutes a peer that relays a bad signature or proof.
+pub struct GossipGate<K> {
+    peers: HashMap<K, PeerBudget>,
+    rejected: std::collections::HashSet<[u8; 32]>,
+    order: std::collections::VecDeque<[u8; 32]>,
+    /// Ids of the txs whose proofs are being verified (at most [`GOSSIP_PROOFS_IN_FLIGHT`]): the
+    /// same tx from another peer meanwhile is a duplicate too.
+    verifying: std::collections::HashSet<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PeerBudget {
+    /// Proof verifications available, in thousandths.
+    milli: u64,
+    at_ms: u64,
+    muted_until_ms: u64,
+}
+
+impl<K> Default for GossipGate<K> {
+    fn default() -> Self {
+        GossipGate { peers: HashMap::new(), rejected: Default::default(), order: Default::default(), verifying: Default::default() }
+    }
+}
+
+impl<K: std::hash::Hash + Eq + Clone> GossipGate<K> {
+    /// Whether a message is dropped unread: its peer is muted, or these bytes failed before.
+    pub fn drops(&self, peer: &K, fingerprint: &[u8; 32], now_ms: u64) -> bool {
+        self.peers.get(peer).is_some_and(|b| now_ms < b.muted_until_ms) || self.rejected.contains(fingerprint)
+    }
+
+    fn budget(&mut self, peer: &K, now_ms: u64) -> &mut PeerBudget {
+        if self.peers.len() >= REMEMBERED_PEERS && !self.peers.contains_key(peer) {
+            self.peers.retain(|_, b| now_ms < b.muted_until_ms);
+        }
+        let b = self.peers.entry(peer.clone()).or_insert(PeerBudget { milli: GOSSIP_PROOF_BURST * 1_000, at_ms: now_ms, muted_until_ms: 0 });
+        let refill = now_ms.saturating_sub(b.at_ms).saturating_mul(GOSSIP_PROOFS_PER_SEC);
+        b.milli = b.milli.saturating_add(refill).min(GOSSIP_PROOF_BURST * 1_000);
+        b.at_ms = b.at_ms.max(now_ms);
+        b
+    }
+
+    /// Whether the tx `id` is having its proof verified.
+    pub fn verifying(&self, id: &str) -> bool {
+        self.verifying.contains(id)
+    }
+
+    /// Takes one proof verification of the tx `id` from `peer`'s budget (and a slot in flight),
+    /// if it has one.
+    pub fn take_proof(&mut self, peer: &K, id: &str, now_ms: u64) -> bool {
+        if self.verifying.len() >= GOSSIP_PROOFS_IN_FLIGHT || self.verifying.contains(id) {
+            return false;
+        }
+        let b = self.budget(peer, now_ms);
+        if b.milli < 1_000 {
+            return false;
+        }
+        b.milli -= 1_000;
+        self.verifying.insert(id.to_string());
+        true
+    }
+
+    /// The proof verification of `id` that [`GossipGate::take_proof`] allowed has finished.
+    pub fn proof_done(&mut self, id: &str) {
+        self.verifying.remove(id);
+    }
+
+    /// These bytes are invalid (remembered); if `mute`, their signature or proof didn't verify,
+    /// and `peer` is muted for [`GOSSIP_MUTE_MS`].
+    pub fn reject(&mut self, peer: &K, fingerprint: [u8; 32], mute: bool, now_ms: u64) {
+        if self.rejected.insert(fingerprint) {
+            self.order.push_back(fingerprint);
+            while self.order.len() > REMEMBERED_REJECTS {
+                if let Some(old) = self.order.pop_front() {
+                    self.rejected.remove(&old);
+                }
+            }
+        }
+        if mute {
+            let b = self.budget(peer, now_ms);
+            b.muted_until_ms = now_ms.saturating_add(GOSSIP_MUTE_MS);
+            b.milli = 0;
+        }
+    }
+}
+
+/// What the mempool ingest loop does with one gossiped message.
+#[derive(Debug)]
+pub enum Screened {
+    /// Dropped. `verified` says whether it reached the signature check (a duplicate, a muted
+    /// peer's message or remembered-invalid bytes never do).
+    Dropped { why: &'static str, verified: bool },
+    /// Verified: into the mempool.
+    Admit(Tx),
+    /// Its signature verified; its ghost proof is next (the gate's budget is taken, so
+    /// [`GossipGate::proof_done`] must follow): `(tx, id, fingerprint)`.
+    Prove(Tx, String, [u8; 32]),
+}
+
+/// Screens one gossiped message, cheapest checks first (audit F30): its size (before it's copied
+/// or parsed), a muted peer or remembered-invalid bytes, then, once parsed, a tx already in the
+/// mempool, finalized or being verified, the fee against the next block's base fee and Ghost Mode
+/// being on; only then the ML-DSA signature, and a ghost proof only within the peer's budget.
+pub fn screen_gossip<K: std::hash::Hash + Eq + Clone>(gate: &Mutex<GossipGate<K>>, chain: &Shared, from: &K, raw: &[u8], now: u64) -> Screened {
+    let drop = |why| Screened::Dropped { why, verified: false };
+    // The kind's own bound (`Tx::from_bytes`) applies next; ghost txs are the largest.
+    if raw.len() > crate::types::MAX_GHOST_TX_BYTES {
+        return drop("too large");
+    }
+    let fingerprint = crate::crypto::hash(raw);
+    if gate.lock().drops(from, &fingerprint, now) {
+        return drop("muted peer or known-invalid bytes");
+    }
+    let Ok(tx) = Tx::from_bytes(raw) else {
+        return drop("unparseable");
+    };
+    let id = tx.id();
+    let (chain_id, genesis_hash, prefix, priced, ghost_off, known) = {
+        let c = chain.lock();
+        let next = c.height() + 1;
+        let known = c.in_mempool(&id) || c.has_tx(&id);
+        (c.genesis.chain_id.clone(), c.genesis_hash.clone(), c.genesis.address_prefix.clone(), crate::econ::check_fee(&c.state, &tx, next), tx.action.is_ghost() && crate::ghost::check_enabled(&c.state, next).is_err(), known)
+    };
+    if known || gate.lock().verifying(&id) {
+        return drop("already known");
+    }
+    if ghost_off {
+        return drop("Ghost Mode is off");
+    }
+    if priced.is_err() {
+        return drop("below the base fee");
+    }
+    // Format and the ML-DSA signature: failures are remembered, and a bad signature mutes the peer
+    // (honest nodes verify every tx before they send it: HTTP submissions and their own txs, and
+    // gossip isn't relayed).
+    if let Err(e) = check_tx_unproven(&tx, &chain_id, &genesis_hash, &prefix) {
+        let bad_signature = e.is::<BadSignature>();
+        gate.lock().reject(from, fingerprint, bad_signature, now);
+        return Screened::Dropped { why: if bad_signature { "bad signature" } else { "invalid" }, verified: true };
+    }
+    if tx.action.ghost_bundle().is_none() {
+        return Screened::Admit(tx);
+    }
+    if !gate.lock().take_proof(from, &id, now) {
+        return Screened::Dropped { why: "over the peer's proof budget", verified: true };
+    }
+    Screened::Prove(tx, id, fingerprint)
+}
+
+/// Verifies the ghost proof of a tx [`screen_gossip`] passed on, and admits it, or remembers its
+/// bytes and mutes `from` (a proof that doesn't verify never comes from an honest node). Returns
+/// whether the proof verified.
+pub fn prove_gossiped<K: std::hash::Hash + Eq + Clone>(gate: &Mutex<GossipGate<K>>, chain: &Shared, from: &K, tx: Tx, id: &str, fingerprint: [u8; 32], now: impl FnOnce() -> u64) -> bool {
+    let verdict = crate::ghost::verify_proof(&tx);
+    let mut g = gate.lock();
+    g.proof_done(id);
+    match verdict {
+        Ok(()) => {
+            drop(g);
+            admit_gossiped(chain, tx);
+            true
+        }
+        Err(e) => {
+            debug!(error = %e, "dropping gossiped ghost tx with a bad proof; muting the peer");
+            g.reject(from, fingerprint, true, now());
+            false
+        }
+    }
+}
+
+/// Admits a tx a peer gossiped (verified), without echoing it back out: its originator already
+/// sent it to everyone.
+fn admit_gossiped(chain: &Arc<Mutex<Chain>>, tx: Tx) {
+    let mut c = chain.lock();
+    let g = c.gossip.take();
+    if let Err(e) = c.submit_tx(tx) {
+        debug!(error = %e, "dropping gossiped tx");
+    }
+    c.gossip = g;
 }
 
 impl<E> Application<E> for App
@@ -900,7 +1137,10 @@ pub struct EpochProvider {
 
 impl EpochProvider {
     pub fn new(chain: Shared, key: Option<PrivateKey>) -> Self {
-        let namespace = namespace(&chain.lock().genesis.chain_id);
+        let namespace = {
+            let c = chain.lock();
+            namespace(&c.genesis.chain_id, &c.genesis_hash)
+        };
         Self { chain, key, namespace, cache: Default::default(), protection: None }
     }
 
@@ -1123,41 +1363,25 @@ where
             }
         });
         let gossip_chain = chain.clone();
-        context.child("mempool_in").spawn(move |_| async move {
+        context.child("mempool_in").spawn(move |ctx| async move {
+            // Audit F30: duplicates and known-bad bytes are dropped before any signature or proof
+            // work, ghost proofs are verified within a per-peer budget off this loop, and a peer
+            // that relays a tx whose signature or proof doesn't verify is muted for a while.
+            let gate = Arc::new(Mutex::new(GossipGate::default()));
             loop {
                 let Ok((from, msg)) = mp_receiver.recv().await else { break };
-                let raw: Vec<u8> = msg.as_ref().to_vec();
-                // The kind's own bound (`Tx::from_bytes`) applies next; ghost txs are the largest.
-                if raw.len() > crate::types::MAX_GHOST_TX_BYTES {
-                    continue;
+                match screen_gossip(&gate, &gossip_chain, &from, msg.as_ref(), ms(ctx.current())) {
+                    Screened::Dropped { why, verified } => debug!(?from, why, verified, "dropping gossiped tx"),
+                    Screened::Admit(tx) => admit_gossiped(&gossip_chain, tx),
+                    // A ghost proof (~6 ms): on the blocking pool, so one peer's proofs can't hold
+                    // up everyone else's gossip.
+                    Screened::Prove(tx, id, fingerprint) => {
+                        let (chain, gate) = (gossip_chain.clone(), gate.clone());
+                        ctx.child("ghost_proof").shared(true).spawn(move |ctx| async move {
+                            prove_gossiped(&gate, &chain, &from, tx, &id, fingerprint, || ms(ctx.current()));
+                        });
+                    }
                 }
-                let Ok(tx) = Tx::from_bytes(&raw) else {
-                    debug!(?from, "unparseable gossiped tx");
-                    continue;
-                };
-                // Verify format + ML-DSA signature (and a ghost tx's proof) before taking the chain
-                // lock; a fee below the next block's base fee is refused first, before the
-                // signature costs anything, and ghost txs are dropped unverified while Ghost Mode
-                // is off or paused.
-                let (chain_id, genesis_hash, prefix, priced, ghost_off) = {
-                    let c = gossip_chain.lock();
-                    let next = c.height() + 1;
-                    (c.genesis.chain_id.clone(), c.genesis_hash.clone(), c.genesis.address_prefix.clone(), crate::econ::check_fee(&c.state, &tx, next), tx.action.is_ghost() && crate::ghost::check_enabled(&c.state, next).is_err())
-                };
-                if ghost_off {
-                    continue;
-                }
-                if let Err(e) = priced.and_then(|_| check_tx_stateless(&tx, &chain_id, &genesis_hash, &prefix)) {
-                    debug!(?from, error = %e, "dropping invalid gossiped tx");
-                    continue;
-                }
-                let mut c = gossip_chain.lock();
-                // Don't echo gossip back out; the originator already sent it to everyone.
-                let g = c.gossip.take();
-                if let Err(e) = c.submit_tx(tx) {
-                    debug!(error = %e, "dropping gossiped tx");
-                }
-                c.gossip = g;
             }
         });
 
@@ -1169,17 +1393,21 @@ where
         let (mux, mut resolver_mux) = Muxer::new(context.child("resolver_mux"), resolver_net.0, resolver_net.1, 1024);
         mux.start();
 
-        // Slashing protection's clock (its startup rule waits on the network for a while), and the
-        // newest epoch the network has finalized a block in (no votes in epochs it has left).
+        // Slashing protection's clock (its startup rule waits on the network for a while), the
+        // newest epoch the network has finalized a block in (no votes in epochs it has left), and
+        // the view of the newest block executed (no votes at or below it: audit F18).
         if let Some(p) = protection.clone() {
             let chain = chain.clone();
             context.child("slashing_protection").spawn(move |ctx| async move {
                 loop {
-                    let finalized = {
+                    let (finalized, executed) = {
                         let c = chain.lock();
-                        c.state.params.epoch_of(c.finalized_tip.max(1))
+                        (c.state.params.epoch_of(c.finalized_tip.max(1)), c.last_block().map(|b| (c.state.params.epoch_of(b.height), b.view)))
                     };
                     p.note_finalized_epoch(finalized);
+                    if let Some((epoch, view)) = executed {
+                        p.note_executed(epoch, view);
+                    }
                     p.tick(ms(ctx.current()));
                     ctx.sleep(Duration::from_millis(250)).await;
                 }
@@ -1297,11 +1525,11 @@ where
                     },
                     msg = votes_backup.recv() => {
                         let Some((their, (from, _))) = msg else { return };
-                        hint_behind(&marshal, &chain, epoch, their, from);
+                        hint_behind(&marshal, &chain, protection.as_deref(), epoch, their, from);
                     },
                     msg = certs_backup.recv() => {
                         let Some((their, (from, _))) = msg else { return };
-                        hint_behind(&marshal, &chain, epoch, their, from);
+                        hint_behind(&marshal, &chain, protection.as_deref(), epoch, their, from);
                     },
                 }
             }
@@ -1313,9 +1541,14 @@ where
 
 /// A peer is voting in a later epoch: we're behind. Ask marshal for the finalization of our
 /// epoch's last block (from that peer); backfill + execution then drive the transition.
-fn hint_behind(marshal: &MarshalMailbox, chain: &Shared, ours: u64, theirs: u64, from: PublicKey) {
+fn hint_behind(marshal: &MarshalMailbox, chain: &Shared, protection: Option<&crate::protection::Protection>, ours: u64, theirs: u64, from: PublicKey) {
     if theirs <= ours {
         return;
+    }
+    // Unverified, so it only keeps slashing protection's restart rule from escaping in an epoch
+    // the network may have left (audit F18).
+    if let Some(p) = protection {
+        p.note_later_epoch(theirs);
     }
     let last = chain.lock().state.params.last_of(ours);
     debug!(ours, theirs, last, "peer is in a later epoch; fetching boundary");
@@ -1337,8 +1570,10 @@ pub const MARSHAL_RETAIN: u64 = 2_000;
 /// Bumped when the on-disk storage layout changes (consensus journals, or the home's own files:
 /// v4 is the segmented block logs and the state database, see `store.rs`; v5 the integrated
 /// protocol v1: txs signed for a genesis hash, state schema 4, block metadata with signals; v6
-/// state schema 5). Dev chains from an older layout reset themselves (`node::dev_is_stale`).
-pub const STORAGE_VERSION: &str = "prunable-v6";
+/// state schema 5; v7 consensus votes signed under the chain instance's namespace, chain id and
+/// genesis hash, so older journals no longer verify). Dev chains from an older layout reset
+/// themselves (`node::dev_is_stale`).
+pub const STORAGE_VERSION: &str = "prunable-v7";
 
 fn archive_config<C>(prefix: &str, name: &str, page_cache: CacheRef, codec_config: C) -> prunable::Config<TwoCap, C> {
     prunable::Config {
@@ -1854,6 +2089,129 @@ mod tests {
                 assert_eq!(Application::<deterministic::Context>::verify(&mut app, (context.child("verify"), cctx.clone()), ancestry).await, valid);
             }
         });
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// Audit F30: gossip is screened cheapest-first. A tx already in the mempool is dropped before
+    /// its signature is looked at (this one's signature is junk: it was put in the mempool
+    /// directly), the same invalid bytes are verified once whichever peer sends them, a peer that
+    /// relays a bad signature is muted for a while (its good txs too; other peers aren't), and
+    /// oversized messages are dropped before they're parsed.
+    #[test]
+    fn gossip_drops_duplicates_and_known_junk_before_verifying() {
+        let (home, mut c, _) = home_at_zero("gossip");
+        let users: Vec<crate::crypto::Keys> = (1..=4u8).map(|i| crate::crypto::Keys::from_seed([i; 32])).collect();
+        for u in &users {
+            c.faucet(&u.address(), 100 * DROPS_PER_FANG).unwrap();
+        }
+        c.produce_block().unwrap();
+        let me = c.me().unwrap();
+        let transfer = |c: &Chain, u: &crate::crypto::Keys, amount: u64| {
+            let mut t = Tx { chain_id: c.genesis.chain_id.clone(), genesis_hash: c.genesis_hash.clone(), from: u.address(), nonce: 0, fee: 0, tip: 0, valid_until: c.height() + 50, action: crate::types::Action::Transfer { to: me.clone(), amount }, memo: String::new(), public_key: hex::encode(u.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+            t.fee = crate::econ::max_fee(&c.state, t.size());
+            t.sign(u)
+        };
+        let forge = |t: &Tx| {
+            let mut f = t.clone();
+            f.signature = format!("{}{}", if f.signature.starts_with("00") { "01" } else { "00" }, &f.signature[2..]);
+            f
+        };
+        // users[0]'s tx sits in the mempool with a signature that doesn't verify.
+        let junk_in_pool = forge(&transfer(&c, &users[0], 1));
+        assert!(junk_in_pool.verify_signature().is_err());
+        c.submit(junk_in_pool.clone()).unwrap();
+        let chain: Shared = Arc::new(Mutex::new(c));
+        let gate = Mutex::new(GossipGate::<u8>::default());
+        let (a, b, d) = (1u8, 2u8, 3u8);
+        let dropped = |r: Screened| match r {
+            Screened::Dropped { why, verified } => (why, verified),
+            other => panic!("expected a drop, got {other:?}"),
+        };
+
+        // Known: dropped unverified, and not held against the peer.
+        assert_eq!(dropped(screen_gossip(&gate, &chain, &a, &junk_in_pool.to_bytes(), 0)), ("already known", false));
+        let good_a = transfer(&chain.lock(), &users[1], 1);
+        let Screened::Admit(tx) = screen_gossip(&gate, &chain, &a, &good_a.to_bytes(), 0) else { panic!("a good tx from a is admitted") };
+        admit_gossiped(&chain, tx);
+        assert!(chain.lock().in_mempool(&good_a.id()));
+        assert_eq!(dropped(screen_gossip(&gate, &chain, &d, &good_a.to_bytes(), 0)), ("already known", false));
+
+        // A bad signature: verified once, remembered, and its relayer muted.
+        let bad = forge(&transfer(&chain.lock(), &users[2], 2));
+        assert_eq!(dropped(screen_gossip(&gate, &chain, &b, &bad.to_bytes(), 1_000)), ("bad signature", true));
+        assert_eq!(dropped(screen_gossip(&gate, &chain, &d, &bad.to_bytes(), 1_000)), ("muted peer or known-invalid bytes", false), "the same bytes from anyone else");
+        let good_b = transfer(&chain.lock(), &users[2], 3);
+        assert_eq!(dropped(screen_gossip(&gate, &chain, &b, &good_b.to_bytes(), 1_000 + GOSSIP_MUTE_MS - 1)), ("muted peer or known-invalid bytes", false));
+        assert!(matches!(screen_gossip(&gate, &chain, &d, &good_b.to_bytes(), 1_000), Screened::Admit(_)), "another peer's copy is fine");
+        assert!(matches!(screen_gossip(&gate, &chain, &b, &good_b.to_bytes(), 1_000 + GOSSIP_MUTE_MS), Screened::Admit(_)), "the mute wears off");
+
+        // Another instance of the chain (an error a peer on another network could send in good
+        // faith): remembered, no mute.
+        let mut other = transfer(&chain.lock(), &users[3], 4);
+        other.genesis_hash = "00".repeat(32);
+        let other = other.sign(&users[3]);
+        assert_eq!(dropped(screen_gossip(&gate, &chain, &d, &other.to_bytes(), 2_000)), ("invalid", true));
+        assert_eq!(dropped(screen_gossip(&gate, &chain, &d, &other.to_bytes(), 2_000)), ("muted peer or known-invalid bytes", false));
+        let good_d = transfer(&chain.lock(), &users[3], 5);
+        assert!(matches!(screen_gossip(&gate, &chain, &d, &good_d.to_bytes(), 2_000), Screened::Admit(_)));
+
+        // Too large: dropped before anything is parsed.
+        assert_eq!(dropped(screen_gossip(&gate, &chain, &d, &vec![0; crate::types::MAX_GHOST_TX_BYTES + 1], 2_000)), ("too large", false));
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// Audit F30: ghost proofs from gossip are verified within each peer's budget, once per tx
+    /// however many peers relay it, and a proof that doesn't verify mutes its relayer.
+    #[test]
+    fn gossiped_ghost_proofs_are_budgeted_and_verified_once() {
+        let (home, mut c, _) = home_at_zero("gossip-ghost");
+        let mut j = crate::chain::Journal::default();
+        let h = c.height();
+        crate::upgrade::exec_activate_feature(&mut c.state, &mut j, crate::ghost::FEATURE, h).unwrap();
+        let (chain_id, genesis_hash, instance) = (c.genesis.chain_id.clone(), c.genesis_hash.clone(), c.state.ghost.meta.instance);
+        let chain: Shared = Arc::new(Mutex::new(c));
+        let gate = Mutex::new(GossipGate::<u8>::default());
+        let good = crate::ghost::tests::stateless_transfer(&chain_id, &genesis_hash, instance, "g1", 100);
+        let mut tampered = crate::ghost::tests::stateless_transfer(&chain_id, &genesis_hash, instance, "g2", 100);
+        tampered.tip += 1;
+        tampered.fee += 1;
+
+        // In flight: the same tx from another peer is a duplicate.
+        let Screened::Prove(tx, id, fp) = screen_gossip(&gate, &chain, &1, &good.to_bytes(), 0) else { panic!("verified next") };
+        assert!(matches!(screen_gossip(&gate, &chain, &2, &good.to_bytes(), 0), Screened::Dropped { why: "already known", verified: false }));
+        // Its proof verifies (the mempool then refuses it: its anchor is a tree of its own).
+        assert!(prove_gossiped(&gate, &chain, &1, tx, &id, fp, || 0));
+        assert!(!gate.lock().verifying(&id) && !gate.lock().drops(&1, &fp, 0));
+
+        // A proof that doesn't verify (the tx changed after proving): remembered, relayer muted.
+        let Screened::Prove(tx, id, fp) = screen_gossip(&gate, &chain, &3, &tampered.to_bytes(), 0) else { panic!("verified next") };
+        assert!(!prove_gossiped(&gate, &chain, &3, tx, &id, fp, || 0));
+        assert!(matches!(screen_gossip(&gate, &chain, &4, &tampered.to_bytes(), 0), Screened::Dropped { verified: false, .. }), "never verified again");
+        assert!(gate.lock().drops(&3, &[0; 32], GOSSIP_MUTE_MS - 1) && !gate.lock().drops(&3, &[0; 32], GOSSIP_MUTE_MS));
+
+        // Budgets: GOSSIP_PROOFS_IN_FLIGHT at once over every peer; GOSSIP_PROOF_BURST per peer,
+        // refilled at GOSSIP_PROOFS_PER_SEC.
+        let mut g = GossipGate::<u8>::default();
+        let ids: Vec<String> = (0..200).map(|i| format!("{i}")).collect();
+        for id in &ids[..GOSSIP_PROOFS_IN_FLIGHT] {
+            assert!(g.take_proof(&1, id, 0));
+        }
+        assert!(!g.take_proof(&2, &ids[GOSSIP_PROOFS_IN_FLIGHT], 0), "nothing more in flight");
+        let mut taken = GOSSIP_PROOFS_IN_FLIGHT as u64;
+        for id in &ids[..GOSSIP_PROOFS_IN_FLIGHT] {
+            g.proof_done(id);
+        }
+        let mut next = GOSSIP_PROOFS_IN_FLIGHT;
+        while g.take_proof(&1, &ids[next], 0) {
+            g.proof_done(&ids[next]);
+            next += 1;
+            taken += 1;
+        }
+        assert_eq!(taken, GOSSIP_PROOF_BURST, "a peer's burst");
+        assert!(g.take_proof(&2, &ids[next], 0), "another peer has its own budget");
+        g.proof_done(&ids[next]);
+        assert!(!g.take_proof(&1, &ids[next + 1], 1_000 / GOSSIP_PROOFS_PER_SEC - 1));
+        assert!(g.take_proof(&1, &ids[next + 1], 1_000 / GOSSIP_PROOFS_PER_SEC), "refilled");
         std::fs::remove_dir_all(home).ok();
     }
 }

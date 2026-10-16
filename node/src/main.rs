@@ -91,6 +91,12 @@ struct Net {
     /// nodes keep serving reads. For coordinated restarts and incidents (docs/OPERATIONS.md)
     #[arg(long)]
     halt_height: Option<u64>,
+    /// The whole network is halted with its last block at this height, and you've checked: while
+    /// this validator is at that height and no HTTP peer answers, slashing protection's restart
+    /// rule may sign again after its escape time without a peer confirming it (docs/OPERATIONS.md).
+    /// Applies at that height only; remove it once the network runs again
+    #[arg(long)]
+    network_halted_at: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -272,7 +278,7 @@ fn net_opts(net: Net, http_port: Option<u16>, p2p_preset: Option<String>, epheme
         (_, Some(n)) => node::Pruning::Keep(n),
         _ => node::Pruning::Default,
     };
-    NetOpts { bind: net.bind, http_port, p2p_preset, ephemeral_p2p, client_ip, peer_http: net.peer_http, force_key: net.force_key, full: net.full, pruning, http, halt_height: net.halt_height }
+    NetOpts { bind: net.bind, http_port, p2p_preset, ephemeral_p2p, client_ip, peer_http: net.peer_http, force_key: net.force_key, full: net.full, pruning, http, halt_height: net.halt_height, network_halted_at: net.network_halted_at }
 }
 
 fn main() -> Result<()> {

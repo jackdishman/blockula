@@ -20,8 +20,9 @@
 //! at most ⌊(m−1)/3⌋ of the new set of `m` ([`churn_limit`]): the members carried over are a
 //! quorum on their own, so newcomers that are still syncing can't stall it, and each set
 //! overlaps the last by more than two thirds (for a full set: ⌊(n−1)/3⌋ replacements per
-//! epoch; a set of one or two takes none). Members over a lowered cap leave ⌊(n−1)/3⌋ (at least
-//! one) per epoch. The set never empties. Votes are equal-weight within the set (DEC-3). On dev
+//! epoch). A set that shrank below four still grows by one newcomer per epoch on chains without
+//! admins ([`newcomers_allowed`]; every member of such a set is needed for a quorum anyway).
+//! Members over a lowered cap leave ⌊(n−1)/3⌋ (at least one) per epoch. The set never empties. Votes are equal-weight within the set (DEC-3). On dev
 //! and test chains admins may still pin a validator (`ApproveValidator`: ranked ahead of stake,
 //! and past the churn limit, at the admin's risk) or remove one (`RemoveValidator`); elsewhere
 //! both are refused.
@@ -31,14 +32,19 @@
 //!
 //! **Slashing.** `ReportEquivocation` carries simplex's own evidence (an encoded
 //! `ConflictingNotarize`, `ConflictingFinalize` or `NullifyFinalize` activity), verified against
-//! that epoch's set and namespace ([`verify_evidence`]). The pool loses `slash_double_sign_bps`
-//! once per (validator, epoch, view), and so do the unbonding and redelegation entries that left
-//! it since that epoch began; the reporter gets `reporter_reward_bps` of the slash, the rest is
-//! burned, and the validator is tombstoned (never selected again). Downtime is measured from
+//! that epoch's set and the chain instance's namespace, from a view that epoch reached
+//! ([`verify_evidence`]). The pool loses `slash_double_sign_bps`, and so do the unbonding and
+//! redelegation entries that left it since that epoch began, once: the validator is tombstoned
+//! (never selected again) and later evidence against it only reaches stake that left before the
+//! punished epoch ([`Pool::slashed_from`]), so every drop answers for double-signing at most once
+//! (a leaked key can't drain a pool fault by fault). The reporter gets `reporter_reward_bps` of the
+//! slash, at most what the validator's owner lost (reporting yourself never pays); the rest is
+//! burned. Downtime is measured from
 //! leader slots: each view a block skipped (`parent_view + 1 .. view − 1`, nullified by 2f+1) is a
-//! miss for that view's leader and the block's own view a hit, with simplex's `RoundRobin`
-//! elector naming the leaders. A validator that missed more than `downtime_max_missed` of its
-//! last `downtime_window` slots is jailed ([`jail`], `slash_downtime_bps`), leaves at the next
+//! miss for that view's leader (at most one per validator per block) and the block's own view a
+//! hit, with simplex's `RoundRobin` elector naming the leaders. A validator that missed more than
+//! `downtime_max_missed` of its last `downtime_window` slots is jailed ([`jail`],
+//! `slash_downtime_bps`) unless more than f of the set would then be jailed, leaves at the next
 //! boundary, and may `Unjail` after `jail_blocks` (with its self-bond at the minimum again).
 //!
 //! **Junk** (CV-5). Verifiers replay a proposal's unexecuted ancestors exactly and reject it if
@@ -99,6 +105,10 @@ pub struct Pool {
     pub slashed: u64,
     pub rewards: u64,
     pub junk_charged: u64,
+    /// Equivocation already took its cut of the stake that was in this pool from this height on
+    /// (the start of the earliest punished fault's epoch). A double-signer is slashed once: later
+    /// evidence only reaches stake that left the pool before this height (audit F05/F07/F60).
+    pub slashed_from: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -113,8 +123,11 @@ pub struct Jail {
 #[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Delegation {
     pub shares: u128,
-    /// Drops put in, less what sales and slashes took out pro rata: value above it is earnings
-    /// (what stays locked for vesting accounts).
+    /// Drops put in, less what sales (and redelegation slashes, which sell shares) took out pro
+    /// rata: value above it is earnings (what stays locked for vesting accounts, 3.7). A pool
+    /// slash doesn't lower it, on purpose: it doesn't lower a vesting lock either, so value the
+    /// pool earns back after a slash refills locked tokens the slash took and stays under the
+    /// original lock; only value above the principal is new (audit F58).
     pub principal: u64,
 }
 
@@ -188,7 +201,8 @@ impl Liveness {
         self.next = (i + 1) % self.window;
     }
 
-    /// Records `n` missed slots in a row.
+    /// Records `n` missed slots in a row (tests; a block charges at most one).
+    #[cfg(test)]
     fn miss(&mut self, n: u64) {
         if n >= self.window {
             let total = self.missed_total + n;
@@ -237,7 +251,7 @@ impl crate::state::Aggregate<Entry> for UnbondingTotal {
     }
 }
 
-/// Staking's slice of the state (namespaces `state::ns` 32–36, META key `staking`).
+/// Staking's slice of the state (namespaces `state::ns` 32–36 and 64–65, META key `staking`).
 #[derive(Clone, Debug, Default)]
 pub struct Staking {
     pub pools: TMap<String, Pool, PoolStake>,
@@ -245,19 +259,25 @@ pub struct Staking {
     pub entries: TMap<String, Entry, UnbondingTotal>,
     pub punished: TMap<String, Punished>,
     pub liveness: TMap<String, Liveness>,
+    /// Every entry, by the validator it left (key: `validator/started_at/delegator/id`, 20 digits
+    /// each), so slashing a validator reads only its own entries, from the fault's epoch on.
+    pub by_validator: TMap<String, ()>,
+    /// The highest view of a block executed in each epoch (key: the epoch), for as long as the
+    /// epoch's set is kept: evidence can't be from a view far beyond what consensus reached.
+    pub views: TMap<u64, u64>,
     /// Id of the next unbonding or redelegation entry.
     pub next_entry_id: u64,
 }
 
 impl SubState for Staking {
     fn tables(&self) -> Vec<(u8, &dyn Table)> {
-        let Staking { pools, delegations, entries, punished, liveness, next_entry_id: _ } = self;
-        vec![(ns::STAKE_POOLS, pools), (ns::STAKE_DELEGATIONS, delegations), (ns::STAKE_UNBONDING, entries), (ns::STAKE_EVIDENCE, punished), (ns::STAKE_LIVENESS, liveness)]
+        let Staking { pools, delegations, entries, punished, liveness, by_validator, views, next_entry_id: _ } = self;
+        vec![(ns::STAKE_POOLS, pools), (ns::STAKE_DELEGATIONS, delegations), (ns::STAKE_UNBONDING, entries), (ns::STAKE_EVIDENCE, punished), (ns::STAKE_LIVENESS, liveness), (ns::STAKE_ENTRIES_BY_VALIDATOR, by_validator), (ns::STAKE_VIEWS, views)]
     }
 
     fn tables_mut(&mut self) -> Vec<(u8, &mut dyn Table)> {
-        let Staking { pools, delegations, entries, punished, liveness, next_entry_id: _ } = self;
-        vec![(ns::STAKE_POOLS, pools), (ns::STAKE_DELEGATIONS, delegations), (ns::STAKE_UNBONDING, entries), (ns::STAKE_EVIDENCE, punished), (ns::STAKE_LIVENESS, liveness)]
+        let Staking { pools, delegations, entries, punished, liveness, by_validator, views, next_entry_id: _ } = self;
+        vec![(ns::STAKE_POOLS, pools), (ns::STAKE_DELEGATIONS, delegations), (ns::STAKE_UNBONDING, entries), (ns::STAKE_EVIDENCE, punished), (ns::STAKE_LIVENESS, liveness), (ns::STAKE_ENTRIES_BY_VALIDATOR, by_validator), (ns::STAKE_VIEWS, views)]
     }
 
     fn meta_records(&self) -> Vec<(&'static [u8], Vec<u8>)> {
@@ -281,29 +301,35 @@ pub struct StakingJournal {
     entries: JMap<String, Entry>,
     punished: JMap<String, Punished>,
     liveness: JMap<String, Liveness>,
+    by_validator: JMap<String, ()>,
+    views: JMap<u64, u64>,
     next_entry_id: Option<u64>,
 }
 
 impl StakingJournal {
     pub fn absorb(&mut self, other: StakingJournal) {
-        let StakingJournal { pools, delegations, entries, punished, liveness, next_entry_id } = other;
+        let StakingJournal { pools, delegations, entries, punished, liveness, by_validator, views, next_entry_id } = other;
         self.pools.absorb(pools);
         self.delegations.absorb(delegations);
         self.entries.absorb(entries);
         self.punished.absorb(punished);
         self.liveness.absorb(liveness);
+        self.by_validator.absorb(by_validator);
+        self.views.absorb(views);
         if self.next_entry_id.is_none() {
             self.next_entry_id = next_entry_id;
         }
     }
 
     pub fn rollback(self, staking: &mut Staking) {
-        let StakingJournal { pools, delegations, entries, punished, liveness, next_entry_id } = self;
+        let StakingJournal { pools, delegations, entries, punished, liveness, by_validator, views, next_entry_id } = self;
         pools.restore(&mut staking.pools);
         delegations.restore(&mut staking.delegations);
         entries.restore(&mut staking.entries);
         punished.restore(&mut staking.punished);
         liveness.restore(&mut staking.liveness);
+        by_validator.restore(&mut staking.by_validator);
+        views.restore(&mut staking.views);
         if let Some(n) = next_entry_id {
             staking.next_entry_id = n;
         }
@@ -322,6 +348,19 @@ fn ekey(delegator: &str, id: u64) -> String {
 
 fn pkey(validator: &str, epoch: u64, view: u64) -> String {
     format!("{validator}/{epoch:020}/{view:020}")
+}
+
+/// The validator an entry left (an unbonding's, a redelegation's `from`).
+fn left(e: &Entry) -> &str {
+    match e {
+        Entry::Unbonding { validator, .. } => validator,
+        Entry::Redelegation { from, .. } => from,
+    }
+}
+
+/// An entry's key in [`Staking::by_validator`]: `validator/started_at/` then its own key.
+fn vkey(e: &Entry, key: &str) -> String {
+    format!("{}/{:020}/{key}", left(e), e.started_at())
 }
 
 /// The records of a map keyed `account/…`, in key order. Addresses never contain `/`, and `0`
@@ -426,10 +465,21 @@ fn put_delegation(state: &mut State, j: &mut Journal, key: &str, d: Option<Deleg
     };
 }
 
+/// Writes (or removes) an entry, and its [`Staking::by_validator`] key with it.
 fn put_entry(state: &mut State, j: &mut Journal, key: &str, e: Option<Entry>) {
+    if let Some(old) = state.staking.entries.get(key) {
+        let k = vkey(old, key);
+        j.staking.by_validator.touch(&state.staking.by_validator, &k);
+        state.staking.by_validator.remove(&k);
+    }
     j.staking.entries.touch(&state.staking.entries, key);
     match e {
-        Some(e) => state.staking.entries.insert(key.to_string(), e),
+        Some(e) => {
+            let k = vkey(&e, key);
+            j.staking.by_validator.touch(&state.staking.by_validator, &k);
+            state.staking.by_validator.insert(k, ());
+            state.staking.entries.insert(key.to_string(), e)
+        }
         None => state.staking.entries.remove(key),
     };
 }
@@ -481,6 +531,13 @@ fn bond(state: &mut State, j: &mut Journal, delegator: &str, validator: &str, am
     Ok(shares)
 }
 
+/// What remains of `d` after `shares` of it leave, and the principal those shares carried (pro
+/// rata).
+fn split(d: &Delegation, shares: u128) -> (Delegation, u64) {
+    let principal = if shares == d.shares { d.principal } else { mul_div(d.principal as u128, shares, d.shares).unwrap_or(0) as u64 };
+    (Delegation { shares: d.shares - shares, principal: d.principal - principal }, principal)
+}
+
 /// Sells `shares` of `delegator`'s stake in `validator`'s pool. Returns what they were worth
 /// (out of the pool, in nobody's balance yet) and the principal they carried.
 fn unbond(state: &mut State, j: &mut Journal, delegator: &str, validator: &str, shares: u128) -> Result<(u64, u64)> {
@@ -489,12 +546,12 @@ fn unbond(state: &mut State, j: &mut Journal, delegator: &str, validator: &str, 
     if shares > d.shares {
         bail!("{} holds {} shares of validator {}'s pool, not {shares}", short(delegator), d.shares, short(validator));
     }
-    let value = state.staking.pools.get(validator).map(|p| p.value(shares)).unwrap_or(0);
-    let p = pool_mut(state, j, validator).ok_or_else(|| anyhow!("validator {} has no pool", short(validator)))?;
+    let pool = state.staking.pools.get(validator).ok_or_else(|| anyhow!("validator {} has no pool", short(validator)))?;
+    let value = pool.value(shares);
+    let (rest, principal) = split(&d, shares);
+    let p = pool_mut(state, j, validator).expect("checked above");
     p.stake -= value;
     p.shares -= shares;
-    let principal = if shares == d.shares { d.principal } else { mul_div(d.principal as u128, shares, d.shares).unwrap_or(0) as u64 };
-    let rest = Delegation { shares: d.shares - shares, principal: d.principal - principal };
     put_delegation(state, j, &key, (rest.shares > 0).then_some(rest));
     Ok((value, principal))
 }
@@ -509,11 +566,10 @@ fn take_from_delegation(state: &mut State, j: &mut Journal, delegator: &str, val
         return 0;
     }
     let (shares, taken) = if want >= worth { (d.shares, worth) } else { (mul_div_ceil(want as u128, pool.shares, pool.stake as u128).unwrap_or(d.shares).min(d.shares), want) };
+    let (rest, _) = split(&d, shares);
     let p = pool_mut(state, j, validator).expect("checked above");
     p.stake -= taken;
     p.shares -= shares;
-    let principal = if shares == d.shares { d.principal } else { mul_div(d.principal as u128, shares, d.shares).unwrap_or(0) as u64 };
-    let rest = Delegation { shares: d.shares - shares, principal: d.principal - principal };
     put_delegation(state, j, &key, (rest.shares > 0).then_some(rest));
     taken
 }
@@ -698,21 +754,32 @@ pub(crate) fn apply(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, s
         }
         Action::ReportEquivocation { evidence } => {
             let bytes = hex::decode(evidence).map_err(|_| anyhow!("evidence must be hex"))?;
-            let fault = verify_evidence(state, &tx.chain_id, &bytes, height)?;
+            // `tx.genesis_hash` is this chain's: admission, gossip and block verification check it.
+            let fault = verify_evidence(state, &tx.chain_id, &tx.genesis_hash, &bytes, height)?;
             let key = pkey(&fault.validator, fault.epoch, fault.view);
             if state.staking.punished.contains_key(&key) {
                 bail!("validator {} was already punished for epoch {}, view {}", short(&fault.validator), fault.epoch, fault.view);
             }
-            // Stake that was in the pool when the epoch began answers for it, wherever it went since.
+            // Stake that was in the pool when the epoch began answers for it, wherever it went
+            // since: once. A double-signer is slashed once (and tombstoned); a fault from an earlier
+            // epoch, reported later, only reaches the stake that left before the first one's.
             let since = fault.epoch.saturating_mul(state.params.epoch_blocks.max(2));
-            let slashed = slash(state, j, &fault.validator, since, state.chain_params.slash_double_sign_bps);
+            let earlier = state.staking.pools.get(&fault.validator).and_then(|p| p.slashed_from);
+            if let Some(from) = earlier.filter(|from| since >= *from) {
+                bail!("validator {} was already slashed for double-signing (its stake from block {from} on answered for it): this fault adds nothing", short(&fault.validator));
+            }
+            let cut = slash(state, j, &fault.validator, since, earlier, earlier.is_none(), state.chain_params.slash_double_sign_bps);
             let owner = state.validators.get(&fault.validator).map(|r| r.owner.clone()).unwrap_or_default();
-            // No reward for reporting yourself.
-            let reward = if sender == owner || sender == fault.validator { 0 } else { bps_of(slashed, state.chain_params.reporter_reward_bps) };
+            // No reward for reporting yourself, and never more than the owner's own stake lost:
+            // reporting yourself from another account can't pay.
+            let reward = if sender == owner || sender == fault.validator { 0 } else { bps_of(cut.total, state.chain_params.reporter_reward_bps).min(cut.owner) };
             state.j_credit(j, sender, reward);
-            state.j_burn(j, slashed - reward);
+            state.j_burn(j, cut.total - reward);
             tombstone(state, j, &fault.validator, height);
-            put_punished(state, j, &key, Some(Punished { kind: fault.kind, height, reporter: sender.to_string(), slashed }));
+            if let Some(p) = pool_mut(state, j, &fault.validator) {
+                p.slashed_from = Some(since);
+            }
+            put_punished(state, j, &key, Some(Punished { kind: fault.kind, height, reporter: sender.to_string(), slashed: cut.total }));
             Ok(())
         }
         _ => bail!("not a staking action"),
@@ -835,44 +902,57 @@ pub(crate) fn remove(state: &mut State, j: &mut Journal, sender: &str, validator
 
 // --------------------------------------------------------------------------------- slashing
 
-/// Takes `bps` of `validator`'s pool, and of the unbonding and redelegation entries that left it
-/// at or after height `since`. Returns the total, which is out of every balance and escrow: the
-/// caller burns it (or pays part of it to a reporter).
-fn slash(state: &mut State, j: &mut Journal, validator: &str, since: u64, bps: u64) -> u64 {
+/// What a slash took: the total (out of every balance and escrow, for the caller to burn or
+/// pay part of to a reporter), and how much of it was the validator owner's own stake.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Cut {
+    pub total: u64,
+    pub owner: u64,
+}
+
+/// Takes `bps` of the stake that answers for an infraction at height `since`: `validator`'s pool
+/// (if `pool`), and each unbonding and redelegation entry that left it at or after `since` and
+/// before `until` (all of them from `since` on if `None`), read through the
+/// [`Staking::by_validator`] index (never a scan of every entry). Each entry is cut on what's left
+/// of it: an unbonding's amount, a redelegation's slashable remainder (what moved, less earlier
+/// cuts; taken from the delegator's stake in the pool it moved to, then from that stake's own way
+/// out), so repeated cuts never take more than the entry held (MAINNET-DESIGN 3.4).
+fn slash(state: &mut State, j: &mut Journal, validator: &str, since: u64, until: Option<u64>, pool: bool, bps: u64) -> Cut {
+    let mut cut = Cut::default();
     if bps == 0 {
-        return 0;
+        return cut;
     }
-    let mut total = 0u64;
-    if let Some(cut) = state.staking.pools.get(validator).map(|p| bps_of(p.stake, bps)).filter(|c| *c > 0) {
-        let p = pool_mut(state, j, validator).expect("checked above");
-        p.stake -= cut;
-        p.slashed += cut;
-        total += cut;
+    let owner = state.validators.get(validator).map(|r| r.owner.clone()).unwrap_or_default();
+    if let Some(p) = state.staking.pools.get(validator).filter(|_| pool) {
+        let c = bps_of(p.stake, bps);
+        if c > 0 {
+            let before = delegation_value(state, &owner, validator);
+            let p = pool_mut(state, j, validator).expect("checked above");
+            p.stake -= c;
+            p.slashed += c;
+            cut.total += c;
+            cut.owner += before - delegation_value(state, &owner, validator);
+        }
     }
-    // Entries are few and slashes rare: a scan.
-    let hits: Vec<(String, Entry)> = state
-        .staking
-        .entries
-        .iter()
-        .filter(|(_, e)| match e {
-            Entry::Unbonding { validator: v, started_at, .. } => v == validator && *started_at >= since,
-            Entry::Redelegation { from, started_at, .. } => from == validator && *started_at >= since,
-        })
-        .map(|(k, e)| (k.clone(), e.clone()))
-        .collect();
-    for (key, e) in hits {
+    let to = until.map_or_else(|| format!("{validator}0"), |u| format!("{validator}/{u:020}"));
+    let hits: Vec<String> = state.staking.by_validator.range(format!("{validator}/{since:020}")..to).filter_map(|(k, _)| k.splitn(3, '/').nth(2).map(str::to_string)).collect();
+    for key in hits {
+        let Some(e) = state.staking.entries.get(&key).cloned() else { continue };
         let delegator = key.split('/').next().unwrap_or_default().to_string();
-        match e {
+        let taken = match e {
             Entry::Unbonding { validator: v, amount, started_at, release_at } => {
-                let cut = bps_of(amount, bps);
-                if cut > 0 {
-                    put_entry(state, j, &key, Some(Entry::Unbonding { validator: v, amount: amount - cut, started_at, release_at }));
-                    total += cut;
+                let c = bps_of(amount, bps);
+                if c > 0 {
+                    put_entry(state, j, &key, Some(Entry::Unbonding { validator: v, amount: amount - c, started_at, release_at }));
                 }
+                c
             }
-            Entry::Redelegation { to, amount, started_at, .. } => {
-                // From the stake it moved into `to`, then from that stake's own way out.
+            Entry::Redelegation { from, to, amount, started_at, release_at } => {
                 let due = bps_of(amount, bps);
+                if due == 0 {
+                    continue;
+                }
+                // From the stake it moved into `to`, then from that stake's own way out.
                 let mut taken = take_from_delegation(state, j, &delegator, &to, due);
                 if taken < due {
                     let later: Vec<(String, Entry)> = entries_of(state, &delegator)
@@ -881,19 +961,25 @@ fn slash(state: &mut State, j: &mut Journal, validator: &str, since: u64, bps: u
                         .collect();
                     for (k, e) in later {
                         let Entry::Unbonding { validator: v, amount: a, started_at: s, release_at: r } = e else { continue };
-                        let cut = a.min(due - taken);
-                        put_entry(state, j, &k, Some(Entry::Unbonding { validator: v, amount: a - cut, started_at: s, release_at: r }));
-                        taken += cut;
+                        let c = a.min(due - taken);
+                        put_entry(state, j, &k, Some(Entry::Unbonding { validator: v, amount: a - c, started_at: s, release_at: r }));
+                        taken += c;
                         if taken == due {
                             break;
                         }
                     }
                 }
-                total += taken;
+                // The moved stake answered for this much of itself: less is left to answer later.
+                put_entry(state, j, &key, Some(Entry::Redelegation { from, to, amount: amount - due, started_at, release_at }));
+                taken
             }
+        };
+        cut.total += taken;
+        if delegator == owner {
+            cut.owner += taken;
         }
     }
-    total
+    cut
 }
 
 /// Jails `validator`: slashes `slash_bps` of its pool (burned), and it leaves the set at the
@@ -904,8 +990,8 @@ pub fn jail(state: &mut State, j: &mut Journal, validator: &str, height: u64, sl
     if state.staking.pools.get(validator).is_none_or(|p| p.tombstoned_at.is_some()) {
         return;
     }
-    let slashed = slash(state, j, validator, height, slash_bps);
-    state.j_burn(j, slashed);
+    let slashed = slash(state, j, validator, height, None, true, slash_bps);
+    state.j_burn(j, slashed.total);
     let until = height.saturating_add(state.chain_params.jail_blocks);
     let p = pool_mut(state, j, validator).expect("checked above");
     let until = p.jail.as_ref().map_or(until, |old| old.until.max(until));
@@ -990,10 +1076,23 @@ fn participants(state: &State, epoch: u64) -> Result<commonware_utils::ordered::
     crate::consensus::keys_of(keys.into_iter()).ok_or_else(|| anyhow!("epoch {epoch}'s set has a bad consensus key"))
 }
 
+/// Views past the highest one a block of the epoch executed in that evidence may still be from:
+/// votes for views not executed yet, and the epoch's tail after its last block. Beyond it, a
+/// "fault" is in a view consensus never reached (made up by the key's holder): refused.
+pub const VIEW_SLACK: u64 = 1_000;
+
+/// The newest view evidence for `epoch` may be from (see [`VIEW_SLACK`]).
+pub fn max_evidence_view(state: &State, epoch: u64) -> u64 {
+    state.staking.views.get(&epoch).copied().unwrap_or(0).saturating_add(VIEW_SLACK)
+}
+
 /// Checks equivocation evidence at `height`: well-formed ([`decode_evidence`]), from an epoch no
-/// later than now and at most `evidence_max_age_epochs` old whose set the state still holds, and
-/// both votes signed by the same member of that set under this chain's consensus namespace.
-pub fn verify_evidence(state: &State, chain_id: &str, bytes: &[u8], height: u64) -> Result<Fault> {
+/// later than now and at most `evidence_max_age_epochs` old whose set the state still holds, from
+/// a view that epoch reached (within [`VIEW_SLACK`] of its highest executed block), and both
+/// votes signed by the same member of that set under this chain instance's consensus
+/// namespace (`consensus::namespace(chain_id, genesis_hash)`: votes from another genesis under
+/// the same chain id never verify).
+pub fn verify_evidence(state: &State, chain_id: &str, genesis_hash: &str, bytes: &[u8], height: u64) -> Result<Fault> {
     let e = decode_evidence(bytes)?;
     let now = state.params.epoch_of(height);
     if e.epoch > now {
@@ -1003,9 +1102,13 @@ pub fn verify_evidence(state: &State, chain_id: &str, bytes: &[u8], height: u64)
     if now - e.epoch > max_age {
         bail!("the evidence is from epoch {}: too old (at most {max_age} epochs back)", e.epoch);
     }
+    let reached = max_evidence_view(state, e.epoch);
+    if e.view > reached {
+        bail!("the evidence is from view {} of epoch {}, beyond any view it reached (at most {reached} so far)", e.view, e.epoch);
+    }
     let set = participants(state, e.epoch)?;
     let pk = set.get(e.signer).ok_or_else(|| anyhow!("signer {} isn't in epoch {}'s set of {}", e.signer, e.epoch, set.len()))?.clone();
-    let scheme = MlDsaScheme::verifier(&crate::consensus::namespace(chain_id), set);
+    let scheme = MlDsaScheme::verifier(&crate::consensus::namespace(chain_id, genesis_hash), set);
     if !e.activity.verify(&mut NoRng, &scheme, &commonware_parallel::Sequential) {
         bail!("the evidence's signatures don't verify against epoch {}'s validators", e.epoch);
     }
@@ -1017,20 +1120,24 @@ pub fn verify_evidence(state: &State, chain_id: &str, bytes: &[u8], height: u64)
 pub enum EvidenceStatus {
     /// Valid, and the fault it proves isn't punished yet: submit it.
     Open(Fault),
+    /// That fault, or one by the same validator that already took this fault's stake.
     Punished,
-    /// From an epoch this state hasn't reached: ask again later.
+    /// From an epoch (or a view of this epoch) this state hasn't reached: ask again later.
     NotYet,
     /// Malformed, forged, or too old: it never will count.
     Never,
 }
 
-pub fn evidence_status(state: &State, chain_id: &str, bytes: &[u8], height: u64) -> EvidenceStatus {
+pub fn evidence_status(state: &State, chain_id: &str, genesis_hash: &str, bytes: &[u8], height: u64) -> EvidenceStatus {
     let Ok(e) = decode_evidence(bytes) else { return EvidenceStatus::Never };
-    if e.epoch > state.params.epoch_of(height) {
+    let now = state.params.epoch_of(height);
+    if e.epoch > now || (e.epoch == now && e.view > max_evidence_view(state, e.epoch)) {
         return EvidenceStatus::NotYet;
     }
-    match verify_evidence(state, chain_id, bytes, height) {
+    let since = |f: &Fault| f.epoch.saturating_mul(state.params.epoch_blocks.max(2));
+    match verify_evidence(state, chain_id, genesis_hash, bytes, height) {
         Ok(f) if state.staking.punished.contains_key(&pkey(&f.validator, f.epoch, f.view)) => EvidenceStatus::Punished,
+        Ok(f) if state.staking.pools.get(&f.validator).and_then(|p| p.slashed_from).is_some_and(|from| since(&f) >= from) => EvidenceStatus::Punished,
         Ok(f) => EvidenceStatus::Open(f),
         Err(_) => EvidenceStatus::Never,
     }
@@ -1043,7 +1150,17 @@ pub fn evidence_status(state: &State, chain_id: &str, bytes: &[u8], height: u64)
 pub fn end_block(state: &mut State, b: &BlockInfo) {
     let mut j = Journal::default();
     charge_junk(state, &mut j, b);
+    note_view(state, &mut j, b);
     score_leader_slots(state, &mut j, b);
+}
+
+/// Records the block's view as its epoch's highest (evidence can't be from far beyond it).
+fn note_view(state: &mut State, j: &mut Journal, b: &BlockInfo) {
+    let epoch = state.params.epoch_of(b.height);
+    if b.view > state.staking.views.get(&epoch).copied().unwrap_or(0) {
+        j.staking.views.touch(&state.staking.views, &epoch);
+        state.staking.views.insert(epoch, b.view);
+    }
 }
 
 /// CV-5: every tx the proposer included that couldn't be admitted costs it the base fee for its
@@ -1101,9 +1218,13 @@ fn leaders(state: &State, epoch: u64) -> Vec<String> {
 }
 
 /// Downtime (3.4): views `parent_view + 1 .. view − 1` were nullified, each a miss for its leader;
-/// the block's own view is a hit for its leader. Within an epoch, any n consecutive views lead
-/// each validator once, so long gaps cost O(n). A validator over `downtime_max_missed` in its
-/// window is jailed.
+/// the block's own view is a hit for its leader. One block charges a validator at most one miss
+/// (audit F59): a stall of many views, whatever its cause (lagging verifiers, a partition, an
+/// upgrade gone wrong), costs every leader in it one slot, not one per lap of the set, so it
+/// can't jail the whole set in one block. A validator over `downtime_max_missed` in its window
+/// is jailed, while that leaves at most f = ⌊(n−1)/3⌋ of the epoch's set jailed: more members
+/// looking offline at once is an incident of the network, not of the validators (more than f
+/// truly offline would have halted the chain), and they're charged again later.
 fn score_leader_slots(state: &mut State, j: &mut Journal, b: &BlockInfo) {
     if b.view == 0 || b.view <= b.parent_view {
         return; // no consensus view (genesis, or a block built outside consensus)
@@ -1115,36 +1236,41 @@ fn score_leader_slots(state: &mut State, j: &mut Journal, b: &BlockInfo) {
         return;
     }
     let seed = crate::beacon::elector_seed(state, epoch);
-    let mut misses = vec![0u64; n];
     let gap = b.view - b.parent_view - 1;
-    let (laps, rest) = (gap / n as u64, gap % n as u64);
-    for m in misses.iter_mut() {
-        *m = laps;
-    }
-    for x in b.view - rest..b.view {
-        misses[leader_index(seed, epoch, x, n)] += 1;
+    // Any n consecutive views lead every validator once.
+    let mut missed = vec![gap >= n as u64; n];
+    if gap < n as u64 {
+        for x in b.view - gap..b.view {
+            missed[leader_index(seed, epoch, x, n)] = true;
+        }
     }
     let hit = leader_index(seed, epoch, b.view, n);
     let (window, max_missed) = (state.chain_params.downtime_window.max(1), state.chain_params.downtime_max_missed);
+    let out = |p: &Pool| p.jail.is_some() || p.tombstoned_at.is_some();
+    let mut jailed = order.iter().filter(|v| state.staking.pools.get(*v).is_some_and(out)).count();
+    let f = (n - 1) / 3;
     for (i, v) in order.iter().enumerate() {
-        if misses[i] == 0 && i != hit {
+        if !missed[i] && i != hit {
             continue;
         }
         let Some(pool) = state.staking.pools.get(v) else { continue };
         // Jailed or tombstoned: already on its way out.
-        if pool.jail.is_some() || pool.tombstoned_at.is_some() {
+        if out(pool) {
             continue;
         }
         let mut l = state.staking.liveness.get(v).filter(|l| l.window == window).cloned().unwrap_or_else(|| Liveness::new(window));
-        l.miss(misses[i]);
+        if missed[i] {
+            l.push(true);
+        }
         if i == hit {
             l.push(false);
         }
         let over = l.missed > max_missed;
         let reason = format!("missed {} of its last {} leader slots", l.missed, l.filled);
         put_liveness(state, j, v, Some(l));
-        if over {
+        if over && jailed < f {
             jail(state, j, v, b.height, state.chain_params.slash_downtime_bps, &reason);
+            jailed += 1;
         }
     }
 }
@@ -1190,9 +1316,24 @@ pub struct Selection {
 
 /// The churn limit (CV-4): most members of a set of `m` that may be newcomers, ⌊(m−1)/3⌋, so the
 /// members it carries over (a quorum, m − ⌊(m−1)/3⌋) finalize on their own while newcomers
-/// sync. For a full set that's ⌊(n−1)/3⌋ replacements per epoch; a set of 1 or 2 takes none.
+/// sync. For a full set that's ⌊(n−1)/3⌋ replacements per epoch; a set of 1 or 2 takes none
+/// under it (see [`newcomers_allowed`] for how such a set still grows).
 pub fn churn_limit(m: usize) -> usize {
     m.saturating_sub(1) / 3
+}
+
+/// Newcomers the next set may take when it carries over `kept` members and would have `size`
+/// with this newcomer (`free`: into a free seat rather than replacing a member). The churn limit,
+/// except that on chains without admins a set carrying over one to three members grows by one per
+/// epoch (audit F24): under the churn limit alone a set that shrank to one or two could never grow
+/// again, with no fault tolerance (f = 0) for good, and mainnet has no other way to add one.
+/// Below four members every member is needed for a quorum whatever happens, so the newcomer must
+/// be synced and online to keep the chain moving (it's a tracked peer from the epoch before, so
+/// it syncs first); safety is unchanged. Dev and test chains keep small sets closed to strangers
+/// (a stranger that joined and went offline would stall them): their admins pin newcomers.
+pub fn newcomers_allowed(state: &State, kept: usize, size: usize, free: bool) -> usize {
+    let limit = churn_limit(size);
+    if free && (1..4).contains(&kept) && state.params.admins.is_empty() { limit.max(1) } else { limit }
 }
 
 /// Picks the next set (see the module docs). Pure: the API previews it.
@@ -1223,7 +1364,7 @@ pub fn select_next(state: &State, epoch: u64) -> Selection {
             break;
         }
         let size = if free { keep.len() + 1 } else { keep.len() };
-        if !pinned(&c) && joined + 1 > churn_limit(size) {
+        if !pinned(&c) && joined + 1 > newcomers_allowed(state, keep.len() - joined, size, free) {
             break;
         }
         if !free {
@@ -1246,11 +1387,18 @@ pub fn select_next(state: &State, epoch: u64) -> Selection {
 /// faults whose evidence can no longer arrive, then fix the next set and its members' statuses.
 pub fn end_epoch(state: &mut State, epoch: u64) {
     let mut j = Journal::default();
-    // Evidence for epoch e is accepted through epoch e + evidence_max_age_epochs.
-    let oldest = (epoch + 1).saturating_sub(state.chain_params.evidence_max_age_epochs);
+    // Punished faults and epochs' views live as long as the epochs' sets (`State::end_epoch`
+    // keeps the next `epoch_sets_kept`), so no window governance sets can reopen a fault whose
+    // record is gone (and `Pool::slashed_from` refuses it anyway).
+    let oldest = (epoch + 2).saturating_sub(crate::chain::epoch_sets_kept(&state.chain_params));
     let stale: Vec<String> = state.staking.punished.keys().filter(|k| k.split('/').nth(1).and_then(|e| e.parse::<u64>().ok()).is_some_and(|e| e < oldest)).cloned().collect();
     for k in stale {
         put_punished(state, &mut j, &k, None);
+    }
+    let old_views: Vec<u64> = state.staking.views.keys().copied().take_while(|e| *e < oldest).collect();
+    for e in old_views {
+        j.staking.views.touch(&state.staking.views, &e);
+        state.staking.views.remove(&e);
     }
     let sel = select_next(state, epoch);
     for v in &sel.leaving {
@@ -1441,6 +1589,7 @@ pub fn check_invariants(state: &State) -> Result<()> {
         ensure!(shares.get(v.as_str()).copied().unwrap_or(0) == p.shares, "pool {v}'s shares aren't its delegations'");
         ensure!(p.shares > 0 || p.stake == 0, "pool {v} holds stake without shares");
         ensure!(p.tombstoned_at.is_none() || state.validators[v].status == ValidatorStatus::Tombstoned, "pool {v} is tombstoned but its validator isn't");
+        ensure!(p.slashed_from.is_none() || p.tombstoned_at.is_some(), "pool {v} was slashed for double-signing but isn't tombstoned");
     }
     for v in state.validators.keys() {
         ensure!(s.pools.contains_key(v), "validator {v} has no pool");
@@ -1456,7 +1605,9 @@ pub fn check_invariants(state: &State) -> Result<()> {
         let n = per.entry(delegator).or_default();
         *n += 1;
         ensure!(*n <= MAX_ENTRIES, "{delegator} has more than {MAX_ENTRIES} entries");
+        ensure!(s.by_validator.contains_key(&vkey(e, k)), "entry {k} is missing from the by-validator index");
     }
+    ensure!(s.by_validator.len() == s.entries.len(), "the by-validator index lists entries that don't exist");
     for (v, l) in s.liveness.iter() {
         ensure!(state.validators.contains_key(v), "liveness of unknown validator {v}");
         ensure!(l.window > 0 && l.bits.len() as u64 == l.window.div_ceil(8) && l.next < l.window, "{v}'s liveness ring is malformed");

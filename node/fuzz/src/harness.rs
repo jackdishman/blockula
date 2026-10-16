@@ -101,7 +101,7 @@ fn genesis_state() -> &'static State {
 
 fn set_verifier() -> &'static MlDsaScheme {
     static V: OnceLock<MlDsaScheme> = OnceLock::new();
-    V.get_or_init(|| MlDsaScheme::verifier(&consensus::namespace(CHAIN_ID), four_validators()))
+    V.get_or_init(|| MlDsaScheme::verifier(&consensus::namespace(CHAIN_ID, genesis_hash()), four_validators()))
 }
 
 fn four_validators() -> Set<pq::PublicKey> {
@@ -387,12 +387,12 @@ pub fn evidence(data: &[u8]) -> bool {
         assert!((staking::CONFLICTING_NOTARIZE..=staking::NULLIFY_FINALIZE).contains(&e.kind));
     }
     let (st, height) = evidence_state();
-    let _ = staking::evidence_status(st, CHAIN_ID, data, *height);
-    let Ok(fault) = staking::verify_evidence(st, CHAIN_ID, data, *height) else { return false };
+    let _ = staking::evidence_status(st, CHAIN_ID, genesis_hash(), data, *height);
+    let Ok(fault) = staking::verify_evidence(st, CHAIN_ID, genesis_hash(), data, *height) else { return false };
     assert!(st.active_sets[&fault.epoch].contains(&fault.validator), "verified evidence names a validator outside its epoch's set");
     let owner = Keys::from_seed(EVIDENCE_OWNER);
     let report = |st: &State, nonce: u64| {
-        let mut tx = Tx { chain_id: CHAIN_ID.into(), genesis_hash: "00".repeat(32), from: owner.address(), nonce, fee: 0, tip: 0, valid_until: height + 10, action: Action::ReportEquivocation { evidence: hex::encode(data) }, memo: String::new(), public_key: hex::encode(owner.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+        let mut tx = Tx { chain_id: CHAIN_ID.into(), genesis_hash: genesis_hash().into(), from: owner.address(), nonce, fee: 0, tip: 0, valid_until: height + 10, action: Action::ReportEquivocation { evidence: hex::encode(data) }, memo: String::new(), public_key: hex::encode(owner.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
         tx.fee = crate::econ::base_fee(st, *height, tx.size());
         tx
     };
@@ -416,7 +416,7 @@ pub fn evidence(data: &[u8]) -> bool {
 fn evidence_seed(kind: u8, signer: usize, epoch: u64, view: u64) -> Vec<u8> {
     let set = four_validators();
     let key = SET_SEEDS.iter().map(|s| PrivateKey::from_seed_bytes(*s)).find(|k| set.position(&k.public_key()) == Some(signer)).unwrap();
-    let s = MlDsaScheme::signer(&consensus::namespace(CHAIN_ID), set, key).unwrap();
+    let s = MlDsaScheme::signer(&consensus::namespace(CHAIN_ID, genesis_hash()), set, key).unwrap();
     let round = Round::new(Epoch::new(epoch), View::new(view));
     let p = |d: u8| Proposal::new(round, View::new(view - 1), Digest([d; 32]));
     let activity = match kind {
@@ -796,7 +796,7 @@ fn proposal(epoch: u64, view: u64, parent_view: u64, block: &CBlock) -> Proposal
 /// A finalization of `block` by the fixture chain's validator.
 fn finalize_fixture(block: &CBlock, epoch: u64, view: u64) -> Vec<u8> {
     let g = genesis();
-    let scheme = MlDsaScheme::signer(&consensus::namespace(CHAIN_ID), consensus::participants(g).unwrap(), PrivateKey::from_seed_bytes(VALIDATOR_SEED)).unwrap();
+    let scheme = MlDsaScheme::signer(&consensus::namespace(CHAIN_ID, genesis_hash()), consensus::participants(g).unwrap(), PrivateKey::from_seed_bytes(VALIDATOR_SEED)).unwrap();
     let vote = Finalize::sign(&scheme, proposal(epoch, view, view - 1, block)).unwrap();
     Finalization::from_finalizes(&scheme, NonEmpty::try_new([vote].iter()).unwrap(), &Sequential).unwrap().encode().to_vec()
 }
@@ -937,7 +937,7 @@ pub fn seeds() -> Vec<(&'static str, &'static str, Vec<u8>)> {
     out.push(("epochs_registry", "fuzz-2-handoff-proof-for-epoch-0", serde_json::to_vec(&json!({ "sets": { "0": genesis_set }, "known_through": 0, "proofs": { "0": { "0": "00" } } })).unwrap()));
 
     // Votes and certificates of the 4-validator set (3 signers make a quorum).
-    let schemes: Vec<MlDsaScheme> = SET_SEEDS.iter().map(|s| MlDsaScheme::signer(&consensus::namespace(CHAIN_ID), four_validators(), PrivateKey::from_seed_bytes(*s)).unwrap()).collect();
+    let schemes: Vec<MlDsaScheme> = SET_SEEDS.iter().map(|s| MlDsaScheme::signer(&consensus::namespace(CHAIN_ID, genesis_hash()), four_validators(), PrivateKey::from_seed_bytes(*s)).unwrap()).collect();
     let p = proposal(2, 9, 8, &chain[1]);
     let round = p.round;
     let notarizes: Vec<_> = schemes.iter().map(|s| Notarize::sign(s, p.clone()).unwrap()).collect();
