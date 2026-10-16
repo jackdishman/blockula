@@ -89,8 +89,53 @@ async fn start_with(
         protection: Some(protection.clone()),
     };
     let ctx = context.child("validator").with_attribute("idx", idx).with_attribute("run", run);
+    serve_http_view(&ctx, genesis, idx, run, &chain, &protection);
     let (handle, _marshal) = consensus::start_validator(ctx, cfg, oracle.manager(), control, channels).await;
     Val { home, key, chain, handle: Some(handle), protection }
+}
+
+/// The simulated validators' HTTP APIs, by chain instance (genesis hash) and index: the latest
+/// run and its chain, and whether it's cut off from the others.
+type HttpPeers = std::collections::HashMap<String, std::collections::BTreeMap<usize, (usize, std::sync::Weak<Mutex<Chain>>, bool)>>;
+static HTTP_PEERS: std::sync::LazyLock<Mutex<HttpPeers>> = std::sync::LazyLock::new(Default::default);
+
+/// Stands in for the HTTP peers a validator asks about the network while slashing protection's
+/// restart rule watches (node.rs `watch_network`, audit F18): every two seconds, the tips of the
+/// chain's other validators, unless one of them is [`cut_off`]. Runs until `run` is replaced.
+fn serve_http_view(ctx: &deterministic::Context, genesis: &Genesis, idx: usize, run: usize, chain: &Shared, protection: &Arc<Protection>) {
+    let instance = ident(genesis).1;
+    HTTP_PEERS.lock().entry(instance.clone()).or_default().insert(idx, (run, Arc::downgrade(chain), false));
+    let (chain, protection) = (chain.clone(), protection.clone());
+    ctx.child("http_view").spawn(move |ctx| async move {
+        loop {
+            let peers: Vec<Shared> = {
+                let all = HTTP_PEERS.lock();
+                let mine = &all[&instance];
+                match mine.get(&idx) {
+                    Some((r, _, _)) if *r != run => return,
+                    Some((_, _, true)) => vec![],
+                    _ => mine.iter().filter(|(i, (_, _, cut))| **i != idx && !cut).filter_map(|(_, (_, c, _))| c.upgrade()).collect(),
+                }
+            };
+            if protection.watching() {
+                let tips: Vec<u64> = peers.iter().map(|c| c.lock().network_height_claimed()).collect();
+                let (params, height, claimed) = {
+                    let c = chain.lock();
+                    (c.state.params.clone(), c.height(), c.network_height_claimed())
+                };
+                let now = ctx.current().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+                protection.note_network(&params, height, claimed, &tips, None, now);
+            }
+            ctx.sleep(Duration::from_secs(2)).await;
+        }
+    });
+}
+
+/// Cuts validator `idx` off from the others' HTTP APIs (and theirs from it), or reconnects it.
+fn cut_off(genesis: &Genesis, idx: usize, cut: bool) {
+    if let Some((_, _, c)) = HTTP_PEERS.lock().get_mut(&ident(genesis).1).and_then(|m| m.get_mut(&idx)) {
+        *c = cut;
+    }
 }
 
 async fn wait_for_height(context: &deterministic::Context, vals: &[Val], height: u64) {

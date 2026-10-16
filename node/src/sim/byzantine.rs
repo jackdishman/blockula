@@ -70,6 +70,7 @@ async fn start_muteable(context: &deterministic::Context, oracle: &mut Oracle<Pu
     let protection = Protection::open(&home.join(crate::protection::RECORD_FILE), key.public_key().as_ref(), Timing::for_block_time(genesis.block_time_ms), false).unwrap();
     let cfg = ValidatorConfig { chain: chain.clone(), key: key.clone(), genesis: consensus::genesis_block(genesis), block_time_ms: genesis.block_time_ms, epoch_blocks: genesis.epoch_blocks, partition: format!("v{idx}"), protection: Some(protection.clone()) };
     let ctx = context.child("validator").with_attribute("idx", idx).with_attribute("run", 0);
+    serve_http_view(&ctx, genesis, idx, 0, &chain, &protection);
     let (handle, _marshal) = consensus::start_validator(ctx, cfg, oracle.manager(), control, channels).await;
     Val { home, key, chain, handle: Some(handle), protection }
 }

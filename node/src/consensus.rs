@@ -1392,17 +1392,21 @@ where
         let (mux, mut resolver_mux) = Muxer::new(context.child("resolver_mux"), resolver_net.0, resolver_net.1, 1024);
         mux.start();
 
-        // Slashing protection's clock (its startup rule waits on the network for a while), and the
-        // newest epoch the network has finalized a block in (no votes in epochs it has left).
+        // Slashing protection's clock (its startup rule waits on the network for a while), the
+        // newest epoch the network has finalized a block in (no votes in epochs it has left), and
+        // the view of the newest block executed (no votes at or below it: audit F18).
         if let Some(p) = protection.clone() {
             let chain = chain.clone();
             context.child("slashing_protection").spawn(move |ctx| async move {
                 loop {
-                    let finalized = {
+                    let (finalized, executed) = {
                         let c = chain.lock();
-                        c.state.params.epoch_of(c.finalized_tip.max(1))
+                        (c.state.params.epoch_of(c.finalized_tip.max(1)), c.last_block().map(|b| (c.state.params.epoch_of(b.height), b.view)))
                     };
                     p.note_finalized_epoch(finalized);
+                    if let Some((epoch, view)) = executed {
+                        p.note_executed(epoch, view);
+                    }
                     p.tick(ms(ctx.current()));
                     ctx.sleep(Duration::from_millis(250)).await;
                 }

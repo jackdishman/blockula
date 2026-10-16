@@ -184,19 +184,20 @@ async fn exchange_epochs(chain: Shared, peers: Vec<String>) {
 
 /// Slashing protection's view of the network from outside consensus (protection.rs, audit F18):
 /// while its restart rule watches, every HTTP peer is asked for its tip every couple of seconds.
-/// Only a network that stands where this node does (halted, or every validator restarting) lets
-/// the rule's escape fire; a peer in a later epoch keeps it shut (`protection::network_view`).
+/// Only a network standing still where this node is (halted, or every validator restarting) lets
+/// the rule's escape fire; a peer ahead of it, or in a later epoch, keeps it shut, and so does
+/// silence (`protection::network_view`), unless the operator said where the network halted.
 async fn watch_network(chain: Shared, peers: Vec<String>, protection: Arc<Protection>, halted_at: Option<u64>) {
     let client = reqwest::Client::builder().timeout(Duration::from_secs(3)).build().unwrap();
     let genesis_hash = chain.lock().genesis_hash.clone();
     loop {
         if protection.watching() {
             let tips: Vec<u64> = futures::future::join_all(peers.iter().map(|p| peer_tip(&client, p, &genesis_hash))).await.into_iter().flatten().collect();
-            let (params, height) = {
+            let (params, height, claimed) = {
                 let c = chain.lock();
-                (c.state.params.clone(), c.height())
+                (c.state.params.clone(), c.height(), c.network_height_claimed())
             };
-            protection.note_network(&params, height, &tips, halted_at, crate::chain::now_ms());
+            protection.note_network(&params, height, claimed, &tips, halted_at, crate::chain::now_ms());
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
