@@ -9,6 +9,8 @@ claude mcp add blockula -- npx -y @blockula/mcp --network local      # a `blocku
 
 With no configuration it connects to the public testnet at `https://blockula-testnet.fly.dev`. Call `status` to see which network and chain you're on.
 
+To run an exact release, name it: `npx -y @blockula/mcp@0.4.0`. Each release pins its whole dependency tree (exact versions plus a published `npm-shrinkwrap.json`), so what runs next to the agent's key is what CI tested.
+
 ## Which network (WAL-4)
 
 The network is chosen by the user, once, in the MCP's configuration, and nothing changes it while the server runs: it never switches to whatever answers on `localhost:7070`, and no tool can point it somewhere else.
@@ -41,15 +43,19 @@ The network is chosen by the user, once, in the MCP's configuration, and nothing
 
 Session keys can only send transfers: staking, voting and name renewals need an owner key (the agent's own account, or one the user made it an owner of). Staking and voting lock FANG for weeks, so ask the user first.
 
+**Spending caps.** `BLOCKULA_MAX_SEND` bounds what one call moves and `BLOCKULA_MAX_DAILY` what leaves the account per UTC day through this MCP. Every FANG-moving tool counts: `send` (with the fee and, for a new account, the opening fee), `stake`, `fund_hunt`, `register_name` and `renew_name` (their price, computed from the chain's parameters and never below the node's quote; a node that doesn't report one is refused), `submit_contribution` (the bond), and every tx's fee. A spend is reserved before the tx is sent and given back only if the node refuses it. A tx that isn't final within `BLOCKULA_TX_WAIT_MS` comes back as `"status": "pending"` with its `tx_id`: it was submitted and still counts, so check `tx_status` instead of sending it again. The chain itself enforces a session key's limit; these caps are the MCP's own (`wallet_info` shows today's total).
+
+**Chain text is untrusted.** Hunt titles, memos, proposal titles and links, key labels and claim notes are written by anyone. Tools return them in fields named `untrusted_*`, cleaned of control and invisible characters, and the server's instructions tell the agent they're data, never instructions. Node JSON is nested (`status`'s `node_reports`, `lookup`'s `data`), so a node can't override what the MCP says about the network.
+
 ## install_node
 
 Downloads the prebuilt `blockula` for this machine from the GitHub release and installs it to `~/.blockula/bin`, after the same checks as `scripts/install.sh` (docs/OPERATIONS.md "Releases"):
 
 1. SHA-256 against the release's `checksums.txt`, always. That only catches a corrupted download.
 2. Build provenance with a logged-in GitHub CLI (`gh attestation verify … --signer-workflow …/release.yml`). A failed check refuses the install.
-3. The offline ML-DSA-65 signature on `checksums.txt` (`checksums.txt.sig`), verified with the SDK against the release key id (built in after the key ceremony; `BLOCKULA_RELEASE_KEY_ID` until then). A failed check refuses the install.
+3. The offline ML-DSA-65 signature on `checksums.txt` (`checksums.txt.sig`), verified with the SDK against the release key id (built in after the key ceremony; `BLOCKULA_RELEASE_KEY_ID` until then). Once the key id is known, every release must carry a valid signature: a missing or failed one refuses the install, even with valid provenance (an unsigned release is what a compromised GitHub account or workflow would publish).
 
-The result lists what was verified. If only the checksum could be, it says so in a warning, and `BLOCKULA_REQUIRE_VERIFY=1` refuses instead.
+The checks add up: each refuses a release it fails. The result lists what was verified. If only the checksum could be (no key id yet, no `gh`), it says so in a warning, and `BLOCKULA_REQUIRE_VERIFY=1` refuses instead; with a key id, `BLOCKULA_REQUIRE_VERIFY=1` requires provenance as well as the signature.
 
 ## Configuration
 
@@ -59,12 +65,14 @@ The result lists what was verified. If only the checksum could be, it says so in
 | `BLOCKULA_RPC` | the network's public RPC | node URL |
 | `BLOCKULA_CHAIN_ID` / `BLOCKULA_GENESIS_HASH` | the network's pins | the chain the node must be on |
 | `BLOCKULA_HOME` | `~/.blockula` | the agent key (mode 600), the spending ledger and `known-chains.json` |
-| `BLOCKULA_MAX_SEND` | `100` | max FANG per `send` / `stake` / `fund_hunt` call (and per vote) |
-| `BLOCKULA_MAX_DAILY` | `100` | max FANG sent per UTC day across all calls (persisted in `BLOCKULA_HOME`) |
+| `BLOCKULA_MAX_SEND` | `100` | max FANG one call moves: sent, staked, escrowed, paid for a name, bonded (and per vote) |
+| `BLOCKULA_MAX_DAILY` | `100` | max FANG leaving the account per UTC day across all calls, fees and pending txs included (persisted in `BLOCKULA_HOME`) |
+| `BLOCKULA_TIMEOUT_MS` | `15000` | how long one request to the node may take |
+| `BLOCKULA_TX_WAIT_MS` | `15000` | how long a tx tool waits for finality before answering `pending` |
 | `BLOCKULA_BIN` | `~/.blockula/bin/blockula`, else `blockula` | node binary used by `start_dev_node` / `summon_chain` |
-| `BLOCKULA_REQUIRE_VERIFY` | unset | `1`: `install_node` refuses a release it can only checksum |
+| `BLOCKULA_REQUIRE_VERIFY` | unset | `1`: `install_node` refuses a release it can only checksum, and with a release key id requires provenance too |
 | `BLOCKULA_RELEASE_KEY_ID` | built in after the key ceremony | release signing key id to trust |
 
-`npm test -w @blockula/mcp` checks the network rules, the pins and the release checks offline, and runs the built server against a fake node.
+`npm test -w @blockula/mcp` checks the network rules, the pins, the release checks and the dependency pins offline, and runs the built server against a fake node (`test/spend.ts`: the spending caps with pending, refused, failed and final txs, name prices, untrusted text, timeouts).
 
 ⚠️ Early and unaudited: test chains only.

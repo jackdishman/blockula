@@ -7,6 +7,11 @@
 # no id-token; `publish`, the only job that can mint the OIDC token, installs nothing and runs no
 # build: it checks the tarballs against the build job's checksum and publishes them as they are.
 #
+# The MCP tarball carries npm-shrinkwrap.json (audit F75), so `npx` users get exactly the
+# dependency tree CI built and tested. The build job writes it from the reviewed lockfile with the
+# SDK tarball's own integrity (what the registry reports once that tarball is published); the
+# publish job refuses to publish the MCP unless the registry's SDK integrity is that one.
+#
 # One-time setup by the maintainer (docs/OPERATIONS.md "npm packages"):
 #   npmjs.com → each package → Settings → Trusted publishing → GitHub Actions:
 #     owner jackdishman, repository blockula, workflow npm-publish.yml, environment npm.
@@ -32,6 +37,7 @@ jobs:
       contents: read
     outputs:
       sums: ${{ steps.pack.outputs.sums }}
+      sdk_integrity: ${{ steps.pack.outputs.sdk_integrity }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { persist-credentials: false }
@@ -52,7 +58,14 @@ jobs:
         id: pack
         run: |
           mkdir dist-npm
-          npm pack -w @blockula/sdk -w @blockula/mcp --ignore-scripts --pack-destination dist-npm
+          # The SDK first: its tarball's integrity goes into the MCP's shrinkwrap.
+          npm pack -w @blockula/sdk --ignore-scripts --pack-destination dist-npm --json > sdk-pack.json
+          sdk_integrity=$(node -p 'JSON.parse(require("fs").readFileSync("sdk-pack.json", "utf8"))[0].integrity')
+          echo "sdk_integrity=$sdk_integrity" >> "$GITHUB_OUTPUT"
+          # Pin the MCP's whole dependency tree for `npx` users (audit F75): every entry by integrity.
+          node scripts/mcp-shrinkwrap.mjs --check --sdk-integrity "$sdk_integrity"
+          npm pack -w @blockula/mcp --ignore-scripts --pack-destination dist-npm --json > mcp-pack.json
+          node -e 'const f = JSON.parse(require("fs").readFileSync("mcp-pack.json", "utf8"))[0].files.map((x) => x.path); if (!f.includes("npm-shrinkwrap.json")) { console.error("the MCP tarball lacks npm-shrinkwrap.json"); process.exit(1); }'
           cd dist-npm
           sha256sum -- *.tgz | tee SHA256SUMS
           echo "sums=$(sha256sum SHA256SUMS | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
@@ -87,6 +100,7 @@ jobs:
       - name: Publish @blockula/sdk, then @blockula/mcp
         env:
           DRY_RUN: ${{ inputs.dry_run }}
+          SDK_INTEGRITY: ${{ needs.build.outputs.sdk_integrity }}
         run: |
           version=${GITHUB_REF_NAME#v}
           publish() {
@@ -100,4 +114,10 @@ jobs:
             echo "$1@$version didn't appear on the registry" >&2; exit 1
           }
           publish @blockula/sdk blockula-sdk
+          # The MCP's shrinkwrap pins the SDK tarball the build job packed. A dry run hasn't
+          # published the SDK, so only a published one is compared.
+          if npm view "@blockula/sdk@$version" version >/dev/null 2>&1; then
+            got=$(npm view "@blockula/sdk@$version" dist.integrity)
+            [ "$got" = "$SDK_INTEGRITY" ] || { echo "@blockula/sdk@$version on npm is $got, but the MCP's shrinkwrap pins $SDK_INTEGRITY" >&2; exit 1; }
+          fi
           publish @blockula/mcp blockula-mcp

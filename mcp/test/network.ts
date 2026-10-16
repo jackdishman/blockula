@@ -111,20 +111,26 @@ const deps = (files: Record<string, Buffer | null>, attest: Awaited<ReturnType<R
 });
 const files = { [asset]: archive, "checksums.txt": sums, "checksums.txt.sig": sig(sums) };
 const base = "https://example/release";
-const ok = await fetchVerifiedRelease(base, asset, { releaseKeyId: keyId, requireVerify: true }, deps(files));
+const ok = await fetchVerifiedRelease(base, asset, { releaseKeyId: keyId, requireVerify: false }, deps(files));
 assert.deepEqual(ok.verified, [`release signature (ML-DSA-65 key ${keyId.slice(0, 16)}…)`]);
 assert.equal(ok.warning, undefined);
 const both = await fetchVerifiedRelease(base, asset, { releaseKeyId: keyId, requireVerify: true }, deps(files, "ok"));
-assert.equal(both.verified.length, 2);
+assert.equal(both.verified.length, 2, "REQUIRE_VERIFY with a key id: provenance and the signature");
+const provenanceOnly = await fetchVerifiedRelease(base, asset, { releaseKeyId: "", requireVerify: true }, deps({ ...files, "checksums.txt.sig": null }, "ok"));
+assert.equal(provenanceOnly.verified.length, 1, "before the key ceremony, provenance is what REQUIRE_VERIFY can require");
 const onlySum = await fetchVerifiedRelease(base, asset, { releaseKeyId: "", requireVerify: false }, deps(files));
 assert.deepEqual(onlySum.verified, []);
 assert.match(onlySum.warning ?? "", /ONLY THE CHECKSUM/);
-const noSig = await fetchVerifiedRelease(base, asset, { releaseKeyId: keyId, requireVerify: false }, deps({ ...files, "checksums.txt.sig": null }));
-assert.match(noSig.warning ?? "", /ONLY THE CHECKSUM/, "a release without a signature file falls back to the warning");
 const other = ml_dsa65.keygen(new Uint8Array(32).fill(8));
 const tampered = Buffer.from(archive.toString() + "!");
 const releaseRefusals: [string, Promise<unknown>, RegExp][] = [
   ["unverifiable with REQUIRE_VERIFY", fetchVerifiedRelease(base, asset, { releaseKeyId: "", requireVerify: true }, deps(files)), /BLOCKULA_REQUIRE_VERIFY=1/],
+  // Audit F69: with a release key id, a release without its signature is refused, even with
+  // valid provenance (all a compromised GitHub account or workflow can produce).
+  ["no signature file (key id known)", fetchVerifiedRelease(base, asset, { releaseKeyId: keyId, requireVerify: false }, deps({ ...files, "checksums.txt.sig": null })), /no checksums.txt.sig/],
+  ["no signature file, provenance passing", fetchVerifiedRelease(base, asset, { releaseKeyId: keyId, requireVerify: false }, deps({ ...files, "checksums.txt.sig": null }, "ok")), /no checksums.txt.sig/],
+  ["no signature file with REQUIRE_VERIFY", fetchVerifiedRelease(base, asset, { releaseKeyId: keyId, requireVerify: true }, deps({ ...files, "checksums.txt.sig": null }, "ok")), /no checksums.txt.sig/],
+  ["signature without provenance under REQUIRE_VERIFY", fetchVerifiedRelease(base, asset, { releaseKeyId: keyId, requireVerify: true }, deps(files)), /requires build provenance as well/],
   ["a tampered archive", fetchVerifiedRelease(base, asset, { releaseKeyId: keyId, requireVerify: false }, deps({ ...files, [asset]: tampered })), /checksum mismatch/],
   ["an archive missing from checksums.txt", fetchVerifiedRelease(base, asset, { releaseKeyId: keyId, requireVerify: false }, deps({ ...files, "checksums.txt": Buffer.from("00  other\n") })), /checksum mismatch/],
   ["failed provenance", fetchVerifiedRelease(base, asset, { releaseKeyId: keyId, requireVerify: false }, deps(files, "failed")), /provenance check FAILED/],
@@ -175,6 +181,7 @@ await s.close();
 s = await server({ BLOCKULA_RPC: rpc, BLOCKULA_CHAIN_ID: "another-chain" });
 const tools = await s.tools();
 for (const name of ["stake", "unstake", "my_stake", "withdraw_stake", "list_proposals", "vote", "renew_name"]) assert.ok(tools.some((t) => t.name === name), `tool ${name}`);
+for (const name of ["list_hunts", "lookup", "list_proposals"]) assert.match(tools.find((t) => t.name === name)?.description ?? "", /untrusted_\*/, `${name} says its chain text is untrusted`);
 for (const name of ["list_hunts", "fund_hunt", "contribution_pool", "submit_contribution", "my_contributions"]) {
   assert.match(tools.find((t) => t.name === name)?.description ?? "", /Testnet FANG, Hunts and Soul have no monetary value/, `${name} carries the disclaimer`);
 }

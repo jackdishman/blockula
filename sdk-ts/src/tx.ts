@@ -183,27 +183,72 @@ export const DROPS_PER_FANG = 1_000_000_000n;
 
 const utf8 = new TextEncoder();
 
+const U64_LIMIT = 1n << 64n;
+
+/** An optional field's JSON default (`#[serde(default)]` in node/src/types.rs): only when it's absent, never for `null`. */
+const orDefault = <T>(v: T | undefined, d: T): T => (v === undefined ? d : v);
+
+/**
+ * An unsigned integer field as the node reads it from JSON (node/src/types.rs: a JSON number,
+ * or for amounts a decimal string), checked to be in `0 ..= max`. Anything the node's JSON
+ * parser would refuse is refused here, so `signingBytes`/`txBytes` never encode a value other
+ * than the one in the tx object (no wrapping of negative or oversized numbers).
+ */
+export function uintField(v: unknown, max: bigint, what = "integer field"): bigint {
+  let n: bigint;
+  if (typeof v === "bigint") n = v;
+  else if (typeof v === "number") {
+    if (!Number.isInteger(v)) throw new RangeError(`${what} must be a whole number, got ${v}`);
+    // Above 2^53 − 1 a JavaScript number may not be the value that was meant: pass a string of digits.
+    if (!Number.isSafeInteger(v)) throw new RangeError(`${what} must be 0 to ${max < BigInt(Number.MAX_SAFE_INTEGER) ? max : Number.MAX_SAFE_INTEGER} as a number (larger values as a string of digits), got ${v}`);
+    n = BigInt(v);
+  } else if (typeof v === "string") {
+    if (!/^\d+$/.test(v)) throw new RangeError(`${what} must be a decimal string of digits, got ${JSON.stringify(v)}`);
+    n = BigInt(v);
+  } else throw new RangeError(`${what} must be a number or a decimal string, got ${typeof v}`);
+  if (n < 0n || n > max) throw new RangeError(`${what} must be 0 to ${max}, got ${n}`);
+  return n;
+}
+
+/** A u64 field (`uintField` up to 2^64 − 1). */
+export const u64Field = (v: unknown, what?: string) => uintField(v, U64_LIMIT - 1n, what);
+
 class Writer {
   private parts: number[] = [];
   bytes(b: Uint8Array) { for (const x of b) this.parts.push(x); }
-  u8(n: number) { this.parts.push(n & 0xff); }
-  u16(n: number) { this.u8(n); this.u8(n >> 8); }
-  u32(n: number) { this.u16(n & 0xffff); this.u16(n >>> 16); }
-  u64(n: bigint) { for (let i = 0n; i < 8n; i++) this.u8(Number((n >> (8n * i)) & 0xffn)); }
-  str(s: string) {
+  /** A byte the encoder chose (tags, bools, lengths' bytes): always in range. */
+  private byte(n: number) { this.parts.push(n & 0xff); }
+  u8(n: unknown, what?: string) { this.byte(Number(uintField(n, 0xffn, what))); }
+  u16(n: number, what?: string) { const v = Number(uintField(n, 0xffffn, what)); this.byte(v); this.byte(v >> 8); }
+  u32(n: unknown, what?: string) { const v = Number(uintField(n, 0xffff_ffffn, what)); this.byte(v); this.byte(v >> 8); this.byte(v >> 16); this.byte(v >>> 24); }
+  u64(n: unknown, what?: string) { const v = u64Field(n, what); for (let i = 0n; i < 8n; i++) this.byte(Number((v >> (8n * i)) & 0xffn)); }
+  bool(b: unknown, what = "flag") {
+    if (typeof b !== "boolean") throw new TypeError(`${what} must be true or false`);
+    this.byte(b ? 1 : 0);
+  }
+  str(s: unknown, what = "string field") {
+    if (typeof s !== "string") throw new TypeError(`${what} must be a string`);
     const b = utf8.encode(s);
-    if (b.length > 0xffff) throw new Error("string field too long to encode");
+    if (b.length > 0xffff) throw new Error(`${what} too long to encode`);
     this.u16(b.length);
     this.bytes(b);
   }
-  ids(xs: number[]) { this.u16(xs.length); for (const x of xs) this.u64(BigInt(x)); }
+  ids(xs: unknown, what = "id list") {
+    if (!Array.isArray(xs)) throw new TypeError(`${what} must be an array`);
+    this.u16(xs.length, `${what} length`);
+    for (const x of xs) this.u64(x, what);
+  }
   /** Raw bytes of exactly `len` bytes, from hex. */
   fixed(hex: string, len: number) {
     const b = hexToBytes(hex);
     if (b.length !== len) throw new Error(`expected ${len} bytes, got ${b.length}`);
     this.bytes(b);
   }
-  strs(xs: string[]) { this.u16(xs.length); for (const x of xs) this.str(x); }
+  strs(xs: unknown, what = "string list") {
+    if (!Array.isArray(xs)) throw new TypeError(`${what} must be an array`);
+    this.u16(xs.length, `${what} length`);
+    for (const x of xs) this.str(x, what);
+  }
   done() { return Uint8Array.from(this.parts); }
 }
 
@@ -230,9 +275,9 @@ export function signingBytes(tx: UnsignedTx): Uint8Array {
     w.bytes(utf8.encode(GHOST_TX_DOMAIN));
     w.str(tx.chain_id);
     w.bytes(genesisHashBytes(tx.genesis_hash));
-    w.u64(BigInt(tx.fee));
-    w.u64(BigInt(tx.tip ?? "0"));
-    w.u64(BigInt(tx.valid_until));
+    w.u64(tx.fee, "fee");
+    w.u64(orDefault(tx.tip, "0"), "tip");
+    w.u64(tx.valid_until, "valid_until");
     encodeAction(w, tx.action);
     return w.done();
   }
@@ -240,12 +285,12 @@ export function signingBytes(tx: UnsignedTx): Uint8Array {
   w.str(tx.chain_id);
   w.bytes(genesisHashBytes(tx.genesis_hash));
   w.str(tx.from);
-  w.u64(BigInt(tx.nonce));
-  w.u64(BigInt(tx.fee));
-  w.u64(BigInt(tx.tip ?? "0"));
-  w.u64(BigInt(tx.valid_until));
+  w.u64(tx.nonce, "nonce");
+  w.u64(tx.fee, "fee");
+  w.u64(orDefault(tx.tip, "0"), "tip");
+  w.u64(tx.valid_until, "valid_until");
   encodeAction(w, tx.action);
-  w.str(tx.memo);
+  w.str(orDefault(tx.memo, ""), "memo");
   return w.done();
 }
 
@@ -253,7 +298,7 @@ export function signingBytes(tx: UnsignedTx): Uint8Array {
 function encodeAction(w: Writer, a: Action) {
   switch (a.type) {
     case "transfer":
-      w.u8(0); w.str(a.to); w.u64(BigInt(a.amount));
+      w.u8(0); w.str(a.to); w.u64(a.amount);
       break;
     case "register_name":
       w.u8(1); w.str(a.name);
@@ -261,13 +306,13 @@ function encodeAction(w: Writer, a: Action) {
     case "add_key":
       w.u8(2); w.str(a.key_id); w.str(a.label);
       if (a.role.type === "owner") w.u8(0);
-      else { w.u8(1); w.u64(BigInt(a.role.limit)); w.u64(BigInt(a.role.period_blocks)); w.u64(BigInt(a.role.expires_at)); }
+      else { w.u8(1); w.u64(a.role.limit); w.u64(a.role.period_blocks); w.u64(a.role.expires_at); }
       break;
     case "remove_key":
       w.u8(3); w.str(a.key_id);
       break;
     case "register_validator":
-      w.u8(4); w.str(a.consensus_key); w.str(a.p2p_addr); w.str(a.http_addr); w.u64(BigInt(a.bond)); w.str(a.pop);
+      w.u8(4); w.str(a.consensus_key); w.str(a.p2p_addr); w.str(a.http_addr); w.u64(a.bond); w.str(a.pop);
       break;
     case "approve_validator":
       w.u8(5); w.str(a.validator);
@@ -285,25 +330,25 @@ function encodeAction(w: Writer, a: Action) {
       w.u8(9); w.str(a.handle);
       break;
     case "create_hunt":
-      w.u8(10); w.str(a.repo); w.u64(BigInt(a.issue)); w.u64(BigInt(a.amount)); w.u64(BigInt(a.expires_at)); w.str(a.title);
+      w.u8(10); w.str(a.repo); w.u64(a.issue); w.u64(a.amount); w.u64(a.expires_at); w.str(a.title);
       break;
     case "fund_hunt":
-      w.u8(11); w.u64(BigInt(a.hunt_id)); w.u64(BigInt(a.amount));
+      w.u8(11); w.u64(a.hunt_id); w.u64(a.amount);
       break;
     case "award_hunt":
-      w.u8(12); w.u64(BigInt(a.hunt_id)); w.str(a.to); w.u64(BigInt(a.pr)); w.str(a.familiar_key ?? "");
+      w.u8(12); w.u64(a.hunt_id); w.str(a.to); w.u64(a.pr); w.str(a.familiar_key ?? "");
       break;
     case "cancel_hunt":
-      w.u8(13); w.u64(BigInt(a.hunt_id));
+      w.u8(13); w.u64(a.hunt_id);
       break;
     case "register_familiar":
       w.u8(14); w.str(a.key_id); w.str(a.label);
       break;
     case "set_repo":
-      w.u8(15); w.str(a.repo); w.u64(BigInt(a.weight));
+      w.u8(15); w.str(a.repo); w.u64(a.weight);
       break;
     case "grant_soul":
-      w.u8(16); w.str(a.to); w.u64(BigInt(a.amount)); w.str(a.reason);
+      w.u8(16); w.str(a.to); w.u64(a.amount); w.str(a.reason);
       break;
     case "vouch":
       w.u8(17); w.str(a.account);
@@ -315,28 +360,28 @@ function encodeAction(w: Writer, a: Action) {
       w.u8(19); w.str(a.account); w.str(a.reason);
       break;
     case "submit_claim":
-      w.u8(20); w.str(a.repo); w.u64(BigInt(a.pr)); w.str(a.familiar_key ?? "");
+      w.u8(20); w.str(a.repo); w.u64(a.pr); w.str(a.familiar_key ?? "");
       break;
     case "attest_claim":
-      w.u8(21); w.u64(BigInt(a.claim_id)); w.u8(a.ok ? 1 : 0); w.str(a.merge_sha); w.str(a.note);
+      w.u8(21); w.u64(a.claim_id); w.bool(a.ok, "ok"); w.str(a.merge_sha); w.str(orDefault(a.note, ""));
       break;
     case "reject_claim":
-      w.u8(22); w.u64(BigInt(a.claim_id)); w.str(a.reason);
+      w.u8(22); w.u64(a.claim_id); w.str(a.reason);
       break;
     case "join_jury":
-      w.u8(23); w.u64(BigInt(a.bond));
+      w.u8(23); w.u64(a.bond);
       break;
     case "leave_jury":
       w.u8(24);
       break;
     case "commit_votes":
-      w.u8(25); w.u64(BigInt(a.seance_id)); w.str(a.commitment);
+      w.u8(25); w.u64(a.seance_id); w.str(a.commitment);
       break;
     case "reveal_votes":
-      w.u8(26); w.u64(BigInt(a.seance_id)); w.str(a.votes); w.ids(a.spam); w.str(a.salt);
+      w.u8(26); w.u64(a.seance_id); w.str(a.votes); w.ids(a.spam); w.str(a.salt);
       break;
     case "fund_pool":
-      w.u8(27); w.u64(BigInt(a.amount));
+      w.u8(27); w.u64(a.amount);
       break;
     case "withdraw_vested":
       w.u8(28);
@@ -345,19 +390,19 @@ function encodeAction(w: Writer, a: Action) {
       w.u8(29); w.str(a.account); w.str(a.reason);
       break;
     case "delegate":
-      w.u8(30); w.str(a.validator); w.u64(BigInt(a.amount));
+      w.u8(30); w.str(a.validator); w.u64(a.amount);
       break;
     case "undelegate":
-      w.u8(31); w.str(a.validator); w.u64(BigInt(a.shares));
+      w.u8(31); w.str(a.validator); w.u64(a.shares);
       break;
     case "redelegate":
-      w.u8(32); w.str(a.from_validator); w.str(a.to_validator); w.u64(BigInt(a.shares));
+      w.u8(32); w.str(a.from_validator); w.str(a.to_validator); w.u64(a.shares);
       break;
     case "withdraw_unbonded":
       w.u8(33);
       break;
     case "update_validator":
-      w.u8(34); w.u64(BigInt(a.commission_bps)); w.str(a.p2p_addr); w.str(a.http_addr);
+      w.u8(34); w.u64(a.commission_bps); w.str(a.p2p_addr); w.str(a.http_addr);
       break;
     case "unjail":
       w.u8(35); w.str(a.validator);
@@ -366,32 +411,32 @@ function encodeAction(w: Writer, a: Action) {
       w.u8(36); w.str(a.evidence);
       break;
     case "beacon_commit":
-      w.u8(37); w.u64(BigInt(a.epoch)); w.str(a.commitment);
+      w.u8(37); w.u64(a.epoch); w.str(a.commitment);
       break;
     case "beacon_reveal":
-      w.u8(38); w.u64(BigInt(a.epoch)); w.str(a.secret);
+      w.u8(38); w.u64(a.epoch); w.str(a.secret);
       break;
     case "propose":
-      w.u8(39); encodeProposalKind(w, a.kind); w.u64(BigInt(a.deposit)); w.str(a.title); w.str(a.url ?? "");
+      w.u8(39); encodeProposalKind(w, a.kind); w.u64(a.deposit); w.str(a.title); w.str(orDefault(a.url, ""));
       break;
     case "vote":
-      w.u8(40); w.u64(BigInt(a.proposal_id)); w.u8(a.aye ? 1 : 0); w.u64(BigInt(a.amount)); w.u8(a.conviction);
+      w.u8(40); w.u64(a.proposal_id); w.bool(a.aye, "aye"); w.u64(a.amount); w.u8(a.conviction, "conviction");
       break;
     case "unlock":
       w.u8(41);
       break;
     case "multisig_create":
-      w.u8(42); w.strs(a.owners); w.u8(a.threshold);
+      w.u8(42); w.strs(a.owners); w.u8(a.threshold, "threshold");
       break;
     case "multisig_propose":
       if (a.action.type === "multisig_propose") throw new Error("a multisig proposal can't contain another");
       w.u8(43); encodeAction(w, a.action);
       break;
     case "multisig_approve":
-      w.u8(44); w.u64(BigInt(a.id));
+      w.u8(44); w.u64(a.id);
       break;
     case "renew_name":
-      w.u8(45); w.str(a.name); w.u8(a.years);
+      w.u8(45); w.str(a.name); w.u8(a.years, "years");
       break;
     case "transfer_name":
       w.u8(46); w.str(a.name); w.str(a.to);
@@ -400,19 +445,19 @@ function encodeAction(w: Writer, a: Action) {
       w.u8(47); w.str(a.name);
       break;
     case "claim_distribution":
-      w.u8(48); w.u64(BigInt(a.distribution_id)); w.u64(BigInt(a.amount)); w.strs(a.proof);
+      w.u8(48); w.u64(a.distribution_id); w.u64(a.amount); w.strs(a.proof);
       break;
     case "attest_revert":
-      w.u8(49); w.u64(BigInt(a.claim_id)); w.str(a.revert_sha);
+      w.u8(49); w.u64(a.claim_id); w.str(a.revert_sha);
       break;
     case "shield":
-      w.u8(50); w.u64(BigInt(a.amount)); encodeBundle(w, a.bundle);
+      w.u8(50); w.u64(a.amount); encodeBundle(w, a.bundle);
       break;
     case "private_transfer":
       w.u8(51); encodeBundle(w, a.bundle);
       break;
     case "unshield":
-      w.u8(52); w.str(a.to); w.u64(BigInt(a.amount)); encodeBundle(w, a.bundle);
+      w.u8(52); w.str(a.to); w.u64(a.amount); encodeBundle(w, a.bundle);
       break;
     case "set_ghost_address":
       w.u8(53); w.fixed(a.address, GHOST_ADDRESS_BYTES);
@@ -456,11 +501,11 @@ export function ghostSighash(tx: UnsignedTx): Uint8Array {
   w.str(tx.chain_id);
   w.bytes(genesisHashBytes(tx.genesis_hash));
   w.u8(a.type === "shield" ? 50 : a.type === "private_transfer" ? 51 : 52);
-  w.u64(BigInt(tx.valid_until));
-  w.u64(BigInt(tx.fee));
-  w.u64(BigInt(tx.tip ?? "0"));
-  if (a.type === "shield") { w.str(tx.from); w.u64(BigInt(tx.nonce)); w.u64(BigInt(a.amount)); }
-  if (a.type === "unshield") { w.str(a.to); w.u64(BigInt(a.amount)); }
+  w.u64(tx.valid_until, "valid_until");
+  w.u64(tx.fee, "fee");
+  w.u64(orDefault(tx.tip, "0"), "tip");
+  if (a.type === "shield") { w.str(tx.from); w.u64(tx.nonce, "nonce"); w.u64(a.amount); }
+  if (a.type === "unshield") { w.str(a.to); w.u64(a.amount); }
   encodeBundlePublic(w, a.bundle);
   w.u32(GHOST_CIRCUIT_ID);
   return blake3(w.done(), { context: utf8.encode("blockula ghost v1 tx sighash") });
@@ -470,25 +515,25 @@ export function ghostSighash(tx: UnsignedTx): Uint8Array {
 function encodeProposalKind(w: Writer, k: ProposalKind) {
   switch (k.type) {
     case "param_change":
-      w.u8(0); w.str(k.key); w.u64(BigInt(k.value));
+      w.u8(0); w.str(k.key); w.u64(k.value);
       break;
     case "treasury_spend":
-      w.u8(1); w.str(k.to); w.u64(BigInt(k.amount));
+      w.u8(1); w.str(k.to); w.u64(k.amount);
       break;
     case "distribution":
-      w.u8(2); w.u64(BigInt(k.distribution_id)); w.str(k.merkle_root); w.u64(BigInt(k.total)); w.u64(BigInt(k.claim_until));
+      w.u8(2); w.u64(k.distribution_id); w.str(k.merkle_root); w.u64(k.total); w.u64(k.claim_until);
       break;
     case "set_repo":
-      w.u8(3); w.str(k.repo); w.u64(BigInt(k.weight));
+      w.u8(3); w.str(k.repo); w.u64(k.weight);
       break;
     case "grant_soul":
-      w.u8(4); w.str(k.to); w.u64(BigInt(k.amount)); w.str(k.reason);
+      w.u8(4); w.str(k.to); w.u64(k.amount); w.str(k.reason);
       break;
     case "flag_sybil":
       w.u8(5); w.str(k.account); w.str(k.reason);
       break;
     case "reject_claim":
-      w.u8(6); w.u64(BigInt(k.claim_id)); w.str(k.reason);
+      w.u8(6); w.u64(k.claim_id); w.str(k.reason);
       break;
     case "clawback":
       w.u8(7); w.str(k.account); w.str(k.reason);
@@ -497,10 +542,10 @@ function encodeProposalKind(w: Writer, k: ProposalKind) {
       w.u8(8); w.str(k.handle);
       break;
     case "refund_hunt":
-      w.u8(9); w.u64(BigInt(k.hunt_id));
+      w.u8(9); w.u64(k.hunt_id);
       break;
     case "schedule_upgrade":
-      w.u8(10); w.u32(k.version); w.u64(BigInt(k.activation_height));
+      w.u8(10); w.u32(k.version, "version"); w.u64(k.activation_height);
       break;
     case "activate_feature":
       w.u8(11); w.str(k.feature);
@@ -515,7 +560,7 @@ function encodeProposalKind(w: Writer, k: ProposalKind) {
       w.u8(14); w.str(k.account); w.str(k.reason);
       break;
     case "cancel_upgrade":
-      w.u8(15); w.u32(k.version); w.u64(BigInt(k.activation_height));
+      w.u8(15); w.u32(k.version, "version"); w.u64(k.activation_height, "activation_height");
       break;
     default:
       throw new Error(`unknown proposal kind ${(k as { type: string }).type}`);
@@ -529,7 +574,7 @@ function encodeProposalKind(w: Writer, k: ProposalKind) {
 export function seanceCommitment(seanceId: number, juror: string, votes: string, spam: number[], salt: string): string {
   const w = new Writer();
   w.bytes(utf8.encode("BLOCKULA_SEANCE_V1"));
-  w.u64(BigInt(seanceId));
+  w.u64(seanceId);
   w.str(juror);
   w.str(votes);
   w.ids(spam);
@@ -546,7 +591,8 @@ export function seanceCommitment(seanceId: number, juror: string, votes: string,
 export function beaconCommitment(chainId: string, epoch: number, validator: string, secret: string): string {
   const u64 = (n: number) => {
     const b = new Uint8Array(8);
-    new DataView(b.buffer).setBigUint64(0, BigInt(n), true);
+    // setBigUint64 would wrap a negative or oversized value: check it first.
+    new DataView(b.buffer).setBigUint64(0, u64Field(n, "epoch"), true);
     return b;
   };
   const str = (s: string) => {
@@ -620,7 +666,7 @@ export function maxTip(tx: UnsignedTx, fee: BaseFee = FLOOR_BASE_FEE, multiple: 
 
 /** What the tx is charged in a block with this base fee (node/src/econ.rs `charge`): base fee + tip. Its `fee` must cover it; nothing more is debited. */
 export function txCharge(tx: UnsignedTx, fee: BaseFee = FLOOR_BASE_FEE): bigint {
-  return baseFee(tx, fee) + BigInt(tx.tip ?? "0");
+  return baseFee(tx, fee) + u64Field(orDefault(tx.tip, "0"), "tip");
 }
 
 /**

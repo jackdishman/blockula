@@ -843,6 +843,34 @@ export class TxFailedError extends Error {
   }
 }
 
+/**
+ * The node accepted a transaction, but it wasn't seen finalized (or failed) in time. It may still
+ * execute until its `valid_until`: check it with `client.tx(id)` before sending it again, or a
+ * retry can pay twice.
+ */
+export class TxPendingError extends Error {
+  constructor(readonly id: string, readonly waitedMs: number, readonly lastError?: unknown) {
+    super(`tx ${id} still pending ${waitedMs > 0 ? `after ${waitedMs}ms` : "(its status couldn't be read)"}; it was submitted and may still execute, so check it (client.tx) before sending again`);
+    this.name = "TxPendingError";
+  }
+}
+
+/** The node didn't answer within the client's `timeoutMs`. Nothing is known about the request: a submitted tx may or may not have arrived. */
+export class RequestTimeoutError extends Error {
+  constructor(readonly rpc: string, readonly path: string, readonly timeoutMs: number) {
+    super(`${rpc} didn't answer within ${timeoutMs}ms (${path})`);
+    this.name = "RequestTimeoutError";
+  }
+}
+
+/** A proof older than the newest head seen (this node's and every witness's) by more than `maxLagBlocks`. */
+export class StaleProofError extends Error {
+  constructor(readonly height: number, readonly head: number, readonly maxLagBlocks: number) {
+    super(`the proof is for block #${height}, but the chain is at #${head} (at most ${maxLagBlocks} blocks behind is accepted): a node serving old state, or one that's far behind`);
+    this.name = "StaleProofError";
+  }
+}
+
 /** The node reports a different chain than the client is pinned to (`ClientOptions`). */
 export class ChainMismatchError extends Error {
   constructor(readonly rpc: string, readonly field: "chain_id" | "genesis_hash" | "address_prefix", readonly expected: string, readonly reported: string | undefined) {
@@ -859,7 +887,33 @@ export interface ClientOptions {
   chainId?: string;
   /** The genesis hash (hex) the node must report. */
   genesisHash?: string;
+  /** How long one request may take before it fails with `RequestTimeoutError` (default 15 s). */
+  timeoutMs?: number;
 }
+
+/** Default per-request timeout of a `Client`. */
+export const DEFAULT_TIMEOUT_MS = 15_000;
+
+/**
+ * How far behind the newest head (the node's own and each witness's `/api/status` height) a
+ * proven read's proof may be, by default: 10 blocks (10 s at 1 s blocks), room for propagation
+ * between nodes. Older proofs are refused (`StaleProofError`), so a node can't answer with a
+ * genuine but outdated record (a name's previous owner, a balance before a spend, a removed key).
+ */
+export const DEFAULT_MAX_PROOF_LAG_BLOCKS = 10;
+
+/** Options of the proven reads (`provenRecord`, `provenAccount`, `provenName`). */
+export interface ProvenOptions {
+  /** Clients for independent nodes: each must report the same state root for the proof's block, and its head bounds how old the proof may be. */
+  witnesses?: Client[];
+  /** How long to wait for a witness that hasn't reached the proof's block yet (default 5 s). */
+  waitMs?: number;
+  /** How many blocks the proof may be behind the newest head seen (default `DEFAULT_MAX_PROOF_LAG_BLOCKS`). */
+  maxLagBlocks?: number;
+}
+
+/** A record proven against a state root, and the newest head height that root was checked against. */
+export type ProvenRead = ProvenRecord & { head: number };
 
 export class Client {
   /** The chain's address prefix: given, learned from `/api/status`, or `boo` until then. */
@@ -868,11 +922,16 @@ export class Client {
   private readonly pinnedPrefix?: string;
   private readonly pinnedChainId?: string;
   private readonly pinnedGenesis?: string;
+  /** Per-request timeout (ms). */
+  readonly timeoutMs: number;
 
   /** `opts` pins the chain: a node reporting another prefix, chain id or genesis hash is refused with `ChainMismatchError`. */
   constructor(readonly rpc: string = DEFAULT_RPC, opts: ClientOptions = {}) {
     if (opts.prefix !== undefined && !(KNOWN_PREFIXES as readonly string[]).includes(opts.prefix)) throw new Error(`unknown address prefix ${opts.prefix}`);
     if (opts.genesisHash !== undefined && !/^[0-9a-f]{64}$/i.test(opts.genesisHash)) throw new Error("genesisHash must be 64 hex characters");
+    const timeout = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    if (!Number.isSafeInteger(timeout) || timeout < 1) throw new Error("timeoutMs must be a positive whole number of milliseconds");
+    this.timeoutMs = timeout;
     this.pinnedPrefix = opts.prefix;
     this.pinnedChainId = opts.chainId;
     this.pinnedGenesis = opts.genesisHash?.toLowerCase();
@@ -886,9 +945,22 @@ export class Client {
     return this.prefix;
   }
 
+  /** One request, bounded by `timeoutMs` (headers and body): a node that never answers fails with `RequestTimeoutError` instead of hanging. */
   private async call(path: string, body?: unknown) {
-    const res = await fetch(this.rpc.replace(/\/$/, "") + "/api" + path, body === undefined ? undefined : { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-    const text = await res.text();
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), this.timeoutMs);
+    let res: Response;
+    let text: string;
+    try {
+      const init: RequestInit = body === undefined ? { signal: ctl.signal } : { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: ctl.signal };
+      res = await fetch(this.rpc.replace(/\/$/, "") + "/api" + path, init);
+      text = await res.text();
+    } catch (e) {
+      if (ctl.signal.aborted) throw new RequestTimeoutError(this.rpc, path, this.timeoutMs);
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
     let json: any;
     try {
       json = JSON.parse(text);
@@ -971,11 +1043,29 @@ export class Client {
    * that only shows the node is consistent; `witnesses` (clients for independent nodes) must
    * each report the same state root for that block, so a single lying node can't fake balances,
    * names or keys. A witness that hasn't reached the block yet is retried for `waitMs`.
+   *
+   * The proof must also be fresh: its block may be at most `maxLagBlocks` behind the newest head
+   * this node and the witnesses report (`StaleProofError` otherwise). Witnesses confirm any
+   * genuine root, old ones included, so without this a lying node could serve a real but outdated
+   * record (a name's previous owner, a balance before a spend, a key since removed). `head` is
+   * the newest head seen. Without witnesses only this node's own head is compared, which a lying
+   * node controls: pass witnesses for anything that matters.
    */
-  async provenRecord(namespace: number, key: string | Uint8Array, opts: { witnesses?: Client[]; waitMs?: number } = {}): Promise<ProvenRecord> {
+  async provenRecord(namespace: number, key: string | Uint8Array, opts: ProvenOptions = {}): Promise<ProvenRead> {
+    const maxLag = opts.maxLagBlocks ?? DEFAULT_MAX_PROOF_LAG_BLOCKS;
+    if (!Number.isSafeInteger(maxLag) || maxLag < 0) throw new Error("maxLagBlocks must be a whole number of blocks");
+    const witnesses = opts.witnesses ?? [];
+    // Heads first, so the honest ones can only be behind the proof, never far ahead of it.
+    const heads = await Promise.all([this, ...witnesses].map(async (c) => {
+      const h = (await c.status()).height;
+      if (!Number.isSafeInteger(h) || h < 0) throw new Error(`${c.rpc} doesn't report its height`);
+      return h as number;
+    }));
     const r = checkProofResponse(await this.proof(namespace, key), namespace, key);
-    await Promise.all((opts.witnesses ?? []).map((w) => w.confirmStateRoot(r.height, r.root, opts.waitMs ?? 5_000)));
-    return r;
+    const head = Math.max(...heads);
+    if (r.height + maxLag < head) throw new StaleProofError(r.height, head, maxLag);
+    await Promise.all(witnesses.map((w) => w.confirmStateRoot(r.height, r.root, opts.waitMs ?? 5_000)));
+    return { ...r, head };
   }
 
   /** Throws unless this node's block `height` has state root `root` (waiting up to `waitMs` for it to get there). */
@@ -993,17 +1083,27 @@ export class Client {
     }
   }
 
-  /** An address's balance, nonce and keys, proven (see `provenRecord`). `null` if the account provably doesn't exist. */
-  async provenAccount(address: string, opts: { witnesses?: Client[]; waitMs?: number } = {}) {
+  /** An address's balance, nonce and keys, proven and fresh (see `provenRecord`). `null` if the account provably doesn't exist. */
+  async provenAccount(address: string, opts: ProvenOptions = {}) {
     if (!isAddress(address)) throw new Error(`${address} isn't an address`);
     const r = await this.provenRecord(NAMESPACES.ACCOUNTS, address, opts);
-    return r.value === null ? null : { address, ...decodeAccount(r.value), height: r.height, root: r.root };
+    return r.value === null ? null : { address, ...decodeAccount(r.value), height: r.height, root: r.root, head: r.head };
   }
 
-  /** Who owns a `.boo` name, proven (see `provenRecord`). `null` if it provably isn't registered. */
-  async provenName(name: string, opts: { witnesses?: Client[]; waitMs?: number } = {}) {
+  /**
+   * Who a `.boo` name resolves to, proven and fresh (see `provenRecord`). `null` if it provably
+   * doesn't resolve: never registered, or expired (`expires_at` passed; in its grace period only
+   * the owner can renew it, and after that anyone can register it). `includeExpired` returns an
+   * expired record too, with `active: false`: never pay its `owner`.
+   */
+  async provenName(name: string, opts: ProvenOptions & { includeExpired?: boolean } = {}) {
     const r = await this.provenRecord(NAMESPACES.NAMES, bareName(name), opts);
-    return r.value === null ? null : { ...decodeName(r.value), height: r.height, root: r.root };
+    if (r.value === null) return null;
+    const rec = decodeName(r.value);
+    // node/src/econ.rs `name_active`: the next block (height + 1) must be at most `expires_at`.
+    const active = r.height + 1 <= rec.expires_at;
+    if (!active && !opts.includeExpired) return null;
+    return { ...rec, active, height: r.height, root: r.root, head: r.head };
   }
 
   async resolve(nameOrAddress: string): Promise<string> {
@@ -1015,9 +1115,21 @@ export class Client {
     return r.owner.address;
   }
 
+  /**
+   * Submits a signed tx, then (with `wait`) waits for it. What a failure means:
+   * - `ApiError`: the node refused the tx; it wasn't admitted.
+   * - `RequestTimeoutError` or a network error: unknown; the tx may have arrived.
+   * - `TxFailedError`: it was admitted and then failed (its fee is charged when it executed).
+   * - `TxPendingError`: it was admitted and may still execute. Don't send it again blindly.
+   */
   async submit(tx: Tx, wait = true) {
     const { id } = await this.call("/tx", tx);
-    return wait ? this.waitForTx(id) : this.tx(id);
+    if (wait) return this.waitForTx(id);
+    try {
+      return await this.tx(id);
+    } catch (e) {
+      throw new TxPendingError(id, 0, e);
+    }
   }
 
   async faucet(to: string, wait = true) {
@@ -1025,13 +1137,24 @@ export class Client {
     return wait ? this.waitForTx(id) : this.tx(id);
   }
 
+  /**
+   * Polls a tx until it's finalized (returns it) or failed (`TxFailedError`). A poll that fails
+   * (rate limited, a node error, a timeout, not visible yet) is retried; after `timeoutMs` it
+   * throws `TxPendingError`, since the tx may still execute.
+   */
   async waitForTx(id: string, timeoutMs = 15_000) {
     const start = Date.now();
+    let lastError: unknown;
     for (;;) {
-      const tx = await this.tx(id);
-      if (tx.status === "finalized") return tx;
-      if (tx.status === "failed") throw new TxFailedError(id, tx.error ?? "unknown reason", tx);
-      if (Date.now() - start > timeoutMs) throw new Error(`tx ${id} still pending after ${timeoutMs}ms`);
+      try {
+        const tx = await this.tx(id);
+        if (tx.status === "finalized") return tx;
+        if (tx.status === "failed") throw new TxFailedError(id, tx.error ?? "unknown reason", tx);
+      } catch (e) {
+        if (e instanceof TxFailedError || (e instanceof ApiError && e.status === 400)) throw e;
+        lastError = e;
+      }
+      if (Date.now() - start > timeoutMs) throw new TxPendingError(id, timeoutMs, lastError);
       await new Promise((r) => setTimeout(r, 250));
     }
   }

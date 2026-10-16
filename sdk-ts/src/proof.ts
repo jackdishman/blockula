@@ -273,14 +273,25 @@ export function decodeAccount(value: Uint8Array): AccountRecord {
   return { balance, nonce, keys };
 }
 
-/** The parts of a name record (chain.rs `NameRecord`) every version has: the bare name, its owner and when it was registered. */
+/**
+ * A name record (chain.rs `NameRecord`): the bare name, its owner, when it was registered, and
+ * the last height it resolves at (DEC-11; after it, a grace period in which only the owner can
+ * renew it, then anyone can register it). Later fields, if a version adds them, aren't read.
+ */
 export interface NameRecord {
   name: string;
   owner: string;
   registered_at: number;
+  expires_at: number;
 }
 
 export function decodeName(value: Uint8Array): NameRecord {
   const r = new Reader(value);
-  return { name: r.str(), owner: r.str(), registered_at: Number(r.u64()) };
+  const name = r.str();
+  const owner = r.str();
+  const registered_at = Number(r.u64());
+  // Saturated, so a never-expiring record (u64::MAX) compares as "later than any height".
+  const exp = r.u64();
+  const expires_at = exp > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(exp);
+  return { name, owner, registered_at, expires_at };
 }

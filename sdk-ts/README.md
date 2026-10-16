@@ -90,20 +90,36 @@ const client = new Client("https://rpc.example", { chainId: "blockula-1", genesi
 
 A pinned client checks every `/api/status` it reads, including the one each signature is made against, and throws `ChainMismatchError` instead of signing for another chain.
 
-A node can still lie about the state of the right chain. Proven reads check the node's Merkle proof (`/api/proof`) against its state root, and ask independent nodes (`witnesses`) for that block's root:
+A node can still lie about the state of the right chain. Proven reads check the node's Merkle proof (`/api/proof`) against its state root, ask independent nodes (`witnesses`) for that block's root, and require the proof to be fresh:
 
 ```ts
 const others = [new Client("https://rpc-2.example"), new Client("https://rpc-3.example")];
-const acct = await client.provenAccount("boo1…", { witnesses: others });  // { balance, nonce, keys, height, root } or null
-const name = await client.provenName("vlad.boo", { witnesses: others });  // { owner, registered_at, … } or null
+const acct = await client.provenAccount("boo1…", { witnesses: others });  // { balance, nonce, keys, height, root, head } or null
+const name = await client.provenName("vlad.boo", { witnesses: others });  // { owner, registered_at, expires_at, active, … } or null
 ```
 
-`verifyProof(root, namespace, key, value, proof)` is the bare check (a port of `node/src/state/tree.rs`, tested against the node's own vectors), and `provenRecord(namespace, key)` works for any record.
+- **Fresh, not just genuine.** Witnesses confirm any root the chain ever had, so a lying node could answer with a real but old record: a name's previous owner, a balance before a spend, a key since removed. The proof's block may be at most `maxLagBlocks` (default 10) behind the newest head the node and its witnesses report, or it throws `StaleProofError`. Without witnesses only the node's own head is compared, which a lying node controls.
+- **Expired names don't resolve.** `provenName` returns `null` once a name's `expires_at` has passed (its grace period included), like `client.resolve`. `{ includeExpired: true }` returns the record with `active: false`; never pay its `owner`.
+
+`verifyProof(root, namespace, key, value, proof)` is the bare check (a port of `node/src/state/tree.rs`, tested against the node's own vectors), and `provenRecord(namespace, key)` works for any record (check its `height` against `head` if you call it with your own options).
+
+### Timeouts and pending transactions
+
+Every request has a timeout (`new Client(rpc, { timeoutMs })`, default 15 s): a node that never answers fails with `RequestTimeoutError` instead of hanging. `submit` (and every helper that sends) tells you what a failure means:
+
+- `ApiError`: the node refused the tx. It wasn't admitted, so nothing was spent.
+- `TxFailedError`: it executed and failed (its fee was charged).
+- `TxPendingError`: it was admitted but isn't final yet, and it can still execute until its `valid_until`. Check `client.tx(err.id)` before sending again, or the payment can go out twice.
+- `RequestTimeoutError` or a network error while submitting: unknown, the tx may have arrived. Same advice.
+
+### Encoding
+
+`signingBytes` and `txBytes` encode a tx exactly as the node does (`node/src/types.rs`, checked offline against the node's vectors in `test/tx-vectors.json`). They take integers as the node's JSON parser does, as JSON numbers or strings of digits within the field's width, and refuse anything else (a negative or oversized amount, `"0x10"`, `" 1"`, a fraction) instead of wrapping it into a different tx.
 
 `verifyReleaseSignature(sig, checksumsFile, trustedKeyId)` checks a release's offline ML-DSA-65 signature (docs/OPERATIONS.md "Releases").
 
 The public testnet is `https://blockula-testnet.fly.dev`, and the wallet is https://blockula-wallet.vercel.app.
 
-Tests: `npm run test:vectors` (offline: passkey derivation, state-proof vectors from the node, every protocol v1 helper against a fake node, pinning, release signatures), `npm run test:kat` (ML-DSA known answers), `npm test` (end to end against `blockula dev`).
+Tests: `npm run test:vectors` (offline: passkey derivation, state-proof and tx-encoding vectors from the node, every protocol v1 helper against a fake node, pinning, proof freshness, timeouts, release signatures), `npm run test:kat` (ML-DSA known answers), `npm test` (end to end against `blockula dev`).
 
 ⚠️ Early and unaudited: test chains only.

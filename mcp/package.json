@@ -8,19 +8,20 @@
   },
   "files": [
     "dist",
+    "npm-shrinkwrap.json",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "test": "tsc && tsx test/network.ts"
+    "test": "tsc && node ../scripts/mcp-shrinkwrap.mjs --dry-run && tsx test/network.ts && tsx test/spend.ts"
   },
   "license": "MIT",
   "dependencies": {
-    "@blockula/sdk": "^0.4.0",
-    "@modelcontextprotocol/sdk": "^1.32.1",
-    "zod": "^4.0.0"
+    "@blockula/sdk": "0.4.0",
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "zod": "4.6.7"
   },
   "devDependencies": {
     "@types/node": "*",

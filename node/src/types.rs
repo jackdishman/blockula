@@ -2190,6 +2190,74 @@ pub(crate) mod tests {
         if tx.is_unsigned() { Tx { from: String::new(), nonce: 0, memo: String::new(), public_key: String::new(), signature: String::new(), ..tx } } else { tx }
     }
 
+    /// `sdk-ts/test/tx-vectors.json`, found from the crate's directory (`node/`, or `node/fuzz/`,
+    /// which compiles these modules too).
+    fn tx_vectors_file() -> std::path::PathBuf {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        dir.ancestors().map(|d| d.join("sdk-ts/test/tx-vectors.json")).find(|p| p.exists()).unwrap_or_else(|| dir.join("../sdk-ts/test/tx-vectors.json"))
+    }
+
+    /// Signing-bytes vectors for the SDK's encoder (`signingBytes` in sdk-ts/src/tx.ts, checked
+    /// offline by sdk-ts/test/tx-vectors.ts): every vector action, then txs at the bounds of
+    /// every integer width (u64 amounts at u64::MAX, JSON-number fields at 2^53 − 1, the largest
+    /// a JavaScript number holds exactly, u8 and u32 fields at their maxima, zeros) and non-ASCII
+    /// strings. Each case is the tx's JSON (key and signature left empty: they aren't signed) and
+    /// its signing bytes; the SDK must produce the same bytes from the JSON, and must refuse the
+    /// out-of-range values the node's JSON parser refuses instead of wrapping them.
+    fn tx_vectors() -> serde_json::Value {
+        const JS_MAX: u64 = (1 << 53) - 1;
+        let unsigned = |tx: Tx| Tx { public_key: String::new(), signature: String::new(), ..tx };
+        let mut cases: Vec<(String, Tx)> = vector_actions().into_iter().chain(v1_vector_actions()).chain(ghost_vector_actions()).map(|a| (format!("{} (tag {})", a.kind(), a.to_bytes()[0]), unsigned(vector_tx(a)))).collect();
+        let base = unsigned(vector_tx(Action::Transfer { to: "x.boo".into(), amount: u64::MAX }));
+        let at = |label: &str, action: Action| (label.to_string(), Tx { action, ..base.clone() });
+        cases.extend([
+            ("tx integers at their maxima".to_string(), Tx { nonce: JS_MAX, fee: u64::MAX, tip: u64::MAX, valid_until: JS_MAX, ..base.clone() }),
+            ("tx integers at zero".to_string(), Tx { nonce: 0, fee: 0, tip: 0, valid_until: 0, action: Action::Transfer { to: "x.boo".into(), amount: 0 }, memo: String::new(), ..base.clone() }),
+            ("non-ASCII strings".to_string(), Tx { chain_id: "vec-🧛".into(), memo: "ünïcödé 🦇 \u{0}\u{7f}".into(), action: Action::AddKey { key_id: "ab".repeat(32), label: "Vlad’s phone 📱".into(), role: KeyRole::Owner }, ..base.clone() }),
+            at("session key limit at u64::MAX", Action::AddKey { key_id: "cd".repeat(32), label: "agent".into(), role: KeyRole::Session { limit: u64::MAX, period_blocks: JS_MAX, expires_at: JS_MAX } }),
+            at("hunt at the bounds", Action::CreateHunt { repo: "a/b".into(), issue: JS_MAX, amount: u64::MAX, expires_at: JS_MAX, title: "t".into() }),
+            at("award at the bounds", Action::AwardHunt { hunt_id: JS_MAX, to: "x.boo".into(), pr: JS_MAX, familiar_key: None }),
+            at("vote at the bounds", Action::Vote { proposal_id: JS_MAX, aye: false, amount: u64::MAX, conviction: u8::MAX }),
+            at("multisig threshold at u8::MAX", Action::MultisigCreate { owners: vec![], threshold: u8::MAX }),
+            at("renewal years at u8::MAX", Action::RenewName { name: "vlad".into(), years: u8::MAX }),
+            at("reveal with large ids", Action::RevealVotes { seance_id: JS_MAX, votes: String::new(), spam: vec![0, JS_MAX], salt: String::new() }),
+            at("param change at u64::MAX", Action::Propose { kind: ProposalKind::ParamChange { key: "k".into(), value: u64::MAX }, deposit: u64::MAX, title: "t".into(), url: String::new() }),
+            at("upgrade at u32::MAX", Action::Propose { kind: ProposalKind::ScheduleUpgrade { version: u32::MAX, activation_height: JS_MAX }, deposit: 0, title: "t".into(), url: String::new() }),
+            at("distribution at the bounds", Action::Propose { kind: ProposalKind::Distribution { distribution_id: JS_MAX, merkle_root: "ef".repeat(32), total: u64::MAX, claim_until: JS_MAX }, deposit: 1, title: "t".into(), url: String::new() }),
+            at("unflag sybil (proposal kind 14)", Action::Propose { kind: ProposalKind::UnflagSybil { account: "vlad.boo".into(), reason: "appeal ✓".into() }, deposit: 1, title: "t".into(), url: String::new() }),
+            at("upgrade cancellation at the bounds (proposal kind 15)", Action::Propose { kind: ProposalKind::CancelUpgrade { version: u32::MAX, activation_height: JS_MAX }, deposit: 1, title: "t".into(), url: String::new() }),
+            at("claim at u64::MAX", Action::ClaimDistribution { distribution_id: JS_MAX, amount: u64::MAX, proof: vec![] }),
+            at("delegate at u64::MAX", Action::Delegate { validator: "boo1v".into(), amount: u64::MAX }),
+            at("commission at the JS bound", Action::UpdateValidator { commission_bps: JS_MAX, p2p_addr: String::new(), http_addr: String::new() }),
+            at("shield at u64::MAX", Action::Shield { amount: u64::MAX, bundle: vector_bundle(15) }),
+        ]);
+        let cases: Vec<serde_json::Value> = cases
+            .into_iter()
+            .map(|(label, tx)| {
+                let json = serde_json::to_value(&tx).unwrap();
+                assert_eq!(serde_json::from_value::<Tx>(json.clone()).unwrap(), tx, "{label}: the JSON parses back");
+                serde_json::json!({ "label": label, "tx": json, "signing_bytes": hex::encode(tx.signing_bytes()) })
+            })
+            .collect();
+        serde_json::json!({
+            "description": "Signing bytes of txs from their JSON (node/src/types.rs `tx_vectors`), for sdk-ts/src/tx.ts `signingBytes`. Regenerate: cargo test --manifest-path node/Cargo.toml types::tests::write_tx_vectors -- --ignored",
+            "cases": cases,
+        })
+    }
+
+    /// The signing encoding is a consensus rule: the SDK's vector file must match exactly.
+    #[test]
+    fn tx_vectors_match_the_sdk_file() {
+        let file: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(tx_vectors_file()).expect("sdk-ts/test/tx-vectors.json")).unwrap();
+        assert!(file == tx_vectors(), "the tx encoding or the vectors changed: regenerate sdk-ts/test/tx-vectors.json (types::tests::write_tx_vectors) and run `npm run test:vectors -w @blockula/sdk`");
+    }
+
+    #[test]
+    #[ignore = "generator, run by hand (see tx_vectors)"]
+    fn write_tx_vectors() {
+        std::fs::write(tx_vectors_file(), serde_json::to_string_pretty(&tx_vectors()).unwrap() + "\n").unwrap();
+    }
+
     /// The same vectors are computed by sdk-ts (test/e2e.ts): the encodings must match byte for byte.
     #[test]
     fn encodings_match_the_sdk() {
