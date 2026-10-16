@@ -1,15 +1,16 @@
 // Offline tests of the protocol v1 helpers: every Wallet helper for tags 30–49 against a fake
 // node (the tx it signs, its checks), chain pinning, the tolerant readers for the module
-// endpoints, proven reads with witnesses, and release signatures (the known-answer vector of
-// scripts/release-sig.mjs). No node needed: `npm run test:vectors -w @blockula/sdk`.
+// endpoints, proven reads with witnesses (and their freshness), request timeouts, and release
+// signatures (the known-answer vector of scripts/release-sig.mjs). No node needed:
+// `npm run test:vectors -w @blockula/sdk`.
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex, hexToBytes, utf8ToBytes } from "@noble/hashes/utils.js";
 import {
-  ChainMismatchError, Client, RELEASE_SIGNATURE_FORMAT, Wallet, addressFromPublicKey, bareName, buildDistribution, convictionWeight, distributionLeaf, distributionNode,
-  keyId, minFee, paramsOf, proposal, proposalSummary, releaseMessage, sharesFor, signingBytes, stakeSummary, verifyDistributionProof, verifyReleaseSignature, type Action,
+  ApiError, ChainMismatchError, Client, RELEASE_SIGNATURE_FORMAT, RequestTimeoutError, StaleProofError, TxPendingError, Wallet, addressFromPublicKey, bareName, buildDistribution, convictionWeight, distributionLeaf, distributionNode,
+  keyHash, keyId, leafHash, minFee, paramsOf, proposal, proposalSummary, releaseMessage, sharesFor, signingBytes, stakeSummary, valueHash, verifyDistributionProof, verifyReleaseSignature, type Action,
   type Tx,
 } from "../src/index.js";
 
@@ -22,7 +23,16 @@ const OTHER_VALIDATOR = addressFromPublicKey(pk(2));
 const BOB = addressFromPublicKey(pk(3));
 const GENESIS = "6e".repeat(32);
 
-interface Host { status: Record<string, unknown>; routes: Record<string, unknown>; posted: Tx[]; blocks: Record<number, string> }
+interface Host {
+  status: Record<string, unknown>;
+  routes: Record<string, unknown>;
+  posted: Tx[];
+  blocks: Record<number, string>;
+  /** Accepts connections and never answers (until the request is aborted). */
+  hang?: boolean;
+  /** Answers for `/tx/{id}`, in turn (the last one repeats): a status, or an HTTP error code. */
+  txAnswers?: (string | number)[];
+}
 const hosts = new Map<string, Host>();
 function host(rpc: string, status: Record<string, unknown> = {}): Host {
   // Every node serves its base fee (node/src/api.rs `fees`); at the floor here.
@@ -37,6 +47,9 @@ globalThis.fetch = (async (input: string | URL, init?: RequestInit) => {
   const h = hosts.get(url.host);
   const reply = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
   if (!h) throw new TypeError("fetch failed");
+  if (h.hang) {
+    return new Promise((_, reject) => init?.signal?.addEventListener("abort", () => reject(new DOMException("This operation was aborted", "AbortError"))));
+  }
   const path = decodeURIComponent(url.pathname.replace(/^\/api/, "")) + url.search;
   if (init?.method === "POST" && path === "/tx") {
     const tx = JSON.parse(String(init.body)) as Tx;
@@ -44,6 +57,10 @@ globalThis.fetch = (async (input: string | URL, init?: RequestInit) => {
     return reply(200, { id: "ab".repeat(32) });
   }
   if (path === "/status") return reply(200, h.status);
+  if (path === `/tx/${"ab".repeat(32)}` && h.txAnswers?.length) {
+    const a = h.txAnswers.length > 1 ? h.txAnswers.shift()! : h.txAnswers[0];
+    return typeof a === "number" ? reply(a, { error: `error ${a}` }) : reply(200, { id: "ab".repeat(32), status: a, error: a === "failed" ? "insufficient balance" : undefined });
+  }
   if (path === `/tx/${"ab".repeat(32)}`) return reply(200, { status: "finalized", summary: "ok", fee: h.posted.at(-1)?.fee });
   const block = path.match(/^\/block\/(\d+)$/);
   if (block) return h.blocks[Number(block[1])] ? reply(200, { height: Number(block[1]), state_root: h.blocks[Number(block[1])] }) : reply(404, { error: "no such block" });
@@ -198,29 +215,116 @@ assert.equal(convictionWeight("10", 6), 60n * FANG);
 assert.throws(() => convictionWeight("1", 7), /conviction/);
 console.log("✓ readers for staking, params and proposals");
 
-// ---- proven reads: the proof checks out, and witnesses must agree on the root ----
+// ---- proven reads: the proof checks out, witnesses must agree on the root, and it must be fresh ----
 
 const V = JSON.parse(readFileSync(new URL("./proof-vectors.json", import.meta.url), "utf8"));
 const alice = V.state.proofs.find((c: { label: string }) => c.label === "account boo1alice");
 const aliceAddr = "boo1alice";
-node.routes[`/proof/1/${bytesToHex(utf8ToBytes(aliceAddr))}`] = { namespace: 1, key: alice.key, value: alice.value, proof: alice.proof, root: V.state.root, height: 9 };
+const aliceProof = (height: number, value: string = alice.value) => ({ namespace: 1, key: alice.key, value, proof: alice.proof, root: V.state.root, height });
+// The fake node is at height 50 (its /api/status): a proof for its head.
+node.routes[`/proof/1/${bytesToHex(utf8ToBytes(aliceAddr))}`] = aliceProof(50);
 // provenAccount wants a real address; the vector's account is keyed "boo1alice", so read the record directly.
 const rec = await client.provenRecord(1, aliceAddr);
-assert.equal(rec.root, V.state.root);
+assert.deepEqual([rec.root, rec.height, rec.head], [V.state.root, 50, 50]);
 const agrees = host("http://witness-a.node");
-agrees.blocks[9] = V.state.root;
+agrees.blocks[50] = V.state.root;
 const disagrees = host("http://witness-b.node");
-disagrees.blocks[9] = "22".repeat(32);
-const lagging = host("http://witness-c.node");
+disagrees.blocks[50] = "22".repeat(32);
+const lagging = host("http://witness-c.node", { height: 45 });
 await client.provenRecord(1, aliceAddr, { witnesses: [new Client("http://witness-a.node")] });
-await assert.rejects(client.provenRecord(1, aliceAddr, { witnesses: [new Client("http://witness-a.node"), new Client("http://witness-b.node")] }), /disagrees about the state at block #9/);
-setTimeout(() => (lagging.blocks[9] = V.state.root), 300);
+await assert.rejects(client.provenRecord(1, aliceAddr, { witnesses: [new Client("http://witness-a.node"), new Client("http://witness-b.node")] }), /disagrees about the state at block #50/);
+setTimeout(() => (lagging.blocks[50] = V.state.root), 300);
 await client.provenRecord(1, aliceAddr, { witnesses: [new Client("http://witness-c.node")], waitMs: 3000 });
 await assert.rejects(client.provenRecord(1, aliceAddr, { witnesses: [new Client("http://witness-d.node")] }), /fetch failed/);
-node.routes[`/proof/1/${bytesToHex(utf8ToBytes(aliceAddr))}`] = { namespace: 1, key: alice.key, value: "00", proof: alice.proof, root: V.state.root, height: 9 };
+node.routes[`/proof/1/${bytesToHex(utf8ToBytes(aliceAddr))}`] = aliceProof(50, "00");
 await assert.rejects(client.provenRecord(1, aliceAddr), /doesn't verify/);
 await assert.rejects(client.provenAccount("boo1alice"), /isn't an address/);
-console.log("✓ proven reads check proofs and witnesses");
+// Freshness against the node's own head: a node whose /api/proof lags its /api/status is caught
+// even without witnesses.
+node.routes[`/proof/1/${bytesToHex(utf8ToBytes(aliceAddr))}`] = aliceProof(9);
+await assert.rejects(client.provenRecord(1, aliceAddr), (e: unknown) => e instanceof StaleProofError && e.height === 9 && e.head === 50);
+assert.equal((await client.provenRecord(1, aliceAddr, { maxLagBlocks: 41 })).height, 9, "maxLagBlocks widens it");
+node.routes[`/proof/1/${bytesToHex(utf8ToBytes(aliceAddr))}`] = aliceProof(50);
+console.log("✓ proven reads check proofs, witnesses and the node's own head");
+
+// Audit F67/F71: a lying node answers with a genuine but OLD record. Two real states of one chain:
+// at block 100 the attacker owns alice.boo, at block 5000 (the head) the victim does. The honest
+// witness serves both blocks' roots, so the old proof checks out against it; only freshness
+// catches it. (Single-leaf states: the root is the record's leaf.)
+const le64 = (n: number) => { const b = new Uint8Array(8); new DataView(b.buffer).setBigUint64(0, BigInt(n), true); return b; };
+const str = (x: string) => { const b = utf8ToBytes(x); const n = new Uint8Array(4); new DataView(n.buffer).setUint32(0, b.length, true); return [n, b]; };
+const nameRecord = (name: string, owner: string, registered: number, expires: number) => {
+  const parts = [...str(name), ...str(owner), le64(registered), le64(expires)];
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  parts.reduce((at, p) => (out.set(p, at), at + p.length), 0);
+  return out;
+};
+const nameState = (record: Uint8Array) => {
+  const [k, v] = [keyHash(2, utf8ToBytes("alice")), valueHash(record)];
+  return { root: bytesToHex(leafHash(k, v)), value: bytesToHex(record), proof: { siblings: [], leaf: { key: bytesToHex(k), value: bytesToHex(v) } } };
+};
+const ATTACKER = addressFromPublicKey(pk(9));
+const VICTIM = addressFromPublicKey(pk(10));
+const before = nameState(nameRecord("alice", ATTACKER, 10, 10 + 31_536_000));
+const after = nameState(nameRecord("alice", VICTIM, 4000, 4000 + 31_536_000));
+const proofOf = (st: typeof before, height: number) => ({ namespace: 2, key: bytesToHex(utf8ToBytes("alice")), value: st.value, proof: st.proof, root: st.root, height });
+const liar = host("http://liar.node", { height: 100 }); // its status agrees with its lie
+liar.routes[`/proof/2/${bytesToHex(utf8ToBytes("alice"))}`] = proofOf(before, 100);
+const honest = host("http://honest.node", { height: 5000 });
+honest.blocks[100] = before.root;
+honest.blocks[5000] = after.root;
+const witnesses = [new Client("http://honest.node")];
+await assert.rejects(new Client("http://liar.node").provenName("alice.boo", { witnesses }), (e: unknown) => e instanceof StaleProofError && e.height === 100 && e.head === 5000, "the previous owner isn't proven");
+await assert.rejects(new Client("http://liar.node").provenRecord(2, "alice", { witnesses }), StaleProofError);
+// The same node answering with the head's record is fine, and so is one a few blocks behind.
+liar.status.height = 5000;
+liar.routes[`/proof/2/${bytesToHex(utf8ToBytes("alice"))}`] = proofOf(after, 5000);
+const proven = await new Client("http://liar.node").provenName("alice", { witnesses });
+assert.deepEqual([proven?.owner, proven?.active, proven?.height, proven?.head, proven?.expires_at], [VICTIM, true, 5000, 5000, 4000 + 31_536_000]);
+honest.blocks[4995] = after.root;
+liar.status.height = 4995;
+liar.routes[`/proof/2/${bytesToHex(utf8ToBytes("alice"))}`] = proofOf(after, 4995);
+assert.equal((await new Client("http://liar.node").provenName("alice", { witnesses }))?.owner, VICTIM, "within maxLagBlocks");
+await assert.rejects(new Client("http://liar.node").provenName("alice", { witnesses, maxLagBlocks: 4 }), StaleProofError);
+await assert.rejects(new Client("http://liar.node").provenName("alice", { witnesses, maxLagBlocks: -1 }), /maxLagBlocks/);
+// An expired name doesn't resolve: its record is still there (grace, or not yet swept), but a
+// payer must not treat its owner as the name's. node/src/econ.rs `name_active`: height + 1 <= expires_at.
+const expiring = (expires: number) => {
+  const st = nameState(nameRecord("alice", ATTACKER, 10, expires));
+  honest.blocks[5000] = st.root;
+  liar.status.height = 5000;
+  liar.routes[`/proof/2/${bytesToHex(utf8ToBytes("alice"))}`] = proofOf(st, 5000);
+  return new Client("http://liar.node");
+};
+assert.equal(await expiring(5000).provenName("alice", { witnesses }), null, "expired at the head: doesn't resolve");
+assert.equal((await expiring(5001).provenName("alice", { witnesses }))?.owner, ATTACKER, "still resolves for the next block");
+const expired = await expiring(4000).provenName("alice", { witnesses, includeExpired: true });
+assert.deepEqual([expired?.owner, expired?.active, expired?.expires_at], [ATTACKER, false, 4000]);
+console.log("✓ proven reads refuse a genuine but stale record (a name's previous owner) and expired names");
+
+// ---- requests time out; a submitted tx that isn't seen final is "pending", not "failed" ----
+
+host("http://hang.node").hang = true;
+const t0 = Date.now();
+await assert.rejects(new Client("http://hang.node", { timeoutMs: 200 }).status(), (e: unknown) => e instanceof RequestTimeoutError && e.timeoutMs === 200 && /didn't answer within 200ms/.test(e.message));
+assert.ok(Date.now() - t0 < 5_000, "bounded by timeoutMs");
+await assert.rejects(Wallet.fromSeed("07".repeat(32), new Client("http://hang.node", { timeoutMs: 100 })).send(BOB, "1"), RequestTimeoutError);
+assert.throws(() => new Client(RPC, { timeoutMs: 0 }), /timeoutMs/);
+assert.equal(new Client(RPC).timeoutMs, 15_000);
+const slow = host("http://slow.node");
+const sc = new Client("http://slow.node");
+const id = "ab".repeat(32);
+slow.txAnswers = ["pending"];
+await assert.rejects(sc.waitForTx(id, 300), (e: unknown) => e instanceof TxPendingError && e.id === id && /still pending after 300ms/.test(e.message));
+slow.txAnswers = [429, 503, 404, "pending", "finalized"];
+assert.equal((await sc.waitForTx(id, 5_000)).status, "finalized", "failed polls are retried, not reported as a failed tx");
+slow.txAnswers = [429];
+await assert.rejects(sc.waitForTx(id, 300), (e: unknown) => e instanceof TxPendingError && e.lastError instanceof ApiError && e.lastError.status === 429);
+slow.txAnswers = ["failed"];
+await assert.rejects(sc.waitForTx(id, 300), /failed: insufficient balance/);
+slow.txAnswers = [503];
+await assert.rejects(sc.submit(await Wallet.fromSeed("07".repeat(32), sc).build({ type: "transfer", to: BOB, amount: "1" }), false), TxPendingError, "admitted, then the read failed: pending, not refused");
+console.log("✓ requests time out (RequestTimeoutError); waits retry failed polls and end in TxPendingError");
 
 // ---- release signatures (scripts/release-sig.mjs's known-answer vector) ----
 

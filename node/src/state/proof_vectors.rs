@@ -5,8 +5,8 @@
 //!   by another key's leaf);
 //! - `state`: every record of `tests::golden_encodings`' state, its root, and proofs for an
 //!   account, a scalar and an absent account;
-//! - `records`: an account with keys and a name record, encoded by the node, with what the SDK's
-//!   decoders must read from them.
+//! - `records`: an account with keys and a name record (with its expiry), encoded by the node,
+//!   with what the SDK's decoders must read from them.
 //!
 //! The tree sections depend only on the tree format (a consensus rule), so they must match a
 //! fresh generation exactly. The state and record sections follow the state encoding, which
@@ -17,7 +17,7 @@
 use super::codec::encode;
 use super::tree::{key_hash, root_of, value_hash, verify, Proof, Smt};
 use super::*;
-use crate::chain::{Account, KeyRecord};
+use crate::chain::{Account, KeyRecord, NameRecord};
 use crate::types::KeyRole;
 use serde_json::{json, Value};
 
@@ -102,8 +102,9 @@ fn records() -> Value {
     let owner = KeyRecord { label: "phone".into(), role: KeyRole::Owner, added_at: 9, spent: 0, window_start: 0 };
     let keys = [("ab".repeat(32), owner), ("cd".repeat(32), session)].into_iter().collect();
     let account = Account { balance: 123_456_789_012_345, nonce: 77, keys, ..Default::default() };
-    // A name record's leading fields (`NameRecord` may grow more after them).
-    let name = encode(&("alice".to_string(), "boo1owner".to_string(), 1234u64));
+    // A name record as the state stores it; the SDK reads its fields in order, so a version that
+    // appends fields keeps working.
+    let name = encode(&NameRecord { name: "alice".into(), owner: "boo1owner".into(), registered_at: 1234, expires_at: 5678 });
     json!({
         "account": {
             "value": hex::encode(encode(&account)),
@@ -114,7 +115,7 @@ fn records() -> Value {
                 { "key_id": "cd".repeat(32), "label": "claude", "role": { "type": "session", "limit": "10000000000", "period_blocks": 86400, "expires_at": 2000000 }, "added_at": 12 },
             ],
         },
-        "name": { "value": hex::encode(name), "name": "alice", "owner": "boo1owner", "registered_at": 1234 },
+        "name": { "value": hex::encode(name), "name": "alice", "owner": "boo1owner", "registered_at": 1234, "expires_at": 5678 },
     })
 }
 

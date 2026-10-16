@@ -13,7 +13,7 @@ const V = JSON.parse(readFileSync(new URL("./proof-vectors.json", import.meta.ur
   tree_golden: { leaves: [string, string][]; root: string };
   tree: Section;
   state: Section & { alice: { balance: string; nonce: number } };
-  records: { account: { value: string; balance: string; nonce: number; keys: unknown[] }; name: { value: string; name: string; owner: string; registered_at: number } };
+  records: { account: { value: string; balance: string; nonce: number; keys: unknown[] }; name: { value: string; name: string; owner: string; registered_at: number; expires_at: number } };
 };
 
 const be32 = (i: number) => new Uint8Array([i >>> 24, (i >>> 16) & 255, (i >>> 8) & 255, i & 255]);
@@ -88,10 +88,11 @@ assert.throws(() => checkProofResponse({ ...resp, height: -1 }, NAMESPACES.ACCOU
 const nobody = V.state.proofs.find((c) => c.label === "boo1nobody has no account") as Case;
 assert.equal(checkProofResponse({ ...resp, key: nobody.key, value: null, proof: nobody.proof }, NAMESPACES.ACCOUNTS, "boo1nobody").value, null);
 
-// Record decoders: an account with an owner and a session key, and a name record's leading fields.
+// Record decoders: an account with an owner and a session key, and a name record with its expiry.
 const a = decodeAccount(hexToBytes(V.records.account.value));
 assert.deepEqual({ balance: a.balance.toString(), nonce: a.nonce, keys: a.keys }, { balance: V.records.account.balance, nonce: V.records.account.nonce, keys: V.records.account.keys });
 assert.throws(() => decodeAccount(hexToBytes(V.records.account.value).slice(0, 20)), /ends early/);
 const n = decodeName(hexToBytes(V.records.name.value));
-assert.deepEqual(n, { name: V.records.name.name, owner: V.records.name.owner, registered_at: V.records.name.registered_at });
+assert.deepEqual(n, { name: V.records.name.name, owner: V.records.name.owner, registered_at: V.records.name.registered_at, expires_at: V.records.name.expires_at });
+assert.throws(() => decodeName(hexToBytes(V.records.name.value).slice(0, -1)), /ends early/, "a name record without its expiry isn't read as one that never expires");
 console.log("✓ proof responses and record decoders");

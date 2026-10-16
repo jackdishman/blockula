@@ -18,7 +18,7 @@
     "build": "tsc",
     "test": "tsx test/e2e.ts",
     "test:kat": "tsx test/kat.ts",
-    "test:vectors": "tsx test/passkey-vectors.ts && tsx test/proof-vectors.ts && tsx test/unit.ts"
+    "test:vectors": "tsx test/passkey-vectors.ts && tsx test/proof-vectors.ts && tsx test/tx-vectors.ts && tsx test/unit.ts"
   },
   "license": "MIT",
   "dependencies": {
