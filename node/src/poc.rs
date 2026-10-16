@@ -743,6 +743,16 @@ impl State {
                         bail!("this vouch is locked until block {unlock}");
                     }
                 }
+                // A vouch keeps its two accounts off each other's juries (`conflicted`, checked
+                // when a Séance opens). Its beacon seed is public an epoch before that, so
+                // dropping the vouch then would seat a juror on a claim it mustn't judge (audit
+                // F53): it stays while either side has a claim open.
+                for who in [&to, &v.voucher] {
+                    let open = self.poc.has_open_claims(who);
+                    if open > 0 {
+                        bail!("{} has {open} open claim{}: a vouch keeps its two accounts off each other's juries, so it stays until they're settled", short(who), if open == 1 { "" } else { "s" });
+                    }
+                }
                 self.pj(j).vouches.touch(&self.poc.vouches, &to);
                 self.poc.vouches.remove(&to);
                 self.j_credit(j, &v.voucher, v.bond);
@@ -1205,7 +1215,9 @@ impl State {
     }
 
     /// Claims a juror mustn't judge: their own, and those of people they vouched for or who
-    /// vouched for them.
+    /// vouched for them. A vouch can't be withdrawn while either side has a claim open (see
+    /// `Unvouch`), so the relationships a Séance opens on are the ones its claims were made under
+    /// (plus any vouches since), whatever its seed showed in advance.
     fn conflicted(&self, juror: &str, claimant: &str) -> bool {
         juror == claimant || self.poc.vouches.get(claimant).is_some_and(|v| v.voucher == juror) || self.poc.vouches.get(juror).is_some_and(|v| v.voucher == claimant)
     }
@@ -2078,6 +2090,35 @@ mod scenarios {
         t.blocks(1);
         let id = t.c.state.poc.open_seance.unwrap();
         assert_eq!(draw(&t.c.state.poc.seances[&id]), draw(&c));
+        t.reopen_same_root();
+    }
+
+    /// Audit F53: a vouch keeps its accounts off each other's juries, and the Séance seed is
+    /// public an epoch before the opening, so neither side can withdraw the vouch while either
+    /// has a claim open (the vouchee could otherwise drop it for free once the seed showed its
+    /// voucher would sit). Settled, it can go.
+    #[test]
+    fn a_vouch_stays_while_either_side_has_a_claim_open() {
+        let mut t = setup("vouchlock");
+        t.admin(Action::SetRepo { repo: "jackdishman/blockula".into(), weight: 10 }).unwrap();
+        let (juror, newbie) = (k(1), k(6));
+        t.grant(&juror, 20);
+        t.tx(&juror, Action::Vouch { account: newbie.address() }).unwrap();
+        t.link(&newbie, "newbie");
+        let c = t.claim(&newbie, 1).unwrap();
+        t.attest(c, true).unwrap();
+        assert!(t.tx(&newbie, Action::Unvouch { account: newbie.address() }).unwrap_err().to_string().contains("1 open claim"));
+        t.blocks(100);
+        assert!(t.tx(&juror, Action::Unvouch { account: newbie.address() }).unwrap_err().to_string().contains("1 open claim"), "past the lock too");
+        // The voucher's own open claims hold it as well.
+        t.link(&juror, "juror");
+        t.admin(Action::RejectClaim { claim_id: c, reason: "test".into() }).unwrap();
+        let mine = t.claim(&juror, 2).unwrap();
+        assert!(t.tx(&newbie, Action::Unvouch { account: newbie.address() }).unwrap_err().to_string().contains("1 open claim"));
+        t.admin(Action::RejectClaim { claim_id: mine, reason: "test".into() }).unwrap();
+        t.tx(&newbie, Action::Unvouch { account: newbie.address() }).unwrap();
+        assert!(!t.c.state.poc.vouches.contains_key(&newbie.address()));
+        conserved(&t.c.state);
         t.reopen_same_root();
     }
 
