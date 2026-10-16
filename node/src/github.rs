@@ -420,9 +420,17 @@ where
             add(vec![p], &mut pulls);
         }
     }
+    // A candidate that is a PR's merge is compared by the PR's own diff (against its base, the
+    // same for every merge method: a merge commit's listed files depend on how GitHub shows a
+    // two-parent commit); a plain commit by its own.
+    let merged_as: BTreeMap<String, u64> = pulls.iter().filter(|p| p.merged).filter_map(|p| Some((p.merge_sha.clone()?.to_ascii_lowercase(), p.number))).collect();
     let mut diffs = BTreeMap::new();
     for r in revert_candidates(repo, pr, merge_sha, &commits, &pulls).into_iter().take(REVERT_DIFF_CHECKS) {
-        if let Some(v) = get(format!("/repos/{repo}/commits/{}", r.sha)).await? {
+        let path = match merged_as.get(&r.sha.to_ascii_lowercase()) {
+            Some(n) => format!("/repos/{repo}/pulls/{n}/files?per_page=100"),
+            None => format!("/repos/{repo}/commits/{}", r.sha),
+        };
+        if let Some(v) = get(path).await? {
             diffs.insert(r.sha, parse_files(&v));
         }
     }
@@ -618,10 +626,10 @@ mod tests {
             { "filename": "src/thing.rs", "status": "added", "patch": "@@ -0,0 +1,4 @@\n+pub fn thing() -> u32 {\n+    42\n+}\n+" },
             { "filename": "src/lib.rs", "status": "modified", "patch": "@@ -1,2 +1,3 @@\n mod a;\n+mod thing;\n-mod old_thing;\n mod b;" }
         ]);
-        let undoing = json!({ "sha": m77, "files": [
+        let undoing = json!([
             { "filename": "src/thing.rs", "status": "removed", "patch": "@@ -1,4 +0,0 @@\n-pub fn thing() -> u32 {\n-    42\n-}\n-" },
             { "filename": "src/lib.rs", "status": "modified", "patch": "@@ -1,3 +1,2 @@\n mod a;\n-mod thing;\n+mod old_thing;\n mod b;" }
-        ] });
+        ]);
         let since = "2026-10-11T08:30:00Z";
         let routes: BTreeMap<String, Value> = [
             (format!("/repos/{repo}/pulls/42"), claim),
@@ -629,7 +637,7 @@ mod tests {
             (format!("/repos/{repo}/commits?since={since}&per_page=100&page=1"), commits),
             (format!("/repos/{repo}/commits?path=src/thing.rs&since={since}&per_page=100"), json!([{ "sha": undo, "commit": { "message": "Undo the thing" } }, { "sha": MERGE, "commit": { "message": "Add the thing (#42)" } }])),
             (format!("/repos/{repo}/commits/{undo}/pulls"), json!([pr77])),
-            (format!("/repos/{repo}/commits/{m77}"), undoing),
+            (format!("/repos/{repo}/pulls/77/files?per_page=100"), undoing),
         ]
         .into_iter()
         .collect();
@@ -644,6 +652,7 @@ mod tests {
         assert!(r.how.contains("#77 reverts #42"), "{}", r.how);
         let asked = asked.into_inner().unwrap();
         assert!(!asked.iter().any(|p| p.contains("state=closed")), "{asked:?}");
+        assert!(!asked.contains(&format!("/repos/{repo}/commits/{m77}")), "a PR's merge is compared by the PR's diff");
         assert!(asked.contains(&format!("/repos/{repo}/commits?path=src/thing.rs&since={since}&per_page=100")), "the file #42 created is followed first");
         assert_eq!(query_value("a b/ü&x=1.rs"), "a%20b/%C3%BC%26x%3D1.rs");
     }

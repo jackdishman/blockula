@@ -599,7 +599,7 @@ pub(crate) fn apply_unsigned(state: &mut State, j: &mut Journal, tx: &Tx, chain_
     let b = tx.action.ghost_bundle().ok_or_else(|| anyhow!("not an unsigned ghost transaction"))?;
     check_size(state, tx)?;
     check_instance(state, b)?;
-    if tx.fee % FEE_GRID != 0 || tx.tip % FEE_GRID != 0 {
+    if !tx.fee.is_multiple_of(FEE_GRID) || !tx.tip.is_multiple_of(FEE_GRID) {
         bail!("an unsigned ghost tx's fee and tip are whole multiples of {FEE_GRID} drops (0.001 FANG), so they don't set wallets apart: price it with ghost::canonical_fee (fee {}, tip {})", tx.fee, tx.tip);
     }
     let (base, opening, floor) = unsigned_floor(state, tx, height).ok_or_else(|| anyhow!("fee overflows"))?;
