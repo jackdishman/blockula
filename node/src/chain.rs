@@ -2606,8 +2606,8 @@ impl Chain {
 
     /// The network height peers claim: the median of their latest claims, so one lying peer
     /// can't move it. Display-only (status/health read it through `Live`); verified heights come
-    /// from certificates.
-    #[cfg(test)]
+    /// from certificates. Slashing protection's restart watch (`node::watch_network`) reads it
+    /// only as a sign the network moved on, which keeps the escape shut (fail-safe), never opens it.
     pub fn network_height_claimed(&self) -> u64 {
         self.live.claimed.load(std::sync::atomic::Ordering::Relaxed).max(self.finalized_tip).max(self.height)
     }
