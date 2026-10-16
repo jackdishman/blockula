@@ -418,6 +418,18 @@ impl Genesis {
         // first boundaries), so it must fit the p2p layer's peer set like any later one.
         let max_set = crate::consensus::MAX_PEERS_PER_SET;
         ensure!(!self.validators.is_empty() && self.validators.len() <= max_set, "a genesis needs 1–{max_set} validators (the p2p peer set's bound)");
+        // Each validator once, with a well-formed consensus key that is its address: a validator
+        // listed twice makes epoch 0's set unusable (consensus refuses duplicate keys) and bonds
+        // its operator's self-bond twice (audit F33).
+        let (mut addresses, mut public_keys) = (BTreeSet::new(), BTreeSet::new());
+        for v in &self.validators {
+            let who = format!("validator {}", v.address);
+            ensure!(crypto::is_lower_hex(&v.public_key) && v.public_key.len() == crypto::PUBLIC_KEY_LEN * 2, "{who}: public_key must be an ML-DSA-65 public key in lowercase hex");
+            ensure!(v.address == crypto::address_with_prefix(prefix, &hex::decode(&v.public_key)?), "{who} isn't its public key's address");
+            ensure!(addresses.insert(v.address.as_str()) && public_keys.insert(v.public_key.as_str()), "{who} is listed twice");
+            check_host_port(&v.p2p_addr).with_context(|| format!("{who}: p2p_addr"))?;
+            check_http_addr(&v.http_addr).with_context(|| format!("{who}: http_addr"))?;
+        }
         let mut keys = BTreeSet::new();
         let mut bonds: BTreeMap<&str, u64> = BTreeMap::new();
         for o in &self.operators {
@@ -473,6 +485,8 @@ impl Genesis {
             ensure!(self.validators.iter().all(|v| keys.contains(v.public_key.as_str())), "every {MAINNET_CHAIN_ID} validator needs an operator (owner, self-bond, commission)");
             // DEC-2: Ghost Mode ships disabled; only governance switches it on, after its audit.
             ensure!(!self.features.iter().any(|f| f == crate::ghost::FEATURE), "{MAINNET_CHAIN_ID} starts with Ghost Mode off: governance activates it after its audit");
+            // Governance's own safety parameters start where a vote could take them at most.
+            cp.check_governance_floors(&params).context(MAINNET_CHAIN_ID)?;
         }
         Ok(())
     }
@@ -1516,10 +1530,12 @@ impl State {
         Ok(())
     }
 
-    /// Sets a governance-adjustable parameter, within its bounds (`ParamChange`).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Sets a governance-adjustable parameter (`ParamChange`): within its bounds, and governance's
+    /// own safety parameters only as far as their floors allow
+    /// (`ChainParams::check_governance_change`).
     pub(crate) fn exec_set_param(&mut self, j: &mut Journal, key: &str, value: u64) -> Result<()> {
         let params = self.params.clone();
+        self.chain_params.check_governance_change(key, value, &params)?;
         let mut next = self.chain_params.clone();
         next.set(key, value, &params)?;
         *self.chain_params_mut(j) = next;
@@ -4625,6 +4641,21 @@ mod scaffold {
         refused(&|v| v["operators"][0]["consensus_key"] = hex::encode(keys(99).public_key()).into(), "isn't one of the genesis validators");
         refused(&|v| v["operators"][0]["country"] = "France".into(), "ISO 3166-1");
         refused(&|v| v["operators"][0]["owner"] = treasury("boo").into(), "can't own a validator");
+        // Validators: each once (audit F33: twice, epoch 0's set had no usable keys and the
+        // operator's self-bond was bonded twice), keyed by their own address.
+        let twice = |v: &mut serde_json::Value| {
+            let again = v["validators"][0].clone();
+            v["validators"].as_array_mut().unwrap().push(again);
+        };
+        refused(&twice, "is listed twice");
+        let mut v = good.clone();
+        twice(&mut v);
+        let g: Genesis = serde_json::from_value(v).unwrap();
+        assert_eq!(g.initial_state().active_sets[&0].len(), 2, "what the check keeps out");
+        assert!(g.initial_state().check_invariants().is_err());
+        refused(&|v| v["validators"][0]["address"] = keys(98).address().into(), "isn't its public key's address");
+        refused(&|v| v["validators"][0]["public_key"] = "AB".repeat(crypto::PUBLIC_KEY_LEN).into(), "lowercase hex");
+        refused(&|v| v["validators"][0]["p2p_addr"] = "nowhere".into(), "p2p_addr");
         // Reserved names, the Soul ledger and features.
         refused(&|v| v["reserved_names"][0] = "blockula.boo".into(), "bare lowercase name");
         refused(&|v| v["reserved_names"][1] = "blockula".into(), "listed twice");
@@ -4646,6 +4677,13 @@ mod scaffold {
         let mut main = serde_json::to_value(genesis(MAINNET_CHAIN_ID)).unwrap();
         main["features"] = serde_json::json!(["ghost"]);
         assert!(load(&main).unwrap_err().contains("Ghost Mode off"));
+        // … and governance's safety parameters on the safe side of their floors (F15).
+        for (key, value) in [("timelock_blocks", 3_600), ("supermajority_bps", 5_001), ("treasury_large_bps", 1_000), ("quorum_floor", 0)] {
+            let mut main = serde_json::to_value(genesis(MAINNET_CHAIN_ID)).unwrap();
+            main["params"][key] = value.into();
+            let e = load(&main).unwrap_err();
+            assert!(e.contains(&format!("`{key}`")) && e.contains("past governance's floor"), "{key}: {e}");
+        }
         // Other chains may keep admins (dev and test).
         let mut test = good.clone();
         test["validator_admins"] = serde_json::json!([keys(22).address()]);

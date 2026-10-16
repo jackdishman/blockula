@@ -435,6 +435,7 @@ fn prepare_kind(state: &State, kind: &ProposalKind, height: u64) -> Result<Propo
     let mut k = kind.clone();
     match &mut k {
         ProposalKind::ParamChange { key, value } => {
+            cp.check_governance_change(key, *value, &state.params)?;
             cp.clone().set(key, *value, &state.params)?;
         }
         ProposalKind::TreasurySpend { to, .. } => {
@@ -464,11 +465,8 @@ fn prepare_kind(state: &State, kind: &ProposalKind, height: u64) -> Result<Propo
             Some(h) => bail!("hunt #{hunt_id} is already {:?}", h.status),
             None => bail!("no hunt #{hunt_id}"),
         },
-        ProposalKind::ScheduleUpgrade { activation_height, .. } => {
-            if *activation_height <= runs_at {
-                bail!("activation_height must be after the vote and the timelock (block {runs_at})");
-            }
-        }
+        // What it could run into at the earliest block it runs in (audit F46); checked again then.
+        ProposalKind::ScheduleUpgrade { version, activation_height } => crate::upgrade::check_schedule_upgrade(state, *version, *activation_height, runs_at).map_err(|e| anyhow!("{e} (the vote and the timelock end at block {runs_at})"))?,
         ProposalKind::ActivateFeature { feature } | ProposalKind::DeactivateFeature { feature } => {
             if !crate::upgrade::KNOWN_FEATURES.contains(&feature.as_str()) {
                 bail!("unknown feature {feature} (known: {})", crate::upgrade::KNOWN_FEATURES.join(", "));
@@ -591,18 +589,27 @@ pub fn unlocked_supply_by_walk(state: &State, height: u64) -> u128 {
 }
 
 /// Whether a kind needs `supermajority_bps` of the weight: upgrades, feature activations
-/// (security-critical switches such as Ghost Mode), issuance parameters, and treasury spends above
-/// `treasury_large_bps` of the treasury's balance. Turning a feature off takes a simple majority.
+/// (security-critical switches such as Ghost Mode), issuance parameters, governance's own safety
+/// parameters (`params::GOVERNANCE_KEYS`), and treasury spends above `treasury_large_bps` of the
+/// treasury's balance. Turning a feature off takes a simple majority.
 pub fn needs_supermajority(state: &State, kind: &ProposalKind) -> bool {
     match kind {
         ProposalKind::ScheduleUpgrade { .. } | ProposalKind::ActivateFeature { .. } => true,
-        ProposalKind::ParamChange { key, .. } => key.starts_with("issuance_"),
+        ProposalKind::ParamChange { key, .. } => key.starts_with("issuance_") || crate::params::GOVERNANCE_KEYS.contains(&key.as_str()),
         ProposalKind::TreasurySpend { amount, .. } => {
             let treasury = state.account(&state.treasury()).balance as u128;
             *amount as u128 * 10_000 > state.chain_params.treasury_large_bps as u128 * treasury
         }
         _ => false,
     }
+}
+
+/// Whether the bootstrap council may pass a kind on its own: anything but a change to
+/// governance's own safety parameters (`params::GOVERNANCE_KEYS`), which only token holders
+/// decide, so the council can't extend itself, open spending early or weaken the vote that
+/// checks it (audit F15, F16).
+pub fn council_may_pass(kind: &ProposalKind) -> bool {
+    !matches!(kind, ProposalKind::ParamChange { key, .. } if crate::params::GOVERNANCE_KEYS.contains(&key.as_str()))
 }
 
 /// Closes voting on proposal `id` at `height`: tally, settle the deposit, queue or reject.
@@ -622,7 +629,7 @@ fn close_vote(state: &mut State, id: u64, height: u64, unlocked: u128) {
     let n = set.len() as u64;
     let in_set = p.council.iter().filter(|(v, _)| set.contains(*v));
     let (ayes, nays) = in_set.fold((0u64, 0u64), |(a, b), (_, c)| if c.aye { (a + 1, b) } else { (a, b + 1) });
-    let by_council = n > 0 && ayes * 3 >= 2 * n && p.nay_weight <= p.aye_weight;
+    let by_council = n > 0 && ayes * 3 >= 2 * n && p.nay_weight <= p.aye_weight && council_may_pass(&p.kind);
     let council_quorum = n > 0 && (ayes + nays) * 3 >= 2 * n;
     // Deposit: back if the proposal drew a quorum (of tokens, or of the council), burned if not.
     if quorum_reached || council_quorum {

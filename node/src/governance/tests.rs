@@ -534,6 +534,63 @@ fn the_bootstrap_council_passes_proposals_until_the_bootstrap_ends() {
     assert!(t.p(i).council.is_empty(), "votes after the bootstrap aren't council votes");
 }
 
+/// Audit F15, F16: governance's own safety parameters change only by a token supermajority, never
+/// by the bootstrap council, and never past their floors: the council can't extend itself, open
+/// spending early or rewrite quorum, voting and the timelock with two 1-FANG votes, and a simple
+/// majority can't lower the supermajority or the timelock before scheduling an upgrade.
+#[test]
+fn governance_safety_parameters_need_tokens_and_keep_their_floors() {
+    let mut t = T::new(&[("bootstrap_end_height", 1_000), ("governance_spend_height", 5_000), ("quorum_floor", 30_000 * FANG)]);
+    let [v1, v2, _] = VALIDATORS;
+    let refused = |t: &mut T, kind: ProposalKind, why: &str| {
+        let e = t.err(ALICE, Action::Propose { kind: kind.clone(), deposit: 50 * FANG, title: "x".into(), url: String::new() });
+        assert!(e.contains(why), "{kind:?}: {e}");
+    };
+    let day = 86_400;
+    // What can never pass: the council outliving its end, the spend gate opening earlier, a
+    // supermajority under 60%, a timelock or lock period under a day, voting under 3 days, quorum
+    // under 1% or 5M FANG, a large-spend line over 5%.
+    refused(&mut t, param("bootstrap_end_height", 3_650 * day), "never lasts longer");
+    refused(&mut t, param("governance_spend_height", 0), "never moves earlier");
+    for (key, value, why) in [("supermajority_bps", 5_001, "to 6000 at the least"), ("treasury_large_bps", 10_000, "500 (5% of the treasury) at the most"), ("quorum_bps", 1, "to 100 at the least")] {
+        refused(&mut t, param(key, value), why);
+    }
+    // This chain starts below the floors (short test periods, 30k FANG quorum floor): they only
+    // move up.
+    for (key, value) in [("timelock_blocks", 1), ("voting_blocks", 10 - 1), ("lock_period_blocks", 1), ("quorum_floor", 0)] {
+        refused(&mut t, param(key, value), "at the least");
+    }
+    // Moves within the rules still need tokens: two council votes of 1 FANG pass a text proposal,
+    // not a governance parameter.
+    let council = |t: &mut T, kind: ProposalKind| {
+        let id = t.propose(ALICE, kind);
+        t.vote(v1, id, true, 1, 0).unwrap();
+        t.vote(v2, id, true, 1, 0).unwrap();
+        id
+    };
+    let ids = [council(&mut t, text()), council(&mut t, param("bootstrap_end_height", 500)), council(&mut t, param("timelock_blocks", 2 * day)), council(&mut t, param("governance_spend_height", 6_000))];
+    t.finish(ids[3]);
+    let status: Vec<ProposalStatus> = ids.iter().map(|id| t.p(*id).status).collect();
+    assert_eq!(status, [ProposalStatus::Executed, ProposalStatus::Rejected, ProposalStatus::Rejected, ProposalStatus::Rejected]);
+    assert_eq!(t.p(ids[1]).tally.as_ref().unwrap().council_ayes, 2, "⅔ of the council said aye, and it wasn't enough");
+    assert!(t.p(ids[1]).tally.as_ref().unwrap().supermajority);
+    assert_eq!((t.st.chain_params.bootstrap_end_height, t.st.chain_params.governance_spend_height), (1_000, 5_000));
+    // Token holders: a simple majority isn't enough, the supermajority is.
+    let (a, b) = (t.propose(ALICE, param("supermajority_bps", 6_000)), t.propose(ALICE, param("governance_spend_height", 10_000)));
+    let late = t.propose(ALICE, param("governance_spend_height", 6_000));
+    for id in [a, b, late] {
+        t.vote(ALICE, id, true, 60_000, 1).unwrap();
+    }
+    t.vote(BOB, a, false, 40_000, 1).unwrap();
+    t.finish(late);
+    assert_eq!([a, b].map(|id| t.p(id).status), [ProposalStatus::Rejected, ProposalStatus::Executed]);
+    assert!(t.p(a).outcome.contains("fewer than 66.67%"), "{}", t.p(a).outcome);
+    // Checked again when they run: the gate moved to 10,000 first, so 6,000 would move it back.
+    assert_eq!(t.p(late).status, ProposalStatus::Failed);
+    assert!(t.p(late).outcome.contains("never moves earlier"), "{}", t.p(late).outcome);
+    assert_eq!((t.st.chain_params.supermajority_bps, t.st.chain_params.governance_spend_height), (6_667, 10_000));
+}
+
 #[test]
 fn spending_waits_for_the_spend_height_and_vested_treasury_funds() {
     let mut t = T::new(&[("governance_spend_height", 30)]);
@@ -630,7 +687,14 @@ fn proposals_are_checked_when_they_are_made() {
     refused(&mut t, ProposalKind::UnlinkGithub { handle: "nobody".into() }, "isn't linked");
     refused(&mut t, ProposalKind::RefundHunt { hunt_id: 0 }, "no hunt #0");
     refused(&mut t, ProposalKind::ActivateFeature { feature: "warp".into() }, "unknown feature warp");
-    refused(&mut t, ProposalKind::ScheduleUpgrade { version: 9, activation_height: 10 }, "after the vote and the timelock");
+    // Upgrades that can't run when the vote and the timelock are over (audit F46): too soon after
+    // them, or not newer than what's in force.
+    let runs_at = t.h + 10 + 3;
+    let v = crate::consensus::PROTOCOL_VERSION;
+    refused(&mut t, ProposalKind::ScheduleUpgrade { version: 9, activation_height: 10 }, "the vote and the timelock end at block");
+    refused(&mut t, ProposalKind::ScheduleUpgrade { version: v + 1, activation_height: runs_at + crate::upgrade::MIN_UPGRADE_LEAD - 1 }, &format!("at least 64 blocks after block {runs_at}"));
+    refused(&mut t, ProposalKind::ScheduleUpgrade { version: v, activation_height: runs_at + 1_000 }, "isn't newer than");
+    t.propose(ALICE, ProposalKind::ScheduleUpgrade { version: v + 1, activation_height: runs_at + crate::upgrade::MIN_UPGRADE_LEAD });
     refused(&mut t, ProposalKind::Distribution { merkle_root: "ab".repeat(32), total: FANG, claim_until: 14 }, "after the vote and the timelock");
     refused(&mut t, ProposalKind::TreasurySpend { to: "nobody.boo".into(), amount: FANG }, "no one has claimed nobody.boo");
     refused(&mut t, param("warp_speed", 1), "unknown parameter");
