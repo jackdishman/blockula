@@ -138,6 +138,11 @@ enum Cmd {
         /// Address prefix: `boo` (mainnet) or `tboo` (public testnets)
         #[arg(long, default_value = "boo")]
         address_prefix: String,
+        /// `blockula dev`'s short durations (`ChainParams::dev_overrides`): unbonding in a few
+        /// minutes, votes in a minute, a 20-second timelock, a 10 FANG proposal deposit, spends
+        /// open at once. For local multi-validator chains that exercise those flows end to end.
+        #[arg(long)]
+        dev_durations: bool,
     },
     /// Run a validator (a home with validator.key) or a joined full node
     Run {
@@ -239,7 +244,11 @@ enum Cmd {
         cmd: genesis_builder::GenesisCmd,
     },
     /// Generate an ML-DSA-65 keypair
-    Keygen,
+    Keygen {
+        /// Address prefix to print the address with: `boo` (mainnet) or `tboo` (public testnets)
+        #[arg(long, default_value = "boo")]
+        prefix: String,
+    },
     /// Sign or verify release checksums with the offline ML-DSA-65 release key
     Release {
         #[command(subcommand)]
@@ -292,7 +301,7 @@ fn main() -> Result<()> {
             }
             node::run_validator(home, net_opts(net, Some(port), Some("local".into()), true))
         }
-        Cmd::Summon { chain_id, home, no_faucet, block_time_ms, validators, admins, epoch_blocks, min_bond, seance_blocks, claim_maturity_blocks, vesting_blocks, address_prefix } => {
+        Cmd::Summon { chain_id, home, no_faucet, block_time_ms, validators, admins, epoch_blocks, min_bond, seance_blocks, claim_maturity_blocks, vesting_blocks, address_prefix, dev_durations } => {
             let home = home.unwrap_or_else(|| blockula_dir().join(&chain_id));
             if home.join("genesis.json").exists() {
                 anyhow::bail!("{} already has a chain", home.display());
@@ -312,7 +321,7 @@ fn main() -> Result<()> {
                     poc::PocTimes { seance_blocks: seance_blocks.unwrap_or(d.seance_blocks), claim_maturity_blocks: claim_maturity_blocks.unwrap_or(d.claim_maturity_blocks), vesting_blocks: vesting_blocks.unwrap_or(d.vesting_blocks), ..d }
                 }),
                 address_prefix,
-                params: Default::default(),
+                params: if dev_durations { params::ChainParams::dev_overrides(block_time_ms, epoch_blocks) } else { Default::default() },
             };
             let homes = Chain::summon(&home, &opts)?;
             let g = chain::Genesis::load(&homes[0].join("genesis.json"))?;
@@ -322,6 +331,10 @@ fn main() -> Result<()> {
             }
             println!("   genesis hash: {}  (joiners can pin it with --genesis-hash)", hex::encode(consensus::genesis_block(&g).digest_bytes()));
             println!("   epochs: {} blocks · min self-bond: {} · validator admins: {}", g.epoch_blocks, types::fmt_fang(g.chain_params()?.min_self_bond), g.validator_admins.join(", "));
+            if dev_durations {
+                let cp = g.chain_params()?;
+                println!("   dev durations: unbonding {} blocks · voting {} · timelock {} · deposit {}", cp.unbonding_blocks, cp.voting_blocks, cp.timelock_blocks, types::fmt_fang(cp.proposal_deposit));
+            }
             println!("   (Edit validators[].p2p_addr / http_addr in genesis.json before the first start if nodes will be reached at other addresses; every node must use the same file.)");
             Ok(())
         }
@@ -362,9 +375,10 @@ fn main() -> Result<()> {
         Cmd::Multisig { cmd } => gov_cli::multisig(cmd, &blockula_dir()),
         Cmd::Name { cmd } => contrib_cli::name(cmd, &blockula_dir()),
         Cmd::Stake { cmd } => contrib_cli::stake(cmd, &blockula_dir()),
-        Cmd::Keygen => {
+        Cmd::Keygen { prefix } => {
+            anyhow::ensure!(crypto::is_prefix(&prefix), "prefix must be one of {:?}", crypto::KNOWN_PREFIXES);
             let k = crypto::Keys::generate();
-            println!("{}", serde_json::json!({ "address": k.address(), "seed": k.seed_hex() }));
+            println!("{}", serde_json::json!({ "address": k.address_with(&prefix), "seed": k.seed_hex() }));
             Ok(())
         }
     }

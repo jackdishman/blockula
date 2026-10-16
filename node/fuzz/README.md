@@ -14,6 +14,7 @@ Every decoder that takes bytes from a peer or an HTTP response is a way to crash
 | `epochs_registry` | `GET /api/epochs` | `merge_sigs` as `exchange_epochs` runs it, plus `verify_chain` (epoch 0 included) and `proven_through` |
 | `certificate` | finalization certificates; simplex votes and certificates (p2p) | `pq::Certificate` (bitmap plus signatures), `simplex::types::{Certificate, Vote}` for a 4-validator set, all canonical, all verified |
 | `state_machine` | every tx a proposer can put in a block | Up to 300 ops, 5 bytes each (kind, two account indexes, an amount; a raw-action op takes up to 64 more bytes, decoded with `Action::from_bytes`), become txs of every tag from 6 users (one with a vesting lock), 3 agent session keys and the admin validator, in blocks across 4-block epochs and Séances of a few blocks. Each block is first dry-run on a journal and rolled back (the state must be unchanged), then applied as execution does (`State::apply`, `end_block`, `commit_block`). After every block: incremental root == full rebuild, `check_invariants` (supply conservation, escrows, cross-references, nested-collection caps) and every record within the snapshot limits. At the end the state must survive the snapshot encoding; one input in four runs twice and must give the same roots |
+| `evidence` | `ReportEquivocation` evidence (any account may send it) | `staking::decode_evidence` accepts only canonical encodings of the three fault kinds (`ConflictingNotarize`, `ConflictingFinalize`, `NullifyFinalize`); it, `verify_evidence`, `evidence_status` and the explorer's description never panic. Evidence that verifies against a fixture state (the 4-validator set, bonded, active in epochs 0–3) is reported in a tx: it applies, the offender is tombstoned, no FANG is minted, `check_invariants` holds, and the same fault reported again fails. Seeds are real double-signs of each kind |
 
 ## Running
 
@@ -36,6 +37,14 @@ CI (`.github/workflows/fuzz.yml`) runs the stable checks on PRs that touch `node
 ### How the crate builds
 
 The node is a binary crate with no library target, so `src/lib.rs` compiles its modules straight from `node/src` through a `#[path]` module and re-exports them, so the node's `crate::…` paths still resolve. The node crate itself doesn't change. In exchange, this crate repeats the node's module list and `[dependencies]`; `check-sync.sh` (run in CI) fails when they drift. If the node gains a `lib.rs`, this crate can depend on it and drop both copies.
+
+## Results (2026-10-15, local, Apple M-series, nightly-2026-10-06): equivocation evidence
+
+| Target | Executions | Result |
+|---|---|---|
+| `evidence` | 186,811 (120 s, 1 worker), its first run, from the committed seeds; corpus 182 | no crash, no invariant failure |
+
+Certificate-derived conflicts (a validator's direct vote against its signature inside another block's certificate) aren't evidence the chain accepts yet: `ReportEquivocation` carries simplex's own `ConflictingNotarize`/`ConflictingFinalize`/`NullifyFinalize`, which pair two votes. Extracting a vote from a certificate needs simplex's per-signer certificate layout (`pq::Certificate`'s signer bitmap and signatures) to be decoded and re-verified per signer on chain, a new evidence format with its own golden vector and fuzzing. It's tracked as CV-3's pending item in docs/MAINNET.md.
 
 ## Results (2026-10-15, local, Apple M-series, nightly-2026-10-06): the integrated node
 

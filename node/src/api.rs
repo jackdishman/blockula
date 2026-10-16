@@ -21,7 +21,7 @@ use axum::{
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -433,6 +433,7 @@ pub fn router(node: Node) -> Router {
         .route("/api/ghost/address/{id}", get(ghost_address))
         .route("/api/health", get(health))
         .route("/api/upgrade", get(upgrade))
+        .route("/api/beacon", get(beacon))
         .route("/metrics", get(metrics))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(axum::middleware::from_fn_with_state(node.clone(), limit_reads))
@@ -835,6 +836,63 @@ async fn upgrade(State(n): State<Node>) -> ApiResult {
     })))
 }
 
+/// Epochs of beacon misses `/api/beacon` lists (the state keeps `beacon::VALUES_KEPT`).
+const BEACON_MISS_HISTORY: u64 = 16;
+
+/// What the randomness beacon's rounds stand at for `epoch` (beacon.rs): validators commit for
+/// `epoch + 2` and reveal for `epoch + 1`. `(committed for e + 2, committed for e + 1, revealed
+/// for e + 1)`.
+fn beacon_participation(st: &crate::chain::State, epoch: u64) -> (usize, usize, usize) {
+    let committing = st.beacon.rounds.get(&(epoch + 2)).map_or(0, |r| r.len());
+    let revealing = st.beacon.rounds.get(&(epoch + 1));
+    (committing, revealing.map_or(0, |r| r.len()), revealing.map_or(0, |r| r.values().filter(|e| e.secret.is_some()).count()))
+}
+
+/// 🎲 The randomness beacon (beacon.rs): this epoch's value and the next one's (derived at this
+/// epoch's last block), the two rounds in progress (commitments for the epoch after next, reveals
+/// for the next) with every active validator's part in them, and recent epochs' misses
+/// (validators that committed and didn't reveal, jailed for it).
+async fn beacon(State(n): State<Node>) -> ApiResult {
+    let v = n.live.view();
+    let (st, h) = (&v.state, v.height);
+    let epoch = st.params.epoch_of(h + 1);
+    let value = |e: u64| {
+        st.beacon.values.get(&e).map(|x| json!({ "epoch": e, "value": hex::encode(x.value), "reveals": x.reveals, "missed": x.missed.iter().map(|a| label(&v, a)).collect::<Vec<_>>(), "hash_chain_only": x.reveals == 0 }))
+    };
+    let active = st.active_sets.get(&epoch).cloned().unwrap_or_default();
+    let committing = st.beacon.rounds.get(&(epoch + 2));
+    let revealing = st.beacon.rounds.get(&(epoch + 1));
+    let validators: Vec<Value> = active
+        .iter()
+        .map(|a| {
+            let c = committing.and_then(|r| r.get(a));
+            let r = revealing.and_then(|r| r.get(a));
+            json!({ "validator": label(&v, a), "committed_for_epoch_after_next": c.map(|e| e.committed_at), "committed_for_next": r.map(|e| e.committed_at), "revealed_for_next": r.and_then(|e| e.revealed_at) })
+        })
+        .collect();
+    let (committed, owed, revealed) = beacon_participation(st, epoch);
+    // Owed reveals that came from validators no longer in the set still count (they committed).
+    let round = |target: u64, r: Option<&BTreeMap<String, crate::beacon::Entry>>| {
+        json!({ "epoch": target, "committed": r.map_or(0, |r| r.len()), "revealed": r.map_or(0, |r| r.values().filter(|e| e.secret.is_some()).count()), "validators": r.map(|r| r.keys().map(|a| label(&v, a)).collect::<Vec<_>>()).unwrap_or_default() })
+    };
+    let misses: Vec<Value> = st.beacon.values.range(epoch.saturating_sub(BEACON_MISS_HISTORY)..=epoch).rev().filter(|(_, x)| !x.missed.is_empty()).map(|(e, x)| json!({ "epoch": e, "missed": x.missed.iter().map(|a| label(&v, a)).collect::<Vec<_>>() })).collect();
+    Ok(Json(json!({
+        "height": h,
+        "epoch": epoch,
+        "epoch_ends_at": st.params.last_of(epoch),
+        "current": value(epoch),
+        "next": value(epoch + 1),
+        "active": active.len(),
+        "commit_round": round(epoch + 2, committing),
+        "reveal_round": round(epoch + 1, revealing),
+        "participation": { "committed": committed, "of": active.len(), "reveals_owed": owed, "revealed": revealed },
+        "validators": validators,
+        "misses": misses,
+        "miss_slash_bps": st.chain_params.beacon_miss_slash_bps,
+        "explainer": "Each epoch, active validators commit to a secret for the epoch after next and reveal the one they committed to last epoch. At the epoch's last block the next epoch's value is BLAKE3 over this one and the reveals, sorted; it seeds the next epoch's leader order and Séances. A validator that committed and doesn't reveal is jailed and slashed (misses).",
+    })))
+}
+
 /// Prometheus text format.
 async fn metrics(State(n): State<Node>) -> Response {
     use std::fmt::Write as _;
@@ -895,6 +953,19 @@ async fn metrics(State(n): State<Node>) -> Response {
             ]);
         }
         gauges.push(("blockula_downtime_max_missed", "Leader slots a validator may miss in its downtime window before it's jailed", v.state.chain_params.downtime_max_missed as f64));
+        // The randomness beacon (beacon.rs): the rounds in progress and this epoch's value.
+        let (committed, owed, revealed) = beacon_participation(&v.state, epoch);
+        let current = v.state.beacon.values.get(&epoch);
+        gauges.extend([
+            ("blockula_beacon_commitments", "Validators committed to the beacon for the epoch after next", committed as f64),
+            ("blockula_beacon_reveals_owed", "Validators that committed for the next epoch's beacon (each owes a reveal this epoch)", owed as f64),
+            ("blockula_beacon_reveals", "Reveals for the next epoch's beacon so far", revealed as f64),
+            ("blockula_beacon_last_reveals", "Reveals that went into this epoch's beacon value (0: the hash chain alone)", current.map_or(0.0, |x| x.reveals as f64)),
+            ("blockula_beacon_last_missed", "Validators that committed for this epoch's beacon and didn't reveal (jailed for it)", current.map_or(0.0, |x| x.missed.len() as f64)),
+        ]);
+        if let Some(me) = n.me.as_deref() {
+            gauges.push(("blockula_beacon_own_missed", "1 if this validator missed its reveal for this epoch's beacon", f64::from(u8::from(current.is_some_and(|x| x.missed.iter().any(|a| a == me))))));
+        }
         for (name, help, val) in gauges {
             let kind = if name.ends_with("_total") { "counter" } else { "gauge" };
             let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {val}");
@@ -1074,7 +1145,7 @@ async fn fees(State(n): State<Node>) -> ApiResult {
     let v = n.live.view();
     let st = &v.state;
     let cp = &st.chain_params;
-    let slot = |h: u64, s: &crate::econ::FeeSlot| json!({ "height": h, "flat": s.flat.to_string(), "rate": s.rate.to_string(), "max_block_bytes": s.max_block_bytes });
+    let slot = |h: u64, s: &crate::econ::FeeSlot| json!({ "height": h, "flat": s.flat.to_string(), "rate": s.rate.to_string(), "max_block_bytes": s.max_block_bytes, "ghost_max_tx_bytes": s.ghost_max_tx_bytes, "ghost_max_block_bytes": s.ghost_max_block_bytes });
     let slots: Vec<Value> = st.econ.fees.iter().enumerate().map(|(i, s)| slot(st.econ.height + i as u64, s)).collect();
     let s = crate::econ::suggested(st);
     Ok(Json(json!({
@@ -1571,6 +1642,29 @@ fn claim_json(v: &ReadView, cl: &crate::poc::Claim) -> Value {
         "soul_awarded_display": crate::poc::fmt_soul(cl.soul_awarded),
         "closed_at": cl.closed_at,
         "reason": cl.reason,
+        // GOV-3: validators re-check a verified claim for reverts during its revert window; a
+        // BFT quorum of the current set naming one revert commit rejects it (beacon.rs).
+        "revert_window_until": (cl.status == crate::poc::ClaimStatus::Verified).then(|| cl.verified_at.map(|x| x + p.claim_maturity_blocks)).flatten(),
+        "revert_attestations": revert_attestations_json(v, cl.id),
+    })
+}
+
+/// A claim's revert attestations (while its window is open): who attested which revert commit,
+/// whether they're in the current set, and how many of the set each commit has of the quorum.
+fn revert_attestations_json(v: &ReadView, claim_id: u64) -> Value {
+    let st = &v.state;
+    let Some(atts) = st.beacon.reverts.get(&claim_id) else { return json!(null) };
+    let set = st.active_sets.get(&st.params.epoch_of(v.height + 1)).cloned().unwrap_or_default();
+    let n = set.len();
+    let mut by_sha: BTreeMap<&str, usize> = BTreeMap::new();
+    for a in atts.iter().filter(|(val, _)| set.contains(val)).map(|(_, a)| a) {
+        *by_sha.entry(a.revert_sha.as_str()).or_default() += 1;
+    }
+    json!({
+        "attestations": atts.iter().map(|(val, a)| json!({ "validator": label(v, val), "revert_sha": a.revert_sha, "at": a.at, "in_current_set": set.contains(val) })).collect::<Vec<_>>(),
+        "quorum": n - n.saturating_sub(1) / 3,
+        "set": n,
+        "by_revert": by_sha.into_iter().map(|(sha, c)| json!({ "revert_sha": sha, "validators": c })).collect::<Vec<_>>(),
     })
 }
 
@@ -2023,6 +2117,52 @@ mod http_tests {
         assert_eq!(s, StatusCode::OK);
         assert_eq!(b["to"], 1);
         assert_eq!(b["finalization"], "010203");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The randomness beacon over HTTP (`/api/beacon`): the current value, the commit and reveal
+    /// rounds with each active validator's part, recent misses; their metrics; and a claim's
+    /// revert attestations in its JSON (who attested which revert, against the set's quorum).
+    #[tokio::test]
+    async fn beacon_rounds_misses_and_revert_attestations() {
+        let (root, n) = node("beacon");
+        let me = n.chain.lock().me().unwrap();
+        let entry = |revealed: bool| crate::beacon::Entry { commitment: [7; 32], committed_at: 1, secret: revealed.then_some([8; 32]), revealed_at: revealed.then_some(2) };
+        {
+            let mut c = n.chain.lock();
+            let st = &mut c.state;
+            // Epoch 0: the validator committed for epoch 2 and committed and revealed for epoch 1;
+            // the genesis value records a miss (as a derived value would).
+            st.beacon.rounds.insert(2, BTreeMap::from([(me.clone(), entry(false))]));
+            st.beacon.rounds.insert(1, BTreeMap::from([(me.clone(), entry(true))]));
+            st.beacon.values.get_mut(&0).unwrap().missed = vec![me.clone()];
+            // A verified claim in its revert window, with one attestation.
+            let claim = crate::poc::Claim { id: 0, claimant: me.clone(), handle: "someone".into(), repo: "o/r".into(), pr: 1, familiar_key: None, bond: 0, submitted_at: 1, status: crate::poc::ClaimStatus::Verified, attestations: BTreeMap::new(), merge_sha: Some("a".repeat(40)), verified_at: Some(1), seance: None, score_ppm: None, payout: 0, soul_awarded: 0, grant: None, closed_at: None, reason: None };
+            st.poc.claims.insert(0, claim);
+            st.poc.next_claim_id = 1;
+            st.beacon.reverts.insert(0, BTreeMap::from([(me.clone(), crate::beacon::RevertAttestation { revert_sha: "b".repeat(40), at: 1 })]));
+            c.produce_block().unwrap();
+        }
+        let (s, b, _) = call(&n, "GET", "/api/beacon", None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!((b["epoch"].as_u64(), b["active"].as_u64(), b["current"]["epoch"].as_u64(), b["current"]["hash_chain_only"].as_bool()), (Some(0), Some(1), Some(0), Some(true)));
+        assert_eq!(b["current"]["missed"][0]["address"], me.as_str());
+        assert!(b["next"].is_null(), "epoch 1's value is derived at epoch 0's last block");
+        assert_eq!((b["commit_round"]["epoch"].as_u64(), b["commit_round"]["committed"].as_u64()), (Some(2), Some(1)));
+        assert_eq!((b["reveal_round"]["epoch"].as_u64(), b["reveal_round"]["revealed"].as_u64()), (Some(1), Some(1)));
+        assert_eq!(b["participation"], json!({ "committed": 1, "of": 1, "reveals_owed": 1, "revealed": 1 }));
+        assert_eq!((b["validators"][0]["committed_for_epoch_after_next"].as_u64(), b["validators"][0]["revealed_for_next"].as_u64()), (Some(1), Some(2)));
+        assert_eq!(b["misses"][0]["epoch"].as_u64(), Some(0));
+        let (_, _, text) = call(&n, "GET", "/metrics", None, "127.0.0.1:1").await;
+        for want in ["blockula_beacon_commitments 1", "blockula_beacon_reveals_owed 1", "blockula_beacon_reveals 1", "blockula_beacon_last_reveals 0", "blockula_beacon_last_missed 1", "blockula_beacon_own_missed 1"] {
+            assert!(text.contains(want), "{want} in {text}");
+        }
+        let (s, cl, _) = call(&n, "GET", "/api/claim/0", None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::OK);
+        let r = &cl["revert_attestations"];
+        assert_eq!((r["quorum"].as_u64(), r["set"].as_u64(), r["by_revert"][0]["validators"].as_u64()), (Some(1), Some(1), Some(1)));
+        assert_eq!((r["attestations"][0]["revert_sha"].as_str(), r["attestations"][0]["in_current_set"].as_bool()), (Some("b".repeat(40).as_str()), Some(true)));
+        assert!(cl["revert_window_until"].as_u64().is_some());
         std::fs::remove_dir_all(root).ok();
     }
 

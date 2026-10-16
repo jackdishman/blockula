@@ -222,8 +222,7 @@ fn without_quorum_the_deposit_is_burned() {
     assert_eq!((t.p(id).status, t.p(id).tally.as_ref().unwrap().quorum), (ProposalStatus::Rejected, (20_000 * FANG) as u128));
 }
 
-/// The O(accounts) unlocked-supply sum runs once an epoch: votes closing later in the epoch
-/// reuse it.
+/// The unlocked supply is taken once an epoch: votes closing later in the epoch reuse it.
 #[test]
 fn the_unlocked_supply_is_taken_once_an_epoch() {
     let mut t = T::new(&[]);
@@ -244,6 +243,64 @@ fn the_unlocked_supply_is_taken_once_an_epoch() {
     let later = t.p(c).tally.as_ref().unwrap().unlocked;
     assert_eq!((later, t.st.governance.quorum_base), (unlocked_supply(&t.st, end), Some((1, later))));
     assert!(later < first - 9_999 * FANG as u128);
+}
+
+/// The quorum base is running totals (balances, pool stake, unbonding) less what the few vesting
+/// accounts still hold, not a walk over every account, and it follows every change exactly:
+/// transfers and fees, new accounts, delegating, unbonding, rewards, moves to keyless accounts and
+/// the vesting curve. (`check_invariants` also compares it with a walk after every block.)
+#[test]
+fn the_unlocked_supply_is_kept_exact_without_walking_the_accounts() {
+    let mut t = T::new(&[]);
+    let at = |t: &T, h: u64| {
+        let u = unlocked_supply(&t.st, h);
+        assert_eq!(u, unlocked_supply_by_walk(&t.st, h), "running total vs walk at {h}");
+        u
+    };
+    let u0 = at(&t, t.h);
+    // Users, validators and the operator (its bond included); not the founder's unvested
+    // million, not the system accounts.
+    assert_eq!(u0, 164_000 * FANG as u128);
+    // A transfer that opens an account burns its fee and the creation fee; the rest still votes.
+    let creation = t.st.chain_params.account_creation_fee as u128;
+    let fee = t.tx(ALICE, Action::Transfer { to: addr(DAVE), amount: 1_000 * FANG }).unwrap() as u128;
+    let u1 = at(&t, t.h);
+    assert_eq!(u1, u0 - fee - creation);
+    // Delegating and unbonding move FANG between balance, pool and entry: only the fees go.
+    let v3 = addr(VALIDATORS[2]);
+    let fee = t.tx(DAVE, Action::Delegate { validator: v3.clone(), amount: 500 * FANG }).unwrap() as u128;
+    let u2 = at(&t, t.h);
+    assert_eq!(u2, u1 - fee);
+    let shares = t.st.staking.delegations.get(&format!("{}/{v3}", addr(DAVE))).unwrap().shares as u64;
+    let fee = t.tx(DAVE, Action::Undelegate { validator: v3.clone(), shares: shares / 2 }).unwrap() as u128;
+    t.next();
+    let u3 = at(&t, t.h);
+    assert_eq!(u3, u2 - fee);
+    assert!(t.st.staking.entries.total() > 0);
+    // FANG sent to a keyless account stops counting.
+    let fee = t.tx(BOB, Action::Transfer { to: community("boo"), amount: 2_000 * FANG }).unwrap() as u128;
+    let u4 = at(&t, t.h);
+    assert_eq!(u4, u3 - fee - 2_000 * FANG as u128);
+    // Issuance at the epoch boundary: the stakers' share lands in the pools and counts; the
+    // pool's and the treasury's shares don't.
+    let staked = t.st.staking.pools.total();
+    t.through(600);
+    let rewards = t.st.staking.pools.total() - staked;
+    assert!(rewards > 0);
+    assert_eq!(at(&t, t.h), u4 + rewards);
+    // The founder's allocation counts as it vests (linearly from 0 to 20,000, nothing before the
+    // cliff at 10,000), with the walk agreeing at each height.
+    let before = at(&t, 9_999);
+    assert_eq!(at(&t, 10_000), before + 500_000 * FANG as u128);
+    assert_eq!(at(&t, 15_000), before + 750_000 * FANG as u128);
+    assert_eq!(at(&t, 20_000), before + 1_000_000 * FANG as u128);
+    // Locked tokens the founder stakes stay unvested: only its liquid 10 FANG (less fees) vote.
+    let fee = t.tx(ALICE, Action::Transfer { to: addr(FOUNDER), amount: 10 * FANG }).unwrap() as u128;
+    let u5 = at(&t, t.h);
+    assert_eq!(u5, u4 + rewards - fee);
+    let fee = t.tx(FOUNDER, Action::Delegate { validator: v3, amount: 100_000 * FANG }).unwrap() as u128;
+    t.next();
+    assert_eq!(at(&t, t.h), u5 - fee);
 }
 
 #[test]
@@ -583,6 +640,46 @@ fn merkle_trees_build_and_verify() {
     assert_eq!(proofs, VECTOR_PROOFS.map(|p| p.iter().map(|h| h.to_string()).collect::<Vec<_>>()));
 }
 
+/// The shared vectors the SDK's helper (`sdk-ts/src/distribution.ts`) checks:
+/// `sdk-ts/test/distribution-vectors.json`, distribution 7 (the table in docs/GOVERNANCE.md) and
+/// trees of 1 to 9 entries. Regenerate with `cargo test governance::tests::write_distribution_vectors -- --ignored`.
+fn distribution_vectors() -> serde_json::Value {
+    let tree = |id: u64, entries: &[(String, u64)]| {
+        let (root, proofs) = build_distribution(id, entries).unwrap();
+        serde_json::json!({
+            "distribution_id": id,
+            "entries": entries.iter().zip(&proofs).map(|((a, amount), p)| serde_json::json!({ "address": a, "amount": amount.to_string(), "leaf": hex::encode(distribution_leaf(id, a, *amount)), "proof": p.iter().map(hex::encode).collect::<Vec<_>>() })).collect::<Vec<_>>(),
+            "root": hex::encode(root),
+        })
+    };
+    let a = crate::crypto::render_address("boo", &[7; 32]);
+    let b = crate::crypto::render_address("boo", &[8; 32]);
+    let c = crate::crypto::render_address("tboo", &[9; 32]);
+    let mut trees = vec![tree(7, &[(a, 1_000_000_000), (b, 2_500_000_000), (c, 1)])];
+    for n in 1..=9u8 {
+        trees.push(tree(1_000 + n as u64, &(0..n).map(|i| (addr(100 + i), (i as u64 + 1) * FANG + i as u64)).collect::<Vec<_>>()));
+    }
+    serde_json::json!({ "trees": trees })
+}
+
+fn distribution_vectors_file() -> std::path::PathBuf {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    dir.ancestors().map(|d| d.join("sdk-ts/test/distribution-vectors.json")).find(|p| p.exists()).unwrap_or_else(|| dir.join("../sdk-ts/test/distribution-vectors.json"))
+}
+
+#[test]
+fn distribution_vectors_match_the_sdk_file() {
+    let file: serde_json::Value = serde_json::from_slice(&std::fs::read(distribution_vectors_file()).expect("sdk-ts/test/distribution-vectors.json")).unwrap();
+    assert_eq!(file, distribution_vectors(), "regenerate with `cargo test governance::tests::write_distribution_vectors -- --ignored`");
+    assert_eq!(file["trees"][0]["root"], VECTOR_ROOT);
+}
+
+#[test]
+#[ignore]
+fn write_distribution_vectors() {
+    std::fs::write(distribution_vectors_file(), serde_json::to_string_pretty(&distribution_vectors()).unwrap() + "\n").unwrap();
+}
+
 // Distribution 7 over boo1qurswpc8…z6hc9p (bytes [7; 32]) 1 FANG, boo1pqyqszqg…66rhlm
 // ([8; 32]) 2.5 FANG and tboo1pyysjzgf…j0amg2 ([9; 32]) 1 drop.
 const VECTOR_LEAF: &str = "17031a8f14226964c8df49241c3572e7b17e3f492ae175f6b0b7e3d68e7b9515";
@@ -641,6 +738,48 @@ fn distributions_pay_valid_claims_once_and_return_the_rest() {
     let claim = |amount: u64, p: &Vec<[u8; 32]>| Action::ClaimDistribution { distribution_id: id, amount, proof: p.iter().map(hex::encode).collect() };
     t.tx(ALICE, claim(150 * FANG, &proofs[0])).unwrap();
     assert!(t.err(BOB, claim(150 * FANG, &proofs[1])).contains("has only 50 FANG left"));
+}
+
+/// A claimant with nothing to pay the fee with (a new account) pays it, and its account's
+/// creation fee, out of the claim. A claim that doesn't check out (bad proof, too small to cover
+/// the fees, already claimed) is no help: without a balance it isn't admitted at all, so it's
+/// never free.
+#[test]
+fn claims_pay_their_own_fee_out_of_the_claim() {
+    let mut t = T::new(&[]);
+    let id = t.st.governance.next_proposal_id;
+    let (dave, eve) = (addr(DAVE), addr(40));
+    let entries = vec![(dave.clone(), 10 * FANG), (eve.clone(), 1_000)];
+    let (root, proofs) = build_distribution(id, &entries).unwrap();
+    let proof = |i: usize| proofs[i].iter().map(hex::encode).collect::<Vec<_>>();
+    let claim = |amount: u64, proof: Vec<String>| Action::ClaimDistribution { distribution_id: id, amount, proof };
+    t.propose(ALICE, ProposalKind::Distribution { merkle_root: hex::encode(root), total: 10 * FANG + 1_000, claim_until: t.h + 100 });
+    t.vote(ALICE, id, true, 50_000, 1).unwrap();
+    t.finish(id);
+    assert!(!t.st.accounts.contains_key(&dave), "DAVE has never held anything");
+    let (supply, burned) = (t.st.supply, t.st.burned);
+    // A bad proof: not admitted (no account, no fee, nothing claimed).
+    let e = t.err(DAVE, claim(10 * FANG, proof(1)));
+    assert!(e.contains("insufficient balance for the fee") && e.contains("doesn't lead to"), "{e}");
+    let e = t.err(DAVE, claim(11 * FANG, proof(0)));
+    assert!(e.contains("the claim can't pay it"), "{e}");
+    // Too small to cover the fees.
+    let e = t.err(40, claim(1_000, proof(1)));
+    assert!(e.contains("claims 0.000001 FANG"), "{e}");
+    assert!(!t.st.accounts.contains_key(&dave) && !t.st.accounts.contains_key(&eve));
+    assert_eq!((t.st.supply, t.st.burned, t.st.governance.distributions[&id].claims), (supply, burned, 0));
+    // A valid claim opens the account and pays both fees out of the 10 FANG.
+    let creation = t.st.chain_params.account_creation_fee;
+    let charge = t.tx(DAVE, claim(10 * FANG, proof(0))).unwrap();
+    assert_eq!(t.bal(DAVE), 10 * FANG - charge - creation);
+    assert_eq!(t.st.account(&dave).nonce, 1);
+    assert_eq!(t.st.burned, burned + charge + creation, "the base fee (no tip) and the creation fee burn");
+    assert_eq!(t.st.governance.distributions[&id].claimed, 10 * FANG);
+    // Claiming again, now with a balance: admitted, charged, and it fails.
+    let before = t.bal(DAVE);
+    assert!(t.err(DAVE, claim(10 * FANG, proof(0))).contains("already claimed"));
+    assert!(t.bal(DAVE) < before && t.st.account(&dave).nonce == 2);
+    t.next();
 }
 
 #[test]

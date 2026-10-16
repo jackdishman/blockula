@@ -410,7 +410,10 @@ admission and execution check it equals the chain's (`/api/ghost` serves it).
 
 **Limits.** Ghost txs (50–52) up to `MAX_GHOST_TX_BYTES` = 1 MiB in the codec, and
 `ghost_max_tx_bytes` at admission and in blocks; at most `ghost_max_block_bytes` of them per
-block (`ghost::BlockBudget`, in consensus `propose` and `verify`). At most 256 queued in the
+block (`ghost::BlockBudget`, in consensus `propose` and `verify`). In blocks, both limits are the
+ones the block's fee slot fixed 17 blocks ahead (`econ::FeeSlot`, like the base fee and
+`max_block_bytes`), so a `ParamChange` takes effect 17 blocks after it executes and every proposer
+within the execution lag knows them exactly; `verify` checks them before any proof. At most 256 queued in the
 mempool; a tx spending a nullifier a queued tx spends replaces it only with a higher tip per byte.
 `POST /api/tx` takes the wire form as `application/octet-stream` (and JSON up to twice
 `MAX_GHOST_TX_BYTES`).

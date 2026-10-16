@@ -58,6 +58,12 @@ pub const BUCKETS: &[Bucket] = &[
     Bucket { name: "operators", bps: 300, system: None, vesting: Some((6, 24)) },
 ];
 
+/// Not a DEC-5 bucket: on a chain with a faucet (testnets), liquid FANG for the validators'
+/// consensus-key accounts, which pay the drips (`Chain::faucet`) and their own fees. It sits
+/// outside the DEC-5 table (the buckets' shares are of the supply without it), and a chain
+/// without a faucet (so `blockula-1`) refuses it.
+pub const FAUCET_BUCKET: &str = "faucet";
+
 impl Bucket {
     /// Its vesting curve in blocks at this block time.
     pub fn curve(&self, block_time_ms: u64) -> Option<Vesting> {
@@ -304,9 +310,22 @@ pub fn build_from(spec: &Spec, operators: &[OperatorFile], strict: bool) -> Resu
     let mut allocations = vec![];
     let mut by_bucket: BTreeMap<&str, u128> = BTreeMap::new();
     let mut sum: u128 = 0;
+    let mut faucet: u128 = 0;
     for (i, a) in spec.allocations.iter().enumerate() {
         let what = format!("allocation {} ({})", i + 1, a.bucket);
-        let bucket = BUCKETS.iter().find(|b| b.name == a.bucket).ok_or_else(|| anyhow!("{what}: unknown bucket (known: {})", BUCKETS.iter().map(|b| b.name).collect::<Vec<_>>().join(", ")))?;
+        if a.bucket == FAUCET_BUCKET {
+            ensure!(spec.faucet, "{what}: only a chain with a faucet (`faucet = true`) funds one");
+            let addr = a.address.as_ref().ok_or_else(|| anyhow!("{what}: needs an `address`"))?;
+            ensure!(crypto::parse_address(addr).map(|(p, _)| p) == Some(prefix), "{what}: {addr} isn't a {prefix}1… address");
+            ensure!(system_account(prefix, addr).is_none(), "{what}: {addr} is a keyless system account");
+            let amount = parse_fang_amount(&a.amount).with_context(|| what.clone())?;
+            ensure!(amount > 0, "{what}: amount must be more than 0");
+            sum += amount as u128;
+            faucet += amount as u128;
+            allocations.push(Allocation { address: addr.clone(), amount, vesting: None, label: Some(a.label.clone().unwrap_or_else(|| FAUCET_BUCKET.to_string())) });
+            continue;
+        }
+        let bucket = BUCKETS.iter().find(|b| b.name == a.bucket).ok_or_else(|| anyhow!("{what}: unknown bucket (known: {}, and {FAUCET_BUCKET} on chains with a faucet)", BUCKETS.iter().map(|b| b.name).collect::<Vec<_>>().join(", ")))?;
         let address = match (bucket.system, &a.address) {
             (Some(sys), None) => sys(prefix),
             (Some(sys), Some(addr)) if *addr == sys(prefix) => addr.clone(),
@@ -326,7 +345,7 @@ pub fn build_from(spec: &Spec, operators: &[OperatorFile], strict: bool) -> Resu
     }
     ensure!(sum == total as u128, "allocations add up to {} drops, but total_supply is {} drops", sum, total);
     for b in BUCKETS {
-        let want = total as u128 * b.bps as u128 / 10_000;
+        let want = (total as u128 - faucet) * b.bps as u128 / 10_000;
         let has = by_bucket.get(b.name).copied().unwrap_or(0);
         if has != want {
             findings.push(format!("bucket {} holds {} drops; DEC-5 gives it {} ({}% of the supply)", b.name, has, want, crate::staking::fmt_bps(b.bps)));
@@ -692,6 +711,28 @@ mod tests {
         }
         t += &alloc("operators", Some(&Keys::from_seed([0x32; 32]).address_with(prefix)), 30_000_000 - ops.len() as u64 * 1_000_000);
         toml::from_str(&t).unwrap()
+    }
+
+    /// A testnet with a faucet funds its validators' consensus-key accounts liquid, outside the
+    /// DEC-5 table (whose shares are of the rest); a chain without a faucet refuses it.
+    #[test]
+    fn faucet_allocations_fund_testnet_validators() {
+        let ops = operators("blockula-testnet-9", "tboo", 22);
+        let faucet = |addr: &str| format!("[[allocation]]\nbucket = \"faucet\"\naddress = \"{addr}\"\namount = \"5000000\"\n");
+        let mut spec = spec_for("blockula-testnet-9", "tboo", &ops, "faucet = true");
+        let extra: Vec<SpecAllocation> = ops.iter().take(2).flat_map(|o| toml::from_str::<Spec>(&format!("chain_id = \"x\"\naddress_prefix = \"tboo\"\ngenesis_time_ms = 1\nblock_time_ms = 1\nepoch_blocks = 2\ntotal_supply = \"1\"\n{}", faucet(&o.keys.consensus_address))).unwrap().allocations).collect();
+        spec.allocations.extend(extra.clone());
+        spec.total_supply = "1010000000".into();
+        let built = build_from(&spec, &ops, false).unwrap();
+        assert!(built.warnings.is_empty(), "the DEC-5 shares are of the supply without the faucet: {:?}", built.warnings);
+        let funded = built.genesis.allocations.iter().find(|a| a.address == ops[0].keys.consensus_address).unwrap();
+        assert_eq!((funded.amount, funded.vesting.clone(), funded.label.as_deref()), (5_000_000 * FANG, None, Some("faucet")));
+        let st = built.genesis.initial_state();
+        assert_eq!(crate::econ::transferable(&st, &ops[0].keys.consensus_address, 0), 5_000_000 * FANG, "liquid, for drips and fees");
+        let mut no_faucet = spec_for("blockula-testnet-9", "tboo", &ops, "");
+        no_faucet.allocations.extend(extra);
+        no_faucet.total_supply = "1010000000".into();
+        assert!(format!("{:#}", build_from(&no_faucet, &ops, false).err().unwrap()).contains("only a chain with a faucet"));
     }
 
     /// A mainnet-shaped spec (22 independent operators, DEC-5 exactly) passes strict, and so

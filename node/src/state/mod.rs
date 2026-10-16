@@ -22,7 +22,7 @@ pub mod codec;
 pub mod tmap;
 pub mod tree;
 
-pub use tmap::{JMap, TMap};
+pub use tmap::{Aggregate, JMap, TMap};
 pub use tree::{Hash, Proof};
 
 use crate::chain::{HuntStatus, State};
@@ -160,10 +160,11 @@ pub trait SubState {
     }
 }
 
-impl<K, V> Table for TMap<K, V>
+impl<K, V, A> Table for TMap<K, V, A>
 where
     K: Ord + Clone + RecordKey,
     V: Clone + BorshSerialize + BorshDeserialize,
+    A: Aggregate<V>,
 {
     fn record_count(&self) -> usize {
         self.len()
@@ -467,6 +468,12 @@ impl State {
         // distributions, the shielded pool.
         held += crate::staking::escrow(self) + crate::governance::escrow(self) + crate::ghost::escrow(self);
         ensure!(held == self.supply as u128, "supply is {} drops but balances and escrows hold {held}", self.supply);
+        // Running totals and indexes the maps keep (`tmap::Aggregate`) match a recomputation.
+        let full = self.accounts.full_aggregate();
+        ensure!((self.accounts.total(), self.accounts.indexed()) == full, "the accounts' running totals (Σ balance, vesting accounts) drifted from the state");
+        ensure!(self.staking.pools.total() == self.staking.pools.full_aggregate().0, "the running total of pool stake drifted from the pools");
+        ensure!(self.staking.entries.total() == self.staking.entries.full_aggregate().0, "the running total of unbonding drifted from the entries");
+        ensure!(self.poc.claims.indexed() == self.poc.claims.full_aggregate().1, "the open-claims index drifted from the claims");
         crate::staking::check_invariants(self)?;
         crate::governance::check_invariants(self)?;
         crate::econ::check_invariants(self)?;

@@ -12,9 +12,10 @@
 //! `base_fee_max_change_bps`, an empty one lowers it as much), never below the floor
 //! (`base_fee_floor_flat + base_fee_floor_per_byte × size`, today's `min_fee`). A parameter change
 //! reaches the ring 17 blocks later, like everything else in it. The block-size limit
-//! (`max_block_bytes`) is fixed the same way, so a verifier that has executed `h − 17` checks a
-//! block's size and every tx's fee exactly (consensus.rs), and a block with txs must cite such a
-//! state. Statelessly, a fee is only checked against the lowest base fee any parameters allow.
+//! (`max_block_bytes`) and Ghost Mode's per-block limits (`ghost_max_tx_bytes`,
+//! `ghost_max_block_bytes`) are fixed the same way, so a verifier that has executed `h − 17`
+//! checks a block's size, its ghost txs' sizes and every tx's fee exactly (consensus.rs), and a
+//! block with txs must cite such a state. Statelessly, a fee is only checked against the lowest base fee any parameters allow.
 //!
 //! **Issuance.** At every epoch boundary, [`issue`] mints `S(y) × rate_ppm(y) / (10⁶ ×
 //! epochs_per_year)`, where `S(y)` is the supply when year `y`'s first epoch ends (before its
@@ -85,12 +86,24 @@ pub struct FeeSlot {
     pub rate: u64,
     /// Most tx bytes the block may carry.
     pub max_block_bytes: u64,
+    /// Ghost Mode's limits for the block (`ghost::BlockBudget`): most bytes per ghost tx, and of
+    /// ghost txs together. Fixed ahead like the rest, so a proposer within the lag knows them.
+    #[serde(default)]
+    pub ghost_max_tx_bytes: u64,
+    #[serde(default)]
+    pub ghost_max_block_bytes: u64,
 }
 
 impl FeeSlot {
     /// The floor under these parameters.
     pub fn floor(cp: &ChainParams) -> Self {
-        Self { flat: cp.base_fee_floor_flat, rate: floor_rate(cp), max_block_bytes: cp.max_block_bytes }
+        Self { flat: cp.base_fee_floor_flat, rate: floor_rate(cp), max_block_bytes: cp.max_block_bytes, ghost_max_tx_bytes: cp.ghost_max_tx_bytes, ghost_max_block_bytes: cp.ghost_max_block_bytes }
+    }
+
+    /// A slot that only prices txs (no size limits): for computing a fee from a flat part and a
+    /// rate.
+    pub fn pricing(flat: u64, rate: u64) -> Self {
+        Self { flat, rate, max_block_bytes: 0, ghost_max_tx_bytes: 0, ghost_max_block_bytes: 0 }
     }
 
     /// The base fee of a tx of `size` bytes: `flat + rate × size / 1000`, rounded down.
@@ -220,7 +233,7 @@ pub fn base_fee(state: &State, height: u64, size: u64) -> u64 {
             rate += (rate * step / 10_000).max(1);
         }
     }
-    FeeSlot { flat: last.flat.max(cp.base_fee_floor_flat), rate: rate.min(MAX_RATE as u128) as u64, max_block_bytes: last.max_block_bytes }.fee(size)
+    FeeSlot::pricing(last.flat.max(cp.base_fee_floor_flat), rate.min(MAX_RATE as u128) as u64).fee(size)
 }
 
 /// What `tx` is charged in block `height`: the base fee plus its tip (`None` on overflow).
@@ -243,7 +256,13 @@ pub fn suggested(state: &State) -> FeeSlot {
     let upcoming = state.econ.fees.iter().skip(1);
     upcoming.fold(None, |acc: Option<FeeSlot>, s| Some(match acc {
         None => *s,
-        Some(a) => FeeSlot { flat: a.flat.max(s.flat), rate: a.rate.max(s.rate), max_block_bytes: a.max_block_bytes.min(s.max_block_bytes) },
+        Some(a) => FeeSlot {
+            flat: a.flat.max(s.flat),
+            rate: a.rate.max(s.rate),
+            max_block_bytes: a.max_block_bytes.min(s.max_block_bytes),
+            ghost_max_tx_bytes: a.ghost_max_tx_bytes.min(s.ghost_max_tx_bytes),
+            ghost_max_block_bytes: a.ghost_max_block_bytes.min(s.ghost_max_block_bytes),
+        },
     }))
     .unwrap_or_else(|| FeeSlot::floor(&state.chain_params))
 }
@@ -280,7 +299,7 @@ pub fn next_slot(prev: &FeeSlot, used: u64, limit: u64, cp: &ChainParams) -> Fee
     } else {
         rate
     };
-    FeeSlot { flat: cp.base_fee_floor_flat, rate: next.clamp(floor_rate(cp) as u128, MAX_RATE as u128) as u64, max_block_bytes: cp.max_block_bytes }
+    FeeSlot { rate: next.clamp(floor_rate(cp) as u128, MAX_RATE as u128) as u64, ..FeeSlot::floor(cp) }
 }
 
 /// Second end-of-block step, every block: fixes the slot for `height + FEE_LAG` from this
@@ -616,6 +635,7 @@ pub fn check_invariants(state: &State) -> Result<()> {
     ensure!(e.fees.is_empty() || e.fees.len() == FEE_LAG as usize + 1, "the fee ring has {} slots, not {}", e.fees.len(), FEE_LAG + 1);
     for s in &e.fees {
         ensure!((1..=MAX_RATE).contains(&s.rate) && s.max_block_bytes <= crate::params::CODEC_MAX_BLOCK_BYTES, "fee slot {s:?} is out of bounds");
+        ensure!(s.ghost_max_tx_bytes <= s.ghost_max_block_bytes && s.ghost_max_block_bytes <= crate::params::CODEC_MAX_BLOCK_BYTES, "fee slot {s:?} has out-of-bounds ghost limits");
     }
     ensure!(e.issuance.year == 0 || e.issuance.rate_ppm > 0, "issuance year {} has no rate", e.issuance.year);
     for (n, r) in state.names.iter() {
@@ -780,7 +800,7 @@ mod tests {
         let max = cp.max_block_bytes;
         assert_eq!((cp.base_fee_max_change_bps, cp.target_fullness_bps, max), (1_250, 5_000, 2 << 20));
         let floor = FeeSlot::floor(&cp);
-        assert_eq!(floor, FeeSlot { flat: 10_000, rate: 10_000, max_block_bytes: max });
+        assert_eq!(floor, FeeSlot { flat: 10_000, rate: 10_000, max_block_bytes: max, ghost_max_tx_bytes: cp.ghost_max_tx_bytes, ghost_max_block_bytes: cp.ghost_max_block_bytes });
         assert_eq!(floor.fee(5_400), min_fee(5_400), "the floor is today's min_fee");
         let at = |rate: u64, used: u64| next_slot(&FeeSlot { rate, ..floor }, used, max, &cp).rate;
         assert_eq!(at(100_000, max), 112_500, "full: +12.5%");
@@ -803,9 +823,9 @@ mod tests {
         // New parameters reach the next slot: a higher floor lifts the rate to it at once, and
         // the flat part and size limit are the current ones.
         let raised = ChainParams { base_fee_floor_per_byte: 20, base_fee_floor_flat: 7, max_block_bytes: 1 << 20, ..cp.clone() };
-        assert_eq!(next_slot(&floor, 0, max, &raised), FeeSlot { flat: 7, rate: 20_000, max_block_bytes: 1 << 20 });
+        assert_eq!(next_slot(&floor, 0, max, &raised), FeeSlot { flat: 7, rate: 20_000, max_block_bytes: 1 << 20, ..floor });
         // Fees round down, per tx.
-        assert_eq!(FeeSlot { flat: 0, rate: 10_999, max_block_bytes: 1 }.fee(1), 10);
+        assert_eq!(FeeSlot::pricing(0, 10_999).fee(1), 10);
         assert_eq!(lowest_base_fee(5_400), 5_400, "the bounds allow 0 flat and 1 drop per byte");
     }
 
@@ -815,7 +835,35 @@ mod tests {
     fn fee_slots_match_the_sdk() {
         let tx = crate::types::tests::vector_tx(Action::Transfer { to: "x.boo".into(), amount: 5 });
         assert_eq!(tx.size(), 5_373);
-        assert_eq!(FeeSlot { flat: 10_000, rate: 12_656, max_block_bytes: 0 }.fee(tx.size()), 78_000);
+        assert_eq!(FeeSlot::pricing(10_000, 12_656).fee(tx.size()), 78_000);
+    }
+
+    /// Ghost Mode's per-block limits ride in the same slots: a `ParamChange` that executes at the
+    /// end of block `h` reaches the slot block `h + 1` fixes (for `h + 1 + FEE_LAG`), so every
+    /// height a proposer within the lag may build on keeps the limits it already knew, and
+    /// `ghost::BlockBudget` reads them from the slot, not from the parameters in force.
+    #[test]
+    fn ghost_limits_are_fixed_17_blocks_ahead() {
+        let mut st = State::default();
+        init_genesis(&mut st);
+        let old = FeeSlot::floor(&st.chain_params);
+        let h = 5;
+        for height in 1..=h {
+            end_block(&mut st, &info(height, 0));
+        }
+        // Executed at the end of block h, after its own econ step (governance runs after it).
+        st.exec_set_param(&mut Journal::default(), "ghost_max_tx_bytes", 50 << 10).unwrap();
+        st.exec_set_param(&mut Journal::default(), "ghost_max_block_bytes", 100 << 10).unwrap();
+        let limits = |st: &State, height: u64| slot(st, height).map(|s| (s.ghost_max_tx_bytes, s.ghost_max_block_bytes));
+        assert!((h..=h + FEE_LAG).all(|x| limits(&st, x) == Some((old.ghost_max_tx_bytes, old.ghost_max_block_bytes))));
+        let tx = crate::types::tests::vector_tx(Action::PrivateTransfer { bundle: crate::types::tests::vector_bundle(11) });
+        let budget = |st: &State, height: u64| crate::ghost::BlockBudget::new(slot(st, height).as_ref()).take(&tx, 60 << 10).is_ok();
+        assert!(budget(&st, h + FEE_LAG), "a 60 KiB ghost tx still fits the slot fixed before the change");
+        end_block(&mut st, &info(h + 1, 0));
+        assert_eq!(limits(&st, h + FEE_LAG), Some((old.ghost_max_tx_bytes, old.ghost_max_block_bytes)));
+        assert_eq!(limits(&st, h + 1 + FEE_LAG), Some((50 << 10, 100 << 10)));
+        assert!(budget(&st, h + FEE_LAG) && !budget(&st, h + 1 + FEE_LAG));
+        check_invariants(&st).unwrap();
     }
 
     /// The fee for block `h` is fixed by block `h − 17`'s execution, from the rate before it and

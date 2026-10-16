@@ -545,7 +545,6 @@ impl Store {
     }
 
     /// Stores a certificate outside a block commit (one that arrived after its block).
-    #[cfg(test)]
     pub fn put_cert(&self, height: u64, cert: &[u8]) -> Result<()> {
         let tx = self.begin(true)?;
         tx.open_table(CERTS).map_err(storage)?.insert(height, cert).map_err(storage)?;

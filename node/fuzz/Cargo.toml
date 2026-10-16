@@ -145,3 +145,10 @@ path = "fuzz_targets/state_machine.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "evidence"
+path = "fuzz_targets/evidence.rs"
+test = false
+doc = false
+bench = false

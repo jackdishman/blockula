@@ -229,7 +229,10 @@ if (minBond + parseFang("2") <= BigInt((await client.account(alice.address)).bal
   const reg = await operator.registerValidator({ consensusKey, p2pAddr, httpAddr, bond: minBond, pop });
   console.log("✓", reg.summary);
   const after = await client.validators();
-  assert.ok(after.candidates.some((v: any) => v.validator.address === node.address), "a registered validator is a candidate");
+  // A candidate, or (if an epoch boundary passed since it registered, which on a multi-validator
+  // chain with free seats selects it) already in the set: the retirement below covers both.
+  const listed = (vs: any[]) => vs.some((v: any) => v.validator.address === node.address);
+  assert.ok(listed(after.candidates) || listed(after.active), "a registered validator is a candidate (or was selected at a boundary since)");
   await assert.rejects(operator.approveValidator(node.address), /only validator admins/);
   await assert.rejects(operator.unbond(node.address), /Unbond is gone/);
   console.log(`✓ validator registered as a candidate (epoch ${after.epoch}, ${after.blocks_until_next_epoch} blocks to the next one)`);

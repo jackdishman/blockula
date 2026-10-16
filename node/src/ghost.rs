@@ -43,7 +43,8 @@
 //!   and it can only stop the pool, never move funds). A pause belongs to the activation it was
 //!   voted under, so governance resumes the pool by switching the feature off and on again.
 //! - **Limits.** Ghost txs (50–52) up to `ghost_max_tx_bytes`, at most `ghost_max_block_bytes` of
-//!   them per block ([`BlockBudget`], consensus.rs), at most [`MAX_MEMPOOL_GHOST`] queued, and a
+//!   them per block ([`BlockBudget`], consensus.rs; both as the block's fee slot fixed them
+//!   `econ::FEE_LAG` blocks ahead), at most [`MAX_MEMPOOL_GHOST`] queued, and a
 //!   queued spend of a note is replaced only by a higher tip per byte ([`mempool_admit`]).
 //!
 //! State (namespaces `state::ns` 48–52, 53–55 reserved; the scalars are the META record `ghost`):
@@ -58,7 +59,6 @@
 //! | META `ghost` | [`GhostMeta`] | instance, frontier, anchor, pool, pause |
 
 use crate::chain::{check_validity, short, BlockInfo, Genesis, Journal, KeyRecord, Outcome, State, TipRate};
-use crate::params::ChainParams;
 use crate::state::codec::{decode, encode};
 use crate::state::{meta, ns, JMap, SubState, TMap, Table};
 use crate::types::*;
@@ -342,8 +342,10 @@ fn check_instance(state: &State, b: &GhostBundle) -> Result<()> {
 }
 
 /// The ghost share of one block (consensus `propose` and `verify`): ghost txs (tags 50–52) up to
-/// `ghost_max_tx_bytes` each and `ghost_max_block_bytes` together. That bounds the proofs a
-/// block makes every node verify (~7 per MiB, ~45 ms of one core).
+/// `ghost_max_tx_bytes` each and `ghost_max_block_bytes` together, as the block's fee slot fixed
+/// them `econ::FEE_LAG` blocks ahead (so proposers within the lag and every verifier agree on
+/// them, whenever a `ParamChange` executes). That bounds the proofs a block makes every node
+/// verify (~7 per MiB, ~45 ms of one core).
 #[derive(Clone, Copy, Debug)]
 pub struct BlockBudget {
     max_tx: u64,
@@ -351,8 +353,9 @@ pub struct BlockBudget {
 }
 
 impl BlockBudget {
-    pub fn new(p: &ChainParams) -> Self {
-        Self { max_tx: p.ghost_max_tx_bytes, left: p.ghost_max_block_bytes }
+    /// The budget of the block whose fee slot is `slot` (none: no ghost txs).
+    pub fn new(slot: Option<&crate::econ::FeeSlot>) -> Self {
+        slot.map_or(Self { max_tx: 0, left: 0 }, |s| Self { max_tx: s.ghost_max_tx_bytes, left: s.ghost_max_block_bytes })
     }
 
     /// Counts a tx of `bytes` wire bytes if it's a ghost tx (others don't use this budget). On

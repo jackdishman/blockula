@@ -358,6 +358,23 @@ tests:
         alertname: BlockulaValidatorTombstoned
         exp_alerts: []
 
+  # The beacon: this validator missed its reveal.
+  - interval: 1m
+    input_series:
+      - series: 'blockula_beacon_own_missed{job="blockula",instance="a",node="v1"}'
+        values: "0 0 1 1"
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: BlockulaBeaconRevealMissed
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: BlockulaBeaconRevealMissed
+        exp_alerts:
+          - exp_labels: { severity: warning, job: blockula, instance: a, node: v1 }
+            exp_annotations:
+              summary: "v1: this validator didn't reveal its randomness beacon secret this epoch (jailed for it)"
+              runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#jailed-or-tombstoned
+
   - interval: 1m
     input_series: []
     alert_rule_test:

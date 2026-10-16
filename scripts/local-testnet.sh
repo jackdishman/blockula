@@ -5,6 +5,9 @@
 # against a validator (with validator
 # 0 as the Season 0 admin, so the contribution pool's admin flow runs too) and against the full
 # node, restarts a validator mid-run, then checks every node agrees on hashes and state roots.
+# The chain has `blockula dev`'s short durations (`summon --dev-durations`), so the e2e's staking
+# runs through unbonding and withdrawal, and a ParamChange proposal passes the bootstrap council
+# (3 of the 4 validators) and executes after its timelock.
 #
 #   scripts/local-testnet.sh            # build release, run, tear down
 #   KEEP=1 scripts/local-testnet.sh     # leave the testnet running afterwards
@@ -32,7 +35,7 @@ trap cleanup EXIT
 echo "📁 $DIR"
 
 EPOCH=${EPOCH:-20}
-"$BIN" summon testnet --home "$DIR" --validators "$N" --epoch-blocks "$EPOCH" | tee "$DIR/summon.txt"
+"$BIN" summon testnet --home "$DIR" --validators "$N" --epoch-blocks "$EPOCH" --dev-durations | tee "$DIR/summon.txt"
 GHASH=$(grep -o 'genesis hash: [0-9a-f]*' "$DIR/summon.txt" | awk '{print $3}')
 addr() { node -e "console.log(require('$DIR/genesis.json').validators[$1].http_addr)"; }
 status() { curl -sf -m 3 "http://$1/api/status"; }
@@ -62,6 +65,22 @@ FULL="127.0.0.1:$FULL_PORT"
 
 echo "— SDK e2e against validator 2 (faucet + txs gossiped to whoever leads)"
 BLOCKULA_RPC="http://$V2" BLOCKULA_ADMIN_SEED="$(cat "$DIR/v0/validator.key")" npm test -w @blockula/sdk
+
+echo "— governance: a ParamChange the bootstrap council passes (⅔ of the validators vote aye)"
+proposals() { curl -sf "http://$V0/api/proposals?limit=1"; }
+before=$(curl -sf "http://$V0/api/params" | field '.params.jail_blocks')
+want=$((before + 7))
+"$BIN" gov propose param jail_blocks "$want" --title "local testnet: jail_blocks $want" --key "$DIR/v0/validator.key" --rpc "http://$V0"
+PID=$(proposals | field '.proposals[0].id')
+for i in 0 1 2; do "$BIN" gov vote "$PID" aye 1 --conviction 0 --key "$DIR/v$i/validator.key" --rpc "http://$V0"; done
+status=""
+for _ in $(seq 1 240); do
+  status=$(curl -sf "http://$V0/api/proposal/$PID" | field '.status')
+  [[ "$status" == "executed" || "$status" == "rejected" || "$status" == "failed" ]] && break; sleep 1
+done
+now=$(curl -sf "http://$V0/api/params" | field '.params.jail_blocks')
+[[ "$status" == "executed" && "$now" == "$want" ]] || { echo "❌ proposal #$PID: $status, jail_blocks $now (wanted $want)" >&2; curl -sf "http://$V0/api/proposal/$PID" >&2; exit 1; }
+echo "✓ proposal #$PID passed by the council and ran: jail_blocks $before → $now"
 
 echo "— onboarding a validator with the CLI"
 "$BIN" validator init --home "$DIR/v$N" --genesis "http://$V0" --genesis-hash "$GHASH" | tee "$DIR/init.txt"
@@ -137,7 +156,10 @@ BLOCKULA_HOME="$W" "$BIN" contrib fund 1 --rpc "http://$V0"
 echo "— fast join from a certified snapshot"
 wait_height "$V0" 106
 FAST="127.0.0.1:$((FULL_PORT + 1))"
-"$BIN" join --genesis "http://$V0" --genesis-hash "$GHASH" --home "$DIR/fast" --port "$((FULL_PORT + 1))" >"$DIR/fast.log" 2>&1 &
+# Dev durations shrink the weak-subjectivity period (half the evidence window, at most the
+# unbonding period) to a minute of blocks, so trusting only the genesis is "stale" by now: this
+# smoke test accepts that risk explicitly instead of fetching a checkpoint (OPERATIONS.md).
+"$BIN" join --genesis "http://$V0" --genesis-hash "$GHASH" --allow-stale-checkpoint --home "$DIR/fast" --port "$((FULL_PORT + 1))" >"$DIR/fast.log" 2>&1 &
 PIDS[$((N + 2))]=$!
 wait_height "$FAST" "$(status "$V0" | field .height)"
 from=$(status "$FAST" | field .fast_synced_from)

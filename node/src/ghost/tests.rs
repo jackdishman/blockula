@@ -762,15 +762,16 @@ fn size_limits() {
     assert!(err(n.submit(&tx)).contains("ghost_max_tx_bytes"));
     assert_eq!(n.block(vec![tx.clone()]), vec![false]);
     // The block budget, with the default limits and the shield's real size.
-    let p = ChainParams { ghost_max_tx_bytes: 256 << 10, ghost_max_block_bytes: 300 << 10, ..Default::default() };
+    let p = crate::params::ChainParams { ghost_max_tx_bytes: 256 << 10, ghost_max_block_bytes: 300 << 10, ..Default::default() };
     let size = tx.to_bytes().len();
-    let mut budget = BlockBudget::new(&p);
+    let slot = crate::econ::FeeSlot::floor(&p);
+    let mut budget = BlockBudget::new(Some(&slot));
     budget.take(&tx, size).unwrap();
     budget.take(&tx, size).unwrap();
     assert!(budget.take(&tx, size).unwrap_err().to_string().contains("ghost_max_block_bytes"));
     let transfer = Tx { action: Action::Transfer { to: alice.address(), amount: 1 }, ..tx.clone() };
     budget.take(&transfer, 60_000).unwrap();
-    assert!(BlockBudget::new(&p).take(&tx, (256 << 10) + 1).unwrap_err().to_string().contains("ghost_max_tx_bytes"));
+    assert!(BlockBudget::new(Some(&slot)).take(&tx, (256 << 10) + 1).unwrap_err().to_string().contains("ghost_max_tx_bytes"));
     // The codec: ghost txs up to MAX_GHOST_TX_BYTES, others to MAX_TX_BYTES.
     let mut big = tx.clone();
     bundle_mut(&mut big).proof = HexBytes(vec![1; blockula_ghost::MAX_PROOF_BYTES + 1]);

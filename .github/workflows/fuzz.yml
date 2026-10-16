@@ -52,7 +52,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [cblock, tx_json, tx_wire, snapshot_manifest, state_snapshot, sync_batch, epochs_registry, certificate, state_machine, ghost_tx]
+        target: [cblock, tx_json, tx_wire, snapshot_manifest, state_snapshot, sync_batch, epochs_registry, certificate, state_machine, ghost_tx, evidence]
     env:
       SECONDS_PER_TARGET: ${{ github.event.inputs.seconds || '300' }}
     steps:

@@ -293,3 +293,147 @@ fn withheld_votes_stall_only_without_a_quorum() {
     });
     std::fs::remove_dir_all(root).ok();
 }
+
+/// SEC-3: a leader that cites a wrong `exec_root` (lying about the state it executed, or having
+/// diverged from it) gets every proposal rejected, since honest verifiers check the cited root
+/// once they've executed that height. None of its blocks finalize while it does, the chain stays
+/// live (its views are nullified and skipped), its leader slots count as missed and, with a
+/// short downtime window, it's jailed and leaves the set. Every node agrees throughout.
+#[test]
+fn a_leader_citing_a_wrong_exec_root_is_rejected() {
+    let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_env("BLOCKULA_LOG").unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off"))).with_test_writer().try_init();
+    let (root, homes, genesis, seeds) = summon_with("badroot", EPOCH_BLOCKS, &[("downtime_window", 8), ("downtime_max_missed", 3), ("jail_blocks", 15)]);
+    let executor = deterministic::Runner::timed(Duration::from_secs(3_000));
+    executor.start(|context| async move {
+        let mut oracle = network(&context, &genesis, &[]).await;
+        let mut vals = vec![];
+        for (i, (home, seed)) in homes.iter().zip(&seeds).enumerate() {
+            vals.push(start(&context, &mut oracle, &genesis, i, 0, home.clone(), PrivateKey::from_seed_bytes(*seed)).await);
+        }
+        wait_for_height(&context, &vals, 3).await;
+        let liar = Keys::from_seed(seeds[2]).address();
+        vals[2].chain.lock().wrong_exec_root = true;
+        // Whatever it proposed before the switch may still finalize.
+        context.sleep(Duration::from_secs(3)).await;
+        let from = max_height(&vals) + 1;
+        let jailed = |vals: &[Val]| vals.iter().all(|v| v.chain.lock().state.staking.pools[&liar].jail.is_some());
+        wait_until(&context, "the lying leader's jailing", || jailed(&vals)).await;
+        wait_until(&context, "its exit from the set", || vals.iter().all(|v| v.chain.lock().state.validators[&liar].status != ValidatorStatus::Active)).await;
+        let to = max_height(&vals);
+        wait_for_height(&context, &vals, to).await;
+        assert!(to >= from + EPOCH_BLOCKS, "the chain stayed live ({from}..={to})");
+        assert_eq!(proposed_by(&vals, 2, from..=to), 0, "none of its blocks with a wrong exec_root was finalized");
+        {
+            let c = vals[0].chain.lock();
+            let l = &c.state.staking.liveness[&liar];
+            assert!(l.missed_total > 0 && c.state.staking.pools[&liar].jail.as_ref().unwrap().reason.contains("leader slots"), "its rejected proposals are missed slots: {l:?}");
+            // Its stake isn't slashed for lying (no evidence of it), only for the missed slots.
+        }
+        let h = assert_agree(&vals);
+        println!("✓ a leader citing a wrong exec_root: 0 of its blocks finalized in {from}..={to}, jailed for the missed slots; 4 nodes agree through {h}");
+    });
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// A tx from `from` with an explicit fee cap and tip (signed).
+fn paying(g: &Genesis, from: &Keys, nonce: u64, action: Action, fee: u64, tip: u64) -> Tx {
+    let (chain_id, genesis_hash) = ident(g);
+    let tx = Tx { chain_id, genesis_hash, from: from.address(), nonce, fee, tip, valid_until: VALID_UNTIL, action, memo: "load".into(), public_key: hex::encode(from.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+    tx.sign(from)
+}
+
+/// TOK-2's spam load test on the real consensus path. Blocks hold ~12 transfers
+/// (`max_block_bytes` = 64 KiB); three spammers queue 150 transfers at the floor's tip (0), far
+/// more than the next dozen blocks hold, and junk that doesn't pay the base fee isn't admitted at
+/// all. Honest users then send transfers with a modest tip, priced the way wallets price them
+/// (`econ::max_fee`, what `/api/fees` suggests, plus the tip): each confirms within
+/// `CONFIRM_BLOCKS` blocks of reaching the mempool, ahead of the backlog, and is charged its
+/// block's base fee plus its tip, never more than it offered. Full blocks raise the base fee.
+#[test]
+fn spam_doesnt_delay_honest_txs_with_a_competitive_tip() {
+    const CONFIRM_BLOCKS: u64 = 3;
+    const SPAM_PER_SENDER: u64 = 50;
+    let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_env("BLOCKULA_LOG").unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off"))).with_test_writer().try_init();
+    let (root, homes, genesis, seeds) = summon_with("spam", EPOCH_BLOCKS, &[("max_block_bytes", MAX_TX_BYTES as u64)]);
+    let executor = deterministic::Runner::timed(Duration::from_secs(3_000));
+    executor.start(|context| async move {
+        let mut oracle = network(&context, &genesis, &[]).await;
+        let mut vals = vec![];
+        for (i, (home, seed)) in homes.iter().zip(&seeds).enumerate() {
+            vals.push(start(&context, &mut oracle, &genesis, i, 0, home.clone(), PrivateKey::from_seed_bytes(*seed)).await);
+        }
+        wait_for_height(&context, &vals, 3).await;
+        // Honest users, funded by validator 3.
+        let funder = Keys::from_seed(seeds[3]);
+        let users: Vec<Keys> = (0..3u8).map(|i| Keys::from_seed([90 + i; 32])).collect();
+        for (n, u) in users.iter().enumerate() {
+            vals[3].chain.lock().submit(transfer(&genesis, &funder, n as u64, &u.address(), 100 * DROPS_PER_FANG)).unwrap();
+        }
+        wait_until(&context, "the users' funding", || users.iter().all(|u| vals.iter().all(|v| v.chain.lock().state.account(&u.address()).balance > 0))).await;
+
+        // Junk that doesn't pay the base fee never enters a mempool.
+        let spammers: Vec<Keys> = seeds[..3].iter().map(|s| Keys::from_seed(*s)).collect();
+        let sink = funder.address();
+        let floor = |size: u64| min_fee(size);
+        let cheap = paying(&genesis, &spammers[0], vals[0].chain.lock().next_nonce(&spammers[0].address()), Action::Transfer { to: sink.clone(), amount: 1 }, 1, 0);
+        assert!(vals[0].chain.lock().submit(cheap).unwrap_err().to_string().contains("fee"), "a tx under the base fee is refused");
+        // The spam: valid, paying up to 4× the floor if the base fee rises, no tip.
+        let spam_from = max_height(&vals);
+        let mut spam_ids = vec![];
+        for (i, s) in spammers.iter().enumerate() {
+            let mut c = vals[i].chain.lock();
+            let first = c.next_nonce(&s.address());
+            for n in first..first + SPAM_PER_SENDER {
+                let probe = paying(&genesis, s, n, Action::Transfer { to: sink.clone(), amount: 1 }, 0, 0);
+                let tx = paying(&genesis, s, n, Action::Transfer { to: sink.clone(), amount: 1 }, 4 * floor(probe.size()), 0);
+                spam_ids.push(c.submit(tx).unwrap());
+            }
+        }
+        let backlog_blocks = spam_ids.len() as u64 / 12;
+        println!("  {} spam txs queued at #{spam_from} (~{backlog_blocks} full blocks of backlog)", spam_ids.len());
+        wait_for_height(&context, &vals, spam_from + 2).await;
+
+        // Honest txs, one at a time while the backlog drains.
+        let mut report = vec![];
+        for (k, u) in users.iter().enumerate() {
+            let (sent_at, tx) = {
+                let c = vals[k].chain.lock();
+                let tip = 1_000;
+                let probe = paying(&genesis, u, 0, Action::Transfer { to: sink.clone(), amount: DROPS_PER_FANG }, 0, tip);
+                let fee = crate::econ::max_fee(&c.state, probe.size()) + tip;
+                (c.height(), paying(&genesis, u, 0, Action::Transfer { to: sink.clone(), amount: DROPS_PER_FANG }, fee, tip))
+            };
+            let id = vals[k].chain.lock().submit(tx.clone()).unwrap();
+            wait_until(&context, "the honest tx", || vals.iter().all(|v| v.chain.lock().has_tx(&id))).await;
+            let (at, pending_spam, base) = {
+                let c = vals[0].chain.lock();
+                let (at, _) = c.tx_location(&id).unwrap();
+                (at, spam_ids.iter().filter(|s| !c.has_tx(s)).count(), c.block(at).unwrap().base_fee.expect("executed blocks record their base fee").fee(tx.size()))
+            };
+            let charged = base + tx.tip;
+            assert!(at - sent_at <= CONFIRM_BLOCKS, "honest tx {k} sent at #{sent_at} confirmed at #{at}: more than {CONFIRM_BLOCKS} blocks");
+            assert!(charged <= tx.fee, "charged {charged}, more than the {} it offered", tx.fee);
+            assert!(pending_spam > 0, "the spam backlog was still pending when honest tx {k} confirmed");
+            report.push(format!("tx {k}: sent #{sent_at}, in #{at} ({} blocks), charged {charged} drops (offered {}, floor {}), {pending_spam} spam txs still waiting", at - sent_at, tx.fee, floor(tx.size()) + tx.tip));
+            let h = max_height(&vals);
+            wait_for_height(&context, &vals, h + 2).await;
+        }
+        // The backlog drains, and full blocks raised the base fee (of the blocks 17 after them:
+        // the slots their execution fixed).
+        wait_until(&context, "the spam to drain", || spam_ids.iter().all(|s| vals[0].chain.lock().has_tx(s))).await;
+        let c = vals[0].chain.lock();
+        let floor_rate = crate::econ::FeeSlot::floor(&c.state.chain_params).rate;
+        let charged = (spam_from..=c.height()).filter_map(|h| c.block(h)?.base_fee).map(|s| s.rate);
+        let peak = charged.chain(c.state.econ.fees.iter().map(|s| s.rate)).max().unwrap();
+        assert!(peak > floor_rate, "full blocks raise the base fee ({peak} vs the floor's {floor_rate})");
+        let full = (spam_from + 1..spam_from + backlog_blocks).filter_map(|h| c.block(h)).filter(|b| b.txs.iter().map(|t| t.size()).sum::<u64>() > MAX_TX_BYTES as u64 / 2).count();
+        assert!(full as u64 >= backlog_blocks / 2, "the spam filled blocks ({full})");
+        drop(c);
+        for r in &report {
+            println!("  {r}");
+        }
+        let h = assert_agree(&vals);
+        println!("✓ {} spam txs, 3 honest txs each confirmed within {CONFIRM_BLOCKS} blocks at their offered fee; base rate peaked at {peak} milli-drops/byte (floor {floor_rate}); 4 nodes agree through {h}", spam_ids.len());
+    });
+    std::fs::remove_dir_all(root).ok();
+}

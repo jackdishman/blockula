@@ -10,8 +10,9 @@
 //! action fails when it runs changes nothing and is marked failed.
 //!
 //! **Tally.** Quorum is `max(quorum_floor, quorum_bps × unlocked supply)` on the raw FANG voted
-//! (aye + nay), where the unlocked supply is what could vote: Σ `econ::voting_balance` over every
-//! account but the keyless system ones. A proposal passes on tokens if it reached quorum and its
+//! (aye + nay), where the unlocked supply is what could vote: what every account but the keyless
+//! system ones holds (liquid, staked at its pool's value, unbonding) less what vesting locks still
+//! hold of it ([`unlocked_supply`], O(vesting accounts) from running totals). A proposal passes on tokens if it reached quorum and its
 //! conviction-weighted ayes beat the nays: by a simple majority, or by `supermajority_bps` of the
 //! weight for upgrades, feature activations, issuance parameters and treasury spends above
 //! `treasury_large_bps` of the treasury. Until `bootstrap_end_height` it also passes if ⅔ of the active set approve
@@ -42,7 +43,9 @@
 //! **Distributions** move `total` from the community account into an escrow claimable until
 //! `claim_until` with Merkle proofs: BLAKE3 leaves over `(distribution_id, address, amount)`
 //! (the id is the proposal's), sorted-pair inner nodes ([`distribution_leaf`], [`merkle_parent`]).
-//! What's unclaimed returns to the community account after `claim_until`.
+//! What's unclaimed returns to the community account after `claim_until`. A claimant with
+//! nothing to pay the fee with pays it (and its new account's creation fee) out of the claim
+//! ([`claim_toward_fee`]).
 //!
 //! **Multisig (SF-11).** `MultisigCreate` makes an account M-of-N over its owner keys. From then
 //! on its owner keys may only sign `MultisigPropose` and `MultisigApprove` (admission refuses
@@ -105,7 +108,7 @@ pub struct CouncilVote {
 /// How a vote went, recorded when voting closes.
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Tally {
-    /// Σ `econ::voting_balance` (what could have voted) and the quorum it set.
+    /// The unlocked supply (what could have voted, [`unlocked_supply`]) and the quorum it set.
     pub unlocked: u128,
     pub quorum: u128,
     pub quorum_reached: bool,
@@ -252,8 +255,7 @@ pub struct Governance {
     pub open_proposals: BTreeSet<u64>,
     pub open_distributions: BTreeSet<u64>,
     /// `(epoch, unlocked supply)`: quorums in an epoch use the unlocked supply as of the first
-    /// vote that closed in it, so the O(accounts) sum runs at most once an epoch, however many
-    /// proposals close.
+    /// vote that closed in it, however many proposals close.
     pub quorum_base: Option<(u64, u128)>,
 }
 
@@ -546,12 +548,46 @@ fn vote(state: &mut State, j: &mut Journal, sender: &str, signer: &str, key: &Ke
     Ok(())
 }
 
-/// What could vote at `height`: Σ `econ::voting_balance` over every account except the keyless
-/// system accounts. O(accounts): `end_block` computes it at most once an epoch (`quorum_base`).
+/// The keyless system accounts, which never vote (and never stake).
+fn system_accounts(prefix: &str) -> [String; 5] {
+    [crate::chain::treasury(prefix), community(prefix), crate::chain::endowment(prefix), crate::chain::bootstrap_delegation(prefix), crate::poc::pool_address(prefix)]
+}
+
+/// What could vote at `height` (the quorum base): the FANG every account but the keyless system
+/// ones holds, liquid, in stake pools (at the pools' value) or unbonding, less what vesting
+/// locks still hold of it. O(vesting accounts), not O(accounts): balances, pool stake and
+/// unbonding are running totals their maps keep (`chain::AccountTotals`, `staking::PoolStake`,
+/// `staking::UnbondingTotal`), and only genesis allocations carry vesting locks.
+/// `check_invariants` compares it with [`unlocked_supply_by_walk`].
 pub fn unlocked_supply(state: &State, height: u64) -> u128 {
-    let prefix = state.params.prefix();
-    let system: BTreeSet<String> = [crate::chain::treasury(prefix), community(prefix), crate::chain::endowment(prefix), crate::chain::bootstrap_delegation(prefix), crate::poc::pool_address(prefix)].into();
-    state.accounts.keys().filter(|a| !system.contains(*a)).map(|a| crate::econ::voting_balance(state, a, height) as u128).sum()
+    let system = system_accounts(state.params.prefix());
+    let system_balances: u128 = system.iter().filter_map(|a| state.accounts.get(a)).map(|a| a.balance as u128).sum();
+    let held = state.accounts.total() - system_balances + state.staking.pools.total() + state.staking.entries.total();
+    let vesting: u128 = state.accounts.indexed().iter().filter(|a| !system.contains(*a)).map(|a| still_vesting(state, a, height)).sum();
+    held - vesting
+}
+
+/// What `account`'s vesting locks still hold at `height`, up to what it holds (fees and slashes
+/// may have taken locked tokens): the part of its holdings that can't vote yet.
+fn still_vesting(state: &State, account: &str, height: u64) -> u128 {
+    let Some(a) = state.accounts.get(account) else { return 0 };
+    let unvested = a.unvested_at(height);
+    if unvested == 0 {
+        return 0;
+    }
+    let (staked, unbonding) = crate::staking::holdings(state, account);
+    (unvested as u128).min(a.balance as u128 + staked as u128 + unbonding as u128)
+}
+
+/// [`unlocked_supply`] from scratch, walking every account, pool and entry: O(state), for checks.
+pub fn unlocked_supply_by_walk(state: &State, height: u64) -> u128 {
+    let system = system_accounts(state.params.prefix());
+    let accounts = state.accounts.iter().filter(|(a, _)| !system.contains(*a));
+    let liquid: u128 = accounts.clone().map(|(_, acct)| acct.balance as u128).sum();
+    let vesting: u128 = accounts.map(|(a, _)| still_vesting(state, a, height)).sum();
+    let staked: u128 = state.staking.pools.values().map(|p| p.stake as u128).sum();
+    let unbonding: u128 = state.staking.entries.values().map(|e| if let crate::staking::Entry::Unbonding { amount, .. } = e { *amount as u128 } else { 0 }).sum();
+    liquid + staked + unbonding - vesting
 }
 
 /// Whether a kind needs `supermajority_bps` of the weight: upgrades, feature activations
@@ -827,13 +863,14 @@ pub fn build_distribution(distribution_id: u64, entries: &[(String, u64)]) -> Re
     Ok((level[0], proofs))
 }
 
-fn claim_distribution(state: &mut State, j: &mut Journal, sender: &str, id: u64, amount: u64, proof: &[String], height: u64) -> Result<()> {
+/// Everything that decides whether `sender` may claim `amount` from distribution `id` at
+/// `height`: open, not claimed yet, the proof leads to the stored root, enough left.
+fn check_claim(state: &State, sender: &str, id: u64, amount: u64, proof: &[String], height: u64) -> Result<()> {
     let d = state.governance.distributions.get(&id).ok_or_else(|| anyhow!("no distribution #{id}"))?;
     if d.closed_at.is_some() || height > d.claim_until {
         bail!("distribution #{id} closed at block {}", d.claim_until);
     }
-    let ck = IdKey::new(id, sender);
-    if state.governance.distribution_claims.contains_key(&ck) {
+    if state.governance.distribution_claims.contains_key(&IdKey::new(id, sender)) {
         bail!("{} already claimed from distribution #{id}", short(sender));
     }
     let siblings: Vec<[u8; 32]> = proof.iter().map(|h| hex::decode(h).ok().and_then(|b| b.try_into().ok())).collect::<Option<_>>().ok_or_else(|| anyhow!("proof hashes must be 32 bytes of hex"))?;
@@ -844,6 +881,24 @@ fn claim_distribution(state: &mut State, j: &mut Journal, sender: &str, id: u64,
     if amount > left {
         bail!("distribution #{id} has only {} left", fmt_fang(left));
     }
+    Ok(())
+}
+
+/// What a `ClaimDistribution` tx would credit its sender at `height`, if the claim checks out
+/// ([`check_claim`]): admission counts it toward the fee of a claimant that can't pay it yet (a
+/// new or empty account), and the fee phase then runs the claim first (`State::apply_j`). An
+/// invalid claim is no help, so it stays unadmittable rather than free.
+pub fn claim_toward_fee(state: &State, tx: &Tx, sender: &str, height: u64) -> Result<u64> {
+    let Action::ClaimDistribution { distribution_id, amount, proof } = &tx.action else { bail!("only a distribution claim pays its fee out of what it claims") };
+    check_claim(state, sender, *distribution_id, *amount, proof, height)?;
+    Ok(*amount)
+}
+
+/// Runs a checked `ClaimDistribution` (the action, or the fee phase of a claim paying its own
+/// fee).
+pub(crate) fn claim_distribution(state: &mut State, j: &mut Journal, sender: &str, id: u64, amount: u64, proof: &[String], height: u64) -> Result<()> {
+    check_claim(state, sender, id, amount, proof, height)?;
+    let ck = IdKey::new(id, sender);
     j.governance.distributions.touch(&state.governance.distributions, &id);
     let d = state.governance.distributions.get_mut(&id).expect("checked above");
     d.claimed += amount;
@@ -1036,6 +1091,14 @@ pub fn check_invariants(state: &State) -> Result<()> {
     for id in &g.open_distributions {
         ensure!(g.distributions.contains_key(id), "open distribution #{id} doesn't exist");
     }
+    // The quorum base counts all pool stake and every unbonding entry as voters' (no keyless
+    // account stakes), and its running totals match a walk over the state.
+    for a in system_accounts(state.params.prefix()) {
+        ensure!(crate::staking::delegations_of(state, &a).is_empty() && crate::staking::entries_of_account(state, &a).is_empty(), "keyless system account {a} holds stake");
+    }
+    let height = crate::econ::now(state);
+    let (fast, walked) = (unlocked_supply(state, height), unlocked_supply_by_walk(state, height));
+    ensure!(fast == walked, "the unlocked supply's running total is {fast}, but a walk over the state gives {walked}");
     Ok(())
 }
 

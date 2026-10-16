@@ -816,12 +816,26 @@ pub fn max_hunt_blocks(block_time_ms: u64) -> u64 {
     365 * 86_400 * 1000 / block_time_ms.max(1)
 }
 
+/// What `State::accounts` keeps up to date as it changes: Σ balance, and the accounts holding a
+/// vesting lock (only genesis allocations create one). Governance's quorum base reads both
+/// instead of walking every account (`governance::unlocked_supply`).
+pub struct AccountTotals;
+
+impl crate::state::Aggregate<Account> for AccountTotals {
+    fn weight(a: &Account) -> u128 {
+        a.balance as u128
+    }
+    fn indexed(a: &Account) -> bool {
+        a.locks.iter().any(|l| matches!(l.amount, LockAmount::Vesting { .. }))
+    }
+}
+
 /// The chain state. Maps are `TMap`s: cloning a `State` is O(1) (structure is shared), and
 /// changed keys are tracked so `commit_block` updates the root from just those. How it maps to
 /// records and the root is in `state/mod.rs`.
 #[derive(Clone, Default)]
 pub struct State {
-    pub accounts: TMap<String, Account>,
+    pub accounts: TMap<String, Account, AccountTotals>,
     pub names: TMap<String, NameRecord>,
     pub supply: u64,
     pub burned: u64,
@@ -1116,7 +1130,17 @@ impl State {
             bail!("bad nonce: expected {}, got {}", acct.nonce, tx.nonce);
         }
         if acct.balance < charge {
-            bail!("insufficient balance for the fee: has {}, needs {}", fmt_fang(acct.balance), fmt_fang(charge));
+            // A distribution claim may pay its fee, and the creation fee of the account it opens,
+            // out of what it claims, once the claim itself checks out (governance.rs).
+            let claim = match crate::governance::claim_toward_fee(self, tx, &sender, height) {
+                Ok(amount) => amount,
+                Err(e) if matches!(tx.action, Action::ClaimDistribution { .. }) => bail!("insufficient balance for the fee: has {}, needs {}, and the claim can't pay it: {e}", fmt_fang(acct.balance), fmt_fang(charge)),
+                Err(_) => bail!("insufficient balance for the fee: has {}, needs {}", fmt_fang(acct.balance), fmt_fang(charge)),
+            };
+            let need = charge.saturating_add(self.creation_fee_for(&sender));
+            if acct.balance.saturating_add(claim) < need {
+                bail!("insufficient balance for the fee: has {} and claims {}, needs {}", fmt_fang(acct.balance), fmt_fang(claim), fmt_fang(need));
+            }
         }
         if let KeyRole::Session { limit, period_blocks, expires_at } = key.role {
             if height > expires_at {
@@ -1166,6 +1190,27 @@ impl State {
         }
         let (sender, signer, key, charge) = self.admit(tx, chain_id, height, full_checks)?;
         let base = charge - tx.tip;
+        // A distribution claim its sender can't pay for pays out of the claim (admission checked
+        // the claim covers the fee and the new account's creation fee): the claim runs first, here.
+        let prepaid = self.account(&sender).balance < charge;
+        if prepaid {
+            let Action::ClaimDistribution { distribution_id, amount, proof } = &tx.action else { bail!("insufficient balance for the fee") };
+            let opening = self.creation_fee_for(&sender);
+            let mut cj = Journal::default();
+            let claimed = crate::governance::claim_distribution(self, &mut cj, &sender, *distribution_id, *amount, proof, height).and_then(|()| {
+                if opening > 0 {
+                    self.j_debit(&mut cj, &sender, opening)?;
+                    self.j_burn(&mut cj, opening);
+                }
+                ensure!(self.account(&sender).balance >= charge, "insufficient balance for the fee, even with the claim");
+                Ok(())
+            });
+            if let Err(e) = claimed {
+                self.rollback(cj);
+                return Err(e);
+            }
+            j.absorb(cj);
+        }
         // Fee phase (always sticks once admitted): the charge is debited (not the whole `fee`),
         // its base part burned and the tip paid to the proposer.
         if let KeyRole::Session { period_blocks, .. } = key.role {
@@ -1188,7 +1233,9 @@ impl State {
         // account may end up moving tokens its locks hold (fees above may: they're paid first).
         let free = crate::econ::free(self, &sender, height);
         let mut aj = Journal::default();
-        let result = self.apply_action(&mut aj, tx, &sender, &signer, &key, height).and_then(|()| {
+        // A prepaid claim already ran.
+        let action = if prepaid { Ok(()) } else { self.apply_action(&mut aj, tx, &sender, &signer, &key, height) };
+        let result = action.and_then(|()| {
             let touched = aj.touched_accounts();
             crate::econ::charge_new_accounts(self, &mut aj, &touched, &sender, &signer, &key)?;
             crate::econ::check_locks(self, &touched, &sender, free, height)
@@ -1638,12 +1685,14 @@ pub const PRUNE_DAYS: u64 = 2;
 const REPLAY_SYNC_EVERY: u64 = 1_000;
 
 /// The fewest heights a pruning node keeps: both kept snapshots' manifests (checkpoint +
-/// certifying blocks), every ancestor a proposal may still cite, and a tx's whole validity
-/// window (so the tx index still catches a replayed tx). The validity window is a governance
-/// parameter (`max_tx_validity_blocks`), so this is re-read from the state at every commit.
+/// certifying blocks) and their epoch anchor (the last block of the epoch before, up to an epoch
+/// before the snapshot: `snapshot::anchor_height`), every ancestor a proposal may still cite, and
+/// a tx's whole validity window (so the tx index still catches a replayed tx). The validity
+/// window is a governance parameter (`max_tx_validity_blocks`), so this is re-read from the
+/// state at every commit.
 pub fn min_keep_blocks(state: &State) -> u64 {
     use crate::snapshot::{CHECKPOINT_DELAY, CHECKPOINT_INTERVAL};
-    2 * CHECKPOINT_INTERVAL + 2 * CHECKPOINT_DELAY + crate::consensus::MAX_EXEC_LAG + state.chain_params.max_tx_validity_blocks
+    state.params.epoch_blocks.max(2) + 2 * CHECKPOINT_INTERVAL + 2 * CHECKPOINT_DELAY + crate::consensus::MAX_EXEC_LAG + state.chain_params.max_tx_validity_blocks
 }
 
 /// What a pruning validator keeps by default: `PRUNE_DAYS` of blocks at this block time.
@@ -1736,6 +1785,10 @@ pub struct Chain {
     /// Byzantine leader filling blocks it doesn't pay for (CV-5).
     #[cfg(test)]
     pub junk_proposals: bool,
+    /// Tests: this node's proposals cite a wrong `exec_root` (a Byzantine leader lying about the
+    /// state it executed, or one that diverged).
+    #[cfg(test)]
+    pub wrong_exec_root: bool,
 }
 
 /// The block logs and the state database. One executor writes at a time; the consensus path
@@ -2200,6 +2253,8 @@ impl Chain {
             halt: Default::default(),
             #[cfg(test)]
             junk_proposals: false,
+            #[cfg(test)]
+            wrong_exec_root: false,
         };
         chain.replay_logs()?;
         if rebuilt_epochs {
@@ -2411,6 +2466,30 @@ impl Chain {
             return Some((b.height, b.txs.iter().position(|t| t.id() == id)?));
         }
         self.snap.tx(&hash32(id).ok()?).ok()?
+    }
+
+    /// Keeps a certificate that arrived after its block, if its block is one whose certificate
+    /// stays on disk (an epoch's last block, or a checkpoint still in the window) and it isn't
+    /// stored yet: execution stores the certificates consensus hands it, and this fills in what
+    /// it missed (`consensus::fill_late_certs` reads them from marshal), so the epoch anchor of a
+    /// fast-sync manifest stays servable. `digest` must be the executed block's hash. The
+    /// database write holds the writer's lock, not the chain's. Returns whether it stored it.
+    pub fn store_late_cert(chain: &parking_lot::Mutex<Chain>, height: u64, digest: &str, cert: Vec<u8>) -> Result<bool> {
+        let (store, writer) = {
+            let c = chain.lock();
+            let kept = c.state.params.is_boundary(height) || (height.is_multiple_of(CERT_CHECKPOINT) && height >= c.point.pruned_below);
+            if height > c.height() || !kept || c.view().cert(height).is_some() {
+                return Ok(false);
+            }
+            ensure!(c.hash_at(height).as_deref() == Some(digest), "the certificate at #{height} is for another block");
+            (c.store.clone(), c.writer.clone())
+        };
+        {
+            let _commits = writer.lock();
+            store.put_cert(height, &cert)?;
+        }
+        chain.lock().disk.remember_cert(height, cert);
+        Ok(true)
     }
 
     /// Keeps a certificate that arrived after its block: in memory for recent heights, on disk at
@@ -5074,6 +5153,72 @@ mod persistence {
         let c = Chain::open(&h).unwrap();
         assert_eq!((c.state.root(), c.height()), (root, height));
         assert_eq!(c.replayed, height - 700, "rebuilt from snapshot 700, then the logged blocks after it");
+        drop(c);
+        fs::remove_dir_all(h).ok();
+    }
+
+    /// The smallest window still holds the epoch anchor of every manifest the node serves, at
+    /// the worst point: from the end of an epoch, the newest snapshot (late in that epoch) needs
+    /// the previous epoch's last block, an epoch back. Minute blocks make the tx validity window
+    /// small (60 blocks), so the epoch (300 blocks) is what the window has to cover.
+    #[test]
+    fn the_smallest_window_keeps_the_epoch_anchor() {
+        let h = home("prune-anchor");
+        Chain::summon(&h, &SummonOpts { block_time_ms: 60_000, epoch_blocks: 300, ..SummonOpts::new("prune-anchor", 1) }).unwrap();
+        let mut c = Chain::open_with(&h, &OpenOpts { segment_heights: Some(50) }).unwrap();
+        c.set_pruning(Some(1));
+        let keep = min_keep_blocks(&c.state);
+        assert!(keep >= 300 + 2 * crate::snapshot::CHECKPOINT_INTERVAL + crate::snapshot::CHECKPOINT_DELAY, "{keep}");
+        // Consensus hands over certificates for epoch ends and checkpoints' certifying blocks.
+        while c.height() < 899 {
+            c.produce_block_with(vec![]).unwrap();
+            let height = c.height();
+            if c.state.params.is_boundary(height) || crate::snapshot::certifies(height).is_some() {
+                c.store_cert(height, vec![(height % 251) as u8]).unwrap();
+            }
+        }
+        let t = Instant::now();
+        while !crate::snapshot::list(&h).contains(&800) {
+            assert!(t.elapsed().as_secs() < 30, "no snapshot at 800");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let v = c.view();
+        assert!(v.history_from() > 299, "the node prunes: history from #{}", v.history_from());
+        let m = crate::snapshot::build_manifest(&c.live).expect("a manifest with its anchor");
+        assert_eq!(m.height, 800);
+        let anchor = m.anchor.expect("snapshot 800 is in epoch 2, after #599");
+        assert_eq!(anchor.finalization, hex::encode([(599 % 251) as u8]));
+        assert!(v.cblock(599).is_some());
+        drop(v);
+        drop(c);
+        fs::remove_dir_all(h).ok();
+    }
+
+    /// A certificate execution didn't get (consensus missed it) is kept afterwards for the
+    /// heights that keep one: an epoch's last block, a checkpoint. Only for the block executed
+    /// there, once, and not for heights that keep none.
+    #[test]
+    fn late_certificates_fill_in_epoch_ends() {
+        let h = home("late-cert");
+        Chain::summon(&h, &SummonOpts { epoch_blocks: 10, ..SummonOpts::new("late-cert", 1) }).unwrap();
+        let chain = parking_lot::Mutex::new(Chain::open(&h).unwrap());
+        while chain.lock().height() < 25 {
+            chain.lock().produce_block_with(vec![]).unwrap();
+        }
+        let hash = |height: u64| chain.lock().hash_at(height).unwrap();
+        assert_eq!(chain.lock().cert(19), None);
+        assert!(Chain::store_late_cert(&chain, 19, &hash(18), vec![19]).unwrap_err().to_string().contains("another block"));
+        assert!(!Chain::store_late_cert(&chain, 15, &hash(15), vec![15]).unwrap(), "#15 keeps no certificate");
+        assert!(!Chain::store_late_cert(&chain, 29, &"00".repeat(32), vec![29]).unwrap(), "not executed yet");
+        assert!(Chain::store_late_cert(&chain, 19, &hash(19), vec![19]).unwrap());
+        assert!(!Chain::store_late_cert(&chain, 19, &hash(19), vec![1, 9]).unwrap(), "already kept");
+        assert_eq!(chain.lock().cert(19), Some(vec![19]));
+        // On disk: the next published snapshot of the store has it, and so does a restart.
+        chain.lock().produce_block_with(vec![]).unwrap();
+        assert_eq!(chain.lock().view().snap.cert(19).unwrap(), Some(vec![19]));
+        drop(chain);
+        let c = Chain::open(&h).unwrap();
+        assert_eq!(c.view().snap.cert(19).unwrap(), Some(vec![19]));
         drop(c);
         fs::remove_dir_all(h).ok();
     }
