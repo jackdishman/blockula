@@ -38,6 +38,7 @@ mod sim;
 use anyhow::Result;
 use chain::{Chain, SummonOpts};
 use clap::{Args, Parser, Subcommand};
+use cli_net::blockula_dir;
 use node::NetOpts;
 use std::path::PathBuf;
 
@@ -257,10 +258,6 @@ enum Cmd {
         #[command(subcommand)]
         cmd: release_cli::ReleaseCmd,
     },
-}
-
-fn blockula_dir() -> PathBuf {
-    std::env::var_os("BLOCKULA_HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap()).join(".blockula"))
 }
 
 fn net_opts(net: Net, http_port: Option<u16>, p2p_preset: Option<String>, ephemeral_p2p: bool) -> NetOpts {

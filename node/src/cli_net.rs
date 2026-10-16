@@ -215,6 +215,12 @@ pub fn effective_pin(net: &Network, remembered: Option<Pin>) -> Pin {
     Pin { chain_id: net.pin.chain_id.clone().or(r.chain_id), genesis_hash: net.pin.genesis_hash.clone().or(r.genesis_hash), prefix: net.pin.prefix.clone().or(r.prefix) }
 }
 
+/// The CLI's directory: `$BLOCKULA_HOME`, else `~/.blockula` (the wallet, `known-chains.json`,
+/// dev homes).
+pub fn blockula_dir() -> PathBuf {
+    std::env::var_os("BLOCKULA_HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap()).join(".blockula"))
+}
+
 /// Chains remembered on first use, by network and node URL (`known-chains.json`, shared with the
 /// MCP: entries are keyed `"<network> <url>"`).
 pub struct KnownChains {

@@ -251,7 +251,7 @@ pub fn run(cmd: ValidatorCmd) -> Result<()> {
             let action = Action::RegisterValidator { consensus_key: hex::encode(keys.public_key()), p2p_addr: addrs.p2p_addr, http_addr: addrs.http_addr, bond, pop };
             // The node must be on the home's chain: its genesis pins it.
             let pin = ChainPin { network: None, chain_id: Some(g.chain_id.clone()), genesis_hash: Some(crate::checkpoints::genesis_hash(&g)) };
-            let tx = rt.block_on(async { send(&Remote::connect_in(&crate::blockula_dir(), &rpc, &pin).await?, &keys, &me, action).await })?;
+            let tx = rt.block_on(async { send(&Remote::connect_in(&crate::cli_net::blockula_dir(), &rpc, &pin).await?, &keys, &me, action).await })?;
             println!("✓ {}", tx["summary"].as_str().unwrap_or_default());
             println!("  It joins the active set at an epoch boundary if its stake ranks in the top max_validators (newcomers are at most a third of a set).");
             println!("  Others can back it: blockula stake delegate {me} <FANG> --key <key file> --rpc {rpc}");
@@ -261,7 +261,7 @@ pub fn run(cmd: ValidatorCmd) -> Result<()> {
         ValidatorCmd::Commission { bps, key, rpc, from, pin } => {
             let keys = load_seed(&key)?;
             let tx = rt()?.block_on(async {
-                let remote = Remote::connect(&crate::blockula_dir(), &rpc, &pin).await?;
+                let remote = Remote::connect(&crate::cli_net::blockula_dir(), &rpc, &pin).await?;
                 let from = match from {
                     Some(f) => remote.resolve(&f).await?,
                     None => remote.address(&keys),
@@ -307,7 +307,7 @@ pub fn run(cmd: ValidatorCmd) -> Result<()> {
 fn admin(a: AdminArgs, action: impl FnOnce(String) -> Action) -> Result<()> {
     let keys = load_seed(&a.key)?;
     let tx = rt()?.block_on(async {
-        let remote = Remote::connect(&crate::blockula_dir(), &a.rpc, &a.pin).await?;
+        let remote = Remote::connect(&crate::cli_net::blockula_dir(), &a.rpc, &a.pin).await?;
         let from = match a.from {
             Some(f) => remote.resolve(&f).await?,
             None => remote.address(&keys),
