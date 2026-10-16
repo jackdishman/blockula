@@ -921,10 +921,10 @@ fn sweep_multisig_proposals(state: &mut State, height: u64) {
 
 /// Removes multisig proposal `id` of `account` (expired, or run).
 fn drop_multisig_proposal(state: &mut State, j: &mut Journal, account: &str, id: u64) {
-    if let Some(mut m) = state.governance.multisigs.get(account).cloned() {
-        if m.pending.remove(&id) {
-            put_multisig(state, j, account, m);
-        }
+    if let Some(mut m) = state.governance.multisigs.get(account).cloned()
+        && m.pending.remove(&id)
+    {
+        put_multisig(state, j, account, m);
     }
     put_multisig_proposal(state, j, None, id);
 }
