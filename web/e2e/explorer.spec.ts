@@ -139,3 +139,17 @@ test("a node without the v1 endpoints says so", async ({ page }) => {
   await page.goto(`${ORIGIN}/#/params`);
   await expect(page.locator("#app")).toContainText("This node doesn't serve its parameters yet");
 });
+
+test("route ids never become markup, even under Object.prototype names (F64)", async ({ page }) => {
+  const payload = encodeURIComponent('<img src=x onerror="window.__pwned=3">');
+  await open(page, `#/constructor/${payload}`);
+  const app = page.locator("#app");
+  // The home view renders instead of the id.
+  await expect(app).toContainText("Latest blocks");
+  await expect(app.locator("img")).toHaveCount(0);
+  for (const view of ["__proto__", "toString", "hasOwnProperty", "valueOf"]) {
+    await page.goto(`${ORIGIN}/#/${view}/${payload}`);
+    await expect(app.locator("img")).toHaveCount(0);
+  }
+  expect(await page.evaluate(() => (window as unknown as { __pwned?: number }).__pwned)).toBeUndefined();
+});

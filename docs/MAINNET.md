@@ -645,10 +645,11 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
 - **Effort:** S–M.
 - ✅ **Done (wave 1):** docs/OPERATIONS.md (hosting, hardware, bandwidth, disk sizing, ports and firewall, time, sentries, keys, upgrades, incidents, runbooks).
 
-**SF-15. The explorer has no CSP.**
+✅ **SF-15. The explorer has no CSP.**
 - **Missing:** the explorer is served from the API's origin (`api.rs:259`). It escapes on-chain strings consistently (`esc()` in `explorer.html`), but sets no CSP.
 - **Done when:** the node serves the explorer with a CSP.
 - **Effort:** S.
+- ✅ **Done (audit F64):** the hash router resolved `#/constructor/…` to `Object`, which handed the route id to `innerHTML` unescaped (a DOM XSS on the node's origin). Routes now resolve against the explorer's own views only and only strings reach `innerHTML`; `GET /` sends a CSP that runs only the explorer's inline script (by its SHA-256), fetches from its own origin only and can't be framed (`explorer_routes_only_to_its_own_views` runs the page script under Node, `explorer_is_served_with_a_script_hash_csp`, and the wallet e2e's `explorer.spec.ts`).
 
 ## 4. Fine to ship after launch
 
