@@ -507,6 +507,298 @@ fn redelegated_stake_stays_slashable_and_cant_hop() {
     t.block();
 }
 
+/// Audits F05/F07: a validator's key (its operator's, or a thief's) can sign as many "faults" as
+/// it likes, at views consensus never reached or at real ones. The pool and its exits answer
+/// once: one slash and a tombstone, and the reporter's reward never exceeds what the owner lost,
+/// so reporting yourself from a puppet account can't pay. A fault from an earlier epoch, reported
+/// after a later one, reaches only the stake that left in between.
+#[test]
+fn a_double_signer_is_slashed_once_however_many_faults_it_signs() {
+    let (whale, puppet) = (keys(200), keys(201));
+    let mut t = Setup { accounts: vec![(whale.address(), 600_000 * FANG, None), (puppet.address(), 100 * FANG, None)], ..Default::default() }.start();
+    let v = vaddr(0);
+    t.ok(&whale, Action::Delegate { validator: v.clone(), amount: 500_000 * FANG });
+    t.block();
+    // In epoch 0 the whale starts taking 100,000 out.
+    t.ok(&whale, Action::Undelegate { validator: v.clone(), shares: 100_000 * FANG });
+    t.finish_epoch();
+    t.blocks(3);
+    let h = t.height;
+    // Views far beyond what the epoch reached are made up: never evidence (not yet, in this one).
+    let far = double_notarize(&t, 0, 1, 1_000_000_000_000);
+    let err = verify_evidence(&t.st, CHAIN, &genesis_hash(), &hex::decode(&far).unwrap(), h).unwrap_err().to_string();
+    assert!(err.contains("beyond any view"), "{err}");
+    assert_eq!(evidence_status(&t.st, CHAIN, &genesis_hash(), &hex::decode(&far).unwrap(), h), EvidenceStatus::NotYet);
+    let far0 = double_notarize(&t, 0, 0, 1_000_000_000_000);
+    assert_eq!(evidence_status(&t.st, CHAIN, &genesis_hash(), &hex::decode(&far0).unwrap(), h), EvidenceStatus::Never);
+    assert!(t.fails(&puppet, Action::ReportEquivocation { evidence: far }).contains("beyond any view"));
+    // A real-range fault in epoch 1: 5% of the pool (and of exits since epoch 1: none).
+    let (pool0, self0, whale_out0) = (t.stake(&v), self_bond(&t.st, &v), holdings(&t.st, &whale.address()));
+    let puppet0 = t.balance(&puppet.address());
+    let report = t.tx_from(&puppet, &puppet.address(), Action::ReportEquivocation { evidence: double_notarize(&t, 0, 1, 2) });
+    assert_eq!(t.apply(&report).unwrap(), Outcome::Applied);
+    assert_eq!(t.stake(&v), pool0 - pool0 / 20);
+    let owner_lost = self0 - self_bond(&t.st, &v);
+    // 10% of the cut would be 2,050 FANG; the owner lost 500: the puppet gets 500.
+    assert_eq!(t.balance(&puppet.address()), puppet0 - report.charge().unwrap() + owner_lost);
+    assert!(owner_lost < bps_of(pool0 / 20, 1_000));
+    assert_eq!(holdings(&t.st, &whale.address()).1, whale_out0.1, "the epoch-0 exit isn't epoch 1's");
+    // Ninety-nine more faults in that epoch, or later ones: refused, nothing more taken.
+    let pool1 = t.stake(&v);
+    for view in 3..6 {
+        assert!(t.fails(&puppet, Action::ReportEquivocation { evidence: double_notarize(&t, 0, 1, view) }).contains("already slashed"));
+    }
+    assert_eq!(t.stake(&v), pool1);
+    let later = double_notarize(&t, 0, 1, 7);
+    assert_eq!(evidence_status(&t.st, CHAIN, &genesis_hash(), &hex::decode(&later).unwrap(), h), EvidenceStatus::Punished);
+    // An epoch-0 fault: only the stake that left during epoch 0 (the whale's 100,000) answers
+    // for it now; the pool already did. The owner lost nothing more, so no reward.
+    let puppet1 = t.balance(&puppet.address());
+    let report = t.tx_from(&puppet, &puppet.address(), Action::ReportEquivocation { evidence: double_notarize(&t, 0, 0, 2) });
+    assert_eq!(t.apply(&report).unwrap(), Outcome::Applied);
+    assert_eq!(t.stake(&v), pool1);
+    assert_eq!(holdings(&t.st, &whale.address()).1, whale_out0.1 - whale_out0.1 / 20);
+    assert_eq!(t.balance(&puppet.address()), puppet1 - report.charge().unwrap());
+    assert!(t.fails(&puppet, Action::ReportEquivocation { evidence: double_notarize(&t, 0, 0, 3) }).contains("already slashed"));
+    t.block();
+}
+
+/// Audit F60: a punished fault stays punished. Its record lives as long as its epoch's set (so
+/// governance moving `evidence_max_age_epochs` can't bring the epoch back without it), and even
+/// without the record the pool refuses evidence its slash already covered.
+#[test]
+fn punished_faults_stay_punished_whatever_the_window() {
+    let reporter = keys(203);
+    let mut t = Setup { accounts: vec![(reporter.address(), 1_000 * FANG, None)], ..Default::default() }.start();
+    t.finish_epoch();
+    t.blocks(2);
+    let evidence = double_notarize(&t, 1, 1, 2);
+    t.ok(&reporter, Action::ReportEquivocation { evidence: evidence.clone() });
+    let (key, set1) = (pkey(&vaddr(1), 1, 2), t.set(1));
+    while t.st.active_sets.contains_key(&1) {
+        assert!(t.st.staking.punished.contains_key(&key), "pruned before its set, at height {}", t.height);
+        t.finish_epoch();
+    }
+    assert!(!t.st.staking.punished.contains_key(&key), "pruned with its set");
+    // Governance widens the window and the set is still there (a state the old schedule allowed):
+    // the same evidence again takes nothing.
+    let mut st = t.st.clone();
+    st.chain_params.evidence_max_age_epochs = 1_000;
+    st.active_sets.insert(1, set1);
+    let pool = st.staking.pools[&vaddr(1)].stake;
+    let mut j = Journal::default();
+    let tx = t.tx_from(&reporter, &reporter.address(), Action::ReportEquivocation { evidence });
+    let err = apply(&mut st, &mut j, &tx, &reporter.address(), &tx.signer_key_id().unwrap(), &KeyRecord { label: String::new(), role: KeyRole::Owner, added_at: 0, spent: 0, window_start: 0 }, t.height).unwrap_err().to_string();
+    assert!(err.contains("already slashed"), "{err}");
+    assert_eq!(st.staking.pools[&vaddr(1)].stake, pool);
+}
+
+/// Audit F57: a slash reads the slashed validator's own entries from the fault's epoch on (the
+/// by-validator index), never every entry in the state.
+#[test]
+fn slashing_reads_only_the_validators_own_entries() {
+    let mut t = Setup::default().start();
+    t.finish_epoch();
+    let (v0, v1) = (vaddr(0), vaddr(1));
+    let mut j = Journal::default();
+    let at = |h: u64, v: &str| Entry::Unbonding { validator: v.to_string(), amount: 1_000 * FANG, started_at: h, release_at: h + 1_000 };
+    // Thousands of other validators' entries, and v0's: one before the fault's epoch, two after.
+    for i in 0..3_000u64 {
+        add_entry(&mut t.st, &mut j, &crate::crypto::address_from_bytes(&crate::crypto::hash(&i.to_le_bytes())), at(t.height, &v1));
+    }
+    let d = keys(250).address();
+    add_entry(&mut t.st, &mut j, &d, at(EPOCH - 1, &v0));
+    add_entry(&mut t.st, &mut j, &d, at(EPOCH, &v0));
+    add_entry(&mut t.st, &mut j, &d, at(EPOCH + 1, &v0));
+    t.st.j_mint(&mut j, 3_003_000 * FANG); // the entries' escrow
+    let mut s = Journal::default();
+    let cut = slash(&mut t.st, &mut s, &v0, EPOCH, None, false, 500);
+    assert_eq!(cut.total, 100 * FANG, "5% of the two entries since the epoch began");
+    assert_eq!(s.staking.entries.touched().count(), 2, "only those two were read and written");
+    t.st.j_burn(&mut j, cut.total);
+    t.st.check_invariants().unwrap();
+    // Within a window [since, until): just the one in between.
+    let cut = slash(&mut t.st, &mut Journal::default(), &v0, EPOCH - 1, Some(EPOCH), false, 500);
+    assert_eq!(cut.total, 50 * FANG);
+}
+
+/// Audit F25: a redelegation answers for at most what moved, cut on what's left of it each time,
+/// and nothing else of the delegator's stake in the pool it moved to (MAINNET-DESIGN 3.4).
+#[test]
+fn a_redelegation_answers_for_at_most_what_moved() {
+    let d = keys(200);
+    let mut t = Setup { accounts: vec![(d.address(), 20_000 * FANG, None)], ..Default::default() }.start();
+    let (v2, v3) = (vaddr(2), vaddr(3));
+    t.ok(&d, Action::Delegate { validator: v3.clone(), amount: 10_000 * FANG });
+    t.ok(&d, Action::Delegate { validator: v2.clone(), amount: 100 * FANG });
+    t.ok(&d, Action::Redelegate { from_validator: v2.clone(), to_validator: v3.clone(), shares: 100 * FANG });
+    t.block();
+    let worth = |t: &T| delegation_value(&t.st, &d.address(), &v3);
+    assert_eq!(worth(&t), 10_100 * FANG);
+    // Sixty slashes of v2 (say, downtime after downtime, each reaching back to the move).
+    let mut left = 100 * FANG;
+    for _ in 0..60 {
+        let mut j = Journal::default();
+        let cut = slash(&mut t.st, &mut j, &v2, 0, None, true, 500);
+        t.st.j_burn(&mut j, cut.total);
+        left -= bps_of(left, 500);
+        let entry = entries_of_account(&t.st, &d.address()).into_iter().find_map(|(_, e)| if let Entry::Redelegation { amount, .. } = e { Some(amount) } else { None }).unwrap();
+        assert_eq!(entry, left, "what's left of the move to answer with");
+    }
+    assert!(worth(&t) >= 10_000 * FANG, "the stake that didn't move is untouched: {}", fmt_fang(worth(&t)));
+    assert_eq!(worth(&t), 10_000 * FANG + left);
+    t.block();
+}
+
+/// Audit F58 (not reproducible): a pool slash doesn't lower a delegation's principal, and needn't.
+/// It doesn't lower the vesting lock either, so what the pool earns back refills locked tokens the
+/// slash took: it stays under the original lock (nothing becomes movable), and only value above
+/// the principal is new and joins the lock. Lowering the principal too would lock it twice.
+#[test]
+fn value_regained_after_a_slash_stays_under_the_vesting_lock() {
+    let (founder, friend) = (keys(210), keys(211));
+    let vest = Vesting { start: 0, cliff: 1_000, end: 2_000 };
+    let accounts = vec![(founder.address(), 1_000_000 * FANG, Some(vest)), (friend.address(), 100 * FANG, None)];
+    let mut t = Setup { accounts, params: vec![("insider_delegation_cap_bps", 10_000)], ..Default::default() }.start();
+    let (v, f) = (vaddr(0), founder.address());
+    // A little liquid FANG of its own (not under the lock), for fees.
+    t.ok(&friend, Action::Transfer { to: f.clone(), amount: 10 * FANG });
+    let liquid = crate::econ::transferable(&t.st, &f, t.height);
+    assert_eq!(liquid, 10 * FANG);
+    let mut fees = 0;
+    let mut run = |t: &mut T, action: Action| {
+        let tx = t.tx_from(&founder, &f, action);
+        fees += tx.charge().unwrap();
+        assert_eq!(t.apply(&tx).unwrap(), Outcome::Applied);
+    };
+    run(&mut t, Action::Delegate { validator: v.clone(), amount: 100_000 * FANG });
+    // A 5% slash, then the pool earns more than it lost.
+    let mut j = Journal::default();
+    let cut = slash(&mut t.st, &mut j, &v, t.height, None, true, 500);
+    t.st.j_burn(&mut j, cut.total);
+    assert_eq!(delegation_value(&t.st, &f, &v), 95_000 * FANG);
+    t.st.j_mint(&mut j, 20_000 * FANG);
+    let paid = distribute_rewards(&mut t.st, &mut j, 20_000 * FANG, t.height);
+    t.st.j_burn(&mut j, 20_000 * FANG - paid);
+    let value = delegation_value(&t.st, &f, &v);
+    assert!(value > 100_000 * FANG);
+    let shares = t.shares(&f, &v) as u64;
+    run(&mut t, Action::Undelegate { validator: v.clone(), shares });
+    // The lock grew by what's above the 100,000 put in; the 5,000 regained stayed under it, and
+    // all that's movable is the founder's own liquid FANG, less its fees.
+    let lock: &Lock = &t.st.account(&f).locks[0];
+    assert_eq!(lock.amount, LockAmount::Vesting { total: 1_000_000 * FANG + (value - 100_000 * FANG), start: 0, cliff: 1_000, end: 2_000 });
+    assert_eq!(crate::econ::transferable(&t.st, &f, t.height), liquid - fees, "nothing earned became movable before the cliff");
+    t.block();
+}
+
+/// One step of [`slashing_conserves_fang_and_cuts_each_drop_once`]: who and what are indices
+/// into the test's delegators and validators.
+#[derive(Clone, Debug)]
+enum Op {
+    Delegate { who: usize, to: usize, fang: u64 },
+    Undelegate { who: usize, from: usize, permille: u64 },
+    Redelegate { who: usize, from: usize, to: usize, permille: u64 },
+    Withdraw { who: usize },
+    /// Validator `v` double-signs in the epoch `back` epochs ago (clamped), at view `view`.
+    Report { v: usize, back: u64, view: u64 },
+    Jail { v: usize, bps: u64 },
+    Reward { fang: u64 },
+    Blocks { n: u64 },
+}
+
+fn arb_op() -> impl proptest::strategy::Strategy<Value = Op> {
+    use proptest::prelude::*;
+    prop_oneof![
+        3 => (0..3usize, 0..4usize, 1..5_000u64).prop_map(|(who, to, fang)| Op::Delegate { who, to, fang }),
+        2 => (0..3usize, 0..4usize, 1..=1_000u64).prop_map(|(who, from, permille)| Op::Undelegate { who, from, permille }),
+        2 => (0..3usize, 0..4usize, 0..4usize, 1..=1_000u64).prop_map(|(who, from, to, permille)| Op::Redelegate { who, from, to, permille }),
+        1 => (0..3usize).prop_map(|who| Op::Withdraw { who }),
+        2 => (0..4usize, 0..3u64, 1..6u64).prop_map(|(v, back, view)| Op::Report { v, back, view }),
+        1 => (0..4usize, 1..1_000u64).prop_map(|(v, bps)| Op::Jail { v, bps }),
+        1 => (1..2_000u64).prop_map(|fang| Op::Reward { fang }),
+        2 => (1..12u64).prop_map(|n| Op::Blocks { n }),
+    ]
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig { cases: 24, ..Default::default() })]
+    /// Random delegations, exits, redelegations, withdrawals, double-sign reports (real and
+    /// repeated, from this epoch and earlier ones), jails and rewards: FANG is conserved (supply +
+    /// burned moves only by what was minted, and the state's invariants hold after every step), a
+    /// pool takes one equivocation slash however many reports come, and no unbonding or
+    /// redelegation entry ever grows.
+    #[test]
+    fn slashing_conserves_fang_and_cuts_each_drop_once(ops in proptest::collection::vec(arb_op(), 1..40)) {
+        let delegators: Vec<Keys> = (200..203).map(keys).collect();
+        let reporter = keys(203);
+        let mut accounts: Vec<(String, u64, Option<Vesting>)> = delegators.iter().map(|k| (k.address(), 100_000 * FANG, None)).collect();
+        accounts.push((reporter.address(), 1_000 * FANG, None));
+        let mut t = Setup { accounts, params: vec![("slash_double_sign_bps", 500), ("reporter_reward_bps", 1_000)], ..Default::default() }.start();
+        let vals: Vec<String> = (0..4u8).map(vaddr).collect();
+        let total = |t: &T| t.st.supply as u128 + t.st.burned as u128;
+        let (mut expected, mut double_signed) = (total(&t), std::collections::BTreeSet::new());
+        for op in ops {
+            let entries_before: BTreeMap<String, u64> = t.st.staking.entries.iter().map(|(k, e)| (k.clone(), match e { Entry::Unbonding { amount, .. } | Entry::Redelegation { amount, .. } => *amount })).collect();
+            let height = t.height;
+            match op {
+                Op::Delegate { who, to, fang } => {
+                    let _ = t.run(&delegators[who], Action::Delegate { validator: vals[to].clone(), amount: fang * FANG });
+                }
+                Op::Undelegate { who, from, permille } => {
+                    let held = t.shares(&delegators[who].address(), &vals[from]);
+                    if held > 0 {
+                        let _ = t.run(&delegators[who], Action::Undelegate { validator: vals[from].clone(), shares: ((held * permille as u128 / 1_000).max(1)) as u64 });
+                    }
+                }
+                Op::Redelegate { who, from, to, permille } => {
+                    let held = t.shares(&delegators[who].address(), &vals[from]);
+                    if held > 0 && from != to {
+                        let _ = t.run(&delegators[who], Action::Redelegate { from_validator: vals[from].clone(), to_validator: vals[to].clone(), shares: ((held * permille as u128 / 1_000).max(1)) as u64 });
+                    }
+                }
+                Op::Withdraw { who } => {
+                    let _ = t.run(&delegators[who], Action::WithdrawUnbonded {});
+                }
+                Op::Report { v, back, view } => {
+                    let epoch = t.epoch.saturating_sub(back);
+                    if t.set(epoch).contains(&vals[v]) {
+                        let pool_slashes = t.st.staking.pools[&vals[v]].slashed;
+                        let ev = double_notarize(&t, v as u8, epoch, view);
+                        let applied = matches!(t.run(&reporter, Action::ReportEquivocation { evidence: ev }), Ok(Outcome::Applied));
+                        let cut_pool = t.st.staking.pools[&vals[v]].slashed > pool_slashes;
+                        proptest::prop_assert!(!(cut_pool && double_signed.contains(&vals[v])), "{} lost pool stake to a second double-sign report", vals[v]);
+                        if applied {
+                            double_signed.insert(vals[v].clone());
+                        }
+                    }
+                }
+                Op::Jail { v, bps } => {
+                    let mut j = Journal::default();
+                    jail(&mut t.st, &mut j, &vals[v], height, bps, "test");
+                }
+                Op::Reward { fang } => {
+                    let mut j = Journal::default();
+                    t.st.j_mint(&mut j, fang * FANG);
+                    expected += (fang * FANG) as u128;
+                    let paid = distribute_rewards(&mut t.st, &mut j, fang * FANG, height);
+                    t.st.j_burn(&mut j, fang * FANG - paid);
+                }
+                Op::Blocks { n } => t.blocks(n),
+            }
+            if let Err(e) = t.st.check_invariants() {
+                return Err(proptest::test_runner::TestCaseError::fail(format!("invariants: {e}")));
+            }
+            proptest::prop_assert_eq!(total(&t), expected, "FANG appeared or vanished");
+            for (k, e) in t.st.staking.entries.iter() {
+                let now = match e { Entry::Unbonding { amount, .. } | Entry::Redelegation { amount, .. } => *amount };
+                proptest::prop_assert!(entries_before.get(k).is_none_or(|before| now <= *before), "entry {} grew", k);
+            }
+        }
+        t.block();
+    }
+}
+
 // --------------------------------------------------------------------------------- evidence
 
 /// Evidence is checked strictly: well-formed fault activities only, signed by a member of that
@@ -726,6 +1018,48 @@ fn small_sets_take_no_newcomers_unless_an_admin_pins_one() {
     assert_eq!(t.set(2).len(), 2, "pinned in by the admin");
 }
 
+/// Audit F24: on a chain without admins (mainnet) a set that shrank to two, or to one, grows
+/// again, one newcomer per epoch, until the churn limit takes over at four (from three, one
+/// newcomer is within it already). Under the churn limit alone neither ever grew.
+#[test]
+fn a_set_that_shrank_below_four_grows_back() {
+    let mut t = Setup::default().start();
+    assert!(t.st.params.admins.is_empty());
+    // The owners of validators 2 and 3 sell below the minimum self-bond: the set drops to 2.
+    for i in [2u8, 3] {
+        let held = t.shares(&owner(i).address(), &vaddr(i)) as u64;
+        t.ok(&owner(i), Action::Undelegate { validator: vaddr(i), shares: held - 500 * FANG });
+    }
+    t.finish_epoch();
+    let mut two = vec![vaddr(0), vaddr(1)];
+    two.sort();
+    assert_eq!(t.set(1), two);
+    // Both bond back above it: they're eligible newcomers, admitted one per epoch.
+    for i in [2u8, 3] {
+        t.ok(&owner(i), Action::Delegate { validator: vaddr(i), amount: 900 * FANG });
+    }
+    assert_eq!(select_next(&t.st, 1).joining.len(), 1);
+    t.finish_epoch();
+    assert_eq!(t.set(2).len(), 3);
+    t.finish_epoch();
+    assert_eq!(t.set(3).len(), 4, "back to f = 1");
+    // From a set of one, likewise.
+    let mut t = Setup::default().start();
+    for i in 1..4u8 {
+        let held = t.shares(&owner(i).address(), &vaddr(i)) as u64;
+        t.ok(&owner(i), Action::Undelegate { validator: vaddr(i), shares: held - 500 * FANG });
+    }
+    t.finish_epoch();
+    assert_eq!(t.set(1), vec![vaddr(0)]);
+    for i in 1..4u8 {
+        t.ok(&owner(i), Action::Delegate { validator: vaddr(i), amount: 900 * FANG });
+    }
+    for (epoch, size) in [(2, 2), (3, 3), (4, 4)] {
+        t.finish_epoch();
+        assert_eq!(t.set(epoch).len(), size, "epoch {epoch}");
+    }
+}
+
 /// CV-4: at most ⌊(n−1)/3⌋ seats change per epoch for stake (highest stake first), while
 /// ineligible members always leave; the set never empties.
 #[test]
@@ -885,22 +1219,47 @@ fn liveness_rings_slide_and_saturate() {
     assert_eq!(l.missed, 9);
 }
 
-/// A long stall: every validator is charged once per lap of the views that were nullified, and
-/// the leftover views' leaders once more.
+/// Audit F59: a long stall (here 204 nullified views, 51 laps of the set: whatever stalled it)
+/// costs every leader in it one slot, so the block that ends it jails nobody; a short gap still
+/// charges exactly the leaders it skipped. Even stall after stall, at most f = ⌊(n−1)/3⌋ of the
+/// set is jailed for downtime: the others are charged and stay.
 #[test]
-fn long_outages_are_charged_per_lap() {
+fn a_long_stall_costs_each_leader_one_slot_and_jails_at_most_f() {
     let mut t = Setup { params: vec![("downtime_window", 100), ("downtime_max_missed", 50)], ..Default::default() }.start();
     t.block();
-    let (epoch, from) = (t.epoch, t.view);
-    t.skip = 9; // views from+1 ..= from+9: two laps of 4, and one more
-    t.block();
+    let epoch = t.epoch;
     let order = leaders(&t.st, epoch);
-    let extra = &order[t.idx(epoch, from + 9)];
-    for v in &order {
-        let want = if v == extra { 3 } else { 2 };
-        assert_eq!(t.st.staking.liveness[v].missed, want, "{v}");
+    let counts = |t: &T| order.iter().map(|v| t.st.staking.liveness.get(v).map_or((0, 0), |l| (l.missed, l.filled))).collect::<Vec<_>>();
+    let before = counts(&t);
+    t.skip = 204;
+    t.block();
+    for (i, v) in order.iter().enumerate() {
+        let hit = (*v == t.leader(epoch, t.view)) as u64;
+        assert_eq!(counts(&t)[i], (before[i].0 + 1, before[i].1 + 1 + hit), "{v}: one slot for the stall");
     }
-    assert!(order.iter().all(|v| t.st.staking.pools[v].jail.is_none()));
+    assert!(order.iter().all(|v| t.st.staking.pools[v].jail.is_none()), "nobody jailed by one stall");
+    // A short gap: exactly the skipped views' leaders.
+    let (before, at) = (order.iter().map(|v| t.st.staking.liveness[v].missed).collect::<Vec<_>>(), t.view);
+    t.skip = 2;
+    t.block();
+    let skipped: Vec<&String> = [at + 1, at + 2].iter().map(|x| &order[t.idx(epoch, *x)]).collect();
+    for (i, v) in order.iter().enumerate() {
+        assert_eq!(t.st.staking.liveness[v].missed - before[i], skipped.contains(&v) as u64, "{v}");
+    }
+    // Stall after stall: everyone crosses the threshold, but at most f of the set at a time is
+    // jailed (the first epoch's set of 4: one; the 3 left after it leaves: none).
+    let mut ever = std::collections::BTreeSet::new();
+    for _ in 0..60 {
+        t.skip = 8;
+        t.block();
+        let set = t.set(t.st.params.epoch_of(t.height - 1));
+        let jailed: Vec<&String> = set.iter().filter(|v| t.st.staking.pools[*v].jail.is_some()).collect();
+        assert!(jailed.len() <= (set.len() - 1) / 3, "{} of {} jailed at height {}", jailed.len(), set.len(), t.height - 1);
+        ever.extend(jailed.into_iter().cloned());
+    }
+    assert_eq!(ever.len(), 1, "downtime still jails, within f");
+    let over = |v: &String| t.st.staking.liveness.get(v).is_some_and(|l| l.missed > 50);
+    assert!(t.set(t.epoch).iter().all(over), "the rest are over the threshold, charged but not jailed");
 }
 
 // ----------------------------------------------------------------------------- junk charge

@@ -20,8 +20,9 @@
 //! at most ⌊(m−1)/3⌋ of the new set of `m` ([`churn_limit`]): the members carried over are a
 //! quorum on their own, so newcomers that are still syncing can't stall it, and each set
 //! overlaps the last by more than two thirds (for a full set: ⌊(n−1)/3⌋ replacements per
-//! epoch; a set of one or two takes none). Members over a lowered cap leave ⌊(n−1)/3⌋ (at least
-//! one) per epoch. The set never empties. Votes are equal-weight within the set (DEC-3). On dev
+//! epoch). A set that shrank below four still grows by one newcomer per epoch on chains without
+//! admins ([`newcomers_allowed`]; every member of such a set is needed for a quorum anyway).
+//! Members over a lowered cap leave ⌊(n−1)/3⌋ (at least one) per epoch. The set never empties. Votes are equal-weight within the set (DEC-3). On dev
 //! and test chains admins may still pin a validator (`ApproveValidator`: ranked ahead of stake,
 //! and past the churn limit, at the admin's risk) or remove one (`RemoveValidator`); elsewhere
 //! both are refused.
@@ -31,14 +32,19 @@
 //!
 //! **Slashing.** `ReportEquivocation` carries simplex's own evidence (an encoded
 //! `ConflictingNotarize`, `ConflictingFinalize` or `NullifyFinalize` activity), verified against
-//! that epoch's set and namespace ([`verify_evidence`]). The pool loses `slash_double_sign_bps`
-//! once per (validator, epoch, view), and so do the unbonding and redelegation entries that left
-//! it since that epoch began; the reporter gets `reporter_reward_bps` of the slash, the rest is
-//! burned, and the validator is tombstoned (never selected again). Downtime is measured from
+//! that epoch's set and the chain instance's namespace, from a view that epoch reached
+//! ([`verify_evidence`]). The pool loses `slash_double_sign_bps`, and so do the unbonding and
+//! redelegation entries that left it since that epoch began, once: the validator is tombstoned
+//! (never selected again) and later evidence against it only reaches stake that left before the
+//! punished epoch ([`Pool::slashed_from`]), so every drop answers for double-signing at most once
+//! (a leaked key can't drain a pool fault by fault). The reporter gets `reporter_reward_bps` of the
+//! slash, at most what the validator's owner lost (reporting yourself never pays); the rest is
+//! burned. Downtime is measured from
 //! leader slots: each view a block skipped (`parent_view + 1 .. view − 1`, nullified by 2f+1) is a
-//! miss for that view's leader and the block's own view a hit, with simplex's `RoundRobin`
-//! elector naming the leaders. A validator that missed more than `downtime_max_missed` of its
-//! last `downtime_window` slots is jailed ([`jail`], `slash_downtime_bps`), leaves at the next
+//! miss for that view's leader (at most one per validator per block) and the block's own view a
+//! hit, with simplex's `RoundRobin` elector naming the leaders. A validator that missed more than
+//! `downtime_max_missed` of its last `downtime_window` slots is jailed ([`jail`],
+//! `slash_downtime_bps`) unless more than f of the set would then be jailed, leaves at the next
 //! boundary, and may `Unjail` after `jail_blocks` (with its self-bond at the minimum again).
 //!
 //! **Junk** (CV-5). Verifiers replay a proposal's unexecuted ancestors exactly and reject it if
@@ -99,19 +105,12 @@ pub struct Pool {
     pub slashed: u64,
     pub rewards: u64,
     pub junk_charged: u64,
-    /// What a drop that was in the pool before any slash is worth now (pool-level slashes only),
-    /// scaled by [`KEPT_ONE`]; 0 if never slashed. Delegations' principals scale by it lazily
-    /// ([`principal_of`]), so slashes take their share of principal too (3.7's locked gains).
-    pub kept: u128,
     /// Equivocation already took its cut of the stake that was in this pool from this height on
     /// (the start of the earliest punished fault's epoch). A double-signer is slashed once: later
     /// evidence only reaches stake that left the pool before this height (audit F05/F07/F60).
     pub slashed_from: Option<u64>,
 }
 
-/// [`Pool::kept`] (and [`Delegation::kept_at`]) of a pool never slashed: one, as a fixed-point
-/// fraction.
-pub const KEPT_ONE: u128 = 1_000_000_000_000_000_000;
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Jail {
@@ -125,22 +124,12 @@ pub struct Jail {
 #[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Delegation {
     pub shares: u128,
-    /// Drops put in, less what sales and slashes took out pro rata: value above it is earnings
-    /// (what stays locked for vesting accounts). Pool-level slashes since it was last set aren't
-    /// in it yet: read it through [`principal_of`].
+    /// Drops put in, less what sales (and redelegation slashes, which sell shares) took out pro
+    /// rata: value above it is earnings (what stays locked for vesting accounts, 3.7). A pool
+    /// slash doesn't lower it, on purpose: it doesn't lower a vesting lock either, so value the
+    /// pool earns back after a slash refills locked tokens the slash took and stays under the
+    /// original lock; only value above the principal is new (audit F58).
     pub principal: u64,
-    /// The pool's [`Pool::kept`] when `principal` was last set (0: never slashed).
-    pub kept_at: u128,
-}
-
-/// `d`'s principal in `pool` now: its recorded principal, less the pool-level slashes since it
-/// was recorded, pro rata (rounded down).
-pub fn principal_of(pool: &Pool, d: &Delegation) -> u64 {
-    let (now, then) = (pool.kept(), if d.kept_at == 0 { KEPT_ONE } else { d.kept_at });
-    if now >= then {
-        return d.principal;
-    }
-    mul_div(d.principal as u128, now, then).map_or(d.principal, |p| p.min(d.principal as u128) as u64)
 }
 
 /// Stake on its way out or recently moved (key: `delegator/id`, 20 digits). Both kinds stay
@@ -213,7 +202,8 @@ impl Liveness {
         self.next = (i + 1) % self.window;
     }
 
-    /// Records `n` missed slots in a row.
+    /// Records `n` missed slots in a row (tests; a block charges at most one).
+    #[cfg(test)]
     fn miss(&mut self, n: u64) {
         if n >= self.window {
             let total = self.missed_total + n;
@@ -435,11 +425,6 @@ fn bps_of(amount: u64, bps: u64) -> u64 {
 }
 
 impl Pool {
-    /// [`Pool::kept`], with 0 read as "never slashed".
-    pub fn kept(&self) -> u128 {
-        if self.kept == 0 { KEPT_ONE } else { self.kept }
-    }
-
     /// What `shares` of this pool are worth, rounded down (all of them: exactly `stake`).
     pub fn value(&self, shares: u128) -> u64 {
         if self.shares == 0 {
@@ -536,23 +521,22 @@ fn bond(state: &mut State, j: &mut Journal, delegator: &str, validator: &str, am
         bail!("{} is too little to buy a share of validator {}'s pool", fmt_fang(amount), short(validator));
     }
     let stake = pool.stake.checked_add(amount).ok_or_else(|| anyhow!("pool overflow"))?;
-    let key = dkey(delegator, validator);
-    let mut d = state.staking.delegations.get(&key).cloned().unwrap_or_default();
-    (d.principal, d.kept_at) = (principal_of(pool, &d).saturating_add(principal), pool.kept);
-    d.shares += shares;
     let p = pool_mut(state, j, validator).expect("checked above");
     p.stake = stake;
     p.shares += shares;
+    let key = dkey(delegator, validator);
+    let mut d = state.staking.delegations.get(&key).cloned().unwrap_or_default();
+    d.shares += shares;
+    d.principal = d.principal.saturating_add(principal);
     put_delegation(state, j, &key, Some(d));
     Ok(shares)
 }
 
-/// What remains of `d` (in `pool`) after `shares` of it leave: its principal now
-/// ([`principal_of`]) split pro rata. Returns the rest and the principal the shares carried.
-fn split(pool: &Pool, d: &Delegation, shares: u128) -> (Delegation, u64) {
-    let now = principal_of(pool, d);
-    let principal = if shares == d.shares { now } else { mul_div(now as u128, shares, d.shares).unwrap_or(0) as u64 };
-    (Delegation { shares: d.shares - shares, principal: now - principal, kept_at: pool.kept }, principal)
+/// What remains of `d` after `shares` of it leave, and the principal those shares carried (pro
+/// rata).
+fn split(d: &Delegation, shares: u128) -> (Delegation, u64) {
+    let principal = if shares == d.shares { d.principal } else { mul_div(d.principal as u128, shares, d.shares).unwrap_or(0) as u64 };
+    (Delegation { shares: d.shares - shares, principal: d.principal - principal }, principal)
 }
 
 /// Sells `shares` of `delegator`'s stake in `validator`'s pool. Returns what they were worth
@@ -565,7 +549,7 @@ fn unbond(state: &mut State, j: &mut Journal, delegator: &str, validator: &str, 
     }
     let pool = state.staking.pools.get(validator).ok_or_else(|| anyhow!("validator {} has no pool", short(validator)))?;
     let value = pool.value(shares);
-    let (rest, principal) = split(pool, &d, shares);
+    let (rest, principal) = split(&d, shares);
     let p = pool_mut(state, j, validator).expect("checked above");
     p.stake -= value;
     p.shares -= shares;
@@ -583,7 +567,7 @@ fn take_from_delegation(state: &mut State, j: &mut Journal, delegator: &str, val
         return 0;
     }
     let (shares, taken) = if want >= worth { (d.shares, worth) } else { (mul_div_ceil(want as u128, pool.shares, pool.stake as u128).unwrap_or(d.shares).min(d.shares), want) };
-    let (rest, _) = split(pool, &d, shares);
+    let (rest, _) = split(&d, shares);
     let p = pool_mut(state, j, validator).expect("checked above");
     p.stake -= taken;
     p.shares -= shares;
@@ -944,12 +928,9 @@ fn slash(state: &mut State, j: &mut Journal, validator: &str, since: u64, until:
         let c = bps_of(p.stake, bps);
         if c > 0 {
             let before = delegation_value(state, &owner, validator);
-            // Every drop in the pool keeps `stake − c` of `stake`: so does every principal.
-            let kept = mul_div(p.kept(), (p.stake - c) as u128, p.stake as u128).unwrap_or(0).max(1);
             let p = pool_mut(state, j, validator).expect("checked above");
             p.stake -= c;
             p.slashed += c;
-            p.kept = kept;
             cut.total += c;
             cut.owner += before - delegation_value(state, &owner, validator);
         }
@@ -1238,9 +1219,13 @@ fn leaders(state: &State, epoch: u64) -> Vec<String> {
 }
 
 /// Downtime (3.4): views `parent_view + 1 .. view − 1` were nullified, each a miss for its leader;
-/// the block's own view is a hit for its leader. Within an epoch, any n consecutive views lead
-/// each validator once, so long gaps cost O(n). A validator over `downtime_max_missed` in its
-/// window is jailed.
+/// the block's own view is a hit for its leader. One block charges a validator at most one miss
+/// (audit F59): a stall of many views, whatever its cause (lagging verifiers, a partition, an
+/// upgrade gone wrong), costs every leader in it one slot, not one per lap of the set, so it
+/// can't jail the whole set in one block. A validator over `downtime_max_missed` in its window
+/// is jailed, while that leaves at most f = ⌊(n−1)/3⌋ of the epoch's set jailed: more members
+/// looking offline at once is an incident of the network, not of the validators (more than f
+/// truly offline would have halted the chain), and they're charged again later.
 fn score_leader_slots(state: &mut State, j: &mut Journal, b: &BlockInfo) {
     if b.view == 0 || b.view <= b.parent_view {
         return; // no consensus view (genesis, or a block built outside consensus)
@@ -1252,36 +1237,41 @@ fn score_leader_slots(state: &mut State, j: &mut Journal, b: &BlockInfo) {
         return;
     }
     let seed = crate::beacon::elector_seed(state, epoch);
-    let mut misses = vec![0u64; n];
     let gap = b.view - b.parent_view - 1;
-    let (laps, rest) = (gap / n as u64, gap % n as u64);
-    for m in misses.iter_mut() {
-        *m = laps;
-    }
-    for x in b.view - rest..b.view {
-        misses[leader_index(seed, epoch, x, n)] += 1;
+    // Any n consecutive views lead every validator once.
+    let mut missed = vec![gap >= n as u64; n];
+    if gap < n as u64 {
+        for x in b.view - gap..b.view {
+            missed[leader_index(seed, epoch, x, n)] = true;
+        }
     }
     let hit = leader_index(seed, epoch, b.view, n);
     let (window, max_missed) = (state.chain_params.downtime_window.max(1), state.chain_params.downtime_max_missed);
+    let out = |p: &Pool| p.jail.is_some() || p.tombstoned_at.is_some();
+    let mut jailed = order.iter().filter(|v| state.staking.pools.get(*v).is_some_and(out)).count();
+    let f = (n - 1) / 3;
     for (i, v) in order.iter().enumerate() {
-        if misses[i] == 0 && i != hit {
+        if !missed[i] && i != hit {
             continue;
         }
         let Some(pool) = state.staking.pools.get(v) else { continue };
         // Jailed or tombstoned: already on its way out.
-        if pool.jail.is_some() || pool.tombstoned_at.is_some() {
+        if out(pool) {
             continue;
         }
         let mut l = state.staking.liveness.get(v).filter(|l| l.window == window).cloned().unwrap_or_else(|| Liveness::new(window));
-        l.miss(misses[i]);
+        if missed[i] {
+            l.push(true);
+        }
         if i == hit {
             l.push(false);
         }
         let over = l.missed > max_missed;
         let reason = format!("missed {} of its last {} leader slots", l.missed, l.filled);
         put_liveness(state, j, v, Some(l));
-        if over {
+        if over && jailed < f {
             jail(state, j, v, b.height, state.chain_params.slash_downtime_bps, &reason);
+            jailed += 1;
         }
     }
 }
@@ -1327,9 +1317,24 @@ pub struct Selection {
 
 /// The churn limit (CV-4): most members of a set of `m` that may be newcomers, ⌊(m−1)/3⌋, so the
 /// members it carries over (a quorum, m − ⌊(m−1)/3⌋) finalize on their own while newcomers
-/// sync. For a full set that's ⌊(n−1)/3⌋ replacements per epoch; a set of 1 or 2 takes none.
+/// sync. For a full set that's ⌊(n−1)/3⌋ replacements per epoch; a set of 1 or 2 takes none
+/// under it (see [`newcomers_allowed`] for how such a set still grows).
 pub fn churn_limit(m: usize) -> usize {
     m.saturating_sub(1) / 3
+}
+
+/// Newcomers the next set may take when it carries over `kept` members and would have `size`
+/// with this newcomer (`free`: into a free seat rather than replacing a member). The churn limit,
+/// except that on chains without admins a set carrying over one to three members grows by one per
+/// epoch (audit F24): under the churn limit alone a set that shrank to one or two could never grow
+/// again, with no fault tolerance (f = 0) for good, and mainnet has no other way to add one.
+/// Below four members every member is needed for a quorum whatever happens, so the newcomer must
+/// be synced and online to keep the chain moving (it's a tracked peer from the epoch before, so
+/// it syncs first); safety is unchanged. Dev and test chains keep small sets closed to strangers
+/// (a stranger that joined and went offline would stall them): their admins pin newcomers.
+pub fn newcomers_allowed(state: &State, kept: usize, size: usize, free: bool) -> usize {
+    let limit = churn_limit(size);
+    if free && (1..4).contains(&kept) && state.params.admins.is_empty() { limit.max(1) } else { limit }
 }
 
 /// Picks the next set (see the module docs). Pure: the API previews it.
@@ -1360,7 +1365,7 @@ pub fn select_next(state: &State, epoch: u64) -> Selection {
             break;
         }
         let size = if free { keep.len() + 1 } else { keep.len() };
-        if !pinned(&c) && joined + 1 > churn_limit(size) {
+        if !pinned(&c) && joined + 1 > newcomers_allowed(state, keep.len() - joined, size, free) {
             break;
         }
         if !free {
@@ -1564,11 +1569,6 @@ pub fn check_invariants(state: &State) -> Result<()> {
         ensure!(p.shares > 0 || p.stake == 0, "pool {v} holds stake without shares");
         ensure!(p.tombstoned_at.is_none() || state.validators[v].status == ValidatorStatus::Tombstoned, "pool {v} is tombstoned but its validator isn't");
         ensure!(p.slashed_from.is_none() || p.tombstoned_at.is_some(), "pool {v} was slashed for double-signing but isn't tombstoned");
-        ensure!(p.kept <= KEPT_ONE, "pool {v} kept more than it had");
-    }
-    for (k, d) in s.delegations.iter() {
-        let v = k.split_once('/').map(|(_, v)| v).unwrap_or_default();
-        ensure!(d.kept_at <= KEPT_ONE && (d.kept_at == 0 || d.kept_at >= s.pools[v].kept()), "delegation {k} was recorded after slashes its pool hasn't had");
     }
     for v in state.validators.keys() {
         ensure!(s.pools.contains_key(v), "validator {v} has no pool");
