@@ -790,8 +790,10 @@ impl Read for Chunks<'_> {
     }
 }
 
-/// Fetches, verifies and installs the newest certified snapshot from `peers` into an empty chain,
-/// refusing any that contradicts `trust`.
+/// Fetches, verifies and installs a certified snapshot (what a peer serves: its newest, or a big
+/// state's newest long-lived one) from `peers` into an empty chain, refusing any that contradicts
+/// `trust`. Peers are tried in a random order; each one's manifest is downloaded from all of them
+/// ([`download_chunks`]).
 pub async fn fast_sync(chain: &crate::consensus::Shared, peers: &[String], trust: &crate::checkpoints::Trust) -> Result<u64> {
     let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(60)).build()?;
     let g = chain.lock().genesis.clone();
