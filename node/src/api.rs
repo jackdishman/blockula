@@ -1280,9 +1280,16 @@ async fn faucet(State(n): State<Node>, ConnectInfo(peer): ConnectInfo<SocketAddr
     Ok(Json(v))
 }
 
-/// Manifest of the newest certified state snapshot (for `join --fast`).
-async fn snapshot_latest(State(n): State<Node>) -> ApiResult {
-    let m = crate::snapshot::build_manifest(&n.live).map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
+#[derive(Deserialize)]
+struct SnapshotQuery {
+    /// The manifest must reach at least this height (the joiner's newest checkpoint).
+    min: Option<u64>,
+}
+
+/// Manifest of a certified state snapshot (for `join --fast`): the newest, or for a big state the
+/// newest long-lived one (`snapshot::LONG_SNAPSHOT_INTERVAL`), reaching `min` if given.
+async fn snapshot_latest(State(n): State<Node>, Query(q): Query<SnapshotQuery>) -> ApiResult {
+    let m = crate::snapshot::build_manifest_reaching(&n.live, q.min.unwrap_or(0)).map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
     Ok(Json(serde_json::to_value(m).unwrap()))
 }
 

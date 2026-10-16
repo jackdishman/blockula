@@ -43,8 +43,23 @@ pub const CHECKPOINT_INTERVAL: u64 = 100;
 /// Blocks after a checkpoint until the block that must certify it (execution lags ordering).
 pub const CHECKPOINT_DELAY: u64 = 4;
 pub const CHUNK_SIZE: usize = 1 << 20;
-/// Snapshots kept per node.
+/// Snapshots kept per node: the newest ones, and as many at multiples of
+/// [`LONG_SNAPSHOT_INTERVAL`].
 pub const KEEP_SNAPSHOTS: usize = 2;
+/// Snapshots at multiples of this live 1,000–2,000 blocks (17–33 minutes at 1 s blocks) instead
+/// of 100–200, and a node serves one of them rather than its newest when the state is bigger than
+/// [`SMALL_SNAPSHOT_BYTES`], so a joiner has time to download it before it's deleted (F63).
+pub const LONG_SNAPSHOT_INTERVAL: u64 = 10 * CHECKPOINT_INTERVAL;
+/// A snapshot (compressed) this small is downloaded well within the 100 blocks the newest one
+/// lives at least, even at ~1 MiB/s: the newest is served.
+pub const SMALL_SNAPSHOT_BYTES: u64 = 64 << 20;
+/// A chunk request that takes longer than this (a 1 MiB chunk below ~35 KiB/s) fails, and the
+/// chunk is asked of another peer (F62).
+pub const CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// A snapshot download must finish within this per chunk (~0.5 MiB/s overall) plus
+/// [`DOWNLOAD_SLACK`], or the joiner gives up on that manifest and asks the next peer (F62).
+pub const DOWNLOAD_PER_CHUNK: std::time::Duration = std::time::Duration::from_secs(2);
+pub const DOWNLOAD_SLACK: std::time::Duration = std::time::Duration::from_secs(120);
 /// Refuse to decompress a snapshot bigger than this.
 pub const MAX_STATE_BYTES: u64 = 4 << 30;
 /// Most chunks a manifest may list: `MAX_STATE_BYTES` of state, plus slack for a compressed
@@ -221,10 +236,32 @@ pub fn list(home: &Path) -> Vec<u64> {
     hs
 }
 
+/// The snapshot heights to keep, of `heights` (newest first): the newest [`KEEP_SNAPSHOTS`], and
+/// the newest [`KEEP_SNAPSHOTS`] at multiples of [`LONG_SNAPSHOT_INTERVAL`].
+fn kept(heights: &[u64]) -> Vec<u64> {
+    let long = heights.iter().filter(|h| h.is_multiple_of(LONG_SNAPSHOT_INTERVAL)).take(KEEP_SNAPSHOTS);
+    let mut keep: Vec<u64> = heights.iter().take(KEEP_SNAPSHOTS).chain(long).copied().collect();
+    keep.sort_unstable_by(|a, b| b.cmp(a));
+    keep.dedup();
+    keep
+}
+
 fn prune(home: &Path) {
-    for h in list(home).into_iter().skip(KEEP_SNAPSHOTS) {
+    let all = list(home);
+    let keep = kept(&all);
+    for h in all.into_iter().filter(|h| !keep.contains(h)) {
         let _ = std::fs::remove_dir_all(dir(home).join(h.to_string()));
     }
+}
+
+/// The order `build_manifest` tries snapshots in: newest first, but when the newest is bigger
+/// than [`SMALL_SNAPSHOT_BYTES`], the long-lived ones first (F63).
+fn serving_order(heights: Vec<u64>, newest_bytes: u64) -> Vec<u64> {
+    let mut hs = heights;
+    if newest_bytes > SMALL_SNAPSHOT_BYTES {
+        hs.sort_by_key(|h| (!h.is_multiple_of(LONG_SNAPSHOT_INTERVAL), std::cmp::Reverse(*h)));
+    }
+    hs
 }
 
 pub fn meta(home: &Path, height: u64) -> Option<SnapshotMeta> {
@@ -300,10 +337,19 @@ fn anchor_proof(home: &Path, a: u64, cblock: impl Fn(u64) -> Option<Vec<u8>>, ce
 /// Builds the manifest for the newest snapshot this node can prove, from what it has published
 /// (no consensus lock). The validator-set history isn't in it: `/api/epochs` pages serve that.
 pub fn build_manifest(live: &crate::view::Live) -> Result<Manifest> {
+    build_manifest_reaching(live, 0)
+}
+
+/// [`build_manifest`], for a snapshot whose manifest reaches at least `min_last` (a joiner's
+/// newest checkpoint: an older one would be no use to it). A big state is served from a
+/// long-lived snapshot when one reaches that far ([`serving_order`]).
+pub fn build_manifest_reaching(live: &crate::view::Live, min_last: u64) -> Result<Manifest> {
     let v = live.view();
     let home = &v.disk.home;
     let params = &v.state.params;
-    for height in list(home) {
+    let heights = list(home);
+    let newest_bytes = heights.first().and_then(|h| meta(home, *h)).map_or(0, |m| m.chunks.iter().map(|c| c.size as u64).sum());
+    for height in serving_order(heights, newest_bytes) {
         let Some(meta) = meta(home, height) else { continue };
         let certifier = height + CHECKPOINT_DELAY;
         let mut blocks = vec![];
@@ -319,6 +365,9 @@ pub fn build_manifest(live: &crate::view::Live) -> Result<Manifest> {
             }
         }
         let Some((last, finalization)) = fin else { continue };
+        if last < min_last {
+            continue;
+        }
         let anchor = match anchor_height(params, height, last) {
             None => None,
             // Without the anchor's proof this snapshot can't be served; an older one may be.
@@ -709,8 +758,11 @@ pub async fn fast_sync(chain: &crate::consensus::Shared, peers: &[String], trust
     let mut last_err = anyhow!("no peers");
     // A peer that's only behind a checkpoint says a later snapshot will do: report that one.
     let mut behind = None;
-    for peer in peers {
-        match fast_sync_from(&client, &g, chain, peer, trust).await {
+    // In a new order each run, so no listed endpoint is always the one asked first (F62).
+    let peers = shuffled(peers);
+    let limits = DownloadLimits::default();
+    for peer in &peers {
+        match fast_sync_from(&client, &g, chain, peer, &peers, trust, &limits).await {
             Ok(h) => return Ok(h),
             Err(e) => {
                 tracing::debug!(peer = %peer, error = %e, "fast sync failed");
@@ -726,8 +778,86 @@ pub async fn fast_sync(chain: &crate::consensus::Shared, peers: &[String], trust
     Err(behind.unwrap_or(last_err))
 }
 
-async fn fast_sync_from(client: &reqwest::Client, g: &Genesis, chain: &crate::consensus::Shared, peer: &str, trust: &crate::checkpoints::Trust) -> Result<u64> {
-    let body = crate::node::get_capped(client, &format!("{peer}/api/snapshot/latest"), 64 << 20).await?;
+/// `peers` in a random order.
+fn shuffled(peers: &[String]) -> Vec<String> {
+    let mut out = peers.to_vec();
+    for i in (1..out.len()).rev() {
+        let mut r = [0u8; 8];
+        let j = match getrandom::fill(&mut r) {
+            Ok(()) => (u64::from_le_bytes(r) % (i as u64 + 1)) as usize,
+            Err(_) => i,
+        };
+        out.swap(i, j);
+    }
+    out
+}
+
+/// How long a snapshot download may take ([`CHUNK_TIMEOUT`], [`DOWNLOAD_PER_CHUNK`],
+/// [`DOWNLOAD_SLACK`]; tests shorten them).
+#[derive(Clone, Debug)]
+pub struct DownloadLimits {
+    pub chunk_timeout: std::time::Duration,
+    pub per_chunk: std::time::Duration,
+    pub slack: std::time::Duration,
+}
+
+impl Default for DownloadLimits {
+    fn default() -> Self {
+        Self { chunk_timeout: CHUNK_TIMEOUT, per_chunk: DOWNLOAD_PER_CHUNK, slack: DOWNLOAD_SLACK }
+    }
+}
+
+/// Downloads a verified snapshot's chunks into `out`, four at a time, each checked against the
+/// manifest as it arrives. Chunks are identified by their hashes, so any peer holding the same
+/// snapshot can serve them: each chunk is asked of `sources` in turn (the manifest's peer
+/// first), and a source that fails one (an error, a 404, a wrong chunk, or no answer within
+/// `chunk_timeout`) isn't asked again. The whole download must finish within the deadline the
+/// limits give for this many chunks (F62).
+pub async fn download_chunks(client: &reqwest::Client, sources: &[String], v: &Verified, out: &mut impl Write, limits: &DownloadLimits) -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    ensure!(!sources.is_empty(), "no peer to download from");
+    let deadline = limits.slack.saturating_add(limits.per_chunk.saturating_mul(u32::try_from(v.chunks.len()).unwrap_or(u32::MAX)));
+    let failed: Vec<AtomicBool> = sources.iter().map(|_| AtomicBool::new(false)).collect();
+    let fetch = |i: usize| {
+        let failed = &failed;
+        async move {
+            let mut last = anyhow!("no peer left that serves snapshot #{} (chunk {i})", v.height);
+            for (s, src) in sources.iter().enumerate() {
+                if failed[s].load(Ordering::Relaxed) {
+                    continue;
+                }
+                let url = format!("{src}/api/snapshot/{}/chunk/{i}", v.height);
+                let got = match tokio::time::timeout(limits.chunk_timeout, crate::node::get_capped(client, &url, CHUNK_SIZE + 1024)).await {
+                    Ok(Ok(bytes)) => check_chunk(v, i, &bytes).map(|()| bytes),
+                    Ok(Err(e)) => Err(e),
+                    Err(_) => Err(anyhow!("no chunk within {}s", limits.chunk_timeout.as_secs_f64())),
+                };
+                match got {
+                    Ok(bytes) => return Ok(bytes),
+                    Err(e) => {
+                        tracing::debug!(peer = %src, chunk = i, error = %format!("{e:#}"), "chunk failed; asking another peer");
+                        failed[s].store(true, Ordering::Relaxed);
+                        last = e.context(format!("chunk {i} from {src}"));
+                    }
+                }
+            }
+            Err(last)
+        }
+    };
+    let all = async {
+        for batch in (0..v.chunks.len()).collect::<Vec<_>>().chunks(4) {
+            for r in futures::future::join_all(batch.iter().map(|i| fetch(*i))).await {
+                out.write_all(&r?)?;
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+    tokio::time::timeout(deadline, all).await.map_err(|_| anyhow!("the snapshot's {} chunks didn't arrive within {}s", v.chunks.len(), deadline.as_secs()))?
+}
+
+async fn fast_sync_from(client: &reqwest::Client, g: &Genesis, chain: &crate::consensus::Shared, peer: &str, peers: &[String], trust: &crate::checkpoints::Trust, limits: &DownloadLimits) -> Result<u64> {
+    // A snapshot older than our newest checkpoint is no use: ask for one that reaches it.
+    let body = crate::node::get_capped(client, &format!("{peer}/api/snapshot/latest?min={}", trust.newest()), 64 << 20).await?;
     let m: Manifest = serde_json::from_slice(&body)?;
     ensure!(m.blocks.len() as u64 <= 4 * CHECKPOINT_INTERVAL, "the manifest lists {} blocks", m.blocks.len());
     // The history from our newest trusted root through the manifest's epoch, nothing more.
@@ -738,18 +868,9 @@ async fn fast_sync_from(client: &reqwest::Client, g: &Genesis, chain: &crate::co
     // most, never the whole snapshot.
     let part = chain.lock().home.join("base.state.zst.part");
     let mut file = std::io::BufWriter::new(std::fs::File::create(&part)?);
-    for batch in (0..v.chunks.len()).collect::<Vec<_>>().chunks(4) {
-        let futs = batch.iter().map(|i| {
-            let url = format!("{peer}/api/snapshot/{}/chunk/{i}", v.height);
-            let client = client.clone();
-            async move { crate::node::get_capped(&client, &url, CHUNK_SIZE + 1024).await }
-        });
-        for (i, r) in batch.iter().zip(futures::future::join_all(futs).await) {
-            let bytes = r?;
-            check_chunk(&v, *i, &bytes)?;
-            file.write_all(&bytes)?;
-        }
-    }
+    // The manifest's peer first, then the others (any of them may hold the same snapshot).
+    let sources: Vec<String> = std::iter::once(peer.to_string()).chain(peers.iter().filter(|p| *p != peer).cloned()).collect();
+    download_chunks(client, &sources, &v, &mut file, limits).await?;
     file.into_inner().map_err(|e| e.into_error())?.sync_all()?;
     let state = restore_file(&v, &part)?;
     // The epoch anchor (if it's before the snapshot) came certified in the manifest.
