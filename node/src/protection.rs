@@ -895,7 +895,8 @@ mod tests {
         assert!(refused(&p) && p.check_and_record(4, 104, Kind::Nullify, b""));
 
         // Answers that don't count, each for a minute:
-        let cases: Vec<(&str, Box<dyn Fn(&Protection, u64)>)> = vec![
+        type Answer<'a> = Box<dyn Fn(&Protection, u64) + 'a>;
+        let cases: Vec<(&str, Answer)> = vec![
             ("a peer one block ahead (it finalized a view this node never saw)", Box::new(|p, t| p.note_network(&params, 45, 45, &[45, 46], None, t))),
             ("this node's own certificates or sync claims are ahead", Box::new(|p, t| p.note_network(&params, 45, 47, &[45], None, t))),
             ("peers in a later epoch", Box::new(|p, t| p.note_network(&params, 45, 45, &[50], None, t))),
