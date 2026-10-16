@@ -1444,6 +1444,35 @@ mod tests {
         t.replays();
     }
 
+    /// Audit F35 (a mitigation): the mempool gives a name to whoever asked first. Another
+    /// account's registration of a name already waiting isn't admitted, whatever its tip, unless
+    /// the waiting one can no longer be included.
+    #[test]
+    fn a_name_goes_to_whoever_asked_first() {
+        let (alice, mallory) = (keys(1), keys(2));
+        let mut t = chain("names-first", vec![alloc(&alice, 1_000 * FANG, None, "a"), alloc(&mallory, 1_000 * FANG, None, "m")], &[], 600);
+        let first = t.tx(&alice, Action::RegisterName { name: "coinbase".into() });
+        t.c.submit(first.clone()).unwrap();
+        let mut outbid = t.unsigned(&mallory, Action::RegisterName { name: "Coinbase.boo".into() });
+        outbid.tip = FANG;
+        outbid.fee += FANG;
+        let e = t.c.submit(outbid.sign(&mallory)).unwrap_err().to_string();
+        assert!(e.contains("already waiting"), "{e}");
+        // Other names, and the same sender's own txs, aren't affected.
+        t.c.submit(t.tx(&mallory, Action::RegisterName { name: "coinbase2".into() })).unwrap();
+        t.c.produce_block().unwrap();
+        assert_eq!(t.c.state.resolve("coinbase.boo").unwrap(), alice.address());
+        assert!(t.err(&mallory, Action::RegisterName { name: "coinbase".into() }).contains("already taken"));
+        // A waiting registration whose fee no longer covers the base fee holds nothing.
+        let stuck = t.tx(&alice, Action::RegisterName { name: "kraken".into() });
+        t.c.submit(stuck).unwrap();
+        for s in t.c.state.econ.fees.iter_mut() {
+            s.rate *= 100;
+        }
+        t.c.submit(t.tx(&mallory, Action::RegisterName { name: "kraken".into() })).unwrap();
+        t.done();
+    }
+
     /// The sweep visits every name, a batch per block, and wraps around.
     #[test]
     fn the_name_sweep_wraps_around() {

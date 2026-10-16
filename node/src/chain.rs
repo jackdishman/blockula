@@ -3044,6 +3044,9 @@ impl Chain {
         // Ghost Mode: a bounded share of the mempool, and one queued spend per note (a higher tip
         // per byte replaces it). Unsigned ghost txs have no sender: no queue, nonce or simulation.
         let replaces = crate::ghost::mempool_admit(&self.mempool, &self.mempool_ids, &tx)?;
+        if let Action::RegisterName { name } = &tx.action {
+            self.first_to_ask(&tx, name)?;
+        }
         let unsigned = tx.is_unsigned();
         let sender = if unsigned { String::new() } else { tx.sender()? };
         let count = if unsigned { 0 } else { self.pending_count(&sender) };
@@ -3094,6 +3097,23 @@ impl Chain {
         self.mempool_ids.push(id.clone());
         self.publish_mempool();
         Ok((id, true))
+    }
+
+    /// Names go to whoever asked first, as far as this mempool can tell (audit F35, a mitigation):
+    /// a registration of a name that another account's registration, includable in the next
+    /// block, is already waiting for isn't admitted, so outbidding a registration seen in the
+    /// public mempool with a higher tip doesn't work through this node (or any node it has
+    /// reached). A registration that can't be included (its fee no longer covers the base fee)
+    /// doesn't hold the name. A proposer can still put its own registration first in its block:
+    /// that's PLAN.md "Known limits".
+    fn first_to_ask(&self, tx: &Tx, name: &str) -> Result<()> {
+        let Ok(n) = normalize_name(name) else { return Ok(()) };
+        let next = self.height() + 1;
+        let same = |t: &Tx| matches!(&t.action, Action::RegisterName { name } if normalize_name(name).is_ok_and(|m| m == n));
+        if self.mempool.iter().any(|t| t.from != tx.from && same(t) && crate::econ::check_fee(&self.state, t, next).is_ok()) {
+            bail!("another account's registration of {n}{NAME_SUFFIX} is already waiting: names go to whoever asked first");
+        }
+        Ok(())
     }
 
     /// Dry-runs `tx` (from `sender`, at the next height) after the sender's `queued` txs; `Err`
