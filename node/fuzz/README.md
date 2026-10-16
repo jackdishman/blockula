@@ -38,6 +38,14 @@ CI (`.github/workflows/fuzz.yml`) runs the stable checks on PRs that touch `node
 
 The node is a binary crate with no library target, so `src/lib.rs` compiles its modules straight from `node/src` through a `#[path]` module and re-exports them, so the node's `crate::…` paths still resolve. The node crate itself doesn't change. In exchange, this crate repeats the node's module list and `[dependencies]`; `check-sync.sh` (run in CI) fails when they drift. If the node gains a `lib.rs`, this crate can depend on it and drop both copies.
 
+## Results (2026-10-15, local, Apple M-series, nightly-2026-10-06): equivocation evidence
+
+| Target | Executions | Result |
+|---|---|---|
+| `evidence` | 186,811 (120 s, 1 worker), its first run, from the committed seeds; corpus 182 | no crash, no invariant failure |
+
+Certificate-derived conflicts (a validator's direct vote against its signature inside another block's certificate) aren't evidence the chain accepts yet: `ReportEquivocation` carries simplex's own `ConflictingNotarize`/`ConflictingFinalize`/`NullifyFinalize`, which pair two votes. Extracting a vote from a certificate needs simplex's per-signer certificate layout (`pq::Certificate`'s signer bitmap and signatures) to be decoded and re-verified per signer on chain, a new evidence format with its own golden vector and fuzzing. It's tracked as CV-3's pending item in docs/MAINNET.md.
+
 ## Results (2026-10-15, local, Apple M-series, nightly-2026-10-06): the integrated node
 
 After all nine wave 3 packages were merged (schema 4: staking, governance, econ, beacon, upgrade and Ghost Mode state), from the committed seeds:
