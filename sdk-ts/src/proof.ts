@@ -283,6 +283,8 @@ export interface NameRecord {
   owner: string;
   registered_at: number;
   expires_at: number;
+  /** The account the owner offered the name to (`TransferName`); it's still the owner's until they accept it. */
+  offered_to?: string;
 }
 
 export function decodeName(value: Uint8Array): NameRecord {
@@ -293,5 +295,9 @@ export function decodeName(value: Uint8Array): NameRecord {
   // Saturated, so a never-expiring record (u64::MAX) compares as "later than any height".
   const exp = r.u64();
   const expires_at = exp > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(exp);
-  return { name, owner, registered_at, expires_at };
+  // State schema 6 appended `offered_to` (an Option: 0, or 1 and the address); older records end here.
+  if (r.at === value.length) return { name, owner, registered_at, expires_at };
+  const tag = r.u8();
+  if (tag > 1) throw new Error(`name record: bad offered_to tag ${tag}`);
+  return tag === 1 ? { name, owner, registered_at, expires_at, offered_to: r.str() } : { name, owner, registered_at, expires_at };
 }

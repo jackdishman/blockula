@@ -13,7 +13,7 @@ const V = JSON.parse(readFileSync(new URL("./proof-vectors.json", import.meta.ur
   tree_golden: { leaves: [string, string][]; root: string };
   tree: Section;
   state: Section & { alice: { balance: string; nonce: number } };
-  records: { account: { value: string; balance: string; nonce: number; keys: unknown[] }; name: { value: string; name: string; owner: string; registered_at: number; expires_at: number } };
+  records: { account: { value: string; balance: string; nonce: number; keys: unknown[] }; name: { value: string; name: string; owner: string; registered_at: number; expires_at: number; offered_to: string } };
 };
 
 const be32 = (i: number) => new Uint8Array([i >>> 24, (i >>> 16) & 255, (i >>> 8) & 255, i & 255]);
@@ -93,6 +93,13 @@ const a = decodeAccount(hexToBytes(V.records.account.value));
 assert.deepEqual({ balance: a.balance.toString(), nonce: a.nonce, keys: a.keys }, { balance: V.records.account.balance, nonce: V.records.account.nonce, keys: V.records.account.keys });
 assert.throws(() => decodeAccount(hexToBytes(V.records.account.value).slice(0, 20)), /ends early/);
 const n = decodeName(hexToBytes(V.records.name.value));
-assert.deepEqual(n, { name: V.records.name.name, owner: V.records.name.owner, registered_at: V.records.name.registered_at, expires_at: V.records.name.expires_at });
-assert.throws(() => decodeName(hexToBytes(V.records.name.value).slice(0, -1)), /ends early/, "a name record without its expiry isn't read as one that never expires");
+assert.deepEqual(n, { name: V.records.name.name, owner: V.records.name.owner, registered_at: V.records.name.registered_at, expires_at: V.records.name.expires_at, offered_to: V.records.name.offered_to });
+// Older records (before schema 6) end after the expiry; one cut inside it, or inside the offer, is refused.
+const nameBytes = hexToBytes(V.records.name.value);
+const offerLen = 1 + 4 + V.records.name.offered_to.length;
+assert.deepEqual(decodeName(nameBytes.slice(0, -offerLen)), { name: V.records.name.name, owner: V.records.name.owner, registered_at: V.records.name.registered_at, expires_at: V.records.name.expires_at });
+assert.equal(decodeName(Uint8Array.from([...nameBytes.slice(0, -offerLen), 0])).offered_to, undefined);
+assert.throws(() => decodeName(nameBytes.slice(0, -offerLen - 1)), /ends early/, "a name record without its expiry isn't read as one that never expires");
+assert.throws(() => decodeName(nameBytes.slice(0, -1)), /ends early/);
+assert.throws(() => decodeName(Uint8Array.from([...nameBytes.slice(0, -offerLen), 2])), /bad offered_to tag/);
 console.log("✓ proof responses and record decoders");

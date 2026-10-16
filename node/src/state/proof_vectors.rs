@@ -115,7 +115,7 @@ fn records() -> Value {
                 { "key_id": "cd".repeat(32), "label": "claude", "role": { "type": "session", "limit": "10000000000", "period_blocks": 86400, "expires_at": 2000000 }, "added_at": 12 },
             ],
         },
-        "name": { "value": hex::encode(name), "name": "alice", "owner": "boo1owner", "registered_at": 1234, "expires_at": 5678 },
+        "name": { "value": hex::encode(name), "name": "alice", "owner": "boo1owner", "registered_at": 1234, "expires_at": 5678, "offered_to": "boo1taker" },
     })
 }
 
