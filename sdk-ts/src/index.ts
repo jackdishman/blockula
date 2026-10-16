@@ -2,7 +2,7 @@ import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex, hexToBytes, randomBytes, utf8ToBytes } from "@noble/hashes/utils.js";
 import { bech32m } from "@scure/base";
-import { baseFee, parseFang, parseSoul, seanceCommitment, signingBytes, type Action, type BaseFee, type KeyRole, type ProposalKind, type Tx, type UnsignedTx } from "./tx.js";
+import { DEFAULT_TIP_CAP_MULTIPLE, baseFee, maxTip, parseFang, parseSoul, seanceCommitment, signingBytes, type Action, type BaseFee, type KeyRole, type ProposalKind, type Tx, type UnsignedTx } from "./tx.js";
 import { NAMESPACES, checkProofResponse, decodeAccount, decodeName, type ProofResponse, type ProvenRecord } from "./proof.js";
 
 export * from "./tx.js";
@@ -324,7 +324,7 @@ export function proposalSummary(raw: unknown, rules?: { supermajority_bps?: numb
 
 /** Per-transaction options. */
 export interface TxOptions {
-  /** Paid to the block's proposer on top of the base fee: FANG ("0.001") or bigint drops. Default: the wallet's `tip` (0). */
+  /** Paid to the block's proposer on top of the base fee: FANG ("0.001") or bigint drops. Default: the wallet's `tip` (0). At most `tip_cap_multiple` (20) × the base fee (`maxTip`), from transferable FANG. */
   tip?: string | number | bigint;
   /** Blocks from now the tx stays valid (at most the chain's `max_tx_validity_blocks`, an hour of blocks). Default: the wallet's `validForBlocks` (600). */
   validForBlocks?: number;
@@ -407,8 +407,9 @@ export class Wallet {
    * Builds and signs a tx: `fee` = the highest base fee already fixed for the next blocks
    * (`/api/fees` `suggested`) + `tip`, `valid_until` = the current height + `validForBlocks`, and
    * the chain's id and genesis hash from `/api/status`. Only the base fee of the block that
-   * includes it (+ the tip) is charged. To sign offline, build an `UnsignedTx` yourself (with the
-   * chain's `genesis_hash`) and `sign` it.
+   * includes it (+ the tip) is charged. A tip above `tip_cap_multiple` × the lowest upcoming base
+   * fee (`/api/fees` `lowest`, see `maxTip`) is refused here, as nodes would refuse it. To sign
+   * offline, build an `UnsignedTx` yourself (with the chain's `genesis_hash`) and `sign` it.
    */
   async build(action: Action, memo = "", opts: TxOptions = {}): Promise<Tx> {
     await this.client.addressPrefix(); // so `this.account` uses the chain's prefix
@@ -422,6 +423,12 @@ export class Wallet {
     // Binds the tx to this chain instance (not just its id), so it can't replay on a relaunch.
     const unsigned: UnsignedTx = { chain_id: status.chain_id, genesis_hash: status.genesis_hash, from: this.account, nonce: account?.next_nonce ?? 0, fee: "0", tip: tip.toString(), valid_until: status.height + validFor, action, memo };
     unsigned.fee = (baseFee(unsigned, fees.suggested) + tip).toString();
+    if (tip > 0n) {
+      // The cap is a multiple of the base fee of the block that includes the tx: price it at the lowest upcoming one.
+      const multiple = fees.tip_cap_multiple ?? DEFAULT_TIP_CAP_MULTIPLE;
+      const cap = maxTip(unsigned, fees.lowest ?? fees.suggested, multiple);
+      if (tip > cap) throw new Error(`tip too high: at most ${multiple}× the base fee, ${cap} drops for this transaction now`);
+    }
     return this.sign(unsigned);
   }
 
@@ -875,7 +882,7 @@ export class Client {
   /** A name: `status` (`active`, `grace` (expired; only its owner can renew it), `reserved` or `available`), owner, `expires_at`, prices. */
   name(name: string) { return this.call(`/name/${encodeURIComponent(name)}`); }
   /** The base fee: each upcoming block's (`slots`) and `suggested`, which covers any of the next 17 blocks. */
-  fees(): Promise<{ height: number; lag: number; slots: ({ height: number; max_block_bytes: number } & BaseFee)[]; suggested: BaseFee; account_creation_fee: string; [k: string]: unknown }> { return this.call("/fees"); }
+  fees(): Promise<{ height: number; lag: number; slots: ({ height: number; max_block_bytes: number } & BaseFee)[]; suggested: BaseFee; lowest?: BaseFee; tip_cap_multiple?: number; account_creation_fee: string; [k: string]: unknown }> { return this.call("/fees"); }
   /** The governance parameters (node/src/params.rs `ChainParams`; amounts as strings) under `params`, genesis constants under `genesis`, and the issuance year. `paramsOf` flattens it. */
   params() { return this.call("/params"); }
   /** Accounts a key is authorized on (its own address, plus any it was added to). */

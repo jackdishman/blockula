@@ -1139,7 +1139,9 @@ async fn params(State(n): State<Node>) -> ApiResult {
 /// blocks ahead (flat drops, `rate` in milli-drops per byte, the block's tx-byte limit), and
 /// `suggested`, the highest flat part and rate among the upcoming ones: a tx whose `fee` covers
 /// `flat + rate × size / 1000 + tip` is accepted in any of the next `lag` blocks, and is charged
-/// only its block's base fee plus its tip.
+/// only its block's base fee plus its tip. A tip may be at most `tip_cap_multiple` × the base
+/// fee of the block that includes it; `lowest` (the lowest flat part and rate upcoming) prices a
+/// tip that fits the cap in any of them.
 async fn fees(State(n): State<Node>) -> ApiResult {
     use crate::econ::{FEE_LAG, RATE_SCALE};
     let v = n.live.view();
@@ -1147,13 +1149,15 @@ async fn fees(State(n): State<Node>) -> ApiResult {
     let cp = &st.chain_params;
     let slot = |h: u64, s: &crate::econ::FeeSlot| json!({ "height": h, "flat": s.flat.to_string(), "rate": s.rate.to_string(), "max_block_bytes": s.max_block_bytes, "ghost_max_tx_bytes": s.ghost_max_tx_bytes, "ghost_max_block_bytes": s.ghost_max_block_bytes });
     let slots: Vec<Value> = st.econ.fees.iter().enumerate().map(|(i, s)| slot(st.econ.height + i as u64, s)).collect();
-    let s = crate::econ::suggested(st);
+    let (s, low) = (crate::econ::suggested(st), crate::econ::lowest(st));
     Ok(Json(json!({
         "height": st.econ.height,
         "lag": FEE_LAG,
         "rate_scale": RATE_SCALE,
         "slots": slots,
         "suggested": { "flat": s.flat.to_string(), "rate": s.rate.to_string() },
+        "lowest": { "flat": low.flat.to_string(), "rate": low.rate.to_string() },
+        "tip_cap_multiple": cp.tip_cap_multiple,
         "floor": { "flat": cp.base_fee_floor_flat.to_string(), "per_byte": cp.base_fee_floor_per_byte.to_string() },
         "target_fullness_bps": cp.target_fullness_bps,
         "max_change_bps": cp.base_fee_max_change_bps,
@@ -2234,6 +2238,7 @@ mod http_tests {
         assert_eq!((f["lag"].as_u64(), f["slots"].as_array().unwrap().len()), (Some(17), 18));
         assert_eq!((f["slots"][17]["height"].as_u64(), f["slots"][0]["rate"].as_str()), (Some(17), Some("10000")));
         assert_eq!((f["suggested"]["flat"].as_str(), f["suggested"]["rate"].as_str(), f["rate_scale"].as_u64()), (Some("10000"), Some("10000"), Some(1_000)));
+        assert_eq!((f["lowest"]["flat"].as_str(), f["lowest"]["rate"].as_str(), f["tip_cap_multiple"].as_u64()), (Some("10000"), Some("10000"), Some(20)));
         assert_eq!((f["floor"]["per_byte"].as_str(), f["account_creation_fee"].as_str()), (Some("10"), Some("100000000")));
         let (_, p, _) = call(&n, "GET", "/api/params", None, "127.0.0.1:1").await;
         assert_eq!((p["params"]["max_block_bytes"].as_str(), p["params"]["name_price_5"].as_str()), (Some("2097152"), Some("5000000000")));

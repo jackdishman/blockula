@@ -1759,7 +1759,9 @@ mod tests {
     /// count. Beyond `MAX_REPLAY` ancestors the verifier abstains.
     #[test]
     fn verify_replays_unexecuted_ancestors_exactly() {
-        let (home, mut c, seed) = home_at_zero("replay");
+        // Tips up to 1,000× the base fee, so one tx can spend nearly all of P's balance.
+        let params = [("tip_cap_multiple".to_string(), 1_000)].into_iter().collect();
+        let (home, mut c, seed) = home_at_zero_with("replay", SummonOpts { params, ..SummonOpts::new("replay", 1) });
         let (chain_id, genesis_hash) = (c.genesis.chain_id.clone(), c.genesis_hash.clone());
         let junk_genesis = genesis_hash.clone();
         let signed = move |from: &crate::crypto::Keys, nonce: u64, tip: u64, to: String, amount: u64| {
@@ -1768,18 +1770,19 @@ mod tests {
             t.sign(from)
         };
         let (me, p) = (crate::crypto::Keys::from_seed(seed), crate::crypto::Keys::from_seed([4; 32]));
-        // P holds 1 FANG: enough for one tx with a tip that leaves it 1,000 drops.
-        c.produce_block_with(vec![signed(&me, 0, 0, p.address(), DROPS_PER_FANG)]).unwrap();
+        // P holds 0.01 FANG: enough for one tx with a tip that leaves it 1,000 drops.
+        let funded = crate::types::MIN_NEW_ACCOUNT;
+        c.produce_block_with(vec![signed(&me, 0, 0, p.address(), funded)]).unwrap();
         let (tip, root) = (Digest(hex_32(c.last_hash())), hex_32(&c.state.root()));
-        assert_eq!(c.state.account(&p.address()).balance, DROPS_PER_FANG);
+        assert_eq!(c.state.account(&p.address()).balance, funded);
         let chain_id = c.genesis.chain_id.clone();
         let chain: Shared = Arc::new(Mutex::new(c));
         deterministic::Runner::timed(Duration::from_secs(120)).start(|context| async move {
             let pricey = |nonce: u64| {
                 let probe = signed(&p, nonce, 0, me.address(), 1);
-                signed(&p, nonce, DROPS_PER_FANG - probe.charge().unwrap() - 1_000, me.address(), 1)
+                signed(&p, nonce, funded - probe.charge().unwrap() - 1_000, me.address(), 1)
             };
-            assert_eq!(pricey(0).charge().unwrap(), DROPS_PER_FANG - 1_000);
+            assert_eq!(pricey(0).charge().unwrap(), funded - 1_000);
             let send = |nonce: u64| signed(&me, nonce, 0, p.address(), DROPS_PER_FANG);
             let leader = PrivateKey::from_seed_bytes(seed).public_key();
             let mut app = App { chain: chain.clone(), block_time_ms: 1_000, address_prefix: "boo".into() };

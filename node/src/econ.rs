@@ -284,6 +284,18 @@ pub fn suggested(state: &State) -> FeeSlot {
     .unwrap_or_else(|| FeeSlot::floor(&state.chain_params))
 }
 
+/// The lowest flat part and rate among the slots fixed after the last executed height (`/api/fees`
+/// serves it as `lowest`): a tip within `tip_cap_multiple` × the base fee at it fits the cap
+/// ([`check_tip`]) in any of those blocks.
+pub fn lowest(state: &State) -> FeeSlot {
+    let upcoming = state.econ.fees.iter().skip(1);
+    upcoming.fold(None, |acc: Option<FeeSlot>, s| Some(match acc {
+        None => *s,
+        Some(a) => FeeSlot { flat: a.flat.min(s.flat), rate: a.rate.min(s.rate), ..a },
+    }))
+    .unwrap_or_else(|| FeeSlot::floor(&state.chain_params))
+}
+
 /// A `fee` (without tip) for a tx of `size` bytes that covers the base fee of any block in the
 /// next `FEE_LAG` ([`suggested`]'s). Wallets and the node's own txs use it; only the block's
 /// actual base fee is charged.

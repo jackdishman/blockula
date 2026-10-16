@@ -411,7 +411,10 @@ fn namespaces_and_meta_keys_are_unique() {
 /// without the block-hash seed; 13 records): the JS side re-derived the simple records' bytes
 /// (scalars, the account) and rebuilt the tree from the node's dump of the rest. Schema 5 (the
 /// fee slots' ghost limits) changes only the `schema` record here (the default state's fee ring
-/// is empty); the SDK's vector test re-checks the regenerated root and proofs.
+/// is empty); the SDK's vector test re-checks the regenerated root and proofs. Schema 6 changes
+/// the `schema` record and `chain_params` (`tip_cap_multiple`, 20, after
+/// `max_tx_validity_blocks`); the record bytes were re-derived independently from the defaults
+/// and the SDK rebuilt the root from them.
 #[test]
 fn golden_encodings() {
     let acct = Account { balance: 5, nonce: 2, keys: Default::default(), locks: vec![] };
@@ -422,7 +425,7 @@ fn golden_encodings() {
     st.commit_block().unwrap();
     assert_eq!(st.root_hash(), st.full_root());
     assert_eq!(st.record_count(), 13);
-    assert_eq!(st.root(), "2a47baa1686f29adfe7693211d2087518ebb2d922e339e5f61c89906e9ad87e3");
+    assert_eq!(st.root(), "e275713ecd5b9313dc1ba4557e00065a97ac41a8d78ab2a4913437edc121c3dd");
 }
 
 fn million_accounts() -> State {

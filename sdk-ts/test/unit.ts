@@ -9,7 +9,7 @@ import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex, hexToBytes, utf8ToBytes } from "@noble/hashes/utils.js";
 import {
   ChainMismatchError, Client, RELEASE_SIGNATURE_FORMAT, Wallet, addressFromPublicKey, bareName, buildDistribution, convictionWeight, distributionLeaf, distributionNode,
-  keyId, minFee, paramsOf, proposal, proposalSummary, releaseMessage, sharesFor, signingBytes, stakeSummary, verifyDistributionProof, verifyReleaseSignature, type Action,
+  keyId, maxTip, minFee, paramsOf, proposal, proposalSummary, releaseMessage, sharesFor, signingBytes, stakeSummary, verifyDistributionProof, verifyReleaseSignature, type Action,
   type Tx,
 } from "../src/index.js";
 
@@ -143,6 +143,29 @@ assert.throws(() => proposal.grantSoul(BOB, "1.2345", "r"), /Soul/);
 assert.throws(() => proposal.scheduleUpgrade(0, 10), /version/);
 assert.deepEqual(proposal.grantSoul("bob.boo", "2.5", "r"), { type: "grant_soul", to: "bob.boo", amount: 2500, reason: "r" });
 console.log(`✓ ${refused.length} bad calls refused before signing`);
+
+// ---- the tip cap (node/src/econ.rs `check_tip`): at most `tip_cap_multiple` × the base fee ----
+
+{
+  const probe = await me.build({ type: "unlock" });
+  const floorCap = maxTip(probe);
+  assert.equal(floorCap, 20n * minFee(probe), "20× the floor base fee by default");
+  const fees = node.routes["/fees"] as Record<string, unknown>;
+  const tipped = await me.build({ type: "unlock" }, "", { tip: floorCap });
+  assert.equal(BigInt(tipped.fee), minFee(tipped) + floorCap, "a tip at the cap is fine");
+  await assert.rejects(me.build({ type: "unlock" }, "", { tip: floorCap + 1n }), /tip too high: at most 20× the base fee/);
+  // The chain's own multiple, priced at the lowest upcoming base fee.
+  fees.tip_cap_multiple = 3;
+  fees.lowest = { flat: "10000", rate: "10000" };
+  fees.suggested = { flat: "20000", rate: "20000" };
+  const cap = maxTip(probe, fees.lowest as { flat: string; rate: string }, 3);
+  await me.build({ type: "unlock" }, "", { tip: cap });
+  await assert.rejects(me.build({ type: "unlock" }, "", { tip: cap + 1n }), /at most 3× the base fee/);
+  fees.suggested = { flat: "10000", rate: "10000" };
+  delete fees.tip_cap_multiple;
+  delete fees.lowest;
+  console.log("✓ tips above tip_cap_multiple × the lowest upcoming base fee are refused before signing");
+}
 
 // ---- chain pinning: every status (and so every signature) is checked ----
 
