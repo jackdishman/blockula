@@ -431,6 +431,13 @@ burned. A ghost tx that can't be included is skipped, and P-STAKE charges the pr
   alone (`ghost::statement`: digests from the bundle, the value balance from the tag and fields
   in `i128` through `ValueBalance::new`, the sighash). A block with an invalid proof is
   permanently invalid and gets a no.
+- **Gossip** screens cheapest-first (audit F30, `consensus::screen_gossip`): the size before
+  anything is copied, a muted peer or bytes already found invalid, then (parsed) a tx already in
+  the mempool, finalized or being verified, the base fee and Ghost Mode being on, and only then
+  the signature. A ghost proof is verified off the ingest loop, within a per-peer budget (8 a
+  second, bursts of 32; 16 in flight over all peers), once per tx however many peers relay it. A
+  peer that relays a bad signature or proof (honest nodes verify every tx before they send it) has
+  its mempool gossip dropped unread for 5 minutes; its votes and blocks are unaffected.
 - **Admission and execution**, deterministically: the feature on and unpaused, the size limit,
   the instance, the fee floor, the turnstile (`pool ≥ value leaving`), the recipient, a usable
   anchor, unspent nullifiers, room for two leaves (`size + 2 ≤ CAPACITY`), and the proof again.
