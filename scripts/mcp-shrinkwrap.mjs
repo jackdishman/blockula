@@ -58,6 +58,9 @@ while (todo.length) {
     fail(`${name} (needed by ${from}) isn't in package-lock.json; run npm install`);
   }
   if (closure.has(path)) continue;
+  // A copy nested under a workspace (mcp/node_modules/…, sdk-ts/node_modules/…) would need its
+  // path rewritten for the published package; npm hoists today, so refuse rather than guess.
+  if (!path.startsWith("node_modules/")) fail(`${path} (needed by ${from}) is nested under a workspace; hoist it (npm dedupe) or teach this script to relocate it`);
   const entry = packages[path];
   closure.set(path, entry);
   const own = entry.link ? entry.resolved : path;
