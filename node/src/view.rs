@@ -14,7 +14,7 @@
 use crate::chain::{Base, Genesis, HuntStatus, Role, State};
 use crate::epochs::EpochRegistry;
 use crate::store::{hash32, ix, BlockMeta, SegReader, Snap};
-use crate::types::{Block, Tx, NAME_SUFFIX};
+use crate::types::{normalize_name, Action, Block, Tx, NAME_SUFFIX};
 use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -109,8 +109,19 @@ pub struct MempoolView {
     txs: imbl::OrdMap<u64, Pending>,
     ids: imbl::HashMap<String, u64>,
     senders: imbl::HashMap<String, usize>,
+    /// Pending name registrations: (normalized name, arrival seq), so a name's waiting
+    /// registrations are a range read, not a mempool scan ([`MempoolView::registrations`]).
+    names: imbl::OrdSet<(String, u64)>,
     failed: imbl::HashMap<String, (String, u64)>,
     next: u64,
+}
+
+/// The normalized name a tx registers, if it's a registration of a well-formed name.
+fn registers(tx: &Tx) -> Option<String> {
+    match &tx.action {
+        Action::RegisterName { name } => normalize_name(name).ok(),
+        _ => None,
+    }
 }
 
 impl MempoolView {
@@ -140,6 +151,12 @@ impl MempoolView {
         self.senders.get(sender).copied().unwrap_or(0)
     }
 
+    /// The pending registrations of `name` (normalized), newest first.
+    pub fn registrations<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a Pending> + 'a {
+        let range = (name.to_string(), 0)..=(name.to_string(), u64::MAX);
+        self.names.range(range).rev().filter_map(|(_, seq)| self.txs.get(seq))
+    }
+
     /// Why a tx failed or was dropped, if it did recently.
     pub fn failure(&self, id: &str) -> Option<&(String, u64)> {
         self.failed.get(id)
@@ -152,6 +169,9 @@ impl MempoolView {
         let seq = self.next;
         self.next += 1;
         *self.senders.entry(tx.from.clone()).or_default() += 1;
+        if let Some(name) = registers(tx) {
+            self.names.insert((name, seq));
+        }
         self.txs.insert(seq, Pending { id: id.clone(), tx: Arc::new(tx.clone()), added_at });
         self.ids.insert(id, seq);
     }
@@ -159,6 +179,9 @@ impl MempoolView {
     pub(crate) fn remove(&mut self, id: &str) {
         let Some(seq) = self.ids.remove(id) else { return };
         let Some(Pending { tx, .. }) = self.txs.remove(&seq) else { return };
+        if let Some(name) = registers(&tx) {
+            self.names.remove(&(name, seq));
+        }
         if let Some(n) = self.senders.get_mut(&tx.from) {
             *n -= 1;
             if *n == 0 {

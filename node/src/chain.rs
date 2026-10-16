@@ -1729,6 +1729,12 @@ pub const CERT_CHECKPOINT: u64 = 100;
 /// Mempool txs not included within this many blocks are dropped (they stay valid until their
 /// `valid_until`, so a holder could resubmit them).
 pub const MEMPOOL_TTL_BLOCKS: u64 = 600;
+/// A waiting name registration keeps other accounts' registrations of the name out of the
+/// mempool for this many blocks after it arrived ([`Chain::first_to_ask`]): the window the
+/// suggested fee covers. A registration still waiting after that is being outbid on tips anyway,
+/// and holds nothing, so a zero-tip registration can't keep a name from anyone while blocks are
+/// full.
+pub const NAME_HOLD_BLOCKS: u64 = crate::econ::FEE_LAG;
 /// How long the node's own txs (faucet drips, attestations) stay valid.
 pub const OWN_TX_VALIDITY: u64 = 600;
 /// Recently failed/dropped tx ids remembered for `/api/tx/{id}`.
@@ -3100,17 +3106,24 @@ impl Chain {
     }
 
     /// Names go to whoever asked first, as far as this mempool can tell (audit F35, a mitigation):
-    /// a registration of a name that another account's registration, includable in the next
-    /// block, is already waiting for isn't admitted, so outbidding a registration seen in the
-    /// public mempool with a higher tip doesn't work through this node (or any node it has
-    /// reached). A registration that can't be included (its fee no longer covers the base fee)
-    /// doesn't hold the name. A proposer can still put its own registration first in its block:
-    /// that's PLAN.md "Known limits".
+    /// a registration of a name that another account's registration is already waiting for isn't
+    /// admitted, whatever its tip, so outbidding a registration seen in the public mempool
+    /// doesn't work through this node (or any node the first one reached first). The waiting one
+    /// holds the name only while it can be included in the next block (its fee covers that
+    /// block's base fee) and for [`NAME_HOLD_BLOCKS`] after it arrived, so a registration that's
+    /// stuck, or left waiting on purpose, keeps the name from nobody. A sender's own txs never
+    /// count against it. The waiting registrations are an index read (newest first, stopping at
+    /// the first that's too old), not a mempool scan. A proposer can still put its own
+    /// registration first in its block: PLAN.md "Known limits".
     fn first_to_ask(&self, tx: &Tx, name: &str) -> Result<()> {
         let Ok(n) = normalize_name(name) else { return Ok(()) };
         let next = self.height() + 1;
-        let same = |t: &Tx| matches!(&t.action, Action::RegisterName { name } if normalize_name(name).is_ok_and(|m| m == n));
-        if self.mempool.iter().any(|t| t.from != tx.from && same(t) && crate::econ::check_fee(&self.state, t, next).is_ok()) {
+        let held = self
+            .mp
+            .registrations(&n)
+            .take_while(|p| p.added_at.saturating_add(NAME_HOLD_BLOCKS) >= next)
+            .any(|p| p.tx.from != tx.from && crate::econ::check_fee(&self.state, &p.tx, next).is_ok());
+        if held {
             bail!("another account's registration of {n}{NAME_SUFFIX} is already waiting: names go to whoever asked first");
         }
         Ok(())

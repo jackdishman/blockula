@@ -1446,23 +1446,47 @@ mod tests {
 
     /// Audit F35 (a mitigation): the mempool gives a name to whoever asked first. Another
     /// account's registration of a name already waiting isn't admitted, whatever its tip, unless
-    /// the waiting one can no longer be included.
+    /// the waiting one can no longer be included or has waited past `NAME_HOLD_BLOCKS`. The
+    /// waiting registrations are indexed by name, and the index follows inclusion and drops.
     #[test]
     fn a_name_goes_to_whoever_asked_first() {
-        let (alice, mallory) = (keys(1), keys(2));
-        let mut t = chain("names-first", vec![alloc(&alice, 1_000 * FANG, None, "a"), alloc(&mallory, 1_000 * FANG, None, "m")], &[], 600);
+        use crate::chain::NAME_HOLD_BLOCKS;
+        let (alice, mallory, carol) = (keys(1), keys(2), keys(3));
+        let mut t = chain("names-first", vec![alloc(&alice, 1_000 * FANG, None, "a"), alloc(&mallory, 1_000 * FANG, None, "m"), alloc(&carol, 1_000 * FANG, None, "c")], &[], 600);
+        let waiting = |t: &T, name: &str| t.c.live.mempool().registrations(name).count();
         let first = t.tx(&alice, Action::RegisterName { name: "coinbase".into() });
         t.c.submit(first.clone()).unwrap();
+        assert_eq!(waiting(&t, "coinbase"), 1);
         let mut outbid = t.unsigned(&mallory, Action::RegisterName { name: "Coinbase.boo".into() });
         outbid.tip = FANG;
         outbid.fee += FANG;
         let e = t.c.submit(outbid.sign(&mallory)).unwrap_err().to_string();
         assert!(e.contains("already waiting"), "{e}");
-        // Other names, and the same sender's own txs, aren't affected.
+        // Resubmitting the waiting one is idempotent, and other names aren't affected.
+        t.c.submit(first).unwrap();
         t.c.submit(t.tx(&mallory, Action::RegisterName { name: "coinbase2".into() })).unwrap();
+        assert_eq!((waiting(&t, "coinbase"), waiting(&t, "coinbase2")), (1, 1));
         t.c.produce_block().unwrap();
         assert_eq!(t.c.state.resolve("coinbase.boo").unwrap(), alice.address());
+        assert_eq!((waiting(&t, "coinbase"), waiting(&t, "coinbase2")), (0, 0), "included registrations leave the index");
         assert!(t.err(&mallory, Action::RegisterName { name: "coinbase".into() }).contains("already taken"));
+
+        // A registration left waiting holds the name for NAME_HOLD_BLOCKS after it arrived, then
+        // nothing: (here) empty blocks stand in for full ones it's outbid in.
+        t.c.submit(t.tx(&alice, Action::RegisterName { name: "binance".into() })).unwrap();
+        t.blocks(NAME_HOLD_BLOCKS);
+        assert!(t.err(&mallory, Action::RegisterName { name: "binance".into() }).contains("already waiting"));
+        t.blocks(1);
+        let late = t.tx(&mallory, Action::RegisterName { name: "binance".into() });
+        t.c.submit(late.clone()).unwrap();
+        assert_eq!(waiting(&t, "binance"), 2);
+        // Alice's own txs are never held off by it; mallory's newer one now holds the name.
+        t.c.submit(t.tx(&alice, Action::Transfer { to: mallory.address(), amount: FANG })).unwrap();
+        assert!(t.err(&carol, Action::RegisterName { name: "binance".into() }).contains("already waiting"));
+        // Dropping a waiting registration (here: a full node's failed forward) unindexes it.
+        t.c.drop_pending(&late.id());
+        assert_eq!(waiting(&t, "binance"), 1);
+
         // A waiting registration whose fee no longer covers the base fee holds nothing.
         let stuck = t.tx(&alice, Action::RegisterName { name: "kraken".into() });
         t.c.submit(stuck).unwrap();
