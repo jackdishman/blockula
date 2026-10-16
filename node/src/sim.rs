@@ -105,24 +105,29 @@ static HTTP_PEERS: std::sync::LazyLock<Mutex<HttpPeers>> = std::sync::LazyLock::
 fn serve_http_view(ctx: &deterministic::Context, genesis: &Genesis, idx: usize, run: usize, chain: &Shared, protection: &Arc<Protection>) {
     let instance = ident(genesis).1;
     HTTP_PEERS.lock().entry(instance.clone()).or_default().insert(idx, (run, Arc::downgrade(chain), false));
-    let (chain, protection) = (chain.clone(), protection.clone());
+    // Weak, like the registry: a crashed run's chain closes when the test drops it.
+    let (chain, protection) = (Arc::downgrade(chain), protection.clone());
     ctx.child("http_view").spawn(move |ctx| async move {
         loop {
-            let peers: Vec<Shared> = {
+            // Nothing strong is held across the sleep: a dropped run's chain must close.
+            let answers = {
                 let all = HTTP_PEERS.lock();
                 let mine = &all[&instance];
                 match mine.get(&idx) {
                     Some((r, _, _)) if *r != run => return,
-                    Some((_, _, true)) => vec![],
-                    _ => mine.iter().filter(|(i, (_, _, cut))| **i != idx && !cut).filter_map(|(_, (_, c, _))| c.upgrade()).collect(),
+                    Some((_, _, true)) => Some(vec![]),
+                    _ if !protection.watching() => None,
+                    _ => Some(mine.iter().filter(|(i, (_, _, cut))| **i != idx && !cut).filter_map(|(_, (_, c, _))| c.upgrade()).collect::<Vec<Shared>>()),
                 }
             };
-            if protection.watching() {
+            if let Some(peers) = answers.filter(|_| protection.watching()) {
+                let Some(chain) = chain.upgrade() else { return };
                 let tips: Vec<u64> = peers.iter().map(|c| c.lock().network_height_claimed()).collect();
                 let (params, height, claimed) = {
                     let c = chain.lock();
                     (c.state.params.clone(), c.height(), c.network_height_claimed())
                 };
+                drop((chain, peers));
                 let now = ctx.current().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
                 protection.note_network(&params, height, claimed, &tips, None, now);
             }
@@ -865,6 +870,106 @@ fn a_validator_restored_from_an_old_snapshot_does_not_double_sign() {
         let roots: Vec<String> = vals.iter().map(|v| v.chain.lock().root_at(top).unwrap()).collect();
         assert!(roots.windows(2).all(|w| w[0] == w[1]), "state roots diverged at {top}: {roots:?}");
         println!("✓ restored validator resumed at view {first} (earlier run: through {old_view}, snapshot at {snapshot_view}); {} signatures, none conflicting; in {signed_certs} certificates", later.len());
+    });
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// A storage partition's blobs as they stand (a volume snapshot of it).
+async fn snapshot_partition(context: &deterministic::Context, partition: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+    use commonware_runtime::{Blob as _, Storage as _};
+    let mut out = vec![];
+    for name in context.scan(partition).await.unwrap_or_default() {
+        let (blob, len) = context.open(partition, &name).await.unwrap();
+        let bytes = blob.read_at(0, len as usize, Default::default()).await.unwrap().coalesce();
+        out.push((name, bytes.as_ref().to_vec()));
+    }
+    out
+}
+
+/// Puts a partition back as [`snapshot_partition`] found it.
+async fn restore_partition(context: &deterministic::Context, partition: &str, blobs: &[(Vec<u8>, Vec<u8>)]) {
+    use commonware_runtime::{Blob as _, Storage as _};
+    let _ = context.remove(partition, None).await;
+    for (name, bytes) in blobs {
+        let (blob, _) = context.open(partition, name).await.unwrap();
+        blob.write_at(0, bytes.clone(), Default::default()).await.unwrap();
+        blob.sync().await.unwrap();
+    }
+}
+
+/// Audit F18, end to end (the auditor's engine-level PoC): a validator restored from an old
+/// volume snapshot (its record and its simplex journal rolled back together, so its engine
+/// resumes right after the snapshot's views) that can't reach the network at all, neither over
+/// p2p nor HTTP (what a node stuck in an epoch the network has left, or a restored host without
+/// working networking, sees). The network is live without it. It sees no certificates, but that
+/// silence isn't a halted network, so slashing protection's escape never fires: it signs nothing,
+/// however long it waits. Reconnected, it watches the network move on and votes again, never in a
+/// view its earlier run signed in.
+#[test]
+fn a_restored_validator_cut_off_from_the_network_never_signs() {
+    let (root, homes, genesis, seeds) = summon_with("restore-cut", 1_000, &[]);
+    let executor = deterministic::Runner::timed(Duration::from_secs(1_800));
+    executor.start(|context| async move {
+        let mut oracle = network(&context, &genesis, &[]).await;
+        let mut vals = vec![];
+        for (i, (home, seed)) in homes.iter().zip(&seeds).enumerate() {
+            vals.push(start(&context, &mut oracle, &genesis, i, 0, home.clone(), PrivateKey::from_seed_bytes(*seed)).await);
+        }
+        wait_for_height(&context, &vals, 10).await;
+        let record = vals[1].home.join(crate::protection::RECORD_FILE);
+        let snapshot = std::fs::read(&record).unwrap();
+        let snapshot_view = vals[1].protection.record().last_view();
+        let journal = snapshot_partition(&context, &consensus::simplex_partition("v1", 0)).await;
+        assert!(!journal.is_empty());
+        let h = vals[0].chain.lock().height();
+        wait_for_height(&context, &vals, h + 15).await;
+        let mut v = vals.remove(1);
+        v.handle.take().unwrap().abort();
+        let earlier = v.protection.log();
+        let old_view = v.protection.record().last_view();
+        let (home, key) = (v.home.clone(), v.key.clone());
+        drop(v);
+        assert!(old_view > snapshot_view + 10, "it signed {} views after the snapshot", old_view - snapshot_view);
+        // Restored from the snapshot, on a host that reaches nobody.
+        std::fs::write(&record, &snapshot).unwrap();
+        restore_partition(&context, &consensus::simplex_partition("v1", 0), &journal).await;
+        let me = commonware_cryptography::Signer::public_key(&key);
+        let others: Vec<PublicKey> = vals.iter().map(|v| commonware_cryptography::Signer::public_key(&v.key)).collect();
+        for o in &others {
+            let _ = oracle.remove_link(me.clone(), o.clone()).await;
+            let _ = oracle.remove_link(o.clone(), me.clone()).await;
+        }
+        let restored = start(&context, &mut oracle, &genesis, 1, 1, home, key).await;
+        cut_off(&genesis, 1, true);
+        // Many escape times (20 s at 1 s blocks) later, the network having moved on without it.
+        let h = vals[0].chain.lock().height();
+        wait_for(&context, &vals.iter().collect::<Vec<_>>(), h + 120).await;
+        assert!(restored.protection.log().is_empty(), "it signed while cut off: {:?}", &restored.protection.log()[..1]);
+        assert!(restored.protection.status().abstaining && restored.protection.halted().is_none());
+        // Reconnected: certificates (verified) open the gate the usual way.
+        let link = Link { latency: Duration::from_millis(40), jitter: Duration::from_millis(5), success_rate: probability!(1.0) };
+        for o in &others {
+            oracle.add_link(me.clone(), o.clone(), link.clone()).await.unwrap();
+            oracle.add_link(o.clone(), me.clone(), link.clone()).await.unwrap();
+        }
+        cut_off(&genesis, 1, false);
+        vals.insert(1, restored);
+        let h = vals[0].chain.lock().height();
+        wait_for_height(&context, &vals, h + 25).await;
+        let later = vals[1].protection.log();
+        assert!(later.len() > 20, "it votes again ({} signatures)", later.len());
+        let first = later.iter().map(|(_, v, _, _)| *v).min().unwrap();
+        assert!(first > old_view, "first view signed after the restore: {first}, the earlier run signed through {old_view}");
+        for (e, v, k, hash) in &later {
+            for (e0, v0, k0, hash0) in &earlier {
+                if (e, v) == (e0, v0) {
+                    let conflict = (k == k0 && hash != hash0) || matches!((k, k0), (crate::protection::Kind::Nullify, crate::protection::Kind::Finalize) | (crate::protection::Kind::Finalize, crate::protection::Kind::Nullify));
+                    assert!(!conflict, "double-signed {k:?}/{k0:?} in view {v}");
+                }
+            }
+        }
+        assert!(vals[1].protection.halted().is_none());
+        println!("✓ cut off for 120 blocks: signed nothing; reconnected: resumed at view {first} (earlier run: through {old_view}), {} signatures", later.len());
     });
     std::fs::remove_dir_all(root).ok();
 }
