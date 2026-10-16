@@ -12,8 +12,9 @@ use std::path::PathBuf;
 
 const FANG: u64 = DROPS_PER_FANG;
 /// An unsigned tx's fee in these tests: the base fee of a tx well above a real one's size, plus
-/// the default verify fee (the excess is burned).
-pub(crate) const FEE: u64 = 10_000 + 200_000 * 10 + FANG / 1_000;
+/// the default verify fee (the excess is burned), on the fee grid (`FEE_GRID`).
+pub(crate) const FEE: u64 = 4 * FEE_GRID;
+const _: () = assert!(FEE >= 10_000 + 250_000 * 10 + FANG / 1_000 && FEE % FEE_GRID == 0);
 
 /// Deterministic randomness for test wallets (BLAKE3's XOF). Provers draw their masks from the
 /// OS regardless.
@@ -96,11 +97,12 @@ impl Wallet {
     }
 
     /// An unshield of `amount` to `to` from `note` (of `key`), the rest back to `key`, with fee
-    /// `FEE`.
+    /// `FEE`, plus `account_creation_fee` if `to` has no account yet (as a wallet prices it).
     pub(crate) fn unshield(&mut self, c: &Chain, key: &SpendingKey, note: Note, to: &str, amount: u64) -> Tx {
-        let change = self.output(note.value - amount - FEE, key, key);
+        let fee = FEE + c.state.creation_fee_for(to);
+        let change = self.output(note.value - amount - fee, key, key);
         let act = Act { spends: [spend(c, key, note), self.dummy_spend()], outputs: [change, self.dummy_output()], anchor: anchor(c) };
-        let tx = unsigned(c, Action::Unshield { to: to.into(), amount, bundle: Box::new(act.bundle(instance(c))) }, FEE, 0);
+        let tx = unsigned(c, Action::Unshield { to: to.into(), amount, bundle: Box::new(act.bundle(instance(c))) }, fee, 0);
         act.prove(tx)
     }
 }
@@ -404,8 +406,21 @@ fn shield_transfer_unshield_through_the_node() {
     let note_b = found[0];
     assert_eq!(note_b.value, 60 * FANG);
 
-    // 3. Bob unshields 50 FANG to Carol's transparent account (a new account), with a tip.
+    // 3. Bob unshields 50 FANG to Carol's transparent account (a new account). Opening it burns
+    // `account_creation_fee` like any other account's (DEC-6, audit F13): the fee must cover it
+    // too, or the unshield can't be included.
+    let open = n.c.state.chain_params.account_creation_fee;
+    assert!(open > 0 && n.c.state.creation_fee_for(&carol.address()) == open);
+    let cheap = {
+        let change = n.output(60 * FANG - 50 * FANG - FEE, &ghost_bob, &ghost_bob);
+        let act = Act { spends: [n.spend(&ghost_bob, note_b), n.dummy_spend()], outputs: [change, n.dummy_output()], anchor: n.anchor() };
+        let tx = n.unsigned(Action::Unshield { to: carol.address(), amount: 50 * FANG, bundle: Box::new(act.bundle(n.instance())) }, FEE, 0);
+        act.prove(tx)
+    };
+    assert!(err(n.submit(&cheap)).contains("account_creation_fee"));
+    assert_eq!(n.block(vec![cheap]), vec![false], "can't be included either");
     let tx = n.unshield(&ghost_bob, note_b, &carol.address(), 50 * FANG);
+    assert_eq!(tx.fee, FEE + open);
     assert_eq!(n.c.state.account(&carol.address()).balance, 0);
     // The proof is bound to the fee: a relayer can't raise it (or the tip, or the recipient).
     let mut raised = tx.clone();
@@ -424,9 +439,9 @@ fn shield_transfer_unshield_through_the_node() {
     n.c.produce_block().unwrap();
     let s = &n.c.state;
     assert_eq!(s.account(&carol.address()).balance, 50 * FANG);
-    assert_eq!(s.ghost.meta.pool, 100 * FANG - FEE - 50 * FANG - FEE, "the pool holds exactly the live notes: Alice's and Bob's change");
-    assert_eq!(s.ghost.meta.pool, (40 * FANG - FEE) + (10 * FANG - FEE));
-    assert_eq!(s.supply, supply - FEE);
+    assert_eq!(s.ghost.meta.pool, 100 * FANG - FEE - 50 * FANG - (FEE + open), "the pool holds exactly the live notes: Alice's and Bob's change");
+    assert_eq!(s.ghost.meta.pool, (40 * FANG - FEE) + (10 * FANG - FEE - open));
+    assert_eq!(s.supply, supply - FEE - open, "the fee is burned, the new account's creation fee with it");
     assert!(n.c.describe_last(0).contains(&format!("50 FANG left Ghost Mode for {}", short(&carol.address()))));
     assert_eq!(s.ghost.commitments.len(), 6);
 
@@ -483,7 +498,7 @@ fn double_spends_are_refused() {
     assert_eq!(n.block(vec![first.clone(), second.clone()]), vec![true, false]);
     assert_eq!(n.c.last_block().unwrap().skipped.len(), 1);
     assert!(n.c.failure(&second.id()).unwrap().0.contains("already spent"));
-    assert_eq!(n.c.state.ghost.meta.pool, pool - 10 * FANG - FEE);
+    assert_eq!(n.c.state.ghost.meta.pool, pool - 10 * FANG - FEE - n.c.state.chain_params.account_creation_fee, "it opened Carol's account");
     // In a later block, and at the mempool: refused.
     assert!(err(n.submit(&second)).contains("already spent"));
     assert_eq!(n.block(vec![second.clone()]), vec![false]);
@@ -501,19 +516,32 @@ fn double_spends_are_refused() {
     let same = n.unshield(&key, note, &carol, 11 * FANG);
     n.submit(&low).unwrap();
     assert!(err(n.submit(&same)).contains("already spends one of these notes"));
-    let act_tip = {
-        let change = n.output(100 * FANG - 12 * FANG - FEE - 5_000, &key, &key);
+    // A replacement pays at least the relay of its own bytes on top of the queued tip (audit
+    // F39): one grid step (0.001 FANG) is less than a ~135 KiB tx's base fee, two clear it.
+    let tipped = |n: &mut Net, amount: u64, tip: u64| {
+        let change = n.output(100 * FANG - amount - FEE - tip, &key, &key);
         let act = Act { spends: [n.spend(&key, note), n.dummy_spend()], outputs: [change, n.dummy_output()], anchor: n.anchor() };
-        let tx = n.unsigned(Action::Unshield { to: carol.clone(), amount: 12 * FANG, bundle: Box::new(act.bundle(n.instance())) }, FEE + 5_000, 5_000);
+        let tx = n.unsigned(Action::Unshield { to: carol.clone(), amount, bundle: Box::new(act.bundle(n.instance())) }, FEE + tip, tip);
         act.prove(tx)
     };
+    let relay = crate::econ::base_fee(&n.c.state, n.c.height() + 1, low.size());
+    assert!(FEE_GRID < relay && relay <= 2 * FEE_GRID, "{relay}");
+    let one_step = tipped(&mut n, 12 * FANG, FEE_GRID);
+    assert!(err(n.submit(&one_step)).contains(&format!("a tip of at least {}", 2 * FEE_GRID)));
+    // Off the fee grid: refused whatever the tip (audit F38).
+    let off_grid = tipped(&mut n, 12 * FANG, 2 * FEE_GRID + 1);
+    assert!(err(n.submit(&off_grid)).contains("whole multiples"));
+    let act_tip = tipped(&mut n, 12 * FANG, 2 * FEE_GRID);
     n.submit(&act_tip).unwrap();
     assert!(!n.c.in_mempool(&low.id()) && n.c.in_mempool(&act_tip.id()));
     assert!(n.c.failure(&low.id()).unwrap().0.contains("replaced"));
+    // Replacing that one again costs its tip plus another relay.
+    let again = tipped(&mut n, 13 * FANG, 3 * FEE_GRID);
+    assert!(err(n.submit(&again)).contains(&format!("a tip of at least {}", 4 * FEE_GRID)));
     let proposer = n.c.me().unwrap();
     let before = n.c.state.account(&proposer).balance;
     n.c.produce_block().unwrap();
-    assert_eq!(n.c.state.account(&proposer).balance, before + 5_000, "the tip goes to the proposer");
+    assert_eq!(n.c.state.account(&proposer).balance, before + 2 * FEE_GRID, "the tip goes to the proposer");
     assert_eq!(n.c.state.account(&carol).balance, 22 * FANG);
     n.cleanup();
 }
@@ -578,10 +606,12 @@ fn the_turnstile_bounds_a_counterfeit_note() {
     n.c.state.ghost.roots.insert(fake_root, u64::MAX);
     n.c.state.ghost.retired.insert(u64::MAX, fake_root);
     let spend = || SpendWitness::new(&thief, fake, elsewhere.path(pos).unwrap());
+    // Carol has no account: the unshield's fee covers opening it.
+    let fee = FEE + n.c.state.chain_params.account_creation_fee;
     let carry = |n: &mut Net, amount: u64| {
-        let change = n.output(500 * FANG - amount - FEE, &thief, &thief);
+        let change = n.output(500 * FANG - amount - fee, &thief, &thief);
         let act = Act { spends: [spend(), n.dummy_spend()], outputs: [change, n.dummy_output()], anchor: elsewhere.root() };
-        let tx = n.unsigned(Action::Unshield { to: carol.clone(), amount, bundle: Box::new(act.bundle(n.instance())) }, FEE, 0);
+        let tx = n.unsigned(Action::Unshield { to: carol.clone(), amount, bundle: Box::new(act.bundle(n.instance())) }, fee, 0);
         act.prove(tx)
     };
     let (pool, supply) = (n.c.state.ghost.meta.pool, n.c.state.supply);
@@ -596,18 +626,19 @@ fn the_turnstile_bounds_a_counterfeit_note() {
     assert_eq!((n.c.state.ghost.meta.pool, n.c.state.supply), (pool, supply - junk), "nothing minted, nothing moved");
     assert_eq!(n.c.state.account(&carol).balance, 0);
     // A private transfer whose fee alone is more than the pool holds is stopped the same way.
-    let outputs = [n.output(500 * FANG - (pool + 1), &thief, &thief), n.dummy_output()];
+    let over = pool + FEE_GRID;
+    let outputs = [n.output(500 * FANG - over, &thief, &thief), n.dummy_output()];
     let act = Act { spends: [spend(), n.dummy_spend()], outputs, anchor: elsewhere.root() };
-    let tx = n.unsigned(Action::PrivateTransfer { bundle: Box::new(act.bundle(n.instance())) }, pool + 1, 0);
+    let tx = n.unsigned(Action::PrivateTransfer { bundle: Box::new(act.bundle(n.instance())) }, over, 0);
     let tx = act.prove(tx);
     assert!(err(n.submit(&tx)).contains("turnstile"));
     // Within the pool, the counterfeit does take honest deposits: what the turnstile bounds
     // (and the pool cap with it) is the damage, not the bug.
-    let modest = carry(&mut n, pool - FEE);
+    let modest = carry(&mut n, pool - fee);
     n.submit(&modest).unwrap();
     n.c.produce_block().unwrap();
-    assert_eq!((n.c.state.ghost.meta.pool, n.c.state.account(&carol).balance), (0, pool - FEE));
-    assert_eq!(n.c.state.supply, supply - junk - FEE, "still nothing minted");
+    assert_eq!((n.c.state.ghost.meta.pool, n.c.state.account(&carol).balance), (0, pool - fee));
+    assert_eq!(n.c.state.supply, supply - junk - fee, "still nothing minted");
     n.cleanup();
 }
 
@@ -805,8 +836,10 @@ fn proofs_are_bound_to_their_chain() {
     n.cleanup();
 }
 
-/// The mempool holds at most `MAX_MEMPOOL_GHOST` ghost txs, and one queued spend per note,
-/// which only a higher tip per byte replaces (even when the ghost share is full).
+/// The mempool holds at most `MAX_MEMPOOL_GHOST` ghost txs, and one queued spend per note. A
+/// spend of the same note replaces the queued one, and a full ghost share gives up its cheapest
+/// tx (audit F36: a higher tip gets in), only for a tip higher by a tenth and by the relay of the
+/// newcomer's bytes (audit F39: every displacement pays for itself).
 #[test]
 fn mempool_bounds_ghost_txs() {
     let mk = |i: u32, tip: u64| {
@@ -814,14 +847,58 @@ fn mempool_bounds_ghost_txs() {
         b.nullifiers = [HexBytes([i.to_le_bytes(), [1; 4], [0; 4], [0; 4], [0; 4], [0; 4], [0; 4], [0; 4]].concat()), HexBytes([i.to_le_bytes(), [2; 4], [0; 4], [0; 4], [0; 4], [0; 4], [0; 4], [0; 4]].concat())];
         Tx { chain_id: "c".into(), genesis_hash: "00".repeat(32), from: String::new(), nonce: 0, fee: FEE + tip, tip, valid_until: 9, action: Action::PrivateTransfer { bundle: b }, memo: String::new(), public_key: String::new(), signature: String::new() }
     };
-    let queued: Vec<Tx> = (0..MAX_MEMPOOL_GHOST as u32).map(|i| mk(i, 0)).collect();
+    let relay = FEE_GRID + FEE_GRID / 2;
+    let mut queued: Vec<Tx> = (0..MAX_MEMPOOL_GHOST as u32).map(|i| mk(i, 0)).collect();
+    queued[3] = mk(3, 5 * FEE_GRID);
     let ids: Vec<String> = queued.iter().map(Tx::id).collect();
-    assert!(mempool_admit(&queued[..10], &ids[..10], &mk(999, 0)).unwrap().is_empty(), "room, no conflict");
-    assert!(mempool_admit(&queued, &ids, &mk(999, 0)).unwrap_err().to_string().contains("maximum"));
-    assert!(mempool_admit(&queued, &ids, &mk(7, 0)).unwrap_err().to_string().contains("higher tip"));
-    assert_eq!(mempool_admit(&queued, &ids, &mk(7, 1_000)).unwrap(), vec![ids[7].clone()], "a better-paying spend of the same note replaces the queued one");
+    let admit = |tx: &Tx, evict: bool| mempool_admit(&queued, &ids, tx, relay, evict);
+    assert!(mempool_admit(&queued[..10], &ids[..10], &mk(999, 0), relay, true).unwrap().is_empty(), "room, no conflict");
+    // Full: a tip that doesn't clear the cheapest queued tx's plus the relay is refused…
+    for tip in [0, FEE_GRID] {
+        let e = admit(&mk(999, tip), true).unwrap_err().to_string();
+        assert!(e.contains("maximum") && e.contains(&format!("a tip of at least {}", 2 * FEE_GRID)), "{e}");
+    }
+    // …one that does evicts the newest of the cheapest (only where eviction is allowed).
+    assert_eq!(admit(&mk(999, 2 * FEE_GRID), true).unwrap(), vec![(ids[MAX_MEMPOOL_GHOST - 1].clone(), "evicted from the mempool's full ghost share by a transaction with a higher tip")]);
+    assert!(admit(&mk(999, 2 * FEE_GRID), false).unwrap_err().to_string().contains("maximum"));
+    // The same note: replaced only past the bump (its tip + max(a tenth, the relay)).
+    assert!(admit(&mk(7, 0), true).unwrap_err().to_string().contains("already spends"));
+    assert!(admit(&mk(7, FEE_GRID), true).unwrap_err().to_string().contains(&format!("a tip of at least {}", 2 * FEE_GRID)));
+    assert_eq!(admit(&mk(7, 2 * FEE_GRID), true).unwrap(), vec![(ids[7].clone(), "replaced by a transaction spending the same note with a higher tip")]);
+    assert!(admit(&mk(3, 6 * FEE_GRID), true).unwrap_err().to_string().contains(&format!("a tip of at least {}", 7 * FEE_GRID)), "5 + max(0.5, 1.5) rounds up to 7");
+    assert_eq!(admit(&mk(3, 7 * FEE_GRID), true).unwrap().len(), 1);
     let transfer = Tx { action: Action::GhostPause {}, ..mk(1, 0) };
-    assert!(mempool_admit(&queued, &ids, &transfer).unwrap().is_empty(), "other txs aren't counted");
+    assert!(admit(&transfer, true).unwrap().is_empty(), "other txs aren't counted");
+}
+
+/// Audit F41: junk (proofs that fail, even cheaply) is remembered apart from valid verdicts, so
+/// it can't flush them; valid verdicts are kept least recently used first, and a hit refreshes
+/// one.
+#[test]
+fn junk_doesnt_evict_remembered_verdicts() {
+    let mut v = Verdicts { ok: HashMap::new(), by_use: BTreeMap::new(), clock: 0, failed: HashMap::new(), failed_order: VecDeque::new() };
+    let key = |i: u32| *blake3::hash(&i.to_le_bytes()).as_bytes();
+    v.put(key(0), Ok(()));
+    // A junk proof's verdict: it fails at decoding.
+    let tx = crate::types::tests::vector_tx(Action::PrivateTransfer { bundle: crate::types::tests::vector_bundle(11) });
+    let (public, _) = statement(&tx).unwrap().unwrap();
+    let junk = blockula_ghost::verify(&public, &[1]);
+    assert!(junk.is_err());
+    for i in 1..=(REMEMBERED_VERDICTS + REMEMBERED_FAILURES) as u32 * 2 {
+        v.put(key(1_000_000 + i), junk);
+    }
+    assert_eq!(v.get(&key(0)), Some(Ok(())), "thousands of failures later, still remembered");
+    assert!(v.failed.len() <= REMEMBERED_FAILURES && v.get(&key(1_000_000 + 1)).is_none(), "failures are bounded on their own");
+    assert!(matches!(v.get(&key(1_000_000 + (REMEMBERED_VERDICTS + REMEMBERED_FAILURES) as u32 * 2)), Some(Err(_))));
+    // Valid verdicts: least recently used goes first, and a hit refreshes.
+    for i in 1..REMEMBERED_VERDICTS as u32 {
+        v.put(key(i), Ok(()));
+    }
+    assert_eq!(v.ok.len(), REMEMBERED_VERDICTS);
+    assert_eq!(v.get(&key(0)), Some(Ok(())), "used again: now the freshest");
+    v.put(key(REMEMBERED_VERDICTS as u32), Ok(()));
+    assert_eq!((v.get(&key(0)), v.get(&key(1))), (Some(Ok(())), None), "the least recently used went");
+    assert_eq!((v.ok.len(), v.by_use.len()), (REMEMBERED_VERDICTS, REMEMBERED_VERDICTS));
 }
 
 /// The node's release profile keeps overflow checks on in blockula-ghost and every Plonky3 crate

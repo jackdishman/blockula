@@ -946,7 +946,9 @@ fn ghost_txs_finalize_through_consensus() {
         let h = vals.iter().map(|v| v.chain.lock().height()).min().unwrap();
         let roots: Vec<String> = vals.iter().map(|v| v.chain.lock().root_at(h).unwrap().to_string()).collect();
         assert!(roots.windows(2).all(|w| w[0] == w[1]), "state roots diverged at {h}: {roots:?}");
-        assert!(vals.iter().all(|v| pool(v) == 100 * DROPS_PER_FANG - 50 * DROPS_PER_FANG - 2 * FEE && v.chain.lock().mempool.is_empty()));
+        // The unshield opened Carol's account: its fee covered the creation fee too.
+        let open = vals[0].chain.lock().state.chain_params.account_creation_fee;
+        assert!(vals.iter().all(|v| pool(v) == 100 * DROPS_PER_FANG - 50 * DROPS_PER_FANG - 2 * FEE - open && v.chain.lock().mempool.is_empty()));
         println!("✓ shield, private transfer and unshield finalized; 4 validators agree at height {h}");
     });
     std::fs::remove_dir_all(root).ok();

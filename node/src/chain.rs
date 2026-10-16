@@ -2986,9 +2986,10 @@ impl Chain {
         if self.pool.contains(&id) || self.has_tx(&id) {
             return Ok((id, false));
         }
-        // Ghost Mode: a bounded share of the mempool, and one queued spend per note (a higher tip
-        // per byte replaces it). Unsigned ghost txs have no sender: no queue, nonce or simulation.
-        let replaces = crate::ghost::mempool_admit(&self.mempool, &self.mempool_ids, &tx)?;
+        // Ghost Mode: a bounded share of the mempool, and one queued spend per note (a high enough
+        // tip displaces one). Unsigned ghost txs have no sender: no queue, nonce or simulation.
+        let relay = crate::econ::base_fee(&self.state, self.height() + 1, tx.size());
+        let replaces = crate::ghost::mempool_admit(&self.mempool, &self.mempool_ids, &tx, relay, evict)?;
         let unsigned = tx.is_unsigned();
         let sender = if unsigned { String::new() } else { tx.sender()? };
         let count = if unsigned { 0 } else { self.pending_count(&sender) };
@@ -3002,11 +3003,11 @@ impl Chain {
         let next = self.height() + 1;
         let sim = self.dry_run(&tx, &sender, count)?;
         if !replaces.is_empty() {
-            self.remove_from_mempool(|i| replaces.iter().any(|r| r == i));
-            for r in replaces {
+            self.remove_from_mempool(|i| replaces.iter().any(|(r, _)| r == i));
+            for (r, why) in replaces {
                 self.pool.remove(&r);
                 self.mp.remove(&r);
-                self.note_failed(r, "replaced by a transaction spending the same note with a higher tip".into(), next);
+                self.note_failed(r, why.into(), next);
             }
             self.rebuild_pending();
         }
