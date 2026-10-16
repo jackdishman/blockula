@@ -64,7 +64,9 @@ struct Net {
     /// genesis validators' http addresses entirely (e.g. http://blockula-v0.internal:7070).
     #[arg(long = "peer-http")]
     peer_http: Vec<String>,
-    /// Skip the double-signing guards (missing consensus journal, machine.lock mismatch).
+    /// Skip the double-signing guards (missing consensus journal, machine.lock mismatch) and
+    /// clear a recorded slashing-protection stop (double-sign-halt.json). Only after you've
+    /// proven no other copy of this validator.key is running.
     #[arg(long = "i-know-this-key-is-not-running-elsewhere")]
     force_key: bool,
     /// Replay the whole chain from genesis instead of fast-syncing from a certified snapshot

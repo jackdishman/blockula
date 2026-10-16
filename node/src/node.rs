@@ -126,9 +126,65 @@ fn exit_halted(halt: &Halt) -> ! {
     std::process::exit(halt.exit_code())
 }
 
+/// Where a validator home records that slashing protection stopped it (exit 12). The halt itself
+/// lives in memory, so without this a restart (a supervisor without `RestartPreventExitStatus`,
+/// a redeploy, a host move or reboot) would start the node again next to the other instance. With
+/// it, the node stops again at once, with the same code, until an operator who has found and
+/// stopped the other instance starts it with `--i-know-this-key-is-not-running-elsewhere` (or
+/// deletes the file). Audit F52.
+pub const DOUBLE_SIGN_HALT_FILE: &str = "double-sign-halt.json";
+
+#[derive(Serialize, Deserialize)]
+struct DoubleSignHalt {
+    reason: String,
+    at_ms: u64,
+}
+
+/// Records a slashing-protection halt in `home` (best effort: the node is stopping anyway).
+fn record_double_sign_halt(home: &Path, reason: &str) {
+    let path = home.join(DOUBLE_SIGN_HALT_FILE);
+    let body = serde_json::to_vec_pretty(&DoubleSignHalt { reason: reason.to_string(), at_ms: crate::chain::now_ms() }).unwrap_or_default();
+    let written = std::fs::File::create(&path).and_then(|mut f| {
+        use std::io::Write as _;
+        f.write_all(&body)?;
+        f.sync_all()
+    });
+    if let Err(e) = written {
+        eprintln!("⚠️  couldn't record the halt in {}: {e}. Keep this node stopped until you've found the other instance.", path.display());
+    }
+}
+
+/// The halt to stop with at start if slashing protection stopped this home before and nobody has
+/// cleared it. `force` (`--i-know-this-key-is-not-running-elsewhere`) clears it.
+pub fn recorded_double_sign_halt(home: &Path, force: bool) -> Result<Option<Halt>> {
+    let path = home.join(DOUBLE_SIGN_HALT_FILE);
+    let Ok(bytes) = std::fs::read(&path) else { return Ok(None) };
+    if force {
+        std::fs::remove_file(&path).with_context(|| format!("clearing {}", path.display()))?;
+        eprintln!("⚠️  {} said slashing protection stopped this validator; cleared by --i-know-this-key-is-not-running-elsewhere.", path.display());
+        return Ok(None);
+    }
+    let why = serde_json::from_slice::<DoubleSignHalt>(&bytes).map(|h| h.reason).unwrap_or_else(|_| "(unreadable record)".into());
+    Ok(Some(Halt::DoubleSignRisk {
+        reason: format!(
+            "{why}. Recorded in {} when it stopped; it stays stopped across restarts. Find and stop every other copy of this key, then start once with --i-know-this-key-is-not-running-elsewhere (or delete the file)",
+            path.display()
+        ),
+    }))
+}
+
+/// A validator's stop: a slashing-protection halt is recorded in its home first, so it outlasts
+/// the process.
+fn exit_validator(home: &Path, halt: &Halt) -> ! {
+    if let Halt::DoubleSignRisk { reason } = halt {
+        record_double_sign_halt(home, reason);
+    }
+    exit_halted(halt)
+}
+
 /// Watches a validator for a reason to stop: a halt recorded by execution (--halt-height, an
 /// unsupported version) or another instance signing with its key (slashing protection).
-async fn watch_halts(chain: Shared, protection: Arc<Protection>) {
+async fn watch_halts(chain: Shared, protection: Arc<Protection>, home: PathBuf) {
     let signal = chain.lock().halt.signal.clone();
     loop {
         if let Some(reason) = protection.halted() {
@@ -137,7 +193,7 @@ async fn watch_halts(chain: Shared, protection: Arc<Protection>) {
         if let Some(halt) = signal.get() {
             // The block that halted is stored; wait for the executor to let go of the chain.
             drop(chain.lock());
-            exit_halted(&halt);
+            exit_validator(&home, &halt);
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -547,6 +603,9 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
     if let Some(halt) = chain.halt.signal.get() {
         exit_halted(&halt);
     }
+    if let Some(halt) = recorded_double_sign_halt(&home, net.force_key)? {
+        exit_halted(&halt);
+    }
     double_sign_guard(&home, chain.height(), net.force_key)?;
     check_storage_version(&home)?;
     let genesis = chain.genesis.clone();
@@ -638,6 +697,7 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
     let cfg = cw_tokio::Config::new().with_storage_directory(home.join("consensus"));
     let halt = shared.lock().halt.signal.clone();
     let watched = protection.clone();
+    let validator_home = home.clone();
     let stopped = cw_tokio::Runner::new(cfg).start(|context| async move {
         let ns = [consensus::namespace(&chain_id).as_slice(), b"/p2p"].concat();
         let max_peers = NonZeroUsize::new(consensus::MAX_PEERS_PER_SET).unwrap();
@@ -662,7 +722,7 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
         tokio::spawn(attest_claims(shared.clone()));
         tokio::spawn(beacon_duties(shared.clone(), home.clone(), Duration::from_millis(block_time_ms)));
         tokio::spawn(attest_reverts(shared.clone()));
-        tokio::spawn(watch_halts(shared.clone(), protection.clone()));
+        tokio::spawn(watch_halts(shared.clone(), protection.clone(), home.clone()));
         let mut node = http_node(shared, Some(marshal), peers, &net, &trust);
         node.protection = Some(protection);
         let metrics = context.child("metrics");
@@ -675,7 +735,7 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
         halt.set(Halt::DoubleSignRisk { reason });
     }
     if let Some(h) = halt.get() {
-        exit_halted(&h);
+        exit_validator(&validator_home, &h);
     }
     match stopped {
         Ok(()) => bail!("consensus stopped (a finalized block failed to execute? see the log above)"),
@@ -964,6 +1024,31 @@ mod tests {
         double_sign_guard_with(&h, 10, false, Some("machine-a".into())).unwrap();
         double_sign_guard_with(&h, 10, false, Some("machine-a".into())).unwrap();
         assert!(double_sign_guard_with(&h, 10, false, Some("machine-b".into())).unwrap_err().to_string().contains("machine-a"));
+        std::fs::remove_dir_all(h).ok();
+    }
+
+    /// F52: a slashing-protection stop (exit 12) outlasts the process. Whatever restarts the node
+    /// (a supervisor's restart policy, a redeploy, a host move), it stops again with code 12 until
+    /// the operator clears it with --i-know-this-key-is-not-running-elsewhere.
+    #[test]
+    fn a_double_sign_halt_survives_restarts_until_cleared() {
+        let h = home("sticky");
+        std::fs::create_dir_all(&h).unwrap();
+        assert!(recorded_double_sign_halt(&h, false).unwrap().is_none(), "nothing recorded");
+        record_double_sign_halt(&h, "another instance signed a Finalize vote in epoch 1, view 15");
+        for _ in 0..2 {
+            let halt = recorded_double_sign_halt(&h, false).unwrap().expect("stays halted");
+            assert_eq!(halt.exit_code(), crate::upgrade::EXIT_DOUBLE_SIGN_RISK);
+            let text = halt.to_string();
+            assert!(text.contains("view 15") && text.contains(DOUBLE_SIGN_HALT_FILE) && text.contains("--i-know-this-key-is-not-running-elsewhere"), "{text}");
+        }
+        // The operator found the other copy: one forced start clears it, later starts are normal.
+        assert!(recorded_double_sign_halt(&h, true).unwrap().is_none());
+        assert!(!h.join(DOUBLE_SIGN_HALT_FILE).exists());
+        assert!(recorded_double_sign_halt(&h, false).unwrap().is_none());
+        // A record that doesn't parse still stops the node.
+        std::fs::write(h.join(DOUBLE_SIGN_HALT_FILE), "garbage").unwrap();
+        assert_eq!(recorded_double_sign_halt(&h, false).unwrap().map(|h| h.exit_code()), Some(crate::upgrade::EXIT_DOUBLE_SIGN_RISK));
         std::fs::remove_dir_all(h).ok();
     }
 
