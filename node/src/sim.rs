@@ -687,7 +687,7 @@ async fn conflicter(context: &deterministic::Context, oracle: &mut Oracle<Public
     for c in CHANNELS {
         channels.push(control.register(c, consensus::quota(c)).await.unwrap());
     }
-    let scheme = crate::pq::MlDsaScheme::signer(&consensus::namespace(&genesis.chain_id), consensus::participants(genesis).unwrap(), key).unwrap();
+    let scheme = crate::pq::MlDsaScheme::signer(&consensus::genesis_namespace(genesis), consensus::participants(genesis).unwrap(), key).unwrap();
     context.child("conflicter").spawn(move |_| async move {
         let (mut sender, mut receiver) = channels.remove(consensus::CH_VOTES as usize);
         let mut fake = 0u8;

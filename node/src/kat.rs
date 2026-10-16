@@ -344,7 +344,8 @@ fn long_namespaces_are_hashed_to_a_context() {
 // ------------------------------------------------------------------------------------ Rust ⇄ TS
 
 const CROSS_CHAIN: &str = "blockula-kat";
-/// The cross vectors' chain instance (the genesis hash every tx signs after the chain id).
+/// The cross vectors' chain instance (the genesis hash every tx signs after the chain id, and
+/// part of the consensus namespace votes are signed under).
 fn cross_genesis() -> String {
     hex::encode(crypto::hash(b"blockula-kat genesis"))
 }
@@ -412,8 +413,8 @@ fn rust_signed() -> Value {
         cases.push(c);
     }
     // Consensus votes, signed by simplex through `MlDsaScheme` exactly as validators sign them.
-    let scheme = pq::MlDsaScheme::signer(&consensus::namespace(CROSS_CHAIN), validator_set(), pq::PrivateKey::from_seed_bytes(VALIDATOR_SEEDS[0])).unwrap();
-    let ns = Namespace::derive(&consensus::namespace(CROSS_CHAIN));
+    let scheme = pq::MlDsaScheme::signer(&consensus::namespace(CROSS_CHAIN, &cross_genesis()), validator_set(), pq::PrivateKey::from_seed_bytes(VALIDATOR_SEEDS[0])).unwrap();
+    let ns = Namespace::derive(&consensus::namespace(CROSS_CHAIN, &cross_genesis()));
     let p = kat_proposal();
     let votes = [
         ("consensus/notarize", Subject::Notarize { proposal: &p }, Notarize::sign(&scheme, p.clone()).unwrap().attestation),
@@ -506,7 +507,7 @@ fn cross_ts_signed() {
 
     // Votes: simplex's own verification, then a quorum certificate built from SDK signatures.
     let set = validator_set();
-    let verifier = pq::MlDsaScheme::verifier(&consensus::namespace(CROSS_CHAIN), set.clone());
+    let verifier = pq::MlDsaScheme::verifier(&consensus::namespace(CROSS_CHAIN, &cross_genesis()), set.clone());
     let p = kat_proposal();
     let attestation = |c: &Value| -> Attestation<pq::MlDsaScheme> {
         let pk = pq::PrivateKey::from_seed_bytes(seed_of(c, "seed")).public_key();

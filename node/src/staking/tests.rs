@@ -15,6 +15,12 @@ const FANG: u64 = DROPS_PER_FANG;
 const EPOCH: u64 = 10;
 const CHAIN: &str = "stake-test";
 
+/// The chain instance test txs name (the state machine alone doesn't check it), and so the one
+/// evidence is verified against: consensus votes are signed under `namespace(CHAIN, GENESIS)`.
+fn genesis_hash() -> String {
+    "00".repeat(32)
+}
+
 fn keys(seed: u8) -> Keys {
     Keys::from_seed([seed; 32])
 }
@@ -120,7 +126,7 @@ fn without_issuance(mut st: State) -> State {
 impl T {
     fn tx_from(&self, k: &Keys, from: &str, action: Action) -> Tx {
         // The state machine alone doesn't check the chain instance (admission over HTTP does).
-        let mut tx = Tx { chain_id: CHAIN.into(), genesis_hash: "00".repeat(32), from: from.into(), nonce: self.st.account(from).nonce, fee: 0, tip: 0, valid_until: self.height + 100, action, memo: String::new(), public_key: hex::encode(k.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+        let mut tx = Tx { chain_id: CHAIN.into(), genesis_hash: genesis_hash(), from: from.into(), nonce: self.st.account(from).nonce, fee: 0, tip: 0, valid_until: self.height + 100, action, memo: String::new(), public_key: hex::encode(k.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
         tx.fee = tx.charge().unwrap();
         tx.sign(k)
     }
@@ -235,7 +241,7 @@ impl T {
 /// Signs a vote of validator `i` in `epoch` against the set the state holds for it.
 fn scheme_of(t: &T, i: u8, epoch: u64) -> MlDsaScheme {
     let set = participants(&t.st, epoch).unwrap();
-    MlDsaScheme::signer(&crate::consensus::namespace(CHAIN), set, PrivateKey::from_seed_bytes([vseed(i); 32])).expect("in the set")
+    MlDsaScheme::signer(&crate::consensus::namespace(CHAIN, &genesis_hash()), set, PrivateKey::from_seed_bytes([vseed(i); 32])).expect("in the set")
 }
 
 fn proposal(epoch: u64, view: u64, digest: u8) -> Proposal<Digest> {
@@ -445,7 +451,7 @@ fn double_signing_slashes_the_pool_its_exits_and_pays_the_reporter() {
     let (supply, burned, rep0) = (t.st.supply, t.st.burned, t.balance(&reporter.address()));
     let pool0 = t.stake(&v);
     let evidence = double_notarize(&t, 2, 1, 4);
-    assert_eq!(verify_evidence(&t.st, CHAIN, &hex::decode(&evidence).unwrap(), t.height).unwrap(), Fault { kind: CONFLICTING_NOTARIZE, validator: v.clone(), epoch: 1, view: 4 });
+    assert_eq!(verify_evidence(&t.st, CHAIN, &genesis_hash(), &hex::decode(&evidence).unwrap(), t.height).unwrap(), Fault { kind: CONFLICTING_NOTARIZE, validator: v.clone(), epoch: 1, view: 4 });
     let report = t.tx_from(&reporter, &reporter.address(), Action::ReportEquivocation { evidence: evidence.clone() });
     assert!(t.st.describe(&report, None).ends_with(&format!("reported validator {} for signing two different blocks in epoch 1, view 4", short(&v))));
     assert_eq!(t.apply(&report).unwrap(), Outcome::Applied);
@@ -511,7 +517,7 @@ fn evidence_is_verified_strictly() {
     t.finish_epoch();
     t.blocks(2);
     let h = t.height;
-    let check = |t: &T, hex_ev: &str| verify_evidence(&t.st, CHAIN, &hex::decode(hex_ev).unwrap(), h).map_err(|e| e.to_string());
+    let check = |t: &T, hex_ev: &str| verify_evidence(&t.st, CHAIN, &genesis_hash(), &hex::decode(hex_ev).unwrap(), h).map_err(|e| e.to_string());
     // All three kinds verify.
     let s = scheme_of(&t, 1, 1);
     let fin = |d: u8| Finalize::sign(&s, proposal(1, 3, d)).unwrap();
@@ -529,11 +535,11 @@ fn evidence_is_verified_strictly() {
     let pk = |seed: u8| commonware_cryptography::Signer::public_key(&PrivateKey::from_seed_bytes([seed; 32]));
     let set = participants(&t.st, 1).unwrap();
     let swapped = commonware_utils::ordered::Set::try_from(set.iter().cloned().map(|k| if k == pk(vseed(1)) { pk(99) } else { k }).collect::<Vec<_>>()).unwrap();
-    let s99 = MlDsaScheme::signer(&crate::consensus::namespace(CHAIN), swapped, PrivateKey::from_seed_bytes([99; 32])).unwrap();
+    let s99 = MlDsaScheme::signer(&crate::consensus::namespace(CHAIN, &genesis_hash()), swapped, PrivateKey::from_seed_bytes([99; 32])).unwrap();
     let forged = Activity::ConflictingNotarize(ConflictingNotarize::new(Notarize::sign(&s99, proposal(1, 3, 1)).unwrap(), Notarize::sign(&s99, proposal(1, 3, 2)).unwrap()));
     assert!(check(&t, &hex::encode(forged.encode())).unwrap_err().contains("don't verify"), "a stranger's votes in a member's slot");
     // Another chain's namespace (a vote replayed from a testnet with the same keys).
-    let other = MlDsaScheme::signer(&crate::consensus::namespace("other-chain"), participants(&t.st, 1).unwrap(), PrivateKey::from_seed_bytes([vseed(1); 32])).unwrap();
+    let other = MlDsaScheme::signer(&crate::consensus::namespace("other-chain", &genesis_hash()), participants(&t.st, 1).unwrap(), PrivateKey::from_seed_bytes([vseed(1); 32])).unwrap();
     let replayed = Activity::ConflictingNotarize(ConflictingNotarize::new(Notarize::sign(&other, proposal(1, 3, 1)).unwrap(), Notarize::sign(&other, proposal(1, 3, 2)).unwrap()));
     assert!(check(&t, &hex::encode(replayed.encode())).unwrap_err().contains("don't verify"));
     // Mismatched: the two votes from different members don't decode as one fault.
@@ -565,17 +571,63 @@ fn evidence_is_verified_strictly() {
     let max_age = t.st.chain_params.evidence_max_age_epochs;
     let old = double_notarize(&t, 1, 1, 3);
     let late = h + (max_age + 1) * EPOCH;
-    assert!(verify_evidence(&t.st, CHAIN, &hex::decode(&old).unwrap(), late).unwrap_err().to_string().contains("too old"));
+    assert!(verify_evidence(&t.st, CHAIN, &genesis_hash(), &hex::decode(&old).unwrap(), late).unwrap_err().to_string().contains("too old"));
     // A set the state no longer holds can't be checked.
     let mut pruned = t.st.clone();
     pruned.active_sets.remove(&1);
-    assert!(verify_evidence(&pruned, CHAIN, &hex::decode(&old).unwrap(), h).unwrap_err().to_string().contains("no longer in state"));
+    assert!(verify_evidence(&pruned, CHAIN, &genesis_hash(), &hex::decode(&old).unwrap(), h).unwrap_err().to_string().contains("no longer in state"));
     // The status the node's evidence task asks for.
-    assert!(matches!(evidence_status(&t.st, CHAIN, &hex::decode(&old).unwrap(), h), EvidenceStatus::Open(_)));
-    assert_eq!(evidence_status(&t.st, CHAIN, &hex::decode(&future).unwrap(), h), EvidenceStatus::NotYet);
-    assert_eq!(evidence_status(&t.st, CHAIN, &trailing, h), EvidenceStatus::Never);
+    assert!(matches!(evidence_status(&t.st, CHAIN, &genesis_hash(), &hex::decode(&old).unwrap(), h), EvidenceStatus::Open(_)));
+    assert_eq!(evidence_status(&t.st, CHAIN, &genesis_hash(), &hex::decode(&future).unwrap(), h), EvidenceStatus::NotYet);
+    assert_eq!(evidence_status(&t.st, CHAIN, &genesis_hash(), &trailing, h), EvidenceStatus::Never);
     t.ok(&reporter, Action::ReportEquivocation { evidence: old.clone() });
-    assert_eq!(evidence_status(&t.st, CHAIN, &hex::decode(&old).unwrap(), h), EvidenceStatus::Punished);
+    assert_eq!(evidence_status(&t.st, CHAIN, &genesis_hash(), &hex::decode(&old).unwrap(), h), EvidenceStatus::Punished);
+    t.block();
+}
+
+/// Audit F02: a relaunch that keeps the chain id and the validator keys (another genesis) signs
+/// under another consensus namespace. Its votes and certificates, public on the old chain, can't
+/// be paired with this chain's into evidence, and its certificates don't verify here.
+#[test]
+fn votes_from_another_instance_of_the_chain_id_are_not_evidence() {
+    let reporter = keys(203);
+    let mut t = Setup { accounts: vec![(reporter.address(), 1_000 * FANG, None)], ..Default::default() }.start();
+    t.finish_epoch();
+    t.blocks(2);
+    let h = t.height;
+    let set = participants(&t.st, 1).unwrap();
+    let old_instance = "11".repeat(32);
+    let signer = |genesis: &str, i: u8| MlDsaScheme::signer(&crate::consensus::namespace(CHAIN, genesis), set.clone(), PrivateKey::from_seed_bytes([vseed(i); 32])).unwrap();
+    let (here, there) = (signer(&genesis_hash(), 1), signer(&old_instance, 1));
+    // Both instances finalized view 3 of epoch 1, each its own block (their genesis blocks differ).
+    let fin_here = Finalize::sign(&here, proposal(1, 3, 1)).unwrap();
+    let fin_there = Finalize::sign(&there, proposal(1, 3, 2)).unwrap();
+    let null_there = Nullify::sign::<Digest>(&there, Round::new(Epoch::new(1), View::new(3))).unwrap();
+    let forged = [
+        Activity::ConflictingFinalize(ConflictingFinalize::new(fin_there.clone(), fin_here.clone())),
+        Activity::NullifyFinalize(NullifyFinalize::new(null_there, fin_here.clone())),
+        Activity::ConflictingNotarize(ConflictingNotarize::new(Notarize::sign(&there, proposal(1, 3, 2)).unwrap(), Notarize::sign(&here, proposal(1, 3, 1)).unwrap())),
+    ];
+    let pool = t.stake(&vaddr(1));
+    for a in forged {
+        let ev = hex::encode(a.encode());
+        let err = verify_evidence(&t.st, CHAIN, &genesis_hash(), &hex::decode(&ev).unwrap(), h).unwrap_err().to_string();
+        assert!(err.contains("don't verify"), "{err}");
+        assert_eq!(evidence_status(&t.st, CHAIN, &genesis_hash(), &hex::decode(&ev).unwrap(), h), EvidenceStatus::Never);
+        assert!(t.fails(&reporter, Action::ReportEquivocation { evidence: ev }).contains("don't verify"));
+    }
+    assert_eq!((t.stake(&vaddr(1)), t.st.validators[&vaddr(1)].status), (pool, ValidatorStatus::Active), "nobody was slashed");
+    // The old instance's certificate isn't one here (fast sync, snapshots and marshal verify with
+    // this chain's namespace), though it is on its own chain.
+    let verifier = |genesis: &str| MlDsaScheme::verifier(&crate::consensus::namespace(CHAIN, genesis), set.clone());
+    let votes: Vec<_> = (0..3u8).map(|i| Finalize::sign(&signer(&old_instance, i), proposal(1, 3, 2)).unwrap()).collect();
+    let cert = commonware_consensus::simplex::types::Finalization::from_finalizes(&verifier(&old_instance), commonware_utils::iter::NonEmpty::try_new(votes.iter()).unwrap(), &commonware_parallel::Sequential).unwrap();
+    assert!(cert.verify(&mut NoRng, &verifier(&old_instance), &commonware_parallel::Sequential));
+    assert!(!cert.verify(&mut NoRng, &verifier(&genesis_hash()), &commonware_parallel::Sequential));
+    // Genuine evidence from this instance still counts.
+    let fin_here2 = Finalize::sign(&here, proposal(1, 3, 2)).unwrap();
+    let ev = hex::encode(Activity::ConflictingFinalize(ConflictingFinalize::new(fin_here, fin_here2)).encode());
+    t.ok(&reporter, Action::ReportEquivocation { evidence: ev });
     t.block();
 }
 

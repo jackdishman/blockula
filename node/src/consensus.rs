@@ -73,8 +73,24 @@ pub const CH_BLOCKS: u64 = 4;
 pub const CH_MEMPOOL: u64 = 5;
 pub const CHANNELS: [u64; 6] = [CH_VOTES, CH_CERTS, CH_RESOLVER, CH_BACKFILL, CH_BLOCKS, CH_MEMPOOL];
 
-pub fn namespace(chain_id: &str) -> Vec<u8> {
-    format!("blockula/{chain_id}").into_bytes()
+/// The consensus signing domain of one chain *instance*: its id and its genesis hash (hex), as
+/// `Tx::signing_bytes` binds txs (audit #7). Every vote and certificate is signed under it, so a
+/// relaunch that keeps the chain id (same validator keys, another genesis) shares no valid
+/// signature with the old chain: its certificates can't be replayed here, or paired with this
+/// chain's votes into equivocation evidence.
+pub fn namespace(chain_id: &str, genesis_hash: &str) -> Vec<u8> {
+    format!("blockula/{chain_id}/{genesis_hash}").into_bytes()
+}
+
+/// [`namespace`] of `g`'s chain (computes its genesis hash).
+pub fn genesis_namespace(g: &crate::chain::Genesis) -> Vec<u8> {
+    namespace(&g.chain_id, &crate::checkpoints::genesis_hash(g))
+}
+
+/// The p2p handshake's namespace: per chain id (`docs/PQ-TRANSPORT.md`), unchanged by the
+/// consensus domain above.
+pub fn p2p_namespace(chain_id: &str) -> Vec<u8> {
+    format!("blockula/{chain_id}/p2p").into_bytes()
 }
 
 /// Most unexecuted ancestors `propose` and `verify` replay before building on a block or judging
@@ -899,7 +915,10 @@ pub struct EpochProvider {
 
 impl EpochProvider {
     pub fn new(chain: Shared, key: Option<PrivateKey>) -> Self {
-        let namespace = namespace(&chain.lock().genesis.chain_id);
+        let namespace = {
+            let c = chain.lock();
+            namespace(&c.genesis.chain_id, &c.genesis_hash)
+        };
         Self { chain, key, namespace, cache: Default::default(), protection: None }
     }
 
@@ -1336,8 +1355,10 @@ pub const MARSHAL_RETAIN: u64 = 2_000;
 /// Bumped when the on-disk storage layout changes (consensus journals, or the home's own files:
 /// v4 is the segmented block logs and the state database, see `store.rs`; v5 the integrated
 /// protocol v1: txs signed for a genesis hash, state schema 4, block metadata with signals; v6
-/// state schema 5). Dev chains from an older layout reset themselves (`node::dev_is_stale`).
-pub const STORAGE_VERSION: &str = "prunable-v6";
+/// state schema 5; v7 consensus votes signed under the chain instance's namespace, chain id and
+/// genesis hash, so older journals no longer verify). Dev chains from an older layout reset
+/// themselves (`node::dev_is_stale`).
+pub const STORAGE_VERSION: &str = "prunable-v7";
 
 fn archive_config<C>(prefix: &str, name: &str, page_cache: CacheRef, codec_config: C) -> prunable::Config<TwoCap, C> {
     prunable::Config {

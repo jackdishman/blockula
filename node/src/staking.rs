@@ -698,7 +698,8 @@ pub(crate) fn apply(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, s
         }
         Action::ReportEquivocation { evidence } => {
             let bytes = hex::decode(evidence).map_err(|_| anyhow!("evidence must be hex"))?;
-            let fault = verify_evidence(state, &tx.chain_id, &bytes, height)?;
+            // `tx.genesis_hash` is this chain's: admission, gossip and block verification check it.
+            let fault = verify_evidence(state, &tx.chain_id, &tx.genesis_hash, &bytes, height)?;
             let key = pkey(&fault.validator, fault.epoch, fault.view);
             if state.staking.punished.contains_key(&key) {
                 bail!("validator {} was already punished for epoch {}, view {}", short(&fault.validator), fault.epoch, fault.view);
@@ -992,8 +993,10 @@ fn participants(state: &State, epoch: u64) -> Result<commonware_utils::ordered::
 
 /// Checks equivocation evidence at `height`: well-formed ([`decode_evidence`]), from an epoch no
 /// later than now and at most `evidence_max_age_epochs` old whose set the state still holds, and
-/// both votes signed by the same member of that set under this chain's consensus namespace.
-pub fn verify_evidence(state: &State, chain_id: &str, bytes: &[u8], height: u64) -> Result<Fault> {
+/// both votes signed by the same member of that set under this chain instance's consensus
+/// namespace (`consensus::namespace(chain_id, genesis_hash)`: votes from another genesis under
+/// the same chain id never verify).
+pub fn verify_evidence(state: &State, chain_id: &str, genesis_hash: &str, bytes: &[u8], height: u64) -> Result<Fault> {
     let e = decode_evidence(bytes)?;
     let now = state.params.epoch_of(height);
     if e.epoch > now {
@@ -1005,7 +1008,7 @@ pub fn verify_evidence(state: &State, chain_id: &str, bytes: &[u8], height: u64)
     }
     let set = participants(state, e.epoch)?;
     let pk = set.get(e.signer).ok_or_else(|| anyhow!("signer {} isn't in epoch {}'s set of {}", e.signer, e.epoch, set.len()))?.clone();
-    let scheme = MlDsaScheme::verifier(&crate::consensus::namespace(chain_id), set);
+    let scheme = MlDsaScheme::verifier(&crate::consensus::namespace(chain_id, genesis_hash), set);
     if !e.activity.verify(&mut NoRng, &scheme, &commonware_parallel::Sequential) {
         bail!("the evidence's signatures don't verify against epoch {}'s validators", e.epoch);
     }
@@ -1024,12 +1027,12 @@ pub enum EvidenceStatus {
     Never,
 }
 
-pub fn evidence_status(state: &State, chain_id: &str, bytes: &[u8], height: u64) -> EvidenceStatus {
+pub fn evidence_status(state: &State, chain_id: &str, genesis_hash: &str, bytes: &[u8], height: u64) -> EvidenceStatus {
     let Ok(e) = decode_evidence(bytes) else { return EvidenceStatus::Never };
     if e.epoch > state.params.epoch_of(height) {
         return EvidenceStatus::NotYet;
     }
-    match verify_evidence(state, chain_id, bytes, height) {
+    match verify_evidence(state, chain_id, genesis_hash, bytes, height) {
         Ok(f) if state.staking.punished.contains_key(&pkey(&f.validator, f.epoch, f.view)) => EvidenceStatus::Punished,
         Ok(f) => EvidenceStatus::Open(f),
         Err(_) => EvidenceStatus::Never,

@@ -283,11 +283,11 @@ pub async fn report_evidence<E: commonware_runtime::Clock>(context: E, chain: Sh
         if c.syncing() {
             continue;
         }
-        let (height, chain_id) = (c.height() + 1, c.genesis.chain_id.clone());
+        let (height, chain_id, genesis_hash) = (c.height() + 1, c.genesis.chain_id.clone(), c.genesis_hash.clone());
         let fault_of = |evidence: &str| hex::decode(evidence).ok().and_then(|b| decode_evidence(&b).ok()).map(|e| (e.epoch, e.view, e.signer));
         pending.retain(|evidence, submitted| {
             let Ok(bytes) = hex::decode(evidence) else { return false };
-            match evidence_status(&c.state, &chain_id, &bytes, height) {
+            match evidence_status(&c.state, &chain_id, &genesis_hash, &bytes, height) {
                 EvidenceStatus::Punished | EvidenceStatus::Never => false,
                 EvidenceStatus::NotYet => true,
                 EvidenceStatus::Open(fault) => {
@@ -639,7 +639,7 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
     let halt = shared.lock().halt.signal.clone();
     let watched = protection.clone();
     let stopped = cw_tokio::Runner::new(cfg).start(|context| async move {
-        let ns = [consensus::namespace(&chain_id).as_slice(), b"/p2p"].concat();
+        let ns = consensus::p2p_namespace(&chain_id);
         let max_peers = NonZeroUsize::new(consensus::MAX_PEERS_PER_SET).unwrap();
         let mut p2p_cfg = if preset == "local" {
             discovery::Config::local(key.clone(), &ns, listen, dialable, bootstrappers, max_peers, MAX_MESSAGE_SIZE)
@@ -1059,7 +1059,7 @@ mod tests {
             let parent = blocks.last().unwrap().digest();
             blocks.push(CBlock::new(parent, h, h, h - 1, g.created_at_ms + 1000 * h, g.validators[0].address.clone(), 0, root_hash, vec![]));
         }
-        let scheme = MlDsaScheme::signer(&consensus::namespace(&g.chain_id), consensus::participants(&g).unwrap(), PrivateKey::from_seed_bytes(seed)).unwrap();
+        let scheme = MlDsaScheme::signer(&consensus::genesis_namespace(&g), consensus::participants(&g).unwrap(), PrivateKey::from_seed_bytes(seed)).unwrap();
         let last = &blocks[3];
         let vote = Finalize::sign(&scheme, Proposal::new(Round::new(Epoch::new(0), View::new(3)), View::new(2), last.digest())).unwrap();
         let fin = Finalization::from_finalizes(&scheme, commonware_utils::iter::NonEmpty::try_new([vote].iter()).unwrap(), &commonware_parallel::Sequential).unwrap();
