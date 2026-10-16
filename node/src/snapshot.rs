@@ -370,6 +370,7 @@ fn anchor_proof(home: &Path, a: u64, cblock: impl Fn(u64) -> Option<Vec<u8>>, ce
 
 /// Builds the manifest for the newest snapshot this node can prove, from what it has published
 /// (no consensus lock). The validator-set history isn't in it: `/api/epochs` pages serve that.
+#[cfg_attr(not(test), allow(dead_code))] // tests and the simulator; `/api/snapshot/latest` passes the joiner's `min`
 pub fn build_manifest(live: &crate::view::Live) -> Result<Manifest> {
     build_manifest_reaching(live, 0)
 }
@@ -1277,7 +1278,7 @@ mod tests {
                     // The newest long-lived one: the first written in the newest snapshot's
                     // stretch, so it goes only once two later stretches have begun.
                     let big = serving_order(disk.clone(), 2, 1, long)[0];
-                    assert!(big % long == 0 || big == CHECKPOINT_INTERVAL || skipped == Some(big - CHECKPOINT_INTERVAL), "#{big}");
+                    assert!(big.is_multiple_of(long) || big == CHECKPOINT_INTERVAL || skipped == Some(big - CHECKPOINT_INTERVAL), "#{big}");
                     served.push((big, disk[0], long));
                 }
             }
