@@ -227,10 +227,14 @@ impl Params {
         height / self.epoch_blocks.max(2)
     }
     pub fn is_boundary(&self, height: u64) -> bool {
-        (height + 1) % self.epoch_blocks.max(2) == 0
+        let e = self.epoch_blocks.max(2);
+        height % e == e - 1
     }
+    /// The epoch's last height (saturating: an epoch past the last whole one ends at u64::MAX,
+    /// so a caller's height near u64::MAX can't overflow it).
     pub fn last_of(&self, epoch: u64) -> u64 {
-        (epoch + 1) * self.epoch_blocks.max(2) - 1
+        let e = self.epoch_blocks.max(2);
+        epoch.saturating_mul(e).saturating_add(e - 1)
     }
 }
 
@@ -1764,9 +1768,15 @@ impl SummonOpts {
 
 /// How far behind the (claimed) network height still counts as synced.
 pub const SYNC_SLACK: u64 = 3;
-/// Certificates are stored on disk for these heights (plus every epoch's last block); the last
-/// `view::RECENT_CERTS` heights' are kept in memory.
+/// Certificates are stored on disk for these heights (plus every epoch's last block, and see
+/// [`CERT_SPACING_BYTES`]); the last `view::RECENT_CERTS` heights' are kept in memory.
 pub const CERT_CHECKPOINT: u64 = 100;
+/// ... and once this many consensus-block bytes have gone by since the last one stored, so a
+/// stretch between two stored certificates stays well inside one `/api/sync` response however
+/// full its blocks are (at most this plus one block; F09). An empty chain stores one every
+/// `CERT_CHECKPOINT` heights, a full one about every 1 MiB of blocks (a certificate is ~5-7%
+/// of that).
+pub const CERT_SPACING_BYTES: u64 = 1 << 20;
 /// Mempool txs not included within this many blocks are dropped (they stay valid until their
 /// `valid_until`, so a holder could resubmit them).
 pub const MEMPOOL_TTL_BLOCKS: u64 = 600;
@@ -1787,15 +1797,16 @@ pub const PRUNE_DAYS: u64 = 2;
 /// A rebuild (or a replay after a crash) syncs the store at least this often.
 const REPLAY_SYNC_EVERY: u64 = 1_000;
 
-/// The fewest heights a pruning node keeps: both kept snapshots' manifests (checkpoint +
-/// certifying blocks) and their epoch anchor (the last block of the epoch before, up to an epoch
-/// before the snapshot: `snapshot::anchor_height`), every ancestor a proposal may still cite, and
-/// a tx's whole validity window (so the tx index still catches a replayed tx). The validity
-/// window is a governance parameter (`max_tx_validity_blocks`), so this is re-read from the
-/// state at every commit.
+/// The fewest heights a pruning node keeps: every kept snapshot's manifest (checkpoint +
+/// certifying blocks; the long-lived ones go back up to two `snapshot::long_interval`s), the
+/// blocks after it that a joiner who downloaded it syncs next, and its epoch anchor (the last
+/// block of the epoch before, up to an epoch before the snapshot: `snapshot::anchor_height`),
+/// every ancestor a proposal may still cite, and a tx's whole validity window (so the tx index
+/// still catches a replayed tx). The validity window is a governance parameter
+/// (`max_tx_validity_blocks`), so this is re-read from the state at every commit.
 pub fn min_keep_blocks(state: &State) -> u64 {
-    use crate::snapshot::{CHECKPOINT_DELAY, CHECKPOINT_INTERVAL};
-    state.params.epoch_blocks.max(2) + 2 * CHECKPOINT_INTERVAL + 2 * CHECKPOINT_DELAY + crate::consensus::MAX_EXEC_LAG + state.chain_params.max_tx_validity_blocks
+    use crate::snapshot::{long_interval, CHECKPOINT_DELAY};
+    state.params.epoch_blocks.max(2) + 2 * long_interval(&state.params) + 2 * CHECKPOINT_DELAY + crate::consensus::MAX_EXEC_LAG + state.chain_params.max_tx_validity_blocks
 }
 
 /// What a pruning validator keeps by default: `PRUNE_DAYS` of blocks at this block time.
@@ -1885,6 +1896,11 @@ pub struct Chain {
     broken: Option<String>,
     /// Blocks `open` executed again because they were past the store's commit point.
     pub replayed: u64,
+    /// Writes `epochs.json` off the chain lock.
+    epochs_saver: EpochsSaver,
+    /// Consensus-block bytes executed since the last certificate stored on disk
+    /// ([`CERT_SPACING_BYTES`]; starts full, so the first certificate after a start is kept).
+    cert_bytes: u64,
     /// What this binary supports, `--halt-height`, and whether the node halted (upgrade.rs).
     pub halt: crate::upgrade::HaltControl,
     /// Tests: this node's proposals carry a junk tx (stateless-valid, never admittable), like a
@@ -1895,6 +1911,90 @@ pub struct Chain {
     /// state it executed, or one that diverged).
     #[cfg(test)]
     pub wrong_exec_root: bool,
+}
+
+/// Epochs of validator-set history a node always keeps and serves: the weak-subjectivity period
+/// (no joiner may start from an older root, `checkpoints::ws_period_blocks`) under the genesis
+/// parameters and the current ones, whichever is longer, plus a quarter for slow blocks and late
+/// joiners. Older changes and their proofs are dropped once the history passes
+/// `epochs::KEEP_BYTES` (F10).
+pub fn registry_keep_epochs(g: &Genesis, state: &State) -> u64 {
+    let eb = state.params.epoch_blocks.max(2);
+    let genesis = g.chain_params().map(|cp| crate::checkpoints::ws_period_blocks(&cp, eb)).unwrap_or(0);
+    let ws = crate::checkpoints::ws_period_blocks(&state.chain_params, eb).max(genesis).div_ceil(eb);
+    ws.saturating_add(ws / 4).saturating_add(2)
+}
+
+/// Writes `epochs.json` on its own thread, so a big registry never stalls the chain lock: the
+/// newest registry handed to it wins, every write is durable, and dropping it (with the chain)
+/// waits for the last one.
+struct EpochsSaver {
+    path: PathBuf,
+    /// The sequence number of the registry on disk; writes take it, so they never go backwards.
+    written: Arc<parking_lot::Mutex<u64>>,
+    next: std::sync::atomic::AtomicU64,
+    queue: Option<std::sync::mpsc::Sender<(u64, Arc<crate::epochs::EpochRegistry>)>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl EpochsSaver {
+    fn new(path: PathBuf) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<(u64, Arc<crate::epochs::EpochRegistry>)>();
+        let written: Arc<parking_lot::Mutex<u64>> = Default::default();
+        let (p, w) = (path.clone(), written.clone());
+        let thread = std::thread::Builder::new()
+            .name("epochs.json".into())
+            .spawn(move || {
+                while let Ok(mut latest) = rx.recv() {
+                    while let Ok(newer) = rx.try_recv() {
+                        latest = newer;
+                    }
+                    if let Err(e) = Self::write(&p, &w, latest.0, &latest.1) {
+                        tracing::warn!(error = %format!("{e:#}"), "couldn't save epochs.json");
+                    }
+                }
+            })
+            .ok();
+        Self { path, written, next: Default::default(), queue: Some(tx), thread }
+    }
+
+    fn write(path: &Path, written: &parking_lot::Mutex<u64>, seq: u64, e: &crate::epochs::EpochRegistry) -> Result<()> {
+        let bytes = serde_json::to_vec(e)?;
+        let mut w = written.lock();
+        if seq > *w {
+            store::write_durably(path, &bytes)?;
+            *w = seq;
+        }
+        Ok(())
+    }
+
+    fn seq(&self) -> u64 {
+        self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+    }
+
+    /// Queues a write (in this thread if the writer is gone).
+    fn save(&self, e: Arc<crate::epochs::EpochRegistry>) {
+        let seq = self.seq();
+        if let Some(Err(std::sync::mpsc::SendError((_, e)))) = self.queue.as_ref().map(|q| q.send((seq, e.clone()))) {
+            if let Err(err) = Self::write(&self.path, &self.written, seq, &e) {
+                tracing::warn!(error = %format!("{err:#}"), "couldn't save epochs.json");
+            }
+        }
+    }
+
+    /// Writes now (a newer queued write may follow, an older one never lands after it).
+    fn save_now(&self, e: &crate::epochs::EpochRegistry) -> Result<()> {
+        Self::write(&self.path, &self.written, self.seq(), e)
+    }
+}
+
+impl Drop for EpochsSaver {
+    fn drop(&mut self) {
+        drop(self.queue.take());
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 /// The block logs and the state database. One executor writes at a time; the consensus path
@@ -2301,7 +2401,11 @@ impl Chain {
         let genesis_root = genesis_state.root();
         let genesis_hash = hex::encode(crate::consensus::genesis_block(&genesis).digest_bytes());
         let store = Store::open(&home.join(store::DB_FILE))?;
-        let saved_epochs: Option<crate::epochs::EpochRegistry> = fs::read(home.join("epochs.json")).ok().and_then(|b| serde_json::from_slice(&b).ok());
+        let saved_epochs: Option<crate::epochs::EpochRegistry> = fs::read(home.join("epochs.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).map(|mut e: crate::epochs::EpochRegistry| {
+            // Proofs signed under an older handoff format no longer verify: signed again below.
+            e.upgrade_format();
+            e
+        });
         let ctx = OpenCtx { home, genesis: &genesis, genesis_hash: &genesis_hash, genesis_root: &genesis_root, base: base.as_ref(), saved_epochs: saved_epochs.as_ref(), blocks: &blocks };
         let start = match ctx.load(&store) {
             Ok(Some(s)) => s,
@@ -2322,6 +2426,7 @@ impl Chain {
         };
         let view = ReadView::new(state.clone(), height, last_hash.clone(), genesis_arc.clone(), genesis_hash.clone(), genesis_root.clone(), role, base.clone(), point.pruned_below, None, head.clone(), snap.clone(), disk.clone());
         let live = Arc::new(Live::new(view, epochs.clone(), disk.clone()));
+        let epochs_saver = EpochsSaver::new(home.join("epochs.json"));
         let mut chain = Chain {
             home: home.into(),
             genesis,
@@ -2358,6 +2463,8 @@ impl Chain {
             keep_blocks: None,
             broken: None,
             replayed: 0,
+            epochs_saver,
+            cert_bytes: CERT_SPACING_BYTES,
             halt: Default::default(),
             #[cfg(test)]
             junk_proposals: false,
@@ -2378,7 +2485,7 @@ impl Chain {
         let _ = crate::upgrade::after_block(&chain, chain.height);
         chain.set_finalized_tip(chain.height());
         chain.publish();
-        chain.live.publish_epochs(chain.epochs.clone());
+        chain.live.publish_epochs(Arc::new(chain.epochs.clone()));
         Ok(chain)
     }
 
@@ -2440,10 +2547,18 @@ impl Chain {
     }
 
     /// Brings the validator-set history up to the next height's epoch from the sets in state
-    /// (it can trail when `epochs.json` was saved before a crash).
+    /// (it can trail when `epochs.json` was saved before a crash), and forgets anything recorded
+    /// past it: this node hasn't executed that far, so nothing there is its own (F08; a registry
+    /// an older binary adopted whole from a fast-sync peer could run ahead).
     fn reconcile_epochs(&mut self) -> Result<()> {
         let want = self.state.params.epoch_of(self.height + 1);
-        if self.epochs.known_through >= want {
+        if self.epochs.known_through > want {
+            tracing::info!(known_through = self.epochs.known_through, executed = want, "dropping validator-set history past the executed epoch");
+            self.epochs.truncate(want);
+            self.save_epochs();
+            return Ok(());
+        }
+        if self.epochs.known_through == want {
             return Ok(());
         }
         for e in self.epochs.known_through + 1..=want {
@@ -2651,6 +2766,7 @@ impl Chain {
             history,
             version: block.version,
             signal: block.signal,
+            base_fee: block.base_fee,
         })
     }
 
@@ -2659,7 +2775,8 @@ impl Chain {
     fn prepare_commit(&self, block: Arc<Block>, cblock: Option<Vec<u8>>, records: Vec<RecordChange>, cert: Option<Vec<u8>>) -> Result<Executed> {
         let meta = self.block_meta(&block, Pos::default(), None)?;
         let epoch_head = self.state.params.is_boundary(block.height);
-        let cert = cert.filter(|_| block.height.is_multiple_of(CERT_CHECKPOINT) || epoch_head);
+        let spaced = self.cert_bytes.saturating_add(cblock.as_ref().map_or(0, |b| b.len() as u64)) >= CERT_SPACING_BYTES;
+        let cert = cert.filter(|_| block.height.is_multiple_of(CERT_CHECKPOINT) || epoch_head || spaced);
         // Never below the minimum as of this block (governance may have widened the tx window).
         let prune_below = self.keep_blocks.map(|k| (block.height + 1).saturating_sub(k.max(min_keep_blocks(&self.state)))).unwrap_or(0);
         Ok(Executed { meta, root: self.state.root_hash(), root_child: self.state.tree.root_child().encode(), nodes: self.state.tree.pending_changes(), records, cert, epoch_head, prune_below, cblock, block })
@@ -2821,7 +2938,9 @@ impl Chain {
         if let Some(cert) = &f.certificate {
             self.disk.remember_cert(f.height, cert.clone());
         }
+        let cblock_bytes = f.cblock.len() as u64;
         let e = self.prepare_commit(block, Some(f.cblock), commit.records, f.certificate)?;
+        self.cert_bytes = if e.cert.is_some() { 0 } else { self.cert_bytes.saturating_add(cblock_bytes) };
         self.advance(&e.block);
         Ok(e)
     }
@@ -2869,41 +2988,58 @@ impl Chain {
         let next = self.state.params.epoch_of(boundary) + 1;
         let keys: Vec<String> = self.state.active_set(next).map(|s| s.iter().map(|v| v.consensus_key.clone()).collect()).unwrap_or_default();
         let changed = self.epochs.record(next, keys);
+        // Older than the window a joiner may start from is dropped once the history is big (F10).
+        self.epochs.trim(next.saturating_sub(registry_keep_epochs(&self.genesis, &self.state)), crate::epochs::KEEP_BYTES);
         self.save_epochs();
         changed
     }
 
-    /// Signs handoffs for set changes this validator presided over (also retroactively).
+    /// The sorted consensus keys this node's state holds for `epoch` (executed, or certified by
+    /// the snapshot it fast-synced from).
+    fn executed_set(&self, epoch: u64) -> Option<Vec<String>> {
+        let mut keys: Vec<String> = self.state.active_set(epoch)?.iter().map(|v| v.consensus_key.clone()).collect();
+        keys.sort();
+        Some(keys)
+    }
+
+    /// Signs handoffs for set changes this validator presided over (also retroactively), but only
+    /// those its own state shows on both sides: never one it learned from a peer (F08).
     pub fn sign_handoffs(&mut self) -> usize {
         let Some(seed) = self.keys.as_ref().map(|k| k.seed()) else { return 0 };
         let chain_id = self.genesis.chain_id.clone();
-        let n = self.epochs.sign_missing(&chain_id, seed).len();
+        let mut epochs = std::mem::take(&mut self.epochs);
+        let n = epochs.sign_missing(&chain_id, seed, |e| self.executed_set(e)).len();
+        self.epochs = epochs;
         if n > 0 {
             self.save_epochs();
         }
         n
     }
 
-    pub fn merge_epochs(&mut self, other: &crate::epochs::EpochRegistry) -> usize {
+    /// Adds handoff signatures verified elsewhere (`epochs::verify_candidates`).
+    pub fn add_handoffs(&mut self, verified: Vec<crate::epochs::Candidate>) -> usize {
         let chain_id = self.genesis.chain_id.clone();
-        let n = self.epochs.merge_sigs(&chain_id, other);
+        let n = self.epochs.add_verified(&chain_id, verified);
         if n > 0 {
             self.save_epochs();
         }
         n
     }
 
-    /// Writes `epochs.json` durably (temp file, fsync, rename, fsync the directory) and publishes
-    /// the registry. A failure is logged: the registry is rebuilt from state on the next start.
+    /// Publishes the registry and writes `epochs.json` in the background (durably, newest wins). A
+    /// failed or lost write only means a restart rebuilds the sets from state and collects the
+    /// proofs again.
     fn save_epochs(&self) {
-        if let Err(e) = self.try_save_epochs() {
-            tracing::warn!(error = %format!("{e:#}"), "couldn't save epochs.json");
-        }
+        let e = Arc::new(self.epochs.clone());
+        self.live.publish_epochs(e.clone());
+        self.epochs_saver.save(e);
     }
 
+    /// [`Chain::save_epochs`], written before it returns.
     fn try_save_epochs(&self) -> Result<()> {
-        store::write_durably(&self.home.join("epochs.json"), &serde_json::to_vec(&self.epochs)?)?;
-        self.live.publish_epochs(self.epochs.clone());
+        let e = Arc::new(self.epochs.clone());
+        self.epochs_saver.save_now(&e)?;
+        self.live.publish_epochs(e);
         Ok(())
     }
 
@@ -2937,8 +3073,17 @@ impl Chain {
             bail!("fast sync needs an empty home");
         }
         let base_hash = hex::encode(v.blocks[0].parent_bytes());
+        // The verified history (from the trusted root through the certified epoch, nothing past
+        // it: F08) must agree with the sets the certified state holds.
+        let mut epochs = v.epochs.clone();
+        for (&e, addrs) in state.active_sets.range(epochs.base..=epochs.known_through) {
+            let mut keys: Vec<String> = addrs.iter().filter_map(|a| state.validators.get(a)).map(|r| r.consensus_key.clone()).collect();
+            keys.sort();
+            ensure!(epochs.set(e) == Some(&keys), "the snapshot's state holds another validator set for epoch {e} than its verified history");
+        }
+        epochs.upgrade_format();
         store::install_durably(packed, &self.home.join("base.state.zst"))?;
-        self.epochs = v.epochs.clone();
+        self.epochs = epochs;
         self.try_save_epochs()?;
         // The anchor's proof, for this node's own manifests (P-SYNC).
         crate::snapshot::save_anchor(&self.home, v.anchor.as_ref())?;
@@ -3439,9 +3584,14 @@ impl OpenCtx<'_> {
             tracing::info!(format = p.format, schema = p.schema, base = p.base, "the state database was written for another format, chain or base; rebuilding it");
             return Ok(None);
         }
+        let genesis_epochs = crate::epochs::EpochRegistry::genesis(self.genesis);
         let epochs = match self.saved_epochs {
+            // A genesis home that hasn't executed anything holds only the genesis set: a history
+            // saved there is one a fast sync verified and a crash kept from installing (or a
+            // peer's), not this node's own (F08). Executing records it again.
+            Some(_) if p.height == 0 && self.base.is_none() => genesis_epochs,
             Some(e) => e.clone(),
-            None if p.height == 0 => crate::epochs::EpochRegistry::genesis(self.genesis),
+            None if p.height == 0 => genesis_epochs,
             None => bail!("epochs.json is missing"),
         };
         let snap = Arc::new(store.snapshot()?);
@@ -5396,6 +5546,50 @@ mod persistence {
         fs::remove_dir_all(h).ok();
     }
 
+    /// F08: a genesis home that hasn't executed anything ignores an `epochs.json` it finds (a fast
+    /// sync's verified history that a crash kept from installing, or anyone's): it starts from the
+    /// genesis set, and its validator signs no handoff for the changes that file claimed.
+    #[test]
+    fn a_genesis_home_ignores_a_saved_history_it_never_executed() {
+        let h = home("planted");
+        Chain::summon(&h, &SummonOpts::new("planted", 1)).unwrap();
+        let c = Chain::open(&h).unwrap();
+        let genesis = crate::epochs::EpochRegistry::genesis(&c.genesis);
+        assert!(c.keys.is_some(), "a validator's home");
+        drop(c);
+        let mut planted = genesis.clone();
+        assert!(planted.record(5, vec![hex::encode(commonware_cryptography::Signer::public_key(&crate::pq::PrivateKey::from_seed_bytes([200; 32])).as_ref())]));
+        fs::write(h.join("epochs.json"), serde_json::to_vec(&planted).unwrap()).unwrap();
+        let mut c = Chain::open(&h).unwrap();
+        assert_eq!(c.epochs, genesis);
+        assert_eq!(c.sign_handoffs(), 0);
+        drop(c);
+        fs::remove_dir_all(h).ok();
+    }
+
+    /// F08: a home that executed blocks forgets whatever its `epochs.json` records past the epoch
+    /// it executed (an older binary adopted a fast-sync peer's registry whole), so a planted
+    /// change neither stays in what it serves nor gets signed when its epoch comes.
+    #[test]
+    fn history_past_the_executed_epoch_is_dropped_on_open() {
+        let (h, c, _) = active("ahead", 3);
+        let executed = c.epochs.clone();
+        let want = c.state.params.epoch_of(c.height() + 1);
+        assert_eq!(executed.known_through, want);
+        drop(c);
+        let mut planted = executed.clone();
+        let evil = hex::encode(commonware_cryptography::Signer::public_key(&crate::pq::PrivateKey::from_seed_bytes([200; 32])).as_ref());
+        assert!(planted.record(want + 3, vec![evil]));
+        planted.format = crate::epochs::HANDOFF_FORMAT;
+        fs::write(h.join("epochs.json"), serde_json::to_vec(&planted).unwrap()).unwrap();
+        let mut c = Chain::open(&h).unwrap();
+        assert_eq!((c.epochs.known_through, c.epochs.sets.keys().next_back().copied()), (want, executed.sets.keys().next_back().copied()));
+        assert_eq!(*c.live.epochs(), c.epochs, "and that's what it serves");
+        assert_eq!(c.sign_handoffs(), 0);
+        drop(c);
+        fs::remove_dir_all(h).ok();
+    }
+
     #[test]
     fn half_written_snapshots_and_temp_files_are_cleaned_up() {
         let (h, c, _) = active("snap", 3);
@@ -5505,6 +5699,58 @@ mod persistence {
         let anchor = m.anchor.expect("snapshot 800 is in epoch 2, after #599");
         assert_eq!(anchor.finalization, hex::encode([(599 % 251) as u8]));
         assert!(v.cblock(599).is_some());
+        drop(v);
+        drop(c);
+        fs::remove_dir_all(h).ok();
+    }
+
+    /// F63: a big state is served from the newest long-lived snapshot (every 200 blocks at
+    /// 4.5 s blocks: `snapshot::long_interval`), and a joiner that took its manifest still finds
+    /// its chunks and the blocks after it once newer snapshots have replaced the newest twice
+    /// over, on a node keeping the smallest window. A joiner's checkpoint skips what's older.
+    #[test]
+    fn a_served_snapshot_outlives_newer_ones() {
+        use crate::snapshot::{build_manifest_with, chunk, list, long_interval, CHECKPOINT_DELAY};
+        let h = home("long-snap");
+        let params = BTreeMap::from([("max_tx_validity_blocks".to_string(), 10)]);
+        Chain::summon(&h, &SummonOpts { block_time_ms: 4_500, epoch_blocks: 100, params, ..SummonOpts::new("long-snap", 1) }).unwrap();
+        let mut c = Chain::open_with(&h, &OpenOpts { segment_heights: Some(50) }).unwrap();
+        c.set_pruning(Some(1));
+        assert_eq!(long_interval(&c.state.params), 200);
+        let keep = min_keep_blocks(&c.state);
+        assert_eq!(keep, 100 + 2 * 200 + 2 * CHECKPOINT_DELAY + crate::consensus::MAX_EXEC_LAG + 10);
+        // Consensus hands over certificates for epoch ends and checkpoints' certifying blocks.
+        let run_to = |c: &mut Chain, to: u64, gone: u64| {
+            while c.height() < to {
+                c.produce_block_with(vec![]).unwrap();
+                let height = c.height();
+                if c.state.params.is_boundary(height) || crate::snapshot::certifies(height).is_some() {
+                    c.store_cert(height, vec![(height % 251) as u8]).unwrap();
+                }
+            }
+            let t = Instant::now();
+            while !list(&h).contains(&(to / 100 * 100)) || list(&h).contains(&gone) {
+                assert!(t.elapsed().as_secs() < 30, "snapshots: {:?}", list(&h));
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        };
+        run_to(&mut c, 999, 700);
+        assert_eq!(list(&h), vec![900, 800, 600]);
+        let big = build_manifest_with(&c.live, 0, 0).unwrap();
+        assert_eq!((big.height, big.anchor.as_ref().map(|a| a.finalization.clone())), (800, Some(hex::encode([(799 % 251) as u8]))));
+        assert_eq!(crate::snapshot::build_manifest(&c.live).unwrap().height, 900, "a small state: the newest");
+        // Two checkpoints later the newest (900) is gone; the long-lived 800 isn't, nor are the
+        // blocks after its manifest, which the joiner syncs next.
+        run_to(&mut c, 1_199, 900);
+        assert_eq!(list(&h), vec![1_100, 1_000, 800]);
+        assert!(chunk(&h, 800, 0).is_some());
+        let v = c.view();
+        assert_eq!(v.history_from(), 1_200 - keep);
+        assert!(v.cblock(805).is_some() && v.block(805).is_some());
+        assert_eq!(build_manifest_with(&c.live, 0, 0).unwrap().height, 1_000);
+        // A joiner whose checkpoint is past 1000's manifest gets the newest that reaches it.
+        assert_eq!(build_manifest_with(&c.live, 1_005, 0).unwrap().height, 1_100);
+        assert!(build_manifest_with(&c.live, 1_105, 0).is_err());
         drop(v);
         drop(c);
         fs::remove_dir_all(h).ok();

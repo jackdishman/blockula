@@ -4,15 +4,25 @@
 # review them alone and run the simulator and local testnet.
 version: 2
 updates:
+  # The node (with the vendored p2p stream, a workspace member) and Ghost Mode's core (its own
+  # workspace and lockfile), so their exact pins are surfaced too.
   - package-ecosystem: cargo
-    directory: /node
+    directories: ["/node", "/node/ghost"]
     schedule: { interval: weekly, day: monday }
     cooldown: { default-days: 7 }
     open-pull-requests-limit: 5
     commit-message: { prefix: "deps(cargo)" }
     groups:
+      # Every crate the manifests pin exactly (`=`, checked by scripts/check-pins.sh) because it
+      # decides a consensus format, the state root, signatures, keys or the transport: the record
+      # encoding and state maps (borsh, imbl), the database format (redb), the tx JSON parser
+      # (serde_json), consensus and its crypto (commonware-*, ml-dsa, blake3, bech32), Ghost Mode's
+      # STARK (p3-*), the transport's KEM and key handling (ml-kem, x25519-dalek, zeroize). A bump
+      # can change block validity without a protocol version, which only a network of old and new
+      # binaries would show: its PR is reviewed alone, with the simulator, the local testnet and a
+      # mixed-version run, never merged as part of the catch-all batch below (audit F78).
       consensus-and-crypto:
-        patterns: ["commonware-*", "ml-dsa", "blake3", "bech32", "getrandom", "rand_core"]
+        patterns: ["commonware-*", "ml-dsa", "ml-kem", "blake3", "bech32", "borsh", "borsh-*", "imbl", "imbl-*", "redb", "serde_json", "arc-swap", "p3-*", "x25519-dalek", "zeroize", "getrandom", "rand_core"]
       cargo:
         patterns: ["*"]
 

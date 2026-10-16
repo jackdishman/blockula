@@ -123,9 +123,14 @@ pub struct ClientIpPolicy {
     /// Shared secret a forwarding full node sends in `X-Blockula-Forwarder-Key`; proves the
     /// forwarder when its IP isn't stable (e.g. on Fly). Also sent by `forward()`.
     pub forwarder_secret: Option<String>,
-    /// Header set by the reverse proxy in front of this node (`fly-client-ip`, `x-forwarded-for`).
-    /// Only enable it when every request comes through that proxy.
+    /// Header set by the reverse proxy in front of this node (`fly-client-ip`, `x-real-ip`,
+    /// `x-forwarded-for`). Only enable it when every request comes through that proxy.
     pub header: Option<String>,
+    /// Trusted proxies that append to `header` (`--client-ip-hops`, default 1). Appending proxies
+    /// (`X-Forwarded-For`) keep what the client sent first and add the address they saw last,
+    /// so the client is this many entries from the right; anything left of it is the client's
+    /// own say. Headers a proxy overwrites have one entry.
+    pub hops: usize,
 }
 
 impl std::fmt::Debug for ClientIpPolicy {
@@ -134,25 +139,35 @@ impl std::fmt::Debug for ClientIpPolicy {
             .field("trusted_forwarders", &self.trusted_forwarders)
             .field("forwarder_secret", &self.forwarder_secret.as_ref().map(|_| "<redacted>"))
             .field("header", &self.header)
+            .field("hops", &self.hops)
             .finish()
     }
 }
 
 impl ClientIpPolicy {
+    /// The client's IP, or `None` for a local caller (loopback, nothing configured speaks for it).
     pub fn resolve(&self, peer: SocketAddr, h: &HeaderMap) -> Option<IpAddr> {
-        let header_ip = |name: &str| h.get(name).and_then(|v| v.to_str().ok()).and_then(|v| v.split(',').next()).and_then(|v| v.trim().parse::<IpAddr>().ok());
+        // The entry `hops` from the right of a (possibly comma-separated) header (F29: the
+        // leftmost one is whatever the client sent).
+        let header_ip = |name: &str, hops: usize| {
+            let v = h.get(name)?.to_str().ok()?;
+            let entries: Vec<&str> = v.split(',').collect();
+            entries.len().checked_sub(hops.max(1)).and_then(|i| entries[i].trim().parse::<IpAddr>().ok())
+        };
         let policy = self;
         let by_secret = match (&policy.forwarder_secret, h.get("x-blockula-forwarder-key")) {
             (Some(secret), Some(given)) => ct_eq(secret.as_bytes(), given.as_bytes()),
             _ => false,
         };
         if by_secret || policy.trusted_forwarders.contains(&peer.ip()) {
-            if let Some(ip) = header_ip("x-blockula-client-ip") {
+            if let Some(ip) = header_ip("x-blockula-client-ip", 1) {
                 return Some(ip);
             }
         }
-        if let Some(ip) = policy.header.as_deref().and_then(header_ip) {
-            return Some(ip);
+        if let Some(name) = policy.header.as_deref() {
+            // Configured but missing or unreadable: limited as the proxy itself, never as a
+            // local caller (which isn't limited at all).
+            return Some(header_ip(name, policy.hops).unwrap_or(peer.ip()));
         }
         if peer.ip().is_loopback() { None } else { Some(peer.ip()) }
     }
@@ -169,34 +184,22 @@ struct Limits {
 }
 
 impl Limits {
-    /// Whether every `(key, max, window)` has room (nothing recorded).
-    fn check(&self, rules: &[(String, usize, Duration)]) -> Result<(), Duration> {
-        let now = Instant::now();
+    /// Gives back a hit [`Limits::allow`] recorded at `at` (the action it reserved failed).
+    fn refund(&self, rules: &[(String, usize, Duration)], at: Instant) {
         let mut hits = self.hits.lock();
-        for (key, max, window) in rules {
+        for (key, _, _) in rules {
             if let Some(q) = hits.get_mut(key) {
-                while q.front().is_some_and(|t| now.duration_since(*t) >= *window) {
-                    q.pop_front();
-                }
-                if q.len() >= *max {
-                    return Err(*window - now.duration_since(*q.front().unwrap()));
+                if let Some(i) = q.iter().rposition(|t| *t == at) {
+                    q.remove(i);
                 }
             }
         }
-        Ok(())
     }
 
-    /// Records a hit on each rule (after the action succeeded).
-    fn record(&self, rules: &[(String, usize, Duration)]) {
-        let now = Instant::now();
-        let mut hits = self.hits.lock();
-        for (key, _, _) in rules {
-            hits.entry(key.clone()).or_default().push_back(now);
-        }
-    }
-
-    /// Allows only if every `(key, max, window)` has room; then records a hit on each.
-    fn allow(&self, rules: &[(String, usize, Duration)]) -> Result<(), Duration> {
+    /// Allows only if every `(key, max, window)` has room; then records a hit on each, in the
+    /// same critical section (so concurrent callers can't all pass before any records: F28).
+    /// Returns the hit's time, for a [`Limits::refund`].
+    fn allow(&self, rules: &[(String, usize, Duration)]) -> Result<Instant, Duration> {
         let now = Instant::now();
         let mut hits = self.hits.lock();
         if hits.len() > 100_000 {
@@ -214,7 +217,7 @@ impl Limits {
         for (key, _, _) in rules {
             hits.get_mut(key).unwrap().push_back(now);
         }
-        Ok(())
+        Ok(now)
     }
 }
 
@@ -348,6 +351,44 @@ impl Node {
 
 const EXPLORER: &str = include_str!("explorer.html");
 
+/// The explorer's one inline script (what its CSP hash covers: the text between the tags).
+fn explorer_script() -> &'static str {
+    EXPLORER.split_once("<script>").and_then(|(_, rest)| rest.split_once("</script>")).map(|(s, _)| s).unwrap_or_default()
+}
+
+/// The explorer's Content-Security-Policy (F64, defense in depth): only its own inline script
+/// runs (by hash: no injected `<script>` or `on*=` handler), it fetches from this origin only,
+/// fonts come from Google Fonts, and no other page may frame it.
+fn explorer_csp() -> &'static str {
+    static CSP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CSP.get_or_init(|| {
+        use commonware_cryptography::Hasher as _;
+        let digest = commonware_cryptography::Sha256::hash(&[explorer_script().as_bytes()]);
+        format!(
+            "default-src 'none'; script-src 'sha256-{}'; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+            base64(digest.as_ref())
+        )
+    })
+}
+
+/// Standard base64 with padding (RFC 4648), for the CSP hash.
+fn base64(bytes: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            out.push(if i <= c.len() { ABC[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
+}
+
+async fn explorer() -> Response {
+    use axum::http::header;
+    ([(header::CONTENT_SECURITY_POLICY, explorer_csp()), (header::X_CONTENT_TYPE_OPTIONS, "nosniff"), (header::REFERRER_POLICY, "no-referrer")], Html(EXPLORER)).into_response()
+}
+
 /// Set on requests a node forwards to another; a forwarded request is never forwarded again
 /// (so misconfigured peers — e.g. a node listed as its own peer — can't loop).
 pub const FORWARDED_HEADER: &str = "x-blockula-forwarded";
@@ -395,7 +436,7 @@ type ApiResult = Result<Json<Value>, ApiError>;
 
 pub fn router(node: Node) -> Router {
     Router::new()
-        .route("/", get(|| async { Html(EXPLORER) }))
+        .route("/", get(explorer))
         .route("/api/status", get(status))
         .route("/api/blocks", get(blocks))
         .route("/api/block/{id}", get(block))
@@ -540,7 +581,7 @@ fn tx_json_with(v: &ReadView, tx: &Tx, height: Option<u64>, error: Option<&str>)
 /// its tip, at most its `fee`. Blocks record their base fee (P-ECON); a pending tx is priced at
 /// the next block's.
 fn charged(v: &ReadView, tx: &Tx, height: Option<u64>) -> u64 {
-    let charge = match height.and_then(|h| v.block(h)).and_then(|b| b.base_fee) {
+    let charge = match height.and_then(|h| v.base_fee(h)) {
         Some(slot) => slot.fee(tx.size()).checked_add(tx.tip),
         None => crate::econ::charge(&v.state, tx, height.unwrap_or_else(|| crate::econ::now(&v.state))),
     };
@@ -924,6 +965,9 @@ async fn metrics(State(n): State<Node>) -> Response {
             ("blockula_active_validators", "Validators in the active set", active as f64),
             ("blockula_validators_online", "Signers on the latest finalization certificate", online.map(|o| o as f64).unwrap_or(f64::NAN)),
             ("blockula_history_from", "First height whose block this node holds", v.history_from() as f64),
+            ("blockula_epochs_known_through", "Newest epoch whose validator set this node's history holds", n.live.epochs().known_through as f64),
+            ("blockula_epochs_proven_through", "Newest epoch through which every set change has a quorum of handoff proofs here (it should follow known_through)", n.live.epochs().proven_through() as f64),
+            ("blockula_epochs_from", "Oldest epoch of the validator-set history this node keeps and serves", n.live.epochs().base as f64),
             ("blockula_faucet_drips_total", "Faucet drips served", n.stats.faucet_drips.load(Relaxed) as f64),
             ("blockula_tx_submitted_total", "Transactions accepted over HTTP", n.stats.tx_submitted.load(Relaxed) as f64),
             ("blockula_tx_rejected_total", "Transactions rejected over HTTP", n.stats.tx_rejected.load(Relaxed) as f64),
@@ -1216,36 +1260,51 @@ async fn faucet(State(n): State<Node>, ConnectInfo(peer): ConnectInfo<SocketAddr
     }
     // Loopback callers (local dev, tests) aren't limited at all.
     let limited = client.is_some() || !peer.ip().is_loopback();
-    if limited {
-        n.limits.check(&rules).map_err(|w| too_many("the faucet already dripped for you", w))?;
+    // The slot is taken before the drip (atomically: parallel requests can't all pass a check
+    // first, F28) and given back if the drip doesn't go out.
+    let reserved = if limited { Some(n.limits.allow(&rules).map_err(|w| too_many("the faucet already dripped for you", w))?) } else { None };
+    let dripped = async {
+        if !faucet_here {
+            if forwarded(&headers) {
+                return Err(ApiError(StatusCode::LOOP_DETECTED, "forwarding loop: no faucet here".into()));
+            }
+            let v = n.forward("/faucet", &json!({ "to": to }), client).await?;
+            if let Ok(tx) = serde_json::from_value::<Tx>(v["tx"].clone()) {
+                let _ = n.chain.lock().track_pending(tx);
+            }
+            Ok(v)
+        } else {
+            let tx = n.chain.lock().faucet(to, 100 * DROPS_PER_FANG).map_err(|e| {
+                let msg = e.to_string();
+                ApiError(if msg.contains("faucet busy") { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::BAD_REQUEST }, msg)
+            })?;
+            Ok(json!({ "id": tx.id(), "amount_display": "100 FANG", "tx": tx }))
+        }
     }
-    // Quota is only consumed once the drip actually went out.
-    let v = if !faucet_here {
-        if forwarded(&headers) {
-            return Err(ApiError(StatusCode::LOOP_DETECTED, "forwarding loop: no faucet here".into()));
+    .await;
+    let v = match dripped {
+        Ok(v) => v,
+        Err(e) => {
+            if let Some(at) = reserved {
+                n.limits.refund(&rules, at);
+            }
+            return Err(e);
         }
-        let v = n.forward("/faucet", &json!({ "to": to }), client).await?;
-        if let Ok(tx) = serde_json::from_value::<Tx>(v["tx"].clone()) {
-            let _ = n.chain.lock().track_pending(tx);
-        }
-        v
-    } else {
-        let tx = n.chain.lock().faucet(to, 100 * DROPS_PER_FANG).map_err(|e| {
-            let msg = e.to_string();
-            ApiError(if msg.contains("faucet busy") { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::BAD_REQUEST }, msg)
-        })?;
-        json!({ "id": tx.id(), "amount_display": "100 FANG", "tx": tx })
     };
-    if limited {
-        n.limits.record(&rules);
-    }
     bump(&n.stats.faucet_drips);
     Ok(Json(v))
 }
 
-/// Manifest of the newest certified state snapshot (for `join --fast`).
-async fn snapshot_latest(State(n): State<Node>) -> ApiResult {
-    let m = crate::snapshot::build_manifest(&n.live).map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
+#[derive(Deserialize)]
+struct SnapshotQuery {
+    /// The manifest must reach at least this height (the joiner's newest checkpoint).
+    min: Option<u64>,
+}
+
+/// Manifest of a certified state snapshot (for `join --fast`): the newest, or for a big state the
+/// newest long-lived one (`snapshot::long_interval`), reaching `min` if given.
+async fn snapshot_latest(State(n): State<Node>, Query(q): Query<SnapshotQuery>) -> ApiResult {
+    let m = crate::snapshot::build_manifest_reaching(&n.live, q.min.unwrap_or(0)).map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
     Ok(Json(serde_json::to_value(m).unwrap()))
 }
 
@@ -1257,12 +1316,19 @@ async fn snapshot_chunk(State(n): State<Node>, Path((height, i)): Path<(u64, usi
     }
 }
 
-/// Validator-set history with handoff proofs.
-async fn epochs(State(n): State<Node>) -> ApiResult {
-    let e = n.live.epochs();
-    let mut v = serde_json::to_value(&*e).unwrap();
-    v["proven_through"] = json!(e.proven_through());
-    Ok(Json(v))
+#[derive(Deserialize)]
+struct EpochsQuery {
+    from: Option<u64>,
+}
+
+/// Validator-set history with handoff proofs, a page at a time: the set in effect at `from`
+/// (default: the oldest epoch this node keeps, `base`) and the set changes after it, each with a
+/// quorum of its proofs, up to about `epochs::PAGE_BYTES`. `next` is the `from` of the next page
+/// (`null` at the end); `proven_through` covers this page. Pages are cached per registry.
+async fn epochs(State(n): State<Node>, Query(q): Query<EpochsQuery>) -> Response {
+    let from = q.from.unwrap_or_else(|| n.live.epochs().base);
+    let page = n.live.epoch_page(from);
+    ([(axum::http::header::CONTENT_TYPE, "application/json")], page.as_ref().clone()).into_response()
 }
 
 /// A record and its Merkle proof against the state root of the latest executed block:
@@ -1544,8 +1610,17 @@ struct SyncQuery {
     limit: Option<u64>,
 }
 
-/// Bytes of block data per `/api/sync` response (the joiner caps what it reads, too).
+/// Block bytes (hex) per `/api/sync` batch: a batch ends at the last certified height inside it.
 pub const SYNC_BATCH_BYTES: usize = 8 << 20;
+/// A batch with no certified height inside the budget (or the `limit`) goes on to the next one,
+/// but never past this (blocks as hex), below the joiner's `MAX_SYNC_RESPONSE` with room for the
+/// certificate and the JSON. Certificates are stored at least every `CERT_SPACING_BYTES` of
+/// blocks, so an honest node's stretches fit with lots to spare (F09).
+pub const SYNC_MAX_BYTES: usize = crate::node::MAX_SYNC_RESPONSE - (4 << 20);
+
+fn no_cert(from: u64, to: u64) -> ApiError {
+    ApiError(StatusCode::SERVICE_UNAVAILABLE, format!("no finalization certificate stored for heights {from}..={to} within one response; try another peer"))
+}
 
 /// Finalized consensus blocks `[from, to]` plus the finalization certificate of block `to`, so a
 /// joining node can verify the whole batch (hash links + one ML-DSA quorum certificate).
@@ -1557,44 +1632,47 @@ async fn sync(State(n): State<Node>, Query(q): Query<SyncQuery>) -> ApiResult {
     let v = n.live.view();
     let tip = v.height;
     let from = q.from.max(1);
-    let epoch_end = v.state.params.last_of(v.state.params.epoch_of(from));
-    let range_end = tip.min(epoch_end); // never mix epochs (different validator sets)
+    // Before any arithmetic on `from` (a caller's u64::MAX overflowed the epoch math, F61).
     if from > tip {
         return Ok(Json(json!({ "tip": tip, "blocks": [], "to": null, "finalization": null })));
     }
+    let epoch_end = v.state.params.last_of(v.state.params.epoch_of(from));
+    let range_end = tip.min(epoch_end); // never mix epochs (different validator sets)
     if v.is_pruned(from) {
         return Err(pruned(&v, from));
     }
     let want = (from + q.limit.unwrap_or(100).clamp(1, 500) - 1).min(range_end);
-    // Blocks up to `want`, cut at the byte budget, and the highest certified height among them.
+    // Blocks up to `want` within the byte budget, ending at the highest certified height among
+    // them; without one, on to the next certified height (if this node holds one in the epoch),
+    // within `SYNC_MAX_BYTES`. Either way the bytes read and sent are bounded.
+    let next_cert = v.next_cert(from..=range_end);
+    if next_cert.is_none() && n.marshal.is_none() {
+        return Err(no_cert(from, range_end));
+    }
     let (mut blocks, mut cert) = (vec![], None);
     let mut bytes = 0usize;
     let mut last_cert_len = 0usize;
-    for h in from..=want {
-        let Some(b) = v.cblock(h) else { break };
-        bytes += b.len() * 2;
-        if bytes > SYNC_BATCH_BYTES && !blocks.is_empty() {
+    let mut h = from;
+    while h <= next_cert.map_or(want, |c| c.max(want)) {
+        if cert.is_some() && h > want {
             break;
         }
+        let Some(b) = v.cblock(h) else { break };
+        let size = b.len() * 2;
+        let within = h <= want && bytes + size <= SYNC_BATCH_BYTES;
+        if !blocks.is_empty() && !within && (cert.is_some() || bytes + size > SYNC_MAX_BYTES) {
+            break;
+        }
+        bytes += size;
         blocks.push(hex::encode(&b));
         if let Some(f) = v.cert(h) {
             cert = Some((h, hex::encode(f)));
             last_cert_len = blocks.len();
-        }
-    }
-    // No certificate in range: extend to the next certified height (still within the epoch).
-    if cert.is_none() && bytes <= SYNC_BATCH_BYTES {
-        let mut h = from + blocks.len() as u64;
-        while h <= range_end && h < from + 600 {
-            let Some(b) = v.cblock(h) else { break };
-            blocks.push(hex::encode(&b));
-            if let Some(f) = v.cert(h) {
-                cert = Some((h, hex::encode(f)));
-                last_cert_len = blocks.len();
+            if !within {
                 break;
             }
-            h += 1;
         }
+        h += 1;
     }
     drop(v);
     // Validators can fall back to marshal's archive for the certificate.
@@ -1610,9 +1688,7 @@ async fn sync(State(n): State<Node>, Query(q): Query<SyncQuery>) -> ApiResult {
             }
         }
     }
-    let Some((to, finalization)) = cert else {
-        return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, format!("no finalization certificate stored for heights {from}..={range_end}; try another peer")));
-    };
+    let Some((to, finalization)) = cert else { return Err(no_cert(from, range_end)) };
     blocks.truncate(last_cert_len);
     Ok(Json(json!({ "tip": tip, "blocks": blocks, "to": to, "finalization": finalization })))
 }
@@ -2036,6 +2112,19 @@ mod tests {
         // Behind Fly: only the configured header counts.
         let fly = ClientIpPolicy { header: Some("fly-client-ip".into()), ..Default::default() };
         assert_eq!(fly.resolve(peer, &spoof), Some("1.2.3.4".parse().unwrap()));
+        // F29: an appending proxy's header is read from the right (what the proxy saw), never
+        // the client's own leftmost entries; with two proxies, the second entry from the right.
+        let local: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let xff = ClientIpPolicy { header: Some("x-forwarded-for".into()), ..Default::default() };
+        let forged = headers(&[("x-forwarded-for", "9.9.9.9, 203.0.113.7")]);
+        assert_eq!(xff.resolve(local, &forged), Some("203.0.113.7".parse().unwrap()));
+        let two = ClientIpPolicy { hops: 2, ..xff.clone() };
+        assert_eq!(two.resolve(local, &headers(&[("x-forwarded-for", "9.9.9.9, 203.0.113.7, 10.0.0.9")])), Some("203.0.113.7".parse().unwrap()));
+        // Unparseable or missing: limited as the proxy, never treated as a local, unlimited caller.
+        assert_eq!(xff.resolve(local, &headers(&[("x-forwarded-for", "203.0.113.7, nope")])), Some(local.ip()));
+        assert_eq!(xff.resolve(local, &HeaderMap::new()), Some(local.ip()));
+        assert_eq!(two.resolve(local, &headers(&[("x-forwarded-for", "203.0.113.7")])), Some(local.ip()), "fewer entries than proxies");
+        assert_eq!(ClientIpPolicy::default().resolve(local, &forged), None, "no header configured: loopback is local");
         // Forwarder secret: wrong key is ignored, right key is honored.
         let secret = ClientIpPolicy { forwarder_secret: Some("s".repeat(32)), ..Default::default() };
         let wrong = headers(&[("x-blockula-forwarder-key", "nope"), ("x-blockula-client-ip", "9.9.9.9")]);
@@ -2059,6 +2148,48 @@ mod tests {
         assert!(ghost.is_unsigned() && !signed.is_unsigned() && !shield.is_unsigned());
         assert_eq!(forwarded_client_ip(&ghost, ip), None);
         assert_eq!((forwarded_client_ip(&signed, ip), forwarded_client_ip(&shield, ip)), (ip, ip), "signed txs (a shield too) name their sender anyway");
+    }
+
+    /// F64: the explorer resolves routes against its own views only (`#/constructor/<html>` used
+    /// to reach `Object`, which handed the decoded id to innerHTML unescaped), and never puts a
+    /// non-string into innerHTML. Runs the page's script under Node with a stub DOM (skipped
+    /// where `node` isn't installed; CI has it).
+    #[test]
+    fn explorer_routes_only_to_its_own_views() {
+        let Ok(out) = std::process::Command::new("node").arg("--version").output() else {
+            eprintln!("skipping: node isn't installed");
+            return;
+        };
+        assert!(out.status.success());
+        let stub = r##"
+const app = { innerHTML: "" };
+globalThis.document = { querySelector: (s) => (s === "#app" ? app : { addEventListener() {}, textContent: "", value: "" }), querySelectorAll: () => [] };
+globalThis.window = { addEventListener() {} };
+globalThis.setInterval = () => 0;
+globalThis.fetch = async () => ({ ok: false, json: async () => ({ error: "offline" }) });
+globalThis.location = { hash: "" };
+"##;
+        let probe = r##"
+(async () => {
+  const out = {};
+  for (const [name, hash] of Object.entries({ constructor: "#/constructor/%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E", proto: "#/__proto__/%3Cb%3Ex%3C%2Fb%3E", toString: "#/toString/%3Cb%3Ex%3C%2Fb%3E", hasOwnProperty: "#/hasOwnProperty/%3Cb%3Ex%3C%2Fb%3E" })) {
+    location.hash = hash;
+    await route();
+    out[name] = app.innerHTML;
+  }
+  console.log(JSON.stringify(out));
+})();
+"##;
+        let src = format!("{stub}{}{probe}", explorer_script());
+        let out = std::process::Command::new("node").arg("-e").arg(&src).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let pages: BTreeMap<String, String> = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(pages.len(), 4);
+        for (route, html) in &pages {
+            // Each falls back to the home view, which fails offline: the escaped error card.
+            assert!(!html.contains("<img") && !html.contains("<b>"), "{route}: {html}");
+            assert!(html.contains("offline"), "{route}: {html}");
+        }
     }
 
     /// The p2p transport `/api/status` reports is the one linked (audit #1/#3). Compiling
@@ -2110,6 +2241,118 @@ mod http_tests {
         assert_eq!(err.0, StatusCode::BAD_GATEWAY);
         assert!(!err.1.contains("scheme"), "{}", err.1);
         assert!(err.1.contains("couldn't reach"), "{}", err.1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// `call` for big responses: the status and the body's size, and the JSON when it parses.
+    async fn get_big(n: &Node, uri: &str) -> (StatusCode, usize, Value) {
+        let app = router(n.clone()).layer(MockConnectInfo("127.0.0.1:1".parse::<SocketAddr>().unwrap()));
+        let res = app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), 256 << 20).await.unwrap();
+        (status, bytes.len(), serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    /// Executes a block whose consensus bytes are `size` long, with a certificate if `cert`.
+    fn big_block(n: &Node, size: usize, cert: bool) {
+        let mut c = n.chain.lock();
+        let mut f = c.test_block(vec![]);
+        f.cblock = vec![7; size];
+        f.certificate = cert.then(|| vec![0xce; 64]);
+        c.execute(f).unwrap();
+    }
+
+    /// F64: `GET /` carries a CSP that only lets the explorer's own inline script run (by its
+    /// SHA-256), so an injected handler or script doesn't run even if a view forgot to escape.
+    #[tokio::test]
+    async fn explorer_is_served_with_a_script_hash_csp() {
+        assert_eq!([base64(b""), base64(b"f"), base64(b"fo"), base64(b"foo"), base64(b"foobar")], ["", "Zg==", "Zm8=", "Zm9v", "Zm9vYmFy"]);
+        {
+            use commonware_cryptography::Hasher as _;
+            assert_eq!(base64(commonware_cryptography::Sha256::hash(&[b"abc"]).as_ref()), "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=");
+        }
+        assert_eq!(EXPLORER.matches("<script").count(), 1, "one inline script, the one the CSP hashes");
+        assert!(explorer_script().contains("async function route()"));
+        let html = EXPLORER.split("<script>").next().unwrap();
+        assert!(!html.contains(" onclick=") && !html.contains(" onload=") && !html.contains(" onerror="), "no inline handlers: the CSP would block them");
+        let (root, n) = node("csp");
+        let res = router(n).oneshot(Request::builder().uri("/").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let csp = res.headers()[axum::http::header::CONTENT_SECURITY_POLICY].to_str().unwrap().to_string();
+        assert!(csp.contains("default-src 'none'") && csp.contains("connect-src 'self'") && csp.contains("frame-ancestors 'none'"), "{csp}");
+        let script_src = csp.split(';').find(|d| d.trim().starts_with("script-src")).unwrap();
+        assert!(!script_src.contains("unsafe-inline") && script_src.contains("'sha256-"), "{script_src}");
+        assert_eq!(res.headers()[axum::http::header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// F61/F65: `from` near u64::MAX used to overflow the epoch math before the `from > tip`
+    /// check (a panic per request); the epoch helpers saturate too.
+    #[tokio::test]
+    async fn sync_from_u64_max_is_an_empty_batch() {
+        let (root, n) = node("syncmax");
+        n.chain.lock().produce_block_with(vec![]).unwrap();
+        for from in [u64::MAX, u64::MAX - 1, 1 << 63, 2] {
+            let (s, b, _) = call(&n, "GET", &format!("/api/sync?from={from}&limit=500"), None, "127.0.0.1:1").await;
+            assert_eq!((s, b["tip"].as_u64(), b["blocks"].as_array().map(Vec::len)), (StatusCode::OK, Some(1), Some(0)), "from={from}");
+        }
+        let p = n.chain.lock().state.params.clone();
+        assert_eq!(p.last_of(p.epoch_of(u64::MAX)), u64::MAX);
+        assert_eq!((p.last_of(0), p.last_of(1)), (p.epoch_blocks - 1, 2 * p.epoch_blocks - 1));
+        assert!(p.is_boundary(p.epoch_blocks - 1) && !p.is_boundary(p.epoch_blocks));
+        assert_eq!(p.is_boundary(u64::MAX), u64::MAX % p.epoch_blocks == p.epoch_blocks - 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// F09: a full node (no marshal fallback) stores a certificate at least every
+    /// `CERT_SPACING_BYTES` of blocks, so a joiner's batch over big blocks always has one (after a
+    /// restart too, from disk); a stretch with no certificate inside the byte budget is extended to
+    /// the next stored one within `SYNC_MAX_BYTES` instead of answering 503; and no response, not
+    /// even `limit=1`'s, goes past `SYNC_MAX_BYTES` of blocks.
+    #[tokio::test]
+    async fn sync_batches_over_big_blocks_end_at_a_stored_certificate_within_the_cap() {
+        let (root, n) = node("syncbig");
+        let size = 300_000;
+        // Certificates for every block: kept on disk by bytes (every 4th block here), not only at
+        // multiples of 100.
+        for _ in 0..40 {
+            big_block(&n, size, true);
+        }
+        let home = n.chain.lock().home.clone();
+        drop(n);
+        let chain = Arc::new(Mutex::new(Chain::open(&home).unwrap()));
+        let n = Node::new(chain, None, vec![], ClientIpPolicy::default());
+        let stored: Vec<u64> = (1..=40).filter(|h| n.chain.lock().cert(*h).is_some()).collect();
+        assert!(stored.windows(2).all(|w| (w[1] - w[0]) * size as u64 <= crate::chain::CERT_SPACING_BYTES + size as u64), "{stored:?}");
+        let (s, len, b) = get_big(&n, "/api/sync?from=1&limit=200").await;
+        assert_eq!(s, StatusCode::OK);
+        let to = b["to"].as_u64().unwrap();
+        assert!(stored.contains(&to) && len <= SYNC_BATCH_BYTES + (1 << 20), "to {to}, {len} bytes");
+        // A stretch whose blocks pass the budget, its only certificate at its end (what CERT_CHECKPOINT
+        // spacing left before): served up to it, for the joiner's request and for `limit=1`.
+        for _ in 41..=60 {
+            big_block(&n, size, false);
+        }
+        big_block(&n, size, true);
+        for limit in [200, 1] {
+            let (s, len, b) = get_big(&n, &format!("/api/sync?from=41&limit={limit}")).await;
+            assert_eq!((s, b["to"].as_u64()), (StatusCode::OK, Some(61)), "limit={limit}");
+            assert!(len > SYNC_BATCH_BYTES && len <= SYNC_MAX_BYTES + (1 << 20), "{len} bytes");
+        }
+        // Past the hard cap there is no batch to give: 503, the joiner tries another peer.
+        for _ in 62..=120 {
+            big_block(&n, size, false);
+        }
+        big_block(&n, size, true);
+        let (s, len, _) = get_big(&n, "/api/sync?from=62&limit=1").await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(len < 1024);
+        // No certificate ahead at all (and no marshal): 503 without reading the stretch.
+        let (s, _, _) = get_big(&n, "/api/sync?from=122").await;
+        assert_eq!(s, StatusCode::OK, "past the tip");
+        big_block(&n, size, false);
+        let (s, _, b) = get_big(&n, "/api/sync?from=122").await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{b}");
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -2380,6 +2623,35 @@ mod http_tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// F28: the faucet takes its rate-limit slot atomically before dripping, so a burst of
+    /// parallel requests from one IP to one address gets one drip, not one per request that
+    /// passed a check before any recorded; a drip that fails gives the slot back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn faucet_limits_hold_under_concurrent_requests() {
+        let (root, n) = node("faucetrace");
+        let a = crate::crypto::Keys::from_seed([5; 32]).address();
+        let tasks: Vec<_> = (0..32).map(|_| {
+            let (n, a) = (n.clone(), a.clone());
+            tokio::spawn(async move { call(&n, "POST", "/api/faucet", Some(json!({ "to": a })), "203.0.113.5:1").await.0 })
+        }).collect();
+        let mut ok = 0;
+        for t in tasks {
+            match t.await.unwrap() {
+                StatusCode::OK => ok += 1,
+                s => assert_eq!(s, StatusCode::TOO_MANY_REQUESTS),
+            }
+        }
+        assert_eq!(ok, 1, "one drip per IP and address window");
+        // A reserved slot that's given back is free again; others' hits stay.
+        let rules = vec![("k".to_string(), 1, Duration::from_secs(60))];
+        let at = n.limits.allow(&rules).unwrap();
+        assert!(n.limits.allow(&rules).is_err());
+        n.limits.refund(&rules, at);
+        n.limits.allow(&rules).unwrap();
+        assert!(n.limits.allow(&rules).is_err());
+        std::fs::remove_dir_all(root).ok();
+    }
+
     /// `/api/proof`: a record's value and Merkle proof against the latest state root, checked with
     /// `state::tree::verify` exactly as a light client would; an absent key gets an exclusion
     /// proof.
@@ -2630,6 +2902,40 @@ mod http_tests {
         assert_eq!(s, StatusCode::OK);
         assert_eq!(v["status"], "failed");
         assert!(v["error"].as_str().unwrap().contains("insufficient"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// F66: a finalized tx's charge comes from its block's index row, so `/api/tx` and
+    /// `/api/account` read one tx's span, never parse (and cache) the whole block.
+    #[tokio::test]
+    async fn tx_and_account_reads_dont_parse_whole_blocks() {
+        let root = std::env::temp_dir().join(format!("blockula-api-txspan-{}-{}", crate::chain::now_ms(), std::process::id()));
+        let homes = Chain::summon(&root, &SummonOpts::new("txspan", 1)).unwrap();
+        let k = crate::crypto::Keys::from_seed([9; 32]);
+        let (id, at, fee) = {
+            let mut c = Chain::open(&homes[0]).unwrap();
+            c.faucet(&k.address(), 10 * DROPS_PER_FANG).unwrap();
+            c.produce_block().unwrap();
+            let mut tx = Tx { chain_id: "txspan".into(), genesis_hash: c.genesis_hash.clone(), from: k.address(), nonce: 0, fee: 0, tip: 7, valid_until: c.height() + 100, action: Action::Transfer { to: c.me().unwrap(), amount: DROPS_PER_FANG }, memo: String::new(), public_key: hex::encode(k.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+            tx.fee = min_fee(tx.size()) + 1_000_000;
+            let tx = tx.sign(&k);
+            c.produce_block_with(vec![tx.clone()]).unwrap();
+            let at = c.height();
+            let slot = c.view().block(at).unwrap().base_fee.expect("blocks record their base fee");
+            c.produce_block().unwrap();
+            (tx.id(), at, slot.fee(tx.size()) + 7)
+        };
+        // A fresh start: nothing cached, and the tx's block isn't the head.
+        let chain = Arc::new(Mutex::new(Chain::open(&homes[0]).unwrap()));
+        let n = Node::new(chain, None, vec![], ClientIpPolicy::default());
+        assert!(n.live.view().disk.cached_block(at).is_none());
+        let (s, v, _) = call(&n, "GET", &format!("/api/tx/{id}"), None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!((v["status"].as_str(), v["fee"].as_str()), (Some("finalized"), Some(fee.to_string().as_str())), "{v}");
+        let (s, a, _) = call(&n, "GET", &format!("/api/account/{}", k.address()), None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(a["recent_txs"].as_array().unwrap().iter().any(|t| t["id"] == json!(id) && t["fee"] == v["fee"]), "{a}");
+        assert!(n.live.view().disk.cached_block(at).is_none(), "the block was parsed for its base fee");
         std::fs::remove_dir_all(root).ok();
     }
 

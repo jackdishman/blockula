@@ -367,10 +367,14 @@ fn kat_proposal() -> Proposal<Digest> {
     Proposal::new(Round::new(Epoch::new(3), View::new(42)), View::new(40), Digest(crypto::hash(b"blockula kat block")))
 }
 
-fn handoff_keys() -> Vec<String> {
-    let mut keys: Vec<String> = VALIDATOR_SEEDS[1..].iter().map(|s| hex::encode(pq::PrivateKey::from_seed_bytes(*s).public_key().as_ref())).collect();
-    keys.sort();
-    keys
+/// The handoff vector's outgoing set (all four) and incoming set (the last three), sorted.
+fn handoff_keys() -> (Vec<String>, Vec<String>) {
+    let sorted = |seeds: &[[u8; 32]]| {
+        let mut keys: Vec<String> = seeds.iter().map(|s| hex::encode(pq::PrivateKey::from_seed_bytes(*s).public_key().as_ref())).collect();
+        keys.sort();
+        keys
+    };
+    (sorted(&VALIDATOR_SEEDS), sorted(&VALIDATOR_SEEDS[1..]))
 }
 
 /// Seed → public key, key id, and its address under both prefixes (mainnet `boo`, testnet `tboo`).
@@ -432,7 +436,8 @@ fn rust_signed() -> Value {
     let mut c = case("validator-pop", VALIDATOR_SEEDS[0], types::POP_CONTEXT, &pop_msg, v0.sign(types::POP_CONTEXT, &pop_msg).as_ref());
     c["pop"] = json!({ "chain_id": CROSS_CHAIN, "owner": owner.address(), "p2p_addr": POP.0, "http_addr": POP.1 });
     cases.push(c);
-    let handoff = epochs::handoff_message(CROSS_CHAIN, HANDOFF_EPOCH, &handoff_keys());
+    let (outgoing, incoming) = handoff_keys();
+    let handoff = epochs::handoff_message(CROSS_CHAIN, HANDOFF_EPOCH, &outgoing, &incoming);
     cases.push(case("epoch-handoff", VALIDATOR_SEEDS[0], epochs::HANDOFF_CONTEXT, &handoff, v0.sign(epochs::HANDOFF_CONTEXT, &handoff).as_ref()));
     // Context edge cases: empty message, the longest context, and a namespace pq.rs hashes.
     let k = pq::PrivateKey::from_seed_bytes([0xff; 32]);

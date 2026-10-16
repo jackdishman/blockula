@@ -84,6 +84,11 @@ impl Disk {
         self.certs.read().get(&height).cloned()
     }
 
+    /// The lowest height in `range` whose certificate is in memory.
+    pub fn next_recent_cert(&self, range: std::ops::RangeInclusive<u64>) -> Option<u64> {
+        self.certs.read().range(range).next().map(|(h, _)| *h)
+    }
+
     pub fn remember_cert(&self, height: u64, cert: Vec<u8>) {
         let mut certs = self.certs.write();
         certs.insert(height, Arc::new(cert));
@@ -293,6 +298,15 @@ impl ReadView {
         (self.history_from()..=top).rev().take(limit).filter_map(|h| Some((h, self.block_meta(h)?))).collect()
     }
 
+    /// The base fee block `height` charged: from memory if the block is there, else from its
+    /// index row (never by parsing the block, F66).
+    pub fn base_fee(&self, height: u64) -> Option<crate::econ::FeeSlot> {
+        if let Some(b) = self.head.as_ref().filter(|b| b.height == height).cloned().or_else(|| self.disk.cached_block(height)) {
+            return b.base_fee;
+        }
+        self.block_meta(height)?.base_fee
+    }
+
     /// Executed block at `height`.
     pub fn block(&self, height: u64) -> Option<Arc<Block>> {
         if height == 0 || height > self.height || height < self.history_from() {
@@ -378,6 +392,15 @@ impl ReadView {
             return Some((*c).clone());
         }
         self.snap.cert(height).ok()?
+    }
+
+    /// The lowest height in `range` with a certificate this node holds (memory or disk).
+    pub fn next_cert(&self, range: std::ops::RangeInclusive<u64>) -> Option<u64> {
+        let disk = self.snap.next_cert(range.clone()).ok().flatten();
+        match (self.disk.next_recent_cert(range), disk) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     pub fn cert_len(&self, height: u64) -> usize {
@@ -495,6 +518,8 @@ pub struct Live {
     view: ArcSwap<ReadView>,
     mempool: ArcSwap<MempoolView>,
     epochs: ArcSwap<EpochRegistry>,
+    /// `/api/epochs` pages as served (JSON), by `from`, and the registry they were cut from.
+    epoch_pages: Mutex<(Arc<EpochRegistry>, HashMap<u64, Arc<Vec<u8>>>)>,
     /// Highest finalized height proven by a certificate (consensus updates it between blocks).
     pub finalized_tip: AtomicU64,
     /// Median of the tips HTTP peers claim (display only).
@@ -504,7 +529,8 @@ pub struct Live {
 
 impl Live {
     pub fn new(view: ReadView, epochs: EpochRegistry, disk: Arc<Disk>) -> Self {
-        Self { view: ArcSwap::from_pointee(view), mempool: ArcSwap::from_pointee(MempoolView::default()), epochs: ArcSwap::from_pointee(epochs), finalized_tip: AtomicU64::new(0), claimed: AtomicU64::new(0), disk }
+        let epochs = Arc::new(epochs);
+        Self { view: ArcSwap::from_pointee(view), mempool: ArcSwap::from_pointee(MempoolView::default()), epochs: ArcSwap::new(epochs.clone()), epoch_pages: Mutex::new((epochs, HashMap::new())), finalized_tip: AtomicU64::new(0), claimed: AtomicU64::new(0), disk }
     }
 
     pub fn view(&self) -> Arc<ReadView> {
@@ -527,8 +553,35 @@ impl Live {
         self.mempool.store(Arc::new(m));
     }
 
-    pub fn publish_epochs(&self, e: EpochRegistry) {
-        self.epochs.store(Arc::new(e));
+    pub fn publish_epochs(&self, e: Arc<EpochRegistry>) {
+        self.epochs.store(e);
+    }
+
+    /// The `/api/epochs` page from `from` (JSON: the registry's `slice` plus `proven_through` and
+    /// `next`), serialized once per published registry (a few pages are cached), without holding
+    /// anything the chain waits on.
+    pub fn epoch_page(&self, from: u64) -> Arc<Vec<u8>> {
+        let e = self.epochs();
+        {
+            let pages = self.epoch_pages.lock();
+            if let Some(p) = pages.1.get(&from).filter(|_| Arc::ptr_eq(&pages.0, &e)) {
+                return p.clone();
+            }
+        }
+        let (page, next) = e.slice(from, crate::epochs::PAGE_BYTES);
+        let mut v = serde_json::to_value(&page).unwrap_or_default();
+        v["proven_through"] = serde_json::json!(page.proven_through());
+        v["next"] = serde_json::json!(next);
+        let bytes = Arc::new(serde_json::to_vec(&v).unwrap_or_default());
+        let mut pages = self.epoch_pages.lock();
+        if !Arc::ptr_eq(&pages.0, &e) {
+            *pages = (e, HashMap::new());
+        }
+        if pages.1.len() >= 16 {
+            pages.1.clear();
+        }
+        pages.1.insert(from, bytes.clone());
+        bytes
     }
 
     /// Highest height known final: certified, or executed here.

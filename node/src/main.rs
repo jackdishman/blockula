@@ -56,10 +56,15 @@ struct Net {
     /// rate limits (repeatable)
     #[arg(long = "trusted-forwarder")]
     trusted_forwarders: Vec<std::net::IpAddr>,
-    /// Reverse-proxy header holding the real client IP (e.g. `fly-client-ip`). Only set this when
-    /// every request reaches the node through that proxy; otherwise clients can spoof it.
+    /// Reverse-proxy header holding the real client IP (e.g. `fly-client-ip`, `x-real-ip`). Only
+    /// set this when every request reaches the node through that proxy; otherwise clients can
+    /// spoof it. A request without it is limited as the proxy's own IP
     #[arg(long)]
     client_ip_header: Option<String>,
+    /// Proxies that append to --client-ip-header (`x-forwarded-for`): the client is this many
+    /// entries from the right (entries further left are the client's own say)
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..=16))]
+    client_ip_hops: u64,
     /// HTTP peer to sync from and forward txs/faucet requests to (repeatable). Replaces the
     /// genesis validators' http addresses entirely (e.g. http://blockula-v0.internal:7070).
     #[arg(long = "peer-http")]
@@ -271,6 +276,7 @@ fn net_opts(net: Net, http_port: Option<u16>, p2p_preset: Option<String>, epheme
         trusted_forwarders: net.trusted_forwarders,
         forwarder_secret: std::env::var("BLOCKULA_FORWARDER_SECRET").ok().filter(|s| s.len() >= 32),
         header: net.client_ip_header.map(|h| h.to_lowercase()),
+        hops: net.client_ip_hops as usize,
     };
     let http = node::HttpOpts { read_rps: net.read_rps, read_burst: net.read_burst, timeout: std::time::Duration::from_secs(net.http_timeout_secs.max(1)) };
     let pruning = match (net.archive, net.prune_blocks) {

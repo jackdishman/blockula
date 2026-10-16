@@ -599,12 +599,17 @@ function txRow(t) {
 
 async function route() {
   const [, view = "", id = ""] = location.hash.split("/");
-  const fn = views[view] || views.home;
+  // Own views only: `views["constructor"]` is Object, which hands the route id back unescaped.
+  const fn = Object.hasOwn(views, view) ? views[view] : views.home;
   // Detail pages (a block, tx, account, name) don't belong to one section; a single hunt does.
-  const section = { block: null, tx: null, account: null, name: null, hunt: "hunts", claim: "contribute", seance: "contribute", proposal: "governance" }[view];
-  const current = section === undefined ? view : section;
+  const sections = { block: null, tx: null, account: null, name: null, hunt: "hunts", claim: "contribute", seance: "contribute", proposal: "governance" };
+  const current = Object.hasOwn(sections, view) ? sections[view] : view;
   document.querySelectorAll("nav a").forEach((a) => a.toggleAttribute("aria-current", current !== null && a.getAttribute("href") === `#/${current}`));
-  try { $("#app").innerHTML = await fn(decodeURIComponent(id)); }
+  try {
+    const html = await fn(decodeURIComponent(id));
+    // Views build HTML strings with every value escaped; anything else is never markup.
+    $("#app").innerHTML = typeof html === "string" ? html : "";
+  }
   catch (e) { $("#app").innerHTML = card(`<span class="eyebrow">Not found</span><p class="err">${esc(e.message)}</p>`); }
 }
 

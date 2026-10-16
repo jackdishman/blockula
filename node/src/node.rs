@@ -165,17 +165,66 @@ pub fn prune_epoch_journals(dir: &Path, prefix: &str, epoch: u64) -> Result<usiz
     Ok(deleted)
 }
 
+/// Handoff signatures checked per peer per round, at most (a peer can only offer ones we lack, for
+/// changes still short of a quorum; this bounds what a lying one costs us each round).
+const HANDOFF_VERIFIES_PER_ROUND: usize = 512;
+/// `/api/epochs` pages read per peer per round, at most: past a change nobody has a quorum for,
+/// the next pages may still hold signatures we lack.
+const HANDOFF_PAGES_PER_ROUND: usize = 4;
+
+/// Where the next `/api/epochs` page starts (`null` after the last).
+#[derive(serde::Deserialize)]
+struct PageNext {
+    #[serde(default)]
+    next: Option<u64>,
+}
+
 /// Pulls peers' validator-set handoff signatures every 30s (and signs our own, if we're a
-/// validator), so this node can serve complete proofs to fast-syncing joiners.
+/// validator), so this node can serve complete proofs to fast-syncing joiners. Incremental
+/// (F19, F26): it asks only while some set change lacks a quorum here, only for pages from the
+/// first such change on, and verifies only signatures it lacks, without the chain lock.
 async fn exchange_epochs(chain: Shared, peers: Vec<String>) {
     let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
-    chain.lock().sign_handoffs();
+    let (live, chain_id) = {
+        let mut c = chain.lock();
+        c.sign_handoffs();
+        (c.live.clone(), c.genesis.chain_id.clone())
+    };
     loop {
         for peer in &peers {
-            if let Ok(body) = get_capped(&client, &format!("{peer}/api/epochs"), 16 << 20).await {
-                if let Ok(reg) = serde_json::from_slice::<crate::epochs::EpochRegistry>(&body) {
-                    chain.lock().merge_epochs(&reg);
+            let ours = live.epochs();
+            let from = ours.proven_through();
+            if from >= ours.known_through {
+                break; // every change has its quorum: nothing to ask anyone for
+            }
+            let mut wanted = vec![];
+            let mut at = Some(from);
+            for _ in 0..HANDOFF_PAGES_PER_ROUND {
+                let Some(from) = at.filter(|a| *a < ours.known_through) else { break };
+                let url = format!("{peer}/api/epochs?from={from}");
+                let (page, next) = match get_capped(&client, &url, crate::epochs::MAX_PAGE_BYTES).await.and_then(|b| Ok((serde_json::from_slice::<crate::epochs::EpochRegistry>(&b)?, serde_json::from_slice::<PageNext>(&b)?.next))) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::debug!(peer = %peer, error = %format!("{e:#}"), "couldn't fetch handoff proofs");
+                        break;
+                    }
+                };
+                wanted = ours.candidates(&chain_id, &page, HANDOFF_VERIFIES_PER_ROUND);
+                if !wanted.is_empty() {
+                    break;
                 }
+                at = next.filter(|n| *n > from);
+            }
+            if wanted.is_empty() {
+                continue;
+            }
+            let offered = wanted.len();
+            let verified = tokio::task::spawn_blocking(move || crate::epochs::verify_candidates(wanted)).await.unwrap_or_default();
+            if verified.len() < offered {
+                tracing::warn!(peer = %peer, offered, valid = verified.len(), "a peer served handoff signatures that don't verify");
+            }
+            if !verified.is_empty() {
+                chain.lock().add_handoffs(verified);
             }
         }
         tokio::time::sleep(Duration::from_secs(30)).await;
@@ -847,8 +896,9 @@ pub async fn get_capped(client: &reqwest::Client, url: &str, cap: usize) -> Resu
     Ok(body)
 }
 
-/// One sync round against `peer`. Ok(true) = applied blocks, Ok(false) = peer had nothing new.
-async fn sync_once(chain: &Shared, provider: &consensus::EpochProvider, client: &reqwest::Client, peer: &str, trust: &Trust) -> Result<bool> {
+/// One sync round against `peer`: how many blocks it applied (0: the peer had nothing new) and
+/// how long the peer took to send them.
+async fn sync_once(chain: &Shared, provider: &consensus::EpochProvider, client: &reqwest::Client, peer: &str, trust: &Trust) -> Result<(u64, Duration)> {
     // Batches never cross an epoch boundary: each is verified with that epoch's validator set,
     // which we learn by executing the previous epoch's last block.
     let (from, limit, epoch) = {
@@ -858,7 +908,9 @@ async fn sync_once(chain: &Shared, provider: &consensus::EpochProvider, client: 
         (from, (c.state.params.last_of(epoch) - from + 1).min(200), epoch)
     };
     let verifier = provider.epoch_scheme(epoch).ok_or_else(|| anyhow!("no validator set known for epoch {epoch}"))?;
+    let asked = std::time::Instant::now();
     let body = get_capped(client, &format!("{peer}/api/sync?from={from}&limit={limit}"), MAX_SYNC_RESPONSE).await?;
+    let took = asked.elapsed();
     let batch: SyncBatch = serde_json::from_slice(&body)?;
     // A peer's claimed tip is display-only, and only noted once its answer checked out.
     if batch.blocks.is_empty() {
@@ -866,15 +918,64 @@ async fn sync_once(chain: &Shared, provider: &consensus::EpochProvider, client: 
             bail!("peer claims height {} but sent nothing", batch.tip);
         }
         chain.lock().note_claim(peer, batch.tip);
-        return Ok(false);
+        return Ok((0, took));
     }
     apply_batch_trusted(chain, &verifier, epoch, &batch, Some(trust))?;
     chain.lock().note_claim(peer, batch.tip);
-    Ok(true)
+    Ok((batch.blocks.len() as u64, took))
 }
 
-/// Follows peers forever (full nodes). Peers rotate on errors, bad batches and empty replies,
-/// so one stalling or lying peer can't hold the node back.
+/// How long a peer that sent blocks slower than the chain makes them is asked last, at first;
+/// each slow round in a row doubles it, up to `SLOW_PEER_MAX`.
+const SLOW_PEER_BENCH: Duration = Duration::from_secs(60);
+const SLOW_PEER_MAX: Duration = Duration::from_secs(15 * 60);
+
+/// Which peer sync asks next (F27). Peers take turns on errors and empty replies, and a peer
+/// whose round delivered blocks at less than twice the chain's rate (`blocks × block_time <
+/// 2 × time taken`: a node fed that way never catches up, or only slowly) is benched: asked again
+/// only once every other peer is benched too, or its time is up. So a peer that trickles real,
+/// certified blocks just inside the request timeout gets one round, not the node.
+struct Rotation {
+    at: usize,
+    benched_until: Vec<Option<std::time::Instant>>,
+    strikes: Vec<u32>,
+}
+
+impl Rotation {
+    fn new(peers: usize) -> Self {
+        Self { at: 0, benched_until: vec![None; peers.max(1)], strikes: vec![0; peers.max(1)] }
+    }
+
+    fn current(&self) -> usize {
+        self.at
+    }
+
+    /// Moves on to the next peer that isn't benched (or just the next one, if all are).
+    fn advance(&mut self, now: std::time::Instant) {
+        let n = self.benched_until.len();
+        let next = (1..=n).map(|step| (self.at + step) % n).find(|i| self.benched_until[*i].is_none_or(|t| t <= now));
+        self.at = next.unwrap_or((self.at + 1) % n);
+    }
+
+    /// A round that applied `blocks` (≥ 1), sent in `took`. Returns how long the peer is benched
+    /// for when that was too slow (and moves on), `None` when it may go on.
+    fn progress(&mut self, blocks: u64, took: Duration, block_time: Duration, now: std::time::Instant) -> Option<Duration> {
+        let i = self.at;
+        if u128::from(blocks) * block_time.as_millis() >= 2 * took.as_millis() {
+            self.strikes[i] = 0;
+            return None;
+        }
+        self.strikes[i] = self.strikes[i].saturating_add(1);
+        let bench = SLOW_PEER_BENCH.saturating_mul(1u32 << (self.strikes[i] - 1).min(8)).min(SLOW_PEER_MAX);
+        self.benched_until[i] = Some(now + bench);
+        self.advance(now);
+        Some(bench)
+    }
+}
+
+/// Follows peers forever (full nodes). Peers rotate on errors, bad batches and empty replies, and
+/// one that sends blocks slower than the chain makes them is benched ([`Rotation`]), so one
+/// stalling, trickling or lying peer can't hold the node back.
 async fn sync_loop(chain: Shared, peers: Vec<String>, stop_when_caught_up: bool, trust: Arc<Trust>) {
     let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build().unwrap();
     let provider = consensus::EpochProvider::new(chain.clone(), None);
@@ -883,7 +984,7 @@ async fn sync_loop(chain: Shared, peers: Vec<String>, stop_when_caught_up: bool,
         eprintln!("❌ no peers to sync from (set --peer-http)");
         return;
     }
-    let mut peer = 0usize;
+    let mut rotation = Rotation::new(peers.len());
     let mut idle_rounds = 0usize;
     let mut failures = 0usize;
     let halt = chain.lock().halt.signal.clone();
@@ -896,15 +997,19 @@ async fn sync_loop(chain: Shared, peers: Vec<String>, stop_when_caught_up: bool,
             eprintln!("🛑 {h}\n   still serving reads at height {}; /api/health reports the halt", chain.lock().height());
             return futures::future::pending().await;
         }
-        let url = &peers[peer % peers.len()];
+        let url = &peers[rotation.current()];
         match sync_once(&chain, &provider, &client, url, &trust).await {
-            Ok(true) => {
-                idle_rounds = 0;
-                failures = 0;
-            }
-            Ok(false) => {
+            Ok((blocks, took)) if blocks > 0 => match rotation.progress(blocks, took, block_time, std::time::Instant::now()) {
+                // A slow round doesn't count as progress: catching up must not hinge on it.
+                Some(bench) => eprintln!("⚠️  sync from {url}: {blocks} block(s) in {:.1}s, slower than the chain; asking other peers first for {}s", took.as_secs_f64(), bench.as_secs()),
+                None => {
+                    idle_rounds = 0;
+                    failures = 0;
+                }
+            },
+            Ok(_) => {
                 idle_rounds += 1;
-                peer += 1; // ask someone else next time, so no single peer can stall us
+                rotation.advance(std::time::Instant::now()); // ask someone else next time, so no single peer can stall us
                 if stop_when_caught_up && idle_rounds >= peers.len() {
                     return;
                 }
@@ -915,7 +1020,7 @@ async fn sync_loop(chain: Shared, peers: Vec<String>, stop_when_caught_up: bool,
                 if !e.to_string().contains("sent nothing") && halt.get().is_none() {
                     eprintln!("⚠️  sync from {url}: {e:#}");
                 }
-                peer += 1;
+                rotation.advance(std::time::Instant::now());
                 failures += 1;
                 if stop_when_caught_up && failures >= peers.len() * 2 {
                     return;
@@ -1123,6 +1228,101 @@ mod tests {
         assert_eq!(chain.lock().height(), 0, "nothing executed");
         apply_batch_trusted(&chain, &verifier, 0, &batch, Some(&trust(&hash2, genesis_set))).unwrap();
         assert_eq!(chain.lock().hash_at(2), Some(hash2));
+        drop(chain);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// F27: the rotation benches a peer whose round delivered blocks slower than twice the
+    /// chain's rate, skips it while benched (unless every peer is), and backs off more each time.
+    #[test]
+    fn slow_peers_are_benched_and_skipped() {
+        let t0 = std::time::Instant::now();
+        let second = Duration::from_secs(1);
+        let mut r = Rotation::new(3);
+        assert_eq!(r.progress(200, Duration::from_secs(20), second, t0), None, "10 blocks a second: fine");
+        assert_eq!(r.progress(1, Duration::from_millis(400), second, t0), None, "one block in 0.4 s keeps up");
+        assert_eq!(r.progress(1, Duration::from_millis(29_000), second, t0), Some(SLOW_PEER_BENCH), "a trickle");
+        assert_eq!(r.current(), 1);
+        r.advance(t0);
+        r.advance(t0);
+        assert_eq!(r.current(), 1, "peer 0 is skipped while benched");
+        assert_eq!(r.progress(3, Duration::from_secs(2), second, t0), Some(SLOW_PEER_BENCH));
+        assert_eq!(r.current(), 2);
+        assert_eq!(r.progress(1, Duration::from_secs(1), second, t0), Some(SLOW_PEER_BENCH));
+        assert_eq!(r.current(), 0, "all benched: plain turns");
+        assert_eq!(r.progress(1, Duration::from_secs(5), second, t0), Some(2 * SLOW_PEER_BENCH), "twice in a row: longer");
+        let later = t0 + SLOW_PEER_MAX;
+        r.advance(later);
+        assert_eq!(r.current(), 2, "benches run out");
+        for _ in 0..20 {
+            r.progress(1, Duration::from_secs(5), second, later);
+        }
+        assert!(r.strikes.iter().all(|s| *s <= 21) && r.benched_until.iter().flatten().all(|t| *t <= later + SLOW_PEER_MAX));
+    }
+
+    /// F27: a peer that serves real, certified blocks one at a time just slower than the chain
+    /// (first in the list, as genesis validator 0's endpoint is for everyone by default) gets one
+    /// round; the honest peer brings the node up to its tip and catching up ends.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_trickling_peer_does_not_capture_sync() {
+        use axum::extract::{Path as AxPath, Query, State as AxState};
+        use axum::{routing::get, Router};
+        use commonware_codec::Encode as _;
+        use commonware_consensus::simplex::types::{Finalize, Proposal};
+        use commonware_consensus::types::{Epoch, Round, View};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = home("trickle");
+        let homes = Chain::summon(&root, &SummonOpts::new("trickle", 1)).unwrap();
+        let g = Genesis::load(&homes[0].join("genesis.json")).unwrap();
+        let seed: [u8; 32] = hex::decode(std::fs::read_to_string(homes[0].join("validator.key")).unwrap().trim()).unwrap().try_into().unwrap();
+        let full = root.join("full");
+        std::fs::create_dir_all(&full).unwrap();
+        std::fs::copy(homes[0].join("genesis.json"), full.join("genesis.json")).unwrap();
+        let chain: Shared = Arc::new(Mutex::new(Chain::open(&full).unwrap()));
+        const TIP: u64 = 20;
+        let root_hash = consensus::hex_32(&g.initial_state().root());
+        let mut blocks = vec![consensus::genesis_block(&g)];
+        for h in 1..=TIP {
+            let parent = blocks.last().unwrap().digest();
+            blocks.push(CBlock::new(parent, h, h, h - 1, g.created_at_ms + 1000 * h, g.validators[0].address.clone(), 0, root_hash, vec![]));
+        }
+        let scheme = Arc::new(MlDsaScheme::signer(&consensus::genesis_namespace(&g), consensus::participants(&g).unwrap(), PrivateKey::from_seed_bytes(seed)).unwrap());
+        #[derive(Clone)]
+        struct Peer {
+            blocks: Arc<Vec<CBlock>>,
+            scheme: Arc<MlDsaScheme>,
+            hits: Arc<[AtomicUsize; 2]>,
+        }
+        let peer = Peer { blocks: Arc::new(blocks), scheme, hits: Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]) };
+        async fn serve(AxState(p): AxState<Peer>, AxPath(who): AxPath<String>, Query(q): Query<std::collections::HashMap<String, u64>>) -> axum::Json<serde_json::Value> {
+            let trickle = who == "trickle";
+            p.hits[usize::from(!trickle)].fetch_add(1, Ordering::SeqCst);
+            let from = q["from"];
+            let to = if trickle { from } else { (from + q["limit"] - 1).min(TIP) };
+            if trickle {
+                tokio::time::sleep(Duration::from_millis(700)).await; // one block per 0.7 s: slower than twice the chain's rate
+            }
+            if from > TIP {
+                return axum::Json(serde_json::json!({ "tip": TIP, "blocks": [], "to": null, "finalization": null }));
+            }
+            let last = &p.blocks[to as usize];
+            let vote = Finalize::sign(&*p.scheme, Proposal::new(Round::new(Epoch::new(0), View::new(to)), View::new(to - 1), last.digest())).unwrap();
+            let fin = Finalization::from_finalizes(&*p.scheme, commonware_utils::iter::NonEmpty::try_new([vote].iter()).unwrap(), &commonware_parallel::Sequential).unwrap();
+            let blocks: Vec<String> = (from..=to).map(|h| hex::encode(p.blocks[h as usize].encode())).collect();
+            axum::Json(serde_json::json!({ "tip": TIP, "blocks": blocks, "to": to, "finalization": hex::encode(fin.encode()) }))
+        }
+        let app = Router::new().route("/{who}/api/sync", get(serve)).with_state(peer.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let trust = Arc::new(Trust::new(&g, &Pins::default(), false).unwrap());
+        let started = std::time::Instant::now();
+        let peers = vec![format!("http://{addr}/trickle"), format!("http://{addr}/honest")];
+        tokio::time::timeout(Duration::from_secs(20), catch_up(chain.clone(), peers, trust)).await.expect("catching up ends");
+        assert_eq!(chain.lock().height(), TIP);
+        let (trickled, honest) = (peer.hits[0].load(Ordering::SeqCst), peer.hits[1].load(Ordering::SeqCst));
+        assert_eq!(trickled, 1, "the trickling peer got one round ({honest} to the honest one)");
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
         drop(chain);
         std::fs::remove_dir_all(root).ok();
     }

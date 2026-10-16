@@ -239,10 +239,21 @@ fn ghost_seed_txs(funded: &Keys) -> Vec<(&'static str, Tx)> {
 }
 
 /// `GET /api/snapshot/latest` as fast sync reads it: JSON, then `verify_manifest` (hex blocks,
-/// hash links, the checkpoint commitment, the validator-set history and the certificate).
+/// hash links, the checkpoint commitment, the validator-set history and the certificate). The
+/// history a joiner fetches from `/api/epochs` rides along in the input as `epochs` (the genesis
+/// set alone when it's absent).
 pub fn snapshot_manifest(data: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    struct History {
+        #[serde(default)]
+        epochs: Option<EpochRegistry>,
+    }
     let Ok(m) = serde_json::from_slice::<snapshot::Manifest>(data) else { return false };
-    let Ok(v) = snapshot::verify_manifest(genesis(), &m) else { return false };
+    let history = serde_json::from_slice::<History>(data).ok().and_then(|h| h.epochs).unwrap_or_else(|| EpochRegistry::genesis(genesis()));
+    let Ok(v) = snapshot::verify_manifest(genesis(), &m, &history) else { return false };
+    // Nothing past the certified epoch is kept (F08), and it starts at the root it was checked from.
+    assert!(v.epochs.base == 0 && v.epochs.known_through == snapshot::last_epoch(genesis(), &m), "verify_manifest kept history it didn't verify");
+    assert!(v.epochs.sets.keys().chain(v.epochs.proofs.keys()).all(|e| *e <= v.epochs.known_through), "verify_manifest kept sets past the certified epoch");
     let _ = snapshot::check_chunk(&v, 0, data);
     // And against trusted checkpoints, as `join` checks it: one the manifest proves, one it can't.
     let set_hash = checkpoints::genesis_checkpoint(genesis()).set_hash;
@@ -292,18 +303,43 @@ pub fn sync_batch(data: &[u8]) -> bool {
     applied
 }
 
-/// `GET /api/epochs` as `exchange_epochs` merges it (`Chain::merge_epochs`), and the validator-set
-/// history check fast sync runs (`verify_chain`), epoch 0 included (FUZZ-1, FUZZ-2).
+/// A `GET /api/epochs` page as `exchange_epochs` takes signatures from it (`candidates`, verified,
+/// `add_verified`), as fast sync assembles pages (`append_page`) and verifies the history from
+/// the genesis or a pinned set (`verify_chain`, `verify_from`), epoch 0 included (FUZZ-1,
+/// FUZZ-2), and as a node pages, rebases and truncates its own.
 pub fn epochs_registry(data: &[u8]) -> bool {
     let Ok(reg) = serde_json::from_slice::<EpochRegistry>(data) else { return false };
     let g = genesis();
     let verified = epochs::verify_chain(g, &reg, reg.known_through).is_ok();
     for epoch in 0..=reg.known_through.min(3) {
         let _ = epochs::verify_chain(g, &reg, epoch);
+        if let Some(set) = reg.set(epoch) {
+            let _ = epochs::verify_from(g, &reg, &epochs::Root { epoch, set_hash: epochs::set_hash(set) }, reg.known_through);
+        }
     }
-    let _ = (reg.proven_through(), reg.set(reg.known_through));
-    EpochRegistry::genesis(g).merge_sigs(CHAIN_ID, &reg);
-    reg.clone().merge_sigs(CHAIN_ID, &reg);
+    let _ = (reg.proven_through(), reg.set(reg.known_through), reg.set(reg.base));
+    let mut ours = EpochRegistry::genesis(g);
+    let wanted = ours.candidates(CHAIN_ID, &reg, 64);
+    assert!(wanted.len() <= 64);
+    ours.add_verified(CHAIN_ID, epochs::verify_candidates(wanted));
+    let mut same = reg.clone();
+    same.merge_sigs(CHAIN_ID, &reg);
+    let _ = ours.clone().append_page(&reg);
+    // Paging what it holds reassembles it, page by page, whatever it holds.
+    let (mut first, mut next) = reg.slice(reg.base, 4096);
+    let mut pages = 0;
+    while let Some(from) = next.filter(|_| pages < 64) {
+        let (page, more) = reg.slice(from, 4096);
+        assert!(more.is_none_or(|m| m > from), "a page must move forward");
+        first.append_page(&page).expect("a node's own pages fit together");
+        (next, pages) = (more, pages + 1);
+    }
+    for at in [reg.base, reg.known_through / 2, reg.known_through, u64::MAX] {
+        let (mut r, mut t) = (reg.clone(), reg.clone());
+        r.rebase(at);
+        t.truncate(at);
+        let _ = (r.proven_through(), t.proven_through(), r.set(at), t.set(at));
+    }
     verified
 }
 
@@ -930,7 +966,8 @@ pub fn seeds() -> Vec<(&'static str, &'static str, Vec<u8>)> {
     next.sort();
     reg.record(1, next.clone());
     reg.record(2, next);
-    reg.sign_missing(CHAIN_ID, VALIDATOR_SEED);
+    let executed = reg.clone();
+    reg.sign_missing(CHAIN_ID, VALIDATOR_SEED, |e| executed.set(e).cloned());
     out.push(("epochs_registry", "handoff-epoch-1", serde_json::to_vec(&reg).unwrap()));
     // FUZZ-2's reproducer: a "handoff proof" for epoch 0 made `add_sig` compute `0 - 1`.
     let genesis_set = EpochRegistry::genesis(g).set(0).unwrap().clone();
