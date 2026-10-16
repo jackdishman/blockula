@@ -348,6 +348,44 @@ impl Node {
 
 const EXPLORER: &str = include_str!("explorer.html");
 
+/// The explorer's one inline script (what its CSP hash covers: the text between the tags).
+fn explorer_script() -> &'static str {
+    EXPLORER.split_once("<script>").and_then(|(_, rest)| rest.split_once("</script>")).map(|(s, _)| s).unwrap_or_default()
+}
+
+/// The explorer's Content-Security-Policy (F64, defense in depth): only its own inline script
+/// runs (by hash: no injected `<script>` or `on*=` handler), it fetches from this origin only,
+/// fonts come from Google Fonts, and no other page may frame it.
+fn explorer_csp() -> &'static str {
+    static CSP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CSP.get_or_init(|| {
+        use commonware_cryptography::Hasher as _;
+        let digest = commonware_cryptography::Sha256::hash(&[explorer_script().as_bytes()]);
+        format!(
+            "default-src 'none'; script-src 'sha256-{}'; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+            base64(digest.as_ref())
+        )
+    })
+}
+
+/// Standard base64 with padding (RFC 4648), for the CSP hash.
+fn base64(bytes: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            out.push(if i <= c.len() { ABC[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
+}
+
+async fn explorer() -> Response {
+    use axum::http::header;
+    ([(header::CONTENT_SECURITY_POLICY, explorer_csp()), (header::X_CONTENT_TYPE_OPTIONS, "nosniff"), (header::REFERRER_POLICY, "no-referrer")], Html(EXPLORER)).into_response()
+}
+
 /// Set on requests a node forwards to another; a forwarded request is never forwarded again
 /// (so misconfigured peers — e.g. a node listed as its own peer — can't loop).
 pub const FORWARDED_HEADER: &str = "x-blockula-forwarded";
@@ -395,7 +433,7 @@ type ApiResult = Result<Json<Value>, ApiError>;
 
 pub fn router(node: Node) -> Router {
     Router::new()
-        .route("/", get(|| async { Html(EXPLORER) }))
+        .route("/", get(explorer))
         .route("/api/status", get(status))
         .route("/api/blocks", get(blocks))
         .route("/api/block/{id}", get(block))
@@ -2041,6 +2079,48 @@ mod tests {
         assert_eq!(lan.resolve(peer, &fake), Some(peer.ip()));
     }
 
+    /// F64: the explorer resolves routes against its own views only (`#/constructor/<html>` used
+    /// to reach `Object`, which handed the decoded id to innerHTML unescaped), and never puts a
+    /// non-string into innerHTML. Runs the page's script under Node with a stub DOM (skipped
+    /// where `node` isn't installed; CI has it).
+    #[test]
+    fn explorer_routes_only_to_its_own_views() {
+        let Ok(out) = std::process::Command::new("node").arg("--version").output() else {
+            eprintln!("skipping: node isn't installed");
+            return;
+        };
+        assert!(out.status.success());
+        let stub = r##"
+const app = { innerHTML: "" };
+globalThis.document = { querySelector: (s) => (s === "#app" ? app : { addEventListener() {}, textContent: "", value: "" }), querySelectorAll: () => [] };
+globalThis.window = { addEventListener() {} };
+globalThis.setInterval = () => 0;
+globalThis.fetch = async () => ({ ok: false, json: async () => ({ error: "offline" }) });
+globalThis.location = { hash: "" };
+"##;
+        let probe = r##"
+(async () => {
+  const out = {};
+  for (const [name, hash] of Object.entries({ constructor: "#/constructor/%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E", proto: "#/__proto__/%3Cb%3Ex%3C%2Fb%3E", toString: "#/toString/%3Cb%3Ex%3C%2Fb%3E", hasOwnProperty: "#/hasOwnProperty/%3Cb%3Ex%3C%2Fb%3E" })) {
+    location.hash = hash;
+    await route();
+    out[name] = app.innerHTML;
+  }
+  console.log(JSON.stringify(out));
+})();
+"##;
+        let src = format!("{stub}{}{probe}", explorer_script());
+        let out = std::process::Command::new("node").arg("-e").arg(&src).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let pages: BTreeMap<String, String> = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(pages.len(), 4);
+        for (route, html) in &pages {
+            // Each falls back to the home view, which fails offline: the escaped error card.
+            assert!(!html.contains("<img") && !html.contains("<b>"), "{route}: {html}");
+            assert!(html.contains("offline"), "{route}: {html}");
+        }
+    }
+
     /// The p2p transport `/api/status` reports is the one linked (audit #1/#3). Compiling
     /// `p2p_transport` already proves the node links the vendored crate; the lockfile check
     /// proves nothing else (commonware-p2p) links a second, upstream copy, which an unapplied or
@@ -2109,6 +2189,30 @@ mod http_tests {
         f.cblock = vec![7; size];
         f.certificate = cert.then(|| vec![0xce; 64]);
         c.execute(f).unwrap();
+    }
+
+    /// F64: `GET /` carries a CSP that only lets the explorer's own inline script run (by its
+    /// SHA-256), so an injected handler or script doesn't run even if a view forgot to escape.
+    #[tokio::test]
+    async fn explorer_is_served_with_a_script_hash_csp() {
+        assert_eq!([base64(b""), base64(b"f"), base64(b"fo"), base64(b"foo"), base64(b"foobar")], ["", "Zg==", "Zm8=", "Zm9v", "Zm9vYmFy"]);
+        {
+            use commonware_cryptography::Hasher as _;
+            assert_eq!(base64(commonware_cryptography::Sha256::hash(&[b"abc"]).as_ref()), "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=");
+        }
+        assert_eq!(EXPLORER.matches("<script").count(), 1, "one inline script, the one the CSP hashes");
+        assert!(explorer_script().contains("async function route()"));
+        let html = EXPLORER.split("<script>").next().unwrap();
+        assert!(!html.contains(" onclick=") && !html.contains(" onload=") && !html.contains(" onerror="), "no inline handlers: the CSP would block them");
+        let (root, n) = node("csp");
+        let res = router(n).oneshot(Request::builder().uri("/").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let csp = res.headers()[axum::http::header::CONTENT_SECURITY_POLICY].to_str().unwrap().to_string();
+        assert!(csp.contains("default-src 'none'") && csp.contains("connect-src 'self'") && csp.contains("frame-ancestors 'none'"), "{csp}");
+        let script_src = csp.split(';').find(|d| d.trim().starts_with("script-src")).unwrap();
+        assert!(!script_src.contains("unsafe-inline") && script_src.contains("'sha256-"), "{script_src}");
+        assert_eq!(res.headers()[axum::http::header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        std::fs::remove_dir_all(root).ok();
     }
 
     /// F61/F65: `from` near u64::MAX used to overflow the epoch math before the `from > tip`
