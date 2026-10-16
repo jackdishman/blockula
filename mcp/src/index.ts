@@ -174,8 +174,8 @@ async function submitCapped(w: Wallet, action: Action, spend: Spend, memo = ""):
       LEDGER.release(reservation, reservation.drops);
       throw e;
     }
-    if (e instanceof TxPendingError) return inFlight("pending", `Submitted (tx ${id}), but its status couldn't be read.`);
-    return inFlight("unknown", `The node didn't answer clearly (${clean(String((e as Error)?.message ?? e), 200)}), so the tx (${id}) may or may not have arrived.`);
+    // Admitted, but the first read of its status failed: wait for it below like any other.
+    if (!(e instanceof TxPendingError)) return inFlight("unknown", `The node didn't answer clearly (${clean(String((e as Error)?.message ?? e), 200)}), so the tx (${id}) may or may not have arrived.`);
   }
   try {
     const done = await w.client.waitForTx(id, TX_WAIT_MS);
