@@ -68,6 +68,7 @@ fn genesis(params: &[(&str, u64)]) -> Genesis {
         reserved_names: vec![],
         soul_ledger: vec![],
         features: vec![],
+        bootstrap_excluded: vec![],
     }
 }
 

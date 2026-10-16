@@ -25,8 +25,11 @@ use std::io::{Read, Write};
 /// `multisig_expiry_blocks`), the randomness beacon (its rounds, values and revert attestations;
 /// the PoC scalars lose the block-hash seed) and Ghost Mode (namespaces 48–52, the `ghost` scalar
 /// record, `ghost_anchor_window` and `ghost_verify_fee`). 5: the fee ring's slots also fix Ghost
-/// Mode's per-block limits (`econ::FeeSlot`), so they're known `FEE_LAG` blocks ahead.
-pub const SCHEMA_VERSION: u32 = 5;
+/// Mode's per-block limits (`econ::FeeSlot`), so they're known `FEE_LAG` blocks ahead. 6 (the
+/// audit's governance fixes): the governance scalars gain the recent treasury spends, the closed
+/// proposals whose votes are being swept and the multisig sweep cursor; `Distribution` proposals
+/// name their distribution id; `Params` lists the owners the bootstrap delegation passes over.
+pub const SCHEMA_VERSION: u32 = 6;
 
 pub fn encode<T: BorshSerialize + ?Sized>(v: &T) -> Vec<u8> {
     borsh::to_vec(v).expect("encoding to memory can't fail")

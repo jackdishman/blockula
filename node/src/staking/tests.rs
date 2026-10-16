@@ -99,6 +99,7 @@ impl Setup {
             reserved_names: vec![],
             soul_ledger: vec![],
             features: vec![],
+            bootstrap_excluded: vec![],
         }
     }
 
@@ -1077,4 +1078,97 @@ fn staking_txs_roll_back_completely() {
     t.st.rollback(j);
     assert_eq!((t.st.full_root(), t.st.supply), (root, supply));
     assert!(t.st.commit_block().unwrap().records.is_empty(), "nothing left to commit");
+}
+
+// ------------------------------------------------------------------- the bootstrap delegation
+
+/// A chain whose bootstrap account holds `amount` on a return curve over blocks 30–90, and
+/// validator 3's owner is excluded (the founder's or the foundation's seat).
+fn bootstrap_chain(setup: Setup, amount: u64) -> T {
+    let mut g = setup.genesis();
+    g.allocations.push(Allocation { address: crate::chain::bootstrap_delegation("boo"), amount, vesting: Some(Vesting { start: 30, cliff: 30, end: 90 }), label: Some("bootstrap".into()) });
+    g.bootstrap_excluded = vec![owner(3).address()];
+    g.check().unwrap();
+    T { st: without_issuance(g.initial_state()), height: 1, epoch: 0, view: 0, skip: 0, skipped: vec![], tx_bytes: 0 }
+}
+
+/// What the bootstrap account holds: liquid, and its delegations' value.
+fn boot_holds(t: &T) -> u64 {
+    let boot = t.st.bootstrap();
+    t.balance(&boot) + delegations_of(&t.st, &boot).iter().map(|(v, _)| delegation_value(&t.st, &boot, v)).sum::<u64>()
+}
+
+/// Audit F12: DEC-5's 10% bootstrap bucket is never stranded. Each boundary it sends its rewards
+/// to the treasury (operators keep their commission), keeps what its lock still holds, spread
+/// equally over the next set's members not run by an excluded owner (it leaves jailed ones at
+/// once), and returns the rest to the treasury on the curve, until it holds nothing.
+#[test]
+fn the_bootstrap_delegation_follows_the_set_and_returns_to_the_treasury() {
+    let mut t = bootstrap_chain(Setup::default(), 1_200_000 * FANG);
+    let (boot, treasury) = (t.st.bootstrap(), t.st.treasury());
+    let worth = |t: &T, i: u8| delegation_value(&t.st, &boot, &vaddr(i));
+    let quorum_base = crate::governance::unlocked_supply(&t.st, t.height);
+    t.finish_epoch();
+    // Equal shares to validators 0–2; none to 3 (excluded); nothing returned before the curve.
+    assert_eq!([0, 1, 2, 3].map(|i| worth(&t, i)), [400_000 * FANG, 400_000 * FANG, 400_000 * FANG, 0]);
+    assert_eq!((t.balance(&boot), t.balance(&treasury)), (0, 0));
+    assert_eq!(crate::governance::unlocked_supply(&t.st, t.height), quorum_base, "its stake doesn't vote");
+
+    // Rewards: the bootstrap's part goes to the treasury at the boundary; commission stays.
+    t.block();
+    let mut j = Journal::default();
+    t.st.j_mint(&mut j, 124_000 * FANG);
+    let paid = distribute_rewards(&mut t.st, &mut j, 124_000 * FANG, t.height);
+    t.st.j_credit(&mut j, &treasury, 124_000 * FANG - paid);
+    let (gain, treasury_before, bond0) = ((0..3).map(|i| worth(&t, i) - 400_000 * FANG).sum::<u64>(), t.balance(&treasury), self_bond(&t.st, &vaddr(0)));
+    assert!(gain > 80_000 * FANG, "the bootstrap's stake earned ({gain})");
+    t.finish_epoch();
+    assert_eq!(t.balance(&treasury) - treasury_before, gain, "every drop it earned");
+    assert!((0..3).all(|i| (400_000 * FANG - 2..=400_000 * FANG).contains(&worth(&t, i))), "back to its share");
+    assert_eq!(self_bond(&t.st, &vaddr(0)), bond0, "the operator keeps its commission");
+
+    // A jailed validator leaves the set and the bootstrap leaves it at once, for the others.
+    let held = boot_holds(&t);
+    jail(&mut t.st, &mut j, &vaddr(1), t.height, 0, "test");
+    t.finish_epoch();
+    assert!(!t.set(t.epoch + 1).contains(&vaddr(1)));
+    assert!(!t.st.staking.delegations.contains_key(&dkey(&boot, &vaddr(1))), "out of the jailed pool");
+    assert!([0, 2].iter().all(|i| (held / 2 - 2..=held / 2).contains(&worth(&t, *i))), "{} {}", worth(&t, 0), worth(&t, 2));
+    assert!(t.balance(&boot) < 10, "all of it staked but dust");
+
+    // Years 2–4 (here blocks 30–90): what the lock no longer holds goes back, each boundary.
+    let treasury_before = t.balance(&treasury);
+    while t.height < 60 {
+        t.finish_epoch();
+    }
+    let unvested = t.st.account(&boot).unvested_at(59);
+    assert_eq!(unvested, 1_200_000 * FANG * 31 / 60);
+    assert!((unvested - 4..=unvested).contains(&boot_holds(&t)), "keeps what the lock holds: {} vs {unvested}", boot_holds(&t));
+    assert!(t.balance(&treasury) - treasury_before >= held - unvested, "and returned the rest");
+    // Past the curve's end it holds nothing; everything it had is back in the treasury.
+    while t.height < 100 {
+        t.finish_epoch();
+    }
+    assert!(delegations_of(&t.st, &boot).is_empty() && t.balance(&boot) == 0, "{:?}", delegations_of(&t.st, &boot));
+    assert!(t.balance(&treasury) - treasury_before >= held - 10, "{} of {held}", t.balance(&treasury) - treasury_before);
+}
+
+/// The bootstrap delegation follows the set; it doesn't pick it. Its stake doesn't count toward
+/// the ranking, so a newcomer with more stake of its own still replaces the weakest member.
+#[test]
+fn the_bootstrap_delegation_doesnt_entrench_the_set() {
+    let newbie = keys(150);
+    // Validator 3 (excluded, no bootstrap stake) outranks the newcomer on its own.
+    let setup = Setup { validators: vec![10_000 * FANG, 10_000 * FANG, 10_000 * FANG, 30_000 * FANG, 10_000 * FANG], accounts: vec![(newbie.address(), 100_000 * FANG, None)], params: vec![("max_validators", 5)], ..Default::default() };
+    let mut t = bootstrap_chain(setup, 1_200_000 * FANG);
+    t.finish_epoch();
+    assert!(delegation_value(&t.st, &t.st.bootstrap(), &vaddr(0)) > 200_000 * FANG);
+    let nk = keys(50);
+    let pop = crate::chain::make_pop([50; 32], CHAIN, &newbie.address(), "127.0.0.1:7999", "127.0.0.1:7998");
+    t.ok(&newbie, Action::RegisterValidator { consensus_key: hex::encode(nk.public_key()), p2p_addr: "127.0.0.1:7999".into(), http_addr: "127.0.0.1:7998".into(), bond: 20_000 * FANG, pop });
+    t.finish_epoch();
+    let set = t.set(t.epoch + 1);
+    assert!(set.contains(&nk.address()) && set.contains(&vaddr(3)) && set.len() == 5, "{set:?}");
+    // And it backs the newcomer from the next boundary on.
+    assert!(delegation_value(&t.st, &t.st.bootstrap(), &nk.address()) > 200_000 * FANG);
 }

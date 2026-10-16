@@ -583,21 +583,24 @@ fn vote(state: &mut State, j: &mut Journal, sender: &str, signer: &str, key: &Ke
     Ok(())
 }
 
-/// The keyless system accounts, which never vote (and never stake).
+/// The keyless system accounts, which never vote (only the bootstrap delegation stakes, by
+/// formula: `staking::bootstrap_epoch`).
 fn system_accounts(prefix: &str) -> [String; 5] {
     [crate::chain::treasury(prefix), community(prefix), crate::chain::endowment(prefix), crate::chain::bootstrap_delegation(prefix), crate::poc::pool_address(prefix)]
 }
 
 /// What could vote at `height` (the quorum base): the FANG every account but the keyless system
 /// ones holds, liquid, in stake pools (at the pools' value) or unbonding, less what vesting
-/// locks still hold of it. O(vesting accounts), not O(accounts): balances, pool stake and
-/// unbonding are running totals their maps keep (`chain::AccountTotals`, `staking::PoolStake`,
-/// `staking::UnbondingTotal`), and only genesis allocations carry vesting locks.
-/// `check_invariants` compares it with [`unlocked_supply_by_walk`].
+/// locks still hold of it. O(vesting accounts + the system accounts' delegations), not
+/// O(accounts): balances, pool stake and unbonding are running totals their maps keep
+/// (`chain::AccountTotals`, `staking::PoolStake`, `staking::UnbondingTotal`), and only genesis
+/// allocations carry vesting locks. `check_invariants` compares it with
+/// [`unlocked_supply_by_walk`].
 pub fn unlocked_supply(state: &State, height: u64) -> u128 {
     let system = system_accounts(state.params.prefix());
     let system_balances: u128 = system.iter().filter_map(|a| state.accounts.get(a)).map(|a| a.balance as u128).sum();
-    let held = state.accounts.total() - system_balances + state.staking.pools.total() + state.staking.entries.total();
+    let system_stake: u128 = system.iter().map(|a| crate::staking::holdings(state, a)).map(|(b, u)| b as u128 + u as u128).sum();
+    let held = state.accounts.total() - system_balances + state.staking.pools.total() + state.staking.entries.total() - system_stake;
     let vesting: u128 = state.accounts.indexed().iter().filter(|a| !system.contains(*a)).map(|a| still_vesting(state, a, height)).sum();
     held - vesting
 }
@@ -622,7 +625,11 @@ pub fn unlocked_supply_by_walk(state: &State, height: u64) -> u128 {
     let vesting: u128 = accounts.map(|(a, _)| still_vesting(state, a, height)).sum();
     let staked: u128 = state.staking.pools.values().map(|p| p.stake as u128).sum();
     let unbonding: u128 = state.staking.entries.values().map(|e| if let crate::staking::Entry::Unbonding { amount, .. } = e { *amount as u128 } else { 0 }).sum();
-    liquid + staked + unbonding - vesting
+    // The bootstrap delegation's stake, walked delegation by delegation.
+    let system_of = |k: &str| k.split_once('/').is_some_and(|(d, _)| system.iter().any(|s| s == d));
+    let system_staked: u128 = state.staking.delegations.iter().filter(|(k, _)| system_of(k)).filter_map(|(k, d)| Some(state.staking.pools.get(k.split_once('/')?.1)?.value(d.shares) as u128)).sum();
+    let system_unbonding: u128 = state.staking.entries.iter().filter(|(k, _)| system_of(k)).map(|(_, e)| if let crate::staking::Entry::Unbonding { amount, .. } = e { *amount as u128 } else { 0 }).sum();
+    liquid + staked + unbonding - system_staked - system_unbonding - vesting
 }
 
 /// Whether a kind needs `supermajority_bps` of the weight: upgrades, feature activations
@@ -1239,10 +1246,12 @@ pub fn check_invariants(state: &State) -> Result<()> {
     for id in &g.open_distributions {
         ensure!(g.distributions.contains_key(id), "open distribution #{id} doesn't exist");
     }
-    // The quorum base counts all pool stake and every unbonding entry as voters' (no keyless
-    // account stakes), and its running totals match a walk over the state.
+    // The quorum base counts pool stake and unbonding entries as voters' but the bootstrap
+    // delegation's (the only keyless account that stakes, and never through an unbonding entry),
+    // and its running totals match a walk over the state.
+    let boot = state.bootstrap();
     for a in system_accounts(state.params.prefix()) {
-        ensure!(crate::staking::delegations_of(state, &a).is_empty() && crate::staking::entries_of_account(state, &a).is_empty(), "keyless system account {a} holds stake");
+        ensure!((a == boot || crate::staking::delegations_of(state, &a).is_empty()) && crate::staking::entries_of_account(state, &a).is_empty(), "keyless system account {a} holds stake");
     }
     let height = crate::econ::now(state);
     let (fast, walked) = (unlocked_supply(state, height), unlocked_supply_by_walk(state, height));

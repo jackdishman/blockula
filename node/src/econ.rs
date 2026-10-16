@@ -737,6 +737,7 @@ mod tests {
             reserved_names: vec!["reserved".into()],
             soul_ledger: vec![],
             features: vec![],
+            bootstrap_excluded: vec![],
         };
         let home = std::env::temp_dir().join(format!("blockula-econ-{tag}-{}-{}", now_ms(), std::process::id()));
         std::fs::create_dir_all(&home).unwrap();

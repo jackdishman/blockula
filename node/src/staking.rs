@@ -1190,11 +1190,13 @@ pub fn delegation_value(state: &State, delegator: &str, validator: &str) -> u64 
     }
 }
 
-/// Ranking for the set: admin-pinned first (dev and test chains), then pool stake, then address
-/// (ascending). Greater is better.
-fn rank<'a>(state: &State, validator: &'a str) -> (bool, u64, std::cmp::Reverse<&'a str>) {
+/// Ranking for the set: admin-pinned first (dev and test chains), then pool stake without the
+/// bootstrap delegation's (`boot`: it follows the set, it doesn't pick it; [`bootstrap_epoch`]),
+/// then address (ascending). Greater is better.
+fn rank<'a>(state: &State, boot: &str, validator: &'a str) -> (bool, u64, std::cmp::Reverse<&'a str>) {
     let pinned = state.validators.get(validator).is_some_and(|r| r.approved_at.is_some());
-    (pinned, state.staking.pools.get(validator).map_or(0, |p| p.stake), std::cmp::Reverse(validator))
+    let stake = state.staking.pools.get(validator).map_or(0, |p| p.stake.saturating_sub(delegation_value(state, boot, validator)));
+    (pinned, stake, std::cmp::Reverse(validator))
 }
 
 /// The set for `epoch + 1` if `epoch` ended now, with who joins and who leaves.
@@ -1217,7 +1219,8 @@ pub fn churn_limit(m: usize) -> usize {
 pub fn select_next(state: &State, epoch: u64) -> Selection {
     let current: Vec<String> = state.active_sets.get(&epoch).cloned().unwrap_or_default();
     let cap = state.chain_params.max_validators.max(1) as usize;
-    let by_rank = |a: &String, b: &String| rank(state, b).cmp(&rank(state, a));
+    let boot = state.bootstrap();
+    let by_rank = |a: &String, b: &String| rank(state, &boot, b).cmp(&rank(state, &boot, a));
     let pinned = |v: &str| state.validators.get(v).is_some_and(|r| r.approved_at.is_some());
     // Members that may stay; the ineligible leave whatever the limit.
     let mut keep: Vec<String> = current.iter().filter(|v| eligible(state, v)).cloned().collect();
@@ -1237,7 +1240,7 @@ pub fn select_next(state: &State, epoch: u64) -> Selection {
     let mut joined = 0;
     for c in newcomers {
         let free = keep.len() < cap;
-        if !free && !keep.last().is_some_and(|last| rank(state, &c) > rank(state, last)) {
+        if !free && !keep.last().is_some_and(|last| rank(state, &boot, &c) > rank(state, &boot, last)) {
             break;
         }
         let size = if free { keep.len() + 1 } else { keep.len() };
@@ -1299,9 +1302,100 @@ pub fn end_epoch(state: &mut State, epoch: u64) {
 pub fn likely_candidates(state: &State, epoch: u64, limit: usize) -> Vec<String> {
     let current = state.active_sets.get(&epoch).cloned().unwrap_or_default();
     let mut c: Vec<String> = state.validators.keys().filter(|v| !current.contains(v) && eligible(state, v)).cloned().collect();
-    c.sort_by(|a, b| rank(state, b).cmp(&rank(state, a)));
+    let boot = state.bootstrap();
+    c.sort_by(|a, b| rank(state, &boot, b).cmp(&rank(state, &boot, a)));
     c.truncate(limit);
     c
+}
+
+// ------------------------------------------------------------------- the bootstrap delegation
+
+/// DEC-5's validator bootstrap delegation (docs/TOKENOMICS.md, section 1), run at every epoch
+/// boundary once [`end_epoch`] has fixed the next set. The keyless bootstrap account
+/// (`chain::bootstrap_delegation`):
+///
+/// 1. sends what its stake earned since the last boundary to the treasury (it sells shares worth
+///    the gain; operators keep their commission, minted to them as shares) and books a slash as a
+///    loss: afterwards each of its delegations' principal is what it's worth;
+/// 2. keeps what its vesting lock still holds (mainnet: a curve from year 1 to year 4) and
+///    returns whatever it holds beyond that to the treasury. Without a lock everything returns at
+///    the first boundary, so the bucket is never stranded (audit F12);
+/// 3. spreads what it keeps equally over the next set's members whose owner isn't in
+///    `Params::bootstrap_excluded` (the founder's and the foundation's accounts): it leaves every
+///    other pool and moves each delegation to its share, leaving alone one within
+///    [`MIN_DELEGATION`] of it so rounding dust doesn't trade every epoch. What doesn't divide
+///    evenly stays liquid.
+///
+/// The protocol moves this stake at once, without unbonding entries, but only at boundaries and
+/// only by the formula. Stake it took out of a pool isn't reached by evidence for an earlier
+/// epoch that arrives later (the operator's and every other delegator's stake still is), which
+/// only spares the treasury. Its stake earns rewards like any other but doesn't count toward the
+/// set's ranking ([`rank`]) or governance's quorum base (`governance::unlocked_supply`).
+pub fn bootstrap_epoch(state: &mut State, epoch: u64) {
+    let boot = state.bootstrap();
+    if state.account(&boot).balance == 0 && delegations_of(state, &boot).is_empty() {
+        return;
+    }
+    let mut j = Journal::default();
+    let (height, treasury) = (state.params.last_of(epoch), state.treasury());
+    // 1. Gains to the treasury, losses booked.
+    for (v, d) in delegations_of(state, &boot) {
+        let worth = delegation_value(state, &boot, &v);
+        if worth > d.principal {
+            let taken = take_from_delegation(state, &mut j, &boot, &v, worth - d.principal);
+            if taken > 0 {
+                state.j_credit(&mut j, &treasury, taken);
+            }
+        }
+        settle_principal(state, &mut j, &boot, &v);
+    }
+    // 2. What it keeps.
+    let staked = delegations_of(state, &boot).iter().map(|(v, _)| delegation_value(state, &boot, v)).fold(0u64, u64::saturating_add);
+    let holds = state.account(&boot).balance.saturating_add(staked);
+    let keep = state.account(&boot).unvested_at(height).min(holds);
+    // 3. Its share for each member it backs: out of the pools above it, back to the treasury,
+    //    then into the pools below it.
+    let excluded = |v: &String| state.validators.get(v).is_none_or(|r| state.params.bootstrap_excluded.contains(&r.owner));
+    let targets: Vec<String> = state.active_sets.get(&(epoch + 1)).map(|set| set.iter().filter(|v| eligible(state, v) && !excluded(v)).cloned().collect()).unwrap_or_default();
+    let share = if targets.is_empty() { 0 } else { keep / targets.len() as u64 };
+    for (v, d) in delegations_of(state, &boot) {
+        let worth = delegation_value(state, &boot, &v);
+        let sold = if share == 0 || !targets.contains(&v) {
+            unbond(state, &mut j, &boot, &v, d.shares).map_or(0, |(value, _)| value)
+        } else if worth > share.saturating_add(MIN_DELEGATION) {
+            take_from_delegation(state, &mut j, &boot, &v, worth - share)
+        } else {
+            0
+        };
+        if sold > 0 {
+            state.j_credit(&mut j, &boot, sold);
+        }
+        settle_principal(state, &mut j, &boot, &v);
+    }
+    let back = (holds - keep).min(state.account(&boot).balance);
+    if back > 0 {
+        state.j_debit(&mut j, &boot, back).expect("within the balance");
+        state.j_credit(&mut j, &treasury, back);
+    }
+    for v in &targets {
+        let room = share.saturating_sub(delegation_value(state, &boot, v));
+        let amount = room.min(state.account(&boot).balance);
+        if room < MIN_DELEGATION || amount == 0 || bond(state, &mut j, &boot, v, amount, amount).is_err() {
+            continue;
+        }
+        state.j_debit(&mut j, &boot, amount).expect("within the balance");
+        settle_principal(state, &mut j, &boot, v);
+    }
+}
+
+/// Sets `delegator`'s principal in `validator`'s pool to what the delegation is worth now (the
+/// bootstrap delegation's gains and losses are settled every epoch).
+fn settle_principal(state: &mut State, j: &mut Journal, delegator: &str, validator: &str) {
+    let key = dkey(delegator, validator);
+    let worth = delegation_value(state, delegator, validator);
+    if let Some(d) = state.staking.delegations.get(&key).filter(|d| d.principal != worth).cloned() {
+        put_delegation(state, j, &key, Some(Delegation { principal: worth, ..d }));
+    }
 }
 
 // ------------------------------------------------------------------ for the other modules

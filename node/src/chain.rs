@@ -39,8 +39,9 @@ pub fn endowment(prefix: &str) -> String {
     crypto::system_address(prefix, "endowment")
 }
 
-/// The keyless validator bootstrap delegation (DEC-5): delegated by formula, returned to the
-/// treasury in years 2–4. (The foundation is an ordinary multisig account.)
+/// The keyless validator bootstrap delegation (DEC-5): delegated by formula at every epoch
+/// boundary, returned to the treasury on its vesting curve (years 2–4 on mainnet), its rewards
+/// to the treasury (`staking::bootstrap_epoch`). (The foundation is an ordinary multisig account.)
 pub fn bootstrap_delegation(prefix: &str) -> String {
     crypto::system_address(prefix, "bootstrap-delegation")
 }
@@ -174,6 +175,10 @@ pub struct Genesis {
     /// Features on from genesis (`upgrade::KNOWN_FEATURES`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub features: Vec<String>,
+    /// Accounts whose validators the bootstrap delegation passes over (DEC-5: the founder's and
+    /// the foundation's, now and later), sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bootstrap_excluded: Vec<String>,
 }
 
 fn default_epoch_blocks() -> u64 {
@@ -203,6 +208,8 @@ pub struct Params {
     pub poc: crate::poc::PocTimes,
     /// The chain's address prefix (see [`Params::prefix`]).
     pub address_prefix: String,
+    /// Owners whose validators the bootstrap delegation passes over (`Genesis::bootstrap_excluded`).
+    pub bootstrap_excluded: Vec<String>,
 }
 
 impl Params {
@@ -274,7 +281,7 @@ impl Genesis {
 
     pub fn params(&self) -> Params {
         let poc = self.contribution.clone().unwrap_or_else(|| crate::poc::PocTimes::for_block_time(self.block_time_ms));
-        Params { block_time_ms: self.block_time_ms, epoch_blocks: self.epoch_blocks, admins: self.validator_admins.clone(), poc, address_prefix: self.address_prefix.clone() }
+        Params { block_time_ms: self.block_time_ms, epoch_blocks: self.epoch_blocks, admins: self.validator_admins.clone(), poc, address_prefix: self.address_prefix.clone(), bootstrap_excluded: self.bootstrap_excluded.clone() }
     }
 
     /// The governance-adjustable parameters at genesis: the defaults with `params` applied.
@@ -472,6 +479,11 @@ impl Genesis {
             ensure!((1..=MAX_GENESIS_SOUL).contains(&e.soul), "soul_ledger: {} gets 1–{MAX_GENESIS_SOUL} milli-Soul", e.account);
             check_reason(&e.reason).with_context(|| format!("soul_ledger: {}", e.account))?;
             ensure!(souls.insert(&e.account), "soul_ledger lists {} twice", e.account);
+        }
+        for (i, a) in self.bootstrap_excluded.iter().enumerate() {
+            ensure!(crypto::parse_address(a).map(|(p, _)| p) == Some(prefix), "bootstrap_excluded: {a} isn't a {prefix}1… address");
+            ensure!(system_account(prefix, a).is_none(), "bootstrap_excluded: {a} is a keyless system account");
+            ensure!(i == 0 || self.bootstrap_excluded[i - 1] < *a, "bootstrap_excluded must be sorted, each account once");
         }
         let mut features = BTreeSet::new();
         for f in &self.features {
@@ -906,6 +918,11 @@ impl State {
         treasury(self.params.prefix())
     }
 
+    /// This chain's bootstrap delegation account.
+    pub fn bootstrap(&self) -> String {
+        bootstrap_delegation(self.params.prefix())
+    }
+
     /// This chain's contribution pool account.
     pub fn pool(&self) -> String {
         crate::poc::pool_address(self.params.prefix())
@@ -928,8 +945,10 @@ impl State {
     ///    age out.
     /// 6. At an epoch boundary: `econ::issue` (issuance into the pools, the contribution pool and
     ///    the treasury; the endowment's vested part into the contribution pool), `staking::end_epoch`
-    ///    (the next set by stake, churn-limited), `beacon::end_epoch` (the next epoch's beacon
-    ///    value, jailing non-revealers), then [`State::end_epoch`] (how much set history to keep).
+    ///    (the next set by stake, churn-limited), `staking::bootstrap_epoch` (the bootstrap
+    ///    delegation's rewards and return to the treasury, the rest spread over the next set),
+    ///    `beacon::end_epoch` (the next epoch's beacon value, jailing non-revealers), then
+    ///    [`State::end_epoch`] (how much set history to keep).
     ///
     /// Then the caller commits the block and, last, runs `upgrade::check_next(height + 1)`, which
     /// stops the node before a height its binary can't execute (3.9).
@@ -943,6 +962,7 @@ impl State {
             let epoch = self.params.epoch_of(b.height);
             crate::econ::issue(self, epoch);
             crate::staking::end_epoch(self, epoch);
+            crate::staking::bootstrap_epoch(self, epoch);
             crate::beacon::end_epoch(self, epoch);
             self.end_epoch(epoch);
         }
@@ -2166,6 +2186,7 @@ impl Chain {
             reserved_names: vec![],
             soul_ledger: vec![],
             features: vec![],
+            bootstrap_excluded: vec![],
         };
         // Every validator stakes: each owns itself and bonds twice the minimum from its
         // allocation, so a light slash (downtime) doesn't leave it under-bonded.
@@ -4536,6 +4557,7 @@ mod scaffold {
             reserved_names: vec!["blockula".into(), "foundation".into()],
             soul_ledger: vec![SoulEntry { account: owner.address(), soul: 50 * SOUL, reason: "testnet contributor".into() }],
             features: if chain_id == MAINNET_CHAIN_ID { vec![] } else { vec!["ghost".into()] },
+            bootstrap_excluded: vec![],
         }
     }
 
@@ -4662,6 +4684,14 @@ mod scaffold {
         refused(&|v| v["soul_ledger"][0]["soul"] = 0.into(), "milli-Soul");
         refused(&|v| v["soul_ledger"][0]["account"] = community("boo").into(), "system account");
         refused(&|v| v["features"][0] = "warp".into(), "unknown feature warp");
+        // The bootstrap delegation's excluded owners: addresses, not keyless, sorted, once each.
+        let mut ab = [keys(30).address(), keys(31).address()];
+        ab.sort();
+        let [a, b] = ab;
+        refused(&|v| v["bootstrap_excluded"] = serde_json::json!([b, a]), "sorted");
+        refused(&|v| v["bootstrap_excluded"] = serde_json::json!([a, a]), "sorted");
+        refused(&|v| v["bootstrap_excluded"] = serde_json::json!([treasury("boo")]), "keyless system account");
+        refused(&|v| v["bootstrap_excluded"] = serde_json::json!(["nobody"]), "isn't a boo1");
         // Mainnet: no admin keys, no faucet, an operator for every validator.
         let mut main = serde_json::to_value(genesis(MAINNET_CHAIN_ID)).unwrap();
         load(&main).unwrap();

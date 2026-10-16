@@ -42,21 +42,26 @@ pub struct Bucket {
     pub bps: u64,
     /// Keyless buckets live in a system account (`crypto::system_address(prefix, label)`).
     pub system: Option<fn(&str) -> String>,
-    /// `(cliff, end)` in months from genesis (12 to a 365.25-day year), if it vests.
-    pub vesting: Option<(u64, u64)>,
+    /// `(start, cliff, end)` in months from genesis (12 to a 365.25-day year), if it vests.
+    pub vesting: Option<(u64, u64, u64)>,
 }
 
-/// DEC-5. The bootstrap delegation's return to the treasury in years 2–4 and its delegation
-/// formula are staking's (not a lock).
+/// DEC-5. The bootstrap delegation's lock is its return to the treasury, linear over years 2–4:
+/// at each epoch boundary staking delegates what it still holds by formula and sends what has
+/// "vested" to the treasury (`staking::bootstrap_epoch`).
 pub const BUCKETS: &[Bucket] = &[
     Bucket { name: "community", bps: 3_200, system: Some(community), vesting: None },
-    Bucket { name: "treasury", bps: 2_500, system: Some(treasury), vesting: Some((0, 48)) },
-    Bucket { name: "endowment", bps: 1_500, system: Some(endowment), vesting: Some((0, 120)) },
-    Bucket { name: "bootstrap", bps: 1_000, system: Some(bootstrap_delegation), vesting: None },
-    Bucket { name: "founder", bps: 1_000, system: None, vesting: Some((12, 48)) },
-    Bucket { name: "foundation", bps: 500, system: None, vesting: Some((0, 48)) },
-    Bucket { name: "operators", bps: 300, system: None, vesting: Some((6, 24)) },
+    Bucket { name: "treasury", bps: 2_500, system: Some(treasury), vesting: Some((0, 0, 48)) },
+    Bucket { name: "endowment", bps: 1_500, system: Some(endowment), vesting: Some((0, 0, 120)) },
+    Bucket { name: "bootstrap", bps: 1_000, system: Some(bootstrap_delegation), vesting: Some((12, 12, 48)) },
+    Bucket { name: "founder", bps: 1_000, system: None, vesting: Some((0, 12, 48)) },
+    Bucket { name: "foundation", bps: 500, system: None, vesting: Some((0, 0, 48)) },
+    Bucket { name: "operators", bps: 300, system: None, vesting: Some((0, 6, 24)) },
 ];
+
+/// Buckets whose recipients' validators the bootstrap delegation passes over (DEC-5), with the
+/// owners of seats marked `founder_or_foundation`.
+pub const BOOTSTRAP_EXCLUDED_BUCKETS: &[&str] = &["founder", "foundation"];
 
 /// Not a DEC-5 bucket: on a chain with a faucet (testnets), liquid FANG for the validators'
 /// consensus-key accounts, which pay the drips (`Chain::faucet`) and their own fees. It sits
@@ -68,7 +73,7 @@ impl Bucket {
     /// Its vesting curve in blocks at this block time.
     pub fn curve(&self, block_time_ms: u64) -> Option<Vesting> {
         let months = |m: u64| (YEAR_MS as u128 * m as u128 / 12 / block_time_ms.max(1) as u128) as u64;
-        self.vesting.map(|(cliff, end)| Vesting { start: 0, cliff: months(cliff), end: months(end) })
+        self.vesting.map(|(start, cliff, end)| Vesting { start: months(start), cliff: months(cliff), end: months(end) })
     }
 }
 
@@ -398,6 +403,7 @@ pub fn build_from(spec: &Spec, operators: &[OperatorFile], strict: bool) -> Resu
         reserved_names: spec.reserved_names.clone(),
         soul_ledger,
         features: spec.features.clone(),
+        bootstrap_excluded: bootstrap_excluded(spec, operators),
     };
     ensure!(!genesis.validators.is_empty(), "a genesis needs at least one operator");
     genesis.check()?;
@@ -407,6 +413,14 @@ pub fn build_from(spec: &Spec, operators: &[OperatorFile], strict: bool) -> Resu
     let json = serde_json::to_string_pretty(&genesis)? + "\n";
     let hash = hex::encode(crate::consensus::genesis_block(&genesis).digest_bytes());
     Ok(Built { genesis, json, hash, warnings: findings })
+}
+
+/// The accounts whose validators the bootstrap delegation passes over (DEC-5): the founder's and
+/// the foundation's allocations' recipients and the owners of seats they run. Sorted, each once.
+fn bootstrap_excluded(spec: &Spec, operators: &[OperatorFile]) -> Vec<String> {
+    let allocated = spec.allocations.iter().filter(|a| BOOTSTRAP_EXCLUDED_BUCKETS.contains(&a.bucket.as_str())).filter_map(|a| a.address.clone());
+    let owners = operators.iter().filter(|o| o.independence.founder_or_foundation).map(|o| o.keys.owner.clone());
+    allocated.chain(owners).collect::<BTreeSet<String>>().into_iter().collect()
 }
 
 /// The independence policy (DEC-3, DEC-14) over a set of operators: what breaks it, in words.
@@ -662,7 +676,13 @@ mod tests {
         assert_eq!(curve("security grants"), Some(Vesting { start: 0, cliff: 15_778_800, end: 63_115_200 }));
         assert_eq!(curve("treasury"), Some(Vesting { start: 0, cliff: 0, end: 126_230_400 }));
         assert_eq!(curve("endowment"), Some(Vesting { start: 0, cliff: 0, end: 315_576_000 }));
-        assert_eq!((curve("community"), curve("bootstrap")), (None, None));
+        assert_eq!(curve("community"), None);
+        assert_eq!(curve("bootstrap"), Some(Vesting { start: 31_557_600, cliff: 31_557_600, end: 126_230_400 }), "returns to the treasury over years 2–4");
+        // The founder's and the foundation's accounts and seats get no bootstrap delegation.
+        let founder_seats = EXAMPLE_OPERATORS.iter().filter(|o| o.7).map(|o| owner(o.0, "tboo"));
+        let mut excluded: Vec<String> = founder_seats.chain(["founder", "foundation"].map(|l| g.allocations.iter().find(|x| x.label.as_deref() == Some(l)).unwrap().address.clone())).collect();
+        excluded.sort();
+        assert_eq!(g.bootstrap_excluded, excluded);
         assert!(!g.faucet && g.validator_admins.is_empty() && g.validators.len() == 4 && g.operators.len() == 4);
         assert!(g.validators.windows(2).all(|w| w[0].address < w[1].address), "validators in canonical order");
         // It's a genesis like any other: the file loads, and its state holds the allocation.
@@ -671,10 +691,24 @@ mod tests {
         std::fs::write(dir.join("genesis.json"), &a.json).unwrap();
         let loaded = Genesis::load(&dir.join("genesis.json")).unwrap();
         assert_eq!(hex::encode(crate::consensus::genesis_block(&loaded).digest_bytes()), a.hash);
-        let st = loaded.initial_state();
+        let mut st = loaded.initial_state();
         st.check_invariants().unwrap();
         assert_eq!(st.supply, MAX_SUPPLY);
         assert_eq!(crate::econ::transferable(&st, &owner(0xe3, "tboo"), 0), 0, "an operator's allocation is locked (its self-bond is bonded)");
+        // Audit F12: the bootstrap bucket has a mover. At the first boundary it's staked with the
+        // two seats not run by the foundation; once its curve has run, it's all the treasury's.
+        let boot = bootstrap_delegation("tboo");
+        crate::staking::end_epoch(&mut st, 0);
+        crate::staking::bootstrap_epoch(&mut st, 0);
+        let staked: Vec<(String, u64)> = crate::staking::delegations_of(&st, &boot).into_iter().map(|(v, _)| (v.clone(), crate::staking::delegation_value(&st, &boot, &v))).collect();
+        let independent: Vec<String> = g.operators.iter().filter(|o| !g.bootstrap_excluded.contains(&o.owner)).map(|o| crypto::address_with_prefix("tboo", &hex::decode(&o.consensus_key).unwrap())).collect();
+        assert_eq!(staked.iter().map(|(v, _)| v.clone()).collect::<Vec<_>>(), independent);
+        assert!(staked.iter().all(|(_, w)| *w == 50_000_000 * FANG), "{staked:?}");
+        let treasury_before = st.account(&treasury("tboo")).balance;
+        let past_curve = st.params.epoch_of(126_230_400) + 1;
+        crate::staking::bootstrap_epoch(&mut st, past_curve);
+        assert!(crate::staking::delegations_of(&st, &boot).is_empty() && st.account(&boot).balance == 0);
+        assert_eq!(st.account(&treasury("tboo")).balance - treasury_before, 100_000_000 * FANG);
         std::fs::remove_dir_all(dir).ok();
         // The dry run's shortcuts.
         let w = a.warnings.join("\n");
