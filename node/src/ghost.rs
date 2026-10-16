@@ -35,7 +35,10 @@
 //!   deposits.
 //! - **Fees.** A shield pays the usual byte fee and tip, plus `ghost_verify_fee` (burned). An
 //!   unsigned tx's `fee` is exact (it's in the value balance) and must cover the base fee, its
-//!   tip and `ghost_verify_fee`: the tip goes to the proposer, the rest is burned.
+//!   tip, `ghost_verify_fee` and, for an unshield that opens the recipient's account,
+//!   `account_creation_fee` (DEC-6): the tip goes to the proposer, the rest is burned. Its fee
+//!   and tip are whole multiples of [`FEE_GRID`] ([`canonical_fee`]), so they don't fingerprint
+//!   wallets.
 //! - **Anchors.** At the end of a block that changed the tree, its root becomes the anchor; the
 //!   root it replaces stays usable for `ghost_anchor_window` blocks.
 //! - **Pause.** `GhostPause` from f + 1 distinct validators of the current epoch's active set
@@ -44,8 +47,9 @@
 //!   voted under, so governance resumes the pool by switching the feature off and on again.
 //! - **Limits.** Ghost txs (50–52) up to `ghost_max_tx_bytes`, at most `ghost_max_block_bytes` of
 //!   them per block ([`BlockBudget`], consensus.rs; both as the block's fee slot fixed them
-//!   `econ::FEE_LAG` blocks ahead), at most [`MAX_MEMPOOL_GHOST`] queued, and a
-//!   queued spend of a note is replaced only by a higher tip per byte ([`mempool_admit`]).
+//!   `econ::FEE_LAG` blocks ahead), at most [`MAX_MEMPOOL_GHOST`] queued; a queued spend of a
+//!   note is replaced, and a full ghost share gives up its cheapest tx, only for a tip higher by
+//!   a tenth and the relay of the newcomer's bytes ([`mempool_admit`]).
 //!
 //! State (namespaces `state::ns` 48–52, 53–55 reserved; the scalars are the META record `ghost`):
 //!
@@ -68,13 +72,23 @@ use blockula_ghost::tree::CAPACITY;
 use blockula_ghost::{Frontier, PublicInputs, ValueBalance, VerifyError};
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::LazyLock;
 
 /// The feature flag (upgrade.rs `KNOWN_FEATURES`).
 pub const FEATURE: &str = "ghost";
 /// Most ghost txs the mempool holds (each is ~135 KiB).
 pub const MAX_MEMPOOL_GHOST: usize = 256;
+/// An unsigned ghost tx's `fee` and `tip` are whole multiples of this (0.001 FANG). Both are
+/// public, so a fee priced to the drop would tell wallets (and the moment they priced it) apart;
+/// on a grid, txs priced the canonical way ([`canonical_fee`]) share a handful of values (audit
+/// F38). Execution refuses anything else.
+pub const FEE_GRID: u64 = DROPS_PER_FANG / 1_000;
+/// A queued ghost tx is displaced (replaced by a spend of the same note, or evicted from a full
+/// ghost share) only by a tip higher than its own by at least 1/`BUMP_DIVISOR` of it and by at
+/// least the base fee of the newcomer's bytes: every displacement pays to relay itself (audit
+/// F39, BIP-125's rules 3 and 4).
+const BUMP_DIVISOR: u64 = 10;
 /// `/api/ghost` lists at most this many retired anchors, newest first.
 const LISTED_ROOTS: usize = 64;
 
@@ -275,14 +289,66 @@ pub fn statement(tx: &Tx) -> Result<Option<(PublicInputs, &[u8])>> {
 }
 
 /// Remembered verdicts (see the module docs: the key covers the verifier's whole input).
+/// Valid proofs are kept least-recently-used first: the mempool check re-runs every queued ghost
+/// tx each block, so their verdicts stay the freshest, and flushing them would take thousands of
+/// new valid proofs (~6 ms of verification each) within one block. Failures, which junk makes
+/// cheaply (a 1-byte proof fails at decoding in microseconds), are kept apart in a small FIFO,
+/// so they never evict a valid tx's verdict (audit F41).
 struct Verdicts {
-    by_key: HashMap<[u8; 32], Result<(), VerifyError>>,
-    order: VecDeque<[u8; 32]>,
+    /// Verified statement → when it was last used (a tick of `clock`).
+    ok: HashMap<[u8; 32], u64>,
+    /// The same, by last use (oldest first).
+    by_use: BTreeMap<u64, [u8; 32]>,
+    clock: u64,
+    failed: HashMap<[u8; 32], VerifyError>,
+    failed_order: VecDeque<[u8; 32]>,
 }
 
 const REMEMBERED_VERDICTS: usize = 4_096;
+const REMEMBERED_FAILURES: usize = 1_024;
 
-static VERDICTS: LazyLock<parking_lot::Mutex<Verdicts>> = LazyLock::new(|| parking_lot::Mutex::new(Verdicts { by_key: HashMap::new(), order: VecDeque::new() }));
+impl Verdicts {
+    fn get(&mut self, key: &[u8; 32]) -> Option<Result<(), VerifyError>> {
+        if let Some(e) = self.failed.get(key) {
+            return Some(Err(*e));
+        }
+        let used = self.ok.get_mut(key)?;
+        self.by_use.remove(used);
+        self.clock += 1;
+        *used = self.clock;
+        self.by_use.insert(self.clock, *key);
+        Some(Ok(()))
+    }
+
+    fn put(&mut self, key: [u8; 32], verdict: Result<(), VerifyError>) {
+        match verdict {
+            Ok(()) => {
+                if self.ok.contains_key(&key) {
+                    return;
+                }
+                self.clock += 1;
+                self.ok.insert(key, self.clock);
+                self.by_use.insert(self.clock, key);
+                while self.ok.len() > REMEMBERED_VERDICTS {
+                    let Some((_, old)) = self.by_use.pop_first() else { break };
+                    self.ok.remove(&old);
+                }
+            }
+            Err(e) => {
+                if self.failed.insert(key, e).is_none() {
+                    self.failed_order.push_back(key);
+                }
+                while self.failed_order.len() > REMEMBERED_FAILURES {
+                    if let Some(old) = self.failed_order.pop_front() {
+                        self.failed.remove(&old);
+                    }
+                }
+            }
+        }
+    }
+}
+
+static VERDICTS: LazyLock<parking_lot::Mutex<Verdicts>> = LazyLock::new(|| parking_lot::Mutex::new(Verdicts { ok: HashMap::new(), by_use: BTreeMap::new(), clock: 0, failed: HashMap::new(), failed_order: VecDeque::new() }));
 
 /// Hash of everything `blockula_ghost::verify` reads: the public values (canonical encodings),
 /// the circuit it checks against, and the proof bytes.
@@ -306,20 +372,12 @@ fn statement_key(public: &PublicInputs, proof: &[u8]) -> [u8; 32] {
 pub fn verify_proof(tx: &Tx) -> Result<()> {
     let Some((public, proof)) = statement(tx)? else { return Ok(()) };
     let key = statement_key(&public, proof);
-    let known = VERDICTS.lock().by_key.get(&key).copied();
+    let known = VERDICTS.lock().get(&key);
     let verdict = match known {
         Some(v) => v,
         None => {
             let v = blockula_ghost::verify(&public, proof);
-            let mut cache = VERDICTS.lock();
-            if cache.by_key.insert(key, v).is_none() {
-                cache.order.push_back(key);
-            }
-            while cache.order.len() > REMEMBERED_VERDICTS {
-                if let Some(old) = cache.order.pop_front() {
-                    cache.by_key.remove(&old);
-                }
-            }
+            VERDICTS.lock().put(key, v);
             v
         }
     };
@@ -494,11 +552,35 @@ fn pause_vote(state: &mut State, j: &mut Journal, sender: &str, signer: &str, he
     Ok(())
 }
 
-/// The base fee, tip and verify fee an unsigned tx's `fee` must cover (`None` on overflow).
-fn unsigned_floor(state: &State, tx: &Tx, height: u64) -> Option<(u64, u64)> {
+/// What creating an unshield's recipient account burns (`account_creation_fee`, DEC-6), or 0.
+fn opening_fee(state: &State, tx: &Tx) -> u64 {
+    match &tx.action {
+        Action::Unshield { to, .. } => state.creation_fee_for(to),
+        _ => 0,
+    }
+}
+
+/// What an unsigned tx's `fee` must cover: the base fee, its tip, `ghost_verify_fee` and, for an
+/// unshield to an address with no account yet, `account_creation_fee` (audit F13: the recipient
+/// account is opened like any other, and the creation fee is burned with the rest of the fee).
+/// `(base, opening, floor)`, `None` on overflow.
+fn unsigned_floor(state: &State, tx: &Tx, height: u64) -> Option<(u64, u64, u64)> {
     let base = crate::econ::base_fee(state, height, tx.size());
-    let floor = base.checked_add(tx.tip)?.checked_add(state.chain_params.ghost_verify_fee)?;
-    Some((base, floor))
+    let opening = opening_fee(state, tx);
+    let floor = base.checked_add(tx.tip)?.checked_add(state.chain_params.ghost_verify_fee)?.checked_add(opening)?;
+    Some((base, opening, floor))
+}
+
+/// The canonical `fee` for an unsigned ghost tx with no tip (GHOST-MODE.md section 8, "Fees";
+/// `/api/ghost` serves it): the suggested base fee (`econ::max_fee`, which covers any block in
+/// the next `econ::FEE_LAG`) for the largest ghost tx (`ghost_max_tx_bytes`: the fee is in the
+/// sighash, so it's fixed before the proof, and with it the size, is known), plus
+/// `ghost_verify_fee`, plus `account_creation_fee` when it unshields to a new account, rounded up
+/// to [`FEE_GRID`]. Every wallet that prices this way at the same time pays the same.
+pub fn canonical_fee(state: &State, opens_account: bool) -> u64 {
+    let opening = if opens_account { state.chain_params.account_creation_fee } else { 0 };
+    let fee = crate::econ::max_fee(state, state.chain_params.ghost_max_tx_bytes).saturating_add(state.chain_params.ghost_verify_fee).saturating_add(opening);
+    fee.div_ceil(FEE_GRID).saturating_mul(FEE_GRID)
 }
 
 /// `State::apply_j` for an unsigned ghost tx (`PrivateTransfer`, `Unshield`): every check first,
@@ -517,11 +599,15 @@ pub(crate) fn apply_unsigned(state: &mut State, j: &mut Journal, tx: &Tx, chain_
     let b = tx.action.ghost_bundle().ok_or_else(|| anyhow!("not an unsigned ghost transaction"))?;
     check_size(state, tx)?;
     check_instance(state, b)?;
-    let (base, floor) = unsigned_floor(state, tx, height).ok_or_else(|| anyhow!("fee overflows"))?;
+    if !tx.fee.is_multiple_of(FEE_GRID) || !tx.tip.is_multiple_of(FEE_GRID) {
+        bail!("an unsigned ghost tx's fee and tip are whole multiples of {FEE_GRID} drops (0.001 FANG), so they don't set wallets apart: price it with ghost::canonical_fee (fee {}, tip {})", tx.fee, tx.tip);
+    }
+    let (base, opening, floor) = unsigned_floor(state, tx, height).ok_or_else(|| anyhow!("fee overflows"))?;
     // The same tip cap as signed txs (`tip_cap_multiple` × the base fee).
     crate::econ::check_tip(state, tx.tip, base, height)?;
     if tx.fee < floor {
-        bail!("fee too low: an unsigned ghost tx pays exactly its fee (it's in the proof's value balance), which must cover the base fee {base}, the tip {} and ghost_verify_fee {} ({floor} drops), but it's {}", tx.tip, state.chain_params.ghost_verify_fee, tx.fee);
+        let opens = if opening > 0 { format!(", account_creation_fee {opening} (it opens the recipient's account)") } else { String::new() };
+        bail!("fee too low: an unsigned ghost tx pays exactly its fee (it's in the proof's value balance), which must cover the base fee {base}, the tip {}, ghost_verify_fee {}{opens} ({floor} drops), but it's {}", tx.tip, state.chain_params.ghost_verify_fee, tx.fee);
     }
     let leaving = value_balance(tx)?;
     if leaving.is_negative() {
@@ -546,6 +632,8 @@ pub(crate) fn apply_unsigned(state: &mut State, j: &mut Journal, tx: &Tx, chain_
             state.j_credit(j, to, *amount);
         }
         state.j_credit(j, proposer, tx.tip);
+        // The rest of the fee is burned: the base fee, the verify fee, a new account's creation
+        // fee, and anything above them.
         state.j_burn(j, tx.fee - tx.tip);
         record(state, j, b, height)
     };
@@ -688,28 +776,55 @@ pub fn status_json(state: &State, height: u64) -> Value {
         "max_tx_bytes": p.ghost_max_tx_bytes,
         "max_block_bytes": p.ghost_max_block_bytes,
         "verify_fee": p.ghost_verify_fee.to_string(),
+        "fee_grid": FEE_GRID.to_string(),
+        "canonical_fee": canonical_fee(state, false).to_string(),
+        "canonical_fee_new_account": canonical_fee(state, true).to_string(),
     })
 }
 
-/// Mempool admission of a ghost tx (`Chain::submit_tx`) against the queued txs: at most
-/// [`MAX_MEMPOOL_GHOST`] ghost txs, and one queued spend per note: a tx spending a nullifier a
-/// queued tx spends replaces it only with a higher tip per byte. Returns the ids it replaces.
-pub fn mempool_admit(queued: &[Tx], ids: &[String], tx: &Tx) -> Result<Vec<String>> {
+/// The least tip that displaces queued tx `q` (see [`BUMP_DIVISOR`]): `q`'s tip plus the larger
+/// of a tenth of it and `relay` (the base fee of the newcomer's bytes), on the fee grid.
+fn displacing_tip(q: &Tx, relay: u64) -> u64 {
+    let bump = (q.tip / BUMP_DIVISOR).max(relay).max(1);
+    q.tip.saturating_add(bump).div_ceil(FEE_GRID).saturating_mul(FEE_GRID)
+}
+
+fn displaces(tx: &Tx, q: &Tx, relay: u64) -> bool {
+    tx.tip >= displacing_tip(q, relay) && TipRate::of(tx) > TipRate::of(q)
+}
+
+/// Mempool admission of a ghost tx (`Chain::submit_tx`) against the queued txs: one queued spend
+/// per note, and at most [`MAX_MEMPOOL_GHOST`] ghost txs. A tx spending a nullifier a queued tx
+/// spends replaces it, and a full ghost share gives up its lowest tip per byte (the newest
+/// among equals, like `Chain::eviction_victim`; only when `evict`), only for a tip that clears
+/// [`displacing_tip`]: higher tips get in (audit F36), and every displacement pays the relay of
+/// its own bytes (F39). `relay`: the base fee of `tx`'s bytes. Returns the ids it displaces,
+/// with why.
+pub fn mempool_admit(queued: &[Tx], ids: &[String], tx: &Tx, relay: u64, evict: bool) -> Result<Vec<(String, &'static str)>> {
     let Some(b) = tx.action.ghost_bundle() else { return Ok(vec![]) };
     let mut ghosts = 0;
     let mut replaces = vec![];
+    // The lowest tip per byte queued (newest among equals).
+    let mut lowest: Option<(&Tx, &String)> = None;
     for (q, id) in queued.iter().zip(ids) {
         let Some(qb) = q.action.ghost_bundle() else { continue };
         ghosts += 1;
+        if lowest.is_none_or(|(l, _)| TipRate::of(q) <= TipRate::of(l)) {
+            lowest = Some((q, id));
+        }
         if qb.nullifiers.iter().any(|n| b.nullifiers.contains(n)) {
-            if TipRate::of(tx) <= TipRate::of(q) {
-                bail!("a queued transaction already spends one of these notes; to replace it, pay a higher tip per byte than its {} drops for {} bytes", q.tip, q.size());
+            if !displaces(tx, q, relay) {
+                bail!("a queued transaction already spends one of these notes; to replace it, pay a tip of at least {} drops (its {} plus the relay of yours) and the fee to cover it", displacing_tip(q, relay), q.tip);
             }
-            replaces.push(id.clone());
+            replaces.push((id.clone(), "replaced by a transaction spending the same note with a higher tip"));
         }
     }
     if replaces.is_empty() && ghosts >= MAX_MEMPOOL_GHOST {
-        bail!("the mempool holds its maximum of {MAX_MEMPOOL_GHOST} ghost transactions; try again shortly");
+        return match lowest {
+            Some((q, id)) if evict && displaces(tx, q, relay) => Ok(vec![(id.clone(), "evicted from the mempool's full ghost share by a transaction with a higher tip")]),
+            Some((q, _)) => bail!("the mempool holds its maximum of {MAX_MEMPOOL_GHOST} ghost transactions; resubmit with a tip of at least {} drops (and the fee to cover it), or try again shortly", displacing_tip(q, relay)),
+            None => bail!("the mempool holds its maximum of {MAX_MEMPOOL_GHOST} ghost transactions; try again shortly"),
+        };
     }
     Ok(replaces)
 }

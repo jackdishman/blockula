@@ -725,6 +725,14 @@ async fn submit(State(n): State<Node>, ConnectInfo(peer): ConnectInfo<SocketAddr
     result
 }
 
+/// The client IP a full node passes on with a tx it forwards (so the validator's per-IP limits
+/// see the end client): none for an unsigned ghost tx (audit F40). It names no one, and the IP
+/// would tell the validator (and anyone on the path) who sent it. This node's own per-IP limit
+/// still applied; the validator counts it against this node.
+fn forwarded_client_ip(tx: &Tx, client: Option<IpAddr>) -> Option<IpAddr> {
+    if tx.is_unsigned() { None } else { client }
+}
+
 /// A submitted tx: JSON (the API format), or its wire form (`Tx::to_bytes`) with
 /// `Content-Type: application/octet-stream`, which is how ghost txs (~135 KiB) should travel.
 fn parse_tx(headers: &HeaderMap, body: &[u8]) -> Result<Tx, ApiError> {
@@ -764,7 +772,7 @@ async fn submit_inner(n: &Node, headers: &HeaderMap, client: Option<IpAddr>, tx:
         }
         // Admit locally (same checks as a validator), then hand it to a validator.
         let id = n.chain.lock().submit(tx.clone())?;
-        if let Err(e) = n.forward("/tx", &serde_json::to_value(&tx).unwrap(), client).await {
+        if let Err(e) = n.forward("/tx", &serde_json::to_value(&tx).unwrap(), forwarded_client_ip(&tx, client)).await {
             n.chain.lock().drop_pending(&id);
             return Err(e);
         }
@@ -2038,6 +2046,19 @@ mod tests {
         let lan = ClientIpPolicy { trusted_forwarders: vec!["10.0.0.2".parse().unwrap()], ..Default::default() };
         let fake = headers(&[("fly-client-ip", "10.0.0.2"), ("x-blockula-client-ip", "9.9.9.9")]);
         assert_eq!(lan.resolve(peer, &fake), Some(peer.ip()));
+    }
+
+    /// Audit F40: a full node forwards a signed tx with its client's IP (for the validator's
+    /// per-IP limits) but an unsigned ghost tx without it.
+    #[test]
+    fn unsigned_ghost_txs_are_forwarded_without_the_client_ip() {
+        let ip: Option<IpAddr> = Some("203.0.113.9".parse().unwrap());
+        let ghost = crate::types::tests::vector_tx(Action::Unshield { to: "x.boo".into(), amount: 1, bundle: crate::types::tests::vector_bundle(1) });
+        let signed = crate::types::tests::vector_tx(Action::Transfer { to: "x.boo".into(), amount: 1 });
+        let shield = crate::types::tests::vector_tx(Action::Shield { amount: 1, bundle: crate::types::tests::vector_bundle(1) });
+        assert!(ghost.is_unsigned() && !signed.is_unsigned() && !shield.is_unsigned());
+        assert_eq!(forwarded_client_ip(&ghost, ip), None);
+        assert_eq!((forwarded_client_ip(&signed, ip), forwarded_client_ip(&shield, ip)), (ip, ip), "signed txs (a shield too) name their sender anyway");
     }
 
     /// The p2p transport `/api/status` reports is the one linked (audit #1/#3). Compiling

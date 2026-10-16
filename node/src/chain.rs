@@ -949,12 +949,13 @@ impl State {
     /// 4. `governance::end_block`: proposals whose voting ended or whose timelock is over.
     /// 5. `ghost::end_block`: the commitment tree's new root becomes the anchor; old anchors
     ///    age out.
-    /// 6. At an epoch boundary: `econ::issue` (issuance into the pools, the contribution pool and
-    ///    the treasury; the endowment's vested part into the contribution pool), `staking::end_epoch`
-    ///    (the next set by stake, churn-limited), `staking::bootstrap_epoch` (the bootstrap
-    ///    delegation's rewards and return to the treasury, the rest spread over the next set),
-    ///    `beacon::end_epoch` (the next epoch's beacon value, jailing non-revealers), then
-    ///    [`State::end_epoch`] (how much set history to keep).
+    /// 6. At an epoch boundary: `beacon::end_epoch` (the next epoch's beacon value, jailing
+    ///    non-revealers: first, so a withholder earns nothing for the epoch it's caught in and
+    ///    the next set leaves it out), `econ::issue` (issuance into the pools, the contribution
+    ///    pool and the treasury; the endowment's vested part into the contribution pool),
+    ///    `staking::end_epoch` (the next set by stake, churn-limited), `staking::bootstrap_epoch`
+    ///    (the bootstrap delegation's rewards and return to the treasury, the rest spread over the
+    ///    next set), then [`State::end_epoch`] (how much set history to keep).
     ///
     /// Then the caller commits the block and, last, runs `upgrade::check_next(height + 1)`, which
     /// stops the node before a height its binary can't execute (3.9).
@@ -966,10 +967,10 @@ impl State {
         crate::ghost::end_block(self, b);
         if self.params.is_boundary(b.height) {
             let epoch = self.params.epoch_of(b.height);
+            crate::beacon::end_epoch(self, epoch);
             crate::econ::issue(self, epoch);
             crate::staking::end_epoch(self, epoch);
             crate::staking::bootstrap_epoch(self, epoch);
-            crate::beacon::end_epoch(self, epoch);
             self.end_epoch(epoch);
         }
     }
@@ -3114,9 +3115,10 @@ impl Chain {
         if self.pool.contains(&id) || self.has_tx(&id) {
             return Ok((id, false));
         }
-        // Ghost Mode: a bounded share of the mempool, and one queued spend per note (a higher tip
-        // per byte replaces it). Unsigned ghost txs have no sender: no queue, nonce or simulation.
-        let replaces = crate::ghost::mempool_admit(&self.mempool, &self.mempool_ids, &tx)?;
+        // Ghost Mode: a bounded share of the mempool, and one queued spend per note (a high enough
+        // tip displaces one). Unsigned ghost txs have no sender: no queue, nonce or simulation.
+        let relay = crate::econ::base_fee(&self.state, self.height() + 1, tx.size());
+        let replaces = crate::ghost::mempool_admit(&self.mempool, &self.mempool_ids, &tx, relay, evict)?;
         if let Action::RegisterName { name } = &tx.action {
             self.first_to_ask(&tx, name)?;
         }
@@ -3133,11 +3135,11 @@ impl Chain {
         let next = self.height() + 1;
         let sim = self.dry_run(&tx, &sender, count)?;
         if !replaces.is_empty() {
-            self.remove_from_mempool(|i| replaces.iter().any(|r| r == i));
-            for r in replaces {
+            self.remove_from_mempool(|i| replaces.iter().any(|(r, _)| r == i));
+            for (r, why) in replaces {
                 self.pool.remove(&r);
                 self.mp.remove(&r);
-                self.note_failed(r, "replaced by a transaction spending the same note with a higher tip".into(), next);
+                self.note_failed(r, why.into(), next);
             }
             self.rebuild_pending();
         }

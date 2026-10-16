@@ -98,6 +98,7 @@ const cases: [string, () => Promise<unknown>, Action][] = [
     { type: "propose", kind: { type: "treasury_spend", to: BOB, amount: (9n * FANG).toString() }, deposit: "1000000000000", title: "Pay Bob", url: "https://forum.example/p/1" },
   ],
   ["propose a param change", () => me.propose(proposal.paramChange("max_validators", 40), { title: "More validators", deposit: "2000" }), { type: "propose", kind: { type: "param_change", key: "max_validators", value: "40" }, deposit: (2000n * FANG).toString(), title: "More validators", url: "" }],
+  ["propose lifting a sybil flag (name resolved)", () => me.propose(proposal.unflagSybil("bob.boo", "mistaken identity"), { title: "Appeal", deposit: "1" }), { type: "propose", kind: { type: "unflag_sybil", account: BOB, reason: "mistaken identity" }, deposit: FANG.toString(), title: "Appeal", url: "" }],
   ["vote", () => me.vote(1, true, "10", 6), { type: "vote", proposal_id: 1, aye: true, amount: (10n * FANG).toString(), conviction: 6 }],
   ["vote without conviction", () => me.vote(2, false, 1n, 0), { type: "vote", proposal_id: 2, aye: false, amount: "1", conviction: 0 }],
   ["unlock", () => me.unlock(), { type: "unlock" }],
@@ -114,6 +115,11 @@ const cases: [string, () => Promise<unknown>, Action][] = [
 ];
 for (const [label, run, want] of cases) assert.deepEqual(await action(run), want, label);
 console.log(`✓ ${cases.length} protocol v1 helpers sign the expected txs`);
+// `unflag_sybil` (proposal kind 14) signs the bytes node/src/types.rs does (its vector there and in e2e.ts).
+{
+  const vt: Tx = { chain_id: "vec", genesis_hash: "03".repeat(32), from: "boo1from", nonce: 7, fee: "12345", tip: "3", valid_until: 99, action: { type: "propose", kind: proposal.unflagSybil("x.boo", "r"), deposit: (1000n * FANG).toString(), title: "t" }, memo: "m", public_key: "01".repeat(1952), signature: "02".repeat(3309) };
+  assert.equal(bytesToHex(blake3(signingBytes(vt))), "225aa5b8e4df8e8d27fe796992dfd02e5e402c14a9bbc3873d41d63dd07dc2cf");
+}
 
 // Checked before anything is signed.
 const refused: [string, () => Promise<unknown>, RegExp][] = [

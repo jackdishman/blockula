@@ -78,6 +78,11 @@ pub const JUROR_BAD_SOUL: u64 = 2 * SOUL;
 pub const NO_SHOW_SOUL: u64 = JUROR_BAD_SOUL;
 pub const NO_SHOW_SLASH_BPS: u64 = 1_000;
 pub const SPAM_SOUL: u64 = 20 * SOUL;
+/// A spam verdict needs at least this many flags, and more than half of the jurors who saw the
+/// claim (audit F23: with 64 claims and 24 pairs per seat, most claims are seen by 2–4 of the 7
+/// jurors, so "2 and a majority of viewers" let two colluding seats slash competitors). A claim
+/// fewer than this many jurors saw can't be marked spam: on ambiguity it's scored, never slashed.
+pub const SPAM_MIN_FLAGS: u64 = 3;
 pub const SYBIL_VOUCHER_SOUL: u64 = 50 * SOUL;
 /// Soul at which the payout boost maxes out (1.5×).
 pub const BOOST_CAP_SOUL: u64 = 100 * SOUL;
@@ -738,6 +743,22 @@ impl State {
                         bail!("this vouch is locked until block {unlock}");
                     }
                 }
+                // A vouch keeps its two accounts off each other's juries (`conflicted`, checked
+                // when a Séance opens), and a Séance's seed is public an epoch before it opens, so
+                // dropping the vouch once the draw is known would seat a juror on a claim it
+                // mustn't judge (audit F53). So when one side has a claim open, the other, if
+                // it's in the jury pool, becomes new to the draw, as if it had just joined
+                // (`seance_cutoff`): it sits on no Séance whose seed could have been known when
+                // the vouch went. The vouch itself can always go, so a newcomer can decline an
+                // unwanted one even with a claim open (a lock would let a voucher force its cut).
+                for (who, other) in [(&to, &v.voucher), (&v.voucher, &to)] {
+                    if self.poc.has_open_claims(who) > 0 && self.poc.jurors.contains_key(other.as_str()) {
+                        self.pj(j).jurors.touch(&self.poc.jurors, other.as_str());
+                        if let Some(r) = self.poc.jurors.get_mut(other.as_str()) {
+                            r.joined_at = height;
+                        }
+                    }
+                }
                 self.pj(j).vouches.touch(&self.poc.vouches, &to);
                 self.poc.vouches.remove(&to);
                 self.j_credit(j, &v.voucher, v.bond);
@@ -1033,6 +1054,20 @@ impl State {
         Ok(())
     }
 
+    /// Lifts a sybil flag (`UnflagSybil`, the appeal path for `FlagSybil`, audit F54): the account
+    /// can vouch, be vouched for, claim (its GitHub handle stays credited to it), earn Soul and
+    /// join juries again. Nothing the flag took comes back (Soul, bonds, rejected claims,
+    /// clawed-back rewards, voided vouches); governance can grant Soul separately.
+    pub(crate) fn exec_unflag_sybil(&mut self, j: &mut Journal, account: &str) -> Result<()> {
+        let who = self.resolve(account)?;
+        if !self.is_sybil(&who) {
+            bail!("{} isn't flagged as a sybil", short(&who));
+        }
+        self.pj(j).sybils.touch(&self.poc.sybils, &who);
+        self.poc.sybils.remove(&who);
+        Ok(())
+    }
+
     /// Rejects a claim (say, its PR was reverted): slashes the bond, or for a scored claim claws
     /// back its unvested reward (and its vouchers' cuts) and the Soul it earned.
     pub(crate) fn exec_reject_claim(&mut self, j: &mut Journal, claim_id: u64, reason: &str, height: u64) -> Result<()> {
@@ -1200,7 +1235,9 @@ impl State {
     }
 
     /// Claims a juror mustn't judge: their own, and those of people they vouched for or who
-    /// vouched for them.
+    /// vouched for them. A vouch dropped while one side has a claim open makes the other, if it's
+    /// in the jury pool, new to the draw (see `Unvouch`), so a conflict can't be dissolved once a
+    /// Séance's seed shows who would sit.
     fn conflicted(&self, juror: &str, claimant: &str) -> bool {
         juror == claimant || self.poc.vouches.get(claimant).is_some_and(|v| v.voucher == juror) || self.poc.vouches.get(juror).is_some_and(|v| v.voucher == claimant)
     }
@@ -1328,6 +1365,7 @@ impl State {
             }
         }
         let score: BTreeMap<u64, u64> = comps.iter().map(|(c, n)| (*c, wins2.get(c).copied().unwrap_or(0) * PPM / (2 * n))).collect();
+        let mut spam: BTreeSet<u64> = BTreeSet::new();
         let mut results = SeanceResults::default();
         let mut accepted: Vec<u64> = vec![];
         let mut soul_changes: Vec<(String, i64, Option<u64>)> = vec![];
@@ -1343,10 +1381,11 @@ impl State {
             };
             let f = flags.get(c).copied().unwrap_or(0);
             self.claim_mut(&mut j, *c).unwrap().score_ppm = Some(sc);
-            if f >= 2 && 2 * f > seen.get(c).copied().unwrap_or(0) {
+            if f >= SPAM_MIN_FLAGS && 2 * f > seen.get(c).copied().unwrap_or(0) {
                 self.settle_bond(&mut j, *c, false);
                 self.set_status(&mut j, *c, ClaimStatus::Spam, height, Some(format!("{f} of the jurors who saw it flagged it as spam")));
                 soul_changes.push((claimant, -(SPAM_SOUL as i64), None));
+                spam.insert(*c);
                 results.spam += 1;
             } else if sc < MIN_SCORE_PPM {
                 self.settle_bond(&mut j, *c, true);
@@ -1387,6 +1426,13 @@ impl State {
                 points += if v == outcome { 2 } else if v == b'=' || outcome == b'=' { 1 } else { 0 };
                 total += 2;
             }
+            // Spam flags are graded too (F23): a flag on a claim enough jurors saw to decide
+            // (`SPAM_MIN_FLAGS`) that the jury didn't uphold counts as a disagreement, so
+            // flagging everything costs agreement, Soul and the jury reward. Upheld flags and
+            // flags on claims too few saw neither add nor cost.
+            let saw: BTreeSet<u64> = seat.pairs.iter().filter(|[a, b]| live.contains(a) && live.contains(b)).flatten().copied().collect();
+            let overruled = seat.spam.iter().filter(|c| saw.contains(c) && score.contains_key(c) && seen.get(c).copied().unwrap_or(0) >= SPAM_MIN_FLAGS && !spam.contains(c)).count() as u64;
+            total += 2 * overruled;
             if total == 0 {
                 seat_updates.push((juror.clone(), None, 0));
                 continue;
@@ -2065,6 +2111,178 @@ mod scenarios {
         let id = t.c.state.poc.open_seance.unwrap();
         assert_eq!(draw(&t.c.state.poc.seances[&id]), draw(&c));
         t.reopen_same_root();
+    }
+
+    /// Audit F53 (the audit's PoC): a juror's vouchee sees from the public seed that its voucher
+    /// would sit, and drops the vouch so the voucher can judge its claim. The vouch goes, but the
+    /// voucher is then new to the draw, so the same Séance opens without it.
+    #[test]
+    fn dropping_a_vouch_once_the_draw_is_known_seats_nobody_new() {
+        let mut t = setup("vouchdraw");
+        t.admin(Action::SetRepo { repo: "jackdishman/blockula".into(), weight: 10 }).unwrap();
+        let jurors: Vec<Keys> = (1..=4).map(k).collect();
+        for j in &jurors {
+            t.grant(j, 20);
+            t.tx(j, Action::JoinJury { bond: JUROR_BOND }).unwrap();
+        }
+        let (insider, newcomer, other) = (&jurors[0], k(10), k(11));
+        t.tx(insider, Action::Vouch { account: newcomer.address() }).unwrap();
+        t.grant(&other, 1);
+        t.link(&newcomer, "newcomer");
+        t.link(&other, "other");
+        let claims = [t.claim(&newcomer, 1).unwrap(), t.claim(&other, 2).unwrap()];
+        t.attest_all(&claims);
+        t.tx(&k(12), Action::FundPool { amount: 50 * DROPS_PER_FANG }).unwrap();
+        // The first opening whose cutoff is past all that, run to where its seed is public.
+        let at = {
+            let st = &t.c.state;
+            let mut at = st.next_seance_height(t.h() + 1);
+            while st.seance_cutoff(st.params.epoch_of(at)) <= t.h() {
+                at = st.next_seance_height(at + 1);
+            }
+            at
+        };
+        let epoch = t.c.state.params.epoch_of(at);
+        while t.h() < epoch * t.c.state.params.epoch_blocks {
+            t.blocks(1);
+        }
+        assert!(crate::beacon::value(&t.c.state, epoch).is_some() && t.h() < at, "the seed is public before the opening");
+        let draw = |mut st: State, from: u64| -> Seance {
+            for h in from..=at {
+                st.end_block(&BlockInfo { height: h, hash: "x", proposer: "p", view: h, parent_view: h - 1, skipped: &[], tx_bytes: 0 });
+            }
+            let id = st.poc.open_seance.expect("a Séance opens");
+            st.poc.seances[&id].clone()
+        };
+        // As the rules intend: the insider can't judge the newcomer's claim, so with two claims it
+        // has no pair to judge and doesn't sit.
+        let a = draw(t.c.state.clone(), t.h() + 1);
+        assert_eq!((a.claims.len(), a.jurors.len()), (2, 3));
+        assert!(!a.jurors.contains_key(&insider.address()));
+        // Knowing that, the newcomer declines the vouch (it always may). The insider is new to the
+        // draw: the same jury sits, and the insider still doesn't judge the claim it vouched for.
+        t.tx(&newcomer, Action::Unvouch { account: newcomer.address() }).unwrap();
+        assert!(!t.c.state.poc.vouches.contains_key(&newcomer.address()));
+        assert_eq!(t.c.state.poc.jurors.get(&insider.address()).unwrap().joined_at, t.h());
+        let jury = |s: &Seance| serde_json::to_value((&s.claims, &s.jurors)).unwrap();
+        assert_eq!(jury(&draw(t.c.state.clone(), t.h() + 1)), jury(&a));
+        t.blocks(at - t.h());
+        let id = t.c.state.poc.open_seance.expect("the real chain opens it");
+        assert_eq!(jury(&t.c.state.poc.seances[&id]), jury(&a));
+        conserved(&t.c.state);
+        t.reopen_same_root();
+    }
+
+    /// Audit F53, the rule: a vouch can always be withdrawn (the newcomer declines any time, the
+    /// voucher after the lock), so no juror can pin its vouch, and its cut, on a newcomer with a
+    /// claim open. When one side has a claim open, the other, if it's in the jury pool, becomes
+    /// new to the draw; otherwise nobody's draw changes.
+    #[test]
+    fn a_vouch_can_always_go_and_a_juror_on_it_is_new_to_the_draw() {
+        let mut t = setup("vouchgo");
+        t.admin(Action::SetRepo { repo: "jackdishman/blockula".into(), weight: 10 }).unwrap();
+        let (juror, newbie, other) = (k(1), k(6), k(7));
+        t.grant(&juror, 20);
+        t.tx(&juror, Action::JoinJury { bond: JUROR_BOND }).unwrap();
+        let joined = |t: &T, who: &Keys| t.c.state.poc.jurors.get(&who.address()).unwrap().joined_at;
+        let first = joined(&t, &juror);
+        t.link(&juror, "juror");
+        let mine = t.claim(&juror, 2).unwrap();
+        t.attest(mine, true).unwrap();
+        // Neither side has a claim open and is opposite a pool member: nothing changes.
+        t.tx(&juror, Action::Vouch { account: other.address() }).unwrap();
+        t.tx(&other, Action::Unvouch { account: other.address() }).unwrap();
+        assert_eq!(joined(&t, &juror), first);
+        // The newcomer, with a claim open (made under the vouch), declines its juror's vouch: the
+        // juror is new to the draw.
+        t.tx(&juror, Action::Vouch { account: newbie.address() }).unwrap();
+        t.link(&newbie, "newbie");
+        let c = t.claim(&newbie, 1).unwrap();
+        t.attest(c, true).unwrap();
+        t.tx(&newbie, Action::Unvouch { account: newbie.address() }).unwrap();
+        assert_eq!(joined(&t, &juror), t.h());
+        // The voucher withdraws past the lock, the claim still open: the same.
+        t.tx(&juror, Action::Vouch { account: newbie.address() }).unwrap();
+        assert!(t.tx(&juror, Action::Unvouch { account: newbie.address() }).unwrap_err().to_string().contains("locked until"));
+        t.blocks(100);
+        t.tx(&juror, Action::Unvouch { account: newbie.address() }).unwrap();
+        assert_eq!(joined(&t, &juror), t.h());
+        assert!(!t.c.state.poc.vouches.contains_key(&newbie.address()));
+        // The other way round: the voucher has the claim open and the vouchee sits in the pool.
+        t.tx(&juror, Action::Vouch { account: newbie.address() }).unwrap();
+        t.admin(Action::RejectClaim { claim_id: c, reason: "test".into() }).unwrap();
+        t.grant(&newbie, 10);
+        t.tx(&newbie, Action::JoinJury { bond: JUROR_BOND }).unwrap();
+        let (j_before, n_before) = (joined(&t, &juror), joined(&t, &newbie));
+        t.tx(&newbie, Action::Unvouch { account: newbie.address() }).unwrap();
+        assert_eq!((joined(&t, &juror), joined(&t, &newbie)), (j_before, t.h()));
+        assert!(n_before < t.h());
+        t.admin(Action::RejectClaim { claim_id: mine, reason: "test".into() }).unwrap();
+        conserved(&t.c.state);
+        t.reopen_same_root();
+    }
+
+    /// Audit F23: a spam verdict needs `SPAM_MIN_FLAGS` (3) flags and a majority of the jurors who
+    /// saw the claim, so two colluding seats can't slash a claim only they (or few others) saw;
+    /// and a flag the jury didn't uphold counts against the flagger's agreement.
+    #[test]
+    fn spam_needs_three_flags_and_overruled_flags_cost_agreement() {
+        let mut t = setup("spamq");
+        t.admin(Action::SetRepo { repo: "jackdishman/blockula".into(), weight: 10 }).unwrap();
+        let jurors: Vec<Keys> = (1..=5).map(k).collect();
+        for j in &jurors {
+            t.grant(j, 10);
+            t.tx(j, Action::JoinJury { bond: JUROR_BOND }).unwrap();
+        }
+        t.tx(&k(9), Action::FundPool { amount: 50 * DROPS_PER_FANG }).unwrap();
+        let mut claims = vec![];
+        for (i, who) in [(10u8, "ten"), (11, "eleven"), (12, "twelve")] {
+            t.grant(&k(i), 1);
+            t.link(&k(i), who);
+            claims.push(t.claim(&k(i), i as u64).unwrap());
+        }
+        t.attest_all(&claims);
+        let sid = t.wait_for_seance();
+        let (x, a, b) = (claims[0], claims[1], claims[2]);
+        let base = t.c.state.clone();
+        let h = t.h();
+        // Every juror reveals an honest ballot (a > b > x) and the `flaggers` flag `x`; with
+        // `only_two_see_x`, jurors 2–4 compare only `a` and `b`.
+        let close = |flaggers: &[usize], only_two_see_x: bool| -> State {
+            let mut st = base.clone();
+            let s = st.poc.seances.get_mut(&sid).unwrap();
+            for (i, jk) in jurors.iter().enumerate() {
+                let seat = s.jurors.get_mut(&jk.address()).unwrap();
+                if only_two_see_x && i >= 2 {
+                    seat.pairs = vec![[a, b]];
+                }
+                let rank = |c: u64| if c == a { 3 } else if c == b { 2 } else { 1 };
+                seat.votes = Some(seat.pairs.iter().map(|[p, q]| if rank(*p) > rank(*q) { 'a' } else { 'b' }).collect());
+                seat.spam = if flaggers.contains(&i) { vec![x] } else { vec![] };
+            }
+            st.close_seance(sid, h);
+            st.check_invariants().unwrap();
+            st
+        };
+        let agreement = |st: &State, i: usize| st.poc.seances[&sid].jurors[&jurors[i].address()].agreement_ppm.unwrap();
+        // Two of the five who saw it flag it: not spam, and both flags were overruled.
+        let st = close(&[0, 1], false);
+        assert_eq!(st.poc.claims[&x].status, ClaimStatus::Scored);
+        assert!(agreement(&st, 0) < agreement(&st, 2), "an overruled flag costs agreement: {} vs {}", agreement(&st, 0), agreement(&st, 2));
+        assert_eq!(agreement(&st, 2), PPM, "honest ballot, no flags");
+        // Only two jurors saw `x`, and both flagged it: a majority of its viewers, but too few to
+        // decide. It's scored (on ambiguity, never slashed), and the flags aren't graded.
+        let st = close(&[0, 1], true);
+        assert_eq!(st.poc.seances[&sid].jurors[&jurors[3].address()].pairs, vec![[a, b]]);
+        assert_eq!(st.poc.claims[&x].status, ClaimStatus::Scored);
+        assert_eq!(st.poc.claims[&x].bond, 0, "bond refunded");
+        assert_eq!((agreement(&st, 0), agreement(&st, 1)), (PPM, PPM));
+        // Three of five: spam (bond to the pool, Soul lost); upheld flags cost nothing.
+        let st = close(&[0, 1, 2], false);
+        assert_eq!(st.poc.claims[&x].status, ClaimStatus::Spam);
+        assert_eq!(st.poc.seances[&sid].results.as_ref().unwrap().spam, 1);
+        assert_eq!(agreement(&st, 0), PPM);
+        std::fs::remove_dir_all(&t.home).ok();
     }
 
     fn claims_payout(t: &T, c: u64) -> u64 {

@@ -379,7 +379,7 @@ blocks) and `ghost_verify_fee` (0.001 FANG). The flag itself is upgrade.rs's `fe
 |---|---|---|---|---|
 | 50 | `Shield { amount, bundle }` | `from`'s owner key (normal Tx v3) | `−amount` | debit `amount` + `ghost_verify_fee` (burned) besides the usual charge; `pool += amount`; fails (charged) above `ghost_pool_cap` |
 | 51 | `PrivateTransfer { bundle }` | nobody: the proof authorizes | `fee` | `pool −= fee`; tip to the proposer, the rest burned |
-| 52 | `Unshield { to, amount, bundle }` | nobody | `amount + fee` | `pool −= amount + fee`; credit `to` (address or name) |
+| 52 | `Unshield { to, amount, bundle }` | nobody | `amount + fee` | `pool −= amount + fee`; credit `to` (address or name); opening `to`'s account burns `account_creation_fee` out of the fee (DEC-6) |
 | 53 | `SetGhostAddress { address }` | the account's owner key | | the address is filed under the account, so wallets find it under each of its `.boo` names (and it follows the account, not a name that changes hands) |
 | 54 | `GhostPause {}` | an active validator (its consensus key or owner) | | once f + 1 distinct validators of the epoch's active set have signed, ghost actions fail from the next block |
 
@@ -414,15 +414,26 @@ block (`ghost::BlockBudget`, in consensus `propose` and `verify`). In blocks, bo
 ones the block's fee slot fixed 17 blocks ahead (`econ::FeeSlot`, like the base fee and
 `max_block_bytes`), so a `ParamChange` takes effect 17 blocks after it executes and every proposer
 within the execution lag knows them exactly; `verify` checks them before any proof. At most 256 queued in the
-mempool; a tx spending a nullifier a queued tx spends replaces it only with a higher tip per byte.
+mempool. A tx spending a nullifier a queued tx spends replaces it, and a full ghost share gives up its
+lowest tip per byte (the newest among equals), only for a tip at least the displaced one's plus the larger
+of a tenth of it and the base fee of the newcomer's bytes (rounded up to the fee grid), and a higher tip
+per byte: a higher tip always gets in, and every displacement pays for relaying itself (BIP-125's rules 3
+and 4), so re-proving one note with tips one drop apart buys nothing.
 `POST /api/tx` takes the wire form as `application/octet-stream` (and JSON up to twice
 `MAX_GHOST_TX_BYTES`).
 
 **Fees.** A shield pays the usual byte fee and tip transparently, plus `ghost_verify_fee`. An
 unsigned tx's `fee` is exact (it's in the value balance) and must cover the base fee for its
-size (`econ::base_fee`), its tip and `ghost_verify_fee`; the tip goes to the proposer, the rest is
-burned. A ghost tx that can't be included is skipped, and P-STAKE charges the proposer for it
-(CV-5).
+size (`econ::base_fee`), its tip, `ghost_verify_fee` and, for an unshield to an address with no
+account yet, `account_creation_fee` (opening an account burns it, however it's opened); the tip
+goes to the proposer, the rest is burned. Its `fee` and `tip` are public, so a fee priced to the
+drop would tell wallets, and the moment they priced, apart: both must be whole multiples of
+`ghost::FEE_GRID` (0.001 FANG), and wallets pay the canonical fee `/api/ghost` serves
+(`canonical_fee`, `canonical_fee_new_account`: `/api/fees`' suggested base fee for a
+`ghost_max_tx_bytes` tx, since the fee is in the sighash and fixed before the proof's size is
+known, plus the verify fee and, for a new account, the creation fee, rounded up to the grid), tip
+0 unless the mempool's ghost share is full, and `valid_until` = the height + `max_tx_validity_blocks`.
+A ghost tx that can't be included is skipped, and P-STAKE charges the proposer for it (CV-5).
 
 **Pipeline.**
 - **Before the chain lock** (HTTP submission, on a blocking thread, after a cheap "is Ghost Mode
@@ -441,9 +452,11 @@ burned. A ghost tx that can't be included is skipped, and P-STAKE charges the pr
 - **Admission and execution**, deterministically: the feature on and unpaused, the size limit,
   the instance, the fee floor, the turnstile (`pool ≥ value leaving`), the recipient, a usable
   anchor, unspent nullifiers, room for two leaves (`size + 2 ≤ CAPACITY`), and the proof again.
-  Verdicts are remembered (4,096) by a hash of the verifier's whole input (public values,
-  circuit id, proof bytes), and `verify` is a pure function of it, so a hit is exactly a repeat:
-  the cache changes how long execution takes, never what it does. For a signed shield these are
+  Verdicts are remembered by a hash of the verifier's whole input (public values, circuit id,
+  proof bytes), and `verify` is a pure function of it, so a hit is exactly a repeat: the cache
+  changes how long execution takes, never what it does. Valid ones (4,096) are kept least
+  recently used first, and the mempool check re-runs every queued ghost tx each block, so theirs
+  stay the freshest; failures (1,024) are kept apart, so junk that fails cheaply can't flush them. For a signed shield these are
   admission checks (can't be included) except the cap, the anchor and the nullifiers, which fail
   the action with the fee charged, like any signed tx. An unsigned tx applies in full or not at
   all (it has no account to charge).
@@ -467,7 +480,7 @@ and migrate to a new versioned pool through the turnstile (not built).
 
 **API.** `GET /api/ghost`: on or off, paused (since, by whom, signatures so far and the
 threshold), pool and cap, frontier size, the current anchor and recent replaced ones, the window,
-nullifier count, the instance, the circuit id and the limits. `GET /api/ghost/address/{name or
+nullifier count, the instance, the circuit id, the limits, the fee grid and the canonical fees. `GET /api/ghost/address/{name or
 address}`: a published address and its fingerprint. Tx JSON shows ghost bundles without their
 proof (its size and hash instead) but with the commitments and ciphertexts wallets scan; an
 unsigned tx's summary is "👻 a ghost transaction happened".
@@ -603,3 +616,15 @@ of a more complex AIR.
 - **No WASM yet**, so no prover in TypeScript: the SDK encodes ghost txs and their sighash
   (vectors shared with the node) but can't prove. The KATs are the contract for a port.
 - **Timing side channels** in proving and trial decryption haven't been analyzed.
+- **Network-level privacy** isn't provided. The node a wallet submits to sees its IP. A full node
+  forwards an unsigned ghost tx to a validator without the client's IP (it does for signed txs, so
+  the validator's per-IP limits see the end client), but it still knows it, and so does anything
+  between the wallet and it. Submitting through Tor or a relay is the user's part. The price: the
+  validator counts the unsigned txs a full node forwards against that full node's IP
+  (`TX_PER_IP_PER_MINUTE`, 120 a minute), so one full node relays at most that many ghost txs a
+  minute whoever sends them (each client is still held to its own limit at the full node), and a
+  sender of valid ghost txs can use that allowance up; wallets that need more submit to another
+  node or to a validator directly.
+- **Metadata.** The fee grid and the canonical fee leave a few fee values per base-fee level, not
+  one; a tip (only when the ghost share is full), `valid_until` and the time a tx appears still say
+  something about when and how it was built, and an unshield's amount and recipient are public.

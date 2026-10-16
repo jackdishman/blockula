@@ -45,6 +45,7 @@ A passed proposal is queued and runs at the end of block `voting_end + timelock_
 | `TreasurySpend { to, amount }` | pays from the keyless treasury, at most what it can transfer (its vesting) |
 | `Distribution { distribution_id, merkle_root, total, claim_until }` | moves `total` from the community account into a distribution (below); `distribution_id` must be the id the proposal gets |
 | `SetRepo`, `GrantSoul` (≤ 100 Soul), `FlagSybil`, `RejectClaim`, `Clawback`, `UnlinkGithub` | the former admin levers (`poc.rs`, `chain.rs`) |
+| `UnflagSybil { account, reason }` | `FlagSybil`'s appeal: lifts the flag (the account and its GitHub handle can earn again), restores nothing the flag took; only for a flagged account (`blockula gov propose unflag-sybil`) |
 | `RefundHunt { hunt_id }` | refunds every funder of an open hunt exactly what they put in |
 | `ScheduleUpgrade`, `ActivateFeature`, `DeactivateFeature` | `upgrade.rs` (Ghost Mode switches on this way) |
 | `Text {}` | nothing: a recorded signal |

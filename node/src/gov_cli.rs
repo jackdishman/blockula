@@ -192,6 +192,14 @@ pub enum KindCmd {
         #[command(flatten)]
         meta: Meta,
     },
+    /// Lift a sybil flag (the appeal path; nothing the flag took comes back)
+    UnflagSybil {
+        account: String,
+        #[arg(long)]
+        reason: String,
+        #[command(flatten)]
+        meta: Meta,
+    },
     /// Reject a contribution claim
     RejectClaim {
         claim: u64,
@@ -383,6 +391,7 @@ fn propose(dir: &Path, kind: KindCmd) -> Result<()> {
         KindCmd::SetRepo { repo, weight, meta } => (ProposalKind::SetRepo { repo, weight }, meta),
         KindCmd::GrantSoul { to, soul, reason, meta } => (ProposalKind::GrantSoul { to: rt.block_on(resolve(&meta.signer.rpc, &to))?, amount: parse_soul(&soul)?, reason }, meta),
         KindCmd::FlagSybil { account, reason, meta } => (ProposalKind::FlagSybil { account: rt.block_on(resolve(&meta.signer.rpc, &account))?, reason }, meta),
+        KindCmd::UnflagSybil { account, reason, meta } => (ProposalKind::UnflagSybil { account: rt.block_on(resolve(&meta.signer.rpc, &account))?, reason }, meta),
         KindCmd::RejectClaim { claim, reason, meta } => (ProposalKind::RejectClaim { claim_id: claim, reason }, meta),
         KindCmd::Clawback { account, reason, meta } => (ProposalKind::Clawback { account: rt.block_on(resolve(&meta.signer.rpc, &account))?, reason }, meta),
         KindCmd::UnlinkGithub { handle, meta } => (ProposalKind::UnlinkGithub { handle }, meta),
