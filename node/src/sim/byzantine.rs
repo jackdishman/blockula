@@ -405,16 +405,16 @@ fn spam_doesnt_delay_honest_txs_with_a_competitive_tip() {
             };
             let id = vals[k].chain.lock().submit(tx.clone()).unwrap();
             wait_until(&context, "the honest tx", || vals.iter().all(|v| v.chain.lock().has_tx(&id))).await;
-            let c = vals[0].chain.lock();
-            let (at, _) = c.tx_location(&id).unwrap();
-            let pending_spam = spam_ids.iter().filter(|s| !c.has_tx(s)).count();
-            let base = c.block(at).unwrap().base_fee.expect("executed blocks record their base fee").fee(tx.size());
+            let (at, pending_spam, base) = {
+                let c = vals[0].chain.lock();
+                let (at, _) = c.tx_location(&id).unwrap();
+                (at, spam_ids.iter().filter(|s| !c.has_tx(s)).count(), c.block(at).unwrap().base_fee.expect("executed blocks record their base fee").fee(tx.size()))
+            };
             let charged = base + tx.tip;
             assert!(at - sent_at <= CONFIRM_BLOCKS, "honest tx {k} sent at #{sent_at} confirmed at #{at}: more than {CONFIRM_BLOCKS} blocks");
             assert!(charged <= tx.fee, "charged {charged}, more than the {} it offered", tx.fee);
             assert!(pending_spam > 0, "the spam backlog was still pending when honest tx {k} confirmed");
             report.push(format!("tx {k}: sent #{sent_at}, in #{at} ({} blocks), charged {charged} drops (offered {}, floor {}), {pending_spam} spam txs still waiting", at - sent_at, tx.fee, floor(tx.size()) + tx.tip));
-            drop(c);
             let h = max_height(&vals);
             wait_for_height(&context, &vals, h + 2).await;
         }
