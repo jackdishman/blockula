@@ -4,3 +4,5 @@ target
 .scratch-home
 .vercel
 .env*
+# Generated at publish time (scripts/mcp-shrinkwrap.mjs)
+mcp/npm-shrinkwrap.json

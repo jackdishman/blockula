@@ -60,4 +60,13 @@ jobs:
             echo "$1@$version didn't appear on the registry" >&2; exit 1
           }
           publish @blockula/sdk
+          # Pin the MCP's whole dependency tree for `npx` users (audit F75): npm-shrinkwrap.json
+          # from the reviewed lockfile, with the SDK tarball's integrity as the registry reports it.
+          # A dry run hasn't published the SDK, so its entry carries no integrity there.
+          if [ "$DRY_RUN" = true ] && ! npm view "@blockula/sdk@$version" version >/dev/null 2>&1; then
+            node scripts/mcp-shrinkwrap.mjs
+          else
+            node scripts/mcp-shrinkwrap.mjs --check --sdk-integrity "$(npm view "@blockula/sdk@$version" dist.integrity)"
+          fi
+          npm pack -w @blockula/mcp --dry-run --json | node -e 'const f = JSON.parse(require("fs").readFileSync(0, "utf8"))[0].files.map((x) => x.path); if (!f.includes("npm-shrinkwrap.json")) { console.error("the MCP tarball lacks npm-shrinkwrap.json"); process.exit(1); }'
           publish @blockula/mcp
