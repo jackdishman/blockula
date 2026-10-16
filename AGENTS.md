@@ -8,7 +8,7 @@
 
 - **Amounts are strings in FANG** (`"1.5"`), or bigint drops. Never JS floats.
 - **Recipients can be names.** `send("alice.boo", "1")` works. Prefer names in UI.
-- **Fees are automatic.** `wallet.send` / `registerName` set `fee` to the base fee (priced per byte, burned; it rises while blocks are full, see `/api/fees`) plus the tip. Only the including block's base fee and the tip are charged. Opening a new account burns 0.1 FANG on top.
+- **Fees are automatic.** `wallet.send` / `registerName` set `fee` to the base fee (priced per byte, burned; it rises while blocks are full, see `/api/fees`) plus the tip. Only the including block's base fee and the tip are charged. A tip is optional, at most 20× the base fee, and paid from transferable FANG. Opening a new account burns 0.1 FANG on top.
 - **User wallets = passkeys.** Use `createPasskeyWallet` / `unlockPasskeyWallet`. Never ask a user for a seed.
 - **Agent wallets = a local key** at `~/.blockula/agent-wallet.json` (mode 600). The right way to spend a user's money:
   1. `create_wallet` → give the user the `key_id`.
@@ -59,7 +59,7 @@ Reads: `client.staking(account)`, `client.proposals()`, `client.proposal(id)`, `
 | POST | `/api/tx` | submit a signed tx: JSON, or its wire form as `application/octet-stream` (how ghost txs should travel; they're ~135 KiB) |
 | GET | `/api/account/{address\|name}` | balance, `next_nonce`, names, recent txs (sent by it or naming it), `github`, `familiars`, hunts created/won, `contribution` (Soul, vouches, jury seat, claims, vesting rewards) |
 | GET | `/api/name/{name}` | `status` (`active`, `grace` (expired, only the owner can renew), `reserved`, `available`), owner, `expires_at`, `grace_until`, price and yearly renewal price |
-| GET | `/api/fees` | the base fee for the next 17 blocks (`slots`: flat drops, `rate` in milli-drops per byte, `max_block_bytes`), `suggested` (covers any of them), the floor, the account creation fee |
+| GET | `/api/fees` | the base fee for the next 17 blocks (`slots`: flat drops, `rate` in milli-drops per byte, `max_block_bytes`), `suggested` (covers any of them), `lowest` and `tip_cap_multiple` (a tip is at most that × the base fee), the floor, the account creation fee |
 | GET | `/api/params` | governance parameters (amounts as strings), genesis constants (`epochs_per_year`…), the issuance year (rate, per-epoch mint) |
 | GET | `/api/key/{key_id}` | accounts this key is authorized on |
 | GET | `/api/search/{q}` | `{type, id}` for anything |

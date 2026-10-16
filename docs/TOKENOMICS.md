@@ -15,7 +15,7 @@ FANG is the native token of Blockula. It pays transaction fees, bonds validators
 | Held by keyless system accounts at genesis | 82% (820M FANG), moved only by protocol rules or governance |
 | Founder and foundation | 15% (100M + 50M), vesting on-chain |
 | Issuance | 6% a year, falling 15% a year to a 1.5% floor (reached in year 10). 70% to staked validator pools, 20% to the contribution pool, 10% to the treasury |
-| Fees | The base fee (per byte) is burned. The tip goes to the block proposer |
+| Fees | The base fee (per byte) is burned. The tip (at most 20× the base fee, from transferable FANG) goes to the block proposer |
 | Admin keys | None. Every protocol lever is a governance proposal |
 
 ## 1. Genesis allocation

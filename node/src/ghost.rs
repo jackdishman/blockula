@@ -518,6 +518,8 @@ pub(crate) fn apply_unsigned(state: &mut State, j: &mut Journal, tx: &Tx, chain_
     check_size(state, tx)?;
     check_instance(state, b)?;
     let (base, floor) = unsigned_floor(state, tx, height).ok_or_else(|| anyhow!("fee overflows"))?;
+    // The same tip cap as signed txs (`tip_cap_multiple` × the base fee).
+    crate::econ::check_tip(state, tx.tip, base, height)?;
     if tx.fee < floor {
         bail!("fee too low: an unsigned ghost tx pays exactly its fee (it's in the proof's value balance), which must cover the base fee {base}, the tip {} and ghost_verify_fee {} ({floor} drops), but it's {}", tx.tip, state.chain_params.ghost_verify_fee, tx.fee);
     }
