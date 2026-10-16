@@ -3780,6 +3780,51 @@ mod audit {
         assert_eq!(Chain::open(&home).unwrap().state.root(), root);
     }
 
+    /// Audit F31: replay (crash recovery, rebuilding the database from the logs) compared a failed
+    /// tx's reason byte for byte with the log, so a release that reworded an error message made
+    /// every node holding such a block refuse to open. It compares the kind of outcome now (the
+    /// state root, checked after each block, is what must match); a tx that applies where the
+    /// log says it failed still stops it.
+    #[test]
+    fn replay_compares_outcomes_not_failure_wording() {
+        let (home, mut c) = fresh("reword");
+        let a = Keys::from_seed([8u8; 32]);
+        c.faucet(&a.address(), 10 * DROPS_PER_FANG).unwrap();
+        c.produce_block().unwrap();
+        let pay = |c: &Chain, nonce: u64| signed_fee(c, &a.address(), &a, nonce, Action::Transfer { to: c.me().unwrap(), amount: 6 * DROPS_PER_FANG }, None);
+        let (t1, t2) = (pay(&c, 0), pay(&c, 1));
+        let failing = t2.id();
+        c.produce_block_with(vec![t1, t2]).unwrap();
+        let (h, i) = c.tx_location(&failing).unwrap();
+        assert!(c.block(h).unwrap().failed[&i].starts_with("insufficient"));
+        let (root, height) = (c.state.root(), c.height());
+        drop(c);
+        // Edits the block log in place (same length, so every offset stays put).
+        let edit = |from: &str, to: &str| {
+            assert_eq!(from.len(), to.len());
+            let dir = home.join("blocks");
+            let seg = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).find(|p| fs::read(p).unwrap().windows(from.len()).any(|w| w == from.as_bytes())).unwrap();
+            let bytes = fs::read(&seg).unwrap();
+            let at = bytes.windows(from.len()).position(|w| w == from.as_bytes()).unwrap();
+            let mut out = bytes.clone();
+            out[at..at + from.len()].copy_from_slice(to.as_bytes());
+            fs::write(&seg, out).unwrap();
+        };
+        // A release that words the failure differently rebuilds the database just the same.
+        edit("\"insufficient", "\"INSUFFICIENT");
+        fs::remove_file(home.join(store::DB_FILE)).unwrap();
+        let c = Chain::open(&home).unwrap();
+        assert_eq!((c.state.root(), c.height(), c.replayed), (root, height, height));
+        assert!(c.block(h).unwrap().failed[&i].starts_with("INSUFFICIENT"), "the log's record is what reads show");
+        drop(c);
+        // The log saying the other tx failed is a divergence.
+        edit(&format!("\"failed\":{{\"{i}\""), &format!("\"failed\":{{\"{}\"", i - 1));
+        fs::remove_file(home.join(store::DB_FILE)).unwrap();
+        let err = format!("{:#}", Chain::open(&home).err().unwrap());
+        assert!(err.contains(&format!("tx {} applied, but the log recorded it failing", i - 1)), "{err}");
+        fs::remove_dir_all(home).ok();
+    }
+
     #[test]
     fn session_key_bounds_and_names() {
         let (_h, mut c) = fresh("sess");
@@ -4051,6 +4096,42 @@ mod audit {
         assert_eq!((b.txs.len(), b.skipped.len(), b.failed.len()), (79 + 64, 0, 0));
         assert_eq!(c.state.burned - burned, b.txs.iter().map(|t| t.charge().unwrap() - t.tip).sum::<u64>(), "every queued tx paid");
         assert!(c.mempool.is_empty());
+    }
+
+    /// The validator-duty lane (F32/F56; the full-mempool case is in beacon/tests.rs): only a
+    /// validator's own duties, signed by its consensus key, at most `DUTY_LANE_PER_KIND` queued
+    /// per validator and kind, forgotten once they leave the mempool.
+    #[test]
+    fn the_duty_lane_is_bounded_and_only_takes_validators_duties() {
+        let (_h, mut c) = fresh("lane");
+        let gh = c.genesis_hash.clone();
+        let me = c.me().unwrap();
+        let vk = c.keys.as_ref().unwrap().clone_keys();
+        let stranger = Keys::from_seed([7; 32]);
+        fund(&mut c, &stranger, 100 * DROPS_PER_FANG);
+        c.produce_block_with(vec![]).unwrap();
+        let commit = Action::BeaconCommit { epoch: 2, commitment: "ab".repeat(32) };
+        let duty = unsigned_as(&gh, &me, &vk, 0, 0, commit.clone());
+        assert_eq!(c.duty_slot(&duty), Some((me.clone(), "beacon_commit")));
+        // Another key, another action, or the validator's key for an account it doesn't act for:
+        // no duty.
+        assert_eq!(c.duty_slot(&unsigned_as(&gh, &stranger.address(), &stranger, 0, 0, commit.clone())), None);
+        assert_eq!(c.duty_slot(&unsigned_as(&gh, &me, &vk, 0, 0, Action::Transfer { to: stranger.address(), amount: 1 })), None);
+        assert_eq!(c.duty_slot(&unsigned_as(&gh, &stranger.address(), &vk, 0, 0, commit.clone())), None);
+        // At most DUTY_LANE_PER_KIND per validator and kind.
+        for i in 0..DUTY_LANE_PER_KIND {
+            c.lane.insert(format!("queued-{i}"), (me.clone(), "beacon_commit"));
+        }
+        assert_eq!(c.duty_slot(&duty), None);
+        let reveal = unsigned_as(&gh, &me, &vk, 0, 0, Action::BeaconReveal { epoch: 1, secret: "cd".repeat(32) });
+        assert_eq!(c.duty_slot(&reveal), Some((me.clone(), "beacon_reveal")));
+        c.lane.clear();
+        // Queued in the lane, then included and forgotten.
+        let id = c.submit(duty).unwrap();
+        assert_eq!((c.lane.len(), c.regular_len()), (1, 0));
+        assert!(c.lane.contains_key(&id));
+        c.produce_block().unwrap();
+        assert!(c.has_tx(&id) && c.lane.is_empty() && c.mempool.is_empty());
     }
 
     /// Dropping a queued tx takes its sender's later txs along (they'd wait behind a nonce gap
