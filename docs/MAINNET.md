@@ -616,6 +616,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
 - **Done when:** renewal, transfer and pricing are decided (DEC-11) and built before genesis.
 - **Effort:** M.
 - ✅ **Wave 3 (P-ECON):** names cost `name_price_3/4/5` (100, 25, 5 FANG, to the treasury) and last a year; `RenewName` adds years at 20% of the price each, at most 10 years ahead; an expired name doesn't resolve, and for 30 days only its owner can renew it, then anyone can register it; lapsed records are swept a few per block. `TransferName` and `ReleaseName` work; genesis reserved names can't be registered. Pending: assigning reserved names by governance (DEC-11).
+- ✅ **Audit F34:** an unsolicited `TransferName` could make any name, registered earlier than the victim's own, the victim's displayed identity (or, eight of them expiring, hide it). A transfer is now an offer the recipient must accept (a `TransferName` to itself), and accepting re-stamps `registered_at`, so an accepted name never ranks ahead of names the account registered itself (`a_name_changes_hands_only_when_its_recipient_accepts`). `/api/name` shows `offered_to`; the SDK has `acceptName`/`withdrawNameOffer`, the CLI `blockula name accept|withdraw`.
 
 **SF-10. Full nodes can't use p2p.**
 - **Missing:** discovery only admits tracked validators (PLAN.md "Network and sync"), so full nodes sync and forward over HTTP. Every testnet validator's `http_addr` is the one public RPC (`deploy/launch.sh:74-76`).

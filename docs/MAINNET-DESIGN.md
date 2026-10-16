@@ -66,7 +66,7 @@ Action tags 0–29 keep their meaning. New tags are reserved here so packages ne
 | 43 | `MultisigPropose { action }` | P-GOV |
 | 44 | `MultisigApprove { id }` | P-GOV |
 | 45 | `RenewName { name, years }` | P-ECON |
-| 46 | `TransferName { name, to }` | P-ECON |
+| 46 | `TransferName { name, to }`: the owner offers it to `to` (again: replaces the offer; to itself: withdraws it); the account it was offered to accepts it (`to` itself) | P-ECON |
 | 47 | `ReleaseName { name }` | P-ECON |
 | 48 | `ClaimDistribution { distribution_id, amount, proof }` | P-GOV |
 | 49 | `AttestRevert { claim_id, revert_sha }` | P-BEACON |

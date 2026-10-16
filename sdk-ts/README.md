@@ -72,11 +72,11 @@ await wallet.vote(7, true, "10", 2);                          // aye, 10 FANG lo
 await wallet.unlock();                                        // release vote locks that ended
 
 await wallet.renewName("vlad", 2);                            // names are registered a year at a time
-await wallet.transferName("vlad", "alice.boo");
+await wallet.transferName("vlad", "alice.boo");               // an offer: alice.boo accepts with acceptName("vlad")
 await wallet.multisigCreate([phoneKeyId, laptopKeyId, kitKeyId], 2);
 ```
 
-- Every tag 30–49 has a helper: `delegate`, `undelegate`, `redelegate`, `withdrawUnbonded`, `updateValidator`, `unjail`, `propose`, `vote`, `unlock`, `multisigCreate` / `multisigPropose` / `multisigApprove`, `renewName`, `transferName`, `releaseName`, `claimDistribution`, and the low-level validator ones (`reportEquivocation`, `beaconCommit`, `beaconReveal`, `attestRevert`). They check their arguments before signing, resolve `.boo` names to the addresses they sign, and wait for the block.
+- Every tag 30–49 has a helper: `delegate`, `undelegate`, `redelegate`, `withdrawUnbonded`, `updateValidator`, `unjail`, `propose`, `vote`, `unlock`, `multisigCreate` / `multisigPropose` / `multisigApprove`, `renewName`, `transferName` (an offer the recipient takes with `acceptName`; `withdrawNameOffer`), `releaseName`, `claimDistribution`, and the low-level validator ones (`reportEquivocation`, `beaconCommit`, `beaconReveal`, `attestRevert`). They check their arguments before signing, resolve `.boo` names to the addresses they sign, and wait for the block.
 - `proposal.*` builds every `ProposalKind`: `paramChange`, `treasurySpend`, `distribution`, `setRepo`, `grantSoul`, `flagSybil`, `rejectClaim`, `clawback`, `unlinkGithub`, `refundHunt`, `scheduleUpgrade`, `activateFeature`, `deactivateFeature`, `text`. `propose` bonds the chain's `proposal_deposit` unless you pass `deposit`.
 - `convictionWeight(amount, conviction)` is a vote's weight: 0.1× with no lock, then 1×–6× for 1, 2, 4, 8, 16 or 32 lock periods (`CONVICTION_PERIODS`).
 - Reads: `client.staking(account)`, `client.proposals()`, `client.proposal(id)`, `client.params()`, `client.fees()`, `client.distribution(id)`, `client.multisig(account)`. `stakeSummary`, `proposalSummary` and `paramsOf` turn them into stable shapes, tolerating renamed or missing fields.

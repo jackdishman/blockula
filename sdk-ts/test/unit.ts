@@ -106,6 +106,8 @@ const cases: [string, () => Promise<unknown>, Action][] = [
   ["multisig approve", () => me.multisigApprove(3), { type: "multisig_approve", id: 3 }],
   ["renew a name", () => me.renewName("Vlad.boo", 2), { type: "renew_name", name: "vlad", years: 2 }],
   ["transfer a name", () => me.transferName("vlad", "bob.boo"), { type: "transfer_name", name: "vlad", to: BOB }],
+  ["accept a name", () => me.acceptName("Vlad.boo"), { type: "transfer_name", name: "vlad", to: me.account }],
+  ["withdraw a name offer", () => me.withdrawNameOffer("vlad"), { type: "transfer_name", name: "vlad", to: me.account }],
   ["release a name", () => me.releaseName("vlad.boo"), { type: "release_name", name: "vlad" }],
   ["claim a distribution", () => me.claimDistribution(1, "50", ["ab".repeat(32)]), { type: "claim_distribution", distribution_id: 1, amount: (50n * FANG).toString(), proof: ["ab".repeat(32)] }],
   ["attest a revert", () => me.attestRevert(4, "ef".repeat(20)), { type: "attest_revert", claim_id: 4, revert_sha: "ef".repeat(20) }],

@@ -515,7 +515,11 @@ assert.ok(verifyProof(raw.root, NAMESPACES.ACCOUNTS, alice.address, hexToBytes(r
 assert.ok(!verifyProof(raw.root, NAMESPACES.ACCOUNTS, bob.address, hexToBytes(raw.value as string), raw.proof));
 console.log(`✓ proven reads: ${provenAlice.balance} drops at block #${provenAlice.height}, root ${provenAlice.root.slice(0, 12)}…`);
 
-const moved = await alice.transferName(`${name}.boo`, bob.address);
+const offered = await alice.transferName(`${name}.boo`, bob.address);
+console.log("✓", offered.summary);
+assert.equal(await client.resolve(`${name}.boo`), alice.address, "an offer: still alice's");
+assert.equal((await client.name(name)).offered_to?.address, bob.address);
+const moved = await bob.acceptName(name);
 console.log("✓", moved.summary);
 assert.equal(await client.resolve(`${name}.boo`), bob.address);
 await assert.rejects(alice.releaseName(name), /belongs to/);
