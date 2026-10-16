@@ -21,15 +21,15 @@
 //!    at once), it signs again after [`Timing::escape_ms`], relying on the record: the one case a
 //!    restored disk could still double-sign, which is why OPERATIONS.md says never to restore one.
 //!    Silence alone isn't that case (audit F18): a node stuck in an epoch the network has left, or
-//!    cut off from it, sees no certificates either. So the escape fails safe: it also needs peers
+//!    cut off from it, sees no certificates either. So the escape fails safe. It also needs peers
 //!    outside consensus to show the network standing still where this node is
 //!    ([`Protection::note_network`]: every HTTP peer that answers reports a tip at or below this
 //!    node's height, and nobody's tip, this node's included, moved for most of the escape time,
-//!    [`Timing::standstill_ms`]; see [`network_view`]), or the operator to name the height the network halted at
-//!    (`--network-halted-at`, counted only while no peer answers), and no sign of a later epoch
-//!    ([`Protection::note_later_epoch`]: peers' consensus traffic or tips). Without them the node
-//!    keeps abstaining: a missed vote, never a double-sign. And it signs only views above the
-//!    newest finalized block it executed, whatever simplex replayed.
+//!    [`Timing::standstill_ms`]; see [`network_view`]), or the operator to name the height the
+//!    network halted at (`--network-halted-at`, counted only while no peer answers); and no sign
+//!    of a later epoch ([`Protection::note_later_epoch`]: peers' consensus traffic or tips).
+//!    Without them the node keeps abstaining: a missed vote, never a double-sign. And it signs
+//!    only views above the newest finalized block it executed, whatever simplex replayed.
 //! 3. **Doppelganger detection.** A vote or certificate carrying this key's signature on a
 //!    message the record doesn't have, in a view an earlier, stopped instance can't have reached,
 //!    means another instance is signing with this key. The node then signs nothing more and halts
@@ -184,8 +184,8 @@ impl Timing {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Gate {
     /// Watching the network since `since` (ms); `baseline` is the newest certificate view seen
-    /// once the startup settled. `stuck`: the escape time passed without the network confirmed
-    /// (logged once).
+    /// once the startup settled. `stuck`: the escape time passed, but nothing showed the network
+    /// halted here (logged once).
     Watching { since: u64, baseline: Option<u64>, stuck: bool },
     /// Signing views above `above`.
     Open { above: u64 },
@@ -373,7 +373,7 @@ impl Protection {
     }
 
     /// Whether the restart rule is watching the network in an epoch this key votes in (when
-    /// [`Protection::confirm_network`] is worth asking peers for).
+    /// peers are worth asking for [`Protection::note_network`]).
     pub fn watching(&self) -> bool {
         let g = self.inner.lock();
         g.gates.iter().any(|(e, gate)| matches!(gate, Gate::Watching { .. }) && *e >= g.newest_epoch && g.me.get(e).copied().flatten().is_some())
@@ -626,7 +626,6 @@ impl Protection {
     /// that isn't [`NetworkView::Here`] (or no answer) withdraws it. `halted_at`: the operator's
     /// `--network-halted-at`, which stands in for peers while none answers and this node's height
     /// is that one (peers that answer decide).
-    #[allow(clippy::too_many_arguments)]
     pub fn note_network(&self, params: &crate::chain::Params, height: u64, claimed: u64, tips: &[u64], halted_at: Option<u64>, now_ms: u64) {
         let view = match network_view(params, height, claimed, tips) {
             None if halted_at == Some(height) => network_view(params, height, claimed, &[height]),
