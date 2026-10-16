@@ -878,6 +878,146 @@ fn a_multisig_owners_validator_still_signs_its_system_txs() {
     assert!(e.contains("multisig_propose"), "{e}");
 }
 
+// ---- tips (audit F01, F04, F06): the tip is a payment to the proposer, not a burn
+
+impl T {
+    /// `tx_as` with a tip, in a block proposed by `proposer` (who gets the tip). `fee` covers
+    /// exactly the base fee and the tip.
+    fn tip_as(&mut self, k: &Keys, from: &str, action: Action, tip: u64, proposer: &str) -> Result<u64> {
+        let mut tx = Tx { chain_id: CHAIN.into(), genesis_hash: "00".repeat(32), from: from.into(), nonce: self.st.account(from).nonce, fee: 0, tip, valid_until: self.h + 10, action, memo: String::new(), public_key: hex::encode(k.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+        tx.fee = crate::econ::base_fee(&self.st, self.h, tx.size()) + tip;
+        let base = tx.fee - tip;
+        match self.st.apply(&tx, CHAIN, proposer, self.h)? {
+            Outcome::Applied => Ok(base),
+            Outcome::Failed(e) => bail!(e),
+        }
+    }
+
+    /// The base fee of `action` from `from`, signed by `k`, in the current block.
+    fn base(&self, k: &Keys, from: &str, action: Action) -> u64 {
+        let tx = Tx { chain_id: CHAIN.into(), genesis_hash: "00".repeat(32), from: from.into(), nonce: 0, fee: 0, tip: 0, valid_until: self.h, action, memo: String::new(), public_key: hex::encode(k.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+        crate::econ::base_fee(&self.st, self.h, tx.size())
+    }
+}
+
+/// F01 (a, b): a fully vesting founder used to sign a 0-FANG transfer to itself with a tip of
+/// its whole balance, which a colluding proposer received liquid (the lock void). The tip is now
+/// capped at `tip_cap_multiple` × the base fee, and must come from FANG the sender could
+/// transfer: vesting and vote locks hold it like any transfer. The burned base fee may still come
+/// from locked tokens.
+#[test]
+fn tips_come_from_transferable_fang_and_are_capped() {
+    let mut t = T::new(&[]);
+    let (founder, thief) = (keys(FOUNDER), addr(DAVE));
+    let noop = || Action::Transfer { to: addr(FOUNDER), amount: 0 };
+    assert!(t.err(FOUNDER, Action::Transfer { to: thief.clone(), amount: 500_000 * FANG }).contains("locked"));
+    let (balance, base) = (t.bal(FOUNDER), t.base(&founder, &addr(FOUNDER), noop()));
+    // The PoC: the whole balance as a tip. Refused, nothing charged.
+    let e = t.tip_as(&founder, &addr(FOUNDER), noop(), balance - base, &thief).unwrap_err().to_string();
+    assert!(e.contains("tip too high: at most 20× the base fee"), "{e}");
+    // Within the cap, still not out of locked tokens.
+    let e = t.tip_as(&founder, &addr(FOUNDER), noop(), 10 * base, &thief).unwrap_err().to_string();
+    assert!(e.contains("the tip must come from transferable FANG"), "{e}");
+    assert_eq!((t.bal(FOUNDER), t.bal(DAVE)), (balance, 0), "nothing moved, nothing charged");
+    // Fees (the burned base fee) may still come from locked tokens.
+    t.tip_as(&founder, &addr(FOUNDER), noop(), 0, &thief).unwrap();
+    assert_eq!((t.bal(FOUNDER), t.bal(DAVE)), (balance - base, 0));
+    // Liquid tokens on top of the vesting ones may tip.
+    t.tx(ALICE, Action::Transfer { to: addr(FOUNDER), amount: FANG }).unwrap();
+    let base = t.base(&founder, &addr(FOUNDER), noop());
+    t.tip_as(&founder, &addr(FOUNDER), noop(), 20 * base, &thief).unwrap();
+    assert_eq!(t.bal(DAVE), 20 * base, "the proposer got the tip");
+    assert!(t.tip_as(&founder, &addr(FOUNDER), noop(), 20 * base + 1, &thief).unwrap_err().to_string().contains("tip too high"));
+    // Vote locks hold tips too: CAROL votes all but five base fees' worth of what she holds.
+    let id = t.propose(ALICE, text());
+    let vote = |amount: u64| Action::Vote { proposal_id: id, aye: true, amount, conviction: 1 };
+    let (carol, base) = (t.bal(CAROL), t.base(&keys(CAROL), &addr(CAROL), noop()));
+    t.tx(CAROL, vote(carol - t.base(&keys(CAROL), &addr(CAROL), vote(0)) - 5 * base)).unwrap();
+    let free = crate::econ::transferable(&t.st, &addr(CAROL), t.h);
+    assert_eq!(free, 5 * base);
+    let e = t.tip_as(&keys(CAROL), &addr(CAROL), noop(), free + 1, &thief).unwrap_err().to_string();
+    assert!(e.contains("the tip must come from transferable FANG"), "{e}");
+    let dave = t.bal(DAVE);
+    t.tip_as(&keys(CAROL), &addr(CAROL), noop(), free, &thief).unwrap();
+    assert_eq!(t.bal(DAVE), dave + free);
+    // Governance sets the cap, within its bounds.
+    assert!(t.err(BOB, Action::Propose { kind: param("tip_cap_multiple", 0), deposit: 50 * FANG, title: "no tips".into(), url: String::new() }).contains("must be 1–1000"));
+    let id = t.propose(ALICE, param("tip_cap_multiple", 2));
+    t.vote(ALICE, id, true, 10_000, 1).unwrap();
+    t.finish(id);
+    assert_eq!(t.st.chain_params.tip_cap_multiple, 2);
+    let base = t.base(&keys(BOB), &addr(BOB), noop());
+    assert!(t.tip_as(&keys(BOB), &addr(BOB), noop(), 2 * base + 1, &thief).unwrap_err().to_string().contains("at most 2× the base fee"));
+    t.tip_as(&keys(BOB), &addr(BOB), noop(), 2 * base, &thief).unwrap();
+}
+
+/// F01 (b): one owner key of an M-of-N multisig used to empty the account through the tip of a
+/// `MultisigPropose`, the proposal itself never reaching its threshold. A multisig's owner keys
+/// act alone in such txs, so they carry no tip; session keys still tip within their limit.
+#[test]
+fn a_multisig_owner_key_cant_tip() {
+    let mut t = T::new(&[]);
+    let alice = addr(ALICE);
+    let (k1, k2) = (keys(ALICE), keys(11));
+    t.tx(ALICE, Action::AddKey { key_id: kid(11), label: "device".into(), role: KeyRole::Owner }).unwrap();
+    t.tx(ALICE, Action::MultisigCreate { owners: vec![kid(ALICE), kid(11)], threshold: 2 }).unwrap();
+    let propose = || Action::MultisigPropose { action: Box::new(Action::Transfer { to: addr(BOB), amount: 1 }) };
+    let (balance, thief) = (t.bal(ALICE), addr(DAVE));
+    for tip in [1, t.base(&k2, &alice, propose())] {
+        let e = t.tip_as(&k2, &alice, propose(), tip, &thief).unwrap_err().to_string();
+        assert!(e.contains("is a multisig: its owner keys' txs carry no tip"), "{e}");
+    }
+    assert_eq!((t.bal(ALICE), t.bal(DAVE)), (balance, 0));
+    // Without a tip it's an ordinary proposal and approval.
+    let proposed = t.tip_as(&k2, &alice, propose(), 0, &thief).unwrap();
+    assert!(t.tip_as(&k1, &alice, Action::MultisigApprove { id: 0 }, 1, &thief).unwrap_err().to_string().contains("carry no tip"));
+    let approved = t.tip_as(&k1, &alice, Action::MultisigApprove { id: 0 }, 0, &thief).unwrap();
+    assert_eq!((t.bal(ALICE), t.bal(DAVE)), (balance - proposed - approved - 1, 0), "base fees and the approved drop");
+    // A session key (approved by both) tips within its limit, which counts the tip.
+    let agent = keys(50);
+    let add = Action::AddKey { key_id: kid(50), label: "agent".into(), role: KeyRole::Session { limit: FANG, period_blocks: 100, expires_at: t.h + 1_000 } };
+    t.tx_as(&k1, &alice, Action::MultisigPropose { action: Box::new(add) }).unwrap();
+    t.tx_as(&k2, &alice, Action::MultisigApprove { id: 1 }).unwrap();
+    t.tip_as(&agent, &alice, Action::Transfer { to: addr(BOB), amount: 1 }, 5, &thief).unwrap();
+    assert_eq!(t.bal(DAVE), 5);
+}
+
+/// F04, F06 (and F01 c): a validator's consensus key signs its system txs for its owner (SF-13),
+/// and the owner pays. It used to set any tip, so a stolen hot key moved the cold owner's whole
+/// balance to the proposer (itself, in its own slot), through a multisig owner's threshold and
+/// a vesting owner's lock alike. Those txs now carry no tip: the owner pays the base fee only.
+#[test]
+fn a_consensus_key_cant_tip_its_owners_fang() {
+    let mut t = T::new(&[]);
+    let (ck, owner, hot) = (keys(VALIDATORS[2]), addr(OWNER), addr(VALIDATORS[2]));
+    let terms = || Action::UpdateValidator { commission_bps: 0, p2p_addr: String::new(), http_addr: String::new() };
+    let attest = || Action::AttestClaim { claim_id: 9, ok: true, merge_sha: "ab".repeat(20), note: String::new() };
+    let commit = || Action::BeaconCommit { epoch: 0, commitment: "cd".repeat(32) };
+    let (balance, hot_balance) = (t.bal(OWNER), t.bal(VALIDATORS[2]));
+    // F06's PoC: a no-op `UpdateValidator` with the owner's balance as the tip, in the hot key's slot.
+    let base = t.base(&ck, &owner, terms());
+    let e = t.tip_as(&ck, &owner, terms(), balance - base, &hot).unwrap_err().to_string();
+    assert!(e.contains("tip too high"), "{e}");
+    for (action, tip) in [(terms(), 20 * base), (terms(), 1), (attest(), base), (commit(), 1)] {
+        let e = t.tip_as(&ck, &owner, action, tip, &hot).unwrap_err().to_string();
+        assert!(e.contains("consensus key signs system txs") && e.contains("without a tip"), "{e}");
+    }
+    assert_eq!((t.bal(OWNER), t.bal(VALIDATORS[2])), (balance, hot_balance), "nothing moved, nothing charged");
+    // Without a tip: the owner pays the base fee, the hot key's account gets nothing.
+    t.tip_as(&ck, &owner, terms(), 0, &hot).unwrap();
+    assert_eq!((t.bal(OWNER), t.bal(VALIDATORS[2])), (balance - base, hot_balance));
+    // F04: a multisig owner, and an owner whose FANG is all vesting, fare the same.
+    t.tx(OWNER, Action::MultisigCreate { owners: vec![kid(OWNER)], threshold: 1 }).unwrap();
+    let e = t.tip_as(&ck, &owner, commit(), 1, &hot).unwrap_err().to_string();
+    assert!(e.contains("without a tip"), "{e}");
+    let vesting = crate::chain::Lock { id: crate::econ::VESTING_LOCK.into(), amount: crate::chain::LockAmount::Vesting { total: 1_000_000 * FANG, start: 0, cliff: 10_000, end: 20_000 }, reason: "operator grant".into() };
+    t.st.accounts.get_mut(&owner).unwrap().locks.push(vesting);
+    let e = t.tip_as(&ck, &owner, attest(), 1, &hot).unwrap_err().to_string();
+    assert!(e.contains("without a tip"), "{e}");
+    // The hot key's own account (its fee float) is its own to tip from.
+    t.tip_as(&ck, &hot, Action::Transfer { to: addr(ALICE), amount: FANG }, 1, &addr(VALIDATORS[0])).unwrap();
+}
+
 #[test]
 fn chains_without_admins_have_no_admin_levers() {
     let mut t = T::new(&[]);

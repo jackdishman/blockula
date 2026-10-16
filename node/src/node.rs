@@ -327,10 +327,20 @@ async fn beacon_duties(chain: Shared, home: PathBuf, block_time: Duration) {
     };
     let mut tick = tokio::time::interval(block_time.max(Duration::from_millis(500)));
     let mut last_error = String::new();
+    let mut waiting = false;
     loop {
         tick.tick().await;
         let mut c = chain.lock();
-        if c.syncing() {
+        // Only verified heights hold the duties back (`Chain::syncing`); say so when they do.
+        if c.syncing() != waiting {
+            waiting = !waiting;
+            if waiting {
+                tracing::warn!(height = c.height(), finalized = c.finalized_tip, "beacon duties wait until this node catches up");
+            } else {
+                tracing::info!(height = c.height(), "caught up; beacon duties resume");
+            }
+        }
+        if waiting {
             continue;
         }
         match crate::beacon::duties(&mut c, &mut secrets) {
@@ -814,14 +824,16 @@ async fn sync_once(chain: &Shared, provider: &consensus::EpochProvider, client: 
     let verifier = provider.epoch_scheme(epoch).ok_or_else(|| anyhow!("no validator set known for epoch {epoch}"))?;
     let body = get_capped(client, &format!("{peer}/api/sync?from={from}&limit={limit}"), MAX_SYNC_RESPONSE).await?;
     let batch: SyncBatch = serde_json::from_slice(&body)?;
-    chain.lock().note_claim(peer, batch.tip);
+    // A peer's claimed tip is display-only, and only noted once its answer checked out.
     if batch.blocks.is_empty() {
         if batch.tip >= from {
             bail!("peer claims height {} but sent nothing", batch.tip);
         }
+        chain.lock().note_claim(peer, batch.tip);
         return Ok(false);
     }
     apply_batch_trusted(chain, &verifier, epoch, &batch, Some(trust))?;
+    chain.lock().note_claim(peer, batch.tip);
     Ok(true)
 }
 
@@ -1100,8 +1112,11 @@ mod tests {
         assert!(liar.contains("sent nothing"), "{liar}");
         let huge = sync_once(&chain, &provider, &client, &format!("http://{addr}/huge"), &trust).await.unwrap_err().to_string();
         assert!(huge.contains("too large"), "{huge}");
-        // Claims never move our finalized tip; only verified certificates do.
+        // Claims never move our finalized tip; only verified certificates do. A claim whose
+        // answer didn't check out isn't even shown, and none holds back validator duties (F11).
         assert_eq!(chain.lock().finalized_tip, 0);
+        assert_eq!(chain.lock().network_height_claimed(), 0);
+        assert!(!chain.lock().syncing());
         std::fs::remove_dir_all(root).ok();
     }
 }

@@ -595,6 +595,19 @@ export function minFee(tx: UnsignedTx): bigint {
   return baseFee(tx, FLOOR_BASE_FEE);
 }
 
+/** The chain's default `tip_cap_multiple` (node/src/params.rs): a tip may be at most this many times the base fee of the block that includes it. */
+export const DEFAULT_TIP_CAP_MULTIPLE = 20;
+
+/**
+ * The most this tx may tip in a block with this base fee (node/src/econ.rs `max_tip`): `multiple` × its base fee. Nodes refuse
+ * a bigger tip. `/api/fees` serves the chain's `tip_cap_multiple` and `lowest`, the base fee a tip fits under in any upcoming block.
+ * Tips are also paid only from transferable FANG (locks hold them), and a multisig's owner keys or a validator's consensus key
+ * acting for its owner can't tip at all.
+ */
+export function maxTip(tx: UnsignedTx, fee: BaseFee = FLOOR_BASE_FEE, multiple: number | bigint = DEFAULT_TIP_CAP_MULTIPLE): bigint {
+  return BigInt(multiple) * baseFee(tx, fee);
+}
+
 /** What the tx is charged in a block with this base fee (node/src/econ.rs `charge`): base fee + tip. Its `fee` must cover it; nothing more is debited. */
 export function txCharge(tx: UnsignedTx, fee: BaseFee = FLOOR_BASE_FEE): bigint {
   return baseFee(tx, fee) + BigInt(tx.tip ?? "0");

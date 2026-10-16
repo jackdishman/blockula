@@ -5,8 +5,9 @@
 //!
 //! **Base fee.** A tx in block `h` is charged `base_fee(h, size) + tip`, at most its `fee`: the
 //! base part (`flat + rate × size`, the rate in milli-drops per byte) is burned and the tip goes to
-//! the proposer. The fee for `h` is fixed when block `h − FEE_LAG` executes (17 =
-//! `MAX_EXEC_LAG + 1`), so a proposer whose state is within the exec lag knows it exactly: the
+//! the proposer. The tip is at most `tip_cap_multiple` × the base fee ([`check_tip`]), and comes
+//! from transferable FANG (see Locks). The fee for `h` is fixed when block `h − FEE_LAG` executes
+//! (17 = `MAX_EXEC_LAG + 1`), so a proposer whose state is within the exec lag knows it exactly: the
 //! state keeps a ring of [`FeeSlot`]s for the last executed height and the 17 after it. Each block
 //! moves the rate toward `target_fullness_bps` of the block-size limit (a full block raises it by
 //! `base_fee_max_change_bps`, an empty one lowers it as much), never below the floor
@@ -32,8 +33,9 @@
 //! **Locks.** `Account::locks` overlap: the largest applies. Transferable balance = liquid −
 //! max(0, largest lock − staked − unbonding), so locked tokens can be staked and delegated, never
 //! moved out. Every tx's action phase is checked ([`check_locks`]): an account may not end it
-//! with less transferable than zero (or less than it had, if fees already took it below). Fees
-//! may come from locked tokens. Staking rewards credited to a vesting account join its lock
+//! with less transferable than zero (or less than it had, if fees already took it below). The
+//! burned base fee may come from locked tokens; the tip, a payment to the proposer, may not
+//! (`State::admit`). Staking rewards credited to a vesting account join its lock
 //! ([`lock_rewards`]). Votes lock with [`lock`]; [`voting_balance`] leaves unvested tokens out.
 //!
 //! **Accounts.** An action that opens an account (a transfer to a new address, a hunt awarded to
@@ -241,9 +243,24 @@ pub fn charge(state: &State, tx: &Tx, height: u64) -> Option<u64> {
     base_fee(state, height, tx.size()).checked_add(tx.tip)
 }
 
-/// The exact fee check (admission and execution): the charge, if `fee` covers it.
+/// The most a tx whose base fee is `base` may tip: `tip_cap_multiple` × `base`. Priority bidding
+/// works within it; one signature can't hand the proposer a balance (audit F01).
+pub fn max_tip(state: &State, base: u64) -> u64 {
+    (base as u128 * state.chain_params.tip_cap_multiple as u128).min(u64::MAX as u128) as u64
+}
+
+/// The tip cap ([`max_tip`]) for a tx whose base fee in block `height` is `base`.
+pub fn check_tip(state: &State, tip: u64, base: u64, height: u64) -> Result<()> {
+    let cap = max_tip(state, base);
+    ensure!(tip <= cap, "tip too high: at most {}× the base fee, {cap} drops at block {height} (base fee {base}), but it tips {tip}", state.chain_params.tip_cap_multiple);
+    Ok(())
+}
+
+/// The exact fee check (admission and execution): the charge, if `fee` covers it and the tip is
+/// within its cap ([`check_tip`]).
 pub fn check_fee(state: &State, tx: &Tx, height: u64) -> Result<u64> {
     let base = base_fee(state, height, tx.size());
+    check_tip(state, tx.tip, base, height)?;
     match base.checked_add(tx.tip) {
         Some(c) if c <= tx.fee => Ok(c),
         _ => bail!("fee too low: this tx costs {} drops at block {height} (base fee {base} + tip {}), but its fee allows {}", base.saturating_add(tx.tip), tx.tip, tx.fee),
@@ -263,6 +280,18 @@ pub fn suggested(state: &State) -> FeeSlot {
             ghost_max_tx_bytes: a.ghost_max_tx_bytes.min(s.ghost_max_tx_bytes),
             ghost_max_block_bytes: a.ghost_max_block_bytes.min(s.ghost_max_block_bytes),
         },
+    }))
+    .unwrap_or_else(|| FeeSlot::floor(&state.chain_params))
+}
+
+/// The lowest flat part and rate among the slots fixed after the last executed height (`/api/fees`
+/// serves it as `lowest`): a tip within `tip_cap_multiple` × the base fee at it fits the cap
+/// ([`check_tip`]) in any of those blocks.
+pub fn lowest(state: &State) -> FeeSlot {
+    let upcoming = state.econ.fees.iter().skip(1);
+    upcoming.fold(None, |acc: Option<FeeSlot>, s| Some(match acc {
+        None => *s,
+        Some(a) => FeeSlot { flat: a.flat.min(s.flat), rate: a.rate.min(s.rate), ..a },
     }))
     .unwrap_or_else(|| FeeSlot::floor(&state.chain_params))
 }

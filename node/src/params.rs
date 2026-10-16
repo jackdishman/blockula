@@ -115,6 +115,9 @@ chain_params! { |day, epoch|
     account_creation_fee: FANG / 10, [0, 100 * FANG];
     /// How far ahead a tx's `valid_until` may be (an hour of blocks).
     max_tx_validity_blocks: day / 24, [10, day];
+    /// Most a tx may tip, as a multiple of its base fee in the block that includes it: enough to
+    /// bid for priority, never enough for one signature to move a balance to the proposer.
+    tip_cap_multiple: 20, [1, 1_000];
 
     // ---- issuance (3.6): rate in ppm of the supply per year ----
     issuance_initial_ppm: 60_000, [5_000, 200_000];

@@ -1123,12 +1123,14 @@ impl State {
             // SF-13: a validator's consensus key may sign its system txs for its owner, who pays.
             None => (crate::staking::system_tx_key(self, tx, &sender, &signer).ok_or_else(|| anyhow!("this key isn't authorized on {}", short(&sender)))?, true),
         };
-        // The block's base fee, fixed 17 blocks ahead (econ.rs), plus the tip.
+        // The block's base fee, fixed 17 blocks ahead (econ.rs), plus the tip (capped there).
         let charge = crate::econ::check_fee(self, tx, height)?;
         let acct = self.account(&sender);
         if tx.nonce != acct.nonce {
             bail!("bad nonce: expected {}, got {}", acct.nonce, tx.nonce);
         }
+        // What a prepaid distribution claim adds to the sender's free FANG before the fee phase.
+        let mut prepaid = 0i128;
         if acct.balance < charge {
             // A distribution claim may pay its fee, and the creation fee of the account it opens,
             // out of what it claims, once the claim itself checks out (governance.rs).
@@ -1137,9 +1139,29 @@ impl State {
                 Err(e) if matches!(tx.action, Action::ClaimDistribution { .. }) => bail!("insufficient balance for the fee: has {}, needs {}, and the claim can't pay it: {e}", fmt_fang(acct.balance), fmt_fang(charge)),
                 Err(_) => bail!("insufficient balance for the fee: has {}, needs {}", fmt_fang(acct.balance), fmt_fang(charge)),
             };
-            let need = charge.saturating_add(self.creation_fee_for(&sender));
+            let opening = self.creation_fee_for(&sender);
+            let need = charge.saturating_add(opening);
             if acct.balance.saturating_add(claim) < need {
                 bail!("insufficient balance for the fee: has {} and claims {}, needs {}", fmt_fang(acct.balance), fmt_fang(claim), fmt_fang(need));
+            }
+            prepaid = claim as i128 - opening as i128;
+        }
+        // The tip is a payment to the proposer, not a burn (audit F01): only a signer that could
+        // move the account's FANG may pay one, and only out of FANG it could move.
+        if tx.tip > 0 {
+            // SF-13: a consensus key only signs its owner's system txs; it never moves the owner's FANG.
+            if consensus_key {
+                bail!("a validator's consensus key signs system txs for {} without a tip (tip must be 0)", short(&sender));
+            }
+            // SF-11: a multisig's owner key acts alone here (a proposal or one approval), so it
+            // can't pay anyone on the account's behalf.
+            if key.role == KeyRole::Owner && self.governance.multisigs.contains_key(&sender) {
+                bail!("{} is a multisig: its owner keys' txs carry no tip (tip must be 0)", short(&sender));
+            }
+            // Locked tokens may pay the burned base fee, never the tip (3.7).
+            let free = crate::econ::free(self, &sender, height) + prepaid;
+            if tx.tip as i128 > free {
+                bail!("the tip must come from transferable FANG: {} can move {} now (locked tokens may pay the base fee, not a tip)", short(&sender), fmt_fang(free.clamp(0, u64::MAX as i128) as u64));
             }
         }
         if let KeyRole::Session { limit, period_blocks, expires_at } = key.role {
@@ -1603,6 +1625,24 @@ impl State {
     }
 }
 
+/// Replay's check of a logged tx (`Chain::replay`): it must apply or fail as the log recorded
+/// (`recorded`: its failure reason, if it failed). Only the kind of outcome is compared: a failure
+/// reason is the action's error message, which a later release may word differently, and it
+/// isn't consensus state (the state root, checked after the block, is what replay must match).
+fn check_replayed(height: u64, i: usize, outcome: &Outcome, recorded: Option<&String>) -> Result<()> {
+    match (outcome, recorded) {
+        (Outcome::Applied, None) => Ok(()),
+        (Outcome::Failed(now), Some(then)) => {
+            if now != then {
+                tracing::debug!(height, tx = i, recorded = %then, now = %now, "a replayed tx failed with another reason (reworded since)");
+            }
+            Ok(())
+        }
+        (Outcome::Applied, Some(then)) => bail!("replaying block {height}: tx {i} applied, but the log recorded it failing ({then})"),
+        (Outcome::Failed(now), None) => bail!("replaying block {height}: tx {i} failed ({now}), but the log recorded it applying"),
+    }
+}
+
 /// `height <= valid_until <= height + max_validity`: a tx past `valid_until` can never execute.
 pub fn check_validity(tx: &Tx, height: u64, max_validity: u64) -> Result<()> {
     if tx.valid_until < height {
@@ -1753,6 +1793,9 @@ pub struct Chain {
     pool: std::collections::HashSet<String>,
     /// Each sender's queued txs: their indexes in `mempool`, in nonce order.
     pending: HashMap<String, Vec<usize>>,
+    /// The validator-duty lane (`staking::duty_of`): queued ids → (validator, kind of duty).
+    /// Outside `MAX_MEMPOOL`, never evicted for a tip, first in proposals (audit F32/F56).
+    lane: HashMap<String, (String, &'static str)>,
     /// Admission's simulated state per recently active sender (see [`Chain::submit_tx`]).
     sims: Sims,
     /// Mirror of the mempool and of recent failures, published for readers.
@@ -2234,6 +2277,7 @@ impl Chain {
             snap,
             disk,
             mempool: vec![],
+            lane: HashMap::new(),
             mempool_ids: vec![],
             pool: Default::default(),
             pending: HashMap::new(),
@@ -2382,14 +2426,20 @@ impl Chain {
     }
 
     /// The network height peers claim: the median of their latest claims, so one lying peer
-    /// can't move it. Display-only (status/health); verified heights come from certificates.
+    /// can't move it. Display-only (status/health read it through `Live`); verified heights come
+    /// from certificates.
+    #[cfg(test)]
     pub fn network_height_claimed(&self) -> u64 {
         self.live.claimed.load(std::sync::atomic::Ordering::Relaxed).max(self.finalized_tip).max(self.height)
     }
 
-    /// Behind the network by more than a few blocks (verified or claimed).
+    /// Behind the network by more than a few blocks, by the finalized height this node verified
+    /// (certificates, marshal's tips: [`Chain::set_finalized_tip`]). Validator duties (beacon,
+    /// evidence, attestations) wait while it's true, so only verified heights may gate them:
+    /// peers' claims are display-only (`/api/status`, `/api/health`), or a majority of lying
+    /// HTTP peers could keep a validator from revealing until it's jailed (audit F11).
     pub fn syncing(&self) -> bool {
-        self.height + SYNC_SLACK < self.network_height_claimed()
+        self.height + SYNC_SLACK < self.finalized_tip
     }
 
     /// A finalized height consensus told us about (certificates, marshal tips).
@@ -2574,13 +2624,7 @@ impl Chain {
         crate::upgrade::check_next_with(&self.state, block.height, self.halt.supported)?;
         for (i, tx) in block.txs.iter().enumerate() {
             let outcome = self.state.apply(tx, &self.genesis.chain_id, &block.proposer, block.height).with_context(|| format!("replaying block {}", block.height))?;
-            let expected = match block.failed.get(&i) {
-                Some(r) => Outcome::Failed(r.clone()),
-                None => Outcome::Applied,
-            };
-            if outcome != expected {
-                bail!("replaying block {}: tx {i} gave {outcome:?}, recorded {expected:?}", block.height);
-            }
+            check_replayed(block.height, i, &outcome, block.failed.get(&i))?;
         }
         let tx_bytes = block.txs.iter().map(Tx::size).chain(block.skipped.iter().copied()).sum();
         self.state.end_block(&BlockInfo { height: block.height, hash: &block.hash, proposer: &block.proposer, view: block.view, parent_view: block.parent_view, skipped: &block.skipped, tx_bytes });
@@ -2864,6 +2908,9 @@ impl Chain {
     }
 
     fn rebuild_pending(&mut self) {
+        // Every removal from the mempool ends here: the lane forgets what left.
+        let pool = &self.pool;
+        self.lane.retain(|id, _| pool.contains(id));
         self.pending.clear();
         // Unsigned ghost txs have no sender (or nonce) to queue under.
         for (i, tx) in self.mempool.iter().enumerate().filter(|(_, t)| !t.is_unsigned()) {
@@ -2971,10 +3018,30 @@ impl Chain {
     /// same checks as [`Chain::submit_tx`], but it never evicts: if the mempool or the sender's
     /// queue is full, it isn't tracked.
     pub fn track_pending(&mut self, tx: Tx) -> Result<()> {
-        if self.mempool.len() >= MAX_MEMPOOL || tx.sender().is_ok_and(|s| self.pending_count(&s) >= MAX_PENDING_PER_SENDER) {
+        let full = self.regular_len() >= MAX_MEMPOOL && self.duty_slot(&tx).is_none();
+        if full || tx.sender().is_ok_and(|s| self.pending_count(&s) >= MAX_PENDING_PER_SENDER) {
             return Ok(());
         }
         self.admit_to_mempool(tx, false).map(|_| ())
+    }
+
+    /// Queued txs outside the validator-duty lane: what `MAX_MEMPOOL` bounds.
+    fn regular_len(&self) -> usize {
+        // The lane only holds queued ids (`rebuild_pending` prunes it), so this never saturates.
+        self.mempool.len().saturating_sub(self.lane.len())
+    }
+
+    /// The lane slot a validator duty would take (`staking::duty_of`), if its validator has one
+    /// free for this kind of duty ([`DUTY_LANE_PER_KIND`]).
+    fn duty_slot(&self, tx: &Tx) -> Option<(String, &'static str)> {
+        let duty = crate::staking::duty_of(&self.state, tx, self.state.params.epoch_of(self.height() + 1))?;
+        (self.lane.values().filter(|d| **d == duty).count() < DUTY_LANE_PER_KIND).then_some(duty)
+    }
+
+    /// The mempool in the order a proposal takes it ([`proposal_order`]): the validator-duty
+    /// lane first, then by tip per byte.
+    pub fn proposal_txs(&self) -> Vec<&Tx> {
+        proposal_order(&self.mempool, |i| self.lane.contains_key(&self.mempool_ids[i]))
     }
 
     fn admit_to_mempool(&mut self, tx: Tx, evict: bool) -> Result<(String, bool)> {
@@ -3008,7 +3075,10 @@ impl Chain {
             }
             self.rebuild_pending();
         }
-        if self.mempool.len() >= MAX_MEMPOOL {
+        // A validator duty (beacon, evidence, attestations) carries no tip, so it would never win a
+        // slot in a full mempool: it takes one in the lane instead (audit F32/F56).
+        let duty = if unsigned { None } else { self.duty_slot(&tx) };
+        if duty.is_none() && self.regular_len() >= MAX_MEMPOOL {
             let victim = if evict { self.eviction_victim(&tx, &sender) } else { Err(anyhow!("mempool is full")) };
             match victim {
                 Ok(idx) => self.evict(idx, next),
@@ -3030,6 +3100,9 @@ impl Chain {
         }
         if !unsigned {
             self.pending.entry(sender).or_default().push(self.mempool.len());
+        }
+        if let Some(d) = duty {
+            self.lane.insert(id.clone(), d);
         }
         self.pool.insert(id.clone());
         self.mp.add(id.clone(), &tx, next);
@@ -3103,9 +3176,10 @@ impl Chain {
 
     /// The tx a full mempool gives up for `tx`: the lowest tip per byte if `tx` pays more (among
     /// equals, the newest arrival). Only another sender's last queued tx can go, so nobody is
-    /// left with a nonce gap, and every queued tx still applies after its predecessors.
+    /// left with a nonce gap, and every queued tx still applies after its predecessors. Validator
+    /// duties in the lane never go.
     fn eviction_victim(&self, tx: &Tx, sender: &str) -> Result<usize> {
-        let tails = self.pending.iter().filter(|(s, _)| s.as_str() != sender).filter_map(|(_, q)| q.last().copied());
+        let tails = self.pending.iter().filter(|(s, _)| s.as_str() != sender).filter_map(|(_, q)| q.last().copied()).filter(|&i| !self.lane.contains_key(&self.mempool_ids[i]));
         let lowest = tails.min_by(|&a, &b| TipRate::of(&self.mempool[a]).cmp(&TipRate::of(&self.mempool[b])).then(b.cmp(&a)));
         match lowest {
             Some(i) if TipRate::of(tx) > TipRate::of(&self.mempool[i]) => Ok(i),
@@ -3399,10 +3473,17 @@ impl OpenCtx<'_> {
 
 pub const MAX_MEMPOOL: usize = 5_000;
 pub const MAX_PENDING_PER_SENDER: usize = 64;
+/// Validator duties (`staking::duty_of`) the mempool queues per validator and kind of duty in a
+/// lane of its own: outside `MAX_MEMPOOL`, never evicted for a higher tip, and first in proposals
+/// (audit F32/F56). A validator owes one commitment and one reveal an epoch, and each fault or
+/// claim is reported or attested once (the chain refuses repeats), so the lane stays small: at
+/// most 2 × 64 validators × 5 kinds × this many txs. Duties past it queue like any tx.
+pub const DUTY_LANE_PER_KIND: usize = 2;
 
-/// Mempool txs in the order a proposal takes them: highest tip per byte first (earlier arrival
-/// first among equals), each sender's txs still in nonce (arrival) order.
-pub fn proposal_order(mempool: &[Tx]) -> Vec<&Tx> {
+/// Mempool txs in the order a proposal takes them: those `first` picks (the validator-duty lane,
+/// by index) ahead of the rest, then the highest tip per byte (earlier arrival first among
+/// equals), each sender's txs still in nonce (arrival) order.
+pub fn proposal_order(mempool: &[Tx], first: impl Fn(usize) -> bool) -> Vec<&Tx> {
     use std::cmp::Reverse;
     use std::collections::{BinaryHeap, VecDeque};
     let mut queues: Vec<VecDeque<usize>> = vec![];
@@ -3419,14 +3500,15 @@ pub fn proposal_order(mempool: &[Tx]) -> Vec<&Tx> {
         });
         queues[q].push_back(i);
     }
-    // Max-heap of each sender's next tx: (rate, earliest arrival, queue).
-    let mut heap: BinaryHeap<(TipRate, Reverse<usize>, usize)> = queues.iter().enumerate().map(|(q, txs)| (TipRate::of(&mempool[txs[0]]), Reverse(txs[0]), q)).collect();
+    // Max-heap of each sender's next tx: (lane, rate, earliest arrival, queue).
+    let key = |i: usize, q: usize| (first(i), TipRate::of(&mempool[i]), Reverse(i), q);
+    let mut heap: BinaryHeap<(bool, TipRate, Reverse<usize>, usize)> = queues.iter().enumerate().map(|(q, txs)| key(txs[0], q)).collect();
     let mut out = Vec::with_capacity(mempool.len());
-    while let Some((_, Reverse(i), q)) = heap.pop() {
+    while let Some((_, _, Reverse(i), q)) = heap.pop() {
         out.push(&mempool[i]);
         queues[q].pop_front();
         if let Some(&next) = queues[q].front() {
-            heap.push((TipRate::of(&mempool[next]), Reverse(next), q));
+            heap.push(key(next, q));
         }
     }
     out
@@ -3701,6 +3783,51 @@ mod audit {
         assert_eq!(Chain::open(&home).unwrap().state.root(), root);
     }
 
+    /// Audit F31: replay (crash recovery, rebuilding the database from the logs) compared a failed
+    /// tx's reason byte for byte with the log, so a release that reworded an error message made
+    /// every node holding such a block refuse to open. It compares the kind of outcome now (the
+    /// state root, checked after each block, is what must match); a tx that applies where the
+    /// log says it failed still stops it.
+    #[test]
+    fn replay_compares_outcomes_not_failure_wording() {
+        let (home, mut c) = fresh("reword");
+        let a = Keys::from_seed([8u8; 32]);
+        c.faucet(&a.address(), 10 * DROPS_PER_FANG).unwrap();
+        c.produce_block().unwrap();
+        let pay = |c: &Chain, nonce: u64| signed_fee(c, &a.address(), &a, nonce, Action::Transfer { to: c.me().unwrap(), amount: 6 * DROPS_PER_FANG }, None);
+        let (t1, t2) = (pay(&c, 0), pay(&c, 1));
+        let failing = t2.id();
+        c.produce_block_with(vec![t1, t2]).unwrap();
+        let (h, i) = c.tx_location(&failing).unwrap();
+        assert!(c.block(h).unwrap().failed[&i].starts_with("insufficient"));
+        let (root, height) = (c.state.root(), c.height());
+        drop(c);
+        // Edits the block log in place (same length, so every offset stays put).
+        let edit = |from: &str, to: &str| {
+            assert_eq!(from.len(), to.len());
+            let dir = home.join("blocks");
+            let seg = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).find(|p| fs::read(p).unwrap().windows(from.len()).any(|w| w == from.as_bytes())).unwrap();
+            let bytes = fs::read(&seg).unwrap();
+            let at = bytes.windows(from.len()).position(|w| w == from.as_bytes()).unwrap();
+            let mut out = bytes.clone();
+            out[at..at + from.len()].copy_from_slice(to.as_bytes());
+            fs::write(&seg, out).unwrap();
+        };
+        // A release that words the failure differently rebuilds the database just the same.
+        edit("\"insufficient", "\"INSUFFICIENT");
+        fs::remove_file(home.join(store::DB_FILE)).unwrap();
+        let c = Chain::open(&home).unwrap();
+        assert_eq!((c.state.root(), c.height(), c.replayed), (root, height, height));
+        assert!(c.block(h).unwrap().failed[&i].starts_with("INSUFFICIENT"), "the log's record is what reads show");
+        drop(c);
+        // The log saying the other tx failed is a divergence.
+        edit(&format!("\"failed\":{{\"{i}\""), &format!("\"failed\":{{\"{}\"", i - 1));
+        fs::remove_file(home.join(store::DB_FILE)).unwrap();
+        let err = format!("{:#}", Chain::open(&home).err().unwrap());
+        assert!(err.contains(&format!("tx {} applied, but the log recorded it failing", i - 1)), "{err}");
+        fs::remove_dir_all(home).ok();
+    }
+
     #[test]
     fn session_key_bounds_and_names() {
         let (_h, mut c) = fresh("sess");
@@ -3722,7 +3849,9 @@ mod audit {
         let (_h, mut c) = fresh("claims");
         assert!(!c.syncing());
         c.note_claim("a", 1_000);
-        assert!(c.syncing(), "behind an honest peer's claim");
+        assert_eq!(c.network_height_claimed(), 1_000, "shown as the network's height");
+        assert!(c.live.syncing(c.height()), "the API reports it");
+        assert!(!c.syncing(), "but a claim never gates validator duties");
         assert_eq!(c.finalized_tip, 0, "claims never move the verified tip");
         // One liar among three can't move the median.
         c.note_claim("a", 2);
@@ -3730,6 +3859,33 @@ mod audit {
         c.note_claim("liar", u64::MAX);
         assert_eq!(c.network_height_claimed(), 2);
         assert!(!c.syncing());
+    }
+
+    /// Audit F11: a majority of a validator's HTTP peers lying about the tip (once, during its
+    /// startup catch-up) used to pin `syncing()` for the life of the process, so it silently
+    /// skipped its beacon reveals (jailed and slashed), evidence and attestations. Duties now
+    /// wait only on heights this node verified.
+    #[test]
+    fn lying_peers_cant_hold_back_validator_duties() {
+        let (_h, mut c) = fresh("liars");
+        c.note_claim("honest", c.height());
+        c.note_claim("liar-1", 1 << 40);
+        c.note_claim("liar-2", 1 << 40);
+        assert_eq!(c.network_height_claimed(), 1 << 40, "two of three peers lie");
+        for _ in 0..20 {
+            c.produce_block_with(vec![]).unwrap();
+            assert!(!c.syncing(), "duties carry on at height {}", c.height());
+        }
+        // A finalized height this node verified (a certificate, marshal's tip) does gate them.
+        let h = c.height();
+        c.set_finalized_tip(h + SYNC_SLACK + 1);
+        assert!(c.syncing());
+        c.set_finalized_tip(h + SYNC_SLACK);
+        assert!(c.syncing(), "the verified tip never goes back");
+        for _ in 0..=SYNC_SLACK {
+            c.produce_block_with(vec![]).unwrap();
+        }
+        assert!(!c.syncing(), "caught up");
     }
 
     #[test]
@@ -3943,6 +4099,42 @@ mod audit {
         assert_eq!((b.txs.len(), b.skipped.len(), b.failed.len()), (79 + 64, 0, 0));
         assert_eq!(c.state.burned - burned, b.txs.iter().map(|t| t.charge().unwrap() - t.tip).sum::<u64>(), "every queued tx paid");
         assert!(c.mempool.is_empty());
+    }
+
+    /// The validator-duty lane (F32/F56; the full-mempool case is in beacon/tests.rs): only a
+    /// validator's own duties, signed by its consensus key, at most `DUTY_LANE_PER_KIND` queued
+    /// per validator and kind, forgotten once they leave the mempool.
+    #[test]
+    fn the_duty_lane_is_bounded_and_only_takes_validators_duties() {
+        let (_h, mut c) = fresh("lane");
+        let gh = c.genesis_hash.clone();
+        let me = c.me().unwrap();
+        let vk = c.keys.as_ref().unwrap().clone_keys();
+        let stranger = Keys::from_seed([7; 32]);
+        fund(&mut c, &stranger, 100 * DROPS_PER_FANG);
+        c.produce_block_with(vec![]).unwrap();
+        let commit = Action::BeaconCommit { epoch: 2, commitment: "ab".repeat(32) };
+        let duty = unsigned_as(&gh, &me, &vk, 0, 0, commit.clone());
+        assert_eq!(c.duty_slot(&duty), Some((me.clone(), "beacon_commit")));
+        // Another key, another action, or the validator's key for an account it doesn't act for:
+        // no duty.
+        assert_eq!(c.duty_slot(&unsigned_as(&gh, &stranger.address(), &stranger, 0, 0, commit.clone())), None);
+        assert_eq!(c.duty_slot(&unsigned_as(&gh, &me, &vk, 0, 0, Action::Transfer { to: stranger.address(), amount: 1 })), None);
+        assert_eq!(c.duty_slot(&unsigned_as(&gh, &stranger.address(), &vk, 0, 0, commit.clone())), None);
+        // At most DUTY_LANE_PER_KIND per validator and kind.
+        for i in 0..DUTY_LANE_PER_KIND {
+            c.lane.insert(format!("queued-{i}"), (me.clone(), "beacon_commit"));
+        }
+        assert_eq!(c.duty_slot(&duty), None);
+        let reveal = unsigned_as(&gh, &me, &vk, 0, 0, Action::BeaconReveal { epoch: 1, secret: "cd".repeat(32) });
+        assert_eq!(c.duty_slot(&reveal), Some((me.clone(), "beacon_reveal")));
+        c.lane.clear();
+        // Queued in the lane, then included and forgotten.
+        let id = c.submit(duty).unwrap();
+        assert_eq!((c.lane.len(), c.regular_len()), (1, 0));
+        assert!(c.lane.contains_key(&id));
+        c.produce_block().unwrap();
+        assert!(c.has_tx(&id) && c.lane.is_empty() && c.mempool.is_empty());
     }
 
     /// Dropping a queued tx takes its sender's later txs along (they'd wait behind a nonce gap
@@ -4313,10 +4505,11 @@ mod v1 {
         c.produce_block_with(vec![short.clone()]).unwrap();
         assert!(c.failure(&short.id()).unwrap().0.contains("fee too low"));
         assert_eq!(c.state.account(&a.address()).nonce, 1);
-        // A tip that overflows the charge is refused too.
+        // A tip past its cap (`tip_cap_multiple` × the base fee; this one would overflow the
+        // charge) is refused too.
         let mut huge = tx(&c, &a, &a.address(), 1, 0, c.height() + 10, Action::Transfer { to: friend, amount: 1 });
         (huge.tip, huge.fee) = (u64::MAX, u64::MAX);
-        assert!(c.submit(huge.sign(&a)).unwrap_err().to_string().contains("fee too low"));
+        assert!(c.submit(huge.sign(&a)).unwrap_err().to_string().contains("tip too high"));
         let root = c.state.root();
         drop(c);
         assert_eq!(Chain::open(&home).unwrap().state.root(), root, "replays identically");
@@ -4442,7 +4635,7 @@ mod v1 {
         for t in [&a0, &a1, &b, &d, &e] {
             c.submit(t.clone()).unwrap();
         }
-        let order: Vec<String> = proposal_order(&c.mempool).iter().map(|t| t.id()).collect();
+        let order: Vec<String> = c.proposal_txs().iter().map(|t| t.id()).collect();
         assert_eq!(order, [&b, &d, &e, &a0, &a1].map(|t| t.id()));
         fs::remove_dir_all(home).ok();
     }

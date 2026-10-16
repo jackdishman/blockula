@@ -1385,6 +1385,28 @@ pub fn system_tx_key(state: &State, tx: &Tx, sender: &str, signer: &str) -> Opti
     Some(KeyRecord { label: "validator consensus key".into(), role: KeyRole::Owner, added_at: rec.registered_at, spent: 0, window_start: 0 })
 }
 
+/// A validator duty (audit F32/F56): a beacon commitment or reveal, equivocation evidence, or a
+/// claim or revert attestation, signed by a validator's consensus key from its own account or its
+/// owner's (SF-13), while the validator is in the active set of `epoch` or the next. Returns the
+/// validator and the kind of duty. A full mempool must not refuse these for want of a tip (they
+/// carry none from an owner's account: `State::admit`), so the mempool queues them in a small
+/// lane of their own and proposals take them first (`Chain::admit_to_mempool`). Mempool policy
+/// only: blocks are verified the same either way.
+pub fn duty_of(state: &State, tx: &Tx, epoch: u64) -> Option<(String, &'static str)> {
+    let kind = match tx.action {
+        Action::BeaconCommit { .. } => "beacon_commit",
+        Action::BeaconReveal { .. } => "beacon_reveal",
+        Action::ReportEquivocation { .. } => "report_equivocation",
+        Action::AttestClaim { .. } => "attest_claim",
+        Action::AttestRevert { .. } => "attest_revert",
+        _ => return None,
+    };
+    let v = validator_of_key(state, &tx.signer_key_id().ok()?)?;
+    let rec = state.validators.get(&v).filter(|r| r.consensus_key == tx.public_key && (tx.from == v || tx.from == r.owner))?;
+    let active = [epoch, epoch + 1].iter().any(|e| state.active_sets.get(e).is_some_and(|s| s.contains(&rec.address)));
+    active.then_some((v, kind))
+}
+
 /// FANG staking holds outside balances: pool stake and unbonding entries.
 pub fn escrow(state: &State) -> u128 {
     let pools: u128 = state.staking.pools.values().map(|p| p.stake as u128).sum();

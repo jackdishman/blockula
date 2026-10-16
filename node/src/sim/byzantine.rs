@@ -437,3 +437,96 @@ fn spam_doesnt_delay_honest_txs_with_a_competitive_tip() {
     });
     std::fs::remove_dir_all(root).ok();
 }
+
+/// Audit F32/F56 on the real consensus path. Validator duties carry no tip, and proposals used to
+/// take them after every tipped tx, so a backlog of tipping txs through the reveal half of an
+/// epoch made every validator miss its beacon reveal (jailed and slashed). Here eight accounts
+/// queue 512 transfers with a tip, ~40 full blocks of 64 KiB (four epochs), while all four
+/// validators run their beacon duties: the duties take the mempool's lane on every node (gossip
+/// included) and lead each proposal, so every epoch's beacon gets all four reveals while the
+/// backlog drains behind them, and nobody is jailed.
+#[test]
+fn validator_duties_lead_a_tipped_backlog() {
+    const SPAMMERS: u8 = 8;
+    const TIP: u64 = 10;
+    let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_env("BLOCKULA_LOG").unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off"))).with_test_writer().try_init();
+    let (root, homes, genesis, seeds) = summon_with("duties", EPOCH_BLOCKS, &[("max_block_bytes", MAX_TX_BYTES as u64)]);
+    let executor = deterministic::Runner::timed(Duration::from_secs(3_000));
+    executor.start(|context| async move {
+        let mut oracle = network(&context, &genesis, &[]).await;
+        let mut vals = vec![];
+        for (i, (home, seed)) in homes.iter().zip(&seeds).enumerate() {
+            vals.push(start(&context, &mut oracle, &genesis, i, 0, home.clone(), PrivateKey::from_seed_bytes(*seed)).await);
+        }
+        for (v, seed) in vals.iter().zip(&seeds) {
+            let (chain, home, seed) = (v.chain.clone(), v.home.clone(), *seed);
+            context.child("beacon").spawn(move |ctx| async move {
+                let mut secrets = crate::beacon::Secrets::open_deterministic(&home, seed).unwrap();
+                loop {
+                    ctx.sleep(Duration::from_millis(500)).await;
+                    let _ = crate::beacon::duties(&mut chain.lock(), &mut secrets);
+                }
+            });
+        }
+        wait_for_height(&context, &vals, 3).await;
+        // The spammers, funded by validator 3.
+        let funder = Keys::from_seed(seeds[3]);
+        let spammers: Vec<Keys> = (0..SPAMMERS).map(|i| Keys::from_seed([70 + i; 32])).collect();
+        let addrs: std::collections::HashSet<String> = spammers.iter().map(|s| s.address()).collect();
+        {
+            let mut c = vals[3].chain.lock();
+            for s in &spammers {
+                let n = c.next_nonce(&funder.address());
+                c.submit(transfer(&genesis, &funder, n, &s.address(), 10 * DROPS_PER_FANG)).unwrap();
+            }
+        }
+        wait_until(&context, "the spammers' funding", || spammers.iter().all(|s| vals.iter().all(|v| v.chain.lock().state.account(&s.address()).balance > 0))).await;
+
+        // Each queues as many transfers as a sender may, tipping, with room for the base fee to rise.
+        let spam_from = max_height(&vals);
+        let mut spam_ids = vec![];
+        for (i, s) in spammers.iter().enumerate() {
+            let mut c = vals[i % vals.len()].chain.lock();
+            for n in 0..crate::chain::MAX_PENDING_PER_SENDER as u64 {
+                let pay = |fee: u64| paying(&genesis, s, n, Action::Transfer { to: funder.address(), amount: 1 }, fee, TIP);
+                spam_ids.push(c.submit(pay(200 * min_fee(pay(0).size()) + TIP)).unwrap());
+            }
+        }
+        println!("  {} tipping txs queued at #{spam_from} (~{} full blocks of backlog)", spam_ids.len(), spam_ids.len() / 12);
+        wait_until(&context, "the backlog to drain", || !vals[0].chain.lock().mempool.iter().any(|t| addrs.contains(&t.from))).await;
+        let drained = max_height(&vals);
+        wait_for_height(&context, &vals, drained + EPOCH_BLOCKS).await;
+
+        let c = vals[0].chain.lock();
+        assert!(spam_ids.iter().all(|id| c.has_tx(id)), "the backlog drained by inclusion");
+        // Each epoch whose reveal half (the second half of the epoch before it) fell inside the
+        // backlog got every reveal, in full blocks.
+        let reveal_half = |e: u64| ((e - 1) * EPOCH_BLOCKS + EPOCH_BLOCKS / 2)..=(e * EPOCH_BLOCKS);
+        let congested: Vec<u64> = (2..).take_while(|e| e * EPOCH_BLOCKS <= drained).filter(|e| *reveal_half(*e).start() > spam_from + 1).collect();
+        assert!(congested.len() >= 2, "the backlog spanned the reveals of epochs {congested:?}");
+        for &e in &congested {
+            let v = &c.state.beacon.values[&e];
+            assert_eq!((v.reveals, v.missed.len()), (4, 0), "epoch {e}'s beacon, revealed under the backlog");
+            let full = reveal_half(e).filter(|h| c.block(*h).is_some_and(|b| b.txs.iter().map(|t| t.size()).sum::<u64>() > MAX_TX_BYTES as u64 / 2)).count();
+            assert!(full * 2 > EPOCH_BLOCKS as usize / 2, "epoch {e}'s reveal half was congested ({full} full blocks)");
+        }
+        let is_duty = |t: &Tx| matches!(t.action, Action::BeaconCommit { .. } | Action::BeaconReveal { .. });
+        let mut led = 0;
+        for h in spam_from + 1..=drained {
+            let b = c.block(h).unwrap();
+            let (last_duty, first_spam) = (b.txs.iter().rposition(is_duty), b.txs.iter().position(|t| addrs.contains(&t.from)));
+            if let (Some(d), Some(s)) = (last_duty, first_spam) {
+                assert!(d < s, "block {h}: the duties lead the tipped txs");
+                led += 1;
+            }
+        }
+        for seed in &seeds {
+            let me = Keys::from_seed(*seed).address();
+            assert!(c.state.staking.pools[&me].jail.is_none(), "{me} was never jailed");
+        }
+        drop(c);
+        let h = assert_agree(&vals);
+        println!("✓ {} tipping txs over #{spam_from}..=#{drained}: duties led {led} blocks, epochs {congested:?} got all 4 reveals, nobody jailed; 4 nodes agree through {h}", spam_ids.len());
+    });
+    std::fs::remove_dir_all(root).ok();
+}
