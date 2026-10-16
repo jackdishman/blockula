@@ -51,6 +51,7 @@ const refused: [string, UnsignedTx, RegExp][] = [
   ["memo null", tx({ memo: null as unknown as string }), /memo must be a string/],
   ["session period -1", act(session("1", { period_blocks: -1 })), /0 to/],
   ["session expiry 2^64", act(session("1", { expires_at: 2 ** 64 })), /0 to/],
+  ["nonce 2^53 (not exact as a number)", tx({ nonce: 2 ** 53 }), /nonce must be 0 to 9007199254740991 as a number/],
   ["conviction 256", act({ type: "vote", proposal_id: 1, aye: true, amount: "1", conviction: 256 }), /conviction must be 0 to 255/],
   ["conviction -1", act({ type: "vote", proposal_id: 1, aye: true, amount: "1", conviction: -1 }), /conviction must be 0 to 255/],
   ["aye not a bool", act({ type: "vote", proposal_id: 1, aye: "yes" as unknown as boolean, amount: "1", conviction: 1 }), /aye must be true or false/],

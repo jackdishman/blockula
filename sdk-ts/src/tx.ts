@@ -195,6 +195,8 @@ export function uintField(v: unknown, max: bigint, what = "integer field"): bigi
   if (typeof v === "bigint") n = v;
   else if (typeof v === "number") {
     if (!Number.isInteger(v)) throw new RangeError(`${what} must be a whole number, got ${v}`);
+    // Above 2^53 − 1 a JavaScript number may not be the value that was meant: pass a string of digits.
+    if (!Number.isSafeInteger(v)) throw new RangeError(`${what} must be 0 to ${max < BigInt(Number.MAX_SAFE_INTEGER) ? max : Number.MAX_SAFE_INTEGER} as a number (larger values as a string of digits), got ${v}`);
     n = BigInt(v);
   } else if (typeof v === "string") {
     if (!/^\d+$/.test(v)) throw new RangeError(`${what} must be a decimal string of digits, got ${JSON.stringify(v)}`);

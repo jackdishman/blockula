@@ -808,7 +808,7 @@ export class TxFailedError extends Error {
  */
 export class TxPendingError extends Error {
   constructor(readonly id: string, readonly waitedMs: number, readonly lastError?: unknown) {
-    super(`tx ${id} still pending after ${waitedMs}ms; it was submitted and may still execute, so check it (client.tx) before sending again`);
+    super(`tx ${id} still pending ${waitedMs > 0 ? `after ${waitedMs}ms` : "(its status couldn't be read)"}; it was submitted and may still execute, so check it (client.tx) before sending again`);
     this.name = "TxPendingError";
   }
 }
