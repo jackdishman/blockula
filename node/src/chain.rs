@@ -1695,15 +1695,15 @@ pub const PRUNE_DAYS: u64 = 2;
 const REPLAY_SYNC_EVERY: u64 = 1_000;
 
 /// The fewest heights a pruning node keeps: every kept snapshot's manifest (checkpoint +
-/// certifying blocks; the long-lived ones go back up to `2 × LONG_SNAPSHOT_INTERVAL`), the blocks
-/// after it that a joiner who downloaded it syncs next, and its epoch anchor (the last block of
-/// the epoch before, up to an epoch before the snapshot: `snapshot::anchor_height`), every
-/// ancestor a proposal may still cite, and a tx's whole validity window (so the tx index still
-/// catches a replayed tx). The validity window is a governance parameter
+/// certifying blocks; the long-lived ones go back up to two `snapshot::long_interval`s), the
+/// blocks after it that a joiner who downloaded it syncs next, and its epoch anchor (the last
+/// block of the epoch before, up to an epoch before the snapshot: `snapshot::anchor_height`),
+/// every ancestor a proposal may still cite, and a tx's whole validity window (so the tx index
+/// still catches a replayed tx). The validity window is a governance parameter
 /// (`max_tx_validity_blocks`), so this is re-read from the state at every commit.
 pub fn min_keep_blocks(state: &State) -> u64 {
-    use crate::snapshot::{CHECKPOINT_DELAY, LONG_SNAPSHOT_INTERVAL};
-    state.params.epoch_blocks.max(2) + 2 * LONG_SNAPSHOT_INTERVAL + 2 * CHECKPOINT_DELAY + crate::consensus::MAX_EXEC_LAG + state.chain_params.max_tx_validity_blocks
+    use crate::snapshot::{long_interval, CHECKPOINT_DELAY};
+    state.params.epoch_blocks.max(2) + 2 * long_interval(&state.params) + 2 * CHECKPOINT_DELAY + crate::consensus::MAX_EXEC_LAG + state.chain_params.max_tx_validity_blocks
 }
 
 /// What a pruning validator keeps by default: `PRUNE_DAYS` of blocks at this block time.

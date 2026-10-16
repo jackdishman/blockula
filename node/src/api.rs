@@ -1287,7 +1287,7 @@ struct SnapshotQuery {
 }
 
 /// Manifest of a certified state snapshot (for `join --fast`): the newest, or for a big state the
-/// newest long-lived one (`snapshot::LONG_SNAPSHOT_INTERVAL`), reaching `min` if given.
+/// newest long-lived one (`snapshot::long_interval`), reaching `min` if given.
 async fn snapshot_latest(State(n): State<Node>, Query(q): Query<SnapshotQuery>) -> ApiResult {
     let m = crate::snapshot::build_manifest_reaching(&n.live, q.min.unwrap_or(0)).map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
     Ok(Json(serde_json::to_value(m).unwrap()))
