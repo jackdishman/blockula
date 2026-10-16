@@ -4421,10 +4421,11 @@ mod v1 {
         c.produce_block_with(vec![short.clone()]).unwrap();
         assert!(c.failure(&short.id()).unwrap().0.contains("fee too low"));
         assert_eq!(c.state.account(&a.address()).nonce, 1);
-        // A tip that overflows the charge is refused too.
+        // A tip past its cap (`tip_cap_multiple` × the base fee; this one would overflow the
+        // charge) is refused too.
         let mut huge = tx(&c, &a, &a.address(), 1, 0, c.height() + 10, Action::Transfer { to: friend, amount: 1 });
         (huge.tip, huge.fee) = (u64::MAX, u64::MAX);
-        assert!(c.submit(huge.sign(&a)).unwrap_err().to_string().contains("fee too low"));
+        assert!(c.submit(huge.sign(&a)).unwrap_err().to_string().contains("tip too high"));
         let root = c.state.root();
         drop(c);
         assert_eq!(Chain::open(&home).unwrap().state.root(), root, "replays identically");
