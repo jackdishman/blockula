@@ -310,6 +310,7 @@ const views = {
       return card(`<span class="eyebrow">Name</span><h1>${esc(r.name)}</h1><dl>
         <dt>Owner</dt><dd>${who(r.owner)}</dd>
         <dt>Registered</dt><dd>block <a href="#/block/${esc(r.registered_at)}">#${esc(r.registered_at)}</a></dd>
+        ${r.offered_to ? `<dt>Offered to</dt><dd>${who(r.offered_to)} <span class="dim">(theirs once they accept it)</span></dd>` : ""}
         ${r.expires_at != null ? `<dt>${term("expiry", "Expires")}</dt><dd>${expiryText(r, s)}</dd>` : ""}
         ${r.renewal_price_display ? `<dt>Renewal</dt><dd>${esc(r.renewal_price_display)} a year</dd>` : ""}
       </dl>`);

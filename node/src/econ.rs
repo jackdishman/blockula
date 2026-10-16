@@ -566,7 +566,7 @@ pub(crate) fn register_name(state: &mut State, j: &mut Journal, sender: &str, na
     let treasury = state.treasury();
     state.j_credit(j, &treasury, price);
     let expires_at = height.saturating_add(state.chain_params.name_registration_blocks);
-    state.insert_name(j, NameRecord { name: n, owner: sender.to_string(), registered_at: height, expires_at });
+    state.insert_name(j, NameRecord { name: n, owner: sender.to_string(), registered_at: height, expires_at, offered_to: None });
     Ok(())
 }
 
@@ -620,16 +620,35 @@ pub(crate) fn apply(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, _
             }
             state.name_mut(j, &n).expect("checked above").expires_at = expires_at;
         }
+        // A name changes hands in two steps (audit F34): its owner offers it (`to` another
+        // account; offering it again replaces the offer, `to` itself withdraws it), and the account
+        // it was offered to accepts it (`to` itself). Until then it stays the owner's, so nobody
+        // can make a name, and so a primary name, someone else's. Accepting re-stamps
+        // `registered_at`, so a name an account accepted never ranks ahead of the ones it
+        // registered itself.
         Action::TransferName { name, to } => {
+            let n = normalize_name(name)?;
+            let to = state.resolve(to);
+            if let Some(rec) = state.names.get(&n).filter(|r| r.owner != sender && r.offered_to.as_deref() == Some(sender) && to.as_deref().ok() == Some(sender)) {
+                if key.role != KeyRole::Owner {
+                    bail!("only owner keys can manage names");
+                }
+                if height > rec.expires_at {
+                    bail!("{n}{NAME_SUFFIX} expired at block {}; only its owner can renew it, so it can't be accepted", rec.expires_at);
+                }
+                let r = state.name_mut(j, &n).expect("checked above");
+                (r.owner, r.registered_at, r.offered_to) = (sender.to_string(), height, None);
+                return Ok(());
+            }
             let (n, rec) = owned(state, name)?;
             if height > rec.expires_at {
                 bail!("{n}{NAME_SUFFIX} expired at block {}; renew it first", rec.expires_at);
             }
-            let to = state.resolve(to)?;
-            if to == sender {
+            let to = to?;
+            if to == sender && rec.offered_to.is_none() {
                 bail!("you already own {n}{NAME_SUFFIX}");
             }
-            state.name_mut(j, &n).expect("checked above").owner = to;
+            state.name_mut(j, &n).expect("checked above").offered_to = (to != sender).then_some(to);
         }
         Action::ReleaseName { name } => {
             let (n, _) = owned(state, name)?;
@@ -657,6 +676,7 @@ pub fn check_invariants(state: &State) -> Result<()> {
     ensure!(e.issuance.year == 0 || e.issuance.rate_ppm > 0, "issuance year {} has no rate", e.issuance.year);
     for (n, r) in state.names.iter() {
         ensure!(r.expires_at >= r.registered_at, "{n}{NAME_SUFFIX} expires before it was registered");
+        ensure!(r.offered_to.as_ref().is_none_or(|o| *o != r.owner && crate::crypto::is_address(o)), "{n}{NAME_SUFFIX} is offered to its owner or to no account");
     }
     for (addr, a) in state.accounts.iter() {
         ensure!(a.locks.len() <= MAX_LOCKS, "{addr} holds {} locks", a.locks.len());
@@ -670,20 +690,28 @@ pub fn check_invariants(state: &State) -> Result<()> {
     Ok(())
 }
 
-/// Plain-English summary of a names tx (see `State::describe_with`; `primary_name` looks up
-/// names).
-pub fn describe(state: &State, tx: &Tx, from: &str, primary_name: &dyn Fn(&str) -> Option<String>) -> String {
+/// Plain-English summary of a names tx (see `State::describe_with`; `height` is the block it's
+/// in, if it's in one; `primary_name` looks up names).
+pub fn describe(state: &State, tx: &Tx, from: &str, height: Option<u64>, primary_name: &dyn Fn(&str) -> Option<String>) -> String {
     let name = |n: &str| format!("{}{NAME_SUFFIX}", normalize_name(n).unwrap_or_else(|_| n.to_string()));
     match &tx.action {
         Action::RenewName { name: n, years } => format!("{from} renewed {} for {years} year{}", name(n), if *years == 1 { "" } else { "s" }),
-        Action::TransferName { name: n, to } => {
-            let n = name(n);
-            // Described after the fact too, when the name may already be the recipient's.
-            let to = match state.resolve(to) {
-                Ok(a) => primary_name(&a).filter(|p| *p != n).unwrap_or_else(|| short(&a)),
-                Err(_) => to.clone(),
-            };
-            format!("{from} gave {n} to {to}")
+        Action::TransferName { name: bare, to } => {
+            let n = name(bare);
+            match (state.resolve(to), tx.sender().ok()) {
+                // To itself: accepting an offer, or withdrawing its own. Described after the fact
+                // too: an accepted name is re-stamped with the height it changed hands at.
+                (Ok(a), Some(s)) if a == s => {
+                    let rec = normalize_name(bare).ok().and_then(|b| state.names.get(&b));
+                    if rec.is_some_and(|r| r.offered_to.as_deref() == Some(s.as_str()) || (r.owner == s && height.is_some_and(|h| h == r.registered_at))) {
+                        format!("{from} accepted {n}")
+                    } else {
+                        format!("{from} withdrew its offer of {n}")
+                    }
+                }
+                (Ok(a), _) => format!("{from} offered {n} to {}", primary_name(&a).filter(|p| *p != n).unwrap_or_else(|| short(&a))),
+                (Err(_), _) => format!("{from} offered {n} to {to}"),
+            }
         }
         Action::ReleaseName { name: n } => format!("{from} released {}", name(n)),
         _ => String::new(),
@@ -1344,8 +1372,10 @@ mod tests {
         t.ok(&bob, Action::RegisterName { name: "abc".into() });
         assert_eq!((t.c.state.names["abc"].owner.as_str(), t.c.state.names["abc"].registered_at), (b.as_str(), t.c.height()));
         assert!(t.err(&alice, Action::RenewName { name: "abc".into(), years: 1 }).contains("belongs to"));
-        // Transfer and release.
+        // Transfer (an offer, then its acceptance) and release.
         t.ok(&alice, Action::TransferName { name: "alice".into(), to: b.clone() });
+        assert_eq!(t.c.state.resolve("alice.boo").unwrap(), a, "still alice's until bob accepts");
+        t.ok(&bob, Action::TransferName { name: "alice".into(), to: b.clone() });
         assert_eq!(t.c.state.resolve("alice.boo").unwrap(), b);
         t.ok(&bob, Action::ReleaseName { name: "alice".into() });
         assert!(!t.c.state.names.contains_key("alice"));
@@ -1360,13 +1390,67 @@ mod tests {
         t.replays();
     }
 
+    /// Audit F34: nobody is given a name, and so a primary name, without accepting it. A
+    /// `TransferName` to another account only offers the name (it still resolves to its owner,
+    /// and the owner can replace or withdraw the offer); the account it was offered to takes it
+    /// with a `TransferName` to itself, and an accepted name is re-stamped, so it never ranks
+    /// ahead of names the account registered itself.
+    #[test]
+    fn a_name_changes_hands_only_when_its_recipient_accepts() {
+        let (mallory, victim, bob) = (keys(1), keys(2), keys(3));
+        let mut t = chain("names-offer", vec![alloc(&mallory, 1_000 * FANG, None, "m"), alloc(&victim, 1_000 * FANG, None, "v"), alloc(&bob, 1_000 * FANG, None, "b")], &[("name_registration_blocks", 60)], 600);
+        let (m, v, b) = (mallory.address(), victim.address(), bob.address());
+        // Mallory's names are older than the victim's own.
+        for i in 0..9 {
+            t.ok(&mallory, Action::RegisterName { name: format!("scam-wallet-{i}") });
+        }
+        t.ok(&victim, Action::RegisterName { name: "victim".into() });
+        let primary = |t: &T| (t.c.state.primary_name(&v), t.c.view().primary_name(&v));
+        let own = (Some("victim.boo".to_string()), Some("victim.boo".to_string()));
+        assert_eq!(primary(&t), own);
+        // Offers change nothing for the victim, however many.
+        for i in 0..9 {
+            let offer = t.ok(&mallory, Action::TransferName { name: format!("scam-wallet-{i}"), to: v.clone() });
+            assert_eq!(t.c.view().describe(&offer, Some(t.c.height())), format!("scam-wallet-0.boo offered scam-wallet-{i}.boo to victim.boo"));
+        }
+        assert_eq!(primary(&t), own);
+        assert_eq!((t.c.state.resolve("scam-wallet-0").unwrap(), t.c.state.names["scam-wallet-0"].offered_to.as_deref()), (m.clone(), Some(v.as_str())));
+        let send = t.tx(&victim, Action::Transfer { to: b.clone(), amount: FANG });
+        assert_eq!(t.c.view().describe(&send, None), "victim.boo sent 1 FANG to ".to_string() + &short(&b));
+        // Only the account it was offered to can accept it, for itself.
+        assert!(t.err(&bob, Action::TransferName { name: "scam-wallet-0".into(), to: b.clone() }).contains("belongs to"));
+        assert!(t.err(&victim, Action::TransferName { name: "scam-wallet-0".into(), to: b.clone() }).contains("belongs to"));
+        assert!(t.err(&victim, Action::TransferName { name: "victim".into(), to: v.clone() }).contains("you already own"));
+        // Accepted, it's the victim's, but its own older name stays its primary name.
+        let accept = t.ok(&victim, Action::TransferName { name: "scam-wallet-0.boo".into(), to: v.clone() });
+        let h = t.c.height();
+        assert_eq!(t.c.view().describe(&accept, Some(h)), "victim.boo accepted scam-wallet-0.boo");
+        let rec = t.c.state.names["scam-wallet-0"].clone();
+        assert_eq!((rec.owner.as_str(), rec.registered_at, rec.offered_to), (v.as_str(), h, None));
+        assert_eq!(primary(&t), own);
+        assert!(t.c.view().names_of(&v, 8).ends_with(&["scam-wallet-0".to_string()]), "after the names it registered");
+        // The owner can replace an offer, or withdraw it.
+        t.ok(&mallory, Action::TransferName { name: "scam-wallet-1".into(), to: b.clone() });
+        assert!(t.err(&victim, Action::TransferName { name: "scam-wallet-1".into(), to: v.clone() }).contains("belongs to"));
+        let withdraw = t.ok(&mallory, Action::TransferName { name: "scam-wallet-1".into(), to: m.clone() });
+        assert_eq!(t.c.view().describe(&withdraw, Some(t.c.height())), "scam-wallet-1.boo withdrew its offer of scam-wallet-1.boo");
+        assert_eq!(t.c.state.names["scam-wallet-1"].offered_to, None);
+        assert!(t.err(&bob, Action::TransferName { name: "scam-wallet-1".into(), to: b.clone() }).contains("belongs to"));
+        // An expired name's offer can't be accepted.
+        let expiry = t.c.state.names["scam-wallet-2"].expires_at;
+        t.blocks(expiry + 1 - t.c.height());
+        assert!(t.err(&victim, Action::TransferName { name: "scam-wallet-2".into(), to: v.clone() }).contains("can't be accepted"));
+        assert_eq!(t.c.state.names["scam-wallet-2"].owner, m);
+        t.replays();
+    }
+
     /// The sweep visits every name, a batch per block, and wraps around.
     #[test]
     fn the_name_sweep_wraps_around() {
         let mut st = State::default();
         for i in 0..100 {
             let n = format!("name{i:03}");
-            st.names.insert(n.clone(), NameRecord { name: n, owner: keys(1).address(), registered_at: 0, expires_at: if i % 3 == 0 { 0 } else { 1_000 } });
+            st.names.insert(n.clone(), NameRecord { name: n, owner: keys(1).address(), registered_at: 0, expires_at: if i % 3 == 0 { 0 } else { 1_000 }, offered_to: None });
         }
         let grace = st.chain_params.name_grace_blocks;
         for h in 0..4 {

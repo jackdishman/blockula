@@ -792,10 +792,16 @@ pub const MAX_LOCKS: usize = 64;
 pub struct NameRecord {
     pub name: String,
     pub owner: String,
+    /// When the owner got it: registered it, or accepted it from its last owner (so a name it was
+    /// given never ranks ahead of names it registered itself for its primary name).
     pub registered_at: u64,
     /// Last height it resolves (DEC-11: a year after registering, extended by `RenewName`).
     /// Then `name_grace_blocks` in which only the owner can renew it, then anyone can register it.
     pub expires_at: u64,
+    /// The account the owner offered it to (`TransferName`): it's theirs once they accept it
+    /// (audit F34: nobody is given a name, and so a primary name, without saying yes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offered_to: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
@@ -1646,7 +1652,7 @@ impl State {
             Action::Delegate { .. } | Action::Undelegate { .. } | Action::Redelegate { .. } | Action::WithdrawUnbonded {} | Action::UpdateValidator { .. } | Action::Unjail { .. } | Action::ReportEquivocation { .. } => crate::staking::describe(self, tx, &from, primary_name),
             Action::BeaconCommit { .. } | Action::BeaconReveal { .. } | Action::AttestRevert { .. } => crate::beacon::describe(self, tx, &from),
             Action::Propose { .. } | Action::Vote { .. } | Action::Unlock {} | Action::MultisigCreate { .. } | Action::MultisigPropose { .. } | Action::MultisigApprove { .. } | Action::ClaimDistribution { .. } => crate::governance::describe(self, tx, &from, primary_name),
-            Action::RenewName { .. } | Action::TransferName { .. } | Action::ReleaseName { .. } => crate::econ::describe(self, tx, &from, primary_name),
+            Action::RenewName { .. } | Action::TransferName { .. } | Action::ReleaseName { .. } => crate::econ::describe(self, tx, &from, height, primary_name),
             Action::Shield { .. } | Action::PrivateTransfer { .. } | Action::Unshield { .. } | Action::SetGhostAddress { .. } | Action::GhostPause {} => crate::ghost::describe(self, tx, &from, primary_name),
             _ => self.describe_poc(tx, &from, primary_name),
         }
@@ -4739,13 +4745,13 @@ mod scaffold {
         c.submit(signed(&c, &owner, Action::RegisterName { name: "owner".into() })).unwrap();
         c.produce_block().unwrap();
         let give = signed(&c, &owner, Action::TransferName { name: "owner.boo".into(), to: bob.address() });
-        assert_eq!(c.state.describe(&give, None), format!("owner.boo gave owner.boo to {}", short(&bob.address())));
+        assert_eq!(c.state.describe(&give, None), format!("owner.boo offered owner.boo to {}", short(&bob.address())));
         c.submit(give).unwrap();
         c.produce_block().unwrap();
-        assert_eq!(c.state.resolve("owner.boo").unwrap(), bob.address());
-        // Bob holds nothing yet: his release can't even pay its fee.
+        assert_eq!(c.state.resolve("owner.boo").unwrap(), owner.address(), "an offer: the owner's until bob accepts");
+        // Bob holds nothing yet: his acceptance can't even pay its fee, nor can a release of a name he doesn't own.
+        assert!(c.submit(signed(&c, &bob, Action::TransferName { name: "owner".into(), to: bob.address() })).unwrap_err().to_string().contains("insufficient balance"));
         assert!(c.submit(signed(&c, &bob, Action::ReleaseName { name: "owner".into() })).unwrap_err().to_string().contains("insufficient balance"));
-        assert!(c.submit(signed(&c, &owner, Action::ReleaseName { name: "owner".into() })).unwrap_err().to_string().contains("belongs to"));
         // Without admins, the admin levers are closed.
         for action in [Action::SetRepo { repo: "a/b".into(), weight: 1 }, Action::GrantSoul { to: bob.address(), amount: SOUL, reason: "r".into() }] {
             assert!(c.submit(signed(&c, &owner, action)).unwrap_err().to_string().contains("only validator admins"));
@@ -4931,7 +4937,7 @@ mod scaffold {
         assert!(c.submit(signed(&c, &founder, Action::Transfer { to: bob.address(), amount: 5 * FANG })).unwrap_err().to_string().contains("locked (founder)"));
         c.submit(signed(&c, &owner, Action::Transfer { to: bob.address(), amount: 5 * FANG })).unwrap();
         c.produce_block().unwrap();
-        // A name changes hands, a module tx fails (and is charged), a stale tx is skipped.
+        // A name is offered, a module tx fails (and is charged), a stale tx is skipped.
         let give = signed(&c, &owner, Action::TransferName { name: "owner".into(), to: bob.address() });
         let delegate = Tx { nonce: give.nonce + 1, ..signed(&c, &owner, Action::Delegate { validator: v.clone(), amount: 1_000_000 * FANG }) }.sign(&owner);
         let stale = Tx { nonce: 40, ..signed(&c, &owner, Action::Transfer { to: bob.address(), amount: FANG }) }.sign(&owner);
@@ -4967,7 +4973,7 @@ mod scaffold {
         assert!(s.econ.reserved_names.contains_key("blockula") && s.econ.reserved_names.contains_key("foundation"));
         assert_eq!(s.soul_of(&owner.address(), height), 50 * SOUL);
         assert!(crate::upgrade::is_active(s, "ghost"));
-        assert_eq!(s.resolve("owner.boo").unwrap(), bob.address());
+        assert_eq!((s.resolve("owner.boo").unwrap(), s.names["owner"].offered_to.clone()), (owner.address(), Some(bob.address())), "offered to bob, still the owner's");
         assert_eq!(c.block(2).unwrap().skipped, vec![stale.size()]);
         assert_eq!(history(&c, &v), vec![delegate.id()]);
         s.check_invariants().unwrap();

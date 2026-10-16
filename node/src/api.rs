@@ -1071,8 +1071,8 @@ async fn key_accounts(State(n): State<Node>, Path(key_id): Path<String>) -> ApiR
 }
 
 /// A name (DEC-11): its `status` (`active`; `grace`, when only its owner can renew it;
-/// `reserved`; or `available`), its owner and expiry, and what registering it or renewing it for
-/// a year costs.
+/// `reserved`; or `available`), its owner and expiry, the account it's offered to (`offered_to`:
+/// theirs once they accept it), and what registering it or renewing it for a year costs.
 async fn name(State(node): State<Node>, Path(n): Path<String>) -> ApiResult {
     let v = node.live.view();
     let st = &v.state;
@@ -1096,6 +1096,9 @@ async fn name(State(node): State<Node>, Path(n): Path<String>) -> ApiResult {
             out["registered_at"] = r.registered_at.into();
             out["expires_at"] = r.expires_at.into();
             out["grace_until"] = grace.into();
+            if let Some(to) = &r.offered_to {
+                out["offered_to"] = label(&v, to);
+            }
             if now <= r.expires_at {
                 "active"
             } else if now <= grace {
@@ -2260,6 +2263,18 @@ mod http_tests {
         let year = n.chain.lock().state.chain_params.name_registration_blocks;
         assert_eq!((a["status"].as_str(), a["available"].as_bool(), a["owner"]["address"].as_str()), (Some("active"), Some(false), Some(alice.address().as_str())));
         assert_eq!((a["expires_at"].as_u64(), a["grace_until"].as_u64()), (Some(h + year), Some(h + year + n.chain.lock().state.chain_params.name_grace_blocks)));
+        assert!(a.get("offered_to").is_none());
+        // Offered to bob: still alice's, and the name says who may accept it.
+        let bob = crate::crypto::Keys::from_seed([4; 32]).address();
+        {
+            let mut c = n.chain.lock();
+            let mut tx = Tx { chain_id: "econ".into(), genesis_hash: c.genesis_hash.clone(), from: alice.address(), nonce: 1, fee: 0, tip: 0, valid_until: c.height() + 10, action: Action::TransferName { name: "alice".into(), to: bob.clone() }, memo: String::new(), public_key: hex::encode(alice.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+            tx.fee = 3 * min_fee(tx.size());
+            c.submit(tx.sign(&alice)).unwrap();
+            c.produce_block().unwrap();
+        }
+        let (_, a, _) = call(&n, "GET", "/api/name/alice", None, "127.0.0.1:1").await;
+        assert_eq!((a["owner"]["address"].as_str(), a["offered_to"]["address"].as_str()), (Some(alice.address().as_str()), Some(bob.as_str())));
         let (_, t, _) = call(&n, "GET", &format!("/api/tx/{id}"), None, "127.0.0.1:1").await;
         let size = t["size_bytes"].as_u64().unwrap();
         assert_eq!(t["fee"].as_str().unwrap(), (min_fee(size) + 25).to_string(), "charged: the block's base fee + the tip, not the max fee");

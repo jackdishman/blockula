@@ -539,7 +539,7 @@ fn largest_records_fit_in_a_snapshot() {
     // Lock ids at `econ::lock`'s bound (`MAX_LABEL` bytes), distinct.
     let locks = (0..MAX_LOCKS as u64).map(|id| Lock { id: format!("{id:0>MAX_LABEL$}"), amount: LockAmount::Vesting { total: u64::MAX, start: u64::MAX, cliff: u64::MAX, end: u64::MAX }, reason: s(MAX_LABEL) }).collect();
     st.accounts.insert(addr(0), Account { balance: u64::MAX, nonce: u64::MAX, keys, locks });
-    st.names.insert(s(MAX_NAME_FIELD), NameRecord { name: s(MAX_NAME_FIELD), owner: addr(0), registered_at: 0, expires_at: u64::MAX });
+    st.names.insert(s(MAX_NAME_FIELD), NameRecord { name: s(MAX_NAME_FIELD), owner: addr(0), registered_at: 0, expires_at: u64::MAX, offered_to: Some(addr(1)) });
     let vr = ValidatorRecord { address: addr(1), owner: addr(0), consensus_key: "ab".repeat(crypto::PUBLIC_KEY_LEN), p2p_addr: s(MAX_ADDR), http_addr: s(MAX_ADDR), status: ValidatorStatus::Removed, registered_at: 0, approved_at: Some(0), approved_by: Some(addr(2)), active_from: Some(0), removed_at: Some(0), removed_by: Some(addr(2)), active_until: Some(0), commission_bps: 0 };
     st.validators.insert(addr(1), vr);
     // The largest set governance can configure (`max_validators` is bounded by params.rs).
