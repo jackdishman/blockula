@@ -52,6 +52,12 @@
 //! account's whole gain, a conservative reading when it also staked liquid tokens). Such an account
 //! may hold at most `insider_delegation_cap_bps` of the supply in any one pool.
 //!
+//! **The bootstrap delegation** (DEC-5, [`bootstrap_epoch`]): at each boundary the keyless
+//! bootstrap account's rewards go to the treasury, what its vesting lock no longer holds goes back
+//! to the treasury, and the rest is spread equally over the next set's members not owned by the
+//! founder's or the foundation's accounts. It moves without unbonding, only by that formula, and
+//! its stake doesn't count toward the ranking for seats.
+//!
 //! Slashing isn't gated by a flag: it ships together with P-UPGRADE's slashing protection (3.9),
 //! so a restored disk can't get an honest operator slashed. A chain that wants it off sets
 //! `slash_double_sign_bps` and `slash_downtime_bps` to 0 (tombstoning and jailing still apply).
