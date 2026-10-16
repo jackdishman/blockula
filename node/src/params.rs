@@ -199,7 +199,7 @@ pub fn vote_weight(amount: u64, conviction: u8) -> Option<u128> {
 }
 
 /// Blocks per day at a block time (at least 1).
-fn blocks_per_day(block_time_ms: u64) -> u64 {
+pub fn blocks_per_day(block_time_ms: u64) -> u64 {
     (86_400_000 / block_time_ms.max(1)).max(1)
 }
 

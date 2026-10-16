@@ -66,8 +66,20 @@ use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Most open proposals one multisig account may have at once.
+/// Most open proposals one multisig account may have at once. Each owner key may have proposed at
+/// most its share of them, ⌊32 / owner keys⌋ (at least 1), so one key can't fill the list and
+/// keep the others from proposing (audit F14).
 pub const MAX_MULTISIG_PENDING: usize = 32;
+/// Largest action a `MultisigPropose` carries, encoded (`types::MAX_MULTISIG_ACTION_BYTES`, a
+/// format rule): a nested validator registration fits, 32 KiB of evidence doesn't (audit F17).
+pub use crate::types::MAX_MULTISIG_ACTION_BYTES;
+/// Expired multisig proposals checked for removal per block (the sweep, [`end_block`]).
+pub const MULTISIG_SWEEP: usize = 32;
+/// Vote records of closed proposals removed per block (their tallies stay; audit F47).
+pub const VOTE_SWEEP: usize = 256;
+/// Treasury spends passed within this many days count together against `treasury_large_bps`
+/// (audit F44).
+pub const LARGE_SPEND_WINDOW_DAYS: u64 = 30;
 /// Domain separators of distribution Merkle trees (docs/GOVERNANCE.md).
 pub const LEAF_DOMAIN: &[u8] = b"BLOCKULA_DISTRIBUTION_LEAF_V1";
 pub const NODE_DOMAIN: &[u8] = b"BLOCKULA_DISTRIBUTION_NODE_V1";
@@ -249,6 +261,12 @@ pub struct Governance {
     pub multisig_proposals: TMap<u64, MultisigProposal>,
     pub distributions: TMap<u64, Distribution>,
     pub distribution_claims: TMap<IdKey, DistributionClaim>,
+    pub scalars: Scalars,
+}
+
+/// Governance's scalars (one META record).
+#[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct Scalars {
     pub next_proposal_id: u64,
     pub next_multisig_id: u64,
     /// Proposals voting or queued, and distributions still open: all `end_block` looks at.
@@ -257,36 +275,48 @@ pub struct Governance {
     /// `(epoch, unlocked supply)`: quorums in an epoch use the unlocked supply as of the first
     /// vote that closed in it, however many proposals close.
     pub quorum_base: Option<(u64, u128)>,
+    /// Treasury spends that passed within the last [`LARGE_SPEND_WINDOW_DAYS`]: proposal id →
+    /// (the height it passed at, the amount). They count together against `treasury_large_bps`.
+    pub recent_spends: BTreeMap<u64, (u64, u64)>,
+    /// Closed proposals whose vote records are still being removed ([`VOTE_SWEEP`] a block).
+    pub closed_votes: BTreeSet<u64>,
+    /// The expired-multisig-proposal sweep goes on from this id ([`MULTISIG_SWEEP`] a block).
+    pub multisig_cursor: u64,
 }
 
-type Scalars = (u64, u64, BTreeSet<u64>, BTreeSet<u64>, Option<(u64, u128)>);
+impl std::ops::Deref for Governance {
+    type Target = Scalars;
+    fn deref(&self) -> &Scalars {
+        &self.scalars
+    }
+}
 
-impl Governance {
-    fn scalars(&self) -> Scalars {
-        (self.next_proposal_id, self.next_multisig_id, self.open_proposals.clone(), self.open_distributions.clone(), self.quorum_base)
+impl std::ops::DerefMut for Governance {
+    fn deref_mut(&mut self) -> &mut Scalars {
+        &mut self.scalars
     }
 }
 
 impl SubState for Governance {
     fn tables(&self) -> Vec<(u8, &dyn Table)> {
-        let Governance { proposals, votes, multisigs, multisig_proposals, distributions, distribution_claims, next_proposal_id: _, next_multisig_id: _, open_proposals: _, open_distributions: _, quorum_base: _ } = self;
+        let Governance { proposals, votes, multisigs, multisig_proposals, distributions, distribution_claims, scalars: _ } = self;
         vec![(ns::GOV_PROPOSALS, proposals), (ns::GOV_VOTES, votes), (ns::GOV_MULTISIGS, multisigs), (ns::GOV_MULTISIG_PROPOSALS, multisig_proposals), (ns::GOV_DISTRIBUTIONS, distributions), (ns::GOV_DISTRIBUTION_CLAIMS, distribution_claims)]
     }
 
     fn tables_mut(&mut self) -> Vec<(u8, &mut dyn Table)> {
-        let Governance { proposals, votes, multisigs, multisig_proposals, distributions, distribution_claims, next_proposal_id: _, next_multisig_id: _, open_proposals: _, open_distributions: _, quorum_base: _ } = self;
+        let Governance { proposals, votes, multisigs, multisig_proposals, distributions, distribution_claims, scalars: _ } = self;
         vec![(ns::GOV_PROPOSALS, proposals), (ns::GOV_VOTES, votes), (ns::GOV_MULTISIGS, multisigs), (ns::GOV_MULTISIG_PROPOSALS, multisig_proposals), (ns::GOV_DISTRIBUTIONS, distributions), (ns::GOV_DISTRIBUTION_CLAIMS, distribution_claims)]
     }
 
     fn meta_records(&self) -> Vec<(&'static [u8], Vec<u8>)> {
-        vec![(meta::GOVERNANCE, encode(&self.scalars()))]
+        vec![(meta::GOVERNANCE, encode(&self.scalars))]
     }
 
     fn load_meta(&mut self, key: &[u8], value: &[u8]) -> Result<bool> {
         if key != meta::GOVERNANCE {
             return Ok(false);
         }
-        (self.next_proposal_id, self.next_multisig_id, self.open_proposals, self.open_distributions, self.quorum_base) = decode::<Scalars>(value)?;
+        self.scalars = decode::<Scalars>(value)?;
         Ok(true)
     }
 }
@@ -326,7 +356,7 @@ impl GovernanceJournal {
         distributions.restore(&mut g.distributions);
         distribution_claims.restore(&mut g.distribution_claims);
         if let Some(s) = scalars {
-            (g.next_proposal_id, g.next_multisig_id, g.open_proposals, g.open_distributions, g.quorum_base) = s;
+            g.scalars = s;
         }
     }
 }
@@ -361,7 +391,7 @@ impl BorshDeserialize for Action {
 
 fn save_scalars(state: &State, j: &mut Journal) {
     if j.governance.scalars.is_none() {
-        j.governance.scalars = Some(state.governance.scalars());
+        j.governance.scalars = Some(state.governance.scalars.clone());
     }
 }
 
@@ -598,10 +628,24 @@ pub fn needs_supermajority(state: &State, kind: &ProposalKind) -> bool {
         ProposalKind::ParamChange { key, .. } => key.starts_with("issuance_") || crate::params::GOVERNANCE_KEYS.contains(&key.as_str()),
         ProposalKind::TreasurySpend { amount, .. } => {
             let treasury = state.account(&state.treasury()).balance as u128;
-            *amount as u128 * 10_000 > state.chain_params.treasury_large_bps as u128 * treasury
+            (*amount as u128 + recent_spends(state, state.econ.height)) * 10_000 > state.chain_params.treasury_large_bps as u128 * treasury
         }
         _ => false,
     }
+}
+
+/// [`LARGE_SPEND_WINDOW_DAYS`] in blocks.
+fn large_spend_window(state: &State) -> u64 {
+    LARGE_SPEND_WINDOW_DAYS.saturating_mul(crate::params::blocks_per_day(state.params.block_time_ms))
+}
+
+/// What the treasury spends that passed in the window up to `height` add up to (those that
+/// failed when they ran aside): a spend is large if it and they together are more than
+/// `treasury_large_bps` of the treasury, so a large spend split into small proposals still needs
+/// the supermajority (audit F44).
+pub fn recent_spends(state: &State, height: u64) -> u128 {
+    let window = large_spend_window(state);
+    state.governance.recent_spends.values().filter(|(at, _)| at.saturating_add(window) > height).map(|(_, amount)| *amount as u128).sum()
 }
 
 /// Whether the bootstrap council may pass a kind on its own: anything but a change to
@@ -650,6 +694,17 @@ fn close_vote(state: &mut State, id: u64, height: u64, unlocked: u128) {
         "the ayes didn't outweigh the nays".to_string()
     };
     save_scalars(state, &mut j);
+    // Spends that passed count toward the next ones' share of the treasury for the window; spends
+    // that left it don't.
+    let window = large_spend_window(state);
+    state.governance.recent_spends.retain(|_, (at, _)| at.saturating_add(window) > height);
+    if let (true, ProposalKind::TreasurySpend { amount, .. }) = (passed, &p.kind) {
+        state.governance.recent_spends.insert(id, (height, *amount));
+    }
+    // The tally is final: the votes behind it go, a batch a block (`end_block`).
+    if p.voters > 0 {
+        state.governance.closed_votes.insert(id);
+    }
     let p = proposal_mut(state, &mut j, id);
     p.tally = Some(Tally { unlocked, quorum, quorum_reached, supermajority, council_size: n, council_ayes: ayes, council_nays: nays });
     p.outcome = outcome;
@@ -680,6 +735,9 @@ fn execute(state: &mut State, id: u64, height: u64) {
     };
     let mut j = Journal::default();
     save_scalars(state, &mut j);
+    if status == ProposalStatus::Failed {
+        state.governance.recent_spends.remove(&id);
+    }
     let p = proposal_mut(state, &mut j, id);
     p.status = status;
     p.outcome = outcome;
@@ -805,6 +863,55 @@ pub fn end_block(state: &mut State, b: &BlockInfo) {
         d.closed_at = Some(height);
         d.returned = rest;
     }
+    sweep_votes(state);
+    sweep_multisig_proposals(state, height);
+}
+
+/// Removes up to [`VOTE_SWEEP`] vote records of closed proposals (oldest proposal first): once a
+/// vote closes, its tally is final and each vote's lock lives on in the voter's account
+/// (`vote:<id>`), so the records go (audit F47: they'd otherwise be permanent, unbonded state).
+/// What stays per account is bounded by its locks (`MAX_LOCKS`, one per proposal still voting or
+/// locking).
+fn sweep_votes(state: &mut State) {
+    let mut budget = VOTE_SWEEP;
+    while let Some(id) = state.governance.closed_votes.first().copied() {
+        // One more than the budget, to know whether any are left after it.
+        let batch: Vec<IdKey> = state.governance.votes.range(IdKey::new(id, "")..).take_while(|(k, _)| k.id == id).take(budget + 1).map(|(k, _)| k.clone()).collect();
+        let more = batch.len() > budget;
+        for k in batch.into_iter().take(budget) {
+            state.governance.votes.remove(&k);
+            budget -= 1;
+        }
+        if more {
+            return;
+        }
+        state.governance.closed_votes.remove(&id);
+    }
+}
+
+/// Removes up to [`MULTISIG_SWEEP`] expired multisig proposals, resuming where the last sweep
+/// stopped and starting over at the end (audit F17: an account that files proposals and goes
+/// quiet doesn't keep them in state).
+fn sweep_multisig_proposals(state: &mut State, height: u64) {
+    let g = &state.governance;
+    let batch: Vec<(u64, String, bool)> = g.multisig_proposals.range(g.multisig_cursor..).take(MULTISIG_SWEEP).map(|(id, p)| (*id, p.account.clone(), height > p.expires_at)).collect();
+    state.governance.multisig_cursor = if batch.len() < MULTISIG_SWEEP { 0 } else { batch.last().map_or(0, |b| b.0 + 1) };
+    let mut j = Journal::default();
+    for (id, account, expired) in batch {
+        if expired {
+            drop_multisig_proposal(state, &mut j, &account, id);
+        }
+    }
+}
+
+/// Removes multisig proposal `id` of `account` (expired, or run).
+fn drop_multisig_proposal(state: &mut State, j: &mut Journal, account: &str, id: u64) {
+    if let Some(mut m) = state.governance.multisigs.get(account).cloned() {
+        if m.pending.remove(&id) {
+            put_multisig(state, j, account, m);
+        }
+    }
+    put_multisig_proposal(state, j, None, id);
 }
 
 // ---- community distributions
@@ -969,26 +1076,36 @@ fn run_multisig(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, signe
     Ok(())
 }
 
+/// Removes `account`'s expired multisig proposals.
+fn clear_expired(state: &mut State, j: &mut Journal, account: &str, height: u64) {
+    let Some(m) = state.governance.multisigs.get(account) else { return };
+    let expired: Vec<u64> = m.pending.iter().copied().filter(|id| state.governance.multisig_proposals.get(id).is_none_or(|p| height > p.expires_at)).collect();
+    for id in expired {
+        drop_multisig_proposal(state, j, account, id);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn multisig_propose(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, signer: &str, key: &KeyRecord, action: &Action, height: u64) -> Result<()> {
     owner_only(key, "propose multisig actions")?;
+    clear_expired(state, j, sender, height);
     let mut m = state.governance.multisigs.get(sender).cloned().ok_or_else(|| anyhow!("{} isn't a multisig account (multisig_create first)", short(sender)))?;
-    // Expired proposals make room.
-    let expired: Vec<u64> = m.pending.iter().copied().filter(|id| state.governance.multisig_proposals.get(id).is_none_or(|p| height > p.expires_at)).collect();
-    for id in expired {
-        m.pending.remove(&id);
-        put_multisig_proposal(state, j, None, id);
-    }
-    if m.pending.len() >= MAX_MULTISIG_PENDING {
-        bail!("{} has {MAX_MULTISIG_PENDING} open multisig proposals; approve or let some expire first", short(sender));
-    }
     save_scalars(state, j);
     let id = state.governance.next_multisig_id;
     state.governance.next_multisig_id = id.checked_add(1).ok_or_else(|| anyhow!("multisig ids exhausted"))?;
     let p = MultisigProposal { id, account: sender.to_string(), action: action.clone(), proposed_by: signer.to_string(), approvals: BTreeSet::from([signer.to_string()]), created_at: height, expires_at: height.saturating_add(state.chain_params.multisig_expiry_blocks) };
-    put_multisig(state, j, sender, m.clone());
     if approvals(state, &p) >= m.threshold as usize {
         return run_multisig(state, j, tx, sender, signer, &p, height);
+    }
+    // It waits for approvals: within the account's cap, and the proposing key's share of it.
+    if m.pending.len() >= MAX_MULTISIG_PENDING {
+        bail!("{} has {MAX_MULTISIG_PENDING} open multisig proposals; approve or let some expire first", short(sender));
+    }
+    let owners = owner_keys(state, sender).len();
+    let share = (MAX_MULTISIG_PENDING / owners.max(1)).max(1);
+    let mine = m.pending.iter().filter(|id| state.governance.multisig_proposals.get(*id).is_some_and(|p| p.proposed_by == signer)).count();
+    if mine >= share {
+        bail!("this key proposed {mine} of {}'s open multisig proposals, its share among {owners} owner keys; approve or let some expire first", short(sender));
     }
     m.pending.insert(id);
     put_multisig(state, j, sender, m);
@@ -1007,6 +1124,8 @@ fn multisig_approve(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, s
     if height > p.expires_at {
         bail!("multisig action #{id} expired at block {}", p.expires_at);
     }
+    clear_expired(state, j, sender, height);
+    m.pending.retain(|id| state.governance.multisig_proposals.contains_key(id));
     if !p.approvals.insert(signer.to_string()) {
         bail!("this key already approved multisig action #{id}");
     }
@@ -1060,19 +1179,32 @@ pub fn check_invariants(state: &State) -> Result<()> {
         ensure!((p.status == ProposalStatus::Voting) == p.tally.is_none(), "proposal #{id} is {:?} with{} a tally", p.status, if p.tally.is_some() { "" } else { "out" });
         ensure!(p.status != ProposalStatus::Queued || p.execute_at.is_some(), "queued proposal #{id} has no execution height");
         let s = sums.get(id).copied().unwrap_or_default();
-        ensure!(s == (p.aye_amount, p.nay_amount, p.aye_weight, p.nay_weight, p.voters), "proposal #{id}'s tallies aren't the sum of its votes");
-        for (validator, c) in &p.council {
-            let v = g.votes.get(&IdKey::new(*id, &c.voter));
-            ensure!(v.is_some_and(|v| v.aye == c.aye && v.council.as_deref() == Some(validator.as_str())), "proposal #{id}'s council vote for {validator} doesn't match {}'s vote", c.voter);
+        if p.status == ProposalStatus::Voting {
+            ensure!(s == (p.aye_amount, p.nay_amount, p.aye_weight, p.nay_weight, p.voters), "proposal #{id}'s tallies aren't the sum of its votes");
+            for (validator, c) in &p.council {
+                let v = g.votes.get(&IdKey::new(*id, &c.voter));
+                ensure!(v.is_some_and(|v| v.aye == c.aye && v.council.as_deref() == Some(validator.as_str())), "proposal #{id}'s council vote for {validator} doesn't match {}'s vote", c.voter);
+            }
+        } else {
+            // Closed: its votes are being swept (what's left is part of the final tally).
+            ensure!(s.0 <= p.aye_amount && s.1 <= p.nay_amount && s.2 <= p.aye_weight && s.3 <= p.nay_weight && s.4 <= p.voters, "closed proposal #{id} has more votes than its tally");
+            ensure!(s.4 == 0 || g.closed_votes.contains(id), "closed proposal #{id} keeps votes nothing sweeps");
         }
     }
     for id in &g.open_proposals {
         ensure!(g.proposals.contains_key(id), "open proposal #{id} doesn't exist");
     }
+    for id in &g.closed_votes {
+        ensure!(g.proposals.get(id).is_some_and(|p| p.status != ProposalStatus::Voting), "proposal #{id} is swept but not closed");
+    }
+    for (id, (_, amount)) in g.recent_spends.iter() {
+        ensure!(g.proposals.get(id).is_some_and(|p| matches!(p.kind, ProposalKind::TreasurySpend { amount: a, .. } if a == *amount) && matches!(p.status, ProposalStatus::Queued | ProposalStatus::Executed)), "recent spend #{id} isn't a passed treasury spend");
+    }
     for (account, m) in g.multisigs.iter() {
         let owners = owner_keys(state, account).len();
         ensure!(m.threshold >= 1 && m.threshold as usize <= owners, "{account} is a {}-of-{owners} multisig", m.threshold);
         ensure!(m.pending.len() <= MAX_MULTISIG_PENDING, "{account} has too many multisig proposals");
+        ensure!(m.pending.iter().all(|id| *id < g.next_multisig_id), "{account} has a multisig proposal from the future");
         for id in &m.pending {
             ensure!(g.multisig_proposals.get(id).is_some_and(|p| p.account == *account), "{account}'s multisig proposal #{id} is missing");
         }
@@ -1081,6 +1213,7 @@ pub fn check_invariants(state: &State) -> Result<()> {
         ensure!(*id == p.id && *id < g.next_multisig_id, "multisig proposal #{id} is misfiled");
         ensure!(g.multisigs.get(&p.account).is_some_and(|m| m.pending.contains(id)), "multisig proposal #{id} isn't pending on {}", p.account);
         ensure!(p.approvals.contains(&p.proposed_by), "multisig proposal #{id} lacks its proposer's approval");
+        ensure!(p.action.to_bytes().len() <= MAX_MULTISIG_ACTION_BYTES, "multisig proposal #{id}'s action is too large");
     }
     let mut claimed: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
     for (k, c) in g.distribution_claims.iter() {

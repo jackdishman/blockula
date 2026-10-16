@@ -636,6 +636,10 @@ pub const MAX_FEATURE: usize = 32;
 pub const MAX_PARAM_KEY: usize = 64;
 /// `RenewName` renews for 1 to this many years at once.
 pub const MAX_RENEW_YEARS: u8 = 10;
+/// Largest action a `MultisigPropose` may carry, encoded: the proposal is stored until it's
+/// approved or expires, so it's bounded well below `MAX_TX_BYTES` (audit F17). A nested
+/// validator registration (~10.6 KiB: key and proof of possession) fits.
+pub const MAX_MULTISIG_ACTION_BYTES: usize = 12 << 10;
 
 /// What a juror commits to before revealing (hashed with BLAKE3). Mirrored in sdk-ts/src/tx.ts
 /// `seanceCommitment`.
@@ -1270,6 +1274,10 @@ impl Action {
                 }
                 if action.is_ghost() {
                     bail!("a multisig proposal can't hold a ghost action");
+                }
+                let size = action.to_bytes().len();
+                if size > MAX_MULTISIG_ACTION_BYTES {
+                    bail!("a multisig proposal's action is at most {MAX_MULTISIG_ACTION_BYTES} bytes encoded, not {size}");
                 }
                 action.check_format(true).context("the proposed action")?;
             }

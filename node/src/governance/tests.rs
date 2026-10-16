@@ -335,11 +335,12 @@ fn majorities_supermajorities_and_conviction() {
         t.vote(BOB, *id, false, *nay, *nc).unwrap();
     }
     let alice = t.bal(ALICE);
+    let supermajority: Vec<bool> = cases.iter().map(|c| needs_supermajority(&t.st, &c.0)).collect();
     t.through(t.p(0).voting_end);
-    for (id, c) in ids.iter().zip(&cases) {
+    for ((id, c), needed) in ids.iter().zip(&cases).zip(supermajority) {
         let p = t.p(*id);
         assert_eq!(p.status, c.5, "{:?}: {}", c.0, p.outcome);
-        assert_eq!(p.tally.as_ref().unwrap().supermajority, needs_supermajority(&t.st, &c.0), "{:?}", c.0);
+        assert_eq!(p.tally.as_ref().unwrap().supermajority, needed, "{:?}", c.0);
     }
     assert!(t.p(3).outcome.contains("fewer than 66.67% of the vote weight"), "{}", t.p(3).outcome);
     assert!(t.p(0).outcome.contains("didn't outweigh"), "{}", t.p(0).outcome);
@@ -955,14 +956,128 @@ fn multisig_accounts_need_their_threshold() {
     t.tx_as(&k2, &alice, Action::MultisigPropose { action: Box::new(Action::Propose { kind: text(), deposit: 50 * FANG, title: "from a multisig".into(), url: String::new() }) }).unwrap();
     t.tx_as(&k1, &alice, Action::MultisigPropose { action: Box::new(Action::Vote { proposal_id: id, aye: true, amount: 10_000 * FANG, conviction: 1 }) }).unwrap();
     assert_eq!((t.p(id).proposer.clone(), t.p(id).voters), (alice.clone(), 1));
-    // At most 32 open proposals per account.
+    // At most 32 open proposals per account, and each of its 2 owner keys may have proposed 16.
     t.tx_as(&k1, &alice, Action::MultisigPropose { action: Box::new(Action::MultisigCreate { owners: vec![kid(ALICE), kid(11)], threshold: 2 }) }).unwrap();
-    let open = t.st.governance.multisigs[&alice].pending.len();
     assert_eq!(t.st.governance.multisigs[&alice].pending, BTreeSet::from([2, 6]), "the unapproved send and the refused key removal");
-    for _ in open..MAX_MULTISIG_PENDING {
+    for _ in 2..16 {
         t.tx_as(&k1, &alice, Action::MultisigPropose { action: send(1) }).unwrap();
     }
-    assert!(t.tx_as(&k1, &alice, Action::MultisigPropose { action: send(1) }).unwrap_err().to_string().contains("32 open multisig proposals"));
+    assert!(t.tx_as(&k1, &alice, Action::MultisigPropose { action: send(1) }).unwrap_err().to_string().contains("its share among 2 owner keys"));
+    for _ in 0..16 {
+        t.tx_as(&k2, &alice, Action::MultisigPropose { action: send(1) }).unwrap();
+    }
+    assert_eq!(t.st.governance.multisigs[&alice].pending.len(), MAX_MULTISIG_PENDING);
+    assert!(t.tx_as(&k2, &alice, Action::MultisigPropose { action: send(1) }).unwrap_err().to_string().contains("32 open multisig proposals"));
+}
+
+/// Audit F14: one owner key of a 2-of-3 multisig can't fill the pending list and keep the others
+/// from proposing (even its own removal): each key may have proposed only its share, ⌊32 / 3⌋.
+/// Audit F17: what's left of its spam expires and is swept without anyone sending anything, and
+/// a proposal's action is bounded (a validator registration fits, 32 KiB of evidence doesn't).
+#[test]
+fn one_owner_key_cant_freeze_a_multisig_and_expired_proposals_go() {
+    let mut t = T::new(&[]);
+    let alice = addr(ALICE);
+    let (k1, k2, rogue) = (keys(ALICE), keys(11), keys(12));
+    for seed in [11, 12] {
+        t.tx(ALICE, Action::AddKey { key_id: kid(seed), label: format!("device {seed}"), role: KeyRole::Owner }).unwrap();
+    }
+    t.tx(ALICE, Action::MultisigCreate { owners: vec![kid(ALICE), kid(11), kid(12)], threshold: 2 }).unwrap();
+    let junk = || Action::MultisigPropose { action: Box::new(Action::Unlock {}) };
+    for _ in 0..MAX_MULTISIG_PENDING / 3 {
+        t.tx_as(&rogue, &alice, junk()).unwrap();
+    }
+    let e = t.tx_as(&rogue, &alice, junk()).unwrap_err().to_string();
+    assert!(e.contains("its share among 3 owner keys"), "{e}");
+    // The honest keys still propose, and remove the rogue.
+    let id = t.st.governance.next_multisig_id;
+    t.tx_as(&k2, &alice, Action::MultisigPropose { action: Box::new(Action::RemoveKey { key_id: kid(12) }) }).unwrap();
+    t.tx_as(&k1, &alice, Action::MultisigApprove { id }).unwrap();
+    assert!(!owner_keys(&t.st, &alice).contains(&kid(12)));
+    // Its proposals expire, and the sweep takes them out of the state.
+    let expires = t.st.governance.multisig_proposals.values().map(|p| p.expires_at).max().unwrap();
+    assert_eq!(t.st.governance.multisig_proposals.len(), 10);
+    t.through(expires + 2);
+    assert!(t.st.governance.multisig_proposals.is_empty() && t.st.governance.multisigs[&alice].pending.is_empty());
+    // Bounded actions.
+    let evidence = Action::ReportEquivocation { evidence: "ab".repeat(MAX_EVIDENCE_BYTES) };
+    let e = t.tx_as(&k1, &alice, Action::MultisigPropose { action: Box::new(evidence) }).unwrap_err().to_string();
+    assert!(e.contains(&format!("at most {MAX_MULTISIG_ACTION_BYTES} bytes")), "{e}");
+    let node = keys(60);
+    let register = Action::RegisterValidator { consensus_key: hex::encode(node.public_key()), p2p_addr: "validator.example.com:30303".into(), http_addr: "https://validator.example.com".into(), bond: 10 * FANG, pop: make_pop([60; 32], CHAIN, &alice, "validator.example.com:30303", "https://validator.example.com") };
+    assert!(register.to_bytes().len() > 10 << 10);
+    let id = t.st.governance.next_multisig_id;
+    t.tx_as(&k1, &alice, Action::MultisigPropose { action: Box::new(register) }).unwrap();
+    t.tx_as(&k2, &alice, Action::MultisigApprove { id }).unwrap();
+    assert_eq!(t.st.validators[&node.address()].owner, alice);
+}
+
+/// Audit F47: once a vote closes its tally is final, and its vote records are swept, a batch a
+/// block (each vote's lock lives on in the voter's account until `Unlock`).
+#[test]
+fn closed_votes_are_swept_and_their_tallies_stay() {
+    let mut t = T::new(&[]);
+    let id = t.propose(ALICE, text());
+    for seed in [ALICE, BOB, CAROL] {
+        t.vote(seed, id, true, 5_000, 1).unwrap();
+    }
+    // Hundreds more, written straight into the state (with the tally they add up to).
+    let extra = VOTE_SWEEP as u64 * 2 + 7;
+    for i in 0..extra {
+        let voter = crate::crypto::render_address("boo", &crate::crypto::hash(&i.to_le_bytes()));
+        t.st.governance.votes.insert(IdKey::new(id, &voter), VoteRecord { aye: false, amount: 1, conviction: 1, weight: 1, lock_amount: 1, locked_until: 0, council: None, at: t.h });
+        let p = t.st.governance.proposals.get_mut(&id).unwrap();
+        (p.nay_amount, p.nay_weight, p.voters) = (p.nay_amount + 1, p.nay_weight + 1, p.voters + 1);
+    }
+    let end = t.p(id).voting_end;
+    t.through(end);
+    let p = t.p(id).clone();
+    assert_eq!((p.status, p.voters, p.aye_amount), (ProposalStatus::Queued, 3 + extra, (15_000 * FANG) as u128));
+    let left = |t: &T| t.st.governance.votes.range(IdKey::new(id, "")..).take_while(|(k, _)| k.id == id).count();
+    assert_eq!(left(&t), (3 + extra) as usize - VOTE_SWEEP, "the closing block swept a batch");
+    t.next();
+    t.next();
+    assert_eq!(left(&t), 0);
+    assert!(t.st.governance.closed_votes.is_empty());
+    assert_eq!(t.p(id).voters, 3 + extra, "the tally stays");
+    // The voters' locks are still there, and still lock.
+    assert!(t.st.account(&addr(CAROL)).locks.iter().any(|l| l.id == format!("vote:{id}")));
+    t.finish(id);
+    assert_eq!(t.p(id).status, ProposalStatus::Executed);
+}
+
+/// Audit F44: treasury spends that pass within 30 days count together against
+/// `treasury_large_bps`, so a large spend split into small proposals still needs ⅔.
+#[test]
+fn split_treasury_spends_count_together() {
+    let mut t = T::new(&[]);
+    let treasury = t.st.account(&t.st.treasury()).balance;
+    let small = treasury / 100 - FANG;
+    let ids: Vec<u64> = (0..5).map(|_| t.propose(ALICE, ProposalKind::TreasurySpend { to: addr(DAVE), amount: small })).collect();
+    for id in &ids {
+        t.vote(ALICE, *id, true, 50_000, 1).unwrap();
+        t.vote(BOB, *id, false, 40_000, 1).unwrap();
+    }
+    t.finish(ids[4]);
+    let status: Vec<ProposalStatus> = ids.iter().map(|id| t.p(*id).status).collect();
+    assert_eq!(status, [ProposalStatus::Executed, ProposalStatus::Rejected, ProposalStatus::Rejected, ProposalStatus::Rejected, ProposalStatus::Rejected]);
+    assert!(!t.p(ids[0]).tally.as_ref().unwrap().supermajority && t.p(ids[1]).tally.as_ref().unwrap().supermajority);
+    assert_eq!(t.bal(DAVE), small);
+    assert_eq!(recent_spends(&t.st, t.h), small as u128);
+    // Thirty days later the window has moved on (aged here by hand: a month of blocks is long).
+    for (at, _) in t.st.governance.recent_spends.values_mut() {
+        *at = 0;
+    }
+    assert_eq!(recent_spends(&t.st, 30 * 86_400), 0);
+    t.h = 30 * 86_400;
+    t.next();
+    let small = t.st.account(&t.st.treasury()).balance / 100 - FANG;
+    let id = t.propose(ALICE, ProposalKind::TreasurySpend { to: addr(DAVE), amount: small });
+    t.vote(ALICE, id, true, 50_000, 1).unwrap();
+    t.vote(BOB, id, false, 40_000, 1).unwrap();
+    t.finish(id);
+    assert_eq!(t.p(id).status, ProposalStatus::Executed, "{}", t.p(id).outcome);
+    assert_eq!(t.st.governance.recent_spends.keys().copied().collect::<Vec<_>>(), vec![id], "the old one was pruned");
 }
 
 /// GOV-2 and GOV-3: without admins, nobody but a hunt's creator moves its escrow, and the
@@ -1027,6 +1142,9 @@ fn records_round_trip_and_journals_roll_back() {
     t.tx(ALICE, Action::AddKey { key_id: kid(11), label: "laptop".into(), role: KeyRole::Owner }).unwrap();
     t.tx(ALICE, Action::MultisigCreate { owners: vec![kid(ALICE), kid(11)], threshold: 2 }).unwrap();
     t.tx(ALICE, Action::MultisigPropose { action: Box::new(Action::Propose { kind: ProposalKind::GrantSoul { to: addr(BOB), amount: SOUL, reason: "r".into() }, deposit: 50 * FANG, title: "t".into(), url: String::new() }) }).unwrap();
+    // A vote still open (closed votes are swept).
+    let open = t.propose(BOB, text());
+    t.vote(CAROL, open, true, 1, 0).unwrap();
     t.next();
     let mut records = vec![];
     t.st.for_each_record(|n, k, v| records.push(Ok((n, k.to_vec(), v.to_vec()))));
@@ -1042,7 +1160,7 @@ fn records_round_trip_and_journals_roll_back() {
     let mut j = Journal::default();
     let txs = [
         (keys(BOB), addr(BOB), Action::Propose { kind: text(), deposit: 50 * FANG, title: "t".into(), url: String::new() }),
-        (keys(BOB), addr(BOB), Action::Vote { proposal_id: id + 1, aye: true, amount: FANG, conviction: 1 }),
+        (keys(BOB), addr(BOB), Action::Vote { proposal_id: id + 2, aye: true, amount: FANG, conviction: 1 }),
         (keys(CAROL), addr(CAROL), Action::ClaimDistribution { distribution_id: id, amount: 5 * FANG, proof: proofs[1].iter().map(hex::encode).collect() }),
         (keys(11), addr(ALICE), Action::MultisigApprove { id: 0 }),
         (keys(BOB), addr(BOB), Action::MultisigCreate { owners: vec![kid(BOB)], threshold: 1 }),
@@ -1052,7 +1170,7 @@ fn records_round_trip_and_journals_roll_back() {
         tx.fee = min_fee(tx.size());
         assert_eq!(t.st.apply_j(&mut j, &tx, CHAIN, &addr(VALIDATORS[0]), t.h, true).unwrap(), Outcome::Applied, "{:?}", tx.action);
     }
-    assert_eq!(t.st.governance.next_proposal_id, id + 3, "the approval proposed #{}", id + 2);
+    assert_eq!(t.st.governance.next_proposal_id, id + 4, "the approval proposed #{}", id + 3);
     t.st.rollback(j);
     assert_eq!(t.st.full_root(), root);
     assert_eq!(t.st.commit_block().unwrap().records, vec![], "nothing left to commit");
@@ -1121,7 +1239,9 @@ fn random_governance_sequences_keep_the_invariants() {
     }
     t.through(t.h + 200);
     let g = &t.st.governance;
-    assert!(g.next_proposal_id > 10 && g.votes.len() > 10, "the sequence exercised governance ({} proposals, {} votes)", g.next_proposal_id, g.votes.len());
+    let voters: u64 = g.proposals.values().map(|p| p.voters).sum();
+    assert!(g.next_proposal_id > 10 && voters > 10, "the sequence exercised governance ({} proposals, {voters} votes)", g.next_proposal_id);
+    assert!(g.votes.is_empty() && g.closed_votes.is_empty(), "every closed vote was swept");
     assert!(g.proposals.values().any(|p| p.status == ProposalStatus::Executed) && g.proposals.values().any(|p| p.status == ProposalStatus::Rejected));
     assert!(!g.distribution_claims.is_empty() && !g.multisigs.is_empty());
     assert!(g.open_proposals.is_empty() && g.open_distributions.is_empty() && escrow(&t.st) == 0);
