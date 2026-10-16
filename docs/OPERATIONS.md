@@ -206,7 +206,8 @@ sudo useradd --system --home /var/lib/blockula --shell /usr/sbin/nologin blockul
 sudo install -d -o blockula -g blockula -m 700 /var/lib/blockula
 
 # 2. Install a verified binary (see Releases). As your own user, with `gh auth login` done:
-#    REQUIRE_VERIFY refuses anything that isn't proven by provenance or the release signature.
+#    REQUIRE_VERIFY refuses anything not proven by build provenance and, once the release key id
+#    is published, by the release signature too (checked with the blockula you already have).
 curl -fsSLO https://github.com/jackdishman/blockula/releases/latest/download/install.sh
 gh attestation verify install.sh --repo jackdishman/blockula
 BLOCKULA_REQUIRE_VERIFY=1 sh install.sh
@@ -592,7 +593,7 @@ sha256sum --ignore-missing -c checksums.txt
 scripts/reproduce-release.sh $V
 ```
 
-`scripts/install.sh` does a subset automatically: the SHA-256 check always, provenance when a logged-in `gh` is available, and the signature when an installed `blockula` can verify it. If neither of the last two ran, it prints a loud warning, and `BLOCKULA_REQUIRE_VERIFY=1` turns that into a refusal. Validators should always install with `BLOCKULA_REQUIRE_VERIFY=1`.
+`scripts/install.sh` does a subset automatically: the SHA-256 check always, provenance when a logged-in `gh` is available, and the signature when an installed `blockula` can verify it. It prints which checks ran and which it skipped, and refuses a release that fails one. Once the release key id is known (built into `install.sh`, or `BLOCKULA_RELEASE_KEY_ID`), a release without `checksums.txt.sig` is refused outright: provenance alone is all a compromised GitHub account or release workflow can produce, and it can't forge the offline signature (audit F49; the MCP's `install_node` does the same, F69). If neither provenance nor the signature ran, it prints a loud warning. `BLOCKULA_REQUIRE_VERIFY=1` refuses unless provenance was checked and, once a key id is known, the signature too; on a first install there is no `blockula` to check the signature with yet, so install the previous release or a source build first, or verify by hand as above. Validators should always install with `BLOCKULA_REQUIRE_VERIFY=1`. `scripts/test-install.sh` tests this policy offline (CI, `ops` job).
 
 ### npm packages
 

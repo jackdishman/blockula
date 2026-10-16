@@ -476,6 +476,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
 - **Effort:** M. **Who:** Team.
 - ✅ **Wave 1:** pinned toolchain (1.98.1), images by digest and actions by SHA with least-privilege tokens (`scripts/check-pins.sh` in CI), reproducible release builds with an in-CI reproducer, SLSA provenance, an offline ML-DSA release signature that `install.sh` verifies, npm trusted publishing, exact crypto pins, cargo-deny, npm audit, Dependabot. Pending: independent builders reproducing a real release.
 - ✅ **Wave 3 (P-CLIENTS):** the MCP's `install_node` runs the same checks as `install.sh`: checksum, provenance with a logged-in `gh`, and the release signature through the SDK (`verifyReleaseSignature`, same known-answer vector as `scripts/release-sig.mjs`); `BLOCKULA_REQUIRE_VERIFY=1` refuses checksum-only installs.
+- ✅ **Audit fixes (ops, mainnet-prep):** once a release key id is known, `install.sh` refuses a release without `checksums.txt.sig` (or with an invalid one) even when provenance passes, says which checks it skipped (no logged-in `gh`, no installed verifier), and `BLOCKULA_REQUIRE_VERIFY=1` then requires provenance and the signature both; `BLOCKULA_RELEASE_KEY_ID` sets the key id until the ceremony builds it in. Tested offline by `scripts/test-install.sh` in CI (F49).
 
 ### Wallets & clients
 
