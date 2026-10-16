@@ -467,6 +467,7 @@ pub fn trusted_root(g: &Genesis, m: &Manifest, trust: &crate::checkpoints::Trust
 }
 
 /// [`verify_manifest_from`] with the history verified from the genesis set.
+#[cfg_attr(not(test), allow(dead_code))] // tests and the fuzz targets; joiners verify from their trusted root
 pub fn verify_manifest(g: &Genesis, m: &Manifest, history: &EpochRegistry) -> Result<Verified> {
     verify_manifest_from(g, m, history, &epochs::Root::genesis(g))
 }
@@ -799,8 +800,9 @@ mod tests {
     }
 
     /// A manifest for a snapshot at 100 with blocks 101..=`last` (104 certifies the state root),
-    /// signed by `seeds` (the set of every epoch in `epochs`), with the epoch anchor if it needs one.
-    fn manifest(g: &Genesis, seeds: &[[u8; 32]], epochs: EpochRegistry, last: u64) -> Manifest {
+    /// signed by `seeds` (the set of every epoch its history has), with the epoch anchor if it
+    /// needs one.
+    fn manifest(g: &Genesis, seeds: &[[u8; 32]], last: u64) -> Manifest {
         let state_root = crate::crypto::hash(b"the state at 100");
         let mut blocks = vec![];
         let mut parent = Digest(crate::crypto::hash(b"block 100"));
@@ -822,7 +824,6 @@ mod tests {
             chunks: vec![ChunkInfo { hash: hex::encode(crate::crypto::hash(b"c")), size: 1 }],
             blocks: blocks.iter().map(|b| hex::encode(b.encode())).collect(),
             finalization: finalization(g, seeds, blocks.last().unwrap(), params.epoch_of(last)),
-            epochs,
             anchor,
         }
     }
@@ -847,8 +848,9 @@ mod tests {
     #[test]
     fn epoch_anchor_is_certified_by_the_previous_epochs_set() {
         let (root, g, seeds) = four_validators("anchor");
-        let m = manifest(&g, &seeds, steady(&g, 10), 104);
-        let v = verify_manifest(&g, &m).unwrap();
+        let m = manifest(&g, &seeds, 104);
+        let h = steady(&g, 10);
+        let v = verify_manifest(&g, &m, &h).unwrap();
         let anchor_hash = hex::encode(anchor_block(99).digest_bytes());
         assert_eq!(v.epoch_start, Some((99, anchor_hash.clone())));
         assert_eq!(v.anchor, m.anchor);
@@ -856,35 +858,35 @@ mod tests {
         assert_eq!((v.hash_at(103), v.hash_at(98), v.hash_at(105)), (Some(hex::encode(v.blocks[2].digest_bytes())), None, None));
         let mut missing = m.clone();
         missing.anchor = None;
-        assert!(err(verify_manifest(&g, &missing)).contains("doesn't certify the epoch anchor #99"));
+        assert!(err(verify_manifest(&g, &missing, &h)).contains("doesn't certify the epoch anchor #99"));
         let mut tampered = m.clone();
         let mut f = hex::decode(&tampered.anchor.as_ref().unwrap().finalization).unwrap();
         let n = f.len();
         f[n - 100] ^= 0xff;
         tampered.anchor.as_mut().unwrap().finalization = hex::encode(f);
-        assert!(err(verify_manifest(&g, &tampered)).contains("epoch anchor"));
+        assert!(err(verify_manifest(&g, &tampered, &h)).contains("epoch anchor"));
         let with = |block: &CBlock, epoch: u64| {
             let mut m = m.clone();
             m.anchor = Some(Anchor { block: hex::encode(block.encode()), finalization: finalization(&g, &seeds, block, epoch) });
             m
         };
-        assert!(err(verify_manifest(&g, &with(&anchor_block(99), 10))).contains("from epoch 10, expected 9"));
-        assert!(err(verify_manifest(&g, &with(&anchor_block(98), 9))).contains("is #98, expected #99"));
+        assert!(err(verify_manifest(&g, &with(&anchor_block(99), 10), &h)).contains("from epoch 10, expected 9"));
+        assert!(err(verify_manifest(&g, &with(&anchor_block(98), 9), &h)).contains("is #98, expected #99"));
         let mut swapped = with(&anchor_block(99), 9);
         swapped.anchor.as_mut().unwrap().finalization = finalization(&g, &seeds, &CBlock::new(Digest([1; 32]), 99, 99, 98, 0, String::new(), 0, [0; 32], vec![]), 9);
-        assert!(err(verify_manifest(&g, &swapped)).contains("for another block"));
+        assert!(err(verify_manifest(&g, &swapped, &h)).contains("for another block"));
         // Signed by a set that isn't epoch 9's.
         let strangers: Vec<[u8; 32]> = (0..4u8).map(|i| [200 + i; 32]).collect();
         let mut forged = m.clone();
         forged.anchor.as_mut().unwrap().finalization = finalization(&g, &strangers, &anchor_block(99), 9);
-        assert!(verify_manifest(&g, &forged).is_err());
+        assert!(verify_manifest(&g, &forged, &h).is_err());
         // Blocks through 109 end epoch 10: the anchor is the manifest's own last block.
-        let through = manifest(&g, &seeds, steady(&g, 10), 109);
+        let through = manifest(&g, &seeds, 109);
         assert!(through.anchor.is_none());
-        assert_eq!(verify_manifest(&g, &through).unwrap().epoch_start, None);
+        assert_eq!(verify_manifest(&g, &through, &h).unwrap().epoch_start, None);
         let mut extra = through.clone();
         extra.anchor = m.anchor.clone();
-        assert!(err(verify_manifest(&g, &extra)).contains("doesn't need"));
+        assert!(err(verify_manifest(&g, &extra, &h)).contains("doesn't need"));
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -894,7 +896,7 @@ mod tests {
     #[test]
     fn manifests_are_checked_against_trusted_checkpoints() {
         let (root, g, seeds) = four_validators("trusted");
-        let v = verify_manifest(&g, &manifest(&g, &seeds, steady(&g, 10), 104)).unwrap();
+        let v = verify_manifest(&g, &manifest(&g, &seeds, 104), &steady(&g, 10)).unwrap();
         let real_set = crate::checkpoints::genesis_checkpoint(&g).set_hash;
         let trust = |cps: Vec<Checkpoint>| Trust::new(&g, &Pins { checkpoints: cps, ..Default::default() }, false).unwrap();
         let cp = |height: u64, hash: &str, set_hash: Option<String>| Checkpoint { height, hash: hash.into(), set_hash };
@@ -925,17 +927,68 @@ mod tests {
         let evil: Vec<[u8; 32]> = (0..4u8).map(|i| [200 + i; 32]).collect();
         let mut reg = steady(&g, 5);
         assert!(reg.record(6, keys(&evil)));
+        // The old keys sign whatever they're told to.
+        let told = reg.clone();
         for s in &seeds[..3] {
-            reg.sign_missing(&g.chain_id, *s);
+            reg.sign_missing(&g.chain_id, *s, |e| told.set(e).cloned());
         }
         for e in 7..=10 {
             reg.record(e, keys(&evil));
         }
-        let forged = manifest(&g, &evil, reg, 104);
-        let v = verify_manifest(&g, &forged).expect("the history verifies from the genesis: that's the attack");
+        let forged = manifest(&g, &evil, 104);
+        let v = verify_manifest(&g, &forged, &reg).expect("the history verifies from the genesis: that's the attack");
         let pinned = |set_hash: Option<String>| Trust::new(&g, &Pins { checkpoints: vec![Checkpoint { height: 75, hash: "ab".repeat(32), set_hash }], ..Default::default() }, false).unwrap();
         let err = v.check_trust(&pinned(crate::checkpoints::genesis_checkpoint(&g).set_hash)).unwrap_err().to_string();
         assert!(err.contains("epoch 7") && err.contains("forged"), "{err}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// F08: a peer's history may run past the manifest's certified epoch with changes nobody
+    /// signed (here, at epoch 50, to keys the peer holds). The joiner keeps only what it verified,
+    /// from its root through the last block's epoch, so nothing of the planted change reaches its
+    /// registry, and a validator's `sign_missing` (which also needs its own state to show both
+    /// sides) has nothing of it to sign.
+    #[test]
+    fn only_the_verified_history_is_adopted_from_a_manifest() {
+        let (root, g, seeds) = four_validators("planted");
+        let evil: Vec<[u8; 32]> = (0..4u8).map(|i| [200 + i; 32]).collect();
+        let mut history = steady(&g, 10);
+        assert!(history.record(50, keys(&evil)));
+        let v = verify_manifest(&g, &manifest(&g, &seeds, 104), &history).unwrap();
+        assert_eq!((v.epochs.base, v.epochs.known_through), (0, 10));
+        assert_eq!(v.epochs.sets.keys().copied().collect::<Vec<_>>(), vec![0], "only the genesis set: no change through epoch 10");
+        let mut adopted = v.epochs.clone();
+        let executed = steady(&g, 10);
+        assert!(adopted.sign_missing(&g.chain_id, seeds[0], |e| executed.set(e).cloned()).is_empty());
+        // Executing on, the joiner records the epochs itself; the planted set never comes back.
+        for e in 11..=50 {
+            adopted.record(e, keys(&seeds));
+        }
+        assert_eq!(adopted.set(50), Some(&keys(&seeds)));
+        assert!(adopted.sign_missing(&g.chain_id, seeds[0], |e| executed.set(e).or(executed.set(10)).cloned()).is_empty());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// F10: a joiner verifies the history from its newest trusted root, so a peer that keeps only
+    /// a window of it (from epoch 5 here) serves enough when a checkpoint pins a set at or after
+    /// the window's start, and is refused, pointing at `--checkpoint`, when only the genesis is.
+    #[test]
+    fn a_windowed_history_verifies_from_a_pinned_root() {
+        let (root, g, seeds) = four_validators("window");
+        let mut kept = steady(&g, 10);
+        kept.rebase(5);
+        let m = manifest(&g, &seeds, 104);
+        let genesis_only = Trust::new(&g, &Pins::default(), false).unwrap();
+        assert!(format!("{:#}", verify_manifest_trusted(&g, &m, &kept, &genesis_only).err().unwrap()).contains("--checkpoint"));
+        // A checkpoint at #49 pins epoch 5's set (the set certifying #50).
+        let set_hash = Some(hex::encode(epochs::set_hash(&keys(&seeds))));
+        let pinned = Trust::new(&g, &Pins { checkpoints: vec![Checkpoint { height: 49, hash: "ab".repeat(32), set_hash }], ..Default::default() }, false).unwrap();
+        assert_eq!(trusted_root(&g, &m, &pinned).epoch, 5);
+        let v = verify_manifest_trusted(&g, &m, &kept, &pinned).unwrap();
+        assert_eq!((v.epochs.base, v.epochs.known_through), (5, 10));
+        // A pin the window contradicts is a forgery.
+        let wrong = Trust::new(&g, &Pins { checkpoints: vec![Checkpoint { height: 49, hash: "ab".repeat(32), set_hash: Some("cd".repeat(32)) }], ..Default::default() }, false).unwrap();
+        assert!(format!("{:#}", verify_manifest_trusted(&g, &m, &kept, &wrong).err().unwrap()).contains("forged"));
         std::fs::remove_dir_all(root).ok();
     }
 

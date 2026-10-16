@@ -131,6 +131,9 @@ impl EpochRegistry {
             // A different set than recorded before: its proofs were for that one.
             self.proofs.remove(&epoch);
             self.sets.insert(epoch, keys);
+        } else if !changed && epoch > self.base && self.sets.remove(&epoch).is_some() {
+            // Executed, the set didn't change here after all: drop what was recorded instead.
+            self.proofs.remove(&epoch);
         }
         self.known_through = self.known_through.max(epoch);
         changed
@@ -150,22 +153,6 @@ impl EpochRegistry {
         self.proofs.clear();
         self.format = HANDOFF_FORMAT;
         true
-    }
-
-    /// Adds a handoff signature after checking it. Returns whether it was new. Epoch 0's set is
-    /// the genesis set: nothing hands off to it, so a "proof" for it is an error (FUZZ-2).
-    pub fn add_sig(&mut self, chain_id: &str, epoch: u64, signer: u32, sig_hex: &str) -> Result<bool> {
-        let before = epoch.checked_sub(1).ok_or_else(|| anyhow!("epoch 0 is the genesis set; it has no handoff"))?;
-        ensure!(epoch > self.base, "epoch {epoch} isn't after this registry's base ({})", self.base);
-        let new_set = self.sets.get(&epoch).ok_or_else(|| anyhow!("no set change recorded at epoch {epoch}"))?;
-        let prev = self.set(before).ok_or_else(|| anyhow!("unknown set before epoch {epoch}"))?;
-        // Already held: nothing to verify (F19, F26).
-        if self.proofs.get(&epoch).is_some_and(|p| p.contains_key(&signer)) {
-            return Ok(false);
-        }
-        let pk_hex = prev.get(signer as usize).ok_or_else(|| anyhow!("signer {signer} isn't in the previous set"))?;
-        verify_sig(pk_hex, &handoff_message(chain_id, epoch, prev, new_set), sig_hex)?;
-        Ok(self.proofs.entry(epoch).or_default().insert(signer, sig_hex.to_string()).is_none())
     }
 
     /// Signs every recorded set change where `key` was in the outgoing set and hasn't signed yet,
@@ -236,7 +223,9 @@ impl EpochRegistry {
     pub fn add_verified(&mut self, chain_id: &str, verified: Vec<Candidate>) -> usize {
         let mut added = 0;
         for c in verified {
-            let (Some(new), Some(prev)) = (self.sets.get(&c.epoch), self.set(c.epoch - 1)) else { continue };
+            // Nothing hands off to the base (or the genesis) set.
+            let Some(before) = c.epoch.checked_sub(1).filter(|_| c.epoch > self.base) else { continue };
+            let (Some(new), Some(prev)) = (self.sets.get(&c.epoch), self.set(before)) else { continue };
             if prev.get(c.signer as usize) != Some(&c.key) || handoff_message(chain_id, c.epoch, prev, new) != c.msg {
                 continue;
             }
@@ -302,7 +291,8 @@ impl EpochRegistry {
         let first = self.set(base).cloned().unwrap_or_default();
         let mut bytes = first.iter().map(|k| k.len() + 3).sum::<usize>();
         let mut out = EpochRegistry { sets: BTreeMap::from([(base, first)]), known_through: self.known_through.max(base), proofs: BTreeMap::new(), base, format: self.format };
-        for (&e, set) in self.sets.range(base.saturating_add(1)..).filter(|(e, _)| **e > base) {
+        let known = self.known_through;
+        for (&e, set) in self.sets.range(base.saturating_add(1)..).filter(|(e, _)| **e > base).take_while(|(e, _)| **e <= known) {
             let q = self.set(e - 1).map_or(0, |p| quorum(p.len()));
             let proofs: BTreeMap<u32, String> = self.proofs.get(&e).map(|p| p.iter().take(q).map(|(i, s)| (*i, s.clone())).collect()).unwrap_or_default();
             let size = set.iter().map(|k| k.len() + 3).sum::<usize>() + proofs.values().map(|s| s.len() + 16).sum::<usize>() + 32;
@@ -324,22 +314,20 @@ impl EpochRegistry {
         ensure!(page.base == self.known_through, "the page starts at epoch {}, not {}", page.base, self.known_through);
         ensure!(page.sets.get(&page.base).is_some() && page.set(page.base) == self.set(self.known_through), "the page's starting set isn't where the last one ended");
         ensure!(page.known_through >= page.base, "the page ends before it starts");
-        for (e, s) in page.sets.range(page.base.saturating_add(1)..) {
+        // Only what the page covers: changes after its start, through its end.
+        let within = |e: &u64| *e > page.base && *e <= page.known_through;
+        for (e, s) in page.sets.range(page.base.saturating_add(1)..).filter(|(e, _)| within(e)) {
             self.sets.insert(*e, s.clone());
         }
-        for (e, p) in page.proofs.range(page.base.saturating_add(1)..) {
+        for (e, p) in page.proofs.range(page.base.saturating_add(1)..).filter(|(e, _)| within(e)) {
             self.proofs.insert(*e, p.clone());
         }
         self.known_through = page.known_through;
         self.format = page.format;
         Ok(())
     }
-
-    /// Roughly how many bytes its JSON takes (for limits and metrics).
-    pub fn approx_bytes(&self) -> usize {
-        self.sets.values().flatten().map(|k| k.len() + 3).sum::<usize>() + self.proofs.values().flat_map(|p| p.values()).map(|s| s.len() + 16).sum::<usize>()
-    }
 }
+
 
 fn verify_sig(pk_hex: &str, msg: &[u8], sig_hex: &str) -> Result<()> {
     let pk = hex::decode(pk_hex).ok().and_then(|b| PublicKey::from_bytes(&b)).ok_or_else(|| anyhow!("bad validator key"))?;
@@ -365,6 +353,7 @@ impl Root {
 
 /// Verifies a peer's registry from the genesis set up to `epoch` and returns the set in effect
 /// at `epoch` (for epoch 0, the genesis set). Never panics on a peer's registry (FUZZ-1).
+#[cfg_attr(not(test), allow(dead_code))] // tests and the fuzz targets; nodes verify from a `Root`
 pub fn verify_chain(g: &Genesis, claimed: &EpochRegistry, epoch: u64) -> Result<Vec<String>> {
     verify_from(g, claimed, &Root::genesis(g), epoch)
 }
@@ -634,7 +623,8 @@ mod tests {
     }
 
     /// FUZZ-2: a peer's "handoff proof" for epoch 0 made `add_sig` compute `0 - 1`, an overflow
-    /// panic (overflow checks are on in release) that ended the `exchange_epochs` task.
+    /// panic (overflow checks are on in release) that ended the `exchange_epochs` task. Merging
+    /// skips it (nothing hands off to the genesis set), and so does adding a verified one.
     #[test]
     fn handoff_proofs_for_epoch_0_are_ignored() {
         let (root, g) = one_validator_genesis("fuzz2");
@@ -642,7 +632,8 @@ mod tests {
         let mut peer = reg.clone();
         peer.proofs.entry(0).or_default().insert(0, "00".into());
         assert_eq!(reg.merge_sigs("ep0", &peer), 0);
-        assert!(reg.add_sig("ep0", 0, 0, "00").unwrap_err().to_string().contains("genesis"));
+        assert!(reg.candidates("ep0", &peer, usize::MAX).is_empty());
+        assert!(reg.add_verified("ep0", vec![Candidate { epoch: 0, signer: 0, sig: "00".into(), key: reg.sets[&0][0].clone(), msg: vec![] }]) == 0);
         assert_eq!(reg, EpochRegistry::genesis(&g), "nothing was recorded");
         std::fs::remove_dir_all(root).ok();
     }

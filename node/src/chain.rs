@@ -2897,17 +2897,6 @@ impl Chain {
         n
     }
 
-    /// Merges a peer's handoff signatures (verifying each one we lack, under this lock: tests and
-    /// rebuilds; `node::exchange_epochs` verifies without it and calls [`Chain::add_handoffs`]).
-    pub fn merge_epochs(&mut self, other: &crate::epochs::EpochRegistry) -> usize {
-        let chain_id = self.genesis.chain_id.clone();
-        let n = self.epochs.merge_sigs(&chain_id, other);
-        if n > 0 {
-            self.save_epochs();
-        }
-        n
-    }
-
     /// Adds handoff signatures verified elsewhere (`epochs::verify_candidates`).
     pub fn add_handoffs(&mut self, verified: Vec<crate::epochs::Candidate>) -> usize {
         let chain_id = self.genesis.chain_id.clone();
@@ -3420,9 +3409,10 @@ impl OpenCtx<'_> {
         }
         let genesis_epochs = crate::epochs::EpochRegistry::genesis(self.genesis);
         let epochs = match self.saved_epochs {
-            // A genesis home only takes a history that starts at the genesis: one a fast sync
-            // saved before a crash kept it from switching homes is a peer's, not ours (F08).
-            Some(e) if p.height == 0 && self.base.is_none() && (e.base != 0 || e.sets.get(&0) != genesis_epochs.sets.get(&0)) => genesis_epochs,
+            // A genesis home that hasn't executed anything holds only the genesis set: a history
+            // saved there is one a fast sync verified and a crash kept from installing (or a
+            // peer's), not this node's own (F08). Executing records it again.
+            Some(_) if p.height == 0 && self.base.is_none() => genesis_epochs,
             Some(e) => e.clone(),
             None if p.height == 0 => genesis_epochs,
             None => bail!("epochs.json is missing"),
@@ -5226,6 +5216,27 @@ mod persistence {
         assert_eq!((c.state.root(), c.replayed), (root, height));
         drop(c);
         fs::remove_dir_all(other).ok();
+        fs::remove_dir_all(h).ok();
+    }
+
+    /// F08: a genesis home that hasn't executed anything ignores an `epochs.json` it finds (a fast
+    /// sync's verified history that a crash kept from installing, or anyone's): it starts from the
+    /// genesis set, and its validator signs no handoff for the changes that file claimed.
+    #[test]
+    fn a_genesis_home_ignores_a_saved_history_it_never_executed() {
+        let h = home("planted");
+        Chain::summon(&h, &SummonOpts::new("planted", 1)).unwrap();
+        let c = Chain::open(&h).unwrap();
+        let genesis = crate::epochs::EpochRegistry::genesis(&c.genesis);
+        assert!(c.keys.is_some(), "a validator's home");
+        drop(c);
+        let mut planted = genesis.clone();
+        assert!(planted.record(5, vec![hex::encode(commonware_cryptography::Signer::public_key(&crate::pq::PrivateKey::from_seed_bytes([200; 32])).as_ref())]));
+        fs::write(h.join("epochs.json"), serde_json::to_vec(&planted).unwrap()).unwrap();
+        let mut c = Chain::open(&h).unwrap();
+        assert_eq!(c.epochs, genesis);
+        assert_eq!(c.sign_handoffs(), 0);
+        drop(c);
         fs::remove_dir_all(h).ok();
     }
 

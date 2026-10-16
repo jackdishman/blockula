@@ -495,41 +495,61 @@ fn fast_sync_from_certified_snapshot_and_tamper_rejection() {
         let home0 = homes[0].clone();
         let chunks: Vec<Vec<u8>> = (0..m.chunks.len()).map(|i| snapshot::chunk(&home0, m.height, i).unwrap()).collect();
 
+        // The validator-set history comes from /api/epochs pages (the node's whole registry
+        // here, which runs past the snapshot's epoch: only what's verified is kept, F08).
+        let history = {
+            let live = vals[0].chain.lock().live.clone();
+            let page = |from: u64| -> (crate::epochs::EpochRegistry, Option<u64>) {
+                let v: serde_json::Value = serde_json::from_slice(&live.epoch_page(from)).unwrap();
+                (serde_json::from_value(v.clone()).unwrap(), v["next"].as_u64())
+            };
+            let (mut h, mut next) = page(0);
+            while let Some(from) = next {
+                let (p, n) = page(from);
+                h.append_page(&p).unwrap();
+                next = n;
+            }
+            h
+        };
+        let last_epoch = genesis.params().epoch_of(m.height + m.blocks.len() as u64);
+        assert!(history.known_through > last_epoch, "the node knows sets past the snapshot's epoch");
         // Tampering is caught.
-        let v = snapshot::verify_manifest(&genesis, &m).unwrap();
+        let v = snapshot::verify_manifest(&genesis, &m, &history).unwrap();
+        assert_eq!((v.epochs.base, v.epochs.known_through), (0, last_epoch), "nothing past the certified epoch is adopted");
+        assert!(v.epochs.sets.keys().all(|e| *e <= last_epoch) && v.epochs.proofs.keys().all(|e| *e <= last_epoch));
         // So is a manifest that contradicts a trusted checkpoint (here at the epoch anchor, #299).
         let real = crate::checkpoints::Checkpoint { height: 299, hash: vals[0].chain.lock().hash_at(299).unwrap(), set_hash: None };
         let trusting = |cp| crate::checkpoints::Trust::new(&genesis, &crate::checkpoints::Pins { checkpoints: vec![cp], ..Default::default() }, false).unwrap();
-        snapshot::verify_manifest_trusted(&genesis, &m, &trusting(real.clone())).unwrap();
-        assert!(snapshot::verify_manifest_trusted(&genesis, &m, &trusting(crate::checkpoints::Checkpoint { hash: "ab".repeat(32), ..real })).is_err());
+        snapshot::verify_manifest_trusted(&genesis, &m, &history, &trusting(real.clone())).unwrap();
+        assert!(snapshot::verify_manifest_trusted(&genesis, &m, &history, &trusting(crate::checkpoints::Checkpoint { hash: "ab".repeat(32), ..real })).is_err());
         let mut bad = chunks.clone();
         bad[0][10] ^= 1;
         assert!(snapshot::restore(&genesis, &v, &bad).err().unwrap().to_string().contains("doesn't match"));
         // A manifest can't make the joiner download (and hold) more than a state's worth of chunks.
         let mut flood = m.clone();
         flood.chunks = vec![m.chunks[0].clone(); snapshot::MAX_SNAPSHOT_CHUNKS + 1];
-        assert!(snapshot::verify_manifest(&genesis, &flood).err().unwrap().to_string().contains("chunks"));
+        assert!(snapshot::verify_manifest(&genesis, &flood, &history).err().unwrap().to_string().contains("chunks"));
         let mut big = m.clone();
         big.chunks[0].size = snapshot::CHUNK_SIZE + 1;
-        assert!(snapshot::verify_manifest(&genesis, &big).err().unwrap().to_string().contains("chunk sizes"));
+        assert!(snapshot::verify_manifest(&genesis, &big, &history).err().unwrap().to_string().contains("chunk sizes"));
         let mut wrong_root = m.clone();
         wrong_root.state_root = "11".repeat(32);
-        assert!(snapshot::verify_manifest(&genesis, &wrong_root).err().unwrap().to_string().contains("commit"));
+        assert!(snapshot::verify_manifest(&genesis, &wrong_root, &history).err().unwrap().to_string().contains("commit"));
         let mut forged = m.clone();
         let mut f = hex::decode(&forged.finalization).unwrap();
         let n = f.len();
         f[n - 100] ^= 0xff;
         forged.finalization = hex::encode(f);
-        assert!(snapshot::verify_manifest(&genesis, &forged).is_err(), "forged certificate");
-        let mut wrong_set = m.clone();
+        assert!(snapshot::verify_manifest(&genesis, &forged, &history).is_err(), "forged certificate");
+        let mut wrong_set = history.clone();
         let fake: Vec<String> = (0..4u8).map(|i| hex::encode(commonware_cryptography::Signer::public_key(&PrivateKey::from_seed_bytes([200 + i; 32])).as_ref())).collect();
         let mut fake_sorted = fake.clone();
         fake_sorted.sort();
-        wrong_set.epochs.sets.insert(1, fake_sorted);
-        assert!(snapshot::verify_manifest(&genesis, &wrong_set).err().unwrap().to_string().contains("validator set"));
-        let mut lying_genesis = m.clone();
-        lying_genesis.epochs.sets.insert(0, fake);
-        assert!(snapshot::verify_manifest(&genesis, &lying_genesis).is_err());
+        wrong_set.sets.insert(1, fake_sorted);
+        assert!(snapshot::verify_manifest(&genesis, &m, &wrong_set).err().unwrap().to_string().contains("validator set"));
+        let mut lying_genesis = history.clone();
+        lying_genesis.sets.insert(0, fake);
+        assert!(snapshot::verify_manifest(&genesis, &m, &lying_genesis).is_err());
 
         // The honest manifest installs and the node follows the chain.
         let state = snapshot::restore(&genesis, &v, &chunks).unwrap();
