@@ -2426,7 +2426,9 @@ impl Chain {
     }
 
     /// The network height peers claim: the median of their latest claims, so one lying peer
-    /// can't move it. Display-only (status/health); verified heights come from certificates.
+    /// can't move it. Display-only (status/health read it through `Live`); verified heights come
+    /// from certificates.
+    #[cfg(test)]
     pub fn network_height_claimed(&self) -> u64 {
         self.live.claimed.load(std::sync::atomic::Ordering::Relaxed).max(self.finalized_tip).max(self.height)
     }
@@ -3025,7 +3027,8 @@ impl Chain {
 
     /// Queued txs outside the validator-duty lane: what `MAX_MEMPOOL` bounds.
     fn regular_len(&self) -> usize {
-        self.mempool.len() - self.lane.len()
+        // The lane only holds queued ids (`rebuild_pending` prunes it), so this never saturates.
+        self.mempool.len().saturating_sub(self.lane.len())
     }
 
     /// The lane slot a validator duty would take (`staking::duty_of`), if its validator has one
