@@ -39,8 +39,9 @@ pub fn endowment(prefix: &str) -> String {
     crypto::system_address(prefix, "endowment")
 }
 
-/// The keyless validator bootstrap delegation (DEC-5): delegated by formula, returned to the
-/// treasury in years 2–4. (The foundation is an ordinary multisig account.)
+/// The keyless validator bootstrap delegation (DEC-5): delegated by formula at every epoch
+/// boundary, returned to the treasury on its vesting curve (years 2–4 on mainnet), its rewards
+/// to the treasury (`staking::bootstrap_epoch`). (The foundation is an ordinary multisig account.)
 pub fn bootstrap_delegation(prefix: &str) -> String {
     crypto::system_address(prefix, "bootstrap-delegation")
 }
@@ -174,6 +175,10 @@ pub struct Genesis {
     /// Features on from genesis (`upgrade::KNOWN_FEATURES`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub features: Vec<String>,
+    /// Accounts whose validators the bootstrap delegation passes over (DEC-5: the founder's and
+    /// the foundation's, now and later), sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bootstrap_excluded: Vec<String>,
 }
 
 fn default_epoch_blocks() -> u64 {
@@ -203,6 +208,8 @@ pub struct Params {
     pub poc: crate::poc::PocTimes,
     /// The chain's address prefix (see [`Params::prefix`]).
     pub address_prefix: String,
+    /// Owners whose validators the bootstrap delegation passes over (`Genesis::bootstrap_excluded`).
+    pub bootstrap_excluded: Vec<String>,
 }
 
 impl Params {
@@ -274,7 +281,7 @@ impl Genesis {
 
     pub fn params(&self) -> Params {
         let poc = self.contribution.clone().unwrap_or_else(|| crate::poc::PocTimes::for_block_time(self.block_time_ms));
-        Params { block_time_ms: self.block_time_ms, epoch_blocks: self.epoch_blocks, admins: self.validator_admins.clone(), poc, address_prefix: self.address_prefix.clone() }
+        Params { block_time_ms: self.block_time_ms, epoch_blocks: self.epoch_blocks, admins: self.validator_admins.clone(), poc, address_prefix: self.address_prefix.clone(), bootstrap_excluded: self.bootstrap_excluded.clone() }
     }
 
     /// The governance-adjustable parameters at genesis: the defaults with `params` applied.
@@ -418,6 +425,18 @@ impl Genesis {
         // first boundaries), so it must fit the p2p layer's peer set like any later one.
         let max_set = crate::consensus::MAX_PEERS_PER_SET;
         ensure!(!self.validators.is_empty() && self.validators.len() <= max_set, "a genesis needs 1–{max_set} validators (the p2p peer set's bound)");
+        // Each validator once, with a well-formed consensus key that is its address: a validator
+        // listed twice makes epoch 0's set unusable (consensus refuses duplicate keys) and bonds
+        // its operator's self-bond twice (audit F33).
+        let (mut addresses, mut public_keys) = (BTreeSet::new(), BTreeSet::new());
+        for v in &self.validators {
+            let who = format!("validator {}", v.address);
+            ensure!(crypto::is_lower_hex(&v.public_key) && v.public_key.len() == crypto::PUBLIC_KEY_LEN * 2, "{who}: public_key must be an ML-DSA-65 public key in lowercase hex");
+            ensure!(v.address == crypto::address_with_prefix(prefix, &hex::decode(&v.public_key)?), "{who} isn't its public key's address");
+            ensure!(addresses.insert(v.address.as_str()) && public_keys.insert(v.public_key.as_str()), "{who} is listed twice");
+            check_host_port(&v.p2p_addr).with_context(|| format!("{who}: p2p_addr"))?;
+            check_http_addr(&v.http_addr).with_context(|| format!("{who}: http_addr"))?;
+        }
         let mut keys = BTreeSet::new();
         let mut bonds: BTreeMap<&str, u64> = BTreeMap::new();
         for o in &self.operators {
@@ -461,6 +480,11 @@ impl Genesis {
             check_reason(&e.reason).with_context(|| format!("soul_ledger: {}", e.account))?;
             ensure!(souls.insert(&e.account), "soul_ledger lists {} twice", e.account);
         }
+        for (i, a) in self.bootstrap_excluded.iter().enumerate() {
+            ensure!(crypto::parse_address(a).map(|(p, _)| p) == Some(prefix), "bootstrap_excluded: {a} isn't a {prefix}1… address");
+            ensure!(system_account(prefix, a).is_none(), "bootstrap_excluded: {a} is a keyless system account");
+            ensure!(i == 0 || self.bootstrap_excluded[i - 1] < *a, "bootstrap_excluded must be sorted, each account once");
+        }
         let mut features = BTreeSet::new();
         for f in &self.features {
             crate::upgrade::check_feature_name(f)?;
@@ -473,6 +497,8 @@ impl Genesis {
             ensure!(self.validators.iter().all(|v| keys.contains(v.public_key.as_str())), "every {MAINNET_CHAIN_ID} validator needs an operator (owner, self-bond, commission)");
             // DEC-2: Ghost Mode ships disabled; only governance switches it on, after its audit.
             ensure!(!self.features.iter().any(|f| f == crate::ghost::FEATURE), "{MAINNET_CHAIN_ID} starts with Ghost Mode off: governance activates it after its audit");
+            // Governance's own safety parameters start where a vote could take them at most.
+            cp.check_governance_floors(&params).context(MAINNET_CHAIN_ID)?;
         }
         Ok(())
     }
@@ -562,6 +588,11 @@ pub struct Journal {
     pub(crate) beacon: crate::beacon::BeaconJournal,
     pub(crate) upgrade: crate::upgrade::UpgradeJournal,
     pub(crate) ghost: crate::ghost::GhostJournal,
+    /// Not an undo record: how far the sender's own staking moves (delegating, unbonding,
+    /// redelegating) took its transferable balance down (`staking::own_move`). They keep its
+    /// tokens in its holdings, short of rounding dust that stays in a pool, so the lock check
+    /// doesn't count that drop as moving locked tokens out (`econ::check_locks`).
+    pub(crate) lock_slack: u64,
 }
 
 impl Journal {
@@ -580,7 +611,8 @@ impl Journal {
 
     /// Folds a nested journal in, keeping the oldest values. Exhaustive, like `State::rollback`.
     fn absorb(&mut self, other: Journal) {
-        let Journal { accounts, names, validators, hunts, github, github_by_account, familiars, scalars, next_hunt_id, chain_params, poc, staking, governance, econ, beacon, upgrade, ghost } = other;
+        let Journal { accounts, names, validators, hunts, github, github_by_account, familiars, scalars, next_hunt_id, chain_params, poc, staking, governance, econ, beacon, upgrade, ghost, lock_slack } = other;
+        self.lock_slack = self.lock_slack.saturating_add(lock_slack);
         self.accounts.absorb(accounts);
         self.names.absorb(names);
         self.validators.absorb(validators);
@@ -653,16 +685,24 @@ pub struct Account {
 }
 
 impl Account {
-    /// What its locks hold at `height`: they overlap, so the largest applies (MAINNET-DESIGN
-    /// 3.7: transferable = liquid − max(0, that − staked − unbonding)). econ.rs enforces it.
+    /// What its locks hold at `height`: what's still vesting, plus the largest vote lock
+    /// (MAINNET-DESIGN 3.7: transferable = liquid − max(0, that − staked − unbonding)). econ.rs
+    /// enforces it. Vote locks overlap each other (the same tokens vote on many proposals), but
+    /// they hold vested tokens only (unvested ones don't vote, `econ::voting_balance`), so they
+    /// come on top of the vesting lock rather than inside it: a vote can't free its tokens to
+    /// vote again from another account (audit F03).
     pub fn locked_at(&self, height: u64) -> u64 {
-        self.locks.iter().map(|l| l.amount.locked_at(height)).max().unwrap_or(0)
+        self.unvested_at(height).saturating_add(self.vote_locked_at(height))
     }
 
     /// What its vesting locks hold at `height` (unvested tokens: they don't vote).
-    #[cfg_attr(not(test), allow(dead_code))] // econ::voting_balance (P-GOV)
     pub fn unvested_at(&self, height: u64) -> u64 {
         self.locks.iter().filter(|l| matches!(l.amount, LockAmount::Vesting { .. })).map(|l| l.amount.locked_at(height)).max().unwrap_or(0)
+    }
+
+    /// What its vote locks hold at `height`: they overlap, so the largest.
+    pub fn vote_locked_at(&self, height: u64) -> u64 {
+        self.locks.iter().filter(|l| matches!(l.amount, LockAmount::Until { .. })).map(|l| l.amount.locked_at(height)).max().unwrap_or(0)
     }
 }
 
@@ -752,10 +792,16 @@ pub const MAX_LOCKS: usize = 64;
 pub struct NameRecord {
     pub name: String,
     pub owner: String,
+    /// When the owner got it: registered it, or accepted it from its last owner (so a name it was
+    /// given never ranks ahead of names it registered itself for its primary name).
     pub registered_at: u64,
     /// Last height it resolves (DEC-11: a year after registering, extended by `RenewName`).
     /// Then `name_grace_blocks` in which only the owner can renew it, then anyone can register it.
     pub expires_at: u64,
+    /// The account the owner offered it to (`TransferName`): it's theirs once they accept it
+    /// (audit F34: nobody is given a name, and so a primary name, without saying yes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offered_to: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
@@ -878,6 +924,11 @@ impl State {
         treasury(self.params.prefix())
     }
 
+    /// This chain's bootstrap delegation account.
+    pub fn bootstrap(&self) -> String {
+        bootstrap_delegation(self.params.prefix())
+    }
+
     /// This chain's contribution pool account.
     pub fn pool(&self) -> String {
         crate::poc::pool_address(self.params.prefix())
@@ -900,8 +951,10 @@ impl State {
     ///    age out.
     /// 6. At an epoch boundary: `econ::issue` (issuance into the pools, the contribution pool and
     ///    the treasury; the endowment's vested part into the contribution pool), `staking::end_epoch`
-    ///    (the next set by stake, churn-limited), `beacon::end_epoch` (the next epoch's beacon
-    ///    value, jailing non-revealers), then [`State::end_epoch`] (how much set history to keep).
+    ///    (the next set by stake, churn-limited), `staking::bootstrap_epoch` (the bootstrap
+    ///    delegation's rewards and return to the treasury, the rest spread over the next set),
+    ///    `beacon::end_epoch` (the next epoch's beacon value, jailing non-revealers), then
+    ///    [`State::end_epoch`] (how much set history to keep).
     ///
     /// Then the caller commits the block and, last, runs `upgrade::check_next(height + 1)`, which
     /// stops the node before a height its binary can't execute (3.9).
@@ -915,6 +968,7 @@ impl State {
             let epoch = self.params.epoch_of(b.height);
             crate::econ::issue(self, epoch);
             crate::staking::end_epoch(self, epoch);
+            crate::staking::bootstrap_epoch(self, epoch);
             crate::beacon::end_epoch(self, epoch);
             self.end_epoch(epoch);
         }
@@ -1077,7 +1131,7 @@ impl State {
 
     /// Undoes everything recorded in `j` (values, and the dirty marks of keys it cleans up).
     pub fn rollback(&mut self, j: Journal) {
-        let Journal { accounts, names, validators, hunts, github, github_by_account, familiars, scalars, next_hunt_id, chain_params, poc, staking, governance, econ, beacon, upgrade, ghost } = j;
+        let Journal { accounts, names, validators, hunts, github, github_by_account, familiars, scalars, next_hunt_id, chain_params, poc, staking, governance, econ, beacon, upgrade, ghost, lock_slack: _ } = j;
         accounts.restore(&mut self.accounts);
         names.restore(&mut self.names);
         validators.restore(&mut self.validators);
@@ -1260,7 +1314,7 @@ impl State {
         let result = action.and_then(|()| {
             let touched = aj.touched_accounts();
             crate::econ::charge_new_accounts(self, &mut aj, &touched, &sender, &signer, &key)?;
-            crate::econ::check_locks(self, &touched, &sender, free, height)
+            crate::econ::check_locks(self, &touched, &sender, free, aj.lock_slack, height)
         });
         match result {
             Ok(()) => {
@@ -1524,10 +1578,12 @@ impl State {
         Ok(())
     }
 
-    /// Sets a governance-adjustable parameter, within its bounds (`ParamChange`).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Sets a governance-adjustable parameter (`ParamChange`): within its bounds, and governance's
+    /// own safety parameters only as far as their floors allow
+    /// (`ChainParams::check_governance_change`).
     pub(crate) fn exec_set_param(&mut self, j: &mut Journal, key: &str, value: u64) -> Result<()> {
         let params = self.params.clone();
+        self.chain_params.check_governance_change(key, value, &params)?;
         let mut next = self.chain_params.clone();
         next.set(key, value, &params)?;
         *self.chain_params_mut(j) = next;
@@ -1618,7 +1674,7 @@ impl State {
             Action::Delegate { .. } | Action::Undelegate { .. } | Action::Redelegate { .. } | Action::WithdrawUnbonded {} | Action::UpdateValidator { .. } | Action::Unjail { .. } | Action::ReportEquivocation { .. } => crate::staking::describe(self, tx, &from, primary_name),
             Action::BeaconCommit { .. } | Action::BeaconReveal { .. } | Action::AttestRevert { .. } => crate::beacon::describe(self, tx, &from),
             Action::Propose { .. } | Action::Vote { .. } | Action::Unlock {} | Action::MultisigCreate { .. } | Action::MultisigPropose { .. } | Action::MultisigApprove { .. } | Action::ClaimDistribution { .. } => crate::governance::describe(self, tx, &from, primary_name),
-            Action::RenewName { .. } | Action::TransferName { .. } | Action::ReleaseName { .. } => crate::econ::describe(self, tx, &from, primary_name),
+            Action::RenewName { .. } | Action::TransferName { .. } | Action::ReleaseName { .. } => crate::econ::describe(self, tx, &from, height, primary_name),
             Action::Shield { .. } | Action::PrivateTransfer { .. } | Action::Unshield { .. } | Action::SetGhostAddress { .. } | Action::GhostPause {} => crate::ghost::describe(self, tx, &from, primary_name),
             _ => self.describe_poc(tx, &from, primary_name),
         }
@@ -1713,6 +1769,12 @@ pub const CERT_CHECKPOINT: u64 = 100;
 /// Mempool txs not included within this many blocks are dropped (they stay valid until their
 /// `valid_until`, so a holder could resubmit them).
 pub const MEMPOOL_TTL_BLOCKS: u64 = 600;
+/// A waiting name registration keeps other accounts' registrations of the name out of the
+/// mempool for this many blocks after it arrived ([`Chain::first_to_ask`]): the window the
+/// suggested fee covers. A registration still waiting after that is being outbid on tips anyway,
+/// and holds nothing, so a zero-tip registration can't keep a name from anyone while blocks are
+/// full.
+pub const NAME_HOLD_BLOCKS: u64 = crate::econ::FEE_LAG;
 /// How long the node's own txs (faucet drips, attestations) stay valid.
 pub const OWN_TX_VALIDITY: u64 = 600;
 /// Recently failed/dropped tx ids remembered for `/api/tx/{id}`.
@@ -2179,6 +2241,7 @@ impl Chain {
             reserved_names: vec![],
             soul_ledger: vec![],
             features: vec![],
+            bootstrap_excluded: vec![],
         };
         // Every validator stakes: each owns itself and bonds twice the minimum from its
         // allocation, so a light slash (downtime) doesn't leave it under-bonded.
@@ -3054,6 +3117,9 @@ impl Chain {
         // Ghost Mode: a bounded share of the mempool, and one queued spend per note (a higher tip
         // per byte replaces it). Unsigned ghost txs have no sender: no queue, nonce or simulation.
         let replaces = crate::ghost::mempool_admit(&self.mempool, &self.mempool_ids, &tx)?;
+        if let Action::RegisterName { name } = &tx.action {
+            self.first_to_ask(&tx, name)?;
+        }
         let unsigned = tx.is_unsigned();
         let sender = if unsigned { String::new() } else { tx.sender()? };
         let count = if unsigned { 0 } else { self.pending_count(&sender) };
@@ -3110,6 +3176,30 @@ impl Chain {
         self.mempool_ids.push(id.clone());
         self.publish_mempool();
         Ok((id, true))
+    }
+
+    /// Names go to whoever asked first, as far as this mempool can tell (audit F35, a mitigation):
+    /// a registration of a name that another account's registration is already waiting for isn't
+    /// admitted, whatever its tip, so outbidding a registration seen in the public mempool
+    /// doesn't work through this node (or any node the first one reached first). The waiting one
+    /// holds the name only while it can be included in the next block (its fee covers that
+    /// block's base fee) and for [`NAME_HOLD_BLOCKS`] after it arrived, so a registration that's
+    /// stuck, or left waiting on purpose, keeps the name from nobody. A sender's own txs never
+    /// count against it. The waiting registrations are an index read (newest first, stopping at
+    /// the first that's too old), not a mempool scan. A proposer can still put its own
+    /// registration first in its block: PLAN.md "Known limits".
+    fn first_to_ask(&self, tx: &Tx, name: &str) -> Result<()> {
+        let Ok(n) = normalize_name(name) else { return Ok(()) };
+        let next = self.height() + 1;
+        let held = self
+            .mp
+            .registrations(&n)
+            .take_while(|p| p.added_at.saturating_add(NAME_HOLD_BLOCKS) >= next)
+            .any(|p| p.tx.from != tx.from && crate::econ::check_fee(&self.state, &p.tx, next).is_ok());
+        if held {
+            bail!("another account's registration of {n}{NAME_SUFFIX} is already waiting: names go to whoever asked first");
+        }
+        Ok(())
     }
 
     /// Dry-runs `tx` (from `sender`, at the next height) after the sender's `queued` txs; `Err`
@@ -4699,6 +4789,7 @@ mod scaffold {
             reserved_names: vec!["blockula".into(), "foundation".into()],
             soul_ledger: vec![SoulEntry { account: owner.address(), soul: 50 * SOUL, reason: "testnet contributor".into() }],
             features: if chain_id == MAINNET_CHAIN_ID { vec![] } else { vec!["ghost".into()] },
+            bootstrap_excluded: vec![],
         }
     }
 
@@ -4804,12 +4895,35 @@ mod scaffold {
         refused(&|v| v["operators"][0]["consensus_key"] = hex::encode(keys(99).public_key()).into(), "isn't one of the genesis validators");
         refused(&|v| v["operators"][0]["country"] = "France".into(), "ISO 3166-1");
         refused(&|v| v["operators"][0]["owner"] = treasury("boo").into(), "can't own a validator");
+        // Validators: each once (audit F33: twice, epoch 0's set had no usable keys and the
+        // operator's self-bond was bonded twice), keyed by their own address.
+        let twice = |v: &mut serde_json::Value| {
+            let again = v["validators"][0].clone();
+            v["validators"].as_array_mut().unwrap().push(again);
+        };
+        refused(&twice, "is listed twice");
+        let mut v = good.clone();
+        twice(&mut v);
+        let g: Genesis = serde_json::from_value(v).unwrap();
+        assert_eq!(g.initial_state().active_sets[&0].len(), 2, "what the check keeps out");
+        assert!(g.initial_state().check_invariants().is_err());
+        refused(&|v| v["validators"][0]["address"] = keys(98).address().into(), "isn't its public key's address");
+        refused(&|v| v["validators"][0]["public_key"] = "AB".repeat(crypto::PUBLIC_KEY_LEN).into(), "lowercase hex");
+        refused(&|v| v["validators"][0]["p2p_addr"] = "nowhere".into(), "p2p_addr");
         // Reserved names, the Soul ledger and features.
         refused(&|v| v["reserved_names"][0] = "blockula.boo".into(), "bare lowercase name");
         refused(&|v| v["reserved_names"][1] = "blockula".into(), "listed twice");
         refused(&|v| v["soul_ledger"][0]["soul"] = 0.into(), "milli-Soul");
         refused(&|v| v["soul_ledger"][0]["account"] = community("boo").into(), "system account");
         refused(&|v| v["features"][0] = "warp".into(), "unknown feature warp");
+        // The bootstrap delegation's excluded owners: addresses, not keyless, sorted, once each.
+        let mut ab = [keys(30).address(), keys(31).address()];
+        ab.sort();
+        let [a, b] = ab;
+        refused(&|v| v["bootstrap_excluded"] = serde_json::json!([b, a]), "sorted");
+        refused(&|v| v["bootstrap_excluded"] = serde_json::json!([a, a]), "sorted");
+        refused(&|v| v["bootstrap_excluded"] = serde_json::json!([treasury("boo")]), "keyless system account");
+        refused(&|v| v["bootstrap_excluded"] = serde_json::json!(["nobody"]), "isn't a boo1");
         // Mainnet: no admin keys, no faucet, an operator for every validator.
         let mut main = serde_json::to_value(genesis(MAINNET_CHAIN_ID)).unwrap();
         load(&main).unwrap();
@@ -4825,6 +4939,13 @@ mod scaffold {
         let mut main = serde_json::to_value(genesis(MAINNET_CHAIN_ID)).unwrap();
         main["features"] = serde_json::json!(["ghost"]);
         assert!(load(&main).unwrap_err().contains("Ghost Mode off"));
+        // … and governance's safety parameters on the safe side of their floors (F15).
+        for (key, value) in [("timelock_blocks", 3_600), ("supermajority_bps", 5_001), ("treasury_large_bps", 1_000), ("quorum_floor", 0)] {
+            let mut main = serde_json::to_value(genesis(MAINNET_CHAIN_ID)).unwrap();
+            main["params"][key] = value.into();
+            let e = load(&main).unwrap_err();
+            assert!(e.contains(&format!("`{key}`")) && e.contains("past governance's floor"), "{key}: {e}");
+        }
         // Other chains may keep admins (dev and test).
         let mut test = good.clone();
         test["validator_admins"] = serde_json::json!([keys(22).address()]);
@@ -4850,13 +4971,13 @@ mod scaffold {
         c.submit(signed(&c, &owner, Action::RegisterName { name: "owner".into() })).unwrap();
         c.produce_block().unwrap();
         let give = signed(&c, &owner, Action::TransferName { name: "owner.boo".into(), to: bob.address() });
-        assert_eq!(c.state.describe(&give, None), format!("owner.boo gave owner.boo to {}", short(&bob.address())));
+        assert_eq!(c.state.describe(&give, None), format!("owner.boo offered owner.boo to {}", short(&bob.address())));
         c.submit(give).unwrap();
         c.produce_block().unwrap();
-        assert_eq!(c.state.resolve("owner.boo").unwrap(), bob.address());
-        // Bob holds nothing yet: his release can't even pay its fee.
+        assert_eq!(c.state.resolve("owner.boo").unwrap(), owner.address(), "an offer: the owner's until bob accepts");
+        // Bob holds nothing yet: his acceptance can't even pay its fee, nor can a release of a name he doesn't own.
+        assert!(c.submit(signed(&c, &bob, Action::TransferName { name: "owner".into(), to: bob.address() })).unwrap_err().to_string().contains("insufficient balance"));
         assert!(c.submit(signed(&c, &bob, Action::ReleaseName { name: "owner".into() })).unwrap_err().to_string().contains("insufficient balance"));
-        assert!(c.submit(signed(&c, &owner, Action::ReleaseName { name: "owner".into() })).unwrap_err().to_string().contains("belongs to"));
         // Without admins, the admin levers are closed.
         for action in [Action::SetRepo { repo: "a/b".into(), weight: 1 }, Action::GrantSoul { to: bob.address(), amount: SOUL, reason: "r".into() }] {
             assert!(c.submit(signed(&c, &owner, action)).unwrap_err().to_string().contains("only validator admins"));
@@ -5042,7 +5163,7 @@ mod scaffold {
         assert!(c.submit(signed(&c, &founder, Action::Transfer { to: bob.address(), amount: 5 * FANG })).unwrap_err().to_string().contains("locked (founder)"));
         c.submit(signed(&c, &owner, Action::Transfer { to: bob.address(), amount: 5 * FANG })).unwrap();
         c.produce_block().unwrap();
-        // A name changes hands, a module tx fails (and is charged), a stale tx is skipped.
+        // A name is offered, a module tx fails (and is charged), a stale tx is skipped.
         let give = signed(&c, &owner, Action::TransferName { name: "owner".into(), to: bob.address() });
         let delegate = Tx { nonce: give.nonce + 1, ..signed(&c, &owner, Action::Delegate { validator: v.clone(), amount: 1_000_000 * FANG }) }.sign(&owner);
         let stale = Tx { nonce: 40, ..signed(&c, &owner, Action::Transfer { to: bob.address(), amount: FANG }) }.sign(&owner);
@@ -5078,7 +5199,7 @@ mod scaffold {
         assert!(s.econ.reserved_names.contains_key("blockula") && s.econ.reserved_names.contains_key("foundation"));
         assert_eq!(s.soul_of(&owner.address(), height), 50 * SOUL);
         assert!(crate::upgrade::is_active(s, "ghost"));
-        assert_eq!(s.resolve("owner.boo").unwrap(), bob.address());
+        assert_eq!((s.resolve("owner.boo").unwrap(), s.names["owner"].offered_to.clone()), (owner.address(), Some(bob.address())), "offered to bob, still the owner's");
         assert_eq!(c.block(2).unwrap().skipped, vec![stale.size()]);
         assert_eq!(history(&c, &v), vec![delegate.id()]);
         s.check_invariants().unwrap();

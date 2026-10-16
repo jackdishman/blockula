@@ -105,9 +105,14 @@ export const proposal = {
   treasurySpend(to: string, amount: Amount): ProposalKind {
     return { type: "treasury_spend", to, amount: positive(parseFang(amount), "spend").toString() };
   },
-  /** Open a community distribution of `total`, claimable with Merkle proofs against `merkleRoot` until block `claimUntil`. */
-  distribution(merkleRoot: string, total: Amount, claimUntil: number): ProposalKind {
-    return { type: "distribution", merkle_root: hexArg(merkleRoot, "merkleRoot"), total: positive(parseFang(total), "distribute").toString(), claim_until: wholeNumber(claimUntil, "claimUntil") };
+  /**
+   * Open a community distribution of `total`, claimable with Merkle proofs against `merkleRoot` until block `claimUntil`.
+   * `distributionId` is the id the tree was built for (`buildDistribution(id, …)`), which must be the id this proposal
+   * gets (`client.proposals()`'s `next_id`): if another proposal takes it first, the node refuses this one (nothing is
+   * escrowed), so rebuild the tree for the new `next_id` and propose again.
+   */
+  distribution(distributionId: number, merkleRoot: string, total: Amount, claimUntil: number): ProposalKind {
+    return { type: "distribution", distribution_id: wholeNumber(distributionId, "distributionId"), merkle_root: hexArg(merkleRoot, "merkleRoot"), total: positive(parseFang(total), "distribute").toString(), claim_until: wholeNumber(claimUntil, "claimUntil") };
   },
   /** Put a repo in the contribution pool (weight 1–100; 0 removes it). */
   setRepo(repo: string, weight: number): ProposalKind {
@@ -733,9 +738,23 @@ export class Wallet {
     return this.act({ type: "renew_name", name: bareName(name), years }, opts);
   }
 
-  /** Give a name you own to another account (a `.boo` name or address; the address is signed). */
+  /**
+   * Offer a name you own to another account (a `.boo` name or address; the address is signed). It
+   * stays yours until they accept it (`acceptName`); offering it again replaces the offer, and
+   * `withdrawNameOffer` withdraws it. Nobody can be given a name without saying yes.
+   */
   async transferName(name: string, to: string, opts: TxOptions = {}) {
     return this.act({ type: "transfer_name", name: bareName(name), to: await this.client.resolve(to) }, opts);
+  }
+
+  /** Accept a name offered to the account you act for (`client.name(n).offered_to`): it becomes yours. */
+  async acceptName(name: string, opts: TxOptions = {}) {
+    return this.act({ type: "transfer_name", name: bareName(name), to: this.account }, opts);
+  }
+
+  /** Withdraw your offer of a name you own (the same tx as `acceptName`: the chain tells them apart by who owns the name). */
+  async withdrawNameOffer(name: string, opts: TxOptions = {}) {
+    return this.acceptName(name, opts);
   }
 
   /** Give up a name you own; anyone can register it afterwards. */
@@ -879,7 +898,7 @@ export class Client {
   block(heightOrHash: number | string) { return this.call(`/block/${heightOrHash}`); }
   tx(id: string) { return this.call(`/tx/${id}`); }
   account(addressOrName: string) { return this.call(`/account/${encodeURIComponent(addressOrName)}`); }
-  /** A name: `status` (`active`, `grace` (expired; only its owner can renew it), `reserved` or `available`), owner, `expires_at`, prices. */
+  /** A name: `status` (`active`, `grace` (expired; only its owner can renew it), `reserved` or `available`), owner, `expires_at`, `offered_to` (if its owner offered it to an account: theirs once they accept), prices. */
   name(name: string) { return this.call(`/name/${encodeURIComponent(name)}`); }
   /** The base fee: each upcoming block's (`slots`) and `suggested`, which covers any of the next 17 blocks. */
   fees(): Promise<{ height: number; lag: number; slots: ({ height: number; max_block_bytes: number } & BaseFee)[]; suggested: BaseFee; lowest?: BaseFee; tip_cap_multiple?: number; account_creation_fee: string; [k: string]: unknown }> { return this.call("/fees"); }

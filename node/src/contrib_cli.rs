@@ -592,13 +592,26 @@ pub enum NameCmd {
         #[command(flatten)]
         signer: Signer,
     },
-    /// Give a name you own to another account (.boo name or address)
+    /// Offer a name you own to another account (.boo name or address): it stays yours until they
+    /// accept it (`blockula name accept`). Offering it again replaces the offer
     Transfer {
         name: String,
         to: String,
         /// Don't ask for confirmation
         #[arg(long)]
         yes: bool,
+        #[command(flatten)]
+        signer: Signer,
+    },
+    /// Accept a name offered to you: it becomes yours
+    Accept {
+        name: String,
+        #[command(flatten)]
+        signer: Signer,
+    },
+    /// Withdraw your offer of a name you own
+    Withdraw {
+        name: String,
         #[command(flatten)]
         signer: Signer,
     },
@@ -626,6 +639,9 @@ pub fn name(cmd: NameCmd, dir: &Path) -> Result<()> {
                 if let Some(e) = v["expires_at"].as_u64() {
                     println!("   expires at block {e}{}", v["grace_until"].as_u64().map(|g| format!(", renewable by its owner until block {g}")).unwrap_or_default());
                 }
+                if let Some(to) = v["offered_to"]["address"].as_str() {
+                    println!("   offered to {to}: theirs once they accept it (blockula name accept {n})");
+                }
             }
             Ok(())
         }
@@ -638,8 +654,14 @@ pub fn name(cmd: NameCmd, dir: &Path) -> Result<()> {
         NameCmd::Transfer { name, to, yes, signer } => {
             let n = normalize_name(&name)?;
             let to = rt()?.block_on(resolve(&signer.rpc, &to))?;
-            confirm(&format!("Give {n}{NAME_SUFFIX} to {to}? Only they can give it back."), yes)?;
+            confirm(&format!("Offer {n}{NAME_SUFFIX} to {to}? Once they accept it, only they can give it back."), yes)?;
             submit(dir, &signer, Action::TransferName { name: n, to }).map(|_| ())
+        }
+        // Both are a `TransferName` to the signer's own account: the chain tells them apart by
+        // whether it owns the name.
+        NameCmd::Accept { name, signer } | NameCmd::Withdraw { name, signer } => {
+            let me = rt()?.block_on(signer.from(&signer.keys(dir)?))?;
+            submit(dir, &signer, Action::TransferName { name: normalize_name(&name)?, to: me }).map(|_| ())
         }
         NameCmd::Release { name, yes, signer } => {
             let n = normalize_name(&name)?;

@@ -279,8 +279,12 @@ pub enum ProposalKind {
         amount: u64,
     },
     /// Open a community distribution of `total` from the community account, claimable with
-    /// Merkle proofs against `merkle_root` until `claim_until`.
+    /// Merkle proofs against `merkle_root` until `claim_until`. `distribution_id` is the id its
+    /// tree's leaves were built for, which must be the id the proposal gets (`next_id`): a
+    /// proposal that lands after another took that id is refused, so a passed distribution is
+    /// always claimable (audit F45).
     Distribution {
+        distribution_id: u64,
         merkle_root: String,
         #[serde(with = "u64_str")]
         total: u64,
@@ -636,6 +640,10 @@ pub const MAX_FEATURE: usize = 32;
 pub const MAX_PARAM_KEY: usize = 64;
 /// `RenewName` renews for 1 to this many years at once.
 pub const MAX_RENEW_YEARS: u8 = 10;
+/// Largest action a `MultisigPropose` may carry, encoded: the proposal is stored until it's
+/// approved or expires, so it's bounded well below `MAX_TX_BYTES` (audit F17). A nested
+/// validator registration (~10.6 KiB: key and proof of possession) fits.
+pub const MAX_MULTISIG_ACTION_BYTES: usize = 12 << 10;
 
 /// What a juror commits to before revealing (hashed with BLAKE3). Mirrored in sdk-ts/src/tx.ts
 /// `seanceCommitment`.
@@ -1271,6 +1279,10 @@ impl Action {
                 if action.is_ghost() {
                     bail!("a multisig proposal can't hold a ghost action");
                 }
+                let size = action.to_bytes().len();
+                if size > MAX_MULTISIG_ACTION_BYTES {
+                    bail!("a multisig proposal's action is at most {MAX_MULTISIG_ACTION_BYTES} bytes encoded, not {size}");
+                }
                 action.check_format(true).context("the proposed action")?;
             }
             Action::RenewName { name, years } => {
@@ -1436,8 +1448,9 @@ impl ProposalKind {
                 put_str(out, to);
                 put_u64(out, *amount);
             }
-            ProposalKind::Distribution { merkle_root, total, claim_until } => {
+            ProposalKind::Distribution { distribution_id, merkle_root, total, claim_until } => {
                 out.push(2);
+                put_u64(out, *distribution_id);
                 put_str(out, merkle_root);
                 put_u64(out, *total);
                 put_u64(out, *claim_until);
@@ -1497,7 +1510,7 @@ impl ProposalKind {
         Ok(match r.u8()? {
             0 => ProposalKind::ParamChange { key: r.str("key", MAX_PARAM_KEY)?, value: r.u64()? },
             1 => ProposalKind::TreasurySpend { to: r.str("to", MAX_NAME_FIELD)?, amount: r.u64()? },
-            2 => ProposalKind::Distribution { merkle_root: r.str("merkle_root", HEX_32)?, total: r.u64()?, claim_until: r.u64()? },
+            2 => ProposalKind::Distribution { distribution_id: r.u64()?, merkle_root: r.str("merkle_root", HEX_32)?, total: r.u64()?, claim_until: r.u64()? },
             3 => ProposalKind::SetRepo { repo: r.str("repo", MAX_REPO)?, weight: r.u64()? },
             4 => ProposalKind::GrantSoul { to: r.str("to", MAX_NAME_FIELD)?, amount: r.u64()?, reason: r.str("reason", MAX_REASON)? },
             5 => ProposalKind::FlagSybil { account: r.str("account", MAX_NAME_FIELD)?, reason: r.str("reason", MAX_REASON)? },
@@ -1546,7 +1559,7 @@ impl ProposalKind {
                     bail!("a treasury spend must move more than 0");
                 }
             }
-            ProposalKind::Distribution { merkle_root, total, claim_until } => {
+            ProposalKind::Distribution { merkle_root, total, claim_until, .. } => {
                 check_hex_32("merkle_root", merkle_root)?;
                 if *total == 0 || *claim_until == 0 {
                     bail!("a distribution needs a total and a claim deadline");
@@ -2098,7 +2111,7 @@ pub(crate) mod tests {
             Action::BeaconReveal { epoch: 3, secret: "cd".repeat(32) },
             Action::Propose { kind: ProposalKind::ParamChange { key: "max_validators".into(), value: 40 }, deposit: 1_000 * DROPS_PER_FANG, title: "More validators".into(), url: "https://x.example/p/1".into() },
             propose(ProposalKind::TreasurySpend { to: "x.boo".into(), amount: 9 }),
-            propose(ProposalKind::Distribution { merkle_root: "ef".repeat(32), total: 100, claim_until: 5_000 }),
+            propose(ProposalKind::Distribution { distribution_id: 6, merkle_root: "ef".repeat(32), total: 100, claim_until: 5_000 }),
             propose(ProposalKind::SetRepo { repo: "a/b".into(), weight: 10 }),
             propose(ProposalKind::GrantSoul { to: "x.boo".into(), amount: 2500, reason: "r".into() }),
             propose(ProposalKind::FlagSybil { account: "x.boo".into(), reason: "r".into() }),
@@ -2178,7 +2191,7 @@ pub(crate) mod tests {
         for action in v1_vector_actions() {
             h.update(&vector_tx(action).signing_bytes());
         }
-        assert_eq!(h.finalize().to_hex().to_string(), "0ffbf0b5bbb1a26f7abe720bae98d7f97581d5268bfbe75fe290605f16172398");
+        assert_eq!(h.finalize().to_hex().to_string(), "fa975d440a66418e791d1cb415eb19479e544948ca449897fa7bad2e1d94bde0");
         let p: Action = serde_json::from_str(r#"{"type":"propose","kind":{"type":"param_change","key":"max_validators","value":"40"},"deposit":"1000","title":"t"}"#).unwrap();
         assert_eq!(p, Action::Propose { kind: ProposalKind::ParamChange { key: "max_validators".into(), value: 40 }, deposit: 1000, title: "t".into(), url: String::new() });
         let m: Action = serde_json::from_str(r#"{"type":"multisig_propose","action":{"type":"vote","proposal_id":1,"aye":true,"amount":"5","conviction":2}}"#).unwrap();
@@ -2355,7 +2368,7 @@ pub(crate) mod tests {
         ok(propose(ProposalKind::ParamChange { key: "quorum_bps".into(), value: 1 }));
         assert!(bad(propose(ProposalKind::ParamChange { key: "nope".into(), value: 1 })).contains("unknown parameter"));
         assert!(bad(propose(ProposalKind::GrantSoul { to: addr.clone(), amount: crate::poc::MAX_SOUL_GRANT + 1, reason: "r".into() })).contains("milli-Soul"));
-        assert!(bad(propose(ProposalKind::Distribution { merkle_root: hex32.clone(), total: 0, claim_until: 1 })).contains("total"));
+        assert!(bad(propose(ProposalKind::Distribution { distribution_id: 0, merkle_root: hex32.clone(), total: 0, claim_until: 1 })).contains("total"));
         assert!(bad(propose(ProposalKind::ActivateFeature { feature: "Ghost Mode".into() })).contains("feature"));
         assert!(bad(propose(ProposalKind::ScheduleUpgrade { version: 0, activation_height: 5 })).contains("version"));
         assert!(bad(Action::Propose { kind: ProposalKind::Text {}, deposit: 0, title: "t".into(), url: String::new() }).contains("deposit"));
@@ -2531,7 +2544,7 @@ pub(crate) mod tests {
         match tag {
             0 => ProposalKind::ParamChange { key: a, value: w },
             1 => ProposalKind::TreasurySpend { to: a, amount: w },
-            2 => ProposalKind::Distribution { merkle_root: a, total: w, claim_until: x },
+            2 => ProposalKind::Distribution { distribution_id: x ^ w, merkle_root: a, total: w, claim_until: x },
             3 => ProposalKind::SetRepo { repo: a, weight: w },
             4 => ProposalKind::GrantSoul { to: a, amount: w, reason: b },
             5 => ProposalKind::FlagSybil { account: a, reason: b },

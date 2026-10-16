@@ -62,7 +62,10 @@ amount = "250000000"
 bucket = "endowment"
 amount = "150000000"
 
-# 10%: the validator bootstrap delegation (keyless; delegated by formula).
+# 10%: the validator bootstrap delegation (keyless; each epoch delegated equally to the set's
+# members not run by the founder or the foundation, its rewards to the treasury; returns to the
+# treasury linearly over years 2–4). The builder lists the founder's and the foundation's
+# accounts, and the owners of `founder_or_foundation` seats, in `bootstrap_excluded`.
 [[allocation]]
 bucket = "bootstrap"
 amount = "100000000"

@@ -20,7 +20,8 @@
 - **The network is the user's choice, and it's pinned.** The MCP talks to the network its configuration names (`--network mainnet|testnet|local|custom`, `BLOCKULA_RPC`); nothing switches it while it runs, and it never falls back to whatever answers on localhost. It pins the chain id and genesis hash (built in for known networks, `BLOCKULA_CHAIN_ID` / `BLOCKULA_GENESIS_HASH`, or the first ones a node reports, remembered in `~/.blockula/known-chains.json`) and refuses a node that reports anything else. In code, `new Client(rpc, { chainId, genesisHash, prefix })` does the same for every status it reads, including the one each signature is made against.
 - **Don't trust one RPC for what matters.** `client.provenAccount(address, { witnesses })` and `client.provenName(name, { witnesses })` check the node's Merkle proof (`/api/proof`) against its state root, and the witnesses (clients for independent nodes) must report the same root for that block.
 - **Staking and voting lock the user's FANG.** Stake (`stake`, `wallet.delegate`) takes the unbonding period (21 days on mainnet) to come back; a vote at conviction 1–6 locks its amount for 1–32 lock periods (a week each on mainnet) after voting ends. Ask the user before either. Session keys can't stake or vote: only transfers.
-- **Names expire.** `.boo` names are registered for a year at a time; renew with `renew_name` / `wallet.renewName(name, years)`. After a grace period anyone can register an expired name.
+- **Names expire.** `.boo` names are registered for a year at a time; renew with `renew_name` / `wallet.renewName(name, years)`. After a grace period anyone can register an expired name. Names go to whoever asked first: while another account's registration of a name is waiting in the mempool, nodes refuse yours ("already waiting"); a name someone transfers to you is an offer you accept (`wallet.acceptName`).
+- **Names change hands by offer and acceptance.** `transferName(name, to)` only offers it; it's the recipient's once they call `acceptName(name)`, so nobody can be given a name (and the label it puts on them) without saying yes.
 - **Explorer links:** `{rpc}/#/tx/{id}`, `{rpc}/#/account/{name}`, `{rpc}/#/block/{height}`, `{rpc}/#/name/{name}`, `{rpc}/#/proposal/{id}`, `{rpc}/#/validators`, `{rpc}/#/governance`, `{rpc}/#/params`.
 
 ## Protocol v1 actions (tags 30–49)
@@ -42,7 +43,7 @@ Every action has an SDK `Wallet` helper that builds, signs and submits it (and w
 | 41 | `unlock` | `unlock()` | | `blockula gov unlock` |
 | 42–44 | `multisig_create`, `multisig_propose`, `multisig_approve` | `multisigCreate(ownerKeyIds, threshold)`, `multisigPropose(action)`, `multisigApprove(id)` | | `blockula multisig create`, `propose`, `approve` (`show` reads) |
 | 45 | `renew_name` | `renewName(name, years)` | `renew_name` | `blockula name renew` |
-| 46, 47 | `transfer_name`, `release_name` | `transferName(name, to)`, `releaseName(name)` | | `blockula name transfer`, `blockula name release` |
+| 46, 47 | `transfer_name`, `release_name` | `transferName(name, to)` (an offer: the name stays yours until the recipient's `acceptName(name)`; `withdrawNameOffer(name)`), `releaseName(name)` | | `blockula name transfer`, `accept`, `withdraw`, `blockula name release` |
 | 48 | `claim_distribution` | `claimDistribution(id, amount, proof)` | | `blockula gov claim` (`blockula gov tree` builds the proofs) |
 | 49 | `attest_revert` | `attestRevert(claimId, revertSha)` (validator nodes do this) | | |
 

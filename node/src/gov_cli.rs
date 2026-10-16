@@ -378,7 +378,7 @@ fn propose(dir: &Path, kind: KindCmd) -> Result<()> {
             let block_ms = status["block_time_ms"].as_u64().unwrap_or(1000).max(1);
             let claim_until = status["height"].as_u64().unwrap_or(0) + days * 86_400_000 / block_ms;
             let total: u64 = text(&t["total"]).parse().context("bad total in the tree")?;
-            (ProposalKind::Distribution { merkle_root: text(&t["merkle_root"]).to_string(), total, claim_until }, meta)
+            (ProposalKind::Distribution { distribution_id: id, merkle_root: text(&t["merkle_root"]).to_string(), total, claim_until }, meta)
         }
         KindCmd::SetRepo { repo, weight, meta } => (ProposalKind::SetRepo { repo, weight }, meta),
         KindCmd::GrantSoul { to, soul, reason, meta } => (ProposalKind::GrantSoul { to: rt.block_on(resolve(&meta.signer.rpc, &to))?, amount: parse_soul(&soul)?, reason }, meta),

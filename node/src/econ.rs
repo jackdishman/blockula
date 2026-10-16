@@ -30,13 +30,18 @@
 //! the contribution pool. The treasury's lock limits what `TreasurySpend` may move
 //! ([`transferable`]); its inflows (issuance, name fees) are free at once.
 //!
-//! **Locks.** `Account::locks` overlap: the largest applies. Transferable balance = liquid −
-//! max(0, largest lock − staked − unbonding), so locked tokens can be staked and delegated, never
-//! moved out. Every tx's action phase is checked ([`check_locks`]): an account may not end it
-//! with less transferable than zero (or less than it had, if fees already took it below). The
-//! burned base fee may come from locked tokens; the tip, a payment to the proposer, may not
-//! (`State::admit`). Staking rewards credited to a vesting account join its lock
-//! ([`lock_rewards`]). Votes lock with [`lock`]; [`voting_balance`] leaves unvested tokens out.
+//! **Locks.** What an account's locks hold is what's still vesting plus the largest vote lock
+//! (`Account::locked_at`): vote locks overlap each other, but votes only use vested tokens, so a
+//! vote lock comes on top of the vesting lock (audit F03). Transferable balance = liquid −
+//! max(0, locked − staked − unbonding), so locked tokens can be staked and delegated, never moved
+//! out; a vesting account's stake covers its locks at cost (each delegation at most its
+//! principal: gains not sold yet vest with the allocation, `staking::holdings_at_cost`). Every
+//! tx's action phase is checked ([`check_locks`]): an account may not end it with less
+//! transferable than zero (or less than it had, if fees already took it below), the sender's own
+//! staking moves aside (`Journal::lock_slack`: they keep its tokens). The burned base fee may come
+//! from locked tokens; the tip, a payment to the proposer, may not (`State::admit`). Staking
+//! rewards credited to a vesting account join its lock ([`lock_rewards`]). Votes lock with
+//! [`lock`]; [`voting_balance`] leaves unvested tokens out.
 //!
 //! **Accounts.** An action that opens an account (a transfer to a new address, a hunt awarded to
 //! one…) burns `account_creation_fee` per account from the sender, on top of what it moves
@@ -418,25 +423,28 @@ pub fn issue(state: &mut State, epoch: u64) {
 
 // ---- locks (3.7) ----
 
-/// What `account` can move out at `height`: liquid − max(0, largest lock − staked − unbonding).
+/// What `account` can move out at `height`: liquid − max(0, locked − staked − unbonding), where
+/// locked is what's still vesting plus the largest vote lock (`Account::locked_at`).
 pub fn transferable(state: &State, account: &str, height: u64) -> u64 {
     free(state, account, height).clamp(0, u64::MAX as i128) as u64
 }
 
-/// [`transferable`] before clamping: negative when fees (or a slash) took locked tokens.
+/// [`transferable`] before clamping: negative when fees (or a slash) took locked tokens. An
+/// account that's still vesting counts its stake at cost (`staking::holdings_at_cost`): what
+/// staking earned on locked tokens vests with them, so it can't free liquid tokens before it
+/// does (3.7).
 pub fn free(state: &State, account: &str, height: u64) -> i128 {
     let Some(a) = state.accounts.get(account) else { return 0 };
     let locked = a.locked_at(height);
     if locked == 0 {
         return a.balance as i128;
     }
-    let (staked, unbonding) = crate::staking::holdings(state, account);
+    let (staked, unbonding) = if a.unvested_at(height) > 0 { crate::staking::holdings_at_cost(state, account) } else { crate::staking::holdings(state, account) };
     a.balance as i128 - (locked as i128 - staked as i128 - unbonding as i128).max(0)
 }
 
 /// What `account` may vote with at `height`: its holdings (liquid + staked + unbonding) minus
 /// what its vesting locks still hold. Vote locks don't count: one stake votes on many proposals.
-#[cfg_attr(not(test), allow(dead_code))] // P-GOV (votes)
 pub fn voting_balance(state: &State, account: &str, height: u64) -> u64 {
     let Some(a) = state.accounts.get(account) else { return 0 };
     let (staked, unbonding) = crate::staking::holdings(state, account);
@@ -444,17 +452,24 @@ pub fn voting_balance(state: &State, account: &str, height: u64) -> u64 {
     held.saturating_sub(a.unvested_at(height) as u128).min(u64::MAX as u128) as u64
 }
 
-/// Locks `amount` of `account`'s holdings until (not including) height `until` under `id` (e.g.
-/// `"vote:<proposal>"`). Locks overlap: the largest applies. Locking an id again only extends it
-/// (the larger amount, the later end), so a lock never shrinks before it expires.
-#[cfg_attr(not(test), allow(dead_code))] // P-GOV (vote locks)
-pub fn lock(state: &mut State, j: &mut Journal, account: &str, id: String, amount: u64, until: u64) -> Result<()> {
+/// Locks `amount` of `account`'s vested holdings ([`voting_balance`]) until (not including)
+/// height `until` under `id` (e.g. `"vote:<proposal>"`). Vote locks overlap each other (the
+/// largest applies) and come on top of what's still vesting. Locking an id again only extends it
+/// (the larger amount, the later end), so a lock never shrinks before it expires; only the part
+/// that grows it must be held now, so a re-vote never fails over what the lock already holds,
+/// even after fees took the holdings below it (audit F42).
+pub fn lock(state: &mut State, j: &mut Journal, account: &str, id: String, amount: u64, until: u64, height: u64) -> Result<()> {
     ensure!(!id.is_empty() && id.len() <= MAX_LABEL && id != VESTING_LOCK, "lock ids are 1–{MAX_LABEL} bytes (not “{VESTING_LOCK}”)");
     let a = state.accounts.get(account).ok_or_else(|| anyhow!("{} has no account", short(account)))?;
-    let (staked, unbonding) = crate::staking::holdings(state, account);
-    let held = a.balance as u128 + staked as u128 + unbonding as u128;
-    ensure!(amount as u128 <= held, "can't lock {}: {} holds {}", fmt_fang(amount), short(account), fmt_fang(held.min(u64::MAX as u128) as u64));
     let existing = a.locks.iter().position(|l| l.id == id);
+    let holds = existing.map_or(0, |i| match a.locks[i].amount {
+        LockAmount::Until { .. } => a.locks[i].amount.locked_at(height),
+        LockAmount::Vesting { .. } => 0,
+    });
+    if amount > holds {
+        let can = voting_balance(state, account, height);
+        ensure!(amount <= can, "can't lock {}: {} holds {} it could lock (vested liquid, staked and unbonding FANG)", fmt_fang(amount), short(account), fmt_fang(can));
+    }
     ensure!(existing.is_some() || a.locks.len() < MAX_LOCKS, "{} already has {MAX_LOCKS} locks; unlock expired ones first", short(account));
     let locks = &mut state.acct_mut(j, account).locks;
     match existing {
@@ -501,16 +516,18 @@ pub fn lock_rewards(state: &mut State, j: &mut Journal, account: &str, amount: u
 /// After a tx's action: no account it touched may hold less transferable than zero, and the
 /// sender none less than it had (`free_before`, which fees may have taken below zero). Moving
 /// liquid tokens into stake keeps the lock covered, so staking locked tokens passes; moving them
-/// out doesn't. `touched` comes from the action's journal (sorted, so the first error is the
-/// same everywhere).
-pub fn check_locks(state: &State, touched: &[(String, Option<u64>)], sender: &str, free_before: i128, height: u64) -> Result<()> {
+/// out doesn't. `slack` is how far the sender's own staking moves took its transferable balance
+/// down (`Journal::lock_slack`): they keep its tokens (short of a pool's rounding dust), so they
+/// pass even when every token is locked. `touched` comes from the action's journal (sorted, so
+/// the first error is the same everywhere).
+pub fn check_locks(state: &State, touched: &[(String, Option<u64>)], sender: &str, free_before: i128, slack: u64, height: u64) -> Result<()> {
     for (addr, old_balance) in touched {
         let Some(a) = state.accounts.get(addr) else { continue };
         if a.locks.is_empty() {
             continue;
         }
         let after = free(state, addr, height);
-        let (ok, could) = if addr == sender { (after >= free_before.min(0), free_before) } else { (a.balance >= old_balance.unwrap_or(0) || after >= 0, 0) };
+        let (ok, could) = if addr == sender { (after + slack as i128 >= free_before.min(0), free_before) } else { (a.balance >= old_balance.unwrap_or(0) || after >= 0, 0) };
         if !ok {
             let reason = a.locks.iter().max_by_key(|l| l.amount.locked_at(height)).map(|l| l.reason.clone()).unwrap_or_default();
             bail!("{} of {}'s FANG is locked ({reason}): locked tokens can be staked but not moved out, and it can move {} now", fmt_fang(a.locked_at(height)), short(addr), fmt_fang(could.clamp(0, u64::MAX as i128) as u64));
@@ -578,7 +595,7 @@ pub(crate) fn register_name(state: &mut State, j: &mut Journal, sender: &str, na
     let treasury = state.treasury();
     state.j_credit(j, &treasury, price);
     let expires_at = height.saturating_add(state.chain_params.name_registration_blocks);
-    state.insert_name(j, NameRecord { name: n, owner: sender.to_string(), registered_at: height, expires_at });
+    state.insert_name(j, NameRecord { name: n, owner: sender.to_string(), registered_at: height, expires_at, offered_to: None });
     Ok(())
 }
 
@@ -632,16 +649,35 @@ pub(crate) fn apply(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, _
             }
             state.name_mut(j, &n).expect("checked above").expires_at = expires_at;
         }
+        // A name changes hands in two steps (audit F34): its owner offers it (`to` another
+        // account; offering it again replaces the offer, `to` itself withdraws it), and the account
+        // it was offered to accepts it (`to` itself). Until then it stays the owner's, so nobody
+        // can make a name, and so a primary name, someone else's. Accepting re-stamps
+        // `registered_at`, so a name an account accepted never ranks ahead of the ones it
+        // registered itself.
         Action::TransferName { name, to } => {
+            let n = normalize_name(name)?;
+            let to = state.resolve(to);
+            if let Some(rec) = state.names.get(&n).filter(|r| r.owner != sender && r.offered_to.as_deref() == Some(sender) && to.as_deref().ok() == Some(sender)) {
+                if key.role != KeyRole::Owner {
+                    bail!("only owner keys can manage names");
+                }
+                if height > rec.expires_at {
+                    bail!("{n}{NAME_SUFFIX} expired at block {}; only its owner can renew it, so it can't be accepted", rec.expires_at);
+                }
+                let r = state.name_mut(j, &n).expect("checked above");
+                (r.owner, r.registered_at, r.offered_to) = (sender.to_string(), height, None);
+                return Ok(());
+            }
             let (n, rec) = owned(state, name)?;
             if height > rec.expires_at {
                 bail!("{n}{NAME_SUFFIX} expired at block {}; renew it first", rec.expires_at);
             }
-            let to = state.resolve(to)?;
-            if to == sender {
+            let to = to?;
+            if to == sender && rec.offered_to.is_none() {
                 bail!("you already own {n}{NAME_SUFFIX}");
             }
-            state.name_mut(j, &n).expect("checked above").owner = to;
+            state.name_mut(j, &n).expect("checked above").offered_to = (to != sender).then_some(to);
         }
         Action::ReleaseName { name } => {
             let (n, _) = owned(state, name)?;
@@ -669,6 +705,7 @@ pub fn check_invariants(state: &State) -> Result<()> {
     ensure!(e.issuance.year == 0 || e.issuance.rate_ppm > 0, "issuance year {} has no rate", e.issuance.year);
     for (n, r) in state.names.iter() {
         ensure!(r.expires_at >= r.registered_at, "{n}{NAME_SUFFIX} expires before it was registered");
+        ensure!(r.offered_to.as_ref().is_none_or(|o| *o != r.owner && crate::crypto::is_address(o)), "{n}{NAME_SUFFIX} is offered to its owner or to no account");
     }
     for (addr, a) in state.accounts.iter() {
         ensure!(a.locks.len() <= MAX_LOCKS, "{addr} holds {} locks", a.locks.len());
@@ -682,20 +719,28 @@ pub fn check_invariants(state: &State) -> Result<()> {
     Ok(())
 }
 
-/// Plain-English summary of a names tx (see `State::describe_with`; `primary_name` looks up
-/// names).
-pub fn describe(state: &State, tx: &Tx, from: &str, primary_name: &dyn Fn(&str) -> Option<String>) -> String {
+/// Plain-English summary of a names tx (see `State::describe_with`; `height` is the block it's
+/// in, if it's in one; `primary_name` looks up names).
+pub fn describe(state: &State, tx: &Tx, from: &str, height: Option<u64>, primary_name: &dyn Fn(&str) -> Option<String>) -> String {
     let name = |n: &str| format!("{}{NAME_SUFFIX}", normalize_name(n).unwrap_or_else(|_| n.to_string()));
     match &tx.action {
         Action::RenewName { name: n, years } => format!("{from} renewed {} for {years} year{}", name(n), if *years == 1 { "" } else { "s" }),
-        Action::TransferName { name: n, to } => {
-            let n = name(n);
-            // Described after the fact too, when the name may already be the recipient's.
-            let to = match state.resolve(to) {
-                Ok(a) => primary_name(&a).filter(|p| *p != n).unwrap_or_else(|| short(&a)),
-                Err(_) => to.clone(),
-            };
-            format!("{from} gave {n} to {to}")
+        Action::TransferName { name: bare, to } => {
+            let n = name(bare);
+            match (state.resolve(to), tx.sender().ok()) {
+                // To itself: accepting an offer, or withdrawing its own. Described after the fact
+                // too: an accepted name is re-stamped with the height it changed hands at.
+                (Ok(a), Some(s)) if a == s => {
+                    let rec = normalize_name(bare).ok().and_then(|b| state.names.get(&b));
+                    if rec.is_some_and(|r| r.offered_to.as_deref() == Some(s.as_str()) || (r.owner == s && height.is_some_and(|h| h == r.registered_at))) {
+                        format!("{from} accepted {n}")
+                    } else {
+                        format!("{from} withdrew its offer of {n}")
+                    }
+                }
+                (Ok(a), _) => format!("{from} offered {n} to {}", primary_name(&a).filter(|p| *p != n).unwrap_or_else(|| short(&a))),
+                (Err(_), _) => format!("{from} offered {n} to {to}"),
+            }
         }
         Action::ReleaseName { name: n } => format!("{from} released {}", name(n)),
         _ => String::new(),
@@ -749,6 +794,7 @@ mod tests {
             reserved_names: vec!["reserved".into()],
             soul_ledger: vec![],
             features: vec![],
+            bootstrap_excluded: vec![],
         };
         let home = std::env::temp_dir().join(format!("blockula-econ-{tag}-{}-{}", now_ms(), std::process::id()));
         std::fs::create_dir_all(&home).unwrap();
@@ -1173,25 +1219,25 @@ mod tests {
         st.accounts.insert(a.clone(), Account { balance: 100 * FANG, ..Default::default() });
         st.supply = 100 * FANG;
         let mut j = Journal::default();
-        lock(&mut st, &mut j, &a, "vote:1".into(), 60 * FANG, 50).unwrap();
+        lock(&mut st, &mut j, &a, "vote:1".into(), 60 * FANG, 50, 1).unwrap();
         assert_eq!(transferable(&st, &a, 10), 40 * FANG);
-        lock(&mut st, &mut j, &a, "vote:2".into(), 80 * FANG, 30).unwrap();
+        lock(&mut st, &mut j, &a, "vote:2".into(), 80 * FANG, 30, 1).unwrap();
         assert_eq!((transferable(&st, &a, 10), transferable(&st, &a, 30), transferable(&st, &a, 50)), (20 * FANG, 40 * FANG, 100 * FANG));
         // Locking an id again only extends it.
-        lock(&mut st, &mut j, &a, "vote:1".into(), 10 * FANG, 20).unwrap();
+        lock(&mut st, &mut j, &a, "vote:1".into(), 10 * FANG, 20, 1).unwrap();
         assert_eq!(transferable(&st, &a, 40), 40 * FANG);
-        lock(&mut st, &mut j, &a, "vote:1".into(), 70 * FANG, 60).unwrap();
+        lock(&mut st, &mut j, &a, "vote:1".into(), 70 * FANG, 60, 1).unwrap();
         assert_eq!(transferable(&st, &a, 55), 30 * FANG);
         assert_eq!(voting_balance(&st, &a, 10), 100 * FANG, "vote locks don't reduce voting weight");
         // Bounds.
-        assert!(lock(&mut st, &mut j, &a, "vote:3".into(), 101 * FANG, 60).unwrap_err().to_string().contains("can't lock"));
-        assert!(lock(&mut st, &mut j, &a, VESTING_LOCK.into(), FANG, 60).is_err());
-        assert!(lock(&mut st, &mut j, &a, String::new(), FANG, 60).is_err());
-        assert!(lock(&mut st, &mut j, &v, "vote:1".into(), 0, 60).unwrap_err().to_string().contains("no account"));
+        assert!(lock(&mut st, &mut j, &a, "vote:3".into(), 101 * FANG, 60, 1).unwrap_err().to_string().contains("can't lock"));
+        assert!(lock(&mut st, &mut j, &a, VESTING_LOCK.into(), FANG, 60, 1).is_err());
+        assert!(lock(&mut st, &mut j, &a, String::new(), FANG, 60, 1).is_err());
+        assert!(lock(&mut st, &mut j, &v, "vote:1".into(), 0, 60, 1).unwrap_err().to_string().contains("no account"));
         for i in 2..MAX_LOCKS as u64 {
-            lock(&mut st, &mut j, &a, format!("vote:{}", i + 1), FANG, 10).unwrap();
+            lock(&mut st, &mut j, &a, format!("vote:{}", i + 1), FANG, 10, 1).unwrap();
         }
-        assert!(lock(&mut st, &mut j, &a, "vote:999".into(), FANG, 10).unwrap_err().to_string().contains("locks"));
+        assert!(lock(&mut st, &mut j, &a, "vote:999".into(), FANG, 10, 1).unwrap_err().to_string().contains("locks"));
         check_invariants(&st).unwrap();
         // Expired locks go with `Unlock`; the live one stays.
         assert_eq!(release_expired(&mut st, &mut j, &a, 30), MAX_LOCKS as u64 - 1);
@@ -1201,6 +1247,17 @@ mod tests {
         st.acct_mut(&mut j, &a).locks.push(Lock { id: VESTING_LOCK.into(), amount: LockAmount::Vesting { total: 90 * FANG, start: 0, cliff: 100, end: 200 }, reason: "founder".into() });
         assert_eq!((voting_balance(&st, &a, 10), voting_balance(&st, &a, 150), voting_balance(&st, &a, 200)), (10 * FANG, 77 * FANG + FANG / 2, 100 * FANG));
         assert_eq!(voting_balance(&st, &v, 10), 0);
+        // A vote lock holds vested tokens, so it comes on top of the vesting lock (F03): 90
+        // unvested + 70 voted is more than the 100 held until the vote lock ends at 60.
+        assert_eq!(st.account(&a).locked_at(55), 160 * FANG);
+        assert_eq!((transferable(&st, &a, 55), transferable(&st, &a, 60), transferable(&st, &a, 150)), (0, 10 * FANG, 77 * FANG + FANG / 2));
+        // Re-locking an id only needs the part that grows it (F42): with fees having taken the
+        // holdings below the lock, the same lock (or a smaller ask) still goes through.
+        st.acct_mut(&mut j, &a).balance = 75 * FANG;
+        lock(&mut st, &mut j, &a, "vote:1".into(), 70 * FANG, 60, 55).unwrap();
+        lock(&mut st, &mut j, &a, "vote:1".into(), FANG, 60, 55).unwrap();
+        assert!(lock(&mut st, &mut j, &a, "vote:1".into(), 71 * FANG, 60, 55).unwrap_err().to_string().contains("can't lock"));
+        assert!(lock(&mut st, &mut j, &a, "vote:4".into(), FANG, 60, 55).unwrap_err().to_string().contains("can't lock"), "75 held, 90 unvested: nothing to vote with");
         // All of it under one journal: rolled back, nothing is left.
         st.rollback(j);
         assert!(st.account(&a).locks.is_empty());
@@ -1246,14 +1303,14 @@ mod tests {
         st.accounts.insert(sender.clone(), Account { balance: FANG, ..Default::default() });
         st.accounts.insert(other.clone(), locked(40 * FANG));
         // `other` went from 60 to 40 FANG with 50 locked: refused. Receiving is always fine.
-        let e = check_locks(&st, &[(other.clone(), Some(60 * FANG))], &sender, FANG as i128, 10).unwrap_err().to_string();
+        let e = check_locks(&st, &[(other.clone(), Some(60 * FANG))], &sender, FANG as i128, 0, 10).unwrap_err().to_string();
         assert!(e.contains("is locked (vote on proposal #1)"), "{e}");
-        check_locks(&st, &[(other.clone(), Some(30 * FANG))], &sender, FANG as i128, 10).unwrap();
-        check_locks(&st, &[(other.clone(), Some(60 * FANG))], &sender, FANG as i128, 100).unwrap();
+        check_locks(&st, &[(other.clone(), Some(30 * FANG))], &sender, FANG as i128, 0, 10).unwrap();
+        check_locks(&st, &[(other.clone(), Some(60 * FANG))], &sender, FANG as i128, 0, 100).unwrap();
         // The sender may not go further below zero than fees took it.
         st.accounts.insert(sender.clone(), locked(49 * FANG));
-        check_locks(&st, &[(sender.clone(), Some(49 * FANG))], &sender, -(FANG as i128), 10).unwrap();
-        assert!(check_locks(&st, &[(sender.clone(), Some(50 * FANG))], &sender, 0, 10).is_err());
+        check_locks(&st, &[(sender.clone(), Some(49 * FANG))], &sender, -(FANG as i128), 0, 10).unwrap();
+        assert!(check_locks(&st, &[(sender.clone(), Some(50 * FANG))], &sender, 0, 0, 10).is_err());
     }
 
     /// DEC-6: an action that opens an account burns the creation fee from the sender, on top of
@@ -1344,8 +1401,10 @@ mod tests {
         t.ok(&bob, Action::RegisterName { name: "abc".into() });
         assert_eq!((t.c.state.names["abc"].owner.as_str(), t.c.state.names["abc"].registered_at), (b.as_str(), t.c.height()));
         assert!(t.err(&alice, Action::RenewName { name: "abc".into(), years: 1 }).contains("belongs to"));
-        // Transfer and release.
+        // Transfer (an offer, then its acceptance) and release.
         t.ok(&alice, Action::TransferName { name: "alice".into(), to: b.clone() });
+        assert_eq!(t.c.state.resolve("alice.boo").unwrap(), a, "still alice's until bob accepts");
+        t.ok(&bob, Action::TransferName { name: "alice".into(), to: b.clone() });
         assert_eq!(t.c.state.resolve("alice.boo").unwrap(), b);
         t.ok(&bob, Action::ReleaseName { name: "alice".into() });
         assert!(!t.c.state.names.contains_key("alice"));
@@ -1360,13 +1419,120 @@ mod tests {
         t.replays();
     }
 
+    /// Audit F34: nobody is given a name, and so a primary name, without accepting it. A
+    /// `TransferName` to another account only offers the name (it still resolves to its owner,
+    /// and the owner can replace or withdraw the offer); the account it was offered to takes it
+    /// with a `TransferName` to itself, and an accepted name is re-stamped, so it never ranks
+    /// ahead of names the account registered itself.
+    #[test]
+    fn a_name_changes_hands_only_when_its_recipient_accepts() {
+        let (mallory, victim, bob) = (keys(1), keys(2), keys(3));
+        let mut t = chain("names-offer", vec![alloc(&mallory, 1_000 * FANG, None, "m"), alloc(&victim, 1_000 * FANG, None, "v"), alloc(&bob, 1_000 * FANG, None, "b")], &[("name_registration_blocks", 60)], 600);
+        let (m, v, b) = (mallory.address(), victim.address(), bob.address());
+        // Mallory's names are older than the victim's own.
+        for i in 0..9 {
+            t.ok(&mallory, Action::RegisterName { name: format!("scam-wallet-{i}") });
+        }
+        t.ok(&victim, Action::RegisterName { name: "victim".into() });
+        let primary = |t: &T| (t.c.state.primary_name(&v), t.c.view().primary_name(&v));
+        let own = (Some("victim.boo".to_string()), Some("victim.boo".to_string()));
+        assert_eq!(primary(&t), own);
+        // Offers change nothing for the victim, however many.
+        for i in 0..9 {
+            let offer = t.ok(&mallory, Action::TransferName { name: format!("scam-wallet-{i}"), to: v.clone() });
+            assert_eq!(t.c.view().describe(&offer, Some(t.c.height())), format!("scam-wallet-0.boo offered scam-wallet-{i}.boo to victim.boo"));
+        }
+        assert_eq!(primary(&t), own);
+        assert_eq!((t.c.state.resolve("scam-wallet-0").unwrap(), t.c.state.names["scam-wallet-0"].offered_to.as_deref()), (m.clone(), Some(v.as_str())));
+        let send = t.tx(&victim, Action::Transfer { to: b.clone(), amount: FANG });
+        assert_eq!(t.c.view().describe(&send, None), "victim.boo sent 1 FANG to ".to_string() + &short(&b));
+        // Only the account it was offered to can accept it, for itself.
+        assert!(t.err(&bob, Action::TransferName { name: "scam-wallet-0".into(), to: b.clone() }).contains("belongs to"));
+        assert!(t.err(&victim, Action::TransferName { name: "scam-wallet-0".into(), to: b.clone() }).contains("belongs to"));
+        assert!(t.err(&victim, Action::TransferName { name: "victim".into(), to: v.clone() }).contains("you already own"));
+        // Accepted, it's the victim's, but its own older name stays its primary name.
+        let accept = t.ok(&victim, Action::TransferName { name: "scam-wallet-0.boo".into(), to: v.clone() });
+        let h = t.c.height();
+        assert_eq!(t.c.view().describe(&accept, Some(h)), "victim.boo accepted scam-wallet-0.boo");
+        let rec = t.c.state.names["scam-wallet-0"].clone();
+        assert_eq!((rec.owner.as_str(), rec.registered_at, rec.offered_to), (v.as_str(), h, None));
+        assert_eq!(primary(&t), own);
+        assert!(t.c.view().names_of(&v, 8).ends_with(&["scam-wallet-0".to_string()]), "after the names it registered");
+        // The owner can replace an offer, or withdraw it.
+        t.ok(&mallory, Action::TransferName { name: "scam-wallet-1".into(), to: b.clone() });
+        assert!(t.err(&victim, Action::TransferName { name: "scam-wallet-1".into(), to: v.clone() }).contains("belongs to"));
+        let withdraw = t.ok(&mallory, Action::TransferName { name: "scam-wallet-1".into(), to: m.clone() });
+        assert_eq!(t.c.view().describe(&withdraw, Some(t.c.height())), "scam-wallet-1.boo withdrew its offer of scam-wallet-1.boo");
+        assert_eq!(t.c.state.names["scam-wallet-1"].offered_to, None);
+        assert!(t.err(&bob, Action::TransferName { name: "scam-wallet-1".into(), to: b.clone() }).contains("belongs to"));
+        // An expired name's offer can't be accepted.
+        let expiry = t.c.state.names["scam-wallet-2"].expires_at;
+        t.blocks(expiry + 1 - t.c.height());
+        assert!(t.err(&victim, Action::TransferName { name: "scam-wallet-2".into(), to: v.clone() }).contains("can't be accepted"));
+        assert_eq!(t.c.state.names["scam-wallet-2"].owner, m);
+        t.replays();
+    }
+
+    /// Audit F35 (a mitigation): the mempool gives a name to whoever asked first. Another
+    /// account's registration of a name already waiting isn't admitted, whatever its tip, unless
+    /// the waiting one can no longer be included or has waited past `NAME_HOLD_BLOCKS`. The
+    /// waiting registrations are indexed by name, and the index follows inclusion and drops.
+    #[test]
+    fn a_name_goes_to_whoever_asked_first() {
+        use crate::chain::NAME_HOLD_BLOCKS;
+        let (alice, mallory, carol) = (keys(1), keys(2), keys(3));
+        let mut t = chain("names-first", vec![alloc(&alice, 1_000 * FANG, None, "a"), alloc(&mallory, 1_000 * FANG, None, "m"), alloc(&carol, 1_000 * FANG, None, "c")], &[], 600);
+        let waiting = |t: &T, name: &str| t.c.live.mempool().registrations(name).count();
+        let first = t.tx(&alice, Action::RegisterName { name: "coinbase".into() });
+        t.c.submit(first.clone()).unwrap();
+        assert_eq!(waiting(&t, "coinbase"), 1);
+        let mut outbid = t.unsigned(&mallory, Action::RegisterName { name: "Coinbase.boo".into() });
+        outbid.tip = FANG;
+        outbid.fee += FANG;
+        let e = t.c.submit(outbid.sign(&mallory)).unwrap_err().to_string();
+        assert!(e.contains("already waiting"), "{e}");
+        // Resubmitting the waiting one is idempotent, and other names aren't affected.
+        t.c.submit(first).unwrap();
+        t.c.submit(t.tx(&mallory, Action::RegisterName { name: "coinbase2".into() })).unwrap();
+        assert_eq!((waiting(&t, "coinbase"), waiting(&t, "coinbase2")), (1, 1));
+        t.c.produce_block().unwrap();
+        assert_eq!(t.c.state.resolve("coinbase.boo").unwrap(), alice.address());
+        assert_eq!((waiting(&t, "coinbase"), waiting(&t, "coinbase2")), (0, 0), "included registrations leave the index");
+        assert!(t.err(&mallory, Action::RegisterName { name: "coinbase".into() }).contains("already taken"));
+
+        // A registration left waiting holds the name for NAME_HOLD_BLOCKS after it arrived, then
+        // nothing: (here) empty blocks stand in for full ones it's outbid in.
+        t.c.submit(t.tx(&alice, Action::RegisterName { name: "binance".into() })).unwrap();
+        t.blocks(NAME_HOLD_BLOCKS);
+        assert!(t.err(&mallory, Action::RegisterName { name: "binance".into() }).contains("already waiting"));
+        t.blocks(1);
+        let late = t.tx(&mallory, Action::RegisterName { name: "binance".into() });
+        t.c.submit(late.clone()).unwrap();
+        assert_eq!(waiting(&t, "binance"), 2);
+        // Alice's own txs are never held off by it; mallory's newer one now holds the name.
+        t.c.submit(t.tx(&alice, Action::Transfer { to: mallory.address(), amount: FANG })).unwrap();
+        assert!(t.err(&carol, Action::RegisterName { name: "binance".into() }).contains("already waiting"));
+        // Dropping a waiting registration (here: a full node's failed forward) unindexes it.
+        t.c.drop_pending(&late.id());
+        assert_eq!(waiting(&t, "binance"), 1);
+
+        // A waiting registration whose fee no longer covers the base fee holds nothing.
+        let stuck = t.tx(&alice, Action::RegisterName { name: "kraken".into() });
+        t.c.submit(stuck).unwrap();
+        for s in t.c.state.econ.fees.iter_mut() {
+            s.rate *= 100;
+        }
+        t.c.submit(t.tx(&mallory, Action::RegisterName { name: "kraken".into() })).unwrap();
+        t.done();
+    }
+
     /// The sweep visits every name, a batch per block, and wraps around.
     #[test]
     fn the_name_sweep_wraps_around() {
         let mut st = State::default();
         for i in 0..100 {
             let n = format!("name{i:03}");
-            st.names.insert(n.clone(), NameRecord { name: n, owner: keys(1).address(), registered_at: 0, expires_at: if i % 3 == 0 { 0 } else { 1_000 } });
+            st.names.insert(n.clone(), NameRecord { name: n, owner: keys(1).address(), registered_at: 0, expires_at: if i % 3 == 0 { 0 } else { 1_000 }, offered_to: None });
         }
         let grace = st.chain_params.name_grace_blocks;
         for h in 0..4 {

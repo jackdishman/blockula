@@ -68,6 +68,7 @@ fn genesis(params: &[(&str, u64)]) -> Genesis {
         reserved_names: vec![],
         soul_ledger: vec![],
         features: vec![],
+        bootstrap_excluded: vec![],
     }
 }
 
@@ -335,11 +336,12 @@ fn majorities_supermajorities_and_conviction() {
         t.vote(BOB, *id, false, *nay, *nc).unwrap();
     }
     let alice = t.bal(ALICE);
+    let supermajority: Vec<bool> = cases.iter().map(|c| needs_supermajority(&t.st, &c.0)).collect();
     t.through(t.p(0).voting_end);
-    for (id, c) in ids.iter().zip(&cases) {
+    for ((id, c), needed) in ids.iter().zip(&cases).zip(supermajority) {
         let p = t.p(*id);
         assert_eq!(p.status, c.5, "{:?}: {}", c.0, p.outcome);
-        assert_eq!(p.tally.as_ref().unwrap().supermajority, needs_supermajority(&t.st, &c.0), "{:?}", c.0);
+        assert_eq!(p.tally.as_ref().unwrap().supermajority, needed, "{:?}", c.0);
     }
     assert!(t.p(3).outcome.contains("fewer than 66.67% of the vote weight"), "{}", t.p(3).outcome);
     assert!(t.p(0).outcome.contains("didn't outweigh"), "{}", t.p(0).outcome);
@@ -434,6 +436,48 @@ fn unvested_tokens_dont_vote() {
     assert!(u < 170_000 * FANG as u128);
 }
 
+/// Audit F03: a vote lock holds vested tokens, on top of what's still vesting, so a vesting
+/// account (the founder here) can't vote, move the same tokens to another account and vote them
+/// again; a plain account can't either. Before the fix the founder's 1M FANG vesting lock
+/// swallowed its 99 FANG vote lock (the larger applied), and 98 FANG voted twice.
+#[test]
+fn a_vesting_account_cant_vote_and_move_the_same_tokens() {
+    let mut t = T::new(&[]);
+    let id = t.propose(ALICE, text());
+    let founder = addr(FOUNDER);
+    t.tx(ALICE, Action::Transfer { to: founder.clone(), amount: 100 * FANG }).unwrap();
+    let before = crate::econ::transferable(&t.st, &founder, t.h);
+    t.vote(FOUNDER, id, true, 99, 1).unwrap();
+    let after = crate::econ::transferable(&t.st, &founder, t.h);
+    assert!(after < FANG && before > 99 * FANG, "the vote locks 99 of its ~100 liquid FANG: {before} → {after}");
+    let e = t.err(FOUNDER, Action::Transfer { to: addr(DAVE), amount: 98 * FANG });
+    assert!(e.contains("is locked"), "{e}");
+    assert_eq!(t.p(id).aye_amount, (99 * FANG) as u128);
+    // Once the lock lapses the tokens move.
+    let until = t.st.governance.votes[&IdKey::new(id, &founder)].locked_until;
+    t.through(until - 1);
+    t.tx(FOUNDER, Action::Transfer { to: addr(DAVE), amount: 98 * FANG }).unwrap();
+}
+
+/// Audit F42: a voter who voted everything it could can still change its vote (the re-vote's
+/// fee took its holdings below the lock, which only needs to cover what grows it).
+#[test]
+fn a_full_balance_voter_can_change_its_vote() {
+    let mut t = T::new(&[]);
+    let id = t.propose(ALICE, text());
+    let all = crate::econ::voting_balance(&t.st, &addr(CAROL), t.h);
+    // What's left once this vote's own fee is paid: everything.
+    let fee = min_fee(Tx { chain_id: CHAIN.into(), genesis_hash: "00".repeat(32), from: addr(CAROL), nonce: 0, fee: 0, tip: 0, valid_until: 0, action: Action::Vote { proposal_id: id, aye: true, amount: all, conviction: 0 }, memo: String::new(), public_key: hex::encode(keys(CAROL).public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) }.size());
+    t.tx(CAROL, Action::Vote { proposal_id: id, aye: true, amount: all - fee, conviction: 0 }).unwrap();
+    assert_eq!(crate::econ::transferable(&t.st, &addr(CAROL), t.h), 0);
+    t.vote(CAROL, id, false, 1, 0).unwrap();
+    t.tx(CAROL, Action::Vote { proposal_id: id, aye: false, amount: 1, conviction: 1 }).unwrap();
+    let p = t.p(id);
+    assert_eq!((p.aye_amount, p.nay_amount, p.voters), (0, 1, 1));
+    let v = &t.st.governance.votes[&IdKey::new(id, &addr(CAROL))];
+    assert_eq!((v.amount, v.lock_amount), (1, all - fee), "the lock never shrinks");
+}
+
 #[test]
 fn the_bootstrap_council_passes_proposals_until_the_bootstrap_ends() {
     let mut t = T::new(&[("bootstrap_end_height", 1_000)]);
@@ -492,11 +536,68 @@ fn the_bootstrap_council_passes_proposals_until_the_bootstrap_ends() {
     assert!(t.p(i).council.is_empty(), "votes after the bootstrap aren't council votes");
 }
 
+/// Audit F15, F16: governance's own safety parameters change only by a token supermajority, never
+/// by the bootstrap council, and never past their floors: the council can't extend itself, open
+/// spending early or rewrite quorum, voting and the timelock with two 1-FANG votes, and a simple
+/// majority can't lower the supermajority or the timelock before scheduling an upgrade.
+#[test]
+fn governance_safety_parameters_need_tokens_and_keep_their_floors() {
+    let mut t = T::new(&[("bootstrap_end_height", 1_000), ("governance_spend_height", 5_000), ("quorum_floor", 30_000 * FANG)]);
+    let [v1, v2, _] = VALIDATORS;
+    let refused = |t: &mut T, kind: ProposalKind, why: &str| {
+        let e = t.err(ALICE, Action::Propose { kind: kind.clone(), deposit: 50 * FANG, title: "x".into(), url: String::new() });
+        assert!(e.contains(why), "{kind:?}: {e}");
+    };
+    let day = 86_400;
+    // What can never pass: the council outliving its end, the spend gate opening earlier, a
+    // supermajority under 60%, a timelock or lock period under a day, voting under 3 days, quorum
+    // under 1% or 5M FANG, a large-spend line over 5%.
+    refused(&mut t, param("bootstrap_end_height", 3_650 * day), "never lasts longer");
+    refused(&mut t, param("governance_spend_height", 0), "never moves earlier");
+    for (key, value, why) in [("supermajority_bps", 5_001, "to 6000 at the least"), ("treasury_large_bps", 10_000, "500 (5% of the treasury) at the most"), ("quorum_bps", 1, "to 100 at the least")] {
+        refused(&mut t, param(key, value), why);
+    }
+    // This chain starts below the floors (short test periods, 30k FANG quorum floor): they only
+    // move up.
+    for (key, value) in [("timelock_blocks", 1), ("voting_blocks", 10 - 1), ("lock_period_blocks", 1), ("quorum_floor", 0)] {
+        refused(&mut t, param(key, value), "at the least");
+    }
+    // Moves within the rules still need tokens: two council votes of 1 FANG pass a text proposal,
+    // not a governance parameter.
+    let council = |t: &mut T, kind: ProposalKind| {
+        let id = t.propose(ALICE, kind);
+        t.vote(v1, id, true, 1, 0).unwrap();
+        t.vote(v2, id, true, 1, 0).unwrap();
+        id
+    };
+    let ids = [council(&mut t, text()), council(&mut t, param("bootstrap_end_height", 500)), council(&mut t, param("timelock_blocks", 2 * day)), council(&mut t, param("governance_spend_height", 6_000))];
+    t.finish(ids[3]);
+    let status: Vec<ProposalStatus> = ids.iter().map(|id| t.p(*id).status).collect();
+    assert_eq!(status, [ProposalStatus::Executed, ProposalStatus::Rejected, ProposalStatus::Rejected, ProposalStatus::Rejected]);
+    assert_eq!(t.p(ids[1]).tally.as_ref().unwrap().council_ayes, 2, "⅔ of the council said aye, and it wasn't enough");
+    assert!(t.p(ids[1]).tally.as_ref().unwrap().supermajority);
+    assert_eq!((t.st.chain_params.bootstrap_end_height, t.st.chain_params.governance_spend_height), (1_000, 5_000));
+    // Token holders: a simple majority isn't enough, the supermajority is.
+    let (a, b) = (t.propose(ALICE, param("supermajority_bps", 6_000)), t.propose(ALICE, param("governance_spend_height", 10_000)));
+    let late = t.propose(ALICE, param("governance_spend_height", 6_000));
+    for id in [a, b, late] {
+        t.vote(ALICE, id, true, 60_000, 1).unwrap();
+    }
+    t.vote(BOB, a, false, 40_000, 1).unwrap();
+    t.finish(late);
+    assert_eq!([a, b].map(|id| t.p(id).status), [ProposalStatus::Rejected, ProposalStatus::Executed]);
+    assert!(t.p(a).outcome.contains("fewer than 66.67%"), "{}", t.p(a).outcome);
+    // Checked again when they run: the gate moved to 10,000 first, so 6,000 would move it back.
+    assert_eq!(t.p(late).status, ProposalStatus::Failed);
+    assert!(t.p(late).outcome.contains("never moves earlier"), "{}", t.p(late).outcome);
+    assert_eq!((t.st.chain_params.supermajority_bps, t.st.chain_params.governance_spend_height), (6_667, 10_000));
+}
+
 #[test]
 fn spending_waits_for_the_spend_height_and_vested_treasury_funds() {
     let mut t = T::new(&[("governance_spend_height", 30)]);
     let spend = |to: u8, fang: u64| ProposalKind::TreasurySpend { to: addr(to), amount: fang * FANG };
-    let dist = ProposalKind::Distribution { merkle_root: "ab".repeat(32), total: FANG, claim_until: 1_000 };
+    let dist = ProposalKind::Distribution { distribution_id: t.st.governance.next_proposal_id, merkle_root: "ab".repeat(32), total: FANG, claim_until: 1_000 };
     for kind in [spend(CAROL, 1), dist.clone()] {
         assert!(t.err(ALICE, Action::Propose { kind, deposit: 50 * FANG, title: "early".into(), url: String::new() }).contains("open at block 30"));
     }
@@ -531,7 +632,7 @@ fn every_proposal_kind_executes() {
     let kinds = vec![
         param("quorum_bps", 500),
         ProposalKind::TreasurySpend { to: addr(CAROL), amount: 1_000 * FANG },
-        ProposalKind::Distribution { merkle_root: hex::encode(root), total: 7 * FANG, claim_until: 200 },
+        ProposalKind::Distribution { distribution_id: next + 2, merkle_root: hex::encode(root), total: 7 * FANG, claim_until: 200 },
         ProposalKind::SetRepo { repo: "jackdishman/blockula".into(), weight: 5 },
         ProposalKind::GrantSoul { to: addr(ALICE), amount: 50 * SOUL, reason: "bootstrap".into() },
         ProposalKind::FlagSybil { account: addr(DAVE), reason: "same person".into() },
@@ -588,8 +689,16 @@ fn proposals_are_checked_when_they_are_made() {
     refused(&mut t, ProposalKind::UnlinkGithub { handle: "nobody".into() }, "isn't linked");
     refused(&mut t, ProposalKind::RefundHunt { hunt_id: 0 }, "no hunt #0");
     refused(&mut t, ProposalKind::ActivateFeature { feature: "warp".into() }, "unknown feature warp");
-    refused(&mut t, ProposalKind::ScheduleUpgrade { version: 9, activation_height: 10 }, "after the vote and the timelock");
-    refused(&mut t, ProposalKind::Distribution { merkle_root: "ab".repeat(32), total: FANG, claim_until: 14 }, "after the vote and the timelock");
+    // Upgrades that can't run when the vote and the timelock are over (audit F46): too soon after
+    // them, or not newer than what's in force.
+    let runs_at = t.h + 10 + 3;
+    let v = crate::consensus::PROTOCOL_VERSION;
+    refused(&mut t, ProposalKind::ScheduleUpgrade { version: 9, activation_height: 10 }, "the vote and the timelock end at block");
+    refused(&mut t, ProposalKind::ScheduleUpgrade { version: v + 1, activation_height: runs_at + crate::upgrade::MIN_UPGRADE_LEAD - 1 }, &format!("at least 64 blocks after block {runs_at}"));
+    refused(&mut t, ProposalKind::ScheduleUpgrade { version: v, activation_height: runs_at + 1_000 }, "isn't newer than");
+    t.propose(ALICE, ProposalKind::ScheduleUpgrade { version: v + 1, activation_height: runs_at + crate::upgrade::MIN_UPGRADE_LEAD });
+    let next = t.st.governance.next_proposal_id;
+    refused(&mut t, ProposalKind::Distribution { distribution_id: next, merkle_root: "ab".repeat(32), total: FANG, claim_until: 14 }, "after the vote and the timelock");
     refused(&mut t, ProposalKind::TreasurySpend { to: "nobody.boo".into(), amount: FANG }, "no one has claimed nobody.boo");
     refused(&mut t, param("warp_speed", 1), "unknown parameter");
     // Names resolve when proposed: the account voters saw is the one paid.
@@ -699,7 +808,7 @@ fn distributions_pay_valid_claims_once_and_return_the_rest() {
     let proof = |i: usize| proofs[i].iter().map(hex::encode).collect::<Vec<_>>();
     let claim = |amount: u64, proof: Vec<String>| Action::ClaimDistribution { distribution_id: id, amount: amount * FANG, proof };
     let claim_until = t.h + 40;
-    t.propose(ALICE, ProposalKind::Distribution { merkle_root: hex::encode(root), total: 185 * FANG, claim_until });
+    t.propose(ALICE, ProposalKind::Distribution { distribution_id: id, merkle_root: hex::encode(root), total: 185 * FANG, claim_until });
     t.vote(ALICE, id, true, 50_000, 1).unwrap();
     assert!(t.err(ALICE, claim(100, proof(0))).contains("no distribution"));
     let community_before = t.st.account(&community("boo")).balance;
@@ -732,12 +841,43 @@ fn distributions_pay_valid_claims_once_and_return_the_rest() {
     let id = t.st.governance.next_proposal_id;
     let entries = vec![(addr(ALICE), 150 * FANG), (addr(BOB), 150 * FANG)];
     let (root, proofs) = build_distribution(id, &entries).unwrap();
-    t.propose(ALICE, ProposalKind::Distribution { merkle_root: hex::encode(root), total: 200 * FANG, claim_until: t.h + 100 });
+    t.propose(ALICE, ProposalKind::Distribution { distribution_id: id, merkle_root: hex::encode(root), total: 200 * FANG, claim_until: t.h + 100 });
     t.vote(ALICE, id, true, 50_000, 1).unwrap();
     t.finish(id);
     let claim = |amount: u64, p: &Vec<[u8; 32]>| Action::ClaimDistribution { distribution_id: id, amount, proof: p.iter().map(hex::encode).collect() };
     t.tx(ALICE, claim(150 * FANG, &proofs[0])).unwrap();
     assert!(t.err(BOB, claim(150 * FANG, &proofs[1])).contains("has only 50 FANG left"));
+}
+
+/// Audit F45: a distribution's leaves bind the id its tree was built for, and the kind names that
+/// id. A proposal that lands first (a front-running text proposal, or anyone's) used to shift the
+/// id silently, so the distribution passed, escrowed its total and nobody could claim; now the
+/// late proposal is refused before it takes a deposit, and a tree rebuilt for the new id goes
+/// through and pays.
+#[test]
+fn a_distribution_built_for_another_id_is_refused_up_front() {
+    let mut t = T::new(&[]);
+    let id = t.st.governance.next_proposal_id;
+    let entries = vec![(addr(CAROL), 11 * FANG)];
+    let (root, _) = build_distribution(id, &entries).unwrap();
+    let dist = |id: u64, root: [u8; 32]| ProposalKind::Distribution { distribution_id: id, merkle_root: hex::encode(root), total: 11 * FANG, claim_until: 500 };
+    // Someone else's proposal takes id 0 first.
+    assert_eq!(t.propose(BOB, text()), id);
+    let (alice, community_before) = (t.bal(ALICE), t.st.account(&community("boo")).balance);
+    let e = t.err(ALICE, Action::Propose { kind: dist(id, root), deposit: 50 * FANG, title: "drop".into(), url: String::new() });
+    assert!(e.contains(&format!("built for id {id}, but this proposal gets id {}", id + 1)), "{e}");
+    assert!(alice - t.bal(ALICE) < FANG, "only the fee: no deposit taken");
+    assert_eq!(t.st.governance.next_proposal_id, id + 1);
+    // Rebuilt for the id it gets, it passes and pays.
+    let (root, proofs) = build_distribution(id + 1, &entries).unwrap();
+    assert_eq!(t.propose(ALICE, dist(id + 1, root)), id + 1);
+    t.vote(ALICE, id + 1, true, 50_000, 1).unwrap();
+    t.finish(id + 1);
+    assert_eq!(t.p(id + 1).status, ProposalStatus::Executed, "{}", t.p(id + 1).outcome);
+    assert_eq!(t.st.account(&community("boo")).balance, community_before - 11 * FANG);
+    let carol = t.bal(CAROL);
+    let fee = t.tx(CAROL, Action::ClaimDistribution { distribution_id: id + 1, amount: 11 * FANG, proof: proofs[0].iter().map(hex::encode).collect() }).unwrap();
+    assert_eq!(t.bal(CAROL), carol + 11 * FANG - fee);
 }
 
 /// A claimant with nothing to pay the fee with (a new account) pays it, and its account's
@@ -753,7 +893,7 @@ fn claims_pay_their_own_fee_out_of_the_claim() {
     let (root, proofs) = build_distribution(id, &entries).unwrap();
     let proof = |i: usize| proofs[i].iter().map(hex::encode).collect::<Vec<_>>();
     let claim = |amount: u64, proof: Vec<String>| Action::ClaimDistribution { distribution_id: id, amount, proof };
-    t.propose(ALICE, ProposalKind::Distribution { merkle_root: hex::encode(root), total: 10 * FANG + 1_000, claim_until: t.h + 100 });
+    t.propose(ALICE, ProposalKind::Distribution { distribution_id: id, merkle_root: hex::encode(root), total: 10 * FANG + 1_000, claim_until: t.h + 100 });
     t.vote(ALICE, id, true, 50_000, 1).unwrap();
     t.finish(id);
     assert!(!t.st.accounts.contains_key(&dave), "DAVE has never held anything");
@@ -849,14 +989,128 @@ fn multisig_accounts_need_their_threshold() {
     t.tx_as(&k2, &alice, Action::MultisigPropose { action: Box::new(Action::Propose { kind: text(), deposit: 50 * FANG, title: "from a multisig".into(), url: String::new() }) }).unwrap();
     t.tx_as(&k1, &alice, Action::MultisigPropose { action: Box::new(Action::Vote { proposal_id: id, aye: true, amount: 10_000 * FANG, conviction: 1 }) }).unwrap();
     assert_eq!((t.p(id).proposer.clone(), t.p(id).voters), (alice.clone(), 1));
-    // At most 32 open proposals per account.
+    // At most 32 open proposals per account, and each of its 2 owner keys may have proposed 16.
     t.tx_as(&k1, &alice, Action::MultisigPropose { action: Box::new(Action::MultisigCreate { owners: vec![kid(ALICE), kid(11)], threshold: 2 }) }).unwrap();
-    let open = t.st.governance.multisigs[&alice].pending.len();
     assert_eq!(t.st.governance.multisigs[&alice].pending, BTreeSet::from([2, 6]), "the unapproved send and the refused key removal");
-    for _ in open..MAX_MULTISIG_PENDING {
+    for _ in 2..16 {
         t.tx_as(&k1, &alice, Action::MultisigPropose { action: send(1) }).unwrap();
     }
-    assert!(t.tx_as(&k1, &alice, Action::MultisigPropose { action: send(1) }).unwrap_err().to_string().contains("32 open multisig proposals"));
+    assert!(t.tx_as(&k1, &alice, Action::MultisigPropose { action: send(1) }).unwrap_err().to_string().contains("its share among 2 owner keys"));
+    for _ in 0..16 {
+        t.tx_as(&k2, &alice, Action::MultisigPropose { action: send(1) }).unwrap();
+    }
+    assert_eq!(t.st.governance.multisigs[&alice].pending.len(), MAX_MULTISIG_PENDING);
+    assert!(t.tx_as(&k2, &alice, Action::MultisigPropose { action: send(1) }).unwrap_err().to_string().contains("32 open multisig proposals"));
+}
+
+/// Audit F14: one owner key of a 2-of-3 multisig can't fill the pending list and keep the others
+/// from proposing (even its own removal): each key may have proposed only its share, ⌊32 / 3⌋.
+/// Audit F17: what's left of its spam expires and is swept without anyone sending anything, and
+/// a proposal's action is bounded (a validator registration fits, 32 KiB of evidence doesn't).
+#[test]
+fn one_owner_key_cant_freeze_a_multisig_and_expired_proposals_go() {
+    let mut t = T::new(&[]);
+    let alice = addr(ALICE);
+    let (k1, k2, rogue) = (keys(ALICE), keys(11), keys(12));
+    for seed in [11, 12] {
+        t.tx(ALICE, Action::AddKey { key_id: kid(seed), label: format!("device {seed}"), role: KeyRole::Owner }).unwrap();
+    }
+    t.tx(ALICE, Action::MultisigCreate { owners: vec![kid(ALICE), kid(11), kid(12)], threshold: 2 }).unwrap();
+    let junk = || Action::MultisigPropose { action: Box::new(Action::Unlock {}) };
+    for _ in 0..MAX_MULTISIG_PENDING / 3 {
+        t.tx_as(&rogue, &alice, junk()).unwrap();
+    }
+    let e = t.tx_as(&rogue, &alice, junk()).unwrap_err().to_string();
+    assert!(e.contains("its share among 3 owner keys"), "{e}");
+    // The honest keys still propose, and remove the rogue.
+    let id = t.st.governance.next_multisig_id;
+    t.tx_as(&k2, &alice, Action::MultisigPropose { action: Box::new(Action::RemoveKey { key_id: kid(12) }) }).unwrap();
+    t.tx_as(&k1, &alice, Action::MultisigApprove { id }).unwrap();
+    assert!(!owner_keys(&t.st, &alice).contains(&kid(12)));
+    // Its proposals expire, and the sweep takes them out of the state.
+    let expires = t.st.governance.multisig_proposals.values().map(|p| p.expires_at).max().unwrap();
+    assert_eq!(t.st.governance.multisig_proposals.len(), 10);
+    t.through(expires + 2);
+    assert!(t.st.governance.multisig_proposals.is_empty() && t.st.governance.multisigs[&alice].pending.is_empty());
+    // Bounded actions.
+    let evidence = Action::ReportEquivocation { evidence: "ab".repeat(MAX_EVIDENCE_BYTES) };
+    let e = t.tx_as(&k1, &alice, Action::MultisigPropose { action: Box::new(evidence) }).unwrap_err().to_string();
+    assert!(e.contains(&format!("at most {MAX_MULTISIG_ACTION_BYTES} bytes")), "{e}");
+    let node = keys(60);
+    let register = Action::RegisterValidator { consensus_key: hex::encode(node.public_key()), p2p_addr: "validator.example.com:30303".into(), http_addr: "https://validator.example.com".into(), bond: 10 * FANG, pop: make_pop([60; 32], CHAIN, &alice, "validator.example.com:30303", "https://validator.example.com") };
+    assert!(register.to_bytes().len() > 10 << 10);
+    let id = t.st.governance.next_multisig_id;
+    t.tx_as(&k1, &alice, Action::MultisigPropose { action: Box::new(register) }).unwrap();
+    t.tx_as(&k2, &alice, Action::MultisigApprove { id }).unwrap();
+    assert_eq!(t.st.validators[&node.address()].owner, alice);
+}
+
+/// Audit F47: once a vote closes its tally is final, and its vote records are swept, a batch a
+/// block (each vote's lock lives on in the voter's account until `Unlock`).
+#[test]
+fn closed_votes_are_swept_and_their_tallies_stay() {
+    let mut t = T::new(&[]);
+    let id = t.propose(ALICE, text());
+    for seed in [ALICE, BOB, CAROL] {
+        t.vote(seed, id, true, 5_000, 1).unwrap();
+    }
+    // Hundreds more, written straight into the state (with the tally they add up to).
+    let extra = VOTE_SWEEP as u64 * 2 + 7;
+    for i in 0..extra {
+        let voter = crate::crypto::render_address("boo", &crate::crypto::hash(&i.to_le_bytes()));
+        t.st.governance.votes.insert(IdKey::new(id, &voter), VoteRecord { aye: false, amount: 1, conviction: 1, weight: 1, lock_amount: 1, locked_until: 0, council: None, at: t.h });
+        let p = t.st.governance.proposals.get_mut(&id).unwrap();
+        (p.nay_amount, p.nay_weight, p.voters) = (p.nay_amount + 1, p.nay_weight + 1, p.voters + 1);
+    }
+    let end = t.p(id).voting_end;
+    t.through(end);
+    let p = t.p(id).clone();
+    assert_eq!((p.status, p.voters, p.aye_amount), (ProposalStatus::Queued, 3 + extra, (15_000 * FANG) as u128));
+    let left = |t: &T| t.st.governance.votes.range(IdKey::new(id, "")..).take_while(|(k, _)| k.id == id).count();
+    assert_eq!(left(&t), (3 + extra) as usize - VOTE_SWEEP, "the closing block swept a batch");
+    t.next();
+    t.next();
+    assert_eq!(left(&t), 0);
+    assert!(t.st.governance.closed_votes.is_empty());
+    assert_eq!(t.p(id).voters, 3 + extra, "the tally stays");
+    // The voters' locks are still there, and still lock.
+    assert!(t.st.account(&addr(CAROL)).locks.iter().any(|l| l.id == format!("vote:{id}")));
+    t.finish(id);
+    assert_eq!(t.p(id).status, ProposalStatus::Executed);
+}
+
+/// Audit F44: treasury spends that pass within 30 days count together against
+/// `treasury_large_bps`, so a large spend split into small proposals still needs ⅔.
+#[test]
+fn split_treasury_spends_count_together() {
+    let mut t = T::new(&[]);
+    let treasury = t.st.account(&t.st.treasury()).balance;
+    let small = treasury / 100 - FANG;
+    let ids: Vec<u64> = (0..5).map(|_| t.propose(ALICE, ProposalKind::TreasurySpend { to: addr(DAVE), amount: small })).collect();
+    for id in &ids {
+        t.vote(ALICE, *id, true, 50_000, 1).unwrap();
+        t.vote(BOB, *id, false, 40_000, 1).unwrap();
+    }
+    t.finish(ids[4]);
+    let status: Vec<ProposalStatus> = ids.iter().map(|id| t.p(*id).status).collect();
+    assert_eq!(status, [ProposalStatus::Executed, ProposalStatus::Rejected, ProposalStatus::Rejected, ProposalStatus::Rejected, ProposalStatus::Rejected]);
+    assert!(!t.p(ids[0]).tally.as_ref().unwrap().supermajority && t.p(ids[1]).tally.as_ref().unwrap().supermajority);
+    assert_eq!(t.bal(DAVE), small);
+    assert_eq!(recent_spends(&t.st, t.h), small as u128);
+    // Thirty days later the window has moved on (aged here by hand: a month of blocks is long).
+    for (at, _) in t.st.governance.recent_spends.values_mut() {
+        *at = 0;
+    }
+    assert_eq!(recent_spends(&t.st, 30 * 86_400), 0);
+    t.h = 30 * 86_400;
+    t.next();
+    let small = t.st.account(&t.st.treasury()).balance / 100 - FANG;
+    let id = t.propose(ALICE, ProposalKind::TreasurySpend { to: addr(DAVE), amount: small });
+    t.vote(ALICE, id, true, 50_000, 1).unwrap();
+    t.vote(BOB, id, false, 40_000, 1).unwrap();
+    t.finish(id);
+    assert_eq!(t.p(id).status, ProposalStatus::Executed, "{}", t.p(id).outcome);
+    assert_eq!(t.st.governance.recent_spends.keys().copied().collect::<Vec<_>>(), vec![id], "the old one was pruned");
 }
 
 /// GOV-2 and GOV-3: without admins, nobody but a hunt's creator moves its escrow, and the
@@ -1052,7 +1306,7 @@ fn records_round_trip_and_journals_roll_back() {
     let mut t = T::new(&[("bootstrap_end_height", 1_000)]);
     let id = t.st.governance.next_proposal_id;
     let (root, proofs) = build_distribution(id, &[(addr(BOB), 5 * FANG), (addr(CAROL), 5 * FANG)]).unwrap();
-    t.propose(ALICE, ProposalKind::Distribution { merkle_root: hex::encode(root), total: 10 * FANG, claim_until: 500 });
+    t.propose(ALICE, ProposalKind::Distribution { distribution_id: id, merkle_root: hex::encode(root), total: 10 * FANG, claim_until: 500 });
     t.vote(ALICE, id, true, 50_000, 3).unwrap();
     t.vote(VALIDATORS[0], id, true, 1, 0).unwrap();
     t.finish(id);
@@ -1061,6 +1315,9 @@ fn records_round_trip_and_journals_roll_back() {
     t.tx(ALICE, Action::AddKey { key_id: kid(11), label: "laptop".into(), role: KeyRole::Owner }).unwrap();
     t.tx(ALICE, Action::MultisigCreate { owners: vec![kid(ALICE), kid(11)], threshold: 2 }).unwrap();
     t.tx(ALICE, Action::MultisigPropose { action: Box::new(Action::Propose { kind: ProposalKind::GrantSoul { to: addr(BOB), amount: SOUL, reason: "r".into() }, deposit: 50 * FANG, title: "t".into(), url: String::new() }) }).unwrap();
+    // A vote still open (closed votes are swept).
+    let open = t.propose(BOB, text());
+    t.vote(CAROL, open, true, 1, 0).unwrap();
     t.next();
     let mut records = vec![];
     t.st.for_each_record(|n, k, v| records.push(Ok((n, k.to_vec(), v.to_vec()))));
@@ -1076,7 +1333,7 @@ fn records_round_trip_and_journals_roll_back() {
     let mut j = Journal::default();
     let txs = [
         (keys(BOB), addr(BOB), Action::Propose { kind: text(), deposit: 50 * FANG, title: "t".into(), url: String::new() }),
-        (keys(BOB), addr(BOB), Action::Vote { proposal_id: id + 1, aye: true, amount: FANG, conviction: 1 }),
+        (keys(BOB), addr(BOB), Action::Vote { proposal_id: id + 2, aye: true, amount: FANG, conviction: 1 }),
         (keys(CAROL), addr(CAROL), Action::ClaimDistribution { distribution_id: id, amount: 5 * FANG, proof: proofs[1].iter().map(hex::encode).collect() }),
         (keys(11), addr(ALICE), Action::MultisigApprove { id: 0 }),
         (keys(BOB), addr(BOB), Action::MultisigCreate { owners: vec![kid(BOB)], threshold: 1 }),
@@ -1086,7 +1343,7 @@ fn records_round_trip_and_journals_roll_back() {
         tx.fee = min_fee(tx.size());
         assert_eq!(t.st.apply_j(&mut j, &tx, CHAIN, &addr(VALIDATORS[0]), t.h, true).unwrap(), Outcome::Applied, "{:?}", tx.action);
     }
-    assert_eq!(t.st.governance.next_proposal_id, id + 3, "the approval proposed #{}", id + 2);
+    assert_eq!(t.st.governance.next_proposal_id, id + 4, "the approval proposed #{}", id + 3);
     t.st.rollback(j);
     assert_eq!(t.st.full_root(), root);
     assert_eq!(t.st.commit_block().unwrap().records, vec![], "nothing left to commit");
@@ -1121,7 +1378,7 @@ fn random_governance_sequences_keep_the_invariants() {
                 let entries: Vec<(String, u64)> = users.iter().take(1 + (r >> 20) as usize % 6).map(|s| (addr(*s), (1 + (r >> 30) % 9) * FANG)).collect();
                 let (root, proofs) = build_distribution(id, &entries).unwrap();
                 let total = entries.iter().map(|e| e.1).sum::<u64>() - (r >> 50) % 2 * FANG;
-                let res = t.tx(ALICE, Action::Propose { kind: ProposalKind::Distribution { merkle_root: hex::encode(root), total, claim_until: t.h + 20 + (r >> 33) % 40 }, deposit: 50 * FANG, title: "drop".into(), url: String::new() });
+                let res = t.tx(ALICE, Action::Propose { kind: ProposalKind::Distribution { distribution_id: id, merkle_root: hex::encode(root), total, claim_until: t.h + 20 + (r >> 33) % 40 }, deposit: 50 * FANG, title: "drop".into(), url: String::new() });
                 if res.is_ok() {
                     trees.push((id, entries, proofs));
                 }
@@ -1155,7 +1412,9 @@ fn random_governance_sequences_keep_the_invariants() {
     }
     t.through(t.h + 200);
     let g = &t.st.governance;
-    assert!(g.next_proposal_id > 10 && g.votes.len() > 10, "the sequence exercised governance ({} proposals, {} votes)", g.next_proposal_id, g.votes.len());
+    let voters: u64 = g.proposals.values().map(|p| p.voters).sum();
+    assert!(g.next_proposal_id > 10 && voters > 10, "the sequence exercised governance ({} proposals, {voters} votes)", g.next_proposal_id);
+    assert!(g.votes.is_empty() && g.closed_votes.is_empty(), "every closed vote was swept");
     assert!(g.proposals.values().any(|p| p.status == ProposalStatus::Executed) && g.proposals.values().any(|p| p.status == ProposalStatus::Rejected));
     assert!(!g.distribution_claims.is_empty() && !g.multisigs.is_empty());
     assert!(g.open_proposals.is_empty() && g.open_distributions.is_empty() && escrow(&t.st) == 0);

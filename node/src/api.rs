@@ -1071,8 +1071,8 @@ async fn key_accounts(State(n): State<Node>, Path(key_id): Path<String>) -> ApiR
 }
 
 /// A name (DEC-11): its `status` (`active`; `grace`, when only its owner can renew it;
-/// `reserved`; or `available`), its owner and expiry, and what registering it or renewing it for
-/// a year costs.
+/// `reserved`; or `available`), its owner and expiry, the account it's offered to (`offered_to`:
+/// theirs once they accept it), and what registering it or renewing it for a year costs.
 async fn name(State(node): State<Node>, Path(n): Path<String>) -> ApiResult {
     let v = node.live.view();
     let st = &v.state;
@@ -1096,6 +1096,9 @@ async fn name(State(node): State<Node>, Path(n): Path<String>) -> ApiResult {
             out["registered_at"] = r.registered_at.into();
             out["expires_at"] = r.expires_at.into();
             out["grace_until"] = grace.into();
+            if let Some(to) = &r.offered_to {
+                out["offered_to"] = label(&v, to);
+            }
             if now <= r.expires_at {
                 "active"
             } else if now <= grace {
@@ -1907,7 +1910,8 @@ async fn proposals(State(n): State<Node>, Query(q): Query<ProposalQuery>) -> Api
     })))
 }
 
-/// One proposal and its votes (up to 500, by voter).
+/// One proposal and its votes (up to 500, by voter). Once a vote closes its tally is final and
+/// its vote records are swept over the next blocks (`votes_swept`; the txs stay in history).
 async fn proposal(State(n): State<Node>, Path(id): Path<u64>) -> ApiResult {
     let v = n.live.view();
     let g = &v.state.governance;
@@ -1921,6 +1925,7 @@ async fn proposal(State(n): State<Node>, Path(id): Path<u64>) -> ApiResult {
         .collect();
     let mut out = proposal_json(&v, p);
     out["votes"] = json!(votes);
+    out["votes_swept"] = json!(p.status != crate::governance::ProposalStatus::Voting && !g.closed_votes.contains(&id));
     out["distribution"] = json!(g.distributions.contains_key(&id).then(|| format!("/api/distribution/{id}")));
     Ok(Json(out))
 }
@@ -2263,6 +2268,18 @@ mod http_tests {
         let year = n.chain.lock().state.chain_params.name_registration_blocks;
         assert_eq!((a["status"].as_str(), a["available"].as_bool(), a["owner"]["address"].as_str()), (Some("active"), Some(false), Some(alice.address().as_str())));
         assert_eq!((a["expires_at"].as_u64(), a["grace_until"].as_u64()), (Some(h + year), Some(h + year + n.chain.lock().state.chain_params.name_grace_blocks)));
+        assert!(a.get("offered_to").is_none());
+        // Offered to bob: still alice's, and the name says who may accept it.
+        let bob = crate::crypto::Keys::from_seed([4; 32]).address();
+        {
+            let mut c = n.chain.lock();
+            let mut tx = Tx { chain_id: "econ".into(), genesis_hash: c.genesis_hash.clone(), from: alice.address(), nonce: 1, fee: 0, tip: 0, valid_until: c.height() + 10, action: Action::TransferName { name: "alice".into(), to: bob.clone() }, memo: String::new(), public_key: hex::encode(alice.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+            tx.fee = 3 * min_fee(tx.size());
+            c.submit(tx.sign(&alice)).unwrap();
+            c.produce_block().unwrap();
+        }
+        let (_, a, _) = call(&n, "GET", "/api/name/alice", None, "127.0.0.1:1").await;
+        assert_eq!((a["owner"]["address"].as_str(), a["offered_to"]["address"].as_str()), (Some(alice.address().as_str()), Some(bob.as_str())));
         let (_, t, _) = call(&n, "GET", &format!("/api/tx/{id}"), None, "127.0.0.1:1").await;
         let size = t["size_bytes"].as_u64().unwrap();
         assert_eq!(t["fee"].as_str().unwrap(), (min_fee(size) + 25).to_string(), "charged: the block's base fee + the tip, not the max fee");
@@ -2615,7 +2632,7 @@ mod http_tests {
             let mut c = n.chain.lock();
             c.faucet(&k.address(), 10 * FANG).unwrap();
             let claim_until = c.height() + 100;
-            c.submit_own(Action::Propose { kind: ProposalKind::Distribution { merkle_root: hex::encode(tree_root), total: 3 * FANG, claim_until }, deposit: 10 * FANG, title: "First drop".into(), url: String::new() }, "").unwrap();
+            c.submit_own(Action::Propose { kind: ProposalKind::Distribution { distribution_id: 0, merkle_root: hex::encode(tree_root), total: 3 * FANG, claim_until }, deposit: 10 * FANG, title: "First drop".into(), url: String::new() }, "").unwrap();
             c.produce_block().unwrap();
             c.submit_own(Action::Vote { proposal_id: 0, aye: true, amount: 100_000_000 * FANG, conviction: 1 }, "").unwrap();
             for _ in 0..13 {
@@ -2648,7 +2665,8 @@ mod http_tests {
         assert!(p["summary"].as_str().unwrap().starts_with("distribute 3 FANG from the community account"), "{p}");
         assert_eq!(get("/api/proposals?status=voting".into()).await.1["proposals"], json!([]));
         let (_, p, _) = get("/api/proposal/0".into()).await;
-        assert_eq!((p["votes"][0]["voter"]["address"].as_str(), p["votes"][0]["conviction"].as_u64(), p["tally"]["quorum_reached"].as_bool()), (Some(me.as_str()), Some(1), Some(true)));
+        // Closed: the tally stays, the vote records were swept.
+        assert_eq!((p["voters"].as_u64(), p["votes"].as_array().map(Vec::len), p["votes_swept"].as_bool(), p["tally"]["quorum_reached"].as_bool()), (Some(1), Some(0), Some(true), Some(true)));
         assert_eq!((p["ayes"]["weight"]["display"].as_str(), p["distribution"].as_str()), (Some("100000000 FANG"), Some("/api/distribution/0")));
         assert_eq!(get("/api/proposal/9".into()).await.0, StatusCode::NOT_FOUND);
         let (_, d, _) = get(format!("/api/distribution/0?address={}", k.address())).await;

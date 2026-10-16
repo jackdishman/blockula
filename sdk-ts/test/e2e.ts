@@ -69,7 +69,7 @@ const v1VectorActions: Action[] = [
   { type: "beacon_reveal", epoch: 3, secret: "cd".repeat(32) },
   { type: "propose", kind: { type: "param_change", key: "max_validators", value: "40" }, deposit: (1000n * 1_000_000_000n).toString(), title: "More validators", url: "https://x.example/p/1" },
   propose({ type: "treasury_spend", to: "x.boo", amount: "9" }),
-  propose({ type: "distribution", merkle_root: "ef".repeat(32), total: "100", claim_until: 5000 }),
+  propose({ type: "distribution", distribution_id: 6, merkle_root: "ef".repeat(32), total: "100", claim_until: 5000 }),
   propose({ type: "set_repo", repo: "a/b", weight: 10 }),
   propose({ type: "grant_soul", to: "x.boo", amount: 2500, reason: "r" }),
   propose({ type: "flag_sybil", account: "x.boo", reason: "r" }),
@@ -97,7 +97,7 @@ const v1VectorActions: Action[] = [
 const v1 = v1VectorActions.map((a) => signingBytes(vectorTx(a)));
 const v1Joined = new Uint8Array(v1.reduce((n, b) => n + b.length, 0));
 v1.reduce((at, b) => (v1Joined.set(b, at), at + b.length), 0);
-assert.equal(bytesToHex(blake3(v1Joined)), "0ffbf0b5bbb1a26f7abe720bae98d7f97581d5268bfbe75fe290605f16172398");
+assert.equal(bytesToHex(blake3(v1Joined)), "fa975d440a66418e791d1cb415eb19479e544948ca449897fa7bad2e1d94bde0");
 assert.throws(() => signingBytes(vectorTx({ type: "multisig_propose", action: { type: "multisig_propose", action: { type: "unlock" } } })), /can't contain another/);
 // Ghost Mode (tags 50–54): signing bytes (the unsigned wire form for 51 and 52) and the sighashes of 50–52, hashed on their own:
 // `ghost_vector_actions` there.
@@ -515,7 +515,11 @@ assert.ok(verifyProof(raw.root, NAMESPACES.ACCOUNTS, alice.address, hexToBytes(r
 assert.ok(!verifyProof(raw.root, NAMESPACES.ACCOUNTS, bob.address, hexToBytes(raw.value as string), raw.proof));
 console.log(`✓ proven reads: ${provenAlice.balance} drops at block #${provenAlice.height}, root ${provenAlice.root.slice(0, 12)}…`);
 
-const moved = await alice.transferName(`${name}.boo`, bob.address);
+const offered = await alice.transferName(`${name}.boo`, bob.address);
+console.log("✓", offered.summary);
+assert.equal(await client.resolve(`${name}.boo`), alice.address, "an offer: still alice's");
+assert.equal((await client.name(name)).offered_to?.address, bob.address);
+const moved = await bob.acceptName(name);
 console.log("✓", moved.summary);
 assert.equal(await client.resolve(`${name}.boo`), bob.address);
 await assert.rejects(alice.releaseName(name), /belongs to/);

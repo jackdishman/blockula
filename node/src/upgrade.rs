@@ -133,9 +133,11 @@ pub fn is_active(state: &State, feature: &str) -> bool {
 // ---- levers (`ProposalKind::ScheduleUpgrade`, `ActivateFeature`, `DeactivateFeature`): no
 // signer checks, governance (P-GOV) calls them when a proposal executes.
 
-/// Schedules protocol `version` from `activation_height` on: at least [`MIN_UPGRADE_LEAD`] blocks
-/// from now, after every scheduled upgrade, and a newer version than all of them.
-pub(crate) fn exec_schedule_upgrade(state: &mut State, j: &mut Journal, version: u32, activation_height: u64, height: u64) -> Result<()> {
+/// Whether protocol `version` could be scheduled from `activation_height` on by a lever that runs
+/// at `height`: at least [`MIN_UPGRADE_LEAD`] blocks later, after every scheduled upgrade, and a
+/// newer version than all of them. A `ScheduleUpgrade` proposal is checked against it when it's
+/// made (with `height` the earliest block it can run in) and again when it runs.
+pub fn check_schedule_upgrade(state: &State, version: u32, activation_height: u64, height: u64) -> Result<()> {
     if height.checked_add(MIN_UPGRADE_LEAD).is_none_or(|earliest| activation_height < earliest) {
         bail!("an upgrade must activate at least {MIN_UPGRADE_LEAD} blocks after block {height}");
     }
@@ -145,6 +147,12 @@ pub(crate) fn exec_schedule_upgrade(state: &mut State, j: &mut Journal, version:
     if let Some(last) = state.upgrade.schedule.last().filter(|u| u.activation_height >= activation_height) {
         bail!("v{} is already scheduled at block {}; a new upgrade must come after it", last.version, last.activation_height);
     }
+    Ok(())
+}
+
+/// Schedules protocol `version` from `activation_height` on ([`check_schedule_upgrade`]).
+pub(crate) fn exec_schedule_upgrade(state: &mut State, j: &mut Journal, version: u32, activation_height: u64, height: u64) -> Result<()> {
+    check_schedule_upgrade(state, version, activation_height, height)?;
     if j.upgrade.schedule.is_none() {
         j.upgrade.schedule = Some(state.upgrade.schedule.clone());
     }

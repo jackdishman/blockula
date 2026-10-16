@@ -25,13 +25,13 @@ FANG is the native token of Blockula. It pays transaction fees, bonds validators
 | Community distributions | 32% | 320,000,000 | Keyless system account | Nothing at genesis. Who receives distributions, when and on what criteria is decided and announced only after mainnet is running (how the first one executes is open, section 10); later ones need a governance proposal | Governance | No |
 | Community treasury | 25% | 250,000,000 | Keyless `treasury` account | Unlocks linearly over 4 years (62.5M a year). Also receives 10% of issuance, name fees, and the bootstrap delegation as it unwinds | Governance only (`TreasurySpend`; large spends need ⅔) | No |
 | Contribution endowment | 15% | 150,000,000 | Keyless contribution pool | Released into the pool's spendable balance linearly over 10 years (15M a year), on top of 20% of issuance | Séance juries (each Séance draws at most 25% of the pool) | No |
-| Validator bootstrap delegation | 10% | 100,000,000 | Keyless `bootstrap` account | Delegated by formula: equal shares to every active, non-jailed validator not run by the foundation, rebalanced each epoch. Returns to the treasury linearly over years 2–4. Its staking rewards go to the treasury; operators keep their commission | The protocol formula | No |
+| Validator bootstrap delegation | 10% | 100,000,000 | Keyless `bootstrap` account | Delegated by formula at every epoch boundary: equal shares to every member of the next active set (so not jailed) not run by the founder or the foundation, rebalanced each epoch. Returns to the treasury linearly over years 2–4. Its staking rewards go to the treasury each epoch; operators keep their commission. Its stake doesn't count toward a validator's rank for a seat, or toward the governance quorum base | The protocol formula (`staking::bootstrap_epoch`) | No |
 | Founder | 10% | 100,000,000 | The founder's own account | 1-year cliff, then linear to 4 years from genesis (section 7) | The founder, within the lock | Vested tokens only, and a pledge not to vote while vesting runs |
 | Foundation operations | 5% | 50,000,000 | Foundation multisig (≥ 3 signers, ≥ 2 of them not the founder) | Linear over 4 years, no cliff. Pays audits, counsel, infrastructure, the bug bounty and operator onboarding; quarterly public reports | The multisig | Never (policy) |
 | Genesis operators and security grants | 3% | 30,000,000 | Each recipient's own account, under a signed service agreement (genesis operators, auditors who accept FANG) | 6-month cliff, then linear to 2 years from genesis | The recipient, within the lock | Vested tokens only |
 | **Total** | **100%** | **1,000,000,000** | | | | |
 
-If staking isn't ready in time for the bootstrap delegation, that 10% folds into the treasury instead.
+The bootstrap formula runs at every epoch boundary, after the next set is chosen: (1) what its stake earned since the last boundary goes to the treasury (it sells shares worth the gain at once; a slash is booked as a loss); (2) it keeps what its lock (below) still holds and returns the rest to the treasury; (3) it splits what it keeps equally over the next set's members whose owner isn't one of the founder's or the foundation's accounts (`bootstrap_excluded` in the genesis: the founder and foundation allocations' recipients and the owners of their seats), leaving every other pool at once and moving each delegation to its share (one within 1 FANG of its share is left alone). The protocol moves this stake without unbonding, only at boundaries and only by the formula. It follows the set rather than choosing it: its stake isn't counted when validators are ranked for seats, so it doesn't entrench the genesis operators. A genesis that gave the bootstrap account no lock would send it all to the treasury at the first boundary, so the bucket can't be stranded (audit F12).
 
 ### Lock curves
 
@@ -46,7 +46,7 @@ Locks are measured in blocks, not wall-clock time (1 s blocks; a year is 31,557,
 | Contribution endowment | 0 | none | 315,576,000 (10 years) |
 | Bootstrap return to the treasury | 31,557,600 | none | 126,230,400 |
 
-The treasury's and the endowment's curves are vesting locks on their keyless accounts: a treasury spend can't exceed what has unlocked (inflows such as issuance and name fees are free at once), and at every epoch boundary whatever of the endowment has vested moves into the contribution pool. The bootstrap delegation's return is part of its delegation formula, not a lock.
+The treasury's, the endowment's and the bootstrap delegation's curves are vesting locks on their keyless accounts: a treasury spend can't exceed what has unlocked (inflows such as issuance and name fees are free at once), at every epoch boundary whatever of the endowment has vested moves into the contribution pool, and whatever of the bootstrap delegation has "vested" goes back to the treasury (its formula keeps the rest delegated).
 
 ### Released by the schedule (end of each year, FANG)
 

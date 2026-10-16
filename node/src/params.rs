@@ -179,6 +179,14 @@ chain_params! { |day, epoch|
     ghost_verify_fee: FANG / 1_000, [0, FANG];
 }
 
+/// Governance's own safety parameters (audit F15, F16). A `ParamChange` of one needs the
+/// supermajority, can't pass by the bootstrap council, and moves it only toward safety or not
+/// past a floor in code ([`ChainParams::check_governance_change`]), so a vote can't make the next
+/// vote easier to win than the design allows: the spend gate never opens earlier, the bootstrap
+/// council never outlives its end, and voting, the timelock, quorum and the supermajority keep
+/// their floors.
+pub const GOVERNANCE_KEYS: &[&str] = &["voting_blocks", "timelock_blocks", "lock_period_blocks", "quorum_bps", "quorum_floor", "supermajority_bps", "treasury_large_bps", "governance_spend_height", "bootstrap_end_height"];
+
 /// Highest `Vote::conviction`.
 pub const MAX_CONVICTION: u8 = 6;
 /// Lock periods (`lock_period_blocks`) a vote at each conviction locks its amount for: none at 0,
@@ -194,7 +202,7 @@ pub fn vote_weight(amount: u64, conviction: u8) -> Option<u128> {
 }
 
 /// Blocks per day at a block time (at least 1).
-fn blocks_per_day(block_time_ms: u64) -> u64 {
+pub fn blocks_per_day(block_time_ms: u64) -> u64 {
     (86_400_000 / block_time_ms.max(1)).max(1)
 }
 
@@ -255,6 +263,61 @@ impl ChainParams {
         ensure!(self.evidence_max_age_epochs.saturating_mul(p.epoch_blocks.max(1)) <= self.unbonding_blocks, "evidence_max_age_epochs × epoch_blocks can't exceed unbonding_blocks");
         ensure!(self.ghost_max_tx_bytes <= self.ghost_max_block_bytes, "ghost_max_tx_bytes can't exceed ghost_max_block_bytes");
         Ok(())
+    }
+
+    /// The rule a `ParamChange` of `key` to `value` follows on top of the bounds: for
+    /// [`GOVERNANCE_KEYS`], toward safety, or toward weaker governance no further than a floor in
+    /// code (on a chain whose genesis starts below one, only toward safety): voting at least 3
+    /// days, the timelock and the lock period at least a day, quorum at least 1% and 5M FANG, the
+    /// supermajority at least 60%, the large-spend line at most 5% of the treasury. The spend gate
+    /// never moves earlier and the bootstrap council's end never later.
+    pub fn check_governance_change(&self, key: &str, value: u64, p: &Params) -> Result<()> {
+        let Some(old) = self.get(key) else { return Ok(()) };
+        let day = blocks_per_day(p.block_time_ms);
+        let at_least = |floor: u64, what: &str| -> Result<()> {
+            ensure!(value >= old || value >= floor, "governance can lower {key} to {floor} at the least ({what}); it's {old}");
+            Ok(())
+        };
+        match key {
+            "voting_blocks" => at_least(3 * day, "3 days"),
+            "timelock_blocks" | "lock_period_blocks" => at_least(day, "a day"),
+            "quorum_bps" => at_least(100, "1%"),
+            "quorum_floor" => at_least(5_000_000 * FANG, "5M FANG"),
+            "supermajority_bps" => at_least(6_000, "60%"),
+            "treasury_large_bps" => {
+                ensure!(value <= old || value <= 500, "governance can raise treasury_large_bps to 500 (5% of the treasury) at the most; it's {old}");
+                Ok(())
+            }
+            "governance_spend_height" => {
+                ensure!(value >= old, "the spend gate never moves earlier: governance_spend_height is {old}");
+                Ok(())
+            }
+            "bootstrap_end_height" => {
+                ensure!(value <= old, "the bootstrap council never lasts longer: bootstrap_end_height is {old}");
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether these values already sit on the safe side of every floor
+    /// [`ChainParams::check_governance_change`] keeps (mainnet's genesis must).
+    pub fn check_governance_floors(&self, p: &Params) -> Result<()> {
+        for key in ["voting_blocks", "timelock_blocks", "lock_period_blocks", "quorum_bps", "quorum_floor", "supermajority_bps", "treasury_large_bps"] {
+            let v = self.get(key).expect("a parameter");
+            // A value is at its floor if lowering it (raising, for the large-spend line) to itself
+            // from far past it is allowed.
+            let from = if key == "treasury_large_bps" { 0 } else { u64::MAX };
+            self.clone().with(key, from).check_governance_change(key, v, p).map_err(|_| anyhow!("parameter `{key}` ({v}) is past governance's floor"))?;
+        }
+        Ok(())
+    }
+
+    fn with(mut self, key: &str, value: u64) -> Self {
+        if let Some(slot) = self.slot(key) {
+            *slot = value;
+        }
+        self
     }
 
     /// Every parameter by key (for the API: amounts can exceed 2^53, so render them as strings).

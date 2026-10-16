@@ -91,7 +91,7 @@ Genesis supply is 1,000,000,000 FANG. Nothing is sold (TOKENOMICS.md section 1).
 - **Unbonding** takes 21 days. **Slashing:** 5% and permanent removal for double-signing, with a share paid to the reporter and the rest burned. Downtime means jail and a 0.1% slash.
 - **Not at genesis:** no liquid staking token, and no custodial staking by the foundation. Docs and frontends must not market staking as a return.
 - **Locked tokens:** rewards earned on locked tokens are locked on the same curve. Accounts with vesting locks may delegate at most 1% of supply to any one pool.
-- **Bootstrap delegation:** the 10% bucket is delegated by a fixed formula from a keyless account to every eligible non-foundation validator. Its rewards go to the treasury. Its eligibility rules are the hosting policy: caps per provider, country and facility (DEC-14).
+- **Bootstrap delegation:** the 10% bucket is delegated by a fixed formula from a keyless account, in equal shares to every active validator not run by the founder or the foundation, rebalanced each epoch. Its rewards go to the treasury, and it returns to the treasury over years 2–4. The hosting policy (caps per provider, country and facility, DEC-14) is enforced on the genesis set; the protocol can't see where later validators run.
 
 ## 7. Governance
 

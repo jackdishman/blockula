@@ -413,11 +413,11 @@ fn namespaces_and_meta_keys_are_unique() {
 /// without the block-hash seed; 13 records): the JS side re-derived the simple records' bytes
 /// (scalars, the account) and rebuilt the tree from the node's dump of the rest. Schema 5 (the
 /// fee slots' ghost limits) changes only the `schema` record here (the default state's fee ring
-/// is empty); the SDK's vector test re-checks the regenerated root and proofs. Schema 6 changes
-/// the `schema` record and `chain_params` (`tip_cap_multiple`, 20, after
-/// `max_tx_validity_blocks`); the record bytes were re-derived independently from the defaults
-/// and the SDK rebuilt the root from them. Staking's schema-6 slash bookkeeping and its two new
-/// maps are empty here.
+/// is empty); the SDK's vector test re-checks the regenerated root and proofs. Schema 6 (the
+/// audit fixes) changes the `schema` record, `chain_params` (`tip_cap_multiple`, 20, after
+/// `max_tx_validity_blocks`) and the `governance` and `params` scalars' layouts (their new fields
+/// are empty here); staking's slash bookkeeping and its two new maps are empty here too. The
+/// vectors were regenerated with it and the SDK rebuilt the root from them.
 #[test]
 fn golden_encodings() {
     let acct = Account { balance: 5, nonce: 2, keys: Default::default(), locks: vec![] };
@@ -428,7 +428,7 @@ fn golden_encodings() {
     st.commit_block().unwrap();
     assert_eq!(st.root_hash(), st.full_root());
     assert_eq!(st.record_count(), 13);
-    assert_eq!(st.root(), "e275713ecd5b9313dc1ba4557e00065a97ac41a8d78ab2a4913437edc121c3dd");
+    assert_eq!(st.root(), "da0a1b06dbb7be8cf302ca9ce0cb593bca0e96f88449fca52daa9ff6376f07b4");
 }
 
 fn million_accounts() -> State {
@@ -545,7 +545,7 @@ fn largest_records_fit_in_a_snapshot() {
     // Lock ids at `econ::lock`'s bound (`MAX_LABEL` bytes), distinct.
     let locks = (0..MAX_LOCKS as u64).map(|id| Lock { id: format!("{id:0>MAX_LABEL$}"), amount: LockAmount::Vesting { total: u64::MAX, start: u64::MAX, cliff: u64::MAX, end: u64::MAX }, reason: s(MAX_LABEL) }).collect();
     st.accounts.insert(addr(0), Account { balance: u64::MAX, nonce: u64::MAX, keys, locks });
-    st.names.insert(s(MAX_NAME_FIELD), NameRecord { name: s(MAX_NAME_FIELD), owner: addr(0), registered_at: 0, expires_at: u64::MAX });
+    st.names.insert(s(MAX_NAME_FIELD), NameRecord { name: s(MAX_NAME_FIELD), owner: addr(0), registered_at: 0, expires_at: u64::MAX, offered_to: Some(addr(1)) });
     let vr = ValidatorRecord { address: addr(1), owner: addr(0), consensus_key: "ab".repeat(crypto::PUBLIC_KEY_LEN), p2p_addr: s(MAX_ADDR), http_addr: s(MAX_ADDR), status: ValidatorStatus::Removed, registered_at: 0, approved_at: Some(0), approved_by: Some(addr(2)), active_from: Some(0), removed_at: Some(0), removed_by: Some(addr(2)), active_until: Some(0), commission_bps: 0 };
     st.validators.insert(addr(1), vr);
     // The largest set governance can configure (`max_validators` is bounded by params.rs).

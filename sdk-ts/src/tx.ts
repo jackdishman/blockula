@@ -124,8 +124,8 @@ export type ProposalKind =
   /** Set a governance parameter (a key of node/src/params.rs `ChainParams`, e.g. "max_validators"), within its bounds. */
   | { type: "param_change"; key: string; value: string }
   | { type: "treasury_spend"; to: string; amount: string }
-  /** Open a community distribution of `total` drops, claimable with Merkle proofs until block `claim_until`. */
-  | { type: "distribution"; merkle_root: string; total: string; claim_until: number }
+  /** Open a community distribution of `total` drops, claimable with Merkle proofs until block `claim_until`. `distribution_id` is the id its tree was built for, which must be the proposal's (the node's `next_id`). */
+  | { type: "distribution"; distribution_id: number; merkle_root: string; total: string; claim_until: number }
   | { type: "set_repo"; repo: string; weight: number }
   /** milli-Soul, at most 100 Soul. */
   | { type: "grant_soul"; to: string; amount: number; reason: string }
@@ -472,7 +472,7 @@ function encodeProposalKind(w: Writer, k: ProposalKind) {
       w.u8(1); w.str(k.to); w.u64(BigInt(k.amount));
       break;
     case "distribution":
-      w.u8(2); w.str(k.merkle_root); w.u64(BigInt(k.total)); w.u64(BigInt(k.claim_until));
+      w.u8(2); w.u64(BigInt(k.distribution_id)); w.str(k.merkle_root); w.u64(BigInt(k.total)); w.u64(BigInt(k.claim_until));
       break;
     case "set_repo":
       w.u8(3); w.str(k.repo); w.u64(BigInt(k.weight));
