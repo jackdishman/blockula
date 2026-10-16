@@ -14,7 +14,7 @@ const FANG: u64 = DROPS_PER_FANG;
 /// An unsigned tx's fee in these tests: the base fee of a tx well above a real one's size, plus
 /// the default verify fee (the excess is burned), on the fee grid (`FEE_GRID`).
 pub(crate) const FEE: u64 = 4 * FEE_GRID;
-const _: () = assert!(FEE >= 10_000 + 250_000 * 10 + FANG / 1_000 && FEE % FEE_GRID == 0);
+const _: () = assert!(FEE >= 10_000 + 250_000 * 10 + FANG / 1_000 && FEE.is_multiple_of(FEE_GRID));
 
 /// Deterministic randomness for test wallets (BLAKE3's XOF). Provers draw their masks from the
 /// OS regardless.
