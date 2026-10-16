@@ -78,6 +78,11 @@ pub const JUROR_BAD_SOUL: u64 = 2 * SOUL;
 pub const NO_SHOW_SOUL: u64 = JUROR_BAD_SOUL;
 pub const NO_SHOW_SLASH_BPS: u64 = 1_000;
 pub const SPAM_SOUL: u64 = 20 * SOUL;
+/// A spam verdict needs at least this many flags, and more than half of the jurors who saw the
+/// claim (audit F23: with 64 claims and 24 pairs per seat, most claims are seen by 2–4 of the 7
+/// jurors, so "2 and a majority of viewers" let two colluding seats slash competitors). A claim
+/// fewer than this many jurors saw can't be marked spam: on ambiguity it's scored, never slashed.
+pub const SPAM_MIN_FLAGS: u64 = 3;
 pub const SYBIL_VOUCHER_SOUL: u64 = 50 * SOUL;
 /// Soul at which the payout boost maxes out (1.5×).
 pub const BOOST_CAP_SOUL: u64 = 100 * SOUL;
@@ -1328,6 +1333,7 @@ impl State {
             }
         }
         let score: BTreeMap<u64, u64> = comps.iter().map(|(c, n)| (*c, wins2.get(c).copied().unwrap_or(0) * PPM / (2 * n))).collect();
+        let mut spam: BTreeSet<u64> = BTreeSet::new();
         let mut results = SeanceResults::default();
         let mut accepted: Vec<u64> = vec![];
         let mut soul_changes: Vec<(String, i64, Option<u64>)> = vec![];
@@ -1343,10 +1349,11 @@ impl State {
             };
             let f = flags.get(c).copied().unwrap_or(0);
             self.claim_mut(&mut j, *c).unwrap().score_ppm = Some(sc);
-            if f >= 2 && 2 * f > seen.get(c).copied().unwrap_or(0) {
+            if f >= SPAM_MIN_FLAGS && 2 * f > seen.get(c).copied().unwrap_or(0) {
                 self.settle_bond(&mut j, *c, false);
                 self.set_status(&mut j, *c, ClaimStatus::Spam, height, Some(format!("{f} of the jurors who saw it flagged it as spam")));
                 soul_changes.push((claimant, -(SPAM_SOUL as i64), None));
+                spam.insert(*c);
                 results.spam += 1;
             } else if sc < MIN_SCORE_PPM {
                 self.settle_bond(&mut j, *c, true);
@@ -1387,6 +1394,13 @@ impl State {
                 points += if v == outcome { 2 } else if v == b'=' || outcome == b'=' { 1 } else { 0 };
                 total += 2;
             }
+            // Spam flags are graded too (F23): a flag on a claim enough jurors saw to decide
+            // (`SPAM_MIN_FLAGS`) that the jury didn't uphold counts as a disagreement, so
+            // flagging everything costs agreement, Soul and the jury reward. Upheld flags and
+            // flags on claims too few saw neither add nor cost.
+            let saw: BTreeSet<u64> = seat.pairs.iter().filter(|[a, b]| live.contains(a) && live.contains(b)).flatten().copied().collect();
+            let overruled = seat.spam.iter().filter(|c| saw.contains(c) && score.contains_key(c) && seen.get(c).copied().unwrap_or(0) >= SPAM_MIN_FLAGS && !spam.contains(c)).count() as u64;
+            total += 2 * overruled;
             if total == 0 {
                 seat_updates.push((juror.clone(), None, 0));
                 continue;
@@ -2065,6 +2079,69 @@ mod scenarios {
         let id = t.c.state.poc.open_seance.unwrap();
         assert_eq!(draw(&t.c.state.poc.seances[&id]), draw(&c));
         t.reopen_same_root();
+    }
+
+    /// Audit F23: a spam verdict needs `SPAM_MIN_FLAGS` (3) flags and a majority of the jurors who
+    /// saw the claim, so two colluding seats can't slash a claim only they (or few others) saw;
+    /// and a flag the jury didn't uphold counts against the flagger's agreement.
+    #[test]
+    fn spam_needs_three_flags_and_overruled_flags_cost_agreement() {
+        let mut t = setup("spamq");
+        t.admin(Action::SetRepo { repo: "jackdishman/blockula".into(), weight: 10 }).unwrap();
+        let jurors: Vec<Keys> = (1..=5).map(k).collect();
+        for j in &jurors {
+            t.grant(j, 10);
+            t.tx(j, Action::JoinJury { bond: JUROR_BOND }).unwrap();
+        }
+        t.tx(&k(9), Action::FundPool { amount: 50 * DROPS_PER_FANG }).unwrap();
+        let mut claims = vec![];
+        for (i, who) in [(10u8, "ten"), (11, "eleven"), (12, "twelve")] {
+            t.grant(&k(i), 1);
+            t.link(&k(i), who);
+            claims.push(t.claim(&k(i), i as u64).unwrap());
+        }
+        t.attest_all(&claims);
+        let sid = t.wait_for_seance();
+        let (x, a, b) = (claims[0], claims[1], claims[2]);
+        let base = t.c.state.clone();
+        let h = t.h();
+        // Every juror reveals an honest ballot (a > b > x) and the `flaggers` flag `x`; with
+        // `only_two_see_x`, jurors 2–4 compare only `a` and `b`.
+        let close = |flaggers: &[usize], only_two_see_x: bool| -> State {
+            let mut st = base.clone();
+            let s = st.poc.seances.get_mut(&sid).unwrap();
+            for (i, jk) in jurors.iter().enumerate() {
+                let seat = s.jurors.get_mut(&jk.address()).unwrap();
+                if only_two_see_x && i >= 2 {
+                    seat.pairs = vec![[a, b]];
+                }
+                let rank = |c: u64| if c == a { 3 } else if c == b { 2 } else { 1 };
+                seat.votes = Some(seat.pairs.iter().map(|[p, q]| if rank(*p) > rank(*q) { 'a' } else { 'b' }).collect());
+                seat.spam = if flaggers.contains(&i) { vec![x] } else { vec![] };
+            }
+            st.close_seance(sid, h);
+            st.check_invariants().unwrap();
+            st
+        };
+        let agreement = |st: &State, i: usize| st.poc.seances[&sid].jurors[&jurors[i].address()].agreement_ppm.unwrap();
+        // Two of the five who saw it flag it: not spam, and both flags were overruled.
+        let st = close(&[0, 1], false);
+        assert_eq!(st.poc.claims[&x].status, ClaimStatus::Scored);
+        assert!(agreement(&st, 0) < agreement(&st, 2), "an overruled flag costs agreement: {} vs {}", agreement(&st, 0), agreement(&st, 2));
+        assert_eq!(agreement(&st, 2), PPM, "honest ballot, no flags");
+        // Only two jurors saw `x`, and both flagged it: a majority of its viewers, but too few to
+        // decide. It's scored (on ambiguity, never slashed), and the flags aren't graded.
+        let st = close(&[0, 1], true);
+        assert_eq!(st.poc.seances[&sid].jurors[&jurors[3].address()].pairs, vec![[a, b]]);
+        assert_eq!(st.poc.claims[&x].status, ClaimStatus::Scored);
+        assert_eq!(st.poc.claims[&x].bond, 0, "bond refunded");
+        assert_eq!((agreement(&st, 0), agreement(&st, 1)), (PPM, PPM));
+        // Three of five: spam (bond to the pool, Soul lost); upheld flags cost nothing.
+        let st = close(&[0, 1, 2], false);
+        assert_eq!(st.poc.claims[&x].status, ClaimStatus::Spam);
+        assert_eq!(st.poc.seances[&sid].results.as_ref().unwrap().spam, 1);
+        assert_eq!(agreement(&st, 0), PPM);
+        std::fs::remove_dir_all(&t.home).ok();
     }
 
     fn claims_payout(t: &T, c: u64) -> u64 {
