@@ -111,7 +111,6 @@ pub struct Pool {
     pub slashed_from: Option<u64>,
 }
 
-
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Jail {
     pub at: u64,
