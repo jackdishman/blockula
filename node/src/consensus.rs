@@ -386,7 +386,8 @@ where
             let mut bytes = 0;
             // Senders whose earlier tx was left out: their later nonces can't apply.
             let mut stuck = std::collections::HashSet::new();
-            for tx in crate::chain::proposal_order(&c.mempool) {
+            // Validator duties first (the mempool's lane), then by tip per byte.
+            for tx in c.proposal_txs() {
                 if limit == 0 || txs.len() >= MAX_BLOCK_TXS {
                     break;
                 }

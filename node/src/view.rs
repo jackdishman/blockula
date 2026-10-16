@@ -518,6 +518,8 @@ impl Live {
         self.claimed.load(Ordering::Relaxed).max(self.finalized(height))
     }
 
+    /// Behind what peers claim (or what we verified) by more than a few blocks: for display
+    /// (`/api/status`, `/api/health`). Validator duties use `Chain::syncing`, verified heights only.
     pub fn syncing(&self, height: u64) -> bool {
         height + crate::chain::SYNC_SLACK < self.network_height_claimed(height)
     }
