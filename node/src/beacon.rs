@@ -9,16 +9,28 @@
 //! * At the end of `e + 1` ([`end_epoch`]), `value(e + 2)` is [`derive`]: BLAKE3 over
 //!   `value(e + 1)`, the epoch and the revealed `(validator, secret)` pairs sorted by validator.
 //!   With no reveals that is BLAKE3 over the previous value and the epoch alone: a hash chain.
-//!   Validators that committed and didn't reveal are jailed and lightly slashed
-//!   (`staking::jail`, `beacon_miss_slash_bps`). Epoch 0's value comes from genesis
-//!   ([`init_genesis`]); epoch 1 has no round, so its value is the hash chain's next link.
+//!   Validators that committed and didn't reveal are jailed and slashed (`staking::jail`,
+//!   [`miss_slash_bps`]: `beacon_miss_slash_bps`, times one more for each miss already on record
+//!   in the kept values). Epoch 0's value comes from genesis ([`init_genesis`]); epoch 1 has no
+//!   round, so its value is the hash chain's next link.
 //!
 //! What this guarantees: nobody can predict `value(e + 2)` before the first honest validator
 //! reveals (during `e + 1`), and where or in what order reveals land changes nothing (they are
 //! sorted). What it doesn't: a committer that sees everyone else's reveals may withhold its own,
-//! choosing between two values. That is one bit of influence per withholding validator, bought
-//! with jail and a slash each time (the *withholding bit*). If nobody takes part, the beacon is
-//! the predictable hash chain.
+//! choosing between two values. That is one bit of influence per withholding validator (k
+//! colluding withholders choose among at most 2^k values), bought each time with:
+//!
+//! * the slash, escalating with repeat misses;
+//! * the epoch it's caught in (`e + 1`): [`end_epoch`] runs first at the boundary, before
+//!   issuance and set selection (chain.rs `end_block`), so a jailed pool earns nothing for it;
+//! * the epoch it biased (`e + 2`): the set for it is selected after the jail, so the withholder
+//!   isn't in it (`Unjail` comes after `jail_blocks`, and rejoining is churn-limited);
+//! * and a jailed validator can't commit again (no fresh bits while it's on its way out).
+//!
+//! Its value is choosing between two leader orders for `e + 2` and, when a Séance opens at the
+//! end of `e + 2`, between two jury draws: at most that Séance's budget is at stake (a quarter of
+//! the contribution pool). PLAN.md "Known limits" weighs the two. If nobody takes part, the
+//! beacon is the predictable hash chain.
 //!
 //! **Uses.** Séances open on fixed epoch boundaries and draw their jury and pairs from that
 //! epoch's value ([`seance_seed`], poc.rs). Each epoch's leader order is a permutation seeded
@@ -213,6 +225,10 @@ pub(crate) fn apply(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, s
                 bail!("during epoch {epoch} validators commit to the beacon for epoch {}", epoch + 2);
             }
             let v = crate::staking::validator_for_signer(state, sender, signer, epoch).ok_or_else(|| anyhow!("only validators active in epoch {epoch} commit to the beacon"))?;
+            // A jailed validator leaves the set at the next boundary: no new bits for it.
+            if jailed(state, &v) {
+                bail!("validator {} is jailed: it leaves the set at the end of epoch {epoch} and doesn't commit to the beacon", short(&v));
+            }
             let c = hex32("commitment", commitment)?;
             if state.beacon.rounds.get(target).is_some_and(|r| r.contains_key(&v)) {
                 bail!("validator {} already committed to the beacon for epoch {target}", short(&v));
@@ -279,12 +295,29 @@ fn attest_revert(state: &mut State, j: &mut Journal, sender: &str, signer: &str,
     Ok(())
 }
 
+fn jailed(state: &State, validator: &str) -> bool {
+    state.staking.pools.get(validator).is_some_and(|p| p.jail.is_some())
+}
+
 // ----------------------------------------------------------------------------- end of epoch
 
-/// At the end of `epoch`, after `staking::end_epoch`: derive `value(epoch + 1)` from its round,
-/// jail the validators that committed and didn't reveal, and drop revert attestations whose
-/// claims left their window. End-of-block steps aren't rolled back, so the journal only feeds
-/// the helpers.
+/// What a missed reveal slashes: `beacon_miss_slash_bps` for a first miss, times one more for
+/// each miss of `validator`'s already on record in the kept values (the last [`VALUES_KEPT`]
+/// epochs), at most the parameter's ceiling (10%). Honest validators miss only through downtime
+/// spanning half an epoch, which jails them anyway; a validator that withholds again and again
+/// pays more each time.
+pub fn miss_slash_bps(state: &State, validator: &str) -> u64 {
+    let base = state.chain_params.beacon_miss_slash_bps;
+    let prior = state.beacon.values.values().filter(|v| v.missed.binary_search_by(|m| m.as_str().cmp(validator)).is_ok()).count() as u64;
+    let ceiling = crate::params::ChainParams::bounds("beacon_miss_slash_bps", &state.params).map_or(base, |(_, max)| max);
+    base.saturating_mul(1 + prior).min(ceiling.max(base))
+}
+
+/// At the end of `epoch`, first of the epoch-boundary steps (before issuance and
+/// `staking::end_epoch`, so the jail costs the withholder this epoch's rewards and its seat in
+/// the next set): derive `value(epoch + 1)` from its round, jail the validators that committed
+/// and didn't reveal, and drop revert attestations whose claims left their window. End-of-block
+/// steps aren't rolled back, so the journal only feeds the helpers.
 pub fn end_epoch(state: &mut State, epoch: u64) {
     let mut j = Journal::default();
     let target = epoch + 1;
@@ -293,6 +326,8 @@ pub fn end_epoch(state: &mut State, epoch: u64) {
     let reveals: Vec<(String, [u8; 32])> = round.iter().filter_map(|(v, e)| e.secret.map(|s| (v.clone(), s))).collect();
     let missed: Vec<String> = round.iter().filter(|(_, e)| e.secret.is_none()).map(|(v, _)| v.clone()).collect();
     let prev = value(state, epoch).unwrap_or_default();
+    // Escalation counts earlier misses only (before this epoch's value is filed).
+    let slashes: Vec<u64> = missed.iter().map(|v| miss_slash_bps(state, v)).collect();
     let v = Value { value: derive(&prev, target, &reveals), reveals: reveals.len() as u32, missed: missed.clone() };
     state.beacon.values.insert(target, v);
     let done: Vec<u64> = state.beacon.rounds.keys().take_while(|t| **t <= target).copied().collect();
@@ -303,9 +338,8 @@ pub fn end_epoch(state: &mut State, epoch: u64) {
     for e in old {
         state.beacon.values.remove(&e);
     }
-    let slash = state.chain_params.beacon_miss_slash_bps;
-    for v in &missed {
-        crate::staking::jail(state, &mut j, v, height, slash, &format!("committed to the randomness beacon for epoch {target} and didn't reveal"));
+    for (v, bps) in missed.iter().zip(slashes) {
+        crate::staking::jail(state, &mut j, v, height, bps, &format!("committed to the randomness beacon for epoch {target} and didn't reveal"));
     }
     let next = height + 1;
     let closed: Vec<u64> = state.beacon.reverts.keys().filter(|id| !state.poc.claims.get(*id).is_some_and(|c| revert_window_open(state, c, next))).copied().collect();
@@ -479,7 +513,7 @@ pub fn duties(chain: &mut Chain, secrets: &mut Secrets) -> Result<Vec<String>> {
         }
     }
     let commit = epoch + 2;
-    let active = crate::staking::validator_for_signer(&chain.state, &me, &signer, epoch).as_deref() == Some(me.as_str());
+    let active = crate::staking::validator_for_signer(&chain.state, &me, &signer, epoch).as_deref() == Some(me.as_str()) && !jailed(&chain.state, &me);
     let committed = chain.state.beacon.rounds.get(&commit).is_some_and(|r| r.contains_key(&me));
     if active && !committed && !queued(chain, &|a| matches!(a, Action::BeaconCommit { epoch, .. } if *epoch == commit)) {
         // On disk before the commitment leaves this node.

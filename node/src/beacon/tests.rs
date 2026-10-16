@@ -154,8 +154,10 @@ fn a_round_commits_reveals_and_records_who_missed() {
     let got = t.c.state.beacon.values[&2].clone();
     assert_eq!(got, Value { value: derive(&value(&t.c.state, 1).unwrap(), 2, &reveals), reveals: 3, missed: vec![v[3].address()] });
     assert!(!t.c.state.beacon.rounds.contains_key(&2), "the round is gone once derived");
-    // The withholder is jailed by the real `staking::jail` (it leaves the set at the next
-    // boundary, `Unjail` after `jail_blocks`) and lightly slashed; nobody else is.
+    // The withholder is jailed by the real `staking::jail` and slashed; nobody else is. The
+    // beacon step runs first at the boundary, so the set for epoch 2 (the epoch whose value it
+    // biased) is selected without it (audit F21: it used to be selected first, so the jail
+    // never took a seat away), and `Unjail` waits `jail_blocks`.
     let withholder = v[3].address();
     let pool = t.c.state.staking.pools[&withholder].clone();
     let jail = pool.jail.clone().expect("jailed for withholding");
@@ -163,6 +165,20 @@ fn a_round_commits_reveals_and_records_who_missed() {
     assert!(jail.reason.contains("didn't reveal"), "{jail:?}");
     assert!(pool.slashed > 0 && pool.slashed == pool.slashed.min(crate::staking::self_bond(&t.c.state, &withholder) / 100), "{} drops", pool.slashed);
     assert!(v.iter().take(3).all(|k| t.c.state.staking.pools[&k.address()].jail.is_none()));
+    assert!(t.c.state.active_sets[&1].contains(&withholder) && !t.c.state.active_sets[&2].contains(&withholder), "out of the next set");
+    assert!(v.iter().take(3).all(|k| t.c.state.active_sets[&2].contains(&k.address())));
+    // A repeat withholder pays more: the slash grows with its misses on record.
+    let base = t.c.state.chain_params.beacon_miss_slash_bps;
+    assert_eq!((miss_slash_bps(&t.c.state, &withholder), miss_slash_bps(&t.c.state, &v[0].address())), (2 * base, base));
+    // A jailed validator still in the current set can't commit to a new round.
+    {
+        let mut st = t.c.state.clone();
+        let mut j = crate::chain::Journal::default();
+        let me = v[0].address();
+        crate::staking::jail(&mut st, &mut j, &me, 20, 0, "downtime");
+        let tx = signed(&t.c, &v[0], commit(&t.c, &v[0], 4, secret(1)));
+        assert!(matches!(st.apply(&tx, &chain_id, &me, 20).unwrap(), Outcome::Failed(r) if r.contains("is jailed")));
+    }
     // Idempotent for a validator that's already out: jailing it again (another miss) keeps it
     // jailed with the later release and the books balanced; a tombstoned one is left alone.
     {
@@ -294,7 +310,8 @@ fn duties_commit_reveal_and_survive_a_restart() {
     step(&mut t, &mut secrets);
     assert_eq!((secrets.get(2), secrets.get(3).is_some(), secrets.get(4).is_some()), (None, true, true), "then pruned");
     // Losing the secrets file before a reveal: the node says so once the reveal is due, misses
-    // it and is jailed for it, and keeps going with a fresh file.
+    // it and is jailed for it (no commitments while jailed), and once unjailed keeps going with
+    // a fresh file.
     std::fs::remove_file(&path).unwrap();
     let mut secrets = Secrets::open(&home).unwrap();
     assert!(duties(&mut t.c, &mut secrets).unwrap().is_empty(), "nothing due before the middle of the epoch");
@@ -303,9 +320,20 @@ fn duties_commit_reveal_and_survive_a_restart() {
     assert!(err.contains("can't reveal"), "{err}");
     t.advance_to(29);
     assert_eq!(t.c.state.beacon.values[&3], Value { value: derive(&value(&t.c.state, 2).unwrap(), 3, &[]), reveals: 0, missed: vec![me.clone()] });
-    assert_eq!(duties(&mut t.c, &mut secrets).unwrap(), vec!["committed to the beacon for epoch 5".to_string()]);
+    assert!(t.c.state.staking.pools[&me].jail.is_some());
+    assert!(duties(&mut t.c, &mut secrets).unwrap().is_empty(), "a jailed validator doesn't commit");
+    // Epoch 4's commitment (made during epoch 2) can't be opened either: missed and jailed again.
+    t.advance_to(39);
+    let until = t.c.state.staking.pools[&me].jail.as_ref().unwrap().until;
+    assert!(until >= 39 + t.c.state.chain_params.jail_blocks);
+    t.advance_to(until - 1);
+    let v0 = t.vals[0].clone_keys();
+    t.tx(&v0, Action::Unjail { validator: me.clone() }).unwrap();
+    assert!(t.c.state.staking.pools[&me].jail.is_none());
+    let next = t.c.state.params.epoch_of(t.c.height() + 1) + 2;
+    assert_eq!(duties(&mut t.c, &mut secrets).unwrap(), vec![format!("committed to the beacon for epoch {next}")]);
     t.c.produce_block().unwrap();
-    assert_eq!(t.c.state.beacon.rounds[&5][&me].commitment, commitment(&t.c.genesis.chain_id, 5, &me, &secrets.get(5).unwrap()));
+    assert_eq!(t.c.state.beacon.rounds[&next][&me].commitment, commitment(&t.c.genesis.chain_id, next, &me, &secrets.get(next).unwrap()));
     t.done();
 }
 

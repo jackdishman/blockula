@@ -1358,14 +1358,24 @@ fn credit_reward(state: &mut State, j: &mut Journal, validator: &str, reward: u6
 }
 
 /// The active validator (in `epoch`) the tx sender or signer acts for: the validator whose
-/// consensus key signed, when the sender is that validator or its owner; else a validator the
-/// sender is or owns (the first by address). Council votes, beacon commitments and attestations
-/// count for it.
+/// consensus key signed, when the sender is that validator or its owner; else, for a key on the
+/// sender's own account, a validator the sender is or owns (the first by address). Council
+/// votes, beacon commitments and attestations count for it.
+///
+/// A consensus key speaks only for its own validator: the key of an owner's other validator
+/// that isn't in the set (retired, jailed out, removed) acts for nobody, never for a sibling
+/// (audit F22: it could otherwise commit an unopenable beacon commitment in the active one's
+/// name, getting it jailed every epoch, or cast its attestations).
 pub fn validator_for_signer(state: &State, account: &str, signer_key_id: &str, epoch: u64) -> Option<String> {
     let set = state.active_sets.get(&epoch)?;
     let acts_for = |v: &String| v == account || state.validators.get(v).is_some_and(|r| r.owner == account);
     if let Some(v) = validator_of_key(state, signer_key_id).filter(|v| set.contains(v) && acts_for(v)) {
         return Some(v);
+    }
+    // The owner's own keys pick its validator; anything else (another validator's consensus key,
+    // admitted through `system_tx_key`) doesn't.
+    if !state.keys_of(account).contains_key(signer_key_id) {
+        return None;
     }
     set.iter().filter(|v| acts_for(v)).min().cloned()
 }

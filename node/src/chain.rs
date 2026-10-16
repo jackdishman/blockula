@@ -898,10 +898,12 @@ impl State {
     /// 4. `governance::end_block`: proposals whose voting ended or whose timelock is over.
     /// 5. `ghost::end_block`: the commitment tree's new root becomes the anchor; old anchors
     ///    age out.
-    /// 6. At an epoch boundary: `econ::issue` (issuance into the pools, the contribution pool and
-    ///    the treasury; the endowment's vested part into the contribution pool), `staking::end_epoch`
-    ///    (the next set by stake, churn-limited), `beacon::end_epoch` (the next epoch's beacon
-    ///    value, jailing non-revealers), then [`State::end_epoch`] (how much set history to keep).
+    /// 6. At an epoch boundary: `beacon::end_epoch` (the next epoch's beacon value, jailing
+    ///    non-revealers: first, so a withholder earns nothing for the epoch it's caught in and
+    ///    the next set leaves it out), `econ::issue` (issuance into the pools, the contribution
+    ///    pool and the treasury; the endowment's vested part into the contribution pool),
+    ///    `staking::end_epoch` (the next set by stake, churn-limited), then [`State::end_epoch`]
+    ///    (how much set history to keep).
     ///
     /// Then the caller commits the block and, last, runs `upgrade::check_next(height + 1)`, which
     /// stops the node before a height its binary can't execute (3.9).
@@ -913,9 +915,9 @@ impl State {
         crate::ghost::end_block(self, b);
         if self.params.is_boundary(b.height) {
             let epoch = self.params.epoch_of(b.height);
+            crate::beacon::end_epoch(self, epoch);
             crate::econ::issue(self, epoch);
             crate::staking::end_epoch(self, epoch);
-            crate::beacon::end_epoch(self, epoch);
             self.end_epoch(epoch);
         }
     }

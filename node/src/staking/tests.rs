@@ -981,6 +981,43 @@ fn consensus_keys_sign_system_txs_for_their_owners() {
     t.block();
 }
 
+/// Audit F22: an owner's validator that isn't in the set (retired, jailed out) has a consensus
+/// key that's still admitted for the owner's system txs, but it acts for nobody: never for the
+/// owner's active validator, whose beacon commitment and attestations it could otherwise forge.
+#[test]
+fn a_retired_siblings_consensus_key_acts_for_nobody() {
+    let mut t = Setup::default().start();
+    t.finish_epoch();
+    let epoch = t.st.params.epoch_of(t.height);
+    let o = owner(1);
+    let (active, retired) = (vaddr(1), vaddr(2));
+    // Owner 1 also owns validator 2, which has left the set.
+    let mut rec = t.st.validators[&retired].clone();
+    rec.owner = o.address();
+    rec.status = crate::chain::ValidatorStatus::Candidate;
+    t.st.validators.insert(retired.clone(), rec);
+    let set: Vec<String> = t.set(epoch).into_iter().filter(|v| *v != retired).collect();
+    t.st.active_sets.insert(epoch, set);
+    let key = |k: &Keys| key_id(&k.public_key());
+    let sibling = keys(vseed(2));
+    assert_eq!(validator_for_signer(&t.st, &o.address(), &key(&sibling), epoch), None, "not the owner's active validator");
+    assert_eq!(validator_for_signer(&t.st, &o.address(), &key(&keys(vseed(1))), epoch), Some(active.clone()));
+    assert_eq!(validator_for_signer(&t.st, &o.address(), &key(&o), epoch), Some(active.clone()), "the owner's own key still picks it");
+    // Through the state machine: admitted (it's still the owner's validator's key), refused.
+    let commit = t.tx_from(&sibling, &o.address(), Action::BeaconCommit { epoch: epoch + 2, commitment: "11".repeat(32) });
+    assert_eq!(t.apply(&commit).unwrap(), Outcome::Failed(format!("only validators active in epoch {epoch} commit to the beacon")));
+    assert!(t.st.beacon.rounds.get(&(epoch + 2)).is_none_or(|r| !r.contains_key(&active)));
+    let attest = t.tx_from(&sibling, &o.address(), Action::AttestClaim { claim_id: 0, ok: false, merge_sha: String::new(), note: String::new() });
+    assert_eq!(t.apply(&attest).unwrap(), Outcome::Failed("only active validators can attest claims".into()));
+    let revert = t.tx_from(&sibling, &o.address(), Action::AttestRevert { claim_id: 0, revert_sha: "ab".repeat(20) });
+    assert_eq!(t.apply(&revert).unwrap(), Outcome::Failed("only active validators attest reverts".into()));
+    // The active validator's own key commits for it.
+    let own = t.tx_from(&keys(vseed(1)), &o.address(), Action::BeaconCommit { epoch: epoch + 2, commitment: "22".repeat(32) });
+    assert_eq!(t.apply(&own).unwrap(), Outcome::Applied);
+    assert!(t.st.beacon.rounds[&(epoch + 2)].contains_key(&active));
+    t.block();
+}
+
 // ---------------------------------------------------------------------------- admin levers
 
 #[test]
