@@ -1789,6 +1789,8 @@ pub struct Chain {
     broken: Option<String>,
     /// Blocks `open` executed again because they were past the store's commit point.
     pub replayed: u64,
+    /// Writes `epochs.json` off the chain lock.
+    epochs_saver: EpochsSaver,
     /// Consensus-block bytes executed since the last certificate stored on disk
     /// ([`CERT_SPACING_BYTES`]; starts full, so the first certificate after a start is kept).
     cert_bytes: u64,
@@ -1802,6 +1804,89 @@ pub struct Chain {
     /// state it executed, or one that diverged).
     #[cfg(test)]
     pub wrong_exec_root: bool,
+}
+
+/// Epochs of validator-set history a node keeps and serves: the weak-subjectivity period (no
+/// joiner may start from an older root, `checkpoints::ws_period_blocks`) under the genesis
+/// parameters and the current ones, whichever is longer, plus a quarter for slow blocks and late
+/// joiners. Older changes and their proofs are dropped (F10).
+pub fn registry_keep_epochs(g: &Genesis, state: &State) -> u64 {
+    let eb = state.params.epoch_blocks.max(2);
+    let genesis = g.chain_params().map(|cp| crate::checkpoints::ws_period_blocks(&cp, eb)).unwrap_or(0);
+    let ws = crate::checkpoints::ws_period_blocks(&state.chain_params, eb).max(genesis).div_ceil(eb);
+    ws.saturating_add(ws / 4).saturating_add(2)
+}
+
+/// Writes `epochs.json` on its own thread, so a big registry never stalls the chain lock: the
+/// newest registry handed to it wins, every write is durable, and dropping it (with the chain)
+/// waits for the last one.
+struct EpochsSaver {
+    path: PathBuf,
+    /// The sequence number of the registry on disk; writes take it, so they never go backwards.
+    written: Arc<parking_lot::Mutex<u64>>,
+    next: std::sync::atomic::AtomicU64,
+    queue: Option<std::sync::mpsc::Sender<(u64, Arc<crate::epochs::EpochRegistry>)>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl EpochsSaver {
+    fn new(path: PathBuf) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<(u64, Arc<crate::epochs::EpochRegistry>)>();
+        let written: Arc<parking_lot::Mutex<u64>> = Default::default();
+        let (p, w) = (path.clone(), written.clone());
+        let thread = std::thread::Builder::new()
+            .name("epochs.json".into())
+            .spawn(move || {
+                while let Ok(mut latest) = rx.recv() {
+                    while let Ok(newer) = rx.try_recv() {
+                        latest = newer;
+                    }
+                    if let Err(e) = Self::write(&p, &w, latest.0, &latest.1) {
+                        tracing::warn!(error = %format!("{e:#}"), "couldn't save epochs.json");
+                    }
+                }
+            })
+            .ok();
+        Self { path, written, next: Default::default(), queue: Some(tx), thread }
+    }
+
+    fn write(path: &Path, written: &parking_lot::Mutex<u64>, seq: u64, e: &crate::epochs::EpochRegistry) -> Result<()> {
+        let bytes = serde_json::to_vec(e)?;
+        let mut w = written.lock();
+        if seq > *w {
+            store::write_durably(path, &bytes)?;
+            *w = seq;
+        }
+        Ok(())
+    }
+
+    fn seq(&self) -> u64 {
+        self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+    }
+
+    /// Queues a write (in this thread if the writer is gone).
+    fn save(&self, e: Arc<crate::epochs::EpochRegistry>) {
+        let seq = self.seq();
+        if let Some(Err(std::sync::mpsc::SendError((_, e)))) = self.queue.as_ref().map(|q| q.send((seq, e.clone()))) {
+            if let Err(err) = Self::write(&self.path, &self.written, seq, &e) {
+                tracing::warn!(error = %format!("{err:#}"), "couldn't save epochs.json");
+            }
+        }
+    }
+
+    /// Writes now (a newer queued write may follow, an older one never lands after it).
+    fn save_now(&self, e: &crate::epochs::EpochRegistry) -> Result<()> {
+        Self::write(&self.path, &self.written, self.seq(), e)
+    }
+}
+
+impl Drop for EpochsSaver {
+    fn drop(&mut self) {
+        drop(self.queue.take());
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 /// The block logs and the state database. One executor writes at a time; the consensus path
@@ -2207,7 +2292,11 @@ impl Chain {
         let genesis_root = genesis_state.root();
         let genesis_hash = hex::encode(crate::consensus::genesis_block(&genesis).digest_bytes());
         let store = Store::open(&home.join(store::DB_FILE))?;
-        let saved_epochs: Option<crate::epochs::EpochRegistry> = fs::read(home.join("epochs.json")).ok().and_then(|b| serde_json::from_slice(&b).ok());
+        let saved_epochs: Option<crate::epochs::EpochRegistry> = fs::read(home.join("epochs.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).map(|mut e: crate::epochs::EpochRegistry| {
+            // Proofs signed under an older handoff format no longer verify: signed again below.
+            e.upgrade_format();
+            e
+        });
         let ctx = OpenCtx { home, genesis: &genesis, genesis_hash: &genesis_hash, genesis_root: &genesis_root, base: base.as_ref(), saved_epochs: saved_epochs.as_ref(), blocks: &blocks };
         let start = match ctx.load(&store) {
             Ok(Some(s)) => s,
@@ -2228,6 +2317,7 @@ impl Chain {
         };
         let view = ReadView::new(state.clone(), height, last_hash.clone(), genesis_arc.clone(), genesis_hash.clone(), genesis_root.clone(), role, base.clone(), point.pruned_below, None, head.clone(), snap.clone(), disk.clone());
         let live = Arc::new(Live::new(view, epochs.clone(), disk.clone()));
+        let epochs_saver = EpochsSaver::new(home.join("epochs.json"));
         let mut chain = Chain {
             home: home.into(),
             genesis,
@@ -2263,6 +2353,7 @@ impl Chain {
             keep_blocks: None,
             broken: None,
             replayed: 0,
+            epochs_saver,
             cert_bytes: CERT_SPACING_BYTES,
             halt: Default::default(),
             #[cfg(test)]
@@ -2284,7 +2375,7 @@ impl Chain {
         let _ = crate::upgrade::after_block(&chain, chain.height);
         chain.set_finalized_tip(chain.height());
         chain.publish();
-        chain.live.publish_epochs(chain.epochs.clone());
+        chain.live.publish_epochs(Arc::new(chain.epochs.clone()));
         Ok(chain)
     }
 
@@ -2778,21 +2869,36 @@ impl Chain {
         let next = self.state.params.epoch_of(boundary) + 1;
         let keys: Vec<String> = self.state.active_set(next).map(|s| s.iter().map(|v| v.consensus_key.clone()).collect()).unwrap_or_default();
         let changed = self.epochs.record(next, keys);
+        // Only the window a joiner may start from is kept and served (F10).
+        self.epochs.rebase(next.saturating_sub(registry_keep_epochs(&self.genesis, &self.state)));
         self.save_epochs();
         changed
     }
 
-    /// Signs handoffs for set changes this validator presided over (also retroactively).
+    /// The sorted consensus keys this node's state holds for `epoch` (executed, or certified by
+    /// the snapshot it fast-synced from).
+    fn executed_set(&self, epoch: u64) -> Option<Vec<String>> {
+        let mut keys: Vec<String> = self.state.active_set(epoch)?.iter().map(|v| v.consensus_key.clone()).collect();
+        keys.sort();
+        Some(keys)
+    }
+
+    /// Signs handoffs for set changes this validator presided over (also retroactively), but only
+    /// those its own state shows on both sides: never one it learned from a peer (F08).
     pub fn sign_handoffs(&mut self) -> usize {
         let Some(seed) = self.keys.as_ref().map(|k| k.seed()) else { return 0 };
         let chain_id = self.genesis.chain_id.clone();
-        let n = self.epochs.sign_missing(&chain_id, seed).len();
+        let mut epochs = std::mem::take(&mut self.epochs);
+        let n = epochs.sign_missing(&chain_id, seed, |e| self.executed_set(e)).len();
+        self.epochs = epochs;
         if n > 0 {
             self.save_epochs();
         }
         n
     }
 
+    /// Merges a peer's handoff signatures (verifying each one we lack, under this lock: tests and
+    /// rebuilds; `node::exchange_epochs` verifies without it and calls [`Chain::add_handoffs`]).
     pub fn merge_epochs(&mut self, other: &crate::epochs::EpochRegistry) -> usize {
         let chain_id = self.genesis.chain_id.clone();
         let n = self.epochs.merge_sigs(&chain_id, other);
@@ -2802,17 +2908,30 @@ impl Chain {
         n
     }
 
-    /// Writes `epochs.json` durably (temp file, fsync, rename, fsync the directory) and publishes
-    /// the registry. A failure is logged: the registry is rebuilt from state on the next start.
-    fn save_epochs(&self) {
-        if let Err(e) = self.try_save_epochs() {
-            tracing::warn!(error = %format!("{e:#}"), "couldn't save epochs.json");
+    /// Adds handoff signatures verified elsewhere (`epochs::verify_candidates`).
+    pub fn add_handoffs(&mut self, verified: Vec<crate::epochs::Candidate>) -> usize {
+        let chain_id = self.genesis.chain_id.clone();
+        let n = self.epochs.add_verified(&chain_id, verified);
+        if n > 0 {
+            self.save_epochs();
         }
+        n
     }
 
+    /// Publishes the registry and writes `epochs.json` in the background (durably, newest wins). A
+    /// failed or lost write only means a restart rebuilds the sets from state and collects the
+    /// proofs again.
+    fn save_epochs(&self) {
+        let e = Arc::new(self.epochs.clone());
+        self.live.publish_epochs(e.clone());
+        self.epochs_saver.save(e);
+    }
+
+    /// [`Chain::save_epochs`], written before it returns.
     fn try_save_epochs(&self) -> Result<()> {
-        store::write_durably(&self.home.join("epochs.json"), &serde_json::to_vec(&self.epochs)?)?;
-        self.live.publish_epochs(self.epochs.clone());
+        let e = Arc::new(self.epochs.clone());
+        self.epochs_saver.save_now(&e)?;
+        self.live.publish_epochs(e);
         Ok(())
     }
 
@@ -2846,8 +2965,17 @@ impl Chain {
             bail!("fast sync needs an empty home");
         }
         let base_hash = hex::encode(v.blocks[0].parent_bytes());
+        // The verified history (from the trusted root through the certified epoch, nothing past
+        // it: F08) must agree with the sets the certified state holds.
+        let mut epochs = v.epochs.clone();
+        for (&e, addrs) in state.active_sets.range(epochs.base..=epochs.known_through) {
+            let mut keys: Vec<String> = addrs.iter().filter_map(|a| state.validators.get(a)).map(|r| r.consensus_key.clone()).collect();
+            keys.sort();
+            ensure!(epochs.set(e) == Some(&keys), "the snapshot's state holds another validator set for epoch {e} than its verified history");
+        }
+        epochs.upgrade_format();
         store::install_durably(packed, &self.home.join("base.state.zst"))?;
-        self.epochs = v.epochs.clone();
+        self.epochs = epochs;
         self.try_save_epochs()?;
         // The anchor's proof, for this node's own manifests (P-SYNC).
         crate::snapshot::save_anchor(&self.home, v.anchor.as_ref())?;
@@ -3290,9 +3418,13 @@ impl OpenCtx<'_> {
             tracing::info!(format = p.format, schema = p.schema, base = p.base, "the state database was written for another format, chain or base; rebuilding it");
             return Ok(None);
         }
+        let genesis_epochs = crate::epochs::EpochRegistry::genesis(self.genesis);
         let epochs = match self.saved_epochs {
+            // A genesis home only takes a history that starts at the genesis: one a fast sync
+            // saved before a crash kept it from switching homes is a peer's, not ours (F08).
+            Some(e) if p.height == 0 && self.base.is_none() && (e.base != 0 || e.sets.get(&0) != genesis_epochs.sets.get(&0)) => genesis_epochs,
             Some(e) => e.clone(),
-            None if p.height == 0 => crate::epochs::EpochRegistry::genesis(self.genesis),
+            None if p.height == 0 => genesis_epochs,
             None => bail!("epochs.json is missing"),
         };
         let snap = Arc::new(store.snapshot()?);

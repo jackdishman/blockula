@@ -139,6 +139,8 @@ pub fn genesis_checkpoint(g: &Genesis) -> Checkpoint {
 #[derive(Clone, Debug)]
 pub struct Trust {
     pub genesis_hash: String,
+    /// The genesis validator set, the root when no checkpoint pins a newer one.
+    genesis_root: epochs::Root,
     checkpoints: BTreeMap<u64, Checkpoint>,
     params: Params,
     ws_blocks: u64,
@@ -178,7 +180,7 @@ impl Trust {
         }
         let params = g.params();
         let cp = g.chain_params().unwrap_or_else(|_| ChainParams::defaults(&params));
-        let mut trust = Trust { genesis_hash: hash, checkpoints: BTreeMap::new(), ws_blocks: ws_period_blocks(&cp, params.epoch_blocks), params, expected_from: (g.created_at_ms, g.block_time_ms), allow_stale: pins.allow_stale_checkpoint };
+        let mut trust = Trust { genesis_hash: hash, genesis_root: epochs::Root::genesis(g), checkpoints: BTreeMap::new(), ws_blocks: ws_period_blocks(&cp, params.epoch_blocks), params, expected_from: (g.created_at_ms, g.block_time_ms), allow_stale: pins.allow_stale_checkpoint };
         let genesis = genesis_checkpoint(g);
         for c in known.map(|k| k.checkpoints.as_slice()).unwrap_or_default().iter().chain(&pins.checkpoints) {
             c.check()?;
@@ -235,6 +237,20 @@ impl Trust {
         self.params.epoch_of(c.height.saturating_add(1))
     }
 
+    /// The newest validator set trusted at or before `epoch`: the newest checkpoint pinning one,
+    /// or the genesis set. Histories are verified from it; nothing a set before it signed matters.
+    pub fn root(&self, epoch: u64) -> epochs::Root {
+        self.checkpoints
+            .values()
+            .rev()
+            .filter(|c| self.pinned_epoch(c) <= epoch)
+            .find_map(|c| {
+                let hash: [u8; 32] = hex::decode(c.set_hash.as_deref()?).ok()?.try_into().ok()?;
+                Some(epochs::Root { epoch: self.pinned_epoch(c), set_hash: hash })
+            })
+            .unwrap_or_else(|| self.genesis_root.clone())
+    }
+
     /// Block `height` must have `hash` if a checkpoint names that height.
     pub fn check_block(&self, height: u64, hash: &str) -> Result<()> {
         match self.checkpoints.get(&height) {
@@ -287,8 +303,10 @@ impl Trust {
 
 /// `blockula checkpoint`: the checkpoint at `height` (default: the newest epoch boundary every
 /// peer has finalized) that all `peers` agree on. Each peer's genesis must match the others' and
-/// its validator-set history must verify from that genesis (`epochs::verify_chain`). Ask nodes run
-/// by independent operators: agreement among them is what a checkpoint attests.
+/// its validator-set history must verify (`epochs::verify_from`) from the newest root this binary
+/// trusts (an embedded checkpoint, or the genesis), or, when the peer no longer keeps history
+/// that old (nodes keep about the weak-subjectivity period), from the oldest set it keeps. Ask
+/// nodes run by independent operators: agreement among them is what a checkpoint attests.
 pub async fn fetch(peers: &[String], height: Option<u64>) -> Result<(Genesis, Checkpoint)> {
     ensure!(!peers.is_empty(), "name at least one --peer (several independent ones)");
     let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build()?;
@@ -328,12 +346,20 @@ pub async fn fetch(peers: &[String], height: Option<u64>) -> Result<(Genesis, Ch
         return Ok((g.clone(), genesis_checkpoint(&g)));
     }
     let epoch = params.epoch_of(height.saturating_add(1));
+    let trusted = Trust::new(&g, &Pins::default(), false).map(|t| t.root(epoch)).unwrap_or_else(|_| epochs::Root::genesis(&g));
     let mut agreed: Option<(String, Checkpoint)> = None;
     for u in &urls {
         let block = get(format!("{u}/api/block/{height}")).await?;
         let hash = block["hash"].as_str().ok_or_else(|| anyhow!("{u}/api/block/{height} has no hash"))?.to_string();
-        let reg: EpochRegistry = serde_json::from_value(get(format!("{u}/api/epochs")).await?).with_context(|| format!("{u}/api/epochs"))?;
-        let set = epochs::verify_chain(&g, &reg, epoch).with_context(|| format!("{u}: validator-set history through epoch {epoch} (just after a boundary, its handoff signatures may still be arriving; retry, or pass an older --height)"))?;
+        let reg = crate::snapshot::fetch_history(&client, u, trusted.epoch, epoch).await?;
+        let root = match reg.sets.get(&reg.base) {
+            Some(set) if reg.base > trusted.epoch => {
+                eprintln!("⚠️  {u} keeps validator-set history from epoch {} on, after this release's newest trusted set (epoch {}): checking it from there; only the peers' agreement vouches for that set", reg.base, trusted.epoch);
+                epochs::Root { epoch: reg.base, set_hash: epochs::set_hash(set) }
+            }
+            _ => trusted.clone(),
+        };
+        let set = epochs::verify_from(&g, &reg, &root, epoch).with_context(|| format!("{u}: validator-set history through epoch {epoch} (just after a boundary, its handoff signatures may still be arriving; retry, or pass an older --height)"))?;
         let cp = Checkpoint { height, hash, set_hash: Some(hex::encode(epochs::set_hash(&set))) };
         match &agreed {
             Some((first, c)) if *c != cp => bail!("peers disagree at #{height}: {first} says {}, {u} says {}", c.to_flag(), cp.to_flag()),

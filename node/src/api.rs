@@ -957,6 +957,9 @@ async fn metrics(State(n): State<Node>) -> Response {
             ("blockula_active_validators", "Validators in the active set", active as f64),
             ("blockula_validators_online", "Signers on the latest finalization certificate", online.map(|o| o as f64).unwrap_or(f64::NAN)),
             ("blockula_history_from", "First height whose block this node holds", v.history_from() as f64),
+            ("blockula_epochs_known_through", "Newest epoch whose validator set this node's history holds", n.live.epochs().known_through as f64),
+            ("blockula_epochs_proven_through", "Newest epoch through which every set change has a quorum of handoff proofs here (it should follow known_through)", n.live.epochs().proven_through() as f64),
+            ("blockula_epochs_from", "Oldest epoch of the validator-set history this node keeps and serves", n.live.epochs().base as f64),
             ("blockula_faucet_drips_total", "Faucet drips served", n.stats.faucet_drips.load(Relaxed) as f64),
             ("blockula_tx_submitted_total", "Transactions accepted over HTTP", n.stats.tx_submitted.load(Relaxed) as f64),
             ("blockula_tx_rejected_total", "Transactions rejected over HTTP", n.stats.tx_rejected.load(Relaxed) as f64),
@@ -1291,12 +1294,19 @@ async fn snapshot_chunk(State(n): State<Node>, Path((height, i)): Path<(u64, usi
     }
 }
 
-/// Validator-set history with handoff proofs.
-async fn epochs(State(n): State<Node>) -> ApiResult {
-    let e = n.live.epochs();
-    let mut v = serde_json::to_value(&*e).unwrap();
-    v["proven_through"] = json!(e.proven_through());
-    Ok(Json(v))
+#[derive(Deserialize)]
+struct EpochsQuery {
+    from: Option<u64>,
+}
+
+/// Validator-set history with handoff proofs, a page at a time: the set in effect at `from`
+/// (default: the oldest epoch this node keeps, `base`) and the set changes after it, each with a
+/// quorum of its proofs, up to about `epochs::PAGE_BYTES`. `next` is the `from` of the next page
+/// (`null` at the end); `proven_through` covers this page. Pages are cached per registry.
+async fn epochs(State(n): State<Node>, Query(q): Query<EpochsQuery>) -> Response {
+    let from = q.from.unwrap_or_else(|| n.live.epochs().base);
+    let page = n.live.epoch_page(from);
+    ([(axum::http::header::CONTENT_TYPE, "application/json")], page.as_ref().clone()).into_response()
 }
 
 /// A record and its Merkle proof against the state root of the latest executed block:

@@ -486,6 +486,8 @@ pub struct Live {
     view: ArcSwap<ReadView>,
     mempool: ArcSwap<MempoolView>,
     epochs: ArcSwap<EpochRegistry>,
+    /// `/api/epochs` pages as served (JSON), by `from`, for the registry published now.
+    epoch_pages: Mutex<HashMap<u64, Arc<Vec<u8>>>>,
     /// Highest finalized height proven by a certificate (consensus updates it between blocks).
     pub finalized_tip: AtomicU64,
     /// Median of the tips HTTP peers claim (display only).
@@ -495,7 +497,7 @@ pub struct Live {
 
 impl Live {
     pub fn new(view: ReadView, epochs: EpochRegistry, disk: Arc<Disk>) -> Self {
-        Self { view: ArcSwap::from_pointee(view), mempool: ArcSwap::from_pointee(MempoolView::default()), epochs: ArcSwap::from_pointee(epochs), finalized_tip: AtomicU64::new(0), claimed: AtomicU64::new(0), disk }
+        Self { view: ArcSwap::from_pointee(view), mempool: ArcSwap::from_pointee(MempoolView::default()), epochs: ArcSwap::from_pointee(epochs), epoch_pages: Default::default(), finalized_tip: AtomicU64::new(0), claimed: AtomicU64::new(0), disk }
     }
 
     pub fn view(&self) -> Arc<ReadView> {
@@ -518,8 +520,30 @@ impl Live {
         self.mempool.store(Arc::new(m));
     }
 
-    pub fn publish_epochs(&self, e: EpochRegistry) {
-        self.epochs.store(Arc::new(e));
+    pub fn publish_epochs(&self, e: Arc<EpochRegistry>) {
+        let mut pages = self.epoch_pages.lock();
+        self.epochs.store(e);
+        pages.clear();
+    }
+
+    /// The `/api/epochs` page from `from` (JSON: the registry's `slice` plus `proven_through` and
+    /// `next`), serialized once per published registry (a few pages are cached).
+    pub fn epoch_page(&self, from: u64) -> Arc<Vec<u8>> {
+        let mut pages = self.epoch_pages.lock();
+        if let Some(p) = pages.get(&from) {
+            return p.clone();
+        }
+        let e = self.epochs();
+        let (page, next) = e.slice(from, crate::epochs::PAGE_BYTES);
+        let mut v = serde_json::to_value(&page).unwrap_or_default();
+        v["proven_through"] = serde_json::json!(page.proven_through());
+        v["next"] = serde_json::json!(next);
+        let bytes = Arc::new(serde_json::to_vec(&v).unwrap_or_default());
+        if pages.len() >= 16 {
+            pages.clear();
+        }
+        pages.insert(from, bytes.clone());
+        bytes
     }
 
     /// Highest height known final: certified, or executed here.

@@ -162,17 +162,47 @@ pub fn prune_epoch_journals(dir: &Path, prefix: &str, epoch: u64) -> Result<usiz
     Ok(deleted)
 }
 
+/// Handoff signatures checked per peer per round, at most (a peer can only offer ones we lack, for
+/// changes still short of a quorum; this bounds what a lying one costs us each round).
+const HANDOFF_VERIFIES_PER_ROUND: usize = 512;
+
 /// Pulls peers' validator-set handoff signatures every 30s (and signs our own, if we're a
-/// validator), so this node can serve complete proofs to fast-syncing joiners.
+/// validator), so this node can serve complete proofs to fast-syncing joiners. Incremental
+/// (F19, F26): it asks only while some set change lacks a quorum here, only for the page from the
+/// first such change, and verifies only signatures it lacks, without the chain lock.
 async fn exchange_epochs(chain: Shared, peers: Vec<String>) {
     let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
-    chain.lock().sign_handoffs();
+    let (live, chain_id) = {
+        let mut c = chain.lock();
+        c.sign_handoffs();
+        (c.live.clone(), c.genesis.chain_id.clone())
+    };
     loop {
         for peer in &peers {
-            if let Ok(body) = get_capped(&client, &format!("{peer}/api/epochs"), 16 << 20).await {
-                if let Ok(reg) = serde_json::from_slice::<crate::epochs::EpochRegistry>(&body) {
-                    chain.lock().merge_epochs(&reg);
+            let ours = live.epochs();
+            let from = ours.proven_through();
+            if from >= ours.known_through {
+                break; // every change has its quorum: nothing to ask anyone for
+            }
+            let url = format!("{peer}/api/epochs?from={from}");
+            let page = match get_capped(&client, &url, crate::epochs::MAX_PAGE_BYTES).await.and_then(|b| Ok(serde_json::from_slice::<crate::epochs::EpochRegistry>(&b)?)) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::debug!(peer = %peer, error = %format!("{e:#}"), "couldn't fetch handoff proofs");
+                    continue;
                 }
+            };
+            let wanted = ours.candidates(&chain_id, &page, HANDOFF_VERIFIES_PER_ROUND);
+            if wanted.is_empty() {
+                continue;
+            }
+            let offered = wanted.len();
+            let verified = tokio::task::spawn_blocking(move || crate::epochs::verify_candidates(wanted)).await.unwrap_or_default();
+            if verified.len() < offered {
+                tracing::warn!(peer = %peer, offered, valid = verified.len(), "a peer served handoff signatures that don't verify");
+            }
+            if !verified.is_empty() {
+                chain.lock().add_handoffs(verified);
             }
         }
         tokio::time::sleep(Duration::from_secs(30)).await;

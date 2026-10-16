@@ -7,10 +7,12 @@
 //!
 //! Each node writes the state at its latest checkpoints (canonical records → zstd → 1 MiB
 //! chunks, each BLAKE3-hashed) and serves a manifest: chunk hashes, the blocks C+1..=F, F's
-//! finalization certificate, the validator-set history (handoff proofs) needed to check that
-//! certificate, and the epoch anchor (below). A joining node verifies everything, checks it
-//! against the checkpoints it trusts (`checkpoints.rs`), rebuilds the state and its tree from the
-//! records, checks the root against the certified one, executes C+1..=F and carries on syncing.
+//! finalization certificate and the epoch anchor (below). The validator-set history (handoff
+//! proofs) needed to check that certificate comes separately, in pages of `/api/epochs` from the
+//! joiner's newest trusted root (`fetch_history`), so neither grows with the chain. A joining node
+//! verifies everything, checks it against the checkpoints it trusts (`checkpoints.rs`), rebuilds
+//! the state and its tree from the records, checks the root against the certified one, executes
+//! C+1..=F and carries on syncing.
 //!
 //! **Epoch anchor.** Consensus starts each epoch's engine from the hash of the previous epoch's
 //! last block. When that block is before C, the manifest carries it with its finalization
@@ -29,7 +31,7 @@ use crate::chain::{Genesis, State};
 use crate::consensus::{self, CBlock};
 use crate::epochs::{self, EpochRegistry};
 use crate::pq::MlDsaScheme;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use commonware_codec::{Decode, DecodeExt};
 use commonware_consensus::simplex::types::Finalization;
 use commonware_cryptography::{Digestible, blake3::Digest, certificate::Verifier as _};
@@ -244,8 +246,6 @@ pub struct Manifest {
     pub blocks: Vec<String>,
     /// Finalization certificate (hex) of the last block.
     pub finalization: String,
-    /// Validator-set history with handoff proofs.
-    pub epochs: EpochRegistry,
     /// The epoch anchor, when it's before `height` (and only then).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<Anchor>,
@@ -298,7 +298,7 @@ fn anchor_proof(home: &Path, a: u64, cblock: impl Fn(u64) -> Option<Vec<u8>>, ce
 }
 
 /// Builds the manifest for the newest snapshot this node can prove, from what it has published
-/// (no consensus lock).
+/// (no consensus lock). The validator-set history isn't in it: `/api/epochs` pages serve that.
 pub fn build_manifest(live: &crate::view::Live) -> Result<Manifest> {
     let v = live.view();
     let home = &v.disk.home;
@@ -327,7 +327,7 @@ pub fn build_manifest(live: &crate::view::Live) -> Result<Manifest> {
                 None => continue,
             },
         };
-        return Ok(Manifest { chain_id: v.genesis.chain_id.clone(), height, state_root: meta.state_root, chunks: meta.chunks, blocks, finalization, epochs: (*live.epochs()).clone(), anchor });
+        return Ok(Manifest { chain_id: v.genesis.chain_id.clone(), height, state_root: meta.state_root, chunks: meta.chunks, blocks, finalization, anchor });
     }
     bail!("no certified snapshot yet (one is taken every {CHECKPOINT_INTERVAL} blocks and certified {CHECKPOINT_DELAY} blocks later, and the epoch anchor before it must be certified too)")
 }
@@ -339,6 +339,8 @@ pub struct Verified {
     pub chunks: Vec<ChunkInfo>,
     pub blocks: Vec<CBlock>,
     pub finalization: Vec<u8>,
+    /// The validator-set history verified for it: from the trusted root it was checked from
+    /// through the last block's epoch, and nothing after (F08).
     pub epochs: EpochRegistry,
     /// The epoch anchor's height and hash, when it's before the snapshot (certified) ...
     pub epoch_start: Option<(u64, String)>,
@@ -381,10 +383,16 @@ impl Verified {
             }
             let pinned = trust.pinned_epoch(cp);
             if cp.set_hash.is_some() && pinned <= last_epoch {
-                // `verify_manifest` verified every set change through `last_epoch`.
-                let set = self.epochs.set(pinned).ok_or_else(|| anyhow!("the manifest's history doesn't reach epoch {pinned}"))?;
-                trust.check_set(pinned, set)?;
-                (checked, newest_pin) = (true, Some(cp.height));
+                if pinned < self.epochs.base {
+                    // Before the root the history was verified from: a newer pinned set (that
+                    // root) supersedes it.
+                    checked = true;
+                } else {
+                    // `verify_manifest` verified every set change from its root through `last_epoch`.
+                    let set = self.epochs.set(pinned).ok_or_else(|| anyhow!("the manifest's history doesn't reach epoch {pinned}"))?;
+                    trust.check_set(pinned, set)?;
+                    (checked, newest_pin) = (true, Some(cp.height));
+                }
             }
             if !checked {
                 unchecked.push(cp.height);
@@ -444,7 +452,29 @@ fn verify_anchor(g: &Genesis, set: &[String], a: u64, p: &Anchor) -> Result<Stri
     Ok(hex::encode(block.digest_bytes()))
 }
 
-pub fn verify_manifest(g: &Genesis, m: &Manifest) -> Result<Verified> {
+/// The epoch of a manifest's last block (what its certificate and history must reach), without
+/// decoding it: the blocks run from `height + 1`.
+pub fn last_epoch(g: &Genesis, m: &Manifest) -> u64 {
+    g.params().epoch_of(m.height.saturating_add(m.blocks.len() as u64))
+}
+
+/// The root a joiner verifies a manifest's history from: its newest trusted one for the epoch of
+/// the manifest's epoch anchor (whose set certifies it), or of its last block when it needs none.
+pub fn trusted_root(g: &Genesis, m: &Manifest, trust: &crate::checkpoints::Trust) -> epochs::Root {
+    let params = g.params();
+    let last = m.height.saturating_add(m.blocks.len() as u64);
+    trust.root(anchor_height(&params, m.height, last).map_or(params.epoch_of(last), |a| params.epoch_of(a)))
+}
+
+/// [`verify_manifest_from`] with the history verified from the genesis set.
+pub fn verify_manifest(g: &Genesis, m: &Manifest, history: &EpochRegistry) -> Result<Verified> {
+    verify_manifest_from(g, m, history, &epochs::Root::genesis(g))
+}
+
+/// Verifies a manifest and the validator-set history it's checked against (`history`, from the
+/// peer's `/api/epochs`), the history from `root`. What's verified of the history (`root`
+/// through the last block's epoch) is all [`Verified`] keeps.
+pub fn verify_manifest_from(g: &Genesis, m: &Manifest, history: &EpochRegistry, root: &epochs::Root) -> Result<Verified> {
     if m.chain_id != g.chain_id {
         bail!("manifest is for chain {}", m.chain_id);
     }
@@ -480,8 +510,12 @@ pub fn verify_manifest(g: &Genesis, m: &Manifest) -> Result<Verified> {
     let last = blocks.last().unwrap();
     let params = g.params();
     let epoch = params.epoch_of(last.height);
-    // Verifies every set change through `epoch`, so `m.epochs.set(e)` is trusted for e ≤ epoch.
-    let set = epochs::verify_chain(g, &m.epochs, epoch).context("validator set history")?;
+    // Verifies every set change from the root through `epoch`; only that part is kept, so
+    // `epochs.set(e)` is trusted for root ≤ e ≤ epoch, and nothing past `epoch` is adopted.
+    let set = epochs::verify_from(g, history, root, epoch).context("validator set history")?;
+    let mut verified = history.clone();
+    verified.rebase(root.epoch);
+    verified.truncate(epoch);
     let verifier = verifier_for(g, &set)?;
     let fin_bytes = hex::decode(&m.finalization)?;
     let fin = Finalization::<MlDsaScheme, Digest>::decode_cfg(fin_bytes.as_slice(), &verifier.certificate_codec_config())?;
@@ -499,19 +533,50 @@ pub fn verify_manifest(g: &Genesis, m: &Manifest) -> Result<Verified> {
         None => None,
         Some(a) => {
             let p = m.anchor.as_ref().ok_or_else(|| anyhow!("manifest doesn't certify the epoch anchor #{a}"))?;
-            // a < m.height < last, so its epoch's set was verified above.
-            let set = m.epochs.set(params.epoch_of(a)).ok_or_else(|| anyhow!("no validator set for the anchor's epoch"))?;
+            // a < m.height < last, so its epoch's set was verified above (when it's at or after
+            // the root; before it, the root's pin is what's trusted).
+            let set = verified.set(params.epoch_of(a)).ok_or_else(|| anyhow!("no verified validator set for the anchor's epoch {} (the trusted root is at epoch {})", params.epoch_of(a), root.epoch))?;
             Some((a, verify_anchor(g, set, a, p).context("epoch anchor")?))
         }
     };
-    Ok(Verified { height: m.height, state_root: m.state_root.clone(), chunks: m.chunks.clone(), blocks, finalization: fin_bytes, epochs: m.epochs.clone(), anchor: m.anchor.clone().filter(|_| epoch_start.is_some()), epoch_start })
+    Ok(Verified { height: m.height, state_root: m.state_root.clone(), chunks: m.chunks.clone(), blocks, finalization: fin_bytes, epochs: verified, anchor: m.anchor.clone().filter(|_| epoch_start.is_some()), epoch_start })
 }
 
-/// [`verify_manifest`], then [`Verified::check_trust`]: what a joiner runs on a peer's manifest.
-pub fn verify_manifest_trusted(g: &Genesis, m: &Manifest, trust: &crate::checkpoints::Trust) -> Result<Verified> {
-    let v = verify_manifest(g, m)?;
+/// [`verify_manifest_from`] the newest root `trust` has for the manifest's epoch, then
+/// [`Verified::check_trust`]: what a joiner runs on a peer's manifest.
+pub fn verify_manifest_trusted(g: &Genesis, m: &Manifest, history: &EpochRegistry, trust: &crate::checkpoints::Trust) -> Result<Verified> {
+    let v = verify_manifest_from(g, m, history, &trusted_root(g, m, trust))?;
     v.check_trust(trust)?;
     Ok(v)
+}
+
+/// A peer's validator-set history from `from` through at least `through`, assembled from its
+/// `/api/epochs` pages (each capped, and the whole at `epochs::MAX_HISTORY_BYTES`).
+pub async fn fetch_history(client: &reqwest::Client, peer: &str, from: u64, through: u64) -> Result<EpochRegistry> {
+    #[derive(Deserialize)]
+    struct Next {
+        #[serde(default)]
+        next: Option<u64>,
+    }
+    let mut total = 0usize;
+    let mut out: Option<EpochRegistry> = None;
+    let mut at = from;
+    loop {
+        let body = crate::node::get_capped(client, &format!("{peer}/api/epochs?from={at}"), epochs::MAX_PAGE_BYTES).await.with_context(|| format!("{peer}/api/epochs?from={at}"))?;
+        total += body.len();
+        ensure!(total <= epochs::MAX_HISTORY_BYTES, "{peer}'s validator-set history from epoch {from} passes {} MiB", epochs::MAX_HISTORY_BYTES >> 20);
+        let page: EpochRegistry = serde_json::from_slice(&body).with_context(|| format!("{peer}/api/epochs?from={at}"))?;
+        let next = serde_json::from_slice::<Next>(&body).map(|n| n.next).unwrap_or_default();
+        match &mut out {
+            None => out = Some(page),
+            Some(o) => o.append_page(&page)?,
+        }
+        let o = out.as_ref().expect("set above");
+        match next {
+            Some(n) if o.known_through < through && n > at => at = n,
+            _ => return Ok(out.expect("set above")),
+        }
+    }
 }
 
 /// Checks one downloaded chunk against the manifest.
@@ -663,7 +728,10 @@ pub async fn fast_sync(chain: &crate::consensus::Shared, peers: &[String], trust
 async fn fast_sync_from(client: &reqwest::Client, g: &Genesis, chain: &crate::consensus::Shared, peer: &str, trust: &crate::checkpoints::Trust) -> Result<u64> {
     let body = crate::node::get_capped(client, &format!("{peer}/api/snapshot/latest"), 64 << 20).await?;
     let m: Manifest = serde_json::from_slice(&body)?;
-    let v = verify_manifest_trusted(g, &m, trust)?;
+    ensure!(m.blocks.len() as u64 <= 4 * CHECKPOINT_INTERVAL, "the manifest lists {} blocks", m.blocks.len());
+    // The history from our newest trusted root through the manifest's epoch, nothing more.
+    let history = fetch_history(client, peer, trusted_root(g, &m, trust).epoch, last_epoch(g, &m)).await?;
+    let v = verify_manifest_trusted(g, &m, &history, trust)?;
     println!("📦 snapshot #{} ({} chunks) certified by validators; downloading…", v.height, v.chunks.len());
     // Each chunk is checked as it arrives and appended to a file: memory holds a few chunks at
     // most, never the whole snapshot.
