@@ -187,6 +187,18 @@ chain_params! { |day, epoch|
 /// their floors.
 pub const GOVERNANCE_KEYS: &[&str] = &["voting_blocks", "timelock_blocks", "lock_period_blocks", "quorum_bps", "quorum_floor", "supermajority_bps", "treasury_large_bps", "governance_spend_height", "bootstrap_end_height"];
 
+/// Parameters whose raise pays the block proposers, who sit on the bootstrap council: the tip cap
+/// (audit F01; a higher `tip_cap_multiple` lets one signature hand its block's proposer more).
+/// Like [`GOVERNANCE_KEYS`], a change needs the token supermajority and can't pass by the
+/// council; its code bounds still apply.
+pub const PROPOSER_PAY_KEYS: &[&str] = &["tip_cap_multiple"];
+
+/// Whether a `ParamChange` of `key` is the token holders' alone: it needs the supermajority and
+/// the bootstrap council can't pass it ([`GOVERNANCE_KEYS`], [`PROPOSER_PAY_KEYS`]).
+pub fn tokens_only(key: &str) -> bool {
+    GOVERNANCE_KEYS.contains(&key) || PROPOSER_PAY_KEYS.contains(&key)
+}
+
 /// Highest `Vote::conviction`.
 pub const MAX_CONVICTION: u8 = 6;
 /// Lock periods (`lock_period_blocks`) a vote at each conviction locks its amount for: none at 0,

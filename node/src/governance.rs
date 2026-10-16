@@ -671,12 +671,12 @@ pub fn unlocked_supply_by_walk(state: &State, height: u64) -> u128 {
 /// Whether a kind needs `supermajority_bps` of the weight: upgrades and their cancellations (a
 /// simple majority can't undo what a supermajority scheduled), feature activations
 /// (security-critical switches such as Ghost Mode), issuance parameters, governance's own safety
-/// parameters (`params::GOVERNANCE_KEYS`), and treasury spends above `treasury_large_bps` of the
-/// treasury's balance. Turning a feature off takes a simple majority.
+/// parameters and the tip cap (`params::tokens_only`), and treasury spends above
+/// `treasury_large_bps` of the treasury's balance. Turning a feature off takes a simple majority.
 pub fn needs_supermajority(state: &State, kind: &ProposalKind) -> bool {
     match kind {
         ProposalKind::ScheduleUpgrade { .. } | ProposalKind::CancelUpgrade { .. } | ProposalKind::ActivateFeature { .. } => true,
-        ProposalKind::ParamChange { key, .. } => key.starts_with("issuance_") || crate::params::GOVERNANCE_KEYS.contains(&key.as_str()),
+        ProposalKind::ParamChange { key, .. } => key.starts_with("issuance_") || crate::params::tokens_only(key),
         ProposalKind::TreasurySpend { amount, .. } => {
             let treasury = state.account(&state.treasury()).balance as u128;
             (*amount as u128 + recent_spends(state, state.econ.height)) * 10_000 > state.chain_params.treasury_large_bps as u128 * treasury
@@ -702,9 +702,10 @@ pub fn recent_spends(state: &State, height: u64) -> u128 {
 /// Whether the bootstrap council may pass a kind on its own: anything but a change to
 /// governance's own safety parameters (`params::GOVERNANCE_KEYS`), which only token holders
 /// decide, so the council can't extend itself, open spending early or weaken the vote that
-/// checks it (audit F15, F16).
+/// checks it (audit F15, F16), or to the tip cap (`params::PROPOSER_PAY_KEYS`), so the validators
+/// can't raise what a signature may pay them (audit F01).
 pub fn council_may_pass(kind: &ProposalKind) -> bool {
-    !matches!(kind, ProposalKind::ParamChange { key, .. } if crate::params::GOVERNANCE_KEYS.contains(&key.as_str()))
+    !matches!(kind, ProposalKind::ParamChange { key, .. } if crate::params::tokens_only(key))
 }
 
 /// Closes voting on proposal `id` at `height`: tally, settle the deposit, queue or reject.

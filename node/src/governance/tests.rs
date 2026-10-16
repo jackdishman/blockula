@@ -570,10 +570,13 @@ fn governance_safety_parameters_need_tokens_and_keep_their_floors() {
         t.vote(v2, id, true, 1, 0).unwrap();
         id
     };
-    let ids = [council(&mut t, text()), council(&mut t, param("bootstrap_end_height", 500)), council(&mut t, param("timelock_blocks", 2 * day)), council(&mut t, param("governance_spend_height", 6_000))];
-    t.finish(ids[3]);
+    // Nor the tip cap, whose raise pays the validators (audit F01).
+    let ids = [council(&mut t, text()), council(&mut t, param("bootstrap_end_height", 500)), council(&mut t, param("timelock_blocks", 2 * day)), council(&mut t, param("governance_spend_height", 6_000)), council(&mut t, param("tip_cap_multiple", 1_000))];
+    t.finish(ids[4]);
     let status: Vec<ProposalStatus> = ids.iter().map(|id| t.p(*id).status).collect();
-    assert_eq!(status, [ProposalStatus::Executed, ProposalStatus::Rejected, ProposalStatus::Rejected, ProposalStatus::Rejected]);
+    assert_eq!(status, [ProposalStatus::Executed, ProposalStatus::Rejected, ProposalStatus::Rejected, ProposalStatus::Rejected, ProposalStatus::Rejected]);
+    assert!(t.p(ids[4]).tally.as_ref().unwrap().supermajority);
+    assert_eq!(t.st.chain_params.tip_cap_multiple, 20);
     assert_eq!(t.p(ids[1]).tally.as_ref().unwrap().council_ayes, 2, "⅔ of the council said aye, and it wasn't enough");
     assert!(t.p(ids[1]).tally.as_ref().unwrap().supermajority);
     assert_eq!((t.st.chain_params.bootstrap_end_height, t.st.chain_params.governance_spend_height), (1_000, 5_000));
