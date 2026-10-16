@@ -5,8 +5,14 @@
 //   2. SLSA build provenance with a logged-in GitHub CLI (`gh attestation verify`): the archive was
 //      built by this repo's release workflow. A failed check is fatal; no gh skips it.
 //   3. The offline ML-DSA-65 signature on checksums.txt (checksums.txt.sig), verified with the
-//      SDK against the pinned release key id. A failed check is fatal; no key id or no .sig skips it.
-// If neither 2 nor 3 ran, the result says so loudly, and BLOCKULA_REQUIRE_VERIFY=1 refuses.
+//      SDK against the pinned release key id. Once a key id is known (built in, or
+//      BLOCKULA_RELEASE_KEY_ID), every release must carry a valid signature: a missing or invalid
+//      .sig is fatal. Leaving the .sig out is exactly what a compromised GitHub account or release
+//      workflow would do, and it can't forge the offline signature (audit F69). With no key id
+//      (before the key ceremony) there's nothing to check it against, so it's skipped.
+// The checks add up (AND): provenance and the signature each refuse a release they fail. If
+// neither ran, the result says so loudly. BLOCKULA_REQUIRE_VERIFY=1 refuses a release it can only
+// checksum, and once a key id is known it requires provenance too (both checks).
 import { createHash } from "node:crypto";
 import { verifyReleaseSignature, type ReleaseSignature } from "@blockula/sdk";
 
@@ -49,22 +55,27 @@ export async function fetchVerifiedRelease(base: string, asset: string, opts: { 
   const att = await deps.attest(archive, asset);
   if (att.result === "failed") throw new Error(`build provenance check FAILED for ${asset}; not installing${att.detail ? ` (${att.detail.trim().split("\n")[0]})` : ""}. Releases up to v0.4.x predate provenance and have no attestation.`);
   if (att.result === "ok") verified.push(`build provenance (GitHub attestation, ${REPO} release workflow)`);
-  // 3. Release signature, against the pinned key id (never one taken from the download).
+  // 3. Release signature, against the pinned key id (never one taken from the download). Required
+  // once a key id is known.
   if (opts.releaseKeyId) {
     const sigFile = await deps.download(`${base}/checksums.txt.sig`);
-    if (sigFile) {
-      let sig: ReleaseSignature;
-      try {
-        sig = JSON.parse(sigFile.toString("utf8"));
-      } catch {
-        throw new Error("checksums.txt.sig isn't valid JSON; not installing");
-      }
-      try {
-        verifyReleaseSignature(sig, new Uint8Array(sums), opts.releaseKeyId);
-      } catch (e) {
-        throw new Error(`checksums.txt signature check FAILED: ${(e as Error).message}; not installing`);
-      }
-      verified.push(`release signature (ML-DSA-65 key ${opts.releaseKeyId.slice(0, 16)}…)`);
+    if (!sigFile) {
+      throw new Error(`this release has no checksums.txt.sig, but releases are signed offline with the release key ${opts.releaseKeyId.slice(0, 16)}…; not installing. An unsigned release is what a compromised GitHub account or release workflow would publish.`);
+    }
+    let sig: ReleaseSignature;
+    try {
+      sig = JSON.parse(sigFile.toString("utf8"));
+    } catch {
+      throw new Error("checksums.txt.sig isn't valid JSON; not installing");
+    }
+    try {
+      verifyReleaseSignature(sig, new Uint8Array(sums), opts.releaseKeyId);
+    } catch (e) {
+      throw new Error(`checksums.txt signature check FAILED: ${(e as Error).message}; not installing`);
+    }
+    verified.push(`release signature (ML-DSA-65 key ${opts.releaseKeyId.slice(0, 16)}…)`);
+    if (opts.requireVerify && att.result !== "ok") {
+      throw new Error("BLOCKULA_REQUIRE_VERIFY=1 requires build provenance as well as the release signature, and provenance couldn't be checked (log in to the GitHub CLI with `gh auth login`); not installing");
     }
   }
   if (verified.length) return { archive, sha256: actual, verified };

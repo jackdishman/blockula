@@ -14,7 +14,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "test": "tsc && tsx test/network.ts"
+    "test": "tsc && tsx test/network.ts && tsx test/spend.ts"
   },
   "license": "MIT",
   "dependencies": {
