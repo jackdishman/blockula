@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
 import { RequireWallet } from "@/components/Gate";
-import { Ornament } from "@/components/Ornament";
+import { Apparition } from "@/components/Haunt";
 import { ErrorNote, ExplorerLink, Spinner, Tip } from "@/components/ui";
 import { explorer } from "@/lib/config";
 import { friendly } from "@/lib/errors";
@@ -125,7 +125,7 @@ function Send() {
   if (sent)
     return (
       <main className="narrow stack-lg center">
-        <Ornament kind="bat" className="hero-ornament" />
+        <Apparition kind="bat" />
         <h1>Sent</h1>
         <p className="summary">{sent.summary}</p>
         <p className="dim">Sealed in block #{sent.height}. That&apos;s final: no waiting for confirmations.</p>

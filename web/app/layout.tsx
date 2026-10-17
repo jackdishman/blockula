@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import { Courier_Prime, EB_Garamond, IM_Fell_English, IM_Fell_English_SC, UnifrakturMaguntia } from "next/font/google";
 import type { ReactNode } from "react";
+import { Haunt } from "@/components/Haunt";
 import { Header } from "@/components/Header";
 import { Ornament } from "@/components/Ornament";
 import { WalletProvider } from "@/lib/wallet";
@@ -25,6 +26,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="en" className={`${fell.variable} ${fellSc.variable} ${garamond.variable} ${courier.variable} ${fraktur.variable}`}>
       <body>
+        <Haunt />
         <WalletProvider>
           <Header />
           {children}
