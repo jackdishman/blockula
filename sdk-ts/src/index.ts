@@ -803,6 +803,23 @@ export class Wallet {
   }
 
   /**
+   * A member of a set of one or two, signing with its consensus key: admit candidate `validator`
+   * into the set at the end of `epoch` (default: the epoch the next block is in; the tx fails in
+   * any other). The newcomer will be needed for every quorum, so this is the operator's decision,
+   * once an epoch per member; it joins once a quorum of the members admitted it and its node
+   * showed up (`validatorReady`).
+   */
+  async admitValidator(validator: string, opts: { epoch?: number } & TxOptions = {}) {
+    const [v, epoch] = await Promise.all([this.validatorAddress(validator), opts.epoch ?? this.client.status().then((s) => s.epoch as number)]);
+    return this.act({ type: "admit_validator", validator: v, epoch: wholeNumber(epoch, "epoch") }, opts);
+  }
+
+  /** Low-level (candidate nodes do this automatically, in the epoch's last tenth, once a set of one or two admitted them): a candidate's consensus key signals its node is running in `epoch`. */
+  async validatorReady(epoch: number, opts: TxOptions = {}) {
+    return this.act({ type: "validator_ready", epoch: wholeNumber(epoch, "epoch") }, opts);
+  }
+
+  /**
    * Put a proposal to a vote (build `kind` with `proposal.*`). Bonds `deposit` (default: the
    * chain's `proposal_deposit`), refunded once the proposal reaches quorum and burned if it
    * doesn't. Names in the kind (`to`, `account`) are resolved and the addresses are signed.

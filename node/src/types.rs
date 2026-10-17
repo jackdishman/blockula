@@ -277,6 +277,18 @@ pub enum Action {
     /// An active validator (its consensus key or owner) votes to pause Ghost Mode; it pauses
     /// once f + 1 of the epoch's validators have.
     GhostPause {},
+
+    // ---- a set of one or two (tags 60–61, staking.rs; audit round 3, review-fix-staking-2):
+    // the next newcomer would be needed for every quorum, so it joins only with both ----
+    /// A candidate's consensus key (from its own account or its owner's, SF-13): its node is
+    /// running in `epoch`'s last tenth (the epoch it lands in). Changes nothing but the
+    /// candidate's readiness record; accepted only once the set's members admitted it.
+    ValidatorReady { epoch: u64 },
+    /// An active member's consensus key admits candidate `validator` (an address) into the set
+    /// at the end of `epoch` (the epoch it lands in), on its operator's decision (`blockula
+    /// validator admit`; nodes never send it). A newcomer into a set of one or two needs a
+    /// quorum of the members it joins. Once per member and epoch.
+    AdmitValidator { validator: String, epoch: u64 },
 }
 
 /// What a `Propose` asks for: every former admin lever, plus parameters, spending, upgrades and
@@ -1037,6 +1049,15 @@ impl Action {
                 out.extend_from_slice(&address.0);
             }
             Action::GhostPause {} => out.push(54),
+            Action::ValidatorReady { epoch } => {
+                out.push(60);
+                put_u64(out, *epoch);
+            }
+            Action::AdmitValidator { validator, epoch } => {
+                out.push(61);
+                put_str(out, validator);
+                put_u64(out, *epoch);
+            }
         }
     }
 
@@ -1145,6 +1166,8 @@ impl Action {
             52 => Action::Unshield { to: r.str("to", MAX_NAME_FIELD)?, amount: r.u64()?, bundle: Box::new(GhostBundle::decode(r)?) },
             53 => Action::SetGhostAddress { address: HexBytes(r.take(GHOST_ADDRESS_BYTES)?.to_vec()) },
             54 => Action::GhostPause {},
+            60 => Action::ValidatorReady { epoch: r.u64()? },
+            61 => Action::AdmitValidator { validator: r.str("validator", MAX_ADDRESS)?, epoch: r.u64()? },
             t => bail!("unknown action tag {t}"),
         })
     }
@@ -1460,7 +1483,8 @@ impl Action {
                     bail!("address must be a valid {GHOST_ADDRESS_BYTES}-byte Ghost Mode address");
                 }
             }
-            Action::GhostPause {} => {}
+            Action::GhostPause {} | Action::ValidatorReady { .. } => {}
+            Action::AdmitValidator { validator, .. } => check_address("validator", validator)?,
         }
         Ok(())
     }
@@ -1541,6 +1565,8 @@ impl Action {
             Action::Unshield { .. } => "unshield",
             Action::SetGhostAddress { .. } => "set_ghost_address",
             Action::GhostPause {} => "ghost_pause",
+            Action::ValidatorReady { .. } => "validator_ready",
+            Action::AdmitValidator { .. } => "admit_validator",
         }
     }
 
@@ -1549,7 +1575,7 @@ impl Action {
     pub fn addresses(&self) -> Vec<(&'static str, &str)> {
         match self {
             Action::Transfer { to, .. } | Action::AwardHunt { to, .. } | Action::GrantSoul { to, .. } | Action::TransferName { to, .. } | Action::Unshield { to, .. } => vec![("to", to.as_str())],
-            Action::ApproveValidator { validator } | Action::RemoveValidator { validator } | Action::Unbond { validator } | Action::Delegate { validator, .. } | Action::Undelegate { validator, .. } | Action::Unjail { validator } => vec![("validator", validator.as_str())],
+            Action::ApproveValidator { validator } | Action::RemoveValidator { validator } | Action::Unbond { validator } | Action::Delegate { validator, .. } | Action::Undelegate { validator, .. } | Action::Unjail { validator } | Action::AdmitValidator { validator, .. } => vec![("validator", validator.as_str())],
             Action::Redelegate { from_validator, to_validator, .. } => vec![("from_validator", from_validator.as_str()), ("to_validator", to_validator.as_str())],
             Action::Vouch { account } | Action::Unvouch { account } | Action::FlagSybil { account, .. } | Action::Clawback { account, .. } => vec![("account", account.as_str())],
             Action::Propose { kind, .. } => match kind {
@@ -2295,6 +2321,12 @@ pub(crate) mod tests {
         ]
     }
 
+    /// A set of one or two's readiness and admission (tags 60–61, audit round 3): one action per
+    /// tag. Mirrored by `smallSetVectorActions` in sdk-ts/test/e2e.ts.
+    pub(crate) fn small_set_vector_actions() -> Vec<Action> {
+        vec![Action::ValidatorReady { epoch: 3 }, Action::AdmitValidator { validator: "boo1v".into(), epoch: 3 }]
+    }
+
     /// A bundle whose fields are `[1; 32]`, `[2; 32]` … in wire order and whose 300-byte proof is
     /// `[proof; 300]`.
     pub(crate) fn vector_bundle(proof: u8) -> Box<GhostBundle> {
@@ -2327,7 +2359,7 @@ pub(crate) mod tests {
     fn tx_vectors() -> serde_json::Value {
         const JS_MAX: u64 = (1 << 53) - 1;
         let unsigned = |tx: Tx| Tx { public_key: String::new(), signature: String::new(), ..tx };
-        let mut cases: Vec<(String, Tx)> = vector_actions().into_iter().chain(v1_vector_actions()).chain(ghost_vector_actions()).map(|a| (format!("{} (tag {})", a.kind(), a.to_bytes()[0]), unsigned(vector_tx(a)))).collect();
+        let mut cases: Vec<(String, Tx)> = vector_actions().into_iter().chain(v1_vector_actions()).chain(ghost_vector_actions()).chain(small_set_vector_actions()).map(|a| (format!("{} (tag {})", a.kind(), a.to_bytes()[0]), unsigned(vector_tx(a)))).collect();
         let base = unsigned(vector_tx(Action::Transfer { to: "x.boo".into(), amount: u64::MAX }));
         let at = |label: &str, action: Action| (label.to_string(), Tx { action, ..base.clone() });
         cases.extend([
@@ -2350,6 +2382,8 @@ pub(crate) mod tests {
             at("delegate at u64::MAX", Action::Delegate { validator: "boo1v".into(), amount: u64::MAX }),
             at("commission at the JS bound", Action::UpdateValidator { commission_bps: JS_MAX, p2p_addr: String::new(), http_addr: String::new() }),
             at("shield at u64::MAX", Action::Shield { amount: u64::MAX, bundle: vector_bundle(15) }),
+            at("readiness at the JS bound", Action::ValidatorReady { epoch: JS_MAX }),
+            at("admission at the JS bound", Action::AdmitValidator { validator: "boo1v".into(), epoch: JS_MAX }),
         ]);
         let cases: Vec<serde_json::Value> = cases
             .into_iter()
@@ -2485,6 +2519,18 @@ pub(crate) mod tests {
             assert_eq!(json["type"], a.kind());
             assert_eq!(serde_json::from_value::<Action>(json).unwrap(), a);
         }
+        // A set of one or two's readiness and admission (tags 60–61, audit round 3), each on its
+        // own (mirrored in e2e.ts).
+        let [ready, admit]: [Action; 2] = small_set_vector_actions().try_into().unwrap();
+        assert_eq!(ready.to_bytes(), [60, 3, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(blake3::hash(&vector_tx(ready.clone()).signing_bytes()).to_hex().to_string(), "1276620e9888e634548d914538007b797a6b81281a89a27d3f88470804d19012");
+        assert_eq!(blake3::hash(&vector_tx(admit.clone()).signing_bytes()).to_hex().to_string(), "75a6f69d5103b23658fc22a88a23a4ba1811d8c52d8a8043cd633b59a3dcf3c1");
+        assert_eq!(serde_json::to_value(&ready).unwrap(), serde_json::json!({ "type": "validator_ready", "epoch": 3 }));
+        assert_eq!(serde_json::to_value(&admit).unwrap(), serde_json::json!({ "type": "admit_validator", "validator": "boo1v", "epoch": 3 }));
+        for a in [ready, admit] {
+            assert_eq!(serde_json::from_value::<Action>(serde_json::to_value(&a).unwrap()).unwrap(), a);
+        }
+        assert!(serde_json::from_str::<Action>(r#"{"type":"validator_ready","epoch":3,"commission_bps":0}"#).is_err(), "readiness carries no terms");
     }
 
     /// Unsigned ghost txs (51, 52) travel in their own wire form; nothing else does, and they
@@ -2580,7 +2626,7 @@ pub(crate) mod tests {
     fn every_tag_round_trips_through_the_wire_form() {
         let mut tags = std::collections::BTreeSet::new();
         let mut kinds = std::collections::BTreeSet::new();
-        for action in vector_actions().into_iter().chain(v1_vector_actions()).chain(ghost_vector_actions()) {
+        for action in vector_actions().into_iter().chain(v1_vector_actions()).chain(ghost_vector_actions()).chain(small_set_vector_actions()) {
             let enc = action.to_bytes();
             tags.insert(enc[0]);
             if let Action::Propose { kind, .. } = &action {
@@ -2591,7 +2637,7 @@ pub(crate) mod tests {
             let tx = vector_tx(action);
             assert_eq!(Tx::from_bytes(&tx.to_bytes()).unwrap(), tx);
         }
-        assert_eq!(tags, (0..=54).collect(), "the vectors cover every action tag");
+        assert_eq!(tags, (0..=54).chain(60..=61).collect(), "the vectors cover every action tag (55–59 are Ghost Mode's, unused)");
         assert_eq!(kinds, (0..=13).collect(), "and every proposal kind");
     }
 
@@ -2607,6 +2653,8 @@ pub(crate) mod tests {
         let propose = |kind: ProposalKind| Action::Propose { kind, deposit: 1, title: "t".into(), url: String::new() };
         ok(Action::Delegate { validator: addr.clone(), amount: 1 });
         assert!(bad(Action::Delegate { validator: "x.boo".into(), amount: 1 }).contains("address"), "validators are named by address");
+        ok(Action::AdmitValidator { validator: addr.clone(), epoch: 1 });
+        assert!(bad(Action::AdmitValidator { validator: "x.boo".into(), epoch: 1 }).contains("address"), "and admitted by address");
         assert!(bad(Action::Delegate { validator: addr.clone(), amount: 0 }).contains("more than 0"));
         assert!(bad(Action::Redelegate { from_validator: addr.clone(), to_validator: addr.clone(), shares: 1 }).contains("different"));
         assert!(bad(Action::UpdateValidator { commission_bps: 10_001, p2p_addr: String::new(), http_addr: String::new() }).contains("0–10000"));
@@ -2714,8 +2762,10 @@ pub(crate) mod tests {
         let tag_at = TX_DOMAIN.len() + 2 + 3 + 32 + 2 + 8 + 4 * 8;
         assert_eq!(good[tag_at], 21);
         let mut unknown = good.clone();
-        unknown[tag_at] = 55;
-        assert!(err(&unknown).contains("unknown action tag 55"));
+        for t in [55, 59, 62] {
+            unknown[tag_at] = t;
+            assert!(err(&unknown).contains(&format!("unknown action tag {t}")));
+        }
         // A proposal kind past the last one.
         let text = vector_tx(Action::Propose { kind: ProposalKind::Text {}, deposit: 1, title: "t".into(), url: String::new() }).to_bytes();
         let mut bad_kind = text.clone();
@@ -2834,7 +2884,7 @@ pub(crate) mod tests {
         let opt = proptest::option::of(arb_str(6).prop_filter("Some is never empty", |s| !s.is_empty()));
         let ids = proptest::collection::vec(any::<u64>(), 0..4);
         let list = proptest::collection::vec(arb_str(6), 0..4);
-        (0u8..55, strs, nums, any::<bool>(), opt, ids, list, 0u8..16, any::<u8>()).prop_map(|(tag, [a, b, c, d], [w, x, y], ok, familiar_key, spam, list, kind, small)| match tag {
+        (0u8..57, strs, nums, any::<bool>(), opt, ids, list, 0u8..16, any::<u8>()).prop_map(|(tag, [a, b, c, d], [w, x, y], ok, familiar_key, spam, list, kind, small)| match tag {
             0 => Action::Transfer { to: a, amount: w },
             1 => Action::RegisterName { name: a },
             2 => Action::AddKey { key_id: a, label: b, role: if ok { KeyRole::Owner } else { KeyRole::Session { limit: w, period_blocks: x, expires_at: y } }, public_key: c, pop: d },
@@ -2890,6 +2940,9 @@ pub(crate) mod tests {
             52 => Action::Unshield { to: a, amount: w, bundle: vector_bundle(small) },
             53 => Action::SetGhostAddress { address: HexBytes(vec![small; GHOST_ADDRESS_BYTES]) },
             54 => Action::GhostPause {},
+            // Tags 60–61 (55–59 are Ghost Mode's, unused).
+            55 => Action::ValidatorReady { epoch: w },
+            56 => Action::AdmitValidator { validator: a, epoch: w },
             _ => unreachable!(),
         })
     }

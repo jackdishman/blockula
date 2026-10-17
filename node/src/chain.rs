@@ -1248,7 +1248,9 @@ impl State {
         }
         // SF-11: a multisig account's owner keys only propose and approve (governance.rs). A
         // validator's consensus key isn't one of them: it keeps signing its system txs for a
-        // multisig owner, except `UpdateValidator` (the pool's terms are the owner's call).
+        // multisig owner (a small set's readiness and admissions too: they change nothing of the
+        // owner's), except `UpdateValidator` (the pool's terms are the owner's call; the key can't
+        // change them from the validator's own account either, `staking::owned_validator`).
         if !consensus_key || matches!(tx.action, Action::UpdateValidator { .. }) {
             crate::governance::check_multisig_admission(self, &sender, &key, &tx.action)?;
         }
@@ -1577,7 +1579,7 @@ impl State {
                 self.familiars_mut(j, &sender).insert(key_id.clone(), label.clone());
             }
             // Protocol v1 (MAINNET-DESIGN 3.1): each module applies its own tags.
-            Action::Delegate { .. } | Action::Undelegate { .. } | Action::Redelegate { .. } | Action::WithdrawUnbonded {} | Action::UpdateValidator { .. } | Action::Unjail { .. } | Action::ReportEquivocation { .. } => crate::staking::apply(self, j, tx, &sender, signer, key, height)?,
+            Action::Delegate { .. } | Action::Undelegate { .. } | Action::Redelegate { .. } | Action::WithdrawUnbonded {} | Action::UpdateValidator { .. } | Action::Unjail { .. } | Action::ReportEquivocation { .. } | Action::ValidatorReady { .. } | Action::AdmitValidator { .. } => crate::staking::apply(self, j, tx, &sender, signer, key, height)?,
             Action::BeaconCommit { .. } | Action::BeaconReveal { .. } | Action::AttestRevert { .. } => crate::beacon::apply(self, j, tx, &sender, signer, key, height)?,
             Action::Propose { .. } | Action::Vote { .. } | Action::Unlock {} | Action::MultisigCreate { .. } | Action::MultisigPropose { .. } | Action::MultisigApprove { .. } | Action::ClaimDistribution { .. } => crate::governance::apply(self, j, tx, &sender, signer, key, height)?,
             Action::RenewName { .. } | Action::TransferName { .. } | Action::ReleaseName { .. } => crate::econ::apply(self, j, tx, &sender, signer, key, height)?,
@@ -1746,7 +1748,7 @@ impl State {
                 format!("{from} cancelled the hunt on {what}; funders were refunded")
             }
             Action::RegisterFamiliar { label, .. } => format!("{from} registered the Familiar “{label}”"),
-            Action::Delegate { .. } | Action::Undelegate { .. } | Action::Redelegate { .. } | Action::WithdrawUnbonded {} | Action::UpdateValidator { .. } | Action::Unjail { .. } | Action::ReportEquivocation { .. } => crate::staking::describe(self, tx, &from, primary_name),
+            Action::Delegate { .. } | Action::Undelegate { .. } | Action::Redelegate { .. } | Action::WithdrawUnbonded {} | Action::UpdateValidator { .. } | Action::Unjail { .. } | Action::ReportEquivocation { .. } | Action::ValidatorReady { .. } | Action::AdmitValidator { .. } => crate::staking::describe(self, tx, &from, primary_name),
             Action::BeaconCommit { .. } | Action::BeaconReveal { .. } | Action::AttestRevert { .. } => crate::beacon::describe(self, tx, &from),
             Action::Propose { .. } | Action::Vote { .. } | Action::Unlock {} | Action::MultisigCreate { .. } | Action::MultisigPropose { .. } | Action::MultisigApprove { .. } | Action::ClaimDistribution { .. } => crate::governance::describe(self, tx, &from, primary_name),
             Action::RenewName { .. } | Action::TransferName { .. } | Action::ReleaseName { .. } => crate::econ::describe(self, tx, &from, height, primary_name),
@@ -3937,7 +3939,8 @@ pub const MAX_PENDING_PER_SENDER: usize = 64;
 /// (audit F32/F56). A validator owes one commitment and one reveal an epoch, and each fault or
 /// claim is reported or attested once (the chain refuses repeats), so the lane stays small: at
 /// most 2 × 64 validators × 5 kinds × this many txs (a reveal still owed by a validator that left
-/// the set counts too). Duties past it, or behind their sender's other txs (the lane is a prefix of
+/// the set counts too), plus, while the set is one or two members, their admissions and one
+/// candidate's readiness. Duties past it, or behind their sender's other txs (the lane is a prefix of
 /// each sender's queue), queue like any tx and join the lane once what's ahead of them is gone.
 pub const DUTY_LANE_PER_KIND: usize = 2;
 

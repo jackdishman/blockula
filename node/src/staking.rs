@@ -115,11 +115,16 @@ pub struct Pool {
     /// (the start of the earliest punished fault's epoch). A double-signer is slashed once: later
     /// evidence only reaches stake that left the pool before this height (audit F05/F07/F60).
     pub slashed_from: Option<u64>,
-    /// The last height the validator's own consensus key signed an `UpdateValidator` for it: proof
-    /// its node is running and synced. A set below four admits only a newcomer that showed up in
-    /// the epoch ([`select_next`], audit review-fix-staking-2), and the key updates the validator
-    /// for its owner at most once per epoch (audit F04).
+    /// The last height the validator's own consensus key signaled readiness (`ValidatorReady`, in
+    /// an epoch's last tenth): its node was running then. A newcomer into a set of one or two
+    /// joins only if it showed up in the epoch ([`showed_up`], audit review-fix-staking-2).
     pub ready_at: Option<u64>,
+    /// The last height the validator's consensus key updated it for its owner (SF-13): at most
+    /// once an epoch (audit F04).
+    pub key_update_at: Option<u64>,
+    /// The candidate this validator's consensus key last admitted (`AdmitValidator`) and the
+    /// height: it counts for the boundary at the end of that height's epoch ([`admitted`]).
+    pub admit: Option<(String, u64)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -655,7 +660,8 @@ fn room_for_entry(state: &State, delegator: &str) -> Result<()> {
 // --------------------------------------------------------------------------------- actions
 
 /// Tags 30–36: Delegate, Undelegate, Redelegate, WithdrawUnbonded, UpdateValidator, Unjail,
-/// ReportEquivocation. Session keys never get here (admission lets them send transfers only).
+/// ReportEquivocation; 60–61: ValidatorReady, AdmitValidator. Session keys never get here
+/// (admission lets them send transfers only).
 pub(crate) fn apply(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, signer: &str, _key: &KeyRecord, height: u64) -> Result<()> {
     match &tx.action {
         Action::Delegate { validator, amount } => own_move(state, j, sender, height, |state, j| {
@@ -721,11 +727,10 @@ pub(crate) fn apply(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, s
             let epoch = state.params.epoch_of(height);
             let current = state.validators[&v].commission_bps;
             let pool = state.staking.pools.get(&v).cloned().unwrap_or_default();
-            // Its own consensus key signed it: the validator's node is up (readiness). Signed that
-            // way for its owner (SF-13, the owner pays), it updates the validator once an epoch.
-            let by_its_key = validator_of_key(state, signer).as_deref() == Some(v.as_str());
-            let for_owner = by_its_key && !state.keys_of(sender).contains_key(signer);
-            if for_owner && pool.ready_at.is_some_and(|h| state.params.epoch_of(h) == epoch) {
+            // Signed by its own consensus key for its owner (SF-13, the owner pays): once an epoch
+            // (audit F04). The owner is `sender` here (`owned_validator`).
+            let for_owner = validator_of_key(state, signer).as_deref() == Some(v.as_str()) && !state.keys_of(sender).contains_key(signer);
+            if for_owner && pool.key_update_at.is_some_and(|h| state.params.epoch_of(h) == epoch) {
                 bail!("validator {}'s consensus key already updated it for its owner in epoch {epoch} (once an epoch; its owner's own key isn't limited)", short(&v));
             }
             // Measured from at most the cap: a validator above a lowered cap steps down to it at once.
@@ -741,8 +746,8 @@ pub(crate) fn apply(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, s
             }
             if let Some(p) = pool_mut(state, j, &v) {
                 (p.commission_base, p.commission_epoch) = (base, epoch);
-                if by_its_key {
-                    p.ready_at = Some(height);
+                if for_owner {
+                    p.key_update_at = Some(height);
                 }
             }
             let rec = state.validator_mut(j, &v).expect("owned_validator checked it");
@@ -757,8 +762,11 @@ pub(crate) fn apply(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, s
         }
         Action::Unjail { validator } => {
             let rec = state.validators.get(validator).ok_or_else(|| anyhow!("no validator {}", short(validator)))?;
-            if rec.owner != sender && validator != sender {
-                bail!("only validator {}'s owner can unjail it", short(validator));
+            // Its owner's call, never its consensus key's from the validator's own account (when
+            // that's another account than the owner's: a multisig owner's approvals would be
+            // bypassed; audit review-r2-integrate-compose-1).
+            if rec.owner != sender {
+                bail!("only validator {}'s owner ({}) can unjail it", short(validator), short(&rec.owner));
             }
             let pool = state.staking.pools.get(validator).cloned().unwrap_or_default();
             if pool.tombstoned_at.is_some() {
@@ -808,15 +816,62 @@ pub(crate) fn apply(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, s
             put_punished(state, j, &key, Some(Punished { kind: fault.kind, height, reporter: sender.to_string(), slashed: cut.total }));
             Ok(())
         }
+        Action::ValidatorReady { epoch } => {
+            let v = signing_validator(state, sender, signer, "signals readiness")?;
+            in_epoch(state, *epoch, height, "readiness")?;
+            let from = ready_from(&state.params, *epoch);
+            if height < from {
+                bail!("readiness counts only in the epoch's last tenth: from block {from} on");
+            }
+            check_ready(state, &v, *epoch)?;
+            pool_mut(state, j, &v).expect("check_ready found it").ready_at = Some(height);
+            Ok(())
+        }
+        Action::AdmitValidator { validator, epoch } => {
+            let m = signing_validator(state, sender, signer, "admits a newcomer")?;
+            in_epoch(state, *epoch, height, "an admission")?;
+            check_admit(state, &m, validator, *epoch)?;
+            pool_mut(state, j, &m).expect("check_admit found it").admit = Some((validator.clone(), height));
+            Ok(())
+        }
         _ => bail!("not a staking action"),
     }
 }
 
-/// The validator an `UpdateValidator` means: the one whose consensus key signed it (for itself or
-/// its owner), else the one the sender is, else the only one the sender owns.
+/// The validator whose consensus key signed a `ValidatorReady` or `AdmitValidator`, from its own
+/// account or its owner's (SF-13: admission checked the key is the validator's).
+fn signing_validator(state: &State, sender: &str, signer: &str, what: &str) -> Result<String> {
+    let v = validator_of_key(state, signer).ok_or_else(|| anyhow!("only a validator's consensus key {what}"))?;
+    let rec = &state.validators[&v];
+    if sender != v && sender != rec.owner {
+        bail!("validator {}'s consensus key {what} from its own account or its owner's", short(&v));
+    }
+    Ok(v)
+}
+
+/// `epoch`, named by a `ValidatorReady` or `AdmitValidator`, is the one it lands in.
+fn in_epoch(state: &State, epoch: u64, height: u64, what: &str) -> Result<()> {
+    let now = state.params.epoch_of(height);
+    if epoch != now {
+        bail!("{what} for epoch {epoch} can't land in epoch {now}");
+    }
+    Ok(())
+}
+
+/// The validator an `UpdateValidator` means, which `sender` must own: the one whose consensus key
+/// signed it (for its owner), else the one the sender is (owning itself), else the only one the
+/// sender owns. A validator's terms are its owner's call: from the validator's own account its
+/// consensus key changes them only when that account is the owner (audit
+/// review-r2-integrate-compose-1: a multisig owner's approvals and F04's once-an-epoch limit
+/// would be bypassed otherwise).
 fn owned_validator(state: &State, sender: &str, signer: &str) -> Result<String> {
-    if let Some(v) = validator_of_key(state, signer).filter(|v| state.validators.get(v).is_some_and(|r| *v == sender || r.owner == sender)) {
-        return Ok(v);
+    if let Some((v, r)) = validator_of_key(state, signer).and_then(|v| state.validators.get(&v).map(|r| (v, r))) {
+        if r.owner == sender {
+            return Ok(v);
+        }
+        if v == sender {
+            bail!("validator {}'s terms are its owner's call: its consensus key signs them for its owner {} (from = the owner), not from the validator's own account", short(&v), short(&r.owner));
+        }
     }
     if state.validators.get(sender).is_some_and(|r| r.owner == sender) {
         return Ok(sender.to_string());
@@ -1398,30 +1453,106 @@ pub fn churn_limit(m: usize) -> usize {
 /// except that on chains without admins a set carrying over one to three members grows by one per
 /// epoch (audit F24): under the churn limit alone a set that shrank to one or two could never grow
 /// again, with no fault tolerance (f = 0) for good, and mainnet has no other way to add one.
-/// Past the churn limit the newcomer is needed for every quorum (a set of 2 or 3), so it must be
-/// running and synced: [`select_next`] takes one past the limit only if its consensus key showed
-/// up in the epoch ([`showed_up`], audit review-fix-staking-2), not on stake alone. Safety is
-/// unchanged. Dev and test chains keep small sets closed to strangers (a stranger that joined and
-/// went offline would stall them): their admins pin newcomers.
+/// Past the churn limit the newcomer is needed for every quorum (a set of 2 or 3), so stake alone
+/// can't buy the seat (one that never votes would halt the chain for good): [`select_next`] takes
+/// one past the limit only if a quorum of the members it joins admitted it ([`admitted`]) and its
+/// consensus key showed up in the epoch's last tenth ([`showed_up`]; audit review-fix-staking-2).
+/// Safety is unchanged. Dev and test chains keep small sets closed to strangers (a stranger that
+/// joined and went offline would stall them): their admins pin newcomers.
 pub fn newcomers_allowed(state: &State, kept: usize, size: usize, free: bool) -> usize {
     let limit = churn_limit(size);
     if free && (1..4).contains(&kept) && state.params.admins.is_empty() { limit.max(1) } else { limit }
 }
 
-/// Whether `validator`'s own consensus key signed an `UpdateValidator` in `epoch` (for itself or
-/// its owner, [`Pool::ready_at`]): its node was running then. What a newcomer that every quorum of
-/// a set of 2 or 3 would need must show before it joins (the node sends one: `beacon::duties`).
-pub fn showed_up(state: &State, validator: &str, epoch: u64) -> bool {
-    state.staking.pools.get(validator).and_then(|p| p.ready_at).is_some_and(|h| state.params.epoch_of(h) == epoch)
+/// The first height of `epoch`'s last tenth (at least its last block): where a candidate's
+/// readiness counts ([`showed_up`]), so a node that showed up early and then stopped doesn't.
+pub fn ready_from(params: &crate::chain::Params, epoch: u64) -> u64 {
+    let e = params.epoch_blocks.max(2);
+    params.last_of(epoch).saturating_sub((e / 10).max(1) - 1)
 }
 
-/// Whether `validator`'s node should show up in `epoch` ([`showed_up`]): it's an eligible
-/// candidate outside `epoch`'s set, the set keeps fewer than four eligible members (so it takes a
-/// newcomer past the churn limit only if that newcomer showed up) on a chain without admins, and
-/// it hasn't yet. The node sends a no-op `UpdateValidator` then (`beacon::duties`).
-pub fn should_show_up(state: &State, validator: &str, epoch: u64) -> bool {
-    let Some(set) = state.active_sets.get(&epoch) else { return false };
-    state.params.admins.is_empty() && !set.iter().any(|v| v == validator) && eligible(state, validator) && set.iter().filter(|v| eligible(state, v)).count() < 4 && !showed_up(state, validator, epoch)
+/// Whether `validator`'s own consensus key signaled readiness in `epoch`'s last tenth
+/// (`ValidatorReady`, [`Pool::ready_at`]): its node was running then. What a newcomer that every
+/// quorum of a set of 2 or 3 would need must show before it joins (its node sends it by itself
+/// once the set's members admitted it: `beacon::duties`).
+pub fn showed_up(state: &State, validator: &str, epoch: u64) -> bool {
+    state.staking.pools.get(validator).and_then(|p| p.ready_at).is_some_and(|h| state.params.epoch_of(h) == epoch && h >= ready_from(&state.params, epoch))
+}
+
+/// The members of `epoch`'s set that would carry over to the next one now (eligible), if the
+/// next newcomer would be past the churn limit: one or two of them on a chain without admins.
+/// Such a newcomer is needed for every quorum of the set it makes (2 or 3), so it joins only once
+/// a quorum of these members admitted it ([`admitted`]) and it showed up ([`showed_up`]). `None`
+/// otherwise: a set carrying over three or more takes its newcomers on stake, within the churn
+/// limit, and dev and test chains' admins pin theirs.
+pub fn members_admitting(state: &State, epoch: u64) -> Option<Vec<String>> {
+    let set = state.active_sets.get(&epoch)?;
+    let members: Vec<String> = set.iter().filter(|v| eligible(state, v)).cloned().collect();
+    (state.params.admins.is_empty() && (1..=2).contains(&members.len())).then_some(members)
+}
+
+/// Whether a quorum of `members` (those carrying over, [`members_admitting`]) admitted `candidate`
+/// in `epoch` (`AdmitValidator`, [`Pool::admit`]): their operators decided, on purpose, to take a
+/// newcomer every quorum will need (nodes never send it by themselves).
+pub fn admitted(state: &State, members: &[String], candidate: &str, epoch: u64) -> bool {
+    let yes = members.iter().filter(|m| state.staking.pools.get(*m).and_then(|p| p.admit.as_ref()).is_some_and(|(c, h)| c == candidate && state.params.epoch_of(*h) == epoch)).count();
+    !members.is_empty() && yes >= crate::epochs::quorum(members.len())
+}
+
+/// `ValidatorReady`'s rules but the window: `validator` is an eligible candidate outside `epoch`'s
+/// set, which needs its members' admission for the next newcomer ([`members_admitting`]); a
+/// quorum of them admitted it; and it hasn't signaled yet this epoch. So at most one candidate an
+/// epoch may (each member admits one), once.
+fn check_ready(state: &State, validator: &str, epoch: u64) -> Result<()> {
+    let set = state.active_sets.get(&epoch).ok_or_else(|| anyhow!("no set for epoch {epoch}"))?;
+    if set.iter().any(|v| v == validator) {
+        bail!("validator {} is in the set already", short(validator));
+    }
+    if !eligible(state, validator) {
+        bail!("validator {} isn't eligible to join (jailed, tombstoned, removed or below the minimum self-bond)", short(validator));
+    }
+    let Some(members) = members_admitting(state, epoch) else { bail!("the set takes its next newcomer without a readiness signal (only a set of one or two members needs one, on chains without admins)") };
+    if !admitted(state, &members, validator, epoch) {
+        bail!("validator {} needs {} of the set's {} members to admit it first (`blockula validator admit`, epoch {epoch})", short(validator), crate::epochs::quorum(members.len()), members.len());
+    }
+    if state.staking.pools.get(validator).and_then(|p| p.ready_at).is_some_and(|h| state.params.epoch_of(h) == epoch) {
+        bail!("validator {} already signaled readiness in epoch {epoch}", short(validator));
+    }
+    Ok(())
+}
+
+/// `AdmitValidator`'s rules: `member` is an eligible member of `epoch`'s set, which needs its
+/// members' admission for the next newcomer ([`members_admitting`]), `candidate` is an eligible
+/// candidate outside it, and `member` hasn't admitted one yet this epoch.
+fn check_admit(state: &State, member: &str, candidate: &str, epoch: u64) -> Result<()> {
+    let set = state.active_sets.get(&epoch).ok_or_else(|| anyhow!("no set for epoch {epoch}"))?;
+    if !set.iter().any(|v| v == member) || !eligible(state, member) {
+        bail!("only an eligible member of epoch {epoch}'s set admits newcomers; validator {} isn't one", short(member));
+    }
+    if members_admitting(state, epoch).is_none() {
+        bail!("the set takes its next newcomer without its members' admission (only a set of one or two members needs it, on chains without admins)");
+    }
+    if set.iter().any(|v| v == candidate) || !eligible(state, candidate) {
+        bail!("{} isn't an eligible candidate outside the set", short(candidate));
+    }
+    if let Some((c, h)) = state.staking.pools.get(member).and_then(|p| p.admit.as_ref()).filter(|(_, h)| state.params.epoch_of(*h) == epoch) {
+        bail!("validator {} already admitted {} in epoch {epoch} (at block {h}; once an epoch)", short(member), short(c));
+    }
+    Ok(())
+}
+
+/// Whether `validator` may signal readiness in `epoch` (`ValidatorReady`'s rules but the window).
+pub fn may_show_up(state: &State, validator: &str, epoch: u64) -> bool {
+    check_ready(state, validator, epoch).is_ok()
+}
+
+/// Whether `validator`'s node should signal readiness in the block at `height`
+/// ([`showed_up`]): it's in its epoch's last tenth ([`ready_from`]) and [`may_show_up`]. The
+/// node sends `ValidatorReady` then (`beacon::duties`); it changes nothing but the readiness
+/// record.
+pub fn should_show_up(state: &State, validator: &str, height: u64) -> bool {
+    let epoch = state.params.epoch_of(height);
+    height >= ready_from(&state.params, epoch) && may_show_up(state, validator, epoch)
 }
 
 /// Most seats validators owned by `Params::bootstrap_excluded` accounts (the founder's and the
@@ -1465,6 +1596,8 @@ pub fn select_next(state: &State, epoch: u64) -> Selection {
         keep.pop();
         shrink -= 1;
     }
+    // The members carried over: who admits a newcomer past the churn limit.
+    let carried = keep.clone();
     // Newcomers, best first: into a free seat, or in place of the lowest-ranked member they
     // outrank, while newcomers stay within the churn limit of the resulting set and insiders
     // within their seats. Admin-pinned validators (dev and test chains) skip both: that's the
@@ -1481,9 +1614,9 @@ pub fn select_next(state: &State, epoch: u64) -> Selection {
             if joined + 1 > newcomers_allowed(state, keep.len() - joined, size, free) {
                 break;
             }
-            // Past the churn limit (a set of 2 or 3): only a newcomer that showed up. A later one
-            // may have.
-            if !showed_up(state, &c, epoch) {
+            // Past the churn limit (a set of 2 or 3): only a newcomer a quorum of the members it
+            // joins admitted, and that showed up. A later-ranked one may be.
+            if !admitted(state, &carried, &c, epoch) || !showed_up(state, &c, epoch) {
                 continue;
             }
         }
@@ -1795,19 +1928,20 @@ pub fn validator_for_signer(state: &State, account: &str, signer_key_id: &str, e
     set.iter().filter(|v| acts_for(v)).min().cloned()
 }
 
-/// SF-13: a validator's system txs (attestations, beacon commitments and reveals, evidence, and
-/// `UpdateValidator`, whose target only the signer can name) may be signed by its consensus key
-/// with `from` = its owner, who pays the fee, so the consensus key only needs a fee float, if
-/// that. Admission calls this when the signer isn't a key on `from`: the key record such a
-/// signature acts with, or `None` (not allowed).
+/// SF-13: a validator's system txs (attestations, beacon commitments and reveals, evidence,
+/// `UpdateValidator`, whose target only the signer can name, and a small set's readiness and
+/// admissions) may be signed by its consensus key with `from` = its owner, who pays the fee, so
+/// the consensus key only needs a fee float, if that. Admission calls this when the signer isn't
+/// a key on `from`: the key record such a signature acts with, or `None` (not allowed).
 ///
 /// What the owner pays for is bounded by the validator's duties (audit F04: the key is hot, and
 /// protocol v1 can't revoke it): such a tx whose action fails isn't admitted, so it's never
-/// charged (`State::apply_j`); it updates the validator at most once an epoch (`UpdateValidator`);
-/// and a tombstoned or removed validator's key signs only a reveal for a commitment it made while
-/// active (the beacon checks there is one), never anything else again.
+/// charged (`State::apply_j`); it updates the validator at most once an epoch (`UpdateValidator`),
+/// signals readiness and admits a newcomer at most once an epoch each, and only while the set is
+/// one or two members; and a tombstoned or removed validator's key signs only a reveal for a
+/// commitment it made while active (the beacon checks there is one), never anything else again.
 pub fn system_tx_key(state: &State, tx: &Tx, sender: &str, signer: &str) -> Option<KeyRecord> {
-    let system = matches!(tx.action, Action::AttestClaim { .. } | Action::AttestRevert { .. } | Action::BeaconCommit { .. } | Action::BeaconReveal { .. } | Action::ReportEquivocation { .. } | Action::UpdateValidator { .. });
+    let system = matches!(tx.action, Action::AttestClaim { .. } | Action::AttestRevert { .. } | Action::BeaconCommit { .. } | Action::BeaconReveal { .. } | Action::ReportEquivocation { .. } | Action::UpdateValidator { .. } | Action::ValidatorReady { .. } | Action::AdmitValidator { .. });
     if !system {
         return None;
     }
@@ -1824,11 +1958,15 @@ pub fn system_tx_key(state: &State, tx: &Tx, sender: &str, signer: &str) -> Opti
 /// owner's (SF-13), while the validator is in the active set of `epoch` or the next. A reveal is
 /// one whatever the set: the validator owes it once it committed (it may have left the set since,
 /// and `beacon::end_epoch` jails and slashes a committer that doesn't reveal), so it's a duty while
-/// the validator has an unopened commitment for `epoch + 1` (review of F32/F56). Returns the
-/// validator and the kind of duty. A full mempool must not refuse these for want of a tip (they
-/// carry none from an owner's account: `State::admit`), so the mempool queues them in a small
-/// lane of their own and proposals take them first (`Chain::admit_to_mempool`). Mempool policy
-/// only: blocks are verified the same either way.
+/// the validator has an unopened commitment for `epoch + 1` (review of F32/F56). So are a small
+/// set's readiness and admissions for `epoch` while they'd apply (audit review-r2-consensus-2:
+/// the node sends the readiness itself, from the account that pays its beacon duties, so it must
+/// not hold them out of the lane): at most one candidate an epoch may signal readiness, once, and
+/// each of the set's one or two members admit once. Returns the validator and the kind of duty. A
+/// full mempool must not refuse these for want of a tip (they carry none from an owner's account:
+/// `State::admit`), so the mempool queues them in a small lane of their own and proposals take
+/// them first (`Chain::admit_to_mempool`). Mempool policy only: blocks are verified the same
+/// either way.
 pub fn duty_of(state: &State, tx: &Tx, epoch: u64) -> Option<(String, &'static str)> {
     let kind = match tx.action {
         Action::BeaconCommit { .. } => "beacon_commit",
@@ -1836,13 +1974,22 @@ pub fn duty_of(state: &State, tx: &Tx, epoch: u64) -> Option<(String, &'static s
         Action::ReportEquivocation { .. } => "report_equivocation",
         Action::AttestClaim { .. } => "attest_claim",
         Action::AttestRevert { .. } => "attest_revert",
+        Action::ValidatorReady { .. } => "validator_ready",
+        Action::AdmitValidator { .. } => "admit_validator",
         _ => return None,
     };
     let v = validator_of_key(state, &tx.signer_key_id().ok()?)?;
     let rec = state.validators.get(&v).filter(|r| r.consensus_key == tx.public_key && (tx.from == v || tx.from == r.owner))?;
-    let active = [epoch, epoch + 1].iter().any(|e| state.active_sets.get(e).is_some_and(|s| s.contains(&rec.address)));
-    let owed = matches!(&tx.action, Action::BeaconReveal { epoch: target, .. } if *target == epoch + 1 && state.beacon.rounds.get(target).and_then(|r| r.get(&rec.address)).is_some_and(|e| e.secret.is_none()));
-    (active || owed).then_some((v, kind))
+    let due = match &tx.action {
+        Action::ValidatorReady { epoch: e } => *e == epoch && may_show_up(state, &v, epoch),
+        Action::AdmitValidator { validator, epoch: e } => *e == epoch && check_admit(state, &v, validator, epoch).is_ok(),
+        _ => {
+            let active = [epoch, epoch + 1].iter().any(|e| state.active_sets.get(e).is_some_and(|s| s.contains(&rec.address)));
+            let owed = matches!(&tx.action, Action::BeaconReveal { epoch: target, .. } if *target == epoch + 1 && state.beacon.rounds.get(target).and_then(|r| r.get(&rec.address)).is_some_and(|e| e.secret.is_none()));
+            active || owed
+        }
+    };
+    due.then_some((v, kind))
 }
 
 /// FANG staking holds outside balances: pool stake and unbonding entries.
@@ -1880,6 +2027,7 @@ pub fn check_invariants(state: &State) -> Result<()> {
         ensure!(p.shares > 0 || p.stake == 0, "pool {v} holds stake without shares");
         ensure!(p.tombstoned_at.is_none() || state.validators[v].status == ValidatorStatus::Tombstoned, "pool {v} is tombstoned but its validator isn't");
         ensure!(p.slashed_from.is_none() || p.tombstoned_at.is_some(), "pool {v} was slashed for double-signing but isn't tombstoned");
+        ensure!(p.admit.as_ref().is_none_or(|(c, _)| state.validators.contains_key(c) && c != v), "pool {v} admitted no registered newcomer");
     }
     for v in state.validators.keys() {
         ensure!(s.pools.contains_key(v), "validator {v} has no pool");
@@ -1952,8 +2100,15 @@ pub fn describe(state: &State, tx: &Tx, from: &str, primary_name: &dyn Fn(&str) 
             });
             format!("{from} reported {}", what.unwrap_or_else(|| format!("a validator for double-signing ({} bytes of evidence)", evidence.len() / 2)))
         }
+        Action::ValidatorReady { epoch } => format!("{} is ready to join the validator set (epoch {epoch})", signed_by(state, tx, from, &v)),
+        Action::AdmitValidator { validator, epoch } => format!("{} admitted validator {} into the validator set at the end of epoch {epoch}", signed_by(state, tx, from, &v), v(validator)),
         _ => String::new(),
     }
+}
+
+/// "validator X" when a validator's consensus key signed `tx`, else `from`.
+fn signed_by(state: &State, tx: &Tx, from: &str, v: &dyn Fn(&str) -> String) -> String {
+    tx.signer_key_id().ok().and_then(|k| validator_of_key(state, &k)).map(|a| format!("validator {}", v(&a))).unwrap_or_else(|| from.to_string())
 }
 
 /// Basis points as a percentage: 250 → "2.5".

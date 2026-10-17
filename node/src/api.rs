@@ -1549,6 +1549,11 @@ fn validator_json(v: &ReadView, r: &crate::chain::ValidatorRecord) -> Value {
         "removed_by": r.removed_by.as_ref().map(|a| label(v, a)),
         "active_until_epoch": r.active_until,
         "genesis": v.genesis.is_validator(&r.address),
+        // A set of one or two's admission (audit review-fix-staking-2): the height its consensus
+        // key last signaled readiness, and the candidate it last admitted (each counts for its
+        // own epoch only).
+        "ready_at": p.ready_at,
+        "admitted": p.admit.as_ref().map(|(c, h)| json!({ "validator": label(v, c), "at": h, "epoch": st.params.epoch_of(*h) })),
     })
 }
 
@@ -1587,6 +1592,10 @@ async fn validators(State(n): State<Node>) -> ApiResult {
         "min_bond_display": fmt_fang(cp.min_self_bond),
         "max_validators": cp.max_validators,
         "churn_limit": staking::churn_limit(current.len()),
+        // While the set carries over one or two members, its next newcomer is needed for every
+        // quorum: it joins only once a quorum of `members` admitted it this epoch and it showed up
+        // from `ready_from` on (`null`: newcomers join on stake).
+        "admission": staking::members_admitting(st, epoch).map(|m| json!({ "members": m.iter().map(|a| label(&v, a)).collect::<Vec<_>>(), "quorum": crate::epochs::quorum(m.len()), "ready_from": staking::ready_from(p, epoch) })),
         "unbonding_blocks": cp.unbonding_blocks,
         "jail_blocks": cp.jail_blocks,
         "evidence_max_age_epochs": cp.evidence_max_age_epochs,
@@ -2664,6 +2673,7 @@ mod http_tests {
         assert_eq!((active["validator"]["address"].as_str(), active["status"].as_str(), active["eligible"].as_bool()), (Some(me.as_str()), Some("active"), Some(true)));
         assert_eq!(active["self_bond"], active["stake"]);
         assert_eq!((v["churn_limit"].as_u64(), v["candidates"].as_array().map(Vec::len)), (Some(0), Some(0)), "a set of one takes no newcomers");
+        assert!(v["admission"].is_null() && active["ready_at"].is_null() && active["admitted"].is_null(), "its admins pin newcomers: no admission round");
         assert_eq!(v["next_epoch"][0]["validator"]["address"], me.as_str());
         // A delegator: its stake, then its way out.
         let alice = crate::crypto::Keys::from_seed([1; 32]);

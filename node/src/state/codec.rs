@@ -39,8 +39,11 @@ use std::io::{Read, Write};
 /// keep the grace they were registered with (`grace_blocks`); the `upgrade` scalar record follows
 /// the schedule with what cancellations withdrew (`upgrade::Withdrawals`); Proof of Contribution
 /// gains namespaces 26 (withdrawn vouches that still count, `poc::DroppedVouch`) and 27 (GitHub
-/// handles governance holds for an account, `poc::HandleHold`).
-pub const SCHEMA_VERSION: u32 = 7;
+/// handles governance holds for an account, `poc::HandleHold`). 8 (the third audit round): pools
+/// keep the consensus key's last update for its owner (`key_update_at`, F04's once-an-epoch limit,
+/// apart from `ready_at`, which only `ValidatorReady` writes now) and the candidate they last
+/// admitted into a set of one or two (`admit`).
+pub const SCHEMA_VERSION: u32 = 8;
 
 pub fn encode<T: BorshSerialize + ?Sized>(v: &T) -> Vec<u8> {
     borsh::to_vec(v).expect("encoding to memory can't fail")

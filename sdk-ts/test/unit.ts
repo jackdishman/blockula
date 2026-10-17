@@ -136,6 +136,8 @@ const cases: [string, () => Promise<unknown>, Action][] = [
   ["release a name", () => me.releaseName("vlad.boo"), { type: "release_name", name: "vlad" }],
   ["claim a distribution", () => me.claimDistribution(1, "50", ["ab".repeat(32)]), { type: "claim_distribution", distribution_id: 1, amount: (50n * FANG).toString(), proof: ["ab".repeat(32)] }],
   ["attest a revert", () => me.attestRevert(4, "ef".repeat(20)), { type: "attest_revert", claim_id: 4, revert_sha: "ef".repeat(20) }],
+  ["admit a validator (by name)", () => me.admitValidator("vlad.boo", { epoch: 3 }), { type: "admit_validator", validator: VALIDATOR, epoch: 3 }],
+  ["signal readiness", () => me.validatorReady(3), { type: "validator_ready", epoch: 3 }],
 ];
 for (const [label, run, want] of cases) assert.deepEqual(await action(run), want, label);
 console.log(`✓ ${cases.length} protocol v1 helpers sign the expected txs`);
@@ -165,6 +167,7 @@ const refused: [string, () => Promise<unknown>, RegExp][] = [
   ["zero shares", () => me.undelegate(VALIDATOR, "0"), /positive whole number/],
   ["unregistered validator name", () => me.delegate("nobody.boo", "1"), /isn't registered/],
   ["bad revert sha", () => me.attestRevert(1, "ab"), /40-hex/],
+  ["admission without an epoch (none in /api/status)", () => me.admitValidator(VALIDATOR), /epoch/],
 ];
 const posted = node.posted.length;
 for (const [label, run, re] of refused) await assert.rejects(run(), re, label);
