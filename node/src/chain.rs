@@ -5529,11 +5529,11 @@ mod scaffold {
         // Cancelling (F50): only what's scheduled, only `MIN_UPGRADE_LEAD` blocks ahead of it,
         // and the version number is spent (review-fix-ops-1): the fix ships as the next one.
         let lead = crate::upgrade::MIN_UPGRADE_LEAD;
-        assert!(crate::upgrade::exec_cancel_upgrade(s, &mut j, 8, 100, h).unwrap_err().to_string().contains("no upgrade to v8"));
-        assert!(crate::upgrade::exec_cancel_upgrade(s, &mut j, 9, 101, h).unwrap_err().to_string().contains("scheduled at block 100, not 101"));
-        assert!(crate::upgrade::exec_cancel_upgrade(s, &mut j, 9, 100, 100 - lead + 1).unwrap_err().to_string().contains("too late"));
+        assert!(crate::upgrade::exec_cancel_upgrade(s, &mut j, 8, 100, h, 0).unwrap_err().to_string().contains("no upgrade to v8"));
+        assert!(crate::upgrade::exec_cancel_upgrade(s, &mut j, 9, 101, h, 0).unwrap_err().to_string().contains("scheduled at block 100, not 101"));
+        assert!(crate::upgrade::exec_cancel_upgrade(s, &mut j, 9, 100, 100 - lead + 1, 0).unwrap_err().to_string().contains("too late"));
         assert_eq!(crate::upgrade::version_at(s, 100), 9, "a refused cancellation changes nothing");
-        let withdrawn = crate::upgrade::exec_cancel_upgrade(s, &mut j, 9, 100, 100 - lead).unwrap();
+        let withdrawn = crate::upgrade::exec_cancel_upgrade(s, &mut j, 9, 100, 100 - lead, 0).unwrap();
         assert_eq!(withdrawn, [crate::upgrade::ScheduledUpgrade { version: 9, activation_height: 100 }]);
         assert_eq!((crate::upgrade::version_at(s, 100), s.upgrade.schedule.len()), (crate::consensus::PROTOCOL_VERSION, 0));
         s.check_invariants().unwrap();

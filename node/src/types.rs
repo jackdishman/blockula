@@ -745,6 +745,21 @@ pub const MAX_RENEW_YEARS: u8 = 10;
 /// approved or expires, so it's bounded well below `MAX_TX_BYTES` (audit F17). A nested
 /// validator registration (~10.6 KiB: key and proof of possession) fits.
 pub const MAX_MULTISIG_ACTION_BYTES: usize = 12 << 10;
+/// Largest value of an integer field a tx carries as a JSON number rather than a string (ids,
+/// heights, PR numbers, nonces): 2^53 − 1, the largest a JavaScript number holds exactly
+/// (review-r2-clients-1). Clients compute `proposal_digest` and `action_digest` from the node's
+/// JSON of a stored proposal kind or multisig action, so a larger number, which would arrive
+/// rounded, would make it impossible to vote on or approve from JavaScript. Amounts travel as
+/// strings (`u64_str`) and aren't bounded by this.
+pub const MAX_JSON_INT: u64 = (1 << 53) - 1;
+
+/// [`MAX_JSON_INT`] for each named JSON-number field.
+fn check_json_ints(ints: &[(&str, u64)]) -> Result<()> {
+    if let Some((field, v)) = ints.iter().find(|(_, v)| *v > MAX_JSON_INT) {
+        bail!("{field} must be at most {MAX_JSON_INT} (2^53 − 1: it travels as a JSON number), not {v}");
+    }
+    Ok(())
+}
 
 /// What a juror commits to before revealing (hashed with BLAKE3). Mirrored in sdk-ts/src/tx.ts
 /// `seanceCommitment`.
@@ -1151,6 +1166,8 @@ impl Action {
 
     /// The action's own format rules (`Tx::check_format`). `nested`: inside a `MultisigPropose`.
     fn check_format(&self, nested: bool) -> Result<()> {
+        // First, so it's the rule a too-large number meets whatever else is wrong.
+        check_json_ints(&self.json_ints())?;
         let key_id_ok = |k: &str| k.len() == 64 && crypto::is_lower_hex(k);
         let addr = |field: &str, v: &str| -> Result<()> {
             if v.len() > MAX_ADDR {
@@ -1483,6 +1500,32 @@ impl Action {
         }
     }
 
+    /// The integer fields this action carries as JSON numbers (`u64` fields without `u64_str`;
+    /// a `Propose`'s include its kind's). [`MAX_JSON_INT`] bounds them all; a nested multisig
+    /// action is checked by its own `check_format`. `types::tests::json_number_fields_are_bounded`
+    /// pushes every vector action's JSON numbers past the bound, so a field missing here fails it.
+    fn json_ints(&self) -> Vec<(&'static str, u64)> {
+        match self {
+            Action::AddKey { role: KeyRole::Session { period_blocks, expires_at, .. }, .. } => vec![("period_blocks", *period_blocks), ("expires_at", *expires_at)],
+            Action::CreateHunt { issue, expires_at, .. } => vec![("issue", *issue), ("expires_at", *expires_at)],
+            Action::FundHunt { hunt_id, .. } | Action::CancelHunt { hunt_id } => vec![("hunt_id", *hunt_id)],
+            Action::AwardHunt { hunt_id, pr, .. } => vec![("hunt_id", *hunt_id), ("pr", *pr)],
+            Action::SetRepo { weight, .. } => vec![("weight", *weight)],
+            Action::GrantSoul { amount, .. } => vec![("amount", *amount)],
+            Action::SubmitClaim { pr, .. } => vec![("pr", *pr)],
+            Action::AttestClaim { claim_id, .. } | Action::RejectClaim { claim_id, .. } | Action::AttestRevert { claim_id, .. } => vec![("claim_id", *claim_id)],
+            Action::CommitVotes { seance_id, .. } => vec![("seance_id", *seance_id)],
+            Action::RevealVotes { seance_id, spam, .. } => std::iter::once(("seance_id", *seance_id)).chain(spam.iter().map(|id| ("spam", *id))).collect(),
+            Action::UpdateValidator { commission_bps, .. } => vec![("commission_bps", *commission_bps)],
+            Action::BeaconCommit { epoch, .. } | Action::BeaconReveal { epoch, .. } => vec![("epoch", *epoch)],
+            Action::Propose { kind, .. } => kind.json_ints(),
+            Action::Vote { proposal_id, .. } => vec![("proposal_id", *proposal_id)],
+            Action::MultisigApprove { id, .. } => vec![("id", *id)],
+            Action::ClaimDistribution { distribution_id, .. } => vec![("distribution_id", *distribution_id)],
+            _ => vec![],
+        }
+    }
+
     /// The action's JSON `type` (snake_case), e.g. `"delegate"`.
     pub fn kind(&self) -> &'static str {
         match self {
@@ -1685,8 +1728,23 @@ impl ProposalKind {
         Ok(k)
     }
 
+    /// The integer fields this kind carries as JSON numbers: at most [`MAX_JSON_INT`], so every
+    /// client computes its `proposal_digest` exactly (review-r2-clients-1).
+    fn json_ints(&self) -> Vec<(&'static str, u64)> {
+        match self {
+            ProposalKind::Distribution { distribution_id, claim_until, .. } => vec![("distribution_id", *distribution_id), ("claim_until", *claim_until)],
+            ProposalKind::SetRepo { weight, .. } => vec![("weight", *weight)],
+            ProposalKind::GrantSoul { amount, .. } => vec![("amount", *amount)],
+            ProposalKind::RejectClaim { claim_id, .. } => vec![("claim_id", *claim_id)],
+            ProposalKind::RefundHunt { hunt_id } => vec![("hunt_id", *hunt_id)],
+            ProposalKind::ScheduleUpgrade { activation_height, .. } | ProposalKind::CancelUpgrade { activation_height, .. } => vec![("activation_height", *activation_height)],
+            ProposalKind::ParamChange { .. } | ProposalKind::TreasurySpend { .. } | ProposalKind::FlagSybil { .. } | ProposalKind::Clawback { .. } | ProposalKind::UnlinkGithub { .. } | ProposalKind::ActivateFeature { .. } | ProposalKind::DeactivateFeature { .. } | ProposalKind::Text {} | ProposalKind::UnflagSybil { .. } => vec![],
+        }
+    }
+
     /// Stateless rules (stateful ones, like a parameter's bounds, apply when it executes).
     pub fn check(&self) -> Result<()> {
+        check_json_ints(&self.json_ints())?;
         match self {
             ProposalKind::ParamChange { key, .. } => {
                 if !crate::params::ChainParams::KEYS.contains(&key.as_str()) {
@@ -1936,6 +1994,7 @@ impl Tx {
         if self.chain_id.len() > MAX_CHAIN_ID {
             bail!("chain_id too long");
         }
+        check_json_ints(&[("nonce", self.nonce), ("valid_until", self.valid_until)])?;
         if self.genesis_hash.len() != 64 || !crypto::is_lower_hex(&self.genesis_hash) {
             bail!("genesis_hash must be the chain's genesis hash (32 bytes of lowercase hex, from /api/status)");
         }
