@@ -729,6 +729,7 @@ pub fn run(cmd: ReleaseCmd) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
 
     /// The vector `scripts/release-sig.mjs` checks (with @noble/post-quantum): the two
     /// implementations produce byte-identical signatures.
@@ -802,5 +803,273 @@ mod tests {
         assert!(check_tag(b"# blockula-release v0.5.0", "v0.5.0").is_ok());
         assert!(check_tag(b"# blockula-release v0.5.0 \n", "v0.5.0").is_err());
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("blockula-release-{tag}-{}-{}", crate::chain::now_ms(), std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_checksums(dir: &Path, tag: &str) {
+        let mut names: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).filter(|n| !n.starts_with("checksums.txt") && n != "INSTALL_SH_RAN").collect();
+        names.sort();
+        let mut text = format!("{TAG_LINE_PREFIX}{tag}\n");
+        for n in names {
+            text += &format!("{}  {n}\n", sha256_hex(&std::fs::read(dir.join(&n)).unwrap()));
+        }
+        std::fs::write(dir.join("checksums.txt"), text).unwrap();
+    }
+
+    fn sign_into(dir: &Path, key: &Keys) {
+        let checksums = std::fs::read(dir.join("checksums.txt")).unwrap();
+        std::fs::write(dir.join("checksums.txt.sig"), serde_json::to_string(&sign(key, &checksums)).unwrap()).unwrap();
+    }
+
+    /// A release in `dir` as release.yml and the offline signer make it: this machine's archive
+    /// (a `blockula` that reports `reports`), an install.sh that leaves a marker if anything runs
+    /// it, a genesis file, and checksums.txt naming `tag`, signed by `key`. Returns the marker.
+    fn fake_release(dir: &Path, tag: &str, key: &Keys, reports: &str) -> PathBuf {
+        let target = host_target().unwrap();
+        std::fs::create_dir_all(dir).unwrap();
+        let stage = dir.with_extension("stage");
+        let bin_dir = stage.join(format!("blockula-{target}"));
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("blockula"), format!("#!/bin/sh\necho \"{reports}\"\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(bin_dir.join("blockula"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let tar = Command::new("tar").arg("-czf").arg(dir.join(format!("blockula-{target}.tar.gz"))).arg("-C").arg(&stage).arg(format!("blockula-{target}")).status().unwrap();
+        assert!(tar.success());
+        let marker = dir.join("INSTALL_SH_RAN");
+        std::fs::write(dir.join("install.sh"), format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+        std::fs::write(dir.join("genesis-blockula-1.json"), "{\"chain_id\":\"blockula-1\"}\n").unwrap();
+        write_checksums(dir, tag);
+        sign_into(dir, key);
+        marker
+    }
+
+    fn from_dir(dir: &Path, key: Option<&str>, pin: &Path) -> SourceArgs {
+        SourceArgs { key_id: key.map(String::from), from: Some(format!("file://{}", dir.display())), pin_file: Some(pin.into()) }
+    }
+
+    fn reports(bin: &Path) -> Option<String> {
+        Command::new(bin).arg("--version").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    }
+
+    /// Audit F49 (round 3): `release install` is the operator's install and upgrade. It trusts the
+    /// key pinned at onboarding, not anything the release ships, and never runs install.sh.
+    #[test]
+    fn install_trusts_only_the_pinned_key_and_never_runs_install_sh() {
+        let t = scratch("install");
+        let (k, attacker) = (Keys::from_seed([3; 32]), Keys::from_seed([4; 32]));
+        let (kid, aid) = (key_id(&k.public_key()), key_id(&attacker.public_key()));
+        let pin = t.join("home/release-key-id");
+        let dest = t.join("bin/blockula");
+        let inst = |tag: &str, a: SourceArgs| install(tag, &a, Some(dest.clone()), false).map_err(|e| e.to_string());
+        let asset = format!("blockula-{}.tar.gz", host_target().unwrap());
+
+        let genuine = t.join("genuine");
+        let marker = fake_release(&genuine, "v9.9.9", &k, "blockula 9.9.9");
+        // Nothing pinned, no key id given (and none built in yet): nothing to check against.
+        assert!(inst("v9.9.9", from_dir(&genuine, None, &pin)).unwrap_err().contains("no release key id is pinned"));
+        // The first install pins the key id it was given, once the release verified.
+        inst("v9.9.9", from_dir(&genuine, Some(&kid.to_uppercase()), &pin)).unwrap();
+        assert_eq!(reports(&dest).as_deref(), Some("blockula 9.9.9"));
+        assert_eq!(read_pin(&pin).unwrap(), Some(kid.clone()));
+        assert!(!marker.exists(), "the release's install.sh ran");
+        // Upgrades check against the pin.
+        let next = t.join("next");
+        fake_release(&next, "v9.9.10", &k, "blockula 9.9.10");
+        inst("v9.9.10", from_dir(&next, None, &pin)).unwrap();
+        inst("v9.9.10", from_dir(&next, Some(&kid), &pin)).unwrap();
+        assert_eq!(reports(&dest).as_deref(), Some("blockula 9.9.10"));
+
+        // A release signed by another key (a compromised GitHub side re-signing it): refused, and
+        // passing its key id doesn't help: that's a new key, which takes a rotation statement.
+        let evil = t.join("evil");
+        let evil_marker = fake_release(&evil, "v9.9.11", &attacker, "blockula 9.9.11");
+        assert!(inst("v9.9.11", from_dir(&evil, None, &pin)).unwrap_err().contains(&format!("signed by key {aid}, not the release key {kid}")));
+        assert!(inst("v9.9.11", from_dir(&evil, Some(&aid), &pin)).unwrap_err().contains("rotation statement signed by the pinned one"));
+        // An archive swapped under the genuine signature.
+        let swapped = t.join("swapped");
+        fake_release(&swapped, "v9.9.11", &k, "blockula 9.9.11");
+        std::fs::OpenOptions::new().append(true).open(swapped.join(&asset)).unwrap().write_all(b"x").unwrap();
+        assert!(inst("v9.9.11", from_dir(&swapped, None, &pin)).unwrap_err().contains(&format!("{asset} doesn't match the signed checksums.txt")));
+        // An older, genuinely signed release served as the one asked for.
+        assert!(inst("v9.9.12", from_dir(&next, None, &pin)).unwrap_err().contains("it's for release \"v9.9.10\", not v9.9.12"));
+        // No signature, or a junk one.
+        let unsigned = t.join("unsigned");
+        fake_release(&unsigned, "v9.9.12", &k, "blockula 9.9.12");
+        std::fs::remove_file(unsigned.join("checksums.txt.sig")).unwrap();
+        assert!(inst("v9.9.12", from_dir(&unsigned, None, &pin)).unwrap_err().contains("no checksums.txt.sig"));
+        std::fs::write(unsigned.join("checksums.txt.sig"), "{}").unwrap();
+        assert!(inst("v9.9.12", from_dir(&unsigned, None, &pin)).unwrap_err().contains("isn't a release signature"));
+        // A binary that isn't the version asked for.
+        let liar = t.join("liar");
+        fake_release(&liar, "v9.9.13", &k, "blockula 9.9.99");
+        assert!(inst("v9.9.13", from_dir(&liar, None, &pin)).unwrap_err().contains("reports \"blockula 9.9.99\", not blockula 9.9.13"));
+        // Not a release tag.
+        assert!(inst("9.9.10", from_dir(&next, None, &pin)).unwrap_err().contains("vX.Y.Z"));
+        // None of that moved the pin or the installed binary, or ran a release's install.sh.
+        assert_eq!(read_pin(&pin).unwrap(), Some(kid.clone()));
+        assert_eq!(reports(&dest).as_deref(), Some("blockula 9.9.10"));
+        assert!(!evil_marker.exists() && !marker.exists());
+        // A pin file that isn't one is an error, never "nothing pinned".
+        std::fs::write(&pin, "not a key id\n").unwrap();
+        assert!(inst("v9.9.10", from_dir(&next, Some(&kid), &pin)).unwrap_err().contains("isn't a release key id pin"));
+        std::fs::remove_dir_all(t).ok();
+    }
+
+    /// The pin moves to a new key only with a rotation statement the pinned key signed.
+    #[test]
+    fn rotation_moves_the_pin_only_with_the_pinned_keys_signature() {
+        let t = scratch("rotation");
+        let (old, new, other) = (Keys::from_seed([5; 32]), Keys::from_seed([6; 32]), Keys::from_seed([7; 32]));
+        let (old_id, new_id, other_id) = (key_id(&old.public_key()), key_id(&new.public_key()), key_id(&other.public_key()));
+        let pin_file = t.join("release-key-id");
+        let p = |k: &str, r: Option<(&Path, &Path)>| pin(Some(k.into()), r.map(|(a, b)| (a.to_path_buf(), b.to_path_buf())), Some(pin_file.clone())).map_err(|e| e.to_string());
+        let statement = |from: &str, to: &str, by: &Keys, name: &str| -> (PathBuf, PathBuf) {
+            let text = format!("{ROTATION_HEADER}\nold {from}\nnew {to}\n");
+            let (f, s) = (t.join(name), t.join(format!("{name}.sig")));
+            std::fs::write(&f, &text).unwrap();
+            std::fs::write(&s, serde_json::to_string(&sign(by, text.as_bytes())).unwrap()).unwrap();
+            (f, s)
+        };
+        // Nothing to rotate from yet.
+        let (f, s) = statement(&old_id, &new_id, &old, "early.txt");
+        assert!(p(&new_id, Some((&f, &s))).unwrap_err().contains("nothing is pinned"));
+        p(&old_id, None).unwrap();
+        p(&old_id, None).unwrap();
+        assert!(p(&new_id, None).unwrap_err().contains("needs a rotation statement signed by"));
+        // Signed by the new key itself (or anyone but the pinned key): refused.
+        let (f, s) = statement(&old_id, &new_id, &new, "self.txt");
+        assert!(p(&new_id, Some((&f, &s))).unwrap_err().contains("not the release key"));
+        // Signed by the pinned key, but naming another new key, or rotating from another key.
+        let (f, s) = statement(&old_id, &other_id, &old, "other.txt");
+        assert!(p(&new_id, Some((&f, &s))).unwrap_err().contains("names"));
+        let (f, s) = statement(&other_id, &new_id, &old, "from-other.txt");
+        assert!(p(&new_id, Some((&f, &s))).unwrap_err().contains("rotates away from"));
+        // A file the pinned key signed for another purpose (a release's checksums.txt) isn't one.
+        let checksums = t.join("checksums.txt");
+        std::fs::write(&checksums, format!("{TAG_LINE_PREFIX}v1.0.0\n{}  install.sh\n", "a".repeat(64))).unwrap();
+        std::fs::write(t.join("checksums.txt.sig"), serde_json::to_string(&sign(&old, &std::fs::read(&checksums).unwrap())).unwrap()).unwrap();
+        assert!(p(&new_id, Some((&checksums, &t.join("checksums.txt.sig")))).unwrap_err().contains("three lines"));
+        assert_eq!(read_pin(&pin_file).unwrap(), Some(old_id.clone()));
+        // The genuine statement.
+        let (f, s) = statement(&old_id, &new_id, &old, "rotation.txt");
+        p(&new_id, Some((&f, &s))).unwrap();
+        assert_eq!(read_pin(&pin_file).unwrap(), Some(new_id.clone()));
+        // ...which can't pass for a release.
+        assert!(check_tag(&std::fs::read(&f).unwrap(), "v1.0.0").is_err());
+        // Replaying it now does nothing: the pinned key is the new one.
+        assert!(p(&new_id, Some((&f, &s))).unwrap_err().contains("not the release key"));
+        assert!(parse_rotation(format!("{ROTATION_HEADER}\nold {old_id}\nnew {old_id}\n").as_bytes()).is_err());
+        assert!(parse_rotation(format!("{ROTATION_HEADER}\nold {old_id}\nnew {new_id}\nextra\n").as_bytes()).is_err());
+        assert!(parse_rotation(format!("{ROTATION_HEADER}\nnew {new_id}\nold {old_id}\n").as_bytes()).is_err());
+        std::fs::remove_dir_all(t).ok();
+    }
+
+    #[test]
+    fn checksums_parse_strictly() {
+        let h = "ab".repeat(32);
+        let ok = format!("{TAG_LINE_PREFIX}v1.2.3\n{h}  blockula-x86_64-unknown-linux-gnu.tar.gz\n{h}  install.sh\n");
+        let files = parse_checksums(ok.as_bytes(), "v1.2.3").unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(parse_checksums(ok.trim_end().as_bytes(), "v1.2.3").is_ok());
+        assert!(parse_checksums(ok.as_bytes(), "v1.2.4").is_err());
+        for bad in [
+            format!("{TAG_LINE_PREFIX}v1.2.3\n"),
+            format!("{TAG_LINE_PREFIX}v1.2.3\n{h}\tinstall.sh\n"),
+            format!("{TAG_LINE_PREFIX}v1.2.3\n{h} install.sh\n"),
+            format!("{TAG_LINE_PREFIX}v1.2.3\n{}  install.sh\n", h.to_uppercase()),
+            format!("{TAG_LINE_PREFIX}v1.2.3\n{h}  ../install.sh\n"),
+            format!("{TAG_LINE_PREFIX}v1.2.3\n{h}  dir/install.sh\n"),
+            format!("{TAG_LINE_PREFIX}v1.2.3\n{h}  .hidden\n"),
+            format!("{TAG_LINE_PREFIX}v1.2.3\n{h}  install.sh\n{h}  install.sh\n"),
+            format!("{TAG_LINE_PREFIX}v1.2.3\n{h}  install.sh\r\n"),
+            format!("{TAG_LINE_PREFIX}v1.2.3\n{h}  install.sh\n\n{h}  x.json\n"),
+            format!("{h}  install.sh\n"),
+        ] {
+            assert!(parse_checksums(bad.as_bytes(), "v1.2.3").is_err(), "accepted {bad:?}");
+        }
+    }
+
+    /// `release fetch` leaves only verified files (the genesis file the validator runbook uses).
+    #[test]
+    fn fetch_keeps_only_verified_files() {
+        let t = scratch("fetch");
+        let k = Keys::from_seed([8; 32]);
+        let kid = key_id(&k.public_key());
+        let pin = t.join("release-key-id");
+        let rel = t.join("rel");
+        fake_release(&rel, "v9.9.9", &k, "blockula 9.9.9");
+        let files = vec!["genesis-blockula-1.json".to_string(), "install.sh".to_string()];
+        let out = t.join("verified");
+        fetch("v9.9.9", &from_dir(&rel, Some(&kid), &pin), &out, &files).unwrap();
+        for f in files.iter().map(String::as_str).chain(["checksums.txt", "checksums.txt.sig"]) {
+            assert_eq!(std::fs::read(out.join(f)).unwrap(), std::fs::read(rel.join(f)).unwrap(), "{f}");
+        }
+        assert_eq!(read_pin(&pin).unwrap(), Some(kid.clone()));
+        // Only into a new or empty directory.
+        assert!(fetch("v9.9.9", &from_dir(&rel, None, &pin), &out, &files).unwrap_err().to_string().contains("new or empty directory"));
+        // A tampered file leaves nothing behind.
+        std::fs::write(rel.join("genesis-blockula-1.json"), "{\"chain_id\":\"evil\"}\n").unwrap();
+        let out2 = t.join("verified2");
+        assert!(fetch("v9.9.9", &from_dir(&rel, None, &pin), &out2, &files).unwrap_err().to_string().contains("doesn't match the signed checksums.txt"));
+        assert!(!out2.exists());
+        // A file the release doesn't list.
+        assert!(fetch("v9.9.9", &from_dir(&rel, None, &pin), &out2, &["genesis-blockula-2.json".into()]).unwrap_err().to_string().contains("isn't in release v9.9.9's signed checksums.txt"));
+        assert!(fetch("v9.9.9", &from_dir(&rel, None, &pin), &out2, &["../checksums.txt".into()]).is_err());
+        std::fs::remove_dir_all(t).ok();
+    }
+
+    /// Over HTTP, as from GitHub (whose download URLs redirect): the same checks, and a source
+    /// can't send more than the limit.
+    #[test]
+    fn install_over_http_follows_redirects_and_caps_sizes() {
+        let t = scratch("http");
+        let k = Keys::from_seed([9; 32]);
+        let kid = key_id(&k.public_key());
+        let rel = t.join("rel");
+        fake_release(&rel, "v9.9.9", &k, "blockula 9.9.9");
+        let root = rel.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async move {
+                use axum::extract::Path as P;
+                let app = axum::Router::new()
+                    .route("/download/{name}", axum::routing::get(|P(name): P<String>| async move { axum::response::Redirect::temporary(&format!("/objects/{name}")) }))
+                    .route("/objects/{name}", axum::routing::get(move |P(name): P<String>| { let root = root.clone(); async move { std::fs::read(root.join(name)).map_err(|_| axum::http::StatusCode::NOT_FOUND) } }));
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                tx.send(listener.local_addr().unwrap()).unwrap();
+                axum::serve(listener, app).await.unwrap();
+            });
+        });
+        let base = format!("http://{}/download", rx.recv().unwrap());
+        let pin = t.join("release-key-id");
+        let dest = t.join("bin/blockula");
+        let args = SourceArgs { key_id: Some(kid.clone()), from: Some(base.clone()), pin_file: Some(pin.clone()) };
+        install("v9.9.9", &args, Some(dest.clone()), false).unwrap();
+        assert_eq!(reports(&dest).as_deref(), Some("blockula 9.9.9"));
+        let source = Source::new(Some(&base), "v9.9.9").unwrap();
+        assert!(source.get("install.sh", 8).unwrap_err().to_string().contains("larger than 8 bytes"));
+        assert!(source.get("missing.txt", 8).unwrap().is_none());
+        std::fs::remove_file(rel.join("checksums.txt.sig")).unwrap();
+        assert!(install("v9.9.9", &args, Some(dest.clone()), false).unwrap_err().to_string().contains("no checksums.txt.sig"));
+        std::fs::remove_dir_all(t).ok();
+    }
+
+    /// The built-in key id (filled in at the key ceremony) is a key id, and the same as
+    /// install.sh's.
+    #[test]
+    fn built_in_key_id_matches_install_sh() {
+        assert!(BUILTIN_KEY_ID.is_empty() || normalize_key_id(BUILTIN_KEY_ID).ok().as_deref() == Some(BUILTIN_KEY_ID));
+        let script = include_str!("../../scripts/install.sh");
+        let line = script.lines().find(|l| l.starts_with("BUILTIN_KEY_ID=\"")).expect("install.sh has a BUILTIN_KEY_ID line");
+        assert_eq!(line, format!("BUILTIN_KEY_ID=\"{BUILTIN_KEY_ID}\""), "install.sh and release_cli.rs must build in the same release key id");
     }
 }
