@@ -49,7 +49,8 @@
 //!   them per block ([`BlockBudget`], consensus.rs; both as the block's fee slot fixed them
 //!   `econ::FEE_LAG` blocks ahead), at most [`MAX_MEMPOOL_GHOST`] queued; a queued spend of a
 //!   note is replaced, and a full ghost share gives up its cheapest tx, only for a tip higher by
-//!   a tenth and the relay of the newcomer's bytes ([`mempool_admit`]).
+//!   a tenth and the relay of the newcomer's bytes ([`mempool_admit`]). A queued shield is its
+//!   sender's last queued tx, which only its sender's own shield can replace ([`behind_shield`]).
 //!
 //! State (namespaces `state::ns` 48–52, 53–55 reserved; the scalars are the META record `ghost`):
 //!
@@ -84,10 +85,10 @@ pub const MAX_MEMPOOL_GHOST: usize = 256;
 /// on a grid, txs priced the canonical way ([`canonical_fee`]) share a handful of values (audit
 /// F38). Execution refuses anything else.
 pub const FEE_GRID: u64 = DROPS_PER_FANG / 1_000;
-/// A queued ghost tx is displaced (replaced by a spend of the same note, or evicted from a full
-/// ghost share) only by a tip higher than its own by at least 1/`BUMP_DIVISOR` of it and by at
-/// least the base fee of the newcomer's bytes: every displacement pays to relay itself (audit
-/// F39, BIP-125's rules 3 and 4).
+/// A queued ghost tx is displaced (replaced by a spend of the same note or, a shield, by its
+/// sender's shield at its nonce, or evicted from a full ghost share) only by a tip higher than
+/// its own by at least 1/`BUMP_DIVISOR` of it and by at least the base fee of the newcomer's
+/// bytes: every displacement pays to relay itself (audit F39, BIP-125's rules 3 and 4).
 const BUMP_DIVISOR: u64 = 10;
 /// `/api/ghost` lists at most this many retired anchors, newest first.
 const LISTED_ROOTS: usize = 64;
@@ -782,61 +783,104 @@ pub fn status_json(state: &State, height: u64) -> Value {
     })
 }
 
-/// The least tip that displaces queued tx `q` (see [`BUMP_DIVISOR`]): `q`'s tip plus the larger
-/// of a tenth of it and `relay` (the base fee of the newcomer's bytes), on the fee grid.
-fn displacing_tip(q: &Tx, relay: u64) -> u64 {
-    let bump = (q.tip / BUMP_DIVISOR).max(relay).max(1);
-    q.tip.saturating_add(bump).div_ceil(FEE_GRID).saturating_mul(FEE_GRID)
+/// The least tip that displaces queued txs tipping `tip` together (see [`BUMP_DIVISOR`]): `tip`
+/// plus the larger of a tenth of it and `relay` (the base fee of the newcomer's bytes), on the
+/// fee grid.
+fn displacing_tip(tip: u64, relay: u64) -> u64 {
+    let bump = (tip / BUMP_DIVISOR).max(relay).max(1);
+    tip.saturating_add(bump).div_ceil(FEE_GRID).saturating_mul(FEE_GRID)
 }
 
-fn displaces(tx: &Tx, q: &Tx, relay: u64) -> bool {
-    tx.tip >= displacing_tip(q, relay) && TipRate::of(tx) > TipRate::of(q)
+/// Whether `tx` displaces what tips `cost` together (one queued tx, or a shield with what its
+/// sender queued behind it): a tip that clears [`displacing_tip`], and a higher tip per byte.
+fn displaces(tx: &Tx, cost: TipRate, relay: u64) -> bool {
+    tx.tip >= displacing_tip(cost.tip, relay) && TipRate::of(tx) > cost
+}
+
+/// Review of F36, round 3: a queued `Shield` is always its sender's last queued tx, so a full
+/// ghost share can always give it up for a higher tip (no tx of its sender waits behind it on
+/// the nonce it would free) and nobody can pin the share with shields covered by a tx of their
+/// own. `Chain::submit_tx` calls this for every tx from a sender with `shield` queued (at
+/// `tx.nonce` or below; `last`: whether it's the sender's last queued tx, which the node keeps
+/// so): a tx at a later nonce is refused (wait until the shield is included, or replace it),
+/// and one at its nonce replaces it if it's a shield (from the same account, so nothing else
+/// of anyone's goes) that displaces it. `relay`: the base fee of `tx`'s bytes; `hint`: that
+/// of the shield's, the replacement's size a refusal names a tip for.
+pub fn behind_shield(shield: &Tx, last: bool, tx: &Tx, relay: u64, hint: u64) -> Result<()> {
+    let n = shield.nonce;
+    if tx.nonce > n || !last {
+        bail!("your shield (nonce {n}) is waiting in the mempool, and nothing queues behind a shield (so a full ghost share can always give it up for a higher tip): wait until it's included, or replace it with a shield at nonce {n} tipping at least {} drops", displacing_tip(shield.tip, hint));
+    }
+    if !matches!(tx.action, Action::Shield { .. }) {
+        bail!("only a shield replaces your queued shield (nonce {n}): wait until it's included, then send this at nonce {}", n + 1);
+    }
+    if !displaces(tx, TipRate::of(shield), relay) {
+        bail!("to replace your queued shield (nonce {n}), tip at least {} drops (and the fee to cover it)", displacing_tip(shield.tip, relay));
+    }
+    Ok(())
 }
 
 /// Mempool admission of a ghost tx (`Chain::submit_tx`) against the queued txs: one queued spend
 /// per note, and at most [`MAX_MEMPOOL_GHOST`] ghost txs. A tx spending a nullifier a queued tx
 /// spends replaces it, and a full ghost share gives up its lowest tip per byte (the newest
 /// among equals, like `Chain::eviction_victim`; only when `evict`), only for a tip that clears
-/// [`displacing_tip`]: higher tips get in (audit F36), and every displacement pays the relay of
-/// its own bytes (F39). Only an unsigned tx, or another sender's last queued tx, can be given up
-/// (a signed `Shield` from the middle of its sender's queue would leave the txs behind it waiting
-/// on a nonce gap, and the newcomer's own would leave it behind one: review of F36), and a
-/// sender can't replace its own queued tx (its nonce is taken). `relay`: the base fee of `tx`'s
-/// bytes; `cap`: the most it may tip (`econ::max_tip`). Returns the ids it displaces, with why.
-pub fn mempool_admit(queued: &[Tx], ids: &[String], tx: &Tx, relay: u64, cap: u64, evict: bool) -> Result<Vec<(String, &'static str)>> {
+/// [`displacing_tip`]: a higher tip always gets in (audit F36), and every displacement pays the
+/// relay of its own bytes (F39). Any queued ghost tx but the newcomer's sender's own can go (its
+/// own would leave the newcomer behind a nonce gap, and its nonce is taken: review of F36).
+/// A signed one (a `Shield`) goes with its sender's later txs, if any (they'd wait on a nonce
+/// gap: `Chain::displace` drops them), and the newcomer outbids them together. The node never
+/// queues a tx behind a shield ([`behind_shield`]), so that's the shield alone; round 2 kept
+/// such shields instead, and 256 of them, each covered by a cheap tx of its sender, locked the
+/// share against any tip (review of F36, round 3). `own`: the index of the sender's queued
+/// shield `tx` replaces ([`behind_shield`]), left out (of the count, the notes and what can go).
+/// `relay`: the base fee of `tx`'s bytes; `cap`: the most it may tip (`econ::max_tip`).
+/// Returns the ids it displaces, with why.
+pub fn mempool_admit(queued: &[Tx], ids: &[String], tx: &Tx, own: Option<usize>, relay: u64, cap: u64, evict: bool) -> Result<Vec<(String, &'static str)>> {
     let Some(b) = tx.action.ghost_bundle() else { return Ok(vec![]) };
+    let kept = |i: usize| Some(i) != own;
     // Each sender's last queued tx (arrival order is each sender's nonce order).
     let mut last: HashMap<&str, usize> = HashMap::new();
-    for (i, q) in queued.iter().enumerate().filter(|(_, q)| !q.is_unsigned()) {
+    for (i, q) in queued.iter().enumerate().filter(|(i, q)| kept(*i) && !q.is_unsigned()) {
         last.insert(q.from.as_str(), i);
     }
-    let evictable = |i: usize, q: &Tx| q.is_unsigned() || (q.from != tx.from && last.get(q.from.as_str()) == Some(&i));
+    // What giving queued tx `i` up takes out: it, and if it's signed and not its sender's last,
+    // the sender's later txs too.
+    let cost = |i: usize, q: &Tx| -> TipRate {
+        if q.is_unsigned() || last.get(q.from.as_str()) == Some(&i) {
+            return TipRate::of(q);
+        }
+        let then = queued.iter().enumerate().skip(i).filter(|(j, t)| kept(*j) && !t.is_unsigned() && t.from == q.from);
+        then.fold(TipRate { tip: 0, size: 0 }, |c, (_, t)| TipRate { tip: c.tip.saturating_add(t.tip), size: c.size.saturating_add(t.size()) })
+    };
     let mut ghosts = 0;
     let mut replaces = vec![];
     // The lowest tip per byte queued that may go (newest among equals).
-    let mut lowest: Option<(&Tx, &String)> = None;
-    for (i, (q, id)) in queued.iter().zip(ids).enumerate() {
+    let mut lowest: Option<(TipRate, &String)> = None;
+    for (i, (q, id)) in queued.iter().zip(ids).enumerate().filter(|(i, _)| kept(*i)) {
         let Some(qb) = q.action.ghost_bundle() else { continue };
         ghosts += 1;
-        if evictable(i, q) && lowest.is_none_or(|(l, _)| TipRate::of(q) <= TipRate::of(l)) {
-            lowest = Some((q, id));
+        let c = cost(i, q);
+        if (q.is_unsigned() || q.from != tx.from) && lowest.as_ref().is_none_or(|(l, _)| c <= *l) {
+            lowest = Some((c, id));
         }
         if qb.nullifiers.iter().any(|n| b.nullifiers.contains(n)) {
             if !q.is_unsigned() && q.from == tx.from {
                 bail!("your queued transaction with nonce {} already spends one of these notes", q.nonce);
             }
-            if !displaces(tx, q, relay) {
-                bail!("a queued transaction already spends one of these notes; to replace it, pay a tip of at least {} drops (its {} plus the relay of yours) and the fee to cover it", displacing_tip(q, relay), q.tip);
+            if !displaces(tx, c, relay) {
+                bail!("a queued transaction already spends one of these notes; to replace it, pay a tip of at least {} drops (its {} plus the relay of yours) and the fee to cover it", displacing_tip(c.tip, relay), c.tip);
             }
             replaces.push((id.clone(), "replaced by a transaction spending the same note with a higher tip"));
         }
     }
     if replaces.is_empty() && ghosts >= MAX_MEMPOOL_GHOST {
+        // An unsigned tx tips a whole multiple of the grid (review of fix-fees-2).
+        let cap = if tx.is_unsigned() { cap / FEE_GRID * FEE_GRID } else { cap };
         return match lowest {
-            Some((q, id)) if evict && displaces(tx, q, relay) => Ok(vec![(id.clone(), "evicted from the mempool's full ghost share by a transaction with a higher tip")]),
+            Some((c, id)) if evict && displaces(tx, c, relay) => Ok(vec![(id.clone(), "evicted from the mempool's full ghost share by a transaction with a higher tip")]),
             // Review of fix-fees: never ask for a tip past the cap.
-            Some((q, _)) if displacing_tip(q, relay) > cap => bail!("the mempool holds its maximum of {MAX_MEMPOOL_GHOST} ghost transactions, and they tip more than this one may (at most {cap} drops); try again shortly"),
-            Some((q, _)) => bail!("the mempool holds its maximum of {MAX_MEMPOOL_GHOST} ghost transactions; resubmit with a tip of at least {} drops (and the fee to cover it), or try again shortly", displacing_tip(q, relay)),
+            Some((c, _)) if displacing_tip(c.tip, relay) > cap => bail!("the mempool holds its maximum of {MAX_MEMPOOL_GHOST} ghost transactions, and they tip more than this one may (at most {cap} drops); try again shortly"),
+            Some((c, _)) => bail!("the mempool holds its maximum of {MAX_MEMPOOL_GHOST} ghost transactions; resubmit with a tip of at least {} drops (and the fee to cover it), or try again shortly", displacing_tip(c.tip, relay)),
             None => bail!("the mempool holds its maximum of {MAX_MEMPOOL_GHOST} ghost transactions; try again shortly"),
         };
     }
