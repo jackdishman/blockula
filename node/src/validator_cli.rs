@@ -160,15 +160,24 @@ async fn send(remote: &Remote, keys: &Keys, from: &str, action: Action) -> Resul
 
 /// Signs for the chain `remote` was pinned to (`cli_net`), from a status checked against it.
 pub(crate) async fn send_memo(remote: &Remote, keys: &Keys, from: &str, action: Action, memo: String) -> Result<Value> {
+    send_memo_with(remote, keys, from, |_| Ok(action), memo).await
+}
+
+/// [`send_memo`] for an action that carries an absolute height (an expiry, a deadline): `make`
+/// builds it from the height `valid_until` counts from, one status read, so a node that lies
+/// about the height can stretch it by at most the validity window (audit gap-7-3).
+pub(crate) async fn send_memo_with(remote: &Remote, keys: &Keys, from: &str, make: impl FnOnce(u64) -> Result<Action>, memo: String) -> Result<Value> {
     let rpc = remote.rpc.as_str();
     let status = remote.status().await?;
+    let height = status["height"].as_u64().ok_or_else(|| anyhow!("{rpc} doesn't report its height"))?;
+    let action = make(height)?;
     let nonce = match get(rpc, &format!("/account/{from}")).await {
         Ok(a) => a["next_nonce"].as_u64().unwrap_or(0),
         Err(_) => 0,
     };
     // Valid for 600 blocks (or the chain's maximum, if shorter).
     let validity = status["max_tx_validity_blocks"].as_u64().unwrap_or(600).min(600);
-    let valid_until = status["height"].as_u64().unwrap_or(0) + validity;
+    let valid_until = height + validity;
     let mut tx = Tx { chain_id: remote.chain_id.clone(), genesis_hash: remote.genesis_hash.clone(), from: from.into(), nonce, fee: 0, tip: 0, valid_until, action, memo, public_key: hex::encode(keys.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
     // The highest base fee fixed for the next blocks (`/api/fees`); only the actual one is charged.
     let fees = get(rpc, "/fees").await?;
@@ -412,8 +421,8 @@ pub fn wallet(cmd: WalletCmd, dir: &Path) -> Result<()> {
             let amount = parse_fang(&amount)?;
             let tx = rt()?.block_on(async {
                 let remote = Remote::connect(dir, &rpc, &pin).await?;
-                // Resolve names here so we sign the exact recipient address (and show it).
-                let to = remote.resolve(&to).await?;
+                // A name is signed as the name: the chain resolves it, not this node (audit gap-7-1).
+                let to = crate::cli_net::account_ref(&to)?;
                 send_memo(&remote, &keys, &remote.address(&keys), Action::Transfer { to, amount }, memo).await
             })?;
             println!("✓ {}", tx["summary"].as_str().unwrap_or_default());
