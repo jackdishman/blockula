@@ -26,7 +26,7 @@
 - **Names change hands by offer and acceptance.** `transferName(name, to)` only offers it; it's the recipient's once they call `acceptName(name)`, so nobody can be given a name (and the label it puts on them) without saying yes.
 - **Explorer links:** `{rpc}/#/tx/{id}`, `{rpc}/#/account/{name}`, `{rpc}/#/block/{height}`, `{rpc}/#/name/{name}`, `{rpc}/#/proposal/{id}`, `{rpc}/#/validators`, `{rpc}/#/governance`, `{rpc}/#/params`.
 
-## Protocol v1 actions (tags 30–49)
+## Protocol v1 actions (tags 30–49, 60–61)
 
 Every action has an SDK `Wallet` helper that builds, signs and submits it (and waits for it). All of them run on chains with this release. Ghost Mode's actions (tags 50–54: `shield`, `private_transfer`, `unshield`, `set_ghost_address`, `ghost_pause`; [docs/GHOST-MODE.md](docs/GHOST-MODE.md)) are built but off: nodes refuse them with "Ghost Mode is off" until governance activates the `ghost` feature (an `ActivateFeature` proposal, ⅔ supermajority). Tags 60–61 are for a set of one or two members: its next newcomer joins only once a quorum of the members admitted it and its node signaled readiness in the epoch's last tenth.
 
