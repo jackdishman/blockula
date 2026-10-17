@@ -1506,7 +1506,7 @@ mod tests {
         };
         let (base, hits) = chunk_servers(chunks.clone()).await;
         let client = reqwest::Client::new();
-        let limits = DownloadLimits { chunk_timeout: std::time::Duration::from_millis(500), slow: std::time::Duration::from_millis(250), per_chunk: std::time::Duration::from_millis(100), slack: std::time::Duration::from_secs(5) };
+        let limits = DownloadLimits { chunk_timeout: std::time::Duration::from_millis(500), slow: std::time::Duration::from_millis(250), per_chunk: std::time::Duration::from_millis(100), slack: std::time::Duration::from_secs(5), ..DownloadLimits::default() };
         let get = |who: &[&str], limits: DownloadLimits| {
             let (client, v, hits) = (client.clone(), &v, &hits);
             let sources: Vec<String> = who.iter().map(|w| format!("{base}/{w}")).collect();
