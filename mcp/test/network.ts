@@ -8,7 +8,7 @@
 //    remembers the chain across restarts, and notices a node that switches mid-session.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -20,7 +20,7 @@ import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { RELEASE_SIGNATURE_FORMAT, releaseMessage } from "@blockula/sdk";
 import { KNOWN_GENESIS, KnownChains, LOCAL_RPC, TESTNET_RPC, completePin, effectivePin, mismatch, networkArg, resolveNetwork } from "../src/network.js";
-import { checkBinaryVersion, fetchVerifiedRelease, latestTagFrom, releaseKeyIdFrom, type ReleaseDeps } from "../src/release.js";
+import { RELEASE_KEY_ID, binPaths, checkBinaryVersion, fetchVerifiedRelease, latestTagFrom, readReleasePin, releaseKeyIdFrom, type ReleaseDeps } from "../src/release.js";
 
 const G1 = "11".repeat(32);
 const G2 = "22".repeat(32);
@@ -177,7 +177,39 @@ assert.equal(releaseKeyIdFrom(undefined, keyId), keyId);
 assert.equal(releaseKeyIdFrom(keyId, keyId), keyId);
 assert.throws(() => releaseKeyIdFrom("cd".repeat(32), keyId), /isn't BLOCKULA_RELEASE_KEY_ID/);
 assert.throws(() => releaseKeyIdFrom("abc", ""), /64 hex characters/);
-console.log(`✓ install_node: version binding, checksum, provenance and signature checks (${releaseRefusals.length} bad releases refused)`);
+// Audit review-r3-integrate-compose-1: the operator's pin (`blockula release install` writes
+// $BLOCKULA_HOME/release-key-id) binds install_node too, with release_cli.rs read_pin's rules.
+const pinDir = mkdtempSync(join(tmpdir(), "blockula-mcp-pin-"));
+const pinFile = join(pinDir, "release-key-id");
+assert.equal(readReleasePin(pinFile), null, "no pin");
+writeFileSync(pinFile, ` ${keyId.toUpperCase()}\n`);
+chmodSync(pinFile, 0o644);
+assert.equal(readReleasePin(pinFile), keyId);
+chmodSync(pinFile, 0o664);
+assert.throws(() => readReleasePin(pinFile), /writable by others/);
+chmodSync(pinFile, 0o644);
+writeFileSync(pinFile, "not a key id\n");
+assert.throws(() => readReleasePin(pinFile), /isn't a release key id pin/);
+// Every key id that's set must agree: the pin, BLOCKULA_RELEASE_KEY_ID and the built-in one.
+const otherId = "cd".repeat(32);
+assert.equal(releaseKeyIdFrom(undefined, "", keyId, pinFile), keyId);
+assert.equal(releaseKeyIdFrom(keyId, keyId, keyId, pinFile), keyId);
+assert.throws(() => releaseKeyIdFrom(otherId, "", keyId, pinFile), /pinned in .* is [0-9a-f]{64}, not BLOCKULA_RELEASE_KEY_ID/);
+assert.throws(() => releaseKeyIdFrom(undefined, otherId, keyId, pinFile), /built with release key [0-9a-f]{64}, but .* pins [0-9a-f]{64}/);
+// The finding's case: nothing built into this MCP, the operator pinned K, and GitHub serves a
+// release with provenance and no signature. Before, provenance alone installed it; now the pin
+// requires the signature.
+await assert.rejects(fetchVerifiedRelease(base, asset, opts(releaseKeyIdFrom(undefined, "", keyId, pinFile), false), deps({ ...files, "checksums.txt.sig": null }, "ok")), /no checksums.txt.sig/);
+await assert.rejects(fetchVerifiedRelease(base, asset, opts(releaseKeyIdFrom(undefined, "", keyId, pinFile), false), deps({ ...files, "checksums.txt.sig": sig(sums, other) }, "ok")), /signature check FAILED/);
+rmSync(pinDir, { recursive: true, force: true });
+// install_node's binary has a path of its own, never the one `blockula release install` writes.
+assert.notEqual(binPaths("/h").mcp, binPaths("/h").cli);
+assert.equal(binPaths("/h").cli, join("/h", "bin", "blockula"));
+// The built-in key id is the same in all three copies (release_cli.rs checks it too).
+const builtIn = (file: string, re: RegExp) => re.exec(readFileSync(new URL(file, import.meta.url), "utf8"))?.[1];
+assert.equal(builtIn("../../node/src/release_cli.rs", /^pub const BUILTIN_KEY_ID: &str = "([0-9a-f]*)";$/m), RELEASE_KEY_ID, "release_cli.rs BUILTIN_KEY_ID");
+assert.equal(builtIn("../../scripts/install.sh", /^BUILTIN_KEY_ID="([0-9a-f]*)"$/m), RELEASE_KEY_ID, "install.sh BUILTIN_KEY_ID");
+console.log(`✓ install_node: version binding, checksum, provenance and signature checks (${releaseRefusals.length} bad releases refused), the pinned key, its own install path`);
 
 // ---- 4. the server, over stdio, against a fake node ----
 

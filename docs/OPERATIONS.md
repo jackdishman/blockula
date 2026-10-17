@@ -603,7 +603,7 @@ Every release is reproducible, carries SLSA build provenance, and is signed offl
    ```
 
    `scripts/check-release-files.sh` refuses unless the tag is the commit you reviewed, the first line is `# blockula-release vX.Y.Z`, both Linux archives are listed with the hashes the builders rebuilt (and they agree), `install.sh`, every `genesis-<id>.json` and every `checkpoints-<id>.json` hash exactly like the commit's `scripts/install.sh`, `genesis/<id>/genesis.json` and `node/checkpoints/<id>.json` (and all of the commit's are listed), the four archives are listed, and nothing else is (audit F49, review-r2-supply-4). Provenance adds that the files came out of the release workflow.
-4. **Sign offline.** Carry `checksums.txt` (only that file) to the offline signing machine. It holds the release key and one `blockula` binary, and nothing else: no checkout, no `npm ci`, no Node.js tooling. A signing process trusts every line of code it loads, and the monorepo's npm tree (the wallet's toolchain included, with install scripts) is far more than the signer needs (audit supply-chain-B-4). The binary is one the signer verified before taking it offline: their own reproduced build (step 2's `scripts/reproduce-release.sh`, whose archive matched; take `blockula` out of it), or a release installed as in [Installing and upgrading](#installing-and-upgrading). Note its SHA-256 in the release issue, and carry new binaries over only the same way.
+4. **Sign offline.** Carry `checksums.txt` (only that file) to the offline signing machine. It holds the release key and one `blockula` binary, and nothing else: no checkout, no `npm ci`, no Node.js tooling. A signing process trusts every line of code it loads, and the monorepo's npm tree (the wallet's toolchain included, with install scripts) is far more than the signer needs (audit supply-chain-B-4). The binary is one the signer verified before taking it offline: their own reproduced build (step 2's `scripts/reproduce-release.sh`, whose archive matched; take `blockula` out of it), or a release fetched and checked as in [To an offline machine](#to-an-offline-machine). Note its SHA-256 in the release issue, and carry new binaries over only the same way. A binary built with an older release key than the one signing (after a rotation) checks the new key's signatures only once its pin is moved by the rotation statement (`blockula release pin --key-id <new> --rotation …`, as operators do).
 
    ```bash
    blockula release selftest                          # this binary signs the known-answer vector
@@ -621,8 +621,8 @@ Every release is reproducible, carries SLSA build provenance, and is signed offl
 ### The release key
 
 - One ML-DSA-65 key, generated on the offline signing machine (set up as in step 4 above: the key and a verified `blockula`, nothing else) with `blockula keygen > release-key.json`. Its **key id** is the hex BLAKE3 of the public key: `blockula release keyid --key release-key.json`. The key doesn't exist yet; generate it this way from the start, never on a machine that has had a checkout or an npm tree.
-- Publish the key id in SECURITY.md, this file, `scripts/install.sh` (`BUILTIN_KEY_ID`), `node/src/release_cli.rs` (`BUILTIN_KEY_ID`, the key a fresh `blockula release install` trusts when nothing is pinned; a test keeps the two equal), the website, the operators' channel and the project's social accounts, so a single compromised channel can't swap it. **Release key id:** *not generated yet* (the maintainer fills this in at the key ceremony).
-- **Operators pin it once.** Their first `blockula release install --key-id K` writes K to `~/.blockula/release-key-id` once the release verifies (`blockula release pin --key-id K` pins it by hand; `blockula release pin` shows it). From then on, `blockula release install` and `fetch` check against the pin and refuse a different `--key-id`, and `blockula release verify` without `--key-id` uses the pin too. They never take the key id from a release again, or from SECURITY.md, which a compromised GitHub account can edit.
+- Publish the key id in SECURITY.md, this file, `scripts/install.sh` (`BUILTIN_KEY_ID`), `node/src/release_cli.rs` (`BUILTIN_KEY_ID`, the key a fresh `blockula release install` trusts when nothing is pinned, and the only one it lets an operator pin by `--key-id`), `mcp/src/release.ts` (`RELEASE_KEY_ID`, the key the MCP's `install_node` requires), the website, the operators' channel and the project's social accounts, so a single compromised channel can't swap it. A test (`built_in_key_id_matches_install_sh`) fails unless the three built-in copies are equal. **Release key id:** *not generated yet* (the maintainer fills this in at the key ceremony).
+- **Operators pin it once.** Their first `blockula release install --key-id K` writes K to `~/.blockula/release-key-id` once the release verifies (`blockula release pin --key-id K` pins it by hand; `blockula release pin` shows it). A binary built after the key ceremony pins only the key id it was built with: given another, `install`, `fetch`, `pin` and `verify` refuse and name both, since one of them isn't genuine (audit review-r3-supply-4). From then on, `blockula release install` and `fetch` check against the pin and refuse a different `--key-id`, and `blockula release verify` checks against the pin too (a different `--key-id` is refused). They never take the key id from a release again, or from SECURITY.md, which a compromised GitHub account can edit.
 - Back it up like a validator key (encrypted, offline, two locations). **Rotation:** on the offline machine, sign a statement naming the new key id with the old key, and publish both through the same channels as the key id:
 
   ```bash
@@ -630,7 +630,7 @@ Every release is reproducible, carries SLSA build provenance, and is signed offl
   blockula release sign --key release-key.json rotation.txt > rotation.txt.sig
   ```
 
-  Operators cross-check the new key id on a channel GitHub doesn't control (the operators' channel), then move their pin, with `rotation.txt` and `rotation.txt.sig` from the announcement in the current directory. The pin moves only if the pinned key signed the statement, and it names the pinned key as `old` and the given key id as `new`:
+  Operators cross-check the new key id on a channel GitHub doesn't control (the operators' channel), then move their pin, with `rotation.txt` and `rotation.txt.sig` from the announcement in the current directory. The pin moves only if the pinned key signed the statement, and it names the pinned key as `old` and the given key id as `new`. On a host with nothing pinned yet, whose binary was built before the rotation, the same command pins the new key if the key the binary was built with signed the statement:
 
 <!-- runbook-test: rotation -->
 ```bash
@@ -674,7 +674,7 @@ A first install has no `blockula` to check the signature with, so something else
   H=<SHA-256 of blockula-$T.tar.gz from the release announcement in the operators' channel>
   gh release download $V --repo jackdishman/blockula --dir first-$V --pattern "blockula-$T.tar.gz"
   cd first-$V
-  echo "$H  blockula-$T.tar.gz" | sha256sum -c -
+  echo "$H  blockula-$T.tar.gz" | sha256sum --strict -c -
   gh attestation verify blockula-$T.tar.gz --repo jackdishman/blockula \
     --signer-workflow jackdishman/blockula/.github/workflows/release.yml --source-ref refs/tags/$V
   tar -xzf blockula-$T.tar.gz blockula-$T/blockula
@@ -683,9 +683,41 @@ A first install has no `blockula` to check the signature with, so something else
 )
 ```
 
-`K` comes from SECURITY.md, this file, the website and the operators' channel, and they must agree; never from the release. If you already run a verified `blockula` on another host of the same platform, copy it over instead, check its SHA-256 against the one you noted when you installed it, and run the upgrade block with it (`./blockula release install $V --key-id $K --provenance --to …`): then that binary is the trust root. Before the key ceremony there's no key id, and `release install` refuses: testnet installs use the one-line install below.
+`K` comes from SECURITY.md, this file, the website and the operators' channel, and they must agree; never from the release. After the key ceremony the binary also knows the release key id it was built with, and refuses a `K` that isn't that one ("this blockula was built with release key …, and you gave …"): then either your `K` or the archive isn't genuine, so stop and check both on the operators' channel. A key that replaced the built-in one after the binary was built comes in only through the rotation statement the built-in key signed ([The release key](#the-release-key)). `--strict` makes `sha256sum` refuse a malformed `H` (macOS's `sha256sum` otherwise accepts one; without it, use `shasum -a 256 -c -`). If you already run a verified `blockula` on another host of the same platform, copy it over instead, check its SHA-256 against the one you noted when you installed it, and run the upgrade block with it (`./blockula release install $V --key-id $K --provenance --to …`): then that binary is the trust root. Before the key ceremony there's no key id, and `release install` refuses: testnet installs use the one-line install below.
 
 **The trust chain.** The first binary is trusted because of the announcement (or the binary you copied). Every later binary is trusted because the one before checked its signature against the pinned key. The signature is trusted for exactly what the signer checked ([What the signature vouches for](#how-a-release-is-made)). `gh attestation verify` proves only that GitHub's release workflow produced a file: a compromised workflow attests whatever it builds, so it's an extra check, never the trust root. Rebuilding (`COMMIT=<commit> scripts/reproduce-release.sh vX.Y.Z`) is the strongest check, and it's recommended for validators.
+
+#### To an offline machine
+
+An offline machine (the release signing machine, a genesis key machine) gets its `blockula` from an online machine that already runs a verified one with the release key id pinned (above; on a new machine, [a first install](#a-first-install) first). There, `blockula release fetch` downloads the archive for the offline machine's platform, checks it against the signed `checksums.txt` (the signature against the pinned key, the tag line, the archive's SHA-256) and leaves a new directory holding only what matched: the archive, `checksums.txt` and `checksums.txt.sig`. `T` is the offline machine's target (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin` or `x86_64-apple-darwin`), whatever the online machine runs. The last line prints the archive's signed SHA-256: write it down, on paper or in the release or ceremony issue.
+
+<!-- runbook-test: offline-fetch -->
+```bash
+( set -euo pipefail
+  V=vX.Y.Z
+  T=<the offline machine's target>
+  /usr/local/bin/blockula release fetch $V --file blockula-$T.tar.gz --dir offline-$V
+  grep -x "[0-9a-f]\{64\}  blockula-$T.tar.gz" offline-$V/checksums.txt
+)
+```
+
+Copy `offline-$V` over on a fresh USB stick. On the offline machine, before anything from it runs, check the archive against the SHA-256 you wrote down (not against anything on the stick, which could have been changed on the way), then install its binary:
+
+<!-- runbook-test: offline-unpack -->
+```bash
+( set -euo pipefail
+  V=vX.Y.Z
+  T=<the offline machine's target>
+  H=<the SHA-256 you wrote down>
+  cd offline-$V
+  echo "$H  blockula-$T.tar.gz" | sha256sum --strict -c -
+  tar -xzf blockula-$T.tar.gz blockula-$T/blockula
+  sudo install -m 755 blockula-$T/blockula /usr/local/bin/blockula
+  /usr/local/bin/blockula --version
+)
+```
+
+(On a macOS machine without `sha256sum`, `shasum -a 256 -c -` does the same.) If the offline machine has the platform of a host you just did a first install on, the `first-$V/blockula-$T.tar.gz` that block checked against the announced SHA-256 can be carried instead, and checked offline against the announced SHA-256 the same way. Carry later binaries over only this way, and note each one's SHA-256 in the release or ceremony issue.
 
 #### The one-line install
 
