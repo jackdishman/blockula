@@ -30,10 +30,13 @@ RPC_PORT=$((BASE + 20)); RPC=http://127.0.0.1:$RPC_PORT
 JOIN_PORT=$((BASE + 21)); JOINER=http://127.0.0.1:$JOIN_PORT
 PIDS=()
 
+passed=""
 cleanup() {
   if [[ -z "${KEEP:-}" ]]; then
     for p in ${PIDS[@]+"${PIDS[@]}"}; do kill "$p" 2>/dev/null || true; done
     wait 2>/dev/null || true
+    # A pass leaves nothing behind; a failure keeps the logs and keys to look at.
+    if [[ -n "$passed" ]]; then rm -rf "$DIR" "$NET"; else echo "logs: $DIR; keys and genesis: $NET" >&2; fi
   else
     echo "🧛 still running (KEEP=1). Nodes and logs: $DIR; keys and genesis: $NET"
   fi
@@ -194,4 +197,5 @@ for d in v0 rpc; do
   kb=$(du -sk "$DIR/$d" | cut -f1)
   echo "  $d: $((kb / 1024)) MiB for $target blocks, ~$((kb * 1024 / target)) bytes a block"
 done
+passed=1
 echo "✓ rehearsal passed ($CHAIN_ID, genesis $GHASH)"
