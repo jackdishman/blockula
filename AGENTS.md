@@ -40,9 +40,9 @@ Every action has an SDK `Wallet` helper that builds, signs and submits it (and w
 | 36 | `report_equivocation` | `reportEquivocation(evidenceHex)` (nodes do this) | | |
 | 37, 38 | `beacon_commit`, `beacon_reveal` | `beaconCommit(epoch, hex)`, `beaconReveal(epoch, hex)` (validator nodes do this) | | |
 | 39 | `propose` | `propose(proposal.paramChange("max_validators", 40), { title, url?, deposit? })`; builders for every kind in `proposal.*` | | `blockula gov propose` |
-| 40 | `vote` | `vote(proposalId, aye, amount, conviction)` | `vote` | `blockula gov vote` |
+| 40 | `vote` | `vote(proposalId, aye, amount, conviction, { proposal? })` (binds the proposal's kind, title and link: pass the one you showed) | `vote` | `blockula gov vote` |
 | 41 | `unlock` | `unlock()` | | `blockula gov unlock` |
-| 42–44 | `multisig_create`, `multisig_propose`, `multisig_approve` | `multisigCreate(ownerKeyIds, threshold)`, `multisigPropose(action)`, `multisigApprove(id)` | | `blockula multisig create`, `propose`, `approve` (`show` reads) |
+| 42–44 | `multisig_create`, `multisig_propose`, `multisig_approve` | `multisigCreate(ownerKeyIds, threshold)`, `multisigPropose(action)`, `multisigApprove(id, { action? })` (binds the action: pass the one you showed) | | `blockula multisig create`, `propose`, `approve` (`show` reads) |
 | 45 | `renew_name` | `renewName(name, years)` | `renew_name` | `blockula name renew` |
 | 46, 47 | `transfer_name`, `release_name` | `transferName(name, to)` (an offer: the name stays yours until the recipient's `acceptName(name)`; `withdrawNameOffer(name)`), `releaseName(name)` | | `blockula name transfer`, `accept`, `withdraw`, `blockula name release` |
 | 48 | `claim_distribution` | `claimDistribution(id, amount, proof)` | | `blockula gov claim` (`blockula gov tree` builds the proofs) |
