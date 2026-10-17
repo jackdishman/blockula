@@ -6,8 +6,9 @@
 //    a retry can't pass the daily cap. A refused tx stays counted too (a node can say "refused" and
 //    relay it anyway), until another tx reuses its nonce; a final one gives back the unused fee
 //    (never more, whatever fee the node reports: gap-7-4); a failed one stays counted, and a
-//    dropped one comes back "dropped", not "its fee was charged" (review-fix-clients-2). The
-//    default caps let one full-size call through (review-fix-clients-3).
+//    dropped one comes back "dropped", not "its fee was charged", and tx_status reads it the same
+//    way, with the valid_until this MCP signed (review-fix-clients-2). The default caps let one
+//    full-size call through (review-fix-clients-3).
 // 3. Name registration and renewal count their price, from the chain's parameters and never
 //    below the node's quote; a node that doesn't report a price can't make them free (F74).
 // 4. Chain text is labeled and cleaned; node JSON can't override the MCP's own facts (F73).
@@ -15,6 +16,8 @@
 // 6. Names that get signed (gap-7-1): the result shows the address and that the name wasn't
 //    proven; on mainnet an unproven name isn't signed until the address is confirmed. use_account
 //    checks the account's own key list.
+// 7. Unstaking an amount signs the amount, which the chain converts: no node report of the stake
+//    decides how much unbonds (gap-7-5).
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
@@ -113,10 +116,10 @@ const charged = (tx: Tx) => BigInt(tx.fee) - BigInt(tx.fee) / 2n;
 const posted: Tx[] = [];
 /** The keys BOB's account lists (use_account looks for the agent's there). */
 let bobKeys: { key_id: string; label: string; role: { type: string } }[] = [];
-/** The account whose stake /api/staking reports: 100 shares of BOB's pool, worth `stake.value` drops (a witness says `stake.witness`). */
+/** The account whose stake /api/staking reports: `stake.shares` of BOB's pool, worth `stake.value` drops. */
 let stakingFor = "";
-const stake = { value: (11n * FANG).toString(), witness: (11n * FANG).toString() };
-const staking = (value: string) => ({ delegations: [{ validator: { address: BOB, name: "bob.boo" }, shares: (100n * FANG).toString(), value, principal: (10n * FANG).toString() }], entries: [], bonded: value, unbonding: "0", withdrawable: "0", summary: "stake" });
+const stake = { shares: (100n * FANG).toString(), value: (11n * FANG).toString() };
+const staking = () => ({ delegations: [{ validator: { address: BOB, name: "bob.boo" }, shares: stake.shares, value: stake.value, principal: (10n * FANG).toString() }], entries: [], bonded: stake.value, unbonding: "0", withdrawable: "0", summary: "stake" });
 const fake: Server = createServer((req, res) => {
   let body = "";
   req.on("data", (c) => (body += c));
@@ -150,7 +153,7 @@ const fake: Server = createServer((req, res) => {
     // Like node/src/api.rs: any address answers; without an account, with a zero balance and nonce
     // and the address's own key (`keys_of` lists it for every address).
     if (path.startsWith("/account/")) return reply(200, { account: { address: path.slice(9), name: null }, balance: "0", nonce: 0, next_nonce: nextNonce(path.slice(9)), keys: [{ key_id: "ee".repeat(32), label: "original key", role: { type: "owner" }, added_at: 0, spent_this_period: "0", window_start: 0 }], recent_txs: [] });
-    if (path === `/staking/${stakingFor}`) return reply(200, staking(stake.value));
+    if (path === `/staking/${stakingFor}`) return reply(200, staking());
     if (path === "/proposal/1") return reply(200, { id: 1, kind: { type: "text" }, title: "Plant garlic", url: "https://forum.example/p/1", status: "voting" });
     if (path === "/fees") return reply(200, { height: 10, suggested: { flat: "10000", rate: "10000" }, account_creation_fee: "100000000" });
     if (path === "/params") return reply(200, { params: mode.prices.params ? { name_price_3: "100000000000", name_price_4: "25000000000", name_price_5: "5000000000", name_renewal_bps: "2000" } : {} });
@@ -248,6 +251,42 @@ assert.equal(dropped.status, "dropped");
 assert.match(dropped.next, /nothing was charged yet, but another node may still include it.*Do NOT send it again/);
 assert.doesNotMatch(r.text, /fee was charged/);
 assert.equal(ledger(), parseFang("0.5") + BigInt(posted.at(-1)!.fee), "a dropped tx stays counted");
+// review-fix-clients-2 (round 3): tx_status, which that answer sends the agent to, reads it the
+// same way: "dropped", not "failed" in a block, with the valid_until this MCP signed (the node's
+// answer for a dropped tx doesn't carry it) and no reason to send it again before then.
+const droppedTx = posted.at(-1)!;
+r = await s.call("tx_status", { tx_id: txId(droppedTx) });
+assert.ok(!r.error, r.text);
+let ts = r.json();
+assert.deepEqual([ts.status, ts.dropped, ts.valid_until, ts.dropped_at_height, ts.block], ["dropped", true, droppedTx.valid_until, 10, undefined], r.text);
+assert.match(ts.next, /dropped it from its mempool without running it, so nothing was charged, but another node may still include it until block \d+.*Do NOT send it again before then/);
+assert.doesNotMatch(r.text, /fee was charged|"failed"/);
+// Once the chain is past its valid_until (as the node says), it's dead: said so, with the caveat.
+mode.status = { height: droppedTx.valid_until + 1 };
+r = await s.call("tx_status", { tx_id: txId(droppedTx) });
+ts = r.json();
+assert.ok(ts.status === "dropped" && ts.node_height === droppedTx.valid_until + 1 && /past its valid_until.*can never execute and nothing was charged.*check the height with another node/.test(ts.next), r.text);
+mode.status = {};
+// Failed in a block: final, its fee charged, with the block it ran in.
+mode.tx = "failed";
+r = await s.call("tx_status", { tx_id: txId(droppedTx) });
+ts = r.json();
+assert.ok(ts.status === "failed" && ts.block === 11 && /ran in block 11 and failed, so its fee was charged/.test(ts.next), r.text);
+mode.tx = "pending";
+r = await s.call("tx_status", { tx_id: txId(droppedTx) });
+ts = r.json();
+assert.ok(ts.status === "pending" && ts.valid_until === droppedTx.valid_until && /Do NOT send it again/.test(ts.next), r.text);
+// A tx this MCP signed that the node doesn't know (it said it refused it, say): still in flight.
+mode.post = "refuse";
+r = await s.call("send", { to: "bob.boo", amount: "0.1" });
+assert.ok(r.error, r.text);
+const unknownId = r.text.match(/refused tx ([0-9a-f]{64})/)![1];
+r = await s.call("tx_status", { tx_id: unknownId });
+ts = r.json();
+assert.ok(!r.error && ts.status === "unknown" && Number.isSafeInteger(ts.valid_until) && /doesn't know this tx, but this MCP signed it.*Do NOT send it again before then/.test(ts.next), r.text);
+r = await s.call("tx_status", { tx_id: "ef".repeat(32) });
+assert.ok(r.error && /not found/.test(r.text), `a tx this MCP never signed is just unknown to the node: ${r.text}`);
+mode.post = "accept";
 mode.tx = "finalized";
 // Opening a new account burns the creation fee on top: counted too.
 resetLedger();
@@ -430,49 +469,41 @@ mode.status = {};
 rmSync(join(home, "known-chains.json"), { force: true });
 console.log("✓ signed names show their address and say they're unproven; on mainnet an unproven name waits for the address to be confirmed; use_account reads the account's own keys");
 
-// gap-7-5: unstaking an amount converts it to shares at the node's value of the stake. One that
-// reports a tiny value would turn "unstake 10" into all of it: refused, and with witnesses every
-// witness must report the same shares and value.
-const witness: Server = createServer((req, res) => {
-  const reply = (code: number, v: unknown) => res.writeHead(code, { "content-type": "application/json" }).end(JSON.stringify(v));
-  const path = decodeURIComponent((req.url ?? "").replace(/^\/api/, ""));
-  if (path === "/status") return reply(200, { chain_id: "fake-chain", genesis_hash: G, address_prefix: "boo", height: 10, max_tx_validity_blocks: 3600 });
-  if (path === `/staking/${stakingFor}`) return reply(200, staking(stake.witness));
-  return reply(404, { error: `witness: no route for ${path}` });
-});
-await new Promise<void>((r) => witness.listen(0, "127.0.0.1", r));
-const witnessRpc = `http://127.0.0.1:${(witness.address() as AddressInfo).port}`;
+// gap-7-5: "unstake 10" used to be converted to shares here, at the node's value of the stake: a
+// node that reported a 1,000 FANG stake (100e9 shares) as worth 10 FANG and a drop got 99.99% of
+// the shares signed, and one that reported 100× the shares at the true value got all of them
+// signed while the answer read "1%". Now the amount is signed as an amount, which the chain
+// converts at its own price, so neither lie changes what's signed.
 resetLedger();
 s = await server();
 stakingFor = (await s.call("wallet_info")).json().address;
+const unstakeAction = () => posted.at(-1)!.action as { type: string; validator: string; shares: string; amount?: string };
+const TEN = { type: "undelegate", validator: BOB, shares: "0", amount: (10n * FANG).toString() };
+for (const [lie, shares, value] of [["the value is the amount and a drop", 100n * FANG, 10n * FANG + 1n], ["100× the shares at the true value", 10_000n * FANG, 1_000n * FANG], ["the truth", 100n * FANG, 1_000n * FANG]] as const) {
+  stake.shares = shares.toString();
+  stake.value = value.toString();
+  before = posted.length;
+  r = await s.call("unstake", { validator: BOB, amount: "10" });
+  assert.ok(!r.error && posted.length === before + 1, `${lie}: ${r.text}`);
+  assert.deepEqual(unstakeAction(), TEN, `${lie}: the signed tx unbonds 10 FANG, whatever the node reported`);
+  assert.match(r.json().unbonding, /^10 FANG \(at least: the chain sells the shares/);
+}
+// A node reporting less than the amount only gets a refusal (the chain would refuse it too).
 stake.value = (5n * FANG).toString();
 before = posted.length;
 r = await s.call("unstake", { validator: BOB, amount: "10" });
-assert.ok(r.error && /reports this stake is worth 5 FANG, which isn't more than the 10 FANG asked for: nothing was signed/.test(r.text), r.text);
-stake.value = (20n * FANG).toString();
-r = await s.call("unstake", { validator: BOB, amount: "10" });
-assert.ok(!r.error, r.text);
-assert.deepEqual([r.json().unbonding_shares, r.json().of_shares, r.json().worth_as_reported], [(50n * FANG).toString(), (100n * FANG).toString(), "10 FANG"], "the shares and what they're worth are shown");
-assert.equal((posted.at(-1)!.action as { shares: string }).shares, (50n * FANG).toString());
-await s.close();
-// With a witness: a node whose value disagrees with it is refused; agreeing, it goes through.
-s = await server({ BLOCKULA_WITNESSES: witnessRpc });
-stake.value = (11n * FANG).toString();
-stake.witness = (1_000n * FANG).toString();
-const beforeWitness = posted.length;
-r = await s.call("unstake", { validator: BOB, amount: "10" });
-assert.ok(r.error && /\(a witness\) and .* disagree about this stake: 100000000000 shares worth 1000 FANG vs 100000000000 shares worth 11 FANG\. Nothing was signed/.test(r.text), r.text);
-assert.equal(posted.length, beforeWitness, "nothing signed");
-stake.witness = stake.value;
-r = await s.call("unstake", { validator: BOB, amount: "10" });
-assert.ok(!r.error, r.text);
-assert.equal(posted.length, beforeWitness + 1);
+assert.ok(r.error && /reports this stake is worth 5 FANG, less than the 10 FANG asked for: nothing was signed/.test(r.text), r.text);
+r = await s.call("unstake", { validator: BOB, amount: "0" });
+assert.ok(r.error && /more than 0/.test(r.text), r.text);
+assert.equal(posted.length, before, "nothing signed");
+// "all" takes every share the node reports: a lie there can only unbond less, or fail on chain.
+stake.shares = (100n * FANG).toString();
 r = await s.call("unstake", { validator: BOB, amount: "all" });
-assert.ok(!r.error && r.json().unbonding_shares === (100n * FANG).toString(), r.text);
+assert.ok(!r.error, r.text);
+assert.deepEqual(unstakeAction(), { type: "undelegate", validator: BOB, shares: (100n * FANG).toString() });
+assert.match(r.json().unbonding, /^all 100000000000 shares/);
 await s.close();
-witness.close();
-witness.closeAllConnections();
-console.log("✓ unstaking an amount: a node can't turn it into the whole stake (its value is bounded, and witnesses must agree)");
+console.log("✓ unstaking an amount signs the amount (the chain converts it): a node lying about the stake's value or its shares can't turn it into the whole stake");
 
 fake.close();
 fake.closeAllConnections();

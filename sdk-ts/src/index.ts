@@ -996,11 +996,21 @@ export class ApiError extends Error {
  *   was charged, but other nodes may still hold it and include it until its `valid_until`
  *   (`validUntil`, when known): check `client.tx(id)` before sending it again, or a retry can pay twice.
  */
+/**
+ * Whether a `/api/tx` answer of status "failed" is a tx the node dropped from its mempool without
+ * running it (nothing charged; another node may still include it until its `valid_until`), not
+ * one that ran in a block and failed (its fee was charged). Mempool failures are answered without
+ * the tx itself (node/src/api.rs `tx`), and older nodes don't say `dropped`.
+ */
+export function txDropped(answer: unknown): boolean {
+  const tx = answer as { dropped?: unknown; action?: unknown } | null;
+  return tx?.dropped === true || (tx !== null && typeof tx === "object" && tx.action === undefined && tx.dropped !== false);
+}
+
 export class TxFailedError extends Error {
   readonly dropped: boolean;
   constructor(readonly id: string, readonly reason: string, readonly tx: any, readonly validUntil?: number) {
-    // Mempool failures are answered without the tx itself (node/src/api.rs `tx`): older nodes don't say `dropped`.
-    const dropped = tx?.dropped === true || (tx !== null && typeof tx === "object" && tx.action === undefined && tx.dropped !== false);
+    const dropped = txDropped(tx);
     super(
       dropped
         ? `tx ${id} was dropped by this node without running (${reason}); nothing was charged, but another node may still include it${validUntil !== undefined ? ` until block ${validUntil}` : " until its valid_until"}, so check it (client.tx) before sending it again`

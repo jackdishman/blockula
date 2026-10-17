@@ -9,7 +9,7 @@ import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex, hexToBytes, utf8ToBytes } from "@noble/hashes/utils.js";
 import {
-  ApiError, ChainMismatchError, Client, MAX_TIMEOUT_MS, actionDigest, decodeKeyGrant, encodeKeyGrant, proposalDigest, seancePairsDigest, verifyKeyGrant, RELEASE_SIGNATURE_FORMAT, RequestTimeoutError, StaleProofError, TxFailedError, TxPendingError, Wallet, addressFromPublicKey, bareName, buildDistribution, convictionWeight, distributionLeaf, distributionNode,
+  ApiError, ChainMismatchError, Client, MAX_TIMEOUT_MS, actionDigest, decodeKeyGrant, encodeKeyGrant, proposalDigest, seancePairsDigest, verifyKeyGrant, RELEASE_SIGNATURE_FORMAT, RequestTimeoutError, StaleProofError, TxFailedError, TxPendingError, Wallet, txDropped, addressFromPublicKey, bareName, buildDistribution, convictionWeight, distributionLeaf, distributionNode,
   keyHash, keyId, leafHash, maxTip, minFee, paramsOf, proposal, proposalSummary, releaseMessage, sharesFor, signingBytes, stakeSummary, valueHash, verifyDistributionProof, verifyReleaseSignature, type Action,
   type Tx,
 } from "../src/index.js";
@@ -479,6 +479,8 @@ await assert.rejects(sc.waitForTx(id, 300), (e: unknown) => e instanceof TxFaile
 // review-fix-clients-2: dropped from the node's mempool unrun is no "its fee was charged".
 slow.txAnswers = ["dropped"];
 await assert.rejects(sc.waitForTx(id, 300, 999), (e: unknown) => e instanceof TxFailedError && e.dropped && e.validUntil === 999 && /dropped by this node without running \(evicted.*nothing was charged, but another node may still include it until block 999/.test(e.message) && !/fee was charged/.test(e.message));
+// The same reading for anyone holding a /api/tx answer (the MCP's tx_status): dropped, or ran.
+assert.deepEqual([txDropped({ status: "failed", dropped: true }), txDropped({ status: "failed", dropped: false }), txDropped({ status: "failed", error: "x" }), txDropped({ status: "failed", action: { type: "transfer" } })], [true, false, true, false], "an old node's tx-less failure is a drop");
 slow.txAnswers = [503];
 await assert.rejects(sc.submit(await Wallet.fromSeed("07".repeat(32), sc).build({ type: "transfer", to: BOB, amount: "1" }), false), TxPendingError, "admitted, then the read failed: pending, not refused");
 console.log("✓ requests time out (RequestTimeoutError); waits retry failed polls and end in TxPendingError");

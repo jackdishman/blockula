@@ -27,7 +27,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { ApiError, Client, RequestTimeoutError, TxFailedError, TxPendingError, Wallet, bareName, checkTimeoutMs, encodeKeyGrant, proposalDigest, formatFang, paramsOf, parseFang, proposalSummary, sharesFor, stakeSummary, txId, type Action, type ProposalSummary, type Resolution } from "@blockula/sdk";
+import { ApiError, Client, RequestTimeoutError, TxFailedError, TxPendingError, Wallet, bareName, checkTimeoutMs, encodeKeyGrant, proposalDigest, formatFang, paramsOf, parseFang, proposalSummary, stakeSummary, txDropped, txId, type Action, type ProposalSummary, type Resolution } from "@blockula/sdk";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -35,6 +35,7 @@ import { join } from "node:path";
 import { z } from "zod";
 import { KnownChains, completePin, effectivePin, mismatch, mismatchError, resolveNetwork, type Network } from "./network.js";
 import { REPO, RELEASE_KEY_ID, checkBinaryVersion, fetchVerifiedRelease, latestTagFrom, releaseKeyIdFrom } from "./release.js";
+import { SignedTxs } from "./signed.js";
 import { SpendLedger } from "./spend.js";
 import { SERVER_INSTRUCTIONS, UNTRUSTED_NOTE, chainData, clean } from "./untrusted.js";
 
@@ -132,6 +133,8 @@ async function moduleRead<T>(what: string, read: Promise<T>): Promise<T> {
 // ---- spending caps (BLOCKULA_MAX_SEND per call, BLOCKULA_MAX_DAILY per UTC day) ----
 
 const LEDGER = new SpendLedger(SPEND_FILE, MAX_DAILY, MAX_DAILY_TEXT);
+/** The txs this MCP signed (their valid_until, for tx_status): see signed.ts. */
+const SIGNED = new SignedTxs(join(HOME, "agent-txs.json"));
 
 /** What one tool call spends. */
 interface Spend {
@@ -176,6 +179,12 @@ async function submitCapped(w: Wallet, action: Action, spend: Spend, memo = ""):
   const slot = { account: tx.from, nonce: tx.nonce };
   const reservation = LEDGER.reserve(spend.amount + (spend.extra ?? 0n) + maxFee, slot);
   const counted = formatFang(LEDGER.held(slot));
+  // Before it can reach any node: tx_status reads its valid_until from here (review-fix-clients-2).
+  try {
+    SIGNED.add(id, { valid_until: tx.valid_until, account: tx.from, nonce: tx.nonce });
+  } catch {
+    /* informational only: tx_status then says valid_until is unknown */
+  }
   const inFlight = (status: InFlight["status"], why: string): InFlight => ({
     status,
     tx_id: id,
@@ -334,9 +343,54 @@ tool("status", "Blockula network status: which network and node you're connected
   };
 });
 
-tool("tx_status", "Check a transaction by id: pending, finalized (with block), and its plain-English summary.", { tx_id: z.string().regex(/^[0-9a-f]{64}$/) }, async ({ tx_id }) => {
-  const tx = await (await chain()).tx(tx_id);
-  return { status: clean(String(tx.status)), summary: clean(String(tx.summary ?? "")), ...(tx.error ? { error: clean(String(tx.error)) } : {}), block: tx.height, fee: tx.fee_display, valid_until: tx.valid_until, explorer: explorer(`tx/${tx_id}`) };
+/**
+ * A tx's status as the node reports it, read the way submitCapped reads it (audit
+ * review-fix-clients-2): "finalized" and "failed" (it ran in a block; its fee was charged) are
+ * final; "dropped" (this node dropped it from its mempool unrun: nothing charged) and "pending"
+ * aren't, since another node may still include it until its valid_until. For a tx this MCP
+ * signed, valid_until is what it signed (signed.ts), not the node's word.
+ */
+tool("tx_status", "Check a transaction by id: finalized (with its block), failed in a block (its fee was charged), pending, or dropped from this node's mempool without running (nothing charged, but another node may still include it until valid_until, so it must not be sent again before then), with its plain-English summary.", { tx_id: z.string().regex(/^[0-9a-f]{64}$/) }, async ({ tx_id }) => {
+  const client = await chain();
+  const mine = SIGNED.get(tx_id);
+  const link = explorer(`tx/${tx_id}`);
+  const until = (v: number | undefined) => (v === undefined ? "its valid_until (unknown here: this MCP didn't sign it)" : `block ${v}`);
+  let tx: any;
+  try {
+    tx = await client.tx(tx_id);
+  } catch (e) {
+    // This node doesn't know it. One this MCP signed may still be in another node's mempool.
+    if (e instanceof ApiError && e.status === 404 && mine) {
+      return { status: "unknown", tx_id, valid_until: mine.valid_until, next: `${RPC} doesn't know this tx, but this MCP signed it, and a node that holds it may still include it until block ${mine.valid_until}. It still counts toward the daily limit. Do NOT send it again before then: check tx_status again, and tell the user it isn't confirmed yet.`, explorer: link };
+    }
+    throw e;
+  }
+  const status = String(tx.status);
+  const summary = clean(String(tx.summary ?? ""));
+  const error = tx.error ? { error: clean(String(tx.error)) } : {};
+  const nodeUntil = Number.isSafeInteger(tx.valid_until) ? (tx.valid_until as number) : undefined;
+  const validUntil = mine?.valid_until ?? nodeUntil;
+  if (status === "finalized") return { status, summary, ...error, block: tx.height, fee: tx.fee_display, explorer: link };
+  if (status === "failed" && !txDropped(tx)) {
+    return { status, summary, ...error, block: tx.height, fee: tx.fee_display, next: `It ran${typeof tx.height === "number" ? ` in block ${tx.height}` : ""} and failed, so its fee was charged and nothing else happened. That's final.`, explorer: link };
+  }
+  if (status === "failed") {
+    // Dropped unrun: the height in the answer is where this node dropped it, not a block it ran in.
+    const head = await client.status().then((st) => (Number.isSafeInteger(st.height) ? (st.height as number) : undefined)).catch(() => undefined);
+    const past = validUntil !== undefined && head !== undefined && head > validUntil;
+    const next = past
+      ? `This node dropped it without running it, and says the chain is at block ${head}, past its valid_until (${validUntil}): if that height is right, it can never execute and nothing was charged. It stays counted toward today's limit; check the height with another node before signing it again.`
+      : `This node dropped it from its mempool without running it, so nothing was charged, but another node may still include it until ${until(validUntil)}. It still counts toward the daily limit. Do NOT send it again before then: check tx_status again, and tell the user it isn't confirmed yet.`;
+    return { status: "dropped", dropped: true, summary, ...error, ...(typeof tx.height === "number" ? { dropped_at_height: tx.height } : {}), valid_until: validUntil ?? "unknown", ...(head !== undefined ? { node_height: head } : {}), next, explorer: link };
+  }
+  return {
+    status: clean(status),
+    summary,
+    ...error,
+    valid_until: validUntil ?? "unknown",
+    ...(status === "pending" ? { next: `Not final yet: it can still execute until ${until(validUntil)}. Do NOT send it again: check tx_status again.` } : {}),
+    explorer: link,
+  };
 });
 
 tool("start_dev_node", "Start a local Blockula dev chain (faucet + built-in explorer) on this machine. This MCP uses it only if it was configured for the local network (--network local); otherwise it keeps its network and tells you how to switch. Needs the `blockula` binary (install_node).", { reset: z.boolean().optional().describe("wipe the dev chain first") }, async ({ reset }) => {
@@ -575,7 +629,9 @@ tool("stake", "Stake (delegate) FANG from the account this agent acts for in a v
   return isInFlight(r) ? { ...r, ...resolvedView(res, "validator") } : txResult(r, { ...resolvedView(res, "validator"), next: "my_stake shows the stake and its value" });
 });
 
-tool("unstake", "Start unbonding stake from a validator's pool: an amount in FANG (converted to pool shares at the current rate) or \"all\". It stops earning now and can be withdrawn with withdraw_stake once the unbonding period is over.", { validator: z.string(), amount: z.string().default("all").describe("FANG, or \"all\"") }, async ({ validator, amount }) => {
+tool("unstake", "Start unbonding stake from a validator's pool: an amount in FANG (signed as that amount: the chain converts it to pool shares at its own price when the tx runs) or \"all\". It stops earning now and can be withdrawn with withdraw_stake once the unbonding period is over.", { validator: z.string(), amount: z.string().default("all").describe("FANG, or \"all\"") }, async ({ validator, amount }) => {
+  const drops = amount === "all" ? null : parseFang(amount);
+  if (drops !== null && drops <= 0n) throw new Error("unstake more than 0 FANG, or \"all\"");
   const w = await requireWallet();
   const { res, confirm } = await resolved(w.client, validator, "validator");
   if (confirm) return confirm;
@@ -583,24 +639,17 @@ tool("unstake", "Start unbonding stake from a validator's pool: an amount in FAN
   await w.client.addressPrefix();
   const d = stakeSummary(await moduleRead("staking", w.client.staking(w.account))).delegations.find((x) => x.validator === v);
   if (!d || BigInt(d.shares) === 0n) throw new Error(`${w.account} has no stake with ${clean(validator, 100)}`);
-  // The conversion uses the node's value of the delegation: one that reports a tiny value would
-  // turn "unstake 10 FANG" into unbonding all of it (audit gap-7-5). Taking every share takes "all".
-  if (amount !== "all" && parseFang(amount) >= BigInt(d.value)) throw new Error(`the node reports this stake is worth ${formatFang(BigInt(d.value))}, which isn't more than the ${clean(amount, 40)} FANG asked for: nothing was signed. To unbond all ${d.shares} shares, pass amount "all" (after checking the stake's value with the user).`);
-  // With BLOCKULA_WITNESSES, every witness must report the same shares and value for it, so one
-  // lying node can't skew the FANG-to-shares conversion either (audit gap-7-5).
-  if (amount !== "all" && w.client.witnesses.length) {
-    const theirs = await Promise.all(w.client.witnesses.map(async (c) => stakeSummary(await c.staking(w.account)).delegations.find((x) => x.validator === v)));
-    const off = theirs.findIndex((t) => !t || String(t.shares) !== String(d.shares) || String(t.value) !== String(d.value));
-    if (off >= 0) {
-      const t = theirs[off];
-      throw new Error(`${w.client.witnesses[off].rpc} (a witness) and ${RPC} disagree about this stake: ${t ? `${t.shares} shares worth ${formatFang(BigInt(t.value))}` : "no stake"} vs ${d.shares} shares worth ${formatFang(BigInt(d.value))}. Nothing was signed. They may be a block apart: try again, or pass amount "all" (after checking the stake with the user).`);
-    }
-  }
-  const shares = amount === "all" ? BigInt(d.shares) : sharesFor(d, amount);
-  if (shares <= 0n) throw new Error(`${amount} FANG is less than one share of this pool`);
+  // An amount is signed as an amount, and the chain converts it at the pool's price when it runs:
+  // converting it here took the price from this node's report of the stake, and one that said a
+  // 1,000 FANG stake was worth 10 FANG and a drop (or was 100× as many shares) turned "unstake
+  // 10" into unbonding all of it (audit gap-7-5). The node's value only words a refusal now.
+  if (drops !== null && drops > BigInt(d.value)) throw new Error(`the node reports this stake is worth ${formatFang(BigInt(d.value))}, less than the ${formatFang(drops)} asked for: nothing was signed (the chain refuses more than the stake is worth). To unbond all of it, pass amount "all".`);
   // Only the fee leaves the account (it counts toward the daily limit).
-  const view = { ...resolvedView(res, "validator"), unbonding_shares: shares.toString(), of_shares: d.shares, worth_as_reported: formatFang((BigInt(d.value) * shares) / BigInt(d.shares)) };
-  const r = await submitCapped(w, { type: "undelegate", validator: v, shares: shares.toString() }, { amount: 0n });
+  const action: Action = drops === null ? { type: "undelegate", validator: v, shares: d.shares } : { type: "undelegate", validator: v, shares: "0", amount: drops.toString() };
+  const view = drops === null
+    ? { ...resolvedView(res, "validator"), unbonding: `all ${d.shares} shares (the node reports they're worth ${formatFang(BigInt(d.value))})` }
+    : { ...resolvedView(res, "validator"), unbonding: `${formatFang(drops)} (at least: the chain sells the shares that much buys at the pool's price when the tx runs)` };
+  const r = await submitCapped(w, action, { amount: 0n });
   return isInFlight(r) ? { ...r, ...view } : txResult(r, view);
 });
 
