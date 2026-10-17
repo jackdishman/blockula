@@ -1528,8 +1528,12 @@ fn split_treasury_spends_count_together() {
 /// GOV-2 and GOV-3: without admins, nobody but a hunt's creator moves its escrow, and the
 /// former admin levers are proposals only.
 /// SF-13 × SF-11: a validator whose owner is a multisig still signs its system txs with its
-/// consensus key (it isn't one of the owner keys the multisig gates); `UpdateValidator`, which
-/// changes the pool's terms, goes through the multisig like any owner action.
+/// consensus key (it isn't one of the owner keys the multisig gates), a small set's readiness and
+/// admissions among them; `UpdateValidator`, which changes the pool's terms, goes through the
+/// multisig like any owner action. Nor can the key change them, or unjail the validator, from the
+/// validator's own account, where it's the implicit owner key (audit
+/// review-r2-integrate-compose-1: it used to apply there, past the multisig and F04's
+/// once-an-epoch limit, twice in one block).
 #[test]
 fn a_multisig_owners_validator_still_signs_its_system_txs() {
     let mut t = T::new(&[]);
@@ -1541,8 +1545,27 @@ fn a_multisig_owners_validator_still_signs_its_system_txs() {
     let before = t.bal(OWNER);
     let e = format!("{:#}", t.tx_as(&ck, &addr(OWNER), Action::AttestClaim { claim_id: 9, ok: true, merge_sha: "ab".repeat(20), note: String::new() }).unwrap_err());
     assert!(!e.contains("multisig") && e.contains("no claim #9") && t.bal(OWNER) == before, "{e}");
-    let e = t.tx_as(&ck, &addr(OWNER), Action::UpdateValidator { commission_bps: 100, p2p_addr: String::new(), http_addr: String::new() }).unwrap_err().to_string();
+    let epoch = t.st.params.epoch_of(t.h);
+    for (action, why) in [(Action::ValidatorReady { epoch }, "last tenth"), (Action::AdmitValidator { validator: addr(ALICE), epoch }, "isn't an eligible candidate")] {
+        let e = format!("{:#}", t.tx_as(&ck, &addr(OWNER), action).unwrap_err());
+        assert!(!e.contains("multisig") && e.contains(why) && t.bal(OWNER) == before, "{e}");
+    }
+    let terms = |bps, p2p: &str, http: &str| Action::UpdateValidator { commission_bps: bps, p2p_addr: p2p.into(), http_addr: http.into() };
+    let e = t.tx_as(&ck, &addr(OWNER), terms(100, "", "")).unwrap_err().to_string();
     assert!(e.contains("multisig_propose"), "{e}");
+    let (v, hot_before) = (addr(VALIDATORS[2]), t.bal(VALIDATORS[2]));
+    let record = |t: &T| (t.st.validators[&v].commission_bps, t.st.validators[&v].p2p_addr.clone(), t.st.validators[&v].http_addr.clone());
+    let was = record(&t);
+    for bps in [100, 50] {
+        let e = t.tx_as(&ck, &v, terms(bps, "6.6.6.6:30303", "https://evil.example")).unwrap_err().to_string();
+        assert!(e.contains("its owner's call"), "{e}");
+    }
+    assert!(t.tx_as(&ck, &v, Action::Unjail { validator: v.clone() }).unwrap_err().to_string().contains("only validator"));
+    assert_eq!(record(&t), was, "the multisig's terms stand");
+    assert!(t.bal(VALIDATORS[2]) < hot_before, "refused by the rules (charged to the key's own float, as any failed tx)");
+    // Through the multisig they change (its threshold here is one key).
+    t.tx(OWNER, Action::MultisigPropose { action: Box::new(terms(100, "10.0.0.9:30303", "")) }).unwrap();
+    assert_eq!(record(&t).0, 100);
 }
 
 // ---- tips (audit F01, F04, F06): the tip is a payment to the proposer, not a burn

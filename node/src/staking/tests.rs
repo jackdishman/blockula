@@ -2107,3 +2107,27 @@ fn a_consensus_key_changes_its_validators_terms_only_for_its_owner() {
     }
     t.block();
 }
+
+/// The boundary counts admissions again, against the members it carries over: a member that was
+/// ineligible when the others admitted a candidate (so the readiness went through without it) and
+/// is eligible again by the boundary must have admitted the newcomer too.
+#[test]
+fn the_boundary_counts_admissions_against_the_members_it_carries_over() {
+    let mut t = shrunk_to_two([900, 900]);
+    // Validator 1's owner sells below the minimum: for now validator 0 is the only eligible member.
+    let held = t.shares(&owner(1).address(), &vaddr(1)) as u64;
+    t.ok(&owner(1), Action::Undelegate { validator: vaddr(1), shares: held - 500 * FANG });
+    assert_eq!(members_admitting(&t.st, 1), Some(vec![vaddr(0)]));
+    assert!(admit(&mut t, 1, &vaddr(3)).unwrap_err().to_string().contains("only an eligible member"));
+    assert_eq!(admit(&mut t, 0, &vaddr(3)).unwrap(), Outcome::Applied);
+    ready_window(&mut t);
+    assert_eq!(show_up(&mut t, 3).unwrap(), Outcome::Applied, "one of one admitted it");
+    assert_eq!(select_next(&t.st, 1).joining, vec![vaddr(3)]);
+    // It bonds back before the boundary: it'll carry over, and it hasn't admitted validator 3.
+    t.ok(&owner(1), Action::Delegate { validator: vaddr(1), amount: 900 * FANG });
+    assert!(select_next(&t.st, 1).joining.is_empty(), "1 of the 2 members it would join");
+    assert_eq!(admit(&mut t, 1, &vaddr(3)).unwrap(), Outcome::Applied);
+    assert_eq!(select_next(&t.st, 1).joining, vec![vaddr(3)]);
+    t.finish_epoch();
+    assert_eq!(t.set(2).len(), 3);
+}

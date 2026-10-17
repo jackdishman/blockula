@@ -678,3 +678,63 @@ fn duties_past_the_lane_wait_a_block_not_the_backlog() {
     assert!(t.c.state.beacon.rounds[&2].contains_key(&me), "committed during epoch 0, under the backlog");
     std::fs::remove_dir_all(&t.root).ok();
 }
+
+/// Audit review-r2-consensus-2: a candidate's readiness (into a set of one or two) is sent by its
+/// node from the account that pays its beacon duties. Round 2's readiness was an ordinary untipped
+/// `UpdateValidator`, and the lane is a prefix of each sender's queue, so a reveal queued behind
+/// it was an ordinary tx too: refused or evicted under a full mempool of tipped txs, until the
+/// window closed and the validator was jailed for the miss. `ValidatorReady` is a lane duty while
+/// it would apply (one admitted candidate an epoch, once), so the reveal behind it stays in the
+/// lane, and both lead proposals.
+#[test]
+fn a_readiness_queued_ahead_of_a_reveal_keeps_it_in_the_lane() {
+    use crate::chain::MAX_MEMPOOL;
+    let mut t = net("ready", 3, None);
+    let home = t.homes[0].clone();
+    let me = t.c.me().unwrap();
+    let mut secrets = Secrets::open(&home).unwrap();
+    // A chain without admins (mainnet's): a set of one or two takes newcomers only by admission.
+    t.c.state.params.admins.clear();
+    assert_eq!(duties(&mut t.c, &mut secrets).unwrap(), vec!["committed to the beacon for epoch 2".to_string()]);
+    t.c.produce_block().unwrap();
+    // It sells below the minimum self-bond: out at the end of epoch 0, owing epoch 2's reveal.
+    let v0 = t.vals[0].clone_keys();
+    let shares = t.c.state.staking.delegations[&format!("{me}/{me}")].shares;
+    t.tx(&v0, Action::Undelegate { validator: me.clone(), shares: (shares * 3 / 4) as u64 }).unwrap();
+    t.advance_to(9);
+    assert!(!t.c.state.active_sets[&1].contains(&me) && t.c.state.active_sets[&1].len() == 2);
+    // It bonds back (an eligible candidate), and the set's two members admit it.
+    t.tx(&v0, Action::Delegate { validator: me.clone(), amount: 1_000 * DROPS_PER_FANG }).unwrap();
+    for i in [1, 2] {
+        let k = t.vals[i].clone_keys();
+        t.tx(&k, Action::AdmitValidator { validator: me.clone(), epoch: 1 }).unwrap();
+    }
+    // The epoch's last block: readiness counts there, and the reveal is due.
+    t.advance_to(18);
+    assert!(crate::staking::should_show_up(&t.c.state, &me, 19));
+    let senders = crowd(&mut t, 80, 3);
+    fill(&mut t, &senders, &me, MAX_MEMPOOL, 1);
+    assert_eq!(t.c.mempool.len(), MAX_MEMPOOL);
+    // The readiness goes first (a tick that ran before the reveal was due, say), the reveal behind it.
+    let ready = t.c.submit_system(Action::ValidatorReady { epoch: 1 }, "ready").unwrap().id();
+    assert_eq!(duties(&mut t.c, &mut secrets).unwrap(), vec!["revealed the beacon secret for epoch 2".to_string()]);
+    let reveal = t.c.mempool.iter().find(|tx| matches!(tx.action, Action::BeaconReveal { .. })).unwrap().id();
+    assert!(t.c.in_lane(&ready) && t.c.in_lane(&reveal), "both in the lane");
+    // Outbidding the cheapest tails evicts neither.
+    let late = &senders[79];
+    for _ in 0..20 {
+        let tx = pay(&t.c, late, &me, t.c.next_nonce(&late.address()), 2);
+        t.c.submit(tx).unwrap();
+    }
+    let queued = |t: &Net, id: &str| t.c.mempool.iter().any(|tx| tx.id() == id);
+    assert!(queued(&t, &ready) && queued(&t, &reveal) && t.c.mempool.len() == MAX_MEMPOOL + 2);
+    let order = t.c.proposal_txs();
+    assert_eq!((order[0].id(), order[1].id()), (ready.clone(), reveal.clone()), "both lead, in nonce order");
+    let block: Vec<Tx> = order.into_iter().take(20).cloned().collect();
+    t.c.produce_block_with(block).unwrap();
+    assert!(!t.c.state.beacon.values[&2].missed.contains(&me) && t.c.state.staking.pools[&me].jail.is_none(), "revealed in time: not jailed for a miss");
+    assert!(t.c.state.active_sets[&2].contains(&me), "admitted and ready: it joins");
+    // It changed nothing but its readiness record.
+    assert_eq!(t.c.state.staking.pools[&me].ready_at, Some(19));
+    std::fs::remove_dir_all(&t.root).ok();
+}
