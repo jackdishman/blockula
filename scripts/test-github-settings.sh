@@ -62,6 +62,8 @@ module.exports = {
   aliasIf: (s) => rep(rep(s, "env:\n  CARGO_TERM_COLOR: always\n", "env:\n  CARGO_TERM_COLOR: always\n  MAIN_ONLY: &main-only github.ref == 'refs/heads/main'\n"), HEAD, "    name: Clippy\n    if: *main-only\n"),
   capitalIf: (s) => rep(s, HEAD, "    name: Clippy\n    If: github.ref == 'refs/heads/main'\n"),
   mergeKey: (s) => rep(s, HEAD, HEAD + "    <<: { continue-on-error: true }\n"),
+  taggedMergeKey: (s) => rep(s, HEAD, HEAD + "    !!merge <<: { continue-on-error: true }\n"),
+  taggedIf: (s) => rep(s, HEAD, "    name: Clippy\n    if: !!str github.event_name != 'schedule'\n"),
   duplicateIf: (s) => rep(s, HEAD, HEAD + "    if: github.ref == 'refs/heads/main'\n"),
   secondDocument: (s) => s + "---\njobs:\n  clippy:\n    if: false\n",
   flowStepIf: (s) => rep(s, CHECK, "      - { run: scripts/clippy.sh,\n          if: false }\n"),
@@ -167,6 +169,8 @@ variant "a flow-style check step over two lines with if: false" 'its step "(unna
 variant "if: false on the check step" 'its step "(unnamed)" has if: false' wf/ci.yml jsf:booleanStepIf
 # What it can't read as GitHub does is refused, not skipped.
 variant "a merge key (<<) on a required job" "a merge key (<<)" wf/ci.yml jsf:mergeKey
+variant "a merge key tagged !!merge (the parser would merge it)" "a merge key (<<)" wf/ci.yml jsf:taggedMergeKey
+variant "an explicit tag, even on the allowed condition" "an explicit YAML tag (tag:yaml.org,2002:str)" wf/ci.yml jsf:taggedIf
 variant "a duplicate if: key" "ci.yml can't be read the way GitHub reads it" wf/ci.yml jsf:duplicateIf
 variant "a second YAML document" "2 YAML documents" wf/ci.yml jsf:secondDocument
 variant "a needs: that isn't a job id or a list" "its needs: ({\"job\":\"deps\"}) isn't a job id or a list of them" wf/ci.yml jsf:needsMap

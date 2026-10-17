@@ -120,7 +120,11 @@ function readYaml(file, f) {
     YAML.visit(doc, {
       Pair(_, pair) {
         if (!YAML.isScalar(pair.key)) problems.push(`a key that isn't a plain scalar (${String(pair.key)})`);
-        else if (pair.key.value === "<<") problems.push("a merge key (<<), which this checker doesn't expand");
+        else if (pair.key.value === "<<" || typeof pair.key.value === "symbol" || pair.key.source === "<<") problems.push("a merge key (<<), which this checker doesn't expand");
+      },
+      // Workflows need no explicit tags (!!str, !!merge, !custom), and they change how a node reads.
+      Node(_, node) {
+        if (node.tag) problems.push(`an explicit YAML tag (${node.tag})`);
       },
     });
   }
