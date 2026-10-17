@@ -1058,7 +1058,10 @@ fn a_cancellation_supersedes_upgrade_proposals_still_open() {
     let s7 = pass(&mut t, ProposalKind::ScheduleUpgrade { version: v + 5, activation_height: a + 200 });
     assert_eq!(describe_proposal(&t.st, t.p(c), &|_| None), format!("cancel the upgrade to protocol v{v} at block {a}; if it passes, every upgrade proposal made before it runs can't take effect (open now: #{s3} (v{} at block {}), #{s7} (v{} at block {}))", v + 1, a + 100, v + 5, a + 200));
     let ran = t.p(c).voting_end + 1;
-    t.through(ran);
+    t.through(ran - 1);
+    assert_eq!(t.p(c).status, ProposalStatus::Queued);
+    assert!(describe_proposal(&t.st, t.p(c), &|_| None).starts_with(&format!("cancel the upgrade to protocol v{v} at block {a}; when it runs at block {ran}, every upgrade proposal made before it runs can't take effect (open now: #{s3}")), "{}", describe_proposal(&t.st, t.p(c), &|_| None));
+    t.next();
     assert_eq!(t.p(c).status, ProposalStatus::Executed, "{}", t.p(c).outcome);
     assert_eq!((t.p(s3).status, t.p(s7).status), (ProposalStatus::Queued, ProposalStatus::Voting));
     assert_eq!(t.p(c).outcome, format!("cancelled the upgrade to protocol v{v} at block {a}; it supersedes the upgrade proposals still open, #{s3} (v{} at block {}), #{s7} (v{} at block {}), which can't take effect; versions through v{} are spent: ship the next upgrade as v{} or later", v + 1, a + 100, v + 5, a + 200, v + 1, v + 6));

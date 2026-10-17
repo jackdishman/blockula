@@ -1548,7 +1548,11 @@ pub fn describe_proposal(state: &State, p: &Proposal, primary_name: &dyn Fn(&str
     let open: Vec<String> = open_upgrade_proposals(state).iter().map(|(id, _, v, at)| format!("#{id} (v{v} at block {at})")).collect();
     let fail = "every upgrade proposal made before it runs can't take effect";
     also.push(if open.is_empty() { fail.to_string() } else { format!("{fail} (open now: {})", open.join(", ")) });
-    format!("{what}; if it passes, {}", also.join(", and "))
+    let when = match p.execute_at {
+        Some(at) if p.status == ProposalStatus::Queued => format!("when it runs at block {at}"),
+        _ => "if it passes".to_string(),
+    };
+    format!("{what}; {when}, {}", also.join(", and "))
 }
 
 #[cfg(test)]
