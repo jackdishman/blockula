@@ -5,7 +5,10 @@
 //! tags (variants in declaration order). Decoding is strict: no trailing bytes, map keys strictly
 //! increasing (`de_strict_order`), valid UTF-8, known tags. Every record type derives
 //! `BorshSerialize`/`BorshDeserialize` next to its definition; changing a field, its order or an
-//! enum's variants changes the state root, so it also bumps [`SCHEMA_VERSION`].
+//! enum's variants changes the state root, so it also bumps [`SCHEMA_VERSION`]. Proposals and
+//! multisig proposals store their `ProposalKind` and `Action` in the tx encoding (governance.rs),
+//! so a change to `Action::to_bytes` or `ProposalKind::to_bytes` is a state change too and bumps
+//! it the same way (`state::tests::stored_actions_move_with_the_schema`).
 //!
 //! Keys are bytes that sort like the map they come from: strings as UTF-8, integers big-endian.
 
@@ -39,10 +42,15 @@ use std::io::{Read, Write};
 /// keep the grace they were registered with (`grace_blocks`); the `upgrade` scalar record follows
 /// the schedule with what cancellations withdrew (`upgrade::Withdrawals`); Proof of Contribution
 /// gains namespaces 26 (withdrawn vouches that still count, `poc::DroppedVouch`) and 27 (GitHub
-/// handles governance holds for an account, `poc::HandleHold`). 8 (the third audit round): pools
-/// keep the consensus key's last update for its owner (`key_update_at`, F04's once-an-epoch limit,
+/// handles governance holds for an account, `poc::HandleHold`); and the round's signed-format
+/// changes change stored actions too (a multisig proposal holds its action in the tx encoding):
+/// `AddKey` carries the added key's public key and proof of possession, `Vote` its
+/// `proposal_digest` and `CommitVotes` its `pairs_digest`. 8 (the third audit round): pools keep
+/// the consensus key's last update for its owner (`key_update_at`, F04's once-an-epoch limit,
 /// apart from `ready_at`, which only `ValidatorReady` writes now) and the candidate they last
-/// admitted into a set of one or two (`admit`).
+/// admitted into a set of one or two (`admit`); and `Undelegate` (tag 31) gains `amount` after
+/// `shares`, which changes the stored action of a pending multisig `Undelegate` proposal (audit
+/// review-r3-wallet-2).
 pub const SCHEMA_VERSION: u32 = 8;
 
 pub fn encode<T: BorshSerialize + ?Sized>(v: &T) -> Vec<u8> {
