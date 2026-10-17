@@ -757,6 +757,21 @@ pub const MAX_RENEW_YEARS: u8 = 10;
 /// approved or expires, so it's bounded well below `MAX_TX_BYTES` (audit F17). A nested
 /// validator registration (~10.6 KiB: key and proof of possession) fits.
 pub const MAX_MULTISIG_ACTION_BYTES: usize = 12 << 10;
+/// Largest value of an integer field a tx carries as a JSON number rather than a string (ids,
+/// heights, PR numbers, nonces): 2^53 − 1, the largest a JavaScript number holds exactly
+/// (review-r2-clients-1). Clients compute `proposal_digest` and `action_digest` from the node's
+/// JSON of a stored proposal kind or multisig action, so a larger number, which would arrive
+/// rounded, would make it impossible to vote on or approve from JavaScript. Amounts travel as
+/// strings (`u64_str`) and aren't bounded by this.
+pub const MAX_JSON_INT: u64 = (1 << 53) - 1;
+
+/// [`MAX_JSON_INT`] for each named JSON-number field.
+fn check_json_ints(ints: &[(&str, u64)]) -> Result<()> {
+    if let Some((field, v)) = ints.iter().find(|(_, v)| *v > MAX_JSON_INT) {
+        bail!("{field} must be at most {MAX_JSON_INT} (2^53 − 1: it travels as a JSON number), not {v}");
+    }
+    Ok(())
+}
 
 /// What a juror commits to before revealing (hashed with BLAKE3). Mirrored in sdk-ts/src/tx.ts
 /// `seanceCommitment`.
@@ -1174,6 +1189,8 @@ impl Action {
 
     /// The action's own format rules (`Tx::check_format`). `nested`: inside a `MultisigPropose`.
     fn check_format(&self, nested: bool) -> Result<()> {
+        // First, so it's the rule a too-large number meets whatever else is wrong.
+        check_json_ints(&self.json_ints())?;
         let key_id_ok = |k: &str| k.len() == 64 && crypto::is_lower_hex(k);
         let addr = |field: &str, v: &str| -> Result<()> {
             if v.len() > MAX_ADDR {
@@ -1507,6 +1524,32 @@ impl Action {
         }
     }
 
+    /// The integer fields this action carries as JSON numbers (`u64` fields without `u64_str`;
+    /// a `Propose`'s include its kind's). [`MAX_JSON_INT`] bounds them all; a nested multisig
+    /// action is checked by its own `check_format`. `types::tests::json_number_fields_are_bounded`
+    /// pushes every vector action's JSON numbers past the bound, so a field missing here fails it.
+    fn json_ints(&self) -> Vec<(&'static str, u64)> {
+        match self {
+            Action::AddKey { role: KeyRole::Session { period_blocks, expires_at, .. }, .. } => vec![("period_blocks", *period_blocks), ("expires_at", *expires_at)],
+            Action::CreateHunt { issue, expires_at, .. } => vec![("issue", *issue), ("expires_at", *expires_at)],
+            Action::FundHunt { hunt_id, .. } | Action::CancelHunt { hunt_id } => vec![("hunt_id", *hunt_id)],
+            Action::AwardHunt { hunt_id, pr, .. } => vec![("hunt_id", *hunt_id), ("pr", *pr)],
+            Action::SetRepo { weight, .. } => vec![("weight", *weight)],
+            Action::GrantSoul { amount, .. } => vec![("amount", *amount)],
+            Action::SubmitClaim { pr, .. } => vec![("pr", *pr)],
+            Action::AttestClaim { claim_id, .. } | Action::RejectClaim { claim_id, .. } | Action::AttestRevert { claim_id, .. } => vec![("claim_id", *claim_id)],
+            Action::CommitVotes { seance_id, .. } => vec![("seance_id", *seance_id)],
+            Action::RevealVotes { seance_id, spam, .. } => std::iter::once(("seance_id", *seance_id)).chain(spam.iter().map(|id| ("spam", *id))).collect(),
+            Action::UpdateValidator { commission_bps, .. } => vec![("commission_bps", *commission_bps)],
+            Action::BeaconCommit { epoch, .. } | Action::BeaconReveal { epoch, .. } => vec![("epoch", *epoch)],
+            Action::Propose { kind, .. } => kind.json_ints(),
+            Action::Vote { proposal_id, .. } => vec![("proposal_id", *proposal_id)],
+            Action::MultisigApprove { id, .. } => vec![("id", *id)],
+            Action::ClaimDistribution { distribution_id, .. } => vec![("distribution_id", *distribution_id)],
+            _ => vec![],
+        }
+    }
+
     /// The action's JSON `type` (snake_case), e.g. `"delegate"`.
     pub fn kind(&self) -> &'static str {
         match self {
@@ -1711,8 +1754,23 @@ impl ProposalKind {
         Ok(k)
     }
 
+    /// The integer fields this kind carries as JSON numbers: at most [`MAX_JSON_INT`], so every
+    /// client computes its `proposal_digest` exactly (review-r2-clients-1).
+    fn json_ints(&self) -> Vec<(&'static str, u64)> {
+        match self {
+            ProposalKind::Distribution { distribution_id, claim_until, .. } => vec![("distribution_id", *distribution_id), ("claim_until", *claim_until)],
+            ProposalKind::SetRepo { weight, .. } => vec![("weight", *weight)],
+            ProposalKind::GrantSoul { amount, .. } => vec![("amount", *amount)],
+            ProposalKind::RejectClaim { claim_id, .. } => vec![("claim_id", *claim_id)],
+            ProposalKind::RefundHunt { hunt_id } => vec![("hunt_id", *hunt_id)],
+            ProposalKind::ScheduleUpgrade { activation_height, .. } | ProposalKind::CancelUpgrade { activation_height, .. } => vec![("activation_height", *activation_height)],
+            ProposalKind::ParamChange { .. } | ProposalKind::TreasurySpend { .. } | ProposalKind::FlagSybil { .. } | ProposalKind::Clawback { .. } | ProposalKind::UnlinkGithub { .. } | ProposalKind::ActivateFeature { .. } | ProposalKind::DeactivateFeature { .. } | ProposalKind::Text {} | ProposalKind::UnflagSybil { .. } => vec![],
+        }
+    }
+
     /// Stateless rules (stateful ones, like a parameter's bounds, apply when it executes).
     pub fn check(&self) -> Result<()> {
+        check_json_ints(&self.json_ints())?;
         match self {
             ProposalKind::ParamChange { key, .. } => {
                 if !crate::params::ChainParams::KEYS.contains(&key.as_str()) {
@@ -1962,6 +2020,7 @@ impl Tx {
         if self.chain_id.len() > MAX_CHAIN_ID {
             bail!("chain_id too long");
         }
+        check_json_ints(&[("nonce", self.nonce), ("valid_until", self.valid_until)])?;
         if self.genesis_hash.len() != 64 || !crypto::is_lower_hex(&self.genesis_hash) {
             bail!("genesis_hash must be the chain's genesis hash (32 bytes of lowercase hex, from /api/status)");
         }
@@ -2357,7 +2416,7 @@ pub(crate) mod tests {
     /// its signing bytes; the SDK must produce the same bytes from the JSON, and must refuse the
     /// out-of-range values the node's JSON parser refuses instead of wrapping them.
     fn tx_vectors() -> serde_json::Value {
-        const JS_MAX: u64 = (1 << 53) - 1;
+        const JS_MAX: u64 = MAX_JSON_INT;
         let unsigned = |tx: Tx| Tx { public_key: String::new(), signature: String::new(), ..tx };
         let mut cases: Vec<(String, Tx)> = vector_actions().into_iter().chain(v1_vector_actions()).chain(ghost_vector_actions()).chain(small_set_vector_actions()).map(|a| (format!("{} (tag {})", a.kind(), a.to_bytes()[0]), unsigned(vector_tx(a)))).collect();
         let base = unsigned(vector_tx(Action::Transfer { to: "x.boo".into(), amount: u64::MAX }));
@@ -2400,12 +2459,25 @@ pub(crate) mod tests {
             Action::Transfer { to: "bob.boo".into(), amount: 5_000_000_000 },
             Action::Propose { kind: ProposalKind::TreasurySpend { to: "boo1to".into(), amount: 9 }, deposit: 1, title: "Pay Bob".into(), url: String::new() },
             Action::AddKey { key_id: "ab".repeat(32), label: "Vlad’s phone 📱".into(), role: KeyRole::Session { limit: u64::MAX, period_blocks: 1, expires_at: JS_MAX }, public_key: "0c".into(), pop: "0d".into() },
+            // Every JSON-number field at the largest value the format rules allow
+            // (review-r2-clients-1): a JavaScript client computes the same digests.
+            Action::CreateHunt { repo: "a/b".into(), issue: JS_MAX, amount: u64::MAX, expires_at: JS_MAX, title: "t".into() },
+            Action::Propose { kind: ProposalKind::Distribution { distribution_id: JS_MAX, merkle_root: "ef".repeat(32), total: u64::MAX, claim_until: JS_MAX }, deposit: u64::MAX, title: "t".into(), url: String::new() },
+            Action::ClaimDistribution { distribution_id: JS_MAX, amount: u64::MAX, proof: vec!["ab".repeat(32)] },
         ]
         .into_iter()
         .map(|a| serde_json::json!({ "action": a, "digest": action_digest(&a) }))
         .collect::<Vec<_>>();
+        let at_bounds = [
+            ProposalKind::Distribution { distribution_id: JS_MAX, merkle_root: "ef".repeat(32), total: u64::MAX, claim_until: JS_MAX },
+            ProposalKind::ScheduleUpgrade { version: u32::MAX, activation_height: JS_MAX },
+            ProposalKind::CancelUpgrade { version: u32::MAX, activation_height: JS_MAX },
+            ProposalKind::RejectClaim { claim_id: JS_MAX, reason: "r".into() },
+            ProposalKind::RefundHunt { hunt_id: JS_MAX },
+        ];
         let proposals = [(ProposalKind::Text {}, "Plant garlic 🧄", "https://forum.example/p/1"), (ProposalKind::ParamChange { key: "max_validators".into(), value: u64::MAX }, "More validators", ""), (ProposalKind::GrantSoul { to: "boo1to".into(), amount: 1500, reason: "r".into() }, "", "")]
             .into_iter()
+            .chain(at_bounds.into_iter().map(|k| (k, "At the bounds", "")))
             .map(|(kind, title, url)| serde_json::json!({ "kind": kind, "title": title, "url": url, "digest": proposal_digest(&kind, title, url) }))
             .collect::<Vec<_>>();
         let pairs: [[(u64, &str, u64); 2]; 2] = [[(9, "c/d", 90), (7, "a/b", 70)], [(JS_MAX, "x/ÿ", JS_MAX), (0, "", 0)]];
@@ -2639,6 +2711,79 @@ pub(crate) mod tests {
         }
         assert_eq!(tags, (0..=54).chain(60..=61).collect(), "the vectors cover every action tag (55–59 are Ghost Mode's, unused)");
         assert_eq!(kinds, (0..=13).collect(), "and every proposal kind");
+    }
+
+    /// review-r2-clients-1: every integer field a tx carries as a JSON number (not a `u64_str`
+    /// string) is at most `MAX_JSON_INT` by the format rules, so a JavaScript client reads every
+    /// stored proposal kind and multisig action exactly and can compute what a vote or an
+    /// approval binds. Each vector action's JSON numbers (a proposal kind's and a nested multisig
+    /// action's too), pushed one at a time past the bound, make the format check fail with that
+    /// rule; at the bound they don't trip it. A field `json_ints` misses fails here.
+    #[test]
+    fn json_number_fields_are_bounded() {
+        fn numbers(v: &serde_json::Value, path: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+            match v {
+                serde_json::Value::Number(_) => out.push(path.clone()),
+                serde_json::Value::Object(m) => m.iter().for_each(|(k, v)| {
+                    path.push(k.clone());
+                    numbers(v, path, out);
+                    path.pop();
+                }),
+                serde_json::Value::Array(a) => a.iter().enumerate().for_each(|(i, v)| {
+                    path.push(i.to_string());
+                    numbers(v, path, out);
+                    path.pop();
+                }),
+                _ => {}
+            }
+        }
+        fn set(v: &mut serde_json::Value, path: &[String], n: u64) {
+            let mut at = v;
+            for p in path {
+                at = if at.is_array() { &mut at[p.parse::<usize>().unwrap()] } else { &mut at[p.as_str()] };
+            }
+            *at = n.into();
+        }
+        let propose = |kind: ProposalKind| Action::Propose { kind, deposit: 1, title: "t".into(), url: String::new() };
+        let wrap = |a: Action| Action::MultisigPropose { action: Box::new(a) };
+        let session = KeyRole::Session { limit: 1, period_blocks: 2, expires_at: 3 };
+        let extra = [
+            propose(ProposalKind::UnflagSybil { account: "x.boo".into(), reason: "r".into() }),
+            propose(ProposalKind::CancelUpgrade { version: 2, activation_height: 9 }),
+            wrap(Action::CreateHunt { repo: "a/b".into(), issue: 3, amount: 10, expires_at: 500, title: "t".into() }),
+            wrap(Action::AddKey { key_id: "cd".repeat(32), label: "agent".into(), role: session, public_key: "0e".into(), pop: "0f".into() }),
+            wrap(propose(ProposalKind::Distribution { distribution_id: 6, merkle_root: "ef".repeat(32), total: 100, claim_until: 5_000 })),
+            wrap(Action::RevealVotes { seance_id: 2, votes: "ab".into(), spam: vec![5], salt: "s".into() }),
+        ];
+        let rule = format!("must be at most {MAX_JSON_INT}");
+        let mut checked = 0;
+        for action in vector_actions().into_iter().chain(v1_vector_actions()).chain(ghost_vector_actions()).chain(extra) {
+            let json = serde_json::to_value(&action).unwrap();
+            let mut paths = vec![];
+            numbers(&json, &mut vec![], &mut paths);
+            for path in paths {
+                let at = |n: u64| {
+                    let mut j = json.clone();
+                    set(&mut j, &path, n);
+                    serde_json::from_value::<Action>(j).ok()
+                };
+                // u8 and u32 fields (conviction, threshold, years, version) can't hold it at all.
+                let Some(over) = at(MAX_JSON_INT + 1) else { continue };
+                let e = over.check_format(false).map_err(|e| format!("{e:#}"));
+                assert!(e.as_ref().is_err_and(|e| e.contains(&rule)), "{}: {path:?} past 2^53 − 1: {e:?}", action.kind());
+                let fine = at(MAX_JSON_INT).expect("the bound parses").check_format(false).map_err(|e| format!("{e:#}"));
+                assert!(fine.as_ref().is_ok() || fine.as_ref().is_err_and(|e| !e.contains(&rule)), "{}: {path:?} at 2^53 − 1: {fine:?}", action.kind());
+                checked += 1;
+            }
+        }
+        assert!(checked >= 40, "only {checked} JSON-number fields checked");
+        // The tx's own: its nonce and valid_until.
+        for field in ["nonce", "valid_until"] {
+            let mut j = serde_json::to_value(vector_tx(Action::Transfer { to: "x.boo".into(), amount: 5 })).unwrap();
+            j[field] = (MAX_JSON_INT + 1).into();
+            let e = serde_json::from_value::<Tx>(j).unwrap().check_format().unwrap_err().to_string();
+            assert!(e.contains(&format!("{field} {rule}")), "{e}");
+        }
     }
 
     #[test]

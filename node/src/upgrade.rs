@@ -22,9 +22,18 @@
 //! A withdrawn version number is spent (review-fix-ops-1): halts and readiness compare only
 //! numbers, so a fixed release can't share one with the release it replaces (binaries of the
 //! pulled one would run the re-scheduled version with the pulled rules); it ships as the next
-//! number. A cancellation also supersedes every `ScheduleUpgrade` proposed before it ran
-//! (review-fix-ops-2): they were proposed against the schedule it withdrew from, and their
-//! binaries build on the withdrawn rules, so they fail when they'd run ([`check_not_superseded`]).
+//! number. So are the numbers of upgrade proposals that passed and were still waiting to run
+//! when a cancellation ran (review-fix-ops-2: their releases may be out). A cancellation also
+//! supersedes every `ScheduleUpgrade` proposed before it ran: they were proposed against the
+//! schedule it withdrew from, and their binaries build on the withdrawn rules, so they fail when
+//! they'd run ([`check_not_superseded`]).
+//!
+//! Versions only move up in small steps, at most [`MAX_VERSION_STEP`] past the newest version
+//! ever scheduled or withdrawn ([`newest_version`]), and an upgrade activates at most
+//! [`MAX_UPGRADE_HORIZON_DAYS`] after the block that schedules it (review-r2-gov-1): no proposal,
+//! however it passed, can spend the number space or park the schedule out of reach, so a
+//! cancellation always leaves room to schedule the fixed release. No arithmetic on version
+//! numbers here can overflow (it saturates).
 
 // The governance levers are called by P-GOV.
 #![cfg_attr(not(test), allow(dead_code))]
@@ -44,6 +53,18 @@ use std::sync::Arc;
 /// 64 ancestors a proposer replays; a code bound, not a parameter, because lowering it would let
 /// a verifier reject a valid block.
 pub const MIN_UPGRADE_LEAD: u64 = 64;
+
+/// A `ScheduleUpgrade`'s version is at most this far past [`newest_version`] (review-r2-gov-1):
+/// enough for a release line to skip a few numbers, never enough for one proposal (a
+/// fat-fingered `u32::MAX`, `-1 >>> 0` from a script, or a deliberate one) to spend the number
+/// space, which a cancellation would then make permanent. A code bound, like the lead.
+pub const MAX_VERSION_STEP: u32 = 16;
+
+/// An upgrade activates at most this many days after the block that schedules it. Far enough
+/// for any schedule governance runs (the longest vote and timelock the parameters allow, then a
+/// cancellation's vote, take 270 days), and it keeps an activation height a JavaScript number
+/// holds exactly and the schedule within reach (a later upgrade must come after it).
+pub const MAX_UPGRADE_HORIZON_DAYS: u64 = 365;
 
 /// Exit codes of a node that stops on purpose (docs/OPERATIONS.md: systemd's
 /// `RestartPreventExitStatus=10 11 12` keeps it down until an operator acts).
@@ -162,21 +183,44 @@ pub fn is_active(state: &State, feature: &str) -> bool {
 // ---- levers (`ProposalKind::ScheduleUpgrade`, `CancelUpgrade`, `ActivateFeature`,
 // `DeactivateFeature`): no signer checks, governance (P-GOV) calls them when a proposal executes.
 
+/// The newest protocol version the chain has had scheduled (in force, still to come, or
+/// withdrawn since), or [`PROTOCOL_VERSION`]: a new upgrade names a version above it, and at most
+/// [`MAX_VERSION_STEP`] above it.
+pub fn newest_version(state: &State) -> u32 {
+    let scheduled = state.upgrade.schedule.last().map_or(PROTOCOL_VERSION, |u| u.version);
+    PROTOCOL_VERSION.max(scheduled).max(state.upgrade.withdrawals.highest)
+}
+
+/// The latest block an upgrade scheduled by a lever running at `height` may activate at.
+pub fn latest_activation(state: &State, height: u64) -> u64 {
+    height.saturating_add(MAX_UPGRADE_HORIZON_DAYS.saturating_mul(crate::params::blocks_per_day(state.params.block_time_ms)))
+}
+
 /// Whether protocol `version` could be scheduled from `activation_height` on by a lever that runs
-/// at `height`: at least [`MIN_UPGRADE_LEAD`] blocks later, after every scheduled upgrade, a
-/// newer version than all of them, and not a number a cancellation spent. A `ScheduleUpgrade`
-/// proposal is checked against it when it's made (with `height` the earliest block it can run
-/// in) and again when it runs.
+/// at `height`: at least [`MIN_UPGRADE_LEAD`] blocks later and at most
+/// [`MAX_UPGRADE_HORIZON_DAYS`], after every scheduled upgrade, a newer version than all of them,
+/// not a number a cancellation spent, and at most [`MAX_VERSION_STEP`] past [`newest_version`]. A
+/// `ScheduleUpgrade` proposal is checked against it when it's made (with `height` the earliest
+/// block it can run in) and again when it runs.
 pub fn check_schedule_upgrade(state: &State, version: u32, activation_height: u64, height: u64) -> Result<()> {
     if height.checked_add(MIN_UPGRADE_LEAD).is_none_or(|earliest| activation_height < earliest) {
         bail!("an upgrade must activate at least {MIN_UPGRADE_LEAD} blocks after block {height}");
+    }
+    let latest = latest_activation(state, height);
+    if activation_height > latest {
+        bail!("an upgrade activates at most {MAX_UPGRADE_HORIZON_DAYS} days after the block that schedules it: block {latest} at the latest after block {height}");
     }
     if version <= version_at(state, activation_height) {
         bail!("protocol v{version} isn't newer than v{} (in force at block {activation_height})", version_at(state, activation_height));
     }
     let spent = state.upgrade.withdrawals.highest;
     if version <= spent {
-        bail!("protocol v{version} isn't newer than v{spent}, which was scheduled and withdrawn: a version number is never reused (a binary of the withdrawn release would run it), so ship the fixed release as v{} or later", spent + 1);
+        bail!("protocol v{version} isn't newer than v{spent}, which was scheduled and withdrawn (or passed and was superseded): a version number is never reused (a binary of the withdrawn release would run it), so ship the fixed release as v{} or later", spent.saturating_add(1));
+    }
+    let newest = newest_version(state);
+    let most = newest.saturating_add(MAX_VERSION_STEP);
+    if version > most {
+        bail!("protocol v{version} is more than {MAX_VERSION_STEP} past v{newest}, the newest version scheduled or withdrawn: name v{}–v{most}", newest.saturating_add(1));
     }
     if let Some(last) = state.upgrade.schedule.last().filter(|u| u.activation_height >= activation_height) {
         bail!("v{} is already scheduled at block {}; a new upgrade must come after it", last.version, last.activation_height);
@@ -184,13 +228,15 @@ pub fn check_schedule_upgrade(state: &State, version: u32, activation_height: u6
     Ok(())
 }
 
-/// A `ScheduleUpgrade` proposed at `proposed_at` can still run: no cancellation ran in that
-/// block or after it (review-fix-ops-2). One that did withdrew an entry of the schedule the
-/// proposal was made against, and the proposal's release builds on the withdrawn rules.
-pub fn check_not_superseded(state: &State, proposed_at: u64) -> Result<()> {
+/// A `ScheduleUpgrade` of `version` proposed at `proposed_at` can still run: no cancellation ran
+/// in that block or after it (review-fix-ops-2). One that did withdrew an entry of the schedule
+/// the proposal was made against, and the proposal's release builds on the withdrawn rules, so
+/// it ships again under a number past both the spent ones and its own.
+pub fn check_not_superseded(state: &State, proposed_at: u64, version: u32) -> Result<()> {
     let w = &state.upgrade.withdrawals;
     if let Some(at) = w.last_at.filter(|at| proposed_at <= *at) {
-        bail!("superseded: it was proposed at block {proposed_at}, and the CancelUpgrade that ran at block {at} withdrew v{} from the schedule it was proposed against. Propose the upgrade again (as v{} or later)", w.highest, w.highest + 1);
+        let next = w.highest.max(version).saturating_add(1);
+        bail!("superseded: it was proposed at block {proposed_at}, and the CancelUpgrade that ran at block {at} withdrew upgrades from the schedule it was proposed against (versions through v{} are spent). Propose the upgrade again as v{next} or later: a release built as v{version} carries the withdrawn rules", w.highest);
     }
     Ok(())
 }
@@ -209,9 +255,11 @@ pub(crate) fn exec_schedule_upgrade(state: &mut State, j: &mut Journal, version:
 /// scheduling one is: a verifier within that many blocks of a height still knows its version
 /// for certain, and nothing that already activated (or is about to) is ever rewritten. Returns
 /// what it withdrew. The schedule stays strictly increasing (a prefix of it is kept); the
-/// withdrawn version numbers are spent, and every `ScheduleUpgrade` proposed by `height` is
-/// superseded ([`Withdrawals`]).
-pub(crate) fn exec_cancel_upgrade(state: &mut State, j: &mut Journal, version: u32, activation_height: u64, height: u64) -> Result<Vec<ScheduledUpgrade>> {
+/// withdrawn version numbers are spent, and so is `passed` (the highest version of the
+/// `ScheduleUpgrade` proposals that passed and haven't run, 0 for none: they're superseded, and
+/// their releases may be out), and every `ScheduleUpgrade` proposed by `height` is superseded
+/// ([`Withdrawals`]).
+pub(crate) fn exec_cancel_upgrade(state: &mut State, j: &mut Journal, version: u32, activation_height: u64, height: u64, passed: u32) -> Result<Vec<ScheduledUpgrade>> {
     let i = scheduled(state, version, activation_height)?;
     if height.checked_add(MIN_UPGRADE_LEAD).is_none_or(|earliest| activation_height < earliest) {
         bail!("v{version} activates at block {activation_height}, less than {MIN_UPGRADE_LEAD} blocks after block {height}: too late to cancel on chain");
@@ -219,7 +267,7 @@ pub(crate) fn exec_cancel_upgrade(state: &mut State, j: &mut Journal, version: u
     j.upgrade.save(&state.upgrade);
     let withdrawn = state.upgrade.schedule.split_off(i);
     let w = &mut state.upgrade.withdrawals;
-    w.highest = w.highest.max(withdrawn.last().expect("at least the named entry").version);
+    w.highest = w.highest.max(withdrawn.last().expect("at least the named entry").version).max(passed);
     w.last_at = Some(height);
     Ok(withdrawn)
 }
@@ -488,14 +536,14 @@ mod tests {
         exec_schedule_upgrade(&mut st, &mut j, 4, 600, 100).unwrap();
         let before = st.upgrade.schedule.clone();
         // Only the exact entry, only at least the lead before it, and nothing past it.
-        assert!(exec_cancel_upgrade(&mut st, &mut j, 3, 401, 100).unwrap_err().to_string().contains("scheduled at block 400, not 401"));
-        assert!(exec_cancel_upgrade(&mut st, &mut j, 5, 700, 100).unwrap_err().to_string().contains("no upgrade to v5"));
-        assert!(exec_cancel_upgrade(&mut st, &mut j, 2, 200, 200 - MIN_UPGRADE_LEAD + 1).unwrap_err().to_string().contains("too late"));
-        assert!(exec_cancel_upgrade(&mut st, &mut j, 2, 200, 250).unwrap_err().to_string().contains("too late"), "it already activated");
-        assert!(exec_cancel_upgrade(&mut st, &mut j, 4, 600, u64::MAX).is_err(), "the lead can't wrap");
+        assert!(exec_cancel_upgrade(&mut st, &mut j, 3, 401, 100, 0).unwrap_err().to_string().contains("scheduled at block 400, not 401"));
+        assert!(exec_cancel_upgrade(&mut st, &mut j, 5, 700, 100, 0).unwrap_err().to_string().contains("no upgrade to v5"));
+        assert!(exec_cancel_upgrade(&mut st, &mut j, 2, 200, 200 - MIN_UPGRADE_LEAD + 1, 0).unwrap_err().to_string().contains("too late"));
+        assert!(exec_cancel_upgrade(&mut st, &mut j, 2, 200, 250, 0).unwrap_err().to_string().contains("too late"), "it already activated");
+        assert!(exec_cancel_upgrade(&mut st, &mut j, 4, 600, u64::MAX, 0).is_err(), "the lead can't wrap");
         assert_eq!(st.upgrade.schedule, before, "refusals change nothing");
         // v3 goes, and v4, which was scheduled to follow it; v2 (already in force) stays.
-        let withdrawn = exec_cancel_upgrade(&mut st, &mut j, 3, 400, 400 - MIN_UPGRADE_LEAD).unwrap();
+        let withdrawn = exec_cancel_upgrade(&mut st, &mut j, 3, 400, 400 - MIN_UPGRADE_LEAD, 0).unwrap();
         assert_eq!(withdrawn, before[1..]);
         assert_eq!(st.upgrade.schedule, before[..1]);
         assert_eq!((version_at(&st, 399), version_at(&st, 400), version_at(&st, 600)), (2, 2, 2));
@@ -504,7 +552,7 @@ mod tests {
         // (review-fix-ops-1): a binary of the pulled release would run a re-scheduled v3 with its
         // own rules, so the fixed release ships as v5.
         assert_eq!(st.upgrade.withdrawals, Withdrawals { highest: 4, last_at: Some(400 - MIN_UPGRADE_LEAD) });
-        assert!(exec_cancel_upgrade(&mut st, &mut j, 3, 400, 300).unwrap_err().to_string().contains("no upgrade to v3"));
+        assert!(exec_cancel_upgrade(&mut st, &mut j, 3, 400, 300, 0).unwrap_err().to_string().contains("no upgrade to v3"));
         for v in [3, 4] {
             let e = exec_schedule_upgrade(&mut st, &mut j, v, 500, 400).unwrap_err().to_string();
             assert!(e.contains("never reused") && e.contains("as v5 or later"), "{e}");
@@ -513,8 +561,8 @@ mod tests {
         assert_eq!(version_at(&st, 500), 5);
         check_invariants(&st).unwrap();
         // Superseded: anything proposed by the block the cancellation ran in.
-        assert!(check_not_superseded(&st, 400 - MIN_UPGRADE_LEAD).unwrap_err().to_string().contains("superseded"));
-        check_not_superseded(&st, 401 - MIN_UPGRADE_LEAD).unwrap();
+        assert!(check_not_superseded(&st, 400 - MIN_UPGRADE_LEAD, 2).unwrap_err().to_string().contains("superseded"));
+        check_not_superseded(&st, 401 - MIN_UPGRADE_LEAD, 2).unwrap();
         // The journal restores the schedule and the withdrawals as they were before the first change.
         j.upgrade.rollback(&mut st.upgrade);
         assert!(st.upgrade.schedule.is_empty());

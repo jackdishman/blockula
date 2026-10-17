@@ -1994,7 +1994,7 @@ fn proposal_json(v: &ReadView, p: &crate::governance::Proposal) -> Value {
         "title": p.title,
         "url": p.url,
         "kind": p.kind,
-        "summary": crate::governance::describe_kind(st, &p.kind, &|a| v.primary_name(a)),
+        "summary": crate::governance::describe_proposal(st, p, &|a| v.primary_name(a)),
         "proposer": label(v, &p.proposer),
         "deposit": p.deposit.to_string(),
         "deposit_display": fmt_fang(p.deposit),
@@ -2043,6 +2043,8 @@ async fn proposals(State(n): State<Node>, Query(q): Query<ProposalQuery>) -> Api
         "next_id": g.next_proposal_id,
         // A distribution id no distribution or open proposal uses: what a new tree is built for.
         "next_distribution_id": crate::governance::next_distribution_id(st),
+        // The largest id a `Distribution` proposed now may name (the next proposal id + 1,000).
+        "max_distribution_id": crate::governance::max_distribution_id(st),
         "council_active": v.height < cp.bootstrap_end_height,
         "spending_open": v.height >= cp.governance_spend_height,
         "params": {
