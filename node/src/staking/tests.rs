@@ -1215,7 +1215,7 @@ fn missed_leader_slots_jail_and_the_validator_may_unjail_later() {
 
 #[test]
 fn liveness_rings_slide_and_saturate() {
-    let mut l = Liveness::new(10);
+    let mut l = Liveness::new(10, 3);
     assert_eq!(l.bits.len(), 2);
     for i in 0..10 {
         l.push(i % 3 == 0); // misses at 0, 3, 6, 9
@@ -1644,8 +1644,7 @@ fn reward(t: &mut T, v: &str, amount: u64) {
     let mut j = Journal::default();
     t.st.j_mint(&mut j, amount);
     let height = t.height;
-    let _ = height;
-    credit_reward(&mut t.st, &mut j, v, amount);
+    credit_reward(&mut t.st, &mut j, v, amount, height);
 }
 
 /// Sets validator `v`'s stored commission directly (genesis can't go past the cap; the tests
@@ -1682,11 +1681,13 @@ fn unrealized_gains_on_locked_stake_dont_vote() {
     assert_eq!(crate::econ::voting_balance(&t.st, &f, t.height), 0, "unrealized gains on locked stake don't vote");
     let mut j = Journal::default();
     assert!(crate::econ::lock(&mut t.st, &mut j, &f, "vote:0".into(), FANG, 100, t.height).is_err());
-    // The quorum base counts exactly what accounts could vote with.
+    // The quorum base is what accounts could vote with (plus the pools' rounding dust, which no
+    // delegation's value carries: under a drop per pool).
     let system = [t.st.treasury(), t.st.bootstrap(), t.st.pool(), crate::chain::endowment("boo"), crate::chain::community("boo")];
     let votable: u128 = t.st.accounts.keys().filter(|a| !system.contains(*a)).map(|a| crate::econ::voting_balance(&t.st, a, t.height) as u128).sum();
-    assert_eq!(crate::governance::unlocked_supply(&t.st, t.height), votable);
-    assert_eq!(crate::governance::unlocked_supply_by_walk(&t.st, t.height), votable);
+    let base = crate::governance::unlocked_supply(&t.st, t.height);
+    assert_eq!(base, crate::governance::unlocked_supply_by_walk(&t.st, t.height));
+    assert!((votable..=votable + t.st.staking.pools.len() as u128).contains(&base), "{base} vs {votable}");
     // Sold, the gain joins the vesting lock: still nothing votes before the cliff.
     let shares = t.shares(&f, &v) as u64;
     t.ok(&founder, Action::Undelegate { validator: v.clone(), shares });
@@ -1777,7 +1778,7 @@ fn the_bootstrap_delegation_pays_at_most_the_capped_commission() {
     t.finish_epoch();
     assert_eq!(delegation_value(&t.st, &boot, &v), 400_000 * FANG);
     set_commission(&mut t, &v, 10_000);
-    let (o, cap) = (owner(0).address(), 1_000u64);
+    let (o, cap) = (owner(0).address(), t.st.chain_params.bootstrap_commission_cap_bps);
     assert_eq!(cap, 1_000);
     let (bond, treasury_before) = (self_bond(&t.st, &v), t.balance(&treasury));
     reward(&mut t, &v, 41_000 * FANG);

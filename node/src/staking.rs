@@ -115,6 +115,11 @@ pub struct Pool {
     /// (the start of the earliest punished fault's epoch). A double-signer is slashed once: later
     /// evidence only reaches stake that left the pool before this height (audit F05/F07/F60).
     pub slashed_from: Option<u64>,
+    /// The last height the validator's own consensus key signed an `UpdateValidator` for it: proof
+    /// its node is running and synced. A set below four admits only a newcomer that showed up in
+    /// the epoch ([`select_next`], audit review-fix-staking-2), and the key updates the validator
+    /// for its owner at most once per epoch (audit F04).
+    pub ready_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -166,6 +171,10 @@ impl Entry {
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Liveness {
     pub window: u64,
+    /// The `downtime_max_missed` the ring was recorded under: a ring judged by another limit
+    /// starts afresh, as for another window, so a lowered limit never jails for misses the old
+    /// one allowed (audit gap-6-4).
+    pub max_missed: u64,
     pub bits: Vec<u8>,
     /// Where the next slot goes in the ring.
     pub next: u64,
@@ -178,8 +187,8 @@ pub struct Liveness {
 }
 
 impl Liveness {
-    fn new(window: u64) -> Self {
-        Self { window, bits: vec![0; window.div_ceil(8) as usize], next: 0, filled: 0, missed: 0, led: 0, missed_total: 0 }
+    fn new(window: u64, max_missed: u64) -> Self {
+        Self { window, max_missed, bits: vec![0; window.div_ceil(8) as usize], next: 0, filled: 0, missed: 0, led: 0, missed_total: 0 }
     }
 
     fn bit(&self, i: u64) -> bool {
@@ -712,7 +721,15 @@ pub(crate) fn apply(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, s
             let epoch = state.params.epoch_of(height);
             let current = state.validators[&v].commission_bps;
             let pool = state.staking.pools.get(&v).cloned().unwrap_or_default();
-            let base = if pool.commission_epoch == epoch { pool.commission_base } else { current };
+            // Its own consensus key signed it: the validator's node is up (readiness). Signed that
+            // way for its owner (SF-13, the owner pays), it updates the validator once an epoch.
+            let by_its_key = validator_of_key(state, signer).as_deref() == Some(v.as_str());
+            let for_owner = by_its_key && !state.keys_of(sender).contains_key(signer);
+            if for_owner && pool.ready_at.is_some_and(|h| state.params.epoch_of(h) == epoch) {
+                bail!("validator {}'s consensus key already updated it for its owner in epoch {epoch} (once an epoch; its owner's own key isn't limited)", short(&v));
+            }
+            // Measured from at most the cap: a validator above a lowered cap steps down to it at once.
+            let base = if pool.commission_epoch == epoch { pool.commission_base } else { current }.min(max);
             if commission_bps.abs_diff(base) > step {
                 bail!("commission can move at most {} points per epoch: {}%–{}% this epoch", fmt_bps(step), fmt_bps(base.saturating_sub(step)), fmt_bps((base + step).min(max)));
             }
@@ -724,6 +741,9 @@ pub(crate) fn apply(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, s
             }
             if let Some(p) = pool_mut(state, j, &v) {
                 (p.commission_base, p.commission_epoch) = (base, epoch);
+                if by_its_key {
+                    p.ready_at = Some(height);
+                }
             }
             let rec = state.validator_mut(j, &v).expect("owned_validator checked it");
             rec.commission_bps = *commission_bps;
@@ -1282,7 +1302,8 @@ fn score_leader_slots(state: &mut State, j: &mut Journal, b: &BlockInfo) {
         if out(pool) {
             continue;
         }
-        let mut l = state.staking.liveness.get(v).filter(|l| l.window == window).cloned().unwrap_or_else(|| Liveness::new(window));
+        // A ring recorded under another window or limit starts afresh (audit gap-6-4).
+        let mut l = state.staking.liveness.get(v).filter(|l| (l.window, l.max_missed) == (window, max_missed)).cloned().unwrap_or_else(|| Liveness::new(window, max_missed));
         if missed[i] {
             l.push(true);
         }
@@ -1591,8 +1612,8 @@ fn holdings_valued(state: &State, account: &str, at_cost: bool) -> (u64, u64) {
 
 /// Pays `amount` of issuance (already minted by the caller) to the pools of the validators
 /// active at `height`, pro rata to stake; jailed and tombstoned validators get none. Each pool's
-/// owner gets its commission as new shares. Returns what was paid: the caller burns the rest or
-/// sends it to the treasury.
+/// owner gets its commission as new shares ([`credit_reward`]). Returns what was paid: the caller
+/// burns the rest or sends it to the treasury.
 pub fn distribute_rewards(state: &mut State, j: &mut Journal, amount: u64, height: u64) -> u64 {
     let epoch = state.params.epoch_of(height);
     let mut paid_to: Vec<(String, u64)> = state
@@ -1609,31 +1630,70 @@ pub fn distribute_rewards(state: &mut State, j: &mut Journal, amount: u64, heigh
     for (v, stake) in paid_to {
         let reward = (amount as u128 * stake as u128 / total) as u64;
         if reward > 0 {
-            credit_reward(state, j, &v, reward);
+            credit_reward(state, j, &v, reward, height);
             paid += reward;
         }
     }
     paid
 }
 
-/// Adds `reward` to a pool: every share gains, and the owner gets its commission as new shares
-/// worth (at most) the commission.
-fn credit_reward(state: &mut State, j: &mut Journal, validator: &str, reward: u64) {
-    let (owner, bps) = state.validators.get(validator).map(|r| (r.owner.clone(), r.commission_bps)).unwrap_or_default();
+/// The commission a validator charges now: its own, at most `commission_max_bps` (a lowered cap
+/// binds every validator at once; audit gap-5-1, gap-6-2).
+pub fn commission_rate(state: &State, validator: &str) -> u64 {
+    state.validators.get(validator).map_or(0, |r| r.commission_bps.min(state.chain_params.commission_max_bps))
+}
+
+/// Accounts with unvested tokens at `height` (insiders, 3.7), the keyless bootstrap delegation
+/// aside. Only genesis allocations carry vesting locks, so this is O(vesting accounts).
+pub fn insiders(state: &State, height: u64) -> Vec<String> {
+    let boot = state.bootstrap();
+    state.accounts.indexed().into_iter().filter(|a| *a != boot && has_unvested_lock(state, a, height)).collect()
+}
+
+/// Adds `reward` to a pool at `height`: every share gains, less the commission ([`commission_rate`]
+/// of the reward), which every share pays alike, so shares stay one price. The owner gets it as new
+/// shares worth (at most) it, except the part paid on stake that may not pay an owner it chose,
+/// which goes to the treasury:
+///
+/// * stake of accounts still vesting (other than the owner's own): none to the owner, so locked
+///   tokens yield no liquid income through a validator their holder picked, its own non-vesting
+///   account or an accomplice's at 100% (3.7, audit xcut-economic-3);
+/// * the bootstrap delegation's stake: at most `bootstrap_commission_cap_bps` to the owner (DEC-5:
+///   its rewards are the treasury's; audit F12, review-fix-gov-1).
+fn credit_reward(state: &mut State, j: &mut Journal, validator: &str, reward: u64, height: u64) {
+    let (owner, bps) = (state.validators.get(validator).map(|r| r.owner.clone()).unwrap_or_default(), commission_rate(state, validator));
     let commission = bps_of(reward, bps);
+    let to_owner = if commission == 0 { 0 } else { owners_commission(state, validator, &owner, reward, bps, height).min(commission) };
+    let to_treasury = commission - to_owner;
     let p = pool_mut(state, j, validator).expect("rewarded pools exist");
-    p.stake += reward;
-    p.rewards += reward;
-    // Shares that make `commission` of the new stake: commission × shares / (the rest of it).
-    let minted = mul_div(commission as u128, p.shares, (p.stake - commission) as u128).unwrap_or(0);
-    if minted == 0 {
-        return;
+    p.stake += reward - to_treasury;
+    p.rewards += reward - to_treasury;
+    // Shares that make `to_owner` of the new stake: to_owner × shares / (the rest of it).
+    let minted = mul_div(to_owner as u128, p.shares, (p.stake - to_owner) as u128).unwrap_or(0);
+    if minted > 0 {
+        p.shares += minted;
+        let key = dkey(&owner, validator);
+        let mut d = state.staking.delegations.get(&key).cloned().unwrap_or_default();
+        d.shares += minted;
+        put_delegation(state, j, &key, Some(d));
     }
-    p.shares += minted;
-    let key = dkey(&owner, validator);
-    let mut d = state.staking.delegations.get(&key).cloned().unwrap_or_default();
-    d.shares += minted;
-    put_delegation(state, j, &key, Some(d));
+    if to_treasury > 0 {
+        let treasury = state.treasury();
+        state.j_credit(j, &treasury, to_treasury);
+    }
+}
+
+/// What of a `reward`'s commission (at `bps`) the pool's owner gets (see [`credit_reward`]): the
+/// full rate on the part earned by shares that aren't insiders' or the bootstrap delegation's, at
+/// most `bootstrap_commission_cap_bps` on the bootstrap's part, nothing on insiders' parts.
+fn owners_commission(state: &State, validator: &str, owner: &str, reward: u64, bps: u64, height: u64) -> u64 {
+    let Some(shares) = state.staking.pools.get(validator).map(|p| p.shares).filter(|s| *s > 0) else { return 0 };
+    let held = |a: &str| if a == owner { 0 } else { state.staking.delegations.get(&dkey(a, validator)).map_or(0, |d| d.shares) };
+    let part = |s: u128| mul_div(reward as u128, s, shares).unwrap_or(0).min(reward as u128) as u64;
+    let boot = part(held(&state.bootstrap()));
+    let locked = part(insiders(state, height).iter().map(|a| held(a)).sum());
+    let rest = reward.saturating_sub(boot).saturating_sub(locked);
+    bps_of(rest, bps) + bps_of(boot, bps.min(state.chain_params.bootstrap_commission_cap_bps))
 }
 
 /// The active validator (in `epoch`) the tx sender or signer acts for: the validator whose
