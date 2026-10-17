@@ -118,6 +118,15 @@ pool=$(echo "$C" | j 'v.pool.balance')
 jurors=$(get "$RPC/api/souls?limit=10" | j 'v.souls.filter(s => s.soul.points >= 24000).length')
 [ "$jurors" -ge 3 ] || fail "founding jurors' Soul: $(get "$RPC/api/souls?limit=10")"
 echo "✓ the contribution pool is open: jackdishman/blockula, $(node -p "Number(BigInt('$pool') / 10n**9n)") FANG, $jurors founding jurors with Soul"
+# A founding juror (a stand-in key launch.sh made) takes the faucet and joins the juror pool: its
+# genesis Soul is what seats it.
+J0=$NET/juror-0.json; J0ADDR=$(jq -r .address "$J0")
+curl -fsS -X POST -H 'content-type: application/json' -d "{\"to\":\"$J0ADDR\"}" "$RPC/api/faucet" > /dev/null
+until_true "juror-0's drip" 60 sh -c "curl -fsS '$RPC/api/account/$J0ADDR' | grep -q '\"balance\":\"100000000000\"'"
+"$BIN" contrib join-jury --key "$J0" --rpc "$RPC" --chain-id "$CHAIN_ID" --genesis-hash "$GHASH" | tail -1
+in_pool() { [ "$(get "$RPC/api/contributions" | j 'v.jurors.pool')" -ge 1 ]; }
+until_true "a founding juror in the juror pool" 30 in_pool
+echo "✓ a founding juror joined the juror pool on its genesis Soul"
 
 # A validator goes offline: jailed (downtime), out at the boundary.
 V3=$(jq -r .address "$NET/v3/consensus.json")

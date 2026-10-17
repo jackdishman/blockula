@@ -528,6 +528,30 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// Every genesis a release ships (`genesis/<chain id>/genesis.json`, attached by release.yml
+    /// as `genesis-<chain id>.json`) is its directory's chain and hashes to the genesis this
+    /// binary pins for it (scripts/pin-network.sh writes both), so the release PR can't ship a
+    /// genesis its own nodes would refuse; with its spec and operator files next to it, they
+    /// rebuild it byte for byte.
+    #[test]
+    fn shipped_genesis_files_are_the_pinned_ones() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../genesis");
+        let Ok(entries) = std::fs::read_dir(&dir) else { return };
+        for e in entries {
+            let e = e.unwrap();
+            let chain = e.file_name().to_string_lossy().into_owned();
+            let path = e.path().join("genesis.json");
+            let g = Genesis::load(&path).unwrap_or_else(|err| panic!("{}: {err:#}", path.display()));
+            assert_eq!(g.chain_id, chain, "{} is another chain's genesis", path.display());
+            let known = embedded().iter().find(|k| k.chain_id == chain).unwrap_or_else(|| panic!("genesis/{chain}/ ships, but node/checkpoints/{chain}.json isn't embedded (scripts/pin-network.sh)"));
+            assert_eq!(genesis_hash(&g), known.genesis_hash, "genesis/{chain}/genesis.json isn't the genesis this binary pins");
+            if e.path().join("spec.toml").exists() {
+                let built = crate::genesis_builder::build(&e.path().join("spec.toml"), false).unwrap();
+                assert_eq!(built.json, std::fs::read_to_string(&path).unwrap(), "genesis/{chain}/spec.toml doesn't rebuild genesis.json");
+            }
+        }
+    }
+
     #[test]
     fn a_genesis_must_be_pinned_or_known() {
         let (root, _, g) = summoned("pin", 1);

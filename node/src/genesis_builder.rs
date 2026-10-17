@@ -464,6 +464,13 @@ pub fn build_from(spec: &Spec, operators: &[OperatorFile], strict: bool) -> Resu
         ensure!(pool_repos.insert(key.clone(), r.weight).is_none(), "contribution.repo: {key} is listed twice");
     }
     let soul_ledger = spec.soul_ledger.iter().map(|s| Ok(SoulEntry { account: s.account.clone(), soul: parse_soul(&s.soul).with_context(|| format!("soul for {}", s.account))?, reason: s.reason.clone() })).collect::<Result<Vec<_>>>()?;
+    // The founder's and the foundation's accounts (and the owners of seats they run) start with
+    // no Soul: no jury seats or pool claims while their vesting runs (docs/TOKENOMICS.md, "What
+    // the founder must not do"). Founding jurors are other people.
+    let excluded = bootstrap_excluded(spec, operators);
+    for e in soul_ledger.iter().filter(|e| e.soul > 0) {
+        ensure!(!excluded.contains(&e.account), "soul: {} is the founder's or the foundation's (or a seat they run), whose Soul is 0 at genesis (docs/TOKENOMICS.md)", e.account);
+    }
 
     let genesis = Genesis {
         chain_id: spec.chain_id.clone(),
@@ -483,7 +490,7 @@ pub fn build_from(spec: &Spec, operators: &[OperatorFile], strict: bool) -> Resu
         reserved_names: spec.reserved_names.clone(),
         soul_ledger,
         features: spec.features.clone(),
-        bootstrap_excluded: bootstrap_excluded(spec, operators),
+        bootstrap_excluded: excluded,
         pool_repos,
     };
     ensure!(!genesis.validators.is_empty(), "a genesis needs at least one operator");
@@ -910,6 +917,14 @@ mod tests {
         refuse(&with(&pool.replace("\"100000\"", "\"0\""), 150_000_000), "opening_balance must be more than 0");
         refuse(&with(&pool.replace("seance_blocks = 259200", "seance_blocks = 2"), 149_900_000), "seance_blocks ≥ 3");
         assert!(toml::from_str::<Spec>(&format!("{}[contribution]\nwarp = 1\n", toml_of(&spec_for("x", "tboo", &ops, "")))).is_err(), "unknown fields are refused");
+        // The founder's and the foundation's accounts start with no Soul (TOKENOMICS: no jury
+        // seats while vesting runs); a 0 entry is fine.
+        let founder = Keys::from_seed([0x30; 32]).address_with("tboo");
+        let mut with_founder = spec.clone();
+        with_founder.soul_ledger.push(SpecSoul { account: founder.clone(), soul: "5".into(), reason: "juror".into() });
+        refuse(&with_founder, "is the founder's or the foundation's");
+        with_founder.soul_ledger.last_mut().unwrap().soul = "0".into();
+        build_from(&with_founder, &ops, false).unwrap();
     }
 
     /// A spec as TOML again (the tests build specs as values, then add sections as text).
