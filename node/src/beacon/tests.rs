@@ -738,3 +738,40 @@ fn a_readiness_queued_ahead_of_a_reveal_keeps_it_in_the_lane() {
     assert_eq!(t.c.state.staking.pools[&me].ready_at, Some(19));
     std::fs::remove_dir_all(&t.root).ok();
 }
+
+/// Audit review-fix-staking-2: a candidate's node signals readiness by itself, but only once a
+/// quorum of the set's members admitted it (their operators' call: no node admits anyone), only
+/// in the epoch's last tenth, and once.
+#[test]
+fn duties_signal_readiness_only_once_admitted_and_in_the_window() {
+    let mut t = net("admit", 3, None);
+    let home = t.homes[0].clone();
+    let me = t.c.me().unwrap();
+    let mut secrets = Secrets::open(&home).unwrap();
+    t.c.state.params.admins.clear();
+    let v0 = t.vals[0].clone_keys();
+    let shares = t.c.state.staking.delegations[&format!("{me}/{me}")].shares;
+    t.tx(&v0, Action::Undelegate { validator: me.clone(), shares: (shares * 3 / 4) as u64 }).unwrap();
+    t.advance_to(9);
+    t.tx(&v0, Action::Delegate { validator: me.clone(), amount: 1_000 * DROPS_PER_FANG }).unwrap();
+    let ready = |t: &Net| t.c.mempool.iter().filter(|tx| matches!(tx.action, Action::ValidatorReady { .. })).count();
+    // Not admitted: nothing, even in the window.
+    t.advance_to(18);
+    assert!(duties(&mut t.c, &mut secrets).unwrap().is_empty() && ready(&t) == 0);
+    t.c.produce_block_with(vec![]).unwrap();
+    assert_eq!(t.c.state.active_sets[&2].len(), 2, "not admitted: it stays out");
+    // Epoch 2: both members admit it; its node waits for the window, then signals once.
+    for i in [1, 2] {
+        let k = t.vals[i].clone_keys();
+        t.tx(&k, Action::AdmitValidator { validator: me.clone(), epoch: 2 }).unwrap();
+    }
+    assert!(duties(&mut t.c, &mut secrets).unwrap().is_empty() && ready(&t) == 0, "before the epoch's last tenth");
+    t.advance_to(28);
+    assert_eq!(duties(&mut t.c, &mut secrets).unwrap(), vec!["showed up to join the validator set (epoch 2)".to_string()]);
+    assert!(duties(&mut t.c, &mut secrets).unwrap().is_empty() && ready(&t) == 1, "once");
+    let before = t.c.state.validators[&me].commission_bps;
+    t.c.produce_block().unwrap();
+    assert_eq!((t.c.state.staking.pools[&me].ready_at, t.c.state.validators[&me].commission_bps), (Some(29), before));
+    assert!(t.c.state.active_sets[&3].contains(&me), "admitted and ready: it joins");
+    std::fs::remove_dir_all(&t.root).ok();
+}
