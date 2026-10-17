@@ -263,8 +263,16 @@ const views = {
   },
   async tx(id) {
     const t = await api("/tx/" + id);
+    // Answered from the node's failure memory, without the tx. `dropped: false`: it ran in a block
+    // and failed, so its fee was charged; that's final. Anything else (`dropped: true`, or an older
+    // node that doesn't say) was dropped unrun: nothing was charged, but it isn't dead, since
+    // another node may still include it, so it must not be re-sent yet (audit review-fix-clients-2).
     if (t.status === "failed" && !t.from) {
-      return card(`<span class="eyebrow">Transaction</span><div class="summary">This transaction didn't go through</div><span class="pill failed">failed</span><p>${esc(t.error || "")}</p><p class="dim">It was dropped around block #${t.height}. Nothing moved; if it was included, only the fee was charged.</p>`);
+      const at = /^\d+$/.test(String(t.height ?? "")) ? Number(t.height) : null;
+      if (t.dropped === false) {
+        return card(`<span class="eyebrow">Transaction</span><div class="summary">This transaction failed</div><span class="pill failed">failed</span><p>${esc(t.error || "")}</p><p class="dim">It failed in ${at !== null ? `<a href="#/block/${at}">block #${at}</a>` : "a block"}: its fee was charged, and nothing else happened. That's final.</p>`);
+      }
+      return card(`<span class="eyebrow">Transaction</span><div class="summary">Dropped without running, not final</div><span class="pill pending">dropped</span><p>${esc(t.error || "")}</p><p class="dim">It was dropped from this node's mempool without running${at !== null ? ` around block #${at}` : ""}: nothing was charged, but another node may still include it until its valid_until, so don't send it again before then.</p>`);
     }
     return `<div class="stack">
       ${card(`<span class="eyebrow">Transaction</span><div class="summary">${esc(t.summary)}</div>

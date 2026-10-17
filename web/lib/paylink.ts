@@ -6,6 +6,9 @@
  * check only: a `.boo` name can belong to someone else on another network, so Send refuses a link
  * made on another chain than the wallet's and says which one it was made for (audit main-11-1).
  * Links made before the check (no `chain`) still fill the form, with a notice.
+ * A link's `chain` and `genesis` are the sender's text: one that isn't a chain id (the genesis
+ * builder's rule, CHAIN_ID) or GENESIS_HEX hex digits is refused as malformed, and the wallet
+ * names only networks it knows, never the link's own words (audit review-r3-wallet-4).
  * No imports, so lib/qr.test.mjs can run it under plain Node.
  */
 
@@ -14,6 +17,12 @@ export const GENESIS_HEX = 16;
 
 /** The most drops an amount can be (a u64 on chain): about 18.4 billion FANG. */
 export const MAX_DROPS = (1n << 64n) - 1n;
+
+/** A chain id, as the genesis builder allows them (node/src/genesis_builder.rs): 1-64 of [A-Za-z0-9-]. */
+export const CHAIN_ID = /^[A-Za-z0-9-]{1,64}$/;
+
+/** The most bytes a memo can be (UTF-8), as the chain allows. */
+export const MAX_MEMO_BYTES = 256;
 
 /** The chain a link was made on, as it says. */
 export interface LinkChain {
@@ -28,17 +37,28 @@ export interface WalletChain {
   genesisHash?: string;
 }
 
-/** Builds a payment link. Empty amount or memo are left out; `chain` is the payee's chain (its pin). */
+/**
+ * Builds a payment link; `chain` is the payee's chain (its pin). The amount goes in as its
+ * canonical decimal (fangDecimal), not as typed, so no spelling of an amount ("0001.50") makes a
+ * link longer than the largest amount does (audit review-r3-wallet-3). What a link can't carry is
+ * left out rather than passed on: an empty or invalid amount (requestAmountError), an empty memo
+ * or one over MAX_MEMO_BYTES, a chain id that isn't one (CHAIN_ID). So with the payee's own name
+ * or address, every link this makes fits a QR code (lib/qr.test.mjs checks the longest).
+ */
 export function payLink(walletUrl: string, to: string, amount?: string, memo?: string, chain?: WalletChain): string {
   const q = new URLSearchParams({ to });
-  if (amount?.trim()) q.set("amount", amount.trim());
-  if (memo) q.set("memo", memo);
-  if (chain?.chainId) {
+  const drops = amount === undefined ? null : requestDrops(amount);
+  if (drops !== null) q.set("amount", fangDecimal(drops));
+  if (memo && utf8Bytes(memo) <= MAX_MEMO_BYTES) q.set("memo", memo);
+  if (chain?.chainId && CHAIN_ID.test(chain.chainId)) {
     q.set("chain", chain.chainId);
     if (chain.genesisHash && /^[0-9a-f]{64}$/i.test(chain.genesisHash)) q.set("genesis", chain.genesisHash.slice(0, GENESIS_HEX).toLowerCase());
   }
   return `${walletUrl.replace(/\/$/, "")}/send?${q}`;
 }
+
+/** UTF-8 bytes in `s`, as the chain counts a memo. */
+const utf8Bytes = (s: string) => new TextEncoder().encode(s).length;
 
 /** What a link's query says about its chain: `null` for a link without one (made before the check). */
 export function linkChain(params: { get(key: string): string | null }): LinkChain | null {
@@ -54,17 +74,24 @@ export type LinkCheck =
   /** The wallet doesn't know its own chain yet (its node hasn't answered). */
   | { state: "pending" }
   | { state: "match" }
-  /** Made on another chain id, or on another instance of this one (or with a malformed genesis). */
-  | { state: "mismatch"; why: "chain" | "genesis" };
+  /**
+   * Refused. `chain`: made on another chain id; `genesis`: on another instance of this one;
+   * `malformed`: its chain id isn't one (CHAIN_ID), or its genesis isn't GENESIS_HEX hex digits.
+   * Only `chain` and `genesis` are well-formed enough to be named, and only `genesis` (hex) as is.
+   */
+  | { state: "mismatch"; why: "chain" | "genesis" | "malformed" };
+
+/** Exactly what payLink writes: a shorter prefix would match too many chains. */
+const GENESIS_PREFIX = new RegExp(`^[0-9a-f]{${GENESIS_HEX}}$`);
 
 /** Whether a link made on `link` may fill a payment on the wallet's chain. */
 export function checkLinkChain(link: LinkChain | null, wallet: WalletChain): LinkCheck {
   if (!link) return { state: "unchecked" };
+  // The sender's text, checked before anything reads or shows it.
+  if (!CHAIN_ID.test(link.chainId) || (link.genesis !== undefined && !GENESIS_PREFIX.test(link.genesis))) return { state: "mismatch", why: "malformed" };
   if (!wallet.chainId) return { state: "pending" };
   if (link.chainId !== wallet.chainId) return { state: "mismatch", why: "chain" };
   if (link.genesis === undefined) return { state: "match" };
-  // Exactly what payLink writes: a shorter prefix would match too many chains.
-  if (!new RegExp(`^[0-9a-f]{${GENESIS_HEX}}$`).test(link.genesis)) return { state: "mismatch", why: "genesis" };
   if (!wallet.genesisHash) return { state: "pending" };
   return wallet.genesisHash.toLowerCase().startsWith(link.genesis) ? { state: "match" } : { state: "mismatch", why: "genesis" };
 }
@@ -78,10 +105,29 @@ export function checkLinkChain(link: LinkChain | null, wallet: WalletChain): Lin
 export function requestAmountError(amount: string): string | null {
   const s = amount.trim();
   if (!s) return null;
-  if (!/^\d+(\.\d{1,9})?$/.test(s)) return "Use a number like 1 or 0.25 (up to 9 decimals).";
-  const [whole, frac = ""] = s.split(".");
-  const drops = BigInt(whole) * 1_000_000_000n + BigInt(frac.padEnd(9, "0"));
+  const drops = parseDrops(s);
+  if (drops === null) return "Use a number like 1 or 0.25 (up to 9 decimals).";
   if (drops === 0n) return "Enter more than zero, or leave it empty.";
   if (drops > MAX_DROPS) return "That's more FANG than there can ever be.";
   return null;
+}
+
+/** The drops a payment request's amount asks for: null when it's empty or requestAmountError refuses it. */
+export function requestDrops(amount: string): bigint | null {
+  const s = amount.trim();
+  if (!s || requestAmountError(s) !== null) return null;
+  return parseDrops(s);
+}
+
+/** Drops as the shortest decimal FANG amount ("1.5", "0.000000001"): the SDK's formatFang without the unit. */
+export function fangDecimal(drops: bigint): string {
+  const frac = (drops % 1_000_000_000n).toString().padStart(9, "0").replace(/0+$/, "");
+  return `${drops / 1_000_000_000n}${frac ? `.${frac}` : ""}`;
+}
+
+/** The SDK's parseFang rule (up to 9 decimals), or null. */
+function parseDrops(s: string): bigint | null {
+  if (!/^\d+(\.\d{1,9})?$/.test(s)) return null;
+  const [whole, frac = ""] = s.split(".");
+  return BigInt(whole) * 1_000_000_000n + BigInt(frac.padEnd(9, "0"));
 }

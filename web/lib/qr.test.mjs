@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { test } from "node:test";
 import { encodeQr, qrPath, qrSvg } from "./qr.ts";
-import { checkLinkChain, linkChain, MAX_DROPS, payLink, requestAmountError } from "./paylink.ts";
+import { CHAIN_ID, checkLinkChain, fangDecimal, linkChain, MAX_DROPS, payLink, requestAmountError, requestDrops } from "./paylink.ts";
 
 const digest = (m) => createHash("sha256").update(m.map((r) => r.map((c) => (c ? "1" : "0")).join("")).join("\n")).digest("hex");
 
@@ -86,13 +86,47 @@ test("payment links say which chain they were made for, as a check (audit main-1
   assert.deepEqual(check(payLink(BASE, "a.boo", "1", "", TESTNET)), { state: "match" });
   assert.deepEqual(check(payLink(BASE, "a.boo", "1", "", { chainId: "blockula-1", genesisHash: "4d".repeat(32) })), { state: "mismatch", why: "chain" });
   assert.deepEqual(check(payLink(BASE, "a.boo", "1", "", { chainId: "blockula-testnet", genesisHash: "00".repeat(32) })), { state: "mismatch", why: "genesis" }, "another instance of the chain id");
-  assert.deepEqual(check(`${BASE}/send?to=a.boo&chain=blockula-testnet&genesis=6e`), { state: "mismatch", why: "genesis" }, "a short genesis would match too much");
+  assert.deepEqual(check(`${BASE}/send?to=a.boo&chain=blockula-testnet&genesis=6e`), { state: "mismatch", why: "malformed" }, "a short genesis would match too much");
   assert.deepEqual(check(`${BASE}/send?to=a.boo&chain=blockula-testnet&genesis=6E6E6E6E6E6E6E6E`), { state: "match" }, "hex in either case");
   assert.deepEqual(check(`${BASE}/send?to=a.boo&chain=blockula-testnet`), { state: "match" }, "a chain id alone checks the chain id");
   assert.deepEqual(check(`${BASE}/send?to=a.boo&amount=1`), { state: "unchecked" });
   assert.deepEqual(check(payLink(BASE, "a.boo", "1", "", TESTNET), {}), { state: "pending" }, "the wallet doesn't know its chain yet");
   assert.deepEqual(check(payLink(BASE, "a.boo", "1", "", TESTNET), { chainId: "blockula-testnet" }), { state: "pending" }, "nor its genesis");
   assert.deepEqual(check(payLink(BASE, "a.boo", "1", "", TESTNET), { chainId: "blockula-1" }), { state: "mismatch", why: "chain" }, "a chain id mismatch needs no genesis");
+});
+
+test("a link's chain and genesis are checked before anything shows them (audit review-r3-wallet-4)", () => {
+  const read = (query) => linkChain(new URLSearchParams(query));
+  const malformed = { state: "mismatch", why: "malformed" };
+  // Not a chain id (the genesis builder's rule): refused whatever the wallet's chain, even before it's known.
+  for (const chain of ["\u202eMainnet-upgrade: re-import your recovery kit at evil.example", "\u202eblockula-testnet", "blockula testnet", "blockula_testnet", "blockula-testnet\u200b", "blоckula-testnet", "c".repeat(65), "<b>x</b>", "a.boo"]) {
+    for (const wallet of [TESTNET, {}, { chainId: chain }]) assert.deepEqual(checkLinkChain(read({ chain }), wallet), malformed, JSON.stringify(chain));
+  }
+  // A genesis that isn't 16 hex digits is malformed too, even next to the wallet's own chain id.
+  for (const genesis of ["6e", "6e".repeat(9), "zzzzzzzzzzzzzzzz", "6e6e6e6e6e6e6e\u202e6e", "6e6e6e6e 6e6e6e6e"]) {
+    assert.deepEqual(checkLinkChain(read({ chain: "blockula-testnet", genesis }), TESTNET), malformed, JSON.stringify(genesis));
+  }
+  // Well-formed ids are compared (and only configured ones are ever named: components/PayLinkNotice).
+  assert.ok(CHAIN_ID.test("c".repeat(64)) && CHAIN_ID.test("Blockula-Testnet-2") && !CHAIN_ID.test(""));
+  assert.deepEqual(checkLinkChain(read({ chain: "c".repeat(64) }), TESTNET), { state: "mismatch", why: "chain" });
+  assert.deepEqual(checkLinkChain(read({ chain: " blockula-testnet " }), TESTNET), { state: "match" }, "surrounding spaces are trimmed");
+  // payLink never writes a chain id Send would refuse.
+  assert.equal(payLink(BASE, "alice.boo", "", "", { chainId: "\u202eevil", genesisHash: "6e".repeat(32) }), `${BASE}/send?to=alice.boo`);
+});
+
+test("payment links carry the canonical amount, whatever was typed (audit review-r3-wallet-3)", () => {
+  const amountOf = (link) => new URL(link).searchParams.get("amount");
+  for (const [typed, canonical] of [["1.5", "1.5"], [" 0001.50 ", "1.5"], ["1.500000000", "1.5"], ["0".repeat(3000) + "1", "1"], ["0".repeat(3000) + ".000000001", "0.000000001"], ["000000000000018446744073.709551615", "18446744073.709551615"], ["7", "7"], ["7.", null], ["", null], [" ", null], ["0", null], ["0.000", null], ["abc", null], ["1e3", null], ["18446744073.709551616", null]]) {
+    assert.equal(amountOf(payLink(BASE, "alice.boo", typed)), canonical, typed.slice(0, 30));
+    assert.equal(requestDrops(typed), canonical === null ? null : BigInt(canonical.split(".")[0]) * 1_000_000_000n + BigInt((canonical.split(".")[1] ?? "").padEnd(9, "0")), typed.slice(0, 30));
+  }
+  assert.equal(fangDecimal(0n), "0");
+  assert.equal(fangDecimal(1n), "0.000000001");
+  assert.equal(fangDecimal(1_500_000_000n), "1.5");
+  assert.equal(fangDecimal(MAX_DROPS), "18446744073.709551615");
+  // A memo the chain can't carry is left out, not passed on.
+  assert.equal(new URL(payLink(BASE, "alice.boo", "1", "🧛".repeat(64))).searchParams.get("memo"), "🧛".repeat(64));
+  assert.equal(new URL(payLink(BASE, "alice.boo", "1", "🧛".repeat(64) + "x")).searchParams.get("memo"), null);
 });
 
 test("payment requests take amounts the chain can hold, and every link they make fits a QR code (audit main-11-2)", () => {
@@ -105,4 +139,11 @@ test("payment requests take amounts the chain can hold, and every link they make
   // of the costliest characters, a long chain id.
   const longest = payLink(BASE, `${"v".repeat(63)}.boo`, "18446744073.709551615", "🧛".repeat(64), { chainId: "c".repeat(64), genesisHash: "ab".repeat(32) });
   assert.ok(qrSvg(longest) !== null, `${longest.length} characters fit`);
+  // ... and no spelling of an amount, valid or not, nor an over-long memo, makes a longer one.
+  for (const typed of ["0".repeat(3000) + "1", "0".repeat(3000) + "18446744073.709551615", "18446744073.709551615" + "0".repeat(3000), "9".repeat(3000), " ".repeat(3000) + "1", "x".repeat(3000)]) {
+    for (const memo of ["🧛".repeat(64), "🧛".repeat(3000)]) {
+      const link = payLink(BASE, `${"v".repeat(63)}.boo`, typed, memo, { chainId: "c".repeat(64), genesisHash: "ab".repeat(32) });
+      assert.ok(link.length <= longest.length && qrSvg(link) !== null, `${typed.slice(0, 20)}…: ${link.length} characters`);
+    }
+  }
 });
