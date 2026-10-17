@@ -871,6 +871,9 @@ async fn upgrade(State(n): State<Node>) -> ApiResult {
         "protocol_version": crate::upgrade::version_at(st, h + 1),
         "supported_protocol_version": crate::consensus::SUPPORTED_PROTOCOL_VERSION,
         "schedule": st.upgrade.schedule.iter().map(|u| json!({ "version": u.version, "activation_height": u.activation_height, "active": u.activation_height <= h + 1 })).collect::<Vec<_>>(),
+        // What cancellations withdrew: versions through `highest_version` are never scheduled
+        // again, and upgrade proposals made by `last_cancelled_at` are superseded.
+        "withdrawn": { "highest_version": st.upgrade.withdrawals.highest, "last_cancelled_at": st.upgrade.withdrawals.last_at },
         "next": next.map(|u| json!({ "version": u.version, "activation_height": u.activation_height, "blocks_left": u.activation_height.saturating_sub(h + 1), "this_binary_supports_it": u.version <= crate::consensus::SUPPORTED_PROTOCOL_VERSION })),
         "halted": n.halt.get().map(|h| json!({ "kind": h.kind(), "reason": h.to_string() })),
         "readiness": {
@@ -881,7 +884,7 @@ async fn upgrade(State(n): State<Node>) -> ApiResult {
             "window_blocks": headers.len(),
             "validators": active.iter().map(|a| json!({ "validator": label(&v, a), "signal": signals.get(a).map(|s| s.0), "seen_at": signals.get(a).map(|s| s.1) })).collect::<Vec<_>>(),
         },
-        "explainer": "Blocks carry the protocol version in force at their height and signal the newest version their proposer's binary supports. An upgrade is scheduled by governance once at least two-thirds of the active set signal it, and can be withdrawn by governance (CancelUpgrade) until 64 blocks before it activates; a node whose binary doesn't support the version in force stops before that height instead of diverging.",
+        "explainer": "Blocks carry the protocol version in force at their height and signal the newest version their proposer's binary supports. An upgrade is scheduled by governance once at least two-thirds of the active set signal it, and can be withdrawn by governance (CancelUpgrade) until 64 blocks before it activates (a withdrawn version number is never scheduled again, and upgrade proposals made before the withdrawal are superseded); a node whose binary doesn't support the version in force stops before that height instead of diverging.",
     })))
 }
 

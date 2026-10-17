@@ -892,6 +892,7 @@ fn run_kind(state: &mut State, j: &mut Journal, p: &Proposal, height: u64) -> Re
             format!("refunded hunt #{hunt_id}'s funders")
         }
         ProposalKind::ScheduleUpgrade { version, activation_height } => {
+            crate::upgrade::check_not_superseded(state, p.created_at)?;
             crate::upgrade::exec_schedule_upgrade(state, j, *version, *activation_height, height)?;
             format!("protocol v{version} activates at block {activation_height}")
         }
@@ -906,14 +907,25 @@ fn run_kind(state: &mut State, j: &mut Journal, p: &Proposal, height: u64) -> Re
         ProposalKind::CancelUpgrade { version, activation_height } => {
             let withdrawn = crate::upgrade::exec_cancel_upgrade(state, j, *version, *activation_height, height)?;
             let after: Vec<String> = withdrawn[1..].iter().map(|u| format!("v{} at block {}", u.version, u.activation_height)).collect();
-            if after.is_empty() {
-                format!("cancelled the upgrade to protocol v{version} at block {activation_height}")
-            } else {
-                format!("cancelled the upgrade to protocol v{version} at block {activation_height}, and {} scheduled after it", after.join(", "))
+            let mut what = format!("cancelled the upgrade to protocol v{version} at block {activation_height}");
+            if !after.is_empty() {
+                what += &format!(", and {} scheduled after it", after.join(", "));
             }
+            what + &superseded_upgrades(state)
         }
         ProposalKind::Text {} => "recorded (no on-chain effect)".into(),
     })
+}
+
+/// The open `ScheduleUpgrade` proposals a cancellation running now supersedes (all of them:
+/// `upgrade::check_not_superseded`), as a clause for its summary and outcome.
+fn superseded_upgrades(state: &State) -> String {
+    let g = &state.governance;
+    let open: Vec<String> = g.open_proposals.iter().filter_map(|id| g.proposals.get(id)).filter_map(|p| match p.kind {
+        ProposalKind::ScheduleUpgrade { version, activation_height } => Some(format!("#{} (v{version} at block {activation_height})", p.id)),
+        _ => None,
+    }).collect();
+    if open.is_empty() { String::new() } else { format!("; it supersedes the upgrade proposal{} still open, {}, which will fail", if open.len() == 1 { "" } else { "s" }, open.join(", ")) }
 }
 
 /// After `staking::end_block`, every block: close voting on proposals whose vote ended, run
@@ -1385,7 +1397,7 @@ pub fn describe_kind(state: &State, kind: &ProposalKind, primary_name: &dyn Fn(&
         ProposalKind::CancelUpgrade { version, activation_height } => {
             let after: Vec<String> = state.upgrade.schedule.iter().filter(|u| u.activation_height > *activation_height).map(|u| format!("v{} at block {}", u.version, u.activation_height)).collect();
             let and = if after.is_empty() { String::new() } else { format!(", and {} scheduled after it", after.join(", ")) };
-            format!("cancel the upgrade to protocol v{version} at block {activation_height}{and}")
+            format!("cancel the upgrade to protocol v{version} at block {activation_height}{and}{}", superseded_upgrades(state))
         }
         ProposalKind::Text {} => "a text proposal (no on-chain effect)".into(),
     }

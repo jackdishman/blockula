@@ -112,7 +112,7 @@ pub mod meta {
     pub const GOVERNANCE: &[u8] = b"governance";
     pub const ECON: &[u8] = b"econ";
     pub const BEACON: &[u8] = b"beacon";
-    /// The upgrade schedule (`upgrade::Upgrades::schedule`).
+    /// The upgrade schedule and its withdrawals (`upgrade::Upgrades::schedule`, `withdrawals`).
     pub const UPGRADE: &[u8] = b"upgrade";
     /// Ghost Mode's scalars (`ghost::GhostMeta`).
     pub const GHOST: &[u8] = b"ghost";

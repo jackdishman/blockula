@@ -867,9 +867,12 @@ fn a_scheduled_upgrade_can_be_cancelled_before_it_activates() {
     assert_eq!(t.p(c).outcome, format!("cancelled the upgrade to protocol v{v} at block {earliest}"));
     assert!(t.st.upgrade.schedule.is_empty());
     assert_eq!(crate::upgrade::version_at(&t.st, earliest), crate::consensus::PROTOCOL_VERSION);
-    // Nothing left to cancel, and the version can be scheduled again.
+    // Nothing left to cancel, and the version number is spent (review-fix-ops-1): the fixed
+    // release ships as the next one.
     refused(&mut t, cancel, "no upgrade to");
     let again = t.h + voting + timelock + 1 + voting + 1 + lead + 100;
+    refused(&mut t, ProposalKind::ScheduleUpgrade { version: v, activation_height: again }, &format!("never reused (a binary of the withdrawn release would run it), so ship the fixed release as v{} or later", v + 1));
+    let v = v + 1;
     let cancel = ProposalKind::CancelUpgrade { version: v, activation_height: again };
     let s = t.propose(ALICE, ProposalKind::ScheduleUpgrade { version: v, activation_height: again });
     t.vote(ALICE, s, true, 50_000, 1).unwrap();
@@ -896,6 +899,7 @@ fn a_scheduled_upgrade_can_be_cancelled_before_it_activates() {
     // Scheduled once more: once a cancellation could no longer land 64 blocks before the
     // activation, it's refused up front, and the operational path (OPERATIONS.md "Upgrades") is
     // what's left; after the activation it's refused too.
+    let v = v + 1;
     let last = t.h + voting + timelock + 1 + voting + 1 + lead + 10;
     let cancel = ProposalKind::CancelUpgrade { version: v, activation_height: last };
     let s = t.propose(ALICE, ProposalKind::ScheduleUpgrade { version: v, activation_height: last });
@@ -911,6 +915,47 @@ fn a_scheduled_upgrade_can_be_cancelled_before_it_activates() {
     assert_eq!(crate::upgrade::version_at(&t.st, t.h), v);
     // The one proposed in time, which nobody voted for, changed nothing either.
     assert_eq!(t.p(c).status, ProposalStatus::Rejected, "{}", t.p(c).outcome);
+}
+
+/// review-fix-ops-2: a cancellation supersedes every upgrade proposal made before it ran, still
+/// being voted on or in its timelock: they were proposed to follow the withdrawn upgrade, and
+/// their releases build on its rules. Here v3, proposed while v2 was scheduled, would otherwise
+/// run after the cancellation and switch on v2's withdrawn rules with its own. The cancellation's
+/// summary and outcome name it; it fails when it would run. One proposed after it goes through.
+#[test]
+fn a_cancellation_supersedes_upgrade_proposals_still_open() {
+    let mut t = T::new(&[]);
+    let lead = crate::upgrade::MIN_UPGRADE_LEAD;
+    let v = crate::consensus::PROTOCOL_VERSION + 1;
+    let (voting, timelock) = (t.st.chain_params.voting_blocks, t.st.chain_params.timelock_blocks);
+    let pass = |t: &mut T, kind: ProposalKind| {
+        let id = t.propose(ALICE, kind);
+        t.vote(ALICE, id, true, 50_000, 1).unwrap();
+        id
+    };
+    let a = t.h + 4 * (voting + timelock) + lead;
+    let s2 = pass(&mut t, ProposalKind::ScheduleUpgrade { version: v, activation_height: a });
+    t.finish(s2);
+    assert_eq!(crate::upgrade::version_at(&t.st, a), v);
+    // v3 follows it; the cancellation of v2 is proposed a block later, and runs first (no timelock).
+    let s3 = pass(&mut t, ProposalKind::ScheduleUpgrade { version: v + 1, activation_height: a + 100 });
+    t.next();
+    let cancel = ProposalKind::CancelUpgrade { version: v, activation_height: a };
+    assert_eq!(describe_kind(&t.st, &cancel, &|_| None), format!("cancel the upgrade to protocol v{v} at block {a}; it supersedes the upgrade proposal still open, #{s3} (v{} at block {}), which will fail", v + 1, a + 100));
+    let c = pass(&mut t, cancel);
+    let ran = t.p(c).voting_end + 1;
+    t.through(ran);
+    assert_eq!(t.p(c).status, ProposalStatus::Executed, "{}", t.p(c).outcome);
+    assert!(t.p(c).outcome.ends_with(&format!("it supersedes the upgrade proposal still open, #{s3} (v{} at block {}), which will fail", v + 1, a + 100)), "{}", t.p(c).outcome);
+    assert!(ran < t.p(s3).voting_end + timelock, "the successor is still voting or queued");
+    t.finish(s3);
+    assert_eq!(t.p(s3).status, ProposalStatus::Failed);
+    assert!(t.p(s3).outcome.contains(&format!("superseded: it was proposed at block {}, and the CancelUpgrade that ran at block {ran} withdrew v{v}", t.p(s3).created_at)), "{}", t.p(s3).outcome);
+    assert!(t.st.upgrade.schedule.is_empty(), "v2's rules never activate");
+    // Proposed after the cancellation, the next version goes through.
+    let s4 = pass(&mut t, ProposalKind::ScheduleUpgrade { version: v + 1, activation_height: a + 100 });
+    t.finish(s4);
+    assert_eq!((t.p(s4).status, crate::upgrade::version_at(&t.st, a + 100)), (ProposalStatus::Executed, v + 1), "{}", t.p(s4).outcome);
 }
 
 #[test]
