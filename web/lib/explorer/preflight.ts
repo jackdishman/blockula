@@ -12,7 +12,7 @@
  */
 import type { KeyView, Label } from "../types";
 import { DROPS_PER_FANG, effectsOf, formatDrops, type Change, type Effects, type Holding } from "./ledger.ts";
-import type { TxDetail } from "./types";
+import type { AccountDetail, HuntView, MultisigView, NameDetail, TxDetail, ValidatorsDetail } from "./types";
 
 /** node/src/types.rs: MIN_NEW_ACCOUNT, MIN_HUNT, MIN_HUNT_FUNDING; poc.rs: VOUCH_BOND, CLAIM_BOND. */
 export const MIN_NEW_ACCOUNT = DROPS_PER_FANG / 100n;
@@ -294,3 +294,83 @@ export function preflight(i: PreflightInput): Preflight {
 }
 
 const who = (l: Label) => (l.name && !/\s/.test(l.name) ? l.name : l.short);
+
+/** `/api/fees`, for the account-creation fee on nodes whose `/api/account` doesn't report it. */
+export interface Fees {
+  account_creation_fee?: string;
+}
+
+/** What `checkTx` reads from the node for one transaction, as the node answered (node/src/api.rs). */
+export interface Reads {
+  status: { height: number; block_time_ms?: number };
+  /** The sender's `/api/account`. */
+  account: AccountDetail;
+  /** The sender's `/api/multisig` (null: not a multisig, a 404). */
+  multisig?: MultisigView | null;
+  /** A transfer's or a hunt award's recipient: its `/api/account`, by what the action names. */
+  recipient?: AccountDetail | null;
+  fees?: Fees | null;
+  /** The hunt it funds, awards or cancels (`missing`: a 404). */
+  hunt?: HuntView | { id: number; missing: true } | null;
+  /** A name it registers or renews. */
+  name?: NameDetail | null;
+  /** `/api/validators`, for a hunt's cancel (dev and test chains' admins). */
+  validators?: ValidatorsDetail | null;
+}
+
+const treasury: Holding = { address: "holding:treasury", name: "Treasury", short: "Treasury", holding: true };
+const claimBond: Holding = { address: "holding:claim-bond", name: "Claim bond", short: "Claim bond", holding: true };
+
+/**
+ * The preflight's input from the node's answers. A recipient's account says whether the chain has
+ * it yet and what opening it burns from the payer (protocol v1: `exists`, `creation_fee`; older
+ * nodes answer "balance 0, nonce 0" for a missing account, and an existing account almost never
+ * looks like that). The sender's account says what it can move (`transferable`) and why the rest
+ * is locked (its biggest lock), and costs the fields don't carry come from the reads: a name's
+ * price or renewal, the bond the account's next claim holds.
+ */
+export function preflightInput(tx: Built, signer: string, r: Reads): PreflightInput {
+  const action = tx.action;
+  const mine = r.account;
+  const recipient = r.recipient
+    ? (() => {
+        const a = r.recipient;
+        const isNew = a.exists != null ? !a.exists : a.balance === "0" && a.nonce === 0;
+        const creationFee = a.creation_fee != null ? big(a.creation_fee) : isNew ? big(r.fees?.account_creation_fee ?? "0") : 0n;
+        return { label: a.account, isNew, creationFee };
+      })()
+    : null;
+  const name = r.name;
+  const bond = action.type === "submit_claim" ? mine.contribution?.next_claim_bond : undefined;
+  const years = BigInt(Number.isSafeInteger(action.years) ? (action.years as number) : 1);
+  const extra =
+    name && action.type === "register_name"
+      ? { drops: big(name.price), to: treasury, why: `${name.name}'s price` }
+      : name && action.type === "renew_name" && name.renewal_price
+        ? { drops: big(name.renewal_price) * years, to: treasury, why: `renewing ${name.name} for ${years} year${years === 1n ? "" : "s"}` }
+        : bond
+          ? { drops: big(bond), to: claimBond, why: "refundable claim bond" }
+          : null;
+  const lock = [...(mine.locks ?? [])].sort((a, b) => (big(b.amount) > big(a.amount) ? 1 : big(b.amount) < big(a.amount) ? -1 : 0))[0];
+  const h = r.hunt;
+  return {
+    tx,
+    sender: {
+      label: mine.account,
+      balance: mine.balance,
+      transferable: mine.transferable,
+      locked: mine.locked,
+      lockReason: lock ? `${lock.reason}${lock.vesting ? "" : ` until block #${lock.until.toLocaleString("en-US")}`}` : undefined,
+      keys: mine.keys,
+      recent: mine.recent_txs,
+      familiars: (mine.familiars ?? []).map((f) => f.key_id),
+      multisig: r.multisig ? { threshold: r.multisig.threshold, owners: r.multisig.owners.length } : null,
+    },
+    signer,
+    head: r.status.height,
+    recipient,
+    extra,
+    hunt: h && "missing" in h ? h : h ? { id: h.id, status: h.status, expires_at: h.expires_at, creator: h.creator.address } : null,
+    admins: r.validators?.admins?.map((a) => a.address),
+  };
+}
