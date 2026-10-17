@@ -280,9 +280,10 @@ pub enum ProposalKind {
     },
     /// Open a community distribution of `total` from the community account, claimable with
     /// Merkle proofs against `merkle_root` until `claim_until`. `distribution_id` is the id its
-    /// tree's leaves were built for, which must be the id the proposal gets (`next_id`): a
-    /// proposal that lands after another took that id is refused, so a passed distribution is
-    /// always claimable (audit F45).
+    /// tree's leaves were built for, and the one it opens under: the proposer picks one no
+    /// distribution has (`/api/proposals`' `next_distribution_id`), checked when proposed and
+    /// when it runs, so a passed distribution is always claimable and doesn't depend on which
+    /// proposals land first (audit F45, review-fix-gov-2).
     Distribution {
         distribution_id: u64,
         merkle_root: String,
