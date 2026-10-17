@@ -197,6 +197,16 @@ pub fn vouch_key(vouchee: &str, voucher: &str) -> String {
     format!("{vouchee}/{voucher}")
 }
 
+/// A GitHub handle held for one account after governance unlinked it at that account's request
+/// (`ProposalKind::UnlinkGithub`, audit xcut-economic-4): until `until`, only `account` can link
+/// it, so the squatter can't simply link it again the next block. Keyed by lowercase handle;
+/// cleared when the handle is next linked.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+pub struct HandleHold {
+    pub account: String,
+    pub until: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Sybil {
     pub at: u64,
@@ -379,6 +389,8 @@ pub struct Poc {
     /// Lowercase GitHub handle → the account its first verified claim credited. A handle's work
     /// is always credited to one account, so relinking it can't split one person's √ payout.
     pub handles: TMap<String, String>,
+    /// Lowercase GitHub handle → who may link it while governance holds it ([`HandleHold`]).
+    pub handle_holds: TMap<String, HandleHold>,
     pub jurors: TMap<String, Juror>,
     pub seances: TMap<u64, Seance>,
     /// Account → grant id → grant.
@@ -418,6 +430,7 @@ pub struct PocJournal {
     claims: JMap<u64, Claim>,
     claim_by_pr: JMap<String, u64>,
     handles: JMap<String, String>,
+    handle_holds: JMap<String, HandleHold>,
     jurors: JMap<String, Juror>,
     seances: JMap<u64, Seance>,
     grants: JMap<String, BTreeMap<u64, Grant>>,
@@ -434,6 +447,7 @@ impl PocJournal {
         self.claims.absorb(o.claims);
         self.claim_by_pr.absorb(o.claim_by_pr);
         self.handles.absorb(o.handles);
+        self.handle_holds.absorb(o.handle_holds);
         self.jurors.absorb(o.jurors);
         self.seances.absorb(o.seances);
         self.grants.absorb(o.grants);
@@ -451,6 +465,7 @@ impl PocJournal {
         self.claims.restore(&mut p.claims);
         self.claim_by_pr.restore(&mut p.claim_by_pr);
         self.handles.restore(&mut p.handles);
+        self.handle_holds.restore(&mut p.handle_holds);
         self.jurors.restore(&mut p.jurors);
         self.seances.restore(&mut p.seances);
         self.grants.restore(&mut p.grants);
@@ -663,6 +678,16 @@ impl State {
         self.set_dropped_vouch(j, &key, Some(d));
         self.pj(j).vouches.touch(&self.poc.vouches, to);
         self.poc.vouches.remove(to);
+    }
+
+    /// Sets or clears the hold on a GitHub handle (lowercase).
+    pub(crate) fn set_handle_hold(&mut self, j: &mut Journal, handle: &str, hold: Option<HandleHold>) {
+        let key = handle.to_string();
+        self.pj(j).handle_holds.touch(&self.poc.handle_holds, &key);
+        match hold {
+            Some(h) => self.poc.handle_holds.insert(key, h),
+            None => self.poc.handle_holds.remove(&key),
+        };
     }
 
     fn set_claim_by_pr(&mut self, j: &mut Journal, key: &str, id: Option<u64>) {
@@ -2097,8 +2122,9 @@ mod scenarios {
         assert_eq!(t.c.state.poc.handles["newbie"], newbie.address());
         t.tx(&newbie, Action::UnlinkGithub { handle: "newbie".into() }).unwrap();
         t.grant(&hopper, 1);
-        t.link(&hopper, "Newbie");
-        assert!(t.claim(&hopper, 2).unwrap_err().to_string().contains("credited to"));
+        // Nobody else can even link it (audit xcut-economic-4: validators have seen its gist).
+        assert!(t.tx(&hopper, Action::LinkGithub { handle: "Newbie".into(), gist_id: "abc123".into() }).unwrap_err().to_string().contains("credited to"));
+        t.link(&newbie, "newbie");
         // Too few reveals: nothing is decided, claims carry over, the budget goes back.
         t.grant(&other, 1);
         t.link(&other, "other");

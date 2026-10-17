@@ -37,7 +37,7 @@
 //! | `UnflagSybil` | `State::exec_unflag_sybil` (the appeal path: lifts the flag, restores nothing) |
 //! | `RejectClaim` | `State::exec_reject_claim` |
 //! | `Clawback` | `State::exec_clawback` |
-//! | `UnlinkGithub` | `State::exec_unlink_github` |
+//! | `UnlinkGithub` | `State::exec_reclaim_github` (unlinks, then holds the handle for the proposer) |
 //! | `RefundHunt` | `State::exec_refund_hunt` |
 //! | `ScheduleUpgrade`, `CancelUpgrade`, `ActivateFeature`, `DeactivateFeature` | `upgrade::exec_schedule_upgrade`, `exec_cancel_upgrade`, `exec_activate_feature`, `exec_deactivate_feature` |
 //! | `Text` | nothing |
@@ -869,10 +869,7 @@ fn run_kind(state: &mut State, j: &mut Journal, p: &Proposal, height: u64) -> Re
             let back = state.exec_clawback(j, account, height)?;
             format!("clawed back {} from {}", fmt_fang(back), short(account))
         }
-        ProposalKind::UnlinkGithub { handle } => {
-            state.exec_unlink_github(j, handle)?;
-            format!("unlinked @{handle}")
-        }
+        ProposalKind::UnlinkGithub { handle } => state.exec_reclaim_github(j, handle, &p.proposer, height)?,
         ProposalKind::RefundHunt { hunt_id } => {
             state.exec_refund_hunt(j, *hunt_id, height)?;
             format!("refunded hunt #{hunt_id}'s funders")
@@ -1363,7 +1360,7 @@ pub fn describe_kind(state: &State, kind: &ProposalKind, primary_name: &dyn Fn(&
         ProposalKind::UnflagSybil { account, .. } => format!("lift {}'s sybil flag", who(account)),
         ProposalKind::RejectClaim { claim_id, .. } => format!("reject claim #{claim_id}"),
         ProposalKind::Clawback { account, .. } => format!("claw back {}'s unvested rewards", who(account)),
-        ProposalKind::UnlinkGithub { handle } => format!("unlink GitHub @{handle}"),
+        ProposalKind::UnlinkGithub { handle } => format!("unlink GitHub @{handle} and hold it for the proposer to link for one voting period"),
         ProposalKind::RefundHunt { hunt_id } => format!("refund hunt #{hunt_id}'s funders"),
         ProposalKind::ScheduleUpgrade { version, activation_height } => format!("upgrade to protocol v{version} at block {activation_height}"),
         ProposalKind::ActivateFeature { feature } => format!("turn on {feature}"),

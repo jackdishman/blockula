@@ -396,10 +396,10 @@ fn namespaces_and_meta_keys_are_unique() {
     }
     for (n, range) in reserved {
         assert!(range.contains(&n), "namespace {n} is outside its module's range");
-        assert!(!(1..=26).contains(&n), "namespace {n} collides with the base state");
+        assert!(!(1..=27).contains(&n), "namespace {n} collides with the base state");
         seen.insert(n);
     }
-    assert_eq!(seen.len(), 1 + 19 + 16 + 5 + 2, "every namespace is distinct");
+    assert_eq!(seen.len(), 1 + 20 + 16 + 5 + 2, "every namespace is distinct");
     let keys = [meta::BURNED, meta::CHAIN_PARAMS, meta::NEXT_HUNT_ID, meta::PARAMS, meta::POC, meta::SCHEMA, meta::SUPPLY, meta::STAKING, meta::GOVERNANCE, meta::ECON, meta::BEACON, meta::UPGRADE, meta::GHOST];
     assert_eq!(keys.iter().collect::<std::collections::BTreeSet<_>>().len(), keys.len());
     assert!(st.meta_records().iter().all(|(k, _)| keys.contains(k)), "every scalar record uses a declared key");
@@ -569,6 +569,7 @@ fn largest_records_fit_in_a_snapshot() {
     p.claims.insert(0, claim);
     p.claim_by_pr.insert(s(MAX_REPO + 21), 0);
     p.handles.insert(s(MAX_GITHUB_HANDLE), addr(0));
+    p.handle_holds.insert(s(MAX_GITHUB_HANDLE), HandleHold { account: addr(0), until: u64::MAX });
     p.jurors.insert(addr(0), Juror { bond: u64::MAX, joined_at: 0, active: true, served: u64::MAX });
     let seat = JurySeat { pairs: vec![[u64::MAX; 2]; PAIRS_PER_JUROR], commitment: Some(hex32(0)), votes: Some(s(PAIRS_PER_JUROR)), spam: vec![u64::MAX; MAX_SEANCE_CLAIMS], agreement_ppm: Some(0), reward: u64::MAX, soul_delta: i64::MIN };
     let results = SeanceResults { accepted: usize::MAX, below_threshold: usize::MAX, spam: usize::MAX, carried_over: usize::MAX, no_shows: usize::MAX, paid: u64::MAX, returned: u64::MAX };

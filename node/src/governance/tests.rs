@@ -621,6 +621,53 @@ fn spending_waits_for_the_spend_height_and_vested_treasury_funds() {
     assert_eq!(t.st.account(&t.st.treasury()).balance, treasury - 10_000 * FANG, "the failed spend moved nothing");
 }
 
+/// Audit xcut-economic-4: a squatter links Carol's GitHub handle, and on a chain with no admins
+/// her remedy is an `UnlinkGithub` proposal. It used to free the handle for whoever linked it
+/// first the block after it ran, so the squatter just linked it again. Now the handle is held for
+/// the proposer for one voting period, even if the squatter unlinked and relinked it from another
+/// account in the meantime; only Carol can link it then.
+#[test]
+fn an_unlink_proposal_holds_the_handle_for_its_proposer() {
+    let mut t = T::new(&[]);
+    t.tx(BOB, Action::LinkGithub { handle: "carol-gh".into(), gist_id: "abc1".into() }).unwrap();
+    assert!(t.err(CAROL, Action::LinkGithub { handle: "Carol-GH".into(), gist_id: "c0ffee".into() }).contains("already linked"));
+    let id = t.propose(CAROL, ProposalKind::UnlinkGithub { handle: "carol-gh".into() });
+    assert!(describe_kind(&t.st, &t.p(id).kind, &|_| None).contains("hold it for the proposer"));
+    t.vote(ALICE, id, true, 50_000, 1).unwrap();
+    // The squatter dodges: unlinks itself and links the handle from another account.
+    t.tx(BOB, Action::UnlinkGithub { handle: "carol-gh".into() }).unwrap();
+    t.tx(OWNER, Action::LinkGithub { handle: "carol-gh".into(), gist_id: "abc2".into() }).unwrap();
+    t.finish(id);
+    assert_eq!(t.p(id).status, ProposalStatus::Executed, "{}", t.p(id).outcome);
+    assert!(t.p(id).outcome.contains("unlinked @carol-gh"), "{}", t.p(id).outcome);
+    let until = t.st.poc.handle_holds["carol-gh"].until;
+    assert_eq!((t.st.poc.handle_holds["carol-gh"].account.clone(), until), (addr(CAROL), t.p(id).execute_at.unwrap() + t.st.chain_params.voting_blocks));
+    t.next();
+    for squatter in [BOB, OWNER, ALICE] {
+        let e = t.err(squatter, Action::LinkGithub { handle: "carol-gh".into(), gist_id: "abc3".into() });
+        assert!(e.contains("is held for") && e.contains(&format!("until block {until}")), "{e}");
+    }
+    t.tx(CAROL, Action::LinkGithub { handle: "Carol-GH".into(), gist_id: "c0ffee".into() }).unwrap();
+    assert_eq!(t.st.github["carol-gh"].account, addr(CAROL));
+    assert!(!t.st.poc.handle_holds.contains_key("carol-gh"), "the hold ends once she links it");
+    t.next();
+    // A proposal for a handle the proposer already holds changes nothing.
+    let again = t.propose(CAROL, ProposalKind::UnlinkGithub { handle: "carol-gh".into() });
+    t.vote(ALICE, again, true, 50_000, 1).unwrap();
+    t.finish(again);
+    assert_eq!(t.p(again).status, ProposalStatus::Executed);
+    assert_eq!(t.st.github["carol-gh"].account, addr(CAROL));
+    // Unheld once the period is over: had she not linked it, anyone could again.
+    let id = t.propose(CAROL, ProposalKind::UnlinkGithub { handle: "carol-gh".into() });
+    t.vote(ALICE, id, true, 50_000, 1).unwrap();
+    t.tx(CAROL, Action::UnlinkGithub { handle: "carol-gh".into() }).unwrap();
+    t.tx(BOB, Action::LinkGithub { handle: "carol-gh".into(), gist_id: "abc1".into() }).unwrap();
+    t.finish(id);
+    let until = t.st.poc.handle_holds["carol-gh"].until;
+    t.through(until);
+    t.tx(BOB, Action::LinkGithub { handle: "carol-gh".into(), gist_id: "abc1".into() }).unwrap();
+}
+
 /// Audit xcut-economic-opus-2, on a chain with no admins: a `FlagSybil` proposal is public for its
 /// vote and timelock, and no `Unvouch` in that time gets the voucher off the hook. Past the vouch's
 /// lock, a vouch withdrawn while a proposal names the vouchee keeps its bond held: the flag then
