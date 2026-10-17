@@ -31,7 +31,9 @@ use std::io::{Read, Write};
 /// (namespace 64) and epochs' highest views (65); the governance scalars gain the recent treasury
 /// spends, the closed proposals whose votes are being swept and the multisig sweep cursor;
 /// `Distribution` proposals name their distribution id; `Params` lists the owners the bootstrap
-/// delegation passes over.
+/// delegation passes over. The second audit round kept 6 (pre-mainnet): `chain_params` gains
+/// `bootstrap_commission_cap_bps`, pools the height their consensus key last showed up
+/// (`ready_at`), and liveness rings the `downtime_max_missed` they were kept under.
 pub const SCHEMA_VERSION: u32 = 6;
 
 pub fn encode<T: BorshSerialize + ?Sized>(v: &T) -> Vec<u8> {

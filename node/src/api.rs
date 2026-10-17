@@ -1477,8 +1477,11 @@ fn validator_json(v: &ReadView, r: &crate::chain::ValidatorRecord) -> Value {
         "shares": p.shares.to_string(),
         "self_bond": self_bond.to_string(),
         "self_bond_display": fmt_fang(self_bond),
-        "commission_bps": r.commission_bps,
-        "commission_display": format!("{}%", staking::fmt_bps(r.commission_bps)),
+        // What its rewards are charged: its commission, at most `commission_max_bps` (audit
+        // gap-5-1); `commission_recorded_bps` is its own setting when a lowered cap binds it.
+        "commission_bps": staking::commission_rate(st, &r.address),
+        "commission_display": format!("{}%", staking::fmt_bps(staking::commission_rate(st, &r.address))),
+        "commission_recorded_bps": (r.commission_bps != staking::commission_rate(st, &r.address)).then_some(r.commission_bps),
         "eligible": staking::eligible(st, &r.address),
         "jailed": p.jail.as_ref().map(|j| json!({ "at": j.at, "until": j.until, "reason": j.reason })),
         "tombstoned_at": p.tombstoned_at,
