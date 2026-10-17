@@ -1190,6 +1190,14 @@ async fn params(State(n): State<Node>) -> ApiResult {
         },
         "supply": st.supply.to_string(),
         "burned": st.burned.to_string(),
+        // Who changes what: governance's safety parameters and the validators' own economics take
+        // the token supermajority and never pass by the bootstrap council; the council may also
+        // pass the `council` keys (any key not listed there is the token holders' alone).
+        "classes": {
+            "governance": crate::params::GOVERNANCE_KEYS,
+            "validators": crate::params::VALIDATOR_KEYS,
+            "council": crate::params::COUNCIL_KEYS,
+        },
     })))
 }
 
@@ -2519,6 +2527,8 @@ mod http_tests {
         let (_, p, _) = call(&n, "GET", "/api/params", None, "127.0.0.1:1").await;
         assert_eq!((p["params"]["max_block_bytes"].as_str(), p["params"]["name_price_5"].as_str()), (Some("2097152"), Some("5000000000")));
         assert_eq!((p["genesis"]["epochs_per_year"].as_u64(), p["issuance"]["year"].as_u64()), (Some(52_596), Some(0)));
+        let in_class = |class: &str, key: &str| p["classes"][class].as_array().unwrap().iter().any(|k| k == key);
+        assert!(in_class("governance", "supermajority_bps") && in_class("validators", "slash_downtime_bps") && in_class("council", "max_validators") && !in_class("council", "issuance_initial_ppm"));
         let (_, a, _) = call(&n, "GET", "/api/name/alice.boo", None, "127.0.0.1:1").await;
         assert_eq!((a["status"].as_str(), a["available"].as_bool(), a["price"].as_str(), a["renewal_price"].as_str()), (Some("available"), Some(true), Some("5000000000"), Some("1000000000")));
         // Register it; the name shows its owner and expiry, and the tx what it was charged.

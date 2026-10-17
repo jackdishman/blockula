@@ -62,7 +62,7 @@ Reads: `client.staking(account)`, `client.proposals()`, `client.proposal(id)`, `
 | GET | `/api/account/{address\|name}` | balance, `next_nonce`, names, recent txs (sent by it or naming it), `github`, `familiars`, hunts created/won, `contribution` (Soul, vouches, jury seat, claims, vesting rewards) |
 | GET | `/api/name/{name}` | `status` (`active`, `grace` (expired, only the owner can renew), `reserved`, `available`), owner, `expires_at`, `grace_until`, price and yearly renewal price |
 | GET | `/api/fees` | the base fee for the next 17 blocks (`slots`: flat drops, `rate` in milli-drops per byte, `max_block_bytes`), `suggested` (covers any of them), `lowest` and `tip_cap_multiple` (a tip is at most that × the base fee), the floor, the account creation fee |
-| GET | `/api/params` | governance parameters (amounts as strings), genesis constants (`epochs_per_year`…), the issuance year (rate, per-epoch mint) |
+| GET | `/api/params` | governance parameters (amounts as strings), genesis constants (`epochs_per_year`…), the issuance year (rate, per-epoch mint), `classes` (who changes which: `governance` and `validators` keys take the token supermajority, never the bootstrap council; the council may also pass `council` keys) |
 | GET | `/api/key/{key_id}` | accounts this key is authorized on |
 | GET | `/api/search/{q}` | `{type, id}` for anything |
 | POST | `/api/faucet` `{to}` | 100 FANG on faucet chains (1 per address/hour, 1 per IP/10 min; unlimited from localhost) |
