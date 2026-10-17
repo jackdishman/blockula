@@ -25,11 +25,11 @@
 // so every spelling GitHub accepts (quoted keys, indentless or compact sequences, multi-line and
 // folded scalars, flow collections over several lines, anchors and aliases) is read as GitHub
 // reads it. What it can't read the same way is refused, never skipped: a parse error or warning,
-// a merge key (<<), a key that isn't a plain scalar, two keys that differ only in case (keys are
-// read case-insensitively), more than one document, a `needs` that isn't a job id or a list of
-// them, a step that isn't a mapping, a name that isn't text. No job in any workflow may be able to
-// report a required check's name but the required job itself: a computed name
-// ("${{ … }}") counts as every name it could produce (a `matrix.<key>` over a literal list
+// a merge key (<<), an explicit tag, a key that isn't a plain scalar, two keys that differ only
+// in case (keys are read case-insensitively), more than one document, a `needs` that isn't a job
+// id or a list of them, a step that isn't a mapping, a name that isn't text. No job in any
+// workflow may be able to report a required check's name but the required job itself: a computed
+// name ("${{ … }}") counts as every name it could produce (a `matrix.<key>` over a literal list
 // expands to its values; any other expression matches anything), compared without case.
 // What a step's command does is code review's job (CODEOWNERS), not this script's: it makes sure
 // a required job runs on every pull request and that each of its steps runs and counts.
