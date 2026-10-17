@@ -31,14 +31,16 @@ use std::io::{Read, Write};
 /// (namespace 64) and epochs' highest views (65); the governance scalars gain the recent treasury
 /// spends, the closed proposals whose votes are being swept and the multisig sweep cursor;
 /// `Distribution` proposals name their distribution id; `Params` lists the owners the bootstrap
-/// delegation passes over; name records keep the account they're offered to (`offered_to`). The
-/// second audit round kept 6 (pre-mainnet): `chain_params` gains `bootstrap_commission_cap_bps`,
-/// pools the height their consensus key last showed up (`ready_at`), and liveness rings the
-/// `downtime_max_missed` they were kept under; a distribution records the proposal that opened it
-/// (`Distribution::proposal`); name records keep the grace they were registered with
-/// (`grace_blocks`); the `upgrade` scalar record follows the schedule with what cancellations
-/// withdrew (`upgrade::Withdrawals`).
-pub const SCHEMA_VERSION: u32 = 6;
+/// delegation passes over; name records keep the account they're offered to (`offered_to`). 7
+/// (the second audit round, pre-mainnet; one bump for every package): `chain_params` gains
+/// `bootstrap_commission_cap_bps`, pools the height their consensus key last showed up
+/// (`ready_at`), and liveness rings the `downtime_max_missed` they were kept under; a
+/// distribution records the proposal that opened it (`Distribution::proposal`); name records
+/// keep the grace they were registered with (`grace_blocks`); the `upgrade` scalar record follows
+/// the schedule with what cancellations withdrew (`upgrade::Withdrawals`); Proof of Contribution
+/// gains namespaces 26 (withdrawn vouches that still count, `poc::DroppedVouch`) and 27 (GitHub
+/// handles governance holds for an account, `poc::HandleHold`).
+pub const SCHEMA_VERSION: u32 = 7;
 
 pub fn encode<T: BorshSerialize + ?Sized>(v: &T) -> Vec<u8> {
     borsh::to_vec(v).expect("encoding to memory can't fail")

@@ -396,10 +396,10 @@ fn namespaces_and_meta_keys_are_unique() {
     }
     for (n, range) in reserved {
         assert!(range.contains(&n), "namespace {n} is outside its module's range");
-        assert!(!(1..=25).contains(&n), "namespace {n} collides with the base state");
+        assert!(!(1..=27).contains(&n), "namespace {n} collides with the base state");
         seen.insert(n);
     }
-    assert_eq!(seen.len(), 1 + 18 + 16 + 5 + 2, "every namespace is distinct");
+    assert_eq!(seen.len(), 1 + 20 + 16 + 5 + 2, "every namespace is distinct");
     let keys = [meta::BURNED, meta::CHAIN_PARAMS, meta::NEXT_HUNT_ID, meta::PARAMS, meta::POC, meta::SCHEMA, meta::SUPPLY, meta::STAKING, meta::GOVERNANCE, meta::ECON, meta::BEACON, meta::UPGRADE, meta::GHOST];
     assert_eq!(keys.iter().collect::<std::collections::BTreeSet<_>>().len(), keys.len());
     assert!(st.meta_records().iter().all(|(k, _)| keys.contains(k)), "every scalar record uses a declared key");
@@ -417,12 +417,12 @@ fn namespaces_and_meta_keys_are_unique() {
 /// audit fixes) changes the `schema` record, `chain_params` (`tip_cap_multiple`, 20, after
 /// `max_tx_validity_blocks`) and the `governance` and `params` scalars' layouts (their new fields
 /// are empty here); staking's slash bookkeeping and its two new maps are empty here too. The
-/// vectors were regenerated with it and the SDK rebuilt the root from them. The second audit
-/// round adds `bootstrap_commission_cap_bps` (1,000, after `insider_delegation_cap_bps`) to
-/// `chain_params` (pools' `ready_at` and liveness rings' `max_missed` are empty here), and
-/// appends the `upgrade` record's withdrawals (`(0, None)` here: five bytes after the empty
-/// schedule) and fields of name and distribution records (none here); the root moved with
-/// `chain_params` and the `upgrade` record, and the SDK rebuilt it from the regenerated vectors.
+/// vectors were regenerated with it and the SDK rebuilt the root from them. Schema 7 (the second
+/// audit round) changes the `schema` record, adds `bootstrap_commission_cap_bps` (1,000, after
+/// `insider_delegation_cap_bps`) to `chain_params` and appends the `upgrade` record's withdrawals
+/// (`(0, None)` here: five bytes after the empty schedule); pools' `ready_at`, liveness rings'
+/// `max_missed`, the new fields of name and distribution records and PoC's withdrawn vouches and
+/// GitHub handle holds are empty here. The vectors were regenerated and the SDK rebuilt the root.
 #[test]
 fn golden_encodings() {
     let acct = Account { balance: 5, nonce: 2, keys: Default::default(), locks: vec![] };
@@ -433,7 +433,7 @@ fn golden_encodings() {
     st.commit_block().unwrap();
     assert_eq!(st.root_hash(), st.full_root());
     assert_eq!(st.record_count(), 13);
-    assert_eq!(st.root(), "30cf9b5188164ade6a11e805f898753573ae498967b5491fc4e7821a844a01b2");
+    assert_eq!(st.root(), "dc8d102cd9d8b59d4ef5beb937055099dd9f04cf4d04333eb78e0de4976b7759");
 }
 
 fn million_accounts() -> State {
@@ -566,6 +566,7 @@ fn largest_records_fit_in_a_snapshot() {
     p.repos.insert(s(MAX_REPO), MAX_REPO_WEIGHT);
     p.souls.insert(addr(0), Soul { points: u64::MAX, at: u64::MAX, earned: u64::MAX });
     p.vouches.insert(addr(0), Vouch { voucher: addr(1), bond: u64::MAX, at: 0 });
+    p.dropped_vouches.insert(vouch_key(&addr(0), &addr(1)), DroppedVouch { bond: u64::MAX, at: u64::MAX, dropped_at: u64::MAX });
     p.sybils.insert(addr(0), Sybil { at: 0, by: addr(1), reason: s(MAX_REASON) });
     let attestations = (0..MAX_CLAIM_ATTESTATIONS as u64).map(|i| (addr(i), Attestation { ok: true, merge_sha: s(40), at: 0, note: s(MAX_REASON) })).collect();
     // `reason` is a reject reason or one the state machine writes (a short sentence with a handle and an address).
@@ -573,6 +574,7 @@ fn largest_records_fit_in_a_snapshot() {
     p.claims.insert(0, claim);
     p.claim_by_pr.insert(s(MAX_REPO + 21), 0);
     p.handles.insert(s(MAX_GITHUB_HANDLE), addr(0));
+    p.handle_holds.insert(s(MAX_GITHUB_HANDLE), HandleHold { account: addr(0), until: u64::MAX });
     p.jurors.insert(addr(0), Juror { bond: u64::MAX, joined_at: 0, active: true, served: u64::MAX });
     let seat = JurySeat { pairs: vec![[u64::MAX; 2]; PAIRS_PER_JUROR], commitment: Some(hex32(0)), votes: Some(s(PAIRS_PER_JUROR)), spam: vec![u64::MAX; MAX_SEANCE_CLAIMS], agreement_ppm: Some(0), reward: u64::MAX, soul_delta: i64::MIN };
     let results = SeanceResults { accepted: usize::MAX, below_threshold: usize::MAX, spam: usize::MAX, carried_over: usize::MAX, no_shows: usize::MAX, paid: u64::MAX, returned: u64::MAX };

@@ -306,7 +306,7 @@ const views = {
         ${stat(a.nonce, term("nonce", "transactions sent"))}
         ${stat(a.names.length, term("name", "names owned"))}
       </div>
-      ${pc && (pc.soul.points > 0 || pc.claims.length || pc.juror || pc.vouched_by || pc.vouching_for.length || pc.rewards.total_display !== "0 FANG") ? contributionCard(pc) : ""}
+      ${pc && (pc.soul.points > 0 || pc.claims.length || pc.juror || pc.vouched_by || pc.vouching_for.length || pc.vouch_bonds_held?.length || pc.rewards.total_display !== "0 FANG") ? contributionCard(pc) : ""}
       ${a.names.length ? card(`<h2>Names</h2><div class="rows">${a.names.map((n, i) => `<div class="row"><div><a href="#/name/${esc(n)}">${esc(n)}</a></div><span class="dim">${nameInfo[i] ? expiryText(nameInfo[i], s) : ""}</span></div>`).join("")}</div>`) : ""}
       ${a.hunts_won.length || a.familiars.length || a.hunts_created.length ? card(`<h2>Hunts</h2><div class="rows">
         ${a.hunts_won.map((h) => `<div class="row"><div><a href="#/hunt/${h.id}">${esc(h.repo)}#${h.issue}</a> won ${esc(h.amount_display)} for PR #${h.pr}${h.self_awarded ? ' <span class="pill pending">self-awarded</span>' : ""}</div></div>`).join("")}
@@ -376,6 +376,7 @@ function contributionCard(pc) {
     <dt>${term("soul", "Soul")}</dt><dd>${esc(pc.soul.display)} <span class="dim">(${esc(pc.soul.earned_display)} earned in total; it decays slowly)</span></dd>
     ${pc.vouched_by ? `<dt>${term("vouch", "Vouched for by")}</dt><dd>${who(pc.vouched_by.voucher)} at block #${pc.vouched_by.at}</dd>` : ""}
     ${pc.vouching_for.length ? `<dt>${term("vouch", "Vouching for")}</dt><dd>${pc.vouching_for.map((v) => who(v.account)).join(", ")}</dd>` : ""}
+    ${pc.vouch_bonds_held?.length ? `<dt>${term("vouch", "Withdrawn vouches")}</dt><dd>${pc.vouch_bonds_held.map((v) => `${who(v.account)} <span class="dim">(${esc(v.bond_display)} held until block #${v.held_until}, longer while a sybil flag on them is proposed)</span>`).join(", ")}</dd>` : ""}
     ${pc.juror ? `<dt>${term("seance", "Juror")}</dt><dd>${pc.juror.active ? "in the pool" : "benched (missed a reveal; join again to return)"} · bond ${esc(pc.juror.bond_display)} · served on ${plural(pc.juror.served, "Séance")}</dd>` : ""}
     <dt>${term("vesting", "Rewards")}</dt><dd>${esc(r.withdrawable_display)} withdrawable · ${esc(r.unvested_display)} still vesting</dd>
     ${pc.sybil ? `<dt>Flagged</dt><dd class="err">as a sybil by ${who(pc.sybil.by)}: “${esc(pc.sybil.reason)}”</dd>` : ""}

@@ -1441,6 +1441,18 @@ impl State {
                 if let Some(l) = self.github.get(&lower) {
                     bail!("@{} is already linked to {}; it must be unlinked first", l.handle, short(&l.account));
                 }
+                // Audit xcut-economic-4: a squatter can't take a handle validators have seen a gist
+                // prove (its first verified claim, `Poc::handles`), nor one governance holds for
+                // whoever asked it to unlink a squatter (`poc::HandleHold`).
+                if let Some(a) = self.poc.handles.get(&lower).filter(|a| **a != sender) {
+                    bail!("@{handle}'s contributions are credited to {} (validators checked its gist); only that account can link it", short(a));
+                }
+                if let Some(h) = self.poc.handle_holds.get(&lower).filter(|h| h.until > height && h.account != sender) {
+                    bail!("@{handle} is held for {} until block {} (governance unlinked it at their request)", short(&h.account), h.until);
+                }
+                if self.poc.handle_holds.contains_key(&lower) {
+                    self.set_handle_hold(j, &lower, None);
+                }
                 self.j_github(j, &lower, &sender);
                 self.github.insert(lower.clone(), GithubLink { handle: handle.clone(), account: sender.clone(), gist_id: gist_id.clone(), linked_at: height });
                 self.github_by_account.insert(sender.clone(), lower);
@@ -1583,6 +1595,37 @@ impl State {
         self.github.remove(&lower);
         self.github_by_account.remove(&link.account);
         Ok(())
+    }
+
+    /// An `UnlinkGithub` proposal (audit xcut-economic-4): drops the handle's link unless it's
+    /// `proposer`'s, and holds the handle for `proposer` for one voting period (`HandleHold`), so
+    /// the account that asked for it can link it before a squatter links it again. The proposer
+    /// is the one asking, so it's the one the handle is held for; voters judge whether it's the
+    /// handle's owner (its gist). A squatter unlinking itself before the proposal runs doesn't
+    /// stop the hold. A handle validators have credited to another account (`Poc::handles`) isn't
+    /// held: only that account can link it anyway. Returns what it did.
+    pub(crate) fn exec_reclaim_github(&mut self, j: &mut Journal, handle: &str, proposer: &str, height: u64) -> Result<String> {
+        let lower = handle.to_ascii_lowercase();
+        let holder = self.github.get(&lower).map(|l| l.account.clone());
+        if holder.as_deref() == Some(proposer) {
+            return Ok(format!("@{handle} is already linked to the proposer"));
+        }
+        let mut did = match holder {
+            Some(a) => {
+                self.exec_unlink_github(j, handle)?;
+                format!("unlinked @{handle} from {}", short(&a))
+            }
+            None => format!("@{handle} was no longer linked"),
+        };
+        match self.poc.handles.get(&lower).filter(|a| a.as_str() != proposer) {
+            Some(a) => did.push_str(&format!("; its contributions are credited to {}, which alone can link it", short(a))),
+            None => {
+                let until = height.saturating_add(self.chain_params.voting_blocks);
+                self.set_handle_hold(j, &lower, Some(crate::poc::HandleHold { account: proposer.to_string(), until }));
+                did.push_str(&format!("; only {} can link it until block {until}", short(proposer)));
+            }
+        }
+        Ok(did)
     }
 
     /// Cancels an open hunt and refunds every funder what they put in. Nobody can redirect a

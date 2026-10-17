@@ -218,7 +218,8 @@ pub enum KindCmd {
         #[command(flatten)]
         meta: Meta,
     },
-    /// Unlink a GitHub handle
+    /// Unlink a GitHub handle (a squatter's) and hold it for you, the proposer, to link for one
+    /// voting period. Propose it from the account that should get the handle.
     UnlinkGithub {
         handle: String,
         #[command(flatten)]

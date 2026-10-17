@@ -53,6 +53,10 @@ pub mod ns {
     pub const JURORS: u8 = 23;
     pub const SEANCES: u8 = 24;
     pub const GRANTS: u8 = 25;
+    /// Withdrawn vouches that still count (`poc::DroppedVouch`), by `vouchee/voucher`.
+    pub const DROPPED_VOUCHES: u8 = 26;
+    /// GitHub handles governance holds for an account (`poc::HandleHold`), by lowercase handle.
+    pub const HANDLE_HOLDS: u8 = 27;
 
     // 32–47: the protocol v1 modules, each in its own range so they're built in parallel without
     // colliding. Names say the intended use; a module may repurpose a number in its own range
@@ -216,7 +220,7 @@ impl State {
     /// scalar that `meta_records` covers, so nothing escapes the root.
     fn tables(&self) -> Vec<(u8, &dyn Table)> {
         let State { accounts, names, supply: _, burned: _, validators, active_sets, params: _, chain_params: _, hunts, next_hunt_id: _, github, github_by_account, familiars, poc, staking, governance, econ, beacon, upgrade, ghost, tree: _ } = self;
-        let Poc { repos, souls, vouches, sybils, claims, claim_by_pr, handles, jurors, seances, grants, next_claim_id: _, next_seance_id: _, next_grant_id: _, open_seance: _, next_seance_at: _ } = poc;
+        let Poc { repos, souls, vouches, dropped_vouches, sybils, claims, claim_by_pr, handles, handle_holds, jurors, seances, grants, next_claim_id: _, next_seance_id: _, next_grant_id: _, open_seance: _, next_seance_at: _ } = poc;
         let mut t: Vec<(u8, &dyn Table)> = vec![
             (ns::ACCOUNTS, accounts),
             (ns::NAMES, names),
@@ -236,6 +240,8 @@ impl State {
             (ns::JURORS, jurors),
             (ns::SEANCES, seances),
             (ns::GRANTS, grants),
+            (ns::DROPPED_VOUCHES, dropped_vouches),
+            (ns::HANDLE_HOLDS, handle_holds),
         ];
         let modules: [&dyn SubState; 6] = [staking, governance, econ, beacon, upgrade, ghost];
         for m in modules {
@@ -248,7 +254,7 @@ impl State {
     /// [`State::tables`], mutably (same list, same order).
     fn tables_mut(&mut self) -> Vec<(u8, &mut dyn Table)> {
         let State { accounts, names, supply: _, burned: _, validators, active_sets, params: _, chain_params: _, hunts, next_hunt_id: _, github, github_by_account, familiars, poc, staking, governance, econ, beacon, upgrade, ghost, tree: _ } = self;
-        let Poc { repos, souls, vouches, sybils, claims, claim_by_pr, handles, jurors, seances, grants, next_claim_id: _, next_seance_id: _, next_grant_id: _, open_seance: _, next_seance_at: _ } = poc;
+        let Poc { repos, souls, vouches, dropped_vouches, sybils, claims, claim_by_pr, handles, handle_holds, jurors, seances, grants, next_claim_id: _, next_seance_id: _, next_grant_id: _, open_seance: _, next_seance_at: _ } = poc;
         let mut t: Vec<(u8, &mut dyn Table)> = vec![
             (ns::ACCOUNTS, accounts),
             (ns::NAMES, names),
@@ -268,6 +274,8 @@ impl State {
             (ns::JURORS, jurors),
             (ns::SEANCES, seances),
             (ns::GRANTS, grants),
+            (ns::DROPPED_VOUCHES, dropped_vouches),
+            (ns::HANDLE_HOLDS, handle_holds),
         ];
         let modules: [&mut dyn SubState; 6] = [staking, governance, econ, beacon, upgrade, ghost];
         for m in modules {
@@ -281,7 +289,7 @@ impl State {
     /// like [`State::tables`].
     fn meta_records(&self) -> Vec<(&'static [u8], Vec<u8>)> {
         let State { supply, burned, params, chain_params, next_hunt_id, poc, accounts: _, names: _, validators: _, active_sets: _, hunts: _, github: _, github_by_account: _, familiars: _, staking: _, governance: _, econ: _, beacon: _, upgrade: _, ghost: _, tree: _ } = self;
-        let Poc { next_claim_id, next_seance_id, next_grant_id, open_seance, next_seance_at, repos: _, souls: _, vouches: _, sybils: _, claims: _, claim_by_pr: _, handles: _, jurors: _, seances: _, grants: _ } = poc;
+        let Poc { next_claim_id, next_seance_id, next_grant_id, open_seance, next_seance_at, repos: _, souls: _, vouches: _, dropped_vouches: _, sybils: _, claims: _, claim_by_pr: _, handles: _, handle_holds: _, jurors: _, seances: _, grants: _ } = poc;
         let mut m = vec![
             (meta::BURNED, encode(burned)),
             (meta::CHAIN_PARAMS, encode(chain_params)),
@@ -450,7 +458,7 @@ impl State {
     }
 
     /// Accounting and consistency: every drop of the supply sits in a balance or an escrow
-    /// (open hunts, stake pools and unbonding entries, vouches, jurors, claim bonds, unwithdrawn
+    /// (open hunts, stake pools and unbonding entries, vouches (withdrawn ones too, while held), jurors, claim bonds, unwithdrawn
     /// grants, open Séance budgets), and records that refer to each other agree. `Err` names the
     /// first problem.
     pub fn check_invariants(&self) -> Result<()> {
@@ -459,6 +467,7 @@ impl State {
         let open_hunts: Vec<&crate::chain::Hunt> = self.hunts.values().filter(|h| h.status == HuntStatus::Open).collect();
         held += open_hunts.iter().map(|h| h.amount as u128).sum::<u128>();
         held += p.vouches.values().map(|v| v.bond as u128).sum::<u128>();
+        held += p.dropped_vouches.values().map(|d| d.bond as u128).sum::<u128>();
         held += p.jurors.values().map(|r| r.bond as u128).sum::<u128>();
         held += p.claims.values().map(|c| c.bond as u128).sum::<u128>();
         for (who, gs) in p.grants.iter() {
@@ -532,6 +541,13 @@ impl State {
         }
         for (to, v) in p.vouches.iter() {
             ensure!(v.voucher != *to, "{to} vouches for itself");
+        }
+        for (handle, h) in p.handle_holds.iter() {
+            ensure!(*handle == handle.to_ascii_lowercase() && !h.account.is_empty(), "handle hold {handle} is misfiled");
+        }
+        for (key, d) in p.dropped_vouches.iter() {
+            ensure!(key.split_once('/').is_some_and(|(to, by)| !to.is_empty() && !by.contains('/') && to != by), "dropped vouch {key} is misfiled");
+            ensure!(d.at <= d.dropped_at, "dropped vouch {key} was withdrawn before it was made");
         }
         self.check_bounds()
     }
