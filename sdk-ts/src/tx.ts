@@ -498,10 +498,10 @@ function encodeAction(w: Writer, a: Action) {
       w.u8(54);
       break;
     case "validator_ready":
-      w.u8(60); w.u64(a.epoch);
+      w.u8(60); w.int(a.epoch, "epoch");
       break;
     case "admit_validator":
-      w.u8(61); w.str(a.validator); w.u64(a.epoch);
+      w.u8(61); w.str(a.validator); w.int(a.epoch, "epoch");
       break;
     default:
       throw new Error(`unknown action type ${(a as { type: string }).type}`);

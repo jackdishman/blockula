@@ -1541,7 +1541,7 @@ impl Action {
             Action::CommitVotes { seance_id, .. } => vec![("seance_id", *seance_id)],
             Action::RevealVotes { seance_id, spam, .. } => std::iter::once(("seance_id", *seance_id)).chain(spam.iter().map(|id| ("spam", *id))).collect(),
             Action::UpdateValidator { commission_bps, .. } => vec![("commission_bps", *commission_bps)],
-            Action::BeaconCommit { epoch, .. } | Action::BeaconReveal { epoch, .. } => vec![("epoch", *epoch)],
+            Action::BeaconCommit { epoch, .. } | Action::BeaconReveal { epoch, .. } | Action::ValidatorReady { epoch } | Action::AdmitValidator { epoch, .. } => vec![("epoch", *epoch)],
             Action::Propose { kind, .. } => kind.json_ints(),
             Action::Vote { proposal_id, .. } => vec![("proposal_id", *proposal_id)],
             Action::MultisigApprove { id, .. } => vec![("id", *id)],
@@ -2757,7 +2757,7 @@ pub(crate) mod tests {
         ];
         let rule = format!("must be at most {MAX_JSON_INT}");
         let mut checked = 0;
-        for action in vector_actions().into_iter().chain(v1_vector_actions()).chain(ghost_vector_actions()).chain(extra) {
+        for action in vector_actions().into_iter().chain(v1_vector_actions()).chain(ghost_vector_actions()).chain(small_set_vector_actions()).chain(extra) {
             let json = serde_json::to_value(&action).unwrap();
             let mut paths = vec![];
             numbers(&json, &mut vec![], &mut paths);
