@@ -805,9 +805,22 @@ proptest::proptest! {
                     let _ = t.run(&delegators[who], Action::Delegate { validator: vals[to].clone(), amount: fang * FANG });
                 }
                 Op::Undelegate { who, from, permille } => {
-                    let held = t.shares(&delegators[who].address(), &vals[from]);
-                    if held > 0 {
+                    let a = delegators[who].address();
+                    let held = t.shares(&a, &vals[from]);
+                    if held > 0 && permille % 2 == 1 {
                         let _ = t.run(&delegators[who], Action::Undelegate { validator: vals[from].clone(), shares: ((held * permille as u128 / 1_000).max(1)) as u64, amount: 0 });
+                    } else if held > 0 {
+                        // By an amount the chain converts at the pool's price (gap-7-5): at least
+                        // that much unbonds, or (asked for more than the stake is worth) nothing.
+                        let worth = delegation_value(&t.st, &a, &vals[from]);
+                        let amount = if permille == 1_000 { worth + 1 } else { (worth as u128 * permille as u128 / 1_000).max(1) as u64 };
+                        let unbonding = holdings(&t.st, &a).1;
+                        let outcome = t.run(&delegators[who], Action::Undelegate { validator: vals[from].clone(), shares: 0, amount });
+                        if matches!(outcome, Ok(Outcome::Applied)) {
+                            proptest::prop_assert!(amount <= worth && holdings(&t.st, &a).1 >= unbonding + amount, "asked {} of {}, unbonding went {} → {}", amount, worth, unbonding, holdings(&t.st, &a).1);
+                        } else {
+                            proptest::prop_assert!(amount > worth || t.st.staking.entries.iter().filter(|(k, _)| k.starts_with(&format!("{a}/"))).count() >= MAX_ENTRIES, "{:?} for {} of {}", outcome, amount, worth);
+                        }
                     }
                 }
                 Op::Redelegate { who, from, to, permille } => {
