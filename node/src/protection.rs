@@ -23,13 +23,19 @@
 //!    Silence alone isn't that case (audit F18): a node stuck in an epoch the network has left, or
 //!    cut off from it, sees no certificates either. So the escape fails safe. It also needs peers
 //!    outside consensus to show the network standing still where this node is
-//!    ([`Protection::note_network`]: every HTTP peer that answers reports a tip at or below this
-//!    node's height, and nobody's tip, this node's included, moved for most of the escape time,
+//!    ([`Protection::note_network`]: HTTP peers at exactly this node's height outnumber those
+//!    claiming more, and this node's height stayed put for most of the escape time,
 //!    [`Timing::standstill_ms`]; see [`network_view`]), or the operator to name the height the
-//!    network halted at (`--network-halted-at`, counted only while no peer answers); and no sign
-//!    of a later epoch ([`Protection::note_later_epoch`]: peers' consensus traffic or tips).
-//!    Without them the node keeps abstaining: a missed vote, never a double-sign. And it signs
-//!    only views above the newest finalized block it executed, whatever simplex replayed.
+//!    network halted at (`--network-halted-at`, which stands in for the peers' answers, whatever
+//!    they say); and no evidence of a later epoch or of a network past this node. Evidence
+//!    counts only when it's verified (a finalized height or a certificate this node checked
+//!    against a set it knows) or comes from more of this epoch's validators than can be faulty
+//!    ([`Protection::note_later_epoch`]: their consensus traffic for a later epoch, recently).
+//!    No single unverified source can keep a whole network from restarting (review of F18): one
+//!    lying peer, p2p or HTTP, is outvoted, its hints expire, and the operator's word overrides
+//!    every unverified answer. Without the standstill the node keeps abstaining: a missed vote,
+//!    never a double-sign. And it signs only views above the newest finalized block it executed,
+//!    whatever simplex replayed.
 //! 3. **Doppelganger detection.** A vote or certificate carrying this key's signature on a
 //!    message the record doesn't have, in a view an earlier, stopped instance can't have reached,
 //!    means another instance is signing with this key. The node then signs nothing more and halts
@@ -178,6 +184,13 @@ impl Timing {
     pub fn standstill_ms(&self) -> u64 {
         self.escape_ms.saturating_sub(self.watch_ms)
     }
+
+    /// How long a validator's consensus traffic for a later epoch counts against the escape
+    /// ([`Protection::note_later_epoch`]): a network that really is in a later epoch keeps sending
+    /// it every view, so a hint that isn't renewed this long is stale.
+    pub fn hint_ms(&self) -> u64 {
+        self.escape_ms
+    }
 }
 
 /// The startup rule's state for one epoch.
@@ -214,9 +227,12 @@ struct Inner {
     observed: BTreeMap<u64, u64>,
     /// Newest epoch entered or seen certified.
     newest_epoch: u64,
-    /// Newest epoch unverified signals put the network in (peers' traffic, tips): no escape in
-    /// earlier epochs.
-    hinted_epoch: u64,
+    /// Per epoch, the members of its set (by signer index) whose consensus traffic was for a later
+    /// epoch, and when it last arrived (ms). Unverified one by one: it counts against the escape
+    /// only from more members than can be faulty, and only while fresh ([`Timing::hint_ms`]).
+    hints: BTreeMap<u64, BTreeMap<u32, u64>>,
+    /// Each epoch's set size (for the fault bound the hints are counted against).
+    sizes: BTreeMap<u64, usize>,
     /// What peers last said: the network standing still where this node is, since when.
     standstill: Option<Standstill>,
     /// View of the newest finalized block this node executed, per epoch: never signed at or below.
@@ -282,7 +298,8 @@ impl Protection {
             current: false,
             observed: BTreeMap::new(),
             newest_epoch: 0,
-            hinted_epoch: 0,
+            hints: BTreeMap::new(),
+            sizes: BTreeMap::new(),
             standstill: None,
             executed: BTreeMap::new(),
             me: BTreeMap::new(),
@@ -326,6 +343,7 @@ impl Protection {
         let mut g = self.inner.lock();
         g.now = g.now.max(now_ms);
         g.me.insert(epoch, me);
+        g.sizes.insert(epoch, participants);
         g.newest_epoch = g.newest_epoch.max(epoch);
         if !g.gates.contains_key(&epoch) {
             // A set of one has nobody to watch (and nobody to double-sign against).
@@ -342,6 +360,8 @@ impl Protection {
         g.observed.retain(|e, _| *e >= keep);
         g.executed.retain(|e, _| *e >= keep);
         g.me.retain(|e, _| *e >= keep);
+        g.hints.retain(|e, _| *e >= keep);
+        g.sizes.retain(|e, _| *e >= keep);
     }
 
     /// The network has finalized a block of `epoch` (a certificate this node verified): nothing
@@ -361,14 +381,26 @@ impl Protection {
         *e = (*e).max(view);
     }
 
-    /// Something unverified (a peer's consensus traffic, peers' tips) puts the network in `epoch`:
-    /// no escape in an earlier one. It never stops the watch itself (certificates, which are
-    /// verified, still open the gate), so a lying peer can only keep a node from escaping.
-    pub fn note_later_epoch(&self, epoch: u64) {
+    /// Consensus traffic for epoch `theirs` arrived from `member` (its signer index in epoch
+    /// `ours`'s set; `None`: not in that set) while this node is in `ours`. The epoch on that
+    /// traffic is the sender's word (a mux subchannel it picks), so one sender proves nothing,
+    /// and one lying peer mustn't keep every validator of a restarting network from escaping
+    /// (review of F18). It counts against the escape in `ours` once more members than can be
+    /// faulty sent it within [`Timing::hint_ms`] (then an honest one is in a later epoch). Traffic
+    /// from outside the set doesn't count. It never stops the watch itself (certificates, which
+    /// are verified, still open the gate).
+    pub fn note_later_epoch(&self, ours: u64, member: Option<u32>, theirs: u64) {
+        if theirs <= ours {
+            return;
+        }
         let mut g = self.inner.lock();
-        if epoch > g.hinted_epoch {
-            debug!(epoch, "slashing protection: the network is said to be in a later epoch");
-            g.hinted_epoch = epoch;
+        let Some(m) = member else {
+            debug!(ours, theirs, "slashing protection: later-epoch traffic from outside this epoch's set (not counted)");
+            return;
+        };
+        let now = g.now;
+        if g.hints.entry(ours).or_default().insert(m, now).is_none() {
+            debug!(ours, theirs, member = m, "slashing protection: a validator of this epoch is said to be in a later epoch");
         }
     }
 
@@ -496,18 +528,32 @@ impl Protection {
 }
 
 impl Inner {
+    /// Whether more of `epoch`'s validators than can be faulty sent traffic for a later epoch
+    /// within [`Timing::hint_ms`] ([`Protection::note_later_epoch`]).
+    fn later_by_quorum(&self, epoch: u64, now: u64, t: Timing) -> bool {
+        let f = self.sizes.get(&epoch).copied().unwrap_or(0).saturating_sub(1) / 3;
+        let fresh = self.hints.get(&epoch).map_or(0, |h| h.values().filter(|at| now.saturating_sub(**at) <= t.hint_ms()).count());
+        fresh > f
+    }
+
     /// Whether the restart rule may escape in `epoch` (watched since `since`, no progress for
-    /// the escape time): nothing says the network is in a later epoch, and peers' latest answer
-    /// (fresh, and given after the watch began) shows it standing still where this node is, the
-    /// same for at least [`Timing::standstill_ms`]. Anything else keeps it abstaining (audit F18).
+    /// the escape time): no verified sign of a later epoch, nor one from more of the epoch's
+    /// validators than can be faulty, and peers' latest answer (or the operator's word) shows the
+    /// network standing still where this node is, fresh, for at least [`Timing::standstill_ms`]
+    /// of this watch. A standstill first seen before the watch began counts from its start (the
+    /// node executed an epoch's last block, and peers answered before it entered the next epoch:
+    /// review of F18). Anything else keeps it abstaining (audit F18).
     fn escape(&self, epoch: u64, since: u64, now: u64, t: Timing) -> Result<(), &'static str> {
-        if self.hinted_epoch > epoch || self.newest_epoch > epoch {
-            return Err("the network is in a later epoch");
+        if self.newest_epoch > epoch {
+            return Err("the network finalized a later epoch");
+        }
+        if self.later_by_quorum(epoch, now, t) {
+            return Err("more of this epoch's validators than can be faulty are in a later epoch");
         }
         match self.standstill {
-            Some(s) if s.epoch != epoch || s.from_ms < since => Err("no peer shows the network standing where this node is"),
+            Some(s) if s.epoch != epoch => Err("no peer shows the network standing where this node is"),
             Some(s) if now.saturating_sub(s.at_ms) > 2 * t.watch_ms => Err("peers haven't answered lately"),
-            Some(s) if s.at_ms - s.from_ms < t.standstill_ms() => Err("the network hasn't stood still for long enough"),
+            Some(s) if s.at_ms < since || s.at_ms - s.from_ms.max(since) < t.standstill_ms() => Err("the network hasn't stood still for long enough"),
             Some(_) => Ok(()),
             None => Err("no peer shows the network standing where this node is"),
         }
@@ -574,16 +620,15 @@ impl Reporter for Observer {
     }
 }
 
-/// The network standing still where this node is, as peers outside consensus last reported it
-/// ([`Protection::note_network`]).
+/// The network standing still where this node is, as peers outside consensus (or the operator)
+/// last reported it ([`Protection::note_network`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Standstill {
     /// The epoch of this node's next block.
     epoch: u64,
-    /// This node's height, and the highest tip a peer reported (at or below it).
+    /// This node's height.
     height: u64,
-    peers: u64,
-    /// When peers first reported exactly this, and when they last did.
+    /// When it was first reported at exactly this height, and when last.
     from_ms: u64,
     at_ms: u64,
 }
@@ -591,59 +636,68 @@ struct Standstill {
 /// What peers outside consensus say about where the network is, for the restart rule's escape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NetworkView {
-    /// Nobody is past this node: every tip is at or below its height. `epoch` is its next
-    /// block's, `peers` the highest tip a peer reported.
-    Here { epoch: u64, peers: u64 },
-    /// Someone is past this node in its epoch: it's behind, not halted with the network.
-    Ahead,
-    /// Someone is in this later epoch.
-    Later(u64),
+    /// Standing still where this node is: more answering peers are at exactly its height than
+    /// claim more, or the operator said so (`operator`). `epoch` is its next block's.
+    Here { epoch: u64, operator: bool },
+    /// Past this node: `verified` if a finalized height it checked says so (nothing overrides
+    /// that), else peers' unverified answers (the operator's word overrides those).
+    Ahead { verified: bool },
+    /// Nobody answered, or nobody at this node's height.
+    Unknown,
 }
 
-/// Reads the tips (heights) peers reported, for a node whose executed height is `height` and
-/// whose own view of the network's height (finalized certificates, peers' sync claims) is
-/// `claimed`: `None` if no peer answered. There's no slack: a network one block ahead finalized a
-/// view this node never saw, which an earlier run of it (a restored volume) may have voted in.
-pub fn network_view(params: &crate::chain::Params, height: u64, claimed: u64, tips: &[u64]) -> Option<NetworkView> {
-    let peers = *tips.iter().max()?;
+/// Reads what peers outside consensus report, for a node whose executed height is `height`:
+/// `finalized`, the newest finalized height it verified (certificates, marshal's tips, a peer's
+/// certified blocks); `claimed`, what its sync peers claim (the median, unverified); `tips`, the
+/// heights its HTTP peers answer with (unverified); `halted_at`, the operator's
+/// `--network-halted-at`. A verified height above this node means the network finalized a view
+/// it never saw, which an earlier run of it (a restored volume) may have voted in: no escape,
+/// whatever anyone says. The operator's word at exactly this height stands in for the peers,
+/// whatever they answer (an unverified claim can't veto a restart the operator called: review of
+/// F18). Otherwise unverified answers are counted: peers at exactly this height must outnumber
+/// those claiming more (one liar among honest peers can't hold a restart back, and one stale peer
+/// far below, which says nothing about this height, can't make a standstill), and so must the
+/// median sync claim stay at or below it.
+pub fn network_view(params: &crate::chain::Params, height: u64, finalized: u64, claimed: u64, tips: &[u64], halted_at: Option<u64>) -> NetworkView {
     let epoch = params.epoch_of(height + 1);
-    let top = peers.max(claimed);
-    let theirs = params.epoch_of(top.saturating_add(1));
-    Some(if theirs > epoch {
-        NetworkView::Later(theirs)
-    } else if top > height {
-        NetworkView::Ahead
+    if finalized > height {
+        return NetworkView::Ahead { verified: true };
+    }
+    if halted_at == Some(height) {
+        return NetworkView::Here { epoch, operator: true };
+    }
+    let at = tips.iter().filter(|t| **t == height).count();
+    let ahead = tips.iter().filter(|t| **t > height).count();
+    if claimed > height || (ahead > 0 && ahead >= at) {
+        NetworkView::Ahead { verified: false }
+    } else if at == 0 {
+        NetworkView::Unknown
     } else {
-        NetworkView::Here { epoch, peers }
-    })
+        NetworkView::Here { epoch, operator: false }
+    }
 }
 
 impl Protection {
-    /// Feeds what peers outside consensus reported at `now_ms` (their tips, over HTTP) to a node
-    /// whose executed height is `height` and whose own view of the network's height is `claimed`
-    /// ([`network_view`]). Each call replaces the last: the escape needs the network standing
-    /// still, so any change (a peer's tip, this node's height) starts the wait over, and an answer
-    /// that isn't [`NetworkView::Here`] (or no answer) withdraws it. `halted_at`: the operator's
-    /// `--network-halted-at`, which stands in for peers while none answers and this node's height
-    /// is that one (peers that answer decide).
-    pub fn note_network(&self, params: &crate::chain::Params, height: u64, claimed: u64, tips: &[u64], halted_at: Option<u64>, now_ms: u64) {
-        let view = match network_view(params, height, claimed, tips) {
-            None if halted_at == Some(height) => network_view(params, height, claimed, &[height]),
-            view => view,
-        };
+    /// Feeds what peers outside consensus reported at `now_ms` ([`network_view`]: this node's
+    /// executed `height`, its verified `finalized` height, its sync peers' median `claimed`
+    /// height, the HTTP peers' `tips`, the operator's `halted_at`). The escape needs the network
+    /// standing still where this node is, so this node's height moving starts the wait over, and
+    /// an answer that isn't [`NetworkView::Here`] (or no answer) withdraws it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn note_network(&self, params: &crate::chain::Params, height: u64, finalized: u64, claimed: u64, tips: &[u64], halted_at: Option<u64>, now_ms: u64) {
+        let view = network_view(params, height, finalized, claimed, tips, halted_at);
         let mut g = self.inner.lock();
         match view {
-            Some(NetworkView::Here { epoch, peers }) => match &mut g.standstill {
-                Some(s) if (s.epoch, s.height, s.peers) == (epoch, height, peers) => s.at_ms = s.at_ms.max(now_ms),
-                s => *s = Some(Standstill { epoch, height, peers, from_ms: now_ms, at_ms: now_ms }),
-            },
-            view => {
-                g.standstill = None;
-                if let Some(NetworkView::Later(e)) = view {
-                    drop(g);
-                    self.note_later_epoch(e);
+            NetworkView::Here { epoch, operator } => match &mut g.standstill {
+                Some(s) if (s.epoch, s.height) == (epoch, height) => s.at_ms = s.at_ms.max(now_ms),
+                s => {
+                    if operator && tips.iter().any(|t| *t != height) {
+                        warn!(height, ?tips, "slashing protection: --network-halted-at {height} stands in for HTTP peers that answer otherwise (their answers aren't verified; a certificate past this height would still keep this node abstaining)");
+                    }
+                    *s = Some(Standstill { epoch, height, from_ms: now_ms, at_ms: now_ms });
                 }
-            }
+            },
+            _ => g.standstill = None,
         }
     }
 }
@@ -794,11 +848,17 @@ mod tests {
         }
     }
 
-    /// Peers that answer with this node's own height, 5 into `epoch` (`10 * epoch + 5`): a
-    /// network standing still where this node is.
+    /// Peers answering for a node at height `h` (it verified everything up to `h`, and its sync
+    /// peers claim no more): `note_network` at `t`.
+    fn answer(p: &Protection, h: u64, tips: &[u64], halted_at: Option<u64>, t: u64) {
+        p.note_network(&params(), h, h, h, tips, halted_at, t)
+    }
+
+    /// Peers that answer with this node's own height, 5 into `epoch` (`10 * epoch + 5`), and two
+    /// behind it: a network standing still where this node is.
     fn standing(p: &Protection, epoch: u64) -> impl FnMut(u64) + '_ {
         let h = 10 * epoch + 5;
-        move |t| p.note_network(&params(), h, h, &[h, h - 1, 0], None, t)
+        move |t| answer(p, h, &[h, h - 1, 0], None, t)
     }
 
     /// A network that can't progress without this node (every validator restarting, or a halt)
@@ -840,7 +900,7 @@ mod tests {
         // the peers' tips are this node's.
         let q = Protection::in_memory(&public_key(1), T);
         q.enter_epoch(0, Some(0), 4, 0);
-        run(&q, 0, 19_999, |t| q.note_network(&params(), 0, 0, &[0, 0, 0], None, t));
+        run(&q, 0, 19_999, |t| answer(&q, 0, &[0, 0, 0], None, t));
         assert!(!q.check_and_record(0, 1, Kind::Notarize, b"b"));
         q.tick(20_000);
         assert!(q.check_and_record(0, 1, Kind::Notarize, b"b"));
@@ -851,8 +911,10 @@ mod tests {
     /// certificates for its epoch past the ones it replays. That silence isn't a halted network:
     /// with nothing showing the network standing still where it is, it never escapes, so it
     /// can't sign a view its earlier run finalized. Neither do answers that don't show that:
-    /// unverified signs of a later epoch, peers a block ahead, a network still crawling forward,
-    /// stale or early answers, or the operator's word while peers say otherwise.
+    /// more of the epoch's validators than can be faulty in a later epoch, a verified height past
+    /// it, peers ahead that outnumber those at its height, a network still crawling forward,
+    /// stale or early answers, only stale peers far below it, or the operator's word at another
+    /// height or against a verified height.
     #[test]
     fn silence_alone_never_opens_the_escape() {
         // The earlier run signed views 1..=120 of epoch 4; the volume was snapshotted at 100.
@@ -883,11 +945,16 @@ mod tests {
         run(&p, 0, 60_000, |_| {});
         assert!(refused(&p), "the earlier run finalized view 101");
         assert!(p.status().abstaining && p.watching() && p.halted().is_none());
-        run(&p, 60_000, 3_600_000, |t| p.note_network(&params, 45, 45, &[], None, t));
+        run(&p, 60_000, 3_600_000, |t| p.note_network(&params, 45, 45, 45, &[], None, t));
         assert!(refused(&p));
-        // A peer's traffic for a later epoch: peers standing still don't help any more.
-        p.note_later_epoch(5);
-        run(&p, 3_600_000, 3_700_000, standing(&p, 4));
+        // Two of the epoch's four validators (more than its one faulty) keep sending traffic for
+        // a later epoch: peers standing still don't help.
+        let mut stand = standing(&p, 4);
+        run(&p, 3_600_000, 3_700_000, |t| {
+            p.note_later_epoch(4, Some(1), 5);
+            p.note_later_epoch(4, Some(2), 5);
+            stand(t)
+        });
         assert!(refused(&p));
         // Certificates (verified) still open it the usual way: the network moves on from 101.
         let t = progress(&p, 4, 101, 103, 3_700_000);
@@ -897,13 +964,16 @@ mod tests {
         // Answers that don't count, each for a minute:
         type Answer<'a> = Box<dyn Fn(&Protection, u64) + 'a>;
         let cases: Vec<(&str, Answer)> = vec![
-            ("a peer one block ahead (it finalized a view this node never saw)", Box::new(|p, t| p.note_network(&params, 45, 45, &[45, 46], None, t))),
-            ("this node's own certificates or sync claims are ahead", Box::new(|p, t| p.note_network(&params, 45, 47, &[45], None, t))),
-            ("peers in a later epoch", Box::new(|p, t| p.note_network(&params, 45, 45, &[50], None, t))),
-            ("the network still crawling forward", Box::new(|p, t| p.note_network(&params, 40 + t / 10_000, 40 + t / 10_000, &[40 + t / 10_000], None, t))),
-            ("a standstill in another epoch", Box::new(|p, t| p.note_network(&params, 35, 35, &[35], None, t))),
-            ("the operator's word at another height", Box::new(|p, t| p.note_network(&params, 45, 45, &[], Some(44), t))),
-            ("the operator's word while a peer is ahead", Box::new(|p, t| p.note_network(&params, 45, 45, &[46], Some(45), t))),
+            ("a peer one block ahead, and only one at its height", Box::new(|p, t| p.note_network(&params, 45, 45, 45, &[45, 46], None, t))),
+            ("peers ahead outnumber those at its height", Box::new(|p, t| p.note_network(&params, 45, 45, 45, &[45, 46, 50], None, t))),
+            ("this node verified a finalized height above its own", Box::new(|p, t| p.note_network(&params, 45, 47, 47, &[45, 45, 45], None, t))),
+            ("its sync peers' median claim is ahead", Box::new(|p, t| p.note_network(&params, 45, 45, 47, &[45], None, t))),
+            ("peers in a later epoch", Box::new(|p, t| p.note_network(&params, 45, 45, 45, &[50], None, t))),
+            ("the network still crawling forward", Box::new(|p, t| { let h = 40 + t / 10_000; p.note_network(&params, h, h, h, &[h], None, t) })),
+            ("a standstill in another epoch", Box::new(|p, t| p.note_network(&params, 35, 35, 35, &[35], None, t))),
+            ("only stale peers far below it", Box::new(|p, t| p.note_network(&params, 45, 45, 45, &[0, 3, 44], None, t))),
+            ("the operator's word at another height", Box::new(|p, t| p.note_network(&params, 45, 45, 45, &[], Some(44), t))),
+            ("the operator's word against a finalized height it verified", Box::new(|p, t| p.note_network(&params, 45, 46, 46, &[46], Some(45), t))),
         ];
         for (why, answer) in &cases {
             let p = restored(0);
@@ -915,51 +985,150 @@ mod tests {
         run(&p, 0, 29_750, standing(&p, 4));
         run(&p, 30_000, 90_000, |_| {});
         assert!(refused(&p), "before the watch, and stale");
-        // The halted-network case: peers standing still where it is (or, with none answering,
-        // the operator's --network-halted-at), for long enough. It signs on the record alone.
+        // The halted-network case: peers standing still where it is (or the operator's
+        // --network-halted-at, whatever unverified answers say), for long enough. It signs on the
+        // record alone.
         let p = restored(0);
         run(&p, 0, 30_000, standing(&p, 4));
         assert!(!refused(&p));
-        let p = restored(0);
-        run(&p, 0, 30_000, |t| p.note_network(&params, 45, 45, &[], Some(45), t));
-        assert!(!refused(&p));
+        for tips in [&[][..], &[46], &[45, 1_000, 1_001]] {
+            let p = restored(0);
+            run(&p, 0, 30_000, |t| p.note_network(&params, 45, 45, 47, tips, Some(45), t));
+            assert!(!refused(&p), "the operator's word over {tips:?}");
+        }
     }
 
-    /// What peers' tips say, for a node at height 25 of a chain with 10-block epochs (its next
+    /// Review of F18: in a full restart (every validator starting at once, so nobody's votes are
+    /// observed and the escape is the only way back), no single unverified source keeps a
+    /// validator from escaping. One validator's consensus traffic for a later epoch (whatever
+    /// epoch it names) is one sender's word; traffic from outside the set doesn't count; such
+    /// hints expire. One HTTP peer claiming to be ahead (or changing its claim every answer) is
+    /// outvoted by the peers at this node's height, and the operator's word overrides it.
+    #[test]
+    fn one_unverified_source_cant_hold_a_restart_back() {
+        // Epoch 4 of a 4-validator set, halted at height 45; the escape fires at 20 s.
+        let at = |t: u64| {
+            let p = Protection::in_memory(&public_key(1), T);
+            p.enter_epoch(4, Some(0), 4, t);
+            p
+        };
+        let signs = |p: &Protection| p.check_and_record(4, 1, Kind::Nullify, b"");
+        let p = at(0);
+        run(&p, 0, 20_000, |t| answer(&p, 45, &[45, 45, 45], None, t));
+        assert!(signs(&p), "the control: honest peers standing still");
+        // One member's traffic for epoch u64::MAX, renewed every poll, and any number of
+        // non-members': nothing.
+        let p = at(0);
+        run(&p, 0, 20_000, |t| {
+            p.note_later_epoch(4, Some(3), u64::MAX);
+            p.note_later_epoch(4, None, 9);
+            answer(&p, 45, &[45, 45, 45], None, t)
+        });
+        assert!(signs(&p), "one validator's word");
+        // Two members (more than the one that can be faulty) do count, while they keep at it;
+        // once they stop, their hints expire.
+        let p = at(0);
+        run(&p, 0, 60_000, |t| {
+            p.note_later_epoch(4, Some(2), 5);
+            p.note_later_epoch(4, Some(3), 5);
+            answer(&p, 45, &[45, 45, 45], None, t)
+        });
+        assert!(!signs(&p), "two of four validators in a later epoch");
+        run(&p, 60_250, 100_000, |t| answer(&p, 45, &[45, 45, 45], None, t));
+        assert!(signs(&p), "hints expire");
+        // One HTTP peer a block ahead, or claiming a new tip every answer: outvoted.
+        for liar in [Box::new(|_: u64| 46u64) as Box<dyn Fn(u64) -> u64>, Box::new(|t: u64| 46 + t / 2_000)] {
+            let p = at(0);
+            run(&p, 0, 20_000, |t| answer(&p, 45, &[45, 45, liar(t)], None, t));
+            assert!(signs(&p), "one lying HTTP peer among honest ones");
+        }
+        // As many claiming more as at its height: abstains, until the operator, who called the
+        // restart at 45, says so (overriding unverified answers, far ahead or not).
+        let p = at(0);
+        run(&p, 0, 60_000, |t| answer(&p, 45, &[45, 46], None, t));
+        assert!(!signs(&p), "a tie keeps it abstaining");
+        let p = at(0);
+        run(&p, 0, 20_000, |t| answer(&p, 45, &[45, u64::MAX], Some(45), t));
+        assert!(signs(&p), "the operator's word");
+    }
+
+    /// Review of F18: a validator that executes an epoch's last block while the network halts
+    /// there can hear peers standing still at that height before it enters the next epoch (the
+    /// executor signals the epoch only after the block is on disk). That standstill counts from
+    /// the new epoch's watch, so it still escapes there instead of abstaining for good.
+    #[test]
+    fn a_standstill_seen_just_before_the_next_epoch_counts_from_its_watch() {
+        let p = Protection::in_memory(&public_key(1), T);
+        p.enter_epoch(4, Some(0), 4, 0);
+        // Watching epoch 4 at height 48, peers at 49 (ahead).
+        run(&p, 0, 4_000, |t| answer(&p, 48, &[49, 49, 49], None, t));
+        // It executes 49 (the last block of epoch 4); a poll lands before it enters epoch 5.
+        answer(&p, 49, &[49, 49, 49], None, 4_100);
+        p.enter_epoch(5, Some(0), 4, 4_200);
+        for t in (4_250..=24_000).step_by(250) {
+            if t % 2_000 == 250 {
+                answer(&p, 49, &[49, 49, 49], None, t);
+            }
+            p.tick(t);
+        }
+        assert!(!p.check_and_record(5, 1, Kind::Nullify, b""), "not before the escape time of epoch 5's watch");
+        for t in (24_250..=26_000).step_by(250) {
+            if t % 2_000 == 250 {
+                answer(&p, 49, &[49, 49, 49], None, t);
+            }
+            p.tick(t);
+        }
+        assert!(p.check_and_record(5, 1, Kind::Nullify, b""), "escaped in epoch 5");
+    }
+
+    /// What peers' answers say, for a node at height 25 of a chain with 10-block epochs (its next
     /// block, 26, is in epoch 2), and how long the network must stand still.
     #[test]
     fn peers_tips_show_only_a_network_standing_still_here() {
         let params = params();
-        let view = |claimed, tips: &[u64]| network_view(&params, 25, claimed, tips);
-        assert_eq!(view(25, &[]), None, "nobody answered");
-        assert_eq!(view(25, &[25, 24, 0]), Some(NetworkView::Here { epoch: 2, peers: 25 }), "at or behind this node");
-        assert_eq!(view(25, &[3]), Some(NetworkView::Here { epoch: 2, peers: 3 }));
-        assert_eq!(view(25, &[25, 26]), Some(NetworkView::Ahead), "no slack: a block ahead is ahead");
-        assert_eq!(view(26, &[25]), Some(NetworkView::Ahead), "this node's own claims count");
-        assert_eq!(view(25, &[25, 29]), Some(NetworkView::Later(3)), "a tip at 29 means the network votes in epoch 3");
-        assert_eq!(view(29, &[0]), Some(NetworkView::Later(3)));
-        assert_eq!(view(25, &[25, 1_000]), Some(NetworkView::Later(100)), "one peer far ahead is enough");
+        let view = |finalized, claimed, tips: &[u64], halted_at| network_view(&params, 25, finalized, claimed, tips, halted_at);
+        let here = NetworkView::Here { epoch: 2, operator: false };
+        let unverified = NetworkView::Ahead { verified: false };
+        assert_eq!(view(25, 25, &[], None), NetworkView::Unknown, "nobody answered");
+        assert_eq!(view(25, 25, &[25, 24, 0], None), here, "at or behind this node, one at its height");
+        assert_eq!(view(25, 25, &[3, 24], None), NetworkView::Unknown, "stale peers below say nothing about this height");
+        assert_eq!(view(25, 25, &[25, 26], None), unverified, "as many claim more as are here");
+        assert_eq!(view(25, 25, &[25, 25, 26], None), here, "one lying peer is outvoted");
+        assert_eq!(view(25, 25, &[25, 29, 1_000], None), unverified, "peers far ahead outnumber those here");
+        assert_eq!(view(25, 26, &[25], None), unverified, "the sync peers' median claim counts");
+        assert_eq!(view(26, 26, &[25, 25, 25], None), NetworkView::Ahead { verified: true }, "a finalized height this node verified");
+        assert_eq!(view(26, 26, &[], Some(25)), NetworkView::Ahead { verified: true }, "... which the operator's word doesn't override");
+        assert_eq!(view(25, 30, &[26, 1_000], Some(25)), NetworkView::Here { epoch: 2, operator: true }, "unverified answers it does");
+        assert_eq!(view(25, 25, &[], Some(24)), NetworkView::Unknown, "only at this node's height");
 
-        // The wait starts over whenever anything moves: a peer's tip or this node's height.
+        // The wait starts over whenever this node's height moves, and nothing short of a
+        // standstill at its height starts it.
         let p = Protection::in_memory(&public_key(1), T);
         p.enter_epoch(2, Some(0), 4, 0);
-        run(&p, 0, 24_000, |t| p.note_network(&params, 25, 25, &[t / 2_000], None, t));
+        run(&p, 0, 24_000, |t| p.note_network(&params, 25, 25, 25, &[t / 2_000], None, t));
         assert!(!p.check_and_record(2, 1, Kind::Nullify, b""), "a peer catching up until 24 s");
-        run(&p, 24_250, 40_000, |t| p.note_network(&params, 25, 25, &[25], None, t));
+        run(&p, 24_250, 40_000, |t| p.note_network(&params, 25, 25, 25, &[25], None, t));
         assert!(!p.check_and_record(2, 1, Kind::Nullify, b""), "still since 26 s: 14 s");
-        p.note_network(&params, 25, 25, &[25], None, 41_000);
+        p.note_network(&params, 25, 25, 25, &[25], None, 41_000);
         p.tick(41_000);
         assert!(p.check_and_record(2, 1, Kind::Nullify, b""), "still for 15 s (T.standstill_ms)");
-        // A later epoch in peers' tips sticks: no escape in this epoch, whatever peers say next.
         let q = Protection::in_memory(&public_key(1), T);
         q.enter_epoch(2, Some(0), 4, 0);
-        q.note_network(&params, 25, 25, &[31], None, 0);
-        run(&q, 0, 60_000, |t| q.note_network(&params, 25, 25, &[25], None, t));
-        assert!(!q.check_and_record(2, 1, Kind::Nullify, b""));
+        let poll = |t: u64| q.note_network(&params, 24 + (t / 10_000).min(1), 25, 25, &[25], None, t);
+        run(&q, 0, 24_000, poll);
+        assert!(!q.check_and_record(2, 1, Kind::Nullify, b""), "it executed the finalized block 25 at 10 s: still for 14 s");
+        run(&q, 24_250, 26_000, poll);
+        assert!(q.check_and_record(2, 1, Kind::Nullify, b""), "and for 16 s");
+        // A tip in a later epoch is one unverified answer: it doesn't stick.
+        let q = Protection::in_memory(&public_key(1), T);
+        q.enter_epoch(2, Some(0), 4, 0);
+        q.note_network(&params, 25, 25, 25, &[31], None, 0);
+        run(&q, 0, 30_000, |t| q.note_network(&params, 25, 25, 25, &[25], None, t));
+        assert!(q.check_and_record(2, 1, Kind::Nullify, b""));
         // Answering stops (peers unreachable): the standstill is withdrawn, not kept.
         let r = Protection::in_memory(&public_key(1), T);
         r.enter_epoch(2, Some(0), 4, 0);
-        run(&r, 0, 30_000, |t| r.note_network(&params, 25, 25, if t < 18_000 { &[25] } else { &[] }, None, t));
+        run(&r, 0, 30_000, |t| r.note_network(&params, 25, 25, 25, if t < 18_000 { &[25] } else { &[] }, None, t));
         assert!(!r.check_and_record(2, 1, Kind::Nullify, b""));
     }
 

@@ -45,11 +45,13 @@ struct Node {
     /// Upgrades in the state from block 1 on (put there before the first block, as a
     /// `ScheduleUpgrade` proposal would; every node must get the same).
     schedule: Vec<crate::upgrade::ScheduledUpgrade>,
+    /// `--halt-height`: it stops executing after this block (a coordinated halt).
+    halt_height: Option<u64>,
 }
 
 impl Default for Node {
     fn default() -> Self {
-        Self { supported: consensus::SUPPORTED_PROTOCOL_VERSION, schedule: vec![] }
+        Self { supported: consensus::SUPPORTED_PROTOCOL_VERSION, schedule: vec![], halt_height: None }
     }
 }
 
@@ -69,7 +71,7 @@ async fn start_with(
         // Committed with block 1, the same on every node.
         c.state.upgrade.schedule = node.schedule.clone();
     }
-    crate::upgrade::configure(&mut c, node.supported, None);
+    crate::upgrade::configure(&mut c, node.supported, node.halt_height);
     let chain: Shared = Arc::new(Mutex::new(c));
     let pk = commonware_cryptography::Signer::public_key(&key);
     // The simulated disks don't crash, so the record isn't fsynced.
@@ -98,6 +100,9 @@ async fn start_with(
 /// run and its chain, and whether it's cut off from the others.
 type HttpPeers = std::collections::HashMap<String, std::collections::BTreeMap<usize, (usize, std::sync::Weak<Mutex<Chain>>, bool)>>;
 static HTTP_PEERS: std::sync::LazyLock<Mutex<HttpPeers>> = std::sync::LazyLock::new(Default::default);
+/// HTTP peers that lie: by chain instance and index, the tip they answer with whatever their
+/// chain says (or with no chain behind them at all).
+static HTTP_LIES: std::sync::LazyLock<Mutex<std::collections::HashMap<(String, usize), u64>>> = std::sync::LazyLock::new(Default::default);
 
 /// Stands in for the HTTP peers a validator asks about the network while slashing protection's
 /// restart rule watches (node.rs `watch_network`, audit F18): every two seconds, the tips of the
@@ -112,24 +117,28 @@ fn serve_http_view(ctx: &deterministic::Context, genesis: &Genesis, idx: usize, 
             // Nothing strong is held across the sleep: a dropped run's chain must close.
             let answers = {
                 let all = HTTP_PEERS.lock();
+                let lies = HTTP_LIES.lock();
                 let mine = &all[&instance];
                 match mine.get(&idx) {
                     Some((r, _, _)) if *r != run => return,
                     Some((_, _, true)) => Some(vec![]),
                     _ if !protection.watching() => None,
-                    _ => Some(mine.iter().filter(|(i, (_, _, cut))| **i != idx && !cut).filter_map(|(_, (_, c, _))| c.upgrade()).collect::<Vec<Shared>>()),
+                    _ => Some(mine.iter().filter(|(i, (_, _, cut))| **i != idx && !cut).filter_map(|(i, (_, c, _))| match lies.get(&(instance.clone(), *i)) {
+                        Some(lie) => Some(Err(*lie)),
+                        None => c.upgrade().map(Ok),
+                    }).collect::<Vec<Result<Shared, u64>>>()),
                 }
             };
             if let Some(peers) = answers.filter(|_| protection.watching()) {
                 let Some(chain) = chain.upgrade() else { return };
-                let tips: Vec<u64> = peers.iter().map(|c| c.lock().network_height_claimed()).collect();
-                let (params, height, claimed) = {
+                let tips: Vec<u64> = peers.iter().map(|c| c.as_ref().map_or_else(|lie| *lie, |c| c.lock().network_height_claimed())).collect();
+                let (params, height, finalized, claimed) = {
                     let c = chain.lock();
-                    (c.state.params.clone(), c.height(), c.network_height_claimed())
+                    (c.state.params.clone(), c.height(), c.finalized_tip, c.network_height_claimed())
                 };
                 drop((chain, peers));
                 let now = ctx.current().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
-                protection.note_network(&params, height, claimed, &tips, None, now);
+                protection.note_network(&params, height, finalized, claimed, &tips, None, now);
             }
             ctx.sleep(Duration::from_secs(2)).await;
         }
@@ -683,7 +692,7 @@ fn validators_upgrade_one_at_a_time_and_a_laggard_halts_at_the_activation_height
     let executor = deterministic::Runner::timed(Duration::from_secs(1_800));
     executor.start(|context| async move {
         let mut oracle = network(&context, &genesis, &[]).await;
-        let old = Node { supported: v1, schedule: schedule.clone() };
+        let old = Node { supported: v1, schedule: schedule.clone(), halt_height: None };
         let mut vals = vec![];
         for (i, (home, seed)) in homes.iter().zip(&seeds).enumerate() {
             vals.push(start_with(&context, &mut oracle, &genesis, i, 0, home.clone(), PrivateKey::from_seed_bytes(*seed), old.clone()).await);
@@ -697,7 +706,7 @@ fn validators_upgrade_one_at_a_time_and_a_laggard_halts_at_the_activation_height
             drop(v);
             let h = vals[0].chain.lock().height();
             wait_for_height(&context, &vals, h + 2).await;
-            let upgraded = start_with(&context, &mut oracle, &genesis, i, 1, home, key, Node { supported: v2, schedule: vec![] }).await;
+            let upgraded = start_with(&context, &mut oracle, &genesis, i, 1, home, key, Node { supported: v2, schedule: vec![], halt_height: None }).await;
             vals.insert(i, upgraded);
             let h = vals[0].chain.lock().height();
             wait_for_height(&context, &vals, h + 6).await;
@@ -733,7 +742,7 @@ fn validators_upgrade_one_at_a_time_and_a_laggard_halts_at_the_activation_height
         v.handle.take().unwrap().abort();
         let (home, key) = (v.home.clone(), v.key.clone());
         drop(v);
-        vals.push(start_with(&context, &mut oracle, &genesis, 3, 1, home, key, Node { supported: v2, schedule: vec![] }).await);
+        vals.push(start_with(&context, &mut oracle, &genesis, 3, 1, home, key, Node { supported: v2, schedule: vec![], halt_height: None }).await);
         let target = vals[0].chain.lock().height() + 8;
         wait_for_height(&context, &vals, target).await;
         let h = vals.iter().map(|v| v.chain.lock().height()).min().unwrap();
@@ -998,6 +1007,67 @@ fn a_restored_validator_cut_off_from_the_network_never_signs() {
         assert!(vals[1].protection.halted().is_none());
         println!("✓ cut off for 120 blocks: signed nothing; reconnected: resumed at view {first} (earlier run: through {old_view}), {} signatures", later.len());
     });
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// Review of F18: a coordinated restart (OPERATIONS.md: every validator halts at a height, then
+/// all start again) needs slashing protection's escape on every validator, since nobody's votes
+/// are observed until enough of them sign again. One Byzantine validator that doesn't restart but
+/// floods the others' vote channel with traffic for epoch u64::MAX, and answers HTTP with a tip
+/// a block past the halt, can't keep the network halted: that's one validator's word, outvoted by
+/// the peers standing still at the halt height. The three honest validators (a quorum) escape,
+/// and the chain resumes without it.
+#[test]
+fn a_whole_network_restart_resumes_despite_one_lying_validator() {
+    use commonware_codec::Encode as _;
+    use commonware_p2p::Sender as _;
+    let (root, homes, genesis, seeds) = summon_with("restart-liar", 1_000, &[]);
+    let executor = deterministic::Runner::timed(Duration::from_secs(1_800));
+    executor.start(|context| async move {
+        let mut oracle = network(&context, &genesis, &[]).await;
+        // A coordinated halt at block 12.
+        let halt = Node { halt_height: Some(12), ..Node::default() };
+        let mut vals = vec![];
+        for (i, (home, seed)) in homes.iter().zip(&seeds).enumerate() {
+            vals.push(start_with(&context, &mut oracle, &genesis, i, 0, home.clone(), PrivateKey::from_seed_bytes(*seed), halt.clone()).await);
+        }
+        wait_for_height(&context, &vals, 12).await;
+        context.sleep(Duration::from_secs(10)).await;
+        assert!(vals.iter().all(|v| v.chain.lock().height() == 12), "halted at 12");
+        // Every validator stops.
+        let stopped: Vec<(PathBuf, PrivateKey)> = vals.drain(..).map(|mut v| {
+            v.handle.take().unwrap().abort();
+            (v.home.clone(), v.key.clone())
+        }).collect();
+        context.sleep(Duration::from_secs(1)).await;
+        // Validators 0-2 start again on the "new binary" (no halt height). Validator 3 lies
+        // instead: its HTTP API claims block 13, and it sends everyone vote traffic for epoch
+        // u64::MAX (a mux subchannel it picks), all the time.
+        HTTP_LIES.lock().insert((ident(&genesis).1, 3), 13);
+        let liar = commonware_cryptography::Signer::public_key(&stopped[3].1);
+        let (mut lie, _inbox) = oracle.control(liar).register(crate::consensus::CH_VOTES, consensus::quota(crate::consensus::CH_VOTES)).await.unwrap();
+        context.child("liar").spawn(move |ctx| async move {
+            let mut msg = commonware_codec::varint::UInt(u64::MAX).encode().to_vec();
+            msg.extend_from_slice(b"the network is in a later epoch");
+            loop {
+                lie.send(commonware_p2p::Recipients::All, msg.clone(), false);
+                ctx.sleep(Duration::from_millis(500)).await;
+            }
+        });
+        for (i, (home, key)) in stopped.iter().take(3).enumerate() {
+            vals.push(start(&context, &mut oracle, &genesis, i, 1, home.clone(), key.clone()).await);
+        }
+        // Each one watches, sees nobody's certificates, and escapes once its peers show the
+        // network standing still at 12 (two honest answers at 12 outvote the liar's 13; the
+        // liar's epoch is one validator's word). Then the three finalize blocks again.
+        wait_for_height(&context, &vals, 20).await;
+        assert!(vals.iter().all(|v| !v.protection.status().abstaining && v.protection.halted().is_none()));
+        let h = vals.iter().map(|v| v.chain.lock().height()).min().unwrap();
+        let roots: Vec<String> = vals.iter().map(|v| v.chain.lock().root_at(h).unwrap()).collect();
+        assert!(roots.windows(2).all(|w| w[0] == w[1]), "state roots diverged at {h}: {roots:?}");
+        println!("✓ restarted past the halt at 12 to {h} with one validator lying over p2p and HTTP");
+    });
+    HTTP_LIES.lock().clear();
     std::fs::remove_dir_all(root).ok();
 }
 
