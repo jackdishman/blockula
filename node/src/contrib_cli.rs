@@ -61,20 +61,10 @@ impl Signer {
     /// (audit gap-7-1): pass the address.
     pub(crate) async fn acting_for(&self, remote: &Remote, keys: &Keys) -> Result<String> {
         match &self.from {
-            Some(a) => from_on_chain(a, &remote.resolve(a).await?, &remote.chain_id, &remote.rpc),
+            Some(a) => remote.from_account(a).await,
             None => Ok(remote.address(keys)),
         }
     }
-}
-
-/// `--from` as signed: an address as given; a name only off mainnet, where the CLI has printed
-/// the node's (unproven) answer for it. On mainnet the account every tx names must be one the
-/// user typed as an address, so one node can't pick it (audit gap-7-1).
-pub(crate) fn from_on_chain(given: &str, resolved: &str, chain_id: &str, rpc: &str) -> Result<String> {
-    if crate::crypto::is_address(given.trim()) || chain_id != crate::chain::MAINNET_CHAIN_ID {
-        return Ok(resolved.to_string());
-    }
-    bail!("--from {given}: {rpc} says that's {resolved}, but that's one node's word, and on mainnet the CLI only signs for an account given as an address. Check the address with the account's owner and pass --from {resolved}. Nothing was signed.")
 }
 
 /// An address the node resolves a name to, unproven (printed): only where an address is needed.
@@ -92,13 +82,19 @@ fn submit(dir: &Path, s: &Signer, action: Action) -> Result<Value> {
 /// builds it from the status read that sets `valid_until`, with the day length from the pinned
 /// genesis (audit gap-7-3).
 fn submit_at(dir: &Path, s: &Signer, make: impl FnOnce(u64, u64) -> Result<Action>) -> Result<Value> {
+    submit_as(dir, s, |_, height, day| make(height, day))
+}
+
+/// [`submit_at`] for an action that names the account it's signed for (`make(from, height,
+/// blocks_per_day)`): the same account the tx is `from`, never a second resolution of `--from`.
+fn submit_as(dir: &Path, s: &Signer, make: impl FnOnce(&str, u64, u64) -> Result<Action>) -> Result<Value> {
     let keys = s.keys(dir)?;
     let rt = rt()?;
     let tx = rt.block_on(async {
         let remote = s.connect(dir).await?;
         let from = s.acting_for(&remote, &keys).await?;
         let day = remote.blocks_per_day().await?;
-        crate::validator_cli::send_memo_with(&remote, &keys, &from, |height| make(height, day), String::new()).await
+        crate::validator_cli::send_memo_with(&remote, &keys, &from, |height| make(&from, height, day), String::new()).await
     })?;
     println!("✓ {}", tx["summary"].as_str().unwrap_or_default());
     println!("  {}/#/tx/{}", s.rpc.trim_end_matches('/'), tx["id"].as_str().unwrap_or_default());
@@ -765,9 +761,11 @@ pub fn name(cmd: NameCmd, dir: &Path) -> Result<()> {
         }
         // Both are a `TransferName` to the signer's own account: the chain tells them apart by
         // whether it owns the name.
+        // `to` is the account the tx is signed for, not a second read of `--from`: a node answering
+        // two reads differently could otherwise turn "accept" into an offer to its own account.
         NameCmd::Accept { name, signer } | NameCmd::Withdraw { name, signer } => {
-            let me = rt()?.block_on(signer.from(&signer.keys(dir)?))?;
-            submit(dir, &signer, Action::TransferName { name: normalize_name(&name)?, to: me }).map(|_| ())
+            let name = normalize_name(&name)?;
+            submit_as(dir, &signer, |me, _, _| Ok(Action::TransferName { name, to: me.to_string() })).map(|_| ())
         }
         NameCmd::Release { name, yes, signer } => {
             let n = normalize_name(&name)?;
@@ -939,10 +937,12 @@ mod tests {
     #[test]
     fn from_by_name_needs_the_address_on_mainnet() {
         let a = crate::crypto::Keys::from_seed([5; 32]).address();
-        assert_eq!(from_on_chain("alice.boo", &a, "blockula-testnet-2", "http://n").unwrap(), a);
-        assert_eq!(from_on_chain(&a, &a, crate::chain::MAINNET_CHAIN_ID, "http://n").unwrap(), a);
-        let err = from_on_chain("alice.boo", &a, crate::chain::MAINNET_CHAIN_ID, "http://n").unwrap_err().to_string();
-        assert!(err.contains(&format!("pass --from {a}")) && err.contains("Nothing was signed"), "{err}");
+        use crate::cli_net::from_on_chain;
+        assert!(from_on_chain("alice.boo", "blockula-testnet-2").is_ok());
+        assert!(from_on_chain(&a, crate::chain::MAINNET_CHAIN_ID).is_ok());
+        let err = from_on_chain("alice.boo", crate::chain::MAINNET_CHAIN_ID).unwrap_err().to_string();
+        // No node is asked, so no node's answer is offered as the `--from` to copy (review-r3-clients-6).
+        assert!(err.contains("only signs for an account given as an address") && err.contains("Nothing was signed"), "{err}");
     }
 
     /// `stake undelegate` takes exactly one of `--amount` (signed as an amount, converted by the

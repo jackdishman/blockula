@@ -328,14 +328,37 @@ impl Remote {
         Ok(status)
     }
 
+    /// The chain's genesis as the node serves it, checked to hash to the pinned genesis hash, so
+    /// nothing in it (its block time, its start time) is the node's word.
+    pub async fn genesis(&self) -> Result<crate::chain::Genesis> {
+        let g: crate::chain::Genesis = serde_json::from_value(get(&self.rpc, "/genesis").await?).context("the node's genesis doesn't parse")?;
+        let hash = hex::encode(crate::consensus::genesis_block(&g).digest_bytes());
+        ensure!(hash == self.genesis_hash, "{} serves a genesis that hashes to {hash}, not the pinned {}: refusing its block time", self.rpc, self.genesis_hash);
+        Ok(g)
+    }
+
     /// Blocks per day on this chain, from its genesis: the genesis the node serves must hash to
     /// the pinned genesis hash, so the node can't stretch a "days" figure by misreporting its block
     /// time (audit gap-7-3).
     pub async fn blocks_per_day(&self) -> Result<u64> {
-        let g: crate::chain::Genesis = serde_json::from_value(get(&self.rpc, "/genesis").await?).context("the node's genesis doesn't parse")?;
-        let hash = hex::encode(crate::consensus::genesis_block(&g).digest_bytes());
-        ensure!(hash == self.genesis_hash, "{} serves a genesis that hashes to {hash}, not the pinned {}: refusing its block time", self.rpc, self.genesis_hash);
-        Ok(crate::params::blocks_per_day(g.block_time_ms))
+        Ok(crate::params::blocks_per_day(self.genesis().await?.block_time_ms))
+    }
+
+    /// Refuses a status whose height the chain can't have reached by now (audit
+    /// review-r3-clients-2): a tx's validity window counts from that height, so a node reporting a
+    /// future one gets a tx it can hold and release later, when the window it picked opens (and a
+    /// name signed in it may have changed hands by then). See [`height_limit`].
+    pub async fn check_height(&self, height: u64) -> Result<()> {
+        let g = self.genesis().await?;
+        let limit = height_limit(g.created_at_ms, g.block_time_ms, crate::chain::now_ms());
+        ensure!(
+            height <= limit,
+            "{} reports height {height}, but this chain (started {} ms after the epoch, a block at most every {} ms) can't be past block {limit} by this machine's clock. A tx signed against that height could be held and released later. Nothing was signed: use another node (or check this machine's clock)",
+            self.rpc,
+            g.created_at_ms,
+            g.block_time_ms
+        );
+        Ok(())
     }
 
     /// `keys`' own account on this chain.
@@ -348,6 +371,43 @@ impl Remote {
     pub async fn resolve(&self, who: &str) -> Result<String> {
         resolve_unproven(&self.rpc, who).await
     }
+
+    /// The account `--from` names, to sign for on this chain: an address as given; off mainnet, a
+    /// name as this node resolves it (unproven, printed). On mainnet a name is refused: the
+    /// account every tx names must be one the user gave as an address, so one node can't pick it
+    /// (audit gap-7-1, review-r3-clients-3).
+    pub async fn from_account(&self, given: &str) -> Result<String> {
+        let given = given.trim();
+        from_on_chain(given, &self.chain_id)?;
+        self.resolve(given).await
+    }
+}
+
+/// How far a node's clock-free claims can be trusted: the chain can't be past this height at
+/// `now_ms` (by this machine's clock). Every block's timestamp is at least its parent's plus the
+/// block time, and validators refuse one more than `MAX_CLOCK_DRIFT_MS` ahead of their clocks
+/// (consensus.rs `verify`), so block h is stamped no earlier than genesis + h × block time.
+/// `HEIGHT_CLOCK_TOLERANCE_MS` covers this machine's clock being behind. A chain that ran
+/// slower than its block time is below the limit by that much, so this refuses only a height
+/// the chain can't have, not every lie (docs/PLAN.md "Known limits").
+pub fn height_limit(created_at_ms: u64, block_time_ms: u64, now_ms: u64) -> u64 {
+    let ahead = now_ms.saturating_add(crate::consensus::MAX_CLOCK_DRIFT_MS + HEIGHT_CLOCK_TOLERANCE_MS).saturating_sub(created_at_ms);
+    ahead / block_time_ms.max(1)
+}
+
+/// How far behind the network's clocks this machine's may be before [`height_limit`] refuses an
+/// honest node: 15 minutes.
+pub const HEIGHT_CLOCK_TOLERANCE_MS: u64 = 15 * 60 * 1000;
+
+/// Whether `--from` may be signed for on `chain_id`: an address always; a name only off mainnet,
+/// where the CLI prints the node's (unproven) answer for it. On mainnet the account every tx names
+/// must be one the user typed as an address, so no node's answer for a name picks it (audit
+/// gap-7-1); the CLI doesn't even ask, so there's no node's answer to copy by mistake.
+pub(crate) fn from_on_chain(given: &str, chain_id: &str) -> Result<()> {
+    if crate::crypto::is_address(given.trim()) || chain_id != MAINNET_CHAIN_ID {
+        return Ok(());
+    }
+    bail!("--from {given}: on mainnet the CLI only signs for an account given as an address, since a node's answer for a name is its word alone (a node can point a name anywhere). Check the account's address with its owner and pass that address as --from. Nothing was signed.")
 }
 
 /// An account by address, or a name as `rpc` resolves it: unproven, so the address is printed for
@@ -715,19 +775,28 @@ mod tests {
         // was signed against.
         alternate.store(true, Ordering::SeqCst);
         let hunt = crate::contrib_cli::HuntCmd::Create { repo: "jackdishman/blockula".into(), issue: 7, amount: "10".into(), title: "t".into(), days: 30, signer: signer.clone() };
+        let mut refused = 0;
         for _ in 0..2 {
             let before = posted.lock().len();
             match crate::contrib_cli::hunt(hunt_again(&hunt), &dir) {
-                Ok(()) => {}
-                // The lone-read year-ahead lie lands on the signing read: its valid_until is refused.
-                Err(e) => assert!(e.to_string().contains("too far ahead") || e.to_string().contains("valid_until"), "{e}"),
+                Ok(()) => {
+                    let tx = posted.lock()[before..].last().cloned().unwrap();
+                    let (expires, valid_until) = (tx["action"]["expires_at"].as_u64().unwrap(), tx["valid_until"].as_u64().unwrap());
+                    assert_eq!(expires - (valid_until - 600), 30 * 86_400, "one status read, the genesis's block time: {tx}");
+                }
+                // The lone-read year-ahead lie lands on the signing read: a height the chain can't
+                // have reached by this machine's clock is refused before anything is signed
+                // (review-r3-clients-2; before, the tx was signed and only the chain refused it).
+                Err(e) => {
+                    assert!(e.to_string().contains("can't be past block") && e.to_string().contains("Nothing was signed"), "{e}");
+                    assert_eq!(posted.lock().len(), before, "nothing signed against the future height");
+                    refused += 1;
+                }
             }
-            let tx = posted.lock()[before..].last().cloned().unwrap();
-            let (expires, valid_until) = (tx["action"]["expires_at"].as_u64().unwrap(), tx["valid_until"].as_u64().unwrap());
-            assert_eq!(expires - (valid_until - 600), 30 * 86_400, "one status read, the genesis's block time: {tx}");
             // One more read, so the next attempt signs against the other kind of answer.
             rt.block_on(reqwest::get(format!("{node}/api/status"))).unwrap();
         }
+        assert_eq!(refused, 1, "one attempt met the lie");
         assert!(chain.lock().state.hunts.values().any(|h| h.creator == me), "the honest attempt went through");
         // gov propose without --deposit: the node's 999,000 FANG is refused before signing.
         let before = posted.lock().len();
@@ -873,7 +942,7 @@ mod tests {
         let owners = vec![crate::types::key_id(&me_keys.public_key()), crate::types::key_id(&k2.public_key())];
         multisig(MultisigCmd::Create { owners, threshold: 2, signer: signer(&honest) }, &dir).unwrap();
         let drain_action = Action::Transfer { to: mallory.clone(), amount: 50 * DROPS };
-        let by_k2 = Signer { key: Some(k2_file), from: Some(me.clone()), rpc: honest.clone(), pin: ChainPin::default() };
+        let by_k2 = Signer { key: Some(k2_file.clone()), from: Some(me.clone()), rpc: honest.clone(), pin: ChainPin::default() };
         multisig(MultisigCmd::Propose { action: serde_json::to_string(&drain_action).unwrap(), signer: by_k2 }, &dir).unwrap();
         let ms = rt.block_on(get(&honest, &format!("/multisig/{me}"))).unwrap();
         let ms_id = ms["pending"][0]["id"].as_u64().unwrap();
@@ -890,7 +959,7 @@ mod tests {
             }
             v
         }));
-        let display = multisig_lines(&rt.block_on(get(&two_ms, &format!("/multisig/{me}"))).unwrap(), &me);
+        let display = multisig_lines(&rt.block_on(get(&two_ms, &format!("/multisig/{me}"))).unwrap(), &me, &two_ms, &Default::default());
         assert!(display.iter().any(|l| l.contains("does: Send 5 FANG to grants.boo")), "{display:?}");
         let shown_digest = action_digest(&routine);
         assert!(display.iter().any(|l| l.starts_with(&format!("      digest: {shown_digest}"))));
@@ -906,8 +975,132 @@ mod tests {
         // Approving what it really is (its digest from an honest `multisig show`) runs it.
         approve(Some(action_digest(&drain_action))).unwrap();
         assert_eq!(chain.lock().state.account(&mallory).balance, 50 * DROPS);
+
+        // (c) gap-7-6 one level down: K2 proposes that the multisig back proposal #id (the real
+        // 10,000,000 FANG drain) with a vote binding its digest. The co-signer's node shows a
+        // harmless text proposal as #id: the vote's description says the node's #id isn't what
+        // it binds, and the approval is refused before anything is signed, whatever --digest says.
+        let ballot = Action::Vote { proposal_id: id, aye: true, amount: DROPS, conviction: 6, proposal_digest: truth.clone() };
+        let by_k2 = Signer { key: Some(k2_file), from: Some(me.clone()), rpc: honest.clone(), pin: ChainPin::default() };
+        multisig(MultisigCmd::Propose { action: serde_json::to_string(&ballot).unwrap(), signer: by_k2 }, &dir).unwrap();
+        let ms = rt.block_on(get(&honest, &format!("/multisig/{me}"))).unwrap();
+        let ballot_id = ms["pending"].as_array().unwrap().iter().find(|p| serde_json::from_value::<Action>(p["action"].clone()).ok() == Some(ballot.clone())).unwrap()["id"].as_u64().unwrap();
+        let proposal_path = format!("/api/proposal/{id}");
+        let (garlic_node, posted_g) = rt.block_on(liar(honest.clone(), move |path, mut v| {
+            if path == proposal_path {
+                v["kind"] = serde_json::json!({ "type": "text" });
+                v["title"] = "Plant garlic".into();
+            }
+            v
+        }));
+        let read = |rpc: &str| (rt.block_on(get(rpc, &format!("/multisig/{me}"))).unwrap(), [(id, rt.block_on(get(rpc, &format!("/proposal/{id}"))).unwrap())].into_iter().collect::<std::collections::BTreeMap<_, _>>());
+        let (m, proposals) = read(&garlic_node);
+        let lied = multisig_lines(&m, &me, &garlic_node, &proposals);
+        assert!(lied.iter().any(|l| l.contains(&format!("on: NOT what the node shows as proposal #{id}")) && l.contains(&truth)), "{lied:?}");
+        assert!(!lied.join("\n").contains(&format!("multisig approve {ballot_id}")), "no approval command for it: {lied:?}");
+        multisig(MultisigCmd::Show { account: me.clone(), rpc: Rpc { rpc: garlic_node.clone() } }, &dir).unwrap();
+        let err = multisig(MultisigCmd::Approve { id: ballot_id, digest: Some(action_digest(&ballot)), yes: true, signer: signer(&garlic_node) }, &dir).unwrap_err().to_string();
+        assert!(err.contains(&format!("can't confirm what multisig action #{ballot_id} does")) && err.contains("Nothing was signed"), "{err}");
+        assert!(posted_g.lock().is_empty(), "no approval signed for a vote whose proposal the node misrepresents");
+        // Through an honest node the vote is described as backing the drain, and approving it votes.
+        let (m, proposals) = read(&honest);
+        let told = multisig_lines(&m, &me, &honest, &proposals);
+        assert!(told.iter().any(|l| l.contains(&format!("on: proposal #{id} (its content has exactly the digest this vote binds): Pay 10,000,000 FANG from the treasury to {mallory}"))), "{told:?}");
+        multisig(MultisigCmd::Approve { id: ballot_id, digest: Some(action_digest(&ballot)), yes: false, signer: signer(&honest) }, &dir).unwrap();
+        let p = rt.block_on(get(&honest, &format!("/proposal/{id}"))).unwrap();
+        assert!(p["votes"].as_array().unwrap().iter().any(|v| v["voter"]["address"] == me.as_str() && v["aye"] == true && v["conviction"] == 6), "the multisig's vote ran: {p}");
         drop(rt);
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Audit gap-7-1 (the CLI half), review-r3-clients-3 and review-r3-staking-1: `validator admit`
+    /// takes only an address, on every chain (nothing is resolved, read or signed for a name), and
+    /// on mainnet `--from` by name is refused in `validator commission`, `admit` and `unjail` as in
+    /// every other command, against a node that claims blockula-1 and points every name at Mallory.
+    /// Review-r3-clients-2: a status height the chain can't have reached by this machine's clock
+    /// is refused before anything is signed.
+    #[test]
+    fn validator_commands_sign_only_addresses_they_were_given() {
+        use crate::validator_cli::{run_in, AdminArgs, ValidatorCmd};
+        use std::sync::Arc;
+        let root = std::env::temp_dir().join(format!("blockula-cliadmit-{}-{}", crate::chain::now_ms(), std::process::id()));
+        let homes = crate::chain::Chain::summon(&root, &crate::chain::SummonOpts::new("cliadmit", 1)).unwrap();
+        let chain = Arc::new(parking_lot::Mutex::new(crate::chain::Chain::open(&homes[0]).unwrap()));
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let honest = rt.block_on(async {
+            let node = crate::api::Node::new(chain.clone(), None, vec![], Default::default());
+            let app = crate::api::router(node).into_make_service_with_connect_info::<std::net::SocketAddr>();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            url
+        });
+        let producer = chain.clone();
+        rt.spawn(async move {
+            loop {
+                producer.lock().produce_block().ok();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        });
+        let dir = root.join("cli");
+        let key = homes[0].join("validator.key");
+        let me = crate::validator_cli::load_seed(&key).unwrap().address();
+        let mallory = Keys::from_seed([66; 32]).address();
+        let m = mallory.clone();
+        let (main, posted) = rt.block_on(liar(honest.clone(), move |path, mut v| {
+            if path == "/api/status" {
+                v["chain_id"] = MAINNET_CHAIN_ID.into();
+            }
+            if path.starts_with("/api/account/") && !path.contains("boo1") {
+                v["account"]["address"] = m.clone().into();
+            }
+            v
+        }));
+        let mainnet = || ChainPin { network: Some("mainnet".into()), ..Default::default() };
+        let admit = |candidate: &str, rpc: &str, from: Option<&str>, pin: ChainPin| run_in(ValidatorCmd::Admit { candidate: candidate.into(), key: key.clone(), rpc: rpc.into(), from: from.map(String::from), pin }, &dir);
+        // A candidate by name: refused on mainnet and off it, before any read.
+        for (rpc, pin) in [(main.as_str(), mainnet()), (honest.as_str(), ChainPin::default())] {
+            let err = admit("friend.boo", rpc, None, pin).unwrap_err().to_string();
+            assert!(err.contains("takes the candidate's address") && err.contains("Nothing was signed"), "{err}");
+        }
+        let err = admit(&Keys::from_seed([5; 32]).address_with("tboo"), &honest, None, ChainPin::default()).unwrap_err().to_string();
+        assert!(err.contains("another network"), "{err}");
+        // `--from` by name on mainnet, in every validator command that takes it.
+        let refused = |r: anyhow::Result<()>| {
+            let err = r.unwrap_err().to_string();
+            assert!(err.contains("--from owner.boo: on mainnet the CLI only signs for an account given as an address") && !err.contains(&mallory), "{err}");
+        };
+        refused(admit(&mallory, &main, Some("owner.boo"), mainnet()));
+        refused(run_in(ValidatorCmd::Commission { bps: 500, key: key.clone(), rpc: main.clone(), from: Some("owner.boo".into()), pin: mainnet() }, &dir));
+        refused(run_in(ValidatorCmd::Unjail(AdminArgs { validator: me.clone(), key: key.clone(), rpc: main.clone(), from: Some("owner.boo".into()), pin: mainnet() }), &dir));
+        assert!(posted.lock().is_empty(), "nothing signed");
+        // A node a million blocks ahead of what the chain can have reached: refused before signing.
+        let (ahead, posted) = rt.block_on(liar(honest.clone(), |path, mut v| {
+            if path == "/api/status" {
+                v["height"] = (v["height"].as_u64().unwrap() + 1_000_000).into();
+            }
+            v
+        }));
+        let err = run_in(ValidatorCmd::Commission { bps: 500, key: key.clone(), rpc: ahead, from: None, pin: ChainPin::default() }, &dir).unwrap_err().to_string();
+        assert!(err.contains("can't be past block") && err.contains("Nothing was signed"), "{err}");
+        assert!(posted.lock().is_empty(), "nothing signed against the future height");
+        // The honest node: signed (an address in --from is taken as given).
+        run_in(ValidatorCmd::Commission { bps: 1, key: key.clone(), rpc: honest.clone(), from: Some(me.clone()), pin: ChainPin::default() }, &dir).unwrap();
+        assert_eq!(chain.lock().state.validators[&me].commission_bps, 1);
+        drop(rt);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn the_height_limit_follows_the_genesis_clock() {
+        let start = 1_750_000_000_000;
+        // At genesis: only the drift and the tolerance's worth of 1 s blocks.
+        assert_eq!(height_limit(start, 1_000, start), (crate::consensus::MAX_CLOCK_DRIFT_MS + HEIGHT_CLOCK_TOLERANCE_MS) / 1_000);
+        // A day later, a day of blocks more.
+        assert_eq!(height_limit(start, 1_000, start + 86_400_000) - height_limit(start, 1_000, start), 86_400);
+        // A clock before the genesis (or a 0 block time) never underflows or divides by zero.
+        assert_eq!(height_limit(start, 1_000, 0), 0);
+        assert!(height_limit(start, 0, start + 1) > 0);
     }
 
     /// The Séance flavour of review-r2-clients-3: `contrib seance` shows the pairs (and their
