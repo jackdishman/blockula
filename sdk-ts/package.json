@@ -1,7 +1,7 @@
 {
   "name": "@blockula/sdk",
   "version": "0.4.0",
-  "description": "\ud83e\udddb TypeScript SDK for Blockula \u2014 post-quantum wallets (ML-DSA-65), .boo names, transfers",
+  "description": "🧛 TypeScript SDK for Blockula — post-quantum wallets (ML-DSA-65), .boo names, transfers",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -29,7 +29,7 @@
   "devDependencies": {
     "@types/node": "*",
     "tsx": "*",
-    "typescript": "*"
+    "typescript": "^7.0.2"
   },
   "author": "Jack Dishman",
   "keywords": [
