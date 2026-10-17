@@ -50,7 +50,9 @@
 //! **Names** (DEC-11). Registering costs `name_price_3/4/5` by length and lasts
 //! `name_registration_blocks`; `RenewName` adds years at `name_renewal_bps` of the price each (at
 //! most `MAX_RENEW_YEARS` paid ahead). An expired name doesn't resolve; for `name_grace_blocks`
-//! only its owner can renew it, then anyone can register it. Lapsed records are swept a few per
+//! only its owner can renew it, then anyone can register it. The grace a name was registered or
+//! renewed with is kept in its record ([`grace_until`]): lowering the parameter only shortens the
+//! grace of names registered or renewed after the change (a raise lengthens every grace). Lapsed records are swept a few per
 //! block. Reserved names (genesis) can't be registered.
 //!
 //! The scalars (the fee ring, the issuance year, the sweep cursor) are one META record; the
@@ -1459,8 +1461,9 @@ mod tests {
         t.c.state.exec_set_param(&mut Journal::default(), "name_grace_blocks", 70).unwrap();
         assert_eq!((grace(&t, "alice"), grace(&t, "sweepme")), (rec.expires_at + 80, sweep + 70));
         t.c.state.exec_set_param(&mut Journal::default(), "name_grace_blocks", 0).unwrap();
-        // "sweepme" lapses after the 50 blocks it was registered with, then anyone can take it.
-        t.blocks(sweep + 50 - t.c.height());
+        // "sweepme" lapses after the 50 blocks it was registered with (txs admitted now run at
+        // the next height), then anyone can take it.
+        t.blocks(sweep + 49 - t.c.height());
         assert!(t.err(&bob, Action::RegisterName { name: "sweepme".into() }).contains("its owner can renew it until block"));
         t.blocks(1);
         t.ok(&bob, Action::RegisterName { name: "sweepme".into() });
