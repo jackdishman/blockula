@@ -607,7 +607,7 @@ fn largest_records_fit_in_a_snapshot() {
         g.multisigs.insert(addr(0), Multisig { threshold: u8::MAX, created_at: 0, pending: (0..MAX_MULTISIG_PENDING as u64).collect() });
         let action = Action::ReportEquivocation { evidence: "ab".repeat(MAX_EVIDENCE_BYTES) };
         g.multisig_proposals.insert(u64::MAX, MultisigProposal { id: u64::MAX, account: addr(0), action, proposed_by: hex32(0), approvals: (0..MAX_KEYS as u64).map(hex32).collect(), created_at: 0, expires_at: 0 });
-        g.distributions.insert(u64::MAX, Distribution { id: u64::MAX, merkle_root: hex32(0), total: u64::MAX, claimed: u64::MAX, claims: u64::MAX, opened_at: 0, claim_until: 0, closed_at: Some(0), returned: u64::MAX });
+        g.distributions.insert(u64::MAX, Distribution { id: u64::MAX, proposal: u64::MAX, merkle_root: hex32(0), total: u64::MAX, claimed: u64::MAX, claims: u64::MAX, opened_at: 0, claim_until: 0, closed_at: Some(0), returned: u64::MAX });
         g.distribution_claims.insert(IdKey::new(u64::MAX, &addr(0)), DistributionClaim { amount: u64::MAX, at: 0 });
     }
     // Beacon: a round, a revert quorum and a value's misses, each with the whole largest set.

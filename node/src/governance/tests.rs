@@ -1133,35 +1133,60 @@ fn distributions_pay_valid_claims_once_and_return_the_rest() {
     assert!(t.err(BOB, claim(150 * FANG, &proofs[1])).contains("has only 50 FANG left"));
 }
 
-/// Audit F45: a distribution's leaves bind the id its tree was built for, and the kind names that
-/// id. A proposal that lands first (a front-running text proposal, or anyone's) used to shift the
-/// id silently, so the distribution passed, escrowed its total and nobody could claim; now the
-/// late proposal is refused before it takes a deposit, and a tree rebuilt for the new id goes
-/// through and pays.
+/// Audit F45, review-fix-gov-2: a distribution's leaves bind the id its tree was built for, and
+/// the kind names that id, which is the proposer's to pick (no distribution may have it yet), not
+/// the proposal's. So a proposal that lands first changes nothing: neither a front-running text
+/// proposal nor ordinary traffic during a multisig's approval window (the foundation's case,
+/// where the `Propose` only runs at the last approval). An id is used once: a proposal naming
+/// one that's taken is refused before it takes a deposit, and of two open proposals naming the
+/// same id the first to run opens it and the other fails.
 #[test]
-fn a_distribution_built_for_another_id_is_refused_up_front() {
+fn a_distribution_keeps_its_id_whatever_lands_first() {
     let mut t = T::new(&[]);
-    let id = t.st.governance.next_proposal_id;
+    let id = next_distribution_id(&t.st);
+    assert_eq!(id, 0);
     let entries = vec![(addr(CAROL), 11 * FANG)];
-    let (root, _) = build_distribution(id, &entries).unwrap();
+    let (root, proofs) = build_distribution(id, &entries).unwrap();
     let dist = |id: u64, root: [u8; 32]| ProposalKind::Distribution { distribution_id: id, merkle_root: hex::encode(root), total: 11 * FANG, claim_until: 500 };
-    // Someone else's proposal takes id 0 first.
-    assert_eq!(t.propose(BOB, text()), id);
-    let (alice, community_before) = (t.bal(ALICE), t.st.account(&community("boo")).balance);
-    let e = t.err(ALICE, Action::Propose { kind: dist(id, root), deposit: 50 * FANG, title: "drop".into(), url: String::new() });
-    assert!(e.contains(&format!("built for id {id}, but this proposal gets id {}", id + 1)), "{e}");
-    assert!(alice - t.bal(ALICE) < FANG, "only the fee: no deposit taken");
-    assert_eq!(t.st.governance.next_proposal_id, id + 1);
-    // Rebuilt for the id it gets, it passes and pays.
-    let (root, proofs) = build_distribution(id + 1, &entries).unwrap();
-    assert_eq!(t.propose(ALICE, dist(id + 1, root)), id + 1);
-    t.vote(ALICE, id + 1, true, 50_000, 1).unwrap();
-    t.finish(id + 1);
-    assert_eq!(t.p(id + 1).status, ProposalStatus::Executed, "{}", t.p(id + 1).outcome);
-    assert_eq!(t.st.account(&community("boo")).balance, community_before - 11 * FANG);
+    // The foundation is a 2-of-2 multisig: one key proposes, and other proposals land before the
+    // second approves.
+    let foundation = addr(ALICE);
+    let (k1, k2) = (keys(ALICE), keys(11));
+    t.tx(ALICE, Action::AddKey { key_id: kid(11), label: "second key".into(), role: KeyRole::Owner }).unwrap();
+    t.tx(ALICE, Action::MultisigCreate { owners: vec![kid(ALICE), kid(11)], threshold: 2 }).unwrap();
+    let ms = t.st.governance.next_multisig_id;
+    let propose = Action::Propose { kind: dist(id, root), deposit: 50 * FANG, title: "drop".into(), url: String::new() };
+    t.tx_as(&k1, &foundation, Action::MultisigPropose { action: Box::new(propose) }).unwrap();
+    assert_eq!(next_distribution_id(&t.st), 0, "a multisig proposal waiting for approvals holds nothing");
+    t.propose(BOB, text());
+    t.next();
+    t.propose(CAROL, text());
+    let pid = t.st.governance.next_proposal_id;
+    assert_ne!(pid, id);
+    t.tx_as(&k2, &foundation, Action::MultisigApprove { id: ms }).unwrap();
+    assert_eq!((t.p(pid).proposer.as_str(), &t.p(pid).kind), (foundation.as_str(), &dist(id, root)));
+    assert_eq!(next_distribution_id(&t.st), id + 1, "named by an open proposal");
+    // Someone else's proposal naming the same id can be filed (it can't take the id from the
+    // foundation's), but only the first to run opens it.
+    let other = t.propose(BOB, dist(id, build_distribution(id, &[(addr(BOB), 11 * FANG)]).unwrap().0));
+    t.tx_as(&k1, &foundation, Action::MultisigPropose { action: Box::new(Action::Vote { proposal_id: pid, aye: true, amount: 50_000 * FANG, conviction: 1 }) }).unwrap();
+    t.tx_as(&k2, &foundation, Action::MultisigApprove { id: ms + 1 }).unwrap();
+    t.vote(BOB, other, true, 40_000, 1).unwrap();
+    let community_before = t.st.account(&community("boo")).balance;
+    t.finish(other);
+    assert_eq!(t.p(pid).status, ProposalStatus::Executed, "{}", t.p(pid).outcome);
+    assert_eq!(t.p(pid).outcome, format!("opened distribution #{id} of 11 FANG, claimable until block 500"));
+    assert_eq!((t.p(other).status, t.p(other).outcome.contains(&format!("distribution #{id} already exists (proposal #{pid})"))), (ProposalStatus::Failed, true), "{}", t.p(other).outcome);
+    assert_eq!(t.st.account(&community("boo")).balance, community_before - 11 * FANG, "one escrow");
+    assert_eq!((t.st.governance.distributions[&id].proposal, next_distribution_id(&t.st)), (pid, id + 1));
     let carol = t.bal(CAROL);
-    let fee = t.tx(CAROL, Action::ClaimDistribution { distribution_id: id + 1, amount: 11 * FANG, proof: proofs[0].iter().map(hex::encode).collect() }).unwrap();
+    let fee = t.tx(CAROL, Action::ClaimDistribution { distribution_id: id, amount: 11 * FANG, proof: proofs[0].iter().map(hex::encode).collect() }).unwrap();
     assert_eq!(t.bal(CAROL), carol + 11 * FANG - fee);
+    // A taken id is refused up front: only the fee, no deposit.
+    let bob = t.bal(BOB);
+    let e = t.err(BOB, Action::Propose { kind: dist(id, root), deposit: 50 * FANG, title: "again".into(), url: String::new() });
+    assert!(e.contains(&format!("distribution #{id} already exists")), "{e}");
+    assert!(bob - t.bal(BOB) < FANG, "only the fee: no deposit taken");
 }
 
 /// A claimant with nothing to pay the fee with (a new account) pays it, and its account's

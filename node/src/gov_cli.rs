@@ -99,11 +99,11 @@ pub enum GovCmd {
         signer: Signer,
     },
     /// Build a distribution's Merkle tree from `[{"address": "boo1…", "amount": "1.5"}, …]`
-    /// (amounts in FANG). The tree commits to the distribution's id (the proposal's), so build
-    /// it right before proposing; prints (or writes) the root and every recipient's proof.
+    /// (amounts in FANG). The tree commits to the distribution's id, one no distribution has
+    /// yet, which its proposal names; prints (or writes) the root and every recipient's proof.
     Tree {
         entries: PathBuf,
-        /// Distribution id (default: the chain's next proposal id)
+        /// Distribution id (default: the chain's next free one, `next_distribution_id`)
         #[arg(long)]
         id: Option<u64>,
         /// Write the tree here instead of printing it
@@ -351,7 +351,7 @@ pub fn gov(cmd: GovCmd, dir: &Path) -> Result<()> {
                 .collect::<Result<_>>()?;
             let id = match id {
                 Some(id) => id,
-                None => rt()?.block_on(get(&rpc.rpc, "/proposals?limit=0"))?["next_id"].as_u64().ok_or_else(|| anyhow!("no next_id from {}", rpc.rpc))?,
+                None => rt()?.block_on(get(&rpc.rpc, "/proposals?limit=0"))?["next_distribution_id"].as_u64().ok_or_else(|| anyhow!("no next_distribution_id from {}", rpc.rpc))?,
             };
             let (root, proofs) = build_distribution(id, &list)?;
             let total = list.iter().try_fold(0u64, |t, (_, a)| t.checked_add(*a)).ok_or_else(|| anyhow!("the amounts add up to more than u64 drops"))?;
@@ -397,10 +397,10 @@ fn propose(dir: &Path, kind: KindCmd) -> Result<()> {
         KindCmd::Distribution { tree, days, meta } => {
             let t = read_tree(&tree)?;
             let status = rt.block_on(get(&meta.signer.rpc, "/status"))?;
-            let next = rt.block_on(get(&meta.signer.rpc, "/proposals?limit=0"))?["next_id"].as_u64().unwrap_or_default();
             let id = t["distribution_id"].as_u64().unwrap_or_default();
-            if id != next {
-                bail!("{} was built for distribution #{id}, but this proposal will be #{next}: rebuild it with `blockula gov tree --id {next}`", tree.display());
+            if rt.block_on(get(&meta.signer.rpc, &format!("/distribution/{id}"))).is_ok() {
+                let next = rt.block_on(get(&meta.signer.rpc, "/proposals?limit=0"))?["next_distribution_id"].as_u64().unwrap_or_default();
+                bail!("{} was built for distribution #{id}, which already exists: rebuild it with `blockula gov tree --id {next}`", tree.display());
             }
             let block_ms = status["block_time_ms"].as_u64().unwrap_or(1000).max(1);
             let claim_until = status["height"].as_u64().unwrap_or(0) + days * 86_400_000 / block_ms;

@@ -1976,6 +1976,8 @@ async fn proposals(State(n): State<Node>, Query(q): Query<ProposalQuery>) -> Api
     Ok(Json(json!({
         "count": g.proposals.len(),
         "next_id": g.next_proposal_id,
+        // A distribution id no distribution or open proposal uses: what a new tree is built for.
+        "next_distribution_id": crate::governance::next_distribution_id(st),
         "council_active": v.height < cp.bootstrap_end_height,
         "spending_open": v.height >= cp.governance_spend_height,
         "params": {
@@ -2041,7 +2043,7 @@ async fn distribution(State(n): State<Node>, Path(id): Path<u64>, Query(q): Quer
     let remaining = d.total - d.claimed;
     Ok(Json(json!({
         "id": d.id,
-        "proposal": d.id,
+        "proposal": d.proposal,
         "merkle_root": d.merkle_root,
         "total": d.total.to_string(),
         "total_display": fmt_fang(d.total),

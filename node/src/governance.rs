@@ -45,9 +45,12 @@
 //! | `Text` | nothing |
 //!
 //! **Distributions** move `total` from the community account into an escrow claimable until
-//! `claim_until` with Merkle proofs: BLAKE3 leaves over `(distribution_id, address, amount)`
-//! (the id is the proposal's, which the kind names: a proposal whose tree was built for another
-//! id is refused), sorted-pair inner nodes ([`distribution_leaf`], [`merkle_parent`]).
+//! `claim_until` with Merkle proofs: BLAKE3 leaves over `(distribution_id, address, amount)`,
+//! sorted-pair inner nodes ([`distribution_leaf`], [`merkle_parent`]). The proposer picks the id
+//! its tree is built for, which no distribution may have yet (checked when proposed and when it
+//! runs: the first proposal naming it to run opens it), so it doesn't depend on which proposals
+//! land first, and a multisig's proposal survives its approval window (audit F45,
+//! review-fix-gov-2). `/api/proposals` serves a free one, `next_distribution_id`.
 //! What's unclaimed returns to the community account after `claim_until`. A claimant with
 //! nothing to pay the fee with pays it (and its new account's creation fee) out of the claim
 //! ([`claim_toward_fee`]).
@@ -235,10 +238,12 @@ pub struct MultisigProposal {
     pub expires_at: u64,
 }
 
-/// A community distribution (its id is the proposal's).
+/// A community distribution, under the id its proposal named.
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Distribution {
     pub id: u64,
+    /// The proposal that opened it.
+    pub proposal: u64,
     /// Hex BLAKE3 root of the tree of `(id, address, amount)` leaves.
     pub merkle_root: String,
     pub total: u64,
@@ -480,12 +485,9 @@ fn prepare_kind(state: &State, kind: &ProposalKind, height: u64) -> Result<Propo
         }
         ProposalKind::Distribution { distribution_id, claim_until, .. } => {
             spend_gate(state, height)?;
-            // Its tree's leaves bind the id it was built for: refused unless that's the id it
-            // gets, so a proposal that lands first can't leave it unclaimable (audit F45).
-            let next = state.governance.next_proposal_id;
-            if *distribution_id != next {
-                bail!("the distribution's tree was built for id {distribution_id}, but this proposal gets id {next}: rebuild the tree for it (blockula gov tree) and propose again");
-            }
+            // Its tree's leaves bind the id it was built for, which it opens under: one no
+            // distribution has (audit F45, review-fix-gov-2). Checked again when it runs.
+            distribution_id_free(state, *distribution_id)?;
             if *claim_until <= runs_at {
                 bail!("claim_until must be after the vote and the timelock (block {runs_at})");
             }
@@ -842,7 +844,8 @@ fn run_kind(state: &mut State, j: &mut Journal, p: &Proposal, height: u64) -> Re
             format!("paid {} to {}", fmt_fang(*amount), short(to))
         }
         ProposalKind::Distribution { distribution_id, merkle_root, total, claim_until } => {
-            ensure!(*distribution_id == p.id, "the tree was built for distribution #{distribution_id}, not #{}", p.id);
+            let id = *distribution_id;
+            distribution_id_free(state, id)?;
             spend_gate(state, height)?;
             if *claim_until < height {
                 bail!("its claim window ended at block {claim_until}");
@@ -854,10 +857,10 @@ fn run_kind(state: &mut State, j: &mut Journal, p: &Proposal, height: u64) -> Re
             }
             state.j_debit(j, &from, *total)?;
             save_scalars(state, j);
-            state.governance.open_distributions.insert(p.id);
-            j.governance.distributions.touch(&state.governance.distributions, &p.id);
-            state.governance.distributions.insert(p.id, Distribution { id: p.id, merkle_root: merkle_root.clone(), total: *total, claimed: 0, claims: 0, opened_at: height, claim_until: *claim_until, closed_at: None, returned: 0 });
-            format!("opened distribution #{} of {}, claimable until block {claim_until}", p.id, fmt_fang(*total))
+            state.governance.open_distributions.insert(id);
+            j.governance.distributions.touch(&state.governance.distributions, &id);
+            state.governance.distributions.insert(id, Distribution { id, proposal: p.id, merkle_root: merkle_root.clone(), total: *total, claimed: 0, claims: 0, opened_at: height, claim_until: *claim_until, closed_at: None, returned: 0 });
+            format!("opened distribution #{id} of {}, claimable until block {claim_until}", fmt_fang(*total))
         }
         ProposalKind::SetRepo { repo, weight } => {
             state.exec_set_repo(j, repo, *weight, height)?;
@@ -1018,6 +1021,27 @@ fn drop_multisig_proposal(state: &mut State, j: &mut Journal, account: &str, id:
 }
 
 // ---- community distributions
+
+/// A distribution id a `Distribution` proposal may name: no distribution has it yet. Open
+/// proposals naming it don't count (the first to run takes it, and the others fail), so filing a
+/// proposal can't take an id from one in a multisig's approval window.
+fn distribution_id_free(state: &State, id: u64) -> Result<()> {
+    if let Some(d) = state.governance.distributions.get(&id) {
+        bail!("distribution #{id} already exists (proposal #{}): build the tree for another id (blockula gov tree; /api/proposals' next_distribution_id is free)", d.proposal);
+    }
+    Ok(())
+}
+
+/// A distribution id nothing uses yet: past every distribution's and every open `Distribution`
+/// proposal's (what clients build a new tree for).
+pub fn next_distribution_id(state: &State) -> u64 {
+    let g = &state.governance;
+    let open = g.open_proposals.iter().filter_map(|id| g.proposals.get(id)).filter_map(|p| match p.kind {
+        ProposalKind::Distribution { distribution_id, .. } => Some(distribution_id),
+        _ => None,
+    });
+    open.chain(g.distributions.keys().next_back().copied()).max().map_or(0, |m| m.saturating_add(1))
+}
 
 /// A distribution tree's leaf: BLAKE3(`LEAF_DOMAIN` ‖ id u64 LE ‖ address length u16 LE ‖
 /// address ‖ amount u64 LE). The address is the claimant's, as its tx's `from` spells it.
@@ -1325,7 +1349,8 @@ pub fn check_invariants(state: &State) -> Result<()> {
         *s = (s.0 + c.amount, s.1 + 1);
     }
     for (id, d) in g.distributions.iter() {
-        ensure!(*id == d.id && g.proposals.contains_key(id), "distribution #{id} is misfiled");
+        let named = |p: &Proposal| matches!(p.kind, ProposalKind::Distribution { distribution_id, .. } if distribution_id == *id);
+        ensure!(*id == d.id && g.proposals.get(&d.proposal).is_some_and(named), "distribution #{id} is misfiled");
         ensure!(d.claimed <= d.total, "distribution #{id} paid out more than it holds");
         ensure!(claimed.get(id).copied().unwrap_or_default() == (d.claimed, d.claims), "distribution #{id}'s total isn't the sum of its claims");
         ensure!(d.closed_at.is_none() == g.open_distributions.contains(id), "distribution #{id}'s open flag disagrees");

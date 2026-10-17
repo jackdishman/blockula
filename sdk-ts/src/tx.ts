@@ -124,7 +124,7 @@ export type ProposalKind =
   /** Set a governance parameter (a key of node/src/params.rs `ChainParams`, e.g. "max_validators"), within its bounds. */
   | { type: "param_change"; key: string; value: string }
   | { type: "treasury_spend"; to: string; amount: string }
-  /** Open a community distribution of `total` drops, claimable with Merkle proofs until block `claim_until`. `distribution_id` is the id its tree was built for, which must be the proposal's (the node's `next_id`). */
+  /** Open a community distribution of `total` drops, claimable with Merkle proofs until block `claim_until`. `distribution_id` is the id its tree was built for, one no distribution has yet (the node's `next_distribution_id`). */
   | { type: "distribution"; distribution_id: number; merkle_root: string; total: string; claim_until: number }
   | { type: "set_repo"; repo: string; weight: number }
   /** milli-Soul, at most 100 Soul. */
