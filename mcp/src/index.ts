@@ -649,7 +649,7 @@ const proposalView = (p: ProposalSummary) => ({
   untrusted_title: clean(p.title, 120),
   does: clean(describeKind(p.kind, { freeText: false }), 600),
   kind: chainData(p.kind),
-  ...(p.digest ? { proposal_digest: p.digest } : { proposal_digest: null, cannot_vote: clean(`${p.digest_error ?? "unknown content"}: vote with the blockula CLI, which reads it exactly`, 300) }),
+  ...(p.digest ? { proposal_digest: p.digest } : { proposal_digest: null, cannot_vote: clean(`${p.digest_error ?? "unknown content"}: vote with the blockula CLI, which reads it exactly`, 600) }),
   status: clean(p.status, 40),
   proposer: clean(p.proposer_name ?? p.proposer ?? "", 100),
   aye_weight: formatFang(BigInt(p.aye)),
