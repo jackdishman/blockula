@@ -2401,9 +2401,11 @@ impl Chain {
         let genesis_root = genesis_state.root();
         let genesis_hash = hex::encode(crate::consensus::genesis_block(&genesis).digest_bytes());
         let store = Store::open(&home.join(store::DB_FILE))?;
+        let mut upgraded_epochs = false;
         let saved_epochs: Option<crate::epochs::EpochRegistry> = fs::read(home.join("epochs.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).map(|mut e: crate::epochs::EpochRegistry| {
-            // Proofs signed under an older handoff format no longer verify: signed again below.
-            e.upgrade_format();
+            // Proofs signed under an older handoff format no longer verify: dropped, and signed
+            // again where the state still holds both sides of the change (below).
+            upgraded_epochs = e.upgrade_format();
             e
         });
         let ctx = OpenCtx { home, genesis: &genesis, genesis_hash: &genesis_hash, genesis_root: &genesis_root, base: base.as_ref(), saved_epochs: saved_epochs.as_ref(), blocks: &blocks };
@@ -2480,6 +2482,9 @@ impl Chain {
             chain.save_epochs();
         }
         chain.reconcile_epochs()?;
+        if upgraded_epochs {
+            chain.restart_history_after_format_upgrade()?;
+        }
         // A restart replays nothing, so the check `execute` runs after every block runs here too: a
         // binary that can't run the next height opens halted and executes nothing more (3.9).
         let _ = crate::upgrade::after_block(&chain, chain.height);
@@ -2567,6 +2572,23 @@ impl Chain {
         }
         self.save_epochs();
         Ok(())
+    }
+
+    /// After a handoff-format upgrade dropped the old proofs: validators can sign a change again
+    /// only while the state holds the sets on both sides of it (`epoch_sets_kept`), so changes
+    /// before the oldest set it holds would stay unprovable for good, holding `proven_through`
+    /// back and the handoff exchange polling for them. The history starts at that set instead: a
+    /// joiner trusting an older root is told to pass a newer checkpoint (review-fix-sync-4). A
+    /// chain launched at the current format never gets here.
+    fn restart_history_after_format_upgrade(&mut self) -> Result<()> {
+        let Some(oldest) = self.state.active_sets.keys().next().copied() else { return Ok(()) };
+        let base = self.epochs.base;
+        self.epochs.rebase(oldest);
+        if self.epochs.base != base {
+            tracing::warn!(from = base, to = oldest, "handoff proofs of an older format were dropped; the validator-set history now starts at the oldest set the state holds (joiners trusting an older root need a newer --checkpoint)");
+        }
+        // Written now, at the new format, so the next open doesn't take it for an old one.
+        self.try_save_epochs()
     }
 
     /// The validator's own address (fee recipient, faucet account).
@@ -5604,6 +5626,44 @@ mod persistence {
         assert_eq!((c.epochs.known_through, c.epochs.sets.keys().next_back().copied()), (want, executed.sets.keys().next_back().copied()));
         assert_eq!(*c.live.epochs(), c.epochs, "and that's what it serves");
         assert_eq!(c.sign_handoffs(), 0);
+        drop(c);
+        fs::remove_dir_all(h).ok();
+    }
+
+    /// review-fix-sync-4: a home saved by a binary with an older handoff format (here, a change
+    /// at epochs 2 and 3, long out of the state's set window) drops the proofs on open, and the
+    /// history starts at the oldest set the state holds, so no change nobody can sign again
+    /// holds `proven_through` back.
+    #[test]
+    fn a_handoff_format_upgrade_restarts_the_history_at_the_oldest_held_set() {
+        let h = home("hf-upgrade");
+        let params = BTreeMap::from([("evidence_max_age_epochs".to_string(), 1)]);
+        Chain::summon(&h, &SummonOpts { epoch_blocks: 2, params, ..SummonOpts::new("hf-upgrade", 1) }).unwrap();
+        let mut c = Chain::open(&h).unwrap();
+        while c.height() < 40 {
+            c.produce_block_with(vec![]).unwrap();
+        }
+        let oldest = *c.state.active_sets.keys().next().unwrap();
+        assert!(oldest > 4, "the state keeps a window of sets: {oldest}");
+        let mut old = c.epochs.clone();
+        drop(c);
+        let other = vec![hex::encode(commonware_cryptography::Signer::public_key(&crate::pq::PrivateKey::from_seed_bytes([200; 32])).as_ref())];
+        let genesis_set = old.sets[&0].clone();
+        assert!(old.record(2, other) && old.record(3, genesis_set));
+        old.proofs.insert(2, BTreeMap::from([(0, "00".into())]));
+        old.format = crate::epochs::HANDOFF_FORMAT - 1;
+        fs::write(h.join("epochs.json"), serde_json::to_vec(&old).unwrap()).unwrap();
+        let c = Chain::open(&h).unwrap();
+        assert_eq!((c.epochs.format, c.epochs.base), (crate::epochs::HANDOFF_FORMAT, oldest));
+        assert!(c.epochs.proofs.is_empty() && c.epochs.changes().next().is_none());
+        assert_eq!(c.epochs.proven_through(), c.epochs.known_through, "nothing left to ask peers for");
+        assert_eq!(*c.live.epochs(), c.epochs);
+        let saved: crate::epochs::EpochRegistry = serde_json::from_slice(&fs::read(h.join("epochs.json")).unwrap()).unwrap();
+        assert_eq!(saved.base, oldest);
+        drop(c);
+        // Opened again (already at the format), nothing moves.
+        let c = Chain::open(&h).unwrap();
+        assert_eq!(c.epochs.base, oldest);
         drop(c);
         fs::remove_dir_all(h).ok();
     }
