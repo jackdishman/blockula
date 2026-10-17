@@ -36,7 +36,7 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, 
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
-import { KnownChains, completePin, effectivePin, mismatch, mismatchError, resolveNetwork, type Network } from "./network.js";
+import { KNOWN_CLOCKS, KNOWN_GENESIS, KnownChains, completePin, effectivePin, mismatch, mismatchError, resolveNetwork, type Network } from "./network.js";
 import { REPO, RELEASE_KEY_ID, checkBinaryVersion, fetchVerifiedRelease, latestTagFrom, releaseKeyIdFrom } from "./release.js";
 import { SignedTxs } from "./signed.js";
 import { SpendLedger } from "./spend.js";
@@ -107,8 +107,11 @@ async function chain(): Promise<Client> {
   const full = completePin(pin, status);
   KNOWN_CHAINS.save(net, full);
   const pins = { chainId: full.chainId, genesisHash: full.genesisHash, prefix: full.prefix, timeoutMs: TIMEOUT_MS };
-  // Witnesses are held to the same chain; with them, names are proven (Client.resolution).
-  pinned = new Client(net.rpc, { ...pins, witnesses: net.witnesses.map((w) => new Client(w, pins)) });
+  // Witnesses are held to the same chain; with them, names are proven (Client.resolution) and a
+  // height ahead of their heads is refused. A known chain's genesis clock bounds the height too.
+  const known = full.chainId !== undefined && full.genesisHash !== undefined && KNOWN_GENESIS[full.chainId] === full.genesisHash;
+  const genesisClock = known ? KNOWN_CLOCKS[full.chainId!] : undefined;
+  pinned = new Client(net.rpc, { ...pins, genesisClock, witnesses: net.witnesses.map((w) => new Client(w, pins)) });
   return pinned;
 }
 

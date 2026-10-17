@@ -47,6 +47,14 @@ export const MAINNET_RPCS: string[] = [];
  */
 export const KNOWN_GENESIS: Record<string, string> = {};
 
+/**
+ * The genesis clock of chains whose genesis is known (`created_at_ms` and `block_time_ms` of the
+ * genesis.json that hashes to `KNOWN_GENESIS[id]`), added with the hash. With it the client
+ * refuses a node reporting a height the chain can't have reached by this machine's clock, before
+ * anything is signed (audit review-r3-clients-2; `Client.checkSigningHeight`).
+ */
+export const KNOWN_CLOCKS: Record<string, { createdAtMs: number; blockTimeMs: number }> = {};
+
 /** The networks the MCP knows by name. */
 export const KNOWN_NETWORKS: Record<Exclude<NetworkKey, "custom">, Omit<Network, "rpc" | "witnesses"> & { rpc?: string }> = {
   mainnet: { key: "mainnet", label: "Blockula mainnet", rpc: MAINNET_RPCS[0], pin: { chainId: "blockula-1", prefix: "boo" }, mainnet: true, remember: true },

@@ -20,8 +20,11 @@
 //!
 //! Names (audit gap-7-1): where the chain resolves a name itself (transfers, hunt awards, vouches,
 //! Soul grants, flags, clawbacks, name offers, proposal targets) the CLI signs the name
-//! ([`account_ref`]), so a lying node can't redirect it. Where an address is needed (`--from`),
-//! the node resolves it, unproven, and the CLI prints the address it got.
+//! ([`account_ref`]), so a lying node can't point it at another account (it can only hold the tx
+//! until the name changes hands; [`Remote::check_height`] bounds how long). Where an address is
+//! needed (`--from`), the node resolves it off mainnet, unproven, and the CLI prints the address it
+//! got; on mainnet a name there is refused ([`Remote::from_account`]). `validator admit` takes
+//! only an address.
 
 use crate::chain::MAINNET_CHAIN_ID;
 use crate::crypto::Keys;
@@ -309,11 +312,14 @@ impl Remote {
         let (Some(chain_id), Some(genesis_hash)) = (full.chain_id.clone(), full.genesis_hash.clone()) else {
             bail!("{} didn't report its chain id and genesis hash; nothing was signed", net.rpc);
         };
+        // What a tx can carry (and what's printed below, a byte slice): anything else is the
+        // node's invention, refused before it's pinned (review-r3-clients-7's kind of answer).
+        ensure!(genesis_hash.len() == 64 && crate::crypto::is_lower_hex(&genesis_hash), "{} reports a genesis hash that isn't 32 bytes of hex; nothing was signed", net.rpc);
         let prefix = full.prefix.clone().unwrap_or_else(|| crate::crypto::ADDRESS_HRP.to_string());
         ensure!(crate::crypto::is_prefix(&prefix), "{} reports an unknown address prefix {prefix:?}", net.rpc);
         if net.remember && remembered.as_ref() != Some(&full) {
             known.save(&net, &full)?;
-            eprintln!("📌 {} is `{chain_id}` (genesis {}…): pinned in {}", net.rpc, &genesis_hash[..genesis_hash.len().min(16)], known.file.display());
+            eprintln!("📌 {} is `{chain_id}` (genesis {}…): pinned in {}", net.rpc, &genesis_hash[..16], known.file.display());
         }
         Ok(Remote { rpc: net.rpc, chain_id, genesis_hash, prefix })
     }
@@ -425,7 +431,7 @@ pub async fn resolve_unproven(rpc: &str, who: &str) -> Result<String> {
 /// A recipient as signed, for fields the chain resolves itself (transfers, hunt awards, vouches,
 /// Soul grants, flags, clawbacks, name offers, proposal targets): an address as given, or a
 /// `.boo` name signed as the name, which the chain resolves when the tx runs. No node is asked,
-/// so none can redirect it (audit gap-7-1).
+/// so none can point it at another account (audit gap-7-1).
 pub fn account_ref(who: &str) -> Result<String> {
     let w = who.trim();
     if crate::crypto::is_address(w) {
@@ -1084,6 +1090,16 @@ mod tests {
         let err = run_in(ValidatorCmd::Commission { bps: 500, key: key.clone(), rpc: ahead, from: None, pin: ChainPin::default() }, &dir).unwrap_err().to_string();
         assert!(err.contains("can't be past block") && err.contains("Nothing was signed"), "{err}");
         assert!(posted.lock().is_empty(), "nothing signed against the future height");
+        // A genesis hash no tx could carry (multi-byte characters across the bytes the pin's
+        // printout sliced at) is refused, not pinned, and doesn't panic the CLI.
+        let (odd, _) = rt.block_on(liar(honest.clone(), |path, mut v| {
+            if path == "/api/status" {
+                v["genesis_hash"] = "aaaaaaaaaaaaaaa€€€".into();
+            }
+            v
+        }));
+        let err = rt.block_on(Remote::connect_in(&dir, &odd, &ChainPin::default())).unwrap_err().to_string();
+        assert!(err.contains("isn't 32 bytes of hex"), "{err}");
         // The honest node: signed (an address in --from is taken as given).
         run_in(ValidatorCmd::Commission { bps: 1, key: key.clone(), rpc: honest.clone(), from: Some(me.clone()), pin: ChainPin::default() }, &dir).unwrap();
         assert_eq!(chain.lock().state.validators[&me].commission_bps, 1);
