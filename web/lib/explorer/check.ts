@@ -68,7 +68,7 @@ export async function checkTx(tx: Tx, signer: string): Promise<{ pf: Preflight; 
       lockReason: lock ? `${lock.reason}${lock.vesting ? "" : ` until block #${lock.until.toLocaleString("en-US")}`}` : undefined,
       keys: mine.keys,
       recent: mine.recent_txs,
-      familiars: mine.familiars.map((f) => f.key_id),
+      familiars: (mine.familiars ?? []).map((f) => f.key_id),
       multisig: multisig ? { threshold: multisig.threshold, owners: multisig.owners.length } : null,
     },
     signer,
