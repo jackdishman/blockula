@@ -515,14 +515,53 @@ fn label(v: &ReadView, addr: &str) -> Value {
 }
 
 fn tx_json(v: &ReadView, tx: &Tx, height: Option<u64>) -> Value {
-    tx_json_with(v, tx, height, None)
+    tx_json_with(v, tx, height.map(|height| Ran { height, idx: None, meta: None }), None)
 }
 
-fn tx_json_with(v: &ReadView, tx: &Tx, height: Option<u64>, error: Option<&str>) -> Value {
+/// Where a sealed tx ran: its block's height and, when the caller has them, its index in the
+/// block and the block's index row (for who its action named, see `named_at_execution`).
+#[derive(Clone, Copy)]
+struct Ran<'a> {
+    height: u64,
+    idx: Option<usize>,
+    meta: Option<&'a BlockMeta>,
+}
+
+/// The account a sealed tx's action named, as the chain resolved it when its block ran: the tx's
+/// index rows (`BlockMeta::history`, written as the block was executed) hold the accounts it
+/// joined, the sender and the one it named. A name signed as a name (audit gap-7-1) pays whoever
+/// owned it then, so resolving it against today's state would credit a later owner, or nobody
+/// once it lapsed (audit main13-protocol-3). `None` when the rows don't single one out (it named
+/// its own sender, or the name didn't resolve).
+fn named_at_execution(meta: &BlockMeta, idx: usize, sender: &str) -> Option<String> {
+    let mut rows = meta.history.iter().filter(|(i, a)| *i as usize == idx && a != sender).map(|(_, a)| a);
+    match (rows.next(), rows.next()) {
+        (Some(a), None) => Some(a.clone()),
+        _ => None,
+    }
+}
+
+fn tx_json_with(v: &ReadView, tx: &Tx, ran: Option<Ran>, error: Option<&str>) -> Value {
     let st = &v.state;
+    let height = ran.map(|r| r.height);
     let sender = tx.sender().unwrap_or_default();
+    // An address names itself. A name is resolved as it was when the block ran, when this node's
+    // index has the block's rows; else (pending, or no rows) as it resolves now.
+    let named = |named: &String| -> Option<String> {
+        if crypto::is_address(named) {
+            return Some(named.clone());
+        }
+        ran.and_then(|r| named_at_execution(r.meta?, r.idx?, &sender)).or_else(|| st.resolve(named).ok())
+    };
+    // The name the action was signed with, for the kinds whose `to` it names.
+    let signed_name = |n: &String| (!crypto::is_address(n)).then(|| format!("{}{NAME_SUFFIX}", normalize_name(n).unwrap_or_else(|_| n.clone())));
+    let to_name = match &tx.action {
+        Action::Transfer { to, .. } | Action::AwardHunt { to, .. } | Action::GrantSoul { to, .. } | Action::TransferName { to, .. } | Action::Unshield { to, .. } => signed_name(to),
+        Action::Vouch { account } | Action::Unvouch { account } | Action::FlagSybil { account, .. } | Action::Clawback { account, .. } => signed_name(account),
+        _ => None,
+    };
     let (kind, to, amount) = match &tx.action {
-        Action::Transfer { to, amount } => ("transfer", st.resolve(to).ok(), Some(*amount)),
+        Action::Transfer { to, amount } => ("transfer", named(to), Some(*amount)),
         Action::RegisterName { .. } => ("register_name", None, None),
         Action::AddKey { .. } => ("add_key", None, None),
         Action::RemoveKey { .. } => ("remove_key", None, None),
@@ -534,14 +573,14 @@ fn tx_json_with(v: &ReadView, tx: &Tx, height: Option<u64>, error: Option<&str>)
         Action::UnlinkGithub { .. } => ("unlink_github", None, None),
         Action::CreateHunt { amount, .. } => ("create_hunt", None, Some(*amount)),
         Action::FundHunt { amount, .. } => ("fund_hunt", None, Some(*amount)),
-        Action::AwardHunt { to, .. } => ("award_hunt", st.resolve(to).ok(), None),
+        Action::AwardHunt { to, .. } => ("award_hunt", named(to), None),
         Action::CancelHunt { .. } => ("cancel_hunt", None, None),
         Action::RegisterFamiliar { .. } => ("register_familiar", None, None),
         Action::SetRepo { .. } => ("set_repo", None, None),
-        Action::GrantSoul { to, .. } => ("grant_soul", st.resolve(to).ok(), None),
-        Action::Vouch { account } => ("vouch", st.resolve(account).ok(), Some(crate::poc::VOUCH_BOND)),
-        Action::Unvouch { account } => ("unvouch", st.resolve(account).ok(), None),
-        Action::FlagSybil { account, .. } => ("flag_sybil", st.resolve(account).ok(), None),
+        Action::GrantSoul { to, .. } => ("grant_soul", named(to), None),
+        Action::Vouch { account } => ("vouch", named(account), Some(crate::poc::VOUCH_BOND)),
+        Action::Unvouch { account } => ("unvouch", named(account), None),
+        Action::FlagSybil { account, .. } => ("flag_sybil", named(account), None),
         Action::SubmitClaim { .. } => ("submit_claim", None, None),
         Action::AttestClaim { .. } => ("attest_claim", None, None),
         Action::RejectClaim { .. } => ("reject_claim", None, None),
@@ -551,14 +590,14 @@ fn tx_json_with(v: &ReadView, tx: &Tx, height: Option<u64>, error: Option<&str>)
         Action::RevealVotes { .. } => ("reveal_votes", None, None),
         Action::FundPool { amount } => ("fund_pool", Some(st.pool()), Some(*amount)),
         Action::WithdrawVested {} => ("withdraw_vested", None, None),
-        Action::Clawback { account, .. } => ("clawback", st.resolve(account).ok(), None),
+        Action::Clawback { account, .. } => ("clawback", named(account), None),
         Action::Delegate { validator, amount } => ("delegate", Some(validator.clone()), Some(*amount)),
         Action::Propose { deposit, .. } => ("propose", None, Some(*deposit)),
         Action::Vote { amount, .. } => ("vote", None, Some(*amount)),
-        Action::TransferName { to, .. } => ("transfer_name", st.resolve(to).ok(), None),
+        Action::TransferName { to, .. } => ("transfer_name", named(to), None),
         Action::ClaimDistribution { amount, .. } => ("claim_distribution", None, Some(*amount)),
         Action::Shield { amount, .. } => ("shield", None, Some(*amount)),
-        Action::Unshield { to, amount, .. } => ("unshield", st.resolve(to).ok(), Some(*amount)),
+        Action::Unshield { to, amount, .. } => ("unshield", named(to), Some(*amount)),
         a => (a.kind(), None, None),
     };
     // An unsigned ghost tx pays exactly its fee (it's in its proof's value balance).
@@ -572,7 +611,9 @@ fn tx_json_with(v: &ReadView, tx: &Tx, height: Option<u64>, error: Option<&str>)
         "height": height,
         // Unsigned ghost txs have no sender to show.
         "from": (!tx.is_unsigned()).then(|| label(v, &sender)),
+        // Who the action named: for a sealed tx, the account the chain resolved when it ran.
         "to": to.map(|t| label(v, &t)),
+        "to_name": to_name,
         "amount": amount.map(|a| a.to_string()),
         "amount_display": amount.map(fmt_fang),
         // What the tx is charged (base fee burned + tip); `max_fee` is what it allowed.
@@ -623,6 +664,7 @@ fn header_json(v: &ReadView, height: u64, m: &BlockMeta) -> Value {
 }
 
 fn block_json(v: &ReadView, b: &Block) -> Value {
+    let meta = v.block_meta(b.height);
     json!({
         "height": b.height,
         "hash": b.hash,
@@ -638,7 +680,7 @@ fn block_json(v: &ReadView, b: &Block) -> Value {
         // The base fee its txs paid (flat drops + `rate` milli-drops per byte, econ.rs).
         "base_fee": b.base_fee.map(|s| json!({ "flat": s.flat.to_string(), "rate": s.rate.to_string(), "max_block_bytes": s.max_block_bytes })),
         "summary": block_summary(b.height, b.txs.len()),
-        "txs": b.txs.iter().enumerate().map(|(i, t)| tx_json_with(v, t, Some(b.height), b.failed.get(&i).map(|s| s.as_str()))).collect::<Vec<_>>(),
+        "txs": b.txs.iter().enumerate().map(|(i, t)| tx_json_with(v, t, Some(Ran { height: b.height, idx: Some(i), meta: meta.as_ref() }), b.failed.get(&i).map(|s| s.as_str()))).collect::<Vec<_>>(),
         "signature_bytes": v.cert_len(b.height),
         "failed_count": b.failed.len(),
     })
@@ -754,7 +796,8 @@ async fn tx(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
     let v = n.live.view();
     if let Some((h, i)) = v.tx_location(&id) {
         if let Some((t, err)) = v.finalized_tx(h, i) {
-            return Ok(Json(tx_json_with(&v, &t, Some(h), err.as_deref())));
+            let meta = v.block_meta(h);
+            return Ok(Json(tx_json_with(&v, &t, Some(Ran { height: h, idx: Some(i), meta: meta.as_ref() }), err.as_deref())));
         }
     }
     let mp = n.live.mempool();
@@ -1100,14 +1143,45 @@ async fn account(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
     let mp = n.live.mempool();
     // The mempool is capped (`MAX_MEMPOOL`), so this scan is bounded.
     let mut recent: Vec<Value> = mp.newest().filter(|t| t.from == addr || matches!(&t.action, Action::Transfer { to, .. } if st.resolve(to).ok().as_deref() == Some(addr.as_str()))).map(|t| tx_json(&v, t, None)).collect();
-    recent.extend(v.history(&addr, 25).into_iter().filter_map(|(h, i)| v.finalized_tx(h, i).map(|(t, e)| tx_json_with(&v, &t, Some(h), e.as_deref()))));
+    // Each block's index row once, for who its txs paid when they ran.
+    let history = v.history(&addr, 25);
+    let mut metas: BTreeMap<u64, Option<BlockMeta>> = BTreeMap::new();
+    for &(h, _) in &history {
+        metas.entry(h).or_insert_with(|| v.block_meta(h));
+    }
+    recent.extend(history.into_iter().filter_map(|(h, i)| v.finalized_tx(h, i).map(|(t, e)| tx_json_with(&v, &t, Some(Ran { height: h, idx: Some(i), meta: metas.get(&h).and_then(Option::as_ref) }), e.as_deref()))));
     let hunts_created: Vec<u64> = v.ids(ix::HUNT_CREATOR, &addr, false, ACCOUNT_LIST_LIMIT);
     let hunts_won: Vec<Value> = v.ids(ix::HUNT_WINNER, &addr, false, ACCOUNT_LIST_LIMIT).into_iter().filter_map(|id| st.hunts.get(&id)).map(|h| json!({ "id": h.id, "repo": h.repo, "issue": h.issue, "amount_display": fmt_fang(h.amount), "pr": h.pr, "self_awarded": h.self_awarded() })).collect();
     let keys = st.keys_of(&addr);
+    // What it can move out now (econ::free: vesting and vote locks hold the rest, net of stake),
+    // and the locks still holding something, as the next block runs them.
+    let now = crate::econ::now(st);
+    let (transferable, locked) = (crate::econ::transferable(st, &addr, now), acct.locked_at(now));
+    let locks: Vec<Value> = acct
+        .locks
+        .iter()
+        .filter(|l| l.amount.locked_at(now) > 0)
+        .map(|l| {
+            let until = match l.amount {
+                crate::chain::LockAmount::Vesting { end, .. } => end,
+                crate::chain::LockAmount::Until { until, .. } => until,
+            };
+            json!({ "id": l.id, "reason": l.reason, "amount": l.amount.locked_at(now).to_string(), "amount_display": fmt_fang(l.amount.locked_at(now)), "until": until, "vesting": matches!(l.amount, crate::chain::LockAmount::Vesting { .. }) })
+        })
+        .collect();
     Ok(Json(json!({
         "account": label(&v, &addr),
         "balance": acct.balance.to_string(),
         "balance_display": fmt_fang(acct.balance),
+        "transferable": transferable.to_string(),
+        "transferable_display": fmt_fang(transferable),
+        "locked": locked.to_string(),
+        "locked_display": fmt_fang(locked),
+        "locks": locks,
+        // Whether the chain has an account here yet, and what a payment that opens it burns from
+        // its sender (`account_creation_fee`; 0 for an existing or keyless system account).
+        "exists": st.accounts.contains_key(&addr),
+        "creation_fee": st.creation_fee_for(&addr).to_string(),
         "nonce": acct.nonce,
         "next_nonce": acct.nonce + mp.pending_count(&addr) as u64,
         "names": names,
@@ -3044,6 +3118,54 @@ mod http_tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// Audit main13-protocol-3: a payment signed to a name (gap-7-1) is reported as paid to whoever
+    /// owned the name when it ran, with the name it was signed to, even after the name changed hands.
+    #[tokio::test]
+    async fn a_payment_to_a_name_reports_who_it_paid() {
+        let (root, n) = node("paidname");
+        let (alice, bob, payer) = (crate::crypto::Keys::from_seed([21; 32]), crate::crypto::Keys::from_seed([22; 32]), crate::crypto::Keys::from_seed([23; 32]));
+        let (cid, gh) = { let c = n.chain.lock(); (c.genesis.chain_id.clone(), c.genesis_hash.clone()) };
+        let mk = |c: &Chain, from: &crate::crypto::Keys, action: Action| {
+            let mut tx = Tx { chain_id: cid.clone(), genesis_hash: gh.clone(), from: from.address(), nonce: c.next_nonce(&from.address()), fee: 0, tip: 0, valid_until: c.height() + 100, action, memo: String::new(), public_key: hex::encode(from.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+            tx.fee = min_fee(tx.size());
+            tx.sign(from)
+        };
+        let step = |who: &crate::crypto::Keys, action: Action| {
+            let mut c = n.chain.lock();
+            let tx = mk(&c, who, action);
+            c.submit(tx.clone()).unwrap();
+            c.produce_block().unwrap();
+            tx
+        };
+        {
+            let mut c = n.chain.lock();
+            for k in [&alice, &bob, &payer] {
+                c.faucet(&k.address(), 100 * DROPS_PER_FANG).unwrap();
+            }
+            c.produce_block().unwrap();
+        }
+        step(&alice, Action::RegisterName { name: "crypt".into() });
+        let pay = step(&payer, Action::Transfer { to: "crypt.boo".into(), amount: 5 * DROPS_PER_FANG });
+        // alice offers the name to bob, and bob accepts it.
+        step(&alice, Action::TransferName { name: "crypt".into(), to: bob.address() });
+        step(&bob, Action::TransferName { name: "crypt".into(), to: bob.address() });
+        assert_eq!(n.chain.lock().state.resolve("crypt.boo").unwrap(), bob.address());
+        let (s, v, _) = call(&n, "GET", &format!("/api/tx/{}", pay.id()), None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!((v["to"]["address"].as_str(), v["to_name"].as_str()), (Some(alice.address().as_str()), Some("crypt.boo")), "paid to the owner when it ran: {v}");
+        let (_, a, _) = call(&n, "GET", &format!("/api/account/{}", alice.address()), None, "127.0.0.1:1").await;
+        let row = a["recent_txs"].as_array().unwrap().iter().find(|t| t["id"] == json!(pay.id())).cloned().expect("in alice's history");
+        assert_eq!(row["to"]["address"].as_str(), Some(alice.address().as_str()), "{row}");
+        let h = v["height"].as_u64().unwrap();
+        let (_, b, _) = call(&n, "GET", &format!("/api/block/{h}"), None, "127.0.0.1:1").await;
+        assert_eq!(b["txs"][0]["to"]["address"].as_str(), Some(alice.address().as_str()), "{b}");
+        // An address-signed payment names no name.
+        let direct = step(&payer, Action::Transfer { to: bob.address(), amount: DROPS_PER_FANG });
+        let (_, d, _) = call(&n, "GET", &format!("/api/tx/{}", direct.id()), None, "127.0.0.1:1").await;
+        assert_eq!((d["to"]["address"].as_str(), d["to_name"].is_null()), (Some(bob.address().as_str()), true), "{d}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
     #[tokio::test]
     async fn failed_txs_report_status_instead_of_404() {
         let (root, n) = node("txfail");
@@ -3191,6 +3313,23 @@ mod http_tests {
         assert_eq!((m["threshold"].as_u64(), m["owners"].as_array().map(Vec::len), m["pending"][0]["valid_approvals"].as_u64()), (Some(2), Some(2), Some(1)));
         assert!(m["pending"][0]["summary"].as_str().unwrap().contains("sent 1 FANG to"), "{m}");
         assert_eq!(get(format!("/api/multisig/{me}")).await.0, StatusCode::NOT_FOUND);
+        // What an account can move: the vote's conviction lock holds its amount, net of stake
+        // (econ::free), and `locks` says why; a wallet's preflight checks payments against it.
+        let (_, a, _) = get(format!("/api/account/{me}")).await;
+        let c = n.chain.lock();
+        let at = crate::econ::now(&c.state);
+        assert_eq!(a["locked"].as_str(), Some((100_000_000 * FANG).to_string().as_str()), "{a}");
+        assert_eq!(a["transferable"].as_str(), Some(crate::econ::transferable(&c.state, &me, at).to_string().as_str()), "{a}");
+        assert!(a["transferable"].as_str().unwrap().parse::<u64>().unwrap() <= a["balance"].as_str().unwrap().parse::<u64>().unwrap(), "{a}");
+        assert_eq!((a["locks"][0]["id"].as_str(), a["locks"][0]["vesting"].as_bool()), (Some("vote:0"), Some(false)), "{a}");
+        assert_eq!((a["exists"].as_bool(), a["creation_fee"].as_str()), (Some(true), Some("0")), "{a}");
+        drop(c);
+        // An address with no account yet: paying it burns the creation fee from the payer.
+        let fresh = crate::crypto::Keys::from_seed([77; 32]).address();
+        let (_, f, _) = get(format!("/api/account/{fresh}")).await;
+        let fee = n.chain.lock().state.chain_params.account_creation_fee;
+        assert!(fee > 0);
+        assert_eq!((f["exists"].as_bool(), f["creation_fee"].as_str(), f["locked"].as_str(), f["transferable"].as_str()), (Some(false), Some(fee.to_string().as_str()), Some("0"), Some("0")), "{f}");
         std::fs::remove_dir_all(root).ok();
     }
 }
