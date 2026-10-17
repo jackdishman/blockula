@@ -64,6 +64,9 @@ jobs:
       # can't vouch for itself (audit F49).
       - name: Release runbooks as pasted (real blockula release install|sign|verify)
         run: bash scripts/test-release-runbook.sh
+      # The step after a chain launches (scripts/pin-network.sh), on a copy of the files it edits.
+      - name: pin-network.sh (a launched chain pinned in the node, MCP, wallet and genesis/)
+        run: bash scripts/test-pin-network.sh
 
   web:
     # Also the SDK vectors and the MCP's tests; the name stays what the ruleset requires.
@@ -175,6 +178,10 @@ jobs:
       # are the reviewed commit's own (audit F49 round 3).
       - name: Release files against the tagged source (scripts/check-release-files.sh)
         run: bash scripts/test-release-files.sh
+      # The public testnet's entrypoint (key seeding, checkpoint join, flags) and the Fly machine
+      # configurations deploy/launch.sh deploys, offline, under dash as in the image.
+      - name: Testnet deploy scripts (deploy/entrypoint.sh, deploy/fly-config.sh)
+        run: ENTRY_SH=dash bash deploy/test-deploy.sh
       # The fuzz job runs in public: crashes stay out of its log and artifacts (supply-chain-B-1).
       - name: Fuzz crashes stay private (workflow, open findings)
         run: bash scripts/check-fuzz-workflow.sh
