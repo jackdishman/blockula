@@ -851,8 +851,8 @@ fn mempool_bounds_ghost_txs() {
     let mut queued: Vec<Tx> = (0..MAX_MEMPOOL_GHOST as u32).map(|i| mk(i, 0)).collect();
     queued[3] = mk(3, 5 * FEE_GRID);
     let ids: Vec<String> = queued.iter().map(Tx::id).collect();
-    let admit = |tx: &Tx, evict: bool| mempool_admit(&queued, &ids, tx, relay, evict);
-    assert!(mempool_admit(&queued[..10], &ids[..10], &mk(999, 0), relay, true).unwrap().is_empty(), "room, no conflict");
+    let admit = |tx: &Tx, evict: bool| mempool_admit(&queued, &ids, tx, relay, u64::MAX, evict);
+    assert!(mempool_admit(&queued[..10], &ids[..10], &mk(999, 0), relay, u64::MAX, true).unwrap().is_empty(), "room, no conflict");
     // Full: a tip that doesn't clear the cheapest queued tx's plus the relay is refused…
     for tip in [0, FEE_GRID] {
         let e = admit(&mk(999, tip), true).unwrap_err().to_string();

@@ -1868,8 +1868,12 @@ pub struct Chain {
     /// Each sender's queued txs: their indexes in `mempool`, in nonce order.
     pending: HashMap<String, Vec<usize>>,
     /// The validator-duty lane (`staking::duty_of`): queued ids → (validator, kind of duty).
-    /// Outside `MAX_MEMPOOL`, never evicted for a tip, first in proposals (audit F32/F56).
+    /// Outside `MAX_MEMPOOL`, never evicted for a tip, first in proposals (audit F32/F56). A
+    /// prefix of each sender's queue ([`Chain::rebuild_lane`]).
     lane: HashMap<String, (String, &'static str)>,
+    /// Every queued validator duty, in the lane or waiting for a slot in it: queued ids →
+    /// (validator, kind of duty), as `staking::duty_of` said when it was admitted.
+    duties: HashMap<String, (String, &'static str)>,
     /// Admission's simulated state per recently active sender (see [`Chain::submit_tx`]).
     sims: Sims,
     /// Mirror of the mempool and of recent failures, published for readers.
@@ -2447,6 +2451,7 @@ impl Chain {
             disk,
             mempool: vec![],
             lane: HashMap::new(),
+            duties: HashMap::new(),
             mempool_ids: vec![],
             pool: Default::default(),
             pending: HashMap::new(),
@@ -3117,14 +3122,59 @@ impl Chain {
     }
 
     fn rebuild_pending(&mut self) {
-        // Every removal from the mempool ends here: the lane forgets what left.
-        let pool = &self.pool;
-        self.lane.retain(|id, _| pool.contains(id));
         self.pending.clear();
         // Unsigned ghost txs have no sender (or nonce) to queue under.
         for (i, tx) in self.mempool.iter().enumerate().filter(|(_, t)| !t.is_unsigned()) {
             self.pending.entry(tx.from.clone()).or_default().push(i);
         }
+        self.rebuild_lane();
+    }
+
+    /// Every removal from the mempool ends here (through [`Chain::rebuild_pending`]): the lane
+    /// forgets what left, and duties that waited for a slot move up into it. The lane is a prefix
+    /// of each sender's queue (review of F32): a duty queued behind any other tx of its sender
+    /// isn't in it, so a duty can't shield the txs ahead of it from eviction (only a sender's
+    /// last queued tx can go, and the lane's never do), nor wait behind them in proposals (which
+    /// rank each sender's queue by its next tx). Lane txs stay in it: removals take a sender's
+    /// head (included), its tail (evicted) or everything from a nonce on (dropped), so what's
+    /// left of a prefix is still one. Then, in arrival order, each sender's next txs join while
+    /// they're duties whose validator has a slot free for their kind: a duty that arrived
+    /// behind the sender's other txs, or past its validator's slots, moves up once those are
+    /// included (a block later, under any load), instead of waiting behind the whole backlog.
+    fn rebuild_lane(&mut self) {
+        let pool = &self.pool;
+        self.duties.retain(|id, _| pool.contains(id));
+        self.lane.retain(|id, _| pool.contains(id));
+        let mut used: HashMap<(String, &'static str), usize> = HashMap::new();
+        let mut out = vec![];
+        for q in self.pending.values() {
+            let prefix = q.iter().take_while(|&&i| self.lane.contains_key(&self.mempool_ids[i])).count();
+            for &i in &q[..prefix] {
+                *used.entry(self.lane[&self.mempool_ids[i]].clone()).or_default() += 1;
+            }
+            // Never expected (see above), but a lane tx behind a tx outside it would shield it.
+            out.extend(q[prefix..].iter().map(|&i| self.mempool_ids[i].clone()).filter(|id| self.lane.contains_key(id)));
+        }
+        for id in out {
+            self.lane.remove(&id);
+        }
+        let mut closed: std::collections::HashSet<&str> = Default::default();
+        let mut joined = vec![];
+        for (t, id) in self.mempool.iter().zip(&self.mempool_ids).filter(|(t, _)| !t.is_unsigned()) {
+            if closed.contains(t.from.as_str()) || self.lane.contains_key(id) {
+                continue;
+            }
+            match self.duties.get(id) {
+                Some(d) if used.get(d).copied().unwrap_or(0) < DUTY_LANE_PER_KIND => {
+                    *used.entry(d.clone()).or_default() += 1;
+                    joined.push((id.clone(), d.clone()));
+                }
+                _ => {
+                    closed.insert(t.from.as_str());
+                }
+            }
+        }
+        self.lane.extend(joined);
     }
 
     /// Removes the txs the head block included from the mempool (cheap: ids are kept). A new
@@ -3240,11 +3290,25 @@ impl Chain {
         self.mempool.len().saturating_sub(self.lane.len())
     }
 
-    /// The lane slot a validator duty would take (`staking::duty_of`), if its validator has one
-    /// free for this kind of duty ([`DUTY_LANE_PER_KIND`]).
+    /// The validator duty `tx` is (`staking::duty_of`), if any.
+    fn duty_of(&self, tx: &Tx) -> Option<(String, &'static str)> {
+        if tx.is_unsigned() {
+            return None;
+        }
+        crate::staking::duty_of(&self.state, tx, self.state.params.epoch_of(self.height() + 1))
+    }
+
+    /// Whether the duty `d`, queued next by `sender`, takes a lane slot: every tx the sender has
+    /// queued is in the lane (it's a prefix of each queue: [`Chain::rebuild_lane`]), and `d`'s
+    /// validator has a slot free for its kind ([`DUTY_LANE_PER_KIND`]).
+    fn lane_takes(&self, sender: &str, d: &(String, &'static str)) -> bool {
+        let open = self.pending.get(sender).is_none_or(|q| q.iter().all(|&i| self.lane.contains_key(&self.mempool_ids[i])));
+        open && self.lane.values().filter(|x| *x == d).count() < DUTY_LANE_PER_KIND
+    }
+
+    /// The lane slot `tx` would take if queued now: [`Chain::duty_of`] and [`Chain::lane_takes`].
     fn duty_slot(&self, tx: &Tx) -> Option<(String, &'static str)> {
-        let duty = crate::staking::duty_of(&self.state, tx, self.state.params.epoch_of(self.height() + 1))?;
-        (self.lane.values().filter(|d| **d == duty).count() < DUTY_LANE_PER_KIND).then_some(duty)
+        self.duty_of(tx).filter(|d| self.lane_takes(&tx.from, d))
     }
 
     /// The mempool in the order a proposal takes it ([`proposal_order`]): the validator-duty
@@ -3263,7 +3327,7 @@ impl Chain {
         // Ghost Mode: a bounded share of the mempool, and one queued spend per note (a high enough
         // tip displaces one). Unsigned ghost txs have no sender: no queue, nonce or simulation.
         let relay = crate::econ::base_fee(&self.state, self.height() + 1, tx.size());
-        let replaces = crate::ghost::mempool_admit(&self.mempool, &self.mempool_ids, &tx, relay, evict)?;
+        let replaces = crate::ghost::mempool_admit(&self.mempool, &self.mempool_ids, &tx, relay, crate::econ::max_tip(&self.state, relay), evict)?;
         if let Action::RegisterName { name } = &tx.action {
             self.first_to_ask(&tx, name)?;
         }
@@ -3280,18 +3344,15 @@ impl Chain {
         let next = self.height() + 1;
         let sim = self.dry_run(&tx, &sender, count)?;
         if !replaces.is_empty() {
-            self.remove_from_mempool(|i| replaces.iter().any(|(r, _)| r == i));
-            for (r, why) in replaces {
-                self.pool.remove(&r);
-                self.mp.remove(&r);
-                self.note_failed(r, why.into(), next);
-            }
-            self.rebuild_pending();
+            self.displace(replaces, next);
         }
         // A validator duty (beacon, evidence, attestations) carries no tip, so it would never win a
-        // slot in a full mempool: it takes one in the lane instead (audit F32/F56).
-        let duty = if unsigned { None } else { self.duty_slot(&tx) };
-        if duty.is_none() && self.regular_len() >= MAX_MEMPOOL {
+        // slot in a full mempool: it takes one in the lane instead (audit F32/F56), if it's next in
+        // line there (`lane_takes`). One that isn't queues like any tx (and joins the lane once
+        // what's ahead of it is gone: `rebuild_lane`).
+        let duty = self.duty_of(&tx);
+        let lane = duty.clone().filter(|d| self.lane_takes(&sender, d));
+        if lane.is_none() && self.regular_len() >= MAX_MEMPOOL {
             let victim = if evict { self.eviction_victim(&tx, &sender) } else { Err(anyhow!("mempool is full")) };
             match victim {
                 Ok(idx) => self.evict(idx, next),
@@ -3315,6 +3376,9 @@ impl Chain {
             self.pending.entry(sender).or_default().push(self.mempool.len());
         }
         if let Some(d) = duty {
+            self.duties.insert(id.clone(), d);
+        }
+        if let Some(d) = lane {
             self.lane.insert(id.clone(), d);
         }
         self.pool.insert(id.clone());
@@ -3423,10 +3487,46 @@ impl Chain {
             Some(i) => {
                 let low = TipRate::of(&self.mempool[i]);
                 let need = (low.tip as u128 * tx.size() as u128 / low.size.max(1) as u128 + 1).min(u64::MAX as u128);
+                // Never ask for a tip past this tx's cap (review of fix-fees): a mempool full of
+                // smaller txs tipping near theirs can't be outbid until blocks drain it or the
+                // base fee (and with it every cap) rises.
+                let cap = crate::econ::max_tip(&self.state, crate::econ::base_fee(&self.state, self.height() + 1, tx.size()));
+                if need > cap as u128 {
+                    bail!("mempool is full, and its cheapest transactions tip more per byte than this one may (at most {cap} drops, {}× its base fee); try again shortly", self.state.chain_params.tip_cap_multiple);
+                }
                 bail!("mempool is full; resubmit with a tip of at least {need} drops (and the fee to cover it), or try again shortly")
             }
             None => bail!("mempool is full; try again shortly"),
         }
+    }
+
+    /// Removes what a ghost tx displaces (`ghost::mempool_admit`). A signed one (a `Shield`) is
+    /// its sender's last queued tx when a full share gives it up, but a same-note replacement can
+    /// take one from anywhere in its sender's queue: either way the sender's later txs go with it
+    /// (they'd wait behind a nonce gap), and its simulation, which applied it, is forgotten
+    /// (review of F36).
+    fn displace(&mut self, victims: Vec<(String, &'static str)>, next: u64) {
+        let mut gone: HashMap<String, String> = victims.into_iter().map(|(id, why)| (id, why.to_string())).collect();
+        let mut first: HashMap<String, u64> = HashMap::new();
+        for (t, _) in self.mempool.iter().zip(&self.mempool_ids).filter(|(t, id)| !t.is_unsigned() && gone.contains_key(*id)) {
+            let n = first.entry(t.from.clone()).or_insert(t.nonce);
+            *n = (*n).min(t.nonce);
+        }
+        for (t, id) in self.mempool.iter().zip(&self.mempool_ids) {
+            if !t.is_unsigned() && first.get(&t.from).is_some_and(|n| t.nonce > *n) && !gone.contains_key(id) {
+                gone.insert(id.clone(), "dropped from the mempool: an earlier transaction from the same account was displaced".into());
+            }
+        }
+        self.remove_from_mempool(|id| gone.contains_key(id));
+        for (id, why) in gone {
+            self.pool.remove(&id);
+            self.mp.remove(&id);
+            self.note_failed(id, why, next);
+        }
+        for sender in first.keys() {
+            self.sims.forget(sender);
+        }
+        self.rebuild_pending();
     }
 
     fn evict(&mut self, idx: usize, next: u64) {
