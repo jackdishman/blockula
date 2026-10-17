@@ -7,7 +7,7 @@ use crate::cli_net::{ChainPin, Remote};
 use crate::crypto::Keys;
 use crate::types::*;
 use crate::validator_cli::{get, load_seed, own_address, parse_fang, rt, wallet_keys};
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use clap::{Args, Subcommand};
 use serde_json::Value;
 use std::io::{BufRead, IsTerminal, Write};
@@ -267,7 +267,11 @@ fn award(dir: &Path, id: u64, pr: u64, to: Option<String>, familiar: Option<Stri
             if link["verified"] != true {
                 bail!("@{}'s link isn't verified: {}. Pass --to to award anyway.", p.author, link["reason"].as_str().unwrap_or("unknown"));
             }
-            link["account"]["address"].as_str().map(String::from).ok_or_else(|| anyhow!("bad /api/github response"))?
+            let addr = link["account"]["address"].as_str().map(String::from).ok_or_else(|| anyhow!("bad /api/github response"))?;
+            ensure!(crate::crypto::is_address(&addr), "{rpc} linked @{} to {addr:?}, which isn't an address", p.author);
+            // The link is the node's word (audit gap-7-1): the address is printed and confirmed.
+            eprintln!("   @{} → {addr} (the account {rpc} says their GitHub link names, unproven: check the address, or pass --to)", p.author);
+            addr
         }
         (None, None) => unreachable!(),
     };
@@ -280,7 +284,7 @@ fn award(dir: &Path, id: u64, pr: u64, to: Option<String>, familiar: Option<Stri
             hit["key_id"].as_str().map(String::from)
         }
     };
-    confirm(&format!("Award {} (hunt #{id}, {repo}#{issue}) to {} for PR #{pr}{why}?", h["amount_display"].as_str().unwrap_or_default(), name_of(&acct["account"])), yes)?;
+    confirm(&format!("Award {} (hunt #{id}, {repo}#{issue}) to {} ({recipient}) for PR #{pr}{why}?", h["amount_display"].as_str().unwrap_or_default(), name_of(&acct["account"])), yes)?;
     submit(dir, signer, Action::AwardHunt { hunt_id: id, to: recipient, pr, familiar_key })?;
     Ok(())
 }

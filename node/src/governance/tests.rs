@@ -1339,9 +1339,6 @@ fn tips_come_from_transferable_fang_and_are_capped() {
     t.tip_as(&keys(BOB), &addr(BOB), noop(), 2 * base, &thief).unwrap();
 }
 
-/// F01 (b): one owner key of an M-of-N multisig used to empty the account through the tip of a
-/// `MultisigPropose`, the proposal itself never reaching its threshold. A multisig's owner keys
-/// act alone in such txs, so they carry no tip; session keys still tip within their limit.
 /// Audit gap-7-6: an approval binds the stored action and a vote the proposal's content, so a node
 /// that shows a co-signer a routine payment (or a voter another proposal's text) makes the signed
 /// approval or vote fail instead of executing a drain or locking FANG on the wrong proposal.
@@ -1377,6 +1374,9 @@ fn approvals_and_votes_bind_what_their_signer_was_shown() {
     t.vote(CAROL, real, true, 10, 1).unwrap();
 }
 
+/// F01 (b): one owner key of an M-of-N multisig used to empty the account through the tip of a
+/// `MultisigPropose`, the proposal itself never reaching its threshold. A multisig's owner keys
+/// act alone in such txs, so they carry no tip; session keys still tip within their limit.
 #[test]
 fn a_multisig_owner_key_cant_tip() {
     let mut t = T::new(&[]);
