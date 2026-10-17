@@ -623,7 +623,7 @@ async fn maybe_fast_sync(chain: &Shared, peers: &[String], full: bool, trust: &T
                 // state could hide such a change, so this only catches the honest case.
                 let mut live = trust.clone();
                 let shorter = live.follow(&chain.lock().state.chain_params);
-                if let Some(why) = live.stale(0, crate::chain::now_ms()).filter(|_| shorter) {
+                if let Some(why) = live.stale((0, None), crate::chain::now_ms()).filter(|_| shorter) {
                     eprintln!("⚠️  under the chain's parameters in force: {why}; if in doubt, wipe this home and join again with that checkpoint");
                 }
                 return;
@@ -808,8 +808,8 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
             if empty {
                 heed_peers(&mut trust, &peers, false).await;
             }
-            let height = shared.lock().height();
-            if let Some(why) = trust.stale(height, crate::chain::now_ms()) {
+            let own = shared.lock().head_time();
+            if let Some(why) = trust.stale(own, crate::chain::now_ms()) {
                 eprintln!("⚠️  {why}. Validators get recent checkpoints with each release: run the latest one.");
             }
             let trust = Arc::new(trust);
@@ -967,7 +967,7 @@ pub fn join(genesis: &str, home: &Path, pins: &Pins, fast: bool) -> Result<()> {
         (Genesis::load(Path::new(genesis))?, vec![])
     };
     let mut trust = Trust::new(&g, pins, true)?;
-    trust.check_fresh(0, crate::chain::now_ms())?;
+    trust.check_fresh((0, None), crate::chain::now_ms())?;
     for u in http_peers(&g, &[], None) {
         if !peers.contains(&u) {
             peers.push(u);
@@ -976,7 +976,7 @@ pub fn join(genesis: &str, home: &Path, pins: &Pins, fast: bool) -> Result<()> {
     if rt.block_on(heed_peers(&mut trust, &peers, false)) == 0 && !peers.is_empty() {
         println!("ℹ️  no peer answered /api/status for this chain: the weak-subjectivity period in force is checked again when the node first starts");
     }
-    trust.check_fresh(0, crate::chain::now_ms())?;
+    trust.check_fresh((0, None), crate::chain::now_ms())?;
     match trust.newest() {
         0 => println!("🔐 genesis {} pinned", trust.genesis_hash),
         h => println!("🔐 genesis {} pinned; newest trusted checkpoint #{h}", trust.genesis_hash),
@@ -1004,8 +1004,8 @@ pub fn run_full_node(home: PathBuf, net: NetOpts) -> Result<()> {
     let mut trust = Trust::new(&chain.genesis, &jc.pins, false)?;
     trust.follow(&chain.state.chain_params);
     // An empty home is where a stale root bites (a fresh sync); a synced one trusts its own head.
-    let (empty, height) = (chain.height() == 0 && chain.base.is_none(), chain.height());
-    trust.check_fresh(height, crate::chain::now_ms())?;
+    let (empty, own) = (chain.height() == 0 && chain.base.is_none(), chain.head_time());
+    trust.check_fresh(own, crate::chain::now_ms())?;
     let keep = net.pruning.keep(false, &chain.state);
     chain.set_pruning(keep);
     // A halted full node keeps serving reads at its height, with the reason in /api/health.
@@ -1022,7 +1022,7 @@ pub fn run_full_node(home: PathBuf, net: NetOpts) -> Result<()> {
         // an empty home waits for a peer's answer and refuses a root too old for it (`join` asked
         // too, but governance may have acted since); a synced one only warns.
         heed_peers(&mut trust, &peers, empty).await;
-        if let Some(why) = trust.check_fresh(height, crate::chain::now_ms())? {
+        if let Some(why) = trust.check_fresh(own, crate::chain::now_ms())? {
             eprintln!("⚠️  {why}");
         }
         let trust = Arc::new(trust);
@@ -1419,7 +1419,7 @@ pub(crate) fn apply_batch_trusted(chain: &Shared, verifier: &MlDsaScheme, epoch:
     let (blocks, fin_bytes) = verify_batch(chain, verifier, epoch, batch)?;
     if let Some(t) = trust {
         for b in &blocks {
-            t.check_block(b.height, &hex::encode(b.digest_bytes()))?;
+            t.check_block(b.height, &hex::encode(b.digest_bytes()), Some(b.timestamp_ms))?;
         }
     }
     // One block at a time, the chain lock held only for the in-memory parts (sync is this
@@ -1566,10 +1566,10 @@ mod tests {
         assert!(err.contains("--genesis-hash") && err.contains(&hash), "{err}");
         assert!(!root.join("full-none").exists(), "a refused join writes nothing");
         assert!(try_join(&gpath, "full-bad", &pin(&"00".repeat(32))).unwrap_err().to_string().contains("mismatch"));
-        let wrong_genesis = Pins { checkpoints: vec![Checkpoint { height: 0, hash: "ab".repeat(32), set_hash: None }], ..pin(&hash) };
+        let wrong_genesis = Pins { checkpoints: vec![Checkpoint { height: 0, hash: "ab".repeat(32), set_hash: None, timestamp_ms: None }], ..pin(&hash) };
         assert!(try_join(&gpath, "full-cp0", &wrong_genesis).unwrap_err().to_string().contains("checkpoint #0"));
         // Pinned: joined, and `run` finds the pins in join.json.
-        let pins = Pins { checkpoints: vec![Checkpoint { height: 5, hash: "cd".repeat(32), set_hash: None }], ..pin(&hash) };
+        let pins = Pins { checkpoints: vec![Checkpoint { height: 5, hash: "cd".repeat(32), set_hash: None, timestamp_ms: None }], ..pin(&hash) };
         try_join(&gpath, "full-ok", &pins).unwrap();
         let jc: JoinConfig = serde_json::from_slice(&std::fs::read(root.join("full-ok").join("join.json")).unwrap()).unwrap();
         assert_eq!(jc.pins, pins);
@@ -1614,7 +1614,7 @@ mod tests {
         };
         let url = serve(crate::api::router(crate::api::Node::new(chain.clone(), None, vec![], Default::default()))).await;
         let day = 86_400_000 / g.block_time_ms;
-        let pins = |at: u64| Pins { genesis_hash: Some(hash.clone()), checkpoints: vec![Checkpoint { height: at, hash: "cd".repeat(32), set_hash: None }], ..Default::default() };
+        let pins = |at: u64| Pins { genesis_hash: Some(hash.clone()), checkpoints: vec![Checkpoint { height: at, hash: "cd".repeat(32), set_hash: None, timestamp_ms: None }], ..Default::default() };
         let try_join = |from: &str, name: &str, pins: Pins| {
             let (from, home) = (from.to_string(), root.join(name));
             tokio::task::spawn_blocking(move || join(&from, &home, &pins, true))
@@ -1637,9 +1637,9 @@ mod tests {
         let jc: JoinConfig = serde_json::from_slice(&std::fs::read(root.join("before").join("join.json")).unwrap()).unwrap();
         assert!(jc.peers.contains(&url));
         let mut trust = Trust::new(&g, &jc.pins, false).unwrap();
-        assert_eq!(trust.check_fresh(0, crate::chain::now_ms()).unwrap(), None, "by this release alone: fresh");
+        assert_eq!(trust.check_fresh((0, None), crate::chain::now_ms()).unwrap(), None, "by this release alone: fresh");
         assert_eq!(heed_peers(&mut trust, &jc.peers, true).await, 1, "the peer answered; the genesis validator's address didn't");
-        assert!(trust.check_fresh(0, crate::chain::now_ms()).unwrap_err().to_string().contains("~7.0 days"));
+        assert!(trust.check_fresh((0, None), crate::chain::now_ms()).unwrap_err().to_string().contains("~7.0 days"));
         // A liar claiming a 1-block period is held to the floor: a week-old checkpoint still joins.
         let status = |genesis_hash: String| move || {
             let genesis_hash = genesis_hash.clone();
@@ -1688,7 +1688,7 @@ mod tests {
         let verifier = consensus::EpochProvider::new(chain.clone(), None).epoch_scheme(0).unwrap();
         let hash2 = hex::encode(blocks[2].digest_bytes());
         let genesis_set = crate::checkpoints::genesis_checkpoint(&g).set_hash;
-        let trust = |hash: &str, set: Option<String>| Trust::new(&g, &Pins { checkpoints: vec![Checkpoint { height: 2, hash: hash.into(), set_hash: set }], ..Default::default() }, false).unwrap();
+        let trust = |hash: &str, set: Option<String>| Trust::new(&g, &Pins { checkpoints: vec![Checkpoint { height: 2, hash: hash.into(), set_hash: set, timestamp_ms: None }], ..Default::default() }, false).unwrap();
         let err = apply_batch_trusted(&chain, &verifier, 0, &batch, Some(&trust(&"ab".repeat(32), None))).unwrap_err().to_string();
         assert!(err.contains("another chain"), "{err}");
         let err = apply_batch_trusted(&chain, &verifier, 0, &batch, Some(&trust(&hash2, Some("cd".repeat(32))))).unwrap_err().to_string();
