@@ -20,6 +20,7 @@ env:
 
 jobs:
   rust:
+    # A required status check (ci.yml's header, deploy/github/ruleset-main.json): keep the name.
     name: ml-dsa (node)
     runs-on: ubuntu-24.04
     steps:
@@ -38,6 +39,7 @@ jobs:
         run: "cargo test --locked --manifest-path node/Cargo.toml kat:: -- --nocapture"
 
   ts:
+    # A required status check (ci.yml's header, deploy/github/ruleset-main.json): keep the name.
     name: "@noble/post-quantum (SDK)"
     runs-on: ubuntu-24.04
     steps:

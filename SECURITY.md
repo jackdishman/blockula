@@ -19,6 +19,10 @@ Especially wanted: anything that halts or splits the chain, mints or moves FANG 
 
 Known limitations listed in [docs/PLAN.md](docs/PLAN.md#known-limits) and [docs/MAINNET.md](docs/MAINNET.md) are known, but a concrete exploit of one is still welcome.
 
+## Fuzzing findings
+
+The node's decoders are fuzzed nightly in this public repository's CI ([node/fuzz](node/fuzz/README.md)). A crash the fuzzers find is handled exactly like a private report: a private security advisory, fixed in its private fork, disclosed only after the fix has shipped. The job's log says only which target crashed; the crash input and the fuzzer's output leave the runner only encrypted to the maintainers' keys, and open findings' inputs are never committed. If you fuzz Blockula yourself and find a crash, report it here the same way, with the input attached to the advisory, not in an issue or PR.
+
 ## What to expect
 
 These are targets, not guarantees:

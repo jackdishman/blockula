@@ -57,6 +57,27 @@ material
 if "$SEAL" state_machine / "$T/out" > /dev/null 2>&1; then fail "it agreed to seal (and delete) /"; fi
 ok "refuses to treat / as the material directory"
 
+# scripts/check-fuzz-workflow.sh: the committed workflow passes; each way back to publishing a
+# crash (the pre-fix workflow's three) fails. Variants are edits of the real file, and each edit
+# must change it, so the cases can't silently go stale.
+CHECK=$PWD/scripts/check-fuzz-workflow.sh
+WF=.github/workflows/fuzz.yml
+"$CHECK" "$WF" > /dev/null 2>&1 || fail "check-fuzz-workflow.sh refuses the committed $WF"
+variant() {
+  local name=$1 want=$2 expr=$3
+  sed -E "$expr" "$WF" > "$T/wf.yml"
+  if cmp -s "$WF" "$T/wf.yml"; then fail "$name: the edit ($expr) no longer changes $WF"; fi
+  local out
+  if out=$("$CHECK" "$T/wf.yml" 2>&1); then fail "$name: check-fuzz-workflow.sh accepts it"; fi
+  printf '%s' "$out" | grep -qF -- "$want" || fail "$name: expected \"$want\" in: $out"
+}
+variant "a plain crash upload" "only sealed crash material" 's#path: \$\{\{ runner.temp \}\}/sealed/fuzz-crash-\$\{\{ matrix.target \}\}.tar.age#path: node/fuzz/artifacts/${{ matrix.target }}#'
+variant "an inline plain upload" "only sealed crash material" 's#^( +)path: \$\{\{ runner.temp \}\}/sealed/.*#\1path: "${{ runner.temp }}/crash"#'
+variant "fuzzer output in the log" "prints into the public log" 's# > "\$RUNNER_TEMP/crash/\$TARGET/fuzz.log" 2>&1##'
+variant "final stats on" "print_final_stats" 's#-print_final_stats=0#-print_final_stats=1#'
+variant "final stats not turned off" "print_final_stats=0" 's# -print_final_stats=0##'
+ok "check-fuzz-workflow.sh: passes $WF, refuses a plain upload, output in the log, final stats"
+
 if command -v age > /dev/null && command -v age-keygen > /dev/null; then
   age-keygen -o "$T/id1" 2> /dev/null
   age-keygen -o "$T/id2" 2> /dev/null

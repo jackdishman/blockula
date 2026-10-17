@@ -38,7 +38,7 @@ env:
 
 jobs:
   harness:
-    # A required status check (deploy/github/ruleset-main.json): keep the name.
+    # A required status check (ci.yml's header, deploy/github/ruleset-main.json): keep the name.
     name: Fuzz harness
     runs-on: ubuntu-24.04
     steps:
