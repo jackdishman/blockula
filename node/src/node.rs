@@ -572,7 +572,20 @@ async fn maybe_fast_sync(chain: &Shared, peers: &[String], full: bool, trust: &T
     }
     for wait in 0.. {
         match crate::snapshot::fast_sync(chain, peers, trust).await {
-            Ok(h) => return println!("⚡ fast-synced to #{h} from a certified snapshot; history before it isn't stored on this node"),
+            Ok(h) => {
+                println!("⚡ fast-synced to #{h} from a certified snapshot; history before it isn't stored on this node");
+                // The snapshot's parameters may put the period below what this node assumed
+                // (governance shortened it): then the root it trusted was older than is safe, and
+                // the snapshot is only as good as the peers that served it (gap-6-1). A forged
+                // state could hide such a change, so this only catches the honest case.
+                let mut live = trust.clone();
+                if live.follow(&chain.lock().state.chain_params) {
+                    if let Some(why) = live.stale(0, crate::chain::now_ms()) {
+                        eprintln!("⚠️  under the chain's parameters in force: {why}; if in doubt, wipe this home and join again with that checkpoint");
+                    }
+                }
+                return;
+            }
             // A checkpoint newer than every peer's snapshot: one is taken every 100 blocks.
             Err(e) if wait < SNAPSHOT_WAITS && e.chain().any(|c| c.is::<crate::snapshot::SnapshotBehind>()) => {
                 println!("⏳ {e:#}; waiting for a newer snapshot");
@@ -689,8 +702,11 @@ pub fn dev_is_stale(home: &Path) -> bool {
 
 pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
     let mut chain = Chain::open(&home)?;
-    // Validators take their genesis from the signed release; a known chain's must match it.
-    let trust = Arc::new(Trust::new(&chain.genesis, &Pins::default(), false)?);
+    // Validators take their genesis from the signed release; a known chain's must match it. The
+    // weak-subjectivity period is the one the parameters in force set, if governance shortened it.
+    let mut trust = Trust::new(&chain.genesis, &Pins::default(), false)?;
+    trust.follow(&chain.state.chain_params);
+    let trust = Arc::new(trust);
     let keep = net.pruning.keep(true, &chain.state);
     chain.set_pruning(keep);
     crate::upgrade::configure(&mut chain, consensus::SUPPORTED_PROTOCOL_VERSION, net.halt_height);
@@ -899,8 +915,11 @@ pub fn run_full_node(home: PathBuf, net: NetOpts) -> Result<()> {
     let bind = socket(&net.bind, net.http_port.unwrap_or(7171))?;
     let jc: JoinConfig = serde_json::from_slice(&std::fs::read(home.join("join.json")).context("not a joined home — use `blockula join`")?)?;
     let mut chain = Chain::open(&home)?;
-    // The pins were checked at `join`; they (and the embedded checkpoints) apply on every start.
-    let trust = Arc::new(Trust::new(&chain.genesis, &jc.pins, false)?);
+    // The pins were checked at `join`; they (and the embedded checkpoints) apply on every start,
+    // under the weak-subjectivity period of the parameters in force in this node's own state.
+    let mut trust = Trust::new(&chain.genesis, &jc.pins, false)?;
+    trust.follow(&chain.state.chain_params);
+    let trust = Arc::new(trust);
     // An empty home is where a stale root bites (a fresh sync); a synced one trusts its own head.
     if let Some(why) = trust.check_fresh(chain.height(), crate::chain::now_ms())? {
         eprintln!("⚠️  {why}");
