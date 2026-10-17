@@ -89,14 +89,21 @@ export function Alerts() {
       }
     };
 
+    let busy = false;
     const poll = async () => {
       tick++;
       const hidden = document.visibilityState === "hidden";
-      if (hidden && tick % HIDDEN_EVERY) return;
-      for (const addr of hidden ? list.slice(0, myAddr ? 1 : 0) : list) {
-        if (stop) return;
-        const a = await nodeGet<AccountDetail>(`/account/${addr}`).catch(() => null);
-        if (a && !stop) read(addr, a);
+      // A slow node: let the last round finish rather than stack another on it.
+      if (busy || (hidden && tick % HIDDEN_EVERY)) return;
+      busy = true;
+      try {
+        for (const addr of hidden ? list.slice(0, myAddr ? 1 : 0) : list) {
+          if (stop) return;
+          const a = await nodeGet<AccountDetail>(`/account/${addr}`).catch(() => null);
+          if (a && !stop) read(addr, a);
+        }
+      } finally {
+        busy = false;
       }
     };
     poll();
@@ -119,24 +126,25 @@ export function Alerts() {
   return (
     <div className="notices" aria-live="polite">
       {shown.map((n) => (
-        <NoticeCard key={n.key} n={n} onClose={() => dismiss(n.key)} />
+        <NoticeCard key={n.key} n={n} onClose={dismiss} />
       ))}
     </div>
   );
 }
 
-function NoticeCard({ n, onClose }: { n: Notice; onClose: () => void }) {
+/** `onClose` must be stable: the wallet re-renders every few seconds, which mustn't restart the timer. */
+function NoticeCard({ n, onClose }: { n: Notice; onClose: (key: string) => void }) {
   const [held, setHeld] = useState(false);
   useEffect(() => {
     if (held) return;
-    const t = setTimeout(onClose, SHOW_MS);
+    const t = setTimeout(() => onClose(n.key), SHOW_MS);
     return () => clearTimeout(t);
-  }, [held, onClose]);
+  }, [held, onClose, n.key]);
   return (
-    <div className={`notice ${n.tone}`} role="status" onMouseEnter={() => setHeld(true)} onMouseLeave={() => setHeld(false)} onFocus={() => setHeld(true)} onBlur={() => setHeld(false)}>
+    <div className={`notice ${n.tone}`} onMouseEnter={() => setHeld(true)} onMouseLeave={() => setHeld(false)} onFocus={() => setHeld(true)} onBlur={() => setHeld(false)}>
       <div className="notice-head">
         <span className="notice-title">{n.title}</span>
-        <button className="notice-x" onClick={onClose} aria-label="Dismiss">
+        <button className="notice-x" onClick={() => onClose(n.key)} aria-label="Dismiss">
           ×
         </button>
       </div>
@@ -146,7 +154,7 @@ function NoticeCard({ n, onClose }: { n: Notice; onClose: () => void }) {
       </div>
       <div className="notice-foot">
         {n.meta && <span className="dim">{n.meta}</span>}
-        <Link href={to.tx(n.tx)} onClick={onClose}>
+        <Link href={to.tx(n.tx)} onClick={() => onClose(n.key)}>
           Receipt →
         </Link>
       </div>

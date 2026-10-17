@@ -12,11 +12,47 @@ import type { KeyView, Label } from "../types";
 import { DROPS_PER_FANG, effectsOf, formatDrops, type Change, type Effects, type Holding } from "./ledger.ts";
 import type { TxDetail } from "./types";
 
-/** node/src/types.rs: MIN_NEW_ACCOUNT, MIN_HUNT, MIN_HUNT_FUNDING; poc.rs: VOUCH_BOND. */
+/** node/src/types.rs: MIN_NEW_ACCOUNT, MIN_HUNT, MIN_HUNT_FUNDING; poc.rs: VOUCH_BOND, CLAIM_BOND. */
 export const MIN_NEW_ACCOUNT = DROPS_PER_FANG / 100n;
 export const MIN_HUNT = 10n * DROPS_PER_FANG;
 export const MIN_HUNT_FUNDING = DROPS_PER_FANG;
 export const VOUCH_BOND = 10n * DROPS_PER_FANG;
+export const CLAIM_BOND = DROPS_PER_FANG;
+
+/** node/src/types.rs `name_price`: shorter names cost more. */
+export function namePrice(name: string): bigint {
+  const n = name.toLowerCase().replace(/\.boo$/, "");
+  return n.length === 3 ? 100n * DROPS_PER_FANG : n.length === 4 ? 25n * DROPS_PER_FANG : 5n * DROPS_PER_FANG;
+}
+
+/**
+ * What the node reserves from the sender's balance while a transaction waits in the mempool
+ * (node/src/chain.rs `tx_debit`): its fee plus whatever its action takes out.
+ */
+export function txDebit(t: Pick<TxDetail, "fee" | "action">): bigint {
+  const a = t.action ?? { type: "" };
+  const taken = (() => {
+    switch (a.type) {
+      case "transfer":
+      case "create_hunt":
+      case "fund_hunt":
+      case "fund_pool":
+        return big(a.amount);
+      case "register_validator":
+      case "join_jury":
+        return big(a.bond);
+      case "register_name":
+        return typeof a.name === "string" ? namePrice(a.name) : 0n;
+      case "vouch":
+        return VOUCH_BOND;
+      case "submit_claim":
+        return CLAIM_BOND;
+      default:
+        return 0n;
+    }
+  })();
+  return big(t.fee) + taken;
+}
 
 export interface Built {
   from: string;
@@ -31,6 +67,8 @@ export interface Sender {
   keys: KeyView[];
   /** The account's latest transactions (its pending ones come first). */
   recent?: TxDetail[];
+  /** Key ids registered as Familiars (agent keys that may also claim PRs). */
+  familiars?: string[];
 }
 
 export interface PreflightInput {
@@ -44,8 +82,8 @@ export interface PreflightInput {
   recipient?: { label: Label; isNew: boolean } | null;
   /** A cost the transaction's fields don't carry, known to the page (a name's price, a claim bond). */
   extra?: { drops: bigint; to: Label | Holding; why: string } | null;
-  /** The hunt it funds, for fund_hunt. */
-  hunt?: { id: number; status: string; expires_at: number } | null;
+  /** The hunt it funds, for fund_hunt (`missing` when the node has no such hunt). */
+  hunt?: { id: number; status: string; expires_at: number } | { id: number; missing: true } | null;
 }
 
 export interface Budget {
@@ -134,12 +172,8 @@ export function preflight(i: PreflightInput): Preflight {
   const cost = mine && mine.delta < 0n ? -mine.delta : fee;
 
   // Pending transactions from this account reserve what they'll take.
-  let pending = 0n;
-  for (const t of sender.recent ?? []) {
-    if (t.status !== "pending" || t.from?.address !== sender.label.address) continue;
-    const d = effectsOf(t).changes.find((c) => c.who.address === sender.label.address);
-    if (d && d.delta < 0n) pending += -d.delta;
-  }
+  const queued = (sender.recent ?? []).filter((t) => t.status === "pending" && t.from?.address === sender.label.address);
+  const pending = queued.reduce((sum, t) => sum + txDebit(t), 0n);
   const balance = big(sender.balance);
   const available = balance > pending ? balance - pending : 0n;
 
@@ -155,13 +189,19 @@ export function preflight(i: PreflightInput): Preflight {
   if (key?.role.type === "session") {
     const r = key.role;
     const limit = big(r.limit);
-    const spent = spentIn(key, at);
+    const familiar = !!i.signer && (sender.familiars ?? []).includes(i.signer);
     // The chain counts the amount moved plus the fee against the limit (a Familiar's claim
-    // counts its bond).
-    const after = spent + (kind === "transfer" ? amount : kind === "submit_claim" ? (i.extra?.drops ?? 0n) : 0n) + fee;
+    // counts its bond), and blocks apply this key's pending payments first.
+    const cost = (t: Pick<TxDetail, "fee" | "action" | "kind">, bond: bigint) => big(t.fee) + ((t.kind ?? t.action?.type) === "transfer" ? big(t.action?.amount) : (t.kind ?? t.action?.type) === "submit_claim" ? bond : 0n);
+    const queuedHere = queued.filter((t) => t.signer_key === i.signer).reduce((sum, t) => sum + cost(t, CLAIM_BOND), 0n);
+    const spent = spentIn(key, at) + queuedHere;
+    const after = spent + cost({ fee: fee.toString(), action: tx.action, kind }, i.extra?.drops ?? CLAIM_BOND);
     budget = { label: key.label, spentAfter: after, limit, periodBlocks: r.period_blocks };
+    if (kind !== "transfer" && !(kind === "submit_claim" && familiar))
+      refusals.push(kind === "submit_claim" ? `“${key.label}” is an agent key but not a registered Familiar, so it can't claim PRs for this account.` : `“${key.label}” is an agent key, and agent keys can only send transfers.`);
     if (at > r.expires_at) refusals.push(`The agent key “${key.label}” expired at block #${r.expires_at.toLocaleString("en-US")}.`);
-    else if (after > limit) refusals.push(`Over the agent key's budget: “${key.label}” has used ${formatDrops(spent)} of ${formatDrops(limit)} this period, and this needs ${formatDrops(after - spent)} more.`);
+    else if (after > limit)
+      refusals.push(`Over the agent key's budget: “${key.label}” has used ${formatDrops(spent)} of ${formatDrops(limit)} this period${queuedHere ? " (counting its pending payments)" : ""}, and this needs ${formatDrops(after - spent)} more.`);
   }
 
   if (kind === "transfer") {
@@ -172,7 +212,8 @@ export function preflight(i: PreflightInput): Preflight {
   if (kind === "fund_hunt") {
     if (amount < MIN_HUNT_FUNDING) refusals.push(`Fund a hunt with at least ${formatDrops(MIN_HUNT_FUNDING)}.`);
     const h = i.hunt;
-    if (h && h.status !== "open") refusals.push(`Hunt #${h.id} is ${h.status}, so it can't take more funding.`);
+    if (h && "missing" in h) refusals.push(`There's no hunt #${h.id}.`);
+    else if (h && h.status !== "open") refusals.push(`Hunt #${h.id} is ${h.status}, so it can't take more funding.`);
     else if (h && at > h.expires_at) refusals.push(`Hunt #${h.id} expired at block #${h.expires_at.toLocaleString("en-US")}.`);
   }
 

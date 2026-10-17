@@ -14,9 +14,11 @@ import { Amount, Term, Who } from "./kit";
  */
 export function PreflightView({ p, me, blockMs = 1000 }: { p: Preflight; me?: string | null; blockMs?: number }) {
   const fx = p.effects;
+  // Refused, nothing changes: show what it asks for, not a balance it won't leave.
+  const refused = p.refusals.length > 0;
   return (
     <div className="preflight">
-      <span className="eyebrow">What will change</span>
+      <span className="eyebrow">{refused ? "What it would change" : "What will change"}</span>
       <div className="changes">
         {fx.changes.map((c) => (
           <div key={c.who.address} style={{ display: "contents" }}>
@@ -39,26 +41,28 @@ export function PreflightView({ p, me, blockMs = 1000 }: { p: Preflight; me?: st
       </div>
       {fx.unseen && <p className="card-note">{fx.unseen}</p>}
 
-      <dl className="kv after">
-        <dt>Balance after</dt>
-        <dd>
-          <Amount drops={p.balanceAfter} exact />
-          {p.pending > 0n && <span className="dim small block">once your pending transactions ({formatDrops(p.pending)}) go through too</span>}
-        </dd>
-        {p.budget && (
-          <>
-            <dt>
-              <Term k="session_key">Agent budget</Term>
-            </dt>
-            <dd>
-              <Meter used={p.budget.spentAfter > p.budget.limit ? p.budget.limit : p.budget.spentAfter} limit={p.budget.limit} label={`${p.budget.label} will have used ${formatDrops(p.budget.spentAfter)} of ${formatDrops(p.budget.limit)}`} />
-              <span className="small">
-                “{p.budget.label}” will have used <Amount drops={p.budget.spentAfter} /> of <Amount drops={p.budget.limit} /> per {blocksToHuman(p.budget.periodBlocks, blockMs)}
-              </span>
-            </dd>
-          </>
-        )}
-      </dl>
+      {!refused && (
+        <dl className="kv after">
+          <dt>Balance after</dt>
+          <dd>
+            <Amount drops={p.balanceAfter} exact />
+            {p.pending > 0n && <span className="dim small block">once your pending transactions ({formatDrops(p.pending)}) go through too</span>}
+          </dd>
+          {p.budget && (
+            <>
+              <dt>
+                <Term k="session_key">Agent budget</Term>
+              </dt>
+              <dd>
+                <Meter used={p.budget.spentAfter > p.budget.limit ? p.budget.limit : p.budget.spentAfter} limit={p.budget.limit} label={`${p.budget.label} will have used ${formatDrops(p.budget.spentAfter)} of ${formatDrops(p.budget.limit)}`} />
+                <span className="small">
+                  “{p.budget.label}” will have used <Amount drops={p.budget.spentAfter} /> of <Amount drops={p.budget.limit} /> per {blocksToHuman(p.budget.periodBlocks, blockMs)}
+                </span>
+              </dd>
+            </>
+          )}
+        </dl>
+      )}
 
       {p.notes.map((n) => (
         <p key={n} className="warn small" style={{ margin: 0 }}>

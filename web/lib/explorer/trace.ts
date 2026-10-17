@@ -187,6 +187,9 @@ function freeRow(taken: Map<number, Set<number>>, col: number, want: number): nu
 
 const cmp = (a: bigint, b: bigint) => (a > b ? 1 : a < b ? -1 : 0);
 
+/** How many accounts a trace follows besides its root. */
+export const FOLLOW_MAX = 12;
+
 /** Followed accounts in a shareable form (`?follow=a,b`), the root left out. */
 export const followParam = (followed: string[], root: string) => followed.filter((a) => a !== root).join(",");
-export const parseFollow = (s: string | null) => (s ? s.split(",").map((x) => x.trim()).filter(Boolean).slice(0, 12) : []);
+export const parseFollow = (s: string | null) => (s ? s.split(",").map((x) => x.trim()).filter(Boolean).slice(0, FOLLOW_MAX) : []);

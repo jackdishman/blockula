@@ -10,7 +10,7 @@ import { Copy } from "@/components/ui";
 import { parseDrops } from "@/lib/explorer/ledger";
 import { nodeGet, useNode } from "@/lib/explorer/node";
 import { to } from "@/lib/explorer/routes";
-import { buildTrace, followParam, parseFollow, type TraceNode } from "@/lib/explorer/trace";
+import { buildTrace, FOLLOW_MAX, followParam, parseFollow, type TraceNode } from "@/lib/explorer/trace";
 import type { AccountDetail, TxDetail } from "@/lib/explorer/types";
 
 export default function TracePage() {
@@ -49,6 +49,7 @@ function TraceView() {
   const follow = useMemo(() => parseFollow(search.get("follow")), [search]);
   const followed = useAccounts(follow, round);
   const [selected, setSelected] = useState<string | null>(null);
+  const [full, setFull] = useState(false);
 
   const rootAddr = root.data?.account.address ?? null;
   const history = useMemo(() => {
@@ -81,11 +82,12 @@ function TraceView() {
   const loading = new Set(follow.filter((a) => !followed.map.has(a) && !followed.failed.has(a)));
   const setFollow = (next: string[]) => {
     setSelected(null);
+    setFull(false);
     router.replace(to.trace(ref, followParam(next, rootAddr)), { scroll: false });
   };
   const toggle = (n: TraceNode) => {
     if (n.holding || n.id === rootAddr) return;
-    if (!follow.includes(n.id)) return setFollow([...follow, n.id]);
+    if (!follow.includes(n.id)) return follow.length >= FOLLOW_MAX ? setFull(true) : setFollow([...follow, n.id]);
     // Stop following it, and whatever was only reachable through it.
     const rest = new Map([...history].filter(([a]) => a !== n.id));
     const reach = new Set(buildTrace(rootAddr, rest).nodes.map((x) => x.id));
@@ -125,6 +127,11 @@ function TraceView() {
             </button>
           )}
           <Copy text={typeof window === "undefined" ? "" : window.location.href} label="Copy link to this trace" />
+          {full && (
+            <span className="warn small" role="alert">
+              A trace follows at most {FOLLOW_MAX} accounts. Stop following one (click it) to follow another.
+            </span>
+          )}
         </div>
       </div>
 

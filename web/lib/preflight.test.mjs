@@ -20,7 +20,7 @@ test("a transfer: the sender pays amount + fee, the recipient gets the amount, t
 });
 
 test("not enough FANG, counting what pending transactions will take", () => {
-  const pend = { id: "p", summary: "", status: "pending", height: null, kind: "transfer", from: vlad, to: mina, amount: String(4n * F), fee: "4000" };
+  const pend = { id: "p", summary: "", status: "pending", height: null, kind: "transfer", from: vlad, to: mina, amount: String(4n * F), fee: "4000", action: { type: "transfer", to: "boo1mina", amount: String(4n * F) } };
   const p = preflight({ tx: transfer(5n * F), sender: sender(8n * F, [owner], [pend]), signer: "k-owner", head: 100, recipient: { label: mina, isNew: false } });
   assert.equal(p.pending, 4n * F + 4000n);
   assert.match(p.refusals[0], /Not enough FANG: this needs 5\.000004 FANG.*after your pending/);
@@ -61,4 +61,35 @@ test("hunt rules: minimums, and a closed or expired hunt can't take funding", ()
   assert.match(preflight({ tx: fund(F), sender: sender(100n * F), head: 1, hunt: { id: 2, status: "awarded", expires_at: 99 } }).refusals[0], /awarded/);
   assert.match(preflight({ tx: fund(F), sender: sender(100n * F), head: 99, hunt: { id: 2, status: "open", expires_at: 99 } }).refusals[0], /expired at block #99/);
   assert.match(preflight({ tx: { ...fund(F), action: { type: "create_hunt", amount: String(9n * F) } }, sender: sender(100n * F), head: 1 }).refusals[0], /at least 10 FANG/);
+});
+
+test("pending reservations mirror the node's tx_debit: a name's price and a claim bond count too", () => {
+  const pend = (action) => ({ id: action.type, summary: "", status: "pending", height: null, kind: action.type, from: vlad, fee: "4000", action });
+  const p = preflight({ tx: transfer(1n * F), sender: sender(30n * F, [owner], [pend({ type: "register_name", name: "bat" }), pend({ type: "submit_claim", repo: "a/b", pr: 1 })]), head: 1, recipient: { label: mina, isNew: false } });
+  assert.equal(p.pending, 100n * F + F + 8000n, "a 3-letter name costs 100 FANG");
+  assert.match(p.refusals[0], /Not enough FANG/);
+});
+
+test("agent keys: only transfers, or claims from a registered Familiar", () => {
+  const keys = [owner, agent(0n)];
+  const claim = { from: "boo1vlad", fee: "4000", nonce: 1, action: { type: "submit_claim", repo: "a/b", pr: 2 } };
+  const bond = { drops: F, to: { address: "holding:claim-bond", name: "Claim bond", short: "Claim bond", holding: true }, why: "refundable claim bond" };
+  assert.match(preflight({ tx: claim, sender: sender(50n * F, keys), signer: "k-agent", head: 100, extra: bond }).refusals[0], /not a registered Familiar/);
+  const familiar = preflight({ tx: claim, sender: { ...sender(50n * F, keys), familiars: ["k-agent"] }, signer: "k-agent", head: 100, extra: bond });
+  assert.deepEqual(familiar.refusals, []);
+  assert.equal(familiar.budget.spentAfter, F + 4000n, "a Familiar's claim counts its bond against the budget");
+  const fund = { from: "boo1vlad", fee: "4000", nonce: 1, action: { type: "fund_pool", amount: String(F) } };
+  assert.match(preflight({ tx: fund, sender: sender(50n * F, keys), signer: "k-agent", head: 100 }).refusals[0], /can only send transfers/);
+});
+
+test("an agent's own pending payments count against its budget (blocks apply them first)", () => {
+  const pend = { id: "q", summary: "", status: "pending", height: null, kind: "transfer", from: vlad, to: mina, fee: "4000", signer_key: "k-agent", amount: String(6n * F), action: { type: "transfer", to: "boo1mina", amount: String(6n * F) } };
+  const p = preflight({ tx: transfer(5n * F), sender: sender(50n * F, [owner, agent(0n)], [pend]), signer: "k-agent", head: 100, recipient: { label: mina, isNew: false } });
+  assert.equal(p.budget.spentAfter, 11n * F + 8000n);
+  assert.match(p.refusals[0], /counting its pending payments/);
+});
+
+test("funding a hunt that doesn't exist", () => {
+  const fund = { from: "boo1vlad", fee: "4000", nonce: 1, action: { type: "fund_hunt", hunt_id: 9, amount: String(F) } };
+  assert.match(preflight({ tx: fund, sender: sender(50n * F), head: 1, hunt: { id: 9, missing: true } }).refusals[0], /no hunt #9/);
 });
