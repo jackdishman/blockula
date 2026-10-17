@@ -425,7 +425,9 @@ fn namespaces_and_meta_keys_are_unique() {
 /// GitHub handle holds are empty here. The vectors were regenerated and the SDK rebuilt the root.
 /// Schema 8 (the third audit round) changes only the `schema` record here (pools'
 /// `key_update_at` and `admit` are empty); the vectors were regenerated and the SDK rebuilt the
-/// root.
+/// root. Schema 9 (the fourth audit round) changes the `schema` record and appends the highest
+/// superseded version to the `upgrade` record's withdrawals (`0` here: four more bytes); the
+/// vectors were regenerated and the SDK rebuilt the root.
 #[test]
 fn golden_encodings() {
     let acct = Account { balance: 5, nonce: 2, keys: Default::default(), locks: vec![] };
@@ -436,7 +438,7 @@ fn golden_encodings() {
     st.commit_block().unwrap();
     assert_eq!(st.root_hash(), st.full_root());
     assert_eq!(st.record_count(), 13);
-    assert_eq!(st.root(), "dd9d360b0e622ce0adfd44594254359e70daca0cfe2842563047b98f22fd98da");
+    assert_eq!(st.root(), "717a74bb8f4b498806dbcd36467ce6a90e6f06fa4e6e6fc66748bd7e14bf865a");
 }
 
 fn million_accounts() -> State {

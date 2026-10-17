@@ -42,8 +42,10 @@ use std::io::{Read, Write};
 /// handles governance holds for an account, `poc::HandleHold`). 8 (the third audit round): pools
 /// keep the consensus key's last update for its owner (`key_update_at`, F04's once-an-epoch limit,
 /// apart from `ready_at`, which only `ValidatorReady` writes now) and the candidate they last
-/// admitted into a set of one or two (`admit`).
-pub const SCHEMA_VERSION: u32 = 8;
+/// admitted into a set of one or two (`admit`). 9 (the fourth audit round): the `upgrade` record's
+/// withdrawals keep the highest version a cancellation superseded (`Withdrawals::superseded`,
+/// review-r3-gov-1).
+pub const SCHEMA_VERSION: u32 = 9;
 
 pub fn encode<T: BorshSerialize + ?Sized>(v: &T) -> Vec<u8> {
     borsh::to_vec(v).expect("encoding to memory can't fail")
