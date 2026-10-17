@@ -9,7 +9,7 @@ import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex, hexToBytes, utf8ToBytes } from "@noble/hashes/utils.js";
 import {
-  ApiError, ChainMismatchError, Client, MAX_TIMEOUT_MS, decodeKeyGrant, encodeKeyGrant, verifyKeyGrant, RELEASE_SIGNATURE_FORMAT, RequestTimeoutError, StaleProofError, TxFailedError, TxPendingError, Wallet, addressFromPublicKey, bareName, buildDistribution, convictionWeight, distributionLeaf, distributionNode,
+  ApiError, ChainMismatchError, Client, MAX_TIMEOUT_MS, actionDigest, decodeKeyGrant, encodeKeyGrant, proposalDigest, seancePairsDigest, verifyKeyGrant, RELEASE_SIGNATURE_FORMAT, RequestTimeoutError, StaleProofError, TxFailedError, TxPendingError, Wallet, addressFromPublicKey, bareName, buildDistribution, convictionWeight, distributionLeaf, distributionNode,
   keyHash, keyId, leafHash, maxTip, minFee, paramsOf, proposal, proposalSummary, releaseMessage, sharesFor, signingBytes, stakeSummary, valueHash, verifyDistributionProof, verifyReleaseSignature, type Action,
   type Tx,
 } from "../src/index.js";
@@ -85,6 +85,7 @@ const client = new Client(RPC);
 const me = Wallet.fromSeed("07".repeat(32), client);
 // Shapes as node/src/api.rs serves them.
 node.routes["/params"] = { params: { proposal_deposit: "1000000000000", max_validators: "31" }, genesis: { block_time_ms: 1000, epoch_blocks: 3600 }, issuance: { year: 0 } };
+node.routes["/proposal/2"] = { id: 2, kind: { type: "treasury_spend", to: BOB, amount: "5" }, title: "Pay Bob", url: "", summary: "pay 5 drops to bob.boo" };
 node.routes[`/staking/${me.address}`] = { account: { address: me.address, name: null }, bonded: "5000000000", unbonding: "0", withdrawable: "0", delegations: [{ validator: { address: VALIDATOR, name: "vlad.boo" }, shares: "4000", value: "5000000000", principal: "5000000000", self_bond: false }], entries: [], validators: [], summary: "has 5 FANG staked with 1 validator" };
 
 /** Runs a helper and returns the one tx it submitted, after checking what every tx must satisfy. */
@@ -121,12 +122,13 @@ const cases: [string, () => Promise<unknown>, Action][] = [
   ],
   ["propose a param change", () => me.propose(proposal.paramChange("max_validators", 40), { title: "More validators", deposit: "2000" }), { type: "propose", kind: { type: "param_change", key: "max_validators", value: "40" }, deposit: (2000n * FANG).toString(), title: "More validators", url: "" }],
   ["propose lifting a sybil flag (name resolved)", () => me.propose(proposal.unflagSybil("bob.boo", "mistaken identity"), { title: "Appeal", deposit: "1" }), { type: "propose", kind: { type: "unflag_sybil", account: BOB, reason: "mistaken identity" }, deposit: FANG.toString(), title: "Appeal", url: "" }],
-  ["vote", () => me.vote(1, true, "10", 6), { type: "vote", proposal_id: 1, aye: true, amount: (10n * FANG).toString(), conviction: 6 }],
-  ["vote without conviction", () => me.vote(2, false, 1n, 0), { type: "vote", proposal_id: 2, aye: false, amount: "1", conviction: 0 }],
+  // gap-7-6: a vote binds the proposal it was shown (given, or read from the node).
+  ["vote", () => me.vote(1, true, "10", 6, { proposal: { kind: { type: "text" }, title: "Plant garlic", url: "https://forum.example/p/1" } }), { type: "vote", proposal_id: 1, aye: true, amount: (10n * FANG).toString(), conviction: 6, proposal_digest: proposalDigest({ type: "text" }, "Plant garlic", "https://forum.example/p/1") }],
+  ["vote without conviction (proposal read from the node)", () => me.vote(2, false, 1n, 0), { type: "vote", proposal_id: 2, aye: false, amount: "1", conviction: 0, proposal_digest: proposalDigest({ type: "treasury_spend", to: BOB, amount: "5" }, "Pay Bob", "") }],
   ["unlock", () => me.unlock(), { type: "unlock" }],
   ["multisig create", () => me.multisigCreate(["AB".repeat(32), "cd".repeat(32)], 2), { type: "multisig_create", owners: ["ab".repeat(32), "cd".repeat(32)], threshold: 2 }],
   ["multisig propose", () => me.multisigPropose({ type: "transfer", to: BOB, amount: "5" }), { type: "multisig_propose", action: { type: "transfer", to: BOB, amount: "5" } }],
-  ["multisig approve", () => me.multisigApprove(3), { type: "multisig_approve", id: 3 }],
+  ["multisig approve (the action shown)", () => me.multisigApprove(3, { action: { type: "transfer", to: BOB, amount: "5" } }), { type: "multisig_approve", id: 3, action_digest: actionDigest({ type: "transfer", to: BOB, amount: "5" }) }],
   ["renew a name", () => me.renewName("Vlad.boo", 2), { type: "renew_name", name: "vlad", years: 2 }],
   ["transfer a name", () => me.transferName("vlad", "bob.boo"), { type: "transfer_name", name: "vlad", to: BOB }],
   ["accept a name", () => me.acceptName("Vlad.boo"), { type: "transfer_name", name: "vlad", to: me.account }],
@@ -152,7 +154,7 @@ const refused: [string, () => Promise<unknown>, RegExp][] = [
   ["bad name", () => me.releaseName("-x-"), /names/],
   ["duplicate owners", () => me.multisigCreate(["ab".repeat(32), "AB".repeat(32)], 1), /distinct/],
   ["threshold above owners", () => me.multisigCreate(["ab".repeat(32)], 2), /threshold must be 1–1/],
-  ["nested multisig", () => me.multisigPropose({ type: "multisig_approve", id: 1 }), /can't hold another/],
+  ["nested multisig", () => me.multisigPropose({ type: "multisig_approve", id: 1, action_digest: "00".repeat(32) }), /can't hold another/],
   ["bad commitment", () => me.beaconCommit(1, "ab"), /32 bytes of hex/],
   ["bad evidence", () => me.reportEquivocation("0A"), /lowercase hex/],
   ["bad commission", () => me.updateValidator({ commissionBps: 10_001 }), /0 to 10000/],
@@ -417,6 +419,22 @@ console.log("✓ session key and hunt expiries count from the height valid_until
   assert.equal((await owner.client.keyAccounts(device.keyId, { after: "boo1x", limit: 5 })).next, null);
 }
 console.log("✓ keys are added with their grant (consent to the account, on this chain), not by id; grant codes round-trip");
+
+// Audit gap-7-6: a sealed judgment binds the pairs (and PRs) the juror compared, read from the node.
+{
+  const juror = me.account;
+  node.routes["/seance/4"] = { id: 4, claims: [{ id: 7, repo: "a/b", pr: 70 }, { id: 9, repo: "c/d", pr: 90 }], jurors: [{ juror: { address: juror }, assigned_pairs: [[9, 7]] }] };
+  const before = node.posted.length;
+  await assert.rejects(me.sealVotes(4, "ab"), /1 assigned pairs/);
+  const sealed = await me.sealVotes(4, "a", [], "salt");
+  assert.equal(node.posted.length, before + 1);
+  const a = node.posted.at(-1)!.action as { type: string; pairs_digest: string };
+  assert.equal(a.pairs_digest, seancePairsDigest(4, juror, [[{ id: 9, repo: "c/d", pr: 90 }, { id: 7, repo: "a/b", pr: 70 }]]));
+  assert.notEqual(a.pairs_digest, seancePairsDigest(4, juror, [[{ id: 7, repo: "a/b", pr: 70 }, { id: 9, repo: "c/d", pr: 90 }]]), "order matters: 'a' is the first claim");
+  assert.equal(sealed.salt, "salt");
+  await assert.rejects(me.multisigApprove(5), (e: unknown) => e instanceof ApiError || /no open multisig action/.test(String(e)));
+}
+console.log("✓ votes, multisig approvals and sealed judgments bind what they were shown");
 
 // Audit gap-7-5: the default deposit is the node's word: bounded, and the witnesses must agree.
 const greedy = host("http://greedy.node");

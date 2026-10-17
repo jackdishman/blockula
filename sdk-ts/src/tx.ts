@@ -56,8 +56,11 @@ export type Action =
   | { type: "reject_claim"; claim_id: number; reason: string }
   | { type: "join_jury"; bond: string }
   | { type: "leave_jury" }
-  /** A juror's sealed judgment: `seanceCommitment(...)`. */
-  | { type: "commit_votes"; seance_id: number; commitment: string }
+  /**
+   * A juror's sealed judgment: `seanceCommitment(...)`, and `seancePairsDigest(...)` of the pairs
+   * (and their claims' PRs) the juror compared: other pairs on chain refuse it (audit gap-7-6).
+   */
+  | { type: "commit_votes"; seance_id: number; commitment: string; pairs_digest: string }
   /** One of "a", "b", "=" per assigned pair, claim ids flagged as spam, and the salt. */
   | { type: "reveal_votes"; seance_id: number; votes: string; spam: number[]; salt: string }
   | { type: "fund_pool"; amount: string }
@@ -81,14 +84,16 @@ export type Action =
   /** Put `kind` to a vote, bonding `deposit` drops; `url` (https) links the full text. */
   | { type: "propose"; kind: ProposalKind; deposit: string; title: string; url?: string }
   /** Lock `amount` drops for `conviction` (0–6) lock periods: weight 0.1× with no lock, then 1×–6× for 1, 2, 4, 8, 16, 32 periods. */
-  | { type: "vote"; proposal_id: number; aye: boolean; amount: string; conviction: number }
+  /** `proposal_digest`: `proposalDigest(kind, title, url)` of the proposal the voter was shown; a vote on other content is refused (audit gap-7-6). */
+  | { type: "vote"; proposal_id: number; aye: boolean; amount: string; conviction: number; proposal_digest: string }
   /** Release expired vote locks. */
   | { type: "unlock" }
   /** Make this account an M-of-N multisig of its owner keys (key ids). */
   | { type: "multisig_create"; owners: string[]; threshold: number }
   /** Propose an action for a multisig account (never another multisig proposal or approval). */
   | { type: "multisig_propose"; action: Action }
-  | { type: "multisig_approve"; id: number }
+  /** `action_digest`: `actionDigest(action)` of the action the approver was shown; approving anything else is refused (audit gap-7-6). */
+  | { type: "multisig_approve"; id: number; action_digest: string }
   | { type: "renew_name"; name: string; years: number }
   | { type: "transfer_name"; name: string; to: string }
   | { type: "release_name"; name: string }
@@ -382,7 +387,7 @@ function encodeAction(w: Writer, a: Action) {
       w.u8(24);
       break;
     case "commit_votes":
-      w.u8(25); w.u64(a.seance_id); w.str(a.commitment);
+      w.u8(25); w.u64(a.seance_id); w.str(a.commitment); w.str(a.pairs_digest);
       break;
     case "reveal_votes":
       w.u8(26); w.u64(a.seance_id); w.str(a.votes); w.ids(a.spam); w.str(a.salt);
@@ -427,7 +432,7 @@ function encodeAction(w: Writer, a: Action) {
       w.u8(39); encodeProposalKind(w, a.kind); w.u64(a.deposit); w.str(a.title); w.str(orDefault(a.url, ""));
       break;
     case "vote":
-      w.u8(40); w.u64(a.proposal_id); w.bool(a.aye, "aye"); w.u64(a.amount); w.u8(a.conviction, "conviction");
+      w.u8(40); w.u64(a.proposal_id); w.bool(a.aye, "aye"); w.u64(a.amount); w.u8(a.conviction, "conviction"); w.str(a.proposal_digest);
       break;
     case "unlock":
       w.u8(41);
@@ -440,7 +445,7 @@ function encodeAction(w: Writer, a: Action) {
       w.u8(43); encodeAction(w, a.action);
       break;
     case "multisig_approve":
-      w.u8(44); w.u64(a.id);
+      w.u8(44); w.u64(a.id); w.str(a.action_digest);
       break;
     case "renew_name":
       w.u8(45); w.str(a.name); w.u8(a.years, "years");
@@ -617,6 +622,45 @@ export function parseSoul(soul: string | number): number {
   if (!/^\d+(\.\d{1,3})?$/.test(s)) throw new Error(`invalid Soul amount: ${s}`);
   const [whole, frac = ""] = s.split(".");
   return Number(whole) * 1000 + Number(frac.padEnd(3, "0"));
+}
+
+/**
+ * What a `multisig_approve` binds (node/src/types.rs `action_digest`): BLAKE3 (derive-key mode,
+ * context "blockula multisig action v1") of the action's encoding, as inside the signing bytes.
+ * Compute it from the action you show the approver (`client.multisig(account)` `pending[].action`).
+ */
+export function actionDigest(action: Action): string {
+  const w = new Writer();
+  encodeAction(w, action);
+  return bytesToHex(blake3(w.done(), { context: utf8.encode("blockula multisig action v1") }));
+}
+
+/**
+ * What a `vote` binds (node/src/types.rs `proposal_digest`): the proposal's kind (accounts as
+ * stored, resolved), title and link. Compute it from the proposal you show the voter.
+ */
+export function proposalDigest(kind: ProposalKind, title: string, url = ""): string {
+  const w = new Writer();
+  encodeProposalKind(w, kind);
+  w.str(title);
+  w.str(url);
+  return bytesToHex(blake3(w.done(), { context: utf8.encode("blockula proposal v1") }));
+}
+
+/** One claim of a Séance pair, as the juror judged it. */
+export interface SeanceClaimRef { id: number; repo: string; pr: number }
+
+/**
+ * What a `commit_votes` binds (node/src/types.rs `seance_pairs_digest`): the Séance, the juror and,
+ * per assigned pair in order, both claims' ids, repos and PR numbers.
+ */
+export function seancePairsDigest(seanceId: number, juror: string, pairs: [SeanceClaimRef, SeanceClaimRef][]): string {
+  const w = new Writer();
+  w.u64(seanceId, "seance_id");
+  w.str(juror);
+  w.u16(pairs.length);
+  for (const pair of pairs) for (const c of pair) { w.u64(c.id, "claim id"); w.str(c.repo); w.u64(c.pr, "pr"); }
+  return bytesToHex(blake3(w.done(), { context: utf8.encode("blockula seance pairs v1") }));
 }
 
 /** FIPS 204 context string for a key's proof of possession in `add_key` (node/src/types.rs `KEY_POP_CONTEXT`). */

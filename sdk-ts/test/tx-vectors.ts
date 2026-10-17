@@ -7,12 +7,27 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { bytesToHex } from "@noble/hashes/utils.js";
-import { Wallet, beaconCommitment, seanceCommitment, signingBytes, txBytes, u64Field, type Action, type KeyRole, type UnsignedTx } from "../src/index.js";
+import { Wallet, actionDigest, beaconCommitment, keyPopMessage, proposalDigest, seanceCommitment, seancePairsDigest, signingBytes, txBytes, u64Field, type Action, type KeyRole, type ProposalKind, type SeanceClaimRef, type UnsignedTx } from "../src/index.js";
 
 const V = JSON.parse(readFileSync(new URL("./tx-vectors.json", import.meta.url), "utf8")) as { cases: { label: string; tx: UnsignedTx; signing_bytes: string }[] };
 for (const c of V.cases) assert.equal(bytesToHex(signingBytes(c.tx)), c.signing_bytes, c.label);
 for (let tag = 0; tag <= 54; tag++) assert.ok(V.cases.some((c) => c.label.endsWith(`(tag ${tag})`)), `tag ${tag} has a vector`);
 console.log(`✓ ${V.cases.length} tx encodings match the node byte for byte (every action tag, integers at their bounds, non-ASCII strings)`);
+
+// What approvals, votes and sealed judgments bind (audit gap-7-6), and a key's consent (gap-7-2).
+const D = V as unknown as {
+  action_digests: { action: Action; digest: string }[];
+  proposal_digests: { kind: ProposalKind; title: string; url: string; digest: string }[];
+  seance_pairs_digest: { seance_id: number; juror: string; pairs: [SeanceClaimRef, SeanceClaimRef][]; digest: string };
+  key_pop_message: { chain_id: string; genesis_hash: string; account: string; key_id: string; message: string };
+};
+for (const c of D.action_digests) assert.equal(actionDigest(c.action), c.digest, `action digest of ${c.action.type}`);
+for (const c of D.proposal_digests) assert.equal(proposalDigest(c.kind, c.title, c.url), c.digest, `proposal digest of ${c.kind.type}`);
+const sp = D.seance_pairs_digest;
+assert.equal(seancePairsDigest(sp.seance_id, sp.juror, sp.pairs), sp.digest, "Séance pairs digest");
+const kp = D.key_pop_message;
+assert.equal(bytesToHex(keyPopMessage(kp.chain_id, kp.genesis_hash, kp.account, kp.key_id)), kp.message, "key consent message");
+console.log(`✓ ${D.action_digests.length + D.proposal_digests.length + 1} approval, vote and judgment digests and the key consent message match the node`);
 
 // ---- out-of-range integers are refused, never wrapped ----
 
@@ -52,9 +67,9 @@ const refused: [string, UnsignedTx, RegExp][] = [
   ["session period -1", act(session("1", { period_blocks: -1 })), /0 to/],
   ["session expiry 2^64", act(session("1", { expires_at: 2 ** 64 })), /0 to/],
   ["nonce 2^53 (not exact as a number)", tx({ nonce: 2 ** 53 }), /nonce must be 0 to 9007199254740991 as a number/],
-  ["conviction 256", act({ type: "vote", proposal_id: 1, aye: true, amount: "1", conviction: 256 }), /conviction must be 0 to 255/],
-  ["conviction -1", act({ type: "vote", proposal_id: 1, aye: true, amount: "1", conviction: -1 }), /conviction must be 0 to 255/],
-  ["aye not a bool", act({ type: "vote", proposal_id: 1, aye: "yes" as unknown as boolean, amount: "1", conviction: 1 }), /aye must be true or false/],
+  ["conviction 256", act({ type: "vote", proposal_id: 1, aye: true, amount: "1", conviction: 256, proposal_digest: "d1".repeat(32) }), /conviction must be 0 to 255/],
+  ["conviction -1", act({ type: "vote", proposal_id: 1, aye: true, amount: "1", conviction: -1, proposal_digest: "d1".repeat(32) }), /conviction must be 0 to 255/],
+  ["aye not a bool", act({ type: "vote", proposal_id: 1, aye: "yes" as unknown as boolean, amount: "1", conviction: 1, proposal_digest: "d1".repeat(32) }), /aye must be true or false/],
   ["years 256", act({ type: "renew_name", name: "vlad", years: 256 }), /years must be 0 to 255/],
   ["threshold 1.5", act({ type: "multisig_create", owners: [], threshold: 1.5 }), /threshold must be a whole number/],
   ["upgrade version 2^32", act({ type: "propose", kind: { type: "schedule_upgrade", version: 2 ** 32, activation_height: 1 }, deposit: "1", title: "t" }), /version must be 0 to 4294967295/],

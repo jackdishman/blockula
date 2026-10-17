@@ -1,4 +1,44 @@
 {
+  "action_digests": [
+    {
+      "action": {
+        "amount": "5000000000",
+        "to": "bob.boo",
+        "type": "transfer"
+      },
+      "digest": "5be45404083fb0f532326c32d297ed23b79f67985b6430a1825d6235f531a35c"
+    },
+    {
+      "action": {
+        "deposit": "1",
+        "kind": {
+          "amount": "9",
+          "to": "boo1to",
+          "type": "treasury_spend"
+        },
+        "title": "Pay Bob",
+        "type": "propose",
+        "url": ""
+      },
+      "digest": "0e924f19d1f736031bf8c58de9fd4af12bdb99fa88b9205dac2cc3646a6a62ff"
+    },
+    {
+      "action": {
+        "key_id": "abababababababababababababababababababababababababababababababab",
+        "label": "Vlad’s phone 📱",
+        "pop": "0d",
+        "public_key": "0c",
+        "role": {
+          "expires_at": 9007199254740991,
+          "limit": "18446744073709551615",
+          "period_blocks": 1,
+          "type": "session"
+        },
+        "type": "add_key"
+      },
+      "digest": "1c18853760dd3af9d70cbcb8772d8af51e3445a5da62f44222b3ad57233f0e47"
+    }
+  ],
   "cases": [
     {
       "label": "transfer (tag 0)",
@@ -2201,5 +2241,74 @@
       }
     }
   ],
-  "description": "Signing bytes of txs from their JSON (node/src/types.rs `tx_vectors`), for sdk-ts/src/tx.ts `signingBytes`. Regenerate: cargo test --manifest-path node/Cargo.toml types::tests::write_tx_vectors -- --ignored"
+  "description": "Signing bytes of txs from their JSON (node/src/types.rs `tx_vectors`), for sdk-ts/src/tx.ts `signingBytes`. Regenerate: cargo test --manifest-path node/Cargo.toml types::tests::write_tx_vectors -- --ignored",
+  "key_pop_message": {
+    "account": "boo1from",
+    "chain_id": "vec-🧛",
+    "genesis_hash": "0303030303030303030303030303030303030303030303030303030303030303",
+    "key_id": "abababababababababababababababababababababababababababababababab",
+    "message": "424c4f434b554c415f4b45595f504f505f563108007665632df09fa79b4000303330333033303330333033303330333033303330333033303330333033303330333033303330333033303330333033303330333033303330333033303330330800626f6f3166726f6d400061626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162"
+  },
+  "proposal_digests": [
+    {
+      "digest": "fdd98b52c7acd712c3b420326e8ba4f5b169c87b8cecd4d29258dd544358fe3f",
+      "kind": {
+        "type": "text"
+      },
+      "title": "Plant garlic 🧄",
+      "url": "https://forum.example/p/1"
+    },
+    {
+      "digest": "88330ba6a9be8a3801dfe2e82ea91d47eefaaa3790d87601974f2d7890f59022",
+      "kind": {
+        "key": "max_validators",
+        "type": "param_change",
+        "value": "18446744073709551615"
+      },
+      "title": "More validators",
+      "url": ""
+    },
+    {
+      "digest": "540657b3c110ff2062982575c86ad89de96d04769638cca1ec5fcdf05e4ab02a",
+      "kind": {
+        "amount": 1500,
+        "reason": "r",
+        "to": "boo1to",
+        "type": "grant_soul"
+      },
+      "title": "",
+      "url": ""
+    }
+  ],
+  "seance_pairs_digest": {
+    "digest": "16042cefb6fa7f39d132faeee09fcfd6149c030503385a78c7e51f565d876fef",
+    "juror": "boo1juror",
+    "pairs": [
+      [
+        {
+          "id": 9,
+          "pr": 90,
+          "repo": "c/d"
+        },
+        {
+          "id": 7,
+          "pr": 70,
+          "repo": "a/b"
+        }
+      ],
+      [
+        {
+          "id": 9007199254740991,
+          "pr": 9007199254740991,
+          "repo": "x/ÿ"
+        },
+        {
+          "id": 0,
+          "pr": 0,
+          "repo": ""
+        }
+      ]
+    ],
+    "seance_id": 4
+  }
 }

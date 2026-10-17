@@ -63,7 +63,9 @@ test("lists proposals and votes with conviction", async ({ page, node }) => {
   await open.getByRole("button", { name: "Vote aye with 10 FANG (weight 20 FANG)" }).click();
   await expect(page.getByRole("status")).toContainText("voted aye on proposal #7 with 10 FANG");
   const tx = node.submitted.at(-1) as Tx;
-  expect(tx.action).toEqual({ type: "vote", proposal_id: 7, aye: true, amount: parseFang("10").toString(), conviction: 2 });
+  expect(tx.action).toMatchObject({ type: "vote", proposal_id: 7, aye: true, amount: parseFang("10").toString(), conviction: 2 });
+  // Bound to the proposal as shown (gap-7-6); the mock node checks it as nodes do.
+  expect(tx.action.type === "vote" && tx.action.proposal_digest).toMatch(/^[0-9a-f]{64}$/);
   await expect(open).toContainText("320 FANG aye");
 
   // Changing the vote replaces it.

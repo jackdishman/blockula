@@ -2,7 +2,7 @@
 // wallet's flows (status, accounts, keys, names, faucet, tx submit/lookup). Submitted txs are
 // checked like the real node does it: ML-DSA signature over the SDK's signing bytes, the signing
 // key authorized on `from` (owner keys for key changes), nonce and balance.
-import { formatFang, keyId as keyIdOf, parseFang, signingBytes, verifyKeyGrant, type Tx } from "@blockula/sdk";
+import { formatFang, keyId as keyIdOf, parseFang, proposalDigest, signingBytes, verifyKeyGrant, type ProposalKind, type Tx } from "@blockula/sdk";
 import { hexToBytes } from "@noble/hashes/utils.js";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import type { BrowserContext, Page, Route } from "@playwright/test";
@@ -255,6 +255,8 @@ export class MockNode {
       if (!this.governance) throw new HttpError(400, "not active yet");
       const p = this.proposals.find((x) => x.id === act.proposal_id);
       if (!p) throw new HttpError(400, `no proposal #${act.proposal_id}`);
+      // As node/src/governance.rs `vote`: the vote binds the proposal's content (gap-7-6).
+      if (act.proposal_digest !== proposalDigest(p.kind as ProposalKind, String(p.title ?? ""), String(p.url ?? ""))) throw new HttpError(400, `proposal #${act.proposal_id} isn't the proposal this vote was signed for`);
       this.votes = this.votes.filter((v) => !(v.proposal_id === act.proposal_id && v.voter === tx.from));
       this.votes.push({ proposal_id: act.proposal_id, voter: tx.from, aye: act.aye, amount: BigInt(act.amount), conviction: act.conviction });
       summary = `${this.label(tx.from).short} voted ${act.aye ? "aye" : "nay"} on proposal #${act.proposal_id} with ${formatFang(BigInt(act.amount))}`;

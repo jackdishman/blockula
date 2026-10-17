@@ -2,7 +2,7 @@ import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex, hexToBytes, randomBytes, utf8ToBytes } from "@noble/hashes/utils.js";
 import { base64urlnopad, bech32m } from "@scure/base";
-import { DEFAULT_TIP_CAP_MULTIPLE, KEY_POP_CONTEXT, PUBLIC_KEY_LEN, SIGNATURE_LEN, baseFee, formatFang, keyPopMessage, maxTip, parseFang, parseSoul, seanceCommitment, signingBytes, type Action, type BaseFee, type KeyRole, type ProposalKind, type Tx, type UnsignedTx } from "./tx.js";
+import { DEFAULT_TIP_CAP_MULTIPLE, KEY_POP_CONTEXT, PUBLIC_KEY_LEN, SIGNATURE_LEN, actionDigest, baseFee, formatFang, keyPopMessage, maxTip, parseFang, parseSoul, proposalDigest, seanceCommitment, seancePairsDigest, signingBytes, type SeanceClaimRef, type Action, type BaseFee, type KeyRole, type ProposalKind, type Tx, type UnsignedTx } from "./tx.js";
 import { NAMESPACES, checkProofResponse, decodeAccount, decodeName, type ProofResponse, type ProvenRecord } from "./proof.js";
 
 export * from "./tx.js";
@@ -677,11 +677,18 @@ export class Wallet {
   /**
    * Seal a Séance judgment: one of "a", "b" or "=" per assigned pair (see `client.seance(id)`),
    * plus claim ids you think are spam. Keep the returned `salt`: `revealVotes` needs it.
+   *
+   * The judgment binds the pairs it was made on (audit gap-7-6): pass `pairs`, the claims (id,
+   * repo, PR) you showed the juror in order, or they're read from the client (`seancePairs`). A
+   * node that showed other pairs or PRs makes the commitment fail instead of misdirecting it.
    */
-  async sealVotes(seanceId: number, votes: string, spam: number[] = [], salt: string = bytesToHex(randomBytes(16))) {
+  async sealVotes(seanceId: number, votes: string, spam: number[] = [], salt: string = bytesToHex(randomBytes(16)), opts: { pairs?: [SeanceClaimRef, SeanceClaimRef][] } = {}) {
     await this.client.addressPrefix(); // the commitment names this account
+    const pairs = opts.pairs ?? (await this.client.seancePairs(seanceId, this.account));
+    if (votes.length !== pairs.length) throw new Error(`you have ${pairs.length} assigned pairs: give one of a, b or = for each`);
     const commitment = seanceCommitment(seanceId, this.account, votes, spam, salt);
-    const tx = await this.client.submit(await this.build({ type: "commit_votes", seance_id: seanceId, commitment }));
+    const pairs_digest = seancePairsDigest(seanceId, this.account, pairs);
+    const tx = await this.client.submit(await this.build({ type: "commit_votes", seance_id: seanceId, commitment, pairs_digest }));
     return { tx, salt, votes, spam };
   }
 
@@ -829,10 +836,18 @@ export class Wallet {
    * periods after the vote ends, for 0.1×, 1×, 2× … 6× the weight (see `convictionWeight`).
    * Voting again replaces your vote. A validator's consensus key or owner voting before the
    * bootstrap council ends also casts that validator's council vote.
+   *
+   * The vote binds the proposal's content (audit gap-7-6): pass `proposal`, the kind, title and
+   * link you showed the voter (e.g. the `client.proposal(id)` object you rendered), or it's read
+   * from the client. A node that showed another proposal's content makes the vote fail.
    */
-  async vote(proposalId: number, aye: boolean, amount: Amount, conviction = 1, opts: TxOptions = {}) {
+  async vote(proposalId: number, aye: boolean, amount: Amount, conviction = 1, opts: TxOptions & { proposal?: { kind: ProposalKind; title: string; url?: string } } = {}) {
     if (!Number.isInteger(conviction) || conviction < 0 || conviction > MAX_CONVICTION) throw new Error(`conviction must be 0–${MAX_CONVICTION}`);
-    return this.act({ type: "vote", proposal_id: wholeNumber(proposalId, "proposalId"), aye, amount: positive(parseFang(amount), "vote").toString(), conviction }, opts);
+    const id = wholeNumber(proposalId, "proposalId");
+    const drops = positive(parseFang(amount), "vote").toString();
+    const p = opts.proposal ?? (await this.client.proposal(id));
+    const proposal_digest = proposalDigest(p.kind, p.title, p.url ?? "");
+    return this.act({ type: "vote", proposal_id: id, aye, amount: drops, conviction, proposal_digest }, opts);
   }
 
   /** Release every vote lock that has expired. */
@@ -859,8 +874,20 @@ export class Wallet {
     return this.act({ type: "multisig_propose", action }, opts);
   }
 
-  async multisigApprove(id: number, opts: TxOptions = {}) {
-    return this.act({ type: "multisig_approve", id: wholeNumber(id, "id") }, opts);
+  /**
+   * Approve open multisig proposal `id`. The approval binds the action (audit gap-7-6): pass
+   * `action`, the one you showed the approver (decode it, don't trust a summary), or it's read
+   * from `client.multisig(account)`. A node that showed another action makes the approval fail.
+   */
+  async multisigApprove(id: number, opts: TxOptions & { action?: Action } = {}) {
+    const n = wholeNumber(id, "id");
+    let action = opts.action;
+    if (!action) {
+      const m = await this.client.multisig(this.account);
+      action = (Array.isArray(m?.pending) ? m.pending : []).find((p: { id?: unknown }) => p.id === n)?.action as Action | undefined;
+      if (!action) throw new Error(`${this.account} has no open multisig action #${n}`);
+    }
+    return this.act({ type: "multisig_approve", id: n, action_digest: actionDigest(action) }, opts);
   }
 
   /** Extend a name you own by `years` (1–10), at the chain's renewal price per year. */
@@ -1197,6 +1224,19 @@ export class Client {
   claim(id: number) { return this.call(`/claim/${id}`); }
   /** A Séance, with each juror's assigned pairs (what they must judge). */
   seance(id: number) { return this.call(`/seance/${id}`); }
+  /** A juror's assigned pairs in Séance `id`, in order, with each claim's repo and PR (what `sealVotes` binds). */
+  async seancePairs(id: number, juror: string): Promise<[SeanceClaimRef, SeanceClaimRef][]> {
+    const s = await this.seance(id);
+    const seat = (Array.isArray(s?.jurors) ? s.jurors : []).find((j: { juror?: { address?: string } }) => j.juror?.address === juror);
+    if (!seat) throw new Error(`${juror} isn't on the jury of Séance #${id}`);
+    const claims: { id: number; repo: string; pr: number }[] = Array.isArray(s.claims) ? s.claims : [];
+    const ref = (cid: number): SeanceClaimRef => {
+      const c = claims.find((x) => x.id === cid);
+      if (!c) throw new Error(`Séance #${id} doesn't list claim #${cid}`);
+      return { id: cid, repo: c.repo, pr: c.pr };
+    };
+    return (Array.isArray(seat.assigned_pairs) ? seat.assigned_pairs : []).map(([a, b]: [number, number]) => [ref(a), ref(b)] as [SeanceClaimRef, SeanceClaimRef]);
+  }
   /** Soul leaderboard. */
   souls(limit = 50) { return this.call(`/souls?limit=${limit}`); }
 

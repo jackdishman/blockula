@@ -27,7 +27,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { ApiError, Client, RequestTimeoutError, TxFailedError, TxPendingError, Wallet, bareName, checkTimeoutMs, encodeKeyGrant, formatFang, paramsOf, parseFang, proposalSummary, sharesFor, stakeSummary, txId, type Action, type ProposalSummary, type Resolution } from "@blockula/sdk";
+import { ApiError, Client, RequestTimeoutError, TxFailedError, TxPendingError, Wallet, bareName, checkTimeoutMs, encodeKeyGrant, proposalDigest, formatFang, paramsOf, parseFang, proposalSummary, sharesFor, stakeSummary, txId, type Action, type ProposalSummary, type Resolution } from "@blockula/sdk";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -635,8 +635,15 @@ tool("vote", "Vote on a governance proposal for the account this agent acts for.
   const drops = parseFang(amount);
   if (drops <= 0n) throw new Error("vote with more than 0");
   // The amount is locked, not spent: it's held to BLOCKULA_MAX_SEND, and only the fee counts toward the daily limit.
-  const r = await submitCapped(await requireWallet(), { type: "vote", proposal_id, aye: vote === "aye", amount: drops.toString(), conviction }, { amount: 0n, perCall: drops, what: "the vote's amount" });
-  return isInFlight(r) ? r : { summary: clean(String(r.summary ?? "")), fee: r.fee_display, tx_id: r.id, explorer: explorer(`proposal/${proposal_id}`) };
+  const w = await requireWallet();
+  // The vote binds the proposal as read here (its kind, title and link, what list_proposals
+  // showed): a node that misreports it makes the vote fail, not land elsewhere (audit gap-7-6).
+  const p = await w.client.proposal(proposal_id);
+  if (!p?.kind || typeof p.kind !== "object") throw new Error(`the node doesn't report what proposal #${proposal_id} does, so the vote can't be bound to it`);
+  const proposal_digest = proposalDigest(p.kind, String(p.title ?? ""), typeof p.url === "string" ? p.url : "");
+  const voted_on = { untrusted_title: clean(String(p.title ?? ""), 200), kind: chainData(p.kind) };
+  const r = await submitCapped(w, { type: "vote", proposal_id, aye: vote === "aye", amount: drops.toString(), conviction, proposal_digest }, { amount: 0n, perCall: drops, what: "the vote's amount" });
+  return isInFlight(r) ? { ...r, voted_on } : { summary: clean(String(r.summary ?? "")), fee: r.fee_display, tx_id: r.id, voted_on, explorer: explorer(`proposal/${proposal_id}`) };
 });
 
 // ---- Hunts and the contribution pool ----

@@ -24,7 +24,7 @@ import { join } from "node:path";
 import { Client as McpClient } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
-import { addressFromPublicKey, decodeKeyGrant, parseFang, txId, verifyKeyGrant, type Tx } from "@blockula/sdk";
+import { addressFromPublicKey, decodeKeyGrant, parseFang, proposalDigest, txId, verifyKeyGrant, type Tx } from "@blockula/sdk";
 import { SpendLedger } from "../src/spend.js";
 import { chainData, clean } from "../src/untrusted.js";
 
@@ -146,6 +146,7 @@ const fake: Server = createServer((req, res) => {
     // Like node/src/api.rs: any address answers; without an account, with a zero balance and nonce
     // and the address's own key (`keys_of` lists it for every address).
     if (path.startsWith("/account/")) return reply(200, { account: { address: path.slice(9), name: null }, balance: "0", nonce: 0, next_nonce: nextNonce(path.slice(9)), keys: [{ key_id: "ee".repeat(32), label: "original key", role: { type: "owner" }, added_at: 0, spent_this_period: "0", window_start: 0 }], recent_txs: [] });
+    if (path === "/proposal/1") return reply(200, { id: 1, kind: { type: "text" }, title: "Plant garlic", url: "https://forum.example/p/1", status: "voting" });
     if (path === "/fees") return reply(200, { height: 10, suggested: { flat: "10000", rate: "10000" }, account_creation_fee: "100000000" });
     if (path === "/params") return reply(200, { params: mode.prices.params ? { name_price_3: "100000000000", name_price_4: "25000000000", name_price_5: "5000000000", name_renewal_bps: "2000" } : {} });
     if (path === "/name/bob.boo" || path === "/name/bob") return reply(200, { name: "bob.boo", status: "active", available: false, owner: { address: BOB, name: "bob.boo" }, ...mode.prices });
@@ -258,6 +259,11 @@ assert.ok(r.error && /per-call limit \(BLOCKULA_MAX_SEND=1 FANG\)/.test(r.text),
 r = await s.call("vote", { proposal_id: 1, vote: "aye", amount: "2" });
 assert.ok(r.error && /the vote's amount \(2 FANG\) exceeds/.test(r.text), r.text);
 assert.equal(posted.length, before);
+// gap-7-6: a vote binds the proposal it read (kind, title, link).
+r = await s.call("vote", { proposal_id: 1, vote: "aye", amount: "0.5" });
+assert.ok(!r.error, r.text);
+assert.equal((posted.at(-1)!.action as { proposal_digest?: string }).proposal_digest, proposalDigest({ type: "text" }, "Plant garlic", "https://forum.example/p/1"));
+assert.equal(r.json().voted_on.untrusted_title, "Plant garlic");
 await s.close();
 // F68/F72 (round 2): a node that answers 400 but keeps and relays each tx. Before, every refusal
 // gave its reservation back: five sends went out against a 1 FANG day and the ledger read 0.

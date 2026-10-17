@@ -43,7 +43,7 @@ const vectorActions: Action[] = [
   { type: "reject_claim", claim_id: 4, reason: "r" },
   { type: "join_jury", bond: (10n * 1_000_000_000n).toString() },
   { type: "leave_jury" },
-  { type: "commit_votes", seance_id: 2, commitment: "ef".repeat(32) },
+  { type: "commit_votes", seance_id: 2, commitment: "ef".repeat(32), pairs_digest: "e0".repeat(32) },
   { type: "reveal_votes", seance_id: 2, votes: "ab=", spam: [5, 6], salt: "s" },
   { type: "fund_pool", amount: "5" },
   { type: "withdraw_vested" },
@@ -81,12 +81,12 @@ const v1VectorActions: Action[] = [
   propose({ type: "activate_feature", feature: "ghost" }),
   propose({ type: "deactivate_feature", feature: "ghost" }),
   propose({ type: "text" }),
-  { type: "vote", proposal_id: 1, aye: true, amount: "10", conviction: 6 },
-  { type: "vote", proposal_id: 1, aye: false, amount: "10", conviction: 0 },
+  { type: "vote", proposal_id: 1, aye: true, amount: "10", conviction: 6, proposal_digest: "d1".repeat(32) },
+  { type: "vote", proposal_id: 1, aye: false, amount: "10", conviction: 0, proposal_digest: "d1".repeat(32) },
   { type: "unlock" },
   { type: "multisig_create", owners: ["ab".repeat(32), "cd".repeat(32)], threshold: 2 },
   { type: "multisig_propose", action: { type: "transfer", to: "x.boo", amount: "5" } },
-  { type: "multisig_approve", id: 3 },
+  { type: "multisig_approve", id: 3, action_digest: "a3".repeat(32) },
   { type: "renew_name", name: "vlad", years: 2 },
   { type: "transfer_name", name: "vlad", to: "x.boo" },
   { type: "release_name", name: "vlad" },
@@ -296,7 +296,8 @@ await assert.rejects(alice.vouch(bob.address), /at least 10 Soul/);
 await assert.rejects(alice.unvouch(bob.address), /has no vouch/);
 await assert.rejects(alice.submitClaim("jackdishman/blockula", 1), /Soul or a vouch|isn't in the contribution pool/);
 await assert.rejects(alice.leaveJury(), /not in the jury pool/);
-await assert.rejects(alice.sealVotes(999_999, "ab"), /no Séance/);
+const ghostPairs = [[{ id: 1, repo: "a/b", pr: 1 }, { id: 2, repo: "a/b", pr: 2 }], [{ id: 2, repo: "a/b", pr: 2 }, { id: 1, repo: "a/b", pr: 1 }]] as [{ id: number; repo: string; pr: number }, { id: number; repo: string; pr: number }][];
+await assert.rejects(alice.sealVotes(999_999, "ab", [], undefined, { pairs: ghostPairs }), /no Séance/);
 await assert.rejects(alice.revealVotes(999_999, "ab", [3], "salt"), /no Séance/);
 await assert.rejects(alice.withdrawVested(), /nothing has vested/);
 await assert.rejects(alice.client.submit(await alice.build({ type: "attest_claim", claim_id: 0, ok: true, merge_sha: "ab".repeat(20), note: "" })), /only active validators/);
@@ -477,7 +478,7 @@ if (proposalId !== undefined && councilSeed && validators.active.length === 1 &&
 
 // Refused for their own reasons, not the encoding.
 const governance: [Action, RegExp][] = [
-  [{ type: "vote", proposal_id: 1_000_000, aye: true, amount: "1", conviction: 1 }, /no proposal #1000000/],
+  [{ type: "vote", proposal_id: 1_000_000, aye: true, amount: "1", conviction: 1, proposal_digest: "00".repeat(32) }, /no proposal #1000000/],
   [{ type: "multisig_propose", action: { type: "transfer", to: bob.address, amount: "1" } }, /isn't a multisig account/],
   [{ type: "claim_distribution", distribution_id: 1_000_000, amount: "1", proof: ["cd".repeat(32)] }, /no distribution #1000000/],
   // `cancel_upgrade` (F50): the node decodes the SDK's encoding and refuses what isn't scheduled.
@@ -509,7 +510,7 @@ async function verifiedByNode(label: string, run: () => Promise<unknown>) {
 const helpers: [string, () => Promise<unknown>][] = [
   ["redelegate", () => alice.redelegate(validator, bob.address, 1n)],
   ["updateValidator", () => alice.updateValidator({ commissionBps: 500 })],
-  ["multisigApprove", () => alice.multisigApprove(0)],
+  ["multisigApprove", () => alice.multisigApprove(0, { action: { type: "unlock" } })],
   ["beaconCommit", () => alice.beaconCommit(1, "ab".repeat(32))],
   ["claimDistribution", () => alice.claimDistribution(0, "1", ["cd".repeat(32)])],
 ];

@@ -2358,9 +2358,31 @@ pub(crate) mod tests {
                 serde_json::json!({ "label": label, "tx": json, "signing_bytes": hex::encode(tx.signing_bytes()) })
             })
             .collect();
+        // What approvals, votes and sealed judgments bind (audit gap-7-6), and a key's consent
+        // message (gap-7-2): the SDK's `actionDigest`, `proposalDigest`, `seancePairsDigest` and
+        // `keyPopMessage` must compute the same.
+        let digests = [
+            Action::Transfer { to: "bob.boo".into(), amount: 5_000_000_000 },
+            Action::Propose { kind: ProposalKind::TreasurySpend { to: "boo1to".into(), amount: 9 }, deposit: 1, title: "Pay Bob".into(), url: String::new() },
+            Action::AddKey { key_id: "ab".repeat(32), label: "Vlad’s phone 📱".into(), role: KeyRole::Session { limit: u64::MAX, period_blocks: 1, expires_at: JS_MAX }, public_key: "0c".into(), pop: "0d".into() },
+        ]
+        .into_iter()
+        .map(|a| serde_json::json!({ "action": a, "digest": action_digest(&a) }))
+        .collect::<Vec<_>>();
+        let proposals = [(ProposalKind::Text {}, "Plant garlic 🧄", "https://forum.example/p/1"), (ProposalKind::ParamChange { key: "max_validators".into(), value: u64::MAX }, "More validators", ""), (ProposalKind::GrantSoul { to: "boo1to".into(), amount: 1500, reason: "r".into() }, "", "")]
+            .into_iter()
+            .map(|(kind, title, url)| serde_json::json!({ "kind": kind, "title": title, "url": url, "digest": proposal_digest(&kind, title, url) }))
+            .collect::<Vec<_>>();
+        let pairs: [[(u64, &str, u64); 2]; 2] = [[(9, "c/d", 90), (7, "a/b", 70)], [(JS_MAX, "x/ÿ", JS_MAX), (0, "", 0)]];
+        let seance = serde_json::json!({ "seance_id": 4, "juror": "boo1juror", "pairs": pairs.iter().map(|p| p.iter().map(|(id, repo, pr)| serde_json::json!({ "id": id, "repo": repo, "pr": pr })).collect::<Vec<_>>()).collect::<Vec<_>>(), "digest": seance_pairs_digest(4, "boo1juror", &pairs) });
+        let key_pop = serde_json::json!({ "chain_id": "vec-🧛", "genesis_hash": "03".repeat(32), "account": "boo1from", "key_id": "ab".repeat(32), "message": hex::encode(key_pop_message("vec-🧛", &"03".repeat(32), "boo1from", &"ab".repeat(32))) });
         serde_json::json!({
             "description": "Signing bytes of txs from their JSON (node/src/types.rs `tx_vectors`), for sdk-ts/src/tx.ts `signingBytes`. Regenerate: cargo test --manifest-path node/Cargo.toml types::tests::write_tx_vectors -- --ignored",
             "cases": cases,
+            "action_digests": digests,
+            "proposal_digests": proposals,
+            "seance_pairs_digest": seance,
+            "key_pop_message": key_pop,
         })
     }
 
