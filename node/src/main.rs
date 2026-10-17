@@ -64,7 +64,8 @@ struct Net {
     #[arg(long)]
     client_ip_header: Option<String>,
     /// Proxies that append to --client-ip-header (`x-forwarded-for`): the client is this many
-    /// entries from the right (entries further left are the client's own say)
+    /// entries from the right, counted over every line of the header in order (entries further
+    /// left are the client's own say)
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..=16))]
     client_ip_hops: u64,
     /// HTTP peer to sync from and forward txs/faucet requests to (repeatable). Replaces the

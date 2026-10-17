@@ -241,10 +241,10 @@ struct PageNext {
 /// first such change on, and verifies only signatures it lacks, without the chain lock.
 async fn exchange_epochs(chain: Shared, peers: Vec<String>) {
     let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
-    let (live, chain_id) = {
+    let (live, instance) = {
         let mut c = chain.lock();
         c.sign_handoffs();
-        (c.live.clone(), c.genesis.chain_id.clone())
+        (c.live.clone(), c.instance())
     };
     loop {
         for peer in &peers {
@@ -265,7 +265,7 @@ async fn exchange_epochs(chain: Shared, peers: Vec<String>) {
                         break;
                     }
                 };
-                wanted = ours.candidates(&chain_id, &page, HANDOFF_VERIFIES_PER_ROUND);
+                wanted = ours.candidates(&instance, &page, HANDOFF_VERIFIES_PER_ROUND);
                 if !wanted.is_empty() {
                     break;
                 }
@@ -615,7 +615,19 @@ async fn maybe_fast_sync(chain: &Shared, peers: &[String], full: bool, trust: &T
     }
     for wait in 0.. {
         match crate::snapshot::fast_sync(chain, peers, trust).await {
-            Ok(h) => return println!("⚡ fast-synced to #{h} from a certified snapshot; history before it isn't stored on this node"),
+            Ok(h) => {
+                println!("⚡ fast-synced to #{h} from a certified snapshot; history before it isn't stored on this node");
+                // The snapshot's parameters may put the period below what this node assumed
+                // (governance shortened it): then the root it trusted was older than is safe, and
+                // the snapshot is only as good as the peers that served it (gap-6-1). A forged
+                // state could hide such a change, so this only catches the honest case.
+                let mut live = trust.clone();
+                let shorter = live.follow(&chain.lock().state.chain_params);
+                if let Some(why) = live.stale(0, crate::chain::now_ms()).filter(|_| shorter) {
+                    eprintln!("⚠️  under the chain's parameters in force: {why}; if in doubt, wipe this home and join again with that checkpoint");
+                }
+                return;
+            }
             // A checkpoint newer than every peer's snapshot: one is taken every 100 blocks.
             Err(e) if wait < SNAPSHOT_WAITS && e.chain().any(|c| c.is::<crate::snapshot::SnapshotBehind>()) => {
                 println!("⏳ {e:#}; waiting for a newer snapshot");
@@ -732,8 +744,11 @@ pub fn dev_is_stale(home: &Path) -> bool {
 
 pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
     let mut chain = Chain::open(&home)?;
-    // Validators take their genesis from the signed release; a known chain's must match it.
-    let trust = Arc::new(Trust::new(&chain.genesis, &Pins::default(), false)?);
+    // Validators take their genesis from the signed release; a known chain's must match it. The
+    // weak-subjectivity period is the one the parameters in force set, if governance shortened it.
+    let mut trust = Trust::new(&chain.genesis, &Pins::default(), false)?;
+    trust.follow(&chain.state.chain_params);
+    let trust = Arc::new(trust);
     let keep = net.pruning.keep(true, &chain.state);
     chain.set_pruning(keep);
     crate::upgrade::configure(&mut chain, consensus::SUPPORTED_PROTOCOL_VERSION, net.halt_height);
@@ -942,8 +957,11 @@ pub fn run_full_node(home: PathBuf, net: NetOpts) -> Result<()> {
     let bind = socket(&net.bind, net.http_port.unwrap_or(7171))?;
     let jc: JoinConfig = serde_json::from_slice(&std::fs::read(home.join("join.json")).context("not a joined home — use `blockula join`")?)?;
     let mut chain = Chain::open(&home)?;
-    // The pins were checked at `join`; they (and the embedded checkpoints) apply on every start.
-    let trust = Arc::new(Trust::new(&chain.genesis, &jc.pins, false)?);
+    // The pins were checked at `join`; they (and the embedded checkpoints) apply on every start,
+    // under the weak-subjectivity period of the parameters in force in this node's own state.
+    let mut trust = Trust::new(&chain.genesis, &jc.pins, false)?;
+    trust.follow(&chain.state.chain_params);
+    let trust = Arc::new(trust);
     // An empty home is where a stale root bites (a fresh sync); a synced one trusts its own head.
     if let Some(why) = trust.check_fresh(chain.height(), crate::chain::now_ms())? {
         eprintln!("⚠️  {why}");
@@ -1032,53 +1050,143 @@ async fn sync_once(chain: &Shared, provider: &consensus::EpochProvider, client: 
 /// each slow round in a row doubles it, up to `SLOW_PEER_MAX`.
 const SLOW_PEER_BENCH: Duration = Duration::from_secs(60);
 const SLOW_PEER_MAX: Duration = Duration::from_secs(15 * 60);
+/// A round at least a block time long that delivered blocks this many times slower than another
+/// peer's recent best is too slow too: peers are judged against each other, not only the chain.
+const SLOWER_THAN_BEST: u32 = 4;
+/// A peer's rate counts as recent (for the best, and for "keep the fastest") this long.
+const RATE_WINDOW: Duration = Duration::from_secs(120);
+/// Every this many good rounds the next peer is tried instead of the fastest, so a faster one is
+/// found and the rates stay fresh; a slow peer gets no more than that share.
+const EXPLORE_EVERY: u64 = 8;
 
-/// Which peer sync asks next (F27). Peers take turns on errors and empty replies, and a peer
-/// whose round delivered blocks at less than twice the chain's rate (`blocks × block_time <
-/// 2 × time taken`: a node fed that way never catches up, or only slowly) is benched: asked again
-/// only once every other peer is benched too, or its time is up. So a peer that trickles real,
-/// certified blocks just inside the request timeout gets one round, not the node.
+/// Which peer sync asks next (F27). Peers take turns on empty replies. After a good round sync
+/// goes on with the fastest peer (one not asked for [`RATE_WINDOW`] first, then the best recent
+/// rate), trying the next one every [`EXPLORE_EVERY`] rounds. A peer is benched (asked again only
+/// once every other peer is benched too, or its time is up) when a round failed, or took long for
+/// what it delivered: blocks at less than twice the chain's rate (`blocks × block_time < 2 ×
+/// time taken`: a node fed that way never catches up, or only slowly), or, in a round at least a
+/// block time long, [`SLOWER_THAN_BEST`] times slower than another peer's recent best, or an
+/// empty answer after more than two block times. So a peer that trickles real, certified blocks
+/// just fast enough for the chain, or stalls before saying it has nothing, gets a round now and
+/// then, not the node. The first peer asked is a random one.
 struct Rotation {
     at: usize,
     benched_until: Vec<Option<std::time::Instant>>,
     strikes: Vec<u32>,
+    /// Each peer's blocks per second in its newest good round, and when.
+    rates: Vec<Option<(f64, std::time::Instant)>>,
+    /// When each peer was last asked.
+    asked: Vec<Option<std::time::Instant>>,
+    good_rounds: u64,
 }
 
 impl Rotation {
     fn new(peers: usize) -> Self {
-        Self { at: 0, benched_until: vec![None; peers.max(1)], strikes: vec![0; peers.max(1)] }
+        let n = peers.max(1);
+        let mut r = [0u8; 8];
+        let start = if getrandom::fill(&mut r).is_ok() { (u64::from_le_bytes(r) % n as u64) as usize } else { 0 };
+        Self::starting_at(n, start)
+    }
+
+    fn starting_at(peers: usize, at: usize) -> Self {
+        let n = peers.max(1);
+        Self { at: at % n, benched_until: vec![None; n], strikes: vec![0; n], rates: vec![None; n], asked: vec![None; n], good_rounds: 0 }
     }
 
     fn current(&self) -> usize {
         self.at
     }
 
+    fn benched(&self, i: usize, now: std::time::Instant) -> bool {
+        self.benched_until[i].is_some_and(|t| t > now)
+    }
+
+    fn recent_rate(&self, i: usize, now: std::time::Instant) -> Option<f64> {
+        self.rates[i].filter(|(_, at)| now.saturating_duration_since(*at) <= RATE_WINDOW).map(|(r, _)| r)
+    }
+
     /// Moves on to the next peer that isn't benched (or just the next one, if all are).
     fn advance(&mut self, now: std::time::Instant) {
         let n = self.benched_until.len();
-        let next = (1..=n).map(|step| (self.at + step) % n).find(|i| self.benched_until[*i].is_none_or(|t| t <= now));
+        let next = (1..=n).map(|step| (self.at + step) % n).find(|i| !self.benched(*i, now));
         self.at = next.unwrap_or((self.at + 1) % n);
     }
 
-    /// A round that applied `blocks` (≥ 1), sent in `took`. Returns how long the peer is benched
-    /// for when that was too slow (and moves on), `None` when it may go on.
-    fn progress(&mut self, blocks: u64, took: Duration, block_time: Duration, now: std::time::Instant) -> Option<Duration> {
-        let i = self.at;
-        if u128::from(blocks) * block_time.as_millis() >= 2 * took.as_millis() {
-            self.strikes[i] = 0;
-            return None;
+    /// After a good round: the next peer not benched that wasn't asked for [`RATE_WINDOW`] (in
+    /// turn), else the one with the best recent rate (this one, unless another did better).
+    fn fastest(&mut self, now: std::time::Instant) {
+        let n = self.benched_until.len();
+        let order: Vec<usize> = (1..=n).map(|step| (self.at + step) % n).filter(|i| !self.benched(*i, now)).collect();
+        if let Some(i) = order.iter().copied().find(|i| self.asked[*i].is_none_or(|t| now.saturating_duration_since(t) > RATE_WINDOW)) {
+            self.at = i;
+            return;
         }
+        let mut best: Option<(usize, f64)> = None;
+        for i in order {
+            if let Some(r) = self.recent_rate(i, now).filter(|r| best.is_none_or(|(_, b)| *r > b)) {
+                best = Some((i, r));
+            }
+        }
+        if let Some((i, _)) = best {
+            self.at = i;
+        }
+    }
+
+    fn bench(&mut self, now: std::time::Instant) -> Duration {
+        let i = self.at;
         self.strikes[i] = self.strikes[i].saturating_add(1);
         let bench = SLOW_PEER_BENCH.saturating_mul(1u32 << (self.strikes[i] - 1).min(8)).min(SLOW_PEER_MAX);
         self.benched_until[i] = Some(now + bench);
         self.advance(now);
-        Some(bench)
+        bench
+    }
+
+    /// A round that applied `blocks` (≥ 1), sent in `took`. Returns how long the peer is benched
+    /// for when that was too slow (and moves on), `None` when it was fine.
+    fn progress(&mut self, blocks: u64, took: Duration, block_time: Duration, now: std::time::Instant) -> Option<Duration> {
+        let i = self.at;
+        self.asked[i] = Some(now);
+        let rate = blocks as f64 / took.as_secs_f64().max(0.001);
+        let best_other = (0..self.rates.len()).filter(|j| *j != i && !self.benched(*j, now)).filter_map(|j| self.recent_rate(j, now)).fold(None, |b: Option<f64>, r| Some(b.map_or(r, |b| b.max(r))));
+        self.rates[i] = Some((rate, now));
+        let below_chain = u128::from(blocks) * block_time.as_millis() < 2 * took.as_millis();
+        let below_best = took >= block_time && best_other.is_some_and(|b| rate * f64::from(SLOWER_THAN_BEST) < b);
+        if below_chain || below_best {
+            return Some(self.bench(now));
+        }
+        self.strikes[i] = 0;
+        self.good_rounds += 1;
+        if self.good_rounds.is_multiple_of(EXPLORE_EVERY) {
+            self.advance(now);
+        } else {
+            self.fastest(now);
+        }
+        None
+    }
+
+    /// A round with nothing new, answered after `took`: benched when that took more than two
+    /// block times (an honest peer says "nothing new" at once), otherwise the next peer's turn.
+    fn nothing(&mut self, took: Duration, block_time: Duration, now: std::time::Instant) -> Option<Duration> {
+        self.asked[self.at] = Some(now);
+        if took > 2 * block_time {
+            return Some(self.bench(now));
+        }
+        self.advance(now);
+        None
+    }
+
+    /// A round that failed (no answer in time, a bad or lying answer, an unreachable peer):
+    /// benched, so it isn't asked again after every good round.
+    fn failed(&mut self, now: std::time::Instant) -> Duration {
+        self.asked[self.at] = Some(now);
+        self.bench(now)
     }
 }
 
-/// Follows peers forever (full nodes). Peers rotate on errors, bad batches and empty replies, and
-/// one that sends blocks slower than the chain makes them is benched ([`Rotation`]), so one
-/// stalling, trickling or lying peer can't hold the node back.
+/// Follows peers forever (full nodes). Peers rotate on errors, bad batches and empty replies,
+/// sync keeps to the fastest peer, and one that sends blocks slower than the chain makes them or
+/// far slower than the others, or stalls, is benched ([`Rotation`]), so one stalling, trickling
+/// or lying peer can't hold the node back.
 async fn sync_loop(chain: Shared, peers: Vec<String>, stop_when_caught_up: bool, trust: Arc<Trust>) {
     let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build().unwrap();
     let provider = consensus::EpochProvider::new(chain.clone(), None);
@@ -1104,15 +1212,18 @@ async fn sync_loop(chain: Shared, peers: Vec<String>, stop_when_caught_up: bool,
         match sync_once(&chain, &provider, &client, url, &trust).await {
             Ok((blocks, took)) if blocks > 0 => match rotation.progress(blocks, took, block_time, std::time::Instant::now()) {
                 // A slow round doesn't count as progress: catching up must not hinge on it.
-                Some(bench) => eprintln!("⚠️  sync from {url}: {blocks} block(s) in {:.1}s, slower than the chain; asking other peers first for {}s", took.as_secs_f64(), bench.as_secs()),
+                Some(bench) => eprintln!("⚠️  sync from {url}: {blocks} block(s) in {:.1}s, slower than the chain or the other peers; asking other peers first for {}s", took.as_secs_f64(), bench.as_secs()),
                 None => {
                     idle_rounds = 0;
                     failures = 0;
                 }
             },
-            Ok(_) => {
+            Ok((_, took)) => {
                 idle_rounds += 1;
-                rotation.advance(std::time::Instant::now()); // ask someone else next time, so no single peer can stall us
+                // Ask someone else next time, so no single peer can stall us.
+                if let Some(bench) = rotation.nothing(took, block_time, std::time::Instant::now()) {
+                    eprintln!("⚠️  sync from {url}: nothing new, after {:.1}s; asking other peers first for {}s", took.as_secs_f64(), bench.as_secs());
+                }
                 if stop_when_caught_up && idle_rounds >= peers.len() {
                     return;
                 }
@@ -1123,7 +1234,7 @@ async fn sync_loop(chain: Shared, peers: Vec<String>, stop_when_caught_up: bool,
                 if !e.to_string().contains("sent nothing") && halt.get().is_none() {
                     eprintln!("⚠️  sync from {url}: {e:#}");
                 }
-                rotation.advance(std::time::Instant::now());
+                rotation.failed(std::time::Instant::now());
                 failures += 1;
                 if stop_when_caught_up && failures >= peers.len() * 2 {
                     return;
@@ -1423,36 +1534,110 @@ mod tests {
     }
 
     /// F27: the rotation benches a peer whose round delivered blocks slower than twice the
-    /// chain's rate, skips it while benched (unless every peer is), and backs off more each time.
+    /// chain's rate, or (in a round a block time long) far slower than another peer's recent best,
+    /// or that took long to deliver nothing; skips it while benched (unless every peer is), and
+    /// backs off more each time. After a good round it tries an untried peer, else keeps the
+    /// fastest, and every `EXPLORE_EVERY` rounds the next one.
     #[test]
     fn slow_peers_are_benched_and_skipped() {
         let t0 = std::time::Instant::now();
         let second = Duration::from_secs(1);
-        let mut r = Rotation::new(3);
+        let mut r = Rotation::starting_at(3, 0);
         assert_eq!(r.progress(200, Duration::from_secs(20), second, t0), None, "10 blocks a second: fine");
-        assert_eq!(r.progress(1, Duration::from_millis(400), second, t0), None, "one block in 0.4 s keeps up");
-        assert_eq!(r.progress(1, Duration::from_millis(29_000), second, t0), Some(SLOW_PEER_BENCH), "a trickle");
-        assert_eq!(r.current(), 1);
-        r.advance(t0);
-        r.advance(t0);
-        assert_eq!(r.current(), 1, "peer 0 is skipped while benched");
-        assert_eq!(r.progress(3, Duration::from_secs(2), second, t0), Some(SLOW_PEER_BENCH));
+        assert_eq!(r.current(), 1, "an untried peer next");
+        assert_eq!(r.progress(1, Duration::from_millis(400), second, t0), None, "one block in 0.4 s keeps up (too short a round to judge against the best)");
         assert_eq!(r.current(), 2);
+        assert_eq!(r.progress(1, Duration::from_millis(29_000), second, t0), Some(SLOW_PEER_BENCH), "a trickle");
+        assert_eq!(r.current(), 0);
+        assert_eq!(r.progress(200, Duration::from_secs(20), second, t0), None);
+        assert_eq!(r.current(), 0, "the fastest recent peer goes on (2 is benched, 1 slower)");
+        r.advance(t0);
+        r.advance(t0);
+        assert_eq!(r.current(), 0, "peer 2 is skipped while benched");
+        r.advance(t0);
+        assert_eq!(r.progress(3, Duration::from_secs(2), second, t0), Some(SLOW_PEER_BENCH));
+        assert_eq!(r.current(), 0);
         assert_eq!(r.progress(1, Duration::from_secs(1), second, t0), Some(SLOW_PEER_BENCH));
-        assert_eq!(r.current(), 0, "all benched: plain turns");
+        assert_eq!(r.current(), 1, "all benched: plain turns");
         assert_eq!(r.progress(1, Duration::from_secs(5), second, t0), Some(2 * SLOW_PEER_BENCH), "twice in a row: longer");
         let later = t0 + SLOW_PEER_MAX;
         r.advance(later);
-        assert_eq!(r.current(), 2, "benches run out");
+        assert_eq!(r.current(), 0, "benches run out");
         for _ in 0..20 {
             r.progress(1, Duration::from_secs(5), second, later);
         }
         assert!(r.strikes.iter().all(|s| *s <= 21) && r.benched_until.iter().flatten().all(|t| *t <= later + SLOW_PEER_MAX));
+        // Nothing new: at once is fine (the next peer's turn); after a long wait it's a stall.
+        let mut r = Rotation::starting_at(3, 0);
+        assert_eq!(r.nothing(Duration::from_millis(50), second, t0), None);
+        assert_eq!(r.current(), 1);
+        assert_eq!(r.nothing(Duration::from_secs(29), second, t0), Some(SLOW_PEER_BENCH));
+        assert_eq!(r.current(), 2);
+        r.advance(t0);
+        assert_eq!(r.current(), 0, "the staller is skipped");
+        // A failure benches at once: an unreachable peer isn't retried after every good round.
+        let mut r = Rotation::starting_at(2, 0);
+        assert_eq!(r.failed(t0), SLOW_PEER_BENCH);
+        assert_eq!(r.current(), 1);
+        for _ in 0..3 {
+            assert_eq!(r.progress(200, Duration::from_millis(500), second, t0), None);
+            assert_eq!(r.current(), 1);
+        }
+        let mut r = Rotation::starting_at(2, 0);
+        assert_eq!(r.progress(200, Duration::from_millis(500), second, t0), None);
+        assert_eq!(r.current(), 1, "an unasked peer next");
+        assert_eq!(r.nothing(Duration::from_millis(10), second, t0), None);
+        assert_eq!(r.current(), 0);
+        assert_eq!(r.progress(200, Duration::from_millis(500), second, t0), None);
+        assert_eq!(r.current(), 0, "asked recently, and no rate to beat this one's: not asked again after every round");
+        // The first peer asked is a random one, not always the list's first.
+        let firsts: std::collections::BTreeSet<usize> = (0..64).map(|_| Rotation::new(4).current()).collect();
+        assert!(firsts.len() > 1, "{firsts:?}");
     }
 
-    /// F27: a peer that serves real, certified blocks one at a time just slower than the chain
-    /// (first in the list, as genesis validator 0's endpoint is for everyone by default) gets one
-    /// round; the honest peer brings the node up to its tip and catching up ends.
+    /// F27 (R1 bypass): a peer delivering blocks just over twice the chain's rate passes the
+    /// chain-rate floor, but not the comparison with a much faster peer. It gets a first round
+    /// (nothing to compare with yet) and the exploration round, then it's benched; and a peer
+    /// unheard from for `RATE_WINDOW` counts as untried again.
+    #[test]
+    fn a_peer_just_above_the_chain_rate_loses_to_a_fast_one() {
+        let t0 = std::time::Instant::now();
+        let second = Duration::from_secs(1);
+        let trickle = |r: &mut Rotation| r.progress(4, Duration::from_millis(1_800), second, t0);
+        let honest = |r: &mut Rotation| r.progress(200, Duration::from_millis(500), second, t0);
+        let mut r = Rotation::starting_at(2, 0);
+        assert_eq!(trickle(&mut r), None, "2.2 blocks a second, over twice the chain's 1");
+        assert_eq!(r.current(), 1, "the untried peer next");
+        let mut honest_rounds = 0;
+        while r.good_rounds + 1 < EXPLORE_EVERY {
+            assert_eq!(honest(&mut r), None);
+            assert_eq!(r.current(), 1, "the fastest goes on");
+            honest_rounds += 1;
+        }
+        assert_eq!(honest(&mut r), None);
+        assert_eq!((r.current(), honest_rounds + 1), (0, EXPLORE_EVERY - 1), "the exploration round");
+        assert_eq!(trickle(&mut r), Some(SLOW_PEER_BENCH), "a block time or more for 4 blocks, against 400 a second");
+        assert_eq!(r.current(), 1);
+        for _ in 0..3 * EXPLORE_EVERY {
+            assert_eq!(honest(&mut r), None);
+            assert_eq!(r.current(), 1, "the benched peer isn't explored");
+        }
+        // Once the honest rate is old, the next good round tries the other peer again.
+        let mut r = Rotation::starting_at(2, 1);
+        r.progress(200, Duration::from_millis(500), second, t0);
+        assert_eq!(r.current(), 0);
+        r.progress(200, Duration::from_millis(500), second, t0);
+        assert_eq!(r.current(), 1);
+        r.progress(200, Duration::from_millis(500), second, t0 + RATE_WINDOW + second);
+        assert_eq!(r.current(), 0, "peer 0's rate is stale: untried");
+    }
+
+    /// F27: a peer that serves real, certified blocks just slower than the chain gets one round,
+    /// and so (R1's bypass) does one just over twice the chain's rate, 4 blocks per round at
+    /// 450 ms each, against an honest peer serving 5 blocks per round at once: it's benched by
+    /// comparison after at most its first and its exploration round, the honest peer brings the
+    /// node up to its tip at about its own pace, and catching up ends. Whichever peer is asked
+    /// first (a random one).
     #[tokio::test(flavor = "multi_thread")]
     async fn a_trickling_peer_does_not_capture_sync() {
         use axum::extract::{Path as AxPath, Query, State as AxState};
@@ -1465,11 +1650,7 @@ mod tests {
         let homes = Chain::summon(&root, &SummonOpts::new("trickle", 1)).unwrap();
         let g = Genesis::load(&homes[0].join("genesis.json")).unwrap();
         let seed: [u8; 32] = hex::decode(std::fs::read_to_string(homes[0].join("validator.key")).unwrap().trim()).unwrap().try_into().unwrap();
-        let full = root.join("full");
-        std::fs::create_dir_all(&full).unwrap();
-        std::fs::copy(homes[0].join("genesis.json"), full.join("genesis.json")).unwrap();
-        let chain: Shared = Arc::new(Mutex::new(Chain::open(&full).unwrap()));
-        const TIP: u64 = 20;
+        const TIP: u64 = 60;
         let root_hash = consensus::hex_32(&g.initial_state().root());
         let mut blocks = vec![consensus::genesis_block(&g)];
         for h in 1..=TIP {
@@ -1485,12 +1666,19 @@ mod tests {
         }
         let peer = Peer { blocks: Arc::new(blocks), scheme, hits: Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]) };
         async fn serve(AxState(p): AxState<Peer>, AxPath(who): AxPath<String>, Query(q): Query<std::collections::HashMap<String, u64>>) -> axum::Json<serde_json::Value> {
-            let trickle = who == "trickle";
-            p.hits[usize::from(!trickle)].fetch_add(1, Ordering::SeqCst);
+            let honest = who == "honest";
+            p.hits[usize::from(honest)].fetch_add(1, Ordering::SeqCst);
             let from = q["from"];
-            let to = if trickle { from } else { (from + q["limit"] - 1).min(TIP) };
-            if trickle {
-                tokio::time::sleep(Duration::from_millis(700)).await; // one block per 0.7 s: slower than twice the chain's rate
+            // "slow": one block per 0.7 s, slower than twice the chain's rate; "trickle": 4 per
+            // round at 0.45 s each, just over it; "honest": 5 per round, at once.
+            let (per_round, per_block) = match who.as_str() {
+                "slow" => (1, 700),
+                "trickle" => (4, 450),
+                _ => (5, 0),
+            };
+            let to = (from + q["limit"].min(per_round) - 1).min(TIP);
+            if from <= TIP {
+                tokio::time::sleep(Duration::from_millis(per_block * (to - from + 1))).await;
             }
             if from > TIP {
                 return axum::Json(serde_json::json!({ "tip": TIP, "blocks": [], "to": null, "finalization": null }));
@@ -1506,14 +1694,26 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let trust = Arc::new(Trust::new(&g, &Pins::default(), false).unwrap());
-        let started = std::time::Instant::now();
-        let peers = vec![format!("http://{addr}/trickle"), format!("http://{addr}/honest")];
-        tokio::time::timeout(Duration::from_secs(20), catch_up(chain.clone(), peers, trust)).await.expect("catching up ends");
-        assert_eq!(chain.lock().height(), TIP);
-        let (trickled, honest) = (peer.hits[0].load(Ordering::SeqCst), peer.hits[1].load(Ordering::SeqCst));
-        assert_eq!(trickled, 1, "the trickling peer got one round ({honest} to the honest one)");
-        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
-        drop(chain);
+        for (who, most) in [("slow", 1), ("trickle", 2)] {
+            let full = root.join(format!("full-{who}"));
+            std::fs::create_dir_all(&full).unwrap();
+            std::fs::copy(homes[0].join("genesis.json"), full.join("genesis.json")).unwrap();
+            let chain: Shared = Arc::new(Mutex::new(Chain::open(&full).unwrap()));
+            for h in peer.hits.iter() {
+                h.store(0, Ordering::SeqCst);
+            }
+            let started = std::time::Instant::now();
+            let peers = vec![format!("http://{addr}/{who}"), format!("http://{addr}/honest")];
+            tokio::time::timeout(Duration::from_secs(40), catch_up(chain.clone(), peers, trust.clone())).await.expect("catching up ends");
+            assert_eq!(chain.lock().height(), TIP);
+            let (trickled, honest) = (peer.hits[0].load(Ordering::SeqCst), peer.hits[1].load(Ordering::SeqCst));
+            assert!(trickled <= most, "{who}: {trickled} rounds ({honest} to the honest peer)");
+            // Alone, the trickler would take 15 rounds of 1.8 s (27 s of its sleeps, whatever the
+            // load); the honest peer takes 12 quick ones, and executing the 60 blocks the rest
+            // (~4 s here unloaded, more under a parallel test run).
+            assert!(started.elapsed() < Duration::from_secs(25), "{who}: {:?}", started.elapsed());
+            drop(chain);
+        }
         std::fs::remove_dir_all(root).ok();
     }
 

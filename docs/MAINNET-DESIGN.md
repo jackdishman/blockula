@@ -155,7 +155,8 @@ CBlock { version: u32, parent, height, view: u64, parent_view: u64, timestamp_ms
 
 - Releases embed checkpoints (height, block hash, validator-set hash) for known chain ids, and the mainnet genesis hash. `join` requires `--genesis-hash` or a known chain id, and refuses snapshots that contradict an embedded checkpoint.
 - The fast-sync manifest carries a certificate for the epoch anchor (the boundary block before the current epoch), so nothing in it is taken from the peer on trust.
-- The weak-subjectivity period is documented and shorter than unbonding.
+- The weak-subjectivity period is documented and shorter than unbonding. It follows governance: a node enforces the shortest of the genesis parameters' period, the one its release recorded, and the one its own executed state's parameters set (they can only shorten it).
+- Handoff signatures bind the chain instance like votes and certificates: `BLOCKULA_HANDOFF_V3` signs the genesis hash, the chain id, the epoch and both sets' hashes, so no other genesis under the same id accepts them.
 
 ## 4. Work packages
 

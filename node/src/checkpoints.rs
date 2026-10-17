@@ -21,6 +21,14 @@
 //! than [`ws_period_blocks`]: half that window, leaving the other half to report a forgery and
 //! slash it before the forgers' stake is gone. A pinned validator set makes anything a set before
 //! it signed irrelevant: every later set must descend from the pinned one.
+//!
+//! Both parameters are governance's, so the period a node enforces is the shortest it knows of
+//! (gap-6-1): the genesis parameters', the one this release recorded with its newest checkpoint
+//! (`Known::weak_subjectivity_blocks`), and, for a node that has executed the chain, the one its
+//! own state's parameters set ([`Trust::follow`]). A joiner has no state it can trust yet, so a
+//! governance change that shortened the window after its release can't reach it: what protects
+//! it then is a checkpoint younger than the new period (`blockula checkpoint` prints the period
+//! the peers report).
 
 use crate::chain::{Genesis, Params};
 use crate::epochs::{self, EpochRegistry};
@@ -89,6 +97,11 @@ pub struct Known {
     #[serde(default)]
     #[cfg_attr(not(test), allow(dead_code))]
     pub note: String,
+    /// The weak-subjectivity period in force when the newest checkpoint was taken (`/api/status`
+    /// `weak_subjectivity_blocks`), when governance has shortened it below the genesis one: this
+    /// release's nodes enforce the shorter of the two (gap-6-1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weak_subjectivity_blocks: Option<u64>,
 }
 
 /// The embedded table. The files are part of the source, so a malformed one is a build bug
@@ -180,7 +193,9 @@ impl Trust {
         }
         let params = g.params();
         let cp = g.chain_params().unwrap_or_else(|_| ChainParams::defaults(&params));
-        let mut trust = Trust { genesis_hash: hash, genesis_root: epochs::Root::genesis(g), checkpoints: BTreeMap::new(), ws_blocks: ws_period_blocks(&cp, params.epoch_blocks), params, expected_from: (g.created_at_ms, g.block_time_ms), allow_stale: pins.allow_stale_checkpoint };
+        // The genesis period, or the release's when governance shortened it since (gap-6-1).
+        let ws_blocks = ws_period_blocks(&cp, params.epoch_blocks).min(known.and_then(|k| k.weak_subjectivity_blocks).unwrap_or(u64::MAX).max(1));
+        let mut trust = Trust { genesis_hash: hash, genesis_root: epochs::Root::genesis(g), checkpoints: BTreeMap::new(), ws_blocks, params, expected_from: (g.created_at_ms, g.block_time_ms), allow_stale: pins.allow_stale_checkpoint };
         let genesis = genesis_checkpoint(g);
         for c in known.map(|k| k.checkpoints.as_slice()).unwrap_or_default().iter().chain(&pins.checkpoints) {
             c.check()?;
@@ -208,6 +223,24 @@ impl Trust {
             }
         }
         Ok(())
+    }
+
+    /// The weak-subjectivity period this node enforces, in blocks: the shortest of the genesis
+    /// parameters', this release's and (once [`Trust::follow`]ed) the executed state's.
+    pub fn ws_blocks(&self) -> u64 {
+        self.ws_blocks
+    }
+
+    /// Enforces the period the parameters `live` set (those in force in a state this node has
+    /// executed) when it's shorter than the one enforced so far: governance can shorten the
+    /// evidence window (`evidence_max_age_epochs`, `unbonding_blocks`), and a root is only safe
+    /// for half the window in force, whatever the genesis said (gap-6-1). It never lengthens the
+    /// period, so a state claiming a longer window changes nothing. Returns whether it shortened.
+    pub fn follow(&mut self, live: &ChainParams) -> bool {
+        let ws = ws_period_blocks(live, self.params.epoch_blocks);
+        let shorter = ws < self.ws_blocks;
+        self.ws_blocks = self.ws_blocks.min(ws);
+        shorter
     }
 
     /// Every checkpoint, oldest first.
@@ -320,10 +353,13 @@ pub async fn fetch(peers: &[String], height: Option<u64>) -> Result<(Genesis, Ch
     let urls: Vec<String> = peers.iter().map(|p| crate::chain::http_url(p).trim_end_matches('/').to_string()).collect();
     let mut genesis: Option<Genesis> = None;
     let mut finalized = u64::MAX;
+    // The shortest weak-subjectivity period the peers report (their parameters in force).
+    let mut reported_ws = u64::MAX;
     for u in &urls {
         let g: Genesis = serde_json::from_value(get(format!("{u}/api/genesis")).await?).with_context(|| format!("{u}/api/genesis"))?;
         let status = get(format!("{u}/api/status")).await?;
         finalized = finalized.min(status["finalized_height"].as_u64().ok_or_else(|| anyhow!("{u}/api/status has no finalized_height"))?);
+        reported_ws = reported_ws.min(status["weak_subjectivity_blocks"].as_u64().unwrap_or(u64::MAX));
         match &genesis {
             Some(first) if genesis_hash(first) != genesis_hash(&g) => bail!("{u} serves another genesis ({}) than {} ({})", genesis_hash(&g), urls[0], genesis_hash(first)),
             Some(_) => {}
@@ -332,6 +368,16 @@ pub async fn fetch(peers: &[String], height: Option<u64>) -> Result<(Genesis, Ch
     }
     let g = genesis.expect("at least one peer");
     let params = g.params();
+    // Governance shortened the evidence window since this release (gap-6-1): say how fresh a
+    // checkpoint must be now, since this binary's joiners only know the longer period.
+    if let Some(t) = Trust::new(&g, &Pins::default(), false).ok().filter(|t| reported_ws < t.ws_blocks()) {
+        eprintln!(
+            "⚠️  the peers' parameters in force put the weak-subjectivity period at {reported_ws} blocks (~{} days), shorter than this release's {} (~{} days): a checkpoint is safe for that long only",
+            days(reported_ws, g.block_time_ms),
+            t.ws_blocks(),
+            days(t.ws_blocks(), g.block_time_ms)
+        );
+    }
     let height = match height {
         Some(h) => {
             ensure!(h <= finalized, "#{h} isn't finalized on every peer yet (the lowest is at #{finalized})");
@@ -351,7 +397,7 @@ pub async fn fetch(peers: &[String], height: Option<u64>) -> Result<(Genesis, Ch
     for u in &urls {
         let block = get(format!("{u}/api/block/{height}")).await?;
         let hash = block["hash"].as_str().ok_or_else(|| anyhow!("{u}/api/block/{height} has no hash"))?.to_string();
-        let reg = crate::snapshot::fetch_history(&client, u, trusted.epoch, epoch).await?;
+        let reg = crate::snapshot::fetch_history(&client, u, trusted.epoch, epoch, &crate::snapshot::DownloadLimits::default()).await?;
         let root = match reg.sets.get(&reg.base) {
             Some(set) if reg.base > trusted.epoch => {
                 eprintln!("⚠️  {u} keeps validator-set history from epoch {} on, after this release's newest trusted set (epoch {}): checking it from there; only the peers' agreement vouches for that set", reg.base, trusted.epoch);
@@ -387,7 +433,7 @@ mod tests {
     }
 
     fn known(g: &Genesis, hash: &str, checkpoints: Vec<Checkpoint>) -> Vec<Known> {
-        vec![Known { chain_id: g.chain_id.clone(), genesis_hash: hash.into(), checkpoints, note: String::new() }]
+        vec![Known { chain_id: g.chain_id.clone(), genesis_hash: hash.into(), checkpoints, note: String::new(), weak_subjectivity_blocks: None }]
     }
 
     #[test]
@@ -503,6 +549,50 @@ mod tests {
         // Slower than nominal blocks only make it look older (never fresher).
         g.created_at_ms = created - 30 * 86_400_000;
         assert!(Trust::new(&g, &Pins { genesis_hash: Some(genesis_hash(&g)), ..Default::default() }, true).unwrap().check_fresh(0, now(0)).is_err());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// gap-6-1: governance shortens the evidence window (what a passed `ParamChange` runs:
+    /// `exec_set_param`) to a day, so a root is safe for half a day. A node that executed that
+    /// state enforces it, so a checkpoint 9 days old (fresh by the genesis' 10.5 days) is refused
+    /// for an empty home and warned about otherwise; a state claiming a longer window doesn't
+    /// lengthen it; and a release that recorded the shorter period makes joiners enforce it too.
+    #[test]
+    fn the_weak_subjectivity_period_follows_governance() {
+        let (root, homes, g) = summoned("ws-gov", 1);
+        let mut c = Chain::open(&homes[0]).unwrap();
+        let day = 86_400_000 / g.block_time_ms;
+        let mut j = crate::chain::Journal::default();
+        c.state.exec_set_param(&mut j, "evidence_max_age_epochs", day / g.epoch_blocks).unwrap();
+        c.state.exec_set_param(&mut j, "unbonding_blocks", 2 * day).unwrap();
+        assert_eq!(ws_period_blocks(&c.state.chain_params, g.epoch_blocks), day / 2);
+        let now = g.created_at_ms + 30 * 86_400_000;
+        let hash = genesis_hash(&g);
+        let nine_days_old = Pins { genesis_hash: Some(hash.clone()), checkpoints: vec![Checkpoint { height: 21 * day, hash: "cd".repeat(32), set_hash: None }], ..Default::default() };
+        let by_genesis = Trust::new(&g, &nine_days_old, true).unwrap();
+        assert_eq!((by_genesis.ws_blocks(), by_genesis.check_fresh(0, now).unwrap()), (21 * day / 2, None), "the genesis period: fresh");
+        let mut live = by_genesis.clone();
+        assert!(live.follow(&c.state.chain_params));
+        assert_eq!(live.ws_blocks(), day / 2);
+        let err = live.check_fresh(0, now).unwrap_err().to_string();
+        assert!(err.contains("weak-subjectivity period") && err.contains("~0.5 days"), "{err}");
+        assert!(live.check_fresh(29 * day, now).unwrap().unwrap().contains("--checkpoint"), "a node with older state of its own: warned");
+        assert_eq!(live.check_fresh(30 * day - 10, now).unwrap(), None, "its own head is recent");
+        // Following a longer window changes nothing.
+        let mut longer = c.state.chain_params.clone();
+        longer.set("unbonding_blocks", 300 * day, &g.params()).unwrap();
+        longer.set("evidence_max_age_epochs", 300 * day / g.epoch_blocks, &g.params()).unwrap();
+        assert!(!live.follow(&longer) && live.ws_blocks() == day / 2);
+        assert!(!by_genesis.clone().follow(&longer), "never past the genesis period either");
+        // A release that recorded the shorter period: its joiners enforce it before any state.
+        let mut table = known(&g, &hash, vec![]);
+        table[0].weak_subjectivity_blocks = Some(day / 2);
+        let released = Trust::with_table(&g, &nine_days_old, true, &table).unwrap();
+        assert_eq!(released.ws_blocks(), day / 2);
+        assert!(released.check_fresh(0, now).is_err());
+        table[0].weak_subjectivity_blocks = Some(400 * day);
+        assert_eq!(Trust::with_table(&g, &nine_days_old, true, &table).unwrap().ws_blocks(), 21 * day / 2, "a longer recorded period changes nothing");
+        drop(c);
         std::fs::remove_dir_all(root).ok();
     }
 

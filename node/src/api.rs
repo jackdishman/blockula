@@ -128,7 +128,8 @@ pub struct ClientIpPolicy {
     pub header: Option<String>,
     /// Trusted proxies that append to `header` (`--client-ip-hops`, default 1). Appending proxies
     /// (`X-Forwarded-For`) keep what the client sent first and add the address they saw last,
-    /// so the client is this many entries from the right; anything left of it is the client's
+    /// so the client is this many entries from the right, counted over all of the header's
+    /// lines in order (a proxy may add a line of its own); anything left of it is the client's
     /// own say. Headers a proxy overwrites have one entry.
     pub hops: usize,
 }
@@ -148,10 +149,13 @@ impl ClientIpPolicy {
     /// The client's IP, or `None` for a local caller (loopback, nothing configured speaks for it).
     pub fn resolve(&self, peer: SocketAddr, h: &HeaderMap) -> Option<IpAddr> {
         // The entry `hops` from the right of a (possibly comma-separated) header (F29: the
-        // leftmost one is whatever the client sent).
+        // leftmost one is whatever the client sent), counted over every line of it in order: a
+        // proxy may append its own line (HAProxy's `option forwardfor`) after the client's
+        // instead of extending it, and the first line alone is the client's say. A line that
+        // isn't text is still split on commas (only the proxy's entries need to parse).
         let header_ip = |name: &str, hops: usize| {
-            let v = h.get(name)?.to_str().ok()?;
-            let entries: Vec<&str> = v.split(',').collect();
+            let lines: Vec<String> = h.get_all(name).iter().map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned()).collect();
+            let entries: Vec<&str> = lines.iter().flat_map(|l| l.split(',')).collect();
             entries.len().checked_sub(hops.max(1)).and_then(|i| entries[i].trim().parse::<IpAddr>().ok())
         };
         let policy = self;
@@ -1323,7 +1327,8 @@ struct SnapshotQuery {
 }
 
 /// Manifest of a certified state snapshot (for `join --fast`): the newest, or for a big state the
-/// newest long-lived one (`snapshot::long_interval`), reaching `min` if given.
+/// newest long-lived one (`snapshot::long_interval`), reaching `min` if given (when none does,
+/// the one reaching furthest, so the joiner sees it's behind and waits for the next one).
 async fn snapshot_latest(State(n): State<Node>, Query(q): Query<SnapshotQuery>) -> ApiResult {
     let m = crate::snapshot::build_manifest_reaching(&n.live, q.min.unwrap_or(0)).map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
     Ok(Json(serde_json::to_value(m).unwrap()))
@@ -2152,6 +2157,23 @@ mod tests {
         assert_eq!(xff.resolve(local, &headers(&[("x-forwarded-for", "203.0.113.7, nope")])), Some(local.ip()));
         assert_eq!(xff.resolve(local, &HeaderMap::new()), Some(local.ip()));
         assert_eq!(two.resolve(local, &headers(&[("x-forwarded-for", "203.0.113.7")])), Some(local.ip()), "fewer entries than proxies");
+        // A proxy that appends its own header line (HAProxy `option forwardfor`) after the
+        // client's: every line counts, in order, so the client's first line can't name it.
+        let lines = |vals: &[&str]| {
+            let mut h = HeaderMap::new();
+            for v in vals {
+                h.append("x-forwarded-for", v.parse().unwrap());
+            }
+            h
+        };
+        assert_eq!(xff.resolve(local, &lines(&["9.9.9.9", "203.0.113.7"])), Some("203.0.113.7".parse().unwrap()));
+        assert_eq!(xff.resolve(local, &lines(&["8.8.8.8, 9.9.9.9", "203.0.113.7"])), Some("203.0.113.7".parse().unwrap()));
+        assert_eq!(two.resolve(local, &lines(&["9.9.9.9", "203.0.113.7", "10.0.0.9"])), Some("203.0.113.7".parse().unwrap()), "hops count entries across lines");
+        assert_eq!(two.resolve(local, &lines(&["9.9.9.9, 203.0.113.7", "10.0.0.9"])), Some("203.0.113.7".parse().unwrap()));
+        let mut binary = lines(&[]);
+        binary.append("x-forwarded-for", axum::http::HeaderValue::from_bytes(b"\xff\xfe, 9.9.9.9").unwrap());
+        binary.append("x-forwarded-for", "203.0.113.7".parse().unwrap());
+        assert_eq!(xff.resolve(local, &binary), Some("203.0.113.7".parse().unwrap()), "a client line that isn't text doesn't hide the proxy's");
         assert_eq!(ClientIpPolicy::default().resolve(local, &forged), None, "no header configured: loopback is local");
         // Forwarder secret: wrong key is ignored, right key is honored.
         let secret = ClientIpPolicy { forwarder_secret: Some("s".repeat(32)), ..Default::default() };

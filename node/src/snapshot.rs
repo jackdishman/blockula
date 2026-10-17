@@ -68,6 +68,19 @@ pub const CHUNK_SLOW: std::time::Duration = std::time::Duration::from_secs(10);
 /// [`DOWNLOAD_SLACK`], or the joiner gives up on that manifest and asks the next peer (F62).
 pub const DOWNLOAD_PER_CHUNK: std::time::Duration = std::time::Duration::from_secs(2);
 pub const DOWNLOAD_SLACK: std::time::Duration = std::time::Duration::from_secs(120);
+/// A peer's validator-set history (its `/api/epochs` pages, from the joiner's root through the
+/// manifest's epoch) must arrive within this per epoch it spans (each page that continues holds
+/// a set change, so there are at most that many pages; 2 s is ~0.4 MiB/s for a change of a
+/// hundred keys and their quorum) plus [`HISTORY_SLACK`], and never takes longer than
+/// [`HISTORY_MAX`] (review-fix-sync-1).
+pub const HISTORY_PER_EPOCH: std::time::Duration = std::time::Duration::from_secs(2);
+pub const HISTORY_SLACK: std::time::Duration = std::time::Duration::from_secs(120);
+pub const HISTORY_MAX: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// A manifest is refused before anything else is fetched for it when it certifies a block past
+/// the height the chain can have reached by now plus this much clock difference (blocks are at
+/// least `block_time_ms` apart from the genesis on; validators refuse timestamps more than
+/// `consensus::MAX_CLOCK_DRIFT_MS` ahead).
+pub const FUTURE_SLACK_MS: u64 = 3_600_000;
 
 /// Blocks between long-lived snapshots at this chain's block time: the fewest whole checkpoint
 /// intervals that last [`LONG_SNAPSHOT_MS`] (900 blocks at 1 s blocks; one interval on a chain
@@ -377,7 +390,10 @@ pub fn build_manifest(live: &crate::view::Live) -> Result<Manifest> {
 
 /// [`build_manifest`], for a snapshot whose manifest reaches at least `min_last` (a joiner's
 /// newest checkpoint: an older one would be no use to it). A big state is served from a
-/// long-lived snapshot when one reaches that far ([`serving_order`]).
+/// long-lived snapshot when one reaches that far ([`serving_order`]). When none does, the one
+/// reaching furthest: the joiner sees it's behind its checkpoint ([`SnapshotBehind`]) and waits
+/// for the next snapshot, rather than taking "nothing here" for "sync from the genesis"
+/// (review-fix-sync-3).
 pub fn build_manifest_reaching(live: &crate::view::Live, min_last: u64) -> Result<Manifest> {
     build_manifest_with(live, min_last, SMALL_SNAPSHOT_BYTES)
 }
@@ -389,6 +405,8 @@ pub(crate) fn build_manifest_with(live: &crate::view::Live, min_last: u64, small
     let params = &v.state.params;
     let heights = list(home);
     let newest_bytes = heights.first().and_then(|h| meta(home, *h)).map_or(0, |m| m.chunks.iter().map(|c| c.size as u64).sum());
+    // The servable manifest reaching furthest, when none reaches `min_last`.
+    let mut behind: Option<(u64, Manifest)> = None;
     for height in serving_order(heights, newest_bytes, small, long_interval(params)) {
         let Some(meta) = meta(home, height) else { continue };
         let certifier = height + CHECKPOINT_DELAY;
@@ -405,9 +423,6 @@ pub(crate) fn build_manifest_with(live: &crate::view::Live, min_last: u64, small
             }
         }
         let Some((last, finalization)) = fin else { continue };
-        if last < min_last {
-            continue;
-        }
         let anchor = match anchor_height(params, height, last) {
             None => None,
             // Without the anchor's proof this snapshot can't be served; an older one may be.
@@ -416,7 +431,17 @@ pub(crate) fn build_manifest_with(live: &crate::view::Live, min_last: u64, small
                 None => continue,
             },
         };
-        return Ok(Manifest { chain_id: v.genesis.chain_id.clone(), height, state_root: meta.state_root, chunks: meta.chunks, blocks, finalization, anchor });
+        let m = Manifest { chain_id: v.genesis.chain_id.clone(), height, state_root: meta.state_root, chunks: meta.chunks, blocks, finalization, anchor };
+        if last < min_last {
+            if behind.as_ref().is_none_or(|(l, _)| last > *l) {
+                behind = Some((last, m));
+            }
+            continue;
+        }
+        return Ok(m);
+    }
+    if let Some((_, m)) = behind {
+        return Ok(m);
     }
     bail!("no certified snapshot yet (one is taken every {CHECKPOINT_INTERVAL} blocks and certified {CHECKPOINT_DELAY} blocks later, and the epoch anchor before it must be certified too)")
 }
@@ -602,11 +627,9 @@ pub fn verify_manifest_from(g: &Genesis, m: &Manifest, history: &EpochRegistry, 
     let params = g.params();
     let epoch = params.epoch_of(last.height);
     // Verifies every set change from the root through `epoch`; only that part is kept, so
-    // `epochs.set(e)` is trusted for root ≤ e ≤ epoch, and nothing past `epoch` is adopted.
-    let set = epochs::verify_from(g, history, root, epoch).context("validator set history")?;
-    let mut verified = history.clone();
-    verified.rebase(root.epoch);
-    verified.truncate(epoch);
+    // `epochs.set(e)` is trusted for root ≤ e ≤ epoch, nothing past `epoch` is adopted, and of
+    // each change's signatures only a quorum that verified (review-fix-sync-2, -5).
+    let (set, verified) = epochs::verify_history(g, history, root, epoch).context("validator set history")?;
     // Certificates of this chain instance only (another genesis under the same id never verifies).
     let ns = consensus::genesis_namespace(g);
     let verifier = verifier_for(&ns, &set)?;
@@ -644,8 +667,19 @@ pub fn verify_manifest_trusted(g: &Genesis, m: &Manifest, history: &EpochRegistr
 }
 
 /// A peer's validator-set history from `from` through at least `through`, assembled from its
-/// `/api/epochs` pages (each capped, and the whole at `epochs::MAX_HISTORY_BYTES`).
-pub async fn fetch_history(client: &reqwest::Client, peer: &str, from: u64, through: u64) -> Result<EpochRegistry> {
+/// `/api/epochs` pages (each capped, and the whole at `epochs::MAX_HISTORY_BYTES`), within
+/// [`DownloadLimits::history`]. A page that says there's more must hold a set change and end
+/// where the next one starts, as [`EpochRegistry::slice`] pages do, so there are at most as many
+/// as the epochs spanned: a peer can't hold a joiner with an endless stream of pages
+/// (review-fix-sync-1).
+pub async fn fetch_history(client: &reqwest::Client, peer: &str, from: u64, through: u64, limits: &DownloadLimits) -> Result<EpochRegistry> {
+    let deadline = limits.history(from, through);
+    tokio::time::timeout(deadline, fetch_pages(client, peer, from, through))
+        .await
+        .map_err(|_| anyhow!("{peer}'s validator-set history from epoch {from} through {through} didn't arrive within {}s", deadline.as_secs()))?
+}
+
+async fn fetch_pages(client: &reqwest::Client, peer: &str, from: u64, through: u64) -> Result<EpochRegistry> {
     #[derive(Deserialize)]
     struct Next {
         #[serde(default)]
@@ -660,6 +694,12 @@ pub async fn fetch_history(client: &reqwest::Client, peer: &str, from: u64, thro
         ensure!(total <= epochs::MAX_HISTORY_BYTES, "{peer}'s validator-set history from epoch {from} passes {} MiB", epochs::MAX_HISTORY_BYTES >> 20);
         let page: EpochRegistry = serde_json::from_slice(&body).with_context(|| format!("{peer}/api/epochs?from={at}"))?;
         let next = serde_json::from_slice::<Next>(&body).map(|n| n.next).unwrap_or_default();
+        if let Some(n) = next {
+            ensure!(
+                n > at && n == page.known_through && page.changes().any(|e| e <= page.known_through),
+                "{peer}/api/epochs?from={at}: a page that continues must hold a set change and end where the next one starts"
+            );
+        }
         match &mut out {
             None => out = Some(page),
             Some(o) => o.append_page(&page)?,
@@ -798,16 +838,20 @@ impl Read for Chunks<'_> {
 /// `trust`. Peers are tried in a random order; each one's manifest is downloaded from all of them
 /// ([`download_chunks`]).
 pub async fn fast_sync(chain: &crate::consensus::Shared, peers: &[String], trust: &crate::checkpoints::Trust) -> Result<u64> {
-    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(60)).build()?;
+    fast_sync_with(chain, peers, trust, &DownloadLimits::default()).await
+}
+
+/// [`fast_sync`] within `limits`.
+pub async fn fast_sync_with(chain: &crate::consensus::Shared, peers: &[String], trust: &crate::checkpoints::Trust, limits: &DownloadLimits) -> Result<u64> {
+    let client = reqwest::Client::builder().timeout(MANIFEST_TIMEOUT).build()?;
     let g = chain.lock().genesis.clone();
     let mut last_err = anyhow!("no peers");
     // A peer that's only behind a checkpoint says a later snapshot will do: report that one.
     let mut behind = None;
     // In a new order each run, so no listed endpoint is always the one asked first (F62).
     let peers = shuffled(peers);
-    let limits = DownloadLimits::default();
     for peer in &peers {
-        match fast_sync_from(&client, &g, chain, peer, &peers, trust, &limits).await {
+        match fast_sync_from(&client, &g, chain, peer, &peers, trust, limits).await {
             Ok(h) => return Ok(h),
             Err(e) => {
                 tracing::debug!(peer = %peer, error = %e, "fast sync failed");
@@ -837,19 +881,36 @@ fn shuffled(peers: &[String]) -> Vec<String> {
     out
 }
 
-/// How long a snapshot download may take ([`CHUNK_TIMEOUT`], [`CHUNK_SLOW`],
-/// [`DOWNLOAD_PER_CHUNK`], [`DOWNLOAD_SLACK`]; tests shorten them).
+/// How long a fast-sync attempt may take: the snapshot download ([`CHUNK_TIMEOUT`],
+/// [`CHUNK_SLOW`], [`DOWNLOAD_PER_CHUNK`], [`DOWNLOAD_SLACK`]) and the history before it
+/// ([`HISTORY_PER_EPOCH`], [`HISTORY_SLACK`], [`HISTORY_MAX`]); tests shorten them.
 #[derive(Clone, Debug)]
 pub struct DownloadLimits {
     pub chunk_timeout: std::time::Duration,
     pub slow: std::time::Duration,
     pub per_chunk: std::time::Duration,
     pub slack: std::time::Duration,
+    pub history_per_epoch: std::time::Duration,
+    pub history_slack: std::time::Duration,
+    pub history_max: std::time::Duration,
 }
 
 impl Default for DownloadLimits {
     fn default() -> Self {
-        Self { chunk_timeout: CHUNK_TIMEOUT, slow: CHUNK_SLOW, per_chunk: DOWNLOAD_PER_CHUNK, slack: DOWNLOAD_SLACK }
+        Self { chunk_timeout: CHUNK_TIMEOUT, slow: CHUNK_SLOW, per_chunk: DOWNLOAD_PER_CHUNK, slack: DOWNLOAD_SLACK, history_per_epoch: HISTORY_PER_EPOCH, history_slack: HISTORY_SLACK, history_max: HISTORY_MAX }
+    }
+}
+
+impl DownloadLimits {
+    /// The most a download of `chunks` chunks may take.
+    pub fn download(&self, chunks: usize) -> std::time::Duration {
+        self.slack.saturating_add(self.per_chunk.saturating_mul(u32::try_from(chunks).unwrap_or(u32::MAX)))
+    }
+
+    /// The most a history from epoch `from` through `through` may take.
+    pub fn history(&self, from: u64, through: u64) -> std::time::Duration {
+        let epochs = u32::try_from(through.saturating_sub(from).saturating_add(1)).unwrap_or(u32::MAX);
+        self.history_slack.saturating_add(self.history_per_epoch.saturating_mul(epochs)).min(self.history_max)
     }
 }
 
@@ -866,7 +927,7 @@ pub async fn download_chunks(client: &reqwest::Client, sources: &[String], v: &V
     const SLOW: u8 = 1;
     const FAILED: u8 = 2;
     ensure!(!sources.is_empty(), "no peer to download from");
-    let deadline = limits.slack.saturating_add(limits.per_chunk.saturating_mul(u32::try_from(v.chunks.len()).unwrap_or(u32::MAX)));
+    let deadline = limits.download(v.chunks.len());
     let health: Vec<AtomicU8> = sources.iter().map(|_| AtomicU8::new(OK)).collect();
     let fetch = |i: usize| {
         let health = &health;
@@ -916,13 +977,31 @@ pub async fn download_chunks(client: &reqwest::Client, sources: &[String], v: &V
     tokio::time::timeout(deadline, all).await.map_err(|_| anyhow!("the snapshot's {} chunks didn't arrive within {}s", v.chunks.len(), deadline.as_secs()))?
 }
 
+/// How long the request for a manifest (and any other single request of a fast sync) may take.
+pub const MANIFEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 async fn fast_sync_from(client: &reqwest::Client, g: &Genesis, chain: &crate::consensus::Shared, peer: &str, peers: &[String], trust: &crate::checkpoints::Trust, limits: &DownloadLimits) -> Result<u64> {
     // A snapshot older than our newest checkpoint is no use: ask for one that reaches it.
     let body = crate::node::get_capped(client, &format!("{peer}/api/snapshot/latest?min={}", trust.newest()), 64 << 20).await?;
     let m: Manifest = serde_json::from_slice(&body)?;
     ensure!(m.blocks.len() as u64 <= 4 * CHECKPOINT_INTERVAL, "the manifest lists {} blocks", m.blocks.len());
+    ensure!(m.chunks.len() <= MAX_SNAPSHOT_CHUNKS, "manifest lists {} chunks, at most {MAX_SNAPSHOT_CHUNKS}", m.chunks.len());
+    let last = m.height.saturating_add(m.blocks.len() as u64);
+    // Nothing is fetched for a manifest of blocks the chain can't have yet: the history it would
+    // need is the peer's to make up, as long as it likes (review-fix-sync-1).
+    let expected = trust.expected_height(crate::chain::now_ms().saturating_add(FUTURE_SLACK_MS));
+    ensure!(last <= expected, "the manifest certifies #{last}, past any height the chain can have reached by now (#{expected})");
+    // Ends before our newest checkpoint (an old-binary peer serves its newest anyway): a later
+    // snapshot will do, so say so without fetching anything for it (review-fix-sync-3).
+    if trust.newest() > last {
+        return Err(anyhow::Error::new(SnapshotBehind { certified: last, checkpoint: trust.newest() }));
+    }
+    // One deadline over the rest of the attempt: the history, then the chunks (F62).
+    let (from, through) = (trusted_root(g, &m, trust).epoch, last_epoch(g, &m));
+    let deadline = tokio::time::Instant::now() + limits.history(from, through).saturating_add(limits.download(m.chunks.len()));
+    let late = || anyhow!("fast sync from {peer} didn't finish within its deadline");
     // The history from our newest trusted root through the manifest's epoch, nothing more.
-    let history = fetch_history(client, peer, trusted_root(g, &m, trust).epoch, last_epoch(g, &m)).await?;
+    let history = tokio::time::timeout_at(deadline, fetch_history(client, peer, from, through, limits)).await.map_err(|_| late())??;
     let v = verify_manifest_trusted(g, &m, &history, trust)?;
     println!("📦 snapshot #{} ({} chunks) certified by validators; downloading…", v.height, v.chunks.len());
     // Each chunk is checked as it arrives and appended to a file: memory holds a few chunks at
@@ -931,7 +1010,7 @@ async fn fast_sync_from(client: &reqwest::Client, g: &Genesis, chain: &crate::co
     let mut file = std::io::BufWriter::new(std::fs::File::create(&part)?);
     // The manifest's peer first, then the others (any of them may hold the same snapshot).
     let sources: Vec<String> = std::iter::once(peer.to_string()).chain(peers.iter().filter(|p| *p != peer).cloned()).collect();
-    download_chunks(client, &sources, &v, &mut file, limits).await?;
+    tokio::time::timeout_at(deadline, download_chunks(client, &sources, &v, &mut file, limits)).await.map_err(|_| late())??;
     file.into_inner().map_err(|e| e.into_error())?.sync_all()?;
     let state = restore_file(&v, &part)?;
     // The epoch anchor (if it's before the snapshot) came certified in the manifest.
@@ -1112,7 +1191,7 @@ mod tests {
         // The old keys sign whatever they're told to.
         let told = reg.clone();
         for s in &seeds[..3] {
-            reg.sign_missing(&g.chain_id, *s, |e| told.set(e).cloned());
+            reg.sign_missing(&epochs::Instance::of(&g), *s, |e| told.set(e).cloned());
         }
         for e in 7..=10 {
             reg.record(e, keys(&evil));
@@ -1141,13 +1220,106 @@ mod tests {
         assert_eq!(v.epochs.sets.keys().copied().collect::<Vec<_>>(), vec![0], "only the genesis set: no change through epoch 10");
         let mut adopted = v.epochs.clone();
         let executed = steady(&g, 10);
-        assert!(adopted.sign_missing(&g.chain_id, seeds[0], |e| executed.set(e).cloned()).is_empty());
+        assert!(adopted.sign_missing(&epochs::Instance::of(&g), seeds[0], |e| executed.set(e).cloned()).is_empty());
         // Executing on, the joiner records the epochs itself; the planted set never comes back.
         for e in 11..=50 {
             adopted.record(e, keys(&seeds));
         }
         assert_eq!(adopted.set(50), Some(&keys(&seeds)));
-        assert!(adopted.sign_missing(&g.chain_id, seeds[0], |e| executed.set(e).or(executed.set(10)).cloned()).is_empty());
+        assert!(adopted.sign_missing(&epochs::Instance::of(&g), seeds[0], |e| executed.set(e).or(executed.set(10)).cloned()).is_empty());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// F02 (review-integrate-compose-1): instance B relaunches A under the same chain id with the
+    /// same genesis validators (only `created_at_ms` differs, so the genesis hash does). On A, a
+    /// quorum of the genesis keys handed off to a set the attacker holds (it joined A's set, or
+    /// A's keys leaked once A was abandoned). A forged B snapshot certified by those keys under
+    /// B's own namespace, served with A's history, used to verify on B with only B's genesis
+    /// trusted. Handoffs bind the genesis hash now, so A's don't verify on B.
+    #[test]
+    fn handoffs_do_not_replay_across_a_relaunch() {
+        let (root, a, seeds) = four_validators("relaunch");
+        let mut b = a.clone();
+        b.created_at_ms += 1;
+        assert_ne!(crate::checkpoints::genesis_hash(&a), crate::checkpoints::genesis_hash(&b));
+        let evil: Vec<[u8; 32]> = (0..4u8).map(|i| [200 + i; 32]).collect();
+        let history = |g: &Genesis| {
+            let mut reg = steady(g, 5);
+            assert!(reg.record(6, keys(&evil)));
+            let told = reg.clone();
+            for s in &seeds[..3] {
+                reg.sign_missing(&epochs::Instance::of(g), *s, |e| told.set(e).cloned());
+            }
+            for e in 7..=10 {
+                reg.record(e, keys(&evil));
+            }
+            reg
+        };
+        let on_a = history(&a);
+        // On A itself the history verifies (that's A's own weak-subjectivity story).
+        assert!(verify_manifest(&a, &manifest(&a, &evil, 104), &on_a).is_ok());
+        // On B, A's handoffs are no proof of anything.
+        let forged = manifest(&b, &evil, 104);
+        let e = err(verify_manifest(&b, &forged, &on_a));
+        assert!(e.contains("epoch 6") && e.contains("0 valid handoff signatures"), "{e}");
+        let genesis_only = Trust::new(&b, &Pins::default(), false).unwrap();
+        assert!(verify_manifest_trusted(&b, &forged, &on_a, &genesis_only).is_err());
+        // B's own validators signing B's change is what B needs.
+        assert_eq!(verify_manifest(&b, &forged, &history(&b)).unwrap().epochs.set(10), Some(&keys(&evil)));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// review-fix-sync-2, -5: a joiner adopts only what verified. A peer's history with junk at
+    /// a lower signer index than a quorum of valid signatures (epoch 1), and with a set and junk
+    /// proofs past the certified epoch while its `known_through` is that epoch: the manifest
+    /// verifies, but the joiner's registry holds neither, so it serves pages that verify, counts
+    /// only real signatures toward a quorum, and still collects (and signs) epoch 11's handoff.
+    #[test]
+    fn junk_and_entries_past_the_certified_epoch_are_not_adopted() {
+        let (root, g, seeds) = four_validators("junk");
+        let at = epochs::Instance::of(&g);
+        let newcomer = PrivateKey::from_seed_bytes([9; 32]).public_key();
+        let next = {
+            let mut k = keys(&seeds[1..]);
+            k.push(hex::encode(newcomer.as_ref()));
+            k.sort();
+            k
+        };
+        let mut history = steady(&g, 0);
+        assert!(history.record(1, next.clone()));
+        for e in 2..=10 {
+            history.record(e, next.clone());
+        }
+        let told = history.clone();
+        for s in &seeds {
+            history.sign_missing(&at, *s, |e| told.set(e).cloned());
+        }
+        assert_eq!(history.proofs[&1].len(), 4, "all four outgoing validators signed (quorum 3)");
+        let honest = history.clone();
+        let lowest = *history.proofs[&1].keys().next().unwrap();
+        history.proofs.get_mut(&1).unwrap().insert(lowest, "00".repeat(3309));
+        // Past the certified epoch: the set the joiner will execute at 11 (the attacker can know
+        // it), with junk for its handoff.
+        history.sets.insert(11, keys(&seeds));
+        history.proofs.insert(11, (0..4).map(|i| (i, "00".repeat(3309))).collect());
+        let v = verify_manifest(&g, &manifest(&g, &[seeds[1], seeds[2], seeds[3], [9; 32]], 104), &history).unwrap();
+        assert_eq!(v.epochs.known_through, 10);
+        assert!(v.epochs.sets.keys().chain(v.epochs.proofs.keys()).all(|e| *e <= 10), "nothing past the certified epoch");
+        assert!(!v.epochs.proofs[&1].contains_key(&lowest) && v.epochs.proofs[&1].len() == 3, "the junk is left out");
+        let (page, _) = v.epochs.slice(0, epochs::PAGE_BYTES);
+        assert!(epochs::verify_chain(&g, &page, 10).is_ok(), "what it serves verifies");
+        // Executing on, epoch 11's real handoff is still missing here, so it's collected.
+        let mut adopted = v.epochs.clone();
+        adopted.record(11, keys(&seeds));
+        let mut real = honest.clone();
+        real.record(11, keys(&seeds));
+        let told = real.clone();
+        for s in &seeds[1..] {
+            real.sign_missing(&at, *s, |e| told.set(e).cloned());
+        }
+        assert_eq!(adopted.proven_through(), 10);
+        assert_eq!(adopted.merge_sigs(&at, &real), 3);
+        assert_eq!(adopted.proven_through(), 11);
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -1346,7 +1518,7 @@ mod tests {
         };
         let (base, hits) = chunk_servers(chunks.clone()).await;
         let client = reqwest::Client::new();
-        let limits = DownloadLimits { chunk_timeout: std::time::Duration::from_millis(500), slow: std::time::Duration::from_millis(250), per_chunk: std::time::Duration::from_millis(100), slack: std::time::Duration::from_secs(5) };
+        let limits = DownloadLimits { chunk_timeout: std::time::Duration::from_millis(500), slow: std::time::Duration::from_millis(250), per_chunk: std::time::Duration::from_millis(100), slack: std::time::Duration::from_secs(5), ..DownloadLimits::default() };
         let get = |who: &[&str], limits: DownloadLimits| {
             let (client, v, hits) = (client.clone(), &v, &hits);
             let sources: Vec<String> = who.iter().map(|w| format!("{base}/{w}")).collect();
@@ -1392,6 +1564,123 @@ mod tests {
         assert!(took < std::time::Duration::from_secs(1), "{took:?}");
         // Nobody to ask.
         assert!(download_chunks(&client, &[], &v, &mut vec![], &limits).await.is_err());
+    }
+
+    /// Fast-sync peers for [`fast_sync_with`] tests: `/{who}/api/snapshot/latest` serves `manifests[who]`
+    /// (503 when there's none) and `/{who}/api/epochs?from=k` answers as `who` says. "trickle":
+    /// a page per epoch, each with a set change, 300 ms apiece (a peer that can make up as many
+    /// epochs as the manifest spans). "flat": the 96-byte page that changes nothing and says
+    /// there's more. Every request is counted, by `who` and path.
+    async fn fast_sync_peers(g: &Genesis, manifests: std::collections::BTreeMap<String, Manifest>) -> (String, std::sync::Arc<parking_lot::Mutex<std::collections::BTreeMap<String, usize>>>) {
+        use axum::extract::{Path as UrlPath, Query, State as Shared};
+        use axum::response::IntoResponse;
+        type Hits = std::sync::Arc<parking_lot::Mutex<std::collections::BTreeMap<String, usize>>>;
+        type Ctx = (std::sync::Arc<std::collections::BTreeMap<String, Manifest>>, [Vec<String>; 2], Hits);
+        async fn latest(Shared((manifests, _, hits)): Shared<Ctx>, UrlPath(who): UrlPath<String>) -> axum::response::Response {
+            *hits.lock().entry(format!("{who}/latest")).or_default() += 1;
+            match manifests.get(&who) {
+                Some(m) => axum::Json(m.clone()).into_response(),
+                None => (axum::http::StatusCode::SERVICE_UNAVAILABLE, "no certified snapshot yet").into_response(),
+            }
+        }
+        async fn epochs(Shared((_, sets, hits)): Shared<Ctx>, UrlPath(who): UrlPath<String>, Query(q): Query<std::collections::HashMap<String, u64>>) -> axum::response::Response {
+            *hits.lock().entry(format!("{who}/epochs")).or_default() += 1;
+            let k = q.get("from").copied().unwrap_or(0);
+            let page = match who.as_str() {
+                "trickle" => {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    let set = |e: u64| sets[(e % 2) as usize].clone();
+                    serde_json::json!({ "sets": { k.to_string(): set(k), (k + 1).to_string(): set(k + 1) }, "base": k, "known_through": k + 1, "proofs": {}, "format": epochs::HANDOFF_FORMAT, "next": k + 1 })
+                }
+                _ => serde_json::json!({ "sets": { k.to_string(): [] }, "base": k, "known_through": k + 1, "proofs": {}, "format": epochs::HANDOFF_FORMAT, "next": k + 1 }),
+            };
+            axum::Json(page).into_response()
+        }
+        let hits: Hits = Default::default();
+        let genesis_set = EpochRegistry::genesis(g).sets[&0].clone();
+        let other = keys(&[[200; 32]]);
+        let app = axum::Router::new()
+            .route("/{who}/api/snapshot/latest", axum::routing::get(latest))
+            .route("/{who}/api/epochs", axum::routing::get(epochs))
+            .with_state((std::sync::Arc::new(manifests), [genesis_set, other], hits.clone()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// An empty joiner's chain for `g` (what `blockula join` leaves).
+    fn joiner(g: &Genesis, tag: &str) -> (PathBuf, crate::consensus::Shared) {
+        let home = std::env::temp_dir().join(format!("blockula-joiner-{tag}-{}-{}", crate::chain::now_ms(), std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("genesis.json"), serde_json::to_string(g).unwrap()).unwrap();
+        let chain = crate::chain::Chain::open(&home).unwrap();
+        (home, std::sync::Arc::new(parking_lot::Mutex::new(chain)))
+    }
+
+    /// F62, review-fix-sync-1: one deadline covers a fast-sync attempt's history and chunks, so
+    /// a peer that answers history pages slowly (each a real-looking set change, one epoch at a
+    /// time) loses the attempt and the next peer is asked; a page that changes nothing yet says
+    /// there's more is refused at once; and a manifest of blocks the chain can't have reached
+    /// yet (its height is the peer's word until verified) is refused before any history is
+    /// asked for. review-fix-sync-3: a peer whose manifest ends before the joiner's checkpoint
+    /// says so (`SnapshotBehind`, so the joiner waits for a newer snapshot), also without asking
+    /// for history.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peer_paging_history_forever_loses_the_attempt() {
+        let (root, g, seeds) = four_validators("endless");
+        let m = manifest(&g, &seeds, 104);
+        let mut future = m.clone();
+        future.height = 1_000_000_000_000;
+        let manifests = std::collections::BTreeMap::from([("trickle".to_string(), m.clone()), ("flat".to_string(), m.clone()), ("future".to_string(), future), ("behind".to_string(), m.clone())]);
+        let (base, hits) = fast_sync_peers(&g, manifests).await;
+        let url = |who: &str| format!("{base}/{who}");
+        let limits = DownloadLimits {
+            history_per_epoch: std::time::Duration::from_millis(10),
+            history_slack: std::time::Duration::from_millis(200),
+            history_max: std::time::Duration::from_secs(1),
+            per_chunk: std::time::Duration::from_millis(10),
+            slack: std::time::Duration::from_millis(100),
+            ..DownloadLimits::default()
+        };
+        assert_eq!(limits.history(0, 10), std::time::Duration::from_millis(310));
+        assert_eq!(limits.history(0, u64::MAX), std::time::Duration::from_secs(1), "capped");
+        let client = reqwest::Client::new();
+        // The page that changes nothing: refused on the first one (it used to page on until the
+        // manifest's epoch, as far off as the peer liked).
+        let e = format!("{:#}", fetch_history(&client, &url("flat"), 0, u64::MAX / 4, &limits).await.unwrap_err());
+        assert!(e.contains("must hold a set change"), "{e}");
+        let n = hits.lock().clone();
+        assert_eq!(n["flat/epochs"], 1, "{n:?}");
+        // The trickler alone: out of time on the history, long before its pages run out.
+        let genesis_only = Trust::new(&g, &Pins::default(), false).unwrap();
+        let (home, chain) = joiner(&g, "endless");
+        let started = std::time::Instant::now();
+        let e = format!("{:#}", fast_sync_with(&chain, &[url("trickle")], &genesis_only, &limits).await.unwrap_err());
+        assert!(e.contains("within"), "{e}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(3), "{:?}", started.elapsed());
+        let n = hits.lock().clone();
+        assert!(n["trickle/epochs"] <= 3, "{n:?}");
+        // With another peer listed, that one is asked too, whichever comes first.
+        hits.lock().clear();
+        let started = std::time::Instant::now();
+        assert!(fast_sync_with(&chain, &[url("trickle"), url("none")], &genesis_only, &limits).await.is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(3), "{:?}", started.elapsed());
+        let n = hits.lock().clone();
+        assert_eq!((n["trickle/latest"], n["none/latest"]), (1, 1), "{n:?}");
+        // A manifest past the chain's expected height: nothing more is fetched for it.
+        hits.lock().clear();
+        let e = format!("{:#}", fast_sync_with(&chain, &[url("future")], &genesis_only, &limits).await.unwrap_err());
+        assert!(e.contains("past any height the chain can have reached"), "{e}");
+        assert!(!hits.lock().clone().contains_key("future/epochs"));
+        // Behind the joiner's checkpoint (#200 > #104): wait for a later snapshot.
+        let ahead = Trust::new(&g, &Pins { checkpoints: vec![Checkpoint { height: 200, hash: "ab".repeat(32), set_hash: None }], ..Default::default() }, false).unwrap();
+        let e = fast_sync_with(&chain, &[url("behind")], &ahead, &limits).await.unwrap_err();
+        assert!(e.chain().any(|c| c.is::<SnapshotBehind>()), "{e:#}");
+        assert!(!hits.lock().clone().contains_key("behind/epochs"));
+        assert_eq!(chain.lock().height(), 0);
+        std::fs::remove_dir_all(home).ok();
+        std::fs::remove_dir_all(root).ok();
     }
 
     /// F62: fast sync asks the peers in a new order each run, so no listed endpoint is always first.
