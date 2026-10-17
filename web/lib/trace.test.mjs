@@ -66,3 +66,10 @@ test("the follow list round-trips through a URL without the root", () => {
   assert.deepEqual(parseFollow("boo1mina, boo1lucy,"), ["boo1mina", "boo1lucy"]);
   assert.deepEqual(parseFollow(null), []);
 });
+
+test("a distribution's claim is drawn from the distribution to the claimant; a vote moves nothing", () => {
+  const claim = tx({ kind: "claim_distribution", from: vlad, amount: String(1000n * F), action: { type: "claim_distribution", distribution_id: 2 } });
+  const vote = tx({ kind: "vote", from: vlad, amount: String(50n * F), action: { type: "vote", proposal_id: 1 } });
+  const { moves } = movesOf([claim, vote]);
+  assert.deepEqual(moves.map((m) => [m.from, m.to, m.amount]), [["holding:distribution:2", "boo1vlad", 1000n * F]]);
+});

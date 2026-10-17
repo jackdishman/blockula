@@ -77,7 +77,10 @@ export function movesOf(txs: Iterable<TxDetail>): { moves: Move[]; who: Map<stri
     know(tx.to);
     for (const c of effectsOf(tx).changes) {
       know(c.who);
-      if (c.delta > 0n && c.who.address !== tx.from.address) moves.push({ tx: tx.id, from: tx.from.address, to: c.who.address, amount: c.delta, height: tx.height });
+      if (c.who.address === tx.from.address) continue;
+      // Whoever gained was paid by the sender; a holding that lost (a distribution's claim) paid it.
+      if (c.delta > 0n) moves.push({ tx: tx.id, from: tx.from.address, to: c.who.address, amount: c.delta, height: tx.height });
+      else if (c.delta < 0n) moves.push({ tx: tx.id, from: c.who.address, to: tx.from.address, amount: -c.delta, height: tx.height });
     }
   }
   return { moves, who };

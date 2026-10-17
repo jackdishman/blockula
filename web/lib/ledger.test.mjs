@@ -2,7 +2,7 @@
 // the node's /api/tx output. Run with `npm test -w @blockula/web`.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { bySigner, compactDrops, counterparty, deltaFor, effectsOf, flowsOf, formatDrops, fromMySide } from "./explorer/ledger.ts";
+import { amountLeaves, bySigner, compactDrops, counterparty, deltaFor, effectsOf, flowsOf, formatDrops, fromMySide } from "./explorer/ledger.ts";
 
 const F = 1_000_000_000n;
 const label = (name, address = `boo1${name}`) => ({ address, name: `${name}.boo`, short: `${address.slice(0, 6)}…` });
@@ -111,30 +111,109 @@ test("formatting drops", () => {
 });
 
 test("a kind this explorer doesn't know claims only its fee, and is never reported as exact", () => {
-  // A newer protocol's claim_distribution pays its amount *to* the sender: guessing would invert it.
-  const fx = effectsOf(tx({ kind: "claim_distribution", from: vlad, amount: String(F) }));
+  // A later protocol's kind may pay its amount *to* the sender: guessing would invert it.
+  const fx = effectsOf(tx({ kind: "summon_bats", from: vlad, amount: String(F) }));
   assert.deepEqual(fx.changes.map((c) => [c.who.name, c.delta]), [["vlad.boo", -1000n]]);
   assert.match(fx.unseen, /doesn't know this kind/);
-  assert.equal(deltaFor(tx({ kind: "shield", from: vlad, amount: String(F) }), vlad.address).exact, false);
+  assert.equal(deltaFor(tx({ kind: "summon_bats", from: vlad, amount: String(F) }), vlad.address).exact, false);
   assert.equal(effectsOf(tx({ kind: "add_key", from: vlad })).unseen, null, "known kinds that move nothing stay exact");
   assert.match(effectsOf(tx({ kind: "reject_claim", from: vlad })).unseen, /forfeited/);
 });
 
-test("a fee above the minimum tips the block's proposer; only the minimum burns", () => {
-  // min_fee(size) = 10,000 + 10 per byte (node/src/types.rs).
+test("a fee above the minimum tips the block's proposer on old nodes; v1 reports the exact tip", () => {
+  // Before v1: min_fee(size) = 10,000 + 10 per byte (node/src/types.rs) burned, the rest tipped.
   const exact = effectsOf(send(vlad, mina, 1, { size_bytes: 5000, fee: "60000" }));
   assert.equal(exact.burned, 60000n);
   assert.equal(exact.changes.length, 2);
   const tipped = effectsOf(send(vlad, mina, 1, { size_bytes: 5000, fee: "70000" }));
   assert.equal(tipped.burned, 60000n);
   assert.deepEqual(tipped.changes.map((c) => [c.who.name, c.delta]), [["vlad.boo", -(F + 70000n)], ["mina.boo", F], ["The block's proposer", 10000n]]);
-  // Later protocols report the tip; a charge capped at max_fee hides the split, and says so.
+  // Protocol v1 charges exactly base fee + tip (node/src/econ.rs check_fee), so `tip` of `fee`
+  // went to the proposer however the charge compares with max_fee (audit main13-protocol-10).
   const v1 = effectsOf(send(vlad, mina, 1, { fee: "50000", max_fee: "90000", tip: "2000" }));
   assert.equal(v1.burned, 48000n);
-  const capped = effectsOf(send(vlad, mina, 1, { fee: "90000", max_fee: "90000", tip: "2000" }));
-  assert.equal(capped.burned, 90000n);
-  assert.match(capped.unseen, /may have tipped/);
+  for (const t of [send(vlad, mina, 1, { fee: "164440", max_fee: "164440", tip: "100000" }), send(vlad, mina, 1, { status: "failed", fee: "164440", max_fee: "164440", tip: "100000" })]) {
+    const fx = effectsOf(t);
+    assert.equal(fx.burned, 64440n, "the SDK signs fee = base + tip, the usual case");
+    assert.equal(fx.changes.find((c) => c.who.name === "The block's proposer").delta, 100000n);
+    assert.equal(fx.unseen, null);
+    assert.equal(deltaFor(t, vlad.address).exact, true);
+  }
+  assert.equal(effectsOf(send(vlad, mina, 1, { fee: "64440", max_fee: "64440", tip: "0" })).burned, 64440n);
   // A tip never counts as money the recipient got.
   const flows = flowsOf([send(vlad, mina, 1, { size_bytes: 5000, fee: "70000" })], mina.address);
   assert.equal(flows.totalIn, F);
+});
+
+// ---- protocol v1 ----
+
+const addr = (c) => `boo1${c.repeat(58)}`;
+const fresh = { address: addr("q"), name: null, short: "boo1qqqq…qqqq" };
+
+test("paying an address may open its account: the sender's side says so, the recipient's stays exact", () => {
+  const t = send(vlad, fresh, 1, { fee: "64920", max_fee: "64920", tip: "0", to_name: null, action: { type: "transfer", to: fresh.address, amount: String(F) } });
+  const fx = effectsOf(t);
+  assert.match(fx.unseen, /account-creation fee/);
+  assert.equal(fx.unseenFor, "sender");
+  assert.equal(deltaFor(t, vlad.address).exact, false);
+  assert.equal(deltaFor(t, fresh.address).exact, true);
+  // Known to have had an account already (it shows up earlier): nothing to flag.
+  assert.equal(effectsOf(t, { recipientExisted: true }).unseen, null);
+  // Known to open one (a preflight reads it): the burn is booked.
+  const opening = effectsOf({ ...t, status: "pending", height: null }, { creationFee: F / 10n });
+  assert.deepEqual(opening.changes.map((c) => c.delta), [-(F + 64920n + F / 10n), F]);
+  assert.equal(opening.burned, 64920n + F / 10n);
+  // A name's owner always has an account; paying a name opens none.
+  assert.equal(effectsOf(send(vlad, mina, 1, { to_name: "mina.boo", action: { type: "transfer", to: "mina.boo", amount: String(F) } })).unseen, null);
+});
+
+test("an older node's to for a name is its owner now; a v1 node's is who it paid when it ran", () => {
+  const signedToName = { action: { type: "transfer", to: "mina.boo", amount: String(F) } };
+  const old = effectsOf(send(vlad, mina, 5, signedToName));
+  assert.match(old.unseen, /owned it when this ran/);
+  assert.equal(effectsOf(send(vlad, mina, 5, { ...signedToName, to_name: "mina.boo" })).unseen, null);
+});
+
+test("v1 kinds: a vote and unlock move nothing, a claim comes in, stake and deposits are held", () => {
+  const vote = tx({ kind: "vote", from: vlad, amount: String(150n * F), action: { type: "vote", proposal_id: 1, aye: true, amount: String(150n * F), conviction: 1 } });
+  assert.deepEqual(effectsOf(vote).changes.map((c) => c.delta), [-1000n]);
+  assert.match(effectsOf(vote).note, /locks 150 FANG/);
+  assert.equal(deltaFor(vote, vlad.address).exact, true);
+  assert.equal(amountLeaves("vote"), false);
+  const claim = tx({ kind: "claim_distribution", from: vlad, amount: String(1000n * F), action: { type: "claim_distribution", distribution_id: 0, amount: String(1000n * F) } });
+  assert.deepEqual(deltaFor(claim, vlad.address), { delta: 1000n * F - 1000n, direction: "in", exact: true });
+  assert.equal(effectsOf(claim).changes[1].who.name, "Community distribution #0");
+  assert.equal(flowsOf([claim], vlad.address).totalIn, 1000n * F);
+  const val = label("val");
+  const del = tx({ kind: "delegate", from: vlad, to: val, amount: String(20n * F), action: { type: "delegate", validator: val.address, amount: String(20n * F) } });
+  assert.deepEqual(effectsOf(del).changes.map((c) => [c.who.name, c.delta]), [["vlad.boo", -(20n * F + 1000n)], ["Stake with val.boo", 20n * F]]);
+  assert.equal(deltaFor(del, val.address).direction, "none", "stake is held in the pool, not paid to the validator");
+  const prop = tx({ kind: "propose", from: vlad, amount: String(1000n * F), action: { type: "propose", deposit: String(1000n * F) } });
+  assert.equal(effectsOf(prop).changes[1].who.name, "Proposal deposit");
+  assert.match(effectsOf(prop).note, /refunded once the proposal reaches quorum/);
+  for (const kind of ["undelegate", "redelegate", "unlock", "transfer_name", "release_name", "multisig_create", "update_validator", "unjail"]) {
+    const fx = effectsOf(tx({ kind, from: vlad }));
+    assert.deepEqual(fx.changes.map((c) => c.delta), [-1000n], kind);
+    assert.equal(fx.unseen, null, kind);
+  }
+  for (const kind of ["renew_name", "withdraw_unbonded", "multisig_approve", "report_equivocation"]) assert.ok(effectsOf(tx({ kind, from: vlad })).unseen, kind);
+});
+
+test("a failure this node remembers without its transaction: dropped changed nothing, one that ran was charged", () => {
+  const dropped = effectsOf({ id: "d", status: "failed", dropped: true, summary: "Transaction dropped without running: x", height: 7 });
+  assert.deepEqual([dropped.changes, dropped.unseen], [[], null]);
+  const ran = effectsOf({ id: "r", status: "failed", dropped: false, summary: "Transaction failed: x", height: 7 });
+  assert.deepEqual(ran.changes, []);
+  assert.match(ran.unseen, /fee was charged/);
+});
+
+test("summaries from my side leave the names I act on alone (audit main13-render-6)", () => {
+  const me = { address: vlad.address, names: ["vlad.boo", "castle.boo", "tomb.boo"], short: vlad.short };
+  assert.equal(fromMySide("vlad.boo offered castle.boo to mina.boo", me), "You offered castle.boo to mina.boo");
+  assert.equal(fromMySide("vlad.boo withdrew its offer of tomb.boo", me), "You withdrew its offer of tomb.boo");
+  assert.equal(fromMySide("vlad.boo renewed vlad.boo for 1 year", me), "You renewed vlad.boo for 1 year");
+  assert.equal(fromMySide("vlad.boo accepted castle.boo", me), "You accepted castle.boo");
+  assert.equal(fromMySide("vlad.boo released tomb.boo", me), "You released tomb.boo");
+  const mina2 = { address: mina.address, names: ["mina.boo", "castle.boo"] };
+  assert.equal(fromMySide("vlad.boo offered castle.boo to mina.boo", mina2), "vlad.boo offered castle.boo to you");
 });
