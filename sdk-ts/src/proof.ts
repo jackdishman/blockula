@@ -302,8 +302,8 @@ export function decodeName(value: Uint8Array): NameRecord {
   const sat = (v: bigint) => (v > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(v));
   const expires_at = sat(r.u64());
   const rec: NameRecord = { name, owner, registered_at, expires_at };
-  // State schema 6 appended `offered_to` (an Option: 0, or 1 and the address), then `grace_blocks`;
-  // older records end earlier.
+  // State schema 6 appended `offered_to` (an Option: 0, or 1 and the address), schema 7
+  // `grace_blocks`; older records end earlier.
   if (r.at === value.length) return rec;
   const tag = r.u8();
   if (tag > 1) throw new Error(`name record: bad offered_to tag ${tag}`);

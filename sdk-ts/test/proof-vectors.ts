@@ -94,8 +94,8 @@ assert.deepEqual({ balance: a.balance.toString(), nonce: a.nonce, keys: a.keys }
 assert.throws(() => decodeAccount(hexToBytes(V.records.account.value).slice(0, 20)), /ends early/);
 const n = decodeName(hexToBytes(V.records.name.value));
 assert.deepEqual(n, { name: V.records.name.name, owner: V.records.name.owner, registered_at: V.records.name.registered_at, expires_at: V.records.name.expires_at, offered_to: V.records.name.offered_to, grace_blocks: V.records.name.grace_blocks });
-// Older records end after the expiry (before schema 6) or after the offer (before the grace was
-// recorded); one cut inside the expiry, the offer or the grace is refused.
+// Older records end after the expiry (before schema 6) or after the offer (schema 6, before the
+// grace was recorded in 7); one cut inside the expiry, the offer or the grace is refused.
 const nameBytes = hexToBytes(V.records.name.value);
 const graceLen = 8;
 const offerLen = 1 + 4 + V.records.name.offered_to.length;

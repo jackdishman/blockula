@@ -1627,7 +1627,8 @@ mod tests {
         let wrap = |name: &str| Action::MultisigPropose { action: Box::new(Action::RegisterName { name: name.into() }) };
         // Mallory's account is a 1-of-1 multisig; erin's a 2-of-2 with frank's key.
         t.ok(&mallory, Action::MultisigCreate { owners: vec![kid(&mallory)], threshold: 1 });
-        t.ok(&erin, crate::types::add_key(&frank, CHAIN_ID, &t.c.genesis_hash.clone(), &erin.address(), "frank", KeyRole::Owner));
+        let gh = t.c.genesis_hash.clone();
+        t.ok(&erin, crate::types::add_key(&frank, CHAIN_ID, &gh, &erin.address(), "frank", KeyRole::Owner));
         t.ok(&erin, Action::MultisigCreate { owners: vec![kid(&erin), kid(&frank)], threshold: 2 });
 
         // The reviewer's bypass: alice waits for coinbase; mallory's 1-of-1 wrap asks for it too.
@@ -1676,7 +1677,14 @@ mod tests {
         t.c.submit(as_key(&t, &erin, &erin, wrap("bybit"))).unwrap();
         t.c.produce_block().unwrap();
         let bybit = t.c.state.governance.next_multisig_id - 1;
-        t.c.submit(as_key(&t, &frank, &erin, approve(&t, bybit))).unwrap();
+        // An approval bound to another action (gap-7-6) wouldn't run the registration: it holds
+        // nothing, and admission refuses it.
+        let stale = as_key(&t, &frank, &erin, Action::MultisigApprove { id: bybit, action_digest: "00".repeat(32) });
+        assert!(!crate::governance::runs_when_included(&t.c.state, &stale, t.c.height() + 1));
+        assert!(t.c.submit(stale).unwrap_err().to_string().contains("isn't the action this approval was signed for"));
+        let bound = as_key(&t, &frank, &erin, approve(&t, bybit));
+        assert!(crate::governance::runs_when_included(&t.c.state, &bound, t.c.height() + 1));
+        t.c.submit(bound).unwrap();
         assert_eq!(waiting(&t, "bybit"), 1);
         let e = t.c.submit(tipped(&t, &carol, Action::RegisterName { name: "bybit".into() })).unwrap_err().to_string();
         assert!(e.contains("already waiting"), "{e}");

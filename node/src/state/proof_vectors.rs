@@ -103,8 +103,8 @@ fn records() -> Value {
     let keys = [("ab".repeat(32), owner), ("cd".repeat(32), session)].into_iter().collect();
     let account = Account { balance: 123_456_789_012_345, nonce: 77, keys, ..Default::default() };
     // A name record as the state stores it; the SDK reads its fields in order, so a version that
-    // appends fields keeps working (schema 6 appended `offered_to`, set here: a pending offer,
-    // and `grace_blocks`, the grace it was registered with).
+    // appends fields keeps working (schema 6 appended `offered_to`, set here: a pending offer;
+    // schema 7 `grace_blocks`, the grace it was registered with).
     let name = encode(&NameRecord { name: "alice".into(), owner: "boo1owner".into(), registered_at: 1234, expires_at: 5678, offered_to: Some("boo1taker".into()), grace_blocks: 2_592_000 });
     json!({
         "account": {
