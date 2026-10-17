@@ -54,7 +54,8 @@ pub enum ValidatorCmd {
     Commission {
         /// e.g. 500 for 5%
         bps: u64,
-        /// File holding the signing key's 32-byte hex seed (the owner's, or the validator's consensus key)
+        /// File holding the signing key's 32-byte hex seed: the owner's, or the validator's
+        /// consensus key, which signs for its owner (once an epoch; never for a multisig owner)
         #[arg(long)]
         key: PathBuf,
         #[arg(long)]
@@ -294,7 +295,8 @@ pub fn run(cmd: ValidatorCmd) -> Result<()> {
                 let remote = Remote::connect(&crate::cli_net::blockula_dir(), &rpc, &pin).await?;
                 let from = match from {
                     Some(f) => remote.resolve(&f).await?,
-                    None => remote.address(&keys),
+                    // A validator's consensus key signs its terms for its owner (they're the owner's call).
+                    None => validator_owner(&remote, &remote.address(&keys)).await?.unwrap_or_else(|| remote.address(&keys)),
                 };
                 send(&remote, &keys, &from, Action::UpdateValidator { commission_bps: bps, p2p_addr: String::new(), http_addr: String::new() }).await
             })?;
@@ -308,10 +310,12 @@ pub fn run(cmd: ValidatorCmd) -> Result<()> {
                 let me = remote.address(&keys);
                 let candidate = remote.resolve(&candidate).await?;
                 let set = get(&remote.rpc, "/validators").await?;
-                let member = set["active"].as_array().into_iter().flatten().find(|v| v["validator"]["address"].as_str() == Some(me.as_str())).ok_or_else(|| anyhow!("{me} isn't in this epoch's set: only its members admit newcomers"))?;
+                if !set["active"].as_array().into_iter().flatten().any(|v| v["validator"]["address"].as_str() == Some(me.as_str())) {
+                    bail!("{me} isn't in this epoch's set: only its members admit newcomers");
+                }
                 let from = match from {
                     Some(f) => remote.resolve(&f).await?,
-                    None => member["owner"]["address"].as_str().unwrap_or(&me).to_string(),
+                    None => validator_owner(&remote, &me).await?.unwrap_or_else(|| me.clone()),
                 };
                 // The epoch the next block is in: the admission fails in any other.
                 let epoch = set["epoch"].as_u64().ok_or_else(|| anyhow!("{rpc} doesn't report the epoch"))?;
@@ -356,6 +360,13 @@ pub fn run(cmd: ValidatorCmd) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// The owner of validator `v` per the node's `/api/validators` (`None`: `v` is no validator).
+async fn validator_owner(remote: &Remote, v: &str) -> Result<Option<String>> {
+    let set = get(&remote.rpc, "/validators").await?;
+    let lists = ["active", "candidates", "jailed", "next_epoch"];
+    Ok(lists.iter().flat_map(|k| set[*k].as_array().cloned().unwrap_or_default()).find(|r| r["validator"]["address"].as_str() == Some(v)).and_then(|r| r["owner"]["address"].as_str().map(String::from)))
 }
 
 fn admin(a: AdminArgs, action: impl FnOnce(String) -> Action) -> Result<()> {

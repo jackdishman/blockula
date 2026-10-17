@@ -27,7 +27,7 @@
 
 ## Protocol v1 actions (tags 30–49)
 
-Every action has an SDK `Wallet` helper that builds, signs and submits it (and waits for it). All of them run on chains with this release. Ghost Mode's actions (tags 50–54: `shield`, `private_transfer`, `unshield`, `set_ghost_address`, `ghost_pause`; [docs/GHOST-MODE.md](docs/GHOST-MODE.md)) are built but off: nodes refuse them with "Ghost Mode is off" until governance activates the `ghost` feature (an `ActivateFeature` proposal, ⅔ supermajority).
+Every action has an SDK `Wallet` helper that builds, signs and submits it (and waits for it). All of them run on chains with this release. Ghost Mode's actions (tags 50–54: `shield`, `private_transfer`, `unshield`, `set_ghost_address`, `ghost_pause`; [docs/GHOST-MODE.md](docs/GHOST-MODE.md)) are built but off: nodes refuse them with "Ghost Mode is off" until governance activates the `ghost` feature (an `ActivateFeature` proposal, ⅔ supermajority). Tags 60–61 are for a set of one or two members: its next newcomer joins only once a quorum of the members admitted it and its node signaled readiness in the epoch's last tenth.
 
 | Tag | Action | SDK (`Wallet`) | MCP tool | CLI |
 |---|---|---|---|---|
@@ -47,6 +47,8 @@ Every action has an SDK `Wallet` helper that builds, signs and submits it (and w
 | 46, 47 | `transfer_name`, `release_name` | `transferName(name, to)` (an offer: the name stays yours until the recipient's `acceptName(name)`; `withdrawNameOffer(name)`), `releaseName(name)` | | `blockula name transfer`, `accept`, `withdraw`, `blockula name release` |
 | 48 | `claim_distribution` | `claimDistribution(id, amount, proof)` | | `blockula gov claim` (`blockula gov tree` builds the proofs) |
 | 49 | `attest_revert` | `attestRevert(claimId, revertSha)` (validator nodes do this) | | |
+| 60 | `validator_ready` | `validatorReady(epoch)` (candidate nodes do this, once a set of one or two admitted them) | | |
+| 61 | `admit_validator` | `admitValidator(validator, { epoch? })` (a member of a set of one or two, by its consensus key: its operator's call) | | `blockula validator admit` |
 
 Reads: `client.staking(account)`, `client.proposals()`, `client.proposal(id)`, `client.params()`, `client.fees()`, `client.upgrade()`, `client.validators()`, `client.distribution(id)`, `client.multisig(account)`. `stakeSummary(raw)` (delegations with `value` and `principal`, unbonding entries with `completes_at` and `ready`, totals), `proposalSummary(raw, rules?)` (tallies, turnout, quorum, council votes, outcome) and `paramsOf(raw)` turn the node's JSON into typed objects, and `sharesFor(delegation, "2")` converts FANG into pool shares for `undelegate`/`redelegate`. The MCP also has `my_stake` and `list_proposals`. On the CLI, `blockula stake show`, `blockula gov list|show`, `blockula name show` and `blockula validator list` read the same endpoints.
 
@@ -66,7 +68,7 @@ Reads: `client.staking(account)`, `client.proposals()`, `client.proposal(id)`, `
 | GET | `/api/key/{key_id}?after=&limit=` | accounts this key is authorized on (only accounts it consented to), a page at a time (`next`) |
 | GET | `/api/search/{q}` | `{type, id}` for anything |
 | POST | `/api/faucet` `{to}` | 100 FANG on faucet chains (1 per address/hour, 1 per IP/10 min; unlimited from localhost) |
-| GET | `/api/validators` | epoch, blocks until the next one, active / next-epoch (joining, leaving) / candidate / jailed / tombstoned / removed validators with stake, self-bond, commission, jail and liveness; the churn limit, min self-bond, slashing and downtime parameters |
+| GET | `/api/validators` | epoch, blocks until the next one, active / next-epoch (joining, leaving) / candidate / jailed / tombstoned / removed validators with stake, self-bond, commission, jail and liveness (and `ready_at`, `admitted`); the churn limit, `admission` (a set of one or two: the members, the quorum that must admit a newcomer, and `ready_from`), min self-bond, slashing and downtime parameters |
 | GET | `/api/staking/{address\|name}` | an account's delegations (shares, value, earnings), unbonding and redelegation entries (and when they're free), the validators it runs, a `summary` |
 | GET | `/api/genesis` | the chain's genesis.json |
 | GET | `/api/sync?from=&limit=` | finalized consensus blocks + a finalization certificate (served by every node; used by `blockula join`); `410` `pruned` when `from` is below `history_from` |
