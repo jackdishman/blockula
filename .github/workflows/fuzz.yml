@@ -1,11 +1,19 @@
 # SEC-3: fuzzing the node's network-facing decoders (node/fuzz, see its README.md).
-# PRs that touch the node check the harness and its seeds on the pinned stable toolchain; the
-# fuzzers themselves run nightly and on demand, a few minutes per target, keeping their corpus
-# between runs.
+# Every PR checks the harness and its seeds on the pinned stable toolchain (a required check, so it
+# runs on every PR: a path filter would leave it pending); the fuzzers themselves run nightly and
+# on demand, a few minutes per target, keeping their corpus between runs.
+#
+# This repository is public, and so are its workflow logs and artifacts. A fuzzer crash is an
+# undisclosed vulnerability, often a remote crash of every validator, so (audit supply-chain-B-1):
+#   - the fuzzer's output (the panic, the input in base64) goes to a file, never to the log: a
+#     crash shows up only as "Fuzz <target>: crash found";
+#   - the crash files and that log leave the runner only encrypted to the maintainers' age keys
+#     (repository variable FUZZ_CRASH_AGE_RECIPIENTS, scripts/fuzz-seal-crash.sh); without it
+#     nothing is kept. The only artifact is the sealed *.age file (scripts/check-fuzz-workflow.sh);
+#   - a crash is handled as a private security advisory (SECURITY.md, node/fuzz/README.md).
 name: Fuzz
 on:
   pull_request:
-    paths: ["node/**", ".github/workflows/fuzz.yml"]
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
@@ -30,7 +38,8 @@ env:
 
 jobs:
   harness:
-    name: Harness and seeds (stable)
+    # A required status check (ci.yml's header, deploy/github/ruleset-main.json): keep the name.
+    name: Fuzz harness
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -41,7 +50,8 @@ jobs:
         with: { workspaces: node/fuzz }
       - name: Fuzz crate matches the node's modules and dependencies
         run: node/fuzz/check-sync.sh
-      - name: Seeds are accepted; open findings still reproduce
+      # Open findings live outside this public tree (node/fuzz/README.md): here, only the seeds.
+      - name: Seeds are accepted
         run: cargo test --locked --manifest-path node/fuzz/Cargo.toml
 
   fuzz:
@@ -55,6 +65,7 @@ jobs:
         target: [cblock, tx_json, tx_wire, snapshot_manifest, state_snapshot, sync_batch, epochs_registry, certificate, state_machine, ghost_tx, evidence]
     env:
       SECONDS_PER_TARGET: ${{ github.event.inputs.seconds || '300' }}
+      TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { persist-credentials: false }
@@ -68,6 +79,11 @@ jobs:
       # cargo-fuzz has no --locked: fail here instead if node/fuzz/Cargo.lock is out of date.
       - name: Dependencies match node/fuzz/Cargo.lock
         run: cargo fetch --locked --manifest-path node/fuzz/Cargo.toml
+      # Built in its own step, so a build failure is in the log; the run below prints nothing.
+      - name: Build the fuzzer
+        working-directory: node
+        run: cargo "+$FUZZ_NIGHTLY" fuzz build "$TARGET"
+      # The corpus is saved only after a run without a crash (actions/cache saves on success).
       - name: Restore the corpus
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -75,14 +91,33 @@ jobs:
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: fuzz-corpus-${{ matrix.target }}-
       - name: Fuzz
+        id: fuzz
         working-directory: node
         run: |
-          mkdir -p fuzz/corpus/${{ matrix.target }}
-          cargo "+$FUZZ_NIGHTLY" fuzz run ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} -- \
-            "-max_total_time=$SECONDS_PER_TARGET" -timeout=20 -rss_limit_mb=4096 -print_final_stats=1
-      - name: Upload crashes
-        if: failure()
+          mkdir -p "fuzz/corpus/$TARGET" "$RUNNER_TEMP/crash/$TARGET"
+          if cargo "+$FUZZ_NIGHTLY" fuzz run "$TARGET" "fuzz/corpus/$TARGET" "fuzz/seeds/$TARGET" -- "-max_total_time=$SECONDS_PER_TARGET" -timeout=20 -rss_limit_mb=4096 -print_final_stats=0 > "$RUNNER_TEMP/crash/$TARGET/fuzz.log" 2>&1; then
+            echo "✓ $TARGET: no crash in ${SECONDS_PER_TARGET}s"
+            rm -rf "$RUNNER_TEMP/crash/$TARGET"
+          else
+            echo "crash=1" >> "$GITHUB_OUTPUT"
+            echo "::error::Fuzz $TARGET: crash found (a panic, a timeout or an out-of-memory input). Its details are sealed for the maintainers; it's handled as a private security advisory (SECURITY.md)."
+            exit 1
+          fi
+      - name: Seal the crash for the maintainers
+        id: seal
+        if: failure() && steps.fuzz.outputs.crash == '1'
+        env:
+          RECIPIENTS: ${{ vars.FUZZ_CRASH_AGE_RECIPIENTS }}
+        run: |
+          if [ -d "fuzz/artifacts/$TARGET" ]; then mv "fuzz/artifacts/$TARGET" "$RUNNER_TEMP/crash/$TARGET/artifacts"; fi
+          if [ -n "$RECIPIENTS" ]; then sudo apt-get update -qq > /dev/null && sudo apt-get install -y -qq --no-install-recommends age > /dev/null; fi
+          ../scripts/fuzz-seal-crash.sh "$TARGET" "$RUNNER_TEMP/crash/$TARGET" "$RUNNER_TEMP/sealed"
+        working-directory: node
+      - name: Upload the sealed crash
+        if: failure() && steps.seal.outputs.sealed == '1'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fuzz-crash-${{ matrix.target }}
-          path: node/fuzz/artifacts/${{ matrix.target }}
+          path: ${{ runner.temp }}/sealed/fuzz-crash-${{ matrix.target }}.tar.age
+          if-no-files-found: error
+          retention-days: 14

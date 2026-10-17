@@ -1,3 +1,20 @@
+# Required status checks (audit supply-chain-B-3). The main-branch ruleset requires these jobs by
+# their `name:`, so a job's name is an interface: renaming one without the ruleset leaves a
+# required check that's never reported, and every PR waits on it. The intended ruleset is
+# deploy/github/ruleset-main.json (the maintainer applies it with deploy/github/apply-rulesets.sh,
+# docs/OPERATIONS.md "Repository settings"). scripts/check-required-checks.mjs (the `ops` job)
+# fails unless this list, that file and the jobs that run on every pull request agree:
+#   required: Node (Rust tests + local multi-validator testnet)
+#   required: Packages + wallet build
+#   required: Wallet e2e (Playwright, Chromium)
+#   required: Clippy
+#   required: Dependencies (cargo-deny, npm audit)
+#   required: Supply-chain pins, workflows, monitoring config
+#   required: ml-dsa (node)
+#   required: @noble/post-quantum (SDK)
+#   required: Fuzz harness
+# (the last three are in crypto.yml and fuzz.yml). A new job that runs on pull requests is
+# required too, unless it's listed here as "#   optional: <name>".
 name: CI
 on:
   push: { branches: [main] }
@@ -42,9 +59,14 @@ jobs:
       - run: npm run build -w @blockula/sdk && npm run build -w @blockula/mcp
       - name: 4 validators + full node + SDK e2e + CLI
         run: bash scripts/local-testnet.sh
+      # The validator's release check (docs/OPERATIONS.md "Verifying a release"), with the binary
+      # local-testnet.sh just built: a release can't vouch for its own install.sh (audit F49).
+      - name: Release verification runbook (real blockula release sign|verify)
+        run: bash scripts/test-release-runbook.sh
 
   web:
-    name: Packages + wallet build + SDK vectors
+    # Also the SDK vectors and the MCP's tests; the name stays what the ruleset requires.
+    name: Packages + wallet build
     if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     steps:
@@ -148,3 +170,15 @@ jobs:
         run: node scripts/release-sig.mjs selftest
       - name: install.sh verification policy (offline fake release)
         run: bash scripts/test-install.sh
+      # The fuzz job runs in public: crashes stay out of its log and artifacts (supply-chain-B-1).
+      - name: Fuzz crashes stay private (workflow, open findings)
+        run: bash scripts/check-fuzz-workflow.sh
+      - name: Fuzz crash sealing (a real age round trip)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends age
+          REQUIRE_AGE=1 bash scripts/test-fuzz-seal.sh
+      # The ruleset requires these jobs by name (supply-chain-B-3).
+      - name: Required checks match the ruleset (deploy/github/ruleset-main.json)
+        run: node scripts/check-required-checks.mjs
+      - name: Required-checks checker and ruleset script (offline fake gh)
+        run: bash scripts/test-github-settings.sh

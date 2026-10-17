@@ -32,32 +32,55 @@ fn committed_seeds_are_accepted() {
     }
 }
 
-/// Open findings (README.md) must still reproduce. When one is fixed this fails: move its input
-/// from `harness::open_findings` and `regressions/` to the seeds, where it then guards the fix.
+/// Open findings (README.md "Findings") must still reproduce. They're undisclosed vulnerabilities,
+/// so their inputs never enter this public tree: they live in `private/<target>/` (git-ignored) on
+/// a maintainer's machine, or wherever `BLOCKULA_FUZZ_FINDINGS` points (the advisory's private
+/// fork). Without that directory, as in public CI, this checks nothing. When one is fixed this
+/// fails: once the fix is public, move its input to `harness::seeds`, where it then guards the fix.
 #[test]
 fn open_findings_still_reproduce() {
-    for (target, name, bytes) in harness::open_findings() {
-        let committed = std::fs::read(regressions_dir().join(target).join(name)).unwrap_or_else(|e| panic!("regressions/{target}/{name}: {e}"));
-        assert_eq!(committed, bytes, "regressions/{target}/{name} is out of date: rerun write_seeds");
-        let outcome = std::panic::catch_unwind(|| harness::run(target, &bytes));
-        assert!(outcome.is_err(), "{target}/{name} no longer panics: the finding is fixed, so make it a seed (see README.md)");
+    let dir = findings_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        eprintln!("no open findings here ({} doesn't exist): nothing to reproduce", dir.display());
+        return;
+    };
+    let mut inputs = Vec::new();
+    for entry in entries {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let target = harness::TARGETS.iter().find(|t| **t == name).unwrap_or_else(|| panic!("{}: not a fuzz target (one directory per target: {:?})", path.display(), harness::TARGETS));
+        for f in std::fs::read_dir(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())) {
+            let f = f.unwrap().path();
+            if !f.file_name().unwrap().to_string_lossy().starts_with('.') {
+                inputs.push((*target, f));
+            }
+        }
     }
+    inputs.sort();
+    for (target, f) in &inputs {
+        let bytes = std::fs::read(f).unwrap();
+        let outcome = std::panic::catch_unwind(|| harness::run(target, &bytes));
+        assert!(outcome.is_err(), "{} no longer panics: the finding is fixed; once the fix is public, make it a seed (README.md \"Findings\")", f.display());
+    }
+    eprintln!("{} open finding(s) in {} still reproduce", inputs.len(), dir.display());
 }
 
-fn regressions_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("regressions")
+fn findings_dir() -> PathBuf {
+    match std::env::var_os("BLOCKULA_FUZZ_FINDINGS") {
+        Some(d) if !d.is_empty() => PathBuf::from(d),
+        _ => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("private"),
+    }
 }
 
 #[test]
-#[ignore = "generator: rewrites seeds/ and regressions/"]
+#[ignore = "generator: rewrites seeds/"]
 fn write_seeds() {
-    for dir in [seeds_dir(), regressions_dir()] {
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-    for (dir, inputs) in [(seeds_dir(), harness::seeds()), (regressions_dir(), harness::open_findings())] {
-        for (target, name, bytes) in inputs {
-            std::fs::create_dir_all(dir.join(target)).unwrap();
-            std::fs::write(dir.join(target).join(name), bytes).unwrap();
-        }
+    let _ = std::fs::remove_dir_all(seeds_dir());
+    for (target, name, bytes) in harness::seeds() {
+        std::fs::create_dir_all(seeds_dir().join(target)).unwrap();
+        std::fs::write(seeds_dir().join(target).join(name), bytes).unwrap();
     }
 }

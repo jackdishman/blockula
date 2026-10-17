@@ -34,7 +34,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
 import { KnownChains, completePin, effectivePin, mismatch, mismatchError, resolveNetwork, type Network } from "./network.js";
-import { REPO, RELEASE_KEY_ID, fetchVerifiedRelease } from "./release.js";
+import { REPO, RELEASE_KEY_ID, checkBinaryVersion, fetchVerifiedRelease, latestTagFrom, releaseKeyIdFrom } from "./release.js";
 import { SpendLedger } from "./spend.js";
 import { SERVER_INSTRUCTIONS, UNTRUSTED_NOTE, chainData, clean } from "./untrusted.js";
 
@@ -373,34 +373,46 @@ tool("start_dev_node", "Start a local Blockula dev chain (faucet + built-in expl
 
 tool(
   "install_node",
-  "Download the prebuilt `blockula` node + CLI for this machine from the official GitHub release and install it to ~/.blockula/bin, after the same checks as scripts/install.sh: SHA-256 against the release checksums, build provenance with a logged-in GitHub CLI, and the offline ML-DSA-65 release signature. Once the release key id is known, a release without a valid signature is refused. It says which checks passed; with BLOCKULA_REQUIRE_VERIFY=1 it also requires provenance and refuses a release it can only checksum. Needed for start_dev_node and summon_chain; nothing else needs it.",
+  "Download the prebuilt `blockula` node + CLI for this machine from the official GitHub release and install it to ~/.blockula/bin, after the same checks as scripts/install.sh: the release must be the version asked for (`latest` is resolved to its tag first), SHA-256 against the release checksums, build provenance from that tag with a logged-in GitHub CLI, and the offline ML-DSA-65 release signature. Once the release key id is known, a release without a valid signature is refused. It says which checks passed; with BLOCKULA_REQUIRE_VERIFY=1 it also requires provenance and refuses a release it can only checksum. Needed for start_dev_node and summon_chain; nothing else needs it.",
   { version: z.string().regex(/^(latest|v\d+\.\d+\.\d+)$/).default("latest") },
   async ({ version }) => {
     const target = releaseTarget();
     if (!target) throw new Error(`No prebuilt node for ${process.platform}/${process.arch}. Build from source: https://github.com/${REPO}`);
-    const base = version === "latest" ? `https://github.com/${REPO}/releases/latest/download` : `https://github.com/${REPO}/releases/download/${version}`;
+    const releaseKeyId = releaseKeyIdFrom(process.env.BLOCKULA_RELEASE_KEY_ID, RELEASE_KEY_ID);
+    // Every check is bound to one tag: GitHub redirects /releases/latest to /releases/tag/<tag>.
+    const tag = version === "latest" ? latestTagFrom((await fetch(`https://github.com/${REPO}/releases/latest`, { method: "HEAD", redirect: "follow", signal: AbortSignal.timeout(60_000) })).url) : version;
+    const base = `https://github.com/${REPO}/releases/download/${tag}`;
     const asset = `blockula-${target}.tar.gz`;
     const tmp = mkdtempSync(join(tmpdir(), "blockula-"));
     try {
-      const rel = await fetchVerifiedRelease(base, asset, { releaseKeyId: process.env.BLOCKULA_RELEASE_KEY_ID?.trim().toLowerCase() || RELEASE_KEY_ID, requireVerify: process.env.BLOCKULA_REQUIRE_VERIFY === "1" }, {
+      const rel = await fetchVerifiedRelease(base, asset, { releaseKeyId, requireVerify: process.env.BLOCKULA_REQUIRE_VERIFY === "1", tag }, {
         async download(url) {
           const res = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(300_000) });
           if (res.status === 404) return null;
           if (!res.ok) throw new Error(`download failed (${res.status}): ${url}`);
           return Buffer.from(await res.arrayBuffer());
         },
-        async attest(archive, name) {
+        async attest(archive, name, tag) {
           if (spawnSync("gh", ["auth", "status"], { stdio: "ignore" }).status !== 0) return { result: "unavailable" };
           const file = join(tmp, `attest-${name}`);
           writeFileSync(file, archive);
-          const r = spawnSync("gh", ["attestation", "verify", file, "--repo", REPO, "--signer-workflow", `${REPO}/.github/workflows/release.yml`], { encoding: "utf8" });
+          const r = spawnSync("gh", ["attestation", "verify", file, "--repo", REPO, "--signer-workflow", `${REPO}/.github/workflows/release.yml`, "--source-ref", `refs/tags/${tag}`], { encoding: "utf8" });
           return r.status === 0 ? { result: "ok" } : { result: "failed", detail: r.stderr || r.stdout };
         },
       });
       writeFileSync(join(tmp, asset), rel.archive);
       execFileSync("tar", ["-xzf", join(tmp, asset), "-C", tmp]);
+      // The binary must be the version asked for before it replaces anything.
+      const extracted = join(tmp, `blockula-${target}`, "blockula");
+      let printed = "";
+      try {
+        printed = execFileSync(extracted, ["--version"], { encoding: "utf8" });
+      } catch {
+        // checkBinaryVersion reports it as unrunnable.
+      }
+      checkBinaryVersion(printed, tag);
       mkdirSync(join(HOME, "bin"), { recursive: true });
-      copyFileSync(join(tmp, `blockula-${target}`, "blockula"), INSTALLED_BIN);
+      copyFileSync(extracted, INSTALLED_BIN);
       chmodSync(INSTALLED_BIN, 0o755);
       BIN = INSTALLED_BIN;
       const installed = execFileSync(INSTALLED_BIN, ["--version"], { encoding: "utf8" }).trim();

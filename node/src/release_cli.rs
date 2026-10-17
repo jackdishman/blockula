@@ -7,8 +7,15 @@
 //! * key id: hex BLAKE3 of the public key;
 //! * `.sig` file: one JSON line `{"format","key_id","public_key","signature"}` (hex).
 //!
+//! A release's `checksums.txt` names its tag on its first line, `# blockula-release vX.Y.Z`
+//! (`scripts/release-checksums.sh`), so the signature binds the files to that version; `verify
+//! --tag` checks the line, and an older release's genuine signature can't pass for a newer one
+//! (audit supply-chain-B-2).
+//!
 //! `scripts/install.sh` runs `blockula release verify` (from an already-installed binary) to
-//! check a new release before installing it.
+//! check a new release before installing it. Signing happens only here, with this binary, on the
+//! offline machine (docs/OPERATIONS.md "Releases"): `scripts/release-sig.mjs` verifies, it never
+//! loads a key (audit supply-chain-B-4).
 
 use crate::crypto::{self, Keys};
 use anyhow::{anyhow, bail, ensure, Context, Result};
@@ -39,6 +46,10 @@ pub enum ReleaseCmd {
         /// The release key id to trust (64 hex chars, published in SECURITY.md and OPERATIONS.md)
         #[arg(long = "key-id")]
         key_id: String,
+        /// The release (vX.Y.Z) the file must name on its first line, as checksums.txt does
+        /// ("# blockula-release vX.Y.Z"), so another release's signed checksums can't pass for it
+        #[arg(long)]
+        tag: Option<String>,
         /// The signature file (or give it after the file)
         #[arg(long)]
         sig: Option<PathBuf>,
@@ -106,6 +117,27 @@ pub fn verify(sig: &ReleaseSignature, file: &[u8], expected_key_id: &str) -> Res
     crypto::verify(&public_key, &message(file), &signature).map_err(|_| anyhow!("INVALID signature"))
 }
 
+/// The first line of a release's `checksums.txt`, before the tag (`scripts/release-checksums.sh`).
+pub const TAG_LINE_PREFIX: &str = "# blockula-release ";
+
+fn is_release_tag(tag: &str) -> bool {
+    tag.strip_prefix('v').is_some_and(|v| {
+        let parts: Vec<&str> = v.split('.').collect();
+        parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
+/// `Ok` only if `file`'s first line names release `tag` (`# blockula-release vX.Y.Z`).
+pub fn check_tag(file: &[u8], tag: &str) -> Result<()> {
+    ensure!(is_release_tag(tag), "a release tag is vX.Y.Z, got {tag:?}");
+    let first = file.split(|&b| b == b'\n').next().unwrap_or_default();
+    match std::str::from_utf8(first).ok().and_then(|l| l.strip_prefix(TAG_LINE_PREFIX)) {
+        Some(named) if named == tag => Ok(()),
+        Some(named) => bail!("it's for release {named:?}, not {tag}: another release's signed checksums"),
+        None => bail!("it names no release (no \"{TAG_LINE_PREFIX}vX.Y.Z\" first line; releases before v0.5.0 have none), so it can't be bound to {tag}"),
+    }
+}
+
 /// Shared with `scripts/release-sig.mjs` (VECTOR): seed 07×32 signs this file.
 pub const VECTOR_SEED: [u8; 32] = [7; 32];
 pub const VECTOR_FILE: &str = "0123abcd  blockula-x86_64-unknown-linux-gnu.tar.gz\n";
@@ -149,7 +181,7 @@ pub fn run(cmd: ReleaseCmd) -> Result<()> {
             println!("{}", serde_json::to_string(&sig)?);
             eprintln!("signed {} with key {}", file.display(), sig.key_id);
         }
-        ReleaseCmd::Verify { key_id, sig, file, sig_file } => {
+        ReleaseCmd::Verify { key_id, tag, sig, file, sig_file } => {
             let sig_path = match (sig, sig_file) {
                 (Some(s), None) | (None, Some(s)) => s,
                 _ => bail!("give the signature file once: --sig <file.sig> <file>, or <file> <file.sig>"),
@@ -157,7 +189,13 @@ pub fn run(cmd: ReleaseCmd) -> Result<()> {
             let sig: ReleaseSignature = serde_json::from_slice(&std::fs::read(&sig_path).with_context(|| format!("reading {}", sig_path.display()))?).with_context(|| format!("{} isn't a release signature", sig_path.display()))?;
             let bytes = std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
             verify(&sig, &bytes, &key_id).map_err(|e| anyhow!("✗ {}: {e}", file.display()))?;
-            println!("✓ {} is signed by release key {key_id}", file.display());
+            if let Some(tag) = &tag {
+                check_tag(&bytes, tag).map_err(|e| anyhow!("✗ {}: {e}", file.display()))?;
+            }
+            match tag {
+                Some(tag) => println!("✓ {} is signed by release key {key_id} and is release {tag}'s", file.display()),
+                None => println!("✓ {} is signed by release key {key_id}", file.display()),
+            }
         }
         ReleaseCmd::Selftest => {
             selftest()?;
@@ -207,9 +245,41 @@ mod tests {
         // The CLI paths.
         let sig_path = dir.join("checksums.txt.sig");
         std::fs::write(&sig_path, format!("{line}\n")).unwrap();
-        run(ReleaseCmd::Verify { key_id: id.clone(), sig: Some(sig_path.clone()), file: file.clone(), sig_file: None }).unwrap();
-        run(ReleaseCmd::Verify { key_id: id.clone(), sig: None, file: file.clone(), sig_file: Some(sig_path.clone()) }).unwrap();
-        assert!(run(ReleaseCmd::Verify { key_id: id, sig: None, file: file.clone(), sig_file: None }).is_err());
+        run(ReleaseCmd::Verify { key_id: id.clone(), tag: None, sig: Some(sig_path.clone()), file: file.clone(), sig_file: None }).unwrap();
+        run(ReleaseCmd::Verify { key_id: id.clone(), tag: None, sig: None, file: file.clone(), sig_file: Some(sig_path.clone()) }).unwrap();
+        assert!(run(ReleaseCmd::Verify { key_id: id.clone(), tag: None, sig: None, file: file.clone(), sig_file: None }).is_err());
+        // This checksums.txt names no release, so it can't be bound to one.
+        let untagged = run(ReleaseCmd::Verify { key_id: id, tag: Some("v0.5.0".into()), sig: Some(sig_path), file: file.clone(), sig_file: None });
+        assert!(untagged.unwrap_err().to_string().contains("names no release"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// supply-chain-B-2: a release's genuinely signed checksums.txt can't pass for another
+    /// release's. The tag line is signed with the rest, so it can't be edited either.
+    #[test]
+    fn verify_tag_binds_the_signed_checksums_to_a_release() {
+        let dir = std::env::temp_dir().join(format!("blockula-release-tag-{}-{}", crate::chain::now_ms(), std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let keys = Keys::from_seed([9; 32]);
+        let id = key_id(&keys.public_key());
+        let file = dir.join("checksums.txt");
+        let sig_path = dir.join("checksums.txt.sig");
+        let old = "# blockula-release v0.5.0\nabc  blockula-x86_64-unknown-linux-gnu.tar.gz\n";
+        std::fs::write(&file, old).unwrap();
+        std::fs::write(&sig_path, serde_json::to_string(&sign(&keys, old.as_bytes())).unwrap()).unwrap();
+        let verify_as = |tag: &str| run(ReleaseCmd::Verify { key_id: id.clone(), tag: Some(tag.into()), sig: Some(sig_path.clone()), file: file.clone(), sig_file: None });
+        verify_as("v0.5.0").unwrap();
+        // The older release, replayed as the one asked for.
+        assert!(verify_as("v0.5.1").unwrap_err().to_string().contains("for release \"v0.5.0\", not v0.5.1"));
+        assert!(verify_as("0.5.0").unwrap_err().to_string().contains("vX.Y.Z"));
+        assert!(verify_as("v0.5").is_err() && verify_as("v0.5.0.1").is_err() && verify_as("v0.5.x").is_err());
+        // Relabelling it breaks the signature.
+        std::fs::write(&file, old.replace("v0.5.0", "v0.5.1")).unwrap();
+        assert!(verify_as("v0.5.1").unwrap_err().to_string().contains("INVALID signature"));
+        // The line must be the first one.
+        assert!(check_tag(b"abc  x.tar.gz\n# blockula-release v0.5.0\n", "v0.5.0").is_err());
+        assert!(check_tag(b"# blockula-release v0.5.0", "v0.5.0").is_ok());
+        assert!(check_tag(b"# blockula-release v0.5.0 \n", "v0.5.0").is_err());
         std::fs::remove_dir_all(dir).ok();
     }
 }

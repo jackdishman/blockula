@@ -30,9 +30,14 @@ Swap `cblock` for any target. The first directory is the working corpus (git-ign
 
 `state_machine` is stateful and slow per input (tens of executions a second per core); run it with `-fork=N` for throughput.
 
-On stable, with no fuzzer, `cargo test --manifest-path node/fuzz/Cargo.toml` checks that every seed is still accepted (a format change otherwise leaves the fuzzers mutating dead input) and that open findings (`harness::open_findings()`, inputs in `regressions/`; none today) still reproduce. After a format change, regenerate the seeds with `cargo test --manifest-path node/fuzz/Cargo.toml -- --ignored write_seeds`.
+On stable, with no fuzzer, `cargo test --manifest-path node/fuzz/Cargo.toml` checks that every seed is still accepted (a format change otherwise leaves the fuzzers mutating dead input) and, where they're present, that open findings still reproduce (see [Findings](#findings): their inputs are never in this tree). After a format change, regenerate the seeds with `cargo test --manifest-path node/fuzz/Cargo.toml -- --ignored write_seeds`.
 
-CI (`.github/workflows/fuzz.yml`) runs the stable checks on PRs that touch `node/`, and fuzzes each target for 5 minutes nightly (or on demand, with a chosen duration), keeping the corpus between runs. A crash fails that target's job and uploads the input.
+CI (`.github/workflows/fuzz.yml`) runs the stable checks on every PR (a required check), and fuzzes each target for 5 minutes nightly (or on demand, with a chosen duration), keeping the corpus between runs. The repository is public, and so are its workflow logs and artifacts, so a crash stays private (audit supply-chain-B-1):
+
+- The fuzzer's output (the panic, its file and line, the input in base64) goes to a file, never to the log. A crash fails that target's job with only `Fuzz <target>: crash found`.
+- The crash files and that log leave the runner only encrypted with [age](https://age-encryption.org) to the maintainers' keys, the repository variable `FUZZ_CRASH_AGE_RECIPIENTS` (`scripts/fuzz-seal-crash.sh`; [deploy/github/README.md](../../deploy/github/README.md) sets it). The artifact `fuzz-crash-<target>` holds only `fuzz-crash-<target>.tar.age`. With the variable unset, nothing is kept: the run is red, and a maintainer fuzzes that target privately to find the crash again.
+- The corpus is cached only after a run without a crash, so it never holds a crashing input. It isn't secret either (fork PRs can restore the default branch's caches), so treat it as public.
+- `scripts/check-fuzz-workflow.sh` (CI, `ops` job) fails if a fuzz run's output reaches the log, if anything but `*.age` is uploaded, or if open findings' inputs enter the tree; `scripts/test-fuzz-seal.sh` tests the sealing (a real age round trip in CI).
 
 ### How the crate builds
 
@@ -92,7 +97,14 @@ These are smoke runs, not the two-week soak SEC-3 asks for.
 
 ## Findings
 
-Open findings live in `harness::open_findings()` with their inputs in `regressions/`, and `tests/seeds.rs` (`open_findings_still_reproduce`) checks they still crash. Fixing one makes that test fail on purpose: move the input into the seeds and delete its entry. None are open.
+A fuzzer crash is an undisclosed vulnerability, often a remote crash of every validator at the same height, so it's handled as a [private security advisory](../../SECURITY.md#fuzzing-findings) until the fix has shipped. Nothing about an open one goes into this public tree, an issue, a PR or a public log.
+
+1. **Get the crash.** A red `Fuzz <target>` job means a crash. Download its sealed artifact and decrypt it with your age identity: `gh run download <run id> --repo jackdishman/blockula -n fuzz-crash-<target>`, then `age -d -i ~/.config/blockula/fuzz-age.key fuzz-crash-<target>.tar.age | tar -x -C <private dir>` (the crash files under `artifacts/`, the fuzzer's log in `fuzz.log`). Without `FUZZ_CRASH_AGE_RECIPIENTS` there's no artifact: fuzz the target locally from the same seeds until it crashes again.
+2. **Open a private advisory** (GitHub's "Report a vulnerability", or the maintainers' channel), and fix it in the advisory's temporary private fork ([OPERATIONS.md "Patch distribution"](../../docs/OPERATIONS.md#patch-distribution)).
+3. **Keep the reproducer private.** Put the input in `node/fuzz/private/<target>/` (git-ignored) or in the private fork, pointed to by `BLOCKULA_FUZZ_FINDINGS`. `tests/seeds.rs` (`open_findings_still_reproduce`) checks every input there still crashes; in public CI the directory doesn't exist and the test checks nothing. Fixing one makes that test fail on purpose.
+4. **After the fix is public**, the input becomes a regression seed: add it to `harness::seeds()` (as `fuzz-<n>-…`), run `write_seeds`, and write it up below.
+
+None are open.
 
 **FUZZ-1 (fixed): any fast-sync manifest from epoch 0 crashed the joining node** (now the seed `seeds/snapshot_manifest/fuzz-1-manifest-in-epoch-0`).
 `snapshot::verify_manifest` calls `epochs::verify_chain(g, &m.epochs, epoch)` with the epoch of the manifest's last block. For epoch 0, `verify_chain` ran `claimed.sets.range(1..=0)`, and `BTreeMap::range` panicked ("range start is greater than range end"). `fast_sync` runs inside `block_on` during `join` and validator start-up, so the process died, and did so again on every restart that asked the same peer first. Two ways in:

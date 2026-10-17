@@ -53,9 +53,10 @@ Session keys can only send transfers: staking, voting and name renewals need an 
 
 Downloads the prebuilt `blockula` for this machine from the GitHub release and installs it to `~/.blockula/bin`, after the same checks as `scripts/install.sh` (docs/OPERATIONS.md "Releases"):
 
+0. The version you asked for (`latest` is resolved to its tag first) is bound to every check: `checksums.txt` must name it on its first line (`# blockula-release vX.Y.Z`, covered by the signature), provenance must come from its tag, and the extracted binary's `--version` must match before it's installed. An older, genuinely signed release served as the one asked for is refused.
 1. SHA-256 against the release's `checksums.txt`, always. That only catches a corrupted download.
-2. Build provenance with a logged-in GitHub CLI (`gh attestation verify … --signer-workflow …/release.yml`). A failed check refuses the install.
-3. The offline ML-DSA-65 signature on `checksums.txt` (`checksums.txt.sig`), verified with the SDK against the release key id (built in after the key ceremony; `BLOCKULA_RELEASE_KEY_ID` until then). Once the key id is known, every release must carry a valid signature: a missing or failed one refuses the install, even with valid provenance (an unsigned release is what a compromised GitHub account or workflow would publish).
+2. Build provenance with a logged-in GitHub CLI (`gh attestation verify … --signer-workflow …/release.yml --source-ref refs/tags/<version>`). A failed check refuses the install.
+3. The offline ML-DSA-65 signature on `checksums.txt` (`checksums.txt.sig`), verified with the SDK against the release key id (built in after the key ceremony; `BLOCKULA_RELEASE_KEY_ID` until then, from SECURITY.md or the website; if both are set they must agree). Once the key id is known, every release must carry a valid signature: a missing or failed one refuses the install, even with valid provenance (an unsigned release is what a compromised GitHub account or workflow would publish).
 
 The checks add up: each refuses a release it fails. The result lists what was verified. If only the checksum could be (no key id yet, no `gh`), it says so in a warning, and `BLOCKULA_REQUIRE_VERIFY=1` refuses instead; with a key id, `BLOCKULA_REQUIRE_VERIFY=1` requires provenance as well as the signature.
 

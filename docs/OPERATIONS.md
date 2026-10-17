@@ -16,7 +16,7 @@ Some of what's below needs protocol v1 code that is still landing. Those parts a
 8. [Incident response](#incident-response)
 9. [Runbooks](#runbooks) (one per alert)
 10. [Weak subjectivity](#weak-subjectivity): what a joining node trusts, and checkpoints in releases
-11. [Releases](#releases) and [npm packages](#npm-packages)
+11. [Releases](#releases), [npm packages](#npm-packages) and [repository settings](#repository-settings-github)
 12. [Monitoring](#monitoring)
 13. [Checklists](#checklists)
 
@@ -207,12 +207,18 @@ On a fresh Debian 12 / Ubuntu 24.04 host that meets the [hardware](#reference-ha
 sudo useradd --system --home /var/lib/blockula --shell /usr/sbin/nologin blockula
 sudo install -d -o blockula -g blockula -m 700 /var/lib/blockula
 
-# 2. Install a verified binary (see Releases). As your own user, with `gh auth login` done:
-#    REQUIRE_VERIFY refuses anything not proven by build provenance and, once the release key id
-#    is published, by the release signature too (checked with the blockula you already have).
-curl -fsSLO https://github.com/jackdishman/blockula/releases/latest/download/install.sh
-gh attestation verify install.sh --repo jackdishman/blockula
-BLOCKULA_REQUIRE_VERIFY=1 sh install.sh
+# 2. Install a verified binary ("Verifying a release" under Releases), as your own user with
+#    `gh auth login` done. K is the release key id from SECURITY.md and the website, never from
+#    the release: install.sh comes from the release, so check it before you run it. The blockula
+#    you already run checks the signature (a first install: see "Verifying a release"). Before
+#    the key ceremony there's no key id yet: skip K and the `release verify` line.
+V=vX.Y.Z; K=<release key id>
+gh release download $V --repo jackdishman/blockula --dir rel-$V \
+  --pattern blockula-x86_64-unknown-linux-gnu.tar.gz --pattern 'checksums.txt*' --pattern install.sh
+cd rel-$V
+blockula release verify --key-id $K --tag $V --sig checksums.txt.sig checksums.txt
+sha256sum --ignore-missing -c checksums.txt     # the archive and install.sh: OK
+BLOCKULA_VERSION=$V BLOCKULA_RELEASE_KEY_ID=$K BLOCKULA_RELEASE_URL=file://$PWD BLOCKULA_REQUIRE_VERIFY=1 sh install.sh
 sudo install -m 755 ~/.blockula/bin/blockula /usr/local/bin/blockula
 
 # 3. Create the validator home (generates the consensus key). Use the genesis file from the
@@ -386,8 +392,8 @@ For a vulnerability that's exploitable before a fix is widely deployed:
 
 1. Fix and review in a private fork (a GitHub private security advisory fork). Add a regression test.
 2. Tag a release candidate in the private fork. Build it reproducibly (`scripts/release-build.sh`), and have at least one more maintainer rebuild it and match the hashes.
-3. Sign `checksums.txt` with the release key ([Releases](#releases)) and send the archives, `checksums.txt`, its signature and the source commit to operators through the private channel. Don't send the diff until enough of the set has upgraded, if the diff itself reveals the bug.
-4. Operators verify the signature against the published release key id, install and confirm in the channel. Track it in a checklist: ⅔ of the set is the target, everyone is the goal.
+3. Write `checksums.txt` with `scripts/release-checksums.sh vX.Y.Z <dir of the archives>` (its first line names the version, so the signature binds the files to it), sign it with the release key ([Releases](#releases)) and send the archives, `checksums.txt`, its signature and the source commit to operators through the private channel. Don't send the diff until enough of the set has upgraded, if the diff itself reveals the bug.
+4. Operators verify the signature against the published release key id, for this version: `blockula release verify --key-id <release key id> --tag vX.Y.Z --sig checksums.txt.sig checksums.txt`, so an older signed release can't be passed off as the patch. Then `sha256sum --ignore-missing -c checksums.txt`, install (`BLOCKULA_VERSION=vX.Y.Z BLOCKULA_RELEASE_KEY_ID=<id> BLOCKULA_RELEASE_URL=file://<dir> sh install.sh`, or by hand) and confirm in the channel. Track it in a checklist: ⅔ of the set is the target, everyone is the goal.
 5. When ≥ ⅔ have upgraded (or the activation height passes), publish the source, the public release (normal pipeline, same hashes) and the advisory.
 
 ### Coordinated restart at a height
@@ -403,7 +409,7 @@ For a vulnerability that's exploitable before a fix is widely deployed:
 For a deterministic halt, or a vulnerability that must be closed before it's public:
 
 1. Private fix with a regression test, height-gated (see the playbook above), reviewed by a second maintainer.
-2. Reproducible build, signed offline ([Patch distribution](#patch-distribution)): operators check `blockula release verify --key-id <release key id> --sig checksums.txt.sig checksums.txt` with their installed binary before anything else.
+2. Reproducible build, signed offline ([Patch distribution](#patch-distribution)): operators check `blockula release verify --key-id <release key id> --tag vX.Y.Z --sig checksums.txt.sig checksums.txt` with their installed binary before anything else.
 3. If the chain is running: a coordinated restart at a height onto the patched binary (above). If it's halted: operators install and start; the chain resumes at ⅔.
 4. Afterwards: the public release, the advisory, the post-mortem.
 
@@ -548,7 +554,7 @@ Every release carries a fresh checkpoint for each live chain it knows, in `node/
 1. In the release PR, take the checkpoint from at least three nodes run by different operators, not only the project's: `blockula checkpoint --json --peer … --peer … --peer …`. Append it to the file's `checkpoints` (keep the earlier ones) and note in the PR which operators' nodes you asked and when.
 2. Two reviewers rerun it against nodes they pick, with `--height <H>`, and must get the same entry.
 3. Tag and release as in [Releases](#releases). A release's checkpoint is only useful to joiners for the period after it was taken, so take it within a day or two of the tag.
-4. **Between releases**, roots still go stale after ~10.5 days (less, if governance has shortened the evidence window: then also set `weak_subjectivity_blocks` in the release's file to the period the nodes report in `/api/status`). Every week the release team takes a checkpoint the same way (steps 1 and 2) and signs it on the offline machine like `checksums.txt`: `node scripts/release-sig.mjs sign --key release-key.json checkpoint-<chain id>-<height>.txt > checkpoint-<chain id>-<height>.txt.sig`, where the file holds the `HEIGHT:HASH:SET_HASH` line. It's published with the signature through the same channels as the release key id; joiners verify it with `release-sig.mjs verify` and pass it with `--checkpoint`.
+4. **Between releases**, roots still go stale after ~10.5 days (less, if governance has shortened the evidence window: then also set `weak_subjectivity_blocks` in the release's file to the period the nodes report in `/api/status`). Every week the release team takes a checkpoint the same way (steps 1 and 2) and signs it on the offline machine like `checksums.txt`, with the same verified binary: `blockula release sign --key release-key.json checkpoint-<chain id>-<height>.txt > checkpoint-<chain id>-<height>.txt.sig`, where the file holds the `HEIGHT:HASH:SET_HASH` line. It's published with the signature through the same channels as the release key id; joiners verify it with `blockula release verify --key-id <release key id> --sig checkpoint-<chain id>-<height>.txt.sig checkpoint-<chain id>-<height>.txt` and pass it with `--checkpoint`.
 
 A new chain gets its own file (and a line in `EMBEDDED`, `node/src/checkpoints.rs`) in the first release after its genesis, with the genesis hash and no checkpoints yet.
 
@@ -561,7 +567,8 @@ Every release is reproducible, carries SLSA build provenance, and is signed offl
 1. A maintainer tags `vX.Y.Z` on `main` and pushes the tag. `.github/workflows/release.yml`:
    - builds the four targets with `scripts/release-build.sh`: the toolchain pinned in `rust-toolchain.toml`, Linux in a digest-pinned `rust` image, `--locked`, `SOURCE_DATE_EPOCH` from the commit, build paths remapped, deterministic archives;
    - rebuilds the x86_64 Linux archive on a fresh runner from a different directory and fails unless it's byte-identical;
-   - writes `checksums.txt` (archives, `install.sh`, committed genesis files and the checkpoint files `node/checkpoints/*.json`, see [Checkpoints in releases](#checkpoints-in-releases)) and attests every file with GitHub artifact attestations (SLSA provenance, `actions/attest-build-provenance`);
+   - refuses a tag that isn't `vX.Y.Z` or isn't `node/Cargo.toml`'s version, so `blockula --version` prints the tag;
+   - writes `checksums.txt` with `scripts/release-checksums.sh`: a first line naming the tag (`# blockula-release vX.Y.Z`), then the archives, `install.sh`, committed genesis files and the checkpoint files `node/checkpoints/*.json` (see [Checkpoints in releases](#checkpoints-in-releases)), and attests every file with GitHub artifact attestations (SLSA provenance, `actions/attest-build-provenance`). The tag line is what binds the offline signature to this version: without it, an older release's genuine signature would pass for a newer one (audit supply-chain-B-2);
    - creates a **draft** release. Only that last job can write to the repo.
 2. **Reproduce.** At least two people rebuild the Linux archives independently and compare against the draft:
 
@@ -572,44 +579,59 @@ Every release is reproducible, carries SLSA build provenance, and is signed offl
    ```
 
    Each builder posts the result (and their hashes) in the release issue. macOS archives reproduce only with the same Xcode as the release run (its log prints `xcodebuild -version`).
-3. **Check provenance** of what you'll sign: `gh attestation verify /tmp/rel/checksums.txt --repo jackdishman/blockula --signer-workflow jackdishman/blockula/.github/workflows/release.yml`.
-4. **Sign offline.** Carry `checksums.txt` (only that file) to the offline signing machine, which holds the release key and a checkout with `npm ci` already run:
+3. **Check provenance** of what you'll sign: `gh attestation verify /tmp/rel/checksums.txt --repo jackdishman/blockula --signer-workflow jackdishman/blockula/.github/workflows/release.yml --source-ref refs/tags/vX.Y.Z`, and that its first line is `# blockula-release vX.Y.Z`.
+4. **Sign offline.** Carry `checksums.txt` (only that file) to the offline signing machine. It holds the release key and one `blockula` binary, and nothing else: no checkout, no `npm ci`, no Node.js tooling. A signing process trusts every line of code it loads, and the monorepo's npm tree (the wallet's toolchain included, with install scripts) is far more than the signer needs (audit supply-chain-B-4). The binary is one the signer verified before taking it offline: their own reproduced build (step 2's `scripts/reproduce-release.sh`, whose archive matched; take `blockula` out of it), or a release verified as in [Verifying a release](#verifying-a-release-as-a-user-or-operator). Note its SHA-256 in the release issue, and carry new binaries over only the same way.
 
    ```bash
+   blockula release selftest                          # this binary signs the known-answer vector
+   head -n 1 checksums.txt                            # "# blockula-release vX.Y.Z": the release you mean to sign
    blockula release sign --key release-key.json checksums.txt > checksums.txt.sig
-   blockula release verify --key-id <release key id> --sig checksums.txt.sig checksums.txt
-   # or, from a checkout after npm ci (same format, same known-answer vector):
-   node scripts/release-sig.mjs sign --key release-key.json checksums.txt > checksums.txt.sig
+   blockula release verify --key-id <release key id> --tag vX.Y.Z --sig checksums.txt.sig checksums.txt
    ```
 
-   Carry `checksums.txt.sig` back.
+   Carry `checksums.txt.sig` back. `scripts/release-sig.mjs` has no `sign`: it only verifies, for machines that have a checkout.
 5. **Publish.** `gh release upload vX.Y.Z checksums.txt.sig --repo jackdishman/blockula`, check the draft once more, then `gh release edit vX.Y.Z --draft=false --repo jackdishman/blockula`. With GitHub's immutable releases enabled (repository settings), nobody can swap an asset after that.
 
 ### The release key
 
-- One ML-DSA-65 key, generated on an offline machine with a verified `blockula`: `blockula keygen > release-key.json`. Its **key id** is the hex BLAKE3 of the public key: `blockula release keyid --key release-key.json` (or `node scripts/release-sig.mjs keyid --key release-key.json`).
+- One ML-DSA-65 key, generated on the offline signing machine (set up as in step 4 above: the key and a verified `blockula`, nothing else) with `blockula keygen > release-key.json`. Its **key id** is the hex BLAKE3 of the public key: `blockula release keyid --key release-key.json`. The key doesn't exist yet; generate it this way from the start, never on a machine that has had a checkout or an npm tree.
 - Publish the key id in SECURITY.md, this file, `scripts/install.sh` (`RELEASE_KEY_ID`), the website and the project's social accounts, so a single compromised channel can't swap it. **Release key id:** *not generated yet* (the maintainer fills this in at the key ceremony).
 - Back it up like a validator key (encrypted, offline, two locations). Rotation: sign a statement naming the new key id with the old key, publish it through the same channels, and update every place above.
-- Signature format: the message is `"BLOCKULA_RELEASE_V1"` followed by the exact bytes of `checksums.txt`, signed with FIPS 204 ML-DSA-65 (empty context, deterministic, as `crypto::Keys::sign`). `checksums.txt.sig` is one JSON line: `{"format":"blockula-release-signature-v1","key_id","public_key","signature"}` (hex). Two implementations produce byte-identical signatures: `blockula release` (`node/src/release_cli.rs`) and `scripts/release-sig.mjs`; `blockula release selftest` and `node scripts/release-sig.mjs selftest` check the same known-answer vector.
+- Signature format: the message is `"BLOCKULA_RELEASE_V1"` followed by the exact bytes of `checksums.txt`, signed with FIPS 204 ML-DSA-65 (empty context, deterministic, as `crypto::Keys::sign`). `checksums.txt.sig` is one JSON line: `{"format":"blockula-release-signature-v1","key_id","public_key","signature"}` (hex). `checksums.txt`'s first line, `# blockula-release vX.Y.Z`, is part of the signed bytes; `verify --tag vX.Y.Z` checks it. `blockula release` (`node/src/release_cli.rs`) signs and verifies; `scripts/release-sig.mjs` only verifies (it never loads a key). Both check the same known-answer vector (`blockula release selftest`, `node scripts/release-sig.mjs selftest`), so their signatures are byte-identical.
 - `blockula release verify` is what `install.sh` calls to check a new release's signature with an already-installed binary.
 
 ### Verifying a release as a user or operator
 
 ```bash
 V=vX.Y.Z; T=x86_64-unknown-linux-gnu
-gh release download $V --repo jackdishman/blockula --pattern "blockula-$T.tar.gz" --pattern 'checksums.txt*'
-# 1. Provenance: built by this repo's release workflow from the tag.
+K=<release key id>   # from SECURITY.md, this file, the website and your operators' channel; never from the release
+gh release download $V --repo jackdishman/blockula --dir rel-$V \
+  --pattern "blockula-$T.tar.gz" --pattern 'checksums.txt*' --pattern install.sh
+cd rel-$V
+# 1. The offline signature, against the key id you got independently, and for this release (not an older one).
+blockula release verify --key-id $K --tag $V --sig checksums.txt.sig checksums.txt
+# 2. The files match the signed checksums: the archive and install.sh.
+sha256sum --ignore-missing -c checksums.txt
+# 3. Provenance: built by this repo's release workflow from the tag.
 gh attestation verify blockula-$T.tar.gz --repo jackdishman/blockula \
   --signer-workflow jackdishman/blockula/.github/workflows/release.yml --source-ref refs/tags/$V
-# 2. The offline signature, with the published key id (an installed blockula, or the script from a checkout).
-blockula release verify --key-id <release key id> --sig checksums.txt.sig checksums.txt
-# 3. The archive matches the signed checksums.
-sha256sum --ignore-missing -c checksums.txt
-# 4. Optional, and recommended for validators: rebuild it.
+# 4. Install exactly these files (install.sh repeats the checks on them).
+BLOCKULA_VERSION=$V BLOCKULA_RELEASE_KEY_ID=$K BLOCKULA_RELEASE_URL=file://$PWD BLOCKULA_REQUIRE_VERIFY=1 sh install.sh
+# 5. Optional, and recommended for validators: rebuild it.
 scripts/reproduce-release.sh $V
 ```
 
-`scripts/install.sh` does a subset automatically: the SHA-256 check always, provenance when a logged-in `gh` is available, and the signature when an installed `blockula` can verify it. It prints which checks ran and which it skipped, and refuses a release that fails one. Once the release key id is known (built into `install.sh`, or `BLOCKULA_RELEASE_KEY_ID`), a release without `checksums.txt.sig` is refused outright: provenance alone is all a compromised GitHub account or release workflow can produce, and it can't forge the offline signature (audit F49; the MCP's `install_node` does the same, F69). If neither provenance nor the signature ran, it prints a loud warning. `BLOCKULA_REQUIRE_VERIFY=1` refuses unless provenance was checked and, once a key id is known, the signature too; on a first install there is no `blockula` to check the signature with yet, so install the previous release or a source build first, or verify by hand as above. Validators should always install with `BLOCKULA_REQUIRE_VERIFY=1`. `scripts/test-install.sh` tests this policy offline (CI, `ops` job).
+**Why this order.** `install.sh` comes from the release. Whoever controls the release (a compromised GitHub account or release workflow, OPS-7's adversary) controls the script, any key id built into it, and every check it makes, so its checks are only worth something once the script is known to be genuine. Steps 1 and 2 establish that: the signature, checked by the `blockula` you already run against a key id you got elsewhere, covers `install.sh`'s hash. **`gh attestation verify install.sh` alone doesn't protect against that adversary**: it proves only that the release workflow produced the file, and a compromised workflow attests whatever it builds. Provenance (step 3) catches a swapped or branch-built download; only the offline signature catches a compromised GitHub side (audit F49).
+
+**A first install** has no `blockula` to verify with. Check step 1 with a verifier you already trust instead: a `blockula` on another machine of yours, or `node scripts/release-sig.mjs verify --key-id $K --tag $V --sig checksums.txt.sig checksums.txt` from a checkout you trust after `npm ci` (it only verifies; it holds no key). Then steps 2 to 4. Before the key ceremony there's no key id: provenance (step 3) and the rebuild (step 5) are the checks.
+
+`scripts/install.sh` makes the same checks on what it downloads, so the one-line install (`curl … | sh`) is still checked, just with the script as the trust root:
+- **The version** is bound to every check: `latest` is resolved to its tag first (a mirror, `BLOCKULA_RELEASE_URL`, needs `BLOCKULA_VERSION`), `checksums.txt` must name it on its first line, provenance must come from its tag, and the binary's `--version` must match before it's installed. An older, genuinely signed release served as the one you asked for is refused (audit supply-chain-B-2). Releases before v0.5.0 name no tag: install those with their own `install.sh`.
+- **The checksum**, always. **Provenance**, when a logged-in `gh` is available. **The signature**, when an installed `blockula` can verify it.
+- Once a release key id is known (`BLOCKULA_RELEASE_KEY_ID`, or built into the script after the key ceremony; if both are set they must agree), a release without `checksums.txt.sig` is refused: provenance alone is all a compromised GitHub account or release workflow can produce, and it can't forge the offline signature (audit F49; the MCP's `install_node` does the same, F69). With no installed verifier the signature can't be checked at all, so the script refuses if you gave `BLOCKULA_RELEASE_KEY_ID` or `BLOCKULA_REQUIRE_VERIFY=1`; with only the built-in key id (a developer's first install) it installs with a loud warning.
+- It prints which checks ran and which it skipped. If neither provenance nor the signature ran, it prints a loud warning. `BLOCKULA_REQUIRE_VERIFY=1` refuses unless provenance was checked and, once a key id is known, the signature too. Validators always install as in steps 1 to 4 above.
+
+`scripts/test-install.sh` tests this policy offline (CI, `ops` job), including an older signed release replayed as a newer one. `scripts/test-release-runbook.sh` runs steps 1, 2 and 4 above with the real `blockula release sign|verify` (CI, `node` job). It shows that an `install.sh` whose signature check was removed or rekeyed installs on its own under `BLOCKULA_REQUIRE_VERIFY=1`, and that the runbook stops it, a swapped `install.sh` and an older signed release at the step meant to catch each.
 
 ### npm packages
 
@@ -625,6 +647,14 @@ One-time setup by the maintainer:
 3. GitHub → Settings → Environments → `npm`: add the maintainers as required reviewers and limit deployments to `v*` tags.
 
 To publish: bump both `package.json` versions to the tag's version in the release PR, tag, then Actions → "Publish npm packages" → Use workflow from: the tag → Run (dry run first). Users verify with `npm audit signatures`.
+
+### Repository settings (GitHub)
+
+The checks a PR must pass, who may push release tags and where fuzz crashes go are GitHub settings, which change without a commit. The intended ones are in [`deploy/github`](../deploy/github/README.md): `ruleset-main.json` (a code-owner-approved PR, squash merges, and every CI job that runs on pull requests as a required check, tied to the GitHub Actions app), `ruleset-tags.json` (`v*` tags admin-only) and the variable `FUZZ_CRASH_AGE_RECIPIENTS` (the maintainers' age keys, see [node/fuzz](../node/fuzz/README.md)). As the admin, apply them with `deploy/github/apply-rulesets.sh` (a dry-run diff first, then `--apply`); CI can't.
+
+Required checks are job names. `.github/workflows/ci.yml`'s header lists them, and `scripts/check-required-checks.mjs` (CI, `ops`) fails when that list, `ruleset-main.json` and the workflows drift: a renamed job, a required job skipped or path-filtered on PRs, a new job nobody required (audit supply-chain-B-3). Rename or add a required job in the same PR as the ruleset file, and apply the ruleset when it merges.
+
+With one maintainer, the admin bypass (pull-request mode) is how every PR merges, since nobody approves their own. When a second maintainer joins, make the bypass an emergency path and require a second person's review for `.github/**`, `scripts/**`, `deploy/**`, `deny.toml`, `rust-toolchain.toml` and the lockfiles ([deploy/github/README.md](../deploy/github/README.md#the-admin-bypass)).
 
 ## Monitoring
 

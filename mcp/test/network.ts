@@ -3,7 +3,7 @@
 // 1. resolveNetwork: the network comes from --network / BLOCKULA_NETWORK / BLOCKULA_RPC only;
 //    with nothing set it's the public testnet, never whatever answers on localhost.
 // 2. Pins: chain id, genesis hash, prefix, known genesis per chain id, trust on first use.
-// 3. fetchVerifiedRelease: checksum, provenance and signature outcomes.
+// 3. fetchVerifiedRelease: version binding, checksum, provenance and signature outcomes.
 // 4. The built server against a fake node: refuses a wrong chain before signing anything,
 //    remembers the chain across restarts, and notices a node that switches mid-session.
 import assert from "node:assert/strict";
@@ -20,7 +20,7 @@ import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { RELEASE_SIGNATURE_FORMAT, releaseMessage } from "@blockula/sdk";
 import { KNOWN_GENESIS, KnownChains, LOCAL_RPC, TESTNET_RPC, completePin, effectivePin, mismatch, networkArg, resolveNetwork } from "../src/network.js";
-import { fetchVerifiedRelease, type ReleaseDeps } from "../src/release.js";
+import { checkBinaryVersion, fetchVerifiedRelease, latestTagFrom, releaseKeyIdFrom, type ReleaseDeps } from "../src/release.js";
 
 const G1 = "11".repeat(32);
 const G2 = "22".repeat(32);
@@ -107,46 +107,77 @@ console.log("✓ pins: chain id, genesis, prefix, known genesis, trust on first 
 
 const asset = "blockula-x86_64-unknown-linux-gnu.tar.gz";
 const archive = Buffer.from("pretend this is a tarball");
-const sums = Buffer.from(`${createHash("sha256").update(archive).digest("hex")}  ${asset}\n`);
+const tag = "v9.9.9";
+// checksums.txt as release.yml writes it (scripts/release-checksums.sh): the tag first.
+const checksums = (t: string | null) => Buffer.from(`${t ? `# blockula-release ${t}\n` : ""}${createHash("sha256").update(archive).digest("hex")}  ${asset}\n`);
+const sums = checksums(tag);
 const releaseKey = ml_dsa65.keygen(new Uint8Array(32).fill(7));
 const keyId = bytesToHex(blake3(releaseKey.publicKey));
 const sig = (file: Buffer, key = releaseKey) => Buffer.from(JSON.stringify({ format: RELEASE_SIGNATURE_FORMAT, key_id: bytesToHex(blake3(key.publicKey)), public_key: bytesToHex(key.publicKey), signature: bytesToHex(ml_dsa65.sign(releaseMessage(file), key.secretKey)) }));
-const deps = (files: Record<string, Buffer | null>, attest: Awaited<ReturnType<ReleaseDeps["attest"]>>["result"] = "unavailable"): ReleaseDeps => ({
+// The fake attestation was made on refs/tags/<attestedTag>; like gh with --source-ref, asking for
+// another tag's provenance fails.
+const deps = (files: Record<string, Buffer | null>, attest: Awaited<ReturnType<ReleaseDeps["attest"]>>["result"] = "unavailable", attestedTag = tag): ReleaseDeps => ({
   download: async (url) => files[url.split("/").pop() as string] ?? null,
-  attest: async () => ({ result: attest, detail: "no attestation found" }),
+  attest: async (_archive, _name, asked) => (attest === "ok" && asked !== attestedTag ? { result: "failed", detail: `source ref refs/tags/${asked} doesn't match` } : { result: attest, detail: "no attestation found" }),
 });
 const files = { [asset]: archive, "checksums.txt": sums, "checksums.txt.sig": sig(sums) };
 const base = "https://example/release";
-const ok = await fetchVerifiedRelease(base, asset, { releaseKeyId: keyId, requireVerify: false }, deps(files));
+const opts = (releaseKeyId: string, requireVerify: boolean, t = tag) => ({ releaseKeyId, requireVerify, tag: t });
+const ok = await fetchVerifiedRelease(base, asset, opts(keyId, false), deps(files));
 assert.deepEqual(ok.verified, [`release signature (ML-DSA-65 key ${keyId.slice(0, 16)}…)`]);
 assert.equal(ok.warning, undefined);
-const both = await fetchVerifiedRelease(base, asset, { releaseKeyId: keyId, requireVerify: true }, deps(files, "ok"));
+const both = await fetchVerifiedRelease(base, asset, opts(keyId, true), deps(files, "ok"));
 assert.equal(both.verified.length, 2, "REQUIRE_VERIFY with a key id: provenance and the signature");
-const provenanceOnly = await fetchVerifiedRelease(base, asset, { releaseKeyId: "", requireVerify: true }, deps({ ...files, "checksums.txt.sig": null }, "ok"));
+assert.match(both.verified[0], /tag v9\.9\.9/);
+const provenanceOnly = await fetchVerifiedRelease(base, asset, opts("", true), deps({ ...files, "checksums.txt.sig": null }, "ok"));
 assert.equal(provenanceOnly.verified.length, 1, "before the key ceremony, provenance is what REQUIRE_VERIFY can require");
-const onlySum = await fetchVerifiedRelease(base, asset, { releaseKeyId: "", requireVerify: false }, deps(files));
+const onlySum = await fetchVerifiedRelease(base, asset, opts("", false), deps(files));
 assert.deepEqual(onlySum.verified, []);
 assert.match(onlySum.warning ?? "", /ONLY THE CHECKSUM/);
 const other = ml_dsa65.keygen(new Uint8Array(32).fill(8));
 const tampered = Buffer.from(archive.toString() + "!");
+// supply-chain-B-2: an older release, genuinely signed and attested on its own tag, served as the
+// one asked for.
+const oldSums = checksums("v9.9.8");
+const oldRelease = { ...files, "checksums.txt": oldSums, "checksums.txt.sig": sig(oldSums) };
+const untaggedSums = checksums(null);
+const untagged = { ...files, "checksums.txt": untaggedSums, "checksums.txt.sig": sig(untaggedSums) };
 const releaseRefusals: [string, Promise<unknown>, RegExp][] = [
-  ["unverifiable with REQUIRE_VERIFY", fetchVerifiedRelease(base, asset, { releaseKeyId: "", requireVerify: true }, deps(files)), /BLOCKULA_REQUIRE_VERIFY=1/],
+  ["an older release replayed (signature and its own provenance)", fetchVerifiedRelease(base, asset, opts(keyId, true), deps(oldRelease, "ok", "v9.9.8")), /is for v9\.9\.8, not v9\.9\.9/],
+  ["an older release replayed, checksum only", fetchVerifiedRelease(base, asset, opts("", false), deps(oldRelease)), /is for v9\.9\.8, not v9\.9\.9/],
+  ["a checksums.txt naming no release", fetchVerifiedRelease(base, asset, opts(keyId, false), deps(untagged)), /names no release/],
+  ["provenance from another ref (a branch build)", fetchVerifiedRelease(base, asset, opts(keyId, false), deps(files, "ok", "v9.9.8")), /provenance check FAILED .*from tag v9\.9\.9/],
+  ["not a release tag", fetchVerifiedRelease(base, asset, opts(keyId, false, "latest"), deps(files)), /vX\.Y\.Z tag/],
+  ["unverifiable with REQUIRE_VERIFY", fetchVerifiedRelease(base, asset, opts("", true), deps(files)), /BLOCKULA_REQUIRE_VERIFY=1/],
   // Audit F69: with a release key id, a release without its signature is refused, even with
   // valid provenance (all a compromised GitHub account or workflow can produce).
-  ["no signature file (key id known)", fetchVerifiedRelease(base, asset, { releaseKeyId: keyId, requireVerify: false }, deps({ ...files, "checksums.txt.sig": null })), /no checksums.txt.sig/],
-  ["no signature file, provenance passing", fetchVerifiedRelease(base, asset, { releaseKeyId: keyId, requireVerify: false }, deps({ ...files, "checksums.txt.sig": null }, "ok")), /no checksums.txt.sig/],
-  ["no signature file with REQUIRE_VERIFY", fetchVerifiedRelease(base, asset, { releaseKeyId: keyId, requireVerify: true }, deps({ ...files, "checksums.txt.sig": null }, "ok")), /no checksums.txt.sig/],
-  ["signature without provenance under REQUIRE_VERIFY", fetchVerifiedRelease(base, asset, { releaseKeyId: keyId, requireVerify: true }, deps(files)), /requires build provenance as well/],
-  ["a tampered archive", fetchVerifiedRelease(base, asset, { releaseKeyId: keyId, requireVerify: false }, deps({ ...files, [asset]: tampered })), /checksum mismatch/],
-  ["an archive missing from checksums.txt", fetchVerifiedRelease(base, asset, { releaseKeyId: keyId, requireVerify: false }, deps({ ...files, "checksums.txt": Buffer.from("00  other\n") })), /checksum mismatch/],
-  ["failed provenance", fetchVerifiedRelease(base, asset, { releaseKeyId: keyId, requireVerify: false }, deps(files, "failed")), /provenance check FAILED/],
-  ["checksums signed by another key", fetchVerifiedRelease(base, asset, { releaseKeyId: keyId, requireVerify: false }, deps({ ...files, "checksums.txt.sig": sig(sums, other) })), /signature check FAILED/],
-  ["a signature over other checksums", fetchVerifiedRelease(base, asset, { releaseKeyId: keyId, requireVerify: false }, deps({ ...files, "checksums.txt.sig": sig(Buffer.from("x")) })), /signature check FAILED/],
-  ["a garbled signature file", fetchVerifiedRelease(base, asset, { releaseKeyId: keyId, requireVerify: false }, deps({ ...files, "checksums.txt.sig": Buffer.from("{") })), /isn't valid JSON/],
-  ["no checksums.txt", fetchVerifiedRelease(base, asset, { releaseKeyId: keyId, requireVerify: false }, deps({ ...files, "checksums.txt": null })), /no checksums.txt/],
+  ["no signature file (key id known)", fetchVerifiedRelease(base, asset, opts(keyId, false), deps({ ...files, "checksums.txt.sig": null })), /no checksums.txt.sig/],
+  ["no signature file, provenance passing", fetchVerifiedRelease(base, asset, opts(keyId, false), deps({ ...files, "checksums.txt.sig": null }, "ok")), /no checksums.txt.sig/],
+  ["no signature file with REQUIRE_VERIFY", fetchVerifiedRelease(base, asset, opts(keyId, true), deps({ ...files, "checksums.txt.sig": null }, "ok")), /no checksums.txt.sig/],
+  ["signature without provenance under REQUIRE_VERIFY", fetchVerifiedRelease(base, asset, opts(keyId, true), deps(files)), /requires build provenance as well/],
+  ["a tampered archive", fetchVerifiedRelease(base, asset, opts(keyId, false), deps({ ...files, [asset]: tampered })), /checksum mismatch/],
+  ["an archive missing from checksums.txt", fetchVerifiedRelease(base, asset, opts(keyId, false), deps({ ...files, "checksums.txt": Buffer.from(`# blockula-release ${tag}\n00  other\n`) })), /checksum mismatch/],
+  ["failed provenance", fetchVerifiedRelease(base, asset, opts(keyId, false), deps(files, "failed")), /provenance check FAILED/],
+  ["checksums signed by another key", fetchVerifiedRelease(base, asset, opts(keyId, false), deps({ ...files, "checksums.txt.sig": sig(sums, other) })), /signature check FAILED/],
+  ["a signature over other checksums", fetchVerifiedRelease(base, asset, opts(keyId, false), deps({ ...files, "checksums.txt.sig": sig(Buffer.from("x")) })), /signature check FAILED/],
+  ["a garbled signature file", fetchVerifiedRelease(base, asset, opts(keyId, false), deps({ ...files, "checksums.txt.sig": Buffer.from("{") })), /isn't valid JSON/],
+  ["no checksums.txt", fetchVerifiedRelease(base, asset, opts(keyId, false), deps({ ...files, "checksums.txt": null })), /no checksums.txt/],
 ];
 for (const [label, p, re] of releaseRefusals) await assert.rejects(p, re, label);
-console.log(`✓ install_node: checksum, provenance and signature checks (${releaseRefusals.length} bad releases refused)`);
+// `latest` is resolved to its tag before anything is downloaded, and the binary must report it.
+assert.equal(latestTagFrom("https://github.com/jackdishman/blockula/releases/tag/v0.5.0"), "v0.5.0");
+for (const url of ["https://github.com/jackdishman/blockula/releases/tag/nightly", "https://github.com/jackdishman/blockula/releases", "https://github.com/jackdishman/blockula/releases/tag/v0.5.0/x"]) assert.throws(() => latestTagFrom(url), /isn't a release tag/, url);
+checkBinaryVersion("blockula 9.9.9\n", tag);
+assert.throws(() => checkBinaryVersion("blockula 9.9.8\n", tag), /is blockula 9\.9\.8, not 9\.9\.9/);
+assert.throws(() => checkBinaryVersion("", tag), /unrunnable/);
+// F49/F69: the operator's key id (from an independent channel) and a built-in one must agree.
+assert.equal(releaseKeyIdFrom(undefined, ""), "");
+assert.equal(releaseKeyIdFrom(` ${keyId.toUpperCase()} `, ""), keyId);
+assert.equal(releaseKeyIdFrom(undefined, keyId), keyId);
+assert.equal(releaseKeyIdFrom(keyId, keyId), keyId);
+assert.throws(() => releaseKeyIdFrom("cd".repeat(32), keyId), /isn't BLOCKULA_RELEASE_KEY_ID/);
+assert.throws(() => releaseKeyIdFrom("abc", ""), /64 hex characters/);
+console.log(`✓ install_node: version binding, checksum, provenance and signature checks (${releaseRefusals.length} bad releases refused)`);
 
 // ---- 4. the server, over stdio, against a fake node ----
 

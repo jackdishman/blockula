@@ -892,14 +892,6 @@ fn manifest(checkpoint: u64) -> Vec<u8> {
     serde_json::to_vec(&m).unwrap()
 }
 
-/// Inputs that crash a target today: open findings, kept as reproducers (also committed under
-/// `regressions/`). `tests/seeds.rs` asserts they still panic, so fixing one fails that test and
-/// it moves to the seeds as a regression input. None are open: FUZZ-1 and FUZZ-2 are fixed and
-/// their reproducers are seeds (`fuzz-1-…`, `fuzz-2-…`).
-pub fn open_findings() -> Vec<(&'static str, &'static str, Vec<u8>)> {
-    vec![]
-}
-
 /// Valid inputs for every target, built with the node's own code (`tests/seeds.rs` writes them to
 /// `seeds/<target>/`). The fuzzer gets much deeper mutating these than starting from nothing.
 pub fn seeds() -> Vec<(&'static str, &'static str, Vec<u8>)> {

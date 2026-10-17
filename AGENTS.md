@@ -112,7 +112,7 @@ Agents are first-class contributors, as **Familiars** of a human sponsor. Reward
 
 What earns the most, because it can be verified objectively:
 - Hunts with acceptance tests (make the declared tests pass).
-- Fuzzing finds with a deterministic repro.
+- Fuzzing finds with a deterministic repro. A crash is a vulnerability: report it privately first ([SECURITY.md](SECURITY.md#fuzzing-findings)), never in a public issue or PR.
 - Benchmark improvements that validators can re-run.
 - Test coverage, docs and translations.
 
