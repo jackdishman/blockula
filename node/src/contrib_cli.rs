@@ -747,8 +747,12 @@ pub enum StakeCmd {
     },
     /// Move pool shares to another validator without unbonding
     Redelegate {
-        from: String,
-        to: String,
+        /// The validator the shares leave (its own name: `from` is the signer's `--from`)
+        #[arg(value_name = "FROM")]
+        from_validator: String,
+        /// The validator they move to
+        #[arg(value_name = "TO")]
+        to_validator: String,
         #[command(flatten)]
         shares: Shares,
         #[command(flatten)]
@@ -846,12 +850,12 @@ pub fn stake(cmd: StakeCmd, dir: &Path) -> Result<()> {
             let shares = rt.block_on(shares_of(&signer.rpc, &me, &validator, &Shares { shares, all }))?;
             submit(dir, &signer, Action::Undelegate { validator, shares, amount: 0 }).map(|_| ())
         }
-        StakeCmd::Redelegate { from, to, shares, signer } => {
+        StakeCmd::Redelegate { from_validator, to_validator, shares, signer } => {
             let keys = signer.keys(dir)?;
             let rt = rt()?;
             let me = rt.block_on(signer.from(&keys))?;
-            let shares = rt.block_on(shares_of(&signer.rpc, &me, &from, &shares))?;
-            submit(dir, &signer, Action::Redelegate { from_validator: from, to_validator: to, shares }).map(|_| ())
+            let shares = rt.block_on(shares_of(&signer.rpc, &me, &from_validator, &shares))?;
+            submit(dir, &signer, Action::Redelegate { from_validator, to_validator, shares }).map(|_| ())
         }
         StakeCmd::Withdraw { signer } => submit(dir, &signer, Action::WithdrawUnbonded {}).map(|_| ()),
     }
@@ -868,6 +872,33 @@ mod tests {
         let v = serde_json::json!({ "bonded": "47", "delegations": [{ "validator": { "address": "boo1v", "name": "v.boo" }, "shares": "40", "value": "40", "self_bond": false }, { "validator": { "address": "boo1w", "name": null }, "shares": "7", "value": "7", "self_bond": true }], "entries": [] });
         assert_eq!(delegations(&v), vec![("boo1v".to_string(), 40), ("boo1w".to_string(), 7)]);
         assert!(delegations(&serde_json::json!({})).is_empty());
+    }
+
+    /// `stake undelegate` takes exactly one of `--amount` (signed as an amount, converted by the
+    /// chain: audit gap-7-5), `--shares` or `--all`.
+    #[test]
+    fn undelegate_takes_an_amount_shares_or_all() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            cmd: StakeCmd,
+        }
+        let parse = |args: &[&str]| Cli::try_parse_from(["blockula"].iter().chain(args)).map(|c| c.cmd);
+        let Ok(StakeCmd::Undelegate { validator, shares: Unbonding { amount, shares, all }, .. }) = parse(&["undelegate", "boo1v", "--amount", "2.5"]) else { panic!("--amount parses") };
+        assert_eq!((validator.as_str(), amount.as_deref(), shares, all), ("boo1v", Some("2.5"), None, false));
+        assert!(matches!(parse(&["undelegate", "boo1v", "--shares", "7"]), Ok(StakeCmd::Undelegate { shares: Unbonding { shares: Some(7), amount: None, all: false }, .. })));
+        assert!(matches!(parse(&["undelegate", "boo1v", "--all"]), Ok(StakeCmd::Undelegate { shares: Unbonding { all: true, amount: None, shares: None }, .. })));
+        assert!(parse(&["undelegate", "boo1v"]).is_err(), "one of them is required");
+        assert!(parse(&["undelegate", "boo1v", "--amount", "1", "--all"]).is_err(), "only one");
+        assert!(parse(&["redelegate", "boo1v", "boo1w", "--amount", "1"]).is_err(), "redelegate moves shares");
+        // The validators are positionals of their own: the source used to share the id `from` with
+        // the signer's `--from` (a debug-build panic; in release the signer read the validator as
+        // the account to act for).
+        let Ok(StakeCmd::Redelegate { from_validator, to_validator, signer, .. }) = parse(&["redelegate", "boo1v", "boo1w", "--all"]) else { panic!("redelegate parses") };
+        assert_eq!((from_validator.as_str(), to_validator.as_str(), signer.from), ("boo1v", "boo1w", None));
+        let Ok(StakeCmd::Redelegate { from_validator, signer, .. }) = parse(&["redelegate", "boo1v", "boo1w", "--all", "--from", "vlad.boo"]) else { panic!("with --from") };
+        assert_eq!((from_validator.as_str(), signer.from.as_deref()), ("boo1v", Some("vlad.boo")));
     }
 
     #[test]
