@@ -74,7 +74,9 @@ test("send fills a link made for this chain, and refuses one made for another", 
   await review.click();
   await page.getByRole("button", { name: "Confirm & send" }).click();
   await expect(page.getByRole("heading", { name: "Sent" })).toBeVisible();
-  expect(node.submitted.at(-1)?.action).toEqual({ type: "transfer", to: ALICE, amount: parseFang("1.5").toString() });
+  // Signed as the name (audit gap-7-1, no witnesses here): the chain pays its owner on this chain.
+  expect(node.submitted.at(-1)?.action).toEqual({ type: "transfer", to: "alice.boo", amount: parseFang("1.5").toString() });
+  expect(node.accounts.get(ALICE)?.balance).toBe(parseFang("1.5"));
   expect(node.submitted.at(-1)?.memo).toBe("pumpkins");
 
   // A link from before the check: still filled in, with a notice that it doesn't say its network.
