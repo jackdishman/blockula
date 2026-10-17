@@ -602,11 +602,9 @@ pub fn verify_manifest_from(g: &Genesis, m: &Manifest, history: &EpochRegistry, 
     let params = g.params();
     let epoch = params.epoch_of(last.height);
     // Verifies every set change from the root through `epoch`; only that part is kept, so
-    // `epochs.set(e)` is trusted for root ≤ e ≤ epoch, and nothing past `epoch` is adopted.
-    let set = epochs::verify_from(g, history, root, epoch).context("validator set history")?;
-    let mut verified = history.clone();
-    verified.rebase(root.epoch);
-    verified.truncate(epoch);
+    // `epochs.set(e)` is trusted for root ≤ e ≤ epoch, nothing past `epoch` is adopted, and of
+    // each change's signatures only a quorum that verified (review-fix-sync-2, -5).
+    let (set, verified) = epochs::verify_history(g, history, root, epoch).context("validator set history")?;
     // Certificates of this chain instance only (another genesis under the same id never verifies).
     let ns = consensus::genesis_namespace(g);
     let verifier = verifier_for(&ns, &set)?;
@@ -1112,7 +1110,7 @@ mod tests {
         // The old keys sign whatever they're told to.
         let told = reg.clone();
         for s in &seeds[..3] {
-            reg.sign_missing(&g.chain_id, *s, |e| told.set(e).cloned());
+            reg.sign_missing(&epochs::Instance::of(&g), *s, |e| told.set(e).cloned());
         }
         for e in 7..=10 {
             reg.record(e, keys(&evil));
@@ -1141,13 +1139,106 @@ mod tests {
         assert_eq!(v.epochs.sets.keys().copied().collect::<Vec<_>>(), vec![0], "only the genesis set: no change through epoch 10");
         let mut adopted = v.epochs.clone();
         let executed = steady(&g, 10);
-        assert!(adopted.sign_missing(&g.chain_id, seeds[0], |e| executed.set(e).cloned()).is_empty());
+        assert!(adopted.sign_missing(&epochs::Instance::of(&g), seeds[0], |e| executed.set(e).cloned()).is_empty());
         // Executing on, the joiner records the epochs itself; the planted set never comes back.
         for e in 11..=50 {
             adopted.record(e, keys(&seeds));
         }
         assert_eq!(adopted.set(50), Some(&keys(&seeds)));
-        assert!(adopted.sign_missing(&g.chain_id, seeds[0], |e| executed.set(e).or(executed.set(10)).cloned()).is_empty());
+        assert!(adopted.sign_missing(&epochs::Instance::of(&g), seeds[0], |e| executed.set(e).or(executed.set(10)).cloned()).is_empty());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// F02 (review-integrate-compose-1): instance B relaunches A under the same chain id with the
+    /// same genesis validators (only `created_at_ms` differs, so the genesis hash does). On A, a
+    /// quorum of the genesis keys handed off to a set the attacker holds (it joined A's set, or
+    /// A's keys leaked once A was abandoned). A forged B snapshot certified by those keys under
+    /// B's own namespace, served with A's history, used to verify on B with only B's genesis
+    /// trusted. Handoffs bind the genesis hash now, so A's don't verify on B.
+    #[test]
+    fn handoffs_do_not_replay_across_a_relaunch() {
+        let (root, a, seeds) = four_validators("relaunch");
+        let mut b = a.clone();
+        b.created_at_ms += 1;
+        assert_ne!(crate::checkpoints::genesis_hash(&a), crate::checkpoints::genesis_hash(&b));
+        let evil: Vec<[u8; 32]> = (0..4u8).map(|i| [200 + i; 32]).collect();
+        let history = |g: &Genesis| {
+            let mut reg = steady(g, 5);
+            assert!(reg.record(6, keys(&evil)));
+            let told = reg.clone();
+            for s in &seeds[..3] {
+                reg.sign_missing(&epochs::Instance::of(g), *s, |e| told.set(e).cloned());
+            }
+            for e in 7..=10 {
+                reg.record(e, keys(&evil));
+            }
+            reg
+        };
+        let on_a = history(&a);
+        // On A itself the history verifies (that's A's own weak-subjectivity story).
+        assert!(verify_manifest(&a, &manifest(&a, &evil, 104), &on_a).is_ok());
+        // On B, A's handoffs are no proof of anything.
+        let forged = manifest(&b, &evil, 104);
+        let e = err(verify_manifest(&b, &forged, &on_a));
+        assert!(e.contains("epoch 6") && e.contains("0 valid handoff signatures"), "{e}");
+        let genesis_only = Trust::new(&b, &Pins::default(), false).unwrap();
+        assert!(verify_manifest_trusted(&b, &forged, &on_a, &genesis_only).is_err());
+        // B's own validators signing B's change is what B needs.
+        assert_eq!(verify_manifest(&b, &forged, &history(&b)).unwrap().epochs.set(10), Some(&keys(&evil)));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// review-fix-sync-2, -5: a joiner adopts only what verified. A peer's history with junk at
+    /// a lower signer index than a quorum of valid signatures (epoch 1), and with a set and junk
+    /// proofs past the certified epoch while its `known_through` is that epoch: the manifest
+    /// verifies, but the joiner's registry holds neither, so it serves pages that verify, counts
+    /// only real signatures toward a quorum, and still collects (and signs) epoch 11's handoff.
+    #[test]
+    fn junk_and_entries_past_the_certified_epoch_are_not_adopted() {
+        let (root, g, seeds) = four_validators("junk");
+        let at = epochs::Instance::of(&g);
+        let newcomer = PrivateKey::from_seed_bytes([9; 32]).public_key();
+        let next = {
+            let mut k = keys(&seeds[1..]);
+            k.push(hex::encode(newcomer.as_ref()));
+            k.sort();
+            k
+        };
+        let mut history = steady(&g, 0);
+        assert!(history.record(1, next.clone()));
+        for e in 2..=10 {
+            history.record(e, next.clone());
+        }
+        let told = history.clone();
+        for s in &seeds {
+            history.sign_missing(&at, *s, |e| told.set(e).cloned());
+        }
+        assert_eq!(history.proofs[&1].len(), 4, "all four outgoing validators signed (quorum 3)");
+        let honest = history.clone();
+        let lowest = *history.proofs[&1].keys().next().unwrap();
+        history.proofs.get_mut(&1).unwrap().insert(lowest, "00".repeat(3309));
+        // Past the certified epoch: the set the joiner will execute at 11 (the attacker can know
+        // it), with junk for its handoff.
+        history.sets.insert(11, keys(&seeds));
+        history.proofs.insert(11, (0..4).map(|i| (i, "00".repeat(3309))).collect());
+        let v = verify_manifest(&g, &manifest(&g, &[seeds[1], seeds[2], seeds[3], [9; 32]], 104), &history).unwrap();
+        assert_eq!(v.epochs.known_through, 10);
+        assert!(v.epochs.sets.keys().chain(v.epochs.proofs.keys()).all(|e| *e <= 10), "nothing past the certified epoch");
+        assert!(!v.epochs.proofs[&1].contains_key(&lowest) && v.epochs.proofs[&1].len() == 3, "the junk is left out");
+        let (page, _) = v.epochs.slice(0, epochs::PAGE_BYTES);
+        assert!(epochs::verify_chain(&g, &page, 10).is_ok(), "what it serves verifies");
+        // Executing on, epoch 11's real handoff is still missing here, so it's collected.
+        let mut adopted = v.epochs.clone();
+        adopted.record(11, keys(&seeds));
+        let mut real = honest.clone();
+        real.record(11, keys(&seeds));
+        let told = real.clone();
+        for s in &seeds[1..] {
+            real.sign_missing(&at, *s, |e| told.set(e).cloned());
+        }
+        assert_eq!(adopted.proven_through(), 10);
+        assert_eq!(adopted.merge_sigs(&at, &real), 3);
+        assert_eq!(adopted.proven_through(), 11);
         std::fs::remove_dir_all(root).ok();
     }
 

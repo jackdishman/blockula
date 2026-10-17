@@ -2474,8 +2474,8 @@ impl Chain {
         chain.replay_logs()?;
         if rebuilt_epochs {
             if let Some(saved) = &saved_epochs {
-                let chain_id = chain.genesis.chain_id.clone();
-                chain.epochs.merge_sigs(&chain_id, saved);
+                let at = chain.instance();
+                chain.epochs.merge_sigs(&at, saved);
             }
             chain.save_epochs();
         }
@@ -3002,13 +3002,18 @@ impl Chain {
         Some(keys)
     }
 
+    /// The chain instance handoffs are signed for (its id and genesis hash, F02).
+    pub fn instance(&self) -> crate::epochs::Instance {
+        crate::epochs::Instance::new(&self.genesis.chain_id, crate::consensus::hex_32(&self.genesis_hash))
+    }
+
     /// Signs handoffs for set changes this validator presided over (also retroactively), but only
     /// those its own state shows on both sides: never one it learned from a peer (F08).
     pub fn sign_handoffs(&mut self) -> usize {
         let Some(seed) = self.keys.as_ref().map(|k| k.seed()) else { return 0 };
-        let chain_id = self.genesis.chain_id.clone();
+        let at = self.instance();
         let mut epochs = std::mem::take(&mut self.epochs);
-        let n = epochs.sign_missing(&chain_id, seed, |e| self.executed_set(e)).len();
+        let n = epochs.sign_missing(&at, seed, |e| self.executed_set(e)).len();
         self.epochs = epochs;
         if n > 0 {
             self.save_epochs();
@@ -3018,8 +3023,8 @@ impl Chain {
 
     /// Adds handoff signatures verified elsewhere (`epochs::verify_candidates`).
     pub fn add_handoffs(&mut self, verified: Vec<crate::epochs::Candidate>) -> usize {
-        let chain_id = self.genesis.chain_id.clone();
-        let n = self.epochs.add_verified(&chain_id, verified);
+        let at = self.instance();
+        let n = self.epochs.add_verified(&at, verified);
         if n > 0 {
             self.save_epochs();
         }

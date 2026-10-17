@@ -88,6 +88,12 @@ pub fn genesis_hash() -> &'static str {
     H.get_or_init(|| hex::encode(consensus::genesis_block(genesis()).digest_bytes()))
 }
 
+/// The fixture chain's instance, as handoffs bind it (F02).
+fn instance() -> &'static epochs::Instance {
+    static I: OnceLock<epochs::Instance> = OnceLock::new();
+    I.get_or_init(|| epochs::Instance::of(genesis()))
+}
+
 /// The fixture chain's address prefix (`boo`, the genesis default).
 fn prefix() -> &'static str {
     &genesis().address_prefix
@@ -319,11 +325,12 @@ pub fn epochs_registry(data: &[u8]) -> bool {
     }
     let _ = (reg.proven_through(), reg.set(reg.known_through), reg.set(reg.base));
     let mut ours = EpochRegistry::genesis(g);
-    let wanted = ours.candidates(CHAIN_ID, &reg, 64);
+    let at = instance();
+    let wanted = ours.candidates(at, &reg, 64);
     assert!(wanted.len() <= 64);
-    ours.add_verified(CHAIN_ID, epochs::verify_candidates(wanted));
+    ours.add_verified(at, epochs::verify_candidates(wanted));
     let mut same = reg.clone();
-    same.merge_sigs(CHAIN_ID, &reg);
+    same.merge_sigs(at, &reg);
     let _ = ours.clone().append_page(&reg);
     // Paging what it holds reassembles it, page by page, whatever it holds.
     let (mut first, mut next) = reg.slice(reg.base, 4096);
@@ -974,7 +981,7 @@ pub fn seeds() -> Vec<(&'static str, &'static str, Vec<u8>)> {
     reg.record(1, next.clone());
     reg.record(2, next);
     let executed = reg.clone();
-    reg.sign_missing(CHAIN_ID, VALIDATOR_SEED, |e| executed.set(e).cloned());
+    reg.sign_missing(instance(), VALIDATOR_SEED, |e| executed.set(e).cloned());
     out.push(("epochs_registry", "handoff-epoch-1", serde_json::to_vec(&reg).unwrap()));
     // FUZZ-2's reproducer: a "handoff proof" for epoch 0 made `add_sig` compute `0 - 1`.
     let genesis_set = EpochRegistry::genesis(g).set(0).unwrap().clone();

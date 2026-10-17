@@ -349,6 +349,10 @@ const CROSS_CHAIN: &str = "blockula-kat";
 fn cross_genesis() -> String {
     hex::encode(crypto::hash(b"blockula-kat genesis"))
 }
+/// The same instance, as handoffs bind it (F02).
+fn cross_instance() -> epochs::Instance {
+    epochs::Instance::new(CROSS_CHAIN, crypto::hash(b"blockula-kat genesis"))
+}
 /// Consensus keys of the 4-validator set used for the vote and certificate vectors.
 const VALIDATOR_SEEDS: [[u8; 32]; 4] = [[11; 32], [12; 32], [13; 32], [14; 32]];
 const POP: (&str, &str) = ("203.0.113.7:7071", "https://validator.example:7070");
@@ -437,7 +441,7 @@ fn rust_signed() -> Value {
     c["pop"] = json!({ "chain_id": CROSS_CHAIN, "owner": owner.address(), "p2p_addr": POP.0, "http_addr": POP.1 });
     cases.push(c);
     let (outgoing, incoming) = handoff_keys();
-    let handoff = epochs::handoff_message(CROSS_CHAIN, HANDOFF_EPOCH, &outgoing, &incoming);
+    let handoff = epochs::handoff_message(&cross_instance(), HANDOFF_EPOCH, &outgoing, &incoming);
     cases.push(case("epoch-handoff", VALIDATOR_SEEDS[0], epochs::HANDOFF_CONTEXT, &handoff, v0.sign(epochs::HANDOFF_CONTEXT, &handoff).as_ref()));
     // Context edge cases: empty message, the longest context, and a namespace pq.rs hashes.
     let k = pq::PrivateKey::from_seed_bytes([0xff; 32]);

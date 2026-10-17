@@ -241,10 +241,10 @@ struct PageNext {
 /// first such change on, and verifies only signatures it lacks, without the chain lock.
 async fn exchange_epochs(chain: Shared, peers: Vec<String>) {
     let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
-    let (live, chain_id) = {
+    let (live, instance) = {
         let mut c = chain.lock();
         c.sign_handoffs();
-        (c.live.clone(), c.genesis.chain_id.clone())
+        (c.live.clone(), c.instance())
     };
     loop {
         for peer in &peers {
@@ -265,7 +265,7 @@ async fn exchange_epochs(chain: Shared, peers: Vec<String>) {
                         break;
                     }
                 };
-                wanted = ours.candidates(&chain_id, &page, HANDOFF_VERIFIES_PER_ROUND);
+                wanted = ours.candidates(&instance, &page, HANDOFF_VERIFIES_PER_ROUND);
                 if !wanted.is_empty() {
                     break;
                 }
