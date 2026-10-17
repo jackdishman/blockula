@@ -30,8 +30,11 @@ use std::io::{Read, Write};
 /// base fee); staking slashes once per stake (pools' `slashed_from`), entries indexed by validator
 /// (namespace 64) and epochs' highest views (65); the governance scalars gain the recent treasury
 /// spends, the closed proposals whose votes are being swept and the multisig sweep cursor;
-/// `Distribution` proposals name their distribution id; `Params` lists the owners the bootstrap
-/// delegation passes over.
+/// `Distribution` proposals name their distribution id, and a distribution records the proposal
+/// that opened it (`Distribution::proposal`); `Params` lists the owners the bootstrap delegation
+/// passes over; name records keep the account they're offered to (`offered_to`) and the grace
+/// they were registered with (`grace_blocks`); the `upgrade` scalar record follows the schedule
+/// with what cancellations withdrew (`upgrade::Withdrawals`).
 pub const SCHEMA_VERSION: u32 = 6;
 
 pub fn encode<T: BorshSerialize + ?Sized>(v: &T) -> Vec<u8> {

@@ -417,7 +417,10 @@ fn namespaces_and_meta_keys_are_unique() {
 /// audit fixes) changes the `schema` record, `chain_params` (`tip_cap_multiple`, 20, after
 /// `max_tx_validity_blocks`) and the `governance` and `params` scalars' layouts (their new fields
 /// are empty here); staking's slash bookkeeping and its two new maps are empty here too. The
-/// vectors were regenerated with it and the SDK rebuilt the root from them.
+/// vectors were regenerated with it and the SDK rebuilt the root from them. The second fix round
+/// appended the `upgrade` record's withdrawals (`(0, None)` here: five bytes after the empty
+/// schedule) and fields of name and distribution records (none here); the root moved with the
+/// `upgrade` record and the SDK rebuilt it from the regenerated vectors.
 #[test]
 fn golden_encodings() {
     let acct = Account { balance: 5, nonce: 2, keys: Default::default(), locks: vec![] };
@@ -428,7 +431,7 @@ fn golden_encodings() {
     st.commit_block().unwrap();
     assert_eq!(st.root_hash(), st.full_root());
     assert_eq!(st.record_count(), 13);
-    assert_eq!(st.root(), "da0a1b06dbb7be8cf302ca9ce0cb593bca0e96f88449fca52daa9ff6376f07b4");
+    assert_eq!(st.root(), "72b529606c5641ff2035b14db79cc70e122027bf4e09cd39815be77ee133f12a");
 }
 
 fn million_accounts() -> State {
