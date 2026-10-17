@@ -695,7 +695,7 @@ tool("fund_hunt", `Add FANG to an open Hunt's bounty (crowdfunding). Refunded to
   return isInFlight(r) ? r : { summary: clean(String(r.summary ?? "")), fee: r.fee_display, tx_id: r.id, explorer: explorer(`hunt/${hunt_id}`) };
 });
 
-tool("contribution_pool", `Blockula's contribution pool (Proof of Contribution): its balance, which GitHub repos earn from it, the rules, and the Séance (review jury) that's open now. Merged PRs to pool repos can be claimed for a share; payouts are judged by human juries, square-rooted per sponsor, and vest over ~90 days. ${NO_VALUE}`, {}, async () => {
+tool("contribution_pool", `Blockula's contribution pool (Proof of Contribution): its balance, which GitHub repos earn from it, the rules, and the Séance (review jury) that's open now. Merged PRs to pool repos can be claimed for a share; payouts are judged by human juries, count a sponsor's claims best first (each next a quarter of the one before), and vest over ~90 days. ${NO_VALUE}`, {}, async () => {
   const c = await (await chain()).contributions();
   return {
     pool: chainData(c.pool?.balance_display),
