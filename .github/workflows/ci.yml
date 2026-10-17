@@ -59,6 +59,10 @@ jobs:
       - run: npm run build -w @blockula/sdk && npm run build -w @blockula/mcp
       - name: 4 validators + full node + SDK e2e + CLI
         run: bash scripts/local-testnet.sh
+      # The validator's release check (docs/OPERATIONS.md "Verifying a release"), with the binary
+      # local-testnet.sh just built: a release can't vouch for its own install.sh (audit F49).
+      - name: Release verification runbook (real blockula release sign|verify)
+        run: bash scripts/test-release-runbook.sh
 
   web:
     # Also the SDK vectors and the MCP's tests; the name stays what the ruleset requires.

@@ -628,7 +628,7 @@ scripts/reproduce-release.sh $V
 - Once a release key id is known (`BLOCKULA_RELEASE_KEY_ID`, or built into the script after the key ceremony; if both are set they must agree), a release without `checksums.txt.sig` is refused: provenance alone is all a compromised GitHub account or release workflow can produce, and it can't forge the offline signature (audit F49; the MCP's `install_node` does the same, F69). With no installed verifier the signature can't be checked at all, so the script refuses if you gave `BLOCKULA_RELEASE_KEY_ID` or `BLOCKULA_REQUIRE_VERIFY=1`; with only the built-in key id (a developer's first install) it installs with a loud warning.
 - It prints which checks ran and which it skipped. If neither provenance nor the signature ran, it prints a loud warning. `BLOCKULA_REQUIRE_VERIFY=1` refuses unless provenance was checked and, once a key id is known, the signature too. Validators always install as in steps 1 to 4 above.
 
-`scripts/test-install.sh` tests this policy offline (CI, `ops` job), including an older signed release replayed as a newer one.
+`scripts/test-install.sh` tests this policy offline (CI, `ops` job), including an older signed release replayed as a newer one. `scripts/test-release-runbook.sh` runs steps 1, 2 and 4 above with the real `blockula release sign|verify` (CI, `node` job). It shows that an `install.sh` whose signature check was removed or rekeyed installs on its own under `BLOCKULA_REQUIRE_VERIFY=1`, and that the runbook stops it, a swapped `install.sh` and an older signed release at the step meant to catch each.
 
 ### npm packages
 
