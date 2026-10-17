@@ -43,6 +43,7 @@ test("makes a recovery kit during onboarding: print, download, confirm, activate
   await createWallet(page, {
     kit: async (p) => {
       await p.getByRole("button", { name: "Make my recovery kit" }).click();
+      await expect(p.getByTestId("kit-words")).toBeVisible();
       const words = (await p.getByTestId("kit-words").locator(".kit-w").allTextContents()).map((w) => w.trim());
       const keyId = ((await p.getByTestId("kit-key-id").textContent()) ?? "").trim();
       // The 24 words are the kit key's seed.

@@ -41,11 +41,14 @@ export function RecoveryKitSetup({
 
   const make = async () => {
     setError(null);
+    setBusy(true);
     let made;
     try {
       made = await generateKit(wallet.account, client);
     } catch (e) {
       return setError(friendly(e));
+    } finally {
+      setBusy(false);
     }
     const { words, keyId, grant } = made;
     setStage({
@@ -111,7 +114,8 @@ export function RecoveryKitSetup({
           <p className="dim">
             The words are made here, in this browser, and never sent anywhere. Anyone who finds them can take your account, so keep the kit offline, like a passport.
           </p>
-          <button className="btn primary" onClick={make}>Make my recovery kit</button>
+          <button className="btn primary" disabled={busy} onClick={make}>Make my recovery kit</button>
+          <ErrorNote error={error} />
         </section>
         {skip}
       </div>
