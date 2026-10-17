@@ -1156,10 +1156,12 @@ impl Rate {
 /// another peer's recent rate (blocks and bytes, each round measured over at least a quarter of
 /// a block time), or an empty answer after more than two block times. So a peer that trickles
 /// real, certified blocks just fast enough for the chain, or stalls before saying it has
-/// nothing, gets a round now and then, not the node. A peer with nothing new can't be the bar
-/// (its rate is dropped), and once every peer not benched has said "nothing new" since the last
-/// blocks, the ones benched only for being slower than another are asked again: a slow peer with
-/// blocks beats a fast one with none. The first peer asked is a random one.
+/// nothing, gets a round now and then, not the node. A peer benched only for being slower than
+/// another keeps its rate as a bar while it waits, and is free again once the peers that beat it
+/// stop doing so: when every peer not benched has said "nothing new" since the last blocks (a
+/// slow peer with blocks beats a fast one with none; a peer with nothing new loses its rate), or
+/// when a short round that left blocks behind is far below its rate. The first peer asked is a
+/// random one.
 struct Rotation {
     at: usize,
     benched_until: Vec<Option<std::time::Instant>>,
@@ -1272,6 +1274,20 @@ impl Rotation {
         self.strikes[i] = 0;
         self.benched_until[i] = None;
         self.relative[i] = false;
+        // A short round that left blocks behind (fewer than asked) far below the rate a peer
+        // benched only for being slower than another delivered: that peer is the faster one now,
+        // so it's free again. A peer can't bench another with one fast round and then keep the
+        // turn by trickling (review-r2-sync-1); whoever holds it delivers at least a quarter of
+        // what the benched peer did, in full batches, or in rounds a block time long (judged
+        // against it above).
+        if round.blocks < round.limit && round.took < block_time {
+            for j in (0..self.rates.len()).filter(|j| *j != i) {
+                if self.benched(j, now) && self.relative[j] && self.rates[j].is_some_and(|b| rate.far_below((b.blocks, b.bytes))) {
+                    self.benched_until[j] = None;
+                    self.relative[j] = false;
+                }
+            }
+        }
         self.good_rounds += 1;
         if self.good_rounds.is_multiple_of(EXPLORE_EVERY) {
             self.advance(now);
@@ -1797,6 +1813,65 @@ mod tests {
         assert!(firsts.len() > 1, "{firsts:?}");
     }
 
+    /// review-r2-sync-1: the bar a round is judged against is what another peer really delivered.
+    /// A tiny round answered at once counts as a quarter block time long, so it can't bench a
+    /// full one; a real fast batch can, until its peer has nothing new (its rate goes, and with
+    /// every free peer quiet the benched one is free and isn't judged against the old bar) or
+    /// trickles far below the benched peer (which is free again); a full batch at an epoch's end
+    /// or a trickler's rate frees nobody; and a peer is far slower only in blocks and in bytes.
+    #[test]
+    fn a_bar_is_only_what_a_peer_really_delivered() {
+        let t0 = std::time::Instant::now();
+        let second = Duration::from_secs(1);
+        let ms = Duration::from_millis;
+        // 1 block in 1 ms is 4 a second, not 1,000: a 200-block round of 1.2 s isn't below it.
+        let mut r = Rotation::starting_at(2, 0);
+        assert_eq!(r.progress(round(1, ms(1)), second, t0), None);
+        assert_eq!(r.rates[0].map(|b| b.blocks), Some(4.0));
+        assert_eq!(r.current(), 1, "the untried peer");
+        assert_eq!(r.progress(round(200, ms(1_200)), second, t0), None);
+        // 200 in 10 ms (800 a second over a quarter block time) benches a 4 s round (50 a second).
+        let fast_then_slow = || {
+            let mut r = Rotation::starting_at(2, 0);
+            assert_eq!(r.progress(round(200, ms(10)), second, t0), None);
+            assert_eq!(r.progress(round(200, ms(4_000)), second, t0), Some(SLOW_PEER_BENCH));
+            assert_eq!((r.current(), r.relative[1]), (0, true), "benched for being slower");
+            r
+        };
+        let mut r = fast_then_slow();
+        assert_eq!(r.nothing(ms(1), second, t0), None);
+        assert!(r.rates[0].is_none(), "a peer with nothing new is no bar");
+        assert_eq!(r.current(), 1, "every free peer has nothing: the slower one is free again");
+        assert_eq!(r.progress(round(200, ms(4_000)), second, t0), None, "and no old bar benches it");
+        // A trickle far below the benched peer's rate frees it, and the faster one goes on.
+        let mut r = fast_then_slow();
+        assert_eq!(r.progress(round(1, ms(490)), second, t0), None);
+        assert_eq!((r.current(), r.benched(1, t0)), (1, false));
+        // Not a full batch, however small (the epoch's last blocks) ...
+        let mut r = fast_then_slow();
+        assert_eq!(r.progress(Round { blocks: 3, bytes: 3 * BLOCK_BYTES, limit: 3, took: ms(200) }, second, t0), None);
+        assert!(r.benched(1, t0));
+        // ... nor a short round no slower than the benched peer's rate.
+        assert_eq!(r.progress(round(20, ms(200)), second, t0), None);
+        assert!(r.benched(1, t0));
+        // A round a block time long far below the benched peer's rate is benched in its turn.
+        let mut r = fast_then_slow();
+        assert_eq!(r.progress(round(2, ms(1_000)), second, t0), Some(SLOW_PEER_BENCH), "2 a second against the benched peer's 50");
+        // Far slower in blocks but not in bytes (bigger blocks) isn't far slower.
+        let mut r = Rotation::starting_at(2, 0);
+        r.progress(round(200, ms(10)), second, t0);
+        let big = Round { blocks: 20, bytes: 20 * 100 * BLOCK_BYTES, limit: 200, took: ms(2_000) };
+        assert_eq!(r.progress(big, second, t0), None);
+        // A failed or stalled peer's rate is no bar.
+        let mut r = Rotation::starting_at(2, 0);
+        r.progress(round(200, ms(10)), second, t0);
+        assert_eq!(r.progress(round(200, ms(1_000)), second, t0), None, "200 a second is a quarter of 800: not far below");
+        assert_eq!(r.current(), 0, "the faster one goes on");
+        r.failed(t0);
+        assert_eq!(r.current(), 1);
+        assert_eq!(r.progress(round(200, ms(4_000)), second, t0), None);
+    }
+
     /// F27 (R1 bypass): a peer delivering blocks just over twice the chain's rate passes the
     /// chain-rate floor, but not the comparison with a much faster peer. It gets a first round
     /// (nothing to compare with yet) and the exploration round, then it's benched; and a peer
@@ -1840,8 +1915,17 @@ mod tests {
         Blocks(u64, Duration),
         /// "Nothing new", after this long.
         Nothing(Duration),
+        /// An error, after this long.
+        Fail(Duration),
     }
     const BLOCK_BYTES: u64 = 2_000;
+
+    /// What a simulated peer sees of the node's rotation when it's asked: the worst case, an
+    /// attacker that knows how long each peer stays benched.
+    struct Seen {
+        benched: Vec<Duration>,
+    }
+    type Peer = Box<dyn FnMut(u64, u64, u64, &Seen) -> Answer>;
 
     /// A round of `blocks` blocks of `BLOCK_BYTES` each, out of 200 asked for, sent in `took`.
     fn round(blocks: u64, took: Duration) -> Round {
@@ -1853,7 +1937,7 @@ mod tests {
     /// delivered, `block_time / peers` after "nothing new". `peers[i](from, limit, tip, now)`
     /// answers a request. Starts `behind` blocks behind at peer `start`; returns how far behind
     /// the node is after `run`, and how often each peer was asked.
-    fn simulate(peers: &mut [Box<dyn FnMut(u64, u64, u64, Duration) -> Answer>], behind: u64, start: usize, run: Duration) -> (u64, Vec<usize>) {
+    fn simulate(peers: &mut [Peer], behind: u64, start: usize, run: Duration) -> (u64, Vec<usize>) {
         let block_time = Duration::from_secs(1);
         let epoch = 3_600u64;
         let t0 = std::time::Instant::now();
@@ -1866,7 +1950,8 @@ mod tests {
             asked[i] += 1;
             let from = height + 1;
             let limit = ((from / epoch + 1) * epoch - from).min(200);
-            match peers[i](from, limit, tip(now), now) {
+            let seen = Seen { benched: r.benched_until.iter().map(|b| b.map_or(Duration::ZERO, |t| t.saturating_duration_since(t0 + now))).collect() };
+            match peers[i](from, limit, tip(now), &seen) {
                 Answer::Blocks(n, took) => {
                     let n = n.min(tip(now).saturating_sub(height)).min(limit);
                     now += took;
@@ -1883,13 +1968,18 @@ mod tests {
                     r.nothing(took, block_time, t0 + now);
                     now += block_time / peers.len() as u32;
                 }
+                Answer::Fail(took) => {
+                    now += took;
+                    r.failed(t0 + now);
+                    now += Duration::from_millis(500);
+                }
             }
         }
         (tip(now) - height, asked)
     }
 
     /// An honest peer: everything asked for that exists, in `rtt` plus `per_block` a block.
-    fn honest(rtt: Duration, per_block: Duration) -> Box<dyn FnMut(u64, u64, u64, Duration) -> Answer> {
+    fn honest(rtt: Duration, per_block: Duration) -> Peer {
         Box::new(move |from, limit, tip, _| match tip.checked_sub(from) {
             Some(more) => {
                 let n = (more + 1).min(limit);
@@ -1908,7 +1998,7 @@ mod tests {
     /// 450 ms each) in place of the liar, and with both.
     #[test]
     fn a_fast_tiny_round_then_empty_answers_does_not_capture_sync() {
-        let liar = || -> Box<dyn FnMut(u64, u64, u64, Duration) -> Answer> {
+        let liar = || -> Peer {
             let mut round = 0u64;
             Box::new(move |_, _, _, _| {
                 round += 1;
@@ -1919,7 +2009,7 @@ mod tests {
                 }
             })
         };
-        let trickler = || -> Box<dyn FnMut(u64, u64, u64, Duration) -> Answer> { Box::new(|_, limit, _, _| Answer::Blocks(limit.min(4), Duration::from_millis(450 * limit.min(4)))) };
+        let trickler = || -> Peer { Box::new(|_, limit, _, _| Answer::Blocks(limit.min(4), Duration::from_millis(450 * limit.min(4)))) };
         let slow_honest = || honest(Duration::from_millis(200), Duration::from_millis(4));
         for behind in [600, 3_600, 86_400] {
             for start in [0, 1] {
@@ -1930,6 +2020,51 @@ mod tests {
             }
             let (lag, asked) = simulate(&mut [liar(), trickler(), slow_honest()], behind, 0, Duration::from_secs(3 * 3_600));
             assert!(lag <= 3, "liar and trickler, {behind} behind: {lag} behind after 3 h; asked {asked:?}");
+        }
+    }
+
+    /// review-r2-sync-1, the variants, against a slow honest peer (a 200-block round takes 4 s,
+    /// 50 blocks a second) and hostile peers that see the rotation's state. From a second before
+    /// the honest peer's bench ends they send just enough real blocks to keep the turn and bench
+    /// it again when it's tried, for longer each time: 51 blocks in 240 ms, 4× its pace and a
+    /// little more. While it's benched they trickle single blocks just over twice the chain's rate (one in 490 ms, too short a
+    /// round to judge), answer "nothing new" at once, fail at once, or mix those; one such peer,
+    /// or two. None of them keeps the node from catching up a day of blocks within an hour (the
+    /// honest peer alone takes about half an hour): a trickle far below the benched peer's rate
+    /// frees it, and so does every other peer having nothing. (With 6a338b6's rules, or without
+    /// either way back, the node is tens of thousands of blocks behind after the hour.)
+    #[test]
+    fn hostile_peers_cant_hold_the_turn_after_benching_an_honest_one() {
+        let smart = |honest: usize, then: fn(u64) -> Answer| -> Peer {
+            let mut round = 0u64;
+            Box::new(move |_, limit, _, seen: &Seen| {
+                round += 1;
+                if seen.benched[honest] > Duration::from_secs(1) {
+                    then(round)
+                } else {
+                    Answer::Blocks(limit.min(51), Duration::from_millis(240))
+                }
+            })
+        };
+        let trickle = |_| Answer::Blocks(1, Duration::from_millis(490));
+        let nothing = |_| Answer::Nothing(Duration::from_millis(1));
+        let fail = |_| Answer::Fail(Duration::from_millis(1));
+        let mixed = |round: u64| match round % 3 {
+            0 => Answer::Blocks(1, Duration::from_millis(490)),
+            1 => Answer::Nothing(Duration::from_millis(1)),
+            _ => Answer::Fail(Duration::from_millis(1)),
+        };
+        let slow_honest = || honest(Duration::from_millis(200), Duration::from_millis(19));
+        let day = 86_400;
+        let (alone, _) = simulate(&mut [slow_honest()], day, 0, Duration::from_secs(30 * 60));
+        assert!(alone < 1_000, "the honest peer alone: {alone} behind after half an hour");
+        for (name, then) in [("trickle", trickle as fn(u64) -> Answer), ("nothing", nothing), ("fail", fail), ("mixed", mixed)] {
+            for start in [0, 1] {
+                let (lag, asked) = simulate(&mut [smart(1, then), slow_honest()], day, start, Duration::from_secs(3_600));
+                assert!(lag <= 2, "{name}, starting at {start}: {lag} behind after an hour; asked {asked:?}");
+            }
+            let (lag, asked) = simulate(&mut [smart(2, then), smart(2, then), slow_honest()], day, 2, Duration::from_secs(3_600));
+            assert!(lag <= 3, "two {name}: {lag} behind after an hour; asked {asked:?}");
         }
     }
 
