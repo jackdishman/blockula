@@ -68,6 +68,9 @@ export interface TxDetail {
   amount_display?: string | null;
   fee?: string;
   fee_display?: string;
+  /** Later protocol versions: the most it allowed, and the part that tips the proposer. */
+  max_fee?: string;
+  tip?: string;
   size_bytes?: number;
   nonce?: number;
   signer_key?: string | null;

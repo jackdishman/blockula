@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { deltaFor, formatDrops, fromMySide, type Me } from "@/lib/explorer/ledger";
+import { deltaFor, formatDrops, fromMySide, knownKind, type Me } from "@/lib/explorer/ledger";
 import { to } from "@/lib/explorer/routes";
 import type { TxDetail } from "@/lib/explorer/types";
 import type { KeyView } from "@/lib/types";
@@ -83,7 +83,8 @@ export function Ledger({
     <ul className="ledger">
       {txs.map((t) => {
         const { label, dir } = kindLabel(t, side ?? null);
-        const signed = side ? deltaFor(t, side) : null;
+        // A kind this explorer can't read shows its amount as the node reports it, unsigned.
+        const signed = side && knownKind(t.kind ?? t.action?.type ?? "") ? deltaFor(t, side) : null;
         const signer = side && t.from?.address === side ? signerOf(t, keys, myKeyId) : null;
         return (
           <li key={t.id} className={fresh?.has(t.id) ? "fresh" : undefined}>

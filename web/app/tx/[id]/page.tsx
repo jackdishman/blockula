@@ -185,7 +185,7 @@ export default function TxPage() {
                   <span className="burn">
                     <Term k="burned">Burned forever</Term>
                   </span>
-                  <span className="why">the fee</span>
+                  <span className="why">{fx.burned === fee ? "the fee" : "the fee, less the tip"}</span>
                   <Amount drops={fx.burned} exact />
                 </div>
               )}

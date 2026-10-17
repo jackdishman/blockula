@@ -110,10 +110,31 @@ test("formatting drops", () => {
   assert.equal(compactDrops(0n), "0");
 });
 
-test("a kind this explorer doesn't know is never reported as exact", () => {
-  const fx = effectsOf(tx({ kind: "shield", from: vlad, amount: String(F) }));
+test("a kind this explorer doesn't know claims only its fee, and is never reported as exact", () => {
+  // A newer protocol's claim_distribution pays its amount *to* the sender: guessing would invert it.
+  const fx = effectsOf(tx({ kind: "claim_distribution", from: vlad, amount: String(F) }));
+  assert.deepEqual(fx.changes.map((c) => [c.who.name, c.delta]), [["vlad.boo", -1000n]]);
   assert.match(fx.unseen, /doesn't know this kind/);
   assert.equal(deltaFor(tx({ kind: "shield", from: vlad, amount: String(F) }), vlad.address).exact, false);
   assert.equal(effectsOf(tx({ kind: "add_key", from: vlad })).unseen, null, "known kinds that move nothing stay exact");
   assert.match(effectsOf(tx({ kind: "reject_claim", from: vlad })).unseen, /forfeited/);
+});
+
+test("a fee above the minimum tips the block's proposer; only the minimum burns", () => {
+  // min_fee(size) = 10,000 + 10 per byte (node/src/types.rs).
+  const exact = effectsOf(send(vlad, mina, 1, { size_bytes: 5000, fee: "60000" }));
+  assert.equal(exact.burned, 60000n);
+  assert.equal(exact.changes.length, 2);
+  const tipped = effectsOf(send(vlad, mina, 1, { size_bytes: 5000, fee: "70000" }));
+  assert.equal(tipped.burned, 60000n);
+  assert.deepEqual(tipped.changes.map((c) => [c.who.name, c.delta]), [["vlad.boo", -(F + 70000n)], ["mina.boo", F], ["The block's proposer", 10000n]]);
+  // Later protocols report the tip; a charge capped at max_fee hides the split, and says so.
+  const v1 = effectsOf(send(vlad, mina, 1, { fee: "50000", max_fee: "90000", tip: "2000" }));
+  assert.equal(v1.burned, 48000n);
+  const capped = effectsOf(send(vlad, mina, 1, { fee: "90000", max_fee: "90000", tip: "2000" }));
+  assert.equal(capped.burned, 90000n);
+  assert.match(capped.unseen, /may have tipped/);
+  // A tip never counts as money the recipient got.
+  const flows = flowsOf([send(vlad, mina, 1, { size_bytes: 5000, fee: "70000" })], mina.address);
+  assert.equal(flows.totalIn, F);
 });

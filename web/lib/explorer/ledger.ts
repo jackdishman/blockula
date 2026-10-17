@@ -68,19 +68,46 @@ const UNSEEN: Record<string, string> = {
 const COMPLETE = new Set(["transfer", "fund_pool", "add_key", "remove_key", "register_familiar", "link_github", "unlink_github", "approve_validator", "remove_validator", "set_repo", "grant_soul", "commit_votes", "reveal_votes", ...Object.keys(ESCROW)]);
 
 /** A kind newer than this explorer (a later protocol version) may move FANG in ways it can't read. */
-const UNKNOWN = "This explorer doesn't know this kind of transaction yet, so it may have moved FANG in ways not shown here.";
+const UNKNOWN = "This explorer doesn't know this kind of transaction yet, so only its fee is shown; it may have moved more.";
 
-const unseenOf = (kind: string) => UNSEEN[kind] ?? (COMPLETE.has(kind) ? null : UNKNOWN);
+/** Whether this explorer knows what a kind of transaction moves. */
+export const knownKind = (kind: string) => COMPLETE.has(kind) || kind in UNSEEN;
 
 const big = (s: string | null | undefined) => (s && /^\d+$/.test(s) ? BigInt(s) : 0n);
+
+const PROPOSER = holding("proposer", "The block's proposer");
+
+/**
+ * The part of a fee that tipped the block's proposer instead of burning, or null if it can't be
+ * told. Today's chain burns `min_fee(size)` (node/src/types.rs) and pays the rest to the
+ * proposer; later protocol versions report the `tip` and a `max_fee`, and charge
+ * min(base fee + tip, max_fee), so a capped charge hides the split.
+ */
+function tipOf(tx: TxDetail, fee: bigint): bigint | null {
+  if (tx.max_fee != null) {
+    const tip = big(tx.tip);
+    if (tip === 0n) return 0n;
+    return fee < big(tx.max_fee) ? (tip < fee ? tip : fee) : null;
+  }
+  if (tx.size_bytes == null) return 0n;
+  const min = 10_000n + BigInt(tx.size_bytes) * 10n;
+  return fee > min ? fee - min : 0n;
+}
 
 export function effectsOf(tx: TxDetail): Effects {
   const pending = tx.status === "pending";
   const fee = big(tx.fee);
   if (!tx.from) return { changes: [], burned: 0n, unseen: null, pending };
+  const tip = tipOf(tx, fee);
+  const burned = fee - (tip ?? 0n);
+  const tipped: Change[] = tip ? [{ who: PROPOSER, delta: tip, why: "tip, above the fee that burns" }] : [];
+  const split = tip == null ? "Part of the fee may have tipped the block's proposer rather than burning; the node doesn't say how much." : null;
   // Included but failed: only the fee was charged.
-  if (tx.status === "failed") return { changes: [{ who: tx.from, delta: -fee, why: "fee (the action failed)" }], burned: fee, unseen: null, pending };
+  if (tx.status === "failed") return { changes: [{ who: tx.from, delta: -fee, why: "fee (the action failed)" }, ...tipped], burned, unseen: split, pending };
   const kind = tx.kind ?? tx.action?.type ?? "";
+  // A kind newer than this explorer: the fee is all that's certain (its amount may even be
+  // coming in, not going out).
+  if (!knownKind(kind)) return { changes: [{ who: tx.from, delta: -fee, why: "fee" }, ...tipped], burned, unseen: UNKNOWN, pending };
   const amount = big(tx.amount);
   const changes: Change[] = [];
   if (amount > 0n) {
@@ -96,7 +123,9 @@ export function effectsOf(tx: TxDetail): Effects {
   } else {
     changes.push({ who: tx.from, delta: -fee, why: "fee" });
   }
-  return { changes, burned: fee, unseen: unseenOf(kind), pending };
+  changes.push(...tipped);
+  const unseen = [UNSEEN[kind], split].filter(Boolean).join(" ");
+  return { changes, burned, unseen: unseen || null, pending };
 }
 
 export type Direction = "in" | "out" | "self" | "none";
@@ -167,8 +196,10 @@ export function flowsOf(txs: TxDetail[], me: string): Flows {
         row.out += c.delta;
         totalOut += c.delta;
       } else {
-        row.in += -c.delta - (tx.from?.address === c.who.address ? fx.burned : 0n);
-        totalIn += -c.delta - (tx.from?.address === c.who.address ? fx.burned : 0n);
+        // What they lost beyond their fee (burned or tipped) came to us.
+        const got = -c.delta - (tx.from?.address === c.who.address ? big(tx.fee) : 0n);
+        row.in += got;
+        totalIn += got;
       }
       by.set(c.who.address, row);
     }

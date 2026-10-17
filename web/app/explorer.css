@@ -253,6 +253,12 @@ details.raw pre { background: var(--paper-hi); border: 1px solid var(--hair); pa
 
 /* Preflight: what a transaction will do, before it's signed */
 .preflight { display: flex; flex-direction: column; gap: 10px; border-top: 1px solid var(--ink); padding-top: 12px; }
+.preflight { container-type: inline-size; }
+@container (max-width: 440px) {
+  .preflight .changes { grid-template-columns: minmax(0, 1fr) auto; }
+  .preflight .changes .why { display: none; }
+  .preflight .kv.after { grid-template-columns: 1fr; gap: 2px; }
+}
 .preflight .kv.after { grid-template-columns: 130px minmax(0, 1fr); }
 .preflight .kv.after dd { display: flex; flex-direction: column; gap: 4px; }
 .refusal { border: 1.5px solid var(--blood); background: var(--out-wash); padding: 10px 14px; font-size: 16px; }
