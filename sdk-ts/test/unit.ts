@@ -32,6 +32,8 @@ interface Host {
   hang?: boolean;
   /** Answers for `/tx/{id}`, in turn (the last one repeats): a status, or an HTTP error code. */
   txAnswers?: (string | number)[];
+  /** Who `/api/name/{name}` says owns a name (before the shared vlad/bob). */
+  names?: Record<string, string>;
 }
 const hosts = new Map<string, Host>();
 function host(rpc: string, status: Record<string, unknown> = {}): Host {
@@ -70,7 +72,7 @@ globalThis.fetch = (async (input: string | URL, init?: RequestInit) => {
   const name = path.match(/^\/name\/(.+)$/);
   if (name) {
     const n = bareName(name[1]);
-    const owner = ({ vlad: VALIDATOR, bob: BOB } as Record<string, string>)[n];
+    const owner = h.names?.[n] ?? ({ vlad: VALIDATOR, bob: BOB } as Record<string, string>)[n];
     return reply(200, owner ? { name: `${n}.boo`, available: false, owner: { address: owner, name: `${n}.boo` } } : { name: `${n}.boo`, available: true });
   }
   if (path in h.routes) return reply(200, h.routes[path]);
@@ -345,6 +347,59 @@ assert.equal((await expiring(5001).provenName("alice", { witnesses }))?.owner, A
 const expired = await expiring(4000).provenName("alice", { witnesses, includeExpired: true });
 assert.deepEqual([expired?.owner, expired?.active, expired?.expires_at], [ATTACKER, false, 4000]);
 console.log("✓ proven reads refuse a genuine but stale record (a name's previous owner) and expired names");
+
+// Audit gap-7-1: a name that ends up in a signature is proven when the client has witnesses. The
+// lying node says alice.boo is the attacker's, and backs it with a proof against a root of its own.
+const fakeAlice = nameState(nameRecord("alice", ATTACKER, 4000, 4000 + 31_536_000));
+const redirect = host("http://redirect.node", { height: 5000 });
+redirect.names = { alice: ATTACKER };
+redirect.routes[`/proof/2/${bytesToHex(utf8ToBytes("alice"))}`] = proofOf(fakeAlice, 5000);
+honest.blocks[5000] = after.root; // the real head: alice.boo is the victim's
+const unproven = await new Client("http://redirect.node").resolution("alice.boo");
+assert.deepEqual([unproven.address, unproven.proven], [ATTACKER, false], "without witnesses it's one node's word, and says so");
+assert.match(unproven.how, /as http:\/\/redirect\.node reports it, unproven/);
+const sender = (c: Client) => Wallet.fromSeed("08".repeat(32), c);
+const before71 = redirect.posted.length;
+await assert.rejects(sender(new Client("http://redirect.node", { witnesses })).send("alice.boo", "1"), /disagrees about the state at block #5000/, "with witnesses the redirect is refused, nothing is signed");
+await assert.rejects(new Client("http://redirect.node", { witnesses }).resolve("Alice.boo"), /disagrees/);
+assert.equal(redirect.posted.length, before71);
+redirect.routes[`/proof/2/${bytesToHex(utf8ToBytes("alice"))}`] = proofOf(after, 5000);
+const provenRes = await new Client("http://redirect.node", { witnesses }).resolution("alice");
+assert.deepEqual([provenRes.address, provenRes.proven, provenRes.height], [VICTIM, true, 5000]);
+await sender(new Client("http://redirect.node", { witnesses })).send("alice.boo", "1");
+assert.equal((redirect.posted.at(-1)!.action as { to: string }).to, VICTIM, "the proven owner is signed, whatever /api/name says");
+assert.deepEqual(await new Client("http://redirect.node").resolution(BOB), { input: BOB, address: BOB, name: null, proven: true, how: "an address, signed as given" });
+assert.throws(() => new Client("http://redirect.node", { requireProvenNames: true }), /needs witnesses/);
+assert.throws(() => new Client("http://redirect.node", { witnesses: [new Client("http://redirect.node/")] }), /another node/);
+console.log("✓ names that get signed are proven against the client's witnesses (a lying node can't redirect them), else marked unproven");
+
+// Audit gap-7-3: an absolute expiry counts from the height valid_until does, in one status read.
+// This node answers a lone status read 300 days ahead and the next one truthfully.
+const twoFaced = host("http://two-faced.node");
+let reads = 0;
+Object.defineProperty(twoFaced.status, "height", { enumerable: true, get: () => (reads++ % 2 === 0 ? 50 + 300 * 86_400 : 50) });
+const tf = Wallet.fromSeed("09".repeat(32), new Client("http://two-faced.node", { prefix: "boo" }));
+for (const run of [() => tf.addSessionKey("ab".repeat(32), "agent", { limit: "1", periodBlocks: 100, expiresInBlocks: 30 * 86_400 }), () => tf.createHunt({ repo: "a/b", issue: 1, amount: "10", title: "t", expiresInBlocks: 30 * 86_400 })]) {
+  await run();
+  const t = twoFaced.posted.at(-1)!;
+  const expiresAt = t.action.type === "add_key" && t.action.role.type === "session" ? t.action.role.expires_at : t.action.type === "create_hunt" ? t.action.expires_at : -1;
+  assert.equal(expiresAt, t.valid_until - 600 + 30 * 86_400, `${t.action.type}: the expiry and valid_until come from one status read`);
+}
+console.log("✓ session key and hunt expiries count from the height valid_until is signed against");
+
+// Audit gap-7-5: the default deposit is the node's word: bounded, and the witnesses must agree.
+const greedy = host("http://greedy.node");
+greedy.routes["/params"] = { params: { proposal_deposit: (999_000n * FANG).toString() } };
+const gw = Wallet.fromSeed("0a".repeat(32), new Client("http://greedy.node"));
+await assert.rejects(gw.propose(proposal.text(), { title: "t" }), /reports a proposal_deposit of 999000 FANG, more than maxDeposit \(1000 FANG\)/);
+assert.equal(greedy.posted.length, 0, "nothing signed");
+await gw.propose(proposal.text(), { title: "t", maxDeposit: "1000000" });
+assert.equal((greedy.posted.at(-1)!.action as { deposit: string }).deposit, (999_000n * FANG).toString(), "a raised maxDeposit lets it through");
+const fair = host("http://fair.node");
+fair.routes["/params"] = { params: { proposal_deposit: (10n * FANG).toString() } };
+greedy.routes["/params"] = { params: { proposal_deposit: (900n * FANG).toString() } };
+await assert.rejects(Wallet.fromSeed("0a".repeat(32), new Client("http://greedy.node", { witnesses: [new Client("http://fair.node")] })).propose(proposal.text(), { title: "t" }), /disagree about proposal_deposit \(900 FANG, 10 FANG\)/);
+console.log("✓ propose's default deposit is bounded by maxDeposit and must match the witnesses");
 
 // ---- requests time out; a submitted tx that isn't seen final is "pending", not "failed" ----
 

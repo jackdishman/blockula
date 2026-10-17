@@ -77,8 +77,9 @@ export function initialPin(net: Network): ChainPin {
  * switch chains mid-session either.
  */
 export class PinnedClient extends Client {
-  constructor(rpc: string, public pin: ChainPin, private onFirstPin?: (pin: ChainPin) => void) {
-    super(rpc);
+  constructor(rpc: string, public pin: ChainPin, private onFirstPin?: (pin: ChainPin) => void, witnesses: string[] = []) {
+    // Witnesses only for networks whose chain is pinned by configuration: they're held to it too.
+    super(rpc, { witnesses: pin.chainId ? witnesses.map((w) => new Client(w, { chainId: pin.chainId, genesisHash: pin.genesisHash, prefix: pin.prefix })) : [] });
     // `Wallet.address` renders with the client's prefix: use the pinned one before the first
     // status arrives (which still checks it, through `status()` below).
     if (pin.prefix) this.prefix = pin.prefix;
@@ -99,7 +100,12 @@ export class PinnedClient extends Client {
 
 /** The client for the selected network. Custom nodes remember the chain they first reported. */
 export function networkClient() {
-  return new PinnedClient(NETWORK.rpc.replace(/\/$/, ""), initialPin(NETWORK), (pin) => {
-    if (NETWORK.key === "custom") saveCustomPin(NETWORK.rpc, pin);
-  });
+  return new PinnedClient(
+    NETWORK.rpc.replace(/\/$/, ""),
+    initialPin(NETWORK),
+    (pin) => {
+      if (NETWORK.key === "custom") saveCustomPin(NETWORK.rpc, pin);
+    },
+    NETWORK.witnesses ?? [],
+  );
 }

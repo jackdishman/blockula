@@ -8,6 +8,10 @@
 //   BLOCKULA_RPC        node URL (default: the network's public RPC; required for custom, and for
 //                       mainnet until public RPCs are built in)
 //   BLOCKULA_CHAIN_ID / BLOCKULA_GENESIS_HASH   pin the chain the node must be on
+//   BLOCKULA_WITNESSES  other nodes of the same chain (comma-separated URLs): .boo names that get
+//                       signed (send, stake, unstake, use_account) are proven against them. Without
+//                       them a name is the node's word, and on mainnet a send to a name needs the
+//                       address confirmed first.
 //   BLOCKULA_HOME       where the agent wallet lives (default ~/.blockula)
 //   BLOCKULA_MAX_SEND   max FANG one call moves (sent, staked, escrowed, paid for a name, bonded; default 100)
 //   BLOCKULA_MAX_DAILY  max FANG leaving the account per UTC day through this MCP, fees included
@@ -23,7 +27,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { ApiError, Client, RequestTimeoutError, TxFailedError, TxPendingError, Wallet, bareName, checkTimeoutMs, formatFang, paramsOf, parseFang, proposalSummary, sharesFor, stakeSummary, txId, type Action, type ProposalSummary } from "@blockula/sdk";
+import { ApiError, Client, RequestTimeoutError, TxFailedError, TxPendingError, Wallet, bareName, checkTimeoutMs, formatFang, paramsOf, parseFang, proposalSummary, sharesFor, stakeSummary, txId, type Action, type ProposalSummary, type Resolution } from "@blockula/sdk";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -98,7 +102,9 @@ async function chain(): Promise<Client> {
   if (why) throw mismatchError(net, why, KNOWN_CHAINS.file);
   const full = completePin(pin, status);
   KNOWN_CHAINS.save(net, full);
-  pinned = new Client(net.rpc, { chainId: full.chainId, genesisHash: full.genesisHash, prefix: full.prefix, timeoutMs: TIMEOUT_MS });
+  const pins = { chainId: full.chainId, genesisHash: full.genesisHash, prefix: full.prefix, timeoutMs: TIMEOUT_MS };
+  // Witnesses are held to the same chain; with them, names are proven (Client.resolution).
+  pinned = new Client(net.rpc, { ...pins, witnesses: net.witnesses.map((w) => new Client(w, pins)) });
   return pinned;
 }
 
@@ -242,6 +248,32 @@ async function namePrices(client: Client, name: string): Promise<{ price: bigint
   const quotedRenewal = reported(info?.renewal_price, "the name's renewal price");
   return { price: quoted > own ? quoted : own, renewal: quotedRenewal > ownRenewal ? quotedRenewal : ownRenewal, info };
 }
+
+/**
+ * A name or address resolved for a signature (audit gap-7-1). With BLOCKULA_WITNESSES a name is
+ * proven against them (`Client.resolution`). Without, it's the node's word: on mainnet that's
+ * not enough to sign real money to, so the tool answers with the address for the user to
+ * confirm instead (the agent then passes the address); elsewhere it signs and says it's unproven.
+ */
+async function resolved(client: Client, input: string, role: string): Promise<{ res: Resolution; confirm?: undefined } | { res?: undefined; confirm: Record<string, unknown> }> {
+  const res = await client.resolution(input);
+  if (!res.proven && network().mainnet) {
+    return {
+      confirm: {
+        status: "not_sent",
+        needs_confirmation: true,
+        [role]: clean(input, 100),
+        resolves_to: res.address,
+        resolved_by: clean(res.how, 300),
+        next: `Nothing was signed. This is real money, and ${clean(input, 100)} was resolved by one node without proof: a node can point a name anywhere. Show the user the address ${res.address}; only if they confirm it's the right ${role}, call this tool again with that address instead of the name. (With BLOCKULA_WITNESSES configured, names are proven and this step isn't needed.)`,
+      },
+    };
+  }
+  return { res };
+}
+
+/** What a tool reports about a resolved name: the exact address signed and how it was found. */
+const resolvedView = (res: Resolution, role: string) => (res.name === null ? {} : { [`${role}_address`]: res.address, name_resolution: res.proven ? clean(res.how, 300) : `UNPROVEN: ${clean(res.how, 300)}` });
 
 /** A tx tool's answer: the tx's summary and links, or the in-flight notice. */
 const txResult = (r: any, extra: Record<string, unknown> = {}) =>
@@ -413,13 +445,15 @@ tool("use_account", "Act for a user's account (name or address) that has authori
   if (account === "self") {
     delete f.account;
   } else {
-    const addr = await client.resolve(account);
-    const { accounts } = await client.keyAccounts(w.keyId);
-    const grant = accounts.find((a: { account: { address: string } }) => a.account.address === addr);
-    if (!grant) throw new Error(`${account} hasn't authorized this key yet. Ask the user to add key_id ${w.keyId} in their wallet (Devices & agents).`);
+    const res = await client.resolution(account);
+    const addr = res.address;
+    // The account's own key list, not /api/key's list of accounts (which others can pad: audit gap-7-2).
+    const a = await client.account(addr);
+    const grant = (Array.isArray(a?.keys) ? a.keys : []).find((k: { key_id?: unknown }) => k.key_id === w.keyId);
+    if (!grant) throw new Error(`${clean(account, 100)} (${addr}) hasn't authorized this key yet. Ask the user to give this agent a budget in their wallet (Devices & agents) with the grant code from create_wallet (account "${clean(account, 100)}").`);
     f.account = addr;
     writeFileSync(WALLET_FILE, JSON.stringify(f, null, 2), { mode: 0o600 });
-    return { acting_for: clean(String(grant.account.name ?? addr)), role: chainData(grant.role), untrusted_label: clean(String(grant.label ?? ""), 100) };
+    return { acting_for: clean(String(a?.account?.name ?? addr)), address: addr, ...(res.name === null ? {} : { name_resolution: res.proven ? clean(res.how, 300) : `UNPROVEN: ${clean(res.how, 300)}` }), role: chainData(grant.role), untrusted_label: clean(String(grant.label ?? ""), 100) };
   }
   writeFileSync(WALLET_FILE, JSON.stringify(f, null, 2), { mode: 0o600 });
   await client.addressPrefix();
@@ -463,9 +497,11 @@ tool("send", "Send FANG to a .boo name or address. Amounts are in FANG, e.g. \"1
   const w = await requireWallet();
   await w.client.addressPrefix();
   // Sign the resolved address, not the name: what was checked is exactly who gets paid.
-  const recipient = await w.client.resolve(to);
-  const opening = await openingFee(w.client, recipient);
-  return txResult(await submitCapped(w, { type: "transfer", to: recipient, amount: drops.toString() }, { amount: drops, extra: opening }, memo ?? ""));
+  const { res, confirm } = await resolved(w.client, to, "recipient");
+  if (confirm) return confirm;
+  const opening = await openingFee(w.client, res.address);
+  const r = await submitCapped(w, { type: "transfer", to: res.address, amount: drops.toString() }, { amount: drops, extra: opening }, memo ?? "");
+  return isInFlight(r) ? { ...r, ...resolvedView(res, "recipient") } : txResult(r, resolvedView(res, "recipient"));
 });
 
 tool("check_name", "Check whether a .boo name is available and what it costs, or who owns it and when it expires.", { name: z.string() }, async ({ name }) => chainData(await (await chain()).name(name)));
@@ -509,20 +545,29 @@ tool("stake", "Stake (delegate) FANG from the account this agent acts for in a v
   const drops = parseFang(amount);
   if (drops <= 0n) throw new Error("delegate more than 0");
   const w = await requireWallet();
-  const v = await w.client.resolve(validator);
-  return txResult(await submitCapped(w, { type: "delegate", validator: v, amount: drops.toString() }, { amount: drops }), { next: "my_stake shows the stake and its value" });
+  const { res, confirm } = await resolved(w.client, validator, "validator");
+  if (confirm) return confirm;
+  const r = await submitCapped(w, { type: "delegate", validator: res.address, amount: drops.toString() }, { amount: drops });
+  return isInFlight(r) ? { ...r, ...resolvedView(res, "validator") } : txResult(r, { ...resolvedView(res, "validator"), next: "my_stake shows the stake and its value" });
 });
 
 tool("unstake", "Start unbonding stake from a validator's pool: an amount in FANG (converted to pool shares at the current rate) or \"all\". It stops earning now and can be withdrawn with withdraw_stake once the unbonding period is over.", { validator: z.string(), amount: z.string().default("all").describe("FANG, or \"all\"") }, async ({ validator, amount }) => {
   const w = await requireWallet();
-  const v = await w.client.resolve(validator);
+  const { res, confirm } = await resolved(w.client, validator, "validator");
+  if (confirm) return confirm;
+  const v = res.address;
   await w.client.addressPrefix();
   const d = stakeSummary(await moduleRead("staking", w.client.staking(w.account))).delegations.find((x) => x.validator === v);
   if (!d || BigInt(d.shares) === 0n) throw new Error(`${w.account} has no stake with ${clean(validator, 100)}`);
+  // The conversion uses the node's value of the delegation: one that reports a tiny value would
+  // turn "unstake 10 FANG" into unbonding all of it (audit gap-7-5). Taking every share takes "all".
+  if (amount !== "all" && parseFang(amount) >= BigInt(d.value)) throw new Error(`the node reports this stake is worth ${formatFang(BigInt(d.value))}, which isn't more than the ${clean(amount, 40)} FANG asked for: nothing was signed. To unbond all ${d.shares} shares, pass amount "all" (after checking the stake's value with the user).`);
   const shares = amount === "all" ? BigInt(d.shares) : sharesFor(d, amount);
   if (shares <= 0n) throw new Error(`${amount} FANG is less than one share of this pool`);
   // Only the fee leaves the account (it counts toward the daily limit).
-  return txResult(await submitCapped(w, { type: "undelegate", validator: v, shares: shares.toString() }, { amount: 0n }));
+  const view = { ...resolvedView(res, "validator"), unbonding_shares: shares.toString(), of_shares: d.shares, worth_as_reported: formatFang((BigInt(d.value) * shares) / BigInt(d.shares)) };
+  const r = await submitCapped(w, { type: "undelegate", validator: v, shares: shares.toString() }, { amount: 0n });
+  return isInFlight(r) ? { ...r, ...view } : txResult(r, view);
 });
 
 tool("withdraw_stake", "Pay out every unbonding entry of the account this agent acts for that has finished unbonding.", {}, async () => {

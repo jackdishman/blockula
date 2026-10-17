@@ -33,6 +33,12 @@ export interface Network {
   prefix?: string;
   /** Real money: no browser-only keys, no faucet copy, a plain badge. */
   mainnet?: boolean;
+  /**
+   * Independent nodes of the same chain that names are proven against before a send signs their
+   * owner (audit gap-7-1). Without witnesses a name is the selected node's word, and the wallet
+   * says so.
+   */
+  witnesses?: string[];
 }
 
 type KnownKey = "mainnet" | "testnet" | "local";
@@ -45,8 +51,18 @@ function clean(v: string | undefined) {
 const mainnetRpc = clean(process.env.NEXT_PUBLIC_MAINNET_RPC);
 const testnetRpc = clean(process.env.NEXT_PUBLIC_BLOCKULA_RPC);
 
+/** Comma-separated https node URLs (NEXT_PUBLIC_*_WITNESSES): the witnesses names are proven against. */
+export function witnessList(v: string | undefined, rpc: string): string[] {
+  const out: string[] = [];
+  for (const w of (v ?? "").split(",").map((x) => x.trim().replace(/\/+$/, "")).filter(Boolean)) {
+    if (!isNodeUrl(w) || (!w.startsWith("https://") && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(w))) throw new Error(`witness ${w} must be an https node URL`);
+    if (w !== rpc.replace(/\/+$/, "") && !out.includes(w)) out.push(w);
+  }
+  return out;
+}
+
 const mainnet: Network | undefined = mainnetRpc
-  ? { key: "mainnet", label: "Mainnet", rpc: mainnetRpc, chainId: MAINNET_CHAIN_ID, genesisHash: MAINNET_GENESIS_HASH, prefix: MAINNET_PREFIX, mainnet: true }
+  ? { key: "mainnet", label: "Mainnet", rpc: mainnetRpc, chainId: MAINNET_CHAIN_ID, genesisHash: MAINNET_GENESIS_HASH, prefix: MAINNET_PREFIX, mainnet: true, witnesses: witnessList(process.env.NEXT_PUBLIC_MAINNET_WITNESSES, mainnetRpc) }
   : undefined;
 
 // A mainnet deployment lists the testnet only when it's configured explicitly.
@@ -60,6 +76,7 @@ const testnet: Network | undefined =
         genesisHash: clean(process.env.NEXT_PUBLIC_TESTNET_GENESIS_HASH)?.toLowerCase(),
         // Today's public testnet predates DEC-7 and still uses "boo"; protocol v1 testnets use "tboo".
         prefix: clean(process.env.NEXT_PUBLIC_TESTNET_PREFIX) || "boo",
+        witnesses: witnessList(process.env.NEXT_PUBLIC_TESTNET_WITNESSES, testnetRpc || "https://blockula-testnet.fly.dev"),
       }
     : undefined;
 

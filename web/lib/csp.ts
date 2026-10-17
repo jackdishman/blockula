@@ -6,7 +6,7 @@ import { NETWORKS } from "./config";
 /** Origins the page may fetch from: every configured node, and a local one on 127.0.0.1 too. */
 export function nodeOrigins(): string[] {
   const out = new Set<string>(["http://localhost:7070", "http://127.0.0.1:7070"]);
-  for (const n of Object.values(NETWORKS)) if (n) out.add(new URL(n.rpc).origin);
+  for (const n of Object.values(NETWORKS)) if (n) for (const u of [n.rpc, ...(n.witnesses ?? [])]) out.add(new URL(u).origin);
   return [...out];
 }
 

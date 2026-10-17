@@ -2,7 +2,7 @@ import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex, hexToBytes, randomBytes, utf8ToBytes } from "@noble/hashes/utils.js";
 import { bech32m } from "@scure/base";
-import { DEFAULT_TIP_CAP_MULTIPLE, baseFee, maxTip, parseFang, parseSoul, seanceCommitment, signingBytes, type Action, type BaseFee, type KeyRole, type ProposalKind, type Tx, type UnsignedTx } from "./tx.js";
+import { DEFAULT_TIP_CAP_MULTIPLE, baseFee, formatFang, maxTip, parseFang, parseSoul, seanceCommitment, signingBytes, type Action, type BaseFee, type KeyRole, type ProposalKind, type Tx, type UnsignedTx } from "./tx.js";
 import { NAMESPACES, checkProofResponse, decodeAccount, decodeName, type ProofResponse, type ProvenRecord } from "./proof.js";
 
 export * from "./tx.js";
@@ -74,6 +74,12 @@ export function bareName(name: string): string {
   if (n.startsWith("-") || n.endsWith("-")) throw new Error("names can't start or end with '-'");
   return n;
 }
+
+/**
+ * The most `Wallet.propose` bonds by default without being told (audit gap-7-5): mainnet's genesis
+ * `proposal_deposit` (node/src/params.rs). A node reporting more is refused; pass `deposit`.
+ */
+export const DEFAULT_MAX_PROPOSAL_DEPOSIT = 1_000n * 1_000_000_000n;
 
 /** Highest vote conviction (node/src/params.rs `MAX_CONVICTION`). */
 export const MAX_CONVICTION = 6;
@@ -430,10 +436,17 @@ export class Wallet {
    * includes it (+ the tip) is charged. A tip above `tip_cap_multiple` × the lowest upcoming base
    * fee (`/api/fees` `lowest`, see `maxTip`) is refused here, as nodes would refuse it. To sign
    * offline, build an `UnsignedTx` yourself (with the chain's `genesis_hash`) and `sign` it.
+   *
+   * `action` may be a function of the height `valid_until` is counted from, for actions that
+   * carry an absolute block height of their own (a session key's or a hunt's expiry): computed
+   * from the same status read, a node that lies about the height can stretch them by at most
+   * `max_tx_validity_blocks`, since validators refuse a `valid_until` further ahead than that
+   * (audit gap-7-3).
    */
-  async build(action: Action, memo = "", opts: TxOptions = {}): Promise<Tx> {
+  async build(action: Action | ((height: number) => Action), memo = "", opts: TxOptions = {}): Promise<Tx> {
     await this.client.addressPrefix(); // so `this.account` uses the chain's prefix
     const [status, account, fees] = await Promise.all([this.client.status(), this.client.account(this.account).catch(() => null), this.client.fees()]);
+    if (!Number.isSafeInteger(status.height) || status.height < 0) throw new Error(`${this.client.rpc} doesn't report its height`);
     const max: number = status.max_tx_validity_blocks ?? Number.MAX_SAFE_INTEGER;
     const validFor = opts.validForBlocks ?? Math.min(this.validForBlocks, max);
     if (!Number.isSafeInteger(validFor) || validFor < 1) throw new Error("validForBlocks must be a positive whole number of blocks");
@@ -441,7 +454,8 @@ export class Wallet {
     const tip = opts.tip === undefined ? this.tip : parseFang(opts.tip);
     if (typeof status.genesis_hash !== "string") throw new Error(`${this.client.rpc} doesn't report a genesis_hash; it's too old for this SDK`);
     // Binds the tx to this chain instance (not just its id), so it can't replay on a relaunch.
-    const unsigned: UnsignedTx = { chain_id: status.chain_id, genesis_hash: status.genesis_hash, from: this.account, nonce: account?.next_nonce ?? 0, fee: "0", tip: tip.toString(), valid_until: status.height + validFor, action, memo };
+    const act = typeof action === "function" ? action(status.height) : action;
+    const unsigned: UnsignedTx = { chain_id: status.chain_id, genesis_hash: status.genesis_hash, from: this.account, nonce: account?.next_nonce ?? 0, fee: "0", tip: tip.toString(), valid_until: status.height + validFor, action: act, memo };
     unsigned.fee = (baseFee(unsigned, fees.suggested) + tip).toString();
     if (tip > 0n) {
       // The cap is a multiple of the base fee of the block that includes the tx: price it at the lowest upcoming one.
@@ -478,9 +492,9 @@ export class Wallet {
   async addSessionKey(keyIdHex: string, label: string, opts: { limit: string | number | bigint; periodBlocks: number; expiresInBlocks: number }) {
     if (!Number.isSafeInteger(opts.periodBlocks) || opts.periodBlocks < 1) throw new Error("periodBlocks must be a positive whole number of blocks");
     if (!Number.isSafeInteger(opts.expiresInBlocks) || opts.expiresInBlocks < 1) throw new Error("expiresInBlocks must be a positive whole number of blocks");
-    const { height } = await this.client.status();
-    const role: KeyRole = { type: "session", limit: parseFang(opts.limit).toString(), period_blocks: opts.periodBlocks, expires_at: height + opts.expiresInBlocks };
-    return this.client.submit(await this.build({ type: "add_key", key_id: keyIdHex, label, role }));
+    const limit = parseFang(opts.limit).toString();
+    // The expiry counts from the height valid_until does (one status read): see `build`.
+    return this.client.submit(await this.build((height) => ({ type: "add_key", key_id: keyIdHex, label, role: { type: "session", limit, period_blocks: opts.periodBlocks, expires_at: height + opts.expiresInBlocks } satisfies KeyRole })));
   }
 
   async removeKey(keyIdHex: string) {
@@ -518,8 +532,10 @@ export class Wallet {
 
   /** Put a bounty on a GitHub issue. `expiresInBlocks` from now (max ~1 year). */
   async createHunt(opts: { repo: string; issue: number; amount: string | number | bigint; title: string; expiresInBlocks: number }) {
-    const { height } = await this.client.status();
-    return this.client.submit(await this.build({ type: "create_hunt", repo: opts.repo, issue: opts.issue, amount: parseFang(opts.amount).toString(), expires_at: height + opts.expiresInBlocks, title: opts.title }));
+    if (!Number.isSafeInteger(opts.expiresInBlocks) || opts.expiresInBlocks < 1) throw new Error("expiresInBlocks must be a positive whole number of blocks");
+    const amount = parseFang(opts.amount).toString();
+    // The expiry counts from the height valid_until does (one status read): see `build`.
+    return this.client.submit(await this.build((height) => ({ type: "create_hunt", repo: opts.repo, issue: opts.issue, amount, expires_at: height + opts.expiresInBlocks, title: opts.title })));
   }
 
   async fundHunt(huntId: number, amount: string | number | bigint) {
@@ -691,8 +707,13 @@ export class Wallet {
    * Put a proposal to a vote (build `kind` with `proposal.*`). Bonds `deposit` (default: the
    * chain's `proposal_deposit`), refunded once the proposal reaches quorum and burned if it
    * doesn't. Names in the kind (`to`, `account`) are resolved and the addresses are signed.
+   *
+   * The default deposit is what the node reports, and a node can report anything, so it's
+   * bounded (audit gap-7-5): every witness of the client must report the same value, and it may
+   * be at most `maxDeposit` (default `DEFAULT_MAX_PROPOSAL_DEPOSIT`, mainnet's 1,000 FANG).
+   * Pass `deposit` to bond an amount you checked yourself.
    */
-  async propose(kind: ProposalKind, opts: { title: string; url?: string; deposit?: Amount } & TxOptions) {
+  async propose(kind: ProposalKind, opts: { title: string; url?: string; deposit?: Amount; maxDeposit?: Amount } & TxOptions) {
     const title = opts.title.trim();
     if (!title || new TextEncoder().encode(title).length > 96 || /\p{Cc}/u.test(title)) throw new Error("title must be 1–96 bytes with no control characters");
     const url = opts.url ?? "";
@@ -700,9 +721,13 @@ export class Wallet {
     let deposit: bigint;
     if (opts.deposit !== undefined) deposit = parseFang(opts.deposit);
     else {
-      const d = paramsOf(await this.client.params()).proposal_deposit;
+      const reported = await Promise.all([this.client, ...this.client.witnesses].map(async (c) => paramsOf(await c.params()).proposal_deposit));
+      const d = reported[0];
       if (d === undefined) throw new Error("this node doesn't report proposal_deposit; pass deposit");
+      if (reported.some((x) => x !== d)) throw new Error(`the node and its witnesses disagree about proposal_deposit (${reported.map((x) => (x === undefined ? "none" : formatFang(x))).join(", ")}); pass deposit`);
       deposit = BigInt(d);
+      const max = opts.maxDeposit !== undefined ? parseFang(opts.maxDeposit) : DEFAULT_MAX_PROPOSAL_DEPOSIT;
+      if (deposit > max) throw new Error(`${this.client.rpc} reports a proposal_deposit of ${formatFang(deposit)}, more than maxDeposit (${formatFang(max)}): a node can report any deposit, and all of it is burned if the vote misses quorum. Check it on another node, then pass deposit (or a higher maxDeposit)`);
     }
     return this.act({ type: "propose", kind: await this.resolveKind(kind), deposit: positive(deposit, "deposit").toString(), title, url }, opts);
   }
@@ -903,8 +928,34 @@ export interface ClientOptions {
   chainId?: string;
   /** The genesis hash (hex) the node must report. */
   genesisHash?: string;
-  /** How long one request may take before it fails with `RequestTimeoutError` (default 15 s). */
+  /** How long one request may take before it fails with `RequestTimeoutError` (default 15 s, at most `MAX_TIMEOUT_MS`). */
   timeoutMs?: number;
+  /**
+   * Clients for independent nodes of the same chain. With witnesses, every name this client
+   * resolves for a signature (`resolve`, so `Wallet.send`, `awardHunt`, `vouch`, `transferName`,
+   * `delegate`, proposal targets, `actAs` …) is a proven read (`provenName`): the record's Merkle
+   * proof must check out against a state root each witness reports for that block, and be fresh.
+   * Without them a name is one node's unproven answer (audit gap-7-1).
+   */
+  witnesses?: Client[];
+  /** Refuse to resolve a `.boo` name for a signature unless it's proven (needs `witnesses`). */
+  requireProvenNames?: boolean;
+}
+
+/** Where a recipient (a `.boo` name or an address) goes, and how sure that is (`Client.resolution`). */
+export interface Resolution {
+  /** What was asked for. */
+  input: string;
+  /** The address that gets signed. */
+  address: string;
+  /** The bare name, when `input` was one. */
+  name: string | null;
+  /** An address as given, or a name proven against the client's witnesses; `false`: one node's word. */
+  proven: boolean;
+  /** How it was resolved, in plain English (show it with the address before signing). */
+  how: string;
+  /** The block a proven name was read at. */
+  height?: number;
 }
 
 /** Default per-request timeout of a `Client`. */
@@ -952,12 +1003,19 @@ export class Client {
   private readonly pinnedGenesis?: string;
   /** Per-request timeout (ms). */
   readonly timeoutMs: number;
+  /** Independent nodes names are proven against (`ClientOptions.witnesses`). */
+  readonly witnesses: Client[];
+  readonly requireProvenNames: boolean;
 
   /** `opts` pins the chain: a node reporting another prefix, chain id or genesis hash is refused with `ChainMismatchError`. */
   constructor(readonly rpc: string = DEFAULT_RPC, opts: ClientOptions = {}) {
     if (opts.prefix !== undefined && !(KNOWN_PREFIXES as readonly string[]).includes(opts.prefix)) throw new Error(`unknown address prefix ${opts.prefix}`);
     if (opts.genesisHash !== undefined && !/^[0-9a-f]{64}$/i.test(opts.genesisHash)) throw new Error("genesisHash must be 64 hex characters");
     this.timeoutMs = checkTimeoutMs(opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+    this.witnesses = [...(opts.witnesses ?? [])];
+    if (this.witnesses.some((w) => w === this || w.rpc.replace(/\/$/, "") === rpc.replace(/\/$/, ""))) throw new Error("a witness must be another node, not the client's own");
+    this.requireProvenNames = opts.requireProvenNames === true;
+    if (this.requireProvenNames && this.witnesses.length === 0) throw new Error("requireProvenNames needs witnesses to prove names against");
     this.pinnedPrefix = opts.prefix;
     this.pinnedChainId = opts.chainId;
     this.pinnedGenesis = opts.genesisHash?.toLowerCase();
@@ -1132,13 +1190,39 @@ export class Client {
     return { ...rec, active, height: r.height, root: r.root, head: r.head };
   }
 
+  /**
+   * The address a recipient resolves to, for a signature: an address as given, or a `.boo` name's
+   * owner (see `resolution`). With witnesses the name is proven; `requireProvenNames` refuses
+   * anything else.
+   */
   async resolve(nameOrAddress: string): Promise<string> {
-    if (isAddress(nameOrAddress)) return nameOrAddress;
-    if (/^t?boo1/i.test(nameOrAddress.trim())) throw new Error(`${nameOrAddress} isn't a valid address (check for typos; addresses are lowercase)`);
-    const r = await this.name(nameOrAddress);
+    return (await this.resolution(nameOrAddress)).address;
+  }
+
+  /**
+   * Where a recipient goes and how sure that is: show `address` and `how` before signing. With the
+   * client's `witnesses` a name is a proven, fresh read (`provenName`), so a lying node can't
+   * point it elsewhere; without them it's this node's answer alone (`proven: false`), which a
+   * lying node controls (audit gap-7-1).
+   */
+  async resolution(nameOrAddress: string): Promise<Resolution> {
+    const input = nameOrAddress;
+    if (isAddress(input)) return { input, address: input, name: null, proven: true, how: "an address, signed as given" };
+    if (/^t?boo1/i.test(input.trim())) throw new Error(`${input} isn't a valid address (check for typos; addresses are lowercase)`);
+    const name = bareName(input);
+    if (this.witnesses.length) {
+      const rec = await this.provenName(name, { witnesses: this.witnesses });
+      if (!rec) throw new Error(`${name}.boo doesn't resolve: it isn't registered or has expired (proven against ${this.witnesses.length} witness${this.witnesses.length === 1 ? "" : "es"})`);
+      if (!isAddress(rec.owner)) throw new Error(`${name}.boo's record names ${rec.owner}, which isn't an address`);
+      return { input, address: rec.owner, name, proven: true, how: `${name}.boo proven at block #${rec.height} against ${this.witnesses.length} independent node${this.witnesses.length === 1 ? "" : "s"}`, height: rec.height };
+    }
+    if (this.requireProvenNames) throw new Error(`${name}.boo can't be proven: this client has no witnesses`);
+    const r = await this.name(name);
     if (r.status === "grace") throw new Error(`${r.name} has expired (at block ${r.expires_at})`);
     if (r.available || !r.owner) throw new Error(`${r.name} isn't registered`);
-    return r.owner.address;
+    const address = String(r.owner.address ?? "");
+    if (!isAddress(address)) throw new Error(`${this.rpc} resolved ${name}.boo to ${JSON.stringify(address)}, which isn't an address`);
+    return { input, address, name, proven: false, how: `${name}.boo as ${this.rpc} reports it, unproven (a node can point a name anywhere; give the client witnesses to prove it)` };
   }
 
   /**

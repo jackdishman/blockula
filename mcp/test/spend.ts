@@ -12,6 +12,9 @@
 //    below the node's quote; a node that doesn't report a price can't make them free (F74).
 // 4. Chain text is labeled and cleaned; node JSON can't override the MCP's own facts (F73).
 // 5. A node that never answers fails a tool call after BLOCKULA_TIMEOUT_MS (F76).
+// 6. Names that get signed (gap-7-1): the result shows the address and that the name wasn't
+//    proven; on mainnet an unproven name isn't signed until the address is confirmed. use_account
+//    checks the account's own key list.
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
@@ -108,6 +111,8 @@ const mode: Mode = { post: "accept", tx: "pending", prices: QUOTES, status: {} }
 /** What a final tx keeps counted of its max fee: the fake node charges half of it. */
 const charged = (tx: Tx) => BigInt(tx.fee) - BigInt(tx.fee) / 2n;
 const posted: Tx[] = [];
+/** The keys BOB's account lists (use_account looks for the agent's there). */
+let bobKeys: { key_id: string; label: string; role: { type: string } }[] = [];
 const fake: Server = createServer((req, res) => {
   let body = "";
   req.on("data", (c) => (body += c));
@@ -135,7 +140,7 @@ const fake: Server = createServer((req, res) => {
       const inBlock = mode.tx === "finalized" || mode.tx === "failed";
       return reply(200, { id: tx[1], status: mode.tx, error: mode.tx === "failed" ? "insufficient balance" : null, summary: `sent ${t.action.type}`, fee: charged, fee_display: "fee", max_fee: t.fee, height: inBlock ? 11 : null, valid_until: t.valid_until, action: t.action });
     }
-    if (path === `/account/${BOB}`) return reply(200, { account: { address: BOB, name: "bob.boo" }, balance: "5", nonce: 0, next_nonce: 0, keys: [] });
+    if (path === `/account/${BOB}`) return reply(200, { account: { address: BOB, name: "bob.boo" }, balance: "5", nonce: 0, next_nonce: 0, keys: bobKeys });
     // Like a node: the next nonce counts the account's txs it holds (refused ones don't count).
     const nextNonce = (a: string) => posted.filter((p) => p.from === a).length;
     // Like node/src/api.rs: any address answers; without an account, with a zero balance and nonce
@@ -364,6 +369,49 @@ mode.post = "accept";
 // review-fix-clients-1: a timeout a timer can't hold (it would fire at once) is a startup error.
 await assert.rejects(server({ BLOCKULA_TIMEOUT_MS: "3000000000" }), "BLOCKULA_TIMEOUT_MS above 2^31 - 1 ms is refused");
 console.log("✓ a node that never answers fails the call after BLOCKULA_TIMEOUT_MS; an unanswered submit stays counted; timeouts past a timer's range are refused");
+
+// ---- 6. names that get signed ----
+
+resetLedger();
+mode.tx = "finalized";
+s = await server();
+r = await s.call("send", { to: "bob.boo", amount: "1" });
+assert.ok(!r.error, r.text);
+assert.equal(r.json().recipient_address, BOB, "the exact address signed is shown");
+assert.match(r.json().name_resolution, /^UNPROVEN: bob\.boo as http:\/\/127\.0\.0\.1:\d+ reports it/);
+r = await s.call("send", { to: BOB, amount: "1" });
+assert.ok(!r.error && r.json().recipient_address === undefined && r.json().name_resolution === undefined, "an address needs no resolving");
+const agentKey = (await s.call("create_wallet")).json().key_id as string;
+r = await s.call("use_account", { account: "bob.boo" });
+assert.ok(r.error && /hasn't authorized this key/.test(r.text), r.text);
+bobKeys = [{ key_id: agentKey, label: "claude", role: { type: "session" } }];
+r = await s.call("use_account", { account: "bob.boo" });
+assert.ok(!r.error && r.json().address === BOB && /^UNPROVEN/.test(r.json().name_resolution), r.text);
+r = await s.call("use_account", { account: "self" });
+assert.ok(!r.error, r.text);
+bobKeys = [];
+await s.close();
+// Mainnet without witnesses: a name is one node's word, so nothing is signed until the user
+// confirms the address (the agent then sends to the address).
+rmSync(join(home, "known-chains.json"), { force: true });
+mode.status = { chain_id: "blockula-1" };
+s = await server({ BLOCKULA_NETWORK: "mainnet", BLOCKULA_CHAIN_ID: "blockula-1" });
+before = posted.length;
+r = await s.call("send", { to: "bob.boo", amount: "1" });
+assert.ok(!r.error, r.text);
+const ask = r.json();
+assert.deepEqual([ask.status, ask.needs_confirmation, ask.resolves_to], ["not_sent", true, BOB]);
+assert.match(ask.next, /Nothing was signed.*call this tool again with that address/);
+r = await s.call("stake", { validator: "bob.boo", amount: "1" });
+assert.ok(!r.error && r.json().needs_confirmation === true, r.text);
+assert.equal(posted.length, before, "nothing signed for an unproven name on mainnet");
+r = await s.call("send", { to: BOB, amount: "1" });
+assert.ok(!r.error && r.json().block === 11, `the confirmed address is sent to: ${r.text}`);
+assert.equal(posted.length, before + 1);
+await s.close();
+mode.status = {};
+rmSync(join(home, "known-chains.json"), { force: true });
+console.log("✓ signed names show their address and say they're unproven; on mainnet an unproven name waits for the address to be confirmed; use_account reads the account's own keys");
 
 fake.close();
 fake.closeAllConnections();
