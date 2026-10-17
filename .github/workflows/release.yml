@@ -1,6 +1,6 @@
 # Tag vX.Y.Z → reproducible `blockula` archives for Linux + macOS, install.sh, any committed
-# genesis files, the embedded sync checkpoints, checksums.txt, SLSA build provenance (GitHub
-# artifact attestations) for every file, and a DRAFT release. It stays a draft until a maintainer
+# genesis files, the embedded sync checkpoints, checksums.txt (whose first line names the tag),
+# SLSA build provenance (GitHub artifact attestations) for every file, and a DRAFT release. It stays a draft until a maintainer
 # has reproduced the Linux build, signed checksums.txt offline with the ML-DSA-65 release key and
 # attached checksums.txt.sig (docs/OPERATIONS.md "Releases"). scripts/install.sh and the MCP's
 # install_node download from the published release.
@@ -15,8 +15,26 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  version:
+    name: Tag is the crate version
+    permissions: { contents: read }
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      # install.sh and install_node refuse a binary whose `blockula --version` isn't the tag they
+      # asked for, and provenance is checked against refs/tags/<tag> (audit supply-chain-B-2).
+      - name: vX.Y.Z is node/Cargo.toml's version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(sed -nE 's/^version = "([^"]+)"/\1/p' node/Cargo.toml | head -n 1)
+          [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::release tags are vX.Y.Z, got $TAG"; exit 1; }
+          [ "$TAG" = "v$version" ] || { echo "::error::tag $TAG, but node/Cargo.toml's version is $version"; exit 1; }
+
   build:
     name: Build ${{ matrix.target }}
+    needs: version
     permissions: { contents: read }
     strategy:
       fail-fast: false
@@ -89,8 +107,12 @@ jobs:
       # committed under genesis/<chain id>/genesis.json (docs/GENESIS_CEREMONY.md), the sync
       # checkpoints compiled into the binary (node/checkpoints/, OPERATIONS.md "Weak
       # subjectivity"), checksums.txt.
+      # checksums.txt's first line names the tag (scripts/release-checksums.sh), so the offline
+      # signature binds the files to this version.
       - name: checksums.txt
         id: files
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
           shopt -s nullglob
           (cd dist && sha256sum -c ./*.tar.gz.sha256)
@@ -98,8 +120,7 @@ jobs:
           cp dist/*.tar.gz scripts/install.sh release/
           for g in genesis/*/genesis.json; do cp "$g" "release/genesis-$(basename "$(dirname "$g")").json"; done
           for c in node/checkpoints/*.json; do cp "$c" "release/checkpoints-$(basename "$c")"; done
-          (cd release && sha256sum -- * | sort -k2 > ../checksums.txt)
-          mv checksums.txt release/ && cat release/checksums.txt
+          scripts/release-checksums.sh "$TAG" release
           { echo 'subjects<<EOF'; ls -1 release/*; echo EOF; } >> "$GITHUB_OUTPUT"
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -125,13 +146,16 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           cat > notes.md <<EOF
-          Install: \`curl -fsSL https://github.com/$REPO/releases/download/$TAG/install.sh | sh\`
+          Install: \`curl -fsSL https://github.com/$REPO/releases/download/$TAG/install.sh | BLOCKULA_VERSION=$TAG sh\`
 
-          **Verify before you run it.** Every file has SLSA build provenance:
-          \`gh attestation verify blockula-<target>.tar.gz --repo $REPO\`.
-          \`checksums.txt\` is signed offline with the Blockula release key (ML-DSA-65):
-          \`checksums.txt.sig\`. The Linux archives rebuild bit for bit with
-          \`scripts/reproduce-release.sh $TAG\`. See docs/OPERATIONS.md "Releases".
+          **Verify before you run it.** \`checksums.txt\` (its first line names $TAG) is signed offline
+          with the Blockula release key (ML-DSA-65): \`checksums.txt.sig\`. Check it against the
+          release key id published in SECURITY.md and on the website, never one taken from this page:
+          \`blockula release verify --key-id <release key id> --tag $TAG --sig checksums.txt.sig checksums.txt\`,
+          then \`sha256sum --ignore-missing -c checksums.txt\` (that covers install.sh too). Every file
+          also has SLSA build provenance (\`gh attestation verify <file> --repo $REPO --source-ref refs/tags/$TAG\`),
+          which a compromised GitHub account or workflow could produce as well. The Linux archives
+          rebuild bit for bit with \`scripts/reproduce-release.sh $TAG\`. See docs/OPERATIONS.md "Releases".
           EOF
           gh release create "$TAG" release/* \
             --repo "$REPO" --draft --verify-tag --title "Blockula $TAG" --notes-file notes.md --generate-notes

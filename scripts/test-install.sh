@@ -65,9 +65,9 @@ exec /usr/bin/curl "\${args[@]}"
 SH
 chmod +x "$T/bin/"* "$T/verifier/blockula"
 
-sum() { if command -v sha256sum >/dev/null; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
 # release DIR TAG PRINTS [no-tag-line]: an archive whose blockula prints PRINTS for --version, and
-# checksums.txt (with the "# blockula-release TAG" line release.yml writes, unless no-tag-line).
+# checksums.txt as release.yml writes it (scripts/release-checksums.sh), or without its first line
+# naming the release, as before v0.5.0.
 release() {
   local dir=$1 tag=$2 prints=$3 tagline=${4:-}
   rm -rf "$dir" "$T/src"
@@ -75,7 +75,9 @@ release() {
   printf '#!/bin/sh\necho "%s"\n' "$prints" > "$T/src/blockula-$target/blockula"
   chmod +x "$T/src/blockula-$target/blockula"
   tar -czf "$dir/blockula-$target.tar.gz" -C "$T/src" "blockula-$target"
-  (cd "$dir" && { [ "$tagline" = no-tag-line ] || echo "# blockula-release $tag"; sum blockula-*.tar.gz; } > checksums.txt)
+  scripts/release-checksums.sh "$tag" "$dir" > /dev/null
+  [ "$(head -n 1 "$dir/checksums.txt")" = "# blockula-release $tag" ] || { echo "✗ release-checksums.sh didn't name $tag first" >&2; exit 1; }
+  if [ "$tagline" = no-tag-line ]; then sed -i.bak 1d "$dir/checksums.txt" && rm "$dir/checksums.txt.bak"; fi
 }
 # sig DIR none|CONTENT: the release's checksums.txt.sig.
 sig() { rm -f "$1/checksums.txt.sig"; [ "$2" = none ] || echo "$2" > "$1/checksums.txt.sig"; }
