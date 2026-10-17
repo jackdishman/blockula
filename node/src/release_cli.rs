@@ -599,6 +599,7 @@ fn install(tag: &str, args: &SourceArgs, to: Option<PathBuf>, provenance: bool) 
 /// directory (with checksums.txt and its signature), so it holds verified files only.
 fn fetch(tag: &str, args: &SourceArgs, dir: &Path, files: &[String]) -> Result<()> {
     let mut names: Vec<String> = if files.is_empty() { vec![format!("blockula-{}.tar.gz", host_target()?)] } else { files.to_vec() };
+    names.sort();
     names.dedup();
     for n in &names {
         ensure!(n != "checksums.txt" && n != "checksums.txt.sig", "{n} is always fetched (and verified); name the files it lists");
