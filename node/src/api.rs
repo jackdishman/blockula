@@ -1936,6 +1936,8 @@ fn proposal_json(v: &ReadView, p: &crate::governance::Proposal) -> Value {
         "execute_at": p.execute_at,
         // Decided at the close; until then, what it would need now.
         "supermajority": p.tally.as_ref().map(|t| t.supermajority).unwrap_or_else(|| crate::governance::needs_supermajority(st, &p.kind)),
+        // Whether the bootstrap council's ⅔ can pass it (not the token holders' parameters).
+        "council_may_pass": crate::governance::council_may_pass(&p.kind),
         "ayes": { "amount": big_amount(p.aye_amount), "weight": big_amount(p.aye_weight) },
         "nays": { "amount": big_amount(p.nay_amount), "weight": big_amount(p.nay_weight) },
         "voters": p.voters,

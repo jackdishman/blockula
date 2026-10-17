@@ -68,9 +68,11 @@ BLOCKULA_RPC="http://$V2" BLOCKULA_ADMIN_SEED="$(cat "$DIR/v0/validator.key")" n
 
 echo "— governance: a ParamChange the bootstrap council passes (⅔ of the validators vote aye)"
 proposals() { curl -sf "http://$V0/api/proposals?limit=1"; }
-before=$(curl -sf "http://$V0/api/params" | field '.params.jail_blocks')
+# (A key the council may change: the validators' own economics, e.g. jail_blocks, are the token
+# holders' alone, `params::COUNCIL_KEYS`.)
+before=$(curl -sf "http://$V0/api/params" | field '.params.multisig_expiry_blocks')
 want=$((before + 7))
-"$BIN" gov propose param jail_blocks "$want" --title "local testnet: jail_blocks $want" --key "$DIR/v0/validator.key" --rpc "http://$V0"
+"$BIN" gov propose param multisig_expiry_blocks "$want" --title "local testnet: multisig_expiry_blocks $want" --key "$DIR/v0/validator.key" --rpc "http://$V0"
 PID=$(proposals | field '.proposals[0].id')
 for i in 0 1 2; do "$BIN" gov vote "$PID" aye 1 --conviction 0 --key "$DIR/v$i/validator.key" --rpc "http://$V0"; done
 status=""
@@ -78,9 +80,9 @@ for _ in $(seq 1 240); do
   status=$(curl -sf "http://$V0/api/proposal/$PID" | field '.status')
   [[ "$status" == "executed" || "$status" == "rejected" || "$status" == "failed" ]] && break; sleep 1
 done
-now=$(curl -sf "http://$V0/api/params" | field '.params.jail_blocks')
-[[ "$status" == "executed" && "$now" == "$want" ]] || { echo "❌ proposal #$PID: $status, jail_blocks $now (wanted $want)" >&2; curl -sf "http://$V0/api/proposal/$PID" >&2; exit 1; }
-echo "✓ proposal #$PID passed by the council and ran: jail_blocks $before → $now"
+now=$(curl -sf "http://$V0/api/params" | field '.params.multisig_expiry_blocks')
+[[ "$status" == "executed" && "$now" == "$want" ]] || { echo "❌ proposal #$PID: $status, multisig_expiry_blocks $now (wanted $want)" >&2; curl -sf "http://$V0/api/proposal/$PID" >&2; exit 1; }
+echo "✓ proposal #$PID passed by the council and ran: multisig_expiry_blocks $before → $now"
 
 echo "— onboarding a validator with the CLI"
 "$BIN" validator init --home "$DIR/v$N" --genesis "http://$V0" --genesis-hash "$GHASH" | tee "$DIR/init.txt"

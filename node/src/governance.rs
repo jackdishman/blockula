@@ -15,10 +15,12 @@
 //! system ones holds (liquid, staked at its pool's value, unbonding) less what vesting locks still
 //! hold of it ([`unlocked_supply`], O(vesting accounts) from running totals). A proposal passes on tokens if it reached quorum and its
 //! conviction-weighted ayes beat the nays: by a simple majority, or by `supermajority_bps` of the
-//! weight for upgrades (and cancelling them), feature activations, issuance parameters and treasury spends above
-//! `treasury_large_bps` of the treasury. Until `bootstrap_end_height` it also passes if ⅔ of the active set approve
-//! (a validator's council vote is any `Vote` its consensus key or owner signs) and the
-//! token-weighted nays don't exceed the ayes.
+//! weight for upgrades (and cancelling them), feature activations, the parameters that are the
+//! token holders' alone (`params::tokens_only`: governance's own and the validators' own
+//! economics) and treasury spends above `treasury_large_bps` of the treasury. Until
+//! `bootstrap_end_height` it also passes if ⅔ of the active set approve (a validator's council
+//! vote is any `Vote` its consensus key or owner signs) and the token-weighted nays don't exceed
+//! the ayes, unless it changes one of those parameters ([`council_may_pass`]).
 //!
 //! **Votes** lock `amount` of the voter's unlocked holdings (`econ::lock`, id `vote:<proposal>`)
 //! until `conviction` lock periods after voting ends; weight is `amount` × 0.1 at conviction 0,
@@ -469,7 +471,7 @@ fn prepare_kind(state: &State, kind: &ProposalKind, height: u64) -> Result<Propo
     let mut k = kind.clone();
     match &mut k {
         ProposalKind::ParamChange { key, value } => {
-            cp.check_governance_change(key, *value, &state.params)?;
+            cp.check_governance_change(key, *value, &state.params, height)?;
             cp.clone().set(key, *value, &state.params)?;
         }
         ProposalKind::TreasurySpend { to, .. } => {
@@ -670,13 +672,14 @@ pub fn unlocked_supply_by_walk(state: &State, height: u64) -> u128 {
 
 /// Whether a kind needs `supermajority_bps` of the weight: upgrades and their cancellations (a
 /// simple majority can't undo what a supermajority scheduled), feature activations
-/// (security-critical switches such as Ghost Mode), issuance parameters, governance's own safety
-/// parameters and the tip cap (`params::tokens_only`), and treasury spends above
-/// `treasury_large_bps` of the treasury's balance. Turning a feature off takes a simple majority.
+/// (security-critical switches such as Ghost Mode), the parameters that are the token holders'
+/// alone (`params::tokens_only`: governance's own safety parameters and the validators' own
+/// economics, issuance among them), and treasury spends above `treasury_large_bps` of the
+/// treasury's balance. Turning a feature off takes a simple majority.
 pub fn needs_supermajority(state: &State, kind: &ProposalKind) -> bool {
     match kind {
         ProposalKind::ScheduleUpgrade { .. } | ProposalKind::CancelUpgrade { .. } | ProposalKind::ActivateFeature { .. } => true,
-        ProposalKind::ParamChange { key, .. } => key.starts_with("issuance_") || crate::params::tokens_only(key),
+        ProposalKind::ParamChange { key, .. } => crate::params::tokens_only(key),
         ProposalKind::TreasurySpend { amount, .. } => {
             let treasury = state.account(&state.treasury()).balance as u128;
             (*amount as u128 + recent_spends(state, state.econ.height)) * 10_000 > state.chain_params.treasury_large_bps as u128 * treasury
@@ -699,11 +702,13 @@ pub fn recent_spends(state: &State, height: u64) -> u128 {
     state.governance.recent_spends.values().filter(|(at, _)| at.saturating_add(window) > height).map(|(_, amount)| *amount as u128).sum()
 }
 
-/// Whether the bootstrap council may pass a kind on its own: anything but a change to
-/// governance's own safety parameters (`params::GOVERNANCE_KEYS`), which only token holders
-/// decide, so the council can't extend itself, open spending early or weaken the vote that
-/// checks it (audit F15, F16), or to the tip cap (`params::PROPOSER_PAY_KEYS`), so the validators
-/// can't raise what a signature may pay them (audit F01).
+/// Whether the bootstrap council may pass a kind on its own: anything but a change to a
+/// parameter that's the token holders' alone (`params::tokens_only`): governance's own safety
+/// parameters (`params::GOVERNANCE_KEYS`), so the council can't extend itself, open spending
+/// early or weaken the vote that checks it (audit F15, F16), and the validators' own economics
+/// (`params::VALIDATOR_KEYS`: issuance, the tip cap, commission bounds, the self-bond, slashing,
+/// jail and downtime), since the council is the validators (audit F01, review-integrate-merges-1).
+/// Upgrades and feature switches stay the council's to pass in year 1.
 pub fn council_may_pass(kind: &ProposalKind) -> bool {
     !matches!(kind, ProposalKind::ParamChange { key, .. } if crate::params::tokens_only(key))
 }
@@ -735,16 +740,25 @@ fn close_vote(state: &mut State, id: u64, height: u64, unlocked: u128) {
     }
     let passed = by_tokens || by_council;
     let runs_at = p.voting_end.saturating_add(timelock(&cp, &p.kind)).max(height + 1);
+    // Why it didn't pass: the token vote's majority if it reached quorum, else why the council's
+    // ⅔ (which did vote, or the deposit is burned) didn't carry it.
     let outcome = if passed {
         let at = runs_at;
         let how = if by_tokens { "by token vote" } else { "by the bootstrap council" };
         format!("passed {how}; runs at block {at}")
     } else if !quorum_reached && !council_quorum {
         format!("no quorum: {} of {} needed voted; deposit burned", fmt_fang(clamp(turnout)), fmt_fang(clamp(quorum)))
-    } else if supermajority {
+    } else if quorum_reached && supermajority {
         format!("fewer than {}% of the vote weight said aye", crate::staking::fmt_bps(cp.supermajority_bps))
-    } else {
+    } else if quorum_reached {
         "the ayes didn't outweigh the nays".to_string()
+    } else {
+        let no_quorum = format!("no token quorum ({} of {} needed voted)", fmt_fang(clamp(turnout)), fmt_fang(clamp(quorum)));
+        match &p.kind {
+            ProposalKind::ParamChange { key, .. } if !council_may_pass(&p.kind) => format!("{no_quorum}, and the bootstrap council can't pass a change to {key}: it's the token holders' alone"),
+            _ if p.nay_weight > p.aye_weight => format!("{no_quorum}, and the token nays outweighed the ayes, which the bootstrap council can't overrule"),
+            _ => format!("{no_quorum}, and {ayes} of the council's {n} said aye (⅔ needed)"),
+        }
     };
     save_scalars(state, &mut j);
     // Spends that passed count toward the next ones' share of the treasury for the window; spends

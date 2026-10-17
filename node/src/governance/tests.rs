@@ -6,6 +6,7 @@
 use super::*;
 use crate::chain::{make_pop, treasury, Allocation, Genesis, Operator, Outcome, ValidatorInfo, Vesting};
 use crate::crypto::Keys;
+use crate::params::ChainParams;
 use crate::poc::SOUL;
 
 const FANG: u64 = DROPS_PER_FANG;
@@ -594,6 +595,126 @@ fn governance_safety_parameters_need_tokens_and_keep_their_floors() {
     assert_eq!(t.p(late).status, ProposalStatus::Failed);
     assert!(t.p(late).outcome.contains("never moves earlier"), "{}", t.p(late).outcome);
     assert_eq!((t.st.chain_params.supermajority_bps, t.st.chain_params.governance_spend_height), (6_667, 10_000));
+}
+
+/// review-integrate-merges-1: the bootstrap council is the validators, so it can't set their own
+/// economics: what they're paid (issuance and its split, the tip cap, commission bounds), what
+/// being one takes (the self-bond, insiders' delegations) or how they're penalized (slashes, jail,
+/// downtime, the evidence window, beacon misses). Those take the token supermajority. It still
+/// runs everything else in year 1: upgrades, features, the active set's size. A council-backed
+/// proposal it can't pass says so, not that too few said aye.
+#[test]
+fn the_council_cant_set_the_validators_own_economics() {
+    let mut t = T::new(&[("bootstrap_end_height", 1_000)]);
+    let [v1, v2, _] = VALIDATORS;
+    let council = |t: &mut T, kind: ProposalKind| {
+        let id = t.propose(ALICE, kind);
+        t.vote(v1, id, true, 1, 0).unwrap();
+        t.vote(v2, id, true, 1, 0).unwrap();
+        id
+    };
+    let own = [
+        ("issuance_stakers_bps", 8_000),
+        ("issuance_initial_ppm", 200_000),
+        ("issuance_floor_ppm", 20_000),
+        ("issuance_decay_ppm", 0),
+        ("issuance_pool_bps", 0),
+        ("slash_double_sign_bps", 0),
+        ("slash_downtime_bps", 0),
+        ("beacon_miss_slash_bps", 0),
+        ("jail_blocks", 1),
+        ("downtime_window", 1_000),
+        ("downtime_max_missed", 100),
+        ("reporter_reward_bps", 10_000),
+        ("commission_max_bps", 9_000),
+        ("commission_max_change_bps", 10_000),
+        ("min_self_bond", 2 * FANG),
+        ("evidence_max_age_epochs", 1),
+        ("insider_delegation_cap_bps", 10_000),
+        ("tip_cap_multiple", 1_000),
+    ];
+    let before = t.st.chain_params.clone();
+    let refused: Vec<u64> = own.iter().map(|(k, v)| council(&mut t, param(k, *v))).collect();
+    let lead = crate::upgrade::MIN_UPGRADE_LEAD;
+    let (voting, timelock) = (t.st.chain_params.voting_blocks, t.st.chain_params.timelock_blocks);
+    let upgrade = ProposalKind::ScheduleUpgrade { version: crate::consensus::PROTOCOL_VERSION + 1, activation_height: t.h + voting + timelock + voting + lead + 10 };
+    let passed = [council(&mut t, upgrade), council(&mut t, ProposalKind::ActivateFeature { feature: "ghost".into() }), council(&mut t, param("max_validators", 40)), council(&mut t, param("multisig_expiry_blocks", 20))];
+    t.finish(*passed.last().unwrap());
+    for (id, (key, _)) in refused.iter().zip(own) {
+        let p = t.p(*id);
+        assert_eq!(p.status, ProposalStatus::Rejected, "{key}: {}", p.outcome);
+        assert!(p.tally.as_ref().unwrap().supermajority, "{key} takes the supermajority");
+        assert!(p.outcome.contains(&format!("the bootstrap council can't pass a change to {key}")) && p.outcome.contains("no token quorum"), "{key}: {}", p.outcome);
+        assert!(needs_supermajority(&t.st, &param(key, 1)) && !council_may_pass(&param(key, 1)), "{key}");
+    }
+    assert_eq!(t.st.chain_params, ChainParams { max_validators: 40, multisig_expiry_blocks: 20, ..before }, "only the council's own keys moved");
+    for id in passed {
+        assert_eq!(t.p(id).status, ProposalStatus::Executed, "#{id}: {}", t.p(id).outcome);
+    }
+    assert!(crate::upgrade::is_active(&t.st, "ghost"));
+    // Token holders can, by the supermajority.
+    let id = t.propose(ALICE, param("slash_downtime_bps", 20));
+    t.vote(ALICE, id, true, 60_000, 1).unwrap();
+    t.finish(id);
+    assert_eq!((t.p(id).status, t.st.chain_params.slash_downtime_bps), (ProposalStatus::Executed, 20), "{}", t.p(id).outcome);
+    // Every parameter has a class: the token holders' alone, or the council's too. A key added
+    // later is the token holders' until it's listed with the council's.
+    let class: Vec<&str> = ChainParams::KEYS.iter().copied().filter(|k| !crate::params::COUNCIL_KEYS.contains(k)).collect();
+    for k in ChainParams::KEYS {
+        let listed = [crate::params::GOVERNANCE_KEYS, crate::params::VALIDATOR_KEYS, crate::params::COUNCIL_KEYS].iter().filter(|l| l.contains(k)).count();
+        assert_eq!(listed, 1, "{k} is in exactly one class");
+        assert_eq!(crate::params::tokens_only(k), class.contains(k));
+    }
+    assert!(crate::params::tokens_only("a_key_added_later"));
+}
+
+/// review-fix-gov-3: a vote moving a safety parameter toward safety can always be undone by the
+/// next one. The supermajority stops at 80%, so a dust nay can't block every upgrade (and its own
+/// repeal); quorum stops at 10% of the unlocked supply and 50M FANG (2.5× the defaults), so it
+/// stays reachable; the spend gate moves at most a year past the block that moves it, so
+/// spending reopens by itself.
+#[test]
+fn safety_parameters_can_always_be_moved_back() {
+    let mut t = T::new(&[]);
+    let refused = |t: &mut T, kind: ProposalKind, why: &str| {
+        let e = t.err(ALICE, Action::Propose { kind: kind.clone(), deposit: 50 * FANG, title: "x".into(), url: String::new() });
+        assert!(e.contains(why), "{kind:?}: {e}");
+    };
+    let day = 86_400;
+    refused(&mut t, param("supermajority_bps", 8_001), "raise supermajority_bps to 8000 (80%) at the most");
+    refused(&mut t, param("quorum_bps", 1_001), "raise quorum_bps to 1000 (10% of the unlocked supply) at the most");
+    refused(&mut t, param("quorum_floor", 50_000_000 * FANG + 1), &format!("raise quorum_floor to {} (50M FANG) at the most", 50_000_000 * FANG));
+    let gate = t.h + 365 * day;
+    refused(&mut t, param("governance_spend_height", gate + 1), &format!("block {gate} at the latest"));
+    let pass = |t: &mut T, kind: ProposalKind| {
+        let id = t.propose(ALICE, kind);
+        t.vote(ALICE, id, true, 60_000, 1).unwrap();
+        // One drop, at 1× conviction: no veto at 80%.
+        t.tx(BOB, Action::Vote { proposal_id: id, aye: false, amount: 1, conviction: 1 }).unwrap();
+        t.finish(id);
+        assert_eq!(t.p(id).status, ProposalStatus::Executed, "{}", t.p(id).outcome);
+    };
+    for (key, safe, back) in [("supermajority_bps", 8_000, 6_667), ("quorum_bps", 1_000, 400)] {
+        pass(&mut t, param(key, safe));
+        assert_eq!(t.st.chain_params.get(key), Some(safe));
+        // A ScheduleUpgrade passes against the dust nay at the strictest supermajority too.
+        if key == "supermajority_bps" {
+            let lead = crate::upgrade::MIN_UPGRADE_LEAD;
+            let (voting, timelock) = (t.st.chain_params.voting_blocks, t.st.chain_params.timelock_blocks);
+            let at = t.h + voting + timelock + voting + lead + 10;
+            pass(&mut t, ProposalKind::ScheduleUpgrade { version: crate::consensus::PROTOCOL_VERSION + 1, activation_height: at });
+        }
+        pass(&mut t, param(key, back));
+        assert_eq!(t.st.chain_params.get(key), Some(back));
+    }
+    // This test chain's whole supply is under the quorum floor's floor (5M FANG): it only moves
+    // up, to 50M FANG at the most.
+    pass(&mut t, param("quorum_floor", FANG));
+    // The spend gate, raised as far as it goes, reopens by itself: never earlier, never later.
+    let gate = t.h + 365 * day;
+    pass(&mut t, param("governance_spend_height", gate));
+    assert_eq!(t.st.chain_params.governance_spend_height, gate);
+    refused(&mut t, param("governance_spend_height", gate - 1), "never moves earlier");
 }
 
 #[test]

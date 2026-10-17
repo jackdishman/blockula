@@ -1584,11 +1584,11 @@ impl State {
     }
 
     /// Sets a governance-adjustable parameter (`ParamChange`): within its bounds, and governance's
-    /// own safety parameters only as far as their floors allow
-    /// (`ChainParams::check_governance_change`).
+    /// own safety parameters only within their bands (`ChainParams::check_governance_change`, as
+    /// of the block it runs in).
     pub(crate) fn exec_set_param(&mut self, j: &mut Journal, key: &str, value: u64) -> Result<()> {
         let params = self.params.clone();
-        self.chain_params.check_governance_change(key, value, &params)?;
+        self.chain_params.check_governance_change(key, value, &params, self.econ.height)?;
         let mut next = self.chain_params.clone();
         next.set(key, value, &params)?;
         *self.chain_params_mut(j) = next;
@@ -5091,12 +5091,13 @@ mod scaffold {
         let mut main = serde_json::to_value(genesis(MAINNET_CHAIN_ID)).unwrap();
         main["features"] = serde_json::json!(["ghost"]);
         assert!(load(&main).unwrap_err().contains("Ghost Mode off"));
-        // … and governance's safety parameters on the safe side of their floors (F15).
-        for (key, value) in [("timelock_blocks", 3_600), ("supermajority_bps", 5_001), ("treasury_large_bps", 1_000), ("quorum_floor", 0)] {
+        // … and governance's safety parameters inside their bands (F15, review-fix-gov-3).
+        let day = 86_400u64;
+        for (key, value, side) in [("timelock_blocks", 3_600, "floor"), ("supermajority_bps", 5_001, "floor"), ("treasury_large_bps", 1_000, "ceiling"), ("quorum_floor", 0, "floor"), ("supermajority_bps", 9_000, "ceiling"), ("quorum_bps", 2_000, "ceiling"), ("governance_spend_height", 366 * day, "ceiling")] {
             let mut main = serde_json::to_value(genesis(MAINNET_CHAIN_ID)).unwrap();
             main["params"][key] = value.into();
             let e = load(&main).unwrap_err();
-            assert!(e.contains(&format!("`{key}`")) && e.contains("past governance's floor"), "{key}: {e}");
+            assert!(e.contains(&format!("`{key}`")) && e.contains(&format!("past governance's {side}")), "{key}: {e}");
         }
         // Other chains may keep admins (dev and test).
         let mut test = good.clone();
