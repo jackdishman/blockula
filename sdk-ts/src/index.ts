@@ -1,8 +1,8 @@
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex, hexToBytes, randomBytes, utf8ToBytes } from "@noble/hashes/utils.js";
-import { bech32m } from "@scure/base";
-import { DEFAULT_TIP_CAP_MULTIPLE, baseFee, formatFang, maxTip, parseFang, parseSoul, seanceCommitment, signingBytes, type Action, type BaseFee, type KeyRole, type ProposalKind, type Tx, type UnsignedTx } from "./tx.js";
+import { base64urlnopad, bech32m } from "@scure/base";
+import { DEFAULT_TIP_CAP_MULTIPLE, KEY_POP_CONTEXT, PUBLIC_KEY_LEN, SIGNATURE_LEN, baseFee, formatFang, keyPopMessage, maxTip, parseFang, parseSoul, seanceCommitment, signingBytes, type Action, type BaseFee, type KeyRole, type ProposalKind, type Tx, type UnsignedTx } from "./tx.js";
 import { NAMESPACES, checkProofResponse, decodeAccount, decodeName, type ProofResponse, type ProvenRecord } from "./proof.js";
 
 export * from "./tx.js";
@@ -357,6 +357,63 @@ export interface TxOptions {
 }
 
 /**
+ * A key's consent to being added to one account (audit gap-7-2): its public key and its
+ * signature over `keyPopMessage(chain_id, genesis_hash, account, key_id)` (context
+ * `KEY_POP_CONTEXT`). The key's holder makes it (`Wallet.keyGrant`) and hands it to the account's
+ * owner (`encodeKeyGrant`: a grant code to paste), who adds the key with it (`addOwnerKey`,
+ * `addSessionKey`). Nobody can put a key on an account without it, so `/api/key` lists only
+ * accounts the key agreed to.
+ */
+export interface KeyGrant {
+  /** The account the key agrees to join. */
+  account: string;
+  key_id: string;
+  /** Hex ML-DSA-65 public key. */
+  public_key: string;
+  /** Hex proof of possession. */
+  pop: string;
+}
+
+const GRANT_PREFIX = "bkgrant1";
+
+/** A grant as one pasteable string: `bkgrant1.<account>.<base64url(public key ‖ pop)>`. */
+export function encodeKeyGrant(g: KeyGrant): string {
+  const body = new Uint8Array(PUBLIC_KEY_LEN + SIGNATURE_LEN);
+  body.set(hexToBytes(g.public_key));
+  body.set(hexToBytes(g.pop), PUBLIC_KEY_LEN);
+  return `${GRANT_PREFIX}.${g.account}.${base64urlnopad.encode(body)}`;
+}
+
+/** Parses a grant code (`encodeKeyGrant`). Whitespace is ignored, so a wrapped paste works. */
+export function decodeKeyGrant(code: string): KeyGrant {
+  const c = code.replace(/\s+/g, "");
+  if (/^[0-9a-f]{64}$/i.test(c)) throw new Error("that's a key id: adding a key needs its grant code now, which the key's holder makes for your account (Wallet.keyGrant, the MCP's use_account, or a new device's link screen)");
+  const [prefix, account, body, ...rest] = c.split(".");
+  if (prefix !== GRANT_PREFIX || !account || !body || rest.length) throw new Error("that isn't a key grant code (it starts with bkgrant1.)");
+  if (!isAddress(account)) throw new Error("the grant code's account isn't an address");
+  let bytes: Uint8Array;
+  try {
+    bytes = base64urlnopad.decode(body);
+  } catch {
+    throw new Error("the grant code is damaged (copy all of it)");
+  }
+  if (bytes.length !== PUBLIC_KEY_LEN + SIGNATURE_LEN) throw new Error("the grant code is damaged or cut short (copy all of it)");
+  const pk = bytes.slice(0, PUBLIC_KEY_LEN);
+  return { account, key_id: keyId(pk), public_key: bytesToHex(pk), pop: bytesToHex(bytes.slice(PUBLIC_KEY_LEN)) };
+}
+
+/** Whether `g` is a valid consent by its key to join `g.account` on the chain `(chainId, genesisHash)`. */
+export function verifyKeyGrant(g: KeyGrant, chainId: string, genesisHash: string): boolean {
+  try {
+    const pk = hexToBytes(g.public_key);
+    if (pk.length !== PUBLIC_KEY_LEN || keyId(pk) !== g.key_id) return false;
+    return ml_dsa65.verify(hexToBytes(g.pop), keyPopMessage(chainId, genesisHash, g.account, g.key_id), pk, { context: KEY_POP_CONTEXT });
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Wallet = one ML-DSA-65 key (from a 32-byte seed, FIPS 204 ξ) acting for one account.
  * By default the account is the key's own address. Call `actAs(account)` to use a key that
  * was added to another account (a second device, or an agent session key).
@@ -430,6 +487,35 @@ export class Wallet {
   }
 
   /**
+   * This key's consent to being added to `account` (an address, or a name resolved by the
+   * client: proven when it has witnesses) on the client's chain: hand `encodeKeyGrant(grant)` to
+   * the account's owner, who adds the key with it. Pass `chain` to sign offline.
+   */
+  async keyGrant(account: string, chain?: { chainId: string; genesisHash: string }): Promise<KeyGrant> {
+    const address = isAddress(account) ? account : await this.client.resolve(account);
+    let c = chain;
+    if (!c) {
+      const status = await this.client.status();
+      if (typeof status.genesis_hash !== "string") throw new Error(`${this.client.rpc} doesn't report a genesis_hash; it's too old for this SDK`);
+      c = { chainId: status.chain_id, genesisHash: status.genesis_hash };
+    }
+    const pop = ml_dsa65.sign(keyPopMessage(c.chainId, c.genesisHash, address, this.keyId), this.secretKey, { context: KEY_POP_CONTEXT });
+    return { account: address, key_id: this.keyId, public_key: bytesToHex(this.publicKey), pop: bytesToHex(pop) };
+  }
+
+  /**
+   * The `add_key` action for a grant (an object or its code): it must be for this account and
+   * verify on the client's chain, so a wrong or damaged code fails here, before anything is signed.
+   */
+  private async grantAction(grant: KeyGrant | string, label: string, role: KeyRole): Promise<Action> {
+    const g = typeof grant === "string" ? decodeKeyGrant(grant) : grant;
+    if (g.account !== this.account) throw new Error(`that grant is for ${g.account}, not this account (${this.account}): the key's holder must make it for ${this.account}`);
+    const status = await this.client.status();
+    if (!verifyKeyGrant(g, status.chain_id, status.genesis_hash)) throw new Error("that grant doesn't verify: it's damaged, or it was made for another chain");
+    return { type: "add_key", key_id: g.key_id, label, role, public_key: g.public_key, pop: g.pop };
+  }
+
+  /**
    * Builds and signs a tx: `fee` = the highest base fee already fixed for the next blocks
    * (`/api/fees` `suggested`) + `tip`, `valid_until` = the current height + `validForBlocks`, and
    * the chain's id and genesis hash from `/api/status`. Only the base fee of the block that
@@ -480,21 +566,26 @@ export class Wallet {
     return this.client.submit(tx, opts.wait ?? true);
   }
 
-  /** Authorize another device's key (e.g. a second passkey) with full control. */
-  async addOwnerKey(keyIdHex: string, label: string) {
-    return this.client.submit(await this.build({ type: "add_key", key_id: keyIdHex, label, role: { type: "owner" } }));
+  /**
+   * Authorize another device's key (e.g. a second passkey) with full control. `grant` is the
+   * key's consent to this account (`keyGrant` on that device, or its grant code).
+   */
+  async addOwnerKey(grant: KeyGrant | string, label: string) {
+    return this.client.submit(await this.build(await this.grantAction(grant, label, { type: "owner" })));
   }
 
   /**
-   * Let an agent/app key spend from this account, transfers only, within a limit.
-   * Example: `addSessionKey(agentKeyId, "claude", { limit: "10", periodBlocks: 86_400, expiresInBlocks: 30 * 86_400 })`.
+   * Let an agent/app key spend from this account, transfers only, within a limit. `grant` is the
+   * key's consent to this account (the agent's grant code).
+   * Example: `addSessionKey(grantCode, "claude", { limit: "10", periodBlocks: 86_400, expiresInBlocks: 30 * 86_400 })`.
    */
-  async addSessionKey(keyIdHex: string, label: string, opts: { limit: string | number | bigint; periodBlocks: number; expiresInBlocks: number }) {
+  async addSessionKey(grant: KeyGrant | string, label: string, opts: { limit: string | number | bigint; periodBlocks: number; expiresInBlocks: number }) {
     if (!Number.isSafeInteger(opts.periodBlocks) || opts.periodBlocks < 1) throw new Error("periodBlocks must be a positive whole number of blocks");
     if (!Number.isSafeInteger(opts.expiresInBlocks) || opts.expiresInBlocks < 1) throw new Error("expiresInBlocks must be a positive whole number of blocks");
     const limit = parseFang(opts.limit).toString();
+    const base = await this.grantAction(grant, label, { type: "owner" });
     // The expiry counts from the height valid_until does (one status read): see `build`.
-    return this.client.submit(await this.build((height) => ({ type: "add_key", key_id: keyIdHex, label, role: { type: "session", limit, period_blocks: opts.periodBlocks, expires_at: height + opts.expiresInBlocks } satisfies KeyRole })));
+    return this.client.submit(await this.build((height) => ({ ...base, role: { type: "session", limit, period_blocks: opts.periodBlocks, expires_at: height + opts.expiresInBlocks } satisfies KeyRole }) as Action));
   }
 
   async removeKey(keyIdHex: string) {
@@ -1079,7 +1170,16 @@ export class Client {
   /** Upgrades: the protocol version in force, what the node's binary supports, the `schedule` (`[{ version, activation_height, active }]`, what `proposal.cancelUpgrade` names), halts and each validator's readiness signal. */
   upgrade() { return this.call("/upgrade"); }
   /** Accounts a key is authorized on (its own address, plus any it was added to). */
-  keyAccounts(keyIdHex: string) { return this.call(`/key/${keyIdHex}`); }
+  /**
+   * Accounts a key is on (`{ key_id, accounts, next }`), a page at a time: pass the previous page's
+   * `next` as `after`. Only accounts the key agreed to join (its grant) can list it (audit gap-7-2).
+   */
+  keyAccounts(keyIdHex: string, page: { after?: string; limit?: number } = {}) {
+    const q = new URLSearchParams();
+    if (page.after) q.set("after", page.after);
+    if (page.limit !== undefined) q.set("limit", String(page.limit));
+    return this.call(`/key/${keyIdHex}${q.size ? `?${q}` : ""}`);
+  }
   search(q: string) { return this.call(`/search/${encodeURIComponent(q)}`); }
   /** The validator set: `active` this epoch, `next_epoch` (with `joining`/`leaving`), `candidates`, `jailed`, `tombstoned` and `removed`, each with stake, self-bond, commission, jail and liveness; epoch timing; the churn limit and slashing parameters. */
   validators() { return this.call("/validators"); }

@@ -10,7 +10,13 @@ export type KeyRole =
 export type Action =
   | { type: "transfer"; to: string; amount: string }
   | { type: "register_name"; name: string }
-  | { type: "add_key"; key_id: string; label: string; role: KeyRole }
+  /**
+   * Authorize a key on this account (owner keys only). The added key consents: `public_key` is its
+   * hex ML-DSA-65 public key (`key_id` is its BLAKE3) and `pop` its signature over
+   * `keyPopMessage(chain_id, genesis_hash, account, key_id)` with context `KEY_POP_CONTEXT`. Build
+   * it from a `KeyGrant` (`Wallet.keyGrant`, `addOwnerKey`, `addSessionKey`).
+   */
+  | { type: "add_key"; key_id: string; label: string; role: KeyRole; public_key: string; pop: string }
   | { type: "remove_key"; key_id: string }
   /** Bond `bond` drops and offer `consensus_key` (hex ML-DSA-65 public key) as a validator. */
   | {
@@ -307,6 +313,7 @@ function encodeAction(w: Writer, a: Action) {
       w.u8(2); w.str(a.key_id); w.str(a.label);
       if (a.role.type === "owner") w.u8(0);
       else { w.u8(1); w.u64(a.role.limit); w.u64(a.role.period_blocks); w.u64(a.role.expires_at); }
+      w.str(a.public_key); w.str(a.pop);
       break;
     case "remove_key":
       w.u8(3); w.str(a.key_id);
@@ -610,6 +617,20 @@ export function parseSoul(soul: string | number): number {
   if (!/^\d+(\.\d{1,3})?$/.test(s)) throw new Error(`invalid Soul amount: ${s}`);
   const [whole, frac = ""] = s.split(".");
   return Number(whole) * 1000 + Number(frac.padEnd(3, "0"));
+}
+
+/** FIPS 204 context string for a key's proof of possession in `add_key` (node/src/types.rs `KEY_POP_CONTEXT`). */
+export const KEY_POP_CONTEXT = utf8.encode("blockula/key-pop/v1");
+
+/**
+ * What a key signs to consent to being added to `account` (node/src/types.rs `key_pop_message`):
+ * the chain instance, the account and the key's own id (audit gap-7-2).
+ */
+export function keyPopMessage(chainId: string, genesisHash: string, account: string, keyId: string): Uint8Array {
+  const w = new Writer();
+  w.bytes(utf8.encode("BLOCKULA_KEY_POP_V1"));
+  for (const s of [chainId, genesisHash, account, keyId]) w.str(s);
+  return w.done();
 }
 
 /** FIPS 204 context string for validator proofs of possession (node/src/types.rs `POP_CONTEXT`). */

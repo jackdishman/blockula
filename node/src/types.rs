@@ -38,8 +38,19 @@ pub enum Action {
         amount: u64,
     },
     RegisterName { name: String },
-    /// Authorize another key on this account (owner keys only).
-    AddKey { key_id: String, label: String, role: KeyRole },
+    /// Authorize another key on this account (owner keys only). The added key consents: `pop` is
+    /// its signature over `key_pop_message(chain_id, genesis_hash, account, key_id)` (context
+    /// `KEY_POP_CONTEXT`), so nobody can put a key they don't hold on their own accounts (and
+    /// pad its `/api/key` listing: audit gap-7-2).
+    AddKey {
+        key_id: String,
+        label: String,
+        role: KeyRole,
+        /// The added key's hex ML-DSA-65 public key (`key_id` is its BLAKE3).
+        public_key: String,
+        /// Its hex ML-DSA-65 proof of possession for this account (see `key_pop`).
+        pop: String,
+    },
     /// Revoke a key (owner keys only). The last owner key can't be removed.
     RemoveKey { key_id: String },
     /// Offer to validate: bonds `bond` drops from the sender and creates a *pending* validator
@@ -356,6 +367,46 @@ impl From<KeyRoleJson> for KeyRole {
 /// A key's id is BLAKE3(public key) as hex, the same 32 bytes inside a `boo1…` address.
 pub fn key_id(public_key: &[u8]) -> String {
     hex::encode(crypto::hash(public_key))
+}
+
+/// Domain separation for a key's proof of possession when it's added to an account (FIPS 204
+/// context string; validators' consensus keys use `POP_CONTEXT`).
+pub const KEY_POP_CONTEXT: &[u8] = b"blockula/key-pop/v1";
+
+/// What a key signs to consent to being added to `account` (`AddKey.pop`): the chain instance,
+/// the account and the key's own id. Not the role or label, which the account's owners choose.
+pub fn key_pop_message(chain_id: &str, genesis_hash: &str, account: &str, key_id: &str) -> Vec<u8> {
+    let mut out = b"BLOCKULA_KEY_POP_V1".to_vec();
+    for s in [chain_id, genesis_hash, account, key_id] {
+        put_str(&mut out, s);
+    }
+    out
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+/// `keys`' proof of possession for being added to `account` on the chain `(chain_id, genesis_hash)`.
+pub fn key_pop(keys: &crypto::Keys, chain_id: &str, genesis_hash: &str, account: &str) -> String {
+    hex::encode(keys.sign_with_context(KEY_POP_CONTEXT, &key_pop_message(chain_id, genesis_hash, account, &key_id(&keys.public_key()))))
+}
+
+/// An `AddKey` for `keys`, with its proof of possession for `account`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn add_key(keys: &crypto::Keys, chain_id: &str, genesis_hash: &str, account: &str, label: &str, role: KeyRole) -> Action {
+    Action::AddKey { key_id: key_id(&keys.public_key()), label: label.into(), role, public_key: hex::encode(keys.public_key()), pop: key_pop(keys, chain_id, genesis_hash, account) }
+}
+
+/// Checks an `AddKey`'s proof of possession: `public_key` is the key `key_id` names and it signed
+/// its consent to `account` on this chain instance.
+pub fn verify_key_pop(chain_id: &str, genesis_hash: &str, account: &str, key_id: &str, public_key: &str, pop: &str) -> Result<()> {
+    let pk = hex::decode(public_key).map_err(|_| anyhow!("public_key must be hex"))?;
+    if self::key_id(&pk) != key_id {
+        bail!("public_key isn't the key key_id names (key_id is BLAKE3 of the public key)");
+    }
+    let sig = hex::decode(pop).map_err(|_| anyhow!("pop must be a hex ML-DSA-65 signature"))?;
+    if !crypto::verify_with_context(&pk, KEY_POP_CONTEXT, &key_pop_message(chain_id, genesis_hash, account, key_id), &sig) {
+        bail!("the added key's proof of possession doesn't verify: the key must sign its consent to this account on this chain (see Wallet.keyGrant)");
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -679,7 +730,7 @@ impl Action {
                 out.push(1);
                 put_str(out, name);
             }
-            Action::AddKey { key_id, label, role } => {
+            Action::AddKey { key_id, label, role, public_key, pop } => {
                 out.push(2);
                 put_str(out, key_id);
                 put_str(out, label);
@@ -692,6 +743,8 @@ impl Action {
                         out.extend_from_slice(&expires_at.to_le_bytes());
                     }
                 }
+                put_str(out, public_key);
+                put_str(out, pop);
             }
             Action::RemoveKey { key_id } => {
                 out.push(3);
@@ -984,6 +1037,8 @@ impl Action {
                     1 => KeyRole::Session { limit: r.u64()?, period_blocks: r.u64()?, expires_at: r.u64()? },
                     t => bail!("unknown key role {t}"),
                 },
+                public_key: r.str("public_key", hex_pk)?,
+                pop: r.str("pop", hex_sig)?,
             },
             3 => Action::RemoveKey { key_id: r.str("key_id", HEX_32)? },
             4 => Action::RegisterValidator {
@@ -1073,9 +1128,18 @@ impl Action {
                 }
                 normalize_name(name)?;
             }
-            Action::AddKey { key_id, label, role } => {
+            Action::AddKey { key_id, label, role, public_key, pop } => {
                 if !key_id_ok(key_id) {
                     bail!("key_id must be 32 bytes of lowercase hex (BLAKE3 of the public key)");
+                }
+                if !crypto::is_lower_hex(public_key) || public_key.len() != crypto::PUBLIC_KEY_LEN * 2 {
+                    bail!("public_key must be the added key's ML-DSA-65 public key ({} bytes of lowercase hex)", crypto::PUBLIC_KEY_LEN);
+                }
+                if hex::decode(public_key).map(|pk| self::key_id(&pk) != *key_id).unwrap_or(true) {
+                    bail!("public_key isn't the key key_id names (key_id is BLAKE3 of the public key)");
+                }
+                if !crypto::is_lower_hex(pop) || pop.len() != crypto::SIGNATURE_LEN * 2 {
+                    bail!("pop must be the added key's ML-DSA-65 signature ({} bytes of lowercase hex) over its consent to this account (see Wallet.keyGrant)", crypto::SIGNATURE_LEN);
                 }
                 if label.len() > MAX_LABEL {
                     bail!("key label too long (max {MAX_LABEL} bytes)");
@@ -2084,8 +2148,8 @@ pub(crate) mod tests {
         vec![
             Action::Transfer { to: "x.boo".into(), amount: 5 },
             Action::RegisterName { name: "vlad".into() },
-            Action::AddKey { key_id: "ab".repeat(32), label: "phone".into(), role: KeyRole::Owner },
-            Action::AddKey { key_id: "cd".repeat(32), label: "claude".into(), role: KeyRole::Session { limit: 10, period_blocks: 100, expires_at: 1000 } },
+            Action::AddKey { key_id: "ab".repeat(32), label: "phone".into(), role: KeyRole::Owner, public_key: "0c".into(), pop: "0d".into() },
+            Action::AddKey { key_id: "cd".repeat(32), label: "claude".into(), role: KeyRole::Session { limit: 10, period_blocks: 100, expires_at: 1000 }, public_key: "0e".into(), pop: "0f".into() },
             Action::RemoveKey { key_id: "ab".repeat(32) },
             Action::RegisterValidator { consensus_key: "0a".into(), p2p_addr: "1.2.3.4:5".into(), http_addr: "https://v.example".into(), bond: 50, pop: "0b".into() },
             Action::ApproveValidator { validator: "boo1v".into() },
@@ -2213,8 +2277,8 @@ pub(crate) mod tests {
         cases.extend([
             ("tx integers at their maxima".to_string(), Tx { nonce: JS_MAX, fee: u64::MAX, tip: u64::MAX, valid_until: JS_MAX, ..base.clone() }),
             ("tx integers at zero".to_string(), Tx { nonce: 0, fee: 0, tip: 0, valid_until: 0, action: Action::Transfer { to: "x.boo".into(), amount: 0 }, memo: String::new(), ..base.clone() }),
-            ("non-ASCII strings".to_string(), Tx { chain_id: "vec-🧛".into(), memo: "ünïcödé 🦇 \u{0}\u{7f}".into(), action: Action::AddKey { key_id: "ab".repeat(32), label: "Vlad’s phone 📱".into(), role: KeyRole::Owner }, ..base.clone() }),
-            at("session key limit at u64::MAX", Action::AddKey { key_id: "cd".repeat(32), label: "agent".into(), role: KeyRole::Session { limit: u64::MAX, period_blocks: JS_MAX, expires_at: JS_MAX } }),
+            ("non-ASCII strings".to_string(), Tx { chain_id: "vec-🧛".into(), memo: "ünïcödé 🦇 \u{0}\u{7f}".into(), action: Action::AddKey { key_id: "ab".repeat(32), label: "Vlad’s phone 📱".into(), role: KeyRole::Owner, public_key: "0c".into(), pop: "0d".into() }, ..base.clone() }),
+            at("session key limit at u64::MAX", Action::AddKey { key_id: "cd".repeat(32), label: "agent".into(), role: KeyRole::Session { limit: u64::MAX, period_blocks: JS_MAX, expires_at: JS_MAX }, public_key: "0e".into(), pop: "0f".into() }),
             at("hunt at the bounds", Action::CreateHunt { repo: "a/b".into(), issue: JS_MAX, amount: u64::MAX, expires_at: JS_MAX, title: "t".into() }),
             at("award at the bounds", Action::AwardHunt { hunt_id: JS_MAX, to: "x.boo".into(), pr: JS_MAX, familiar_key: None }),
             at("vote at the bounds", Action::Vote { proposal_id: JS_MAX, aye: false, amount: u64::MAX, conviction: u8::MAX }),
@@ -2534,10 +2598,12 @@ pub(crate) mod tests {
         inner["action"]["padding"] = serde_json::json!("x");
         assert!(serde_json::from_value::<Tx>(inner).is_err(), "unknown field inside the (internally tagged) action");
         assert!(serde_json::from_str::<Action>(r#"{"type":"leave_jury","x":1}"#).is_err());
-        let role = |r: &str| serde_json::from_str::<Action>(&format!(r#"{{"type":"add_key","key_id":"ab","label":"l","role":{r}}}"#));
+        let role = |r: &str| serde_json::from_str::<Action>(&format!(r#"{{"type":"add_key","key_id":"ab","label":"l","role":{r},"public_key":"0c","pop":"0d"}}"#));
         assert!(role(r#"{"type":"owner","limit":"1"}"#).is_err(), "and inside the key role");
         assert!(role(r#"{"type":"session","limit":"1","period_blocks":2,"expires_at":3,"x":0}"#).is_err());
-        assert_eq!(role(r#"{"type":"owner"}"#).unwrap(), Action::AddKey { key_id: "ab".into(), label: "l".into(), role: KeyRole::Owner });
+        assert_eq!(role(r#"{"type":"owner"}"#).unwrap(), Action::AddKey { key_id: "ab".into(), label: "l".into(), role: KeyRole::Owner, public_key: "0c".into(), pop: "0d".into() });
+        // gap-7-2: the added key's public key and proof of possession are required.
+        assert!(serde_json::from_str::<Action>(r#"{"type":"add_key","key_id":"ab","label":"l","role":{"type":"owner"}}"#).is_err(), "an AddKey without the key's consent");
         let session = role(r#"{"type":"session","limit":"1","period_blocks":2,"expires_at":3}"#).unwrap();
         assert_eq!(serde_json::to_value(&session).unwrap()["role"], serde_json::json!({ "type": "session", "limit": "1", "period_blocks": 2, "expires_at": 3 }));
         let mut missing = ok;
@@ -2587,9 +2653,10 @@ pub(crate) mod tests {
         assert!(err(&long_memo.to_bytes()).contains("`memo` too long"));
         let spam = vector_tx(Action::RevealVotes { seance_id: 1, votes: "a".into(), spam: vec![1; crate::poc::MAX_SEANCE_CLAIMS + 1], salt: "s".into() });
         assert!(err(&spam.to_bytes()).contains("too many entries"));
-        let role = vector_tx(Action::AddKey { key_id: "ab".repeat(32), label: "l".into(), role: KeyRole::Owner });
+        let role = vector_tx(Action::AddKey { key_id: "ab".repeat(32), label: "l".into(), role: KeyRole::Owner, public_key: "0c".into(), pop: "0d".into() });
         let mut bad_role = role.to_bytes();
-        bad_role[role.signing_bytes().len() - 2 - 1 - 1] = 2;
+        // Back from the end of the signing bytes: the memo ("m"), the pop and the public key.
+        bad_role[role.signing_bytes().len() - (2 + 1) - (2 + 2) - (2 + 2) - 1] = 2;
         assert!(err(&bad_role).contains("unknown key role"));
         assert!(Tx::from_bytes(&vec![0u8; MAX_GHOST_TX_BYTES + 1]).unwrap_err().to_string().contains("too large"));
     }
@@ -2686,7 +2753,7 @@ pub(crate) mod tests {
         (0u8..55, strs, nums, any::<bool>(), opt, ids, list, 0u8..16, any::<u8>()).prop_map(|(tag, [a, b, c, d], [w, x, y], ok, familiar_key, spam, list, kind, small)| match tag {
             0 => Action::Transfer { to: a, amount: w },
             1 => Action::RegisterName { name: a },
-            2 => Action::AddKey { key_id: a, label: b, role: if ok { KeyRole::Owner } else { KeyRole::Session { limit: w, period_blocks: x, expires_at: y } } },
+            2 => Action::AddKey { key_id: a, label: b, role: if ok { KeyRole::Owner } else { KeyRole::Session { limit: w, period_blocks: x, expires_at: y } }, public_key: c, pop: d },
             3 => Action::RemoveKey { key_id: a },
             4 => Action::RegisterValidator { consensus_key: a, p2p_addr: b, http_addr: c, bond: w, pop: d },
             5 => Action::ApproveValidator { validator: a },

@@ -74,7 +74,7 @@ impl Sim {
             0 => by(a, Action::Transfer { to: addr(b), amount: fang(amt % 20) + 1 }),
             1 => by(a, Action::Transfer { to: newcomer, amount: fang(1) }),
             2 => by(a, Action::RegisterName { name: format!("name{b}") }),
-            3 => by(a, Action::AddKey { key_id: key_id(&agent.public_key()), label: "agent".into(), role: KeyRole::Session { limit: fang(5), period_blocks: 10, expires_at: h + 500 } }),
+            3 => by(a, crate::types::add_key(&agent, &self.c.genesis.chain_id, &self.c.genesis_hash, &addr(a), "agent", KeyRole::Session { limit: fang(5), period_blocks: 10, expires_at: h + 500 })),
             4 => by(a, Action::RemoveKey { key_id: key_id(&agent.public_key()) }),
             5 => by(a, Action::RegisterFamiliar { key_id: key_id(&agent.public_key()), label: "claude".into() }),
             6 => Some((agent, addr(a), Action::Transfer { to: addr(b), amount: fang(1) })),

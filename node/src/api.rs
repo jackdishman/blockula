@@ -1106,11 +1106,30 @@ async fn account(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
 
 /// Which accounts a key may act for — lets a newly linked device find its account. From the
 /// store's key index, not a scan of every account.
-async fn key_accounts(State(n): State<Node>, Path(key_id): Path<String>) -> ApiResult {
+#[derive(Deserialize)]
+struct KeyQuery {
+    /// The last account of the previous page.
+    after: Option<String>,
+    limit: Option<usize>,
+}
+
+/// `/api/key/{key_id}?after=&limit=`: the accounts a key is on, in address order, a page (at most
+/// `ACCOUNT_LIST_LIMIT`) at a time; `next` is the next page's `after` (`null` at the end). The
+/// key's own address (its original account) leads the first page. Only accounts the key agreed to
+/// join can list it (AddKey carries its proof of possession), so strangers can't pad this list to
+/// push an account off it (audit gap-7-2).
+async fn key_accounts(State(n): State<Node>, Path(key_id): Path<String>, Query(q): Query<KeyQuery>) -> ApiResult {
     let v = n.live.view();
     let st = &v.state;
-    let mut accounts: Vec<Value> = v
-        .accounts_with_key(&key_id, ACCOUNT_LIST_LIMIT)
+    let limit = q.limit.unwrap_or(ACCOUNT_LIST_LIMIT).clamp(1, ACCOUNT_LIST_LIMIT);
+    let after = q.after.as_deref().filter(|a| !a.is_empty());
+    // One more than a page, to know whether there's another.
+    let mut page = v.accounts_with_key_after(&key_id, after, limit + 1);
+    let next = (page.len() > limit).then(|| {
+        page.truncate(limit);
+        page.last().cloned()
+    });
+    let mut accounts: Vec<Value> = page
         .into_iter()
         .filter_map(|addr| {
             let k = st.accounts.get(&addr)?.keys.get(&key_id)?.clone();
@@ -1121,12 +1140,12 @@ async fn key_accounts(State(n): State<Node>, Path(key_id): Path<String>) -> ApiR
         if let Ok(bytes) = <[u8; 32]>::try_from(bytes) {
             let own = crypto::render_address(st.params.prefix(), &bytes);
             let listed = accounts.iter().any(|a| a["account"]["address"] == own.as_str());
-            if !listed && st.keys_of(&own).contains_key(&key_id) {
+            if after.is_none() && !listed && st.keys_of(&own).contains_key(&key_id) {
                 accounts.insert(0, json!({ "account": label(&v, &own), "role": { "type": "owner" }, "label": "original key" }));
             }
         }
     }
-    Ok(Json(json!({ "key_id": key_id, "accounts": accounts })))
+    Ok(Json(json!({ "key_id": key_id, "accounts": accounts, "next": next.flatten() })))
 }
 
 /// A name (DEC-11): its `status` (`active`; `grace`, when only its owner can renew it;
@@ -2882,6 +2901,60 @@ mod http_tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// Audit gap-7-2: `/api/key` lists only accounts the key agreed to join (a stranger's AddKey
+    /// without its consent is refused, so 100 of them can't push the real account off the list),
+    /// and it pages past its limit with `next`.
+    #[tokio::test]
+    async fn key_listings_hold_only_consenting_accounts_and_page() {
+        let (root, n) = node("keypage");
+        let kit = crate::crypto::Keys::from_seed([40; 32]);
+        let kid = key_id(&kit.public_key());
+        let owners: Vec<_> = (0..4u8).map(|i| crate::crypto::Keys::from_seed([50 + i; 32])).collect();
+        let mallory = crate::crypto::Keys::from_seed([60; 32]);
+        let (cid, gh) = { let c = n.chain.lock(); (c.genesis.chain_id.clone(), c.genesis_hash.clone()) };
+        let mk = |c: &Chain, from: &crate::crypto::Keys, action: Action| {
+            let mut tx = Tx { chain_id: cid.clone(), genesis_hash: gh.clone(), from: from.address(), nonce: c.next_nonce(&from.address()), fee: 0, tip: 0, valid_until: c.height() + 100, action, memo: String::new(), public_key: hex::encode(from.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+            tx.fee = min_fee(tx.size());
+            tx.sign(from)
+        };
+        {
+            let mut c = n.chain.lock();
+            for k in owners.iter().chain([&mallory]) {
+                c.faucet(&k.address(), 10 * DROPS_PER_FANG).unwrap();
+            }
+            c.produce_block().unwrap();
+            for k in &owners {
+                let add = mk(&c, k, crate::types::add_key(&kit, &cid, &gh, &k.address(), "kit", KeyRole::Owner));
+                c.submit(add).unwrap();
+            }
+            // The PoC's sybil: the key id is public, but its consent names other accounts.
+            let theirs = crate::types::add_key(&kit, &cid, &gh, &owners[0].address(), "kit", KeyRole::Owner);
+            let sybil = mk(&c, &mallory, theirs);
+            assert!(c.submit(sybil).unwrap_err().to_string().contains("proof of possession"));
+            c.produce_block().unwrap();
+        }
+        let mut want: Vec<String> = owners.iter().map(|k| k.address()).collect();
+        want.sort();
+        let (s, v, _) = call(&n, "GET", &format!("/api/key/{kid}"), None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let listed = |v: &Value| v["accounts"].as_array().unwrap().iter().map(|a| a["account"]["address"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        assert_eq!(listed(&v)[1..], want[..], "the kit's own address first, then the consenting accounts");
+        assert!(v["next"].is_null());
+        // Two at a time: the pages add up to the whole list, each once.
+        let (mut seen, mut after) = (vec![], None::<String>);
+        loop {
+            let uri = format!("/api/key/{kid}?limit=2{}", after.as_ref().map(|a| format!("&after={a}")).unwrap_or_default());
+            let (_, v, _) = call(&n, "GET", &uri, None, "127.0.0.1:1").await;
+            seen.extend(listed(&v).into_iter().filter(|a| *a != kit.address()));
+            match v["next"].as_str() {
+                Some(next) => after = Some(next.to_string()),
+                None => break,
+            }
+        }
+        assert_eq!(seen, want);
+        std::fs::remove_dir_all(root).ok();
+    }
+
     #[tokio::test]
     async fn failed_txs_report_status_instead_of_404() {
         let (root, n) = node("txfail");
@@ -2997,7 +3070,7 @@ mod http_tests {
             let k2_id = key_id(&k2.public_key());
             let txs = vec![
                 signed(&c, &k, 0, Action::ClaimDistribution { distribution_id: 0, amount: 3 * FANG, proof: proofs[0].iter().map(hex::encode).collect() }),
-                signed(&c, &k, 1, Action::AddKey { key_id: k2_id.clone(), label: "laptop".into(), role: KeyRole::Owner }),
+                signed(&c, &k, 1, crate::types::add_key(&k2, "govapi", &c.genesis_hash, &k.address(), "laptop", KeyRole::Owner)),
                 signed(&c, &k, 2, Action::MultisigCreate { owners: vec![key_id(&k.public_key()), k2_id], threshold: 2 }),
                 signed(&c, &k2, 3, Action::MultisigPropose { action: Box::new(Action::Transfer { to: c.me().unwrap(), amount: FANG }) }),
             ];

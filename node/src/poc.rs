@@ -1803,7 +1803,8 @@ mod scenarios {
         t.grant(&bob, 1);
         let h = t.h();
         for key in [&agent, &stranger] {
-            t.tx(&bob, Action::AddKey { key_id: key_id(&key.public_key()), label: "agent".into(), role: KeyRole::Session { limit: 5 * DROPS_PER_FANG, period_blocks: 1000, expires_at: h + 1000 } }).unwrap();
+            let add = crate::types::add_key(key, &t.c.genesis.chain_id, &t.c.genesis_hash, &bob.address(), "agent", KeyRole::Session { limit: 5 * DROPS_PER_FANG, period_blocks: 1000, expires_at: h + 1000 });
+            t.tx(&bob, add).unwrap();
         }
         t.tx(&bob, Action::RegisterFamiliar { key_id: key_id(&agent.public_key()), label: "claude".into() }).unwrap();
         let bob_addr = bob.address();

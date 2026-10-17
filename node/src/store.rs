@@ -633,6 +633,29 @@ impl Snap {
         Ok(out)
     }
 
+    /// [`Snapshot::index`] in ascending order, starting after the entry `after` (a page's last).
+    pub fn index_after(&self, tag: u8, a: &[u8], after: &[u8], limit: usize) -> Result<Vec<Vec<u8>>> {
+        let lo = ix_prefix(tag, a);
+        let mut hi = lo.clone();
+        *hi.last_mut().unwrap() = 1;
+        let mut from = lo.clone();
+        from.extend_from_slice(after);
+        let range = self.index.range(from.as_slice()..hi.as_slice()).map_err(storage)?;
+        let mut out = vec![];
+        for r in range {
+            let (k, _) = r.map_err(storage)?;
+            let rest = &k.value()[lo.len()..];
+            if rest == after {
+                continue;
+            }
+            out.push(rest.to_vec());
+            if out.len() == limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     pub fn cert(&self, height: u64) -> Result<Option<Vec<u8>>> {
         Ok(self.certs.get(height).map_err(storage)?.map(|v| v.value().to_vec()))
     }

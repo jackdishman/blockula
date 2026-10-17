@@ -34,6 +34,11 @@ fn kid(seed: u8) -> String {
     key_id(&keys(seed).public_key())
 }
 
+/// An `AddKey` for `seed`'s key onto `account`, with its proof of possession (audit gap-7-2).
+fn add_key(seed: u8, account: &str, label: &str, role: KeyRole) -> Action {
+    crate::types::add_key(&keys(seed), CHAIN, &"00".repeat(32), account, label, role)
+}
+
 /// Three validators (the third owned by an operator), funded users, a founder whose tokens are
 /// all still vesting, the community account and a treasury vesting over 400 blocks. Short
 /// governance periods; no quorum floor (quorum is 4% of the unlocked supply, ≈ 6,560 FANG), no
@@ -830,7 +835,7 @@ fn proposals_are_checked_when_they_are_made() {
     assert_eq!((t.bal(BOB), t.bal(CAROL)), (bob, carol + FANG));
     // Session keys can't propose or vote.
     let agent = keys(50);
-    t.tx(ALICE, Action::AddKey { key_id: kid(50), label: "agent".into(), role: KeyRole::Session { limit: 1_000 * FANG, period_blocks: 100, expires_at: 1_000 } }).unwrap();
+    t.tx(ALICE, add_key(50, &addr(ALICE), "agent", KeyRole::Session { limit: 1_000 * FANG, period_blocks: 100, expires_at: 1_000 })).unwrap();
     for action in [Action::Propose { kind: text(), deposit: 50 * FANG, title: "x".into(), url: String::new() }, Action::Vote { proposal_id: id, aye: true, amount: FANG, conviction: 0 }, Action::Unlock {}] {
         assert!(t.tx_as(&agent, &addr(ALICE), action).unwrap_err().to_string().contains("session keys can only"));
     }
@@ -1046,7 +1051,7 @@ fn multisig_accounts_need_their_threshold() {
     let alice = addr(ALICE);
     let (k1, k2, k3) = (keys(ALICE), keys(11), keys(12));
     for seed in [11, 12] {
-        t.tx(ALICE, Action::AddKey { key_id: kid(seed), label: format!("device {seed}"), role: KeyRole::Owner }).unwrap();
+        t.tx(ALICE, add_key(seed, &alice, &format!("device {seed}"), KeyRole::Owner)).unwrap();
     }
     assert!(t.err(ALICE, Action::MultisigCreate { owners: vec![kid(ALICE), kid(11)], threshold: 2 }).contains("exactly this account's 3 owner key(s)"));
     assert!(t.err(ALICE, Action::MultisigCreate { owners: vec![kid(ALICE), kid(11), kid(12)], threshold: 4 }).contains("threshold must be 1–3"));
@@ -1084,7 +1089,7 @@ fn multisig_accounts_need_their_threshold() {
     assert_eq!(t.bal(CAROL), carol + FANG);
     // Session keys keep working, within their limits.
     let agent = keys(50);
-    let add = Action::AddKey { key_id: kid(50), label: "agent".into(), role: KeyRole::Session { limit: 5 * FANG, period_blocks: 100, expires_at: t.h + 1_000 } };
+    let add = add_key(50, &alice, "agent", KeyRole::Session { limit: 5 * FANG, period_blocks: 100, expires_at: t.h + 1_000 });
     t.tx_as(&k1, &alice, Action::MultisigPropose { action: Box::new(add) }).unwrap();
     t.tx_as(&k2, &alice, Action::MultisigApprove { id: 4 }).unwrap();
     t.tx_as(&agent, &alice, Action::Transfer { to: addr(CAROL), amount: FANG }).unwrap();
@@ -1131,7 +1136,7 @@ fn one_owner_key_cant_freeze_a_multisig_and_expired_proposals_go() {
     let alice = addr(ALICE);
     let (k1, k2, rogue) = (keys(ALICE), keys(11), keys(12));
     for seed in [11, 12] {
-        t.tx(ALICE, Action::AddKey { key_id: kid(seed), label: format!("device {seed}"), role: KeyRole::Owner }).unwrap();
+        t.tx(ALICE, add_key(seed, &alice, &format!("device {seed}"), KeyRole::Owner)).unwrap();
     }
     t.tx(ALICE, Action::MultisigCreate { owners: vec![kid(ALICE), kid(11), kid(12)], threshold: 2 }).unwrap();
     let junk = || Action::MultisigPropose { action: Box::new(Action::Unlock {}) };
@@ -1331,7 +1336,7 @@ fn a_multisig_owner_key_cant_tip() {
     let mut t = T::new(&[]);
     let alice = addr(ALICE);
     let (k1, k2) = (keys(ALICE), keys(11));
-    t.tx(ALICE, Action::AddKey { key_id: kid(11), label: "device".into(), role: KeyRole::Owner }).unwrap();
+    t.tx(ALICE, add_key(11, &alice, "device", KeyRole::Owner)).unwrap();
     t.tx(ALICE, Action::MultisigCreate { owners: vec![kid(ALICE), kid(11)], threshold: 2 }).unwrap();
     let propose = || Action::MultisigPropose { action: Box::new(Action::Transfer { to: addr(BOB), amount: 1 }) };
     let (balance, thief) = (t.bal(ALICE), addr(DAVE));
@@ -1347,7 +1352,7 @@ fn a_multisig_owner_key_cant_tip() {
     assert_eq!((t.bal(ALICE), t.bal(DAVE)), (balance - proposed - approved - 1, 0), "base fees and the approved drop");
     // A session key (approved by both) tips within its limit, which counts the tip.
     let agent = keys(50);
-    let add = Action::AddKey { key_id: kid(50), label: "agent".into(), role: KeyRole::Session { limit: FANG, period_blocks: 100, expires_at: t.h + 1_000 } };
+    let add = add_key(50, &alice, "agent", KeyRole::Session { limit: FANG, period_blocks: 100, expires_at: t.h + 1_000 });
     t.tx_as(&k1, &alice, Action::MultisigPropose { action: Box::new(add) }).unwrap();
     t.tx_as(&k2, &alice, Action::MultisigApprove { id: 1 }).unwrap();
     t.tip_as(&agent, &alice, Action::Transfer { to: addr(BOB), amount: 1 }, 5, &thief).unwrap();
@@ -1430,7 +1435,7 @@ fn records_round_trip_and_journals_roll_back() {
     t.finish(id);
     t.tx(BOB, Action::ClaimDistribution { distribution_id: id, amount: 5 * FANG, proof: proofs[0].iter().map(hex::encode).collect() }).unwrap();
     t.tx(OWNER, Action::MultisigCreate { owners: vec![kid(OWNER)], threshold: 1 }).unwrap();
-    t.tx(ALICE, Action::AddKey { key_id: kid(11), label: "laptop".into(), role: KeyRole::Owner }).unwrap();
+    t.tx(ALICE, add_key(11, &addr(ALICE), "laptop", KeyRole::Owner)).unwrap();
     t.tx(ALICE, Action::MultisigCreate { owners: vec![kid(ALICE), kid(11)], threshold: 2 }).unwrap();
     t.tx(ALICE, Action::MultisigPropose { action: Box::new(Action::Propose { kind: ProposalKind::GrantSoul { to: addr(BOB), amount: SOUL, reason: "r".into() }, deposit: 50 * FANG, title: "t".into(), url: String::new() }) }).unwrap();
     // A vote still open (closed votes are swept).
@@ -1472,7 +1477,7 @@ fn records_round_trip_and_journals_roll_back() {
 fn random_governance_sequences_keep_the_invariants() {
     let mut t = T::new(&[("bootstrap_end_height", 150), ("governance_spend_height", 20)]);
     let users = [ALICE, BOB, CAROL, OWNER, VALIDATORS[0], VALIDATORS[1], FOUNDER];
-    t.tx(BOB, Action::AddKey { key_id: kid(13), label: "two".into(), role: KeyRole::Owner }).unwrap();
+    t.tx(BOB, add_key(13, &addr(BOB), "two", KeyRole::Owner)).unwrap();
     let mut rng: u64 = 0x9e37_79b9_7f4a_7c15;
     let mut next = || {
         rng ^= rng << 13;

@@ -465,9 +465,14 @@ impl ReadView {
     }
 
     /// Accounts that hold the key `key_id` (hex), from the key index.
-    pub fn accounts_with_key(&self, key_id: &str, limit: usize) -> Vec<String> {
+    /// The accounts after `after` (a page's last) in address order, or from the first.
+    pub fn accounts_with_key_after(&self, key_id: &str, after: Option<&str>, limit: usize) -> Vec<String> {
         let Ok(id) = hex::decode(key_id) else { return vec![] };
-        self.snap.index(ix::KEY, &id, false, limit).unwrap_or_default().into_iter().filter_map(|r| String::from_utf8(r).ok()).collect()
+        let rows = match after {
+            Some(a) => self.snap.index_after(ix::KEY, &id, a.as_bytes(), limit),
+            None => self.snap.index(ix::KEY, &id, false, limit),
+        };
+        rows.unwrap_or_default().into_iter().filter_map(|r| String::from_utf8(r).ok()).collect()
     }
 
     /// Ids (u64 keys) under an index, e.g. the Hunts an account created.

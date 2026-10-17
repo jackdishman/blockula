@@ -139,6 +139,25 @@ impl Keys {
     pub fn sign(&self, msg: &[u8]) -> Vec<u8> {
         self.signing.sign(msg).encode().to_vec()
     }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    /// A deterministic FIPS 204 signature under a context string (domain separation, at most
+    /// 255 bytes), e.g. a key's proof of possession (`types::KEY_POP_CONTEXT`).
+    pub fn sign_with_context(&self, context: &[u8], msg: &[u8]) -> Vec<u8> {
+        self.signing.expanded_key().sign_deterministic(msg, context).expect("context <= 255 bytes").encode().to_vec()
+    }
+}
+
+/// Checks a FIPS 204 signature made under `context` (see [`Keys::sign_with_context`]).
+pub fn verify_with_context(public_key: &[u8], context: &[u8], msg: &[u8], signature: &[u8]) -> bool {
+    if public_key.len() != PUBLIC_KEY_LEN || signature.len() != SIGNATURE_LEN {
+        return false;
+    }
+    let Ok(vk) = EncodedVerifyingKey::<MlDsa65>::try_from(public_key) else { return false };
+    let vk = VerifyingKey::<MlDsa65>::decode(&vk);
+    let Ok(sig) = EncodedSignature::<MlDsa65>::try_from(signature) else { return false };
+    let Some(sig) = Signature::<MlDsa65>::decode(&sig) else { return false };
+    vk.verify_with_context(msg, context, &sig)
 }
 
 pub fn verify(public_key: &[u8], msg: &[u8], signature: &[u8]) -> Result<()> {
