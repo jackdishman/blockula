@@ -5828,7 +5828,10 @@ mod persistence {
         assert_eq!(build_manifest_with(&c.live, 0, 0).unwrap().height, 1_000);
         // A joiner whose checkpoint is past 1000's manifest gets the newest that reaches it.
         assert_eq!(build_manifest_with(&c.live, 1_005, 0).unwrap().height, 1_100);
-        assert!(build_manifest_with(&c.live, 1_105, 0).is_err());
+        // Past every manifest: the one reaching furthest, so the joiner sees it's behind its
+        // checkpoint and waits for the next snapshot (review-fix-sync-3).
+        let furthest = build_manifest_with(&c.live, 1_105, 0).unwrap();
+        assert!(furthest.height == 1_100 && furthest.height + (furthest.blocks.len() as u64) < 1_105, "#{}", furthest.height);
         drop(v);
         drop(c);
         fs::remove_dir_all(h).ok();

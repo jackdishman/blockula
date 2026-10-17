@@ -390,7 +390,10 @@ pub fn build_manifest(live: &crate::view::Live) -> Result<Manifest> {
 
 /// [`build_manifest`], for a snapshot whose manifest reaches at least `min_last` (a joiner's
 /// newest checkpoint: an older one would be no use to it). A big state is served from a
-/// long-lived snapshot when one reaches that far ([`serving_order`]).
+/// long-lived snapshot when one reaches that far ([`serving_order`]). When none does, the one
+/// reaching furthest: the joiner sees it's behind its checkpoint ([`SnapshotBehind`]) and waits
+/// for the next snapshot, rather than taking "nothing here" for "sync from the genesis"
+/// (review-fix-sync-3).
 pub fn build_manifest_reaching(live: &crate::view::Live, min_last: u64) -> Result<Manifest> {
     build_manifest_with(live, min_last, SMALL_SNAPSHOT_BYTES)
 }
@@ -402,6 +405,8 @@ pub(crate) fn build_manifest_with(live: &crate::view::Live, min_last: u64, small
     let params = &v.state.params;
     let heights = list(home);
     let newest_bytes = heights.first().and_then(|h| meta(home, *h)).map_or(0, |m| m.chunks.iter().map(|c| c.size as u64).sum());
+    // The servable manifest reaching furthest, when none reaches `min_last`.
+    let mut behind: Option<(u64, Manifest)> = None;
     for height in serving_order(heights, newest_bytes, small, long_interval(params)) {
         let Some(meta) = meta(home, height) else { continue };
         let certifier = height + CHECKPOINT_DELAY;
@@ -418,9 +423,6 @@ pub(crate) fn build_manifest_with(live: &crate::view::Live, min_last: u64, small
             }
         }
         let Some((last, finalization)) = fin else { continue };
-        if last < min_last {
-            continue;
-        }
         let anchor = match anchor_height(params, height, last) {
             None => None,
             // Without the anchor's proof this snapshot can't be served; an older one may be.
@@ -429,7 +431,17 @@ pub(crate) fn build_manifest_with(live: &crate::view::Live, min_last: u64, small
                 None => continue,
             },
         };
-        return Ok(Manifest { chain_id: v.genesis.chain_id.clone(), height, state_root: meta.state_root, chunks: meta.chunks, blocks, finalization, anchor });
+        let m = Manifest { chain_id: v.genesis.chain_id.clone(), height, state_root: meta.state_root, chunks: meta.chunks, blocks, finalization, anchor };
+        if last < min_last {
+            if behind.as_ref().is_none_or(|(l, _)| last > *l) {
+                behind = Some((last, m));
+            }
+            continue;
+        }
+        return Ok(m);
+    }
+    if let Some((_, m)) = behind {
+        return Ok(m);
     }
     bail!("no certified snapshot yet (one is taken every {CHECKPOINT_INTERVAL} blocks and certified {CHECKPOINT_DELAY} blocks later, and the epoch anchor before it must be certified too)")
 }
@@ -1552,6 +1564,123 @@ mod tests {
         assert!(took < std::time::Duration::from_secs(1), "{took:?}");
         // Nobody to ask.
         assert!(download_chunks(&client, &[], &v, &mut vec![], &limits).await.is_err());
+    }
+
+    /// Fast-sync peers for [`fast_sync_with`] tests: `/{who}/api/snapshot/latest` serves `manifests[who]`
+    /// (503 when there's none) and `/{who}/api/epochs?from=k` answers as `who` says. "trickle":
+    /// a page per epoch, each with a set change, 300 ms apiece (a peer that can make up as many
+    /// epochs as the manifest spans). "flat": the 96-byte page that changes nothing and says
+    /// there's more. Every request is counted, by `who` and path.
+    async fn fast_sync_peers(g: &Genesis, manifests: std::collections::BTreeMap<String, Manifest>) -> (String, std::sync::Arc<parking_lot::Mutex<std::collections::BTreeMap<String, usize>>>) {
+        use axum::extract::{Path as UrlPath, Query, State as Shared};
+        use axum::response::IntoResponse;
+        type Hits = std::sync::Arc<parking_lot::Mutex<std::collections::BTreeMap<String, usize>>>;
+        type Ctx = (std::sync::Arc<std::collections::BTreeMap<String, Manifest>>, [Vec<String>; 2], Hits);
+        async fn latest(Shared((manifests, _, hits)): Shared<Ctx>, UrlPath(who): UrlPath<String>) -> axum::response::Response {
+            *hits.lock().entry(format!("{who}/latest")).or_default() += 1;
+            match manifests.get(&who) {
+                Some(m) => axum::Json(m.clone()).into_response(),
+                None => (axum::http::StatusCode::SERVICE_UNAVAILABLE, "no certified snapshot yet").into_response(),
+            }
+        }
+        async fn epochs(Shared((_, sets, hits)): Shared<Ctx>, UrlPath(who): UrlPath<String>, Query(q): Query<std::collections::HashMap<String, u64>>) -> axum::response::Response {
+            *hits.lock().entry(format!("{who}/epochs")).or_default() += 1;
+            let k = q.get("from").copied().unwrap_or(0);
+            let page = match who.as_str() {
+                "trickle" => {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    let set = |e: u64| sets[(e % 2) as usize].clone();
+                    serde_json::json!({ "sets": { k.to_string(): set(k), (k + 1).to_string(): set(k + 1) }, "base": k, "known_through": k + 1, "proofs": {}, "format": epochs::HANDOFF_FORMAT, "next": k + 1 })
+                }
+                _ => serde_json::json!({ "sets": { k.to_string(): [] }, "base": k, "known_through": k + 1, "proofs": {}, "format": epochs::HANDOFF_FORMAT, "next": k + 1 }),
+            };
+            axum::Json(page).into_response()
+        }
+        let hits: Hits = Default::default();
+        let genesis_set = EpochRegistry::genesis(g).sets[&0].clone();
+        let other = keys(&[[200; 32]]);
+        let app = axum::Router::new()
+            .route("/{who}/api/snapshot/latest", axum::routing::get(latest))
+            .route("/{who}/api/epochs", axum::routing::get(epochs))
+            .with_state((std::sync::Arc::new(manifests), [genesis_set, other], hits.clone()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// An empty joiner's chain for `g` (what `blockula join` leaves).
+    fn joiner(g: &Genesis, tag: &str) -> (PathBuf, crate::consensus::Shared) {
+        let home = std::env::temp_dir().join(format!("blockula-joiner-{tag}-{}-{}", crate::chain::now_ms(), std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("genesis.json"), serde_json::to_string(g).unwrap()).unwrap();
+        let chain = crate::chain::Chain::open(&home).unwrap();
+        (home, std::sync::Arc::new(parking_lot::Mutex::new(chain)))
+    }
+
+    /// F62, review-fix-sync-1: one deadline covers a fast-sync attempt's history and chunks, so
+    /// a peer that answers history pages slowly (each a real-looking set change, one epoch at a
+    /// time) loses the attempt and the next peer is asked; a page that changes nothing yet says
+    /// there's more is refused at once; and a manifest of blocks the chain can't have reached
+    /// yet (its height is the peer's word until verified) is refused before any history is
+    /// asked for. review-fix-sync-3: a peer whose manifest ends before the joiner's checkpoint
+    /// says so (`SnapshotBehind`, so the joiner waits for a newer snapshot), also without asking
+    /// for history.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peer_paging_history_forever_loses_the_attempt() {
+        let (root, g, seeds) = four_validators("endless");
+        let m = manifest(&g, &seeds, 104);
+        let mut future = m.clone();
+        future.height = 1_000_000_000_000;
+        let manifests = std::collections::BTreeMap::from([("trickle".to_string(), m.clone()), ("flat".to_string(), m.clone()), ("future".to_string(), future), ("behind".to_string(), m.clone())]);
+        let (base, hits) = fast_sync_peers(&g, manifests).await;
+        let url = |who: &str| format!("{base}/{who}");
+        let limits = DownloadLimits {
+            history_per_epoch: std::time::Duration::from_millis(10),
+            history_slack: std::time::Duration::from_millis(200),
+            history_max: std::time::Duration::from_secs(1),
+            per_chunk: std::time::Duration::from_millis(10),
+            slack: std::time::Duration::from_millis(100),
+            ..DownloadLimits::default()
+        };
+        assert_eq!(limits.history(0, 10), std::time::Duration::from_millis(310));
+        assert_eq!(limits.history(0, u64::MAX), std::time::Duration::from_secs(1), "capped");
+        let client = reqwest::Client::new();
+        // The page that changes nothing: refused on the first one (it used to page on until the
+        // manifest's epoch, as far off as the peer liked).
+        let e = format!("{:#}", fetch_history(&client, &url("flat"), 0, u64::MAX / 4, &limits).await.unwrap_err());
+        assert!(e.contains("must hold a set change"), "{e}");
+        let n = hits.lock().clone();
+        assert_eq!(n["flat/epochs"], 1, "{n:?}");
+        // The trickler alone: out of time on the history, long before its pages run out.
+        let genesis_only = Trust::new(&g, &Pins::default(), false).unwrap();
+        let (home, chain) = joiner(&g, "endless");
+        let started = std::time::Instant::now();
+        let e = format!("{:#}", fast_sync_with(&chain, &[url("trickle")], &genesis_only, &limits).await.unwrap_err());
+        assert!(e.contains("within"), "{e}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(3), "{:?}", started.elapsed());
+        let n = hits.lock().clone();
+        assert!(n["trickle/epochs"] <= 3, "{n:?}");
+        // With another peer listed, that one is asked too, whichever comes first.
+        hits.lock().clear();
+        let started = std::time::Instant::now();
+        assert!(fast_sync_with(&chain, &[url("trickle"), url("none")], &genesis_only, &limits).await.is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(3), "{:?}", started.elapsed());
+        let n = hits.lock().clone();
+        assert_eq!((n["trickle/latest"], n["none/latest"]), (1, 1), "{n:?}");
+        // A manifest past the chain's expected height: nothing more is fetched for it.
+        hits.lock().clear();
+        let e = format!("{:#}", fast_sync_with(&chain, &[url("future")], &genesis_only, &limits).await.unwrap_err());
+        assert!(e.contains("past any height the chain can have reached"), "{e}");
+        assert!(!hits.lock().clone().contains_key("future/epochs"));
+        // Behind the joiner's checkpoint (#200 > #104): wait for a later snapshot.
+        let ahead = Trust::new(&g, &Pins { checkpoints: vec![Checkpoint { height: 200, hash: "ab".repeat(32), set_hash: None }], ..Default::default() }, false).unwrap();
+        let e = fast_sync_with(&chain, &[url("behind")], &ahead, &limits).await.unwrap_err();
+        assert!(e.chain().any(|c| c.is::<SnapshotBehind>()), "{e:#}");
+        assert!(!hits.lock().clone().contains_key("behind/epochs"));
+        assert_eq!(chain.lock().height(), 0);
+        std::fs::remove_dir_all(home).ok();
+        std::fs::remove_dir_all(root).ok();
     }
 
     /// F62: fast sync asks the peers in a new order each run, so no listed endpoint is always first.
