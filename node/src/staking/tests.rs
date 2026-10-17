@@ -1049,13 +1049,20 @@ fn a_set_that_shrank_below_four_grows_back() {
     let mut two = vec![vaddr(0), vaddr(1)];
     two.sort();
     assert_eq!(t.set(1), two);
-    // Both bond back above it: they're eligible newcomers, admitted one per epoch.
+    // Both bond back above it: they're eligible newcomers, admitted one per epoch once their
+    // nodes showed up (a set of 2 or 3 needs every member for a quorum).
     for i in [2u8, 3] {
         t.ok(&owner(i), Action::Delegate { validator: vaddr(i), amount: 900 * FANG });
+        assert!(should_show_up(&t.st, &vaddr(i), 1));
+        show_up(&mut t, i);
+        assert!(!should_show_up(&t.st, &vaddr(i), 1));
     }
     assert_eq!(select_next(&t.st, 1).joining.len(), 1);
     t.finish_epoch();
     assert_eq!(t.set(2).len(), 3);
+    // Into a set of 4 (f = 1) the newcomer isn't needed for a quorum: stake is enough.
+    let last = t.st.validators.keys().find(|v| !t.set(2).contains(v)).unwrap().clone();
+    assert!(!showed_up(&t.st, &last, 2));
     t.finish_epoch();
     assert_eq!(t.set(3).len(), 4, "back to f = 1");
     // From a set of one, likewise.
@@ -1070,9 +1077,21 @@ fn a_set_that_shrank_below_four_grows_back() {
         t.ok(&owner(i), Action::Delegate { validator: vaddr(i), amount: 900 * FANG });
     }
     for (epoch, size) in [(2, 2), (3, 3), (4, 4)] {
+        for i in 1..4u8 {
+            if should_show_up(&t.st, &vaddr(i), epoch - 1) {
+                show_up(&mut t, i);
+            }
+        }
         t.finish_epoch();
         assert_eq!(t.set(epoch).len(), size, "epoch {epoch}");
     }
+}
+
+/// Validator `i`'s consensus key shows up for its owner ([`showed_up`]): a no-op
+/// `UpdateValidator`, as the node's duties send it.
+fn show_up(t: &mut T, i: u8) {
+    let tx = t.tx_from(&keys(vseed(i)), &owner(i).address(), Action::UpdateValidator { commission_bps: commission_rate(&t.st, &vaddr(i)), p2p_addr: String::new(), http_addr: String::new() });
+    assert_eq!(t.apply(&tx).unwrap(), Outcome::Applied);
 }
 
 /// CV-4: at most ⌊(n−1)/3⌋ seats change per epoch for stake (highest stake first), while
@@ -1811,18 +1830,24 @@ fn chain_with_excluded(setup: Setup, excluded: Vec<String>) -> T {
 /// Audit xcut-economic-2: locked insider stake can't take over seats, however many pools it
 /// spreads over. Stake of an account with unvested tokens counts toward ranking only in a pool
 /// it owns, such an owner holds at most one seat, and the founder's and the foundation's
-/// accounts (`bootstrap_excluded`) together hold at most 2 seats and fewer than f.
+/// accounts (`bootstrap_excluded`) together take seats only while they hold at most 2 and fewer
+/// than f (here f = 2: one), even with liquid tokens.
 #[test]
 fn locked_insider_stake_cant_take_over_seats() {
-    let (founder, grantee, friend) = (keys(214), keys(215), keys(216));
+    let (founder, grantee, friend, seats) = (keys(214), keys(215), keys(216), keys(217));
     let vest = Some(Vesting { start: 0, cliff: 10_000, end: 20_000 });
     let setup = Setup {
         validators: vec![100_000 * FANG; 7],
-        accounts: vec![(founder.address(), 50_000_000 * FANG, vest.clone()), (grantee.address(), 50_000_000 * FANG, vest), (friend.address(), 10_000 * FANG, None)],
+        accounts: vec![(founder.address(), 50_000_000 * FANG, vest.clone()), (grantee.address(), 50_000_000 * FANG, vest), (friend.address(), 10_000 * FANG, None), (seats.address(), 20_000_000 * FANG, None)],
         params: vec![("max_validators", 7), ("insider_delegation_cap_bps", 10_000)],
         ..Default::default()
     };
-    let mut t = chain_with_excluded(setup, vec![founder.address()]);
+    // `seats`: the foundation's seat owner, liquid.
+    let mut excluded = vec![founder.address(), seats.address()];
+    excluded.sort();
+    let mut t = chain_with_excluded(setup, excluded);
+    assert_eq!(excluded_seats_cap(7), 1);
+    let foundation: Vec<String> = (67..69).map(|s| register(&mut t, &seats, s, 5_000_000 * FANG)).collect();
     let mine: Vec<String> = (60..63).map(|s| register(&mut t, &founder, s, 3_000_000 * FANG)).collect();
     let theirs: Vec<String> = (63..66).map(|s| register(&mut t, &grantee, s, 3_000_000 * FANG)).collect();
     // A friend's pool, backed by the grantee's locked tokens.
@@ -1834,10 +1859,15 @@ fn locked_insider_stake_cant_take_over_seats() {
     let set = t.set(t.epoch + 1);
     let count = |vs: &[String]| set.iter().filter(|v| vs.contains(v)).count();
     assert_eq!(set.len(), 7);
-    assert!(count(&mine) <= 1, "the founder holds {} of {set:?} (f = 2)", count(&mine));
-    assert!(count(&theirs) <= 1, "the grantee holds {} seats", count(&theirs));
+    assert_eq!(count(&mine), 0, "the founder holds {} of {set:?}: the foundation's best seat filled their one", count(&mine));
+    assert_eq!(count(&foundation), 1, "the foundation's seat owner, liquid, still holds one");
+    assert_eq!(count(&theirs), 1, "the grantee holds {} seats", count(&theirs));
     assert!(!set.contains(&friendly), "locked stake in someone else's pool doesn't rank it");
-    assert_eq!(count(&mine) + count(&theirs), 2, "each insider's best pool still competes: {set:?}");
+    assert!(t.st.staking.pools[&friendly].stake > 10_000_000 * FANG && likely_candidates(&t.st, t.epoch, 100).last() == Some(&friendly), "it ranks on its owner's 1,000 FANG alone");
+    // Seats they held already aren't taken away (genesis seats): only newcomers are held to it.
+    let seated: Vec<String> = set.iter().filter(|v| foundation.contains(v)).cloned().collect();
+    t.finish_epoch();
+    assert!(t.set(t.epoch + 1).contains(&seated[0]));
 }
 
 /// Audit F04 (rest): a validator's consensus key acting for its owner (SF-13) burns no more than
@@ -1898,20 +1928,26 @@ fn a_tiny_set_admits_only_a_newcomer_that_showed_up() {
         let held = t.shares(&owner(i).address(), &vaddr(i)) as u64;
         t.ok(&owner(i), Action::Undelegate { validator: vaddr(i), shares: held - 500 * FANG });
     }
+    // Validator 3 shows up in epoch 0: too early to count at the end of epoch 1.
+    show_up(&mut t, 3);
     t.finish_epoch();
     assert_eq!(t.set(1).len(), 2);
-    for i in [2u8, 3] {
-        t.ok(&owner(i), Action::Delegate { validator: vaddr(i), amount: 900 * FANG });
+    // Validator 2 bonds more: it ranks first.
+    for (i, amount) in [(2u8, 950), (3, 900)] {
+        t.ok(&owner(i), Action::Delegate { validator: vaddr(i), amount: amount * FANG });
     }
-    assert!(select_next(&t.st, 1).joining.is_empty(), "stake alone doesn't get it in");
+    assert!(select_next(&t.st, 1).joining.is_empty(), "stake alone doesn't get it in, nor a readiness from an earlier epoch");
+    // The owner's own key doesn't prove the validator's node is up.
+    t.ok(&owner(2), Action::UpdateValidator { commission_bps: 1_000, p2p_addr: String::new(), http_addr: String::new() });
+    assert!(select_next(&t.st, 1).joining.is_empty());
     // Validator 3's consensus key shows up (signed for its owner, who pays).
     let ready = t.tx_from(&keys(vseed(3)), &owner(3).address(), Action::UpdateValidator { commission_bps: 1_000, p2p_addr: String::new(), http_addr: String::new() });
     assert_eq!(t.apply(&ready).unwrap(), Outcome::Applied);
-    // The owner's own key doesn't prove the validator's node is up.
-    t.ok(&owner(2), Action::UpdateValidator { commission_bps: 1_000, p2p_addr: String::new(), http_addr: String::new() });
-    assert_eq!(select_next(&t.st, 1).joining, vec![vaddr(3)]);
+    assert!(showed_up(&t.st, &vaddr(3), 1) && !showed_up(&t.st, &vaddr(2), 1));
+    assert_eq!(select_next(&t.st, 1).joining, vec![vaddr(3)], "the one that showed up, though validator 2 ranks above it");
     t.finish_epoch();
     assert_eq!(t.set(2).len(), 3);
-    // A readiness from an earlier epoch doesn't count.
-    assert!(select_next(&t.st, 2).joining.is_empty());
+    // Into a set of 4 the newcomer isn't needed for a quorum (f = 1): stake is enough again.
+    assert_eq!(select_next(&t.st, 2).joining, vec![vaddr(2)]);
+    t.block();
 }

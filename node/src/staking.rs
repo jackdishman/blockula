@@ -1343,13 +1343,37 @@ pub fn delegation_value(state: &State, delegator: &str, validator: &str) -> u64 
     }
 }
 
-/// Ranking for the set: admin-pinned first (dev and test chains), then pool stake without the
-/// bootstrap delegation's (`boot`: it follows the set, it doesn't pick it; [`bootstrap_epoch`]),
-/// then address (ascending). Greater is better.
-fn rank<'a>(state: &State, boot: &str, validator: &'a str) -> (bool, u64, std::cmp::Reverse<&'a str>) {
-    let pinned = state.validators.get(validator).is_some_and(|r| r.approved_at.is_some());
-    let stake = state.staking.pools.get(validator).map_or(0, |p| p.stake.saturating_sub(delegation_value(state, boot, validator)));
-    (pinned, stake, std::cmp::Reverse(validator))
+/// What counts toward a validator's rank for a seat: its pool's stake without the bootstrap
+/// delegation's (`boot`: it follows the set, it doesn't pick it; [`bootstrap_epoch`]) and without
+/// what accounts still vesting (`insiders`) other than its owner hold in it: locked stake earns
+/// like any other, but picks no seat except its own holder's (audit xcut-economic-2: an insider
+/// can't rank the validators of an accomplice, or of its own other accounts, with locked tokens).
+fn ranking_stake(state: &State, boot: &str, insiders: &[String], validator: &str) -> u64 {
+    let Some(p) = state.staking.pools.get(validator) else { return 0 };
+    let owner = state.validators.get(validator).map(|r| r.owner.as_str()).unwrap_or_default();
+    let locked = insiders.iter().filter(|a| a.as_str() != owner).map(|a| delegation_value(state, a, validator)).fold(0u64, u64::saturating_add);
+    p.stake.saturating_sub(delegation_value(state, boot, validator)).saturating_sub(locked)
+}
+
+/// Ranks for the set at `height`, worked out once per selection: admin-pinned first (dev and test
+/// chains), then [`ranking_stake`], then address (ascending). Greater is better.
+struct Ranks(BTreeMap<String, (bool, u64)>);
+
+impl Ranks {
+    fn new<'a>(state: &State, height: u64, validators: impl Iterator<Item = &'a String>) -> Self {
+        let (boot, insiders) = (state.bootstrap(), insiders(state, height));
+        Ranks(validators.map(|v| (v.clone(), (state.validators.get(v).is_some_and(|r| r.approved_at.is_some()), ranking_stake(state, &boot, &insiders, v)))).collect())
+    }
+
+    fn of<'a>(&self, validator: &'a str) -> (bool, u64, std::cmp::Reverse<&'a str>) {
+        let (pinned, stake) = self.0.get(validator).copied().unwrap_or_default();
+        (pinned, stake, std::cmp::Reverse(validator))
+    }
+
+    /// Best first.
+    fn sort(&self, vs: &mut [String]) {
+        vs.sort_by(|a, b| self.of(b).cmp(&self.of(a)));
+    }
 }
 
 /// The set for `epoch + 1` if `epoch` ended now, with who joins and who leaves.
@@ -1374,25 +1398,66 @@ pub fn churn_limit(m: usize) -> usize {
 /// except that on chains without admins a set carrying over one to three members grows by one per
 /// epoch (audit F24): under the churn limit alone a set that shrank to one or two could never grow
 /// again, with no fault tolerance (f = 0) for good, and mainnet has no other way to add one.
-/// Below four members every member is needed for a quorum whatever happens, so the newcomer must
-/// be synced and online to keep the chain moving (it's a tracked peer from the epoch before, so
-/// it syncs first); safety is unchanged. Dev and test chains keep small sets closed to strangers
-/// (a stranger that joined and went offline would stall them): their admins pin newcomers.
+/// Past the churn limit the newcomer is needed for every quorum (a set of 2 or 3), so it must be
+/// running and synced: [`select_next`] takes one past the limit only if its consensus key showed
+/// up in the epoch ([`showed_up`], audit review-fix-staking-2), not on stake alone. Safety is
+/// unchanged. Dev and test chains keep small sets closed to strangers (a stranger that joined and
+/// went offline would stall them): their admins pin newcomers.
 pub fn newcomers_allowed(state: &State, kept: usize, size: usize, free: bool) -> usize {
     let limit = churn_limit(size);
     if free && (1..4).contains(&kept) && state.params.admins.is_empty() { limit.max(1) } else { limit }
+}
+
+/// Whether `validator`'s own consensus key signed an `UpdateValidator` in `epoch` (for itself or
+/// its owner, [`Pool::ready_at`]): its node was running then. What a newcomer that every quorum of
+/// a set of 2 or 3 would need must show before it joins (the node sends one: `beacon::duties`).
+pub fn showed_up(state: &State, validator: &str, epoch: u64) -> bool {
+    state.staking.pools.get(validator).and_then(|p| p.ready_at).is_some_and(|h| state.params.epoch_of(h) == epoch)
+}
+
+/// Whether `validator`'s node should show up in `epoch` ([`showed_up`]): it's an eligible
+/// candidate outside `epoch`'s set, the set keeps fewer than four eligible members (so it takes a
+/// newcomer past the churn limit only if that newcomer showed up) on a chain without admins, and
+/// it hasn't yet. The node sends a no-op `UpdateValidator` then (`beacon::duties`).
+pub fn should_show_up(state: &State, validator: &str, epoch: u64) -> bool {
+    let Some(set) = state.active_sets.get(&epoch) else { return false };
+    state.params.admins.is_empty() && !set.iter().any(|v| v == validator) && eligible(state, validator) && set.iter().filter(|v| eligible(state, v)).count() < 4 && !showed_up(state, validator, epoch)
+}
+
+/// Most seats validators owned by `Params::bootstrap_excluded` accounts (the founder's and the
+/// foundation's) may hold in a set of `m` once they're newcomers: `MAX_FOUNDER_SEATS` (DEC-3), and
+/// fewer than f = ⌊(m−1)/3⌋, so together they can't halt the set or veto its council, even with
+/// one more member down (audit xcut-economic-2). Seats they hold already aren't taken away.
+pub fn excluded_seats_cap(m: usize) -> usize {
+    crate::genesis_builder::MAX_FOUNDER_SEATS.min(churn_limit(m).saturating_sub(1))
+}
+
+/// Whether the set `trial` (with newcomer `c` in it) keeps locked insiders within their seats
+/// (audit xcut-economic-2): an account with unvested tokens owns at most one seat (its locked
+/// tokens can fund one validator that ranks, not one per 1% of the supply), and the founder's and
+/// the foundation's accounts no more than [`excluded_seats_cap`] together. Only a newcomer is
+/// held to it: members carried over keep their seats.
+fn insiders_within_seats(state: &State, height: u64, trial: &[String], c: &str) -> bool {
+    let owner = |v: &str| state.validators.get(v).map(|r| r.owner.clone()).unwrap_or_default();
+    let mine = owner(c);
+    if has_unvested_lock(state, &mine, height) && trial.iter().filter(|v| owner(v) == mine).count() > 1 {
+        return false;
+    }
+    let excluded = &state.params.bootstrap_excluded;
+    !excluded.contains(&mine) || trial.iter().filter(|v| excluded.contains(&owner(v))).count() <= excluded_seats_cap(trial.len())
 }
 
 /// Picks the next set (see the module docs). Pure: the API previews it.
 pub fn select_next(state: &State, epoch: u64) -> Selection {
     let current: Vec<String> = state.active_sets.get(&epoch).cloned().unwrap_or_default();
     let cap = state.chain_params.max_validators.max(1) as usize;
-    let boot = state.bootstrap();
-    let by_rank = |a: &String, b: &String| rank(state, &boot, b).cmp(&rank(state, &boot, a));
-    let pinned = |v: &str| state.validators.get(v).is_some_and(|r| r.approved_at.is_some());
+    let height = state.params.last_of(epoch);
+    let mut newcomers: Vec<String> = state.validators.keys().filter(|v| !current.contains(v) && eligible(state, v)).cloned().collect();
+    let ranks = Ranks::new(state, height, current.iter().chain(&newcomers));
+    let pinned = |v: &str| ranks.of(v).0;
     // Members that may stay; the ineligible leave whatever the limit.
     let mut keep: Vec<String> = current.iter().filter(|v| eligible(state, v)).cloned().collect();
-    keep.sort_by(by_rank);
+    ranks.sort(&mut keep);
     // Over the cap (governance lowered it): the lowest-ranked leave, ⌊(n−1)/3⌋ (at least one)
     // per epoch.
     let mut shrink = churn_limit(current.len()).max(1);
@@ -1401,25 +1466,37 @@ pub fn select_next(state: &State, epoch: u64) -> Selection {
         shrink -= 1;
     }
     // Newcomers, best first: into a free seat, or in place of the lowest-ranked member they
-    // outrank, while newcomers stay within the churn limit of the resulting set. Admin-pinned
-    // validators (dev and test chains) skip the limit: that's the admin's call.
-    let mut newcomers: Vec<String> = state.validators.keys().filter(|v| !current.contains(v) && eligible(state, v)).cloned().collect();
-    newcomers.sort_by(by_rank);
+    // outrank, while newcomers stay within the churn limit of the resulting set and insiders
+    // within their seats. Admin-pinned validators (dev and test chains) skip both: that's the
+    // admin's call.
+    ranks.sort(&mut newcomers);
     let mut joined = 0;
     for c in newcomers {
         let free = keep.len() < cap;
-        if !free && !keep.last().is_some_and(|last| rank(state, &boot, &c) > rank(state, &boot, last)) {
+        if !free && !keep.last().is_some_and(|last| ranks.of(&c) > ranks.of(last)) {
             break;
         }
         let size = if free { keep.len() + 1 } else { keep.len() };
-        if !pinned(&c) && joined + 1 > newcomers_allowed(state, keep.len() - joined, size, free) {
-            break;
+        if !pinned(&c) && joined + 1 > churn_limit(size) {
+            if joined + 1 > newcomers_allowed(state, keep.len() - joined, size, free) {
+                break;
+            }
+            // Past the churn limit (a set of 2 or 3): only a newcomer that showed up. A later one
+            // may have.
+            if !showed_up(state, &c, epoch) {
+                continue;
+            }
         }
+        let mut trial = keep.clone();
         if !free {
-            keep.pop();
+            trial.pop();
         }
-        keep.push(c);
-        keep.sort_by(by_rank);
+        trial.push(c.clone());
+        if !pinned(&c) && !insiders_within_seats(state, height, &trial, &c) {
+            continue;
+        }
+        keep = trial;
+        ranks.sort(&mut keep);
         joined += 1;
     }
     if keep.is_empty() {
@@ -1477,8 +1554,7 @@ pub fn end_epoch(state: &mut State, epoch: u64) {
 pub fn likely_candidates(state: &State, epoch: u64, limit: usize) -> Vec<String> {
     let current = state.active_sets.get(&epoch).cloned().unwrap_or_default();
     let mut c: Vec<String> = state.validators.keys().filter(|v| !current.contains(v) && eligible(state, v)).cloned().collect();
-    let boot = state.bootstrap();
-    c.sort_by(|a, b| rank(state, &boot, b).cmp(&rank(state, &boot, a)));
+    Ranks::new(state, state.params.last_of(epoch), c.iter()).sort(&mut c);
     c.truncate(limit);
     c
 }
