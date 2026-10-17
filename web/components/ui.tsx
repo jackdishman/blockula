@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useState, type ReactNode } from "react";
 import { markTutorial } from "@/lib/session";
 
@@ -41,12 +42,12 @@ export function Spinner({ children }: { children?: ReactNode }) {
   );
 }
 
-/** Link to the node's built-in explorer. Ticks the "view it in the explorer" tutorial item. */
+/** Link to an explorer page (in this app). Ticks the "view it in the explorer" tutorial item. */
 export function ExplorerLink({ href, children, className }: { href: string; children: ReactNode; className?: string }) {
   return (
-    <a href={href} target="_blank" rel="noreferrer" className={className} onClick={() => markTutorial({ viewedExplorer: true })}>
+    <Link href={href} className={className} onClick={() => markTutorial({ viewedExplorer: true })}>
       {children}
-    </a>
+    </Link>
   );
 }
 

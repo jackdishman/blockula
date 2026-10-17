@@ -4,12 +4,15 @@ import { formatFang, isAddress, parseFang, type Tx } from "@blockula/sdk";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
+import { PreflightView } from "@/components/explorer/PreflightView";
 import { RequireWallet } from "@/components/Gate";
 import { Apparition } from "@/components/Haunt";
 import { PayLinkNotice } from "@/components/PayLinkNotice";
 import { ErrorNote, ExplorerLink, Spinner, Tip } from "@/components/ui";
 import { explorer, MAINNET_PREFIX, NETWORK } from "@/lib/config";
 import { friendly } from "@/lib/errors";
+import { checkTx } from "@/lib/explorer/check";
+import type { Preflight } from "@/lib/explorer/preflight";
 import { shortAddr } from "@/lib/format";
 import { checkLinkChain, linkChain } from "@/lib/paylink";
 import type { TxView } from "@/lib/types";
@@ -92,7 +95,7 @@ function Send() {
     setAmount("");
     setMemo("");
   }, [refused]);
-  const [review, setReview] = useState<{ tx: Tx; display: string; proven: boolean; byChain: boolean; nodeSays: string } | null>(null);
+  const [review, setReview] = useState<{ tx: Tx; display: string; proven: boolean; byChain: boolean; nodeSays: string; pf: Preflight | null; blockMs: number } | null>(null);
   const [sent, setSent] = useState<TxView | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -120,7 +123,17 @@ function Send() {
     try {
       // Build and sign now so the fee shown is exactly what will be paid.
       const tx = await wallet.build({ type: "transfer", to: recipient.signed, amount: drops.toString() }, memo);
-      setReview({ tx, display: recipient.display, proven: recipient.proven === true, byChain: recipient.byChain === true, nodeSays: recipient.address });
+      // What it will do and whether the chain will take it; the review still works without it.
+      const check = await checkTx(tx, wallet.keyId).catch(() => null);
+      setReview({
+        tx,
+        display: recipient.display,
+        proven: recipient.proven === true,
+        byChain: recipient.byChain === true,
+        nodeSays: recipient.address,
+        pf: check?.pf ?? null,
+        blockMs: check?.blockMs ?? 1000,
+      });
     } catch (e) {
       setError(friendly(e));
     } finally {
@@ -153,7 +166,7 @@ function Send() {
         <p className="summary">{sent.summary}</p>
         <p className="dim">Sealed in block #{sent.height}. That&apos;s final: no waiting for confirmations.</p>
         <div className="row-gap center-row">
-          <ExplorerLink className="btn" href={explorer.tx(sent.id)}>See it in the explorer ↗</ExplorerLink>
+          <ExplorerLink className="btn" href={explorer.tx(sent.id)}>View the receipt</ExplorerLink>
           <Link className="btn primary" href="/">Done</Link>
         </div>
       </main>
@@ -199,14 +212,15 @@ function Send() {
               </>
             )}
           </dl>
+          {review.pf && <PreflightView p={review.pf} me={wallet.account} blockMs={review.blockMs} />}
         </section>
         <Tip>
           The fee is priced by size: post-quantum signatures are about 3.3 KB, so every transaction pays a little for its bytes, and that fee is destroyed rather than paid to anyone.
         </Tip>
         <div className="row-gap">
           <button className="btn" disabled={busy} onClick={() => setReview(null)}>← Edit</button>
-          <button className="btn primary grow" disabled={busy} onClick={confirm}>
-            {busy ? <Spinner>Sealing into a block…</Spinner> : "Confirm & send"}
+          <button className={`btn grow ${review.pf?.refusals.length ? "" : "primary"}`} disabled={busy} onClick={confirm}>
+            {busy ? <Spinner>Sealing into a block…</Spinner> : review.pf?.refusals.length ? "Send anyway" : "Confirm & send"}
           </button>
         </div>
         <ErrorNote error={error} />
