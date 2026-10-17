@@ -544,6 +544,21 @@ pub fn contrib(cmd: ContribCmd, dir: &Path) -> Result<()> {
             getrandom::fill(&mut salt).map_err(|e| anyhow!("no randomness: {e}"))?;
             let salt = hex::encode(salt);
             let commitment = seance_commitment(seance, &account, &votes, &spam, &salt);
+            // The judgment binds the pairs and PRs `contrib seance` shows (read again here): a node
+            // that misreports them makes the commitment fail, not misdirect it (audit gap-7-6).
+            let s = rt.block_on(get(&signer.rpc, &format!("/seance/{seance}")))?;
+            let seat = s["jurors"].as_array().into_iter().flatten().find(|j| j["juror"]["address"] == account.as_str()).ok_or_else(|| anyhow!("{account} isn't on the jury of Séance #{seance}"))?;
+            let claims: Vec<Value> = s["claims"].as_array().cloned().unwrap_or_default();
+            let claim = |id: u64| -> Result<(u64, String, u64)> {
+                let c = claims.iter().find(|c| c["id"] == id).ok_or_else(|| anyhow!("Séance #{seance} doesn't list claim #{id}"))?;
+                Ok((id, c["repo"].as_str().unwrap_or_default().to_string(), c["pr"].as_u64().unwrap_or_default()))
+            };
+            let pairs = seat["assigned_pairs"].as_array().into_iter().flatten().map(|p| Ok([claim(p[0].as_u64().unwrap_or_default())?, claim(p[1].as_u64().unwrap_or_default())?])).collect::<Result<Vec<_>>>()?;
+            if votes.len() != pairs.len() {
+                bail!("you have {} assigned pairs: pass one of a, b or = for each (`blockula contrib seance {seance}` lists them)", pairs.len());
+            }
+            let refs: Vec<[(u64, &str, u64); 2]> = pairs.iter().map(|[a, b]| [(a.0, a.1.as_str(), a.2), (b.0, b.1.as_str(), b.2)]).collect();
+            let pairs_digest = seance_pairs_digest(seance, &account, &refs);
             let path = sealed_path(dir, &chain_id, seance, &account);
             std::fs::create_dir_all(path.parent().unwrap())?;
             // Replace the saved vote only once the new commitment is on-chain, so a failed
@@ -551,7 +566,7 @@ pub fn contrib(cmd: ContribCmd, dir: &Path) -> Result<()> {
             let tmp = path.with_extension("pending");
             std::fs::write(&tmp, serde_json::to_vec_pretty(&SealedVote { chain_id, seance, account, votes, spam, salt })?)?;
             // On failure the .pending file stays: if the commit lands anyway, `reveal` finds it.
-            submit(dir, &signer, Action::CommitVotes { seance_id: seance, commitment })?;
+            submit(dir, &signer, Action::CommitVotes { seance_id: seance, commitment, pairs_digest })?;
             std::fs::rename(&tmp, &path)?;
             println!("  sealed vote saved to {} — run `blockula contrib reveal {seance}` once revealing opens", path.display());
             Ok(())

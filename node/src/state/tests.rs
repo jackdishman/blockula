@@ -110,7 +110,7 @@ impl Sim {
                 let seat = seance.jurors.get(&addr(a))?;
                 let votes: String = seat.pairs.iter().map(|_| 'a').collect();
                 if seat.commitment.is_none() && h < seance.commit_until {
-                    by(a, Action::CommitVotes { seance_id: id, commitment: seance_commitment(id, &addr(a), &votes, &[], "salt") })
+                    by(a, Action::CommitVotes { seance_id: id, commitment: seance_commitment(id, &addr(a), &votes, &[], "salt"), pairs_digest: crate::poc::seat_pairs_digest(s, id, &addr(a), &seat.pairs) })
                 } else {
                     by(a, Action::RevealVotes { seance_id: id, votes, spam: vec![], salt: "salt".into() })
                 }

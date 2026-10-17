@@ -334,7 +334,17 @@ pub fn gov(cmd: GovCmd, dir: &Path) -> Result<()> {
                 "nay" | "no" | "n" => false,
                 _ => bail!("vote aye or nay"),
             };
-            submit(dir, &signer, Action::Vote { proposal_id: id, aye, amount: parse_fang(&amount)?, conviction }).map(|_| ())
+            let amount = parse_fang(&amount)?;
+            // The vote binds the proposal shown here (its kind, title and link), decoded from the
+            // node's answer rather than its summary: a node that misreports it makes the vote
+            // fail, not land on something else (audit gap-7-6).
+            let p = rt()?.block_on(get(&signer.rpc, &format!("/proposal/{id}")))?;
+            let kind: ProposalKind = serde_json::from_value(p["kind"].clone()).context("the node's proposal kind doesn't parse")?;
+            let (title, url) = (text(&p["title"]).to_string(), text(&p["url"]).to_string());
+            println!("Voting {} with {} at conviction {conviction} on proposal #{id}: “{title}”{}", if aye { "aye" } else { "nay" }, fmt_fang(amount), if url.is_empty() { String::new() } else { format!(" ({url})") });
+            println!("   it does: {}", serde_json::to_string(&kind)?);
+            let proposal_digest = proposal_digest(&kind, &title, &url);
+            submit(dir, &signer, Action::Vote { proposal_id: id, aye, amount, conviction, proposal_digest }).map(|_| ())
         }
         GovCmd::Unlock { signer } => submit(dir, &signer, Action::Unlock {}).map(|_| ()),
         GovCmd::Tree { entries, id, out, rpc } => {
@@ -480,7 +490,19 @@ pub fn multisig(cmd: MultisigCmd, dir: &Path) -> Result<()> {
             let action: Action = serde_json::from_str(&action).context("the action must be tx action JSON, e.g. {\"type\":\"transfer\",\"to\":\"bob.boo\",\"amount\":\"5000000000\"}")?;
             submit(dir, &signer, Action::MultisigPropose { action: Box::new(action) }).map(|_| ())
         }
-        MultisigCmd::Approve { id, signer } => submit(dir, &signer, Action::MultisigApprove { id }).map(|_| ()),
+        MultisigCmd::Approve { id, signer } => {
+            // The approval binds the stored action, printed decoded (not the node's summary of
+            // it): a node that misreports it makes the approval fail (audit gap-7-6).
+            let keys = keys_of(&signer, dir)?;
+            let rt = rt()?;
+            let account = rt.block_on(acting_for(&signer, &keys))?;
+            let m = rt.block_on(get(&signer.rpc, &format!("/multisig/{account}")))?;
+            let p = m["pending"].as_array().into_iter().flatten().find(|p| p["id"] == id).ok_or_else(|| anyhow!("{account} has no open multisig action #{id}"))?;
+            let action: Action = serde_json::from_value(p["action"].clone()).context("the node's multisig action doesn't parse")?;
+            println!("Approving multisig action #{id} of {account}, which does exactly this:\n{}", serde_json::to_string_pretty(&action)?);
+            drop(rt);
+            submit(dir, &signer, Action::MultisigApprove { id, action_digest: action_digest(&action) }).map(|_| ())
+        }
         MultisigCmd::Show { account, rpc } => {
             let m = rt()?.block_on(get(&rpc.rpc, &format!("/multisig/{account}")))?;
             let owners = m["owners"].as_array().cloned().unwrap_or_default();
@@ -491,6 +513,8 @@ pub fn multisig(cmd: MultisigCmd, dir: &Path) -> Result<()> {
             for p in m["pending"].as_array().cloned().unwrap_or_default() {
                 let expired = if p["expired"] == true { " (expired)" } else { "" };
                 println!("   #{} {} · {}/{} approvals · expires at block {}{expired}", p["id"], text(&p["summary"]), p["valid_approvals"], m["threshold"], p["expires_at"]);
+                // What an approval signs is the action itself: show it, not just the node's summary.
+                println!("      action: {}", serde_json::to_string(&p["action"])?);
             }
             Ok(())
         }

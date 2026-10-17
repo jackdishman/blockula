@@ -53,7 +53,7 @@ const vectorTx = (action: Action): Tx => ({ chain_id: "vec", genesis_hash: "03".
 const all = vectorActions.map((a) => signingBytes(vectorTx(a)));
 const joined = new Uint8Array(all.reduce((n, b) => n + b.length, 0));
 all.reduce((at, b) => (joined.set(b, at), at + b.length), 0);
-assert.equal(bytesToHex(blake3(joined)), "f6013e20819a81f199b415be65c8ad6fe2df599b782b8e63d5e21e9dd3771aca");
+assert.equal(bytesToHex(blake3(joined)), "1078aa2103641542458acf9a1928da918af6505c8cb3a3a1f7bbf7320bbe3c30");
 // Protocol v1 (tags 30–49, every proposal kind, a multisig proposal), hashed on its own: `v1_vector_actions` there.
 const propose = (kind: ProposalKind): Action => ({ type: "propose", kind, deposit: (1000n * 1_000_000_000n).toString(), title: "t" });
 const v1VectorActions: Action[] = [
@@ -97,7 +97,7 @@ const v1VectorActions: Action[] = [
 const v1 = v1VectorActions.map((a) => signingBytes(vectorTx(a)));
 const v1Joined = new Uint8Array(v1.reduce((n, b) => n + b.length, 0));
 v1.reduce((at, b) => (v1Joined.set(b, at), at + b.length), 0);
-assert.equal(bytesToHex(blake3(v1Joined)), "fa975d440a66418e791d1cb415eb19479e544948ca449897fa7bad2e1d94bde0");
+assert.equal(bytesToHex(blake3(v1Joined)), "6979535ae0ead49caa82eba564873762cfc4fb7aad1dc77ec3ae845caf0b5366");
 // Proposal kinds added after that vector froze, each on its own: `unflag_sybil` (tag 14, audit F54) and `cancel_upgrade` (tag 15, audit F50).
 assert.equal(bytesToHex(blake3(signingBytes(vectorTx(propose({ type: "unflag_sybil", account: "x.boo", reason: "r" }))))), "225aa5b8e4df8e8d27fe796992dfd02e5e402c14a9bbc3873d41d63dd07dc2cf");
 assert.equal(bytesToHex(blake3(signingBytes(vectorTx(propose({ type: "cancel_upgrade", version: 2, activation_height: 100_000 }))))), "199d2455419f738528317187cdbfa72e5430308b096c2c8741f5801290d3d156");

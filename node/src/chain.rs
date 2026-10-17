@@ -5210,7 +5210,7 @@ mod scaffold {
             let summary = st.describe(&tx, Some(1));
             assert!(summary.starts_with(&short(&owner.address())) && summary.len() > 30, "{:?}: “{summary}”", tx.action);
         }
-        let vote = |conviction| Tx { chain_id: "c".into(), genesis_hash: String::new(), from: owner.address(), nonce: 0, fee: 0, tip: 0, valid_until: 0, action: Action::Vote { proposal_id: 3, aye: false, amount: 2 * FANG, conviction }, memo: String::new(), public_key: String::new(), signature: String::new() };
+        let vote = |conviction| Tx { chain_id: "c".into(), genesis_hash: String::new(), from: owner.address(), nonce: 0, fee: 0, tip: 0, valid_until: 0, action: Action::Vote { proposal_id: 3, aye: false, amount: 2 * FANG, conviction, proposal_digest: "00".repeat(32) }, memo: String::new(), public_key: String::new(), signature: String::new() };
         assert!(st.describe(&vote(0), None).ends_with("voted nay on proposal #3 with 2 FANG at 0.1× conviction"));
         let spend = Tx { action: Action::Propose { kind: ProposalKind::TreasurySpend { to: keys(22).address(), amount: FANG }, deposit: 50 * FANG, title: "Grants".into(), url: String::new() }, ..vote(1) };
         assert!(st.describe(&spend, None).ends_with(&format!("proposed “Grants”: pay 1 FANG from the treasury to {}, bonding 50 FANG", short(&owner.address()))));

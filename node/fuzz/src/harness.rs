@@ -670,7 +670,7 @@ impl Sm {
                 let votes: String = seat.pairs.iter().enumerate().map(|(i, _)| if (amt >> (i % 16)) & 1 == 0 { 'a' } else { 'b' }).collect();
                 let spam: Vec<u64> = if amt % 7 == 0 { seance.claims.first().copied().into_iter().collect() } else { vec![] };
                 if seat.commitment.is_none() && h < seance.commit_until {
-                    Action::CommitVotes { seance_id: id, commitment: types::seance_commitment(id, &me, &votes, &spam, "salt") }
+                    Action::CommitVotes { seance_id: id, commitment: types::seance_commitment(id, &me, &votes, &spam, "salt"), pairs_digest: crate::poc::seat_pairs_digest(&self.state, id, &me, &seat.pairs) }
                 } else {
                     Action::RevealVotes { seance_id: id, votes, spam, salt: "salt".into() }
                 }
@@ -723,13 +723,14 @@ impl Sm {
                     let kind = kinds[b as usize % kinds.len()].clone();
                     Action::Propose { kind, deposit: fang(1_000 + amt), title: "fuzz".into(), url: String::new() }
                 }
-                1 => Action::Vote { proposal_id: amt % 4, aye: b % 2 == 0, amount: fang(1 + amt % 100), conviction: (b % 7) as u8 },
+                // Bound to the proposal as stored, so most votes land (a wrong digest is refused).
+                1 => Action::Vote { proposal_id: amt % 4, aye: b % 2 == 0, amount: fang(1 + amt % 100), conviction: (b % 7) as u8, proposal_digest: self.state.governance.proposals.get(&(amt % 4)).map(crate::governance::digest_of).unwrap_or_else(|| "00".repeat(32)) },
                 _ => Action::Unlock {},
             },
             30 => match amt % 3 {
                 0 => Action::MultisigCreate { owners: vec![user.key_id.clone(), agent.key_id.clone()], threshold: 1 + (b % 2) },
                 1 => Action::MultisigPropose { action: Box::new(Action::Transfer { to: other, amount: fang(1) }) },
-                _ => Action::MultisigApprove { id: amt % 4 },
+                _ => Action::MultisigApprove { id: amt % 4, action_digest: self.state.governance.multisig_proposals.get(&(amt % 4)).map(|p| types::action_digest(&p.action)).unwrap_or_else(|| "00".repeat(32)) },
             },
             31 => match amt % 3 {
                 0 => Action::RenewName { name: format!("name{}", b % 8), years: 1 + (b % 3) },
@@ -1020,7 +1021,7 @@ pub fn seeds() -> Vec<(&'static str, &'static str, Vec<u8>)> {
     out.push(("state_machine", "hunts-and-agents", sm_ops(&[(3, 0, 0, 15), (5, 0, 0, 0), (34, 0, 0, 0), (6, 0, 0, 2), (7, 1, 3, 4), (34, 0, 0, 0), (8, 2, 0, 0), (8, 3, 0, 1), (9, 1, 0, 0), (7, 2, 4, 1), (34, 0, 0, 3), (10, 2, 0, 1), (10, 0, 0, 0), (4, 0, 0, 0), (6, 0, 0, 1), (2, 1, 3, 0), (0, 1, 2, 7), (1, 3, 1, 0), (35, 2, 1, 0), (35, 2, 1, 1), (34, 0, 0, 2)])));
     out.push(("state_machine", "validators-and-v1", sm_ops(&[(26, 0, 0, 0), (34, 0, 0, 0), (27, 0, 1, 0), (34, 0, 0, 3), (28, 1, 0, 0), (29, 1, 0, 0), (29, 2, 1, 1), (29, 3, 0, 2), (30, 0, 0, 0), (31, 0, 2, 0), (32, 0, 0, 0), (32, 0, 0, 1), (27, 0, 1, 1), (34, 0, 0, 3), (34, 0, 0, 3), (27, 0, 1, 2), (34, 0, 0, 1)])));
     let mut raw = vec![];
-    for action in [Action::Transfer { to: Keys::from_seed([3; 32]).address(), amount: 7 }, Action::Vote { proposal_id: 0, aye: true, amount: 5, conviction: 2 }, Action::Delegate { validator: Keys::from_seed(VALIDATOR_SEED).address(), amount: 3 }] {
+    for action in [Action::Transfer { to: Keys::from_seed([3; 32]).address(), amount: 7 }, Action::Vote { proposal_id: 0, aye: true, amount: 5, conviction: 2, proposal_digest: "00".repeat(32) }, Action::Delegate { validator: Keys::from_seed(VALIDATOR_SEED).address(), amount: 3 }] {
         let enc = action.to_bytes();
         raw.extend(sm_ops(&[(33, 1, (enc.len() - 1) as u8, 0)]));
         raw.extend(enc);
