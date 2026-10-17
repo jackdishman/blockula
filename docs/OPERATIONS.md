@@ -206,27 +206,26 @@ On a fresh Debian 12 / Ubuntu 24.04 host that meets the [hardware](#reference-ha
 # 1. A service account and a home on the data volume.
 sudo useradd --system --home /var/lib/blockula --shell /usr/sbin/nologin blockula
 sudo install -d -o blockula -g blockula -m 700 /var/lib/blockula
-
-# 2. Install a verified binary ("Verifying a release" under Releases), as your own user with
-#    `gh auth login` done. K is the release key id from SECURITY.md and the website, never from
-#    the release: install.sh comes from the release, so check it before you run it. The blockula
-#    you already run checks the signature (a first install: see "Verifying a release"). Before
-#    the key ceremony there's no key id yet: skip K and the `release verify` line.
-V=vX.Y.Z; K=<release key id>
-gh release download $V --repo jackdishman/blockula --dir rel-$V \
-  --pattern blockula-x86_64-unknown-linux-gnu.tar.gz --pattern 'checksums.txt*' --pattern install.sh
-cd rel-$V
-blockula release verify --key-id $K --tag $V --sig checksums.txt.sig checksums.txt
-sha256sum --ignore-missing -c checksums.txt     # the archive and install.sh: OK
-BLOCKULA_VERSION=$V BLOCKULA_RELEASE_KEY_ID=$K BLOCKULA_RELEASE_URL=file://$PWD BLOCKULA_REQUIRE_VERIFY=1 sh install.sh
-sudo install -m 755 ~/.blockula/bin/blockula /usr/local/bin/blockula
-
-# 3. Create the validator home (generates the consensus key). Use the genesis file from the
-#    signed release (genesis-<chain id>.json, verified with the archives), not a node's copy.
-sudo -u blockula blockula validator init --home /var/lib/blockula/val \
-  --genesis ./genesis-blockula-1.json \
-  --public-p2p-addr <your-ip>:30300 --public-http-addr https://<your sentry>
 ```
+
+2. **Install a verified binary**, as your own user with `gh auth login` done: [a first install](#a-first-install) (paste the block there). It checks the archive against the release announcement in the operators' channel, then the release's offline signature against the release key id, which it pins in `~/.blockula/release-key-id`. Every later upgrade is checked against that pin ([Upgrading](#upgrading)). Nothing the release ships, its `install.sh` included, runs before those checks pass.
+3. **The genesis file and the validator home.** Take the genesis file from the signed release, checked against the pinned key, not from a node:
+
+<!-- runbook-test: validator-genesis -->
+```bash
+( set -euo pipefail
+  V=vX.Y.Z
+  # Only files that match the release's signed checksums.txt land in genesis-$V.
+  /usr/local/bin/blockula release fetch $V --file genesis-blockula-1.json --dir genesis-$V
+  sudo install -m 644 genesis-$V/genesis-blockula-1.json /var/lib/blockula/genesis-blockula-1.json
+  # Creates the validator home and its consensus key.
+  sudo -u blockula /usr/local/bin/blockula validator init --home /var/lib/blockula/val \
+    --genesis /var/lib/blockula/genesis-blockula-1.json \
+    --public-p2p-addr <your-ip>:30300 --public-http-addr https://<your sentry>
+)
+```
+
+Each block runs in a subshell with `set -euo pipefail`, so it stops at the first command that fails: paste it whole, and nothing after a failed check runs. `scripts/test-release-runbook.sh` runs these blocks as they're written here (CI).
 
 At genesis, keys come from the [genesis ceremony](GENESIS_CEREMONY.md) instead, and the home is built from the published `genesis.json` (verify its hash).
 
@@ -317,12 +316,12 @@ Upgrades are announced, released, signalled, scheduled and activated at a height
 - a **validator exits with code 11** (systemd keeps it down, `RestartPreventExitStatus`), and does so again on every start until it's upgraded;
 - a **full node keeps serving reads** at that height, with `/api/health` 503 and `"halted": "upgrade_required"`, until it's upgraded.
 
-Install the new binary and start it: it executes the new version's blocks and catches up.
+Install the new binary ([Upgrading](#upgrading)) and start it: it executes the new version's blocks and catches up.
 
 **The hard-fork process.**
 
 1. **Announce** at least two weeks ahead (planned upgrades): the version number, what changes, the release date, and the proposed activation height. Post in the operator channel and publicly.
-2. **Release** a signed, reproducible build ([Releases](#releases)). Operators verify it themselves: provenance, the ML-DSA signature (`blockula release verify`), ideally a rebuild.
+2. **Release** a signed, reproducible build ([Releases](#releases)). Operators install it with `blockula release install` ([Upgrading](#upgrading)), which checks the ML-DSA signature against their pinned release key id and provenance; ideally they rebuild it too.
 3. **Install and signal.** Each operator restarts onto the new binary in their own maintenance window, one node at a time (fewer than ⌊(n−1)/3⌋ validators restarting at any moment across the network: coordinate in the operator channel). The new binary signals the new version in every block it proposes. `GET /api/upgrade` shows readiness: the newest signal from each active validator and whether ≥ ⅔ are ready.
 4. **Schedule.** Once ≥ ⅔ of the active set signal the version, a `ScheduleUpgrade { version, activation_height }` proposal goes to governance (a ⅔ supermajority; MAINNET-DESIGN 3.5; `blockula gov propose upgrade`). Pick the height so the vote, the timelock, a cancellation's vote (below; the node refuses heights that leave no room for one) and a margin for stragglers fit before it. Every node then shows `blockula_upgrade_next_version` and `…_next_height`; nodes without the new binary fire `BlockulaUpgradeRequired`, and `…Soon` a day before.
 5. **Activate.** At the height every upgraded node switches rules. Watch `/api/upgrade` and the explorer: blocks from the activation height on carry the new `version`. Stragglers halt cleanly (above) instead of diverging; they upgrade and continue.
@@ -375,7 +374,7 @@ Today's testnet binary has no version gating: the testnet is upgraded by redeplo
 3. **Deterministic halt:** every validator fails the same finalized block (an execution error or a panic in end-of-block code), and does again on every restart (OPS-5). Logs on all nodes show the same height and error. Then:
    - Stop restarting. Collect logs, the failing block (`/api/block/{height}`) and a repro.
    - Write the fix so it changes behaviour **only from the failing height on** (height-gated in code: `if height >= H_fix`), so history replays identically. A fix that changes consensus rules for later blocks is a protocol upgrade: give the binary a higher `SUPPORTED_PROTOCOL_VERSION` and schedule it once the chain moves ([Upgrades](#upgrades)).
-   - Ship it as an emergency release ([Patch distribution](#patch-distribution)), verified like any release (`blockula release verify`).
+   - Ship it as an emergency release ([Patch distribution](#patch-distribution)), verified like any release (`blockula release install` checks its signature against the pinned key).
    - Operators install it and start. The chain resumes when ≥ ⅔ of the set runs it.
 
 **Safety failure (SEV-1):** two certificates for different blocks at one height, or nodes reporting different state roots for the same height. Ask every operator to stop their validator at once (stop the service; `--halt-height` only if a height in the near future is agreed), preserve disks and logs (copy them aside: the node deletes consensus journals older than two epochs), and don't restart until the IC calls it. Equivocation evidence from the consensus journals (`track_historical_votes`) identifies the signers (planned: P-STAKE).
@@ -392,8 +391,19 @@ For a vulnerability that's exploitable before a fix is widely deployed:
 
 1. Fix and review in a private fork (a GitHub private security advisory fork). Add a regression test.
 2. Tag a release candidate in the private fork. Build it reproducibly (`scripts/release-build.sh`), and have at least one more maintainer rebuild it and match the hashes.
-3. Write `checksums.txt` with `scripts/release-checksums.sh vX.Y.Z <dir of the archives>` (its first line names the version, so the signature binds the files to it), sign it with the release key ([Releases](#releases)) and send the archives, `checksums.txt`, its signature and the source commit to operators through the private channel. Don't send the diff until enough of the set has upgraded, if the diff itself reveals the bug.
-4. Operators verify the signature against the published release key id, for this version: `blockula release verify --key-id <release key id> --tag vX.Y.Z --sig checksums.txt.sig checksums.txt`, so an older signed release can't be passed off as the patch. Then `sha256sum --ignore-missing -c checksums.txt`, install (`BLOCKULA_VERSION=vX.Y.Z BLOCKULA_RELEASE_KEY_ID=<id> BLOCKULA_RELEASE_URL=file://<dir> sh install.sh`, or by hand) and confirm in the channel. Track it in a checklist: ⅔ of the set is the target, everyone is the goal.
+3. Put the archives in a directory of their own (nothing else: no `install.sh`, which operators don't use) and write `checksums.txt` with `scripts/release-checksums.sh vX.Y.Z <that dir>` (its first line names the version, so the signature binds the files to it). Sign it with the release key ([Releases](#releases)) and send the directory (archives, `checksums.txt`, `checksums.txt.sig`) and the source commit to operators through the private channel. Don't send the diff until enough of the set has upgraded, if the diff itself reveals the bug.
+4. Operators install it with the binary they already run, which checks the signature against their pinned release key id, the version on `checksums.txt`'s first line (an older signed release can't pass for the patch), the archive's hash and the binary's version. The patch was built outside GitHub, so it has no build provenance, and the command doesn't ask for any: the offline signature is the check. Then confirm in the channel. Track it in a checklist: ⅔ of the set is the target, everyone is the goal.
+
+<!-- runbook-test: patch-install -->
+```bash
+( set -euo pipefail
+  V=vX.Y.Z    # the patch's version
+  P=<the directory the patch came in>
+  /usr/local/bin/blockula release install $V --from "$P" --to ~/.blockula/bin/blockula
+  sudo install -m 755 ~/.blockula/bin/blockula /usr/local/bin/blockula
+)
+```
+
 5. When ≥ ⅔ have upgraded (or the activation height passes), publish the source, the public release (normal pipeline, same hashes) and the advisory.
 
 ### Coordinated restart at a height
@@ -409,7 +419,7 @@ For a vulnerability that's exploitable before a fix is widely deployed:
 For a deterministic halt, or a vulnerability that must be closed before it's public:
 
 1. Private fix with a regression test, height-gated (see the playbook above), reviewed by a second maintainer.
-2. Reproducible build, signed offline ([Patch distribution](#patch-distribution)): operators check `blockula release verify --key-id <release key id> --tag vX.Y.Z --sig checksums.txt.sig checksums.txt` with their installed binary before anything else.
+2. Reproducible build, signed offline ([Patch distribution](#patch-distribution)): operators install it with `blockula release install vX.Y.Z --from <dir>` (step 4 there), which checks the signature against their pinned release key id before anything from the patch runs.
 3. If the chain is running: a coordinated restart at a height onto the patched binary (above). If it's halted: operators install and start; the chain resumes at ⅔.
 4. Afterwards: the public release, the advisory, the post-mortem.
 
@@ -570,17 +580,27 @@ Every release is reproducible, carries SLSA build provenance, and is signed offl
    - refuses a tag that isn't `vX.Y.Z` or isn't `node/Cargo.toml`'s version, so `blockula --version` prints the tag;
    - writes `checksums.txt` with `scripts/release-checksums.sh`: a first line naming the tag (`# blockula-release vX.Y.Z`), then the archives, `install.sh`, committed genesis files and the checkpoint files `node/checkpoints/*.json` (see [Checkpoints in releases](#checkpoints-in-releases)), and attests every file with GitHub artifact attestations (SLSA provenance, `actions/attest-build-provenance`). The tag line is what binds the offline signature to this version: without it, an older release's genuine signature would pass for a newer one (audit supply-chain-B-2);
    - creates a **draft** release. Only that last job can write to the repo.
+
+   Everything up to here runs on GitHub, so OPS-7's adversary (a compromised GitHub account, runner, action or release workflow) can change any of it: the tag, the archives, `install.sh`, the genesis and checkpoint files, `checksums.txt`, the provenance. Steps 2 and 3 are what the signer checks before vouching for it. Write down the commit you reviewed for the release (the release PR's merge commit) yourself, when you review it: it's `COMMIT` below.
 2. **Reproduce.** At least two people rebuild the Linux archives independently and compare against the draft:
 
    ```bash
    gh release download vX.Y.Z --repo jackdishman/blockula --pattern checksums.txt --dir /tmp/rel
-   CHECKSUMS=/tmp/rel/checksums.txt scripts/reproduce-release.sh vX.Y.Z                            # this machine's arch
-   CHECKSUMS=/tmp/rel/checksums.txt scripts/reproduce-release.sh vX.Y.Z aarch64-unknown-linux-gnu  # emulated on x86: slow
+   COMMIT=<reviewed commit> CHECKSUMS=/tmp/rel/checksums.txt scripts/reproduce-release.sh vX.Y.Z                            # this machine's arch
+   COMMIT=<reviewed commit> CHECKSUMS=/tmp/rel/checksums.txt scripts/reproduce-release.sh vX.Y.Z aarch64-unknown-linux-gnu  # emulated on x86: slow
    ```
 
-   Each builder posts the result (and their hashes) in the release issue. macOS archives reproduce only with the same Xcode as the release run (its log prints `xcodebuild -version`).
-3. **Check provenance** of what you'll sign: `gh attestation verify /tmp/rel/checksums.txt --repo jackdishman/blockula --signer-workflow jackdishman/blockula/.github/workflows/release.yml --source-ref refs/tags/vX.Y.Z`, and that its first line is `# blockula-release vX.Y.Z`.
-4. **Sign offline.** Carry `checksums.txt` (only that file) to the offline signing machine. It holds the release key and one `blockula` binary, and nothing else: no checkout, no `npm ci`, no Node.js tooling. A signing process trusts every line of code it loads, and the monorepo's npm tree (the wallet's toolchain included, with install scripts) is far more than the signer needs (audit supply-chain-B-4). The binary is one the signer verified before taking it offline: their own reproduced build (step 2's `scripts/reproduce-release.sh`, whose archive matched; take `blockula` out of it), or a release verified as in [Verifying a release](#verifying-a-release-as-a-user-or-operator). Note its SHA-256 in the release issue, and carry new binaries over only the same way.
+   With `COMMIT`, the script refuses a tag that isn't that commit, and checks `checksums.txt`'s other lines as in step 3. Each builder posts the result (and their hashes) in the release issue. macOS archives reproduce only with the same Xcode as the release run (its log prints `xcodebuild -version`).
+3. **Check what you'll sign**, on an online machine with a checkout you trust, against the exact `checksums.txt` you'll carry offline:
+
+   ```bash
+   COMMIT=<reviewed commit> scripts/check-release-files.sh vX.Y.Z /tmp/rel/checksums.txt
+   gh attestation verify /tmp/rel/checksums.txt --repo jackdishman/blockula \
+     --signer-workflow jackdishman/blockula/.github/workflows/release.yml --source-ref refs/tags/vX.Y.Z
+   ```
+
+   `scripts/check-release-files.sh` refuses unless the tag is the commit you reviewed, the first line is `# blockula-release vX.Y.Z`, `install.sh`, every `genesis-<id>.json` and every `checkpoints-<id>.json` hash exactly like the commit's `scripts/install.sh`, `genesis/<id>/genesis.json` and `node/checkpoints/<id>.json` (and all of the commit's are listed), the four archives are listed, and nothing else is (audit F49, review-r2-supply-4). Provenance adds that the files came out of the release workflow.
+4. **Sign offline.** Carry `checksums.txt` (only that file) to the offline signing machine. It holds the release key and one `blockula` binary, and nothing else: no checkout, no `npm ci`, no Node.js tooling. A signing process trusts every line of code it loads, and the monorepo's npm tree (the wallet's toolchain included, with install scripts) is far more than the signer needs (audit supply-chain-B-4). The binary is one the signer verified before taking it offline: their own reproduced build (step 2's `scripts/reproduce-release.sh`, whose archive matched; take `blockula` out of it), or a release installed as in [Installing and upgrading](#installing-and-upgrading). Note its SHA-256 in the release issue, and carry new binaries over only the same way.
 
    ```bash
    blockula release selftest                          # this binary signs the known-answer vector
@@ -591,47 +611,91 @@ Every release is reproducible, carries SLSA build provenance, and is signed offl
 
    Carry `checksums.txt.sig` back. `scripts/release-sig.mjs` has no `sign`: it only verifies, for machines that have a checkout.
 5. **Publish.** `gh release upload vX.Y.Z checksums.txt.sig --repo jackdishman/blockula`, check the draft once more, then `gh release edit vX.Y.Z --draft=false --repo jackdishman/blockula`. With GitHub's immutable releases enabled (repository settings), nobody can swap an asset after that.
+6. **Announce** it in the operators' channel and publicly: the tag, the commit, the release key id, and the SHA-256 of each archive (from the signed `checksums.txt`). A first install checks the archive against this announcement ([A first install](#a-first-install)), so post it from the signer's own account on a channel GitHub doesn't control.
+
+**What the signature vouches for.** Exactly what steps 2 and 3 checked: the tag is the commit the signer reviewed; the Linux archives rebuild bit for bit from it (two builders); `install.sh` and the genesis and checkpoint files are its own; nothing else is listed. The macOS archives are signed on provenance, plus a rebuild only where someone has the release run's Xcode, so for them a compromised release workflow is caught only by such a rebuild. Validators run Linux. A compromised GitHub side that changes anything the signer checks gets a release the signer refuses; one that changes a macOS archive gets past the signer unless someone rebuilds it.
 
 ### The release key
 
 - One ML-DSA-65 key, generated on the offline signing machine (set up as in step 4 above: the key and a verified `blockula`, nothing else) with `blockula keygen > release-key.json`. Its **key id** is the hex BLAKE3 of the public key: `blockula release keyid --key release-key.json`. The key doesn't exist yet; generate it this way from the start, never on a machine that has had a checkout or an npm tree.
-- Publish the key id in SECURITY.md, this file, `scripts/install.sh` (`RELEASE_KEY_ID`), the website and the project's social accounts, so a single compromised channel can't swap it. **Release key id:** *not generated yet* (the maintainer fills this in at the key ceremony).
-- Back it up like a validator key (encrypted, offline, two locations). Rotation: sign a statement naming the new key id with the old key, publish it through the same channels, and update every place above.
-- Signature format: the message is `"BLOCKULA_RELEASE_V1"` followed by the exact bytes of `checksums.txt`, signed with FIPS 204 ML-DSA-65 (empty context, deterministic, as `crypto::Keys::sign`). `checksums.txt.sig` is one JSON line: `{"format":"blockula-release-signature-v1","key_id","public_key","signature"}` (hex). `checksums.txt`'s first line, `# blockula-release vX.Y.Z`, is part of the signed bytes; `verify --tag vX.Y.Z` checks it. `blockula release` (`node/src/release_cli.rs`) signs and verifies; `scripts/release-sig.mjs` only verifies (it never loads a key). Both check the same known-answer vector (`blockula release selftest`, `node scripts/release-sig.mjs selftest`), so their signatures are byte-identical.
-- `blockula release verify` is what `install.sh` calls to check a new release's signature with an already-installed binary.
+- Publish the key id in SECURITY.md, this file, `scripts/install.sh` (`BUILTIN_KEY_ID`), `node/src/release_cli.rs` (`BUILTIN_KEY_ID`, the key a fresh `blockula release install` trusts when nothing is pinned; a test keeps the two equal), the website, the operators' channel and the project's social accounts, so a single compromised channel can't swap it. **Release key id:** *not generated yet* (the maintainer fills this in at the key ceremony).
+- **Operators pin it once.** Their first `blockula release install --key-id K` writes K to `~/.blockula/release-key-id` once the release verifies (`blockula release pin --key-id K` pins it by hand; `blockula release pin` shows it). From then on, every `blockula release install`, `fetch` and `verify` without `--key-id` checks against the pin, and a different `--key-id` is refused. They never take the key id from a release again, or from SECURITY.md, which a compromised GitHub account can edit.
+- Back it up like a validator key (encrypted, offline, two locations). **Rotation:** on the offline machine, sign a statement naming the new key id with the old key, and publish both through the same channels as the key id:
 
-### Verifying a release as a user or operator
+  ```bash
+  printf '# blockula-release-key-rotation\nold %s\nnew %s\n' <old key id> <new key id> > rotation.txt
+  blockula release sign --key release-key.json rotation.txt > rotation.txt.sig
+  ```
 
+  Operators cross-check the new key id on a channel GitHub doesn't control (the operators' channel), then move their pin. The pin moves only if the pinned key signed the statement, and it names the pinned key as `old` and the given key id as `new`:
+
+<!-- runbook-test: rotation -->
 ```bash
-V=vX.Y.Z; T=x86_64-unknown-linux-gnu
-K=<release key id>   # from SECURITY.md, this file, the website and your operators' channel; never from the release
-gh release download $V --repo jackdishman/blockula --dir rel-$V \
-  --pattern "blockula-$T.tar.gz" --pattern 'checksums.txt*' --pattern install.sh
-cd rel-$V
-# 1. The offline signature, against the key id you got independently, and for this release (not an older one).
-blockula release verify --key-id $K --tag $V --sig checksums.txt.sig checksums.txt
-# 2. The files match the signed checksums: the archive and install.sh.
-sha256sum --ignore-missing -c checksums.txt
-# 3. Provenance: built by this repo's release workflow from the tag.
-gh attestation verify blockula-$T.tar.gz --repo jackdishman/blockula \
-  --signer-workflow jackdishman/blockula/.github/workflows/release.yml --source-ref refs/tags/$V
-# 4. Install exactly these files (install.sh repeats the checks on them).
-BLOCKULA_VERSION=$V BLOCKULA_RELEASE_KEY_ID=$K BLOCKULA_RELEASE_URL=file://$PWD BLOCKULA_REQUIRE_VERIFY=1 sh install.sh
-# 5. Optional, and recommended for validators: rebuild it.
-scripts/reproduce-release.sh $V
+( set -euo pipefail
+  NEW=<new release key id>
+  # rotation.txt and rotation.txt.sig, from the announcement.
+  /usr/local/bin/blockula release pin --key-id $NEW --rotation rotation.txt --rotation-sig rotation.txt.sig
+)
 ```
 
-**Why this order.** `install.sh` comes from the release. Whoever controls the release (a compromised GitHub account or release workflow, OPS-7's adversary) controls the script, any key id built into it, and every check it makes, so its checks are only worth something once the script is known to be genuine. Steps 1 and 2 establish that: the signature, checked by the `blockula` you already run against a key id you got elsewhere, covers `install.sh`'s hash. **`gh attestation verify install.sh` alone doesn't protect against that adversary**: it proves only that the release workflow produced the file, and a compromised workflow attests whatever it builds. Provenance (step 3) catches a swapped or branch-built download; only the offline signature catches a compromised GitHub side (audit F49).
+- Signature format: the message is `"BLOCKULA_RELEASE_V1"` followed by the exact bytes of `checksums.txt`, signed with FIPS 204 ML-DSA-65 (empty context, deterministic, as `crypto::Keys::sign`). `checksums.txt.sig` is one JSON line: `{"format":"blockula-release-signature-v1","key_id","public_key","signature"}` (hex). `checksums.txt`'s first line, `# blockula-release vX.Y.Z`, is part of the signed bytes; `verify --tag vX.Y.Z` checks it. Rotation statements and weekly checkpoints are signed the same way; their first lines differ, so none of them can pass for another. `blockula release` (`node/src/release_cli.rs`) signs and verifies; `scripts/release-sig.mjs` only verifies (it never loads a key). Both check the same known-answer vector (`blockula release selftest`, `node scripts/release-sig.mjs selftest`), so their signatures are byte-identical.
 
-**A first install** has no `blockula` to verify with. Check step 1 with a verifier you already trust instead: a `blockula` on another machine of yours, or `node scripts/release-sig.mjs verify --key-id $K --tag $V --sig checksums.txt.sig checksums.txt` from a checkout you trust after `npm ci` (it only verifies; it holds no key). Then steps 2 to 4. Before the key ceremony there's no key id: provenance (step 3) and the rebuild (step 5) are the checks.
+### Installing and upgrading
 
-`scripts/install.sh` makes the same checks on what it downloads, so the one-line install (`curl … | sh`) is still checked, just with the script as the trust root:
+`blockula release install vX.Y.Z` installs a release with the `blockula` you already trust. It downloads `checksums.txt` and its signature (from the GitHub release, or `--from` a URL or directory), checks the signature against the pinned release key id, checks that the first line names vX.Y.Z, downloads this machine's archive and checks its SHA-256 against the signed list, with `--provenance` also asks `gh attestation verify` that the release workflow built it from the tag, extracts only the binary, checks that it reports vX.Y.Z, and installs it atomically (`--to`, default `~/.blockula/bin/blockula`). It refuses at the first check that fails, and it never downloads or runs the release's `install.sh`. `blockula release fetch vX.Y.Z --file <name> --dir <new dir>` does the same for other files of a release (the genesis file): only files that match land in the directory.
+
+#### Upgrading
+
+<!-- runbook-test: upgrade -->
+```bash
+( set -euo pipefail
+  V=vX.Y.Z
+  # The signature (against the pinned key id), the tag line, the archive's hash, provenance from
+  # the tag and the binary's version, by the blockula you already run.
+  /usr/local/bin/blockula release install $V --provenance --to ~/.blockula/bin/blockula
+  sudo install -m 755 ~/.blockula/bin/blockula /usr/local/bin/blockula
+)
+```
+
+Then restart the service in your maintenance window ([Upgrades](#upgrades)). A desktop install is the first line alone (`blockula release install vX.Y.Z`, `--provenance` with a logged-in `gh`).
+
+#### A first install
+
+A first install has no `blockula` to check the signature with, so something else has to vouch for the first binary. Here it's the release announcement ([How a release is made](#how-a-release-is-made), step 6): the archive must hash to the SHA-256 the signer announced in the operators' channel, a channel GitHub doesn't control. Provenance is checked too, but on its own it's what a compromised GitHub side can produce. Only then does anything from the release run: the binary it holds checks the release's signature with `K`, pins `K` and installs itself.
+
+<!-- runbook-test: first-install -->
+```bash
+( set -euo pipefail
+  V=vX.Y.Z
+  K=<release key id>
+  T=$(uname -m)-unknown-linux-gnu
+  H=<SHA-256 of blockula-$T.tar.gz from the release announcement in the operators' channel>
+  gh release download $V --repo jackdishman/blockula --dir first-$V --pattern "blockula-$T.tar.gz"
+  cd first-$V
+  # The trust root: the archive is the one the signer announced.
+  echo "$H  blockula-$T.tar.gz" | sha256sum -c -
+  gh attestation verify blockula-$T.tar.gz --repo jackdishman/blockula \
+    --signer-workflow jackdishman/blockula/.github/workflows/release.yml --source-ref refs/tags/$V
+  tar -xzf blockula-$T.tar.gz blockula-$T/blockula
+  # Now that binary checks the offline signature against K, pins K, and installs itself.
+  ./blockula-$T/blockula release install $V --key-id $K --provenance --to ~/.blockula/bin/blockula
+  sudo install -m 755 ~/.blockula/bin/blockula /usr/local/bin/blockula
+)
+```
+
+`K` comes from SECURITY.md, this file, the website and the operators' channel, and they must agree; never from the release. If you already run a verified `blockula` on another host of the same platform, copy it over instead, check its SHA-256 against the one you noted when you installed it, and run the upgrade block with it (`./blockula release install $V --key-id $K --provenance --to …`): then that binary is the trust root. Before the key ceremony there's no key id, and `release install` refuses: testnet installs use the one-line install below.
+
+**The trust chain.** The first binary is trusted because of the announcement (or the binary you copied). Every later binary is trusted because the one before checked its signature against the pinned key. The signature is trusted for exactly what the signer checked ([What the signature vouches for](#how-a-release-is-made)). `gh attestation verify` proves only that GitHub's release workflow produced a file: a compromised workflow attests whatever it builds, so it's an extra check, never the trust root. Rebuilding (`COMMIT=<commit> scripts/reproduce-release.sh vX.Y.Z`) is the strongest check, and it's recommended for validators.
+
+#### The one-line install
+
+`curl -fsSL https://github.com/jackdishman/blockula/releases/latest/download/install.sh | sh` (README) is for developers. It runs the release's own `install.sh`, so whoever controls the release controls the script and every check it makes: its checks protect against a swapped or corrupted download, not against OPS-7's adversary. Validators don't use it. What it checks:
 - **The version** is bound to every check: `latest` is resolved to its tag first (a mirror, `BLOCKULA_RELEASE_URL`, needs `BLOCKULA_VERSION`), `checksums.txt` must name it on its first line, provenance must come from its tag, and the binary's `--version` must match before it's installed. An older, genuinely signed release served as the one you asked for is refused (audit supply-chain-B-2). Releases before v0.5.0 name no tag: install those with their own `install.sh`.
 - **The checksum**, always. **Provenance**, when a logged-in `gh` is available. **The signature**, when an installed `blockula` can verify it.
 - Once a release key id is known (`BLOCKULA_RELEASE_KEY_ID`, or built into the script after the key ceremony; if both are set they must agree), a release without `checksums.txt.sig` is refused: provenance alone is all a compromised GitHub account or release workflow can produce, and it can't forge the offline signature (audit F49; the MCP's `install_node` does the same, F69). With no installed verifier the signature can't be checked at all, so the script refuses if you gave `BLOCKULA_RELEASE_KEY_ID` or `BLOCKULA_REQUIRE_VERIFY=1`; with only the built-in key id (a developer's first install) it installs with a loud warning.
-- It prints which checks ran and which it skipped. If neither provenance nor the signature ran, it prints a loud warning. `BLOCKULA_REQUIRE_VERIFY=1` refuses unless provenance was checked and, once a key id is known, the signature too. Validators always install as in steps 1 to 4 above.
+- It prints which checks ran and which it skipped. If neither provenance nor the signature ran, it prints a loud warning. `BLOCKULA_REQUIRE_VERIFY=1` refuses unless provenance was checked and, once a key id is known, the signature too.
 
-`scripts/test-install.sh` tests this policy offline (CI, `ops` job), including an older signed release replayed as a newer one. `scripts/test-release-runbook.sh` runs steps 1, 2 and 4 above with the real `blockula release sign|verify` (CI, `node` job). It shows that an `install.sh` whose signature check was removed or rekeyed installs on its own under `BLOCKULA_REQUIRE_VERIFY=1`, and that the runbook stops it, a swapped `install.sh` and an older signed release at the step meant to catch each.
+`scripts/test-install.sh` tests this policy offline (CI, `ops` job), including an older signed release replayed as a newer one. `scripts/test-release-runbook.sh` (CI, `node` job) runs every block marked for it in this file as an operator pastes it, with the real `blockula` and stand-ins for GitHub and `sudo`: the genuine release installs, and an attacker's release (re-signed with another key, a swapped archive, an older release, an unsigned or unattested one, an announcement that doesn't match) is refused with nothing from it run and nothing installed. It also runs each block with its `( set -euo pipefail … )` taken off and checks that it then fails open, so a block that doesn't stop on failure can't pass. `scripts/test-release-files.sh` (CI, `ops`) tests the signer's file check.
 
 ### npm packages
 
@@ -646,7 +710,7 @@ One-time setup by the maintainer:
 2. Each package → Settings → Publishing access → **Require two-factor authentication and disallow tokens**. Revoke any old automation tokens.
 3. GitHub → Settings → Environments → `npm`: add the maintainers as required reviewers and limit deployments to `v*` tags.
 
-To publish: bump both `package.json` versions to the tag's version in the release PR, tag, then Actions → "Publish npm packages" → Use workflow from: the tag → Run (dry run first). Users verify with `npm audit signatures`.
+To publish: bump both `package.json` versions to the tag's version in the release PR, tag, and wait until the GitHub release for that tag is published (not a draft: the MCP's `install_node` installs that release, and refuses releases before v0.5.0, whose `checksums.txt` names no tag). Then Actions → "Publish npm packages" → Use workflow from: the tag → Run (dry run first). Users verify with `npm audit signatures`.
 
 ### Repository settings (GitHub)
 
@@ -673,7 +737,7 @@ Logs go to the journal (`journalctl -u blockula`). Keep at least 14 days (`Syste
 - [ ] Hardware, bandwidth plan and disk meet this document; provider/ASN/jurisdiction declared and within the ¼ limit.
 - [ ] Firewall: only p2p and admin SSH reachable from the internet (tested from outside).
 - [ ] chrony with NTS sources; offset < 10 ms.
-- [ ] Binary installed with `BLOCKULA_REQUIRE_VERIFY=1`; genesis hash checked.
+- [ ] Binary installed with `blockula release install` ([A first install](#a-first-install)), release key id pinned (`blockula release pin` shows it); genesis file from `blockula release fetch`, its hash checked.
 - [ ] Consensus key and owner key backed up offline, encrypted, two places; restore tested.
 - [ ] systemd unit with `BLOCKULA_INSTANCE_ID` and `RestartPreventExitStatus=10 11 12`; `GITHUB_TOKEN` set (public-read-only).
 - [ ] Provider volume snapshots off on the validator volume.
