@@ -805,17 +805,29 @@ fn displaces(tx: &Tx, cost: TipRate, relay: u64) -> bool {
 /// so): a tx at a later nonce is refused (wait until the shield is included, or replace it),
 /// and one at its nonce replaces it if it's a shield (from the same account, so nothing else
 /// of anyone's goes) that displaces it. `relay`: the base fee of `tx`'s bytes; `hint`: that
-/// of the shield's, the replacement's size a refusal names a tip for.
-pub fn behind_shield(shield: &Tx, last: bool, tx: &Tx, relay: u64, hint: u64) -> Result<()> {
+/// of the shield's, the replacement's size a refusal names a tip for; `cap`: the most a tx whose
+/// bytes' base fee is the argument may tip (`econ::max_tip`). A refusal never names a tip past
+/// the replacement's cap (review of r3-consensus, as `mempool_admit` and
+/// `Chain::eviction_victim` since review-fix-fees-2): a shield tipping so near its own cap that
+/// no replacement may outbid it at the current base fee can't be replaced, so it says to wait
+/// until the shield is included or leaves the mempool.
+pub fn behind_shield(shield: &Tx, last: bool, tx: &Tx, relay: u64, hint: u64, cap: impl Fn(u64) -> u64) -> Result<()> {
     let n = shield.nonce;
+    let wait = |cap: u64| format!("outbidding it takes a tip past a replacement's cap at the current base fee ({cap} drops), so it can't be replaced: wait until it's included or leaves the mempool (it's valid until block {})", shield.valid_until);
     if tx.nonce > n || !last {
-        bail!("your shield (nonce {n}) is waiting in the mempool, and nothing queues behind a shield (so a full ghost share can always give it up for a higher tip): wait until it's included, or replace it with a shield at nonce {n} tipping at least {} drops", displacing_tip(shield.tip, hint));
+        let need = displacing_tip(shield.tip, hint);
+        let how = if need > cap(hint) { wait(cap(hint)) } else { format!("wait until it's included, or replace it with a shield at nonce {n} tipping at least {need} drops") };
+        bail!("your shield (nonce {n}) is waiting in the mempool, and nothing queues behind a shield (so a full ghost share can always give it up for a higher tip): {how}");
     }
     if !matches!(tx.action, Action::Shield { .. }) {
         bail!("only a shield replaces your queued shield (nonce {n}): wait until it's included, then send this at nonce {}", n + 1);
     }
     if !displaces(tx, TipRate::of(shield), relay) {
-        bail!("to replace your queued shield (nonce {n}), tip at least {} drops (and the fee to cover it)", displacing_tip(shield.tip, relay));
+        let need = displacing_tip(shield.tip, relay);
+        if need > cap(relay) {
+            bail!("your queued shield (nonce {n}) can't be replaced by this one: {}", wait(cap(relay)));
+        }
+        bail!("to replace your queued shield (nonce {n}), tip at least {need} drops (and the fee to cover it)");
     }
     Ok(())
 }
@@ -837,6 +849,8 @@ pub fn behind_shield(shield: &Tx, last: bool, tx: &Tx, relay: u64, hint: u64) ->
 /// Returns the ids it displaces, with why.
 pub fn mempool_admit(queued: &[Tx], ids: &[String], tx: &Tx, own: Option<usize>, relay: u64, cap: u64, evict: bool) -> Result<Vec<(String, &'static str)>> {
     let Some(b) = tx.action.ghost_bundle() else { return Ok(vec![]) };
+    // An unsigned tx tips a whole multiple of the grid (review of fix-fees-2).
+    let cap = if tx.is_unsigned() { cap / FEE_GRID * FEE_GRID } else { cap };
     let kept = |i: usize| Some(i) != own;
     // Each sender's last queued tx (arrival order is each sender's nonce order).
     let mut last: HashMap<&str, usize> = HashMap::new();
@@ -868,14 +882,16 @@ pub fn mempool_admit(queued: &[Tx], ids: &[String], tx: &Tx, own: Option<usize>,
                 bail!("your queued transaction with nonce {} already spends one of these notes", q.nonce);
             }
             if !displaces(tx, c, relay) {
+                // Never a tip past the cap (review of r3-consensus, as below).
+                if displacing_tip(c.tip, relay) > cap {
+                    bail!("a queued transaction already spends one of these notes, and it tips more than this one may (at most {cap} drops), so it can't be replaced at the current base fee: wait until it's included or leaves the mempool");
+                }
                 bail!("a queued transaction already spends one of these notes; to replace it, pay a tip of at least {} drops (its {} plus the relay of yours) and the fee to cover it", displacing_tip(c.tip, relay), c.tip);
             }
             replaces.push((id.clone(), "replaced by a transaction spending the same note with a higher tip"));
         }
     }
     if replaces.is_empty() && ghosts >= MAX_MEMPOOL_GHOST {
-        // An unsigned tx tips a whole multiple of the grid (review of fix-fees-2).
-        let cap = if tx.is_unsigned() { cap / FEE_GRID * FEE_GRID } else { cap };
         return match lowest {
             Some((c, id)) if evict && displaces(tx, c, relay) => Ok(vec![(id.clone(), "evicted from the mempool's full ghost share by a transaction with a higher tip")]),
             // Review of fix-fees: never ask for a tip past the cap.

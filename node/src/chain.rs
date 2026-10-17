@@ -3447,7 +3447,7 @@ impl Chain {
         let own = match (!unsigned).then(|| self.queued_shield(&sender)).flatten() {
             Some((i, last)) if tx.nonce >= self.mempool[i].nonce => {
                 let shield = &self.mempool[i];
-                crate::ghost::behind_shield(shield, last, &tx, relay, crate::econ::base_fee(&self.state, next, shield.size()))?;
+                crate::ghost::behind_shield(shield, last, &tx, relay, crate::econ::base_fee(&self.state, next, shield.size()), |base| crate::econ::max_tip(&self.state, base))?;
                 Some(i)
             }
             _ => None,

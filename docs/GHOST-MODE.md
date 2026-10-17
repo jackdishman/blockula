@@ -428,7 +428,10 @@ sender may replace it with its own shield at the same nonce, for a tip that disp
 replacement of a signed tx by its sender); wallets shield last, and send the account's next tx once the
 shield is in a block. Were a signed tx ever displaced with later txs of its sender behind it, they'd go
 with it and the newcomer would outbid them together. The refusal names the tip that gets in, unless
-that's past the newcomer's tip cap (for an unsigned tx, both on the fee grid).
+that's past the newcomer's tip cap (for an unsigned tx, both on the fee grid). Then it says to wait:
+a queued tx (a shield, or another spend of the same note) tipping so near its own cap that outbidding
+it takes more than the cap at the current base fee can't be replaced until the base fee rises, so its
+sender waits until it's included (it sorts near the top of proposals) or leaves the mempool.
 `POST /api/tx` takes the wire form as `application/octet-stream` (and JSON up to twice
 `MAX_GHOST_TX_BYTES`).
 
