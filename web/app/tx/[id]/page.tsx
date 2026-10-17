@@ -5,6 +5,7 @@ import { useParams } from "next/navigation";
 import { useEffect, useState, type ReactNode } from "react";
 import { Amount, ago, Hash, Loading, NotFound, Section, StatusPill, Term, useMe, useNow, Who } from "@/components/explorer/kit";
 import { Ledger, signerOf } from "@/components/explorer/Ledger";
+import { Copy } from "@/components/ui";
 import { nodeExplorer } from "@/lib/config";
 import { deltaFor, effectsOf, formatDrops, fromMySide, parseDrops, plainDrops } from "@/lib/explorer/ledger";
 import { type NodeError, useNode } from "@/lib/explorer/node";
@@ -140,6 +141,7 @@ export default function TxPage() {
           <StatusPill status={t.status} />
           {t.height != null && <span className="dim small">in block #{t.height.toLocaleString("en-US")}</span>}
           {t.memo && <span className="ledger-memo">“{t.memo}”</span>}
+          <ReceiptTools summary={fromMySide(t.summary, me)} />
         </div>
 
         <hr className="tear" />
@@ -191,6 +193,9 @@ export default function TxPage() {
             {fx.unseen && !(awarded != null && kind === "award_hunt") && <p className="card-note">{fx.unseen}</p>}
           </>
         )}
+        <p className="print-only small dim" style={{ marginTop: 18 }}>
+          {status.data?.chain_id ?? "Blockula"} · {typeof window === "undefined" ? "" : `${window.location.origin}${to.tx(t.id)}`} · printed {new Date(now).toLocaleString()}
+        </p>
       </section>
 
       <div className="cols">
@@ -281,7 +286,7 @@ export default function TxPage() {
           </p>
         </Section>
 
-        <div className="stack-lg">
+        <div className="stack-lg no-print">
           <TxActions t={t} />
           {sender.data && t.from && (
             <Section title={<>More from <Who who={t.from} me={me?.address} link={false} /></>} aside={<Link className="small" href={to.account(t.from.name && !/\s/.test(t.from.name) ? t.from.name : t.from.address)}>All →</Link>}>
@@ -291,6 +296,25 @@ export default function TxPage() {
         </div>
       </div>
     </main>
+  );
+}
+
+/** Keep a receipt: its link, the share sheet where there is one, or paper. */
+function ReceiptTools({ summary }: { summary: string }) {
+  const url = typeof window === "undefined" ? "" : window.location.href;
+  const share = typeof navigator !== "undefined" && typeof navigator.share === "function";
+  return (
+    <span className="receipt-tools no-print">
+      <Copy text={url} label="Copy link" />
+      {share && (
+        <button className="btn small ghost" onClick={() => navigator.share({ title: "Blockula receipt", text: summary, url }).catch(() => undefined)}>
+          Share…
+        </button>
+      )}
+      <button className="btn small ghost" onClick={() => window.print()}>
+        Print
+      </button>
+    </span>
   );
 }
 

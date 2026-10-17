@@ -6,16 +6,28 @@ import { useState } from "react";
 import { FlowChart, Meter } from "@/components/explorer/charts";
 import { Amount, Ext, Fang, Hash, Loading, NotFound, plural, Section, Stat, StatusPill, Term, useMe, whoText } from "@/components/explorer/kit";
 import { Ledger } from "@/components/explorer/Ledger";
+import { WatchButton } from "@/components/explorer/Watch";
 import { blocksToHuman, keyCode } from "@/lib/format";
 import { nodeExplorer } from "@/lib/config";
+import { activityCsv } from "@/lib/explorer/csv";
 import { bySigner, deltaFor, flowsOf, formatDrops, parseDrops } from "@/lib/explorer/ledger";
 import { useNode } from "@/lib/explorer/node";
 import { to } from "@/lib/explorer/routes";
-import type { AccountDetail, ChainStatus } from "@/lib/explorer/types";
+import type { AccountDetail, ChainStatus, TxDetail } from "@/lib/explorer/types";
 import type { KeyView } from "@/lib/types";
 import { useWallet } from "@/lib/wallet";
 
 type Filter = { by: "all" } | { by: "in" } | { by: "out" } | { by: "key"; key: string };
+
+/** Save transactions as a CSV file, amounts signed from `side`. */
+function downloadCsv(txs: TxDetail[], side: string, keys: AccountDetail["keys"], file: string) {
+  const url = URL.createObjectURL(new Blob([activityCsv(txs, side, keys)], { type: "text/csv;charset=utf-8" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `${file.replace(/[^\w.-]+/g, "_")}-activity.csv`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 
 export default function AccountPage() {
   const { id } = useParams<{ id: string }>();
@@ -86,6 +98,10 @@ export default function AccountPage() {
               Send to {name ?? "this address"}
             </Link>
           )}
+          {!yours && <WatchButton who={a.account} />}
+          <Link className="btn small ghost" href={to.trace(name ?? addr)}>
+            Follow the money
+          </Link>
           {yours && (
             <>
               <Link className="btn small primary" href="/send">Send</Link>
@@ -127,13 +143,31 @@ export default function AccountPage() {
                     {plural(flows.unseen, "of these", "of these")} also moved FANG the transaction itself doesn&apos;t record (a name&apos;s price, a bounty, a bond). Open one to see what&apos;s known.
                   </p>
                 )}
+                <Link className="small block" href={to.trace(name ?? addr)} style={{ marginTop: 10 }}>
+                  Follow these flows further, hop by hop →
+                </Link>
               </>
             ) : (
               <p className="ledger-empty">No FANG has moved in or out yet.</p>
             )}
           </Section>
 
-          <Section title="Activity" aside={<span className="dim small">newest first · {sealed.length < a.recent_txs.length ? `${a.recent_txs.length - sealed.length} pending · ` : ""}last {a.recent_txs.length}</span>}>
+          <Section
+            title="Activity"
+            aside={
+              <span className="dim small">
+                newest first · {sealed.length < a.recent_txs.length ? `${a.recent_txs.length - sealed.length} pending · ` : ""}last {a.recent_txs.length}
+                {shown.length > 0 && (
+                  <>
+                    {" · "}
+                    <button className="link small" onClick={() => downloadCsv(shown, addr, a.keys, name ?? addr)} title="Download these transactions as a spreadsheet, amounts exact and signed from this account's side">
+                      Export CSV
+                    </button>
+                  </>
+                )}
+              </span>
+            }
+          >
             <div className="filters" role="group" aria-label="Filter activity">
               {(["all", "in", "out"] as const).map((f) => (
                 <button key={f} className="filter" aria-pressed={filter.by === f} onClick={() => setFilter({ by: f })}>

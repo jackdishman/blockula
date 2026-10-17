@@ -6,6 +6,7 @@ import { explorer, NETWORK, NETWORKS, RPC, setNetwork, type NetworkKey } from "@
 import { isExplorerPath } from "@/lib/explorer/routes";
 import { useWallet } from "@/lib/wallet";
 import { CommandPalette, openPalette } from "./CommandPalette";
+import { Alerts } from "./explorer/Alerts";
 
 export function Header() {
   const { wallet, hint, lock } = useWallet();
@@ -71,6 +72,7 @@ export function Header() {
         </nav>
       </header>
       <CommandPalette />
+      <Alerts />
       {NETWORK.key === "custom" && (
         <div className="banner danger">
           <b>Custom node: {RPC}.</b> It controls what names resolve to and what balances you see. Only send money if you trust whoever runs it.{" "}

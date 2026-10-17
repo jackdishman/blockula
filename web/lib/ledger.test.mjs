@@ -109,3 +109,11 @@ test("formatting drops", () => {
   assert.equal(compactDrops(1n), "0.000000001");
   assert.equal(compactDrops(0n), "0");
 });
+
+test("a kind this explorer doesn't know is never reported as exact", () => {
+  const fx = effectsOf(tx({ kind: "shield", from: vlad, amount: String(F) }));
+  assert.match(fx.unseen, /doesn't know this kind/);
+  assert.equal(deltaFor(tx({ kind: "shield", from: vlad, amount: String(F) }), vlad.address).exact, false);
+  assert.equal(effectsOf(tx({ kind: "add_key", from: vlad })).unseen, null, "known kinds that move nothing stay exact");
+  assert.match(effectsOf(tx({ kind: "reject_claim", from: vlad })).unseen, /forfeited/);
+});

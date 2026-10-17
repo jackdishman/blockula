@@ -6,15 +6,17 @@ import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { ErrorNote, Spinner } from "@/components/ui";
 import { friendly } from "@/lib/errors";
-import { formatDrops, parseDrops } from "@/lib/explorer/ledger";
-import { nodeGet, submitTx } from "@/lib/explorer/node";
+import { checkTx } from "@/lib/explorer/check";
+import { formatDrops } from "@/lib/explorer/ledger";
+import { submitTx } from "@/lib/explorer/node";
+import type { Preflight } from "@/lib/explorer/preflight";
 import { type ActionSpec, type Param, signature, type Values } from "@/lib/explorer/programs";
 import { to } from "@/lib/explorer/routes";
-import type { NameDetail } from "@/lib/explorer/types";
 import { isKeyId, shortAddr } from "@/lib/format";
 import { unlockPasskey } from "@/lib/keys";
 import { useWallet } from "@/lib/wallet";
 import { Amount, Term } from "./kit";
+import { PreflightView } from "./PreflightView";
 
 const utf8 = (s: string) => new TextEncoder().encode(s).length;
 
@@ -75,12 +77,13 @@ export function useInlineUnlock() {
 interface Preview {
   tx: Tx;
   headline: string;
-  spends: bigint;
   /** Typed names resolved to the addresses actually signed. */
   resolved: { label: string; typed: string; address: string }[];
-  /** A cost the action has besides `spends` (a name's price). */
-  extra?: { what: string; drops: bigint };
+  /** What it will do, and whether the chain will take it. */
+  pf: Preflight;
+  blockMs: number;
 }
+
 
 /**
  * Any program action: typed fields, then a preview of the exact signed transaction (who signs,
@@ -129,15 +132,11 @@ export function ActionForm({ spec, initial = {}, fixed = [], compact = false }: 
         } else values[p.key] = v;
       }
       const st = (await client.status()) as { height: number; block_time_ms?: number };
-      const action = spec.build(values, { height: st.height, blockMs: st.block_time_ms || 1000 });
+      const blockMs = st.block_time_ms || 1000;
+      const action = spec.build(values, { height: st.height, blockMs });
       const tx = await wallet.build(action, String(raw.memo ?? "").trim());
-      let extra: Preview["extra"];
-      if (spec.kind === "register_name") {
-        const n = await nodeGet<NameDetail>(`/name/${encodeURIComponent(String(values.name))}`);
-        if (!n.available) throw new Error(`${n.name} is already taken`);
-        extra = { what: `${n.name}'s price, to the treasury`, drops: parseDrops(n.price) };
-      }
-      setPreview({ tx, headline: spec.describe(raw), spends: spec.spends?.(values) ?? 0n, resolved, extra });
+      const { pf } = await checkTx(tx, wallet.keyId);
+      setPreview({ tx, headline: spec.describe(raw), resolved, pf, blockMs });
     } catch (e) {
       setError(friendly(e));
     } finally {
@@ -174,7 +173,7 @@ export function ActionForm({ spec, initial = {}, fixed = [], compact = false }: 
   };
 
   const fee = preview ? BigInt(preview.tx.fee) : 0n;
-  const total = preview ? preview.spends + fee + (preview.extra?.drops ?? 0n) : 0n;
+  const refused = !!preview?.pf.refusals.length;
   return (
     <div className="action-body">
       {!compact && <p className="dim" style={{ margin: 0 }}>{spec.blurb}</p>}
@@ -246,20 +245,6 @@ export function ActionForm({ spec, initial = {}, fixed = [], compact = false }: 
                 </dd>
               </div>
             ))}
-            {preview.spends > 0n && (
-              <>
-                <dt>Moves</dt>
-                <dd>{formatDrops(preview.spends)}</dd>
-              </>
-            )}
-            {preview.extra && (
-              <>
-                <dt>Price</dt>
-                <dd>
-                  {formatDrops(preview.extra.drops)} <span className="dim small">{preview.extra.what}</span>
-                </dd>
-              </>
-            )}
             <dt>
               <Term k="fee">Fee</Term>
             </dt>
@@ -269,15 +254,16 @@ export function ActionForm({ spec, initial = {}, fixed = [], compact = false }: 
             <dt className="total">Total</dt>
             <dd className="total">
               <b>
-                <Amount drops={total} exact />
-              </b>
-              {account && BigInt(account.balance) < total && <span className="warn small block">More than this account&apos;s balance ({account.balance_display}).</span>}
+                <Amount drops={preview.pf.cost} exact />
+              </b>{" "}
+              <span className="dim small">leaves this account</span>
             </dd>
             <dt>
               <Term k="nonce" />
             </dt>
             <dd>{preview.tx.nonce}</dd>
           </dl>
+          <PreflightView p={preview.pf} me={wallet.account} blockMs={preview.blockMs} />
           <details className="raw">
             <summary>The exact transaction you&apos;ll sign</summary>
             <pre>{JSON.stringify({ ...preview.tx, public_key: `${preview.tx.public_key.slice(0, 24)}…`, signature: `${preview.tx.signature.slice(0, 24)}… (${preview.tx.signature.length / 2} bytes)` }, null, 2)}</pre>
@@ -286,8 +272,8 @@ export function ActionForm({ spec, initial = {}, fixed = [], compact = false }: 
             <button className="btn" disabled={!!busy} onClick={() => setPreview(null)}>
               ← Edit
             </button>
-            <button className="btn primary grow" disabled={!!busy} onClick={send}>
-              {busy === "send" ? <Spinner>Sending…</Spinner> : "Sign & send"}
+            <button className={`btn grow ${refused ? "" : "primary"}`} disabled={!!busy} onClick={send}>
+              {busy === "send" ? <Spinner>Sending…</Spinner> : refused ? "Sign & send anyway" : "Sign & send"}
             </button>
           </div>
         </div>

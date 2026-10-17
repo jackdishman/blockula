@@ -4,11 +4,14 @@ import { formatFang, isAddress, parseFang, type Tx } from "@blockula/sdk";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
+import { PreflightView } from "@/components/explorer/PreflightView";
 import { RequireWallet } from "@/components/Gate";
 import { Apparition } from "@/components/Haunt";
 import { ErrorNote, ExplorerLink, Spinner, Tip } from "@/components/ui";
 import { explorer } from "@/lib/config";
 import { friendly } from "@/lib/errors";
+import { checkTx } from "@/lib/explorer/check";
+import type { Preflight } from "@/lib/explorer/preflight";
 import { shortAddr } from "@/lib/format";
 import type { NameView, TxView } from "@/lib/types";
 import { useUnlocked } from "@/lib/wallet";
@@ -69,7 +72,7 @@ function Send() {
   const [amount, setAmount] = useState(params.get("amount") ?? "");
   const [memo, setMemo] = useState(params.get("memo") ?? "");
   const prefilled = params.has("to") || params.has("amount") || params.has("memo");
-  const [review, setReview] = useState<{ tx: Tx; display: string } | null>(null);
+  const [review, setReview] = useState<{ tx: Tx; display: string; pf: Preflight | null; blockMs: number } | null>(null);
   const [sent, setSent] = useState<TxView | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -97,7 +100,9 @@ function Send() {
     try {
       // Build and sign now so the fee shown is exactly what will be paid.
       const tx = await wallet.build({ type: "transfer", to: recipient.address, amount: drops.toString() }, memo);
-      setReview({ tx, display: recipient.display });
+      // What it will do and whether the chain will take it; the review still works without it.
+      const check = await checkTx(tx, wallet.keyId).catch(() => null);
+      setReview({ tx, display: recipient.display, pf: check?.pf ?? null, blockMs: check?.blockMs ?? 1000 });
     } catch (e) {
       setError(friendly(e));
     } finally {
@@ -170,14 +175,15 @@ function Send() {
               </>
             )}
           </dl>
+          {review.pf && <PreflightView p={review.pf} me={wallet.account} blockMs={review.blockMs} />}
         </section>
         <Tip>
           The fee is priced by size: post-quantum signatures are about 3.3 KB, so every transaction pays a little for its bytes, and that fee is destroyed rather than paid to anyone.
         </Tip>
         <div className="row-gap">
           <button className="btn" disabled={busy} onClick={() => setReview(null)}>← Edit</button>
-          <button className="btn primary grow" disabled={busy} onClick={confirm}>
-            {busy ? <Spinner>Sealing into a block…</Spinner> : "Confirm & send"}
+          <button className={`btn grow ${review.pf?.refusals.length ? "" : "primary"}`} disabled={busy} onClick={confirm}>
+            {busy ? <Spinner>Sealing into a block…</Spinner> : review.pf?.refusals.length ? "Send anyway" : "Confirm & send"}
           </button>
         </div>
         <ErrorNote error={error} />

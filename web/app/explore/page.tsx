@@ -5,6 +5,7 @@ import { useEffect, useRef } from "react";
 import { Bars, Cadence, Ribbon } from "@/components/explorer/charts";
 import { Fang, Section, Stat, Term, useMe, useNow, Who, whoText, plural } from "@/components/explorer/kit";
 import { Ledger } from "@/components/explorer/Ledger";
+import { WatchingList } from "@/components/explorer/Watch";
 import { type NodeError, useNode } from "@/lib/explorer/node";
 import { usePulse, useRecentTxs } from "@/lib/explorer/pulse";
 import { to } from "@/lib/explorer/routes";
@@ -153,6 +154,7 @@ export default function ExplorePage() {
           </Section>
         </div>
         <div className="stack-lg">
+          <WatchingList />
           <Section title="Block cadence" aside={<span className="dim small">seconds between blocks</span>}>
             <Cadence blocks={blocks} targetMs={blockMs} />
             <p className="card-note">The target is {(blockMs / 1000).toLocaleString("en-US")}s. Spikes mean a round needed a new leader or a validator was slow to vote.</p>

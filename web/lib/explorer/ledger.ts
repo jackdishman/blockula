@@ -59,7 +59,18 @@ const UNSEEN: Record<string, string> = {
   unvouch: "The vouch bond was returned to the voucher (or the vouch was declined).",
   unbond: "The validator bond was returned to its owner.",
   clawback: "Unvested rewards were clawed back into the pool.",
+  attest_claim: "If this attestation settled the claim, its bond went back to the claimant or into the pool.",
+  reject_claim: "The claim's bond was forfeited to the contribution pool.",
+  flag_sybil: "The flagged account's bonds and unvested rewards went to the contribution pool, and so did the bond of whoever vouched for it.",
 };
+
+/** Kinds whose fields show everything they move (besides those above). */
+const COMPLETE = new Set(["transfer", "fund_pool", "add_key", "remove_key", "register_familiar", "link_github", "unlink_github", "approve_validator", "remove_validator", "set_repo", "grant_soul", "commit_votes", "reveal_votes", ...Object.keys(ESCROW)]);
+
+/** A kind newer than this explorer (a later protocol version) may move FANG in ways it can't read. */
+const UNKNOWN = "This explorer doesn't know this kind of transaction yet, so it may have moved FANG in ways not shown here.";
+
+const unseenOf = (kind: string) => UNSEEN[kind] ?? (COMPLETE.has(kind) ? null : UNKNOWN);
 
 const big = (s: string | null | undefined) => (s && /^\d+$/.test(s) ? BigInt(s) : 0n);
 
@@ -85,7 +96,7 @@ export function effectsOf(tx: TxDetail): Effects {
   } else {
     changes.push({ who: tx.from, delta: -fee, why: "fee" });
   }
-  return { changes, burned: fee, unseen: UNSEEN[kind] ?? null, pending };
+  return { changes, burned: fee, unseen: unseenOf(kind), pending };
 }
 
 export type Direction = "in" | "out" | "self" | "none";

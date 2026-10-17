@@ -181,6 +181,8 @@ export interface ContributionProfile {
   vouching_for: { account: Label }[];
   rewards: { total_display: string; withdrawable: string; withdrawable_display: string; unvested_display: string };
   sybil: { by: Label; reason: string } | null;
+  /** The bond the account's next claim will hold (it grows with open claims). */
+  next_claim_bond?: string;
 }
 
 export interface AccountDetail {

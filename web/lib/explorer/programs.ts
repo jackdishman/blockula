@@ -45,8 +45,6 @@ export interface ActionSpec {
   build(v: Values, ctx: Ctx): Action;
   /** The preview's first line, from the inputs as typed. */
   describe(raw: Record<string, string>): string;
-  /** Drops leaving the account besides the fee (a bounty, a bond). */
-  spends?(v: Values): bigint;
 }
 
 export interface Program {
@@ -91,7 +89,6 @@ export const PROGRAMS: Program[] = [
         ],
         build: (v) => ({ type: "transfer", to: String(v.to), amount: fang(v, "amount") }),
         describe: (r) => `Send ${r.amount || "…"} FANG to ${r.to || "…"}`,
-        spends: (v) => BigInt(v.amount),
       },
       {
         kind: "register_familiar",
@@ -155,7 +152,6 @@ export const PROGRAMS: Program[] = [
         ],
         build: (v, ctx) => ({ type: "create_hunt", repo: String(v.repo), issue: Number(v.issue), amount: fang(v, "amount"), expires_at: ctx.height + blocksOf(Number(v.days), ctx.blockMs), title: String(v.title) }),
         describe: (r) => `Put ${r.amount || "…"} FANG on ${r.repo || "…"}#${r.issue || "…"}`,
-        spends: (v) => BigInt(v.amount),
       },
       {
         kind: "fund_hunt",
@@ -169,7 +165,6 @@ export const PROGRAMS: Program[] = [
         ],
         build: (v) => ({ type: "fund_hunt", hunt_id: Number(v.hunt_id), amount: fang(v, "amount") }),
         describe: (r) => `Add ${r.amount || "…"} FANG to hunt #${r.hunt_id || "…"}`,
-        spends: (v) => BigInt(v.amount),
       },
       {
         kind: "award_hunt",
@@ -219,7 +214,6 @@ export const PROGRAMS: Program[] = [
         params: [{ key: "amount", label: "Amount", type: "fang" }],
         build: (v) => ({ type: "fund_pool", amount: fang(v, "amount") }),
         describe: (r) => `Give ${r.amount || "…"} FANG to the contribution pool`,
-        spends: (v) => BigInt(v.amount),
       },
       {
         kind: "link_github",
@@ -256,7 +250,6 @@ export const PROGRAMS: Program[] = [
         params: [{ key: "account", label: "Newcomer", type: "account" }],
         build: (v) => ({ type: "vouch", account: String(v.account) }),
         describe: (r) => `Vouch for ${r.account || "…"}`,
-        spends: () => 10_000_000_000n,
       },
       {
         kind: "join_jury",
@@ -267,7 +260,6 @@ export const PROGRAMS: Program[] = [
         params: [{ key: "bond", label: "Bond", type: "fang", initial: "10" }],
         build: (v) => ({ type: "join_jury", bond: fang(v, "bond") }),
         describe: (r) => `Join the jury pool with a ${r.bond || "…"} FANG bond`,
-        spends: (v) => BigInt(v.bond),
       },
       {
         kind: "withdraw_vested",

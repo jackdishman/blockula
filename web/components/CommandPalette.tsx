@@ -102,6 +102,7 @@ export function CommandPalette() {
         if (hit.type === "account") {
           out.push({ id: "acct", group: "On the chain", label: hit.id, hint: "account", href: searchHref(hit) });
           if (known && /\.boo$/.test(hit.id)) out.push({ id: "pay", group: "Do", label: `Send FANG to ${hit.id}`, hint: "send", href: `/send?to=${encodeURIComponent(hit.id)}` });
+          out.push({ id: "trace", group: "Do", label: `Follow the money around ${/\.boo$/.test(hit.id) ? hit.id : `${hit.id.slice(0, 12)}…`}`, hint: "trace", href: to.trace(hit.id) });
         } else if (hit.type === "name") {
           const n = await nodeGet<NameDetail>(`/name/${encodeURIComponent(hit.id)}`).catch(() => null);
           out.push({ id: "name", group: "On the chain", label: n?.name ?? `${hit.id}.boo`, hint: n?.available ? `unclaimed · ${n.price_display ?? ""}` : "name", href: to.name(hit.id) });
@@ -132,7 +133,12 @@ export function CommandPalette() {
             { id: "dev", group: "Wallet", label: "Devices & agents", href: "/devices" },
           ]
         : []),
-      ...(myPage ? [{ id: "me", group: "Wallet", label: "My account, as the chain sees it", href: to.account(myPage) }] : []),
+      ...(myPage
+        ? [
+            { id: "me", group: "Wallet", label: "My account, as the chain sees it", href: to.account(myPage) },
+            { id: "mytrace", group: "Wallet", label: "Follow my money", href: to.trace(myPage) },
+          ]
+        : []),
       { id: "pulse", group: "Explore", label: "The pulse: live blocks", href: to.explore() },
       { id: "programs", group: "Explore", label: "Programs", href: to.programs() },
       { id: "hunts", group: "Explore", label: "Hunts (bounties)", href: to.program("hunts") },
