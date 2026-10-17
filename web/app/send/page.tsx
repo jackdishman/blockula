@@ -26,7 +26,8 @@ export default function SendPage() {
 type Recipient =
   | { state: "empty" }
   | { state: "checking" }
-  | { state: "ok"; address: string; display: string; detail: string; proven?: boolean }
+  /** `signed`: what goes in the transfer; `byChain`: it's the name, and `address` only the node's current answer. */
+  | { state: "ok"; signed: string; address: string; display: string; detail: string; proven?: boolean; byChain?: boolean }
   | { state: "bad"; msg: string };
 
 const utf8Len = (s: string) => new TextEncoder().encode(s).length;
@@ -44,19 +45,19 @@ function useRecipient(input: string): Recipient {
     if (q.startsWith(`${hrp}1`)) {
       if (!isAddress(q)) return setR({ state: "bad", msg: "That address doesn't look right. Check for typos." });
       const label = status?.validator.address === q ? "the validator" : "an address";
-      return setR({ state: "ok", address: q, display: shortAddr(q), detail: label, proven: true });
+      return setR({ state: "ok", signed: q, address: q, display: shortAddr(q), detail: label, proven: true });
     }
     setR({ state: "checking" });
     let live = true;
     const t = setTimeout(async () => {
       try {
-        // Proven against the network's witnesses when it has some; otherwise the node's word,
-        // and the check line says so (audit gap-7-1). The short form shown is computed from the
-        // address that gets signed, never taken from the node's answer.
-        const res = await client.resolution(q);
+        // With the network's witnesses the name's proven owner is signed. Without them the name
+        // itself is signed, and the chain pays whoever owns it when the transfer runs, so the node
+        // can't redirect it; what it says the owner is, is shown as just that (audit gap-7-1).
+        const res = await client.recipient(q);
         if (!live) return;
-        const proof = res.proven ? `proven by ${client.witnesses.length} other node${client.witnesses.length === 1 ? "" : "s"}` : "as your node reports it (not proven)";
-        setR({ state: "ok", address: res.address, display: `${res.name}.boo`, detail: `${shortAddr(res.address)} · ${proof}`, proven: res.proven });
+        const detail = res.byChain ? `the chain pays its owner when this runs · your node says ${shortAddr(res.address)} (not proven)` : `${shortAddr(res.address)} · proven by ${client.witnesses.length} other node${client.witnesses.length === 1 ? "" : "s"}`;
+        setR({ state: "ok", signed: res.signed, address: res.address, display: `${res.name}.boo`, detail, proven: res.proven, byChain: res.byChain });
       } catch (e) {
         if (live) setR({ state: "bad", msg: friendly(e) });
       }
@@ -76,7 +77,7 @@ function Send() {
   const [amount, setAmount] = useState(params.get("amount") ?? "");
   const [memo, setMemo] = useState(params.get("memo") ?? "");
   const prefilled = params.has("to") || params.has("amount") || params.has("memo");
-  const [review, setReview] = useState<{ tx: Tx; display: string; proven: boolean } | null>(null);
+  const [review, setReview] = useState<{ tx: Tx; display: string; proven: boolean; byChain: boolean; nodeSays: string } | null>(null);
   const [sent, setSent] = useState<TxView | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -103,8 +104,8 @@ function Send() {
     setError(null);
     try {
       // Build and sign now so the fee shown is exactly what will be paid.
-      const tx = await wallet.build({ type: "transfer", to: recipient.address, amount: drops.toString() }, memo);
-      setReview({ tx, display: recipient.display, proven: recipient.proven === true });
+      const tx = await wallet.build({ type: "transfer", to: recipient.signed, amount: drops.toString() }, memo);
+      setReview({ tx, display: recipient.display, proven: recipient.proven === true, byChain: recipient.byChain === true, nodeSays: recipient.address });
     } catch (e) {
       setError(friendly(e));
     } finally {
@@ -161,9 +162,14 @@ function Send() {
             <dt>To</dt>
             <dd>
               {review.display}
-              {/* Always show the exact address being signed, not just the name. */}
-              <div className="mono small break">{review.tx.action.type === "transfer" ? review.tx.action.to : ""}</div>
-              {!review.proven && <div className="warn small">Looked up on your node only, not proven. For a large payment, check this address with the person you&apos;re paying.</div>}
+              {/* Always show exactly what's signed: the address, or the name the chain resolves. */}
+              <div className="mono small break" data-testid="signed-to">{review.tx.action.type === "transfer" ? review.tx.action.to : ""}</div>
+              {review.byChain && (
+                <div className="small" data-testid="by-chain">
+                  Signed as the name: the chain pays whoever owns {review.display} when this transaction runs, so no node can send it elsewhere. Your node says that&apos;s <span className="mono break">{review.nodeSays}</span> (not proven).
+                </div>
+              )}
+              {!review.proven && !review.byChain && <div className="warn small">Looked up on your node only, not proven. For a large payment, check this address with the person you&apos;re paying.</div>}
             </dd>
             <dt>Amount</dt>
             <dd>{formatFang(amt)}</dd>
@@ -236,7 +242,7 @@ function Send() {
       <Tip>
         {client.witnesses.length
           ? <>Names are proven against {client.witnesses.length + 1} independent nodes before you sign, and the review shows the exact address that gets paid.</>
-          : <>Names are looked up on the node you&apos;re connected to, which could point one anywhere. The review shows the exact address that gets paid: for a large payment, check it with the person you&apos;re paying.</>}
+          : <>A name is signed as the name: the chain pays whoever owns it when the transaction runs, so the node you&apos;re connected to can&apos;t point it at someone else. The review shows exactly what gets signed.</>}
       </Tip>
     </main>
   );

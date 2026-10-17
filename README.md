@@ -81,8 +81,8 @@ blockula contrib link-github vlad <gist id>       # once
 blockula contrib claim jackdishman/blockula 34    # after the PR merges
 blockula contrib status                           # the pool, its repos, the open Séance
 blockula contrib join-jury                        # jurors need 5 Soul and bond 10 FANG
-blockula contrib seance                           # your assigned pairs, with PR links
-blockula contrib vote 2 --votes ab=a --spam 17    # seal, then later:
+blockula contrib seance                           # your assigned pairs, with PR links and their digest
+blockula contrib vote 2 --votes ab=a --spam 17 --digest <pairs digest>   # seal exactly those pairs, then later:
 blockula contrib reveal 2
 blockula contrib withdraw                         # vested rewards
 ```

@@ -3,6 +3,7 @@
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { MAINNET_GENESIS, MAINNET_RPC } from "./env";
+import { addressOf } from "./mock-node";
 import { createWallet, expect, test } from "./helpers";
 
 test("defaults to mainnet, pinned to blockula-1, with a plain badge", async ({ page, request }) => {
@@ -84,4 +85,24 @@ test("a mainnet build refuses an rpId it doesn't own, and missing pins", () => {
   expect(load({ ...good, NEXT_PUBLIC_MAINNET_RPC: "" }).stderr).toContain("NEXT_PUBLIC_MAINNET_RPC is unset");
   // Test chains build without any of it.
   expect(load({ NEXT_PUBLIC_NETWORK: "" }).status).toBe(0);
+});
+
+// Audit gap-7-1: linking a device signs its consent to one address. On mainnet without witnesses
+// a name is the node's word, so the address waits for the user to check it on their other device.
+test("linking by name on mainnet waits for the address to be checked", async ({ page, node }) => {
+  const account = addressOf("a1".repeat(32));
+  node.names.set("alice", account);
+  await page.goto("/link");
+  await page.getByRole("button", { name: "Create a passkey for this device" }).click();
+  await page.getByPlaceholder("yourname.boo or boo1…").fill("alice.boo");
+  await page.getByRole("button", { name: "Make this device's grant code" }).click();
+  const check = page.getByTestId("check-address");
+  await expect(check).toContainText(account);
+  const go = check.getByRole("button", { name: "It matches: make the grant code" });
+  await expect(go).toBeDisabled();
+  await expect(page.getByText("This device's grant code")).toHaveCount(0);
+  await check.getByRole("checkbox").check();
+  await go.click();
+  await expect(page.getByText("This device's grant code")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Almost there" })).toBeVisible();
 });
