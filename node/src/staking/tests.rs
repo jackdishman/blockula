@@ -612,10 +612,24 @@ fn slashing_reads_only_the_validators_own_entries() {
     add_entry(&mut t.st, &mut j, &d, at(EPOCH, &v0));
     add_entry(&mut t.st, &mut j, &d, at(EPOCH + 1, &v0));
     t.st.j_mint(&mut j, 3_003_000 * FANG); // the entries' escrow
+    // And v0 entries the index doesn't list (as no real state has them): a slash that scanned
+    // every entry for v0's would cut them too.
+    let hidden: Vec<String> = (0..3u64).map(|i| ekey(&keys(251).address(), i + 1_000_000)).collect();
+    for k in &hidden {
+        t.st.staking.entries.insert(k.clone(), at(EPOCH + 2, &v0));
+    }
     let mut s = Journal::default();
+    let read = crate::state::tmap::visits();
     let cut = slash(&mut t.st, &mut s, &v0, EPOCH, None, false, 500);
-    assert_eq!(cut.total, 100 * FANG, "5% of the two entries since the epoch began");
-    assert_eq!(s.staking.entries.touched().count(), 2, "only those two were read and written");
+    // The records its reads walked through (every map's): a scan of the entries or of the index
+    // would walk thousands.
+    let walked = crate::state::tmap::visits() - read;
+    assert!(walked <= 4, "the slash walked {walked} records, not just v0's two");
+    assert_eq!(cut.total, 100 * FANG, "5% of the two entries since the epoch began, through the index alone");
+    assert_eq!(s.staking.entries.touched().count(), 2, "only those two were written");
+    for k in &hidden {
+        t.st.staking.entries.remove(k);
+    }
     t.st.j_burn(&mut j, cut.total);
     t.st.check_invariants().unwrap();
     // Within a window [since, until): just the one in between.
@@ -1620,4 +1634,278 @@ fn the_bootstrap_delegation_doesnt_entrench_the_set() {
     assert!(set.contains(&nk.address()) && set.contains(&vaddr(3)) && set.len() == 5, "{set:?}");
     // And it backs the newcomer from the next boundary on.
     assert!(delegation_value(&t.st, &t.st.bootstrap(), &nk.address()) > 200_000 * FANG);
+}
+
+// ------------------------------------------------------------------- audit, second round
+
+/// Mints `amount` and credits it to `v`'s pool as one reward (what `distribute_rewards` does for
+/// each pool).
+fn reward(t: &mut T, v: &str, amount: u64) {
+    let mut j = Journal::default();
+    t.st.j_mint(&mut j, amount);
+    let height = t.height;
+    let _ = height;
+    credit_reward(&mut t.st, &mut j, v, amount);
+}
+
+/// Sets validator `v`'s stored commission directly (genesis can't go past the cap; the tests
+/// that need a validator above it start there).
+fn set_commission(t: &mut T, v: &str, bps: u64) {
+    let mut j = Journal::default();
+    t.st.validator_mut(&mut j, v).unwrap().commission_bps = bps;
+    let p = pool_mut(&mut t.st, &mut j, v).unwrap();
+    p.commission_base = bps;
+}
+
+/// Registers a validator for `owner` with consensus key seed `seed` and self-bond `bond`.
+fn register(t: &mut T, owner: &Keys, seed: u8, bond: u64) -> String {
+    let k = keys(seed);
+    let (p2p, http) = (format!("127.0.0.1:{}", 9000 + seed as u16), format!("127.0.0.1:{}", 9500 + seed as u16));
+    let pop = crate::chain::make_pop([seed; 32], CHAIN, &owner.address(), &p2p, &http);
+    t.ok(owner, Action::RegisterValidator { consensus_key: hex::encode(k.public_key()), p2p_addr: p2p, http_addr: http, bond, pop });
+    k.address()
+}
+
+/// Audit xcut-economic-1 (the rest of F03's unrealized-gains case): what a still-vesting
+/// account's stake earned and hasn't sold doesn't vote before the cliff, just as it doesn't
+/// move: its delegations count at cost. The quorum base is what every account could vote with.
+#[test]
+fn unrealized_gains_on_locked_stake_dont_vote() {
+    let founder = keys(212);
+    let mut t = Setup { accounts: vec![(founder.address(), 1_000_000 * FANG, Some(Vesting { start: 0, cliff: 10_000, end: 20_000 }))], params: vec![("insider_delegation_cap_bps", 10_000)], ..Default::default() }.start();
+    let (f, v) = (founder.address(), vaddr(0));
+    t.ok(&founder, Action::Delegate { validator: v.clone(), amount: 900_000 * FANG });
+    assert_eq!(crate::econ::voting_balance(&t.st, &f, t.height), 0, "nothing vested");
+    reward(&mut t, &v, 500_000 * FANG);
+    let gain = delegation_value(&t.st, &f, &v) - 900_000 * FANG;
+    assert!(gain > 400_000 * FANG, "{gain}");
+    assert_eq!(crate::econ::voting_balance(&t.st, &f, t.height), 0, "unrealized gains on locked stake don't vote");
+    let mut j = Journal::default();
+    assert!(crate::econ::lock(&mut t.st, &mut j, &f, "vote:0".into(), FANG, 100, t.height).is_err());
+    // The quorum base counts exactly what accounts could vote with.
+    let system = [t.st.treasury(), t.st.bootstrap(), t.st.pool(), crate::chain::endowment("boo"), crate::chain::community("boo")];
+    let votable: u128 = t.st.accounts.keys().filter(|a| !system.contains(*a)).map(|a| crate::econ::voting_balance(&t.st, a, t.height) as u128).sum();
+    assert_eq!(crate::governance::unlocked_supply(&t.st, t.height), votable);
+    assert_eq!(crate::governance::unlocked_supply_by_walk(&t.st, t.height), votable);
+    // Sold, the gain joins the vesting lock: still nothing votes before the cliff.
+    let shares = t.shares(&f, &v) as u64;
+    t.ok(&founder, Action::Undelegate { validator: v.clone(), shares });
+    assert_eq!(crate::econ::voting_balance(&t.st, &f, t.height), 0);
+    t.block();
+}
+
+/// Audit gap-5-1 / gap-6-2: a lowered `commission_max_bps` binds every validator at once (rewards
+/// are charged at most the cap), and a validator above it may step down to it in one
+/// `UpdateValidator`, changing its addresses with it.
+#[test]
+fn a_lowered_commission_cap_binds_every_validator_at_once() {
+    let alice = keys(200);
+    let mut t = Setup { accounts: vec![(alice.address(), 100_000 * FANG, None)], ..Default::default() }.start();
+    let (v, o) = (vaddr(0), owner(0));
+    t.ok(&alice, Action::Delegate { validator: v.clone(), amount: 10_000 * FANG });
+    let mut j = Journal::default();
+    t.st.exec_set_param(&mut j, "commission_max_bps", 500).unwrap();
+    // Alice holds half of the pool: half of a 20,000 FANG reward, less 5% (not 10%).
+    let before = delegation_value(&t.st, &alice.address(), &v);
+    reward(&mut t, &v, 20_000 * FANG);
+    let gain = delegation_value(&t.st, &alice.address(), &v) - before;
+    assert!((9_500 * FANG - 2..=9_500 * FANG).contains(&gain), "{gain}");
+    let set = |bps, p2p: &str| Action::UpdateValidator { commission_bps: bps, p2p_addr: p2p.into(), http_addr: String::new() };
+    assert!(t.fails(&o, set(600, "")).contains("at most 5%"));
+    // From 10% down to the 5% cap in one step, with a new address.
+    t.ok(&o, set(500, "10.0.0.1:30303"));
+    assert_eq!((t.st.validators[&v].commission_bps, t.st.validators[&v].p2p_addr.as_str()), (500, "10.0.0.1:30303"));
+    t.ok(&o, set(400, ""));
+    assert!(t.fails(&o, set(300, "")).contains("at most 1 points per epoch"), "then the step applies again");
+    t.block();
+}
+
+/// Audit gap-6-4: lowering `downtime_max_missed` doesn't jail a validator for misses it made
+/// while they were within the old limit: the rings start afresh, as for a new window.
+#[test]
+fn lowering_downtime_max_missed_judges_only_later_misses() {
+    let mut t = Setup { params: vec![("downtime_window", 20), ("downtime_max_missed", 10)], ..Default::default() }.start();
+    t.block();
+    let victim = t.leader(t.epoch, t.view + 1);
+    assert_eq!(t.starve(&victim, 4), 4);
+    assert!(t.st.staking.pools[&victim].jail.is_none());
+    let mut j = Journal::default();
+    t.st.exec_set_param(&mut j, "downtime_max_missed", 2).unwrap();
+    // It leads its next slot: not jailed for the 4 misses the old limit allowed.
+    loop {
+        let epoch = t.st.params.epoch_of(t.height);
+        let view = if epoch != t.epoch { 1 } else { t.view + 1 };
+        let led = t.leader(epoch, view) == victim;
+        t.block();
+        if led {
+            break;
+        }
+    }
+    assert!(t.st.staking.pools[&victim].jail.is_none(), "jailed for misses within the old limit");
+    // The new limit judges what it misses from now on.
+    t.starve(&victim, 3);
+    assert!(t.st.staking.pools[&victim].jail.is_some());
+}
+
+/// Audit xcut-economic-3: locked stake pays no commission to the owner of the pool it's in (a
+/// vesting account could otherwise route its rewards, liquid, to a 100%-commission validator it
+/// chose): that part of the commission goes to the treasury.
+#[test]
+fn locked_stake_pays_no_liquid_commission() {
+    let founder = keys(213);
+    let mut t = Setup { accounts: vec![(founder.address(), 1_000_000 * FANG, Some(Vesting { start: 0, cliff: 10_000, end: 20_000 }))], params: vec![("insider_delegation_cap_bps", 10_000)], ..Default::default() }.start();
+    let (f, v, o, treasury) = (founder.address(), vaddr(0), owner(0).address(), t.st.treasury());
+    set_commission(&mut t, &v, 10_000);
+    t.ok(&founder, Action::Delegate { validator: v.clone(), amount: 990_000 * FANG });
+    let (owner_before, founder_before, treasury_before) = (delegation_value(&t.st, &o, &v), delegation_value(&t.st, &f, &v), t.balance(&treasury));
+    reward(&mut t, &v, 100_000 * FANG);
+    // The owner's own 1% earns it its part; the founder's 99% pays the treasury, not the owner.
+    let owner_gain = delegation_value(&t.st, &o, &v) - owner_before;
+    assert!(owner_gain <= 1_000 * FANG, "{owner_gain}");
+    assert!((99_000 * FANG - 2..=99_000 * FANG).contains(&(t.balance(&treasury) - treasury_before)), "{}", t.balance(&treasury) - treasury_before);
+    assert!(delegation_value(&t.st, &f, &v) <= founder_before);
+    t.block();
+}
+
+/// Audit F12 (rest) / review-fix-gov-1: the bootstrap delegation pays at most
+/// `bootstrap_commission_cap_bps` of its rewards in commission; a target charging more sends the
+/// excess to the treasury.
+#[test]
+fn the_bootstrap_delegation_pays_at_most_the_capped_commission() {
+    let mut t = bootstrap_chain(Setup::default(), 1_200_000 * FANG);
+    let (boot, treasury, v) = (t.st.bootstrap(), t.st.treasury(), vaddr(0));
+    t.finish_epoch();
+    assert_eq!(delegation_value(&t.st, &boot, &v), 400_000 * FANG);
+    set_commission(&mut t, &v, 10_000);
+    let (o, cap) = (owner(0).address(), 1_000u64);
+    assert_eq!(cap, 1_000);
+    let (bond, treasury_before) = (self_bond(&t.st, &v), t.balance(&treasury));
+    reward(&mut t, &v, 41_000 * FANG);
+    t.finish_epoch();
+    // 40,000 of the reward is the bootstrap's (400k of 410k): 10% to the operator, the rest to the
+    // treasury; the operator's own 1,000 at its own 100%.
+    let to_treasury = t.balance(&treasury) - treasury_before;
+    assert!((36_000 * FANG - 5..=36_000 * FANG).contains(&to_treasury), "{to_treasury}");
+    let gained = delegation_value(&t.st, &o, &v) - bond;
+    assert!((5_000 * FANG - 5..=5_000 * FANG).contains(&gained), "{gained}");
+}
+
+/// A chain whose `founder` account is in `bootstrap_excluded` (the founder's and the
+/// foundation's accounts).
+fn chain_with_excluded(setup: Setup, excluded: Vec<String>) -> T {
+    let mut g = setup.genesis();
+    g.bootstrap_excluded = excluded;
+    g.bootstrap_excluded.sort();
+    g.check().unwrap();
+    T { st: without_issuance(g.initial_state()), height: 1, epoch: 0, view: 0, skip: 0, skipped: vec![], tx_bytes: 0 }
+}
+
+/// Audit xcut-economic-2: locked insider stake can't take over seats, however many pools it
+/// spreads over. Stake of an account with unvested tokens counts toward ranking only in a pool
+/// it owns, such an owner holds at most one seat, and the founder's and the foundation's
+/// accounts (`bootstrap_excluded`) together hold at most 2 seats and fewer than f.
+#[test]
+fn locked_insider_stake_cant_take_over_seats() {
+    let (founder, grantee, friend) = (keys(214), keys(215), keys(216));
+    let vest = Some(Vesting { start: 0, cliff: 10_000, end: 20_000 });
+    let setup = Setup {
+        validators: vec![100_000 * FANG; 7],
+        accounts: vec![(founder.address(), 50_000_000 * FANG, vest.clone()), (grantee.address(), 50_000_000 * FANG, vest), (friend.address(), 10_000 * FANG, None)],
+        params: vec![("max_validators", 7), ("insider_delegation_cap_bps", 10_000)],
+        ..Default::default()
+    };
+    let mut t = chain_with_excluded(setup, vec![founder.address()]);
+    let mine: Vec<String> = (60..63).map(|s| register(&mut t, &founder, s, 3_000_000 * FANG)).collect();
+    let theirs: Vec<String> = (63..66).map(|s| register(&mut t, &grantee, s, 3_000_000 * FANG)).collect();
+    // A friend's pool, backed by the grantee's locked tokens.
+    let friendly = register(&mut t, &friend, 66, 1_000 * FANG);
+    t.ok(&grantee, Action::Delegate { validator: friendly.clone(), amount: 10_000_000 * FANG });
+    for _ in 0..6 {
+        t.finish_epoch();
+    }
+    let set = t.set(t.epoch + 1);
+    let count = |vs: &[String]| set.iter().filter(|v| vs.contains(v)).count();
+    assert_eq!(set.len(), 7);
+    assert!(count(&mine) <= 1, "the founder holds {} of {set:?} (f = 2)", count(&mine));
+    assert!(count(&theirs) <= 1, "the grantee holds {} seats", count(&theirs));
+    assert!(!set.contains(&friendly), "locked stake in someone else's pool doesn't rank it");
+    assert_eq!(count(&mine) + count(&theirs), 2, "each insider's best pool still competes: {set:?}");
+}
+
+/// Audit F04 (rest): a validator's consensus key acting for its owner (SF-13) burns no more than
+/// the validator's duties cost. Its txs that would fail aren't admitted (so they're never
+/// charged), it updates the validator at most once per epoch, and a tombstoned or removed
+/// validator's key signs only what it still owes (a reveal for an open commitment).
+#[test]
+fn a_stolen_consensus_key_burns_at_most_its_validators_duties() {
+    let mut t = Setup::default().start();
+    t.finish_epoch();
+    let (ck, o, v) = (keys(vseed(1)), owner(1), vaddr(1));
+    // Every token of the owner's is locked (a vesting allocation): it can't move any of it.
+    let mut j = Journal::default();
+    let total = t.balance(&o.address()) + self_bond(&t.st, &v);
+    t.st.acct_mut(&mut j, &o.address()).locks.push(Lock { id: "vesting".into(), amount: LockAmount::Vesting { total, start: 0, cliff: 10_000, end: 20_000 }, reason: "test".into() });
+    assert!(t.fails(&o, Action::Transfer { to: keys(250).address(), amount: FANG }).contains("locked"));
+    let before = t.balance(&o.address());
+    // No-op updates: one per epoch.
+    let noop = || Action::UpdateValidator { commission_bps: 1_000, p2p_addr: String::new(), http_addr: String::new() };
+    let mut applied = 0;
+    for _ in 0..64 {
+        let tx = t.tx_from(&ck, &o.address(), noop());
+        if t.apply(&tx).is_ok_and(|r| r == Outcome::Applied) {
+            applied += 1;
+        }
+    }
+    assert_eq!(applied, 1);
+    // A duty it already did, or one that isn't its: refused, not charged.
+    let epoch = t.st.params.epoch_of(t.height);
+    let commit = |t: &T, c: &str| t.tx_from(&ck, &o.address(), Action::BeaconCommit { epoch: epoch + 2, commitment: c.repeat(32) });
+    let secret = [7u8; 32];
+    let c = hex::encode(crate::beacon::commitment(CHAIN, epoch + 2, &v, &secret));
+    assert_eq!(t.apply(&t.tx_from(&ck, &o.address(), Action::BeaconCommit { epoch: epoch + 2, commitment: c })).unwrap(), Outcome::Applied);
+    let paid = before - t.balance(&o.address());
+    for _ in 0..8 {
+        assert!(t.apply(&commit(&t, "33")).is_err());
+        assert!(t.apply(&t.tx_from(&ck, &o.address(), Action::AttestClaim { claim_id: 0, ok: false, merge_sha: String::new(), note: String::new() })).is_err());
+    }
+    assert_eq!(before - t.balance(&o.address()), paid, "only the update and the commitment were charged");
+    // Tombstoned: it still reveals what it committed to, and nothing else.
+    t.finish_epoch();
+    let mut j = Journal::default();
+    tombstone(&mut t.st, &mut j, &v, t.height);
+    let mut late = t.tx_from(&ck, &o.address(), noop());
+    late.nonce = t.st.account(&o.address()).nonce;
+    assert!(t.apply(&t.tx_from(&ck, &o.address(), noop())).unwrap_err().to_string().contains("isn't authorized"));
+    assert!(t.apply(&t.tx_from(&ck, &o.address(), Action::BeaconCommit { epoch: epoch + 3, commitment: "44".repeat(32) })).is_err());
+    let reveal = t.tx_from(&ck, &o.address(), Action::BeaconReveal { epoch: epoch + 2, secret: hex::encode(secret) });
+    assert_eq!(t.apply(&reveal).unwrap(), Outcome::Applied, "it owes the reveal");
+    t.block();
+}
+
+/// Audit review-fix-staking-2: a set of one or two (f = 0: every member is needed) admits a
+/// newcomer only once its consensus key showed it's running and synced in that epoch (an
+/// `UpdateValidator` it signed), so one that never comes online can't halt it by stake alone.
+#[test]
+fn a_tiny_set_admits_only_a_newcomer_that_showed_up() {
+    let mut t = Setup::default().start();
+    for i in [2u8, 3] {
+        let held = t.shares(&owner(i).address(), &vaddr(i)) as u64;
+        t.ok(&owner(i), Action::Undelegate { validator: vaddr(i), shares: held - 500 * FANG });
+    }
+    t.finish_epoch();
+    assert_eq!(t.set(1).len(), 2);
+    for i in [2u8, 3] {
+        t.ok(&owner(i), Action::Delegate { validator: vaddr(i), amount: 900 * FANG });
+    }
+    assert!(select_next(&t.st, 1).joining.is_empty(), "stake alone doesn't get it in");
+    // Validator 3's consensus key shows up (signed for its owner, who pays).
+    let ready = t.tx_from(&keys(vseed(3)), &owner(3).address(), Action::UpdateValidator { commission_bps: 1_000, p2p_addr: String::new(), http_addr: String::new() });
+    assert_eq!(t.apply(&ready).unwrap(), Outcome::Applied);
+    // The owner's own key doesn't prove the validator's node is up.
+    t.ok(&owner(2), Action::UpdateValidator { commission_bps: 1_000, p2p_addr: String::new(), http_addr: String::new() });
+    assert_eq!(select_next(&t.st, 1).joining, vec![vaddr(3)]);
+    t.finish_epoch();
+    assert_eq!(t.set(2).len(), 3);
+    // A readiness from an earlier epoch doesn't count.
+    assert!(select_next(&t.st, 2).joining.is_empty());
 }
