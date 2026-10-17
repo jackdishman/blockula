@@ -700,7 +700,7 @@ fn a_readiness_queued_ahead_of_a_reveal_keeps_it_in_the_lane() {
     // It sells below the minimum self-bond: out at the end of epoch 0, owing epoch 2's reveal.
     let v0 = t.vals[0].clone_keys();
     let shares = t.c.state.staking.delegations[&format!("{me}/{me}")].shares;
-    t.tx(&v0, Action::Undelegate { validator: me.clone(), shares: (shares * 3 / 4) as u64 }).unwrap();
+    t.tx(&v0, Action::Undelegate { validator: me.clone(), shares: (shares * 3 / 4) as u64, amount: 0 }).unwrap();
     t.advance_to(9);
     assert!(!t.c.state.active_sets[&1].contains(&me) && t.c.state.active_sets[&1].len() == 2);
     // It bonds back (an eligible candidate), and the set's two members admit it.
@@ -751,7 +751,7 @@ fn duties_signal_readiness_only_once_admitted_and_in_the_window() {
     t.c.state.params.admins.clear();
     let v0 = t.vals[0].clone_keys();
     let shares = t.c.state.staking.delegations[&format!("{me}/{me}")].shares;
-    t.tx(&v0, Action::Undelegate { validator: me.clone(), shares: (shares * 3 / 4) as u64 }).unwrap();
+    t.tx(&v0, Action::Undelegate { validator: me.clone(), shares: (shares * 3 / 4) as u64, amount: 0 }).unwrap();
     t.advance_to(9);
     t.tx(&v0, Action::Delegate { validator: me.clone(), amount: 1_000 * DROPS_PER_FANG }).unwrap();
     let ready = |t: &Net| t.c.mempool.iter().filter(|tx| matches!(tx.action, Action::ValidatorReady { .. })).count();

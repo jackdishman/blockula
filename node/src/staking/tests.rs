@@ -2173,7 +2173,7 @@ fn the_boundary_counts_admissions_against_the_members_it_carries_over() {
     let mut t = shrunk_to_two([900, 900]);
     // Validator 1's owner sells below the minimum: for now validator 0 is the only eligible member.
     let held = t.shares(&owner(1).address(), &vaddr(1)) as u64;
-    t.ok(&owner(1), Action::Undelegate { validator: vaddr(1), shares: held - 500 * FANG });
+    t.ok(&owner(1), Action::Undelegate { validator: vaddr(1), shares: held - 500 * FANG, amount: 0 });
     assert_eq!(members_admitting(&t.st, 1), Some(vec![vaddr(0)]));
     assert!(admit(&mut t, 1, &vaddr(3)).unwrap_err().to_string().contains("only an eligible member"));
     assert_eq!(admit(&mut t, 0, &vaddr(3)).unwrap(), Outcome::Applied);

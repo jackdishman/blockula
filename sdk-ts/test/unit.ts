@@ -486,6 +486,10 @@ console.log("✓ on mainnet, fields that need an address never sign an unproven 
   assert.match(describeAction({ type: "multisig_create", owners: ["ab".repeat(32)], threshold: 1 }), /1-of-1 multisig/);
   assert.match(describeAction({ type: "propose", kind: drain, deposit: "1000000000", title: "t" }), /^Propose, bonding 1 FANG: Pay 10,000,000 FANG/);
   assert.match(describeAction({ type: "mystery" }), /can't read.*don't approve it/);
+  // gap-7-5: an undelegate by amount says the amount, not "0 pool shares".
+  assert.equal(describeAction({ type: "undelegate", validator: BOB, shares: "0", amount: (25n * FANG / 10n).toString() }), `Start unbonding 2.5 FANG of stake from validator ${BOB} (the chain converts it to pool shares at its own price when this runs)`);
+  assert.equal(describeAction({ type: "undelegate", validator: BOB, shares: "7", amount: "0" }), `Start unbonding 7 pool shares from validator ${BOB}`);
+  assert.equal(describeAction({ type: "undelegate", validator: BOB, shares: "7" }), `Start unbonding 7 pool shares from validator ${BOB}`);
 }
 console.log("✓ describeKind / describeAction render what a vote or approval binds (amounts and recipients spelled out), never throw, and flag numbers they can't read");
 

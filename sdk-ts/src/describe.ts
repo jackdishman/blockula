@@ -239,8 +239,13 @@ export function describeAction(action: unknown, opts: DescribeOptions = {}): str
       return `Claw back the unvested rewards of ${account(a.account)} (admin chains only)${quoted(a.reason, "reason", opts)}`;
     case "delegate":
       return `Stake ${fangText(a.amount)} with validator ${account(a.validator)}`;
-    case "undelegate":
+    case "undelegate": {
+      // Amount mode (audit gap-7-5): `shares` 0 and an amount the chain converts at its own price.
+      const amount = whole(a.amount);
+      if (amount !== undefined && amount > 0n) return `Start unbonding ${fangText(a.amount)} of stake from validator ${account(a.validator)} (the chain converts it to pool shares at its own price when this runs)`;
+      if (a.amount !== undefined && amount === undefined) return `Start unbonding ${fangText(a.amount)} of stake from validator ${account(a.validator)}`;
       return `Start unbonding ${n(a.shares)} pool shares from validator ${account(a.validator)}`;
+    }
     case "redelegate":
       return `Move ${n(a.shares)} pool shares from validator ${account(a.from_validator)} to validator ${account(a.to_validator)}`;
     case "withdraw_unbonded":
