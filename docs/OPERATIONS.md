@@ -16,7 +16,7 @@ Some of what's below needs protocol v1 code that is still landing. Those parts a
 8. [Incident response](#incident-response)
 9. [Runbooks](#runbooks) (one per alert)
 10. [Weak subjectivity](#weak-subjectivity): what a joining node trusts, and checkpoints in releases
-11. [Releases](#releases) and [npm packages](#npm-packages)
+11. [Releases](#releases), [npm packages](#npm-packages) and [repository settings](#repository-settings-github)
 12. [Monitoring](#monitoring)
 13. [Checklists](#checklists)
 
@@ -644,6 +644,14 @@ One-time setup by the maintainer:
 3. GitHub → Settings → Environments → `npm`: add the maintainers as required reviewers and limit deployments to `v*` tags.
 
 To publish: bump both `package.json` versions to the tag's version in the release PR, tag, then Actions → "Publish npm packages" → Use workflow from: the tag → Run (dry run first). Users verify with `npm audit signatures`.
+
+### Repository settings (GitHub)
+
+The checks a PR must pass, who may push release tags and where fuzz crashes go are GitHub settings, which change without a commit. The intended ones are in [`deploy/github`](../deploy/github/README.md): `ruleset-main.json` (a code-owner-approved PR, squash merges, and every CI job that runs on pull requests as a required check, tied to the GitHub Actions app), `ruleset-tags.json` (`v*` tags admin-only) and the variable `FUZZ_CRASH_AGE_RECIPIENTS` (the maintainers' age keys, see [node/fuzz](../node/fuzz/README.md)). As the admin, apply them with `deploy/github/apply-rulesets.sh` (a dry-run diff first, then `--apply`); CI can't.
+
+Required checks are job names. `.github/workflows/ci.yml`'s header lists them, and `scripts/check-required-checks.mjs` (CI, `ops`) fails when that list, `ruleset-main.json` and the workflows drift: a renamed job, a required job skipped or path-filtered on PRs, a new job nobody required (audit supply-chain-B-3). Rename or add a required job in the same PR as the ruleset file, and apply the ruleset when it merges.
+
+With one maintainer, the admin bypass (pull-request mode) is how every PR merges, since nobody approves their own. When a second maintainer joins, make the bypass an emergency path and require a second person's review for `.github/**`, `scripts/**`, `deploy/**`, `deny.toml`, `rust-toolchain.toml` and the lockfiles ([deploy/github/README.md](../deploy/github/README.md#the-admin-bypass)).
 
 ## Monitoring
 
