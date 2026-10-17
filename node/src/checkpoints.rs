@@ -272,7 +272,7 @@ impl Trust {
     pub fn heed(&mut self, reports: &[(String, u64)]) -> bool {
         let Some((peer, reported)) = reports.iter().min_by_key(|(_, w)| *w) else { return false };
         let ws = (*reported).max(self.ws_floor);
-        let floor = (ws > *reported).then(|| format!(", the protocol's floor; it reports {reported}")).unwrap_or_default();
+        let floor = if ws > *reported { format!(", the protocol's floor; it reports {reported}") } else { String::new() };
         self.shorten(ws, || format!("in force on the chain as {peer} reports it{floor}: governance shortened the evidence window after this release"))
     }
 
