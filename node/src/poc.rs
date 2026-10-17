@@ -82,7 +82,7 @@ pub const CLAIM_SOUL: u64 = 10 * SOUL;
 /// didn't mark spam, those below the threshold too), never by the best of them: each claim's own
 /// rate is a noisy estimate from a handful of comparisons, and the best of k noisy rates grows
 /// with k (round 3 paid it: with honest jurors who pick a side between two weak PRs, 16 weak
-/// PRs out-earned a solid one in 39 of 40 draws), while a pooled rate only gets steadier. The
+/// PRs out-earned a solid one in 40 of 40 draws), while a pooled rate only gets steadier. The
 /// person's accepted claims then count heaviest repo first, each a quarter (`>> 2`) of the one
 /// ranked above it, for payout weight and for Soul, so all of them together count for less than
 /// 4/3 of one claim at the person's rate: in expectation, k claims of one quality earn at most
@@ -1528,7 +1528,7 @@ impl State {
         // handful of comparisons, so the best of k claims of the same quality scores higher the
         // more there are; the pooled rate doesn't (more claims only make it steadier), and the
         // claims below the threshold count in it too, so nothing is selected.
-        // (By claim: each live claim's claimant's rate.)
+        // Kept by claim: each live claim maps to its claimant's rate.
         let claim_rate: BTreeMap<u64, u64> = {
             let mut pooled: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
             for c in live.iter().filter(|c| !spam_verdict(c)) {
