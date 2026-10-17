@@ -406,7 +406,7 @@ fn undelegate_by_amount_converts_at_the_chains_price() {
     t.st.j_burn(&mut j, issued - paid);
     t.block();
     let p = t.st.staking.pools[&v].clone();
-    assert!(p.stake as u128 > p.shares && (p.stake as u128 * 1_000) % p.shares != 0, "an uneven price above a drop a share");
+    assert!(p.stake as u128 > p.shares && !(p.stake as u128 * 1_000).is_multiple_of(p.shares), "an uneven price above a drop a share");
     let (held, worth) = (t.shares(&a, &v), delegation_value(&t.st, &a, &v));
     // More than the stake is worth, or from a pool it isn't in: refused, nothing unbonds.
     assert!(t.fails(&alice, Action::Undelegate { validator: v.clone(), shares: 0, amount: worth + 1 }).contains("less than the"));

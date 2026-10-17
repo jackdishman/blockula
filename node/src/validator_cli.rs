@@ -192,10 +192,8 @@ pub(crate) async fn send_memo_with(remote: &Remote, keys: &Keys, from: &str, mak
     }
     let id = v["id"].as_str().unwrap_or_default().to_string();
     for _ in 0..120 {
-        if let Ok(t) = get(rpc, &format!("/tx/{id}")).await {
-            if let Some(done) = tx_outcome(&id, t, valid_until) {
-                return done;
-            }
+        if let Some(done) = get(rpc, &format!("/tx/{id}")).await.ok().and_then(|t| tx_outcome(&id, t, valid_until)) {
+            return done;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
