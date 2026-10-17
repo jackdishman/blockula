@@ -370,15 +370,13 @@ pub async fn fetch(peers: &[String], height: Option<u64>) -> Result<(Genesis, Ch
     let params = g.params();
     // Governance shortened the evidence window since this release (gap-6-1): say how fresh a
     // checkpoint must be now, since this binary's joiners only know the longer period.
-    if let Ok(t) = Trust::new(&g, &Pins::default(), false) {
-        if reported_ws < t.ws_blocks() {
-            eprintln!(
-                "⚠️  the peers' parameters in force put the weak-subjectivity period at {reported_ws} blocks (~{} days), shorter than this release's {} (~{} days): a checkpoint is safe for that long only",
-                days(reported_ws, g.block_time_ms),
-                t.ws_blocks(),
-                days(t.ws_blocks(), g.block_time_ms)
-            );
-        }
+    if let Some(t) = Trust::new(&g, &Pins::default(), false).ok().filter(|t| reported_ws < t.ws_blocks()) {
+        eprintln!(
+            "⚠️  the peers' parameters in force put the weak-subjectivity period at {reported_ws} blocks (~{} days), shorter than this release's {} (~{} days): a checkpoint is safe for that long only",
+            days(reported_ws, g.block_time_ms),
+            t.ws_blocks(),
+            days(t.ws_blocks(), g.block_time_ms)
+        );
     }
     let height = match height {
         Some(h) => {

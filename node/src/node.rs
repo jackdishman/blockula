@@ -579,10 +579,9 @@ async fn maybe_fast_sync(chain: &Shared, peers: &[String], full: bool, trust: &T
                 // the snapshot is only as good as the peers that served it (gap-6-1). A forged
                 // state could hide such a change, so this only catches the honest case.
                 let mut live = trust.clone();
-                if live.follow(&chain.lock().state.chain_params) {
-                    if let Some(why) = live.stale(0, crate::chain::now_ms()) {
-                        eprintln!("⚠️  under the chain's parameters in force: {why}; if in doubt, wipe this home and join again with that checkpoint");
-                    }
+                let shorter = live.follow(&chain.lock().state.chain_params);
+                if let Some(why) = live.stale(0, crate::chain::now_ms()).filter(|_| shorter) {
+                    eprintln!("⚠️  under the chain's parameters in force: {why}; if in doubt, wipe this home and join again with that checkpoint");
                 }
                 return;
             }

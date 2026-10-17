@@ -547,7 +547,7 @@ mod tests {
         }
         let truth = reg.clone();
         for s in seeds {
-            reg.sign_missing(&Instance::of(&g), *s, |e| truth.set(e).cloned());
+            reg.sign_missing(&Instance::of(g), *s, |e| truth.set(e).cloned());
         }
         assert_eq!(reg.proven_through(), changes);
         reg
