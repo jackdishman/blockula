@@ -3434,17 +3434,29 @@ impl Chain {
         if self.pool.contains(&id) || self.has_tx(&id) {
             return Ok((id, false));
         }
+        let unsigned = tx.is_unsigned();
+        let sender = if unsigned { String::new() } else { tx.sender()? };
+        let next = self.height() + 1;
+        let relay = crate::econ::base_fee(&self.state, next, tx.size());
+        // A queued shield is its sender's last queued tx (review of F36, round 3): nothing queues
+        // behind it, and its sender may replace it with a shield tipping more (`own`).
+        let own = match (!unsigned).then(|| self.queued_shield(&sender)).flatten() {
+            Some((i, last)) if tx.nonce >= self.mempool[i].nonce => {
+                let shield = &self.mempool[i];
+                crate::ghost::behind_shield(shield, last, &tx, relay, crate::econ::base_fee(&self.state, next, shield.size()))?;
+                Some(i)
+            }
+            _ => None,
+        };
         // Ghost Mode: a bounded share of the mempool, and one queued spend per note (a high enough
         // tip displaces one). Unsigned ghost txs have no sender: no queue, nonce or simulation.
-        let relay = crate::econ::base_fee(&self.state, self.height() + 1, tx.size());
-        let replaces = crate::ghost::mempool_admit(&self.mempool, &self.mempool_ids, &tx, relay, crate::econ::max_tip(&self.state, relay), evict)?;
+        let mut replaces = crate::ghost::mempool_admit(&self.mempool, &self.mempool_ids, &tx, own, relay, crate::econ::max_tip(&self.state, relay), evict)?;
         let asks = crate::econ::name_asked_for(&self.state, &tx);
         if let Some(name) = &asks {
             self.first_to_ask(&tx, name)?;
         }
-        let unsigned = tx.is_unsigned();
-        let sender = if unsigned { String::new() } else { tx.sender()? };
-        let count = if unsigned { 0 } else { self.pending_count(&sender) };
+        // The sender's txs ahead of this one (a replacement takes its shield's place).
+        let count = if unsigned { 0 } else { self.pending_count(&sender) - usize::from(own.is_some()) };
         if count >= MAX_PENDING_PER_SENDER {
             bail!("too many pending transactions from {}; wait for some to finalize", short(&sender));
         }
@@ -3452,8 +3464,10 @@ impl Chain {
         if !unsigned && tx.nonce != expected {
             bail!("bad nonce: expected {expected}, got {}", tx.nonce);
         }
-        let next = self.height() + 1;
         let sim = self.dry_run(&tx, &sender, count)?;
+        if let Some(i) = own {
+            replaces.push((self.mempool_ids[i].clone(), "replaced by its sender's shield with a higher tip"));
+        }
         if !replaces.is_empty() {
             self.displace(replaces, next);
         }
@@ -3559,7 +3573,7 @@ impl Chain {
         let mut sim = match self.sims.take(sender, self.height(), queued) {
             Some(sim) => sim,
             None => {
-                let sim = self.simulate_queue(sender, next, &proposer, &chain_id)?;
+                let sim = self.simulate_queue(sender, queued, next, &proposer, &chain_id)?;
                 self.sims.rebuilt += sim.applied as u64;
                 sim
             }
@@ -3573,12 +3587,14 @@ impl Chain {
         }
     }
 
-    /// A copy of the state with `sender`'s queued txs applied in nonce order, as the block at
-    /// `next` would apply them. `Err` if one no longer applies (a block changed the state since
-    /// it was queued; the post-block check drops it and the txs behind it).
-    fn simulate_queue(&self, sender: &str, next: u64, proposer: &str, chain_id: &str) -> Result<SenderSim> {
+    /// A copy of the state with `sender`'s first `queued` queued txs applied in nonce order (all
+    /// of them, but for a replacement of the last: [`crate::ghost::behind_shield`]), as the block
+    /// at `next` would apply them. `Err` if one no longer applies (a block changed the state
+    /// since it was queued; the post-block check drops it and the txs behind it).
+    fn simulate_queue(&self, sender: &str, queued: usize, next: u64, proposer: &str, chain_id: &str) -> Result<SenderSim> {
         let mut state = self.state.clone();
         let queue = self.pending.get(sender).map(Vec::as_slice).unwrap_or_default();
+        let queue = &queue[..queued.min(queue.len())];
         for &i in queue {
             let t = &self.mempool[i];
             let mut j = Journal::default();
@@ -3603,11 +3619,17 @@ impl Chain {
             Some(i) if TipRate::of(tx) > TipRate::of(&self.mempool[i]) => Ok(i),
             Some(i) => {
                 let low = TipRate::of(&self.mempool[i]);
-                let need = (low.tip as u128 * tx.size() as u128 / low.size.max(1) as u128 + 1).min(u64::MAX as u128);
+                let mut need = (low.tip as u128 * tx.size() as u128 / low.size.max(1) as u128 + 1).min(u64::MAX as u128);
                 // Never ask for a tip past this tx's cap (review of fix-fees): a mempool full of
                 // smaller txs tipping near theirs can't be outbid until blocks drain it or the
                 // base fee (and with it every cap) rises.
-                let cap = crate::econ::max_tip(&self.state, crate::econ::base_fee(&self.state, self.height() + 1, tx.size()));
+                let mut cap = crate::econ::max_tip(&self.state, crate::econ::base_fee(&self.state, self.height() + 1, tx.size()));
+                // An unsigned ghost tx tips a whole multiple of the fee grid (review of fix-fees-2).
+                if tx.is_unsigned() {
+                    let grid = crate::ghost::FEE_GRID as u128;
+                    need = need.div_ceil(grid) * grid;
+                    cap -= cap % crate::ghost::FEE_GRID;
+                }
                 if need > cap as u128 {
                     bail!("mempool is full, and its cheapest transactions tip more per byte than this one may (at most {cap} drops, {}× its base fee); try again shortly", self.state.chain_params.tip_cap_multiple);
                 }
@@ -3617,11 +3639,11 @@ impl Chain {
         }
     }
 
-    /// Removes what a ghost tx displaces (`ghost::mempool_admit`). A signed one (a `Shield`) is
-    /// its sender's last queued tx when a full share gives it up, but a same-note replacement can
-    /// take one from anywhere in its sender's queue: either way the sender's later txs go with it
-    /// (they'd wait behind a nonce gap), and its simulation, which applied it, is forgotten
-    /// (review of F36).
+    /// Removes what a ghost tx displaces (`ghost::mempool_admit`, and the shield a sender
+    /// replaces: `ghost::behind_shield`). A signed one (a `Shield`) is its sender's last queued
+    /// tx, as admission keeps the mempool; if it ever weren't, its sender's later txs would go
+    /// with it (they'd wait behind a nonce gap; `mempool_admit` prices them in), and either way
+    /// its simulation, which applied it, is forgotten (review of F36).
     fn displace(&mut self, victims: Vec<(String, &'static str)>, next: u64) {
         let mut gone: HashMap<String, String> = victims.into_iter().map(|(id, why)| (id, why.to_string())).collect();
         let mut first: HashMap<String, u64> = HashMap::new();
@@ -3671,6 +3693,14 @@ impl Chain {
         self.sims.forget(&from);
         self.rebuild_pending();
         self.publish_mempool();
+    }
+
+    /// `sender`'s queued shield, if any (its first), and whether it's the sender's last queued tx
+    /// (always, as [`Chain::submit_tx`] keeps the mempool: [`crate::ghost::behind_shield`]).
+    fn queued_shield(&self, sender: &str) -> Option<(usize, bool)> {
+        let q = self.pending.get(sender)?;
+        let i = q.iter().copied().find(|&i| matches!(self.mempool[i].action, Action::Shield { .. }))?;
+        Some((i, q.last() == Some(&i)))
     }
 
     pub fn pending_count(&self, addr: &str) -> usize {
