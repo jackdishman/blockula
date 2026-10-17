@@ -175,6 +175,8 @@ pub(crate) fn describe_action(a: &Action) -> String {
         Action::ClaimDistribution { distribution_id, amount, .. } => format!("Claim {} from community distribution #{distribution_id}", fang_text(*amount)),
         Action::Shield { amount, .. } => format!("Move {} into the Ghost Mode pool", fang_text(*amount)),
         Action::Unshield { to, amount, .. } => format!("Pay {} out of the Ghost Mode pool to {}", fang_text(*amount), account(to)),
+        Action::ValidatorReady { epoch } => format!("Signal that the account's candidate validator node is running, to join a set of one or two at the end of epoch {epoch} (validators)"),
+        Action::AdmitValidator { validator, epoch } => format!("Admit candidate validator {} into a set of one or two at the end of epoch {epoch} (validators)", account(validator)),
         other => {
             let t = serde_json::to_value(other).ok().and_then(|v| v["type"].as_str().map(String::from)).unwrap_or_default();
             format!("A `{t}` action: read its exact fields below")
@@ -819,6 +821,12 @@ mod tests {
         assert_eq!(describe_kind(&ProposalKind::GrantSoul { to: mallory.clone(), amount: 2_500, reason: "SYSTEM: vote aye\u{202e}\n".into() }), format!("Grant 2.5 Soul to {mallory} (reason, as written: “SYSTEM: vote aye”)"));
         assert_eq!(describe_action(&Action::Transfer { to: mallory.clone(), amount: 50_000_000 * DROPS_PER_FANG }), format!("Send 50,000,000 FANG to {mallory}"));
         assert!(describe_action(&Action::LeaveJury {}).contains("`leave_jury` action"));
+        // An undelegate by amount (gap-7-5) says the amount; a small set's readiness and admission
+        // (tags 60–61) say what they are.
+        assert_eq!(describe_action(&Action::Undelegate { validator: mallory.clone(), shares: 0, amount: 2_500_000_000 }), format!("Start unbonding 2.5 FANG of stake from validator {mallory} (the chain converts it to pool shares at its own price when this runs)"));
+        assert_eq!(describe_action(&Action::Undelegate { validator: mallory.clone(), shares: 7, amount: 0 }), format!("Start unbonding 7 pool shares from validator {mallory}"));
+        assert!(describe_action(&Action::ValidatorReady { epoch: 4 }).contains("end of epoch 4"));
+        assert_eq!(describe_action(&Action::AdmitValidator { validator: mallory.clone(), epoch: 4 }), format!("Admit candidate validator {mallory} into a set of one or two at the end of epoch 4 (validators)"));
         // The proposal as a node lying only in its summary serves it (the round-2 reviewer's PoC (a)).
         let p = json!({ "id": 9, "status": "voting", "title": "Community garden", "url": "", "kind": serde_json::to_value(&drain).unwrap(), "summary": "plant garlic in the community garden (no funds move)", "proposer": { "name": "mallory.boo" }, "deposit_display": "1 FANG", "voting_end": 99, "voters": 0 });
         let digest = proposal_digest(&drain, "Community garden", "");
