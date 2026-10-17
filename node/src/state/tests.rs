@@ -417,7 +417,10 @@ fn namespaces_and_meta_keys_are_unique() {
 /// audit fixes) changes the `schema` record, `chain_params` (`tip_cap_multiple`, 20, after
 /// `max_tx_validity_blocks`) and the `governance` and `params` scalars' layouts (their new fields
 /// are empty here); staking's slash bookkeeping and its two new maps are empty here too. The
-/// vectors were regenerated with it and the SDK rebuilt the root from them.
+/// vectors were regenerated with it and the SDK rebuilt the root from them. The second audit
+/// round adds `bootstrap_commission_cap_bps` (1,000, after `insider_delegation_cap_bps`) to
+/// `chain_params` (pools' `ready_at` and liveness rings' `max_missed` are empty here); vectors
+/// regenerated, the SDK rebuilt the root.
 #[test]
 fn golden_encodings() {
     let acct = Account { balance: 5, nonce: 2, keys: Default::default(), locks: vec![] };
@@ -428,7 +431,7 @@ fn golden_encodings() {
     st.commit_block().unwrap();
     assert_eq!(st.root_hash(), st.full_root());
     assert_eq!(st.record_count(), 13);
-    assert_eq!(st.root(), "da0a1b06dbb7be8cf302ca9ce0cb593bca0e96f88449fca52daa9ff6376f07b4");
+    assert_eq!(st.root(), "be8f283db9390f49355f6f03dcc2b9014b846b1a3965a3a04bc046ff9ba177f6");
 }
 
 fn million_accounts() -> State {
@@ -584,13 +587,13 @@ fn largest_records_fit_in_a_snapshot() {
         let (_, window) = crate::params::ChainParams::bounds("downtime_window", &st.params).unwrap();
         let sk = &mut st.staking;
         let jail = Some(Jail { at: u64::MAX, until: u64::MAX, reason: s(MAX_REASON) });
-        sk.pools.insert(addr(1), Pool { stake: u64::MAX, shares: u128::MAX, commission_base: u64::MAX, commission_epoch: u64::MAX, jail, tombstoned_at: Some(u64::MAX), slashed: u64::MAX, rewards: u64::MAX, junk_charged: u64::MAX, slashed_from: Some(u64::MAX) });
+        sk.pools.insert(addr(1), Pool { stake: u64::MAX, shares: u128::MAX, commission_base: u64::MAX, commission_epoch: u64::MAX, jail, tombstoned_at: Some(u64::MAX), slashed: u64::MAX, rewards: u64::MAX, junk_charged: u64::MAX, slashed_from: Some(u64::MAX), ready_at: Some(u64::MAX) });
         sk.delegations.insert(format!("{}/{}", addr(0), addr(1)), Delegation { shares: u128::MAX, principal: u64::MAX });
         sk.entries.insert(format!("{}/{:020}", addr(0), u64::MAX), Entry::Redelegation { from: addr(1), to: addr(2), amount: u64::MAX, started_at: u64::MAX, release_at: u64::MAX });
         sk.by_validator.insert(format!("{}/{:020}/{}/{:020}", addr(1), u64::MAX, addr(0), u64::MAX), ());
         sk.views.insert(u64::MAX, u64::MAX);
         sk.punished.insert(format!("{}/{:020}/{:020}", addr(1), u64::MAX, u64::MAX), Punished { kind: u8::MAX, height: u64::MAX, reporter: addr(2), slashed: u64::MAX });
-        sk.liveness.insert(addr(1), Liveness { window, bits: vec![0xff; window.div_ceil(8) as usize], next: u64::MAX, filled: u64::MAX, missed: u64::MAX, led: u64::MAX, missed_total: u64::MAX });
+        sk.liveness.insert(addr(1), Liveness { window, max_missed: u64::MAX, bits: vec![0xff; window.div_ceil(8) as usize], next: u64::MAX, filled: u64::MAX, missed: u64::MAX, led: u64::MAX, missed_total: u64::MAX });
     }
     // Governance: a proposal with a full council and every string at its bound, a vote, a
     // multisig with every pending slot, its proposal carrying the largest action an owner can

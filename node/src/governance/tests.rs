@@ -570,13 +570,14 @@ fn governance_safety_parameters_need_tokens_and_keep_their_floors() {
         t.vote(v2, id, true, 1, 0).unwrap();
         id
     };
-    // Nor the tip cap, whose raise pays the validators (audit F01).
-    let ids = [council(&mut t, text()), council(&mut t, param("bootstrap_end_height", 500)), council(&mut t, param("timelock_blocks", 2 * day)), council(&mut t, param("governance_spend_height", 6_000)), council(&mut t, param("tip_cap_multiple", 1_000))];
-    t.finish(ids[4]);
+    // Nor the tip cap or the bootstrap delegation's commission cap, whose raises pay the
+    // validators (audit F01, F12).
+    let ids = [council(&mut t, text()), council(&mut t, param("bootstrap_end_height", 500)), council(&mut t, param("timelock_blocks", 2 * day)), council(&mut t, param("governance_spend_height", 6_000)), council(&mut t, param("tip_cap_multiple", 1_000)), council(&mut t, param("bootstrap_commission_cap_bps", 10_000))];
+    t.finish(ids[5]);
     let status: Vec<ProposalStatus> = ids.iter().map(|id| t.p(*id).status).collect();
-    assert_eq!(status, [ProposalStatus::Executed, ProposalStatus::Rejected, ProposalStatus::Rejected, ProposalStatus::Rejected, ProposalStatus::Rejected]);
-    assert!(t.p(ids[4]).tally.as_ref().unwrap().supermajority);
-    assert_eq!(t.st.chain_params.tip_cap_multiple, 20);
+    assert_eq!(status, [ProposalStatus::Executed, ProposalStatus::Rejected, ProposalStatus::Rejected, ProposalStatus::Rejected, ProposalStatus::Rejected, ProposalStatus::Rejected]);
+    assert!(t.p(ids[4]).tally.as_ref().unwrap().supermajority && t.p(ids[5]).tally.as_ref().unwrap().supermajority);
+    assert_eq!((t.st.chain_params.tip_cap_multiple, t.st.chain_params.bootstrap_commission_cap_bps), (20, 1_000));
     assert_eq!(t.p(ids[1]).tally.as_ref().unwrap().council_ayes, 2, "⅔ of the council said aye, and it wasn't enough");
     assert!(t.p(ids[1]).tally.as_ref().unwrap().supermajority);
     assert_eq!((t.st.chain_params.bootstrap_end_height, t.st.chain_params.governance_spend_height), (1_000, 5_000));
@@ -1242,10 +1243,11 @@ fn a_multisig_owners_validator_still_signs_its_system_txs() {
     t.tx(OWNER, Action::MultisigCreate { owners: vec![kid(OWNER)], threshold: 1 }).unwrap();
     assert!(t.err(OWNER, Action::Transfer { to: addr(ALICE), amount: FANG }).contains("multisig_propose"));
     let ck = keys(VALIDATORS[2]);
-    // Admitted and charged to the owner; the action itself fails (there's no claim #9).
+    // Past the multisig's gate to the action itself, which fails (there's no claim #9): so it
+    // isn't admitted, and the owner pays nothing (audit F04).
     let before = t.bal(OWNER);
-    let e = t.tx_as(&ck, &addr(OWNER), Action::AttestClaim { claim_id: 9, ok: true, merge_sha: "ab".repeat(20), note: String::new() }).unwrap_err().to_string();
-    assert!(!e.contains("multisig") && t.bal(OWNER) < before, "{e}");
+    let e = format!("{:#}", t.tx_as(&ck, &addr(OWNER), Action::AttestClaim { claim_id: 9, ok: true, merge_sha: "ab".repeat(20), note: String::new() }).unwrap_err());
+    assert!(!e.contains("multisig") && e.contains("no claim #9") && t.bal(OWNER) == before, "{e}");
     let e = t.tx_as(&ck, &addr(OWNER), Action::UpdateValidator { commission_bps: 100, p2p_addr: String::new(), http_addr: String::new() }).unwrap_err().to_string();
     assert!(e.contains("multisig_propose"), "{e}");
 }

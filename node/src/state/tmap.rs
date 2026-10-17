@@ -84,11 +84,71 @@ impl<K, V, A> Deref for TMap<K, V, A> {
     }
 }
 
+#[cfg(not(test))]
 impl<'a, K: Ord, V, A> IntoIterator for &'a TMap<K, V, A> {
     type Item = (&'a K, &'a V);
     type IntoIter = imbl::ordmap::Iter<'a, K, V, imbl::shared_ptr::DefaultSharedPtr>;
     fn into_iter(self) -> Self::IntoIter {
         self.map.iter()
+    }
+}
+
+// Tests count the records that reads walk through (`visits`): what tells a range read from a
+// scan of the whole map (audit F57: slashing a validator must read only its own entries). In
+// test builds a map's `iter`, `range`, `keys` and `values` are these counting wrappers; in the
+// node they're the inner map's own, through `Deref`.
+#[cfg(test)]
+thread_local! {
+    static VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Records every map read on this thread has walked through so far (tests).
+#[cfg(test)]
+pub fn visits() -> u64 {
+    VISITS.with(|v| v.get())
+}
+
+#[cfg(test)]
+fn count<T>(_: &T) {
+    VISITS.with(|v| v.set(v.get() + 1));
+}
+
+#[cfg(test)]
+type Counted<I> = std::iter::Inspect<I, fn(&<I as Iterator>::Item)>;
+
+#[cfg(test)]
+type Ptr = imbl::shared_ptr::DefaultSharedPtr;
+
+#[cfg(test)]
+impl<'a, K: Ord, V, A> IntoIterator for &'a TMap<K, V, A> {
+    type Item = (&'a K, &'a V);
+    type IntoIter = Counted<imbl::ordmap::Iter<'a, K, V, Ptr>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.map.iter().inspect(count)
+    }
+}
+
+#[cfg(test)]
+impl<K: Ord, V, A> TMap<K, V, A> {
+    pub fn iter(&self) -> Counted<imbl::ordmap::Iter<'_, K, V, Ptr>> {
+        self.map.iter().inspect(count)
+    }
+
+    pub fn range<R, Q>(&self, range: R) -> Counted<imbl::ordmap::RangedIter<'_, K, V, Ptr>>
+    where
+        R: std::ops::RangeBounds<Q>,
+        Q: Ord + ?Sized,
+        K: Borrow<Q>,
+    {
+        self.map.range(range).inspect(count)
+    }
+
+    pub fn keys(&self) -> Counted<imbl::ordmap::Keys<'_, K, V, Ptr>> {
+        self.map.keys().inspect(count)
+    }
+
+    pub fn values(&self) -> Counted<imbl::ordmap::Values<'_, K, V, Ptr>> {
+        self.map.values().inspect(count)
     }
 }
 

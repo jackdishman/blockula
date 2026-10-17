@@ -115,6 +115,11 @@ pub struct Pool {
     /// (the start of the earliest punished fault's epoch). A double-signer is slashed once: later
     /// evidence only reaches stake that left the pool before this height (audit F05/F07/F60).
     pub slashed_from: Option<u64>,
+    /// The last height the validator's own consensus key signed an `UpdateValidator` for it: proof
+    /// its node is running and synced. A set below four admits only a newcomer that showed up in
+    /// the epoch ([`select_next`], audit review-fix-staking-2), and the key updates the validator
+    /// for its owner at most once per epoch (audit F04).
+    pub ready_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -166,6 +171,10 @@ impl Entry {
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Liveness {
     pub window: u64,
+    /// The `downtime_max_missed` the ring was recorded under: a ring judged by another limit
+    /// starts afresh, as for another window, so a lowered limit never jails for misses the old
+    /// one allowed (audit gap-6-4).
+    pub max_missed: u64,
     pub bits: Vec<u8>,
     /// Where the next slot goes in the ring.
     pub next: u64,
@@ -178,8 +187,8 @@ pub struct Liveness {
 }
 
 impl Liveness {
-    fn new(window: u64) -> Self {
-        Self { window, bits: vec![0; window.div_ceil(8) as usize], next: 0, filled: 0, missed: 0, led: 0, missed_total: 0 }
+    fn new(window: u64, max_missed: u64) -> Self {
+        Self { window, max_missed, bits: vec![0; window.div_ceil(8) as usize], next: 0, filled: 0, missed: 0, led: 0, missed_total: 0 }
     }
 
     fn bit(&self, i: u64) -> bool {
@@ -712,7 +721,15 @@ pub(crate) fn apply(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, s
             let epoch = state.params.epoch_of(height);
             let current = state.validators[&v].commission_bps;
             let pool = state.staking.pools.get(&v).cloned().unwrap_or_default();
-            let base = if pool.commission_epoch == epoch { pool.commission_base } else { current };
+            // Its own consensus key signed it: the validator's node is up (readiness). Signed that
+            // way for its owner (SF-13, the owner pays), it updates the validator once an epoch.
+            let by_its_key = validator_of_key(state, signer).as_deref() == Some(v.as_str());
+            let for_owner = by_its_key && !state.keys_of(sender).contains_key(signer);
+            if for_owner && pool.ready_at.is_some_and(|h| state.params.epoch_of(h) == epoch) {
+                bail!("validator {}'s consensus key already updated it for its owner in epoch {epoch} (once an epoch; its owner's own key isn't limited)", short(&v));
+            }
+            // Measured from at most the cap: a validator above a lowered cap steps down to it at once.
+            let base = if pool.commission_epoch == epoch { pool.commission_base } else { current }.min(max);
             if commission_bps.abs_diff(base) > step {
                 bail!("commission can move at most {} points per epoch: {}%–{}% this epoch", fmt_bps(step), fmt_bps(base.saturating_sub(step)), fmt_bps((base + step).min(max)));
             }
@@ -724,6 +741,9 @@ pub(crate) fn apply(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, s
             }
             if let Some(p) = pool_mut(state, j, &v) {
                 (p.commission_base, p.commission_epoch) = (base, epoch);
+                if by_its_key {
+                    p.ready_at = Some(height);
+                }
             }
             let rec = state.validator_mut(j, &v).expect("owned_validator checked it");
             rec.commission_bps = *commission_bps;
@@ -1282,7 +1302,8 @@ fn score_leader_slots(state: &mut State, j: &mut Journal, b: &BlockInfo) {
         if out(pool) {
             continue;
         }
-        let mut l = state.staking.liveness.get(v).filter(|l| l.window == window).cloned().unwrap_or_else(|| Liveness::new(window));
+        // A ring recorded under another window or limit starts afresh (audit gap-6-4).
+        let mut l = state.staking.liveness.get(v).filter(|l| (l.window, l.max_missed) == (window, max_missed)).cloned().unwrap_or_else(|| Liveness::new(window, max_missed));
         if missed[i] {
             l.push(true);
         }
@@ -1322,13 +1343,37 @@ pub fn delegation_value(state: &State, delegator: &str, validator: &str) -> u64 
     }
 }
 
-/// Ranking for the set: admin-pinned first (dev and test chains), then pool stake without the
-/// bootstrap delegation's (`boot`: it follows the set, it doesn't pick it; [`bootstrap_epoch`]),
-/// then address (ascending). Greater is better.
-fn rank<'a>(state: &State, boot: &str, validator: &'a str) -> (bool, u64, std::cmp::Reverse<&'a str>) {
-    let pinned = state.validators.get(validator).is_some_and(|r| r.approved_at.is_some());
-    let stake = state.staking.pools.get(validator).map_or(0, |p| p.stake.saturating_sub(delegation_value(state, boot, validator)));
-    (pinned, stake, std::cmp::Reverse(validator))
+/// What counts toward a validator's rank for a seat: its pool's stake without the bootstrap
+/// delegation's (`boot`: it follows the set, it doesn't pick it; [`bootstrap_epoch`]) and without
+/// what accounts still vesting (`insiders`) other than its owner hold in it: locked stake earns
+/// like any other, but picks no seat except its own holder's (audit xcut-economic-2: an insider
+/// can't rank the validators of an accomplice, or of its own other accounts, with locked tokens).
+fn ranking_stake(state: &State, boot: &str, insiders: &[String], validator: &str) -> u64 {
+    let Some(p) = state.staking.pools.get(validator) else { return 0 };
+    let owner = state.validators.get(validator).map(|r| r.owner.as_str()).unwrap_or_default();
+    let locked = insiders.iter().filter(|a| a.as_str() != owner).map(|a| delegation_value(state, a, validator)).fold(0u64, u64::saturating_add);
+    p.stake.saturating_sub(delegation_value(state, boot, validator)).saturating_sub(locked)
+}
+
+/// Ranks for the set at `height`, worked out once per selection: admin-pinned first (dev and test
+/// chains), then [`ranking_stake`], then address (ascending). Greater is better.
+struct Ranks(BTreeMap<String, (bool, u64)>);
+
+impl Ranks {
+    fn new<'a>(state: &State, height: u64, validators: impl Iterator<Item = &'a String>) -> Self {
+        let (boot, insiders) = (state.bootstrap(), insiders(state, height));
+        Ranks(validators.map(|v| (v.clone(), (state.validators.get(v).is_some_and(|r| r.approved_at.is_some()), ranking_stake(state, &boot, &insiders, v)))).collect())
+    }
+
+    fn of<'a>(&self, validator: &'a str) -> (bool, u64, std::cmp::Reverse<&'a str>) {
+        let (pinned, stake) = self.0.get(validator).copied().unwrap_or_default();
+        (pinned, stake, std::cmp::Reverse(validator))
+    }
+
+    /// Best first.
+    fn sort(&self, vs: &mut [String]) {
+        vs.sort_by(|a, b| self.of(b).cmp(&self.of(a)));
+    }
 }
 
 /// The set for `epoch + 1` if `epoch` ended now, with who joins and who leaves.
@@ -1353,25 +1398,66 @@ pub fn churn_limit(m: usize) -> usize {
 /// except that on chains without admins a set carrying over one to three members grows by one per
 /// epoch (audit F24): under the churn limit alone a set that shrank to one or two could never grow
 /// again, with no fault tolerance (f = 0) for good, and mainnet has no other way to add one.
-/// Below four members every member is needed for a quorum whatever happens, so the newcomer must
-/// be synced and online to keep the chain moving (it's a tracked peer from the epoch before, so
-/// it syncs first); safety is unchanged. Dev and test chains keep small sets closed to strangers
-/// (a stranger that joined and went offline would stall them): their admins pin newcomers.
+/// Past the churn limit the newcomer is needed for every quorum (a set of 2 or 3), so it must be
+/// running and synced: [`select_next`] takes one past the limit only if its consensus key showed
+/// up in the epoch ([`showed_up`], audit review-fix-staking-2), not on stake alone. Safety is
+/// unchanged. Dev and test chains keep small sets closed to strangers (a stranger that joined and
+/// went offline would stall them): their admins pin newcomers.
 pub fn newcomers_allowed(state: &State, kept: usize, size: usize, free: bool) -> usize {
     let limit = churn_limit(size);
     if free && (1..4).contains(&kept) && state.params.admins.is_empty() { limit.max(1) } else { limit }
+}
+
+/// Whether `validator`'s own consensus key signed an `UpdateValidator` in `epoch` (for itself or
+/// its owner, [`Pool::ready_at`]): its node was running then. What a newcomer that every quorum of
+/// a set of 2 or 3 would need must show before it joins (the node sends one: `beacon::duties`).
+pub fn showed_up(state: &State, validator: &str, epoch: u64) -> bool {
+    state.staking.pools.get(validator).and_then(|p| p.ready_at).is_some_and(|h| state.params.epoch_of(h) == epoch)
+}
+
+/// Whether `validator`'s node should show up in `epoch` ([`showed_up`]): it's an eligible
+/// candidate outside `epoch`'s set, the set keeps fewer than four eligible members (so it takes a
+/// newcomer past the churn limit only if that newcomer showed up) on a chain without admins, and
+/// it hasn't yet. The node sends a no-op `UpdateValidator` then (`beacon::duties`).
+pub fn should_show_up(state: &State, validator: &str, epoch: u64) -> bool {
+    let Some(set) = state.active_sets.get(&epoch) else { return false };
+    state.params.admins.is_empty() && !set.iter().any(|v| v == validator) && eligible(state, validator) && set.iter().filter(|v| eligible(state, v)).count() < 4 && !showed_up(state, validator, epoch)
+}
+
+/// Most seats validators owned by `Params::bootstrap_excluded` accounts (the founder's and the
+/// foundation's) may hold in a set of `m` once they're newcomers: `MAX_FOUNDER_SEATS` (DEC-3), and
+/// fewer than f = ⌊(m−1)/3⌋, so together they can't halt the set or veto its council, even with
+/// one more member down (audit xcut-economic-2). Seats they hold already aren't taken away.
+pub fn excluded_seats_cap(m: usize) -> usize {
+    crate::genesis_builder::MAX_FOUNDER_SEATS.min(churn_limit(m).saturating_sub(1))
+}
+
+/// Whether the set `trial` (with newcomer `c` in it) keeps locked insiders within their seats
+/// (audit xcut-economic-2): an account with unvested tokens owns at most one seat (its locked
+/// tokens can fund one validator that ranks, not one per 1% of the supply), and the founder's and
+/// the foundation's accounts no more than [`excluded_seats_cap`] together. Only a newcomer is
+/// held to it: members carried over keep their seats.
+fn insiders_within_seats(state: &State, height: u64, trial: &[String], c: &str) -> bool {
+    let owner = |v: &str| state.validators.get(v).map(|r| r.owner.clone()).unwrap_or_default();
+    let mine = owner(c);
+    if has_unvested_lock(state, &mine, height) && trial.iter().filter(|v| owner(v) == mine).count() > 1 {
+        return false;
+    }
+    let excluded = &state.params.bootstrap_excluded;
+    !excluded.contains(&mine) || trial.iter().filter(|v| excluded.contains(&owner(v))).count() <= excluded_seats_cap(trial.len())
 }
 
 /// Picks the next set (see the module docs). Pure: the API previews it.
 pub fn select_next(state: &State, epoch: u64) -> Selection {
     let current: Vec<String> = state.active_sets.get(&epoch).cloned().unwrap_or_default();
     let cap = state.chain_params.max_validators.max(1) as usize;
-    let boot = state.bootstrap();
-    let by_rank = |a: &String, b: &String| rank(state, &boot, b).cmp(&rank(state, &boot, a));
-    let pinned = |v: &str| state.validators.get(v).is_some_and(|r| r.approved_at.is_some());
+    let height = state.params.last_of(epoch);
+    let mut newcomers: Vec<String> = state.validators.keys().filter(|v| !current.contains(v) && eligible(state, v)).cloned().collect();
+    let ranks = Ranks::new(state, height, current.iter().chain(&newcomers));
+    let pinned = |v: &str| ranks.of(v).0;
     // Members that may stay; the ineligible leave whatever the limit.
     let mut keep: Vec<String> = current.iter().filter(|v| eligible(state, v)).cloned().collect();
-    keep.sort_by(by_rank);
+    ranks.sort(&mut keep);
     // Over the cap (governance lowered it): the lowest-ranked leave, ⌊(n−1)/3⌋ (at least one)
     // per epoch.
     let mut shrink = churn_limit(current.len()).max(1);
@@ -1380,25 +1466,37 @@ pub fn select_next(state: &State, epoch: u64) -> Selection {
         shrink -= 1;
     }
     // Newcomers, best first: into a free seat, or in place of the lowest-ranked member they
-    // outrank, while newcomers stay within the churn limit of the resulting set. Admin-pinned
-    // validators (dev and test chains) skip the limit: that's the admin's call.
-    let mut newcomers: Vec<String> = state.validators.keys().filter(|v| !current.contains(v) && eligible(state, v)).cloned().collect();
-    newcomers.sort_by(by_rank);
+    // outrank, while newcomers stay within the churn limit of the resulting set and insiders
+    // within their seats. Admin-pinned validators (dev and test chains) skip both: that's the
+    // admin's call.
+    ranks.sort(&mut newcomers);
     let mut joined = 0;
     for c in newcomers {
         let free = keep.len() < cap;
-        if !free && !keep.last().is_some_and(|last| rank(state, &boot, &c) > rank(state, &boot, last)) {
+        if !free && !keep.last().is_some_and(|last| ranks.of(&c) > ranks.of(last)) {
             break;
         }
         let size = if free { keep.len() + 1 } else { keep.len() };
-        if !pinned(&c) && joined + 1 > newcomers_allowed(state, keep.len() - joined, size, free) {
-            break;
+        if !pinned(&c) && joined + 1 > churn_limit(size) {
+            if joined + 1 > newcomers_allowed(state, keep.len() - joined, size, free) {
+                break;
+            }
+            // Past the churn limit (a set of 2 or 3): only a newcomer that showed up. A later one
+            // may have.
+            if !showed_up(state, &c, epoch) {
+                continue;
+            }
         }
+        let mut trial = keep.clone();
         if !free {
-            keep.pop();
+            trial.pop();
         }
-        keep.push(c);
-        keep.sort_by(by_rank);
+        trial.push(c.clone());
+        if !pinned(&c) && !insiders_within_seats(state, height, &trial, &c) {
+            continue;
+        }
+        keep = trial;
+        ranks.sort(&mut keep);
         joined += 1;
     }
     if keep.is_empty() {
@@ -1456,8 +1554,7 @@ pub fn end_epoch(state: &mut State, epoch: u64) {
 pub fn likely_candidates(state: &State, epoch: u64, limit: usize) -> Vec<String> {
     let current = state.active_sets.get(&epoch).cloned().unwrap_or_default();
     let mut c: Vec<String> = state.validators.keys().filter(|v| !current.contains(v) && eligible(state, v)).cloned().collect();
-    let boot = state.bootstrap();
-    c.sort_by(|a, b| rank(state, &boot, b).cmp(&rank(state, &boot, a)));
+    Ranks::new(state, state.params.last_of(epoch), c.iter()).sort(&mut c);
     c.truncate(limit);
     c
 }
@@ -1591,8 +1688,8 @@ fn holdings_valued(state: &State, account: &str, at_cost: bool) -> (u64, u64) {
 
 /// Pays `amount` of issuance (already minted by the caller) to the pools of the validators
 /// active at `height`, pro rata to stake; jailed and tombstoned validators get none. Each pool's
-/// owner gets its commission as new shares. Returns what was paid: the caller burns the rest or
-/// sends it to the treasury.
+/// owner gets its commission as new shares ([`credit_reward`]). Returns what was paid: the caller
+/// burns the rest or sends it to the treasury.
 pub fn distribute_rewards(state: &mut State, j: &mut Journal, amount: u64, height: u64) -> u64 {
     let epoch = state.params.epoch_of(height);
     let mut paid_to: Vec<(String, u64)> = state
@@ -1609,31 +1706,70 @@ pub fn distribute_rewards(state: &mut State, j: &mut Journal, amount: u64, heigh
     for (v, stake) in paid_to {
         let reward = (amount as u128 * stake as u128 / total) as u64;
         if reward > 0 {
-            credit_reward(state, j, &v, reward);
+            credit_reward(state, j, &v, reward, height);
             paid += reward;
         }
     }
     paid
 }
 
-/// Adds `reward` to a pool: every share gains, and the owner gets its commission as new shares
-/// worth (at most) the commission.
-fn credit_reward(state: &mut State, j: &mut Journal, validator: &str, reward: u64) {
-    let (owner, bps) = state.validators.get(validator).map(|r| (r.owner.clone(), r.commission_bps)).unwrap_or_default();
+/// The commission a validator charges now: its own, at most `commission_max_bps` (a lowered cap
+/// binds every validator at once; audit gap-5-1, gap-6-2).
+pub fn commission_rate(state: &State, validator: &str) -> u64 {
+    state.validators.get(validator).map_or(0, |r| r.commission_bps.min(state.chain_params.commission_max_bps))
+}
+
+/// Accounts with unvested tokens at `height` (insiders, 3.7), the keyless bootstrap delegation
+/// aside. Only genesis allocations carry vesting locks, so this is O(vesting accounts).
+pub fn insiders(state: &State, height: u64) -> Vec<String> {
+    let boot = state.bootstrap();
+    state.accounts.indexed().into_iter().filter(|a| *a != boot && has_unvested_lock(state, a, height)).collect()
+}
+
+/// Adds `reward` to a pool at `height`: every share gains, less the commission ([`commission_rate`]
+/// of the reward), which every share pays alike, so shares stay one price. The owner gets it as new
+/// shares worth (at most) it, except the part paid on stake that may not pay an owner it chose,
+/// which goes to the treasury:
+///
+/// * stake of accounts still vesting (other than the owner's own): none to the owner, so locked
+///   tokens yield no liquid income through a validator their holder picked, its own non-vesting
+///   account or an accomplice's at 100% (3.7, audit xcut-economic-3);
+/// * the bootstrap delegation's stake: at most `bootstrap_commission_cap_bps` to the owner (DEC-5:
+///   its rewards are the treasury's; audit F12, review-fix-gov-1).
+fn credit_reward(state: &mut State, j: &mut Journal, validator: &str, reward: u64, height: u64) {
+    let (owner, bps) = (state.validators.get(validator).map(|r| r.owner.clone()).unwrap_or_default(), commission_rate(state, validator));
     let commission = bps_of(reward, bps);
+    let to_owner = if commission == 0 { 0 } else { owners_commission(state, validator, &owner, reward, bps, height).min(commission) };
+    let to_treasury = commission - to_owner;
     let p = pool_mut(state, j, validator).expect("rewarded pools exist");
-    p.stake += reward;
-    p.rewards += reward;
-    // Shares that make `commission` of the new stake: commission × shares / (the rest of it).
-    let minted = mul_div(commission as u128, p.shares, (p.stake - commission) as u128).unwrap_or(0);
-    if minted == 0 {
-        return;
+    p.stake += reward - to_treasury;
+    p.rewards += reward - to_treasury;
+    // Shares that make `to_owner` of the new stake: to_owner × shares / (the rest of it).
+    let minted = mul_div(to_owner as u128, p.shares, (p.stake - to_owner) as u128).unwrap_or(0);
+    if minted > 0 {
+        p.shares += minted;
+        let key = dkey(&owner, validator);
+        let mut d = state.staking.delegations.get(&key).cloned().unwrap_or_default();
+        d.shares += minted;
+        put_delegation(state, j, &key, Some(d));
     }
-    p.shares += minted;
-    let key = dkey(&owner, validator);
-    let mut d = state.staking.delegations.get(&key).cloned().unwrap_or_default();
-    d.shares += minted;
-    put_delegation(state, j, &key, Some(d));
+    if to_treasury > 0 {
+        let treasury = state.treasury();
+        state.j_credit(j, &treasury, to_treasury);
+    }
+}
+
+/// What of a `reward`'s commission (at `bps`) the pool's owner gets (see [`credit_reward`]): the
+/// full rate on the part earned by shares that aren't insiders' or the bootstrap delegation's, at
+/// most `bootstrap_commission_cap_bps` on the bootstrap's part, nothing on insiders' parts.
+fn owners_commission(state: &State, validator: &str, owner: &str, reward: u64, bps: u64, height: u64) -> u64 {
+    let Some(shares) = state.staking.pools.get(validator).map(|p| p.shares).filter(|s| *s > 0) else { return 0 };
+    let held = |a: &str| if a == owner { 0 } else { state.staking.delegations.get(&dkey(a, validator)).map_or(0, |d| d.shares) };
+    let part = |s: u128| mul_div(reward as u128, s, shares).unwrap_or(0).min(reward as u128) as u64;
+    let boot = part(held(&state.bootstrap()));
+    let locked = part(insiders(state, height).iter().map(|a| held(a)).sum());
+    let rest = reward.saturating_sub(boot).saturating_sub(locked);
+    bps_of(rest, bps) + bps_of(boot, bps.min(state.chain_params.bootstrap_commission_cap_bps))
 }
 
 /// The active validator (in `epoch`) the tx sender or signer acts for: the validator whose
@@ -1664,6 +1800,12 @@ pub fn validator_for_signer(state: &State, account: &str, signer_key_id: &str, e
 /// with `from` = its owner, who pays the fee, so the consensus key only needs a fee float, if
 /// that. Admission calls this when the signer isn't a key on `from`: the key record such a
 /// signature acts with, or `None` (not allowed).
+///
+/// What the owner pays for is bounded by the validator's duties (audit F04: the key is hot, and
+/// protocol v1 can't revoke it): such a tx whose action fails isn't admitted, so it's never
+/// charged (`State::apply_j`); it updates the validator at most once an epoch (`UpdateValidator`);
+/// and a tombstoned or removed validator's key signs only a reveal for a commitment it made while
+/// active (the beacon checks there is one), never anything else again.
 pub fn system_tx_key(state: &State, tx: &Tx, sender: &str, signer: &str) -> Option<KeyRecord> {
     let system = matches!(tx.action, Action::AttestClaim { .. } | Action::AttestRevert { .. } | Action::BeaconCommit { .. } | Action::BeaconReveal { .. } | Action::ReportEquivocation { .. } | Action::UpdateValidator { .. });
     if !system {
@@ -1671,6 +1813,9 @@ pub fn system_tx_key(state: &State, tx: &Tx, sender: &str, signer: &str) -> Opti
     }
     let v = validator_of_key(state, signer)?;
     let rec = state.validators.get(&v).filter(|r| r.owner == sender && r.consensus_key == tx.public_key)?;
+    if matches!(rec.status, ValidatorStatus::Tombstoned | ValidatorStatus::Removed) && !matches!(tx.action, Action::BeaconReveal { .. }) {
+        return None;
+    }
     Some(KeyRecord { label: "validator consensus key".into(), role: KeyRole::Owner, added_at: rec.registered_at, spent: 0, window_start: 0 })
 }
 

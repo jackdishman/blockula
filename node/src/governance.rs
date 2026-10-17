@@ -13,7 +13,8 @@
 //! **Tally.** Quorum is `max(quorum_floor, quorum_bps × unlocked supply)` on the raw FANG voted
 //! (aye + nay), where the unlocked supply is what could vote: what every account but the keyless
 //! system ones holds (liquid, staked at its pool's value, unbonding) less what vesting locks still
-//! hold of it ([`unlocked_supply`], O(vesting accounts) from running totals). A proposal passes on tokens if it reached quorum and its
+//! hold of it and what still-vesting accounts' stake earned and hasn't sold (`econ::voting_balance`;
+//! [`unlocked_supply`], O(vesting accounts) from running totals). A proposal passes on tokens if it reached quorum and its
 //! conviction-weighted ayes beat the nays: by a simple majority, or by `supermajority_bps` of the
 //! weight for upgrades (and cancelling them), feature activations, issuance parameters and treasury spends above
 //! `treasury_large_bps` of the treasury. Until `bootstrap_end_height` it also passes if ⅔ of the active set approve
@@ -627,7 +628,8 @@ fn system_accounts(prefix: &str) -> [String; 5] {
 
 /// What could vote at `height` (the quorum base): the FANG every account but the keyless system
 /// ones holds, liquid, in stake pools (at the pools' value) or unbonding, less what vesting
-/// locks still hold of it. O(vesting accounts + the system accounts' delegations), not
+/// accounts can't vote with yet ([`still_vesting`]): the sum of every account's
+/// `econ::voting_balance`. O(vesting accounts + their and the system accounts' delegations), not
 /// O(accounts): balances, pool stake and unbonding are running totals their maps keep
 /// (`chain::AccountTotals`, `staking::PoolStake`, `staking::UnbondingTotal`), and only genesis
 /// allocations carry vesting locks. `check_invariants` compares it with
@@ -641,16 +643,17 @@ pub fn unlocked_supply(state: &State, height: u64) -> u128 {
     held - vesting
 }
 
-/// What `account`'s vesting locks still hold at `height`, up to what it holds (fees and slashes
-/// may have taken locked tokens): the part of its holdings that can't vote yet.
+/// The part of a still-vesting `account`'s holdings (stake at the pools' value) that can't vote
+/// yet: all of it but `econ::voting_balance`, which leaves out what the vesting locks still hold
+/// and what its locked stake earned and hasn't sold (it vests with them).
 fn still_vesting(state: &State, account: &str, height: u64) -> u128 {
     let Some(a) = state.accounts.get(account) else { return 0 };
-    let unvested = a.unvested_at(height);
-    if unvested == 0 {
+    if a.unvested_at(height) == 0 {
         return 0;
     }
     let (staked, unbonding) = crate::staking::holdings(state, account);
-    (unvested as u128).min(a.balance as u128 + staked as u128 + unbonding as u128)
+    let held = a.balance as u128 + staked as u128 + unbonding as u128;
+    held - crate::econ::voting_balance(state, account, height) as u128
 }
 
 /// [`unlocked_supply`] from scratch, walking every account, pool and entry: O(state), for checks.
@@ -702,8 +705,9 @@ pub fn recent_spends(state: &State, height: u64) -> u128 {
 /// Whether the bootstrap council may pass a kind on its own: anything but a change to
 /// governance's own safety parameters (`params::GOVERNANCE_KEYS`), which only token holders
 /// decide, so the council can't extend itself, open spending early or weaken the vote that
-/// checks it (audit F15, F16), or to the tip cap (`params::PROPOSER_PAY_KEYS`), so the validators
-/// can't raise what a signature may pay them (audit F01).
+/// checks it (audit F15, F16), or to what pays the validators (`params::PROPOSER_PAY_KEYS`: the
+/// tip cap and the bootstrap delegation's commission cap), so they can't raise what a signature
+/// or the treasury's bootstrap stake pays them (audit F01, F12).
 pub fn council_may_pass(kind: &ProposalKind) -> bool {
     !matches!(kind, ProposalKind::ParamChange { key, .. } if crate::params::tokens_only(key))
 }

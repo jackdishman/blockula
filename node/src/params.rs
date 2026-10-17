@@ -100,6 +100,10 @@ chain_params! { |day, epoch|
     commission_max_change_bps: 100, [0, 10_000];
     /// Most an account with vesting locks may delegate to one pool, in bps of the supply (3.7).
     insider_delegation_cap_bps: 100, [0, 10_000];
+    /// Most commission the bootstrap delegation's stake pays a validator (DEC-5: its rewards are
+    /// the treasury's): a validator charging more keeps this much of the bootstrap's part and the
+    /// rest goes to the treasury (audit F12, review-fix-gov-1). Raising it pays the validators.
+    bootstrap_commission_cap_bps: 1_000, [0, 10_000];
     /// Oldest equivocation evidence accepted; at most `unbonding_blocks` of epochs.
     evidence_max_age_epochs: ((21 * day).max(epoch) / epoch).max(1), [1, 365 * day];
 
@@ -187,11 +191,12 @@ chain_params! { |day, epoch|
 /// their floors.
 pub const GOVERNANCE_KEYS: &[&str] = &["voting_blocks", "timelock_blocks", "lock_period_blocks", "quorum_bps", "quorum_floor", "supermajority_bps", "treasury_large_bps", "governance_spend_height", "bootstrap_end_height"];
 
-/// Parameters whose raise pays the block proposers, who sit on the bootstrap council: the tip cap
-/// (audit F01; a higher `tip_cap_multiple` lets one signature hand its block's proposer more).
-/// Like [`GOVERNANCE_KEYS`], a change needs the token supermajority and can't pass by the
-/// council; its code bounds still apply.
-pub const PROPOSER_PAY_KEYS: &[&str] = &["tip_cap_multiple"];
+/// Parameters whose raise pays the validators, who sit on the bootstrap council: the tip cap
+/// (audit F01; a higher `tip_cap_multiple` lets one signature hand its block's proposer more) and
+/// the bootstrap delegation's commission cap (a higher one hands the operators more of the
+/// treasury's bootstrap rewards; audit F12). Like [`GOVERNANCE_KEYS`], a change needs the token
+/// supermajority and can't pass by the council; the code bounds still apply.
+pub const PROPOSER_PAY_KEYS: &[&str] = &["tip_cap_multiple", "bootstrap_commission_cap_bps"];
 
 /// Whether a `ParamChange` of `key` is the token holders' alone: it needs the supermajority and
 /// the bootstrap council can't pass it ([`GOVERNANCE_KEYS`], [`PROPOSER_PAY_KEYS`]).

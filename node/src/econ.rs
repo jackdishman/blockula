@@ -445,11 +445,15 @@ pub fn free(state: &State, account: &str, height: u64) -> i128 {
 
 /// What `account` may vote with at `height`: its holdings (liquid + staked + unbonding) minus
 /// what its vesting locks still hold. Vote locks don't count: one stake votes on many proposals.
+/// An account that's still vesting counts its stake at cost, as [`free`] does: what its locked
+/// stake earned and hasn't sold yet vests with it, so it doesn't vote before it vests (audit
+/// xcut-economic-1).
 pub fn voting_balance(state: &State, account: &str, height: u64) -> u64 {
     let Some(a) = state.accounts.get(account) else { return 0 };
-    let (staked, unbonding) = crate::staking::holdings(state, account);
+    let unvested = a.unvested_at(height);
+    let (staked, unbonding) = if unvested > 0 { crate::staking::holdings_at_cost(state, account) } else { crate::staking::holdings(state, account) };
     let held = a.balance as u128 + staked as u128 + unbonding as u128;
-    held.saturating_sub(a.unvested_at(height) as u128).min(u64::MAX as u128) as u64
+    held.saturating_sub(unvested as u128).min(u64::MAX as u128) as u64
 }
 
 /// Locks `amount` of `account`'s vested holdings ([`voting_balance`]) until (not including)
