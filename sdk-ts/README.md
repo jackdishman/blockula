@@ -7,16 +7,22 @@ npm install @blockula/sdk
 ```
 
 ```ts
-import { Client, Wallet } from "@blockula/sdk";
+import { Client, Wallet, encodeKeyGrant } from "@blockula/sdk";
 
 const wallet = Wallet.generate(new Client("http://localhost:7070"));
 await wallet.faucet();                        // test chains: 100 FANG
 await wallet.registerName("vlad");            // vlad.boo
 await wallet.send("alice.boo", "1.5", { memo: "trick or treat" });
 
-// Let an agent spend up to 10 FANG/day from this account (enforced on-chain)
-await wallet.addSessionKey(agentKeyId, "claude", { limit: "10", periodBlocks: 86_400, expiresInBlocks: 30 * 86_400 });
+// Let an agent spend up to 10 FANG/day from this account (enforced on-chain). The agent's key
+// consents to joining this account first: its grant code (the MCP's use_account answers with one).
+const agentGrantCode = encodeKeyGrant(await agent.keyGrant(wallet.account));
+await wallet.addSessionKey(agentGrantCode, "claude", { limit: "10", periodBlocks: 86_400, expiresInBlocks: 30 * 86_400 });
 ```
+
+Adding a key needs the key's consent (audit gap-7-2): `AddKey` carries the key's public key and its signature over the chain, the account and its key id, so nobody can put your key on their account (and pad `client.keyAccounts(keyId)`, which pages with `{ after }`). The key's holder makes it with `keyGrant(account)`; `encodeKeyGrant`/`decodeKeyGrant` turn it into a pasteable `bkgrant1.…` code, `verifyKeyGrant` checks one, and `addOwnerKey`/`addSessionKey` take either and refuse a grant made for another account or chain.
+
+Votes, multisig approvals and sealed Séance judgments bind what they approve (audit gap-7-6): `vote(id, aye, amount, conviction, { proposal })` signs `proposalDigest(kind, title, url)` of the proposal you showed, `multisigApprove(id, { action })` signs `actionDigest(action)`, and `sealVotes(…, { pairs })` signs `seancePairsDigest` of the pairs and PRs the juror compared (each read from the client when not given). The chain refuses a digest that doesn't match what's stored, so a node that misreports what's being approved makes it fail instead of landing elsewhere.
 
 In the browser, a passkey unlocks the wallet. There's no seed phrase, and the passkey's (non-quantum-safe) signature is never used on-chain. Its PRF output derives the ML-DSA key:
 
