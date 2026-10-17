@@ -881,6 +881,9 @@ async fn upgrade(State(n): State<Node>) -> ApiResult {
         "protocol_version": crate::upgrade::version_at(st, h + 1),
         "supported_protocol_version": crate::consensus::SUPPORTED_PROTOCOL_VERSION,
         "schedule": st.upgrade.schedule.iter().map(|u| json!({ "version": u.version, "activation_height": u.activation_height, "active": u.activation_height <= h + 1 })).collect::<Vec<_>>(),
+        // What cancellations withdrew: versions through `highest_version` are never scheduled
+        // again, and upgrade proposals made by `last_cancelled_at` are superseded.
+        "withdrawn": { "highest_version": st.upgrade.withdrawals.highest, "last_cancelled_at": st.upgrade.withdrawals.last_at },
         "next": next.map(|u| json!({ "version": u.version, "activation_height": u.activation_height, "blocks_left": u.activation_height.saturating_sub(h + 1), "this_binary_supports_it": u.version <= crate::consensus::SUPPORTED_PROTOCOL_VERSION })),
         "halted": n.halt.get().map(|h| json!({ "kind": h.kind(), "reason": h.to_string() })),
         "readiness": {
@@ -891,7 +894,7 @@ async fn upgrade(State(n): State<Node>) -> ApiResult {
             "window_blocks": headers.len(),
             "validators": active.iter().map(|a| json!({ "validator": label(&v, a), "signal": signals.get(a).map(|s| s.0), "seen_at": signals.get(a).map(|s| s.1) })).collect::<Vec<_>>(),
         },
-        "explainer": "Blocks carry the protocol version in force at their height and signal the newest version their proposer's binary supports. An upgrade is scheduled by governance once at least two-thirds of the active set signal it, and can be withdrawn by governance (CancelUpgrade) until 64 blocks before it activates; a node whose binary doesn't support the version in force stops before that height instead of diverging.",
+        "explainer": "Blocks carry the protocol version in force at their height and signal the newest version their proposer's binary supports. An upgrade is scheduled by governance once at least two-thirds of the active set signal it, and can be withdrawn by governance (CancelUpgrade) until 64 blocks before it activates (a withdrawn version number is never scheduled again, and upgrade proposals made before the withdrawal are superseded); a node whose binary doesn't support the version in force stops before that height instead of diverging.",
     })))
 }
 
@@ -1197,6 +1200,14 @@ async fn params(State(n): State<Node>) -> ApiResult {
         },
         "supply": st.supply.to_string(),
         "burned": st.burned.to_string(),
+        // Who changes what: governance's safety parameters and the validators' own economics take
+        // the token supermajority and never pass by the bootstrap council; the council may also
+        // pass the `council` keys (any key not listed there is the token holders' alone).
+        "classes": {
+            "governance": crate::params::GOVERNANCE_KEYS,
+            "validators": crate::params::VALIDATOR_KEYS,
+            "council": crate::params::COUNCIL_KEYS,
+        },
     })))
 }
 
@@ -1949,6 +1960,8 @@ fn proposal_json(v: &ReadView, p: &crate::governance::Proposal) -> Value {
         "execute_at": p.execute_at,
         // Decided at the close; until then, what it would need now.
         "supermajority": p.tally.as_ref().map(|t| t.supermajority).unwrap_or_else(|| crate::governance::needs_supermajority(st, &p.kind)),
+        // Whether the bootstrap council's ⅔ can pass it (not the token holders' parameters).
+        "council_may_pass": crate::governance::council_may_pass(&p.kind),
         "ayes": { "amount": big_amount(p.aye_amount), "weight": big_amount(p.aye_weight) },
         "nays": { "amount": big_amount(p.nay_amount), "weight": big_amount(p.nay_weight) },
         "voters": p.voters,
@@ -1984,6 +1997,8 @@ async fn proposals(State(n): State<Node>, Query(q): Query<ProposalQuery>) -> Api
     Ok(Json(json!({
         "count": g.proposals.len(),
         "next_id": g.next_proposal_id,
+        // A distribution id no distribution or open proposal uses: what a new tree is built for.
+        "next_distribution_id": crate::governance::next_distribution_id(st),
         "council_active": v.height < cp.bootstrap_end_height,
         "spending_open": v.height >= cp.governance_spend_height,
         "params": {
@@ -2049,7 +2064,7 @@ async fn distribution(State(n): State<Node>, Path(id): Path<u64>, Query(q): Quer
     let remaining = d.total - d.claimed;
     Ok(Json(json!({
         "id": d.id,
-        "proposal": d.id,
+        "proposal": d.proposal,
         "merkle_root": d.merkle_root,
         "total": d.total.to_string(),
         "total_display": fmt_fang(d.total),
@@ -2543,6 +2558,8 @@ mod http_tests {
         let (_, p, _) = call(&n, "GET", "/api/params", None, "127.0.0.1:1").await;
         assert_eq!((p["params"]["max_block_bytes"].as_str(), p["params"]["name_price_5"].as_str()), (Some("2097152"), Some("5000000000")));
         assert_eq!((p["genesis"]["epochs_per_year"].as_u64(), p["issuance"]["year"].as_u64()), (Some(52_596), Some(0)));
+        let in_class = |class: &str, key: &str| p["classes"][class].as_array().unwrap().iter().any(|k| k == key);
+        assert!(in_class("governance", "supermajority_bps") && in_class("validators", "slash_downtime_bps") && in_class("council", "max_validators") && !in_class("council", "issuance_initial_ppm"));
         let (_, a, _) = call(&n, "GET", "/api/name/alice.boo", None, "127.0.0.1:1").await;
         assert_eq!((a["status"].as_str(), a["available"].as_bool(), a["price"].as_str(), a["renewal_price"].as_str()), (Some("available"), Some(true), Some("5000000000"), Some("1000000000")));
         // Register it; the name shows its owner and expiry, and the tx what it was charged.

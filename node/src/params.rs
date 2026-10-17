@@ -184,25 +184,85 @@ chain_params! { |day, epoch|
 }
 
 /// Governance's own safety parameters (audit F15, F16). A `ParamChange` of one needs the
-/// supermajority, can't pass by the bootstrap council, and moves it only toward safety or not
-/// past a floor in code ([`ChainParams::check_governance_change`]), so a vote can't make the next
-/// vote easier to win than the design allows: the spend gate never opens earlier, the bootstrap
-/// council never outlives its end, and voting, the timelock, quorum and the supermajority keep
-/// their floors.
+/// supermajority, can't pass by the bootstrap council, and stays within a band in code
+/// ([`ChainParams::check_governance_change`]), so a vote can't make the next vote easier to win
+/// than the design allows (the spend gate never opens earlier, the bootstrap council never
+/// outlives its end, and voting, the timelock, quorum and the supermajority keep their floors),
+/// nor make it impossible to win (the supermajority and quorum keep ceilings, and the spend gate
+/// moves at most a year out; review-fix-gov-3), so the next vote can always undo it.
 pub const GOVERNANCE_KEYS: &[&str] = &["voting_blocks", "timelock_blocks", "lock_period_blocks", "quorum_bps", "quorum_floor", "supermajority_bps", "treasury_large_bps", "governance_spend_height", "bootstrap_end_height"];
 
-/// Parameters whose raise pays the validators, who sit on the bootstrap council: the tip cap
-/// (audit F01; a higher `tip_cap_multiple` lets one signature hand its block's proposer more) and
-/// the bootstrap delegation's commission cap (a higher one hands the operators more of the
-/// treasury's bootstrap rewards; audit F12). Like [`GOVERNANCE_KEYS`], a change needs the token
-/// supermajority and can't pass by the council; the code bounds still apply.
-pub const PROPOSER_PAY_KEYS: &[&str] = &["tip_cap_multiple", "bootstrap_commission_cap_bps"];
+/// The validators' own economics (review-integrate-merges-1): what they're paid (issuance and
+/// its split, the tip cap (audit F01: a higher one lets one signature hand its block's proposer
+/// more), the commission bounds), what being one takes (the self-bond, the cap on insiders'
+/// delegations to one pool) and how they're penalized (slashes, jail, downtime, the evidence
+/// window, the reporter's share, beacon misses), plus the most commission the bootstrap
+/// delegation's stake pays them (`bootstrap_commission_cap_bps`, audit F12: a higher one hands
+/// the operators more of the treasury's bootstrap rewards). The bootstrap council is the
+/// validators, so like [`GOVERNANCE_KEYS`] a change needs the token supermajority and never
+/// passes by the council; the code bounds still apply.
+pub const VALIDATOR_KEYS: &[&str] = &[
+    "min_self_bond",
+    "slash_double_sign_bps",
+    "slash_downtime_bps",
+    "downtime_window",
+    "downtime_max_missed",
+    "jail_blocks",
+    "reporter_reward_bps",
+    "commission_max_bps",
+    "commission_max_change_bps",
+    "insider_delegation_cap_bps",
+    "bootstrap_commission_cap_bps",
+    "evidence_max_age_epochs",
+    "tip_cap_multiple",
+    "issuance_initial_ppm",
+    "issuance_decay_ppm",
+    "issuance_floor_ppm",
+    "issuance_stakers_bps",
+    "issuance_pool_bps",
+    "beacon_miss_slash_bps",
+];
+
+/// The parameters the bootstrap council may also change, by its ⅔ (simple-majority keys for
+/// token votes): the active set's size, unbonding (it can't fall below the evidence window,
+/// which is the token holders'), fees, deposits and periods outside governance's own, names and
+/// Ghost Mode's limits. Every other key, including one added later and not listed here, is the
+/// token holders' alone ([`tokens_only`]).
+pub const COUNCIL_KEYS: &[&str] = &[
+    "max_validators",
+    "unbonding_blocks",
+    "base_fee_floor_flat",
+    "base_fee_floor_per_byte",
+    "target_fullness_bps",
+    "base_fee_max_change_bps",
+    "max_block_bytes",
+    "account_creation_fee",
+    "max_tx_validity_blocks",
+    "proposal_deposit",
+    "multisig_expiry_blocks",
+    "name_price_3",
+    "name_price_4",
+    "name_price_5",
+    "name_renewal_bps",
+    "name_registration_blocks",
+    "name_grace_blocks",
+    "ghost_pool_cap",
+    "ghost_max_tx_bytes",
+    "ghost_max_block_bytes",
+    "ghost_anchor_window",
+    "ghost_verify_fee",
+];
 
 /// Whether a `ParamChange` of `key` is the token holders' alone: it needs the supermajority and
-/// the bootstrap council can't pass it ([`GOVERNANCE_KEYS`], [`PROPOSER_PAY_KEYS`]).
+/// the bootstrap council can't pass it. That's every key but [`COUNCIL_KEYS`]: governance's own
+/// ([`GOVERNANCE_KEYS`]) and the validators' ([`VALIDATOR_KEYS`]).
 pub fn tokens_only(key: &str) -> bool {
-    GOVERNANCE_KEYS.contains(&key) || PROPOSER_PAY_KEYS.contains(&key)
+    !COUNCIL_KEYS.contains(&key)
 }
+
+/// How far past the block that changes it `governance_spend_height` may move (a year): a vote can
+/// close spending again, but not for longer than that, so it reopens by itself (review-fix-gov-3).
+pub const SPEND_GATE_MAX_DELAY_DAYS: u64 = 365;
 
 /// Highest `Vote::conviction`.
 pub const MAX_CONVICTION: u8 = 6;
@@ -282,31 +342,44 @@ impl ChainParams {
         Ok(())
     }
 
-    /// The rule a `ParamChange` of `key` to `value` follows on top of the bounds: for
-    /// [`GOVERNANCE_KEYS`], toward safety, or toward weaker governance no further than a floor in
-    /// code (on a chain whose genesis starts below one, only toward safety): voting at least 3
-    /// days, the timelock and the lock period at least a day, quorum at least 1% and 5M FANG, the
-    /// supermajority at least 60%, the large-spend line at most 5% of the treasury. The spend gate
-    /// never moves earlier and the bootstrap council's end never later.
-    pub fn check_governance_change(&self, key: &str, value: u64, p: &Params) -> Result<()> {
-        let Some(old) = self.get(key) else { return Ok(()) };
+    /// The band governance keeps a safety parameter in, `(floor, ceiling)` with what each means:
+    /// voting at least 3 days, the timelock and the lock period at least a day, quorum 1–10% of
+    /// the unlocked supply and 5M–50M FANG (2.5× the defaults at most, so it stays reachable), the
+    /// supermajority 60–80% (so a dust nay can't veto every upgrade, review-fix-gov-3), the
+    /// large-spend line at most 5% of the treasury. `None` for keys without one.
+    pub fn governance_band(key: &str, p: &Params) -> Option<((u64, &'static str), (u64, &'static str))> {
         let day = blocks_per_day(p.block_time_ms);
-        let at_least = |floor: u64, what: &str| -> Result<()> {
-            ensure!(value >= old || value >= floor, "governance can lower {key} to {floor} at the least ({what}); it's {old}");
-            Ok(())
-        };
+        let (min, max) = Self::bounds(key, p)?;
+        Some(match key {
+            "voting_blocks" => ((3 * day, "3 days"), (max, "the code bound")),
+            "timelock_blocks" | "lock_period_blocks" => ((day, "a day"), (max, "the code bound")),
+            "quorum_bps" => ((100, "1%"), (1_000, "10% of the unlocked supply")),
+            "quorum_floor" => ((5_000_000 * FANG, "5M FANG"), (50_000_000 * FANG, "50M FANG")),
+            "supermajority_bps" => ((6_000, "60%"), (8_000, "80%")),
+            "treasury_large_bps" => ((min, "the code bound"), (500, "5% of the treasury")),
+            _ => return None,
+        })
+    }
+
+    /// The rule a `ParamChange` of `key` to `value` at `height` follows on top of the bounds, for
+    /// [`GOVERNANCE_KEYS`]: within [`ChainParams::governance_band`], or (on a chain whose genesis
+    /// starts outside it) no further outside than it is. So a vote can neither make the next
+    /// vote easier to win than the floors allow nor impossible to win, and the next vote can
+    /// always move it back. The spend gate never moves earlier, and later by at most
+    /// [`SPEND_GATE_MAX_DELAY_DAYS`] past `height` (or where it already is); the bootstrap
+    /// council's end never moves later.
+    pub fn check_governance_change(&self, key: &str, value: u64, p: &Params, height: u64) -> Result<()> {
+        let Some(old) = self.get(key) else { return Ok(()) };
+        if let Some(((floor, low), (ceiling, high))) = Self::governance_band(key, p) {
+            ensure!(value >= old.min(floor), "governance can lower {key} to {floor} at the least ({low}); it's {old}");
+            ensure!(value <= old.max(ceiling), "governance can raise {key} to {ceiling} ({high}) at the most; it's {old}");
+            return Ok(());
+        }
         match key {
-            "voting_blocks" => at_least(3 * day, "3 days"),
-            "timelock_blocks" | "lock_period_blocks" => at_least(day, "a day"),
-            "quorum_bps" => at_least(100, "1%"),
-            "quorum_floor" => at_least(5_000_000 * FANG, "5M FANG"),
-            "supermajority_bps" => at_least(6_000, "60%"),
-            "treasury_large_bps" => {
-                ensure!(value <= old || value <= 500, "governance can raise treasury_large_bps to 500 (5% of the treasury) at the most; it's {old}");
-                Ok(())
-            }
             "governance_spend_height" => {
                 ensure!(value >= old, "the spend gate never moves earlier: governance_spend_height is {old}");
+                let latest = height.saturating_add(SPEND_GATE_MAX_DELAY_DAYS.saturating_mul(blocks_per_day(p.block_time_ms))).max(old);
+                ensure!(value <= latest, "governance can move the spend gate to block {latest} at the latest ({SPEND_GATE_MAX_DELAY_DAYS} days past block {height}); it's {old}");
                 Ok(())
             }
             "bootstrap_end_height" => {
@@ -317,24 +390,20 @@ impl ChainParams {
         }
     }
 
-    /// Whether these values already sit on the safe side of every floor
-    /// [`ChainParams::check_governance_change`] keeps (mainnet's genesis must).
+    /// Whether these values already sit inside every band [`ChainParams::check_governance_change`]
+    /// keeps, with the spend gate at most [`SPEND_GATE_MAX_DELAY_DAYS`] out (mainnet's genesis
+    /// must).
     pub fn check_governance_floors(&self, p: &Params) -> Result<()> {
-        for key in ["voting_blocks", "timelock_blocks", "lock_period_blocks", "quorum_bps", "quorum_floor", "supermajority_bps", "treasury_large_bps"] {
+        for key in GOVERNANCE_KEYS {
             let v = self.get(key).expect("a parameter");
-            // A value is at its floor if lowering it (raising, for the large-spend line) to itself
-            // from far past it is allowed.
-            let from = if key == "treasury_large_bps" { 0 } else { u64::MAX };
-            self.clone().with(key, from).check_governance_change(key, v, p).map_err(|_| anyhow!("parameter `{key}` ({v}) is past governance's floor"))?;
+            if let Some(((floor, _), (ceiling, _))) = Self::governance_band(key, p) {
+                ensure!(v >= floor, "parameter `{key}` ({v}) is past governance's floor ({floor})");
+                ensure!(v <= ceiling, "parameter `{key}` ({v}) is past governance's ceiling ({ceiling})");
+            }
         }
+        let latest = SPEND_GATE_MAX_DELAY_DAYS.saturating_mul(blocks_per_day(p.block_time_ms));
+        ensure!(self.governance_spend_height <= latest, "parameter `governance_spend_height` ({}) is past governance's ceiling ({latest})", self.governance_spend_height);
         Ok(())
-    }
-
-    fn with(mut self, key: &str, value: u64) -> Self {
-        if let Some(slot) = self.slot(key) {
-            *slot = value;
-        }
-        self
     }
 
     /// Every parameter by key (for the API: amounts can exceed 2^53, so render them as strings).
@@ -464,6 +533,34 @@ mod tests {
         // Name prices.
         assert_eq!((c.name_price(3), c.name_price(4), c.name_price(9)), (100 * FANG, 25 * FANG, 5 * FANG));
         assert_eq!(c.name_renewal_price(5, 2), 2 * FANG);
+    }
+
+    /// review-fix-gov-3: governance's safety parameters move within a band, both ways, so no vote
+    /// leaves one where the next vote can't move it back; a chain that starts outside the band
+    /// only moves toward it.
+    #[test]
+    fn safety_parameters_move_within_their_bands() {
+        let p = params();
+        let c = ChainParams::defaults(&p);
+        let ok = |c: &ChainParams, k: &str, v: u64| c.check_governance_change(k, v, &p, 0).is_ok();
+        assert!(ok(&c, "supermajority_bps", 8_000) && !ok(&c, "supermajority_bps", 8_001) && ok(&c, "supermajority_bps", 6_000) && !ok(&c, "supermajority_bps", 5_999));
+        let strict = ChainParams { supermajority_bps: 8_000, quorum_bps: 1_000, quorum_floor: 50_000_000 * FANG, ..c.clone() };
+        assert!(ok(&strict, "supermajority_bps", 6_667) && ok(&strict, "quorum_bps", 400) && ok(&strict, "quorum_floor", 20_000_000 * FANG), "back from the ceiling");
+        assert!(!ok(&c, "quorum_bps", 1_001) && !ok(&c, "quorum_floor", 50_000_000 * FANG + 1));
+        // Outside the band (a test chain's genesis): only toward it, and not past the far side.
+        let loose = ChainParams { quorum_floor: 0, supermajority_bps: 9_000, ..c.clone() };
+        assert!(ok(&loose, "quorum_floor", FANG) && !ok(&loose, "quorum_floor", 50_000_000 * FANG + 1));
+        assert!(ok(&loose, "supermajority_bps", 8_500) && ok(&loose, "supermajority_bps", 9_000) && !ok(&loose, "supermajority_bps", 9_001));
+        // The spend gate: never earlier, at most a year past the block that moves it.
+        let year = SPEND_GATE_MAX_DELAY_DAYS * 86_400;
+        let g = c.governance_spend_height;
+        assert!(c.check_governance_change("governance_spend_height", 1_000 + year, &p, 1_000).is_ok());
+        assert!(c.check_governance_change("governance_spend_height", 1_001 + year, &p, 1_000).is_err());
+        assert!(c.check_governance_change("governance_spend_height", g - 1, &p, 0).is_err());
+        assert!(c.check_governance_change("governance_spend_height", g, &p, 0).is_ok(), "where it is is always fine");
+        // Mainnet's genesis must start inside every band.
+        c.check_governance_floors(&p).unwrap();
+        assert!(strict.check_governance_floors(&p).is_ok() && loose.check_governance_floors(&p).is_err());
     }
 
     #[test]

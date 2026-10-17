@@ -62,7 +62,7 @@ Reads: `client.staking(account)`, `client.proposals()`, `client.proposal(id)`, `
 | GET | `/api/account/{address\|name}` | balance, `next_nonce`, names, recent txs (sent by it or naming it), `github`, `familiars`, hunts created/won, `contribution` (Soul, vouches, jury seat, claims, vesting rewards) |
 | GET | `/api/name/{name}` | `status` (`active`, `grace` (expired, only the owner can renew), `reserved`, `available`), owner, `expires_at`, `grace_until`, price and yearly renewal price |
 | GET | `/api/fees` | the base fee for the next 17 blocks (`slots`: flat drops, `rate` in milli-drops per byte, `max_block_bytes`), `suggested` (covers any of them), `lowest` and `tip_cap_multiple` (a tip is at most that × the base fee), the floor, the account creation fee |
-| GET | `/api/params` | governance parameters (amounts as strings), genesis constants (`epochs_per_year`…), the issuance year (rate, per-epoch mint) |
+| GET | `/api/params` | governance parameters (amounts as strings), genesis constants (`epochs_per_year`…), the issuance year (rate, per-epoch mint), `classes` (who changes which: `governance` and `validators` keys take the token supermajority, never the bootstrap council; the council may also pass `council` keys) |
 | GET | `/api/key/{key_id}` | accounts this key is authorized on |
 | GET | `/api/search/{q}` | `{type, id}` for anything |
 | POST | `/api/faucet` `{to}` | 100 FANG on faucet chains (1 per address/hour, 1 per IP/10 min; unlimited from localhost) |
@@ -79,7 +79,7 @@ Reads: `client.staking(account)`, `client.proposals()`, `client.proposal(id)`, `
 | GET | `/api/claim/{id}` | one claim: PR, validator attestations, score, payout, and while its revert window is open (`revert_window_until`) validators' `revert_attestations` against the set's quorum |
 | GET | `/api/seance/{id}` | one Séance: claims, jurors with their assigned pairs, commitments, reveals, results |
 | GET | `/api/souls?limit=` | Soul leaderboard |
-| GET | `/api/proposals?status=&limit=` | governance proposals, newest first (`voting`/`queued`/`rejected`/`executed`/`failed`), the rules (deposit, periods, quorum, council, spend height), treasury and community balances, `next_id` |
+| GET | `/api/proposals?status=&limit=` | governance proposals, newest first (`voting`/`queued`/`rejected`/`executed`/`failed`), the rules (deposit, periods, quorum, council, spend height), treasury and community balances, `next_id`, `next_distribution_id` (an id no distribution or open `Distribution` proposal uses) |
 | GET | `/api/proposal/{id}` | one proposal: kind and summary, tallies (raw and conviction-weighted), council votes, the tally at the close, outcome, votes |
 | GET | `/api/distribution/{id}?address=` | a community distribution: Merkle root, total, claimed, claim deadline; with `address`, that account's claim |
 | GET | `/api/multisig/{address\|name}` | a multisig account: threshold, owner keys, open proposals with their approvals |
@@ -90,7 +90,7 @@ Reads: `client.staking(account)`, `client.proposals()`, `client.proposal(id)`, `
 | GET | `/api/ghost` | 👻 Ghost Mode (off at genesis): `active`, `paused` (+ by whom, signatures, threshold), `pool` and `pool_cap`, `frontier_size`, the anchor `root` and `recent_roots`, `anchor_window`, `nullifiers`, the chain `instance` proofs bind, `circuit_id`, size limits, `verify_fee`, and the fee rule for unsigned ghost txs: `fee_grid` (fee and tip are whole multiples of it) and the `canonical_fee` / `canonical_fee_new_account` wallets pay (an unshield that opens an account burns `account_creation_fee` too) |
 | GET | `/api/ghost/address/{name\|address}` | an account's published Ghost Mode address (hex) and its fingerprint |
 | GET | `/api/health` | 200 if the head is fresh and synced, else 503 + `reason` (and `halted`: `halt_height` or `upgrade_required` when the node stopped executing on purpose) |
-| GET | `/api/upgrade` | protocol version in force, what this binary supports, the upgrade schedule and next activation, halt status, and readiness (each active validator's newest `signal`) |
+| GET | `/api/upgrade` | protocol version in force, what this binary supports, the upgrade schedule and next activation, what cancellations withdrew (`withdrawn`: versions up to `highest_version` are never scheduled again), halt status, and readiness (each active validator's newest `signal`) |
 | GET | `/api/beacon` | the randomness beacon: this epoch's value (`reveals`, `missed`) and the next one's once derived, the commit round (for the epoch after next) and reveal round (for the next) with each active validator's part, recent misses |
 | GET | `/metrics` | Prometheus: height, finalized lag, mempool, epoch, validators, faucet, tx counters, peers, protocol version and upgrade schedule, halts and slashing protection, and staking liveness (`blockula_missed_leader_slots_total`, `blockula_downtime_max_missed`, per-validator `blockula_validator_missed_slots`, `blockula_validator_jailed`, `blockula_validator_tombstoned` labelled `validator` and `own`) |
 

@@ -16,10 +16,12 @@
 //! hold of it and what still-vesting accounts' stake earned and hasn't sold (`econ::voting_balance`;
 //! [`unlocked_supply`], O(vesting accounts) from running totals). A proposal passes on tokens if it reached quorum and its
 //! conviction-weighted ayes beat the nays: by a simple majority, or by `supermajority_bps` of the
-//! weight for upgrades (and cancelling them), feature activations, issuance parameters and treasury spends above
-//! `treasury_large_bps` of the treasury. Until `bootstrap_end_height` it also passes if ⅔ of the active set approve
-//! (a validator's council vote is any `Vote` its consensus key or owner signs) and the
-//! token-weighted nays don't exceed the ayes.
+//! weight for upgrades (and cancelling them), feature activations, the parameters that are the
+//! token holders' alone (`params::tokens_only`: governance's own and the validators' own
+//! economics) and treasury spends above `treasury_large_bps` of the treasury. Until
+//! `bootstrap_end_height` it also passes if ⅔ of the active set approve (a validator's council
+//! vote is any `Vote` its consensus key or owner signs) and the token-weighted nays don't exceed
+//! the ayes, unless it changes one of those parameters ([`council_may_pass`]).
 //!
 //! **Votes** lock `amount` of the voter's unlocked holdings (`econ::lock`, id `vote:<proposal>`)
 //! until `conviction` lock periods after voting ends; weight is `amount` × 0.1 at conviction 0,
@@ -44,9 +46,12 @@
 //! | `Text` | nothing |
 //!
 //! **Distributions** move `total` from the community account into an escrow claimable until
-//! `claim_until` with Merkle proofs: BLAKE3 leaves over `(distribution_id, address, amount)`
-//! (the id is the proposal's, which the kind names: a proposal whose tree was built for another
-//! id is refused), sorted-pair inner nodes ([`distribution_leaf`], [`merkle_parent`]).
+//! `claim_until` with Merkle proofs: BLAKE3 leaves over `(distribution_id, address, amount)`,
+//! sorted-pair inner nodes ([`distribution_leaf`], [`merkle_parent`]). The proposer picks the id
+//! its tree is built for, which no distribution may have yet (checked when proposed and when it
+//! runs: the first proposal naming it to run opens it), so it doesn't depend on which proposals
+//! land first, and a multisig's proposal survives its approval window (audit F45,
+//! review-fix-gov-2). `/api/proposals` serves a free one, `next_distribution_id`.
 //! What's unclaimed returns to the community account after `claim_until`. A claimant with
 //! nothing to pay the fee with pays it (and its new account's creation fee) out of the claim
 //! ([`claim_toward_fee`]).
@@ -234,10 +239,12 @@ pub struct MultisigProposal {
     pub expires_at: u64,
 }
 
-/// A community distribution (its id is the proposal's).
+/// A community distribution, under the id its proposal named.
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Distribution {
     pub id: u64,
+    /// The proposal that opened it.
+    pub proposal: u64,
     /// Hex BLAKE3 root of the tree of `(id, address, amount)` leaves.
     pub merkle_root: String,
     pub total: u64,
@@ -470,7 +477,7 @@ fn prepare_kind(state: &State, kind: &ProposalKind, height: u64) -> Result<Propo
     let mut k = kind.clone();
     match &mut k {
         ProposalKind::ParamChange { key, value } => {
-            cp.check_governance_change(key, *value, &state.params)?;
+            cp.check_governance_change(key, *value, &state.params, height)?;
             cp.clone().set(key, *value, &state.params)?;
         }
         ProposalKind::TreasurySpend { to, .. } => {
@@ -479,12 +486,9 @@ fn prepare_kind(state: &State, kind: &ProposalKind, height: u64) -> Result<Propo
         }
         ProposalKind::Distribution { distribution_id, claim_until, .. } => {
             spend_gate(state, height)?;
-            // Its tree's leaves bind the id it was built for: refused unless that's the id it
-            // gets, so a proposal that lands first can't leave it unclaimable (audit F45).
-            let next = state.governance.next_proposal_id;
-            if *distribution_id != next {
-                bail!("the distribution's tree was built for id {distribution_id}, but this proposal gets id {next}: rebuild the tree for it (blockula gov tree) and propose again");
-            }
+            // Its tree's leaves bind the id it was built for, which it opens under: one no
+            // distribution has (audit F45, review-fix-gov-2). Checked again when it runs.
+            distribution_id_free(state, *distribution_id)?;
             if *claim_until <= runs_at {
                 bail!("claim_until must be after the vote and the timelock (block {runs_at})");
             }
@@ -673,13 +677,14 @@ pub fn unlocked_supply_by_walk(state: &State, height: u64) -> u128 {
 
 /// Whether a kind needs `supermajority_bps` of the weight: upgrades and their cancellations (a
 /// simple majority can't undo what a supermajority scheduled), feature activations
-/// (security-critical switches such as Ghost Mode), issuance parameters, governance's own safety
-/// parameters and the tip cap (`params::tokens_only`), and treasury spends above
-/// `treasury_large_bps` of the treasury's balance. Turning a feature off takes a simple majority.
+/// (security-critical switches such as Ghost Mode), the parameters that are the token holders'
+/// alone (`params::tokens_only`: governance's own safety parameters and the validators' own
+/// economics, issuance among them), and treasury spends above `treasury_large_bps` of the
+/// treasury's balance. Turning a feature off takes a simple majority.
 pub fn needs_supermajority(state: &State, kind: &ProposalKind) -> bool {
     match kind {
         ProposalKind::ScheduleUpgrade { .. } | ProposalKind::CancelUpgrade { .. } | ProposalKind::ActivateFeature { .. } => true,
-        ProposalKind::ParamChange { key, .. } => key.starts_with("issuance_") || crate::params::tokens_only(key),
+        ProposalKind::ParamChange { key, .. } => crate::params::tokens_only(key),
         ProposalKind::TreasurySpend { amount, .. } => {
             let treasury = state.account(&state.treasury()).balance as u128;
             (*amount as u128 + recent_spends(state, state.econ.height)) * 10_000 > state.chain_params.treasury_large_bps as u128 * treasury
@@ -702,12 +707,14 @@ pub fn recent_spends(state: &State, height: u64) -> u128 {
     state.governance.recent_spends.values().filter(|(at, _)| at.saturating_add(window) > height).map(|(_, amount)| *amount as u128).sum()
 }
 
-/// Whether the bootstrap council may pass a kind on its own: anything but a change to
-/// governance's own safety parameters (`params::GOVERNANCE_KEYS`), which only token holders
-/// decide, so the council can't extend itself, open spending early or weaken the vote that
-/// checks it (audit F15, F16), or to what pays the validators (`params::PROPOSER_PAY_KEYS`: the
-/// tip cap and the bootstrap delegation's commission cap), so they can't raise what a signature
-/// or the treasury's bootstrap stake pays them (audit F01, F12).
+/// Whether the bootstrap council may pass a kind on its own: anything but a change to a
+/// parameter that's the token holders' alone (`params::tokens_only`): governance's own safety
+/// parameters (`params::GOVERNANCE_KEYS`), so the council can't extend itself, open spending
+/// early or weaken the vote that checks it (audit F15, F16), and the validators' own economics
+/// (`params::VALIDATOR_KEYS`: issuance, the tip cap, commission bounds, the bootstrap
+/// delegation's commission cap, the self-bond, slashing, jail and downtime), since the council is
+/// the validators (audit F01, F12, review-integrate-merges-1).
+/// Upgrades and feature switches stay the council's to pass in year 1.
 pub fn council_may_pass(kind: &ProposalKind) -> bool {
     !matches!(kind, ProposalKind::ParamChange { key, .. } if crate::params::tokens_only(key))
 }
@@ -739,16 +746,25 @@ fn close_vote(state: &mut State, id: u64, height: u64, unlocked: u128) {
     }
     let passed = by_tokens || by_council;
     let runs_at = p.voting_end.saturating_add(timelock(&cp, &p.kind)).max(height + 1);
+    // Why it didn't pass: the token vote's majority if it reached quorum, else why the council's
+    // ⅔ (which did vote, or the deposit is burned) didn't carry it.
     let outcome = if passed {
         let at = runs_at;
         let how = if by_tokens { "by token vote" } else { "by the bootstrap council" };
         format!("passed {how}; runs at block {at}")
     } else if !quorum_reached && !council_quorum {
         format!("no quorum: {} of {} needed voted; deposit burned", fmt_fang(clamp(turnout)), fmt_fang(clamp(quorum)))
-    } else if supermajority {
+    } else if quorum_reached && supermajority {
         format!("fewer than {}% of the vote weight said aye", crate::staking::fmt_bps(cp.supermajority_bps))
-    } else {
+    } else if quorum_reached {
         "the ayes didn't outweigh the nays".to_string()
+    } else {
+        let no_quorum = format!("no token quorum ({} of {} needed voted)", fmt_fang(clamp(turnout)), fmt_fang(clamp(quorum)));
+        match &p.kind {
+            ProposalKind::ParamChange { key, .. } if !council_may_pass(&p.kind) => format!("{no_quorum}, and the bootstrap council can't pass a change to {key}: it's the token holders' alone"),
+            _ if p.nay_weight > p.aye_weight => format!("{no_quorum}, and the token nays outweighed the ayes, which the bootstrap council can't overrule"),
+            _ => format!("{no_quorum}, and {ayes} of the council's {n} said aye (⅔ needed)"),
+        }
     };
     save_scalars(state, &mut j);
     // Spends that passed count toward the next ones' share of the treasury for the window; spends
@@ -832,7 +848,8 @@ fn run_kind(state: &mut State, j: &mut Journal, p: &Proposal, height: u64) -> Re
             format!("paid {} to {}", fmt_fang(*amount), short(to))
         }
         ProposalKind::Distribution { distribution_id, merkle_root, total, claim_until } => {
-            ensure!(*distribution_id == p.id, "the tree was built for distribution #{distribution_id}, not #{}", p.id);
+            let id = *distribution_id;
+            distribution_id_free(state, id)?;
             spend_gate(state, height)?;
             if *claim_until < height {
                 bail!("its claim window ended at block {claim_until}");
@@ -844,10 +861,10 @@ fn run_kind(state: &mut State, j: &mut Journal, p: &Proposal, height: u64) -> Re
             }
             state.j_debit(j, &from, *total)?;
             save_scalars(state, j);
-            state.governance.open_distributions.insert(p.id);
-            j.governance.distributions.touch(&state.governance.distributions, &p.id);
-            state.governance.distributions.insert(p.id, Distribution { id: p.id, merkle_root: merkle_root.clone(), total: *total, claimed: 0, claims: 0, opened_at: height, claim_until: *claim_until, closed_at: None, returned: 0 });
-            format!("opened distribution #{} of {}, claimable until block {claim_until}", p.id, fmt_fang(*total))
+            state.governance.open_distributions.insert(id);
+            j.governance.distributions.touch(&state.governance.distributions, &id);
+            state.governance.distributions.insert(id, Distribution { id, proposal: p.id, merkle_root: merkle_root.clone(), total: *total, claimed: 0, claims: 0, opened_at: height, claim_until: *claim_until, closed_at: None, returned: 0 });
+            format!("opened distribution #{id} of {}, claimable until block {claim_until}", fmt_fang(*total))
         }
         ProposalKind::SetRepo { repo, weight } => {
             state.exec_set_repo(j, repo, *weight, height)?;
@@ -882,6 +899,7 @@ fn run_kind(state: &mut State, j: &mut Journal, p: &Proposal, height: u64) -> Re
             format!("refunded hunt #{hunt_id}'s funders")
         }
         ProposalKind::ScheduleUpgrade { version, activation_height } => {
+            crate::upgrade::check_not_superseded(state, p.created_at)?;
             crate::upgrade::exec_schedule_upgrade(state, j, *version, *activation_height, height)?;
             format!("protocol v{version} activates at block {activation_height}")
         }
@@ -896,14 +914,25 @@ fn run_kind(state: &mut State, j: &mut Journal, p: &Proposal, height: u64) -> Re
         ProposalKind::CancelUpgrade { version, activation_height } => {
             let withdrawn = crate::upgrade::exec_cancel_upgrade(state, j, *version, *activation_height, height)?;
             let after: Vec<String> = withdrawn[1..].iter().map(|u| format!("v{} at block {}", u.version, u.activation_height)).collect();
-            if after.is_empty() {
-                format!("cancelled the upgrade to protocol v{version} at block {activation_height}")
-            } else {
-                format!("cancelled the upgrade to protocol v{version} at block {activation_height}, and {} scheduled after it", after.join(", "))
+            let mut what = format!("cancelled the upgrade to protocol v{version} at block {activation_height}");
+            if !after.is_empty() {
+                what += &format!(", and {} scheduled after it", after.join(", "));
             }
+            what + &superseded_upgrades(state)
         }
         ProposalKind::Text {} => "recorded (no on-chain effect)".into(),
     })
+}
+
+/// The open `ScheduleUpgrade` proposals a cancellation running now supersedes (all of them:
+/// `upgrade::check_not_superseded`), as a clause for its summary and outcome.
+fn superseded_upgrades(state: &State) -> String {
+    let g = &state.governance;
+    let open: Vec<String> = g.open_proposals.iter().filter_map(|id| g.proposals.get(id)).filter_map(|p| match p.kind {
+        ProposalKind::ScheduleUpgrade { version, activation_height } => Some(format!("#{} (v{version} at block {activation_height})", p.id)),
+        _ => None,
+    }).collect();
+    if open.is_empty() { String::new() } else { format!("; it supersedes the upgrade proposal{} still open, {}, which will fail", if open.len() == 1 { "" } else { "s" }, open.join(", ")) }
 }
 
 /// After `staking::end_block`, every block: close voting on proposals whose vote ended, run
@@ -996,6 +1025,27 @@ fn drop_multisig_proposal(state: &mut State, j: &mut Journal, account: &str, id:
 }
 
 // ---- community distributions
+
+/// A distribution id a `Distribution` proposal may name: no distribution has it yet. Open
+/// proposals naming it don't count (the first to run takes it, and the others fail), so filing a
+/// proposal can't take an id from one in a multisig's approval window.
+fn distribution_id_free(state: &State, id: u64) -> Result<()> {
+    if let Some(d) = state.governance.distributions.get(&id) {
+        bail!("distribution #{id} already exists (proposal #{}): build the tree for another id (blockula gov tree; /api/proposals' next_distribution_id is free)", d.proposal);
+    }
+    Ok(())
+}
+
+/// A distribution id nothing uses yet: past every distribution's and every open `Distribution`
+/// proposal's (what clients build a new tree for).
+pub fn next_distribution_id(state: &State) -> u64 {
+    let g = &state.governance;
+    let open = g.open_proposals.iter().filter_map(|id| g.proposals.get(id)).filter_map(|p| match p.kind {
+        ProposalKind::Distribution { distribution_id, .. } => Some(distribution_id),
+        _ => None,
+    });
+    open.chain(g.distributions.keys().next_back().copied()).max().map_or(0, |m| m.saturating_add(1))
+}
 
 /// A distribution tree's leaf: BLAKE3(`LEAF_DOMAIN` ‖ id u64 LE ‖ address length u16 LE ‖
 /// address ‖ amount u64 LE). The address is the claimant's, as its tx's `from` spells it.
@@ -1166,6 +1216,24 @@ fn clear_expired(state: &mut State, j: &mut Journal, account: &str, height: u64)
     }
 }
 
+/// Whether `tx`, included in the block at `height`, would run its action rather than store it
+/// for approvals: a multisig action runs when its proposer's approval (`MultisigPropose`) or this
+/// one (`MultisigApprove`) brings the owner keys' approvals on chain to the threshold; any other
+/// action runs as it is. A mempool read (the first-to-ask name hold, `Chain::first_to_ask`):
+/// execution decides.
+pub fn runs_when_included(state: &State, tx: &Tx, height: u64) -> bool {
+    let Ok(signer) = tx.signer_key_id() else { return true };
+    let g = &state.governance;
+    match &tx.action {
+        Action::MultisigPropose { .. } => g.multisigs.get(&tx.from).is_some_and(|m| m.threshold <= 1 && owner_keys(state, &tx.from).contains(&signer)),
+        Action::MultisigApprove { id } => {
+            let (Some(m), Some(p)) = (g.multisigs.get(&tx.from), g.multisig_proposals.get(id)) else { return false };
+            p.account == tx.from && height <= p.expires_at && !p.approvals.contains(&signer) && owner_keys(state, &tx.from).contains(&signer) && approvals(state, p) + 1 >= m.threshold as usize
+        }
+        _ => true,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn multisig_propose(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, signer: &str, key: &KeyRecord, action: &Action, height: u64) -> Result<()> {
     owner_only(key, "propose multisig actions")?;
@@ -1303,7 +1371,8 @@ pub fn check_invariants(state: &State) -> Result<()> {
         *s = (s.0 + c.amount, s.1 + 1);
     }
     for (id, d) in g.distributions.iter() {
-        ensure!(*id == d.id && g.proposals.contains_key(id), "distribution #{id} is misfiled");
+        let named = |p: &Proposal| matches!(p.kind, ProposalKind::Distribution { distribution_id, .. } if distribution_id == *id);
+        ensure!(*id == d.id && g.proposals.get(&d.proposal).is_some_and(named), "distribution #{id} is misfiled");
         ensure!(d.claimed <= d.total, "distribution #{id} paid out more than it holds");
         ensure!(claimed.get(id).copied().unwrap_or_default() == (d.claimed, d.claims), "distribution #{id}'s total isn't the sum of its claims");
         ensure!(d.closed_at.is_none() == g.open_distributions.contains(id), "distribution #{id}'s open flag disagrees");
@@ -1375,7 +1444,7 @@ pub fn describe_kind(state: &State, kind: &ProposalKind, primary_name: &dyn Fn(&
         ProposalKind::CancelUpgrade { version, activation_height } => {
             let after: Vec<String> = state.upgrade.schedule.iter().filter(|u| u.activation_height > *activation_height).map(|u| format!("v{} at block {}", u.version, u.activation_height)).collect();
             let and = if after.is_empty() { String::new() } else { format!(", and {} scheduled after it", after.join(", ")) };
-            format!("cancel the upgrade to protocol v{version} at block {activation_height}{and}")
+            format!("cancel the upgrade to protocol v{version} at block {activation_height}{and}{}", superseded_upgrades(state))
         }
         ProposalKind::Text {} => "a text proposal (no on-chain effect)".into(),
     }

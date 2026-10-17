@@ -107,9 +107,10 @@ export const proposal = {
   },
   /**
    * Open a community distribution of `total`, claimable with Merkle proofs against `merkleRoot` until block `claimUntil`.
-   * `distributionId` is the id the tree was built for (`buildDistribution(id, …)`), which must be the id this proposal
-   * gets (`client.proposals()`'s `next_id`): if another proposal takes it first, the node refuses this one (nothing is
-   * escrowed), so rebuild the tree for the new `next_id` and propose again.
+   * `distributionId` is the id the tree was built for (`buildDistribution(id, …)`): one no distribution has yet
+   * (`client.proposals()`'s `next_distribution_id` is free). Other proposals landing first don't change it, so a
+   * multisig can take its time approving; if a distribution with that id opens first, the node refuses this one
+   * (nothing is escrowed), or it fails when it runs.
    */
   distribution(distributionId: number, merkleRoot: string, total: Amount, claimUntil: number): ProposalKind {
     return { type: "distribution", distribution_id: wholeNumber(distributionId, "distributionId"), merkle_root: hexArg(merkleRoot, "merkleRoot"), total: positive(parseFang(total), "distribute").toString(), claim_until: wholeNumber(claimUntil, "claimUntil") };

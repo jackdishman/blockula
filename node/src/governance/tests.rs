@@ -6,6 +6,7 @@
 use super::*;
 use crate::chain::{make_pop, treasury, Allocation, Genesis, Operator, Outcome, ValidatorInfo, Vesting};
 use crate::crypto::Keys;
+use crate::params::ChainParams;
 use crate::poc::SOUL;
 
 const FANG: u64 = DROPS_PER_FANG;
@@ -597,6 +598,126 @@ fn governance_safety_parameters_need_tokens_and_keep_their_floors() {
     assert_eq!((t.st.chain_params.supermajority_bps, t.st.chain_params.governance_spend_height), (6_667, 10_000));
 }
 
+/// review-integrate-merges-1: the bootstrap council is the validators, so it can't set their own
+/// economics: what they're paid (issuance and its split, the tip cap, commission bounds), what
+/// being one takes (the self-bond, insiders' delegations) or how they're penalized (slashes, jail,
+/// downtime, the evidence window, beacon misses). Those take the token supermajority. It still
+/// runs everything else in year 1: upgrades, features, the active set's size. A council-backed
+/// proposal it can't pass says so, not that too few said aye.
+#[test]
+fn the_council_cant_set_the_validators_own_economics() {
+    let mut t = T::new(&[("bootstrap_end_height", 1_000)]);
+    let [v1, v2, _] = VALIDATORS;
+    let council = |t: &mut T, kind: ProposalKind| {
+        let id = t.propose(ALICE, kind);
+        t.vote(v1, id, true, 1, 0).unwrap();
+        t.vote(v2, id, true, 1, 0).unwrap();
+        id
+    };
+    let own = [
+        ("issuance_stakers_bps", 8_000),
+        ("issuance_initial_ppm", 200_000),
+        ("issuance_floor_ppm", 20_000),
+        ("issuance_decay_ppm", 0),
+        ("issuance_pool_bps", 0),
+        ("slash_double_sign_bps", 0),
+        ("slash_downtime_bps", 0),
+        ("beacon_miss_slash_bps", 0),
+        ("jail_blocks", 1),
+        ("downtime_window", 1_000),
+        ("downtime_max_missed", 100),
+        ("reporter_reward_bps", 10_000),
+        ("commission_max_bps", 9_000),
+        ("commission_max_change_bps", 10_000),
+        ("min_self_bond", 2 * FANG),
+        ("evidence_max_age_epochs", 1),
+        ("insider_delegation_cap_bps", 10_000),
+        ("tip_cap_multiple", 1_000),
+    ];
+    let before = t.st.chain_params.clone();
+    let refused: Vec<u64> = own.iter().map(|(k, v)| council(&mut t, param(k, *v))).collect();
+    let lead = crate::upgrade::MIN_UPGRADE_LEAD;
+    let (voting, timelock) = (t.st.chain_params.voting_blocks, t.st.chain_params.timelock_blocks);
+    let upgrade = ProposalKind::ScheduleUpgrade { version: crate::consensus::PROTOCOL_VERSION + 1, activation_height: t.h + voting + timelock + voting + lead + 10 };
+    let passed = [council(&mut t, upgrade), council(&mut t, ProposalKind::ActivateFeature { feature: "ghost".into() }), council(&mut t, param("max_validators", 40)), council(&mut t, param("multisig_expiry_blocks", 20))];
+    t.finish(*passed.last().unwrap());
+    for (id, (key, _)) in refused.iter().zip(own) {
+        let p = t.p(*id);
+        assert_eq!(p.status, ProposalStatus::Rejected, "{key}: {}", p.outcome);
+        assert!(p.tally.as_ref().unwrap().supermajority, "{key} takes the supermajority");
+        assert!(p.outcome.contains(&format!("the bootstrap council can't pass a change to {key}")) && p.outcome.contains("no token quorum"), "{key}: {}", p.outcome);
+        assert!(needs_supermajority(&t.st, &param(key, 1)) && !council_may_pass(&param(key, 1)), "{key}");
+    }
+    assert_eq!(t.st.chain_params, ChainParams { max_validators: 40, multisig_expiry_blocks: 20, ..before }, "only the council's own keys moved");
+    for id in passed {
+        assert_eq!(t.p(id).status, ProposalStatus::Executed, "#{id}: {}", t.p(id).outcome);
+    }
+    assert!(crate::upgrade::is_active(&t.st, "ghost"));
+    // Token holders can, by the supermajority.
+    let id = t.propose(ALICE, param("slash_downtime_bps", 20));
+    t.vote(ALICE, id, true, 60_000, 1).unwrap();
+    t.finish(id);
+    assert_eq!((t.p(id).status, t.st.chain_params.slash_downtime_bps), (ProposalStatus::Executed, 20), "{}", t.p(id).outcome);
+    // Every parameter has a class: the token holders' alone, or the council's too. A key added
+    // later is the token holders' until it's listed with the council's.
+    let class: Vec<&str> = ChainParams::KEYS.iter().copied().filter(|k| !crate::params::COUNCIL_KEYS.contains(k)).collect();
+    for k in ChainParams::KEYS {
+        let listed = [crate::params::GOVERNANCE_KEYS, crate::params::VALIDATOR_KEYS, crate::params::COUNCIL_KEYS].iter().filter(|l| l.contains(k)).count();
+        assert_eq!(listed, 1, "{k} is in exactly one class");
+        assert_eq!(crate::params::tokens_only(k), class.contains(k));
+    }
+    assert!(crate::params::tokens_only("a_key_added_later"));
+}
+
+/// review-fix-gov-3: a vote moving a safety parameter toward safety can always be undone by the
+/// next one. The supermajority stops at 80%, so a dust nay can't block every upgrade (and its own
+/// repeal); quorum stops at 10% of the unlocked supply and 50M FANG (2.5× the defaults), so it
+/// stays reachable; the spend gate moves at most a year past the block that moves it, so
+/// spending reopens by itself.
+#[test]
+fn safety_parameters_can_always_be_moved_back() {
+    let mut t = T::new(&[]);
+    let refused = |t: &mut T, kind: ProposalKind, why: &str| {
+        let e = t.err(ALICE, Action::Propose { kind: kind.clone(), deposit: 50 * FANG, title: "x".into(), url: String::new() });
+        assert!(e.contains(why), "{kind:?}: {e}");
+    };
+    let day = 86_400;
+    refused(&mut t, param("supermajority_bps", 8_001), "raise supermajority_bps to 8000 (80%) at the most");
+    refused(&mut t, param("quorum_bps", 1_001), "raise quorum_bps to 1000 (10% of the unlocked supply) at the most");
+    refused(&mut t, param("quorum_floor", 50_000_000 * FANG + 1), &format!("raise quorum_floor to {} (50M FANG) at the most", 50_000_000 * FANG));
+    let gate = t.h + 365 * day;
+    refused(&mut t, param("governance_spend_height", gate + 1), &format!("block {gate} at the latest"));
+    let pass = |t: &mut T, kind: ProposalKind| {
+        let id = t.propose(ALICE, kind);
+        t.vote(ALICE, id, true, 60_000, 1).unwrap();
+        // One drop, at 1× conviction: no veto at 80%.
+        t.tx(BOB, Action::Vote { proposal_id: id, aye: false, amount: 1, conviction: 1 }).unwrap();
+        t.finish(id);
+        assert_eq!(t.p(id).status, ProposalStatus::Executed, "{}", t.p(id).outcome);
+    };
+    for (key, safe, back) in [("supermajority_bps", 8_000, 6_667), ("quorum_bps", 1_000, 400)] {
+        pass(&mut t, param(key, safe));
+        assert_eq!(t.st.chain_params.get(key), Some(safe));
+        // A ScheduleUpgrade passes against the dust nay at the strictest supermajority too.
+        if key == "supermajority_bps" {
+            let lead = crate::upgrade::MIN_UPGRADE_LEAD;
+            let (voting, timelock) = (t.st.chain_params.voting_blocks, t.st.chain_params.timelock_blocks);
+            let at = t.h + voting + timelock + voting + lead + 10;
+            pass(&mut t, ProposalKind::ScheduleUpgrade { version: crate::consensus::PROTOCOL_VERSION + 1, activation_height: at });
+        }
+        pass(&mut t, param(key, back));
+        assert_eq!(t.st.chain_params.get(key), Some(back));
+    }
+    // This test chain's whole supply is under the quorum floor's floor (5M FANG): it only moves
+    // up, to 50M FANG at the most.
+    pass(&mut t, param("quorum_floor", FANG));
+    // The spend gate, raised as far as it goes, reopens by itself: never earlier, never later.
+    let gate = t.h + 365 * day;
+    pass(&mut t, param("governance_spend_height", gate));
+    assert_eq!(t.st.chain_params.governance_spend_height, gate);
+    refused(&mut t, param("governance_spend_height", gate - 1), "never moves earlier");
+}
+
 #[test]
 fn spending_waits_for_the_spend_height_and_vested_treasury_funds() {
     let mut t = T::new(&[("governance_spend_height", 30)]);
@@ -747,9 +868,12 @@ fn a_scheduled_upgrade_can_be_cancelled_before_it_activates() {
     assert_eq!(t.p(c).outcome, format!("cancelled the upgrade to protocol v{v} at block {earliest}"));
     assert!(t.st.upgrade.schedule.is_empty());
     assert_eq!(crate::upgrade::version_at(&t.st, earliest), crate::consensus::PROTOCOL_VERSION);
-    // Nothing left to cancel, and the version can be scheduled again.
+    // Nothing left to cancel, and the version number is spent (review-fix-ops-1): the fixed
+    // release ships as the next one.
     refused(&mut t, cancel, "no upgrade to");
     let again = t.h + voting + timelock + 1 + voting + 1 + lead + 100;
+    refused(&mut t, ProposalKind::ScheduleUpgrade { version: v, activation_height: again }, &format!("never reused (a binary of the withdrawn release would run it), so ship the fixed release as v{} or later", v + 1));
+    let v = v + 1;
     let cancel = ProposalKind::CancelUpgrade { version: v, activation_height: again };
     let s = t.propose(ALICE, ProposalKind::ScheduleUpgrade { version: v, activation_height: again });
     t.vote(ALICE, s, true, 50_000, 1).unwrap();
@@ -776,6 +900,7 @@ fn a_scheduled_upgrade_can_be_cancelled_before_it_activates() {
     // Scheduled once more: once a cancellation could no longer land 64 blocks before the
     // activation, it's refused up front, and the operational path (OPERATIONS.md "Upgrades") is
     // what's left; after the activation it's refused too.
+    let v = v + 1;
     let last = t.h + voting + timelock + 1 + voting + 1 + lead + 10;
     let cancel = ProposalKind::CancelUpgrade { version: v, activation_height: last };
     let s = t.propose(ALICE, ProposalKind::ScheduleUpgrade { version: v, activation_height: last });
@@ -791,6 +916,47 @@ fn a_scheduled_upgrade_can_be_cancelled_before_it_activates() {
     assert_eq!(crate::upgrade::version_at(&t.st, t.h), v);
     // The one proposed in time, which nobody voted for, changed nothing either.
     assert_eq!(t.p(c).status, ProposalStatus::Rejected, "{}", t.p(c).outcome);
+}
+
+/// review-fix-ops-2: a cancellation supersedes every upgrade proposal made before it ran, still
+/// being voted on or in its timelock: they were proposed to follow the withdrawn upgrade, and
+/// their releases build on its rules. Here v3, proposed while v2 was scheduled, would otherwise
+/// run after the cancellation and switch on v2's withdrawn rules with its own. The cancellation's
+/// summary and outcome name it; it fails when it would run. One proposed after it goes through.
+#[test]
+fn a_cancellation_supersedes_upgrade_proposals_still_open() {
+    let mut t = T::new(&[]);
+    let lead = crate::upgrade::MIN_UPGRADE_LEAD;
+    let v = crate::consensus::PROTOCOL_VERSION + 1;
+    let (voting, timelock) = (t.st.chain_params.voting_blocks, t.st.chain_params.timelock_blocks);
+    let pass = |t: &mut T, kind: ProposalKind| {
+        let id = t.propose(ALICE, kind);
+        t.vote(ALICE, id, true, 50_000, 1).unwrap();
+        id
+    };
+    let a = t.h + 4 * (voting + timelock) + lead;
+    let s2 = pass(&mut t, ProposalKind::ScheduleUpgrade { version: v, activation_height: a });
+    t.finish(s2);
+    assert_eq!(crate::upgrade::version_at(&t.st, a), v);
+    // v3 follows it; the cancellation of v2 is proposed a block later, and runs first (no timelock).
+    let s3 = pass(&mut t, ProposalKind::ScheduleUpgrade { version: v + 1, activation_height: a + 100 });
+    t.next();
+    let cancel = ProposalKind::CancelUpgrade { version: v, activation_height: a };
+    assert_eq!(describe_kind(&t.st, &cancel, &|_| None), format!("cancel the upgrade to protocol v{v} at block {a}; it supersedes the upgrade proposal still open, #{s3} (v{} at block {}), which will fail", v + 1, a + 100));
+    let c = pass(&mut t, cancel);
+    let ran = t.p(c).voting_end + 1;
+    t.through(ran);
+    assert_eq!(t.p(c).status, ProposalStatus::Executed, "{}", t.p(c).outcome);
+    assert!(t.p(c).outcome.ends_with(&format!("it supersedes the upgrade proposal still open, #{s3} (v{} at block {}), which will fail", v + 1, a + 100)), "{}", t.p(c).outcome);
+    assert!(ran < t.p(s3).voting_end + timelock, "the successor is still voting or queued");
+    t.finish(s3);
+    assert_eq!(t.p(s3).status, ProposalStatus::Failed);
+    assert!(t.p(s3).outcome.contains(&format!("superseded: it was proposed at block {}, and the CancelUpgrade that ran at block {ran} withdrew v{v}", t.p(s3).created_at)), "{}", t.p(s3).outcome);
+    assert!(t.st.upgrade.schedule.is_empty(), "v2's rules never activate");
+    // Proposed after the cancellation, the next version goes through.
+    let s4 = pass(&mut t, ProposalKind::ScheduleUpgrade { version: v + 1, activation_height: a + 100 });
+    t.finish(s4);
+    assert_eq!((t.p(s4).status, crate::upgrade::version_at(&t.st, a + 100)), (ProposalStatus::Executed, v + 1), "{}", t.p(s4).outcome);
 }
 
 #[test]
@@ -968,35 +1134,60 @@ fn distributions_pay_valid_claims_once_and_return_the_rest() {
     assert!(t.err(BOB, claim(150 * FANG, &proofs[1])).contains("has only 50 FANG left"));
 }
 
-/// Audit F45: a distribution's leaves bind the id its tree was built for, and the kind names that
-/// id. A proposal that lands first (a front-running text proposal, or anyone's) used to shift the
-/// id silently, so the distribution passed, escrowed its total and nobody could claim; now the
-/// late proposal is refused before it takes a deposit, and a tree rebuilt for the new id goes
-/// through and pays.
+/// Audit F45, review-fix-gov-2: a distribution's leaves bind the id its tree was built for, and
+/// the kind names that id, which is the proposer's to pick (no distribution may have it yet), not
+/// the proposal's. So a proposal that lands first changes nothing: neither a front-running text
+/// proposal nor ordinary traffic during a multisig's approval window (the foundation's case,
+/// where the `Propose` only runs at the last approval). An id is used once: a proposal naming
+/// one that's taken is refused before it takes a deposit, and of two open proposals naming the
+/// same id the first to run opens it and the other fails.
 #[test]
-fn a_distribution_built_for_another_id_is_refused_up_front() {
+fn a_distribution_keeps_its_id_whatever_lands_first() {
     let mut t = T::new(&[]);
-    let id = t.st.governance.next_proposal_id;
+    let id = next_distribution_id(&t.st);
+    assert_eq!(id, 0);
     let entries = vec![(addr(CAROL), 11 * FANG)];
-    let (root, _) = build_distribution(id, &entries).unwrap();
+    let (root, proofs) = build_distribution(id, &entries).unwrap();
     let dist = |id: u64, root: [u8; 32]| ProposalKind::Distribution { distribution_id: id, merkle_root: hex::encode(root), total: 11 * FANG, claim_until: 500 };
-    // Someone else's proposal takes id 0 first.
-    assert_eq!(t.propose(BOB, text()), id);
-    let (alice, community_before) = (t.bal(ALICE), t.st.account(&community("boo")).balance);
-    let e = t.err(ALICE, Action::Propose { kind: dist(id, root), deposit: 50 * FANG, title: "drop".into(), url: String::new() });
-    assert!(e.contains(&format!("built for id {id}, but this proposal gets id {}", id + 1)), "{e}");
-    assert!(alice - t.bal(ALICE) < FANG, "only the fee: no deposit taken");
-    assert_eq!(t.st.governance.next_proposal_id, id + 1);
-    // Rebuilt for the id it gets, it passes and pays.
-    let (root, proofs) = build_distribution(id + 1, &entries).unwrap();
-    assert_eq!(t.propose(ALICE, dist(id + 1, root)), id + 1);
-    t.vote(ALICE, id + 1, true, 50_000, 1).unwrap();
-    t.finish(id + 1);
-    assert_eq!(t.p(id + 1).status, ProposalStatus::Executed, "{}", t.p(id + 1).outcome);
-    assert_eq!(t.st.account(&community("boo")).balance, community_before - 11 * FANG);
+    // The foundation is a 2-of-2 multisig: one key proposes, and other proposals land before the
+    // second approves.
+    let foundation = addr(ALICE);
+    let (k1, k2) = (keys(ALICE), keys(11));
+    t.tx(ALICE, Action::AddKey { key_id: kid(11), label: "second key".into(), role: KeyRole::Owner }).unwrap();
+    t.tx(ALICE, Action::MultisigCreate { owners: vec![kid(ALICE), kid(11)], threshold: 2 }).unwrap();
+    let ms = t.st.governance.next_multisig_id;
+    let propose = Action::Propose { kind: dist(id, root), deposit: 50 * FANG, title: "drop".into(), url: String::new() };
+    t.tx_as(&k1, &foundation, Action::MultisigPropose { action: Box::new(propose) }).unwrap();
+    assert_eq!(next_distribution_id(&t.st), 0, "a multisig proposal waiting for approvals holds nothing");
+    t.propose(BOB, text());
+    t.next();
+    t.propose(CAROL, text());
+    let pid = t.st.governance.next_proposal_id;
+    assert_ne!(pid, id);
+    t.tx_as(&k2, &foundation, Action::MultisigApprove { id: ms }).unwrap();
+    assert_eq!((t.p(pid).proposer.as_str(), &t.p(pid).kind), (foundation.as_str(), &dist(id, root)));
+    assert_eq!(next_distribution_id(&t.st), id + 1, "named by an open proposal");
+    // Someone else's proposal naming the same id can be filed (it can't take the id from the
+    // foundation's), but only the first to run opens it.
+    let other = t.propose(BOB, dist(id, build_distribution(id, &[(addr(BOB), 11 * FANG)]).unwrap().0));
+    t.tx_as(&k1, &foundation, Action::MultisigPropose { action: Box::new(Action::Vote { proposal_id: pid, aye: true, amount: 50_000 * FANG, conviction: 1 }) }).unwrap();
+    t.tx_as(&k2, &foundation, Action::MultisigApprove { id: ms + 1 }).unwrap();
+    t.vote(BOB, other, true, 40_000, 1).unwrap();
+    let community_before = t.st.account(&community("boo")).balance;
+    t.finish(other);
+    assert_eq!(t.p(pid).status, ProposalStatus::Executed, "{}", t.p(pid).outcome);
+    assert_eq!(t.p(pid).outcome, format!("opened distribution #{id} of 11 FANG, claimable until block 500"));
+    assert_eq!((t.p(other).status, t.p(other).outcome.contains(&format!("distribution #{id} already exists (proposal #{pid})"))), (ProposalStatus::Failed, true), "{}", t.p(other).outcome);
+    assert_eq!(t.st.account(&community("boo")).balance, community_before - 11 * FANG, "one escrow");
+    assert_eq!((t.st.governance.distributions[&id].proposal, next_distribution_id(&t.st)), (pid, id + 1));
     let carol = t.bal(CAROL);
-    let fee = t.tx(CAROL, Action::ClaimDistribution { distribution_id: id + 1, amount: 11 * FANG, proof: proofs[0].iter().map(hex::encode).collect() }).unwrap();
+    let fee = t.tx(CAROL, Action::ClaimDistribution { distribution_id: id, amount: 11 * FANG, proof: proofs[0].iter().map(hex::encode).collect() }).unwrap();
     assert_eq!(t.bal(CAROL), carol + 11 * FANG - fee);
+    // A taken id is refused up front: only the fee, no deposit.
+    let bob = t.bal(BOB);
+    let e = t.err(BOB, Action::Propose { kind: dist(id, root), deposit: 50 * FANG, title: "again".into(), url: String::new() });
+    assert!(e.contains(&format!("distribution #{id} already exists")), "{e}");
+    assert!(bob - t.bal(BOB) < FANG, "only the fee: no deposit taken");
 }
 
 /// A claimant with nothing to pay the fee with (a new account) pays it, and its account's

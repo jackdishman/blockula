@@ -419,8 +419,10 @@ fn namespaces_and_meta_keys_are_unique() {
 /// are empty here); staking's slash bookkeeping and its two new maps are empty here too. The
 /// vectors were regenerated with it and the SDK rebuilt the root from them. The second audit
 /// round adds `bootstrap_commission_cap_bps` (1,000, after `insider_delegation_cap_bps`) to
-/// `chain_params` (pools' `ready_at` and liveness rings' `max_missed` are empty here); vectors
-/// regenerated, the SDK rebuilt the root.
+/// `chain_params` (pools' `ready_at` and liveness rings' `max_missed` are empty here), and
+/// appends the `upgrade` record's withdrawals (`(0, None)` here: five bytes after the empty
+/// schedule) and fields of name and distribution records (none here); the root moved with
+/// `chain_params` and the `upgrade` record, and the SDK rebuilt it from the regenerated vectors.
 #[test]
 fn golden_encodings() {
     let acct = Account { balance: 5, nonce: 2, keys: Default::default(), locks: vec![] };
@@ -431,7 +433,7 @@ fn golden_encodings() {
     st.commit_block().unwrap();
     assert_eq!(st.root_hash(), st.full_root());
     assert_eq!(st.record_count(), 13);
-    assert_eq!(st.root(), "be8f283db9390f49355f6f03dcc2b9014b846b1a3965a3a04bc046ff9ba177f6");
+    assert_eq!(st.root(), "30cf9b5188164ade6a11e805f898753573ae498967b5491fc4e7821a844a01b2");
 }
 
 fn million_accounts() -> State {
@@ -548,7 +550,7 @@ fn largest_records_fit_in_a_snapshot() {
     // Lock ids at `econ::lock`'s bound (`MAX_LABEL` bytes), distinct.
     let locks = (0..MAX_LOCKS as u64).map(|id| Lock { id: format!("{id:0>MAX_LABEL$}"), amount: LockAmount::Vesting { total: u64::MAX, start: u64::MAX, cliff: u64::MAX, end: u64::MAX }, reason: s(MAX_LABEL) }).collect();
     st.accounts.insert(addr(0), Account { balance: u64::MAX, nonce: u64::MAX, keys, locks });
-    st.names.insert(s(MAX_NAME_FIELD), NameRecord { name: s(MAX_NAME_FIELD), owner: addr(0), registered_at: 0, expires_at: u64::MAX, offered_to: Some(addr(1)) });
+    st.names.insert(s(MAX_NAME_FIELD), NameRecord { name: s(MAX_NAME_FIELD), owner: addr(0), registered_at: 0, expires_at: u64::MAX, offered_to: Some(addr(1)), grace_blocks: u64::MAX });
     let vr = ValidatorRecord { address: addr(1), owner: addr(0), consensus_key: "ab".repeat(crypto::PUBLIC_KEY_LEN), p2p_addr: s(MAX_ADDR), http_addr: s(MAX_ADDR), status: ValidatorStatus::Removed, registered_at: 0, approved_at: Some(0), approved_by: Some(addr(2)), active_from: Some(0), removed_at: Some(0), removed_by: Some(addr(2)), active_until: Some(0), commission_bps: 0 };
     st.validators.insert(addr(1), vr);
     // The largest set governance can configure (`max_validators` is bounded by params.rs).
@@ -610,7 +612,7 @@ fn largest_records_fit_in_a_snapshot() {
         g.multisigs.insert(addr(0), Multisig { threshold: u8::MAX, created_at: 0, pending: (0..MAX_MULTISIG_PENDING as u64).collect() });
         let action = Action::ReportEquivocation { evidence: "ab".repeat(MAX_EVIDENCE_BYTES) };
         g.multisig_proposals.insert(u64::MAX, MultisigProposal { id: u64::MAX, account: addr(0), action, proposed_by: hex32(0), approvals: (0..MAX_KEYS as u64).map(hex32).collect(), created_at: 0, expires_at: 0 });
-        g.distributions.insert(u64::MAX, Distribution { id: u64::MAX, merkle_root: hex32(0), total: u64::MAX, claimed: u64::MAX, claims: u64::MAX, opened_at: 0, claim_until: 0, closed_at: Some(0), returned: u64::MAX });
+        g.distributions.insert(u64::MAX, Distribution { id: u64::MAX, proposal: u64::MAX, merkle_root: hex32(0), total: u64::MAX, claimed: u64::MAX, claims: u64::MAX, opened_at: 0, claim_until: 0, closed_at: Some(0), returned: u64::MAX });
         g.distribution_claims.insert(IdKey::new(u64::MAX, &addr(0)), DistributionClaim { amount: u64::MAX, at: 0 });
     }
     // Beacon: a round, a revert quorum and a value's misses, each with the whole largest set.
