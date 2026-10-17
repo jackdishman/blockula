@@ -54,12 +54,14 @@ export interface BlockView extends BlockSummary {
 
 export type TxStatus = "pending" | "finalized" | "failed";
 
-/** A transaction as `/api/tx/{id}` serves it. A dropped one has only id, status, error, height and summary. */
+/** A transaction as `/api/tx/{id}` serves it. A dropped one has only id, status, error, height, summary and dropped. */
 export interface TxDetail {
   id: string;
   summary: string;
   kind?: string;
   status: TxStatus;
+  /** On a failure answered without the tx: true if it was dropped unrun (nothing charged), false if it ran in a block (its fee was charged). */
+  dropped?: boolean;
   error?: string | null;
   height: number | null;
   from?: Label;

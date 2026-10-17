@@ -45,7 +45,10 @@ export default function TxPage() {
   const keys = sender.data?.keys;
   const signer = signerOf(t, keys, wallet?.keyId);
   const signerKey = keys?.find((k) => k.key_id === t.signer_key);
-  const dropped = t.status === "failed" && !t.from;
+  // Answered without the tx: `dropped: false` ran in a block and failed (its fee was charged); a
+  // drop (or an older node that doesn't say) ran nowhere, and another node may still include it
+  // (audit review-fix-clients-2).
+  const dropped = t.status === "failed" && !t.from && t.dropped !== false;
   const head = status.data?.height;
   const fee = parseDrops(t.fee);
   const kind = t.kind ?? t.action?.type ?? "";
@@ -75,7 +78,7 @@ export default function TxPage() {
     {
       step: "Broadcast",
       state: dropped || lost ? "bad" : t.status === "pending" ? "now" : "done",
-      what: dropped ? `dropped: ${t.error ?? "it couldn't apply"}` : lost ? "this node no longer has it (it may have restarted); it was never sealed here" : t.status === "pending" ? "waiting in the mempool" : "accepted by the network",
+      what: dropped ? `dropped from this node's mempool without running (${t.error ?? "it couldn't apply"}): nothing was charged, but another node may still include it until its valid_until, so don't send it again before then` : lost ? "this node no longer has it (it may have restarted); it was never sealed here" : t.status === "pending" ? "waiting in the mempool" : "accepted by the network",
       when: t.size_bytes ? `${(t.size_bytes / 1024).toFixed(1)} KB` : undefined,
     },
     {
@@ -128,7 +131,7 @@ export default function TxPage() {
       </nav>
 
       <section className="card plate receipt">
-        <span className="eyebrow">{dropped ? "Didn't go through" : lost ? "Lost track of it" : t.status === "pending" ? "On its way" : t.status === "failed" ? "Included, but failed" : "Receipt"}</span>
+        <span className="eyebrow">{dropped ? "Dropped, not final" : lost ? "Lost track of it" : t.status === "pending" ? "On its way" : t.status === "failed" ? "Included, but failed" : "Receipt"}</span>
         <p className="headline">{fromMySide(t.summary, me)}</p>
         {/* The amount moved, signed from your side when it's yours; fees are itemized below. */}
         {!dropped && (t.amount || awarded != null) && (
