@@ -1920,8 +1920,9 @@ async fn contributions(State(n): State<Node>) -> ApiResult {
             "vouch_min_soul": fmt_soul(VOUCH_MIN_SOUL), "juror_min_soul": fmt_soul(JUROR_MIN_SOUL),
             "jury_size": JURY_SIZE, "min_jury": MIN_JURY, "pairs_per_juror": PAIRS_PER_JUROR, "max_claims_per_seance": MAX_SEANCE_CLAIMS,
             "pool_share_per_seance": ppm_display(SEANCE_POOL_BPS * 100), "juror_share": ppm_display(JUROR_SHARE_BPS * 100), "min_score": ppm_display(MIN_SCORE_PPM),
-            // The budget reaches the full share at this many people; within a Séance each of a
-            // person's claims after their best counts 1/`claim_rank_divisor` of the one above it.
+            // The budget reaches the full share at this many people; within a Séance a person's
+            // claims share one win rate pooled over all their comparisons, and each after the
+            // first counts 1/`claim_rank_divisor` of the one above it.
             "full_budget_people": FULL_BUDGET_PEOPLE, "min_people": 2, "claim_rank_divisor": 1u64 << CLAIM_RANK_SHIFT,
         },
     })))
