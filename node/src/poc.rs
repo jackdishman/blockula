@@ -2080,12 +2080,15 @@ mod scenarios {
             t.grant(j, 10);
         }
         t.grant(&vet, 25);
-        // Vouches are for newcomers only, and the vouchee can decline (bond back to the voucher).
+        // Vouches are for newcomers only, and the vouchee can decline. The voucher still answers
+        // for it until the lock is over (audit xcut-economic-opus-2): the bond stays held, the
+        // slot taken (25 Soul allows 2).
         assert!(t.tx(&vet, Action::Vouch { account: j1.address() }).unwrap_err().to_string().contains("isn't a newcomer"));
         t.tx(&vet, Action::Vouch { account: newbie.address() }).unwrap();
         let v0 = t.bal(&vet);
         t.tx(&newbie, Action::Unvouch { account: newbie.address() }).unwrap();
-        assert_eq!(t.bal(&vet), v0 + VOUCH_BOND);
+        assert_eq!(t.bal(&vet), v0);
+        assert_eq!(t.c.state.vouches_held_by(&vet.address()), 1);
         t.tx(&vet, Action::Vouch { account: newbie.address() }).unwrap();
         // A handle's work is credited to the first account it's verified for.
         t.link(&newbie, "newbie");
@@ -2232,7 +2235,8 @@ mod scenarios {
 
     /// Audit F53 (the audit's PoC): a juror's vouchee sees from the public seed that its voucher
     /// would sit, and drops the vouch so the voucher can judge its claim. The vouch goes, but the
-    /// voucher is then new to the draw, so the same Séance opens without it.
+    /// conflict counts as of the Séance's cutoff (`DroppedVouch`), so the same Séance opens without
+    /// it, and the voucher's place in the pool doesn't move (audit review-fix-poc-2).
     #[test]
     fn dropping_a_vouch_once_the_draw_is_known_seats_nobody_new() {
         let mut t = setup("vouchdraw");
@@ -2276,11 +2280,13 @@ mod scenarios {
         let a = draw(t.c.state.clone(), t.h() + 1);
         assert_eq!((a.claims.len(), a.jurors.len()), (2, 3));
         assert!(!a.jurors.contains_key(&insider.address()));
-        // Knowing that, the newcomer declines the vouch (it always may). The insider is new to the
-        // draw: the same jury sits, and the insider still doesn't judge the claim it vouched for.
+        // Knowing that, the newcomer declines the vouch (it always may). The two stay tied for
+        // this Séance: the same jury sits, and the insider still doesn't judge the claim it
+        // vouched for. Its seniority in the pool is untouched.
+        let joined = t.c.state.poc.jurors[&insider.address()].joined_at;
         t.tx(&newcomer, Action::Unvouch { account: newcomer.address() }).unwrap();
         assert!(!t.c.state.poc.vouches.contains_key(&newcomer.address()));
-        assert_eq!(t.c.state.poc.jurors.get(&insider.address()).unwrap().joined_at, t.h());
+        assert_eq!(t.c.state.poc.jurors[&insider.address()].joined_at, joined);
         let jury = |s: &Seance| serde_json::to_value((&s.claims, &s.jurors)).unwrap();
         assert_eq!(jury(&draw(t.c.state.clone(), t.h() + 1)), jury(&a));
         t.blocks(at - t.h());
@@ -2422,39 +2428,57 @@ mod scenarios {
 
     /// Audit F53, the rule: a vouch can always be withdrawn (the newcomer declines any time, the
     /// voucher after the lock), so no juror can pin its vouch, and its cut, on a newcomer with a
-    /// claim open. When one side has a claim open, the other, if it's in the jury pool, becomes
-    /// new to the draw; otherwise nobody's draw changes.
+    /// claim open. Withdrawing moves nobody's place in the jury pool (audit review-fix-poc-2): the
+    /// two stay tied for any Séance whose cutoff came before it, and the voucher's bond and slot
+    /// stay held until the lock is over (audit xcut-economic-opus-2).
     #[test]
-    fn a_vouch_can_always_go_and_a_juror_on_it_is_new_to_the_draw() {
+    fn a_vouch_can_always_go_and_moves_no_seat() {
         let mut t = setup("vouchgo");
         t.admin(Action::SetRepo { repo: "jackdishman/blockula".into(), weight: 10 }).unwrap();
         let (juror, newbie, other) = (k(1), k(6), k(7));
-        t.grant(&juror, 20);
+        t.grant(&juror, 35);
         t.tx(&juror, Action::JoinJury { bond: JUROR_BOND }).unwrap();
         let joined = |t: &T, who: &Keys| t.c.state.poc.jurors.get(&who.address()).unwrap().joined_at;
         let first = joined(&t, &juror);
         t.link(&juror, "juror");
         let mine = t.claim(&juror, 2).unwrap();
         t.attest(mine, true).unwrap();
-        // Neither side has a claim open and is opposite a pool member: nothing changes.
+        let b0 = t.bal(&juror);
+        // A newcomer declines: the bond is held, the slot taken, the juror's place unchanged.
         t.tx(&juror, Action::Vouch { account: other.address() }).unwrap();
         t.tx(&other, Action::Unvouch { account: other.address() }).unwrap();
         assert_eq!(joined(&t, &juror), first);
+        let d = t.c.state.poc.dropped_vouches[&vouch_key(&other.address(), &juror.address())].clone();
+        assert_eq!((d.bond, d.dropped_at), (VOUCH_BOND, t.h()));
         // The newcomer, with a claim open (made under the vouch), declines its juror's vouch: the
-        // juror is new to the draw.
+        // same. Its claim stays tied to the juror for Séances whose cutoff came before.
         t.tx(&juror, Action::Vouch { account: newbie.address() }).unwrap();
         t.link(&newbie, "newbie");
         let c = t.claim(&newbie, 1).unwrap();
         t.attest(c, true).unwrap();
         t.tx(&newbie, Action::Unvouch { account: newbie.address() }).unwrap();
-        assert_eq!(joined(&t, &juror), t.h());
-        // The voucher withdraws past the lock, the claim still open: the same.
+        let dropped = t.h();
+        assert_eq!(joined(&t, &juror), first);
+        assert!(t.c.state.conflicted(&juror.address(), &newbie.address(), dropped));
+        assert!(!t.c.state.conflicted(&juror.address(), &newbie.address(), dropped + 1));
+        // Three slots (35 Soul, decaying): two held, so one more vouch, and no fourth.
         t.tx(&juror, Action::Vouch { account: newbie.address() }).unwrap();
+        assert!(t.tx(&juror, Action::Vouch { account: k(8).address() }).unwrap_err().to_string().contains("allows 3"));
+        let spent = b0 - t.bal(&juror);
+        assert!((3 * VOUCH_BOND..3 * VOUCH_BOND + DROPS_PER_FANG / 10).contains(&spent), "three bonds held, plus fees: {spent}");
+        // The voucher withdraws past the lock, the claim still open: its bond comes straight back,
+        // and the earlier held ones at an epoch boundary once their locks are over.
         assert!(t.tx(&juror, Action::Unvouch { account: newbie.address() }).unwrap_err().to_string().contains("locked until"));
         t.blocks(100);
+        let b1 = t.bal(&juror);
         t.tx(&juror, Action::Unvouch { account: newbie.address() }).unwrap();
-        assert_eq!(joined(&t, &juror), t.h());
+        assert!(t.bal(&juror) + DROPS_PER_FANG / 100 > b1 + VOUCH_BOND);
+        assert_eq!(joined(&t, &juror), first);
         assert!(!t.c.state.poc.vouches.contains_key(&newbie.address()));
+        t.blocks(t.c.state.params.epoch_blocks);
+        assert_eq!(t.c.state.vouches_held_by(&juror.address()), 0, "the held bonds came back");
+        assert!(t.bal(&juror) + DROPS_PER_FANG / 10 > b0, "all three");
+        conserved(&t.c.state);
         // The other way round: the voucher has the claim open and the vouchee sits in the pool.
         t.tx(&juror, Action::Vouch { account: newbie.address() }).unwrap();
         t.admin(Action::RejectClaim { claim_id: c, reason: "test".into() }).unwrap();
@@ -2462,8 +2486,8 @@ mod scenarios {
         t.tx(&newbie, Action::JoinJury { bond: JUROR_BOND }).unwrap();
         let (j_before, n_before) = (joined(&t, &juror), joined(&t, &newbie));
         t.tx(&newbie, Action::Unvouch { account: newbie.address() }).unwrap();
-        assert_eq!((joined(&t, &juror), joined(&t, &newbie)), (j_before, t.h()));
-        assert!(n_before < t.h());
+        assert_eq!((joined(&t, &juror), joined(&t, &newbie)), (j_before, n_before));
+        assert!(t.c.state.conflicted(&newbie.address(), &juror.address(), t.h()));
         t.admin(Action::RejectClaim { claim_id: mine, reason: "test".into() }).unwrap();
         conserved(&t.c.state);
         t.reopen_same_root();

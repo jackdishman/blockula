@@ -621,6 +621,44 @@ fn spending_waits_for_the_spend_height_and_vested_treasury_funds() {
     assert_eq!(t.st.account(&t.st.treasury()).balance, treasury - 10_000 * FANG, "the failed spend moved nothing");
 }
 
+/// Audit xcut-economic-opus-2, on a chain with no admins: a `FlagSybil` proposal is public for its
+/// vote and timelock, and no `Unvouch` in that time gets the voucher off the hook. Past the vouch's
+/// lock, a vouch withdrawn while a proposal names the vouchee keeps its bond held: the flag then
+/// costs the voucher the bond and `SYBIL_VOUCHER_SOUL`; a proposal that fails lets the bond go
+/// back at the next epoch boundary.
+#[test]
+fn a_flag_sybil_proposal_holds_a_withdrawn_vouch() {
+    let mut g = genesis(&[]);
+    g.contribution = Some(crate::poc::PocTimes { seance_blocks: 30, claim_maturity_blocks: 0, vesting_blocks: 20, vouch_lock_blocks: 5, claim_ttl_blocks: 50, soul_half_life_blocks: 1_000_000 });
+    g.soul_ledger = vec![crate::chain::SoulEntry { account: addr(CAROL), soul: 25 * SOUL, reason: "bootstrap".into() }];
+    g.check().unwrap();
+    let mut t = T { st: g.initial_state(), h: 1, tx_bytes: 0 };
+    t.tx(CAROL, Action::Vouch { account: addr(BOB) }).unwrap();
+    t.tx(CAROL, Action::Vouch { account: addr(ALICE) }).unwrap();
+    t.through(10);
+    // Past the lock, proposals name both vouchees; both decline the vouch (or the voucher could
+    // withdraw it: the same rule).
+    let flag = t.propose(ALICE, ProposalKind::FlagSybil { account: addr(BOB), reason: "a sock puppet".into() });
+    let fail = t.propose(BOB, ProposalKind::FlagSybil { account: addr(ALICE), reason: "spite".into() });
+    let carol = t.bal(CAROL);
+    t.tx(BOB, Action::Unvouch { account: addr(BOB) }).unwrap();
+    let fee = t.tx(CAROL, Action::Unvouch { account: addr(ALICE) }).unwrap();
+    assert_eq!(t.bal(CAROL), carol - fee, "both bonds stay held");
+    assert_eq!(t.st.vouches_held_by(&addr(CAROL)), 2);
+    t.vote(ALICE, flag, true, 50_000, 1).unwrap();
+    let pool = t.st.account(&t.st.pool()).balance;
+    t.finish(flag);
+    assert_eq!(t.p(flag).status, ProposalStatus::Executed, "{}", t.p(flag).outcome);
+    assert_eq!(t.p(fail).status, ProposalStatus::Rejected);
+    assert!(t.st.is_sybil(&addr(BOB)));
+    assert_eq!(t.st.soul_of(&addr(CAROL), t.h), 0, "the voucher lost SYBIL_VOUCHER_SOUL");
+    assert_eq!(t.st.account(&t.st.pool()).balance, pool + crate::poc::VOUCH_BOND, "and the bond");
+    assert_eq!(t.bal(CAROL), carol - fee, "the other bond is still held");
+    t.through(t.st.params.last_of(t.st.params.epoch_of(t.h)));
+    assert_eq!(t.bal(CAROL), carol - fee + crate::poc::VOUCH_BOND, "the failed flag's bond came back at the boundary");
+    assert_eq!(t.st.vouches_held_by(&addr(CAROL)), 0);
+}
+
 /// Every proposal kind runs its lever: the former admin powers, upgrades and features, spending.
 #[test]
 fn every_proposal_kind_executes() {
