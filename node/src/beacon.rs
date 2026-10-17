@@ -482,7 +482,7 @@ impl Secrets {
 /// while active, commit to a fresh secret for the epoch after next; in the second half of the
 /// epoch, reveal the secret committed to for the next one (the next epoch's value, and so its
 /// leader order, stays unknown until the last reveal, and half an epoch is plenty to land one).
-/// A candidate that a set below four would need also shows up (`staking::should_show_up`).
+/// A candidate that a set of one or two admitted also shows up (`staking::should_show_up`).
 /// Each tx is submitted once (on-chain records and the mempool are checked first). Returns what
 /// it did; a reveal it can't make (its secret is gone) is an error.
 pub fn duties(chain: &mut Chain, secrets: &mut Secrets) -> Result<Vec<String>> {
@@ -523,12 +523,13 @@ pub fn duties(chain: &mut Chain, secrets: &mut Secrets) -> Result<Vec<String>> {
         notes.push(format!("committed to the beacon for epoch {commit}"));
     }
     secrets.prune(reveal)?;
-    // A candidate a set of 2 or 3 would need for every quorum joins only once it showed up in the
-    // epoch (`staking::showed_up`, audit review-fix-staking-2): a no-op `UpdateValidator` signed by
-    // this key says this node is running and synced.
-    if crate::staking::should_show_up(&chain.state, &me, epoch) && !queued(chain, &|a| matches!(a, Action::UpdateValidator { .. })) {
-        let commission_bps = crate::staking::commission_rate(&chain.state, &me);
-        match chain.submit_system(Action::UpdateValidator { commission_bps, p2p_addr: String::new(), http_addr: String::new() }, "🧛 ready to join the validator set") {
+    // A candidate a set of 2 or 3 would need for every quorum joins only once a quorum of the
+    // members it joins admitted it (their operators' call, never a node's) and it showed up in the
+    // epoch's last tenth (`staking::showed_up`, audit review-fix-staking-2): `ValidatorReady`,
+    // signed by this key, says this node is running then. It changes nothing but that record,
+    // and it's a lane duty (`staking::duty_of`), so it never holds the duties behind it back.
+    if crate::staking::should_show_up(&chain.state, &me, next) && !queued(chain, &|a| matches!(a, Action::ValidatorReady { epoch: e } if *e == epoch)) {
+        match chain.submit_system(Action::ValidatorReady { epoch }, "🧛 ready to join the validator set") {
             Ok(_) => notes.push(format!("showed up to join the validator set (epoch {epoch})")),
             Err(e) => error = error.or(Some(e.context("couldn't show up to join the validator set"))),
         }

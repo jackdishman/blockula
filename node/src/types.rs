@@ -277,6 +277,18 @@ pub enum Action {
     /// An active validator (its consensus key or owner) votes to pause Ghost Mode; it pauses
     /// once f + 1 of the epoch's validators have.
     GhostPause {},
+
+    // ---- a set of one or two (tags 55–56, staking.rs; audit round 3, review-fix-staking-2):
+    // the next newcomer would be needed for every quorum, so it joins only with both ----
+    /// A candidate's consensus key (from its own account or its owner's, SF-13): its node is
+    /// running in `epoch`'s last tenth (the epoch it lands in). Changes nothing but the
+    /// candidate's readiness record; accepted only once the set's members admitted it.
+    ValidatorReady { epoch: u64 },
+    /// An active member's consensus key admits candidate `validator` (an address) into the set
+    /// at the end of `epoch` (the epoch it lands in), on its operator's decision (`blockula
+    /// validator admit`; nodes never send it). A newcomer into a set of one or two needs a
+    /// quorum of the members it joins. Once per member and epoch.
+    AdmitValidator { validator: String, epoch: u64 },
 }
 
 /// What a `Propose` asks for: every former admin lever, plus parameters, spending, upgrades and
@@ -1037,6 +1049,15 @@ impl Action {
                 out.extend_from_slice(&address.0);
             }
             Action::GhostPause {} => out.push(54),
+            Action::ValidatorReady { epoch } => {
+                out.push(55);
+                put_u64(out, *epoch);
+            }
+            Action::AdmitValidator { validator, epoch } => {
+                out.push(56);
+                put_str(out, validator);
+                put_u64(out, *epoch);
+            }
         }
     }
 
@@ -1145,6 +1166,8 @@ impl Action {
             52 => Action::Unshield { to: r.str("to", MAX_NAME_FIELD)?, amount: r.u64()?, bundle: Box::new(GhostBundle::decode(r)?) },
             53 => Action::SetGhostAddress { address: HexBytes(r.take(GHOST_ADDRESS_BYTES)?.to_vec()) },
             54 => Action::GhostPause {},
+            55 => Action::ValidatorReady { epoch: r.u64()? },
+            56 => Action::AdmitValidator { validator: r.str("validator", MAX_ADDRESS)?, epoch: r.u64()? },
             t => bail!("unknown action tag {t}"),
         })
     }
@@ -1460,7 +1483,8 @@ impl Action {
                     bail!("address must be a valid {GHOST_ADDRESS_BYTES}-byte Ghost Mode address");
                 }
             }
-            Action::GhostPause {} => {}
+            Action::GhostPause {} | Action::ValidatorReady { .. } => {}
+            Action::AdmitValidator { validator, .. } => check_address("validator", validator)?,
         }
         Ok(())
     }
@@ -1541,6 +1565,8 @@ impl Action {
             Action::Unshield { .. } => "unshield",
             Action::SetGhostAddress { .. } => "set_ghost_address",
             Action::GhostPause {} => "ghost_pause",
+            Action::ValidatorReady { .. } => "validator_ready",
+            Action::AdmitValidator { .. } => "admit_validator",
         }
     }
 
@@ -1549,7 +1575,7 @@ impl Action {
     pub fn addresses(&self) -> Vec<(&'static str, &str)> {
         match self {
             Action::Transfer { to, .. } | Action::AwardHunt { to, .. } | Action::GrantSoul { to, .. } | Action::TransferName { to, .. } | Action::Unshield { to, .. } => vec![("to", to.as_str())],
-            Action::ApproveValidator { validator } | Action::RemoveValidator { validator } | Action::Unbond { validator } | Action::Delegate { validator, .. } | Action::Undelegate { validator, .. } | Action::Unjail { validator } => vec![("validator", validator.as_str())],
+            Action::ApproveValidator { validator } | Action::RemoveValidator { validator } | Action::Unbond { validator } | Action::Delegate { validator, .. } | Action::Undelegate { validator, .. } | Action::Unjail { validator } | Action::AdmitValidator { validator, .. } => vec![("validator", validator.as_str())],
             Action::Redelegate { from_validator, to_validator, .. } => vec![("from_validator", from_validator.as_str()), ("to_validator", to_validator.as_str())],
             Action::Vouch { account } | Action::Unvouch { account } | Action::FlagSybil { account, .. } | Action::Clawback { account, .. } => vec![("account", account.as_str())],
             Action::Propose { kind, .. } => match kind {
@@ -2714,8 +2740,8 @@ pub(crate) mod tests {
         let tag_at = TX_DOMAIN.len() + 2 + 3 + 32 + 2 + 8 + 4 * 8;
         assert_eq!(good[tag_at], 21);
         let mut unknown = good.clone();
-        unknown[tag_at] = 55;
-        assert!(err(&unknown).contains("unknown action tag 55"));
+        unknown[tag_at] = 57;
+        assert!(err(&unknown).contains("unknown action tag 57"));
         // A proposal kind past the last one.
         let text = vector_tx(Action::Propose { kind: ProposalKind::Text {}, deposit: 1, title: "t".into(), url: String::new() }).to_bytes();
         let mut bad_kind = text.clone();
@@ -2834,7 +2860,7 @@ pub(crate) mod tests {
         let opt = proptest::option::of(arb_str(6).prop_filter("Some is never empty", |s| !s.is_empty()));
         let ids = proptest::collection::vec(any::<u64>(), 0..4);
         let list = proptest::collection::vec(arb_str(6), 0..4);
-        (0u8..55, strs, nums, any::<bool>(), opt, ids, list, 0u8..16, any::<u8>()).prop_map(|(tag, [a, b, c, d], [w, x, y], ok, familiar_key, spam, list, kind, small)| match tag {
+        (0u8..57, strs, nums, any::<bool>(), opt, ids, list, 0u8..16, any::<u8>()).prop_map(|(tag, [a, b, c, d], [w, x, y], ok, familiar_key, spam, list, kind, small)| match tag {
             0 => Action::Transfer { to: a, amount: w },
             1 => Action::RegisterName { name: a },
             2 => Action::AddKey { key_id: a, label: b, role: if ok { KeyRole::Owner } else { KeyRole::Session { limit: w, period_blocks: x, expires_at: y } }, public_key: c, pop: d },
@@ -2890,6 +2916,8 @@ pub(crate) mod tests {
             52 => Action::Unshield { to: a, amount: w, bundle: vector_bundle(small) },
             53 => Action::SetGhostAddress { address: HexBytes(vec![small; GHOST_ADDRESS_BYTES]) },
             54 => Action::GhostPause {},
+            55 => Action::ValidatorReady { epoch: w },
+            56 => Action::AdmitValidator { validator: a, epoch: w },
             _ => unreachable!(),
         })
     }
