@@ -884,7 +884,7 @@ export class Wallet {
    */
   async admitValidator(validator: string, opts: { epoch?: number } & TxOptions = {}) {
     const [v, epoch] = await Promise.all([this.validatorAddress(validator), opts.epoch ?? this.client.status().then((s) => s.epoch as number)]);
-    return this.act({ type: "admit_validator", validator: v, epoch: wholeNumber(epoch, "epoch") }, opts);
+    return this.act({ type: "admit_validator", validator: v.address, epoch: wholeNumber(epoch, "epoch") }, opts, [v]);
   }
 
   /** Low-level (candidate nodes do this automatically, in the epoch's last tenth, once a set of one or two admitted them): a candidate's consensus key signals its node is running in `epoch`. */

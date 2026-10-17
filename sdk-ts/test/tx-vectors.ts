@@ -7,12 +7,18 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { bytesToHex } from "@noble/hashes/utils.js";
-import { Wallet, actionDigest, beaconCommitment, keyPopMessage, proposalDigest, seanceCommitment, seancePairsDigest, signingBytes, txBytes, u64Field, type Action, type KeyRole, type ProposalKind, type SeanceClaimRef, type UnsignedTx } from "../src/index.js";
+import { Wallet, actionDigest, beaconCommitment, describeAction, keyPopMessage, proposalDigest, seanceCommitment, seancePairsDigest, signingBytes, txBytes, u64Field, type Action, type KeyRole, type ProposalKind, type SeanceClaimRef, type UnsignedTx } from "../src/index.js";
 
 const V = JSON.parse(readFileSync(new URL("./tx-vectors.json", import.meta.url), "utf8")) as { cases: { label: string; tx: UnsignedTx; signing_bytes: string }[] };
 for (const c of V.cases) assert.equal(bytesToHex(signingBytes(c.tx)), c.signing_bytes, c.label);
-for (let tag = 0; tag <= 54; tag++) assert.ok(V.cases.some((c) => c.label.endsWith(`(tag ${tag})`)), `tag ${tag} has a vector`);
+// Tags 55–59 are Ghost Mode's, unused; 60–61 are a small set's readiness and admission.
+for (const tag of [...Array(55).keys(), 60, 61]) assert.ok(V.cases.some((c) => c.label.endsWith(`(tag ${tag})`)), `tag ${tag} has a vector`);
 console.log(`✓ ${V.cases.length} tx encodings match the node byte for byte (every action tag, integers at their bounds, non-ASCII strings)`);
+
+// Every action the chain takes (and every proposal kind, through propose) has a client-rendered
+// description: a multisig owner approving one is never left with "can't read" (audit gap-7-6).
+for (const c of V.cases) assert.doesNotMatch(describeAction(c.tx.action), /can't read/, c.label);
+console.log("✓ describeAction renders every action tag and proposal kind in the vectors");
 
 // What approvals, votes and sealed judgments bind (audit gap-7-6), and a key's consent (gap-7-2).
 const D = V as unknown as {

@@ -289,6 +289,10 @@ export function describeAction(action: unknown, opts: DescribeOptions = {}): str
       return "Publish the account's Ghost Mode address";
     case "ghost_pause":
       return "Vote to pause Ghost Mode (validators)";
+    case "validator_ready":
+      return `Signal that the account's candidate validator node is running, to join a set of one or two at the end of epoch ${n(a.epoch)} (validators)`;
+    case "admit_validator":
+      return `Admit candidate validator ${account(a.validator)} into a set of one or two at the end of epoch ${n(a.epoch)} (validators)`;
     default:
       return `Something this client can't read (an action of type ${typeof a.type === "string" ? token(a.type, /^[a-z_]{1,40}$/, "type") : "unknown"}): don't approve it from here`;
   }
