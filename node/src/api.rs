@@ -350,6 +350,8 @@ impl Node {
 }
 
 const EXPLORER: &str = include_str!("explorer.html");
+/// The explorer's animated ASCII backdrop, bundled from web/lib/ascii by `npm run build:haunt`.
+const HAUNT_JS: &str = include_str!("haunt.js");
 
 /// The explorer's one inline script (what its CSP hash covers: the text between the tags).
 fn explorer_script() -> &'static str {
@@ -357,7 +359,8 @@ fn explorer_script() -> &'static str {
 }
 
 /// The explorer's Content-Security-Policy (F64, defense in depth): only its own inline script
-/// runs (by hash: no injected `<script>` or `on*=` handler), it fetches from this origin only,
+/// runs (by hash: no injected `<script>` or `on*=` handler), plus what that script adds itself
+/// ('strict-dynamic': the backdrop, `/haunt.js`), it fetches from this origin only,
 /// fonts come from Google Fonts, and no other page may frame it.
 fn explorer_csp() -> &'static str {
     static CSP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -365,7 +368,7 @@ fn explorer_csp() -> &'static str {
         use commonware_cryptography::Hasher as _;
         let digest = commonware_cryptography::Sha256::hash(&[explorer_script().as_bytes()]);
         format!(
-            "default-src 'none'; script-src 'sha256-{}'; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+            "default-src 'none'; script-src 'sha256-{}' 'strict-dynamic'; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
             base64(digest.as_ref())
         )
     })
@@ -382,6 +385,12 @@ fn base64(bytes: &[u8]) -> String {
         }
     }
     out
+}
+
+/// The explorer's backdrop script, which the explorer's own script loads.
+async fn haunt_js() -> Response {
+    use axum::http::header;
+    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8"), (header::CACHE_CONTROL, "public, max-age=3600"), (header::X_CONTENT_TYPE_OPTIONS, "nosniff")], HAUNT_JS).into_response()
 }
 
 async fn explorer() -> Response {
@@ -437,6 +446,7 @@ type ApiResult = Result<Json<Value>, ApiError>;
 pub fn router(node: Node) -> Router {
     Router::new()
         .route("/", get(explorer))
+        .route("/haunt.js", get(haunt_js))
         .route("/api/status", get(status))
         .route("/api/blocks", get(blocks))
         .route("/api/block/{id}", get(block))
@@ -2163,7 +2173,7 @@ mod tests {
         assert!(out.status.success());
         let stub = r##"
 const app = { innerHTML: "" };
-globalThis.document = { querySelector: (s) => (s === "#app" ? app : { addEventListener() {}, textContent: "", value: "" }), querySelectorAll: () => [] };
+globalThis.document = { querySelector: (s) => (s === "#app" ? app : { addEventListener() {}, textContent: "", value: "" }), querySelectorAll: () => [], head: { append() {} }, createElement: () => ({}) };
 globalThis.window = { addEventListener() {} };
 globalThis.setInterval = () => 0;
 globalThis.fetch = async () => ({ ok: false, json: async () => ({ error: "offline" }) });
@@ -2282,6 +2292,8 @@ mod http_tests {
         assert!(csp.contains("default-src 'none'") && csp.contains("connect-src 'self'") && csp.contains("frame-ancestors 'none'"), "{csp}");
         let script_src = csp.split(';').find(|d| d.trim().starts_with("script-src")).unwrap();
         assert!(!script_src.contains("unsafe-inline") && script_src.contains("'sha256-"), "{script_src}");
+        // Only what the hashed script adds runs: no origin (not even 'self') may serve script by URL.
+        assert!(script_src.contains("'strict-dynamic'") && !script_src.contains("'self'") && !script_src.contains("http"), "{script_src}");
         assert_eq!(res.headers()[axum::http::header::X_CONTENT_TYPE_OPTIONS], "nosniff");
         std::fs::remove_dir_all(root).ok();
     }
@@ -2353,6 +2365,22 @@ mod http_tests {
         big_block(&n, size, false);
         let (s, _, b) = get_big(&n, "/api/sync?from=122").await;
         assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{b}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn explorer_serves_its_haunted_backdrop() {
+        let (root, n) = node("haunt");
+        let (s, _, html) = call(&n, "GET", "/", None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(html.contains(r#"src: "/haunt.js""#) && explorer_script().contains("/haunt.js"), "the explorer's own script loads the backdrop");
+        let app = router(n.clone()).layer(MockConnectInfo("127.0.0.1:1".parse::<SocketAddr>().unwrap()));
+        let res = app.oneshot(Request::builder().uri("/haunt.js").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()[axum::http::header::CONTENT_TYPE], "text/javascript; charset=utf-8");
+        assert_eq!(res.headers()[axum::http::header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        let body = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        assert!(body.starts_with(b"\"use strict\";(()=>{") && body.len() > 10_000, "a bundled script, not a stub");
         std::fs::remove_dir_all(root).ok();
     }
 

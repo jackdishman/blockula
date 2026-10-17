@@ -1,13 +1,40 @@
 "use client";
 
 import Link from "next/link";
+import { useEffect, useRef, useState } from "react";
 import { RequireWallet } from "@/components/Gate";
 import { Activity } from "@/components/Activity";
+import { Apparition } from "@/components/Haunt";
 import { Tutorial, useTutorial } from "@/components/Tutorial";
 import { Copy, ExplorerLink, Spinner } from "@/components/ui";
 import { explorer } from "@/lib/config";
 import { fangParts, shortAddr } from "@/lib/format";
+import type { TxView } from "@/lib/types";
 import { useUnlocked } from "@/lib/wallet";
+
+/**
+ * Ids of payments into `me` that showed up since the last poll (none on first load), held for a
+ * few seconds so the coin can spin and the rows can light up.
+ */
+function useArrivals(txs: TxView[] | undefined, me: string | undefined) {
+  const seen = useRef<Set<string> | null>(null);
+  // Not tied to the effect: the account re-polls every few seconds, which mustn't cancel it.
+  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const [fresh, setFresh] = useState<ReadonlySet<string>>(new Set());
+  useEffect(() => () => clearTimeout(timer.current), []);
+  useEffect(() => {
+    if (!txs || !me) return;
+    const known = seen.current;
+    seen.current = new Set(txs.map((t) => t.id));
+    if (!known) return;
+    const arrived = txs.filter((t) => !known.has(t.id) && t.kind === "transfer" && t.from.address !== me).map((t) => t.id);
+    if (!arrived.length) return;
+    setFresh(new Set(arrived));
+    clearTimeout(timer.current);
+    timer.current = setTimeout(() => setFresh(new Set()), 4000);
+  }, [txs, me]);
+  return fresh;
+}
 
 export default function HomePage() {
   return (
@@ -20,6 +47,7 @@ export default function HomePage() {
 function Home() {
   const { account, hint } = useUnlocked();
   const [tutorial, updateTutorial] = useTutorial();
+  const fresh = useArrivals(account?.recent_txs, account?.account.address);
   if (!account) return <main className="narrow"><Spinner>Loading your account…</Spinner></main>;
   const { whole, frac } = fangParts(account.balance);
   const name = account.names[0];
@@ -27,6 +55,7 @@ function Home() {
   return (
     <main className="narrow stack-lg">
       <section className="card plate balance-card">
+        <Apparition kind="coin" busy={fresh.size > 0} />
         <span className="eyebrow">The account of</span>
         <div className="who">
           {name ? <span className="who-name">{name}</span> : <Link href="/name" className="claim-pill">Claim your .boo name</Link>}
@@ -56,7 +85,7 @@ function Home() {
           <h2>Activity</h2>
           <ExplorerLink className="small" href={explorer.account(name ?? addr)}>Open in the explorer ↗</ExplorerLink>
         </div>
-        <Activity txs={account.recent_txs} me={addr} />
+        <Activity txs={account.recent_txs} me={addr} fresh={fresh} />
       </section>
 
       {tutorial.dismissed && (

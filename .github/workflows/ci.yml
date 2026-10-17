@@ -60,6 +60,9 @@ jobs:
         run: npm run test:vectors -w @blockula/sdk
       - name: MCP network pinning and release checks
         run: npm test -w @blockula/mcp
+      - run: npm test -w @blockula/web
+      - name: Explorer backdrop bundle is up to date
+        run: npm run build:haunt && git diff --exit-code node/src/haunt.js
 
   wallet-e2e:
     name: Wallet e2e (Playwright, Chromium)

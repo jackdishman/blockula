@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useState } from "react";
 import { RequireWallet } from "@/components/Gate";
 import { RecoveryKitSetup } from "@/components/RecoveryKit";
+import { Apparition } from "@/components/Haunt";
 import { Copy, ErrorNote, ExplorerLink, Spinner, Tip } from "@/components/ui";
 import { BLOCKS_PER_DAY, explorer } from "@/lib/config";
 import { friendly } from "@/lib/errors";
@@ -23,13 +24,18 @@ export default function DevicesPage() {
 
 function Devices() {
   const { account } = useUnlocked();
+  // Keys revoked while this page is open, laid to rest under a gravestone.
+  const [buried, setBuried] = useState<string[]>([]);
   if (!account) return <main className="narrow"><Spinner>Loading…</Spinner></main>;
   const owners = account.keys.filter((k) => k.role.type === "owner");
   const devices = owners.filter((k) => k.label !== KIT_LABEL);
   const sessions = account.keys.filter((k) => k.role.type === "session");
+  const bury = (label: string) => setBuried((b) => [label, ...b]);
   return (
     <main className="narrow stack-lg">
       <Link href="/" className="back">← Home</Link>
+      {/* The agents' Familiar. */}
+      <Apparition kind="cat" />
       <h1>Devices &amp; agents</h1>
       <p className="dim">
         Your account isn&apos;t one key: it&apos;s a list of keys, each with its own permissions. Owners can do anything. Agents (session keys) can only send FANG, within a limit, until they expire.
@@ -37,15 +43,23 @@ function Devices() {
 
       <section className="card">
         <h2>Owner devices</h2>
-        {devices.map((k) => <KeyRow key={k.key_id} k={k} canRevoke={owners.length > 1} />)}
+        {devices.map((k) => <KeyRow key={k.key_id} k={k} canRevoke={owners.length > 1} onRevoked={bury} />)}
       </section>
 
-      <RecoverySection kits={owners.filter((k) => k.label === KIT_LABEL)} canRevoke={owners.length > 1} />
+      <RecoverySection kits={owners.filter((k) => k.label === KIT_LABEL)} canRevoke={owners.length > 1} onRevoked={bury} />
 
       <section className="card">
         <h2>Agents with a budget</h2>
-        {sessions.length ? sessions.map((k) => <KeyRow key={k.key_id} k={k} canRevoke />) : <p className="dim">No agents yet.</p>}
+        {sessions.length ? sessions.map((k) => <KeyRow key={k.key_id} k={k} canRevoke onRevoked={bury} />) : <p className="dim">No agents yet.</p>}
       </section>
+
+      {buried.length > 0 && (
+        <section className="card center graveyard">
+          <Apparition kind="grave" text={`R.I.P.\n${buried[0].length > 12 ? `${buried[0].slice(0, 11)}.` : buried[0]}`} />
+          <h2>Laid to rest</h2>
+          <p className="dim">{buried.join(", ")} can no longer sign for this account.</p>
+        </section>
+      )}
 
       <AddDevice />
       <AddAgent />
@@ -53,7 +67,7 @@ function Devices() {
   );
 }
 
-function KeyRow({ k, canRevoke }: { k: KeyView; canRevoke: boolean }) {
+function KeyRow({ k, canRevoke, onRevoked }: { k: KeyView; canRevoke: boolean; onRevoked: (label: string) => void }) {
   const { wallet, status, refresh } = useUnlocked();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -70,6 +84,7 @@ function KeyRow({ k, canRevoke }: { k: KeyView; canRevoke: boolean }) {
     setError(null);
     try {
       await wallet.removeKey(k.key_id);
+      onRevoked(k.label);
       await refresh();
     } catch (e) {
       setError(friendly(e));
@@ -110,7 +125,7 @@ function KeyRow({ k, canRevoke }: { k: KeyView; canRevoke: boolean }) {
 }
 
 /** The account's recovery kits (owner keys kept on paper), a kit waiting for fee money, and making a new one. */
-function RecoverySection({ kits, canRevoke }: { kits: KeyView[]; canRevoke: boolean }) {
+function RecoverySection({ kits, canRevoke, onRevoked }: { kits: KeyView[]; canRevoke: boolean; onRevoked: (label: string) => void }) {
   const { wallet, account, hint, updateHint, refresh } = useUnlocked();
   const [making, setMaking] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -137,7 +152,7 @@ function RecoverySection({ kits, canRevoke }: { kits: KeyView[]; canRevoke: bool
       <section className="card stack" id="recovery">
         <h2>Recovery kit</h2>
         {kits.length ? (
-          kits.map((k) => <KeyRow key={k.key_id} k={k} canRevoke={canRevoke} />)
+          kits.map((k) => <KeyRow key={k.key_id} k={k} canRevoke={canRevoke} onRevoked={onRevoked} />)
         ) : (
           <p className="dim">No recovery kit yet. If every device and passkey were lost, nothing could get you back in.</p>
         )}

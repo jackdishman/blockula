@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { AccountPicker } from "@/components/AccountPicker";
-import { Ornament } from "@/components/Ornament";
+import { Apparition } from "@/components/Haunt";
 import { ErrorNote, ExplorerLink, Spinner, Tip } from "@/components/ui";
 import { explorer, NETWORK } from "@/lib/config";
 import { friendly } from "@/lib/errors";
@@ -101,7 +101,7 @@ export default function RecoverPage() {
     return (
       <main className="narrow stack-lg">
         <div className="center">
-          <Ornament kind="key" className="hero-ornament" />
+          <Apparition kind="key" />
           <span className="eyebrow">Kit accepted</span>
           <h1>Found {stage.account.name ?? stage.account.short}</h1>
           <p className="dim">
@@ -123,7 +123,7 @@ export default function RecoverPage() {
     <main className="narrow stack-lg">
       <Link href="/welcome" className="back">← Back</Link>
       <div className="center">
-        <Ornament kind="candle" className="hero-ornament" />
+        <Apparition kind="candle" />
         <h1>Restore with a recovery kit</h1>
         <p className="dim">Type the {KIT_WORDS} words from your kit, in order. They stay in this browser: nothing you type here is sent anywhere.</p>
       </div>
@@ -179,7 +179,7 @@ function Cleanup({ account, kitKeyId, deviceKeyId, tx, onDone }: { account: Acco
   return (
     <main className="narrow stack-lg" data-testid="restore-done">
       <div className="center">
-        <Ornament kind="moon" className="hero-ornament" />
+        <Apparition kind="moon" />
         <span className="eyebrow">Restored</span>
         <h1>Welcome back{account.name ? `, ${account.name}` : ""}</h1>
         <p className="ok">✓ {tx.summary}. <ExplorerLink href={explorer.tx(tx.id)}>View ↗</ExplorerLink></p>

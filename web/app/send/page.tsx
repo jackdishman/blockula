@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
 import { RequireWallet } from "@/components/Gate";
-import { Ornament } from "@/components/Ornament";
+import { Apparition } from "@/components/Haunt";
 import { ErrorNote, ExplorerLink, Spinner, Tip } from "@/components/ui";
 import { explorer, MAINNET_PREFIX, NETWORK } from "@/lib/config";
 import { friendly } from "@/lib/errors";
@@ -72,7 +72,7 @@ function Send() {
   const [to, setTo] = useState(params.get("to") ?? "");
   const [amount, setAmount] = useState(params.get("amount") ?? "");
   const [memo, setMemo] = useState(params.get("memo") ?? "");
-  const prefilled = params.has("to") || params.has("amount");
+  const prefilled = params.has("to") || params.has("amount") || params.has("memo");
   const [review, setReview] = useState<{ tx: Tx; display: string } | null>(null);
   const [sent, setSent] = useState<TxView | null>(null);
   const [busy, setBusy] = useState(false);
@@ -129,7 +129,7 @@ function Send() {
   if (sent)
     return (
       <main className="narrow stack-lg center">
-        <Ornament kind="bat" className="hero-ornament" />
+        <Apparition kind="bat" burst={9} />
         <h1>Sent</h1>
         <p className="summary">{sent.summary}</p>
         <p className="dim">Sealed in block #{sent.height}. That&apos;s final: no waiting for confirmations.</p>

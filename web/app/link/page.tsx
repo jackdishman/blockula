@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { Splash, Unlock } from "@/components/Gate";
 import { AccountPicker } from "@/components/AccountPicker";
-import { Ornament } from "@/components/Ornament";
+import { Apparition } from "@/components/Haunt";
 import { Copy, ErrorNote, Spinner, Tip } from "@/components/ui";
 import { localKeysAllowed } from "@/lib/config";
 import { friendly, isPrfUnsupported } from "@/lib/errors";
@@ -75,7 +75,7 @@ export default function LinkPage() {
   if (wallet && hint?.account)
     return (
       <main className="narrow center stack-lg">
-        <Ornament kind="key" className="hero-ornament" />
+        <Apparition kind="key" />
         <h1>This device is already set up</h1>
         <p className="dim">It acts for {hint.name ?? "your account"}. To link another device, open Devices &amp; agents.</p>
         <Link className="btn primary" href="/">Go home</Link>
@@ -86,7 +86,7 @@ export default function LinkPage() {
     return (
       <main className="narrow stack-lg">
         <div className="center">
-          <Ornament kind="candle" className="hero-ornament" />
+          <Apparition kind="candle" />
           <h1>Almost there</h1>
           <p className="dim">On a device that already has your wallet, open <b>Devices &amp; agents → Link a device</b> and paste this key id.</p>
         </div>
@@ -109,7 +109,7 @@ export default function LinkPage() {
     <main className="narrow stack-lg">
       <Link href="/welcome" className="back">← Back</Link>
       <div className="center">
-        <Ornament kind="key" className="hero-ornament" />
+        <Apparition kind="key" />
         <h1>Link this device</h1>
         <p className="dim">
           This device gets its own passkey and key. Your other device then adds it as a co-owner of your account. Nothing secret ever leaves either device.

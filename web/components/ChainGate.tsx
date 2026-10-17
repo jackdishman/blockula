@@ -5,7 +5,7 @@ import { saveCustomPin, type ChainMismatchError } from "@/lib/chain";
 import { NETWORK, NETWORKS, RPC, setNetwork, type Network } from "@/lib/config";
 import { useWallet } from "@/lib/wallet";
 import { Splash } from "./Gate";
-import { Ornament } from "./Ornament";
+import { Apparition } from "./Haunt";
 import { Tip } from "./ui";
 
 /** Nothing renders until the node has proved it's on the expected chain; a wrong chain blocks the app. */
@@ -32,7 +32,7 @@ function WrongChain({ error }: { error: ChainMismatchError }) {
   return (
     <main className="narrow stack-lg" data-testid="wrong-chain">
       <div className="center">
-        <Ornament kind="candle" className="hero-ornament" />
+        <Apparition kind="candle" />
         <span className="eyebrow">Wrong chain</span>
         <h1>This node isn&apos;t on {NETWORK.label}</h1>
         <p className="lead">{error.message} The wallet won&apos;t show balances or sign anything through it.</p>

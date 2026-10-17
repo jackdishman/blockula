@@ -3,6 +3,7 @@ import { Courier_Prime, EB_Garamond, IM_Fell_English, IM_Fell_English_SC, Unifra
 import { connection } from "next/server";
 import type { ReactNode } from "react";
 import { ChainGate } from "@/components/ChainGate";
+import { Haunt, MotionToggle } from "@/components/Haunt";
 import { Header } from "@/components/Header";
 import { Ornament } from "@/components/Ornament";
 import { IS_MAINNET_BUILD } from "@/lib/config";
@@ -30,6 +31,7 @@ export default async function RootLayout({ children }: { children: ReactNode }) 
   return (
     <html lang="en" className={`${fell.variable} ${fellSc.variable} ${garamond.variable} ${courier.variable} ${fraktur.variable}`}>
       <body>
+        <Haunt />
         <WalletProvider>
           <Header />
           <ChainGate>{children}</ChainGate>
@@ -38,6 +40,7 @@ export default async function RootLayout({ children }: { children: ReactNode }) 
             <span className="caps">Quantum-safe ML-DSA-65 keys · Unlocked by passkeys</span>
             {/* Mainnet builds are for real money (after the audit, WAL-3); test builds say what they are. */}
             <span data-testid="imprint-note">{IS_MAINNET_BUILD ? "Self-custodial: your key is derived on this device and never leaves it." : "Not audited. For test chains only."}</span>
+            <MotionToggle />
           </footer>
         </WalletProvider>
       </body>

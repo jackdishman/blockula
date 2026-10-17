@@ -10,13 +10,13 @@ import { findAccounts, unlockPasskey, type AccountChoice } from "@/lib/keys";
 import type { Hint } from "@/lib/session";
 import { useWallet } from "@/lib/wallet";
 import { AccountPicker } from "./AccountPicker";
-import { Ornament } from "./Ornament";
+import { Apparition } from "./Haunt";
 import { ErrorNote, Spinner } from "./ui";
 
 export function Splash({ text = "Rising from the grave…" }: { text?: string }) {
   return (
     <div className="splash">
-      <Ornament kind="bat" />
+      <Apparition kind="coffin" />
       <p className="dim">{text}</p>
     </div>
   );
@@ -112,7 +112,7 @@ export function Unlock() {
 
   return (
     <main className="narrow center">
-      <Ornament kind="key" className="hero-ornament" />
+      <Apparition kind="key" busy={busy} />
       <span className="eyebrow">The door is locked</span>
       <h1>Welcome back{h.name ? `, ${h.name}` : ""}</h1>
       <p className="dim">

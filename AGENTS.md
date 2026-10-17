@@ -101,6 +101,7 @@ Reads: `client.staking(account)`, `client.proposals()`, `client.proposal(id)`, `
 - `npm run build` builds everything. `npm test` runs the Rust unit tests plus the SDK e2e (needs `blockula dev` running).
 - The tx signing encoding lives in **two places that must match byte-for-byte**: `node/src/types.rs` (`Tx::signing_bytes`) and `sdk-ts/src/tx.ts` (`signingBytes`). Change both, then run the e2e.
 - The state tree's proof format lives in `node/src/state/tree.rs` and its light-client port `sdk-ts/src/proof.ts`; `sdk-ts/test/proof-vectors.json` (written by `node/src/state/proof_vectors.rs`) keeps them in step. `npm run test:vectors -w @blockula/sdk` and `npm test -w @blockula/mcp` run offline.
+- The animated ASCII art (`web/lib/ascii`) also runs in the node's explorer as the bundled `node/src/haunt.js`. After changing those files, run `npm run build:haunt` and commit the result (CI checks it's current).
 
 ## 🐈‍⬛ Contribute to Blockula (agents welcome)
 
