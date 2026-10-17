@@ -1035,7 +1035,9 @@ fn small_sets_take_no_newcomers_unless_an_admin_pins_one() {
 
 /// Audit F24: on a chain without admins (mainnet) a set that shrank to two, or to one, grows
 /// again, one newcomer per epoch, until the churn limit takes over at four (from three, one
-/// newcomer is within it already). Under the churn limit alone neither ever grew.
+/// newcomer is within it already). Under the churn limit alone neither ever grew. Past it (into a
+/// set of 2 or 3) the newcomer joins once a quorum of the members admitted it and it showed up
+/// (audit review-fix-staking-2).
 #[test]
 fn a_set_that_shrank_below_four_grows_back() {
     let mut t = Setup::default().start();
@@ -1049,23 +1051,28 @@ fn a_set_that_shrank_below_four_grows_back() {
     let mut two = vec![vaddr(0), vaddr(1)];
     two.sort();
     assert_eq!(t.set(1), two);
-    // Both bond back above it: they're eligible newcomers, admitted one per epoch once their
-    // nodes showed up (a set of 2 or 3 needs every member for a quorum).
+    // Both bond back above it: they're eligible newcomers, one per epoch, each once the members
+    // admitted it and its node showed up (a set of 2 or 3 needs every member for a quorum).
     for i in [2u8, 3] {
         t.ok(&owner(i), Action::Delegate { validator: vaddr(i), amount: 900 * FANG });
-        assert!(should_show_up(&t.st, &vaddr(i), 1));
-        show_up(&mut t, i);
-        assert!(!should_show_up(&t.st, &vaddr(i), 1));
     }
-    assert_eq!(select_next(&t.st, 1).joining.len(), 1);
+    assert_eq!(members_admitting(&t.st, 1), Some(two.clone()));
+    for m in [0u8, 1] {
+        assert_eq!(admit(&mut t, m, &vaddr(2)).unwrap(), Outcome::Applied);
+    }
+    ready_window(&mut t);
+    assert!(should_show_up(&t.st, &vaddr(2), t.height) && !should_show_up(&t.st, &vaddr(3), t.height), "only the one admitted");
+    assert_eq!(show_up(&mut t, 2).unwrap(), Outcome::Applied);
+    assert!(!should_show_up(&t.st, &vaddr(2), t.height), "once an epoch");
+    assert_eq!(select_next(&t.st, 1).joining, vec![vaddr(2)]);
     t.finish_epoch();
     assert_eq!(t.set(2).len(), 3);
     // Into a set of 4 (f = 1) the newcomer isn't needed for a quorum: stake is enough.
-    let last = t.st.validators.keys().find(|v| !t.set(2).contains(v)).unwrap().clone();
-    assert!(!showed_up(&t.st, &last, 2));
+    assert_eq!(members_admitting(&t.st, 2), None);
+    assert!(!showed_up(&t.st, &vaddr(3), 2));
     t.finish_epoch();
     assert_eq!(t.set(3).len(), 4, "back to f = 1");
-    // From a set of one, likewise.
+    // From a set of one, likewise: its member admits the first newcomer, then both the second.
     let mut t = Setup::default().start();
     for i in 1..4u8 {
         let held = t.shares(&owner(i).address(), &vaddr(i)) as u64;
@@ -1077,21 +1084,46 @@ fn a_set_that_shrank_below_four_grows_back() {
         t.ok(&owner(i), Action::Delegate { validator: vaddr(i), amount: 900 * FANG });
     }
     for (epoch, size) in [(2, 2), (3, 3), (4, 4)] {
-        for i in 1..4u8 {
-            if should_show_up(&t.st, &vaddr(i), epoch - 1) {
-                show_up(&mut t, i);
+        if let Some(members) = members_admitting(&t.st, epoch - 1) {
+            let c = likely_candidates(&t.st, epoch - 1, 1).remove(0);
+            for m in &members {
+                assert_eq!(admit(&mut t, index(m), &c).unwrap(), Outcome::Applied);
             }
+            ready_window(&mut t);
+            assert_eq!(show_up(&mut t, index(&c)).unwrap(), Outcome::Applied);
         }
         t.finish_epoch();
         assert_eq!(t.set(epoch).len(), size, "epoch {epoch}");
     }
 }
 
-/// Validator `i`'s consensus key shows up for its owner ([`showed_up`]): a no-op
-/// `UpdateValidator`, as the node's duties send it.
-fn show_up(t: &mut T, i: u8) {
-    let tx = t.tx_from(&keys(vseed(i)), &owner(i).address(), Action::UpdateValidator { commission_bps: commission_rate(&t.st, &vaddr(i)), p2p_addr: String::new(), http_addr: String::new() });
-    assert_eq!(t.apply(&tx).unwrap(), Outcome::Applied);
+/// Genesis validator `i`'s index from its address.
+fn index(v: &str) -> u8 {
+    (0..16u8).find(|i| vaddr(*i) == v).expect("a genesis validator")
+}
+
+/// Validator `i`'s consensus key signals readiness for its owner (`ValidatorReady`), as its node's
+/// duties send it.
+fn show_up(t: &mut T, i: u8) -> Result<Outcome> {
+    let epoch = t.st.params.epoch_of(t.height);
+    let tx = t.tx_from(&keys(vseed(i)), &owner(i).address(), Action::ValidatorReady { epoch });
+    t.apply(&tx)
+}
+
+/// Member `m`'s consensus key admits validator `c` for its owner (`AdmitValidator`), as its
+/// operator's `blockula validator admit` sends it.
+fn admit(t: &mut T, m: u8, c: &str) -> Result<Outcome> {
+    let epoch = t.st.params.epoch_of(t.height);
+    let tx = t.tx_from(&keys(vseed(m)), &owner(m).address(), Action::AdmitValidator { validator: c.to_string(), epoch });
+    t.apply(&tx)
+}
+
+/// Runs blocks up to the current epoch's readiness window (its last tenth: [`ready_from`]).
+fn ready_window(t: &mut T) {
+    let from = ready_from(&t.st.params, t.st.params.epoch_of(t.height));
+    while t.height < from {
+        t.block();
+    }
 }
 
 /// CV-4: at most ⌊(n−1)/3⌋ seats change per epoch for stake (highest stake first), while
@@ -1918,36 +1950,160 @@ fn a_stolen_consensus_key_burns_at_most_its_validators_duties() {
     t.block();
 }
 
-/// Audit review-fix-staking-2: a set of one or two (f = 0: every member is needed) admits a
-/// newcomer only once its consensus key showed it's running and synced in that epoch (an
-/// `UpdateValidator` it signed), so one that never comes online can't halt it by stake alone.
-#[test]
-fn a_tiny_set_admits_only_a_newcomer_that_showed_up() {
+// -------------------------------------------------------------------- audit, third round
+
+/// Shrinks the default 4-validator chain to validators 0 and 1 (2 and 3 sell below the minimum
+/// self-bond), then has 2 and 3 bond back: eligible candidates for a set of two, at
+/// `[(2, a), (3, b)]` FANG more each. Returns at epoch 1.
+fn shrunk_to_two(bonds: [u64; 2]) -> T {
     let mut t = Setup::default().start();
     for i in [2u8, 3] {
         let held = t.shares(&owner(i).address(), &vaddr(i)) as u64;
         t.ok(&owner(i), Action::Undelegate { validator: vaddr(i), shares: held - 500 * FANG });
     }
-    // Validator 3 shows up in epoch 0: too early to count at the end of epoch 1.
-    show_up(&mut t, 3);
     t.finish_epoch();
     assert_eq!(t.set(1).len(), 2);
-    // Validator 2 bonds more: it ranks first.
-    for (i, amount) in [(2u8, 950), (3, 900)] {
+    for (i, amount) in [2u8, 3].into_iter().zip(bonds) {
         t.ok(&owner(i), Action::Delegate { validator: vaddr(i), amount: amount * FANG });
     }
-    assert!(select_next(&t.st, 1).joining.is_empty(), "stake alone doesn't get it in, nor a readiness from an earlier epoch");
-    // The owner's own key doesn't prove the validator's node is up.
-    t.ok(&owner(2), Action::UpdateValidator { commission_bps: 1_000, p2p_addr: String::new(), http_addr: String::new() });
+    t
+}
+
+/// Audit review-fix-staking-2 (rounds 2 and 3): a set of one or two (f = 0: every member is
+/// needed) takes a newcomer only if a quorum of the members it joins admitted it in the epoch,
+/// their operators' decision (`AdmitValidator`; nodes never send it), and its consensus key showed
+/// up in the epoch's last tenth (`ValidatorReady`). Stake alone can't buy the seat: round 2 let a
+/// stranger that outbid every candidate sign one readiness and then never vote, halting the chain
+/// for good. It can't even signal now, and nothing it signs costs its owner (refused, not charged).
+#[test]
+fn a_tiny_set_takes_only_a_newcomer_its_members_admitted_that_showed_up() {
+    // Validator 2 (the stranger that bought the top seat) bonds the most, validator 3 less.
+    let mut t = shrunk_to_two([950, 900]);
+    assert_eq!(likely_candidates(&t.st, 1, 1), vec![vaddr(2)]);
+    assert!(select_next(&t.st, 1).joining.is_empty(), "stake alone doesn't get it in");
+    let before = t.balance(&owner(2).address());
+    let early = show_up(&mut t, 2).unwrap_err().to_string();
+    assert!(early.contains("last tenth"), "a node that shows up early may stop before the boundary: {early}");
+    // Admissions: a member's consensus key, once an epoch; nobody else's.
+    assert!(admit(&mut t, 3, &vaddr(2)).unwrap_err().to_string().contains("only an eligible member"));
+    assert!(t.fails(&owner(0), Action::AdmitValidator { validator: vaddr(3), epoch: 1 }).contains("consensus key"), "the operator's call, not the owner key's");
+    assert!(admit(&mut t, 0, &vaddr(0)).unwrap_err().to_string().contains("isn't an eligible candidate"));
+    assert_eq!(admit(&mut t, 0, &vaddr(3)).unwrap(), Outcome::Applied);
+    assert!(admit(&mut t, 0, &vaddr(2)).unwrap_err().to_string().contains("once an epoch"));
+    ready_window(&mut t);
+    // One member of two isn't a quorum.
+    assert!(show_up(&mut t, 3).unwrap_err().to_string().contains("needs 2 of the set's 2 members"));
     assert!(select_next(&t.st, 1).joining.is_empty());
-    // Validator 3's consensus key shows up (signed for its owner, who pays).
-    let ready = t.tx_from(&keys(vseed(3)), &owner(3).address(), Action::UpdateValidator { commission_bps: 1_000, p2p_addr: String::new(), http_addr: String::new() });
-    assert_eq!(t.apply(&ready).unwrap(), Outcome::Applied);
+    assert_eq!(admit(&mut t, 1, &vaddr(3)).unwrap(), Outcome::Applied);
+    assert!(select_next(&t.st, 1).joining.is_empty(), "admitted, but its node hasn't shown up");
+    // The top-staked candidate nobody admitted still can't signal; the admitted one can, once.
+    assert!(show_up(&mut t, 2).unwrap_err().to_string().contains("to admit it first"));
+    assert_eq!(t.balance(&owner(2).address()), before, "its refused txs cost its owner nothing (F04)");
+    assert!(!should_show_up(&t.st, &vaddr(2), t.height) && should_show_up(&t.st, &vaddr(3), t.height));
+    assert!(t.fails(&owner(3), Action::ValidatorReady { epoch: 1 }).contains("consensus key"), "the owner's key doesn't prove the node is up");
+    assert_eq!(show_up(&mut t, 3).unwrap(), Outcome::Applied);
+    assert!(show_up(&mut t, 3).unwrap_err().to_string().contains("already signaled"));
     assert!(showed_up(&t.st, &vaddr(3), 1) && !showed_up(&t.st, &vaddr(2), 1));
-    assert_eq!(select_next(&t.st, 1).joining, vec![vaddr(3)], "the one that showed up, though validator 2 ranks above it");
+    assert_eq!(select_next(&t.st, 1).joining, vec![vaddr(3)], "the one admitted and ready, though validator 2 ranks above it");
     t.finish_epoch();
     assert_eq!(t.set(2).len(), 3);
-    // Into a set of 4 the newcomer isn't needed for a quorum (f = 1): stake is enough again.
+    // Into a set of 4 the newcomer isn't needed for a quorum (f = 1): stake is enough again, and
+    // there's nothing to admit or signal.
+    assert_eq!(members_admitting(&t.st, 2), None);
+    assert!(admit(&mut t, 0, &vaddr(2)).unwrap_err().to_string().contains("without its members' admission"));
     assert_eq!(select_next(&t.st, 2).joining, vec![vaddr(2)]);
+    t.block();
+}
+
+/// An admission and a readiness count only for the boundary of their own epoch: a candidate the
+/// members admitted whose node didn't show up stays out, and needs admitting again; last epoch's
+/// admissions don't let it signal. A consent for another epoch, or delayed into the next, fails.
+#[test]
+fn admissions_and_readiness_count_only_in_their_epoch() {
+    let mut t = shrunk_to_two([900, 900]);
+    for m in [0u8, 1] {
+        assert_eq!(admit(&mut t, m, &vaddr(3)).unwrap(), Outcome::Applied);
+    }
+    assert!(admitted(&t.st, &t.set(1), &vaddr(3), 1));
+    t.finish_epoch();
+    assert_eq!(t.set(2).len(), 2, "admitted, but its node never showed up");
+    assert!(!admitted(&t.st, &t.set(2), &vaddr(3), 2));
+    ready_window(&mut t);
+    assert!(show_up(&mut t, 3).unwrap_err().to_string().contains("to admit it first"), "last epoch's admissions don't count");
+    let stale = t.tx_from(&keys(vseed(0)), &owner(0).address(), Action::AdmitValidator { validator: vaddr(3), epoch: 1 });
+    assert!(t.apply(&stale).unwrap_err().to_string().contains("can't land in epoch 2"));
+    for m in [0u8, 1] {
+        assert_eq!(admit(&mut t, m, &vaddr(3)).unwrap(), Outcome::Applied);
+    }
+    let late = t.tx_from(&keys(vseed(3)), &owner(3).address(), Action::ValidatorReady { epoch: 3 });
+    assert!(t.apply(&late).unwrap_err().to_string().contains("can't land in epoch 2"));
+    assert_eq!(show_up(&mut t, 3).unwrap(), Outcome::Applied);
+    t.finish_epoch();
+    assert!(t.set(3).contains(&vaddr(3)));
+    t.block();
+}
+
+/// Audit review-r2-staking-1: round 2's readiness was a "no-op" `UpdateValidator` carrying the
+/// commission its node read when signing, so landing after its owner's own change it reverted it,
+/// and under a lowered cap it wrote the cap over the owner's setting. `ValidatorReady` carries no
+/// terms: it writes the readiness record and nothing else.
+#[test]
+fn readiness_leaves_the_owners_terms_alone() {
+    let mut t = shrunk_to_two([900, 900]);
+    let (v, o) = (vaddr(3), owner(3));
+    for m in [0u8, 1] {
+        assert_eq!(admit(&mut t, m, &v).unwrap(), Outcome::Applied);
+    }
+    ready_window(&mut t);
+    // The owner moves its commission (10% → 11%) and its addresses; governance then lowers the
+    // cap below it. The node's readiness lands after both.
+    t.ok(&o, Action::UpdateValidator { commission_bps: 1_100, p2p_addr: "10.0.0.3:30303".into(), http_addr: "https://v3.example".into() });
+    let mut j = Journal::default();
+    t.st.exec_set_param(&mut j, "commission_max_bps", 1_050).unwrap();
+    let terms = |t: &T| (t.st.validators[&v].commission_bps, t.st.validators[&v].p2p_addr.clone(), t.st.validators[&v].http_addr.clone(), t.st.staking.pools[&v].commission_base, t.st.staking.pools[&v].commission_epoch, t.st.staking.pools[&v].key_update_at);
+    let before = terms(&t);
+    assert_eq!(show_up(&mut t, 3).unwrap(), Outcome::Applied);
+    assert_eq!(terms(&t), before, "the owner's 11% and addresses stand (charged at the 10.5% cap)");
+    assert_eq!(commission_rate(&t.st, &v), 1_050);
+    assert_eq!(t.st.staking.pools[&v].ready_at, Some(t.height));
+    // Nor does it spend the consensus key's own once-an-epoch update for its owner (F04).
+    let upd = t.tx_from(&keys(vseed(3)), &o.address(), Action::UpdateValidator { commission_bps: 1_050, p2p_addr: String::new(), http_addr: String::new() });
+    assert_eq!(t.apply(&upd).unwrap(), Outcome::Applied);
+    t.block();
+}
+
+/// Audit review-r2-integrate-compose-1: a validator's terms are its owner's call. Its consensus
+/// key used to change them from the validator's own account (its implicit owner key there) when
+/// the owner was another account: past a multisig owner's approvals (governance/tests.rs) and
+/// F04's once-an-epoch limit, as often as it liked. It updates them only for its owner now (once
+/// an epoch), and unjailing is the owner's alone too.
+#[test]
+fn a_consensus_key_changes_its_validators_terms_only_for_its_owner() {
+    let mut t = Setup::default().start();
+    let (ck, v, o) = (keys(vseed(1)), vaddr(1), owner(1));
+    let mut j = Journal::default();
+    t.st.j_credit(&mut j, &v, 10 * FANG);
+    t.st.j_mint(&mut j, 10 * FANG);
+    let before = (t.st.validators[&v].commission_bps, t.st.validators[&v].p2p_addr.clone());
+    for _ in 0..2 {
+        let e = t.fails(&ck, Action::UpdateValidator { commission_bps: 1_100, p2p_addr: "6.6.6.6:30303".into(), http_addr: String::new() });
+        assert!(e.contains("its owner's call"), "{e}");
+    }
+    assert_eq!((t.st.validators[&v].commission_bps, t.st.validators[&v].p2p_addr.clone()), before);
+    assert!(t.fails(&ck, Action::Unjail { validator: v.clone() }).contains("only validator"));
+    // For its owner: once an epoch.
+    let upd = |t: &T, bps| t.tx_from(&ck, &o.address(), Action::UpdateValidator { commission_bps: bps, p2p_addr: String::new(), http_addr: String::new() });
+    assert_eq!(t.apply(&upd(&t, 1_100)).unwrap(), Outcome::Applied);
+    assert!(t.apply(&upd(&t, 1_050)).unwrap_err().to_string().contains("once an epoch"));
+    // A validator that owns itself (registered from its own account) is its own owner.
+    let selfish = keys(60);
+    t.st.j_credit(&mut j, &selfish.address(), 1_100 * FANG);
+    t.st.j_mint(&mut j, 1_100 * FANG);
+    let pop = crate::chain::make_pop([60; 32], CHAIN, &selfish.address(), "127.0.0.1:7999", "127.0.0.1:7998");
+    t.ok(&selfish, Action::RegisterValidator { consensus_key: hex::encode(selfish.public_key()), p2p_addr: "127.0.0.1:7999".into(), http_addr: "127.0.0.1:7998".into(), bond: 1_000 * FANG, pop });
+    assert_eq!(t.st.validators[&selfish.address()].owner, selfish.address());
+    for bps in [50, 100, 75] {
+        t.ok(&selfish, Action::UpdateValidator { commission_bps: bps, p2p_addr: String::new(), http_addr: String::new() });
+    }
     t.block();
 }
