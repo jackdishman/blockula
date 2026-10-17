@@ -2103,8 +2103,13 @@ mod tests {
         let peer = Peer { blocks: Arc::new(blocks), scheme, hits: Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]) };
         async fn serve(AxState(p): AxState<Peer>, AxPath(who): AxPath<String>, Query(q): Query<std::collections::HashMap<String, u64>>) -> axum::Json<serde_json::Value> {
             let honest = who == "honest";
-            p.hits[usize::from(honest)].fetch_add(1, Ordering::SeqCst);
             let from = q["from"];
+            // Rounds with blocks to give. Once the node is at the tip and the honest peer says
+            // "nothing new", a peer benched only for being slower is asked again (review-r2-sync-1)
+            // and says "nothing new" at once: that probe isn't a captured round.
+            if from <= TIP {
+                p.hits[usize::from(honest)].fetch_add(1, Ordering::SeqCst);
+            }
             // "slow": one block per 0.7 s, slower than twice the chain's rate; "trickle": 4 per
             // round at 0.45 s each, just over it; "honest": 5 per round, at once.
             let (per_round, per_block) = match who.as_str() {
