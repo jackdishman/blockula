@@ -507,6 +507,8 @@ struct SmFixture {
     candidates: Vec<(String, String)>,
     /// Addresses that hold nothing at genesis.
     newcomers: Vec<String>,
+    /// Per agent, per user: the agent key's consent to joining that user's account (AddKey's pop).
+    agent_pops: Vec<Vec<String>>,
 }
 
 fn sm_fixture() -> &'static SmFixture {
@@ -542,7 +544,8 @@ fn sm_fixture() -> &'static SmFixture {
             })
             .collect();
         let newcomers = (0..8u8).map(|i| Keys::from_seed([200 + i; 32]).address()).collect();
-        SmFixture { state: genesis.initial_state(), validator: Who::of(&validator), users: users.iter().map(Who::of).collect(), agents: agents.iter().map(Who::of).collect(), candidates, newcomers }
+        let agent_pops = agents.iter().map(|a| users.iter().map(|u| types::key_pop(a, SM_CHAIN, &"00".repeat(32), &u.address())).collect()).collect();
+        SmFixture { state: genesis.initial_state(), validator: Who::of(&validator), users: users.iter().map(Who::of).collect(), agents: agents.iter().map(Who::of).collect(), candidates, newcomers, agent_pops }
     })
 }
 
@@ -633,7 +636,7 @@ impl Sm {
             0 => Action::Transfer { to: other, amount: fang(amt % 50) + 1 },
             1 => Action::Transfer { to: newcomer, amount: fang(1) },
             2 => Action::RegisterName { name: format!("name{}", b % 8) },
-            3 => Action::AddKey { key_id: agent.key_id.clone(), label: "agent".into(), role: KeyRole::Session { limit: fang(amt % 20), period_blocks: 1 + amt % 10, expires_at: h + 50 } },
+            3 => Action::AddKey { key_id: agent.key_id.clone(), label: "agent".into(), role: KeyRole::Session { limit: fang(amt % 20), period_blocks: 1 + amt % 10, expires_at: h + 50 }, public_key: agent.public_key.clone(), pop: f.agent_pops[b as usize % SM_AGENTS][ai].clone() },
             4 => Action::RemoveKey { key_id: agent.key_id.clone() },
             5 => Action::RegisterFamiliar { key_id: agent.key_id.clone(), label: "claude".into() },
             6 => return self.tx(agent, &me, tip, Action::Transfer { to: other, amount: fang(amt % 3) }),
@@ -674,7 +677,7 @@ impl Sm {
                 let votes: String = seat.pairs.iter().enumerate().map(|(i, _)| if (amt >> (i % 16)) & 1 == 0 { 'a' } else { 'b' }).collect();
                 let spam: Vec<u64> = if amt % 7 == 0 { seance.claims.first().copied().into_iter().collect() } else { vec![] };
                 if seat.commitment.is_none() && h < seance.commit_until {
-                    Action::CommitVotes { seance_id: id, commitment: types::seance_commitment(id, &me, &votes, &spam, "salt") }
+                    Action::CommitVotes { seance_id: id, commitment: types::seance_commitment(id, &me, &votes, &spam, "salt"), pairs_digest: crate::poc::seat_pairs_digest(&self.state, id, &me, &seat.pairs) }
                 } else {
                     Action::RevealVotes { seance_id: id, votes, spam, salt: "salt".into() }
                 }
@@ -727,13 +730,14 @@ impl Sm {
                     let kind = kinds[b as usize % kinds.len()].clone();
                     Action::Propose { kind, deposit: fang(1_000 + amt), title: "fuzz".into(), url: String::new() }
                 }
-                1 => Action::Vote { proposal_id: amt % 4, aye: b % 2 == 0, amount: fang(1 + amt % 100), conviction: (b % 7) as u8 },
+                // Bound to the proposal as stored, so most votes land (a wrong digest is refused).
+                1 => Action::Vote { proposal_id: amt % 4, aye: b % 2 == 0, amount: fang(1 + amt % 100), conviction: (b % 7) as u8, proposal_digest: self.state.governance.proposals.get(&(amt % 4)).map(crate::governance::digest_of).unwrap_or_else(|| "00".repeat(32)) },
                 _ => Action::Unlock {},
             },
             30 => match amt % 3 {
                 0 => Action::MultisigCreate { owners: vec![user.key_id.clone(), agent.key_id.clone()], threshold: 1 + (b % 2) },
                 1 => Action::MultisigPropose { action: Box::new(Action::Transfer { to: other, amount: fang(1) }) },
-                _ => Action::MultisigApprove { id: amt % 4 },
+                _ => Action::MultisigApprove { id: amt % 4, action_digest: self.state.governance.multisig_proposals.get(&(amt % 4)).map(|p| types::action_digest(&p.action)).unwrap_or_else(|| "00".repeat(32)) },
             },
             31 => match amt % 3 {
                 0 => Action::RenewName { name: format!("name{}", b % 8), years: 1 + (b % 3) },
@@ -908,14 +912,14 @@ pub fn seeds() -> Vec<(&'static str, &'static str, Vec<u8>)> {
         signed_tx(&funded, 0, 1_000, json!({ "type": "transfer", "to": other.address(), "amount": "2000000000" })),
         signed_tx(&funded, 1, 0, json!({ "type": "transfer", "to": "alice.boo", "amount": "1" })),
         signed_tx(&funded, 2, 0, json!({ "type": "register_name", "name": "count-dracula" })),
-        signed_tx(&funded, 3, 0, json!({ "type": "add_key", "key_id": types::key_id(&other.public_key()), "label": "agent", "role": { "type": "session", "limit": "5000000000", "period_blocks": 600, "expires_at": 100000 } })),
+        signed_tx(&funded, 3, 0, json!({ "type": "add_key", "key_id": types::key_id(&other.public_key()), "label": "agent", "role": { "type": "session", "limit": "5000000000", "period_blocks": 600, "expires_at": 100000 }, "public_key": hex::encode(other.public_key()), "pop": types::key_pop(&other, CHAIN_ID, genesis_hash(), &funded.address()) })),
         signed_tx(&funded, 4, 0, json!({ "type": "register_validator", "consensus_key": hex::encode(funded.public_key()), "p2p_addr": "203.0.113.9:7071", "http_addr": "https://v.example", "bond": "50000000000", "pop": pop("203.0.113.9:7071", "https://v.example") })),
         signed_tx(&funded, 5, 0, json!({ "type": "create_hunt", "repo": "jackdishman/blockula", "issue": 7, "amount": "10000000000", "expires_at": 9000, "title": "Fuzz the decoders" })),
         signed_tx(&funded, 6, 0, json!({ "type": "reveal_votes", "seance_id": 2, "votes": "ab=", "spam": [5, 6], "salt": "pepper" })),
         signed_tx(&funded, 7, 0, json!({ "type": "attest_claim", "claim_id": 1, "ok": true, "merge_sha": "cd".repeat(20), "note": "" })),
         // Protocol v1 tags (30–49): nested proposal kinds and actions, lists, conviction.
         signed_tx(&funded, 8, 0, json!({ "type": "propose", "kind": { "type": "treasury_spend", "to": "alice.boo", "amount": "5000000000" }, "deposit": "1000000000000", "title": "Fund the fuzzers", "url": "https://example.com/p/1" })),
-        signed_tx(&funded, 9, 0, json!({ "type": "vote", "proposal_id": 0, "aye": true, "amount": "1000000000", "conviction": 3 })),
+        signed_tx(&funded, 9, 0, json!({ "type": "vote", "proposal_id": 0, "aye": true, "amount": "1000000000", "conviction": 3, "proposal_digest": types::proposal_digest(&types::ProposalKind::TreasurySpend { to: "alice.boo".into(), amount: 5_000_000_000 }, "Fund the fuzzers", "https://example.com/p/1") })),
         signed_tx(&funded, 10, 0, json!({ "type": "multisig_propose", "action": { "type": "delegate", "validator": funded.address(), "amount": "10000000000" } })),
         signed_tx(&funded, 11, 0, json!({ "type": "claim_distribution", "distribution_id": 1, "amount": "7", "proof": ["ab".repeat(32), "cd".repeat(32)] })),
         signed_tx(&funded, 12, 0, json!({ "type": "report_equivocation", "evidence": "0a".repeat(512) })),
@@ -1024,7 +1028,7 @@ pub fn seeds() -> Vec<(&'static str, &'static str, Vec<u8>)> {
     out.push(("state_machine", "hunts-and-agents", sm_ops(&[(3, 0, 0, 15), (5, 0, 0, 0), (34, 0, 0, 0), (6, 0, 0, 2), (7, 1, 3, 4), (34, 0, 0, 0), (8, 2, 0, 0), (8, 3, 0, 1), (9, 1, 0, 0), (7, 2, 4, 1), (34, 0, 0, 3), (10, 2, 0, 1), (10, 0, 0, 0), (4, 0, 0, 0), (6, 0, 0, 1), (2, 1, 3, 0), (0, 1, 2, 7), (1, 3, 1, 0), (35, 2, 1, 0), (35, 2, 1, 1), (34, 0, 0, 2)])));
     out.push(("state_machine", "validators-and-v1", sm_ops(&[(26, 0, 0, 0), (34, 0, 0, 0), (27, 0, 1, 0), (34, 0, 0, 3), (28, 1, 0, 0), (29, 1, 0, 0), (29, 2, 1, 1), (29, 3, 0, 2), (30, 0, 0, 0), (31, 0, 2, 0), (32, 0, 0, 0), (32, 0, 0, 1), (27, 0, 1, 1), (34, 0, 0, 3), (34, 0, 0, 3), (27, 0, 1, 2), (34, 0, 0, 1)])));
     let mut raw = vec![];
-    for action in [Action::Transfer { to: Keys::from_seed([3; 32]).address(), amount: 7 }, Action::Vote { proposal_id: 0, aye: true, amount: 5, conviction: 2 }, Action::Delegate { validator: Keys::from_seed(VALIDATOR_SEED).address(), amount: 3 }] {
+    for action in [Action::Transfer { to: Keys::from_seed([3; 32]).address(), amount: 7 }, Action::Vote { proposal_id: 0, aye: true, amount: 5, conviction: 2, proposal_digest: "00".repeat(32) }, Action::Delegate { validator: Keys::from_seed(VALIDATOR_SEED).address(), amount: 3 }] {
         let enc = action.to_bytes();
         raw.extend(sm_ops(&[(33, 1, (enc.len() - 1) as u8, 0)]));
         raw.extend(enc);

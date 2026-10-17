@@ -406,9 +406,13 @@ fn rust_signed() -> Value {
     // gossip carry. One acts from a testnet address.
     let owner = crypto::Keys::from_seed([7; 32]);
     let testnet_to = crypto::Keys::from_seed([0xff; 32]).address_with(crypto::TESTNET_HRP);
+    // The added key (seed 0xff) consents to the owner's account on the vectors' chain instance.
+    let added = crypto::Keys::from_seed([0xff; 32]);
+    let added_pk = hex::encode(added.public_key());
+    let added_pop = types::key_pop(&added, CROSS_CHAIN, &cross_genesis(), &owner.address());
     let actions = [
         ("tx/transfer", owner.address(), json!({ "type": "transfer", "to": "alice.boo", "amount": "1500000000" })),
-        ("tx/add_key", owner.address(), json!({ "type": "add_key", "key_id": "ab".repeat(32), "label": "agent", "role": { "type": "session", "limit": "5000000000", "period_blocks": 600, "expires_at": 100000 } })),
+        ("tx/add_key", owner.address(), json!({ "type": "add_key", "key_id": types::key_id(&added.public_key()), "label": "agent", "role": { "type": "session", "limit": "5000000000", "period_blocks": 600, "expires_at": 100000 }, "public_key": added_pk, "pop": added_pop })),
         ("tx/transfer-tboo", owner.address_with(crypto::TESTNET_HRP), json!({ "type": "transfer", "to": testnet_to, "amount": "42" })),
     ];
     for (label, from, action) in actions {
@@ -439,6 +443,13 @@ fn rust_signed() -> Value {
     let pop_msg = types::pop_message(CROSS_CHAIN, &owner.address(), POP.0, POP.1);
     let mut c = case("validator-pop", VALIDATOR_SEEDS[0], types::POP_CONTEXT, &pop_msg, v0.sign(types::POP_CONTEXT, &pop_msg).as_ref());
     c["pop"] = json!({ "chain_id": CROSS_CHAIN, "owner": owner.address(), "p2p_addr": POP.0, "http_addr": POP.1 });
+    cases.push(c);
+    // A key's proof of possession for being added to an account (AddKey, audit gap-7-2): the
+    // tx keys' derivation, deterministic, under KEY_POP_CONTEXT.
+    let key_pop = json!({ "chain_id": CROSS_CHAIN, "genesis_hash": cross_genesis(), "account": owner.address(), "key_id": types::key_id(&added.public_key()) });
+    let msg = types::key_pop_message(CROSS_CHAIN, &cross_genesis(), &owner.address(), &types::key_id(&added.public_key()));
+    let mut c = case("key-pop", [0xff; 32], types::KEY_POP_CONTEXT, &msg, &added.sign_with_context(types::KEY_POP_CONTEXT, &msg));
+    c["key_pop"] = key_pop;
     cases.push(c);
     let (outgoing, incoming) = handoff_keys();
     let handoff = epochs::handoff_message(&cross_instance(), HANDOFF_EPOCH, &outgoing, &incoming);
@@ -480,7 +491,7 @@ fn check_keys(file: &Value, side: &str) {
 fn cross_rust_signed() {
     let file = load("cross/rust-signed.json");
     check_keys(&file, "rust-signed");
-    assert_eq!(cases_of(&file).len(), 11);
+    assert_eq!(cases_of(&file).len(), 12);
     for c in cases_of(&file) {
         let (label, seed, ns, msg) = (str_of(c, "label"), seed_of(c, "seed"), hx(c, "namespace"), hx(c, "msg"));
         assert_eq!(hx(c, "ctx"), context_for(&ns), "{label}: context");
@@ -497,7 +508,7 @@ fn cross_rust_signed() {
 fn cross_ts_signed() {
     let file = load("cross/ts-signed.json");
     check_keys(&file, "ts-signed");
-    assert_eq!(cases_of(&file).len(), 14);
+    assert_eq!(cases_of(&file).len(), 15);
     for c in cases_of(&file) {
         let (label, seed, ns, msg, sigb) = (str_of(c, "label"), seed_of(c, "seed"), hx(c, "namespace"), hx(c, "msg"), hx(c, "sig"));
         assert_eq!(hx(c, "ctx"), context_for(&ns), "{label}: context");
@@ -571,6 +582,17 @@ fn cross_formats_are_current() {
             assert_eq!(types::Tx::from_bytes(&wire).unwrap_or_else(|e| panic!("{label}: Tx::from_bytes: {e}")), tx, "{label}: wire round trip");
             let (prefix, _) = crypto::parse_address(&tx.from).unwrap_or_else(|| panic!("{label}: `from` isn't an address"));
             tx.check_prefix(prefix).unwrap_or_else(|e| panic!("{label}: check_prefix: {e}"));
+            // An AddKey's proof of possession is the node's to check too.
+            if let types::Action::AddKey { key_id, public_key, pop, .. } = &tx.action {
+                types::verify_key_pop(&tx.chain_id, &tx.genesis_hash, &tx.from, key_id, public_key, pop).unwrap_or_else(|e| panic!("{label}: verify_key_pop: {e}"));
+            }
+        }
+        if let Some(p) = c.get("key_pop") {
+            let msg = types::key_pop_message(str_of(p, "chain_id"), str_of(p, "genesis_hash"), str_of(p, "account"), str_of(p, "key_id"));
+            assert_eq!((hx(c, "namespace"), hx(c, "msg")), (types::KEY_POP_CONTEXT.to_vec(), msg), "{}", stale(label));
+            let pk = crypto::Keys::from_seed(seed_of(c, "seed")).public_key();
+            assert_eq!(types::key_id(&pk), str_of(p, "key_id"), "{label}: the signer is the key");
+            types::verify_key_pop(str_of(p, "chain_id"), str_of(p, "genesis_hash"), str_of(p, "account"), str_of(p, "key_id"), &hex::encode(&pk), str_of(c, "sig")).unwrap_or_else(|e| panic!("{label}: verify_key_pop: {e}"));
         }
         if let Some(pop) = c.get("pop") {
             let msg = types::pop_message(str_of(pop, "chain_id"), str_of(pop, "owner"), str_of(pop, "p2p_addr"), str_of(pop, "http_addr"));

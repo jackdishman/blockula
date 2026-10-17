@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex, hexToBytes, randomBytes } from "@noble/hashes/utils.js";
-import { ApiError, Client, NAMESPACES, POP_CONTEXT, TxFailedError, Wallet, addressFromPublicKey, addressPrefix, baseFee, beaconCommitment, formatFang, ghostSighash, isAddress, minFee, paramsOf, parseFang, parseSoul, popMessage, proposal, proposalSummary, seanceCommitment, sharesFor, signingBytes, stakeSummary, txBytes, txCharge, txId, txSize, verifyProof, type Action, type GhostBundle, type ProposalKind, type Tx } from "../src/index.js";
+import { ApiError, Client, NAMESPACES, POP_CONTEXT, encodeKeyGrant, TxFailedError, Wallet, addressFromPublicKey, addressPrefix, baseFee, beaconCommitment, formatFang, ghostSighash, isAddress, minFee, paramsOf, parseFang, parseSoul, popMessage, proposal, proposalSummary, seanceCommitment, sharesFor, signingBytes, stakeSummary, txBytes, txCharge, txId, txSize, verifyProof, type Action, type GhostBundle, type ProposalKind, type Tx } from "../src/index.js";
 
 const client = new Client(process.env.BLOCKULA_RPC ?? "http://localhost:7070");
 
@@ -17,8 +17,8 @@ assert.equal(formatFang(1_500_000_000n), "1.5 FANG");
 const vectorActions: Action[] = [
   { type: "transfer", to: "x.boo", amount: "5" },
   { type: "register_name", name: "vlad" },
-  { type: "add_key", key_id: "ab".repeat(32), label: "phone", role: { type: "owner" } },
-  { type: "add_key", key_id: "cd".repeat(32), label: "claude", role: { type: "session", limit: "10", period_blocks: 100, expires_at: 1000 } },
+  { type: "add_key", key_id: "ab".repeat(32), label: "phone", role: { type: "owner" }, public_key: "0c", pop: "0d" },
+  { type: "add_key", key_id: "cd".repeat(32), label: "claude", role: { type: "session", limit: "10", period_blocks: 100, expires_at: 1000 }, public_key: "0e", pop: "0f" },
   { type: "remove_key", key_id: "ab".repeat(32) },
   { type: "register_validator", consensus_key: "0a", p2p_addr: "1.2.3.4:5", http_addr: "https://v.example", bond: "50", pop: "0b" },
   { type: "approve_validator", validator: "boo1v" },
@@ -43,7 +43,7 @@ const vectorActions: Action[] = [
   { type: "reject_claim", claim_id: 4, reason: "r" },
   { type: "join_jury", bond: (10n * 1_000_000_000n).toString() },
   { type: "leave_jury" },
-  { type: "commit_votes", seance_id: 2, commitment: "ef".repeat(32) },
+  { type: "commit_votes", seance_id: 2, commitment: "ef".repeat(32), pairs_digest: "e0".repeat(32) },
   { type: "reveal_votes", seance_id: 2, votes: "ab=", spam: [5, 6], salt: "s" },
   { type: "fund_pool", amount: "5" },
   { type: "withdraw_vested" },
@@ -53,7 +53,7 @@ const vectorTx = (action: Action): Tx => ({ chain_id: "vec", genesis_hash: "03".
 const all = vectorActions.map((a) => signingBytes(vectorTx(a)));
 const joined = new Uint8Array(all.reduce((n, b) => n + b.length, 0));
 all.reduce((at, b) => (joined.set(b, at), at + b.length), 0);
-assert.equal(bytesToHex(blake3(joined)), "3633490a583afa9a7aec72593fd29e9d5461b3a037abec251ca90c762e3b1b65");
+assert.equal(bytesToHex(blake3(joined)), "1078aa2103641542458acf9a1928da918af6505c8cb3a3a1f7bbf7320bbe3c30");
 // Protocol v1 (tags 30–49, every proposal kind, a multisig proposal), hashed on its own: `v1_vector_actions` there.
 const propose = (kind: ProposalKind): Action => ({ type: "propose", kind, deposit: (1000n * 1_000_000_000n).toString(), title: "t" });
 const v1VectorActions: Action[] = [
@@ -81,12 +81,12 @@ const v1VectorActions: Action[] = [
   propose({ type: "activate_feature", feature: "ghost" }),
   propose({ type: "deactivate_feature", feature: "ghost" }),
   propose({ type: "text" }),
-  { type: "vote", proposal_id: 1, aye: true, amount: "10", conviction: 6 },
-  { type: "vote", proposal_id: 1, aye: false, amount: "10", conviction: 0 },
+  { type: "vote", proposal_id: 1, aye: true, amount: "10", conviction: 6, proposal_digest: "d1".repeat(32) },
+  { type: "vote", proposal_id: 1, aye: false, amount: "10", conviction: 0, proposal_digest: "d1".repeat(32) },
   { type: "unlock" },
   { type: "multisig_create", owners: ["ab".repeat(32), "cd".repeat(32)], threshold: 2 },
   { type: "multisig_propose", action: { type: "transfer", to: "x.boo", amount: "5" } },
-  { type: "multisig_approve", id: 3 },
+  { type: "multisig_approve", id: 3, action_digest: "a3".repeat(32) },
   { type: "renew_name", name: "vlad", years: 2 },
   { type: "transfer_name", name: "vlad", to: "x.boo" },
   { type: "release_name", name: "vlad" },
@@ -97,7 +97,7 @@ const v1VectorActions: Action[] = [
 const v1 = v1VectorActions.map((a) => signingBytes(vectorTx(a)));
 const v1Joined = new Uint8Array(v1.reduce((n, b) => n + b.length, 0));
 v1.reduce((at, b) => (v1Joined.set(b, at), at + b.length), 0);
-assert.equal(bytesToHex(blake3(v1Joined)), "fa975d440a66418e791d1cb415eb19479e544948ca449897fa7bad2e1d94bde0");
+assert.equal(bytesToHex(blake3(v1Joined)), "6979535ae0ead49caa82eba564873762cfc4fb7aad1dc77ec3ae845caf0b5366");
 // Proposal kinds added after that vector froze, each on its own: `unflag_sybil` (tag 14, audit F54) and `cancel_upgrade` (tag 15, audit F50).
 assert.equal(bytesToHex(blake3(signingBytes(vectorTx(propose({ type: "unflag_sybil", account: "x.boo", reason: "r" }))))), "225aa5b8e4df8e8d27fe796992dfd02e5e402c14a9bbc3873d41d63dd07dc2cf");
 assert.equal(bytesToHex(blake3(signingBytes(vectorTx(propose({ type: "cancel_upgrade", version: 2, activation_height: 100_000 }))))), "199d2455419f738528317187cdbfa72e5430308b096c2c8741f5801290d3d156");
@@ -193,8 +193,19 @@ console.log("✓ validity windows, the chain instance, prefixes and strict JSON 
 
 // Account abstraction: alice lets an agent key spend up to 5 FANG per 100 blocks from her account.
 const agent = Wallet.generate(client);
-const grant = await alice.addSessionKey(agent.keyId, "claude", { limit: "5", periodBlocks: 100, expiresInBlocks: 1000 });
+// The agent consents to alice's account (its grant code); a key id alone, or a grant made for
+// another account, can't be added (audit gap-7-2).
+const agentGrant = await agent.keyGrant(alice.address);
+await assert.rejects(alice.addSessionKey(agent.keyId, "claude", { limit: "5", periodBlocks: 100, expiresInBlocks: 1000 }), /that's a key id/);
+await assert.rejects(bob.addSessionKey(agentGrant, "claude", { limit: "5", periodBlocks: 100, expiresInBlocks: 1000 }), /that grant is for/);
+// Mallory (bob) signs alice's grant into his own AddKey anyway: the node refuses it.
+const stolen = { type: "add_key", key_id: agentGrant.key_id, label: "x", role: { type: "owner" }, public_key: agentGrant.public_key, pop: agentGrant.pop } as const;
+await assert.rejects(client.submit(await bob.build(stolen)), /proof of possession doesn't verify/);
+const grant = await alice.addSessionKey(encodeKeyGrant(agentGrant), "claude", { limit: "5", periodBlocks: 100, expiresInBlocks: 1000 });
 console.log("✓", grant.summary);
+const listing = await client.keyAccounts(agent.keyId);
+assert.deepEqual(listing.accounts.map((a: { account: { address: string } }) => a.account.address).filter((a: string) => a !== agent.address), [alice.address], "only the account it agreed to join lists the key");
+assert.equal(listing.next, null);
 await agent.actAs(`${name}.boo`);
 const paid = await agent.send(bob.address, "3", { memo: "agent errand" });
 console.log("✓", paid.summary);
@@ -204,7 +215,7 @@ console.log("✓ session key limits enforced");
 
 // A second device (e.g. another passkey) gets full control, then revokes the agent.
 const phone = Wallet.generate(client);
-await alice.addOwnerKey(phone.keyId, "phone");
+await alice.addOwnerKey(await phone.keyGrant(alice.address), "phone");
 await phone.actAs(alice.address);
 await phone.removeKey(agent.keyId);
 await assert.rejects(agent.send(bob.address, "0.1"), /isn't authorized/);
@@ -251,7 +262,7 @@ if (minBond + parseFang("2") <= BigInt((await client.account(alice.address)).bal
 // Hunts: bob escrows a bounty on a GitHub issue, alice chips in, bob awards it to alice's
 // Familiar (an agent session key she registered).
 const agent2 = Wallet.generate(client);
-await alice.addSessionKey(agent2.keyId, "claude", { limit: "1", periodBlocks: 100, expiresInBlocks: 1000 });
+await alice.addSessionKey(await agent2.keyGrant(alice.address), "claude", { limit: "1", periodBlocks: 100, expiresInBlocks: 1000 });
 console.log("✓", (await alice.registerFamiliar(agent2.keyId, "claude")).summary);
 const created = await bob.createHunt({ repo: "jackdishman/blockula", issue: 1, amount: "10", title: "Shared tx test vectors", expiresInBlocks: 500 });
 console.log("✓", created.summary);
@@ -285,7 +296,8 @@ await assert.rejects(alice.vouch(bob.address), /at least 10 Soul/);
 await assert.rejects(alice.unvouch(bob.address), /has no vouch/);
 await assert.rejects(alice.submitClaim("jackdishman/blockula", 1), /Soul or a vouch|isn't in the contribution pool/);
 await assert.rejects(alice.leaveJury(), /not in the jury pool/);
-await assert.rejects(alice.sealVotes(999_999, "ab"), /no Séance/);
+const ghostPairs = [[{ id: 1, repo: "a/b", pr: 1 }, { id: 2, repo: "a/b", pr: 2 }], [{ id: 2, repo: "a/b", pr: 2 }, { id: 1, repo: "a/b", pr: 1 }]] as [{ id: number; repo: string; pr: number }, { id: number; repo: string; pr: number }][];
+await assert.rejects(alice.sealVotes(999_999, "ab", [], undefined, { pairs: ghostPairs }), /no Séance/);
 await assert.rejects(alice.revealVotes(999_999, "ab", [3], "salt"), /no Séance/);
 await assert.rejects(alice.withdrawVested(), /nothing has vested/);
 await assert.rejects(alice.client.submit(await alice.build({ type: "attest_claim", claim_id: 0, ok: true, merge_sha: "ab".repeat(20), note: "" })), /only active validators/);
@@ -466,7 +478,7 @@ if (proposalId !== undefined && councilSeed && validators.active.length === 1 &&
 
 // Refused for their own reasons, not the encoding.
 const governance: [Action, RegExp][] = [
-  [{ type: "vote", proposal_id: 1_000_000, aye: true, amount: "1", conviction: 1 }, /no proposal #1000000/],
+  [{ type: "vote", proposal_id: 1_000_000, aye: true, amount: "1", conviction: 1, proposal_digest: "00".repeat(32) }, /no proposal #1000000/],
   [{ type: "multisig_propose", action: { type: "transfer", to: bob.address, amount: "1" } }, /isn't a multisig account/],
   [{ type: "claim_distribution", distribution_id: 1_000_000, amount: "1", proof: ["cd".repeat(32)] }, /no distribution #1000000/],
   // `cancel_upgrade` (F50): the node decodes the SDK's encoding and refuses what isn't scheduled.
@@ -498,7 +510,7 @@ async function verifiedByNode(label: string, run: () => Promise<unknown>) {
 const helpers: [string, () => Promise<unknown>][] = [
   ["redelegate", () => alice.redelegate(validator, bob.address, 1n)],
   ["updateValidator", () => alice.updateValidator({ commissionBps: 500 })],
-  ["multisigApprove", () => alice.multisigApprove(0)],
+  ["multisigApprove", () => alice.multisigApprove(0, { action: { type: "unlock" } })],
   ["beaconCommit", () => alice.beaconCommit(1, "ab".repeat(32))],
   ["claimDistribution", () => alice.claimDistribution(0, "1", ["cd".repeat(32)])],
 ];

@@ -4,10 +4,10 @@
 //! any node's HTTP API and signs with the CLI wallet or a key file.
 
 use crate::cli_net::{ChainPin, Remote};
-use crate::crypto::{self, Keys};
+use crate::crypto::Keys;
 use crate::types::*;
-use crate::validator_cli::{get, load_seed, own_address, parse_fang, rt, send_memo, wallet_keys};
-use anyhow::{anyhow, bail, Context, Result};
+use crate::validator_cli::{get, load_seed, own_address, parse_fang, rt, wallet_keys};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use clap::{Args, Subcommand};
 use serde_json::Value;
 use std::io::{BufRead, IsTerminal, Write};
@@ -65,22 +65,28 @@ impl Signer {
     }
 }
 
+/// An address the node resolves a name to, unproven (printed): only where an address is needed.
 async fn resolve(rpc: &str, who: &str) -> Result<String> {
-    if crypto::is_address(who) {
-        return Ok(who.to_string());
-    }
-    get(rpc, &format!("/account/{who}")).await?["account"]["address"].as_str().map(String::from).ok_or_else(|| anyhow!("can't resolve {who}"))
+    crate::cli_net::resolve_unproven(rpc, who).await
 }
 
 /// Signs and submits `action` for the chain `s` pins, waits for it, and prints the summary and
 /// explorer link.
 fn submit(dir: &Path, s: &Signer, action: Action) -> Result<Value> {
+    submit_at(dir, s, |_, _| Ok(action))
+}
+
+/// [`submit`] for an action that carries an absolute height: `make(height, blocks_per_day)`
+/// builds it from the status read that sets `valid_until`, with the day length from the pinned
+/// genesis (audit gap-7-3).
+fn submit_at(dir: &Path, s: &Signer, make: impl FnOnce(u64, u64) -> Result<Action>) -> Result<Value> {
     let keys = s.keys(dir)?;
     let rt = rt()?;
     let tx = rt.block_on(async {
         let remote = s.connect(dir).await?;
         let from = s.acting_for(&remote, &keys).await?;
-        send_memo(&remote, &keys, &from, action, String::new()).await
+        let day = remote.blocks_per_day().await?;
+        crate::validator_cli::send_memo_with(&remote, &keys, &from, |height| make(height, day), String::new()).await
     })?;
     println!("✓ {}", tx["summary"].as_str().unwrap_or_default());
     println!("  {}/#/tx/{}", s.rpc.trim_end_matches('/'), tx["id"].as_str().unwrap_or_default());
@@ -206,10 +212,10 @@ pub fn hunt(cmd: HuntCmd, dir: &Path) -> Result<()> {
         }
         HuntCmd::Create { repo, issue, amount, title, days, signer } => {
             check_repo(&repo)?;
-            let status = rt()?.block_on(get(&signer.rpc, "/status"))?;
-            let block_ms = status["block_time_ms"].as_u64().unwrap_or(1000).max(1);
-            let expires_at = status["height"].as_u64().unwrap_or(0) + days * 86_400_000 / block_ms;
-            submit(dir, &signer, Action::CreateHunt { repo, issue, amount: parse_fang(&amount)?, expires_at, title })?;
+            let amount = parse_fang(&amount)?;
+            // The expiry counts `days` days of the genesis's blocks from the status the tx is
+            // signed against, not a separate read or the node's block time (audit gap-7-3).
+            submit_at(dir, &signer, |height, day| Ok(Action::CreateHunt { repo, issue, amount, expires_at: height.saturating_add(days.saturating_mul(day)), title }))?;
             Ok(())
         }
         HuntCmd::Fund { id, amount, signer } => submit(dir, &signer, Action::FundHunt { hunt_id: id, amount: parse_fang(&amount)? }).map(|_| ()),
@@ -254,13 +260,18 @@ fn award(dir: &Path, id: u64, pr: u64, to: Option<String>, familiar: Option<Stri
         Some(p)
     };
     let recipient = match (&to, &pr_info) {
-        (Some(t), _) => rt.block_on(resolve(rpc, t))?,
+        // A name is signed as the name: the chain resolves it (audit gap-7-1).
+        (Some(t), _) => crate::cli_net::account_ref(t)?,
         (None, Some(p)) => {
             let link = rt.block_on(get(rpc, &format!("/github/{}", p.author))).map_err(|_| anyhow!("@{} hasn't linked a Blockula account (they can run link_github); or pass --to <name>", p.author))?;
             if link["verified"] != true {
                 bail!("@{}'s link isn't verified: {}. Pass --to to award anyway.", p.author, link["reason"].as_str().unwrap_or("unknown"));
             }
-            link["account"]["address"].as_str().map(String::from).ok_or_else(|| anyhow!("bad /api/github response"))?
+            let addr = link["account"]["address"].as_str().map(String::from).ok_or_else(|| anyhow!("bad /api/github response"))?;
+            ensure!(crate::crypto::is_address(&addr), "{rpc} linked @{} to {addr:?}, which isn't an address", p.author);
+            // The link is the node's word (audit gap-7-1): the address is printed and confirmed.
+            eprintln!("   @{} → {addr} (the account {rpc} says their GitHub link names, unproven: check the address, or pass --to)", p.author);
+            addr
         }
         (None, None) => unreachable!(),
     };
@@ -273,7 +284,7 @@ fn award(dir: &Path, id: u64, pr: u64, to: Option<String>, familiar: Option<Stri
             hit["key_id"].as_str().map(String::from)
         }
     };
-    confirm(&format!("Award {} (hunt #{id}, {repo}#{issue}) to {} for PR #{pr}{why}?", h["amount_display"].as_str().unwrap_or_default(), name_of(&acct["account"])), yes)?;
+    confirm(&format!("Award {} (hunt #{id}, {repo}#{issue}) to {} ({recipient}) for PR #{pr}{why}?", h["amount_display"].as_str().unwrap_or_default(), name_of(&acct["account"])), yes)?;
     submit(dir, signer, Action::AwardHunt { hunt_id: id, to: recipient, pr, familiar_key })?;
     Ok(())
 }
@@ -494,11 +505,11 @@ pub fn contrib(cmd: ContribCmd, dir: &Path) -> Result<()> {
             Ok(())
         }
         ContribCmd::Vouch { account, signer } => {
-            let to = rt()?.block_on(resolve(&signer.rpc, &account))?;
+            let to = crate::cli_net::account_ref(&account)?;
             submit(dir, &signer, Action::Vouch { account: to }).map(|_| ())
         }
         ContribCmd::Unvouch { account, signer } => {
-            let to = rt()?.block_on(resolve(&signer.rpc, &account))?;
+            let to = crate::cli_net::account_ref(&account)?;
             submit(dir, &signer, Action::Unvouch { account: to }).map(|_| ())
         }
         ContribCmd::JoinJury { bond, signer } => submit(dir, &signer, Action::JoinJury { bond: parse_fang(&bond)? }).map(|_| ()),
@@ -544,6 +555,21 @@ pub fn contrib(cmd: ContribCmd, dir: &Path) -> Result<()> {
             getrandom::fill(&mut salt).map_err(|e| anyhow!("no randomness: {e}"))?;
             let salt = hex::encode(salt);
             let commitment = seance_commitment(seance, &account, &votes, &spam, &salt);
+            // The judgment binds the pairs and PRs `contrib seance` shows (read again here): a node
+            // that misreports them makes the commitment fail, not misdirect it (audit gap-7-6).
+            let s = rt.block_on(get(&signer.rpc, &format!("/seance/{seance}")))?;
+            let seat = s["jurors"].as_array().into_iter().flatten().find(|j| j["juror"]["address"] == account.as_str()).ok_or_else(|| anyhow!("{account} isn't on the jury of Séance #{seance}"))?;
+            let claims: Vec<Value> = s["claims"].as_array().cloned().unwrap_or_default();
+            let claim = |id: u64| -> Result<(u64, String, u64)> {
+                let c = claims.iter().find(|c| c["id"] == id).ok_or_else(|| anyhow!("Séance #{seance} doesn't list claim #{id}"))?;
+                Ok((id, c["repo"].as_str().unwrap_or_default().to_string(), c["pr"].as_u64().unwrap_or_default()))
+            };
+            let pairs = seat["assigned_pairs"].as_array().into_iter().flatten().map(|p| Ok([claim(p[0].as_u64().unwrap_or_default())?, claim(p[1].as_u64().unwrap_or_default())?])).collect::<Result<Vec<_>>>()?;
+            if votes.len() != pairs.len() {
+                bail!("you have {} assigned pairs: pass one of a, b or = for each (`blockula contrib seance {seance}` lists them)", pairs.len());
+            }
+            let refs: Vec<[(u64, &str, u64); 2]> = pairs.iter().map(|[a, b]| [(a.0, a.1.as_str(), a.2), (b.0, b.1.as_str(), b.2)]).collect();
+            let pairs_digest = seance_pairs_digest(seance, &account, &refs);
             let path = sealed_path(dir, &chain_id, seance, &account);
             std::fs::create_dir_all(path.parent().unwrap())?;
             // Replace the saved vote only once the new commitment is on-chain, so a failed
@@ -551,7 +577,7 @@ pub fn contrib(cmd: ContribCmd, dir: &Path) -> Result<()> {
             let tmp = path.with_extension("pending");
             std::fs::write(&tmp, serde_json::to_vec_pretty(&SealedVote { chain_id, seance, account, votes, spam, salt })?)?;
             // On failure the .pending file stays: if the commit lands anyway, `reveal` finds it.
-            submit(dir, &signer, Action::CommitVotes { seance_id: seance, commitment })?;
+            submit(dir, &signer, Action::CommitVotes { seance_id: seance, commitment, pairs_digest })?;
             std::fs::rename(&tmp, &path)?;
             println!("  sealed vote saved to {} — run `blockula contrib reveal {seance}` once revealing opens", path.display());
             Ok(())
@@ -577,16 +603,16 @@ pub fn contrib(cmd: ContribCmd, dir: &Path) -> Result<()> {
         ContribCmd::Admin { cmd } => match cmd {
             AdminCmd::SetRepo { repo, weight, signer } => submit(dir, &signer, Action::SetRepo { repo, weight }).map(|_| ()),
             AdminCmd::GrantSoul { account, soul, reason, signer } => {
-                let to = rt()?.block_on(resolve(&signer.rpc, &account))?;
+                let to = crate::cli_net::account_ref(&account)?;
                 submit(dir, &signer, Action::GrantSoul { to, amount: parse_soul(&soul)?, reason }).map(|_| ())
             }
             AdminCmd::Reject { claim, reason, signer } => submit(dir, &signer, Action::RejectClaim { claim_id: claim, reason }).map(|_| ()),
             AdminCmd::FlagSybil { account, reason, signer } => {
-                let who = rt()?.block_on(resolve(&signer.rpc, &account))?;
+                let who = crate::cli_net::account_ref(&account)?;
                 submit(dir, &signer, Action::FlagSybil { account: who, reason }).map(|_| ())
             }
             AdminCmd::Clawback { account, reason, signer } => {
-                let who = rt()?.block_on(resolve(&signer.rpc, &account))?;
+                let who = crate::cli_net::account_ref(&account)?;
                 submit(dir, &signer, Action::Clawback { account: who, reason }).map(|_| ())
             }
         },
@@ -672,7 +698,7 @@ pub fn name(cmd: NameCmd, dir: &Path) -> Result<()> {
         }
         NameCmd::Transfer { name, to, yes, signer } => {
             let n = normalize_name(&name)?;
-            let to = rt()?.block_on(resolve(&signer.rpc, &to))?;
+            let to = crate::cli_net::account_ref(&to)?;
             confirm(&format!("Offer {n}{NAME_SUFFIX} to {to}? Once they accept it, only they can give it back."), yes)?;
             submit(dir, &signer, Action::TransferName { name: n, to }).map(|_| ())
         }

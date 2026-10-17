@@ -28,6 +28,11 @@ export interface Network {
   mainnet: boolean;
   /** Remember the first chain this node reports (TOFU) across restarts. Off for local dev chains, which `--reset` replaces. */
   remember: boolean;
+  /**
+   * Independent nodes of the same chain (BLOCKULA_WITNESSES, comma-separated): names that end up
+   * in a signature are proven against them (audit gap-7-1). Empty: a name is the node's word.
+   */
+  witnesses: string[];
 }
 
 export const LOCAL_RPC = "http://localhost:7070";
@@ -43,7 +48,7 @@ export const MAINNET_RPCS: string[] = [];
 export const KNOWN_GENESIS: Record<string, string> = {};
 
 /** The networks the MCP knows by name. */
-export const KNOWN_NETWORKS: Record<Exclude<NetworkKey, "custom">, Omit<Network, "rpc"> & { rpc?: string }> = {
+export const KNOWN_NETWORKS: Record<Exclude<NetworkKey, "custom">, Omit<Network, "rpc" | "witnesses"> & { rpc?: string }> = {
   mainnet: { key: "mainnet", label: "Blockula mainnet", rpc: MAINNET_RPCS[0], pin: { chainId: "blockula-1", prefix: "boo" }, mainnet: true, remember: true },
   // The protocol v1 public testnet (deploy/launch.sh): its own chain id (never reused) and the
   // testnet prefix (DEC-7). Its genesis hash exists only once it launches: until a release adds it
@@ -68,15 +73,15 @@ const isPrivateUrl = (u: string) => {
 };
 
 /** A node URL: http(s) without credentials; plain http only on this machine or a private network. */
-export function checkRpcUrl(u: string): string {
+export function checkRpcUrl(u: string, what = "BLOCKULA_RPC"): string {
   let url: URL;
   try {
     url = new URL(u);
   } catch {
-    throw new Error(`BLOCKULA_RPC isn't a URL: ${u}`);
+    throw new Error(`${what} isn't a URL: ${u}`);
   }
-  if (!/^https?:$/.test(url.protocol) || url.username || url.password) throw new Error(`BLOCKULA_RPC must be an http(s) URL without credentials: ${u}`);
-  if (url.protocol === "http:" && !isPrivateUrl(u)) throw new Error(`BLOCKULA_RPC must use https unless the node is on this machine or a private network: ${u}`);
+  if (!/^https?:$/.test(url.protocol) || url.username || url.password) throw new Error(`${what} must be an http(s) URL without credentials: ${u}`);
+  if (url.protocol === "http:" && !isPrivateUrl(u)) throw new Error(`${what} must use https unless the node is on this machine or a private network: ${u}`);
   return u.replace(/\/+$/, "");
 }
 
@@ -125,7 +130,10 @@ export function resolveNetwork(env: Record<string, string | undefined>, argv: st
   pin.genesisHash ??= known;
   // A real-money chain is never the local or a custom network by accident.
   const mainnet = base.mainnet || pin.chainId === KNOWN_NETWORKS.mainnet.pin.chainId;
-  return { key, label: base.label, rpc: url, pin, mainnet, remember: base.remember };
+  const witnesses = (env.BLOCKULA_WITNESSES ?? "").split(",").map((w) => w.trim()).filter(Boolean).map((w) => checkRpcUrl(w, "BLOCKULA_WITNESSES"));
+  if (witnesses.includes(url)) throw new Error("BLOCKULA_WITNESSES must be other nodes than BLOCKULA_RPC's");
+  if (new Set(witnesses).size !== witnesses.length) throw new Error("BLOCKULA_WITNESSES lists a node twice");
+  return { key, label: base.label, rpc: url, pin, mainnet, remember: base.remember, witnesses };
 }
 
 /** Why a node's status doesn't match a pin, or null if it does. Known chain ids must come with their known genesis. */

@@ -48,11 +48,20 @@ export type AccountChoice = { address: string; name: string | null; short: strin
  * authorized) even if it was never used, so hide it when it's empty and there's somewhere better.
  */
 export async function findAccounts(client: PinnedClient, wallet: Wallet): Promise<AccountChoice[]> {
-  const res = (await client.keyAccounts(wallet.keyId)) as KeyAccounts;
+  // Only accounts this key agreed to join list it (AddKey carries the key's consent, audit
+  // gap-7-2), a page at a time; a few pages is more than any real key has.
+  const listed: KeyAccounts["accounts"] = [];
+  let after: string | undefined;
+  for (let page = 0; page < 5; page++) {
+    const res = (await client.keyAccounts(wallet.keyId, after ? { after } : {})) as KeyAccounts;
+    listed.push(...res.accounts);
+    if (!res.next) break;
+    after = res.next;
+  }
   const out: AccountChoice[] = [];
   // Node quirk: once an account has added any key, /api/key lists the key's own account twice.
   const seen = new Set<string>();
-  for (const a of res.accounts) {
+  for (const a of listed) {
     if (seen.has(a.account.address)) continue;
     seen.add(a.account.address);
     const acct = (await client.account(a.account.address).catch(() => null)) as AccountView | null;

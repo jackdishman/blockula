@@ -78,7 +78,8 @@ export default function RecoverPage() {
       const device = stage.device ?? (await createPasskey(client, `Blockula (${account.name ?? account.short})`));
       if (!stage.device) setStage({ ...stage, device });
       await kit.actAs(account.address);
-      const tx = (await kit.addOwnerKey(device.wallet.keyId, "Restored device")) as TxView;
+      // The new passkey consents to joining the account (audit gap-7-2); the kit adds it.
+      const tx = (await kit.addOwnerKey(await device.wallet.keyGrant(account.address), "Restored device")) as TxView;
       await device.wallet.actAs(account.address);
       unlocked(device.wallet, { ...device.hint, account: account.address, name: account.name ?? undefined });
       setStage({ s: "cleanup", account, kitKeyId: kit.keyId, deviceKeyId: device.wallet.keyId, tx });

@@ -358,7 +358,7 @@ fn shield_transfer_unshield_through_the_node() {
     assert!(n.c.describe_last(0).contains(&ghost_bob.address().fingerprint()));
     // Session keys can't shield (or spend shielded funds: that needs the spending key).
     let agent = Keys::from_seed([4; 32]);
-    let mut add = Tx { chain_id: n.c.genesis.chain_id.clone(), genesis_hash: n.c.genesis_hash.clone(), from: alice.address(), nonce: n.c.next_nonce(&alice.address()), fee: 0, tip: 0, valid_until: n.c.height() + 100, action: Action::AddKey { key_id: key_id(&agent.public_key()), label: "agent".into(), role: KeyRole::Session { limit: 50 * FANG, period_blocks: 100, expires_at: 10_000 } }, memo: String::new(), public_key: hex::encode(alice.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+    let mut add = Tx { chain_id: n.c.genesis.chain_id.clone(), genesis_hash: n.c.genesis_hash.clone(), from: alice.address(), nonce: n.c.next_nonce(&alice.address()), fee: 0, tip: 0, valid_until: n.c.height() + 100, action: crate::types::add_key(&agent, &n.c.genesis.chain_id, &n.c.genesis_hash, &alice.address(), "agent", KeyRole::Session { limit: 50 * FANG, period_blocks: 100, expires_at: 10_000 }), memo: String::new(), public_key: hex::encode(alice.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
     add.fee = min_fee(add.size());
     n.submit(&add.sign(&alice)).unwrap();
     n.c.produce_block().unwrap();

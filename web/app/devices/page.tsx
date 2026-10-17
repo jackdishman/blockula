@@ -1,6 +1,6 @@
 "use client";
 
-import { formatFang, parseFang } from "@blockula/sdk";
+import { decodeKeyGrant, formatFang, parseFang, type KeyGrant } from "@blockula/sdk";
 import Link from "next/link";
 import { useState } from "react";
 import { RequireWallet } from "@/components/Gate";
@@ -9,7 +9,7 @@ import { Apparition } from "@/components/Haunt";
 import { Copy, ErrorNote, ExplorerLink, Spinner, Tip } from "@/components/ui";
 import { BLOCKS_PER_DAY, explorer } from "@/lib/config";
 import { friendly } from "@/lib/errors";
-import { blocksToHuman, isKeyId, keyCode } from "@/lib/format";
+import { blocksToHuman, keyCode } from "@/lib/format";
 import { KIT_LABEL } from "@/lib/recovery";
 import type { KeyView, TxView } from "@/lib/types";
 import { useUnlocked } from "@/lib/wallet";
@@ -137,7 +137,9 @@ function RecoverySection({ kits, canRevoke, onRevoked }: { kits: KeyView[]; canR
     setBusy(true);
     setError(null);
     try {
-      await wallet.addOwnerKey(pending.keyId, KIT_LABEL);
+      // Kits made before kits carried their grant can't be added without the words: make a new one.
+      if (!pending.grant) throw new Error("This kit was made before kits carried their consent to your account, so it can't be added from here. Make a new kit and forget this one.");
+      await wallet.addOwnerKey(pending.grant, KIT_LABEL);
       updateHint({ pendingKit: undefined });
       await refresh();
     } catch (e) {
@@ -174,6 +176,18 @@ function RecoverySection({ kits, canRevoke, onRevoked }: { kits: KeyView[]; canR
   );
 }
 
+/** A pasted grant code, parsed (or why it can't be), and whether it's for this account. */
+function parseGrant(code: string, account: string): { grant: KeyGrant | null; problem: string | null } {
+  if (!code.trim()) return { grant: null, problem: null };
+  try {
+    const grant = decodeKeyGrant(code);
+    if (grant.account !== account) return { grant: null, problem: `This code is for another account (${grant.account.slice(0, 12)}…). The other side must make it for ${account}.` };
+    return { grant, problem: null };
+  } catch (e) {
+    return { grant: null, problem: friendly(e) };
+  }
+}
+
 function AddDevice() {
   const { wallet, refresh } = useUnlocked();
   const [id, setId] = useState("");
@@ -181,14 +195,16 @@ function AddDevice() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState<TxView | null>(null);
-  const key = id.trim().toLowerCase();
-  const valid = isKeyId(key);
+  // The new device's grant: its consent to joining this account (audit gap-7-2), not just its key id.
+  const { grant, problem } = parseGrant(id, wallet.account);
+  const valid = grant !== null;
 
   const add = async () => {
+    if (!grant) return;
     setBusy(true);
     setError(null);
     try {
-      const tx = (await wallet.addOwnerKey(key, label.trim() || "Another device")) as TxView;
+      const tx = (await wallet.addOwnerKey(grant, label.trim() || "Another device")) as TxView;
       setDone(tx);
       setId("");
       await refresh();
@@ -203,15 +219,15 @@ function AddDevice() {
     <section className="card stack" id="device">
       <h2>Link a device</h2>
       <ol className="steps">
-        <li>On the new device, open this wallet and choose <b>Link this device to a wallet on another device</b>.</li>
-        <li>It shows a key id. Paste it here.</li>
+        <li>On the new device, open this wallet and choose <b>Link this device to a wallet on another device</b>, then enter this account: <span className="mono">{wallet.account}</span>.</li>
+        <li>It shows a grant code. Copy it and paste it here.</li>
         <li>Check the code matches, then add it. The new device opens automatically.</li>
       </ol>
       <label className="field">
-        <span>New device&apos;s key id</span>
-        <input value={id} onChange={(e) => setId(e.target.value)} placeholder="64 hex characters" className="mono" autoCapitalize="none" spellCheck={false} />
+        <span>New device&apos;s grant code</span>
+        <textarea value={id} onChange={(e) => setId(e.target.value)} placeholder="bkgrant1.…" className="mono" autoCapitalize="none" spellCheck={false} rows={3} />
       </label>
-      {key && (valid ? <span className="ok">Check code: <b className="code inline">{keyCode(key)}</b></span> : <span className="warn">A key id is 64 characters of 0–9 and a–f.</span>)}
+      {id.trim() && (grant ? <span className="ok">Check code: <b className="code inline">{keyCode(grant.key_id)}</b></span> : <span className="warn">{problem}</span>)}
       <label className="field">
         <span>Name it</span>
         <input value={label} onChange={(e) => setLabel(e.target.value)} maxLength={64} />
@@ -235,7 +251,8 @@ function AddAgent() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState<{ tx: TxView; limit: string; days: number } | null>(null);
-  const key = id.trim().toLowerCase();
+  // The agent's grant: its consent to spending from this account (audit gap-7-2).
+  const { grant, problem } = parseGrant(id, wallet.account);
   const nDays = Number(days);
   let limitOk = true;
   try {
@@ -243,16 +260,17 @@ function AddAgent() {
   } catch {
     limitOk = false;
   }
-  const valid = isKeyId(key) && limitOk && Number.isInteger(nDays) && nDays > 0 && nDays <= 365;
+  const valid = grant !== null && limitOk && Number.isInteger(nDays) && nDays > 0 && nDays <= 365;
   const me = account?.names[0] ?? wallet.account;
   // A "day" in blocks. A fixed constant: block timing reported by the node isn't trusted here.
   const day = BLOCKS_PER_DAY;
 
   const add = async () => {
+    if (!grant) return;
     setBusy(true);
     setError(null);
     try {
-      const tx = (await wallet.addSessionKey(key, label.trim() || "agent", { limit, periodBlocks: day, expiresInBlocks: nDays * day })) as TxView;
+      const tx = (await wallet.addSessionKey(grant, label.trim() || "agent", { limit, periodBlocks: day, expiresInBlocks: nDays * day })) as TxView;
       setDone({ tx, limit, days: nDays });
       setId("");
       await refresh();
@@ -277,14 +295,14 @@ SDK:  await wallet.actAs("${me}");
         Let an AI agent pay for things without handing over your wallet. It gets its own key, a daily limit and an expiry date, and can only send FANG.
       </p>
       <ol className="steps">
-        <li>In your agent (e.g. Claude Code with the Blockula MCP), run <code>create_wallet</code>.</li>
-        <li>Copy the <code>key_id</code> it prints and paste it here.</li>
+        <li>Tell your agent (e.g. Claude Code with the Blockula MCP) to <code>use_account</code> <span className="mono">{me}</span>.</li>
+        <li>It answers with a <code>grant_code</code> (its key&apos;s consent to this account). Paste it here.</li>
       </ol>
       <label className="field">
-        <span>Agent&apos;s key id</span>
-        <input value={id} onChange={(e) => setId(e.target.value)} placeholder="64 hex characters" className="mono" autoCapitalize="none" spellCheck={false} />
+        <span>Agent&apos;s grant code</span>
+        <textarea value={id} onChange={(e) => setId(e.target.value)} placeholder="bkgrant1.…" className="mono" autoCapitalize="none" spellCheck={false} rows={3} />
       </label>
-      {key && !isKeyId(key) && <span className="warn">A key id is 64 characters of 0–9 and a–f.</span>}
+      {id.trim() && !grant && <span className="warn">{problem}</span>}
       <div className="grid-2">
         <label className="field">
           <span>Label</span>
@@ -310,7 +328,7 @@ SDK:  await wallet.actAs("${me}");
       </button>
       {valid && (
         <p className="dim small">
-          You&apos;ll sign: key <span className="mono">{key.slice(0, 12)}…</span> may send at most {limit} FANG (amount + fees) every {BLOCKS_PER_DAY.toLocaleString()} blocks (~1 day), transfers only, until {nDays} days of blocks from now. Revoke it any time.
+          You&apos;ll sign: key <span className="mono">{grant?.key_id.slice(0, 12)}…</span> (check code {grant ? keyCode(grant.key_id) : ""}) may send at most {limit} FANG (amount + fees) every {BLOCKS_PER_DAY.toLocaleString()} blocks (~1 day), transfers only, until {nDays} days of blocks from now. Revoke it any time.
         </p>
       )}
       <ErrorNote error={error} />

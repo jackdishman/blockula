@@ -1378,13 +1378,17 @@ impl State {
             }
             // Prices, expiry and the reserved list: econ.rs (DEC-11).
             Action::RegisterName { name } => crate::econ::register_name(self, j, &sender, name, height)?,
-            Action::AddKey { key_id, label, role } => {
+            Action::AddKey { key_id, label, role, public_key, pop } => {
                 if key.role != KeyRole::Owner {
                     bail!("only owner keys can add keys");
                 }
                 if key_id.len() != 64 || !crypto::is_lower_hex(key_id) {
                     bail!("key_id must be 32 bytes of lowercase hex (BLAKE3 of the public key)");
                 }
+                // The added key consents to this account on this chain (audit gap-7-2). The tx's
+                // chain id and genesis hash are the chain's (checked before it executes); `sender`
+                // is the account the key joins, a multisig's own for an approved AddKey.
+                crate::types::verify_key_pop(&tx.chain_id, &tx.genesis_hash, &sender, key_id, public_key, pop)?;
                 if label.len() > MAX_LABEL {
                     bail!("key label too long (max {MAX_LABEL} bytes)");
                 }
@@ -2922,16 +2926,23 @@ impl Chain {
         Ok(())
     }
 
-    fn note_failed(&mut self, id: String, reason: String, height: u64) {
+    /// Remembers why a tx failed: `ran` when it executed in a block (charged), else it was dropped
+    /// from the mempool unrun (`/api/tx` says which).
+    fn note_failed_as(&mut self, id: String, reason: String, height: u64, ran: bool) {
         if !self.mp.has_failure(&id) {
             self.failed_order.push_back(id.clone());
         }
-        self.mp.fail(id, reason, height);
+        self.mp.fail(id, reason, height, ran);
         while self.failed_order.len() > RECENT_FAILED {
             if let Some(old) = self.failed_order.pop_front() {
                 self.mp.unfail(&old);
             }
         }
+    }
+
+    /// A tx dropped from the mempool without running (evicted, replaced, not included, expired…).
+    fn note_failed(&mut self, id: String, reason: String, height: u64) {
+        self.note_failed_as(id, reason, height, false);
     }
 
     /// Why a tx failed or was dropped, if we remember.
@@ -3011,7 +3022,7 @@ impl Chain {
                 Ok(Outcome::Applied) => txs.push(tx),
                 Ok(Outcome::Failed(r)) => {
                     failed.insert(txs.len(), r.clone());
-                    self.note_failed(tx.id(), r, f.height);
+                    self.note_failed_as(tx.id(), r, f.height, true);
                     txs.push(tx);
                 }
                 Err(e) => {
@@ -4026,6 +4037,49 @@ mod tests {
         tx.sign(keys)
     }
 
+    /// Audit gap-7-2: AddKey needs the added key's consent to that account on this chain. Before,
+    /// anyone could put any (public) key id on their own accounts as an owner, and 100 such
+    /// strangers pushed the key's real account out of `/api/key`.
+    #[test]
+    fn adding_a_key_needs_its_consent() {
+        let home = std::env::temp_dir().join(format!("blockula-pop-{}-{}", now_ms(), std::process::id()));
+        Chain::summon(&home, &SummonOpts::new("test-pop", 1)).unwrap();
+        let mut c = Chain::open(&home).unwrap();
+        let (victim, kit, mallory) = (Keys::from_seed([1u8; 32]), Keys::from_seed([2u8; 32]), Keys::from_seed([3u8; 32]));
+        let (va, ma) = (victim.address(), mallory.address());
+        c.faucet(&va, 10 * DROPS_PER_FANG).unwrap();
+        c.faucet(&ma, 10 * DROPS_PER_FANG).unwrap();
+        c.produce_block().unwrap();
+        let (cid, gh) = (c.genesis.chain_id.clone(), c.genesis_hash.clone());
+        // The victim adds their recovery kit with its consent: the kit's AddKey is public now.
+        let theirs = crate::types::add_key(&kit, &cid, &gh, &va, "recovery kit", KeyRole::Owner);
+        c.submit(signed(&c, &va, &victim, 0, theirs.clone())).unwrap();
+        c.produce_block().unwrap();
+        assert!(c.state.keys_of(&va).contains_key(&key_id(&kit.public_key())));
+        // Mallory replays it (the kit's consent names the victim's account), forges one, or brings
+        // a consent made for another chain instance: all refused at admission…
+        let Action::AddKey { key_id: kid, public_key, pop, .. } = theirs.clone() else { unreachable!() };
+        let forged = Action::AddKey { key_id: kid.clone(), label: "x".into(), role: KeyRole::Owner, public_key: public_key.clone(), pop: hex::encode(mallory.sign_with_context(crate::types::KEY_POP_CONTEXT, b"anything")) };
+        let other_chain = crate::types::add_key(&kit, &cid, &"77".repeat(32), &ma, "x", KeyRole::Owner);
+        for (what, action) in [("a replayed consent", theirs.clone()), ("a forged one", forged), ("one for another chain", other_chain)] {
+            let err = c.submit(signed(&c, &ma, &mallory, 0, action)).unwrap_err().to_string();
+            assert!(err.contains("proof of possession doesn't verify"), "{what}: {err}");
+        }
+        // …and in a block (a proposer that includes one anyway): it fails, nothing is added.
+        let replay = signed(&c, &ma, &mallory, 0, theirs);
+        c.produce_block_with(vec![replay.clone()]).unwrap();
+        assert!(c.failure(&replay.id()).unwrap().0.contains("proof of possession"));
+        assert!(!c.state.keys_of(&ma).contains_key(&kid));
+        // A public key that isn't the key id's is a format error.
+        let swapped = Action::AddKey { key_id: kid, label: "x".into(), role: KeyRole::Owner, public_key: hex::encode(mallory.public_key()), pop };
+        assert!(c.submit(signed(&c, &ma, &mallory, 1, swapped)).unwrap_err().to_string().contains("isn't the key key_id names"));
+        // With the key's consent to Mallory's own account it's fine (the kit's holder agreed).
+        c.submit(signed(&c, &ma, &mallory, 1, crate::types::add_key(&kit, &cid, &gh, &ma, "kit", KeyRole::Owner))).unwrap();
+        c.produce_block().unwrap();
+        assert!(c.state.keys_of(&ma).contains_key(&key_id(&kit.public_key())));
+        fs::remove_dir_all(home).ok();
+    }
+
     #[test]
     fn owner_and_session_keys() {
         let home = std::env::temp_dir().join(format!("blockula-aa-{}", now_ms()));
@@ -4041,8 +4095,9 @@ mod tests {
 
         // Owner adds a second device and an agent session key: 5 FANG per 10 blocks.
         let session = KeyRole::Session { limit: 5 * DROPS_PER_FANG, period_blocks: 10, expires_at: 1_000 };
-        c.submit(signed(&c, &acct, &owner, 0, Action::AddKey { key_id: key_id(&laptop.public_key()), label: "laptop".into(), role: KeyRole::Owner })).unwrap();
-        c.submit(signed(&c, &acct, &owner, 1, Action::AddKey { key_id: key_id(&agent.public_key()), label: "claude".into(), role: session })).unwrap();
+        let (cid, gh) = (c.genesis.chain_id.clone(), c.genesis_hash.clone());
+        c.submit(signed(&c, &acct, &owner, 0, crate::types::add_key(&laptop, &cid, &gh, &acct, "laptop", KeyRole::Owner))).unwrap();
+        c.submit(signed(&c, &acct, &owner, 1, crate::types::add_key(&agent, &cid, &gh, &acct, "claude", session))).unwrap();
         c.produce_block().unwrap();
         assert_eq!(c.state.keys_of(&acct).len(), 3);
 
@@ -4116,7 +4171,7 @@ mod audit {
         assert!(c.track_pending(big).is_err());
         assert!(c.mempool.is_empty());
         // Field caps.
-        let long_label = Action::AddKey { key_id: "ab".repeat(32), label: "x".repeat(65), role: KeyRole::Owner };
+        let long_label = crate::types::add_key(&Keys::from_seed([77; 32]), &c.genesis.chain_id, &c.genesis_hash, &a.address(), &"x".repeat(65), KeyRole::Owner);
         assert!(c.submit(signed_fee(&c, &a.address(), &a, 1, long_label, None)).unwrap_err().to_string().contains("label too long"));
         let mut memo = signed_fee(&c, &a.address(), &a, 1, Action::Transfer { to: c.me().unwrap(), amount: 1 }, None);
         memo.memo = "m".repeat(257);
@@ -4158,7 +4213,8 @@ mod audit {
         let acct = orig.address();
         c.faucet(&acct, 50 * DROPS_PER_FANG).unwrap();
         c.produce_block().unwrap();
-        let upper = Action::AddKey { key_id: key_id(&dev.public_key()).to_uppercase(), label: "phone".into(), role: KeyRole::Owner };
+        let Action::AddKey { key_id: kid, label, role, public_key, pop } = crate::types::add_key(&dev, &c.genesis.chain_id, &c.genesis_hash, &acct, "phone", KeyRole::Owner) else { unreachable!() };
+        let upper = Action::AddKey { key_id: kid.to_uppercase(), label, role, public_key, pop };
         assert!(c.submit(signed_fee(&c, &acct, &orig, 0, upper.clone(), None)).unwrap_err().to_string().contains("lowercase"));
         // Even if one got into a block, execution rejects it (no bricked account).
         let tx = signed_fee(&c, &acct, &orig, 0, upper, None);
@@ -4284,9 +4340,10 @@ mod audit {
         let (o, s) = (Keys::from_seed([1u8; 32]), Keys::from_seed([2u8; 32]));
         c.faucet(&o.address(), 50 * DROPS_PER_FANG).unwrap();
         c.produce_block().unwrap();
-        let zero = Action::AddKey { key_id: key_id(&s.public_key()), label: "a".into(), role: KeyRole::Session { limit: 1, period_blocks: 0, expires_at: 10 } };
+        let (cid, gh) = (c.genesis.chain_id.clone(), c.genesis_hash.clone());
+        let zero = crate::types::add_key(&s, &cid, &gh, &o.address(), "a", KeyRole::Session { limit: 1, period_blocks: 0, expires_at: 10 });
         assert!(c.submit(signed_fee(&c, &o.address(), &o, 0, zero, None)).is_err());
-        let forever = Action::AddKey { key_id: key_id(&s.public_key()), label: "a".into(), role: KeyRole::Session { limit: 1, period_blocks: 1, expires_at: u64::MAX } };
+        let forever = crate::types::add_key(&s, &cid, &gh, &o.address(), "a", KeyRole::Session { limit: 1, period_blocks: 1, expires_at: u64::MAX });
         assert!(c.submit(signed_fee(&c, &o.address(), &o, 0, forever, None)).unwrap_err().to_string().contains("at most"));
         assert!(normalize_name("\u{212A}im").is_err(), "Kelvin sign doesn't fold to k");
         assert!(normalize_name(" jack").is_err());
@@ -4478,7 +4535,8 @@ mod audit {
         assert_eq!((b.txs.len(), b.skipped.len(), b.failed.len()), (2, 0, 0));
         // The agent again, then 62 of its transfers and the owner's removal behind them: all in,
         // all executed.
-        let add = Action::AddKey { key_id: agent_kid, label: "agent".into(), role: KeyRole::Session { limit: 1_000 * DROPS_PER_FANG, period_blocks: 100, expires_at: 10_000 } };
+        assert_eq!(agent_kid, key_id(&agent.public_key()));
+        let add = crate::types::add_key(&agent, "audit", &gh, &acct, "agent", KeyRole::Session { limit: 1_000 * DROPS_PER_FANG, period_blocks: 100, expires_at: 10_000 });
         c.submit(unsigned_as(&gh, &acct, &owner, 2, 0, add)).unwrap();
         c.produce_block().unwrap();
         for n in 3..65 {
@@ -4938,7 +4996,8 @@ mod hunts {
         let kid = key_id(&agent.public_key());
         assert!(t.tx(&alice, Action::RegisterFamiliar { key_id: kid.clone(), label: "claude".into() }).unwrap_err().to_string().contains("isn't on this account"));
         let h = t.c.height();
-        t.tx(&alice, Action::AddKey { key_id: kid.clone(), label: "claude".into(), role: KeyRole::Session { limit: DROPS_PER_FANG, period_blocks: 10, expires_at: h + 100 } }).unwrap();
+        let add = crate::types::add_key(&agent, &t.c.genesis.chain_id, &t.c.genesis_hash, &alice.address(), "claude", KeyRole::Session { limit: DROPS_PER_FANG, period_blocks: 10, expires_at: h + 100 });
+        t.tx(&alice, add).unwrap();
         t.tx(&alice, Action::RegisterFamiliar { key_id: kid.clone(), label: "claude".into() }).unwrap();
         // Awards can credit the Familiar; a non-Familiar key can't be named.
         t.tx(&bob, create("jackdishman/blockula", 5, 10 * DROPS_PER_FANG, t.c.height() + 100, "PQ handshake")).unwrap();
@@ -5031,7 +5090,8 @@ mod v1 {
         c.produce_block().unwrap();
         let limit = DROPS_PER_FANG;
         let role = KeyRole::Session { limit, period_blocks: 100, expires_at: c.height() + 1_000 };
-        c.submit(tx(&c, &owner, &acct, 0, 0, c.height() + 10, Action::AddKey { key_id: key_id(&agent.public_key()), label: "claude".into(), role })).unwrap();
+        let add = crate::types::add_key(&agent, &c.genesis.chain_id, &c.genesis_hash, &acct, "claude", role);
+        c.submit(tx(&c, &owner, &acct, 0, 0, c.height() + 10, add)).unwrap();
         c.produce_block().unwrap();
         // An amount that fits with the base fee (and the fee for opening `friend`'s account)
         // alone, but not with a tip on top.
@@ -5415,7 +5475,7 @@ mod scaffold {
             let summary = st.describe(&tx, Some(1));
             assert!(summary.starts_with(&short(&owner.address())) && summary.len() > 30, "{:?}: “{summary}”", tx.action);
         }
-        let vote = |conviction| Tx { chain_id: "c".into(), genesis_hash: String::new(), from: owner.address(), nonce: 0, fee: 0, tip: 0, valid_until: 0, action: Action::Vote { proposal_id: 3, aye: false, amount: 2 * FANG, conviction }, memo: String::new(), public_key: String::new(), signature: String::new() };
+        let vote = |conviction| Tx { chain_id: "c".into(), genesis_hash: String::new(), from: owner.address(), nonce: 0, fee: 0, tip: 0, valid_until: 0, action: Action::Vote { proposal_id: 3, aye: false, amount: 2 * FANG, conviction, proposal_digest: "00".repeat(32) }, memo: String::new(), public_key: String::new(), signature: String::new() };
         assert!(st.describe(&vote(0), None).ends_with("voted nay on proposal #3 with 2 FANG at 0.1× conviction"));
         let spend = Tx { action: Action::Propose { kind: ProposalKind::TreasurySpend { to: keys(22).address(), amount: FANG }, deposit: 50 * FANG, title: "Grants".into(), url: String::new() }, ..vote(1) };
         assert!(st.describe(&spend, None).ends_with(&format!("proposed “Grants”: pay 1 FANG from the treasury to {}, bonding 50 FANG", short(&owner.address()))));

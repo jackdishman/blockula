@@ -43,6 +43,7 @@ test("makes a recovery kit during onboarding: print, download, confirm, activate
   await createWallet(page, {
     kit: async (p) => {
       await p.getByRole("button", { name: "Make my recovery kit" }).click();
+      await expect(p.getByTestId("kit-words")).toBeVisible();
       const words = (await p.getByTestId("kit-words").locator(".kit-w").allTextContents()).map((w) => w.trim());
       const keyId = ((await p.getByTestId("kit-key-id").textContent()) ?? "").trim();
       // The 24 words are the kit key's seed.
@@ -73,7 +74,9 @@ test("makes a recovery kit during onboarding: print, download, confirm, activate
 
       const hint = await storedHint(p);
       const add = node.submitted.at(-1);
-      expect(add?.action).toEqual({ type: "add_key", key_id: keyId, label: KIT_LABEL, role: { type: "owner" } });
+      expect(add?.action).toMatchObject({ type: "add_key", key_id: keyId, label: KIT_LABEL, role: { type: "owner" } });
+      // The kit key's consent to this account rode along (the mock node checks it, as nodes do).
+      expect(add?.action.type === "add_key" && keyIdOf(hexToBytes(add.action.public_key))).toBe(keyId);
       expect(add?.from).toBe(hint?.account);
       expect(hint?.pendingKit).toBeUndefined();
       await p.getByRole("button", { name: "Next: claim a name" }).click();

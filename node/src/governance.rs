@@ -442,7 +442,7 @@ pub fn owner_keys(state: &State, account: &str) -> BTreeSet<String> {
 pub(crate) fn apply(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, signer: &str, key: &KeyRecord, height: u64) -> Result<()> {
     match &tx.action {
         Action::Propose { kind, deposit, title, url } => propose(state, j, sender, key, kind, *deposit, title, url, height),
-        Action::Vote { proposal_id, aye, amount, conviction } => vote(state, j, sender, signer, key, *proposal_id, *aye, *amount, *conviction, height),
+        Action::Vote { proposal_id, aye, amount, conviction, proposal_digest } => vote(state, j, sender, signer, key, *proposal_id, *aye, *amount, *conviction, proposal_digest, height),
         Action::Unlock {} => {
             owner_only(key, "unlock votes")?;
             if crate::econ::release_expired(state, j, sender, height) == 0 {
@@ -452,7 +452,7 @@ pub(crate) fn apply(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, s
         }
         Action::MultisigCreate { owners, threshold } => multisig_create(state, j, sender, key, owners, *threshold, height),
         Action::MultisigPropose { action } => multisig_propose(state, j, tx, sender, signer, key, action, height),
-        Action::MultisigApprove { id } => multisig_approve(state, j, tx, sender, signer, key, *id, height),
+        Action::MultisigApprove { id, action_digest } => multisig_approve(state, j, tx, sender, signer, key, *id, action_digest, height),
         Action::ClaimDistribution { distribution_id, amount, proof } => claim_distribution(state, j, sender, *distribution_id, *amount, proof, height),
         _ => bail!("not a governance action"),
     }
@@ -577,11 +577,21 @@ fn propose(state: &mut State, j: &mut Journal, sender: &str, key: &KeyRecord, ki
 }
 
 #[allow(clippy::too_many_arguments)]
-fn vote(state: &mut State, j: &mut Journal, sender: &str, signer: &str, key: &KeyRecord, id: u64, aye: bool, amount: u64, conviction: u8, height: u64) -> Result<()> {
+/// `proposal_digest` of a stored proposal: what a vote on it binds.
+pub fn digest_of(p: &Proposal) -> String {
+    crate::types::proposal_digest(&p.kind, &p.title, &p.url)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn vote(state: &mut State, j: &mut Journal, sender: &str, signer: &str, key: &KeyRecord, id: u64, aye: bool, amount: u64, conviction: u8, digest: &str, height: u64) -> Result<()> {
     owner_only(key, "vote")?;
     let p = state.governance.proposals.get(&id).ok_or_else(|| anyhow!("no proposal #{id}"))?;
     if p.status != ProposalStatus::Voting || height > p.voting_end {
         bail!("voting on proposal #{id} closed at block {}", p.voting_end);
+    }
+    // The vote is for the content its signer was shown (audit gap-7-6).
+    if digest_of(p) != digest {
+        bail!("proposal #{id} isn't the proposal this vote was signed for (its kind, title or link differ): the node it was read from may be misreporting it");
     }
     let voting_end = p.voting_end;
     let cp = &state.chain_params;
@@ -1223,9 +1233,9 @@ pub fn runs_when_included(state: &State, tx: &Tx, height: u64) -> bool {
     let g = &state.governance;
     match &tx.action {
         Action::MultisigPropose { .. } => g.multisigs.get(&tx.from).is_some_and(|m| m.threshold <= 1 && owner_keys(state, &tx.from).contains(&signer)),
-        Action::MultisigApprove { id } => {
+        Action::MultisigApprove { id, action_digest } => {
             let (Some(m), Some(p)) = (g.multisigs.get(&tx.from), g.multisig_proposals.get(id)) else { return false };
-            p.account == tx.from && height <= p.expires_at && !p.approvals.contains(&signer) && owner_keys(state, &tx.from).contains(&signer) && approvals(state, p) + 1 >= m.threshold as usize
+            p.account == tx.from && height <= p.expires_at && crate::types::action_digest(&p.action) == *action_digest && !p.approvals.contains(&signer) && owner_keys(state, &tx.from).contains(&signer) && approvals(state, p) + 1 >= m.threshold as usize
         }
         _ => true,
     }
@@ -1260,7 +1270,7 @@ fn multisig_propose(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, s
 }
 
 #[allow(clippy::too_many_arguments)]
-fn multisig_approve(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, signer: &str, key: &KeyRecord, id: u64, height: u64) -> Result<()> {
+fn multisig_approve(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, signer: &str, key: &KeyRecord, id: u64, digest: &str, height: u64) -> Result<()> {
     owner_only(key, "approve multisig actions")?;
     let mut m = state.governance.multisigs.get(sender).cloned().ok_or_else(|| anyhow!("{} isn't a multisig account", short(sender)))?;
     let mut p = state.governance.multisig_proposals.get(&id).cloned().ok_or_else(|| anyhow!("no open multisig action #{id}"))?;
@@ -1269,6 +1279,10 @@ fn multisig_approve(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, s
     }
     if height > p.expires_at {
         bail!("multisig action #{id} expired at block {}", p.expires_at);
+    }
+    // The approval is for the action its signer was shown (audit gap-7-6).
+    if crate::types::action_digest(&p.action) != digest {
+        bail!("multisig action #{id} isn't the action this approval was signed for: the node it was read from may be misreporting it");
     }
     clear_expired(state, j, sender, height);
     m.pending.retain(|id| state.governance.multisig_proposals.contains_key(id));
@@ -1396,7 +1410,7 @@ pub fn check_invariants(state: &State) -> Result<()> {
 pub fn describe(state: &State, tx: &Tx, from: &str, primary_name: &dyn Fn(&str) -> Option<String>) -> String {
     match &tx.action {
         Action::Propose { kind, deposit, title, .. } => format!("{from} proposed “{title}”: {}, bonding {}", describe_kind(state, kind, primary_name), fmt_fang(*deposit)),
-        Action::Vote { proposal_id, aye, amount, conviction } => {
+        Action::Vote { proposal_id, aye, amount, conviction, .. } => {
             let side = if *aye { "aye" } else { "nay" };
             let x = match conviction {
                 0 => "0.1".to_string(),
@@ -1410,7 +1424,7 @@ pub fn describe(state: &State, tx: &Tx, from: &str, primary_name: &dyn Fn(&str) 
             let inner = Tx { action: (**action).clone(), ..tx.clone() };
             format!("{from} proposed a multisig action: {}", state.describe_with(&inner, None, primary_name))
         }
-        Action::MultisigApprove { id } => format!("{from} approved multisig action #{id}"),
+        Action::MultisigApprove { id, .. } => format!("{from} approved multisig action #{id}"),
         Action::ClaimDistribution { distribution_id, amount, .. } => format!("{from} claimed {} from community distribution #{distribution_id}", fmt_fang(*amount)),
         _ => String::new(),
     }

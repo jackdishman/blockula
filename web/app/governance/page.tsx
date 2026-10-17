@@ -191,7 +191,10 @@ function VoteForm({ p, lockPeriod, run }: { p: ProposalSummary; lockPeriod?: num
   const submit = async () => {
     if (aye === null || drops === null) return;
     setBusy(true);
-    await run(() => wallet.vote(p.id, aye, drops as bigint, conviction));
+    // The vote binds the proposal shown here (its kind, title and link): a node that showed
+    // another proposal's content makes it fail instead of landing elsewhere (audit gap-7-6).
+    const kind = p.kind;
+    await run(() => (kind ? wallet.vote(p.id, aye, drops as bigint, conviction, { proposal: { kind, title: p.title, url: p.url } }) : Promise.reject(new Error("This wallet can't show what this proposal does, so it won't sign a vote on it."))));
     setBusy(false);
   };
   return (

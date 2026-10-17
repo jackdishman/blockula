@@ -1,6 +1,6 @@
 // Recovery kits (WAL-2): an offline ML-DSA-65 key, added to the account as an owner, written
 // down as 24 words. The seed is made in the browser, shown once, and never stored or sent.
-import { Wallet } from "@blockula/sdk";
+import { Wallet, encodeKeyGrant, type Client } from "@blockula/sdk";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { WORDLIST } from "./bip39-english";
 
@@ -101,15 +101,22 @@ export function confirmPositions(): [number, number] {
   return a < b ? [a, b] : [b, a];
 }
 
-/** A fresh kit key, made in this browser. Only its words leave this function; the seed is wiped. */
-export function generateKit() {
+/**
+ * A fresh kit key for `account`, made in this browser. Only its words and its grant (the kit key's
+ * public consent to joining `account` on `client`'s chain, which adding it needs: audit gap-7-2)
+ * leave this function; the seed is wiped.
+ */
+export async function generateKit(account: string, client: Client) {
   const seed = crypto.getRandomValues(new Uint8Array(32));
   const words = seedToWords(seed);
-  const wallet = Wallet.fromSeed(seed);
-  const keyId = wallet.keyId;
-  wipeWallet(wallet);
-  seed.fill(0);
-  return { words, keyId };
+  const wallet = Wallet.fromSeed(seed, client);
+  try {
+    const grant = encodeKeyGrant(await wallet.keyGrant(account));
+    return { words, keyId: wallet.keyId, grant };
+  } finally {
+    wipeWallet(wallet);
+    seed.fill(0);
+  }
 }
 
 /**
@@ -126,6 +133,8 @@ export function wipeWallet(w: Wallet) {
 export interface Kit {
   words: string[];
   keyId: string;
+  /** The kit key's grant code for `account` (public; not printed). */
+  grant?: string;
   account: string;
   name?: string;
   network: string;

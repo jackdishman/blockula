@@ -1017,16 +1017,18 @@ impl State {
                 self.poc.jurors.remove(sender);
                 self.j_credit(j, sender, r.bond);
             }
-            Action::CommitVotes { seance_id, commitment } => {
+            Action::CommitVotes { seance_id, commitment, pairs_digest } => {
                 let s = self.poc.seances.get(seance_id).ok_or_else(|| anyhow!("no Séance #{seance_id}"))?;
                 if s.closed {
                     bail!("Séance #{seance_id} is closed");
                 }
-                if !s.jurors.contains_key(sender) {
-                    bail!("you're not on the jury of Séance #{seance_id}");
-                }
+                let Some(seat) = s.jurors.get(sender) else { bail!("you're not on the jury of Séance #{seance_id}") };
                 if height > s.commit_until {
                     bail!("sealed votes for Séance #{seance_id} closed at block {}; reveal now", s.commit_until);
+                }
+                // The judgment is for the pairs (and PRs) its juror compared (audit gap-7-6).
+                if seat_pairs_digest(self, *seance_id, sender, &seat.pairs) != *pairs_digest {
+                    bail!("the pairs this judgment was made on aren't your seat's in Séance #{seance_id} (claims or PRs differ): the node they were read from may be misreporting them");
                 }
                 let seat = self.seance_mut(j, *seance_id).unwrap().jurors.get_mut(sender).unwrap();
                 seat.commitment = Some(commitment.clone());
@@ -1657,6 +1659,14 @@ impl State {
     }
 }
 
+/// `types::seance_pairs_digest` of a juror's seat: each assigned pair's claims with their repos
+/// and PR numbers, as `CommitVotes` must bind them.
+pub fn seat_pairs_digest(state: &State, seance_id: u64, juror: &str, pairs: &[[u64; 2]]) -> String {
+    let claim = |id: u64| state.poc.claims.get(&id).map(|c| (id, c.repo.as_str(), c.pr)).unwrap_or((id, "", 0));
+    let pairs: Vec<[(u64, &str, u64); 2]> = pairs.iter().map(|[a, b]| [claim(*a), claim(*b)]).collect();
+    crate::types::seance_pairs_digest(seance_id, juror, &pairs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1945,7 +1955,8 @@ mod scenarios {
         t.grant(&bob, 1);
         let h = t.h();
         for key in [&agent, &stranger] {
-            t.tx(&bob, Action::AddKey { key_id: key_id(&key.public_key()), label: "agent".into(), role: KeyRole::Session { limit: 5 * DROPS_PER_FANG, period_blocks: 1000, expires_at: h + 1000 } }).unwrap();
+            let add = crate::types::add_key(key, &t.c.genesis.chain_id, &t.c.genesis_hash, &bob.address(), "agent", KeyRole::Session { limit: 5 * DROPS_PER_FANG, period_blocks: 1000, expires_at: h + 1000 });
+            t.tx(&bob, add).unwrap();
         }
         t.tx(&bob, Action::RegisterFamiliar { key_id: key_id(&agent.public_key()), label: "claude".into() }).unwrap();
         let bob_addr = bob.address();
@@ -2018,14 +2029,31 @@ mod scenarios {
             let salt = format!("salt-{i}");
             let commitment = seance_commitment(sid, &jk.address(), &votes, &spam, &salt);
             assert!(t.tx(jk, Action::RevealVotes { seance_id: sid, votes: votes.clone(), spam: spam.clone(), salt: salt.clone() }).unwrap_err().to_string().contains("open after"));
-            t.tx(jk, Action::CommitVotes { seance_id: sid, commitment }).unwrap();
+            let pairs_digest = seat_pairs_digest(&t.c.state, sid, &jk.address(), &seat.pairs);
+            if i == 0 {
+                // gap-7-6: a node that showed the juror the pairs flipped (so 'a' would credit the
+                // other claim), or a claim with another PR, gets the commitment refused.
+                let flipped: Vec<[u64; 2]> = seat.pairs.iter().map(|[a, b]| [*b, *a]).collect();
+                let shown = seat_pairs_digest(&t.c.state, sid, &jk.address(), &flipped);
+                assert!(t.tx(jk, Action::CommitVotes { seance_id: sid, commitment: commitment.clone(), pairs_digest: shown }).unwrap_err().to_string().contains("aren't your seat's"));
+                let [x, y] = seat.pairs[0];
+                let other_pr = |id: u64| { let c = &t.c.state.poc.claims[&id]; (id, c.repo.clone(), c.pr + 1) };
+                let (cx, cy) = (other_pr(x), (y, t.c.state.poc.claims[&y].repo.clone(), t.c.state.poc.claims[&y].pr));
+                let mut refs: Vec<[(u64, &str, u64); 2]> = vec![[(cx.0, cx.1.as_str(), cx.2), (cy.0, cy.1.as_str(), cy.2)]];
+                let rest: Vec<[(u64, String, u64); 2]> = seat.pairs[1..].iter().map(|[a, b]| [a, b].map(|id| (*id, t.c.state.poc.claims[id].repo.clone(), t.c.state.poc.claims[id].pr))).collect();
+                refs.extend(rest.iter().map(|[a, b]| [(a.0, a.1.as_str(), a.2), (b.0, b.1.as_str(), b.2)]));
+                let swapped_pr = crate::types::seance_pairs_digest(sid, &jk.address(), &refs);
+                assert!(t.tx(jk, Action::CommitVotes { seance_id: sid, commitment: commitment.clone(), pairs_digest: swapped_pr }).unwrap_err().to_string().contains("aren't your seat's"));
+            }
+            t.tx(jk, Action::CommitVotes { seance_id: sid, commitment, pairs_digest }).unwrap();
             sealed.push((i, votes, spam, salt));
         }
-        assert!(t.tx(&solid, Action::CommitVotes { seance_id: sid, commitment: "00".repeat(32) }).unwrap_err().to_string().contains("not on the jury"));
+        assert!(t.tx(&solid, Action::CommitVotes { seance_id: sid, commitment: "00".repeat(32), pairs_digest: "00".repeat(32) }).unwrap_err().to_string().contains("not on the jury"));
         while t.h() <= s.commit_until {
             t.blocks(1);
         }
-        assert!(t.tx(&jurors[2], Action::CommitVotes { seance_id: sid, commitment: "00".repeat(32) }).unwrap_err().to_string().contains("closed at block"));
+        let late = seat_pairs_digest(&t.c.state, sid, &jurors[2].address(), &s.jurors[&jurors[2].address()].pairs);
+        assert!(t.tx(&jurors[2], Action::CommitVotes { seance_id: sid, commitment: "00".repeat(32), pairs_digest: late }).unwrap_err().to_string().contains("closed at block"));
         for (i, votes, spam, salt) in &sealed {
             let jk = &jurors[*i];
             assert!(t.tx(jk, Action::RevealVotes { seance_id: sid, votes: votes.clone(), spam: spam.clone(), salt: "wrong".into() }).unwrap_err().to_string().contains("doesn't match"));
@@ -2139,7 +2167,8 @@ mod scenarios {
         let mut sealed = vec![];
         for jk in [&j1, &j2] {
             let votes: String = s.jurors[&jk.address()].pairs.iter().map(|_| 'a').collect();
-            t.tx(jk, Action::CommitVotes { seance_id: sid, commitment: seance_commitment(sid, &jk.address(), &votes, &[], "x") }).unwrap();
+            let pairs_digest = seat_pairs_digest(&t.c.state, sid, &jk.address(), &s.jurors[&jk.address()].pairs);
+            t.tx(jk, Action::CommitVotes { seance_id: sid, commitment: seance_commitment(sid, &jk.address(), &votes, &[], "x"), pairs_digest }).unwrap();
             sealed.push((jk.clone_keys(), votes));
         }
         while t.h() <= s.commit_until {

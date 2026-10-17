@@ -1,8 +1,8 @@
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex, hexToBytes, randomBytes, utf8ToBytes } from "@noble/hashes/utils.js";
-import { bech32m } from "@scure/base";
-import { DEFAULT_TIP_CAP_MULTIPLE, baseFee, maxTip, parseFang, parseSoul, seanceCommitment, signingBytes, type Action, type BaseFee, type KeyRole, type ProposalKind, type Tx, type UnsignedTx } from "./tx.js";
+import { base64urlnopad, bech32m } from "@scure/base";
+import { DEFAULT_TIP_CAP_MULTIPLE, KEY_POP_CONTEXT, PUBLIC_KEY_LEN, SIGNATURE_LEN, actionDigest, baseFee, formatFang, keyPopMessage, maxTip, parseFang, parseSoul, proposalDigest, seanceCommitment, seancePairsDigest, signingBytes, type SeanceClaimRef, type Action, type BaseFee, type KeyRole, type ProposalKind, type Tx, type UnsignedTx } from "./tx.js";
 import { NAMESPACES, checkProofResponse, decodeAccount, decodeName, type ProofResponse, type ProvenRecord } from "./proof.js";
 
 export * from "./tx.js";
@@ -74,6 +74,12 @@ export function bareName(name: string): string {
   if (n.startsWith("-") || n.endsWith("-")) throw new Error("names can't start or end with '-'");
   return n;
 }
+
+/**
+ * The most `Wallet.propose` bonds by default without being told (audit gap-7-5): mainnet's genesis
+ * `proposal_deposit` (node/src/params.rs). A node reporting more is refused; pass `deposit`.
+ */
+export const DEFAULT_MAX_PROPOSAL_DEPOSIT = 1_000n * 1_000_000_000n;
 
 /** Highest vote conviction (node/src/params.rs `MAX_CONVICTION`). */
 export const MAX_CONVICTION = 6;
@@ -352,6 +358,63 @@ export interface TxOptions {
 }
 
 /**
+ * A key's consent to being added to one account (audit gap-7-2): its public key and its
+ * signature over `keyPopMessage(chain_id, genesis_hash, account, key_id)` (context
+ * `KEY_POP_CONTEXT`). The key's holder makes it (`Wallet.keyGrant`) and hands it to the account's
+ * owner (`encodeKeyGrant`: a grant code to paste), who adds the key with it (`addOwnerKey`,
+ * `addSessionKey`). Nobody can put a key on an account without it, so `/api/key` lists only
+ * accounts the key agreed to.
+ */
+export interface KeyGrant {
+  /** The account the key agrees to join. */
+  account: string;
+  key_id: string;
+  /** Hex ML-DSA-65 public key. */
+  public_key: string;
+  /** Hex proof of possession. */
+  pop: string;
+}
+
+const GRANT_PREFIX = "bkgrant1";
+
+/** A grant as one pasteable string: `bkgrant1.<account>.<base64url(public key ‖ pop)>`. */
+export function encodeKeyGrant(g: KeyGrant): string {
+  const body = new Uint8Array(PUBLIC_KEY_LEN + SIGNATURE_LEN);
+  body.set(hexToBytes(g.public_key));
+  body.set(hexToBytes(g.pop), PUBLIC_KEY_LEN);
+  return `${GRANT_PREFIX}.${g.account}.${base64urlnopad.encode(body)}`;
+}
+
+/** Parses a grant code (`encodeKeyGrant`). Whitespace is ignored, so a wrapped paste works. */
+export function decodeKeyGrant(code: string): KeyGrant {
+  const c = code.replace(/\s+/g, "");
+  if (/^[0-9a-f]{64}$/i.test(c)) throw new Error("that's a key id: adding a key needs its grant code now, which the key's holder makes for your account (Wallet.keyGrant, the MCP's use_account, or a new device's link screen)");
+  const [prefix, account, body, ...rest] = c.split(".");
+  if (prefix !== GRANT_PREFIX || !account || !body || rest.length) throw new Error("that isn't a key grant code (it starts with bkgrant1.)");
+  if (!isAddress(account)) throw new Error("the grant code's account isn't an address");
+  let bytes: Uint8Array;
+  try {
+    bytes = base64urlnopad.decode(body);
+  } catch {
+    throw new Error("the grant code is damaged (copy all of it)");
+  }
+  if (bytes.length !== PUBLIC_KEY_LEN + SIGNATURE_LEN) throw new Error("the grant code is damaged or cut short (copy all of it)");
+  const pk = bytes.slice(0, PUBLIC_KEY_LEN);
+  return { account, key_id: keyId(pk), public_key: bytesToHex(pk), pop: bytesToHex(bytes.slice(PUBLIC_KEY_LEN)) };
+}
+
+/** Whether `g` is a valid consent by its key to join `g.account` on the chain `(chainId, genesisHash)`. */
+export function verifyKeyGrant(g: KeyGrant, chainId: string, genesisHash: string): boolean {
+  try {
+    const pk = hexToBytes(g.public_key);
+    if (pk.length !== PUBLIC_KEY_LEN || keyId(pk) !== g.key_id) return false;
+    return ml_dsa65.verify(hexToBytes(g.pop), keyPopMessage(chainId, genesisHash, g.account, g.key_id), pk, { context: KEY_POP_CONTEXT });
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Wallet = one ML-DSA-65 key (from a 32-byte seed, FIPS 204 ξ) acting for one account.
  * By default the account is the key's own address. Call `actAs(account)` to use a key that
  * was added to another account (a second device, or an agent session key).
@@ -425,16 +488,52 @@ export class Wallet {
   }
 
   /**
+   * This key's consent to being added to `account` (an address, or a name resolved by the
+   * client: proven when it has witnesses) on the client's chain: hand `encodeKeyGrant(grant)` to
+   * the account's owner, who adds the key with it. Pass `chain` to sign offline.
+   */
+  async keyGrant(account: string, chain?: { chainId: string; genesisHash: string }): Promise<KeyGrant> {
+    const address = isAddress(account) ? account : await this.client.resolve(account);
+    let c = chain;
+    if (!c) {
+      const status = await this.client.status();
+      if (typeof status.genesis_hash !== "string") throw new Error(`${this.client.rpc} doesn't report a genesis_hash; it's too old for this SDK`);
+      c = { chainId: status.chain_id, genesisHash: status.genesis_hash };
+    }
+    const pop = ml_dsa65.sign(keyPopMessage(c.chainId, c.genesisHash, address, this.keyId), this.secretKey, { context: KEY_POP_CONTEXT });
+    return { account: address, key_id: this.keyId, public_key: bytesToHex(this.publicKey), pop: bytesToHex(pop) };
+  }
+
+  /**
+   * The `add_key` action for a grant (an object or its code): it must be for this account and
+   * verify on the client's chain, so a wrong or damaged code fails here, before anything is signed.
+   */
+  private async grantAction(grant: KeyGrant | string, label: string, role: KeyRole): Promise<Action> {
+    const g = typeof grant === "string" ? decodeKeyGrant(grant) : grant;
+    if (g.account !== this.account) throw new Error(`that grant is for ${g.account}, not this account (${this.account}): the key's holder must make it for ${this.account}`);
+    const status = await this.client.status();
+    if (!verifyKeyGrant(g, status.chain_id, status.genesis_hash)) throw new Error("that grant doesn't verify: it's damaged, or it was made for another chain");
+    return { type: "add_key", key_id: g.key_id, label, role, public_key: g.public_key, pop: g.pop };
+  }
+
+  /**
    * Builds and signs a tx: `fee` = the highest base fee already fixed for the next blocks
    * (`/api/fees` `suggested`) + `tip`, `valid_until` = the current height + `validForBlocks`, and
    * the chain's id and genesis hash from `/api/status`. Only the base fee of the block that
    * includes it (+ the tip) is charged. A tip above `tip_cap_multiple` × the lowest upcoming base
    * fee (`/api/fees` `lowest`, see `maxTip`) is refused here, as nodes would refuse it. To sign
    * offline, build an `UnsignedTx` yourself (with the chain's `genesis_hash`) and `sign` it.
+   *
+   * `action` may be a function of the height `valid_until` is counted from, for actions that
+   * carry an absolute block height of their own (a session key's or a hunt's expiry): computed
+   * from the same status read, a node that lies about the height can stretch them by at most
+   * `max_tx_validity_blocks`, since validators refuse a `valid_until` further ahead than that
+   * (audit gap-7-3).
    */
-  async build(action: Action, memo = "", opts: TxOptions = {}): Promise<Tx> {
+  async build(action: Action | ((height: number) => Action), memo = "", opts: TxOptions = {}): Promise<Tx> {
     await this.client.addressPrefix(); // so `this.account` uses the chain's prefix
     const [status, account, fees] = await Promise.all([this.client.status(), this.client.account(this.account).catch(() => null), this.client.fees()]);
+    if (!Number.isSafeInteger(status.height) || status.height < 0) throw new Error(`${this.client.rpc} doesn't report its height`);
     const max: number = status.max_tx_validity_blocks ?? Number.MAX_SAFE_INTEGER;
     const validFor = opts.validForBlocks ?? Math.min(this.validForBlocks, max);
     if (!Number.isSafeInteger(validFor) || validFor < 1) throw new Error("validForBlocks must be a positive whole number of blocks");
@@ -442,7 +541,8 @@ export class Wallet {
     const tip = opts.tip === undefined ? this.tip : parseFang(opts.tip);
     if (typeof status.genesis_hash !== "string") throw new Error(`${this.client.rpc} doesn't report a genesis_hash; it's too old for this SDK`);
     // Binds the tx to this chain instance (not just its id), so it can't replay on a relaunch.
-    const unsigned: UnsignedTx = { chain_id: status.chain_id, genesis_hash: status.genesis_hash, from: this.account, nonce: account?.next_nonce ?? 0, fee: "0", tip: tip.toString(), valid_until: status.height + validFor, action, memo };
+    const act = typeof action === "function" ? action(status.height) : action;
+    const unsigned: UnsignedTx = { chain_id: status.chain_id, genesis_hash: status.genesis_hash, from: this.account, nonce: account?.next_nonce ?? 0, fee: "0", tip: tip.toString(), valid_until: status.height + validFor, action: act, memo };
     unsigned.fee = (baseFee(unsigned, fees.suggested) + tip).toString();
     if (tip > 0n) {
       // The cap is a multiple of the base fee of the block that includes the tx: price it at the lowest upcoming one.
@@ -467,21 +567,26 @@ export class Wallet {
     return this.client.submit(tx, opts.wait ?? true);
   }
 
-  /** Authorize another device's key (e.g. a second passkey) with full control. */
-  async addOwnerKey(keyIdHex: string, label: string) {
-    return this.client.submit(await this.build({ type: "add_key", key_id: keyIdHex, label, role: { type: "owner" } }));
+  /**
+   * Authorize another device's key (e.g. a second passkey) with full control. `grant` is the
+   * key's consent to this account (`keyGrant` on that device, or its grant code).
+   */
+  async addOwnerKey(grant: KeyGrant | string, label: string) {
+    return this.client.submit(await this.build(await this.grantAction(grant, label, { type: "owner" })));
   }
 
   /**
-   * Let an agent/app key spend from this account, transfers only, within a limit.
-   * Example: `addSessionKey(agentKeyId, "claude", { limit: "10", periodBlocks: 86_400, expiresInBlocks: 30 * 86_400 })`.
+   * Let an agent/app key spend from this account, transfers only, within a limit. `grant` is the
+   * key's consent to this account (the agent's grant code).
+   * Example: `addSessionKey(grantCode, "claude", { limit: "10", periodBlocks: 86_400, expiresInBlocks: 30 * 86_400 })`.
    */
-  async addSessionKey(keyIdHex: string, label: string, opts: { limit: string | number | bigint; periodBlocks: number; expiresInBlocks: number }) {
+  async addSessionKey(grant: KeyGrant | string, label: string, opts: { limit: string | number | bigint; periodBlocks: number; expiresInBlocks: number }) {
     if (!Number.isSafeInteger(opts.periodBlocks) || opts.periodBlocks < 1) throw new Error("periodBlocks must be a positive whole number of blocks");
     if (!Number.isSafeInteger(opts.expiresInBlocks) || opts.expiresInBlocks < 1) throw new Error("expiresInBlocks must be a positive whole number of blocks");
-    const { height } = await this.client.status();
-    const role: KeyRole = { type: "session", limit: parseFang(opts.limit).toString(), period_blocks: opts.periodBlocks, expires_at: height + opts.expiresInBlocks };
-    return this.client.submit(await this.build({ type: "add_key", key_id: keyIdHex, label, role }));
+    const limit = parseFang(opts.limit).toString();
+    const base = await this.grantAction(grant, label, { type: "owner" });
+    // The expiry counts from the height valid_until does (one status read): see `build`.
+    return this.client.submit(await this.build((height) => ({ ...base, role: { type: "session", limit, period_blocks: opts.periodBlocks, expires_at: height + opts.expiresInBlocks } satisfies KeyRole }) as Action));
   }
 
   async removeKey(keyIdHex: string) {
@@ -519,8 +624,10 @@ export class Wallet {
 
   /** Put a bounty on a GitHub issue. `expiresInBlocks` from now (max ~1 year). */
   async createHunt(opts: { repo: string; issue: number; amount: string | number | bigint; title: string; expiresInBlocks: number }) {
-    const { height } = await this.client.status();
-    return this.client.submit(await this.build({ type: "create_hunt", repo: opts.repo, issue: opts.issue, amount: parseFang(opts.amount).toString(), expires_at: height + opts.expiresInBlocks, title: opts.title }));
+    if (!Number.isSafeInteger(opts.expiresInBlocks) || opts.expiresInBlocks < 1) throw new Error("expiresInBlocks must be a positive whole number of blocks");
+    const amount = parseFang(opts.amount).toString();
+    // The expiry counts from the height valid_until does (one status read): see `build`.
+    return this.client.submit(await this.build((height) => ({ type: "create_hunt", repo: opts.repo, issue: opts.issue, amount, expires_at: height + opts.expiresInBlocks, title: opts.title })));
   }
 
   async fundHunt(huntId: number, amount: string | number | bigint) {
@@ -571,11 +678,18 @@ export class Wallet {
   /**
    * Seal a Séance judgment: one of "a", "b" or "=" per assigned pair (see `client.seance(id)`),
    * plus claim ids you think are spam. Keep the returned `salt`: `revealVotes` needs it.
+   *
+   * The judgment binds the pairs it was made on (audit gap-7-6): pass `pairs`, the claims (id,
+   * repo, PR) you showed the juror in order, or they're read from the client (`seancePairs`). A
+   * node that showed other pairs or PRs makes the commitment fail instead of misdirecting it.
    */
-  async sealVotes(seanceId: number, votes: string, spam: number[] = [], salt: string = bytesToHex(randomBytes(16))) {
+  async sealVotes(seanceId: number, votes: string, spam: number[] = [], salt: string = bytesToHex(randomBytes(16)), opts: { pairs?: [SeanceClaimRef, SeanceClaimRef][] } = {}) {
     await this.client.addressPrefix(); // the commitment names this account
+    const pairs = opts.pairs ?? (await this.client.seancePairs(seanceId, this.account));
+    if (votes.length !== pairs.length) throw new Error(`you have ${pairs.length} assigned pairs: give one of a, b or = for each`);
     const commitment = seanceCommitment(seanceId, this.account, votes, spam, salt);
-    const tx = await this.client.submit(await this.build({ type: "commit_votes", seance_id: seanceId, commitment }));
+    const pairs_digest = seancePairsDigest(seanceId, this.account, pairs);
+    const tx = await this.client.submit(await this.build({ type: "commit_votes", seance_id: seanceId, commitment, pairs_digest }));
     return { tx, salt, votes, spam };
   }
 
@@ -692,8 +806,13 @@ export class Wallet {
    * Put a proposal to a vote (build `kind` with `proposal.*`). Bonds `deposit` (default: the
    * chain's `proposal_deposit`), refunded once the proposal reaches quorum and burned if it
    * doesn't. Names in the kind (`to`, `account`) are resolved and the addresses are signed.
+   *
+   * The default deposit is what the node reports, and a node can report anything, so it's
+   * bounded (audit gap-7-5): every witness of the client must report the same value, and it may
+   * be at most `maxDeposit` (default `DEFAULT_MAX_PROPOSAL_DEPOSIT`, mainnet's 1,000 FANG).
+   * Pass `deposit` to bond an amount you checked yourself.
    */
-  async propose(kind: ProposalKind, opts: { title: string; url?: string; deposit?: Amount } & TxOptions) {
+  async propose(kind: ProposalKind, opts: { title: string; url?: string; deposit?: Amount; maxDeposit?: Amount } & TxOptions) {
     const title = opts.title.trim();
     if (!title || new TextEncoder().encode(title).length > 96 || /\p{Cc}/u.test(title)) throw new Error("title must be 1–96 bytes with no control characters");
     const url = opts.url ?? "";
@@ -701,9 +820,13 @@ export class Wallet {
     let deposit: bigint;
     if (opts.deposit !== undefined) deposit = parseFang(opts.deposit);
     else {
-      const d = paramsOf(await this.client.params()).proposal_deposit;
+      const reported = await Promise.all([this.client, ...this.client.witnesses].map(async (c) => paramsOf(await c.params()).proposal_deposit));
+      const d = reported[0];
       if (d === undefined) throw new Error("this node doesn't report proposal_deposit; pass deposit");
+      if (reported.some((x) => x !== d)) throw new Error(`the node and its witnesses disagree about proposal_deposit (${reported.map((x) => (x === undefined ? "none" : formatFang(x))).join(", ")}); pass deposit`);
       deposit = BigInt(d);
+      const max = opts.maxDeposit !== undefined ? parseFang(opts.maxDeposit) : DEFAULT_MAX_PROPOSAL_DEPOSIT;
+      if (deposit > max) throw new Error(`${this.client.rpc} reports a proposal_deposit of ${formatFang(deposit)}, more than maxDeposit (${formatFang(max)}): a node can report any deposit, and all of it is burned if the vote misses quorum. Check it on another node, then pass deposit (or a higher maxDeposit)`);
     }
     return this.act({ type: "propose", kind: await this.resolveKind(kind), deposit: positive(deposit, "deposit").toString(), title, url }, opts);
   }
@@ -714,10 +837,18 @@ export class Wallet {
    * periods after the vote ends, for 0.1×, 1×, 2× … 6× the weight (see `convictionWeight`).
    * Voting again replaces your vote. A validator's consensus key or owner voting before the
    * bootstrap council ends also casts that validator's council vote.
+   *
+   * The vote binds the proposal's content (audit gap-7-6): pass `proposal`, the kind, title and
+   * link you showed the voter (e.g. the `client.proposal(id)` object you rendered), or it's read
+   * from the client. A node that showed another proposal's content makes the vote fail.
    */
-  async vote(proposalId: number, aye: boolean, amount: Amount, conviction = 1, opts: TxOptions = {}) {
+  async vote(proposalId: number, aye: boolean, amount: Amount, conviction = 1, opts: TxOptions & { proposal?: { kind: ProposalKind; title: string; url?: string } } = {}) {
     if (!Number.isInteger(conviction) || conviction < 0 || conviction > MAX_CONVICTION) throw new Error(`conviction must be 0–${MAX_CONVICTION}`);
-    return this.act({ type: "vote", proposal_id: wholeNumber(proposalId, "proposalId"), aye, amount: positive(parseFang(amount), "vote").toString(), conviction }, opts);
+    const id = wholeNumber(proposalId, "proposalId");
+    const drops = positive(parseFang(amount), "vote").toString();
+    const p = opts.proposal ?? (await this.client.proposal(id));
+    const proposal_digest = proposalDigest(p.kind, p.title, p.url ?? "");
+    return this.act({ type: "vote", proposal_id: id, aye, amount: drops, conviction, proposal_digest }, opts);
   }
 
   /** Release every vote lock that has expired. */
@@ -744,8 +875,20 @@ export class Wallet {
     return this.act({ type: "multisig_propose", action }, opts);
   }
 
-  async multisigApprove(id: number, opts: TxOptions = {}) {
-    return this.act({ type: "multisig_approve", id: wholeNumber(id, "id") }, opts);
+  /**
+   * Approve open multisig proposal `id`. The approval binds the action (audit gap-7-6): pass
+   * `action`, the one you showed the approver (decode it, don't trust a summary), or it's read
+   * from `client.multisig(account)`. A node that showed another action makes the approval fail.
+   */
+  async multisigApprove(id: number, opts: TxOptions & { action?: Action } = {}) {
+    const n = wholeNumber(id, "id");
+    let action = opts.action;
+    if (!action) {
+      const m = await this.client.multisig(this.account);
+      action = (Array.isArray(m?.pending) ? m.pending : []).find((p: { id?: unknown }) => p.id === n)?.action as Action | undefined;
+      if (!action) throw new Error(`${this.account} has no open multisig action #${n}`);
+    }
+    return this.act({ type: "multisig_approve", id: n, action_digest: actionDigest(action) }, opts);
   }
 
   /** Extend a name you own by `years` (1–10), at the chain's renewal price per year. */
@@ -836,10 +979,26 @@ export class ApiError extends Error {
   }
 }
 
-/** A transaction that was rejected at execution (fee charged) or dropped from the mempool. */
+/**
+ * The node reports a transaction as failed. Two different things (audit review-fix-clients-2):
+ * - `dropped` false: it executed in block `tx.height` and failed there. Its fee was charged; it
+ *   can't execute again.
+ * - `dropped` true: this node dropped it from its mempool without running it (evicted by a
+ *   higher tip, replaced, not included, or an earlier tx from the account was dropped). Nothing
+ *   was charged, but other nodes may still hold it and include it until its `valid_until`
+ *   (`validUntil`, when known): check `client.tx(id)` before sending it again, or a retry can pay twice.
+ */
 export class TxFailedError extends Error {
-  constructor(readonly id: string, readonly reason: string, readonly tx: any) {
-    super(`tx ${id} failed: ${reason}`);
+  readonly dropped: boolean;
+  constructor(readonly id: string, readonly reason: string, readonly tx: any, readonly validUntil?: number) {
+    // Mempool failures are answered without the tx itself (node/src/api.rs `tx`): older nodes don't say `dropped`.
+    const dropped = tx?.dropped === true || (tx !== null && typeof tx === "object" && tx.action === undefined && tx.dropped !== false);
+    super(
+      dropped
+        ? `tx ${id} was dropped by this node without running (${reason}); nothing was charged, but another node may still include it${validUntil !== undefined ? ` until block ${validUntil}` : " until its valid_until"}, so check it (client.tx) before sending it again`
+        : `tx ${id} failed${typeof tx?.height === "number" ? ` in block ${tx.height}` : ""}: ${reason} (its fee was charged)`,
+    );
+    this.dropped = dropped;
     this.name = "TxFailedError";
   }
 }
@@ -888,12 +1047,50 @@ export interface ClientOptions {
   chainId?: string;
   /** The genesis hash (hex) the node must report. */
   genesisHash?: string;
-  /** How long one request may take before it fails with `RequestTimeoutError` (default 15 s). */
+  /** How long one request may take before it fails with `RequestTimeoutError` (default 15 s, at most `MAX_TIMEOUT_MS`). */
   timeoutMs?: number;
+  /**
+   * Clients for independent nodes of the same chain. With witnesses, every name this client
+   * resolves for a signature (`resolve`, so `Wallet.send`, `awardHunt`, `vouch`, `transferName`,
+   * `delegate`, proposal targets, `actAs` …) is a proven read (`provenName`): the record's Merkle
+   * proof must check out against a state root each witness reports for that block, and be fresh.
+   * Without them a name is one node's unproven answer (audit gap-7-1).
+   */
+  witnesses?: Client[];
+  /** Refuse to resolve a `.boo` name for a signature unless it's proven (needs `witnesses`). */
+  requireProvenNames?: boolean;
+}
+
+/** Where a recipient (a `.boo` name or an address) goes, and how sure that is (`Client.resolution`). */
+export interface Resolution {
+  /** What was asked for. */
+  input: string;
+  /** The address that gets signed. */
+  address: string;
+  /** The bare name, when `input` was one. */
+  name: string | null;
+  /** An address as given, or a name proven against the client's witnesses; `false`: one node's word. */
+  proven: boolean;
+  /** How it was resolved, in plain English (show it with the address before signing). */
+  how: string;
+  /** The block a proven name was read at. */
+  height?: number;
 }
 
 /** Default per-request timeout of a `Client`. */
 export const DEFAULT_TIMEOUT_MS = 15_000;
+
+/**
+ * The longest timeout a `Client` takes: 2^31 − 1 ms (about 24.8 days). Timers store their delay
+ * as a signed 32-bit number, and a longer one fires at once (audit review-fix-clients-1).
+ */
+export const MAX_TIMEOUT_MS = 2_147_483_647;
+
+/** `ms` as a timeout: a whole number of milliseconds from 1 to `MAX_TIMEOUT_MS`, or an error naming `what`. */
+export function checkTimeoutMs(ms: number, what = "timeoutMs"): number {
+  if (!Number.isSafeInteger(ms) || ms < 1 || ms > MAX_TIMEOUT_MS) throw new Error(`${what} must be a whole number of milliseconds from 1 to ${MAX_TIMEOUT_MS} (about 24.8 days)`);
+  return ms;
+}
 
 /**
  * How far behind the newest head (the node's own and each witness's `/api/status` height) a
@@ -925,14 +1122,19 @@ export class Client {
   private readonly pinnedGenesis?: string;
   /** Per-request timeout (ms). */
   readonly timeoutMs: number;
+  /** Independent nodes names are proven against (`ClientOptions.witnesses`). */
+  readonly witnesses: Client[];
+  readonly requireProvenNames: boolean;
 
   /** `opts` pins the chain: a node reporting another prefix, chain id or genesis hash is refused with `ChainMismatchError`. */
   constructor(readonly rpc: string = DEFAULT_RPC, opts: ClientOptions = {}) {
     if (opts.prefix !== undefined && !(KNOWN_PREFIXES as readonly string[]).includes(opts.prefix)) throw new Error(`unknown address prefix ${opts.prefix}`);
     if (opts.genesisHash !== undefined && !/^[0-9a-f]{64}$/i.test(opts.genesisHash)) throw new Error("genesisHash must be 64 hex characters");
-    const timeout = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    if (!Number.isSafeInteger(timeout) || timeout < 1) throw new Error("timeoutMs must be a positive whole number of milliseconds");
-    this.timeoutMs = timeout;
+    this.timeoutMs = checkTimeoutMs(opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+    this.witnesses = [...(opts.witnesses ?? [])];
+    if (this.witnesses.some((w) => w === this || w.rpc.replace(/\/$/, "") === rpc.replace(/\/$/, ""))) throw new Error("a witness must be another node, not the client's own");
+    this.requireProvenNames = opts.requireProvenNames === true;
+    if (this.requireProvenNames && this.witnesses.length === 0) throw new Error("requireProvenNames needs witnesses to prove names against");
     this.pinnedPrefix = opts.prefix;
     this.pinnedChainId = opts.chainId;
     this.pinnedGenesis = opts.genesisHash?.toLowerCase();
@@ -996,7 +1198,16 @@ export class Client {
   /** Upgrades: the protocol version in force, what the node's binary supports, the `schedule` (`[{ version, activation_height, active }]`, what `proposal.cancelUpgrade` names), halts and each validator's readiness signal. */
   upgrade() { return this.call("/upgrade"); }
   /** Accounts a key is authorized on (its own address, plus any it was added to). */
-  keyAccounts(keyIdHex: string) { return this.call(`/key/${keyIdHex}`); }
+  /**
+   * Accounts a key is on (`{ key_id, accounts, next }`), a page at a time: pass the previous page's
+   * `next` as `after`. Only accounts the key agreed to join (its grant) can list it (audit gap-7-2).
+   */
+  keyAccounts(keyIdHex: string, page: { after?: string; limit?: number } = {}) {
+    const q = new URLSearchParams();
+    if (page.after) q.set("after", page.after);
+    if (page.limit !== undefined) q.set("limit", String(page.limit));
+    return this.call(`/key/${keyIdHex}${q.size ? `?${q}` : ""}`);
+  }
   search(q: string) { return this.call(`/search/${encodeURIComponent(q)}`); }
   /** The validator set: `active` this epoch, `next_epoch` (with `joining`/`leaving`), `candidates`, `jailed`, `tombstoned` and `removed`, each with stake, self-bond, commission, jail and liveness; epoch timing; the churn limit and slashing parameters. */
   validators() { return this.call("/validators"); }
@@ -1014,6 +1225,19 @@ export class Client {
   claim(id: number) { return this.call(`/claim/${id}`); }
   /** A Séance, with each juror's assigned pairs (what they must judge). */
   seance(id: number) { return this.call(`/seance/${id}`); }
+  /** A juror's assigned pairs in Séance `id`, in order, with each claim's repo and PR (what `sealVotes` binds). */
+  async seancePairs(id: number, juror: string): Promise<[SeanceClaimRef, SeanceClaimRef][]> {
+    const s = await this.seance(id);
+    const seat = (Array.isArray(s?.jurors) ? s.jurors : []).find((j: { juror?: { address?: string } }) => j.juror?.address === juror);
+    if (!seat) throw new Error(`${juror} isn't on the jury of Séance #${id}`);
+    const claims: { id: number; repo: string; pr: number }[] = Array.isArray(s.claims) ? s.claims : [];
+    const ref = (cid: number): SeanceClaimRef => {
+      const c = claims.find((x) => x.id === cid);
+      if (!c) throw new Error(`Séance #${id} doesn't list claim #${cid}`);
+      return { id: cid, repo: c.repo, pr: c.pr };
+    };
+    return (Array.isArray(seat.assigned_pairs) ? seat.assigned_pairs : []).map(([a, b]: [number, number]) => [ref(a), ref(b)] as [SeanceClaimRef, SeanceClaimRef]);
+  }
   /** Soul leaderboard. */
   souls(limit = 50) { return this.call(`/souls?limit=${limit}`); }
 
@@ -1107,25 +1331,53 @@ export class Client {
     return { ...rec, active, height: r.height, root: r.root, head: r.head };
   }
 
+  /**
+   * The address a recipient resolves to, for a signature: an address as given, or a `.boo` name's
+   * owner (see `resolution`). With witnesses the name is proven; `requireProvenNames` refuses
+   * anything else.
+   */
   async resolve(nameOrAddress: string): Promise<string> {
-    if (isAddress(nameOrAddress)) return nameOrAddress;
-    if (/^t?boo1/i.test(nameOrAddress.trim())) throw new Error(`${nameOrAddress} isn't a valid address (check for typos; addresses are lowercase)`);
-    const r = await this.name(nameOrAddress);
+    return (await this.resolution(nameOrAddress)).address;
+  }
+
+  /**
+   * Where a recipient goes and how sure that is: show `address` and `how` before signing. With the
+   * client's `witnesses` a name is a proven, fresh read (`provenName`), so a lying node can't
+   * point it elsewhere; without them it's this node's answer alone (`proven: false`), which a
+   * lying node controls (audit gap-7-1).
+   */
+  async resolution(nameOrAddress: string): Promise<Resolution> {
+    const input = nameOrAddress;
+    if (isAddress(input)) return { input, address: input, name: null, proven: true, how: "an address, signed as given" };
+    if (/^t?boo1/i.test(input.trim())) throw new Error(`${input} isn't a valid address (check for typos; addresses are lowercase)`);
+    const name = bareName(input);
+    if (this.witnesses.length) {
+      const rec = await this.provenName(name, { witnesses: this.witnesses });
+      if (!rec) throw new Error(`${name}.boo doesn't resolve: it isn't registered or has expired (proven against ${this.witnesses.length} witness${this.witnesses.length === 1 ? "" : "es"})`);
+      if (!isAddress(rec.owner)) throw new Error(`${name}.boo's record names ${rec.owner}, which isn't an address`);
+      return { input, address: rec.owner, name, proven: true, how: `${name}.boo proven at block #${rec.height} against ${this.witnesses.length} independent node${this.witnesses.length === 1 ? "" : "s"}`, height: rec.height };
+    }
+    if (this.requireProvenNames) throw new Error(`${name}.boo can't be proven: this client has no witnesses`);
+    const r = await this.name(name);
     if (r.status === "grace") throw new Error(`${r.name} has expired (at block ${r.expires_at})`);
     if (r.available || !r.owner) throw new Error(`${r.name} isn't registered`);
-    return r.owner.address;
+    const address = String(r.owner.address ?? "");
+    if (!isAddress(address)) throw new Error(`${this.rpc} resolved ${name}.boo to ${JSON.stringify(address)}, which isn't an address`);
+    return { input, address, name, proven: false, how: `${name}.boo as ${this.rpc} reports it, unproven (a node can point a name anywhere; give the client witnesses to prove it)` };
   }
 
   /**
    * Submits a signed tx, then (with `wait`) waits for it. What a failure means:
    * - `ApiError`: the node refused the tx; it wasn't admitted.
    * - `RequestTimeoutError` or a network error: unknown; the tx may have arrived.
-   * - `TxFailedError`: it was admitted and then failed (its fee is charged when it executed).
+   * - `TxFailedError`: it executed and failed (`dropped` false: its fee was charged), or this node
+   *   dropped it unrun (`dropped` true: nothing charged, but it may still execute elsewhere until
+   *   its `valid_until`).
    * - `TxPendingError`: it was admitted and may still execute. Don't send it again blindly.
    */
   async submit(tx: Tx, wait = true) {
     const { id } = await this.call("/tx", tx);
-    if (wait) return this.waitForTx(id);
+    if (wait) return this.waitForTx(id, undefined, tx.valid_until);
     try {
       return await this.tx(id);
     } catch (e) {
@@ -1139,18 +1391,19 @@ export class Client {
   }
 
   /**
-   * Polls a tx until it's finalized (returns it) or failed (`TxFailedError`). A poll that fails
-   * (rate limited, a node error, a timeout, not visible yet) is retried; after `timeoutMs` it
-   * throws `TxPendingError`, since the tx may still execute.
+   * Polls a tx until it's finalized (returns it) or failed (`TxFailedError`, which says whether it
+   * executed or was dropped unrun). A poll that fails (rate limited, a node error, a timeout, not
+   * visible yet) is retried; after `timeoutMs` it throws `TxPendingError`, since the tx may still
+   * execute. `validUntil` (the tx's, when the caller has it) goes into a dropped tx's error.
    */
-  async waitForTx(id: string, timeoutMs = 15_000) {
+  async waitForTx(id: string, timeoutMs = 15_000, validUntil?: number) {
     const start = Date.now();
     let lastError: unknown;
     for (;;) {
       try {
         const tx = await this.tx(id);
         if (tx.status === "finalized") return tx;
-        if (tx.status === "failed") throw new TxFailedError(id, tx.error ?? "unknown reason", tx);
+        if (tx.status === "failed") throw new TxFailedError(id, tx.error ?? "unknown reason", tx, validUntil);
       } catch (e) {
         if (e instanceof TxFailedError || (e instanceof ApiError && e.status === 400)) throw e;
         lastError = e;

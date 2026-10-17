@@ -57,7 +57,13 @@ const refusals: [Record<string, string>, string[], RegExp][] = [
   [{ BLOCKULA_RPC: "https://rpc.example" }, ["--network", "local"], /on this machine/],
   [{ BLOCKULA_CHAIN_ID: "blockula-1" }, ["--network", "testnet"], /contradicts/],
   [{ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_GENESIS_HASH: "abc" }, [], /64 hex/],
+  [{ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_WITNESSES: "http://w.example" }, [], /BLOCKULA_WITNESSES must use https/],
+  [{ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_WITNESSES: "https://rpc.example/" }, [], /other nodes than BLOCKULA_RPC/],
+  [{ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_WITNESSES: "https://w.example,https://w.example" }, [], /twice/],
 ];
+// gap-7-1: witnesses names are proven against.
+assert.deepEqual(resolveNetwork({ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_WITNESSES: " https://a.example/ , https://b.example ," }).witnesses, ["https://a.example", "https://b.example"]);
+assert.deepEqual(resolveNetwork({}).witnesses, []);
 for (const [env, argv, re] of refusals) assert.throws(() => resolveNetwork(env, argv), re, JSON.stringify([env, argv]));
 console.log("✓ the network comes from the configuration only (default: the public testnet)");
 

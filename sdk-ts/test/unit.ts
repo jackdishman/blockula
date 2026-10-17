@@ -9,7 +9,7 @@ import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex, hexToBytes, utf8ToBytes } from "@noble/hashes/utils.js";
 import {
-  ApiError, ChainMismatchError, Client, RELEASE_SIGNATURE_FORMAT, RequestTimeoutError, StaleProofError, TxPendingError, Wallet, addressFromPublicKey, bareName, buildDistribution, convictionWeight, distributionLeaf, distributionNode,
+  ApiError, ChainMismatchError, Client, MAX_TIMEOUT_MS, actionDigest, decodeKeyGrant, encodeKeyGrant, proposalDigest, seancePairsDigest, verifyKeyGrant, RELEASE_SIGNATURE_FORMAT, RequestTimeoutError, StaleProofError, TxFailedError, TxPendingError, Wallet, addressFromPublicKey, bareName, buildDistribution, convictionWeight, distributionLeaf, distributionNode,
   keyHash, keyId, leafHash, maxTip, minFee, paramsOf, proposal, proposalSummary, releaseMessage, sharesFor, signingBytes, stakeSummary, valueHash, verifyDistributionProof, verifyReleaseSignature, type Action,
   type Tx,
 } from "../src/index.js";
@@ -32,6 +32,8 @@ interface Host {
   hang?: boolean;
   /** Answers for `/tx/{id}`, in turn (the last one repeats): a status, or an HTTP error code. */
   txAnswers?: (string | number)[];
+  /** Who `/api/name/{name}` says owns a name (before the shared vlad/bob). */
+  names?: Record<string, string>;
 }
 const hosts = new Map<string, Host>();
 function host(rpc: string, status: Record<string, unknown> = {}): Host {
@@ -59,7 +61,10 @@ globalThis.fetch = (async (input: string | URL, init?: RequestInit) => {
   if (path === "/status") return reply(200, h.status);
   if (path === `/tx/${"ab".repeat(32)}` && h.txAnswers?.length) {
     const a = h.txAnswers.length > 1 ? h.txAnswers.shift()! : h.txAnswers[0];
-    return typeof a === "number" ? reply(a, { error: `error ${a}` }) : reply(200, { id: "ab".repeat(32), status: a, error: a === "failed" ? "insufficient balance" : undefined });
+    if (typeof a === "number") return reply(a, { error: `error ${a}` });
+    // As node/src/api.rs answers: a tx that failed in a block comes with its fields; one dropped from the mempool unrun doesn't, and says `dropped`.
+    if (a === "dropped") return reply(200, { id: "ab".repeat(32), status: "failed", dropped: true, error: "evicted from a full mempool by a transaction with a higher tip", height: 50 });
+    return reply(200, { id: "ab".repeat(32), status: a, error: a === "failed" ? "insufficient balance" : undefined, ...(a === "failed" ? { height: 51, action: { type: "transfer", to: BOB, amount: "1" } } : {}) });
   }
   if (path === `/tx/${"ab".repeat(32)}`) return reply(200, { status: "finalized", summary: "ok", fee: h.posted.at(-1)?.fee });
   const block = path.match(/^\/block\/(\d+)$/);
@@ -67,7 +72,7 @@ globalThis.fetch = (async (input: string | URL, init?: RequestInit) => {
   const name = path.match(/^\/name\/(.+)$/);
   if (name) {
     const n = bareName(name[1]);
-    const owner = ({ vlad: VALIDATOR, bob: BOB } as Record<string, string>)[n];
+    const owner = h.names?.[n] ?? ({ vlad: VALIDATOR, bob: BOB } as Record<string, string>)[n];
     return reply(200, owner ? { name: `${n}.boo`, available: false, owner: { address: owner, name: `${n}.boo` } } : { name: `${n}.boo`, available: true });
   }
   if (path in h.routes) return reply(200, h.routes[path]);
@@ -80,6 +85,7 @@ const client = new Client(RPC);
 const me = Wallet.fromSeed("07".repeat(32), client);
 // Shapes as node/src/api.rs serves them.
 node.routes["/params"] = { params: { proposal_deposit: "1000000000000", max_validators: "31" }, genesis: { block_time_ms: 1000, epoch_blocks: 3600 }, issuance: { year: 0 } };
+node.routes["/proposal/2"] = { id: 2, kind: { type: "treasury_spend", to: BOB, amount: "5" }, title: "Pay Bob", url: "", summary: "pay 5 drops to bob.boo" };
 node.routes[`/staking/${me.address}`] = { account: { address: me.address, name: null }, bonded: "5000000000", unbonding: "0", withdrawable: "0", delegations: [{ validator: { address: VALIDATOR, name: "vlad.boo" }, shares: "4000", value: "5000000000", principal: "5000000000", self_bond: false }], entries: [], validators: [], summary: "has 5 FANG staked with 1 validator" };
 
 /** Runs a helper and returns the one tx it submitted, after checking what every tx must satisfy. */
@@ -116,12 +122,13 @@ const cases: [string, () => Promise<unknown>, Action][] = [
   ],
   ["propose a param change", () => me.propose(proposal.paramChange("max_validators", 40), { title: "More validators", deposit: "2000" }), { type: "propose", kind: { type: "param_change", key: "max_validators", value: "40" }, deposit: (2000n * FANG).toString(), title: "More validators", url: "" }],
   ["propose lifting a sybil flag (name resolved)", () => me.propose(proposal.unflagSybil("bob.boo", "mistaken identity"), { title: "Appeal", deposit: "1" }), { type: "propose", kind: { type: "unflag_sybil", account: BOB, reason: "mistaken identity" }, deposit: FANG.toString(), title: "Appeal", url: "" }],
-  ["vote", () => me.vote(1, true, "10", 6), { type: "vote", proposal_id: 1, aye: true, amount: (10n * FANG).toString(), conviction: 6 }],
-  ["vote without conviction", () => me.vote(2, false, 1n, 0), { type: "vote", proposal_id: 2, aye: false, amount: "1", conviction: 0 }],
+  // gap-7-6: a vote binds the proposal it was shown (given, or read from the node).
+  ["vote", () => me.vote(1, true, "10", 6, { proposal: { kind: { type: "text" }, title: "Plant garlic", url: "https://forum.example/p/1" } }), { type: "vote", proposal_id: 1, aye: true, amount: (10n * FANG).toString(), conviction: 6, proposal_digest: proposalDigest({ type: "text" }, "Plant garlic", "https://forum.example/p/1") }],
+  ["vote without conviction (proposal read from the node)", () => me.vote(2, false, 1n, 0), { type: "vote", proposal_id: 2, aye: false, amount: "1", conviction: 0, proposal_digest: proposalDigest({ type: "treasury_spend", to: BOB, amount: "5" }, "Pay Bob", "") }],
   ["unlock", () => me.unlock(), { type: "unlock" }],
   ["multisig create", () => me.multisigCreate(["AB".repeat(32), "cd".repeat(32)], 2), { type: "multisig_create", owners: ["ab".repeat(32), "cd".repeat(32)], threshold: 2 }],
   ["multisig propose", () => me.multisigPropose({ type: "transfer", to: BOB, amount: "5" }), { type: "multisig_propose", action: { type: "transfer", to: BOB, amount: "5" } }],
-  ["multisig approve", () => me.multisigApprove(3), { type: "multisig_approve", id: 3 }],
+  ["multisig approve (the action shown)", () => me.multisigApprove(3, { action: { type: "transfer", to: BOB, amount: "5" } }), { type: "multisig_approve", id: 3, action_digest: actionDigest({ type: "transfer", to: BOB, amount: "5" }) }],
   ["renew a name", () => me.renewName("Vlad.boo", 2), { type: "renew_name", name: "vlad", years: 2 }],
   ["transfer a name", () => me.transferName("vlad", "bob.boo"), { type: "transfer_name", name: "vlad", to: BOB }],
   ["accept a name", () => me.acceptName("Vlad.boo"), { type: "transfer_name", name: "vlad", to: me.account }],
@@ -147,7 +154,7 @@ const refused: [string, () => Promise<unknown>, RegExp][] = [
   ["bad name", () => me.releaseName("-x-"), /names/],
   ["duplicate owners", () => me.multisigCreate(["ab".repeat(32), "AB".repeat(32)], 1), /distinct/],
   ["threshold above owners", () => me.multisigCreate(["ab".repeat(32)], 2), /threshold must be 1–1/],
-  ["nested multisig", () => me.multisigPropose({ type: "multisig_approve", id: 1 }), /can't hold another/],
+  ["nested multisig", () => me.multisigPropose({ type: "multisig_approve", id: 1, action_digest: "00".repeat(32) }), /can't hold another/],
   ["bad commitment", () => me.beaconCommit(1, "ab"), /32 bytes of hex/],
   ["bad evidence", () => me.reportEquivocation("0A"), /lowercase hex/],
   ["bad commission", () => me.updateValidator({ commissionBps: 10_001 }), /0 to 10000/],
@@ -343,6 +350,106 @@ const expired = await expiring(4000).provenName("alice", { witnesses, includeExp
 assert.deepEqual([expired?.owner, expired?.active, expired?.expires_at], [ATTACKER, false, 4000]);
 console.log("✓ proven reads refuse a genuine but stale record (a name's previous owner) and expired names");
 
+// Audit gap-7-1: a name that ends up in a signature is proven when the client has witnesses. The
+// lying node says alice.boo is the attacker's, and backs it with a proof against a root of its own.
+const fakeAlice = nameState(nameRecord("alice", ATTACKER, 4000, 4000 + 31_536_000));
+const redirect = host("http://redirect.node", { height: 5000 });
+redirect.names = { alice: ATTACKER };
+redirect.routes[`/proof/2/${bytesToHex(utf8ToBytes("alice"))}`] = proofOf(fakeAlice, 5000);
+honest.blocks[5000] = after.root; // the real head: alice.boo is the victim's
+const unproven = await new Client("http://redirect.node").resolution("alice.boo");
+assert.deepEqual([unproven.address, unproven.proven], [ATTACKER, false], "without witnesses it's one node's word, and says so");
+assert.match(unproven.how, /as http:\/\/redirect\.node reports it, unproven/);
+const sender = (c: Client) => Wallet.fromSeed("08".repeat(32), c);
+const before71 = redirect.posted.length;
+await assert.rejects(sender(new Client("http://redirect.node", { witnesses })).send("alice.boo", "1"), /disagrees about the state at block #5000/, "with witnesses the redirect is refused, nothing is signed");
+await assert.rejects(new Client("http://redirect.node", { witnesses }).resolve("Alice.boo"), /disagrees/);
+assert.equal(redirect.posted.length, before71);
+redirect.routes[`/proof/2/${bytesToHex(utf8ToBytes("alice"))}`] = proofOf(after, 5000);
+const provenRes = await new Client("http://redirect.node", { witnesses }).resolution("alice");
+assert.deepEqual([provenRes.address, provenRes.proven, provenRes.height], [VICTIM, true, 5000]);
+await sender(new Client("http://redirect.node", { witnesses })).send("alice.boo", "1");
+assert.equal((redirect.posted.at(-1)!.action as { to: string }).to, VICTIM, "the proven owner is signed, whatever /api/name says");
+assert.deepEqual(await new Client("http://redirect.node").resolution(BOB), { input: BOB, address: BOB, name: null, proven: true, how: "an address, signed as given" });
+assert.throws(() => new Client("http://redirect.node", { requireProvenNames: true }), /needs witnesses/);
+assert.throws(() => new Client("http://redirect.node", { witnesses: [new Client("http://redirect.node/")] }), /another node/);
+console.log("✓ names that get signed are proven against the client's witnesses (a lying node can't redirect them), else marked unproven");
+
+// Audit gap-7-3: an absolute expiry counts from the height valid_until does, in one status read.
+// This node answers a lone status read 300 days ahead and the next one truthfully.
+const twoFaced = host("http://two-faced.node");
+let reads = 0;
+Object.defineProperty(twoFaced.status, "height", { enumerable: true, get: () => (reads++ % 2 === 0 ? 50 + 300 * 86_400 : 50) });
+const tf = Wallet.fromSeed("09".repeat(32), new Client("http://two-faced.node", { prefix: "boo" }));
+const tfAgent = await Wallet.fromSeed("0b".repeat(32)).keyGrant(tf.account, { chainId: "unit", genesisHash: GENESIS });
+for (const run of [() => tf.addSessionKey(tfAgent, "agent", { limit: "1", periodBlocks: 100, expiresInBlocks: 30 * 86_400 }), () => tf.createHunt({ repo: "a/b", issue: 1, amount: "10", title: "t", expiresInBlocks: 30 * 86_400 })]) {
+  await run();
+  const t = twoFaced.posted.at(-1)!;
+  const expiresAt = t.action.type === "add_key" && t.action.role.type === "session" ? t.action.role.expires_at : t.action.type === "create_hunt" ? t.action.expires_at : -1;
+  assert.equal(expiresAt, t.valid_until - 600 + 30 * 86_400, `${t.action.type}: the expiry and valid_until come from one status read`);
+}
+console.log("✓ session key and hunt expiries count from the height valid_until is signed against");
+
+// Audit gap-7-2: a key is added with its consent to the account (a grant), never by id alone.
+{
+  const g = host("http://grants.node");
+  const owner = Wallet.fromSeed("0c".repeat(32), new Client("http://grants.node"));
+  const device = Wallet.fromSeed("0d".repeat(32));
+  const chain = { chainId: "unit", genesisHash: GENESIS };
+  const grant = await device.keyGrant(owner.account, chain);
+  assert.equal(grant.key_id, device.keyId);
+  const code = encodeKeyGrant(grant);
+  assert.match(code, /^bkgrant1\.boo1[0-9a-z]+\.[A-Za-z0-9_-]+$/);
+  assert.deepEqual(decodeKeyGrant(code.replace(/(.{80})/g, "$1\n ")), grant, "a wrapped paste still decodes");
+  assert.ok(verifyKeyGrant(grant, "unit", GENESIS));
+  assert.ok(!verifyKeyGrant({ ...grant, account: BOB }, "unit", GENESIS), "another account");
+  assert.ok(!verifyKeyGrant(grant, "unit", "00".repeat(32)), "another chain instance");
+  assert.ok(!verifyKeyGrant({ ...grant, key_id: "ab".repeat(32) }, "unit", GENESIS), "another key id");
+  assert.throws(() => decodeKeyGrant(device.keyId), /that's a key id/);
+  assert.throws(() => decodeKeyGrant(code.slice(0, -10)), /damaged|cut short/);
+  assert.throws(() => decodeKeyGrant("bkgrant1.nope.AAAA"), /isn't an address/);
+  await assert.rejects(owner.addOwnerKey(device.keyId, "phone"), /that's a key id/);
+  await assert.rejects(owner.addOwnerKey(await device.keyGrant(BOB, chain), "phone"), /that grant is for/);
+  await assert.rejects(owner.addOwnerKey(await device.keyGrant(owner.account, { chainId: "other", genesisHash: GENESIS }), "phone"), /doesn't verify/);
+  assert.equal(g.posted.length, 0, "nothing signed for a bad grant");
+  await owner.addOwnerKey(code, "phone");
+  assert.deepEqual(g.posted.at(-1)!.action, { type: "add_key", key_id: device.keyId, label: "phone", role: { type: "owner" }, public_key: grant.public_key, pop: grant.pop });
+  // keyAccounts pages with `after`.
+  g.routes[`/key/${device.keyId}?after=boo1x&limit=5`] = { key_id: device.keyId, accounts: [], next: null };
+  assert.equal((await owner.client.keyAccounts(device.keyId, { after: "boo1x", limit: 5 })).next, null);
+}
+console.log("✓ keys are added with their grant (consent to the account, on this chain), not by id; grant codes round-trip");
+
+// Audit gap-7-6: a sealed judgment binds the pairs (and PRs) the juror compared, read from the node.
+{
+  const juror = me.account;
+  node.routes["/seance/4"] = { id: 4, claims: [{ id: 7, repo: "a/b", pr: 70 }, { id: 9, repo: "c/d", pr: 90 }], jurors: [{ juror: { address: juror }, assigned_pairs: [[9, 7]] }] };
+  const before = node.posted.length;
+  await assert.rejects(me.sealVotes(4, "ab"), /1 assigned pairs/);
+  const sealed = await me.sealVotes(4, "a", [], "salt");
+  assert.equal(node.posted.length, before + 1);
+  const a = node.posted.at(-1)!.action as { type: string; pairs_digest: string };
+  assert.equal(a.pairs_digest, seancePairsDigest(4, juror, [[{ id: 9, repo: "c/d", pr: 90 }, { id: 7, repo: "a/b", pr: 70 }]]));
+  assert.notEqual(a.pairs_digest, seancePairsDigest(4, juror, [[{ id: 7, repo: "a/b", pr: 70 }, { id: 9, repo: "c/d", pr: 90 }]]), "order matters: 'a' is the first claim");
+  assert.equal(sealed.salt, "salt");
+  await assert.rejects(me.multisigApprove(5), (e: unknown) => e instanceof ApiError || /no open multisig action/.test(String(e)));
+}
+console.log("✓ votes, multisig approvals and sealed judgments bind what they were shown");
+
+// Audit gap-7-5: the default deposit is the node's word: bounded, and the witnesses must agree.
+const greedy = host("http://greedy.node");
+greedy.routes["/params"] = { params: { proposal_deposit: (999_000n * FANG).toString() } };
+const gw = Wallet.fromSeed("0a".repeat(32), new Client("http://greedy.node"));
+await assert.rejects(gw.propose(proposal.text(), { title: "t" }), /reports a proposal_deposit of 999000 FANG, more than maxDeposit \(1000 FANG\)/);
+assert.equal(greedy.posted.length, 0, "nothing signed");
+await gw.propose(proposal.text(), { title: "t", maxDeposit: "1000000" });
+assert.equal((greedy.posted.at(-1)!.action as { deposit: string }).deposit, (999_000n * FANG).toString(), "a raised maxDeposit lets it through");
+const fair = host("http://fair.node");
+fair.routes["/params"] = { params: { proposal_deposit: (10n * FANG).toString() } };
+greedy.routes["/params"] = { params: { proposal_deposit: (900n * FANG).toString() } };
+await assert.rejects(Wallet.fromSeed("0a".repeat(32), new Client("http://greedy.node", { witnesses: [new Client("http://fair.node")] })).propose(proposal.text(), { title: "t" }), /disagree about proposal_deposit \(900 FANG, 10 FANG\)/);
+console.log("✓ propose's default deposit is bounded by maxDeposit and must match the witnesses");
+
 // ---- requests time out; a submitted tx that isn't seen final is "pending", not "failed" ----
 
 host("http://hang.node").hang = true;
@@ -352,6 +459,9 @@ assert.ok(Date.now() - t0 < 5_000, "bounded by timeoutMs");
 await assert.rejects(Wallet.fromSeed("07".repeat(32), new Client("http://hang.node", { timeoutMs: 100 })).send(BOB, "1"), RequestTimeoutError);
 assert.throws(() => new Client(RPC, { timeoutMs: 0 }), /timeoutMs/);
 assert.equal(new Client(RPC).timeoutMs, 15_000);
+// review-fix-clients-1: a timer longer than 2^31 - 1 ms fires at once, so such a timeout is refused.
+assert.equal(new Client(RPC, { timeoutMs: MAX_TIMEOUT_MS }).timeoutMs, 2 ** 31 - 1);
+for (const ms of [2 ** 31, 3_000_000_000, Number.MAX_SAFE_INTEGER]) assert.throws(() => new Client(RPC, { timeoutMs: ms }), /timeoutMs must be a whole number of milliseconds from 1 to 2147483647/, String(ms));
 const slow = host("http://slow.node");
 const sc = new Client("http://slow.node");
 const id = "ab".repeat(32);
@@ -362,7 +472,10 @@ assert.equal((await sc.waitForTx(id, 5_000)).status, "finalized", "failed polls 
 slow.txAnswers = [429];
 await assert.rejects(sc.waitForTx(id, 300), (e: unknown) => e instanceof TxPendingError && e.lastError instanceof ApiError && e.lastError.status === 429);
 slow.txAnswers = ["failed"];
-await assert.rejects(sc.waitForTx(id, 300), /failed: insufficient balance/);
+await assert.rejects(sc.waitForTx(id, 300), (e: unknown) => e instanceof TxFailedError && !e.dropped && /failed in block 51: insufficient balance \(its fee was charged\)/.test(e.message));
+// review-fix-clients-2: dropped from the node's mempool unrun is no "its fee was charged".
+slow.txAnswers = ["dropped"];
+await assert.rejects(sc.waitForTx(id, 300, 999), (e: unknown) => e instanceof TxFailedError && e.dropped && e.validUntil === 999 && /dropped by this node without running \(evicted.*nothing was charged, but another node may still include it until block 999/.test(e.message) && !/fee was charged/.test(e.message));
 slow.txAnswers = [503];
 await assert.rejects(sc.submit(await Wallet.fromSeed("07".repeat(32), sc).build({ type: "transfer", to: BOB, amount: "1" }), false), TxPendingError, "admitted, then the read failed: pending, not refused");
 console.log("✓ requests time out (RequestTimeoutError); waits retry failed polls and end in TxPendingError");

@@ -38,8 +38,19 @@ pub enum Action {
         amount: u64,
     },
     RegisterName { name: String },
-    /// Authorize another key on this account (owner keys only).
-    AddKey { key_id: String, label: String, role: KeyRole },
+    /// Authorize another key on this account (owner keys only). The added key consents: `pop` is
+    /// its signature over `key_pop_message(chain_id, genesis_hash, account, key_id)` (context
+    /// `KEY_POP_CONTEXT`), so nobody can put a key they don't hold on their own accounts (and
+    /// pad its `/api/key` listing: audit gap-7-2).
+    AddKey {
+        key_id: String,
+        label: String,
+        role: KeyRole,
+        /// The added key's hex ML-DSA-65 public key (`key_id` is its BLAKE3).
+        public_key: String,
+        /// Its hex ML-DSA-65 proof of possession for this account (see `key_pop`).
+        pop: String,
+    },
     /// Revoke a key (owner keys only). The last owner key can't be removed.
     RemoveKey { key_id: String },
     /// Offer to validate: bonds `bond` drops from the sender and creates a *pending* validator
@@ -140,8 +151,10 @@ pub enum Action {
     },
     /// Leave the juror pool and get the bond back (not while serving on an open Séance).
     LeaveJury {},
-    /// A juror's sealed judgment: hex BLAKE3 of `seance_commitment(...)`.
-    CommitVotes { seance_id: u64, commitment: String },
+    /// A juror's sealed judgment: hex BLAKE3 of `seance_commitment(...)`. `pairs_digest` is
+    /// `seance_pairs_digest` of the pairs (and their claims' PRs) the juror judged, so a node that
+    /// showed other pairs makes the commitment fail instead of misdirecting it (audit gap-7-6).
+    CommitVotes { seance_id: u64, commitment: String, pairs_digest: String },
     /// Open the sealed judgment: one of `a`, `b`, `=` per assigned pair, claims flagged as spam,
     /// and the salt.
     RevealVotes { seance_id: u64, votes: String, spam: Vec<u64>, salt: String },
@@ -200,12 +213,15 @@ pub enum Action {
     },
     /// Vote with `amount` of the voter's own unlocked holdings, locked for `conviction` (0–6)
     /// lock periods: weight is amount × 0.1 with no lock, then 1×–6× for 1–32 periods.
+    /// `proposal_digest` is `proposal_digest(kind, title, url)` of the proposal the voter was
+    /// shown: a vote for different content is refused (audit gap-7-6).
     Vote {
         proposal_id: u64,
         aye: bool,
         #[serde(with = "u64_str")]
         amount: u64,
         conviction: u8,
+        proposal_digest: String,
     },
     /// Release the vote locks that have expired.
     Unlock {},
@@ -214,7 +230,9 @@ pub enum Action {
     /// A multisig owner proposes an action for the account (never another multisig proposal);
     /// it runs once `threshold` owners approve.
     MultisigPropose { action: Box<Action> },
-    MultisigApprove { id: u64 },
+    /// Approve proposal `id`; `action_digest` is `action_digest` of the action the approver was
+    /// shown, so approving anything else fails (audit gap-7-6).
+    MultisigApprove { id: u64, action_digest: String },
     /// Extend a name you own by `years` (econ.rs).
     RenewName { name: String, years: u8 },
     /// Give a name you own to another account (address or name).
@@ -357,6 +375,80 @@ impl From<KeyRoleJson> for KeyRole {
 /// A key's id is BLAKE3(public key) as hex, the same 32 bytes inside a `boo1…` address.
 pub fn key_id(public_key: &[u8]) -> String {
     hex::encode(crypto::hash(public_key))
+}
+
+/// Domain separation for a key's proof of possession when it's added to an account (FIPS 204
+/// context string; validators' consensus keys use `POP_CONTEXT`).
+pub const KEY_POP_CONTEXT: &[u8] = b"blockula/key-pop/v1";
+
+/// What a key signs to consent to being added to `account` (`AddKey.pop`): the chain instance,
+/// the account and the key's own id. Not the role or label, which the account's owners choose.
+pub fn key_pop_message(chain_id: &str, genesis_hash: &str, account: &str, key_id: &str) -> Vec<u8> {
+    let mut out = b"BLOCKULA_KEY_POP_V1".to_vec();
+    for s in [chain_id, genesis_hash, account, key_id] {
+        put_str(&mut out, s);
+    }
+    out
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+/// `keys`' proof of possession for being added to `account` on the chain `(chain_id, genesis_hash)`.
+pub fn key_pop(keys: &crypto::Keys, chain_id: &str, genesis_hash: &str, account: &str) -> String {
+    hex::encode(keys.sign_with_context(KEY_POP_CONTEXT, &key_pop_message(chain_id, genesis_hash, account, &key_id(&keys.public_key()))))
+}
+
+/// An `AddKey` for `keys`, with its proof of possession for `account`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn add_key(keys: &crypto::Keys, chain_id: &str, genesis_hash: &str, account: &str, label: &str, role: KeyRole) -> Action {
+    Action::AddKey { key_id: key_id(&keys.public_key()), label: label.into(), role, public_key: hex::encode(keys.public_key()), pop: key_pop(keys, chain_id, genesis_hash, account) }
+}
+
+/// What a `MultisigApprove` binds: BLAKE3 (derive-key mode) of the action's canonical encoding
+/// (as inside the signing bytes), so an approval is for that action and nothing else (audit gap-7-6).
+pub fn action_digest(action: &Action) -> String {
+    let mut out = vec![];
+    action.encode(&mut out);
+    hex::encode(blake3::derive_key("blockula multisig action v1", &out))
+}
+
+/// What a `Vote` binds: the proposal's kind (accounts resolved, as stored), title and link.
+pub fn proposal_digest(kind: &ProposalKind, title: &str, url: &str) -> String {
+    let mut out = vec![];
+    kind.encode(&mut out);
+    put_str(&mut out, title);
+    put_str(&mut out, url);
+    hex::encode(blake3::derive_key("blockula proposal v1", &out))
+}
+
+/// What a `CommitVotes` binds: the Séance, the juror and, per assigned pair in order, both claims'
+/// ids, repos and PR numbers (what the juror compared).
+pub fn seance_pairs_digest(seance_id: u64, juror: &str, pairs: &[[(u64, &str, u64); 2]]) -> String {
+    let mut out = vec![];
+    put_u64(&mut out, seance_id);
+    put_str(&mut out, juror);
+    out.extend_from_slice(&(pairs.len() as u16).to_le_bytes());
+    for pair in pairs {
+        for (id, repo, pr) in pair {
+            put_u64(&mut out, *id);
+            put_str(&mut out, repo);
+            put_u64(&mut out, *pr);
+        }
+    }
+    hex::encode(blake3::derive_key("blockula seance pairs v1", &out))
+}
+
+/// Checks an `AddKey`'s proof of possession: `public_key` is the key `key_id` names and it signed
+/// its consent to `account` on this chain instance.
+pub fn verify_key_pop(chain_id: &str, genesis_hash: &str, account: &str, key_id: &str, public_key: &str, pop: &str) -> Result<()> {
+    let pk = hex::decode(public_key).map_err(|_| anyhow!("public_key must be hex"))?;
+    if self::key_id(&pk) != key_id {
+        bail!("public_key isn't the key key_id names (key_id is BLAKE3 of the public key)");
+    }
+    let sig = hex::decode(pop).map_err(|_| anyhow!("pop must be a hex ML-DSA-65 signature"))?;
+    if !crypto::verify_with_context(&pk, KEY_POP_CONTEXT, &key_pop_message(chain_id, genesis_hash, account, key_id), &sig) {
+        bail!("the added key's proof of possession doesn't verify: the key must sign its consent to this account on this chain (see Wallet.keyGrant)");
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -680,7 +772,7 @@ impl Action {
                 out.push(1);
                 put_str(out, name);
             }
-            Action::AddKey { key_id, label, role } => {
+            Action::AddKey { key_id, label, role, public_key, pop } => {
                 out.push(2);
                 put_str(out, key_id);
                 put_str(out, label);
@@ -693,6 +785,8 @@ impl Action {
                         out.extend_from_slice(&expires_at.to_le_bytes());
                     }
                 }
+                put_str(out, public_key);
+                put_str(out, pop);
             }
             Action::RemoveKey { key_id } => {
                 out.push(3);
@@ -803,10 +897,11 @@ impl Action {
                 out.extend_from_slice(&bond.to_le_bytes());
             }
             Action::LeaveJury {} => out.push(24),
-            Action::CommitVotes { seance_id, commitment } => {
+            Action::CommitVotes { seance_id, commitment, pairs_digest } => {
                 out.push(25);
                 out.extend_from_slice(&seance_id.to_le_bytes());
                 put_str(out, commitment);
+                put_str(out, pairs_digest);
             }
             Action::RevealVotes { seance_id, votes, spam, salt } => {
                 out.push(26);
@@ -873,12 +968,13 @@ impl Action {
                 put_str(out, title);
                 put_str(out, url);
             }
-            Action::Vote { proposal_id, aye, amount, conviction } => {
+            Action::Vote { proposal_id, aye, amount, conviction, proposal_digest } => {
                 out.push(40);
                 put_u64(out, *proposal_id);
                 out.push(*aye as u8);
                 put_u64(out, *amount);
                 out.push(*conviction);
+                put_str(out, proposal_digest);
             }
             Action::Unlock {} => out.push(41),
             Action::MultisigCreate { owners, threshold } => {
@@ -890,9 +986,10 @@ impl Action {
                 out.push(43);
                 action.encode(out);
             }
-            Action::MultisigApprove { id } => {
+            Action::MultisigApprove { id, action_digest } => {
                 out.push(44);
                 put_u64(out, *id);
+                put_str(out, action_digest);
             }
             Action::RenewName { name, years } => {
                 out.push(45);
@@ -985,6 +1082,8 @@ impl Action {
                     1 => KeyRole::Session { limit: r.u64()?, period_blocks: r.u64()?, expires_at: r.u64()? },
                     t => bail!("unknown key role {t}"),
                 },
+                public_key: r.str("public_key", hex_pk)?,
+                pop: r.str("pop", hex_sig)?,
             },
             3 => Action::RemoveKey { key_id: r.str("key_id", HEX_32)? },
             4 => Action::RegisterValidator {
@@ -1014,7 +1113,7 @@ impl Action {
             22 => Action::RejectClaim { claim_id: r.u64()?, reason: r.str("reason", MAX_REASON)? },
             23 => Action::JoinJury { bond: r.u64()? },
             24 => Action::LeaveJury {},
-            25 => Action::CommitVotes { seance_id: r.u64()?, commitment: r.str("commitment", HEX_32)? },
+            25 => Action::CommitVotes { seance_id: r.u64()?, commitment: r.str("commitment", HEX_32)?, pairs_digest: r.str("pairs_digest", HEX_32)? },
             26 => Action::RevealVotes { seance_id: r.u64()?, votes: r.str("votes", PAIRS_PER_JUROR)?, spam: r.ids("spam", MAX_SEANCE_CLAIMS)?, salt: r.str("salt", 64)? },
             27 => Action::FundPool { amount: r.u64()? },
             28 => Action::WithdrawVested {},
@@ -1029,12 +1128,12 @@ impl Action {
             37 => Action::BeaconCommit { epoch: r.u64()?, commitment: r.str("commitment", HEX_32)? },
             38 => Action::BeaconReveal { epoch: r.u64()?, secret: r.str("secret", HEX_32)? },
             39 => Action::Propose { kind: ProposalKind::decode(r)?, deposit: r.u64()?, title: r.str("title", MAX_PROPOSAL_TITLE)?, url: r.str("url", MAX_URL)? },
-            40 => Action::Vote { proposal_id: r.u64()?, aye: r.bool("aye")?, amount: r.u64()?, conviction: r.u8()? },
+            40 => Action::Vote { proposal_id: r.u64()?, aye: r.bool("aye")?, amount: r.u64()?, conviction: r.u8()?, proposal_digest: r.str("proposal_digest", HEX_32)? },
             41 => Action::Unlock {},
             42 => Action::MultisigCreate { owners: r.strs("owners", crate::chain::MAX_KEYS, HEX_32)?, threshold: r.u8()? },
             43 if nested => bail!("a multisig proposal can't contain another"),
             43 => Action::MultisigPropose { action: Box::new(Action::decode_at(r, true)?) },
-            44 => Action::MultisigApprove { id: r.u64()? },
+            44 => Action::MultisigApprove { id: r.u64()?, action_digest: r.str("action_digest", HEX_32)? },
             45 => Action::RenewName { name: r.str("name", MAX_NAME_FIELD)?, years: r.u8()? },
             46 => Action::TransferName { name: r.str("name", MAX_NAME_FIELD)?, to: r.str("to", MAX_NAME_FIELD)? },
             47 => Action::ReleaseName { name: r.str("name", MAX_NAME_FIELD)? },
@@ -1074,9 +1173,18 @@ impl Action {
                 }
                 normalize_name(name)?;
             }
-            Action::AddKey { key_id, label, role } => {
+            Action::AddKey { key_id, label, role, public_key, pop } => {
                 if !key_id_ok(key_id) {
                     bail!("key_id must be 32 bytes of lowercase hex (BLAKE3 of the public key)");
+                }
+                if !crypto::is_lower_hex(public_key) || public_key.len() != crypto::PUBLIC_KEY_LEN * 2 {
+                    bail!("public_key must be the added key's ML-DSA-65 public key ({} bytes of lowercase hex)", crypto::PUBLIC_KEY_LEN);
+                }
+                if hex::decode(public_key).map(|pk| self::key_id(&pk) != *key_id).unwrap_or(true) {
+                    bail!("public_key isn't the key key_id names (key_id is BLAKE3 of the public key)");
+                }
+                if !crypto::is_lower_hex(pop) || pop.len() != crypto::SIGNATURE_LEN * 2 {
+                    bail!("pop must be the added key's ML-DSA-65 signature ({} bytes of lowercase hex) over its consent to this account (see Wallet.keyGrant)", crypto::SIGNATURE_LEN);
                 }
                 if label.len() > MAX_LABEL {
                     bail!("key label too long (max {MAX_LABEL} bytes)");
@@ -1191,9 +1299,12 @@ impl Action {
                 }
             }
             Action::RejectClaim { reason, .. } => check_reason(reason)?,
-            Action::CommitVotes { commitment, .. } => {
+            Action::CommitVotes { commitment, pairs_digest, .. } => {
                 if commitment.len() != 64 || !crypto::is_lower_hex(commitment) {
                     bail!("commitment must be 32 bytes of lowercase hex");
+                }
+                if !key_id_ok(pairs_digest) {
+                    bail!("pairs_digest must be 32 bytes of lowercase hex (seance_pairs_digest of the pairs you judged)");
                 }
             }
             Action::RevealVotes { votes, spam, salt, .. } => {
@@ -1261,15 +1372,23 @@ impl Action {
                     bail!("url must be empty or an https:// link of at most {MAX_URL} bytes");
                 }
             }
-            Action::Vote { amount, conviction, .. } => {
+            Action::Vote { amount, conviction, proposal_digest, .. } => {
                 if *amount == 0 {
                     bail!("vote with more than 0");
+                }
+                if !key_id_ok(proposal_digest) {
+                    bail!("proposal_digest must be 32 bytes of lowercase hex (proposal_digest of the proposal you vote on)");
                 }
                 if *conviction > crate::params::MAX_CONVICTION {
                     bail!("conviction must be 0–{}", crate::params::MAX_CONVICTION);
                 }
             }
-            Action::WithdrawUnbonded {} | Action::Unlock {} | Action::MultisigApprove { .. } => {}
+            Action::WithdrawUnbonded {} | Action::Unlock {} => {}
+            Action::MultisigApprove { action_digest, .. } => {
+                if !key_id_ok(action_digest) {
+                    bail!("action_digest must be 32 bytes of lowercase hex (action_digest of the action you approve)");
+                }
+            }
             Action::MultisigCreate { owners, threshold } => {
                 if owners.is_empty() || owners.len() > crate::chain::MAX_KEYS || !owners.iter().all(|k| key_id_ok(k)) {
                     bail!("owners must be 1–{} key ids (32 bytes of lowercase hex)", crate::chain::MAX_KEYS);
@@ -2085,8 +2204,8 @@ pub(crate) mod tests {
         vec![
             Action::Transfer { to: "x.boo".into(), amount: 5 },
             Action::RegisterName { name: "vlad".into() },
-            Action::AddKey { key_id: "ab".repeat(32), label: "phone".into(), role: KeyRole::Owner },
-            Action::AddKey { key_id: "cd".repeat(32), label: "claude".into(), role: KeyRole::Session { limit: 10, period_blocks: 100, expires_at: 1000 } },
+            Action::AddKey { key_id: "ab".repeat(32), label: "phone".into(), role: KeyRole::Owner, public_key: "0c".into(), pop: "0d".into() },
+            Action::AddKey { key_id: "cd".repeat(32), label: "claude".into(), role: KeyRole::Session { limit: 10, period_blocks: 100, expires_at: 1000 }, public_key: "0e".into(), pop: "0f".into() },
             Action::RemoveKey { key_id: "ab".repeat(32) },
             Action::RegisterValidator { consensus_key: "0a".into(), p2p_addr: "1.2.3.4:5".into(), http_addr: "https://v.example".into(), bond: 50, pop: "0b".into() },
             Action::ApproveValidator { validator: "boo1v".into() },
@@ -2111,7 +2230,7 @@ pub(crate) mod tests {
             Action::RejectClaim { claim_id: 4, reason: "r".into() },
             Action::JoinJury { bond: 10 * DROPS_PER_FANG },
             Action::LeaveJury {},
-            Action::CommitVotes { seance_id: 2, commitment: "ef".repeat(32) },
+            Action::CommitVotes { seance_id: 2, commitment: "ef".repeat(32), pairs_digest: "e0".repeat(32) },
             Action::RevealVotes { seance_id: 2, votes: "ab=".into(), spam: vec![5, 6], salt: "s".into() },
             Action::FundPool { amount: 5 },
             Action::WithdrawVested {},
@@ -2149,12 +2268,12 @@ pub(crate) mod tests {
             propose(ProposalKind::ActivateFeature { feature: "ghost".into() }),
             propose(ProposalKind::DeactivateFeature { feature: "ghost".into() }),
             propose(ProposalKind::Text {}),
-            Action::Vote { proposal_id: 1, aye: true, amount: 10, conviction: 6 },
-            Action::Vote { proposal_id: 1, aye: false, amount: 10, conviction: 0 },
+            Action::Vote { proposal_id: 1, aye: true, amount: 10, conviction: 6, proposal_digest: "d1".repeat(32) },
+            Action::Vote { proposal_id: 1, aye: false, amount: 10, conviction: 0, proposal_digest: "d1".repeat(32) },
             Action::Unlock {},
             Action::MultisigCreate { owners: vec!["ab".repeat(32), "cd".repeat(32)], threshold: 2 },
             Action::MultisigPropose { action: Box::new(Action::Transfer { to: "x.boo".into(), amount: 5 }) },
-            Action::MultisigApprove { id: 3 },
+            Action::MultisigApprove { id: 3, action_digest: "a3".repeat(32) },
             Action::RenewName { name: "vlad".into(), years: 2 },
             Action::TransferName { name: "vlad".into(), to: "x.boo".into() },
             Action::ReleaseName { name: "vlad".into() },
@@ -2214,11 +2333,11 @@ pub(crate) mod tests {
         cases.extend([
             ("tx integers at their maxima".to_string(), Tx { nonce: JS_MAX, fee: u64::MAX, tip: u64::MAX, valid_until: JS_MAX, ..base.clone() }),
             ("tx integers at zero".to_string(), Tx { nonce: 0, fee: 0, tip: 0, valid_until: 0, action: Action::Transfer { to: "x.boo".into(), amount: 0 }, memo: String::new(), ..base.clone() }),
-            ("non-ASCII strings".to_string(), Tx { chain_id: "vec-🧛".into(), memo: "ünïcödé 🦇 \u{0}\u{7f}".into(), action: Action::AddKey { key_id: "ab".repeat(32), label: "Vlad’s phone 📱".into(), role: KeyRole::Owner }, ..base.clone() }),
-            at("session key limit at u64::MAX", Action::AddKey { key_id: "cd".repeat(32), label: "agent".into(), role: KeyRole::Session { limit: u64::MAX, period_blocks: JS_MAX, expires_at: JS_MAX } }),
+            ("non-ASCII strings".to_string(), Tx { chain_id: "vec-🧛".into(), memo: "ünïcödé 🦇 \u{0}\u{7f}".into(), action: Action::AddKey { key_id: "ab".repeat(32), label: "Vlad’s phone 📱".into(), role: KeyRole::Owner, public_key: "0c".into(), pop: "0d".into() }, ..base.clone() }),
+            at("session key limit at u64::MAX", Action::AddKey { key_id: "cd".repeat(32), label: "agent".into(), role: KeyRole::Session { limit: u64::MAX, period_blocks: JS_MAX, expires_at: JS_MAX }, public_key: "0e".into(), pop: "0f".into() }),
             at("hunt at the bounds", Action::CreateHunt { repo: "a/b".into(), issue: JS_MAX, amount: u64::MAX, expires_at: JS_MAX, title: "t".into() }),
             at("award at the bounds", Action::AwardHunt { hunt_id: JS_MAX, to: "x.boo".into(), pr: JS_MAX, familiar_key: None }),
-            at("vote at the bounds", Action::Vote { proposal_id: JS_MAX, aye: false, amount: u64::MAX, conviction: u8::MAX }),
+            at("vote at the bounds", Action::Vote { proposal_id: JS_MAX, aye: false, amount: u64::MAX, conviction: u8::MAX, proposal_digest: "ff".repeat(32) }),
             at("multisig threshold at u8::MAX", Action::MultisigCreate { owners: vec![], threshold: u8::MAX }),
             at("renewal years at u8::MAX", Action::RenewName { name: "vlad".into(), years: u8::MAX }),
             at("reveal with large ids", Action::RevealVotes { seance_id: JS_MAX, votes: String::new(), spam: vec![0, JS_MAX], salt: String::new() }),
@@ -2240,9 +2359,31 @@ pub(crate) mod tests {
                 serde_json::json!({ "label": label, "tx": json, "signing_bytes": hex::encode(tx.signing_bytes()) })
             })
             .collect();
+        // What approvals, votes and sealed judgments bind (audit gap-7-6), and a key's consent
+        // message (gap-7-2): the SDK's `actionDigest`, `proposalDigest`, `seancePairsDigest` and
+        // `keyPopMessage` must compute the same.
+        let digests = [
+            Action::Transfer { to: "bob.boo".into(), amount: 5_000_000_000 },
+            Action::Propose { kind: ProposalKind::TreasurySpend { to: "boo1to".into(), amount: 9 }, deposit: 1, title: "Pay Bob".into(), url: String::new() },
+            Action::AddKey { key_id: "ab".repeat(32), label: "Vlad’s phone 📱".into(), role: KeyRole::Session { limit: u64::MAX, period_blocks: 1, expires_at: JS_MAX }, public_key: "0c".into(), pop: "0d".into() },
+        ]
+        .into_iter()
+        .map(|a| serde_json::json!({ "action": a, "digest": action_digest(&a) }))
+        .collect::<Vec<_>>();
+        let proposals = [(ProposalKind::Text {}, "Plant garlic 🧄", "https://forum.example/p/1"), (ProposalKind::ParamChange { key: "max_validators".into(), value: u64::MAX }, "More validators", ""), (ProposalKind::GrantSoul { to: "boo1to".into(), amount: 1500, reason: "r".into() }, "", "")]
+            .into_iter()
+            .map(|(kind, title, url)| serde_json::json!({ "kind": kind, "title": title, "url": url, "digest": proposal_digest(&kind, title, url) }))
+            .collect::<Vec<_>>();
+        let pairs: [[(u64, &str, u64); 2]; 2] = [[(9, "c/d", 90), (7, "a/b", 70)], [(JS_MAX, "x/ÿ", JS_MAX), (0, "", 0)]];
+        let seance = serde_json::json!({ "seance_id": 4, "juror": "boo1juror", "pairs": pairs.iter().map(|p| p.iter().map(|(id, repo, pr)| serde_json::json!({ "id": id, "repo": repo, "pr": pr })).collect::<Vec<_>>()).collect::<Vec<_>>(), "digest": seance_pairs_digest(4, "boo1juror", &pairs) });
+        let key_pop = serde_json::json!({ "chain_id": "vec-🧛", "genesis_hash": "03".repeat(32), "account": "boo1from", "key_id": "ab".repeat(32), "message": hex::encode(key_pop_message("vec-🧛", &"03".repeat(32), "boo1from", &"ab".repeat(32))) });
         serde_json::json!({
             "description": "Signing bytes of txs from their JSON (node/src/types.rs `tx_vectors`), for sdk-ts/src/tx.ts `signingBytes`. Regenerate: cargo test --manifest-path node/Cargo.toml types::tests::write_tx_vectors -- --ignored",
             "cases": cases,
+            "action_digests": digests,
+            "proposal_digests": proposals,
+            "seance_pairs_digest": seance,
+            "key_pop_message": key_pop,
         })
     }
 
@@ -2267,7 +2408,7 @@ pub(crate) mod tests {
         for action in vector_actions() {
             h.update(&vector_tx(action).signing_bytes());
         }
-        assert_eq!(h.finalize().to_hex().to_string(), "3633490a583afa9a7aec72593fd29e9d5461b3a037abec251ca90c762e3b1b65");
+        assert_eq!(h.finalize().to_hex().to_string(), "1078aa2103641542458acf9a1928da918af6505c8cb3a3a1f7bbf7320bbe3c30");
         // Wire form, size and id of one tx.
         let tx = vector_tx(Action::Transfer { to: "x.boo".into(), amount: 5 });
         assert_eq!(hex::encode(crypto::hash(&tx.to_bytes())), "084ce40c9d406468f7373b0aced2b285ff77d353de986752050877e1953501e0");
@@ -2285,7 +2426,7 @@ pub(crate) mod tests {
         for action in v1_vector_actions() {
             h.update(&vector_tx(action).signing_bytes());
         }
-        assert_eq!(h.finalize().to_hex().to_string(), "fa975d440a66418e791d1cb415eb19479e544948ca449897fa7bad2e1d94bde0");
+        assert_eq!(h.finalize().to_hex().to_string(), "6979535ae0ead49caa82eba564873762cfc4fb7aad1dc77ec3ae845caf0b5366");
         // Proposal kinds added after that vector froze, each on its own (mirrored in e2e.ts):
         // `UnflagSybil` (tag 14, audit F54), then `CancelUpgrade` (tag 15, audit F50; unit.ts too).
         let unflag = Action::Propose { kind: ProposalKind::UnflagSybil { account: "x.boo".into(), reason: "r".into() }, deposit: 1_000 * DROPS_PER_FANG, title: "t".into(), url: String::new() };
@@ -2308,8 +2449,9 @@ pub(crate) mod tests {
         assert!(ProposalKind::from_bytes(&[16]).unwrap_err().to_string().contains("unknown proposal kind 16"));
         let p: Action = serde_json::from_str(r#"{"type":"propose","kind":{"type":"param_change","key":"max_validators","value":"40"},"deposit":"1000","title":"t"}"#).unwrap();
         assert_eq!(p, Action::Propose { kind: ProposalKind::ParamChange { key: "max_validators".into(), value: 40 }, deposit: 1000, title: "t".into(), url: String::new() });
-        let m: Action = serde_json::from_str(r#"{"type":"multisig_propose","action":{"type":"vote","proposal_id":1,"aye":true,"amount":"5","conviction":2}}"#).unwrap();
-        assert_eq!(m, Action::MultisigPropose { action: Box::new(Action::Vote { proposal_id: 1, aye: true, amount: 5, conviction: 2 }) });
+        let m: Action = serde_json::from_str(&format!(r#"{{"type":"multisig_propose","action":{{"type":"vote","proposal_id":1,"aye":true,"amount":"5","conviction":2,"proposal_digest":"{}"}}}}"#, "d1".repeat(32))).unwrap();
+        assert!(serde_json::from_str::<Action>(r#"{"type":"vote","proposal_id":1,"aye":true,"amount":"5","conviction":2}"#).is_err(), "a vote binds its proposal (gap-7-6)");
+        assert_eq!(m, Action::MultisigPropose { action: Box::new(Action::Vote { proposal_id: 1, aye: true, amount: 5, conviction: 2, proposal_digest: "d1".repeat(32) }) });
         for a in [r#"{"type":"withdraw_unbonded"}"#, r#"{"type":"unlock"}"#, r#"{"type":"propose","kind":{"type":"text"},"deposit":"1","title":"t","url":""}"#] {
             serde_json::from_str::<Action>(a).unwrap();
         }
@@ -2475,9 +2617,14 @@ pub(crate) mod tests {
         assert!(bad(Action::ReportEquivocation { evidence: String::new() }).contains("1–"));
         assert!(bad(Action::BeaconCommit { epoch: 1, commitment: "ab".into() }).contains("32 bytes"));
         // Votes: conviction 0–6.
-        ok(Action::Vote { proposal_id: 0, aye: true, amount: 1, conviction: 6 });
-        assert!(bad(Action::Vote { proposal_id: 0, aye: true, amount: 1, conviction: 7 }).contains("0–6"));
-        assert!(bad(Action::Vote { proposal_id: 0, aye: true, amount: 0, conviction: 1 }).contains("more than 0"));
+        let d = "d0".repeat(32);
+        ok(Action::Vote { proposal_id: 0, aye: true, amount: 1, conviction: 6, proposal_digest: d.clone() });
+        assert!(bad(Action::Vote { proposal_id: 0, aye: true, amount: 1, conviction: 7, proposal_digest: d.clone() }).contains("0–6"));
+        assert!(bad(Action::Vote { proposal_id: 0, aye: true, amount: 0, conviction: 1, proposal_digest: d.clone() }).contains("more than 0"));
+        // gap-7-6: what a vote, an approval and a sealed judgment bind is 32 bytes of lowercase hex.
+        assert!(bad(Action::Vote { proposal_id: 0, aye: true, amount: 1, conviction: 1, proposal_digest: "D0".repeat(32) }).contains("proposal_digest"));
+        assert!(bad(Action::MultisigApprove { id: 0, action_digest: String::new() }).contains("action_digest"));
+        assert!(bad(Action::CommitVotes { seance_id: 0, commitment: d.clone(), pairs_digest: "0".into() }).contains("pairs_digest"));
         // Proposals: the kind's own rules, a deposit, a title, an https link or nothing.
         ok(propose(ProposalKind::ParamChange { key: "quorum_bps".into(), value: 1 }));
         assert!(bad(propose(ProposalKind::ParamChange { key: "nope".into(), value: 1 })).contains("unknown parameter"));
@@ -2497,7 +2644,7 @@ pub(crate) mod tests {
         ok(Action::MultisigPropose { action: Box::new(inner.clone()) });
         let nested = Action::MultisigPropose { action: Box::new(Action::MultisigPropose { action: Box::new(inner.clone()) }) };
         assert!(bad(nested.clone()).contains("can't hold another"));
-        assert!(bad(Action::MultisigPropose { action: Box::new(Action::MultisigApprove { id: 1 }) }).contains("can't hold another"));
+        assert!(bad(Action::MultisigPropose { action: Box::new(Action::MultisigApprove { id: 1, action_digest: "a1".repeat(32) }) }).contains("can't hold another"));
         assert!(bad(Action::MultisigPropose { action: Box::new(Action::Transfer { to: "x".into(), amount: 1 }) }).contains("proposed action"));
         // … nor do they decode nested.
         assert!(Action::from_bytes(&nested.to_bytes()).unwrap_err().to_string().contains("can't contain another"));
@@ -2535,10 +2682,12 @@ pub(crate) mod tests {
         inner["action"]["padding"] = serde_json::json!("x");
         assert!(serde_json::from_value::<Tx>(inner).is_err(), "unknown field inside the (internally tagged) action");
         assert!(serde_json::from_str::<Action>(r#"{"type":"leave_jury","x":1}"#).is_err());
-        let role = |r: &str| serde_json::from_str::<Action>(&format!(r#"{{"type":"add_key","key_id":"ab","label":"l","role":{r}}}"#));
+        let role = |r: &str| serde_json::from_str::<Action>(&format!(r#"{{"type":"add_key","key_id":"ab","label":"l","role":{r},"public_key":"0c","pop":"0d"}}"#));
         assert!(role(r#"{"type":"owner","limit":"1"}"#).is_err(), "and inside the key role");
         assert!(role(r#"{"type":"session","limit":"1","period_blocks":2,"expires_at":3,"x":0}"#).is_err());
-        assert_eq!(role(r#"{"type":"owner"}"#).unwrap(), Action::AddKey { key_id: "ab".into(), label: "l".into(), role: KeyRole::Owner });
+        assert_eq!(role(r#"{"type":"owner"}"#).unwrap(), Action::AddKey { key_id: "ab".into(), label: "l".into(), role: KeyRole::Owner, public_key: "0c".into(), pop: "0d".into() });
+        // gap-7-2: the added key's public key and proof of possession are required.
+        assert!(serde_json::from_str::<Action>(r#"{"type":"add_key","key_id":"ab","label":"l","role":{"type":"owner"}}"#).is_err(), "an AddKey without the key's consent");
         let session = role(r#"{"type":"session","limit":"1","period_blocks":2,"expires_at":3}"#).unwrap();
         assert_eq!(serde_json::to_value(&session).unwrap()["role"], serde_json::json!({ "type": "session", "limit": "1", "period_blocks": 2, "expires_at": 3 }));
         let mut missing = ok;
@@ -2573,7 +2722,7 @@ pub(crate) mod tests {
         assert_eq!((bad_kind[tag_at], bad_kind[tag_at + 1]), (39, 13));
         bad_kind[tag_at + 1] = 16;
         assert!(err(&bad_kind).contains("unknown proposal kind 16"));
-        let mut bad_aye = vector_tx(Action::Vote { proposal_id: 1, aye: true, amount: 1, conviction: 1 }).to_bytes();
+        let mut bad_aye = vector_tx(Action::Vote { proposal_id: 1, aye: true, amount: 1, conviction: 1, proposal_digest: "d1".repeat(32) }).to_bytes();
         bad_aye[tag_at + 1 + 8] = 2;
         assert!(err(&bad_aye).contains("`aye` must be 0 or 1"));
         let mut bad_bool = good.clone();
@@ -2588,9 +2737,10 @@ pub(crate) mod tests {
         assert!(err(&long_memo.to_bytes()).contains("`memo` too long"));
         let spam = vector_tx(Action::RevealVotes { seance_id: 1, votes: "a".into(), spam: vec![1; crate::poc::MAX_SEANCE_CLAIMS + 1], salt: "s".into() });
         assert!(err(&spam.to_bytes()).contains("too many entries"));
-        let role = vector_tx(Action::AddKey { key_id: "ab".repeat(32), label: "l".into(), role: KeyRole::Owner });
+        let role = vector_tx(Action::AddKey { key_id: "ab".repeat(32), label: "l".into(), role: KeyRole::Owner, public_key: "0c".into(), pop: "0d".into() });
         let mut bad_role = role.to_bytes();
-        bad_role[role.signing_bytes().len() - 2 - 1 - 1] = 2;
+        // Back from the end of the signing bytes: the memo ("m"), the pop and the public key.
+        bad_role[role.signing_bytes().len() - (2 + 1) - (2 + 2) - (2 + 2) - 1] = 2;
         assert!(err(&bad_role).contains("unknown key role"));
         assert!(Tx::from_bytes(&vec![0u8; MAX_GHOST_TX_BYTES + 1]).unwrap_err().to_string().contains("too large"));
     }
@@ -2687,7 +2837,7 @@ pub(crate) mod tests {
         (0u8..55, strs, nums, any::<bool>(), opt, ids, list, 0u8..16, any::<u8>()).prop_map(|(tag, [a, b, c, d], [w, x, y], ok, familiar_key, spam, list, kind, small)| match tag {
             0 => Action::Transfer { to: a, amount: w },
             1 => Action::RegisterName { name: a },
-            2 => Action::AddKey { key_id: a, label: b, role: if ok { KeyRole::Owner } else { KeyRole::Session { limit: w, period_blocks: x, expires_at: y } } },
+            2 => Action::AddKey { key_id: a, label: b, role: if ok { KeyRole::Owner } else { KeyRole::Session { limit: w, period_blocks: x, expires_at: y } }, public_key: c, pop: d },
             3 => Action::RemoveKey { key_id: a },
             4 => Action::RegisterValidator { consensus_key: a, p2p_addr: b, http_addr: c, bond: w, pop: d },
             5 => Action::ApproveValidator { validator: a },
@@ -2710,7 +2860,7 @@ pub(crate) mod tests {
             22 => Action::RejectClaim { claim_id: w, reason: a },
             23 => Action::JoinJury { bond: w },
             24 => Action::LeaveJury {},
-            25 => Action::CommitVotes { seance_id: w, commitment: a },
+            25 => Action::CommitVotes { seance_id: w, commitment: a, pairs_digest: c },
             26 => Action::RevealVotes { seance_id: w, votes: a, spam, salt: b },
             27 => Action::FundPool { amount: w },
             28 => Action::WithdrawVested {},
@@ -2725,11 +2875,11 @@ pub(crate) mod tests {
             37 => Action::BeaconCommit { epoch: w, commitment: a },
             38 => Action::BeaconReveal { epoch: w, secret: a },
             39 => Action::Propose { kind: proposal_kind(kind, [c, d], [x, y]), deposit: w, title: a, url: b },
-            40 => Action::Vote { proposal_id: w, aye: ok, amount: x, conviction: small },
+            40 => Action::Vote { proposal_id: w, aye: ok, amount: x, conviction: small, proposal_digest: a },
             41 => Action::Unlock {},
             42 => Action::MultisigCreate { owners: list, threshold: small },
-            43 => Action::MultisigPropose { action: Box::new(if ok { Action::Transfer { to: a, amount: w } } else { Action::Vote { proposal_id: w, aye: small % 2 == 0, amount: x, conviction: small } }) },
-            44 => Action::MultisigApprove { id: w },
+            43 => Action::MultisigPropose { action: Box::new(if ok { Action::Transfer { to: a, amount: w } } else { Action::Vote { proposal_id: w, aye: small % 2 == 0, amount: x, conviction: small, proposal_digest: b } }) },
+            44 => Action::MultisigApprove { id: w, action_digest: a },
             45 => Action::RenewName { name: a, years: small },
             46 => Action::TransferName { name: a, to: b },
             47 => Action::ReleaseName { name: a },

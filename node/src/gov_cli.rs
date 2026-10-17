@@ -6,7 +6,7 @@ use crate::contrib_cli::{Rpc, Signer};
 use crate::crypto::{self, Keys};
 use crate::governance::build_distribution;
 use crate::types::*;
-use crate::validator_cli::{get, load_seed, own_address, parse_fang, rt, send_memo, wallet_keys};
+use crate::validator_cli::{get, load_seed, own_address, parse_fang, rt, wallet_keys};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
@@ -19,11 +19,9 @@ fn keys_of(s: &Signer, dir: &Path) -> Result<Keys> {
     }
 }
 
+/// An address the node resolves a name to, unproven (printed): only where an address is needed.
 async fn resolve(rpc: &str, who: &str) -> Result<String> {
-    if crypto::is_address(who) {
-        return Ok(who.to_string());
-    }
-    get(rpc, &format!("/account/{who}")).await?["account"]["address"].as_str().map(String::from).ok_or_else(|| anyhow!("can't resolve {who}"))
+    crate::cli_net::resolve_unproven(rpc, who).await
 }
 
 /// The account the signer acts for: `--from`, or the key's own address.
@@ -37,11 +35,19 @@ async fn acting_for(s: &Signer, keys: &Keys) -> Result<String> {
 /// Signs and submits `action` for the chain `s` pins, waits for it, and prints the summary and
 /// explorer link.
 fn submit(dir: &Path, s: &Signer, action: Action) -> Result<Value> {
+    submit_at(dir, s, |_, _| Ok(action))
+}
+
+/// [`submit`] for an action that carries an absolute height: `make(height, blocks_per_day)`
+/// builds it from the status read that sets `valid_until`, with the day length from the pinned
+/// genesis, never the node's word (audit gap-7-3).
+fn submit_at(dir: &Path, s: &Signer, make: impl FnOnce(u64, u64) -> Result<Action>) -> Result<Value> {
     let keys = keys_of(s, dir)?;
     let tx = rt()?.block_on(async {
         let remote = s.connect(dir).await?;
         let from = s.acting_for(&remote, &keys).await?;
-        send_memo(&remote, &keys, &from, action, String::new()).await
+        let day = remote.blocks_per_day().await?;
+        crate::validator_cli::send_memo_with(&remote, &keys, &from, |height| make(height, day), String::new()).await
     })?;
     println!("✓ {}", tx["summary"].as_str().unwrap_or_default());
     println!("  {}/#/tx/{}", s.rpc.trim_end_matches('/'), tx["id"].as_str().unwrap_or_default());
@@ -125,15 +131,20 @@ pub enum GovCmd {
 pub struct Meta {
     /// One line: what and why (at most 96 bytes)
     #[arg(long)]
-    title: String,
+    pub(crate) title: String,
     /// https:// link to the full text and discussion
     #[arg(long, default_value = "")]
-    url: String,
-    /// Deposit in FANG (default: the chain's minimum)
+    pub(crate) url: String,
+    /// Deposit in FANG (default: the chain's minimum as the node reports it, at most
+    /// --max-deposit). All of it burns if the vote misses quorum
     #[arg(long)]
-    deposit: Option<String>,
+    pub(crate) deposit: Option<String>,
+    /// The most a node-reported default deposit may be, in FANG (audit gap-7-5: a node can report
+    /// any deposit); pass --deposit to bond an amount you checked
+    #[arg(long, default_value = "1000")]
+    pub(crate) max_deposit: String,
     #[command(flatten)]
-    signer: Signer,
+    pub(crate) signer: Signer,
 }
 
 #[derive(Subcommand)]
@@ -335,7 +346,17 @@ pub fn gov(cmd: GovCmd, dir: &Path) -> Result<()> {
                 "nay" | "no" | "n" => false,
                 _ => bail!("vote aye or nay"),
             };
-            submit(dir, &signer, Action::Vote { proposal_id: id, aye, amount: parse_fang(&amount)?, conviction }).map(|_| ())
+            let amount = parse_fang(&amount)?;
+            // The vote binds the proposal shown here (its kind, title and link), decoded from the
+            // node's answer rather than its summary: a node that misreports it makes the vote
+            // fail, not land on something else (audit gap-7-6).
+            let p = rt()?.block_on(get(&signer.rpc, &format!("/proposal/{id}")))?;
+            let kind: ProposalKind = serde_json::from_value(p["kind"].clone()).context("the node's proposal kind doesn't parse")?;
+            let (title, url) = (text(&p["title"]).to_string(), text(&p["url"]).to_string());
+            println!("Voting {} with {} at conviction {conviction} on proposal #{id}: “{title}”{}", if aye { "aye" } else { "nay" }, fmt_fang(amount), if url.is_empty() { String::new() } else { format!(" ({url})") });
+            println!("   it does: {}", serde_json::to_string(&kind)?);
+            let proposal_digest = proposal_digest(&kind, &title, &url);
+            submit(dir, &signer, Action::Vote { proposal_id: id, aye, amount, conviction, proposal_digest }).map(|_| ())
         }
         GovCmd::Unlock { signer } => submit(dir, &signer, Action::Unlock {}).map(|_| ()),
         GovCmd::Tree { entries, id, out, rpc } => {
@@ -388,32 +409,34 @@ pub fn gov(cmd: GovCmd, dir: &Path) -> Result<()> {
 
 fn propose(dir: &Path, kind: KindCmd) -> Result<()> {
     let rt = rt()?;
+    // A distribution's claim deadline is a height: it's set from the status the tx is signed
+    // against (`days` days of the genesis's blocks), not a separate read (audit gap-7-3).
+    let mut claim_days = None;
     let (kind, meta) = match kind {
         KindCmd::Text { meta } => (ProposalKind::Text {}, meta),
         KindCmd::Param { param, value, meta } => {
             let value = value.parse::<u64>().or_else(|_| parse_fang(&value).map_err(|_| anyhow!("value must be a whole number, or FANG for amounts (e.g. 1000.5)")))?;
             (ProposalKind::ParamChange { key: param, value }, meta)
         }
-        KindCmd::Spend { to, amount, meta } => (ProposalKind::TreasurySpend { to: rt.block_on(resolve(&meta.signer.rpc, &to))?, amount: parse_fang(&amount)? }, meta),
+        KindCmd::Spend { to, amount, meta } => (ProposalKind::TreasurySpend { to: crate::cli_net::account_ref(&to)?, amount: parse_fang(&amount)? }, meta),
         KindCmd::Distribution { tree, days, meta } => {
             let t = read_tree(&tree)?;
-            let status = rt.block_on(get(&meta.signer.rpc, "/status"))?;
             let id = t["distribution_id"].as_u64().unwrap_or_default();
             if rt.block_on(get(&meta.signer.rpc, &format!("/distribution/{id}"))).is_ok() {
                 let next = rt.block_on(get(&meta.signer.rpc, "/proposals?limit=0"))?["next_distribution_id"].as_u64().unwrap_or_default();
                 bail!("{} was built for distribution #{id}, which already exists: rebuild it with `blockula gov tree --id {next}`", tree.display());
             }
-            let block_ms = status["block_time_ms"].as_u64().unwrap_or(1000).max(1);
-            let claim_until = status["height"].as_u64().unwrap_or(0) + days * 86_400_000 / block_ms;
             let total: u64 = text(&t["total"]).parse().context("bad total in the tree")?;
-            (ProposalKind::Distribution { distribution_id: id, merkle_root: text(&t["merkle_root"]).to_string(), total, claim_until }, meta)
+            claim_days = Some(days);
+            // claim_until is filled in from the signing status below (1 is a placeholder for check()).
+            (ProposalKind::Distribution { distribution_id: id, merkle_root: text(&t["merkle_root"]).to_string(), total, claim_until: 1 }, meta)
         }
         KindCmd::SetRepo { repo, weight, meta } => (ProposalKind::SetRepo { repo, weight }, meta),
-        KindCmd::GrantSoul { to, soul, reason, meta } => (ProposalKind::GrantSoul { to: rt.block_on(resolve(&meta.signer.rpc, &to))?, amount: parse_soul(&soul)?, reason }, meta),
-        KindCmd::FlagSybil { account, reason, meta } => (ProposalKind::FlagSybil { account: rt.block_on(resolve(&meta.signer.rpc, &account))?, reason }, meta),
-        KindCmd::UnflagSybil { account, reason, meta } => (ProposalKind::UnflagSybil { account: rt.block_on(resolve(&meta.signer.rpc, &account))?, reason }, meta),
+        KindCmd::GrantSoul { to, soul, reason, meta } => (ProposalKind::GrantSoul { to: crate::cli_net::account_ref(&to)?, amount: parse_soul(&soul)?, reason }, meta),
+        KindCmd::FlagSybil { account, reason, meta } => (ProposalKind::FlagSybil { account: crate::cli_net::account_ref(&account)?, reason }, meta),
+        KindCmd::UnflagSybil { account, reason, meta } => (ProposalKind::UnflagSybil { account: crate::cli_net::account_ref(&account)?, reason }, meta),
         KindCmd::RejectClaim { claim, reason, meta } => (ProposalKind::RejectClaim { claim_id: claim, reason }, meta),
-        KindCmd::Clawback { account, reason, meta } => (ProposalKind::Clawback { account: rt.block_on(resolve(&meta.signer.rpc, &account))?, reason }, meta),
+        KindCmd::Clawback { account, reason, meta } => (ProposalKind::Clawback { account: crate::cli_net::account_ref(&account)?, reason }, meta),
         KindCmd::UnlinkGithub { handle, meta } => (ProposalKind::UnlinkGithub { handle }, meta),
         KindCmd::RefundHunt { hunt, meta } => (ProposalKind::RefundHunt { hunt_id: hunt }, meta),
         KindCmd::Upgrade { version, activation_height, meta } => (ProposalKind::ScheduleUpgrade { version, activation_height }, meta),
@@ -428,12 +451,30 @@ fn propose(dir: &Path, kind: KindCmd) -> Result<()> {
         KindCmd::Deactivate { feature, meta } => (ProposalKind::DeactivateFeature { feature }, meta),
     };
     kind.check()?;
+    // The default deposit is the node's word, and all of it burns if the vote misses quorum: it's
+    // shown, and refused above --max-deposit (audit gap-7-5).
     let deposit = match &meta.deposit {
         Some(d) => parse_fang(d)?,
-        None => text(&rt.block_on(get(&meta.signer.rpc, "/proposals?limit=0"))?["params"]["proposal_deposit"]).parse().context("no proposal_deposit from the node")?,
+        None => {
+            let d: u64 = text(&rt.block_on(get(&meta.signer.rpc, "/proposals?limit=0"))?["params"]["proposal_deposit"]).parse().context("no proposal_deposit from the node")?;
+            let max = parse_fang(&meta.max_deposit)?;
+            if d > max {
+                bail!("{} reports a proposal deposit of {}, more than --max-deposit ({}): a node can report any deposit, and all of it burns if the vote misses quorum. Check it on another node, then pass --deposit", meta.signer.rpc, fmt_fang(d), fmt_fang(max));
+            }
+            println!("Bonding {} (the chain's proposal deposit, as {} reports it): refunded once the vote reaches quorum, burned if it doesn't.", fmt_fang(d), meta.signer.rpc);
+            d
+        }
     };
     drop(rt);
-    submit(dir, &meta.signer, Action::Propose { kind, deposit, title: meta.title, url: meta.url }).map(|_| ())
+    let (title, url) = (meta.title, meta.url);
+    submit_at(dir, &meta.signer, |height, day| {
+        let mut kind = kind;
+        if let (Some(days), ProposalKind::Distribution { claim_until, .. }) = (claim_days, &mut kind) {
+            *claim_until = height.saturating_add(days.saturating_mul(day));
+        }
+        Ok(Action::Propose { kind, deposit, title, url })
+    })
+    .map(|_| ())
 }
 
 // --------------------------------------------------------------------------------- multisig
@@ -481,7 +522,19 @@ pub fn multisig(cmd: MultisigCmd, dir: &Path) -> Result<()> {
             let action: Action = serde_json::from_str(&action).context("the action must be tx action JSON, e.g. {\"type\":\"transfer\",\"to\":\"bob.boo\",\"amount\":\"5000000000\"}")?;
             submit(dir, &signer, Action::MultisigPropose { action: Box::new(action) }).map(|_| ())
         }
-        MultisigCmd::Approve { id, signer } => submit(dir, &signer, Action::MultisigApprove { id }).map(|_| ()),
+        MultisigCmd::Approve { id, signer } => {
+            // The approval binds the stored action, printed decoded (not the node's summary of
+            // it): a node that misreports it makes the approval fail (audit gap-7-6).
+            let keys = keys_of(&signer, dir)?;
+            let rt = rt()?;
+            let account = rt.block_on(acting_for(&signer, &keys))?;
+            let m = rt.block_on(get(&signer.rpc, &format!("/multisig/{account}")))?;
+            let p = m["pending"].as_array().into_iter().flatten().find(|p| p["id"] == id).ok_or_else(|| anyhow!("{account} has no open multisig action #{id}"))?;
+            let action: Action = serde_json::from_value(p["action"].clone()).context("the node's multisig action doesn't parse")?;
+            println!("Approving multisig action #{id} of {account}, which does exactly this:\n{}", serde_json::to_string_pretty(&action)?);
+            drop(rt);
+            submit(dir, &signer, Action::MultisigApprove { id, action_digest: action_digest(&action) }).map(|_| ())
+        }
         MultisigCmd::Show { account, rpc } => {
             let m = rt()?.block_on(get(&rpc.rpc, &format!("/multisig/{account}")))?;
             let owners = m["owners"].as_array().cloned().unwrap_or_default();
@@ -492,6 +545,8 @@ pub fn multisig(cmd: MultisigCmd, dir: &Path) -> Result<()> {
             for p in m["pending"].as_array().cloned().unwrap_or_default() {
                 let expired = if p["expired"] == true { " (expired)" } else { "" };
                 println!("   #{} {} · {}/{} approvals · expires at block {}{expired}", p["id"], text(&p["summary"]), p["valid_approvals"], m["threshold"], p["expires_at"]);
+                // What an approval signs is the action itself: show it, not just the node's summary.
+                println!("      action: {}", serde_json::to_string(&p["action"])?);
             }
             Ok(())
         }

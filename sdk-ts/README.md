@@ -7,16 +7,22 @@ npm install @blockula/sdk
 ```
 
 ```ts
-import { Client, Wallet } from "@blockula/sdk";
+import { Client, Wallet, encodeKeyGrant } from "@blockula/sdk";
 
 const wallet = Wallet.generate(new Client("http://localhost:7070"));
 await wallet.faucet();                        // test chains: 100 FANG
 await wallet.registerName("vlad");            // vlad.boo
 await wallet.send("alice.boo", "1.5", { memo: "trick or treat" });
 
-// Let an agent spend up to 10 FANG/day from this account (enforced on-chain)
-await wallet.addSessionKey(agentKeyId, "claude", { limit: "10", periodBlocks: 86_400, expiresInBlocks: 30 * 86_400 });
+// Let an agent spend up to 10 FANG/day from this account (enforced on-chain). The agent's key
+// consents to joining this account first: its grant code (the MCP's use_account answers with one).
+const agentGrantCode = encodeKeyGrant(await agent.keyGrant(wallet.account));
+await wallet.addSessionKey(agentGrantCode, "claude", { limit: "10", periodBlocks: 86_400, expiresInBlocks: 30 * 86_400 });
 ```
+
+Adding a key needs the key's consent (audit gap-7-2): `AddKey` carries the key's public key and its signature over the chain, the account and its key id, so nobody can put your key on their account (and pad `client.keyAccounts(keyId)`, which pages with `{ after }`). The key's holder makes it with `keyGrant(account)`; `encodeKeyGrant`/`decodeKeyGrant` turn it into a pasteable `bkgrant1.…` code, `verifyKeyGrant` checks one, and `addOwnerKey`/`addSessionKey` take either and refuse a grant made for another account or chain.
+
+Votes, multisig approvals and sealed Séance judgments bind what they approve (audit gap-7-6): `vote(id, aye, amount, conviction, { proposal })` signs `proposalDigest(kind, title, url)` of the proposal you showed, `multisigApprove(id, { action })` signs `actionDigest(action)`, and `sealVotes(…, { pairs })` signs `seancePairsDigest` of the pairs and PRs the juror compared (each read from the client when not given). The chain refuses a digest that doesn't match what's stored, so a node that misreports what's being approved makes it fail instead of landing elsewhere.
 
 In the browser, a passkey unlocks the wallet. There's no seed phrase, and the passkey's (non-quantum-safe) signature is never used on-chain. Its PRF output derives the ML-DSA key:
 
@@ -53,9 +59,9 @@ wallet.validForBlocks = 600;
 
 Addresses are bech32m with the chain's prefix: `boo1…` on mainnet, `tboo1…` on public testnets. `isAddress(s)` accepts any known prefix and `isAddress(s, "tboo")` exactly one; `addressFromPublicKey(pk, prefix)` renders one. A `Client` learns its chain's prefix from `/api/status` (`await client.addressPrefix()`), and wallets using that client sign with it (`wallet.address`, `wallet.account`). Pin it with `new Client(rpc, { prefix: "boo" })` to refuse a node on another network (see "Which chain?" below). Nodes reject addresses of another network's prefix.
 
-- `send("alice.boo", …)` resolves the name first and signs the **address**, so whoever you checked is exactly who gets paid.
+- `send("alice.boo", …)` resolves the name first and signs the **address**, so whoever you checked is exactly who gets paid. Every helper that signs a resolved name (`send`, `awardHunt`, `vouch`, `transferName`, `delegate`, proposal targets, `actAs` …) goes through `client.resolve`. Give the client `witnesses` (below) and each name is a proven, fresh read, so a lying node can't point it elsewhere; without them a name is that one node's answer. `client.resolution(name)` returns the address with `proven` and a plain-English `how`: show both before signing (audit gap-7-1).
 - `wallet.address` uses the chain's prefix once the client knows it. Before the first request it shows the `boo` form, so `await client.addressPrefix()` first if you display it on a testnet.
-- Node errors throw `ApiError` (`.status`: 429 means rate limited). A transaction that fails at execution throws `TxFailedError` from `waitForTx`.
+- Node errors throw `ApiError` (`.status`: 429 means rate limited). A transaction the node reports as failed throws `TxFailedError` from `waitForTx` (`dropped` says whether it ran: see "Timeouts and pending transactions").
 - Pass `rpId` to `createPasskeyWallet`/`unlockPasskeyWallet` to pin wallets to your production domain. Passkeys are bound to that hostname for good.
 
 ### Staking, governance and names (protocol v1)
@@ -90,7 +96,9 @@ const client = new Client("https://rpc.example", { chainId: "blockula-1", genesi
 
 A pinned client checks every `/api/status` it reads, including the one each signature is made against, and throws `ChainMismatchError` instead of signing for another chain.
 
-A node can still lie about the state of the right chain. Proven reads check the node's Merkle proof (`/api/proof`) against its state root, ask independent nodes (`witnesses`) for that block's root, and require the proof to be fresh:
+A node can still lie about the state of the right chain. Give a client witnesses and the names it resolves for signatures are proven (`new Client(rpc, { …pins, witnesses: [new Client(rpc2, pins), …], requireProvenNames: true })`; `requireProvenNames` refuses any name it can't prove). `Wallet.propose`'s default deposit must be the same on the node and every witness, and at most `maxDeposit` (default `DEFAULT_MAX_PROPOSAL_DEPOSIT`, 1,000 FANG): a node can report any deposit, and all of it burns if the vote misses quorum (audit gap-7-5). Session-key and hunt expiries count from the same status read as `valid_until`, so a node lying about the height can stretch them by at most `max_tx_validity_blocks` (audit gap-7-3).
+
+Proven reads check the node's Merkle proof (`/api/proof`) against its state root, ask independent nodes (`witnesses`) for that block's root, and require the proof to be fresh:
 
 ```ts
 const others = [new Client("https://rpc-2.example"), new Client("https://rpc-3.example")];
@@ -105,10 +113,11 @@ const name = await client.provenName("vlad.boo", { witnesses: others });  // { o
 
 ### Timeouts and pending transactions
 
-Every request has a timeout (`new Client(rpc, { timeoutMs })`, default 15 s): a node that never answers fails with `RequestTimeoutError` instead of hanging. `submit` (and every helper that sends) tells you what a failure means:
+Every request has a timeout (`new Client(rpc, { timeoutMs })`, default 15 s, at most `MAX_TIMEOUT_MS` = 2^31 − 1 ms, since a longer timer fires at once): a node that never answers fails with `RequestTimeoutError` instead of hanging. `submit` (and every helper that sends) tells you what a failure means:
 
 - `ApiError`: the node refused the tx. It wasn't admitted, so nothing was spent.
-- `TxFailedError`: it executed and failed (its fee was charged).
+- `TxFailedError` with `dropped` false: it executed in a block and failed there (its fee was charged). It can't execute again.
+- `TxFailedError` with `dropped` true: this node dropped it from its mempool without running it (evicted by a higher tip, replaced, not included, or an earlier tx from the account was dropped). Nothing was charged, but another node may still hold it and include it until its `valid_until`: check `client.tx(id)` before sending again, or the payment can go out twice.
 - `TxPendingError`: it was admitted but isn't final yet, and it can still execute until its `valid_until`. Check `client.tx(err.id)` before sending again, or the payment can go out twice.
 - `RequestTimeoutError` or a network error while submitting: unknown, the tx may have arrived. Same advice.
 

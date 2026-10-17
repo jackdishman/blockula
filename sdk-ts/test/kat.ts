@@ -12,7 +12,7 @@ import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex, hexToBytes, utf8ToBytes } from "@noble/hashes/utils.js";
-import { Client, POP_CONTEXT, Wallet, popMessage, signingBytes, txBytes, type Tx, type UnsignedTx } from "../src/index.js";
+import { Client, KEY_POP_CONTEXT, POP_CONTEXT, Wallet, keyPopMessage, popMessage, signingBytes, txBytes, verifyKeyGrant, type Tx, type UnsignedTx } from "../src/index.js";
 
 /** Vector files are plain JSON; fields are read by their upstream names. */
 type Json = any;
@@ -159,7 +159,7 @@ const contextFor = (ns: Uint8Array) => (ns.length <= 255 ? ns : blake3(ns));
 const unsigned = ({ public_key: _pk, signature: _sig, ...tx }: Tx): UnsignedTx => tx;
 
 /** The SDK's own signatures over its own and the node's messages (`ts-signed.json`). */
-function tsSigned(): Json {
+async function tsSigned(): Promise<Json> {
   const out: Json[] = [];
   const push = (label: string, seed: string, ns: Uint8Array, msg: Uint8Array, sig: Uint8Array, extra: Json = {}) =>
     out.push({ label, seed, namespace: bytesToHex(ns), ctx: bytesToHex(contextFor(ns)), msg: bytesToHex(msg), sig: bytesToHex(sig), ...extra });
@@ -184,10 +184,16 @@ function tsSigned(): Json {
   const pop = { chain_id: CHAIN, owner: w.address, p2p_addr: "198.51.100.4:7071", http_addr: "https://sdk-validator.example" };
   const popMsg = popMessage(pop.chain_id, pop.owner, pop.p2p_addr, pop.http_addr);
   push("validator-pop", v, POP_CONTEXT, popMsg, ml_dsa65.sign(popMsg, keys(hx(v)).secretKey, { context: POP_CONTEXT }), { sig_det: det(v, POP_CONTEXT, popMsg), pop });
+  // A key's consent to being added to the owner's account (AddKey's pop), made by `Wallet.keyGrant`.
+  const added = "ff".repeat(32);
+  const grant = await Wallet.fromSeed(added).keyGrant(w.address, { chainId: CHAIN, genesisHash: GENESIS });
+  const key_pop = { chain_id: CHAIN, genesis_hash: GENESIS, account: grant.account, key_id: grant.key_id };
+  const keyPopMsg = keyPopMessage(CHAIN, GENESIS, grant.account, grant.key_id);
+  push("key-pop", added, KEY_POP_CONTEXT, keyPopMsg, hx(grant.pop), { sig_det: det(added, KEY_POP_CONTEXT, keyPopMsg), key_pop });
   // The node's vote, handoff and edge-case messages, signed hedged; all four validators sign
   // the finalize vote so the Rust side can assemble a certificate from SDK signatures.
   const validators = ["0b", "0c", "0d", "0e"].map((b) => b.repeat(32));
-  for (const c of rust.cases.filter((c: Json) => !c.tx && !c.pop)) {
+  for (const c of rust.cases.filter((c: Json) => !c.tx && !c.pop && !c.key_pop)) {
     const signers = c.label === "consensus/finalize" ? validators
       : c.label === "consensus/notarize" ? [validators[1]]
       : c.label === "consensus/nullify" ? [validators[2]]
@@ -206,7 +212,7 @@ function tsSigned(): Json {
 }
 
 if (WRITE) {
-  writeFileSync(testdata("cross/ts-signed.json"), JSON.stringify(tsSigned(), null, 2) + "\n");
+  writeFileSync(testdata("cross/ts-signed.json"), JSON.stringify(await tsSigned(), null, 2) + "\n");
   console.log("wrote node/testdata/cross/ts-signed.json");
 }
 const ts = load("cross/ts-signed.json");
@@ -226,7 +232,7 @@ group("cross rust-signed", rust.cases, (c) => {
   if (ml_dsa65.verify(sig, msg, publicKey, { context: utf8ToBytes("blockula/other") })) return "verifies under another context";
   if (!eq(ml_dsa65.sign(msg, secretKey, { context: ctx, extraEntropy: false }), sig)) return "deterministic signatures differ between Rust and TS";
   if (c.tx && !eq(hx(c.tx.public_key), publicKey)) return "tx public key";
-}, 11);
+}, 12);
 
 // The SDK-signed file still verifies and reproduces (the node checks it in node/src/kat.rs).
 group("cross ts-signed", ts.cases, (c) => {
@@ -235,7 +241,7 @@ group("cross ts-signed", ts.cases, (c) => {
   if (!eq(contextFor(hx(c.namespace)), ctx)) return "context";
   if (!ml_dsa65.verify(sig, msg, publicKey, { context: ctx })) return "signature";
   if (c.sig_det && !eq(ml_dsa65.sign(msg, secretKey, { context: ctx, extraEntropy: false }), hx(c.sig_det))) return "deterministic signature";
-}, 14);
+}, 15);
 group("cross seed → key id / address (TS-derived)", ts.keys, (k) => {
   if (JSON.stringify(keyJson(k.seed)) !== JSON.stringify(k)) return "derivation changed";
 }, 5);
@@ -248,6 +254,16 @@ group("cross formats", [...rust.cases, ...ts.cases], (c) => {
   if (c.pop) {
     if (bytesToHex(popMessage(c.pop.chain_id, c.pop.owner, c.pop.p2p_addr, c.pop.http_addr)) !== c.msg) return stale(c.label);
     if (bytesToHex(POP_CONTEXT) !== c.namespace) return stale(c.label);
+  }
+  // A key's consent (AddKey's pop): the node's message and context, and the SDK accepts it.
+  if (c.key_pop) {
+    const k = c.key_pop;
+    if (bytesToHex(keyPopMessage(k.chain_id, k.genesis_hash, k.account, k.key_id)) !== c.msg || bytesToHex(KEY_POP_CONTEXT) !== c.namespace) return stale(c.label);
+    if (!verifyKeyGrant({ account: k.account, key_id: k.key_id, public_key: bytesToHex(keys(hx(c.seed)).publicKey), pop: c.sig }, k.chain_id, k.genesis_hash)) return "verifyKeyGrant rejects it";
+  }
+  if (c.tx?.action?.type === "add_key") {
+    const a = c.tx.action;
+    if (!verifyKeyGrant({ account: c.tx.from, key_id: a.key_id, public_key: a.public_key, pop: a.pop }, c.tx.chain_id, c.tx.genesis_hash)) return `${c.label}: verifyKeyGrant rejects the AddKey's pop`;
   }
   if (!c.tx && !c.pop) {
     const r = rust.cases.find((x: Json) => x.label === c.label);

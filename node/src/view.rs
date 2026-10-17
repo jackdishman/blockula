@@ -122,6 +122,9 @@ pub struct MempoolView {
     /// ([`MempoolView::registrations`]).
     names: imbl::OrdSet<(String, u64)>,
     failed: imbl::HashMap<String, (String, u64)>,
+    /// The remembered failures that ran in a block (their fee was charged); the rest were dropped
+    /// from the mempool unrun and may still execute elsewhere until their `valid_until`.
+    ran: imbl::HashSet<String>,
     next: u64,
 }
 
@@ -163,6 +166,11 @@ impl MempoolView {
         self.failed.get(id)
     }
 
+    /// Whether a remembered failure ran in a block (and was charged), not just dropped unrun.
+    pub fn failure_ran(&self, id: &str) -> bool {
+        self.ran.contains(id)
+    }
+
     /// Files a pending tx; `name`: the name it asks to register (normalized), if any.
     pub(crate) fn add(&mut self, id: String, tx: &Tx, added_at: u64, name: Option<String>) {
         if self.ids.contains_key(&id) {
@@ -192,12 +200,18 @@ impl MempoolView {
         }
     }
 
-    pub(crate) fn fail(&mut self, id: String, reason: String, height: u64) {
+    pub(crate) fn fail(&mut self, id: String, reason: String, height: u64, ran: bool) {
+        if ran {
+            self.ran.insert(id.clone());
+        } else {
+            self.ran.remove(&id);
+        }
         self.failed.insert(id, (reason, height));
     }
 
     pub(crate) fn unfail(&mut self, id: &str) {
         self.failed.remove(id);
+        self.ran.remove(id);
     }
 
     pub(crate) fn has_failure(&self, id: &str) -> bool {
@@ -448,9 +462,14 @@ impl ReadView {
     }
 
     /// Accounts that hold the key `key_id` (hex), from the key index.
-    pub fn accounts_with_key(&self, key_id: &str, limit: usize) -> Vec<String> {
+    /// The accounts after `after` (a page's last) in address order, or from the first.
+    pub fn accounts_with_key_after(&self, key_id: &str, after: Option<&str>, limit: usize) -> Vec<String> {
         let Ok(id) = hex::decode(key_id) else { return vec![] };
-        self.snap.index(ix::KEY, &id, false, limit).unwrap_or_default().into_iter().filter_map(|r| String::from_utf8(r).ok()).collect()
+        let rows = match after {
+            Some(a) => self.snap.index_after(ix::KEY, &id, a.as_bytes(), limit),
+            None => self.snap.index(ix::KEY, &id, false, limit),
+        };
+        rows.unwrap_or_default().into_iter().filter_map(|r| String::from_utf8(r).ok()).collect()
     }
 
     /// Ids (u64 keys) under an index, e.g. the Hunts an account created.

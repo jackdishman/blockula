@@ -91,6 +91,8 @@ export async function createWallet(page: Page, opts: { kit?: (page: Page) => Pro
 /** Make a recovery kit from its intro, store nothing, answer the two confirmation words. */
 export async function makeKit(page: Page) {
   await page.getByRole("button", { name: "Make my recovery kit" }).click();
+  // The kit signs its grant (its consent to the account) first, so the words appear a moment later.
+  await expect(page.getByTestId("kit-words")).toBeVisible();
   const words = (await page.getByTestId("kit-words").locator(".kit-w").allTextContents()).map((w) => w.trim());
   const keyId = ((await page.getByTestId("kit-key-id").textContent()) ?? "").trim();
   expect(words).toHaveLength(24);

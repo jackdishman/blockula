@@ -17,7 +17,11 @@
 //!   answer for the node.
 //!
 //! Every status a tx is built from is checked again, so a node can't switch chains between reads.
-//! Names (`alice.boo`, `--from`) are still resolved by the node: the CLI prints what it resolved.
+//!
+//! Names (audit gap-7-1): where the chain resolves a name itself (transfers, hunt awards, vouches,
+//! Soul grants, flags, clawbacks, name offers, proposal targets) the CLI signs the name
+//! ([`account_ref`]), so a lying node can't redirect it. Where an address is needed (`--from`),
+//! the node resolves it, unproven, and the CLI prints the address it got.
 
 use crate::chain::MAINNET_CHAIN_ID;
 use crate::crypto::Keys;
@@ -324,20 +328,69 @@ impl Remote {
         Ok(status)
     }
 
+    /// Blocks per day on this chain, from its genesis: the genesis the node serves must hash to
+    /// the pinned genesis hash, so the node can't stretch a "days" figure by misreporting its block
+    /// time (audit gap-7-3).
+    pub async fn blocks_per_day(&self) -> Result<u64> {
+        let g: crate::chain::Genesis = serde_json::from_value(get(&self.rpc, "/genesis").await?).context("the node's genesis doesn't parse")?;
+        let hash = hex::encode(crate::consensus::genesis_block(&g).digest_bytes());
+        ensure!(hash == self.genesis_hash, "{} serves a genesis that hashes to {hash}, not the pinned {}: refusing its block time", self.rpc, self.genesis_hash);
+        Ok(crate::params::blocks_per_day(g.block_time_ms))
+    }
+
     /// `keys`' own account on this chain.
     pub fn address(&self, keys: &Keys) -> String {
         keys.address_with(&self.prefix)
     }
 
-    /// An account by address, or a name resolved by this node (printed, since the node could lie).
+    /// An account by address, or a name resolved by this node, unproven (printed, since the node
+    /// could lie). Only for fields that need an address; see [`account_ref`].
     pub async fn resolve(&self, who: &str) -> Result<String> {
-        if crate::crypto::is_address(who) {
-            return Ok(who.to_string());
-        }
-        let addr = get(&self.rpc, &format!("/account/{who}")).await?["account"]["address"].as_str().map(String::from).ok_or_else(|| anyhow!("can't resolve {who}"))?;
-        ensure!(crate::crypto::is_address(&addr), "{} resolved {who} to {addr:?}, which isn't an address", self.rpc);
-        eprintln!("   {who} → {addr} (as {} resolves it)", self.rpc);
-        Ok(addr)
+        resolve_unproven(&self.rpc, who).await
+    }
+}
+
+/// An account by address, or a name as `rpc` resolves it: unproven, so the address is printed for
+/// the user to check (a node can point a name anywhere). Only where the chain needs an address.
+pub async fn resolve_unproven(rpc: &str, who: &str) -> Result<String> {
+    if crate::crypto::is_address(who) {
+        return Ok(who.to_string());
+    }
+    let addr = get(rpc, &format!("/account/{who}")).await?["account"]["address"].as_str().map(String::from).ok_or_else(|| anyhow!("can't resolve {who}"))?;
+    ensure!(crate::crypto::is_address(&addr), "{rpc} resolved {who} to {addr:?}, which isn't an address");
+    eprintln!("   {who} → {addr} (as {rpc} resolves it, unproven: check the address)");
+    Ok(addr)
+}
+
+/// A recipient as signed, for fields the chain resolves itself (transfers, hunt awards, vouches,
+/// Soul grants, flags, clawbacks, name offers, proposal targets): an address as given, or a
+/// `.boo` name signed as the name, which the chain resolves when the tx runs. No node is asked,
+/// so none can redirect it (audit gap-7-1).
+pub fn account_ref(who: &str) -> Result<String> {
+    let w = who.trim();
+    if crate::crypto::is_address(w) {
+        return Ok(w.to_string());
+    }
+    ensure!(!w.starts_with("boo1") && !w.starts_with("tboo1"), "{w} isn't a valid address (check for typos; addresses are lowercase)");
+    let n = crate::types::normalize_name(w).with_context(|| format!("{w} is neither an address nor a .boo name"))?;
+    let name = format!("{n}{}", crate::types::NAME_SUFFIX);
+    eprintln!("   {name}: signed as the name, so the chain resolves it when the tx runs (no node is asked)");
+    Ok(name)
+}
+
+#[cfg(test)]
+mod account_refs {
+    #[test]
+    fn names_are_signed_as_names_and_addresses_as_given() {
+        let a = crate::crypto::Keys::from_seed([1; 32]).address();
+        assert_eq!(super::account_ref(&a).unwrap(), a);
+        assert_eq!(super::account_ref(" Alice.boo ").unwrap(), "alice.boo");
+        assert_eq!(super::account_ref("alice").unwrap(), "alice.boo");
+        assert!(super::account_ref("boo1notanaddress").is_err());
+        assert!(super::account_ref("not a name!").is_err());
+        // What the chain accepts in a resolved field.
+        let t = crate::types::Action::Transfer { to: super::account_ref("alice").unwrap(), amount: 1 };
+        assert!(crate::types::Tx { chain_id: "c".into(), genesis_hash: "00".repeat(32), from: a, nonce: 0, fee: 1, tip: 0, valid_until: 1, action: t, memo: String::new(), public_key: "00".repeat(crate::crypto::PUBLIC_KEY_LEN), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) }.check_format().is_ok());
     }
 }
 
@@ -561,6 +614,146 @@ mod tests {
         assert_eq!(chain.lock().state.account(&bob).balance, 2 * DROPS);
         drop(rt);
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A node in front of `honest` that rewrites every GET's JSON answer with `f(path, answer)` and
+    /// keeps the bodies of the txs posted through it.
+    async fn liar(honest: String, f: impl Fn(&str, Value) -> Value + Clone + Send + Sync + 'static) -> (String, std::sync::Arc<parking_lot::Mutex<Vec<Value>>>) {
+        let posted = std::sync::Arc::new(parking_lot::Mutex::new(vec![]));
+        let kept = posted.clone();
+        let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+            let (h, f, kept) = (honest.clone(), f.clone(), kept.clone());
+            async move {
+                let (parts, body) = req.into_parts();
+                let body = axum::body::to_bytes(body, 1 << 24).await.unwrap();
+                if parts.method == axum::http::Method::POST {
+                    kept.lock().push(serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null));
+                }
+                let res = reqwest::Client::new().request(parts.method.clone(), format!("{h}{}", parts.uri)).header("content-type", "application/json").body(body).send().await.unwrap();
+                let status = res.status();
+                let text = res.text().await.unwrap();
+                let text = match (parts.method == axum::http::Method::GET, serde_json::from_str::<Value>(&text)) {
+                    (true, Ok(v)) => f(parts.uri.path(), v).to_string(),
+                    _ => text,
+                };
+                (status, text)
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, posted)
+    }
+
+    /// Audit gap-7-1, gap-7-3, gap-7-5 through the CLI, against a real node behind a lying one: a
+    /// name is signed as the name (no node resolves it); a hunt's expiry counts the pinned
+    /// genesis's block time from the status the tx is signed against, whatever the node says its
+    /// block time or a lone status read's height is; a node reporting a huge proposal deposit is
+    /// refused unless the deposit is given.
+    #[test]
+    fn the_cli_doesnt_take_the_nodes_word_for_names_expiries_or_deposits() {
+        use crate::validator_cli::{wallet, WalletCmd};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let root = std::env::temp_dir().join(format!("blockula-clilie-{}-{}", crate::chain::now_ms(), std::process::id()));
+        let homes = crate::chain::Chain::summon(&root, &crate::chain::SummonOpts::new("clilie", 1)).unwrap();
+        let chain = Arc::new(parking_lot::Mutex::new(crate::chain::Chain::open(&homes[0]).unwrap()));
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let honest = rt.block_on(async {
+            let node = crate::api::Node::new(chain.clone(), None, vec![], Default::default());
+            let app = crate::api::router(node).into_make_service_with_connect_info::<std::net::SocketAddr>();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            url
+        });
+        let producer = chain.clone();
+        rt.spawn(async move {
+            loop {
+                producer.lock().produce_block().ok();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        });
+        let dir = root.join("cli");
+        wallet(WalletCmd::New { rpc: None, prefix: None }, &dir).unwrap();
+        wallet(WalletCmd::Faucet { rpc: honest.clone() }, &dir).unwrap();
+        let me = crate::validator_cli::wallet_keys(&dir).unwrap().address();
+        for _ in 0..100 {
+            if chain.lock().state.account(&me).balance > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // The liar says blocks take 1 ms (so "30 days" would be 2.6 billion blocks), answers every
+        // other status read a year ahead, and points every name at Mallory.
+        let mallory = Keys::from_seed([66; 32]).address();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let alternate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (r, a, m) = (reads.clone(), alternate.clone(), mallory.clone());
+        let (node, posted) = rt.block_on(liar(honest.clone(), move |path, mut v| {
+            if path == "/api/status" {
+                v["block_time_ms"] = 1.into();
+                if a.load(Ordering::SeqCst) && r.fetch_add(1, Ordering::SeqCst) % 2 == 1 {
+                    v["height"] = (v["height"].as_u64().unwrap() + 31_536_000).into();
+                }
+            }
+            if path.starts_with("/api/account/") && !path.contains("boo1") {
+                v["account"]["address"] = m.clone().into();
+            }
+            if path == "/api/proposals" {
+                v["params"]["proposal_deposit"] = (999_000 * DROPS).to_string().into();
+            }
+            v
+        }));
+        let signer = crate::contrib_cli::Signer { key: None, from: None, rpc: node.clone(), pin: ChainPin::default() };
+        // A send to a name: the name is what's signed (here nobody owns it, so the chain refuses it).
+        let err = wallet(WalletCmd::Send { to: "Count.boo".into(), amount: "1".into(), memo: String::new(), rpc: node.clone(), pin: ChainPin::default() }, &dir).unwrap_err().to_string();
+        assert!(err.contains("no one has claimed count.boo"), "{err}");
+        assert!(posted.lock().iter().all(|t| t["action"]["to"] != mallory.as_str()), "the node's answer for the name was never signed");
+        assert_eq!(posted.lock().last().unwrap()["action"]["to"], "count.boo");
+        // A 30-day hunt: 30 × 86,400 blocks (the genesis's 1 s blocks) after the height the tx
+        // was signed against.
+        alternate.store(true, Ordering::SeqCst);
+        let hunt = crate::contrib_cli::HuntCmd::Create { repo: "jackdishman/blockula".into(), issue: 7, amount: "10".into(), title: "t".into(), days: 30, signer: signer.clone() };
+        for _ in 0..2 {
+            let before = posted.lock().len();
+            match crate::contrib_cli::hunt(hunt_again(&hunt), &dir) {
+                Ok(()) => {}
+                // The lone-read year-ahead lie lands on the signing read: its valid_until is refused.
+                Err(e) => assert!(e.to_string().contains("too far ahead") || e.to_string().contains("valid_until"), "{e}"),
+            }
+            let tx = posted.lock()[before..].last().cloned().unwrap();
+            let (expires, valid_until) = (tx["action"]["expires_at"].as_u64().unwrap(), tx["valid_until"].as_u64().unwrap());
+            assert_eq!(expires - (valid_until - 600), 30 * 86_400, "one status read, the genesis's block time: {tx}");
+            // One more read, so the next attempt signs against the other kind of answer.
+            rt.block_on(reqwest::get(format!("{node}/api/status"))).unwrap();
+        }
+        assert!(chain.lock().state.hunts.values().any(|h| h.creator == me), "the honest attempt went through");
+        // gov propose without --deposit: the node's 999,000 FANG is refused before signing.
+        let before = posted.lock().len();
+        let meta = crate::gov_cli::Meta { title: "t".into(), url: String::new(), deposit: None, max_deposit: "1000".into(), signer: signer.clone() };
+        let err = crate::gov_cli::gov(crate::gov_cli::GovCmd::Propose { kind: crate::gov_cli::KindCmd::Text { meta } }, &dir).unwrap_err().to_string();
+        assert!(err.contains("more than --max-deposit"), "{err}");
+        assert_eq!(posted.lock().len(), before, "nothing signed");
+        // A node serving a genesis with another block time can't pass it off: it doesn't hash to the pin.
+        let (forger, _) = rt.block_on(liar(honest.clone(), |path, mut v| {
+            if path == "/api/genesis" {
+                v["block_time_ms"] = 1.into();
+            }
+            v
+        }));
+        let err = rt.block_on(async { Remote::connect_in(&dir, &forger, &ChainPin::default()).await.unwrap().blocks_per_day().await }).unwrap_err().to_string();
+        assert!(err.contains("not the pinned"), "{err}");
+        assert_eq!(rt.block_on(async { Remote::connect_in(&dir, &honest, &ChainPin::default()).await.unwrap().blocks_per_day().await }).unwrap(), 86_400);
+        drop(rt);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    fn hunt_again(h: &crate::contrib_cli::HuntCmd) -> crate::contrib_cli::HuntCmd {
+        match h {
+            crate::contrib_cli::HuntCmd::Create { repo, issue, amount, title, days, signer } => crate::contrib_cli::HuntCmd::Create { repo: repo.clone(), issue: *issue, amount: amount.clone(), title: title.clone(), days: *days, signer: signer.clone() },
+            _ => unreachable!(),
+        }
     }
 
     const DROPS: u64 = crate::types::DROPS_PER_FANG;

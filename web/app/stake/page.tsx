@@ -157,6 +157,9 @@ function PoolRow({ d, v, unbondingFor, run }: { d: StakeDelegation; v?: Validato
   let amountErr: string | null = null;
   try {
     if (amount.trim() && parseFang(amount) <= 0n) amountErr = "Enter more than zero.";
+    // The shares are worked out from the value your node reports: a node reporting a tiny value
+    // would turn a partial unstake into all of it (audit gap-7-5). All of it is the empty field.
+    else if (amount.trim() && parseFang(amount) >= BigInt(d.value)) amountErr = `That's all of this stake (your node says it's worth ${formatFang(BigInt(d.value))}). Leave the field empty to unstake all of it.`;
   } catch {
     amountErr = "Use a number like 1 or 0.25.";
   }

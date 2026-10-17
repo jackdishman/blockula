@@ -10,7 +10,7 @@ import { ErrorNote, ExplorerLink, Spinner, Tip } from "@/components/ui";
 import { explorer, MAINNET_PREFIX, NETWORK } from "@/lib/config";
 import { friendly } from "@/lib/errors";
 import { shortAddr } from "@/lib/format";
-import type { NameView, TxView } from "@/lib/types";
+import type { TxView } from "@/lib/types";
 import { useUnlocked } from "@/lib/wallet";
 
 export default function SendPage() {
@@ -26,7 +26,7 @@ export default function SendPage() {
 type Recipient =
   | { state: "empty" }
   | { state: "checking" }
-  | { state: "ok"; address: string; display: string; detail: string }
+  | { state: "ok"; address: string; display: string; detail: string; proven?: boolean }
   | { state: "bad"; msg: string };
 
 const utf8Len = (s: string) => new TextEncoder().encode(s).length;
@@ -44,16 +44,19 @@ function useRecipient(input: string): Recipient {
     if (q.startsWith(`${hrp}1`)) {
       if (!isAddress(q)) return setR({ state: "bad", msg: "That address doesn't look right. Check for typos." });
       const label = status?.validator.address === q ? "the validator" : "an address";
-      return setR({ state: "ok", address: q, display: shortAddr(q), detail: label });
+      return setR({ state: "ok", address: q, display: shortAddr(q), detail: label, proven: true });
     }
     setR({ state: "checking" });
     let live = true;
     const t = setTimeout(async () => {
       try {
-        const v = (await client.name(q)) as NameView;
+        // Proven against the network's witnesses when it has some; otherwise the node's word,
+        // and the check line says so (audit gap-7-1). The short form shown is computed from the
+        // address that gets signed, never taken from the node's answer.
+        const res = await client.resolution(q);
         if (!live) return;
-        if (v.available || !v.owner) setR({ state: "bad", msg: `${v.name} isn't registered. Check the spelling.` });
-        else setR({ state: "ok", address: v.owner.address, display: v.name, detail: v.owner.short });
+        const proof = res.proven ? `proven by ${client.witnesses.length} other node${client.witnesses.length === 1 ? "" : "s"}` : "as your node reports it (not proven)";
+        setR({ state: "ok", address: res.address, display: `${res.name}.boo`, detail: `${shortAddr(res.address)} · ${proof}`, proven: res.proven });
       } catch (e) {
         if (live) setR({ state: "bad", msg: friendly(e) });
       }
@@ -73,7 +76,7 @@ function Send() {
   const [amount, setAmount] = useState(params.get("amount") ?? "");
   const [memo, setMemo] = useState(params.get("memo") ?? "");
   const prefilled = params.has("to") || params.has("amount") || params.has("memo");
-  const [review, setReview] = useState<{ tx: Tx; display: string } | null>(null);
+  const [review, setReview] = useState<{ tx: Tx; display: string; proven: boolean } | null>(null);
   const [sent, setSent] = useState<TxView | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -101,7 +104,7 @@ function Send() {
     try {
       // Build and sign now so the fee shown is exactly what will be paid.
       const tx = await wallet.build({ type: "transfer", to: recipient.address, amount: drops.toString() }, memo);
-      setReview({ tx, display: recipient.display });
+      setReview({ tx, display: recipient.display, proven: recipient.proven === true });
     } catch (e) {
       setError(friendly(e));
     } finally {
@@ -160,6 +163,7 @@ function Send() {
               {review.display}
               {/* Always show the exact address being signed, not just the name. */}
               <div className="mono small break">{review.tx.action.type === "transfer" ? review.tx.action.to : ""}</div>
+              {!review.proven && <div className="warn small">Looked up on your node only, not proven. For a large payment, check this address with the person you&apos;re paying.</div>}
             </dd>
             <dt>Amount</dt>
             <dd>{formatFang(amt)}</dd>
@@ -229,7 +233,11 @@ function Send() {
         </button>
         <ErrorNote error={error} />
       </section>
-      <Tip>Names are checked live against the chain, so you&apos;ll see who you&apos;re paying before you sign anything.</Tip>
+      <Tip>
+        {client.witnesses.length
+          ? <>Names are proven against {client.witnesses.length + 1} independent nodes before you sign, and the review shows the exact address that gets paid.</>
+          : <>Names are looked up on the node you&apos;re connected to, which could point one anywhere. The review shows the exact address that gets paid: for a large payment, check it with the person you&apos;re paying.</>}
+      </Tip>
     </main>
   );
 }

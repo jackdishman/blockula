@@ -590,7 +590,7 @@ pub fn grace_until(state: &State, rec: &NameRecord) -> u64 {
 pub fn name_asked_for(state: &State, tx: &Tx) -> Option<String> {
     let action = match &tx.action {
         Action::MultisigPropose { action } => action.as_ref(),
-        Action::MultisigApprove { id } => &state.governance.multisig_proposals.get(id).filter(|p| p.account == tx.from)?.action,
+        Action::MultisigApprove { id, .. } => &state.governance.multisig_proposals.get(id).filter(|p| p.account == tx.from)?.action,
         a => a,
     };
     match action {
@@ -1627,7 +1627,7 @@ mod tests {
         let wrap = |name: &str| Action::MultisigPropose { action: Box::new(Action::RegisterName { name: name.into() }) };
         // Mallory's account is a 1-of-1 multisig; erin's a 2-of-2 with frank's key.
         t.ok(&mallory, Action::MultisigCreate { owners: vec![kid(&mallory)], threshold: 1 });
-        t.ok(&erin, Action::AddKey { key_id: kid(&frank), label: "frank".into(), role: KeyRole::Owner });
+        t.ok(&erin, crate::types::add_key(&frank, CHAIN_ID, &t.c.genesis_hash.clone(), &erin.address(), "frank", KeyRole::Owner));
         t.ok(&erin, Action::MultisigCreate { owners: vec![kid(&erin), kid(&frank)], threshold: 2 });
 
         // The reviewer's bypass: alice waits for coinbase; mallory's 1-of-1 wrap asks for it too.
@@ -1667,7 +1667,8 @@ mod tests {
         t.c.produce_block().unwrap();
         let okx = t.c.state.governance.next_multisig_id - 1;
         t.c.submit(t.tx(&alice, Action::RegisterName { name: "okx".into() })).unwrap();
-        let e = t.c.submit(as_key(&t, &frank, &erin, Action::MultisigApprove { id: okx })).unwrap_err().to_string();
+        let approve = |t: &T, id: u64| Action::MultisigApprove { id, action_digest: crate::types::action_digest(&t.c.state.governance.multisig_proposals[&id].action) };
+        let e = t.c.submit(as_key(&t, &frank, &erin, approve(&t, okx))).unwrap_err().to_string();
         assert!(e.contains("already waiting"), "{e}");
         t.c.produce_block().unwrap();
         assert_eq!(t.c.state.resolve("okx.boo").unwrap(), alice.address());
@@ -1675,7 +1676,7 @@ mod tests {
         t.c.submit(as_key(&t, &erin, &erin, wrap("bybit"))).unwrap();
         t.c.produce_block().unwrap();
         let bybit = t.c.state.governance.next_multisig_id - 1;
-        t.c.submit(as_key(&t, &frank, &erin, Action::MultisigApprove { id: bybit })).unwrap();
+        t.c.submit(as_key(&t, &frank, &erin, approve(&t, bybit))).unwrap();
         assert_eq!(waiting(&t, "bybit"), 1);
         let e = t.c.submit(tipped(&t, &carol, Action::RegisterName { name: "bybit".into() })).unwrap_err().to_string();
         assert!(e.contains("already waiting"), "{e}");

@@ -35,6 +35,11 @@ fn kid(seed: u8) -> String {
     key_id(&keys(seed).public_key())
 }
 
+/// An `AddKey` for `seed`'s key onto `account`, with its proof of possession (audit gap-7-2).
+fn add_key(seed: u8, account: &str, label: &str, role: KeyRole) -> Action {
+    crate::types::add_key(&keys(seed), CHAIN, &"00".repeat(32), account, label, role)
+}
+
 /// Three validators (the third owned by an operator), funded users, a founder whose tokens are
 /// all still vesting, the community account and a treasury vesting over 400 blocks. Short
 /// governance periods; no quorum floor (quorum is 4% of the unlocked supply, ≈ 6,560 FANG), no
@@ -118,7 +123,17 @@ impl T {
     }
 
     fn vote(&mut self, seed: u8, id: u64, aye: bool, fang: u64, conviction: u8) -> Result<u64> {
-        self.tx(seed, Action::Vote { proposal_id: id, aye, amount: fang * FANG, conviction })
+        self.tx(seed, Action::Vote { proposal_id: id, aye, amount: fang * FANG, conviction, proposal_digest: self.digest(id) })
+    }
+
+    /// `proposal_digest` of proposal `id` as stored: what a vote on it binds (zeros if there's none).
+    fn digest(&self, id: u64) -> String {
+        self.st.governance.proposals.get(&id).map(crate::governance::digest_of).unwrap_or_else(|| "00".repeat(32))
+    }
+
+    /// A `MultisigApprove` of `id`, bound to its stored action (zeros if there's none).
+    fn approve(&self, id: u64) -> Action {
+        Action::MultisigApprove { id, action_digest: self.st.governance.multisig_proposals.get(&id).map(|p| crate::types::action_digest(&p.action)).unwrap_or_else(|| "00".repeat(32)) }
     }
 
     /// Closes the current block (end-of-block steps, commit, root and invariant checks).
@@ -430,8 +445,8 @@ fn unvested_tokens_dont_vote() {
     t.tx(ALICE, Action::Transfer { to: addr(FOUNDER), amount: 100 * FANG }).unwrap();
     let can = crate::econ::voting_balance(&t.st, &addr(FOUNDER), t.h);
     assert!(can < 100 * FANG && can > 99 * FANG, "100 FANG less the failed vote's fee: {can}");
-    assert!(t.tx(FOUNDER, Action::Vote { proposal_id: id, aye: true, amount: can + 1, conviction: 1 }).is_err());
-    t.tx(FOUNDER, Action::Vote { proposal_id: id, aye: true, amount: 50 * FANG, conviction: 1 }).unwrap();
+    assert!(t.tx(FOUNDER, Action::Vote { proposal_id: id, aye: true, amount: can + 1, conviction: 1, proposal_digest: t.digest(id) }).is_err());
+    t.tx(FOUNDER, Action::Vote { proposal_id: id, aye: true, amount: 50 * FANG, conviction: 1, proposal_digest: t.digest(id) }).unwrap();
     // Keyless system accounts never count toward the unlocked supply.
     let u = unlocked_supply(&t.st, t.h);
     assert!(u < 170_000 * FANG as u128);
@@ -468,11 +483,11 @@ fn a_full_balance_voter_can_change_its_vote() {
     let id = t.propose(ALICE, text());
     let all = crate::econ::voting_balance(&t.st, &addr(CAROL), t.h);
     // What's left once this vote's own fee is paid: everything.
-    let fee = min_fee(Tx { chain_id: CHAIN.into(), genesis_hash: "00".repeat(32), from: addr(CAROL), nonce: 0, fee: 0, tip: 0, valid_until: 0, action: Action::Vote { proposal_id: id, aye: true, amount: all, conviction: 0 }, memo: String::new(), public_key: hex::encode(keys(CAROL).public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) }.size());
-    t.tx(CAROL, Action::Vote { proposal_id: id, aye: true, amount: all - fee, conviction: 0 }).unwrap();
+    let fee = min_fee(Tx { chain_id: CHAIN.into(), genesis_hash: "00".repeat(32), from: addr(CAROL), nonce: 0, fee: 0, tip: 0, valid_until: 0, action: Action::Vote { proposal_id: id, aye: true, amount: all, conviction: 0, proposal_digest: t.digest(id) }, memo: String::new(), public_key: hex::encode(keys(CAROL).public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) }.size());
+    t.tx(CAROL, Action::Vote { proposal_id: id, aye: true, amount: all - fee, conviction: 0, proposal_digest: t.digest(id) }).unwrap();
     assert_eq!(crate::econ::transferable(&t.st, &addr(CAROL), t.h), 0);
     t.vote(CAROL, id, false, 1, 0).unwrap();
-    t.tx(CAROL, Action::Vote { proposal_id: id, aye: false, amount: 1, conviction: 1 }).unwrap();
+    t.tx(CAROL, Action::Vote { proposal_id: id, aye: false, amount: 1, conviction: 1, proposal_digest: t.digest(id) }).unwrap();
     let p = t.p(id);
     assert_eq!((p.aye_amount, p.nay_amount, p.voters), (0, 1, 1));
     let v = &t.st.governance.votes[&IdKey::new(id, &addr(CAROL))];
@@ -691,7 +706,8 @@ fn safety_parameters_can_always_be_moved_back() {
         let id = t.propose(ALICE, kind);
         t.vote(ALICE, id, true, 60_000, 1).unwrap();
         // One drop, at 1× conviction: no veto at 80%.
-        t.tx(BOB, Action::Vote { proposal_id: id, aye: false, amount: 1, conviction: 1 }).unwrap();
+        let proposal_digest = t.digest(id);
+        t.tx(BOB, Action::Vote { proposal_id: id, aye: false, amount: 1, conviction: 1, proposal_digest }).unwrap();
         t.finish(id);
         assert_eq!(t.p(id).status, ProposalStatus::Executed, "{}", t.p(id).outcome);
     };
@@ -1082,8 +1098,8 @@ fn proposals_are_checked_when_they_are_made() {
     assert_eq!((t.bal(BOB), t.bal(CAROL)), (bob, carol + FANG));
     // Session keys can't propose or vote.
     let agent = keys(50);
-    t.tx(ALICE, Action::AddKey { key_id: kid(50), label: "agent".into(), role: KeyRole::Session { limit: 1_000 * FANG, period_blocks: 100, expires_at: 1_000 } }).unwrap();
-    for action in [Action::Propose { kind: text(), deposit: 50 * FANG, title: "x".into(), url: String::new() }, Action::Vote { proposal_id: id, aye: true, amount: FANG, conviction: 0 }, Action::Unlock {}] {
+    t.tx(ALICE, add_key(50, &addr(ALICE), "agent", KeyRole::Session { limit: 1_000 * FANG, period_blocks: 100, expires_at: 1_000 })).unwrap();
+    for action in [Action::Propose { kind: text(), deposit: 50 * FANG, title: "x".into(), url: String::new() }, Action::Vote { proposal_id: id, aye: true, amount: FANG, conviction: 0, proposal_digest: t.digest(id) }, Action::Unlock {}] {
         assert!(t.tx_as(&agent, &addr(ALICE), action).unwrap_err().to_string().contains("session keys can only"));
     }
 }
@@ -1238,7 +1254,7 @@ fn a_distribution_keeps_its_id_whatever_lands_first() {
     // second approves.
     let foundation = addr(ALICE);
     let (k1, k2) = (keys(ALICE), keys(11));
-    t.tx(ALICE, Action::AddKey { key_id: kid(11), label: "second key".into(), role: KeyRole::Owner }).unwrap();
+    t.tx(ALICE, add_key(11, &foundation, "second key", KeyRole::Owner)).unwrap();
     t.tx(ALICE, Action::MultisigCreate { owners: vec![kid(ALICE), kid(11)], threshold: 2 }).unwrap();
     let ms = t.st.governance.next_multisig_id;
     let propose = Action::Propose { kind: dist(id, root), deposit: 50 * FANG, title: "drop".into(), url: String::new() };
@@ -1249,14 +1265,15 @@ fn a_distribution_keeps_its_id_whatever_lands_first() {
     t.propose(CAROL, text());
     let pid = t.st.governance.next_proposal_id;
     assert_ne!(pid, id);
-    t.tx_as(&k2, &foundation, Action::MultisigApprove { id: ms }).unwrap();
+    t.tx_as(&k2, &foundation, t.approve(ms)).unwrap();
     assert_eq!((t.p(pid).proposer.as_str(), &t.p(pid).kind), (foundation.as_str(), &dist(id, root)));
     assert_eq!(next_distribution_id(&t.st), id + 1, "named by an open proposal");
     // Someone else's proposal naming the same id can be filed (it can't take the id from the
     // foundation's), but only the first to run opens it.
     let other = t.propose(BOB, dist(id, build_distribution(id, &[(addr(BOB), 11 * FANG)]).unwrap().0));
-    t.tx_as(&k1, &foundation, Action::MultisigPropose { action: Box::new(Action::Vote { proposal_id: pid, aye: true, amount: 50_000 * FANG, conviction: 1 }) }).unwrap();
-    t.tx_as(&k2, &foundation, Action::MultisigApprove { id: ms + 1 }).unwrap();
+    let proposal_digest = t.digest(pid);
+    t.tx_as(&k1, &foundation, Action::MultisigPropose { action: Box::new(Action::Vote { proposal_id: pid, aye: true, amount: 50_000 * FANG, conviction: 1, proposal_digest }) }).unwrap();
+    t.tx_as(&k2, &foundation, t.approve(ms + 1)).unwrap();
     t.vote(BOB, other, true, 40_000, 1).unwrap();
     let community_before = t.st.account(&community("boo")).balance;
     t.finish(other);
@@ -1323,7 +1340,7 @@ fn multisig_accounts_need_their_threshold() {
     let alice = addr(ALICE);
     let (k1, k2, k3) = (keys(ALICE), keys(11), keys(12));
     for seed in [11, 12] {
-        t.tx(ALICE, Action::AddKey { key_id: kid(seed), label: format!("device {seed}"), role: KeyRole::Owner }).unwrap();
+        t.tx(ALICE, add_key(seed, &alice, &format!("device {seed}"), KeyRole::Owner)).unwrap();
     }
     assert!(t.err(ALICE, Action::MultisigCreate { owners: vec![kid(ALICE), kid(11)], threshold: 2 }).contains("exactly this account's 3 owner key(s)"));
     assert!(t.err(ALICE, Action::MultisigCreate { owners: vec![kid(ALICE), kid(11), kid(12)], threshold: 4 }).contains("threshold must be 1–3"));
@@ -1337,44 +1354,44 @@ fn multisig_accounts_need_their_threshold() {
     let bob = t.bal(BOB);
     t.tx_as(&k2, &alice, Action::MultisigPropose { action: send(10) }).unwrap();
     assert_eq!(t.st.governance.multisigs[&alice].pending, BTreeSet::from([0]));
-    assert!(t.tx_as(&k2, &alice, Action::MultisigApprove { id: 0 }).unwrap_err().to_string().contains("already approved"));
-    t.tx_as(&k3, &alice, Action::MultisigApprove { id: 0 }).unwrap();
+    assert!(t.tx_as(&k2, &alice, t.approve(0)).unwrap_err().to_string().contains("already approved"));
+    t.tx_as(&k3, &alice, t.approve(0)).unwrap();
     assert_eq!(t.bal(BOB), bob + 10 * FANG);
     assert!(t.st.governance.multisig_proposals.is_empty() && t.st.governance.multisigs[&alice].pending.is_empty());
-    assert!(t.tx_as(&k1, &alice, Action::MultisigApprove { id: 0 }).unwrap_err().to_string().contains("no open multisig action #0"));
+    assert!(t.tx_as(&k1, &alice, t.approve(0)).unwrap_err().to_string().contains("no open multisig action #0"));
     // A failing action fails its approval and stays open (retry after funding it).
     t.tx_as(&k1, &alice, Action::MultisigPropose { action: send(1_000_000) }).unwrap();
-    assert!(t.tx_as(&k3, &alice, Action::MultisigApprove { id: 1 }).unwrap_err().to_string().contains("multisig action #1: insufficient balance"));
+    assert!(t.tx_as(&k3, &alice, t.approve(1)).unwrap_err().to_string().contains("multisig action #1: insufficient balance"));
     assert_eq!(t.st.governance.multisig_proposals[&1].approvals, BTreeSet::from([kid(ALICE)]));
     // Proposals expire; the next proposal clears them out.
     let expires = t.st.governance.multisig_proposals[&1].expires_at;
     t.through(expires);
-    assert!(t.tx_as(&k3, &alice, Action::MultisigApprove { id: 1 }).unwrap_err().to_string().contains("expired at block"));
+    assert!(t.tx_as(&k3, &alice, t.approve(1)).unwrap_err().to_string().contains("expired at block"));
     // Another account's proposal can't be approved from here.
     t.tx(BOB, Action::MultisigCreate { owners: vec![kid(BOB)], threshold: 1 }).unwrap();
     t.tx_as(&k1, &alice, Action::MultisigPropose { action: send(1) }).unwrap();
     assert!(!t.st.governance.multisig_proposals.contains_key(&1), "the expired one was pruned");
-    assert!(t.tx(BOB, Action::MultisigApprove { id: 2 }).unwrap_err().to_string().contains("belongs to"));
+    assert!(t.tx(BOB, t.approve(2)).unwrap_err().to_string().contains("belongs to"));
     // A 1-of-1 multisig runs its proposals at once.
     let carol = t.bal(CAROL);
     t.tx(BOB, Action::MultisigPropose { action: Box::new(Action::Transfer { to: addr(CAROL), amount: FANG }) }).unwrap();
     assert_eq!(t.bal(CAROL), carol + FANG);
     // Session keys keep working, within their limits.
     let agent = keys(50);
-    let add = Action::AddKey { key_id: kid(50), label: "agent".into(), role: KeyRole::Session { limit: 5 * FANG, period_blocks: 100, expires_at: t.h + 1_000 } };
+    let add = add_key(50, &alice, "agent", KeyRole::Session { limit: 5 * FANG, period_blocks: 100, expires_at: t.h + 1_000 });
     t.tx_as(&k1, &alice, Action::MultisigPropose { action: Box::new(add) }).unwrap();
-    t.tx_as(&k2, &alice, Action::MultisigApprove { id: 4 }).unwrap();
+    t.tx_as(&k2, &alice, t.approve(4)).unwrap();
     t.tx_as(&agent, &alice, Action::Transfer { to: addr(CAROL), amount: FANG }).unwrap();
     assert!(t.tx_as(&agent, &alice, Action::Transfer { to: addr(CAROL), amount: 5 * FANG }).unwrap_err().to_string().contains("limit"));
-    assert!(t.tx_as(&agent, &alice, Action::MultisigApprove { id: 2 }).unwrap_err().to_string().contains("session keys can only"));
+    assert!(t.tx_as(&agent, &alice, t.approve(2)).unwrap_err().to_string().contains("session keys can only"));
     // Keys can go, but never below the threshold.
     t.tx_as(&k1, &alice, Action::MultisigPropose { action: Box::new(Action::RemoveKey { key_id: kid(12) }) }).unwrap();
-    t.tx_as(&k2, &alice, Action::MultisigApprove { id: 5 }).unwrap();
+    t.tx_as(&k2, &alice, t.approve(5)).unwrap();
     t.tx_as(&k1, &alice, Action::MultisigPropose { action: Box::new(Action::RemoveKey { key_id: kid(11) }) }).unwrap();
-    assert!(t.tx_as(&k2, &alice, Action::MultisigApprove { id: 6 }).unwrap_err().to_string().contains("fewer than the threshold"));
+    assert!(t.tx_as(&k2, &alice, t.approve(6)).unwrap_err().to_string().contains("fewer than the threshold"));
     // The threshold changes through the multisig itself.
     t.tx_as(&k1, &alice, Action::MultisigPropose { action: Box::new(Action::MultisigCreate { owners: vec![kid(ALICE), kid(11)], threshold: 1 }) }).unwrap();
-    t.tx_as(&k2, &alice, Action::MultisigApprove { id: 7 }).unwrap();
+    t.tx_as(&k2, &alice, t.approve(7)).unwrap();
     assert_eq!(t.st.governance.multisigs[&alice].threshold, 1);
     let bob = t.bal(BOB);
     t.tx_as(&k2, &alice, Action::MultisigPropose { action: send(2) }).unwrap();
@@ -1382,7 +1399,7 @@ fn multisig_accounts_need_their_threshold() {
     // Governance through a multisig: the account proposes and votes.
     let id = t.st.governance.next_proposal_id;
     t.tx_as(&k2, &alice, Action::MultisigPropose { action: Box::new(Action::Propose { kind: text(), deposit: 50 * FANG, title: "from a multisig".into(), url: String::new() }) }).unwrap();
-    t.tx_as(&k1, &alice, Action::MultisigPropose { action: Box::new(Action::Vote { proposal_id: id, aye: true, amount: 10_000 * FANG, conviction: 1 }) }).unwrap();
+    t.tx_as(&k1, &alice, Action::MultisigPropose { action: Box::new(Action::Vote { proposal_id: id, aye: true, amount: 10_000 * FANG, conviction: 1, proposal_digest: t.digest(id) }) }).unwrap();
     assert_eq!((t.p(id).proposer.clone(), t.p(id).voters), (alice.clone(), 1));
     // At most 32 open proposals per account, and each of its 2 owner keys may have proposed 16.
     t.tx_as(&k1, &alice, Action::MultisigPropose { action: Box::new(Action::MultisigCreate { owners: vec![kid(ALICE), kid(11)], threshold: 2 }) }).unwrap();
@@ -1408,7 +1425,7 @@ fn one_owner_key_cant_freeze_a_multisig_and_expired_proposals_go() {
     let alice = addr(ALICE);
     let (k1, k2, rogue) = (keys(ALICE), keys(11), keys(12));
     for seed in [11, 12] {
-        t.tx(ALICE, Action::AddKey { key_id: kid(seed), label: format!("device {seed}"), role: KeyRole::Owner }).unwrap();
+        t.tx(ALICE, add_key(seed, &alice, &format!("device {seed}"), KeyRole::Owner)).unwrap();
     }
     t.tx(ALICE, Action::MultisigCreate { owners: vec![kid(ALICE), kid(11), kid(12)], threshold: 2 }).unwrap();
     let junk = || Action::MultisigPropose { action: Box::new(Action::Unlock {}) };
@@ -1420,7 +1437,7 @@ fn one_owner_key_cant_freeze_a_multisig_and_expired_proposals_go() {
     // The honest keys still propose, and remove the rogue.
     let id = t.st.governance.next_multisig_id;
     t.tx_as(&k2, &alice, Action::MultisigPropose { action: Box::new(Action::RemoveKey { key_id: kid(12) }) }).unwrap();
-    t.tx_as(&k1, &alice, Action::MultisigApprove { id }).unwrap();
+    t.tx_as(&k1, &alice, t.approve(id)).unwrap();
     assert!(!owner_keys(&t.st, &alice).contains(&kid(12)));
     // Its proposals expire, and the sweep takes them out of the state.
     let expires = t.st.governance.multisig_proposals.values().map(|p| p.expires_at).max().unwrap();
@@ -1436,7 +1453,7 @@ fn one_owner_key_cant_freeze_a_multisig_and_expired_proposals_go() {
     assert!(register.to_bytes().len() > 10 << 10);
     let id = t.st.governance.next_multisig_id;
     t.tx_as(&k1, &alice, Action::MultisigPropose { action: Box::new(register) }).unwrap();
-    t.tx_as(&k2, &alice, Action::MultisigApprove { id }).unwrap();
+    t.tx_as(&k2, &alice, t.approve(id)).unwrap();
     assert_eq!(t.st.validators[&node.address()].owner, alice);
 }
 
@@ -1580,7 +1597,8 @@ fn tips_come_from_transferable_fang_and_are_capped() {
     assert!(t.tip_as(&founder, &addr(FOUNDER), noop(), 20 * base + 1, &thief).unwrap_err().to_string().contains("tip too high"));
     // Vote locks hold tips too: CAROL votes all but five base fees' worth of what she holds.
     let id = t.propose(ALICE, text());
-    let vote = |amount: u64| Action::Vote { proposal_id: id, aye: true, amount, conviction: 1 };
+    let digest = t.digest(id);
+    let vote = |amount: u64| Action::Vote { proposal_id: id, aye: true, amount, conviction: 1, proposal_digest: digest.clone() };
     let (carol, base) = (t.bal(CAROL), t.base(&keys(CAROL), &addr(CAROL), noop()));
     t.tx(CAROL, vote(carol - t.base(&keys(CAROL), &addr(CAROL), vote(0)) - 5 * base)).unwrap();
     let free = crate::econ::transferable(&t.st, &addr(CAROL), t.h);
@@ -1601,6 +1619,41 @@ fn tips_come_from_transferable_fang_and_are_capped() {
     t.tip_as(&keys(BOB), &addr(BOB), noop(), 2 * base, &thief).unwrap();
 }
 
+/// Audit gap-7-6: an approval binds the stored action and a vote the proposal's content, so a node
+/// that shows a co-signer a routine payment (or a voter another proposal's text) makes the signed
+/// approval or vote fail instead of executing a drain or locking FANG on the wrong proposal.
+#[test]
+fn approvals_and_votes_bind_what_their_signer_was_shown() {
+    let mut t = T::new(&[]);
+    let alice = addr(ALICE);
+    let (k1, k2) = (keys(ALICE), keys(11));
+    t.tx(ALICE, add_key(11, &alice, "device", KeyRole::Owner)).unwrap();
+    t.tx(ALICE, Action::MultisigCreate { owners: vec![kid(ALICE), kid(11)], threshold: 2 }).unwrap();
+    // A rogue owner proposes a drain; the co-signer's node reports it as a routine payment.
+    let drain = Action::Transfer { to: addr(DAVE), amount: 100 * FANG };
+    t.tx_as(&k1, &alice, Action::MultisigPropose { action: Box::new(drain.clone()) }).unwrap();
+    let routine = Action::Transfer { to: addr(BOB), amount: FANG };
+    let dave = t.bal(DAVE);
+    let fooled = Action::MultisigApprove { id: 0, action_digest: crate::types::action_digest(&routine) };
+    assert!(t.tx_as(&k2, &alice, fooled).unwrap_err().to_string().contains("isn't the action this approval was signed for"));
+    assert_eq!(t.bal(DAVE), dave, "nothing ran");
+    assert!(t.st.governance.multisig_proposals.contains_key(&0), "still open");
+    // Approving what's really stored runs it.
+    assert_eq!(t.approve(0), Action::MultisigApprove { id: 0, action_digest: crate::types::action_digest(&drain) });
+    t.tx_as(&k2, &alice, t.approve(0)).unwrap();
+    assert_eq!(t.bal(DAVE), dave + 100 * FANG);
+    // Two proposals; the voter's node shows #real with #decoy's text.
+    let real = t.st.governance.next_proposal_id;
+    t.tx(BOB, Action::Propose { kind: text(), deposit: 50 * FANG, title: "Raise the burn".into(), url: String::new() }).unwrap();
+    let decoy = real + 1;
+    t.tx(BOB, Action::Propose { kind: text(), deposit: 50 * FANG, title: "Plant garlic".into(), url: "https://example.com/garlic".into() }).unwrap();
+    let wrong = Action::Vote { proposal_id: real, aye: true, amount: 10 * FANG, conviction: 1, proposal_digest: t.digest(decoy) };
+    assert!(t.tx(CAROL, wrong).unwrap_err().to_string().contains("isn't the proposal this vote was signed for"));
+    assert!(t.st.governance.votes.get(&IdKey::new(real, &addr(CAROL))).is_none(), "no vote, no lock");
+    assert_eq!(t.digest(real), crate::types::proposal_digest(&text(), "Raise the burn", ""));
+    t.vote(CAROL, real, true, 10, 1).unwrap();
+}
+
 /// F01 (b): one owner key of an M-of-N multisig used to empty the account through the tip of a
 /// `MultisigPropose`, the proposal itself never reaching its threshold. A multisig's owner keys
 /// act alone in such txs, so they carry no tip; session keys still tip within their limit.
@@ -1609,7 +1662,7 @@ fn a_multisig_owner_key_cant_tip() {
     let mut t = T::new(&[]);
     let alice = addr(ALICE);
     let (k1, k2) = (keys(ALICE), keys(11));
-    t.tx(ALICE, Action::AddKey { key_id: kid(11), label: "device".into(), role: KeyRole::Owner }).unwrap();
+    t.tx(ALICE, add_key(11, &alice, "device", KeyRole::Owner)).unwrap();
     t.tx(ALICE, Action::MultisigCreate { owners: vec![kid(ALICE), kid(11)], threshold: 2 }).unwrap();
     let propose = || Action::MultisigPropose { action: Box::new(Action::Transfer { to: addr(BOB), amount: 1 }) };
     let (balance, thief) = (t.bal(ALICE), addr(DAVE));
@@ -1620,14 +1673,14 @@ fn a_multisig_owner_key_cant_tip() {
     assert_eq!((t.bal(ALICE), t.bal(DAVE)), (balance, 0));
     // Without a tip it's an ordinary proposal and approval.
     let proposed = t.tip_as(&k2, &alice, propose(), 0, &thief).unwrap();
-    assert!(t.tip_as(&k1, &alice, Action::MultisigApprove { id: 0 }, 1, &thief).unwrap_err().to_string().contains("carry no tip"));
-    let approved = t.tip_as(&k1, &alice, Action::MultisigApprove { id: 0 }, 0, &thief).unwrap();
+    assert!(t.tip_as(&k1, &alice, t.approve(0), 1, &thief).unwrap_err().to_string().contains("carry no tip"));
+    let approved = t.tip_as(&k1, &alice, t.approve(0), 0, &thief).unwrap();
     assert_eq!((t.bal(ALICE), t.bal(DAVE)), (balance - proposed - approved - 1, 0), "base fees and the approved drop");
     // A session key (approved by both) tips within its limit, which counts the tip.
     let agent = keys(50);
-    let add = Action::AddKey { key_id: kid(50), label: "agent".into(), role: KeyRole::Session { limit: FANG, period_blocks: 100, expires_at: t.h + 1_000 } };
+    let add = add_key(50, &alice, "agent", KeyRole::Session { limit: FANG, period_blocks: 100, expires_at: t.h + 1_000 });
     t.tx_as(&k1, &alice, Action::MultisigPropose { action: Box::new(add) }).unwrap();
-    t.tx_as(&k2, &alice, Action::MultisigApprove { id: 1 }).unwrap();
+    t.tx_as(&k2, &alice, t.approve(1)).unwrap();
     t.tip_as(&agent, &alice, Action::Transfer { to: addr(BOB), amount: 1 }, 5, &thief).unwrap();
     assert_eq!(t.bal(DAVE), 5);
 }
@@ -1708,7 +1761,7 @@ fn records_round_trip_and_journals_roll_back() {
     t.finish(id);
     t.tx(BOB, Action::ClaimDistribution { distribution_id: id, amount: 5 * FANG, proof: proofs[0].iter().map(hex::encode).collect() }).unwrap();
     t.tx(OWNER, Action::MultisigCreate { owners: vec![kid(OWNER)], threshold: 1 }).unwrap();
-    t.tx(ALICE, Action::AddKey { key_id: kid(11), label: "laptop".into(), role: KeyRole::Owner }).unwrap();
+    t.tx(ALICE, add_key(11, &addr(ALICE), "laptop", KeyRole::Owner)).unwrap();
     t.tx(ALICE, Action::MultisigCreate { owners: vec![kid(ALICE), kid(11)], threshold: 2 }).unwrap();
     t.tx(ALICE, Action::MultisigPropose { action: Box::new(Action::Propose { kind: ProposalKind::GrantSoul { to: addr(BOB), amount: SOUL, reason: "r".into() }, deposit: 50 * FANG, title: "t".into(), url: String::new() }) }).unwrap();
     // A vote still open (closed votes are swept).
@@ -1729,9 +1782,9 @@ fn records_round_trip_and_journals_roll_back() {
     let mut j = Journal::default();
     let txs = [
         (keys(BOB), addr(BOB), Action::Propose { kind: text(), deposit: 50 * FANG, title: "t".into(), url: String::new() }),
-        (keys(BOB), addr(BOB), Action::Vote { proposal_id: id + 2, aye: true, amount: FANG, conviction: 1 }),
+        (keys(BOB), addr(BOB), Action::Vote { proposal_id: id + 2, aye: true, amount: FANG, conviction: 1, proposal_digest: crate::types::proposal_digest(&text(), "t", "") }),
         (keys(CAROL), addr(CAROL), Action::ClaimDistribution { distribution_id: id, amount: 5 * FANG, proof: proofs[1].iter().map(hex::encode).collect() }),
-        (keys(11), addr(ALICE), Action::MultisigApprove { id: 0 }),
+        (keys(11), addr(ALICE), t.approve(0)),
         (keys(BOB), addr(BOB), Action::MultisigCreate { owners: vec![kid(BOB)], threshold: 1 }),
     ];
     for (k, from, action) in txs {
@@ -1750,7 +1803,7 @@ fn records_round_trip_and_journals_roll_back() {
 fn random_governance_sequences_keep_the_invariants() {
     let mut t = T::new(&[("bootstrap_end_height", 150), ("governance_spend_height", 20)]);
     let users = [ALICE, BOB, CAROL, OWNER, VALIDATORS[0], VALIDATORS[1], FOUNDER];
-    t.tx(BOB, Action::AddKey { key_id: kid(13), label: "two".into(), role: KeyRole::Owner }).unwrap();
+    t.tx(BOB, add_key(13, &addr(BOB), "two", KeyRole::Owner)).unwrap();
     let mut rng: u64 = 0x9e37_79b9_7f4a_7c15;
     let mut next = || {
         rng ^= rng << 13;
@@ -1797,7 +1850,7 @@ fn random_governance_sequences_keep_the_invariants() {
             }
             8 => t.tx(BOB, Action::MultisigCreate { owners: vec![kid(BOB), kid(13)], threshold: 1 + (r >> 20) as u8 % 2 }),
             9 => t.tx_as(&keys(if r % 2 == 0 { BOB } else { 13 }), &addr(BOB), Action::MultisigPropose { action: Box::new(Action::Transfer { to: addr(CAROL), amount: FANG }) }),
-            10 => t.tx_as(&keys(if r % 2 == 0 { BOB } else { 13 }), &addr(BOB), Action::MultisigApprove { id: (r >> 8) % t.st.governance.next_multisig_id.max(1) }),
+            10 => t.tx_as(&keys(if r % 2 == 0 { BOB } else { 13 }), &addr(BOB), t.approve((r >> 8) % t.st.governance.next_multisig_id.max(1))),
             _ => {
                 for _ in 0..1 + (r >> 20) % 4 {
                     t.next();

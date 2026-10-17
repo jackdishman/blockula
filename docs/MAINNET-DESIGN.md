@@ -47,7 +47,7 @@ Tx { chain_id, genesis_hash, from, nonce, fee, tip, valid_until, action, memo, p
 - **Wire form:** `signing_bytes ‖ public_key (1,952 B) ‖ signature (3,309 B)`. Blocks and mempool gossip carry this form; `Tx::from_bytes` is its strict inverse (no trailing bytes, valid UTF-8, known tags, canonical bools and options). `size()` is its length. JSON stays the API format and rejects unknown fields.
 - Addresses: bech32m with the chain's prefix. Statelessly, an address field accepts any known prefix; at admission `from` and every resolved account must use this chain's prefix.
 
-Action tags 0–29 keep their meaning. New tags are reserved here so packages never collide:
+Action tags 0–29 keep their meaning, with two field additions before mainnet: `AddKey` (tag 2) carries the added key's `public_key` and its proof of possession `pop`, an ML-DSA-65 signature over `key_pop_message(chain_id, genesis_hash, account, key_id)` with context `blockula/key-pop/v1`, checked at admission and execution (a key joins an account only with its consent: audit gap-7-2); `CommitVotes` (tag 25) carries `pairs_digest`, the digest of the juror's assigned pairs with each claim's repo and PR, refused if it isn't the seat's (gap-7-6). The digests are BLAKE3 in derive-key mode (`types::action_digest`, `proposal_digest`, `seance_pairs_digest`; `sdk-ts/src/tx.ts` computes the same, checked offline by `sdk-ts/test/tx-vectors.json`). New tags are reserved here so packages never collide:
 
 | Tag | Action | Package |
 |---|---|---|
@@ -61,11 +61,11 @@ Action tags 0–29 keep their meaning. New tags are reserved here so packages ne
 | 37 | `BeaconCommit { epoch, commitment }` | P-BEACON |
 | 38 | `BeaconReveal { epoch, secret }` | P-BEACON |
 | 39 | `Propose { kind, deposit, title, url }` | P-GOV |
-| 40 | `Vote { proposal_id, aye, amount, conviction }` | P-GOV |
+| 40 | `Vote { proposal_id, aye, amount, conviction, proposal_digest }`: the digest of the proposal's kind, title and link the voter was shown; a mismatch is refused (audit gap-7-6) | P-GOV |
 | 41 | `Unlock {}` | P-GOV |
 | 42 | `MultisigCreate { owners, threshold }` | P-GOV |
 | 43 | `MultisigPropose { action }` | P-GOV |
-| 44 | `MultisigApprove { id }` | P-GOV |
+| 44 | `MultisigApprove { id, action_digest }`: the digest of the stored action the approver was shown; a mismatch is refused (audit gap-7-6) | P-GOV |
 | 45 | `RenewName { name, years }` | P-ECON |
 | 46 | `TransferName { name, to }`: the owner offers it to `to` (again: replaces the offer; to itself: withdraws it); the account it was offered to accepts it (`to` itself) | P-ECON |
 | 47 | `ReleaseName { name }` | P-ECON |
