@@ -1,6 +1,6 @@
 "use client";
 
-import { describeAction, isAddress, parseFang, type Resolution, type Tx } from "@blockula/sdk";
+import { describeAction, parseFang, type Resolution, type Tx } from "@blockula/sdk";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
@@ -8,64 +8,17 @@ import { ErrorNote, Spinner } from "@/components/ui";
 import { BLOCKS_PER_DAY, MAINNET_CHAIN_ID, MAINNET_PREFIX } from "@/lib/config";
 import { friendly } from "@/lib/errors";
 import { checkTx } from "@/lib/explorer/check";
+import { checkField } from "@/lib/explorer/fields";
 import { formatDrops } from "@/lib/explorer/ledger";
 import { submitTx } from "@/lib/explorer/node";
 import type { Preflight } from "@/lib/explorer/preflight";
 import { type ActionSpec, type Param, signature, type Values } from "@/lib/explorer/programs";
 import { to } from "@/lib/explorer/routes";
-import { isKeyId, shortAddr } from "@/lib/format";
+import { shortAddr } from "@/lib/format";
 import { openLocalKey, unlockPasskey } from "@/lib/keys";
 import { useWallet } from "@/lib/wallet";
 import { Amount, Term } from "./kit";
 import { PreflightView } from "./PreflightView";
-
-const utf8 = (s: string) => new TextEncoder().encode(s).length;
-const NAME = /^[a-z0-9-]{3,32}(\.boo)?$/i;
-
-/** An account field as typed: a name, or an address of this chain's network (DEC-7: another network's is refused, never converted). */
-export function checkAccount(raw: string, prefix: string): string | null {
-  const v = raw.trim().toLowerCase();
-  const hrp = v.match(/^([a-z]+)1[a-z0-9]{20,}$/)?.[1];
-  if (hrp) {
-    if (hrp !== prefix) return `That's an address on another network (${hrp}1…). Addresses here start with ${prefix}1.`;
-    return isAddress(v, prefix) ? null : "That address doesn't look right. Check for typos.";
-  }
-  return NAME.test(v) ? null : `A .boo name or a ${prefix}1… address.`;
-}
-
-/** What's wrong with one field as typed, or null. */
-function check(p: Param, raw: string, prefix: string): string | null {
-  const v = raw.trim();
-  if (!v) return p.optional ? null : "Required.";
-  switch (p.type) {
-    case "fang":
-      try {
-        return parseFang(v) > 0n ? null : "More than zero.";
-      } catch {
-        return "A number like 1 or 0.25 (up to 9 decimals).";
-      }
-    case "account":
-    case "validator":
-      return checkAccount(v, prefix);
-    case "name":
-      return /^[a-z0-9](?:[a-z0-9-]{1,30}[a-z0-9])(\.boo)?$/i.test(v) ? null : "3 to 32 of a–z, 0–9 and dashes, not starting or ending with a dash.";
-    case "int":
-      return /^\d+$/.test(v) && Number.isSafeInteger(Number(v)) ? null : "A whole number.";
-    case "years":
-      return /^\d+$/.test(v) && Number(v) >= 1 && Number(v) <= 10 ? null : "1 to 10 years.";
-    case "bps":
-      return /^\d+$/.test(v) && Number(v) <= 10_000 ? null : "0 to 10000 (100 basis points = 1%).";
-    case "days":
-      return /^\d+$/.test(v) && Number(v) >= 1 && Number(v) <= 365 ? null : "1 to 365 days.";
-    case "repo":
-      return /^[\w.-]+\/[\w.-]+$/.test(v) ? null : "Like owner/name.";
-    case "key_id":
-      return isKeyId(v) ? null : "64 characters of 0–9 and a–f.";
-    case "text":
-      return p.max && utf8(v) > p.max ? `At most ${p.max} bytes.` : null;
-  }
-  return null;
-}
 
 /**
  * Unlock right here, so acting on a page doesn't mean leaving it. Covers the usual case (this
@@ -142,7 +95,7 @@ export function ActionForm({ spec, initial = {}, fixed = [], compact = false }: 
   const [error, setError] = useState<string | null>(null);
 
   const prefix = client.pin.prefix ?? MAINNET_PREFIX;
-  const errors = Object.fromEntries(spec.params.map((p) => [p.key, check(p, raw[p.key] ?? "", prefix)]));
+  const errors = Object.fromEntries(spec.params.map((p) => [p.key, checkField(p, raw[p.key] ?? "", prefix)]));
   const valid = Object.values(errors).every((e) => !e);
   const myKey = account?.keys.find((k) => k.key_id === wallet?.keyId);
   const agentKey = myKey?.role.type === "session";
