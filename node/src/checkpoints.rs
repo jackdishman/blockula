@@ -402,8 +402,10 @@ pub async fn peer_periods(peers: &[String], genesis_hash: &str, timeout: std::ti
 /// its validator-set history must verify (`epochs::verify_from`) from the newest root this binary
 /// trusts (an embedded checkpoint, or the genesis), or, when the peer no longer keeps history
 /// that old (nodes keep about the weak-subjectivity period), from the oldest set it keeps. Ask
-/// nodes run by independent operators: agreement among them is what a checkpoint attests.
-pub async fn fetch(peers: &[String], height: Option<u64>) -> Result<(Genesis, Checkpoint)> {
+/// nodes run by independent operators: agreement among them is what a checkpoint attests. With
+/// `pinned` (a genesis hash), the peers must serve that genesis: a joiner that already holds the
+/// chain's genesis (an operator rebuilding its own node) can't be handed another chain's.
+pub async fn fetch(peers: &[String], height: Option<u64>, pinned: Option<&str>) -> Result<(Genesis, Checkpoint)> {
     ensure!(!peers.is_empty(), "name at least one --peer (several independent ones)");
     let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build()?;
     let get = |url: String| {
@@ -430,6 +432,10 @@ pub async fn fetch(peers: &[String], height: Option<u64>) -> Result<(Genesis, Ch
         }
     }
     let g = genesis.expect("at least one peer");
+    if let Some(want) = pinned {
+        let have = genesis_hash(&g);
+        ensure!(have == want.trim().to_ascii_lowercase(), "the peers serve genesis {have}, not the pinned {}: another chain (or another instance of {})", want.trim(), g.chain_id);
+    }
     let params = g.params();
     // Governance shortened the evidence window since this release (gap-6-1): say how fresh a
     // checkpoint must be now, since this binary's joiners only know the longer period.
@@ -707,14 +713,17 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, honest).await.unwrap() });
         // Default: the newest epoch boundary every peer finalized, with the next epoch's set.
         let boundary = epoch_blocks - 1;
-        let (got, cp) = fetch(&[url.clone(), url.clone()], None).await.unwrap();
+        let (got, cp) = fetch(&[url.clone(), url.clone()], None, Some(&genesis_hash(&g))).await.unwrap();
         assert_eq!(genesis_hash(&got), genesis_hash(&g));
         assert_eq!(cp.height, boundary);
         assert_eq!(Some(cp.hash.clone()), chain.lock().hash_at(boundary));
         assert_eq!(cp.set_hash, genesis_checkpoint(&g).set_hash, "the set didn't change");
-        assert_eq!(fetch(std::slice::from_ref(&url), Some(3)).await.unwrap().1.hash, chain.lock().hash_at(3).unwrap());
-        assert_eq!(fetch(std::slice::from_ref(&url), Some(0)).await.unwrap().1, genesis_checkpoint(&g));
-        assert!(fetch(std::slice::from_ref(&url), Some(epoch_blocks + 100)).await.unwrap_err().to_string().contains("isn't finalized"));
+        assert_eq!(fetch(std::slice::from_ref(&url), Some(3), None).await.unwrap().1.hash, chain.lock().hash_at(3).unwrap());
+        assert_eq!(fetch(std::slice::from_ref(&url), Some(0), None).await.unwrap().1, genesis_checkpoint(&g));
+        assert!(fetch(std::slice::from_ref(&url), Some(epoch_blocks + 100), None).await.unwrap_err().to_string().contains("isn't finalized"));
+        // Pinned to another genesis: refused before anything else is fetched.
+        let err = fetch(std::slice::from_ref(&url), None, Some(&"ab".repeat(32))).await.unwrap_err().to_string();
+        assert!(err.contains(&format!("the peers serve genesis {}, not the pinned {}", genesis_hash(&g), "ab".repeat(32))), "{err}");
         // A peer that serves another block at that height is called out.
         let real = url.clone();
         let liar = Router::new()
@@ -726,7 +735,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let liar_url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, liar).await.unwrap() });
-        let err = fetch(&[url.clone(), liar_url], Some(3)).await.unwrap_err().to_string();
+        let err = fetch(&[url.clone(), liar_url], Some(3), None).await.unwrap_err().to_string();
         assert!(err.contains("disagree"), "{err}");
         drop(chain);
         std::fs::remove_dir_all(root).ok();

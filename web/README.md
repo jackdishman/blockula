@@ -16,14 +16,18 @@ Everything is a build-time `NEXT_PUBLIC_*` variable.
 
 | Variable | Default | |
 |---|---|---|
-| `NEXT_PUBLIC_NETWORK` | (unset) | `mainnet` makes a mainnet deployment: mainnet is the default network, browser-only keys are off, and the build fails unless the three variables below are set and the rpId isn't on a shared hosting domain (`*.vercel.app`, `*.pages.dev`, …). |
-| `NEXT_PUBLIC_RP_ID` | `blockula-wallet.vercel.app` | The passkey relying-party id. Passkeys, and so wallets, are bound to it for good. Mainnet needs a domain the project owns (DEC-8). |
+| `NEXT_PUBLIC_NETWORK` | (unset) | `mainnet` makes a mainnet deployment: mainnet is the default network, browser-only keys are off, and the build fails unless `NEXT_PUBLIC_RP_ID`, `NEXT_PUBLIC_MAINNET_RPC` and `NEXT_PUBLIC_MAINNET_GENESIS_HASH` are set and the rpId isn't on a shared hosting domain (`*.vercel.app`, `*.pages.dev`, …). |
+| `NEXT_PUBLIC_RP_ID` | `blockula-wallet.vercel.app` | The passkey relying-party id. Passkeys, and so wallets, are bound to it for good. Mainnet needs a domain the project owns (DEC-8). Payment links point at this host. |
 | `NEXT_PUBLIC_MAINNET_RPC` | (unset) | Adds the Mainnet network (chain `blockula-1`, prefix `boo`). Hidden until set. |
 | `NEXT_PUBLIC_MAINNET_GENESIS_HASH` | (unset) | Mainnet's genesis hash. Hard-code it in `lib/config.ts` once the ceremony has produced it. |
+| `NEXT_PUBLIC_MAINNET_WITNESSES` | (unset) | Comma-separated `https://` URLs of other mainnet nodes (independent operators'). Names that end up in a signature are proven against them first (audit gap-7-1); without any, a name is the selected node's word and the wallet says so. |
 | `NEXT_PUBLIC_BLOCKULA_RPC` | `https://blockula-testnet.fly.dev` | The testnet's RPC. On a mainnet deployment, the testnet is listed only if this is set. |
-| `NEXT_PUBLIC_TESTNET_CHAIN_ID` | `blockula-testnet` | The chain id the testnet node must report. |
-| `NEXT_PUBLIC_TESTNET_GENESIS_HASH` | (unset) | Pins the testnet's genesis too. |
-| `NEXT_PUBLIC_TESTNET_PREFIX` | `boo` | The testnet's address prefix. Protocol v1 testnets use `tboo` (DEC-7). |
+| `NEXT_PUBLIC_TESTNET_CHAIN_ID` | `blockula-testnet-2` | The chain id the testnet node must report (`TESTNET_CHAIN_ID`). A relaunched testnet takes a new chain id, so set this only for another testnet. |
+| `NEXT_PUBLIC_TESTNET_GENESIS_HASH` | `TESTNET_GENESIS_HASH` in `lib/config.ts` (unset until the release after the launch pins it, `scripts/pin-network.sh`) | Pins the testnet's genesis. Set it on Vercel right after a launch (`deploy/launch.sh` prints the hash), before the release that builds it in; when both are set, this one wins. |
+| `NEXT_PUBLIC_TESTNET_PREFIX` | `tboo` | The testnet's address prefix (DEC-7). |
+| `NEXT_PUBLIC_TESTNET_WITNESSES` | (unset) | Comma-separated `https://` URLs of other nodes of the testnet, as for mainnet. The public testnet has one public node today (`blockula-testnet.fly.dev`, the RPC itself, which doesn't count), so leave it unset until there's a second, independently run one. |
+
+Witness URLs must be `https://` (or `http://localhost` / `http://127.0.0.1` for development), are deduplicated, and the selected RPC itself is dropped from the list; a malformed one fails the build. The CSP's `connect-src` allows every configured node and witness (`lib/csp.ts`).
 
 ## Stake and Governance (protocol v1)
 
