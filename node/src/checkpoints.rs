@@ -351,7 +351,7 @@ pub async fn fetch(peers: &[String], height: Option<u64>) -> Result<(Genesis, Ch
     for u in &urls {
         let block = get(format!("{u}/api/block/{height}")).await?;
         let hash = block["hash"].as_str().ok_or_else(|| anyhow!("{u}/api/block/{height} has no hash"))?.to_string();
-        let reg = crate::snapshot::fetch_history(&client, u, trusted.epoch, epoch).await?;
+        let reg = crate::snapshot::fetch_history(&client, u, trusted.epoch, epoch, &crate::snapshot::DownloadLimits::default()).await?;
         let root = match reg.sets.get(&reg.base) {
             Some(set) if reg.base > trusted.epoch => {
                 eprintln!("⚠️  {u} keeps validator-set history from epoch {} on, after this release's newest trusted set (epoch {}): checking it from there; only the peers' agreement vouches for that set", reg.base, trusted.epoch);

@@ -68,6 +68,19 @@ pub const CHUNK_SLOW: std::time::Duration = std::time::Duration::from_secs(10);
 /// [`DOWNLOAD_SLACK`], or the joiner gives up on that manifest and asks the next peer (F62).
 pub const DOWNLOAD_PER_CHUNK: std::time::Duration = std::time::Duration::from_secs(2);
 pub const DOWNLOAD_SLACK: std::time::Duration = std::time::Duration::from_secs(120);
+/// A peer's validator-set history (its `/api/epochs` pages, from the joiner's root through the
+/// manifest's epoch) must arrive within this per epoch it spans (each page that continues holds
+/// a set change, so there are at most that many pages; 2 s is ~0.4 MiB/s for a change of a
+/// hundred keys and their quorum) plus [`HISTORY_SLACK`], and never takes longer than
+/// [`HISTORY_MAX`] (review-fix-sync-1).
+pub const HISTORY_PER_EPOCH: std::time::Duration = std::time::Duration::from_secs(2);
+pub const HISTORY_SLACK: std::time::Duration = std::time::Duration::from_secs(120);
+pub const HISTORY_MAX: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// A manifest is refused before anything else is fetched for it when it certifies a block past
+/// the height the chain can have reached by now plus this much clock difference (blocks are at
+/// least `block_time_ms` apart from the genesis on; validators refuse timestamps more than
+/// `consensus::MAX_CLOCK_DRIFT_MS` ahead).
+pub const FUTURE_SLACK_MS: u64 = 3_600_000;
 
 /// Blocks between long-lived snapshots at this chain's block time: the fewest whole checkpoint
 /// intervals that last [`LONG_SNAPSHOT_MS`] (900 blocks at 1 s blocks; one interval on a chain
@@ -642,8 +655,19 @@ pub fn verify_manifest_trusted(g: &Genesis, m: &Manifest, history: &EpochRegistr
 }
 
 /// A peer's validator-set history from `from` through at least `through`, assembled from its
-/// `/api/epochs` pages (each capped, and the whole at `epochs::MAX_HISTORY_BYTES`).
-pub async fn fetch_history(client: &reqwest::Client, peer: &str, from: u64, through: u64) -> Result<EpochRegistry> {
+/// `/api/epochs` pages (each capped, and the whole at `epochs::MAX_HISTORY_BYTES`), within
+/// [`DownloadLimits::history`]. A page that says there's more must hold a set change and end
+/// where the next one starts, as [`EpochRegistry::slice`] pages do, so there are at most as many
+/// as the epochs spanned: a peer can't hold a joiner with an endless stream of pages
+/// (review-fix-sync-1).
+pub async fn fetch_history(client: &reqwest::Client, peer: &str, from: u64, through: u64, limits: &DownloadLimits) -> Result<EpochRegistry> {
+    let deadline = limits.history(from, through);
+    tokio::time::timeout(deadline, fetch_pages(client, peer, from, through))
+        .await
+        .map_err(|_| anyhow!("{peer}'s validator-set history from epoch {from} through {through} didn't arrive within {}s", deadline.as_secs()))?
+}
+
+async fn fetch_pages(client: &reqwest::Client, peer: &str, from: u64, through: u64) -> Result<EpochRegistry> {
     #[derive(Deserialize)]
     struct Next {
         #[serde(default)]
@@ -658,6 +682,12 @@ pub async fn fetch_history(client: &reqwest::Client, peer: &str, from: u64, thro
         ensure!(total <= epochs::MAX_HISTORY_BYTES, "{peer}'s validator-set history from epoch {from} passes {} MiB", epochs::MAX_HISTORY_BYTES >> 20);
         let page: EpochRegistry = serde_json::from_slice(&body).with_context(|| format!("{peer}/api/epochs?from={at}"))?;
         let next = serde_json::from_slice::<Next>(&body).map(|n| n.next).unwrap_or_default();
+        if let Some(n) = next {
+            ensure!(
+                n > at && n == page.known_through && page.changes().any(|e| e <= page.known_through),
+                "{peer}/api/epochs?from={at}: a page that continues must hold a set change and end where the next one starts"
+            );
+        }
         match &mut out {
             None => out = Some(page),
             Some(o) => o.append_page(&page)?,
@@ -796,16 +826,20 @@ impl Read for Chunks<'_> {
 /// `trust`. Peers are tried in a random order; each one's manifest is downloaded from all of them
 /// ([`download_chunks`]).
 pub async fn fast_sync(chain: &crate::consensus::Shared, peers: &[String], trust: &crate::checkpoints::Trust) -> Result<u64> {
-    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(60)).build()?;
+    fast_sync_with(chain, peers, trust, &DownloadLimits::default()).await
+}
+
+/// [`fast_sync`] within `limits`.
+pub async fn fast_sync_with(chain: &crate::consensus::Shared, peers: &[String], trust: &crate::checkpoints::Trust, limits: &DownloadLimits) -> Result<u64> {
+    let client = reqwest::Client::builder().timeout(MANIFEST_TIMEOUT).build()?;
     let g = chain.lock().genesis.clone();
     let mut last_err = anyhow!("no peers");
     // A peer that's only behind a checkpoint says a later snapshot will do: report that one.
     let mut behind = None;
     // In a new order each run, so no listed endpoint is always the one asked first (F62).
     let peers = shuffled(peers);
-    let limits = DownloadLimits::default();
     for peer in &peers {
-        match fast_sync_from(&client, &g, chain, peer, &peers, trust, &limits).await {
+        match fast_sync_from(&client, &g, chain, peer, &peers, trust, limits).await {
             Ok(h) => return Ok(h),
             Err(e) => {
                 tracing::debug!(peer = %peer, error = %e, "fast sync failed");
@@ -835,19 +869,36 @@ fn shuffled(peers: &[String]) -> Vec<String> {
     out
 }
 
-/// How long a snapshot download may take ([`CHUNK_TIMEOUT`], [`CHUNK_SLOW`],
-/// [`DOWNLOAD_PER_CHUNK`], [`DOWNLOAD_SLACK`]; tests shorten them).
+/// How long a fast-sync attempt may take: the snapshot download ([`CHUNK_TIMEOUT`],
+/// [`CHUNK_SLOW`], [`DOWNLOAD_PER_CHUNK`], [`DOWNLOAD_SLACK`]) and the history before it
+/// ([`HISTORY_PER_EPOCH`], [`HISTORY_SLACK`], [`HISTORY_MAX`]); tests shorten them.
 #[derive(Clone, Debug)]
 pub struct DownloadLimits {
     pub chunk_timeout: std::time::Duration,
     pub slow: std::time::Duration,
     pub per_chunk: std::time::Duration,
     pub slack: std::time::Duration,
+    pub history_per_epoch: std::time::Duration,
+    pub history_slack: std::time::Duration,
+    pub history_max: std::time::Duration,
 }
 
 impl Default for DownloadLimits {
     fn default() -> Self {
-        Self { chunk_timeout: CHUNK_TIMEOUT, slow: CHUNK_SLOW, per_chunk: DOWNLOAD_PER_CHUNK, slack: DOWNLOAD_SLACK }
+        Self { chunk_timeout: CHUNK_TIMEOUT, slow: CHUNK_SLOW, per_chunk: DOWNLOAD_PER_CHUNK, slack: DOWNLOAD_SLACK, history_per_epoch: HISTORY_PER_EPOCH, history_slack: HISTORY_SLACK, history_max: HISTORY_MAX }
+    }
+}
+
+impl DownloadLimits {
+    /// The most a download of `chunks` chunks may take.
+    pub fn download(&self, chunks: usize) -> std::time::Duration {
+        self.slack.saturating_add(self.per_chunk.saturating_mul(u32::try_from(chunks).unwrap_or(u32::MAX)))
+    }
+
+    /// The most a history from epoch `from` through `through` may take.
+    pub fn history(&self, from: u64, through: u64) -> std::time::Duration {
+        let epochs = u32::try_from(through.saturating_sub(from).saturating_add(1)).unwrap_or(u32::MAX);
+        self.history_slack.saturating_add(self.history_per_epoch.saturating_mul(epochs)).min(self.history_max)
     }
 }
 
@@ -864,7 +915,7 @@ pub async fn download_chunks(client: &reqwest::Client, sources: &[String], v: &V
     const SLOW: u8 = 1;
     const FAILED: u8 = 2;
     ensure!(!sources.is_empty(), "no peer to download from");
-    let deadline = limits.slack.saturating_add(limits.per_chunk.saturating_mul(u32::try_from(v.chunks.len()).unwrap_or(u32::MAX)));
+    let deadline = limits.download(v.chunks.len());
     let health: Vec<AtomicU8> = sources.iter().map(|_| AtomicU8::new(OK)).collect();
     let fetch = |i: usize| {
         let health = &health;
@@ -914,13 +965,31 @@ pub async fn download_chunks(client: &reqwest::Client, sources: &[String], v: &V
     tokio::time::timeout(deadline, all).await.map_err(|_| anyhow!("the snapshot's {} chunks didn't arrive within {}s", v.chunks.len(), deadline.as_secs()))?
 }
 
+/// How long the request for a manifest (and any other single request of a fast sync) may take.
+pub const MANIFEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 async fn fast_sync_from(client: &reqwest::Client, g: &Genesis, chain: &crate::consensus::Shared, peer: &str, peers: &[String], trust: &crate::checkpoints::Trust, limits: &DownloadLimits) -> Result<u64> {
     // A snapshot older than our newest checkpoint is no use: ask for one that reaches it.
     let body = crate::node::get_capped(client, &format!("{peer}/api/snapshot/latest?min={}", trust.newest()), 64 << 20).await?;
     let m: Manifest = serde_json::from_slice(&body)?;
     ensure!(m.blocks.len() as u64 <= 4 * CHECKPOINT_INTERVAL, "the manifest lists {} blocks", m.blocks.len());
+    ensure!(m.chunks.len() <= MAX_SNAPSHOT_CHUNKS, "manifest lists {} chunks, at most {MAX_SNAPSHOT_CHUNKS}", m.chunks.len());
+    let last = m.height.saturating_add(m.blocks.len() as u64);
+    // Nothing is fetched for a manifest of blocks the chain can't have yet: the history it would
+    // need is the peer's to make up, as long as it likes (review-fix-sync-1).
+    let expected = trust.expected_height(crate::chain::now_ms().saturating_add(FUTURE_SLACK_MS));
+    ensure!(last <= expected, "the manifest certifies #{last}, past any height the chain can have reached by now (#{expected})");
+    // Ends before our newest checkpoint (an old-binary peer serves its newest anyway): a later
+    // snapshot will do, so say so without fetching anything for it (review-fix-sync-3).
+    if trust.newest() > last {
+        return Err(anyhow::Error::new(SnapshotBehind { certified: last, checkpoint: trust.newest() }));
+    }
+    // One deadline over the rest of the attempt: the history, then the chunks (F62).
+    let (from, through) = (trusted_root(g, &m, trust).epoch, last_epoch(g, &m));
+    let deadline = tokio::time::Instant::now() + limits.history(from, through).saturating_add(limits.download(m.chunks.len()));
+    let late = || anyhow!("fast sync from {peer} didn't finish within its deadline");
     // The history from our newest trusted root through the manifest's epoch, nothing more.
-    let history = fetch_history(client, peer, trusted_root(g, &m, trust).epoch, last_epoch(g, &m)).await?;
+    let history = tokio::time::timeout_at(deadline, fetch_history(client, peer, from, through, limits)).await.map_err(|_| late())??;
     let v = verify_manifest_trusted(g, &m, &history, trust)?;
     println!("📦 snapshot #{} ({} chunks) certified by validators; downloading…", v.height, v.chunks.len());
     // Each chunk is checked as it arrives and appended to a file: memory holds a few chunks at
@@ -929,7 +998,7 @@ async fn fast_sync_from(client: &reqwest::Client, g: &Genesis, chain: &crate::co
     let mut file = std::io::BufWriter::new(std::fs::File::create(&part)?);
     // The manifest's peer first, then the others (any of them may hold the same snapshot).
     let sources: Vec<String> = std::iter::once(peer.to_string()).chain(peers.iter().filter(|p| *p != peer).cloned()).collect();
-    download_chunks(client, &sources, &v, &mut file, limits).await?;
+    tokio::time::timeout_at(deadline, download_chunks(client, &sources, &v, &mut file, limits)).await.map_err(|_| late())??;
     file.into_inner().map_err(|e| e.into_error())?.sync_all()?;
     let state = restore_file(&v, &part)?;
     // The epoch anchor (if it's before the snapshot) came certified in the manifest.
