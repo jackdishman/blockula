@@ -1,14 +1,13 @@
 "use client";
 
-import { parseFang } from "@blockula/sdk";
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { RequireWallet } from "@/components/Gate";
 import { Apparition } from "@/components/Haunt";
 import { QrCode } from "@/components/QrCode";
-import { Copy, ExplorerLink, Tip } from "@/components/ui";
+import { Copy, ExplorerLink, Spinner, Tip } from "@/components/ui";
 import { DEFAULT_NETWORK, explorer, NETWORK, walletUrl } from "@/lib/config";
-import { payLink } from "@/lib/paylink";
+import { payLink, requestAmountError } from "@/lib/paylink";
 import { useUnlocked } from "@/lib/wallet";
 
 export default function ReceivePage() {
@@ -59,21 +58,22 @@ function Receive() {
 
 /** QR code + payment link that opens Send with the recipient (and optionally amount and memo) filled in. */
 function PayRequest({ to }: { to: string }) {
+  const { client, status } = useUnlocked();
   const [amount, setAmount] = useState("");
   const [memo, setMemo] = useState("");
   const [canShare, setCanShare] = useState(false);
   useEffect(() => setCanShare(typeof navigator.share === "function"), []);
 
-  let amountErr: string | null = null;
-  try {
-    if (amount.trim() && parseFang(amount) === 0n) amountErr = "Enter more than zero, or leave it empty.";
-  } catch {
-    amountErr = "Use a number like 1 or 0.25 (up to 9 decimals).";
-  }
+  // At most a u64 of drops, like the chain: a longer amount made the link too long for a QR code (main-11-2).
+  const amountErr = requestAmountError(amount);
   const memoErr = utf8Len(memo) > 256 ? "Memos are limited to 256 bytes." : null;
+  // The link says which chain it's for (a check for the payer's wallet, never a switch: main-11-1):
+  // the pinned one, complete once the node's status has filled in what configuration didn't.
+  const chain = client.pin.chainId && (client.pin.genesisHash || status) ? client.pin : null;
   // A bad amount or memo is left out of the link rather than passed on to the payer.
-  const link = payLink(walletUrl(), to, amountErr ? "" : amount, memoErr ? "" : memo);
+  const link = chain?.chainId ? payLink(walletUrl(), to, amountErr ? "" : amount, memoErr ? "" : memo, chain) : null;
 
+  if (!link) return <section className="card"><Spinner>Making your payment link…</Spinner></section>;
   return (
     <section className="card stack">
       <span className="eyebrow">Scan to pay</span>
@@ -93,7 +93,7 @@ function PayRequest({ to }: { to: string }) {
         <input value={memo} onChange={(e) => setMemo(e.target.value)} placeholder="for the pumpkins" />
       </label>
       {memoErr && <span className="warn">{memoErr}</span>}
-      <div className="mono address small">{link}</div>
+      <div className="mono address small" data-testid="paylink">{link}</div>
       <div className="row-gap">
         <Copy text={link} label="Copy link" />
         {canShare && (
@@ -104,7 +104,7 @@ function PayRequest({ to }: { to: string }) {
       </div>
       {NETWORK.key !== DEFAULT_NETWORK.key && (
         <span className="warn small">
-          You&apos;re on {NETWORK.label}. The link opens the wallet on whatever network the payer has picked, usually {DEFAULT_NETWORK.label}.
+          You&apos;re on {NETWORK.label}. The link opens the wallet on whatever network the payer has picked, usually {DEFAULT_NETWORK.label}; it says it&apos;s for {NETWORK.label}, so a wallet on another network won&apos;t fill it in.
         </span>
       )}
       <span className="dim small">The link only fills in the form: the payer still sees who it goes to and signs it themselves.</span>

@@ -4,8 +4,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { test } from "node:test";
-import { encodeQr, qrPath } from "./qr.ts";
-import { payLink } from "./paylink.ts";
+import { encodeQr, qrPath, qrSvg } from "./qr.ts";
+import { checkLinkChain, linkChain, MAX_DROPS, payLink, requestAmountError } from "./paylink.ts";
 
 const digest = (m) => createHash("sha256").update(m.map((r) => r.map((c) => (c ? "1" : "0")).join("")).join("\n")).digest("hex");
 
@@ -46,6 +46,9 @@ test("matches the reference encoder for every mask", () => {
 test("rejects data beyond version 40", () => {
   assert.equal(encodeQr("x".repeat(2331)).length, 177);
   assert.throws(() => encodeQr("x".repeat(2332)), RangeError);
+  // What QrCode draws: null instead of the RangeError, so /receive shows a note (audit main-11-2).
+  assert.equal(qrSvg("x".repeat(2332)), null);
+  assert.deepEqual(qrSvg("boo"), { size: 29, d: qrPath(encodeQr("boo"), 4) });
 });
 
 test("path merges runs and offsets by the quiet zone", () => {
@@ -65,4 +68,41 @@ test("payment links round-trip through the query string Send reads", () => {
   assert.equal(url.searchParams.get("memo"), "trick or treat & a+b 🧛");
   assert.equal(payLink(`${BASE}/`, "alice.boo"), `${BASE}/send?to=alice.boo`);
   assert.equal(payLink(BASE, "alice.boo", " ", ""), `${BASE}/send?to=alice.boo`);
+});
+
+const TESTNET = { chainId: "blockula-testnet", genesisHash: "6e".repeat(32) };
+
+test("payment links say which chain they were made for, as a check (audit main-11-1)", () => {
+  const url = new URL(payLink(BASE, "alice.boo", "1.5", "m", TESTNET));
+  assert.equal(url.searchParams.get("chain"), "blockula-testnet");
+  assert.equal(url.searchParams.get("genesis"), "6e".repeat(8), "the first 16 hex digits of the genesis hash");
+  assert.equal(payLink(BASE, "alice.boo", "", "", { chainId: "dev" }), `${BASE}/send?to=alice.boo&chain=dev`, "no genesis when the pin doesn't know it");
+  assert.equal(payLink(BASE, "alice.boo", "", "", { genesisHash: "6e".repeat(32) }), `${BASE}/send?to=alice.boo`, "nothing without a chain id");
+  const read = (link) => linkChain(new URL(link).searchParams);
+  assert.deepEqual(read(payLink(BASE, "alice.boo", "1", "", TESTNET)), { chainId: "blockula-testnet", genesis: "6e".repeat(8) });
+  assert.equal(read(`${BASE}/send?to=alice.boo&amount=1`), null, "an older link doesn't say");
+  assert.equal(read(`${BASE}/send?to=alice.boo&chain=`), null);
+  const check = (link, wallet = TESTNET) => checkLinkChain(link && read(link), wallet);
+  assert.deepEqual(check(payLink(BASE, "a.boo", "1", "", TESTNET)), { state: "match" });
+  assert.deepEqual(check(payLink(BASE, "a.boo", "1", "", { chainId: "blockula-1", genesisHash: "4d".repeat(32) })), { state: "mismatch", why: "chain" });
+  assert.deepEqual(check(payLink(BASE, "a.boo", "1", "", { chainId: "blockula-testnet", genesisHash: "00".repeat(32) })), { state: "mismatch", why: "genesis" }, "another instance of the chain id");
+  assert.deepEqual(check(`${BASE}/send?to=a.boo&chain=blockula-testnet&genesis=6e`), { state: "mismatch", why: "genesis" }, "a short genesis would match too much");
+  assert.deepEqual(check(`${BASE}/send?to=a.boo&chain=blockula-testnet&genesis=6E6E6E6E6E6E6E6E`), { state: "match" }, "hex in either case");
+  assert.deepEqual(check(`${BASE}/send?to=a.boo&chain=blockula-testnet`), { state: "match" }, "a chain id alone checks the chain id");
+  assert.deepEqual(check(`${BASE}/send?to=a.boo&amount=1`), { state: "unchecked" });
+  assert.deepEqual(check(payLink(BASE, "a.boo", "1", "", TESTNET), {}), { state: "pending" }, "the wallet doesn't know its chain yet");
+  assert.deepEqual(check(payLink(BASE, "a.boo", "1", "", TESTNET), { chainId: "blockula-testnet" }), { state: "pending" }, "nor its genesis");
+  assert.deepEqual(check(payLink(BASE, "a.boo", "1", "", TESTNET), { chainId: "blockula-1" }), { state: "mismatch", why: "chain" }, "a chain id mismatch needs no genesis");
+});
+
+test("payment requests take amounts the chain can hold, and every link they make fits a QR code (audit main-11-2)", () => {
+  assert.equal(MAX_DROPS, 2n ** 64n - 1n);
+  for (const ok of ["", " ", "1", "0.25", "1.000000001", " 2 ", "18446744073.709551615"]) assert.equal(requestAmountError(ok), null, ok);
+  for (const [bad, why] of [["0", /more than zero/], ["0.000", /more than zero/], ["18446744073.709551616", /more FANG than there can ever be/], ["9".repeat(3000), /more FANG than there can ever be/], ["1.0000000001", /up to 9 decimals/], ["-1", /number/], ["1e3", /number/], ["0x10", /number/], [".5", /number/], ["1,5", /number/], ["Infinity", /number/]]) {
+    assert.match(requestAmountError(bad), why, bad.slice(0, 30));
+  }
+  // The longest link /receive can make: a 63-character name, the largest amount, a 256-byte memo
+  // of the costliest characters, a long chain id.
+  const longest = payLink(BASE, `${"v".repeat(63)}.boo`, "18446744073.709551615", "🧛".repeat(64), { chainId: "c".repeat(64), genesisHash: "ab".repeat(32) });
+  assert.ok(qrSvg(longest) !== null, `${longest.length} characters fit`);
 });

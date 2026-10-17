@@ -183,6 +183,7 @@ input.mono { font-family: var(--mono); font-size: 16px; }
 .address.small { font-size: 13px; padding: 8px 12px; }
 .qr-frame { align-self: center; width: min(100%, 280px); border: 1.5px solid var(--ink); box-shadow: 4px 4px 0 var(--ink); }
 .qr { display: block; width: 100%; height: auto; }
+.qr-too-long { aspect-ratio: 1; display: flex; align-items: center; justify-content: center; padding: 1.5rem; text-align: center; background: #fff; color: #000; }
 
 /* Activity, as a ledger */
 .activity { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--ink); }

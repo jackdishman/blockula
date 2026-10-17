@@ -56,6 +56,21 @@ export function encodeQr(text: string, opts: { mask?: number } = {}): QrMatrix {
 }
 
 /**
+ * What QrCode draws for `text`: the SVG's size (with a `border`-module quiet zone) and path, or
+ * `null` when the text is too long for any QR code (`encodeQr` throws a RangeError then), so the
+ * page shows that instead of crashing (audit main-11-2).
+ */
+export function qrSvg(text: string, border = 4): { size: number; d: string } | null {
+  try {
+    const m = encodeQr(text);
+    return { size: m.length + 2 * border, d: qrPath(m, border) };
+  } catch (e) {
+    if (e instanceof RangeError) return null;
+    throw e;
+  }
+}
+
+/**
  * SVG path data for the dark modules, one unit per module, offset by `border` units of quiet
  * zone. Horizontal runs are merged so dense codes stay a reasonable size in the DOM.
  */
