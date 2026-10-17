@@ -43,7 +43,7 @@ Protocol v1 adds, in new modules (estimates): staking, slashing and evidence (~2
 
 **Clients, ~3,100 lines today:** `sdk-ts/src` 686 (`tx.ts` 253, `index.ts` 362, `passkey.ts` 71), `mcp/src` 327, `web/` ~2,100 (Next.js pages and components).
 
-**Supply chain (review only, light):** `.github/workflows/`, `scripts/install.sh`, `scripts/release-build.sh`, `scripts/release-sig.mjs`, `deploy/`, ~1,200 lines.
+**Supply chain (review only, light):** `.github/workflows/`, `scripts/install.sh`, `scripts/release-build.sh`, `scripts/release-sig.mjs`, `scripts/check-release-files.sh`, `node/src/release_cli.rs` (`blockula release install|fetch|pin`, the operators' install path), `deploy/`, ~1,900 lines.
 
 **Dependencies in scope for their use, not their internals:** Commonware `=2026.9.0` (`consensus::simplex` and `marshal` (BETA; the `Application` trait and `marshal::application` are ALPHA), `p2p::authenticated::discovery`, `stream`, `storage` journals and archives, `cryptography`, `codec`, `runtime`); `ml-dsa 0.1.1` (RustCrypto, self-described as never independently audited); `@noble/post-quantum 0.7.1` (self-audited); `blake3`, `bech32`. We'd like the firm's view on whether the Commonware modules we use are covered by Commonware's own audits, and on our use of both ML-DSA implementations (SEC-2).
 

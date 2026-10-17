@@ -16,7 +16,7 @@ Some of what's below needs protocol v1 code that is still landing. Those parts a
 8. [Incident response](#incident-response)
 9. [Runbooks](#runbooks) (one per alert)
 10. [Weak subjectivity](#weak-subjectivity): what a joining node trusts, and checkpoints in releases
-11. [Releases](#releases), [npm packages](#npm-packages) and [repository settings](#repository-settings-github)
+11. [Releases](#releases) (and [installing and upgrading](#installing-and-upgrading) one), [npm packages](#npm-packages) and [repository settings](#repository-settings-github)
 12. [Monitoring](#monitoring)
 13. [Checklists](#checklists)
 
@@ -618,7 +618,7 @@ Every release is reproducible, carries SLSA build provenance, and is signed offl
 
 - One ML-DSA-65 key, generated on the offline signing machine (set up as in step 4 above: the key and a verified `blockula`, nothing else) with `blockula keygen > release-key.json`. Its **key id** is the hex BLAKE3 of the public key: `blockula release keyid --key release-key.json`. The key doesn't exist yet; generate it this way from the start, never on a machine that has had a checkout or an npm tree.
 - Publish the key id in SECURITY.md, this file, `scripts/install.sh` (`BUILTIN_KEY_ID`), `node/src/release_cli.rs` (`BUILTIN_KEY_ID`, the key a fresh `blockula release install` trusts when nothing is pinned; a test keeps the two equal), the website, the operators' channel and the project's social accounts, so a single compromised channel can't swap it. **Release key id:** *not generated yet* (the maintainer fills this in at the key ceremony).
-- **Operators pin it once.** Their first `blockula release install --key-id K` writes K to `~/.blockula/release-key-id` once the release verifies (`blockula release pin --key-id K` pins it by hand; `blockula release pin` shows it). From then on, every `blockula release install`, `fetch` and `verify` without `--key-id` checks against the pin, and a different `--key-id` is refused. They never take the key id from a release again, or from SECURITY.md, which a compromised GitHub account can edit.
+- **Operators pin it once.** Their first `blockula release install --key-id K` writes K to `~/.blockula/release-key-id` once the release verifies (`blockula release pin --key-id K` pins it by hand; `blockula release pin` shows it). From then on, `blockula release install` and `fetch` check against the pin and refuse a different `--key-id`, and `blockula release verify` without `--key-id` uses the pin too. They never take the key id from a release again, or from SECURITY.md, which a compromised GitHub account can edit.
 - Back it up like a validator key (encrypted, offline, two locations). **Rotation:** on the offline machine, sign a statement naming the new key id with the old key, and publish both through the same channels as the key id:
 
   ```bash
