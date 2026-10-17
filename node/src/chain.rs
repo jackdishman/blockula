@@ -3825,7 +3825,9 @@ pub const MAX_PENDING_PER_SENDER: usize = 64;
 /// lane of its own: outside `MAX_MEMPOOL`, never evicted for a higher tip, and first in proposals
 /// (audit F32/F56). A validator owes one commitment and one reveal an epoch, and each fault or
 /// claim is reported or attested once (the chain refuses repeats), so the lane stays small: at
-/// most 2 × 64 validators × 5 kinds × this many txs. Duties past it queue like any tx.
+/// most 2 × 64 validators × 5 kinds × this many txs (a reveal still owed by a validator that left
+/// the set counts too). Duties past it, or behind their sender's other txs (the lane is a prefix of
+/// each sender's queue), queue like any tx and join the lane once what's ahead of them is gone.
 pub const DUTY_LANE_PER_KIND: usize = 2;
 
 /// Mempool txs in the order a proposal takes them: those `first` picks (the validator-duty lane,
