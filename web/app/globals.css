@@ -99,7 +99,10 @@ main > .banner { margin: 0; border: 1px solid var(--ink); }
 /* Haunted ASCII (lib/ascii). The backdrop sits between the paper (body's background; body is
    isolated so it paints first) and the content. Props are 3D ASCII in the hero spots. */
 .haunt { position: fixed; inset: 0; width: 100%; height: 100%; z-index: -1; pointer-events: none; }
-.apparition { display: block; flex: none; max-width: 100%; height: auto; margin: -6px 0 4px; }
+.apparition { display: block; flex: none; align-self: center; max-width: 100%; height: auto; margin: -6px 0 4px; }
+.balance-card .apparition { margin: -14px 0 -4px; }
+.motion-toggle { margin-top: 8px; font: 400 14px var(--caps); letter-spacing: 0.06em; }
+.graveyard h2 { margin: 0; }
 @media print { .haunt { display: none; } }
 
 /* Panels */
@@ -172,6 +175,13 @@ input.mono { font-family: var(--mono); font-size: 16px; }
 .activity-main { min-width: 0; }
 .activity-memo { display: block; font-style: italic; color: var(--dim); font-size: 16px; }
 .activity-height { font-family: var(--mono); font-size: 14px; color: var(--dim); }
+/* A payment that just arrived glows like a candle, then gutters back to ink. */
+.activity li.fresh .activity-row { animation: candlelit 4s ease-out; }
+.activity li.fresh .activity-kind.in { color: var(--blood); }
+@keyframes candlelit {
+  0%, 20% { background: rgba(192, 86, 27, 0.24); box-shadow: inset 3px 0 0 var(--blood); }
+  100% { background: transparent; box-shadow: inset 3px 0 0 transparent; }
+}
 
 /* Tutorial */
 .progress { height: 3px; background: var(--hair); margin: 2px 0 6px; }

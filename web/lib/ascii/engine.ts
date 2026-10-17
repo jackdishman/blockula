@@ -15,7 +15,7 @@
 /** Cell height as a multiple of font size. */
 export const LINE = 1.16;
 
-export const CHARS = " .,'`:;-~_=+*^v<>|/\\!()#%@ox";
+export const CHARS = " .,'`:;-~_=+*^v<>|/\\!()#%@oxABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 const CODES = Uint16Array.from(CHARS, (c) => c.charCodeAt(0));
 const LOOKUP = new Int16Array(128);
 for (let i = 0; i < CHARS.length; i++) LOOKUP[CHARS.charCodeAt(i)] = i;
@@ -25,7 +25,8 @@ export const glyph = (c: string) => LOOKUP[c.charCodeAt(0) & 127] ?? 0;
 export const INK = 0;
 export const BLOOD = 1;
 export const EMBER = 2;
-const COLORS = ["#17120f", "#8d1418", "#c0561b"];
+export const GOLD = 3;
+const COLORS = ["#17120f", "#8d1418", "#c0561b", "#8a5410"];
 /** Opacity is quantized to this many steps so cells can share text runs. */
 const LEVELS = 12;
 
@@ -207,6 +208,10 @@ export interface Hit {
   mat: number;
   /** SURFACE: how much light the ink reflects (1 = bare paper when lit). GLOW: brightness. */
   value: number;
+  /** Print this glyph instead of the shading ramp (lettering on a surface); 0 for none. */
+  glyph: number;
+  /** Color for `glyph`. */
+  tint: number;
 }
 
 /** Per-frame inputs a scene poses itself from. */
@@ -217,6 +222,15 @@ export interface Frame {
   lookY: number;
   /** Extra rotation from scrolling or a busy state, radians. */
   spin: number;
+  /** 1 right after the cursor rushes at the object, easing back to 0. */
+  fright?: number;
+  /** Lettering for scenes that carry some (a gravestone). */
+  text?: string;
+  /** Size of one character cell in object units at the origin, and the grid; set by the renderer. */
+  cellW?: number;
+  cellH?: number;
+  cols?: number;
+  rows?: number;
 }
 
 export interface Scene {
@@ -281,6 +295,24 @@ export const sdCapsule = (x: number, y: number, z: number, ax: number, ay: numbe
   const k = clamp((px * qx + py * qy + pz * qz) / (qx * qx + qy * qy + qz * qz));
   return Math.hypot(px - qx * k, py - qy * k, pz - qz * k) - r;
 };
+/** Approximate ellipsoid at the origin with radii (a, b, c). */
+export const sdEllipsoid = (x: number, y: number, z: number, a: number, b: number, c: number) => {
+  const k0 = Math.hypot(x / a, y / b, z / c), k1 = Math.hypot(x / (a * a), y / (b * b), z / (c * c));
+  return k1 ? (k0 * (k0 - 1)) / k1 : -Math.min(a, b, c);
+};
+/** A cone with rounded ends: radius r1 at a, r2 at b. */
+export const sdRoundCone = (x: number, y: number, z: number, ax: number, ay: number, az: number, bx: number, by: number, bz: number, r1: number, r2: number) => {
+  const bax = bx - ax, bay = by - ay, baz = bz - az;
+  const l2 = bax * bax + bay * bay + baz * baz, rr = r1 - r2, a2 = l2 - rr * rr, il2 = 1 / l2;
+  const pax = x - ax, pay = y - ay, paz = z - az;
+  const py = pax * bax + pay * bay + paz * baz, pz = py - l2;
+  const qx = pax * l2 - bax * py, qy = pay * l2 - bay * py, qz = paz * l2 - baz * py;
+  const x2 = qx * qx + qy * qy + qz * qz, y2 = py * py * l2, z2 = pz * pz * l2;
+  const k = Math.sign(rr) * rr * rr * x2;
+  if (Math.sign(pz) * a2 * z2 > k) return Math.sqrt(x2 + z2) * il2 - r2;
+  if (Math.sign(py) * a2 * y2 < k) return Math.sqrt(x2 + y2) * il2 - r1;
+  return (Math.sqrt(x2 * a2 * il2) + py * rr) * il2 - r1;
+};
 export const smin = (a: number, b: number, k: number) => {
   const h = clamp(0.5 + (0.5 * (b - a)) / k);
   return mix(b, a, h) - k * h * (1 - h);
@@ -299,12 +331,15 @@ export class View {
   private depth = new Float32Array(0);
   private value = new Float32Array(0);
   private mat = new Uint8Array(0);
-  private hit: Hit = { t: 0, x: 0, y: 0, z: 0, nx: 0, ny: 0, nz: 0, mat: 0, value: 0 };
+  private over = new Uint8Array(0);
+  private tint = new Uint8Array(0);
+  private hit: Hit = { t: 0, x: 0, y: 0, z: 0, nx: 0, ny: 0, nz: 0, mat: 0, value: 0, glyph: 0, tint: 0 };
 
   /**
    * Render `scene` into the cols×rows block of `out` whose top-left cell is (c0, r0). Cells the
    * object doesn't cover are left alone, so it composites over whatever is already there.
    * `light` is the world-space direction toward the light (x right, y up, z toward the viewer).
+   * `zoom` scales the object within its block.
    */
   render(
     scene: Scene,
@@ -318,17 +353,24 @@ export class View {
     ch: number,
     light: [number, number, number],
     alpha = 1,
+    zoom = 1,
   ) {
     const n = cols * rows;
     if (this.depth.length < n) {
       this.depth = new Float32Array(n);
       this.value = new Float32Array(n);
       this.mat = new Uint8Array(n);
+      this.over = new Uint8Array(n);
+      this.tint = new Uint8Array(n);
     }
-    const { depth, value, mat, hit: h } = this;
-    const R = scene.pose(frame);
+    const { depth, value, mat, over, tint, hit: h } = this;
     const W = cols * cw, H = rows * ch;
-    const S = Math.min(W / (2 * scene.fit[0]), H / (2 * scene.fit[1]));
+    const S = Math.min(W / (2 * scene.fit[0]), H / (2 * scene.fit[1])) * zoom;
+    frame.cellW = cw / S;
+    frame.cellH = ch / S;
+    frame.cols = cols;
+    frame.rows = rows;
+    const R = scene.pose(frame);
     // Camera and light into object space (R⁻¹ = Rᵀ).
     const ox = R[6] * CAMERA, oy = R[7] * CAMERA, oz = R[8] * CAMERA;
     const [Lx, Ly, Lz] = light;
@@ -348,9 +390,13 @@ export class View {
         const disc = b * b - oo;
         if (disc < 0) continue;
         const sq = Math.sqrt(disc);
+        h.glyph = 0;
+        h.tint = INK;
         if (!scene.intersect(ox, oy, oz, dx, dy, dz, Math.max(0, -b - sq), -b + sq, h)) continue;
         depth[i] = h.t;
         mat[i] = h.mat;
+        over[i] = h.glyph;
+        tint[i] = h.tint;
         if (h.mat === GLOW) {
           value[i] = h.value;
         } else if (scene.light) {
@@ -377,10 +423,16 @@ export class View {
         if (d >= far) continue;
         let g: number;
         let color = INK;
+        let a = alpha;
         if (mat[i] === GLOW) {
           const v = clamp(value[i]);
           g = GLOWS[Math.min(GLOWS.length - 1, Math.floor(v * GLOWS.length))];
           color = v > 0.72 ? EMBER : BLOOD;
+        } else if (over[i]) {
+          // Lettering (or smoke): shade it with opacity, since letters all print about as dark.
+          g = over[i];
+          color = tint[i];
+          a = alpha * (0.4 + 0.6 * Math.min(maxInk, 1 - clamp(value[i])));
         } else {
           const l = at(k - 1, j), r = at(k + 1, j), u = at(k, j - 1), w = at(k, j + 1);
           const edge = l > d + gap || r > d + gap || u > d + gap || w > d + gap;
@@ -399,7 +451,7 @@ export class View {
             g = SHADE[Math.min(SHADE.length - 1, Math.floor(ink * SHADE.length))];
           }
         }
-        out.put(c0 + k, r0 + j, g, color, alpha);
+        out.put(c0 + k, r0 + j, g, color, a);
       }
     }
   }
@@ -413,23 +465,47 @@ export const input = {
   x: 0,
   y: 0,
   seen: false,
-  /** Pointer speed in px/s, smoothed. */
+  /** Pointer velocity and speed in px/s, smoothed. */
+  vx: 0,
+  vy: 0,
   speed: 0,
   movedAt: 0,
   scrollY: 0,
   /** Scroll velocity in px/s, smoothed. */
   scrollV: 0,
-  reduced: false,
 };
+
+/** Seconds since the pointer last moved (large if it never has). */
+export const idleFor = () => (input.seen ? (performance.now() - input.movedAt) / 1000 : 1e9);
+
+/**
+ * How hard to work. Starts from what the device says about itself (small touch screens,
+ * Save-Data, a low battery) and steps down further if frames run long.
+ */
+export const quality = { fps: 30, dpr: 2 };
+const qualityWatchers = new Set<() => void>();
+/** Call `fn` when quality drops. Returns an unsubscribe function. */
+export function onQualityChange(fn: () => void) {
+  qualityWatchers.add(fn);
+  return () => void qualityWatchers.delete(fn);
+}
+function degrade(fps: number, dpr: number) {
+  if (fps >= quality.fps && dpr >= quality.dpr) return;
+  quality.fps = Math.min(quality.fps, fps);
+  quality.dpr = Math.min(quality.dpr, dpr);
+  qualityWatchers.forEach((fn) => fn());
+}
+
+interface BatteryLike extends EventTarget {
+  charging: boolean;
+  level: number;
+}
 
 let tracking = false;
 let lastX = 0, lastY = 0, lastScroll = 0;
 function track() {
   if (tracking || typeof window === "undefined") return;
   tracking = true;
-  const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
-  input.reduced = mq.matches;
-  mq.addEventListener?.("change", () => (input.reduced = mq.matches));
   input.scrollY = lastScroll = window.scrollY;
   window.addEventListener(
     "pointermove",
@@ -445,29 +521,55 @@ function track() {
     },
     { passive: true },
   );
+  const nav = navigator as Navigator & { connection?: { saveData?: boolean }; getBattery?: () => Promise<BatteryLike> };
+  if (matchMedia("(pointer: coarse)").matches || window.innerWidth < 700) degrade(24, 1.5);
+  if (nav.connection?.saveData) degrade(15, 1);
+  nav.getBattery?.().then(
+    (b) => {
+      const check = () => !b.charging && b.level <= 0.25 && degrade(15, 1);
+      check();
+      b.addEventListener("levelchange", check);
+      b.addEventListener("chargingchange", check);
+    },
+    () => {},
+  );
 }
 
 type Tick = (t: number, dt: number) => void;
 const subs = new Set<Tick>();
 let raf = 0;
 let prev = 0;
-const FRAME = 1000 / 30; // ASCII doesn't need more, and it keeps the CPU calm.
+/** Average milliseconds of work per frame, and how many frames it has seen. */
+let cost = 0, costFrames = 0;
 
 function loop(now: number) {
   raf = requestAnimationFrame(loop);
-  if (now - prev < FRAME - 2) return;
+  // ASCII doesn't need more than 30fps, and it keeps the CPU calm.
+  if (now - prev < 1000 / quality.fps - 2) return;
   const dt = Math.min(0.1, (now - prev) / 1000);
   prev = now;
   const sy = window.scrollY;
   input.scrollV = mix(input.scrollV, (sy - lastScroll) / dt, 0.25);
   input.scrollY = lastScroll = sy;
-  input.speed = mix(input.speed, Math.hypot(input.x - lastX, input.y - lastY) / dt, 0.3);
+  input.vx = mix(input.vx, (input.x - lastX) / dt, 0.3);
+  input.vy = mix(input.vy, (input.y - lastY) / dt, 0.3);
+  input.speed = Math.hypot(input.vx, input.vy);
   lastX = input.x;
   lastY = input.y;
+  const t0 = performance.now();
   for (const fn of subs) fn(now / 1000, dt);
+  // A slow machine (or a busy one): fewer frames first, then fewer pixels, then fewer still.
+  cost = mix(cost, performance.now() - t0, 0.1);
+  if (++costFrames > 30 && cost > 9) {
+    if (quality.fps > 20) degrade(20, quality.dpr);
+    else if (quality.fps > 15 || quality.dpr > 1) degrade(15, 1);
+    else degrade(10, 1);
+    cost = 0;
+    costFrames = 0;
+  }
 }
 
-/** Run `fn` on the shared ~30fps clock until the returned function is called. */
+/** Run `fn` on the shared clock until the returned function is called. */
 export function onTick(fn: Tick) {
   track();
   subs.add(fn);
@@ -484,10 +586,8 @@ export function onTick(fn: Tick) {
   };
 }
 
-export function reducedMotion() {
-  track();
-  return input.reduced;
-}
+/** Start tracking the pointer and device hints without ticking (for still prints). */
+export const startInput = track;
 
 /** Direction from a point on screen (CSS px) toward the cursor "lantern", world space. */
 export function lanternFrom(cx: number, cy: number, depth: number, fallback: [number, number, number]): [number, number, number] {
@@ -495,4 +595,16 @@ export function lanternFrom(cx: number, cy: number, depth: number, fallback: [nu
   const x = input.x - cx, y = cy - input.y;
   const l = Math.hypot(x, y, depth) || 1;
   return [x / l, y / l, depth / l];
+}
+
+/**
+ * How startling the cursor is to something at (cx, cy) CSS px: 1 when it rushes straight at
+ * it from close by, 0 when it's calm, far away, or heading elsewhere.
+ */
+export function rushAt(cx: number, cy: number) {
+  if (!input.seen || input.speed < 1100) return 0;
+  const dx = cx - input.x, dy = cy - input.y, d = Math.hypot(dx, dy);
+  if (d > 420 || d < 1) return 0;
+  const toward = (input.vx * dx + input.vy * dy) / (input.speed * d);
+  return toward > 0.7 ? 1 : 0;
 }

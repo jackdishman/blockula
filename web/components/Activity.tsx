@@ -14,14 +14,15 @@ const kind = (t: TxView, me: string): [string, string] => {
   return t.from.address === me ? ["Sent", "out"] : ["Received", "in"];
 };
 
-export function Activity({ txs, me }: { txs: TxView[]; me: string }) {
+/** `fresh`: ids of payments that just arrived, which light up briefly. */
+export function Activity({ txs, me, fresh }: { txs: TxView[]; me: string; fresh?: ReadonlySet<string> }) {
   if (!txs.length) return <p className="dim">Nothing yet. Your transactions will appear here once they&apos;re sealed into a block.</p>;
   return (
     <ul className="activity">
       {txs.map((t) => {
         const [label, dir] = kind(t, me);
         return (
-          <li key={t.id}>
+          <li key={t.id} className={fresh?.has(t.id) ? "fresh" : undefined}>
             <ExplorerLink href={explorer.tx(t.id)} className="activity-row">
               <span className={`activity-kind ${dir}`}>{label}</span>
               <span className="activity-main">

@@ -11,13 +11,20 @@ type Check = { state: "idle" } | { state: "checking" } | { state: "ok"; view: Na
 
 const clean = (s: string) => s.trim().toLowerCase().replace(/\.boo$/, "");
 
-export function NameClaim({ onClaimed, suggestion = "" }: { onClaimed: (name: string) => void; suggestion?: string }) {
+/** What the gravestone beside the name field says: the name being typed, or just R.I.P. */
+export function epitaph(name: string) {
+  if (!name) return undefined;
+  return `HERE LIES\n${name.length > 13 ? `${name.slice(0, 12)}.` : `${name}.boo`}`;
+}
+
+export function NameClaim({ onClaimed, onName, suggestion = "" }: { onClaimed: (name: string) => void; onName?: (name: string) => void; suggestion?: string }) {
   const { client, wallet, account, refresh } = useUnlocked();
   const [input, setInput] = useState(suggestion);
   const [check, setCheck] = useState<Check>({ state: "idle" });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const n = clean(input);
+  useEffect(() => onName?.(n), [n, onName]);
 
   useEffect(() => {
     if (!n) return setCheck({ state: "idle" });

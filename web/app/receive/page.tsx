@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { RequireWallet } from "@/components/Gate";
+import { Apparition } from "@/components/Haunt";
 import { Copy, ExplorerLink, Tip } from "@/components/ui";
 import { explorer } from "@/lib/config";
 import { useUnlocked } from "@/lib/wallet";
@@ -21,6 +22,7 @@ function Receive() {
   return (
     <main className="narrow stack-lg">
       <Link href="/" className="back">← Home</Link>
+      <Apparition kind="cauldron" />
       <h1>Receive FANG</h1>
       {name ? (
         <section className="card stack">

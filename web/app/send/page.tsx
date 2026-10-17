@@ -125,7 +125,7 @@ function Send() {
   if (sent)
     return (
       <main className="narrow stack-lg center">
-        <Apparition kind="bat" />
+        <Apparition kind="bat" burst={9} />
         <h1>Sent</h1>
         <p className="summary">{sent.summary}</p>
         <p className="dim">Sealed in block #{sent.height}. That&apos;s final: no waiting for confirmations.</p>

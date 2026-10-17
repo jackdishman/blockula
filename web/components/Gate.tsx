@@ -14,7 +14,7 @@ import { ErrorNote, Spinner } from "./ui";
 export function Splash({ text = "Rising from the grave…" }: { text?: string }) {
   return (
     <div className="splash">
-      <Apparition kind="bat" />
+      <Apparition kind="coffin" />
       <p className="dim">{text}</p>
     </div>
   );

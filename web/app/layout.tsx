@@ -1,7 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import { Courier_Prime, EB_Garamond, IM_Fell_English, IM_Fell_English_SC, UnifrakturMaguntia } from "next/font/google";
 import type { ReactNode } from "react";
-import { Haunt } from "@/components/Haunt";
+import { Haunt, MotionToggle } from "@/components/Haunt";
 import { Header } from "@/components/Header";
 import { Ornament } from "@/components/Ornament";
 import { WalletProvider } from "@/lib/wallet";
@@ -34,6 +34,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
             <Ornament kind="bat" />
             <span className="caps">Quantum-safe ML-DSA-65 keys · Unlocked by passkeys</span>
             <span>Not audited. For test chains only.</span>
+            <MotionToggle />
           </footer>
         </WalletProvider>
       </body>

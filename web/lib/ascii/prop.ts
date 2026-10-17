@@ -1,39 +1,39 @@
-import { Cells, clamp, type Frame, Glyphs, input, lanternFrom, onFontReady, onTick, reducedMotion, View } from "./engine";
+import { Cells, clamp, type Frame, Glyphs, idleFor, input, lanternFrom, onFontReady, onTick, rushAt, startInput, View } from "./engine";
 import { makeScene, type PropKind } from "./scenes";
+import { motionOn, onMotionChange } from "./settings";
+import { burstBats, stage } from "./stage";
 
 const FONT = 9;
-
-/** Props currently on screen, by kind, so the backdrop can stand its own copy down. */
-export const onStage = new Map<PropKind, number>();
-const stageWatchers = new Set<() => void>();
-const stage = (kind: PropKind, delta: number) => {
-  onStage.set(kind, (onStage.get(kind) ?? 0) + delta);
-  // Let watchers see the whole commit's mounts and unmounts at once.
-  queueMicrotask(() => stageWatchers.forEach((fn) => fn()));
-};
-/** Call `fn` when props come or go. Returns an unsubscribe function. */
-export function onStageChange(fn: () => void) {
-  stageWatchers.add(fn);
-  return () => void stageWatchers.delete(fn);
-}
 const DEFAULT_LIGHT: [number, number, number] = [-0.45, 0.55, 0.7];
 
+export interface PropOptions {
+  /** Spin fast while true (the key turns while you unlock; the coin when money arrives). */
+  busy: () => boolean;
+  /** Lettering, for props that carry some (the gravestone). */
+  text: () => string | undefined;
+  /** Bats to release from the prop when it first appears. */
+  burst?: number;
+}
+
 /**
- * Drive one 3D ASCII prop in `canvas`: it turns on its own, leans toward the cursor, takes its
- * light from the cursor (a lantern), and spins with scrolling or while `busy()` is true.
- * Static under prefers-reduced-motion. Returns a cleanup function.
+ * Drive one 3D ASCII prop in `canvas`: it turns on its own, leans toward the cursor and takes
+ * its light from it (a lantern), spins with scrolling, and starts if the cursor rushes at it.
+ * Holds still when motion is off. `redraw` repaints now (say, when its text changes while
+ * still); `dispose` cleans up.
  */
-export function mountProp(canvas: HTMLCanvasElement, kind: PropKind, busy: () => boolean) {
+export function mountProp(canvas: HTMLCanvasElement, kind: PropKind, opts: PropOptions) {
   const ctx = canvas.getContext("2d");
-  if (!ctx) return () => {};
+  if (!ctx) return { redraw: () => {}, dispose: () => {} };
   const scene = makeScene(kind);
   const view = new View();
   const cells = new Cells();
-  const frame: Frame = { t: 1.6, lookX: 0, lookY: 0, spin: 0 };
+  const frame: Frame = { t: 1.6, lookX: 0, lookY: 0, spin: 0, fright: 0 };
   const light: [number, number, number] = [...DEFAULT_LIGHT];
   let glyphs: Glyphs | null = null;
   let visible = true;
   let dead = false;
+  let zoom = 1;
+  let stopTicking = () => {};
 
   const setup = () => {
     const dpr = Math.min(2, window.devicePixelRatio || 1);
@@ -47,8 +47,9 @@ export function mountProp(canvas: HTMLCanvasElement, kind: PropKind, busy: () =>
 
   const draw = () => {
     if (!glyphs) return;
+    frame.text = opts.text();
     cells.clear();
-    view.render(scene, frame, cells, 0, 0, cells.cols, cells.rows, glyphs.cw, glyphs.ch, light);
+    view.render(scene, frame, cells, 0, 0, cells.cols, cells.rows, glyphs.cw, glyphs.ch, light, 1, zoom);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     cells.paint(ctx, glyphs, Math.floor((canvas.width - cells.cols * glyphs.cw) / 2), Math.floor((canvas.height - cells.rows * glyphs.ch) / 2));
   };
@@ -62,20 +63,47 @@ export function mountProp(canvas: HTMLCanvasElement, kind: PropKind, busy: () =>
     const ty = input.seen ? clamp((cy - input.y) / 420, -1, 1) : 0;
     frame.lookX += (tx - frame.lookX) * k;
     frame.lookY += (ty - frame.lookY) * k;
-    const L = lanternFrom(cx, cy, 300, DEFAULT_LIGHT);
+    let L = lanternFrom(cx, cy, 300, DEFAULT_LIGHT);
+    zoom = 1;
+    if (kind === "moon" && idleFor() > 6) {
+      // Left alone, the moon breathes: its phases wheel slowly round and it swells a little.
+      const a = t * 0.4;
+      L = [Math.cos(a), 0.25, Math.sin(a)];
+      zoom = 1 + 0.025 * Math.sin(t * 1.3);
+    }
     for (let i = 0; i < 3; i++) light[i] += (L[i] - light[i]) * k;
     const l = Math.hypot(...light) || 1;
     for (let i = 0; i < 3; i++) light[i] /= l;
-    frame.spin += dt * ((busy() ? 5 : 0) + clamp(input.scrollV * 0.003, -4, 4));
+    frame.fright = Math.max(rushAt(cx, cy), (frame.fright ?? 0) - dt * 0.9);
+    frame.spin += dt * ((opts.busy() ? 5 : 0) + clamp(input.scrollV * 0.003, -4, 4));
     frame.t = t;
     draw();
   };
 
+  // Motion can be switched on and off while we're mounted (the OS setting or the footer toggle).
+  const apply = () => {
+    stopTicking();
+    stopTicking = motionOn() ? onTick(step) : () => {};
+    if (!motionOn()) {
+      frame.fright = 0;
+      draw();
+    }
+  };
+
   stage(kind, 1);
+  startInput();
   setup();
   draw();
-  const still = reducedMotion();
-  const stop = still ? () => {} : onTick(step);
+  apply();
+  const stopWatching = onMotionChange(apply);
+  if (opts.burst && motionOn()) {
+    // After the page has painted, so the backdrop is listening.
+    requestAnimationFrame(() => {
+      if (dead) return;
+      const r = canvas.getBoundingClientRect();
+      burstBats(r.left + r.width / 2, r.top + r.height / 2, opts.burst ?? 0);
+    });
+  }
   const ro = new ResizeObserver(() => {
     setup();
     draw();
@@ -88,11 +116,15 @@ export function mountProp(canvas: HTMLCanvasElement, kind: PropKind, busy: () =>
     setup();
     draw();
   });
-  return () => {
-    dead = true;
-    stage(kind, -1);
-    stop();
-    ro.disconnect();
-    io.disconnect();
+  return {
+    redraw: draw,
+    dispose: () => {
+      dead = true;
+      stage(kind, -1);
+      stopTicking();
+      stopWatching();
+      ro.disconnect();
+      io.disconnect();
+    },
   };
 }

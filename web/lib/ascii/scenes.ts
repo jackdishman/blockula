@@ -1,12 +1,18 @@
 /**
- * The haunted props: a skeleton key, a cratered moon, a jack-o'-lantern, a chamber candle and
- * a bat. Each is a Scene for the ASCII renderer in ./engine. Object space: x right, y up,
- * z toward the viewer, sized to fit within about one unit of the origin.
+ * The haunted props: a skeleton key, a cratered moon, a jack-o'-lantern, a chamber candle, a
+ * bat, a FANG coin, a coffin, a gravestone, a cauldron and a black cat. Each is a Scene for
+ * the ASCII renderer in ./engine. Object space: x right, y up, z toward the viewer, sized to
+ * fit within about one unit of the origin.
  */
 import {
+  BLOOD,
   clamp,
+  type Frame,
   GLOW,
+  glyph,
+  GOLD,
   type Hit,
+  INK,
   march,
   mul,
   noise3,
@@ -18,13 +24,15 @@ import {
   sdCapsule,
   sdCylX,
   sdCylY,
+  sdEllipsoid,
+  sdRoundCone,
   sdTorusY,
   sdTorusZ,
   smin,
   SURFACE,
 } from "./engine";
 
-export type PropKind = "key" | "moon" | "pumpkin" | "candle" | "bat";
+export type PropKind = "key" | "moon" | "pumpkin" | "candle" | "bat" | "coin" | "coffin" | "grave" | "cauldron" | "cat";
 
 export function makeScene(kind: PropKind): Scene {
   switch (kind) {
@@ -38,8 +46,58 @@ export function makeScene(kind: PropKind): Scene {
       return candleScene();
     case "bat":
       return batScene();
+    case "coin":
+      return coinScene();
+    case "coffin":
+      return coffinScene();
+    case "grave":
+      return graveScene();
+    case "cauldron":
+      return cauldronScene();
+    case "cat":
+      return catScene();
   }
 }
+
+// Lettering on a face-on plane. Rays pass through the screen's cell centres, so letters are
+// placed on that lattice (offset by half a cell when the grid or the text has even length):
+// face-on, every letter lands in exactly one cell. The face sits a little in front of the
+// origin, so it projects a touch larger than a cell there.
+const lattice = (f: Frame) => ({
+  cw: (f.cellW ?? 0.05) * 0.985,
+  ch: (f.cellH ?? 0.1) * 0.985,
+  colRay: (f.cols ?? 1) % 2 ? 0 : 0.5,
+  rowRay: (f.rows ?? 1) % 2 ? 0 : 0.5,
+});
+
+/** Column and row (counting up) of the cell a point on a face-on plane falls in. */
+function cellAt(x: number, y: number, f: Frame): [number, number] {
+  const { cw, ch, colRay, rowRay } = lattice(f);
+  return [Math.round(x / cw - colRay), Math.round(y / ch - rowRay)];
+}
+
+/** The glyph of centred `lines` of text at (x, y); the top line is centred near y = top. */
+function lettering(lines: string[], x: number, y: number, top: number, f: Frame) {
+  const { cw, ch, colRay, rowRay } = lattice(f);
+  const vTop = Math.round(top / ch - rowRay) + rowRay;
+  const line = Math.round(vTop - y / ch);
+  if (line < 0 || line >= lines.length) return 0;
+  const text = lines[line], n = text.length;
+  const i = Math.round(x / cw - colRay - (n % 2 ? 0 : 0.5) + (n - 1) / 2);
+  return i >= 0 && i < n ? glyph(text[i]) : 0;
+}
+
+/** Distance to a few puffs of smoke rising from (x0, y0, z0); they drift and swell as they go. */
+function smoke(x: number, y: number, z: number, x0: number, y0: number, z0: number, t: number, n: number, rise: number, rate: number) {
+  let d = 1e9;
+  for (let i = 0; i < n; i++) {
+    const k = (t * rate + i / n) % 1;
+    const px = x0 + Math.sin(t * 0.9 + i * 2.1) * 0.12 * k, py = y0 + k * rise;
+    d = Math.min(d, Math.hypot(x - px, y - py, z - z0) - (0.025 + 0.05 * k) * (1 - 0.7 * k * k));
+  }
+  return d;
+}
+const G_WISP = glyph("~"), G_TICK = glyph("'");
 
 // ---------------------------------------------------------------------------------------------
 // Skeleton key: ring bow, collars, a long shaft and a three-ward bit. It turns as if in a lock.
@@ -141,10 +199,12 @@ const tri = (x: number, y: number, ax: number, ay: number, bx: number, by: numbe
 };
 const box2 = (x: number, y: number, cx: number, cy: number, hx: number, hy: number) => Math.max(Math.abs(x - cx) - hx, Math.abs(y - cy) - hy);
 
-function face(x: number, y: number) {
+/** The carved face; `blink` (0..1) squeezes the eyes shut. */
+function face(x: number, y: number, blink: number) {
   const ax = Math.abs(x);
-  // Eyes (mirrored) and nose: triangles, wound clockwise.
-  let d = tri(ax, y, 0.13, 0.1, 0.33, 0.4, 0.52, 0.1);
+  // Eyes (mirrored) and nose: triangles.
+  const ey = 0.2 + (y - 0.2) / Math.max(0.1, 1 - blink);
+  let d = tri(ax, ey, 0.13, 0.1, 0.33, 0.4, 0.52, 0.1) * Math.max(0.1, 1 - blink);
   d = Math.min(d, tri(x, y, -0.09, -0.09, 0, 0.06, 0.09, -0.09));
   // A wide grin with two teeth.
   let m = Math.max(y - (-0.19 + 0.5 * x * x), -0.43 + 0.78 * x * x - y, ax - 0.6);
@@ -153,7 +213,7 @@ function face(x: number, y: number) {
 }
 
 function pumpkinScene(): Scene {
-  let flicker = 1;
+  let flicker = 1, blink = 0;
   const body = (x: number, y: number, z: number) => {
     const yy = y * 1.3;
     const r = Math.hypot(x, yy, z);
@@ -170,7 +230,7 @@ function pumpkinScene(): Scene {
     const shell = Math.max(b, -(b + 0.07));
     // Well clear of the face (or behind it) the carving can't matter, so skip it.
     const nearFace = z > -0.1 && Math.abs(x) < 0.72 && y < 0.52 && y > -0.6;
-    const carved = nearFace ? Math.max(shell, -Math.max(face(x, y), -z)) : shell;
+    const carved = nearFace ? Math.max(shell, -Math.max(face(x, y, blink), -z)) : shell;
     // The stem: a stubby, bent, tapering capsule.
     const bend = (y - 0.55) * (y - 0.55) * 1.4;
     const stem = sdCapsule(x - bend, y, z, 0, 0.5, 0, 0.02, 0.86, 0, 0.12 - Math.max(0, y - 0.55) * 0.12);
@@ -180,7 +240,12 @@ function pumpkinScene(): Scene {
     radius: 1.08,
     fit: [1.05, 1.02],
     pose(f) {
-      flicker = 0.78 + 0.22 * noise3(f.t * 6, 0.5, 0.5) + 0.08 * Math.sin(f.t * 23);
+      // Startled (the cursor rushed at it): the candle gutters nearly out, then flares back.
+      const fright = f.fright ?? 0;
+      flicker = (0.78 + 0.22 * noise3(f.t * 6, 0.5, 0.5) + 0.08 * Math.sin(f.t * 23)) * (1 - 0.9 * fright * fright) + 0.25 * fright * (1 - fright);
+      // ...and screws its eyes shut. Otherwise it blinks every seven seconds or so.
+      const lid = f.t % 7.3;
+      blink = Math.max(fright > 0.35 ? 1 : fright / 0.35, lid < 0.16 ? Math.sin((lid / 0.16) * Math.PI) : 0);
       return mul(rotY(0.35 * Math.sin(f.t * 0.45) + f.lookX * 0.75 + f.spin), rotX(0.18 - f.lookY * 0.35));
     },
     intersect(ox, oy, oz, dx, dy, dz, t0, t1, h) {
@@ -202,29 +267,42 @@ function pumpkinScene(): Scene {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Chamber candle: dripping wax in a dish with a ring handle; the flame is the light.
+// Chamber candle: dripping wax on a pool of spilt wax, in a socketed dish with a finger loop and
+// thumb rest. A charred wick, a swaying flame (the light), and a thread of smoke.
 
 function candleScene(): Scene {
-  let sway = 0, tall = 1, flicker = 1;
-  const FY = 0.58;
+  let sway = 0, tall = 1, flicker = 1, time = 0;
+  const FY = 0.56;
+  const DRIPS = [
+    [0.4, 0.32],
+    [1.3, 0.12],
+    [1.9, 0.2],
+    [2.9, 0.48],
+    [3.7, 0.08],
+    [4.3, 0.27],
+    [5.4, 0.14],
+  ];
   const wax = (x: number, y: number, z: number) => {
-    let d = sdCylY(x, y + 0.2, z, 0.22, 0.6);
-    // Melted, slightly cupped top.
-    d = Math.max(d, -(Math.hypot(x, y - 0.62, z) - 0.24));
-    for (const [a, len] of [
-      [0.4, 0.32],
-      [1.9, 0.18],
-      [2.9, 0.45],
-      [4.3, 0.26],
-      [5.4, 0.12],
-    ]) {
-      const px = Math.cos(a) * 0.215, pz = Math.sin(a) * 0.215;
-      d = smin(d, sdCapsule(x, y, z, px, 0.36, pz, px, 0.36 - len, pz, 0.035), 0.03);
+    let d = sdCylY(x, y + 0.21, z, 0.21, 0.6);
+    // A lopsided, melted crown: cupped in the middle, lumpy round the rim.
+    const a = Math.atan2(z, x);
+    d = Math.max(d, y - 0.39 - 0.035 * Math.sin(a * 3 + 1) - 0.02 * Math.sin(a * 7));
+    d = Math.max(d, -(Math.hypot(x, y - 0.6, z) - 0.23));
+    for (const [ang, len] of DRIPS) {
+      const px = Math.cos(ang) * 0.205, pz = Math.sin(ang) * 0.205;
+      d = smin(d, sdCapsule(x, y, z, px, 0.36, pz, px, 0.36 - len, pz, 0.032 + len * 0.02), 0.03);
     }
-    return d;
+    // Spilt wax pooled round the foot.
+    return smin(d, sdEllipsoid(x - 0.04, y + 0.76, z + 0.02, 0.36, 0.035, 0.33), 0.06);
   };
   const dish = (x: number, y: number, z: number) =>
-    Math.min(sdCylY(x, y + 0.84, z, 0.56, 0.025), sdTorusY(x, y + 0.81, z, 0.55, 0.035), sdTorusZ(x - 0.66, y + 0.8, z, 0.11, 0.028));
+    Math.min(
+      sdCylY(x, y + 0.84, z, 0.56, 0.025),
+      sdTorusY(x, y + 0.81, z, 0.55, 0.035),
+      sdTorusY(x, y + 0.74, z, 0.245, 0.035), // the socket
+      sdTorusZ(x - 0.67, y + 0.79, z, 0.11, 0.028), // finger loop
+      sdCylY(x - 0.69, y + 0.66, z, 0.08, 0.012), // thumb rest
+    );
   const flame = (x: number, y: number, z: number) => {
     const yy = (y - FY) / tall;
     const xx = x - sway * Math.max(0, yy + 0.1);
@@ -232,11 +310,14 @@ function candleScene(): Scene {
     const pinch = 1 + Math.max(0, yy) * 5.5;
     return (Math.hypot(xx * pinch, yy * 0.62, z * pinch) - 0.085) * 0.6;
   };
-  const sdf = (x: number, y: number, z: number) => Math.min(wax(x, y, z), dish(x, y, z), flame(x, y, z), sdCylY(x, y - 0.46, z, 0.012, 0.06));
+  const wick = (x: number, y: number, z: number) => sdCapsule(x, y, z, 0, 0.4, 0, sway * 0.15, 0.5, 0, 0.014);
+  const fumes = (x: number, y: number, z: number) => smoke(x, y, z, sway * 0.4, FY + 0.24, 0, time, 3, 0.3, 0.32);
+  const sdf = (x: number, y: number, z: number) => Math.min(wax(x, y, z), dish(x, y, z), flame(x, y, z), wick(x, y, z), fumes(x, y, z));
   return {
-    radius: 1.05,
-    fit: [0.82, 0.98],
+    radius: 1.15,
+    fit: [0.82, 1.06],
     pose(f) {
+      time = f.t;
       flicker = 0.85 + 0.15 * noise3(f.t * 5, 1.5, 0);
       sway = (noise3(f.t * 1.7, 3, 0) - 0.5) * 0.5 - f.lookX * 0.15;
       tall = 0.9 + 0.25 * noise3(f.t * 3.1, 7, 0);
@@ -244,13 +325,18 @@ function candleScene(): Scene {
     },
     intersect(ox, oy, oz, dx, dy, dz, t0, t1, h) {
       if (!march(sdf, ox, oy, oz, dx, dy, dz, t0, t1, h)) return false;
+      h.mat = SURFACE;
       if (flame(h.x, h.y, h.z) < 0.004) {
         h.mat = GLOW;
         // Hotter (ember) at the root of the flame.
         h.value = clamp((1.05 - Math.max(0, h.y - FY) * 2.2) * flicker);
+      } else if (fumes(h.x, h.y, h.z) < 0.004) {
+        h.value = 0.8;
+        h.glyph = h.y > FY + 0.4 ? G_WISP : G_TICK;
+      } else if (wick(h.x, h.y, h.z) < 0.004) {
+        h.value = 0.12;
       } else {
-        h.mat = SURFACE;
-        h.value = h.y < -0.76 ? 0.7 : 0.98;
+        h.value = h.y < -0.7 && Math.hypot(h.x, h.z) > 0.3 ? 0.7 : 0.98;
       }
       return true;
     },
@@ -410,3 +496,305 @@ function batScene(): Scene {
   };
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// FANG coin: a milled disc with a raised rim, its faces struck with F A N G in gold.
+
+function coinScene(): Scene {
+  let frame: Frame = { t: 0, lookX: 0, lookY: 0, spin: 0 };
+  const R = 0.92, T = 0.085;
+  const sdf = (x: number, y: number, z: number) => Math.min(sdCylX(z, x, y, R, T), sdTorusZ(x, y, z, R - 0.08, 0.105));
+  const G_REED = glyph("|"), FANG = "FANG".split("").map(glyph);
+  return {
+    radius: 1.02,
+    fit: [1, 1],
+    pose(f) {
+      frame = f;
+      return mul(rotX(0.18 + f.lookY * 0.2), rotY(f.t * 0.9 + f.spin + f.lookX * 0.3));
+    },
+    intersect(ox, oy, oz, dx, dy, dz, t0, t1, h) {
+      if (!march(sdf, ox, oy, oz, dx, dy, dz, t0, t1, h)) return false;
+      h.mat = SURFACE;
+      h.value = 0.9;
+      const r = Math.hypot(h.x, h.y);
+      if (Math.abs(h.z) > T - 0.01 && r < R - 0.2) {
+        // Minted rows of FANG, staggered like brickwork; mirrored on the back so it reads.
+        const [c, row] = cellAt(h.z > 0 ? h.x : -h.x, h.y, frame);
+        h.glyph = FANG[(((c + row * 2) % 4) + 4) % 4];
+        h.tint = GOLD;
+      } else if (r > R - 0.005 && Math.abs(h.z) < T - 0.01) {
+        h.glyph = G_REED; // the milled edge
+      }
+      return true;
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Coffin: a six-sided box whose lid creaks open on its hinge. Something inside looks out.
+
+function coffinScene(): Scene {
+  let lid = 0, eyes = 0;
+  // Outline seen from above (x along the coffin, z across it): narrow head, wide shoulders.
+  const OUTLINE = [
+    [-1, -0.22],
+    [-0.55, -0.38],
+    [1, -0.2],
+    [1, 0.2],
+    [-0.55, 0.38],
+    [-1, 0.22],
+  ];
+  const outline = (x: number, z: number) => {
+    let d = -1e9;
+    for (let i = 0; i < OUTLINE.length; i++) {
+      const [ax, az] = OUTLINE[i], [bx, bz] = OUTLINE[(i + 1) % OUTLINE.length];
+      const nx = bz - az, nz = ax - bx, l = Math.hypot(nx, nz);
+      d = Math.max(d, ((x - ax) * nx + (z - az) * nz) / l);
+    }
+    return d;
+  };
+  const box = (x: number, y: number, z: number) => {
+    const p = outline(x, z);
+    const outer = Math.max(p, Math.abs(y + 0.09) - 0.17);
+    return Math.max(outer, -Math.max(p + 0.05, -(y + 0.2)));
+  };
+  // The lid, hinged along the far side (y = 0.08, z = -0.3), with a cross in relief.
+  const cover = (x: number, y: number, z: number) => {
+    const c = Math.cos(lid), s = Math.sin(lid), qy = y - 0.08, qz = z + 0.3;
+    const ly = qy * c - qz * s + 0.08, lz = qy * s + qz * c - 0.3;
+    const slab = Math.max(outline(x, lz), Math.abs(ly - 0.12) - 0.04);
+    const cross = Math.min(sdBox(x + 0.1, ly - 0.17, lz, 0.5, 0.02, 0.035), sdBox(x + 0.32, ly - 0.17, lz, 0.035, 0.02, 0.17));
+    return Math.min(slab, cross);
+  };
+  const peepers = (x: number, y: number, z: number) => Math.hypot(x + 0.66, y + 0.1, Math.abs(z) - 0.09) - 0.045;
+  const sdf = (x: number, y: number, z: number) => Math.min(box(x, y, z), cover(x, y, z), eyes > 0 ? peepers(x, y, z) : 1e9);
+  return {
+    radius: 1.25,
+    fit: [1.12, 0.72],
+    maxInk: 0.85,
+    pose(f) {
+      // Creak open, hold, slam shut, wait.
+      const p = (f.t % 4.6) / 4.6;
+      const ease = (u: number) => u * u * (3 - 2 * u);
+      lid = 0.95 * (p < 0.35 ? ease(p / 0.35) : p < 0.72 ? 1 : p < 0.78 ? 1 - ease((p - 0.72) / 0.06) : 0);
+      eyes = lid > 0.25 && (f.t * 1.3) % 3.1 > 0.15 ? 1 : 0;
+      return mul(rotX(0.62 - f.lookY * 0.2), rotY(-0.32 + 0.15 * Math.sin(f.t * 0.5) + f.lookX * 0.4));
+    },
+    intersect(ox, oy, oz, dx, dy, dz, t0, t1, h) {
+      if (!march(sdf, ox, oy, oz, dx, dy, dz, t0, t1, h)) return false;
+      if (eyes && peepers(h.x, h.y, h.z) < 0.004) {
+        h.mat = GLOW;
+        h.value = 0.95;
+      } else {
+        h.mat = SURFACE;
+        // Inside the box is dark.
+        h.value = outline(h.x, h.z) < -0.05 && h.y < 0.07 && box(h.x, h.y, h.z) < 0.004 ? 0.25 : 0.9;
+      }
+      return true;
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Gravestone: an arched, chipped slab on a plinth, in a grassy mound, engraved with the text.
+
+function graveScene(): Scene {
+  let frame: Frame = { t: 0, lookX: 0, lookY: 0, spin: 0 };
+  let lines = ["R.I.P."];
+  let engraved = false;
+  const FACE = 0.1;
+  const slab = (x: number, y: number, z: number) => {
+    let d = Math.min(sdBox(x, y + 0.13, z, 0.5, 0.5, FACE), sdCylX(z, x, y - 0.37, 0.5, FACE));
+    // A chip out of the shoulder.
+    return Math.max(d, -(Math.hypot(x - 0.43, y - 0.72, z - 0.1) - 0.13));
+  };
+  const plinth = (x: number, y: number, z: number) => sdBox(x, y + 0.7, z, 0.62, 0.08, 0.17);
+  const mound = (x: number, y: number, z: number) => sdEllipsoid(x, y + 0.86, z - 0.12, 0.98, 0.17, 0.55);
+  const sdf = (x: number, y: number, z: number) => Math.min(slab(x, y, z), plinth(x, y, z), mound(x, y, z));
+  const G_GRASS = [",", "'", "v", "."].map(glyph);
+  return {
+    radius: 1.3,
+    fit: [0.98, 1.0],
+    pose(f) {
+      frame = f;
+      engraved = !!f.text;
+      lines = f.text ? f.text.toUpperCase().split("\n") : ["R.I.P."];
+      // No lean or tilt about the view axis: that would shear the lettering off the grid.
+      return mul(rotY(0.18 * Math.sin(f.t * 0.35) + f.lookX * 0.28), rotX(0.1 - f.lookY * 0.14));
+    },
+    intersect(ox, oy, oz, dx, dy, dz, t0, t1, h) {
+      if (!march(sdf, ox, oy, oz, dx, dy, dz, t0, t1, h)) return false;
+      h.mat = SURFACE;
+      if (mound(h.x, h.y, h.z) < 0.004) {
+        // Turf: tufts of grass.
+        h.value = 0.8;
+        const n = Math.floor(noise3(h.x * 14, h.y * 14, h.z * 14) * 7);
+        h.glyph = n < G_GRASS.length ? G_GRASS[n] : 0;
+        return true;
+      }
+      // Weathered stone, lichen in patches.
+      h.value = 0.92 - 0.3 * clamp((noise3(h.x * 3, h.y * 3, h.z * 3) - 0.55) * 3);
+      if (h.z > FACE - 0.01 && Math.abs(h.x) < 0.46) {
+        const g = lettering(lines, h.x, h.y, 0.52, frame);
+        if (g) {
+          h.glyph = g;
+          // Someone's name is picked out in red; a plain R.I.P. is just cut. Either way the
+          // letters are inked solid, not shaded.
+          h.tint = engraved ? BLOOD : INK;
+          h.value = 0;
+        }
+      }
+      return true;
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Cauldron: an iron pot on three legs, a blood-red brew that bubbles, and fumes curling up.
+
+function cauldronScene(): Scene {
+  let time = 0;
+  const BREW = 0.24;
+  const BUBBLES = [
+    [0.18, 0.1],
+    [-0.25, 0.15],
+    [0.05, -0.28],
+    [-0.12, -0.05],
+    [0.3, -0.2],
+  ];
+  const pot = (x: number, y: number, z: number) => {
+    const sphere = Math.hypot(x, y + 0.1, z) - 0.75;
+    let d = Math.max(Math.abs(sphere + 0.04) - 0.04, y - 0.38);
+    d = Math.min(d, sdTorusY(x, y - 0.38, z, 0.58, 0.065), sdTorusZ(Math.abs(x) - 0.8, y - 0.14, z, 0.11, 0.03));
+    for (const a of [0.5, 2.6, 4.7]) {
+      const c = Math.cos(a), s = Math.sin(a);
+      d = Math.min(d, sdCapsule(x, y, z, c * 0.42, -0.7, s * 0.42, c * 0.54, -0.98, s * 0.54, 0.06));
+    }
+    return d;
+  };
+  const surface = (x: number, z: number) => BREW + 0.025 * Math.sin(x * 9 + time * 3) * Math.sin(z * 8 - time * 2.3);
+  const brew = (x: number, y: number, z: number) => Math.max(Math.hypot(x, z) - 0.66, Math.abs(y - surface(x, z)) - 0.015) * 0.8;
+  const bubbles = (x: number, y: number, z: number) => {
+    let d = 1e9;
+    BUBBLES.forEach(([bx, bz], i) => {
+      const k = (time * 0.55 + i * 0.37) % 1;
+      d = Math.min(d, Math.hypot(x - bx, y - BREW - k * 0.22, z - bz) - 0.075 * Math.sin(k * Math.PI));
+    });
+    return d;
+  };
+  const fumes = (x: number, y: number, z: number) => smoke(x, y, z, 0, BREW + 0.3, 0, time, 4, 0.42, 0.22);
+  const sdf = (x: number, y: number, z: number) => Math.min(pot(x, y, z), brew(x, y, z), bubbles(x, y, z), fumes(x, y, z));
+  return {
+    radius: 1.3,
+    fit: [1.0, 1.02],
+    maxInk: 0.85,
+    pose(f) {
+      time = f.t;
+      return mul(rotX(0.64 - f.lookY * 0.2), rotY(f.t * 0.12 + f.lookX * 0.5 + f.spin));
+    },
+    intersect(ox, oy, oz, dx, dy, dz, t0, t1, h) {
+      if (!march(sdf, ox, oy, oz, dx, dy, dz, t0, t1, h)) return false;
+      h.mat = SURFACE;
+      if (bubbles(h.x, h.y, h.z) < 0.004) {
+        h.mat = GLOW;
+        h.value = 0.92;
+      } else if (brew(h.x, h.y, h.z) < 0.004) {
+        h.mat = GLOW;
+        h.value = 0.35 + 0.45 * noise3(h.x * 5, h.z * 5, time * 1.2);
+      } else if (fumes(h.x, h.y, h.z) < 0.004) {
+        h.value = 0.75;
+        h.glyph = G_WISP;
+      } else {
+        h.value = 0.74; // black iron
+      }
+      return true;
+    },
+    light(h, lx, ly, lz) {
+      // The cursor lantern, plus the brew's glow on the inside of the pot and its rim.
+      const diff = Math.max(0, h.nx * lx + h.ny * ly + h.nz * lz);
+      const gx = -h.x, gy = BREW - h.y, gz = -h.z, gl = Math.hypot(gx, gy, gz) || 1;
+      const glow = Math.max(0, (h.nx * gx + h.ny * gy + h.nz * gz) / gl) * (0.5 / (0.4 + gl * gl * 3));
+      return clamp(h.value * (0.1 + 0.9 * diff) + glow);
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Black cat, the agents' Familiar: sitting, tail curled round its paws, head turning to watch
+// the cursor with glowing slit-pupilled eyes. It blinks now and then.
+
+function catScene(): Scene {
+  let cy = 1, sy = 0, cp = 1, sp = 0, sweep = 0, open = 1, pupil = 0;
+  const NY = 0.28, NZ = 0.05;
+  const hp = new Float64Array(3);
+  /** Into head space: undo the head's turn (yaw) and nod (pitch) about the neck. */
+  const head = (x: number, y: number, z: number) => {
+    const py = y - NY, pz = z - NZ;
+    const x1 = cy * x - sy * pz, z1 = sy * x + cy * pz;
+    hp[0] = x1;
+    hp[1] = cp * py - sp * z1 + NY;
+    hp[2] = sp * py + cp * z1 + NZ;
+    return hp;
+  };
+  const skull = (x: number, y: number, z: number) => {
+    const [hx, hy, hz] = head(x, y, z);
+    let d = sdEllipsoid(hx, hy - 0.47, hz - 0.08, 0.3, 0.25, 0.26);
+    d = smin(d, sdEllipsoid(hx, hy - 0.38, hz - 0.27, 0.13, 0.085, 0.08), 0.06);
+    return Math.min(d, sdRoundCone(Math.abs(hx), hy, hz, 0.15, 0.6, 0.06, 0.25, 0.86, 0.03, 0.085, 0.012));
+  };
+  const TAIL = [
+    [0.3, -0.86, -0.12],
+    [0.58, -0.88, 0.1],
+    [0.66, -0.78, 0.34],
+    [0.5, -0.74, 0.5],
+  ];
+  const body = (x: number, y: number, z: number) => {
+    let d = smin(sdEllipsoid(x, y + 0.5, z + 0.05, 0.45, 0.4, 0.4), sdEllipsoid(x, y + 0.05, z - 0.05, 0.28, 0.42, 0.26), 0.15);
+    const ax = Math.abs(x);
+    d = smin(d, sdCapsule(ax, y, z, 0.12, -0.25, 0.2, 0.13, -0.84, 0.28, 0.07), 0.05);
+    d = Math.min(d, sdEllipsoid(ax - 0.13, y + 0.87, z - 0.33, 0.085, 0.05, 0.1));
+    for (let i = 0; i < TAIL.length - 1; i++) {
+      const [ax0, ay0, az0] = TAIL[i], [bx0, by0, bz0] = TAIL[i + 1];
+      // The tip twitches.
+      const w = i === TAIL.length - 2 ? sweep : 0;
+      d = smin(d, sdCapsule(x, y, z, ax0, ay0, az0, bx0 + w, by0 + Math.abs(w) * 0.5, bz0, 0.06 - i * 0.008), 0.04);
+    }
+    return d;
+  };
+  const sdf = (x: number, y: number, z: number) => smin(body(x, y, z), skull(x, y, z), 0.1);
+  return {
+    radius: 1.25,
+    fit: [0.86, 1.0],
+    maxInk: 0.86,
+    pose(f) {
+      const yaw = f.lookX * 0.7, pitch = f.lookY * 0.3;
+      cy = Math.cos(yaw);
+      sy = Math.sin(yaw);
+      cp = Math.cos(pitch);
+      sp = Math.sin(pitch);
+      pupil = f.lookX * 0.025;
+      sweep = 0.1 * Math.sin(f.t * 1.7) * Math.sin(f.t * 0.6);
+      const b = f.t % 5.3;
+      open = b < 0.18 ? Math.abs(Math.cos((b / 0.18) * Math.PI)) : 1;
+      return mul(rotY(0.12 * Math.sin(f.t * 0.3) + f.lookX * 0.2), rotX(0.08));
+    },
+    intersect(ox, oy, oz, dx, dy, dz, t0, t1, h) {
+      if (!march(sdf, ox, oy, oz, dx, dy, dz, t0, t1, h)) return false;
+      h.mat = SURFACE;
+      h.value = 0.38; // black fur
+      if (skull(h.x, h.y, h.z) < 0.01) {
+        const [hx, hy, hz] = head(h.x, h.y, h.z);
+        const ex = Math.abs(hx) - 0.11, ey = hy - 0.5;
+        if (hz > 0.2 && open > 0.2 && (ex / 0.065) ** 2 + (ey / (0.048 * open)) ** 2 < 1) {
+          // Glowing eyes with slit pupils that follow the cursor.
+          if (Math.abs(ex - pupil * Math.sign(hx)) < 0.014) h.value = 0.1;
+          else {
+            h.mat = GLOW;
+            h.value = 0.95;
+          }
+        }
+      }
+      return true;
+    },
+  };
+}

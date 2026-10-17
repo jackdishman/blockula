@@ -219,6 +219,8 @@ impl Node {
 }
 
 const EXPLORER: &str = include_str!("explorer.html");
+/// The explorer's animated ASCII backdrop, bundled from web/lib/ascii by `npm run build:haunt`.
+const HAUNT_JS: &str = include_str!("haunt.js");
 
 /// Set on requests a node forwards to another; a forwarded request is never forwarded again
 /// (so misconfigured peers — e.g. a node listed as its own peer — can't loop).
@@ -257,6 +259,10 @@ type ApiResult = Result<Json<Value>, ApiError>;
 pub fn router(node: Node) -> Router {
     Router::new()
         .route("/", get(|| async { Html(EXPLORER) }))
+        .route(
+            "/haunt.js",
+            get(|| async { ([(axum::http::header::CONTENT_TYPE, "text/javascript; charset=utf-8"), (axum::http::header::CACHE_CONTROL, "public, max-age=3600")], HAUNT_JS) }),
+        )
         .route("/api/status", get(status))
         .route("/api/blocks", get(blocks))
         .route("/api/block/{id}", get(block))
@@ -1212,6 +1218,21 @@ mod http_tests {
         assert_eq!(err.0, StatusCode::BAD_GATEWAY);
         assert!(!err.1.contains("scheme"), "{}", err.1);
         assert!(err.1.contains("couldn't reach"), "{}", err.1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn explorer_serves_its_haunted_backdrop() {
+        let (root, n) = node("haunt");
+        let (s, _, html) = call(&n, "GET", "/", None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(html.contains(r#"src="/haunt.js""#), "the explorer loads the backdrop");
+        let app = router(n.clone()).layer(MockConnectInfo("127.0.0.1:1".parse::<SocketAddr>().unwrap()));
+        let res = app.oneshot(Request::builder().uri("/haunt.js").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()[axum::http::header::CONTENT_TYPE], "text/javascript; charset=utf-8");
+        let body = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        assert!(body.starts_with(b"\"use strict\";(()=>{") && body.len() > 10_000, "a bundled script, not a stub");
         std::fs::remove_dir_all(root).ok();
     }
 

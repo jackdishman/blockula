@@ -4,7 +4,11 @@
   "workspaces": ["sdk-ts", "mcp", "web"],
   "scripts": {
     "build": "cargo build --release --manifest-path node/Cargo.toml && npm run build -w @blockula/sdk && npm run build -w @blockula/mcp",
+    "build:haunt": "esbuild web/lib/ascii/standalone.ts --bundle --minify --format=iife --target=es2020 --legal-comments=none --outfile=node/src/haunt.js",
     "dev": "cargo run --release --manifest-path node/Cargo.toml -- dev",
     "test": "cargo test --manifest-path node/Cargo.toml && npm test -w @blockula/sdk"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
   }
 }
