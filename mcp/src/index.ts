@@ -574,6 +574,16 @@ tool("unstake", "Start unbonding stake from a validator's pool: an amount in FAN
   // The conversion uses the node's value of the delegation: one that reports a tiny value would
   // turn "unstake 10 FANG" into unbonding all of it (audit gap-7-5). Taking every share takes "all".
   if (amount !== "all" && parseFang(amount) >= BigInt(d.value)) throw new Error(`the node reports this stake is worth ${formatFang(BigInt(d.value))}, which isn't more than the ${clean(amount, 40)} FANG asked for: nothing was signed. To unbond all ${d.shares} shares, pass amount "all" (after checking the stake's value with the user).`);
+  // With BLOCKULA_WITNESSES, every witness must report the same shares and value for it, so one
+  // lying node can't skew the FANG-to-shares conversion either (audit gap-7-5).
+  if (amount !== "all" && w.client.witnesses.length) {
+    const theirs = await Promise.all(w.client.witnesses.map(async (c) => stakeSummary(await c.staking(w.account)).delegations.find((x) => x.validator === v)));
+    const off = theirs.findIndex((t) => !t || String(t.shares) !== String(d.shares) || String(t.value) !== String(d.value));
+    if (off >= 0) {
+      const t = theirs[off];
+      throw new Error(`${w.client.witnesses[off].rpc} (a witness) and ${RPC} disagree about this stake: ${t ? `${t.shares} shares worth ${formatFang(BigInt(t.value))}` : "no stake"} vs ${d.shares} shares worth ${formatFang(BigInt(d.value))}. Nothing was signed. They may be a block apart: try again, or pass amount "all" (after checking the stake with the user).`);
+    }
+  }
   const shares = amount === "all" ? BigInt(d.shares) : sharesFor(d, amount);
   if (shares <= 0n) throw new Error(`${amount} FANG is less than one share of this pool`);
   // Only the fee leaves the account (it counts toward the daily limit).

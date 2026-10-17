@@ -113,6 +113,10 @@ const charged = (tx: Tx) => BigInt(tx.fee) - BigInt(tx.fee) / 2n;
 const posted: Tx[] = [];
 /** The keys BOB's account lists (use_account looks for the agent's there). */
 let bobKeys: { key_id: string; label: string; role: { type: string } }[] = [];
+/** The account whose stake /api/staking reports: 100 shares of BOB's pool, worth `stake.value` drops (a witness says `stake.witness`). */
+let stakingFor = "";
+const stake = { value: (11n * FANG).toString(), witness: (11n * FANG).toString() };
+const staking = (value: string) => ({ delegations: [{ validator: { address: BOB, name: "bob.boo" }, shares: (100n * FANG).toString(), value, principal: (10n * FANG).toString() }], entries: [], bonded: value, unbonding: "0", withdrawable: "0", summary: "stake" });
 const fake: Server = createServer((req, res) => {
   let body = "";
   req.on("data", (c) => (body += c));
@@ -146,6 +150,7 @@ const fake: Server = createServer((req, res) => {
     // Like node/src/api.rs: any address answers; without an account, with a zero balance and nonce
     // and the address's own key (`keys_of` lists it for every address).
     if (path.startsWith("/account/")) return reply(200, { account: { address: path.slice(9), name: null }, balance: "0", nonce: 0, next_nonce: nextNonce(path.slice(9)), keys: [{ key_id: "ee".repeat(32), label: "original key", role: { type: "owner" }, added_at: 0, spent_this_period: "0", window_start: 0 }], recent_txs: [] });
+    if (path === `/staking/${stakingFor}`) return reply(200, staking(stake.value));
     if (path === "/proposal/1") return reply(200, { id: 1, kind: { type: "text" }, title: "Plant garlic", url: "https://forum.example/p/1", status: "voting" });
     if (path === "/fees") return reply(200, { height: 10, suggested: { flat: "10000", rate: "10000" }, account_creation_fee: "100000000" });
     if (path === "/params") return reply(200, { params: mode.prices.params ? { name_price_3: "100000000000", name_price_4: "25000000000", name_price_5: "5000000000", name_renewal_bps: "2000" } : {} });
@@ -424,6 +429,50 @@ await s.close();
 mode.status = {};
 rmSync(join(home, "known-chains.json"), { force: true });
 console.log("✓ signed names show their address and say they're unproven; on mainnet an unproven name waits for the address to be confirmed; use_account reads the account's own keys");
+
+// gap-7-5: unstaking an amount converts it to shares at the node's value of the stake. One that
+// reports a tiny value would turn "unstake 10" into all of it: refused, and with witnesses every
+// witness must report the same shares and value.
+const witness: Server = createServer((req, res) => {
+  const reply = (code: number, v: unknown) => res.writeHead(code, { "content-type": "application/json" }).end(JSON.stringify(v));
+  const path = decodeURIComponent((req.url ?? "").replace(/^\/api/, ""));
+  if (path === "/status") return reply(200, { chain_id: "fake-chain", genesis_hash: G, address_prefix: "boo", height: 10, max_tx_validity_blocks: 3600 });
+  if (path === `/staking/${stakingFor}`) return reply(200, staking(stake.witness));
+  return reply(404, { error: `witness: no route for ${path}` });
+});
+await new Promise<void>((r) => witness.listen(0, "127.0.0.1", r));
+const witnessRpc = `http://127.0.0.1:${(witness.address() as AddressInfo).port}`;
+resetLedger();
+s = await server();
+stakingFor = (await s.call("wallet_info")).json().address;
+stake.value = (5n * FANG).toString();
+before = posted.length;
+r = await s.call("unstake", { validator: BOB, amount: "10" });
+assert.ok(r.error && /reports this stake is worth 5 FANG, which isn't more than the 10 FANG asked for: nothing was signed/.test(r.text), r.text);
+stake.value = (20n * FANG).toString();
+r = await s.call("unstake", { validator: BOB, amount: "10" });
+assert.ok(!r.error, r.text);
+assert.deepEqual([r.json().unbonding_shares, r.json().of_shares, r.json().worth_as_reported], [(50n * FANG).toString(), (100n * FANG).toString(), "10 FANG"], "the shares and what they're worth are shown");
+assert.equal((posted.at(-1)!.action as { shares: string }).shares, (50n * FANG).toString());
+await s.close();
+// With a witness: a node whose value disagrees with it is refused; agreeing, it goes through.
+s = await server({ BLOCKULA_WITNESSES: witnessRpc });
+stake.value = (11n * FANG).toString();
+stake.witness = (1_000n * FANG).toString();
+const beforeWitness = posted.length;
+r = await s.call("unstake", { validator: BOB, amount: "10" });
+assert.ok(r.error && /\(a witness\) and .* disagree about this stake: 100000000000 shares worth 1000 FANG vs 100000000000 shares worth 11 FANG\. Nothing was signed/.test(r.text), r.text);
+assert.equal(posted.length, beforeWitness, "nothing signed");
+stake.witness = stake.value;
+r = await s.call("unstake", { validator: BOB, amount: "10" });
+assert.ok(!r.error, r.text);
+assert.equal(posted.length, beforeWitness + 1);
+r = await s.call("unstake", { validator: BOB, amount: "all" });
+assert.ok(!r.error && r.json().unbonding_shares === (100n * FANG).toString(), r.text);
+await s.close();
+witness.close();
+witness.closeAllConnections();
+console.log("✓ unstaking an amount: a node can't turn it into the whole stake (its value is bounded, and witnesses must agree)");
 
 fake.close();
 fake.closeAllConnections();
