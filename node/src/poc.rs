@@ -38,9 +38,11 @@ pub const JUROR_BOND: u64 = 10 * DROPS_PER_FANG;
 /// Claim bond is this times (1 + the claimant's open claims).
 pub const CLAIM_BOND: u64 = DROPS_PER_FANG;
 pub const MAX_SEANCE_CLAIMS: usize = 64;
-/// A Séance's budget scales with its claims, reaching the full share at this many (so a two-claim
-/// Séance can't take a quarter of the pool).
-pub const FULL_BUDGET_CLAIMS: u64 = 16;
+/// A Séance's budget scales with the people whose claims it judges (claimant accounts, so a
+/// sponsor and its Familiars are one), reaching the full share at this many: a two-person Séance
+/// can't take a quarter of the pool, and one person's extra claims don't add to it (audit
+/// xcut-economic-opus-1).
+pub const FULL_BUDGET_PEOPLE: u64 = 16;
 pub const JURY_SIZE: usize = 7;
 /// Jurors needed to seat a Séance, and reveals needed to settle it (otherwise claims carry over).
 pub const MIN_JURY: usize = 3;
@@ -1242,9 +1244,11 @@ impl State {
         juror == claimant || self.poc.vouches.get(claimant).is_some_and(|v| v.voucher == juror) || self.poc.vouches.get(juror).is_some_and(|v| v.voucher == claimant)
     }
 
-    /// Opens a Séance at the end of `epoch` if at least 2 claims and `MIN_JURY` jurors are
-    /// eligible (see [`State::seance_cutoff`]); otherwise the next chance is the next opening on
-    /// the cadence.
+    /// Opens a Séance at the end of `epoch` if claims of at least 2 people and `MIN_JURY` jurors
+    /// are eligible (see [`State::seance_cutoff`]); otherwise the next chance is the next opening
+    /// on the cadence. A claim is only ever compared with another person's (audit
+    /// xcut-economic-opus-1: two of one person's claims tie, which would float weak claims over
+    /// the threshold), so a person alone with their claims waits for company.
     fn open_seance(&mut self, height: u64, epoch: u64) {
         let mut j = Journal::default();
         let times = self.params.poc.clone();
@@ -1257,7 +1261,8 @@ impl State {
             .take(MAX_SEANCE_CLAIMS)
             .map(|c| (c.id, c.claimant.clone()))
             .collect();
-        if claims.len() < 2 {
+        let people = claims.iter().map(|(_, who)| who).collect::<BTreeSet<_>>().len() as u64;
+        if people < 2 {
             return;
         }
         let id = self.poc.next_seance_id;
@@ -1277,15 +1282,14 @@ impl State {
             if seats.len() >= JURY_SIZE {
                 break;
             }
-            let allowed: Vec<u64> = claims.iter().filter(|(_, who)| !self.conflicted(&juror, who)).map(|(id, _)| *id).collect();
-            if allowed.len() < 2 {
-                continue;
+            // Pairs of claims by two different people, neither of whom the juror is tied to.
+            let allowed: Vec<&(u64, String)> = claims.iter().filter(|(_, who)| !self.conflicted(&juror, who)).collect();
+            let mut pairs = vec![];
+            for (i, (a, who)) in allowed.iter().enumerate() {
+                pairs.extend(allowed[i + 1..].iter().filter(|(_, other)| other != who).map(|(b, _)| [*a, *b]));
             }
-            let mut pairs = Vec::with_capacity(allowed.len() * (allowed.len() - 1) / 2);
-            for (i, a) in allowed.iter().enumerate() {
-                for b in &allowed[i + 1..] {
-                    pairs.push([*a, *b]);
-                }
+            if pairs.is_empty() {
+                continue;
             }
             let mut rng = Rng::new(&seed, &[b"pairs".as_slice(), &id.to_le_bytes(), juror.as_bytes()].concat());
             rng.shuffle(&mut pairs);
@@ -1301,7 +1305,7 @@ impl State {
             return;
         }
         let pool_addr = self.pool();
-        let budget = (bps(self.account(&pool_addr).balance, SEANCE_POOL_BPS) as u128 * (claims.len() as u64).min(FULL_BUDGET_CLAIMS) as u128 / FULL_BUDGET_CLAIMS as u128) as u64;
+        let budget = (bps(self.account(&pool_addr).balance, SEANCE_POOL_BPS) as u128 * people.min(FULL_BUDGET_PEOPLE) as u128 / FULL_BUDGET_PEOPLE as u128) as u64;
         if budget > 0 {
             let _ = self.j_debit(&mut j, &pool_addr, budget);
         }
@@ -1445,28 +1449,29 @@ impl State {
             soul_changes.push((juror.clone(), delta, None));
             seat_updates.push((juror.clone(), Some(agreement), delta));
         }
-        // Rewards: jurors by agreement; claims by score × repo weight, square-rooted per person
-        // (per GitHub handle, so a sponsor's Familiars and relinked accounts are one person),
-        // boosted up to 1.5× by the claimant's Soul.
+        // Rewards: jurors by agreement; claims by score × repo weight, square-rooted per person,
+        // boosted up to 1.5× by their Soul. A person is the claimant account (audit
+        // xcut-economic-opus-3): a sponsor's Familiars claim as the sponsor, and every handle an
+        // account linked counts together (each handle credits one account, `Poc::handles`).
         let juror_budget = if juror_weights.is_empty() { 0 } else { bps(s.budget, JUROR_SHARE_BPS) };
         let claims_budget = if accepted.is_empty() { 0 } else { s.budget - juror_budget };
         let mut raw: BTreeMap<String, Vec<(u64, u128)>> = BTreeMap::new();
         for c in &accepted {
             let cl = &self.poc.claims[c];
             let w = self.poc.repos.get(&cl.repo).copied().unwrap_or(0) as u128 * score[c] as u128;
-            raw.entry(cl.handle.to_ascii_lowercase()).or_default().push((*c, w));
+            raw.entry(cl.claimant.clone()).or_default().push((*c, w));
         }
         let person_weights: Vec<(String, u128)> = raw
             .iter()
-            .map(|(handle, cs)| {
-                let soul = cs.iter().map(|(c, _)| self.soul_of(&self.poc.claims[c].claimant, height)).max().unwrap_or(0).min(BOOST_CAP_SOUL) as u128;
+            .map(|(who, cs)| {
+                let soul = self.soul_of(who, height).min(BOOST_CAP_SOUL) as u128;
                 let boost = PPM as u128 + soul * (PPM as u128 / 2) / BOOST_CAP_SOUL as u128;
-                (handle.clone(), isqrt(cs.iter().map(|(_, w)| w).sum::<u128>()) * boost / PPM as u128)
+                (who.clone(), isqrt(cs.iter().map(|(_, w)| w).sum::<u128>()) * boost / PPM as u128)
             })
             .collect();
         let mut paid = 0u64;
-        for (handle, amount) in split(claims_budget, &person_weights) {
-            let per_claim: Vec<(String, u128)> = raw[&handle].iter().map(|(c, w)| (c.to_string(), *w)).collect();
+        for (person, amount) in split(claims_budget, &person_weights) {
+            let per_claim: Vec<(String, u128)> = raw[&person].iter().map(|(c, w)| (c.to_string(), *w)).collect();
             for (c, p) in split(amount, &per_claim) {
                 let c: u64 = c.parse().unwrap();
                 if p == 0 {
@@ -1856,8 +1861,8 @@ mod scenarios {
         let s = t.c.state.poc.seances[&sid].clone();
         assert_eq!(s.claims, vec![big, tiny, ok]);
         assert_eq!(s.jurors.len(), 5);
-        assert_eq!(s.budget, 20 * DROPS_PER_FANG * 3 / FULL_BUDGET_CLAIMS, "a quarter of the pool, scaled for 3 claims");
-        assert!(s.jurors.values().all(|seat| seat.pairs.len() == 3), "3 claims → every pair");
+        assert_eq!(s.budget, 20 * DROPS_PER_FANG * 2 / FULL_BUDGET_PEOPLE, "a quarter of the pool, scaled for 2 people");
+        assert!(s.jurors.values().all(|seat| seat.pairs.len() == 2), "every pair of two people's claims (solid's two are never compared)");
         assert!(t.tx(&jurors[0], Action::LeaveJury {}).unwrap_err().to_string().contains("after it closes"));
         conserved(&t.c.state);
         // Honest jurors: big > ok > tiny, and they flag tiny as spam (so does the all-ties juror).
@@ -2288,5 +2293,126 @@ mod scenarios {
     fn claims_payout(t: &T, c: u64) -> u64 {
         let cl = &t.c.state.poc.claims[&c];
         t.c.state.poc.grants[&cl.claimant][&cl.grant.unwrap()].amount
+    }
+
+    /// Fills every seat of Séance `sid` with an honest ballot: the claim `rank` puts higher wins
+    /// its pair, equal ranks tie.
+    fn judge(st: &mut State, sid: u64, rank: impl Fn(u64) -> u32) {
+        let s = st.poc.seances.get_mut(&sid).unwrap();
+        for seat in s.jurors.values_mut() {
+            seat.votes = Some(seat.pairs.iter().map(|[a, b]| match rank(*a).cmp(&rank(*b)) { std::cmp::Ordering::Greater => 'a', std::cmp::Ordering::Less => 'b', std::cmp::Ordering::Equal => '=' }).collect());
+        }
+    }
+
+    /// What an account was paid in a closed Séance (its claims' payouts) and the Soul they earned.
+    fn paid(st: &State, who: &Keys) -> (u64, u64) {
+        st.poc.claims.values().filter(|c| c.claimant == who.address()).fold((0, 0), |(p, s), c| (p + c.payout, s + c.soul_awarded))
+    }
+
+    /// Audit xcut-economic-opus-1: volume doesn't pay. One account's 8 small PRs, each of which
+    /// the jury judges worse than one solid PR, earn less than it (here nothing): one person's
+    /// claims are never compared with each other (they'd tie, which floats weak claims over the
+    /// threshold), and the budget grows with the people in a Séance, not their claim count.
+    #[test]
+    fn eight_weak_prs_never_beat_one_solid_one() {
+        let mut t = setup("volume");
+        t.admin(Action::SetRepo { repo: "jackdishman/blockula".into(), weight: 10 }).unwrap();
+        for j in [k(1), k(2), k(3)] {
+            t.grant(&j, 10);
+            t.tx(&j, Action::JoinJury { bond: JUROR_BOND }).unwrap();
+        }
+        t.tx(&k(9), Action::FundPool { amount: 80 * DROPS_PER_FANG }).unwrap();
+        // The volume farmer has the Soul for 8 open claims; the solid contributor has one claim.
+        let (farmer, solid) = (k(5), k(6));
+        t.grant(&farmer, 60);
+        t.grant(&solid, 1);
+        t.link(&farmer, "volume");
+        t.link(&solid, "solid");
+        let small: Vec<u64> = (1..=8).map(|pr| t.claim(&farmer, pr).unwrap()).collect();
+        let big = t.claim(&solid, 100).unwrap();
+        t.attest_all(&[small.as_slice(), &[big]].concat());
+        let sid = t.wait_for_seance();
+        let s = t.c.state.poc.seances[&sid].clone();
+        let pool = t.c.state.account(&t.c.state.pool()).balance + s.budget;
+        assert_eq!(s.budget, bps(pool, SEANCE_POOL_BPS) * 2 / FULL_BUDGET_PEOPLE, "two people: 2/16 of a quarter, however many claims");
+        for seat in s.jurors.values() {
+            assert!(seat.pairs.iter().all(|[a, b]| (*a == big) != (*b == big)), "the farmer's claims are only ever compared with someone else's: {:?}", seat.pairs);
+        }
+        let mut st = t.c.state.clone();
+        judge(&mut st, sid, |c| if c == big { 2 } else { 1 });
+        st.close_seance(sid, t.h());
+        st.check_invariants().unwrap();
+        let ((farmer_paid, farmer_soul), (solid_paid, solid_soul)) = (paid(&st, &farmer), paid(&st, &solid));
+        assert!(solid_paid > 0 && farmer_paid < solid_paid, "8 weak PRs earned {farmer_paid}, the solid one {solid_paid}");
+        assert!(farmer_soul < solid_soul, "Soul: {farmer_soul} vs {solid_soul}");
+        assert!(small.iter().all(|c| st.poc.claims[c].score_ppm == Some(0)), "each lost its only comparisons");
+        // With other people in the Séance too (6 medium PRs, judged between the two), the farmer
+        // still earns less than the solid PR and less than any medium one.
+        let mut t = setup("volume2");
+        t.admin(Action::SetRepo { repo: "jackdishman/blockula".into(), weight: 10 }).unwrap();
+        for j in [k(1), k(2), k(3), k(4)] {
+            t.grant(&j, 10);
+            t.tx(&j, Action::JoinJury { bond: JUROR_BOND }).unwrap();
+        }
+        t.tx(&k(4), Action::FundPool { amount: 80 * DROPS_PER_FANG }).unwrap();
+        t.grant(&farmer, 60);
+        t.grant(&solid, 1);
+        t.link(&farmer, "volume");
+        t.link(&solid, "solid");
+        let small: Vec<u64> = (1..=8).map(|pr| t.claim(&farmer, pr).unwrap()).collect();
+        let big = t.claim(&solid, 100).unwrap();
+        let mut medium = vec![];
+        for i in 7..=12u8 {
+            t.grant(&k(i), 1);
+            t.link(&k(i), &format!("medium{i}"));
+            medium.push(t.claim(&k(i), 200 + i as u64).unwrap());
+        }
+        t.attest_all(&[small.as_slice(), &[big], &medium].concat());
+        let sid = t.wait_for_seance();
+        let mut st = t.c.state.clone();
+        judge(&mut st, sid, |c| if c == big { 3 } else if medium.contains(&c) { 2 } else { 1 });
+        st.close_seance(sid, t.h());
+        st.check_invariants().unwrap();
+        let farmer_paid = paid(&st, &farmer).0;
+        let best_medium = (7..=12u8).map(|i| paid(&st, &k(i)).0).min().unwrap();
+        assert!(farmer_paid < paid(&st, &solid).0 && farmer_paid < best_medium, "farmer {farmer_paid}, solid {}, least medium {best_medium}", paid(&st, &solid).0);
+        std::fs::remove_dir_all(&t.home).ok();
+    }
+
+    /// Audit xcut-economic-opus-3: the square root is per sponsor account, so one account that
+    /// relinks a second GitHub handle between claims gets one √ bucket for all of them, and earns
+    /// what one handle with the same claims would.
+    #[test]
+    fn relinking_a_second_handle_is_still_one_square_root() {
+        let mut t = setup("relink");
+        t.admin(Action::SetRepo { repo: "jackdishman/blockula".into(), weight: 10 }).unwrap();
+        for j in [k(1), k(2), k(3)] {
+            t.grant(&j, 10);
+            t.tx(&j, Action::JoinJury { bond: JUROR_BOND }).unwrap();
+        }
+        t.tx(&k(9), Action::FundPool { amount: 80 * DROPS_PER_FANG }).unwrap();
+        let (a, b) = (k(5), k(6));
+        t.grant(&a, 15);
+        t.grant(&b, 15);
+        t.link(&a, "a-one");
+        let mut mine = vec![t.claim(&a, 1).unwrap(), t.claim(&a, 2).unwrap()];
+        t.attest_all(&mine);
+        t.tx(&a, Action::UnlinkGithub { handle: "a-one".into() }).unwrap();
+        t.link(&a, "a-two");
+        mine.extend([t.claim(&a, 3).unwrap(), t.claim(&a, 4).unwrap()]);
+        t.link(&b, "b");
+        let theirs: Vec<u64> = (5..=8).map(|pr| t.claim(&b, pr).unwrap()).collect();
+        t.attest_all(&[&mine[2..], theirs.as_slice()].concat());
+        assert_eq!((t.c.state.poc.handles["a-one"].clone(), t.c.state.poc.handles["a-two"].clone()), (a.address(), a.address()));
+        let sid = t.wait_for_seance();
+        assert_eq!(t.c.state.poc.seances[&sid].claims.len(), 8);
+        // Every comparison a tie: every claim scores 50%.
+        let mut st = t.c.state.clone();
+        judge(&mut st, sid, |_| 0);
+        st.close_seance(sid, t.h());
+        st.check_invariants().unwrap();
+        let (pa, pb) = (paid(&st, &a).0, paid(&st, &b).0);
+        assert!(pa > 0 && pa.abs_diff(pb) <= 1, "two handles {pa}, one handle {pb}");
+        std::fs::remove_dir_all(&t.home).ok();
     }
 }
