@@ -660,7 +660,7 @@ fn room_for_entry(state: &State, delegator: &str) -> Result<()> {
 // --------------------------------------------------------------------------------- actions
 
 /// Tags 30–36: Delegate, Undelegate, Redelegate, WithdrawUnbonded, UpdateValidator, Unjail,
-/// ReportEquivocation; 55–56: ValidatorReady, AdmitValidator. Session keys never get here
+/// ReportEquivocation; 60–61: ValidatorReady, AdmitValidator. Session keys never get here
 /// (admission lets them send transfers only).
 pub(crate) fn apply(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, signer: &str, _key: &KeyRecord, height: u64) -> Result<()> {
     match &tx.action {

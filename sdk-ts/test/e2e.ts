@@ -102,9 +102,9 @@ assert.equal(bytesToHex(blake3(v1Joined)), "6979535ae0ead49caa82eba564873762cfc4
 assert.equal(bytesToHex(blake3(signingBytes(vectorTx(propose({ type: "unflag_sybil", account: "x.boo", reason: "r" }))))), "225aa5b8e4df8e8d27fe796992dfd02e5e402c14a9bbc3873d41d63dd07dc2cf");
 assert.equal(bytesToHex(blake3(signingBytes(vectorTx(propose({ type: "cancel_upgrade", version: 2, activation_height: 100_000 }))))), "199d2455419f738528317187cdbfa72e5430308b096c2c8741f5801290d3d156");
 assert.throws(() => signingBytes(vectorTx({ type: "multisig_propose", action: { type: "multisig_propose", action: { type: "unlock" } } })), /can't contain another/);
-// A set of one or two's readiness and admission (tags 55–56, audit round 3), each on its own: `small_set_vector_actions` there.
+// A set of one or two's readiness and admission (tags 60–61, audit round 3), each on its own: `small_set_vector_actions` there.
 const smallSetVectorActions: Action[] = [{ type: "validator_ready", epoch: 3 }, { type: "admit_validator", validator: "boo1v", epoch: 3 }];
-assert.deepEqual(smallSetVectorActions.map((a) => bytesToHex(blake3(signingBytes(vectorTx(a))))), ["fe4bb83346fe989aecadb817a6e50bd6db18a0e767aa6d095b4b280661c7f5b5", "39f77be7724a4a420dbd179924edadda9bf244d9be179e7b05d1bbbe54bb77ce"]);
+assert.deepEqual(smallSetVectorActions.map((a) => bytesToHex(blake3(signingBytes(vectorTx(a))))), ["1276620e9888e634548d914538007b797a6b81281a89a27d3f88470804d19012", "75a6f69d5103b23658fc22a88a23a4ba1811d8c52d8a8043cd633b59a3dcf3c1"]);
 // Ghost Mode (tags 50–54): signing bytes (the unsigned wire form for 51 and 52) and the sighashes of 50–52, hashed on their own:
 // `ghost_vector_actions` there.
 const fill = (n: number, len: number) => n.toString(16).padStart(2, "0").repeat(len);

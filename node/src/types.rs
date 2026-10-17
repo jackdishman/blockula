@@ -278,7 +278,7 @@ pub enum Action {
     /// once f + 1 of the epoch's validators have.
     GhostPause {},
 
-    // ---- a set of one or two (tags 55–56, staking.rs; audit round 3, review-fix-staking-2):
+    // ---- a set of one or two (tags 60–61, staking.rs; audit round 3, review-fix-staking-2):
     // the next newcomer would be needed for every quorum, so it joins only with both ----
     /// A candidate's consensus key (from its own account or its owner's, SF-13): its node is
     /// running in `epoch`'s last tenth (the epoch it lands in). Changes nothing but the
@@ -1050,11 +1050,11 @@ impl Action {
             }
             Action::GhostPause {} => out.push(54),
             Action::ValidatorReady { epoch } => {
-                out.push(55);
+                out.push(60);
                 put_u64(out, *epoch);
             }
             Action::AdmitValidator { validator, epoch } => {
-                out.push(56);
+                out.push(61);
                 put_str(out, validator);
                 put_u64(out, *epoch);
             }
@@ -1166,8 +1166,8 @@ impl Action {
             52 => Action::Unshield { to: r.str("to", MAX_NAME_FIELD)?, amount: r.u64()?, bundle: Box::new(GhostBundle::decode(r)?) },
             53 => Action::SetGhostAddress { address: HexBytes(r.take(GHOST_ADDRESS_BYTES)?.to_vec()) },
             54 => Action::GhostPause {},
-            55 => Action::ValidatorReady { epoch: r.u64()? },
-            56 => Action::AdmitValidator { validator: r.str("validator", MAX_ADDRESS)?, epoch: r.u64()? },
+            60 => Action::ValidatorReady { epoch: r.u64()? },
+            61 => Action::AdmitValidator { validator: r.str("validator", MAX_ADDRESS)?, epoch: r.u64()? },
             t => bail!("unknown action tag {t}"),
         })
     }
@@ -2321,7 +2321,7 @@ pub(crate) mod tests {
         ]
     }
 
-    /// A set of one or two's readiness and admission (tags 55–56, audit round 3): one action per
+    /// A set of one or two's readiness and admission (tags 60–61, audit round 3): one action per
     /// tag. Mirrored by `smallSetVectorActions` in sdk-ts/test/e2e.ts.
     pub(crate) fn small_set_vector_actions() -> Vec<Action> {
         vec![Action::ValidatorReady { epoch: 3 }, Action::AdmitValidator { validator: "boo1v".into(), epoch: 3 }]
@@ -2519,12 +2519,12 @@ pub(crate) mod tests {
             assert_eq!(json["type"], a.kind());
             assert_eq!(serde_json::from_value::<Action>(json).unwrap(), a);
         }
-        // A set of one or two's readiness and admission (tags 55–56, audit round 3), each on its
+        // A set of one or two's readiness and admission (tags 60–61, audit round 3), each on its
         // own (mirrored in e2e.ts).
         let [ready, admit]: [Action; 2] = small_set_vector_actions().try_into().unwrap();
-        assert_eq!(ready.to_bytes(), [55, 3, 0, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(blake3::hash(&vector_tx(ready.clone()).signing_bytes()).to_hex().to_string(), "fe4bb83346fe989aecadb817a6e50bd6db18a0e767aa6d095b4b280661c7f5b5");
-        assert_eq!(blake3::hash(&vector_tx(admit.clone()).signing_bytes()).to_hex().to_string(), "39f77be7724a4a420dbd179924edadda9bf244d9be179e7b05d1bbbe54bb77ce");
+        assert_eq!(ready.to_bytes(), [60, 3, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(blake3::hash(&vector_tx(ready.clone()).signing_bytes()).to_hex().to_string(), "1276620e9888e634548d914538007b797a6b81281a89a27d3f88470804d19012");
+        assert_eq!(blake3::hash(&vector_tx(admit.clone()).signing_bytes()).to_hex().to_string(), "75a6f69d5103b23658fc22a88a23a4ba1811d8c52d8a8043cd633b59a3dcf3c1");
         assert_eq!(serde_json::to_value(&ready).unwrap(), serde_json::json!({ "type": "validator_ready", "epoch": 3 }));
         assert_eq!(serde_json::to_value(&admit).unwrap(), serde_json::json!({ "type": "admit_validator", "validator": "boo1v", "epoch": 3 }));
         for a in [ready, admit] {
@@ -2637,7 +2637,7 @@ pub(crate) mod tests {
             let tx = vector_tx(action);
             assert_eq!(Tx::from_bytes(&tx.to_bytes()).unwrap(), tx);
         }
-        assert_eq!(tags, (0..=56).collect(), "the vectors cover every action tag");
+        assert_eq!(tags, (0..=54).chain(60..=61).collect(), "the vectors cover every action tag (55–59 are Ghost Mode's, unused)");
         assert_eq!(kinds, (0..=13).collect(), "and every proposal kind");
     }
 
@@ -2762,8 +2762,10 @@ pub(crate) mod tests {
         let tag_at = TX_DOMAIN.len() + 2 + 3 + 32 + 2 + 8 + 4 * 8;
         assert_eq!(good[tag_at], 21);
         let mut unknown = good.clone();
-        unknown[tag_at] = 57;
-        assert!(err(&unknown).contains("unknown action tag 57"));
+        for t in [55, 59, 62] {
+            unknown[tag_at] = t;
+            assert!(err(&unknown).contains(&format!("unknown action tag {t}")));
+        }
         // A proposal kind past the last one.
         let text = vector_tx(Action::Propose { kind: ProposalKind::Text {}, deposit: 1, title: "t".into(), url: String::new() }).to_bytes();
         let mut bad_kind = text.clone();
@@ -2938,6 +2940,7 @@ pub(crate) mod tests {
             52 => Action::Unshield { to: a, amount: w, bundle: vector_bundle(small) },
             53 => Action::SetGhostAddress { address: HexBytes(vec![small; GHOST_ADDRESS_BYTES]) },
             54 => Action::GhostPause {},
+            // Tags 60–61 (55–59 are Ghost Mode's, unused).
             55 => Action::ValidatorReady { epoch: w },
             56 => Action::AdmitValidator { validator: a, epoch: w },
             _ => unreachable!(),

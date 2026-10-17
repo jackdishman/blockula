@@ -752,7 +752,7 @@ impl Sm {
                     1 => Action::BeaconReveal { epoch, secret: hex::encode((amt as u128).to_le_bytes().repeat(2)) },
                     2 => Action::AttestRevert { claim_id: claim, revert_sha: "cd".repeat(20) },
                     3 => Action::ClaimDistribution { distribution_id: amt % 3, amount: fang(1), proof: vec![] },
-                    // A small set's readiness and admission (tags 55–56).
+                    // A small set's readiness and admission (tags 60–61).
                     4 => Action::ValidatorReady { epoch },
                     5 => Action::AdmitValidator { validator: validator_addr(self), epoch },
                     _ => Action::ReportEquivocation { evidence: hex::encode(raw) },
