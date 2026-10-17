@@ -35,7 +35,7 @@ export default function SeancePage() {
           opened at block #{s.opened_at} · budget {s.budget_display} · jury drawn from seed <span className="mono">{s.seed.slice(0, 16)}…</span>
         </span>
         {r && (
-          <p style={{ marginTop: 12 }}>
+          <p className="mt-12">
             {r.accepted} accepted · {r.below_threshold} below the threshold · {r.spam} spam · {r.carried_over} carried over · {plural(r.no_shows, "no-show")}
             {s.results_display ? ` · paid ${s.results_display.paid}, ${s.results_display.returned} back to the pool` : ""}
           </p>
@@ -46,7 +46,7 @@ export default function SeancePage() {
           <ul className="ledger">
             {s.claims.map((c) => (
               <li key={c.id}>
-                <Link className="ledger-row" href={to.claim(c.id)} style={{ gridTemplateColumns: "minmax(0,1fr) auto" }}>
+                <Link className="ledger-row two" href={to.claim(c.id)}>
                   <span className="ledger-main">
                     <span className="ledger-summary">
                       {c.repo}#{c.pr}
@@ -65,7 +65,7 @@ export default function SeancePage() {
         <Section title={`Jury (${s.jurors.length})`}>
           <ul className="ledger">
             {s.jurors.map((j) => (
-              <li key={j.juror.address} className="row-between" style={{ padding: "10px 0" }}>
+              <li key={j.juror.address} className="row-between pad-row">
                 <span>
                   <Who who={j.juror} me={me?.address} />
                   <span className="dim small block">

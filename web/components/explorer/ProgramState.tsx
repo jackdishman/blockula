@@ -111,7 +111,7 @@ function PoolState() {
           <ul className="ledger">
             {claims.data.claims.map((cl) => (
               <li key={cl.id}>
-                <Link className="ledger-row" href={to.claim(cl.id)} style={{ gridTemplateColumns: "minmax(0,1fr) auto" }}>
+                <Link className="ledger-row two" href={to.claim(cl.id)}>
                   <span className="ledger-main">
                     <span className="ledger-summary">
                       {cl.repo}#{cl.pr}
@@ -154,11 +154,12 @@ function ValidatorsState() {
   const d = v.data;
   if (!d) return <p className="dim">Reading the validator set…</p>;
   const list = (k: keyof ValidatorsDetail) => (Array.isArray(d[k]) ? (d[k] as ValidatorRow[]) : []);
+  const leavingSoon = new Set(list("leaving").map((x) => x.validator.address));
   const row = (x: ValidatorRow) => (
-    <li key={x.validator.address} style={{ padding: "11px 0" }}>
+    <li key={x.validator.address} className="pad-row-11">
       <div className="row-between">
         <Who who={x.validator} me={me?.address} />
-        <StatusPill status={x.jailed ? "failed" : x.status === "active" ? "finalized" : "pending"}>{x.jailed ? "jailed" : x.status}</StatusPill>
+        <StatusPill status={x.tombstoned_at != null || x.jailed ? "failed" : x.status === "active" ? "finalized" : "pending"}>{x.tombstoned_at != null ? "tombstoned" : x.jailed ? "jailed" : leavingSoon.has(x.validator.address) ? "leaving" : x.status}</StatusPill>
       </div>
       <span className="dim small">
         {[
@@ -174,13 +175,26 @@ function ValidatorsState() {
       </span>
     </li>
   );
-  const groups: [string, ValidatorRow[], string][] = [
-    ["Active this epoch", list("active"), ""],
-    ["Waiting for approval", [...list("pending"), ...list("candidates")], "Nobody is waiting. Run `blockula validator init` to become one."],
-    ["Joining at the next epoch", [...list("approved"), ...list("joining")], ""],
-    ["Jailed", list("jailed"), ""],
-    ["Removed", list("removed"), ""],
-  ];
+  // Protocol v1 picks the set by stake at each boundary: newcomers join, the rest leave; jailed
+  // and tombstoned (slashed out for good) pools sit apart. Dev chains' admins may still pin one.
+  const v1 = Array.isArray(d.leaving) || Array.isArray(d.tombstoned);
+  const groups: [string, ValidatorRow[], string][] = v1
+    ? [
+        ["Active this epoch", list("active"), ""],
+        ["Joining at the next epoch", list("joining"), ""],
+        ["Leaving at the next epoch", list("leaving"), ""],
+        ["Candidates, by stake", list("candidates").filter((x) => !list("active").some((a) => a.validator.address === x.validator.address)), "No candidates outside the set. Run `blockula validator init` to register one."],
+        ["Jailed", list("jailed"), ""],
+        ["Tombstoned", list("tombstoned"), ""],
+        ["Removed", list("removed"), ""],
+      ]
+    : [
+        ["Active this epoch", list("active"), ""],
+        ["Waiting for approval", [...list("pending"), ...list("candidates")], "Nobody is waiting. Run `blockula validator init` to become one."],
+        ["Joining at the next epoch", [...list("approved"), ...list("joining")], ""],
+        ["Jailed", list("jailed"), ""],
+        ["Removed", list("removed"), ""],
+      ];
   const epochBlocks = d.epoch_blocks ?? 0;
   const left = d.blocks_until_next_epoch ?? 0;
   return (
@@ -192,7 +206,7 @@ function ValidatorsState() {
         <Stat v={d.min_bond_display ? <Fang display={d.min_bond_display} /> : "—"} k={<>minimum <Term k="bond" /></>} />
       </div>
       {epochBlocks > 0 && (
-        <div className="stack" style={{ gap: 6 }}>
+        <div className="stack gap-6">
           <Meter used={BigInt(epochBlocks - left)} limit={BigInt(epochBlocks)} label={`Epoch ${d.epoch} is ${Math.round(((epochBlocks - left) / epochBlocks) * 100)}% through`} />
           <span className="dim small">
             Epoch {d.epoch} is {Math.round(((epochBlocks - left) / epochBlocks) * 100)}% through its {epochBlocks.toLocaleString("en-US")} blocks. The set only changes at the boundary.
@@ -206,9 +220,14 @@ function ValidatorsState() {
             {xs.length ? <ul className="ledger">{xs.map(row)}</ul> : <p className="ledger-empty">{empty}</p>}
           </Section>
         ))}
+      {d.admission && (
+        <p className="card-note" data-testid="admission">
+          The set carries over {plural(d.admission.members.length, "member")}, so a newcomer would be needed for every quorum: it joins only once {d.admission.quorum} of them admit it this epoch and its node shows it&apos;s running (from block #{d.admission.ready_from.toLocaleString("en-US")}).
+        </p>
+      )}
       {!!d.admins?.length && (
         <p className="dim small">
-          Season 0 admins: {d.admins.map((a, i) => (
+          Admins of this test chain (they may pin or remove validators): {d.admins.map((a, i) => (
             <span key={a.address}>
               {i ? ", " : ""}
               <Who who={a} me={me?.address} />
@@ -240,19 +259,28 @@ function NamesState() {
             <span className="suffix">.boo</span>
           </div>
         </label>
-        <div className="name-status" aria-live="polite" style={{ marginTop: 8 }}>
+        <div className="name-status mt-8" aria-live="polite">
           {name && !ok && <span className="warn">3 to 32 of a–z, 0–9 and dashes.</span>}
           {ok && look.data && (look.data.available ? (
             <span className="ok">
               {look.data.name} is free for {look.data.price_display}. <Link href={to.name(name)}>Claim it →</Link>
             </span>
+          ) : look.data.status === "reserved" ? (
+            <span>
+              {look.data.name} is reserved at genesis: nobody can register it.
+            </span>
+          ) : look.data.status === "grace" ? (
+            <span className="warn">
+              {look.data.name} expired at block #{look.data.expires_at?.toLocaleString("en-US")}: only <Who who={look.data.owner} /> can renew it, until block #{look.data.grace_until?.toLocaleString("en-US")}. <Link href={to.name(name)}>Details →</Link>
+            </span>
           ) : (
             <span>
-              {look.data.name} belongs to <Who who={look.data.owner} />. <Link href={to.name(name)}>Details →</Link>
+              {look.data.name} belongs to <Who who={look.data.owner} />
+              {look.data.offered_to ? <> (offered to <Who who={look.data.offered_to} />)</> : null}. <Link href={to.name(name)}>Details →</Link>
             </span>
           ))}
         </div>
-        <p className="card-note">Three-letter names are scarcest and cost the most; five letters and up are cheapest. The price goes to the treasury.</p>
+        <p className="card-note">Names are registered for a year at a time and renewed by their owner. Three-letter names are scarcest and cost the most; five letters and up are cheapest. The price goes to the treasury.</p>
       </Section>
     </>
   );
@@ -276,9 +304,9 @@ function AccountsState() {
           <input className="mono" value={q} onChange={(e) => setQ(e.target.value)} placeholder="64 hex characters" autoCapitalize="none" spellCheck={false} />
         </label>
         {look.data && (
-          <ul className="ledger" style={{ marginTop: 12 }}>
+          <ul className="ledger mt-12">
             {look.data.accounts.map((a) => (
-              <li key={a.account.address} style={{ padding: "10px 0" }} className="row-between">
+              <li key={a.account.address} className="row-between pad-row">
                 <Who who={a.account} />
                 <span className="chip">
                   {a.role.type === "session" ? "agent" : "owner"} · {a.label}

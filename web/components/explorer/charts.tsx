@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { cssVars } from "@/lib/cssvars";
 import { compactDrops, type Flow } from "@/lib/explorer/ledger";
 import { to } from "@/lib/explorer/routes";
 import type { BlockSummary } from "@/lib/explorer/types";
@@ -24,7 +25,7 @@ function useWidth<T extends HTMLElement>() {
 
 function Tip({ x, y, children }: { x: number; y: number; children: ReactNode }) {
   return (
-    <div className="tooltip" style={{ left: x, top: y }} role="status">
+    <div className="tooltip" ref={cssVars({ "--x": x, "--y": y })} role="status">
       {children}
     </div>
   );
@@ -70,7 +71,7 @@ export function Ribbon({ blocks: all, mine, here, born, now, caption }: { blocks
               onFocus={(e) => show(b, e.currentTarget)}
               onBlur={() => setHover(null)}
             >
-              <span style={{ height: `${h}%` }} />
+              <span ref={cssVars({ "--h": `${h}%` })} />
             </Link>
           );
         })}
@@ -158,10 +159,10 @@ export function Bars({ rows, format = (v: number) => v.toLocaleString("en-US") }
     <div className="bars-wrap">
     <div className="bars">
       {rows.map((r) => (
-        <div key={r.key} style={{ display: "contents" }} title={r.note}>
+        <div key={r.key} className="contents" title={r.note}>
           <span className="bar-label">{r.label}</span>
           <span className="bar-track">
-            <span className="bar-fill" style={{ display: "block", width: `${(r.value / max) * 100}%` }} />
+            <span className="bar-fill" ref={cssVars({ "--w": `${(r.value / max) * 100}%` })} />
           </span>
           <span className="bar-value">{format(r.value)}</span>
         </div>
@@ -186,7 +187,7 @@ export function FlowChart({ rows, me, limit = 8 }: { rows: Flow[]; me?: string |
   const side = (v: bigint, dir: "in" | "out") => (
     <span className={`flow-side ${dir}`}>
       {dir === "out" && v > 0n && <span className="flow-val">−{compactDrops(v)}</span>}
-      {v > 0n && <span className="flow-bar" style={{ width: `${Math.max(1.5, ratio(v, max) * 0.78)}%` }} />}
+      {v > 0n && <span className="flow-bar" ref={cssVars({ "--w": `${Math.max(1.5, ratio(v, max) * 0.78)}%` })} />}
       {dir === "in" && v > 0n && <span className="flow-val">+{compactDrops(v)}</span>}
     </span>
   );
@@ -195,14 +196,14 @@ export function FlowChart({ rows, me, limit = 8 }: { rows: Flow[]; me?: string |
       <span className="flow-head out" role="columnheader">
         Sent to
       </span>
-      <span className="flow-head" style={{ textAlign: "center" }} role="columnheader">
+      <span className="flow-head center" role="columnheader">
         Counterparty
       </span>
       <span className="flow-head" role="columnheader">
         Received from
       </span>
       {shown.map((r) => (
-        <div key={r.who.address} role="row" style={{ display: "contents" }}>
+        <div key={r.who.address} role="row" className="contents">
           {side(r.out, "out")}
           <span className="flow-who" role="cell" title={`${r.count} transaction${r.count === 1 ? "" : "s"}`}>
             <Who who={r.who} me={me} />
@@ -211,7 +212,7 @@ export function FlowChart({ rows, me, limit = 8 }: { rows: Flow[]; me?: string |
         </div>
       ))}
       {other && (
-        <div role="row" style={{ display: "contents" }}>
+        <div role="row" className="contents">
           {side(other.out, "out")}
           <span className="flow-who dim" role="cell">
             {other.n} others
@@ -228,7 +229,7 @@ export function Meter({ used, limit, label }: { used: bigint; limit: bigint; lab
   const pct = limit > 0n ? Math.min(100, ratio(used, limit)) : 0;
   return (
     <div className={`meter ${pct < 50 ? "low" : ""}`} role="meter" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(pct)} aria-label={label}>
-      <span style={{ width: `${pct}%` }} />
+      <span ref={cssVars({ "--w": `${pct}%` })} />
     </div>
   );
 }

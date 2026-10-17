@@ -17,11 +17,11 @@ export function PreflightView({ p, me, blockMs = 1000 }: { p: Preflight; me?: st
   // Refused, nothing changes: show what it asks for, not a balance it won't leave.
   const refused = p.refusals.length > 0;
   return (
-    <div className="preflight">
+    <div className="preflight" data-testid="preflight">
       <span className="eyebrow">{refused ? "What it would change" : "What will change"}</span>
       <div className="changes">
         {fx.changes.map((c) => (
-          <div key={c.who.address} style={{ display: "contents" }}>
+          <div key={c.who.address} className="contents">
             <span>
               <Who who={c.who} me={me} link={false} />
             </span>
@@ -30,16 +30,17 @@ export function PreflightView({ p, me, blockMs = 1000 }: { p: Preflight; me?: st
           </div>
         ))}
         {fx.burned > 0n && (
-          <div style={{ display: "contents" }}>
+          <div className="contents">
             <span className="burn">
               <Term k="burned">Burned forever</Term>
             </span>
-            <span className="why">the fee</span>
+            <span className="why">{/creation/.test(fx.changes.map((c) => c.why).join(" ")) ? "the base fee and the account-creation fee" : "the base fee, at most"}</span>
             <Amount drops={fx.burned} exact />
           </div>
         )}
       </div>
       {fx.unseen && <p className="card-note">{fx.unseen}</p>}
+      {fx.note && <p className="card-note">{fx.note}</p>}
 
       {!refused && (
         <dl className="kv after">
@@ -47,6 +48,11 @@ export function PreflightView({ p, me, blockMs = 1000 }: { p: Preflight; me?: st
           <dd>
             <Amount drops={p.balanceAfter} exact />
             {p.pending > 0n && <span className="dim small block">once your pending transactions ({formatDrops(p.pending)}) go through too</span>}
+            {p.locked > 0n && (
+              <span className="dim small block">
+                of which <Term k="locked">{formatDrops(p.locked)} is locked</Term> and can be staked but not sent
+              </span>
+            )}
           </dd>
           {p.budget && (
             <>
@@ -65,7 +71,7 @@ export function PreflightView({ p, me, blockMs = 1000 }: { p: Preflight; me?: st
       )}
 
       {p.notes.map((n) => (
-        <p key={n} className="warn small" style={{ margin: 0 }}>
+        <p key={n} className="warn small m0">
           {n}
         </p>
       ))}

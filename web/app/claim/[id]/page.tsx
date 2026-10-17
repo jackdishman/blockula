@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { Ext, Loading, NotFound, Section, Term, useMe, Who } from "@/components/explorer/kit";
+import { Ext, github, Loading, NotFound, Section, Term, useMe, Who } from "@/components/explorer/kit";
 import { claimPill } from "@/components/explorer/ProgramState";
 import { useNode } from "@/lib/explorer/node";
 import { to } from "@/lib/explorer/routes";
@@ -29,7 +29,7 @@ export default function ClaimPage() {
           <Term k="claim">Claim #{c.id}</Term>
         </span>
         <p className="headline">
-          <Ext href={c.pr_url}>
+          <Ext href={github(c.repo, "pull", c.pr)}>
             {c.repo}#{c.pr} ↗
           </Ext>{" "}
           by <Who who={c.claimant} me={me?.address} /> <span className="dim">(@{c.handle})</span>
@@ -44,7 +44,7 @@ export default function ClaimPage() {
           {c.attestations?.length ? (
             <ul className="ledger">
               {c.attestations.map((a) => (
-                <li key={`${a.validator.address}-${a.at}`} className="row-between" style={{ padding: "10px 0" }}>
+                <li key={`${a.validator.address}-${a.at}`} className="row-between pad-row">
                   <span>
                     <Who who={a.validator} me={me?.address} />{" "}
                     {a.ok ? (

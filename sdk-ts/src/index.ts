@@ -393,6 +393,12 @@ export interface TxOptions {
   validForBlocks?: number;
 }
 
+/** `Wallet.build`'s options: a tx's, plus the resolutions of names it carries as addresses. */
+export interface BuildOptions extends TxOptions {
+  /** `Client.resolution`s of names in `action`'s address fields (refused on mainnet unless proven). */
+  unproven?: Resolution[];
+}
+
 /**
  * A key's consent to being added to one account (audit gap-7-2): its public key and its
  * signature over `keyPopMessage(chain_id, genesis_hash, account, key_id)` (context
@@ -579,9 +585,14 @@ export class Wallet {
    * from the same status read, a node that lies about the height can stretch them by at most
    * `max_tx_validity_blocks`, since validators refuse a `valid_until` further ahead than that
    * (audit gap-7-3).
+   *
+   * `opts.unproven`: how names in fields that need an address got into `action` (their
+   * `Client.resolution`s). On mainnet a tx carrying one that only one node vouched for isn't
+   * signed (`UnprovenNameError`), checked against the very status the tx is signed for, as the
+   * helpers do (audit gap-7-1). Fields the chain resolves itself take `Client.recipient(x).signed`.
    */
-  async build(action: Action | ((height: number) => Action), memo = "", opts: TxOptions = {}): Promise<Tx> {
-    return this.buildChecked(action, memo, opts, []);
+  async build(action: Action | ((height: number) => Action), memo = "", opts: BuildOptions = {}): Promise<Tx> {
+    return this.buildChecked(action, memo, opts, opts.unproven ?? []);
   }
 
   /**

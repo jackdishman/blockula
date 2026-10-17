@@ -1,5 +1,6 @@
 "use client";
 
+import { describeAction } from "@blockula/sdk";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useEffect, useState, type ReactNode } from "react";
@@ -7,7 +8,7 @@ import { Amount, ago, Hash, Loading, NotFound, Section, StatusPill, Term, useMe,
 import { Ledger, signerOf } from "@/components/explorer/Ledger";
 import { Copy } from "@/components/ui";
 import { nodeExplorer } from "@/lib/config";
-import { deltaFor, effectsOf, formatDrops, fromMySide, parseDrops, plainDrops } from "@/lib/explorer/ledger";
+import { amountLeaves, deltaFor, effectsOf, formatDrops, fromMySide, parseDrops, plainDrops, type LedgerCtx } from "@/lib/explorer/ledger";
 import { type NodeError, useNode } from "@/lib/explorer/node";
 import { to } from "@/lib/explorer/routes";
 import type { AccountDetail, BlockView, ChainStatus, HuntView, TxDetail } from "@/lib/explorer/types";
@@ -19,18 +20,28 @@ export default function TxPage() {
   const now = useNow(1000);
   const me = useMe();
   const { wallet } = useWallet();
-  // Poll until it settles: a sealed (or dropped) transaction never changes again.
+  // Poll until it settles: a sealed transaction never changes again. One dropped from this node's
+  // mempool may still be included by a node that holds it (until its valid_until), so it's
+  // checked now and then.
   const [poll, setPoll] = useState(true);
-  const tx = useNode<TxDetail>(`/tx/${txId}`, { every: poll ? 1000 : undefined });
+  const tx = useNode<TxDetail>(`/tx/${txId}`, { every: poll ? 1000 : 10_000 });
   const t = tx.data;
+  // Dropped unrun (v1 says `dropped: true`; older nodes, a failure without its transaction). A
+  // failure that ran but isn't in this node's index any more (`dropped: false`) was charged.
+  const dropped = !!t && t.status === "failed" && (t.dropped ?? !t.from);
+  const ranUnseen = !!t && t.status === "failed" && t.dropped === false && !t.from;
   const settled = !!t && t.status !== "pending";
   // Pending, then gone: the node forgot it (a restart empties the mempool). Say so and stop asking.
   const lost = !!t && t.status === "pending" && (tx.error as NodeError | null)?.status === 404;
   useEffect(() => {
     if (settled || lost) setPoll(false);
   }, [settled, lost]);
-  const block = useNode<BlockView>(t?.height ? `/block/${t.height}` : null);
+  const block = useNode<BlockView>(t?.height && !dropped ? `/block/${t.height}` : null);
   const sender = useNode<AccountDetail>(t?.from ? `/account/${t.from.address}` : null);
+  // Paid to an address: did it have an account before this ran? Its own history says (an earlier
+  // transaction naming it), else the receipt can't tell whether this burned the creation fee.
+  const paysAddress = !!t?.to && t.status === "finalized" && (t.kind ?? t.action?.type) === "transfer" && t.action?.to === t.to.address && t.to.address !== t.from?.address;
+  const recipient = useNode<AccountDetail>(paysAddress && t?.to ? `/account/${t.to.address}` : null);
   const status = useNode<ChainStatus>("/status", { every: settled ? 10_000 : 1000 });
   const huntId = t?.action && typeof t.action.hunt_id === "number" ? t.action.hunt_id : null;
   const hunt = useNode<HuntView>(huntId != null ? `/hunt/${huntId}` : null);
@@ -38,14 +49,14 @@ export default function TxPage() {
   if (tx.error && !t) return <NotFound what="transaction" error={tx.error} />;
   if (!t) return <Loading>Finding the transaction…</Loading>;
 
-  const fx = effectsOf(t);
-  const mine = me ? deltaFor(t, me.address) : null;
+  const ctx: LedgerCtx = { recipientExisted: !!recipient.data?.recent_txs.some((x) => x.status !== "pending" && x.height != null && t.height != null && x.height < t.height) };
+  const fx = effectsOf(t, ctx);
+  const mine = me ? deltaFor(t, me.address, ctx) : null;
   const involved = mine && mine.direction !== "none";
   const b = block.data;
   const keys = sender.data?.keys;
   const signer = signerOf(t, keys, wallet?.keyId);
   const signerKey = keys?.find((k) => k.key_id === t.signer_key);
-  const dropped = t.status === "failed" && !t.from;
   const head = status.data?.height;
   const fee = parseDrops(t.fee);
   const kind = t.kind ?? t.action?.type ?? "";
@@ -53,8 +64,15 @@ export default function TxPage() {
   // The headline amount, signed only when it moved into or out of your balance: a bounty you won
   // is +, one you awarded only cost you the fee, and paying yourself moves nothing.
   const heroAmount = awarded ?? parseDrops(t.amount);
+  // Only kinds whose amount moves the way the ledger reads it get a sign: a vote's amount is a
+  // lock (nothing left), a claim's comes in (audit main13-protocol-9).
   const heroSign =
-    kind === "award_hunt" ? (me && hunt.data?.awarded_to?.address === me.address ? 1n : 0n) : mine?.direction === "out" ? -1n : mine?.direction === "in" ? 1n : 0n;
+    kind === "award_hunt"
+      ? me && hunt.data?.awarded_to?.address === me.address ? 1n : 0n
+      : kind === "claim_distribution" || kind === "unshield"
+        ? mine?.direction === "in" ? 1n : 0n
+        : amountLeaves(kind) && mine?.direction === "out" ? -1n : amountLeaves(kind) && mine?.direction === "in" ? 1n : 0n;
+  const heroNote = kind === "vote" ? "locked by the vote, not spent" : kind === "claim_distribution" ? "claimed" : null;
 
   // The lifecycle, step by step.
   const steps: { step: string; what: ReactNode; when?: string; state: "done" | "now" | "todo" | "bad" }[] = [
@@ -75,14 +93,25 @@ export default function TxPage() {
     {
       step: "Broadcast",
       state: dropped || lost ? "bad" : t.status === "pending" ? "now" : "done",
-      what: dropped ? `dropped: ${t.error ?? "it couldn't apply"}` : lost ? "this node no longer has it (it may have restarted); it was never sealed here" : t.status === "pending" ? "waiting in the mempool" : "accepted by the network",
+      what: dropped
+        ? `dropped from this node's mempool without running, at block #${t.height?.toLocaleString("en-US") ?? "?"}: ${t.error ?? "it couldn't apply"}`
+        : lost
+          ? "this node no longer has it (it may have restarted); it was never sealed here"
+          : t.status === "pending"
+            ? "waiting in the mempool"
+            : "accepted by the network",
       when: t.size_bytes ? `${(t.size_bytes / 1024).toFixed(1)} KB` : undefined,
     },
     {
       step: "Sealed",
-      state: t.height == null ? "todo" : t.status === "failed" ? "bad" : "done",
-      what:
-        t.height == null ? (
+      state: dropped ? "todo" : t.height == null ? "todo" : t.status === "failed" ? "bad" : "done",
+      what: dropped ? (
+        "never here: nothing was charged. A node that still holds it could include it until it expires, so this page keeps checking."
+      ) : ranUnseen ? (
+        <>
+          in block #{t.height?.toLocaleString("en-US")}, where it failed and its fee was charged: {t.error}. This node no longer holds that block.
+        </>
+      ) : t.height == null ? (
           "into the next block"
         ) : (
           <>
@@ -101,15 +130,16 @@ export default function TxPage() {
     {
       step: "Final",
       state: t.height == null || dropped ? "todo" : "done",
-      what:
-        t.height == null ? (
+      what: dropped ? (
+        "only once a block seals it"
+      ) : t.height == null ? (
           "the moment it's sealed"
         ) : (
           <>
             {b?.signature_bytes ? <><Term k="certificate">quorum certificate</Term>, {b.signature_bytes.toLocaleString("en-US")} bytes</> : <>by a later block&apos;s <Term k="certificate">certificate</Term></>}
           </>
         ),
-      when: t.height != null && head != null ? `${(head - t.height).toLocaleString("en-US")} blocks deep` : undefined,
+      when: t.height != null && head != null && !dropped ? `${(head - t.height).toLocaleString("en-US")} blocks deep` : undefined,
     },
   ];
 
@@ -117,7 +147,7 @@ export default function TxPage() {
     <main className="wide stack-lg">
       <nav className="crumbs" aria-label="Breadcrumbs">
         <Link href={to.explore()}>Explore</Link>
-        {t.height != null && (
+        {t.height != null && !dropped && (
           <>
             <span>/</span>
             <Link href={to.block(t.height)}>Block #{t.height.toLocaleString("en-US")}</Link>
@@ -130,16 +160,19 @@ export default function TxPage() {
       <section className="card plate receipt">
         <span className="eyebrow">{dropped ? "Didn't go through" : lost ? "Lost track of it" : t.status === "pending" ? "On its way" : t.status === "failed" ? "Included, but failed" : "Receipt"}</span>
         <p className="headline">{fromMySide(t.summary, me)}</p>
+        {/* What was signed, rendered here from the action itself: the node's summary isn't signed (audit gap-7-6). */}
+        {t.action && <p className="dim small m0" data-testid="receipt-signs">Signed: {describeAction(t.action)}</p>}
         {/* The amount moved, signed from your side when it's yours; fees are itemized below. */}
         {!dropped && (t.amount || awarded != null) && (
-          <div className="amount-hero">
+          <div className="amount-hero" data-testid="amount-hero">
             <Amount drops={heroSign === 0n ? heroAmount : heroAmount * heroSign} signed={heroSign !== 0n} unit={false} />
             <span className="unit">FANG</span>
+            {heroNote && <span className="dim small block">{heroNote}</span>}
           </div>
         )}
         <div className="row-gap">
           <StatusPill status={t.status} />
-          {t.height != null && <span className="dim small">in block #{t.height.toLocaleString("en-US")}</span>}
+          {t.height != null && <span className="dim small">{dropped ? "dropped at" : "in"} block #{t.height.toLocaleString("en-US")}</span>}
           {t.memo && <span className="ledger-memo">“{t.memo}”</span>}
           <ReceiptTools summary={fromMySide(t.summary, me)} />
         </div>
@@ -159,11 +192,11 @@ export default function TxPage() {
           <>
             <hr className="tear" />
             <h2>
-              {fx.pending ? "Will change" : "Balance changes"} <span className="dim small" style={{ textTransform: "none", letterSpacing: 0 }}>· what each side gained or lost</span>
+              {fx.pending ? "Will change" : "Balance changes"} <span className="dim small h2-aside">· what each side gained or lost</span>
             </h2>
             <div className="changes">
               {fx.changes.map((c) => (
-                <div key={c.who.address} style={{ display: "contents" }}>
+                <div key={c.who.address} className="contents">
                   <span>
                     <Who who={c.who} me={me?.address} />
                   </span>
@@ -172,7 +205,7 @@ export default function TxPage() {
                 </div>
               ))}
               {awarded != null && hunt.data?.awarded_to && (
-                <div style={{ display: "contents" }}>
+                <div className="contents">
                   <span>
                     <Who who={hunt.data.awarded_to} me={me?.address} />
                   </span>
@@ -181,19 +214,20 @@ export default function TxPage() {
                 </div>
               )}
               {fx.burned > 0n && (
-                <div style={{ display: "contents" }}>
+                <div className="contents">
                   <span className="burn">
                     <Term k="burned">Burned forever</Term>
                   </span>
-                  <span className="why">{fx.burned === fee ? "the fee" : "the fee, less the tip"}</span>
+                  <span className="why">{fx.burned === fee ? "the base fee" : "the base fee (the tip went to the proposer)"}</span>
                   <Amount drops={fx.burned} exact />
                 </div>
               )}
             </div>
             {fx.unseen && !(awarded != null && kind === "award_hunt") && <p className="card-note">{fx.unseen}</p>}
+            {fx.note && <p className="card-note">{fx.note}</p>}
           </>
         )}
-        <p className="print-only small dim" style={{ marginTop: 18 }}>
+        <p className="print-only small dim mt-18">
           {status.data?.chain_id ?? "Blockula"} · {typeof window === "undefined" ? "" : `${window.location.origin}${to.tx(t.id)}`} · printed {new Date(now).toLocaleString()}
         </p>
       </section>
@@ -215,6 +249,8 @@ export default function TxPage() {
                 <dd>
                   <Who who={t.to} me={me?.address} />
                   <span className="mono small block dim">{t.to.address}</span>
+                  {t.to_name && t.status !== "pending" && <span className="dim small block">signed to {t.to_name}: the account that owned it when this ran</span>}
+                  {t.to_name && t.status === "pending" && <span className="dim small block">signed to {t.to_name}: whoever owns it when this runs (that&apos;s this account now)</span>}
                 </dd>
               </>
             )}
@@ -230,7 +266,12 @@ export default function TxPage() {
                   <Term k="fee">Fee</Term>
                 </dt>
                 <dd>
-                  {formatDrops(fee)} <span className="dim small">burned{t.size_bytes ? ` · ${(Number(fee) / t.size_bytes).toFixed(1)} drops per byte` : ""}</span>
+                  {formatDrops(fee)}{" "}
+                  <span className="dim small">
+                    {parseDrops(t.tip) > 0n && t.max_fee != null ? `base fee burned + ${formatDrops(parseDrops(t.tip))} tip to the proposer` : "base fee, burned"}
+                    {t.max_fee != null && parseDrops(t.max_fee) !== fee ? ` · it allowed up to ${formatDrops(parseDrops(t.max_fee))}` : ""}
+                    {t.size_bytes ? ` · ${(Number(fee - parseDrops(t.tip)) / t.size_bytes).toFixed(1)} drops per byte` : ""}
+                  </span>
                 </dd>
               </>
             )}
@@ -276,7 +317,7 @@ export default function TxPage() {
             </dd>
           </dl>
           {t.action && (
-            <details className="raw" style={{ marginTop: 16 }}>
+            <details className="raw mt-16">
               <summary>What was signed, exactly</summary>
               <pre>{JSON.stringify(t.action, null, 2)}</pre>
             </details>
@@ -324,12 +365,15 @@ function TxActions({ t }: { t: TxDetail }) {
   // Locked is fine: these lead to wallet pages, which unlock first.
   if (!me || !t.from || t.status === "failed") return null;
   const name = (l: { name: string | null; address: string } | null | undefined) => (l?.name && !/\s/.test(l.name) ? l.name : l?.address ?? "");
+  // Button labels use the short form of an address (the link carries the whole of it).
+  const label = (l: { name: string | null; address: string; short?: string } | null | undefined) => (l?.name && !/\s/.test(l.name) ? l.name : l?.short ?? l?.address ?? "");
   const kind = t.kind ?? "";
   const out = t.from.address === me.address;
   const amount = t.amount ? plainDrops(parseDrops(t.amount)) : "";
   const links: { href: string; label: string; primary?: boolean }[] = [];
-  if (kind === "transfer" && out && t.to) links.push({ href: `/send?to=${encodeURIComponent(name(t.to))}&amount=${amount}`, label: `Send ${name(t.to)} ${amount} FANG again`, primary: true });
-  if (kind === "transfer" && !out && t.to?.address === me.address) links.push({ href: `/send?to=${encodeURIComponent(name(t.from))}`, label: `Pay ${name(t.from)} back`, primary: true });
+  // Again to what it was signed to: the name (whoever owns it now), or the address.
+  if (kind === "transfer" && out && t.to) links.push({ href: `/send?to=${encodeURIComponent(t.to_name ?? name(t.to))}&amount=${amount}`, label: `Send ${t.to_name ?? label(t.to)} ${amount} FANG again`, primary: true });
+  if (kind === "transfer" && !out && t.to?.address === me.address) links.push({ href: `/send?to=${encodeURIComponent(name(t.from))}`, label: `Pay ${label(t.from)} back`, primary: true });
   if (typeof t.action?.hunt_id === "number") links.push({ href: to.hunt(t.action.hunt_id), label: "Open the hunt" });
   if (kind === "add_key" || kind === "remove_key") links.push({ href: "/devices", label: "Devices & agents" });
   if (!links.length) return null;
@@ -337,7 +381,7 @@ function TxActions({ t }: { t: TxDetail }) {
     <Section title="From here">
       <div className="stack">
         {links.map((l) => (
-          <Link key={l.href} className={`btn ${l.primary ? "primary" : ""}`} href={l.href}>
+          <Link key={l.href} className={`btn wrap ${l.primary ? "primary" : ""}`} href={l.href}>
             {l.label}
           </Link>
         ))}

@@ -146,8 +146,8 @@ function TraceView() {
         title="The graph"
         aside={
           <span className="legend">
-            <span><span className="sw" style={{ background: "var(--in)" }} />into {rootAddr === me?.address ? "you" : name}</span>
-            <span><span className="sw" style={{ background: "var(--out)" }} />out of {rootAddr === me?.address ? "you" : name}</span>
+            <span><span className="sw in" />into {rootAddr === me?.address ? "you" : name}</span>
+            <span><span className="sw out" />out of {rootAddr === me?.address ? "you" : name}</span>
             <span className="dim">point at any account for its own</span>
           </span>
         }

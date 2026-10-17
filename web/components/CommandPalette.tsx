@@ -56,7 +56,9 @@ export function CommandPalette() {
   const input = useRef<HTMLInputElement>(null);
   const router = useRouter();
   const path = usePathname();
-  const { hint } = useWallet();
+  const { hint, chain } = useWallet();
+  // Only a node the wallet accepted as its chain is asked (lookups skip the pinned client).
+  const onChain = chain.state === "ok";
   // Wallet pages unlock on arrival, so a known (even locked) wallet gets its actions here too.
   const known = !!hint?.account;
   const myPage = hint?.name ?? hint?.account;
@@ -92,7 +94,7 @@ export function CommandPalette() {
   // Resolve what was typed against the chain.
   useEffect(() => {
     const raw = q.trim().replace(/^#/, "");
-    if (!raw) return setHits([]);
+    if (!raw || !onChain) return setHits([]);
     let live = true;
     setBusy(true);
     const t = setTimeout(async () => {
@@ -121,7 +123,7 @@ export function CommandPalette() {
       live = false;
       clearTimeout(t);
     };
-  }, [q, known]);
+  }, [q, known, onChain]);
 
   const places = useMemo<Item[]>(() => {
     const go: Item[] = [

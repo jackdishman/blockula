@@ -40,7 +40,7 @@ export default function AccountPage() {
 
   if (acct.error && !acct.data) {
     // A name nobody has registered isn't an account yet; it might be yours to claim.
-    if (!/^boo1/i.test(ref) && /claimed|registered/.test(acct.error.message)) return <UnclaimedName name={ref} />;
+    if (!/^t?boo1/i.test(ref) && /claimed|registered/.test(acct.error.message)) return <UnclaimedName name={ref} />;
     return <NotFound what="account" error={acct.error} />;
   }
   const a = acct.data;
@@ -79,7 +79,7 @@ export default function AccountPage() {
         <span className="eyebrow">{yours ? "Your account, as the chain sees it" : system ? "System account" : "Account"}</span>
         <h1>
           {name ?? (system ? <i>{whoText(a.account)}</i> : "Unnamed account")}
-          {yours && <span className="you" style={{ fontSize: 14, verticalAlign: 8 }}>you</span>}
+          {yours && <span className="you big">you</span>}
         </h1>
         <span className="sub">
           <Term k="address" />: <Hash value={addr} />
@@ -114,6 +114,7 @@ export default function AccountPage() {
 
       <div className="figures">
         <Stat v={<Fang display={a.balance_display} short />} k="balance" />
+        {a.locked != null && parseDrops(a.locked) > 0n && <Stat v={<Fang display={a.transferable_display} short />} k={<>can move · <Term k="locked">{a.locked_display} locked</Term></>} />}
         <Stat v={a.nonce.toLocaleString("en-US")} k={<Term k="nonce">transactions sent</Term>} />
         <Stat v={a.names.length} k={<Term k="name">names</Term>} />
         <Stat v={`${owners.length} · ${agents.length}`} k={<><Term k="owner_key">owners</Term> · <Term k="session_key">agents</Term></>} />
@@ -125,13 +126,13 @@ export default function AccountPage() {
             {flows.rows.length ? (
               <>
                 <FlowChart rows={flows.rows} me={me?.address} />
-                <div className="row-between small" style={{ marginTop: 14, borderTop: "1px solid var(--ink)", paddingTop: 10 }}>
+                <div className="row-between small flow-sum">
                   <span>
-                    <span className="keyline" style={{ background: "var(--in)" }} />
+                    <span className="keyline in" />
                     in <Amount drops={flows.totalIn} />
                   </span>
                   <span>
-                    <span className="keyline" style={{ background: "var(--out)" }} />
+                    <span className="keyline out" />
                     out <Amount drops={flows.totalOut} />
                   </span>
                   <span className="dim">
@@ -140,10 +141,10 @@ export default function AccountPage() {
                 </div>
                 {flows.unseen > 0 && (
                   <p className="card-note">
-                    {plural(flows.unseen, "of these", "of these")} also moved FANG the transaction itself doesn&apos;t record (a name&apos;s price, a bounty, a bond). Open one to see what&apos;s known.
+                    {plural(flows.unseen, "of these", "of these")} may also have moved FANG the transaction itself doesn&apos;t record (a name&apos;s price, a bounty, a bond, the fee for opening a recipient&apos;s account). Open one to see what&apos;s known.
                   </p>
                 )}
-                <Link className="small block" href={to.trace(name ?? addr)} style={{ marginTop: 10 }}>
+                <Link className="small block mt-10" href={to.trace(name ?? addr)}>
                   Follow these flows further, hop by hop →
                 </Link>
               </>
@@ -160,7 +161,7 @@ export default function AccountPage() {
                 {shown.length > 0 && (
                   <>
                     {" · "}
-                    <button className="link small" onClick={() => downloadCsv(shown, addr, a.keys, name ?? addr)} title="Download these transactions as a spreadsheet, amounts exact and signed from this account's side">
+                    <button className="link small" onClick={() => downloadCsv(shown, addr, a.keys, name ?? addr)} title="Download these transactions as a spreadsheet, signed from this account's side; its exact and note columns say which rows moved more than the transaction records">
                       Export CSV
                     </button>
                   </>
@@ -198,11 +199,27 @@ export default function AccountPage() {
             </p>
           </Section>
 
+          {!!a.locks?.length && (
+            <Section title={<Term k="locked">Locked</Term>} aside={<span className="dim small">can be staked, not sent</span>}>
+              <ul className="ledger" data-testid="locks">
+                {a.locks.map((l) => (
+                  <li key={l.id} className="row-between pad-row">
+                    <span>
+                      {l.reason}
+                      <span className="dim small block">{l.vesting ? `vesting until block #${l.until.toLocaleString("en-US")}` : `until block #${l.until.toLocaleString("en-US")}`}</span>
+                    </span>
+                    <span className="amt">{l.amount_display}</span>
+                  </li>
+                ))}
+              </ul>
+            </Section>
+          )}
+
           {a.names.length > 0 && (
             <Section title={<Term k="name">Names</Term>}>
               <div className="row-gap">
                 {a.names.map((n) => (
-                  <Link key={n} className="chip" href={to.name(n)} style={{ fontSize: 15, textTransform: "none" }}>
+                  <Link key={n} className="chip name-chip" href={to.name(n)}>
                     {n}
                   </Link>
                 ))}
@@ -215,7 +232,7 @@ export default function AccountPage() {
               <ul className="ledger">
                 {a.hunts_won.map((h) => (
                   <li key={`w${h.id}`}>
-                    <Link className="ledger-row" href={to.hunt(h.id)} style={{ gridTemplateColumns: "minmax(0,1fr) auto" }}>
+                    <Link className="ledger-row two" href={to.hunt(h.id)}>
                       <span>
                         Won {h.repo}#{h.issue} for PR #{h.pr} {h.self_awarded && <span className="pill pending">self-awarded</span>}
                       </span>
@@ -225,7 +242,7 @@ export default function AccountPage() {
                 ))}
                 {a.hunts_created.map((hid) => (
                   <li key={`c${hid}`}>
-                    <Link className="ledger-row" href={to.hunt(hid)} style={{ gridTemplateColumns: "minmax(0,1fr)" }}>
+                    <Link className="ledger-row one" href={to.hunt(hid)}>
                       <span>Put up hunt #{hid}</span>
                     </Link>
                   </li>
@@ -278,10 +295,10 @@ export default function AccountPage() {
 function KeyRow({ k, head, blockMs, signed, familiar, mine, onPick }: { k: KeyView; head: number; blockMs: number; signed?: { count: number; spent: bigint }; familiar: boolean; mine: boolean; onPick: () => void }) {
   const r = k.role;
   return (
-    <li style={{ padding: "12px 0" }}>
+    <li className="pad-row-12">
       <div className="row-between">
         <span>
-          <span className="key-label" style={{ fontSize: 19 }}>{k.label}</span>{" "}
+          <span className="key-label big">{k.label}</span>{" "}
           {r.type === "session" ? <span className="chip agent">{familiar ? "familiar" : "agent"}</span> : <span className="chip">owner</span>} {mine && <span className="chip this">this device</span>}
         </span>
         {signed ? (
@@ -306,7 +323,7 @@ function Budget({ k, head, blockMs }: { k: KeyView; head: number; blockMs: numbe
   const expired = head > r.expires_at;
   const resets = Math.max(0, k.window_start + r.period_blocks - head);
   return (
-    <div className="stack" style={{ gap: 4, marginTop: 8 }}>
+    <div className="stack gap-4 mt-8">
       <Meter used={spent} limit={limit} label={`${k.label} has spent ${formatDrops(spent)} of ${formatDrops(limit)} this period`} />
       <span className="small">
         <Amount drops={spent} /> of <Amount drops={limit} /> per {blocksToHuman(r.period_blocks, blockMs)}
@@ -327,7 +344,7 @@ function UnclaimedName({ name }: { name: string }) {
         <span className="eyebrow">Nobody&apos;s here yet</span>
         <h1>{n}.boo isn&apos;t anyone&apos;s</h1>
         <p className="dim">No account has registered this name. Check the spelling, or claim it.</p>
-        <Link className="btn primary" href={to.name(n)} style={{ alignSelf: "flex-start" }}>
+        <Link className="btn primary self-start" href={to.name(n)}>
           See {n}.boo
         </Link>
       </section>

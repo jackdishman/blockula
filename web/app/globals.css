@@ -208,7 +208,7 @@ input.mono { font-family: var(--mono); font-size: 16px; }
 
 /* Tutorial */
 .progress { height: 3px; background: var(--hair); margin: 2px 0 6px; }
-.progress span { display: block; height: 100%; background: var(--blood); transition: width 0.4s; }
+.progress span { display: block; height: 100%; width: var(--w, 0%); background: var(--blood); transition: width 0.4s; }
 .checklist { list-style: none; margin: 0; padding: 0; }
 .checklist li { border-bottom: 1px solid var(--hair); }
 .checklist li:last-child { border-bottom: 0; }
@@ -284,11 +284,12 @@ textarea:focus { outline: none; border-color: var(--blood); box-shadow: 0 0 0 1p
 @media (max-width: 520px) {
   .kit-words { grid-template-columns: repeat(2, 1fr); }
 }
-/* Printing shows the recovery kit alone, in black ink on white. */
+/* Printing a recovery kit shows the kit alone, in black ink on white. Only while one is on the
+   page: everything else (a receipt) prints with its own layout (audit main13-render-7). */
 @media print {
   html, body { background: #fff; }
-  body * { visibility: hidden; }
-  .kit-sheet, .kit-sheet * { visibility: visible; }
+  body:has(.kit-sheet) * { visibility: hidden; }
+  body:has(.kit-sheet) .kit-sheet, body:has(.kit-sheet) .kit-sheet * { visibility: visible; }
   .card.plate.kit-sheet { position: absolute; inset: 0 0 auto 0; background: #fff; }
   .no-print { display: none !important; }
 }
@@ -305,8 +306,8 @@ textarea:focus { outline: none; border-color: var(--blood); box-shadow: 0 0 0 1p
 .pool-row { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--hair); flex-wrap: wrap; }
 .pool-row:last-child { border-bottom: 0; }
 .tally { display: flex; height: 10px; border: 1px solid var(--ink); background: var(--paper-hi); margin: 6px 0 2px; }
-.tally .aye { background: var(--moss); }
-.tally .nay { background: var(--blood); }
+.tally .aye { background: var(--moss); width: var(--w, 0%); }
+.tally .nay { background: var(--blood); width: var(--w, 0%); }
 .vote-choice { display: flex; gap: 10px; }
 .vote-choice .btn.on { background: var(--ink); color: var(--paper-hi); }
 select.field-select { font: 400 18px var(--serif); background: transparent; color: var(--ink); border: 0; border-bottom: 1.5px solid var(--ink); padding: 6px 2px; }
