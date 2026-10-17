@@ -1,6 +1,6 @@
 {
   "name": "@blockula/mcp",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "\ud83e\udddb MCP server for Blockula \u2014 lets any coding agent run a node, hold a post-quantum wallet, send FANG and claim .boo names",
   "type": "module",
   "bin": {
@@ -19,7 +19,7 @@
   },
   "license": "MIT",
   "dependencies": {
-    "@blockula/sdk": "0.4.0",
+    "@blockula/sdk": "0.5.0",
     "@modelcontextprotocol/sdk": "1.32.1",
     "zod": "4.6.7"
   },
