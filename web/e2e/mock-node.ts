@@ -1,10 +1,13 @@
 // A small in-memory Blockula node behind Playwright routes: enough of the HTTP API for the
-// wallet's flows (status, accounts, keys, names, faucet, tx submit/lookup). Submitted txs are
-// checked like the real node does it: ML-DSA signature over the SDK's signing bytes, the signing
-// key authorized on `from` (owner keys for key changes), nonce and balance.
-import { formatFang, keyId as keyIdOf, parseFang, proposalDigest, signingBytes, verifyKeyGrant, type ProposalKind, type Tx } from "@blockula/sdk";
+// wallet's flows (status, accounts, keys, names, faucet, tx submit/lookup) and for the explorer's
+// pages (blocks, the mempool, search, hunts, the contribution pool, multisigs), in protocol v1's
+// shapes (node/src/api.rs). Submitted txs are checked like the real node does it: ML-DSA
+// signature over the SDK's signing bytes, the signing key authorized on `from` (owner keys for
+// key changes), nonce and balance. e2e/explorer-world.ts fills it with a little of everything.
+import { formatFang, keyId as keyIdOf, parseFang, proposalDigest, signingBytes, txSize, verifyKeyGrant, type ProposalKind, type Tx } from "@blockula/sdk";
 import { hexToBytes } from "@noble/hashes/utils.js";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
+import { createHash } from "node:crypto";
 import type { BrowserContext, Page, Route } from "@playwright/test";
 import { bech32m } from "@scure/base";
 import { CHAIN_ID, GENESIS, MAINNET_GENESIS, MAINNET_RPC, RPC } from "./env";
@@ -12,9 +15,43 @@ import { CHAIN_ID, GENESIS, MAINNET_GENESIS, MAINNET_RPC, RPC } from "./env";
 type Role = { type: "owner" } | { type: "session"; limit: string; period_blocks: number; expires_at: number };
 interface KeyRec { label: string; role: Role; added_at: number }
 interface Acct { balance: bigint; nonce: number; keys?: Map<string, KeyRec> }
-interface TxRec { id: string; tx: Tx | null; kind: string; from: string; to: string | null; amount: bigint | null; fee: bigint; memo: string; height: number; summary: string }
+/**
+ * A transaction as the node keeps it: signed (`tx`), or described (`action`, for the explorer's
+ * world). `height` null: waiting in the mempool. `fee` is what it was charged (base fee + tip),
+ * `maxFee` what it allowed; `toName` the `.boo` name it was signed to (`to`: who that paid).
+ */
+export interface TxRec {
+  id: string;
+  tx: Tx | null;
+  action?: Record<string, unknown> | null;
+  kind: string;
+  from: string;
+  to: string | null;
+  toName?: string | null;
+  amount: bigint | null;
+  fee: bigint;
+  maxFee?: bigint;
+  tip?: bigint;
+  memo: string;
+  height: number | null;
+  summary: string;
+  status?: "finalized" | "failed" | "pending";
+  error?: string | null;
+  signer?: string | null;
+  nonce?: number;
+}
+
+/** A lock on an account's FANG (`/api/account` `locks`). */
+export interface Lock { id: string; reason: string; amount: bigint; until: number; vesting: boolean }
+
+/** What `/api/name` adds for a name beyond its owner: when it lapses, a pending offer. */
+export interface NameInfo { status?: "active" | "grace" | "available"; registered_at?: number; expires_at?: number; grace_until?: number; offered_to?: string }
+
+type Json = Record<string, unknown>;
 
 const FAUCET = addressOf("fa".repeat(32));
+/** Opening an account burns this from its first payer (`account_creation_fee`, 0.1 FANG). */
+const CREATION_FEE = 100_000_000n;
 export const VALIDATOR = addressOf("7a".repeat(32));
 export const OTHER_VALIDATOR = addressOf("7b".repeat(32));
 
@@ -72,6 +109,25 @@ export class MockNode {
   /** Governance proposals as node/src/api.rs serves them (`proposal_json`), before this mock adds its votes. */
   proposals: Record<string, unknown>[] = [];
   votes: { proposal_id: number; voter: string; aye: boolean; amount: bigint; conviction: number }[] = [];
+  /** Failures the node remembers without their tx (`/api/tx`): dropped unrun, or ran in a block it no longer holds. */
+  failures = new Map<string, { dropped: boolean; error: string; height: number }>();
+  /** `/api/name` beyond the owner (expiry, grace, offers), and names reserved at genesis. */
+  nameInfo = new Map<string, NameInfo>();
+  reserved = new Set<string>();
+  /** `/api/account` beyond balance and keys, by address: locks, GitHub, Familiars, hunts, contribution. */
+  locks = new Map<string, Lock[]>();
+  accountExtra = new Map<string, Json>();
+  /** Programs, as node/src/api.rs serves them (`hunt_json`, `claim_json`, `seance_json`…). */
+  hunts: Json[] = [];
+  claims: Json[] = [];
+  seances: Json[] = [];
+  souls: Json[] = [];
+  contributions: Json | null = null;
+  multisigs = new Map<string, Json>();
+  /** Merged into `/api/validators` (v1's leaving, tombstoned, admission…). */
+  validatorsExtra: Json = {};
+  /** When block 1 was sealed: blocks come a second apart. */
+  private readonly genesisMs = Date.now() - 100_000;
 
   /** A node of one of the e2e chains, optionally at another URL (a "custom node"). */
   constructor(chain: keyof typeof CHAINS = "testnet", rpc?: string) {
@@ -99,34 +155,79 @@ export class MockNode {
     this.acct(address).balance += parseFang(fang);
   }
 
-  private label(address: string) {
+  /** Labels the node gives system accounts ("🪦 contribution pool"). */
+  systemLabels = new Map<string, string>();
+
+  label(address: string) {
     const name = [...this.names].find(([, a]) => a === address)?.[0];
-    return { address, name: name ?? (address === VALIDATOR ? "🧛 validator" : null), short: `${address.slice(0, 10)}…${address.slice(-4)}` };
+    return { address, name: this.systemLabels.get(address) ?? (name ? `${name}.boo` : address === VALIDATOR ? "🧛 validator" : null), short: `${address.slice(0, 10)}…${address.slice(-6)}` };
   }
 
   private record(r: Omit<TxRec, "id" | "height">) {
     this.height += 1;
-    const id = (this.txs.size + 1).toString(16).padStart(64, "0");
+    const id = this.nextId();
     this.txs.set(id, { ...r, id, height: this.height });
     return id;
   }
 
+  /** A transaction id that looks like one (a hash), never all digits (which reads as a block height). */
+  private nextId = () => createHash("sha256").update(`${this.chainId}/${this.txs.size + 1}`).digest("hex");
+
+  /** Add a transaction as the explorer's world describes it: sealed in the next block, or `pending`. */
+  add(r: Omit<TxRec, "id" | "height" | "tx"> & { id?: string }) {
+    if (r.status === "pending") {
+      const id = r.id ?? this.nextId();
+      this.txs.set(id, { tx: null, ...r, id, height: null });
+      return id;
+    }
+    this.height += 1;
+    const id = r.id ?? this.nextId();
+    this.txs.set(id, { tx: null, ...r, id, height: this.height });
+    return id;
+  }
+
+  /** `tx_json`: charged `fee` (base fee + `tip`) out of `max_fee`, `to` as it was paid, `to_name` as it was signed. */
   private txView(r: TxRec) {
     return {
       id: r.id,
       summary: r.summary,
       kind: r.kind,
-      status: "finalized",
+      status: r.status ?? (r.height == null ? "pending" : "finalized"),
+      error: r.error ?? null,
       height: r.height,
       from: this.label(r.from),
       to: r.to ? this.label(r.to) : null,
+      to_name: r.toName ?? null,
       amount: r.amount?.toString() ?? null,
       amount_display: r.amount !== null ? formatFang(r.amount) : null,
       fee: r.fee.toString(),
       fee_display: formatFang(r.fee),
+      max_fee: (r.maxFee ?? r.fee).toString(),
+      tip: (r.tip ?? 0n).toString(),
+      valid_until: (r.height ?? this.height) + 600,
+      size_bytes: r.tx ? txSize(r.tx) : 5400,
+      nonce: r.nonce ?? r.tx?.nonce ?? 0,
+      signer_key: r.signer ?? (r.tx ? keyIdOf(hexToBytes(r.tx.public_key)) : null),
       memo: r.memo,
-      action: r.tx?.action ?? null,
+      action: r.tx?.action ?? r.action ?? null,
+      signature_scheme: "ML-DSA-65 (FIPS 204)",
     };
+  }
+
+  private blockHash = (h: number) => (h * 2654435761).toString(16).padStart(8, "0").repeat(8).slice(0, 64);
+
+  /** `header_json`: one block a second, proposed by the validator. */
+  private header(h: number) {
+    const n = this.txsAt(h).length;
+    return { height: h, hash: this.blockHash(h), prev_hash: this.blockHash(h - 1), timestamp_ms: this.genesisMs + h * 1000, proposer: this.label(VALIDATOR), state_root: this.blockHash(h + 7), tx_count: n, version: 1, signal: 1, summary: `Block #${h} sealed with ${n} transaction${n === 1 ? "" : "s"}` };
+  }
+
+  private txsAt = (h: number) => [...this.txs.values()].filter((t) => t.height === h);
+
+  /** `block_json`: the header, its base fee, its transactions and its certificate's size. */
+  private block(h: number) {
+    const txs = this.txsAt(h);
+    return { ...this.header(h), view: h, parent_view: h - 1, base_fee: { flat: "10000", rate: "10000", max_block_bytes: 2_097_152 }, txs: txs.map((t) => this.txView(t)), signature_bytes: 3354, failed_count: txs.filter((t) => t.status === "failed").length };
   }
 
   private status() {
@@ -139,8 +240,18 @@ export class MockNode {
       block_time_ms: 1000,
       validator: this.label(VALIDATOR),
       faucet: this.faucet,
+      supply: "1000000000000000",
       supply_display: "1,000,000 FANG",
+      burned: "0",
       burned_display: "0 FANG",
+      epoch: 3,
+      active_validators: this.pools.size,
+      accounts: this.accounts.size,
+      names: this.names.size,
+      mempool: [...this.txs.values()].filter((t) => t.height == null).length,
+      history_from: 1,
+      head_age_ms: 500,
+      finalized_height: this.height,
       ...this.statusExtra,
     };
   }
@@ -151,23 +262,50 @@ export class MockNode {
     const name = q.replace(/\.boo$/, "");
     const owner = this.names.get(name);
     if (!owner) throw new HttpError(404, `no one has claimed ${name}.boo yet`);
+    // As node/src/chain.rs `State::resolve`: an expired name points to nobody.
+    const info = this.nameInfo.get(name);
+    if (info?.status === "grace") throw new HttpError(400, `${name}.boo expired at block ${info.expires_at ?? 0}`);
     return owner;
   }
 
+  /** A transfer's recipient whose account it opens (it's credited before the fee is charged). */
+  private opening: string | null = null;
+  /** Spent this period, per session key (`/api/account` keys). */
+  spent = new Map<string, bigint>();
+
   private account(id: string) {
     const address = this.resolve(id);
+    const exists = this.accounts.has(address);
     const a = this.acct(address);
-    const keys = [...this.keysOf(address)].map(([key_id, k]) => ({ key_id, label: k.label, role: k.role, added_at: k.added_at, spent_this_period: "0", window_start: 0 }));
-    const recent = [...this.txs.values()].filter((t) => t.from === address || t.to === address).reverse().map((t) => this.txView(t));
+    const keys = [...this.keysOf(address)].map(([key_id, k]) => ({ key_id, label: k.label, role: k.role, added_at: k.added_at, spent_this_period: (this.spent.get(key_id) ?? 0n).toString(), window_start: Math.max(0, this.height - 10) }));
+    // Pending first, then the newest 25 sealed (node/src/api.rs `account`).
+    const mine = [...this.txs.values()].filter((t) => t.from === address || t.to === address).reverse();
+    const recent = [...mine.filter((t) => t.height == null), ...mine.filter((t) => t.height != null).slice(0, 25)].map((t) => this.txView(t));
+    const locks = (this.locks.get(address) ?? []).filter((l) => l.amount > 0n);
+    const locked = locks.reduce((m, l) => (l.amount > m ? l.amount : m), 0n);
+    const transferable = a.balance > locked ? a.balance - locked : 0n;
     return {
       account: this.label(address),
       balance: a.balance.toString(),
       balance_display: formatFang(a.balance),
+      transferable: transferable.toString(),
+      transferable_display: formatFang(transferable),
+      locked: locked.toString(),
+      locked_display: formatFang(locked),
+      locks: locks.map((l) => ({ id: l.id, reason: l.reason, amount: l.amount.toString(), amount_display: formatFang(l.amount), until: l.until, vesting: l.vesting })),
+      exists,
+      creation_fee: exists ? "0" : CREATION_FEE.toString(),
       nonce: a.nonce,
-      next_nonce: a.nonce,
+      next_nonce: a.nonce + mine.filter((t) => t.height == null && t.from === address).length,
       names: [...this.names].filter(([, o]) => o === address).map(([n]) => `${n}.boo`),
       keys,
       recent_txs: recent,
+      github: null,
+      familiars: [],
+      hunts_created: [],
+      hunts_won: [],
+      contribution: null,
+      ...this.accountExtra.get(address),
     };
   }
 
@@ -218,6 +356,8 @@ export class MockNode {
     } else if (act.type === "transfer") {
       // As node/src/chain.rs: a name in `to` is resolved when the transfer runs.
       to = this.resolve(act.to);
+      if (!this.accounts.has(to) && to !== tx.from && a.balance < amount + fee + CREATION_FEE) throw new HttpError(400, `opening 1 account burns 0.1 FANG: insufficient balance`);
+      if (!this.accounts.has(to)) this.opening = to;
       this.acct(to).balance += amount;
       summary = `${this.label(tx.from).short} sent ${formatFang(amount)} to ${this.label(to).short}`;
     } else if (act.type === "register_name") {
@@ -275,11 +415,87 @@ export class MockNode {
       summary = `${this.label(tx.from).short} voted ${act.aye ? "aye" : "nay"} on proposal #${act.proposal_id} with ${formatFang(BigInt(act.amount))}`;
     } else if (act.type === "unlock") {
       summary = `${this.label(tx.from).short} unlocked their expired vote locks`;
-    } else throw new HttpError(400, `the mock node doesn't do ${act.type}`);
-    a.balance -= amount + fee;
+    } else {
+      const who = this.label(tx.from).short;
+      const held = (x: bigint) => {
+        if (a.balance < x + fee) throw new HttpError(400, `insufficient balance: has ${formatFang(a.balance)}, needs ${formatFang(x + fee)}`);
+        a.balance -= x;
+      };
+      switch (act.type) {
+        case "create_hunt":
+          held(BigInt(act.amount));
+          this.hunts.push({ id: this.hunts.length, repo: act.repo, issue: act.issue, title: act.title, amount: act.amount, amount_display: formatFang(BigInt(act.amount)), creator: this.label(tx.from), funders: [{ account: this.label(tx.from), amount: act.amount, amount_display: formatFang(BigInt(act.amount)) }], status: "open", created_at: this.height + 1, expires_at: act.expires_at, awarded_to: null, awarded_by: null, awarded_at: null, pr: null, pr_url: null, familiar: null, self_awarded: false, cancelled_at: null });
+          summary = `${who} put ${formatFang(BigInt(act.amount))} on ${act.repo}#${act.issue}`;
+          break;
+        case "fund_hunt":
+          held(BigInt(act.amount));
+          summary = `${who} added ${formatFang(BigInt(act.amount))} to hunt #${act.hunt_id}`;
+          break;
+        case "award_hunt": {
+          const h = this.hunts.find((x) => x.id === act.hunt_id);
+          if (!h) throw new HttpError(400, `no hunt #${act.hunt_id}`);
+          if ((h.creator as { address: string }).address !== tx.from) throw new HttpError(400, "only the hunt's creator can award it");
+          // As node/src/chain.rs: a name in `to` is resolved when the award runs.
+          to = this.resolve(act.to);
+          this.acct(to).balance += BigInt(String(h.amount));
+          Object.assign(h, { status: "awarded", awarded_to: this.label(to), awarded_by: this.label(tx.from), awarded_at: this.height + 1, pr: act.pr });
+          summary = `${who} awarded hunt #${act.hunt_id} to ${this.label(to).short}`;
+          break;
+        }
+        case "fund_pool":
+          held(BigInt(act.amount));
+          summary = `${who} gave ${formatFang(BigInt(act.amount))} to the contribution pool`;
+          break;
+        case "vouch":
+          to = this.resolve(act.account);
+          held(10n * 10n ** 9n);
+          summary = `${who} vouched for ${this.label(to).short}`;
+          break;
+        case "transfer_name":
+          to = this.resolve(act.to);
+          summary = to === tx.from ? `${who} accepted ${act.name}.boo` : `${who} offered ${act.name}.boo to ${this.label(to).short}`;
+          break;
+        case "renew_name":
+          held(parseFang("1") * BigInt(act.years));
+          summary = `${who} renewed ${act.name}.boo for ${act.years} year${act.years === 1 ? "" : "s"}`;
+          break;
+        case "cancel_hunt":
+        case "release_name":
+        case "register_familiar":
+        case "link_github":
+        case "submit_claim":
+        case "join_jury":
+        case "withdraw_vested":
+        case "unjail":
+        case "update_validator":
+        case "multisig_propose":
+          summary = `${who}: ${act.type.replace(/_/g, " ")}`;
+          break;
+        default:
+          throw new HttpError(400, `the mock node doesn't do ${act.type}`);
+      }
+    }
+    // Opening the recipient's account burns the creation fee from the sender (econ.rs `charge_new_accounts`).
+    const opens = to && to !== tx.from && (this.opening === to || !this.accounts.has(to)) ? CREATION_FEE : 0n;
+    this.opening = null;
+    if (a.balance < amount + fee + opens) throw new HttpError(400, `opening 1 account burns 0.1 FANG: insufficient balance`);
+    if (to) this.acct(to);
+    a.balance -= amount + fee + opens;
     a.nonce += 1;
+    if (key.role.type === "session") this.spent.set(signer, (this.spent.get(signer) ?? 0n) + amount + fee + opens);
     this.submitted.push(tx);
-    return this.record({ tx, kind: act.type, from: tx.from, to, amount: act.type === "transfer" ? amount : null, fee, memo: tx.memo, summary });
+    const signedTo = act.type === "transfer" || act.type === "award_hunt" || act.type === "transfer_name" ? act.to : act.type === "vouch" ? act.account : null;
+    const toName = signedTo && !/^t?boo1/.test(signedTo) ? `${signedTo.replace(/\.boo$/, "")}.boo` : null;
+    return this.record({ tx, kind: act.type, from: tx.from, to, toName, amount: act.type === "transfer" ? amount : null, fee, maxFee: fee, tip: BigInt(tx.tip ?? 0), signer, nonce: tx.nonce, memo: tx.memo, summary });
+  }
+
+  /** One `validator_json` row, for the world's extra groups (leaving, jailed, tombstoned…). */
+  validatorRow(address: string, extra: Json = {}) {
+    return {
+      validator: this.label(address), owner: this.label(address), status: "candidate", consensus_key: "", p2p_addr: "203.0.113.9:30300", http_addr: "",
+      stake: "0", stake_display: "0 FANG", bond: "0", bond_display: "0 FANG", shares: "0", self_bond: "0", self_bond_display: "0 FANG", commission_bps: 500, commission_display: "5%",
+      eligible: true, jailed: null, tombstoned_at: null, slashed_display: "0 FANG", liveness: null, genesis: false, registered_at: 1, ready_at: null, admitted: null, ...extra,
+    };
   }
 
   /** `/api/validators` as node/src/api.rs serves it (`validator_json`). */
@@ -290,7 +506,7 @@ export class MockNode {
       self_bond: p.stake.toString(), self_bond_display: formatFang(p.stake), commission_bps: p.commission_bps, commission_display: `${p.commission_bps / 100}%`,
       eligible: true, jailed: null, tombstoned_at: null, slashed_display: "0 FANG", liveness: null, genesis: true,
     }));
-    return { epoch: 3, epoch_blocks: 3600, blocks_until_next_epoch: 100, active, next_epoch: active, joining: [], leaving: [], candidates: [], jailed: [], tombstoned: [], removed: [], admins: [], min_bond: "10000000000000", min_bond_display: "10000 FANG", max_validators: 31, churn_limit: 0 };
+    return { epoch: 3, epoch_blocks: 3600, blocks_until_next_epoch: 100, active, next_epoch: active, joining: [], leaving: [], candidates: [], jailed: [], tombstoned: [], removed: [], admins: [], min_bond: "10000000000000", min_bond_display: "10000 FANG", max_validators: 31, churn_limit: 0, admission: null, ...this.validatorsExtra };
   }
 
   /** `/api/staking/{account}` as node/src/api.rs serves it. */
@@ -341,11 +557,83 @@ export class MockNode {
         const n = m[1].toLowerCase().replace(/\.boo$/, "");
         const owner = this.nameLies.get(n) ?? this.names.get(n);
         const prices = { price: parseFang("5").toString(), price_display: "5 FANG", renewal_price: parseFang("1").toString(), renewal_price_display: "1 FANG", registration_blocks: 31_557_600, grace_blocks: 2_592_000 };
-        return reply(200, owner ? { name: `${n}.boo`, ...prices, owner: this.label(owner), registered_at: 1, expires_at: 31_557_601, grace_until: 34_149_601, status: "active", available: false } : { name: `${n}.boo`, ...prices, status: "available", available: true });
+        // node/src/api.rs `name`: active, grace (expired; only its owner can renew it), reserved, available.
+        if (this.reserved.has(n)) return reply(200, { name: `${n}.boo`, ...prices, status: "reserved", available: false });
+        const info = this.nameInfo.get(n) ?? {};
+        const status = info.status ?? "active";
+        return reply(
+          200,
+          owner
+            ? { name: `${n}.boo`, ...prices, owner: this.label(owner), registered_at: info.registered_at ?? 1, expires_at: info.expires_at ?? 31_557_601, grace_until: info.grace_until ?? 34_149_601, ...(info.offered_to ? { offered_to: this.label(info.offered_to) } : {}), status, available: status === "available" }
+            : { name: `${n}.boo`, ...prices, status: "available", available: true },
+        );
       }
       if (req.method() === "GET" && (m = path.match(/^\/tx\/([0-9a-f]{64})$/))) {
         const r = this.txs.get(m[1]);
-        return r ? reply(200, this.txView(r)) : reply(404, { error: "unknown tx" });
+        if (r) return reply(200, this.txView(r));
+        // node/src/api.rs `tx`: a failure remembered without its transaction.
+        const f = this.failures.get(m[1]);
+        if (f) return reply(200, { id: m[1], status: "failed", dropped: f.dropped, error: f.error, height: f.height, summary: f.dropped ? `Transaction dropped without running: ${f.error}` : `Transaction failed: ${f.error}` });
+        return reply(404, { error: "transaction not found" });
+      }
+      if (req.method() === "GET" && path === "/health") return reply(200, { ok: true, reason: null, halted: null, height: this.height, head_age_ms: 500, finalized_height: this.height });
+      if (req.method() === "GET" && path === "/blocks") {
+        const q = new URL(req.url()).searchParams;
+        const limit = Math.min(Number(q.get("limit") ?? 20), 100);
+        const top = Math.min(Number(q.get("before") ?? Infinity) - 1, this.height);
+        const out = [];
+        for (let h = top; h >= 1 && out.length < limit; h--) out.push(this.header(h));
+        return reply(200, out);
+      }
+      if (req.method() === "GET" && (m = path.match(/^\/block\/(\d+)$/))) {
+        const h = Number(m[1]);
+        return h >= 1 && h <= this.height ? reply(200, this.block(h)) : reply(404, { error: "block not found" });
+      }
+      if (req.method() === "GET" && path === "/mempool") {
+        const waiting = [...this.txs.values()].filter((t) => t.height == null).reverse();
+        return reply(200, { count: waiting.length, txs: waiting.map((t) => this.txView(t)) });
+      }
+      if (req.method() === "GET" && (m = path.match(/^\/search\/(.+)$/))) {
+        const q = m[1].trim().toLowerCase();
+        const n = q.replace(/\.boo$/, "");
+        if (/^\d+$/.test(q) && Number(q) >= 1 && Number(q) <= this.height) return reply(200, { type: "block", id: q });
+        if (this.txs.has(q) || this.failures.has(q)) return reply(200, { type: "tx", id: q });
+        if (/^t?boo1/.test(q)) return reply(200, { type: "account", id: q });
+        if (/^[a-z0-9-]{3,32}$/.test(n)) return reply(200, this.names.has(n) ? { type: "account", id: `${n}.boo` } : { type: "name", id: n });
+        return reply(404, { error: "nothing matching that not found" });
+      }
+      if (req.method() === "GET" && path === "/hunts") {
+        const status = new URL(req.url()).searchParams.get("status");
+        const list = this.hunts.filter((h) => !status || h.status === status);
+        const open = this.hunts.filter((h) => h.status === "open").reduce((t, h) => t + BigInt(String(h.amount)), 0n);
+        return reply(200, { count: this.hunts.length, open_bounties: open.toString(), open_bounties_display: formatFang(open), hunts: list });
+      }
+      if (req.method() === "GET" && (m = path.match(/^\/hunt\/(\d+)$/))) {
+        const h = this.hunts.find((x) => x.id === Number(m?.[1]));
+        return h ? reply(200, h) : reply(404, { error: "hunt not found" });
+      }
+      if (req.method() === "GET" && path === "/contributions") return this.contributions ? reply(200, this.contributions) : reply(404, { error: "no contribution pool" });
+      if (req.method() === "GET" && path === "/claims") {
+        const q = new URL(req.url()).searchParams;
+        const list = this.claims.filter((c) => !q.get("status") || c.status === q.get("status")).slice(0, Number(q.get("limit") ?? 100));
+        return reply(200, { count: this.claims.length, claims: list });
+      }
+      if (req.method() === "GET" && (m = path.match(/^\/claim\/(\d+)$/))) {
+        const c = this.claims.find((x) => x.id === Number(m?.[1]));
+        return c ? reply(200, c) : reply(404, { error: "claim not found" });
+      }
+      if (req.method() === "GET" && (m = path.match(/^\/seance\/(\d+)$/))) {
+        const x = this.seances.find((y) => y.id === Number(m?.[1]));
+        return x ? reply(200, x) : reply(404, { error: "Séance not found" });
+      }
+      if (req.method() === "GET" && path === "/souls") return reply(200, { souls: this.souls.slice(0, Number(new URL(req.url()).searchParams.get("limit") ?? 50)) });
+      if (req.method() === "GET" && (m = path.match(/^\/multisig\/(.+)$/))) {
+        const ms = this.multisigs.get(this.resolve(m[1]));
+        return ms ? reply(200, ms) : reply(404, { error: "not a multisig account" });
+      }
+      if (req.method() === "GET" && this.governance && (m = path.match(/^\/proposal\/(\d+)$/))) {
+        const p = this.proposals.find((x) => x.id === Number(m?.[1]));
+        return p ? reply(200, { ...this.proposalView(p), votes: [], distribution: null }) : reply(404, { error: "proposal not found" });
       }
       if (req.method() === "POST" && path === "/faucet") {
         if (!this.faucet) throw new HttpError(400, "this chain has no faucet");

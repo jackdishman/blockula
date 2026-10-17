@@ -59,7 +59,11 @@
 .pill.pending { color: var(--ochre); }
 .pill.failed { color: var(--blood); }
 .pill.dim { color: var(--dim); }
-.chip { display: inline-flex; align-items: baseline; gap: 5px; padding: 0 7px; border: 1px solid var(--hair); font: 400 13px/1.55 var(--caps); letter-spacing: 0.08em; color: var(--ink-soft); white-space: nowrap; text-transform: lowercase; }
+/* A chip may carry a stranger's label: it wraps rather than push a phone's screen sideways. */
+.chip { display: inline-flex; align-items: baseline; gap: 5px; padding: 0 7px; border: 1px solid var(--hair); font: 400 13px/1.55 var(--caps); letter-spacing: 0.08em; color: var(--ink-soft); white-space: nowrap; text-transform: lowercase; max-width: 100%; }
+.chip > * { min-width: 0; }
+.chip, .ledger-memo, .wrap-any { overflow-wrap: anywhere; }
+@media (max-width: 640px) { .chip { white-space: normal; } }
 .chip.agent { border-color: var(--ink-soft); border-style: dotted; }
 .chip.this { border-color: var(--blood); color: var(--blood); }
 a.chip { text-decoration: none; }

@@ -161,7 +161,7 @@ export default function TxPage() {
         <span className="eyebrow">{dropped ? "Didn't go through" : lost ? "Lost track of it" : t.status === "pending" ? "On its way" : t.status === "failed" ? "Included, but failed" : "Receipt"}</span>
         <p className="headline">{fromMySide(t.summary, me)}</p>
         {/* What was signed, rendered here from the action itself: the node's summary isn't signed (audit gap-7-6). */}
-        {t.action && <p className="dim small m0" data-testid="receipt-signs">Signed: {describeAction(t.action)}</p>}
+        {t.action && <p className="dim small m0 wrap-any" data-testid="receipt-signs">Signed: {describeAction(t.action)}</p>}
         {/* The amount moved, signed from your side when it's yours; fees are itemized below. */}
         {!dropped && (t.amount || awarded != null) && (
           <div className="amount-hero" data-testid="amount-hero">

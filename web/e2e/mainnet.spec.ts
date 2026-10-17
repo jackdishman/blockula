@@ -106,3 +106,48 @@ test("linking by name on mainnet waits for the address to be checked", async ({ 
   await expect(page.getByText("This device's grant code")).toBeVisible();
   await expect(page.getByRole("heading", { name: "Almost there" })).toBeVisible();
 });
+
+// Audit main13-signing-2: the explorer's own "Unlock to sign" keeps the wallet's rule.
+test("the explorer's inline unlock won't open a browser-only key either", async ({ page }) => {
+  await page.goto("/welcome");
+  await page.evaluate(() =>
+    localStorage.setItem("blockula.wallet", JSON.stringify({ v: 1, kind: "local", keyId: "11".repeat(32), seed: "22".repeat(32), account: "boo1x" })),
+  );
+  await page.goto("/programs/names?do=register_name&name=ghoul");
+  await page.getByRole("button", { name: "Unlock to sign" }).click();
+  await expect(page.getByText("Browser-only keys are disabled on mainnet.", { exact: false })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Preview" })).toHaveCount(0);
+});
+
+// Audit main13-signing-1: a field that needs an address (staking's validator) never signs a name
+// only one node vouched for on mainnet; fields the chain resolves itself sign the name.
+test("explorer forms on mainnet: an unproven name is refused where an address is needed, and signed as the name elsewhere", async ({ page, node }) => {
+  node.faucet = false;
+  const hint = await createWallet(page);
+  node.credit(hint.account, "100");
+  const validator = addressOf("7a".repeat(32));
+  node.names.set("fangs", validator);
+  await page.goto("/programs/validators?do=delegate&validator=fangs.boo&amount=2");
+  await page.getByRole("button", { name: "Unlock to sign" }).click();
+  await page.getByRole("button", { name: "Preview" }).click();
+  await expect(page.getByText(/fangs\.boo resolves to .* only by .*'s word \(unproven/)).toBeVisible();
+  await expect(page.getByTestId("action-preview")).toHaveCount(0);
+  const before = node.submitted.length;
+  // The address itself signs.
+  const stake = page.locator("details.action[open]");
+  await stake.getByLabel("Validator", { exact: true }).fill(validator);
+  await stake.getByRole("button", { name: "Preview" }).click();
+  await expect(stake.getByTestId("action-preview")).toBeVisible();
+  // A payment to a name is signed as the name.
+  const alice = addressOf("a1".repeat(32));
+  node.names.set("alice", alice);
+  node.nameLies.set("alice", addressOf("66".repeat(32)));
+  await page.goto("/programs/accounts?do=transfer&to=alice.boo&amount=1");
+  await page.getByRole("button", { name: "Unlock to sign" }).click();
+  await page.getByRole("button", { name: "Preview" }).click();
+  await expect(page.getByTestId("signed-name")).toHaveText("alice.boo");
+  await page.getByRole("button", { name: "Sign & send" }).click();
+  await expect(page.locator(".receipt .headline")).toBeVisible();
+  expect(node.submitted.slice(before).map((t) => t.action)).toEqual([{ type: "transfer", to: "alice.boo", amount: "1000000000" }]);
+  expect(node.accounts.get(alice)?.balance).toBe(1_000_000_000n);
+});
