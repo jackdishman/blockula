@@ -1763,6 +1763,47 @@
       }
     },
     {
+      "label": "validator_ready (tag 55)",
+      "signing_bytes": "424c4f434b554c415f54585f5633030076656303030303030303030303030303030303030303030303030303030303030303030800626f6f3166726f6d070000000000000039300000000000000300000000000000630000000000000037030000000000000001006d",
+      "tx": {
+        "action": {
+          "epoch": 3,
+          "type": "validator_ready"
+        },
+        "chain_id": "vec",
+        "fee": "12345",
+        "from": "boo1from",
+        "genesis_hash": "0303030303030303030303030303030303030303030303030303030303030303",
+        "memo": "m",
+        "nonce": 7,
+        "public_key": "",
+        "signature": "",
+        "tip": "3",
+        "valid_until": 99
+      }
+    },
+    {
+      "label": "admit_validator (tag 56)",
+      "signing_bytes": "424c4f434b554c415f54585f5633030076656303030303030303030303030303030303030303030303030303030303030303030800626f6f3166726f6d0700000000000000393000000000000003000000000000006300000000000000380500626f6f3176030000000000000001006d",
+      "tx": {
+        "action": {
+          "epoch": 3,
+          "type": "admit_validator",
+          "validator": "boo1v"
+        },
+        "chain_id": "vec",
+        "fee": "12345",
+        "from": "boo1from",
+        "genesis_hash": "0303030303030303030303030303030303030303030303030303030303030303",
+        "memo": "m",
+        "nonce": 7,
+        "public_key": "",
+        "signature": "",
+        "tip": "3",
+        "valid_until": 99
+      }
+    },
+    {
       "label": "tx integers at their maxima",
       "signing_bytes": "424c4f434b554c415f54585f5633030076656303030303030303030303030303030303030303030303030303030303030303030800626f6f3166726f6dffffffffffff1f00ffffffffffffffffffffffffffffffffffffffffffff1f00000500782e626f6fffffffffffffffff01006d",
       "tx": {
@@ -2227,6 +2268,47 @@
             "proof": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
           },
           "type": "shield"
+        },
+        "chain_id": "vec",
+        "fee": "12345",
+        "from": "boo1from",
+        "genesis_hash": "0303030303030303030303030303030303030303030303030303030303030303",
+        "memo": "m",
+        "nonce": 7,
+        "public_key": "",
+        "signature": "",
+        "tip": "3",
+        "valid_until": 99
+      }
+    },
+    {
+      "label": "readiness at the JS bound",
+      "signing_bytes": "424c4f434b554c415f54585f5633030076656303030303030303030303030303030303030303030303030303030303030303030800626f6f3166726f6d070000000000000039300000000000000300000000000000630000000000000037ffffffffffff1f0001006d",
+      "tx": {
+        "action": {
+          "epoch": 9007199254740991,
+          "type": "validator_ready"
+        },
+        "chain_id": "vec",
+        "fee": "12345",
+        "from": "boo1from",
+        "genesis_hash": "0303030303030303030303030303030303030303030303030303030303030303",
+        "memo": "m",
+        "nonce": 7,
+        "public_key": "",
+        "signature": "",
+        "tip": "3",
+        "valid_until": 99
+      }
+    },
+    {
+      "label": "admission at the JS bound",
+      "signing_bytes": "424c4f434b554c415f54585f5633030076656303030303030303030303030303030303030303030303030303030303030303030800626f6f3166726f6d0700000000000000393000000000000003000000000000006300000000000000380500626f6f3176ffffffffffff1f0001006d",
+      "tx": {
+        "action": {
+          "epoch": 9007199254740991,
+          "type": "admit_validator",
+          "validator": "boo1v"
         },
         "chain_id": "vec",
         "fee": "12345",

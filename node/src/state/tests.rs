@@ -423,6 +423,9 @@ fn namespaces_and_meta_keys_are_unique() {
 /// (`(0, None)` here: five bytes after the empty schedule); pools' `ready_at`, liveness rings'
 /// `max_missed`, the new fields of name and distribution records and PoC's withdrawn vouches and
 /// GitHub handle holds are empty here. The vectors were regenerated and the SDK rebuilt the root.
+/// Schema 8 (the third audit round) changes only the `schema` record here (pools'
+/// `key_update_at` and `admit` are empty); the vectors were regenerated and the SDK rebuilt the
+/// root.
 #[test]
 fn golden_encodings() {
     let acct = Account { balance: 5, nonce: 2, keys: Default::default(), locks: vec![] };
@@ -433,7 +436,7 @@ fn golden_encodings() {
     st.commit_block().unwrap();
     assert_eq!(st.root_hash(), st.full_root());
     assert_eq!(st.record_count(), 13);
-    assert_eq!(st.root(), "dc8d102cd9d8b59d4ef5beb937055099dd9f04cf4d04333eb78e0de4976b7759");
+    assert_eq!(st.root(), "dd9d360b0e622ce0adfd44594254359e70daca0cfe2842563047b98f22fd98da");
 }
 
 fn million_accounts() -> State {

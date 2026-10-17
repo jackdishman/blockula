@@ -111,7 +111,12 @@ export type Action =
   /** Publish this account's 1,216-byte Ghost Mode address (hex) so wallets find it under the account's names. */
   | { type: "set_ghost_address"; address: string }
   /** Validators: vote to pause Ghost Mode (it pauses once f + 1 of the epoch's validators have). */
-  | { type: "ghost_pause" };
+  | { type: "ghost_pause" }
+  // ---- a set of one or two (tags 55–56): its next newcomer is needed for every quorum, so it joins only once a quorum of the members admitted it and its node showed up ----
+  /** A candidate's consensus key: its node is running, in the last tenth of `epoch` (the epoch the tx lands in). Changes nothing but the readiness record; refused until the members admitted it. Nodes send it themselves. */
+  | { type: "validator_ready"; epoch: number }
+  /** An active member's consensus key admits candidate `validator` (an address) into the set at the end of `epoch` (the epoch the tx lands in): its operator's decision, once an epoch. */
+  | { type: "admit_validator"; validator: string; epoch: number };
 
 /**
  * What a ghost action carries (node/src/types.rs `GhostBundle`), every field lowercase hex: the
@@ -476,6 +481,12 @@ function encodeAction(w: Writer, a: Action) {
       break;
     case "ghost_pause":
       w.u8(54);
+      break;
+    case "validator_ready":
+      w.u8(55); w.u64(a.epoch);
+      break;
+    case "admit_validator":
+      w.u8(56); w.str(a.validator); w.u64(a.epoch);
       break;
     default:
       throw new Error(`unknown action type ${(a as { type: string }).type}`);
