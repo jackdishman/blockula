@@ -71,7 +71,7 @@ import { Client, Wallet, proposal, stakeSummary } from "@blockula/sdk";
 
 await wallet.delegate(validatorAddress, "100");               // stake in a validator's pool
 const stake = stakeSummary(await client.staking(wallet.account), (await client.status()).height);
-await wallet.undelegate(validatorAddress, "all");             // or a number of pool shares
+await wallet.undelegate(validatorAddress, { amount: "10" });  // the chain converts it to shares; or "all", or a share count
 await wallet.withdrawUnbonded();                              // once the unbonding period is over
 
 await wallet.propose(proposal.paramChange("max_validators", 40), { title: "More validators", url: "https://forum.example/p/1" });

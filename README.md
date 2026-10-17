@@ -208,7 +208,7 @@ blockula run --home ~/val --bind 0.0.0.0
 blockula validator register --home ~/val --rpc https://<any node>
 # Stake: delegate, start unbonding, withdraw what's free, see an account's stake
 blockula stake delegate boo1… 1000 --key wallet.json --rpc https://<any node>
-blockula stake undelegate boo1… --all --key wallet.json --rpc https://<any node>
+blockula stake undelegate boo1… --amount 250 --key wallet.json --rpc https://<any node>   # or --all, or --shares N
 blockula stake withdraw --key wallet.json --rpc https://<any node>
 blockula stake show --account <address or name> --rpc https://<any node>
 # Operators: commission (moves a little per epoch), unjail after downtime

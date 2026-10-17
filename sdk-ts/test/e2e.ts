@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex, hexToBytes, randomBytes } from "@noble/hashes/utils.js";
-import { ApiError, Client, NAMESPACES, POP_CONTEXT, encodeKeyGrant, TxFailedError, Wallet, addressFromPublicKey, addressPrefix, baseFee, beaconCommitment, formatFang, ghostSighash, isAddress, minFee, paramsOf, parseFang, parseSoul, popMessage, proposal, proposalSummary, seanceCommitment, sharesFor, signingBytes, stakeSummary, txBytes, txCharge, txId, txSize, verifyProof, type Action, type GhostBundle, type ProposalKind, type Tx } from "../src/index.js";
+import { ApiError, Client, NAMESPACES, POP_CONTEXT, encodeKeyGrant, TxFailedError, Wallet, addressFromPublicKey, addressPrefix, baseFee, beaconCommitment, formatFang, ghostSighash, isAddress, minFee, paramsOf, parseFang, parseSoul, popMessage, proposal, proposalSummary, seanceCommitment, signingBytes, stakeSummary, txBytes, txCharge, txId, txSize, verifyProof, type Action, type GhostBundle, type ProposalKind, type Tx } from "../src/index.js";
 
 const client = new Client(process.env.BLOCKULA_RPC ?? "http://localhost:7070");
 
@@ -377,11 +377,17 @@ if (!pool) throw new Error("the delegation isn't served");
 // and issuance may have paid the pool since: on a dev chain the pool is a sliver of the supply,
 // so its share price climbs fast).
 assert.ok(BigInt(pool.principal) === parseFang("3") && BigInt(pool.value) + 1_000n >= parseFang("3") && pool.self_bond === false, `the delegation is served with its value: ${JSON.stringify(pool)}`);
-console.log("✓", (await alice.undelegate(validator, sharesFor(pool, "2"))).summary);
+// By amount (audit gap-7-5): signed as 2 FANG, converted by the chain at the pool's price when it
+// runs, rounded up, so at least 2 FANG unbonds (and under a share's worth more).
+const byAmount = await alice.undelegate(validator, { amount: "2" });
+assert.deepEqual([byAmount.action?.shares, byAmount.action?.amount], ["0", parseFang("2").toString()], JSON.stringify(byAmount.action));
+console.log("✓", byAmount.summary);
 const unbonding = stakeSummary(await client.staking(alice.address));
 assert.equal(unbonding.unbonding.length, 1);
 assert.equal(unbonding.unbonding[0].validator, validator);
-assert.ok(BigInt(unbonding.unbonding_total) > 0n && unbonding.unbonding_total === unbonding.unbonding[0].amount, JSON.stringify(unbonding));
+assert.ok(BigInt(unbonding.unbonding_total) >= parseFang("2") && BigInt(unbonding.unbonding_total) < parseFang("2") + 1_000n && unbonding.unbonding_total === unbonding.unbonding[0].amount, JSON.stringify(unbonding));
+// More than the rest is worth is refused by the chain (nothing is unbonded).
+await assert.rejects(alice.undelegate(validator, { amount: "2" }), /less than the 2 FANG asked for/);
 assert.ok(unbonding.delegations.some((d) => d.validator === validator && BigInt(d.principal) < parseFang("3")), "the sale took principal out");
 await assert.rejects(alice.withdrawUnbonded(), /nothing has finished unbonding/);
 await assert.rejects(alice.unjail(validator), /only validator .*'s owner|isn't jailed/);
