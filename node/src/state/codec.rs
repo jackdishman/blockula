@@ -31,8 +31,10 @@ use std::io::{Read, Write};
 /// (namespace 64) and epochs' highest views (65); the governance scalars gain the recent treasury
 /// spends, the closed proposals whose votes are being swept and the multisig sweep cursor;
 /// `Distribution` proposals name their distribution id; `Params` lists the owners the bootstrap
-/// delegation passes over.
-pub const SCHEMA_VERSION: u32 = 6;
+/// delegation passes over. 7 (the second audit round, Proof of Contribution): namespaces 26
+/// (withdrawn vouches that still count, `poc::DroppedVouch`) and 27 (GitHub handles governance
+/// holds for an account, `poc::HandleHold`).
+pub const SCHEMA_VERSION: u32 = 7;
 
 pub fn encode<T: BorshSerialize + ?Sized>(v: &T) -> Vec<u8> {
     borsh::to_vec(v).expect("encoding to memory can't fail")

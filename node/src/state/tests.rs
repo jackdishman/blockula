@@ -417,7 +417,8 @@ fn namespaces_and_meta_keys_are_unique() {
 /// audit fixes) changes the `schema` record, `chain_params` (`tip_cap_multiple`, 20, after
 /// `max_tx_validity_blocks`) and the `governance` and `params` scalars' layouts (their new fields
 /// are empty here); staking's slash bookkeeping and its two new maps are empty here too. The
-/// vectors were regenerated with it and the SDK rebuilt the root from them.
+/// vectors were regenerated with it and the SDK rebuilt the root from them. Schema 7 (PoC's
+/// withdrawn vouches and GitHub handle holds, both empty here) changes only the `schema` record.
 #[test]
 fn golden_encodings() {
     let acct = Account { balance: 5, nonce: 2, keys: Default::default(), locks: vec![] };
@@ -428,7 +429,7 @@ fn golden_encodings() {
     st.commit_block().unwrap();
     assert_eq!(st.root_hash(), st.full_root());
     assert_eq!(st.record_count(), 13);
-    assert_eq!(st.root(), "da0a1b06dbb7be8cf302ca9ce0cb593bca0e96f88449fca52daa9ff6376f07b4");
+    assert_eq!(st.root(), "5c7426f193833733e1ddf32b51f1598efa2afa918f38bbdee947aa63e7a7cdb2");
 }
 
 fn million_accounts() -> State {
