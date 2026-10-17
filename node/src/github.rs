@@ -452,8 +452,9 @@ pub async fn find_revert(repo: &str, pr: u64, merge_sha: &str) -> Result<Option<
 }
 
 /// Up to `pages` pages (100 entries each) of a list at `path` (which has no query yet), until one
-/// isn't full. A page over the size cap ([`TooLarge`]) is skipped, as every node skips it.
-async fn pages<F, Fut>(get: &F, path: &str, pages: u32, parse: fn(&Value) -> Vec<FileDiff>, mut done: impl FnMut(&[FileDiff]) -> bool) -> Result<Vec<FileDiff>>
+/// isn't full or `done` says so. A page over the size cap ([`TooLarge`]) is skipped, as every
+/// node skips it.
+async fn pages<F, Fut, T>(get: &F, path: &str, pages: u32, parse: fn(&Value) -> Vec<T>, mut done: impl FnMut(&[T]) -> bool) -> Result<Vec<T>>
 where
     F: Fn(String) -> Fut,
     Fut: std::future::Future<Output = Result<Option<Value>>>,
@@ -474,11 +475,6 @@ where
         }
     }
     Ok(out)
-}
-
-/// A commit list as [`FileDiff`]-shaped names (sha in `filename`), so [`pages`] reads both.
-fn commit_shas(v: &Value) -> Vec<FileDiff> {
-    parse_commits(v).into_iter().map(|c| FileDiff { filename: c.sha, added: false, patch: None }).collect()
 }
 
 /// [`find_revert`] against `get` (`GET https://api.github.com{path}`, `Ok(None)` for a 404), so
@@ -502,13 +498,18 @@ where
     // Every file of the PR the pages hold, binary ones too (audit review-fix-poc-3: the first page
     // alone could be all binary files, sorted ahead of the change).
     let original = pages(&get, &format!("/repos/{repo}/pulls/{pr}/files"), REVERT_FILE_PAGES, parse_files, |_| false).await?;
-    let own: std::collections::BTreeSet<String> = pages(&get, &format!("/repos/{repo}/pulls/{pr}/commits"), REVERT_FILE_PAGES, commit_shas, |_| false).await?.into_iter().map(|c| c.filename).collect();
+    // The PR's own commits, by sha and (for a rebase merge, which lands copies) by message: none
+    // of them can be its revert, and they mustn't fill the windows below (audit F55).
+    let own_commits = pages(&get, &format!("/repos/{repo}/pulls/{pr}/commits"), REVERT_FILE_PAGES, parse_commits, |_| false).await?;
+    let own_shas: std::collections::BTreeSet<&str> = own_commits.iter().map(|c| c.sha.as_str()).collect();
+    let own_messages: std::collections::BTreeSet<&str> = own_commits.iter().map(|c| c.message.as_str()).collect();
+    let own = |c: &Commit| own_shas.contains(c.sha.as_str()) || own_messages.contains(c.message.as_str());
     let merge = merge_sha.to_ascii_lowercase();
     let mut commits = vec![];
     for page in 1..=REVERT_COMMIT_PAGES {
         let Some(v) = get(format!("/repos/{repo}/commits?since={since}&per_page=100&page={page}")).await? else { break };
         let full = v.as_array().is_some_and(|a| a.len() == 100);
-        commits.extend(parse_commits(&v).into_iter().filter(|c| !own.contains(&c.sha)));
+        commits.extend(parse_commits(&v).into_iter().filter(|c| !own(c)));
         if !full {
             break;
         }
@@ -526,7 +527,7 @@ where
     for path in followed_paths(&original) {
         let Some(v) = get(format!("/repos/{repo}/commits?path={}&since={since}&per_page=100", query_value(path))).await? else { continue };
         for c in parse_commits(&v).into_iter().rev() {
-            if c.sha != merge && !own.contains(&c.sha) && !touching.contains(&c.sha) {
+            if c.sha != merge && !own(&c) && !touching.contains(&c.sha) {
                 touching.push(c.sha);
             }
         }
@@ -557,7 +558,7 @@ where
             break;
         }
         let diff = match merged_as.get(&r.sha.to_ascii_lowercase()) {
-            // Until the pages hold every file of the claim PR's that this one touches.
+            // Until the pages read hold every one of the claim PR's files (or run out).
             Some(n) => Some(pages(&get, &format!("/repos/{repo}/pulls/{n}/files"), REVERT_FILE_PAGES, parse_files, |d| names.iter().all(|n| d.iter().any(|f| f.filename == *n))).await?),
             None => match get(format!("/repos/{repo}/commits/{}", r.sha)).await {
                 Ok(v) => v.map(|v| parse_files(&v)),
@@ -856,8 +857,13 @@ mod tests {
         let pr77 = json!({ "number": 77, "state": "closed", "title": "Revert \"Add the thing\"", "body": "Reverts jackdishman/blockula#42", "merged_at": "2026-10-14T10:00:00Z", "merge_commit_sha": m77, "user": { "login": "dave" }, "base": base });
         let mut walk = vec![json!({ "sha": m77, "commit": { "message": "Merge pull request #77 from dave/revert-42-add-the-thing\n\nRevert \"Add the thing\"" } }), json!({ "sha": r77, "commit": { "message": "Undo the thing" } })];
         walk.extend(decoys.iter().enumerate().map(|(i, d)| decoy(d, i + 1)));
+        // One more of the PR's commits, landed as a copy (a rebase merge rewrites the sha), whose
+        // subject looks like a revert landing: it mustn't take a PR fetch either.
+        let landing = "Revert the first draft (#90)";
+        walk.push(json!({ "sha": "e1".repeat(20), "commit": { "message": landing } }));
         walk.push(json!({ "sha": MERGE, "commit": { "message": "Merge pull request #42 from mallory/thing" } }));
-        let own: Vec<Value> = decoys.iter().enumerate().map(|(i, d)| decoy(d, i + 1)).collect();
+        let mut own: Vec<Value> = decoys.iter().enumerate().map(|(i, d)| decoy(d, i + 1)).collect();
+        own.push(json!({ "sha": "e0".repeat(20), "commit": { "message": landing } }));
         let not_undoing = files_json(&[FileDiff { filename: "src/thing.rs".into(), added: false, patch: Some("@@ -1 +1 @@\n-    42\n+    43".into()) }]);
         let mut path_list = vec![json!({ "sha": r77, "commit": { "message": "Undo the thing" } })];
         path_list.extend(own.iter().cloned());
@@ -879,6 +885,7 @@ mod tests {
         let r = gh.find(42).await.unwrap().expect("the real revert is found");
         assert_eq!((r.sha.as_str(), r.by), (m77, Stated::Pr { number: 77, by_claimant: false }));
         assert!(decoys.iter().all(|d| !gh.asked(&format!("/repos/{repo}/commits/{d}")) && !gh.asked(&format!("/repos/{repo}/commits/{d}/pulls"))), "no decoy is looked at");
+        assert!(!gh.asked(&format!("/repos/{repo}/pulls/90")), "nor the rebased copy's nomination");
 
         // The claimant's own merged follow-up PRs, touching #42's files, with descriptions edited
         // after the merge to say "Reverts #42": tried after everyone else's.
