@@ -66,7 +66,15 @@ const refused: [string, UnsignedTx, RegExp][] = [
   ["memo null", tx({ memo: null as unknown as string }), /memo must be a string/],
   ["session period -1", act(session("1", { period_blocks: -1 })), /0 to/],
   ["session expiry 2^64", act(session("1", { expires_at: 2 ** 64 })), /0 to/],
-  ["nonce 2^53 (not exact as a number)", tx({ nonce: 2 ** 53 }), /nonce must be 0 to 9007199254740991 as a number/],
+  ["nonce 2^53 (not exact as a number)", tx({ nonce: 2 ** 53 }), /nonce must be 0 to 9007199254740991, got 9007199254740992 \(past 2\^53 − 1/],
+  // review-r2-clients-1: whole-number fields the node's JSON carries as numbers are at most
+  // 2^53 − 1 (its format rules refuse more), even as strings of digits.
+  ["nonce 2^53 as digits", tx({ nonce: "9007199254740992" as unknown as number }), /nonce must be 0 to 9007199254740991, got 9007199254740992/],
+  ["distribution id 2^53", act({ type: "propose", kind: { type: "distribution", distribution_id: "9007199254740992" as unknown as number, merkle_root: "ef".repeat(32), total: "1", claim_until: 1 }, deposit: "1", title: "t" }), /distribution_id must be 0 to 9007199254740991/],
+  ["claim deadline 2^53", act({ type: "propose", kind: { type: "distribution", distribution_id: 1, merkle_root: "ef".repeat(32), total: "1", claim_until: 2 ** 53 }, deposit: "1", title: "t" }), /claim_until must be 0 to 9007199254740991/],
+  ["activation 2^53", act({ type: "propose", kind: { type: "schedule_upgrade", version: 2, activation_height: 2 ** 53 }, deposit: "1", title: "t" }), /activation_height must be 0 to 9007199254740991/],
+  ["hunt issue 2^60", act({ type: "create_hunt", repo: "a/b", issue: 2 ** 60, amount: "1", expires_at: 1, title: "t" }), /issue must be 0 to 9007199254740991/],
+  ["claim id 2^53 in a claim", act({ type: "claim_distribution", distribution_id: 2 ** 53, amount: "1", proof: [] }), /distribution_id must be 0 to 9007199254740991/],
   ["conviction 256", act({ type: "vote", proposal_id: 1, aye: true, amount: "1", conviction: 256, proposal_digest: "d1".repeat(32) }), /conviction must be 0 to 255/],
   ["conviction -1", act({ type: "vote", proposal_id: 1, aye: true, amount: "1", conviction: -1, proposal_digest: "d1".repeat(32) }), /conviction must be 0 to 255/],
   ["aye not a bool", act({ type: "vote", proposal_id: 1, aye: "yes" as unknown as boolean, amount: "1", conviction: 1, proposal_digest: "d1".repeat(32) }), /aye must be true or false/],
@@ -79,6 +87,21 @@ const refused: [string, UnsignedTx, RegExp][] = [
   ["label not a string", act({ type: "add_key", key_id: "ab".repeat(32), label: 5 as unknown as string, role: { type: "owner" }, public_key: "0c", pop: "0d" }), /must be a string/],
 ];
 for (const [label, t, re] of refused) assert.throws(() => signingBytes(t), re, label);
+
+// review-r2-clients-1: what a vote or an approval binds is computed from the node's JSON. The
+// largest values the chain allows (2^53 − 1) read back exactly (the vectors above include a
+// distribution, upgrades, a claim and a hunt at that bound); a larger number arrives rounded, so
+// the digest fails with a message that says so instead of a bare encoder error.
+const atBound = D.proposal_digests.find((c) => c.kind.type === "distribution" && c.title === "At the bounds")!;
+assert.equal((atBound.kind as { distribution_id: number }).distribution_id, Number.MAX_SAFE_INTEGER, "the vector is at the bound");
+const served = (id: string) => JSON.parse(`{"type":"distribution","distribution_id":${id},"merkle_root":"${"ef".repeat(32)}","total":"18446744073709551615","claim_until":9007199254740991}`) as ProposalKind;
+assert.equal(proposalDigest(served("9007199254740991"), "At the bounds", ""), atBound.digest, "parsed from the node's JSON text, the largest id gives the node's digest");
+for (const id of ["9007199254740992", "9007199254740993", "1152921504606846977"]) {
+  assert.throws(() => proposalDigest(served(id), "At the bounds", ""), /^RangeError: can't compute this proposal's digest: distribution_id must be 0 to 9007199254740991, got \d+ \(past 2\^53 − 1: not even exact as a JavaScript number\)\. The chain stores no proposal with a whole number past 2\^53 − 1 .* may be misreporting it/, id);
+}
+const storedAction = JSON.parse(`{"type":"fund_hunt","hunt_id":9007199254740993,"amount":"1"}`) as Action;
+assert.throws(() => actionDigest(storedAction), /can't compute this multisig action's digest: hunt_id must be 0 to 9007199254740991.*misreporting/);
+console.log("✓ digests at the JSON-number bound match the node; past it they fail with a clear message");
 
 // Wallet.sign and txBytes go through the same encoder: nothing out of range gets signed.
 const w = Wallet.fromSeed("07".repeat(32));

@@ -37,6 +37,44 @@
         "type": "add_key"
       },
       "digest": "1c18853760dd3af9d70cbcb8772d8af51e3445a5da62f44222b3ad57233f0e47"
+    },
+    {
+      "action": {
+        "amount": "18446744073709551615",
+        "expires_at": 9007199254740991,
+        "issue": 9007199254740991,
+        "repo": "a/b",
+        "title": "t",
+        "type": "create_hunt"
+      },
+      "digest": "2b5450234faf4769542cddd7a29a530f5942682a3af0f010dfcced5fc72976e8"
+    },
+    {
+      "action": {
+        "deposit": "18446744073709551615",
+        "kind": {
+          "claim_until": 9007199254740991,
+          "distribution_id": 9007199254740991,
+          "merkle_root": "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+          "total": "18446744073709551615",
+          "type": "distribution"
+        },
+        "title": "t",
+        "type": "propose",
+        "url": ""
+      },
+      "digest": "5dd3e6a1736e9a33b5b51f2f29e45db10cf258cd9d38eac55dd49664abc32260"
+    },
+    {
+      "action": {
+        "amount": "18446744073709551615",
+        "distribution_id": 9007199254740991,
+        "proof": [
+          "abababababababababababababababababababababababababababababababab"
+        ],
+        "type": "claim_distribution"
+      },
+      "digest": "9ff9ca7fd84362109b1112d55c095e325418d2f29d79ab9babdfe85266e9ae21"
     }
   ],
   "cases": [
@@ -2277,6 +2315,57 @@
         "type": "grant_soul"
       },
       "title": "",
+      "url": ""
+    },
+    {
+      "digest": "8fd8b57fdaf5ff5011c3068fecb53fe53eb878290db6b2e2d44ecf9e43b65554",
+      "kind": {
+        "claim_until": 9007199254740991,
+        "distribution_id": 9007199254740991,
+        "merkle_root": "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+        "total": "18446744073709551615",
+        "type": "distribution"
+      },
+      "title": "At the bounds",
+      "url": ""
+    },
+    {
+      "digest": "f6fa789f7dd14a2c169e219689c3588b094d4fd2c22a8ea1c8fbee2b2c563e7b",
+      "kind": {
+        "activation_height": 9007199254740991,
+        "type": "schedule_upgrade",
+        "version": 4294967295
+      },
+      "title": "At the bounds",
+      "url": ""
+    },
+    {
+      "digest": "d54568e62d00c99d69f700a44b23758d19696fab47eaeb9197b325521224867e",
+      "kind": {
+        "activation_height": 9007199254740991,
+        "type": "cancel_upgrade",
+        "version": 4294967295
+      },
+      "title": "At the bounds",
+      "url": ""
+    },
+    {
+      "digest": "6cc973b2635621cd177b62c4fdf4b319e39ccfe5e71824f64614711bf13418ad",
+      "kind": {
+        "claim_id": 9007199254740991,
+        "reason": "r",
+        "type": "reject_claim"
+      },
+      "title": "At the bounds",
+      "url": ""
+    },
+    {
+      "digest": "14a2da0ee7d87c61aa77a76eace47a8dc92b29ce2d262ff1222c833babed35ec",
+      "kind": {
+        "hunt_id": 9007199254740991,
+        "type": "refund_hunt"
+      },
+      "title": "At the bounds",
       "url": ""
     }
   ],

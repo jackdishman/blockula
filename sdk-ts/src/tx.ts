@@ -196,6 +196,14 @@ const utf8 = new TextEncoder();
 
 const U64_LIMIT = 1n << 64n;
 
+/**
+ * The largest value of a whole-number field a tx carries as a JSON number, not a string (ids,
+ * heights, PR numbers, the nonce): 2^53 − 1, what a JavaScript number holds exactly
+ * (node/src/types.rs `MAX_JSON_INT`). The chain refuses larger ones, so every stored proposal
+ * kind and multisig action reads back exactly here, and its digest can be computed.
+ */
+export const MAX_JSON_INT = (1n << 53n) - 1n;
+
 /** An optional field's JSON default (`#[serde(default)]` in node/src/types.rs): only when it's absent, never for `null`. */
 const orDefault = <T>(v: T | undefined, d: T): T => (v === undefined ? d : v);
 
@@ -210,8 +218,12 @@ export function uintField(v: unknown, max: bigint, what = "integer field"): bigi
   if (typeof v === "bigint") n = v;
   else if (typeof v === "number") {
     if (!Number.isInteger(v)) throw new RangeError(`${what} must be a whole number, got ${v}`);
-    // Above 2^53 − 1 a JavaScript number may not be the value that was meant: pass a string of digits.
-    if (!Number.isSafeInteger(v)) throw new RangeError(`${what} must be 0 to ${max < BigInt(Number.MAX_SAFE_INTEGER) ? max : Number.MAX_SAFE_INTEGER} as a number (larger values as a string of digits), got ${v}`);
+    // Above 2^53 − 1 a JavaScript number may not be the value that was meant: pass a string of
+    // digits (where the field can be that large).
+    if (!Number.isSafeInteger(v)) {
+      if (max <= MAX_JSON_INT) throw new RangeError(`${what} must be 0 to ${max}, got ${v}${v > Number.MAX_SAFE_INTEGER ? " (past 2^53 − 1: not even exact as a JavaScript number)" : ""}`);
+      throw new RangeError(`${what} must be 0 to ${Number.MAX_SAFE_INTEGER} as a number (larger values as a string of digits), got ${v}`);
+    }
     n = BigInt(v);
   } else if (typeof v === "string") {
     if (!/^\d+$/.test(v)) throw new RangeError(`${what} must be a decimal string of digits, got ${JSON.stringify(v)}`);
@@ -232,7 +244,10 @@ class Writer {
   u8(n: unknown, what?: string) { this.byte(Number(uintField(n, 0xffn, what))); }
   u16(n: number, what?: string) { const v = Number(uintField(n, 0xffffn, what)); this.byte(v); this.byte(v >> 8); }
   u32(n: unknown, what?: string) { const v = Number(uintField(n, 0xffff_ffffn, what)); this.byte(v); this.byte(v >> 8); this.byte(v >> 16); this.byte(v >>> 24); }
-  u64(n: unknown, what?: string) { const v = u64Field(n, what); for (let i = 0n; i < 8n; i++) this.byte(Number((v >> (8n * i)) & 0xffn)); }
+  u64(n: unknown, what?: string) { this.le64(u64Field(n, what)); }
+  /** A u64 the tx carries as a JSON number: at most `MAX_JSON_INT`, as the node's format rules require. */
+  int(n: unknown, what: string) { this.le64(uintField(n, MAX_JSON_INT, what)); }
+  private le64(v: bigint) { for (let i = 0n; i < 8n; i++) this.byte(Number((v >> (8n * i)) & 0xffn)); }
   bool(b: unknown, what = "flag") {
     if (typeof b !== "boolean") throw new TypeError(`${what} must be true or false`);
     this.byte(b ? 1 : 0);
@@ -247,7 +262,7 @@ class Writer {
   ids(xs: unknown, what = "id list") {
     if (!Array.isArray(xs)) throw new TypeError(`${what} must be an array`);
     this.u16(xs.length, `${what} length`);
-    for (const x of xs) this.u64(x, what);
+    for (const x of xs) this.int(x, what);
   }
   /** Raw bytes of exactly `len` bytes, from hex. */
   fixed(hex: string, len: number) {
@@ -288,7 +303,7 @@ export function signingBytes(tx: UnsignedTx): Uint8Array {
     w.bytes(genesisHashBytes(tx.genesis_hash));
     w.u64(tx.fee, "fee");
     w.u64(orDefault(tx.tip, "0"), "tip");
-    w.u64(tx.valid_until, "valid_until");
+    w.int(tx.valid_until, "valid_until");
     encodeAction(w, tx.action);
     return w.done();
   }
@@ -296,10 +311,10 @@ export function signingBytes(tx: UnsignedTx): Uint8Array {
   w.str(tx.chain_id);
   w.bytes(genesisHashBytes(tx.genesis_hash));
   w.str(tx.from);
-  w.u64(tx.nonce, "nonce");
+  w.int(tx.nonce, "nonce");
   w.u64(tx.fee, "fee");
   w.u64(orDefault(tx.tip, "0"), "tip");
-  w.u64(tx.valid_until, "valid_until");
+  w.int(tx.valid_until, "valid_until");
   encodeAction(w, tx.action);
   w.str(orDefault(tx.memo, ""), "memo");
   return w.done();
@@ -317,7 +332,7 @@ function encodeAction(w: Writer, a: Action) {
     case "add_key":
       w.u8(2); w.str(a.key_id); w.str(a.label);
       if (a.role.type === "owner") w.u8(0);
-      else { w.u8(1); w.u64(a.role.limit); w.u64(a.role.period_blocks); w.u64(a.role.expires_at); }
+      else { w.u8(1); w.u64(a.role.limit); w.int(a.role.period_blocks, "period_blocks"); w.int(a.role.expires_at, "expires_at"); }
       w.str(a.public_key); w.str(a.pop);
       break;
     case "remove_key":
@@ -342,25 +357,25 @@ function encodeAction(w: Writer, a: Action) {
       w.u8(9); w.str(a.handle);
       break;
     case "create_hunt":
-      w.u8(10); w.str(a.repo); w.u64(a.issue); w.u64(a.amount); w.u64(a.expires_at); w.str(a.title);
+      w.u8(10); w.str(a.repo); w.int(a.issue, "issue"); w.u64(a.amount); w.int(a.expires_at, "expires_at"); w.str(a.title);
       break;
     case "fund_hunt":
-      w.u8(11); w.u64(a.hunt_id); w.u64(a.amount);
+      w.u8(11); w.int(a.hunt_id, "hunt_id"); w.u64(a.amount);
       break;
     case "award_hunt":
-      w.u8(12); w.u64(a.hunt_id); w.str(a.to); w.u64(a.pr); w.str(a.familiar_key ?? "");
+      w.u8(12); w.int(a.hunt_id, "hunt_id"); w.str(a.to); w.int(a.pr, "pr"); w.str(a.familiar_key ?? "");
       break;
     case "cancel_hunt":
-      w.u8(13); w.u64(a.hunt_id);
+      w.u8(13); w.int(a.hunt_id, "hunt_id");
       break;
     case "register_familiar":
       w.u8(14); w.str(a.key_id); w.str(a.label);
       break;
     case "set_repo":
-      w.u8(15); w.str(a.repo); w.u64(a.weight);
+      w.u8(15); w.str(a.repo); w.int(a.weight, "weight");
       break;
     case "grant_soul":
-      w.u8(16); w.str(a.to); w.u64(a.amount); w.str(a.reason);
+      w.u8(16); w.str(a.to); w.int(a.amount, "amount"); w.str(a.reason);
       break;
     case "vouch":
       w.u8(17); w.str(a.account);
@@ -372,13 +387,13 @@ function encodeAction(w: Writer, a: Action) {
       w.u8(19); w.str(a.account); w.str(a.reason);
       break;
     case "submit_claim":
-      w.u8(20); w.str(a.repo); w.u64(a.pr); w.str(a.familiar_key ?? "");
+      w.u8(20); w.str(a.repo); w.int(a.pr, "pr"); w.str(a.familiar_key ?? "");
       break;
     case "attest_claim":
-      w.u8(21); w.u64(a.claim_id); w.bool(a.ok, "ok"); w.str(a.merge_sha); w.str(orDefault(a.note, ""));
+      w.u8(21); w.int(a.claim_id, "claim_id"); w.bool(a.ok, "ok"); w.str(a.merge_sha); w.str(orDefault(a.note, ""));
       break;
     case "reject_claim":
-      w.u8(22); w.u64(a.claim_id); w.str(a.reason);
+      w.u8(22); w.int(a.claim_id, "claim_id"); w.str(a.reason);
       break;
     case "join_jury":
       w.u8(23); w.u64(a.bond);
@@ -387,10 +402,10 @@ function encodeAction(w: Writer, a: Action) {
       w.u8(24);
       break;
     case "commit_votes":
-      w.u8(25); w.u64(a.seance_id); w.str(a.commitment); w.str(a.pairs_digest);
+      w.u8(25); w.int(a.seance_id, "seance_id"); w.str(a.commitment); w.str(a.pairs_digest);
       break;
     case "reveal_votes":
-      w.u8(26); w.u64(a.seance_id); w.str(a.votes); w.ids(a.spam); w.str(a.salt);
+      w.u8(26); w.int(a.seance_id, "seance_id"); w.str(a.votes); w.ids(a.spam, "spam"); w.str(a.salt);
       break;
     case "fund_pool":
       w.u8(27); w.u64(a.amount);
@@ -414,7 +429,7 @@ function encodeAction(w: Writer, a: Action) {
       w.u8(33);
       break;
     case "update_validator":
-      w.u8(34); w.u64(a.commission_bps); w.str(a.p2p_addr); w.str(a.http_addr);
+      w.u8(34); w.int(a.commission_bps, "commission_bps"); w.str(a.p2p_addr); w.str(a.http_addr);
       break;
     case "unjail":
       w.u8(35); w.str(a.validator);
@@ -423,16 +438,16 @@ function encodeAction(w: Writer, a: Action) {
       w.u8(36); w.str(a.evidence);
       break;
     case "beacon_commit":
-      w.u8(37); w.u64(a.epoch); w.str(a.commitment);
+      w.u8(37); w.int(a.epoch, "epoch"); w.str(a.commitment);
       break;
     case "beacon_reveal":
-      w.u8(38); w.u64(a.epoch); w.str(a.secret);
+      w.u8(38); w.int(a.epoch, "epoch"); w.str(a.secret);
       break;
     case "propose":
       w.u8(39); encodeProposalKind(w, a.kind); w.u64(a.deposit); w.str(a.title); w.str(orDefault(a.url, ""));
       break;
     case "vote":
-      w.u8(40); w.u64(a.proposal_id); w.bool(a.aye, "aye"); w.u64(a.amount); w.u8(a.conviction, "conviction"); w.str(a.proposal_digest);
+      w.u8(40); w.int(a.proposal_id, "proposal_id"); w.bool(a.aye, "aye"); w.u64(a.amount); w.u8(a.conviction, "conviction"); w.str(a.proposal_digest);
       break;
     case "unlock":
       w.u8(41);
@@ -445,7 +460,7 @@ function encodeAction(w: Writer, a: Action) {
       w.u8(43); encodeAction(w, a.action);
       break;
     case "multisig_approve":
-      w.u8(44); w.u64(a.id); w.str(a.action_digest);
+      w.u8(44); w.int(a.id, "id"); w.str(a.action_digest);
       break;
     case "renew_name":
       w.u8(45); w.str(a.name); w.u8(a.years, "years");
@@ -457,10 +472,10 @@ function encodeAction(w: Writer, a: Action) {
       w.u8(47); w.str(a.name);
       break;
     case "claim_distribution":
-      w.u8(48); w.u64(a.distribution_id); w.u64(a.amount); w.strs(a.proof);
+      w.u8(48); w.int(a.distribution_id, "distribution_id"); w.u64(a.amount); w.strs(a.proof);
       break;
     case "attest_revert":
-      w.u8(49); w.u64(a.claim_id); w.str(a.revert_sha);
+      w.u8(49); w.int(a.claim_id, "claim_id"); w.str(a.revert_sha);
       break;
     case "shield":
       w.u8(50); w.u64(a.amount); encodeBundle(w, a.bundle);
@@ -513,10 +528,10 @@ export function ghostSighash(tx: UnsignedTx): Uint8Array {
   w.str(tx.chain_id);
   w.bytes(genesisHashBytes(tx.genesis_hash));
   w.u8(a.type === "shield" ? 50 : a.type === "private_transfer" ? 51 : 52);
-  w.u64(tx.valid_until, "valid_until");
+  w.int(tx.valid_until, "valid_until");
   w.u64(tx.fee, "fee");
   w.u64(orDefault(tx.tip, "0"), "tip");
-  if (a.type === "shield") { w.str(tx.from); w.u64(tx.nonce, "nonce"); w.u64(a.amount); }
+  if (a.type === "shield") { w.str(tx.from); w.int(tx.nonce, "nonce"); w.u64(a.amount); }
   if (a.type === "unshield") { w.str(a.to); w.u64(a.amount); }
   encodeBundlePublic(w, a.bundle);
   w.u32(GHOST_CIRCUIT_ID);
@@ -533,19 +548,19 @@ function encodeProposalKind(w: Writer, k: ProposalKind) {
       w.u8(1); w.str(k.to); w.u64(k.amount);
       break;
     case "distribution":
-      w.u8(2); w.u64(k.distribution_id); w.str(k.merkle_root); w.u64(k.total); w.u64(k.claim_until);
+      w.u8(2); w.int(k.distribution_id, "distribution_id"); w.str(k.merkle_root); w.u64(k.total); w.int(k.claim_until, "claim_until");
       break;
     case "set_repo":
-      w.u8(3); w.str(k.repo); w.u64(k.weight);
+      w.u8(3); w.str(k.repo); w.int(k.weight, "weight");
       break;
     case "grant_soul":
-      w.u8(4); w.str(k.to); w.u64(k.amount); w.str(k.reason);
+      w.u8(4); w.str(k.to); w.int(k.amount, "amount"); w.str(k.reason);
       break;
     case "flag_sybil":
       w.u8(5); w.str(k.account); w.str(k.reason);
       break;
     case "reject_claim":
-      w.u8(6); w.u64(k.claim_id); w.str(k.reason);
+      w.u8(6); w.int(k.claim_id, "claim_id"); w.str(k.reason);
       break;
     case "clawback":
       w.u8(7); w.str(k.account); w.str(k.reason);
@@ -554,10 +569,10 @@ function encodeProposalKind(w: Writer, k: ProposalKind) {
       w.u8(8); w.str(k.handle);
       break;
     case "refund_hunt":
-      w.u8(9); w.u64(k.hunt_id);
+      w.u8(9); w.int(k.hunt_id, "hunt_id");
       break;
     case "schedule_upgrade":
-      w.u8(10); w.u32(k.version, "version"); w.u64(k.activation_height);
+      w.u8(10); w.u32(k.version, "version"); w.int(k.activation_height, "activation_height");
       break;
     case "activate_feature":
       w.u8(11); w.str(k.feature);
@@ -572,7 +587,7 @@ function encodeProposalKind(w: Writer, k: ProposalKind) {
       w.u8(14); w.str(k.account); w.str(k.reason);
       break;
     case "cancel_upgrade":
-      w.u8(15); w.u32(k.version, "version"); w.u64(k.activation_height, "activation_height");
+      w.u8(15); w.u32(k.version, "version"); w.int(k.activation_height, "activation_height");
       break;
     default:
       throw new Error(`unknown proposal kind ${(k as { type: string }).type}`);
@@ -586,10 +601,10 @@ function encodeProposalKind(w: Writer, k: ProposalKind) {
 export function seanceCommitment(seanceId: number, juror: string, votes: string, spam: number[], salt: string): string {
   const w = new Writer();
   w.bytes(utf8.encode("BLOCKULA_SEANCE_V1"));
-  w.u64(seanceId);
+  w.int(seanceId, "seance_id");
   w.str(juror);
   w.str(votes);
-  w.ids(spam);
+  w.ids(spam, "spam");
   w.str(salt);
   return bytesToHex(blake3(w.done()));
 }
@@ -630,9 +645,7 @@ export function parseSoul(soul: string | number): number {
  * Compute it from the action you show the approver (`client.multisig(account)` `pending[].action`).
  */
 export function actionDigest(action: Action): string {
-  const w = new Writer();
-  encodeAction(w, action);
-  return bytesToHex(blake3(w.done(), { context: utf8.encode("blockula multisig action v1") }));
+  return digestOf("multisig action", "blockula multisig action v1", (w) => encodeAction(w, action));
 }
 
 /**
@@ -640,11 +653,27 @@ export function actionDigest(action: Action): string {
  * stored, resolved), title and link. Compute it from the proposal you show the voter.
  */
 export function proposalDigest(kind: ProposalKind, title: string, url = ""): string {
+  return digestOf("proposal", "blockula proposal v1", (w) => {
+    encodeProposalKind(w, kind);
+    w.str(title);
+    w.str(url);
+  });
+}
+
+/**
+ * BLAKE3 (derive-key mode, `context`) of what `encode` writes. A field out of range (a JSON
+ * number past 2^53 − 1 arrives rounded, and can't be the value the chain stored) fails with
+ * what's wrong and where it likely came from, not a bare encoder error (review-r2-clients-1).
+ */
+function digestOf(what: string, context: string, encode: (w: Writer) => void): string {
   const w = new Writer();
-  encodeProposalKind(w, kind);
-  w.str(title);
-  w.str(url);
-  return bytesToHex(blake3(w.done(), { context: utf8.encode("blockula proposal v1") }));
+  try {
+    encode(w);
+  } catch (e) {
+    if (e instanceof RangeError) throw new RangeError(`can't compute this ${what}'s digest: ${e.message}. The chain stores no ${what} with a whole number past 2^53 − 1 (the most a JSON number carries exactly), so the node it was read from may be misreporting it: read it from another node`);
+    throw e;
+  }
+  return bytesToHex(blake3(w.done(), { context: utf8.encode(context) }));
 }
 
 /** One claim of a Séance pair, as the juror judged it. */
@@ -656,10 +685,10 @@ export interface SeanceClaimRef { id: number; repo: string; pr: number }
  */
 export function seancePairsDigest(seanceId: number, juror: string, pairs: [SeanceClaimRef, SeanceClaimRef][]): string {
   const w = new Writer();
-  w.u64(seanceId, "seance_id");
+  w.int(seanceId, "seance_id");
   w.str(juror);
   w.u16(pairs.length);
-  for (const pair of pairs) for (const c of pair) { w.u64(c.id, "claim id"); w.str(c.repo); w.u64(c.pr, "pr"); }
+  for (const pair of pairs) for (const c of pair) { w.int(c.id, "claim id"); w.str(c.repo); w.int(c.pr, "pr"); }
   return bytesToHex(blake3(w.done(), { context: utf8.encode("blockula seance pairs v1") }));
 }
 

@@ -2384,7 +2384,7 @@ pub(crate) mod tests {
     /// its signing bytes; the SDK must produce the same bytes from the JSON, and must refuse the
     /// out-of-range values the node's JSON parser refuses instead of wrapping them.
     fn tx_vectors() -> serde_json::Value {
-        const JS_MAX: u64 = (1 << 53) - 1;
+        const JS_MAX: u64 = MAX_JSON_INT;
         let unsigned = |tx: Tx| Tx { public_key: String::new(), signature: String::new(), ..tx };
         let mut cases: Vec<(String, Tx)> = vector_actions().into_iter().chain(v1_vector_actions()).chain(ghost_vector_actions()).map(|a| (format!("{} (tag {})", a.kind(), a.to_bytes()[0]), unsigned(vector_tx(a)))).collect();
         let base = unsigned(vector_tx(Action::Transfer { to: "x.boo".into(), amount: u64::MAX }));
@@ -2425,12 +2425,25 @@ pub(crate) mod tests {
             Action::Transfer { to: "bob.boo".into(), amount: 5_000_000_000 },
             Action::Propose { kind: ProposalKind::TreasurySpend { to: "boo1to".into(), amount: 9 }, deposit: 1, title: "Pay Bob".into(), url: String::new() },
             Action::AddKey { key_id: "ab".repeat(32), label: "Vlad’s phone 📱".into(), role: KeyRole::Session { limit: u64::MAX, period_blocks: 1, expires_at: JS_MAX }, public_key: "0c".into(), pop: "0d".into() },
+            // Every JSON-number field at the largest value the format rules allow
+            // (review-r2-clients-1): a JavaScript client computes the same digests.
+            Action::CreateHunt { repo: "a/b".into(), issue: JS_MAX, amount: u64::MAX, expires_at: JS_MAX, title: "t".into() },
+            Action::Propose { kind: ProposalKind::Distribution { distribution_id: JS_MAX, merkle_root: "ef".repeat(32), total: u64::MAX, claim_until: JS_MAX }, deposit: u64::MAX, title: "t".into(), url: String::new() },
+            Action::ClaimDistribution { distribution_id: JS_MAX, amount: u64::MAX, proof: vec!["ab".repeat(32)] },
         ]
         .into_iter()
         .map(|a| serde_json::json!({ "action": a, "digest": action_digest(&a) }))
         .collect::<Vec<_>>();
+        let at_bounds = [
+            ProposalKind::Distribution { distribution_id: JS_MAX, merkle_root: "ef".repeat(32), total: u64::MAX, claim_until: JS_MAX },
+            ProposalKind::ScheduleUpgrade { version: u32::MAX, activation_height: JS_MAX },
+            ProposalKind::CancelUpgrade { version: u32::MAX, activation_height: JS_MAX },
+            ProposalKind::RejectClaim { claim_id: JS_MAX, reason: "r".into() },
+            ProposalKind::RefundHunt { hunt_id: JS_MAX },
+        ];
         let proposals = [(ProposalKind::Text {}, "Plant garlic 🧄", "https://forum.example/p/1"), (ProposalKind::ParamChange { key: "max_validators".into(), value: u64::MAX }, "More validators", ""), (ProposalKind::GrantSoul { to: "boo1to".into(), amount: 1500, reason: "r".into() }, "", "")]
             .into_iter()
+            .chain(at_bounds.into_iter().map(|k| (k, "At the bounds", "")))
             .map(|(kind, title, url)| serde_json::json!({ "kind": kind, "title": title, "url": url, "digest": proposal_digest(&kind, title, url) }))
             .collect::<Vec<_>>();
         let pairs: [[(u64, &str, u64); 2]; 2] = [[(9, "c/d", 90), (7, "a/b", 70)], [(JS_MAX, "x/ÿ", JS_MAX), (0, "", 0)]];
@@ -2652,6 +2665,79 @@ pub(crate) mod tests {
         }
         assert_eq!(tags, (0..=54).collect(), "the vectors cover every action tag");
         assert_eq!(kinds, (0..=13).collect(), "and every proposal kind");
+    }
+
+    /// review-r2-clients-1: every integer field a tx carries as a JSON number (not a `u64_str`
+    /// string) is at most `MAX_JSON_INT` by the format rules, so a JavaScript client reads every
+    /// stored proposal kind and multisig action exactly and can compute what a vote or an
+    /// approval binds. Each vector action's JSON numbers (a proposal kind's and a nested multisig
+    /// action's too), pushed one at a time past the bound, make the format check fail with that
+    /// rule; at the bound they don't trip it. A field `json_ints` misses fails here.
+    #[test]
+    fn json_number_fields_are_bounded() {
+        fn numbers(v: &serde_json::Value, path: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+            match v {
+                serde_json::Value::Number(_) => out.push(path.clone()),
+                serde_json::Value::Object(m) => m.iter().for_each(|(k, v)| {
+                    path.push(k.clone());
+                    numbers(v, path, out);
+                    path.pop();
+                }),
+                serde_json::Value::Array(a) => a.iter().enumerate().for_each(|(i, v)| {
+                    path.push(i.to_string());
+                    numbers(v, path, out);
+                    path.pop();
+                }),
+                _ => {}
+            }
+        }
+        fn set(v: &mut serde_json::Value, path: &[String], n: u64) {
+            let mut at = v;
+            for p in path {
+                at = if at.is_array() { &mut at[p.parse::<usize>().unwrap()] } else { &mut at[p.as_str()] };
+            }
+            *at = n.into();
+        }
+        let propose = |kind: ProposalKind| Action::Propose { kind, deposit: 1, title: "t".into(), url: String::new() };
+        let wrap = |a: Action| Action::MultisigPropose { action: Box::new(a) };
+        let session = KeyRole::Session { limit: 1, period_blocks: 2, expires_at: 3 };
+        let extra = [
+            propose(ProposalKind::UnflagSybil { account: "x.boo".into(), reason: "r".into() }),
+            propose(ProposalKind::CancelUpgrade { version: 2, activation_height: 9 }),
+            wrap(Action::CreateHunt { repo: "a/b".into(), issue: 3, amount: 10, expires_at: 500, title: "t".into() }),
+            wrap(Action::AddKey { key_id: "cd".repeat(32), label: "agent".into(), role: session, public_key: "0e".into(), pop: "0f".into() }),
+            wrap(propose(ProposalKind::Distribution { distribution_id: 6, merkle_root: "ef".repeat(32), total: 100, claim_until: 5_000 })),
+            wrap(Action::RevealVotes { seance_id: 2, votes: "ab".into(), spam: vec![5], salt: "s".into() }),
+        ];
+        let rule = format!("must be at most {MAX_JSON_INT}");
+        let mut checked = 0;
+        for action in vector_actions().into_iter().chain(v1_vector_actions()).chain(ghost_vector_actions()).chain(extra) {
+            let json = serde_json::to_value(&action).unwrap();
+            let mut paths = vec![];
+            numbers(&json, &mut vec![], &mut paths);
+            for path in paths {
+                let at = |n: u64| {
+                    let mut j = json.clone();
+                    set(&mut j, &path, n);
+                    serde_json::from_value::<Action>(j).ok()
+                };
+                // u8 and u32 fields (conviction, threshold, years, version) can't hold it at all.
+                let Some(over) = at(MAX_JSON_INT + 1) else { continue };
+                let e = over.check_format(false).map_err(|e| format!("{e:#}"));
+                assert!(e.as_ref().is_err_and(|e| e.contains(&rule)), "{}: {path:?} past 2^53 − 1: {e:?}", action.kind());
+                let fine = at(MAX_JSON_INT).expect("the bound parses").check_format(false).map_err(|e| format!("{e:#}"));
+                assert!(fine.as_ref().is_ok() || fine.as_ref().is_err_and(|e| !e.contains(&rule)), "{}: {path:?} at 2^53 − 1: {fine:?}", action.kind());
+                checked += 1;
+            }
+        }
+        assert!(checked >= 40, "only {checked} JSON-number fields checked");
+        // The tx's own: its nonce and valid_until.
+        for field in ["nonce", "valid_until"] {
+            let mut j = serde_json::to_value(vector_tx(Action::Transfer { to: "x.boo".into(), amount: 5 })).unwrap();
+            j[field] = (MAX_JSON_INT + 1).into();
+            let e = serde_json::from_value::<Tx>(j).unwrap().check_format().unwrap_err().to_string();
+            assert!(e.contains(&format!("{field} {rule}")), "{e}");
+        }
     }
 
     #[test]
