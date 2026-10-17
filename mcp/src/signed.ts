@@ -6,7 +6,9 @@
 //
 // It only ever informs: a missing or unreadable file means "valid_until unknown", and tx_status
 // then tells the agent not to send the tx again until it's final, which is the conservative
-// answer. Spending caps don't depend on it (see spend.ts).
+// answer. Spending caps don't depend on it (see spend.ts). The account and nonce let tx_status
+// tell a tx a node can't show (pruned, or never held) that ran from one still in flight: once the
+// account's nonce is past it, it (or a tx that took its nonce) ran (audit review-r3-wallet-1).
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
@@ -23,6 +25,8 @@ export interface SignedTx {
 export const MAX_SIGNED = 500;
 
 const ID = /^[0-9a-f]{64}$/;
+/** An address as tx_status reads and quotes it: lowercase bech32 characters only. */
+const ACCOUNT = /^[a-z0-9]{1,128}$/;
 
 export class SignedTxs {
   constructor(readonly file: string, readonly max = MAX_SIGNED) {}
@@ -31,7 +35,7 @@ export class SignedTxs {
     try {
       const f = JSON.parse(readFileSync(this.file, "utf8")) as { txs?: unknown };
       if (!Array.isArray(f.txs)) return [];
-      return f.txs.filter((e): e is [string, SignedTx] => Array.isArray(e) && typeof e[0] === "string" && ID.test(e[0]) && typeof e[1] === "object" && e[1] !== null && Number.isSafeInteger(e[1].valid_until) && Number.isSafeInteger(e[1].nonce) && typeof e[1].account === "string");
+      return f.txs.filter((e): e is [string, SignedTx] => Array.isArray(e) && typeof e[0] === "string" && ID.test(e[0]) && typeof e[1] === "object" && e[1] !== null && Number.isSafeInteger(e[1].valid_until) && Number.isSafeInteger(e[1].nonce) && typeof e[1].account === "string" && ACCOUNT.test(e[1].account));
     } catch {
       return [];
     }
@@ -41,6 +45,11 @@ export class SignedTxs {
   get(id: string): SignedTx | undefined {
     const hit = this.read().find(([k]) => k === id);
     return hit ? { valid_until: hit[1].valid_until, account: hit[1].account, nonce: hit[1].nonce } : undefined;
+  }
+
+  /** The other txs this MCP signed with the same (account, nonce), oldest first: at most one of them all executes. */
+  sameSlot(account: string, nonce: number, except: string): string[] {
+    return this.read().filter(([k, t]) => k !== except && t.account === account && t.nonce === nonce).map(([k]) => k);
   }
 
   /** Records a tx about to be submitted. Written whole (temp file, then rename). */

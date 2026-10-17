@@ -18,6 +18,8 @@
 //    checks the account's own key list.
 // 7. Unstaking an amount signs the amount, which the chain converts: no node report of the stake
 //    decides how much unbonds (gap-7-5).
+// 8. tx_status for a tx this MCP signed that the node can't show (review-r3-wallet-1): read
+//    against the account's nonce, with BLOCKULA_WITNESSES proven against them.
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
@@ -27,7 +29,7 @@ import { join } from "node:path";
 import { Client as McpClient } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
-import { addressFromPublicKey, decodeKeyGrant, parseFang, proposalDigest, txId, verifyKeyGrant, type Tx } from "@blockula/sdk";
+import { NAMESPACES, addressFromPublicKey, decodeKeyGrant, keyHash, leafHash, parseFang, proposalDigest, txId, valueHash, verifyKeyGrant, type Tx } from "@blockula/sdk";
 import { SpendLedger } from "../src/spend.js";
 import { chainData, clean } from "../src/untrusted.js";
 
@@ -100,8 +102,10 @@ const GARLIC = proposalDigest({ type: "text" }, "Plant garlic", "https://forum.e
 interface Mode {
   /** What POST /api/tx does. `lie`: answers 400 but keeps the tx and relays it (the F68 bypass). */
   post: "accept" | "refuse" | "hang" | "lie";
-  /** What GET /api/tx/{id} says about a posted tx. `failed`: it ran in a block and failed; `dropped`: evicted unrun. */
-  tx: "pending" | "finalized" | "failed" | "dropped";
+  /** What GET /api/tx/{id} says about a posted tx. `failed`: it ran in a block and failed; `dropped`: evicted unrun; `gone`: 404 (pruned, or never held). */
+  tx: "pending" | "finalized" | "failed" | "dropped" | "gone";
+  /** The executed nonce /api/account reports for accounts without a fixture (default 0); `down`: it answers 500. */
+  accountNonce?: number | "down";
   /** The fee /api/tx/{id} reports for a final tx (default: half its max fee). */
   fee?: string;
   /** /api/name and /api/params quote prices (drops), or leave them out. */
@@ -126,6 +130,19 @@ const DRAIN = { id: 9, kind: { type: "treasury_spend", to: MALLORY, amount: (10_
 // review-r2-clients-1: a kind with a number JSON can't carry exactly.
 const HUGE = JSON.parse(`{"id":12,"kind":{"type":"distribution","distribution_id":1152921504606846976,"merkle_root":"${"ab".repeat(32)}","total":"5","claim_until":50},"title":"Big id","url":"","summary":"distribute 5 drops","status":"voting","voting_end":99}`);
 const gov = { twoFaced: false };
+/** Section 8: the account nonce /api/proof proves, and at which block; `witness`: what the witness reports. */
+const proven: { at?: { nonce: number; height: number }; witness: { height: number; root?: string } } = { witness: { height: 10 } };
+const hex = (b: Uint8Array) => Buffer.from(b).toString("hex");
+/** An account record (balance 5 drops, `nonce`, no keys) as /api/proof serves it, under a one-leaf tree's root. */
+function accountProof(address: string, nonce: number, height: number) {
+  const value = new Uint8Array(20);
+  const v = new DataView(value.buffer);
+  v.setBigUint64(0, 5n, true);
+  v.setBigUint64(8, BigInt(nonce), true);
+  const key = new TextEncoder().encode(address);
+  const [k, h] = [keyHash(NAMESPACES.ACCOUNTS, key), valueHash(value)];
+  return { namespace: NAMESPACES.ACCOUNTS, key: hex(key), value: hex(value), proof: { siblings: [], leaf: { key: hex(k), value: hex(h) } }, root: hex(leafHash(k, h)), height, block_hash: "00".repeat(32) };
+}
 const fake: Server = createServer((req, res) => {
   let body = "";
   req.on("data", (c) => (body += c));
@@ -146,7 +163,7 @@ const fake: Server = createServer((req, res) => {
     if (tx) {
       const t = posted.find((p) => txId(p) === tx[1]);
       if (tx[1] === "cd".repeat(32)) return reply(200, { id: tx[1], status: "finalized", summary: "boo1x sent 1 FANG to bob.boo", memo: INJECTION, public_key: "01".repeat(1952), type: "evil-type", explorer: "https://evil.example" });
-      if (!t) return reply(404, { error: "tx not found" });
+      if (!t || mode.tx === "gone") return reply(404, { error: "tx not found" });
       // As node/src/api.rs answers a tx dropped from its mempool: no tx fields, `dropped`.
       if (mode.tx === "dropped") return reply(200, { id: tx[1], status: "failed", dropped: true, error: "evicted from a full mempool by a transaction with a higher tip", height: 10, summary: "Transaction dropped without running" });
       const charged = mode.fee ?? (BigInt(t.fee) / 2n).toString();
@@ -158,7 +175,8 @@ const fake: Server = createServer((req, res) => {
     const nextNonce = (a: string) => posted.filter((p) => p.from === a).length;
     // Like node/src/api.rs: any address answers; without an account, with a zero balance and nonce
     // and the address's own key (`keys_of` lists it for every address).
-    if (path.startsWith("/account/")) return reply(200, { account: { address: path.slice(9), name: null }, balance: "0", nonce: 0, next_nonce: nextNonce(path.slice(9)), keys: [{ key_id: "ee".repeat(32), label: "original key", role: { type: "owner" }, added_at: 0, spent_this_period: "0", window_start: 0 }], recent_txs: [] });
+    if (path.startsWith("/account/") && mode.accountNonce === "down") return reply(500, { error: "busy" });
+    if (path.startsWith("/account/")) return reply(200, { account: { address: path.slice(9), name: null }, balance: "0", nonce: mode.accountNonce ?? 0, next_nonce: nextNonce(path.slice(9)), keys: [{ key_id: "ee".repeat(32), label: "original key", role: { type: "owner" }, added_at: 0, spent_this_period: "0", window_start: 0 }], recent_txs: [] });
     if (path === `/staking/${stakingFor}`) return reply(200, staking());
     if (path === "/proposal/1") return reply(200, { id: 1, kind: { type: "text" }, title: "Plant garlic", url: "https://forum.example/p/1", status: "voting" });
     // gap-7-6: proposal #9 is a 10,000,000 FANG treasury spend to Mallory. `gov.summaryLie`: the
@@ -172,6 +190,9 @@ const fake: Server = createServer((req, res) => {
     if (path === "/name/bob.boo" || path === "/name/bob") return reply(200, { name: "bob.boo", status: "active", available: false, owner: { address: BOB, name: "bob.boo" }, ...mode.prices });
     if (path.startsWith("/name/")) return reply(200, { name: `${path.slice(6)}.boo`, status: "available", available: true, ...mode.prices });
     if (path.startsWith("/search/")) return reply(200, { type: "tx", id: "cd".repeat(32) });
+    // An account record's Merkle proof (a one-leaf tree), for section 8.
+    const proof = path.match(/^\/proof\/1\/([0-9a-f]+)$/);
+    if (proof && proven.at) return reply(200, accountProof(Buffer.from(proof[1], "hex").toString(), proven.at.nonce, proven.at.height));
     if (path.startsWith("/hunts")) return reply(200, [{ id: 1, title: `${INJECTION}‮\u0007`, amount_display: "10 FANG", issue_url: "https://github.com/a/b/issues/1", funders: { [BOB]: "10" } }]);
     return reply(404, { error: `fake node: no route for ${path}` });
   });
@@ -273,11 +294,23 @@ let ts = r.json();
 assert.deepEqual([ts.status, ts.dropped, ts.valid_until, ts.dropped_at_height, ts.block], ["dropped", true, droppedTx.valid_until, 10, undefined], r.text);
 assert.match(ts.next, /dropped it from its mempool without running it, so nothing was charged, but another node may still include it until block \d+.*Do NOT send it again before then/);
 assert.doesNotMatch(r.text, /fee was charged|"failed"/);
-// Once the chain is past its valid_until (as the node says), it's dead: said so, with the caveat.
+// Once the chain is past its valid_until (as the node says) with its nonce unused, it's dead:
+// said so, with the caveat.
 mode.status = { height: droppedTx.valid_until + 1 };
 r = await s.call("tx_status", { tx_id: txId(droppedTx) });
 ts = r.json();
-assert.ok(ts.status === "dropped" && ts.node_height === droppedTx.valid_until + 1 && /past its valid_until.*can never execute and nothing was charged.*check the height with another node/.test(ts.next), r.text);
+assert.ok(ts.status === "expired" && ts.node_height === droppedTx.valid_until + 1 && ts.dropped_at_height === 10 && /dropped it.*past its valid_until.*nonce \d+ still unused.*can never execute and nothing was charged.*check the height and the account's nonce with another node/.test(ts.next), r.text);
+// review-r3-wallet-1: but once its nonce ran (another node included it after this one dropped
+// it, or a tx with its nonce did), it isn't "nothing was charged": it can't run again, and may have gone through.
+for (const height of [droppedTx.valid_until - 1, droppedTx.valid_until + 1]) {
+  mode.status = { height };
+  mode.accountNonce = droppedTx.nonce + 1;
+  r = await s.call("tx_status", { tx_id: txId(droppedTx) });
+  ts = r.json();
+  assert.ok(ts.status === "nonce_used" && ts.account_nonce === droppedTx.nonce + 1 && /can never execute again.*included by another node after this one dropped it.*Do NOT send it again until you know whether it was this one: if it was, the payment already went through/.test(ts.next), r.text);
+  assert.doesNotMatch(ts.next, /nothing was charged|isn't confirmed yet|may still include/, r.text);
+}
+mode.accountNonce = undefined;
 mode.status = {};
 // Failed in a block: final, its fee charged, with the block it ran in.
 mode.tx = "failed";
@@ -298,6 +331,52 @@ ts = r.json();
 assert.ok(!r.error && ts.status === "unknown" && Number.isSafeInteger(ts.valid_until) && /doesn't know this tx, but this MCP signed it.*Do NOT send it again before then/.test(ts.next), r.text);
 r = await s.call("tx_status", { tx_id: "ef".repeat(32) });
 assert.ok(r.error && /not found/.test(r.text), `a tx this MCP never signed is just unknown to the node: ${r.text}`);
+// review-r3-wallet-1: the next tx this MCP signs takes the refused one's nonce and runs. Then the
+// refused one can never run: tx_status says so, and points at the one that did.
+mode.post = "accept";
+mode.tx = "finalized";
+r = await s.call("send", { to: "bob.boo", amount: "0.1" });
+assert.ok(!r.error, r.text);
+const taker = posted.at(-1)!;
+const refusedNonce = taker.nonce;
+mode.accountNonce = refusedNonce + 1;
+r = await s.call("tx_status", { tx_id: unknownId });
+ts = r.json();
+assert.ok(!r.error && ts.status === "nonce_used" && ts.nonce === refusedNonce && new RegExp(`another tx with the same nonce, ${txId(taker)}, which this node shows finalized in block 11: that one used the nonce, so this one never ran and nothing was charged for it`).test(ts.next), r.text);
+// A finalized payment whose block this node no longer holds (a pruning validator, days later, or a
+// fast-synced node): never "isn't confirmed yet", and no guard that expires at valid_until.
+mode.tx = "gone";
+mode.accountNonce = taker.nonce + 5;
+mode.status = { height: taker.valid_until + 200_000, history_from: taker.valid_until + 100_000 };
+r = await s.call("tx_status", { tx_id: txId(taker) });
+ts = r.json();
+assert.ok(!r.error && ts.status === "nonce_used" && ts.node_height === taker.valid_until + 200_000 && ts.history_from === taker.valid_until + 100_000, r.text);
+assert.match(ts.next, new RegExp(`doesn't know this tx, but ${taker.from}'s nonce ${taker.nonce} has been used.*can never execute again.*only holds blocks from #${taker.valid_until + 100_000} on, so it may have pruned.*archive node.*Do NOT send it again until you know whether it was this one: if it was, the payment already went through`));
+assert.doesNotMatch(ts.next, /isn't confirmed yet|may still include|nothing was charged/, r.text);
+// An archive node (every block it could have run in) that doesn't have it: another tx most likely took the nonce.
+mode.status = { height: taker.valid_until + 200_000, history_from: 1 };
+r = await s.call("tx_status", { tx_id: txId(taker) });
+ts = r.json();
+assert.ok(ts.status === "nonce_used" && /holds every block it could have run in \(from #1\) and has no record of it, so most likely another tx used that nonce/.test(ts.next), r.text);
+// Past valid_until with the nonce unused: it never ran and never can.
+mode.accountNonce = taker.nonce;
+r = await s.call("tx_status", { tx_id: txId(taker) });
+ts = r.json();
+assert.ok(ts.status === "expired" && /past its valid_until \(\d+\), with .*nonce \d+ still unused: if that's right, it can never execute and nothing was charged/.test(ts.next), r.text);
+// At its valid_until with the nonce unused: in flight, until then.
+mode.status = { height: taker.valid_until };
+r = await s.call("tx_status", { tx_id: txId(taker) });
+ts = r.json();
+assert.ok(ts.status === "unknown" && new RegExp(`may still include it until block ${taker.valid_until} \\(the chain is at block ${taker.valid_until}\\).*Do NOT send it again before then`).test(ts.next), r.text);
+// Past valid_until, but the node won't say the account's nonce: it may have run, so no all-clear.
+mode.status = { height: taker.valid_until + 1 };
+mode.accountNonce = "down";
+r = await s.call("tx_status", { tx_id: txId(taker) });
+ts = r.json();
+assert.ok(ts.status === "unknown" && /couldn't read whether .* was used.*may still be in flight .* or have run already.*Do NOT send it again/.test(ts.next), r.text);
+assert.doesNotMatch(ts.next, /nothing was charged|can never execute/, r.text);
+mode.accountNonce = undefined;
+mode.status = {};
 mode.post = "accept";
 mode.tx = "finalized";
 // Opening a new account burns the creation fee on top: counted too.
@@ -557,6 +636,63 @@ assert.deepEqual(unstakeAction(), { type: "undelegate", validator: BOB, shares: 
 assert.match(r.json().unbonding, /^all 100000000000 shares/);
 await s.close();
 console.log("✓ unstaking an amount signs the amount (the chain converts it): a node lying about the stake's value or its shares can't turn it into the whole stake");
+
+// ---- 8. tx_status with BLOCKULA_WITNESSES: the account's nonce is proven, not the node's word ----
+
+// A witness: another node of the chain, which confirms (or not) the state root of a block.
+const witness: Server = createServer((req, res) => {
+  const reply = (code: number, v: unknown) => res.writeHead(code, { "content-type": "application/json" }).end(JSON.stringify(v));
+  const path = (req.url ?? "").replace(/^\/api/, "");
+  if (path === "/status") return reply(200, { chain_id: "fake-chain", genesis_hash: G, address_prefix: "boo", height: proven.witness.height });
+  const b = path.match(/^\/block\/(\d+)$/);
+  if (b && proven.at && Number(b[1]) === proven.at.height) return reply(200, { height: proven.at.height, state_root: proven.witness.root ?? "", hash: "00".repeat(32) });
+  return reply(404, { error: "not found" });
+});
+await new Promise<void>((r) => witness.listen(0, "127.0.0.1", r));
+resetLedger();
+s = await server({ BLOCKULA_WITNESSES: `http://127.0.0.1:${(witness.address() as AddressInfo).port}` });
+const agent = (await s.call("wallet_info")).json().address;
+mode.tx = "finalized";
+mode.post = "accept";
+r = await s.call("send", { to: BOB, amount: "0.1" });
+assert.ok(!r.error, r.text);
+const paid = posted.at(-1)!;
+assert.equal(paid.from, agent);
+mode.tx = "gone";
+const prove = (nonce: number, height: number, head: number, root = accountProof(agent, nonce, height).root) => {
+  proven.at = { nonce, height };
+  proven.witness = { height: head, root };
+  mode.status = { height: head };
+};
+// Proven: at a block past valid_until its nonce was still unused. It never ran: no caveat needed.
+prove(paid.nonce, paid.valid_until + 45, paid.valid_until + 50);
+mode.accountNonce = paid.nonce + 9; // the node's unproven word isn't read
+r = await s.call("tx_status", { tx_id: txId(paid) });
+ts = r.json();
+assert.ok(!r.error && ts.status === "expired" && ts.proven_by_witnesses === 1 && ts.account_nonce_proven_at === paid.valid_until + 45 && ts.account_nonce === paid.nonce, r.text);
+assert.match(ts.next, new RegExp(`at block ${paid.valid_until + 45}, past its valid_until \\(${paid.valid_until}\\), ${agent}'s nonce ${paid.nonce} was still unused \\(proven at block ${paid.valid_until + 45}: its state root confirmed by 1 other node\\): it never ran, can never execute, and nothing was charged`));
+assert.doesNotMatch(ts.next, /if that's right|check the height/, r.text);
+// Proven used: it (or a tx with its nonce) ran.
+prove(paid.nonce + 1, 200_000, 200_005);
+r = await s.call("tx_status", { tx_id: txId(paid) });
+ts = r.json();
+assert.ok(ts.status === "nonce_used" && /has been used \(the account has run \d+ txs \(proven at block 200000: its state root confirmed by 1 other node\)\), so this tx can never execute again/.test(ts.next), r.text);
+// A witness that disagrees about the state root, or a proof too old for the heads: no all-clear,
+// and not the node's unproven word either.
+for (const [why, args] of [["a witness disagrees", [paid.nonce, paid.valid_until + 45, paid.valid_until + 50, "ff".repeat(32)]], ["a stale proof", [paid.nonce, paid.valid_until + 1, paid.valid_until + 500]]] as const) {
+  prove(...(args as [number, number, number, string?]));
+  r = await s.call("tx_status", { tx_id: txId(paid) });
+  ts = r.json();
+  assert.ok(!r.error && ts.status === "unknown" && typeof ts.proof_error === "string" && /couldn't read a proven nonce for .*may still be in flight .* or have run already.*Do NOT send it again/.test(ts.next), `${why}: ${r.text}`);
+  assert.doesNotMatch(ts.next, /nothing was charged|can never execute/, `${why}: ${r.text}`);
+}
+await s.close();
+witness.close();
+witness.closeAllConnections();
+mode.accountNonce = undefined;
+mode.status = {};
+mode.tx = "finalized";
+console.log("✓ tx_status reads a signed tx the node can't show against the account's nonce: executed nonces are never 'unconfirmed', 'expired' needs the nonce unused past valid_until, and with witnesses it's proven, not the node's word");
 
 fake.close();
 fake.closeAllConnections();
