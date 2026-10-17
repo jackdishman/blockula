@@ -6,16 +6,21 @@
 # have no file here are left alone.
 #   deploy/github/apply-rulesets.sh             dry run: show the differences, change nothing
 #   deploy/github/apply-rulesets.sh --apply     make GitHub match the files
-# Needs gh logged in as a repository admin, and jq. BLOCKULA_REPO overrides the repository.
-# Only the maintainer runs this, deliberately: CI never does, and no workflow token can.
+#   deploy/github/apply-rulesets.sh --check     like the dry run, but exit 1 if anything differs
+# Needs gh logged in as a repository admin (--check: any token that can read the repository), and
+# jq. BLOCKULA_REPO overrides the repository. Only the maintainer applies, deliberately: no
+# workflow token can. CI only checks (.github/workflows/github-settings.yml, daily), with a
+# read-only token, which GitHub doesn't show bypass actors to: then they aren't compared.
 set -euo pipefail
 cd "$(dirname "$0")"
 repo=${BLOCKULA_REPO:-jackdishman/blockula}
 apply=0
+check=0
 case "${1:-}" in
   "") ;;
   --apply) apply=1 ;;
-  *) echo "usage: deploy/github/apply-rulesets.sh [--apply]" >&2; exit 2 ;;
+  --check) check=1 ;;
+  *) echo "usage: deploy/github/apply-rulesets.sh [--apply | --check]" >&2; exit 2 ;;
 esac
 command -v gh > /dev/null || { echo "Needs the GitHub CLI (gh), logged in as a repository admin." >&2; exit 1; }
 command -v jq > /dev/null || { echo "Needs jq." >&2; exit 1; }
@@ -36,7 +41,14 @@ for f in "${files[@]}"; do
   id=$(printf '%s' "$live_list" | jq -r --arg n "$name" '[.[] | select(.name == $n)] | if length > 1 then error("two rulesets named \($n)") else (.[0].id // "") end')
   want=$(jq -S "$norm" "$f")
   if [ -n "$id" ]; then
-    have=$(gh api "repos/$repo/rulesets/$id" | jq -S "$norm")
+    live=$(gh api "repos/$repo/rulesets/$id")
+    have=$(printf '%s' "$live" | jq -S "$norm")
+    if [ $check = 1 ] && ! printf '%s' "$live" | jq -e 'has("bypass_actors")' > /dev/null; then
+      # GitHub shows bypass actors only to tokens that can write the ruleset.
+      echo "· $name: bypass actors aren't visible to this token, so they aren't compared"
+      have=$(printf '%s' "$have" | jq -S 'del(.bypass_actors)')
+      want=$(printf '%s' "$want" | jq -S 'del(.bypass_actors)')
+    fi
     if [ "$have" = "$want" ]; then
       echo "✓ $name (ruleset $id) matches $f"
       continue
@@ -54,6 +66,10 @@ for f in "${files[@]}"; do
     echo "  → applied"
   fi
 done
+if [ $changed = 1 ] && [ $check = 1 ]; then
+  echo "✗ $repo's rulesets differ from deploy/github (above). The maintainer reconciles them: deploy/github/apply-rulesets.sh, then --apply (docs/OPERATIONS.md \"Repository settings\")." >&2
+  exit 1
+fi
 if [ $changed = 1 ] && [ $apply = 0 ]; then
   echo "Dry run: nothing changed. Re-run with --apply to make $repo match these files."
 fi

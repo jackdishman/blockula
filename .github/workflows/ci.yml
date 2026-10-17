@@ -59,9 +59,10 @@ jobs:
       - run: npm run build -w @blockula/sdk && npm run build -w @blockula/mcp
       - name: 4 validators + full node + SDK e2e + CLI
         run: bash scripts/local-testnet.sh
-      # The validator's release check (docs/OPERATIONS.md "Verifying a release"), with the binary
-      # local-testnet.sh just built: a release can't vouch for its own install.sh (audit F49).
-      - name: Release verification runbook (real blockula release sign|verify)
+      # The install, upgrade, patch and key-rotation runbooks in docs/OPERATIONS.md, pasted as
+      # written, with the binary local-testnet.sh just built: each fails closed, and a release
+      # can't vouch for itself (audit F49).
+      - name: Release runbooks as pasted (real blockula release install|sign|verify)
         run: bash scripts/test-release-runbook.sh
 
   web:
@@ -170,6 +171,10 @@ jobs:
         run: node scripts/release-sig.mjs selftest
       - name: install.sh verification policy (offline fake release)
         run: bash scripts/test-install.sh
+      # What the release signer checks before signing: install.sh, genesis and checkpoint files
+      # are the reviewed commit's own (audit F49 round 3).
+      - name: Release files against the tagged source (scripts/check-release-files.sh)
+        run: bash scripts/test-release-files.sh
       # The fuzz job runs in public: crashes stay out of its log and artifacts (supply-chain-B-1).
       - name: Fuzz crashes stay private (workflow, open findings)
         run: bash scripts/check-fuzz-workflow.sh
