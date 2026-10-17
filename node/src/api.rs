@@ -1811,6 +1811,10 @@ fn contribution_profile(v: &ReadView, addr: &str) -> Value {
         "sybil": p.sybils.get(addr).map(|s| json!({ "at": s.at, "by": label(v, &s.by), "reason": s.reason })),
         "vouched_by": p.vouches.get(addr).map(|x| json!({ "voucher": label(v, &x.voucher), "at": x.at, "bond_display": fmt_fang(x.bond) })),
         "vouching_for": v.vouching_for(addr, ACCOUNT_LIST_LIMIT).into_iter().filter_map(|to| p.vouches.get(&to).map(|x| json!({ "account": label(v, &to), "at": x.at, "unlocks_at": x.at + st.params.poc.vouch_lock_blocks }))).collect::<Vec<_>>(),
+        // Withdrawn vouches whose voucher still answers for the vouchee (`poc::DroppedVouch`):
+        // the bond is held until the lock is over (and while a FlagSybil proposal names it).
+        "vouches_withdrawn": st.dropped_vouches_of(addr).into_iter().filter(|(_, d)| d.bond > 0).take(ACCOUNT_LIST_LIMIT).map(|(by, d)| json!({ "voucher": label(v, &by), "dropped_at": d.dropped_at, "held_until": d.at + st.params.poc.vouch_lock_blocks })).collect::<Vec<_>>(),
+        "vouch_bonds_held": p.dropped_vouches.iter().filter(|(k, d)| d.bond > 0 && k.rsplit_once('/').is_some_and(|(_, by)| by == addr)).take(ACCOUNT_LIST_LIMIT).map(|(k, d)| json!({ "account": label(v, k.split_once('/').map(|(to, _)| to).unwrap_or_default()), "bond_display": fmt_fang(d.bond), "dropped_at": d.dropped_at, "held_until": d.at + st.params.poc.vouch_lock_blocks })).collect::<Vec<_>>(),
         "juror": p.jurors.get(addr).map(|r| json!({ "bond_display": fmt_fang(r.bond), "active": r.active, "served": r.served, "joined_at": r.joined_at })),
         "claims": v.ids(ix::CLAIMANT, addr, true, 50).into_iter().filter_map(|id| p.claims.get(&id)).map(|cl| claim_json(v, cl)).collect::<Vec<_>>(),
         "next_claim_bond": st.claim_bond(addr).to_string(),

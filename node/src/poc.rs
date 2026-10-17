@@ -173,6 +173,30 @@ pub struct Vouch {
     pub at: u64,
 }
 
+/// A withdrawn vouch, kept while it still counts (audits xcut-economic-opus-2 and
+/// review-fix-poc-2), under [`vouch_key`]. Until the vouch's lock would have ended, and while a
+/// `FlagSybil` proposal names the vouchee, its voucher still answers for the vouchee: the bond
+/// stays held (`bond`) and its slot taken, and a sybil flag on the vouchee costs the voucher the
+/// bond and `SYBIL_VOUCHER_SOUL` as if the vouch were live. And the two stay tied for any Séance
+/// whose cutoff came before the withdrawal (`State::conflicted`), so dropping a vouch once a seed
+/// is public changes nobody's seat. Epoch boundaries hand back bonds that are free and forget
+/// records no Séance can need (`State::sweep_dropped_vouches`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+pub struct DroppedVouch {
+    /// Still held (0 once handed back).
+    #[serde(with = "u64_str")]
+    pub bond: u64,
+    /// When the vouch was made (its lock runs `vouch_lock_blocks` from here), and withdrawn.
+    pub at: u64,
+    pub dropped_at: u64,
+}
+
+/// `vouchee/voucher`, the key of a [`DroppedVouch`] (addresses never contain `/`), so a vouchee's
+/// records are one range.
+pub fn vouch_key(vouchee: &str, voucher: &str) -> String {
+    format!("{vouchee}/{voucher}")
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Sybil {
     pub at: u64,
@@ -346,6 +370,8 @@ pub struct Poc {
     pub souls: TMap<String, Soul>,
     /// Vouchee → the vouch.
     pub vouches: TMap<String, Vouch>,
+    /// Withdrawn vouches that still count, by [`vouch_key`].
+    pub dropped_vouches: TMap<String, DroppedVouch>,
     pub sybils: TMap<String, Sybil>,
     pub claims: TMap<u64, Claim, OpenClaims>,
     /// `repo#pr` → claim id, so a PR is claimed once (cleared when validators reject it).
@@ -370,7 +396,7 @@ impl Poc {
     /// False until Proof of Contribution is first used; until then the end-of-block step
     /// (Séances) doesn't run.
     pub fn is_active(&self) -> bool {
-        !(self.repos.is_empty() && self.souls.is_empty() && self.vouches.is_empty() && self.sybils.is_empty() && self.claims.is_empty() && self.jurors.is_empty() && self.grants.is_empty() && self.handles.is_empty() && self.seances.is_empty())
+        !(self.repos.is_empty() && self.souls.is_empty() && self.vouches.is_empty() && self.dropped_vouches.is_empty() && self.sybils.is_empty() && self.claims.is_empty() && self.jurors.is_empty() && self.grants.is_empty() && self.handles.is_empty() && self.seances.is_empty())
     }
 
     pub fn has_open_claims(&self, account: &str) -> usize {
@@ -387,6 +413,7 @@ pub struct PocJournal {
     repos: JMap<String, u64>,
     souls: JMap<String, Soul>,
     vouches: JMap<String, Vouch>,
+    dropped_vouches: JMap<String, DroppedVouch>,
     sybils: JMap<String, Sybil>,
     claims: JMap<u64, Claim>,
     claim_by_pr: JMap<String, u64>,
@@ -402,6 +429,7 @@ impl PocJournal {
         self.repos.absorb(o.repos);
         self.souls.absorb(o.souls);
         self.vouches.absorb(o.vouches);
+        self.dropped_vouches.absorb(o.dropped_vouches);
         self.sybils.absorb(o.sybils);
         self.claims.absorb(o.claims);
         self.claim_by_pr.absorb(o.claim_by_pr);
@@ -418,6 +446,7 @@ impl PocJournal {
         self.repos.restore(&mut p.repos);
         self.souls.restore(&mut p.souls);
         self.vouches.restore(&mut p.vouches);
+        self.dropped_vouches.restore(&mut p.dropped_vouches);
         self.sybils.restore(&mut p.sybils);
         self.claims.restore(&mut p.claims);
         self.claim_by_pr.restore(&mut p.claim_by_pr);
@@ -514,6 +543,25 @@ impl State {
         (self.soul_of(account, height) / (10 * SOUL)).min(10) as usize
     }
 
+    /// The vouches `voucher` answers for: its live ones, and the withdrawn ones whose bond is
+    /// still held ([`DroppedVouch`]). They count against [`State::max_vouches`].
+    pub fn vouches_held_by(&self, voucher: &str) -> usize {
+        let live = self.poc.vouches.values().filter(|v| v.voucher == voucher).count();
+        live + self.poc.dropped_vouches.iter().filter(|(k, d)| d.bond > 0 && k.rsplit_once('/').is_some_and(|(_, by)| by == voucher)).count()
+    }
+
+    /// A vouchee's withdrawn vouches that still count: (voucher, record).
+    pub fn dropped_vouches_of(&self, vouchee: &str) -> Vec<(String, DroppedVouch)> {
+        self.poc.dropped_vouches.range(format!("{vouchee}/")..format!("{vouchee}0")).filter_map(|(k, d)| Some((k.rsplit_once('/')?.1.to_string(), d.clone()))).collect()
+    }
+
+    /// Whether a `FlagSybil` proposal naming `account` is being voted on or waiting out its
+    /// timelock (its account was resolved to an address when it was proposed).
+    pub fn sybil_flag_proposed(&self, account: &str) -> bool {
+        let g = &self.governance;
+        g.open_proposals.iter().filter_map(|id| g.proposals.get(id)).any(|p| matches!(&p.kind, ProposalKind::FlagSybil { account: a, .. } if a == account))
+    }
+
     /// The bond the next claim from `account` costs.
     pub fn claim_bond(&self, account: &str) -> u64 {
         CLAIM_BOND.saturating_mul(1 + self.poc.has_open_claims(account) as u64)
@@ -586,6 +634,35 @@ impl State {
         let key = account.to_string();
         self.pj(j).grants.touch(&self.poc.grants, &key);
         self.poc.grants.entry(key).or_default()
+    }
+
+    fn set_dropped_vouch(&mut self, j: &mut Journal, key: &str, d: Option<DroppedVouch>) {
+        let key = key.to_string();
+        self.pj(j).dropped_vouches.touch(&self.poc.dropped_vouches, &key);
+        match d {
+            Some(d) => self.poc.dropped_vouches.insert(key, d),
+            None => self.poc.dropped_vouches.remove(&key),
+        };
+    }
+
+    /// Withdraws the live vouch for `to`. Its voucher answers for `to` until the lock would have
+    /// ended, and while a `FlagSybil` proposal names `to`: the bond stays held until then. Either
+    /// way the withdrawal is recorded, so the two stay tied for the Séances whose draw could be
+    /// known when it happened ([`DroppedVouch`]).
+    fn drop_vouch(&mut self, j: &mut Journal, to: &str, height: u64) {
+        let Some(v) = self.poc.vouches.get(to).cloned() else { return };
+        let key = vouch_key(to, &v.voucher);
+        let mut d = self.poc.dropped_vouches.get(&key).cloned().unwrap_or(DroppedVouch { bond: 0, at: v.at, dropped_at: height });
+        if height < v.at.saturating_add(self.params.poc.vouch_lock_blocks) || self.sybil_flag_proposed(to) {
+            d.bond += v.bond;
+            d.at = d.at.max(v.at);
+        } else {
+            self.j_credit(j, &v.voucher, v.bond);
+        }
+        d.dropped_at = height;
+        self.set_dropped_vouch(j, &key, Some(d));
+        self.pj(j).vouches.touch(&self.poc.vouches, to);
+        self.poc.vouches.remove(to);
     }
 
     fn set_claim_by_pr(&mut self, j: &mut Journal, key: &str, id: Option<u64>) {
@@ -723,9 +800,9 @@ impl State {
                 if self.soul_of(&to, height) > 0 || self.poc.claims.values().any(|c| c.claimant == to && c.status == ClaimStatus::Scored) {
                     bail!("{} isn't a newcomer (they already have Soul or judged work)", short(&to));
                 }
-                let mine = self.poc.vouches.values().filter(|v| v.voucher == sender).count();
-                if mine >= self.max_vouches(sender, height) {
-                    bail!("your Soul allows {} active vouches (one per 10 Soul)", self.max_vouches(sender, height));
+                // A withdrawn vouch still takes its slot while its bond is held (`DroppedVouch`).
+                if self.vouches_held_by(sender) >= self.max_vouches(sender, height) {
+                    bail!("your Soul allows {} active vouches (one per 10 Soul; a withdrawn vouch counts until its lock is over)", self.max_vouches(sender, height));
                 }
                 self.j_debit(j, sender, VOUCH_BOND)?;
                 self.pj(j).vouches.touch(&self.poc.vouches, &to);
@@ -745,25 +822,14 @@ impl State {
                         bail!("this vouch is locked until block {unlock}");
                     }
                 }
-                // A vouch keeps its two accounts off each other's juries (`conflicted`, checked
-                // when a Séance opens), and a Séance's seed is public an epoch before it opens, so
-                // dropping the vouch once the draw is known would seat a juror on a claim it
-                // mustn't judge (audit F53). So when one side has a claim open, the other, if
-                // it's in the jury pool, becomes new to the draw, as if it had just joined
-                // (`seance_cutoff`): it sits on no Séance whose seed could have been known when
-                // the vouch went. The vouch itself can always go, so a newcomer can decline an
-                // unwanted one even with a claim open (a lock would let a voucher force its cut).
-                for (who, other) in [(&to, &v.voucher), (&v.voucher, &to)] {
-                    if self.poc.has_open_claims(who) > 0 && self.poc.jurors.contains_key(other.as_str()) {
-                        self.pj(j).jurors.touch(&self.poc.jurors, other.as_str());
-                        if let Some(r) = self.poc.jurors.get_mut(other.as_str()) {
-                            r.joined_at = height;
-                        }
-                    }
-                }
-                self.pj(j).vouches.touch(&self.poc.vouches, &to);
-                self.poc.vouches.remove(&to);
-                self.j_credit(j, &v.voucher, v.bond);
+                // The vouch itself can always go, so a newcomer can decline an unwanted one even
+                // with a claim open (a lock would let a voucher force its cut). What it doesn't
+                // undo (`DroppedVouch`): the voucher answers for the newcomer until the lock is
+                // over (audit xcut-economic-opus-2: otherwise a sybil drops its vouch before the
+                // flag and its voucher loses nothing), and the two stay off each other's claims
+                // in any Séance whose seed could be known when it went (audits F53 and
+                // review-fix-poc-2), without moving anyone's seat.
+                self.drop_vouch(j, &to, height);
             }
             Action::FlagSybil { account, reason } => {
                 need_admin("flag sybils")?;
@@ -1127,7 +1193,9 @@ impl State {
             self.poc.jurors.remove(who);
             self.to_pool(j, r.bond);
         }
-        // Whoever vouched for it loses the bond and Soul; vouches it gave are void.
+        // Whoever vouched for it loses the bond and Soul; vouches it gave are void. That covers
+        // a vouch withdrawn while its voucher still answers for it (`DroppedVouch`, audit
+        // xcut-economic-opus-2): its bond is still held.
         let touched: Vec<String> = self.poc.vouches.iter().filter(|(to, v)| *to == who || v.voucher == who).map(|(to, _)| to.clone()).collect();
         for to in touched {
             let v = self.poc.vouches.get(&to).cloned().unwrap();
@@ -1137,6 +1205,20 @@ impl State {
             if to == who {
                 self.add_soul(j, &v.voucher, -(SYBIL_VOUCHER_SOUL as i64), height);
             }
+        }
+        let dropped: Vec<(String, DroppedVouch)> = self.poc.dropped_vouches.iter().filter(|(k, _)| k.split_once('/').is_some_and(|(to, by)| to == who || by == who)).map(|(k, d)| (k.clone(), d.clone())).collect();
+        for (key, d) in dropped {
+            self.set_dropped_vouch(j, &key, None);
+            self.to_pool(j, d.bond);
+            if d.bond > 0 && key.split_once('/').is_some_and(|(to, _)| to == who) {
+                self.add_soul(j, key.rsplit_once('/').unwrap().1, -(SYBIL_VOUCHER_SOUL as i64), height);
+            }
+        }
+        // And its vouchers' cuts of its rewards go back with its own (as `exec_reject_claim`).
+        let mine: BTreeSet<u64> = self.poc.claims.values().filter(|c| c.claimant == who).map(|c| c.id).collect();
+        let cuts: Vec<(String, u64)> = self.poc.grants.iter().flat_map(|(a, gs)| gs.values().filter(|g| matches!(g.source, GrantSource::Vouch { claim_id } if mine.contains(&claim_id))).map(move |g| (a.clone(), g.id))).collect();
+        for (voucher, g) in cuts {
+            self.claw_back(j, &voucher, Some(g), height);
         }
     }
 
@@ -1215,9 +1297,36 @@ impl State {
             if self.poc.open_seance.is_none() && self.next_seance_height(height) == height {
                 self.open_seance(height, self.params.epoch_of(height));
             }
+            self.sweep_dropped_vouches(height);
         }
         if self.poc.next_seance_at <= height {
             self.poc.next_seance_at = self.next_seance_height(height + 1);
+        }
+    }
+
+    /// At an epoch boundary (after any Séance opens): hands back the held bonds of withdrawn
+    /// vouches whose lock is over and whose vouchee no `FlagSybil` proposal names, and forgets
+    /// the records no Séance can need any more (every later opening's cutoff is after them).
+    fn sweep_dropped_vouches(&mut self, height: u64) {
+        if self.poc.dropped_vouches.is_empty() {
+            return;
+        }
+        let mut j = Journal::default();
+        let lock = self.params.poc.vouch_lock_blocks;
+        let next_cutoff = self.seance_cutoff(self.params.epoch_of(height) + 1);
+        let all: Vec<(String, DroppedVouch)> = self.poc.dropped_vouches.iter().map(|(k, d)| (k.clone(), d.clone())).collect();
+        for (key, d) in all {
+            let Some((to, voucher)) = key.rsplit_once('/') else { continue };
+            let mut next = d.clone();
+            if d.bond > 0 && height >= d.at.saturating_add(lock) && !self.sybil_flag_proposed(to) {
+                self.j_credit(&mut j, voucher, d.bond);
+                next.bond = 0;
+            }
+            if next.bond == 0 && next.dropped_at < next_cutoff {
+                self.set_dropped_vouch(&mut j, &key, None);
+            } else if next != d {
+                self.set_dropped_vouch(&mut j, &key, Some(next));
+            }
         }
     }
 
@@ -1236,12 +1345,15 @@ impl State {
         }
     }
 
-    /// Claims a juror mustn't judge: their own, and those of people they vouched for or who
-    /// vouched for them. A vouch dropped while one side has a claim open makes the other, if it's
-    /// in the jury pool, new to the draw (see `Unvouch`), so a conflict can't be dissolved once a
-    /// Séance's seed shows who would sit.
-    fn conflicted(&self, juror: &str, claimant: &str) -> bool {
-        juror == claimant || self.poc.vouches.get(claimant).is_some_and(|v| v.voucher == juror) || self.poc.vouches.get(juror).is_some_and(|v| v.voucher == claimant)
+    /// Claims a juror mustn't judge in a Séance with this `cutoff`: their own, and those of people
+    /// they vouch for or who vouch for them, counting vouches withdrawn at or after the cutoff
+    /// ([`DroppedVouch`]): a Séance's seed is public before it opens, so a conflict dropped then
+    /// would seat a juror on a claim it mustn't judge (audit F53), and ejecting the juror instead
+    /// would let the vouchee steer the draw (audit review-fix-poc-2). Conflicts are as of the
+    /// cutoff, when nobody could know the draw.
+    fn conflicted(&self, juror: &str, claimant: &str, cutoff: u64) -> bool {
+        let tied = |vouchee: &str, voucher: &str| self.poc.vouches.get(vouchee).is_some_and(|v| v.voucher == voucher) || self.poc.dropped_vouches.get(&vouch_key(vouchee, voucher)).is_some_and(|d| d.dropped_at >= cutoff);
+        juror == claimant || tied(claimant, juror) || tied(juror, claimant)
     }
 
     /// Opens a Séance at the end of `epoch` if claims of at least 2 people and `MIN_JURY` jurors
@@ -1283,7 +1395,7 @@ impl State {
                 break;
             }
             // Pairs of claims by two different people, neither of whom the juror is tied to.
-            let allowed: Vec<&(u64, String)> = claims.iter().filter(|(_, who)| !self.conflicted(&juror, who)).collect();
+            let allowed: Vec<&(u64, String)> = claims.iter().filter(|(_, who)| !self.conflicted(&juror, who, cutoff)).collect();
             let mut pairs = vec![];
             for (i, (a, who)) in allowed.iter().enumerate() {
                 pairs.extend(allowed[i + 1..].iter().filter(|(_, other)| other != who).map(|(b, _)| [*a, *b]));
@@ -2176,6 +2288,136 @@ mod scenarios {
         assert_eq!(jury(&t.c.state.poc.seances[&id]), jury(&a));
         conserved(&t.c.state);
         t.reopen_same_root();
+    }
+
+    /// Audit review-fix-poc-2: once the seed is public, the vouchee dropping its vouch can't take
+    /// its voucher off the upcoming Séance (or, with the pool at `MIN_JURY`, stop the Séance and
+    /// re-roll the seed): the conflict counts as of the cutoff, so the same jury sits with the
+    /// same pairs, and the voucher still never judges its vouchee's claim.
+    #[test]
+    fn an_unvouch_after_the_seed_changes_no_seat() {
+        let mut t = setup("vouchseat");
+        t.admin(Action::SetRepo { repo: "jackdishman/blockula".into(), weight: 10 }).unwrap();
+        let jurors: Vec<Keys> = (1..=3).map(k).collect();
+        for j in &jurors {
+            t.grant(j, 20);
+            t.tx(j, Action::JoinJury { bond: JUROR_BOND }).unwrap();
+        }
+        let (insider, newcomer) = (&jurors[0], k(10));
+        t.tx(insider, Action::Vouch { account: newcomer.address() }).unwrap();
+        t.link(&newcomer, "newcomer");
+        let mut claims = vec![t.claim(&newcomer, 1).unwrap()];
+        for (i, who) in [(11u8, "o1"), (12, "o2")] {
+            t.grant(&k(i), 1);
+            t.link(&k(i), who);
+            claims.push(t.claim(&k(i), i as u64).unwrap());
+        }
+        t.attest_all(&claims);
+        t.tx(&k(9), Action::FundPool { amount: 50 * DROPS_PER_FANG }).unwrap();
+        let at = {
+            let st = &t.c.state;
+            let mut at = st.next_seance_height(t.h() + 1);
+            while st.seance_cutoff(st.params.epoch_of(at)) <= t.h() {
+                at = st.next_seance_height(at + 1);
+            }
+            at
+        };
+        let epoch = t.c.state.params.epoch_of(at);
+        while t.h() < epoch * t.c.state.params.epoch_blocks {
+            t.blocks(1);
+        }
+        assert!(crate::beacon::value(&t.c.state, epoch).is_some() && t.h() < at, "the seed is public before the opening");
+        let draw = |mut st: State, from: u64| -> Option<Seance> {
+            for h in from..=at {
+                st.end_block(&BlockInfo { height: h, hash: "x", proposer: "p", view: h, parent_view: h - 1, skipped: &[], tx_bytes: 0 });
+            }
+            st.poc.open_seance.map(|id| st.poc.seances[&id].clone())
+        };
+        let a = draw(t.c.state.clone(), t.h() + 1).expect("a Séance opens");
+        assert_eq!(a.jurors.len(), 3);
+        let seat = &a.jurors[&insider.address()];
+        assert!(seat.pairs.iter().all(|p| !p.contains(&claims[0])), "the insider never judges its vouchee: {:?}", seat.pairs);
+        t.tx(&newcomer, Action::Unvouch { account: newcomer.address() }).unwrap();
+        assert!(!t.c.state.poc.vouches.contains_key(&newcomer.address()));
+        let jury = |s: &Seance| serde_json::to_value((&s.claims, &s.jurors)).unwrap();
+        assert_eq!(draw(t.c.state.clone(), t.h() + 1).map(|s| jury(&s)), Some(jury(&a)), "the same jury, the same pairs");
+        t.blocks(at - t.h());
+        let id = t.c.state.poc.open_seance.expect("the real chain opens it");
+        assert_eq!(jury(&t.c.state.poc.seances[&id]), jury(&a));
+        conserved(&t.c.state);
+        t.reopen_same_root();
+    }
+
+    /// Audit xcut-economic-opus-2: a sybil dropping its vouch (a newcomer may decline one any
+    /// time) doesn't get its voucher off the hook. Until the vouch's lock would have ended, the
+    /// bond stays held and the slot taken; a sybil flag then costs the voucher the bond and
+    /// `SYBIL_VOUCHER_SOUL`, and claws back its cut of the sybil's rewards. After the lock, with
+    /// no flag, the bond comes back at an epoch boundary.
+    #[test]
+    fn a_dropped_vouch_still_answers_for_its_sybil() {
+        let mut t = setup("sybilvouch");
+        t.admin(Action::SetRepo { repo: "jackdishman/blockula".into(), weight: 10 }).unwrap();
+        let (op, s1, s2, s3) = (k(5), k(6), k(7), k(8));
+        t.grant(&op, 25);
+        t.tx(&op, Action::Vouch { account: s1.address() }).unwrap();
+        t.tx(&op, Action::Vouch { account: s2.address() }).unwrap();
+        t.link(&s1, "s1");
+        let c = t.claim(&s1, 1).unwrap();
+        t.attest(c, true).unwrap();
+        let before = t.bal(&op);
+        t.tx(&s1, Action::Unvouch { account: s1.address() }).unwrap();
+        assert_eq!(t.bal(&op), before, "the bond stays held");
+        assert!(t.tx(&op, Action::Vouch { account: s3.address() }).unwrap_err().to_string().contains("allows 2"), "and its slot taken");
+        conserved(&t.c.state);
+        let (pool0, soul0) = (t.c.state.account(&t.c.state.pool()).balance, t.soul(&op));
+        t.admin(Action::FlagSybil { account: s1.address(), reason: "a sock puppet".into() }).unwrap();
+        assert_eq!(t.c.state.account(&t.c.state.pool()).balance, pool0 + VOUCH_BOND + CLAIM_BOND, "the voucher's bond and the sybil's claim bond go to the pool");
+        assert_eq!(t.soul(&op), soul0.saturating_sub(SYBIL_VOUCHER_SOUL));
+        assert_eq!(t.c.state.poc.claims[&c].status, ClaimStatus::Rejected);
+        conserved(&t.c.state);
+        // s2 declines too; nobody flags it. The bond comes back once the lock would have ended.
+        t.tx(&s2, Action::Unvouch { account: s2.address() }).unwrap();
+        let unlock = t.c.state.poc.dropped_vouches[&vouch_key(&s2.address(), &op.address())].at + t.c.state.params.poc.vouch_lock_blocks;
+        let held = t.bal(&op);
+        while t.h() < unlock {
+            t.blocks(1);
+        }
+        assert_eq!(t.bal(&op), held, "held until the lock is over");
+        t.blocks(t.c.state.params.epoch_blocks);
+        assert_eq!(t.bal(&op), held + VOUCH_BOND, "then handed back at an epoch boundary");
+        assert!(t.c.state.poc.dropped_vouches.is_empty(), "and forgotten once no Séance can need it");
+        conserved(&t.c.state);
+        t.reopen_same_root();
+
+        // The voucher's cut of a sybil's rewards is clawed back with the sybil's own (as
+        // `exec_reject_claim` does for a reverted claim).
+        let mut t = setup("sybilcut");
+        t.admin(Action::SetRepo { repo: "jackdishman/blockula".into(), weight: 10 }).unwrap();
+        for j in [k(1), k(2), k(3)] {
+            t.grant(&j, 10);
+            t.tx(&j, Action::JoinJury { bond: JUROR_BOND }).unwrap();
+        }
+        t.tx(&k(9), Action::FundPool { amount: 80 * DROPS_PER_FANG }).unwrap();
+        let (voucher, sybil, other) = (k(5), k(6), k(7));
+        t.grant(&voucher, 20);
+        t.grant(&other, 1);
+        t.tx(&voucher, Action::Vouch { account: sybil.address() }).unwrap();
+        t.link(&sybil, "sybil");
+        t.link(&other, "other");
+        let ids = [t.claim(&sybil, 1).unwrap(), t.claim(&other, 2).unwrap()];
+        t.attest_all(&ids);
+        let sid = t.wait_for_seance();
+        let mut st = t.c.state.clone();
+        judge(&mut st, sid, |c| if c == ids[0] { 2 } else { 1 });
+        st.close_seance(sid, t.h());
+        let h = t.h() + 1;
+        assert!(st.grant_totals(&voucher.address(), h).2 > 0, "the voucher got a cut");
+        let mut j = Journal::default();
+        st.exec_flag_sybil(&mut j, &sybil.address(), "test", "a sock puppet", h).unwrap();
+        assert_eq!((st.grant_totals(&sybil.address(), h).2, st.grant_totals(&voucher.address(), h).2), (0, 0), "both clawed back");
+        st.check_invariants().unwrap();
+        drop(st);
+        std::fs::remove_dir_all(&t.home).ok();
     }
 
     /// Audit F53, the rule: a vouch can always be withdrawn (the newcomer declines any time, the

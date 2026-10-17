@@ -396,10 +396,10 @@ fn namespaces_and_meta_keys_are_unique() {
     }
     for (n, range) in reserved {
         assert!(range.contains(&n), "namespace {n} is outside its module's range");
-        assert!(!(1..=25).contains(&n), "namespace {n} collides with the base state");
+        assert!(!(1..=26).contains(&n), "namespace {n} collides with the base state");
         seen.insert(n);
     }
-    assert_eq!(seen.len(), 1 + 18 + 16 + 5 + 2, "every namespace is distinct");
+    assert_eq!(seen.len(), 1 + 19 + 16 + 5 + 2, "every namespace is distinct");
     let keys = [meta::BURNED, meta::CHAIN_PARAMS, meta::NEXT_HUNT_ID, meta::PARAMS, meta::POC, meta::SCHEMA, meta::SUPPLY, meta::STAKING, meta::GOVERNANCE, meta::ECON, meta::BEACON, meta::UPGRADE, meta::GHOST];
     assert_eq!(keys.iter().collect::<std::collections::BTreeSet<_>>().len(), keys.len());
     assert!(st.meta_records().iter().all(|(k, _)| keys.contains(k)), "every scalar record uses a declared key");
@@ -561,6 +561,7 @@ fn largest_records_fit_in_a_snapshot() {
     p.repos.insert(s(MAX_REPO), MAX_REPO_WEIGHT);
     p.souls.insert(addr(0), Soul { points: u64::MAX, at: u64::MAX, earned: u64::MAX });
     p.vouches.insert(addr(0), Vouch { voucher: addr(1), bond: u64::MAX, at: 0 });
+    p.dropped_vouches.insert(vouch_key(&addr(0), &addr(1)), DroppedVouch { bond: u64::MAX, at: u64::MAX, dropped_at: u64::MAX });
     p.sybils.insert(addr(0), Sybil { at: 0, by: addr(1), reason: s(MAX_REASON) });
     let attestations = (0..MAX_CLAIM_ATTESTATIONS as u64).map(|i| (addr(i), Attestation { ok: true, merge_sha: s(40), at: 0, note: s(MAX_REASON) })).collect();
     // `reason` is a reject reason or one the state machine writes (a short sentence with a handle and an address).
