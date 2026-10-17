@@ -871,6 +871,115 @@ fn mempool_bounds_ghost_txs() {
     assert!(admit(&transfer, true).unwrap().is_empty(), "other txs aren't counted");
 }
 
+/// Review of F36: a full ghost share gives up only an unsigned tx or another sender's last
+/// queued tx (as `Chain::eviction_victim` does). A signed `Shield` with its sender's later txs
+/// behind it never goes (they'd wait behind a nonce gap), nor does the newcomer's own; a sender
+/// can't replace its own queued tx (its nonce is taken); and the refusal never asks for a tip
+/// past the newcomer's cap.
+#[test]
+fn the_ghost_share_gives_up_only_other_senders_tails() {
+    let nf = |i: u32, k: u8| HexBytes([i.to_le_bytes(), [k; 4], [0; 4], [0; 4], [0; 4], [0; 4], [0; 4], [0; 4]].concat());
+    let unsigned = |i: u32, tip: u64| {
+        let mut b = crate::types::tests::vector_bundle(1);
+        b.nullifiers = [nf(i, 1), nf(i, 2)];
+        Tx { chain_id: "c".into(), genesis_hash: "00".repeat(32), from: String::new(), nonce: 0, fee: FEE + tip, tip, valid_until: 9, action: Action::PrivateTransfer { bundle: b }, memo: String::new(), public_key: String::new(), signature: String::new() }
+    };
+    let shield = |i: u32, from: &str, nonce: u64, tip: u64| {
+        let mut b = crate::types::tests::vector_bundle(1);
+        b.nullifiers = [nf(i, 1), nf(i, 2)];
+        Tx { from: from.into(), nonce, public_key: "01".repeat(32), signature: "02".repeat(32), action: Action::Shield { amount: FANG, bundle: b }, ..unsigned(i, tip) }
+    };
+    let relay = FEE_GRID + FEE_GRID / 2;
+    let ids = |q: &[Tx]| q.iter().map(Tx::id).collect::<Vec<_>>();
+    // Alice's shield is the cheapest ghost tx queued, but her transfer waits behind it.
+    let mut queued = vec![shield(0, "boo1alice", 0, 0), Tx { action: Action::Transfer { to: "boo1bob".into(), amount: 1 }, ..shield(0, "boo1alice", 1, 0) }];
+    queued.extend((1..MAX_MEMPOOL_GHOST as u32).map(|i| unsigned(i, FEE_GRID)));
+    let qids = ids(&queued);
+    let got = mempool_admit(&queued, &qids, &unsigned(999, 3 * FEE_GRID), relay, u64::MAX, true).unwrap();
+    assert_eq!(got, vec![(qids[MAX_MEMPOOL_GHOST].clone(), "evicted from the mempool's full ghost share by a transaction with a higher tip")], "the newest of the cheapest that may go, not Alice's");
+    // Carol's lone shield is the cheapest, and her last queued tx: another sender's tx can
+    // displace it, her own next one can't (it would sit behind the gap it made).
+    let mut queued = vec![shield(0, "boo1carol", 0, 0)];
+    queued.extend((1..MAX_MEMPOOL_GHOST as u32).map(|i| unsigned(i, FEE_GRID)));
+    let qids = ids(&queued);
+    let admit = |tx: &Tx| mempool_admit(&queued, &qids, tx, relay, u64::MAX, true);
+    assert_eq!(admit(&shield(900, "boo1dave", 0, 2 * FEE_GRID)).unwrap()[0].0, qids[0]);
+    assert_eq!(admit(&shield(901, "boo1carol", 1, 3 * FEE_GRID)).unwrap()[0].0, qids[MAX_MEMPOOL_GHOST - 1]);
+    // Her own queued shield's notes: not hers to replace.
+    assert!(admit(&shield(0, "boo1carol", 1, 9 * FEE_GRID)).unwrap_err().to_string().contains("your queued transaction with nonce 0 already spends"));
+    // A tip that would have to pass the cap isn't asked for.
+    let e = mempool_admit(&queued, &qids, &unsigned(999, 0), relay, FEE_GRID, true).unwrap_err().to_string();
+    assert!(e.contains("they tip more than this one may (at most 1000000 drops)"), "{e}");
+    let e = mempool_admit(&queued, &qids, &unsigned(999, 0), relay, 2 * FEE_GRID, true).unwrap_err().to_string();
+    assert!(e.contains("a tip of at least 2000000 drops"), "{e}");
+}
+
+/// Remembers `tx`'s proof as valid: for tests of the mempool, not of proofs.
+fn assume_valid(tx: &Tx) {
+    let (public, proof) = statement(tx).unwrap().unwrap();
+    VERDICTS.lock().put(statement_key(&public, proof), Ok(()));
+}
+
+/// A signed shield of 1 FANG from `from` at `nonce` tipping `tip`, with a stand-in proof of a
+/// real one's size (so its tip cap is a real one's too) remembered as valid.
+fn stand_in_shield(n: &mut Net, from: &Keys, nonce: u64, tip: u64) -> Tx {
+    let to = SpendingKey::from_seed(n.w.rng.bytes());
+    let out = n.output(FANG, &to, &to);
+    let act = Act { spends: [n.dummy_spend(), n.dummy_spend()], outputs: [out, n.dummy_output()], anchor: n.anchor() };
+    let mut tx = Tx { chain_id: n.c.genesis.chain_id.clone(), genesis_hash: n.c.genesis_hash.clone(), from: from.address(), nonce, fee: 0, tip, valid_until: n.c.height() + 100, action: Action::Shield { amount: FANG, bundle: Box::new(act.bundle(n.instance())) }, memo: String::new(), public_key: hex::encode(from.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+    let mut proof = n.w.rng.bytes().to_vec();
+    proof.resize(130 << 10, 7);
+    set_proof(&mut tx, proof);
+    tx.fee = 2 * crate::econ::base_fee(&n.c.state, n.c.height() + 1, tx.size()) + tip;
+    let tx = tx.sign(from);
+    assume_valid(&tx);
+    tx
+}
+
+/// Review of F36, through the node: Alice queues a shield (untipped) and then a transfer, and
+/// the ghost share fills with others' shields. A shield that outbids the cheapest used to evict
+/// Alice's, leaving her transfer behind a nonce gap: her resubmissions refused, and the transfer
+/// dropped a block later. Now the share gives up another sender's last tx, and nobody is left
+/// behind a gap.
+#[test]
+fn a_full_ghost_share_never_leaves_a_sender_behind_a_nonce_gap() {
+    let mut n = net("gap", true, 1, &[]);
+    let accounts: Vec<Keys> = (0..MAX_MEMPOOL_GHOST as u32 + 1).map(|i| Keys::from_seed(crypto::hash(&(i + 7_000).to_le_bytes()))).collect();
+    for k in &accounts {
+        n.c.state.accounts.insert(k.address(), crate::chain::Account { balance: 10 * FANG, ..Default::default() });
+        n.c.state.supply += 10 * FANG;
+    }
+    let (alice, bob, others) = (&accounts[0], &accounts[1], &accounts[2..]);
+    let a = stand_in_shield(&mut n, alice, 0, 0);
+    n.c.submit(a.clone()).unwrap();
+    let mut t = Tx { chain_id: n.c.genesis.chain_id.clone(), genesis_hash: n.c.genesis_hash.clone(), from: alice.address(), nonce: 1, fee: 0, tip: 0, valid_until: n.c.height() + 100, action: Action::Transfer { to: bob.address(), amount: 1 }, memo: String::new(), public_key: hex::encode(alice.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+    t.fee = 2 * crate::econ::base_fee(&n.c.state, n.c.height() + 1, t.size());
+    let t = t.sign(alice);
+    n.c.submit(t.clone()).unwrap();
+    let mut queued = vec![];
+    for k in others {
+        let tx = stand_in_shield(&mut n, k, 0, FEE_GRID);
+        queued.push(n.c.submit(tx).unwrap());
+    }
+    assert_eq!(n.c.mempool.iter().filter(|t| t.action.ghost_bundle().is_some()).count(), MAX_MEMPOOL_GHOST);
+    // Bob outbids the cheapest: the newest of the others' shields goes, not Alice's.
+    let b = stand_in_shield(&mut n, bob, 0, 3 * FEE_GRID);
+    n.c.submit(b).unwrap();
+    assert!(n.c.in_mempool(&a.id()) && n.c.in_mempool(&t.id()) && n.c.next_nonce(&alice.address()) == 2, "Alice's queue is whole");
+    let gone = queued.last().unwrap();
+    assert!(!n.c.in_mempool(gone) && n.c.failure(gone).unwrap().0.contains("full ghost share"));
+    // A sender's own next shield never displaces its first.
+    let again = stand_in_shield(&mut n, &others[0], 1, 3 * FEE_GRID);
+    n.c.submit(again).unwrap();
+    assert!(n.c.in_mempool(&queued[0]) && n.c.pending_count(&others[0].address()) == 2);
+    assert!(!n.c.in_mempool(&queued[queued.len() - 2]));
+    // The next block takes Alice's shield and transfer in order.
+    let mut block = vec![a.clone(), t.clone()];
+    block.extend(n.c.proposal_txs().into_iter().filter(|x| x.from != alice.address()).take(3).cloned());
+    assert_eq!(n.block(block)[..2], [true, true]);
+    n.cleanup();
+}
+
 /// Audit F41: junk (proofs that fail, even cheaply) is remembered apart from valid verdicts, so
 /// it can't flush them; valid verdicts are kept least recently used first, and a hit refreshes
 /// one.

@@ -3290,6 +3290,12 @@ impl Chain {
         self.mempool.len().saturating_sub(self.lane.len())
     }
 
+    /// Whether queued tx `id` is in the validator-duty lane.
+    #[cfg(test)]
+    pub(crate) fn in_lane(&self, id: &str) -> bool {
+        self.lane.contains_key(id)
+    }
+
     /// The validator duty `tx` is (`staking::duty_of`), if any.
     fn duty_of(&self, tx: &Tx) -> Option<(String, &'static str)> {
         if tx.is_unsigned() {
@@ -4441,6 +4447,62 @@ mod audit {
         assert_eq!((b.txs.len(), b.skipped.len(), b.failed.len()), (79 + 64, 0, 0));
         assert_eq!(c.state.burned - burned, b.txs.iter().map(|t| t.charge().unwrap() - t.tip).sum::<u64>(), "every queued tx paid");
         assert!(c.mempool.is_empty());
+    }
+
+    /// Review of F36: what a ghost tx displaces (`displace`) takes its sender's later txs along
+    /// when it's signed (a same-note replacement can hit a `Shield` anywhere in its sender's
+    /// queue), so nobody is left behind a nonce gap, and the sender's simulation goes with it: it
+    /// can submit again at once, from the nonce that's free.
+    #[test]
+    fn a_displaced_signed_tx_takes_its_senders_later_txs() {
+        let (_h, mut c) = fresh("displace");
+        let gh = c.genesis_hash.clone();
+        let me = c.me().unwrap();
+        let a = Keys::from_seed([41; 32]);
+        fund(&mut c, &a, 100 * DROPS_PER_FANG);
+        c.produce_block_with(vec![]).unwrap();
+        let pay = |n: u64| unsigned_as(&gh, &a.address(), &a, n, 0, Action::Transfer { to: me.clone(), amount: n + 1 });
+        let ids: Vec<String> = (0..3).map(|n| c.submit(pay(n)).unwrap()).collect();
+        let next = c.height() + 1;
+        c.displace(vec![(ids[1].clone(), "replaced by a transaction spending the same note with a higher tip")], next);
+        assert!(c.in_mempool(&ids[0]) && !c.in_mempool(&ids[1]) && !c.in_mempool(&ids[2]));
+        assert!(c.failure(&ids[1]).unwrap().0.contains("same note") && c.failure(&ids[2]).unwrap().0.contains("earlier transaction from the same account was displaced"));
+        assert_eq!(c.next_nonce(&a.address()), 1);
+        let again = Tx { tip: 1, ..pay(1) };
+        let again = Tx { fee: again.charge().unwrap(), ..again };
+        c.submit(again).unwrap();
+        c.produce_block().unwrap();
+        assert_eq!(c.state.account(&a.address()).nonce, 2);
+    }
+
+    /// Review of fix-fees: a full mempool's refusal never asks for a tip past the newcomer's cap
+    /// (`tip_cap_multiple` × its base fee). With every tail tipping its cap, the same-size
+    /// newcomer would need a drop more than its own: it's told the mempool is full of txs it
+    /// can't outbid, and to try again, not to pay a tip admission refuses as "tip too high".
+    #[test]
+    fn a_full_mempool_never_asks_for_a_tip_past_the_cap() {
+        let (_h, mut c) = fresh("tipcap");
+        let gh = c.genesis_hash.clone();
+        let me = c.me().unwrap();
+        let senders: Vec<Keys> = (0..80u32).map(|i| Keys::from_seed(crypto::hash(&(i + 9_000).to_le_bytes()))).collect();
+        for k in &senders {
+            fund(&mut c, k, 1_000 * DROPS_PER_FANG);
+        }
+        let pay = |k: &Keys, n: u64, tip: u64| unsigned_as(&gh, &k.address(), k, n, tip, Action::Transfer { to: me.clone(), amount: 1 });
+        let cap = crate::econ::max_tip(&c.state, crate::econ::base_fee(&c.state, c.height() + 1, pay(&senders[0], 0, 0).size()));
+        'fill: for k in &senders[..79] {
+            for n in 0..MAX_PENDING_PER_SENDER as u64 {
+                if c.mempool.len() >= MAX_MEMPOOL {
+                    break 'fill;
+                }
+                c.submit(pay(k, n, cap)).unwrap();
+            }
+        }
+        assert_eq!(c.mempool.len(), MAX_MEMPOOL);
+        let x = &senders[79];
+        let err = c.submit(pay(x, 0, cap)).unwrap_err().to_string();
+        assert!(err.contains("tip more per byte than this one may") && err.contains(&format!("at most {cap} drops")) && !err.contains("resubmit"), "{err}");
+        assert!(c.submit(pay(x, 0, cap + 1)).unwrap_err().to_string().contains("tip too high"), "what the hint used to ask for");
     }
 
     /// The validator-duty lane (F32/F56; the full-mempool case is in beacon/tests.rs): only a
