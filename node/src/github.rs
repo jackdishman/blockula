@@ -34,10 +34,27 @@ async fn get_json_capped(path: &str, cap: usize) -> Result<Option<Value>> {
     while let Some(chunk) = res.chunk().await? {
         body.extend_from_slice(&chunk);
         if body.len() > cap {
-            bail!("GitHub response too large");
+            return Err(TooLarge.into());
         }
     }
     Ok(Some(serde_json::from_slice(&body)?))
+}
+
+/// A response over its size cap: the same for every node asking (GitHub's answer and the cap are),
+/// so unlike a network error it's a definite answer the revert check can act on.
+#[derive(Debug)]
+pub struct TooLarge;
+
+impl std::fmt::Display for TooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GitHub response too large")
+    }
+}
+
+impl std::error::Error for TooLarge {}
+
+fn too_large(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<TooLarge>().is_some()
 }
 
 /// A gist's owner and file contents (`None`: no such gist). `gist_id` is validated on-chain as
@@ -180,23 +197,47 @@ pub struct Revert {
     pub sha: String,
     /// How it was found (logs).
     pub how: String,
+    /// The evidence it states the revert with.
+    pub by: Stated,
+}
+
+/// Where a revert candidate states that it is one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stated {
+    /// Its own commit message on the default branch says `This reverts commit <merge sha>`: git's
+    /// text, which nobody can write before the merge, and which only maintainers land on the
+    /// default branch afterwards. It can't be edited.
+    Commit,
+    /// The description of a PR merged into the default branch (GitHub's `Reverts owner/repo#N`).
+    /// Descriptions can be edited after the merge by their authors, so these are weaker evidence,
+    /// and the claim PR's own author's weakest of all (audit F55).
+    Pr { number: u64, by_claimant: bool },
 }
 
 /// Whether `text` says, in so many words, that it reverts PR `pr` of `repo` (merged as
 /// `merge_sha`): a line that starts with GitHub's revert-button text `Reverts owner/repo#N` (or
 /// `Reverts #N`, or the PR's URL), or with git's `This reverts commit <merge_sha>`. A mention
-/// anywhere else ("Reverts #50. Context: #42", "Follow-up to #42") isn't one (audit F20).
+/// anywhere else ("Reverts #50. Context: #42", "Follow-up to #42") isn't one (audit F20). This is
+/// the rule for PR descriptions; commit messages need git's form ([`commit_states_revert_of`]).
 pub fn states_revert_of(text: &str, repo: &str, pr: u64, merge_sha: &str) -> bool {
-    let (repo, merge_sha) = (repo.to_ascii_lowercase(), merge_sha.to_ascii_lowercase());
+    let repo = repo.to_ascii_lowercase();
     let ends = |rest: &str| !rest.starts_with(|c: char| c.is_ascii_alphanumeric());
-    text.lines().map(|l| l.trim().to_ascii_lowercase()).any(|line| {
-        if let Some(rest) = line.strip_prefix("this reverts commit ") {
-            return rest.strip_prefix(merge_sha.as_str()).is_some_and(ends);
-        }
-        let Some(rest) = line.strip_prefix("reverts ") else { return false };
-        let rest = rest.trim_start();
-        [format!("#{pr}"), format!("{repo}#{pr}"), format!("https://github.com/{repo}/pull/{pr}")].iter().any(|r| rest.strip_prefix(r.as_str()).is_some_and(ends))
-    })
+    commit_states_revert_of(text, merge_sha)
+        || text.lines().map(|l| l.trim().to_ascii_lowercase()).any(|line| {
+            let Some(rest) = line.strip_prefix("reverts ") else { return false };
+            let rest = rest.trim_start();
+            [format!("#{pr}"), format!("{repo}#{pr}"), format!("https://github.com/{repo}/pull/{pr}")].iter().any(|r| rest.strip_prefix(r.as_str()).is_some_and(ends))
+        })
+}
+
+/// Whether a commit message states the revert of the commit `merge_sha` the way git does: a line
+/// starting `This reverts commit <merge_sha>`. Only this form counts in a commit message (audit
+/// F55): the claimant's own commits, which land on the default branch with its PR, are written
+/// before the merge sha exists, so they can't say it, whereas `Reverts #N` they could.
+pub fn commit_states_revert_of(text: &str, merge_sha: &str) -> bool {
+    let merge_sha = merge_sha.to_ascii_lowercase();
+    let ends = |rest: &str| !rest.starts_with(|c: char| c.is_ascii_alphanumeric());
+    text.lines().map(|l| l.trim().to_ascii_lowercase()).any(|line| line.strip_prefix("this reverts commit ").and_then(|rest| rest.strip_prefix(merge_sha.as_str())).is_some_and(ends))
 }
 
 /// Whether `p` is a merged PR into `repo`'s default branch whose description states that it
@@ -227,30 +268,37 @@ pub fn revert_pr_candidates(commits: &[Commit]) -> Vec<u64> {
     out
 }
 
-/// The commits that may be the revert of PR `pr` (merged into `repo` as `merge_sha`), in the
-/// order validators try them, given `commits` (the default branch since the merge, newest first
-/// as GitHub lists them) and `pulls` (PRs that may be reverts). Validators must name the same
-/// commit, so it's the commits on the branch, oldest first, that either
-/// * say they revert it ([`states_revert_of`]: `git revert` writes "This reverts commit <sha>.";
-///   a revert PR merged with a merge commit brings that commit along), or
+/// The commits that may be the revert of PR `pr` (merged into `repo` as `merge_sha`, authored by
+/// `author`), in the order validators try them, given `commits` (the default branch since the
+/// merge, newest first as GitHub lists them, the claim PR's own commits left out) and `pulls`
+/// (PRs that may be reverts). Validators must name the same commit, so it's the commits on the
+/// branch, oldest first, that either
+/// * say they revert it in git's words ([`commit_states_revert_of`]: `git revert` writes "This
+///   reverts commit <sha>."; a revert PR merged with a merge commit brings that commit along), or
 /// * are the merge of a revert PR ([`reverts_pr`]; a squash merge's message may name neither);
 ///
-/// then the revert PRs merged before the commits read, earliest first.
-pub fn revert_candidates(repo: &str, pr: u64, merge_sha: &str, commits: &[Commit], pulls: &[PullRequest]) -> Vec<Revert> {
+/// then the revert PRs merged before the commits read, earliest first; and last of all the revert
+/// PRs the claim PR's author wrote (it can edit their descriptions any time, so they mustn't use
+/// up the check's budget ahead of anyone else's: audit F55).
+pub fn revert_candidates(repo: &str, pr: u64, merge_sha: &str, author: &str, commits: &[Commit], pulls: &[PullRequest]) -> Vec<Revert> {
     let merge_sha = merge_sha.to_ascii_lowercase();
     let short = |sha: &str| sha.chars().take(12).collect::<String>();
+    let by_claimant = |p: &PullRequest| !author.is_empty() && p.author.eq_ignore_ascii_case(author);
     let revert_prs: BTreeMap<&str, &PullRequest> = pulls.iter().filter(|p| reverts_pr(p, repo, pr, &merge_sha)).filter_map(|p| Some((p.merge_sha.as_deref()?, p))).collect();
+    let of_pr = |sha: &str, p: &PullRequest| Revert { sha: sha.to_string(), how: format!("{repo}#{} reverts #{pr}, merged as {}", p.number, short(sha)), by: Stated::Pr { number: p.number, by_claimant: by_claimant(p) } };
     let mut out: Vec<Revert> = vec![];
     for c in commits.iter().rev().filter(|c| c.sha != merge_sha) {
-        if states_revert_of(&c.message, repo, pr, &merge_sha) {
-            out.push(Revert { sha: c.sha.clone(), how: format!("commit {} reverts {}", short(&c.sha), short(&merge_sha)) });
+        if commit_states_revert_of(&c.message, &merge_sha) {
+            out.push(Revert { sha: c.sha.clone(), how: format!("commit {} reverts {}", short(&c.sha), short(&merge_sha)), by: Stated::Commit });
         } else if let Some(p) = revert_prs.get(c.sha.as_str()) {
-            out.push(Revert { sha: c.sha.clone(), how: format!("{repo}#{} reverts #{pr}, merged as {}", p.number, short(&c.sha)) });
+            out.push(of_pr(&c.sha, p));
         }
     }
     let mut earlier: Vec<(&str, u64, &str)> = revert_prs.iter().filter(|(sha, _)| !out.iter().any(|r| r.sha == **sha)).map(|(sha, p)| (p.merged_at.as_str(), p.number, *sha)).collect();
     earlier.sort();
-    out.extend(earlier.into_iter().map(|(_, number, sha)| Revert { sha: sha.to_string(), how: format!("{repo}#{number} reverts #{pr}, merged as {}", short(sha)) }));
+    out.extend(earlier.into_iter().map(|(_, _, sha)| of_pr(sha, revert_prs[sha])));
+    // Stable: each group keeps its order.
+    out.sort_by_key(|r| matches!(r.by, Stated::Pr { by_claimant: true, .. }));
     out
 }
 
@@ -289,10 +337,14 @@ fn changed_lines(patch: &str) -> (BTreeMap<&str, usize>, BTreeMap<&str, usize>) 
 
 /// Whether the diff `revert` undoes the diff `original` (audit F20: a revert must actually revert
 /// the claim's change, not just say so): more than half of the lines `original` added and removed,
-/// file by file, are removed and added back by `revert`. `None` when there's nothing to compare
-/// (no patches: binary files, diffs too large for GitHub to show), which never counts as a
-/// revert.
+/// file by file, are removed and added back by `revert`. When `original` has no lines to compare
+/// (only binary files, or diffs too large for GitHub to show), by its files instead: `revert`
+/// touches more than half of them (audit review-fix-poc-3: no shape of the claim's own diff makes
+/// it revert-proof). `None` only when `original` lists no files at all.
 pub fn undoes(original: &[FileDiff], revert: &[FileDiff]) -> Option<bool> {
+    if original.is_empty() {
+        return None;
+    }
     let (mut matched, mut total) = (0usize, 0usize);
     for f in original {
         let Some(patch) = &f.patch else { continue };
@@ -303,36 +355,73 @@ pub fn undoes(original: &[FileDiff], revert: &[FileDiff]) -> Option<bool> {
         let overlap = |a: &BTreeMap<&str, usize>, b: &BTreeMap<&str, usize>| a.iter().map(|(l, n)| (*n).min(b.get(l).copied().unwrap_or(0))).sum::<usize>();
         matched += overlap(&added, &r_removed) + overlap(&removed, &r_added);
     }
-    (total > 0).then_some(2 * matched > total)
-}
-
-/// The revert of PR `pr`: the first of the [`revert_candidates`] (at most
-/// [`REVERT_DIFF_CHECKS`]) whose diff (`diffs`, by sha) [`undoes`] the PR's (`original`). `Err`
-/// when some candidate states a revert but its diff can't be compared: couldn't tell, so no
-/// attestation (never a rejection on ambiguity).
-pub fn find_revert_in(repo: &str, pr: u64, merge_sha: &str, commits: &[Commit], pulls: &[PullRequest], original: &[FileDiff], diffs: &BTreeMap<String, Vec<FileDiff>>) -> Result<Option<Revert>> {
-    let mut unclear = None;
-    for r in revert_candidates(repo, pr, merge_sha, commits, pulls).into_iter().take(REVERT_DIFF_CHECKS) {
-        match diffs.get(&r.sha).and_then(|d| undoes(original, d)) {
-            Some(true) => return Ok(Some(r)),
-            Some(false) => {}
-            None => unclear = unclear.or(Some(r)),
-        }
+    if total > 0 {
+        return Some(2 * matched > total);
     }
-    match unclear {
-        Some(r) => bail!("{} but its diff can't be compared with #{pr}'s (no patch), so it isn't attested", r.how),
-        None => Ok(None),
-    }
+    let touched = original.iter().filter(|f| revert.iter().any(|r| r.filename == f.filename)).count();
+    Some(2 * touched > original.len())
 }
 
 /// Most pages of commits since the merge a revert check reads (100 each), most revert-looking
 /// PRs it fetches, files of the PR whose later commits it follows (and most of those commits it
-/// asks GitHub the PR of), and most candidates whose diffs it compares.
+/// asks GitHub the PR of), most pages of a PR's files (100 each) or commits it reads, most
+/// candidates whose diffs it fetches, and most of those that touch the claim PR's files it
+/// compares.
 pub const REVERT_COMMIT_PAGES: u32 = 10;
 pub const REVERT_PR_FETCHES: usize = 10;
 pub const REVERT_PATHS: usize = 3;
 pub const REVERT_PATH_COMMITS: usize = 15;
+pub const REVERT_FILE_PAGES: u32 = 3;
+pub const REVERT_DIFF_FETCHES: usize = 10;
 pub const REVERT_DIFF_CHECKS: usize = 5;
+
+/// The comparison budget of one revert check (audit F55): a candidate counts against
+/// [`REVERT_DIFF_CHECKS`] only if its diff touches one of the claim PR's files, so candidates
+/// that state a revert but change something else can't use it up; every fetch counts against
+/// [`REVERT_DIFF_FETCHES`].
+#[derive(Default)]
+struct Scan {
+    fetched: usize,
+    compared: usize,
+}
+
+impl Scan {
+    fn more(&self) -> bool {
+        self.fetched < REVERT_DIFF_FETCHES && self.compared < REVERT_DIFF_CHECKS
+    }
+
+    /// Judges a candidate by its diff (`None`: GitHub had none, or too large to read).
+    fn undone(&mut self, original: &[FileDiff], diff: Option<&[FileDiff]>) -> bool {
+        self.fetched += 1;
+        let Some(diff) = diff.filter(|d| d.iter().any(|f| original.iter().any(|o| o.filename == f.filename))) else { return false };
+        self.compared += 1;
+        undoes(original, diff) == Some(true)
+    }
+}
+
+/// The revert of PR `pr` (merged as `merge_sha`, authored by `author`): the first of the
+/// [`revert_candidates`] whose diff (`diffs`, by sha) [`undoes`] the PR's (`original`), within
+/// the comparison budget ([`Scan`]). When the PR's files couldn't be read at all (`original`
+/// empty: every page over the size cap), the first candidate that states the revert in git's
+/// words in a commit on the default branch ([`Stated::Commit`]; maintainers landed it, nobody can
+/// edit it): a defined answer every validator reaches, never "couldn't tell" forever (audit
+/// review-fix-poc-3), and never a PR description, which its author could rewrite.
+pub fn find_revert_in(repo: &str, pr: u64, merge_sha: &str, author: &str, commits: &[Commit], pulls: &[PullRequest], original: &[FileDiff], diffs: &BTreeMap<String, Vec<FileDiff>>) -> Option<Revert> {
+    let candidates = revert_candidates(repo, pr, merge_sha, author, commits, pulls);
+    if original.is_empty() {
+        return candidates.into_iter().find(|r| r.by == Stated::Commit);
+    }
+    let mut scan = Scan::default();
+    for r in candidates {
+        if !scan.more() {
+            break;
+        }
+        if scan.undone(original, diffs.get(&r.sha).map(Vec::as_slice)) {
+            return Some(r);
+        }
+    }
+    None
+}
 
 /// A file path as a query-string value: every byte but unreserved ones percent-encoded.
 fn query_value(s: &str) -> String {
@@ -349,16 +438,47 @@ fn followed_paths(files: &[FileDiff]) -> Vec<&str> {
 }
 
 /// Looks for a revert of a claim's PR on GitHub (see [`find_revert_in`]). `Err`: couldn't tell
-/// (GitHub unreachable, the PR gone or never merged, a stated revert whose diff can't be read).
+/// (GitHub unreachable, the PR gone or never merged), so try again later.
 ///
 /// Revert PRs are found from the default branch alone, which only maintainers write: commits
 /// that look like a revert landing ([`revert_pr_candidates`]), and the PRs of the commits since
 /// the merge that touch the claim's files (`commits?path=`, then `commits/{sha}/pulls`). Not
 /// from the list of recently updated closed PRs, which anyone can flood by opening and closing
-/// PRs until a revert falls off it (audit F55).
+/// PRs until a revert falls off it (audit F55). The claim PR's own commits (which land on the
+/// branch with it, and may carry any date) are left out of all of that.
 pub async fn find_revert(repo: &str, pr: u64, merge_sha: &str) -> Result<Option<Revert>> {
     crate::types::check_repo(repo)?;
     find_revert_with(|path| async move { get_json_capped(&path, GITHUB_MAX_LIST_BYTES).await }, repo, pr, merge_sha).await
+}
+
+/// Up to `pages` pages (100 entries each) of a list at `path` (which has no query yet), until one
+/// isn't full. A page over the size cap ([`TooLarge`]) is skipped, as every node skips it.
+async fn pages<F, Fut>(get: &F, path: &str, pages: u32, parse: fn(&Value) -> Vec<FileDiff>, mut done: impl FnMut(&[FileDiff]) -> bool) -> Result<Vec<FileDiff>>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Value>>>,
+{
+    let mut out = vec![];
+    for page in 1..=pages {
+        match get(format!("{path}?per_page=100&page={page}")).await {
+            Ok(Some(v)) => {
+                let full = v.as_array().is_some_and(|a| a.len() == 100);
+                out.extend(parse(&v));
+                if !full || done(&out) {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(e) if too_large(&e) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(out)
+}
+
+/// A commit list as [`FileDiff`]-shaped names (sha in `filename`), so [`pages`] reads both.
+fn commit_shas(v: &Value) -> Vec<FileDiff> {
+    parse_commits(v).into_iter().map(|c| FileDiff { filename: c.sha, added: false, patch: None }).collect()
 }
 
 /// [`find_revert`] against `get` (`GET https://api.github.com{path}`, `Ok(None)` for a 404), so
@@ -379,18 +499,20 @@ where
         bail!("{repo}#{pr} has no merge time");
     }
     let since = &p.merged_at;
-    let original = get(format!("/repos/{repo}/pulls/{pr}/files?per_page=100")).await?.map(|v| parse_files(&v)).unwrap_or_default();
+    // Every file of the PR the pages hold, binary ones too (audit review-fix-poc-3: the first page
+    // alone could be all binary files, sorted ahead of the change).
+    let original = pages(&get, &format!("/repos/{repo}/pulls/{pr}/files"), REVERT_FILE_PAGES, parse_files, |_| false).await?;
+    let own: std::collections::BTreeSet<String> = pages(&get, &format!("/repos/{repo}/pulls/{pr}/commits"), REVERT_FILE_PAGES, commit_shas, |_| false).await?.into_iter().map(|c| c.filename).collect();
+    let merge = merge_sha.to_ascii_lowercase();
     let mut commits = vec![];
     for page in 1..=REVERT_COMMIT_PAGES {
         let Some(v) = get(format!("/repos/{repo}/commits?since={since}&per_page=100&page={page}")).await? else { break };
-        let batch = parse_commits(&v);
         let full = v.as_array().is_some_and(|a| a.len() == 100);
-        commits.extend(batch);
+        commits.extend(parse_commits(&v).into_iter().filter(|c| !own.contains(&c.sha)));
         if !full {
             break;
         }
     }
-    let merge = merge_sha.to_ascii_lowercase();
     let mut pulls: Vec<PullRequest> = vec![];
     let add = |found: Vec<PullRequest>, pulls: &mut Vec<PullRequest>| {
         for f in found {
@@ -404,7 +526,7 @@ where
     for path in followed_paths(&original) {
         let Some(v) = get(format!("/repos/{repo}/commits?path={}&since={since}&per_page=100", query_value(path))).await? else { continue };
         for c in parse_commits(&v).into_iter().rev() {
-            if c.sha != merge && !touching.contains(&c.sha) {
+            if c.sha != merge && !own.contains(&c.sha) && !touching.contains(&c.sha) {
                 touching.push(c.sha);
             }
         }
@@ -420,21 +542,34 @@ where
             add(vec![p], &mut pulls);
         }
     }
+    if original.is_empty() {
+        return Ok(find_revert_in(repo, pr, merge_sha, &p.author, &commits, &pulls, &original, &BTreeMap::new()));
+    }
+    let candidates = revert_candidates(repo, pr, merge_sha, &p.author, &commits, &pulls);
     // A candidate that is a PR's merge is compared by the PR's own diff (against its base, the
     // same for every merge method: a merge commit's listed files depend on how GitHub shows a
-    // two-parent commit); a plain commit by its own.
+    // two-parent commit); a plain commit by its own. The scan is `find_revert_in`'s.
     let merged_as: BTreeMap<String, u64> = pulls.iter().filter(|p| p.merged).filter_map(|p| Some((p.merge_sha.clone()?.to_ascii_lowercase(), p.number))).collect();
-    let mut diffs = BTreeMap::new();
-    for r in revert_candidates(repo, pr, merge_sha, &commits, &pulls).into_iter().take(REVERT_DIFF_CHECKS) {
-        let path = match merged_as.get(&r.sha.to_ascii_lowercase()) {
-            Some(n) => format!("/repos/{repo}/pulls/{n}/files?per_page=100"),
-            None => format!("/repos/{repo}/commits/{}", r.sha),
+    let names: std::collections::BTreeSet<&str> = original.iter().map(|f| f.filename.as_str()).collect();
+    let mut scan = Scan::default();
+    for r in candidates {
+        if !scan.more() {
+            break;
+        }
+        let diff = match merged_as.get(&r.sha.to_ascii_lowercase()) {
+            // Until the pages hold every file of the claim PR's that this one touches.
+            Some(n) => Some(pages(&get, &format!("/repos/{repo}/pulls/{n}/files"), REVERT_FILE_PAGES, parse_files, |d| names.iter().all(|n| d.iter().any(|f| f.filename == *n))).await?),
+            None => match get(format!("/repos/{repo}/commits/{}", r.sha)).await {
+                Ok(v) => v.map(|v| parse_files(&v)),
+                Err(e) if too_large(&e) => None,
+                Err(e) => return Err(e),
+            },
         };
-        if let Some(v) = get(path).await? {
-            diffs.insert(r.sha, parse_files(&v));
+        if scan.undone(&original, diff.as_deref()) {
+            return Ok(Some(r));
         }
     }
-    find_revert_in(repo, pr, merge_sha, &commits, &pulls, &original, &diffs)
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -507,7 +642,7 @@ mod tests {
 
     /// Every candidate's diff undoes #42.
     fn all_undo(commits: &[Commit], pulls: &[PullRequest]) -> BTreeMap<String, Vec<FileDiff>> {
-        revert_candidates("jackdishman/blockula", 42, MERGE, commits, pulls).into_iter().map(|r| (r.sha, undoing_files())).collect()
+        revert_candidates("jackdishman/blockula", 42, MERGE, "erin", commits, pulls).into_iter().map(|r| (r.sha, undoing_files())).collect()
     }
 
     #[test]
@@ -516,21 +651,25 @@ mod tests {
         let pulls = parse_pulls(&serde_json::from_str(PULLS).unwrap());
         assert_eq!(commits.len(), 4, "entries without a sha are skipped");
         assert_eq!((pulls[1].number, pulls[1].merged_at.as_str(), pulls[2].merged), (61, "2026-10-13T09:12:44Z", false));
-        let find = |commits: &[Commit], pulls: &[PullRequest]| find_revert_in("jackdishman/blockula", 42, MERGE, commits, pulls, &thing_files(), &all_undo(commits, pulls)).unwrap();
+        let find = |commits: &[Commit], pulls: &[PullRequest]| find_revert_in("jackdishman/blockula", 42, MERGE, "erin", commits, pulls, &thing_files(), &all_undo(commits, pulls));
         // `git revert` (and a revert PR merged with a merge commit): the oldest commit that says it
         // reverts the merge, never the merge commit itself.
         let r = find(&commits, &pulls).unwrap();
         assert_eq!(r.sha, "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00");
-        let upper = find_revert_in("JackDishman/Blockula", 42, &MERGE.to_uppercase(), &commits, &[], &thing_files(), &all_undo(&commits, &[])).unwrap();
+        let upper = find_revert_in("JackDishman/Blockula", 42, &MERGE.to_uppercase(), "alice", &commits, &[], &thing_files(), &all_undo(&commits, &[]));
         assert_eq!(upper.unwrap().sha, r.sha, "case doesn't matter");
         // A squash-merged revert PR whose message doesn't name the merge: the PR's merge commit,
         // the earliest merged PR into the default branch that states it reverts #42.
         let quiet: Vec<Commit> = commits.iter().filter(|c| c.sha == MERGE || !c.message.contains("This reverts")).cloned().collect();
         assert_eq!(find(&quiet, &pulls).unwrap().sha, "9f1c2e3d4b5a69788796a5b4c3d2e1f00f1e2d3c");
+        // Unless the claim PR's own author wrote that one (it can rewrite its description any
+        // time): then the others come first (audit F55).
+        let by_alice = find_revert_in("jackdishman/blockula", 42, MERGE, "Alice", &quiet, &pulls, &thing_files(), &all_undo(&quiet, &pulls));
+        assert_eq!(by_alice.map(|r| (r.sha, r.by)), Some(("6363636363636363636363636363636363636363".into(), Stated::Pr { number: 63, by_claimant: false })));
         // Not reverts: unmerged, another branch, another PR or repo, no statement, the PR itself.
         let not: Vec<PullRequest> = pulls.iter().filter(|p| ![61, 63].contains(&p.number)).cloned().collect();
         assert_eq!(find(&quiet, &not), None);
-        assert_eq!(find_revert_in("jackdishman/blockula", 61, MERGE, &quiet, &pulls[1..2], &thing_files(), &BTreeMap::new()).unwrap(), None);
+        assert_eq!(find_revert_in("jackdishman/blockula", 61, MERGE, "alice", &quiet, &pulls[1..2], &thing_files(), &BTreeMap::new()), None);
         assert_eq!(find(&[], &[]), None);
     }
 
@@ -548,27 +687,31 @@ mod tests {
         let of_50 = pr(61, "Revert \"Add the flag\"", "Reverts jackdishman/blockula#50\r\n\r\nThe flag built on #42, which stays.", sha61);
         let follow_up = pr(61, "revert: drop the flag", "Follow-up to #42: this removes the flag added in #50.", sha61);
         for p in [of_50, follow_up] {
-            assert!(revert_candidates("jackdishman/blockula", 42, MERGE, &commits, std::slice::from_ref(&p)).is_empty(), "{:?}", p.body);
-            assert!(revert_candidates("jackdishman/blockula", 42, MERGE, &[], std::slice::from_ref(&p)).is_empty(), "the fallback too");
+            assert!(revert_candidates("jackdishman/blockula", 42, MERGE, "alice", &commits, std::slice::from_ref(&p)).is_empty(), "{:?}", p.body);
+            assert!(revert_candidates("jackdishman/blockula", 42, MERGE, "alice", &[], std::slice::from_ref(&p)).is_empty(), "the fallback too");
         }
         let states = |t: &str| states_revert_of(t, "jackdishman/blockula", 42, MERGE);
         assert!(states("Reverts jackdishman/blockula#42") && states("Reverts #42.") && states("  reverts https://github.com/jackdishman/blockula/pull/42\nmore") && states(&format!("Revert\n\nThis reverts commit {MERGE}.")));
+        // In a commit message only git's words count (audit F55).
+        assert!(commit_states_revert_of(&format!("Revert\n\nThis reverts commit {MERGE}."), MERGE) && !commit_states_revert_of("Reverts #42", MERGE));
         assert!(!states("Reverts #50. Context: #42") && !states("Reverts #420") && !states("See: Reverts #42") && !states("Reverts otherorg/blockula#42") && !states(&format!("This reverts commit {}.", &MERGE[..12])) && !states("Revert #42"));
         // It says so, but its diff is something else: not a revert.
         let says = pr(61, "Revert \"Add the thing\"", "Reverts #42", sha61);
         let other = parse_files(&json!([{ "filename": "src/lib.rs", "patch": "@@ -9 +9 @@\n-fn unrelated() {}\n+fn unrelated(x: u8) {}" }]));
         let diffs = BTreeMap::from([(sha61.to_string(), other)]);
-        assert_eq!(find_revert_in("jackdishman/blockula", 42, MERGE, &commits, std::slice::from_ref(&says), &thing_files(), &diffs).unwrap(), None);
+        assert_eq!(find_revert_in("jackdishman/blockula", 42, MERGE, "alice", &commits, std::slice::from_ref(&says), &thing_files(), &diffs), None);
         // A partial undo (less than half of #42's changed lines) isn't one either; the whole is.
         let half = parse_files(&json!([{ "filename": "src/lib.rs", "patch": "@@ -1,3 +1,2 @@\n mod a;\n-mod thing;\n+mod old_thing;\n mod b;" }]));
         assert_eq!(undoes(&thing_files(), &half), Some(false));
         assert_eq!(undoes(&thing_files(), &undoing_files()), Some(true));
         let diffs = BTreeMap::from([(sha61.to_string(), undoing_files())]);
-        assert_eq!(find_revert_in("jackdishman/blockula", 42, MERGE, &commits, std::slice::from_ref(&says), &thing_files(), &diffs).unwrap().unwrap().sha, sha61);
-        // No patches to compare: couldn't tell.
+        assert_eq!(find_revert_in("jackdishman/blockula", 42, MERGE, "alice", &commits, std::slice::from_ref(&says), &thing_files(), &diffs).unwrap().sha, sha61);
+        // No lines to compare (binary files): by the files it touches (audit review-fix-poc-3).
         let binary = vec![FileDiff { filename: "logo.png".into(), added: true, patch: None }];
-        assert_eq!(undoes(&binary, &undoing_files()), None);
-        assert!(find_revert_in("jackdishman/blockula", 42, MERGE, &commits, std::slice::from_ref(&says), &binary, &diffs).unwrap_err().to_string().contains("can't be compared"));
+        assert_eq!(undoes(&binary, &undoing_files()), Some(false));
+        assert_eq!(undoes(&binary, &[FileDiff { filename: "logo.png".into(), added: false, patch: None }]), Some(true));
+        assert_eq!(undoes(&[], &undoing_files()), None);
+        assert_eq!(find_revert_in("jackdishman/blockula", 42, MERGE, "alice", &commits, std::slice::from_ref(&says), &binary, &diffs), None, "it touches none of #42's files");
     }
 
     /// Recorded from tokio-rs/axum (trimmed): #3168 merged as `e09cc59…` was reverted by #3287, a
@@ -591,8 +734,8 @@ mod tests {
         let original = parse_files(&json!([{ "filename": "axum-core/src/macros.rs", "patch": "@@ -1 +1 @@\n-pub fn status(&self) -> StatusCode {\n+pub const fn status(&self) -> StatusCode {" }]));
         let undo = parse_files(&json!({ "files": [{ "filename": "axum-core/src/macros.rs", "patch": "@@ -1 +1 @@\n-pub const fn status(&self) -> StatusCode {\n+pub fn status(&self) -> StatusCode {" }, { "filename": "CHANGELOG.md", "patch": "@@ -1 +1,2 @@\n+- yanked" }] }));
         let find = |commits: &[Commit], pulls: &[PullRequest]| {
-            let diffs = revert_candidates("tokio-rs/axum", 3168, merge, commits, pulls).into_iter().map(|r| (r.sha, undo.clone())).collect();
-            find_revert_in("tokio-rs/axum", 3168, merge, commits, pulls, &original, &diffs).unwrap()
+            let diffs = revert_candidates("tokio-rs/axum", 3168, merge, "jplatte", commits, pulls).into_iter().map(|r| (r.sha, undo.clone())).collect();
+            find_revert_in("tokio-rs/axum", 3168, merge, "jplatte", commits, pulls, &original, &diffs)
         };
         let pulls = [other, reverted.clone()];
         let r = find(&commits, &pulls).unwrap();
@@ -633,11 +776,11 @@ mod tests {
         let since = "2026-10-11T08:30:00Z";
         let routes: BTreeMap<String, Value> = [
             (format!("/repos/{repo}/pulls/42"), claim),
-            (format!("/repos/{repo}/pulls/42/files?per_page=100"), files),
+            (format!("/repos/{repo}/pulls/42/files?per_page=100&page=1"), files),
             (format!("/repos/{repo}/commits?since={since}&per_page=100&page=1"), commits),
             (format!("/repos/{repo}/commits?path=src/thing.rs&since={since}&per_page=100"), json!([{ "sha": undo, "commit": { "message": "Undo the thing" } }, { "sha": MERGE, "commit": { "message": "Add the thing (#42)" } }])),
             (format!("/repos/{repo}/commits/{undo}/pulls"), json!([pr77])),
-            (format!("/repos/{repo}/pulls/77/files?per_page=100"), undoing),
+            (format!("/repos/{repo}/pulls/77/files?per_page=100&page=1"), undoing),
         ]
         .into_iter()
         .collect();
@@ -655,6 +798,170 @@ mod tests {
         assert!(!asked.contains(&format!("/repos/{repo}/commits/{m77}")), "a PR's merge is compared by the PR's diff");
         assert!(asked.contains(&format!("/repos/{repo}/commits?path=src/thing.rs&since={since}&per_page=100")), "the file #42 created is followed first");
         assert_eq!(query_value("a b/ü&x=1.rs"), "a%20b/%C3%BC%26x%3D1.rs");
+    }
+
+    /// A stand-in for GitHub: `routes` by path (absent: 404), each path asked recorded. A route
+    /// whose value is the string `"too large"` answers [`TooLarge`].
+    struct Mock {
+        routes: BTreeMap<String, Value>,
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Mock {
+        fn new(routes: impl IntoIterator<Item = (String, Value)>) -> Mock {
+            Mock { routes: routes.into_iter().collect(), asked: Default::default() }
+        }
+        async fn find(&self, pr: u64) -> Result<Option<Revert>> {
+            let get = |path: String| {
+                self.asked.lock().unwrap().push(path.clone());
+                let v = self.routes.get(&path).cloned();
+                async move {
+                    match v {
+                        Some(Value::String(s)) if s == "too large" => Err(TooLarge.into()),
+                        v => Ok(v),
+                    }
+                }
+            };
+            find_revert_with(get, "jackdishman/blockula", pr, MERGE).await
+        }
+        fn asked(&self, path: &str) -> bool {
+            self.asked.lock().unwrap().iter().any(|p| p == path)
+        }
+    }
+
+    const SINCE: &str = "2026-10-11T08:30:00Z";
+
+    fn claim_42(author: &str) -> Value {
+        json!({ "number": 42, "state": "closed", "title": "Add the thing", "body": "", "merged_at": SINCE, "merge_commit_sha": MERGE, "user": { "login": author }, "base": { "ref": "main", "repo": { "full_name": "jackdishman/blockula", "default_branch": "main" } } })
+    }
+
+    fn files_json(files: &[FileDiff]) -> Value {
+        Value::Array(files.iter().map(|f| json!({ "filename": f.filename, "status": if f.added { "added" } else { "modified" }, "patch": f.patch })).collect())
+    }
+
+    /// Audit F55, the R1 reviewer's bypass: the claimant puts five decoy commits in its own PR #42
+    /// (merged with a merge commit, dated after the merge so the walk since the merge lists them,
+    /// right after #42's merge), each saying "Reverts #42's first draft …" and touching #42's
+    /// files without undoing them. They used to take all five comparisons ahead of the real revert,
+    /// PR #77 (GitHub's revert button: "Reverts jackdishman/blockula#42", branch `revert-42-…`,
+    /// its commit hand-edited). Now a commit message counts only in git's words, and the claim
+    /// PR's own commits are left out, so #77 is found and no decoy is ever fetched.
+    #[tokio::test]
+    async fn decoys_in_the_claim_pr_cant_use_up_the_revert_check() {
+        let repo = "jackdishman/blockula";
+        let base = json!({ "ref": "main", "repo": { "full_name": repo, "default_branch": "main" } });
+        let (m77, r77) = ("7777777777777777777777777777777777777777", "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d");
+        let decoys: Vec<String> = (1..=5u8).map(|i| format!("{:02x}", 0xd0 + i).repeat(20)).collect();
+        let decoy = |sha: &str, i: usize| json!({ "sha": sha, "commit": { "message": format!("Step {i}\n\nReverts #42's first draft of step {i}") } });
+        let pr77 = json!({ "number": 77, "state": "closed", "title": "Revert \"Add the thing\"", "body": "Reverts jackdishman/blockula#42", "merged_at": "2026-10-14T10:00:00Z", "merge_commit_sha": m77, "user": { "login": "dave" }, "base": base });
+        let mut walk = vec![json!({ "sha": m77, "commit": { "message": "Merge pull request #77 from dave/revert-42-add-the-thing\n\nRevert \"Add the thing\"" } }), json!({ "sha": r77, "commit": { "message": "Undo the thing" } })];
+        walk.extend(decoys.iter().enumerate().map(|(i, d)| decoy(d, i + 1)));
+        walk.push(json!({ "sha": MERGE, "commit": { "message": "Merge pull request #42 from mallory/thing" } }));
+        let own: Vec<Value> = decoys.iter().enumerate().map(|(i, d)| decoy(d, i + 1)).collect();
+        let not_undoing = files_json(&[FileDiff { filename: "src/thing.rs".into(), added: false, patch: Some("@@ -1 +1 @@\n-    42\n+    43".into()) }]);
+        let mut path_list = vec![json!({ "sha": r77, "commit": { "message": "Undo the thing" } })];
+        path_list.extend(own.iter().cloned());
+        let mut routes = vec![
+            (format!("/repos/{repo}/pulls/42"), claim_42("mallory")),
+            (format!("/repos/{repo}/pulls/42/files?per_page=100&page=1"), files_json(&thing_files())),
+            (format!("/repos/{repo}/pulls/42/commits?per_page=100&page=1"), Value::Array(own)),
+            (format!("/repos/{repo}/commits?since={SINCE}&per_page=100&page=1"), Value::Array(walk)),
+            (format!("/repos/{repo}/commits?path=src/thing.rs&since={SINCE}&per_page=100"), Value::Array(path_list)),
+            (format!("/repos/{repo}/commits/{r77}/pulls"), json!([pr77.clone()])),
+            (format!("/repos/{repo}/pulls/77"), pr77),
+            (format!("/repos/{repo}/pulls/77/files?per_page=100&page=1"), files_json(&undoing_files())),
+        ];
+        for d in &decoys {
+            routes.push((format!("/repos/{repo}/commits/{d}"), json!({ "files": not_undoing })));
+            routes.push((format!("/repos/{repo}/commits/{d}/pulls"), json!([claim_42("mallory")])));
+        }
+        let gh = Mock::new(routes);
+        let r = gh.find(42).await.unwrap().expect("the real revert is found");
+        assert_eq!((r.sha.as_str(), r.by), (m77, Stated::Pr { number: 77, by_claimant: false }));
+        assert!(decoys.iter().all(|d| !gh.asked(&format!("/repos/{repo}/commits/{d}")) && !gh.asked(&format!("/repos/{repo}/commits/{d}/pulls"))), "no decoy is looked at");
+
+        // The claimant's own merged follow-up PRs, touching #42's files, with descriptions edited
+        // after the merge to say "Reverts #42": tried after everyone else's.
+        let commits = parse_commits(&json!([
+            { "sha": m77, "commit": { "message": "Merge pull request #77 from dave/revert-42-add-the-thing" } },
+            { "sha": "8484848484848484848484848484848484848484", "commit": { "message": "Tidy the thing (#84)" } },
+            { "sha": "8383838383838383838383838383838383838383", "commit": { "message": "Tidy the thing (#83)" } },
+            { "sha": "8282828282828282828282828282828282828282", "commit": { "message": "Tidy the thing (#82)" } },
+            { "sha": "8181818181818181818181818181818181818181", "commit": { "message": "Tidy the thing (#81)" } },
+            { "sha": "8080808080808080808080808080808080808080", "commit": { "message": "Tidy the thing (#80)" } },
+            { "sha": MERGE, "commit": { "message": "Add the thing (#42)" } }
+        ]));
+        let follow_up = |n: u64| parse_pr(&json!({ "number": n, "state": "closed", "body": "Reverts #42", "merged_at": "2026-10-12T00:00:00Z", "merge_commit_sha": format!("{n}").repeat(20), "user": { "login": "Mallory" }, "base": base }));
+        let mut pulls: Vec<PullRequest> = (80..=84).map(follow_up).collect();
+        pulls.push(parse_pr(&json!({ "number": 77, "state": "closed", "body": "Reverts jackdishman/blockula#42", "merged_at": "2026-10-14T10:00:00Z", "merge_commit_sha": m77, "user": { "login": "dave" }, "base": base })));
+        let mut diffs: BTreeMap<String, Vec<FileDiff>> = (80..=84u64).map(|n| (format!("{n}").repeat(20), parse_files(&not_undoing))).collect();
+        diffs.insert(m77.into(), undoing_files());
+        assert_eq!(find_revert_in(repo, 42, MERGE, "mallory", &commits, &pulls, &thing_files(), &diffs).map(|r| r.sha), Some(m77.to_string()));
+        // Revert PRs that change none of #42's files don't count against the comparisons (only
+        // against the fetches): six of them ahead of #77 by someone else, and #77 is still found.
+        let others: Vec<PullRequest> = (80..=85).map(|n| PullRequest { author: "sock".into(), ..follow_up(n) }).collect();
+        let mut pulls = others.clone();
+        pulls.push(parse_pr(&json!({ "number": 77, "state": "closed", "body": "Reverts #42", "merged_at": "2026-10-14T10:00:00Z", "merge_commit_sha": m77, "user": { "login": "dave" }, "base": base })));
+        let readme = parse_files(&json!([{ "filename": "README.md", "patch": "@@ -1 +1 @@\n-a\n+b" }]));
+        let mut diffs: BTreeMap<String, Vec<FileDiff>> = others.iter().map(|p| (p.merge_sha.clone().unwrap(), readme.clone())).collect();
+        diffs.insert(m77.into(), undoing_files());
+        let mut commits = commits;
+        commits.insert(1, Commit { sha: "85".repeat(20), message: "Tidy (#85)".into() });
+        assert_eq!(find_revert_in(repo, 42, MERGE, "mallory", &commits, &pulls, &thing_files(), &diffs).map(|r| r.sha), Some(m77.to_string()));
+    }
+
+    /// Audit review-fix-poc-3: the claim PR's first page of files is 100 binary files (no patch;
+    /// GitHub sorts them ahead of `src/`), its real change on page 2. Maintainers revert it with
+    /// GitHub's button (PR #61, merged with a merge commit, bringing git's "This reverts commit
+    /// <merge>"). The check reads the next page and compares the change. Every page of #42's files
+    /// all binary: judged by the files the revert touches. Every page over the size cap: the
+    /// commit stating the revert in git's words, a defined answer, not an error every retry.
+    #[tokio::test]
+    async fn no_shape_of_the_claim_pr_makes_it_revert_proof() {
+        let repo = "jackdishman/blockula";
+        let base = json!({ "ref": "main", "repo": { "full_name": repo, "default_branch": "main" } });
+        let (m61, r61) = ("6161616161616161616161616161616161616161", "5151515151515151515151515151515151515151");
+        let icons = |from: usize, n: usize| -> Vec<FileDiff> { (from..from + n).map(|i| FileDiff { filename: format!("assets/icon{i:03}.png"), added: true, patch: None }).collect() };
+        let pr61 = json!({ "number": 61, "state": "closed", "title": "Revert \"Add the thing\"", "body": "Reverts jackdishman/blockula#42", "merged_at": "2026-10-13T09:12:44Z", "merge_commit_sha": m61, "user": { "login": "dave" }, "base": base });
+        let walk = json!([
+            { "sha": m61, "commit": { "message": "Merge pull request #61 from dave/revert-42-thing\n\nRevert \"Add the thing\"" } },
+            { "sha": r61, "commit": { "message": format!("Revert \"Add the thing\"\n\nThis reverts commit {MERGE}, reversing\nchanges made to 77aa88bb99cc00dd11ee22ff33aa44bb55cc66dd.") } },
+            { "sha": MERGE, "commit": { "message": "Merge pull request #42 from alice/thing" } }
+        ]);
+        let routes = |pages: Vec<Value>, revert: Vec<FileDiff>| {
+            let mut r = vec![
+                (format!("/repos/{repo}/pulls/42"), claim_42("alice")),
+                (format!("/repos/{repo}/commits?since={SINCE}&per_page=100&page=1"), walk.clone()),
+                (format!("/repos/{repo}/commits/{r61}"), json!({ "sha": r61, "files": files_json(&revert) })),
+                (format!("/repos/{repo}/pulls/61"), pr61.clone()),
+                (format!("/repos/{repo}/pulls/61/files?per_page=100&page=1"), files_json(&revert)),
+            ];
+            r.extend(pages.into_iter().enumerate().map(|(i, v)| (format!("/repos/{repo}/pulls/42/files?per_page=100&page={}", i + 1), v)));
+            r
+        };
+        let removed = |files: &[FileDiff]| -> Vec<FileDiff> { files.iter().map(|f| FileDiff { added: false, ..f.clone() }).collect() };
+        // 100 icons, then the change.
+        let mut revert = removed(&icons(0, 100));
+        revert.extend(undoing_files());
+        let gh = Mock::new(routes(vec![files_json(&icons(0, 100)), files_json(&thing_files())], revert.clone()));
+        assert_eq!(gh.find(42).await.unwrap().map(|r| (r.sha, r.by)), Some((r61.to_string(), Stated::Commit)));
+        // Only icons, three full pages of them: the revert touches them all.
+        let all = icons(0, 300);
+        let gh = Mock::new(routes(all.chunks(100).map(files_json).collect(), removed(&all)));
+        assert_eq!(gh.find(42).await.unwrap().map(|r| r.sha), Some(r61.to_string()));
+        // A commit that changes something else isn't the revert, even with icons only.
+        let gh = Mock::new(routes(all.chunks(100).map(files_json).collect(), undoing_files()));
+        assert_eq!(gh.find(42).await.unwrap(), None);
+        // Every page over the size cap: the commit that says so in git's words.
+        let big = || vec![Value::from("too large"); 3];
+        let gh = Mock::new(routes(big(), vec![]));
+        assert_eq!(gh.find(42).await.unwrap().map(|r| (r.sha, r.by)), Some((r61.to_string(), Stated::Commit)));
+        // And with only a PR description saying so (which its author can edit): no revert, and a
+        // definite answer.
+        let quiet = json!([{ "sha": m61, "commit": { "message": "Merge pull request #61 from dave/revert-42-thing" } }, { "sha": r61, "commit": { "message": "Undo" } }, { "sha": MERGE, "commit": { "message": "Merge pull request #42 from alice/thing" } }]);
+        let mut r = routes(big(), vec![]);
+        r[1].1 = quiet;
+        assert_eq!(Mock::new(r).find(42).await.unwrap(), None);
     }
 
     /// Against GitHub itself (network, so ignored): `cargo test live_revert -- --ignored`.
