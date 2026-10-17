@@ -2791,7 +2791,7 @@ mod scenarios {
         for (tag, peers, small, farmer_soul, solid_soul) in [("weak1", 1, 8, 60, 1), ("weak3", 3, 8, 60, 1), ("weak3-even", 3, 8, 60, 60), ("weak7-boost", 7, 16, 170, 1)] {
             let ((fp, fs), (sp, ss), scores) = volume_field(tag, peers, small, farmer_soul, solid_soul);
             let best = scores.iter().copied().max().unwrap();
-            assert!(best >= MIN_SCORE_PPM && best <= PPM / 2, "{tag}: the weak claims are accepted, and none beats the field: {scores:?}");
+            assert!((MIN_SCORE_PPM..=PPM / 2).contains(&best), "{tag}: the weak claims are accepted, and none beats the field: {scores:?}");
             assert!(sp > 0 && fp < sp, "{tag}: {small} weak PRs earned {fp}, the solid one {sp} (scores {scores:?})");
             assert!(fs < ss, "{tag}: Soul {fs} vs {ss}");
             // Their Soul together is under 4/3 of what the best one alone earns.

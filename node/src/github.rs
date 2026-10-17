@@ -687,12 +687,11 @@ where
     for dir in dirs.into_iter().take(REVERT_BASE_DIRS) {
         let path = if dir.is_empty() { format!("/repos/{repo}/contents?ref={base}") } else { format!("/repos/{repo}/contents/{}?ref={base}", query_value(dir)) };
         let Some(v) = get_or_none(get, path).await? else { continue };
-        for e in v.as_array().map(Vec::as_slice).unwrap_or_default() {
-            if let (Some(path), Some(sha)) = (e["path"].as_str(), e["sha"].as_str().filter(|h| is_sha(h))) {
-                if e["type"] == "file" && paths.contains(&path) {
-                    out.insert(path.to_string(), sha.to_ascii_lowercase());
-                }
-            }
+        fn file(e: &Value) -> Option<(&str, &str)> {
+            Some((e["path"].as_str()?, e["sha"].as_str().filter(|h| is_sha(h))?)).filter(|_| e["type"] == "file")
+        }
+        for (path, sha) in v.as_array().map(Vec::as_slice).unwrap_or_default().iter().filter_map(file).filter(|(p, _)| paths.contains(p)) {
+            out.insert(path.to_string(), sha.to_ascii_lowercase());
         }
     }
     Ok(out)
