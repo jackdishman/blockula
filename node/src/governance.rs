@@ -1212,6 +1212,24 @@ fn clear_expired(state: &mut State, j: &mut Journal, account: &str, height: u64)
     }
 }
 
+/// Whether `tx`, included in the block at `height`, would run its action rather than store it
+/// for approvals: a multisig action runs when its proposer's approval (`MultisigPropose`) or this
+/// one (`MultisigApprove`) brings the owner keys' approvals on chain to the threshold; any other
+/// action runs as it is. A mempool read (the first-to-ask name hold, `Chain::first_to_ask`):
+/// execution decides.
+pub fn runs_when_included(state: &State, tx: &Tx, height: u64) -> bool {
+    let Ok(signer) = tx.signer_key_id() else { return true };
+    let g = &state.governance;
+    match &tx.action {
+        Action::MultisigPropose { .. } => g.multisigs.get(&tx.from).is_some_and(|m| m.threshold <= 1 && owner_keys(state, &tx.from).contains(&signer)),
+        Action::MultisigApprove { id } => {
+            let (Some(m), Some(p)) = (g.multisigs.get(&tx.from), g.multisig_proposals.get(id)) else { return false };
+            p.account == tx.from && height <= p.expires_at && !p.approvals.contains(&signer) && owner_keys(state, &tx.from).contains(&signer) && approvals(state, p) + 1 >= m.threshold as usize
+        }
+        _ => true,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn multisig_propose(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, signer: &str, key: &KeyRecord, action: &Action, height: u64) -> Result<()> {
     owner_only(key, "propose multisig actions")?;

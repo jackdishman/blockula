@@ -3270,7 +3270,8 @@ impl Chain {
         // tip displaces one). Unsigned ghost txs have no sender: no queue, nonce or simulation.
         let relay = crate::econ::base_fee(&self.state, self.height() + 1, tx.size());
         let replaces = crate::ghost::mempool_admit(&self.mempool, &self.mempool_ids, &tx, relay, evict)?;
-        if let Action::RegisterName { name } = &tx.action {
+        let asks = crate::econ::name_asked_for(&self.state, &tx);
+        if let Some(name) = &asks {
             self.first_to_ask(&tx, name)?;
         }
         let unsigned = tx.is_unsigned();
@@ -3324,7 +3325,7 @@ impl Chain {
             self.lane.insert(id.clone(), d);
         }
         self.pool.insert(id.clone());
-        self.mp.add(id.clone(), &tx, next);
+        self.mp.add(id.clone(), &tx, next, asks);
         self.mempool.push(tx);
         self.mempool_ids.push(id.clone());
         self.publish_mempool();
@@ -3332,25 +3333,31 @@ impl Chain {
     }
 
     /// Names go to whoever asked first, as far as this mempool can tell (audit F35, a mitigation):
-    /// a registration of a name that another account's registration is already waiting for isn't
-    /// admitted, whatever its tip, so outbidding a registration seen in the public mempool
-    /// doesn't work through this node (or any node the first one reached first). The waiting one
-    /// holds the name only while it can be included in the next block (its fee covers that
-    /// block's base fee) and for [`NAME_HOLD_BLOCKS`] after it arrived, so a registration that's
-    /// stuck, or left waiting on purpose, keeps the name from nobody. A sender's own txs never
-    /// count against it. The waiting registrations are an index read (newest first, stopping at
-    /// the first that's too old), not a mempool scan. A proposer can still put its own
-    /// registration first in its block: PLAN.md "Known limits".
+    /// a tx asking for a name (`name`, normalized: a `RegisterName`, or one wrapped in a
+    /// multisig action, [`crate::econ::name_asked_for`]) that another account's registration is
+    /// already waiting for isn't admitted, whatever its tip, so outbidding a registration seen in
+    /// the public mempool doesn't work through this node (or any node the first one reached
+    /// first). The waiting one holds the name only while it would register it in the next block:
+    /// its fee covers that block's base fee, and a multisig's proposal or approval would run the
+    /// registration rather than wait for more approvals
+    /// ([`crate::governance::runs_when_included`]; a multisig's owner keys can't tip, so this
+    /// is all a multisig's registration has against tips). And only for [`NAME_HOLD_BLOCKS`]
+    /// after it arrived, so a registration that's stuck, or left waiting on purpose, keeps the
+    /// name from nobody. Wrapped ones that wouldn't run hold nothing but are still held off, so
+    /// approvals that only together reach the threshold, or a proposal queued with its approval,
+    /// can't get past a waiting registration either. A sender's own txs never count against it.
+    /// The waiting registrations are an index read (newest first, stopping at the first that's
+    /// too old), not a mempool scan. A proposer can still put its own registration first in its
+    /// block: PLAN.md "Known limits".
     fn first_to_ask(&self, tx: &Tx, name: &str) -> Result<()> {
-        let Ok(n) = normalize_name(name) else { return Ok(()) };
         let next = self.height() + 1;
         let held = self
             .mp
-            .registrations(&n)
+            .registrations(name)
             .take_while(|p| p.added_at.saturating_add(NAME_HOLD_BLOCKS) >= next)
-            .any(|p| p.tx.from != tx.from && crate::econ::check_fee(&self.state, &p.tx, next).is_ok());
+            .any(|p| p.tx.from != tx.from && crate::econ::check_fee(&self.state, &p.tx, next).is_ok() && crate::governance::runs_when_included(&self.state, &p.tx, next));
         if held {
-            bail!("another account's registration of {n}{NAME_SUFFIX} is already waiting: names go to whoever asked first");
+            bail!("another account's registration of {name}{NAME_SUFFIX} is already waiting: names go to whoever asked first");
         }
         Ok(())
     }

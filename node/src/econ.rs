@@ -580,6 +580,21 @@ pub fn grace_until(state: &State, rec: &NameRecord) -> u64 {
     rec.expires_at.saturating_add(rec.grace_blocks.max(state.chain_params.name_grace_blocks))
 }
 
+/// The name `tx` asks to register (normalized), for the mempool's first-to-ask hold
+/// (`Chain::first_to_ask`, audit F35): a `RegisterName`, one wrapped in a `MultisigPropose`, or
+/// a `MultisigApprove` of the sender's stored proposal to register one.
+pub fn name_asked_for(state: &State, tx: &Tx) -> Option<String> {
+    let action = match &tx.action {
+        Action::MultisigPropose { action } => action.as_ref(),
+        Action::MultisigApprove { id } => &state.governance.multisig_proposals.get(id).filter(|p| p.account == tx.from)?.action,
+        a => a,
+    };
+    match action {
+        Action::RegisterName { name } => normalize_name(name).ok(),
+        _ => None,
+    }
+}
+
 /// `RegisterName`: a name nobody holds (or whose grace ran out), not reserved, for a year.
 pub(crate) fn register_name(state: &mut State, j: &mut Journal, sender: &str, name: &str, height: u64) -> Result<()> {
     let n = normalize_name(name)?;
@@ -1575,6 +1590,93 @@ mod tests {
             s.rate *= 100;
         }
         t.c.submit(t.tx(&mallory, Action::RegisterName { name: "kraken".into() })).unwrap();
+        t.done();
+    }
+
+    /// Review of audit F35's mitigation: a registration wrapped in a multisig action asks for the
+    /// name too. A 1-of-1 multisig's `MultisigPropose { RegisterName }` (it runs at once) and a
+    /// `MultisigApprove` that would run a stored one are held off by another account's waiting
+    /// registration, and hold the name against others while they wait (a multisig's owner keys
+    /// can't tip, so without the hold any tipped registration outbids a multisig's). Wrapped
+    /// registrations that wouldn't run when included (a k-of-n proposal, an approval short of the
+    /// threshold) hold nothing, but are still held off, so approvals that only together reach the
+    /// threshold, or a proposal and its approval queued back to back, can't get in either.
+    #[test]
+    fn wrapped_registrations_ask_first_too() {
+        use crate::types::key_id;
+        let (alice, mallory, carol, erin, frank) = (keys(1), keys(2), keys(3), keys(4), keys(5));
+        let mut t = chain("names-wrapped", ["a", "m", "c", "e", "f"].iter().zip([&alice, &mallory, &carol, &erin, &frank]).map(|(l, k)| alloc(k, 1_000 * FANG, None, l)).collect(), &[], 600);
+        let waiting = |t: &T, name: &str| t.c.live.mempool().registrations(name).count();
+        let kid = |k: &Keys| key_id(&k.public_key());
+        // `signer`'s tx for `from` (one of its accounts), at that account's next nonce.
+        let as_key = |t: &T, signer: &Keys, from: &Keys, action: Action| {
+            let mut tx = t.unsigned(signer, action);
+            (tx.from, tx.nonce) = (from.address(), t.c.next_nonce(&from.address()));
+            tx.sign(signer)
+        };
+        // `k`'s tx tipping ten times the base fee.
+        let tipped = |t: &T, k: &Keys, action: Action| {
+            let mut tx = t.unsigned(k, action);
+            (tx.tip, tx.fee) = (tx.fee * 10, tx.fee * 11);
+            tx.sign(k)
+        };
+        let wrap = |name: &str| Action::MultisigPropose { action: Box::new(Action::RegisterName { name: name.into() }) };
+        // Mallory's account is a 1-of-1 multisig; erin's a 2-of-2 with frank's key.
+        t.ok(&mallory, Action::MultisigCreate { owners: vec![kid(&mallory)], threshold: 1 });
+        t.ok(&erin, Action::AddKey { key_id: kid(&frank), label: "frank".into(), role: KeyRole::Owner });
+        t.ok(&erin, Action::MultisigCreate { owners: vec![kid(&erin), kid(&frank)], threshold: 2 });
+
+        // The reviewer's bypass: alice waits for coinbase; mallory's 1-of-1 wrap asks for it too.
+        t.c.submit(t.tx(&alice, Action::RegisterName { name: "coinbase".into() })).unwrap();
+        let e = t.c.submit(as_key(&t, &mallory, &mallory, wrap("Coinbase.boo"))).unwrap_err().to_string();
+        assert!(e.contains("already waiting"), "{e}");
+        t.c.produce_block().unwrap();
+        assert_eq!(t.c.state.resolve("coinbase.boo").unwrap(), alice.address());
+
+        // A waiting 1-of-1 wrap holds the name: carol's direct registration isn't admitted,
+        // whatever its tip (a multisig can't tip back).
+        t.c.submit(as_key(&t, &mallory, &mallory, wrap("kraken"))).unwrap();
+        assert_eq!(waiting(&t, "kraken"), 1);
+        let e = t.c.submit(tipped(&t, &carol, Action::RegisterName { name: "kraken".into() })).unwrap_err().to_string();
+        assert!(e.contains("already waiting"), "{e}");
+        t.c.produce_block().unwrap();
+        assert_eq!((t.c.state.resolve("kraken.boo").unwrap(), waiting(&t, "kraken")), (mallory.address(), 0));
+
+        // A 2-of-2 proposal waiting holds nothing (it doesn't register when included)…
+        t.c.submit(as_key(&t, &erin, &erin, wrap("gemini"))).unwrap();
+        assert_eq!(waiting(&t, "gemini"), 1, "indexed");
+        t.c.submit(tipped(&t, &carol, Action::RegisterName { name: "gemini".into() })).unwrap();
+        // … and a proposal of a name another account is waiting for is held off, so erin can't
+        // queue a proposal and frank's approval behind it.
+        t.c.submit(t.tx(&alice, Action::RegisterName { name: "bitstamp".into() })).unwrap();
+        let e = t.c.submit(as_key(&t, &erin, &erin, wrap("bitstamp"))).unwrap_err().to_string();
+        assert!(e.contains("already waiting"), "{e}");
+        t.c.produce_block().unwrap();
+        assert_eq!(t.c.state.resolve("gemini.boo").unwrap(), carol.address());
+        assert_eq!((waiting(&t, "gemini"), waiting(&t, "bitstamp")), (0, 0));
+        let gemini = t.c.state.governance.next_multisig_id - 1;
+        assert!(matches!(&t.c.state.governance.multisig_proposals[&gemini].action, Action::RegisterName { name } if name == "gemini"));
+
+        // A stored proposal of a free name: frank's approval would run it, so it's held off by
+        // alice's waiting registration (the k-of-n variant of the bypass)…
+        t.c.submit(as_key(&t, &erin, &erin, wrap("okx"))).unwrap();
+        t.c.produce_block().unwrap();
+        let okx = t.c.state.governance.next_multisig_id - 1;
+        t.c.submit(t.tx(&alice, Action::RegisterName { name: "okx".into() })).unwrap();
+        let e = t.c.submit(as_key(&t, &frank, &erin, Action::MultisigApprove { id: okx })).unwrap_err().to_string();
+        assert!(e.contains("already waiting"), "{e}");
+        t.c.produce_block().unwrap();
+        assert_eq!(t.c.state.resolve("okx.boo").unwrap(), alice.address());
+        // … and, waiting, it holds the name against carol.
+        t.c.submit(as_key(&t, &erin, &erin, wrap("bybit"))).unwrap();
+        t.c.produce_block().unwrap();
+        let bybit = t.c.state.governance.next_multisig_id - 1;
+        t.c.submit(as_key(&t, &frank, &erin, Action::MultisigApprove { id: bybit })).unwrap();
+        assert_eq!(waiting(&t, "bybit"), 1);
+        let e = t.c.submit(tipped(&t, &carol, Action::RegisterName { name: "bybit".into() })).unwrap_err().to_string();
+        assert!(e.contains("already waiting"), "{e}");
+        t.c.produce_block().unwrap();
+        assert_eq!((t.c.state.resolve("bybit.boo").unwrap(), waiting(&t, "bybit")), (erin.address(), 0));
         t.done();
     }
 
