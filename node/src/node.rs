@@ -308,15 +308,22 @@ async fn watch_network(chain: Shared, peers: Vec<String>, protection: Arc<Protec
         if protection.watching() {
             let answers: Vec<Option<u64>> = futures::future::join_all(peers.iter().map(|p| peer_tip(&client, p, &genesis_hash))).await;
             let height = chain.lock().height();
+            let mut ahead = vec![];
             for (i, tip) in answers.iter().enumerate() {
                 if tip.is_some_and(|t| t > height) && probed.insert(i, height) != Some(height) {
-                    match probe_ahead(&chain, &provider, &probe_client, &peers[i]).await {
-                        Ok(to) => {
-                            tracing::warn!(peer = %peers[i], height, to, "a peer proved the network finalized blocks past this node's tip (slashing protection keeps abstaining)");
-                            chain.lock().set_finalized_tip(to);
-                        }
-                        Err(e) => tracing::debug!(peer = %peers[i], height, error = %e, "a peer claims to be ahead but didn't prove it"),
+                    ahead.push(i);
+                }
+            }
+            // All at once: a peer that claims to be ahead and then stalls its answer costs one
+            // probe timeout per height of this node, however many do it.
+            let proofs = futures::future::join_all(ahead.iter().map(|&i| probe_ahead(&chain, &provider, &probe_client, &peers[i]))).await;
+            for (i, proof) in ahead.into_iter().zip(proofs) {
+                match proof {
+                    Ok(to) => {
+                        tracing::warn!(peer = %peers[i], height, to, "a peer proved the network finalized blocks past this node's tip (slashing protection keeps abstaining)");
+                        chain.lock().set_finalized_tip(to);
                     }
+                    Err(e) => tracing::info!(peer = %peers[i], height, error = %e, "a peer claims to be ahead but didn't prove it (one unverified answer)"),
                 }
             }
             let tips: Vec<u64> = answers.into_iter().flatten().collect();
