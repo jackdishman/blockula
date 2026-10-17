@@ -261,7 +261,12 @@ function AddAgent() {
     limitOk = false;
   }
   const valid = grant !== null && limitOk && Number.isInteger(nDays) && nDays > 0 && nDays <= 365;
-  const me = account?.names[0] ?? wallet.account;
+  // The agent is told the account's address, the wallet's own (not a node's answer): on mainnet an
+  // agent won't act for a name only one node vouched for (the SDK's actAs refuses it, the MCP's
+  // use_account asks to confirm the address), so the name is only a label (review-r3-clients-4).
+  const me = wallet.account;
+  const name = account?.names[0];
+  const who = name ? `${name} (${me})` : me;
   // A "day" in blocks. A fixed constant: block timing reported by the node isn't trusted here.
   const day = BLOCKS_PER_DAY;
 
@@ -281,7 +286,7 @@ function AddAgent() {
     }
   };
 
-  const snippet = `Your Blockula key may now spend from ${me}
+  const snippet = `Your Blockula key may now spend from ${who}
 (up to ${done?.limit ?? limit} FANG per day, sends only, for ${done?.days ?? nDays} days).
 
 MCP:  call use_account with account "${me}"
@@ -295,8 +300,11 @@ SDK:  await wallet.actAs("${me}");
         Let an AI agent pay for things without handing over your wallet. It gets its own key, a daily limit and an expiry date, and can only send FANG.
       </p>
       <ol className="steps">
-        <li>Tell your agent (e.g. Claude Code with the Blockula MCP) to <code>use_account</code> <span className="mono">{me}</span>.</li>
-        <li>It answers with a <code>grant_code</code> (its key&apos;s consent to this account). Paste it here.</li>
+        <li>
+          Tell your agent (e.g. Claude Code with the Blockula MCP) to <code>use_account</code> with this account&apos;s address
+          {name ? <> ({name})</> : null}: <span className="mono break" data-testid="agent-account">{me}</span> <Copy text={me} label="Copy address" />
+        </li>
+        <li>It answers with a <code>grant_code</code> (its key&apos;s consent to this account). Paste it here. If it asks you to confirm an address instead, it should be exactly the one above.</li>
       </ol>
       <label className="field">
         <span>Agent&apos;s grant code</span>

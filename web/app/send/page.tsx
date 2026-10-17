@@ -58,7 +58,9 @@ function useRecipient(input: string): Recipient {
       try {
         // With the network's witnesses the name's proven owner is signed. Without them the name
         // itself is signed, and the chain pays whoever owns it when the transfer runs, so the node
-        // can't redirect it; what it says the owner is, is shown as just that (audit gap-7-1).
+        // can't point it at another account now (it could hold it and release it later in its
+        // validity window); what it says the owner is, is shown as just that (audit gap-7-1,
+        // review-r3-clients-2).
         const res = await client.recipient(q);
         if (!live) return;
         const detail = res.byChain ? `the chain pays its owner when this runs · your node says ${shortAddr(res.address)} (not proven)` : `${shortAddr(res.address)} · proven by ${client.witnesses.length} other node${client.witnesses.length === 1 ? "" : "s"}`;
@@ -194,7 +196,7 @@ function Send() {
               <div className="mono small break" data-testid="signed-to">{review.tx.action.type === "transfer" ? review.tx.action.to : ""}</div>
               {review.byChain && (
                 <div className="small" data-testid="by-chain">
-                  Signed as the name: the chain pays whoever owns {review.display} when this transaction runs, so no node can send it elsewhere. Your node says that&apos;s <span className="mono break">{review.nodeSays}</span> (not proven).
+                  Signed as the name: the chain pays whoever owns {review.display} when this transaction runs, so your node can&apos;t point it at another account now. Your node says that&apos;s <span className="mono break">{review.nodeSays}</span> (not proven). A dishonest node could still hold the transaction and release it later (its validity window counts from the height that node reports), after the name changed hands: for a name about to expire, pay the address instead.
                 </div>
               )}
               {!review.proven && !review.byChain && <div className="warn small">Looked up on your node only, not proven. For a large payment, check this address with the person you&apos;re paying.</div>}
@@ -267,7 +269,7 @@ function Send() {
       <Tip>
         {client.witnesses.length
           ? <>Names are proven against {client.witnesses.length + 1} independent nodes before you sign, and the review shows the exact address that gets paid.</>
-          : <>A name is signed as the name: the chain pays whoever owns it when the transaction runs, so the node you&apos;re connected to can&apos;t point it at someone else. The review shows exactly what gets signed.</>}
+          : <>A name is signed as the name: the chain pays whoever owns it when the transaction runs, so the node you&apos;re connected to can&apos;t point it at another account now (a dishonest one could only hold the transaction and release it later, by when the name may have changed hands). The review shows exactly what gets signed.</>}
       </Tip>
     </main>
   );

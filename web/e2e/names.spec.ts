@@ -4,7 +4,7 @@ import { parseFang, type Tx } from "@blockula/sdk";
 import { addressOf } from "./mock-node";
 import { createWallet, expect, test } from "./helpers";
 
-test("a payment to a name signs the name, so a lying node can't redirect it", async ({ page, node }) => {
+test("a payment to a name signs the name, so a lying node can't point it at another account", async ({ page, node }) => {
   const alice = addressOf("a1".repeat(32));
   const mallory = addressOf("66".repeat(32));
   node.names.set("alice", alice);

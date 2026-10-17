@@ -33,6 +33,8 @@ test("lists proposals and votes with conviction", async ({ page, node }) => {
       tally: null,
       outcome: "",
     },
+    // review-r3-clients-1: a cancellation says it supersedes the upgrade proposals still open.
+    { id: 8, title: "Postpone the v2 feature flag", url: "", kind: { type: "cancel_upgrade", version: 2, activation_height: 90_000 }, summary: "cancel the upgrade to protocol v2 at block 90000", proposer: label("boo1proposer"), deposit: "0", status: "voting", created_at: node.height - 5, voting_end: node.height + 5000, execute_at: null, supermajority: true, ayes: { amount: big(0n), weight: big(0n) }, nays: { amount: big(0n), weight: big(0n) }, voters: 0, council: [], tally: null, outcome: "" },
     // On-chain strings are attacker-controlled: they must render as text, and only https links work.
     { id: 6, title: '<img src=x onerror="window.__pwned=1">', url: "javascript:window.__pwned=2", kind: { type: "grant_soul", to: addressOf("5e".repeat(32)), amount: 1000, reason: "<b>bold</b>" }, summary: "<b>bold</b>", proposer: label("boo1proposer"), deposit: "0", status: "rejected", created_at: 1, voting_end: 2, execute_at: null, supermajority: false, ayes: { amount: big(0n), weight: big(0n) }, nays: { amount: big(5n), weight: big(5n) }, voters: 1, council: [], tally: { unlocked_supply: big(1000n), quorum: big(40n), quorum_reached: false, supermajority: false, council_size: 22, council_ayes: 0, council_nays: 0 }, outcome: "quorum not reached" },
   ];
@@ -49,6 +51,9 @@ test("lists proposals and votes with conviction", async ({ page, node }) => {
   await expect(open).toContainText("council: 15 validators approve, 1 reject");
   await expect(open).toContainText("by vlad.boo");
   await expect(open.getByRole("link", { name: "Full text ↗" })).toHaveAttribute("href", "https://forum.blockula.test/p/7");
+
+  const cancel = page.getByTestId("proposal").filter({ hasText: "Postpone the v2 feature flag" });
+  await expect(cancel.getByTestId("proposal-does")).toHaveText("Cancel the upgrade to protocol v2 at block 90000 and any upgrade scheduled after it; upgrade proposals still open when it runs are superseded and can't take effect");
 
   // The hostile proposal is plain text, with no link and no script run.
   const hostile = page.getByTestId("proposal").filter({ hasText: "onerror" });
