@@ -2,25 +2,32 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
+import { encodeKeyGrant, type Resolution } from "@blockula/sdk";
 import { useEffect, useState } from "react";
 import { Splash, Unlock } from "@/components/Gate";
-import { AccountPicker } from "@/components/AccountPicker";
 import { Ornament } from "@/components/Ornament";
 import { Copy, ErrorNote, Spinner, Tip } from "@/components/ui";
 import { localKeysAllowed } from "@/lib/config";
 import { friendly, isPrfUnsupported } from "@/lib/errors";
 import { keyCode } from "@/lib/format";
-import { createLocalKey, createPasskey, findAccounts, type AccountChoice } from "@/lib/keys";
+import { createLocalKey, createPasskey, type AccountChoice } from "@/lib/keys";
+import type { AccountView } from "@/lib/types";
 import { useWallet } from "@/lib/wallet";
 
-/** The NEW device's side of linking: make a key, show its id, wait to be added. */
+/**
+ * The NEW device's side of linking: make a key, ask which account it joins, show its grant code
+ * (the key's consent to that account, which adding it needs: audit gap-7-2), and wait until the
+ * account's own key list has it. Never a list of accounts from /api/key, which isn't this
+ * device's to trust before it's on one.
+ */
 export default function LinkPage() {
   const { ready, hint, wallet, client, unlocked, forget } = useWallet();
   const router = useRouter();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [prf, setPrf] = useState(false);
-  const [choices, setChoices] = useState<AccountChoice[] | null>(null);
+  const [target, setTarget] = useState("");
+  const [joining, setJoining] = useState<{ res: Resolution; code: string } | null>(null);
 
   const waiting = !!wallet && !!hint && !hint.account;
 
@@ -31,16 +38,30 @@ export default function LinkPage() {
     router.replace("/");
   };
 
-  // Poll until an owner adds this key to their account.
+  const grantFor = async () => {
+    if (!wallet) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await client.resolution(target.trim());
+      setJoining({ res, code: encodeKeyGrant(await wallet.keyGrant(res.address)) });
+    } catch (e) {
+      setError(friendly(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // Poll the chosen account's own key list until an owner adds this key there.
   useEffect(() => {
-    if (!waiting || !wallet || choices) return;
+    if (!waiting || !wallet || !joining) return;
     let live = true;
     const tick = async () => {
       try {
-        const list = (await findAccounts(client, wallet)).filter((c) => c.address !== wallet.address);
-        if (!live || !list.length) return;
-        if (list.length === 1) await finish(list[0]);
-        else setChoices(list);
+        const a = (await client.account(joining.res.address)) as AccountView;
+        const k = a.keys.find((x) => x.key_id === wallet.keyId);
+        if (!live || !k) return;
+        await finish({ address: joining.res.address, name: a.names[0] ?? null, short: a.account.short, role: k.role.type, label: k.label, balance: a.balance_display });
       } catch {
         /* node hiccup; keep polling */
       }
@@ -52,7 +73,7 @@ export default function LinkPage() {
       clearInterval(t);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [waiting, wallet, choices, client]);
+  }, [waiting, wallet, joining, client]);
 
   const make = async (kind: "passkey" | "local") => {
     setBusy(true);
@@ -70,7 +91,6 @@ export default function LinkPage() {
 
   if (!ready) return <Splash />;
   if (hint && !wallet) return <Unlock />;
-  if (choices) return <main className="narrow"><AccountPicker choices={choices} onPick={finish} /></main>;
 
   if (wallet && hint?.account)
     return (
@@ -82,25 +102,50 @@ export default function LinkPage() {
       </main>
     );
 
-  if (waiting && wallet)
+  if (waiting && wallet && !joining)
+    return (
+      <main className="narrow stack-lg">
+        <div className="center">
+          <Ornament kind="candle" className="hero-ornament" />
+          <h1>Which account?</h1>
+          <p className="dim">Enter the .boo name or address of the account this device should join. On your other device it&apos;s at the top of <b>Devices &amp; agents → Link a device</b>.</p>
+        </div>
+        <section className="card stack">
+          <label className="field">
+            <span>Your account</span>
+            <input value={target} onChange={(e) => setTarget(e.target.value)} placeholder="yourname.boo or boo1…" autoCapitalize="none" spellCheck={false} />
+          </label>
+          <button className="btn primary" disabled={!target.trim() || busy} onClick={grantFor}>{busy ? <Spinner>Signing…</Spinner> : "Make this device's grant code"}</button>
+          <ErrorNote error={error} />
+        </section>
+        <Tip>This device signs its consent to joining that account, and only that one. Nobody else can put this device on their account.</Tip>
+        <button className="link center-self" onClick={() => { forget(); router.replace("/welcome"); }}>Cancel and start over</button>
+      </main>
+    );
+
+  if (waiting && wallet && joining)
     return (
       <main className="narrow stack-lg">
         <div className="center">
           <Ornament kind="candle" className="hero-ornament" />
           <h1>Almost there</h1>
-          <p className="dim">On a device that already has your wallet, open <b>Devices &amp; agents → Link a device</b> and paste this key id.</p>
+          <p className="dim">On a device that already has your wallet, open <b>Devices &amp; agents → Link a device</b> and paste this grant code.</p>
         </div>
         <section className="card stack">
-          <span className="eyebrow">This device&apos;s key id</span>
-          <div className="mono address">{wallet.keyId}</div>
-          <Copy text={wallet.keyId} label="Copy key id" />
+          <span className="eyebrow">Joining</span>
+          <div className="mono address">{joining.res.name ? `${joining.res.name}.boo · ` : ""}{joining.res.address}</div>
+          {!joining.res.proven && <span className="warn small">Looked up on your node only, not proven: check this address on your other device.</span>}
+          <span className="eyebrow">This device&apos;s grant code</span>
+          <div className="mono address small">{joining.code.slice(0, 48)}…</div>
+          <Copy text={joining.code} label="Copy grant code" />
           <span className="eyebrow">Check code (should match on the other device)</span>
           <div className="code">{keyCode(wallet.keyId)}</div>
         </section>
         <p className="center"><Spinner>Waiting to be added…</Spinner></p>
         <Tip>
-          A key id is a fingerprint of this device&apos;s public key. It&apos;s safe to send over chat or email: it lets your other device <i>grant</i> access, but can&apos;t spend anything by itself.
+          The grant code holds this device&apos;s public key and its signed consent to joining this one account. It&apos;s safe to send over chat or email: it lets your other device <i>grant</i> access, but can&apos;t spend anything by itself.
         </Tip>
+        <button className="link center-self" onClick={() => setJoining(null)}>Pick another account</button>
         <button className="link center-self" onClick={() => { forget(); router.replace("/welcome"); }}>Cancel and start over</button>
       </main>
     );

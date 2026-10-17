@@ -20,7 +20,7 @@ const base = V.cases.find((c) => c.label === "tx integers at zero")!.tx;
 const tx = (patch: Partial<UnsignedTx>): UnsignedTx => ({ ...base, ...patch });
 const act = (action: Action) => tx({ action });
 const session = (limit: unknown, extra: Partial<Extract<KeyRole, { type: "session" }>> = {}): Action =>
-  ({ type: "add_key", key_id: "cd".repeat(32), label: "agent", role: { type: "session", limit, period_blocks: 10, expires_at: 10, ...extra } }) as Action;
+  ({ type: "add_key", key_id: "cd".repeat(32), label: "agent", role: { type: "session", limit, period_blocks: 10, expires_at: 10, ...extra }, public_key: "0e", pop: "0f" }) as Action;
 const MAX = (1n << 64n) - 1n;
 
 // The finding's examples: a "-1" limit would have become u64::MAX (an unlimited session key), and
@@ -61,7 +61,7 @@ const refused: [string, UnsignedTx, RegExp][] = [
   ["negative hunt id", act({ type: "fund_hunt", hunt_id: -1, amount: "1" }), /0 to/],
   ["negative spam id", act({ type: "reveal_votes", seance_id: 1, votes: "", spam: [-1], salt: "" }), /0 to/],
   ["param value 2^64", act({ type: "propose", kind: { type: "param_change", key: "k", value: (MAX + 1n).toString() }, deposit: "1", title: "t" }), /0 to/],
-  ["label not a string", act({ type: "add_key", key_id: "ab".repeat(32), label: 5 as unknown as string, role: { type: "owner" } }), /must be a string/],
+  ["label not a string", act({ type: "add_key", key_id: "ab".repeat(32), label: 5 as unknown as string, role: { type: "owner" }, public_key: "0c", pop: "0d" }), /must be a string/],
 ];
 for (const [label, t, re] of refused) assert.throws(() => signingBytes(t), re, label);
 

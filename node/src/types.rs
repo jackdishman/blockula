@@ -2330,7 +2330,7 @@ pub(crate) mod tests {
         for action in vector_actions() {
             h.update(&vector_tx(action).signing_bytes());
         }
-        assert_eq!(h.finalize().to_hex().to_string(), "3633490a583afa9a7aec72593fd29e9d5461b3a037abec251ca90c762e3b1b65");
+        assert_eq!(h.finalize().to_hex().to_string(), "f6013e20819a81f199b415be65c8ad6fe2df599b782b8e63d5e21e9dd3771aca");
         // Wire form, size and id of one tx.
         let tx = vector_tx(Action::Transfer { to: "x.boo".into(), amount: 5 });
         assert_eq!(hex::encode(crypto::hash(&tx.to_bytes())), "084ce40c9d406468f7373b0aced2b285ff77d353de986752050877e1953501e0");

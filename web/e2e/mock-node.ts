@@ -2,7 +2,7 @@
 // wallet's flows (status, accounts, keys, names, faucet, tx submit/lookup). Submitted txs are
 // checked like the real node does it: ML-DSA signature over the SDK's signing bytes, the signing
 // key authorized on `from` (owner keys for key changes), nonce and balance.
-import { formatFang, keyId as keyIdOf, parseFang, signingBytes, type Tx } from "@blockula/sdk";
+import { formatFang, keyId as keyIdOf, parseFang, signingBytes, verifyKeyGrant, type Tx } from "@blockula/sdk";
 import { hexToBytes } from "@noble/hashes/utils.js";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import type { BrowserContext, Page, Route } from "@playwright/test";
@@ -201,6 +201,8 @@ export class MockNode {
       if (key.role.type !== "owner") throw new HttpError(400, `only owner keys can ${act.type === "add_key" ? "add" : "remove"} keys`);
       const keys = new Map(this.keysOf(tx.from));
       if (act.type === "add_key") {
+        // As node/src/types.rs `verify_key_pop`: the added key consents to this account (gap-7-2).
+        if (!verifyKeyGrant({ account: tx.from, key_id: act.key_id, public_key: act.public_key, pop: act.pop }, this.chainId, this.genesisHash)) throw new HttpError(400, "the added key's proof of possession doesn't verify");
         keys.set(act.key_id, { label: act.label, role: act.role, added_at: this.height + 1 });
         summary = `${this.label(tx.from).name ?? this.label(tx.from).short} added key ${act.key_id.slice(0, 8)}… (${act.label}) as ${act.role.type === "owner" ? "an owner" : "a session key"}`;
       } else {

@@ -500,6 +500,8 @@ struct SmFixture {
     candidates: Vec<(String, String)>,
     /// Addresses that hold nothing at genesis.
     newcomers: Vec<String>,
+    /// Per agent, per user: the agent key's consent to joining that user's account (AddKey's pop).
+    agent_pops: Vec<Vec<String>>,
 }
 
 fn sm_fixture() -> &'static SmFixture {
@@ -535,7 +537,8 @@ fn sm_fixture() -> &'static SmFixture {
             })
             .collect();
         let newcomers = (0..8u8).map(|i| Keys::from_seed([200 + i; 32]).address()).collect();
-        SmFixture { state: genesis.initial_state(), validator: Who::of(&validator), users: users.iter().map(Who::of).collect(), agents: agents.iter().map(Who::of).collect(), candidates, newcomers }
+        let agent_pops = agents.iter().map(|a| users.iter().map(|u| types::key_pop(a, SM_CHAIN, &"00".repeat(32), &u.address())).collect()).collect();
+        SmFixture { state: genesis.initial_state(), validator: Who::of(&validator), users: users.iter().map(Who::of).collect(), agents: agents.iter().map(Who::of).collect(), candidates, newcomers, agent_pops }
     })
 }
 
@@ -626,7 +629,7 @@ impl Sm {
             0 => Action::Transfer { to: other, amount: fang(amt % 50) + 1 },
             1 => Action::Transfer { to: newcomer, amount: fang(1) },
             2 => Action::RegisterName { name: format!("name{}", b % 8) },
-            3 => Action::AddKey { key_id: agent.key_id.clone(), label: "agent".into(), role: KeyRole::Session { limit: fang(amt % 20), period_blocks: 1 + amt % 10, expires_at: h + 50 } },
+            3 => Action::AddKey { key_id: agent.key_id.clone(), label: "agent".into(), role: KeyRole::Session { limit: fang(amt % 20), period_blocks: 1 + amt % 10, expires_at: h + 50 }, public_key: agent.public_key.clone(), pop: f.agent_pops[b as usize % SM_AGENTS][ai].clone() },
             4 => Action::RemoveKey { key_id: agent.key_id.clone() },
             5 => Action::RegisterFamiliar { key_id: agent.key_id.clone(), label: "claude".into() },
             6 => return self.tx(agent, &me, tip, Action::Transfer { to: other, amount: fang(amt % 3) }),
@@ -901,7 +904,7 @@ pub fn seeds() -> Vec<(&'static str, &'static str, Vec<u8>)> {
         signed_tx(&funded, 0, 1_000, json!({ "type": "transfer", "to": other.address(), "amount": "2000000000" })),
         signed_tx(&funded, 1, 0, json!({ "type": "transfer", "to": "alice.boo", "amount": "1" })),
         signed_tx(&funded, 2, 0, json!({ "type": "register_name", "name": "count-dracula" })),
-        signed_tx(&funded, 3, 0, json!({ "type": "add_key", "key_id": types::key_id(&other.public_key()), "label": "agent", "role": { "type": "session", "limit": "5000000000", "period_blocks": 600, "expires_at": 100000 } })),
+        signed_tx(&funded, 3, 0, json!({ "type": "add_key", "key_id": types::key_id(&other.public_key()), "label": "agent", "role": { "type": "session", "limit": "5000000000", "period_blocks": 600, "expires_at": 100000 }, "public_key": hex::encode(other.public_key()), "pop": types::key_pop(&other, CHAIN_ID, genesis_hash(), &funded.address()) })),
         signed_tx(&funded, 4, 0, json!({ "type": "register_validator", "consensus_key": hex::encode(funded.public_key()), "p2p_addr": "203.0.113.9:7071", "http_addr": "https://v.example", "bond": "50000000000", "pop": pop("203.0.113.9:7071", "https://v.example") })),
         signed_tx(&funded, 5, 0, json!({ "type": "create_hunt", "repo": "jackdishman/blockula", "issue": 7, "amount": "10000000000", "expires_at": 9000, "title": "Fuzz the decoders" })),
         signed_tx(&funded, 6, 0, json!({ "type": "reveal_votes", "seance_id": 2, "votes": "ab=", "spam": [5, 6], "salt": "pepper" })),

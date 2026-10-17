@@ -24,7 +24,7 @@ import { join } from "node:path";
 import { Client as McpClient } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
-import { addressFromPublicKey, parseFang, txId, type Tx } from "@blockula/sdk";
+import { addressFromPublicKey, decodeKeyGrant, parseFang, txId, verifyKeyGrant, type Tx } from "@blockula/sdk";
 import { SpendLedger } from "../src/spend.js";
 import { chainData, clean } from "../src/untrusted.js";
 
@@ -382,8 +382,14 @@ assert.match(r.json().name_resolution, /^UNPROVEN: bob\.boo as http:\/\/127\.0\.
 r = await s.call("send", { to: BOB, amount: "1" });
 assert.ok(!r.error && r.json().recipient_address === undefined && r.json().name_resolution === undefined, "an address needs no resolving");
 const agentKey = (await s.call("create_wallet")).json().key_id as string;
+// gap-7-2: not authorized yet: the answer is a grant code for exactly that account, which verifies.
 r = await s.call("use_account", { account: "bob.boo" });
-assert.ok(r.error && /hasn't authorized this key/.test(r.text), r.text);
+assert.ok(!r.error && r.json().status === "not_authorized_yet", r.text);
+const code = r.json().grant_code as string;
+const g = decodeKeyGrant(code);
+assert.deepEqual([g.account, g.key_id], [BOB, agentKey]);
+assert.ok(verifyKeyGrant(g, "fake-chain", G), "the grant verifies on the pinned chain");
+assert.match(r.json().next, /Give an agent a budget/);
 bobKeys = [{ key_id: agentKey, label: "claude", role: { type: "session" } }];
 r = await s.call("use_account", { account: "bob.boo" });
 assert.ok(!r.error && r.json().address === BOB && /^UNPROVEN/.test(r.json().name_resolution), r.text);

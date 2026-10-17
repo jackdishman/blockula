@@ -13,7 +13,7 @@ type Stage =
   | { s: "intro" }
   | { s: "show"; kit: Kit }
   | { s: "confirm"; kit: Kit; ask: [number, number] }
-  | { s: "activate"; keyId: string }
+  | { s: "activate"; grant: string }
   | { s: "done"; tx: TxView }
   | { s: "pending" };
 
@@ -39,14 +39,21 @@ export function RecoveryKitSetup({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const make = () => {
-    const { words, keyId } = generateKit();
+  const make = async () => {
     setError(null);
+    let made;
+    try {
+      made = await generateKit(wallet.account, client);
+    } catch (e) {
+      return setError(friendly(e));
+    }
+    const { words, keyId, grant } = made;
     setStage({
       s: "show",
       kit: {
         words,
         keyId,
+        grant,
         account: wallet.account,
         name: account?.names[0],
         network: NETWORK.label,
@@ -57,12 +64,12 @@ export function RecoveryKitSetup({
     });
   };
 
-  const activate = async (keyId: string) => {
+  const activate = async (grant: string) => {
     setBusy(true);
     setError(null);
     try {
       if (account && BigInt(account.balance) === 0n) throw new Error("insufficient balance: has 0 FANG");
-      const tx = (await wallet.addOwnerKey(keyId, KIT_LABEL)) as TxView;
+      const tx = (await wallet.addOwnerKey(grant, KIT_LABEL)) as TxView;
       updateHint({ pendingKit: undefined });
       setStage({ s: "done", tx });
       await refresh();
@@ -81,11 +88,13 @@ export function RecoveryKitSetup({
     const wrong = ask.filter((p, i) => wordIndex(answers[i]) === undefined || wordIndex(answers[i]) !== wordIndex(kit.words[p]));
     if (wrong.length) return setError(`That isn't word #${wrong[0] + 1} on your kit. Check what you wrote down.`);
     setAnswers(["", ""]);
-    // The words have done their job: from here on only the (public) key id is kept, in the hint
-    // until the key is on-chain, so a kit written down is never silently lost.
-    updateHint({ pendingKit: { keyId: kit.keyId, created: kit.created } });
-    setStage({ s: "activate", keyId: kit.keyId });
-    activate(kit.keyId);
+    // The words have done their job: from here on only the (public) key id and grant are kept, in
+    // the hint until the key is on-chain, so a kit written down is never silently lost.
+    const grant = kit.grant;
+    if (!grant) return setError("This kit has no grant to add it with. Make a new kit.");
+    updateHint({ pendingKit: { keyId: kit.keyId, created: kit.created, grant } });
+    setStage({ s: "activate", grant });
+    activate(grant);
   };
 
   const skip = onSkip && (
@@ -163,7 +172,7 @@ export function RecoveryKitSetup({
       <section className="card stack">
         <h2>Adding the kit to your account</h2>
         {busy ? <Spinner>Sealing the kit&apos;s key into a block…</Spinner> : <ErrorNote error={error} />}
-        {!busy && error && <button className="btn primary" onClick={() => activate(stage.keyId)}>Try again</button>}
+        {!busy && error && <button className="btn primary" onClick={() => activate(stage.grant)}>Try again</button>}
       </section>
     );
 

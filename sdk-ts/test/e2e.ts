@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex, hexToBytes, randomBytes } from "@noble/hashes/utils.js";
-import { ApiError, Client, NAMESPACES, POP_CONTEXT, TxFailedError, Wallet, addressFromPublicKey, addressPrefix, baseFee, beaconCommitment, formatFang, ghostSighash, isAddress, minFee, paramsOf, parseFang, parseSoul, popMessage, proposal, proposalSummary, seanceCommitment, sharesFor, signingBytes, stakeSummary, txBytes, txCharge, txId, txSize, verifyProof, type Action, type GhostBundle, type ProposalKind, type Tx } from "../src/index.js";
+import { ApiError, Client, NAMESPACES, POP_CONTEXT, encodeKeyGrant, TxFailedError, Wallet, addressFromPublicKey, addressPrefix, baseFee, beaconCommitment, formatFang, ghostSighash, isAddress, minFee, paramsOf, parseFang, parseSoul, popMessage, proposal, proposalSummary, seanceCommitment, sharesFor, signingBytes, stakeSummary, txBytes, txCharge, txId, txSize, verifyProof, type Action, type GhostBundle, type ProposalKind, type Tx } from "../src/index.js";
 
 const client = new Client(process.env.BLOCKULA_RPC ?? "http://localhost:7070");
 
@@ -17,8 +17,8 @@ assert.equal(formatFang(1_500_000_000n), "1.5 FANG");
 const vectorActions: Action[] = [
   { type: "transfer", to: "x.boo", amount: "5" },
   { type: "register_name", name: "vlad" },
-  { type: "add_key", key_id: "ab".repeat(32), label: "phone", role: { type: "owner" } },
-  { type: "add_key", key_id: "cd".repeat(32), label: "claude", role: { type: "session", limit: "10", period_blocks: 100, expires_at: 1000 } },
+  { type: "add_key", key_id: "ab".repeat(32), label: "phone", role: { type: "owner" }, public_key: "0c", pop: "0d" },
+  { type: "add_key", key_id: "cd".repeat(32), label: "claude", role: { type: "session", limit: "10", period_blocks: 100, expires_at: 1000 }, public_key: "0e", pop: "0f" },
   { type: "remove_key", key_id: "ab".repeat(32) },
   { type: "register_validator", consensus_key: "0a", p2p_addr: "1.2.3.4:5", http_addr: "https://v.example", bond: "50", pop: "0b" },
   { type: "approve_validator", validator: "boo1v" },
@@ -53,7 +53,7 @@ const vectorTx = (action: Action): Tx => ({ chain_id: "vec", genesis_hash: "03".
 const all = vectorActions.map((a) => signingBytes(vectorTx(a)));
 const joined = new Uint8Array(all.reduce((n, b) => n + b.length, 0));
 all.reduce((at, b) => (joined.set(b, at), at + b.length), 0);
-assert.equal(bytesToHex(blake3(joined)), "3633490a583afa9a7aec72593fd29e9d5461b3a037abec251ca90c762e3b1b65");
+assert.equal(bytesToHex(blake3(joined)), "f6013e20819a81f199b415be65c8ad6fe2df599b782b8e63d5e21e9dd3771aca");
 // Protocol v1 (tags 30–49, every proposal kind, a multisig proposal), hashed on its own: `v1_vector_actions` there.
 const propose = (kind: ProposalKind): Action => ({ type: "propose", kind, deposit: (1000n * 1_000_000_000n).toString(), title: "t" });
 const v1VectorActions: Action[] = [
@@ -193,8 +193,19 @@ console.log("✓ validity windows, the chain instance, prefixes and strict JSON 
 
 // Account abstraction: alice lets an agent key spend up to 5 FANG per 100 blocks from her account.
 const agent = Wallet.generate(client);
-const grant = await alice.addSessionKey(agent.keyId, "claude", { limit: "5", periodBlocks: 100, expiresInBlocks: 1000 });
+// The agent consents to alice's account (its grant code); a key id alone, or a grant made for
+// another account, can't be added (audit gap-7-2).
+const agentGrant = await agent.keyGrant(alice.address);
+await assert.rejects(alice.addSessionKey(agent.keyId, "claude", { limit: "5", periodBlocks: 100, expiresInBlocks: 1000 }), /that's a key id/);
+await assert.rejects(bob.addSessionKey(agentGrant, "claude", { limit: "5", periodBlocks: 100, expiresInBlocks: 1000 }), /that grant is for/);
+// Mallory (bob) signs alice's grant into his own AddKey anyway: the node refuses it.
+const stolen = { type: "add_key", key_id: agentGrant.key_id, label: "x", role: { type: "owner" }, public_key: agentGrant.public_key, pop: agentGrant.pop } as const;
+await assert.rejects(client.submit(await bob.build(stolen)), /proof of possession doesn't verify/);
+const grant = await alice.addSessionKey(encodeKeyGrant(agentGrant), "claude", { limit: "5", periodBlocks: 100, expiresInBlocks: 1000 });
 console.log("✓", grant.summary);
+const listing = await client.keyAccounts(agent.keyId);
+assert.deepEqual(listing.accounts.map((a: { account: { address: string } }) => a.account.address).filter((a: string) => a !== agent.address), [alice.address], "only the account it agreed to join lists the key");
+assert.equal(listing.next, null);
 await agent.actAs(`${name}.boo`);
 const paid = await agent.send(bob.address, "3", { memo: "agent errand" });
 console.log("✓", paid.summary);
@@ -204,7 +215,7 @@ console.log("✓ session key limits enforced");
 
 // A second device (e.g. another passkey) gets full control, then revokes the agent.
 const phone = Wallet.generate(client);
-await alice.addOwnerKey(phone.keyId, "phone");
+await alice.addOwnerKey(await phone.keyGrant(alice.address), "phone");
 await phone.actAs(alice.address);
 await phone.removeKey(agent.keyId);
 await assert.rejects(agent.send(bob.address, "0.1"), /isn't authorized/);
@@ -251,7 +262,7 @@ if (minBond + parseFang("2") <= BigInt((await client.account(alice.address)).bal
 // Hunts: bob escrows a bounty on a GitHub issue, alice chips in, bob awards it to alice's
 // Familiar (an agent session key she registered).
 const agent2 = Wallet.generate(client);
-await alice.addSessionKey(agent2.keyId, "claude", { limit: "1", periodBlocks: 100, expiresInBlocks: 1000 });
+await alice.addSessionKey(await agent2.keyGrant(alice.address), "claude", { limit: "1", periodBlocks: 100, expiresInBlocks: 1000 });
 console.log("✓", (await alice.registerFamiliar(agent2.keyId, "claude")).summary);
 const created = await bob.createHunt({ repo: "jackdishman/blockula", issue: 1, amount: "10", title: "Shared tx test vectors", expiresInBlocks: 500 });
 console.log("✓", created.summary);

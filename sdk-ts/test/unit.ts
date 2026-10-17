@@ -9,7 +9,7 @@ import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex, hexToBytes, utf8ToBytes } from "@noble/hashes/utils.js";
 import {
-  ApiError, ChainMismatchError, Client, MAX_TIMEOUT_MS, RELEASE_SIGNATURE_FORMAT, RequestTimeoutError, StaleProofError, TxFailedError, TxPendingError, Wallet, addressFromPublicKey, bareName, buildDistribution, convictionWeight, distributionLeaf, distributionNode,
+  ApiError, ChainMismatchError, Client, MAX_TIMEOUT_MS, decodeKeyGrant, encodeKeyGrant, verifyKeyGrant, RELEASE_SIGNATURE_FORMAT, RequestTimeoutError, StaleProofError, TxFailedError, TxPendingError, Wallet, addressFromPublicKey, bareName, buildDistribution, convictionWeight, distributionLeaf, distributionNode,
   keyHash, keyId, leafHash, maxTip, minFee, paramsOf, proposal, proposalSummary, releaseMessage, sharesFor, signingBytes, stakeSummary, valueHash, verifyDistributionProof, verifyReleaseSignature, type Action,
   type Tx,
 } from "../src/index.js";
@@ -379,13 +379,44 @@ const twoFaced = host("http://two-faced.node");
 let reads = 0;
 Object.defineProperty(twoFaced.status, "height", { enumerable: true, get: () => (reads++ % 2 === 0 ? 50 + 300 * 86_400 : 50) });
 const tf = Wallet.fromSeed("09".repeat(32), new Client("http://two-faced.node", { prefix: "boo" }));
-for (const run of [() => tf.addSessionKey("ab".repeat(32), "agent", { limit: "1", periodBlocks: 100, expiresInBlocks: 30 * 86_400 }), () => tf.createHunt({ repo: "a/b", issue: 1, amount: "10", title: "t", expiresInBlocks: 30 * 86_400 })]) {
+const tfAgent = await Wallet.fromSeed("0b".repeat(32)).keyGrant(tf.account, { chainId: "unit", genesisHash: GENESIS });
+for (const run of [() => tf.addSessionKey(tfAgent, "agent", { limit: "1", periodBlocks: 100, expiresInBlocks: 30 * 86_400 }), () => tf.createHunt({ repo: "a/b", issue: 1, amount: "10", title: "t", expiresInBlocks: 30 * 86_400 })]) {
   await run();
   const t = twoFaced.posted.at(-1)!;
   const expiresAt = t.action.type === "add_key" && t.action.role.type === "session" ? t.action.role.expires_at : t.action.type === "create_hunt" ? t.action.expires_at : -1;
   assert.equal(expiresAt, t.valid_until - 600 + 30 * 86_400, `${t.action.type}: the expiry and valid_until come from one status read`);
 }
 console.log("✓ session key and hunt expiries count from the height valid_until is signed against");
+
+// Audit gap-7-2: a key is added with its consent to the account (a grant), never by id alone.
+{
+  const g = host("http://grants.node");
+  const owner = Wallet.fromSeed("0c".repeat(32), new Client("http://grants.node"));
+  const device = Wallet.fromSeed("0d".repeat(32));
+  const chain = { chainId: "unit", genesisHash: GENESIS };
+  const grant = await device.keyGrant(owner.account, chain);
+  assert.equal(grant.key_id, device.keyId);
+  const code = encodeKeyGrant(grant);
+  assert.match(code, /^bkgrant1\.boo1[0-9a-z]+\.[A-Za-z0-9_-]+$/);
+  assert.deepEqual(decodeKeyGrant(code.replace(/(.{80})/g, "$1\n ")), grant, "a wrapped paste still decodes");
+  assert.ok(verifyKeyGrant(grant, "unit", GENESIS));
+  assert.ok(!verifyKeyGrant({ ...grant, account: BOB }, "unit", GENESIS), "another account");
+  assert.ok(!verifyKeyGrant(grant, "unit", "00".repeat(32)), "another chain instance");
+  assert.ok(!verifyKeyGrant({ ...grant, key_id: "ab".repeat(32) }, "unit", GENESIS), "another key id");
+  assert.throws(() => decodeKeyGrant(device.keyId), /that's a key id/);
+  assert.throws(() => decodeKeyGrant(code.slice(0, -10)), /damaged|cut short/);
+  assert.throws(() => decodeKeyGrant("bkgrant1.nope.AAAA"), /isn't an address/);
+  await assert.rejects(owner.addOwnerKey(device.keyId, "phone"), /that's a key id/);
+  await assert.rejects(owner.addOwnerKey(await device.keyGrant(BOB, chain), "phone"), /that grant is for/);
+  await assert.rejects(owner.addOwnerKey(await device.keyGrant(owner.account, { chainId: "other", genesisHash: GENESIS }), "phone"), /doesn't verify/);
+  assert.equal(g.posted.length, 0, "nothing signed for a bad grant");
+  await owner.addOwnerKey(code, "phone");
+  assert.deepEqual(g.posted.at(-1)!.action, { type: "add_key", key_id: device.keyId, label: "phone", role: { type: "owner" }, public_key: grant.public_key, pop: grant.pop });
+  // keyAccounts pages with `after`.
+  g.routes[`/key/${device.keyId}?after=boo1x&limit=5`] = { key_id: device.keyId, accounts: [], next: null };
+  assert.equal((await owner.client.keyAccounts(device.keyId, { after: "boo1x", limit: 5 })).next, null);
+}
+console.log("✓ keys are added with their grant (consent to the account, on this chain), not by id; grant codes round-trip");
 
 // Audit gap-7-5: the default deposit is the node's word: bounded, and the witnesses must agree.
 const greedy = host("http://greedy.node");

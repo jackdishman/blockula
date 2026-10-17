@@ -17,8 +17,12 @@ export interface Hint {
   name?: string;
   /** Browser-only fallback key. Less secure: anything with access to this browser profile can read it. */
   seed?: string;
-  /** A recovery kit the user wrote down that isn't on the account yet (no FANG for the fee). Its key id only. */
-  pendingKit?: { keyId: string; created: string };
+  /**
+   * A recovery kit the user wrote down that isn't on the account yet (no FANG for the fee): its key
+   * id and its grant code (the kit key's public consent to joining the account, which adding it
+   * needs). Never the words.
+   */
+  pendingKit?: { keyId: string; created: string; grant?: string };
 }
 
 const HINT = "blockula.wallet";

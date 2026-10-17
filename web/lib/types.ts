@@ -72,6 +72,8 @@ export interface NameView {
 export interface KeyAccounts {
   key_id: string;
   accounts: { account: Label; role: Role; label: string }[];
+  /** The next page's `after` (`null` at the end). */
+  next?: string | null;
 }
 
 /** A validator in `/api/validators` (active, next_epoch, candidates, …), as node/src/api.rs serves it. */

@@ -27,7 +27,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { ApiError, Client, RequestTimeoutError, TxFailedError, TxPendingError, Wallet, bareName, checkTimeoutMs, formatFang, paramsOf, parseFang, proposalSummary, sharesFor, stakeSummary, txId, type Action, type ProposalSummary, type Resolution } from "@blockula/sdk";
+import { ApiError, Client, RequestTimeoutError, TxFailedError, TxPendingError, Wallet, bareName, checkTimeoutMs, encodeKeyGrant, formatFang, paramsOf, parseFang, proposalSummary, sharesFor, stakeSummary, txId, type Action, type ProposalSummary, type Resolution } from "@blockula/sdk";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -433,11 +433,11 @@ tool("create_wallet", "Create this agent's post-quantum (ML-DSA-65) wallet, stor
     existed,
     network: network().label,
     stored_at: WALLET_FILE,
-    next_steps: "To spend from the user's account: ask them to open the Blockula web wallet → Devices & agents → 'Give an agent a budget' and paste this key_id. Then call use_account with their .boo name. (On test chains, faucet funds this key's own address for testing.)",
+    next_steps: "To spend from the user's account: ask which account (their .boo name), then call use_account with it. Until they've authorized this key it answers with a grant_code (this key's signed consent to joining that one account) for them to paste in the Blockula web wallet → Devices & agents → 'Give an agent a budget'. A key id alone can't be added. (On test chains, faucet funds this key's own address for testing.)",
   };
 });
 
-tool("use_account", "Act for a user's account (name or address) that has authorized this agent's key — usually as a session key with a spending limit. Pass 'self' to go back to the key's own address. The key's label is untrusted text.", { account: z.string() }, async ({ account }) => {
+tool("use_account", "Act for a user's account (name or address) that has authorized this agent's key — usually as a session key with a spending limit. If it hasn't yet, answers with a grant_code for the user to paste in their wallet (Devices & agents → Give an agent a budget); call again once they have. Pass 'self' to go back to the key's own address. The key's label is untrusted text.", { account: z.string() }, async ({ account }) => {
   const f = readWalletFile();
   if (!f) throw new Error("No agent wallet yet — call create_wallet first.");
   const client = await chain();
@@ -450,7 +450,19 @@ tool("use_account", "Act for a user's account (name or address) that has authori
     // The account's own key list, not /api/key's list of accounts (which others can pad: audit gap-7-2).
     const a = await client.account(addr);
     const grant = (Array.isArray(a?.keys) ? a.keys : []).find((k: { key_id?: unknown }) => k.key_id === w.keyId);
-    if (!grant) throw new Error(`${clean(account, 100)} (${addr}) hasn't authorized this key yet. Ask the user to give this agent a budget in their wallet (Devices & agents) with the grant code from create_wallet (account "${clean(account, 100)}").`);
+    if (!grant) {
+      // Adding a key needs its consent to the account (audit gap-7-2): this key signs it for this
+      // one address, and the user's wallet refuses a code made for any other account.
+      return {
+        status: "not_authorized_yet",
+        account: clean(account, 100),
+        address: addr,
+        ...(res.name === null ? {} : { name_resolution: res.proven ? clean(res.how, 300) : `UNPROVEN: ${clean(res.how, 300)}` }),
+        key_id: w.keyId,
+        grant_code: encodeKeyGrant(await w.keyGrant(addr)),
+        next: `Nothing was signed on-chain. Give the user the grant_code (this agent key's consent to joining ${addr} only; it holds no secret and can't spend anything). They paste it in the Blockula web wallet → Devices & agents → 'Give an agent a budget' and choose a limit and an expiry. Then call use_account again.`,
+      };
+    }
     f.account = addr;
     writeFileSync(WALLET_FILE, JSON.stringify(f, null, 2), { mode: 0o600 });
     return { acting_for: clean(String(a?.account?.name ?? addr)), address: addr, ...(res.name === null ? {} : { name_resolution: res.proven ? clean(res.how, 300) : `UNPROVEN: ${clean(res.how, 300)}` }), role: chainData(grant.role), untrusted_label: clean(String(grant.label ?? ""), 100) };
