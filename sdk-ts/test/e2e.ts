@@ -59,6 +59,7 @@ const propose = (kind: ProposalKind): Action => ({ type: "propose", kind, deposi
 const v1VectorActions: Action[] = [
   { type: "delegate", validator: "boo1v", amount: (5n * 1_000_000_000n).toString() },
   { type: "undelegate", validator: "boo1v", shares: "7" },
+  { type: "undelegate", validator: "boo1v", shares: "0", amount: (9n * 1_000_000_000n).toString() },
   { type: "redelegate", from_validator: "boo1v", to_validator: "boo1w", shares: "8" },
   { type: "withdraw_unbonded" },
   { type: "update_validator", commission_bps: 500, p2p_addr: "1.2.3.4:5", http_addr: "https://v.example" },
@@ -97,7 +98,7 @@ const v1VectorActions: Action[] = [
 const v1 = v1VectorActions.map((a) => signingBytes(vectorTx(a)));
 const v1Joined = new Uint8Array(v1.reduce((n, b) => n + b.length, 0));
 v1.reduce((at, b) => (v1Joined.set(b, at), at + b.length), 0);
-assert.equal(bytesToHex(blake3(v1Joined)), "6979535ae0ead49caa82eba564873762cfc4fb7aad1dc77ec3ae845caf0b5366");
+assert.equal(bytesToHex(blake3(v1Joined)), "a411ddbbcc010f275e102b3d2b2abec2b9e96c6c0e3f69cb50868a07678d4f6e");
 // Proposal kinds added after that vector froze, each on its own: `unflag_sybil` (tag 14, audit F54) and `cancel_upgrade` (tag 15, audit F50).
 assert.equal(bytesToHex(blake3(signingBytes(vectorTx(propose({ type: "unflag_sybil", account: "x.boo", reason: "r" }))))), "225aa5b8e4df8e8d27fe796992dfd02e5e402c14a9bbc3873d41d63dd07dc2cf");
 assert.equal(bytesToHex(blake3(signingBytes(vectorTx(propose({ type: "cancel_upgrade", version: 2, activation_height: 100_000 }))))), "199d2455419f738528317187cdbfa72e5430308b096c2c8741f5801290d3d156");

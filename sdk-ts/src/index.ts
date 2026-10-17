@@ -259,7 +259,11 @@ export function stakeSummary(raw: unknown): StakeSummary {
   return { delegations, unbonding, redelegations, bonded: drops(r.bonded), unbonding_total: drops(r.unbonding), withdrawable: drops(r.withdrawable), summary: String(r.summary ?? "") };
 }
 
-/** Shares worth about `value` drops in a delegation (rounded down, at most all of them). */
+/**
+ * Shares worth about `value` drops in a delegation (rounded down, at most all of them), at the
+ * value the delegation reports. That's a node's word: to unbond an amount, pass
+ * `wallet.undelegate(validator, { amount })`, which the chain converts itself (audit gap-7-5).
+ */
 export function sharesFor(d: StakeDelegation, value: Amount): bigint {
   const want = parseFang(value);
   const [shares, worth] = [BigInt(d.shares), BigInt(d.value)];
@@ -754,12 +758,16 @@ export class Wallet {
   }
 
   /**
-   * Start unbonding `shares` of your stake in a validator's pool (`"all"`: every share you hold
-   * there, read from `/api/staking`). It stops earning now and can be withdrawn with
-   * `withdrawUnbonded` once the unbonding period (21 days on mainnet) is over.
+   * Start unbonding stake in a validator's pool: `{ amount }` (FANG, or bigint drops), `shares`,
+   * or `"all"` (every share you hold there, read from `/api/staking`). An amount is signed as an
+   * amount and the chain converts it at the pool's price when the tx runs, so no node's report of
+   * the stake decides how much unbonds (audit gap-7-5); prefer it to `sharesFor`. It stops
+   * earning now and can be withdrawn with `withdrawUnbonded` once the unbonding period (21 days
+   * on mainnet) is over.
    */
-  async undelegate(validator: string, shares: bigint | string | "all", opts: TxOptions = {}) {
+  async undelegate(validator: string, shares: bigint | string | "all" | { amount: Amount }, opts: TxOptions = {}) {
     const v = await this.validatorAddress(validator);
+    if (typeof shares === "object" && shares !== null) return this.act({ type: "undelegate", validator: v, shares: "0", amount: positive(parseFang(shares.amount), "undelegate").toString() }, opts);
     return this.act({ type: "undelegate", validator: v, shares: (await this.sharesOf(v, shares)).toString() }, opts);
   }
 

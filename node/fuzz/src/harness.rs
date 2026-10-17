@@ -701,7 +701,9 @@ impl Sm {
                 let v = validator_addr(self);
                 match amt % 6 {
                     0 => Action::Delegate { validator: v, amount: fang(1 + amt % 50) },
-                    1 => Action::Undelegate { validator: v, shares: 1 + amt },
+                    // By shares, or by an amount the chain converts at its own price (audit gap-7-5).
+                    1 if (amt / 6) % 2 == 0 => Action::Undelegate { validator: v, shares: 1 + amt, amount: 0 },
+                    1 => Action::Undelegate { validator: v, shares: 0, amount: fang(1 + amt % 50) },
                     2 => Action::Redelegate { from_validator: v, to_validator: f.validator.address.clone(), shares: 1 + amt },
                     3 => Action::WithdrawUnbonded {},
                     4 => Action::UpdateValidator { commission_bps: amt % 2_000, p2p_addr: String::new(), http_addr: String::new() },

@@ -2677,7 +2677,7 @@ mod http_tests {
         let delegate = tx(&n.chain.lock(), 0, Action::Delegate { validator: me.clone(), amount: 20 * DROPS_PER_FANG });
         n.chain.lock().submit(delegate).unwrap();
         n.chain.lock().produce_block().unwrap();
-        let undelegate = tx(&n.chain.lock(), 1, Action::Undelegate { validator: me.clone(), shares: 5 * DROPS_PER_FANG });
+        let undelegate = tx(&n.chain.lock(), 1, Action::Undelegate { validator: me.clone(), shares: 5 * DROPS_PER_FANG, amount: 0 });
         n.chain.lock().submit(undelegate).unwrap();
         n.chain.lock().produce_block().unwrap();
         let (s, st, _) = call(&n, "GET", &format!("/api/staking/{}", alice.address()), None, "127.0.0.1:1").await;

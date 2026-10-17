@@ -737,11 +737,11 @@ pub enum StakeCmd {
         #[command(flatten)]
         signer: Signer,
     },
-    /// Start unbonding pool shares (withdraw them after the unbonding period)
+    /// Start unbonding stake (withdraw it after the unbonding period): an amount, pool shares, or all of it
     Undelegate {
         validator: String,
         #[command(flatten)]
-        shares: Shares,
+        shares: Unbonding,
         #[command(flatten)]
         signer: Signer,
     },
@@ -764,6 +764,22 @@ pub enum StakeCmd {
 #[derive(Args, Clone)]
 #[group(required = true, multiple = false)]
 pub struct Shares {
+    /// How many pool shares (see `blockula stake show`)
+    #[arg(long)]
+    shares: Option<u64>,
+    /// Every share you hold in that pool
+    #[arg(long)]
+    all: bool,
+}
+
+/// What `stake undelegate` unbonds.
+#[derive(Args, Clone)]
+#[group(required = true, multiple = false)]
+pub struct Unbonding {
+    /// FANG, e.g. 10: the chain sells the shares worth that much at the pool's price when the tx
+    /// runs, so no node's report of the price decides how much unbonds
+    #[arg(long)]
+    amount: Option<String>,
     /// How many pool shares (see `blockula stake show`)
     #[arg(long)]
     shares: Option<u64>,
@@ -816,12 +832,19 @@ pub fn stake(cmd: StakeCmd, dir: &Path) -> Result<()> {
             Ok(())
         }
         StakeCmd::Delegate { validator, amount, signer } => submit(dir, &signer, Action::Delegate { validator, amount: parse_fang(&amount)? }).map(|_| ()),
-        StakeCmd::Undelegate { validator, shares, signer } => {
+        StakeCmd::Undelegate { validator, shares: Unbonding { amount: Some(amount), .. }, signer } => {
+            let amount = parse_fang(&amount)?;
+            if amount == 0 {
+                bail!("undelegate more than 0 FANG");
+            }
+            submit(dir, &signer, Action::Undelegate { validator, shares: 0, amount }).map(|_| ())
+        }
+        StakeCmd::Undelegate { validator, shares: Unbonding { shares, all, .. }, signer } => {
             let keys = signer.keys(dir)?;
             let rt = rt()?;
             let me = rt.block_on(signer.from(&keys))?;
-            let shares = rt.block_on(shares_of(&signer.rpc, &me, &validator, &shares))?;
-            submit(dir, &signer, Action::Undelegate { validator, shares }).map(|_| ())
+            let shares = rt.block_on(shares_of(&signer.rpc, &me, &validator, &Shares { shares, all }))?;
+            submit(dir, &signer, Action::Undelegate { validator, shares, amount: 0 }).map(|_| ())
         }
         StakeCmd::Redelegate { from, to, shares, signer } => {
             let keys = signer.keys(dir)?;

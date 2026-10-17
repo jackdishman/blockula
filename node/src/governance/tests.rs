@@ -289,7 +289,7 @@ fn the_unlocked_supply_is_kept_exact_without_walking_the_accounts() {
     let u2 = at(&t, t.h);
     assert_eq!(u2, u1 - fee);
     let shares = t.st.staking.delegations.get(&format!("{}/{v3}", addr(DAVE))).unwrap().shares as u64;
-    let fee = t.tx(DAVE, Action::Undelegate { validator: v3.clone(), shares: shares / 2 }).unwrap() as u128;
+    let fee = t.tx(DAVE, Action::Undelegate { validator: v3.clone(), shares: shares / 2, amount: 0 }).unwrap() as u128;
     t.next();
     let u3 = at(&t, t.h);
     assert_eq!(u3, u2 - fee);

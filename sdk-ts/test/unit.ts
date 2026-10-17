@@ -108,6 +108,8 @@ const cases: [string, () => Promise<unknown>, Action][] = [
   ["delegate by name", () => me.delegate("vlad.boo", "1.5"), { type: "delegate", validator: VALIDATOR, amount: (FANG + FANG / 2n).toString() }],
   ["undelegate shares", () => me.undelegate(VALIDATOR, 5n), { type: "undelegate", validator: VALIDATOR, shares: "5" }],
   ["undelegate all", () => me.undelegate("vlad.boo", "all"), { type: "undelegate", validator: VALIDATOR, shares: "4000" }],
+  // gap-7-5: an amount is signed as an amount; the chain converts it, not this node's report.
+  ["undelegate an amount", () => me.undelegate(VALIDATOR, { amount: "2.5" }), { type: "undelegate", validator: VALIDATOR, shares: "0", amount: (2n * FANG + FANG / 2n).toString() }],
   ["redelegate all", () => me.redelegate(VALIDATOR, OTHER_VALIDATOR, "all"), { type: "redelegate", from_validator: VALIDATOR, to_validator: OTHER_VALIDATOR, shares: "4000" }],
   ["withdraw unbonded", () => me.withdrawUnbonded(), { type: "withdraw_unbonded" }],
   ["update validator", () => me.updateValidator({ commissionBps: 500 }), { type: "update_validator", commission_bps: 500, p2p_addr: "", http_addr: "" }],
@@ -163,6 +165,7 @@ const refused: [string, () => Promise<unknown>, RegExp][] = [
   ["redelegate to itself", () => me.redelegate(VALIDATOR, "vlad.boo", 1n), /different validator/],
   ["no stake to undelegate", () => me.undelegate(OTHER_VALIDATOR, "all"), /no stake/],
   ["zero shares", () => me.undelegate(VALIDATOR, "0"), /positive whole number/],
+  ["zero amount", () => me.undelegate(VALIDATOR, { amount: "0" }), /undelegate more than 0/],
   ["unregistered validator name", () => me.delegate("nobody.boo", "1"), /isn't registered/],
   ["bad revert sha", () => me.attestRevert(1, "ab"), /40-hex/],
 ];
