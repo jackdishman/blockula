@@ -1,6 +1,7 @@
 //! `blockula validator …`: set up a validator node, register it on-chain, stake with validators
-//! (delegate, undelegate, withdraw), unjail and set commission, and (on dev and test chains,
-//! for admins) pin or remove validators. Talks to any node's HTTP API.
+//! (delegate, undelegate, withdraw), unjail and set commission, admit a newcomer into a set of
+//! one or two, and (on dev and test chains, for admins) pin or remove validators. Talks to any
+//! node's HTTP API.
 
 use crate::chain::Genesis;
 use crate::cli_net::{ChainPin, Remote};
@@ -58,6 +59,26 @@ pub enum ValidatorCmd {
         key: PathBuf,
         #[arg(long)]
         rpc: String,
+        #[arg(long)]
+        from: Option<String>,
+        #[command(flatten)]
+        pin: ChainPin,
+    },
+    /// Admit a candidate into a set of one or two members (signed by this member's consensus key).
+    /// Such a set needs every member, the newcomer too, for each block: admit only a validator
+    /// whose operator you trust to keep it online. It joins at the end of this epoch once a quorum
+    /// of the members admitted it and its node showed up (it does that itself, in the epoch's last
+    /// tenth); an admission counts for this epoch only, and each member admits one an epoch
+    Admit {
+        /// The candidate's address or .boo name
+        candidate: String,
+        /// This member's consensus key (its home's validator.key)
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        rpc: String,
+        /// Account that pays the fee (default: the member's owner, as for its other system txs;
+        /// or the validator's own address)
         #[arg(long)]
         from: Option<String>,
         #[command(flatten)]
@@ -280,6 +301,26 @@ pub fn run(cmd: ValidatorCmd) -> Result<()> {
             println!("✓ {}", tx["summary"].as_str().unwrap_or_default());
             Ok(())
         }
+        ValidatorCmd::Admit { candidate, key, rpc, from, pin } => {
+            let keys = load_seed(&key)?;
+            let tx = rt()?.block_on(async {
+                let remote = Remote::connect(&crate::cli_net::blockula_dir(), &rpc, &pin).await?;
+                let me = remote.address(&keys);
+                let candidate = remote.resolve(&candidate).await?;
+                let set = get(&remote.rpc, "/validators").await?;
+                let member = set["active"].as_array().into_iter().flatten().find(|v| v["validator"]["address"].as_str() == Some(me.as_str())).ok_or_else(|| anyhow!("{me} isn't in this epoch's set: only its members admit newcomers"))?;
+                let from = match from {
+                    Some(f) => remote.resolve(&f).await?,
+                    None => member["owner"]["address"].as_str().unwrap_or(&me).to_string(),
+                };
+                // The epoch the next block is in: the admission fails in any other.
+                let epoch = set["epoch"].as_u64().ok_or_else(|| anyhow!("{rpc} doesn't report the epoch"))?;
+                send(&remote, &keys, &from, Action::AdmitValidator { validator: candidate, epoch }).await
+            })?;
+            println!("✓ {}", tx["summary"].as_str().unwrap_or_default());
+            println!("  It joins at the end of the epoch once a quorum of the set's members admitted it and its node showed up (in the epoch's last tenth). Admissions count for this epoch only.");
+            Ok(())
+        }
         ValidatorCmd::Approve(a) => admin(a, |v| Action::ApproveValidator { validator: v }),
         ValidatorCmd::Remove(a) => admin(a, |v| Action::RemoveValidator { validator: v }),
         ValidatorCmd::Pop { home, owner } => {
@@ -301,6 +342,10 @@ pub fn run(cmd: ValidatorCmd) -> Result<()> {
                 n => format!("at most {n} newcomers per epoch"),
             };
             println!("epoch {} · {} blocks until the next epoch · {churn}", v["epoch"], v["blocks_until_next_epoch"]);
+            if let Some(a) = v["admission"].as_object() {
+                let members: Vec<&str> = a["members"].as_array().into_iter().flatten().filter_map(|m| m["address"].as_str()).collect();
+                println!("a set of {}: a newcomer joins once {} of its members admitted it this epoch (blockula validator admit) and its node shows up from block {} on", members.len(), a["quorum"], a["ready_from"]);
+            }
             for (title, key) in [("active", "active"), ("joining next epoch", "joining"), ("leaving next epoch", "leaving"), ("candidates", "candidates"), ("jailed", "jailed"), ("tombstoned", "tombstoned"), ("removed", "removed")] {
                 let list = v[key].as_array().cloned().unwrap_or_default();
                 println!("{title} ({}):", list.len());

@@ -747,11 +747,14 @@ impl Sm {
             32 => {
                 let (signer, from) = (admin, admin.address.clone());
                 let epoch = self.state.params.epoch_of(h) + (amt % 3);
-                let action = match amt % 5 {
+                let action = match amt % 7 {
                     0 => Action::BeaconCommit { epoch, commitment: hex::encode(crate::crypto::hash(&amt.to_le_bytes())) },
                     1 => Action::BeaconReveal { epoch, secret: hex::encode((amt as u128).to_le_bytes().repeat(2)) },
                     2 => Action::AttestRevert { claim_id: claim, revert_sha: "cd".repeat(20) },
                     3 => Action::ClaimDistribution { distribution_id: amt % 3, amount: fang(1), proof: vec![] },
+                    // A small set's readiness and admission (tags 55–56).
+                    4 => Action::ValidatorReady { epoch },
+                    5 => Action::AdmitValidator { validator: validator_addr(self), epoch },
                     _ => Action::ReportEquivocation { evidence: hex::encode(raw) },
                 };
                 return self.tx(signer, &from, tip, action);
