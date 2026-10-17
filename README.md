@@ -46,7 +46,7 @@ curl -fsSL https://github.com/jackdishman/blockula/releases/latest/download/inst
 blockula dev          # local chain + explorer at http://localhost:7070
 ```
 
-Prebuilt for macOS (Apple Silicon and Intel) and Linux (x64 and arm64). The script checks the version, the SHA-256 checksum, build provenance (with a logged-in `gh`) and the offline release signature (with an installed `blockula`). It's still the release's own script, though: validators verify the release, `install.sh` included, before running anything ([OPERATIONS.md "Verifying a release"](docs/OPERATIONS.md#verifying-a-release-as-a-user-or-operator)). Agents can call the MCP's `install_node` tool instead.
+Prebuilt for macOS (Apple Silicon and Intel) and Linux (x64 and arm64). The script checks the version, the SHA-256 checksum, build provenance (with a logged-in `gh`) and the offline release signature (with an installed `blockula`). It's still the release's own script, though, so validators don't use it: they install and upgrade with `blockula release install vX.Y.Z`, which checks the release against the release key id they pinned at their first install and never runs the release's scripts ([OPERATIONS.md "Installing and upgrading"](docs/OPERATIONS.md#installing-and-upgrading)). Agents can call the MCP's `install_node` tool instead.
 
 ## Contribute
 

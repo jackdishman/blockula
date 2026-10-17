@@ -30,8 +30,9 @@
 #
 # This script comes from the release too, and a compromised GitHub account or release workflow
 # controls it (and any key id built into it): `gh attestation verify install.sh` only proves it
-# came out of that workflow. Validators: verify install.sh against the signed checksums.txt with
-# the key id you got independently before you run it (docs/OPERATIONS.md "Verifying a release").
+# came out of that workflow. Validators don't use it: they install with `blockula release install`,
+# which checks the release against the key id they pinned at onboarding and never runs this script
+# (docs/OPERATIONS.md "Installing and upgrading").
 set -eu
 
 REPO=jackdishman/blockula
@@ -130,7 +131,8 @@ if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
     verified="build provenance (GitHub attestation, $REPO release workflow, tag $VERSION)"
   else
     echo "✗ Build provenance check FAILED for $asset (not built by the release workflow from tag $VERSION); refusing to install." >&2
-    echo "  (Releases up to v0.4.x predate provenance: they have no attestation to check.)" >&2
+    echo "  (Releases up to v0.4.x predate provenance: they have no attestation to check. A patch distributed privately" >&2
+    echo "  has none either: install it with blockula release install $VERSION --from <dir>, which checks its signature.)" >&2
     exit 1
   fi
 else
@@ -163,8 +165,8 @@ if [ -n "$RELEASE_KEY_ID" ]; then
   elif [ -n "$GIVEN_KEY_ID" ] || [ "${BLOCKULA_REQUIRE_VERIFY:-}" = 1 ]; then
     # You asked for the signature to be checked, and nothing here can check it.
     echo "✗ There's no installed blockula with \`blockula release verify\`, so this script can't check the release signature; refusing to install." >&2
-    echo "  Install a blockula you trust first (the previous release, or a source build) and re-run, or verify" >&2
-    echo "  checksums.txt.sig by hand and install the archive yourself (docs/OPERATIONS.md \"Verifying a release\")." >&2
+    echo "  Install with a blockula you trust instead (blockula release install $VERSION --key-id <id>), or follow" >&2
+    echo "  docs/OPERATIONS.md \"A first install\", which never runs this script." >&2
     exit 1
   else
     unchecked_signature=1
@@ -190,8 +192,8 @@ elif [ -n "$unchecked_signature" ]; then
 
   ⚠️  THE RELEASE SIGNATURE WAS NOT CHECKED (no installed blockula can verify it yet).
   Provenance alone is what a compromised GitHub account or release workflow could produce too.
-  Now that blockula is installed, the next install or upgrade checks the signature. For a validator,
-  verify this release by hand first: docs/OPERATIONS.md "Verifying a release".
+  Now that blockula is installed, \`blockula release install\` checks the signature of the next one. A
+  validator doesn't install this way: docs/OPERATIONS.md "A first install".
 
 EOF
 fi

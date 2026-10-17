@@ -46,7 +46,7 @@ Each operator generates two keys on a machine that has never been and will never
 - the **owner key**: controls the bond, rewards and commission; stays offline for good.
 
 1. **Prepare the offline machine.** A laptop or small PC you control. Install a fresh OS from install media whose checksum you verified. Remove or disable Wi-Fi and Bluetooth (hardware switch, or remove the card); never plug in a network cable.
-2. **Get a verified `blockula` onto it.** On an online machine, download the release candidate and verify it as in [OPERATIONS.md "Releases"](OPERATIONS.md#releases) (provenance, signature and, ideally, rebuilding it with `scripts/reproduce-release.sh`). Copy the archive over on a fresh USB stick, check its SHA-256 again on the offline machine, and unpack it.
+2. **Get a verified `blockula` onto it.** On an online machine, install the release candidate as in [OPERATIONS.md "Installing and upgrading"](OPERATIONS.md#installing-and-upgrading) (`blockula release install`, or [a first install](OPERATIONS.md#a-first-install): the signature against your pinned release key id, provenance) and, ideally, rebuild it with `COMMIT=<commit> scripts/reproduce-release.sh`. Copy the archive over on a fresh USB stick, check its SHA-256 again on the offline machine, and unpack it.
 3. **Generate the keys:**
 
    ```bash
@@ -131,7 +131,7 @@ Each builder, independently, on their own machine:
 
 ```bash
 git clone https://github.com/jackdishman/blockula && cd blockula && git checkout <release tag>
-scripts/reproduce-release.sh <release tag>          # the binary they'll use matches the release
+COMMIT=<the commit you reviewed> scripts/reproduce-release.sh <release tag>   # the tag is that commit; the binary they'll use matches the release
 sha256sum genesis/blockula-1/spec.toml
 blockula genesis build --spec genesis/blockula-1/spec.toml --out genesis.json   # prints the genesis hash
 sha256sum genesis.json

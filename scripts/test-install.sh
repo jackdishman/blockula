@@ -173,7 +173,7 @@ run "key id given, junk .sig, no verifier: refused" refuses "can't check the rel
 run "a malformed key id: refused" refuses "64 hex characters" BLOCKULA_RELEASE_KEY_ID=abc
 
 # A key id built into the script (after the key ceremony). It comes with the download, so it's no
-# stronger than the script (docs/OPERATIONS.md "Verifying a release"); the operator's own key id
+# stronger than the script (docs/OPERATIONS.md "Installing and upgrading"); the operator's own key id
 # wins any disagreement.
 script=$T/install-with-key.sh
 sed "s/^BUILTIN_KEY_ID=\"\"/BUILTIN_KEY_ID=\"$KEY\"/" "$INSTALL" > "$script"

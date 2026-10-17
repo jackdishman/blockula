@@ -6,7 +6,7 @@ Some of the project's supply-chain controls live in GitHub's settings, not in th
 |---|---|
 | `ruleset-main.json` | The `main` ruleset, "main: reviewed PRs with green CI": a PR with one code-owner approval (stale approvals dismissed, the last push approved by someone else, threads resolved), squash merges and linear history, and **every CI job that runs on pull requests** as a required status check, against an up-to-date `main` |
 | `ruleset-tags.json` | "release tags": only admins create, move or delete `v*` tags, the tags `release.yml` builds and attests from |
-| `apply-rulesets.sh` | Shows how GitHub's rulesets differ from these files; `--apply` makes them match |
+| `apply-rulesets.sh` | Shows how GitHub's rulesets differ from these files; `--apply` makes them match; `--check` exits 1 on any difference (the daily drift job) |
 
 ## Applying the rulesets
 
@@ -21,12 +21,17 @@ Read the dry run before you apply. `ruleset-tags.json` was written from the audi
 
 Apply `ruleset-main.json` when the branch that brings it lands on `main`. Until then, the live ruleset requires only "Node (Rust tests + local multi-validator testnet)" and "Packages + wallet build". Both names are unchanged, so merging doesn't block, but the other checks aren't enforced yet.
 
+## Drift
+
+`.github/workflows/github-settings.yml` runs `apply-rulesets.sh --check` every day (and on demand) with the workflow's read-only token. It fails when a live ruleset differs from its file here or is missing, so a setting changed in the web UI shows up as a red job instead of going unnoticed. GitHub only shows a ruleset's bypass actors to tokens that can write it, so the job doesn't compare them and says so; run the dry run yourself to see those. Until the rulesets are applied the job fails, as a reminder. It doesn't run on pull requests, so it isn't a required check.
+
 ## Keeping the required checks in step (audit supply-chain-B-3)
 
 A required status check is a job's `name:`. Rename a job, and the ruleset waits for a check that's never reported: every PR blocks, and the maintainer's bypass becomes the merge path. Add a job without requiring it, and a PR can merge with it red. So:
 
 - `.github/workflows/ci.yml`'s header lists the required checks (`#   required: <job name>`). A job that should run on PRs without blocking them is listed as `#   optional: <job name>`.
-- `scripts/check-required-checks.mjs` (CI, `ops` job) fails unless that list, `ruleset-main.json` and the jobs that run on every pull request agree. It also fails on a required job that's skipped on PRs (a skipped check counts as passing) or sits behind a `paths` or `branches` filter (a PR outside the filter would wait forever), and on a required check that isn't tied to the GitHub Actions app (`integration_id` 15368), since any other app or token that can post a commit status could satisfy it.
+- `scripts/check-required-checks.mjs` (CI, `ops` job) fails unless that list, `ruleset-main.json` and the jobs that run on every pull request agree. It also fails on a required job that sits behind a `paths` or `branches` filter (a PR outside the filter would wait forever), and on a required check that isn't tied to the GitHub Actions app (`integration_id` 15368), since any other app or token that can post a commit status could satisfy it.
+- A skipped check counts as passing, so the script refuses a required job that could skip itself or pass without its work: a job-level `if:` other than the ones in its `SAFE_JOB_IFS` (today only `github.event_name != 'schedule'`), a `needs:` on a job that isn't required (if that job fails or is skipped, so is this one), job-level `continue-on-error`, and a step-level `if:` or `continue-on-error` that isn't one of the exact exceptions in its `SAFE_STEPS` (the Playwright trace upload on failure, the non-blocking full `npm audit`). A new exception is a reviewed edit to the script. Workflows must be block-style YAML; a job it can't read is an error.
 - To rename or add a required job: change the workflow, the header list and `ruleset-main.json` in one PR, and apply the ruleset when it merges.
 
 ## The admin bypass
