@@ -9,7 +9,7 @@ claude mcp add blockula -- npx -y @blockula/mcp --network local      # a `blocku
 
 With no configuration it connects to the public testnet at `https://blockula-testnet.fly.dev`. Call `status` to see which network and chain you're on.
 
-To run an exact release, name it: `npx -y @blockula/mcp@0.4.0`. Each release pins its whole dependency tree (exact versions plus a published `npm-shrinkwrap.json`), so what runs next to the agent's key is what CI tested.
+To run an exact release, name it: `npx -y @blockula/mcp@0.5.0` (the first release on npm, for the protocol v1 testnet `blockula-testnet-2`). Each release pins its whole dependency tree (exact versions plus a published `npm-shrinkwrap.json`), so what runs next to the agent's key is what CI tested.
 
 ## Which network (WAL-4)
 
@@ -17,8 +17,8 @@ The network is chosen by the user, once, in the MCP's configuration, and nothing
 
 - `--network` (or `BLOCKULA_NETWORK`): `testnet` (default), `mainnet`, `local` (`http://localhost:7070`) or `custom`.
 - `BLOCKULA_RPC` picks the node: required for `custom`, and for `mainnet` until public mainnet RPCs are built in. Plain `http://` only on this machine or a private network.
-- Every network pins a chain id (`blockula-1` for mainnet, `blockula-testnet` for the testnet), and a genesis hash where one is known. `BLOCKULA_CHAIN_ID` and `BLOCKULA_GENESIS_HASH` pin them for any node. Whatever isn't pinned is pinned from the first status the node reports and remembered in `~/.blockula/known-chains.json` (except for local dev chains, which `--reset` replaces).
-- A node reporting another chain id, genesis hash or address prefix is refused, before anything is signed, at startup or mid-session. If a network was relaunched on purpose, the user removes its entry from `known-chains.json` or sets `BLOCKULA_GENESIS_HASH`.
+- Every network pins a chain id (`blockula-1` for mainnet, `blockula-testnet-2` for the testnet, with the `tboo` address prefix), and a genesis hash where one is known (`KNOWN_GENESIS` in `src/network.ts`: a release pins a launched chain's). `BLOCKULA_CHAIN_ID` and `BLOCKULA_GENESIS_HASH` pin them for any node. Whatever isn't pinned is pinned from the first status the node reports and remembered in `~/.blockula/known-chains.json` (except for local dev chains, which `--reset` replaces).
+- A node reporting another chain id, genesis hash or address prefix is refused, before anything is signed, at startup or mid-session. If a network was relaunched on purpose under the same chain id, the user removes its entry from `known-chains.json` or sets `BLOCKULA_GENESIS_HASH`. (A relaunch takes a new chain id, as the testnet's did: an entry remembered for the old `blockula-testnet` isn't held against `blockula-testnet-2`.)
 
 `start_dev_node` starts a local chain, but the MCP only uses it when it was configured with `--network local`.
 

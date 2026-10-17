@@ -125,14 +125,28 @@ kill "${PIDS[3]}"; wait "${PIDS[3]}" 2>/dev/null || true
 pkill -f "run --home $DIR/v3/home" 2>/dev/null || true
 jailed() { get "$RPC/api/validators" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const v=JSON.parse(s);process.exit((v.jailed??[]).some(x=>x.validator.address==='$V3')&&!v.active.some(x=>x.validator.address==='$V3')?0:1)})"; }
 until_true "v3's jailing and exit" 300 jailed
-until_h=$(get "$RPC/api/validators" | j "v.jailed.find(x => x.validator.address === '$V3').jailed.until")
-echo "✓ v3 went offline: jailed until #$until_h, out of the set"
-wait_height "$RPC" "$until_h" 120
-# It restarts from its volume (no secret this time), its owner tops up the slashed self-bond and unjails it.
+jail_until() { get "$RPC/api/validators" | j "(v.jailed.find(x => x.validator.address === '$V3') ?? {}).jailed?.until ?? ''"; }
+echo "✓ v3 went offline: jailed until #$(jail_until), out of the set"
+# It restarts from its volume (no secret this time), its owner tops up the slashed self-bond and
+# unjails it. While it was offline it may have been jailed again (a missed beacon reveal, more
+# missed slots), which keeps the later release: unjail once the newest one is over.
 start_validator 3
 OWNER3=$NET/owner-3.json
-"$BIN" stake delegate "$V3" 20 --key "$OWNER3" --rpc "$RPC" --chain-id "$CHAIN_ID" --genesis-hash "$GHASH" | tail -1
-"$BIN" validator unjail "$V3" --key "$OWNER3" --rpc "$RPC" --chain-id "$CHAIN_ID" --genesis-hash "$GHASH" | tail -1
+as_owner3() { "$@" --key "$OWNER3" --rpc "$RPC" --chain-id "$CHAIN_ID" --genesis-hash "$GHASH"; }
+as_owner3 "$BIN" stake delegate "$V3" 50 | tail -1
+unjailed=""
+for _ in 1 2 3 4 5; do
+  until_h=$(jail_until)
+  [ -n "$until_h" ] || { unjailed=1; break; }
+  wait_height "$RPC" "$until_h" 180
+  if as_owner3 "$BIN" validator unjail "$V3" > "$DIR/unjail.log" 2>&1; then
+    tail -1 "$DIR/unjail.log"; unjailed=1; break
+  fi
+  echo "  (unjail refused: $(tail -1 "$DIR/unjail.log"); retrying)"
+  grep -qi "self-bond" "$DIR/unjail.log" && as_owner3 "$BIN" stake delegate "$V3" 50 | tail -1
+  sleep 2
+done
+[ -n "$unjailed" ] || fail "v3 couldn't be unjailed: $(cat "$DIR/unjail.log")"
 back() { get "$RPC/api/validators" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const v=JSON.parse(s);process.exit(v.active.some(x=>x.validator.address==='$V3'&&BigInt(x.stake)>=25000000n*10n**9n)?0:1)})"; }
 until_true "v3 rejoining, backed by the bootstrap delegation" 300 back
 [ "$(grep -c "validator key seeded" "$DIR/v3.log")" = 1 ] || fail "v3 was re-seeded on restart"

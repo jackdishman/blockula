@@ -144,16 +144,18 @@ blockula run --home ~/.blockula/mynet/v0     # repeat for v1, v2, v3 (each print
 blockula join --genesis http://127.0.0.1:<v0 http port> --genesis-hash <hash> --home ~/.blockula/mynet-full --port 7171
 ```
 
-**On public servers:**
-1. Summon the chain and set the validator admins (your laptop's account, not a server key): `blockula summon pubnet --validators 4 --admin boo1… [--epoch-blocks 600]`.
-2. Before the first start, set `validators[].p2p_addr` / `http_addr` in `genesis.json` to the addresses peers will dial (e.g. `203.0.113.10:30300`). Editing is safe until the first node starts, as long as every node gets the same file. The genesis block hash is derived from this file at startup.
-3. Copy `vN/` to server N and run `blockula run --home vN --bind 0.0.0.0` (or `--bind ::`).
+`summon` is for chains you run for yourself: it gives the first validator's account (or each `--admin`) the validator-admin levers of dev and test chains (pin or remove a validator), which mainnet doesn't have.
+
+**On public servers**, build the genesis the way mainnet's is built, with no admin keys (the validators pass proposals as the bootstrap council):
+1. Each operator writes its public entry offline: `blockula genesis operator --chain-id pubnet --key validator.key --owner <owner account> --p2p-addr 203.0.113.10:30300 --http-addr https://… --out v0.toml` (the addresses peers will dial).
+2. `blockula genesis build --spec spec.toml --out genesis.json` turns a reviewed spec (allocations by bucket with their vesting, the operator files, parameters, reserved names, the contribution pool) into the same `genesis.json` and hash on every machine. `deploy/launch.sh` does both for the public testnet ([deploy/README.md](deploy/README.md)); `deploy/mainnet/genesis-spec.example.toml` is mainnet's shape.
+3. Each server runs `blockula run --home <its home, holding genesis.json and its validator.key> --bind 0.0.0.0` (or `--bind ::`).
    - The node listens on the bind address and advertises its genesis addresses.
    - Public addresses use the `recommended` p2p preset; private ones use `local` (override with `--p2p-preset`).
 
-Full nodes: `blockula join --genesis genesis.json --genesis-hash <hash> --home full --bind 0.0.0.0 --port 7171` (`blockula checkpoint --genesis genesis.json` prints the hash). On a chain older than ~10 days, also pass a recent `--checkpoint` ([OPERATIONS.md, Weak subjectivity](docs/OPERATIONS.md#weak-subjectivity)).
+Full nodes: `blockula join --genesis genesis.json --genesis-hash <hash> --home full --bind 0.0.0.0 --port 7171` (`blockula checkpoint --genesis genesis.json` prints the hash). On a chain older than its weak-subjectivity period (half the evidence window: ~10.5 days on mainnet, 3.5 days on the public testnet), also pass a recent `--checkpoint` ([OPERATIONS.md, Weak subjectivity](docs/OPERATIONS.md#weak-subjectivity)).
 
-**A real genesis** (mainnet, dry runs) isn't summoned: each operator runs `blockula genesis operator` offline to write its public entry (consensus key, owner, addresses, proof of possession), and `blockula genesis build --spec spec.toml --out genesis.json` turns a reviewed spec (allocations by bucket with their vesting, the operators, parameters, reserved names) into the same `genesis.json` and hash on every machine. See `deploy/mainnet/genesis-spec.example.toml` and [docs/GENESIS_CEREMONY.md](docs/GENESIS_CEREMONY.md).
+Mainnet's genesis is built the same way, by independent operators in a ceremony: [docs/GENESIS_CEREMONY.md](docs/GENESIS_CEREMONY.md).
 
 Any node accepts txs, which are gossiped to the leader. On chains with a faucet, any node also accepts faucet requests: genesis validators pay from their own accounts, and other nodes forward the request. A forwarded request is never forwarded again.
 
@@ -215,10 +217,9 @@ blockula stake show --account <address or name> --rpc https://<any node>
 blockula validator commission 500 --key ~/val/validator.key --rpc https://<any node>
 blockula validator unjail boo1… --key ~/val/validator.key --rpc https://<any node>
 blockula validator list --rpc https://<any node>
-# Dev and test chains only (admins): pin a validator ahead of stake, or remove one
-blockula validator approve boo1… --key admin.key --rpc https://<any node>
-blockula validator remove  boo1… --key admin.key --rpc https://<any node>
 ```
+
+Chains made with `blockula summon` also have validator admins, who can pin a validator ahead of stake (`blockula validator approve`) or remove one (`blockula validator remove`). Mainnet and the public testnet have none: there, stake alone decides the set.
 
 The p2p transport authenticates peers with ML-DSA-65 and derives its ChaCha20-Poly1305 keys from a
 hybrid X25519 + ML-KEM-768 exchange, so recorded traffic stays private unless both are broken

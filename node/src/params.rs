@@ -612,6 +612,21 @@ mod tests {
         let dev_ok = |v: u64| dev.check_governance_change("evidence_max_age_epochs", v, &dp, 0).is_ok();
         assert_eq!(dev.evidence_max_age_epochs, 2, "`blockula dev`: two minutes");
         assert!(dev_ok(2) && !dev_ok(1) && dev_ok(evidence_floor_epochs(&dp) + 1));
+        // The public testnet's genesis (deploy/launch.sh): a week of unbonding and of evidence,
+        // below the floor, so its weak-subjectivity period is 3.5 days, not mainnet's 10.5 or
+        // hours. Governance can still change it: raise it (unbonding first, which can't be
+        // shorter), never lower it, and once it's at the floor, never below the floor.
+        let week = 7 * 86_400;
+        let mut testnet = ChainParams::with_overrides(&p, &BTreeMap::from([("unbonding_blocks".to_string(), week), ("evidence_max_age_epochs".to_string(), week / p.epoch_blocks)])).unwrap();
+        assert_eq!(testnet.evidence_max_age_epochs, 7 * 24);
+        assert_eq!(crate::checkpoints::ws_period_blocks(&testnet, p.epoch_blocks), week / 2);
+        let t_ok = |c: &ChainParams, k: &str, v: u64| c.check_governance_change(k, v, &p, 0).is_ok();
+        assert!(t_ok(&testnet, "evidence_max_age_epochs", 7 * 24) && !t_ok(&testnet, "evidence_max_age_epochs", 7 * 24 - 1));
+        assert!(t_ok(&testnet, "evidence_max_age_epochs", floor) && t_ok(&testnet, "evidence_max_age_epochs", 21 * 24));
+        assert!(testnet.set("evidence_max_age_epochs", floor, &p).is_err(), "not past unbonding");
+        testnet.set("unbonding_blocks", 21 * 86_400, &p).unwrap();
+        testnet.set("evidence_max_age_epochs", floor, &p).unwrap();
+        assert!(t_ok(&testnet, "evidence_max_age_epochs", floor) && !t_ok(&testnet, "evidence_max_age_epochs", floor - 1), "once at the floor, never below it");
         // Mainnet's genesis must start at or above it.
         assert!(at_floor.check_governance_floors(&p).is_ok());
         let short = ChainParams { evidence_max_age_epochs: floor - 1, ..c.clone() };

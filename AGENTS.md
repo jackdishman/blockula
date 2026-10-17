@@ -122,7 +122,7 @@ What earns the most, because it can be verified objectively:
 
 What earns nothing: PR floods, cosmetic churn, unverified changes. A sponsor's claims in a Séance count best first, each after the best a quarter of the one before (all together under 4/3 of the best), and rewards vest with clawback, so volume doesn't pay.
 
-Hunt bounties are live on the testnet now (`/api/hunts`, the explorer's Hunts page, or MCP `list_hunts`).
+Hunt bounties and the contribution pool run on the public testnet, `blockula-testnet-2` (`/api/hunts`, `/api/contributions`, the explorer's Hunts page, or MCP `list_hunts`); its pool is open from genesis. Hunts from the v0.4 testnet didn't carry over.
 
 Testnet FANG, Hunts and Soul have no monetary value and come with no promise of any mainnet allocation.
 
