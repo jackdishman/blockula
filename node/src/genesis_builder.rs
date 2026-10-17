@@ -918,13 +918,12 @@ mod tests {
         refuse(&with(&pool.replace("seance_blocks = 259200", "seance_blocks = 2"), 149_900_000), "seance_blocks ≥ 3");
         assert!(toml::from_str::<Spec>(&format!("{}[contribution]\nwarp = 1\n", toml_of(&spec_for("x", "tboo", &ops, "")))).is_err(), "unknown fields are refused");
         // The founder's and the foundation's accounts start with no Soul (TOKENOMICS: no jury
-        // seats while vesting runs); a 0 entry is fine.
-        let founder = Keys::from_seed([0x30; 32]).address_with("tboo");
-        let mut with_founder = spec.clone();
-        with_founder.soul_ledger.push(SpecSoul { account: founder.clone(), soul: "5".into(), reason: "juror".into() });
-        refuse(&with_founder, "is the founder's or the foundation's");
-        with_founder.soul_ledger.last_mut().unwrap().soul = "0".into();
-        build_from(&with_founder, &ops, false).unwrap();
+        // seats while vesting runs), so they're never founding jurors.
+        for seed in [0x30, 0x31] {
+            let mut with = spec.clone();
+            with.soul_ledger.push(SpecSoul { account: Keys::from_seed([seed; 32]).address_with("tboo"), soul: "5".into(), reason: "juror".into() });
+            refuse(&with, "is the founder's or the foundation's");
+        }
     }
 
     /// A spec as TOML again (the tests build specs as values, then add sections as text).
