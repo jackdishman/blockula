@@ -835,10 +835,26 @@ export class ApiError extends Error {
   }
 }
 
-/** A transaction that was rejected at execution (fee charged) or dropped from the mempool. */
+/**
+ * The node reports a transaction as failed. Two different things (audit review-fix-clients-2):
+ * - `dropped` false: it executed in block `tx.height` and failed there. Its fee was charged; it
+ *   can't execute again.
+ * - `dropped` true: this node dropped it from its mempool without running it (evicted by a
+ *   higher tip, replaced, not included, or an earlier tx from the account was dropped). Nothing
+ *   was charged, but other nodes may still hold it and include it until its `valid_until`
+ *   (`validUntil`, when known): check `client.tx(id)` before sending it again, or a retry can pay twice.
+ */
 export class TxFailedError extends Error {
-  constructor(readonly id: string, readonly reason: string, readonly tx: any) {
-    super(`tx ${id} failed: ${reason}`);
+  readonly dropped: boolean;
+  constructor(readonly id: string, readonly reason: string, readonly tx: any, readonly validUntil?: number) {
+    // Mempool failures are answered without the tx itself (node/src/api.rs `tx`): older nodes don't say `dropped`.
+    const dropped = tx?.dropped === true || (tx !== null && typeof tx === "object" && tx.action === undefined && tx.dropped !== false);
+    super(
+      dropped
+        ? `tx ${id} was dropped by this node without running (${reason}); nothing was charged, but another node may still include it${validUntil !== undefined ? ` until block ${validUntil}` : " until its valid_until"}, so check it (client.tx) before sending it again`
+        : `tx ${id} failed${typeof tx?.height === "number" ? ` in block ${tx.height}` : ""}: ${reason} (its fee was charged)`,
+    );
+    this.dropped = dropped;
     this.name = "TxFailedError";
   }
 }
@@ -895,6 +911,18 @@ export interface ClientOptions {
 export const DEFAULT_TIMEOUT_MS = 15_000;
 
 /**
+ * The longest timeout a `Client` takes: 2^31 − 1 ms (about 24.8 days). Timers store their delay
+ * as a signed 32-bit number, and a longer one fires at once (audit review-fix-clients-1).
+ */
+export const MAX_TIMEOUT_MS = 2_147_483_647;
+
+/** `ms` as a timeout: a whole number of milliseconds from 1 to `MAX_TIMEOUT_MS`, or an error naming `what`. */
+export function checkTimeoutMs(ms: number, what = "timeoutMs"): number {
+  if (!Number.isSafeInteger(ms) || ms < 1 || ms > MAX_TIMEOUT_MS) throw new Error(`${what} must be a whole number of milliseconds from 1 to ${MAX_TIMEOUT_MS} (about 24.8 days)`);
+  return ms;
+}
+
+/**
  * How far behind the newest head (the node's own and each witness's `/api/status` height) a
  * proven read's proof may be, by default: 10 blocks (10 s at 1 s blocks), room for propagation
  * between nodes. Older proofs are refused (`StaleProofError`), so a node can't answer with a
@@ -929,9 +957,7 @@ export class Client {
   constructor(readonly rpc: string = DEFAULT_RPC, opts: ClientOptions = {}) {
     if (opts.prefix !== undefined && !(KNOWN_PREFIXES as readonly string[]).includes(opts.prefix)) throw new Error(`unknown address prefix ${opts.prefix}`);
     if (opts.genesisHash !== undefined && !/^[0-9a-f]{64}$/i.test(opts.genesisHash)) throw new Error("genesisHash must be 64 hex characters");
-    const timeout = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    if (!Number.isSafeInteger(timeout) || timeout < 1) throw new Error("timeoutMs must be a positive whole number of milliseconds");
-    this.timeoutMs = timeout;
+    this.timeoutMs = checkTimeoutMs(opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
     this.pinnedPrefix = opts.prefix;
     this.pinnedChainId = opts.chainId;
     this.pinnedGenesis = opts.genesisHash?.toLowerCase();
@@ -1119,12 +1145,14 @@ export class Client {
    * Submits a signed tx, then (with `wait`) waits for it. What a failure means:
    * - `ApiError`: the node refused the tx; it wasn't admitted.
    * - `RequestTimeoutError` or a network error: unknown; the tx may have arrived.
-   * - `TxFailedError`: it was admitted and then failed (its fee is charged when it executed).
+   * - `TxFailedError`: it executed and failed (`dropped` false: its fee was charged), or this node
+   *   dropped it unrun (`dropped` true: nothing charged, but it may still execute elsewhere until
+   *   its `valid_until`).
    * - `TxPendingError`: it was admitted and may still execute. Don't send it again blindly.
    */
   async submit(tx: Tx, wait = true) {
     const { id } = await this.call("/tx", tx);
-    if (wait) return this.waitForTx(id);
+    if (wait) return this.waitForTx(id, undefined, tx.valid_until);
     try {
       return await this.tx(id);
     } catch (e) {
@@ -1138,18 +1166,19 @@ export class Client {
   }
 
   /**
-   * Polls a tx until it's finalized (returns it) or failed (`TxFailedError`). A poll that fails
-   * (rate limited, a node error, a timeout, not visible yet) is retried; after `timeoutMs` it
-   * throws `TxPendingError`, since the tx may still execute.
+   * Polls a tx until it's finalized (returns it) or failed (`TxFailedError`, which says whether it
+   * executed or was dropped unrun). A poll that fails (rate limited, a node error, a timeout, not
+   * visible yet) is retried; after `timeoutMs` it throws `TxPendingError`, since the tx may still
+   * execute. `validUntil` (the tx's, when the caller has it) goes into a dropped tx's error.
    */
-  async waitForTx(id: string, timeoutMs = 15_000) {
+  async waitForTx(id: string, timeoutMs = 15_000, validUntil?: number) {
     const start = Date.now();
     let lastError: unknown;
     for (;;) {
       try {
         const tx = await this.tx(id);
         if (tx.status === "finalized") return tx;
-        if (tx.status === "failed") throw new TxFailedError(id, tx.error ?? "unknown reason", tx);
+        if (tx.status === "failed") throw new TxFailedError(id, tx.error ?? "unknown reason", tx, validUntil);
       } catch (e) {
         if (e instanceof TxFailedError || (e instanceof ApiError && e.status === 400)) throw e;
         lastError = e;

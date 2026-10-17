@@ -9,7 +9,7 @@ import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex, hexToBytes, utf8ToBytes } from "@noble/hashes/utils.js";
 import {
-  ApiError, ChainMismatchError, Client, RELEASE_SIGNATURE_FORMAT, RequestTimeoutError, StaleProofError, TxPendingError, Wallet, addressFromPublicKey, bareName, buildDistribution, convictionWeight, distributionLeaf, distributionNode,
+  ApiError, ChainMismatchError, Client, MAX_TIMEOUT_MS, RELEASE_SIGNATURE_FORMAT, RequestTimeoutError, StaleProofError, TxFailedError, TxPendingError, Wallet, addressFromPublicKey, bareName, buildDistribution, convictionWeight, distributionLeaf, distributionNode,
   keyHash, keyId, leafHash, maxTip, minFee, paramsOf, proposal, proposalSummary, releaseMessage, sharesFor, signingBytes, stakeSummary, valueHash, verifyDistributionProof, verifyReleaseSignature, type Action,
   type Tx,
 } from "../src/index.js";
@@ -59,7 +59,10 @@ globalThis.fetch = (async (input: string | URL, init?: RequestInit) => {
   if (path === "/status") return reply(200, h.status);
   if (path === `/tx/${"ab".repeat(32)}` && h.txAnswers?.length) {
     const a = h.txAnswers.length > 1 ? h.txAnswers.shift()! : h.txAnswers[0];
-    return typeof a === "number" ? reply(a, { error: `error ${a}` }) : reply(200, { id: "ab".repeat(32), status: a, error: a === "failed" ? "insufficient balance" : undefined });
+    if (typeof a === "number") return reply(a, { error: `error ${a}` });
+    // As node/src/api.rs answers: a tx that failed in a block comes with its fields; one dropped from the mempool unrun doesn't, and says `dropped`.
+    if (a === "dropped") return reply(200, { id: "ab".repeat(32), status: "failed", dropped: true, error: "evicted from a full mempool by a transaction with a higher tip", height: 50 });
+    return reply(200, { id: "ab".repeat(32), status: a, error: a === "failed" ? "insufficient balance" : undefined, ...(a === "failed" ? { height: 51, action: { type: "transfer", to: BOB, amount: "1" } } : {}) });
   }
   if (path === `/tx/${"ab".repeat(32)}`) return reply(200, { status: "finalized", summary: "ok", fee: h.posted.at(-1)?.fee });
   const block = path.match(/^\/block\/(\d+)$/);
@@ -352,6 +355,9 @@ assert.ok(Date.now() - t0 < 5_000, "bounded by timeoutMs");
 await assert.rejects(Wallet.fromSeed("07".repeat(32), new Client("http://hang.node", { timeoutMs: 100 })).send(BOB, "1"), RequestTimeoutError);
 assert.throws(() => new Client(RPC, { timeoutMs: 0 }), /timeoutMs/);
 assert.equal(new Client(RPC).timeoutMs, 15_000);
+// review-fix-clients-1: a timer longer than 2^31 - 1 ms fires at once, so such a timeout is refused.
+assert.equal(new Client(RPC, { timeoutMs: MAX_TIMEOUT_MS }).timeoutMs, 2 ** 31 - 1);
+for (const ms of [2 ** 31, 3_000_000_000, Number.MAX_SAFE_INTEGER]) assert.throws(() => new Client(RPC, { timeoutMs: ms }), /timeoutMs must be a whole number of milliseconds from 1 to 2147483647/, String(ms));
 const slow = host("http://slow.node");
 const sc = new Client("http://slow.node");
 const id = "ab".repeat(32);
@@ -362,7 +368,10 @@ assert.equal((await sc.waitForTx(id, 5_000)).status, "finalized", "failed polls 
 slow.txAnswers = [429];
 await assert.rejects(sc.waitForTx(id, 300), (e: unknown) => e instanceof TxPendingError && e.lastError instanceof ApiError && e.lastError.status === 429);
 slow.txAnswers = ["failed"];
-await assert.rejects(sc.waitForTx(id, 300), /failed: insufficient balance/);
+await assert.rejects(sc.waitForTx(id, 300), (e: unknown) => e instanceof TxFailedError && !e.dropped && /failed in block 51: insufficient balance \(its fee was charged\)/.test(e.message));
+// review-fix-clients-2: dropped from the node's mempool unrun is no "its fee was charged".
+slow.txAnswers = ["dropped"];
+await assert.rejects(sc.waitForTx(id, 300, 999), (e: unknown) => e instanceof TxFailedError && e.dropped && e.validUntil === 999 && /dropped by this node without running \(evicted.*nothing was charged, but another node may still include it until block 999/.test(e.message) && !/fee was charged/.test(e.message));
 slow.txAnswers = [503];
 await assert.rejects(sc.submit(await Wallet.fromSeed("07".repeat(32), sc).build({ type: "transfer", to: BOB, amount: "1" }), false), TxPendingError, "admitted, then the read failed: pending, not refused");
 console.log("✓ requests time out (RequestTimeoutError); waits retry failed polls and end in TxPendingError");

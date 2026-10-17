@@ -10,8 +10,9 @@
 //   BLOCKULA_CHAIN_ID / BLOCKULA_GENESIS_HASH   pin the chain the node must be on
 //   BLOCKULA_HOME       where the agent wallet lives (default ~/.blockula)
 //   BLOCKULA_MAX_SEND   max FANG one call moves (sent, staked, escrowed, paid for a name, bonded; default 100)
-//   BLOCKULA_MAX_DAILY  max FANG leaving the account per UTC day through this MCP, fees included (default 100)
-//   BLOCKULA_TIMEOUT_MS how long one request to the node may take (default 15000)
+//   BLOCKULA_MAX_DAILY  max FANG leaving the account per UTC day through this MCP, fees included
+//                       (default BLOCKULA_MAX_SEND + 1 FANG for fees, so one full-size call fits)
+//   BLOCKULA_TIMEOUT_MS how long one request to the node may take (default 15000, at most 2147483647)
 //   BLOCKULA_TX_WAIT_MS how long a tx tool waits for finality before answering "pending" (default 15000)
 //   BLOCKULA_BIN        path to the `blockula` binary (default: ~/.blockula/bin/blockula from install_node, else PATH)
 //   BLOCKULA_REQUIRE_VERIFY=1   install_node needs provenance too (and refuses a checksum-only release)
@@ -22,7 +23,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { ApiError, Client, RequestTimeoutError, TxFailedError, TxPendingError, Wallet, bareName, formatFang, paramsOf, parseFang, proposalSummary, sharesFor, stakeSummary, txId, type Action, type ProposalSummary } from "@blockula/sdk";
+import { ApiError, Client, RequestTimeoutError, TxFailedError, TxPendingError, Wallet, bareName, checkTimeoutMs, formatFang, paramsOf, parseFang, proposalSummary, sharesFor, stakeSummary, txId, type Action, type ProposalSummary } from "@blockula/sdk";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -36,13 +37,20 @@ import { SERVER_INSTRUCTIONS, UNTRUSTED_NOTE, chainData, clean } from "./untrust
 const HOME = process.env.BLOCKULA_HOME ?? join(homedir(), ".blockula");
 const WALLET_FILE = join(HOME, "agent-wallet.json");
 const MAX_SEND = parseFang(process.env.BLOCKULA_MAX_SEND ?? "100");
-const MAX_DAILY = parseFang(process.env.BLOCKULA_MAX_DAILY ?? "100");
+/**
+ * Fees count toward BLOCKULA_MAX_DAILY (they leave the account too), so by default the daily cap
+ * is the per-call cap plus this much for fees: one call of BLOCKULA_MAX_SEND fits in a day, with
+ * room for the fees of many more small txs (audit review-fix-clients-3).
+ */
+const DAILY_FEE_ALLOWANCE = parseFang("1");
+const MAX_DAILY = process.env.BLOCKULA_MAX_DAILY ? parseFang(process.env.BLOCKULA_MAX_DAILY) : MAX_SEND + DAILY_FEE_ALLOWANCE;
+const MAX_DAILY_TEXT = process.env.BLOCKULA_MAX_DAILY ? `BLOCKULA_MAX_DAILY=${process.env.BLOCKULA_MAX_DAILY} FANG` : `BLOCKULA_MAX_DAILY, by default BLOCKULA_MAX_SEND + 1 FANG for fees = ${formatFang(MAX_DAILY)}`;
 const SPEND_FILE = join(HOME, "agent-spend.json");
 const msEnv = (name: string, fallback: number) => {
   const v = process.env[name];
   if (v === undefined || v === "") return fallback;
-  if (!/^\d+$/.test(v) || Number(v) < 1) throw new Error(`${name} must be a positive number of milliseconds`);
-  return Number(v);
+  if (!/^\d+$/.test(v)) throw new Error(`${name} must be a positive number of milliseconds`);
+  return checkTimeoutMs(Number(v), name);
 };
 const TIMEOUT_MS = msEnv("BLOCKULA_TIMEOUT_MS", 15_000);
 const TX_WAIT_MS = msEnv("BLOCKULA_TX_WAIT_MS", 15_000);
@@ -117,7 +125,7 @@ async function moduleRead<T>(what: string, read: Promise<T>): Promise<T> {
 
 // ---- spending caps (BLOCKULA_MAX_SEND per call, BLOCKULA_MAX_DAILY per UTC day) ----
 
-const LEDGER = new SpendLedger(SPEND_FILE, MAX_DAILY, `BLOCKULA_MAX_DAILY=${process.env.BLOCKULA_MAX_DAILY ?? "100"} FANG`);
+const LEDGER = new SpendLedger(SPEND_FILE, MAX_DAILY, MAX_DAILY_TEXT);
 
 /** What one tool call spends. */
 interface Spend {
@@ -133,7 +141,8 @@ interface Spend {
 
 /** A tx that was submitted (or may have been) but isn't known to be final: never "failed", never to be re-sent blindly. */
 interface InFlight {
-  status: "pending" | "unknown";
+  /** `dropped`: the node dropped it from its mempool unrun (nothing charged), but another node may still include it. */
+  status: "pending" | "unknown" | "dropped";
   tx_id: string;
   valid_until: number;
   counted_toward_daily_limit: string;
@@ -141,14 +150,16 @@ interface InFlight {
   explorer: string;
 }
 
-const isInFlight = (r: unknown): r is InFlight => typeof r === "object" && r !== null && "tx_id" in r && ((r as InFlight).status === "pending" || (r as InFlight).status === "unknown");
+const isInFlight = (r: unknown): r is InFlight => typeof r === "object" && r !== null && "tx_id" in r && ["pending", "unknown", "dropped"].includes((r as InFlight).status);
 
 /**
  * Signs `action`, reserves what it can cost (the spend plus the tx's max fee) against today's
- * budget, and only then submits it. Refused by the node: the reservation is given back. Final:
- * the unused part of the max fee is given back and the tx is returned. Failed: it stays counted
- * (the fee was charged) and the error says so. Pending, timed out or unknown: it stays counted and
- * the agent gets the tx id to check instead of an error that invites a retry (audit F68, F72, F74).
+ * budget under its (account, nonce) slot, and only then submits it. Final: the unused part of the
+ * max fee is given back and the tx is returned. Everything else stays counted: failed in a block
+ * (its fee was charged), dropped, pending, timed out, unknown, and refused too, since the node's
+ * refusal is only its word and it may relay the signed tx anyway (audit F68, F72, F74). A refused
+ * tx stops counting twice once this MCP signs another tx with its nonce (the next send, after an
+ * honest refusal): see spend.ts.
  */
 async function submitCapped(w: Wallet, action: Action, spend: Spend, memo = ""): Promise<any> {
   const perCall = spend.perCall ?? spend.amount;
@@ -156,8 +167,9 @@ async function submitCapped(w: Wallet, action: Action, spend: Spend, memo = ""):
   const tx = await w.build(action, memo);
   const id = txId(tx);
   const maxFee = BigInt(tx.fee);
-  const reservation = LEDGER.reserve(spend.amount + (spend.extra ?? 0n) + maxFee);
-  const counted = formatFang(reservation.drops);
+  const slot = { account: tx.from, nonce: tx.nonce };
+  const reservation = LEDGER.reserve(spend.amount + (spend.extra ?? 0n) + maxFee, slot);
+  const counted = formatFang(LEDGER.held(slot));
   const inFlight = (status: InFlight["status"], why: string): InFlight => ({
     status,
     tx_id: id,
@@ -169,21 +181,25 @@ async function submitCapped(w: Wallet, action: Action, spend: Spend, memo = ""):
   try {
     await w.client.submit(tx, false);
   } catch (e) {
-    // The node answered and refused it: it never entered a mempool, so nothing was spent.
+    // The node says it refused it. An honest node then never relayed it, but a lying one can say
+    // so and relay it anyway, so the reservation stays: the next tx this MCP signs with the same
+    // nonce (after a real refusal, the node's next nonce didn't move) takes the slot over.
     if (e instanceof ApiError && e.status >= 400 && e.status < 500) {
-      LEDGER.release(reservation, reservation.drops);
-      throw e;
+      throw new Error(`${e.message} (the node refused tx ${id}; it still counts toward today's limit until another tx reuses its nonce ${tx.nonce}, since a node could refuse a tx and relay it anyway)`);
     }
     // Admitted, but the first read of its status failed: wait for it below like any other.
     if (!(e instanceof TxPendingError)) return inFlight("unknown", `The node didn't answer clearly (${clean(String((e as Error)?.message ?? e), 200)}), so the tx (${id}) may or may not have arrived.`);
   }
   try {
-    const done = await w.client.waitForTx(id, TX_WAIT_MS);
+    const done = await w.client.waitForTx(id, TX_WAIT_MS, tx.valid_until);
+    // Only a whole number of drops below the max fee gives anything back (audit gap-7-4).
     const charged = /^\d+$/.test(String(done.fee ?? "")) ? BigInt(done.fee) : maxFee;
     if (charged < maxFee) LEDGER.release(reservation, maxFee - charged);
     return done;
   } catch (e) {
-    if (e instanceof TxFailedError) throw new Error(`${e.message}. Its fee was charged, and it stays counted toward the daily limit (${counted}).`);
+    // Dropped from this node's mempool unrun: nothing was charged, but it isn't dead (audit review-fix-clients-2).
+    if (e instanceof TxFailedError && e.dropped) return inFlight("dropped", `This node dropped tx ${id} from its mempool without running it (${clean(e.reason, 200)}), so nothing was charged yet, but another node may still include it.`);
+    if (e instanceof TxFailedError) throw new Error(`tx ${id} failed${typeof e.tx?.height === "number" ? ` in block ${e.tx.height}` : ""}: ${clean(e.reason, 300)}. It ran, so its fee was charged, and it stays counted toward the daily limit (${counted}).`);
     return inFlight("pending", `Submitted (tx ${id}), but not final after ${Math.round(TX_WAIT_MS / 1000)} s.`);
   }
 }
@@ -424,7 +440,7 @@ tool("wallet_info", "This agent's address, balance, .boo names, recent activity 
     balance: clean(String(a?.balance_display ?? "0 FANG")),
     names: chainData(a?.names ?? []),
     recent: (Array.isArray(a?.recent_txs) ? a.recent_txs : []).slice(0, 10).map((t: { summary?: unknown; id?: unknown }) => `${clean(String(t.summary ?? ""), 300)} (${clean(String(t.id ?? "")).slice(0, 12)}…)`),
-    spent_today: `${formatFang(LEDGER.spent())} of ${formatFang(MAX_DAILY)} (BLOCKULA_MAX_DAILY; pending txs included)`,
+    spent_today: `${formatFang(LEDGER.spent())} of ${formatFang(MAX_DAILY)} (BLOCKULA_MAX_DAILY; txs that are pending, dropped or refused still count until they're final or their nonce is reused)`,
     note: UNTRUSTED_NOTE,
   };
 });

@@ -748,7 +748,10 @@ async fn tx(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
         return Ok(Json(tx_json(&v, pending, None)));
     }
     if let Some((reason, height)) = mp.failure(&id) {
-        return Ok(Json(json!({ "id": id, "status": "failed", "error": reason, "height": height, "summary": format!("Transaction failed: {reason}") })));
+        // Dropped from this node's mempool without running: nothing was charged, and a node that
+        // still holds it may include it until its `valid_until` (an executed failure is in a
+        // block and answered above).
+        return Ok(Json(json!({ "id": id, "status": "failed", "dropped": true, "error": reason, "height": height, "summary": format!("Transaction dropped without running: {reason}") })));
     }
     Err(not_found("transaction"))
 }
