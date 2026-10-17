@@ -1,6 +1,6 @@
 "use client";
 
-import { ApiError, formatFang, paramsOf, parseFang, sharesFor, stakeSummary, type StakeDelegation, type StakeSummary, type StakeUnbonding } from "@blockula/sdk";
+import { ApiError, formatFang, paramsOf, parseFang, stakeSummary, type StakeDelegation, type StakeSummary, type StakeUnbonding } from "@blockula/sdk";
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import { RequireWallet } from "@/components/Gate";
@@ -148,8 +148,11 @@ function PoolRow({ d, v, unbondingFor, run }: { d: StakeDelegation; v?: Validato
   const [busy, setBusy] = useState(false);
   const unstake = async () => {
     setBusy(true);
-    const shares = amount.trim() ? sharesFor(d, amount) : ("all" as const);
-    await run(() => wallet.undelegate(d.validator, shares));
+    // An amount is signed as an amount: the chain converts it to shares at its own price when it
+    // runs. Converting it here took the price from your node's report of the stake, and a node
+    // that said it was worth a little more than the amount (or was many more shares) turned a
+    // partial unstake into all of it (audit gap-7-5).
+    await run(() => wallet.undelegate(d.validator, amount.trim() ? { amount: amount.trim() } : "all"));
     setBusy(false);
     setOpen(false);
     setAmount("");
@@ -157,9 +160,8 @@ function PoolRow({ d, v, unbondingFor, run }: { d: StakeDelegation; v?: Validato
   let amountErr: string | null = null;
   try {
     if (amount.trim() && parseFang(amount) <= 0n) amountErr = "Enter more than zero.";
-    // The shares are worked out from the value your node reports: a node reporting a tiny value
-    // would turn a partial unstake into all of it (audit gap-7-5). All of it is the empty field.
-    else if (amount.trim() && parseFang(amount) >= BigInt(d.value)) amountErr = `That's all of this stake (your node says it's worth ${formatFang(BigInt(d.value))}). Leave the field empty to unstake all of it.`;
+    // The chain refuses more than the stake is worth; all of it is the empty field.
+    else if (amount.trim() && parseFang(amount) > BigInt(d.value)) amountErr = `That's more than this stake is worth (your node says ${formatFang(BigInt(d.value))}). Leave the field empty to unstake all of it.`;
   } catch {
     amountErr = "Use a number like 1 or 0.25.";
   }
@@ -182,7 +184,7 @@ function PoolRow({ d, v, unbondingFor, run }: { d: StakeDelegation; v?: Validato
             </div>
           </label>
           {amountErr && <span className="warn">{amountErr}</span>}
-          <p className="dim small">It stops earning now and can be withdrawn in {unbondingFor}.</p>
+          <p className="dim small">{amount.trim() ? "The chain turns it into pool shares at its own price when it runs, so at least that much unbonds. " : ""}It stops earning now and can be withdrawn in {unbondingFor}.</p>
           <button className="btn primary" disabled={busy || !!amountErr} onClick={unstake}>{busy ? <Spinner>Sealing…</Spinner> : amount.trim() ? `Unstake ${amount} FANG` : "Unstake all"}</button>
         </div>
       )}

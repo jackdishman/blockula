@@ -313,7 +313,7 @@ fn share_math_never_creates_fang() {
                     let s = (1 + rnd(held as u64)).min(held as u64);
                     let before = t.stake(&v);
                     let worth = t.st.staking.pools[&v].value(s as u128);
-                    t.ok(k, Action::Undelegate { validator: v.clone(), shares: s });
+                    t.ok(k, Action::Undelegate { validator: v.clone(), shares: s, amount: 0 });
                     assert_eq!(t.stake(&v), before - worth, "a sale takes exactly what the shares were worth");
                 }
             }
@@ -359,9 +359,9 @@ fn delegate_undelegate_and_withdraw() {
     t.ok(&alice, Action::Delegate { validator: v.clone(), amount: 1 });
     t.block();
     // Selling more than you hold, or from a pool you're not in, fails.
-    assert!(t.fails(&alice, Action::Undelegate { validator: v.clone(), shares: 600 * FANG }).contains("not 600"));
-    assert!(t.fails(&alice, Action::Undelegate { validator: vaddr(2), shares: 1 }).contains("no stake"));
-    t.ok(&alice, Action::Undelegate { validator: v.clone(), shares: 200 * FANG });
+    assert!(t.fails(&alice, Action::Undelegate { validator: v.clone(), shares: 600 * FANG, amount: 0 }).contains("not 600"));
+    assert!(t.fails(&alice, Action::Undelegate { validator: vaddr(2), shares: 1, amount: 0 }).contains("no stake"));
+    t.ok(&alice, Action::Undelegate { validator: v.clone(), shares: 200 * FANG, amount: 0 });
     let started = t.height;
     assert_eq!(holdings(&t.st, &a), (300 * FANG + 1, 200 * FANG));
     // 100 blocks of unbonding, stretched to when evidence against epoch 0 stops being accepted
@@ -381,8 +381,52 @@ fn delegate_undelegate_and_withdraw() {
     assert_eq!(holdings(&t.st, &a), (300 * FANG + 1, 0));
     assert!(t.fails(&alice, Action::WithdrawUnbonded {}).contains("nothing unbonding"));
     // Selling everything removes the delegation.
-    t.ok(&alice, Action::Undelegate { validator: v.clone(), shares: 300 * FANG + 1 });
+    t.ok(&alice, Action::Undelegate { validator: v.clone(), shares: 300 * FANG + 1, amount: 0 });
     assert!(!t.st.staking.delegations.contains_key(&dkey(&a, &v)));
+    t.block();
+}
+
+/// Audit gap-7-5: an `Undelegate` can name FANG instead of shares, and the chain converts it at
+/// the pool's price when it runs (rounded up: at least the amount unbonds, and less than a share's
+/// worth more). A wallet that had to turn FANG into shares used the node's report of the stake,
+/// so a node that said a 1,000 FANG stake was worth 10 FANG and a drop (or that it was 100× as
+/// many shares) turned "unstake 10 FANG" into unbonding all of it.
+#[test]
+fn undelegate_by_amount_converts_at_the_chains_price() {
+    let alice = keys(200);
+    let mut t = Setup { accounts: vec![(alice.address(), 10_000 * FANG, None)], ..Default::default() }.start();
+    let (v, a) = (vaddr(1), alice.address());
+    t.ok(&alice, Action::Delegate { validator: v.clone(), amount: 1_000 * FANG });
+    t.block();
+    // Rewards make a share worth more than a drop, at an uneven price.
+    let mut j = Journal::default();
+    let issued = 7 * FANG + 3;
+    t.st.j_mint(&mut j, issued);
+    let paid = distribute_rewards(&mut t.st, &mut j, issued, t.height);
+    t.st.j_burn(&mut j, issued - paid);
+    t.block();
+    let p = t.st.staking.pools[&v].clone();
+    assert!(p.stake as u128 > p.shares && !(p.stake as u128 * 1_000).is_multiple_of(p.shares), "an uneven price above a drop a share");
+    let (held, worth) = (t.shares(&a, &v), delegation_value(&t.st, &a, &v));
+    // More than the stake is worth, or from a pool it isn't in: refused, nothing unbonds.
+    assert!(t.fails(&alice, Action::Undelegate { validator: v.clone(), shares: 0, amount: worth + 1 }).contains("less than the"));
+    assert!(t.fails(&alice, Action::Undelegate { validator: vaddr(2), shares: 0, amount: FANG }).contains("no stake"));
+    assert_eq!((t.shares(&a, &v), holdings(&t.st, &a).1), (held, 0));
+    // 10 FANG: the shares that much buys at the pool's price, rounded up.
+    let tx = t.tx_from(&alice, &a, Action::Undelegate { validator: v.clone(), shares: 0, amount: 10 * FANG });
+    assert!(t.st.describe(&tx, None).contains("started unbonding 10 FANG of their stake in validator"), "{}", t.st.describe(&tx, None));
+    assert_eq!(t.apply(&tx).unwrap(), Outcome::Applied);
+    let sold = held - t.shares(&a, &v);
+    assert_eq!(sold, mul_div_ceil(10 * FANG as u128, p.shares, p.stake as u128).unwrap());
+    let unbonding = holdings(&t.st, &a).1;
+    assert!(unbonding >= 10 * FANG && ((unbonding - 10 * FANG) as u128) * p.shares < p.stake as u128, "at least 10 FANG, under a share's worth more: {unbonding}");
+    // Rounding favours the pool: what's left plus what left is at most what the stake was worth.
+    let rest = delegation_value(&t.st, &a, &v);
+    assert!(rest + unbonding <= worth && rest + unbonding + 1 >= worth, "{rest} + {unbonding} vs {worth}");
+    // The stake's whole worth sells every share (a share is worth more than a drop here).
+    t.ok(&alice, Action::Undelegate { validator: v.clone(), shares: 0, amount: rest });
+    assert!(!t.st.staking.delegations.contains_key(&dkey(&a, &v)));
+    assert!(t.fails(&alice, Action::Undelegate { validator: v.clone(), shares: 0, amount: 1 }).contains("no stake"));
     t.block();
 }
 
@@ -393,9 +437,9 @@ fn unbonding_entries_are_capped_per_delegator() {
     let v = vaddr(0);
     t.ok(&alice, Action::Delegate { validator: v.clone(), amount: 100 * FANG });
     for _ in 0..MAX_ENTRIES {
-        t.ok(&alice, Action::Undelegate { validator: v.clone(), shares: 1 });
+        t.ok(&alice, Action::Undelegate { validator: v.clone(), shares: 1, amount: 0 });
     }
-    assert!(t.fails(&alice, Action::Undelegate { validator: v.clone(), shares: 1 }).contains("withdraw the finished ones"));
+    assert!(t.fails(&alice, Action::Undelegate { validator: v.clone(), shares: 1, amount: 0 }).contains("withdraw the finished ones"));
     assert!(t.fails(&alice, Action::Redelegate { from_validator: v.clone(), to_validator: vaddr(1), shares: 1 }).contains("withdraw the finished ones"));
     t.block();
 }
@@ -443,10 +487,10 @@ fn double_signing_slashes_the_pool_its_exits_and_pays_the_reporter() {
         t.ok(k, Action::Delegate { validator: v.clone(), amount: 10_000 * FANG });
     }
     // Alice leaves before the epoch of the fault; bob leaves during it; carol moves to v3.
-    t.ok(&alice, Action::Undelegate { validator: v.clone(), shares: 10_000 * FANG });
+    t.ok(&alice, Action::Undelegate { validator: v.clone(), shares: 10_000 * FANG, amount: 0 });
     t.finish_epoch();
     t.blocks(3);
-    t.ok(&bob, Action::Undelegate { validator: v.clone(), shares: 10_000 * FANG });
+    t.ok(&bob, Action::Undelegate { validator: v.clone(), shares: 10_000 * FANG, amount: 0 });
     t.ok(&carol, Action::Redelegate { from_validator: v.clone(), to_validator: vaddr(3), shares: 10_000 * FANG });
     t.block();
     let (supply, burned, rep0) = (t.st.supply, t.st.burned, t.balance(&reporter.address()));
@@ -483,7 +527,7 @@ fn double_signing_slashes_the_pool_its_exits_and_pays_the_reporter() {
     t.finish_epoch();
     assert!(!t.set(3).contains(&v));
     // Its delegators still get out.
-    t.ok(&owner(2), Action::Undelegate { validator: v.clone(), shares: t.shares(&owner(2).address(), &v) as u64 });
+    t.ok(&owner(2), Action::Undelegate { validator: v.clone(), shares: t.shares(&owner(2).address(), &v) as u64, amount: 0 });
     t.block();
 }
 
@@ -501,7 +545,7 @@ fn redelegated_stake_stays_slashable_and_cant_hop() {
     // No hop onward while the move is fresh…
     assert!(t.fails(&carol, Action::Redelegate { from_validator: v3.clone(), to_validator: vaddr(1), shares: FANG }).contains("can't move on before block"));
     // …and selling it right away doesn't dodge v2's slash either.
-    t.ok(&carol, Action::Undelegate { validator: v3.clone(), shares: t.shares(&carol.address(), &v3) as u64 });
+    t.ok(&carol, Action::Undelegate { validator: v3.clone(), shares: t.shares(&carol.address(), &v3) as u64, amount: 0 });
     t.block();
     t.ok(&reporter, Action::ReportEquivocation { evidence: double_notarize(&t, 2, 1, 2) });
     assert_eq!(holdings(&t.st, &carol.address()), (0, 9_500 * FANG));
@@ -521,7 +565,7 @@ fn a_double_signer_is_slashed_once_however_many_faults_it_signs() {
     t.ok(&whale, Action::Delegate { validator: v.clone(), amount: 500_000 * FANG });
     t.block();
     // In epoch 0 the whale starts taking 100,000 out.
-    t.ok(&whale, Action::Undelegate { validator: v.clone(), shares: 100_000 * FANG });
+    t.ok(&whale, Action::Undelegate { validator: v.clone(), shares: 100_000 * FANG, amount: 0 });
     t.finish_epoch();
     t.blocks(3);
     let h = t.height;
@@ -698,7 +742,7 @@ fn value_regained_after_a_slash_stays_under_the_vesting_lock() {
     let value = delegation_value(&t.st, &f, &v);
     assert!(value > 100_000 * FANG);
     let shares = t.shares(&f, &v) as u64;
-    run(&mut t, Action::Undelegate { validator: v.clone(), shares });
+    run(&mut t, Action::Undelegate { validator: v.clone(), shares, amount: 0 });
     // The lock grew by what's above the 100,000 put in; the 5,000 regained stayed under it, and
     // all that's movable is the founder's own liquid FANG, less its fees.
     let lock: &Lock = &t.st.account(&f).locks[0];
@@ -761,9 +805,22 @@ proptest::proptest! {
                     let _ = t.run(&delegators[who], Action::Delegate { validator: vals[to].clone(), amount: fang * FANG });
                 }
                 Op::Undelegate { who, from, permille } => {
-                    let held = t.shares(&delegators[who].address(), &vals[from]);
-                    if held > 0 {
-                        let _ = t.run(&delegators[who], Action::Undelegate { validator: vals[from].clone(), shares: ((held * permille as u128 / 1_000).max(1)) as u64 });
+                    let a = delegators[who].address();
+                    let held = t.shares(&a, &vals[from]);
+                    if held > 0 && permille % 2 == 1 {
+                        let _ = t.run(&delegators[who], Action::Undelegate { validator: vals[from].clone(), shares: ((held * permille as u128 / 1_000).max(1)) as u64, amount: 0 });
+                    } else if held > 0 {
+                        // By an amount the chain converts at the pool's price (gap-7-5): at least
+                        // that much unbonds, or (asked for more than the stake is worth) nothing.
+                        let worth = delegation_value(&t.st, &a, &vals[from]);
+                        let amount = if permille == 1_000 { worth + 1 } else { (worth as u128 * permille as u128 / 1_000).max(1) as u64 };
+                        let unbonding = holdings(&t.st, &a).1;
+                        let outcome = t.run(&delegators[who], Action::Undelegate { validator: vals[from].clone(), shares: 0, amount });
+                        if matches!(outcome, Ok(Outcome::Applied)) {
+                            proptest::prop_assert!(amount <= worth && holdings(&t.st, &a).1 >= unbonding + amount, "asked {} of {}, unbonding went {} → {}", amount, worth, unbonding, holdings(&t.st, &a).1);
+                        } else {
+                            proptest::prop_assert!(amount > worth || t.st.staking.entries.iter().filter(|(k, _)| k.starts_with(&format!("{a}/"))).count() >= MAX_ENTRIES, "{:?} for {} of {}", outcome, amount, worth);
+                        }
                     }
                 }
                 Op::Redelegate { who, from, to, permille } => {
@@ -992,7 +1049,7 @@ fn the_set_is_the_top_stake_with_ties_by_address() {
     assert!(t.set(3).contains(&nv.address()) && t.set(3).contains(&v1), "{:?}", t.set(3));
     assert_eq!(t.st.validators[&nv.address()].status, ValidatorStatus::Active);
     // Under-bonded validators (the owner sold its self-bond) leave regardless.
-    t.ok(&owner(1), Action::Undelegate { validator: v1.clone(), shares: 19_500 * FANG });
+    t.ok(&owner(1), Action::Undelegate { validator: v1.clone(), shares: 19_500 * FANG, amount: 0 });
     assert!(!eligible(&t.st, &v1));
     t.finish_epoch();
     assert!(!t.set(4).contains(&v1));
@@ -1045,7 +1102,7 @@ fn a_set_that_shrank_below_four_grows_back() {
     // The owners of validators 2 and 3 sell below the minimum self-bond: the set drops to 2.
     for i in [2u8, 3] {
         let held = t.shares(&owner(i).address(), &vaddr(i)) as u64;
-        t.ok(&owner(i), Action::Undelegate { validator: vaddr(i), shares: held - 500 * FANG });
+        t.ok(&owner(i), Action::Undelegate { validator: vaddr(i), shares: held - 500 * FANG, amount: 0 });
     }
     t.finish_epoch();
     let mut two = vec![vaddr(0), vaddr(1)];
@@ -1076,7 +1133,7 @@ fn a_set_that_shrank_below_four_grows_back() {
     let mut t = Setup::default().start();
     for i in 1..4u8 {
         let held = t.shares(&owner(i).address(), &vaddr(i)) as u64;
-        t.ok(&owner(i), Action::Undelegate { validator: vaddr(i), shares: held - 500 * FANG });
+        t.ok(&owner(i), Action::Undelegate { validator: vaddr(i), shares: held - 500 * FANG, amount: 0 });
     }
     t.finish_epoch();
     assert_eq!(t.set(1), vec![vaddr(0)]);
@@ -1254,7 +1311,7 @@ fn missed_leader_slots_jail_and_the_validator_may_unjail_later() {
     }
     // Under-bonded, it would never be selected: the owner tops up first.
     let held = t.shares(&owner(i).address(), &victim) as u64;
-    t.ok(&owner(i), Action::Undelegate { validator: victim.clone(), shares: held - 500 * FANG });
+    t.ok(&owner(i), Action::Undelegate { validator: victim.clone(), shares: held - 500 * FANG, amount: 0 });
     assert!(t.fails(&owner(i), Action::Unjail { validator: victim.clone() }).contains("below the minimum"));
     t.ok(&owner(i), Action::Delegate { validator: victim.clone(), amount: 900 * FANG });
     t.ok(&owner(i), Action::Unjail { validator: victim.clone() });
@@ -1405,7 +1462,7 @@ fn vesting_accounts_have_a_cap_per_pool_and_their_rewards_vest() {
     let (value, principal) = (delegation_value(&t.st, &f, &v), t.st.staking.delegations[&dkey(&f, &v)].principal);
     assert!(value > principal);
     let shares = t.shares(&f, &v) as u64;
-    t.ok(&founder, Action::Undelegate { validator: v.clone(), shares });
+    t.ok(&founder, Action::Undelegate { validator: v.clone(), shares, amount: 0 });
     let lock: &Lock = &t.st.account(&f).locks[0];
     assert_eq!(lock.amount, LockAmount::Vesting { total: 30_000_000 * FANG + (value - principal), start: 0, cliff: 30, end: 60 });
     // Once fully vested: no cap, and gains are liquid.
@@ -1440,7 +1497,7 @@ fn fully_locked_accounts_stake_at_any_share_price_and_gains_dont_unlock() {
     t.ok(&founder, Action::Delegate { validator: v.clone(), amount });
     t.ok(&founder, Action::Delegate { validator: vaddr(1), amount: 500 * FANG });
     t.ok(&founder, Action::Redelegate { from_validator: v.clone(), to_validator: vaddr(2), shares: (t.shares(&f, &v) / 3) as u64 });
-    t.ok(&founder, Action::Undelegate { validator: v.clone(), shares: (t.shares(&f, &v) / 7) as u64 });
+    t.ok(&founder, Action::Undelegate { validator: v.clone(), shares: (t.shares(&f, &v) / 7) as u64, amount: 0 });
     assert!(t.fails(&founder, Action::Transfer { to: keys(250).address(), amount: FANG }).contains("locked"));
     // Stake earns; the gain stays locked until it's sold, then vests with the allocation.
     let mut j = Journal::default();
@@ -1591,7 +1648,7 @@ fn staking_txs_roll_back_completely() {
         assert_eq!(t.st.apply_j(&mut j, &tx, CHAIN, &vaddr(0), t.height, true).unwrap(), Outcome::Applied);
     };
     apply(&mut t, &alice, Action::Delegate { validator: vaddr(1), amount: 500 * FANG });
-    apply(&mut t, &alice, Action::Undelegate { validator: vaddr(0), shares: 100 * FANG });
+    apply(&mut t, &alice, Action::Undelegate { validator: vaddr(0), shares: 100 * FANG, amount: 0 });
     apply(&mut t, &alice, Action::Redelegate { from_validator: vaddr(0), to_validator: vaddr(2), shares: 100 * FANG });
     apply(&mut t, &reporter, Action::ReportEquivocation { evidence });
     apply(&mut t, &owner(1), Action::UpdateValidator { commission_bps: 1_050, p2p_addr: String::new(), http_addr: String::new() });
@@ -1748,7 +1805,7 @@ fn unrealized_gains_on_locked_stake_dont_vote() {
     assert!((votable..=votable + t.st.staking.pools.len() as u128).contains(&base), "{base} vs {votable}");
     // Sold, the gain joins the vesting lock: still nothing votes before the cliff.
     let shares = t.shares(&f, &v) as u64;
-    t.ok(&founder, Action::Undelegate { validator: v.clone(), shares });
+    t.ok(&founder, Action::Undelegate { validator: v.clone(), shares, amount: 0 });
     assert_eq!(crate::econ::voting_balance(&t.st, &f, t.height), 0);
     t.block();
 }
@@ -1959,7 +2016,7 @@ fn shrunk_to_two(bonds: [u64; 2]) -> T {
     let mut t = Setup::default().start();
     for i in [2u8, 3] {
         let held = t.shares(&owner(i).address(), &vaddr(i)) as u64;
-        t.ok(&owner(i), Action::Undelegate { validator: vaddr(i), shares: held - 500 * FANG });
+        t.ok(&owner(i), Action::Undelegate { validator: vaddr(i), shares: held - 500 * FANG, amount: 0 });
     }
     t.finish_epoch();
     assert_eq!(t.set(1).len(), 2);

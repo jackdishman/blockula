@@ -4,11 +4,12 @@
 //!
 //! **Pools.** Every validator owns a pool ([`Pool`], `STAKE_POOLS`): `stake` drops, escrowed (in
 //! no balance), split into `shares`. `Delegate` buys shares at the pool's rate (1 share per drop
-//! in an empty pool); `Undelegate` sells them for an unbonding [`Entry`] that `WithdrawUnbonded`
-//! pays out after `unbonding_blocks`; `Redelegate` moves them to another pool at once. Rewards
-//! raise `stake`, so every share is worth more; the owner's commission is minted to it as new
-//! shares; slashes lower `stake`, so every delegator loses alike. The owner's own shares are the
-//! validator's self-bond. Rounding always favours the pool (a sale pays at most what the shares
+//! in an empty pool); `Undelegate` sells them (a number of shares, or the shares an amount of
+//! FANG buys at the pool's price when it runs, so no signer relies on a node's share price) for an
+//! unbonding [`Entry`] that `WithdrawUnbonded` pays out after `unbonding_blocks`; `Redelegate`
+//! moves them to another pool at once. Rewards raise `stake`, so every share is worth more; the
+//! owner's commission is minted to it as new shares; slashes lower `stake`, so every delegator
+//! loses alike. The owner's own shares are the validator's self-bond. Rounding always favours the pool (a sale pays at most what the shares
 //! are worth, a purchase buys at most what the amount is worth), so no operation creates FANG;
 //! products of shares and amounts go through [`mul_div`]'s 256-bit intermediate.
 //!
@@ -576,6 +577,22 @@ fn unbond(state: &mut State, j: &mut Journal, delegator: &str, validator: &str, 
     Ok((value, principal))
 }
 
+/// The shares of `delegator`'s stake in `validator`'s pool an `Undelegate` of `amount` drops
+/// sells: what that much buys at the pool's price now, rounded up so the sale pays at least
+/// `amount` (and less than a share's worth more; the pool still pays what the shares are worth,
+/// rounded down), at most all of them. Refused when the stake is worth less than `amount`: the
+/// signer named FANG, so the chain never unbonds more or less than that (audit gap-7-5).
+fn shares_worth(state: &State, delegator: &str, validator: &str, amount: u64) -> Result<u128> {
+    let d = state.staking.delegations.get(&dkey(delegator, validator)).ok_or_else(|| anyhow!("{} has no stake with validator {}", short(delegator), short(validator)))?;
+    let pool = state.staking.pools.get(validator).ok_or_else(|| anyhow!("validator {} has no pool", short(validator)))?;
+    let worth = pool.value(d.shares);
+    if amount > worth {
+        bail!("{}'s stake with validator {} is worth {}, less than the {} asked for (undelegate all its shares to take all of it)", short(delegator), short(validator), fmt_fang(worth), fmt_fang(amount));
+    }
+    // worth ≥ amount > 0, so the pool has stake and shares, and the quotient is at most its shares.
+    Ok(mul_div_ceil(amount as u128, pool.shares, pool.stake as u128).map_or(d.shares, |s| s.min(d.shares)))
+}
+
 /// Takes up to `want` drops of `delegator`'s stake in `validator`'s pool by burning its shares
 /// (rounded up, so the others' shares lose nothing). Returns what it took (out of the pool).
 fn take_from_delegation(state: &mut State, j: &mut Journal, delegator: &str, validator: &str, want: u64) -> u64 {
@@ -673,9 +690,12 @@ pub(crate) fn apply(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, s
             bond(state, j, sender, validator, *amount, *amount)?;
             check_insider_cap(state, sender, validator, height)
         }),
-        Action::Undelegate { validator, shares } => own_move(state, j, sender, height, |state, j| {
+        Action::Undelegate { validator, shares, amount } => own_move(state, j, sender, height, |state, j| {
             room_for_entry(state, sender)?;
-            let (value, principal) = unbond(state, j, sender, validator, *shares as u128)?;
+            // An amount is converted here, at the pool's price now: never at a price some node
+            // reported to the signer (audit gap-7-5).
+            let shares = if *amount > 0 { shares_worth(state, sender, validator, *amount)? } else { *shares as u128 };
+            let (value, principal) = unbond(state, j, sender, validator, shares)?;
             lock_gains(state, j, sender, value.saturating_sub(principal), height);
             if value > 0 {
                 let release_at = release_height(state, height);
@@ -2076,7 +2096,8 @@ pub fn describe(state: &State, tx: &Tx, from: &str, primary_name: &dyn Fn(&str) 
     let v = |a: &str| primary_name(a).unwrap_or_else(|| short(a));
     match &tx.action {
         Action::Delegate { validator, amount } => format!("{from} delegated {} to validator {}", fmt_fang(*amount), v(validator)),
-        Action::Undelegate { validator, shares } => {
+        Action::Undelegate { validator, amount, .. } if *amount > 0 => format!("{from} started unbonding {} of their stake in validator {}'s pool", fmt_fang(*amount), v(validator)),
+        Action::Undelegate { validator, shares, .. } => {
             // At the pool's current price (none once a sale emptied it).
             let worth = state.staking.pools.get(validator).filter(|p| p.shares > 0).map(|p| format!(" (about {})", fmt_fang(p.value(*shares as u128)))).unwrap_or_default();
             format!("{from} started unbonding {shares} shares{worth} of validator {}'s pool", v(validator))

@@ -176,11 +176,17 @@ pub enum Action {
         #[serde(with = "u64_str")]
         amount: u64,
     },
-    /// Start unbonding `shares` of a pool; `WithdrawUnbonded` pays them out after `unbonding_blocks`.
+    /// Start unbonding stake in a pool: exactly `shares` of it, or (with `shares` 0) the shares
+    /// worth `amount` drops at the pool's price when the tx runs (`staking::shares_worth`: rounded
+    /// up, so at least `amount` unbonds). One of the two is set. Naming FANG, a signer never takes
+    /// a share price from a node's report (audit gap-7-5). `WithdrawUnbonded` pays them out after
+    /// `unbonding_blocks`.
     Undelegate {
         validator: String,
         #[serde(with = "u64_str")]
         shares: u64,
+        #[serde(default, with = "u64_str")]
+        amount: u64,
     },
     /// Move `shares` from one pool to another without unbonding.
     Redelegate {
@@ -952,10 +958,11 @@ impl Action {
                 put_str(out, validator);
                 put_u64(out, *amount);
             }
-            Action::Undelegate { validator, shares } => {
+            Action::Undelegate { validator, shares, amount } => {
                 out.push(31);
                 put_str(out, validator);
                 put_u64(out, *shares);
+                put_u64(out, *amount);
             }
             Action::Redelegate { from_validator, to_validator, shares } => {
                 out.push(32);
@@ -1155,7 +1162,7 @@ impl Action {
             28 => Action::WithdrawVested {},
             29 => Action::Clawback { account: r.str("account", MAX_NAME_FIELD)?, reason: r.str("reason", MAX_REASON)? },
             30 => Action::Delegate { validator: r.str("validator", MAX_ADDRESS)?, amount: r.u64()? },
-            31 => Action::Undelegate { validator: r.str("validator", MAX_ADDRESS)?, shares: r.u64()? },
+            31 => Action::Undelegate { validator: r.str("validator", MAX_ADDRESS)?, shares: r.u64()?, amount: r.u64()? },
             32 => Action::Redelegate { from_validator: r.str("from_validator", MAX_ADDRESS)?, to_validator: r.str("to_validator", MAX_ADDRESS)?, shares: r.u64()? },
             33 => Action::WithdrawUnbonded {},
             34 => Action::UpdateValidator { commission_bps: r.u64()?, p2p_addr: r.str("p2p_addr", MAX_ADDR)?, http_addr: r.str("http_addr", MAX_ADDR)? },
@@ -1365,10 +1372,12 @@ impl Action {
                     bail!("delegate more than 0");
                 }
             }
-            Action::Undelegate { validator, shares } => {
+            Action::Undelegate { validator, shares, amount } => {
                 check_address("validator", validator)?;
-                if *shares == 0 {
-                    bail!("undelegate more than 0 shares");
+                match (*shares, *amount) {
+                    (0, 0) => bail!("undelegate more than 0 shares, or an amount above 0"),
+                    (s, a) if s > 0 && a > 0 => bail!("undelegate a number of shares or an amount, not both"),
+                    _ => {}
                 }
             }
             Action::Redelegate { from_validator, to_validator, shares } => {
@@ -2330,7 +2339,8 @@ pub(crate) mod tests {
         let propose = |kind: ProposalKind| Action::Propose { kind, deposit: 1_000 * DROPS_PER_FANG, title: "t".into(), url: String::new() };
         vec![
             Action::Delegate { validator: "boo1v".into(), amount: 5 * DROPS_PER_FANG },
-            Action::Undelegate { validator: "boo1v".into(), shares: 7 },
+            Action::Undelegate { validator: "boo1v".into(), shares: 7, amount: 0 },
+            Action::Undelegate { validator: "boo1v".into(), shares: 0, amount: 9 * DROPS_PER_FANG },
             Action::Redelegate { from_validator: "boo1v".into(), to_validator: "boo1w".into(), shares: 8 },
             Action::WithdrawUnbonded {},
             Action::UpdateValidator { commission_bps: 500, p2p_addr: "1.2.3.4:5".into(), http_addr: "https://v.example".into() },
@@ -2532,7 +2542,7 @@ pub(crate) mod tests {
         for action in v1_vector_actions() {
             h.update(&vector_tx(action).signing_bytes());
         }
-        assert_eq!(h.finalize().to_hex().to_string(), "6979535ae0ead49caa82eba564873762cfc4fb7aad1dc77ec3ae845caf0b5366");
+        assert_eq!(h.finalize().to_hex().to_string(), "a411ddbbcc010f275e102b3d2b2abec2b9e96c6c0e3f69cb50868a07678d4f6e");
         // Proposal kinds added after that vector froze, each on its own (mirrored in e2e.ts):
         // `UnflagSybil` (tag 14, audit F54), then `CancelUpgrade` (tag 15, audit F50; unit.ts too).
         let unflag = Action::Propose { kind: ProposalKind::UnflagSybil { account: "x.boo".into(), reason: "r".into() }, deposit: 1_000 * DROPS_PER_FANG, title: "t".into(), url: String::new() };
@@ -2802,6 +2812,14 @@ pub(crate) mod tests {
         assert!(bad(Action::AdmitValidator { validator: "x.boo".into(), epoch: 1 }).contains("address"), "and admitted by address");
         assert!(bad(Action::Delegate { validator: addr.clone(), amount: 0 }).contains("more than 0"));
         assert!(bad(Action::Redelegate { from_validator: addr.clone(), to_validator: addr.clone(), shares: 1 }).contains("different"));
+        // Undelegate: a number of shares or an amount (audit gap-7-5), exactly one of them.
+        ok(Action::Undelegate { validator: addr.clone(), shares: 1, amount: 0 });
+        ok(Action::Undelegate { validator: addr.clone(), shares: 0, amount: 1 });
+        assert!(bad(Action::Undelegate { validator: addr.clone(), shares: 0, amount: 0 }).contains("more than 0"));
+        assert!(bad(Action::Undelegate { validator: addr.clone(), shares: 1, amount: 1 }).contains("not both"));
+        // The shape clients sent before the amount existed still parses (by shares).
+        let a: Action = serde_json::from_str(&format!(r#"{{"type":"undelegate","validator":"{addr}","shares":"5"}}"#)).unwrap();
+        assert_eq!(a, Action::Undelegate { validator: addr.clone(), shares: 5, amount: 0 });
         assert!(bad(Action::UpdateValidator { commission_bps: 10_001, p2p_addr: String::new(), http_addr: String::new() }).contains("0–10000"));
         // Evidence: at most 16 KiB decoded, as lowercase hex.
         ok(Action::ReportEquivocation { evidence: "ab".repeat(MAX_EVIDENCE_BYTES) });
@@ -3061,7 +3079,7 @@ pub(crate) mod tests {
             28 => Action::WithdrawVested {},
             29 => Action::Clawback { account: a, reason: b },
             30 => Action::Delegate { validator: a, amount: w },
-            31 => Action::Undelegate { validator: a, shares: w },
+            31 => Action::Undelegate { validator: a, shares: w, amount: x },
             32 => Action::Redelegate { from_validator: a, to_validator: b, shares: w },
             33 => Action::WithdrawUnbonded {},
             34 => Action::UpdateValidator { commission_bps: w, p2p_addr: a, http_addr: b },

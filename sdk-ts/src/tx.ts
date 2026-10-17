@@ -69,8 +69,13 @@ export type Action =
   // ---- protocol v1 (tags 30–49, MAINNET-DESIGN 3.1): staking, governance, the beacon, names and distributions. Older nodes, built before these modules, fail them with "not active yet". ----
   /** Stake `amount` drops in a validator's pool (validators are named by address). */
   | { type: "delegate"; validator: string; amount: string }
-  /** Start unbonding `shares` of a pool; `withdraw_unbonded` pays them out after the unbonding period. */
-  | { type: "undelegate"; validator: string; shares: string }
+  /**
+   * Start unbonding stake in a pool: exactly `shares`, or (with `shares` "0") the shares worth
+   * `amount` drops at the pool's price when the tx runs (rounded up: at least `amount` unbonds).
+   * One of the two is set. Naming an amount, a wallet never converts FANG to shares at a price
+   * some node reported (audit gap-7-5). `withdraw_unbonded` pays it out after the unbonding period.
+   */
+  | { type: "undelegate"; validator: string; shares: string; amount?: string }
   | { type: "redelegate"; from_validator: string; to_validator: string; shares: string }
   | { type: "withdraw_unbonded" }
   /** A validator's owner: commission (bps) and, when non-empty, new addresses. */
@@ -425,7 +430,7 @@ function encodeAction(w: Writer, a: Action) {
       w.u8(30); w.str(a.validator); w.u64(a.amount);
       break;
     case "undelegate":
-      w.u8(31); w.str(a.validator); w.u64(a.shares);
+      w.u8(31); w.str(a.validator); w.u64(a.shares); w.u64(orDefault(a.amount, "0"));
       break;
     case "redelegate":
       w.u8(32); w.str(a.from_validator); w.str(a.to_validator); w.u64(a.shares);

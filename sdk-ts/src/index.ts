@@ -268,7 +268,11 @@ export function stakeSummary(raw: unknown): StakeSummary {
   return { delegations, unbonding, redelegations, bonded: drops(r.bonded), unbonding_total: drops(r.unbonding), withdrawable: drops(r.withdrawable), summary: String(r.summary ?? "") };
 }
 
-/** Shares worth about `value` drops in a delegation (rounded down, at most all of them). */
+/**
+ * Shares worth about `value` drops in a delegation (rounded down, at most all of them), at the
+ * value the delegation reports. That's a node's word: to unbond an amount, pass
+ * `wallet.undelegate(validator, { amount })`, which the chain converts itself (audit gap-7-5).
+ */
 export function sharesFor(d: StakeDelegation, value: Amount): bigint {
   const want = parseFang(value);
   const [shares, worth] = [BigInt(d.shares), BigInt(d.value)];
@@ -826,12 +830,16 @@ export class Wallet {
   }
 
   /**
-   * Start unbonding `shares` of your stake in a validator's pool (`"all"`: every share you hold
-   * there, read from `/api/staking`). It stops earning now and can be withdrawn with
-   * `withdrawUnbonded` once the unbonding period (21 days on mainnet) is over.
+   * Start unbonding stake in a validator's pool: `{ amount }` (FANG, or bigint drops), `shares`,
+   * or `"all"` (every share you hold there, read from `/api/staking`). An amount is signed as an
+   * amount and the chain converts it at the pool's price when the tx runs, so no node's report of
+   * the stake decides how much unbonds (audit gap-7-5); prefer it to `sharesFor`. It stops
+   * earning now and can be withdrawn with `withdrawUnbonded` once the unbonding period (21 days
+   * on mainnet) is over.
    */
-  async undelegate(validator: string, shares: bigint | string | "all", opts: TxOptions = {}) {
+  async undelegate(validator: string, shares: bigint | string | "all" | { amount: Amount }, opts: TxOptions = {}) {
     const v = await this.validatorAddress(validator);
+    if (typeof shares === "object" && shares !== null) return this.act({ type: "undelegate", validator: v.address, shares: "0", amount: positive(parseFang(shares.amount), "undelegate").toString() }, opts, [v]);
     return this.act({ type: "undelegate", validator: v.address, shares: (await this.sharesOf(v.address, shares)).toString() }, opts, [v]);
   }
 
@@ -1094,11 +1102,21 @@ export class ApiError extends Error {
  *   was charged, but other nodes may still hold it and include it until its `valid_until`
  *   (`validUntil`, when known): check `client.tx(id)` before sending it again, or a retry can pay twice.
  */
+/**
+ * Whether a `/api/tx` answer of status "failed" is a tx the node dropped from its mempool without
+ * running it (nothing charged; another node may still include it until its `valid_until`), not
+ * one that ran in a block and failed (its fee was charged). Mempool failures are answered without
+ * the tx itself (node/src/api.rs `tx`), and older nodes don't say `dropped`.
+ */
+export function txDropped(answer: unknown): boolean {
+  const tx = answer as { dropped?: unknown; action?: unknown } | null;
+  return tx?.dropped === true || (tx !== null && typeof tx === "object" && tx.action === undefined && tx.dropped !== false);
+}
+
 export class TxFailedError extends Error {
   readonly dropped: boolean;
   constructor(readonly id: string, readonly reason: string, readonly tx: any, readonly validUntil?: number) {
-    // Mempool failures are answered without the tx itself (node/src/api.rs `tx`): older nodes don't say `dropped`.
-    const dropped = tx?.dropped === true || (tx !== null && typeof tx === "object" && tx.action === undefined && tx.dropped !== false);
+    const dropped = txDropped(tx);
     super(
       dropped
         ? `tx ${id} was dropped by this node without running (${reason}); nothing was charged, but another node may still include it${validUntil !== undefined ? ` until block ${validUntil}` : " until its valid_until"}, so check it (client.tx) before sending it again`

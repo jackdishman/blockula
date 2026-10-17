@@ -6,10 +6,12 @@ import { useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
 import { RequireWallet } from "@/components/Gate";
 import { Apparition } from "@/components/Haunt";
+import { PayLinkNotice } from "@/components/PayLinkNotice";
 import { ErrorNote, ExplorerLink, Spinner, Tip } from "@/components/ui";
 import { explorer, MAINNET_PREFIX, NETWORK } from "@/lib/config";
 import { friendly } from "@/lib/errors";
 import { shortAddr } from "@/lib/format";
+import { checkLinkChain, linkChain } from "@/lib/paylink";
 import type { TxView } from "@/lib/types";
 import { useUnlocked } from "@/lib/wallet";
 
@@ -73,10 +75,23 @@ function useRecipient(input: string): Recipient {
 function Send() {
   const { wallet, account, client, refresh } = useUnlocked();
   const params = useSearchParams();
-  const [to, setTo] = useState(params.get("to") ?? "");
-  const [amount, setAmount] = useState(params.get("amount") ?? "");
-  const [memo, setMemo] = useState(params.get("memo") ?? "");
   const prefilled = params.has("to") || params.has("amount") || params.has("memo");
+  // A payment link says which chain it was made for: a check, never a switch. A .boo name can be
+  // someone else's on another network, so a link from another chain fills nothing and can't be
+  // reviewed; until the wallet knows its own chain, it can't be reviewed either (audit main-11-1).
+  const link = prefilled ? linkChain(params) : null;
+  const linkCheck = prefilled ? checkLinkChain(link, client.pin) : null;
+  const refused = linkCheck?.state === "mismatch";
+  const fromLink = (key: string) => (refused ? "" : (params.get(key) ?? ""));
+  const [to, setTo] = useState(() => fromLink("to"));
+  const [amount, setAmount] = useState(() => fromLink("amount"));
+  const [memo, setMemo] = useState(() => fromLink("memo"));
+  useEffect(() => {
+    if (!refused) return;
+    setTo("");
+    setAmount("");
+    setMemo("");
+  }, [refused]);
   const [review, setReview] = useState<{ tx: Tx; display: string; proven: boolean; byChain: boolean; nodeSays: string } | null>(null);
   const [sent, setSent] = useState<TxView | null>(null);
   const [busy, setBusy] = useState(false);
@@ -96,7 +111,7 @@ function Send() {
   }
   const memoErr = utf8Len(memo) > 256 ? "Memos are limited to 256 bytes." : null;
   const self = recipient.state === "ok" && recipient.address === wallet.account;
-  const canReview = recipient.state === "ok" && drops !== null && !amountErr && !memoErr && !self;
+  const canReview = recipient.state === "ok" && drops !== null && !amountErr && !memoErr && !self && !refused && linkCheck?.state !== "pending";
 
   const toReview = async () => {
     if (recipient.state !== "ok" || drops === null) return;
@@ -203,11 +218,7 @@ function Send() {
     <main className="narrow stack-lg">
       <Link href="/" className="back">← Home</Link>
       <h1>Send FANG</h1>
-      {prefilled && (
-        <div className="banner">
-          A link filled in this payment. Double-check who it goes to and how much before sending.
-        </div>
-      )}
+      {linkCheck && <PayLinkNotice check={linkCheck} link={link} wallet={client.pin} />}
       <section className="card stack">
         <label className="field">
           <span>To</span>

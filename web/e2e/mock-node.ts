@@ -66,6 +66,8 @@ export class MockNode {
   ]);
   /** Shares by account, then validator. */
   shares = new Map<string, Map<string, bigint>>();
+  /** A lying node: what `/api/staking` reports for a delegation, given the truth (audit gap-7-5). */
+  reportStake: ((truth: { shares: bigint; value: bigint }) => { shares: bigint; value: bigint }) | null = null;
   unbonding = new Map<string, { id: number; validator: string; amount: bigint; started_at: number; release_at: number }[]>();
   /** Governance proposals as node/src/api.rs serves them (`proposal_json`), before this mock adds its votes. */
   proposals: Record<string, unknown>[] = [];
@@ -238,7 +240,15 @@ export class MockNode {
       const pool = this.pools.get(act.validator);
       const mine = this.shares.get(tx.from);
       const held = mine?.get(act.validator) ?? 0n;
-      const shares = BigInt(act.shares);
+      let shares = BigInt(act.shares);
+      // As node/src/staking.rs `shares_worth`: an amount is converted at the pool's price, rounded up (gap-7-5).
+      const want = BigInt(act.amount ?? "0");
+      if ((shares > 0n) === (want > 0n)) throw new HttpError(400, "undelegate a number of shares or an amount, not both");
+      if (want > 0n) {
+        if (!pool || !mine || want > (held * pool.stake) / pool.shares) throw new HttpError(400, "that's more than the stake is worth");
+        shares = (want * pool.shares + pool.stake - 1n) / pool.stake;
+        if (shares > held) shares = held;
+      }
       if (!pool || !mine || shares > held) throw new HttpError(400, `you hold ${held} shares of that pool`);
       const value = (shares * pool.stake) / pool.shares;
       pool.stake -= value;
@@ -246,7 +256,7 @@ export class MockNode {
       mine.set(act.validator, held - shares);
       const entries = this.unbonding.get(tx.from) ?? [];
       this.unbonding.set(tx.from, [...entries, { id: entries.length, validator: act.validator, amount: value, started_at: this.height + 1, release_at: this.height + 10 }]);
-      summary = `${this.label(tx.from).short} started unbonding ${shares} shares of validator ${this.label(act.validator).short}'s pool`;
+      summary = want > 0n ? `${this.label(tx.from).short} started unbonding ${formatFang(want)} of their stake in validator ${this.label(act.validator).short}'s pool` : `${this.label(tx.from).short} started unbonding ${shares} shares of validator ${this.label(act.validator).short}'s pool`;
     } else if (act.type === "withdraw_unbonded") {
       const entries = this.unbonding.get(tx.from) ?? [];
       const ready = entries.filter((u) => u.release_at <= this.height + 1);
@@ -286,9 +296,10 @@ export class MockNode {
   /** `/api/staking/{account}` as node/src/api.rs serves it. */
   private stakingOf(account: string) {
     const mine = this.shares.get(account) ?? new Map<string, bigint>();
-    const delegations = [...mine].filter(([, s]) => s > 0n).map(([v, shares]) => {
+    const delegations = [...mine].filter(([, s]) => s > 0n).map(([v, held]) => {
       const p = this.pools.get(v) as { stake: bigint; shares: bigint };
-      const value = (shares * p.stake) / p.shares;
+      const truth = { shares: held, value: (held * p.stake) / p.shares };
+      const { shares, value } = this.reportStake ? this.reportStake(truth) : truth;
       return { validator: this.label(v), shares: shares.toString(), value: value.toString(), value_display: formatFang(value), principal: value.toString(), earned_display: "0 FANG", self_bond: false };
     });
     const next = this.height + 1;

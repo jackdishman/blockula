@@ -396,3 +396,15 @@ fn main() -> Result<()> {
         }
     }
 }
+
+#[cfg(test)]
+mod cli_tests {
+    /// clap's own checks of the whole command tree (unique argument ids, groups, defaults), which
+    /// otherwise run only for a subcommand being parsed, and only in debug builds: `stake
+    /// redelegate` once named a positional `from`, the id of the signer's `--from`.
+    #[test]
+    fn the_cli_is_well_formed() {
+        use clap::CommandFactory;
+        super::Cli::command().debug_assert();
+    }
+}

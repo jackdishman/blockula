@@ -798,18 +798,22 @@ pub enum StakeCmd {
         #[command(flatten)]
         signer: Signer,
     },
-    /// Start unbonding pool shares (withdraw them after the unbonding period)
+    /// Start unbonding stake (withdraw it after the unbonding period): an amount, pool shares, or all of it
     Undelegate {
         validator: String,
         #[command(flatten)]
-        shares: Shares,
+        shares: Unbonding,
         #[command(flatten)]
         signer: Signer,
     },
     /// Move pool shares to another validator without unbonding
     Redelegate {
-        from: String,
-        to: String,
+        /// The validator the shares leave (its own name: `from` is the signer's `--from`)
+        #[arg(value_name = "FROM")]
+        from_validator: String,
+        /// The validator they move to
+        #[arg(value_name = "TO")]
+        to_validator: String,
         #[command(flatten)]
         shares: Shares,
         #[command(flatten)]
@@ -825,6 +829,22 @@ pub enum StakeCmd {
 #[derive(Args, Clone)]
 #[group(required = true, multiple = false)]
 pub struct Shares {
+    /// How many pool shares (see `blockula stake show`)
+    #[arg(long)]
+    shares: Option<u64>,
+    /// Every share you hold in that pool
+    #[arg(long)]
+    all: bool,
+}
+
+/// What `stake undelegate` unbonds.
+#[derive(Args, Clone)]
+#[group(required = true, multiple = false)]
+pub struct Unbonding {
+    /// FANG, e.g. 10: the chain sells the shares worth that much at the pool's price when the tx
+    /// runs, so no node's report of the price decides how much unbonds
+    #[arg(long)]
+    amount: Option<String>,
     /// How many pool shares (see `blockula stake show`)
     #[arg(long)]
     shares: Option<u64>,
@@ -877,19 +897,26 @@ pub fn stake(cmd: StakeCmd, dir: &Path) -> Result<()> {
             Ok(())
         }
         StakeCmd::Delegate { validator, amount, signer } => submit(dir, &signer, Action::Delegate { validator, amount: parse_fang(&amount)? }).map(|_| ()),
-        StakeCmd::Undelegate { validator, shares, signer } => {
-            let keys = signer.keys(dir)?;
-            let rt = rt()?;
-            let me = rt.block_on(signer.from(&keys))?;
-            let shares = rt.block_on(shares_of(&signer.rpc, &me, &validator, &shares))?;
-            submit(dir, &signer, Action::Undelegate { validator, shares }).map(|_| ())
+        StakeCmd::Undelegate { validator, shares: Unbonding { amount: Some(amount), .. }, signer } => {
+            let amount = parse_fang(&amount)?;
+            if amount == 0 {
+                bail!("undelegate more than 0 FANG");
+            }
+            submit(dir, &signer, Action::Undelegate { validator, shares: 0, amount }).map(|_| ())
         }
-        StakeCmd::Redelegate { from, to, shares, signer } => {
+        StakeCmd::Undelegate { validator, shares: Unbonding { shares, all, .. }, signer } => {
             let keys = signer.keys(dir)?;
             let rt = rt()?;
             let me = rt.block_on(signer.from(&keys))?;
-            let shares = rt.block_on(shares_of(&signer.rpc, &me, &from, &shares))?;
-            submit(dir, &signer, Action::Redelegate { from_validator: from, to_validator: to, shares }).map(|_| ())
+            let shares = rt.block_on(shares_of(&signer.rpc, &me, &validator, &Shares { shares, all }))?;
+            submit(dir, &signer, Action::Undelegate { validator, shares, amount: 0 }).map(|_| ())
+        }
+        StakeCmd::Redelegate { from_validator, to_validator, shares, signer } => {
+            let keys = signer.keys(dir)?;
+            let rt = rt()?;
+            let me = rt.block_on(signer.from(&keys))?;
+            let shares = rt.block_on(shares_of(&signer.rpc, &me, &from_validator, &shares))?;
+            submit(dir, &signer, Action::Redelegate { from_validator, to_validator, shares }).map(|_| ())
         }
         StakeCmd::Withdraw { signer } => submit(dir, &signer, Action::WithdrawUnbonded {}).map(|_| ()),
     }
@@ -916,6 +943,33 @@ mod tests {
         assert_eq!(from_on_chain(&a, &a, crate::chain::MAINNET_CHAIN_ID, "http://n").unwrap(), a);
         let err = from_on_chain("alice.boo", &a, crate::chain::MAINNET_CHAIN_ID, "http://n").unwrap_err().to_string();
         assert!(err.contains(&format!("pass --from {a}")) && err.contains("Nothing was signed"), "{err}");
+    }
+
+    /// `stake undelegate` takes exactly one of `--amount` (signed as an amount, converted by the
+    /// chain: audit gap-7-5), `--shares` or `--all`.
+    #[test]
+    fn undelegate_takes_an_amount_shares_or_all() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            cmd: StakeCmd,
+        }
+        let parse = |args: &[&str]| Cli::try_parse_from(["blockula"].iter().chain(args)).map(|c| c.cmd);
+        let Ok(StakeCmd::Undelegate { validator, shares: Unbonding { amount, shares, all }, .. }) = parse(&["undelegate", "boo1v", "--amount", "2.5"]) else { panic!("--amount parses") };
+        assert_eq!((validator.as_str(), amount.as_deref(), shares, all), ("boo1v", Some("2.5"), None, false));
+        assert!(matches!(parse(&["undelegate", "boo1v", "--shares", "7"]), Ok(StakeCmd::Undelegate { shares: Unbonding { shares: Some(7), amount: None, all: false }, .. })));
+        assert!(matches!(parse(&["undelegate", "boo1v", "--all"]), Ok(StakeCmd::Undelegate { shares: Unbonding { all: true, amount: None, shares: None }, .. })));
+        assert!(parse(&["undelegate", "boo1v"]).is_err(), "one of them is required");
+        assert!(parse(&["undelegate", "boo1v", "--amount", "1", "--all"]).is_err(), "only one");
+        assert!(parse(&["redelegate", "boo1v", "boo1w", "--amount", "1"]).is_err(), "redelegate moves shares");
+        // The validators are positionals of their own: the source used to share the id `from` with
+        // the signer's `--from` (a debug-build panic; in release the signer read the validator as
+        // the account to act for).
+        let Ok(StakeCmd::Redelegate { from_validator, to_validator, signer, .. }) = parse(&["redelegate", "boo1v", "boo1w", "--all"]) else { panic!("redelegate parses") };
+        assert_eq!((from_validator.as_str(), to_validator.as_str(), signer.from), ("boo1v", "boo1w", None));
+        let Ok(StakeCmd::Redelegate { from_validator, signer, .. }) = parse(&["redelegate", "boo1v", "boo1w", "--all", "--from", "vlad.boo"]) else { panic!("with --from") };
+        assert_eq!((from_validator.as_str(), signer.from.as_deref()), ("boo1v", Some("vlad.boo")));
     }
 
     #[test]

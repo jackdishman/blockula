@@ -27,7 +27,7 @@ Everything is a build-time `NEXT_PUBLIC_*` variable.
 
 ## Stake and Governance (protocol v1)
 
-- **Stake** (`/stake`): what the account has staked and unbonding, each pool (value, shares, commission), unstaking an amount or everything, withdrawing what has finished unbonding, and delegating to a validator of the active set. Amounts become pool shares at the pool's current rate (`sharesFor`).
+- **Stake** (`/stake`): what the account has staked and unbonding, each pool (value, shares, commission), unstaking an amount or everything, withdrawing what has finished unbonding, and delegating to a validator of the active set. An amount to unstake is signed as an amount, and the chain converts it to pool shares at its own price (audit gap-7-5), so the node's report of the stake never decides how much unbonds.
 - **Governance** (`/governance`): open and earlier proposals with their token tallies, quorum, bootstrap-council votes and timelock; voting aye or nay with a conviction (its weight and lock time shown before signing); releasing expired vote locks.
 - Both use the SDK helpers (`wallet.delegate`, `wallet.vote`, …) through the pinned client, read the module endpoints tolerantly (`stakeSummary`, `proposalSummary`), and say so plainly on a node that doesn't serve them yet. Text and links from the chain render as text; only `https://` links become links.
 
@@ -73,7 +73,8 @@ Everything is a build-time `NEXT_PUBLIC_*` variable.
 | `recovery.spec.ts` | Kit creation (print, download, confirmation, activation), restore on a second device and revoking the lost one, mistyped kits, pending kits on a chain without a faucet, no secret in requests, storage or the page |
 | `recovery-phrase.spec.ts` | BIP39 256-bit vectors, wordlist hash, round trips, abbreviations, error messages |
 | `mainnet.spec.ts` | Mainnet default and badge, pinned genesis, no browser-only keys, the build refusing a borrowed rpId or missing pins, a footer that doesn't call mainnet a test chain |
-| `stake.spec.ts` | Delegate, unstake an amount and the rest, withdraw once unbonded (each tx checked by the mock node), no CSP violations, a node without staking |
+| `stake.spec.ts` | Delegate, unstake an amount and the rest, withdraw once unbonded (each tx checked by the mock node), no CSP violations, a node lying about the stake's value or shares (the amount is signed), a node without staking |
+| `paylink.spec.ts` | Receive links carry their chain; an absurd amount is refused without crashing; Send fills a link made for this chain, refuses one made for another chain or instance, and fills an older link with a notice |
 | `governance.spec.ts` | Proposals with tallies, quorum and council votes; voting with conviction and changing the vote; releasing locks; hostile on-chain titles and links rendered inert; a node without governance |
 | `explorer.spec.ts` | The node's built-in explorer (`node/src/explorer.html`) on a mocked protocol v1 API: validator pools, Governance and proposal pages, parameters, name expiry, escaping |
 

@@ -214,17 +214,27 @@ pub(crate) async fn send_memo_with(remote: &Remote, keys: &Keys, from: &str, mak
     }
     let id = v["id"].as_str().unwrap_or_default().to_string();
     for _ in 0..120 {
-        if let Ok(t) = get(rpc, &format!("/tx/{id}")).await {
-            if t["status"] == "finalized" {
-                return Ok(t);
-            }
-            if t["status"] == "failed" {
-                bail!("tx {id} failed: {}", t["error"].as_str().unwrap_or("unknown reason"));
-            }
+        if let Some(done) = get(rpc, &format!("/tx/{id}")).await.ok().and_then(|t| tx_outcome(&id, t, valid_until)) {
+            return done;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    bail!("tx {id} still pending after 60s (it may have been dropped: check balance and nonce)")
+    bail!("tx {id} still pending after 60s: it was submitted and can still execute until block {valid_until}, so check it (GET /api/tx/{id}) before sending it again")
+}
+
+/// What a `/api/tx` answer says about a tx this CLI signed (valid until `valid_until`): final
+/// (`Ok`), failed in a block (its fee was charged), dropped from that node's mempool without
+/// running (nothing charged, but another node may still include it until `valid_until`, so it
+/// mustn't be sent again before then: audit review-fix-clients-2), or not yet known (`None`).
+/// A drop is answered without the tx itself, and older nodes don't say `dropped`.
+fn tx_outcome(id: &str, t: Value, valid_until: u64) -> Option<Result<Value>> {
+    let reason = t["error"].as_str().unwrap_or("unknown reason");
+    match t["status"].as_str() {
+        Some("finalized") => Some(Ok(t)),
+        Some("failed") if t["dropped"] == true || (t["action"].is_null() && t["dropped"] != false) => Some(Err(anyhow!("tx {id} was dropped by the node without running ({reason}): nothing was charged, but another node may still include it until block {valid_until}, so check it (GET /api/tx/{id}) before sending it again"))),
+        Some("failed") => Some(Err(anyhow!("tx {id} failed{}: {reason} (it ran, so its fee was charged)", t["height"].as_u64().map(|h| format!(" in block {h}")).unwrap_or_default()))),
+        _ => None,
+    }
 }
 
 pub fn run(cmd: ValidatorCmd) -> Result<()> {
@@ -514,6 +524,24 @@ pub fn wallet(cmd: WalletCmd, dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tx the node dropped unrun isn't reported as a failure that was charged (review-fix-clients-2).
+    #[test]
+    fn dropped_txs_are_not_failures() {
+        use serde_json::json;
+        let id = "ab".repeat(32);
+        let ran = json!({ "status": "failed", "error": "insufficient balance", "height": 12, "action": { "type": "transfer" } });
+        let err = tx_outcome(&id, ran, 90).unwrap().unwrap_err().to_string();
+        assert!(err.contains("failed in block 12: insufficient balance (it ran, so its fee was charged)"), "{err}");
+        // As node/src/api.rs answers a drop, and as an older node did (no `dropped`, no tx).
+        for dropped in [json!({ "status": "failed", "dropped": true, "error": "evicted", "height": 12 }), json!({ "status": "failed", "error": "evicted" })] {
+            let err = tx_outcome(&id, dropped, 90).unwrap().unwrap_err().to_string();
+            assert!(err.contains("dropped by the node without running (evicted): nothing was charged, but another node may still include it until block 90") && !err.contains("fee was charged"), "{err}");
+        }
+        assert!(tx_outcome(&id, json!({ "status": "failed", "dropped": false, "error": "x", "height": 3 }), 90).unwrap().unwrap_err().to_string().contains("fee was charged"));
+        assert!(tx_outcome(&id, json!({ "status": "finalized", "height": 4 }), 90).unwrap().is_ok());
+        assert!(tx_outcome(&id, json!({ "status": "pending" }), 90).is_none());
+    }
 
     /// `--key` takes a bare hex seed, `blockula keygen` JSON (e.g. the testnet admin.json), or a
     /// wallet.json, and they all load the same key.
