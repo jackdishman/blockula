@@ -645,7 +645,7 @@ fn the_council_cant_set_the_validators_own_economics() {
         ("commission_max_bps", 9_000),
         ("commission_max_change_bps", 10_000),
         ("min_self_bond", 2 * FANG),
-        ("evidence_max_age_epochs", 1),
+        ("evidence_max_age_epochs", crate::params::evidence_floor_epochs(&t.st.params)),
         ("insider_delegation_cap_bps", 10_000),
         ("tip_cap_multiple", 1_000),
     ];
@@ -732,6 +732,34 @@ fn safety_parameters_can_always_be_moved_back() {
     pass(&mut t, param("governance_spend_height", gate));
     assert_eq!(t.st.chain_params.governance_spend_height, gate);
     refused(&mut t, param("governance_spend_height", gate - 1), "never moves earlier");
+}
+
+/// gap-6-1: the evidence window, which the weak-subjectivity period joiners rely on is half of,
+/// never falls below two weeks: a proposal below the floor is refused when it's made (and would
+/// be when it runs), one at the floor passes by the token supermajority, and unbonding (the
+/// council's) can't go below the window either.
+#[test]
+fn the_evidence_window_never_falls_below_its_floor() {
+    let mut t = T::new(&[]);
+    let floor = crate::params::evidence_floor_epochs(&t.st.params);
+    let epoch = t.st.params.epoch_blocks;
+    assert_eq!(floor * epoch, 14 * 86_400, "two weeks of 600-block epochs");
+    for low in [1, floor - 1] {
+        let e = t.err(ALICE, Action::Propose { kind: param("evidence_max_age_epochs", low), deposit: 50 * FANG, title: "x".into(), url: String::new() });
+        assert!(e.contains(&format!("lower evidence_max_age_epochs to {floor} at the least")) && e.contains("weak-subjectivity floor"), "{e}");
+    }
+    let id = t.propose(ALICE, param("evidence_max_age_epochs", floor));
+    t.vote(ALICE, id, true, 60_000, 1).unwrap();
+    t.finish(id);
+    assert_eq!((t.p(id).status, t.st.chain_params.evidence_max_age_epochs), (ProposalStatus::Executed, floor), "{}", t.p(id).outcome);
+    let e = t.err(ALICE, Action::Propose { kind: param("unbonding_blocks", floor * epoch - 1), deposit: 50 * FANG, title: "x".into(), url: String::new() });
+    assert!(e.contains("can't exceed unbonding_blocks"), "{e}");
+    assert_eq!(crate::checkpoints::ws_period_blocks(&t.st.chain_params, epoch), 7 * 86_400, "the period stays at least a week");
+    // Run time checks it again: a ParamChange that got stored (by an older rule) still can't
+    // take the window below the floor when it runs.
+    let mut j = crate::chain::Journal::default();
+    let e = t.st.exec_set_param(&mut j, "evidence_max_age_epochs", floor - 1).unwrap_err().to_string();
+    assert!(e.contains("weak-subjectivity floor"), "{e}");
 }
 
 #[test]

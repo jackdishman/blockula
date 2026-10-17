@@ -748,7 +748,7 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
     // weak-subjectivity period is the one the parameters in force set, if governance shortened it.
     let mut trust = Trust::new(&chain.genesis, &Pins::default(), false)?;
     trust.follow(&chain.state.chain_params);
-    let trust = Arc::new(trust);
+    let empty = chain.height() == 0 && chain.base.is_none();
     let keep = net.pruning.keep(true, &chain.state);
     chain.set_pruning(keep);
     crate::upgrade::configure(&mut chain, consensus::SUPPORTED_PROTOCOL_VERSION, net.halt_height);
@@ -798,19 +798,28 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
         None if net.ephemeral_p2p || is_private_host(&addrs.p2p_addr) => "local".into(),
         None => "recommended".into(),
     };
-    if let Some(why) = trust.stale(chain.height(), crate::chain::now_ms()).filter(|_| !peers.is_empty()) {
-        eprintln!("⚠️  {why}. Validators get recent checkpoints with each release: run the latest one.");
-    }
     let shared: Shared = Arc::new(Mutex::new(chain));
     // Far behind (new validator, long downtime)? Catch up over HTTP first: verified batches,
     // much faster than consensus backfill, and peers prune old consensus data.
-    if !peers.is_empty() {
+    let trust = if !peers.is_empty() {
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
         rt.block_on(async {
+            // An empty home also heeds the period its peers report (gap-6-1); a validator warns.
+            if empty {
+                heed_peers(&mut trust, &peers, false).await;
+            }
+            let height = shared.lock().height();
+            if let Some(why) = trust.stale(height, crate::chain::now_ms()) {
+                eprintln!("⚠️  {why}. Validators get recent checkpoints with each release: run the latest one.");
+            }
+            let trust = Arc::new(trust);
             maybe_fast_sync(&shared, &peers, net.full, &trust).await;
             catch_up(shared.clone(), peers.clone(), trust.clone()).await;
-        });
-    }
+            trust
+        })
+    } else {
+        Arc::new(trust)
+    };
     if let Some(halt) = shared.lock().halt.signal.get() {
         exit_halted(&halt);
     }
@@ -912,34 +921,67 @@ fn yes() -> bool {
     true
 }
 
+/// How long `join` and an empty home's first start wait for each peer's `/api/status`.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// An empty home has nothing of its own to go by, so before it syncs it asks every peer for the
+/// weak-subjectivity period in force and enforces the shortest ([`Trust::heed`]: never below the
+/// protocol's floor), so a governance change after this release can't leave it trusting a root
+/// that's too old for the chain's evidence window, as long as one honest peer answers (gap-6-1).
+/// With `wait`, it asks again every 10 s until a peer answers for the chain (a node about to sync
+/// can't without one anyway). Returns how many answered.
+async fn heed_peers(trust: &mut Trust, peers: &[String], wait: bool) -> usize {
+    let mut waiting = false;
+    loop {
+        let reports = crate::checkpoints::peer_periods(peers, &trust.genesis_hash, STATUS_TIMEOUT).await;
+        if !reports.is_empty() || !wait || peers.is_empty() {
+            if trust.heed(&reports) {
+                let (peer, w) = reports.iter().min_by_key(|(_, w)| *w).expect("a report");
+                eprintln!("⚠️  {peer} reports the weak-subjectivity period in force as {w} blocks: shorter than this release knows (governance shortened the evidence window since); enforcing {}", trust.ws_blocks());
+            }
+            return reports.len();
+        }
+        if !waiting {
+            println!("⏳ no peer answers /api/status for this chain yet (to learn the weak-subjectivity period in force before syncing an empty home); asking every 10 s");
+            waiting = true;
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+}
+
 /// Prepares a full-node home: genesis.json (copied or fetched from a node) + join.json.
 /// The genesis must be pinned: by `pins.genesis_hash`, or by this binary for a known chain id
 /// (`checkpoints.rs`). Checkpoints must agree with it, and the newest root must be younger than
-/// the weak-subjectivity period unless `pins.allow_stale_checkpoint`.
+/// the weak-subjectivity period, the shortest of this release's and the peers' reports
+/// ([`heed_peers`]), unless `pins.allow_stale_checkpoint`.
 pub fn join(genesis: &str, home: &Path, pins: &Pins, fast: bool) -> Result<()> {
     if home.join("validator.key").exists() {
         bail!("{} is a validator home", home.display());
     }
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let (g, mut peers): (Genesis, Vec<String>) = if genesis.starts_with("http://") || genesis.starts_with("https://") {
         let url = genesis.trim_end_matches('/').to_string();
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         let g: Genesis = rt.block_on(async { reqwest::get(format!("{url}/api/genesis")).await?.error_for_status()?.json().await })?;
         (g, vec![url])
     } else {
         (Genesis::load(Path::new(genesis))?, vec![])
     };
-    let trust = Trust::new(&g, pins, true)?;
+    let mut trust = Trust::new(&g, pins, true)?;
+    trust.check_fresh(0, crate::chain::now_ms())?;
+    for u in http_peers(&g, &[], None) {
+        if !peers.contains(&u) {
+            peers.push(u);
+        }
+    }
+    if rt.block_on(heed_peers(&mut trust, &peers, false)) == 0 && !peers.is_empty() {
+        println!("ℹ️  no peer answered /api/status for this chain: the weak-subjectivity period in force is checked again when the node first starts");
+    }
     trust.check_fresh(0, crate::chain::now_ms())?;
     match trust.newest() {
         0 => println!("🔐 genesis {} pinned", trust.genesis_hash),
         h => println!("🔐 genesis {} pinned; newest trusted checkpoint #{h}", trust.genesis_hash),
     }
     std::fs::create_dir_all(home)?;
-    for u in http_peers(&g, &[], None) {
-        if !peers.contains(&u) {
-            peers.push(u);
-        }
-    }
     let path = home.join("genesis.json");
     if path.exists() {
         let existing = Genesis::load(&path)?;
@@ -961,8 +1003,8 @@ pub fn run_full_node(home: PathBuf, net: NetOpts) -> Result<()> {
     // under the weak-subjectivity period of the parameters in force in this node's own state.
     let mut trust = Trust::new(&chain.genesis, &jc.pins, false)?;
     trust.follow(&chain.state.chain_params);
-    let trust = Arc::new(trust);
     // An empty home is where a stale root bites (a fresh sync); a synced one trusts its own head.
+    let empty = chain.height() == 0 && chain.base.is_none();
     if let Some(why) = trust.check_fresh(chain.height(), crate::chain::now_ms())? {
         eprintln!("⚠️  {why}");
     }
@@ -978,11 +1020,18 @@ pub fn run_full_node(home: PathBuf, net: NetOpts) -> Result<()> {
     rt.block_on(async move {
         // The API and explorer come up immediately, while syncing.
         tokio::spawn(serve_http(http_node(shared.clone(), None, peers.clone(), &net, &trust), bind));
+        // Nothing synced yet: the period in force, as the peers report it, before anything is
+        // fetched (gap-6-1; `join` asked too, but governance may have acted since).
+        if empty {
+            heed_peers(&mut trust, &peers, true).await;
+            trust.check_fresh(0, crate::chain::now_ms())?;
+        }
+        let trust = Arc::new(trust);
         maybe_fast_sync(&shared, &peers, !fast, &trust).await;
         tokio::spawn(exchange_epochs(shared.clone(), peers.clone()));
         sync_loop(shared, peers, false, trust).await;
-    });
-    Ok(())
+        Ok(())
+    })
 }
 
 #[derive(Deserialize)]
@@ -1436,6 +1485,78 @@ mod tests {
         let err = try_join(&old_path, "full-stale", &pin(&old_hash)).unwrap_err().to_string();
         assert!(err.contains("weak-subjectivity") && err.contains("--allow-stale-checkpoint"), "{err}");
         try_join(&old_path, "full-stale", &Pins { allow_stale_checkpoint: true, ..pin(&old_hash) }).unwrap();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// gap-6-1: a joiner on a release that predates a governance change shortening the evidence
+    /// window learns the period in force from its peers' `/api/status`. A 9-day-old checkpoint is
+    /// fine at the genesis period (10.5 days); once governance has cut the window to its floor
+    /// (two weeks, so a week's period), the same `join` is refused and says why, and so is the
+    /// first start of a home that joined before the change and never synced (`run_full_node`'s
+    /// empty-home check). A fresher checkpoint or `--allow-stale-checkpoint` still joins. A peer
+    /// claiming less than any chain can have is held to the floor, and a peer of another chain
+    /// isn't heard.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_joiner_heeds_the_period_its_peers_report() {
+        use crate::checkpoints::Checkpoint;
+        use axum::{routing::get, Json, Router};
+        let root = home("wsjoin");
+        let homes = Chain::summon(&root, &SummonOpts::new("wsjoin", 1)).unwrap();
+        // A month-old chain.
+        let gpath = homes[0].join("genesis.json");
+        let mut g = Genesis::load(&gpath).unwrap();
+        g.created_at_ms -= 30 * 86_400_000;
+        std::fs::write(&gpath, serde_json::to_string_pretty(&g).unwrap()).unwrap();
+        let chain: Shared = Arc::new(Mutex::new(Chain::open(&homes[0]).unwrap()));
+        let hash = crate::checkpoints::genesis_hash(&g);
+        let serve = |app: Router| async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap() });
+            url
+        };
+        let url = serve(crate::api::router(crate::api::Node::new(chain.clone(), None, vec![], Default::default()))).await;
+        let day = 86_400_000 / g.block_time_ms;
+        let pins = |at: u64| Pins { genesis_hash: Some(hash.clone()), checkpoints: vec![Checkpoint { height: at, hash: "cd".repeat(32), set_hash: None }], ..Default::default() };
+        let try_join = |from: &str, name: &str, pins: Pins| {
+            let (from, home) = (from.to_string(), root.join(name));
+            tokio::task::spawn_blocking(move || join(&from, &home, &pins, true))
+        };
+        // Before the change: 9 days old is fresh.
+        try_join(&url, "before", pins(21 * day)).await.unwrap().unwrap();
+        // Governance cuts the evidence window as far as it can: two weeks.
+        {
+            let mut c = chain.lock();
+            let mut j = crate::chain::Journal::default();
+            c.state.exec_set_param(&mut j, "evidence_max_age_epochs", crate::params::evidence_floor_epochs(&g.params())).unwrap();
+            c.set_pruning(None); // publishes the state to the API
+        }
+        let err = try_join(&url, "after", pins(21 * day)).await.unwrap().unwrap_err().to_string();
+        assert!(err.contains(&format!("~7.0 days, in force on the chain as {url} reports it")) && err.contains("--allow-stale-checkpoint"), "{err}");
+        assert!(!root.join("after").exists(), "a refused join writes nothing");
+        try_join(&url, "fresh", pins(24 * day)).await.unwrap().unwrap();
+        try_join(&url, "allowed", Pins { allow_stale_checkpoint: true, ..pins(21 * day) }).await.unwrap().unwrap();
+        // The home that joined before the change: its first start asks again, and stops.
+        let jc: JoinConfig = serde_json::from_slice(&std::fs::read(root.join("before").join("join.json")).unwrap()).unwrap();
+        assert!(jc.peers.contains(&url));
+        let mut trust = Trust::new(&g, &jc.pins, false).unwrap();
+        assert_eq!(trust.check_fresh(0, crate::chain::now_ms()).unwrap(), None, "by this release alone: fresh");
+        assert_eq!(heed_peers(&mut trust, &jc.peers, true).await, 1, "the peer answered; the genesis validator's address didn't");
+        assert!(trust.check_fresh(0, crate::chain::now_ms()).unwrap_err().to_string().contains("~7.0 days"));
+        // A liar claiming a 1-block period is held to the floor: a week-old checkpoint still joins.
+        let status = |genesis_hash: String| move || {
+            let genesis_hash = genesis_hash.clone();
+            async move { Json(serde_json::json!({ "genesis_hash": genesis_hash, "weak_subjectivity_blocks": 1 })) }
+        };
+        let served = g.clone();
+        let liar = serve(Router::new().route("/api/genesis", get(move || async move { Json(served.clone()) })).route("/api/status", get(status(hash.clone())))).await;
+        let err = try_join(&liar, "lied-to", pins(21 * day)).await.unwrap().unwrap_err().to_string();
+        assert!(err.contains("~7.0 days") && err.contains("the protocol's floor; it reports 1"), "{err}");
+        try_join(&liar, "lied-to", pins(24 * day)).await.unwrap().unwrap();
+        // Another chain's node isn't heard at all.
+        let other = serve(Router::new().route("/api/status", get(status("00".repeat(32))))).await;
+        assert_eq!(crate::checkpoints::peer_periods(&[other.clone(), url.clone()], &hash, Duration::from_secs(5)).await, vec![(url.clone(), 7 * day)]);
+        drop(chain);
         std::fs::remove_dir_all(root).ok();
     }
 
