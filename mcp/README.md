@@ -53,12 +53,12 @@ Session keys can only send transfers: staking, voting and name renewals need an 
 
 ## install_node
 
-Downloads the prebuilt `blockula` for this machine from the GitHub release and installs it to `~/.blockula/bin`, after the same checks as `scripts/install.sh` (docs/OPERATIONS.md "Releases"). It installs releases from v0.5.0 on: earlier releases' `checksums.txt` names no tag, so nothing binds them to the version asked for, and it refuses them. (Validators install with `blockula release install` instead, which checks against a pinned release key id.)
+Downloads the prebuilt `blockula` for this machine from the GitHub release and installs it to `~/.blockula/mcp-bin` (its own path: it never replaces the binary `blockula release install` keeps in `~/.blockula/bin`), after the same checks as `scripts/install.sh` (docs/OPERATIONS.md "Releases"). It installs releases from v0.5.0 on: earlier releases' `checksums.txt` names no tag, so nothing binds them to the version asked for, and it refuses them. (Validators install with `blockula release install` instead, which checks against a pinned release key id.)
 
 0. The version you asked for (`latest` is resolved to its tag first) is bound to every check: `checksums.txt` must name it on its first line (`# blockula-release vX.Y.Z`, covered by the signature), provenance must come from its tag, and the extracted binary's `--version` must match before it's installed. An older, genuinely signed release served as the one asked for is refused.
 1. SHA-256 against the release's `checksums.txt`, always. That only catches a corrupted download.
 2. Build provenance with a logged-in GitHub CLI (`gh attestation verify … --signer-workflow …/release.yml --source-ref refs/tags/<version>`). A failed check refuses the install.
-3. The offline ML-DSA-65 signature on `checksums.txt` (`checksums.txt.sig`), verified with the SDK against the release key id (built in after the key ceremony; `BLOCKULA_RELEASE_KEY_ID` until then, from SECURITY.md or the website; if both are set they must agree). Once the key id is known, every release must carry a valid signature: a missing or failed one refuses the install, even with valid provenance (an unsigned release is what a compromised GitHub account or workflow would publish).
+3. The offline ML-DSA-65 signature on `checksums.txt` (`checksums.txt.sig`), verified with the SDK against the release key id: the one pinned in `~/.blockula/release-key-id` by `blockula release install` (read with the same rules: refused if others can write it or it isn't a key id), built in after the key ceremony, or `BLOCKULA_RELEASE_KEY_ID` (from SECURITY.md or the website). All that are set must agree. Once the key id is known, every release must carry a valid signature: a missing or failed one refuses the install, even with valid provenance (an unsigned release is what a compromised GitHub account or workflow would publish).
 
 The checks add up: each refuses a release it fails. The result lists what was verified. If only the checksum could be (no key id yet, no `gh`), it says so in a warning, and `BLOCKULA_REQUIRE_VERIFY=1` refuses instead; with a key id, `BLOCKULA_REQUIRE_VERIFY=1` requires provenance as well as the signature.
 
@@ -75,9 +75,9 @@ The checks add up: each refuses a release it fails. The result lists what was ve
 | `BLOCKULA_WITNESSES` | none | other nodes of the same chain (comma-separated https URLs): names that get signed are proven against them |
 | `BLOCKULA_TIMEOUT_MS` | `15000` | how long one request to the node may take (at most 2147483647) |
 | `BLOCKULA_TX_WAIT_MS` | `15000` | how long a tx tool waits for finality before answering `pending` |
-| `BLOCKULA_BIN` | `~/.blockula/bin/blockula`, else `blockula` | node binary used by `start_dev_node` / `summon_chain` |
+| `BLOCKULA_BIN` | `~/.blockula/mcp-bin/blockula` (from `install_node`), else `~/.blockula/bin/blockula`, else `blockula` | node binary used by `start_dev_node` / `summon_chain` |
 | `BLOCKULA_REQUIRE_VERIFY` | unset | `1`: `install_node` refuses a release it can only checksum, and with a release key id requires provenance too |
-| `BLOCKULA_RELEASE_KEY_ID` | built in after the key ceremony | release signing key id to trust |
+| `BLOCKULA_RELEASE_KEY_ID` | built in after the key ceremony | release signing key id to trust (must agree with the built-in one and the pin) |
 
 `npm test -w @blockula/mcp` checks the network rules, the pins, the release checks and the dependency pins offline, and runs the built server against a fake node (`test/spend.ts`: the spending caps with pending, refused (and a node that refuses but relays), failed, dropped and final txs, name prices, untrusted text, timeouts, unproven names).
 
