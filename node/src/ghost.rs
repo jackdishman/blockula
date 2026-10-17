@@ -49,7 +49,8 @@
 //!   them per block ([`BlockBudget`], consensus.rs; both as the block's fee slot fixed them
 //!   `econ::FEE_LAG` blocks ahead), at most [`MAX_MEMPOOL_GHOST`] queued; a queued spend of a
 //!   note is replaced, and a full ghost share gives up its cheapest tx, only for a tip higher by
-//!   a tenth and the relay of the newcomer's bytes ([`mempool_admit`]).
+//!   a tenth and the relay of the newcomer's bytes ([`mempool_admit`]). A queued shield is its
+//!   sender's last queued tx, which only its sender's own shield can replace ([`behind_shield`]).
 //!
 //! State (namespaces `state::ns` 48–52, 53–55 reserved; the scalars are the META record `ghost`):
 //!

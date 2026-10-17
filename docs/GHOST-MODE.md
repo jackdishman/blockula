@@ -418,10 +418,17 @@ mempool. A tx spending a nullifier a queued tx spends replaces it, and a full gh
 lowest tip per byte (the newest among equals), only for a tip at least the displaced one's plus the larger
 of a tenth of it and the base fee of the newcomer's bytes (rounded up to the fee grid), and a higher tip
 per byte: a higher tip always gets in, and every displacement pays for relaying itself (BIP-125's rules 3
-and 4), so re-proving one note with tips one drop apart buys nothing. Only an unsigned tx, or another
-sender's last queued tx, can be given up (a signed shield with its sender's later txs behind it stays, so
-nobody is left behind a nonce gap), and a signed tx a replacement does displace takes its sender's later
-txs with it. The refusal names the tip that gets in, unless that's past the newcomer's tip cap.
+and 4), so re-proving one note with tips one drop apart buys nothing. Any queued ghost tx but the
+newcomer's sender's own can be given up. A queued shield is always its sender's last queued tx: nothing
+queues behind it (any later tx from the account, a validator duty it pays included, is refused: "your
+shield (nonce n) is waiting in the mempool, and nothing queues behind a shield"), so giving one up never
+leaves a nonce gap, and nobody can make shields unevictable by covering each with a cheap tx of their own
+(review of F36, round 3: 256 such shields locked the share against any tip). Until it's included, its
+sender may replace it with its own shield at the same nonce, for a tip that displaces it (the only
+replacement of a signed tx by its sender); wallets shield last, and send the account's next tx once the
+shield is in a block. Were a signed tx ever displaced with later txs of its sender behind it, they'd go
+with it and the newcomer would outbid them together. The refusal names the tip that gets in, unless
+that's past the newcomer's tip cap (for an unsigned tx, both on the fee grid).
 `POST /api/tx` takes the wire form as `application/octet-stream` (and JSON up to twice
 `MAX_GHOST_TX_BYTES`).
 

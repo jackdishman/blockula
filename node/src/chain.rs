@@ -3381,8 +3381,10 @@ impl Chain {
     /// same checks as [`Chain::submit_tx`], but it never evicts: if the mempool or the sender's
     /// queue is full, it isn't tracked.
     pub fn track_pending(&mut self, tx: Tx) -> Result<()> {
+        // A sender's replacement of its queued shield takes that one's place (`ghost::behind_shield`).
+        let replaces = !tx.is_unsigned() && self.queued_shield(&tx.from).is_some_and(|(i, last)| last && self.mempool[i].nonce == tx.nonce);
         let full = self.regular_len() >= MAX_MEMPOOL && self.duty_slot(&tx).is_none();
-        if full || tx.sender().is_ok_and(|s| self.pending_count(&s) >= MAX_PENDING_PER_SENDER) {
+        if !replaces && (full || tx.sender().is_ok_and(|s| self.pending_count(&s) >= MAX_PENDING_PER_SENDER)) {
             return Ok(());
         }
         self.admit_to_mempool(tx, false).map(|_| ())
