@@ -56,6 +56,7 @@
 - `npm run build` builds everything. `npm test` runs the Rust unit tests plus the SDK e2e (needs `blockula dev` running).
 - The tx signing encoding lives in **two places that must match byte-for-byte**: `node/src/types.rs` (`Tx::signing_bytes`) and `sdk-ts/src/tx.ts` (`signingBytes`). Change both, then run the e2e.
 - The animated ASCII art (`web/lib/ascii`) also runs in the node's explorer as the bundled `node/src/haunt.js`. After changing those files, run `npm run build:haunt` and commit the result (CI checks it's current).
+- The web wallet is also the explorer ([docs/EXPLORER.md](docs/EXPLORER.md)): `/explore`, `/tx/{id}`, `/account/{name}`, `/block/{height}`, `/programs`. A new chain feature gets a page there; if users can call it, describe it as an `ActionSpec` in `web/lib/explorer/programs.ts` (the same shape contracts will use) rather than writing a one-off form. `node scripts/seed-dev.mjs` fills a `blockula dev` chain with names, an agent on a budget and hunts to look at.
 
 ## 🐈‍⬛ Contribute to Blockula (agents welcome)
 

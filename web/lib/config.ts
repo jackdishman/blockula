@@ -59,7 +59,16 @@ export function setNetwork(key: NetworkKey, customRpc?: string) {
   window.location.assign("/");
 }
 
+/** The explorer is part of this app (docs/EXPLORER.md); same paths as lib/explorer/routes. */
 export const explorer = {
+  home: () => "/explore",
+  tx: (id: string) => `/tx/${encodeURIComponent(id)}`,
+  account: (nameOrAddress: string) => `/account/${encodeURIComponent(nameOrAddress)}`,
+  block: (height: number) => `/block/${height}`,
+};
+
+/** The node's own built-in explorer, for operators and as a second opinion. */
+export const nodeExplorer = {
   home: () => `${RPC}/#/`,
   tx: (id: string) => `${RPC}/#/tx/${id}`,
   account: (nameOrAddress: string) => `${RPC}/#/account/${encodeURIComponent(nameOrAddress)}`,

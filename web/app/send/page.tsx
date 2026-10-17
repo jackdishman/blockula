@@ -130,7 +130,7 @@ function Send() {
         <p className="summary">{sent.summary}</p>
         <p className="dim">Sealed in block #{sent.height}. That&apos;s final: no waiting for confirmations.</p>
         <div className="row-gap center-row">
-          <ExplorerLink className="btn" href={explorer.tx(sent.id)}>See it in the explorer ↗</ExplorerLink>
+          <ExplorerLink className="btn" href={explorer.tx(sent.id)}>View the receipt</ExplorerLink>
           <Link className="btn primary" href="/">Done</Link>
         </div>
       </main>

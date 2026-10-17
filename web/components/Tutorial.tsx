@@ -141,7 +141,7 @@ function buildItems(account: AccountView, status: Status | null, state: Tutorial
       title: "View your transaction in the explorer",
       done: !!state.viewedExplorer,
       learn: "A blockchain is public: anyone can check that your transaction happened, but only your key could have signed it. The explorer shows the block it landed in and the signature that proves it.",
-      action: txs[0] ? <ExplorerLink className="btn small" href={explorer.tx((sent ?? txs[0]).id)}>Open in explorer ↗</ExplorerLink> : <span className="dim small">Make a transaction first.</span>,
+      action: txs[0] ? <ExplorerLink className="btn small" href={explorer.tx((sent ?? txs[0]).id)}>Open its receipt</ExplorerLink> : <span className="dim small">Make a transaction first.</span>,
     },
     {
       id: "device",

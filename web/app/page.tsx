@@ -3,7 +3,9 @@
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import { RequireWallet } from "@/components/Gate";
-import { Activity } from "@/components/Activity";
+import { Heartbeat } from "@/components/explorer/Heartbeat";
+import { useMe } from "@/components/explorer/kit";
+import { Ledger } from "@/components/explorer/Ledger";
 import { Apparition } from "@/components/Haunt";
 import { Tutorial, useTutorial } from "@/components/Tutorial";
 import { Copy, ExplorerLink, Spinner } from "@/components/ui";
@@ -45,7 +47,8 @@ export default function HomePage() {
 }
 
 function Home() {
-  const { account, hint } = useUnlocked();
+  const { account, hint, wallet, status } = useUnlocked();
+  const me = useMe();
   const [tutorial, updateTutorial] = useTutorial();
   const fresh = useArrivals(account?.recent_txs, account?.account.address);
   if (!account) return <main className="narrow"><Spinner>Loading your account…</Spinner></main>;
@@ -70,6 +73,7 @@ function Home() {
           <Link className="btn primary" href="/send">Send</Link>
           <Link className="btn" href="/receive">Receive</Link>
         </div>
+        <Heartbeat />
       </section>
 
       <Tutorial state={tutorial} update={updateTutorial} />
@@ -77,9 +81,9 @@ function Home() {
       <section className="card">
         <div className="row-between">
           <h2>Activity</h2>
-          <ExplorerLink className="small" href={explorer.account(name ?? addr)}>Open in the explorer ↗</ExplorerLink>
+          <ExplorerLink className="small" href={explorer.account(name ?? addr)}>Flows, keys &amp; full history →</ExplorerLink>
         </div>
-        <Activity txs={account.recent_txs} me={addr} fresh={fresh} />
+        <Ledger txs={account.recent_txs} side={addr} me={me} keys={account.keys} myKeyId={wallet.keyId} head={status?.height} blockMs={status?.block_time_ms} fresh={fresh} empty="Nothing yet. Your transactions will appear here once they're sealed into a block." />
       </section>
 
       {tutorial.dismissed && (

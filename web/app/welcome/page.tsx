@@ -129,6 +129,7 @@ export default function Welcome() {
           {step < 2 ? "Next" : "Let's go"}
         </button>
         <button className="link" onClick={() => setStep("start")}>Skip intro</button>
+        <Link className="link small" href="/explore">Just looking? Explore the chain first</Link>
       </main>
     );
   }

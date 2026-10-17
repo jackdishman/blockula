@@ -3,13 +3,18 @@
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { explorer, NETWORK, NETWORKS, RPC, setNetwork, type NetworkKey } from "@/lib/config";
+import { isExplorerPath } from "@/lib/explorer/routes";
 import { useWallet } from "@/lib/wallet";
+import { CommandPalette, openPalette } from "./CommandPalette";
 
 export function Header() {
   const { wallet, hint, lock } = useWallet();
   const path = usePathname();
   const router = useRouter();
   const open = wallet && hint?.account;
+  // A program's records (a hunt, a claim, a Séance) belong to Programs; every other chain page to Explore.
+  const programs = /^\/(programs|hunt|claim|seance)(\/|$)/.test(path);
+  const explore = isExplorerPath(path) && !programs;
   return (
     <>
       <header className="top">
@@ -18,9 +23,16 @@ export function Header() {
           <span className="edition">The Wallet</span>
         </Link>
         <nav>
+          <button type="button" className="search-btn" onClick={openPalette} aria-label="Search the chain (⌘K)">
+            <span className="label">Search the chain…</span>
+            <span className="label-short">Search</span>
+            <span className="kbd">⌘K</span>
+          </button>
+          <Link href="/" className={path === "/" ? "active" : ""}>{hint?.account ? "Wallet" : "Open wallet"}</Link>
+          <Link href={explorer.home()} className={explore ? "active" : ""}>Explore</Link>
+          <Link href="/programs" className={programs ? "active" : ""}>Programs</Link>
           {open && (
             <>
-              <Link href="/" className={path === "/" ? "active" : ""}>Home</Link>
               <Link href="/devices" className={path === "/devices" ? "active" : ""}>Devices &amp; agents</Link>
             </>
           )}
@@ -44,7 +56,6 @@ export function Header() {
             ))}
             <option value="custom">{NETWORK.key === "custom" ? `Custom: ${RPC.replace(/^https?:\/\//, "")}` : "Custom node…"}</option>
           </select>
-          <a href={explorer.home()} target="_blank" rel="noreferrer">Explorer ↗</a>
           {open && (
             <button
               className="link caps"
@@ -59,6 +70,7 @@ export function Header() {
           )}
         </nav>
       </header>
+      <CommandPalette />
       {NETWORK.key === "custom" && (
         <div className="banner danger">
           <b>Custom node: {RPC}.</b> It controls what names resolve to and what balances you see. Only send money if you trust whoever runs it.{" "}

@@ -1,0 +1,33 @@
+/** Plain-language definitions behind underlined terms. Same wording as node/src/explorer.html. */
+export const GLOSSARY = {
+  block: "A batch of transactions sealed together. Each block points to the one before it, forming a chain that can't be quietly rewritten.",
+  height: "The block's position in the chain. Block #1 is the first block after genesis.",
+  hash: "A 256-bit BLAKE3 fingerprint. Change one byte of the data and the fingerprint changes completely. Quantum computers only weaken hashes a little, so 256 bits stays safe.",
+  signature: "Proof that the owner of a key approved this. Blockula uses ML-DSA-65 (NIST FIPS 204), a lattice-based scheme designed to resist quantum computers — unlike the ECDSA used by Bitcoin and Ethereum.",
+  nonce: "A counter for each account. It stops anyone from replaying the same signed transaction twice.",
+  fee: "What it costs to include a transaction. The base part is burned forever, slowly reducing supply. It's priced by size because post-quantum signatures are bigger.",
+  state_root: "A single hash summarizing every balance and name after this block. If two nodes agree on it, they agree on everything.",
+  address: "Your account ID: bech32m('boo', BLAKE3(public key)). You rarely need to see it — names like jack.boo point to it.",
+  name: "A human-readable .boo name that points to an address, like a domain name for your wallet.",
+  finalized: "Included in a block. On Blockula, once a block is sealed it's final — no waiting for confirmations.",
+  epoch: "A stretch of blocks with a fixed validator set. Changes to the set (new validators, removals) only take effect when the next epoch starts.",
+  bond: "FANG a validator locks up to take part. It can be reclaimed one epoch after the validator leaves.",
+  familiar: "An AI agent working for this account through a spend-limited session key. Its earnings go to the account that sponsors it.",
+  hunt: "A bounty on a GitHub issue. The FANG is locked in escrow until the creator (or a Season 0 admin) awards it for a pull request, or it's refunded to everyone who funded it.",
+  proposer: "The validator that proposed this block. A 2/3+ quorum of validators then voted (ML-DSA-65 signatures) to finalize it.",
+  certificate: "The finality proof: ML-DSA-65 votes from a 2/3+ quorum of validators. Blocks finalized as an ancestor of a later block share that later block's certificate.",
+  burned: "Fees destroyed forever. Burning offsets new issuance and ties the token's value to real network usage.",
+  soul: "Reputation that can't be bought or transferred. It's earned when juries accept your work (or by serving well as a juror), it slowly decays, and it's lost for spam or vouching for fakes.",
+  seance: "A review jury. Randomly drawn jurors with Soul compare pairs of merged PRs (“which mattered more?”), seal their votes, then reveal them. The outcome scores each claim and pays the pool out.",
+  vouch: "Staking FANG (and your Soul) on a newcomer being a real, distinct person. If they turn out to be a sybil, the voucher loses both. Newcomers can decline a vouch.",
+  claim: "A merged PR submitted for the contribution pool. Validators check GitHub that it's merged and authored by the claimant's linked handle, then a Séance judges it.",
+  vesting: "Rewards unlock gradually (about 90 days). Until then they can be clawed back, e.g. if the PR is reverted or the account turns out to be fake.",
+  pool: "FANG set aside to reward useful work. Each Séance pays out a quarter of it, split by jury scores, square-rooted per person so volume doesn't pay.",
+  owner_key: "A key with full control of the account: each passkey device, plus any recovery keys. It can add and revoke other keys.",
+  session_key: "A spend-limited key, usually an agent's. It can only send transfers, at most its limit per period (amount + fees), until it expires. The chain enforces this, not the agent.",
+  mempool: "Transactions a node has accepted but no block has sealed yet. On Blockula they usually wait about a second.",
+  program: "One of the chain's built-in modules: its state, the transactions that call it, and the actions you can take. Smart contracts will appear the same way.",
+  escrow: "FANG a program holds on everyone's behalf (a hunt's bounty, a bond) until its rules release it.",
+} as const;
+
+export type TermKey = keyof typeof GLOSSARY;
