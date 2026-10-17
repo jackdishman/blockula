@@ -613,7 +613,16 @@ where
 
 /// Up to `pages` pages (100 entries each, [`page_of`]) of a list at `path`, until one isn't full
 /// or `done` says so.
-async fn pages<F, Fut, T>(get: &F, path: &str, pages: u32, parse: fn(&Value) -> Vec<T>, mut done: impl FnMut(&[T]) -> bool) -> Result<Vec<T>>
+async fn pages<F, Fut, T>(get: &F, path: &str, pages: u32, parse: fn(&Value) -> Vec<T>, done: impl FnMut(&[T]) -> bool) -> Result<Vec<T>>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Value>>>,
+{
+    Ok(list(get, path, pages, parse, done).await?.0)
+}
+
+/// [`pages`], and whether the list may go on past them (every page read was full).
+async fn list<F, Fut, T>(get: &F, path: &str, pages: u32, parse: fn(&Value) -> Vec<T>, mut done: impl FnMut(&[T]) -> bool) -> Result<(Vec<T>, bool)>
 where
     F: Fn(String) -> Fut,
     Fut: std::future::Future<Output = Result<Option<Value>>>,
@@ -623,10 +632,10 @@ where
         let (found, count) = page_of(get, path, page, parse).await?;
         out.extend(found);
         if count < 100 || done(&out) {
-            break;
+            return Ok((out, false));
         }
     }
-    Ok(out)
+    Ok((out, true))
 }
 
 /// `get`'s answer, with one over the size cap read as none (a single object, so there's no
@@ -716,9 +725,17 @@ where
     // for the PR (250 at most), and the merge's ancestors since it merged, which hold every one of
     // them that reached the branch (a rebase merge's copies too) whatever their number.
     let own_commits = pages(&get, &format!("/repos/{repo}/pulls/{pr}/commits"), REVERT_FILE_PAGES, parse_commits, |_| false).await?;
-    let ancestors = pages(&get, &format!("/repos/{repo}/commits?sha={merge}&since={since}"), REVERT_COMMIT_PAGES, parse_commits, |_| false).await?;
+    let (ancestors, more_ancestors) = list(&get, &format!("/repos/{repo}/commits?sha={merge}&since={since}"), REVERT_COMMIT_PAGES, parse_commits, |_| false).await?;
     let own: std::collections::BTreeSet<&str> = own_commits.iter().chain(&ancestors).map(|c| c.sha.as_str()).chain([merge.as_str()]).collect();
-    let commits: Vec<Commit> = pages(&get, &format!("/repos/{repo}/commits?since={since}"), REVERT_COMMIT_PAGES, parse_commits, |_| false).await?.into_iter().filter(|c| !own.contains(c.sha.as_str())).collect();
+    let walk = pages(&get, &format!("/repos/{repo}/commits?since={since}"), REVERT_COMMIT_PAGES, parse_commits, |_| false).await?;
+    // The branch lists everything after the merge before the merge itself, so when the walk reaches
+    // the merge it holds every later commit there is. If the merge's ancestors since it merged
+    // didn't all fit in the pages read (a claim PR of more than 1,000 commits), the PR's commits
+    // past them could still turn up in a path's history: then only commits the walk holds are
+    // followed.
+    let walk_only = more_ancestors && walk.iter().any(|c| c.sha == merge);
+    let in_walk: std::collections::BTreeSet<String> = if walk_only { walk.iter().map(|c| c.sha.clone()).collect() } else { Default::default() };
+    let commits: Vec<Commit> = walk.into_iter().filter(|c| !own.contains(c.sha.as_str())).collect();
     let mut pulls: Vec<PullRequest> = vec![];
     let add = |found: Vec<PullRequest>, pulls: &mut Vec<PullRequest>| {
         for f in found {
@@ -732,7 +749,7 @@ where
     for path in followed_paths(&original) {
         let listed = pages(&get, &format!("/repos/{repo}/commits?path={}&since={since}", query_value(path)), 1, parse_commits, |_| false).await?;
         for c in listed.into_iter().rev() {
-            if !own.contains(c.sha.as_str()) && !touching.contains(&c.sha) {
+            if !own.contains(c.sha.as_str()) && (!walk_only || in_walk.contains(&c.sha)) && !touching.contains(&c.sha) {
                 touching.push(c.sha);
             }
         }
@@ -1320,6 +1337,44 @@ mod tests {
         assert_eq!(gh.asked_count(|p| p.ends_with("/pulls") && !p.contains(m77)), 0, "no decoy took a path slot");
         // Without the merge's ancestors, the 50 decoys take all of it: the attack this closes.
         assert_eq!(without.find(42).await.unwrap(), None);
+    }
+
+    /// The same with more of #42's commits than GitHub lists (250 for the PR, 1,000 ancestors
+    /// read): 16 more, touching its file and dated so they sort after the 1,000, show up in the
+    /// file's history only. The walk reached the merge, so it holds every later commit there is,
+    /// and only those are followed: #77 is found and no path slot goes to the 16.
+    #[tokio::test]
+    async fn a_claim_pr_past_what_github_lists_cant_fill_the_path_slots() {
+        let repo = "jackdishman/blockula";
+        let base = json!({ "ref": "main", "repo": { "full_name": repo, "default_branch": "main" } });
+        let m77 = "7777777777777777777777777777777777777777";
+        let sha = |i: usize| format!("{i:040x}");
+        let mine = |i: usize| commit(&sha(i), &format!("step {i}"), &[&sha(i - 1)]);
+        let merge = commit(MERGE, "Merge pull request #42 from mallory/thing", &["77aa88bb99cc00dd11ee22ff33aa44bb55cc66dd", &sha(2_000)]);
+        let squash77 = commit(m77, "Undo the thing (#77)", &[MERGE]);
+        let pr77 = json!({ "number": 77, "state": "closed", "title": "Undo the thing", "body": format!("Reverts {repo}#42"), "merged_at": "2026-10-14T10:00:00Z", "merge_commit_sha": m77, "user": { "login": "dave" }, "base": base });
+        let mut ancestors = vec![merge.clone()];
+        ancestors.extend((1_001..=1_999).rev().map(mine));
+        let mut walk = vec![squash77.clone(), merge];
+        walk.extend((1_002..=1_999).rev().map(mine));
+        let mut path_list = vec![squash77];
+        path_list.extend((1..=16).map(mine));
+        let mut routes = vec![
+            (format!("/repos/{repo}/pulls/42"), claim_42("mallory")),
+            (format!("/repos/{repo}/pulls/42/files?per_page=100&page=1"), files_json(&thing_files())),
+            (format!("/repos/{repo}/pulls/42/commits?per_page=100&page=1"), Value::Array((2_001..=2_100).map(mine).collect())),
+            (format!("/repos/{repo}/commits?path=src/thing.rs&since={SINCE}&per_page=100&page=1"), Value::Array(path_list)),
+            (format!("/repos/{repo}/commits/{m77}/pulls"), json!([pr77.clone()])),
+            (format!("/repos/{repo}/pulls/77"), pr77),
+            (format!("/repos/{repo}/pulls/77/files?per_page=100&page=1"), files_json(&undoing_files())),
+        ];
+        for (path, list) in [(format!("/repos/{repo}/commits?sha={MERGE}&since={SINCE}"), &ancestors), (format!("/repos/{repo}/commits?since={SINCE}"), &walk)] {
+            assert_eq!(list.len(), 1_000);
+            routes.extend(list_routes(&path, list, |_| false).into_iter().filter(|(p, _)| p.contains("per_page=100")));
+        }
+        let gh = Mock::new(routes);
+        assert_eq!(gh.find(42).await.unwrap().map(|r| r.sha), Some(m77.to_string()));
+        assert_eq!(gh.asked_count(|p| p.ends_with("/pulls") && !p.contains(m77)), 0, "none of the 16 took a path slot");
     }
 
     /// Audit review-fix-poc-3 (round 3): a claimant controls how big some of the branch's commits
