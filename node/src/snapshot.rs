@@ -1365,10 +1365,14 @@ mod tests {
         assert_eq!(out.unwrap(), whole);
         assert!(n["stall"] <= 2 && n["honest"] == 12, "{n:?}");
         assert!(took < std::time::Duration::from_secs(3), "{took:?}");
-        // Wrong bytes and a 404 cost a request or two each (the first batch asks at once).
+        // Wrong bytes and a 404 cost a request or a few each, only in the first batch: its four
+        // chunks ask at once, so a source can be asked by every chunk that reaches it before its
+        // failure is recorded. "wrong" is first for chunks 0 and 3; "missing" is first for chunk 1
+        // and second for chunks 0 and 3, so it gets a third request whenever "wrong" fails before
+        // "missing" answers its 404 (a race, not a retry).
         let (out, _, n) = get(&["wrong", "missing", "honest"], limits.clone()).await;
         assert_eq!(out.unwrap(), whole);
-        assert!(n["wrong"] <= 2 && n["missing"] <= 2 && n["honest"] == 12, "{n:?}");
+        assert!(n["wrong"] <= 2 && n["missing"] <= 3 && n["honest"] == 12, "{n:?}");
         // A slow peer (under the timeout) gets its first batch's share, then only what nobody
         // faster can serve; alone, it's still used.
         let (out, _, n) = get(&["slow", "honest"], limits.clone()).await;
