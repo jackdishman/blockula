@@ -1164,8 +1164,9 @@ impl State {
     }
 
     /// Checks that decide whether a tx can be included at all (at `height`). No state changes.
-    /// Returns the sender, the signer's key id and record, and what the tx is charged.
-    fn admit(&self, tx: &Tx, chain_id: &str, height: u64, full_checks: bool) -> Result<(String, String, KeyRecord, u64)> {
+    /// Returns the sender, the signer's key id and record, what the tx is charged, and whether a
+    /// validator's consensus key signed it for its owner (SF-13).
+    fn admit(&self, tx: &Tx, chain_id: &str, height: u64, full_checks: bool) -> Result<(String, String, KeyRecord, u64, bool)> {
         if tx.chain_id != chain_id {
             bail!("wrong chain_id: expected {chain_id}");
         }
@@ -1247,7 +1248,7 @@ impl State {
         }
         // Ghost Mode's own admission rules (on and unpaused; a shield's size, chain and proof).
         crate::ghost::admit(self, tx, height)?;
-        Ok((sender, signer, key, charge))
+        Ok((sender, signer, key, charge, consensus_key))
     }
 
     /// Validates and applies a tx (signatures are checked before txs reach the state machine:
@@ -1256,7 +1257,11 @@ impl State {
     /// * `Err`: not includable (bad nonce, fee, key…); state untouched.
     /// * `Ok(Applied)`: done.
     /// * `Ok(Failed(reason))`: the fee was charged and the nonce used, but the action failed and
-    ///   its effects were rolled back (so failing txs aren't free).
+    ///   its effects were rolled back (so failing txs aren't free). Not for a validator's
+    ///   consensus key signing for its owner (SF-13): such a tx whose action fails is `Err`, so
+    ///   the owner pays only for duties that apply (audit F04: a stolen key can't burn the owner's
+    ///   FANG, locked or a multisig's, on failing txs; a proposer that includes one pays for it
+    ///   as junk).
     pub fn apply(&mut self, tx: &Tx, chain_id: &str, proposer: &str, height: u64) -> Result<Outcome> {
         let mut j = Journal::default();
         self.apply_j(&mut j, tx, chain_id, proposer, height, true)
@@ -1269,7 +1274,7 @@ impl State {
         if tx.is_unsigned() {
             return crate::ghost::apply_unsigned(self, j, tx, chain_id, proposer, height, full_checks);
         }
-        let (sender, signer, key, charge) = self.admit(tx, chain_id, height, full_checks)?;
+        let (sender, signer, key, charge, consensus_key) = self.admit(tx, chain_id, height, full_checks)?;
         let base = charge - tx.tip;
         // A distribution claim its sender can't pay for pays out of the claim (admission checked
         // the claim covers the fee and the new account's creation fee): the claim runs first, here.
@@ -1292,8 +1297,9 @@ impl State {
             }
             j.absorb(cj);
         }
-        // Fee phase (always sticks once admitted): the charge is debited (not the whole `fee`),
-        // its base part burned and the tip paid to the proposer.
+        // Fee phase (always sticks once admitted, but for SF-13 below): the charge is debited
+        // (not the whole `fee`), its base part burned and the tip paid to the proposer.
+        let mut fj = Journal::default();
         if let KeyRole::Session { period_blocks, .. } = key.role {
             let mut keys = self.keys_of(&sender);
             let rec = keys.get_mut(&signer).unwrap();
@@ -1302,14 +1308,17 @@ impl State {
                 rec.window_start = height;
             }
             rec.spent = rec.spent.saturating_add(charge);
-            self.acct_mut(j, &sender).keys = keys;
+            self.acct_mut(&mut fj, &sender).keys = keys;
         }
-        self.j_debit(j, &sender, charge)?;
-        self.j_scalars(j);
+        if let Err(e) = self.j_debit(&mut fj, &sender, charge) {
+            self.rollback(fj);
+            return Err(e);
+        }
+        self.j_scalars(&mut fj);
         self.burned += base;
         self.supply -= base;
-        self.j_credit(j, proposer, tx.tip);
-        self.acct_mut(j, &sender).nonce += 1;
+        self.j_credit(&mut fj, proposer, tx.tip);
+        self.acct_mut(&mut fj, &sender).nonce += 1;
         // Action phase (rolled back on failure). Accounts it opens pay the creation fee, and no
         // account may end up moving tokens its locks hold (fees above may: they're paid first).
         let free = crate::econ::free(self, &sender, height);
@@ -1323,11 +1332,19 @@ impl State {
         });
         match result {
             Ok(()) => {
+                j.absorb(fj);
                 j.absorb(aj);
                 Ok(Outcome::Applied)
             }
+            // SF-13: the owner pays for its validator's duties, not for failed attempts (audit F04).
+            Err(e) if consensus_key => {
+                self.rollback(aj);
+                self.rollback(fj);
+                Err(anyhow!("{e} (not admitted: a validator's consensus key acting for {} pays only for txs that apply)", short(&sender)))
+            }
             Err(e) => {
                 self.rollback(aj);
+                j.absorb(fj);
                 Ok(Outcome::Failed(e.to_string()))
             }
         }

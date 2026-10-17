@@ -1724,6 +1724,12 @@ pub fn validator_for_signer(state: &State, account: &str, signer_key_id: &str, e
 /// with `from` = its owner, who pays the fee, so the consensus key only needs a fee float, if
 /// that. Admission calls this when the signer isn't a key on `from`: the key record such a
 /// signature acts with, or `None` (not allowed).
+///
+/// What the owner pays for is bounded by the validator's duties (audit F04: the key is hot, and
+/// protocol v1 can't revoke it): such a tx whose action fails isn't admitted, so it's never
+/// charged (`State::apply_j`); it updates the validator at most once an epoch (`UpdateValidator`);
+/// and a tombstoned or removed validator's key signs only a reveal for a commitment it made while
+/// active (the beacon checks there is one), never anything else again.
 pub fn system_tx_key(state: &State, tx: &Tx, sender: &str, signer: &str) -> Option<KeyRecord> {
     let system = matches!(tx.action, Action::AttestClaim { .. } | Action::AttestRevert { .. } | Action::BeaconCommit { .. } | Action::BeaconReveal { .. } | Action::ReportEquivocation { .. } | Action::UpdateValidator { .. });
     if !system {
@@ -1731,6 +1737,9 @@ pub fn system_tx_key(state: &State, tx: &Tx, sender: &str, signer: &str) -> Opti
     }
     let v = validator_of_key(state, signer)?;
     let rec = state.validators.get(&v).filter(|r| r.owner == sender && r.consensus_key == tx.public_key)?;
+    if matches!(rec.status, ValidatorStatus::Tombstoned | ValidatorStatus::Removed) && !matches!(tx.action, Action::BeaconReveal { .. }) {
+        return None;
+    }
     Some(KeyRecord { label: "validator consensus key".into(), role: KeyRole::Owner, added_at: rec.registered_at, spent: 0, window_start: 0 })
 }
 

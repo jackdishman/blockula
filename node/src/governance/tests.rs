@@ -1243,10 +1243,11 @@ fn a_multisig_owners_validator_still_signs_its_system_txs() {
     t.tx(OWNER, Action::MultisigCreate { owners: vec![kid(OWNER)], threshold: 1 }).unwrap();
     assert!(t.err(OWNER, Action::Transfer { to: addr(ALICE), amount: FANG }).contains("multisig_propose"));
     let ck = keys(VALIDATORS[2]);
-    // Admitted and charged to the owner; the action itself fails (there's no claim #9).
+    // Past the multisig's gate to the action itself, which fails (there's no claim #9): so it
+    // isn't admitted, and the owner pays nothing (audit F04).
     let before = t.bal(OWNER);
-    let e = t.tx_as(&ck, &addr(OWNER), Action::AttestClaim { claim_id: 9, ok: true, merge_sha: "ab".repeat(20), note: String::new() }).unwrap_err().to_string();
-    assert!(!e.contains("multisig") && t.bal(OWNER) < before, "{e}");
+    let e = format!("{:#}", t.tx_as(&ck, &addr(OWNER), Action::AttestClaim { claim_id: 9, ok: true, merge_sha: "ab".repeat(20), note: String::new() }).unwrap_err());
+    assert!(!e.contains("multisig") && e.contains("no claim #9") && t.bal(OWNER) == before, "{e}");
     let e = t.tx_as(&ck, &addr(OWNER), Action::UpdateValidator { commission_bps: 100, p2p_addr: String::new(), http_addr: String::new() }).unwrap_err().to_string();
     assert!(e.contains("multisig_propose"), "{e}");
 }

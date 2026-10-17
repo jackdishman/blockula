@@ -1427,10 +1427,13 @@ fn consensus_keys_sign_system_txs_for_their_owners() {
     let not_mine = t.tx_from(&keys(vseed(3)), &o.address(), Action::ReportEquivocation { evidence: double_notarize(&t, 2, 1, 2) });
     assert!(t.apply(&not_mine).is_err());
     // Attestations too: the consensus key's claim check counts as validator 1's (it gets to the
-    // claim, which doesn't exist here), while a stranger isn't a validator at all.
+    // claim, which doesn't exist here: refused, so the owner isn't charged for it; audit F04),
+    // while a stranger isn't a validator at all.
     let attest = |t: &T, k: &Keys, from: &str| t.tx_from(k, from, Action::AttestClaim { claim_id: 0, ok: false, merge_sha: String::new(), note: String::new() });
     let tx = attest(&t, &ck, &o.address());
-    assert_eq!(t.apply(&tx).unwrap(), Outcome::Failed("no claim #0".into()));
+    let before = t.balance(&o.address());
+    assert!(format!("{:#}", t.apply(&tx).unwrap_err()).contains("no claim #0"));
+    assert_eq!(t.balance(&o.address()), before);
     let tx = attest(&t, &stranger, &stranger.address());
     assert_eq!(t.apply(&tx).unwrap(), Outcome::Failed("only active validators can attest claims".into()));
     // It also picks which validator an owner's `UpdateValidator` means.
@@ -1469,14 +1472,18 @@ fn a_retired_siblings_consensus_key_acts_for_nobody() {
     assert_eq!(validator_for_signer(&t.st, &o.address(), &key(&sibling), epoch), None, "not the owner's active validator");
     assert_eq!(validator_for_signer(&t.st, &o.address(), &key(&keys(vseed(1))), epoch), Some(active.clone()));
     assert_eq!(validator_for_signer(&t.st, &o.address(), &key(&o), epoch), Some(active.clone()), "the owner's own key still picks it");
-    // Through the state machine: admitted (it's still the owner's validator's key), refused.
+    // Through the state machine: it's still the owner's validator's key, but every action fails,
+    // so none is admitted (or charged to the owner; audit F04).
+    let before = t.balance(&o.address());
+    let refused = |t: &mut T, tx: &Tx| format!("{:#}", t.apply(tx).unwrap_err());
     let commit = t.tx_from(&sibling, &o.address(), Action::BeaconCommit { epoch: epoch + 2, commitment: "11".repeat(32) });
-    assert_eq!(t.apply(&commit).unwrap(), Outcome::Failed(format!("only validators active in epoch {epoch} commit to the beacon")));
+    assert!(refused(&mut t, &commit).contains(&format!("only validators active in epoch {epoch} commit to the beacon")));
     assert!(t.st.beacon.rounds.get(&(epoch + 2)).is_none_or(|r| !r.contains_key(&active)));
     let attest = t.tx_from(&sibling, &o.address(), Action::AttestClaim { claim_id: 0, ok: false, merge_sha: String::new(), note: String::new() });
-    assert_eq!(t.apply(&attest).unwrap(), Outcome::Failed("only active validators can attest claims".into()));
+    assert!(refused(&mut t, &attest).contains("only active validators can attest claims"));
     let revert = t.tx_from(&sibling, &o.address(), Action::AttestRevert { claim_id: 0, revert_sha: "ab".repeat(20) });
-    assert_eq!(t.apply(&revert).unwrap(), Outcome::Failed("only active validators attest reverts".into()));
+    assert!(refused(&mut t, &revert).contains("only active validators attest reverts"));
+    assert_eq!(t.balance(&o.address()), before);
     // The active validator's own key commits for it.
     let own = t.tx_from(&keys(vseed(1)), &o.address(), Action::BeaconCommit { epoch: epoch + 2, commitment: "22".repeat(32) });
     assert_eq!(t.apply(&own).unwrap(), Outcome::Applied);
@@ -1874,8 +1881,6 @@ fn a_stolen_consensus_key_burns_at_most_its_validators_duties() {
     t.finish_epoch();
     let mut j = Journal::default();
     tombstone(&mut t.st, &mut j, &v, t.height);
-    let mut late = t.tx_from(&ck, &o.address(), noop());
-    late.nonce = t.st.account(&o.address()).nonce;
     assert!(t.apply(&t.tx_from(&ck, &o.address(), noop())).unwrap_err().to_string().contains("isn't authorized"));
     assert!(t.apply(&t.tx_from(&ck, &o.address(), Action::BeaconCommit { epoch: epoch + 3, commitment: "44".repeat(32) })).is_err());
     let reveal = t.tx_from(&ck, &o.address(), Action::BeaconReveal { epoch: epoch + 2, secret: hex::encode(secret) });
