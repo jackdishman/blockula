@@ -748,9 +748,13 @@ async fn tx(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
         return Ok(Json(tx_json(&v, pending, None)));
     }
     if let Some((reason, height)) = mp.failure(&id) {
-        // Dropped from this node's mempool without running: nothing was charged, and a node that
-        // still holds it may include it until its `valid_until` (an executed failure is in a
-        // block and answered above).
+        // A failure that ran is in a block, normally answered above (this view may predate the
+        // block, or the block may be pruned): its fee was charged. Anything else was dropped from
+        // this node's mempool without running: nothing was charged, and a node that still holds it
+        // may include it until its `valid_until` (audit review-fix-clients-2).
+        if mp.failure_ran(&id) {
+            return Ok(Json(json!({ "id": id, "status": "failed", "dropped": false, "error": reason, "height": height, "summary": format!("Transaction failed: {reason}") })));
+        }
         return Ok(Json(json!({ "id": id, "status": "failed", "dropped": true, "error": reason, "height": height, "summary": format!("Transaction dropped without running: {reason}") })));
     }
     Err(not_found("transaction"))
@@ -2905,6 +2909,23 @@ mod http_tests {
         assert_eq!(s, StatusCode::OK);
         assert_eq!(v["status"], "failed");
         assert!(v["error"].as_str().unwrap().contains("insufficient"));
+        assert_ne!(v["dropped"], true, "it ran in a block: its fee was charged");
+        // The failure memory knows which failures ran, for when the block isn't answered above.
+        assert!(n.live.mempool().failure_ran(&t2.id()));
+        // review-fix-clients-2: a tx dropped from the mempool unrun (here: it expired before anyone
+        // included it) is `dropped`: nothing charged, and it isn't "failed at execution".
+        let h = n.chain.lock().height();
+        let mut t3 = Tx { chain_id: "txfail".into(), genesis_hash: genesis_hash.clone(), from: k.address(), nonce: 2, fee: 0, tip: 0, valid_until: h + 1, action: Action::Transfer { to: me.clone(), amount: 1 }, memo: String::new(), public_key: hex::encode(k.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+        t3.fee = min_fee(t3.size());
+        let t3 = t3.sign(&k);
+        n.chain.lock().submit(t3.clone()).unwrap();
+        n.chain.lock().produce_block_with(vec![]).unwrap();
+        n.chain.lock().produce_block_with(vec![]).unwrap();
+        let (s, v, _) = call(&n, "GET", &format!("/api/tx/{}", t3.id()), None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!((v["status"].as_str(), v["dropped"].as_bool()), (Some("failed"), Some(true)), "{v}");
+        assert!(v["error"].as_str().unwrap().contains("expired"), "{v}");
+        assert!(!n.live.mempool().failure_ran(&t3.id()));
         std::fs::remove_dir_all(root).ok();
     }
 

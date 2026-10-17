@@ -118,6 +118,9 @@ pub struct MempoolView {
     /// registrations are a range read, not a mempool scan ([`MempoolView::registrations`]).
     names: imbl::OrdSet<(String, u64)>,
     failed: imbl::HashMap<String, (String, u64)>,
+    /// The remembered failures that ran in a block (their fee was charged); the rest were dropped
+    /// from the mempool unrun and may still execute elsewhere until their `valid_until`.
+    ran: imbl::HashSet<String>,
     next: u64,
 }
 
@@ -167,6 +170,11 @@ impl MempoolView {
         self.failed.get(id)
     }
 
+    /// Whether a remembered failure ran in a block (and was charged), not just dropped unrun.
+    pub fn failure_ran(&self, id: &str) -> bool {
+        self.ran.contains(id)
+    }
+
     pub(crate) fn add(&mut self, id: String, tx: &Tx, added_at: u64) {
         if self.ids.contains_key(&id) {
             return;
@@ -195,12 +203,18 @@ impl MempoolView {
         }
     }
 
-    pub(crate) fn fail(&mut self, id: String, reason: String, height: u64) {
+    pub(crate) fn fail(&mut self, id: String, reason: String, height: u64, ran: bool) {
+        if ran {
+            self.ran.insert(id.clone());
+        } else {
+            self.ran.remove(&id);
+        }
         self.failed.insert(id, (reason, height));
     }
 
     pub(crate) fn unfail(&mut self, id: &str) {
         self.failed.remove(id);
+        self.ran.remove(id);
     }
 
     pub(crate) fn has_failure(&self, id: &str) -> bool {

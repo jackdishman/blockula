@@ -2829,16 +2829,23 @@ impl Chain {
         Ok(())
     }
 
-    fn note_failed(&mut self, id: String, reason: String, height: u64) {
+    /// Remembers why a tx failed: `ran` when it executed in a block (charged), else it was dropped
+    /// from the mempool unrun (`/api/tx` says which).
+    fn note_failed_as(&mut self, id: String, reason: String, height: u64, ran: bool) {
         if !self.mp.has_failure(&id) {
             self.failed_order.push_back(id.clone());
         }
-        self.mp.fail(id, reason, height);
+        self.mp.fail(id, reason, height, ran);
         while self.failed_order.len() > RECENT_FAILED {
             if let Some(old) = self.failed_order.pop_front() {
                 self.mp.unfail(&old);
             }
         }
+    }
+
+    /// A tx dropped from the mempool without running (evicted, replaced, not included, expired…).
+    fn note_failed(&mut self, id: String, reason: String, height: u64) {
+        self.note_failed_as(id, reason, height, false);
     }
 
     /// Why a tx failed or was dropped, if we remember.
@@ -2918,7 +2925,7 @@ impl Chain {
                 Ok(Outcome::Applied) => txs.push(tx),
                 Ok(Outcome::Failed(r)) => {
                     failed.insert(txs.len(), r.clone());
-                    self.note_failed(tx.id(), r, f.height);
+                    self.note_failed_as(tx.id(), r, f.height, true);
                     txs.push(tx);
                 }
                 Err(e) => {
