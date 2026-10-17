@@ -27,7 +27,8 @@ norm='{name, target, enforcement, bypass_actors: (.bypass_actors // []), conditi
 shopt -s nullglob
 files=(ruleset-*.json)
 [ ${#files[@]} -gt 0 ] || { echo "No ruleset-*.json here." >&2; exit 1; }
-live_list=$(gh api --paginate "repos/$repo/rulesets?includes_parents=false")
+# --paginate prints one JSON array per page: merge them.
+live_list=$(gh api --paginate "repos/$repo/rulesets?includes_parents=false" | jq -s 'add // []')
 changed=0
 for f in "${files[@]}"; do
   jq -e 'has("name") and has("target") and has("rules")' "$f" > /dev/null || { echo "✗ $f isn't a ruleset (name, target, rules)" >&2; exit 1; }

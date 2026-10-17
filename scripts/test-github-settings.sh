@@ -70,7 +70,8 @@ cat > "$T/bin/gh" <<SH
 echo "\$*" >> "$T/gh.log"
 case "\$*" in
   "api --paginate repos/jackdishman/blockula/rulesets?includes_parents=false")
-    if [ "\${FAKE_TAGS:-}" = 1 ]; then echo '[{"id":1,"name":"main: reviewed PRs with green CI","target":"branch"},{"id":2,"name":"release tags","target":"tag"}]'
+    # Two rulesets come back as two pages, as --paginate prints them: one array each.
+    if [ "\${FAKE_TAGS:-}" = 1 ]; then echo '[{"id":1,"name":"main: reviewed PRs with green CI","target":"branch"}]'; echo '[{"id":2,"name":"release tags","target":"tag"}]'
     else echo '[{"id":1,"name":"main: reviewed PRs with green CI","target":"branch"}]'; fi ;;
   "api repos/jackdishman/blockula/rulesets/1")
     src=$T/live-main.json; [ "\${FAKE_MAIN:-live}" = same ] && src=$ROOT/deploy/github/ruleset-main.json
