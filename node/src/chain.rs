@@ -4334,6 +4334,33 @@ mod audit {
         fs::remove_dir_all(home).ok();
     }
 
+    /// review-r2-gov-1: admission dry-runs a tx on the live state when its sender has nothing
+    /// queued, so a panic inside it would leave the fee debited and the nonce bumped with no
+    /// rollback. The upgrade checks can't panic, whatever the schedule holds: before, once a
+    /// `u32::MAX` was scheduled and withdrawn, the refusal's `spent + 1` overflowed in any later
+    /// upgrade proposal's dry run (and in the block that carried it, on every validator). The
+    /// withdrawal is set directly here (versions now move in small steps, so no chain gets there).
+    #[test]
+    fn an_upgrade_proposal_is_refused_cleanly_whatever_was_withdrawn() {
+        let (_h, mut c) = fresh("upgrade-admit");
+        let o = Keys::from_seed([1u8; 32]);
+        let deposit = c.state.chain_params.proposal_deposit;
+        c.faucet(&o.address(), deposit + 10 * DROPS_PER_FANG).unwrap();
+        c.produce_block().unwrap();
+        c.state.upgrade.withdrawals = crate::upgrade::Withdrawals { highest: u32::MAX, last_at: Some(1) };
+        let at = |c: &Chain| (c.state.full_root(), c.state.account(&o.address()).balance, c.state.account(&o.address()).nonce);
+        let before = at(&c);
+        let cp = &c.state.chain_params;
+        let activation_height = c.height() + 2 * (cp.voting_blocks + cp.timelock_blocks) + 1_000;
+        for version in [2, u32::MAX] {
+            let propose = Action::Propose { kind: ProposalKind::ScheduleUpgrade { version, activation_height }, deposit, title: "v2".into(), url: String::new() };
+            let e = c.submit(signed_fee(&c, &o.address(), &o, 0, propose, None)).unwrap_err().to_string();
+            assert!(e.contains(&format!("isn't newer than v{}", u32::MAX)) && e.contains(&format!("as v{} or later", u32::MAX)), "{e}");
+            assert_eq!(at(&c), before, "the live state is as it was");
+        }
+        assert!(crate::upgrade::check_not_superseded(&c.state, 1, u32::MAX).unwrap_err().to_string().contains(&format!("as v{} or later", u32::MAX)));
+    }
+
     #[test]
     fn session_key_bounds_and_names() {
         let (_h, mut c) = fresh("sess");
