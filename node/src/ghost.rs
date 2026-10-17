@@ -85,10 +85,10 @@ pub const MAX_MEMPOOL_GHOST: usize = 256;
 /// on a grid, txs priced the canonical way ([`canonical_fee`]) share a handful of values (audit
 /// F38). Execution refuses anything else.
 pub const FEE_GRID: u64 = DROPS_PER_FANG / 1_000;
-/// A queued ghost tx is displaced (replaced by a spend of the same note, or evicted from a full
-/// ghost share) only by a tip higher than its own by at least 1/`BUMP_DIVISOR` of it and by at
-/// least the base fee of the newcomer's bytes: every displacement pays to relay itself (audit
-/// F39, BIP-125's rules 3 and 4).
+/// A queued ghost tx is displaced (replaced by a spend of the same note or, a shield, by its
+/// sender's shield at its nonce, or evicted from a full ghost share) only by a tip higher than
+/// its own by at least 1/`BUMP_DIVISOR` of it and by at least the base fee of the newcomer's
+/// bytes: every displacement pays to relay itself (audit F39, BIP-125's rules 3 and 4).
 const BUMP_DIVISOR: u64 = 10;
 /// `/api/ghost` lists at most this many retired anchors, newest first.
 const LISTED_ROOTS: usize = 64;
