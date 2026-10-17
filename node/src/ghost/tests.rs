@@ -3,7 +3,7 @@
 //! root against a rebuild and the invariants (pool included) in `State::debug_check`.
 
 use super::*;
-use crate::chain::{now_ms, Chain, SummonOpts};
+use crate::chain::{now_ms, Chain, SummonOpts, MAX_MEMPOOL, MAX_PENDING_PER_SENDER};
 use crate::crypto::{self, Keys};
 use blockula_ghost::encryption::MEMO_BYTES;
 use blockula_ghost::field::Digest;
@@ -1146,6 +1146,32 @@ fn a_queued_shield_is_its_senders_last_tx() {
     n.c.submit(s1.clone()).unwrap();
     assert!(!n.c.in_mempool(&s0.id()) && n.c.in_mempool(&s1.id()) && n.c.pending_count(&alice.address()) == 1);
     assert!(n.c.failure(&s0.id()).unwrap().0.contains("replaced by its sender's shield with a higher tip"));
+    // Behind a full queue of its sender's other txs (the replacement runs after them, not after
+    // the shield it replaces, and takes no new slot).
+    let bob = Keys::from_seed([72; 32]);
+    let last = MAX_PENDING_PER_SENDER as u64 - 1;
+    let (b0, b1) = (stand_in_shield(&mut n, &bob, last, 0), stand_in_shield(&mut n, &bob, last, need));
+    let bobs: Vec<Tx> = (0..last)
+        .map(|nonce| {
+            let mut b = Tx { from: bob.address(), nonce, public_key: hex::encode(bob.public_key()), fee: 0, ..t.clone() };
+            b.fee = 2 * crate::econ::base_fee(&n.c.state, n.c.height() + 1, b.size());
+            b.sign(&bob)
+        })
+        .collect();
+    // His balance covers his transfers and one shield, not two.
+    let balance = bobs.iter().map(|x| x.fee + 1).sum::<u64>() + b1.fee + FANG + n.c.state.chain_params.ghost_verify_fee;
+    n.c.state.accounts.insert(bob.address(), crate::chain::Account { balance, ..Default::default() });
+    n.c.state.supply += balance;
+    for b in &bobs {
+        n.c.submit(b.clone()).unwrap();
+    }
+    n.c.submit(b0.clone()).unwrap();
+    assert_eq!(n.c.pending_count(&bob.address()), MAX_PENDING_PER_SENDER);
+    n.c.submit(b1.clone()).unwrap();
+    assert!(!n.c.in_mempool(&b0.id()) && n.c.in_mempool(&b1.id()) && n.c.pending_count(&bob.address()) == MAX_PENDING_PER_SENDER);
+    let mut block = bobs.clone();
+    block.push(b1);
+    assert!(n.block(block).into_iter().all(|x| x), "his transfers, then the replacement");
     // The validator's own account (it pays its duties here): a duty waits behind its shield too.
     let me = n.validators[0].clone_keys();
     let nonce = n.c.next_nonce(&me.address());
@@ -1156,6 +1182,54 @@ fn a_queued_shield_is_its_senders_last_tx() {
     // Once the shields are included, the account queues again.
     assert_eq!(n.block(vec![s1, mine]), [true, true]);
     n.c.submit(Tx { nonce: 1, ..t }.sign(&alice)).unwrap();
+    n.cleanup();
+}
+
+/// Review of fix-fees-2: an unsigned ghost tx tips a whole multiple of the fee grid, so a full
+/// mempool's hint for one, and the cap it names, are on the grid too.
+#[test]
+fn a_full_mempool_hints_an_unsigned_tx_a_tip_on_the_grid() {
+    let mut n = net("grid", true, 1, &[]);
+    let alice = Keys::from_seed([81; 32]);
+    let key = SpendingKey::from_seed([82; 32]);
+    n.fund(&[&alice], 300 * FANG);
+    let (s, note) = n.shield(&alice, 10 * FANG, &key);
+    n.submit(&s).unwrap();
+    n.c.produce_block().unwrap();
+    let senders: Vec<Keys> = (0..(MAX_MEMPOOL / MAX_PENDING_PER_SENDER + 1) as u32).map(|i| Keys::from_seed(crypto::hash(&(i + 11_000).to_le_bytes()))).collect();
+    for k in &senders {
+        n.c.state.accounts.insert(k.address(), crate::chain::Account { balance: 10 * FANG, ..Default::default() });
+        n.c.state.supply += 10 * FANG;
+    }
+    let pay = |n: &Net, k: &Keys, nonce: u64, tip: u64| {
+        let mut t = Tx { chain_id: n.c.genesis.chain_id.clone(), genesis_hash: n.c.genesis_hash.clone(), from: k.address(), nonce, fee: 0, tip, valid_until: n.c.height() + 100, action: Action::Transfer { to: alice.address(), amount: 1 }, memo: String::new(), public_key: hex::encode(k.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+        t.fee = 2 * crate::econ::base_fee(&n.c.state, n.c.height() + 1, t.size()) + tip;
+        t.sign(k)
+    };
+    'fill: for k in &senders {
+        for nonce in 0..MAX_PENDING_PER_SENDER as u64 {
+            if n.c.mempool.len() >= MAX_MEMPOOL {
+                break 'fill;
+            }
+            let t = pay(&n, k, nonce, 1_000);
+            n.c.submit(t).unwrap();
+        }
+    }
+    let spend = |n: &mut Net, tip: u64| {
+        let to = SpendingKey::from_seed([83; 32]);
+        let outputs = [n.output(note.value - FEE - tip, &to, &key), n.dummy_output()];
+        let act = Act { spends: [n.spend(&key, note), n.dummy_spend()], outputs, anchor: n.anchor() };
+        let tx = n.unsigned(Action::PrivateTransfer { bundle: Box::new(act.bundle(n.instance())) }, FEE + tip, tip);
+        act.prove(tx)
+    };
+    // Outbidding a transfer tipping 1,000 drops takes about 25 times that for ~135 KiB, which an
+    // unsigned tx can't tip: the hint rounds it up to the grid.
+    let t0 = spend(&mut n, 0);
+    let e = err(n.submit(&t0));
+    assert!(e.contains(&format!("mempool is full; resubmit with a tip of at least {FEE_GRID} drops")), "{e}");
+    let t1 = spend(&mut n, FEE_GRID);
+    n.submit(&t1).unwrap();
+    assert_eq!(n.c.mempool.len(), MAX_MEMPOOL);
     n.cleanup();
 }
 
