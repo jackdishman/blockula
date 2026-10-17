@@ -10,6 +10,7 @@ import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex, hexToBytes, utf8ToBytes } from "@noble/hashes/utils.js";
 import {
   ApiError, ChainMismatchError, Client, MAINNET_CHAIN_ID, MAX_TIMEOUT_MS, UnprovenNameError, actionDigest, describeAction, describeKind, fangText, decodeKeyGrant, encodeKeyGrant, proposalDigest, seancePairsDigest, verifyKeyGrant, RELEASE_SIGNATURE_FORMAT, RequestTimeoutError, StaleProofError, TxFailedError, TxPendingError, Wallet, txDropped, addressFromPublicKey, bareName, buildDistribution, convictionWeight, distributionLeaf, distributionNode,
+  HeightAheadError, HEIGHT_CLOCK_TOLERANCE_MS, heightLimit, reviewAction,
   keyHash, keyId, leafHash, maxTip, minFee, paramsOf, proposal, proposalSummary, releaseMessage, sharesFor, signingBytes, stakeSummary, valueHash, verifyDistributionProof, verifyReleaseSignature, type Action,
   type Tx,
 } from "../src/index.js";
@@ -377,7 +378,7 @@ const sender = (c: Client) => Wallet.fromSeed("08".repeat(32), c);
   const lone = sender(new Client("http://redirect.node"));
   const rcpt = await lone.client.recipient("Alice.boo");
   assert.deepEqual([rcpt.signed, rcpt.byChain, rcpt.address, rcpt.proven], ["alice.boo", true, ATTACKER, false]);
-  assert.match(rcpt.how, /signed as the name: the chain resolves it to whoever owns it when the transaction runs.*says that's .* now, unproven/);
+  assert.match(rcpt.how, /signed as the name: the chain pays whoever owns it when the transaction runs.*says the owner is .* now, unproven/);
   const sent = redirect.posted.length;
   await lone.send("alice.boo", "1");
   await lone.awardHunt(3, "alice", 12);
@@ -412,7 +413,7 @@ assert.deepEqual([(await new Client("http://redirect.node", { witnesses }).recip
 assert.deepEqual(await new Client("http://redirect.node").resolution(BOB), { input: BOB, address: BOB, name: null, proven: true, how: "an address, signed as given" });
 assert.throws(() => new Client("http://redirect.node", { requireProvenNames: true }), /needs witnesses/);
 assert.throws(() => new Client("http://redirect.node", { witnesses: [new Client("http://redirect.node/")] }), /another node/);
-console.log("✓ names that get signed are proven against the client's witnesses, else signed as the name where the chain resolves it (a lying node can't redirect either)");
+console.log("✓ names that get signed are proven against the client's witnesses, else signed as the name where the chain resolves it (a lying node can't point either at another account)");
 
 // Audit gap-7-1, fields that need an address (staking, actAs, key grants): on mainnet an unproven
 // name is never signed. The check runs against the status each tx is signed for, so a node that
@@ -448,6 +449,63 @@ console.log("✓ names that get signed are proven against the client's witnesses
   assert.equal(flip.posted.length, 1);
 }
 console.log("✓ on mainnet, fields that need an address never sign an unproven name (staking, actAs, key grants), checked against the signing status");
+
+// Audit gap-7-1 (the MCP's path): a caller that resolved a name itself hands the resolution to
+// `build` / `keyGrant`, which refuse an unproven one on mainnet against the signing status.
+{
+  const main = host("http://mainnet2.node", { chain_id: MAINNET_CHAIN_ID });
+  main.names = { vlad: ATTACKER };
+  const c = new Client("http://mainnet2.node");
+  const w = Wallet.fromSeed("1a".repeat(32), c);
+  const res = await c.resolution("vlad.boo");
+  assert.equal(res.proven, false);
+  await assert.rejects(w.build({ type: "delegate", validator: res.address, amount: "1" }, "", { resolutions: [res] }), UnprovenNameError);
+  await assert.rejects(w.keyGrant(res), UnprovenNameError);
+  assert.equal((await w.keyGrant(await c.resolution(BOB))).account, BOB, "an address resolution is fine");
+  const t = host("http://unit2.node");
+  t.names = { vlad: ATTACKER };
+  const tw = Wallet.fromSeed("1b".repeat(32), new Client("http://unit2.node"));
+  const tres = await tw.client.resolution("vlad");
+  assert.equal((await tw.build({ type: "delegate", validator: tres.address, amount: "1" }, "", { resolutions: [tres] })).action.type, "delegate", "off mainnet it's signed (shown as unproven by the caller)");
+  assert.equal((await tw.keyGrant(tres)).account, ATTACKER, "the resolution given is used, not a second read");
+}
+console.log("✓ build and keyGrant take a caller's resolution and refuse an unproven one on mainnet");
+
+// Audit review-r3-clients-2: the height a tx's validity window counts from is checked against the
+// witnesses' heads, and against the genesis clock when the client has one, before signing.
+{
+  const start = 1_750_000_000_000;
+  assert.equal(heightLimit(start, 1000, start), Math.floor((1000 + HEIGHT_CLOCK_TOLERANCE_MS) / 1000));
+  assert.equal(heightLimit(start, 1000, start + 86_400_000) - heightLimit(start, 1000, start), 86_400);
+  assert.equal(heightLimit(start, 1000, 0), 0);
+  // A node a year ahead of its witnesses.
+  const ahead = host("http://ahead.node", { height: 50 + 31_536_000 });
+  host("http://head-a.node", { height: 50 });
+  const aw = Wallet.fromSeed("1c".repeat(32), new Client("http://ahead.node", { witnesses: [new Client("http://head-a.node"), new Client("http://down.node")] }));
+  await assert.rejects(aw.send(BOB, "1"), (e: unknown) => e instanceof HeightAheadError && e.height === 50 + 31_536_000 && e.limit === 80 && /Nothing was signed/.test(e.message));
+  assert.equal(ahead.posted.length, 0, "nothing signed against the future height");
+  // Within the lead (propagation): signed.
+  ahead.status.height = 50 + 30;
+  await aw.send(BOB, "1");
+  assert.equal(ahead.posted.length, 1);
+  // No witness answers: it can't be checked, so nothing is signed.
+  const lonely = Wallet.fromSeed("1c".repeat(32), new Client("http://ahead.node", { witnesses: [new Client("http://down.node")] }));
+  await assert.rejects(lonely.send(BOB, "1"), /none of this client's 1 witness reported its height.*nothing was signed/);
+  assert.throws(() => new Client("http://ahead.node", { maxHeadLeadBlocks: -1 }), /maxHeadLeadBlocks/);
+  // The genesis clock: a chain that started a day ago at 1 s blocks can't be a year in.
+  const clocked = host("http://clocked.node", { height: 31_536_000 });
+  const clock = { createdAtMs: Date.now() - 86_400_000, blockTimeMs: 1000 };
+  const cw = Wallet.fromSeed("1d".repeat(32), new Client("http://clocked.node", { genesisClock: clock }));
+  await assert.rejects(cw.send("bob.boo", "1"), (e: unknown) => e instanceof HeightAheadError && /this machine's clock and the chain's genesis/.test((e as Error).message));
+  assert.equal(clocked.posted.length, 0);
+  clocked.status.height = 86_000;
+  await cw.send("bob.boo", "1");
+  assert.equal(clocked.posted.length, 1, "a height the chain can have reached is signed");
+  assert.throws(() => new Client("http://clocked.node", { genesisClock: { createdAtMs: 1.5, blockTimeMs: 1000 } }), /genesisClock/);
+  // The name signed as the name says what a held tx can do.
+  assert.match((await cw.client.recipient("bob")).how, /can't point it at another account now, though a node holding the signed transaction could release it later in its validity window, after the name changed hands/);
+}
+console.log("✓ the height a tx is signed against is refused when it's ahead of the witnesses' heads or of the genesis clock");
 
 // Audit gap-7-6: what a proposal or a multisig action does is rendered by the client from the
 // content the vote or approval binds, never from the node's summary.
@@ -492,6 +550,45 @@ console.log("✓ on mainnet, fields that need an address never sign an unproven 
   assert.equal(describeAction({ type: "undelegate", validator: BOB, shares: "7" }), `Start unbonding 7 pool shares from validator ${BOB}`);
 }
 console.log("✓ describeKind / describeAction render what a vote or approval binds (amounts and recipients spelled out), never throw, and flag numbers they can't read");
+
+// review-r3-clients-1, -5 and gap-7-6 one level down (a multisig-held ballot).
+{
+  const MALLORY = ATTACKER;
+  // A cancellation says it supersedes the upgrade proposals still open (the same sentence as the CLI and the node).
+  assert.equal(describeKind({ type: "cancel_upgrade", version: 2, activation_height: 90_000 }), "Cancel the upgrade to protocol v2 at block 90000 and any upgrade scheduled after it; upgrade proposals still open when it runs are superseded and can't take effect");
+  assert.match(proposalSummary({ id: 3, kind: { type: "cancel_upgrade", version: 2, activation_height: 90_000 }, title: "Postpone v2" }).does, /upgrade proposals still open when it runs are superseded and can't take effect$/);
+  // A validator update names each address it sets; an empty one is kept, so it isn't mentioned.
+  assert.equal(describeAction({ type: "update_validator", commission_bps: 5, p2p_addr: "", http_addr: "https://evil.example" }), "Set the account's validator commission to 5 basis points, its HTTP address to “https://evil.example”");
+  assert.equal(describeAction({ type: "update_validator", commission_bps: 5, p2p_addr: "1.2.3.4:9000", http_addr: "" }), "Set the account's validator commission to 5 basis points, its p2p address to “1.2.3.4:9000”");
+  assert.equal(describeAction({ type: "update_validator", commission_bps: 5, p2p_addr: "", http_addr: "" }), "Set the account's validator commission to 5 basis points");
+  assert.match(describeAction({ type: "update_validator", commission_bps: 5, p2p_addr: "a\u202eb\nc", http_addr: 7 }), /p2p address to “a b c”, its HTTP address to an unreadable address$/);
+  // A registration names the consensus key it puts in charge of the bond, by key id.
+  const ck = bytesToHex(pk(9));
+  const id = keyId(pk(9));
+  assert.equal(describeAction({ type: "register_validator", consensus_key: ck, p2p_addr: "1.2.3.4:9000", http_addr: "https://v.example", bond: (1_000_000n * FANG).toString(), pop: "" }), `Register a validator with consensus key ${id.slice(0, 12)}…${id.slice(-8)} (it signs for the validator; the validator's address carries the same key id), p2p address “1.2.3.4:9000”, HTTP address “https://v.example”, bonding 1,000,000 FANG from the account`);
+  assert.match(describeAction({ type: "register_validator", consensus_key: "zz", p2p_addr: "", http_addr: "", bond: "1" }), /^Register a validator with an unreadable consensus key/);
+  // A multisig's vote binds a proposal by digest: described by the proposal only if its content has it.
+  const drain = { type: "treasury_spend", to: MALLORY, amount: (10_000_000n * FANG).toString() };
+  const truth = proposalDigest(drain as never, "Community garden", "");
+  const ballot = { type: "vote", proposal_id: 12, aye: true, amount: (100_000_000n * FANG).toString(), conviction: 6, proposal_digest: truth };
+  const bare = reviewAction(ballot);
+  assert.equal(bare.does, `Vote aye on proposal #12 with 100,000,000 FANG at conviction 6, binding the proposal whose content has digest ${truth}: read proposal #12 and check its digest before approving`);
+  assert.equal(bare.readable, false, "a vote isn't approvable before its proposal is checked");
+  const told = reviewAction(ballot, { proposal: { id: 12, kind: drain, title: "Community garden", url: "", summary: "plant garlic" } });
+  assert.deepEqual(told, { does: `Vote aye on proposal #12 with 100,000,000 FANG at conviction 6, binding the proposal whose content has digest ${truth}: proposal #12 (its content has exactly that digest), which does this: Pay 10,000,000 FANG from the treasury to ${MALLORY} (title, as written: “Community garden”)`, readable: true });
+  const lied = reviewAction(ballot, { proposal: { id: 12, kind: { type: "text" }, title: "Plant garlic", url: "" } });
+  assert.equal(lied.readable, false);
+  assert.match(lied.does, /but that's NOT what the node shows as proposal #12 \(Nothing on chain: a text proposal.*digest [0-9a-f]{64}\).*Don't approve it$/);
+  assert.ok(!lied.does.includes("Pay 10,000,000"), "the node's proposal isn't described as what the vote backs");
+  assert.equal(reviewAction(ballot, { proposal: JSON.parse('{"id":12,"kind":{"type":"distribution","distribution_id":1152921504606846976,"merkle_root":"' + "ab".repeat(32) + '","total":"5","claim_until":50}}') }).readable, false, "a proposal this client can't read exactly");
+  // Anything described as unreadable isn't approvable; a stranger's text saying "unreadable" doesn't count.
+  assert.equal(reviewAction({ type: "remove_key", key_id: "aaaaaaaaaaa€€€" }).readable, false);
+  assert.equal(reviewAction({ type: "remove_key", key_id: "ab".repeat(32) }).readable, true);
+  assert.equal(reviewAction({ type: "mystery" }).readable, false);
+  assert.equal(reviewAction({ type: "add_key", key_id: "ab".repeat(32), label: "unreadable", role: { type: "owner" }, public_key: "", pop: "" }).readable, true);
+  assert.equal(reviewAction({ type: "transfer", to: MALLORY, amount: 9007199254740993 }).readable, false);
+}
+console.log("✓ describers say a cancellation supersedes open upgrade proposals, which validator addresses move and which consensus key registers; a multisig vote is described by the proposal its digest binds");
 
 // Audit gap-7-3: an absolute expiry counts from the height valid_until does, in one status read.
 // This node answers a lone status read 300 days ahead and the next one truthfully.

@@ -170,6 +170,8 @@ const fake: Server = createServer((req, res) => {
     if (path === "/fees") return reply(200, { height: 10, suggested: { flat: "10000", rate: "10000" }, account_creation_fee: "100000000" });
     if (path === "/params") return reply(200, { params: mode.prices.params ? { name_price_3: "100000000000", name_price_4: "25000000000", name_price_5: "5000000000", name_renewal_bps: "2000" } : {} });
     if (path === "/name/bob.boo" || path === "/name/bob") return reply(200, { name: "bob.boo", status: "active", available: false, owner: { address: BOB, name: "bob.boo" }, ...mode.prices });
+    // The lie the R1 reviewer of gap-7-1 used: validator.boo "is" Mallory's.
+    if (path === "/name/validator") return reply(200, { name: "validator.boo", status: "active", available: false, owner: { address: MALLORY, name: "validator.boo" }, ...mode.prices });
     if (path.startsWith("/name/")) return reply(200, { name: `${path.slice(6)}.boo`, status: "available", available: true, ...mode.prices });
     if (path.startsWith("/search/")) return reply(200, { type: "tx", id: "cd".repeat(32) });
     if (path.startsWith("/hunts")) return reply(200, [{ id: 1, title: `${INJECTION}‮\u0007`, amount_display: "10 FANG", issue_url: "https://github.com/a/b/issues/1", funders: { [BOB]: "10" } }]);
@@ -477,7 +479,7 @@ assert.ok(!r.error, r.text);
 // (shown, as unproven) never decides who gets paid.
 assert.equal((posted.at(-1)!.action as { to: string }).to, "bob.boo", "the name is signed, not the node's address for it");
 assert.deepEqual([r.json().recipient_signed_as, r.json().recipient_owner_now_unproven], ["bob.boo", BOB]);
-assert.match(r.json().name_resolution, /^bob\.boo is signed as the name: the chain resolves it to whoever owns it when the transaction runs/);
+assert.match(r.json().name_resolution, /^bob\.boo is signed as the name: the chain pays whoever owns it when the transaction runs, so .* can't point it at another account now, though a node holding the signed transaction could release it later/);
 r = await s.call("send", { to: BOB, amount: "1" });
 assert.ok(!r.error && r.json().recipient_address === undefined && r.json().name_resolution === undefined, "an address needs no resolving");
 const agentKey = (await s.call("create_wallet")).json().key_id as string;
@@ -518,6 +520,27 @@ r = await s.call("send", { to: BOB, amount: "1" });
 assert.ok(!r.error && r.json().block === 11, `the confirmed address is sent to: ${r.text}`);
 assert.equal(posted.length, before + 2);
 await s.close();
+// The R1 reviewer's bypass (gap-7-1): no --network mainnet, only BLOCKULA_RPC (a "custom" network,
+// or "local" for this machine) at a node that reports blockula-1 and lies about validator.boo.
+// Mainnet is decided by the chain the client is pinned to, not the configuration's name for it:
+// nothing is signed for the name.
+for (const [env, label] of [[{ BLOCKULA_RPC: rpc }, "local dev node"], [{ BLOCKULA_RPC: rpc, BLOCKULA_NETWORK: "custom" }, "custom node"]] as const) {
+  rmSync(join(home, "known-chains.json"), { force: true });
+  s = await server(env);
+  before = posted.length;
+  r = await s.call("status");
+  assert.ok(!r.error && r.json().real_money === true && r.json().network === label, r.text);
+  for (const [tool, args] of [["stake", { validator: "validator.boo", amount: "1" }], ["unstake", { validator: "validator.boo", amount: "1" }], ["use_account", { account: "validator.boo" }]] as const) {
+    r = await s.call(tool, args);
+    assert.ok(!r.error, `${label} ${tool}: ${r.text}`);
+    assert.deepEqual([r.json().status, r.json().needs_confirmation, r.json().resolves_to, r.json().grant_code], ["not_sent", true, MALLORY, undefined], `${label} ${tool}: ${r.text}`);
+  }
+  assert.equal(posted.length, before, "nothing signed for the lying node's validator.boo");
+  r = await s.call("stake", { validator: BOB, amount: "1" });
+  assert.ok(!r.error && r.json().block === 11, `an address the user confirmed is staked to: ${r.text}`);
+  assert.equal((posted.at(-1)!.action as { validator: string }).validator, BOB);
+  await s.close();
+}
 mode.status = {};
 rmSync(join(home, "known-chains.json"), { force: true });
 console.log("✓ payments to a name sign the name (the chain resolves it); where an address is needed it's shown as unproven, and on mainnet waits for the address to be confirmed; use_account reads the account's own keys");
