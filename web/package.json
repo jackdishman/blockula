@@ -25,6 +25,6 @@
     "@types/node": "*",
     "@types/react": "^19",
     "@types/react-dom": "^19",
-    "typescript": "^5.9.3"
+    "typescript": "^7.0.2"
   }
 }
