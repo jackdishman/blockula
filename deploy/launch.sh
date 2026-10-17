@@ -172,7 +172,8 @@ if [ ! -f "$NET/genesis.json" ]; then
   # Founding jurors: Soul in the genesis ledger (docs/TOKENOMICS.md: never the founder's).
   souls=""
   if [ -n "${JURORS_FILE:-}" ]; then
-    while read -r addr soul reason; do
+    [ -f "$JURORS_FILE" ] || { echo "❌ JURORS_FILE=$JURORS_FILE isn't a file" >&2; exit 1; }
+    while read -r addr soul reason || [ -n "${addr:-}" ]; do
       case "$addr" in "" | \#*) continue ;; esac
       souls="$souls[[soul]]\naccount = \"$addr\"\nsoul = \"$soul\"\nreason = $(toml_str "${reason:-founding juror}")\n\n"
     done < "$JURORS_FILE"
