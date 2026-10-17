@@ -800,12 +800,18 @@ pub struct NameRecord {
     /// given never ranks ahead of names it registered itself for its primary name).
     pub registered_at: u64,
     /// Last height it resolves (DEC-11: a year after registering, extended by `RenewName`).
-    /// Then `name_grace_blocks` in which only the owner can renew it, then anyone can register it.
+    /// Then a grace in which only the owner can renew it (`econ::grace_until`), then anyone can
+    /// register it.
     pub expires_at: u64,
     /// The account the owner offered it to (`TransferName`): it's theirs once they accept it
     /// (audit F34: nobody is given a name, and so a primary name, without saying yes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offered_to: Option<String>,
+    /// `name_grace_blocks` as it was when the name was registered or last renewed: its grace is
+    /// at least that long, so a `ParamChange` lowering the parameter only shortens the grace of
+    /// names registered or renewed after it (gap-6-3), while a raise lengthens every grace.
+    #[serde(default)]
+    pub grace_blocks: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]

@@ -570,9 +570,12 @@ pub fn name_active(state: &State, rec: &NameRecord) -> bool {
     now(state) <= rec.expires_at
 }
 
-/// The last height its owner can still renew it; anyone can register it after.
+/// The last height its owner can still renew it; anyone can register it after: `expires_at`
+/// plus the longer of the grace it was registered (or last renewed) with and today's
+/// `name_grace_blocks`, so lowering the parameter never takes the grace of a name already
+/// counting on it (gap-6-3).
 pub fn grace_until(state: &State, rec: &NameRecord) -> u64 {
-    rec.expires_at.saturating_add(state.chain_params.name_grace_blocks)
+    rec.expires_at.saturating_add(rec.grace_blocks.max(state.chain_params.name_grace_blocks))
 }
 
 /// `RegisterName`: a name nobody holds (or whose grace ran out), not reserved, for a year.
@@ -595,7 +598,8 @@ pub(crate) fn register_name(state: &mut State, j: &mut Journal, sender: &str, na
     let treasury = state.treasury();
     state.j_credit(j, &treasury, price);
     let expires_at = height.saturating_add(state.chain_params.name_registration_blocks);
-    state.insert_name(j, NameRecord { name: n, owner: sender.to_string(), registered_at: height, expires_at, offered_to: None });
+    let grace_blocks = state.chain_params.name_grace_blocks;
+    state.insert_name(j, NameRecord { name: n, owner: sender.to_string(), registered_at: height, expires_at, offered_to: None, grace_blocks });
     Ok(())
 }
 
@@ -603,9 +607,8 @@ pub(crate) fn register_name(state: &mut State, j: &mut Journal, sender: &str, na
 /// last sweep stopped and starting over at the end.
 fn sweep_names(state: &mut State, height: u64) {
     use std::ops::Bound;
-    let grace = state.chain_params.name_grace_blocks;
     let from = (Bound::Excluded(state.econ.name_cursor.clone()), Bound::Unbounded);
-    let batch: Vec<(String, bool)> = state.names.range(from).take(NAME_SWEEP).map(|(n, r)| (n.clone(), r.expires_at.saturating_add(grace) < height)).collect();
+    let batch: Vec<(String, bool)> = state.names.range(from).take(NAME_SWEEP).map(|(n, r)| (n.clone(), grace_until(state, r) < height)).collect();
     state.econ.name_cursor = if batch.len() < NAME_SWEEP { String::new() } else { batch.last().map(|(n, _)| n.clone()).unwrap_or_default() };
     for (n, lapsed) in batch {
         if lapsed {
@@ -647,7 +650,10 @@ pub(crate) fn apply(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, _
                 let treasury = state.treasury();
                 state.j_credit(j, &treasury, price);
             }
-            state.name_mut(j, &n).expect("checked above").expires_at = expires_at;
+            // The new term's grace is today's.
+            let grace_blocks = state.chain_params.name_grace_blocks;
+            let rec = state.name_mut(j, &n).expect("checked above");
+            (rec.expires_at, rec.grace_blocks) = (expires_at, grace_blocks);
         }
         // A name changes hands in two steps (audit F34): its owner offers it (`to` another
         // account; offering it again replaces the offer, `to` itself withdraws it), and the account
@@ -1419,6 +1425,49 @@ mod tests {
         t.replays();
     }
 
+    /// gap-6-3: a name's grace is fixed when it's registered or renewed. Lowering
+    /// `name_grace_blocks` (to 0, here) doesn't free names already in their grace, or let the
+    /// sweep take them: their owners can still renew, and nobody else can register them until the
+    /// grace they were promised is over. Names registered or renewed after it get the new grace;
+    /// a raise lengthens every grace at once.
+    #[test]
+    fn lowering_the_grace_keeps_the_grace_names_were_promised() {
+        let (alice, bob) = (keys(1), keys(2));
+        let mut t = chain("names-grace", vec![alloc(&alice, 1_000 * FANG, None, "alice"), alloc(&bob, 1_000 * FANG, None, "bob")], &[("name_registration_blocks", 10), ("name_grace_blocks", 50)], 600);
+        t.ok(&alice, Action::RegisterName { name: "alice".into() });
+        t.ok(&alice, Action::RegisterName { name: "sweepme".into() });
+        let (rec, sweep) = (t.c.state.names["alice"].clone(), t.c.state.names["sweepme"].expires_at);
+        assert_eq!(rec.grace_blocks, 50);
+        t.blocks(sweep + 1 - t.c.height());
+        let grace = |t: &T, n: &str| grace_until(&t.c.state, &t.c.state.names[n]);
+        assert_eq!(grace(&t, "alice"), rec.expires_at + 50);
+        assert!(t.err(&bob, Action::RegisterName { name: "alice".into() }).contains("its owner can renew it until block"));
+        // Governance lowers the grace to nothing.
+        t.c.state.exec_set_param(&mut Journal::default(), "name_grace_blocks", 0).unwrap();
+        assert_eq!(grace(&t, "alice"), rec.expires_at + 50, "the grace it was promised");
+        let e = t.err(&bob, Action::RegisterName { name: "alice".into() });
+        assert!(e.contains(&format!("its owner can renew it until block {}", rec.expires_at + 50)), "{e}");
+        t.blocks(3);
+        assert!(t.c.state.names.contains_key("sweepme"), "the sweep keeps it through its grace too");
+        // Its owner renews it: the new term has today's grace.
+        t.ok(&alice, Action::RenewName { name: "alice".into(), years: 1 });
+        let renewed = t.c.state.names["alice"].clone();
+        assert_eq!((renewed.expires_at, renewed.grace_blocks, grace(&t, "alice")), (rec.expires_at + 10, 0, rec.expires_at + 10));
+        t.ok(&bob, Action::RegisterName { name: "bob".into() });
+        assert_eq!(t.c.state.names["bob"].grace_blocks, 0, "registered after the change: the new grace");
+        // A raise applies to every name at once.
+        t.c.state.exec_set_param(&mut Journal::default(), "name_grace_blocks", 70).unwrap();
+        assert_eq!((grace(&t, "alice"), grace(&t, "sweepme")), (rec.expires_at + 80, sweep + 70));
+        t.c.state.exec_set_param(&mut Journal::default(), "name_grace_blocks", 0).unwrap();
+        // "sweepme" lapses after the 50 blocks it was registered with, then anyone can take it.
+        t.blocks(sweep + 50 - t.c.height());
+        assert!(t.err(&bob, Action::RegisterName { name: "sweepme".into() }).contains("its owner can renew it until block"));
+        t.blocks(1);
+        t.ok(&bob, Action::RegisterName { name: "sweepme".into() });
+        assert_eq!(t.c.state.names["sweepme"].owner, bob.address());
+        t.done();
+    }
+
     /// Audit F34: nobody is given a name, and so a primary name, without accepting it. A
     /// `TransferName` to another account only offers the name (it still resolves to its owner,
     /// and the owner can replace or withdraw the offer); the account it was offered to takes it
@@ -1532,7 +1581,7 @@ mod tests {
         let mut st = State::default();
         for i in 0..100 {
             let n = format!("name{i:03}");
-            st.names.insert(n.clone(), NameRecord { name: n, owner: keys(1).address(), registered_at: 0, expires_at: if i % 3 == 0 { 0 } else { 1_000 }, offered_to: None });
+            st.names.insert(n.clone(), NameRecord { name: n, owner: keys(1).address(), registered_at: 0, expires_at: if i % 3 == 0 { 0 } else { 1_000 }, offered_to: None, grace_blocks: 0 });
         }
         let grace = st.chain_params.name_grace_blocks;
         for h in 0..4 {
