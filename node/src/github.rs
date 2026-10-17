@@ -406,6 +406,7 @@ impl Scan {
 /// words in a commit on the default branch ([`Stated::Commit`]; maintainers landed it, nobody can
 /// edit it): a defined answer every validator reaches, never "couldn't tell" forever (audit
 /// review-fix-poc-3), and never a PR description, which its author could rewrite.
+#[allow(clippy::too_many_arguments)]
 pub fn find_revert_in(repo: &str, pr: u64, merge_sha: &str, author: &str, commits: &[Commit], pulls: &[PullRequest], original: &[FileDiff], diffs: &BTreeMap<String, Vec<FileDiff>>) -> Option<Revert> {
     let candidates = revert_candidates(repo, pr, merge_sha, author, commits, pulls);
     if original.is_empty() {
