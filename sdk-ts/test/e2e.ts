@@ -167,6 +167,8 @@ const viaName = await bob.client.account(`${name}.boo`);
 assert.equal(viaName.account.address, alice.address);
 
 const bobTx = await bob.send(`${name}.boo`, "2");
+// Without witnesses the name itself is signed, and the chain pays its owner (audit gap-7-1).
+assert.equal(bobTx.action.to, `${name}.boo`);
 assert.equal(await bob.balance(), formatFang(parseFang("10.5") - BigInt(bobTx.fee)));
 const { chain_id, genesis_hash } = await client.status();
 assert.equal(BigInt(bobTx.fee), minFee({ chain_id, genesis_hash, from: bob.address, nonce: 0, fee: "0", valid_until: bobTx.valid_until, action: bobTx.action, memo: "" }));

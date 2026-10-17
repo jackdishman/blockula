@@ -56,13 +56,25 @@ impl Signer {
         Remote::connect(dir, &self.rpc, &self.pin).await
     }
 
-    /// The account to sign for on `remote`'s chain: `--from`, or the key's own address.
+    /// The account to sign for on `remote`'s chain: `--from`, or the key's own address. A name in
+    /// `--from` is resolved by the node, unproven; on mainnet that isn't enough to sign for
+    /// (audit gap-7-1): pass the address.
     pub(crate) async fn acting_for(&self, remote: &Remote, keys: &Keys) -> Result<String> {
         match &self.from {
-            Some(a) => remote.resolve(a).await,
+            Some(a) => from_on_chain(a, &remote.resolve(a).await?, &remote.chain_id, &remote.rpc),
             None => Ok(remote.address(keys)),
         }
     }
+}
+
+/// `--from` as signed: an address as given; a name only off mainnet, where the CLI has printed
+/// the node's (unproven) answer for it. On mainnet the account every tx names must be one the
+/// user typed as an address, so one node can't pick it (audit gap-7-1).
+pub(crate) fn from_on_chain(given: &str, resolved: &str, chain_id: &str, rpc: &str) -> Result<String> {
+    if crate::crypto::is_address(given.trim()) || chain_id != crate::chain::MAINNET_CHAIN_ID {
+        return Ok(resolved.to_string());
+    }
+    bail!("--from {given}: {rpc} says that's {resolved}, but that's one node's word, and on mainnet the CLI only signs for an account given as an address. Check the address with the account's owner and pass --from {resolved}. Nothing was signed.")
 }
 
 /// An address the node resolves a name to, unproven (printed): only where an address is needed.
@@ -97,7 +109,7 @@ fn name_of(v: &Value) -> String {
     v["name"].as_str().or(v["short"].as_str()).unwrap_or_default().to_string()
 }
 
-fn confirm(question: &str, yes: bool) -> Result<()> {
+pub(crate) fn confirm(question: &str, yes: bool) -> Result<()> {
     if yes {
         return Ok(());
     }
@@ -357,7 +369,9 @@ pub enum ContribCmd {
         signer: Signer,
     },
     /// Seal your judgment: one of a, b or = per pair, in order (e.g. "ab=a"). The salt is kept
-    /// in ~/.blockula/seances/ for `reveal`.
+    /// in ~/.blockula/seances/ for `reveal`. The judgment binds the pairs it was made on: pass
+    /// the pairs digest `contrib seance` printed (--digest), or check the pairs printed here.
+    #[command(alias = "commit")]
     Vote {
         seance: u64,
         #[arg(long)]
@@ -365,6 +379,13 @@ pub enum ContribCmd {
         /// Claim ids you think are spam (comma-separated)
         #[arg(long, value_delimiter = ',')]
         spam: Vec<u64>,
+        /// The pairs digest `contrib seance` printed with the pairs you judged: refused if the
+        /// node now gives other pairs (audit gap-7-6)
+        #[arg(long)]
+        digest: Option<String>,
+        /// Without --digest, don't ask for confirmation after printing the pairs it binds
+        #[arg(long)]
+        yes: bool,
         #[command(flatten)]
         signer: Signer,
     },
@@ -464,6 +485,34 @@ struct SealedVote {
     salt: String,
 }
 
+/// One claim of a Séance pair as a judgment binds it: (id, repo, PR number).
+type ClaimRef = (u64, String, u64);
+
+/// `account`'s assigned pairs in a Séance (the node's `/api/seance/{id}` answer), in order, each
+/// claim with its repo and PR: what a sealed judgment binds (`seance_pairs_digest`).
+pub(crate) fn seat_pairs(s: &Value, seance: u64, account: &str) -> Result<Vec<[ClaimRef; 2]>> {
+    let seat = s["jurors"].as_array().into_iter().flatten().find(|j| j["juror"]["address"] == account).ok_or_else(|| anyhow!("{account} isn't on the jury of Séance #{seance}"))?;
+    let claims: Vec<Value> = s["claims"].as_array().cloned().unwrap_or_default();
+    let claim = |id: &Value| -> Result<ClaimRef> {
+        let id = id.as_u64().ok_or_else(|| anyhow!("Séance #{seance} lists a pair with a bad claim id: {id}"))?;
+        let c = claims.iter().find(|c| c["id"] == id).ok_or_else(|| anyhow!("Séance #{seance} doesn't list claim #{id}"))?;
+        Ok((id, c["repo"].as_str().unwrap_or_default().to_string(), c["pr"].as_u64().unwrap_or_default()))
+    };
+    seat["assigned_pairs"].as_array().into_iter().flatten().map(|p| Ok([claim(&p[0])?, claim(&p[1])?])).collect()
+}
+
+/// `seance_pairs_digest` of a seat's pairs.
+pub(crate) fn pairs_digest(seance: u64, account: &str, pairs: &[[ClaimRef; 2]]) -> String {
+    let refs: Vec<[(u64, &str, u64); 2]> = pairs.iter().map(|[a, b]| [(a.0, a.1.as_str(), a.2), (b.0, b.1.as_str(), b.2)]).collect();
+    seance_pairs_digest(seance, account, &refs)
+}
+
+/// The pairs as a juror reads them: which claim and PR is `a`, which is `b`.
+pub(crate) fn pair_lines(pairs: &[[ClaimRef; 2]]) -> Vec<String> {
+    let pr = |c: &ClaimRef| format!("claim #{} {}#{} (https://github.com/{}/pull/{})", c.0, c.1, c.2, c.1, c.2);
+    pairs.iter().enumerate().map(|(i, [a, b])| format!("  {:>2}. a = {}\n      b = {}", i + 1, pr(a), pr(b))).collect()
+}
+
 fn sealed_path(dir: &Path, chain_id: &str, seance: u64, account: &str) -> PathBuf {
     dir.join("seances").join(format!("{chain_id}-{seance}-{account}.json"))
 }
@@ -534,42 +583,54 @@ pub fn contrib(cmd: ContribCmd, dir: &Path) -> Result<()> {
             let seat = s["jurors"].as_array().cloned().unwrap_or_default().into_iter().find(|j| me.as_deref().is_some_and(|m| j["juror"]["address"] == m));
             match seat {
                 Some(seat) => {
-                    let url = |id: &Value| claims.iter().find(|c| c["id"] == *id).map(|c| c["pr_url"].as_str().unwrap_or_default().to_string()).unwrap_or_default();
+                    // The pairs (and each claim's repo and PR) are what a judgment binds: printed
+                    // with their digest, which `contrib vote --digest` checks (audit gap-7-6).
+                    let me = me.unwrap_or_default();
+                    let pairs = seat_pairs(&s, id, &me)?;
                     println!("\nYou're on this jury. For each pair, which PR mattered more? a, b, or = (about equal):");
-                    for (i, p) in seat["assigned_pairs"].as_array().cloned().unwrap_or_default().iter().enumerate() {
-                        println!("  {:>2}. a = claim #{} {}\n      b = claim #{} {}", i + 1, p[0], url(&p[0]), p[1], url(&p[1]));
+                    for l in pair_lines(&pairs) {
+                        println!("{l}");
                     }
-                    println!("\nThen: blockula contrib vote {id} --votes <{} chars of a/b/=> [--spam <claim ids>]", seat["pairs"]);
+                    let d = pairs_digest(id, &me, &pairs);
+                    println!("\npairs digest: {d}");
+                    println!("Then: blockula contrib vote {id} --votes <{} chars of a/b/=> --digest {d} [--spam <claim ids>]", pairs.len());
                     println!("Status: {}", if seat["revealed"] == true { "revealed" } else if seat["committed"] == true { "sealed (reveal after the sealing phase)" } else { "not voted yet" });
                 }
                 None => println!("\n{} jurors: {}", s["jurors"].as_array().map(|a| a.len()).unwrap_or(0), s["jurors"].as_array().cloned().unwrap_or_default().iter().map(|j| format!("{}{}", name_of(&j["juror"]), if j["revealed"] == true { " ✓" } else if j["committed"] == true { " 🔒" } else { "" })).collect::<Vec<_>>().join(", ")),
             }
             Ok(())
         }
-        ContribCmd::Vote { seance, votes, spam, signer } => {
+        ContribCmd::Vote { seance, votes, spam, digest, yes, signer } => {
             let keys = signer.keys(dir)?;
             let rt = rt()?;
             let account = rt.block_on(signer.from(&keys))?;
             let chain_id = rt.block_on(get(&signer.rpc, "/status"))?["chain_id"].as_str().unwrap_or_default().to_string();
+            // The judgment binds the pairs and PRs, read again here. That read is the node's word
+            // too, so it must be what the juror judged: the pairs digest `contrib seance` printed
+            // (--digest), or the pairs printed here and confirmed (audit gap-7-6, review-r2-clients-3).
+            let s = rt.block_on(get(&signer.rpc, &format!("/seance/{seance}")))?;
+            let pairs = seat_pairs(&s, seance, &account)?;
+            if votes.len() != pairs.len() {
+                bail!("you have {} assigned pairs: pass one of a, b or = for each (`blockula contrib seance {seance}` lists them)", pairs.len());
+            }
+            let pairs_digest = pairs_digest(seance, &account, &pairs);
+            println!("Your judgment in Séance #{seance} binds these pairs, in order:");
+            for (l, v) in pair_lines(&pairs).iter().zip(votes.chars()) {
+                println!("{l}\n      your vote: {}", match v {
+                    'a' => "a",
+                    'b' => "b",
+                    '=' => "= (about equal)",
+                    _ => "(not a, b or =)",
+                });
+            }
+            println!("pairs digest: {pairs_digest}");
+            if !crate::gov_cli::check_digest(digest.as_deref(), &pairs_digest, &format!("Séance #{seance}'s pairs for you"))? {
+                confirm("Seal this judgment on exactly these pairs?", yes)?;
+            }
             let mut salt = [0u8; 16];
             getrandom::fill(&mut salt).map_err(|e| anyhow!("no randomness: {e}"))?;
             let salt = hex::encode(salt);
             let commitment = seance_commitment(seance, &account, &votes, &spam, &salt);
-            // The judgment binds the pairs and PRs `contrib seance` shows (read again here): a node
-            // that misreports them makes the commitment fail, not misdirect it (audit gap-7-6).
-            let s = rt.block_on(get(&signer.rpc, &format!("/seance/{seance}")))?;
-            let seat = s["jurors"].as_array().into_iter().flatten().find(|j| j["juror"]["address"] == account.as_str()).ok_or_else(|| anyhow!("{account} isn't on the jury of Séance #{seance}"))?;
-            let claims: Vec<Value> = s["claims"].as_array().cloned().unwrap_or_default();
-            let claim = |id: u64| -> Result<(u64, String, u64)> {
-                let c = claims.iter().find(|c| c["id"] == id).ok_or_else(|| anyhow!("Séance #{seance} doesn't list claim #{id}"))?;
-                Ok((id, c["repo"].as_str().unwrap_or_default().to_string(), c["pr"].as_u64().unwrap_or_default()))
-            };
-            let pairs = seat["assigned_pairs"].as_array().into_iter().flatten().map(|p| Ok([claim(p[0].as_u64().unwrap_or_default())?, claim(p[1].as_u64().unwrap_or_default())?])).collect::<Result<Vec<_>>>()?;
-            if votes.len() != pairs.len() {
-                bail!("you have {} assigned pairs: pass one of a, b or = for each (`blockula contrib seance {seance}` lists them)", pairs.len());
-            }
-            let refs: Vec<[(u64, &str, u64); 2]> = pairs.iter().map(|[a, b]| [(a.0, a.1.as_str(), a.2), (b.0, b.1.as_str(), b.2)]).collect();
-            let pairs_digest = seance_pairs_digest(seance, &account, &refs);
             let path = sealed_path(dir, &chain_id, seance, &account);
             std::fs::create_dir_all(path.parent().unwrap())?;
             // Replace the saved vote only once the new commitment is on-chain, so a failed
@@ -845,6 +906,16 @@ mod tests {
         let v = serde_json::json!({ "bonded": "47", "delegations": [{ "validator": { "address": "boo1v", "name": "v.boo" }, "shares": "40", "value": "40", "self_bond": false }, { "validator": { "address": "boo1w", "name": null }, "shares": "7", "value": "7", "self_bond": true }], "entries": [] });
         assert_eq!(delegations(&v), vec![("boo1v".to_string(), 40), ("boo1w".to_string(), 7)]);
         assert!(delegations(&serde_json::json!({})).is_empty());
+    }
+
+    /// Audit gap-7-1: `--from` by name is the node's word; on mainnet it's refused, by address it's fine.
+    #[test]
+    fn from_by_name_needs_the_address_on_mainnet() {
+        let a = crate::crypto::Keys::from_seed([5; 32]).address();
+        assert_eq!(from_on_chain("alice.boo", &a, "blockula-testnet-2", "http://n").unwrap(), a);
+        assert_eq!(from_on_chain(&a, &a, crate::chain::MAINNET_CHAIN_ID, "http://n").unwrap(), a);
+        let err = from_on_chain("alice.boo", &a, crate::chain::MAINNET_CHAIN_ID, "http://n").unwrap_err().to_string();
+        assert!(err.contains(&format!("pass --from {a}")) && err.contains("Nothing was signed"), "{err}");
     }
 
     #[test]

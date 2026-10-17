@@ -2,12 +2,12 @@
 //! `blockula multisig …` (M-of-N accounts). Talks to any node's HTTP API and signs with the CLI
 //! wallet or a key file, like `blockula hunt` and `blockula contrib`.
 
-use crate::contrib_cli::{Rpc, Signer};
+use crate::contrib_cli::{confirm, Rpc, Signer};
 use crate::crypto::{self, Keys};
 use crate::governance::build_distribution;
 use crate::types::*;
 use crate::validator_cli::{get, load_seed, own_address, parse_fang, rt, wallet_keys};
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -62,6 +62,136 @@ fn name_of(v: &Value) -> String {
     v["name"].as_str().or(v["short"].as_str()).unwrap_or_default().to_string()
 }
 
+// ------------------------------------------------------- what an approval or vote binds, in words
+//
+// Audit gap-7-6: a vote binds `proposal_digest(kind, title, url)`, an approval `action_digest`, a
+// sealed judgment `seance_pairs_digest`. The node's own `summary` text is covered by none of them,
+// so the CLI describes what it decoded itself (and prints the digest), and treats the summary as
+// the node's note at most. The SDK's `describeKind` / `describeAction` say the same things.
+
+/// Drops as FANG with every digit, in groups of three: "10,000,000 FANG", "0.5 FANG".
+pub(crate) fn fang_text(drops: u64) -> String {
+    let whole = (drops / DROPS_PER_FANG).to_string();
+    let mut g = String::new();
+    for (i, c) in whole.chars().enumerate() {
+        if i > 0 && (whole.len() - i).is_multiple_of(3) {
+            g.push(',');
+        }
+        g.push(c);
+    }
+    match drops % DROPS_PER_FANG {
+        0 => format!("{g} FANG"),
+        f => format!("{g}.{} FANG", format!("{f:09}").trim_end_matches('0')),
+    }
+}
+
+/// An account field: an address in full (check it), or a `.boo` name the chain resolves when it runs.
+fn account(v: &str) -> String {
+    if crypto::is_address(v) {
+        return v.to_string();
+    }
+    match normalize_name(v) {
+        Ok(n) => format!("{n}{NAME_SUFFIX} (a name, not an address: the chain resolves it to whoever owns it when this runs)"),
+        Err(_) => format!("{:?} (not an account)", one_line(v, 80)),
+    }
+}
+
+/// A stranger's text on one line, without control or format characters, at most `max` characters.
+fn one_line(v: &str, max: usize) -> String {
+    let t: String = v.chars().map(|c| if c.is_control() || matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}') { ' ' } else { c }).collect();
+    let t = t.split_whitespace().collect::<Vec<_>>().join(" ");
+    if t.chars().count() > max {
+        format!("{}…", t.chars().take(max).collect::<String>())
+    } else {
+        t
+    }
+}
+
+fn quoted(label: &str, v: &str) -> String {
+    if v.trim().is_empty() {
+        String::new()
+    } else {
+        // No curly quotes of its own, so the text can't close the quote early.
+        format!(" ({label}, as written: “{}”)", one_line(v, 200).replace(['“', '”'], "\""))
+    }
+}
+
+/// What a proposal kind does, in plain English, from the kind itself (exact: decoded as the chain
+/// stores it). This, not the node's summary, is what `blockula gov` shows a voter.
+pub(crate) fn describe_kind(kind: &ProposalKind) -> String {
+    match kind {
+        ProposalKind::ParamChange { key, value } => format!("Set the chain parameter {} to {value} (in that parameter's own units: drops, blocks, basis points…)", one_line(key, 64)),
+        ProposalKind::TreasurySpend { to, amount } => format!("Pay {} from the treasury to {}", fang_text(*amount), account(to)),
+        ProposalKind::Distribution { distribution_id, merkle_root, total, claim_until } => format!("Distribute {} from the community account as distribution #{distribution_id}, to the accounts in the Merkle tree with root {} (check it against the published tree), claimable until block #{claim_until}", fang_text(*total), one_line(merkle_root, 64)),
+        ProposalKind::SetRepo { repo, weight: 0 } => format!("Remove the repo {} from the contribution pool", one_line(repo, 140)),
+        ProposalKind::SetRepo { repo, weight } => format!("Put the repo {} in the contribution pool with weight {weight}", one_line(repo, 140)),
+        ProposalKind::GrantSoul { to, amount, reason } => format!("Grant {} Soul to {}{}", crate::poc::fmt_soul(*amount), account(to), quoted("reason", reason)),
+        ProposalKind::FlagSybil { account: a, reason } => format!("Flag {} as a sybil (its voucher is slashed, its unvested rewards clawed back){}", account(a), quoted("reason", reason)),
+        ProposalKind::UnflagSybil { account: a, reason } => format!("Lift the sybil flag on {} (nothing the flag took comes back){}", account(a), quoted("reason", reason)),
+        ProposalKind::RejectClaim { claim_id, reason } => format!("Reject contribution claim #{claim_id}{}", quoted("reason", reason)),
+        ProposalKind::Clawback { account: a, reason } => format!("Claw back the unvested contribution rewards of {}{}", account(a), quoted("reason", reason)),
+        ProposalKind::UnlinkGithub { handle } => format!("Unlink the GitHub handle @{} and hold it for the proposer to link for one voting period", one_line(handle, 39)),
+        ProposalKind::RefundHunt { hunt_id } => format!("Refund every funder of hunt #{hunt_id} what they put in"),
+        ProposalKind::ScheduleUpgrade { version, activation_height } => format!("Switch the chain to protocol version {version} at block #{activation_height} (nodes that can't run it stop there)"),
+        ProposalKind::CancelUpgrade { version, activation_height } => format!("Cancel the scheduled upgrade to protocol version {version} at block #{activation_height}, and any upgrade scheduled after it"),
+        ProposalKind::ActivateFeature { feature } => format!("Turn on the feature {}", one_line(feature, 64)),
+        ProposalKind::DeactivateFeature { feature } => format!("Turn off the feature {}", one_line(feature, 64)),
+        ProposalKind::Text {} => "Nothing on chain: a text proposal (a signal; read its title and link)".into(),
+    }
+}
+
+/// What an action does (a multisig's pending action), in plain English, from the decoded action.
+/// The CLI prints the action's exact JSON under it.
+pub(crate) fn describe_action(a: &Action) -> String {
+    let key = |k: &str| format!("{}…{}", &k[..k.len().min(12)], &k[k.len().saturating_sub(8)..]);
+    match a {
+        Action::Transfer { to, amount } => format!("Send {} to {}", fang_text(*amount), account(to)),
+        Action::RegisterName { name } => format!("Register the name {}", one_line(name, 40)),
+        Action::AddKey { key_id, label, role: KeyRole::Owner, .. } => format!("Add key {} to the account as an owner key (full control of the account){}", key(key_id), quoted("label", label)),
+        Action::AddKey { key_id, label, role: KeyRole::Session { limit, period_blocks, expires_at }, .. } => format!("Add key {} to the account as a session key that may send up to {} (fees included) every {period_blocks} blocks, until block #{expires_at}, and nothing else{}", key(key_id), fang_text(*limit), quoted("label", label)),
+        Action::RemoveKey { key_id } => format!("Remove key {} from the account", key(key_id)),
+        Action::RegisterValidator { bond, .. } => format!("Register a validator, bonding {} from the account", fang_text(*bond)),
+        Action::CreateHunt { repo, issue, amount, expires_at, title } => format!("Escrow {} as a bounty on {}#{issue}, until block #{expires_at}{}", fang_text(*amount), one_line(repo, 140), quoted("title", title)),
+        Action::FundHunt { hunt_id, amount } => format!("Add {} to hunt #{hunt_id}", fang_text(*amount)),
+        Action::AwardHunt { hunt_id, to, pr, .. } => format!("Pay hunt #{hunt_id}'s bounty to {} for PR #{pr}", account(to)),
+        Action::GrantSoul { to, amount, reason } => format!("Grant {} Soul to {} (admin chains only){}", crate::poc::fmt_soul(*amount), account(to), quoted("reason", reason)),
+        Action::Vouch { account: a } => format!("Stake 10 FANG vouching for {}", account(a)),
+        Action::Unvouch { account: a } => format!("Withdraw the vouch for {}", account(a)),
+        Action::JoinJury { bond } => format!("Join the Séance juror pool, bonding {}", fang_text(*bond)),
+        Action::FundPool { amount } => format!("Add {} to the contribution pool", fang_text(*amount)),
+        Action::Delegate { validator, amount } => format!("Stake {} with validator {}", fang_text(*amount), account(validator)),
+        Action::Undelegate { validator, shares } => format!("Start unbonding {shares} pool shares from validator {}", account(validator)),
+        Action::Redelegate { from_validator, to_validator, shares } => format!("Move {shares} pool shares from validator {} to validator {}", account(from_validator), account(to_validator)),
+        Action::WithdrawUnbonded {} => "Withdraw the stake that has finished unbonding".into(),
+        Action::UpdateValidator { commission_bps, p2p_addr, .. } => format!("Set the account's validator commission to {commission_bps} basis points{}", if p2p_addr.is_empty() { "" } else { " and change its addresses" }),
+        Action::Propose { kind, deposit, title, .. } => format!("Propose, bonding {}: {}{}", fang_text(*deposit), describe_kind(kind), quoted("title", title)),
+        Action::Vote { proposal_id, aye, amount, conviction, .. } => format!("Vote {} on proposal #{proposal_id} with {} at conviction {conviction}", if *aye { "aye" } else { "nay" }, fang_text(*amount)),
+        Action::Unlock {} => "Release the account's expired vote locks".into(),
+        Action::MultisigCreate { owners, threshold } => format!("Make the account a {threshold}-of-{} multisig of the owner keys {}", owners.len(), owners.iter().map(|k| key(k)).collect::<Vec<_>>().join(", ")),
+        Action::RenewName { name, years } => format!("Renew the name {} for {years} year(s)", one_line(name, 40)),
+        Action::TransferName { name, to } => format!("Offer the name {} to {} (theirs once they accept it; offered to the account itself, it accepts or withdraws an offer)", one_line(name, 40), account(to)),
+        Action::ReleaseName { name } => format!("Release the name {}: anyone can register it afterwards", one_line(name, 40)),
+        Action::ClaimDistribution { distribution_id, amount, .. } => format!("Claim {} from community distribution #{distribution_id}", fang_text(*amount)),
+        Action::Shield { amount, .. } => format!("Move {} into the Ghost Mode pool", fang_text(*amount)),
+        Action::Unshield { to, amount, .. } => format!("Pay {} out of the Ghost Mode pool to {}", fang_text(*amount), account(to)),
+        other => {
+            let t = serde_json::to_value(other).ok().and_then(|v| v["type"].as_str().map(String::from)).unwrap_or_default();
+            format!("A `{t}` action: read its exact fields below")
+        }
+    }
+}
+
+/// With `--digest`, checks the content read now against what the user was shown (its digest):
+/// a mismatch refuses before anything is signed. `Ok(true)`: it matched; `Ok(false)`: no digest
+/// was given (the caller then shows the content and asks).
+pub(crate) fn check_digest(shown: Option<&str>, now: &str, what: &str) -> Result<bool> {
+    let Some(shown) = shown else { return Ok(false) };
+    let shown = shown.trim().to_ascii_lowercase();
+    ensure!(shown.len() == 64 && shown.bytes().all(|b| b.is_ascii_hexdigit()), "--digest must be the full 64-hex digest that was printed with {what}");
+    ensure!(shown == now, "{what} doesn't read the way it did when you were shown it: its digest is now {now}, not {shown}. Nothing was signed. The node may be showing different content to different reads: look at it again, ideally through another node, before signing.");
+    Ok(true)
+}
+
 // ------------------------------------------------------------------------------- governance
 
 #[derive(Subcommand)]
@@ -96,6 +226,13 @@ pub enum GovCmd {
         amount: String,
         #[arg(long, default_value = "1")]
         conviction: u8,
+        /// The proposal's digest as `gov show` / `gov list` printed it: the vote binds exactly
+        /// that content, and is refused if the proposal reads differently now (audit gap-7-6)
+        #[arg(long)]
+        digest: Option<String>,
+        /// Without --digest, don't ask for confirmation after printing what the vote binds
+        #[arg(long)]
+        yes: bool,
         #[command(flatten)]
         signer: Signer,
     },
@@ -297,16 +434,50 @@ fn read_tree(path: &Path) -> Result<Value> {
     Ok(v)
 }
 
-fn print_proposal(p: &Value) {
-    println!("#{} [{}] {}", p["id"], text(&p["status"]), text(&p["title"]));
-    println!("   {} · by {} · deposit {}", text(&p["summary"]), name_of(&p["proposer"]), text(&p["deposit_display"]));
+/// A proposal's kind as the node serves it, decoded exactly, and the digest a vote on it binds.
+fn bound_proposal(p: &Value) -> Result<(ProposalKind, String, String, String)> {
+    let kind: ProposalKind = serde_json::from_value(p["kind"].clone()).context("the node's proposal kind doesn't parse")?;
+    let (title, url) = (text(&p["title"]).to_string(), text(&p["url"]).to_string());
+    let digest = proposal_digest(&kind, &title, &url);
+    Ok((kind, title, url, digest))
+}
+
+/// What `gov list` (and, with `detail`, `gov show`) prints for a proposal. What it does is the
+/// CLI's own description of the decoded kind, with the digest a vote binds; the node's summary
+/// is shown only with `detail`, labelled as the node's text (audit gap-7-6).
+pub(crate) fn proposal_lines(p: &Value, detail: bool) -> Vec<String> {
+    let mut out = vec![format!("#{} [{}] {}", p["id"], text(&p["status"]), one_line(text(&p["title"]), 120))];
+    match bound_proposal(p) {
+        Ok((kind, _, url, digest)) => {
+            out.push(format!("   does: {}", describe_kind(&kind)));
+            if detail {
+                out.push(format!("   kind: {}", serde_json::to_string(&kind).unwrap_or_default()));
+                if !url.is_empty() {
+                    out.push(format!("   link: {}", one_line(&url, 200)));
+                }
+            }
+            out.push(format!("   digest: {digest} (blockula gov vote {} … --digest {digest})", p["id"]));
+        }
+        Err(e) => out.push(format!("   does: this CLI can't decode it ({e:#}): don't vote on it")),
+    }
+    out.push(format!("   by {} · deposit {}", name_of(&p["proposer"]), text(&p["deposit_display"])));
     let weight = |side: &str| text(&p[side]["weight"]["display"]).to_string();
     let end = match text(&p["status"]) {
         "voting" => format!("voting ends at block {}", p["voting_end"]),
         "queued" => format!("runs at block {}", p["execute_at"]),
         _ => text(&p["outcome"]).to_string(),
     };
-    println!("   ayes {} · nays {} (weight) · {} voters · {end}", weight("ayes"), weight("nays"), p["voters"]);
+    out.push(format!("   ayes {} · nays {} (weight) · {} voters · {end}", weight("ayes"), weight("nays"), p["voters"]));
+    if detail && !text(&p["summary"]).is_empty() {
+        out.push(format!("   the node's own note (its text, not bound by any vote): {}", one_line(text(&p["summary"]), 300)));
+    }
+    out
+}
+
+fn print_proposal(p: &Value, detail: bool) {
+    for l in proposal_lines(p, detail) {
+        println!("{l}");
+    }
 }
 
 pub fn gov(cmd: GovCmd, dir: &Path) -> Result<()> {
@@ -320,16 +491,13 @@ pub fn gov(cmd: GovCmd, dir: &Path) -> Result<()> {
                 println!("   bootstrap council: ⅔ of the validators can pass proposals until block {}", p["bootstrap_end_height"]);
             }
             for p in v["proposals"].as_array().cloned().unwrap_or_default() {
-                print_proposal(&p);
+                print_proposal(&p, false);
             }
             Ok(())
         }
         GovCmd::Show { id, rpc } => {
             let p = rt()?.block_on(get(&rpc.rpc, &format!("/proposal/{id}")))?;
-            print_proposal(&p);
-            if !text(&p["url"]).is_empty() {
-                println!("   {}", text(&p["url"]));
-            }
+            print_proposal(&p, true);
             if let Some(t) = p["tally"].as_object() {
                 println!("   quorum {} of {} unlocked: {} · council {}/{} aye, {} nay", text(&t["quorum"]["display"]), text(&t["unlocked_supply"]["display"]), if t["quorum_reached"] == true { "reached" } else { "not reached" }, t["council_ayes"], t["council_size"], t["council_nays"]);
             }
@@ -340,22 +508,27 @@ pub fn gov(cmd: GovCmd, dir: &Path) -> Result<()> {
             Ok(())
         }
         GovCmd::Propose { kind } => propose(dir, kind),
-        GovCmd::Vote { id, side, amount, conviction, signer } => {
+        GovCmd::Vote { id, side, amount, conviction, digest, yes, signer } => {
             let aye = match side.as_str() {
                 "aye" | "yes" | "y" => true,
                 "nay" | "no" | "n" => false,
                 _ => bail!("vote aye or nay"),
             };
             let amount = parse_fang(&amount)?;
-            // The vote binds the proposal shown here (its kind, title and link), decoded from the
-            // node's answer rather than its summary: a node that misreports it makes the vote
-            // fail, not land on something else (audit gap-7-6).
+            // The vote binds the proposal's kind, title and link, decoded from this read (never the
+            // node's summary). That read is the node's word too, so it must be what the user was
+            // shown: the digest `gov show` printed (--digest), or the content printed here and
+            // confirmed (audit gap-7-6, review-r2-clients-3).
             let p = rt()?.block_on(get(&signer.rpc, &format!("/proposal/{id}")))?;
-            let kind: ProposalKind = serde_json::from_value(p["kind"].clone()).context("the node's proposal kind doesn't parse")?;
-            let (title, url) = (text(&p["title"]).to_string(), text(&p["url"]).to_string());
-            println!("Voting {} with {} at conviction {conviction} on proposal #{id}: “{title}”{}", if aye { "aye" } else { "nay" }, fmt_fang(amount), if url.is_empty() { String::new() } else { format!(" ({url})") });
-            println!("   it does: {}", serde_json::to_string(&kind)?);
-            let proposal_digest = proposal_digest(&kind, &title, &url);
+            let (kind, title, url, proposal_digest) = bound_proposal(&p)?;
+            println!("Proposal #{id}: “{}”{}", one_line(&title, 120), if url.is_empty() { String::new() } else { format!(" ({})", one_line(&url, 200)) });
+            println!("   does: {}", describe_kind(&kind));
+            println!("   kind: {}", serde_json::to_string(&kind)?);
+            println!("   digest: {proposal_digest}");
+            let side = if aye { "aye" } else { "nay" };
+            if !check_digest(digest.as_deref(), &proposal_digest, &format!("proposal #{id}"))? {
+                confirm(&format!("Vote {side} on exactly this, locking {} at conviction {conviction}?", fmt_fang(amount)), yes)?;
+            }
             submit(dir, &signer, Action::Vote { proposal_id: id, aye, amount, conviction, proposal_digest }).map(|_| ())
         }
         GovCmd::Unlock { signer } => submit(dir, &signer, Action::Unlock {}).map(|_| ()),
@@ -504,6 +677,13 @@ pub enum MultisigCmd {
     /// Approve an open proposal; the approval that reaches the threshold runs it
     Approve {
         id: u64,
+        /// The action's digest as `multisig show` printed it: the approval binds exactly that
+        /// action, and is refused if it reads differently now (audit gap-7-6)
+        #[arg(long)]
+        digest: Option<String>,
+        /// Without --digest, don't ask for confirmation after printing what the approval binds
+        #[arg(long)]
+        yes: bool,
         #[command(flatten)]
         signer: Signer,
     },
@@ -522,35 +702,63 @@ pub fn multisig(cmd: MultisigCmd, dir: &Path) -> Result<()> {
             let action: Action = serde_json::from_str(&action).context("the action must be tx action JSON, e.g. {\"type\":\"transfer\",\"to\":\"bob.boo\",\"amount\":\"5000000000\"}")?;
             submit(dir, &signer, Action::MultisigPropose { action: Box::new(action) }).map(|_| ())
         }
-        MultisigCmd::Approve { id, signer } => {
-            // The approval binds the stored action, printed decoded (not the node's summary of
-            // it): a node that misreports it makes the approval fail (audit gap-7-6).
+        MultisigCmd::Approve { id, digest, yes, signer } => {
+            // The approval binds the stored action, decoded from this read (not the node's
+            // summary of it). That read is the node's word too, so it must be what the user was
+            // shown: the digest `multisig show` printed (--digest), or the action printed here and
+            // confirmed (audit gap-7-6, review-r2-clients-3).
             let keys = keys_of(&signer, dir)?;
             let rt = rt()?;
             let account = rt.block_on(acting_for(&signer, &keys))?;
             let m = rt.block_on(get(&signer.rpc, &format!("/multisig/{account}")))?;
             let p = m["pending"].as_array().into_iter().flatten().find(|p| p["id"] == id).ok_or_else(|| anyhow!("{account} has no open multisig action #{id}"))?;
             let action: Action = serde_json::from_value(p["action"].clone()).context("the node's multisig action doesn't parse")?;
-            println!("Approving multisig action #{id} of {account}, which does exactly this:\n{}", serde_json::to_string_pretty(&action)?);
+            let d = action_digest(&action);
+            println!("Multisig action #{id} of {account}:\n   does: {}\n   action: {}\n   digest: {d}", describe_action(&action), serde_json::to_string_pretty(&action)?);
+            if !check_digest(digest.as_deref(), &d, &format!("multisig action #{id}"))? {
+                confirm("Approve exactly this? If it reaches the threshold, this approval runs it.", yes)?;
+            }
             drop(rt);
-            submit(dir, &signer, Action::MultisigApprove { id, action_digest: action_digest(&action) }).map(|_| ())
+            submit(dir, &signer, Action::MultisigApprove { id, action_digest: d }).map(|_| ())
         }
         MultisigCmd::Show { account, rpc } => {
             let m = rt()?.block_on(get(&rpc.rpc, &format!("/multisig/{account}")))?;
-            let owners = m["owners"].as_array().cloned().unwrap_or_default();
-            println!("{} is a {}-of-{} multisig", name_of(&m["account"]), m["threshold"], owners.len());
-            for o in &owners {
-                println!("   owner {} {}", text(&o["key_id"]), text(&o["label"]));
-            }
-            for p in m["pending"].as_array().cloned().unwrap_or_default() {
-                let expired = if p["expired"] == true { " (expired)" } else { "" };
-                println!("   #{} {} · {}/{} approvals · expires at block {}{expired}", p["id"], text(&p["summary"]), p["valid_approvals"], m["threshold"], p["expires_at"]);
-                // What an approval signs is the action itself: show it, not just the node's summary.
-                println!("      action: {}", serde_json::to_string(&p["action"])?);
+            for l in multisig_lines(&m, &account) {
+                println!("{l}");
             }
             Ok(())
         }
     }
+}
+
+/// What `multisig show` prints: each pending action described from its decoded content, its exact
+/// JSON and the digest an approval binds (`multisig approve --digest`); the node's summary only as
+/// its labelled note (audit gap-7-6).
+pub(crate) fn multisig_lines(m: &Value, account: &str) -> Vec<String> {
+    let owners = m["owners"].as_array().cloned().unwrap_or_default();
+    // `approve --from` takes the address (a name there is refused on mainnet).
+    let account = m["account"]["address"].as_str().filter(|a| crypto::is_address(a)).unwrap_or(account);
+    let mut out = vec![format!("{} is a {}-of-{} multisig", name_of(&m["account"]), m["threshold"], owners.len())];
+    for o in &owners {
+        out.push(format!("   owner {} {}", text(&o["key_id"]), one_line(text(&o["label"]), 64)));
+    }
+    for p in m["pending"].as_array().cloned().unwrap_or_default() {
+        let expired = if p["expired"] == true { " (expired)" } else { "" };
+        out.push(format!("   #{} · {}/{} approvals · expires at block {}{expired}", p["id"], p["valid_approvals"], m["threshold"], p["expires_at"]));
+        match serde_json::from_value::<Action>(p["action"].clone()) {
+            Ok(a) => {
+                let d = action_digest(&a);
+                out.push(format!("      does: {}", describe_action(&a)));
+                out.push(format!("      action: {}", serde_json::to_string(&a).unwrap_or_default()));
+                out.push(format!("      digest: {d} (blockula multisig approve {} --from {} --digest {d})", p["id"], one_line(account, 70)));
+            }
+            Err(e) => out.push(format!("      this CLI can't decode its action ({e}): don't approve it")),
+        }
+        if !text(&p["summary"]).is_empty() {
+            out.push(format!("      the node's own note (its text, not bound by any approval): {}", one_line(text(&p["summary"]), 300)));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -589,5 +797,52 @@ mod tests {
         assert!(matches!(ms.cmd, MultisigCmd::Create { owners, threshold: 2, .. } if owners == ["aa", "bb"]));
         assert_eq!((parse_soul("2.5").unwrap(), parse_soul("10").unwrap()), (2_500, 10_000));
         assert!(parse_soul("1.2345").is_err());
+        assert!(matches!(gov(&format!("vote 3 aye 1 --digest {} --yes", "ab".repeat(32))).unwrap(), GovCmd::Vote { digest: Some(_), yes: true, .. }));
+        let ms = Ms::try_parse_from(["multisig", "approve", "7", "--digest", "cd"]).unwrap();
+        assert!(matches!(ms.cmd, MultisigCmd::Approve { id: 7, digest: Some(d), yes: false, .. } if d == "cd"));
+    }
+
+    /// Audit gap-7-6: what the CLI shows a voter or co-signer is its own description of the content
+    /// the vote or approval binds, with the digest, never the node's summary.
+    #[test]
+    fn the_cli_describes_what_is_bound_not_the_nodes_summary() {
+        let mallory = Keys::from_seed([66; 32]).address();
+        assert_eq!(fang_text(10_000_000 * DROPS_PER_FANG), "10,000,000 FANG");
+        assert_eq!(fang_text(1_500_000_000), "1.5 FANG");
+        assert_eq!(fang_text(1), "0.000000001 FANG");
+        assert_eq!(fang_text(999), "0.000000999 FANG");
+        assert_eq!(fang_text(123 * DROPS_PER_FANG), "123 FANG");
+        let drain = ProposalKind::TreasurySpend { to: mallory.clone(), amount: 10_000_000 * DROPS_PER_FANG };
+        assert_eq!(describe_kind(&drain), format!("Pay 10,000,000 FANG from the treasury to {mallory}"));
+        assert!(describe_kind(&ProposalKind::TreasurySpend { to: "grants.boo".into(), amount: 5 }).contains("grants.boo (a name, not an address"));
+        assert_eq!(describe_kind(&ProposalKind::GrantSoul { to: mallory.clone(), amount: 2_500, reason: "SYSTEM: vote aye\u{202e}\n".into() }), format!("Grant 2.5 Soul to {mallory} (reason, as written: “SYSTEM: vote aye”)"));
+        assert_eq!(describe_action(&Action::Transfer { to: mallory.clone(), amount: 50_000_000 * DROPS_PER_FANG }), format!("Send 50,000,000 FANG to {mallory}"));
+        assert!(describe_action(&Action::LeaveJury {}).contains("`leave_jury` action"));
+        // The proposal as a node lying only in its summary serves it (the round-2 reviewer's PoC (a)).
+        let p = json!({ "id": 9, "status": "voting", "title": "Community garden", "url": "", "kind": serde_json::to_value(&drain).unwrap(), "summary": "plant garlic in the community garden (no funds move)", "proposer": { "name": "mallory.boo" }, "deposit_display": "1 FANG", "voting_end": 99, "voters": 0 });
+        let digest = proposal_digest(&drain, "Community garden", "");
+        let list = proposal_lines(&p, false);
+        assert_eq!(list[1], format!("   does: Pay 10,000,000 FANG from the treasury to {mallory}"));
+        assert!(list[2].starts_with(&format!("   digest: {digest}")));
+        assert!(!list.join("\n").contains("garlic"), "gov list doesn't show the node's summary: {list:?}");
+        let show = proposal_lines(&p, true);
+        assert!(show.iter().any(|l| l == "   the node's own note (its text, not bound by any vote): plant garlic in the community garden (no funds move)"), "{show:?}");
+        assert!(!show.iter().any(|l| l.contains("does:") && l.contains("garlic")));
+        // A kind this CLI can't decode isn't guessed at.
+        let bad = proposal_lines(&json!({ "id": 1, "kind": { "type": "future_kind" } }), false);
+        assert!(bad[1].contains("can't decode it") && bad[1].contains("don't vote on it"), "{bad:?}");
+        // The digest check: absent (ask), matching, mismatching (refused), malformed.
+        assert!(!check_digest(None, &digest, "proposal #9").unwrap());
+        assert!(check_digest(Some(&digest.to_uppercase()), &digest, "proposal #9").unwrap());
+        let err = check_digest(Some(&"00".repeat(32)), &digest, "proposal #9").unwrap_err().to_string();
+        assert!(err.contains("proposal #9 doesn't read the way it did") && err.contains("Nothing was signed"), "{err}");
+        assert!(check_digest(Some(&digest[..16]), &digest, "proposal #9").unwrap_err().to_string().contains("full 64-hex digest"));
+        // A pending multisig action: described, its exact JSON, its digest; the summary as a note.
+        let action = Action::Transfer { to: mallory.clone(), amount: 50_000_000 * DROPS_PER_FANG };
+        let m = json!({ "account": { "name": "foundation.boo" }, "threshold": 2, "owners": [{ "key_id": "ab", "label": "a" }, { "key_id": "cd", "label": "b" }], "pending": [{ "id": 7, "action": serde_json::to_value(&action).unwrap(), "summary": "pay the monthly grants", "valid_approvals": 1, "expires_at": 500 }] });
+        let lines = multisig_lines(&m, "foundation.boo");
+        assert!(lines.contains(&format!("      does: Send 50,000,000 FANG to {mallory}")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with(&format!("      digest: {} (blockula multisig approve 7 --from foundation.boo --digest", action_digest(&action)))));
+        assert!(lines.iter().any(|l| l == "      the node's own note (its text, not bound by any approval): pay the monthly grants"));
     }
 }

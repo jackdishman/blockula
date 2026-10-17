@@ -1,7 +1,8 @@
 // The Governance page: proposals with tallies and council votes, voting with conviction (signed
 // by the passkey wallet, checked by the mock node), on-chain text rendered as text, and a node
 // without governance.
-import { parseFang, type Tx } from "@blockula/sdk";
+import { parseFang, proposalDigest, type ProposalKind, type Tx } from "@blockula/sdk";
+import { addressOf } from "./mock-node";
 import { createWallet, cspViolations, expect, test, watchCsp } from "./helpers";
 
 const FANG = 10n ** 9n;
@@ -33,7 +34,7 @@ test("lists proposals and votes with conviction", async ({ page, node }) => {
       outcome: "",
     },
     // On-chain strings are attacker-controlled: they must render as text, and only https links work.
-    { id: 6, title: '<img src=x onerror="window.__pwned=1">', url: "javascript:window.__pwned=2", kind: { type: "text" }, summary: "<b>bold</b>", proposer: label("boo1proposer"), deposit: "0", status: "rejected", created_at: 1, voting_end: 2, execute_at: null, supermajority: false, ayes: { amount: big(0n), weight: big(0n) }, nays: { amount: big(5n), weight: big(5n) }, voters: 1, council: [], tally: { unlocked_supply: big(1000n), quorum: big(40n), quorum_reached: false, supermajority: false, council_size: 22, council_ayes: 0, council_nays: 0 }, outcome: "quorum not reached" },
+    { id: 6, title: '<img src=x onerror="window.__pwned=1">', url: "javascript:window.__pwned=2", kind: { type: "grant_soul", to: addressOf("5e".repeat(32)), amount: 1000, reason: "<b>bold</b>" }, summary: "<b>bold</b>", proposer: label("boo1proposer"), deposit: "0", status: "rejected", created_at: 1, voting_end: 2, execute_at: null, supermajority: false, ayes: { amount: big(0n), weight: big(0n) }, nays: { amount: big(5n), weight: big(5n) }, voters: 1, council: [], tally: { unlocked_supply: big(1000n), quorum: big(40n), quorum_reached: false, supermajority: false, council_size: 22, council_ayes: 0, council_nays: 0 }, outcome: "quorum not reached" },
   ];
   await watchCsp(page);
   await createWallet(page);
@@ -41,6 +42,8 @@ test("lists proposals and votes with conviction", async ({ page, node }) => {
   await expect(page.getByRole("heading", { name: "Governance" })).toBeVisible();
 
   const open = page.getByTestId("proposal").filter({ hasText: "Raise the active set to 40" });
+  // What it does is rendered from the kind the vote binds, not the node's summary.
+  await expect(open.getByTestId("proposal-does")).toHaveText("Set the chain parameter max_validators to 40 (in that parameter's own units: drops, blocks, basis points…)");
   await expect(open).toContainText("300 FANG aye · 100 FANG nay");
   await expect(open).toContainText("400 FANG voted");
   await expect(open).toContainText("council: 15 validators approve, 1 reject");
@@ -50,7 +53,7 @@ test("lists proposals and votes with conviction", async ({ page, node }) => {
   // The hostile proposal is plain text, with no link and no script run.
   const hostile = page.getByTestId("proposal").filter({ hasText: "onerror" });
   await expect(hostile).toContainText('<img src=x onerror="window.__pwned=1">');
-  await expect(hostile).toContainText("<b>bold</b>");
+  await expect(hostile.getByTestId("proposal-does")).toContainText("(reason, as written: “<b>bold</b>”)");
   await expect(hostile.getByRole("link", { name: "Full text ↗" })).toHaveCount(0);
   await expect(hostile.getByTestId("vote-form")).toHaveCount(0);
   expect(await page.evaluate(() => (window as unknown as { __pwned?: number }).__pwned)).toBeUndefined();
@@ -91,4 +94,36 @@ test("explains when the network has no governance yet", async ({ page, node }) =
 test("the testnet footer says it's for test chains", async ({ page }) => {
   await page.goto("/welcome");
   await expect(page.getByTestId("imprint-note")).toHaveText("Not audited. For test chains only.");
+});
+
+// Round 3 (gap-7-6, the R1 reviewer's PoC): a node that keeps a proposal's kind, title and link true
+// and lies only in its summary. The card used to show the summary while the vote signed the drain.
+test("a proposal card says what the vote binds, whatever the node's summary says", async ({ page, node }) => {
+  const mallory = addressOf("66".repeat(32));
+  const zero = { amount: { drops: "0", display: "0 FANG" }, weight: { drops: "0", display: "0 FANG" } };
+  const base = { url: "", proposer: { address: mallory, name: null }, deposit: "1000000000000", status: "voting", created_at: node.height - 1, voting_end: node.height + 5000, execute_at: null, supermajority: true, ayes: zero, nays: zero, voters: 0, council: [], tally: null, outcome: "" };
+  const drain: ProposalKind = { type: "treasury_spend", to: mallory, amount: (10_000_000n * 10n ** 9n).toString() };
+  node.proposals = [
+    { ...base, id: 8, title: "Community garden", kind: drain, summary: "plant garlic in the community garden (no funds move)" },
+    // review-r2-clients-1: a number JSON can't carry exactly. Not described as a guess, and no vote.
+    { ...base, id: 9, title: "Big id", kind: { type: "distribution", distribution_id: 2 ** 60, merkle_root: "ab".repeat(32), total: "5", claim_until: 50 }, summary: "distribute 5 drops" },
+  ];
+  await createWallet(page);
+  await page.getByRole("link", { name: "Governance", exact: true }).click();
+  const garden = page.getByTestId("proposal").filter({ hasText: "Community garden" });
+  await expect(garden.getByTestId("proposal-does")).toHaveText(`Pay 10,000,000 FANG from the treasury to ${mallory}`);
+  await expect(garden).not.toContainText("garlic");
+  const digest = proposalDigest(drain, "Community garden", "");
+  await expect(garden.getByTestId("proposal-digest")).toHaveText(`vote binds ${digest.slice(0, 16)}…`);
+  await garden.getByRole("button", { name: "Nay" }).click();
+  await garden.getByLabel("Amount to vote with").fill("1");
+  await garden.getByRole("button", { name: /^Vote nay with 1 FANG/ }).click();
+  await expect(page.getByRole("status")).toContainText("voted nay on proposal #8");
+  const tx = node.submitted.at(-1) as Tx;
+  expect(tx.action.type === "vote" && tx.action.proposal_digest).toBe(digest);
+
+  const big = page.getByTestId("proposal").filter({ hasText: "Big id" });
+  await expect(big.getByTestId("proposal-does")).toContainText("distribution #a number too large for this client to read exactly");
+  await expect(big.getByTestId("cannot-vote")).toBeVisible();
+  await expect(big.getByTestId("vote-form")).toHaveCount(0);
 });

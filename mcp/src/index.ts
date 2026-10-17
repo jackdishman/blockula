@@ -10,8 +10,9 @@
 //   BLOCKULA_CHAIN_ID / BLOCKULA_GENESIS_HASH   pin the chain the node must be on
 //   BLOCKULA_WITNESSES  other nodes of the same chain (comma-separated URLs): .boo names that get
 //                       signed (send, stake, unstake, use_account) are proven against them. Without
-//                       them a name is the node's word, and on mainnet a send to a name needs the
-//                       address confirmed first.
+//                       them a send signs the name itself (the chain resolves it when it runs), and
+//                       where an address is needed (stake, unstake, use_account) a name is the
+//                       node's word: on mainnet the address must be confirmed first.
 //   BLOCKULA_HOME       where the agent wallet lives (default ~/.blockula)
 //   BLOCKULA_MAX_SEND   max FANG one call moves (sent, staked, escrowed, paid for a name, bonded; default 100)
 //   BLOCKULA_MAX_DAILY  max FANG leaving the account per UTC day through this MCP, fees included
@@ -27,7 +28,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { ApiError, Client, RequestTimeoutError, TxFailedError, TxPendingError, Wallet, bareName, checkTimeoutMs, encodeKeyGrant, proposalDigest, formatFang, paramsOf, parseFang, proposalSummary, sharesFor, stakeSummary, txId, type Action, type ProposalSummary, type Resolution } from "@blockula/sdk";
+import { ApiError, Client, RequestTimeoutError, TxFailedError, TxPendingError, Wallet, bareName, checkTimeoutMs, describeKind, encodeKeyGrant, proposalDigest, formatFang, paramsOf, parseFang, proposalSummary, sharesFor, stakeSummary, txId, type Action, type ProposalKind, type ProposalSummary, type Recipient, type Resolution } from "@blockula/sdk";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -250,10 +251,12 @@ async function namePrices(client: Client, name: string): Promise<{ price: bigint
 }
 
 /**
- * A name or address resolved for a signature (audit gap-7-1). With BLOCKULA_WITNESSES a name is
- * proven against them (`Client.resolution`). Without, it's the node's word: on mainnet that's
- * not enough to sign real money to, so the tool answers with the address for the user to
- * confirm instead (the agent then passes the address); elsewhere it signs and says it's unproven.
+ * A name or address resolved for a field that needs an address (staking's validator, the account
+ * use_account acts for; audit gap-7-1). With BLOCKULA_WITNESSES a name is proven against them
+ * (`Client.resolution`). Without, it's the node's word: on mainnet that's not enough to sign real
+ * money to, so the tool answers with the address for the user to confirm instead (the agent then
+ * passes the address); elsewhere it signs and says it's unproven. Payments don't come here: they
+ * sign the name (`Client.recipient`), which the chain resolves itself.
  */
 async function resolved(client: Client, input: string, role: string): Promise<{ res: Resolution; confirm?: undefined } | { res?: undefined; confirm: Record<string, unknown> }> {
   const res = await client.resolution(input);
@@ -274,6 +277,10 @@ async function resolved(client: Client, input: string, role: string): Promise<{ 
 
 /** What a tool reports about a resolved name: the exact address signed and how it was found. */
 const resolvedView = (res: Resolution, role: string) => (res.name === null ? {} : { [`${role}_address`]: res.address, name_resolution: res.proven ? clean(res.how, 300) : `UNPROVEN: ${clean(res.how, 300)}` });
+
+/** What a tool reports about a recipient the chain resolves: what was signed (a proven address, or the name itself) and how. */
+const recipientView = (r: Recipient, role: string) =>
+  r.name === null ? {} : r.byChain ? { [`${role}_signed_as`]: r.signed, [`${role}_owner_now_unproven`]: r.address, name_resolution: clean(r.how, 400) } : { [`${role}_address`]: r.address, name_resolution: clean(r.how, 300) };
 
 /** A tx tool's answer: the tx's summary and links, or the in-flight notice. */
 const txResult = (r: any, extra: Record<string, unknown> = {}) =>
@@ -457,7 +464,10 @@ tool("use_account", "Act for a user's account (name or address) that has authori
   if (account === "self") {
     delete f.account;
   } else {
-    const res = await client.resolution(account);
+    // The account is an address every later tx names: on mainnet an unproven name waits for the
+    // user to confirm the address (audit gap-7-1).
+    const { res, confirm } = await resolved(client, account, "account");
+    if (confirm) return confirm;
     const addr = res.address;
     // The account's own key list, not /api/key's list of accounts (which others can pad: audit gap-7-2).
     const a = await client.account(addr);
@@ -515,17 +525,17 @@ tool("faucet", "Get 100 test FANG on a dev/test chain (to this agent's wallet, o
   return { summary: clean(String(tx.summary ?? "")), tx_id: tx.id, explorer: explorer(`tx/${tx.id}`) };
 });
 
-tool("send", "Send FANG to a .boo name or address. Amounts are in FANG, e.g. \"1.5\". Counts toward BLOCKULA_MAX_SEND / BLOCKULA_MAX_DAILY (with the fee, and what opening a new account burns). If it comes back \"pending\", it was submitted: check tx_status, never send it again.", { to: z.string(), amount: z.string(), memo: z.string().max(256).optional() }, async ({ to, amount, memo }) => {
+tool("send", "Send FANG to a .boo name or address. Amounts are in FANG, e.g. \"1.5\". A name is signed as the name (the chain pays whoever owns it when the tx runs) unless BLOCKULA_WITNESSES proved its owner. Counts toward BLOCKULA_MAX_SEND / BLOCKULA_MAX_DAILY (with the fee, and what opening a new account burns). If it comes back \"pending\", it was submitted: check tx_status, never send it again.", { to: z.string(), amount: z.string(), memo: z.string().max(256).optional() }, async ({ to, amount, memo }) => {
   const drops = parseFang(amount);
   if (drops <= 0n) throw new Error("send more than 0");
   const w = await requireWallet();
   await w.client.addressPrefix();
-  // Sign the resolved address, not the name: what was checked is exactly who gets paid.
-  const { res, confirm } = await resolved(w.client, to, "recipient");
-  if (confirm) return confirm;
-  const opening = await openingFee(w.client, res.address);
-  const r = await submitCapped(w, { type: "transfer", to: res.address, amount: drops.toString() }, { amount: drops, extra: opening }, memo ?? "");
-  return isInFlight(r) ? { ...r, ...resolvedView(res, "recipient") } : txResult(r, resolvedView(res, "recipient"));
+  // With witnesses a name's proven owner is signed; without, the name itself, which the chain
+  // resolves when the tx runs: a lying node can make it fail, not pay someone else (audit gap-7-1).
+  const rc = await w.client.recipient(to);
+  const opening = await openingFee(w.client, rc.address);
+  const r = await submitCapped(w, { type: "transfer", to: rc.signed, amount: drops.toString() }, { amount: drops, extra: opening }, memo ?? "");
+  return isInFlight(r) ? { ...r, ...recipientView(rc, "recipient") } : txResult(r, recipientView(rc, "recipient"));
 });
 
 tool("check_name", "Check whether a .boo name is available and what it costs, or who owns it and when it expires.", { name: z.string() }, async ({ name }) => chainData(await (await chain()).name(name)));
@@ -628,10 +638,18 @@ tool("my_stake", "The stake of the account this agent acts for: each pool (valid
 
 // ---- governance ----
 
+/**
+ * A proposal as the agent sees it. `does` is rendered here from the proposal's kind, the content a
+ * vote binds (with its title and link): the node's own summary isn't covered by any digest, so a
+ * node could make it say anything (audit gap-7-6), and it isn't relayed. `proposal_digest` is what
+ * `vote` needs back: it refuses a proposal that reads differently by then.
+ */
 const proposalView = (p: ProposalSummary) => ({
   id: p.id,
   untrusted_title: clean(p.title, 120),
-  does: clean(p.summary, 400),
+  does: clean(describeKind(p.kind, { freeText: false }), 600),
+  kind: chainData(p.kind),
+  ...(p.digest ? { proposal_digest: p.digest } : { proposal_digest: null, cannot_vote: clean(`${p.digest_error ?? "unknown content"}: vote with the blockula CLI, which reads it exactly`, 300) }),
   status: clean(p.status, 40),
   proposer: clean(p.proposer_name ?? p.proposer ?? "", 100),
   aye_weight: formatFang(BigInt(p.aye)),
@@ -647,23 +665,32 @@ const proposalView = (p: ProposalSummary) => ({
   explorer: explorer(`proposal/${p.id}`),
 });
 
-tool("list_proposals", `On-chain governance proposals (parameter changes, treasury spends, upgrades, distributions …): what each does, its status, token-weighted tallies, the bootstrap validator council's votes, and when voting ends and the timelock lets it execute. Titles, links and the reasons quoted in \`does\` are written by proposers. ${UNTRUSTED_NOTE}`, { status: z.string().optional().describe("e.g. \"voting\"; default: all, newest first"), limit: z.number().int().min(1).max(50).default(20) }, async ({ status, limit }) => {
+tool("list_proposals", `On-chain governance proposals (parameter changes, treasury spends, upgrades, distributions …): what each does (\`does\`, rendered by this MCP from the proposal's \`kind\`, the content a vote binds: show it to the user with the title), its \`proposal_digest\` (pass it to vote), its status, token-weighted tallies, the bootstrap validator council's votes, and when voting ends and the timelock lets it execute. Titles, links and reasons are written by proposers. ${UNTRUSTED_NOTE}`, { status: z.string().optional().describe("e.g. \"voting\"; default: all, newest first"), limit: z.number().int().min(1).max(50).default(20) }, async ({ status, limit }) => {
   const res = await moduleRead("governance proposals", (await chain()).proposals({ status, limit }));
   const list = (Array.isArray(res.proposals) ? res.proposals : []) as unknown[];
   return { proposals: list.slice(0, limit).map((p) => proposalView(proposalSummary(p, res.params))), note: UNTRUSTED_NOTE };
 });
 
-tool("vote", "Vote on a governance proposal for the account this agent acts for. `amount` FANG of its unlocked holdings is locked: conviction 0 locks nothing and counts 0.1×; 1–6 lock for 1, 2, 4, 8, 16 or 32 lock periods (a week each on mainnet) after voting ends and count 1×–6×. Voting again replaces the vote. Session keys can't vote. Ask the user before locking their FANG.", { proposal_id: z.number().int().min(0), vote: z.enum(["aye", "nay"]), amount: z.string().describe("FANG to lock"), conviction: z.number().int().min(0).max(6).default(1) }, async ({ proposal_id, vote, amount, conviction }) => {
+tool("vote", "Vote on a governance proposal for the account this agent acts for. Pass the proposal_digest list_proposals returned with what you showed the user: the vote binds exactly that content, and is refused (nothing signed) if the proposal reads differently now. `amount` FANG of its unlocked holdings is locked: conviction 0 locks nothing and counts 0.1×; 1–6 lock for 1, 2, 4, 8, 16 or 32 lock periods (a week each on mainnet) after voting ends and count 1×–6×. Voting again replaces the vote. Session keys can't vote. Ask the user before locking their FANG.", { proposal_id: z.number().int().min(0), proposal_digest: z.string().regex(/^[0-9a-f]{64}$/).describe("list_proposals' proposal_digest for this proposal: what the user was shown"), vote: z.enum(["aye", "nay"]), amount: z.string().describe("FANG to lock"), conviction: z.number().int().min(0).max(6).default(1) }, async ({ proposal_id, proposal_digest: shown, vote, amount, conviction }) => {
   const drops = parseFang(amount);
   if (drops <= 0n) throw new Error("vote with more than 0");
   // The amount is locked, not spent: it's held to BLOCKULA_MAX_SEND, and only the fee counts toward the daily limit.
   const w = await requireWallet();
-  // The vote binds the proposal as read here (its kind, title and link, what list_proposals
-  // showed): a node that misreports it makes the vote fail, not land elsewhere (audit gap-7-6).
+  // The vote binds the content list_proposals showed (its digest, passed back here), not a fresh
+  // read: a node that showed one thing and answers another now is refused before anything is
+  // signed, and on chain the digest must match the stored proposal (audit gap-7-6).
   const p = await w.client.proposal(proposal_id);
   if (!p?.kind || typeof p.kind !== "object") throw new Error(`the node doesn't report what proposal #${proposal_id} does, so the vote can't be bound to it`);
-  const proposal_digest = proposalDigest(p.kind, String(p.title ?? ""), typeof p.url === "string" ? p.url : "");
-  const voted_on = { untrusted_title: clean(String(p.title ?? ""), 200), kind: chainData(p.kind) };
+  let proposal_digest: string;
+  try {
+    proposal_digest = proposalDigest(p.kind as ProposalKind, String(p.title ?? ""), typeof p.url === "string" ? p.url : "");
+  } catch (e) {
+    throw new Error(`proposal #${proposal_id} holds content this MCP can't read exactly (${clean(String((e as Error).message), 200)}), so it can't bind a vote to it: vote with the blockula CLI`);
+  }
+  if (proposal_digest !== shown) {
+    throw new Error(`proposal #${proposal_id} doesn't read the way it did when it was shown (its digest is now ${proposal_digest}, not ${shown}): nothing was signed. The node may be showing different content to different reads. Call list_proposals again and show the user what it does now before voting.`);
+  }
+  const voted_on = { untrusted_title: clean(String(p.title ?? ""), 200), does: clean(describeKind(p.kind, { freeText: false }), 600), kind: chainData(p.kind), proposal_digest };
   const r = await submitCapped(w, { type: "vote", proposal_id, aye: vote === "aye", amount: drops.toString(), conviction, proposal_digest }, { amount: 0n, perCall: drops, what: "the vote's amount" });
   return isInFlight(r) ? { ...r, voted_on } : { summary: clean(String(r.summary ?? "")), fee: r.fee_display, tx_id: r.id, voted_on, explorer: explorer(`proposal/${proposal_id}`) };
 });

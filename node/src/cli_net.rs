@@ -749,6 +749,233 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// Audit gap-7-6 / review-r2-clients-3 through the CLI, against a real node behind lying ones
+    /// (the round-2 reviewer's PoCs):
+    /// (a) a node that keeps a proposal's kind, title and link true and lies only in its summary
+    ///     ("plant garlic" on a 10,000,000 FANG treasury spend): `gov list`/`gov show` describe the
+    ///     decoded kind, the summary is at most a labelled note;
+    /// (b) a two-faced node, lying on the display read and truthful on the signing read: `gov vote
+    ///     --digest` and `multisig approve --digest` with what was shown are refused before
+    ///     anything is signed, without --digest they print the content and won't sign unconfirmed,
+    ///     and with the true digest they go through.
+    #[test]
+    fn the_cli_signs_only_what_it_showed() {
+        use crate::contrib_cli::{Rpc, Signer};
+        use crate::gov_cli::{gov, multisig, multisig_lines, proposal_lines, GovCmd, KindCmd, Meta, MultisigCmd};
+        use crate::types::{action_digest, proposal_digest, Action, KeyRole, ProposalKind};
+        use crate::validator_cli::{wallet, WalletCmd};
+        use std::io::IsTerminal;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let root = std::env::temp_dir().join(format!("blockula-clibind-{}-{}", crate::chain::now_ms(), std::process::id()));
+        let mut opts = crate::chain::SummonOpts::new("clibind", 1);
+        opts.params.insert("proposal_deposit".into(), DROPS);
+        opts.params.insert("governance_spend_height".into(), 0);
+        let homes = crate::chain::Chain::summon(&root, &opts).unwrap();
+        let chain = Arc::new(parking_lot::Mutex::new(crate::chain::Chain::open(&homes[0]).unwrap()));
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let honest = rt.block_on(async {
+            let node = crate::api::Node::new(chain.clone(), None, vec![], Default::default());
+            let app = crate::api::router(node).into_make_service_with_connect_info::<std::net::SocketAddr>();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            url
+        });
+        let producer = chain.clone();
+        rt.spawn(async move {
+            loop {
+                producer.lock().produce_block().ok();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        });
+        let dir = root.join("cli");
+        wallet(WalletCmd::New { rpc: None, prefix: None }, &dir).unwrap();
+        wallet(WalletCmd::Faucet { rpc: honest.clone() }, &dir).unwrap();
+        let me_keys = crate::validator_cli::wallet_keys(&dir).unwrap();
+        let me = me_keys.address();
+        for _ in 0..100 {
+            if chain.lock().state.account(&me).balance > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let mallory = Keys::from_seed([66; 32]).address();
+        let signer = |rpc: &str| Signer { key: None, from: None, rpc: rpc.into(), pin: ChainPin::default() };
+        // The real proposal: 10,000,000 FANG from the treasury to Mallory, titled "Community garden".
+        let meta = Meta { title: "Community garden".into(), url: String::new(), deposit: Some("1".into()), max_deposit: "1000".into(), signer: signer(&honest) };
+        gov(GovCmd::Propose { kind: KindCmd::Spend { to: mallory.clone(), amount: "10000000".into(), meta } }, &dir).unwrap();
+        let id = rt.block_on(get(&honest, "/proposals")).unwrap()["proposals"][0]["id"].as_u64().unwrap();
+        let drain = ProposalKind::TreasurySpend { to: mallory.clone(), amount: 10_000_000 * DROPS };
+        let truth = proposal_digest(&drain, "Community garden", "");
+
+        // (a) The summary-only lie.
+        let garlic = "plant garlic in the community garden (no funds move)";
+        let (liar1, _) = rt.block_on(liar(honest.clone(), move |path, mut v| {
+            if path == "/api/proposals" {
+                for p in v["proposals"].as_array_mut().into_iter().flatten() {
+                    p["summary"] = garlic.into();
+                }
+            } else if path.starts_with("/api/proposal/") {
+                v["summary"] = garlic.into();
+            }
+            v
+        }));
+        for p in [rt.block_on(get(&liar1, "/proposals")).unwrap()["proposals"][0].clone(), rt.block_on(get(&liar1, &format!("/proposal/{id}"))).unwrap()] {
+            assert_eq!(p["summary"], garlic, "the node lies");
+            let lines = proposal_lines(&p, false);
+            assert!(lines.contains(&format!("   does: Pay 10,000,000 FANG from the treasury to {mallory}")), "{lines:?}");
+            assert!(lines.iter().any(|l| l.starts_with(&format!("   digest: {truth}"))), "{lines:?}");
+            assert!(!lines.join("\n").contains("garlic"), "gov list shows what the vote binds, not the summary: {lines:?}");
+            assert!(proposal_lines(&p, true).iter().filter(|l| l.contains("garlic")).all(|l| l.starts_with("   the node's own note (its text, not bound by any vote)")));
+        }
+        gov(GovCmd::Show { id, rpc: Rpc { rpc: liar1.clone() } }, &dir).unwrap();
+        gov(GovCmd::List { status: None, rpc: Rpc { rpc: liar1 } }, &dir).unwrap();
+
+        // (b) Two-faced: the list (what `gov list` shows) says it's a harmless text proposal; the
+        // single read `gov vote` makes tells the truth.
+        let (two, posted) = rt.block_on(liar(honest.clone(), |path, mut v| {
+            if path == "/api/proposals" {
+                for p in v["proposals"].as_array_mut().into_iter().flatten() {
+                    p["kind"] = serde_json::json!({ "type": "text" });
+                }
+            }
+            v
+        }));
+        let shown = rt.block_on(get(&two, "/proposals")).unwrap()["proposals"][0].clone();
+        let shown_lines = proposal_lines(&shown, false);
+        assert!(shown_lines[1].contains("a text proposal"), "{shown_lines:?}");
+        let lie = proposal_digest(&ProposalKind::Text {}, "Community garden", "");
+        assert!(shown_lines.iter().any(|l| l.starts_with(&format!("   digest: {lie}"))));
+        let vote = |side: &str, digest: Option<String>| gov(GovCmd::Vote { id, side: side.into(), amount: "1".into(), conviction: 6, digest, yes: false, signer: signer(&two) }, &dir);
+        let err = vote("aye", Some(lie)).unwrap_err().to_string();
+        assert!(err.contains(&format!("proposal #{id} doesn't read the way it did when you were shown it")) && err.contains("Nothing was signed"), "{err}");
+        if !std::io::stdin().is_terminal() {
+            let err = vote("aye", None).unwrap_err().to_string();
+            assert!(err.contains("Vote aye on exactly this") && err.contains("pass --yes"), "without --digest it asks first: {err}");
+        }
+        assert!(posted.lock().is_empty(), "nothing signed for content the voter wasn't shown");
+        // With the digest of what they saw (here the truth, shown by `gov show`), it's signed.
+        vote("nay", Some(truth.clone())).unwrap();
+        assert_eq!(posted.lock().len(), 1);
+        assert_eq!(posted.lock()[0]["action"]["proposal_digest"], truth.as_str());
+
+        // (b) for a 2-of-2 multisig: the wallet's own key and K2, which proposes a 50,000,000-drop
+        // (50 FANG) transfer to Mallory, standing in for "the foundation drain".
+        let k2 = Keys::from_seed([77; 32]);
+        let k2_file = root.join("k2.key");
+        std::fs::write(&k2_file, hex::encode([77u8; 32])).unwrap();
+        rt.block_on(async {
+            let remote = Remote::connect_in(&dir, &honest, &ChainPin::default()).await.unwrap();
+            let add = crate::types::add_key(&k2, &remote.chain_id, &remote.genesis_hash, &me, "k2", KeyRole::Owner);
+            crate::validator_cli::send_memo(&remote, &me_keys, &me, add, String::new()).await.unwrap();
+        });
+        let owners = vec![crate::types::key_id(&me_keys.public_key()), crate::types::key_id(&k2.public_key())];
+        multisig(MultisigCmd::Create { owners, threshold: 2, signer: signer(&honest) }, &dir).unwrap();
+        let drain_action = Action::Transfer { to: mallory.clone(), amount: 50 * DROPS };
+        let by_k2 = Signer { key: Some(k2_file), from: Some(me.clone()), rpc: honest.clone(), pin: ChainPin::default() };
+        multisig(MultisigCmd::Propose { action: serde_json::to_string(&drain_action).unwrap(), signer: by_k2 }, &dir).unwrap();
+        let ms = rt.block_on(get(&honest, &format!("/multisig/{me}"))).unwrap();
+        let ms_id = ms["pending"][0]["id"].as_u64().unwrap();
+        assert_eq!(serde_json::from_value::<Action>(ms["pending"][0]["action"].clone()).unwrap(), drain_action);
+        // The co-signer's node: the first read of the multisig (what `multisig show` displays)
+        // shows a routine 5 FANG grant, every later one the truth.
+        let routine = Action::Transfer { to: "grants.boo".into(), amount: 5 * DROPS };
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (r, shown_action) = (reads.clone(), serde_json::to_value(&routine).unwrap());
+        let (two_ms, posted_ms) = rt.block_on(liar(honest.clone(), move |path, mut v| {
+            if path.starts_with("/api/multisig/") && r.fetch_add(1, Ordering::SeqCst) == 0 {
+                v["pending"][0]["action"] = shown_action.clone();
+                v["pending"][0]["summary"] = "pay the monthly grants".into();
+            }
+            v
+        }));
+        let display = multisig_lines(&rt.block_on(get(&two_ms, &format!("/multisig/{me}"))).unwrap(), &me);
+        assert!(display.iter().any(|l| l.contains("does: Send 5 FANG to grants.boo")), "{display:?}");
+        let shown_digest = action_digest(&routine);
+        assert!(display.iter().any(|l| l.starts_with(&format!("      digest: {shown_digest}"))));
+        let approve = |digest: Option<String>| multisig(MultisigCmd::Approve { id: ms_id, digest, yes: false, signer: signer(&two_ms) }, &dir);
+        let err = approve(Some(shown_digest)).unwrap_err().to_string();
+        assert!(err.contains(&format!("multisig action #{ms_id} doesn't read the way it did")), "{err}");
+        if !std::io::stdin().is_terminal() {
+            let err = approve(None).unwrap_err().to_string();
+            assert!(err.contains("Approve exactly this?") && err.contains("pass --yes"), "{err}");
+        }
+        assert!(posted_ms.lock().is_empty(), "no approval signed");
+        assert_eq!(chain.lock().state.account(&mallory).balance, 0, "the drain didn't run");
+        // Approving what it really is (its digest from an honest `multisig show`) runs it.
+        approve(Some(action_digest(&drain_action))).unwrap();
+        assert_eq!(chain.lock().state.account(&mallory).balance, 50 * DROPS);
+        drop(rt);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The Séance flavour of review-r2-clients-3: `contrib seance` shows the pairs (and their
+    /// digest) from one read, `contrib vote` binds another. A node that flips the pairs between
+    /// them is refused when the juror passes the digest they were shown, and without it the
+    /// juror sees the pairs the vote binds before anything is signed.
+    #[test]
+    fn contrib_vote_binds_the_pairs_the_juror_was_shown() {
+        use crate::contrib_cli::{contrib, pairs_digest, pair_lines, seat_pairs, ContribCmd, Signer};
+        use crate::validator_cli::{wallet, WalletCmd};
+        use std::io::IsTerminal;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let dir = std::env::temp_dir().join(format!("blockula-cliseance-{}-{}", crate::chain::now_ms(), std::process::id()));
+        wallet(WalletCmd::New { rpc: None, prefix: None }, &dir).unwrap();
+        let me = crate::validator_cli::wallet_keys(&dir).unwrap().address();
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let posts = Arc::new(AtomicUsize::new(0));
+        let seance = |flipped: bool, me: &str| {
+            let pair = if flipped { json!([[2, 1]]) } else { json!([[1, 2]]) };
+            json!({ "id": 7, "phase": "commit", "claims": [{ "id": 1, "repo": "a/b", "pr": 10 }, { "id": 2, "repo": "c/d", "pr": 20 }], "jurors": [{ "juror": { "address": me }, "assigned_pairs": pair, "pairs": 1 }] })
+        };
+        let url = rt.block_on(async {
+            use axum::{routing::get, Json, Router};
+            let (r, p, m) = (reads.clone(), posts.clone(), me.clone());
+            let app = Router::new()
+                .route("/api/status", get(|| async { Json(json!({ "chain_id": "seance-test", "genesis_hash": "11".repeat(32), "address_prefix": "boo", "height": 5 })) }))
+                // The first read (the display) shows [(1, 2)]; every later one (the vote's) [(2, 1)].
+                .route("/api/seance/7", get(move || {
+                    let flipped = r.fetch_add(1, Ordering::SeqCst) > 0;
+                    let v = seance(flipped, &m);
+                    async move { Json(v) }
+                }))
+                .fallback(move |req: axum::extract::Request| {
+                    if req.method() == axum::http::Method::POST {
+                        p.fetch_add(1, Ordering::SeqCst);
+                    }
+                    async { (axum::http::StatusCode::NOT_FOUND, Json(json!({ "error": "fake node: no such route" }))) }
+                });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            url
+        });
+        let shown_view = rt.block_on(get(&url, "/seance/7")).unwrap();
+        let shown = seat_pairs(&shown_view, 7, &me).unwrap();
+        assert_eq!(pair_lines(&shown), vec!["   1. a = claim #1 a/b#10 (https://github.com/a/b/pull/10)\n      b = claim #2 c/d#20 (https://github.com/c/d/pull/20)".to_string()]);
+        let shown_digest = pairs_digest(7, &me, &shown);
+        let signer = Signer { key: None, from: None, rpc: url.clone(), pin: ChainPin::default() };
+        // The juror prefers claim #1 ("a" in what they were shown).
+        let vote = |digest: Option<String>| contrib(ContribCmd::Vote { seance: 7, votes: "a".into(), spam: vec![], digest, yes: false, signer: signer.clone() }, &dir);
+        let err = vote(Some(shown_digest)).unwrap_err().to_string();
+        assert!(err.contains("Séance #7's pairs for you doesn't read the way it did") && err.contains("Nothing was signed"), "{err}");
+        if !std::io::stdin().is_terminal() {
+            let err = vote(None).unwrap_err().to_string();
+            assert!(err.contains("Seal this judgment on exactly these pairs?") && err.contains("pass --yes"), "{err}");
+        }
+        // With the digest of the pairs it would really bind, the check passes (the fake node then
+        // can't serve the rest of a signing round, which is all that fails).
+        let now = pairs_digest(7, &me, &seat_pairs(&seance(true, &me), 7, &me).unwrap());
+        let err = vote(Some(now)).unwrap_err().to_string();
+        assert!(!err.contains("doesn't read the way"), "{err}");
+        assert_eq!(posts.load(Ordering::SeqCst), 0, "no judgment was sealed on flipped pairs");
+        drop(rt);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     fn hunt_again(h: &crate::contrib_cli::HuntCmd) -> crate::contrib_cli::HuntCmd {
         match h {
             crate::contrib_cli::HuntCmd::Create { repo, issue, amount, title, days, signer } => crate::contrib_cli::HuntCmd::Create { repo: repo.clone(), issue: *issue, amount: amount.clone(), title: title.clone(), days: *days, signer: signer.clone() },

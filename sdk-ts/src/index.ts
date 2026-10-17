@@ -4,16 +4,20 @@ import { bytesToHex, hexToBytes, randomBytes, utf8ToBytes } from "@noble/hashes/
 import { base64urlnopad, bech32m } from "@scure/base";
 import { DEFAULT_TIP_CAP_MULTIPLE, KEY_POP_CONTEXT, PUBLIC_KEY_LEN, SIGNATURE_LEN, actionDigest, baseFee, formatFang, keyPopMessage, maxTip, parseFang, parseSoul, proposalDigest, seanceCommitment, seancePairsDigest, signingBytes, type SeanceClaimRef, type Action, type BaseFee, type KeyRole, type ProposalKind, type Tx, type UnsignedTx } from "./tx.js";
 import { NAMESPACES, checkProofResponse, decodeAccount, decodeName, type ProofResponse, type ProvenRecord } from "./proof.js";
+import { describeKind } from "./describe.js";
 
 export * from "./tx.js";
 export * from "./proof.js";
 export * from "./distribution.js";
 export * from "./release.js";
+export * from "./describe.js";
 
 export const DEFAULT_RPC = "http://localhost:7070";
 /** Address prefixes: `boo` on mainnet (and dev chains), `tboo` on public testnets. */
 export const KNOWN_PREFIXES = ["boo", "tboo"] as const;
 export const DEFAULT_PREFIX = "boo";
+/** Mainnet's chain id (node/src/chain.rs `MAINNET_CHAIN_ID`). */
+export const MAINNET_CHAIN_ID = "blockula-1";
 /** How long a transaction stays valid by default: 600 blocks (10 minutes at 1 s blocks). */
 export const DEFAULT_VALID_FOR_BLOCKS = 600;
 
@@ -286,9 +290,20 @@ export interface ProposalSummary {
   id: number;
   title: string;
   url: string;
-  /** What it does, in plain English (the node's summary). */
+  /**
+   * The node's own summary text. No digest covers it, so a lying node can make it say anything
+   * (audit gap-7-6): show `does` instead, and never present this as what the proposal does.
+   */
   summary: string;
+  /** What it does, rendered here from `kind` (`describeKind`): what a vote on it binds. */
+  does: string;
   kind: ProposalKind | null;
+  /**
+   * `proposalDigest(kind, title, url)`: what a vote binds. `null` when this client can't compute
+   * it exactly (`digest_error` says why, e.g. a number past 2^53): it can't vote on it either.
+   */
+  digest: string | null;
+  digest_error?: string;
   proposer: string | null;
   proposer_name: string | null;
   /** `voting`, `queued`, `rejected`, `executed` or `failed`. */
@@ -319,6 +334,16 @@ export interface ProposalSummary {
   threshold_bps?: number;
 }
 
+/** `proposalDigest` of a proposal's content as the node served it, or why it can't be computed. */
+function digestOf(kind: unknown, title: unknown, url: unknown): { digest: string | null; digest_error?: string } {
+  if (!kind || typeof kind !== "object") return { digest: null, digest_error: "the node didn't say what this proposal does" };
+  try {
+    return { digest: proposalDigest(kind as ProposalKind, String(title ?? ""), typeof url === "string" ? url : "") };
+  } catch (e) {
+    return { digest: null, digest_error: `this client can't read the proposal exactly (${(e as Error).message})` };
+  }
+}
+
 export function proposalSummary(raw: unknown, rules?: { supermajority_bps?: number }): ProposalSummary {
   const p = obj(raw);
   const weight = (side: unknown) => drops(obj(obj(side).weight).drops);
@@ -332,7 +357,9 @@ export function proposalSummary(raw: unknown, rules?: { supermajority_bps?: numb
     title: String(p.title ?? ""),
     url: typeof p.url === "string" ? p.url : "",
     summary: String(p.summary ?? ""),
+    does: describeKind(p.kind),
     kind: p.kind && typeof p.kind === "object" ? (p.kind as ProposalKind) : null,
+    ...digestOf(p.kind, p.title, p.url),
     proposer: p.proposer === undefined ? null : addressOf(p.proposer),
     proposer_name: nameOf(p.proposer),
     status: String(p.status ?? "unknown"),
@@ -434,6 +461,8 @@ export class Wallet {
   validForBlocks = DEFAULT_VALID_FOR_BLOCKS;
   private readonly secretKey: Uint8Array;
   private acting?: string;
+  /** How `actAs` found the account, when that was one node's unproven word (checked when signing on mainnet). */
+  private actingUnproven?: Resolution;
 
   private constructor(readonly seed: Uint8Array, public client: Client = new Client()) {
     const keys = ml_dsa65.keygen(seed);
@@ -453,15 +482,24 @@ export class Wallet {
 
   set account(account: string) {
     this.acting = account;
+    this.actingUnproven = undefined;
   }
 
   get keyId() {
     return keyId(this.publicKey);
   }
 
-  /** Act for another account this key has been authorized on. Accepts a name or address. */
+  /**
+   * Act for another account this key has been authorized on. Accepts a name or address. A name
+   * needs an address here (every tx names the account it acts for), so it's resolved: proven with
+   * the client's witnesses. Without them it's one node's word, and on mainnet nothing is signed
+   * for an account found that way (`UnprovenNameError`): check the address and pass it instead
+   * (audit gap-7-1).
+   */
   async actAs(account: string) {
-    this.acting = await this.client.resolve(account);
+    const r = await this.addressNeeded(await this.client.resolution(account));
+    this.acting = r.address;
+    this.actingUnproven = r.proven ? undefined : r;
     return this;
   }
 
@@ -494,17 +532,20 @@ export class Wallet {
 
   /**
    * This key's consent to being added to `account` (an address, or a name resolved by the
-   * client: proven when it has witnesses) on the client's chain: hand `encodeKeyGrant(grant)` to
-   * the account's owner, who adds the key with it. Pass `chain` to sign offline.
+   * client: proven when it has witnesses; on mainnet an unproven name is refused, pass the address)
+   * on the client's chain: hand `encodeKeyGrant(grant)` to the account's owner, who adds the key
+   * with it. Pass `chain` to sign offline.
    */
   async keyGrant(account: string, chain?: { chainId: string; genesisHash: string }): Promise<KeyGrant> {
-    const address = isAddress(account) ? account : await this.client.resolve(account);
+    const res = isAddress(account) ? null : await this.client.resolution(account);
+    const address = res?.address ?? account;
     let c = chain;
     if (!c) {
       const status = await this.client.status();
       if (typeof status.genesis_hash !== "string") throw new Error(`${this.client.rpc} doesn't report a genesis_hash; it's too old for this SDK`);
       c = { chainId: status.chain_id, genesisHash: status.genesis_hash };
     }
+    if (res && !res.proven && c.chainId === MAINNET_CHAIN_ID) throw new UnprovenNameError(res, this.client.rpc);
     const pop = ml_dsa65.sign(keyPopMessage(c.chainId, c.genesisHash, address, this.keyId), this.secretKey, { context: KEY_POP_CONTEXT });
     return { account: address, key_id: this.keyId, public_key: bytesToHex(this.publicKey), pop: bytesToHex(pop) };
   }
@@ -536,6 +577,15 @@ export class Wallet {
    * (audit gap-7-3).
    */
   async build(action: Action | ((height: number) => Action), memo = "", opts: TxOptions = {}): Promise<Tx> {
+    return this.buildChecked(action, memo, opts, []);
+  }
+
+  /**
+   * `build`, refusing on mainnet a tx that carries an address only one node vouched for: `unproven`
+   * (the helpers' resolutions of names in fields that need an address) or the account `actAs`
+   * found that way (audit gap-7-1). Checked against the very status the tx is signed for.
+   */
+  private async buildChecked(action: Action | ((height: number) => Action), memo: string, opts: TxOptions, unproven: Resolution[]): Promise<Tx> {
     await this.client.addressPrefix(); // so `this.account` uses the chain's prefix
     const [status, account, fees] = await Promise.all([this.client.status(), this.client.account(this.account).catch(() => null), this.client.fees()]);
     if (!Number.isSafeInteger(status.height) || status.height < 0) throw new Error(`${this.client.rpc} doesn't report its height`);
@@ -545,6 +595,8 @@ export class Wallet {
     if (validFor > max) throw new Error(`validForBlocks can be at most ${max} (an hour of blocks)`);
     const tip = opts.tip === undefined ? this.tip : parseFang(opts.tip);
     if (typeof status.genesis_hash !== "string") throw new Error(`${this.client.rpc} doesn't report a genesis_hash; it's too old for this SDK`);
+    const guess = [...unproven, ...(this.actingUnproven ? [this.actingUnproven] : [])].find((r) => !r.proven);
+    if (guess && status.chain_id === MAINNET_CHAIN_ID) throw new UnprovenNameError(guess, this.client.rpc);
     // Binds the tx to this chain instance (not just its id), so it can't replay on a relaunch.
     const act = typeof action === "function" ? action(status.height) : action;
     const unsigned: UnsignedTx = { chain_id: status.chain_id, genesis_hash: status.genesis_hash, from: this.account, nonce: account?.next_nonce ?? 0, fee: "0", tip: tip.toString(), valid_until: status.height + validFor, action: act, memo };
@@ -558,12 +610,16 @@ export class Wallet {
     return this.sign(unsigned);
   }
 
-  /** Send FANG to a `.boo` name or an address. `amount` is in FANG ("1.5") or bigint drops. */
+  /**
+   * Send FANG to a `.boo` name or an address. `amount` is in FANG ("1.5") or bigint drops. A name
+   * is signed as its proven owner's address when the client has witnesses (who you checked is who
+   * gets paid, even if the name changes hands before the tx runs), and as the name itself when it
+   * doesn't: the chain then pays whoever owns it when the tx runs, so a lying node can make the
+   * send fail but not redirect it (audit gap-7-1). See `Client.recipient`.
+   */
   async send(to: string, amount: string | number | bigint, opts: { memo?: string; wait?: boolean } & TxOptions = {}) {
-    // Sign the resolved address, not the name: what you checked is exactly who gets paid,
-    // even if the name changes hands before the block is sealed.
-    const recipient = await this.client.resolve(to);
-    const tx = await this.build({ type: "transfer", to: recipient, amount: parseFang(amount).toString() }, opts.memo, opts);
+    const recipient = await this.client.recipient(to);
+    const tx = await this.build({ type: "transfer", to: recipient.signed, amount: parseFang(amount).toString() }, opts.memo, opts);
     return this.client.submit(tx, opts.wait ?? true);
   }
 
@@ -639,9 +695,9 @@ export class Wallet {
     return this.client.submit(await this.build({ type: "fund_hunt", hunt_id: huntId, amount: parseFang(amount).toString() }));
   }
 
-  /** Pay a hunt's bounty (creator or admin). `to` may be a .boo name; it's resolved and the address is signed. */
+  /** Pay a hunt's bounty (creator or admin). `to` may be a .boo name: signed as `Client.recipient` says (the proven address, or the name for the chain to resolve). */
   async awardHunt(huntId: number, to: string, pr: number, familiarKey?: string) {
-    const addr = await this.client.resolve(to);
+    const addr = (await this.client.recipient(to)).signed;
     return this.client.submit(await this.build({ type: "award_hunt", hunt_id: huntId, to: addr, pr, ...(familiarKey ? { familiar_key: familiarKey } : {}) }));
   }
 
@@ -663,12 +719,12 @@ export class Wallet {
 
   /** Stake 10 FANG on a newcomer being a real, distinct person (needs 10 Soul). */
   async vouch(account: string) {
-    return this.client.submit(await this.build({ type: "vouch", account: await this.client.resolve(account) }));
+    return this.client.submit(await this.build({ type: "vouch", account: (await this.client.recipient(account)).signed }));
   }
 
   /** Withdraw your vouch for `account` (after the lock), or pass your own account to decline one. */
   async unvouch(account: string) {
-    return this.client.submit(await this.build({ type: "unvouch", account: await this.client.resolve(account) }));
+    return this.client.submit(await this.build({ type: "unvouch", account: (await this.client.recipient(account)).signed }));
   }
 
   /** Join (or top up) the Séance juror pool. Needs 5 Soul; owner keys only. */
@@ -718,7 +774,7 @@ export class Wallet {
 
   /** Admins of dev and test chains only (elsewhere: a governance proposal). `soul` in Soul ("2.5"), up to 100 per grant. */
   async grantSoul(to: string, soul: string | number, reason: string) {
-    return this.client.submit(await this.build({ type: "grant_soul", to: await this.client.resolve(to), amount: parseSoul(soul), reason }));
+    return this.client.submit(await this.build({ type: "grant_soul", to: (await this.client.recipient(to)).signed, amount: parseSoul(soul), reason }));
   }
 
   /** Admins of dev and test chains only (elsewhere: a governance proposal). */
@@ -728,12 +784,12 @@ export class Wallet {
 
   /** Admins of dev and test chains only (elsewhere: a governance proposal). */
   async flagSybil(account: string, reason: string) {
-    return this.client.submit(await this.build({ type: "flag_sybil", account: await this.client.resolve(account), reason }));
+    return this.client.submit(await this.build({ type: "flag_sybil", account: (await this.client.recipient(account)).signed, reason }));
   }
 
   /** Admins of dev and test chains only (elsewhere: a governance proposal). */
   async clawback(account: string, reason: string) {
-    return this.client.submit(await this.build({ type: "clawback", account: await this.client.resolve(account), reason }));
+    return this.client.submit(await this.build({ type: "clawback", account: (await this.client.recipient(account)).signed, reason }));
   }
 
   /** Reclaim the bond of a removed validator this account owns. */
@@ -743,19 +799,30 @@ export class Wallet {
 
   // ---- protocol v1 (tags 30–49). Each builds, signs and submits one tx and waits for it. ----
 
-  /** Submits one action (the shared tail of the helpers below). */
-  private async act(action: Action, opts: TxOptions & { wait?: boolean; memo?: string } = {}) {
-    return this.client.submit(await this.build(action, opts.memo ?? "", opts), opts.wait ?? true);
+  /** Submits one action (the shared tail of the helpers below); `unproven`: see `buildChecked`. */
+  private async act(action: Action, opts: TxOptions & { wait?: boolean; memo?: string } = {}, unproven: Resolution[] = []) {
+    return this.client.submit(await this.buildChecked(action, opts.memo ?? "", opts, unproven), opts.wait ?? true);
   }
 
-  /** A validator by address, or by a `.boo` name its account holds. */
+  /**
+   * A validator by address, or by a `.boo` name its account holds. Staking needs the address, so
+   * a name is resolved (proven with the client's witnesses); on mainnet a tx with an unproven one
+   * isn't signed (audit gap-7-1): pass the validator's address.
+   */
   private async validatorAddress(validator: string) {
-    return this.client.resolve(validator);
+    return this.addressNeeded(await this.client.resolution(validator));
+  }
+
+  /** `r`, unless it's an unproven name on mainnet (`UnprovenNameError`); `buildChecked` checks again against the signing status. */
+  private async addressNeeded(r: Resolution): Promise<Resolution> {
+    if (!r.proven && (await this.client.status()).chain_id === MAINNET_CHAIN_ID) throw new UnprovenNameError(r, this.client.rpc);
+    return r;
   }
 
   /** Stake `amount` (FANG, or bigint drops) in a validator's pool. Your stake earns its share of issuance and is slashed with the pool. */
   async delegate(validator: string, amount: Amount, opts: TxOptions = {}) {
-    return this.act({ type: "delegate", validator: await this.validatorAddress(validator), amount: positive(parseFang(amount), "delegate").toString() }, opts);
+    const v = await this.validatorAddress(validator);
+    return this.act({ type: "delegate", validator: v.address, amount: positive(parseFang(amount), "delegate").toString() }, opts, [v]);
   }
 
   /**
@@ -765,14 +832,14 @@ export class Wallet {
    */
   async undelegate(validator: string, shares: bigint | string | "all", opts: TxOptions = {}) {
     const v = await this.validatorAddress(validator);
-    return this.act({ type: "undelegate", validator: v, shares: (await this.sharesOf(v, shares)).toString() }, opts);
+    return this.act({ type: "undelegate", validator: v.address, shares: (await this.sharesOf(v.address, shares)).toString() }, opts, [v]);
   }
 
   /** Move `shares` (or `"all"`) from one pool to another without waiting out the unbonding period. */
   async redelegate(fromValidator: string, toValidator: string, shares: bigint | string | "all", opts: TxOptions = {}) {
     const [from, to] = await Promise.all([this.validatorAddress(fromValidator), this.validatorAddress(toValidator)]);
-    if (from === to) throw new Error("redelegate to a different validator");
-    return this.act({ type: "redelegate", from_validator: from, to_validator: to, shares: (await this.sharesOf(from, shares)).toString() }, opts);
+    if (from.address === to.address) throw new Error("redelegate to a different validator");
+    return this.act({ type: "redelegate", from_validator: from.address, to_validator: to.address, shares: (await this.sharesOf(from.address, shares)).toString() }, opts, [from, to]);
   }
 
   /** Pay out every unbonding entry that has finished unbonding. */
@@ -788,7 +855,8 @@ export class Wallet {
 
   /** Bring a jailed validator back (its owner, after the jail period). */
   async unjail(validator: string, opts: TxOptions = {}) {
-    return this.act({ type: "unjail", validator: await this.validatorAddress(validator) }, opts);
+    const v = await this.validatorAddress(validator);
+    return this.act({ type: "unjail", validator: v.address }, opts, [v]);
   }
 
   /** Low-level (nodes do this automatically): two conflicting signed votes, hex-encoded as the node's evidence reporter emits them. */
@@ -827,7 +895,9 @@ export class Wallet {
   /**
    * Put a proposal to a vote (build `kind` with `proposal.*`). Bonds `deposit` (default: the
    * chain's `proposal_deposit`), refunded once the proposal reaches quorum and burned if it
-   * doesn't. Names in the kind (`to`, `account`) are resolved and the addresses are signed.
+   * doesn't. Names in the kind (`to`, `account`) are signed as `Client.recipient` says: the proven
+   * address with witnesses, else the name, which the chain resolves when the proposal is made
+   * (it stores the address, which voters then see and bind).
    *
    * The default deposit is what the node reports, and a node can report anything, so it's
    * bounded (audit gap-7-5): every witness of the client must report the same value, and it may
@@ -861,15 +931,19 @@ export class Wallet {
    * bootstrap council ends also casts that validator's council vote.
    *
    * The vote binds the proposal's content (audit gap-7-6): pass `proposal`, the kind, title and
-   * link you showed the voter (e.g. the `client.proposal(id)` object you rendered), or it's read
-   * from the client. A node that showed another proposal's content makes the vote fail.
+   * link you showed the voter (e.g. the `client.proposal(id)` object you rendered, described with
+   * `describeKind`), or it's read from the client. A node that showed another proposal's content
+   * makes the vote fail. If you showed it earlier and only kept its digest
+   * (`proposalSummary(raw).digest`), pass `digest`: a proposal that reads differently now is
+   * refused before anything is signed.
    */
-  async vote(proposalId: number, aye: boolean, amount: Amount, conviction = 1, opts: TxOptions & { proposal?: { kind: ProposalKind; title: string; url?: string } } = {}) {
+  async vote(proposalId: number, aye: boolean, amount: Amount, conviction = 1, opts: TxOptions & { proposal?: { kind: ProposalKind; title: string; url?: string }; digest?: string } = {}) {
     if (!Number.isInteger(conviction) || conviction < 0 || conviction > MAX_CONVICTION) throw new Error(`conviction must be 0–${MAX_CONVICTION}`);
     const id = wholeNumber(proposalId, "proposalId");
     const drops = positive(parseFang(amount), "vote").toString();
     const p = opts.proposal ?? (await this.client.proposal(id));
     const proposal_digest = proposalDigest(p.kind, p.title, p.url ?? "");
+    shownDigest(opts.digest, proposal_digest, `proposal #${id}`);
     return this.act({ type: "vote", proposal_id: id, aye, amount: drops, conviction, proposal_digest }, opts);
   }
 
@@ -899,10 +973,12 @@ export class Wallet {
 
   /**
    * Approve open multisig proposal `id`. The approval binds the action (audit gap-7-6): pass
-   * `action`, the one you showed the approver (decode it, don't trust a summary), or it's read
-   * from `client.multisig(account)`. A node that showed another action makes the approval fail.
+   * `action`, the one you showed the approver (decode it and describe it with `describeAction`,
+   * don't trust a summary), or it's read from `client.multisig(account)`. A node that showed
+   * another action makes the approval fail. `digest`: the `actionDigest` of what you showed, if
+   * that's all you kept; an action that reads differently now is refused before anything is signed.
    */
-  async multisigApprove(id: number, opts: TxOptions & { action?: Action } = {}) {
+  async multisigApprove(id: number, opts: TxOptions & { action?: Action; digest?: string } = {}) {
     const n = wholeNumber(id, "id");
     let action = opts.action;
     if (!action) {
@@ -910,7 +986,9 @@ export class Wallet {
       action = (Array.isArray(m?.pending) ? m.pending : []).find((p: { id?: unknown }) => p.id === n)?.action as Action | undefined;
       if (!action) throw new Error(`${this.account} has no open multisig action #${n}`);
     }
-    return this.act({ type: "multisig_approve", id: n, action_digest: actionDigest(action) }, opts);
+    const action_digest = actionDigest(action);
+    shownDigest(opts.digest, action_digest, `multisig action #${n}`);
+    return this.act({ type: "multisig_approve", id: n, action_digest }, opts);
   }
 
   /** Extend a name you own by `years` (1–10), at the chain's renewal price per year. */
@@ -920,12 +998,12 @@ export class Wallet {
   }
 
   /**
-   * Offer a name you own to another account (a `.boo` name or address; the address is signed). It
+   * Offer a name you own to another account (a `.boo` name or address, signed as `Client.recipient` says). It
    * stays yours until they accept it (`acceptName`); offering it again replaces the offer, and
    * `withdrawNameOffer` withdraws it. Nobody can be given a name without saying yes.
    */
   async transferName(name: string, to: string, opts: TxOptions = {}) {
-    return this.act({ type: "transfer_name", name: bareName(name), to: await this.client.resolve(to) }, opts);
+    return this.act({ type: "transfer_name", name: bareName(name), to: (await this.client.recipient(to)).signed }, opts);
   }
 
   /** Accept a name offered to the account you act for (`client.name(n).offered_to`): it becomes yours. */
@@ -967,16 +1045,16 @@ export class Wallet {
     return BigInt(d.shares);
   }
 
-  /** A proposal kind with its names resolved to addresses (what's signed is who's paid or affected). */
+  /** A proposal kind with its accounts as `Client.recipient` signs them (the chain resolves names when the proposal is made). */
   private async resolveKind(kind: ProposalKind): Promise<ProposalKind> {
     switch (kind.type) {
       case "treasury_spend":
       case "grant_soul":
-        return { ...kind, to: await this.client.resolve(kind.to) };
+        return { ...kind, to: (await this.client.recipient(kind.to)).signed };
       case "flag_sybil":
       case "unflag_sybil":
       case "clawback":
-        return { ...kind, account: await this.client.resolve(kind.account) };
+        return { ...kind, account: (await this.client.recipient(kind.account)).signed };
       default:
         return kind;
     }
@@ -991,6 +1069,12 @@ export class Wallet {
     await this.client.addressPrefix();
     return this.client.faucet(this.account, wait);
   }
+}
+
+/** Throws unless `shown` (a digest the caller displayed, if any) is `now`, the digest about to be signed. */
+function shownDigest(shown: string | undefined, now: string, what: string) {
+  if (shown === undefined) return;
+  if (shown.trim().toLowerCase() !== now) throw new Error(`${what} doesn't read the way it did when it was shown: its digest is now ${now}, not ${shown}. Nothing was signed: the node may be showing different content to different reads.`);
 }
 
 /** An error response from a Blockula node. `status` is the HTTP status (429 = rate limited). */
@@ -1053,6 +1137,19 @@ export class StaleProofError extends Error {
   }
 }
 
+/**
+ * On mainnet, a transaction would carry an address that only one node vouched for: a `.boo` name
+ * resolved without witnesses, in a field that needs an address (staking's validator, the account
+ * `actAs` acts for, a key grant's account). Nothing was signed (audit gap-7-1). Check
+ * `resolution.address` with its owner and pass it instead of the name, or give the client witnesses.
+ */
+export class UnprovenNameError extends Error {
+  constructor(readonly resolution: Resolution, rpc: string) {
+    super(`${resolution.name ?? resolution.input}.boo resolves to ${resolution.address} only by ${rpc}'s word (unproven: a node can point a name anywhere), and on mainnet this needs an address: nothing was signed. Check that address with its owner and pass it instead of the name, or give the client witnesses to prove names`);
+    this.name = "UnprovenNameError";
+  }
+}
+
 /** The node reports a different chain than the client is pinned to (`ClientOptions`). */
 export class ChainMismatchError extends Error {
   constructor(readonly rpc: string, readonly field: "chain_id" | "genesis_hash" | "address_prefix", readonly expected: string, readonly reported: string | undefined) {
@@ -1073,10 +1170,15 @@ export interface ClientOptions {
   timeoutMs?: number;
   /**
    * Clients for independent nodes of the same chain. With witnesses, every name this client
-   * resolves for a signature (`resolve`, so `Wallet.send`, `awardHunt`, `vouch`, `transferName`,
-   * `delegate`, proposal targets, `actAs` …) is a proven read (`provenName`): the record's Merkle
-   * proof must check out against a state root each witness reports for that block, and be fresh.
-   * Without them a name is one node's unproven answer (audit gap-7-1).
+   * resolves for a signature is a proven read (`provenName`): the record's Merkle proof must check
+   * out against a state root each witness reports for that block, and be fresh. Without them
+   * (audit gap-7-1):
+   * - where the chain resolves names itself (`Wallet.send`, `awardHunt`, `vouch`/`unvouch`,
+   *   `grantSoul`, `flagSybil`, `clawback`, `transferName`, proposal targets), the name is signed
+   *   as the name (`recipient`), so a lying node can only make the tx fail;
+   * - where an address is needed (`delegate`/`undelegate`/`redelegate`/`unjail`, `actAs`,
+   *   `keyGrant`), a name is one node's unproven answer, and on mainnet nothing is signed with it
+   *   (`UnprovenNameError`): pass the address.
    */
   witnesses?: Client[];
   /** Refuse to resolve a `.boo` name for a signature unless it's proven (needs `witnesses`). */
@@ -1097,6 +1199,20 @@ export interface Resolution {
   how: string;
   /** The block a proven name was read at. */
   height?: number;
+}
+
+/** A recipient in a field the chain resolves itself, as it gets signed (`Client.recipient`). */
+export interface Recipient extends Resolution {
+  /**
+   * What goes into the action: an address as given, a name's proven owner (with witnesses), or
+   * the name itself (`alice.boo`) when nothing proved it.
+   */
+  signed: string;
+  /**
+   * `signed` is the name: the chain resolves it to whoever owns it when the tx runs, so no node
+   * can redirect it. `address` is then just the node's current answer, for display.
+   */
+  byChain: boolean;
 }
 
 /** Default per-request timeout of a `Client`. */
@@ -1354,12 +1470,30 @@ export class Client {
   }
 
   /**
-   * The address a recipient resolves to, for a signature: an address as given, or a `.boo` name's
-   * owner (see `resolution`). With witnesses the name is proven; `requireProvenNames` refuses
-   * anything else.
+   * The address a name or address resolves to, for fields that need an address (see
+   * `resolution`): proven with witnesses, else one node's word. Where the chain resolves names
+   * itself (payments, vouches, name offers…), use `recipient` instead, which signs the name.
    */
   async resolve(nameOrAddress: string): Promise<string> {
     return (await this.resolution(nameOrAddress)).address;
+  }
+
+  /**
+   * How to sign a recipient in a field the chain resolves itself (`transfer.to`, `award_hunt.to`,
+   * `vouch`/`unvouch`/`flag_sybil`/`clawback.account`, `grant_soul.to`, `transfer_name.to`, and
+   * proposal targets): an address as given; with witnesses a name's proven owner; without them
+   * the name itself, which the chain resolves to its owner when the tx runs, so a lying node can
+   * make the tx fail but not send it elsewhere (audit gap-7-1). Show `how` before signing.
+   */
+  async recipient(nameOrAddress: string): Promise<Recipient> {
+    const r = await this.resolution(nameOrAddress);
+    if (r.name === null || r.proven) return { ...r, signed: r.address, byChain: false };
+    return {
+      ...r,
+      signed: `${r.name}.boo`,
+      byChain: true,
+      how: `${r.name}.boo is signed as the name: the chain resolves it to whoever owns it when the transaction runs, so no node can redirect it (${this.rpc} says that's ${r.address} now, unproven)`,
+    };
   }
 
   /**

@@ -7,7 +7,7 @@ import { useEffect, useState } from "react";
 import { Splash, Unlock } from "@/components/Gate";
 import { Apparition } from "@/components/Haunt";
 import { Copy, ErrorNote, Spinner, Tip } from "@/components/ui";
-import { localKeysAllowed } from "@/lib/config";
+import { localKeysAllowed, MAINNET_CHAIN_ID, NETWORK } from "@/lib/config";
 import { friendly, isPrfUnsupported } from "@/lib/errors";
 import { keyCode } from "@/lib/format";
 import { createLocalKey, createPasskey, type AccountChoice } from "@/lib/keys";
@@ -28,6 +28,9 @@ export default function LinkPage() {
   const [prf, setPrf] = useState(false);
   const [target, setTarget] = useState("");
   const [joining, setJoining] = useState<{ res: Resolution; code: string } | null>(null);
+  /** An account name only the node vouched for, on mainnet: its address waits for the user to check it (audit gap-7-1). */
+  const [checking, setChecking] = useState<Resolution | null>(null);
+  const [matches, setMatches] = useState(false);
 
   const waiting = !!wallet && !!hint && !hint.account;
 
@@ -38,16 +41,40 @@ export default function LinkPage() {
     router.replace("/");
   };
 
+  /** Signs this device's consent to joining `res.address` (an address the user typed, proved, or checked). */
+  const grant = async (res: Resolution) => {
+    if (!wallet) return;
+    setBusy(true);
+    setError(null);
+    try {
+      setJoining({ res, code: encodeKeyGrant(await wallet.keyGrant(res.address)) });
+      setChecking(null);
+    } catch (e) {
+      setError(friendly(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const grantFor = async () => {
     if (!wallet) return;
     setBusy(true);
     setError(null);
     try {
       const res = await client.resolution(target.trim());
-      setJoining({ res, code: encodeKeyGrant(await wallet.keyGrant(res.address)) });
+      // The grant names an address, so a name has to become one. Proven by the network's
+      // witnesses, or typed as an address, it's signed for; on mainnet a name only the node vouched
+      // for waits until the user has checked the address against their other device.
+      const mainnet = NETWORK.mainnet === true || client.pin.chainId === MAINNET_CHAIN_ID;
+      if (!res.proven && mainnet) {
+        setMatches(false);
+        setChecking(res);
+        setBusy(false);
+        return;
+      }
+      await grant(res);
     } catch (e) {
       setError(friendly(e));
-    } finally {
       setBusy(false);
     }
   };
@@ -99,6 +126,29 @@ export default function LinkPage() {
         <h1>This device is already set up</h1>
         <p className="dim">It acts for {hint.name ?? "your account"}. To link another device, open Devices &amp; agents.</p>
         <Link className="btn primary" href="/">Go home</Link>
+      </main>
+    );
+
+  if (waiting && wallet && !joining && checking)
+    return (
+      <main className="narrow stack-lg">
+        <div className="center">
+          <Apparition kind="candle" />
+          <h1>Check your account&apos;s address</h1>
+          <p className="dim">Your node says {checking.name ? <b>{checking.name}.boo</b> : "that account"} is the address below, but nothing proved it, and a node can point a name anywhere. This device will only agree to join that address.</p>
+        </div>
+        <section className="card stack" data-testid="check-address">
+          <span className="eyebrow">Your node says</span>
+          <div className="mono address break">{checking.address}</div>
+          <p className="small">On your other device, open <b>Devices &amp; agents → Link a device</b>: it shows your account&apos;s address. Compare every character.</p>
+          <label className="row-gap small">
+            <input type="checkbox" checked={matches} onChange={(e) => setMatches(e.target.checked)} />
+            <span>It&apos;s exactly the address my other device shows</span>
+          </label>
+          <button className="btn primary" disabled={!matches || busy} onClick={() => grant(checking)}>{busy ? <Spinner>Signing…</Spinner> : "It matches: make the grant code"}</button>
+          <ErrorNote error={error} />
+        </section>
+        <button className="link center-self" onClick={() => setChecking(null)}>It doesn&apos;t match: pick another account</button>
       </main>
     );
 

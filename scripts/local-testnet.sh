@@ -74,7 +74,11 @@ before=$(curl -sf "http://$V0/api/params" | field '.params.multisig_expiry_block
 want=$((before + 7))
 "$BIN" gov propose param multisig_expiry_blocks "$want" --title "local testnet: multisig_expiry_blocks $want" --key "$DIR/v0/validator.key" --rpc "http://$V0"
 PID=$(proposals | field '.proposals[0].id')
-for i in 0 1 2; do "$BIN" gov vote "$PID" aye 1 --conviction 0 --key "$DIR/v$i/validator.key" --rpc "http://$V0"; done
+# A vote binds what `gov show` printed (its digest): the CLI refuses a proposal that reads
+# differently by the time it signs (audit gap-7-6).
+DIGEST=$("$BIN" gov show "$PID" --rpc "http://$V0" | sed -n 's/^   digest: \([0-9a-f]\{64\}\).*/\1/p')
+[[ ${#DIGEST} == 64 ]] || { echo "❌ gov show printed no digest for proposal #$PID" >&2; exit 1; }
+for i in 0 1 2; do "$BIN" gov vote "$PID" aye 1 --conviction 0 --digest "$DIGEST" --key "$DIR/v$i/validator.key" --rpc "http://$V0"; done
 status=""
 for _ in $(seq 1 240); do
   status=$(curl -sf "http://$V0/api/proposal/$PID" | field '.status')

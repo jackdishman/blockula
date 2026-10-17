@@ -150,7 +150,11 @@ function ProposalCard({ p, lockPeriod, run, canVote = false }: { p: ProposalSumm
         <span className="pill">{p.status.replace(/_/g, " ")}</span>
       </div>
       <h3 className="summary">{p.title}</h3>
-      <p>{p.summary}</p>
+      {/* What it does, rendered here from the proposal's kind: the content a vote on it signs (with
+          the title and link). The node's own summary isn't covered by the vote's digest, so a node
+          could make it say anything; it isn't shown (audit gap-7-6). */}
+      <p data-testid="proposal-does">{p.does}</p>
+      {p.digest ? <div className="dim small mono" data-testid="proposal-digest" title={p.digest}>vote binds {p.digest.slice(0, 16)}…</div> : <div className="warn small">{p.digest_error ?? "This wallet can't read this proposal exactly"}.</div>}
       <Tally p={p} />
       <div className="dim small">
         {[
@@ -166,7 +170,7 @@ function ProposalCard({ p, lockPeriod, run, canVote = false }: { p: ProposalSumm
         {url && <a href={url} target="_blank" rel="noreferrer nofollow">Full text ↗</a>}
         <ExplorerLink href={explorerProposal(p.id)}>In the explorer ↗</ExplorerLink>
       </div>
-      {canVote && <VoteForm p={p} lockPeriod={lockPeriod} run={run} />}
+      {canVote && (p.kind && p.digest ? <VoteForm p={p} lockPeriod={lockPeriod} run={run} /> : <p className="warn small" data-testid="cannot-vote">This wallet won&apos;t sign a vote on a proposal it can&apos;t show exactly. Vote with the blockula CLI, which reads it exactly.</p>)}
     </article>
   );
 }
@@ -191,8 +195,9 @@ function VoteForm({ p, lockPeriod, run }: { p: ProposalSummary; lockPeriod?: num
   const submit = async () => {
     if (aye === null || drops === null) return;
     setBusy(true);
-    // The vote binds the proposal shown here (its kind, title and link): a node that showed
-    // another proposal's content makes it fail instead of landing elsewhere (audit gap-7-6).
+    // The vote binds the proposal shown here (its kind, which the card rendered, title and link):
+    // a node that showed another proposal's content makes it fail instead of landing elsewhere
+    // (audit gap-7-6).
     const kind = p.kind;
     await run(() => (kind ? wallet.vote(p.id, aye, drops as bigint, conviction, { proposal: { kind, title: p.title, url: p.url } }) : Promise.reject(new Error("This wallet can't show what this proposal does, so it won't sign a vote on it."))));
     setBusy(false);

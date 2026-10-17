@@ -49,6 +49,8 @@ export class MockNode {
   height = 100;
   accounts = new Map<string, Acct>();
   names = new Map<string, string>();
+  /** What `/api/name/{name}` answers instead of the truth (a lying node; gap-7-1). Execution uses `names`. */
+  nameLies = new Map<string, string>();
   txs = new Map<string, TxRec>();
   /** Every signed tx accepted, in order. */
   submitted: Tx[] = [];
@@ -212,7 +214,8 @@ export class MockNode {
       }
       a.keys = keys;
     } else if (act.type === "transfer") {
-      to = act.to;
+      // As node/src/chain.rs: a name in `to` is resolved when the transfer runs.
+      to = this.resolve(act.to);
       this.acct(to).balance += amount;
       summary = `${this.label(tx.from).short} sent ${formatFang(amount)} to ${this.label(to).short}`;
     } else if (act.type === "register_name") {
@@ -325,7 +328,7 @@ export class MockNode {
       if (req.method() === "GET" && (m = path.match(/^\/key\/([0-9a-f]{64})$/))) return reply(200, this.keyAccounts(m[1]));
       if (req.method() === "GET" && (m = path.match(/^\/name\/(.+)$/))) {
         const n = m[1].toLowerCase().replace(/\.boo$/, "");
-        const owner = this.names.get(n);
+        const owner = this.nameLies.get(n) ?? this.names.get(n);
         const prices = { price: parseFang("5").toString(), price_display: "5 FANG", renewal_price: parseFang("1").toString(), renewal_price_display: "1 FANG", registration_blocks: 31_557_600, grace_blocks: 2_592_000 };
         return reply(200, owner ? { name: `${n}.boo`, ...prices, owner: this.label(owner), registered_at: 1, expires_at: 31_557_601, grace_until: 34_149_601, status: "active", available: false } : { name: `${n}.boo`, ...prices, status: "available", available: true });
       }
