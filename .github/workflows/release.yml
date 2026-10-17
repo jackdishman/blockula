@@ -146,16 +146,19 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           cat > notes.md <<EOF
-          Install: \`curl -fsSL https://github.com/$REPO/releases/download/$TAG/install.sh | BLOCKULA_VERSION=$TAG sh\`
+          Upgrade: \`blockula release install $TAG --provenance\`. It checks \`checksums.txt\` (its first line
+          names $TAG) against the offline signature \`checksums.txt.sig\` by the Blockula release key
+          (ML-DSA-65) whose key id you pinned at your first install, then the archive's SHA-256,
+          provenance and the binary's version, and never runs this release's install.sh. A first
+          install checks the archive against the SHA-256 announced in the operators' channel first:
+          docs/OPERATIONS.md "A first install". Take the release key id from SECURITY.md, the website
+          and the operators' channel, never from this page. Every file also has SLSA build provenance
+          (\`gh attestation verify <file> --repo $REPO --source-ref refs/tags/$TAG\`), which a
+          compromised GitHub account or workflow could produce as well. The Linux archives rebuild bit
+          for bit with \`COMMIT=<commit> scripts/reproduce-release.sh $TAG\`.
 
-          **Verify before you run it.** \`checksums.txt\` (its first line names $TAG) is signed offline
-          with the Blockula release key (ML-DSA-65): \`checksums.txt.sig\`. Check it against the
-          release key id published in SECURITY.md and on the website, never one taken from this page:
-          \`blockula release verify --key-id <release key id> --tag $TAG --sig checksums.txt.sig checksums.txt\`,
-          then \`sha256sum --ignore-missing -c checksums.txt\` (that covers install.sh too). Every file
-          also has SLSA build provenance (\`gh attestation verify <file> --repo $REPO --source-ref refs/tags/$TAG\`),
-          which a compromised GitHub account or workflow could produce as well. The Linux archives
-          rebuild bit for bit with \`scripts/reproduce-release.sh $TAG\`. See docs/OPERATIONS.md "Releases".
+          Developers: \`curl -fsSL https://github.com/$REPO/releases/download/$TAG/install.sh | BLOCKULA_VERSION=$TAG sh\`
+          (the release's own script: it checks what it can, but it's only as trustworthy as this release).
           EOF
           gh release create "$TAG" release/* \
             --repo "$REPO" --draft --verify-tag --title "Blockula $TAG" --notes-file notes.md --generate-notes

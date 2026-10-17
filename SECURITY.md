@@ -40,7 +40,7 @@ No third-party audit yet. The scope for the external audit of the mainnet code (
 
 ## Verifying releases
 
-Release archives carry SLSA build provenance, the Linux builds are reproducible, and `checksums.txt` is signed offline with the Blockula release key (ML-DSA-65). How to check all three: [docs/OPERATIONS.md "Releases"](docs/OPERATIONS.md#releases). Release key id: *not generated yet*; it will be published here, in OPERATIONS.md and in `scripts/install.sh`.
+Release archives carry SLSA build provenance, the Linux builds are reproducible, and `checksums.txt` is signed offline with the Blockula release key (ML-DSA-65). How to check all three: [docs/OPERATIONS.md "Releases"](docs/OPERATIONS.md#releases). `blockula release install vX.Y.Z` installs a release only if its signature checks against the release key id you pinned at your first install (`~/.blockula/release-key-id`), and a new key id is accepted only with a rotation statement signed by the pinned key. This file is in a repository a compromised GitHub account could edit, so take the key id from here and from a channel GitHub doesn't control (the website, the operators' channel), check they agree, and pin it once. Release key id: *not generated yet*; it will be published here, in OPERATIONS.md, in `scripts/install.sh` and in `node/src/release_cli.rs`.
 
 ## Testing on the public testnet
 

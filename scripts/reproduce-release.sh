@@ -2,9 +2,13 @@
 # Rebuilds a release's Linux archive from source in the pinned build image and compares it with
 # the published checksums.txt. Independent builders run this before a release is signed
 # (docs/OPERATIONS.md "Releases"). Needs git, curl and docker.
-#   scripts/reproduce-release.sh v0.5.0                       target = this machine's arch
-#   scripts/reproduce-release.sh v0.5.0 aarch64-unknown-linux-gnu
-# Env: CHECKSUMS=<file> (e.g. from a draft release: gh release download v0.5.0 -p checksums.txt),
+#   COMMIT=<sha> scripts/reproduce-release.sh v0.5.0          target = this machine's arch
+#   COMMIT=<sha> scripts/reproduce-release.sh v0.5.0 aarch64-unknown-linux-gnu
+# Env: COMMIT=<the full commit SHA you reviewed> (builders and the signer always set it): the
+#      tag must be that commit, and then scripts/check-release-files.sh also checks checksums.txt's
+#      other lines (install.sh, genesis and checkpoint files) against it. A moved tag rebuilds and
+#      matches from its own source, so without COMMIT this only proves the archive is the tag's.
+#      CHECKSUMS=<file> (e.g. from a draft release: gh release download v0.5.0 -p checksums.txt),
 #      SRC=<checkout> (build its committed HEAD instead of cloning the tag), BLOCKULA_REPO (default
 #      jackdishman/blockula).
 set -euo pipefail
@@ -26,9 +30,16 @@ asset=blockula-$target.tar.gz
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 src=$work/src
+commit=${COMMIT:-}
+[ -z "$commit" ] || [[ $commit =~ ^[0-9a-f]{40}$ ]] || { echo "COMMIT must be a full commit SHA (40 hex), got '$commit'" >&2; exit 1; }
 if [ -n "${SRC:-}" ]; then git clone --quiet "$SRC" "$src"
 else git clone --quiet --depth 1 --branch "$tag" "https://github.com/$repo.git" "$src"; fi
-echo "🔨 Building $asset from $(git -C "$src" rev-parse HEAD) in $RELEASE_IMAGE ($platform)…"
+built=$(git -C "$src" rev-parse HEAD)
+if [ -n "$commit" ] && [ "$built" != "$commit" ]; then
+  echo "✗ $tag is $built here, not the commit you reviewed ($commit). Don't sign or install it: find out who moved the tag." >&2
+  exit 1
+fi
+echo "🔨 Building $asset from $built in $RELEASE_IMAGE ($platform)…"
 # A fresh clone inside a throwaway container, at a path unlike CI's: the build remaps paths, so
 # the output must not change. Only committed files are built.
 mkdir -p "$work/dist"
@@ -48,7 +59,15 @@ echo "published: ${expected:-<missing>}"
 echo "rebuilt:   $actual"
 if [ "$expected" = "$actual" ]; then
   echo "✓ $asset reproduces bit for bit"
+  echo "  For the signer's REPRODUCED file (send it on the operators' channel, not only the release issue):"
+  echo "  $actual  $asset"
 else
   echo "✗ $asset does NOT match the release. Don't sign or install it; report the diff (diffoscope helps)." >&2
   exit 1
+fi
+if [ -n "$commit" ]; then
+  # The other lines of checksums.txt: the tag's own install.sh, genesis and checkpoint files.
+  SRC=$src COMMIT=$commit "$(dirname "$0")/check-release-files.sh" "$tag" "$work/checksums.txt"
+else
+  echo "⚠️  Built from $built: compare it with the commit you reviewed. COMMIT=<sha> makes this script check it, and checksums.txt's other files (scripts/check-release-files.sh)." >&2
 fi

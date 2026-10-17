@@ -53,7 +53,7 @@ Session keys can only send transfers: staking, voting and name renewals need an 
 
 ## install_node
 
-Downloads the prebuilt `blockula` for this machine from the GitHub release and installs it to `~/.blockula/bin`, after the same checks as `scripts/install.sh` (docs/OPERATIONS.md "Releases"):
+Downloads the prebuilt `blockula` for this machine from the GitHub release and installs it to `~/.blockula/bin`, after the same checks as `scripts/install.sh` (docs/OPERATIONS.md "Releases"). It installs releases from v0.5.0 on: earlier releases' `checksums.txt` names no tag, so nothing binds them to the version asked for, and it refuses them. (Validators install with `blockula release install` instead, which checks against a pinned release key id.)
 
 0. The version you asked for (`latest` is resolved to its tag first) is bound to every check: `checksums.txt` must name it on its first line (`# blockula-release vX.Y.Z`, covered by the signature), provenance must come from its tag, and the extracted binary's `--version` must match before it's installed. An older, genuinely signed release served as the one asked for is refused.
 1. SHA-256 against the release's `checksums.txt`, always. That only catches a corrupted download.

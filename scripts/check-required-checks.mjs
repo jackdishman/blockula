@@ -12,11 +12,28 @@
 //   - the list in .github/workflows/ci.yml's header ("#   required: <name>", "#   optional: <name>").
 // A workflow that runs on pull_request with a paths or branches filter doesn't report on every
 // PR, so its jobs can't be required: that's an error too.
+// GitHub counts a skipped check as passing, so a required job must not be able to skip itself or
+// pass without its work running (round 3). It's refused when it has:
+//   - a job-level `if:` other than the conditions in SAFE_JOB_IFS (which keep it on every PR);
+//   - `needs:` on a job that isn't required (if that job fails or is skipped, this one is skipped);
+//   - `continue-on-error` on the job, or a step-level `if:` or `continue-on-error` that isn't in
+//     SAFE_STEPS (exact job, step name and value: a reviewed exception, e.g. an upload on failure).
 //   node scripts/check-required-checks.mjs [--ruleset F] [--workflows DIR] [--list F]
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 const GITHUB_ACTIONS = 15368;
+// Job-level conditions that never skip a job on a pull request.
+const SAFE_JOB_IFS = new Set(["github.event_name != 'schedule'"]);
+// Step-level conditions in required jobs that can't make the job pass without its checks: each
+// is "<job name> / <step name> / <key>: <value>", reviewed.
+const SAFE_STEPS = new Set([
+  // Uploads the Playwright traces when the tests already failed.
+  "Wallet e2e (Playwright, Chromium) / Traces of failed tests / if: failure()",
+  // Reports dev-tooling advisories; the runtime audit in the step before blocks.
+  "Dependencies (cargo-deny, npm audit) / npm audit (all, non-blocking) / continue-on-error: true",
+]);
+const cond = (v) => v.replace(/^\$\{\{\s*([\s\S]*?)\s*\}\}$/, "$1").trim();
 const args = process.argv.slice(2);
 const opt = (k, d) => {
   const i = args.indexOf(k);
@@ -88,30 +105,65 @@ function parseWorkflow(file) {
       if (f) prFilter = f[1];
     }
   }
-  // jobs: id → { name, if }
+  // jobs: id → { name, if, needs, continueOnError, steps: [{ name, if, continueOnError }] }
   const jobs = [];
+  const flow = [];
   const jb = block("jobs").body;
   for (let j = 0; j < jb.length; j++) {
+    if (/^ {2}[A-Za-z0-9_-]+:\s*[^\s#]/.test(jb[j])) flow.push(jb[j].trim());
     const m = /^ {2}([A-Za-z0-9_-]+):\s*(#.*)?$/.exec(jb[j]);
     if (!m) continue;
-    const job = { id: m[1], name: m[1], if: "" };
+    const job = { id: m[1], name: m[1], if: "", needs: [], continueOnError: "", steps: [] };
+    let inSteps = false;
+    let step = null;
     for (let k = j + 1; k < jb.length && !(meaningful(jb[k]) && indent(jb[k]) <= 2); k++) {
-      const kv = /^ {4}(name|if):\s*(.*)$/.exec(jb[k]);
-      if (kv) job[kv[1]] = unquote(kv[2]);
+      const l = jb[k];
+      if (!meaningful(l)) continue;
+      const kv = /^ {4}([A-Za-z-]+):\s*(.*)$/.exec(l);
+      if (kv) {
+        inSteps = kv[1] === "steps";
+        step = null;
+        if (kv[1] === "name" || kv[1] === "if") job[kv[1]] = unquote(kv[2]);
+        if (kv[1] === "continue-on-error") job.continueOnError = unquote(kv[2]) || "(set)";
+        if (kv[1] === "needs") {
+          const v = unquote(kv[2]);
+          if (v.startsWith("[")) job.needs.push(...v.replace(/^\[|\]$/g, "").split(",").map((x) => unquote(x)).filter(Boolean));
+          else if (v) job.needs.push(v);
+          else for (let n = k + 1; n < jb.length && /^ {6}- /.test(jb[n]); n++) job.needs.push(unquote(jb[n].replace(/^ {6}- /, "")));
+        }
+        continue;
+      }
+      if (!inSteps) continue;
+      const item = /^ {6}- ([A-Za-z-]+):\s*(.*)$/.exec(l);
+      if (item || /^ {6}-\s*$/.test(l)) {
+        step = { name: "", if: "", continueOnError: "" };
+        job.steps.push(step);
+      }
+      const sk = item ?? /^ {8}([A-Za-z-]+):\s*(.*)$/.exec(l);
+      if (step && sk) {
+        if (sk[1] === "name") step.name = unquote(sk[2]);
+        if (sk[1] === "if") step.if = cond(unquote(sk[2])) || "(set)";
+        if (sk[1] === "continue-on-error") step.continueOnError = unquote(sk[2]) || "(set)";
+      }
     }
     jobs.push(job);
   }
-  return { pr, prFilter, jobs };
+  return { pr, prFilter, jobs, flow };
 }
 
 const prJobs = new Map(); // name → "file: job id"
+const prWorkflows = []; // [file, jobs] of the workflows that run on pull requests
 const filteredJobs = new Map(); // jobs that run only on some pull requests (a paths/branches filter)
 const files = readdirSync(workflowDir).filter((f) => /\.ya?ml$/.test(f)).sort();
 if (files.length === 0) bad(`no workflows in ${workflowDir}`);
+const allJobs = new Map(); // name → ["file: job id", …] across every workflow, whatever triggers it
 for (const f of files) {
   const wf = parseWorkflow(join(workflowDir, f));
+  for (const job of wf.jobs) allJobs.set(job.name, [...(allJobs.get(job.name) ?? []), `${f}: ${job.id}`]);
   if (!wf.pr) continue;
+  prWorkflows.push([f, wf.jobs]);
   if (wf.jobs.length === 0) bad(`${f}: runs on pull_request but no jobs were found (this checker reads block-style YAML only)`);
+  for (const l of wf.flow) bad(`${f}: job "${l}" is written in flow style; this checker reads block-style YAML only, so it can't tell what the job does`);
   for (const job of wf.jobs) {
     // A job whose `if:` names pull_request is taken not to run on PRs (e.g. the nightly fuzzers);
     // a skipped job would report success, which is no check at all.
@@ -130,6 +182,37 @@ for (const f of files) {
     }
     if (prJobs.has(job.name)) bad(`two jobs that run on pull requests are both named "${job.name}" (${prJobs.get(job.name)}, ${f}: ${job.id}): a check name must say which job it is`);
     prJobs.set(job.name, `${f}: ${job.id}`);
+  }
+}
+
+// A check run from any other job with a required name (a push-triggered copy that always passes,
+// say) could stand in for the real one on the PR's head commit.
+for (const ctx of required.keys()) {
+  const where = allJobs.get(ctx) ?? [];
+  if (where.length > 1) bad(`the required check "${ctx}" is the name of ${where.length} jobs (${where.join(", ")}): any of them reporting it would satisfy the ruleset. Keep required names unique across all workflows`);
+}
+
+// ---- required jobs can't skip themselves or pass without their work ----
+for (const [f, jobs] of prWorkflows) {
+  const byId = new Map(jobs.map((j) => [j.id, j]));
+  for (const job of jobs) {
+    if (!required.has(job.name)) continue;
+    const at = `"${job.name}" (${f}: ${job.id})`;
+    const c = cond(job.if);
+    if (c && !/pull_request/.test(c) && !SAFE_JOB_IFS.has(c)) bad(`${at} is required, but its if: (${c}) can skip it, and a skipped check counts as passing. Drop the condition, or if it can't skip a pull request add it to SAFE_JOB_IFS in this script (now: ${[...SAFE_JOB_IFS].join("; ")})`);
+    for (const n of job.needs) {
+      const dep = byId.get(n);
+      if (!dep) bad(`${at} needs "${n}", which isn't a job in ${f}`);
+      else if (!required.has(dep.name)) bad(`${at} is required, but it needs "${dep.name}" (${f}: ${n}), which isn't: if that job fails or is skipped, ${at} is skipped, and a skipped check counts as passing. Require it too, or drop the needs`);
+    }
+    if (job.continueOnError) bad(`${at} is required, but it has continue-on-error: ${job.continueOnError}, so it can fail and still let the PR through`);
+    for (const st of job.steps) {
+      for (const [key, v] of [["if", st.if], ["continue-on-error", st.continueOnError]]) {
+        if (!v) continue;
+        const entry = `${job.name} / ${st.name || "(unnamed step)"} / ${key}: ${v}`;
+        if (!SAFE_STEPS.has(entry)) bad(`${at} is required, but its step "${st.name || "(unnamed)"}" has ${key}: ${v}, which can let the job pass without that step's check. Drop it, or if it can't, add "${entry}" to SAFE_STEPS in this script`);
+      }
+    }
   }
 }
 
