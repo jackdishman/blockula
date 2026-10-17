@@ -78,7 +78,7 @@ fly_ok() { [ -z "${GENESIS_ONLY:-}" ]; }
 if ! fly_ok && [ -n "${RESET:-}" ]; then echo "❌ RESET=1 with GENESIS_ONLY=1: a rehearsal makes no Fly calls, so it never resets anything" >&2; exit 1; fi
 if fly_ok; then fly auth whoami >/dev/null || { echo "Run: fly auth login" >&2; exit 1; }; fi
 mkdir -p "$CONF" && chmod 700 "$CONF"
-cargo build --release --locked --manifest-path node/Cargo.toml -q
+[ -n "${SKIP_BUILD:-}" ] || cargo build --release --locked --manifest-path node/Cargo.toml -q
 BIN=node/target/release/blockula
 
 if [ "${RESET:-}" = 1 ]; then

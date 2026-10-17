@@ -173,7 +173,10 @@ assert.equal(bobTx.action.to, `${name}.boo`);
 assert.equal(await bob.balance(), formatFang(parseFang("10.5") - BigInt(bobTx.fee)));
 const { chain_id, genesis_hash } = await client.status();
 assert.equal(BigInt(bobTx.fee), minFee({ chain_id, genesis_hash, from: bob.address, nonce: 0, fee: "0", valid_until: bobTx.valid_until, action: bobTx.action, memo: "" }));
-assert.equal(await client.addressPrefix(), "boo");
+// The chain's prefix: `boo` on a dev chain, `tboo` on a public testnet (DEC-7); addresses follow it.
+const prefix = await client.addressPrefix();
+assert.ok(prefix === "boo" || prefix === "tboo", prefix);
+assert.equal(addressPrefix(alice.address), prefix);
 console.log("✓", bobTx.summary);
 
 // Tips: paid on top of the base fee (which is burned), and the fee covers exactly both.
@@ -192,7 +195,8 @@ await assert.rejects(alice.send(bob.address, "1", { validForBlocks: 100_000 }), 
 assert.equal(unsigned.genesis_hash, genesis_hash);
 await assert.rejects(client.submit(alice.sign({ ...unsigned, genesis_hash: "00".repeat(32) })), /another instance/);
 // The node checks address prefixes, and JSON with unknown fields is refused.
-await assert.rejects(alice.send(testAddr, "1"), /tboo \(testnet\) address/);
+const foreign = prefix === "tboo" ? mainAddr : testAddr;
+await assert.rejects(alice.send(foreign, "1"), prefix === "tboo" ? /boo \(mainnet\) address/ : /tboo \(testnet\) address/);
 const extra = { ...(await alice.build({ type: "transfer", to: bob.address, amount: "1" })), padding: "x".repeat(100) };
 await assert.rejects(client.submit(extra as Tx), (e: unknown) => e instanceof ApiError && e.status === 422);
 console.log("✓ validity windows, the chain instance, prefixes and strict JSON enforced");

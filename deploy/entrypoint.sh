@@ -17,7 +17,7 @@
 # (`--network-halted-at`: the whole network is halted at that height, OPERATIONS.md), PRUNE_BLOCKS
 # (`--prune-blocks`: the block window to keep; validators keep ~2 days without it, full nodes
 # everything), ARCHIVE=1 (`--archive`), CHECKPOINT (HEIGHT:HASH:SET_HASH for an empty rpc home),
-# RPC_PORT (the rpc's HTTP port, 7171).
+# HTTP_PORT (the HTTP port: the rpc's 7171 and a validator's 7070 by default).
 #
 # Joining after the weak-subjectivity period (relaunch problem 1): a full node with an empty home
 # refuses to sync from a root older than the period (OPERATIONS.md "Weak subjectivity"), and a
@@ -136,12 +136,12 @@ case "${ROLE:-}" in
     fi
     # The node never sees the secret, whether or not it was used.
     unset VALIDATOR_KEY_B64
-    run_node "$bin" run --home "$home" "$@"
+    run_node "$bin" run --home "$home" ${HTTP_PORT:+--port "$HTTP_PORT"} "$@"
     ;;
   rpc)
     unset VALIDATOR_KEY_B64
     home=$data/full
-    port=${RPC_PORT:-7171}
+    port=${HTTP_PORT:-7171}
     if [ -f "$home/join.json" ]; then
       as_node "$bin" run --home "$home" --port "$port" "$@"
     fi

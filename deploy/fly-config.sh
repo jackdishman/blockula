@@ -80,7 +80,7 @@ primary_region = "$RPC_REGION"
   GENESIS_HASH = "$GENESIS_HASH"
   CLIENT_IP_HEADER = "fly-client-ip"
   PEER_HTTP = "$(validator_peer_urls)"
-  RPC_PORT = "$RPC_PORT"
+  HTTP_PORT = "$RPC_PORT"
   BLOCKULA_LOG = "warn,blockula=info"
 $(fly_env ARCHIVE "$archive")
 $( [ -n "$archive" ] || fly_env PRUNE_BLOCKS "${RPC_PRUNE_BLOCKS:-}")

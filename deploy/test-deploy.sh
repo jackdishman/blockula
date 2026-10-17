@@ -54,8 +54,8 @@ code=$(entry "$d" ROLE=validator VALIDATOR_KEY_B64="$KEY_B64" PEER_HTTP="http://
 expect "validator: runs with its flags" "$(log)" "run --home $d/home --bind :: --halt-height 99 --network-halted-at 1234 --prune-blocks 43200 --peer-http http://a.internal:7070 --peer-http http://b.internal:7171 | key_env="
 refute "validator: the node never sees VALIDATOR_KEY_B64" "$(log)" "key_env=set"
 # Later boots (the secret deleted from Fly, or still in a stale machine config): the volume's key.
-code=$(entry "$d" ROLE=validator)
-[ "$code" = 0 ] && expect "validator: restarts from the volume alone" "$(log)" "run --home $d/home --bind ::" || bad "validator: restart exited $code: $(cat "$T/out")"
+code=$(entry "$d" ROLE=validator HTTP_PORT=7333)
+[ "$code" = 0 ] && expect "validator: restarts from the volume alone (HTTP_PORT sets its HTTP port)" "$(log)" "run --home $d/home --port 7333 --bind ::" || bad "validator: restart exited $code: $(cat "$T/out")"
 code=$(entry "$d" ROLE=validator VALIDATOR_KEY_B64="$(printf '%s\n' "$(printf '77%.0s' $(seq 32))" | base64 | tr -d '\n')")
 [ "$(cat "$d/home/validator.key")" = "$SEED" ] && refute "validator: a secret never replaces the volume's key, nor reaches the node" "$(log)" "key_env=set" || bad "validator: key replaced"
 # A volume that held a key once and lost it, or never had one and no secret: refuse.
@@ -87,7 +87,7 @@ code=$(entry "$T/r" ROLE=rpc GENESIS_HASH="$H" PEER_HTTP="http://v0.internal:707
 expect "rpc: asks the peers for a checkpoint of the pinned genesis" "$(log)" "checkpoint --peer http://v0.internal:7070 --peer http://v1.internal:7070 --genesis-hash $H"
 expect "rpc: joins with it" "$(log)" "join --genesis $T/etc/genesis.json --genesis-hash $H --checkpoint $CP --home $T/r/full --port 7171 --bind :: --client-ip-header fly-client-ip --prune-blocks 1209600 --peer-http http://v0.internal:7070 --peer-http http://v1.internal:7070"
 refute "rpc: never passes a validator secret on" "$(log)" "key_env=set"
-code=$(entry "$T/r" ROLE=rpc GENESIS_HASH="$H" PEER_HTTP="http://v0.internal:7070" RPC_PORT=7999)
+code=$(entry "$T/r" ROLE=rpc GENESIS_HASH="$H" PEER_HTTP="http://v0.internal:7070" HTTP_PORT=7999)
 [ "$code" = 0 ] && expect "rpc: a joined home restarts with run" "$(log)" "run --home $T/r/full --port 7999 --bind ::" || bad "rpc: restart exited $code"
 refute "rpc: a joined home doesn't fetch a checkpoint again" "$(log)" "checkpoint"
 code=$(entry "$T/r2" ROLE=rpc GENESIS_HASH="$H" PEER_HTTP="http://v0.internal:7070" CHECKPOINT="12:$H")
@@ -127,6 +127,7 @@ expect "validator config: NETWORK_HALTED_AT" "$v0" 'NETWORK_HALTED_AT = "499"'
 expect "validator config: VALIDATOR_PRUNE_BLOCKS" "$v0" 'PRUNE_BLOCKS = "43200"'
 r=$(rpc_toml)
 expect "rpc config: pins the genesis" "$r" "GENESIS_HASH = \"$H\""
+expect "rpc config: its HTTP port" "$r" 'HTTP_PORT = "7171"'
 expect "rpc config: its checkpoint peers are the validators" "$r" 'PEER_HTTP = "http://blockula-v0.internal:7070 http://blockula-v1.internal:7070 http://blockula-v2.internal:7070 http://blockula-v3.internal:7070"'
 expect "rpc config: keeps 14 days by default" "$r" 'PRUNE_BLOCKS = "1209600"'
 refute "rpc config: never halts with the validators" "$r" "HALT"
