@@ -356,7 +356,7 @@ pub fn parse_files(v: &Value) -> Vec<FileDiff> {
 }
 
 /// Lines a patch adds and removes (trimmed; blank ones don't count), by content.
-fn changed_lines(patch: &str) -> (BTreeMap<&str, usize>, BTreeMap<&str, usize>) {
+fn changed_lines(patch: &str) -> Lines<'_> {
     let (mut added, mut removed) = (BTreeMap::new(), BTreeMap::new());
     for line in patch.lines() {
         let (side, rest) = match line.as_bytes().first() {
@@ -398,9 +398,12 @@ fn restores(f: &FileDiff, revert: &[FileDiff], base: &BTreeMap<String, String>) 
     }
 }
 
+/// Lines a patch adds and removes, by content ([`changed_lines`]).
+type Lines<'a> = (BTreeMap<&'a str, usize>, BTreeMap<&'a str, usize>);
+
 /// Lines a file's patch changes, if any: `None` for a file with no lines to compare (binary, a
 /// diff too large for GitHub to show, a pure rename or mode change).
-fn lines_of(f: &FileDiff) -> Option<(BTreeMap<&str, usize>, BTreeMap<&str, usize>)> {
+fn lines_of(f: &FileDiff) -> Option<Lines<'_>> {
     f.patch.as_deref().map(changed_lines).filter(|(added, removed)| !added.is_empty() || !removed.is_empty())
 }
 
@@ -555,7 +558,9 @@ fn followed_paths(files: &[FileDiff]) -> Vec<&str> {
 ///
 /// Revert PRs are found from the default branch alone, which only maintainers write: commits
 /// that look like a revert landing ([`revert_pr_candidates`]), and the PRs of the commits since
-/// the merge that touch the claim's files (`commits?path=`, then `commits/{sha}/pulls`). Not
+/// the merge that touch the claim's files (`commits?path=`, then `commits/{sha}/pulls`); those
+/// commits are candidates themselves when they state the revert in git's words (a `git revert`
+/// pushed with no PR, past the commit walk: audit review-r3-poc-2). Not
 /// from the list of recently updated closed PRs, which anyone can flood by opening and closing
 /// PRs until a revert falls off it (audit F55). The claim PR's own commits (which land on the
 /// branch with it, and may carry any date) are left out of all of that: those GitHub lists for
@@ -685,9 +690,11 @@ fn merge_base(merge: &str, ancestors: &BTreeMap<&str, &Commit>) -> Option<String
     None
 }
 
-/// A tree's entries (`GET /repos/{repo}/git/trees/{sha}`): path → (type, sha), entries without a
-/// 40-hex sha skipped.
-fn tree_entries(v: &Value) -> BTreeMap<String, (String, String)> {
+/// A tree's entries (`GET /repos/{repo}/git/trees/{sha}`): path → (type, sha).
+type Tree = BTreeMap<String, (String, String)>;
+
+/// A tree's entries, those without a 40-hex sha skipped.
+fn tree_entries(v: &Value) -> Tree {
     let list = v["tree"].as_array().map(Vec::as_slice).unwrap_or_default();
     list.iter()
         .filter_map(|e| Some((e["path"].as_str()?.to_string(), (e["type"].as_str()?.to_string(), e["sha"].as_str().filter(|h| is_sha(h))?.to_ascii_lowercase()))))
@@ -722,7 +729,7 @@ where
         }
     }
     // A directory's entries by its path ("" is the root), as read (`None`: GitHub had none).
-    let mut levels: BTreeMap<String, Option<BTreeMap<String, (String, String)>>> = BTreeMap::new();
+    let mut levels: BTreeMap<String, Option<Tree>> = BTreeMap::new();
     let mut read = 0usize;
     let missing: Vec<&str> = wanted.iter().copied().filter(|p| !out.contains_key(*p)).collect();
     for path in missing {
