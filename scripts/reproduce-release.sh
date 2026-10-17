@@ -59,6 +59,8 @@ echo "published: ${expected:-<missing>}"
 echo "rebuilt:   $actual"
 if [ "$expected" = "$actual" ]; then
   echo "✓ $asset reproduces bit for bit"
+  echo "  For the signer's REPRODUCED file (send it on the operators' channel, not only the release issue):"
+  echo "  $actual  $asset"
 else
   echo "✗ $asset does NOT match the release. Don't sign or install it; report the diff (diffoscope helps)." >&2
   exit 1

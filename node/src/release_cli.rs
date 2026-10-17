@@ -278,13 +278,21 @@ fn default_pin_file() -> PathBuf {
     crate::cli_net::blockula_dir().join(PIN_FILE)
 }
 
-/// The pinned release key id, if any. A pin file that doesn't hold one is an error, never ignored.
+/// The pinned release key id, if any. A pin file that doesn't hold one is an error, never ignored,
+/// and so is one that others could have rewritten (writable by group or others, like ssh's keys).
 pub fn read_pin(path: &Path) -> Result<Option<String>> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => normalize_key_id(&text).map(Some).with_context(|| format!("{} isn't a release key id pin: fix it or remove it", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(path)?.permissions().mode();
+        ensure!(mode & 0o022 == 0, "{} is writable by others (mode {:o}), so it can't vouch for a release key: chmod 644 it once you've checked it holds your key id", path.display(), mode & 0o777);
     }
+    normalize_key_id(&text).map(Some).with_context(|| format!("{} isn't a release key id pin: fix it or remove it", path.display()))
 }
 
 fn write_pin(path: &Path, key_id: &str) -> Result<()> {
@@ -293,6 +301,11 @@ fn write_pin(path: &Path, key_id: &str) -> Result<()> {
     }
     let tmp = path.with_extension(format!("new-{}", std::process::id()));
     std::fs::write(&tmp, format!("{key_id}\n")).with_context(|| format!("writing {}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))?;
+    }
     std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
 }
 
@@ -917,6 +930,14 @@ mod tests {
         assert_eq!(read_pin(&pin).unwrap(), Some(kid.clone()));
         assert_eq!(reports(&dest).as_deref(), Some("blockula 9.9.10"));
         assert!(!evil_marker.exists() && !marker.exists());
+        // A pin file others could rewrite vouches for nothing.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&pin, std::fs::Permissions::from_mode(0o666)).unwrap();
+            assert!(inst("v9.9.10", from_dir(&next, None, &pin)).unwrap_err().contains("is writable by others"));
+            std::fs::set_permissions(&pin, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
         // A pin file that isn't one is an error, never "nothing pinned".
         std::fs::write(&pin, "not a key id\n").unwrap();
         assert!(inst("v9.9.10", from_dir(&next, Some(&kid), &pin)).unwrap_err().contains("isn't a release key id pin"));

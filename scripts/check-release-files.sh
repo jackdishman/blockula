@@ -13,9 +13,13 @@
 # missing one, a duplicate, a malformed line, another release's tag line) is refused, and so is a
 # tag that doesn't point at COMMIT: a tag moved to another commit would rebuild and match from its
 # own source, so only the commit you reviewed says the source is the one you meant to sign.
-#   COMMIT=<full sha you reviewed> scripts/check-release-files.sh v0.5.0 /tmp/rel/checksums.txt
-# Env: COMMIT (required), SRC=<checkout that has the tag> instead of a fresh clone,
-#      BLOCKULA_REPO (default jackdishman/blockula). Needs git.
+# GitHub serves the draft to each builder and to the signer separately, and could serve the signer
+# a checksums.txt the builders never rebuilt; REPRODUCED binds the Linux archive lines to the
+# hashes the builders reported (on a channel GitHub doesn't control): each must be there.
+#   COMMIT=<full sha you reviewed> REPRODUCED=rebuilt.txt scripts/check-release-files.sh v0.5.0 /tmp/rel/checksums.txt
+# Env: COMMIT (required), REPRODUCED (a file of "<sha256>  blockula-<linux target>.tar.gz" lines,
+#      the builders' rebuilt hashes: the signer always sets it), SRC=<checkout that has the tag>
+#      instead of a fresh clone, BLOCKULA_REPO (default jackdishman/blockula). Needs git.
 set -euo pipefail
 usage="usage: COMMIT=<reviewed commit> scripts/check-release-files.sh <vX.Y.Z> <checksums.txt>"
 tag=${1:?$usage}
@@ -84,6 +88,25 @@ while IFS= read -r line || [ -n "$line" ]; do
   esac
 done < <(tail -n +2 "$sums")
 
+# The Linux archives are the ones the builders rebuilt.
+linux=(x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu)
+if [ -n "${REPRODUCED:-}" ]; then
+  [ -f "$REPRODUCED" ] || die "REPRODUCED=$REPRODUCED isn't a file"
+  for t in "${linux[@]}"; do
+    name=blockula-$t.tar.gz
+    listed_hash=$(hash_of "$name")
+    rebuilt=$(awk -v n="$name" '$2 == n {print $1}' "$REPRODUCED" | sort -u)
+    if [ -z "$rebuilt" ]; then bad "$name: no rebuilt hash for it in $REPRODUCED (two builders reproduce each Linux archive)"
+    elif [ "$(printf '%s\n' "$rebuilt" | wc -l | tr -d ' ')" != 1 ]; then bad "$name: the builders' hashes in $REPRODUCED disagree: $(printf '%s ' $rebuilt)"
+    elif [ "$rebuilt" != "$listed_hash" ]; then bad "$name is listed as ${listed_hash:-nothing}, but the builders rebuilt $rebuilt"
+    else echo "✓ $name is the archive the builders rebuilt"; fi
+  done
+  reproduced=1
+else
+  echo "⚠️  The Linux archives' lines weren't compared with the builders' rebuilt hashes (REPRODUCED=<file>): the signer must set it." >&2
+  reproduced=0
+fi
+
 # Everything the tag would publish is there.
 for t in "${targets[@]}"; do [ -n "$(hash_of "blockula-$t.tar.gz")" ] || bad "blockula-$t.tar.gz isn't listed"; done
 [ -n "$(hash_of install.sh)" ] || bad "install.sh isn't listed"
@@ -100,4 +123,8 @@ if [ $errors -gt 0 ]; then
   echo "✗ $sums: $errors problem(s). Don't sign it." >&2
   exit 1
 fi
-echo "✓ $sums: $tag is $commit; install.sh, the genesis and checkpoint files are the tag's own; ${#targets[@]} archives listed (rebuild the Linux ones with scripts/reproduce-release.sh)"
+if [ $reproduced = 1 ]; then
+  echo "✓ $sums: $tag is $commit; the Linux archives are the builders' rebuilds; install.sh, the genesis and checkpoint files are the tag's own; the macOS archives are listed (signed on provenance)"
+else
+  echo "✓ $sums: $tag is $commit; install.sh, the genesis and checkpoint files are the tag's own; ${#targets[@]} archives listed (not compared with rebuilds)"
+fi

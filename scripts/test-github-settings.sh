@@ -74,6 +74,7 @@ variant "an if: that skips a required job's check step" "has if: github.event_na
 variant "if: failure() on a check step (it never runs when the job is green)" 'its step "Known-answer and cross-implementation tests" has if: failure()' wf/crypto.yml 's/^(      - name: Known-answer and cross-implementation tests)$/\1\n        if: failure()/'
 variant "a job written in flow style (the checker can't read it)" 'job "docs: { name: Lint docs' wf/crypto.yml '$a\
   docs: { name: Lint docs, runs-on: ubuntu-24.04, steps: [{ run: "true" }] }'
+variant "a push-triggered job reusing a required name" 'the required check "Clippy" is the name of 2 jobs' wf/release.yml 's/^    name: Tag is the crate version$/    name: Clippy/'
 # The safe forms still pass: the allowed job condition in ${{ }}, and the reviewed step exceptions.
 rm -rf "$T/v" && mkdir -p "$T/v/wf" && cp .github/workflows/*.yml "$T/v/wf/"
 sed -E '/^    name: Clippy$/{n;s/^    if: .*/    if: ${{ github.event_name != '"'"'schedule'"'"' }}/;}' .github/workflows/ci.yml > "$T/v/wf/ci.yml"

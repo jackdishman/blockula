@@ -78,6 +78,20 @@ refused "a malformed line" "isn't '<sha256>  <file>'" "$T/odd"
 release "$T/tagline" && sums "$T/tagline" v9.9.8
 refused "another release's tag line" "not '# blockula-release v9.9.9'" "$T/tagline"
 
+# The builders' rebuilt hashes (REPRODUCED): the draft the signer got must list exactly those.
+for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do grep " blockula-$t.tar.gz\$" "$T/genuine/checksums.txt"; done > "$T/rebuilt.txt"
+out=$(REPRODUCED=$T/rebuilt.txt check "$T/genuine") || fail "the genuine release with the builders' hashes is refused: $out"
+printf '%s' "$out" | grep -qF "blockula-x86_64-unknown-linux-gnu.tar.gz is the archive the builders rebuilt" || fail "REPRODUCED wasn't compared: $out"
+ok "REPRODUCED: the Linux archives are the ones the builders rebuilt"
+release "$T/swapped" && printf 'evil archive\n' > "$T/swapped/blockula-aarch64-unknown-linux-gnu.tar.gz" && sums "$T/swapped"
+REPRODUCED=$T/rebuilt.txt refused "a Linux archive the builders didn't rebuild (the draft changed after they checked it)" "blockula-aarch64-unknown-linux-gnu.tar.gz is listed as" "$T/swapped"
+grep -v aarch64 "$T/rebuilt.txt" > "$T/rebuilt-one.txt"
+REPRODUCED=$T/rebuilt-one.txt refused "only one Linux archive reproduced" "blockula-aarch64-unknown-linux-gnu.tar.gz: no rebuilt hash for it" "$T/genuine"
+{ cat "$T/rebuilt.txt"; echo "$(printf 'f%.0s' $(seq 64))  blockula-x86_64-unknown-linux-gnu.tar.gz"; } > "$T/rebuilt-split.txt"
+REPRODUCED=$T/rebuilt-split.txt refused "builders who disagree" "the builders' hashes in" "$T/genuine"
+out=$(check "$T/genuine" 2>&1) && printf '%s' "$out" | grep -qF "weren't compared with the builders' rebuilt hashes" || fail "without REPRODUCED the check doesn't warn: $out"
+ok "without REPRODUCED: says the archives weren't compared"
+
 # The tag moved to a commit that changes only install.sh: everything matches its own source, so
 # only the commit the signer reviewed catches it.
 reviewed=$COMMIT

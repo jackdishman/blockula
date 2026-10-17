@@ -44,6 +44,10 @@ for n in $EXPECTED; do
   b=$(block "$n")
   [ "$(printf '%s\n' "$b" | head -n 1)" = "( set -euo pipefail" ] || fail "block $n doesn't start with '( set -euo pipefail': pasted, it would run on after a failed check"
   [ "$(printf '%s\n' "$b" | tail -n 1)" = ")" ] || fail "block $n doesn't end with ')'"
+  # Interactive zsh runs a '#' line as a command (no interactivecomments), and interactive bash
+  # expands '!': a block must paste the same into both.
+  if printf '%s\n' "$b" | grep -n '#'; then fail "block $n has a comment (above): interactive zsh would run it as a command; put it in the prose"; fi
+  if printf '%s\n' "$b" | grep -nF '!'; then fail "block $n has a '!' (above): interactive bash would expand it"; fi
 done
 ok "the doc's $(echo "$EXPECTED" | wc -w | tr -d ' ') release blocks are each one '( set -euo pipefail … )'"
 grep -nE '(^|[^a-z])sh install\.sh|bash install\.sh|\| *sh *$' "$DOC" | grep -v 'curl -fsSL https://github.com/jackdishman/blockula/releases/latest/download/install.sh | sh' \
@@ -152,7 +156,7 @@ paste() {
   [ -z "${WORKFILES:-}" ] || cp -R "$WORKFILES"/. "$T/work/"
   set +e
   (cd "$T/work" && env -i PATH="$PATH_RUN" HOME="$T/home" TMPDIR="$T/tmp" LOG="$T" MIRROR="$MIRROR" FAKE_ATTEST="${FAKE_ATTEST:-pass}" \
-    BLOCKULA_RELEASE_URL="file://$MIRROR" bash "$f" < /dev/null) > "$T/out" 2>&1
+    BLOCKULA_RELEASE_URL="file://$MIRROR" ${PASTE_SHELL:-bash} "$f" < /dev/null) > "$T/out" 2>&1
   rc=$?
   set -e
 }
@@ -234,6 +238,14 @@ machine 9.9.9 && MIRROR=$UNSIGNED
 expect upgrade refused "a release without checksums.txt.sig"
 machine 9.9.9 && MIRROR=$NEXT
 FAKE_ATTEST=none expect upgrade refused "a genuine signature but no provenance for a public release"
+
+# The same blocks paste into zsh (macOS's shell), where installed.
+if command -v zsh > /dev/null; then
+  machine 9.9.9 && MIRROR=$NEXT
+  PASTE_SHELL="zsh -f" expect upgrade "installed blockula 9.9.10" "pasted into zsh, the genuine next release"
+  machine 9.9.9 && MIRROR=$EVIL2
+  PASTE_SHELL="zsh -f" expect upgrade refused "pasted into zsh, a release signed by another key"
+fi
 
 # ---- the emergency patch (built in the private fork: no attestation; review-r2-supply-3) ----
 TAG=v9.9.11

@@ -156,8 +156,10 @@ const prWorkflows = []; // [file, jobs] of the workflows that run on pull reques
 const filteredJobs = new Map(); // jobs that run only on some pull requests (a paths/branches filter)
 const files = readdirSync(workflowDir).filter((f) => /\.ya?ml$/.test(f)).sort();
 if (files.length === 0) bad(`no workflows in ${workflowDir}`);
+const allJobs = new Map(); // name → ["file: job id", …] across every workflow, whatever triggers it
 for (const f of files) {
   const wf = parseWorkflow(join(workflowDir, f));
+  for (const job of wf.jobs) allJobs.set(job.name, [...(allJobs.get(job.name) ?? []), `${f}: ${job.id}`]);
   if (!wf.pr) continue;
   prWorkflows.push([f, wf.jobs]);
   if (wf.jobs.length === 0) bad(`${f}: runs on pull_request but no jobs were found (this checker reads block-style YAML only)`);
@@ -181,6 +183,13 @@ for (const f of files) {
     if (prJobs.has(job.name)) bad(`two jobs that run on pull requests are both named "${job.name}" (${prJobs.get(job.name)}, ${f}: ${job.id}): a check name must say which job it is`);
     prJobs.set(job.name, `${f}: ${job.id}`);
   }
+}
+
+// A check run from any other job with a required name (a push-triggered copy that always passes,
+// say) could stand in for the real one on the PR's head commit.
+for (const ctx of required.keys()) {
+  const where = allJobs.get(ctx) ?? [];
+  if (where.length > 1) bad(`the required check "${ctx}" is the name of ${where.length} jobs (${where.join(", ")}): any of them reporting it would satisfy the ruleset. Keep required names unique across all workflows`);
 }
 
 // ---- required jobs can't skip themselves or pass without their work ----
