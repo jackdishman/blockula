@@ -584,13 +584,13 @@ fn largest_records_fit_in_a_snapshot() {
         let (_, window) = crate::params::ChainParams::bounds("downtime_window", &st.params).unwrap();
         let sk = &mut st.staking;
         let jail = Some(Jail { at: u64::MAX, until: u64::MAX, reason: s(MAX_REASON) });
-        sk.pools.insert(addr(1), Pool { stake: u64::MAX, shares: u128::MAX, commission_base: u64::MAX, commission_epoch: u64::MAX, jail, tombstoned_at: Some(u64::MAX), slashed: u64::MAX, rewards: u64::MAX, junk_charged: u64::MAX, slashed_from: Some(u64::MAX) });
+        sk.pools.insert(addr(1), Pool { stake: u64::MAX, shares: u128::MAX, commission_base: u64::MAX, commission_epoch: u64::MAX, jail, tombstoned_at: Some(u64::MAX), slashed: u64::MAX, rewards: u64::MAX, junk_charged: u64::MAX, slashed_from: Some(u64::MAX), ready_at: Some(u64::MAX) });
         sk.delegations.insert(format!("{}/{}", addr(0), addr(1)), Delegation { shares: u128::MAX, principal: u64::MAX });
         sk.entries.insert(format!("{}/{:020}", addr(0), u64::MAX), Entry::Redelegation { from: addr(1), to: addr(2), amount: u64::MAX, started_at: u64::MAX, release_at: u64::MAX });
         sk.by_validator.insert(format!("{}/{:020}/{}/{:020}", addr(1), u64::MAX, addr(0), u64::MAX), ());
         sk.views.insert(u64::MAX, u64::MAX);
         sk.punished.insert(format!("{}/{:020}/{:020}", addr(1), u64::MAX, u64::MAX), Punished { kind: u8::MAX, height: u64::MAX, reporter: addr(2), slashed: u64::MAX });
-        sk.liveness.insert(addr(1), Liveness { window, bits: vec![0xff; window.div_ceil(8) as usize], next: u64::MAX, filled: u64::MAX, missed: u64::MAX, led: u64::MAX, missed_total: u64::MAX });
+        sk.liveness.insert(addr(1), Liveness { window, max_missed: u64::MAX, bits: vec![0xff; window.div_ceil(8) as usize], next: u64::MAX, filled: u64::MAX, missed: u64::MAX, led: u64::MAX, missed_total: u64::MAX });
     }
     // Governance: a proposal with a full council and every string at its bound, a vote, a
     // multisig with every pending slot, its proposal carrying the largest action an owner can
