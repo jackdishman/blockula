@@ -264,6 +264,19 @@ pub fn tokens_only(key: &str) -> bool {
 /// close spending again, but not for longer than that, so it reopens by itself (review-fix-gov-3).
 pub const SPEND_GATE_MAX_DELAY_DAYS: u64 = 365;
 
+/// The shortest evidence window (`evidence_max_age_epochs` × `epoch_blocks`, and so
+/// `unbonding_blocks`, which can't be shorter) governance can set: two weeks, twice the weekly
+/// checkpoint cadence (OPERATIONS.md "Weak subjectivity"). The weak-subjectivity period is half
+/// the window, so it never falls below a week: a joiner's newest weekly checkpoint stays usable
+/// whatever a vote does, and a peer claiming a shorter period lies (audit gap-6-1).
+pub const EVIDENCE_WINDOW_FLOOR_DAYS: u64 = 14;
+
+/// [`EVIDENCE_WINDOW_FLOOR_DAYS`] in epochs on a chain with these genesis constants (rounded up,
+/// so the window is at least that long).
+pub fn evidence_floor_epochs(p: &Params) -> u64 {
+    EVIDENCE_WINDOW_FLOOR_DAYS.saturating_mul(blocks_per_day(p.block_time_ms)).div_ceil(p.epoch_blocks.max(1)).max(1)
+}
+
 /// Highest `Vote::conviction`.
 pub const MAX_CONVICTION: u8 = 6;
 /// Lock periods (`lock_period_blocks`) a vote at each conviction locks its amount for: none at 0,
@@ -346,7 +359,9 @@ impl ChainParams {
     /// voting at least 3 days, the timelock and the lock period at least a day, quorum 1–10% of
     /// the unlocked supply and 5M–50M FANG (2.5× the defaults at most, so it stays reachable), the
     /// supermajority 60–80% (so a dust nay can't veto every upgrade, review-fix-gov-3), the
-    /// large-spend line at most 5% of the treasury. `None` for keys without one.
+    /// large-spend line at most 5% of the treasury, and the evidence window at least
+    /// [`EVIDENCE_WINDOW_FLOOR_DAYS`] (what joiners' weak-subjectivity period rests on, gap-6-1).
+    /// `None` for keys without one.
     pub fn governance_band(key: &str, p: &Params) -> Option<((u64, &'static str), (u64, &'static str))> {
         let day = blocks_per_day(p.block_time_ms);
         let (min, max) = Self::bounds(key, p)?;
@@ -357,17 +372,19 @@ impl ChainParams {
             "quorum_floor" => ((5_000_000 * FANG, "5M FANG"), (50_000_000 * FANG, "50M FANG")),
             "supermajority_bps" => ((6_000, "60%"), (8_000, "80%")),
             "treasury_large_bps" => ((min, "the code bound"), (500, "5% of the treasury")),
+            "evidence_max_age_epochs" => ((evidence_floor_epochs(p), "14 days of epochs, the weak-subjectivity floor"), (max, "the code bound")),
             _ => return None,
         })
     }
 
     /// The rule a `ParamChange` of `key` to `value` at `height` follows on top of the bounds, for
-    /// [`GOVERNANCE_KEYS`]: within [`ChainParams::governance_band`], or (on a chain whose genesis
-    /// starts outside it) no further outside than it is. So a vote can neither make the next
-    /// vote easier to win than the floors allow nor impossible to win, and the next vote can
-    /// always move it back. The spend gate never moves earlier, and later by at most
-    /// [`SPEND_GATE_MAX_DELAY_DAYS`] past `height` (or where it already is); the bootstrap
-    /// council's end never moves later.
+    /// [`GOVERNANCE_KEYS`] and the evidence window: within [`ChainParams::governance_band`], or
+    /// (on a chain whose genesis starts outside it) no further outside than it is. So a vote can
+    /// neither make the next vote easier to win than the floors allow nor impossible to win, the
+    /// next vote can always move it back, and the evidence window (with `unbonding_blocks`, which
+    /// can't be shorter) never falls below [`EVIDENCE_WINDOW_FLOOR_DAYS`]. The spend gate never
+    /// moves earlier, and later by at most [`SPEND_GATE_MAX_DELAY_DAYS`] past `height` (or where
+    /// it already is); the bootstrap council's end never moves later.
     pub fn check_governance_change(&self, key: &str, value: u64, p: &Params, height: u64) -> Result<()> {
         let Some(old) = self.get(key) else { return Ok(()) };
         if let Some(((floor, low), (ceiling, high))) = Self::governance_band(key, p) {
@@ -391,10 +408,10 @@ impl ChainParams {
     }
 
     /// Whether these values already sit inside every band [`ChainParams::check_governance_change`]
-    /// keeps, with the spend gate at most [`SPEND_GATE_MAX_DELAY_DAYS`] out (mainnet's genesis
-    /// must).
+    /// keeps (the evidence window's too), with the spend gate at most
+    /// [`SPEND_GATE_MAX_DELAY_DAYS`] out (mainnet's genesis must).
     pub fn check_governance_floors(&self, p: &Params) -> Result<()> {
-        for key in GOVERNANCE_KEYS {
+        for key in Self::KEYS {
             let v = self.get(key).expect("a parameter");
             if let Some(((floor, _), (ceiling, _))) = Self::governance_band(key, p) {
                 ensure!(v >= floor, "parameter `{key}` ({v}) is past governance's floor ({floor})");
@@ -561,6 +578,44 @@ mod tests {
         // Mainnet's genesis must start inside every band.
         c.check_governance_floors(&p).unwrap();
         assert!(strict.check_governance_floors(&p).is_ok() && loose.check_governance_floors(&p).is_err());
+    }
+
+    /// gap-6-1: the evidence window, which the weak-subjectivity period is half of, never falls
+    /// below two weeks by a vote (and unbonding can't be shorter than it), so the period never
+    /// falls below a week. A chain whose genesis starts below the floor (dev chains) only moves up.
+    #[test]
+    fn the_evidence_window_has_a_floor() {
+        let p = params();
+        let c = ChainParams::defaults(&p);
+        let floor = evidence_floor_epochs(&p);
+        assert_eq!((floor, c.evidence_max_age_epochs), (14 * 24, 21 * 24), "mainnet: 14 of 21 days");
+        let ok = |c: &ChainParams, k: &str, v: u64| c.check_governance_change(k, v, &p, 0);
+        ok(&c, "evidence_max_age_epochs", floor).unwrap();
+        let err = ok(&c, "evidence_max_age_epochs", floor - 1).unwrap_err().to_string();
+        assert!(err.contains(&format!("to {floor} at the least")) && err.contains("weak-subjectivity floor"), "{err}");
+        ok(&c, "evidence_max_age_epochs", 365 * 24).unwrap();
+        // At the floor, unbonding can't go below it either (the cross-parameter rule), so the
+        // weak-subjectivity period is at least a week.
+        let mut at_floor = c.clone();
+        at_floor.set("evidence_max_age_epochs", floor, &p).unwrap();
+        assert!(at_floor.set("unbonding_blocks", floor * p.epoch_blocks - 1, &p).is_err());
+        at_floor.set("unbonding_blocks", floor * p.epoch_blocks, &p).unwrap();
+        assert_eq!(crate::checkpoints::ws_period_blocks(&at_floor, p.epoch_blocks), 7 * 86_400);
+        // Rounded up to whole epochs: a 7-hour epoch takes 48 epochs (14 days exactly), a
+        // 5-hour one 68 (14.2 days), never fewer than 14 days.
+        assert_eq!(evidence_floor_epochs(&Params { epoch_blocks: 7 * 3_600, ..p.clone() }), 48);
+        assert_eq!(evidence_floor_epochs(&Params { epoch_blocks: 5 * 3_600, ..p.clone() }), 68);
+        assert_eq!(evidence_floor_epochs(&Params { epoch_blocks: 30 * 86_400, ..p.clone() }), 1);
+        // A genesis below the floor (dev chains' minutes) keeps it or raises it, never lowers it.
+        let dp = Params { epoch_blocks: 60, ..p.clone() };
+        let dev = ChainParams::with_overrides(&dp, &ChainParams::dev_overrides(dp.block_time_ms, dp.epoch_blocks)).unwrap();
+        let dev_ok = |v: u64| dev.check_governance_change("evidence_max_age_epochs", v, &dp, 0).is_ok();
+        assert_eq!(dev.evidence_max_age_epochs, 2, "`blockula dev`: two minutes");
+        assert!(dev_ok(2) && !dev_ok(1) && dev_ok(evidence_floor_epochs(&dp) + 1));
+        // Mainnet's genesis must start at or above it.
+        assert!(at_floor.check_governance_floors(&p).is_ok());
+        let short = ChainParams { evidence_max_age_epochs: floor - 1, ..c.clone() };
+        assert!(short.check_governance_floors(&p).unwrap_err().to_string().contains("evidence_max_age_epochs"));
     }
 
     #[test]

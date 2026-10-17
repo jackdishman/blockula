@@ -748,7 +748,7 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
     // weak-subjectivity period is the one the parameters in force set, if governance shortened it.
     let mut trust = Trust::new(&chain.genesis, &Pins::default(), false)?;
     trust.follow(&chain.state.chain_params);
-    let trust = Arc::new(trust);
+    let empty = chain.height() == 0 && chain.base.is_none();
     let keep = net.pruning.keep(true, &chain.state);
     chain.set_pruning(keep);
     crate::upgrade::configure(&mut chain, consensus::SUPPORTED_PROTOCOL_VERSION, net.halt_height);
@@ -798,19 +798,28 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
         None if net.ephemeral_p2p || is_private_host(&addrs.p2p_addr) => "local".into(),
         None => "recommended".into(),
     };
-    if let Some(why) = trust.stale(chain.height(), crate::chain::now_ms()).filter(|_| !peers.is_empty()) {
-        eprintln!("⚠️  {why}. Validators get recent checkpoints with each release: run the latest one.");
-    }
     let shared: Shared = Arc::new(Mutex::new(chain));
     // Far behind (new validator, long downtime)? Catch up over HTTP first: verified batches,
     // much faster than consensus backfill, and peers prune old consensus data.
-    if !peers.is_empty() {
+    let trust = if !peers.is_empty() {
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
         rt.block_on(async {
+            // An empty home also heeds the period its peers report (gap-6-1); a validator warns.
+            if empty {
+                heed_peers(&mut trust, &peers, false).await;
+            }
+            let height = shared.lock().height();
+            if let Some(why) = trust.stale(height, crate::chain::now_ms()) {
+                eprintln!("⚠️  {why}. Validators get recent checkpoints with each release: run the latest one.");
+            }
+            let trust = Arc::new(trust);
             maybe_fast_sync(&shared, &peers, net.full, &trust).await;
             catch_up(shared.clone(), peers.clone(), trust.clone()).await;
-        });
-    }
+            trust
+        })
+    } else {
+        Arc::new(trust)
+    };
     if let Some(halt) = shared.lock().halt.signal.get() {
         exit_halted(&halt);
     }
@@ -912,34 +921,67 @@ fn yes() -> bool {
     true
 }
 
+/// How long `join` and an empty home's first start wait for each peer's `/api/status`.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// An empty home has nothing of its own to go by, so before it syncs it asks every peer for the
+/// weak-subjectivity period in force and enforces the shortest ([`Trust::heed`]: never below the
+/// protocol's floor), so a governance change after this release can't leave it trusting a root
+/// that's too old for the chain's evidence window, as long as one honest peer answers (gap-6-1).
+/// With `wait`, it asks again every 10 s until a peer answers for the chain (a node about to sync
+/// can't without one anyway). Returns how many answered.
+async fn heed_peers(trust: &mut Trust, peers: &[String], wait: bool) -> usize {
+    let mut waiting = false;
+    loop {
+        let reports = crate::checkpoints::peer_periods(peers, &trust.genesis_hash, STATUS_TIMEOUT).await;
+        if !reports.is_empty() || !wait || peers.is_empty() {
+            if trust.heed(&reports) {
+                let (peer, w) = reports.iter().min_by_key(|(_, w)| *w).expect("a report");
+                eprintln!("⚠️  {peer} reports the weak-subjectivity period in force as {w} blocks: shorter than this release knows (governance shortened the evidence window since); enforcing {}", trust.ws_blocks());
+            }
+            return reports.len();
+        }
+        if !waiting {
+            println!("⏳ no peer answers /api/status for this chain yet (to learn the weak-subjectivity period in force before syncing an empty home); asking every 10 s");
+            waiting = true;
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+}
+
 /// Prepares a full-node home: genesis.json (copied or fetched from a node) + join.json.
 /// The genesis must be pinned: by `pins.genesis_hash`, or by this binary for a known chain id
 /// (`checkpoints.rs`). Checkpoints must agree with it, and the newest root must be younger than
-/// the weak-subjectivity period unless `pins.allow_stale_checkpoint`.
+/// the weak-subjectivity period, the shortest of this release's and the peers' reports
+/// ([`heed_peers`]), unless `pins.allow_stale_checkpoint`.
 pub fn join(genesis: &str, home: &Path, pins: &Pins, fast: bool) -> Result<()> {
     if home.join("validator.key").exists() {
         bail!("{} is a validator home", home.display());
     }
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let (g, mut peers): (Genesis, Vec<String>) = if genesis.starts_with("http://") || genesis.starts_with("https://") {
         let url = genesis.trim_end_matches('/').to_string();
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         let g: Genesis = rt.block_on(async { reqwest::get(format!("{url}/api/genesis")).await?.error_for_status()?.json().await })?;
         (g, vec![url])
     } else {
         (Genesis::load(Path::new(genesis))?, vec![])
     };
-    let trust = Trust::new(&g, pins, true)?;
+    let mut trust = Trust::new(&g, pins, true)?;
+    trust.check_fresh(0, crate::chain::now_ms())?;
+    for u in http_peers(&g, &[], None) {
+        if !peers.contains(&u) {
+            peers.push(u);
+        }
+    }
+    if rt.block_on(heed_peers(&mut trust, &peers, false)) == 0 && !peers.is_empty() {
+        println!("ℹ️  no peer answered /api/status for this chain: the weak-subjectivity period in force is checked again when the node first starts");
+    }
     trust.check_fresh(0, crate::chain::now_ms())?;
     match trust.newest() {
         0 => println!("🔐 genesis {} pinned", trust.genesis_hash),
         h => println!("🔐 genesis {} pinned; newest trusted checkpoint #{h}", trust.genesis_hash),
     }
     std::fs::create_dir_all(home)?;
-    for u in http_peers(&g, &[], None) {
-        if !peers.contains(&u) {
-            peers.push(u);
-        }
-    }
     let path = home.join("genesis.json");
     if path.exists() {
         let existing = Genesis::load(&path)?;
@@ -961,11 +1003,9 @@ pub fn run_full_node(home: PathBuf, net: NetOpts) -> Result<()> {
     // under the weak-subjectivity period of the parameters in force in this node's own state.
     let mut trust = Trust::new(&chain.genesis, &jc.pins, false)?;
     trust.follow(&chain.state.chain_params);
-    let trust = Arc::new(trust);
     // An empty home is where a stale root bites (a fresh sync); a synced one trusts its own head.
-    if let Some(why) = trust.check_fresh(chain.height(), crate::chain::now_ms())? {
-        eprintln!("⚠️  {why}");
-    }
+    let (empty, height) = (chain.height() == 0 && chain.base.is_none(), chain.height());
+    trust.check_fresh(height, crate::chain::now_ms())?;
     let keep = net.pruning.keep(false, &chain.state);
     chain.set_pruning(keep);
     // A halted full node keeps serving reads at its height, with the reason in /api/health.
@@ -978,11 +1018,19 @@ pub fn run_full_node(home: PathBuf, net: NetOpts) -> Result<()> {
     rt.block_on(async move {
         // The API and explorer come up immediately, while syncing.
         tokio::spawn(serve_http(http_node(shared.clone(), None, peers.clone(), &net, &trust), bind));
+        // The period in force, as the peers report it, before anything is fetched (gap-6-1):
+        // an empty home waits for a peer's answer and refuses a root too old for it (`join` asked
+        // too, but governance may have acted since); a synced one only warns.
+        heed_peers(&mut trust, &peers, empty).await;
+        if let Some(why) = trust.check_fresh(height, crate::chain::now_ms())? {
+            eprintln!("⚠️  {why}");
+        }
+        let trust = Arc::new(trust);
         maybe_fast_sync(&shared, &peers, !fast, &trust).await;
         tokio::spawn(exchange_epochs(shared.clone(), peers.clone()));
         sync_loop(shared, peers, false, trust).await;
-    });
-    Ok(())
+        Ok(())
+    })
 }
 
 #[derive(Deserialize)]
@@ -1017,9 +1065,19 @@ pub async fn get_capped(client: &reqwest::Client, url: &str, cap: usize) -> Resu
     Ok(body)
 }
 
-/// One sync round against `peer`: how many blocks it applied (0: the peer had nothing new) and
-/// how long the peer took to send them.
-async fn sync_once(chain: &Shared, provider: &consensus::EpochProvider, client: &reqwest::Client, peer: &str, trust: &Trust) -> Result<(u64, Duration)> {
+/// What one sync round brought: the blocks it applied (0: the peer had nothing new), their size
+/// as sent (hex) and how many were asked for, both counted only up to what an honest batch holds,
+/// and how long the peer took to send them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Round {
+    blocks: u64,
+    bytes: u64,
+    limit: u64,
+    took: Duration,
+}
+
+/// One sync round against `peer`: what it applied ([`Round`]).
+async fn sync_once(chain: &Shared, provider: &consensus::EpochProvider, client: &reqwest::Client, peer: &str, trust: &Trust) -> Result<Round> {
     // Batches never cross an epoch boundary: each is verified with that epoch's validator set,
     // which we learn by executing the previous epoch's last block.
     let (from, limit, epoch) = {
@@ -1039,11 +1097,13 @@ async fn sync_once(chain: &Shared, provider: &consensus::EpochProvider, client: 
             bail!("peer claims height {} but sent nothing", batch.tip);
         }
         chain.lock().note_claim(peer, batch.tip);
-        return Ok((0, took));
+        return Ok(Round { blocks: 0, bytes: 0, limit, took });
     }
     apply_batch_trusted(chain, &verifier, epoch, &batch, Some(trust))?;
     chain.lock().note_claim(peer, batch.tip);
-    Ok((batch.blocks.len() as u64, took))
+    // What an honest peer would have sent for this request at most: no credit for more.
+    let bytes = batch.blocks.iter().take(limit as usize).map(|b| b.len() as u64).sum::<u64>().min(api::SYNC_BATCH_BYTES as u64);
+    Ok(Round { blocks: batch.blocks.len() as u64, bytes, limit, took })
 }
 
 /// How long a peer that sent blocks slower than the chain makes them is asked last, at first;
@@ -1051,32 +1111,70 @@ async fn sync_once(chain: &Shared, provider: &consensus::EpochProvider, client: 
 const SLOW_PEER_BENCH: Duration = Duration::from_secs(60);
 const SLOW_PEER_MAX: Duration = Duration::from_secs(15 * 60);
 /// A round at least a block time long that delivered blocks this many times slower than another
-/// peer's recent best is too slow too: peers are judged against each other, not only the chain.
+/// peer's recent best, in blocks and in bytes per second, is too slow too: peers are judged
+/// against each other, not only the chain.
 const SLOWER_THAN_BEST: u32 = 4;
 /// A peer's rate counts as recent (for the best, and for "keep the fastest") this long.
 const RATE_WINDOW: Duration = Duration::from_secs(120);
 /// Every this many good rounds the next peer is tried instead of the fastest, so a faster one is
 /// found and the rates stay fresh; a slow peer gets no more than that share.
 const EXPLORE_EVERY: u64 = 8;
+/// A round's rate is measured over at least this share of a block time (a quarter): a tiny round
+/// answered at once counts as if it took that long, so it can't set a bar real batches can't
+/// meet (review-r2-sync-1). To beat a peer by [`SLOWER_THAN_BEST`], another must really deliver,
+/// within a quarter of a block time, more than that peer delivers in a block time.
+const RATE_FLOOR_DIVISOR: u32 = 4;
 
-/// Which peer sync asks next (F27). Peers take turns on empty replies. After a good round sync
-/// goes on with the fastest peer (one not asked for [`RATE_WINDOW`] first, then the best recent
-/// rate), trying the next one every [`EXPLORE_EVERY`] rounds. A peer is benched (asked again only
-/// once every other peer is benched too, or its time is up) when a round failed, or took long for
-/// what it delivered: blocks at less than twice the chain's rate (`blocks × block_time < 2 ×
-/// time taken`: a node fed that way never catches up, or only slowly), or, in a round at least a
-/// block time long, [`SLOWER_THAN_BEST`] times slower than another peer's recent best, or an
-/// empty answer after more than two block times. So a peer that trickles real, certified blocks
-/// just fast enough for the chain, or stalls before saying it has nothing, gets a round now and
-/// then, not the node. The first peer asked is a random one.
+/// A peer's newest round, as rates: blocks and bytes a second, and when.
+#[derive(Clone, Copy, Debug)]
+struct Rate {
+    blocks: f64,
+    bytes: f64,
+    at: std::time::Instant,
+}
+
+impl Rate {
+    fn of(r: &Round, block_time: Duration, at: std::time::Instant) -> Self {
+        let secs = r.took.max(block_time / RATE_FLOOR_DIVISOR).as_secs_f64().max(0.001);
+        Rate { blocks: r.blocks.min(r.limit.max(1)) as f64 / secs, bytes: r.bytes as f64 / secs, at }
+    }
+
+    /// [`SLOWER_THAN_BEST`] times slower than `best` in both blocks and bytes a second.
+    fn far_below(&self, best: (f64, f64)) -> bool {
+        let k = f64::from(SLOWER_THAN_BEST);
+        self.blocks * k < best.0 && self.bytes * k < best.1
+    }
+}
+
+/// Which peer sync asks next (F27, review-r2-sync-1). Peers take turns on empty replies. After a
+/// good round sync goes on with the fastest peer (one not asked for [`RATE_WINDOW`] first, then
+/// the best recent rate), trying the next one every [`EXPLORE_EVERY`] rounds. A peer is benched
+/// (asked again only once every other peer is benched too, or its time is up) when a round
+/// failed, or took long for what it delivered: blocks at less than twice the chain's rate
+/// (`blocks × block_time < 2 × time taken`: a node fed that way never catches up, or only
+/// slowly), or, in a round at least a block time long, [`SLOWER_THAN_BEST`] times slower than
+/// another peer's recent rate (blocks and bytes, each round measured over at least a quarter of
+/// a block time), or an empty answer after more than two block times. So a peer that trickles
+/// real, certified blocks just fast enough for the chain, or stalls before saying it has
+/// nothing, gets a round now and then, not the node. A peer benched only for being slower than
+/// another keeps its rate as a bar while it waits, and is free again once the peers that beat it
+/// stop doing so: when every peer not benched has said "nothing new" since the last blocks (a
+/// slow peer with blocks beats a fast one with none; a peer with nothing new loses its rate), or
+/// when a short round that left blocks behind is far below its rate. The first peer asked is a
+/// random one.
 struct Rotation {
     at: usize,
     benched_until: Vec<Option<std::time::Instant>>,
+    /// Whether a peer's bench is only for being slower than another peer (not for failing,
+    /// stalling or falling short of the chain's rate).
+    relative: Vec<bool>,
     strikes: Vec<u32>,
-    /// Each peer's blocks per second in its newest good round, and when.
-    rates: Vec<Option<(f64, std::time::Instant)>>,
+    /// Each peer's newest good or slow round, until it answers "nothing new".
+    rates: Vec<Option<Rate>>,
     /// When each peer was last asked.
     asked: Vec<Option<std::time::Instant>>,
+    /// Which peers answered "nothing new" since any peer last delivered blocks.
+    quiet: Vec<bool>,
     good_rounds: u64,
 }
 
@@ -1090,7 +1188,7 @@ impl Rotation {
 
     fn starting_at(peers: usize, at: usize) -> Self {
         let n = peers.max(1);
-        Self { at: at % n, benched_until: vec![None; n], strikes: vec![0; n], rates: vec![None; n], asked: vec![None; n], good_rounds: 0 }
+        Self { at: at % n, benched_until: vec![None; n], relative: vec![false; n], strikes: vec![0; n], rates: vec![None; n], asked: vec![None; n], quiet: vec![false; n], good_rounds: 0 }
     }
 
     fn current(&self) -> usize {
@@ -1101,8 +1199,17 @@ impl Rotation {
         self.benched_until[i].is_some_and(|t| t > now)
     }
 
+    /// Peer `i`'s rate if it's a fair bar for the others: from the last [`RATE_WINDOW`], or still
+    /// on the bench for being slower than another (it delivered at that rate; the rate stays the
+    /// bar while it waits, so a peer far slower than it can't take its place). Not a peer benched
+    /// for failing or stalling.
+    fn bar(&self, i: usize, now: std::time::Instant) -> Option<Rate> {
+        let benched = self.benched(i, now);
+        self.rates[i].filter(|r| if benched { self.relative[i] } else { now.saturating_duration_since(r.at) <= RATE_WINDOW })
+    }
+
     fn recent_rate(&self, i: usize, now: std::time::Instant) -> Option<f64> {
-        self.rates[i].filter(|(_, at)| now.saturating_duration_since(*at) <= RATE_WINDOW).map(|(r, _)| r)
+        self.rates[i].filter(|r| now.saturating_duration_since(r.at) <= RATE_WINDOW).map(|r| r.blocks)
     }
 
     /// Moves on to the next peer that isn't benched (or just the next one, if all are).
@@ -1132,29 +1239,55 @@ impl Rotation {
         }
     }
 
-    fn bench(&mut self, now: std::time::Instant) -> Duration {
-        let i = self.at;
+    /// Benches peer `i` (`relative`: only for being slower than another): 60 s, doubling with
+    /// each bench in a row up to [`SLOW_PEER_MAX`].
+    fn bench_at(&mut self, i: usize, now: std::time::Instant, relative: bool) -> Duration {
         self.strikes[i] = self.strikes[i].saturating_add(1);
         let bench = SLOW_PEER_BENCH.saturating_mul(1u32 << (self.strikes[i] - 1).min(8)).min(SLOW_PEER_MAX);
         self.benched_until[i] = Some(now + bench);
+        self.relative[i] = relative;
+        bench
+    }
+
+    /// Benches the current peer and moves on.
+    fn bench(&mut self, now: std::time::Instant, relative: bool) -> Duration {
+        let bench = self.bench_at(self.at, now, relative);
         self.advance(now);
         bench
     }
 
-    /// A round that applied `blocks` (≥ 1), sent in `took`. Returns how long the peer is benched
-    /// for when that was too slow (and moves on), `None` when it was fine.
-    fn progress(&mut self, blocks: u64, took: Duration, block_time: Duration, now: std::time::Instant) -> Option<Duration> {
+    /// A round that applied `round.blocks` (≥ 1). Returns how long the peer is benched for when
+    /// that was too slow (and moves on), `None` when it was fine.
+    fn progress(&mut self, round: Round, block_time: Duration, now: std::time::Instant) -> Option<Duration> {
         let i = self.at;
         self.asked[i] = Some(now);
-        let rate = blocks as f64 / took.as_secs_f64().max(0.001);
-        let best_other = (0..self.rates.len()).filter(|j| *j != i && !self.benched(*j, now)).filter_map(|j| self.recent_rate(j, now)).fold(None, |b: Option<f64>, r| Some(b.map_or(r, |b| b.max(r))));
-        self.rates[i] = Some((rate, now));
-        let below_chain = u128::from(blocks) * block_time.as_millis() < 2 * took.as_millis();
-        let below_best = took >= block_time && best_other.is_some_and(|b| rate * f64::from(SLOWER_THAN_BEST) < b);
+        self.quiet.fill(false);
+        let rate = Rate::of(&round, block_time, now);
+        let others = (0..self.rates.len()).filter(|j| *j != i).filter_map(|j| self.bar(j, now));
+        let best = others.fold(None, |b: Option<(f64, f64)>, r| Some(b.map_or((r.blocks, r.bytes), |(x, y)| (x.max(r.blocks), y.max(r.bytes)))));
+        self.rates[i] = Some(rate);
+        let below_chain = u128::from(round.blocks) * block_time.as_millis() < 2 * round.took.as_millis();
+        let below_best = round.took >= block_time && best.is_some_and(|b| rate.far_below(b));
         if below_chain || below_best {
-            return Some(self.bench(now));
+            return Some(self.bench(now, !below_chain));
         }
         self.strikes[i] = 0;
+        self.benched_until[i] = None;
+        self.relative[i] = false;
+        // A short round that left blocks behind (fewer than asked) far below the rate a peer
+        // benched only for being slower than another delivered: that peer is the faster one now,
+        // so it's free again. A peer can't bench another with one fast round and then keep the
+        // turn by trickling (review-r2-sync-1); whoever holds it delivers at least a quarter of
+        // what the benched peer did, in full batches, or in rounds a block time long (judged
+        // against it above).
+        if round.blocks < round.limit && round.took < block_time {
+            for j in (0..self.rates.len()).filter(|j| *j != i) {
+                if self.benched(j, now) && self.relative[j] && self.rates[j].is_some_and(|b| rate.far_below((b.blocks, b.bytes))) {
+                    self.benched_until[j] = None;
+                    self.relative[j] = false;
+                }
+            }
+        }
         self.good_rounds += 1;
         if self.good_rounds.is_multiple_of(EXPLORE_EVERY) {
             self.advance(now);
@@ -1166,20 +1299,33 @@ impl Rotation {
 
     /// A round with nothing new, answered after `took`: benched when that took more than two
     /// block times (an honest peer says "nothing new" at once), otherwise the next peer's turn.
+    /// Either way the peer's rate is dropped: one with nothing to offer isn't the bar for the
+    /// others. Once every peer not benched has said "nothing new" since the last blocks, the
+    /// peers benched only for being slower than another are free again (review-r2-sync-1).
     fn nothing(&mut self, took: Duration, block_time: Duration, now: std::time::Instant) -> Option<Duration> {
-        self.asked[self.at] = Some(now);
-        if took > 2 * block_time {
-            return Some(self.bench(now));
+        let i = self.at;
+        self.asked[i] = Some(now);
+        self.rates[i] = None;
+        self.quiet[i] = true;
+        let stalled = (took > 2 * block_time).then(|| self.bench_at(i, now, false));
+        let n = self.benched_until.len();
+        if (0..n).filter(|j| !self.benched(*j, now)).all(|j| self.quiet[j]) {
+            for j in 0..n {
+                if self.benched(j, now) && self.relative[j] {
+                    self.benched_until[j] = None;
+                    self.relative[j] = false;
+                }
+            }
         }
         self.advance(now);
-        None
+        stalled
     }
 
     /// A round that failed (no answer in time, a bad or lying answer, an unreachable peer):
     /// benched, so it isn't asked again after every good round.
     fn failed(&mut self, now: std::time::Instant) -> Duration {
         self.asked[self.at] = Some(now);
-        self.bench(now)
+        self.bench(now, false)
     }
 }
 
@@ -1210,15 +1356,15 @@ async fn sync_loop(chain: Shared, peers: Vec<String>, stop_when_caught_up: bool,
         }
         let url = &peers[rotation.current()];
         match sync_once(&chain, &provider, &client, url, &trust).await {
-            Ok((blocks, took)) if blocks > 0 => match rotation.progress(blocks, took, block_time, std::time::Instant::now()) {
+            Ok(round) if round.blocks > 0 => match rotation.progress(round, block_time, std::time::Instant::now()) {
                 // A slow round doesn't count as progress: catching up must not hinge on it.
-                Some(bench) => eprintln!("⚠️  sync from {url}: {blocks} block(s) in {:.1}s, slower than the chain or the other peers; asking other peers first for {}s", took.as_secs_f64(), bench.as_secs()),
+                Some(bench) => eprintln!("⚠️  sync from {url}: {} block(s) in {:.1}s, slower than the chain or the other peers; asking other peers first for {}s", round.blocks, round.took.as_secs_f64(), bench.as_secs()),
                 None => {
                     idle_rounds = 0;
                     failures = 0;
                 }
             },
-            Ok((_, took)) => {
+            Ok(Round { took, .. }) => {
                 idle_rounds += 1;
                 // Ask someone else next time, so no single peer can stall us.
                 if let Some(bench) = rotation.nothing(took, block_time, std::time::Instant::now()) {
@@ -1439,6 +1585,78 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// gap-6-1: a joiner on a release that predates a governance change shortening the evidence
+    /// window learns the period in force from its peers' `/api/status`. A 9-day-old checkpoint is
+    /// fine at the genesis period (10.5 days); once governance has cut the window to its floor
+    /// (two weeks, so a week's period), the same `join` is refused and says why, and so is the
+    /// first start of a home that joined before the change and never synced (`run_full_node`'s
+    /// empty-home check). A fresher checkpoint or `--allow-stale-checkpoint` still joins. A peer
+    /// claiming less than any chain can have is held to the floor, and a peer of another chain
+    /// isn't heard.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_joiner_heeds_the_period_its_peers_report() {
+        use crate::checkpoints::Checkpoint;
+        use axum::{routing::get, Json, Router};
+        let root = home("wsjoin");
+        let homes = Chain::summon(&root, &SummonOpts::new("wsjoin", 1)).unwrap();
+        // A month-old chain.
+        let gpath = homes[0].join("genesis.json");
+        let mut g = Genesis::load(&gpath).unwrap();
+        g.created_at_ms -= 30 * 86_400_000;
+        std::fs::write(&gpath, serde_json::to_string_pretty(&g).unwrap()).unwrap();
+        let chain: Shared = Arc::new(Mutex::new(Chain::open(&homes[0]).unwrap()));
+        let hash = crate::checkpoints::genesis_hash(&g);
+        let serve = |app: Router| async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap() });
+            url
+        };
+        let url = serve(crate::api::router(crate::api::Node::new(chain.clone(), None, vec![], Default::default()))).await;
+        let day = 86_400_000 / g.block_time_ms;
+        let pins = |at: u64| Pins { genesis_hash: Some(hash.clone()), checkpoints: vec![Checkpoint { height: at, hash: "cd".repeat(32), set_hash: None }], ..Default::default() };
+        let try_join = |from: &str, name: &str, pins: Pins| {
+            let (from, home) = (from.to_string(), root.join(name));
+            tokio::task::spawn_blocking(move || join(&from, &home, &pins, true))
+        };
+        // Before the change: 9 days old is fresh.
+        try_join(&url, "before", pins(21 * day)).await.unwrap().unwrap();
+        // Governance cuts the evidence window as far as it can: two weeks.
+        {
+            let mut c = chain.lock();
+            let mut j = crate::chain::Journal::default();
+            c.state.exec_set_param(&mut j, "evidence_max_age_epochs", crate::params::evidence_floor_epochs(&g.params())).unwrap();
+            c.set_pruning(None); // publishes the state to the API
+        }
+        let err = try_join(&url, "after", pins(21 * day)).await.unwrap().unwrap_err().to_string();
+        assert!(err.contains(&format!("~7.0 days, in force on the chain as {url} reports it")) && err.contains("--allow-stale-checkpoint"), "{err}");
+        assert!(!root.join("after").exists(), "a refused join writes nothing");
+        try_join(&url, "fresh", pins(24 * day)).await.unwrap().unwrap();
+        try_join(&url, "allowed", Pins { allow_stale_checkpoint: true, ..pins(21 * day) }).await.unwrap().unwrap();
+        // The home that joined before the change: its first start asks again, and stops.
+        let jc: JoinConfig = serde_json::from_slice(&std::fs::read(root.join("before").join("join.json")).unwrap()).unwrap();
+        assert!(jc.peers.contains(&url));
+        let mut trust = Trust::new(&g, &jc.pins, false).unwrap();
+        assert_eq!(trust.check_fresh(0, crate::chain::now_ms()).unwrap(), None, "by this release alone: fresh");
+        assert_eq!(heed_peers(&mut trust, &jc.peers, true).await, 1, "the peer answered; the genesis validator's address didn't");
+        assert!(trust.check_fresh(0, crate::chain::now_ms()).unwrap_err().to_string().contains("~7.0 days"));
+        // A liar claiming a 1-block period is held to the floor: a week-old checkpoint still joins.
+        let status = |genesis_hash: String| move || {
+            let genesis_hash = genesis_hash.clone();
+            async move { Json(serde_json::json!({ "genesis_hash": genesis_hash, "weak_subjectivity_blocks": 1 })) }
+        };
+        let served = g.clone();
+        let liar = serve(Router::new().route("/api/genesis", get(move || async move { Json(served.clone()) })).route("/api/status", get(status(hash.clone())))).await;
+        let err = try_join(&liar, "lied-to", pins(21 * day)).await.unwrap().unwrap_err().to_string();
+        assert!(err.contains("~7.0 days") && err.contains("the protocol's floor; it reports 1"), "{err}");
+        try_join(&liar, "lied-to", pins(24 * day)).await.unwrap().unwrap();
+        // Another chain's node isn't heard at all.
+        let other = serve(Router::new().route("/api/status", get(status("00".repeat(32))))).await;
+        assert_eq!(crate::checkpoints::peer_periods(&[other.clone(), url.clone()], &hash, Duration::from_secs(5)).await, vec![(url.clone(), 7 * day)]);
+        drop(chain);
+        std::fs::remove_dir_all(root).ok();
+    }
+
     /// Sync batches that contradict a trusted checkpoint are refused before anything executes: a
     /// block at the checkpoint's height with another hash, or another set for the epoch it pins.
     #[test]
@@ -1543,28 +1761,28 @@ mod tests {
         let t0 = std::time::Instant::now();
         let second = Duration::from_secs(1);
         let mut r = Rotation::starting_at(3, 0);
-        assert_eq!(r.progress(200, Duration::from_secs(20), second, t0), None, "10 blocks a second: fine");
+        assert_eq!(r.progress(round(200, Duration::from_secs(20)), second, t0), None, "10 blocks a second: fine");
         assert_eq!(r.current(), 1, "an untried peer next");
-        assert_eq!(r.progress(1, Duration::from_millis(400), second, t0), None, "one block in 0.4 s keeps up (too short a round to judge against the best)");
+        assert_eq!(r.progress(round(1, Duration::from_millis(400)), second, t0), None, "one block in 0.4 s keeps up (too short a round to judge against the best)");
         assert_eq!(r.current(), 2);
-        assert_eq!(r.progress(1, Duration::from_millis(29_000), second, t0), Some(SLOW_PEER_BENCH), "a trickle");
+        assert_eq!(r.progress(round(1, Duration::from_millis(29_000)), second, t0), Some(SLOW_PEER_BENCH), "a trickle");
         assert_eq!(r.current(), 0);
-        assert_eq!(r.progress(200, Duration::from_secs(20), second, t0), None);
+        assert_eq!(r.progress(round(200, Duration::from_secs(20)), second, t0), None);
         assert_eq!(r.current(), 0, "the fastest recent peer goes on (2 is benched, 1 slower)");
         r.advance(t0);
         r.advance(t0);
         assert_eq!(r.current(), 0, "peer 2 is skipped while benched");
         r.advance(t0);
-        assert_eq!(r.progress(3, Duration::from_secs(2), second, t0), Some(SLOW_PEER_BENCH));
+        assert_eq!(r.progress(round(3, Duration::from_secs(2)), second, t0), Some(SLOW_PEER_BENCH));
         assert_eq!(r.current(), 0);
-        assert_eq!(r.progress(1, Duration::from_secs(1), second, t0), Some(SLOW_PEER_BENCH));
+        assert_eq!(r.progress(round(1, Duration::from_secs(1)), second, t0), Some(SLOW_PEER_BENCH));
         assert_eq!(r.current(), 1, "all benched: plain turns");
-        assert_eq!(r.progress(1, Duration::from_secs(5), second, t0), Some(2 * SLOW_PEER_BENCH), "twice in a row: longer");
+        assert_eq!(r.progress(round(1, Duration::from_secs(5)), second, t0), Some(2 * SLOW_PEER_BENCH), "twice in a row: longer");
         let later = t0 + SLOW_PEER_MAX;
         r.advance(later);
         assert_eq!(r.current(), 0, "benches run out");
         for _ in 0..20 {
-            r.progress(1, Duration::from_secs(5), second, later);
+            r.progress(round(1, Duration::from_secs(5)), second, later);
         }
         assert!(r.strikes.iter().all(|s| *s <= 21) && r.benched_until.iter().flatten().all(|t| *t <= later + SLOW_PEER_MAX));
         // Nothing new: at once is fine (the next peer's turn); after a long wait it's a stall.
@@ -1580,19 +1798,78 @@ mod tests {
         assert_eq!(r.failed(t0), SLOW_PEER_BENCH);
         assert_eq!(r.current(), 1);
         for _ in 0..3 {
-            assert_eq!(r.progress(200, Duration::from_millis(500), second, t0), None);
+            assert_eq!(r.progress(round(200, Duration::from_millis(500)), second, t0), None);
             assert_eq!(r.current(), 1);
         }
         let mut r = Rotation::starting_at(2, 0);
-        assert_eq!(r.progress(200, Duration::from_millis(500), second, t0), None);
+        assert_eq!(r.progress(round(200, Duration::from_millis(500)), second, t0), None);
         assert_eq!(r.current(), 1, "an unasked peer next");
         assert_eq!(r.nothing(Duration::from_millis(10), second, t0), None);
         assert_eq!(r.current(), 0);
-        assert_eq!(r.progress(200, Duration::from_millis(500), second, t0), None);
+        assert_eq!(r.progress(round(200, Duration::from_millis(500)), second, t0), None);
         assert_eq!(r.current(), 0, "asked recently, and no rate to beat this one's: not asked again after every round");
         // The first peer asked is a random one, not always the list's first.
         let firsts: std::collections::BTreeSet<usize> = (0..64).map(|_| Rotation::new(4).current()).collect();
         assert!(firsts.len() > 1, "{firsts:?}");
+    }
+
+    /// review-r2-sync-1: the bar a round is judged against is what another peer really delivered.
+    /// A tiny round answered at once counts as a quarter block time long, so it can't bench a
+    /// full one; a real fast batch can, until its peer has nothing new (its rate goes, and with
+    /// every free peer quiet the benched one is free and isn't judged against the old bar) or
+    /// trickles far below the benched peer (which is free again); a full batch at an epoch's end
+    /// or a trickler's rate frees nobody; and a peer is far slower only in blocks and in bytes.
+    #[test]
+    fn a_bar_is_only_what_a_peer_really_delivered() {
+        let t0 = std::time::Instant::now();
+        let second = Duration::from_secs(1);
+        let ms = Duration::from_millis;
+        // 1 block in 1 ms is 4 a second, not 1,000: a 200-block round of 1.2 s isn't below it.
+        let mut r = Rotation::starting_at(2, 0);
+        assert_eq!(r.progress(round(1, ms(1)), second, t0), None);
+        assert_eq!(r.rates[0].map(|b| b.blocks), Some(4.0));
+        assert_eq!(r.current(), 1, "the untried peer");
+        assert_eq!(r.progress(round(200, ms(1_200)), second, t0), None);
+        // 200 in 10 ms (800 a second over a quarter block time) benches a 4 s round (50 a second).
+        let fast_then_slow = || {
+            let mut r = Rotation::starting_at(2, 0);
+            assert_eq!(r.progress(round(200, ms(10)), second, t0), None);
+            assert_eq!(r.progress(round(200, ms(4_000)), second, t0), Some(SLOW_PEER_BENCH));
+            assert_eq!((r.current(), r.relative[1]), (0, true), "benched for being slower");
+            r
+        };
+        let mut r = fast_then_slow();
+        assert_eq!(r.nothing(ms(1), second, t0), None);
+        assert!(r.rates[0].is_none(), "a peer with nothing new is no bar");
+        assert_eq!(r.current(), 1, "every free peer has nothing: the slower one is free again");
+        assert_eq!(r.progress(round(200, ms(4_000)), second, t0), None, "and no old bar benches it");
+        // A trickle far below the benched peer's rate frees it, and the faster one goes on.
+        let mut r = fast_then_slow();
+        assert_eq!(r.progress(round(1, ms(490)), second, t0), None);
+        assert_eq!((r.current(), r.benched(1, t0)), (1, false));
+        // Not a full batch, however small (the epoch's last blocks) ...
+        let mut r = fast_then_slow();
+        assert_eq!(r.progress(Round { blocks: 3, bytes: 3 * BLOCK_BYTES, limit: 3, took: ms(200) }, second, t0), None);
+        assert!(r.benched(1, t0));
+        // ... nor a short round no slower than the benched peer's rate.
+        assert_eq!(r.progress(round(20, ms(200)), second, t0), None);
+        assert!(r.benched(1, t0));
+        // A round a block time long far below the benched peer's rate is benched in its turn.
+        let mut r = fast_then_slow();
+        assert_eq!(r.progress(round(2, ms(1_000)), second, t0), Some(SLOW_PEER_BENCH), "2 a second against the benched peer's 50");
+        // Far slower in blocks but not in bytes (bigger blocks) isn't far slower.
+        let mut r = Rotation::starting_at(2, 0);
+        r.progress(round(200, ms(10)), second, t0);
+        let big = Round { blocks: 20, bytes: 20 * 100 * BLOCK_BYTES, limit: 200, took: ms(2_000) };
+        assert_eq!(r.progress(big, second, t0), None);
+        // A failed or stalled peer's rate is no bar.
+        let mut r = Rotation::starting_at(2, 0);
+        r.progress(round(200, ms(10)), second, t0);
+        assert_eq!(r.progress(round(200, ms(1_000)), second, t0), None, "200 a second is a quarter of 800: not far below");
+        assert_eq!(r.current(), 0, "the faster one goes on");
+        r.failed(t0);
+        assert_eq!(r.current(), 1);
+        assert_eq!(r.progress(round(200, ms(4_000)), second, t0), None);
     }
 
     /// F27 (R1 bypass): a peer delivering blocks just over twice the chain's rate passes the
@@ -1603,8 +1880,8 @@ mod tests {
     fn a_peer_just_above_the_chain_rate_loses_to_a_fast_one() {
         let t0 = std::time::Instant::now();
         let second = Duration::from_secs(1);
-        let trickle = |r: &mut Rotation| r.progress(4, Duration::from_millis(1_800), second, t0);
-        let honest = |r: &mut Rotation| r.progress(200, Duration::from_millis(500), second, t0);
+        let trickle = |r: &mut Rotation| r.progress(round(4, Duration::from_millis(1_800)), second, t0);
+        let honest = |r: &mut Rotation| r.progress(round(200, Duration::from_millis(500)), second, t0);
         let mut r = Rotation::starting_at(2, 0);
         assert_eq!(trickle(&mut r), None, "2.2 blocks a second, over twice the chain's 1");
         assert_eq!(r.current(), 1, "the untried peer next");
@@ -1624,12 +1901,171 @@ mod tests {
         }
         // Once the honest rate is old, the next good round tries the other peer again.
         let mut r = Rotation::starting_at(2, 1);
-        r.progress(200, Duration::from_millis(500), second, t0);
+        r.progress(round(200, Duration::from_millis(500)), second, t0);
         assert_eq!(r.current(), 0);
-        r.progress(200, Duration::from_millis(500), second, t0);
+        r.progress(round(200, Duration::from_millis(500)), second, t0);
         assert_eq!(r.current(), 1);
-        r.progress(200, Duration::from_millis(500), second, t0 + RATE_WINDOW + second);
+        r.progress(round(200, Duration::from_millis(500)), second, t0 + RATE_WINDOW + second);
         assert_eq!(r.current(), 0, "peer 0's rate is stale: untried");
+    }
+
+    /// What a simulated peer does with one `/api/sync` request.
+    enum Answer {
+        /// This many blocks (of `BLOCK_BYTES` each), sent in this long.
+        Blocks(u64, Duration),
+        /// "Nothing new", after this long.
+        Nothing(Duration),
+        /// An error, after this long.
+        Fail(Duration),
+    }
+    const BLOCK_BYTES: u64 = 2_000;
+
+    /// What a simulated peer sees of the node's rotation when it's asked: the worst case, an
+    /// attacker that knows how long each peer stays benched.
+    struct Seen {
+        benched: Vec<Duration>,
+    }
+    type Peer = Box<dyn FnMut(u64, u64, u64, &Seen) -> Answer>;
+
+    /// A round of `blocks` blocks of `BLOCK_BYTES` each, out of 200 asked for, sent in `took`.
+    fn round(blocks: u64, took: Duration) -> Round {
+        Round { blocks, bytes: blocks * BLOCK_BYTES, limit: 200, took }
+    }
+
+    /// Drives the real [`Rotation`] the way `sync_loop` does, in virtual time (1 s blocks, mainnet
+    /// epochs, batches of at most 200 that never cross an epoch): no pause after a round that
+    /// delivered, `block_time / peers` after "nothing new". `peers[i](from, limit, tip, now)`
+    /// answers a request. Starts `behind` blocks behind at peer `start`; returns how far behind
+    /// the node is after `run`, and how often each peer was asked.
+    fn simulate(peers: &mut [Peer], behind: u64, start: usize, run: Duration) -> (u64, Vec<usize>) {
+        let block_time = Duration::from_secs(1);
+        let epoch = 3_600u64;
+        let t0 = std::time::Instant::now();
+        let mut r = Rotation::starting_at(peers.len(), start);
+        let (mut now, mut height) = (Duration::ZERO, 10_000u64);
+        let tip = |now: Duration| 10_000 + behind + now.as_secs();
+        let mut asked = vec![0; peers.len()];
+        while now < run {
+            let i = r.current();
+            asked[i] += 1;
+            let from = height + 1;
+            let limit = ((from / epoch + 1) * epoch - from).min(200);
+            let seen = Seen { benched: r.benched_until.iter().map(|b| b.map_or(Duration::ZERO, |t| t.saturating_duration_since(t0 + now))).collect() };
+            match peers[i](from, limit, tip(now), &seen) {
+                Answer::Blocks(n, took) => {
+                    let n = n.min(tip(now).saturating_sub(height)).min(limit);
+                    now += took;
+                    height += n;
+                    if n > 0 {
+                        r.progress(Round { blocks: n, bytes: n * BLOCK_BYTES, limit, took }, block_time, t0 + now);
+                    } else {
+                        r.nothing(took, block_time, t0 + now);
+                        now += block_time / peers.len() as u32;
+                    }
+                }
+                Answer::Nothing(took) => {
+                    now += took;
+                    r.nothing(took, block_time, t0 + now);
+                    now += block_time / peers.len() as u32;
+                }
+                Answer::Fail(took) => {
+                    now += took;
+                    r.failed(t0 + now);
+                    now += Duration::from_millis(500);
+                }
+            }
+        }
+        (tip(now) - height, asked)
+    }
+
+    /// An honest peer: everything asked for that exists, in `rtt` plus `per_block` a block.
+    fn honest(rtt: Duration, per_block: Duration) -> Peer {
+        Box::new(move |from, limit, tip, _| match tip.checked_sub(from) {
+            Some(more) => {
+                let n = (more + 1).min(limit);
+                Answer::Blocks(n, rtt + per_block * n as u32)
+            }
+            None => Answer::Nothing(rtt),
+        })
+    }
+
+    /// review-r2-sync-1: a colocated peer answers one round in 50 with a single block in 1 ms
+    /// (1,000 blocks a second, as R2 measured it) and every other round "nothing new" in 1 ms,
+    /// against an honest peer whose full rounds take a block time or more (0.2 s + 4 ms a block,
+    /// 1 s for 200). Its tiny round must not become the bar that benches the honest peer, and its
+    /// instant empty answers must not keep the turn while the honest peer has blocks: the node
+    /// keeps up from any lag, from either peer. The same with the R2 trickler (4 blocks a round,
+    /// 450 ms each) in place of the liar, and with both.
+    #[test]
+    fn a_fast_tiny_round_then_empty_answers_does_not_capture_sync() {
+        let liar = || -> Peer {
+            let mut round = 0u64;
+            Box::new(move |_, _, _, _| {
+                round += 1;
+                if round % 50 == 1 {
+                    Answer::Blocks(1, Duration::from_millis(1))
+                } else {
+                    Answer::Nothing(Duration::from_millis(1))
+                }
+            })
+        };
+        let trickler = || -> Peer { Box::new(|_, limit, _, _| Answer::Blocks(limit.min(4), Duration::from_millis(450 * limit.min(4)))) };
+        let slow_honest = || honest(Duration::from_millis(200), Duration::from_millis(4));
+        for behind in [600, 3_600, 86_400] {
+            for start in [0, 1] {
+                let (lag, asked) = simulate(&mut [liar(), slow_honest()], behind, start, Duration::from_secs(3 * 3_600));
+                assert!(lag <= 2, "{behind} behind, starting at {start}: {lag} behind after 3 h; asked {asked:?}");
+                let (lag, asked) = simulate(&mut [trickler(), slow_honest()], behind, start, Duration::from_secs(3 * 3_600));
+                assert!(lag <= 2, "trickler, {behind} behind, starting at {start}: {lag} behind after 3 h; asked {asked:?}");
+            }
+            let (lag, asked) = simulate(&mut [liar(), trickler(), slow_honest()], behind, 0, Duration::from_secs(3 * 3_600));
+            assert!(lag <= 3, "liar and trickler, {behind} behind: {lag} behind after 3 h; asked {asked:?}");
+        }
+    }
+
+    /// review-r2-sync-1, the variants, against a slow honest peer (a 200-block round takes 4 s,
+    /// 50 blocks a second) and hostile peers that see the rotation's state. From a second before
+    /// the honest peer's bench ends they send just enough real blocks to keep the turn and bench
+    /// it again when it's tried, for longer each time: 51 blocks in 240 ms, 4× its pace and a
+    /// little more. While it's benched they trickle single blocks just over twice the chain's rate (one in 490 ms, too short a
+    /// round to judge), answer "nothing new" at once, fail at once, or mix those; one such peer,
+    /// or two. None of them keeps the node from catching up a day of blocks within an hour (the
+    /// honest peer alone takes about half an hour): a trickle far below the benched peer's rate
+    /// frees it, and so does every other peer having nothing. (With 6a338b6's rules, or without
+    /// either way back, the node is tens of thousands of blocks behind after the hour.)
+    #[test]
+    fn hostile_peers_cant_hold_the_turn_after_benching_an_honest_one() {
+        let smart = |honest: usize, then: fn(u64) -> Answer| -> Peer {
+            let mut round = 0u64;
+            Box::new(move |_, limit, _, seen: &Seen| {
+                round += 1;
+                if seen.benched[honest] > Duration::from_secs(1) {
+                    then(round)
+                } else {
+                    Answer::Blocks(limit.min(51), Duration::from_millis(240))
+                }
+            })
+        };
+        let trickle = |_| Answer::Blocks(1, Duration::from_millis(490));
+        let nothing = |_| Answer::Nothing(Duration::from_millis(1));
+        let fail = |_| Answer::Fail(Duration::from_millis(1));
+        let mixed = |round: u64| match round % 3 {
+            0 => Answer::Blocks(1, Duration::from_millis(490)),
+            1 => Answer::Nothing(Duration::from_millis(1)),
+            _ => Answer::Fail(Duration::from_millis(1)),
+        };
+        let slow_honest = || honest(Duration::from_millis(200), Duration::from_millis(19));
+        let day = 86_400;
+        let (alone, _) = simulate(&mut [slow_honest()], day, 0, Duration::from_secs(30 * 60));
+        assert!(alone < 1_000, "the honest peer alone: {alone} behind after half an hour");
+        for (name, then) in [("trickle", trickle as fn(u64) -> Answer), ("nothing", nothing), ("fail", fail), ("mixed", mixed)] {
+            for start in [0, 1] {
+                let (lag, asked) = simulate(&mut [smart(1, then), slow_honest()], day, start, Duration::from_secs(3_600));
+                assert!(lag <= 2, "{name}, starting at {start}: {lag} behind after an hour; asked {asked:?}");
+            }
+            let (lag, asked) = simulate(&mut [smart(2, then), smart(2, then), slow_honest()], day, 2, Duration::from_secs(3_600));
+            assert!(lag <= 3, "two {name}: {lag} behind after an hour; asked {asked:?}");
+        }
     }
 
     /// F27: a peer that serves real, certified blocks just slower than the chain gets one round,
