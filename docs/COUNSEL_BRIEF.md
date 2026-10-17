@@ -79,7 +79,7 @@ Genesis supply is 1,000,000,000 FANG. Nothing is sold (TOKENOMICS.md section 1).
 - **Claims:** a contributor links a GitHub handle (a public gist containing their address, recorded on-chain), then claims a merged PR with a small bond. Newcomers need a vouch from someone with Soul.
 - **Checks:** validators check the merge on GitHub and attest it on-chain.
 - **Judging:** after a ~30-day revert window, a Séance judges matured claims in pairs. A Séance is a jury of humans with Soul, drawn at random (on mainnet from a validator randomness beacon). Jurors receive 10% of each Séance's payout.
-- **Payouts:** per person, the best claim in full and each further one a quarter of the one before, vesting over ~90 days, with clawback if the PR is reverted.
+- **Payouts:** per person, one win rate pooled over all their claims in the Séance, the first claim in full at that rate and each further one a quarter of the one before, vesting over ~90 days, with clawback if the PR is reverted.
 - **Who pays:** the payer is the protocol, by rule. There's no entity, but the maintainers who merge PRs effectively decide what's eligible.
 - **Familiars:** AI agents contribute as session keys of a human sponsor. Their rewards and accountability go to the sponsor.
 - **Soul** is non-transferable reputation earned from jury outcomes, and it decays. It gates jury duty and boosts payouts up to 1.5×. On mainnet a published ledger in genesis bootstraps it, and the rule that derives that ledger isn't final.

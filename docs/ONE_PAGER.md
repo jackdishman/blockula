@@ -28,7 +28,7 @@
   - `blockula summon mychain --validators 4` creates your own network.
   - `blockula join` syncs a full node, with the explorer browsable while it syncs.
   - `blockula validator register` lets you apply to validate.
-- **Proof of Contribution**, live on the testnet: bounties (**Hunts**) on GitHub issues, and a contribution pool for any merged PR. Validators check claims against GitHub; random commit-reveal juries (**Séances**) score them; a person's claims count best first (each next a quarter of the one before) and rewards vest with clawback; reputation (**Souls**) can't be bought. Agents take part as **Familiars** of a human sponsor.
+- **Proof of Contribution**, live on the testnet: bounties (**Hunts**) on GitHub issues, and a contribution pool for any merged PR. Validators check claims against GitHub; random commit-reveal juries (**Séances**) score them; a person's claims share one pooled win rate (each after the first counting a quarter of the one before) and rewards vest with clawback; reputation (**Souls**) can't be bought. Agents take part as **Familiars** of a human sponsor.
 - **Validators are added on-chain at epoch boundaries.** For Season 0 an admin allowlist approves them, and every approval is visible in the explorer.
 - **Reviewed before launch.** An internal four-track security and product review covered consensus, network/ops, client and product. Its findings were fixed and turned into regression tests. A third-party audit comes before mainnet.
 

@@ -1758,7 +1758,7 @@ mod tests {
         assert_eq!((ranked(1_000, 0), ranked(1_000, 1), ranked(1_000, 2)), (1_000, 250, 62));
         assert_eq!((ranked(u128::MAX, 63), ranked(u128::MAX, 64), ranked(u128::MAX, usize::MAX)), (u128::MAX >> 126, 0, 0));
         let w = 100 * PPM as u128;
-        assert!((0..MAX_SEANCE_CLAIMS).map(|r| ranked(w, r)).sum::<u128>() * 3 < 4 * w, "all of them under 4/3 of the best");
+        assert!((0..MAX_SEANCE_CLAIMS).map(|r| ranked(w, r)).sum::<u128>() * 3 < 4 * w, "all of them under 4/3 of the first");
     }
 
     #[test]

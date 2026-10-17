@@ -404,14 +404,20 @@ fn lines_of(f: &FileDiff) -> Option<(BTreeMap<&str, usize>, BTreeMap<&str, usize
     f.patch.as_deref().map(changed_lines).filter(|(added, removed)| !added.is_empty() || !removed.is_empty())
 }
 
-/// Whether the pre-PR state of `original`'s file `f`, which has no lines to compare, is known: a
-/// file the PR added, copied or removed always is; one it changed or renamed when its blob at the
-/// PR's base is (`base`, [`base_blobs`]).
-fn judgeable(f: &FileDiff, base: &BTreeMap<String, String>) -> bool {
+/// Whether the diff `revert` brings `original`'s file `f`, which has no lines to compare, back to
+/// its pre-PR state ([`restores`]), when that can be told: a file the PR added, copied or removed
+/// always can; one it changed or renamed when its blob at the PR's base is known (`base`,
+/// [`base_blobs`]), or when `revert` doesn't touch it at all (then it can't have brought it back).
+/// `None`: `revert` changes it, to a blob that can't be compared.
+fn restored(f: &FileDiff, revert: &[FileDiff], base: &BTreeMap<String, String>) -> Option<bool> {
     match f.status.as_str() {
-        "added" | "copied" | "removed" => true,
-        "modified" | "changed" | "renamed" => base.contains_key(f.before()),
-        _ => false,
+        "added" | "copied" | "removed" => Some(restores(f, revert, base)),
+        "modified" | "changed" | "renamed" if base.contains_key(f.before()) => Some(restores(f, revert, base)),
+        "modified" | "changed" | "renamed" => {
+            let touched = revert.iter().any(|r| [f.filename.as_str(), f.before()].contains(&r.filename.as_str()) || r.previous_filename.as_deref().is_some_and(|p| [f.filename.as_str(), f.before()].contains(&p)));
+            (!touched).then_some(false)
+        }
+        _ => None,
     }
 }
 
@@ -420,22 +426,22 @@ fn judgeable(f: &FileDiff, base: &BTreeMap<String, String>) -> bool {
 /// * its lines: more than half of the lines `original` added and removed, file by file, are
 ///   removed and added back by `revert`;
 /// * its files with no lines to compare (binary files, diffs too large for GitHub to show): more
-///   than half of those whose pre-PR state is known are brought back to it ([`restores`]; audit
-///   review-fix-poc-3, review-r2-poc-1). A file whose pre-PR state GitHub didn't give
-///   ([`base_blobs`]) counts as neither restored nor not (audit review-r3-poc-1), so neither the
-///   PR's layout nor a listing's cap decides.
+///   than half of those it can tell about are brought back to their pre-PR state ([`restored`];
+///   audit review-fix-poc-3, review-r2-poc-1). A file `revert` changes whose pre-PR blob GitHub
+///   didn't give ([`base_blobs`]) counts as neither restored nor not (audit review-r3-poc-1), so
+///   neither the PR's layout nor a listing's cap decides; one it leaves alone wasn't restored.
 ///
 /// A PR with both needs both (audit review-r2-poc-1, round 4: undoing the one README line of a PR
 /// that also added 20 icons isn't reverting it). `None` when there is nothing to judge: `original`
-/// lists no files, or none with lines and none with a known pre-PR state.
+/// lists no files, or none with lines and none whose restoring can be told.
 pub fn undoes(original: &[FileDiff], revert: &[FileDiff], base: &BTreeMap<String, String>) -> Option<bool> {
     let (mut matched, mut total) = (0usize, 0usize);
-    let (mut known, mut restored) = (0usize, 0usize);
+    let (mut known, mut brought) = (0usize, 0usize);
     for f in original {
         let Some((added, removed)) = lines_of(f) else {
-            if judgeable(f, base) {
+            if let Some(back) = restored(f, revert, base) {
                 known += 1;
-                restored += usize::from(restores(f, revert, base));
+                brought += usize::from(back);
             }
             continue;
         };
@@ -448,7 +454,7 @@ pub fn undoes(original: &[FileDiff], revert: &[FileDiff], base: &BTreeMap<String
     if total == 0 && known == 0 {
         return None;
     }
-    Some((total == 0 || 2 * matched > total) && (known == 0 || 2 * restored > known))
+    Some((total == 0 || 2 * matched > total) && (known == 0 || 2 * brought > known))
 }
 
 /// The files of `original` with no lines to compare whose pre-PR blob a revert must bring back
@@ -1604,12 +1610,15 @@ mod tests {
         }
         // Nothing GitHub can tell about the base: nothing to judge, no revert attested.
         assert_eq!(Mock::new(routes(6, back(6), 0, false)).find(42).await.unwrap(), None);
-        // The pure rule: unknown files are neither restored nor not.
+        // The pure rule: a file the candidate changes to a blob that can't be compared is neither
+        // restored nor not; one it leaves alone wasn't restored.
         let claim: Vec<FileDiff> = (0..6).map(|i| logo(i, "modified", 0x1b)).collect();
         let known: BTreeMap<String, String> = (0..2).map(|i| (format!("d{i}/logo.png"), blob(i, 0x1a))).collect();
         assert_eq!(undoes(&claim, &back(6), &known), Some(true));
+        assert_eq!(undoes(&claim, &back(2), &known), Some(false), "the two known back, the four unknown left alone: 2 of 6");
         assert_eq!(undoes(&claim, &back(1), &known), Some(false));
         assert_eq!(undoes(&claim, &back(6), &BTreeMap::new()), None);
+        assert_eq!(undoes(&claim, &back(3), &BTreeMap::new()), Some(false), "three left alone, three unknown");
     }
 
     /// Audit review-r2-poc-1 (round 4): Alice's #42 adds 20 icons (binary, no patch) and one
@@ -1665,10 +1674,16 @@ mod tests {
         most.extend(line_only.clone());
         assert_eq!(undoes(&claim, &most, &none), Some(true), "11 of 20 icons and the line");
         assert_eq!(undoes(&claim, &line_only, &none), Some(false));
-        // A text PR's binaries whose pre-PR state is unknown don't make it revert-proof.
+        // A text PR's binaries whose pre-PR state is unknown don't make it revert-proof: a revert
+        // that changes them back (to blobs that can't be compared) is judged by its lines, and
+        // one that leaves them alone didn't undo them.
+        let bins = |n: usize| -> Vec<FileDiff> { (0..n).map(|i| FileDiff { filename: format!("d{i}/big.bin"), status: "modified".into(), ..Default::default() }).collect() };
         let mut text_and_unknown = vec![readme("@@ -1 +1,2 @@\n # Blockula\n+See the icons")];
-        text_and_unknown.extend((0..5).map(|i| FileDiff { filename: format!("d{i}/big.bin"), status: "modified".into(), ..Default::default() }));
-        assert_eq!(undoes(&text_and_unknown, &line_only, &none), Some(true));
+        text_and_unknown.extend(bins(5));
+        let mut full = line_only.clone();
+        full.extend(bins(5));
+        assert_eq!(undoes(&text_and_unknown, &full, &none), Some(true));
+        assert_eq!(undoes(&text_and_unknown, &line_only, &none), Some(false));
     }
 
     /// Audit review-r3-poc-2: claim #42 is squash-merged, and a maintainer pushes `git revert` R

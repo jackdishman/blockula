@@ -74,7 +74,7 @@ blockula hunt list | show | create | fund | cancel
 **Beyond Hunts, the contribution pool pays testnet FANG for any merged PR to a pool repo** (Proof of Contribution, [docs/PLAN.md](docs/PLAN.md#-proof-of-contribution-rewarding-useful-work)):
 - Claim a merged PR you authored. Validators check it on GitHub.
 - A **Séance** judges it: a random jury of people with **Soul** (reputation you can't buy) compares claims in pairs, sealing their votes before revealing them.
-- Payouts count a person's claims best first, each next one a quarter of the one before (so volume doesn't pay), and vest over ~90 days with clawback.
+- Payouts rate a person's claims in a Séance together (one win rate over all their comparisons) and count each after the first a quarter of the one before (so volume doesn't pay), and vest over ~90 days with clawback.
 
 ```bash
 blockula contrib link-github vlad <gist id>       # once
