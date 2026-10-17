@@ -527,3 +527,154 @@ fn a_full_mempool_doesnt_starve_the_validators_duties() {
     assert!(t.c.state.beacon.rounds[&3].contains_key(&me));
     std::fs::remove_dir_all(&t.root).ok();
 }
+
+/// `n` accounts funded straight in the state, for a crowd of txs that tip (the state machine
+/// doesn't check signatures; admission over HTTP and gossip does, so their txs carry dummy ones).
+fn crowd(t: &mut Net, n: u32, salt: u32) -> Vec<Keys> {
+    let senders: Vec<Keys> = (0..n).map(|i| Keys::from_seed(crypto::hash(&[salt.to_le_bytes(), i.to_le_bytes()].concat()))).collect();
+    for k in &senders {
+        t.c.state.accounts.insert(k.address(), crate::chain::Account { balance: 1_000 * DROPS_PER_FANG, ..Default::default() });
+        t.c.state.supply += 1_000 * DROPS_PER_FANG;
+    }
+    senders
+}
+
+/// A 1-drop transfer to `to` from `k` at `nonce`, tipping `tip` (a dummy signature).
+fn pay(c: &Chain, k: &Keys, to: &str, nonce: u64, tip: u64) -> Tx {
+    let mut tx = Tx { chain_id: c.genesis.chain_id.clone(), genesis_hash: c.genesis_hash.clone(), from: k.address(), nonce, fee: 0, tip, valid_until: c.height() + 100, action: Action::Transfer { to: to.into(), amount: 1 }, memo: String::new(), public_key: hex::encode(k.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+    tx.fee = 2 * min_fee(tx.size()) + tip;
+    tx
+}
+
+/// Queues txs tipping `tip` from `senders` (each up to `MAX_PENDING_PER_SENDER`) until the
+/// mempool holds `until` txs outside the duty lane, or `senders` run out.
+fn fill(t: &mut Net, senders: &[Keys], to: &str, until: usize, tip: u64) {
+    let mut regular = t.c.mempool.iter().filter(|tx| !t.c.in_lane(&tx.id())).count();
+    'fill: for k in senders {
+        for _ in t.c.pending_count(&k.address())..crate::chain::MAX_PENDING_PER_SENDER {
+            if regular >= until {
+                break 'fill;
+            }
+            let tx = pay(&t.c, k, to, t.c.next_nonce(&k.address()), tip);
+            t.c.submit(tx).unwrap();
+            regular += 1;
+        }
+    }
+}
+
+/// Review of F32/F56: a validator that committed while in the set and left it at the next
+/// boundary (jailed, outranked, under-bonded) still owes its reveal, and `end_epoch` jails and
+/// slashes it for a miss. The lane used to take duties only from validators in the set of this
+/// epoch or the next, so a full mempool of tipped txs refused that reveal ("mempool is full"),
+/// and the validator was jailed for it: F56's outcome. A reveal is a duty while its commitment
+/// is unopened, whatever the set.
+#[test]
+fn a_validator_that_left_the_set_still_reveals_through_a_full_mempool() {
+    use crate::chain::MAX_MEMPOOL;
+    let mut t = net("left", 4, None);
+    let home = t.homes[0].clone();
+    let me = t.c.me().unwrap();
+    let mut secrets = Secrets::open(&home).unwrap();
+    assert_eq!(duties(&mut t.c, &mut secrets).unwrap(), vec!["committed to the beacon for epoch 2".to_string()]);
+    t.c.produce_block().unwrap();
+    assert!(t.c.state.beacon.rounds[&2].contains_key(&me));
+    // It leaves the set at the end of epoch 0 (jailed, say, for downtime), owing epoch 2's reveal.
+    let h = t.c.height();
+    crate::staking::jail(&mut t.c.state, &mut crate::chain::Journal::default(), &me, h, 0, "downtime");
+    t.advance_to(9);
+    assert!(!t.c.state.active_sets[&1].contains(&me) && !t.c.state.active_sets.contains_key(&2), "in neither this epoch's set nor (yet) the next");
+    // The reveal half of epoch 1, under a full mempool of tipped txs.
+    t.advance_to(14);
+    let senders = crowd(&mut t, 80, 1);
+    fill(&mut t, &senders, &me, MAX_MEMPOOL, 1);
+    assert_eq!(t.c.mempool.len(), MAX_MEMPOOL);
+    assert_eq!(duties(&mut t.c, &mut secrets).unwrap(), vec!["revealed the beacon secret for epoch 2".to_string()]);
+    let order = t.c.proposal_txs();
+    assert!(matches!(order[0].action, Action::BeaconReveal { epoch: 2, .. }) && t.c.in_lane(&order[0].id()), "in the lane, leading proposals");
+    let block: Vec<Tx> = order.into_iter().take(20).cloned().collect();
+    t.c.produce_block_with(block).unwrap();
+    assert_eq!(t.c.state.beacon.rounds[&2][&me].revealed_at, Some(15));
+    t.advance_to(19);
+    assert!(!t.c.state.beacon.values[&2].missed.contains(&me), "not missed, so not jailed for it");
+    assert!(!t.c.state.staking.pools[&me].jail.as_ref().unwrap().reason.contains("didn't reveal"));
+    std::fs::remove_dir_all(&t.root).ok();
+}
+
+/// Review of F32: the full mempool gives up only a sender's last queued tx, and never one in the
+/// duty lane, so a duty at the end of its sender's queue used to make the whole queue
+/// unevictable: a validator's account could pin untipped txs during congestion behind a
+/// commitment. The lane is a prefix of each sender's queue now: a duty queued behind the
+/// sender's other txs queues like them (and goes first, as the cheapest tail), and joins the
+/// lane once nothing else is ahead of it.
+#[test]
+fn a_duty_doesnt_shield_its_senders_other_txs_from_eviction() {
+    use crate::chain::MAX_MEMPOOL;
+    let mut t = net("pin", 1, None);
+    let home = t.homes[0].clone();
+    let me = t.c.me().unwrap();
+    assert_eq!(t.c.system_fee_payer().as_deref(), Some(me.as_str()));
+    let mut secrets = Secrets::open(&home).unwrap();
+    let senders = crowd(&mut t, 81, 2);
+    // The validator's account queues 10 untipped transfers, then its node the commitment.
+    let v0 = t.vals[0].clone_keys();
+    for _ in 0..10 {
+        t.c.submit(signed(&t.c, &v0, Action::Transfer { to: senders[0].address(), amount: 1 })).unwrap();
+    }
+    assert_eq!(duties(&mut t.c, &mut secrets).unwrap(), vec!["committed to the beacon for epoch 2".to_string()]);
+    let commit = t.c.mempool.iter().find(|tx| matches!(tx.action, Action::BeaconCommit { .. })).unwrap().id();
+    assert!(!t.c.in_lane(&commit), "behind the account's other txs: not in the lane");
+    fill(&mut t, &senders[..80], &me, MAX_MEMPOOL, 1);
+    assert_eq!(t.c.mempool.len(), MAX_MEMPOOL);
+    // Eleven txs outbid the cheapest tails: the validator's account's, the commitment first.
+    let late = &senders[80];
+    for n in 0..11 {
+        t.c.submit(pay(&t.c, late, &me, n, 2)).unwrap();
+    }
+    assert_eq!((t.c.mempool.len(), t.c.pending_count(&me)), (MAX_MEMPOOL, 0), "nothing of the validator's account was pinned");
+    // Resubmitted with nothing ahead of it, the commitment takes a lane slot (outside the bound).
+    assert_eq!(duties(&mut t.c, &mut secrets).unwrap(), vec!["committed to the beacon for epoch 2".to_string()]);
+    assert_eq!(t.c.mempool.len(), MAX_MEMPOOL + 1);
+    let order = t.c.proposal_txs();
+    assert!(matches!(order[0].action, Action::BeaconCommit { .. }) && t.c.in_lane(&order[0].id()));
+    std::fs::remove_dir_all(&t.root).ok();
+}
+
+/// Review of fix-fees (F32): proposals rank each sender's queue by its next tx, and the node's
+/// loops queue more duties of a kind than the lane holds for it (up to four attestations a tick),
+/// untipped. A duty behind one of those used to wait behind the whole tipped backlog, lane or
+/// not. Duties past the lane's slots now move up into it once the duties ahead of them are
+/// included, so they and everything behind them lead the next proposal: a block late, not a
+/// backlog late.
+#[test]
+fn duties_past_the_lane_wait_a_block_not_the_backlog() {
+    let (mut t, alice) = revert_net("past-lane");
+    let me = t.c.me().unwrap();
+    let mut secrets = Secrets::open(&t.homes[0]).unwrap();
+    for pr in 10..13 {
+        t.tx(&alice, Action::SubmitClaim { repo: "jackdishman/blockula".into(), pr, familiar_key: None }).unwrap();
+    }
+    let first = t.c.state.poc.next_claim_id - 3;
+    // The node attests the three claims at once, as attest_claims does: one past the lane's slots.
+    let mut attested = vec![];
+    for id in first..first + 3 {
+        attested.push(t.c.submit_system(Action::AttestClaim { claim_id: id, ok: true, merge_sha: "ab".repeat(20), note: String::new() }, "attest").unwrap().id());
+    }
+    assert_eq!(attested.iter().map(|id| t.c.in_lane(id)).collect::<Vec<_>>(), vec![true, true, false]);
+    // A tipped backlog (more than a block takes), then the beacon commitment.
+    let senders = crowd(&mut t, 20, 3);
+    fill(&mut t, &senders, &me, 600, 1);
+    assert_eq!(duties(&mut t.c, &mut secrets).unwrap(), vec!["committed to the beacon for epoch 2".to_string()]);
+    let at = |t: &Net| t.c.proposal_txs().iter().position(|tx| matches!(tx.action, Action::BeaconCommit { .. })).unwrap();
+    assert_eq!(at(&t), t.c.mempool.len() - 1, "behind the untipped attestation, last of {}", t.c.mempool.len());
+    assert!(t.c.mempool.len() > 300);
+    // A block of 100 from the head of the order takes the lane's two attestations; the third and
+    // the commitment behind it move up into the lane and lead the next proposal.
+    let block: Vec<Tx> = t.c.proposal_txs().into_iter().take(100).cloned().collect();
+    t.c.produce_block_with(block).unwrap();
+    assert!(t.c.in_lane(&attested[2]));
+    assert_eq!(at(&t), 1, "right behind the third attestation");
+    let block: Vec<Tx> = t.c.proposal_txs().into_iter().take(100).cloned().collect();
+    t.c.produce_block_with(block).unwrap();
+    assert!(t.c.state.beacon.rounds[&2].contains_key(&me), "committed during epoch 0, under the backlog");
+    std::fs::remove_dir_all(&t.root).ok();
+}

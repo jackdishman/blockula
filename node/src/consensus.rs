@@ -1525,11 +1525,13 @@ where
                     },
                     msg = votes_backup.recv() => {
                         let Some((their, (from, _))) = msg else { return };
-                        hint_behind(&marshal, &chain, protection.as_deref(), epoch, their, from);
+                        let member = scheme.participants().position(&from).map(|i| i as u32);
+                        hint_behind(&marshal, &chain, protection.as_deref(), epoch, their, from, member);
                     },
                     msg = certs_backup.recv() => {
                         let Some((their, (from, _))) = msg else { return };
-                        hint_behind(&marshal, &chain, protection.as_deref(), epoch, their, from);
+                        let member = scheme.participants().position(&from).map(|i| i as u32);
+                        hint_behind(&marshal, &chain, protection.as_deref(), epoch, their, from, member);
                     },
                 }
             }
@@ -1541,14 +1543,16 @@ where
 
 /// A peer is voting in a later epoch: we're behind. Ask marshal for the finalization of our
 /// epoch's last block (from that peer); backfill + execution then drive the transition.
-fn hint_behind(marshal: &MarshalMailbox, chain: &Shared, protection: Option<&crate::protection::Protection>, ours: u64, theirs: u64, from: PublicKey) {
+/// `member`: the peer's index in our epoch's set, if it's in it.
+fn hint_behind(marshal: &MarshalMailbox, chain: &Shared, protection: Option<&crate::protection::Protection>, ours: u64, theirs: u64, from: PublicKey, member: Option<u32>) {
     if theirs <= ours {
         return;
     }
-    // Unverified, so it only keeps slashing protection's restart rule from escaping in an epoch
-    // the network may have left (audit F18).
+    // The epoch is the sender's word (the mux subchannel it picked), so slashing protection
+    // counts it only from more of our epoch's validators than can be faulty (audit F18 and its
+    // review). The boundary finalization marshal fetches is verified, and moves the node on.
     if let Some(p) = protection {
-        p.note_later_epoch(theirs);
+        p.note_later_epoch(ours, member, theirs);
     }
     let last = chain.lock().state.params.last_of(ours);
     debug!(ours, theirs, last, "peer is in a later epoch; fetching boundary");

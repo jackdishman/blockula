@@ -798,21 +798,33 @@ fn displaces(tx: &Tx, q: &Tx, relay: u64) -> bool {
 /// spends replaces it, and a full ghost share gives up its lowest tip per byte (the newest
 /// among equals, like `Chain::eviction_victim`; only when `evict`), only for a tip that clears
 /// [`displacing_tip`]: higher tips get in (audit F36), and every displacement pays the relay of
-/// its own bytes (F39). `relay`: the base fee of `tx`'s bytes. Returns the ids it displaces,
-/// with why.
-pub fn mempool_admit(queued: &[Tx], ids: &[String], tx: &Tx, relay: u64, evict: bool) -> Result<Vec<(String, &'static str)>> {
+/// its own bytes (F39). Only an unsigned tx, or another sender's last queued tx, can be given up
+/// (a signed `Shield` from the middle of its sender's queue would leave the txs behind it waiting
+/// on a nonce gap, and the newcomer's own would leave it behind one: review of F36), and a
+/// sender can't replace its own queued tx (its nonce is taken). `relay`: the base fee of `tx`'s
+/// bytes; `cap`: the most it may tip (`econ::max_tip`). Returns the ids it displaces, with why.
+pub fn mempool_admit(queued: &[Tx], ids: &[String], tx: &Tx, relay: u64, cap: u64, evict: bool) -> Result<Vec<(String, &'static str)>> {
     let Some(b) = tx.action.ghost_bundle() else { return Ok(vec![]) };
+    // Each sender's last queued tx (arrival order is each sender's nonce order).
+    let mut last: HashMap<&str, usize> = HashMap::new();
+    for (i, q) in queued.iter().enumerate().filter(|(_, q)| !q.is_unsigned()) {
+        last.insert(q.from.as_str(), i);
+    }
+    let evictable = |i: usize, q: &Tx| q.is_unsigned() || (q.from != tx.from && last.get(q.from.as_str()) == Some(&i));
     let mut ghosts = 0;
     let mut replaces = vec![];
-    // The lowest tip per byte queued (newest among equals).
+    // The lowest tip per byte queued that may go (newest among equals).
     let mut lowest: Option<(&Tx, &String)> = None;
-    for (q, id) in queued.iter().zip(ids) {
+    for (i, (q, id)) in queued.iter().zip(ids).enumerate() {
         let Some(qb) = q.action.ghost_bundle() else { continue };
         ghosts += 1;
-        if lowest.is_none_or(|(l, _)| TipRate::of(q) <= TipRate::of(l)) {
+        if evictable(i, q) && lowest.is_none_or(|(l, _)| TipRate::of(q) <= TipRate::of(l)) {
             lowest = Some((q, id));
         }
         if qb.nullifiers.iter().any(|n| b.nullifiers.contains(n)) {
+            if !q.is_unsigned() && q.from == tx.from {
+                bail!("your queued transaction with nonce {} already spends one of these notes", q.nonce);
+            }
             if !displaces(tx, q, relay) {
                 bail!("a queued transaction already spends one of these notes; to replace it, pay a tip of at least {} drops (its {} plus the relay of yours) and the fee to cover it", displacing_tip(q, relay), q.tip);
             }
@@ -822,6 +834,8 @@ pub fn mempool_admit(queued: &[Tx], ids: &[String], tx: &Tx, relay: u64, evict: 
     if replaces.is_empty() && ghosts >= MAX_MEMPOOL_GHOST {
         return match lowest {
             Some((q, id)) if evict && displaces(tx, q, relay) => Ok(vec![(id.clone(), "evicted from the mempool's full ghost share by a transaction with a higher tip")]),
+            // Review of fix-fees: never ask for a tip past the cap.
+            Some((q, _)) if displacing_tip(q, relay) > cap => bail!("the mempool holds its maximum of {MAX_MEMPOOL_GHOST} ghost transactions, and they tip more than this one may (at most {cap} drops); try again shortly"),
             Some((q, _)) => bail!("the mempool holds its maximum of {MAX_MEMPOOL_GHOST} ghost transactions; resubmit with a tip of at least {} drops (and the fee to cover it), or try again shortly", displacing_tip(q, relay)),
             None => bail!("the mempool holds its maximum of {MAX_MEMPOOL_GHOST} ghost transactions; try again shortly"),
         };

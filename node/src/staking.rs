@@ -1821,7 +1821,10 @@ pub fn system_tx_key(state: &State, tx: &Tx, sender: &str, signer: &str) -> Opti
 
 /// A validator duty (audit F32/F56): a beacon commitment or reveal, equivocation evidence, or a
 /// claim or revert attestation, signed by a validator's consensus key from its own account or its
-/// owner's (SF-13), while the validator is in the active set of `epoch` or the next. Returns the
+/// owner's (SF-13), while the validator is in the active set of `epoch` or the next. A reveal is
+/// one whatever the set: the validator owes it once it committed (it may have left the set since,
+/// and `beacon::end_epoch` jails and slashes a committer that doesn't reveal), so it's a duty while
+/// the validator has an unopened commitment for `epoch + 1` (review of F32/F56). Returns the
 /// validator and the kind of duty. A full mempool must not refuse these for want of a tip (they
 /// carry none from an owner's account: `State::admit`), so the mempool queues them in a small
 /// lane of their own and proposals take them first (`Chain::admit_to_mempool`). Mempool policy
@@ -1838,7 +1841,8 @@ pub fn duty_of(state: &State, tx: &Tx, epoch: u64) -> Option<(String, &'static s
     let v = validator_of_key(state, &tx.signer_key_id().ok()?)?;
     let rec = state.validators.get(&v).filter(|r| r.consensus_key == tx.public_key && (tx.from == v || tx.from == r.owner))?;
     let active = [epoch, epoch + 1].iter().any(|e| state.active_sets.get(e).is_some_and(|s| s.contains(&rec.address)));
-    active.then_some((v, kind))
+    let owed = matches!(&tx.action, Action::BeaconReveal { epoch: target, .. } if *target == epoch + 1 && state.beacon.rounds.get(target).and_then(|r| r.get(&rec.address)).is_some_and(|e| e.secret.is_none()));
+    (active || owed).then_some((v, kind))
 }
 
 /// FANG staking holds outside balances: pool stake and unbonding entries.

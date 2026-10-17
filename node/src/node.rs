@@ -290,22 +290,65 @@ async fn exchange_epochs(chain: Shared, peers: Vec<String>) {
 /// Slashing protection's view of the network from outside consensus (protection.rs, audit F18):
 /// while its restart rule watches, every HTTP peer is asked for its tip every couple of seconds.
 /// Only a network standing still where this node is (halted, or every validator restarting) lets
-/// the rule's escape fire; a peer ahead of it, or in a later epoch, keeps it shut, and so does
-/// silence (`protection::network_view`), unless the operator said where the network halted.
+/// the rule's escape fire: peers at its height must outnumber those claiming more, and silence
+/// keeps it shut (`protection::network_view`), unless the operator said where the network halted.
+/// A peer that claims to be ahead is asked to show it, once per peer and height of this node:
+/// the finalization certificate of the blocks after this node's tip, checked against the set this
+/// node knows for them ([`verify_batch`]). A claim it proves is a verified finalized height, which
+/// keeps the escape shut whatever anyone else (the operator included) says; one it can't prove
+/// is a single unverified answer (review of F18).
 async fn watch_network(chain: Shared, peers: Vec<String>, protection: Arc<Protection>, halted_at: Option<u64>) {
     let client = reqwest::Client::builder().timeout(Duration::from_secs(3)).build().unwrap();
+    let probe_client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build().unwrap();
+    let provider = consensus::EpochProvider::new(chain.clone(), None);
     let genesis_hash = chain.lock().genesis_hash.clone();
+    // Which height of ours each peer last proved (or failed to prove) it's past.
+    let mut probed: std::collections::HashMap<usize, u64> = Default::default();
     loop {
         if protection.watching() {
-            let tips: Vec<u64> = futures::future::join_all(peers.iter().map(|p| peer_tip(&client, p, &genesis_hash))).await.into_iter().flatten().collect();
-            let (params, height, claimed) = {
+            let answers: Vec<Option<u64>> = futures::future::join_all(peers.iter().map(|p| peer_tip(&client, p, &genesis_hash))).await;
+            let height = chain.lock().height();
+            let mut ahead = vec![];
+            for (i, tip) in answers.iter().enumerate() {
+                if tip.is_some_and(|t| t > height) && probed.insert(i, height) != Some(height) {
+                    ahead.push(i);
+                }
+            }
+            // All at once: a peer that claims to be ahead and then stalls its answer costs one
+            // probe timeout per height of this node, however many do it.
+            let proofs = futures::future::join_all(ahead.iter().map(|&i| probe_ahead(&chain, &provider, &probe_client, &peers[i]))).await;
+            for (i, proof) in ahead.into_iter().zip(proofs) {
+                match proof {
+                    Ok(to) => {
+                        tracing::warn!(peer = %peers[i], height, to, "a peer proved the network finalized blocks past this node's tip (slashing protection keeps abstaining)");
+                        chain.lock().set_finalized_tip(to);
+                    }
+                    Err(e) => tracing::info!(peer = %peers[i], height, error = %e, "a peer claims to be ahead but didn't prove it (one unverified answer)"),
+                }
+            }
+            let tips: Vec<u64> = answers.into_iter().flatten().collect();
+            let (params, height, finalized, claimed) = {
                 let c = chain.lock();
-                (c.state.params.clone(), c.height(), c.network_height_claimed())
+                (c.state.params.clone(), c.height(), c.finalized_tip, c.network_height_claimed())
             };
-            protection.note_network(&params, height, claimed, &tips, halted_at, crate::chain::now_ms());
+            protection.note_network(&params, height, finalized, claimed, &tips, halted_at, crate::chain::now_ms());
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
+}
+
+/// Asks `peer` for the blocks after this node's tip (`/api/sync`) and verifies them without
+/// executing anything ([`verify_batch`]): the finalized height they prove.
+async fn probe_ahead(chain: &Shared, provider: &consensus::EpochProvider, client: &reqwest::Client, peer: &str) -> Result<u64> {
+    let (from, epoch) = {
+        let c = chain.lock();
+        (c.height() + 1, c.state.params.epoch_of(c.height() + 1))
+    };
+    let verifier = provider.epoch_scheme(epoch).ok_or_else(|| anyhow!("no validator set known for epoch {epoch}"))?;
+    let body = get_capped(client, &format!("{peer}/api/sync?from={from}&limit=1"), MAX_SYNC_RESPONSE).await?;
+    let batch: SyncBatch = serde_json::from_slice(&body)?;
+    let (blocks, _) = verify_batch(chain, &verifier, epoch, &batch)?;
+    Ok(blocks.last().map_or(0, |b| b.height))
 }
 
 /// A peer's tip as its `/api/status` reports it (the highest of its executed, finalized and
@@ -1116,6 +1159,26 @@ pub(crate) fn apply_batch_trusted(chain: &Shared, verifier: &MlDsaScheme, epoch:
         let keys: Vec<String> = chain.lock().state.active_set(epoch).map(|s| s.iter().map(|v| v.consensus_key.clone()).collect()).unwrap_or_default();
         t.check_set(epoch, &keys)?;
     }
+    let (blocks, fin_bytes) = verify_batch(chain, verifier, epoch, batch)?;
+    if let Some(t) = trust {
+        for b in &blocks {
+            t.check_block(b.height, &hex::encode(b.digest_bytes()))?;
+        }
+    }
+    // One block at a time, the chain lock held only for the in-memory parts (sync is this
+    // node's only executor, so nothing else extends the chain in between).
+    let last = blocks.last().map(|b| b.height);
+    for b in &blocks {
+        let cert = (Some(b.height) == last).then(|| fin_bytes.clone());
+        Chain::execute_shared(chain, consensus::finalized_from(b, cert))?;
+    }
+    Ok(())
+}
+
+/// Checks a sync batch without executing it: contiguous heights hash-linked to this node's tip,
+/// the last block covered by a finalization certificate of `epoch` that `verifier` (the epoch's
+/// set) accepts. Returns the decoded blocks and the certificate's bytes.
+pub(crate) fn verify_batch(chain: &Shared, verifier: &MlDsaScheme, epoch: u64, batch: &SyncBatch) -> Result<(Vec<CBlock>, Vec<u8>)> {
     let blocks: Vec<CBlock> = batch.blocks.iter().map(|h| Ok(CBlock::decode(hex::decode(h)?.as_slice())?)).collect::<Result<_>>()?;
     let fin_hex = batch.finalization.as_ref().ok_or_else(|| anyhow!("missing finalization"))?;
     let fin_bytes = hex::decode(fin_hex)?;
@@ -1140,17 +1203,8 @@ pub(crate) fn apply_batch_trusted(chain: &Shared, verifier: &MlDsaScheme, epoch:
         }
         prev = hex::encode(b.digest_bytes());
         height = b.height;
-        if let Some(t) = trust {
-            t.check_block(height, &prev)?;
-        }
     }
-    // One block at a time, the chain lock held only for the in-memory parts (sync is this
-    // node's only executor, so nothing else extends the chain in between).
-    for b in &blocks {
-        let cert = (b.height == last.height).then(|| fin_bytes.clone());
-        Chain::execute_shared(chain, consensus::finalized_from(b, cert))?;
-    }
-    Ok(())
+    Ok((blocks, fin_bytes))
 }
 
 #[cfg(test)]
@@ -1313,6 +1367,57 @@ mod tests {
         assert_eq!(chain.lock().height(), 0, "nothing executed");
         apply_batch_trusted(&chain, &verifier, 0, &batch, Some(&trust(&hash2, genesis_set))).unwrap();
         assert_eq!(chain.lock().hash_at(2), Some(hash2));
+        drop(chain);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Review of F18: slashing protection's network watch counts a peer's claim to be past this
+    /// node only once the peer shows it: blocks after this node's tip, hash-linked to it, with a
+    /// finalization certificate the epoch's set signed (`verify_batch`, which executes nothing).
+    /// A certificate by anyone else, blocks that don't extend this node's chain, or a batch the
+    /// certificate doesn't cover prove nothing.
+    #[test]
+    fn a_claim_to_be_ahead_counts_only_once_its_blocks_verify() {
+        use commonware_codec::Encode as _;
+        use commonware_consensus::simplex::types::{Finalize, Proposal};
+        use commonware_consensus::types::{Epoch, Round, View};
+        let root = home("probe");
+        let homes = Chain::summon(&root, &SummonOpts::new("probe", 1)).unwrap();
+        let g = Genesis::load(&homes[0].join("genesis.json")).unwrap();
+        let seed: [u8; 32] = hex::decode(std::fs::read_to_string(homes[0].join("validator.key")).unwrap().trim()).unwrap().try_into().unwrap();
+        let chain: Shared = Arc::new(Mutex::new(Chain::open(&homes[0]).unwrap()));
+        let root_hash = consensus::hex_32(&g.initial_state().root());
+        let mut blocks = vec![consensus::genesis_block(&g)];
+        for h in 1..=3u64 {
+            let parent = blocks.last().unwrap().digest();
+            blocks.push(CBlock::new(parent, h, h, h - 1, g.created_at_ms + 1000 * h, g.validators[0].address.clone(), 0, root_hash, vec![]));
+        }
+        let namespace = consensus::genesis_namespace(&g);
+        let certify = |key: PrivateKey, set, block: &CBlock| {
+            let scheme = MlDsaScheme::signer(&namespace, set, key).unwrap();
+            let vote = Finalize::sign(&scheme, Proposal::new(Round::new(Epoch::new(0), View::new(block.height)), View::new(block.height - 1), block.digest())).unwrap();
+            hex::encode(Finalization::from_finalizes(&scheme, commonware_utils::iter::NonEmpty::try_new([vote].iter()).unwrap(), &commonware_parallel::Sequential).unwrap().encode())
+        };
+        let batch = |from: usize, to: usize, fin: String| SyncBatch { tip: 3, blocks: blocks[from..=to].iter().map(|b| hex::encode(b.encode())).collect(), to: Some(to as u64), finalization: Some(fin) };
+        let verifier = consensus::EpochProvider::new(chain.clone(), None).epoch_scheme(0).unwrap();
+        let validator = || PrivateKey::from_seed_bytes(seed);
+        let set = || consensus::participants(&g).unwrap();
+        // Proven: blocks 1..=3, the last certified by the set.
+        let (got, _) = verify_batch(&chain, &verifier, 0, &batch(1, 3, certify(validator(), set(), &blocks[3]))).unwrap();
+        assert_eq!(got.last().unwrap().height, 3);
+        assert_eq!(chain.lock().height(), 0, "nothing executed");
+        // Not proven: a certificate by a key outside the set (in a set of its own), ...
+        let forger = PrivateKey::from_seed_bytes([9; 32]);
+        let forged_set = commonware_utils::ordered::Set::try_from(vec![commonware_cryptography::Signer::public_key(&forger)]).unwrap();
+        let err = verify_batch(&chain, &verifier, 0, &batch(1, 3, certify(forger, forged_set, &blocks[3]))).unwrap_err().to_string();
+        assert!(err.contains("invalid finalization certificate"), "{err}");
+        // ... blocks that don't start at this node's tip, ...
+        let err = verify_batch(&chain, &verifier, 0, &batch(2, 3, certify(validator(), set(), &blocks[3]))).unwrap_err().to_string();
+        assert!(err.contains("does not extend our chain"), "{err}");
+        // ... a certificate for another block, or for another epoch's set.
+        let err = verify_batch(&chain, &verifier, 0, &batch(1, 3, certify(validator(), set(), &blocks[2]))).unwrap_err().to_string();
+        assert!(err.contains("does not cover"), "{err}");
+        assert!(verify_batch(&chain, &verifier, 1, &batch(1, 3, certify(validator(), set(), &blocks[3]))).is_err());
         drop(chain);
         std::fs::remove_dir_all(root).ok();
     }

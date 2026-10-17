@@ -418,7 +418,10 @@ mempool. A tx spending a nullifier a queued tx spends replaces it, and a full gh
 lowest tip per byte (the newest among equals), only for a tip at least the displaced one's plus the larger
 of a tenth of it and the base fee of the newcomer's bytes (rounded up to the fee grid), and a higher tip
 per byte: a higher tip always gets in, and every displacement pays for relaying itself (BIP-125's rules 3
-and 4), so re-proving one note with tips one drop apart buys nothing.
+and 4), so re-proving one note with tips one drop apart buys nothing. Only an unsigned tx, or another
+sender's last queued tx, can be given up (a signed shield with its sender's later txs behind it stays, so
+nobody is left behind a nonce gap), and a signed tx a replacement does displace takes its sender's later
+txs with it. The refusal names the tip that gets in, unless that's past the newcomer's tip cap.
 `POST /api/tx` takes the wire form as `application/octet-stream` (and JSON up to twice
 `MAX_GHOST_TX_BYTES`).
 
