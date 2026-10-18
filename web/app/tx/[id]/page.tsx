@@ -19,19 +19,25 @@ export default function TxPage() {
   const now = useNow(1000);
   const me = useMe();
   const { wallet } = useWallet();
-  // Poll until it settles: a sealed (or dropped) transaction never changes again.
-  const [poll, setPoll] = useState(true);
-  const tx = useNode<TxDetail>(`/tx/${txId}`, { every: poll ? 1000 : undefined });
+  // Poll until it settles: a transaction sealed in a block never changes again. One this node
+  // dropped unrun hasn't settled: another node may still include it until its valid_until, and
+  // then this node shows it in that block, so it keeps asking, less often.
+  const [every, setEvery] = useState<number | undefined>(1000);
+  const tx = useNode<TxDetail>(`/tx/${txId}`, { every });
   const t = tx.data;
-  const settled = !!t && t.status !== "pending";
+  // A failure answered without the tx: `dropped: false` ran in a block and failed (its fee was
+  // charged); a drop (or an older node that doesn't say) ran nowhere, and its height is where this
+  // node dropped it, not a block it ran in (audit review-fix-clients-2, review-r4-wallet-2).
+  const dropped = !!t && t.status === "failed" && (t.dropped === true || (!t.from && t.dropped !== false));
+  const settled = !!t && t.status !== "pending" && !dropped;
   // Pending, then gone: the node forgot it (a restart empties the mempool). Say so and stop asking.
   const lost = !!t && t.status === "pending" && (tx.error as NodeError | null)?.status === 404;
   useEffect(() => {
-    if (settled || lost) setPoll(false);
-  }, [settled, lost]);
-  const block = useNode<BlockView>(t?.height ? `/block/${t.height}` : null);
+    setEvery(settled || lost ? undefined : dropped ? 10_000 : 1000);
+  }, [settled, lost, dropped]);
+  const block = useNode<BlockView>(t?.height && !dropped ? `/block/${t.height}` : null);
   const sender = useNode<AccountDetail>(t?.from ? `/account/${t.from.address}` : null);
-  const status = useNode<ChainStatus>("/status", { every: settled ? 10_000 : 1000 });
+  const status = useNode<ChainStatus>("/status", { every: settled || dropped ? 10_000 : 1000 });
   const huntId = t?.action && typeof t.action.hunt_id === "number" ? t.action.hunt_id : null;
   const hunt = useNode<HuntView>(huntId != null ? `/hunt/${huntId}` : null);
 
@@ -45,10 +51,10 @@ export default function TxPage() {
   const keys = sender.data?.keys;
   const signer = signerOf(t, keys, wallet?.keyId);
   const signerKey = keys?.find((k) => k.key_id === t.signer_key);
-  // Answered without the tx: `dropped: false` ran in a block and failed (its fee was charged); a
-  // drop (or an older node that doesn't say) ran nowhere, and another node may still include it
-  // (audit review-fix-clients-2).
-  const dropped = t.status === "failed" && !t.from && t.dropped !== false;
+  // Failed in a block, answered from the node's memory of it without the tx: its fee was charged,
+  // but the node no longer says by whom or how much.
+  const ranUnseen = t.status === "failed" && !t.from && !dropped;
+  const droppedAt = dropped && Number.isSafeInteger(t.height) ? ` around block #${(t.height as number).toLocaleString("en-US")}` : "";
   const head = status.data?.height;
   const fee = parseDrops(t.fee);
   const kind = t.kind ?? t.action?.type ?? "";
@@ -78,14 +84,15 @@ export default function TxPage() {
     {
       step: "Broadcast",
       state: dropped || lost ? "bad" : t.status === "pending" ? "now" : "done",
-      what: dropped ? `dropped from this node's mempool without running (${t.error ?? "it couldn't apply"}): nothing was charged, but another node may still include it until its valid_until, so don't send it again before then` : lost ? "this node no longer has it (it may have restarted); it was never sealed here" : t.status === "pending" ? "waiting in the mempool" : "accepted by the network",
+      what: dropped ? `dropped from this node's mempool without running${droppedAt} (${t.error ?? "it couldn't apply"}): nothing was charged, but another node may still include it until its valid_until, so don't send it again before then` : lost ? "this node no longer has it (it may have restarted); it was never sealed here" : t.status === "pending" ? "waiting in the mempool" : "accepted by the network",
       when: t.size_bytes ? `${(t.size_bytes / 1024).toFixed(1)} KB` : undefined,
     },
     {
       step: "Sealed",
-      state: t.height == null ? "todo" : t.status === "failed" ? "bad" : "done",
-      what:
-        t.height == null ? (
+      state: dropped || t.height == null ? "todo" : t.status === "failed" ? "bad" : "done",
+      what: dropped ? (
+        "not in any block this node holds: another node may still include it until its valid_until"
+      ) : t.height == null ? (
           "into the next block"
         ) : (
           <>
@@ -99,20 +106,21 @@ export default function TxPage() {
             {t.status === "failed" && <span className="error block">but the action failed: {t.error}</span>}
           </>
         ),
-      when: b ? `${new Date(b.timestamp_ms).toLocaleString()} · ${ago(now - b.timestamp_ms)}` : undefined,
+      when: b && !dropped ? `${new Date(b.timestamp_ms).toLocaleString()} · ${ago(now - b.timestamp_ms)}` : undefined,
     },
     {
       step: "Final",
       state: t.height == null || dropped ? "todo" : "done",
-      what:
-        t.height == null ? (
+      what: dropped ? (
+        "not yet: it may still run until its valid_until passes"
+      ) : t.height == null ? (
           "the moment it's sealed"
         ) : (
           <>
             {b?.signature_bytes ? <><Term k="certificate">quorum certificate</Term>, {b.signature_bytes.toLocaleString("en-US")} bytes</> : <>by a later block&apos;s <Term k="certificate">certificate</Term></>}
           </>
         ),
-      when: t.height != null && head != null ? `${(head - t.height).toLocaleString("en-US")} blocks deep` : undefined,
+      when: t.height != null && !dropped && head != null ? `${(head - t.height).toLocaleString("en-US")} blocks deep` : undefined,
     },
   ];
 
@@ -120,7 +128,7 @@ export default function TxPage() {
     <main className="wide stack-lg">
       <nav className="crumbs" aria-label="Breadcrumbs">
         <Link href={to.explore()}>Explore</Link>
-        {t.height != null && (
+        {t.height != null && !dropped && (
           <>
             <span>/</span>
             <Link href={to.block(t.height)}>Block #{t.height.toLocaleString("en-US")}</Link>
@@ -141,8 +149,8 @@ export default function TxPage() {
           </div>
         )}
         <div className="row-gap">
-          <StatusPill status={t.status} />
-          {t.height != null && <span className="dim small">in block #{t.height.toLocaleString("en-US")}</span>}
+          {dropped ? <StatusPill status="pending">dropped</StatusPill> : <StatusPill status={t.status} />}
+          {t.height != null && !dropped && <span className="dim small">in block #{t.height.toLocaleString("en-US")}</span>}
           {t.memo && <span className="ledger-memo">“{t.memo}”</span>}
           <ReceiptTools summary={fromMySide(t.summary, me)} />
         </div>
@@ -164,6 +172,7 @@ export default function TxPage() {
             <h2>
               {fx.pending ? "Will change" : "Balance changes"} <span className="dim small" style={{ textTransform: "none", letterSpacing: 0 }}>· what each side gained or lost</span>
             </h2>
+            {ranUnseen && <p className="card-note">It ran and failed, so its sender was charged the fee and nothing else changed. This node no longer has the transaction itself, so it doesn&apos;t say who paid or how much.</p>}
             <div className="changes">
               {fx.changes.map((c) => (
                 <div key={c.who.address} style={{ display: "contents" }}>

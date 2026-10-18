@@ -52,6 +52,8 @@ export class MockNode {
   /** What `/api/name/{name}` answers instead of the truth (a lying node; gap-7-1). Execution uses `names`. */
   nameLies = new Map<string, string>();
   txs = new Map<string, TxRec>();
+  /** What `/api/tx/{id}` answers as is, before any recorded tx: e.g. node/src/api.rs's answers from its mempool's memory, without the tx (a drop, a failure that ran). */
+  txAnswers = new Map<string, unknown>();
   /** Every signed tx accepted, in order. */
   submitted: Tx[] = [];
   /** Every request body the wallet sent to the node, to prove secrets never leave the page. */
@@ -344,6 +346,7 @@ export class MockNode {
         return reply(200, owner ? { name: `${n}.boo`, ...prices, owner: this.label(owner), registered_at: 1, expires_at: 31_557_601, grace_until: 34_149_601, status: "active", available: false } : { name: `${n}.boo`, ...prices, status: "available", available: true });
       }
       if (req.method() === "GET" && (m = path.match(/^\/tx\/([0-9a-f]{64})$/))) {
+        if (this.txAnswers.has(m[1])) return reply(200, this.txAnswers.get(m[1]));
         const r = this.txs.get(m[1]);
         return r ? reply(200, this.txView(r)) : reply(404, { error: "unknown tx" });
       }
