@@ -89,19 +89,26 @@ test.describe("every explorer page", () => {
     await visit(page, "/trace/vlad.boo", (p) => p.getByRole("heading", { name: "Around vlad.boo" }), errors);
   });
 
-  test("receipts for every kind of transaction, as v1 reports them", async ({ page }) => {
-    const { ids } = w;
-    const eyebrow = (p: Page) => p.locator(".receipt .eyebrow");
-    for (const [name, id] of Object.entries(ids)) {
-      await visit(page, `/tx/${id}`, receipt, errors);
-      if (["failed", "ranUnseen"].includes(name)) await expect(eyebrow(page), name).toHaveText("Included, but failed");
-      else if (name === "dropped") await expect(eyebrow(page), name).toHaveText("Didn't go through");
-      else if (name === "waiting") await expect(eyebrow(page), name).toHaveText("On its way");
-      else await expect(eyebrow(page), name).toHaveText("Receipt");
-      // What was signed is rendered here from the action, never taken from the node's summary.
-      if (!["dropped", "ranUnseen"].includes(name)) await expect(page.getByTestId("receipt-signs"), name).toBeVisible();
-    }
+  // A receipt for every kind, a quarter of them per test: each page load is a server render, so
+  // all of them in one test wouldn't fit its timeout on a busy machine.
+  const PARTS = 4;
+  for (let part = 0; part < PARTS; part++) {
+    test(`receipts for every kind of transaction, as v1 reports them (${part + 1} of ${PARTS})`, async ({ page }) => {
+      const eyebrow = (p: Page) => p.locator(".receipt .eyebrow");
+      for (const [name, id] of Object.entries(w.ids).filter((_, i) => i % PARTS === part)) {
+        await visit(page, `/tx/${id}`, receipt, errors);
+        if (["failed", "ranUnseen"].includes(name)) await expect(eyebrow(page), name).toHaveText("Included, but failed");
+        else if (name === "dropped") await expect(eyebrow(page), name).toHaveText("Didn't go through");
+        else if (name === "waiting") await expect(eyebrow(page), name).toHaveText("On its way");
+        else await expect(eyebrow(page), name).toHaveText("Receipt");
+        // What was signed is rendered here from the action, never taken from the node's summary.
+        if (!["dropped", "ranUnseen"].includes(name)) await expect(page.getByTestId("receipt-signs"), name).toBeVisible();
+      }
+    });
+  }
 
+  test("receipts read v1's dropped, failed, tipped, by-name and locking transactions right", async ({ page }) => {
+    const { ids } = w;
     // Dropped unrun: in no block, nothing charged, and it may still be included elsewhere.
     await visit(page, `/tx/${ids.dropped}`, receipt, errors);
     await expect(page.locator(".crumbs")).not.toContainText("Block #");
