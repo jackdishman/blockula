@@ -20,7 +20,7 @@ import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { RELEASE_SIGNATURE_FORMAT, releaseMessage } from "@blockula/sdk";
 import { KNOWN_GENESIS, KnownChains, LOCAL_RPC, TESTNET_RPC, completePin, effectivePin, mismatch, networkArg, resolveNetwork } from "../src/network.js";
-import { RELEASE_KEY_ID, binPaths, checkBinaryVersion, fetchVerifiedRelease, latestTagFrom, readReleasePin, releaseKeyIdFrom, type ReleaseDeps } from "../src/release.js";
+import { RELEASE_KEY_ID, binPaths, checkBinaryVersion, fetchVerifiedRelease, latestTagFrom, pickNodeBinary, readReleasePin, releaseKeyIdFrom, type ReleaseDeps } from "../src/release.js";
 
 const G1 = "11".repeat(32);
 const G2 = "22".repeat(32);
@@ -205,6 +205,17 @@ rmSync(pinDir, { recursive: true, force: true });
 // install_node's binary has a path of its own, never the one `blockula release install` writes.
 assert.notEqual(binPaths("/h").mcp, binPaths("/h").cli);
 assert.equal(binPaths("/h").cli, join("/h", "bin", "blockula"));
+// review-r4-supply-3: install_node's binary doesn't shadow a newer one `release install` put in
+// ~/.blockula/bin. The one of this MCP's version runs, `release install`'s first; else the first
+// that runs, flagged as another version.
+const cli = { path: "/h/bin/blockula", version: "blockula 0.6.0" };
+const mcpBin = { path: "/h/mcp-bin/blockula", version: "blockula 0.5.0" };
+assert.deepEqual(pickNodeBinary([cli, mcpBin], "0.6.0"), { ...cli, matches: true });
+assert.deepEqual(pickNodeBinary([cli, mcpBin], "0.5.0"), { ...mcpBin, matches: true });
+assert.deepEqual(pickNodeBinary([cli, { ...mcpBin, version: "blockula 0.6.0" }], "0.6.0"), { ...cli, matches: true }, "both match: the pinned-key-checked one");
+assert.deepEqual(pickNodeBinary([cli, mcpBin], "0.7.0"), { ...cli, matches: false });
+assert.deepEqual(pickNodeBinary([{ path: cli.path }, mcpBin], "0.7.0"), { ...mcpBin, matches: false }, "one that doesn't run comes last");
+assert.deepEqual(pickNodeBinary([], "0.6.0"), { path: "blockula", matches: false });
 // The built-in key id is the same in all three copies (release_cli.rs checks it too).
 const builtIn = (file: string, re: RegExp) => re.exec(readFileSync(new URL(file, import.meta.url), "utf8"))?.[1];
 assert.equal(builtIn("../../node/src/release_cli.rs", /^pub const BUILTIN_KEY_ID: &str = "([0-9a-f]*)";$/m), RELEASE_KEY_ID, "release_cli.rs BUILTIN_KEY_ID");

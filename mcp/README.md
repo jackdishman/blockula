@@ -75,7 +75,7 @@ The checks add up: each refuses a release it fails. The result lists what was ve
 | `BLOCKULA_WITNESSES` | none | other nodes of the same chain (comma-separated https URLs): names that get signed are proven against them |
 | `BLOCKULA_TIMEOUT_MS` | `15000` | how long one request to the node may take (at most 2147483647) |
 | `BLOCKULA_TX_WAIT_MS` | `15000` | how long a tx tool waits for finality before answering `pending` |
-| `BLOCKULA_BIN` | `~/.blockula/mcp-bin/blockula` (from `install_node`), else `~/.blockula/bin/blockula`, else `blockula` | node binary used by `start_dev_node` / `summon_chain` |
+| `BLOCKULA_BIN` | of `~/.blockula/bin/blockula` (`blockula release install`, checked against the pinned key) and `~/.blockula/mcp-bin/blockula` (`install_node`), the one whose `--version` is this MCP's, the first if both or neither are; else `blockula` | node binary used by `start_dev_node` / `summon_chain` (they say which ran, and when it isn't this MCP's version) |
 | `BLOCKULA_REQUIRE_VERIFY` | unset | `1`: `install_node` refuses a release it can only checksum, and with a release key id requires provenance too |
 | `BLOCKULA_RELEASE_KEY_ID` | built in after the key ceremony | release signing key id to trust (must agree with the built-in one and the pin) |
 
