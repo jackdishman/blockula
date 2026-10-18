@@ -341,7 +341,9 @@ fn snapshots_reject_tampering() {
     assert!(crate::snapshot::read_state(&mut [bytes.as_slice(), &[0]].concat().as_slice()).is_err());
     assert!(crate::snapshot::read_state(&mut &bytes[..bytes.len() - 1]).is_err());
     let mut schema = bytes.clone();
-    schema[8] = 9;
+    // Another schema than this binary's (the byte after the magic is its low byte).
+    assert_eq!(schema[8], crate::state::codec::SCHEMA_VERSION as u8);
+    schema[8] = schema[8].wrapping_add(1);
     assert!(crate::snapshot::read_state(&mut schema.as_slice()).err().unwrap().to_string().contains("schema"));
     assert!(crate::snapshot::read_state(&mut &b"NOTSTATE"[..]).is_err());
     // Records must come in canonical order, without duplicates or unknown namespaces.
@@ -425,7 +427,9 @@ fn namespaces_and_meta_keys_are_unique() {
 /// GitHub handle holds are empty here. The vectors were regenerated and the SDK rebuilt the root.
 /// Schema 8 (the third audit round) changes only the `schema` record here (pools'
 /// `key_update_at` and `admit` are empty); the vectors were regenerated and the SDK rebuilt the
-/// root.
+/// root. Schema 9 (the fourth audit round) changes the `schema` record and appends the highest
+/// superseded version to the `upgrade` record's withdrawals (`0` here: four more bytes); the
+/// vectors were regenerated and the SDK rebuilt the root.
 #[test]
 fn golden_encodings() {
     let acct = Account { balance: 5, nonce: 2, keys: Default::default(), locks: vec![] };
@@ -436,7 +440,7 @@ fn golden_encodings() {
     st.commit_block().unwrap();
     assert_eq!(st.root_hash(), st.full_root());
     assert_eq!(st.record_count(), 13);
-    assert_eq!(st.root(), "dd9d360b0e622ce0adfd44594254359e70daca0cfe2842563047b98f22fd98da");
+    assert_eq!(st.root(), "717a74bb8f4b498806dbcd36467ce6a90e6f06fa4e6e6fc66748bd7e14bf865a");
 }
 
 fn million_accounts() -> State {

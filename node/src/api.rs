@@ -939,8 +939,12 @@ async fn upgrade(State(n): State<Node>) -> ApiResult {
         "supported_protocol_version": crate::consensus::SUPPORTED_PROTOCOL_VERSION,
         "schedule": st.upgrade.schedule.iter().map(|u| json!({ "version": u.version, "activation_height": u.activation_height, "active": u.activation_height <= h + 1 })).collect::<Vec<_>>(),
         // What cancellations withdrew: versions through `highest_version` are never scheduled
-        // again, and upgrade proposals made by `last_cancelled_at` are superseded.
-        "withdrawn": { "highest_version": st.upgrade.withdrawals.highest, "last_cancelled_at": st.upgrade.withdrawals.last_at },
+        // again, and upgrade proposals made by `last_cancelled_at` are superseded; the highest of
+        // those (`superseded_version`) isn't spent, but a release may carry it.
+        // `next_version`: what the next upgrade should ship as (past all of them and what's
+        // scheduled; a new one is at most 16 past `next_version - 1`).
+        "withdrawn": { "highest_version": st.upgrade.withdrawals.highest, "last_cancelled_at": st.upgrade.withdrawals.last_at, "superseded_version": st.upgrade.withdrawals.superseded },
+        "next_version": crate::upgrade::next_version(st),
         "next": next.map(|u| json!({ "version": u.version, "activation_height": u.activation_height, "blocks_left": u.activation_height.saturating_sub(h + 1), "this_binary_supports_it": u.version <= crate::consensus::SUPPORTED_PROTOCOL_VERSION })),
         "halted": n.halt.get().map(|h| json!({ "kind": h.kind(), "reason": h.to_string() })),
         "readiness": {
@@ -2233,6 +2237,9 @@ async fn multisig(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
                 "created_at": p.created_at,
                 "expires_at": p.expires_at,
                 "expired": v.height > p.expires_at,
+                // Why no approval can file it any more (an upgrade proposal a cancellation
+                // superseded), or null.
+                "superseded": crate::governance::superseded_multisig_action(st, p),
             })
         })
         .collect();
@@ -2650,6 +2657,8 @@ mod http_tests {
         let (s, u, _) = call(&n, "GET", "/api/upgrade", None, "127.0.0.1:1").await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!((u["height"].as_u64(), u["next"]["version"].as_u64(), u["next"]["blocks_left"].as_u64(), u["next"]["this_binary_supports_it"].as_bool()), (Some(2), Some(v2 as u64), Some(1), Some(false)));
+        // Nothing withdrawn or superseded; the next upgrade ships past what's scheduled.
+        assert_eq!((u["withdrawn"]["highest_version"].as_u64(), u["withdrawn"]["superseded_version"].as_u64(), u["next_version"].as_u64()), (Some(0), Some(0), Some(v2 as u64 + 1)));
         // The one validator proposed both blocks, signalling what its binary supports.
         assert_eq!((u["readiness"]["version"].as_u64(), u["readiness"]["ready"].as_u64(), u["readiness"]["active"].as_u64()), (Some(v2 as u64), Some(0), Some(1)));
         assert_eq!(u["readiness"]["validators"][0]["signal"].as_u64(), Some(crate::consensus::SUPPORTED_PROTOCOL_VERSION as u64));

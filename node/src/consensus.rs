@@ -1576,8 +1576,9 @@ pub const MARSHAL_RETAIN: u64 = 2_000;
 /// protocol v1: txs signed for a genesis hash, state schema 4, block metadata with signals; v6
 /// state schema 5; v7 consensus votes signed under the chain instance's namespace, chain id and
 /// genesis hash, so older journals no longer verify, and state schema 6; v8 state schema 7; v9
-/// state schema 8). Dev chains from an older layout reset themselves (`node::dev_is_stale`).
-pub const STORAGE_VERSION: &str = "prunable-v9";
+/// state schema 8; v10 state schema 9). Dev chains from an older layout reset themselves
+/// (`node::dev_is_stale`).
+pub const STORAGE_VERSION: &str = "prunable-v10";
 
 fn archive_config<C>(prefix: &str, name: &str, page_cache: CacheRef, codec_config: C) -> prunable::Config<TwoCap, C> {
     prunable::Config {

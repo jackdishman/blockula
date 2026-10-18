@@ -8,7 +8,9 @@
 //! (or, during the bootstrap, ⅔ of the council voted) and burned otherwise; a proposal that
 //! passed is queued and runs at the end of block `voting_end + timelock_blocks` (a
 //! `CancelUpgrade`, which keeps the rules in force, at `voting_end + 1`). A proposal whose action
-//! fails when it runs changes nothing and is marked failed.
+//! fails when it runs changes nothing and is marked failed. Every vote that ends in a block
+//! closes before any proposal runs in it, so what a proposal sees when it runs (which others
+//! passed) doesn't depend on proposal ids (review-r3-gov-2).
 //!
 //! **Tally.** Quorum is `max(quorum_floor, quorum_bps × unlocked supply)` on the raw FANG voted
 //! (aye + nay), where the unlocked supply is what could vote: what every account but the keyless
@@ -53,7 +55,8 @@
 //! land first, and a multisig's proposal survives its approval window (audit F45,
 //! review-fix-gov-2). Ids stay small: at most [`DISTRIBUTION_ID_MARGIN`] past the proposal's own
 //! id ([`max_distribution_id`], review-r2-gov-2), and `claim_until` at most
-//! [`MAX_CLAIM_WINDOW_DAYS`] out. `/api/proposals` serves a free one, `next_distribution_id`.
+//! [`MAX_CLAIM_WINDOW_DAYS`] after the proposal's vote ends (fixed when it's proposed, so the
+//! same bound when it runs: review-r3-gov-3). `/api/proposals` serves a free one, `next_distribution_id`.
 //! What's unclaimed returns to the community account after `claim_until`. A claimant with
 //! nothing to pay the fee with pays it (and its new account's creation fee) out of the claim
 //! ([`claim_toward_fee`]).
@@ -97,7 +100,8 @@ pub const LARGE_SPEND_WINDOW_DAYS: u64 = 30;
 /// bound only grows (proposal ids never go back), so a tree built for an id that was allowed
 /// stays allowed.
 pub const DISTRIBUTION_ID_MARGIN: u64 = 1_000;
-/// A distribution's claims close at most this many days after it opens.
+/// A distribution's claims close at most this many days after its proposal's vote ends (it opens
+/// a timelock later).
 pub const MAX_CLAIM_WINDOW_DAYS: u64 = 730;
 /// Domain separators of distribution Merkle trees (docs/GOVERNANCE.md).
 pub const LEAF_DOMAIN: &[u8] = b"BLOCKULA_DISTRIBUTION_LEAF_V1";
@@ -483,7 +487,10 @@ fn spend_gate(state: &State, height: u64) -> Result<()> {
 /// known to fail refused (it's checked again when it runs).
 fn prepare_kind(state: &State, kind: &ProposalKind, height: u64) -> Result<ProposalKind> {
     let cp = &state.chain_params;
-    let runs_at = height.saturating_add(cp.voting_blocks).saturating_add(cp.timelock_blocks);
+    // The proposal's `voting_end` (fixed now; the horizons count from it, here and when it runs),
+    // and the earliest block it can run in (the timelock in force at the close decides).
+    let vote_end = height.saturating_add(cp.voting_blocks);
+    let runs_at = vote_end.saturating_add(cp.timelock_blocks);
     let mut k = kind.clone();
     match &mut k {
         ProposalKind::ParamChange { key, value } => {
@@ -504,7 +511,7 @@ fn prepare_kind(state: &State, kind: &ProposalKind, height: u64) -> Result<Propo
             if *claim_until <= runs_at {
                 bail!("claim_until must be after the vote and the timelock (block {runs_at})");
             }
-            claim_window(state, *claim_until, runs_at)?;
+            claim_window(state, *claim_until, vote_end)?;
         }
         ProposalKind::GrantSoul { to, .. } => *to = state.resolve(to)?,
         ProposalKind::FlagSybil { account, .. } | ProposalKind::Clawback { account, .. } => *account = state.resolve(account)?,
@@ -531,7 +538,7 @@ fn prepare_kind(state: &State, kind: &ProposalKind, height: u64) -> Result<Propo
         },
         ProposalKind::ScheduleUpgrade { version, activation_height } => {
             // What it could run into at the earliest block it runs in (audit F46); checked again then.
-            crate::upgrade::check_schedule_upgrade(state, *version, *activation_height, runs_at).map_err(|e| anyhow!("{e} (the vote and the timelock end at block {runs_at})"))?;
+            crate::upgrade::check_schedule_upgrade(state, *version, *activation_height, runs_at, vote_end).map_err(|e| anyhow!("{e} (the vote and the timelock end at block {runs_at})"))?;
             // Late enough that a `CancelUpgrade` proposed the block after this one runs still
             // lands (its vote, no timelock) `MIN_UPGRADE_LEAD` blocks before it (audit F50).
             let lead = crate::upgrade::MIN_UPGRADE_LEAD;
@@ -801,6 +808,11 @@ fn close_vote(state: &mut State, id: u64, height: u64, unlocked: u128) {
     if p.voters > 0 {
         state.governance.closed_votes.insert(id);
     }
+    // An upgrade proposal a cancellation superseded during its vote that passes anyway spends
+    // its number, like one that had passed when the cancellation ran (review-r3-gov-2).
+    if let (true, ProposalKind::ScheduleUpgrade { version, .. }) = (passed, &p.kind) {
+        crate::upgrade::spend_if_superseded(state, &mut j, p.created_at, *version);
+    }
     let p = proposal_mut(state, &mut j, id);
     p.tally = Some(Tally { unlocked, quorum, quorum_reached, supermajority, council_size: n, council_ayes: ayes, council_nays: nays });
     p.outcome = outcome;
@@ -878,7 +890,7 @@ fn run_kind(state: &mut State, j: &mut Journal, p: &Proposal, height: u64) -> Re
             if *claim_until < height {
                 bail!("its claim window ended at block {claim_until}");
             }
-            claim_window(state, *claim_until, height)?;
+            claim_window(state, *claim_until, p.voting_end)?;
             let from = community(state.params.prefix());
             let available = crate::econ::transferable(state, &from, height);
             if *total > available {
@@ -922,7 +934,7 @@ fn run_kind(state: &mut State, j: &mut Journal, p: &Proposal, height: u64) -> Re
         }
         ProposalKind::ScheduleUpgrade { version, activation_height } => {
             crate::upgrade::check_not_superseded(state, p.created_at, *version)?;
-            crate::upgrade::exec_schedule_upgrade(state, j, *version, *activation_height, height)?;
+            crate::upgrade::exec_schedule_upgrade(state, j, *version, *activation_height, height, p.voting_end)?;
             format!("protocol v{version} activates at block {activation_height}")
         }
         ProposalKind::ActivateFeature { feature } => {
@@ -934,13 +946,20 @@ fn run_kind(state: &mut State, j: &mut Journal, p: &Proposal, height: u64) -> Re
             format!("{feature} is off")
         }
         ProposalKind::CancelUpgrade { version, activation_height } => {
-            // Every open upgrade proposal is superseded (each was made by now). Those that passed
-            // and wait to run also spend their numbers (review-fix-ops-2): their releases may be
-            // out, signalled, and built on the withdrawn rules. Still-voting ones don't, or
-            // filing one would spend numbers for the price of a deposit.
+            // Every open upgrade proposal is superseded (each was made by now), and so is every
+            // one waiting in a multisig for approvals (review-fix-ops-2: `multisig_approve`
+            // refuses to file it). Those that passed and wait to run also spend their numbers:
+            // their releases may be out, signalled, and built on the withdrawn rules. The others
+            // don't (filing one, or storing one in a multisig, mustn't spend numbers), but a
+            // release may carry theirs too, so the highest is kept and the advice goes past it
+            // (review-r3-gov-1). Only numbers the step allowed count: the advice stays one the
+            // step accepts.
             let open = open_upgrade_proposals(state);
-            let passed = open.iter().filter(|(_, status, _, _)| *status == ProposalStatus::Queued).map(|(_, _, v, _)| *v).max().unwrap_or(0);
-            let withdrawn = crate::upgrade::exec_cancel_upgrade(state, j, *version, *activation_height, height, passed)?;
+            let stored = multisig_upgrade_proposals(state, height);
+            let in_step = |v: &u32| crate::upgrade::within_step(state, *v);
+            let passed = open.iter().filter(|(_, status, _, _)| *status == ProposalStatus::Queued).map(|(_, _, v, _)| *v).filter(in_step).max().unwrap_or(0);
+            let superseded = open.iter().map(|(_, _, v, _)| *v).chain(stored.iter().map(|(_, v)| *v)).filter(in_step).max().unwrap_or(0);
+            let withdrawn = crate::upgrade::exec_cancel_upgrade(state, j, *version, *activation_height, height, passed, superseded)?;
             let after: Vec<String> = withdrawn[1..].iter().map(|u| format!("v{} at block {}", u.version, u.activation_height)).collect();
             let mut what = format!("cancelled the upgrade to protocol v{version} at block {activation_height}");
             if !after.is_empty() {
@@ -950,11 +969,15 @@ fn run_kind(state: &mut State, j: &mut Journal, p: &Proposal, height: u64) -> Re
                 let list: Vec<String> = open.iter().map(|(id, _, v, at)| format!("#{id} (v{v} at block {at})")).collect();
                 what += &format!("; it supersedes the upgrade proposal{} still open, {}, which can't take effect", if open.len() == 1 { "" } else { "s" }, list.join(", "));
             }
+            // Counted, not listed: anyone can store them, and the outcome stays in the state.
+            if !stored.is_empty() {
+                let n = stored.len();
+                what += &format!("; it supersedes {n} upgrade proposal{} waiting in multisigs, which can't be approved", if n == 1 { "" } else { "s" });
+            }
             // The number to ship the fixed release as: past the spent ones and the superseded
-            // proposals' own (a release may be out for any of them).
+            // proposals' own (a release may be out for any of them), within the step.
             let spent = state.upgrade.withdrawals.highest;
-            let next = open.iter().map(|(_, _, v, _)| *v).fold(spent, u32::max).saturating_add(1);
-            what + &format!("; versions through v{spent} are spent: ship the next upgrade as v{next} or later")
+            what + &format!("; versions through v{spent} are spent: ship the next upgrade as v{} or later", crate::upgrade::next_version(state))
         }
         ProposalKind::Text {} => "recorded (no on-chain effect)".into(),
     })
@@ -970,28 +993,55 @@ fn open_upgrade_proposals(state: &State) -> Vec<(u64, ProposalStatus, u32, u64)>
     }).collect()
 }
 
-/// After `staking::end_block`, every block: close voting on proposals whose vote ended, run
-/// those whose timelock is over, and return what's unclaimed of distributions past
-/// `claim_until` to the community account.
+/// The `ScheduleUpgrade` proposals multisigs store, waiting for approvals and not expired at
+/// `height` (multisig id, version): a cancellation running now supersedes them too
+/// (review-fix-ops-2), since they were made against the schedule it withdraws from. A scan of
+/// the stored multisig proposals, which only a cancellation (a ⅔ supermajority) runs.
+fn multisig_upgrade_proposals(state: &State, height: u64) -> Vec<(u64, u32)> {
+    state.governance.multisig_proposals.values().filter(|m| height <= m.expires_at).filter_map(|m| match &m.action {
+        Action::Propose { kind: ProposalKind::ScheduleUpgrade { version, .. }, .. } => Some((m.id, *version)),
+        _ => None,
+    }).collect()
+}
+
+/// Why a multisig's stored action can't be approved any more, whoever signs: it's a
+/// `ScheduleUpgrade` proposal stored before a cancellation ran (review-fix-ops-2), made against
+/// the schedule the cancellation withdrew from. `multisig_approve` refuses it; `/api/multisig`
+/// shows it.
+pub fn superseded_multisig_action(state: &State, p: &MultisigProposal) -> Option<String> {
+    match &p.action {
+        Action::Propose { kind: ProposalKind::ScheduleUpgrade { version, .. }, .. } => crate::upgrade::check_not_superseded(state, p.created_at, *version).err().map(|e| e.to_string()),
+        _ => None,
+    }
+}
+
+/// After `staking::end_block`, every block: close voting on proposals whose vote ended, then run
+/// those whose timelock is over, and return what's unclaimed of distributions past `claim_until`
+/// to the community account. Every vote closes before anything runs (review-r3-gov-2): a
+/// proposal that runs here sees every proposal whose vote ended by now as passed or rejected,
+/// whatever the ids (a `CancelUpgrade` spends the numbers of the upgrades that passed).
 pub fn end_block(state: &mut State, b: &BlockInfo) {
     let height = b.height;
     for id in state.governance.open_proposals.clone() {
         let p = &state.governance.proposals[&id];
-        match p.status {
-            ProposalStatus::Voting if height >= p.voting_end => {
-                let epoch = state.params.epoch_of(height);
-                let u = match state.governance.quorum_base {
-                    Some((e, u)) if e == epoch => u,
-                    _ => {
-                        let u = unlocked_supply(state, height);
-                        state.governance.quorum_base = Some((epoch, u));
-                        u
-                    }
-                };
-                close_vote(state, id, height, u);
-            }
-            ProposalStatus::Queued if p.execute_at.is_some_and(|at| height >= at) => execute(state, id, height),
-            _ => {}
+        if p.status == ProposalStatus::Voting && height >= p.voting_end {
+            let epoch = state.params.epoch_of(height);
+            let u = match state.governance.quorum_base {
+                Some((e, u)) if e == epoch => u,
+                _ => {
+                    let u = unlocked_supply(state, height);
+                    state.governance.quorum_base = Some((epoch, u));
+                    u
+                }
+            };
+            close_vote(state, id, height, u);
+        }
+    }
+    // A vote that closed just now queues its proposal for a later block (`close_vote`).
+    for id in state.governance.open_proposals.clone() {
+        let p = &state.governance.proposals[&id];
+        if p.status == ProposalStatus::Queued && p.execute_at.is_some_and(|at| height >= at) {
+            execute(state, id, height);
         }
     }
     for id in state.governance.open_distributions.clone() {
@@ -1087,11 +1137,13 @@ fn distribution_id_in_range(state: &State, id: u64) -> Result<()> {
     Ok(())
 }
 
-/// A claim deadline at most [`MAX_CLAIM_WINDOW_DAYS`] after `opens` (when it would open).
-fn claim_window(state: &State, claim_until: u64, opens: u64) -> Result<()> {
-    let latest = opens.saturating_add(MAX_CLAIM_WINDOW_DAYS.saturating_mul(crate::params::blocks_per_day(state.params.block_time_ms)));
+/// A claim deadline at most [`MAX_CLAIM_WINDOW_DAYS`] after `vote_end`, the proposal's: the same
+/// bound when it's proposed and when it runs, whatever the timelock does meanwhile
+/// (review-r3-gov-3).
+fn claim_window(state: &State, claim_until: u64, vote_end: u64) -> Result<()> {
+    let latest = vote_end.saturating_add(MAX_CLAIM_WINDOW_DAYS.saturating_mul(crate::params::blocks_per_day(state.params.block_time_ms)));
     if claim_until > latest {
-        bail!("claims close at most {MAX_CLAIM_WINDOW_DAYS} days after a distribution opens: claim_until must be block {latest} or earlier");
+        bail!("claims close at most {MAX_CLAIM_WINDOW_DAYS} days after its proposal's vote ends: claim_until must be block {latest} or earlier");
     }
     Ok(())
 }
@@ -1351,6 +1403,11 @@ fn multisig_approve(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, s
     if crate::types::action_digest(&p.action) != digest {
         bail!("multisig action #{id} isn't the action this approval was signed for: the node it was read from may be misreporting it");
     }
+    // An upgrade proposal stored before a cancellation ran was made against the schedule it
+    // withdrew from (review-fix-ops-2): filing it now would date it after the cancellation.
+    if let Some(e) = superseded_multisig_action(state, &p) {
+        bail!("multisig action #{id}: {e}");
+    }
     clear_expired(state, j, sender, height);
     m.pending.retain(|id| state.governance.multisig_proposals.contains_key(id));
     if !p.approvals.insert(signer.to_string()) {
@@ -1522,37 +1579,55 @@ pub fn describe_kind(state: &State, kind: &ProposalKind, primary_name: &dyn Fn(&
         ProposalKind::ScheduleUpgrade { version, activation_height } => format!("upgrade to protocol v{version} at block {activation_height}"),
         ProposalKind::ActivateFeature { feature } => format!("turn on {feature}"),
         ProposalKind::DeactivateFeature { feature } => format!("turn off {feature}"),
-        // What it would also withdraw and supersede depends on when it runs: a proposal's
-        // summary says that while it's open ([`describe_proposal`]), and its outcome says what
-        // it did (review-r2-gov-3).
-        ProposalKind::CancelUpgrade { version, activation_height } => format!("cancel the upgrade to protocol v{version} at block {activation_height}"),
+        // What it would withdraw and supersede depends on when it runs: a proposal's summary
+        // lists that while it's open ([`describe_proposal`]), and its outcome says what it did
+        // (review-r2-gov-3); the clause is the kind's (review-r3-gov-4; the SDK and CLI
+        // describers say the same).
+        ProposalKind::CancelUpgrade { version, activation_height } => format!("cancel the upgrade to protocol v{version} at block {activation_height} and any upgrade scheduled after it; upgrade proposals still open when it runs are superseded and can't take effect"),
         ProposalKind::Text {} => "a text proposal (no on-chain effect)".into(),
     }
 }
 
 /// A stored proposal's summary: [`describe_kind`], plus, for a `CancelUpgrade` still voting or
 /// waiting to run, what it would withdraw and supersede if it ran now, worded as conditional
-/// (review-r2-gov-3). Once it has run, its outcome (written when it ran) says what it withdrew
-/// and superseded; a rejected or failed one did neither.
+/// (review-r2-gov-3), or, when its upgrade isn't scheduled any more (another cancellation
+/// withdrew it; a withdrawn number is never scheduled again), that it will fail and change
+/// nothing; for an open `ScheduleUpgrade` a cancellation superseded, that it will fail. Once a
+/// cancellation has run, its outcome (written when it ran) says what it withdrew and superseded;
+/// a rejected or failed one did neither.
 pub fn describe_proposal(state: &State, p: &Proposal, primary_name: &dyn Fn(&str) -> Option<String>) -> String {
     let what = describe_kind(state, &p.kind, primary_name);
-    let ProposalKind::CancelUpgrade { activation_height, .. } = p.kind else { return what };
     if !matches!(p.status, ProposalStatus::Voting | ProposalStatus::Queued) {
         return what;
     }
-    let mut also = vec![];
+    // An open upgrade proposal a cancellation superseded will fail: say so, and what to ship.
+    if let ProposalKind::ScheduleUpgrade { version, .. } = p.kind {
+        return match crate::upgrade::check_not_superseded(state, p.created_at, version) {
+            Ok(()) => what,
+            Err(_) => format!("{what}; but a CancelUpgrade ran after it was proposed, so it's superseded and will fail when it runs (ship it as v{} or later)", crate::upgrade::next_version(state)),
+        };
+    }
+    let ProposalKind::CancelUpgrade { version, activation_height } = p.kind else { return what };
+    if crate::upgrade::scheduled(state, version, activation_height).is_err() {
+        return format!("{what}; but v{version} at block {activation_height} isn't scheduled any more: it would fail when it runs and change nothing");
+    }
+    let mut now = vec![];
     let after: Vec<String> = state.upgrade.schedule.iter().filter(|u| u.activation_height > activation_height).map(|u| format!("v{} at block {}", u.version, u.activation_height)).collect();
     if !after.is_empty() {
-        also.push(format!("it also withdraws what's scheduled after it (now {})", after.join(", ")));
+        now.push(format!("withdraws {} scheduled after it", after.join(", ")));
     }
     let open: Vec<String> = open_upgrade_proposals(state).iter().map(|(id, _, v, at)| format!("#{id} (v{v} at block {at})")).collect();
-    let fail = "every upgrade proposal made before it runs can't take effect";
-    also.push(if open.is_empty() { fail.to_string() } else { format!("{fail} (open now: {})", open.join(", ")) });
+    if !open.is_empty() {
+        now.push(format!("supersedes the upgrade proposal{} open now, {}", if open.len() == 1 { "" } else { "s" }, open.join(", ")));
+    }
+    if now.is_empty() {
+        return what;
+    }
     let when = match p.execute_at {
         Some(at) if p.status == ProposalStatus::Queued => format!("when it runs at block {at}"),
         _ => "if it passes".to_string(),
     };
-    format!("{what}; {when}, {}", also.join(", and "))
+    format!("{what}; {when}, as things stand it also {}", now.join(", and "))
 }
 
 #[cfg(test)]

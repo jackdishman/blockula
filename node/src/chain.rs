@@ -4396,7 +4396,7 @@ mod audit {
         let deposit = c.state.chain_params.proposal_deposit;
         c.faucet(&o.address(), deposit + 10 * DROPS_PER_FANG).unwrap();
         c.produce_block().unwrap();
-        c.state.upgrade.withdrawals = crate::upgrade::Withdrawals { highest: u32::MAX, last_at: Some(1) };
+        c.state.upgrade.withdrawals = crate::upgrade::Withdrawals { highest: u32::MAX, last_at: Some(1), superseded: u32::MAX };
         let at = |c: &Chain| (c.state.full_root(), c.state.account(&o.address()).balance, c.state.account(&o.address()).nonce);
         let before = at(&c);
         let cp = &c.state.chain_params;
@@ -5598,24 +5598,24 @@ mod scaffold {
         assert!(crate::upgrade::exec_deactivate_feature(s, &mut j, "ghost").is_err());
         crate::upgrade::exec_activate_feature(s, &mut j, "ghost", h).unwrap();
         assert!(crate::upgrade::exec_activate_feature(s, &mut j, "warp", h).is_err());
-        assert!(crate::upgrade::exec_schedule_upgrade(s, &mut j, 9, h, h).is_err(), "only after now");
-        crate::upgrade::exec_schedule_upgrade(s, &mut j, 9, 100, h).unwrap();
-        assert!(crate::upgrade::exec_schedule_upgrade(s, &mut j, 10, 80, h).unwrap_err().to_string().contains("must come after it"), "only after the last one");
+        assert!(crate::upgrade::exec_schedule_upgrade(s, &mut j, 9, h, h, h).is_err(), "only after now");
+        crate::upgrade::exec_schedule_upgrade(s, &mut j, 9, 100, h, h).unwrap();
+        assert!(crate::upgrade::exec_schedule_upgrade(s, &mut j, 10, 80, h, h).unwrap_err().to_string().contains("must come after it"), "only after the last one");
         assert_eq!(crate::upgrade::version_at(s, 100), 9);
         s.check_invariants().unwrap();
         // Cancelling (F50): only what's scheduled, only `MIN_UPGRADE_LEAD` blocks ahead of it,
         // and the version number is spent (review-fix-ops-1): the fix ships as the next one.
         let lead = crate::upgrade::MIN_UPGRADE_LEAD;
-        assert!(crate::upgrade::exec_cancel_upgrade(s, &mut j, 8, 100, h, 0).unwrap_err().to_string().contains("no upgrade to v8"));
-        assert!(crate::upgrade::exec_cancel_upgrade(s, &mut j, 9, 101, h, 0).unwrap_err().to_string().contains("scheduled at block 100, not 101"));
-        assert!(crate::upgrade::exec_cancel_upgrade(s, &mut j, 9, 100, 100 - lead + 1, 0).unwrap_err().to_string().contains("too late"));
+        assert!(crate::upgrade::exec_cancel_upgrade(s, &mut j, 8, 100, h, 0, 0).unwrap_err().to_string().contains("no upgrade to v8"));
+        assert!(crate::upgrade::exec_cancel_upgrade(s, &mut j, 9, 101, h, 0, 0).unwrap_err().to_string().contains("scheduled at block 100, not 101"));
+        assert!(crate::upgrade::exec_cancel_upgrade(s, &mut j, 9, 100, 100 - lead + 1, 0, 0).unwrap_err().to_string().contains("too late"));
         assert_eq!(crate::upgrade::version_at(s, 100), 9, "a refused cancellation changes nothing");
-        let withdrawn = crate::upgrade::exec_cancel_upgrade(s, &mut j, 9, 100, 100 - lead, 0).unwrap();
+        let withdrawn = crate::upgrade::exec_cancel_upgrade(s, &mut j, 9, 100, 100 - lead, 0, 0).unwrap();
         assert_eq!(withdrawn, [crate::upgrade::ScheduledUpgrade { version: 9, activation_height: 100 }]);
         assert_eq!((crate::upgrade::version_at(s, 100), s.upgrade.schedule.len()), (crate::consensus::PROTOCOL_VERSION, 0));
         s.check_invariants().unwrap();
-        assert!(crate::upgrade::exec_schedule_upgrade(s, &mut j, 9, 100, h).unwrap_err().to_string().contains("never reused"));
-        crate::upgrade::exec_schedule_upgrade(s, &mut j, 10, 100, h).unwrap();
+        assert!(crate::upgrade::exec_schedule_upgrade(s, &mut j, 9, 100, h, h).unwrap_err().to_string().contains("never reused"));
+        crate::upgrade::exec_schedule_upgrade(s, &mut j, 10, 100, h, h).unwrap();
         assert_eq!(crate::upgrade::version_at(s, 100), 10);
         s.check_invariants().unwrap();
         // Everything rolls back, dirty marks included.
