@@ -1,0 +1,45 @@
+# The public testnet, watched from outside Fly (deploy/README.md "External watch"). About every 10
+# minutes a GitHub runner checks https://blockula-testnet.fly.dev with scripts/testnet-watch.sh:
+# /api/health, the chain id, finality advancing, the head's age, the active validators, none
+# jailed or tombstoned. A failing check opens an issue labeled testnet-alert that @-mentions the
+# maintainer, so GitHub emails and pushes it to him, or comments on the one already open; the
+# first run that passes every check comments "Recovered" and closes it. To prove delivery:
+#   gh workflow run testnet-watch.yml -f test_alert=true
+# opens a test alert (the next healthy run closes it). The run stays green once the alert is
+# delivered and fails only when a gh call does (a broken alert path). It never runs on pull
+# requests, so it isn't a required check.
+name: Testnet watch
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: Open a test alert issue, to check its notification reaches the maintainer
+        type: boolean
+        default: false
+
+# No permissions by default; the job's token can only read and write issues (the alert, its label).
+permissions: {}
+
+# One watch at a time, so two runs can't both open an alert issue.
+concurrency: { group: testnet-watch, cancel-in-progress: false }
+
+jobs:
+  watch:
+    name: Public testnet (external watch)
+    # Forks don't watch (their alerts would mention the maintainer). If the repository moves,
+    # update its name here, or the watch stops.
+    if: github.repository == 'jackdishman/blockula'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - name: Check the testnet; open, update or close the alert issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TEST_ALERT: ${{ inputs.test_alert }}
+        run: bash scripts/testnet-watch.sh

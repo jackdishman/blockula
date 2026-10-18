@@ -185,6 +185,10 @@ jobs:
       # stand-in fly (retries, RESET, key removal, rolling restarts), offline.
       - name: Testnet deploy scripts (deploy/entrypoint.sh, fly-config.sh, launch.sh, set-github-token.sh)
         run: ENTRY_SH=dash bash deploy/test-deploy.sh
+      # The public testnet's external watch (testnet-watch.yml): its checks and its alert issue,
+      # against a mock node and a stand-in gh, offline.
+      - name: Testnet watch (scripts/testnet-watch.sh against a mock node and a stand-in gh)
+        run: bash scripts/test-testnet-watch.sh
       # The fuzz job runs in public: crashes stay out of its log and artifacts (supply-chain-B-1).
       - name: Fuzz crashes stay private (workflow, open findings)
         run: bash scripts/check-fuzz-workflow.sh
