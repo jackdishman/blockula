@@ -806,6 +806,7 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
         rt.block_on(async {
             // An empty home also heeds the period its peers report (gap-6-1); a validator warns.
             if empty {
+                learn_checkpoint_time(&mut trust, &peers).await;
                 heed_peers(&mut trust, &peers, false).await;
             }
             let own = shared.lock().head_time();
@@ -949,6 +950,21 @@ async fn heed_peers(trust: &mut Trust, peers: &[String], wait: bool) -> usize {
     }
 }
 
+/// An empty home whose newest checkpoint records no time (one in an older form) reads it from a
+/// peer's copy of that block (whose hash covers it), so the root's age counts from the checkpoint
+/// rather than from the genesis, where every slot the chain ever missed adds up (review-r3-sync-1).
+/// Without one, it says so: the age then counts from the genesis.
+async fn learn_checkpoint_time(trust: &mut Trust, peers: &[String]) {
+    let Some((height, hash)) = trust.untimed_newest() else { return };
+    match crate::checkpoints::peer_block_time(peers, height, &hash, STATUS_TIMEOUT).await {
+        Some((peer, time)) => match trust.learn_time(height, time) {
+            Ok(()) => println!("🕰️  checkpoint #{height} records no time; its block (from {peer}, whose copy hashes to it) carries {time}: its age counts from there"),
+            Err(e) => eprintln!("⚠️  checkpoint #{height}'s block carries the time {time}, which the other trusted checkpoints rule out ({e:#}): its age counts from the genesis"),
+        },
+        None => println!("ℹ️  checkpoint #{height} records no time, and no peer serves its block: its age counts from the genesis, so every slot the chain missed since adds to it (`blockula checkpoint` prints the HEIGHT:HASH:SET_HASH:TIMESTAMP_MS form)"),
+    }
+}
+
 /// Prepares a full-node home: genesis.json (copied or fetched from a node) + join.json.
 /// The genesis must be pinned: by `pins.genesis_hash`, or by this binary for a known chain id
 /// (`checkpoints.rs`). Checkpoints must agree with it, and the newest root must be younger than
@@ -967,12 +983,13 @@ pub fn join(genesis: &str, home: &Path, pins: &Pins, fast: bool) -> Result<()> {
         (Genesis::load(Path::new(genesis))?, vec![])
     };
     let mut trust = Trust::new(&g, pins, true)?;
-    trust.check_fresh((0, None), crate::chain::now_ms())?;
     for u in http_peers(&g, &[], None) {
         if !peers.contains(&u) {
             peers.push(u);
         }
     }
+    rt.block_on(learn_checkpoint_time(&mut trust, &peers));
+    trust.check_fresh((0, None), crate::chain::now_ms())?;
     if rt.block_on(heed_peers(&mut trust, &peers, false)) == 0 && !peers.is_empty() {
         println!("ℹ️  no peer answered /api/status for this chain: the weak-subjectivity period in force is checked again when the node first starts");
     }
@@ -1003,17 +1020,20 @@ pub fn run_full_node(home: PathBuf, net: NetOpts) -> Result<()> {
     // under the weak-subjectivity period of the parameters in force in this node's own state.
     let mut trust = Trust::new(&chain.genesis, &jc.pins, false)?;
     trust.follow(&chain.state.chain_params);
+    let peers = if net.peer_http.is_empty() { jc.peers } else { http_peers(&chain.genesis, &net.peer_http, None) };
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     // An empty home is where a stale root bites (a fresh sync); a synced one trusts its own head.
     let (empty, own) = (chain.height() == 0 && chain.base.is_none(), chain.head_time());
+    if empty {
+        rt.block_on(learn_checkpoint_time(&mut trust, &peers));
+    }
     trust.check_fresh(own, crate::chain::now_ms())?;
     let keep = net.pruning.keep(false, &chain.state);
     chain.set_pruning(keep);
     // A halted full node keeps serving reads at its height, with the reason in /api/health.
     crate::upgrade::configure(&mut chain, consensus::SUPPORTED_PROTOCOL_VERSION, net.halt_height);
-    let peers = if net.peer_http.is_empty() { jc.peers } else { http_peers(&chain.genesis, &net.peer_http, None) };
     println!("🦇 Full node for `{}` at height {} — syncing from {}", chain.genesis.chain_id, chain.height(), peers.join(", "));
     let shared: Shared = Arc::new(Mutex::new(chain));
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let fast = jc.fast && !net.full;
     rt.block_on(async move {
         // The API and explorer come up immediately, while syncing.
@@ -1706,6 +1726,93 @@ mod tests {
         assert_eq!(chain.lock().height(), 0, "nothing executed");
         apply_batch_trusted(&chain, &verifier, 0, &batch, Some(&timed(2, &hash2, genesis_set, Some(at2)))).unwrap();
         assert_eq!(chain.lock().hash_at(2), Some(hash2));
+        drop(chain);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// review-r3-sync-1, for a checkpoint in an older form (no time): a chain a year old whose
+    /// blocks only started a minute ago (a year of missed slots, the extreme of an aging chain).
+    /// Counted from the genesis, a checkpoint at its tip is a year old, and `join` refuses it. An
+    /// empty home reads the time from a peer's copy of the checkpoint's block (`/api/sync`, the
+    /// consensus block, whose hash covers its time), so it's a minute old and joins. A peer
+    /// serving junk or another block is passed over; without a copy, the age counts from the
+    /// genesis as before.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_untimed_checkpoint_counts_from_its_blocks_time() {
+        use crate::checkpoints::Checkpoint;
+        use axum::{routing::get, Json, Router};
+        use commonware_codec::Encode as _;
+        use commonware_consensus::simplex::types::{Finalize, Proposal};
+        use commonware_consensus::types::{Epoch, Round, View};
+        let root = home("cptime");
+        let homes = Chain::summon(&root, &SummonOpts::new("cptime", 1)).unwrap();
+        let gpath = homes[0].join("genesis.json");
+        let mut g = Genesis::load(&gpath).unwrap();
+        g.created_at_ms -= 365 * 86_400_000;
+        std::fs::write(&gpath, serde_json::to_string_pretty(&g).unwrap()).unwrap();
+        let seed: [u8; 32] = hex::decode(std::fs::read_to_string(homes[0].join("validator.key")).unwrap().trim()).unwrap().try_into().unwrap();
+        let source = root.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::copy(&gpath, source.join("genesis.json")).unwrap();
+        let chain: Shared = Arc::new(Mutex::new(Chain::open(&source).unwrap()));
+        // Blocks 1..=3, a minute ago, the last certified by the one validator.
+        let start = crate::chain::now_ms() - 60_000;
+        let root_hash = consensus::hex_32(&g.initial_state().root());
+        let mut blocks = vec![consensus::genesis_block(&g)];
+        for h in 1..=3u64 {
+            let parent = blocks.last().unwrap().digest();
+            blocks.push(CBlock::new(parent, h, h, h - 1, start + 1000 * h, g.validators[0].address.clone(), 0, root_hash, vec![]));
+        }
+        let scheme = MlDsaScheme::signer(&consensus::genesis_namespace(&g), consensus::participants(&g).unwrap(), PrivateKey::from_seed_bytes(seed)).unwrap();
+        let vote = Finalize::sign(&scheme, Proposal::new(Round::new(Epoch::new(0), View::new(3)), View::new(2), blocks[3].digest())).unwrap();
+        let fin = Finalization::from_finalizes(&scheme, commonware_utils::iter::NonEmpty::try_new([vote].iter()).unwrap(), &commonware_parallel::Sequential).unwrap();
+        let batch = SyncBatch { tip: 3, blocks: blocks[1..].iter().map(|b| hex::encode(b.encode())).collect(), to: Some(3), finalization: Some(hex::encode(fin.encode())) };
+        let verifier = consensus::EpochProvider::new(chain.clone(), None).epoch_scheme(0).unwrap();
+        apply_batch_trusted(&chain, &verifier, 0, &batch, None).unwrap();
+        chain.lock().set_pruning(None); // publishes the state to the API
+        let serve = |app: Router| async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap() });
+            url
+        };
+        let url = serve(crate::api::router(crate::api::Node::new(chain.clone(), None, vec![], Default::default()))).await;
+        let (hash, hash2, t2) = (crate::checkpoints::genesis_hash(&g), hex::encode(blocks[2].digest_bytes()), blocks[2].timestamp_ms);
+        // A peer serving junk, or block #3 as #2, is passed over; the honest copy is read.
+        let b3 = hex::encode(blocks[3].encode());
+        let junk = serve(Router::new().route("/api/sync", get(|| async { Json(serde_json::json!({ "blocks": ["00ff"] })) }))).await;
+        let wrong = serve(Router::new().route("/api/sync", get(move || async move { Json(serde_json::json!({ "blocks": [b3] })) }))).await;
+        let peers = [junk.clone(), wrong.clone(), url.clone()];
+        assert_eq!(crate::checkpoints::peer_block_time(&peers, 2, &hash2, STATUS_TIMEOUT).await, Some((url.clone(), t2)));
+        assert_eq!(crate::checkpoints::peer_block_time(&peers[..2], 2, &hash2, STATUS_TIMEOUT).await, None);
+        assert_eq!(crate::checkpoints::peer_block_time(&peers, 2, &"ab".repeat(32), STATUS_TIMEOUT).await, None, "no block hashes to another hash");
+        // Counted from the genesis, the tip is a year old; from its block's time, a minute.
+        let pins = |hash2: &str| Pins { genesis_hash: Some(hash.clone()), checkpoints: vec![Checkpoint { height: 2, hash: hash2.into(), set_hash: None, timestamp_ms: None }], ..Default::default() };
+        let mut trust = Trust::new(&g, &pins(&hash2), true).unwrap();
+        assert!(trust.check_fresh((0, None), crate::chain::now_ms()).unwrap_err().to_string().contains("~365.0 days"));
+        learn_checkpoint_time(&mut trust, std::slice::from_ref(&url)).await;
+        assert_eq!(trust.check_fresh((0, None), crate::chain::now_ms()).unwrap(), None);
+        assert_eq!(trust.checkpoints().next().unwrap().timestamp_ms, Some(t2));
+        // A time the other checkpoints rule out isn't learned (a later timed checkpoint can't be
+        // closer than the blocks between them allow).
+        let mut pinned = pins(&hash2);
+        pinned.checkpoints.push(Checkpoint { height: 5, hash: "cd".repeat(32), set_hash: None, timestamp_ms: Some(t2 + 1000) });
+        let mut ruled_out = Trust::new(&g, &pinned, true).unwrap();
+        assert!(ruled_out.learn_time(2, t2).unwrap_err().to_string().contains("checkpoint #5 records"));
+        assert_eq!(ruled_out.untimed_newest(), None, "the newest (#5) records its time");
+        assert_eq!(ruled_out.checkpoints().next().unwrap().timestamp_ms, None, "unchanged");
+        // `join` learns it the same way, and refuses (from the genesis' line) when no peer can
+        // show the block, or the checkpoint names another one.
+        let try_join = |name: &str, pins: Pins| {
+            let (from, home) = (url.clone(), root.join(name));
+            tokio::task::spawn_blocking(move || join(&from, &home, &pins, true))
+        };
+        try_join("joined", pins(&hash2)).await.unwrap().unwrap();
+        let err = try_join("refused", pins(&"cd".repeat(32))).await.unwrap().unwrap_err().to_string();
+        assert!(err.contains("~365.0 days") && err.contains("TIMESTAMP_MS"), "{err}");
+        // The joined home's first start reads it again (join.json keeps what the operator passed).
+        let jc: JoinConfig = serde_json::from_slice(&std::fs::read(root.join("joined").join("join.json")).unwrap()).unwrap();
+        assert_eq!(jc.pins, pins(&hash2));
         drop(chain);
         std::fs::remove_dir_all(root).ok();
     }

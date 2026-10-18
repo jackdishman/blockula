@@ -258,13 +258,18 @@ impl Trust {
             }
             trust.add(c.clone())?;
         }
-        // Recorded times must be ones the chain could have: no block is less than a block time
-        // after its parent, so none is earlier than the genesis (or a timed checkpoint before it)
-        // allows. A time in seconds, or another chain's, is refused here.
-        let mut before = (0, g.created_at_ms);
-        for c in trust.checkpoints.values() {
+        trust.check_times()?;
+        Ok(trust)
+    }
+
+    /// Recorded times must be ones the chain could have: no block is less than a block time after
+    /// its parent, so none is earlier than the genesis (or a timed checkpoint before it) allows. A
+    /// time in seconds, or another chain's, is refused here.
+    fn check_times(&self) -> Result<()> {
+        let mut before = (0, self.genesis_time);
+        for c in self.checkpoints.values() {
             let Some(t) = c.timestamp_ms else { continue };
-            let least = earliest(before, c.height, trust.block_time);
+            let least = earliest(before, c.height, self.block_time);
             ensure!(
                 t as u128 >= least,
                 "checkpoint #{} records its block's time as {t}, earlier than the chain allows ({least}: {} ms after #{}'s time {}, blocks being at least {} ms apart): a wrong checkpoint (the time is the block's timestamp_ms, in milliseconds)",
@@ -272,11 +277,34 @@ impl Trust {
                 least - before.1 as u128,
                 before.0,
                 before.1,
-                trust.block_time
+                self.block_time
             );
             before = (c.height, t);
         }
-        Ok(trust)
+        Ok(())
+    }
+
+    /// The newest checkpoint, as (height, hash), when it records no time (an older form): its
+    /// age then counts from the genesis, or from an older timed checkpoint ([`peer_block_time`]
+    /// can read its time from the block).
+    pub fn untimed_newest(&self) -> Option<(u64, String)> {
+        self.checkpoints.values().next_back().filter(|c| c.height > 0 && c.timestamp_ms.is_none()).map(|c| (c.height, c.hash.clone()))
+    }
+
+    /// Records `time` as the time of the checkpoint at `height`, which records none: the time its
+    /// block carries ([`peer_block_time`] checked the block hashes to the checkpoint's hash, which
+    /// covers the time). Refused, changing nothing, when the checkpoints' times can't all be the
+    /// chain's (an earlier checkpoint records a wrong time).
+    pub fn learn_time(&mut self, height: u64, time: u64) -> Result<()> {
+        let mut next = self.clone();
+        let c = next.checkpoints.get_mut(&height).ok_or_else(|| anyhow!("no trusted checkpoint at #{height}"))?;
+        if c.timestamp_ms.is_some() {
+            return Ok(());
+        }
+        c.timestamp_ms = Some(time);
+        next.check_times()?;
+        *self = next;
+        Ok(())
     }
 
     /// Adds a checkpoint; two at one height must agree (a set hash fills in a missing one).
@@ -493,6 +521,27 @@ pub async fn peer_periods(peers: &[String], genesis_hash: &str, timeout: std::ti
         }
     };
     futures::future::join_all(peers.iter().cloned().map(ask)).await.into_iter().flatten().collect()
+}
+
+/// The time of the block at `height` whose hash is `hash` (a trusted checkpoint that records no
+/// time), as the first of `peers` (each asked within `timeout`, in turn) that serves that block
+/// (`/api/sync`: the consensus block itself) shows it. The hash covers the time, so no peer can
+/// make it another; one that pruned the block, serves another or junk is passed over. Returns the
+/// peer and the time. For [`Trust::learn_time`] (review-r3-sync-1).
+pub async fn peer_block_time(peers: &[String], height: u64, hash: &str, timeout: std::time::Duration) -> Option<(String, u64)> {
+    use commonware_codec::DecodeExt;
+    let client = reqwest::Client::builder().timeout(timeout).build().ok()?;
+    for peer in peers {
+        let url = format!("{}/api/sync?from={height}&limit=1", peer.trim_end_matches('/'));
+        let Ok(body) = crate::node::get_capped(&client, &url, crate::node::MAX_SYNC_RESPONSE).await else { continue };
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) else { continue };
+        let bytes = v["blocks"].get(0).and_then(|b| b.as_str()).and_then(|b| hex::decode(b).ok());
+        let block = bytes.and_then(|b| crate::consensus::CBlock::decode(b.as_slice()).ok());
+        if let Some(b) = block.filter(|b| b.height == height && hex::encode(b.digest_bytes()) == hash) {
+            return Some((peer.clone(), b.timestamp_ms));
+        }
+    }
+    None
 }
 
 /// `blockula checkpoint`: the checkpoint at `height` (default: the newest epoch boundary every
