@@ -2,7 +2,7 @@
 // the node's /api/tx output. Run with `npm test -w @blockula/web`.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { amountLeaves, bySigner, compactDrops, counterparty, deltaFor, effectsOf, flowsOf, formatDrops, fromMySide } from "./explorer/ledger.ts";
+import { amountLeaves, bySigner, compactDrops, contextsOf, counterparty, deltaFor, effectsOf, flowsOf, formatDrops, fromMySide, showsAccount } from "./explorer/ledger.ts";
 
 const F = 1_000_000_000n;
 const label = (name, address = `boo1${name}`) => ({ address, name: `${name}.boo`, short: `${address.slice(0, 6)}…` });
@@ -159,6 +159,20 @@ test("paying an address may open its account: the sender's side says so, the rec
   assert.equal(deltaFor(t, fresh.address).exact, true);
   // Known to have had an account already (it shows up earlier): nothing to flag.
   assert.equal(effectsOf(t, { recipientExisted: true }).unseen, null);
+  // review-main13-3: only a transaction that shows an account counts as that evidence: one the
+  // address sent, or a finalized payment to it. A name offer, a vouch or a failed payment to it
+  // opens none, so the payment after it may still have.
+  const at = (h, extra) => ({ ...t, id: `e${h}`, height: h, ...extra });
+  const named = [
+    at(3, { kind: "transfer_name", to: fresh, amount: null, action: { type: "transfer_name", name: "castle", to: fresh.address } }),
+    at(4, { kind: "vouch", to: fresh, action: { type: "vouch", account: fresh.address } }),
+    at(5, { status: "failed", error: "insufficient balance" }),
+  ];
+  assert.equal(contextsOf([t, ...named])(t).recipientExisted, false);
+  assert.equal(deltaFor(t, vlad.address, contextsOf([t, ...named])(t)).exact, false);
+  assert.equal(contextsOf([t, at(5, {})])(t).recipientExisted, true, "an earlier finalized payment to it");
+  assert.equal(contextsOf([t, at(6, { from: fresh, to: vlad })])(t).recipientExisted, true, "an earlier transaction it sent");
+  assert.ok(!showsAccount({ ...t, status: "pending" }, fresh.address));
   // Known to open one (a preflight reads it): the burn is booked.
   const opening = effectsOf({ ...t, status: "pending", height: null }, { creationFee: F / 10n });
   assert.deepEqual(opening.changes.map((c) => c.delta), [-(F + 64920n + F / 10n), F]);
@@ -180,8 +194,14 @@ test("v1 kinds: a vote and unlock move nothing, a claim comes in, stake and depo
   assert.match(effectsOf(vote).note, /locks 150 FANG/);
   assert.equal(deltaFor(vote, vlad.address).exact, true);
   assert.equal(amountLeaves("vote"), false);
-  const claim = tx({ kind: "claim_distribution", from: vlad, amount: String(1000n * F), action: { type: "claim_distribution", distribution_id: 0, amount: String(1000n * F) } });
+  const claim = tx({ kind: "claim_distribution", from: vlad, nonce: 3, amount: String(1000n * F), action: { type: "claim_distribution", distribution_id: 0, amount: String(1000n * F) } });
   assert.deepEqual(deltaFor(claim, vlad.address), { delta: 1000n * F - 1000n, direction: "in", exact: true });
+  // review-main13-7: an account's first transaction may be a claim that opens it, burning the
+  // creation fee out of the claim: not exact on the claimant's side, unless it's known to exist.
+  const first = { ...claim, nonce: 0 };
+  assert.match(effectsOf(first).unseen, /If this claim opened vlad.boo's account, the chain also burned the account-creation fee/);
+  assert.equal(deltaFor(first, vlad.address).exact, false);
+  assert.equal(deltaFor(first, vlad.address, { senderExisted: true }).exact, true);
   assert.equal(effectsOf(claim).changes[1].who.name, "Community distribution #0");
   assert.equal(flowsOf([claim], vlad.address).totalIn, 1000n * F);
   const val = label("val");

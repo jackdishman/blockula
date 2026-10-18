@@ -2,22 +2,27 @@
  * An action form's fields as typed, checked before anything is built: the same rules the chain
  * applies, in words. Pure (the SDK's address check only), so `node --test` runs it directly.
  */
-import { isAddress, parseFang } from "@blockula/sdk";
+import { KNOWN_PREFIXES, addressPrefix, parseFang } from "@blockula/sdk";
 import type { Param } from "./programs.ts";
 
 const utf8 = (s: string) => new TextEncoder().encode(s).length;
 const NAME = /^[a-z0-9-]{3,32}(\.boo)?$/i;
+/** Longer than any name with its suffix (32 + ".boo"): an address is 60-odd characters. */
+const NAME_MAX = 36;
 
 /**
  * An account field as typed: a name, or an address of this chain's network (DEC-7: another
- * network's is refused, never converted). `prefix` is the chain's (`client.pin.prefix`).
+ * network's is refused, never converted). `prefix` is the chain's (`client.pin.prefix`). Only
+ * something too long for a name, starting with a known network's prefix, is read as an address:
+ * a name may look like `team1abc…` (audit review-main13-5).
  */
 export function checkAccount(raw: string, prefix: string): string | null {
   const v = raw.trim().toLowerCase();
-  const hrp = v.match(/^([a-z]+)1[a-z0-9]{20,}$/)?.[1];
-  if (hrp) {
-    if (hrp !== prefix) return `That's an address on another network (${hrp}1…). Addresses here start with ${prefix}1.`;
-    return isAddress(v, prefix) ? null : "That address doesn't look right. Check for typos.";
+  const hrp = v.match(/^([a-z]+)1[a-z0-9]+$/)?.[1];
+  if (hrp && (KNOWN_PREFIXES as readonly string[]).includes(hrp) && v.length > NAME_MAX) {
+    const valid = addressPrefix(v);
+    if (!valid) return "That address doesn't look right. Check for typos.";
+    return valid === prefix ? null : `That's an address on another network (${valid}1…). Addresses here start with ${prefix}1.`;
   }
   return NAME.test(v) ? null : `A .boo name or a ${prefix}1… address.`;
 }

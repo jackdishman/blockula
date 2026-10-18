@@ -6,6 +6,7 @@
 // signed as names, expired and reserved names, hunts' cancel rule, staking's groups.
 import type { Tx } from "@blockula/sdk";
 import { HOSTILE, PHONE, seedWorld, type World } from "./explorer-world";
+import { RPC } from "./env";
 import { addressOf, VALIDATOR } from "./mock-node";
 import { createWallet, cspViolations, expect, test, watchCsp } from "./helpers";
 import type { Locator, Page } from "@playwright/test";
@@ -98,7 +99,11 @@ test.describe("every explorer page", () => {
       for (const [name, id] of Object.entries(w.ids).filter((_, i) => i % PARTS === part)) {
         await visit(page, `/tx/${id}`, receipt, errors);
         if (["failed", "ranUnseen"].includes(name)) await expect(eyebrow(page), name).toHaveText("Included, but failed");
-        else if (name === "dropped") await expect(eyebrow(page), name).toHaveText("Dropped, not final");
+        else if (name === "dropped") {
+          // Not a failure that ran: not final, nothing charged, no red pill (review-r4-wallet-2).
+          await expect(eyebrow(page), name).toHaveText("Dropped, not final");
+          await expect(page.locator(".receipt .pill"), name).toHaveText(["dropped"]);
+        }
         else if (name === "waiting") await expect(eyebrow(page), name).toHaveText("On its way");
         else await expect(eyebrow(page), name).toHaveText("Receipt");
         // What was signed is rendered here from the action, never taken from the node's summary.
@@ -114,6 +119,7 @@ test.describe("every explorer page", () => {
     await expect(page.locator(".crumbs")).not.toContainText("Block #");
     await expect(page.locator("ol.trace")).toContainText("nothing was charged, but another node may still include it until its valid_until");
     await expect(page.locator("ol.trace")).toContainText("not in any block this node holds");
+    await expect(page.locator(".receipt .pill.failed")).toHaveCount(0);
     await expect(page.locator("ol.trace")).not.toContainText("quorum certificate");
     await expect(page.getByText("Balance changes")).toHaveCount(0);
     // Ran in a block this node no longer holds: it was charged.
@@ -303,7 +309,13 @@ test.describe("the explorer from an account holder's side", () => {
     await preview("Register a name", { Name: "ghoul" });
     await preview("Renew a name", { Name: "vlad" });
     await preview("Offer a name", { Name: "castle", To: "lucy.boo" });
-    await preview("Accept a name", { Name: "castle" });
+    // review-main13-2: castle.boo is this account's (offered to mina.boo), so sending it to oneself
+    // withdraws the offer: the headline says what the chain will do, and the "accept" form refuses.
+    const accept = await preview("Accept a name", { Name: "castle" });
+    await expect(accept.getByTestId("action-preview").locator(".headline")).toHaveText("Withdraw your offer of castle.boo");
+    await expect(accept.getByTestId("preflight")).toContainText("owns castle.boo, so this would withdraw its offer, not accept one");
+    const withdraw = await preview("Withdraw an offer", { Name: "castle" });
+    await expect(withdraw.getByTestId("action-preview").locator(".headline")).toHaveText("Withdraw your offer of castle.boo");
     await preview("Release a name", { Name: "castle" });
 
     await page.goto("/programs/hunts");
@@ -409,6 +421,31 @@ test.describe("the explorer from an account holder's side", () => {
     for (let i = 0; i < 26; i++) node.add({ kind: "transfer", from: w.lucy, to: me, amount: 1n, fee: 64_920n, memo: "", summary: "lucy.boo sent 0.000000001 FANG to vlad.boo", action: { type: "transfer", to: me, amount: "1" } });
     await expect(page.locator(".notice.agent", { hasText: "Your agent “claude" })).toBeVisible({ timeout: 9000 });
     expect(await cspViolations(page)).toEqual([]);
+    expect(errors).toEqual([]);
+  });
+
+  test("a payment to a watched account that seals between the two reads is no missed spend (audit review-main13-4)", async ({ page, node }) => {
+    await page.addInitScript(([key, address]) => localStorage.setItem(key, JSON.stringify([{ address, label: "mina.boo", at: 1 }])), [`blockula.watch:${RPC}`, w.mina]);
+    await visit(page, "/explore", (p) => p.getByRole("heading", { name: "blockula-testnet, live" }), errors);
+    await page.waitForTimeout(4500); // the first look is the baseline
+    // A round reads this account, then the watched one; a payment from this account to the watched
+    // one seals in between (just before the watched account's read, which only these notices
+    // make): that read announces it first, and this account's next read sees its nonce moved.
+    node.beforeAccountRead = (id) => {
+      if (id !== w.mina) return;
+      node.beforeAccountRead = null;
+      node.add({ kind: "transfer", from: me, to: w.mina, amount: 2_000_000_000n, fee: 64_920n, memo: "", summary: "vlad.boo sent 2 FANG to mina.boo", action: { type: "transfer", to: w.mina, amount: "2000000000" } });
+      node.acct(me).nonce += 1;
+    };
+    await expect(page.locator(".notice", { hasText: "Watching mina.boo" })).toBeVisible({ timeout: 9000 });
+    // Through this account's next read: no notice says a spend was pushed out of view. (Sampled,
+    // not retried until it passes: a notice that showed and was dismissed still counts.)
+    const shown = new Set<string>();
+    for (let i = 0; i < 24; i++) {
+      for (const text of await page.locator(".notice").allInnerTexts()) shown.add(text);
+      await page.waitForTimeout(250);
+    }
+    expect([...shown].filter((text) => text.includes("pushed out of view"))).toEqual([]);
     expect(errors).toEqual([]);
   });
 

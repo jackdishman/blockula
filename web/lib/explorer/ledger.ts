@@ -51,6 +51,8 @@ export interface LedgerCtx {
   creationFee?: bigint;
   /** The recipient already had an account before it ran, so paying it opened none. */
   recipientExisted?: boolean;
+  /** The sender already had an account before it ran (a claim by a new account opens its own). */
+  senderExisted?: boolean;
 }
 
 const holding = (key: string, name: string): Holding => ({ address: `holding:${key}`, name, short: name, holding: true });
@@ -211,6 +213,10 @@ export function effectsOf(tx: TxDetail, ctx: LedgerCtx = {}): Effects {
     const id = String(tx.action?.distribution_id ?? "?");
     changes.push({ who: tx.from, delta: amount - fee, why: "claimed, less the fee" });
     changes.push({ who: holding(`distribution:${id}`, `Community distribution #${id}`), delta: -amount, why: "paid the claim" });
+    // A claim by an account that doesn't exist yet opens it, and burns the account-creation fee
+    // out of the claim (node/src/chain.rs, the prepaid path). Only an account's first transaction
+    // can (nonce 0), and the transaction doesn't record whether it did (audit review-main13-7).
+    if (!pending && !ctx.senderExisted && (tx.nonce == null || tx.nonce === 0)) senderOnly.push(`If this claim opened ${labelText(tx.from)}'s account, the chain also burned the account-creation fee (0.1 FANG by default) out of the claim; the transaction doesn't record whether it did.`);
   } else if (amount > 0n && !NOT_SPENT.has(kind)) {
     // An escrowing kind's amount goes to its holding even when the node names a `to` (a vouch
     // names the newcomer, but the bond is held by the program, not paid to them).
@@ -262,17 +268,31 @@ export function counterparty(tx: TxDetail, me: string | null): Label | Holding |
 }
 
 /**
- * What each transaction tells about the accounts it pays, from the list it came from: a
- * recipient that already shows up in an earlier transaction of the list had an account then, so
- * paying it opened none (and burned no creation fee).
+ * Whether sealed transaction `t` shows that `address` had an account once it ran: it sent it (a
+ * sender pays a fee, from an account), or it's a finalized payment, award or unshield to it.
+ * Being named doesn't: a vouch, a name offer, Soul or a failed payment opens no account (audit
+ * main13-render-2, review-main13-3).
+ */
+export function showsAccount(t: TxDetail, address: string): boolean {
+  if (t.status === "pending" || t.height == null) return false;
+  if (t.from?.address === address) return true;
+  const kind = t.kind ?? t.action?.type;
+  return t.status === "finalized" && t.to?.address === address && (kind === "transfer" || kind === "award_hunt" || kind === "unshield");
+}
+
+/**
+ * What each transaction tells about the accounts it pays, from the list it came from: an account
+ * an earlier transaction of the list shows existed ([`showsAccount`]) had one then, so paying it
+ * opened none (and burned no creation fee), and its own claim opened none either.
  */
 export function contextsOf(txs: TxDetail[]): (tx: TxDetail) => LedgerCtx {
   const first = new Map<string, number>();
   for (const t of txs) {
     if (t.height == null) continue;
-    for (const w of [t.from, t.to]) if (w && (first.get(w.address) ?? Infinity) > t.height) first.set(w.address, t.height);
+    for (const w of [t.from, t.to]) if (w && showsAccount(t, w.address) && (first.get(w.address) ?? Infinity) > t.height) first.set(w.address, t.height);
   }
-  return (t) => ({ recipientExisted: !!t.to && t.height != null && (first.get(t.to.address) ?? Infinity) < t.height });
+  const before = (w: Label | null | undefined, t: TxDetail) => !!w && t.height != null && (first.get(w.address) ?? Infinity) < t.height;
+  return (t) => ({ recipientExisted: before(t.to, t), senderExisted: before(t.from, t) });
 }
 
 export interface Flow {

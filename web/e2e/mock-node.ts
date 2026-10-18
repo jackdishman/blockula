@@ -93,6 +93,8 @@ export class MockNode {
   txs = new Map<string, TxRec>();
   /** What `/api/tx/{id}` answers as is, before any recorded tx: e.g. node/src/api.rs's answers from its mempool's memory, without the tx (a drop, a failure that ran). */
   txAnswers = new Map<string, unknown>();
+  /** Runs just before `/api/account/{id}` answers: a block executing between two of the page's reads. */
+  beforeAccountRead: ((id: string) => void) | null = null;
   /** Every signed tx accepted, in order. */
   submitted: Tx[] = [];
   /** Every request body the wallet sent to the node, to prove secrets never leave the page. */
@@ -557,7 +559,10 @@ export class MockNode {
       let m: RegExpMatchArray | null;
       if (req.method() === "GET" && path === "/status") return reply(200, this.status());
       if (req.method() === "GET" && path === "/genesis") return this.genesis ? reply(200, this.genesis) : reply(404, { error: "no genesis here" });
-      if (req.method() === "GET" && (m = path.match(/^\/account\/(.+)$/))) return reply(200, this.account(m[1]));
+      if (req.method() === "GET" && (m = path.match(/^\/account\/(.+)$/))) {
+        this.beforeAccountRead?.(m[1]);
+        return reply(200, this.account(m[1]));
+      }
       if (req.method() === "GET" && (m = path.match(/^\/key\/([0-9a-f]{64})$/))) return reply(200, this.keyAccounts(m[1]));
       if (req.method() === "GET" && (m = path.match(/^\/name\/(.+)$/))) {
         const n = m[1].toLowerCase().replace(/\.boo$/, "");

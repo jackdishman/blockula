@@ -1013,19 +1013,28 @@ impl State {
     /// (`Err`: not admittable, so skipped; the proposer pays for it at the end of the block).
     /// `tx_bytes` (econ's fullness) counts every tx the block carried, skipped ones included.
     #[allow(clippy::too_many_arguments)]
-    pub fn run_block<'t>(&mut self, chain_id: &str, height: u64, hash: &str, proposer: &str, view: u64, parent_view: u64, txs: impl IntoIterator<Item = &'t Tx>, mut each: impl FnMut(&'t Tx, Result<Outcome>)) {
+    pub fn run_block<'t>(&mut self, chain_id: &str, height: u64, hash: &str, proposer: &str, view: u64, parent_view: u64, txs: impl IntoIterator<Item = &'t Tx>, mut each: impl FnMut(&'t Tx, Vec<String>, Result<Outcome>)) {
         let mut skipped = vec![];
         let mut tx_bytes = 0u64;
         for tx in txs {
             let size = tx.size();
             tx_bytes += size;
+            let named = self.named_by(tx);
             let r = self.apply(tx, chain_id, proposer, height);
             if r.is_err() {
                 skipped.push(size);
             }
-            each(tx, r);
+            each(tx, named, r);
         }
         self.end_block(&BlockInfo { height, hash, proposer, view, parent_view, skipped: &skipped, tx_bytes });
+    }
+
+    /// The accounts `tx`'s action names, resolved as the state is now: just before it runs, which
+    /// is whom it pays (a name pays whoever owns it when the tx runs: audit gap-7-1). The block's
+    /// index rows keep these, so an account's history and the API's `to` name who a sealed tx
+    /// paid, not who owned the name once the whole block had run (audit review-main13-1).
+    pub fn named_by(&self, tx: &Tx) -> Vec<String> {
+        tx.action.addresses().into_iter().filter_map(|(_, named)| self.resolve(named).ok()).collect()
     }
 
     /// An address as is, or a name's owner. Expired names (DEC-11) don't resolve.
@@ -2856,15 +2865,19 @@ impl Chain {
     /// Index rows for an executed block: its tx ids and the accounts whose history it joins (the
     /// sender, and every account the action names: recipients, validators, the accounts a
     /// proposal or a multisig proposal names; see [`Action::addresses`]).
-    fn block_meta(&self, block: &Block, at: Pos, cblock: Option<Pos>) -> Result<BlockMeta> {
+    /// `named[i]`: the accounts tx `i` named, resolved just before it ran ([`State::named_by`]).
+    fn block_meta(&self, block: &Block, named: &[Vec<String>], at: Pos, cblock: Option<Pos>) -> Result<BlockMeta> {
+        if named.len() != block.txs.len() {
+            bail!("block {}: {} txs but {} resolutions of what they named", block.height, block.txs.len(), named.len());
+        }
         let mut txs = Vec::with_capacity(block.txs.len());
         let mut history = vec![];
-        for (i, tx) in block.txs.iter().enumerate() {
+        for (i, (tx, named)) in block.txs.iter().zip(named).enumerate() {
             txs.push(hash32(&tx.id())?);
             let mut joined: Vec<String> = tx.sender().ok().into_iter().collect();
-            for a in tx.action.addresses().into_iter().filter_map(|(_, named)| self.state.resolve(named).ok()) {
-                if !joined.contains(&a) {
-                    joined.push(a);
+            for a in named {
+                if !joined.contains(a) {
+                    joined.push(a.clone());
                 }
             }
             history.extend(joined.into_iter().map(|a| (i as u32, a)));
@@ -2891,8 +2904,8 @@ impl Chain {
 
     /// Everything the commit of `block` writes, as of the state now in memory (the writer fills
     /// in where the block lands in the logs).
-    fn prepare_commit(&self, block: Arc<Block>, cblock: Option<Vec<u8>>, records: Vec<RecordChange>, cert: Option<Vec<u8>>) -> Result<Executed> {
-        let meta = self.block_meta(&block, Pos::default(), None)?;
+    fn prepare_commit(&self, block: Arc<Block>, named: &[Vec<String>], cblock: Option<Vec<u8>>, records: Vec<RecordChange>, cert: Option<Vec<u8>>) -> Result<Executed> {
+        let meta = self.block_meta(&block, named, Pos::default(), None)?;
         let epoch_head = self.state.params.is_boundary(block.height);
         let spaced = self.cert_bytes.saturating_add(cblock.as_ref().map_or(0, |b| b.len() as u64)) >= CERT_SPACING_BYTES;
         let cert = cert.filter(|_| block.height.is_multiple_of(CERT_CHECKPOINT) || epoch_head || spaced);
@@ -2922,7 +2935,9 @@ impl Chain {
         }
         // A block this binary can't run was logged by a newer one (3.9).
         crate::upgrade::check_next_with(&self.state, block.height, self.halt.supported)?;
+        let mut named = Vec::with_capacity(block.txs.len());
         for (i, tx) in block.txs.iter().enumerate() {
+            named.push(self.state.named_by(tx));
             let outcome = self.state.apply(tx, &self.genesis.chain_id, &block.proposer, block.height).with_context(|| format!("replaying block {}", block.height))?;
             check_replayed(block.height, i, &outcome, block.failed.get(&i))?;
         }
@@ -2939,7 +2954,7 @@ impl Chain {
             bail!("state root mismatch at height {}", block.height);
         }
         let height = block.height;
-        let mut e = self.prepare_commit(Arc::new(block), None, commit.records, None)?;
+        let mut e = self.prepare_commit(Arc::new(block), &named, None, commit.records, None)?;
         (e.meta.block, e.meta.cblock, e.meta.tx_spans) = (at, cblock, tx_spans);
         let (snap, point) = self.writer.lock().commit(&e, durable)?;
         self.advance(&e.block);
@@ -3032,20 +3047,25 @@ impl Chain {
 
     fn apply_block(&mut self, f: Finalized) -> Result<Executed> {
         let mut txs = vec![];
+        let mut named = vec![];
         let mut failed = BTreeMap::new();
         let mut skipped = vec![];
         // What this height's txs pay, fixed before the block's own end-of-block steps run.
         let base_fee = crate::econ::slot(&self.state, f.height);
         let mut results = Vec::with_capacity(f.txs.len());
         let chain_id = self.genesis.chain_id.clone();
-        self.state.run_block(&chain_id, f.height, &f.hash, &f.proposer, f.view, f.parent_view, &f.txs, |_, r| results.push(r));
-        for (tx, r) in f.txs.into_iter().zip(results) {
+        self.state.run_block(&chain_id, f.height, &f.hash, &f.proposer, f.view, f.parent_view, &f.txs, |_, n, r| results.push((n, r)));
+        for (tx, (n, r)) in f.txs.into_iter().zip(results) {
             match r {
-                Ok(Outcome::Applied) => txs.push(tx),
+                Ok(Outcome::Applied) => {
+                    txs.push(tx);
+                    named.push(n);
+                }
                 Ok(Outcome::Failed(r)) => {
                     failed.insert(txs.len(), r.clone());
                     self.note_failed_as(tx.id(), r, f.height, true);
                     txs.push(tx);
+                    named.push(n);
                 }
                 Err(e) => {
                     skipped.push(tx.size());
@@ -3065,7 +3085,7 @@ impl Chain {
             self.disk.remember_cert(f.height, cert.clone());
         }
         let cblock_bytes = f.cblock.len() as u64;
-        let e = self.prepare_commit(block, Some(f.cblock), commit.records, f.certificate)?;
+        let e = self.prepare_commit(block, &named, Some(f.cblock), commit.records, f.certificate)?;
         self.cert_bytes = if e.cert.is_some() { 0 } else { self.cert_bytes.saturating_add(cblock_bytes) };
         self.advance(&e.block);
         Ok(e)

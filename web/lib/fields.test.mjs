@@ -22,6 +22,10 @@ test("names pass, and the hint names the chain's prefix", () => {
   assert.equal(checkAccount("alice.boo", "tboo"), null);
   assert.equal(checkAccount("Alice", "boo"), null);
   assert.equal(checkAccount("al", "tboo"), "A .boo name or a tboo1… address.");
+  // review-main13-5: a name may look like an address's start ('team1…', even 'boo1…'): only
+  // something too long for a name, with a known network's prefix, is read as an address.
+  for (const name of ["team1abcdefghijklmnopqrst", "boo1abcdefghijklmnopqrstuvwxyz", "tboo1abcdefghij"]) assert.equal(checkAccount(name, "boo"), null, name);
+  assert.equal(checkAccount("cosmos1abcdefghijklmnopqrstuvwxyz0123456789", "boo"), "A .boo name or a boo1… address.");
 });
 
 test("other fields", () => {
