@@ -524,24 +524,27 @@ pub async fn peer_periods(peers: &[String], genesis_hash: &str, timeout: std::ti
 }
 
 /// The time of the block at `height` whose hash is `hash` (a trusted checkpoint that records no
-/// time), as the first of `peers` (each asked within `timeout`, in turn) that serves that block
-/// (`/api/sync`: the consensus block itself) shows it. The hash covers the time, so no peer can
-/// make it another; one that pruned the block, serves another or junk is passed over. Returns the
-/// peer and the time. For [`Trust::learn_time`] (review-r3-sync-1).
+/// time), as a peer that serves that block (`/api/sync`: the consensus block itself) shows it:
+/// the first to answer of `peers`, asked a few at a time, each within `timeout`. The hash covers
+/// the time, so no peer can make it another; one that pruned the block, serves another or junk is
+/// passed over. Returns the peer and the time. For [`Trust::learn_time`] (review-r3-sync-1).
 pub async fn peer_block_time(peers: &[String], height: u64, hash: &str, timeout: std::time::Duration) -> Option<(String, u64)> {
     use commonware_codec::DecodeExt;
+    use futures::StreamExt;
     let client = reqwest::Client::builder().timeout(timeout).build().ok()?;
-    for peer in peers {
-        let url = format!("{}/api/sync?from={height}&limit=1", peer.trim_end_matches('/'));
-        let Ok(body) = crate::node::get_capped(&client, &url, crate::node::MAX_SYNC_RESPONSE).await else { continue };
-        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) else { continue };
-        let bytes = v["blocks"].get(0).and_then(|b| b.as_str()).and_then(|b| hex::decode(b).ok());
-        let block = bytes.and_then(|b| crate::consensus::CBlock::decode(b.as_slice()).ok());
-        if let Some(b) = block.filter(|b| b.height == height && hex::encode(b.digest_bytes()) == hash) {
-            return Some((peer.clone(), b.timestamp_ms));
+    let ask = |peer: String| {
+        let client = client.clone();
+        async move {
+            let url = format!("{}/api/sync?from={height}&limit=1", peer.trim_end_matches('/'));
+            let body = crate::node::get_capped(&client, &url, crate::node::MAX_SYNC_RESPONSE).await.ok()?;
+            let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
+            let block = crate::consensus::CBlock::decode(hex::decode(v["blocks"].get(0)?.as_str()?).ok()?.as_slice()).ok()?;
+            (block.height == height && hex::encode(block.digest_bytes()) == hash).then_some((peer, block.timestamp_ms))
         }
-    }
-    None
+    };
+    // A few at a time: each answer may be up to a sync response's size.
+    let answers = futures::stream::iter(peers.iter().cloned().map(ask)).buffer_unordered(4).filter_map(std::future::ready);
+    std::pin::pin!(answers).next().await
 }
 
 /// `blockula checkpoint`: the checkpoint at `height` (default: the newest epoch boundary every
