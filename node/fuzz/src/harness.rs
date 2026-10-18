@@ -598,7 +598,7 @@ impl Sm {
         // Exactly as execution runs a block (`State::run_block`).
         let hash = hex::encode(crate::crypto::hash(&height.to_le_bytes()));
         let mut applied = 0;
-        self.state.run_block(SM_CHAIN, height, &hash, &proposer, height, height - 1, &txs, |_, r| applied += matches!(r, Ok(Outcome::Applied)) as usize);
+        self.state.run_block(SM_CHAIN, height, &hash, &proposer, height, height - 1, &txs, |_, _, r| applied += matches!(r, Ok(Outcome::Applied)) as usize);
         self.applied += applied;
         let commit = self.state.commit_block().expect("an in-memory tree can't fail");
         assert_eq!(commit.root, self.state.full_root(), "incremental state root diverged from a full rebuild at height {height}");
