@@ -2894,8 +2894,9 @@ mod scenarios {
     /// Audit xcut-economic-opus-1, round 4 (the round-3 R1 reviewer's bypass): with honest jurors
     /// who prefer one weak PR to another rather than calling it a tie, each weak claim's win rate
     /// is noisy, and paying a person's best claim paid the best of k noisy rates, which grows with
-    /// k: 16 weak PRs out-earned the solid one in 39 of 40 runs (1.27× on average), and volume
-    /// about doubled the farmer's payout. A person's claims now share one win rate pooled over
+    /// k: 16 weak PRs out-earned the solid one in 39 of 40 of the reviewer's runs (1.27× on
+    /// average), and in 40 of 40 of this model's (1.37×), 1.70× what one weak claim earned. A
+    /// person's claims now share one win rate pooled over
     /// all their comparisons, so more claims don't raise it, and the ranks add at most a third:
     /// over 40 draws, k weak claims earn at most 4/3 of what one does (FANG and Soul), and the
     /// farmer's 16 with the full Soul boost stay below one solid PR by a newcomer.
