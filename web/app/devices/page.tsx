@@ -2,14 +2,16 @@
 
 import { decodeKeyGrant, formatFang, parseFang, type KeyGrant } from "@blockula/sdk";
 import Link from "next/link";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { RequireWallet } from "@/components/Gate";
 import { RecoveryKitSetup } from "@/components/RecoveryKit";
 import { Apparition } from "@/components/Haunt";
+import { QrCode } from "@/components/QrCode";
 import { Copy, ErrorNote, ExplorerLink, Spinner, Tip } from "@/components/ui";
-import { BLOCKS_PER_DAY, explorer } from "@/lib/config";
+import { BLOCKS_PER_DAY, DEFAULT_NETWORK, explorer, NETWORK, walletUrl } from "@/lib/config";
 import { friendly } from "@/lib/errors";
 import { blocksToHuman, keyCode } from "@/lib/format";
+import { deviceLink } from "@/lib/paylink";
 import { KIT_LABEL } from "@/lib/recovery";
 import type { KeyView, TxView } from "@/lib/types";
 import { useUnlocked } from "@/lib/wallet";
@@ -189,15 +191,22 @@ function parseGrant(code: string, account: string): { grant: KeyGrant | null; pr
 }
 
 function AddDevice() {
-  const { wallet, refresh } = useUnlocked();
+  const { wallet, client, status, refresh } = useUnlocked();
   const [id, setId] = useState("");
   const [label, setLabel] = useState("My phone");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState<TxView | null>(null);
+  const [canShare, setCanShare] = useState(false);
+  useEffect(() => setCanShare(typeof navigator.share === "function"), []);
   // The new device's grant: its consent to joining this account (audit gap-7-2), not just its key id.
   const { grant, problem } = parseGrant(id, wallet.account);
   const valid = grant !== null;
+  // Opens /link on the new device with this account filled in. Like a payment link it says which
+  // chain it's for, a check there, never a switch: complete once the node's status has filled in
+  // what configuration didn't.
+  const chain = client.pin.chainId && (client.pin.genesisHash || status) ? client.pin : null;
+  const link = chain ? deviceLink(walletUrl(), wallet.account, chain) : null;
 
   const add = async () => {
     if (!grant) return;
@@ -218,16 +227,42 @@ function AddDevice() {
   return (
     <section className="card stack" id="device">
       <h2>Link a device</h2>
+      <p className="dim">Add your phone, tablet or another computer as a co-owner. It makes its own passkey, so nothing secret leaves this device.</p>
       <ol className="steps">
-        <li>On the new device, open this wallet and choose <b>Link this device to a wallet on another device</b>, then enter this account: <span className="mono">{wallet.account}</span>.</li>
-        <li>It shows a grant code. Copy it and paste it here.</li>
-        <li>Check the code matches, then add it. The new device opens automatically.</li>
+        <li>On the new device, scan this code with the camera, or open the link there.</li>
+        <li>It makes a passkey and shows a grant code. Send that code here (AirDrop, or a message or email to yourself: it holds no secret) and paste it below.</li>
+        <li>Check the codes match, then add it. The new device opens your wallet by itself.</li>
       </ol>
+      {link ? (
+        <>
+          <div className="qr-frame">
+            <QrCode text={link} label="QR code: link a new device to this account" />
+          </div>
+          <div className="row-gap center-row">
+            <Copy text={link} label="Copy link" />
+            {canShare && (
+              <button type="button" className="btn small ghost" onClick={() => navigator.share({ url: link }).catch(() => {})}>
+                Share…
+              </button>
+            )}
+          </div>
+        </>
+      ) : (
+        <Spinner>Making your device link…</Spinner>
+      )}
+      <p className="dim small">
+        No camera? On the new device, open {new URL(walletUrl()).host}, choose <b>I already have a wallet → Link this device</b>, and enter this address:{" "}
+        <span className="mono break" data-testid="device-account">{wallet.account}</span> <Copy text={wallet.account} label="Copy address" />
+      </p>
+      {NETWORK.key !== DEFAULT_NETWORK.key && (
+        <span className="warn small">You&apos;re on {NETWORK.label}. Switch the new device to {NETWORK.label} too (the header menu) before you open the link there.</span>
+      )}
+      <hr className="rule" />
       <label className="field">
         <span>New device&apos;s grant code</span>
         <textarea value={id} onChange={(e) => setId(e.target.value)} placeholder="bkgrant1.…" className="mono" autoCapitalize="none" spellCheck={false} rows={3} />
       </label>
-      {id.trim() && (grant ? <span className="ok">Check code: <b className="code inline">{keyCode(grant.key_id)}</b></span> : <span className="warn">{problem}</span>)}
+      {id.trim() && (grant ? <span className="ok">Check code: <b className="code inline">{keyCode(grant.key_id)}</b> (the new device shows the same)</span> : <span className="warn">{problem}</span>)}
       <label className="field">
         <span>Name it</span>
         <input value={label} onChange={(e) => setLabel(e.target.value)} maxLength={64} />

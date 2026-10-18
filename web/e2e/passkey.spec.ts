@@ -38,8 +38,8 @@ test("opens the same wallet from the passkey alone when this browser has forgott
   const created = await createWallet(page);
   await page.evaluate(() => localStorage.clear());
   await page.goto("/welcome");
-  await page.getByRole("button", { name: "Skip intro" }).click();
   await page.getByRole("button", { name: "I already have a wallet" }).click();
+  await page.getByRole("button", { name: /^Open it with my passkey/ }).click();
   await expect(page.getByText("The account of")).toBeVisible();
   expect(await storedHint(page)).toMatchObject({ keyId: created.keyId, account: created.account });
 });

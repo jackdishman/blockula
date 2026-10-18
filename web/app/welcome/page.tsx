@@ -16,7 +16,7 @@ import { createLocalKey, createPasskey, unlockPasskey } from "@/lib/keys";
 import type { Hint } from "@/lib/session";
 import { useWallet } from "@/lib/wallet";
 
-type Step = 0 | 1 | 2 | "start" | "prf" | "fund" | "kit" | "name" | "done";
+type Step = 0 | 1 | 2 | "start" | "have" | "prf" | "fund" | "kit" | "name" | "done";
 
 const INTRO: { ornament: PropKind; chapter: string; title: string; body: string }[] = [
   {
@@ -118,6 +118,33 @@ export default function Welcome() {
   if (!ready || (hint && !inFlow.current)) return <Splash />;
   if (picker) return <main className="narrow">{picker}</main>;
 
+  // The ways into a wallet this browser hasn't seen: on the start screen and its own step.
+  const haveWallet = (
+    <>
+      <button className="choice" disabled={!!busy} onClick={existing}>
+        <span>
+          <b>{busy === "existing" ? <Spinner>Waiting for your passkey…</Spinner> : "Open it with my passkey"}</b>
+          <span className="dim small block">If your passkey synced here through iCloud Keychain, Google Password Manager or 1Password.</span>
+        </span>
+        <span aria-hidden>→</span>
+      </button>
+      <Link className="choice" href="/link">
+        <span>
+          <b>Link this device</b>
+          <span className="dim small block">Your wallet is open on another device. There, open Devices &amp; agents → Link a device and scan its code with this device&apos;s camera, or start here.</span>
+        </span>
+        <span aria-hidden>→</span>
+      </Link>
+      <Link className="choice" href="/recover">
+        <span>
+          <b>Restore with a recovery kit</b>
+          <span className="dim small block">The 24 words on paper, if no device opens your wallet any more.</span>
+        </span>
+        <span aria-hidden>→</span>
+      </Link>
+    </>
+  );
+
   if (typeof step === "number") {
     const s = INTRO[step];
     return (
@@ -131,6 +158,7 @@ export default function Welcome() {
           {step < 2 ? "Next" : "Let's go"}
         </button>
         <button className="link" onClick={() => setStep("start")}>Skip intro</button>
+        <button className="link" onClick={() => setStep("have")}>I already have a wallet</button>
         <Link className="link small" href="/explore">Just looking? Explore the chain first</Link>
       </main>
     );
@@ -155,15 +183,26 @@ export default function Welcome() {
           <ErrorNote error={error} />
         </section>
         <section className="card stack">
-          <button className="btn" disabled={!!busy} onClick={existing}>
-            {busy === "existing" ? <Spinner>Waiting for your passkey…</Spinner> : "I already have a wallet"}
-          </button>
-          <Link className="btn ghost" href="/link">Link this device to a wallet on another device</Link>
-          <Link className="btn ghost" href="/recover">Restore with a recovery kit</Link>
-          <p className="dim small">
-            Passkeys sync through iCloud Keychain, Google Password Manager or 1Password, so your wallet usually just appears on your other devices. Use linking when they don&apos;t share a passkey provider.
-          </p>
+          <h2>Already have a wallet?</h2>
+          {haveWallet}
         </section>
+      </main>
+    );
+
+  if (step === "have")
+    return (
+      <main className="narrow stack-lg">
+        <div className="center">
+          <Apparition kind="key" />
+          <span className="eyebrow">Welcome back</span>
+          <h1>Open your wallet here</h1>
+          <p className="dim">How should this device get in?</p>
+        </div>
+        <section className="card stack">
+          {haveWallet}
+          <ErrorNote error={error} />
+        </section>
+        <button className="link center-self" onClick={() => { setError(null); setStep("start"); }}>New here? Create a wallet</button>
       </main>
     );
 

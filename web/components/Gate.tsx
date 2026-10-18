@@ -53,7 +53,8 @@ export function useAccountResolution() {
     const list = await findAccounts(client, w);
     if (opts.waitingForLink && list.every((c) => c.address === w.address)) {
       unlocked(w, { ...h, account: undefined });
-      router.replace("/link");
+      // Already on /link? Keep the other device's link (its account) it was opened with.
+      router.replace(window.location.pathname === "/link" ? `/link${window.location.search}` : "/link");
       return;
     }
     if (list.length === 1) return finish(w, h, list[0]);
