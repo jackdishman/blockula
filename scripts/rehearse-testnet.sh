@@ -159,10 +159,14 @@ for _ in 1 2 3 4 5; do
   sleep 2
 done
 [ -n "$unjailed" ] || fail "v3 couldn't be unjailed: $(cat "$DIR/unjail.log")"
-back() { get "$RPC/api/validators" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const v=JSON.parse(s);process.exit(v.active.some(x=>x.validator.address==='$V3'&&BigInt(x.stake)>=25000000n*10n**9n)?0:1)})"; }
+# Back in the set with the bootstrap delegation on it again: its share, as large as the other
+# seats' (within 1%). Not 25M exactly: the downtime slash took the delegation's part of it too,
+# and the delegation splits what's left evenly.
+back() { get "$RPC/api/validators" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const v=JSON.parse(s);const me=v.active.find(x=>x.validator.address==='$V3');const others=v.active.filter(x=>x.validator.address!=='$V3').map(x=>BigInt(x.stake));if(!me||!others.length)process.exit(1);const low=others.reduce((a,b)=>a<b?a:b);process.exit(BigInt(me.stake)>=20000000n*10n**9n&&BigInt(me.stake)*100n>=low*99n?0:1)})"; }
 until_true "v3 rejoining, backed by the bootstrap delegation" 300 back
 [ "$(grep -c "validator key seeded" "$DIR/v3.log")" = 1 ] || fail "v3 was re-seeded on restart"
-echo "✓ v3 restarted from its volume alone, was topped up and unjailed by its owner, and rejoined (backed again)"
+stake3=$(get "$RPC/api/validators" | j "Number(BigInt(v.active.find(x => x.validator.address === '$V3').stake) / 10n**9n)")
+echo "✓ v3 restarted from its volume alone, was topped up and unjailed by its owner, and rejoined (backed again: $stake3 FANG at stake)"
 
 # Weak subjectivity: past the (shortened) period, the genesis alone is refused; the entrypoint's
 # checkpoint path joins.
