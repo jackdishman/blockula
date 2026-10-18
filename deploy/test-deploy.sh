@@ -171,6 +171,8 @@ case "$1 ${2:-}" in
   "secrets list") touch "$secrets"; jq -Rn '[inputs | select(length > 0) | {name: .}]' < "$secrets" ;;
   "secrets import") touch "$secrets"; while IFS='=' read -r k _; do [ -z "$k" ] || grep -qx "$k" "$secrets" || echo "$k" >> "$secrets"; done ;;
   "secrets unset") touch "$secrets"; { grep -vx "$3" "$secrets" || true; } > "$S/tmp"; mv "$S/tmp" "$secrets" ;;
+  "ssh console")
+    if [[ "$*" = *"checkpoint --peer"* && "${FAKE_LOCAL_DOWN:-}" = "$app" ]]; then exit 1; fi ;;
   deploy*)
     if printf '%s\n' "$*" | grep -q -- --build-only; then [ -z "${FAKE_FLY_BUILD_FAIL:-}" ] || exit 1; exit 0; fi
     app=$(sed -nE 's/^app = "(.*)"/\1/p' "$cfg")
@@ -185,7 +187,7 @@ cat > "$T/bin/curl" <<'STUB'
 #!/usr/bin/env bash
 for a; do url=$a; done
 case $url in
-  */api/status) h=$(cat "$FAKE_FLY/height" 2>/dev/null || echo 100); [ -n "${FAKE_STALL:-}" ] || h=$((h + 3)); echo "$h" > "$FAKE_FLY/height"; echo "{\"height\":$h}" ;;
+  */api/status) h=$(cat "$FAKE_FLY/height" 2>/dev/null || echo 100); [ -n "${FAKE_STALL:-}" ] || h=$((h + 3)); echo "$h" > "$FAKE_FLY/height"; echo "{\"height\":$h,\"genesis_hash\":\"abababababababababababababababababababababababababababababababab\"}" ;;
   */api/health) echo '{}' ;;
   https://api.github.com/*) cat > /dev/null; printf 'HTTP/2 200 \r\ncontent-type: application/json\r\n\r\n' ;;
   *) exit 7 ;;
@@ -242,6 +244,12 @@ code=$(launch RESET=1 CHAIN_ID=t-c FAKE_STALL=1)
 ! has blockula-v0 VALIDATOR_KEY_B64 && has blockula-v1 VALIDATOR_KEY_B64 && has blockula-v3 VALIDATOR_KEY_B64 \
   && ok "launch: only the first validator restarted" || bad "launch: keys after a stall: $(cat "$T/fly/"*.secrets)"
 
+# Three validators still finalize when the restarted fourth never returns. Public progress alone
+# must not authorize restarting another validator and taking the network below quorum.
+code=$(launch RESET=1 CHAIN_ID=t-e FAKE_LOCAL_DOWN=blockula-v0)
+[ "$code" != 0 ] && has blockula-v1 VALIDATOR_KEY_B64 && has blockula-v3 VALIDATOR_KEY_B64 \
+  && ok "launch: public progress cannot hide a restarted validator that never returns" || bad "launch: continued after a validator failed to return (exit $code)"
+
 # A genesis an earlier attempt built two days ago isn't launched as it is.
 code=$(launch RESET=1 CHAIN_ID=t-d FAKE_FLY_BUILD_FAIL=1)
 g=$NETDIR/t-d/genesis.json
@@ -258,9 +266,16 @@ rm -f "$T/fly/"*.secrets
 code=$(token)
 [ "$code" = 0 ] && has blockula-v3 GITHUB_TOKEN && has blockula-testnet GITHUB_TOKEN && ok "token: set on every app" || bad "token: exited $code: $(cat "$T/token.out")"
 refute "token: never in argv" "$(cat "$T/fly/log")" "github_pat_"
+expect "token: the validator confirms its own finalized height" "$(cat "$T/fly/log")" "-a blockula-v0 -C blockula checkpoint --peer http://127.0.0.1:7070 --height"
+expect "token: the public node confirms its own finalized height" "$(cat "$T/fly/log")" "-a blockula-testnet -C blockula checkpoint --peer http://127.0.0.1:7171 --height"
+expect "token: the check is pinned to this genesis" "$(cat "$T/fly/log")" "--genesis-hash abababababababababababababababababababababababababababababababab"
 rm -f "$T/fly/"*.secrets
 code=$(token FAKE_STALL=1)
 [ "$code" != 0 ] && has blockula-v0 GITHUB_TOKEN && ! has blockula-v1 GITHUB_TOKEN && ok "token: no new blocks stops before the next app" || bad "token: stall exited $code: $(cat "$T/token.out")"
+rm -f "$T/fly/"*.secrets
+code=$(token FAKE_LOCAL_DOWN=blockula-v0)
+[ "$code" != 0 ] && has blockula-v0 GITHUB_TOKEN && ! has blockula-v1 GITHUB_TOKEN \
+  && ok "token: public progress cannot hide a restarted validator that never returns" || bad "token: continued after a validator failed to return (exit $code)"
 
 if [ $fails -gt 0 ]; then echo "✗ $fails failed" >&2; exit 1; fi
 echo "✓ deploy scripts behave"

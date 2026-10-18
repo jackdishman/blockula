@@ -9,9 +9,8 @@
 # token (github.com/settings/personal-access-tokens/new) with "Public repositories (read-only)"
 # and no permissions: it ends up on internet-facing machines.
 #
-# Apps restart one at a time, and the next waits until the chain has finalized new blocks, so
-# 3 of 4 validators are always up and the chain keeps going. Without new blocks within 5 minutes
-# it stops there, leaving the rest as they were.
+# Apps restart one at a time, and the next waits until the restarted app itself has finalized
+# new blocks. If it cannot confirm that, stop there and leave the remaining apps untouched.
 set -euo pipefail
 
 PREFIX=${PREFIX:-blockula}
@@ -36,13 +35,20 @@ if [ -n "$scopes" ]; then
 fi
 
 height() { curl -fsS -m 5 "$RPC_URL/api/status" 2>/dev/null | jq -r '.height // 0' || echo 0; }
+GENESIS_HASH=$(curl -fsS -m 5 "$RPC_URL/api/status" | jq -r '.genesis_hash')
+[[ "$GENESIS_HASH" =~ ^[0-9a-f]{64}$ ]] || { echo "No valid genesis hash at $RPC_URL; nothing restarted" >&2; exit 1; }
 
 for app in $(for i in $(seq 0 $((N - 1))); do echo "$PREFIX-v$i"; done) "$RPC_APP"; do
   before=$(height)
   printf 'GITHUB_TOKEN=%s\n' "$TOKEN" | fly secrets import -a "$app" >/dev/null
   echo "🔑 $app: GITHUB_TOKEN set (machine restarted)"
   ok=""
-  for _ in $(seq 60); do [ "$(height)" -gt "$((before + 5))" ] && { ok=1; break; }; sleep "$PROGRESS_SECS"; done
-  [ -n "$ok" ] || { echo "❌ no new blocks at $RPC_URL within 5 minutes of restarting $app (from #$before): stopping before the next app. Check fly logs -a $app, then rerun." >&2; exit 1; }
+  port=7070; [ "$app" != "$RPC_APP" ] || port=7171
+  target=$((before + 6))
+  for _ in $(seq 60); do
+    if [ "$(height)" -ge "$target" ] && fly ssh console -a "$app" -C "blockula checkpoint --peer http://127.0.0.1:$port --height $target --genesis-hash $GENESIS_HASH" >/dev/null 2>&1; then ok=1; break; fi
+    sleep "$PROGRESS_SECS"
+  done
+  [ -n "$ok" ] || { echo "❌ $app did not confirm new finalized blocks after its restart (from #$before): stopping before the next app. Check fly logs -a $app, then rerun." >&2; exit 1; }
 done
 echo "✓ GITHUB_TOKEN set on $N validators and $RPC_APP"
