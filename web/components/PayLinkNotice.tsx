@@ -9,7 +9,7 @@ import type { LinkChain, LinkCheck, WalletChain } from "@/lib/paylink";
  * else null. A link's chain id is the sender's text, so the wallet never shows it as its own
  * words, even when it's well-formed (audit review-r3-wallet-4).
  */
-const knownChain = (chainId: string): { label: string; inMenu: boolean } | null => {
+export const knownChain = (chainId: string): { label: string; inMenu: boolean } | null => {
   const configured = Object.values(NETWORKS).find((n) => n?.chainId === chainId);
   if (configured) return { label: configured.label, inMenu: true };
   return chainId === MAINNET_CHAIN_ID ? { label: "Mainnet", inMenu: false } : null;

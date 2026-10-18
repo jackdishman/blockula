@@ -50,11 +50,29 @@ export function payLink(walletUrl: string, to: string, amount?: string, memo?: s
   const drops = amount === undefined ? null : requestDrops(amount);
   if (drops !== null) q.set("amount", fangDecimal(drops));
   if (memo && utf8Bytes(memo) <= MAX_MEMO_BYTES) q.set("memo", memo);
-  if (chain?.chainId && CHAIN_ID.test(chain.chainId)) {
-    q.set("chain", chain.chainId);
-    if (chain.genesisHash && /^[0-9a-f]{64}$/i.test(chain.genesisHash)) q.set("genesis", chain.genesisHash.slice(0, GENESIS_HEX).toLowerCase());
-  }
+  setChain(q, chain);
   return `${walletUrl.replace(/\/$/, "")}/send?${q}`;
+}
+
+/**
+ * Device links: `<wallet>/link?account=<address>&chain=<chain id>&genesis=<hex>`, the QR code
+ * Devices & agents → Link a device shows. The new device opens it with the account filled in, and
+ * the user still checks it against the old device before the new one signs its consent to joining.
+ * Always the account's address, never a name: the old device knows its own address, and a name
+ * would be a node's word on the new one. `chain` and `genesis` are the same check as a payment
+ * link's (checkLinkChain).
+ */
+export function deviceLink(walletUrl: string, account: string, chain?: WalletChain): string {
+  const q = new URLSearchParams({ account });
+  setChain(q, chain);
+  return `${walletUrl.replace(/\/$/, "")}/link?${q}`;
+}
+
+/** Adds the chain a link is for (a check for the wallet that opens it, never a switch). */
+function setChain(q: URLSearchParams, chain?: WalletChain) {
+  if (!chain?.chainId || !CHAIN_ID.test(chain.chainId)) return;
+  q.set("chain", chain.chainId);
+  if (chain.genesisHash && /^[0-9a-f]{64}$/i.test(chain.genesisHash)) q.set("genesis", chain.genesisHash.slice(0, GENESIS_HEX).toLowerCase());
 }
 
 /** UTF-8 bytes in `s`, as the chain counts a memo. */

@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { test } from "node:test";
 import { encodeQr, qrPath, qrSvg } from "./qr.ts";
-import { CHAIN_ID, checkLinkChain, fangDecimal, linkChain, MAX_DROPS, payLink, requestAmountError, requestDrops } from "./paylink.ts";
+import { CHAIN_ID, checkLinkChain, deviceLink, fangDecimal, linkChain, MAX_DROPS, payLink, requestAmountError, requestDrops } from "./paylink.ts";
 
 const digest = (m) => createHash("sha256").update(m.map((r) => r.map((c) => (c ? "1" : "0")).join("")).join("\n")).digest("hex");
 
@@ -146,4 +146,18 @@ test("payment requests take amounts the chain can hold, and every link they make
       assert.ok(link.length <= longest.length && qrSvg(link) !== null, `${typed.slice(0, 20)}…: ${link.length} characters`);
     }
   }
+});
+
+test("device links open /link with the account and its chain, and fit a QR code", () => {
+  const account = "boo1yuuvyc7ngus0l2vytdt6yr0zqhj2qyz9j4zyfxk97vjtpsw9rk4qzmxxe9";
+  const url = new URL(deviceLink(`${BASE}/`, account, TESTNET));
+  assert.equal(url.origin + url.pathname, `${BASE}/link`);
+  assert.equal(url.searchParams.get("account"), account);
+  // The same check as a payment link's: made on another chain, it fills nothing in.
+  assert.deepEqual(checkLinkChain(linkChain(url.searchParams), TESTNET), { state: "match" });
+  assert.deepEqual(checkLinkChain(linkChain(url.searchParams), { chainId: "blockula-1", genesisHash: "4d".repeat(32) }), { state: "mismatch", why: "chain" });
+  assert.equal(deviceLink(BASE, account), `${BASE}/link?account=${account}`, "no chain when the pin doesn't know it");
+  assert.equal(deviceLink(BASE, account, { chainId: "\u202eevil" }), `${BASE}/link?account=${account}`, "never a chain id /link would refuse");
+  const longest = deviceLink(BASE, account, { chainId: "c".repeat(64), genesisHash: "ab".repeat(32) });
+  assert.ok(qrSvg(longest) !== null, `${longest.length} characters fit`);
 });
