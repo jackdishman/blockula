@@ -1004,6 +1004,17 @@ fn multisig_upgrade_proposals(state: &State, height: u64) -> Vec<(u64, u32)> {
     }).collect()
 }
 
+/// Why a multisig's stored action can't be approved any more, whoever signs: it's a
+/// `ScheduleUpgrade` proposal stored before a cancellation ran (review-fix-ops-2), made against
+/// the schedule the cancellation withdrew from. `multisig_approve` refuses it; `/api/multisig`
+/// shows it.
+pub fn superseded_multisig_action(state: &State, p: &MultisigProposal) -> Option<String> {
+    match &p.action {
+        Action::Propose { kind: ProposalKind::ScheduleUpgrade { version, .. }, .. } => crate::upgrade::check_not_superseded(state, p.created_at, *version).err().map(|e| e.to_string()),
+        _ => None,
+    }
+}
+
 /// After `staking::end_block`, every block: close voting on proposals whose vote ended, then run
 /// those whose timelock is over, and return what's unclaimed of distributions past `claim_until`
 /// to the community account. Every vote closes before anything runs (review-r3-gov-2): a
@@ -1394,8 +1405,8 @@ fn multisig_approve(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, s
     }
     // An upgrade proposal stored before a cancellation ran was made against the schedule it
     // withdrew from (review-fix-ops-2): filing it now would date it after the cancellation.
-    if let Action::Propose { kind: ProposalKind::ScheduleUpgrade { version, .. }, .. } = &p.action {
-        crate::upgrade::check_not_superseded(state, p.created_at, *version).map_err(|e| anyhow!("multisig action #{id}: {e}"))?;
+    if let Some(e) = superseded_multisig_action(state, &p) {
+        bail!("multisig action #{id}: {e}");
     }
     clear_expired(state, j, sender, height);
     m.pending.retain(|id| state.governance.multisig_proposals.contains_key(id));

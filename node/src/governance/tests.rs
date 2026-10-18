@@ -1337,6 +1337,8 @@ fn a_cancellation_supersedes_upgrade_proposals_waiting_in_a_multisig() {
     let ms = t.st.governance.next_multisig_id;
     t.tx_as(&k1, &foundation, Action::MultisigPropose { action: up(v + 1, a + 100) }).unwrap();
     t.tx_as(&k1, &foundation, Action::MultisigPropose { action: up(u32::MAX, a + 200) }).unwrap();
+    let stored = |t: &T, id: u64| superseded_multisig_action(&t.st, &t.st.governance.multisig_proposals[&id]);
+    assert_eq!(stored(&t, ms), None, "nothing cancelled yet");
     let c = pass_by(&mut t, BOB, BOB, ProposalKind::CancelUpgrade { version: v, activation_height: a });
     t.through(t.p(c).voting_end + 1);
     assert_eq!(t.p(c).status, ProposalStatus::Executed, "{}", t.p(c).outcome);
@@ -1347,10 +1349,13 @@ fn a_cancellation_supersedes_upgrade_proposals_waiting_in_a_multisig() {
     let e = t.tx_as(&k2, &foundation, t.approve(ms)).unwrap_err().to_string();
     assert!(e.contains(&format!("multisig action #{ms}: superseded")) && e.contains(&format!("Propose the upgrade again as v{} or later", v + 2)), "{e}");
     assert!(t.st.governance.multisig_proposals.contains_key(&ms));
+    // `/api/multisig` says why (the same text).
+    assert!(stored(&t, ms).is_some_and(|why| e.ends_with(&why)), "{:?}", stored(&t, ms));
     // Filed again after the cancellation, as advised, it goes through.
     let id = t.st.governance.next_proposal_id;
     let again = t.st.governance.next_multisig_id;
     t.tx_as(&k1, &foundation, Action::MultisigPropose { action: up(v + 2, a + 300) }).unwrap();
+    assert_eq!(stored(&t, again), None, "stored after the cancellation");
     t.tx_as(&k2, &foundation, t.approve(again)).unwrap();
     assert_eq!(t.p(id).kind, ProposalKind::ScheduleUpgrade { version: v + 2, activation_height: a + 300 });
 }

@@ -2160,6 +2160,9 @@ async fn multisig(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
                 "created_at": p.created_at,
                 "expires_at": p.expires_at,
                 "expired": v.height > p.expires_at,
+                // Why no approval can file it any more (an upgrade proposal a cancellation
+                // superseded), or null.
+                "superseded": crate::governance::superseded_multisig_action(st, p),
             })
         })
         .collect();
