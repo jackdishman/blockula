@@ -94,10 +94,18 @@ assert.deepEqual(effectivePin(custom, known.get(custom)), { chainId: "a", genesi
 assert.deepEqual(effectivePin(pinned, { chainId: "other", genesisHash: G2 }), { chainId: "x", genesisHash: G1, prefix: undefined }, "configuration beats memory");
 // The testnet relaunched under a new chain id: what was remembered for the old one (its genesis)
 // isn't held against the new one, which is pinned on first use.
+// Its genesis is built in once a release pins it (scripts/pin-network.sh); until then it's pinned
+// on first use. Either way these hold.
 const testnet = resolveNetwork({});
-assert.deepEqual([testnet.pin.chainId, testnet.pin.prefix, testnet.pin.genesisHash], ["blockula-testnet-2", "tboo", undefined], "its genesis exists only once it launches");
-assert.deepEqual(effectivePin(testnet, { chainId: "blockula-testnet", genesisHash: G2, prefix: "boo" }), { chainId: "blockula-testnet-2", genesisHash: undefined, prefix: "tboo" });
-assert.deepEqual(effectivePin(testnet, { chainId: "blockula-testnet-2", genesisHash: G1, prefix: "tboo" }), { chainId: "blockula-testnet-2", genesisHash: G1, prefix: "tboo" });
+const builtIn: string | undefined = KNOWN_GENESIS["blockula-testnet-2"];
+assert.deepEqual([testnet.pin.chainId, testnet.pin.prefix, testnet.pin.genesisHash], ["blockula-testnet-2", "tboo", builtIn], "its genesis is built in only once a release pins it");
+assert.deepEqual(effectivePin(testnet, { chainId: "blockula-testnet", genesisHash: G2, prefix: "boo" }), { chainId: "blockula-testnet-2", genesisHash: builtIn, prefix: "tboo" });
+assert.deepEqual(effectivePin(testnet, { chainId: "blockula-testnet-2", genesisHash: G1, prefix: "tboo" }), { chainId: "blockula-testnet-2", genesisHash: builtIn ?? G1, prefix: "tboo" });
+if (builtIn) {
+  assert.match(builtIn, /^[0-9a-f]{64}$/);
+  assert.match(mismatch(testnet.pin, status("blockula-testnet-2", G1 === builtIn ? G2 : G1, "tboo")) ?? "", /genesis/, "a node on another instance of the testnet is refused");
+  assert.equal(mismatch(testnet.pin, status("blockula-testnet-2", builtIn, "tboo")), null);
+}
 const local = resolveNetwork({}, ["--network", "local"]);
 known.save(local, { chainId: "blockula-dev", genesisHash: G1 });
 assert.equal(known.get(local), undefined, "dev chains are re-pinned each session (a reset makes a new genesis)");

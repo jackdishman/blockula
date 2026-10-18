@@ -44,7 +44,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
 
 | | Today |
 |---|---|
-| Public testnet | Runs v0.4.0 (`b1f9614`), with the contribution pool active (one repo, 10,001 FANG). Its genesis was created 2026-10-14 12:19 UTC, so the longest continuous run on the current chain is a few hours (height ~11.3k when checked). |
+| Public testnet | Runs v0.4.0 (`b1f9614`), with the contribution pool active (one repo, 10,001 FANG). Its genesis was created 2026-10-14 12:19 UTC, so the longest continuous run on the current chain is a few hours (height ~11.3k when checked). ✅ Since: its protocol v1 relaunch, `blockula-testnet-2` (v0.5.0), is scripted and rehearsed (`deploy/launch.sh`, `scripts/rehearse-testnet.sh`, `deploy/README.md` "Relaunch"): built with the genesis builder (`tboo`, DEC-5, an owner account per validator, no admin keys), a week of unbonding and evidence, the contribution pool and founding jurors from genesis, a public node that rebuilds itself from its validators' checkpoint. |
 | Operators | 4 validators in one Fly.io org, in 4 regions. Every validator key and the one admin key were generated on one laptop (`deploy/launch.sh:44,71`). Nakamoto coefficient: 1. |
 | Supply | 1.1B FANG: 250M on each validator's hot consensus key, 100M on the keyless treasury (live `/api/genesis`; `chain.rs:1370-1372`). |
 | Tests | Unit tests, 3 deterministic simulator scenarios (`sim.rs`: crash and recover, onboarding, fast sync) and a 4-validator smoke test (`scripts/local-testnet.sh`). No fuzzing, property tests or Byzantine scenarios. ✅ Since: fuzzing (the state machine too), property tests, invariant checks after every test block, and Byzantine scenarios: partitions, clock skew, withheld votes (SEC-3). |

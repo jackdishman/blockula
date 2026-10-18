@@ -59,11 +59,15 @@ struct Setup {
     accounts: Vec<(String, u64, Option<Vesting>)>,
     params: Vec<(&'static str, u64)>,
     admins: Vec<String>,
+    /// `Genesis::bootstrap_excluded` (sorted by `genesis`).
+    excluded: Vec<String>,
+    /// A vesting curve on the owners' allocations (genesis operators' own, as on a real chain).
+    owner_vesting: Option<Vesting>,
 }
 
 impl Default for Setup {
     fn default() -> Self {
-        Self { validators: vec![10_000 * FANG; 4], accounts: vec![], params: vec![], admins: vec![] }
+        Self { validators: vec![10_000 * FANG; 4], accounts: vec![], params: vec![], admins: vec![], excluded: vec![], owner_vesting: None }
     }
 }
 
@@ -77,7 +81,7 @@ impl Setup {
             let (v, o) = (keys(vseed(i)), owner(i));
             let (p2p, http) = (format!("127.0.0.1:{}", 7100 + i as u16), format!("127.0.0.1:{}", 7200 + i as u16));
             validators.push(ValidatorInfo { address: v.address(), public_key: hex::encode(v.public_key()), p2p_addr: p2p.clone(), http_addr: http.clone() });
-            allocations.push(Allocation { address: o.address(), amount: bond + 1_000 * FANG, vesting: None, label: None });
+            allocations.push(Allocation { address: o.address(), amount: bond + 1_000 * FANG, vesting: self.owner_vesting.clone(), label: None });
             operators.push(Operator { owner: o.address(), consensus_key: hex::encode(v.public_key()), pop: crate::chain::make_pop([vseed(i); 32], CHAIN, &o.address(), &p2p, &http), p2p_addr: p2p, http_addr: http, self_bond: *bond, commission_bps: 1_000, provider: None, asn: None, country: None, entity: None });
         }
         for (address, amount, vesting) in &self.accounts {
@@ -105,7 +109,12 @@ impl Setup {
             reserved_names: vec![],
             soul_ledger: vec![],
             features: vec![],
-            bootstrap_excluded: vec![],
+            bootstrap_excluded: {
+                let mut e = self.excluded.clone();
+                e.sort();
+                e
+            },
+            pool_repos: Default::default(),
         }
     }
 
@@ -1321,6 +1330,68 @@ fn missed_leader_slots_jail_and_the_validator_may_unjail_later() {
     assert!(t.set(t.epoch + 1).contains(&victim), "back at the next boundary");
 }
 
+/// The public testnet's seats (deploy/launch.sh, relaunch problem 2): four genesis operators with
+/// vesting owner accounts, the founder's and the foundation's stand-in accounts excluded from
+/// the bootstrap delegation, and no seat flagged as theirs. The bootstrap delegation backs all
+/// four from the first boundary; a seat that's jailed leaves (and the delegation with it),
+/// unjails and rejoins, and is backed again. Had launch.sh flagged every seat the founder's or
+/// the foundation's (as it once did), DEC-3's cap on such seats (`excluded_seats_cap`: fewer than
+/// f, so none in a set of 4) would keep a seat that left out for good, and the delegation would
+/// back nobody: the cap stays as mainnet needs it, so the testnet doesn't flag its seats.
+#[test]
+fn testnet_seats_leave_rejoin_and_get_the_bootstrap_delegation() {
+    let (founder, foundation) = (keys(240).address(), keys(241).address());
+    let far = Vesting { start: 1_000_000, cliff: 1_000_000, end: 4_000_000 };
+    let run = |excluded: Vec<String>| {
+        let boot = crate::chain::bootstrap_delegation("boo");
+        let accounts = vec![(boot.clone(), 100_000_000 * FANG, Some(far.clone())), (founder.clone(), 1_000 * FANG, None), (foundation.clone(), 1_000 * FANG, None)];
+        let t = Setup { accounts, excluded, owner_vesting: Some(Vesting { start: 0, cliff: 1_000_000, end: 2_000_000 }), ..Default::default() }.start();
+        (t, boot)
+    };
+    let backed = |t: &T, boot: &str| -> Vec<String> { (0..4).map(vaddr).filter(|v| delegation_value(&t.st, boot, v) > 0).collect() };
+
+    // As launch.sh flags them now: only the founder's and the foundation's accounts are excluded.
+    let (mut t, boot) = run(vec![founder.clone(), foundation.clone()]);
+    t.finish_epoch();
+    assert_eq!(backed(&t, &boot), (0..4).map(vaddr).collect::<Vec<_>>(), "the bootstrap delegation backs every seat");
+    assert!((0..4).all(|i| delegation_value(&t.st, &boot, &vaddr(i)) == 25_000_000 * FANG));
+    let v = vaddr(1);
+    let mut j = Journal::default();
+    jail(&mut t.st, &mut j, &v, t.height, 0, "test: offline");
+    let until = t.st.staking.pools[&v].jail.as_ref().unwrap().until;
+    t.finish_epoch();
+    assert!(!t.set(t.epoch + 1).contains(&v), "a jailed seat leaves at the boundary");
+    assert!(!backed(&t, &boot).contains(&v) && backed(&t, &boot).len() == 3, "and the delegation follows the set");
+    while t.height < until {
+        t.block();
+    }
+    t.ok(&owner(1), Action::Unjail { validator: v.clone() });
+    t.finish_epoch();
+    assert!(t.set(t.epoch + 1).contains(&v), "unjailed, it rejoins at the next boundary");
+    t.finish_epoch();
+    assert_eq!(backed(&t, &boot).len(), 4, "and is backed again");
+
+    // As launch.sh once flagged them: every seat the founder's or the foundation's.
+    let mut all: Vec<String> = (0..4).map(|i| owner(i).address()).collect();
+    all.extend([founder.clone(), foundation.clone()]);
+    let (mut t, boot) = run(all);
+    t.finish_epoch();
+    assert!(backed(&t, &boot).is_empty(), "nobody to back");
+    let mut j = Journal::default();
+    jail(&mut t.st, &mut j, &v, t.height, 0, "test: offline");
+    let until = t.st.staking.pools[&v].jail.as_ref().unwrap().until;
+    t.finish_epoch();
+    while t.height < until {
+        t.block();
+    }
+    t.ok(&owner(1), Action::Unjail { validator: v.clone() });
+    assert_eq!(excluded_seats_cap(4), 0, "DEC-3 as mainnet needs it");
+    for _ in 0..4 {
+        t.finish_epoch();
+        assert!(!t.set(t.epoch + 1).contains(&v), "a flagged seat that left can't come back into a set of 4");
+    }
+}
+
 #[test]
 fn liveness_rings_slide_and_saturate() {
     let mut l = Liveness::new(10, 3);
@@ -1611,7 +1682,7 @@ fn admin_levers_exist_only_on_dev_and_test_chains() {
     assert!(t.fails(&owner(0), Action::Unbond { validator: vaddr(0) }).contains("Undelegate it"));
     // With admins: a pin outranks stake, and a removal is final.
     let stakes = [10_000, 20_000, 30_000, 40_000, 50_000].map(|f| f * FANG).to_vec();
-    let mut t = Setup { validators: stakes, accounts: vec![(admin.address(), 100 * FANG, None)], params: vec![("max_validators", 4)], admins: vec![admin.address()] }.start();
+    let mut t = Setup { validators: stakes, accounts: vec![(admin.address(), 100 * FANG, None)], params: vec![("max_validators", 4)], admins: vec![admin.address()], ..Default::default() }.start();
     assert!(t.fails(&owner(0), Action::ApproveValidator { validator: vaddr(0) }).contains("only validator admins"));
     t.ok(&admin, Action::ApproveValidator { validator: vaddr(0) });
     assert!(t.fails(&admin, Action::ApproveValidator { validator: vaddr(0) }).contains("already approved"));

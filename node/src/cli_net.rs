@@ -459,7 +459,10 @@ mod tests {
         assert!(mismatch(&p, &json!({ "chain_id": "c" })).unwrap().contains("(none reported)"));
         // First use fills what wasn't pinned; remembered pins fill a network's gaps, but never
         // override it, and a relaunched network's old chain is ignored.
+        // (The testnet's genesis is built in once a release pins it, scripts/pin-network.sh.)
         let net = resolve(TESTNET_RPC, &ChainPin::default()).unwrap();
+        let g = known_genesis(TESTNET_CHAIN_ID).unwrap_or(g);
+        assert_eq!(net.pin.genesis_hash, known_genesis(TESTNET_CHAIN_ID));
         let first = complete_pin(&net.pin, &status(TESTNET_CHAIN_ID, &g, "tboo"));
         assert_eq!(first, Pin { chain_id: Some(TESTNET_CHAIN_ID.into()), genesis_hash: Some(g.clone()), prefix: Some("tboo".into()) });
         assert_eq!(effective_pin(&net, Some(first.clone())), first);

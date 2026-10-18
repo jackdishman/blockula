@@ -159,11 +159,14 @@ impl ClientIpPolicy {
             entries.len().checked_sub(hops.max(1)).and_then(|i| entries[i].trim().parse::<IpAddr>().ok())
         };
         let policy = self;
+        // A node bound to `::` sees IPv4 peers as IPv4-mapped IPv6 (`::ffff:127.0.0.1`): the
+        // same caller, so local callers stay local and trusted forwarders stay trusted.
+        let ip = peer.ip().to_canonical();
         let by_secret = match (&policy.forwarder_secret, h.get("x-blockula-forwarder-key")) {
             (Some(secret), Some(given)) => ct_eq(secret.as_bytes(), given.as_bytes()),
             _ => false,
         };
-        if by_secret || policy.trusted_forwarders.contains(&peer.ip()) {
+        if by_secret || policy.trusted_forwarders.contains(&ip) {
             if let Some(ip) = header_ip("x-blockula-client-ip", 1) {
                 return Some(ip);
             }
@@ -171,9 +174,9 @@ impl ClientIpPolicy {
         if let Some(name) = policy.header.as_deref() {
             // Configured but missing or unreadable: limited as the proxy itself, never as a
             // local caller (which isn't limited at all).
-            return Some(header_ip(name, policy.hops).unwrap_or(peer.ip()));
+            return Some(header_ip(name, policy.hops).unwrap_or(ip));
         }
-        if peer.ip().is_loopback() { None } else { Some(peer.ip()) }
+        if ip.is_loopback() { None } else { Some(ip) }
     }
 }
 
@@ -1310,7 +1313,7 @@ async fn faucet(State(n): State<Node>, ConnectInfo(peer): ConnectInfo<SocketAddr
         rules.push((format!("faucet-ip:{}", ip_key(ip)), 1, FAUCET_IP_WINDOW));
     }
     // Loopback callers (local dev, tests) aren't limited at all.
-    let limited = client.is_some() || !peer.ip().is_loopback();
+    let limited = client.is_some() || !peer.ip().to_canonical().is_loopback();
     // The slot is taken before the drip (atomically: parallel requests can't all pass a check
     // first, F28) and given back if the drip doesn't go out.
     let reserved = if limited { Some(n.limits.allow(&rules).map_err(|w| too_many("the faucet already dripped for you", w))?) } else { None };
@@ -2229,6 +2232,13 @@ mod tests {
         let lan = ClientIpPolicy { trusted_forwarders: vec!["10.0.0.2".parse().unwrap()], ..Default::default() };
         let fake = headers(&[("fly-client-ip", "10.0.0.2"), ("x-blockula-client-ip", "9.9.9.9")]);
         assert_eq!(lan.resolve(peer, &fake), Some(peer.ip()));
+        // A node bound to `::` (dual stack) sees IPv4 peers as IPv4-mapped: 127.0.0.1 is still
+        // a local caller, a trusted forwarder still trusted, and anyone else limited by their
+        // IPv4 address.
+        let mapped = |s: &str| SocketAddr::new(IpAddr::V6(s.parse::<std::net::Ipv4Addr>().unwrap().to_ipv6_mapped()), 5000);
+        assert_eq!(ClientIpPolicy::default().resolve(mapped("127.0.0.1"), &HeaderMap::new()), None);
+        assert_eq!(lan.resolve(mapped("10.0.0.2"), &headers(&[("x-blockula-client-ip", "9.9.9.9")])), Some("9.9.9.9".parse().unwrap()));
+        assert_eq!(ClientIpPolicy::default().resolve(mapped("203.0.113.7"), &HeaderMap::new()), Some(peer.ip()));
     }
 
     /// Audit F40: a full node forwards a signed tx with its client's IP (for the validator's

@@ -18,6 +18,17 @@ export const MAINNET_PREFIX = "boo";
  */
 export const MAINNET_GENESIS_HASH = clean(process.env.NEXT_PUBLIC_MAINNET_GENESIS_HASH)?.toLowerCase();
 
+/** The public testnet (deploy/launch.sh): its own chain id, never reused (DEC-7), and the testnet prefix. */
+export const TESTNET_CHAIN_ID = "blockula-testnet-2";
+export const TESTNET_PREFIX = "tboo";
+export const TESTNET_RPC = "https://blockula-testnet.fly.dev";
+/**
+ * The testnet's genesis hash, once it has launched: the release after the launch pins it here
+ * (scripts/pin-network.sh). Until then, and when it's set, NEXT_PUBLIC_TESTNET_GENESIS_HASH
+ * pins it instead.
+ */
+export const TESTNET_GENESIS_HASH: string | undefined = undefined;
+
 /** A mainnet deployment (`NEXT_PUBLIC_NETWORK=mainnet`): stricter rules, see next.config.ts. */
 export const IS_MAINNET_BUILD = process.env.NEXT_PUBLIC_NETWORK === "mainnet";
 
@@ -71,12 +82,11 @@ const testnet: Network | undefined =
     ? {
         key: "testnet",
         label: "Testnet",
-        rpc: testnetRpc || "https://blockula-testnet.fly.dev",
-        chainId: clean(process.env.NEXT_PUBLIC_TESTNET_CHAIN_ID) || "blockula-testnet",
-        genesisHash: clean(process.env.NEXT_PUBLIC_TESTNET_GENESIS_HASH)?.toLowerCase(),
-        // Today's public testnet predates DEC-7 and still uses "boo"; protocol v1 testnets use "tboo".
-        prefix: clean(process.env.NEXT_PUBLIC_TESTNET_PREFIX) || "boo",
-        witnesses: witnessList(process.env.NEXT_PUBLIC_TESTNET_WITNESSES, testnetRpc || "https://blockula-testnet.fly.dev"),
+        rpc: testnetRpc || TESTNET_RPC,
+        chainId: clean(process.env.NEXT_PUBLIC_TESTNET_CHAIN_ID) || TESTNET_CHAIN_ID,
+        genesisHash: clean(process.env.NEXT_PUBLIC_TESTNET_GENESIS_HASH)?.toLowerCase() || TESTNET_GENESIS_HASH,
+        prefix: clean(process.env.NEXT_PUBLIC_TESTNET_PREFIX) || TESTNET_PREFIX,
+        witnesses: witnessList(process.env.NEXT_PUBLIC_TESTNET_WITNESSES, testnetRpc || TESTNET_RPC),
       }
     : undefined;
 

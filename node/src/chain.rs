@@ -179,6 +179,11 @@ pub struct Genesis {
     /// the foundation's, now and later), sorted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bootstrap_excluded: Vec<String>,
+    /// Repos in the contribution pool from genesis (lowercase `owner/name` → weight, 1 to
+    /// `poc::MAX_REPO_WEIGHT`), as a `SetRepo` proposal would put them there. Its balance is an
+    /// ordinary allocation to the pool's account (`poc::pool_address`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pool_repos: BTreeMap<String, u64>,
 }
 
 fn default_epoch_blocks() -> u64 {
@@ -363,6 +368,9 @@ impl Genesis {
         for e in &self.soul_ledger {
             state.poc.souls.insert(e.account.clone(), crate::poc::Soul { points: e.soul, at: 0, earned: e.soul });
         }
+        for (repo, weight) in &self.pool_repos {
+            state.poc.repos.insert(repo.to_ascii_lowercase(), *weight);
+        }
         for f in &self.features {
             state.upgrade.features.insert(f.clone(), crate::upgrade::Feature { activated_at: 0 });
         }
@@ -483,6 +491,11 @@ impl Genesis {
             ensure!((1..=MAX_GENESIS_SOUL).contains(&e.soul), "soul_ledger: {} gets 1–{MAX_GENESIS_SOUL} milli-Soul", e.account);
             check_reason(&e.reason).with_context(|| format!("soul_ledger: {}", e.account))?;
             ensure!(souls.insert(&e.account), "soul_ledger lists {} twice", e.account);
+        }
+        for (repo, weight) in &self.pool_repos {
+            check_repo(repo).with_context(|| format!("pool_repos: {repo}"))?;
+            ensure!(*repo == repo.to_ascii_lowercase(), "pool_repos: {repo} must be lowercase (as the pool keys it)");
+            ensure!((1..=crate::poc::MAX_REPO_WEIGHT).contains(weight), "pool_repos: {repo} needs a weight of 1–{}", crate::poc::MAX_REPO_WEIGHT);
         }
         for (i, a) in self.bootstrap_excluded.iter().enumerate() {
             ensure!(crypto::parse_address(a).map(|(p, _)| p) == Some(prefix), "bootstrap_excluded: {a} isn't a {prefix}1… address");
@@ -2419,6 +2432,7 @@ impl Chain {
             soul_ledger: vec![],
             features: vec![],
             bootstrap_excluded: vec![],
+            pool_repos: Default::default(),
         };
         // Every validator stakes: each owns itself and bonds twice the minimum from its
         // allocation, so a light slash (downtime) doesn't leave it under-bonded.
@@ -5328,6 +5342,7 @@ mod scaffold {
             soul_ledger: vec![SoulEntry { account: owner.address(), soul: 50 * SOUL, reason: "testnet contributor".into() }],
             features: if chain_id == MAINNET_CHAIN_ID { vec![] } else { vec!["ghost".into()] },
             bootstrap_excluded: vec![],
+            pool_repos: Default::default(),
         }
     }
 

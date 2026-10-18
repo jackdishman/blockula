@@ -75,6 +75,7 @@ fn genesis(params: &[(&str, u64)]) -> Genesis {
         soul_ledger: vec![],
         features: vec![],
         bootstrap_excluded: vec![],
+        pool_repos: Default::default(),
     }
 }
 

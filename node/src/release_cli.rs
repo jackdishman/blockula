@@ -1086,12 +1086,16 @@ mod tests {
     }
 
     /// The built-in key id (filled in at the key ceremony) is a key id, and the same as
-    /// install.sh's.
+    /// install.sh's and the MCP's `install_node` (docs/OPERATIONS.md "The release key" lists
+    /// every place it's published).
     #[test]
     fn built_in_key_id_matches_install_sh() {
         assert!(BUILTIN_KEY_ID.is_empty() || normalize_key_id(BUILTIN_KEY_ID).ok().as_deref() == Some(BUILTIN_KEY_ID));
         let script = include_str!("../../scripts/install.sh");
         let line = script.lines().find(|l| l.starts_with("BUILTIN_KEY_ID=\"")).expect("install.sh has a BUILTIN_KEY_ID line");
         assert_eq!(line, format!("BUILTIN_KEY_ID=\"{BUILTIN_KEY_ID}\""), "install.sh and release_cli.rs must build in the same release key id");
+        let mcp = include_str!("../../mcp/src/release.ts");
+        let line = mcp.lines().find(|l| l.starts_with("export const RELEASE_KEY_ID = \"")).expect("mcp/src/release.ts has a RELEASE_KEY_ID line");
+        assert_eq!(line, format!("export const RELEASE_KEY_ID = \"{BUILTIN_KEY_ID}\";"), "mcp/src/release.ts and release_cli.rs must build in the same release key id");
     }
 }

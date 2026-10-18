@@ -213,6 +213,9 @@ enum Cmd {
         /// Print the JSON entry for node/checkpoints/<chain id>.json
         #[arg(long)]
         json: bool,
+        /// Refuse unless the peers serve this genesis (hex): for a node whose genesis you hold
+        #[arg(long, conflicts_with = "genesis")]
+        genesis_hash: Option<String>,
     },
     /// A simple command-line wallet (key in ~/.blockula/wallet.json, mode 600)
     Wallet {
@@ -364,13 +367,13 @@ fn main() -> Result<()> {
             node::join(&genesis, &home, &pins, !net.full)?;
             node::run_full_node(home, net_opts(net, Some(port), None, false))
         }
-        Cmd::Checkpoint { peers, height, genesis, json } => {
+        Cmd::Checkpoint { peers, height, genesis, json, genesis_hash } => {
             if let Some(path) = genesis {
                 println!("{}", checkpoints::genesis_hash(&chain::Genesis::load(&path)?));
                 return Ok(());
             }
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-            let (g, cp) = rt.block_on(checkpoints::fetch(&peers, height))?;
+            let (g, cp) = rt.block_on(checkpoints::fetch(&peers, height, genesis_hash.as_deref()))?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&cp)?);
             } else {

@@ -1,5 +1,5 @@
 import { defineConfig, devices } from "@playwright/test";
-import { GENESIS, MAINNET_GENESIS, MAINNET_PORT, MAINNET_RPC, PORT, RPC } from "./e2e/env";
+import { CHAIN_ID, GENESIS, MAINNET_GENESIS, MAINNET_PORT, MAINNET_RPC, PORT, PREFIX, RPC } from "./e2e/env";
 
 /**
  * Browser tests for the wallet (WAL-1): Chromium with a CDP virtual authenticator that supports
@@ -32,7 +32,7 @@ export default defineConfig({
     { name: "mainnet", testMatch: /mainnet\.spec\.ts/, use: { baseURL: `http://localhost:${MAINNET_PORT}` } },
   ],
   webServer: [
-    server(PORT, "testnet", { NEXT_PUBLIC_BLOCKULA_RPC: RPC, NEXT_PUBLIC_TESTNET_GENESIS_HASH: GENESIS }),
+    server(PORT, "testnet", { NEXT_PUBLIC_BLOCKULA_RPC: RPC, NEXT_PUBLIC_TESTNET_CHAIN_ID: CHAIN_ID, NEXT_PUBLIC_TESTNET_PREFIX: PREFIX, NEXT_PUBLIC_TESTNET_GENESIS_HASH: GENESIS }),
     server(MAINNET_PORT, "mainnet", {
       NEXT_PUBLIC_NETWORK: "mainnet",
       // Passkeys on localhost are always allowed for development; the rpId check still runs.

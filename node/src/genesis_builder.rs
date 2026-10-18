@@ -4,7 +4,8 @@
 //!   the owner account, the addresses, commission, self-bond and independence fields, it writes the
 //!   operator's public entry (TOML, or JSON) with a proof of possession. Nothing secret leaves.
 //! * `blockula genesis build --spec spec.toml` reads a reviewed spec (allocations by DEC-5 bucket,
-//!   the operator files, parameters, reserved names, the Soul ledger) and writes a `genesis.json`
+//!   the operator files, parameters, reserved names, the Soul ledger, the contribution pool's repos,
+//!   opening balance and timings) and writes a `genesis.json`
 //!   that is byte-identical for the same spec and binary, and prints its genesis hash.
 //!
 //! The builder validates: allocations add up to `total_supply` exactly; every allocation names a
@@ -69,6 +70,9 @@ pub const BOOTSTRAP_EXCLUDED_BUCKETS: &[&str] = &["founder", "foundation"];
 /// without a faucet (so `blockula-1`) refuses it.
 pub const FAUCET_BUCKET: &str = "faucet";
 
+/// The label of the contribution pool's opening balance (`[contribution] opening_balance`).
+pub const POOL_OPENING_LABEL: &str = "contribution pool: opening balance (endowment)";
+
 impl Bucket {
     /// Its vesting curve in blocks at this block time.
     pub fn curve(&self, block_time_ms: u64) -> Option<Vesting> {
@@ -112,6 +116,67 @@ pub struct Spec {
     pub allocations: Vec<SpecAllocation>,
     #[serde(default, rename = "soul")]
     pub soul_ledger: Vec<SpecSoul>,
+    /// Proof of Contribution from genesis: timings, the pool's repos and its opening balance.
+    #[serde(default)]
+    pub contribution: Option<SpecContribution>,
+}
+
+/// `[contribution]`: the contribution pool open from block 1 instead of after a `SetRepo`
+/// proposal and the first epochs' issuance.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpecContribution {
+    /// FANG the pool holds at genesis, out of the endowment bucket: it counts toward that
+    /// bucket's share and `total_supply`, so the spec's endowment allocation is that much
+    /// smaller. DEC-5 releases the endowment linearly from zero, so this is a finding (a testnet
+    /// shortcut, refused when strict).
+    #[serde(default)]
+    pub opening_balance: Option<String>,
+    /// Repos in the pool from genesis (`[[contribution.repo]]`).
+    #[serde(default, rename = "repo")]
+    pub repos: Vec<SpecRepo>,
+    /// Timings in blocks (`poc::PocTimes`); each one left out keeps its default for the block
+    /// time (weeks: a Séance a week, a 30-day revert window, 90-day vesting).
+    #[serde(default)]
+    pub seance_blocks: Option<u64>,
+    #[serde(default)]
+    pub claim_maturity_blocks: Option<u64>,
+    #[serde(default)]
+    pub vesting_blocks: Option<u64>,
+    #[serde(default)]
+    pub vouch_lock_blocks: Option<u64>,
+    #[serde(default)]
+    pub claim_ttl_blocks: Option<u64>,
+    #[serde(default)]
+    pub soul_half_life_blocks: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpecRepo {
+    /// GitHub `owner/name` (any case; the pool keys it lowercase).
+    pub repo: String,
+    /// 1–`poc::MAX_REPO_WEIGHT`: a claim's payout weight is its score times this.
+    pub weight: u64,
+}
+
+impl SpecContribution {
+    /// The timings, if the spec sets any (`None`: the genesis derives them from the block time).
+    fn times(&self, block_time_ms: u64) -> Option<crate::poc::PocTimes> {
+        let set = [self.seance_blocks, self.claim_maturity_blocks, self.vesting_blocks, self.vouch_lock_blocks, self.claim_ttl_blocks, self.soul_half_life_blocks];
+        if set.iter().all(Option::is_none) {
+            return None;
+        }
+        let d = crate::poc::PocTimes::for_block_time(block_time_ms);
+        Some(crate::poc::PocTimes {
+            seance_blocks: self.seance_blocks.unwrap_or(d.seance_blocks),
+            claim_maturity_blocks: self.claim_maturity_blocks.unwrap_or(d.claim_maturity_blocks),
+            vesting_blocks: self.vesting_blocks.unwrap_or(d.vesting_blocks),
+            vouch_lock_blocks: self.vouch_lock_blocks.unwrap_or(d.vouch_lock_blocks),
+            claim_ttl_blocks: self.claim_ttl_blocks.unwrap_or(d.claim_ttl_blocks),
+            soul_half_life_blocks: self.soul_half_life_blocks.unwrap_or(d.soul_half_life_blocks),
+        })
+    }
 }
 
 /// A number written as a TOML integer or a string (amounts past 2^53 read better quoted).
@@ -348,6 +413,16 @@ pub fn build_from(spec: &Spec, operators: &[OperatorFile], strict: bool) -> Resu
         *by_bucket.entry(bucket.name).or_default() += amount as u128;
         allocations.push(Allocation { address, amount, vesting: bucket.curve(spec.block_time_ms), label: Some(a.label.clone().unwrap_or_else(|| bucket.name.to_string())) });
     }
+    // The pool's opening balance: an endowment allocation paid into the pool's account, liquid.
+    let contribution = spec.contribution.clone().unwrap_or_default();
+    if let Some(opening) = &contribution.opening_balance {
+        let amount = parse_fang_amount(opening).context("contribution.opening_balance")?;
+        ensure!(amount > 0, "contribution.opening_balance must be more than 0 (or left out)");
+        sum += amount as u128;
+        *by_bucket.entry("endowment").or_default() += amount as u128;
+        allocations.push(Allocation { address: crate::poc::pool_address(prefix), amount, vesting: None, label: Some(POOL_OPENING_LABEL.into()) });
+        findings.push(format!("the contribution pool opens with {} out of the endowment, which DEC-5 releases linearly from zero (docs/TOKENOMICS.md, section 1)", fmt_fang(amount)));
+    }
     ensure!(sum == total as u128, "allocations add up to {} drops, but total_supply is {} drops", sum, total);
     for b in BUCKETS {
         let want = (total as u128 - faucet) * b.bps as u128 / 10_000;
@@ -383,7 +458,19 @@ pub fn build_from(spec: &Spec, operators: &[OperatorFile], strict: bool) -> Resu
     for (k, v) in &spec.params {
         param_overrides.insert(k.clone(), v.value().with_context(|| format!("params.{k}"))?);
     }
+    let mut pool_repos = BTreeMap::new();
+    for r in &contribution.repos {
+        let key = r.repo.trim().to_ascii_lowercase();
+        ensure!(pool_repos.insert(key.clone(), r.weight).is_none(), "contribution.repo: {key} is listed twice");
+    }
     let soul_ledger = spec.soul_ledger.iter().map(|s| Ok(SoulEntry { account: s.account.clone(), soul: parse_soul(&s.soul).with_context(|| format!("soul for {}", s.account))?, reason: s.reason.clone() })).collect::<Result<Vec<_>>>()?;
+    // The founder's and the foundation's accounts (and the owners of seats they run) start with
+    // no Soul: no jury seats or pool claims while their vesting runs (docs/TOKENOMICS.md, "What
+    // the founder must not do"). Founding jurors are other people.
+    let excluded = bootstrap_excluded(spec, operators);
+    for e in soul_ledger.iter().filter(|e| e.soul > 0) {
+        ensure!(!excluded.contains(&e.account), "soul: {} is the founder's or the foundation's (or a seat they run), whose Soul is 0 at genesis (docs/TOKENOMICS.md)", e.account);
+    }
 
     let genesis = Genesis {
         chain_id: spec.chain_id.clone(),
@@ -396,14 +483,15 @@ pub fn build_from(spec: &Spec, operators: &[OperatorFile], strict: bool) -> Resu
         allocations,
         epoch_blocks: spec.epoch_blocks,
         validator_admins: spec.validator_admins.clone(),
-        contribution: None,
+        contribution: contribution.times(spec.block_time_ms),
         address_prefix: prefix.into(),
         param_overrides,
         operators: entries,
         reserved_names: spec.reserved_names.clone(),
         soul_ledger,
         features: spec.features.clone(),
-        bootstrap_excluded: bootstrap_excluded(spec, operators),
+        bootstrap_excluded: excluded,
+        pool_repos,
     };
     ensure!(!genesis.validators.is_empty(), "a genesis needs at least one operator");
     genesis.check()?;
@@ -767,6 +855,84 @@ mod tests {
         no_faucet.allocations.extend(extra);
         no_faucet.total_supply = "1010000000".into();
         assert!(format!("{:#}", build_from(&no_faucet, &ops, false).err().unwrap()).contains("only a chain with a faucet"));
+    }
+
+    /// `[contribution]`: the pool opens at genesis with its repos, an opening balance out of the
+    /// endowment (a finding: DEC-5 releases the endowment from zero, so strict refuses it) and
+    /// the spec's timings; the Soul ledger seats founding jurors. All of it is in the genesis
+    /// state, byte-identically, and each kind of mistake is refused.
+    #[test]
+    fn the_contribution_pool_opens_at_genesis() {
+        let ops = operators("blockula-testnet-9", "tboo", 22);
+        let jurors: Vec<String> = (0..3).map(|i| Keys::from_seed([0x60 + i; 32]).address_with("tboo")).collect();
+        let souls: String = jurors.iter().map(|j| format!("[[soul]]\naccount = \"{j}\"\nsoul = \"25\"\nreason = \"founding juror (testnet)\"\n")).collect();
+        let pool = "[contribution]\nopening_balance = \"100000\"\nseance_blocks = 259200\nclaim_maturity_blocks = 259200\n[[contribution.repo]]\nrepo = \"JackDishman/Blockula\"\nweight = 10\n";
+        let with = |extra: &str, endowment: u64| {
+            let mut spec: Spec = toml::from_str(&format!("{}{souls}{extra}", toml_of(&spec_for("blockula-testnet-9", "tboo", &ops, "")))).unwrap();
+            spec.allocations[2].amount = endowment.to_string();
+            spec
+        };
+        let spec = with(pool, 149_900_000);
+        let a = build_from(&spec, &ops, false).unwrap();
+        assert_eq!(a.json, build_from(&spec, &ops, false).unwrap().json, "byte-identical");
+        assert_eq!(a.warnings, vec!["the contribution pool opens with 100000 FANG out of the endowment, which DEC-5 releases linearly from zero (docs/TOKENOMICS.md, section 1)".to_string()], "the endowment bucket still holds its 15%");
+        let g = &a.genesis;
+        assert_eq!(g.pool_repos, BTreeMap::from([("jackdishman/blockula".to_string(), 10)]));
+        let times = g.contribution.clone().unwrap();
+        let d = crate::poc::PocTimes::for_block_time(1000);
+        assert_eq!(times, crate::poc::PocTimes { seance_blocks: 259_200, claim_maturity_blocks: 259_200, ..d }, "the rest keep their defaults");
+        // In the state: the repo, the pool's balance (liquid), the endowment's curve, the Soul.
+        let st = g.initial_state();
+        st.check_invariants().unwrap();
+        assert!(st.poc.is_active());
+        assert_eq!(st.poc.repos.get("jackdishman/blockula"), Some(&10));
+        let pool_addr = crate::poc::pool_address("tboo");
+        assert_eq!((st.account(&pool_addr).balance, crate::econ::transferable(&st, &pool_addr, 0)), (100_000 * FANG, 100_000 * FANG));
+        let endow = g.allocations.iter().find(|x| x.address == endowment("tboo")).unwrap();
+        assert_eq!((endow.amount, endow.vesting.clone()), (149_900_000 * FANG, Some(Vesting { start: 0, cliff: 0, end: 315_576_000 })));
+        assert_eq!(g.allocations.iter().find(|x| x.address == pool_addr).unwrap().label.as_deref(), Some(POOL_OPENING_LABEL));
+        for j in &jurors {
+            assert!(st.soul_of(j, 0) >= crate::poc::JUROR_MIN_SOUL && st.soul_of(j, 0) >= crate::poc::VOUCH_MIN_SOUL, "a founding juror can sit and vouch");
+        }
+        assert_eq!(st.params.poc, times);
+        // Strict (and so blockula-1) refuses the opening balance; repos alone are fine there.
+        assert!(format!("{:#}", build_from(&spec, &ops, true).err().unwrap()).contains("opens with 100000 FANG"));
+        let main_ops = operators("blockula-1", "boo", 22);
+        let main_repos: Spec = toml::from_str(&format!("{}[contribution]\n[[contribution.repo]]\nrepo = \"jackdishman/blockula\"\nweight = 10\n", toml_of(&spec_for("blockula-1", "boo", &main_ops, "")))).unwrap();
+        let main = build_from(&main_repos, &main_ops, false).unwrap();
+        assert!(main.warnings.is_empty() && main.genesis.pool_repos.len() == 1 && main.genesis.contribution.is_none(), "{:?}", main.warnings);
+        // Without [contribution], nothing changes: no repos, no timings, no pool allocation.
+        let plain = build_from(&spec_for("blockula-testnet-9", "tboo", &ops, ""), &ops, false).unwrap();
+        assert!(plain.genesis.pool_repos.is_empty() && plain.genesis.contribution.is_none() && !plain.json.contains("pool_repos"));
+        // Mistakes.
+        let refuse = |spec: &Spec, why: &str| {
+            let err = format!("{:#}", build_from(spec, &ops, false).err().unwrap_or_else(|| panic!("expected {why:?}")));
+            assert!(err.contains(why), "expected {why:?}, got: {err}");
+        };
+        refuse(&with(pool, 150_000_000), "allocations add up to");
+        refuse(&with(&pool.replace("weight = 10", "weight = 0"), 149_900_000), "needs a weight of 1–100");
+        refuse(&with(&pool.replace("weight = 10", "weight = 101"), 149_900_000), "needs a weight of 1–100");
+        refuse(&with(&pool.replace("JackDishman/Blockula", "not a repo"), 149_900_000), "pool_repos");
+        refuse(&with(&format!("{pool}[[contribution.repo]]\nrepo = \"jackdishman/blockula\"\nweight = 3\n"), 149_900_000), "listed twice");
+        refuse(&with(&pool.replace("\"100000\"", "\"0\""), 150_000_000), "opening_balance must be more than 0");
+        refuse(&with(&pool.replace("seance_blocks = 259200", "seance_blocks = 2"), 149_900_000), "seance_blocks ≥ 3");
+        assert!(toml::from_str::<Spec>(&format!("{}[contribution]\nwarp = 1\n", toml_of(&spec_for("x", "tboo", &ops, "")))).is_err(), "unknown fields are refused");
+        // The founder's and the foundation's accounts start with no Soul (TOKENOMICS: no jury
+        // seats while vesting runs), so they're never founding jurors.
+        for seed in [0x30, 0x31] {
+            let mut with = spec.clone();
+            with.soul_ledger.push(SpecSoul { account: Keys::from_seed([seed; 32]).address_with("tboo"), soul: "5".into(), reason: "juror".into() });
+            refuse(&with, "is the founder's or the foundation's");
+        }
+    }
+
+    /// A spec as TOML again (the tests build specs as values, then add sections as text).
+    fn toml_of(spec: &Spec) -> String {
+        let mut t = format!("chain_id = \"{}\"\naddress_prefix = \"{}\"\ngenesis_time_ms = {}\nblock_time_ms = {}\nepoch_blocks = {}\nfaucet = {}\ntotal_supply = \"{}\"\n", spec.chain_id, spec.address_prefix, spec.genesis_time_ms, spec.block_time_ms, spec.epoch_blocks, spec.faucet, spec.total_supply);
+        for a in &spec.allocations {
+            t += &format!("[[allocation]]\nbucket = \"{}\"\n{}amount = \"{}\"\n", a.bucket, a.address.as_ref().map(|x| format!("address = \"{x}\"\n")).unwrap_or_default(), a.amount);
+        }
+        t
     }
 
     /// A mainnet-shaped spec (22 independent operators, DEC-5 exactly) passes strict, and so
