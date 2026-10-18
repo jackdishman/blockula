@@ -51,11 +51,14 @@ test("a node reporting a height the chain can't have reached gets nothing signed
   node.names.set("alice", alice);
   node.genesis = { chain_id: node.chainId, created_at_ms: Date.now() - 86_400_000, block_time_ms: 1000, validators: [] };
   await createWallet(page);
-  const pay = async () => {
-    await page.getByRole("link", { name: "Send", exact: true }).first().click();
+  const review = async () => {
     await page.getByPlaceholder(/alice\.boo or/).fill("alice.boo");
     await page.getByPlaceholder("0.0").fill("1");
     await page.getByRole("button", { name: "Review" }).click();
+  };
+  const pay = async () => {
+    await page.getByRole("link", { name: "Send", exact: true }).first().click();
+    await review();
   };
   // A height the chain can have reached (a day of 1 s blocks): signed.
   await pay();
@@ -72,7 +75,8 @@ test("a node reporting a height the chain can't have reached gets nothing signed
   node.genesis = { chain_id: node.chainId, created_at_ms: 0, block_time_ms: 1, validators: [] };
   await page.reload();
   await page.getByRole("button", { name: "Unlock with passkey" }).click();
-  await pay();
+  await expect(page.getByRole("heading", { name: "Send FANG" })).toBeVisible();
+  await review();
   await expect(page.getByText("Your node reports a block height the network can't have reached yet")).toBeVisible();
   expect(node.submitted.length).toBe(sent);
 });
