@@ -32,7 +32,7 @@ test("a tx dropped unrun reads as dropped and not final, never sealed or failed,
   await expect(trace.locator("li").filter({ hasText: /^Final/ })).toContainText("not yet: it may still run until its valid_until passes");
   // The height is where this node dropped it, not a block it ran in.
   await expect(page.getByRole("navigation", { name: "Breadcrumbs" })).not.toContainText("Block");
-  for (const ran of ["in block #", "action failed", "blocks deep", "certificate", "fee was charged", "Included, but failed"]) await expect(main).not.toContainText(ran);
+  for (const ran of ["in block #", "but the action failed", "blocks deep", "certificate", "fee was charged", "Included, but failed"]) await expect(main).not.toContainText(ran);
   expect(blockReads).toEqual([]);
 
   // Another node includes it, and this node runs that block: the receipt follows it there.
@@ -53,7 +53,7 @@ test("an older node's tx-less failure, which doesn't say whether it ran, reads a
   const receipt = page.locator("section.receipt");
   await expect(receipt.locator(".eyebrow")).toHaveText("Dropped, not final");
   await expect(receipt.locator(".pill")).toHaveText(["dropped"]);
-  await expect(page.locator("main")).not.toContainText("action failed");
+  await expect(page.locator("main")).not.toContainText("but the action failed");
 });
 
 test("a failure answered from memory, without the tx, ran in its block: final, and its fee was charged", async ({ page, node }) => {

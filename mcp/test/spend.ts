@@ -423,6 +423,34 @@ ts = r.json();
 assert.ok(ts.status === "unknown" && /couldn't read whether .* was used.*may still be in flight .* or have run already.*Do NOT send it again/.test(ts.next), r.text);
 assert.doesNotMatch(ts.next, /nothing was charged|can never execute/, r.text);
 mode.accountNonce = undefined;
+// review-r4-wallet-3: every network shares BLOCKULA_HOME, and the taker's record says it was
+// signed for fake-chain. On another chain (a relaunch, or testnet asked about a mainnet payment)
+// that 404s it past its valid_until with the account's nonce unused, it isn't "expired": that
+// chain's head and nonce say nothing about it.
+await s.close();
+const otherChain = { chain_id: "other-chain", genesis_hash: "22".repeat(32), height: taker.valid_until + 200_000, history_from: 1 };
+mode.status = otherChain;
+mode.tx = "gone";
+mode.accountNonce = taker.nonce;
+rmSync(join(home, "known-chains.json"), { force: true });
+s = await server({ BLOCKULA_MAX_DAILY: "1" });
+r = await s.call("tx_status", { tx_id: txId(taker) });
+ts = r.json();
+assert.ok(!r.error && ts.status === "other_chain" && ts.signed_for_chain_id === "fake-chain" && ts.signed_for_genesis_hash === G && /signed it for chain fake-chain \(genesis 1{64}\), not the network it's on now \(other-chain .*Do NOT send it again, and don't tell the user it failed or never ran/.test(ts.next), r.text);
+assert.ok(ts.account_nonce === undefined && !/nothing was charged|can never execute/.test(ts.next), r.text);
+await s.close();
+// A record kept before records named their chain is read against no chain, even the one it was signed on.
+const signedFile = join(home, "agent-txs.json");
+const records = JSON.parse(readFileSync(signedFile, "utf8")) as { txs: [string, Record<string, unknown>][] };
+for (const [id, t] of records.txs) if (id === txId(taker)) [delete t.chain_id, delete t.genesis_hash];
+writeFileSync(signedFile, JSON.stringify(records));
+mode.status = { height: taker.valid_until + 200_000, history_from: 1 };
+rmSync(join(home, "known-chains.json"), { force: true });
+s = await server({ BLOCKULA_MAX_DAILY: "1" });
+r = await s.call("tx_status", { tx_id: txId(taker) });
+ts = r.json();
+assert.ok(!r.error && ts.status === "other_chain" && /signed it for a chain it didn't record/.test(ts.next) && ts.account_nonce === undefined, r.text);
+mode.accountNonce = undefined;
 mode.status = {};
 mode.post = "accept";
 mode.tx = "finalized";
@@ -809,6 +837,12 @@ prove(paid.nonce + 1, 200_000, 200_005);
 r = await s.call("tx_status", { tx_id: txId(paid) });
 ts = r.json();
 assert.ok(ts.status === "nonce_used" && /has been used \(the account has run \d+ txs \(proven at block 200000: its state root confirmed by 1 other node\)\), so this tx can never execute again/.test(ts.next), r.text);
+// review-r4-wallet-4: only the nonce is proven. That this one most likely never ran (an archive
+// node's 404) is still the node's word, and the answer says so.
+mode.status = { height: 200_005, history_from: 1 };
+r = await s.call("tx_status", { tx_id: txId(paid) });
+ts = r.json();
+assert.ok(ts.status === "nonce_used" && /This node says it holds every block it could have run in \(from #1\) and has no record of it, so most likely another tx used that nonce.*Only the nonce is proven: which tx used it is this node's word/.test(ts.next), r.text);
 // A witness that disagrees about the state root, or a proof too old for the heads: no all-clear,
 // and not the node's unproven word either.
 for (const [why, args] of [["a witness disagrees", [paid.nonce, paid.valid_until + 45, paid.valid_until + 50, "ff".repeat(32)]], ["a stale proof", [paid.nonce, paid.valid_until + 1, paid.valid_until + 500]]] as const) {
