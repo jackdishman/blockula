@@ -187,8 +187,9 @@ enum Cmd {
         /// Required unless this release knows the chain id
         #[arg(long)]
         genesis_hash: Option<String>,
-        /// Trusted checkpoint HEIGHT:HASH[:SET_HASH] (repeatable): snapshots and blocks that
-        /// contradict it are refused. Get one from sources you trust (`blockula checkpoint`)
+        /// Trusted checkpoint HEIGHT:HASH[:SET_HASH[:TIMESTAMP_MS]] (repeatable): snapshots and
+        /// blocks that contradict it are refused, and its age counts from its block's time. Get
+        /// one from sources you trust (`blockula checkpoint`)
         #[arg(long = "checkpoint", value_parser = checkpoints::Checkpoint::parse)]
         checkpoints: Vec<checkpoints::Checkpoint>,
         /// Sync even when the newest trusted checkpoint is older than the weak-subjectivity
@@ -198,8 +199,8 @@ enum Cmd {
         #[command(flatten)]
         net: Net,
     },
-    /// Print a checkpoint (HEIGHT:HASH:SET_HASH) that several nodes agree on, for `join
-    /// --checkpoint` and node/checkpoints/*.json; or, with --genesis, a genesis file's hash
+    /// Print a checkpoint (HEIGHT:HASH:SET_HASH:TIMESTAMP_MS) that several nodes agree on, for
+    /// `join --checkpoint` and node/checkpoints/*.json; or, with --genesis, a genesis file's hash
     Checkpoint {
         /// A node's HTTP URL (repeat it: ask nodes run by independent operators)
         #[arg(long = "peer", required_unless_present = "genesis")]

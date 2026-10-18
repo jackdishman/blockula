@@ -1688,13 +1688,23 @@ mod tests {
         let verifier = consensus::EpochProvider::new(chain.clone(), None).epoch_scheme(0).unwrap();
         let hash2 = hex::encode(blocks[2].digest_bytes());
         let genesis_set = crate::checkpoints::genesis_checkpoint(&g).set_hash;
-        let trust = |hash: &str, set: Option<String>| Trust::new(&g, &Pins { checkpoints: vec![Checkpoint { height: 2, hash: hash.into(), set_hash: set, timestamp_ms: None }], ..Default::default() }, false).unwrap();
+        let timed = |height: u64, hash: &str, set: Option<String>, time: Option<u64>| Trust::new(&g, &Pins { checkpoints: vec![Checkpoint { height, hash: hash.into(), set_hash: set, timestamp_ms: time }], ..Default::default() }, false).unwrap();
+        let trust = |hash: &str, set: Option<String>| timed(2, hash, set, None);
         let err = apply_batch_trusted(&chain, &verifier, 0, &batch, Some(&trust(&"ab".repeat(32), None))).unwrap_err().to_string();
         assert!(err.contains("another chain"), "{err}");
         let err = apply_batch_trusted(&chain, &verifier, 0, &batch, Some(&trust(&hash2, Some("cd".repeat(32))))).unwrap_err().to_string();
         assert!(err.contains("forged validator-set history"), "{err}");
+        // review-r3-sync-1: a checkpoint's recorded time is the block's (its hash covers it), and
+        // later blocks are no earlier than it allows: a checkpoint claiming to be fresher than it
+        // is gets caught by the blocks.
+        let at2 = blocks[2].timestamp_ms;
+        let err = apply_batch_trusted(&chain, &verifier, 0, &batch, Some(&timed(2, &hash2, genesis_set.clone(), Some(at2 + 1)))).unwrap_err().to_string();
+        assert!(err.contains("carries the time") && err.contains("the checkpoint's time is wrong"), "{err}");
+        let hash1 = hex::encode(blocks[1].digest_bytes());
+        let err = apply_batch_trusted(&chain, &verifier, 0, &batch, Some(&timed(1, &hash1, None, Some(blocks[1].timestamp_ms + 500)))).unwrap_err().to_string();
+        assert!(err.contains("block #1") && err.contains("the checkpoint's time is wrong"), "{err}");
         assert_eq!(chain.lock().height(), 0, "nothing executed");
-        apply_batch_trusted(&chain, &verifier, 0, &batch, Some(&trust(&hash2, genesis_set))).unwrap();
+        apply_batch_trusted(&chain, &verifier, 0, &batch, Some(&timed(2, &hash2, genesis_set, Some(at2)))).unwrap();
         assert_eq!(chain.lock().hash_at(2), Some(hash2));
         drop(chain);
         std::fs::remove_dir_all(root).ok();

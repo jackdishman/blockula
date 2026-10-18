@@ -4,12 +4,13 @@
 //! A joining node checks everything it downloads against a validator set, and learns each set
 //! from the one before it (handoff signatures, `epochs.rs`) back to genesis. That chain is only as
 //! good as its roots: the genesis hash, and **checkpoints** `(height, block hash, validator-set
-//! hash)` that the node already trusts. They come from two places:
+//! hash, block time)` that the node already trusts. They come from two places:
 //!
 //! - **This binary**: `node/checkpoints/<chain id>.json`, compiled in, so the release signature
 //!   covers them. Each release appends a recent checkpoint (OPERATIONS.md "Weak subjectivity").
-//! - **The operator**: `join --genesis-hash` and `--checkpoint HEIGHT:HASH[:SET_HASH]`, saved in
-//!   `join.json` and enforced on every start.
+//! - **The operator**: `join --genesis-hash` and
+//!   `--checkpoint HEIGHT:HASH[:SET_HASH[:TIMESTAMP_MS]]`, saved in `join.json` and enforced on
+//!   every start.
 //!
 //! `join` refuses a genesis that neither pins, and a node refuses every snapshot, epoch anchor and
 //! sync batch that contradicts a checkpoint.
@@ -32,6 +33,13 @@
 //! (`params::EVIDENCE_WINDOW_FLOOR_DAYS`: governance can't shorten the evidence window below two
 //! weeks, so the period never falls below a week), so a lying peer can at worst ask for a
 //! checkpoint a week old.
+//!
+//! A root's age is measured in blocks against the highest the chain can have reached by the wall
+//! clock, counted from the newest block whose time the node trusts ([`Trust::expected_height`]):
+//! the newest checkpoint that records its block's time, or the genesis. Counted from the genesis
+//! alone, every slot the chain ever missed would make even a checkpoint at the tip look older
+//! (review-r3-sync-1), and an old chain would refuse every checkpoint once the deficit passed the
+//! period; counted from the checkpoint's own time, only slots missed since then count.
 
 use crate::chain::{Genesis, Params};
 use crate::epochs::{self, EpochRegistry};
@@ -599,6 +607,9 @@ mod tests {
             for c in &k.checkpoints {
                 c.check().unwrap();
                 assert!(c.set_hash.is_some(), "{} #{}: embedded checkpoints pin a validator set", k.chain_id, c.height);
+                // So joiners measure its age from its own time, not the chain's lifetime of missed
+                // slots (review-r3-sync-1): `blockula checkpoint --json` prints it.
+                assert!(c.timestamp_ms.is_some(), "{} #{}: embedded checkpoints record their block's timestamp_ms", k.chain_id, c.height);
             }
         }
         let main = embedded().iter().find(|k| k.chain_id == crate::chain::MAINNET_CHAIN_ID).expect("blockula-1 has an entry");
@@ -640,7 +651,15 @@ mod tests {
         let (a, b) = ("aa".repeat(32), "bb".repeat(32));
         assert_eq!(Checkpoint::parse(&format!("7:{}", a.to_uppercase())).unwrap(), Checkpoint { height: 7, hash: a.clone(), set_hash: None, timestamp_ms: None });
         assert_eq!(Checkpoint::parse(&format!("7:{a}:{b}")).unwrap().to_flag(), format!("7:{a}:{b}"));
-        for bad in ["7", &format!("x:{a}"), "7:abc", &format!("7:{a}:zz"), &format!("7:{a}:{b}:{b}"), &format!("-1:{a}")] {
+        // With the block's time (review-r3-sync-1), with or without a set hash.
+        let timed = Checkpoint::parse(&format!("7:{a}:{b}:1700000000123")).unwrap();
+        assert_eq!(timed, Checkpoint { height: 7, hash: a.clone(), set_hash: Some(b.clone()), timestamp_ms: Some(1_700_000_000_123) });
+        assert_eq!(timed.to_flag(), format!("7:{a}:{b}:1700000000123"));
+        let no_set = Checkpoint::parse(&format!("7:{a}::42")).unwrap();
+        assert_eq!((no_set.set_hash.clone(), no_set.timestamp_ms, no_set.to_flag()), (None, Some(42), format!("7:{a}::42")));
+        assert_eq!(serde_json::from_str::<Checkpoint>(&serde_json::to_string(&timed).unwrap()).unwrap(), timed);
+        assert!(serde_json::to_string(&timed).unwrap().contains("\"timestamp_ms\":1700000000123"));
+        for bad in ["7", &format!("x:{a}"), "7:abc", &format!("7:{a}:zz"), &format!("7:{a}:{b}:{b}"), &format!("-1:{a}"), &format!("7:{a}:"), &format!("7:{a}::"), &format!("7:{a}:{b}:-5"), &format!("7:{a}:{b}:1:2"), &format!("7:{a}:zz:1")] {
             assert!(Checkpoint::parse(bad).is_err(), "{bad}");
         }
         let pins = |cps: Vec<Checkpoint>| Pins { genesis_hash: Some(hash.clone()), checkpoints: cps, ..Default::default() };
@@ -704,6 +723,102 @@ mod tests {
         // Slower than nominal blocks only make it look older (never fresher).
         g.created_at_ms = created - 30 * 86_400_000;
         assert!(Trust::new(&g, &Pins { genesis_hash: Some(genesis_hash(&g)), ..Default::default() }, true).unwrap().check_fresh((0, None), now(0)).is_err());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// review-r3-sync-1: blocks are never closer than the block time and are further apart after
+    /// every missed slot, so on an aging chain the deficit since the genesis only grows. Measured
+    /// from the genesis, a checkpoint taken at the tip looked as old as that whole deficit: past
+    /// a week of it, one lying peer's report (held to the week's floor) refused every checkpoint
+    /// there is, and past the genesis' 10.5 days, honest parameters did. A checkpoint that records
+    /// its block's time is as old as that time says: only slots missed since then count.
+    #[test]
+    fn an_aging_chain_measures_a_checkpoint_from_its_own_time() {
+        let (root, _, mut g) = summoned("aging", 1);
+        let bt = g.block_time_ms;
+        let day = 86_400_000 / bt;
+        let now = crate::chain::now_ms();
+        let days_ago = |d: u64| now - d * 86_400_000;
+        // A year old, with 8 days of nominal blocks lost to timed-out views (a 2.2% deficit).
+        g.created_at_ms = days_ago(365);
+        let hash = genesis_hash(&g);
+        let tip = 357 * day;
+        let at = |height: u64, time: Option<u64>| Pins { genesis_hash: Some(hash.clone()), checkpoints: vec![Checkpoint { height, hash: "cd".repeat(32), set_hash: None, timestamp_ms: time }], ..Default::default() };
+        let liar = [("http://one-genesis-validator".to_string(), 1)];
+        // Without its time, the checkpoint at the tip is 8 days behind the genesis' line: fresh by
+        // the genesis' 10.5 days, refused once a liar pulls the period to a week.
+        let mut untimed = Trust::new(&g, &at(tip, None), true).unwrap();
+        assert_eq!(untimed.check_fresh((0, None), now).unwrap(), None);
+        assert!(untimed.heed(&liar));
+        let err = untimed.check_fresh((0, None), now).unwrap_err().to_string();
+        assert!(err.contains("~8.0 days") && err.contains("the protocol's floor; it reports 1"), "{err}");
+        // With it (taken a minute ago), it's a minute old, whatever any peer says.
+        let mut timed = Trust::new(&g, &at(tip, Some(now - 60_000)), true).unwrap();
+        assert_eq!(timed.expected_height(now), tip + 60_000 / bt, "counted from the checkpoint's own time");
+        assert!(timed.heed(&liar) && timed.ws_blocks() == 7 * day);
+        assert_eq!(timed.check_fresh((0, None), now).unwrap(), None, "a checkpoint at the tip survives any lie");
+        // Six days old: fresh under the floor. Eight days old by its own time: refused, and the
+        // refusal counts only those eight days.
+        let mut six = Trust::new(&g, &at(tip - 6 * day, Some(days_ago(6))), true).unwrap();
+        assert!(six.heed(&liar));
+        assert_eq!(six.check_fresh((0, None), now).unwrap(), None, "a week-old checkpoint survives any lie");
+        let mut eight = Trust::new(&g, &at(tip - 8 * day, Some(days_ago(8))), true).unwrap();
+        assert_eq!(eight.check_fresh((0, None), now).unwrap(), None, "by the genesis' period");
+        assert!(eight.heed(&liar));
+        assert!(eight.check_fresh((0, None), now).unwrap_err().to_string().contains("~8.0 days"));
+        // Twelve days of deficit (past the genesis' own period): the untimed tip is refused with
+        // no lie at all, the timed one is fresh, and so is it after honest governance shortens
+        // the window to its floor.
+        let tip = 353 * day;
+        assert!(Trust::new(&g, &at(tip, None), true).unwrap().check_fresh((0, None), now).unwrap_err().to_string().contains("~12.0 days"));
+        let mut timed = Trust::new(&g, &at(tip, Some(now - 60_000)), true).unwrap();
+        assert_eq!(timed.check_fresh((0, None), now).unwrap(), None);
+        let mut floor = g.chain_params().unwrap();
+        floor.evidence_max_age_epochs = evidence_floor_epochs(&g.params());
+        floor.unbonding_blocks = floor.evidence_max_age_epochs * g.epoch_blocks;
+        assert!(timed.follow(&floor) && timed.ws_blocks() == 7 * day);
+        assert_eq!(timed.check_fresh((0, None), now).unwrap(), None);
+        // A synced node's own head counts from its own time too: no warning at the tip of an
+        // aging chain (only the height, as from a fast-sync base it hasn't built on: warned).
+        let genesis_only = Trust::new(&g, &Pins { genesis_hash: Some(hash.clone()), ..Default::default() }, true).unwrap();
+        assert_eq!(genesis_only.check_fresh((tip, Some(now - 2_000)), now).unwrap(), None);
+        assert!(genesis_only.check_fresh((tip, None), now).unwrap().unwrap().contains("~12.0 days"));
+        assert!(genesis_only.check_fresh((tip - 11 * day, Some(days_ago(11))), now).unwrap().unwrap().contains("~11.0 days"), "a head that's really old still warns");
+        // A time far enough ahead of the line is impossible (a forged root can't hide behind it):
+        // it's refused below the genesis' line and above this machine's clock.
+        let below = Trust::new(&g, &at(tip, Some(g.created_at_ms + tip * bt - 1)), true).unwrap_err().to_string();
+        assert!(below.contains("earlier than the chain allows"), "{below}");
+        let seconds = Trust::new(&g, &at(tip, Some(now / 1000)), true).unwrap_err().to_string();
+        assert!(seconds.contains("in milliseconds"), "{seconds}");
+        let micros = Trust::new(&g, &at(tip, Some(now * 1000)), true).unwrap();
+        let err = micros.check_fresh((0, None), now).unwrap_err().to_string();
+        assert!(err.contains("past this machine's clock") && err.contains("TIMESTAMP_MS"), "{err}");
+        assert!(micros.check_fresh((tip, Some(now)), now).unwrap().unwrap().contains("past this machine's clock"), "a synced node is warned");
+        Trust::new(&g, &at(tip, Some(now + 60_000)), true).unwrap().check_fresh((0, None), now).unwrap();
+        // Two times the chain can't both have, and two at one height, are refused.
+        let pair = |a: (u64, u64), b: (u64, u64)| Pins { genesis_hash: Some(hash.clone()), checkpoints: vec![Checkpoint { height: a.0, hash: "cd".repeat(32), set_hash: None, timestamp_ms: Some(a.1) }, Checkpoint { height: b.0, hash: "ef".repeat(32), set_hash: None, timestamp_ms: Some(b.1) }], ..Default::default() };
+        let err = Trust::new(&g, &pair((tip, days_ago(2)), (tip + day, days_ago(2) + 86_400_000 - bt)), true).unwrap_err().to_string();
+        assert!(err.contains(&format!("checkpoint #{} records", tip + day)) && err.contains(&format!("after #{tip}'s time")), "{err}");
+        Trust::new(&g, &pair((tip, days_ago(2)), (tip + day, days_ago(1))), true).unwrap();
+        let mut both = at(tip, Some(days_ago(1)));
+        both.checkpoints.push(Checkpoint { timestamp_ms: Some(days_ago(1) + 1), ..both.checkpoints[0].clone() });
+        assert!(Trust::new(&g, &both, true).unwrap_err().to_string().contains("conflicting checkpoints"));
+        let filled = Trust::with_table(&g, &at(tip, None), true, &known(&g, &hash, vec![Checkpoint { height: tip, hash: "cd".repeat(32), set_hash: None, timestamp_ms: Some(days_ago(1)) }])).unwrap();
+        assert_eq!(filled.checkpoints().next().unwrap().timestamp_ms, Some(days_ago(1)), "a time fills in a missing one");
+        let zero = |t: u64| Pins { genesis_hash: Some(hash.clone()), checkpoints: vec![Checkpoint { timestamp_ms: Some(t), ..genesis_checkpoint(&g) }], ..Default::default() };
+        Trust::new(&g, &zero(g.created_at_ms), true).unwrap();
+        assert!(Trust::new(&g, &zero(g.created_at_ms + 1), true).unwrap_err().to_string().contains("created_at_ms"));
+        // Blocks: at the checkpoint, its time (the hash covers it); after it, no earlier than it
+        // allows; before it, unconstrained; a caller without the block checks only the hash.
+        let t = Trust::new(&g, &at(tip, Some(days_ago(1))), true).unwrap();
+        t.check_block(tip, &"cd".repeat(32), Some(days_ago(1))).unwrap();
+        t.check_block(tip, &"cd".repeat(32), None).unwrap();
+        let err = t.check_block(tip, &"cd".repeat(32), Some(days_ago(1) + 1)).unwrap_err().to_string();
+        assert!(err.contains("the checkpoint's time is wrong"), "{err}");
+        t.check_block(tip + 10, &"ab".repeat(32), Some(days_ago(1) + 10 * bt)).unwrap();
+        let err = t.check_block(tip + 10, &"ab".repeat(32), Some(days_ago(1) + 10 * bt - 1)).unwrap_err().to_string();
+        assert!(err.contains(&format!("earlier than the trusted checkpoint #{tip}")), "{err}");
+        t.check_block(tip - 10, &"ab".repeat(32), Some(0)).unwrap();
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -804,22 +919,36 @@ mod tests {
         assert_eq!(cp.height, boundary);
         assert_eq!(Some(cp.hash.clone()), chain.lock().hash_at(boundary));
         assert_eq!(cp.set_hash, genesis_checkpoint(&g).set_hash, "the set didn't change");
-        assert_eq!(fetch(std::slice::from_ref(&url), Some(3)).await.unwrap().1.hash, chain.lock().hash_at(3).unwrap());
+        // With the block's time (review-r3-sync-1), in the form `join --checkpoint` takes.
+        let time = |h: u64| chain.lock().block(h).unwrap().timestamp_ms;
+        assert_eq!(cp.timestamp_ms, Some(time(boundary)));
+        assert_eq!(Checkpoint::parse(&cp.to_flag()).unwrap(), cp);
+        assert_eq!(cp.to_flag(), format!("{boundary}:{}:{}:{}", cp.hash, cp.set_hash.as_deref().unwrap(), time(boundary)));
+        let three = fetch(std::slice::from_ref(&url), Some(3)).await.unwrap().1;
+        assert_eq!((three.hash.clone(), three.timestamp_ms), (chain.lock().hash_at(3).unwrap(), Some(time(3))));
         assert_eq!(fetch(std::slice::from_ref(&url), Some(0)).await.unwrap().1, genesis_checkpoint(&g));
+        assert_eq!(genesis_checkpoint(&g).timestamp_ms, Some(g.created_at_ms));
         assert!(fetch(std::slice::from_ref(&url), Some(epoch_blocks + 100)).await.unwrap_err().to_string().contains("isn't finalized"));
-        // A peer that serves another block at that height is called out.
-        let real = url.clone();
-        let liar = Router::new()
-            .route("/api/block/{h}", get(|| async { Json(serde_json::json!({ "hash": "ee".repeat(32) })) }))
-            .fallback(move |req: axum::extract::Request| {
-                let real = real.clone();
-                async move { reqwest::get(format!("{real}{}", req.uri())).await.unwrap().text().await.unwrap() }
-            });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let liar_url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, liar).await.unwrap() });
-        let err = fetch(&[url.clone(), liar_url], Some(3)).await.unwrap_err().to_string();
-        assert!(err.contains("disagree"), "{err}");
+        // A peer that serves another block at that height, or another time for it, is called out.
+        let liar = |block: serde_json::Value| {
+            let real = url.clone();
+            async move {
+                let liar = Router::new().route("/api/block/{h}", get(move || async move { Json(block.clone()) })).fallback(move |req: axum::extract::Request| {
+                    let real = real.clone();
+                    async move { reqwest::get(format!("{real}{}", req.uri())).await.unwrap().text().await.unwrap() }
+                });
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let liar_url = format!("http://{}", listener.local_addr().unwrap());
+                tokio::spawn(async move { axum::serve(listener, liar).await.unwrap() });
+                liar_url
+            }
+        };
+        for lie in [serde_json::json!({ "hash": "ee".repeat(32), "timestamp_ms": time(3) }), serde_json::json!({ "hash": three.hash, "timestamp_ms": time(3) + 86_400_000 })] {
+            let err = fetch(&[url.clone(), liar(lie).await], Some(3)).await.unwrap_err().to_string();
+            assert!(err.contains("disagree"), "{err}");
+        }
+        let err = fetch(&[liar(serde_json::json!({ "hash": three.hash })).await], Some(3)).await.unwrap_err().to_string();
+        assert!(err.contains("has no timestamp_ms"), "{err}");
         drop(chain);
         std::fs::remove_dir_all(root).ok();
     }
