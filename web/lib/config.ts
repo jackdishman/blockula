@@ -27,7 +27,7 @@ export const TESTNET_RPC = "https://blockula-testnet.fly.dev";
  * (scripts/pin-network.sh). Until then, and when it's set, NEXT_PUBLIC_TESTNET_GENESIS_HASH
  * pins it instead.
  */
-export const TESTNET_GENESIS_HASH: string | undefined = undefined;
+export const TESTNET_GENESIS_HASH: string | undefined = "b004e2f91b63429fc009088b16ec02b6d5388a03642699ae3dc6e325939f19b2";
 
 /** A chain's genesis clock: its genesis.json's `created_at_ms` and `block_time_ms`. */
 export interface GenesisClock {
@@ -41,7 +41,7 @@ export interface GenesisClock {
  * from the first payment on, instead of taking the clock from the node on first use
  * (lib/chain.ts, audit review-r3-clients-2).
  */
-export const TESTNET_GENESIS_CLOCK: GenesisClock | undefined = undefined;
+export const TESTNET_GENESIS_CLOCK: GenesisClock | undefined = { createdAtMs: 1792328803000, blockTimeMs: 1000 };
 
 /** A mainnet deployment (`NEXT_PUBLIC_NETWORK=mainnet`): stricter rules, see next.config.ts. */
 export const IS_MAINNET_BUILD = process.env.NEXT_PUBLIC_NETWORK === "mainnet";

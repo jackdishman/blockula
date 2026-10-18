@@ -36,15 +36,36 @@ TIME2=$((CREATED + 2 * BLOCK_TIME))
 ZERO=$("$BIN" checkpoint --genesis "$G" --json)
 ZERO_SET=$(ZERO="$ZERO" node -p 'JSON.parse(process.env.ZERO).set_hash')
 
-# A checkout with just what the script edits.
+# A checkout with just what the script edits, as it is before any chain is pinned: whatever this
+# tree already pins (a launched testnet, from the release after its launch on) is taken out of the
+# copies, so every case below is a first pin and a release's own pins can't fail the test. A rule
+# that no longer matches its file fails loudly rather than testing the wrong thing.
 fresh() {
   rm -rf "$T/repo"
   mkdir -p "$T/repo/node/src" "$T/repo/node/checkpoints" "$T/repo/mcp/src" "$T/repo/web/lib"
-  cp node/src/checkpoints.rs "$T/repo/node/src/"
-  cp node/checkpoints/*.json "$T/repo/node/checkpoints/"
-  cp mcp/src/network.ts "$T/repo/mcp/src/"
-  # The wallet's testnet is this chain, so its constant is pinned too.
-  sed "s/export const TESTNET_CHAIN_ID = \"[^\"]*\";/export const TESTNET_CHAIN_ID = \"$CHAIN\";/" web/lib/config.ts > "$T/repo/web/lib/config.ts"
+  cp node/checkpoints/blockula-1.json "$T/repo/node/checkpoints/"
+  CHAIN="$CHAIN" OUT="$T/repo" node --input-type=module <<'JS' || exit 1
+import { readFileSync, writeFileSync } from "node:fs";
+const reset = (file, rules) => {
+  let s = readFileSync(file, "utf8");
+  for (const [re, by] of rules) {
+    if (!re.test(s)) { console.error(`✗ test-pin-network.sh: ${file} has no ${re}`); process.exit(1); }
+    s = s.replace(re, () => by);
+  }
+  writeFileSync(`${process.env.OUT}/${file}`, s);
+};
+reset("node/src/checkpoints.rs", [[/const EMBEDDED: &\[&str\] = &\[[^\]]*\];/, 'const EMBEDDED: &[&str] = &[include_str!("../checkpoints/blockula-1.json")];']]);
+reset("mcp/src/network.ts", [
+  [/export const KNOWN_GENESIS: Record<string, string> = \{[^}]*\};/, "export const KNOWN_GENESIS: Record<string, string> = {};"],
+  [/export const KNOWN_CLOCKS: Record<string, GenesisClock> = \{(?:[^{}]|\{[^{}]*\})*\};/, "export const KNOWN_CLOCKS: Record<string, GenesisClock> = {};"],
+]);
+// The wallet's testnet is this chain, so its constants are pinned too.
+reset("web/lib/config.ts", [
+  [/export const TESTNET_CHAIN_ID = "[^"]*";/, `export const TESTNET_CHAIN_ID = "${process.env.CHAIN}";`],
+  [/export const TESTNET_GENESIS_HASH: string \| undefined = (?:undefined|"[0-9a-f]{64}");/, "export const TESTNET_GENESIS_HASH: string | undefined = undefined;"],
+  [/export const TESTNET_GENESIS_CLOCK: GenesisClock \| undefined = (?:undefined|\{ createdAtMs: \d+, blockTimeMs: \d+ \});/, "export const TESTNET_GENESIS_CLOCK: GenesisClock | undefined = undefined;"],
+]);
+JS
 }
 pin() { ROOT="$T/repo" BIN="$BIN" bash scripts/pin-network.sh "$@" > "$T/out" 2>&1; }
 snapshot() { (cd "$T/repo" && find . -type f | sort | xargs shasum) ; }

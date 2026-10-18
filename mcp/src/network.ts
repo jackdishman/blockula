@@ -45,7 +45,7 @@ export const MAINNET_RPCS: string[] = [];
  * genesis hash, whatever network it was configured as. `blockula-1`'s hash is added here once the
  * genesis ceremony has produced it (docs/GENESIS_CEREMONY.md).
  */
-export const KNOWN_GENESIS: Record<string, string> = {};
+export const KNOWN_GENESIS: Record<string, string> = { "blockula-testnet-2": "b004e2f91b63429fc009088b16ec02b6d5388a03642699ae3dc6e325939f19b2" };
 
 /**
  * The genesis clock of chains whose genesis is known (`created_at_ms` and `block_time_ms` of the
@@ -53,7 +53,7 @@ export const KNOWN_GENESIS: Record<string, string> = {};
  * refuses a node reporting a height the chain can't have reached by this machine's clock, before
  * anything is signed (audit review-r3-clients-2; `Client.checkSigningHeight`).
  */
-export const KNOWN_CLOCKS: Record<string, GenesisClock> = {};
+export const KNOWN_CLOCKS: Record<string, GenesisClock> = { "blockula-testnet-2": { createdAtMs: 1792328803000, blockTimeMs: 1000 } };
 
 /** A chain's genesis clock: its genesis.json's `created_at_ms` and `block_time_ms`. */
 export interface GenesisClock {

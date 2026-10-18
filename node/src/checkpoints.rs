@@ -50,7 +50,7 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 /// The embedded trust files, one per known chain id. A new chain gets a file here (and a line).
-const EMBEDDED: &[&str] = &[include_str!("../checkpoints/blockula-1.json")];
+const EMBEDDED: &[&str] = &[include_str!("../checkpoints/blockula-1.json"), include_str!("../checkpoints/blockula-testnet-2.json")];
 
 /// A block a node trusts without verifying it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,0 +1,143 @@
+# The blockula-testnet-2 genesis spec, written by deploy/launch.sh. Rebuild it (byte-identically) with
+#   blockula genesis build --spec spec.toml --out genesis.json
+# Founder, foundation, grant and juror accounts are testnet stand-ins held by the launcher.
+chain_id = "blockula-testnet-2"
+address_prefix = "tboo"
+genesis_time_ms = 1792328803000
+block_time_ms = 1000
+epoch_blocks = 3600
+faucet = true
+validator_admins = []
+total_supply = "1010000000"
+strict = false
+operators = [
+  "operators/v0.toml",
+  "operators/v1.toml",
+  "operators/v2.toml",
+  "operators/v3.toml",]
+reserved_names = ["blockula", "boo", "foundation", "treasury", "community", "validator", "admin", "support", "security", "official"]
+features = []
+
+# Mainnet's parameters, except durations short enough to exercise on a testnet: a week of
+# unbonding and of evidence (the weak-subjectivity period is half that), day-long votes, an
+# hour's timelock, spends open from genesis.
+[params]
+unbonding_blocks = 604800
+evidence_max_age_epochs = 168
+voting_blocks = 86400
+timelock_blocks = 3600
+governance_spend_height = 0
+proposal_deposit = "100000000000"
+
+
+# Proof of Contribution from genesis: the pool's repos, an opening balance out of the endowment,
+# and days instead of weeks (Séances every 3 days, a 3-day revert window, 30-day vesting).
+[contribution]
+opening_balance = "100000"
+seance_blocks = 259200
+claim_maturity_blocks = 259200
+vesting_blocks = 2592000
+vouch_lock_blocks = 2592000
+claim_ttl_blocks = 259200
+
+[[contribution.repo]]
+repo = "jackdishman/blockula"
+weight = 10
+
+[[soul]]
+account = "tboo1vyy79kku8fmr7h5qj9jjrx6zkk3fnf3e5jee3ga43a8rp3epy5as0lgmp7"
+soul = "25"
+reason = "founding juror (testnet stand-in 0)"
+
+[[soul]]
+account = "tboo1jr9nhwluqk2mkw35xu4qd4wczxhq8xz3agrvz36rjgcvmkhfw32qaeq06m"
+soul = "25"
+reason = "founding juror (testnet stand-in 1)"
+
+[[soul]]
+account = "tboo1ruejuj5sy4sv4zleqkkjz4jzxe8xnqzl3kz7cl79zgcm6pfv5mks8a8zey"
+soul = "25"
+reason = "founding juror (testnet stand-in 2)"
+
+[[allocation]]
+bucket = "community"
+amount = "320000000"
+
+[[allocation]]
+bucket = "treasury"
+amount = "250000000"
+
+[[allocation]]
+bucket = "endowment"
+amount = "149900000"
+
+[[allocation]]
+bucket = "bootstrap"
+amount = "100000000"
+
+[[allocation]]
+bucket = "founder"
+address = "tboo12e6nydssa923dwqgs4se69thc86rpcjx0n9txq6zsg5ld3c08jmqclwv6n"
+amount = "100000000"
+label = "founder (testnet stand-in)"
+
+[[allocation]]
+bucket = "foundation"
+address = "tboo1mlrxawrt8wva5c7c8hqc4avmj9932cyy9mnvljtcnays2kcvrdlsds6s3q"
+amount = "50000000"
+label = "foundation (testnet stand-in)"
+
+[[allocation]]
+bucket = "operators"
+address = "tboo19ryuyuxdj38vh6j2qj4p0apesqnjtc66828ascnngwz538g9084s2t2k9n"
+amount = "26000000"
+label = "security grants (testnet stand-in)"
+
+[[allocation]]
+bucket = "operators"
+address = "tboo1usyr055y9y2jh9fmul79vvrqrh7n4nfmwnl2643lqxhe9jtp4pqspamet3"
+amount = "1000000"
+label = "genesis operator: validator 0"
+
+[[allocation]]
+bucket = "faucet"
+address = "tboo10l67f8shh5u3jk84rwvc2tq095qmu88eu0hkmt5x6kc6207dyv8q8gvqu3"
+amount = "2500000"
+label = "faucet: validator 0"
+
+[[allocation]]
+bucket = "operators"
+address = "tboo1t08pvx59vmnrk7zr5rzutgxy0078zje52tcal28mypahv4ngzkzq3vf3ny"
+amount = "1000000"
+label = "genesis operator: validator 1"
+
+[[allocation]]
+bucket = "faucet"
+address = "tboo1kmq79um833fmfvdclufga7auyqerfr87x6pxqjxetz6zfzu80hsqxx25dx"
+amount = "2500000"
+label = "faucet: validator 1"
+
+[[allocation]]
+bucket = "operators"
+address = "tboo14u43xz6w3v9t365shv6elm8y57wv2wah4smmhnml7e67ljlplarszjxc2a"
+amount = "1000000"
+label = "genesis operator: validator 2"
+
+[[allocation]]
+bucket = "faucet"
+address = "tboo1q5yz7y9yr4sfha69x4ntaxx0yknx6g5lh7wykcj7pq8dsdexmaxqt57lhd"
+amount = "2500000"
+label = "faucet: validator 2"
+
+[[allocation]]
+bucket = "operators"
+address = "tboo1av9kzzdzyjjz30maywfyazkf4w802e9fh6peg98j6jxh779xguvqtz4tp9"
+amount = "1000000"
+label = "genesis operator: validator 3"
+
+[[allocation]]
+bucket = "faucet"
+address = "tboo1ds4xwl043lyuar2kgdxhkhz7lfgvjurar7nuqyupewjny05nnrcsq7x507"
+amount = "2500000"
+label = "faucet: validator 3"
+

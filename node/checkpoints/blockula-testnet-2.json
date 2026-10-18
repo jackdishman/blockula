@@ -1,0 +1,13 @@
+{
+  "chain_id": "blockula-testnet-2",
+  "genesis_hash": "b004e2f91b63429fc009088b16ec02b6d5388a03642699ae3dc6e325939f19b2",
+  "checkpoints": [
+    {
+      "height": 3599,
+      "hash": "eaa9cc4b3046de4945a6fbfe5df115e84e6c60c7729d34be158202e2169bc781",
+      "set_hash": "0918091e08f9232c8f2d8a34b8f6de9453a968f9d4fdc71be0b3f1afab544248",
+      "timestamp_ms": 1792334617880
+    }
+  ],
+  "note": "blockula-testnet-2: pinned after its launch (scripts/pin-network.sh). Each release appends a recent checkpoint (docs/OPERATIONS.md, Checkpoints in releases)."
+}
