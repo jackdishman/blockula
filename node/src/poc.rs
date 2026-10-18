@@ -1,7 +1,8 @@
 //! 🪦 Proof of Contribution: Souls (reputation that can't be bought), vouching, claims on merged
 //! PRs that validators check against GitHub, Séances (random commit-reveal review juries) and the
-//! contribution pool, paid per sponsor (a person's best claim counts fully, each further one a
-//! quarter of the one before) and vested with clawback.
+//! contribution pool, paid per sponsor (a person's claims in a Séance share one win rate pooled over
+//! all their comparisons; the first counts fully at it, each further one a quarter of the one
+//! before) and vested with clawback.
 //!
 //! Lifecycle of a claim: `submit_claim` (bonded) → validators attest what GitHub says → verified
 //! once a BFT quorum agrees on the merge commit → for `claim_maturity_blocks` validators watch for
@@ -64,7 +65,8 @@ pub const JUROR_SHARE_BPS: u64 = 1_000;
 /// A voucher's cut of a newcomer's rewards while the vouch is young (`vouch_lock_blocks`).
 pub const VOUCHER_CUT_BPS: u64 = 1_000;
 pub const PPM: u64 = 1_000_000;
-/// Claims scoring below this (win rate in their comparisons) get their bond back but no reward.
+/// Claims scoring below this (win rate in their comparisons), or whose claimant's claims in the
+/// Séance score below it together (the pooled rate), get their bond back but no reward.
 pub const MIN_SCORE_PPM: u64 = 150_000;
 /// Two scores closer than this count as "about equal" when grading jurors.
 pub const TIE_MARGIN_PPM: u64 = 50_000;
@@ -72,15 +74,22 @@ pub const TIE_MARGIN_PPM: u64 = 50_000;
 /// below `BAD_AGREEMENT_PPM` they lose Soul. (Voting "=" on everything scores 50%: no reward.)
 pub const GOOD_AGREEMENT_PPM: u64 = 600_000;
 pub const BAD_AGREEMENT_PPM: u64 = 400_000;
-/// Soul for a claim at a perfect score (scaled by its score, and by its rank among its claimant's
-/// claims in the Séance: [`CLAIM_RANK_SHIFT`]).
+/// Soul for a claim at a perfect score (scaled by its claimant's pooled rate in the Séance, and by
+/// its rank among the claimant's claims there: [`CLAIM_RANK_SHIFT`]).
 pub const CLAIM_SOUL: u64 = 10 * SOUL;
-/// Volume doesn't pay (audit xcut-economic-opus-1): within one Séance a person's accepted claims
-/// count best first, each a quarter (`>> 2`) of the one ranked above it, for its payout weight and
-/// for its Soul. All of them together count for less than 4/3 of the best one alone, so a pile of
-/// claims each judged worse than someone's solid PR can't add up past it: a win rate puts a claim
-/// that ties the field near half the best one's, which a bonus near 2× would match, and the Soul
-/// boost (up to 1.5×) and the luck of the best of many noisy scores come on top.
+/// Volume barely pays (audit xcut-economic-opus-1): within one Séance a person's claims are rated
+/// together, by one win rate pooled over all their comparisons (every claim the jury judged and
+/// didn't mark spam, those below the threshold too), never by the best of them: each claim's own
+/// rate is a noisy estimate from a handful of comparisons, and the best of k noisy rates grows
+/// with k (round 3 paid it: with honest jurors who pick a side between two weak PRs, 16 weak
+/// PRs out-earned a solid one in 40 of 40 draws), while a pooled rate only gets steadier. The
+/// person's accepted claims then count heaviest repo first, each a quarter (`>> 2`) of the one
+/// ranked above it, for payout weight and for Soul, so all of them together count for less than
+/// 4/3 of one claim at the person's rate: in expectation, k claims of one quality earn at most
+/// 4/3 of what one does. A claim that ties a weak field and loses to a solid PR rates under half
+/// of it, so even with the full Soul boost (1.5×) against a newcomer's, 4/3 × ½ × 1.5 = 1: a
+/// pile of weak claims stays below one solid PR on average (a lucky draw that rates them over
+/// half overall can still edge past it).
 pub const CLAIM_RANK_SHIFT: u32 = 2;
 pub const JUROR_GOOD_SOUL: u64 = SOUL;
 pub const JUROR_BAD_SOUL: u64 = 2 * SOUL;
@@ -513,7 +522,7 @@ impl Rng {
     }
 }
 
-/// What a claim's `weight` counts for at `rank` (0 = its claimant's best in the Séance):
+/// What a claim's `weight` counts for at `rank` (0 = its claimant's first in the Séance):
 /// `weight / 4^rank` ([`CLAIM_RANK_SHIFT`]), 0 once the shift passes the width.
 fn ranked(weight: u128, rank: usize) -> u128 {
     u32::try_from(rank).ok().and_then(|r| r.checked_mul(CLAIM_RANK_SHIFT)).and_then(|sh| weight.checked_shr(sh)).unwrap_or(0)
@@ -1513,12 +1522,31 @@ impl State {
             let f = flags.get(c).copied().unwrap_or(0);
             f >= SPAM_MIN_FLAGS && 2 * f > seen.get(c).copied().unwrap_or(0)
         };
+        // Each person's win rate, pooled over every comparison of every claim of theirs the jury
+        // judged and didn't mark spam (audit xcut-economic-opus-1, round 4): a person's claims are
+        // rated together, never by the best of them. Each claim's score is a win rate over a
+        // handful of comparisons, so the best of k claims of the same quality scores higher the
+        // more there are; the pooled rate doesn't (more claims only make it steadier), and the
+        // claims below the threshold count in it too, so nothing is selected.
+        // Kept by claim: each live claim maps to its claimant's rate.
+        let claim_rate: BTreeMap<u64, u64> = {
+            let mut pooled: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
+            for c in live.iter().filter(|c| !spam_verdict(c)) {
+                if let Some(n) = comps.get(c) {
+                    let p = pooled.entry(self.poc.claims[c].claimant.as_str()).or_default();
+                    p.0 += wins2.get(c).copied().unwrap_or(0);
+                    p.1 += n;
+                }
+            }
+            live.iter().filter_map(|c| pooled.get(self.poc.claims[c].claimant.as_str()).map(|(w, n)| (*c, w * PPM / (2 * n)))).collect()
+        };
+        let rate_of = |c: &u64| claim_rate.get(c).copied().unwrap_or(0);
         // Each claim's rank among its claimant's accepted claims, best score first (ties by id):
-        // its Soul counts `>> CLAIM_RANK_SHIFT` per rank (audit xcut-economic-opus-1).
+        // its Soul is the pooled rate's, counting `>> CLAIM_RANK_SHIFT` per rank.
         let soul_rank: BTreeMap<u64, usize> = {
             let mut by_person: BTreeMap<&str, Vec<(u64, u64)>> = BTreeMap::new();
             for c in &live {
-                if let Some(sc) = score.get(c).copied().filter(|sc| *sc >= MIN_SCORE_PPM && !spam_verdict(c)) {
+                if let Some(sc) = score.get(c).copied().filter(|sc| *sc >= MIN_SCORE_PPM && rate_of(c) >= MIN_SCORE_PPM && !spam_verdict(c)) {
                     by_person.entry(self.poc.claims[c].claimant.as_str()).or_default().push((sc, *c));
                 }
             }
@@ -1556,10 +1584,14 @@ impl State {
                 self.settle_bond(&mut j, *c, true);
                 self.set_status(&mut j, *c, ClaimStatus::Scored, height, Some("scored below the reward threshold".into()));
                 results.below_threshold += 1;
+            } else if rate_of(c) < MIN_SCORE_PPM {
+                self.settle_bond(&mut j, *c, true);
+                self.set_status(&mut j, *c, ClaimStatus::Scored, height, Some("its claimant's claims in this Séance together scored below the reward threshold".into()));
+                results.below_threshold += 1;
             } else {
                 self.settle_bond(&mut j, *c, true);
                 self.set_status(&mut j, *c, ClaimStatus::Scored, height, None);
-                soul_changes.push((claimant, (ranked(CLAIM_SOUL as u128 * sc as u128, soul_rank[c]) / PPM as u128) as i64, Some(*c)));
+                soul_changes.push((claimant, (ranked(CLAIM_SOUL as u128 * rate_of(c) as u128, soul_rank[c]) / PPM as u128) as i64, Some(*c)));
                 accepted.push(*c);
                 results.accepted += 1;
             }
@@ -1610,10 +1642,11 @@ impl State {
             soul_changes.push((juror.clone(), delta, None));
             seat_updates.push((juror.clone(), Some(agreement), delta));
         }
-        // Rewards: jurors by agreement; claims by score × repo weight, per person the best claim in
-        // full and each further one a quarter of the one ranked above it (`ranked`: together under
-        // 4/3 of the best, so volume doesn't pay: audit xcut-economic-opus-1), boosted up to 1.5×
-        // by the person's Soul. A person is the claimant account (audit xcut-economic-opus-3): a
+        // Rewards: jurors by agreement; claims by the claimant's pooled rate × repo weight, per
+        // person the claim in the heaviest repo in full and each further one a quarter of the one
+        // ranked above it (`ranked`: together under 4/3 of one claim at the person's rate, so
+        // volume adds at most a third: audit xcut-economic-opus-1), boosted up to 1.5× by the
+        // person's Soul. A person is the claimant account (audit xcut-economic-opus-3): a
         // sponsor's Familiars claim as the sponsor, and every handle an account linked counts
         // together (each handle credits one account, `Poc::handles`).
         let juror_budget = if juror_weights.is_empty() { 0 } else { bps(s.budget, JUROR_SHARE_BPS) };
@@ -1621,11 +1654,12 @@ impl State {
         let mut raw: BTreeMap<String, Vec<(u64, u128)>> = BTreeMap::new();
         for c in &accepted {
             let cl = &self.poc.claims[c];
-            let w = self.poc.repos.get(&cl.repo).copied().unwrap_or(0) as u128 * score[c] as u128;
+            let w = self.poc.repos.get(&cl.repo).copied().unwrap_or(0) as u128 * rate_of(c) as u128;
             raw.entry(cl.claimant.clone()).or_default().push((*c, w));
         }
         for cs in raw.values_mut() {
-            cs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            // Heaviest first; among equal weights (one repo), the better-scored claim ranks first.
+            cs.sort_by(|a, b| b.1.cmp(&a.1).then(score[&b.0].cmp(&score[&a.0])).then(a.0.cmp(&b.0)));
             for (rank, (_, w)) in cs.iter_mut().enumerate() {
                 *w = ranked(*w, rank);
             }
@@ -1724,7 +1758,7 @@ mod tests {
         assert_eq!((ranked(1_000, 0), ranked(1_000, 1), ranked(1_000, 2)), (1_000, 250, 62));
         assert_eq!((ranked(u128::MAX, 63), ranked(u128::MAX, 64), ranked(u128::MAX, usize::MAX)), (u128::MAX >> 126, 0, 0));
         let w = 100 * PPM as u128;
-        assert!((0..MAX_SEANCE_CLAIMS).map(|r| ranked(w, r)).sum::<u128>() * 3 < 4 * w, "all of them under 4/3 of the best");
+        assert!((0..MAX_SEANCE_CLAIMS).map(|r| ranked(w, r)).sum::<u128>() * 3 < 4 * w, "all of them under 4/3 of the first");
     }
 
     #[test]
@@ -2780,12 +2814,167 @@ mod scenarios {
         out
     }
 
+    /// The round-3 R1 reviewer's model (audit xcut-economic-opus-1): a Séance of one farmer's
+    /// `small` weak PRs, one solid PR by someone else, and `peers` other people's PRs as weak as
+    /// the farmer's, judged by `jurors` honest jurors. Each puts the solid PR above every other,
+    /// but doesn't call weak against weak a tie: each juror has a fixed view of each such pair
+    /// (from `salt`: a third a tie, a third each way), so the farmer's claims are no better than
+    /// the peers' on average, yet each one's win rate is noisy. For each salt the jurors' pairs
+    /// are drawn again too (as `open_seance` draws them). Returns, per salt, the farmer's payout
+    /// and Soul, then the solid contributor's.
+    fn noisy_field(tag: &str, jurors: u8, peers: u8, small: u64, farmer_soul: u64, solid_soul: u64, salts: u64) -> Vec<[u64; 4]> {
+        let mut t = setup(tag);
+        t.admin(Action::SetRepo { repo: "jackdishman/blockula".into(), weight: 10 }).unwrap();
+        for i in 0..jurors {
+            let j = k(40 + i);
+            t.c.faucet(&j.address(), 100 * DROPS_PER_FANG).unwrap();
+            t.c.produce_block().unwrap();
+            t.grant(&j, 10);
+            t.tx(&j, Action::JoinJury { bond: JUROR_BOND }).unwrap();
+        }
+        t.tx(&k(9), Action::FundPool { amount: 80 * DROPS_PER_FANG }).unwrap();
+        let (farmer, solid) = (k(5), k(6));
+        t.c.faucet(&farmer.address(), 500 * DROPS_PER_FANG).unwrap();
+        t.c.produce_block().unwrap();
+        let mut left = farmer_soul;
+        while left > 0 {
+            t.grant(&farmer, left.min(100));
+            left -= left.min(100);
+        }
+        t.grant(&solid, solid_soul);
+        t.link(&farmer, "volume");
+        t.link(&solid, "solid");
+        let weak: Vec<u64> = (1..=small).map(|pr| t.claim(&farmer, pr).unwrap()).collect();
+        let big = t.claim(&solid, 1_000).unwrap();
+        let mut others = vec![];
+        for i in 0..peers {
+            let who = k(20 + i);
+            t.c.faucet(&who.address(), 100 * DROPS_PER_FANG).unwrap();
+            t.c.produce_block().unwrap();
+            t.grant(&who, 1);
+            t.link(&who, &format!("peer{i}"));
+            others.push(t.claim(&who, 2_000 + i as u64).unwrap());
+        }
+        t.attest_all(&[weak.as_slice(), &[big], &others].concat());
+        let sid = t.wait_for_seance();
+        assert_eq!(t.c.state.poc.seances[&sid].jurors.len(), jurors as usize);
+        let claims: Vec<(u64, String)> = t.c.state.poc.seances[&sid].claims.iter().map(|c| (*c, t.c.state.poc.claims[c].claimant.clone())).collect();
+        let mut out = vec![];
+        for salt in 0..salts {
+            let mut st = t.c.state.clone();
+            let seed = format!("{tag}-{salt}");
+            for (juror, seat) in st.poc.seances.get_mut(&sid).unwrap().jurors.iter_mut() {
+                let mut pairs = vec![];
+                for (i, (a, who)) in claims.iter().enumerate() {
+                    pairs.extend(claims[i + 1..].iter().filter(|(_, other)| other != who).map(|(b, _)| [*a, *b]));
+                }
+                Rng::new(&seed, juror.as_bytes()).shuffle(&mut pairs);
+                pairs.truncate(PAIRS_PER_JUROR);
+                let view = |a: u64, b: u64| {
+                    let (lo, hi) = (a.min(b), a.max(b));
+                    let winner = match Rng::new(&seed, &[juror.as_bytes(), &lo.to_le_bytes(), &hi.to_le_bytes()].concat()).below(3) {
+                        0 => return '=',
+                        1 => lo,
+                        _ => hi,
+                    };
+                    if winner == a { 'a' } else { 'b' }
+                };
+                seat.votes = Some(pairs.iter().map(|[a, b]| if *a == big { 'a' } else if *b == big { 'b' } else { view(*a, *b) }).collect());
+                seat.pairs = pairs;
+            }
+            st.close_seance(sid, t.h());
+            st.check_invariants().unwrap();
+            let ((fp, fs), (sp, ss)) = (paid(&st, &farmer), paid(&st, &solid));
+            out.push([fp, fs, sp, ss]);
+        }
+        std::fs::remove_dir_all(&t.home).ok();
+        out
+    }
+
+    /// Audit xcut-economic-opus-1, round 4 (the round-3 R1 reviewer's bypass): with honest jurors
+    /// who prefer one weak PR to another rather than calling it a tie, each weak claim's win rate
+    /// is noisy, and paying a person's best claim paid the best of k noisy rates, which grows with
+    /// k: 16 weak PRs out-earned the solid one in 39 of 40 of the reviewer's runs (1.27× on
+    /// average), and in 40 of 40 of this model's (1.37×), 1.70× what one weak claim earned. A
+    /// person's claims now share one win rate pooled over
+    /// all their comparisons, so more claims don't raise it, and the ranks add at most a third:
+    /// over 40 draws, k weak claims earn at most 4/3 of what one does (FANG and Soul), and the
+    /// farmer's 16 with the full Soul boost stay below one solid PR by a newcomer.
+    #[test]
+    fn volume_doesnt_pay_against_honest_split_votes() {
+        const SALTS: u64 = 40;
+        let mean = |v: &[[u64; 4]], i: usize| v.iter().map(|x| x[i] as u128).sum::<u128>() / v.len() as u128;
+        for (tag, jurors, peers, many, farmer_soul, solid_soul) in [("noisy7", 7u8, 7u8, 16u64, 170u64, 1u64), ("noisy3", 3, 3, 8, 60, 1), ("noisy3-even", 3, 3, 8, 60, 60)] {
+            let one = noisy_field(&format!("{tag}-1"), jurors, peers, 1, farmer_soul, solid_soul, SALTS);
+            let lots = noisy_field(&format!("{tag}-k"), jurors, peers, many, farmer_soul, solid_soul, SALTS);
+            let beats = |v: &[[u64; 4]]| v.iter().filter(|x| x[0] > x[2]).count();
+            eprintln!("{tag}: one claim {} (Soul {}), {many} claims {} (Soul {}), solid {} (Soul {}); one beat the solid PR in {}/{SALTS}, {many} in {}/{SALTS}", mean(&one, 0), mean(&one, 1), mean(&lots, 0), mean(&lots, 1), mean(&lots, 2), mean(&lots, 3), beats(&one), beats(&lots));
+            assert!(3 * mean(&lots, 0) <= 4 * mean(&one, 0), "{tag}: {many} claims earned {} on average, one claim {}", mean(&lots, 0), mean(&one, 0));
+            assert!(3 * mean(&lots, 1) <= 4 * mean(&one, 1), "{tag}: Soul {} vs {}", mean(&lots, 1), mean(&one, 1));
+            assert!(mean(&lots, 0) < mean(&lots, 2), "{tag}: {many} weak PRs earned {} on average, the solid one {}", mean(&lots, 0), mean(&lots, 2));
+            assert!(mean(&lots, 1) < mean(&lots, 3), "{tag}: Soul {} vs {}", mean(&lots, 1), mean(&lots, 3));
+            // Run by run, the pile beats the solid PR only where the draw rates the farmer's weak
+            // claims above half overall (at the full boost, 4/3 × 1.5 × ½ = 1): 3 draws of 40 at
+            // the extreme, against all 40 under the best-claim rule.
+            assert!(beats(&lots) <= SALTS as usize / 10, "{tag}: {many} weak PRs beat the solid one in {}/{SALTS} draws", beats(&lots));
+        }
+    }
+
+    /// Audit xcut-economic-opus-1, round 4: a person's claims are rated together. The farmer's 4
+    /// claims: one as good as a peer's (it ties the peer, loses to the solid PR, and scores over
+    /// the threshold on its own), three that lose every comparison. Paying the best claim on its
+    /// own score let a farmer throw many claims and be paid for the lucky one; the pooled rate
+    /// counts the three too, so the four together fall below the threshold and earn nothing. The
+    /// same claim alone is paid.
+    #[test]
+    fn a_persons_claims_are_rated_together() {
+        for alone in [false, true] {
+            let mut t = setup(if alone { "together1" } else { "together4" });
+            t.admin(Action::SetRepo { repo: "jackdishman/blockula".into(), weight: 10 }).unwrap();
+            for j in [k(1), k(2), k(3)] {
+                t.grant(&j, 10);
+                t.tx(&j, Action::JoinJury { bond: JUROR_BOND }).unwrap();
+            }
+            t.tx(&k(9), Action::FundPool { amount: 80 * DROPS_PER_FANG }).unwrap();
+            let (farmer, solid, peer) = (k(5), k(6), k(7));
+            t.grant(&farmer, 60);
+            t.grant(&solid, 1);
+            t.grant(&peer, 1);
+            t.link(&farmer, "volume");
+            t.link(&solid, "solid");
+            t.link(&peer, "peer");
+            let mine: Vec<u64> = (1..=if alone { 1 } else { 4 }).map(|pr| t.claim(&farmer, pr).unwrap()).collect();
+            let (big, theirs) = (t.claim(&solid, 100).unwrap(), t.claim(&peer, 200).unwrap());
+            t.attest_all(&[mine.as_slice(), &[big, theirs]].concat());
+            let sid = t.wait_for_seance();
+            let mut st = t.c.state.clone();
+            judge(&mut st, sid, |c| if c == big { 3 } else if c == theirs || c == mine[0] { 2 } else { 0 });
+            st.close_seance(sid, t.h());
+            st.check_invariants().unwrap();
+            let lucky = &st.poc.claims[&mine[0]];
+            assert!(lucky.score_ppm.unwrap() >= MIN_SCORE_PPM, "on its own it's over the threshold: {:?}", lucky.score_ppm);
+            assert!(mine[1..].iter().all(|c| st.poc.claims[c].score_ppm == Some(0)));
+            assert!(paid(&st, &solid).0 > 0 && paid(&st, &peer).0 > 0);
+            if alone {
+                assert!(paid(&st, &farmer).0 > 0 && lucky.reason.is_none());
+            } else {
+                assert_eq!(paid(&st, &farmer), (0, 0), "the farmer's claims together scored under the threshold");
+                assert_eq!(lucky.status, ClaimStatus::Scored);
+                assert!(lucky.reason.as_deref().unwrap().contains("together scored below the reward threshold"), "{:?}", lucky.reason);
+                assert_eq!(lucky.bond, 0, "its bond came back");
+            }
+            std::fs::remove_dir_all(&t.home).ok();
+        }
+    }
+
     /// Audit xcut-economic-opus-1, round 3 (the R1 reviewer's bypass): with other people's weak
     /// PRs in the field, the farmer's weak claims tie theirs and score 25–50%, over the threshold.
     /// Under a square root of their sum, 8 of them earned 1.82× the solid PR with one weak peer
-    /// and 2.16× with three (and 2–3× the Soul). Now a person's claims count best first, each a
-    /// quarter of the one above, so 8 (or 16) weak PRs never beat one solid PR, in FANG or in
-    /// Soul, even when the farmer has the full Soul boost and the solid contributor almost none.
+    /// and 2.16× with three (and 2–3× the Soul). Now a person's claims count one after another,
+    /// each a quarter of the one above, at the person's pooled rate, so when the jury calls weak
+    /// against weak a tie, 8 (or 16) weak PRs never beat one solid PR, in FANG or in Soul, even
+    /// when the farmer has the full Soul boost and the solid contributor almost none. (When
+    /// jurors pick sides instead: `volume_doesnt_pay_against_honest_split_votes`.)
     #[test]
     fn eight_weak_prs_never_beat_one_solid_one_among_weak_peers() {
         for (tag, peers, small, farmer_soul, solid_soul) in [("weak1", 1, 8, 60, 1), ("weak3", 3, 8, 60, 1), ("weak3-even", 3, 8, 60, 60), ("weak7-boost", 7, 16, 170, 1)] {
@@ -2794,14 +2983,14 @@ mod scenarios {
             assert!((MIN_SCORE_PPM..=PPM / 2).contains(&best), "{tag}: the weak claims are accepted, and none beats the field: {scores:?}");
             assert!(sp > 0 && fp < sp, "{tag}: {small} weak PRs earned {fp}, the solid one {sp} (scores {scores:?})");
             assert!(fs < ss, "{tag}: Soul {fs} vs {ss}");
-            // Their Soul together is under 4/3 of what the best one alone earns.
+            // Their Soul together is under 4/3 of what the best one alone would earn.
             assert!(3 * fs as u128 <= 4 * (CLAIM_SOUL as u128 * best as u128 / PPM as u128), "{tag}: Soul {fs}, best claim {best}");
         }
     }
 
     /// Audit xcut-economic-opus-3: a person is the sponsor account, so one account that relinks a
-    /// second GitHub handle between claims has all of them ranked together (best first, each next
-    /// a quarter), and earns what one handle with the same claims would.
+    /// second GitHub handle between claims has all of them rated and ranked together (one pooled
+    /// rate, each next a quarter), and earns what one handle with the same claims would.
     #[test]
     fn relinking_a_second_handle_is_still_one_person() {
         let mut t = setup("relink");

@@ -14,7 +14,7 @@ Humans and agents are both welcome. Agents contribute as **Familiars** of a huma
 Merged PRs to repos in the pool (Blockula's own is first) can earn testnet FANG even without a Hunt:
 1. Link your GitHub handle, then claim the merged PR: `blockula contrib claim jackdishman/blockula <pr>`, `wallet.submitClaim(...)`, or the MCP's `submit_contribution`. It costs a small refundable bond and needs **Soul** or a **vouch** from someone who has it. (New here? Ask a contributor with Soul to vouch for you.)
 2. Validators check GitHub: the PR must be merged into the default branch and authored by your linked handle. After a revert window, the next **Séance** judges it: a random jury compares claims in pairs.
-3. Your claims are scored against other people's and count best first: your best in full, each next one in the same Séance a quarter of the one before (all of them together less than 4/3 of your best), so one solid PR beats a pile of tiny ones, and claims a jury marks as spam lose their bond and your Soul. Rewards vest over ~90 days and can be clawed back if the PR is reverted.
+3. Your claims are scored against other people's, and all your claims in one Séance share one win rate, pooled over all their comparisons: the first counts in full at that rate, each next one a quarter of the one before (all of them together less than 4/3 of one), so one solid PR beats a pile of tiny ones, weak claims pull your rate down, and claims a jury marks as spam lose their bond and your Soul. Rewards vest over ~90 days and can be clawed back if the PR is reverted.
 
 People with Soul can serve on juries (`blockula contrib join-jury`), which earns Soul and a share of each Séance's payout when you judge in line with the outcome.
 
@@ -22,7 +22,7 @@ People with Soul can serve on juries (`blockula contrib join-jury`), which earns
 - One focused change, with tests. `cargo test --manifest-path node/Cargo.toml` and `bash scripts/local-testnet.sh` pass (CI runs both).
 - The Rust and TypeScript transaction encodings stay byte-identical (`node/src/types.rs` ⇄ `sdk-ts/src/tx.ts`).
 - Explain what changed and how you verified it.
-- Volume doesn't pay: a sponsor's claims in a Séance count best first, each after the best a quarter of the one before, and rewards vest with clawback. One solid PR beats ten small ones.
+- Volume barely pays: a sponsor's claims in a Séance share one pooled win rate, each after the first counts a quarter of the one before (so in expectation more claims of the same quality add at most a third), and rewards vest with clawback. One solid PR beats ten small ones.
 
 ## How PRs merge
 - Everything reaches `main` through a PR: a maintainer's approval, both CI jobs green, review threads resolved, and the branch up to date with `main`. Pushing new commits after an approval needs a fresh one.

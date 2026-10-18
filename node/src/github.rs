@@ -356,7 +356,7 @@ pub fn parse_files(v: &Value) -> Vec<FileDiff> {
 }
 
 /// Lines a patch adds and removes (trimmed; blank ones don't count), by content.
-fn changed_lines(patch: &str) -> (BTreeMap<&str, usize>, BTreeMap<&str, usize>) {
+fn changed_lines(patch: &str) -> Lines<'_> {
     let (mut added, mut removed) = (BTreeMap::new(), BTreeMap::new());
     for line in patch.lines() {
         let (side, rest) = match line.as_bytes().first() {
@@ -398,53 +398,72 @@ fn restores(f: &FileDiff, revert: &[FileDiff], base: &BTreeMap<String, String>) 
     }
 }
 
-/// Whether the diff `revert` undoes the diff `original` (audit F20: a revert must actually revert
-/// the claim's change, not just say so): more than half of the lines `original` added and removed,
-/// file by file, are removed and added back by `revert`. When `original` has no lines to compare
-/// (only binary files, or diffs too large for GitHub to show), by its files instead: `revert`
-/// brings more than half of them back to their pre-PR state ([`restores`]; audit
-/// review-fix-poc-3 and review-r2-poc-1). `None` when there is nothing to judge: `original` lists
-/// no files, or none whose pre-PR state is known.
-pub fn undoes(original: &[FileDiff], revert: &[FileDiff], base: &BTreeMap<String, String>) -> Option<bool> {
-    if original.is_empty() {
-        return None;
+/// Lines a patch adds and removes, by content ([`changed_lines`]).
+type Lines<'a> = (BTreeMap<&'a str, usize>, BTreeMap<&'a str, usize>);
+
+/// Lines a file's patch changes, if any: `None` for a file with no lines to compare (binary, a
+/// diff too large for GitHub to show, a pure rename or mode change).
+fn lines_of(f: &FileDiff) -> Option<Lines<'_>> {
+    f.patch.as_deref().map(changed_lines).filter(|(added, removed)| !added.is_empty() || !removed.is_empty())
+}
+
+/// Whether the diff `revert` brings `original`'s file `f`, which has no lines to compare, back to
+/// its pre-PR state ([`restores`]), when that can be told: a file the PR added, copied or removed
+/// always can; one it changed or renamed when its blob at the PR's base is known (`base`,
+/// [`base_blobs`]), or when `revert` doesn't touch it at all (then it can't have brought it back).
+/// `None`: `revert` changes it, to a blob that can't be compared.
+fn restored(f: &FileDiff, revert: &[FileDiff], base: &BTreeMap<String, String>) -> Option<bool> {
+    match f.status.as_str() {
+        "added" | "copied" | "removed" => Some(restores(f, revert, base)),
+        "modified" | "changed" | "renamed" if base.contains_key(f.before()) => Some(restores(f, revert, base)),
+        "modified" | "changed" | "renamed" => {
+            let touched = revert.iter().any(|r| [f.filename.as_str(), f.before()].contains(&r.filename.as_str()) || r.previous_filename.as_deref().is_some_and(|p| [f.filename.as_str(), f.before()].contains(&p)));
+            (!touched).then_some(false)
+        }
+        _ => None,
     }
+}
+
+/// Whether the diff `revert` undoes the diff `original` (audit F20: a revert must actually revert
+/// the claim's change, not just say so), judged on both kinds of file the PR has:
+/// * its lines: more than half of the lines `original` added and removed, file by file, are
+///   removed and added back by `revert`;
+/// * its files with no lines to compare (binary files, diffs too large for GitHub to show): more
+///   than half of those it can tell about are brought back to their pre-PR state ([`restored`];
+///   audit review-fix-poc-3, review-r2-poc-1). A file `revert` changes whose pre-PR blob GitHub
+///   didn't give ([`base_blobs`]) counts as neither restored nor not (audit review-r3-poc-1), so
+///   neither the PR's layout nor a listing's cap decides; one it leaves alone wasn't restored.
+///
+/// A PR with both needs both (audit review-r2-poc-1, round 4: undoing the one README line of a PR
+/// that also added 20 icons isn't reverting it). `None` when there is nothing to judge: `original`
+/// lists no files, or none with lines and none whose restoring can be told.
+pub fn undoes(original: &[FileDiff], revert: &[FileDiff], base: &BTreeMap<String, String>) -> Option<bool> {
     let (mut matched, mut total) = (0usize, 0usize);
+    let (mut known, mut brought) = (0usize, 0usize);
     for f in original {
-        let Some(patch) = &f.patch else { continue };
-        let (added, removed) = changed_lines(patch);
+        let Some((added, removed)) = lines_of(f) else {
+            if let Some(back) = restored(f, revert, base) {
+                known += 1;
+                brought += usize::from(back);
+            }
+            continue;
+        };
         total += added.values().sum::<usize>() + removed.values().sum::<usize>();
         let Some(r) = revert.iter().find(|r| r.filename == f.filename).and_then(|r| r.patch.as_deref()) else { continue };
         let (r_added, r_removed) = changed_lines(r);
         let overlap = |a: &BTreeMap<&str, usize>, b: &BTreeMap<&str, usize>| a.iter().map(|(l, n)| (*n).min(b.get(l).copied().unwrap_or(0))).sum::<usize>();
         matched += overlap(&added, &r_removed) + overlap(&removed, &r_added);
     }
-    if total > 0 {
-        return Some(2 * matched > total);
-    }
-    let known = original.iter().filter(|f| matches!(f.status.as_str(), "added" | "copied" | "removed") || base.contains_key(f.before())).count();
-    if known == 0 {
+    if total == 0 && known == 0 {
         return None;
     }
-    let restored = original.iter().filter(|f| restores(f, revert, base)).count();
-    Some(2 * restored > original.len())
+    Some((total == 0 || 2 * matched > total) && (known == 0 || 2 * brought > known))
 }
 
-/// Whether any file of `original` has lines [`undoes`] compares (then those decide).
-fn has_lines(original: &[FileDiff]) -> bool {
-    original.iter().filter_map(|f| f.patch.as_deref()).any(|p| {
-        let (added, removed) = changed_lines(p);
-        !added.is_empty() || !removed.is_empty()
-    })
-}
-
-/// The patchless files of `original` whose pre-PR blob a revert must bring back (changed or
-/// renamed ones), when it has no lines to compare at all; their paths before the PR.
+/// The files of `original` with no lines to compare whose pre-PR blob a revert must bring back
+/// (changed or renamed ones): their paths before the PR.
 fn needs_base(original: &[FileDiff]) -> Vec<&str> {
-    if has_lines(original) {
-        return vec![];
-    }
-    original.iter().filter(|f| matches!(f.status.as_str(), "modified" | "changed" | "renamed")).map(FileDiff::before).collect()
+    original.iter().filter(|f| lines_of(f).is_none() && matches!(f.status.as_str(), "modified" | "changed" | "renamed")).map(FileDiff::before).collect()
 }
 
 /// Most pages of commits since the merge a revert check reads (100 each), most revert-looking
@@ -459,9 +478,10 @@ pub const REVERT_PATH_COMMITS: usize = 15;
 pub const REVERT_FILE_PAGES: u32 = 3;
 pub const REVERT_DIFF_FETCHES: usize = 10;
 pub const REVERT_DIFF_CHECKS: usize = 5;
-/// Most directories whose listing at the PR's base a check reads, for the pre-PR blobs of a
-/// binary-only PR's changed files ([`restores`]).
-pub const REVERT_BASE_DIRS: usize = 3;
+/// Most trees a check reads one level at a time for the pre-PR blobs of a PR's changed files with
+/// no lines to compare ([`restores`]), when GitHub truncates the base's whole tree or it's over
+/// the size cap ([`base_blobs`]).
+pub const REVERT_BASE_TREES: usize = 16;
 /// Paths longer than this (percent-encoded) aren't followed or looked up: GitHub may refuse such a
 /// URL, and a refusal would read as "unreachable" on every retry.
 pub const REVERT_MAX_PATH: usize = 1_024;
@@ -538,7 +558,9 @@ fn followed_paths(files: &[FileDiff]) -> Vec<&str> {
 ///
 /// Revert PRs are found from the default branch alone, which only maintainers write: commits
 /// that look like a revert landing ([`revert_pr_candidates`]), and the PRs of the commits since
-/// the merge that touch the claim's files (`commits?path=`, then `commits/{sha}/pulls`). Not
+/// the merge that touch the claim's files (`commits?path=`, then `commits/{sha}/pulls`); those
+/// commits are candidates themselves when they state the revert in git's words (a `git revert`
+/// pushed with no PR, past the commit walk: audit review-r3-poc-2). Not
 /// from the list of recently updated closed PRs, which anyone can flood by opening and closing
 /// PRs until a revert falls off it (audit F55). The claim PR's own commits (which land on the
 /// branch with it, and may carry any date) are left out of all of that: those GitHub lists for
@@ -668,33 +690,71 @@ fn merge_base(merge: &str, ancestors: &BTreeMap<&str, &Commit>) -> Option<String
     None
 }
 
-/// The blobs `paths` had at commit `base` (path → blob sha): from the listings of their
-/// directories (`GET /repos/{repo}/contents/{dir}?ref=`, which name every file's blob whatever its
-/// size), at most [`REVERT_BASE_DIRS`] of them. A path not found isn't in the map.
+/// A tree's entries (`GET /repos/{repo}/git/trees/{sha}`): path → (type, sha).
+type Tree = BTreeMap<String, (String, String)>;
+
+/// A tree's entries, those without a 40-hex sha skipped.
+fn tree_entries(v: &Value) -> Tree {
+    let list = v["tree"].as_array().map(Vec::as_slice).unwrap_or_default();
+    list.iter()
+        .filter_map(|e| Some((e["path"].as_str()?.to_string(), (e["type"].as_str()?.to_string(), e["sha"].as_str().filter(|h| is_sha(h))?.to_ascii_lowercase()))))
+        .collect()
+}
+
+/// The blobs `paths` had at commit `base` (path → blob sha), from the base's whole tree
+/// (`GET /repos/{repo}/git/trees/{base}?recursive=1`: every file's blob, whatever its size or its
+/// directory's), one request however many files and directories the PR spans (audit
+/// review-r3-poc-1: reading at most 3 directories' listings, each capped at 1,000 entries, left
+/// a PR spread over 6 directories revert-proof). If GitHub truncates the tree (a repo of more than
+/// 100,000 entries) or it's over the size cap, the paths it doesn't name are looked up a tree
+/// level at a time from the base's root, in order, at most [`REVERT_BASE_TREES`] trees (each by
+/// sha, so no path goes into a URL). Every node asks the same requests. A path still not found
+/// isn't in the map: its file counts as neither restored nor not ([`undoes`]).
 async fn base_blobs<F, Fut>(get: &F, repo: &str, base: &str, paths: &[&str]) -> Result<BTreeMap<String, String>>
 where
     F: Fn(String) -> Fut,
     Fut: std::future::Future<Output = Result<Option<Value>>>,
 {
-    let mut dirs: Vec<&str> = vec![];
-    for p in paths {
-        let dir = p.rsplit_once('/').map_or("", |(d, _)| d);
-        if !dirs.contains(&dir) && query_value(dir).len() <= REVERT_MAX_PATH {
-            dirs.push(dir);
+    let wanted: std::collections::BTreeSet<&str> = paths.iter().copied().collect();
+    let mut out = BTreeMap::new();
+    if !is_sha(base) || wanted.is_empty() {
+        return Ok(out);
+    }
+    let blob = |found: Option<&(String, String)>| found.filter(|(kind, _)| kind == "blob").map(|(_, sha)| sha.clone());
+    if let Some(v) = get_or_none(get, format!("/repos/{repo}/git/trees/{base}?recursive=1")).await? {
+        let entries = tree_entries(&v);
+        out.extend(wanted.iter().filter_map(|p| Some((p.to_string(), blob(entries.get(*p))?))));
+        if v["truncated"].as_bool() == Some(false) {
+            return Ok(out);
         }
     }
-    let mut out = BTreeMap::new();
-    for dir in dirs.into_iter().take(REVERT_BASE_DIRS) {
-        let path = if dir.is_empty() { format!("/repos/{repo}/contents?ref={base}") } else { format!("/repos/{repo}/contents/{}?ref={base}", query_value(dir)) };
-        let Some(v) = get_or_none(get, path).await? else { continue };
-        fn file(e: &Value) -> Option<(&str, &str)> {
-            if e["type"] != "file" {
-                return None;
+    // A directory's entries by its path ("" is the root), as read (`None`: GitHub had none).
+    let mut levels: BTreeMap<String, Option<Tree>> = BTreeMap::new();
+    let mut read = 0usize;
+    let missing: Vec<&str> = wanted.iter().copied().filter(|p| !out.contains_key(*p)).collect();
+    for path in missing {
+        let (mut dir, mut tree) = (String::new(), base.to_string());
+        let parts: Vec<&str> = path.split('/').collect();
+        for (i, part) in parts.iter().enumerate() {
+            if !levels.contains_key(&dir) {
+                if read >= REVERT_BASE_TREES {
+                    break;
+                }
+                read += 1;
+                let level = get_or_none(get, format!("/repos/{repo}/git/trees/{tree}")).await?.map(|v| tree_entries(&v));
+                levels.insert(dir.clone(), level);
             }
-            Some((e["path"].as_str()?, e["sha"].as_str().filter(|h| is_sha(h))?))
-        }
-        for (path, sha) in v.as_array().map(Vec::as_slice).unwrap_or_default().iter().filter_map(file).filter(|(p, _)| paths.contains(p)) {
-            out.insert(path.to_string(), sha.to_ascii_lowercase());
+            let Some(entry) = levels[&dir].as_ref().and_then(|l| l.get(*part)) else { break };
+            if i + 1 == parts.len() {
+                if let Some(sha) = blob(Some(entry)) {
+                    out.insert(path.to_string(), sha);
+                }
+            } else if entry.0 == "tree" {
+                tree = entry.1.clone();
+                dir = if dir.is_empty() { part.to_string() } else { format!("{dir}/{part}") };
+            } else {
+                break;
+            }
         }
     }
     Ok(out)
@@ -747,32 +807,41 @@ where
         }
     };
     // The commits since the merge that touch the PR's files, oldest first, and their PRs.
-    let mut touching: Vec<String> = vec![];
+    let mut touching: Vec<Commit> = vec![];
     for path in followed_paths(&original) {
         let listed = pages(&get, &format!("/repos/{repo}/commits?path={}&since={since}", query_value(path)), 1, parse_commits, |_| false).await?;
         for c in listed.into_iter().rev() {
-            if !own.contains(c.sha.as_str()) && (!walk_only || in_walk.contains(&c.sha)) && !touching.contains(&c.sha) {
-                touching.push(c.sha);
+            if !own.contains(c.sha.as_str()) && (!walk_only || in_walk.contains(&c.sha)) && !touching.iter().any(|t| t.sha == c.sha) {
+                touching.push(c);
             }
         }
     }
-    for sha in touching.iter().take(REVERT_PATH_COMMITS) {
-        if let Some(v) = get_or_none(&get, format!("/repos/{repo}/commits/{sha}/pulls")).await? {
+    for c in touching.iter().take(REVERT_PATH_COMMITS) {
+        if let Some(v) = get_or_none(&get, format!("/repos/{repo}/commits/{}/pulls", c.sha)).await? {
             add(parse_pulls(&v), &mut pulls);
         }
     }
+    // A revert pushed straight to the branch (no PR to find it by) that the walk doesn't hold,
+    // because a merge of many later-dated commits pushed it out of the newest 1,000 (audit
+    // review-r3-poc-2), still shows in the files' histories: one that states the revert in git's
+    // words is a candidate too. The walk lists every commit it holds ahead of those it doesn't,
+    // so these come first, oldest first.
+    let walked: std::collections::BTreeSet<&str> = commits.iter().map(|c| c.sha.as_str()).collect();
+    let stated: Vec<Commit> = touching.iter().filter(|c| !walked.contains(c.sha.as_str()) && commit_states_revert_of(&c.message, &merge)).cloned().collect();
+    let mut branch = commits.clone();
+    branch.extend(stated.into_iter().rev());
     let known: Vec<u64> = pulls.iter().map(|p| p.number).collect();
     for n in revert_pr_candidates(&commits).into_iter().filter(|n| *n != pr && !known.contains(n)).take(REVERT_PR_FETCHES) {
         if let Some(p) = fetch_pr(n).await? {
             add(vec![p], &mut pulls);
         }
     }
-    let candidates = revert_candidates(repo, pr, merge_sha, &p.author, &commits, &pulls);
+    let candidates = revert_candidates(repo, pr, merge_sha, &p.author, &branch, &pulls);
     if original.is_empty() || candidates.is_empty() {
         return Ok(None);
     }
-    // A binary-only PR's changed files must get their pre-PR blobs back: read them at the commit
-    // it merged onto.
+    // The PR's changed files with no lines to compare must get their pre-PR blobs back: read them
+    // at the commit it merged onto.
     let wanted = needs_base(&original);
     let base = match (wanted.is_empty(), merge_base(&merge, &ancestors.iter().map(|c| (c.sha.as_str(), c)).collect())) {
         (false, Some(at)) => base_blobs(&get, repo, &at, &wanted).await?,
@@ -1457,8 +1526,8 @@ mod tests {
         assert_eq!(gh.find(42).await.unwrap().map(|r| (r.sha, r.by)), Some((c90.to_string(), Stated::Commit)));
         // #42 changed an existing icon: only its pre-PR blob coming back is a revert.
         let changed = vec![png("logo.png", "modified", "1b")];
-        let listing = json!([{ "type": "file", "name": "logo.png", "path": "assets/logo.png", "sha": "1a".repeat(20) }, { "type": "file", "name": "x.png", "path": "assets/x.png", "sha": "ee".repeat(20) }]);
-        let at_base = (format!("/repos/{repo}/contents/assets?ref={before}"), listing);
+        let tree = json!({ "sha": before, "truncated": false, "tree": [{ "path": "assets", "type": "tree", "sha": "ad".repeat(20) }, { "path": "assets/logo.png", "type": "blob", "sha": "1a".repeat(20) }, { "path": "assets/x.png", "type": "blob", "sha": "ee".repeat(20) }] });
+        let at_base = (format!("/repos/{repo}/git/trees/{before}?recursive=1"), tree);
         let gh = Mock::new(routes(changed.clone(), vec![png("logo.png", "modified", "1a")], vec![at_base.clone()]));
         assert_eq!(gh.find(42).await.unwrap().map(|r| r.sha), Some(c90.to_string()));
         assert!(Mock::new(routes(changed.clone(), vec![png("logo.png", "modified", "1c")], vec![at_base.clone()])).find(42).await.unwrap().is_none(), "another version isn't the old one");
@@ -1474,6 +1543,193 @@ mod tests {
         // A removed file comes back as the blob it was.
         let gone = [png("c.png", "removed", "cc")];
         assert_eq!((undoes(&gone, &[png("c.png", "added", "cc")], &BTreeMap::new()), undoes(&gone, &[png("c.png", "added", "cd")], &BTreeMap::new())), (Some(true), Some(false)));
+    }
+
+    /// Audit review-fix-poc-3 / review-r3-poc-1 (round 4): a binary-only claim PR (mallory's #42,
+    /// squash-merged) changes `logo.png` in each of `n` directories, and maintainer dave's GitHub
+    /// revert #77 gives every logo its pre-PR blob back. Pre-PR blobs came from at most 3
+    /// directory listings while every file counted, so from 6 directories on the revert was
+    /// never found. They now come from the base's whole tree, one request whatever the layout.
+    /// When GitHub truncates that tree, the rest is read a level at a time (at most
+    /// `REVERT_BASE_TREES` trees), and a file whose pre-PR blob is still unknown counts as
+    /// neither restored nor not: the revert of 40 directories is found from what's known, and
+    /// a change to other blobs still isn't one.
+    #[tokio::test]
+    async fn a_binary_pr_over_many_directories_is_found_reverted() {
+        let repo = "jackdishman/blockula";
+        let base = json!({ "ref": "main", "repo": { "full_name": repo, "default_branch": "main" } });
+        let (m77, before) = ("7777777777777777777777777777777777777777", "77aa88bb99cc00dd11ee22ff33aa44bb55cc66dd");
+        let blob = |i: usize, v: u8| format!("{:02x}{i:038x}", v);
+        let logo = |i: usize, status: &str, v: u8| FileDiff { filename: format!("d{i}/logo.png"), status: status.into(), sha: Some(blob(i, v)), ..Default::default() };
+        let pr77 = json!({ "number": 77, "state": "closed", "title": "Revert \"Refresh logos\"", "body": format!("Reverts {repo}#42"), "merged_at": "2026-10-14T10:00:00Z", "merge_commit_sha": m77, "user": { "login": "dave" }, "base": base });
+        // `listed`: the directories the recursive tree names before GitHub cuts it off (all of
+        // them: not truncated); `levels`: whether the one-level trees are there to read.
+        let routes = |n: usize, revert: Vec<FileDiff>, listed: usize, levels: bool| {
+            let squash = commit(MERGE, "Refresh logos (#42)", &[before]);
+            let walk = json!([commit(m77, "Revert \"Refresh logos\" (#77)\n\nReverts jackdishman/blockula#42", &[MERGE]), squash.clone()]);
+            let mut whole: Vec<Value> = vec![];
+            for i in 0..listed.min(n) {
+                whole.push(json!({ "path": format!("d{i}"), "type": "tree", "sha": blob(i, 0xd0) }));
+                whole.push(json!({ "path": format!("d{i}/logo.png"), "type": "blob", "sha": blob(i, 0x1a) }));
+            }
+            let mut r = vec![
+                (format!("/repos/{repo}/pulls/42"), claim_42("mallory")),
+                (format!("/repos/{repo}/pulls/42/files?per_page=100&page=1"), files_json(&(0..n).map(|i| logo(i, "modified", 0x1b)).collect::<Vec<_>>())),
+                (format!("/repos/{repo}/commits?sha={MERGE}&since={SINCE}&per_page=100&page=1"), json!([squash])),
+                (format!("/repos/{repo}/commits?since={SINCE}&per_page=100&page=1"), walk),
+                (format!("/repos/{repo}/pulls/77"), pr77.clone()),
+                (format!("/repos/{repo}/pulls/77/files?per_page=100&page=1"), files_json(&revert)),
+                (format!("/repos/{repo}/git/trees/{before}?recursive=1"), json!({ "sha": before, "truncated": listed < n, "tree": whole })),
+            ];
+            if levels {
+                let root: Vec<Value> = (0..n).map(|i| json!({ "path": format!("d{i}"), "type": "tree", "sha": blob(i, 0xd0) })).collect();
+                r.push((format!("/repos/{repo}/git/trees/{before}"), json!({ "sha": before, "truncated": false, "tree": root })));
+                r.extend((0..n).map(|i| (format!("/repos/{repo}/git/trees/{}", blob(i, 0xd0)), json!({ "sha": blob(i, 0xd0), "truncated": false, "tree": [{ "path": "logo.png", "type": "blob", "sha": blob(i, 0x1a) }] }))));
+            }
+            r
+        };
+        let back = |n: usize| (0..n).map(|i| logo(i, "modified", 0x1a)).collect::<Vec<_>>();
+        let trees = |gh: &Mock| gh.asked_count(|p| p.contains("/git/trees/"));
+        for n in [3, 6, 10, 40] {
+            let gh = Mock::new(routes(n, back(n), n, false));
+            assert_eq!(gh.find(42).await.unwrap().map(|r| (r.sha, r.by)), Some((m77.to_string(), Stated::Pr { number: 77, by_claimant: false })), "{n} directories");
+            assert_eq!(trees(&gh), 1, "one request for the whole tree");
+            // Another version of every logo isn't the old one.
+            let other: Vec<FileDiff> = (0..n).map(|i| logo(i, "modified", 0x1c)).collect();
+            assert_eq!(Mock::new(routes(n, other, n, false)).find(42).await.unwrap(), None, "{n} directories, other blobs");
+        }
+        // Truncated after 2 of 40 directories: the root and 15 directories are read a level at a
+        // time (16 trees), 17 logos are known, all 17 came back: the revert.
+        let gh = Mock::new(routes(40, back(40), 2, true));
+        assert_eq!(gh.find(42).await.unwrap().map(|r| r.sha), Some(m77.to_string()));
+        assert_eq!(trees(&gh), 1 + REVERT_BASE_TREES);
+        // Only some logos back: of the 17 known (the 2 listed, then the rest by path, in order),
+        // 8 restored isn't more than half; 9 is.
+        let mut rest: Vec<usize> = (2..40).collect();
+        rest.sort_by_key(|i| format!("d{i}/logo.png"));
+        let known: Vec<usize> = (0..2).chain(rest.into_iter().take(REVERT_BASE_TREES - 1)).collect();
+        for (restored, found) in [(8, false), (9, true)] {
+            let mut part: Vec<FileDiff> = (0..40).map(|i| logo(i, "modified", 0x1c)).collect();
+            for i in known.iter().take(restored) {
+                part[*i] = logo(*i, "modified", 0x1a);
+            }
+            assert_eq!(Mock::new(routes(40, part, 2, true)).find(42).await.unwrap().is_some(), found, "{restored} of 17 known restored");
+        }
+        // Nothing GitHub can tell about the base: nothing to judge, no revert attested.
+        assert_eq!(Mock::new(routes(6, back(6), 0, false)).find(42).await.unwrap(), None);
+        // The pure rule: a file the candidate changes to a blob that can't be compared is neither
+        // restored nor not; one it leaves alone wasn't restored.
+        let claim: Vec<FileDiff> = (0..6).map(|i| logo(i, "modified", 0x1b)).collect();
+        let known: BTreeMap<String, String> = (0..2).map(|i| (format!("d{i}/logo.png"), blob(i, 0x1a))).collect();
+        assert_eq!(undoes(&claim, &back(6), &known), Some(true));
+        assert_eq!(undoes(&claim, &back(2), &known), Some(false), "the two known back, the four unknown left alone: 2 of 6");
+        assert_eq!(undoes(&claim, &back(1), &known), Some(false));
+        assert_eq!(undoes(&claim, &back(6), &BTreeMap::new()), None);
+        assert_eq!(undoes(&claim, &back(3), &BTreeMap::new()), Some(false), "three left alone, three unknown");
+    }
+
+    /// Audit review-r2-poc-1 (round 4): Alice's #42 adds 20 icons (binary, no patch) and one
+    /// README line. Mallory's #90 "Tidy", merged with a merge commit, removes only that line and
+    /// leaves every icon, with a commit saying "This reverts commit <merge>" (or its description
+    /// edited to "Reverts #42"). The lines decided alone, so every validator attested it and
+    /// Alice's claim was rejected. A PR with both lines and files with no lines to compare needs
+    /// both undone: more than half of the lines, and more than half of the files whose pre-PR
+    /// state is known. The real revert removes the icons too.
+    #[tokio::test]
+    async fn undoing_a_mixed_prs_one_line_isnt_reverting_it() {
+        let repo = "jackdishman/blockula";
+        let base = json!({ "ref": "main", "repo": { "full_name": repo, "default_branch": "main" } });
+        let (m90, c90) = ("9090909090909090909090909090909090909090", "9191919191919191919191919191919191919191");
+        let before = "77aa88bb99cc00dd11ee22ff33aa44bb55cc66dd";
+        let icons = |status: &str| -> Vec<FileDiff> { (0..20).map(|i| FileDiff { filename: format!("assets/icon{i:02}.png"), status: status.into(), sha: Some(format!("{i:040x}")), ..Default::default() }).collect() };
+        let readme = |patch: &str| FileDiff { filename: "README.md".into(), status: "modified".into(), patch: Some(patch.into()), ..Default::default() };
+        let mut claim = icons("added");
+        claim.push(readme("@@ -1 +1,2 @@\n # Blockula\n+See the icons"));
+        let line_only = vec![readme("@@ -1,2 +1 @@\n # Blockula\n-See the icons")];
+        let routes = |change: Vec<FileDiff>, body: &str, message: &str| {
+            let pr90 = json!({ "number": 90, "state": "closed", "title": "Tidy", "body": body, "merged_at": "2026-10-14T10:00:00Z", "merge_commit_sha": m90, "user": { "login": "mallory" }, "base": base });
+            let walk = json!([
+                commit(m90, "Merge pull request #90 from mallory/tidy\n\nTidy", &[MERGE, c90]),
+                commit(c90, message, &[MERGE]),
+                commit(MERGE, "Merge pull request #42 from alice/icons", &[before, &"a1".repeat(20)])
+            ]);
+            vec![
+                (format!("/repos/{repo}/pulls/42"), claim_42("alice")),
+                (format!("/repos/{repo}/pulls/42/files?per_page=100&page=1"), files_json(&claim)),
+                (format!("/repos/{repo}/commits?sha={MERGE}&since={SINCE}&per_page=100&page=1"), json!([walk[2].clone()])),
+                (format!("/repos/{repo}/commits?since={SINCE}&per_page=100&page=1"), walk.clone()),
+                (format!("/repos/{repo}/commits?path=README.md&since={SINCE}&per_page=100&page=1"), json!([walk[1].clone(), walk[0].clone()])),
+                (format!("/repos/{repo}/commits/{c90}"), json!({ "sha": c90, "files": files_json(&change) })),
+                (format!("/repos/{repo}/commits/{c90}/pulls"), json!([pr90.clone()])),
+                (format!("/repos/{repo}/commits/{m90}/pulls"), json!([pr90.clone()])),
+                (format!("/repos/{repo}/pulls/90"), pr90),
+                (format!("/repos/{repo}/pulls/90/files?per_page=100&page=1"), files_json(&change)),
+            ]
+        };
+        let git_words = format!("Tidy\n\nThis reverts commit {MERGE}.");
+        // The line alone, stated by the commit or by the description: no revert.
+        assert_eq!(Mock::new(routes(line_only.clone(), "", &git_words)).find(42).await.unwrap(), None);
+        assert_eq!(Mock::new(routes(line_only.clone(), &format!("Reverts {repo}#42"), "Tidy")).find(42).await.unwrap(), None);
+        // The line and the icons: the revert.
+        let mut whole = icons("removed");
+        whole.extend(line_only.clone());
+        assert_eq!(Mock::new(routes(whole, "", &git_words)).find(42).await.unwrap().map(|r| (r.sha, r.by)), Some((c90.to_string(), Stated::Commit)));
+        // The pure rule, both ways round.
+        let none = BTreeMap::new();
+        let mut most = icons("removed")[..11].to_vec();
+        assert_eq!(undoes(&claim, &most, &none), Some(false), "the icons without the line");
+        most.extend(line_only.clone());
+        assert_eq!(undoes(&claim, &most, &none), Some(true), "11 of 20 icons and the line");
+        assert_eq!(undoes(&claim, &line_only, &none), Some(false));
+        // A text PR's binaries whose pre-PR state is unknown don't make it revert-proof: a revert
+        // that changes them back (to blobs that can't be compared) is judged by its lines, and
+        // one that leaves them alone didn't undo them.
+        let bins = |n: usize| -> Vec<FileDiff> { (0..n).map(|i| FileDiff { filename: format!("d{i}/big.bin"), status: "modified".into(), ..Default::default() }).collect() };
+        let mut text_and_unknown = vec![readme("@@ -1 +1,2 @@\n # Blockula\n+See the icons")];
+        text_and_unknown.extend(bins(5));
+        let mut full = line_only.clone();
+        full.extend(bins(5));
+        assert_eq!(undoes(&text_and_unknown, &full, &none), Some(true));
+        assert_eq!(undoes(&text_and_unknown, &line_only, &none), Some(false));
+    }
+
+    /// Audit review-r3-poc-2: claim #42 is squash-merged, and a maintainer pushes `git revert` R
+    /// straight to the branch (no PR). Then #95 lands with a merge commit bringing 1,200 commits
+    /// dated after R, so the walk's newest 1,000 no longer hold R, and R has no PR for the path
+    /// history to find it by. A commit in the files' histories that states the revert in git's
+    /// words is a candidate itself now: R is found either way.
+    #[tokio::test]
+    async fn a_pushed_revert_is_found_past_a_flooded_walk() {
+        let repo = "jackdishman/blockula";
+        let (r, m95) = ("5151515151515151515151515151515151515151", "9595959595959595959595959595959595959595");
+        let revert = commit(r, &format!("Revert \"Add the thing\"\n\nThis reverts commit {MERGE}."), &[MERGE]);
+        let squash = commit(MERGE, "Add the thing (#42)", &["77aa88bb99cc00dd11ee22ff33aa44bb55cc66dd"]);
+        let routes = |walk: Vec<Value>| {
+            let mut out = vec![
+                (format!("/repos/{repo}/pulls/42"), claim_42("alice")),
+                (format!("/repos/{repo}/pulls/42/files?per_page=100&page=1"), files_json(&thing_files())),
+                (format!("/repos/{repo}/commits?sha={MERGE}&since={SINCE}&per_page=100&page=1"), json!([squash.clone()])),
+                (format!("/repos/{repo}/commits?path=src/thing.rs&since={SINCE}&per_page=100&page=1"), json!([revert.clone(), squash.clone()])),
+                (format!("/repos/{repo}/commits?path=src/lib.rs&since={SINCE}&per_page=100&page=1"), json!([revert.clone(), squash.clone()])),
+                (format!("/repos/{repo}/commits/{r}/pulls"), json!([])),
+                (format!("/repos/{repo}/commits/{r}"), json!({ "sha": r, "files": files_json(&undoing_files()) })),
+            ];
+            out.extend(list_routes(&format!("/repos/{repo}/commits?since={SINCE}"), &walk, |_| false).into_iter().filter(|(p, _)| p.contains("per_page=100")));
+            out
+        };
+        // Control: the walk holds R.
+        let found = Mock::new(routes(vec![revert.clone(), squash.clone()])).find(42).await.unwrap();
+        assert_eq!(found.map(|f| (f.sha, f.by)), Some((r.to_string(), Stated::Commit)));
+        // Flooded: #95's merge and 999 of its 1,200 commits fill the walk's 1,000.
+        let mut walk = vec![commit(m95, "Merge pull request #95 from someone/big", &[r, &format!("{:040x}", 1_200)])];
+        walk.extend((1..=1_200usize).rev().map(|i| commit(&format!("{i:040x}"), &format!("step {i}"), &[&format!("{:040x}", i - 1)])));
+        walk.push(revert.clone());
+        walk.push(squash.clone());
+        let gh = Mock::new(routes(walk));
+        let found = gh.find(42).await.unwrap();
+        assert_eq!(found.map(|f| (f.sha, f.by)), Some((r.to_string(), Stated::Commit)));
+        assert!(gh.asked(&format!("/repos/{repo}/commits?since={SINCE}&per_page=100&page=10")) && !gh.asked(&format!("/repos/{repo}/commits?since={SINCE}&per_page=100&page=11")), "the walk read its 1,000");
+        assert_eq!(gh.asked_count(|p| p.starts_with(&format!("/repos/{repo}/commits/")) && !p.contains(r)), 0, "none of the flood is fetched");
     }
 
     /// Against GitHub itself (network, so ignored): `cargo test live_revert -- --ignored`.
