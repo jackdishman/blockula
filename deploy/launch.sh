@@ -348,7 +348,6 @@ SEEDING=()
 DEPLOYS=()
 for i in $(seq 0 $((N - 1))); do
   app=$PREFIX-v$i
-  if has_secret "$app" VALIDATOR_KEY_B64; then SEEDING+=("$app"); fi
   # Exit codes 10/11/12 (halt height, upgrade required, slashing protection) make the
   # entrypoint stay down instead of exiting, so neither the restart policy nor the proxy
   # restarts a validator that stopped on purpose; crashes still restart.
@@ -361,6 +360,11 @@ done
 failed=""
 for i in $(seq 0 $((N - 1))); do wait "${DEPLOYS[$i]}" || failed="$failed $PREFIX-v$i"; done
 [ -z "$failed" ] || { echo "❌ deploying$failed failed (fly logs -a <app>); rerun deploy/launch.sh, without RESET" >&2; exit 1; }
+# Which validators still hold their key in Fly, asked once the deploys applied the staged
+# secrets (a staged secret may not be listed before).
+for i in $(seq 0 $((N - 1))); do
+  if has_secret "$PREFIX-v$i" VALIDATOR_KEY_B64; then SEEDING+=("$PREFIX-v$i"); fi
+done
 
 rpc_toml > "$WORK/$RPC_APP.toml"
 echo "🌐 Deploying public node ${RPC_APP}…"
