@@ -1,7 +1,7 @@
 // lib/explorer/preflight.ts: effects and refusals before signing. Run with `npm test -w @blockula/web`.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { preflight } from "./explorer/preflight.ts";
+import { preflight, preflightInput } from "./explorer/preflight.ts";
 
 const F = 1_000_000_000n;
 const label = (name) => ({ address: `boo1${name}`, name: `${name}.boo`, short: `boo1${name}…` });
@@ -196,4 +196,25 @@ test("transfer_name to oneself says what the chain will do with the name, and re
   const offer = { ...toSelf, action: { type: "transfer_name", name: "castle", to: "boo1mina" } };
   assert.match(preflight({ tx: offer, sender: sender(F), signer: "k-owner", head: 100, name: { name: "castle.boo", owner: "boo1mina" } }).refusals.join(" "), /isn't this account's to offer/);
   assert.deepEqual(preflight({ tx: offer, sender: sender(F), signer: "k-owner", head: 100, name: { name: "castle.boo", owner: "boo1vlad", status: "active" } }).refusals, []);
+});
+
+test("a signed name resolving to oneself previews acceptance or withdrawal without rewriting it (audit polish P2)", () => {
+  const tx = { from: vlad.address, fee: "4000", nonce: 3, action: { type: "transfer_name", name: "castle", to: "vlad.boo" } };
+  const account = { account: vlad, balance: String(F), transferable: String(F), nonce: 3, keys: [owner], recent_txs: [] };
+  const reads = { status: { height: 100 }, account, recipient: { ...account, exists: true }, name: { name: "castle.boo", owner: mina, offered_to: vlad, status: "active" } };
+  const input = preflightInput(tx, "k-owner", reads);
+  const accepts = preflight(input);
+  assert.equal(accepts.headline, "Accept castle.boo: it becomes this account's name");
+  assert.deepEqual(accepts.refusals, []);
+  const withdraws = preflight({ ...input, name: { name: "castle.boo", owner: vlad.address, offeredTo: mina.address, status: "active" } });
+  assert.equal(withdraws.headline, "Withdraw your offer of castle.boo");
+  assert.equal(input.tx.action.to, "vlad.boo", "resolution is forecast evidence, not a replacement signed recipient");
+});
+
+test("a lapsed name still in the node's records cannot be offered, accepted or withdrawn (audit polish P3)", () => {
+  const tx = { from: vlad.address, fee: "4000", nonce: 3, action: { type: "transfer_name", name: "castle", to: vlad.address } };
+  const run = (ownerAddress, offeredTo, to) => preflight({ tx: { ...tx, action: { ...tx.action, to } }, sender: sender(F), head: 100, name: { name: "castle.boo", owner: ownerAddress, offeredTo, status: "available" } });
+  assert.match(run(mina.address, vlad.address, vlad.address).refusals.join(" "), /has expired/);
+  assert.match(run(vlad.address, mina.address, vlad.address).refusals.join(" "), /has expired/);
+  assert.match(run(vlad.address, mina.address, mina.address).refusals.join(" "), /has expired/);
 });

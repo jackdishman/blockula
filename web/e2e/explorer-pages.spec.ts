@@ -283,6 +283,23 @@ test.describe("the explorer from an account holder's side", () => {
     }
   });
 
+  test("offering to one's own signed name previews acceptance, not an offer (audit polish P2)", async ({ page, node }) => {
+    node.names.set("castle", w.lucy);
+    node.nameInfo.set("castle", { offered_to: me });
+    await page.goto("/programs/names?do=transfer_name&name=castle&to=vlad.boo");
+    const f = page.locator("details.action", { has: page.locator("summary .title", { hasText: "Offer a name" }) });
+    const unlock = f.getByRole("button", { name: "Unlock to sign" });
+    await expect(unlock.or(f.getByRole("button", { name: "Preview" }))).toBeVisible();
+    if (await unlock.isVisible()) await unlock.click();
+    await f.getByRole("button", { name: "Preview" }).click();
+    await expect(f.getByTestId("action-preview").locator(".headline")).toHaveText("Accept castle.boo: it becomes this account's name");
+    await expect(f.getByTestId("preflight")).not.toContainText("isn't this account's to offer");
+    // The resolution informs only the forecast: without witnesses the signed recipient stays a name.
+    await expect(f.getByTestId("signs")).toContainText("vlad.boo");
+    expect(node.submitted).toEqual([]);
+    expect(errors).toEqual([]);
+  });
+
   test("previews of every program action render, with v1's refusals", async ({ page, node }) => {
     await visit(page, "/programs/accounts", (p) => p.getByRole("heading", { name: "Accounts & keys", level: 1 }), errors);
     const form = (title: string) => page.locator("details.action", { has: page.locator("summary .title", { hasText: title }) });
@@ -426,7 +443,8 @@ test.describe("the explorer from an account holder's side", () => {
 
   test("a payment to a watched account that seals between the two reads is no missed spend (audit review-main13-4)", async ({ page, node }) => {
     await page.addInitScript(([key, address]) => localStorage.setItem(key, JSON.stringify([{ address, label: "mina.boo", at: 1 }])), [`blockula.watch:${RPC}`, w.mina]);
-    await visit(page, "/explore", (p) => p.getByRole("heading", { name: "blockula-testnet, live" }), errors);
+    // No WatchingList on this page: only Alerts can consume the watched-account hook (polish P4).
+    await visit(page, "/programs", (p) => p.getByRole("heading", { name: "What the chain can do" }), errors);
     await page.waitForTimeout(4500); // the first look is the baseline
     // A round reads this account, then the watched one; a payment from this account to the watched
     // one seals in between (just before the watched account's read, which only these notices

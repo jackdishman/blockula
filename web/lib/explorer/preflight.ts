@@ -302,19 +302,23 @@ export function preflight(i: PreflightInput): Preflight {
   const nm = i.name;
   if (kind === "transfer_name" && nm) {
     const me = sender.label.address;
-    if (tx.action.to === me) {
+    // Names stay signed as names without witnesses. Their current resolved address is only
+    // forecast evidence: sending to one's own name accepts or withdraws just like one's address.
+    const toSelf = tx.action.to === me || i.recipient?.label.address === me;
+    const expired = nm.status === "grace" || nm.status === "available";
+    if (toSelf) {
       const outcome = nm.owner !== me && nm.offeredTo === me ? "accept" : nm.owner === me ? "withdraw" : null;
       if (!outcome) refusals.push(`${nm.name} isn't this account's, and it isn't offered to it.`);
       else {
         headline = outcome === "accept" ? `Accept ${nm.name}: it becomes this account's name` : nm.offeredTo ? `Withdraw your offer of ${nm.name}` : `No open offer of ${nm.name} to withdraw`;
-        if (outcome === "accept" && nm.status === "grace") refusals.push(`${nm.name} has expired: only its owner can renew it, so it can't be accepted.`);
-        if (outcome === "withdraw" && nm.status === "grace") refusals.push(`${nm.name} has expired: renew it first.`);
+        if (outcome === "accept" && expired) refusals.push(`${nm.name} has expired: only its owner can renew it, so it can't be accepted.`);
+        if (outcome === "withdraw" && expired) refusals.push(`${nm.name} has expired: renew it first.`);
         if (outcome === "withdraw" && !nm.offeredTo) refusals.push(`${nm.name} has no open offer to withdraw.`);
         if (i.intent === "withdraw_name_offer" && outcome === "accept") refusals.push(`${nm.name} is offered to this account, so this would accept it, not withdraw an offer. To take it, use “Accept a name”.`);
         if (i.intent === "accept_name" && outcome === "withdraw") refusals.push(`This account owns ${nm.name}, so this would withdraw its offer, not accept one.`);
       }
     } else if (nm.owner !== me) refusals.push(`${nm.name} isn't this account's to offer.`);
-    else if (nm.status === "grace") refusals.push(`${nm.name} has expired: renew it first.`);
+    else if (expired) refusals.push(`${nm.name} has expired: renew it first.`);
   }
 
   const balanceAfter = spendable > cost ? spendable - cost : 0n;
@@ -340,7 +344,7 @@ export interface Reads {
   fees?: Fees | null;
   /** The hunt it funds, awards or cancels (`missing`: a 404). */
   hunt?: HuntView | { id: number; missing: true } | null;
-  /** A name it registers or renews. */
+  /** A name it registers, renews or transfers. */
   name?: NameDetail | null;
   /** `/api/validators`, for a hunt's cancel (dev and test chains' admins). */
   validators?: ValidatorsDetail | null;

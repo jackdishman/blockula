@@ -19,7 +19,7 @@ export async function checkTx(tx: Tx, signer: string, intent?: string): Promise<
     nodeGet<ChainStatus>("/status"),
     nodeGet<AccountDetail>(`/account/${tx.from}`),
     missing(nodeGet<MultisigView>(`/multisig/${tx.from}`)).catch(() => null),
-    pays ? nodeGet<AccountDetail>(`/account/${encodeURIComponent(String(action.to))}`) : null,
+    pays || action.type === "transfer_name" ? nodeGet<AccountDetail>(`/account/${encodeURIComponent(String(action.to))}`) : null,
     pays ? nodeGet<Fees>("/fees").catch(() => null) : null,
     huntId != null ? missing(nodeGet<HuntView>(`/hunt/${huntId}`)).then((h) => h ?? { id: huntId, missing: true as const }, () => null) : null,
     action.type === "register_name" || action.type === "renew_name" || action.type === "transfer_name" ? nodeGet<NameDetail>(`/name/${encodeURIComponent(String(action.name))}`) : null,
