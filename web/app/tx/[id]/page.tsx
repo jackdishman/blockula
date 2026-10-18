@@ -20,29 +20,30 @@ export default function TxPage() {
   const now = useNow(1000);
   const me = useMe();
   const { wallet } = useWallet();
-  // Poll until it settles: a sealed transaction never changes again. One dropped from this node's
-  // mempool may still be included by a node that holds it (until its valid_until), so it's
-  // checked now and then.
-  const [poll, setPoll] = useState(true);
-  const tx = useNode<TxDetail>(`/tx/${txId}`, { every: poll ? 1000 : 10_000 });
+  // Poll until it settles: a transaction sealed in a block never changes again. One this node
+  // dropped unrun hasn't settled: another node may still include it until its valid_until, and
+  // then this node shows it in that block, so it keeps asking, less often.
+  const [every, setEvery] = useState<number | undefined>(1000);
+  const tx = useNode<TxDetail>(`/tx/${txId}`, { every });
   const t = tx.data;
-  // Dropped unrun (v1 says `dropped: true`; older nodes, a failure without its transaction). A
-  // failure that ran but isn't in this node's index any more (`dropped: false`) was charged.
+  // A failure answered without the tx: `dropped: false` ran in a block and failed (its fee was
+  // charged); a drop (or an older node that doesn't say) ran nowhere, and its height is where this
+  // node dropped it, not a block it ran in (audit review-fix-clients-2, main13-render-3).
   const dropped = !!t && t.status === "failed" && (t.dropped ?? !t.from);
   const ranUnseen = !!t && t.status === "failed" && t.dropped === false && !t.from;
-  const settled = !!t && t.status !== "pending";
+  const settled = !!t && t.status !== "pending" && !dropped;
   // Pending, then gone: the node forgot it (a restart empties the mempool). Say so and stop asking.
   const lost = !!t && t.status === "pending" && (tx.error as NodeError | null)?.status === 404;
   useEffect(() => {
-    if (settled || lost) setPoll(false);
-  }, [settled, lost]);
+    setEvery(settled || lost ? undefined : dropped ? 10_000 : 1000);
+  }, [settled, lost, dropped]);
   const block = useNode<BlockView>(t?.height && !dropped ? `/block/${t.height}` : null);
   const sender = useNode<AccountDetail>(t?.from ? `/account/${t.from.address}` : null);
   // Paid to an address: did it have an account before this ran? Its own history says (an earlier
   // transaction naming it), else the receipt can't tell whether this burned the creation fee.
   const paysAddress = !!t?.to && t.status === "finalized" && (t.kind ?? t.action?.type) === "transfer" && t.action?.to === t.to.address && t.to.address !== t.from?.address;
   const recipient = useNode<AccountDetail>(paysAddress && t?.to ? `/account/${t.to.address}` : null);
-  const status = useNode<ChainStatus>("/status", { every: settled ? 10_000 : 1000 });
+  const status = useNode<ChainStatus>("/status", { every: settled || dropped ? 10_000 : 1000 });
   const huntId = t?.action && typeof t.action.hunt_id === "number" ? t.action.hunt_id : null;
   const hunt = useNode<HuntView>(huntId != null ? `/hunt/${huntId}` : null);
 
@@ -57,6 +58,8 @@ export default function TxPage() {
   const keys = sender.data?.keys;
   const signer = signerOf(t, keys, wallet?.keyId);
   const signerKey = keys?.find((k) => k.key_id === t.signer_key);
+  // Where this node dropped it, only as a whole block number (never echo anything else).
+  const droppedAt = dropped && Number.isSafeInteger(t.height) ? ` around block #${(t.height as number).toLocaleString("en-US")}` : "";
   const head = status.data?.height;
   const fee = parseDrops(t.fee);
   const kind = t.kind ?? t.action?.type ?? "";
@@ -94,7 +97,7 @@ export default function TxPage() {
       step: "Broadcast",
       state: dropped || lost ? "bad" : t.status === "pending" ? "now" : "done",
       what: dropped
-        ? `dropped from this node's mempool without running, at block #${t.height?.toLocaleString("en-US") ?? "?"}: ${t.error ?? "it couldn't apply"}`
+        ? `dropped from this node's mempool without running${droppedAt} (${t.error ?? "it couldn't apply"}): nothing was charged, but another node may still include it until its valid_until, so don't send it again before then`
         : lost
           ? "this node no longer has it (it may have restarted); it was never sealed here"
           : t.status === "pending"
@@ -104,9 +107,9 @@ export default function TxPage() {
     },
     {
       step: "Sealed",
-      state: dropped ? "todo" : t.height == null ? "todo" : t.status === "failed" ? "bad" : "done",
+      state: dropped || t.height == null ? "todo" : t.status === "failed" ? "bad" : "done",
       what: dropped ? (
-        "never here: nothing was charged. A node that still holds it could include it until it expires, so this page keeps checking."
+        "not in any block this node holds: another node may still include it until its valid_until, so this page keeps checking"
       ) : ranUnseen ? (
         <>
           in block #{t.height?.toLocaleString("en-US")}, where it failed and its fee was charged: {t.error}. This node no longer holds that block.
@@ -125,13 +128,13 @@ export default function TxPage() {
             {t.status === "failed" && <span className="error block">but the action failed: {t.error}</span>}
           </>
         ),
-      when: b ? `${new Date(b.timestamp_ms).toLocaleString()} · ${ago(now - b.timestamp_ms)}` : undefined,
+      when: b && !dropped ? `${new Date(b.timestamp_ms).toLocaleString()} · ${ago(now - b.timestamp_ms)}` : undefined,
     },
     {
       step: "Final",
       state: t.height == null || dropped ? "todo" : "done",
       what: dropped ? (
-        "only once a block seals it"
+        "not yet: it may still run until its valid_until passes"
       ) : t.height == null ? (
           "the moment it's sealed"
         ) : (
@@ -158,7 +161,7 @@ export default function TxPage() {
       </nav>
 
       <section className="card plate receipt">
-        <span className="eyebrow">{dropped ? "Didn't go through" : lost ? "Lost track of it" : t.status === "pending" ? "On its way" : t.status === "failed" ? "Included, but failed" : "Receipt"}</span>
+        <span className="eyebrow">{dropped ? "Dropped, not final" : lost ? "Lost track of it" : t.status === "pending" ? "On its way" : t.status === "failed" ? "Included, but failed" : "Receipt"}</span>
         <p className="headline">{fromMySide(t.summary, me)}</p>
         {/* What was signed, rendered here from the action itself: the node's summary isn't signed (audit gap-7-6). */}
         {t.action && <p className="dim small m0 wrap-any" data-testid="receipt-signs">Signed: {describeAction(t.action)}</p>}
@@ -171,8 +174,8 @@ export default function TxPage() {
           </div>
         )}
         <div className="row-gap">
-          <StatusPill status={t.status} />
-          {t.height != null && <span className="dim small">{dropped ? "dropped at" : "in"} block #{t.height.toLocaleString("en-US")}</span>}
+          {dropped ? <StatusPill status="pending">dropped</StatusPill> : <StatusPill status={t.status} />}
+          {t.height != null && !dropped && <span className="dim small">in block #{t.height.toLocaleString("en-US")}</span>}
           {t.memo && <span className="ledger-memo">“{t.memo}”</span>}
           <ReceiptTools summary={fromMySide(t.summary, me)} />
         </div>

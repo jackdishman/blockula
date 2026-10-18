@@ -65,8 +65,9 @@ export interface TxDetail {
   summary: string;
   kind?: string;
   status: TxStatus;
-  error?: string | null;
+  /** On a failure answered without the tx: true if it was dropped unrun (nothing charged), false if it ran in a block (its fee was charged). */
   dropped?: boolean;
+  error?: string | null;
   height: number | null;
   from?: Label;
   /** Who the action named; for a sealed transaction, as the chain resolved it when it ran. */

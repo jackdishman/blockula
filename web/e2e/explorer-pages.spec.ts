@@ -98,7 +98,7 @@ test.describe("every explorer page", () => {
       for (const [name, id] of Object.entries(w.ids).filter((_, i) => i % PARTS === part)) {
         await visit(page, `/tx/${id}`, receipt, errors);
         if (["failed", "ranUnseen"].includes(name)) await expect(eyebrow(page), name).toHaveText("Included, but failed");
-        else if (name === "dropped") await expect(eyebrow(page), name).toHaveText("Didn't go through");
+        else if (name === "dropped") await expect(eyebrow(page), name).toHaveText("Dropped, not final");
         else if (name === "waiting") await expect(eyebrow(page), name).toHaveText("On its way");
         else await expect(eyebrow(page), name).toHaveText("Receipt");
         // What was signed is rendered here from the action, never taken from the node's summary.
@@ -112,7 +112,8 @@ test.describe("every explorer page", () => {
     // Dropped unrun: in no block, nothing charged, and it may still be included elsewhere.
     await visit(page, `/tx/${ids.dropped}`, receipt, errors);
     await expect(page.locator(".crumbs")).not.toContainText("Block #");
-    await expect(page.locator("ol.trace")).toContainText("never here: nothing was charged");
+    await expect(page.locator("ol.trace")).toContainText("nothing was charged, but another node may still include it until its valid_until");
+    await expect(page.locator("ol.trace")).toContainText("not in any block this node holds");
     await expect(page.locator("ol.trace")).not.toContainText("quorum certificate");
     await expect(page.getByText("Balance changes")).toHaveCount(0);
     // Ran in a block this node no longer holds: it was charged.

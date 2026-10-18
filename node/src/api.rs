@@ -2378,6 +2378,69 @@ globalThis.location = { hash: "" };
         }
     }
 
+    /// The explorer's tx page for one `/api/tx` answer, rendered by the page's own script under
+    /// Node with a stub DOM; `None` where `node` isn't installed (CI has it).
+    pub(super) fn explorer_tx_page(answer: &Value) -> Option<String> {
+        let ok = std::process::Command::new("node").arg("--version").output().is_ok_and(|o| o.status.success());
+        if !ok {
+            eprintln!("skipping: node isn't installed");
+            return None;
+        }
+        let stub = format!(
+            r##"
+const app = {{ innerHTML: "" }};
+globalThis.document = {{ querySelector: (s) => (s === "#app" ? app : {{ addEventListener() {{}}, textContent: "", value: "" }}), querySelectorAll: () => [], head: {{ append() {{}} }}, createElement: () => ({{}}) }};
+globalThis.window = {{ addEventListener() {{}} }};
+globalThis.setInterval = () => 0;
+const ANSWER = {answer};
+globalThis.fetch = async (p) => (String(p).startsWith("/api/tx/") ? {{ ok: true, json: async () => ANSWER }} : {{ ok: false, json: async () => ({{ error: "offline" }}) }});
+globalThis.location = {{ hash: "#/tx/{id}" }};
+"##,
+            id = "ab".repeat(32)
+        );
+        // The page routes once as it loads; this second pass is the one awaited.
+        let probe = r##"
+(async () => {
+  await route();
+  console.log(JSON.stringify(app.innerHTML));
+})();
+"##;
+        let src = format!("{stub}{}{probe}", explorer_script());
+        let out = std::process::Command::new("node").arg("-e").arg(&src).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        Some(serde_json::from_slice(&out.stdout).unwrap())
+    }
+
+    /// review-fix-clients-2: the node's explorer (which the MCP's in-flight answers link to) tells a
+    /// tx dropped unrun (nothing charged; another node may still include it, so it must not be sent
+    /// again yet) from a failure that ran (its fee was charged; final), and calls a drop "failed"
+    /// nowhere. An older node's tx-less failure, which doesn't say, reads as a drop: the answer that
+    /// never invites a re-send.
+    #[test]
+    fn explorer_tells_a_drop_from_a_failure_that_ran() {
+        const DROPPED: &str = "dropped from this node's mempool without running";
+        const NOT_YET: &str = "nothing was charged, but another node may still include it until its valid_until, so don't send it again before then";
+        const RAN: &str = "failed in <a href=\"#/block/12\">block #12</a>: its fee was charged";
+        let id = "ab".repeat(32);
+        let dropped = json!({ "id": id, "status": "failed", "dropped": true, "error": "expired: valid_until 11", "height": 12, "summary": "Transaction dropped without running: expired" });
+        let older = json!({ "id": id, "status": "failed", "error": "expired", "height": 12, "summary": "Transaction failed: expired" });
+        let ran = json!({ "id": id, "status": "failed", "dropped": false, "error": "insufficient balance", "height": 12, "summary": "Transaction failed: insufficient balance" });
+        for (what, answer) in [("dropped", &dropped), ("an older node's tx-less failure", &older)] {
+            let Some(page) = explorer_tx_page(answer) else { return };
+            assert!(page.contains(DROPPED) && page.contains(NOT_YET), "{what}: {page}");
+            assert!(page.contains(r#"<span class="pill pending">dropped</span>"#), "{what}: a non-final pill: {page}");
+            assert!(!page.contains("pill failed") && !page.contains("fee was charged") && !page.contains("didn't go through"), "{what}: {page}");
+        }
+        let Some(page) = explorer_tx_page(&ran) else { return };
+        assert!(page.contains(RAN) && page.contains("final"), "{page}");
+        assert!(page.contains(r#"<span class="pill failed">failed</span>"#), "{page}");
+        assert!(!page.contains(DROPPED) && !page.contains("may still include"), "{page}");
+        // Node text stays text.
+        let hostile = json!({ "id": id, "status": "failed", "dropped": true, "error": "<img src=x onerror=alert(1)>", "height": "<b>12</b>", "summary": "" });
+        let Some(page) = explorer_tx_page(&hostile) else { return };
+        assert!(!page.contains("<img") && !page.contains("<b>"), "{page}");
+    }
+
     /// The p2p transport `/api/status` reports is the one linked (audit #1/#3). Compiling
     /// `p2p_transport` already proves the node links the vendored crate; the lockfile check
     /// proves nothing else (commonware-p2p) links a second, upstream copy, which an unapplied or
@@ -3230,6 +3293,10 @@ mod http_tests {
         assert_eq!((v["status"].as_str(), v["dropped"].as_bool()), (Some("failed"), Some(true)), "{v}");
         assert!(v["error"].as_str().unwrap().contains("expired"), "{v}");
         assert!(!n.live.mempool().failure_ran(&t3.id()));
+        // The node's own explorer reads this answer as a drop too, not as a final failure.
+        if let Some(page) = super::tests::explorer_tx_page(&v) {
+            assert!(page.contains("dropped from this node's mempool without running") && page.contains("so don't send it again before then") && !page.contains("pill failed"), "{page}");
+        }
         std::fs::remove_dir_all(root).ok();
     }
 

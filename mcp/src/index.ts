@@ -30,7 +30,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { ApiError, Client, RequestTimeoutError, TxFailedError, TxPendingError, Wallet, bareName, checkTimeoutMs, describeKind, encodeKeyGrant, proposalDigest, formatFang, paramsOf, parseFang, proposalSummary, stakeSummary, txDropped, txId, type Action, type ProposalKind, type ProposalSummary, type Recipient, type Resolution } from "@blockula/sdk";
+import { ApiError, Client, NAMESPACES, RequestTimeoutError, TxFailedError, TxPendingError, Wallet, bareName, checkTimeoutMs, decodeAccount, describeKind, encodeKeyGrant, isAddress, proposalDigest, formatFang, paramsOf, parseFang, proposalSummary, stakeSummary, txDropped, txId, type Action, type ProposalKind, type ProposalSummary, type Recipient, type Resolution } from "@blockula/sdk";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -38,7 +38,7 @@ import { dirname, join } from "node:path";
 import { z } from "zod";
 import { KnownChains, completePin, effectivePin, mismatch, mismatchError, resolveNetwork, type Network } from "./network.js";
 import { PIN_FILE, REPO, RELEASE_KEY_ID, binPaths, checkBinaryVersion, fetchVerifiedRelease, latestTagFrom, readReleasePin, releaseKeyIdFrom } from "./release.js";
-import { SignedTxs } from "./signed.js";
+import { SignedTxs, type SignedTx } from "./signed.js";
 import { SpendLedger } from "./spend.js";
 import { SERVER_INSTRUCTIONS, UNTRUSTED_NOTE, chainData, clean } from "./untrusted.js";
 
@@ -354,14 +354,187 @@ tool("status", "Blockula network status: which network and node you're connected
   };
 });
 
+/** What a node's head says about a tx this MCP signed but the node can't show (it doesn't know it, or only that it dropped it). */
+interface SlotFate {
+  /** The node's height, and the first block it holds (`history_from`), if it said. */
+  head?: number;
+  historyFrom?: number;
+  /** How far ahead a valid_until may be (`max_tx_validity_blocks`): it ran no earlier than valid_until minus this. */
+  maxValidity?: number;
+  /** The account's executed nonce count (`nonce`, never `next_nonce`, which counts the node's mempool too). */
+  accountNonce?: number;
+  /** With BLOCKULA_WITNESSES: accountNonce is proven (the account record's Merkle proof, its state root confirmed by them) as of block `height`. */
+  proven?: { height: number; witnesses: number };
+  /** Why the witnesses didn't confirm the account's nonce (then it's left unknown). */
+  proofError?: string;
+  /** Another tx this MCP signed with the same (account, nonce) that the node shows in a block. */
+  sibling?: { id: string; status: string; block?: number };
+  /**
+   * The tx itself, read again once its nonce showed used (audit review-r4-wallet-1): `ran`, the
+   * node now shows it in a block (it executed between the first read and the nonce read); `absent`,
+   * still in no block (404, or only its drop); unset, the read failed or caught the node mid-update.
+   */
+  recheck?: { ran: Record<string, unknown> } | "absent";
+}
+
+const safeInt = (v: unknown) => (Number.isSafeInteger(v) && (v as number) >= 0 ? (v as number) : undefined);
+
+/**
+ * Reads the head and the account's nonce for a tx this MCP signed (audit review-r3-wallet-1): at
+ * most one tx per (account, nonce) executes, so an executed nonce past the tx's means it (or a tx
+ * that took its nonce) ran, and it can never run again; a nonce still unused at a block past
+ * valid_until means it can never run at all. The status is read first, so a nonce read after a
+ * head past valid_until can't miss this tx running. With BLOCKULA_WITNESSES the nonce is proven
+ * (as of the proof's block), not this node's word.
+ */
+async function slotFate(client: Client, id: string, mine: SignedTx): Promise<SlotFate> {
+  const fate: SlotFate = {};
+  try {
+    const st = await client.status();
+    [fate.head, fate.historyFrom, fate.maxValidity] = [safeInt(st.height), safeInt(st.history_from), safeInt(st.max_tx_validity_blocks)];
+  } catch {
+    /* unknown: answered conservatively below */
+  }
+  if (client.witnesses.length) {
+    try {
+      if (!isAddress(mine.account)) throw new Error(`${mine.account} isn't an address`);
+      const r = await client.provenRecord(NAMESPACES.ACCOUNTS, mine.account, { witnesses: client.witnesses });
+      // No record: provably no account, so nothing from it ever ran.
+      fate.accountNonce = r.value === null ? 0 : decodeAccount(r.value).nonce;
+      fate.proven = { height: r.height, witnesses: client.witnesses.length };
+      fate.head = Math.max(fate.head ?? 0, r.head);
+    } catch (e) {
+      fate.proofError = clean(String((e as Error)?.message ?? e), 200);
+    }
+  } else {
+    try {
+      fate.accountNonce = safeInt((await client.account(mine.account)).nonce);
+    } catch {
+      /* unknown */
+    }
+  }
+  if (fate.accountNonce !== undefined && fate.accountNonce > mine.nonce) {
+    // The first read (that didn't find it in a block) predates the nonce read: the block it ran in
+    // may have executed in between. Only a read after the nonce read can say it's in none of the
+    // blocks this node holds.
+    try {
+      const t = await client.tx(id);
+      if (t.status === "finalized" || (t.status === "failed" && !txDropped(t))) {
+        fate.recheck = { ran: t };
+        return fate;
+      }
+      if (t.status === "failed") fate.recheck = "absent";
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 404) fate.recheck = "absent";
+    }
+    for (const other of SIGNED.sameSlot(mine.account, mine.nonce, id).slice(-3)) {
+      const t = await client.tx(other).catch(() => null);
+      if (t && (t.status === "finalized" || (t.status === "failed" && !txDropped(t)))) {
+        fate.sibling = { id: other, status: String(t.status), ...(safeInt(t.height) !== undefined ? { block: safeInt(t.height) } : {}) };
+        break;
+      }
+    }
+  }
+  return fate;
+}
+
+/**
+ * tx_status's answer for a tx this MCP signed that the node doesn't show in a block: `how` says
+ * whether the node doesn't know it at all (`unknown`: pruned, never held, or never reached it) or
+ * remembers dropping it unrun (`dropped`). Says it's in flight only while the head is at or below
+ * its valid_until and its nonce is unused; never "isn't confirmed" for a nonce that executed.
+ */
+function afterTheFact(how: "unknown" | "dropped", tx_id: string, mine: SignedTx, fate: SlotFate): Record<string, unknown> {
+  const vu = mine.valid_until;
+  const facts = {
+    tx_id,
+    account: mine.account,
+    nonce: mine.nonce,
+    valid_until: vu,
+    ...(fate.head !== undefined ? { node_height: fate.head } : {}),
+    ...(fate.accountNonce !== undefined ? { account_nonce: fate.accountNonce } : {}),
+    ...(fate.proven ? { account_nonce_proven_at: fate.proven.height, proven_by_witnesses: fate.proven.witnesses } : {}),
+    ...(fate.proofError ? { proof_error: fate.proofError } : {}),
+    ...(fate.historyFrom !== undefined ? { history_from: fate.historyFrom } : {}),
+  };
+  const seen = how === "dropped" ? "This node dropped it from its mempool without running it" : `${RPC} doesn't know this tx`;
+  const proof = fate.proven ? ` (proven at block ${fate.proven.height}: its state root confirmed by ${fate.proven.witnesses} other node${fate.proven.witnesses === 1 ? "" : "s"})` : "";
+  // The block the nonce was read at: the proof's, else (unproven) the node's head, read just before.
+  const nonceAt = fate.proven ? fate.proven.height : fate.head;
+  if (fate.accountNonce !== undefined && fate.accountNonce > mine.nonce) {
+    // Its nonce was used: by this tx (through another node, or in a block this node no longer
+    // holds) or by another one. Either way it's final: it can never execute again.
+    let which: string;
+    if (fate.sibling) {
+      which = `This MCP signed another tx with the same nonce, ${fate.sibling.id}, which this node shows ${fate.sibling.status === "finalized" ? "finalized" : "failed (its fee was charged)"}${fate.sibling.block !== undefined ? ` in block ${fate.sibling.block}` : ""}: that one used the nonce, so this one never ran and nothing was charged for it. Check that tx (tx_status ${fate.sibling.id}), not this one.`;
+    } else {
+      const earliest = fate.maxValidity !== undefined ? Math.max(1, vu - fate.maxValidity) : 1;
+      const holdsAll = fate.historyFrom !== undefined && fate.historyFrom <= earliest;
+      // "In none of them" needs a read after the nonce read that still didn't find it in a block.
+      const lacks = !holdsAll || fate.recheck !== "absent";
+      which = lacks
+        ? `It may have been this one${how === "dropped" ? ", included by another node after this one dropped it" : holdsAll ? ": asked again after its nonce was read, this node gave no clear answer" : `: this node ${fate.historyFrom !== undefined ? `only holds blocks from #${fate.historyFrom} on` : "may not hold the block it ran in"}, so it may have pruned or never held it`}. Look it up on an archive node (or in ${mine.account}'s history) to see whether this one ran and whether it succeeded.`
+        : `This node holds every block it could have run in (from #${fate.historyFrom}) and ${how === "dropped" ? "shows it in none of them" : "has no record of it"}, so most likely another tx used that nonce and this one never ran; confirm on another node (or in ${mine.account}'s history).`;
+    }
+    return {
+      status: "nonce_used",
+      ...facts,
+      next: `${seen}, but ${mine.account}'s nonce ${mine.nonce} has been used (the account has run ${fate.accountNonce} txs${proof}), so this tx can never execute again: it already ran, or another tx with the same nonce took its place. ${which} Do NOT send it again until you know whether it was this one: if it was, the payment already went through. Tell the user exactly that, not that it isn't confirmed.`,
+    };
+  }
+  if (nonceAt !== undefined && nonceAt > vu && fate.accountNonce !== undefined) {
+    return {
+      status: "expired",
+      ...facts,
+      next: fate.proven
+        ? `${seen}, and at block ${nonceAt}, past its valid_until (${vu}), ${mine.account}'s nonce ${mine.nonce} was still unused${proof}: it never ran, can never execute, and nothing was charged for it. It stays counted toward today's limit.`
+        : `${seen}, and says the chain is at block ${nonceAt}, past its valid_until (${vu}), with ${mine.account}'s nonce ${mine.nonce} still unused: if that's right, it can never execute and nothing was charged. It stays counted toward today's limit; check the height and the account's nonce with another node (or configure BLOCKULA_WITNESSES) before signing it again.`,
+    };
+  }
+  if (fate.head !== undefined && fate.head <= vu && (fate.accountNonce !== undefined || (how === "dropped" && !fate.proofError))) {
+    const inFlight = how === "dropped" ? "This node dropped it from its mempool without running it, so nothing was charged, but another node" : `${RPC} doesn't know this tx, but this MCP signed it, and a node that holds it`;
+    return {
+      status: how,
+      ...(how === "dropped" ? { dropped: true } : {}),
+      ...facts,
+      next: `${inFlight} may still include it until block ${vu} (the chain is at block ${fate.head}). It still counts toward the daily limit. Do NOT send it again before then: check tx_status again, and tell the user it isn't confirmed yet.`,
+    };
+  }
+  // The node (or the witnesses) didn't say enough: the height, or the account's nonce once past valid_until.
+  const missing =
+    fate.head === undefined
+      ? "the chain's height"
+      : fate.proofError
+        ? `a proven nonce for ${mine.account} (${fate.proofError})`
+        : fate.accountNonce !== undefined
+          ? `${mine.account}'s nonce as of a block past its valid_until (the proof is from block ${nonceAt}, the chain at block ${fate.head})`
+          : `whether ${mine.account}'s nonce ${mine.nonce} was used`;
+  return {
+    status: how,
+    ...(how === "dropped" ? { dropped: true } : {}),
+    ...facts,
+    next: `${seen}, and this MCP couldn't read ${missing}, so it may still be in flight (until block ${vu}) or have run already. Do NOT send it again: check tx_status again (or ask another node), and tell the user it isn't known yet whether it went through.`,
+  };
+}
+
+/** A tx the node shows in a block: finalized, or failed (it ran, so its fee was charged). Final either way. */
+function inBlock(tx: any, link: string): Record<string, unknown> {
+  const status = String(tx.status);
+  const summary = clean(String(tx.summary ?? ""));
+  const error = tx.error ? { error: clean(String(tx.error)) } : {};
+  if (status === "finalized") return { status, summary, ...error, block: tx.height, fee: tx.fee_display, explorer: link };
+  return { status, summary, ...error, block: tx.height, fee: tx.fee_display, next: `It ran${typeof tx.height === "number" ? ` in block ${tx.height}` : ""} and failed, so its fee was charged and nothing else happened. That's final.`, explorer: link };
+}
+
 /**
  * A tx's status as the node reports it, read the way submitCapped reads it (audit
  * review-fix-clients-2): "finalized" and "failed" (it ran in a block; its fee was charged) are
  * final; "dropped" (this node dropped it from its mempool unrun: nothing charged) and "pending"
  * aren't, since another node may still include it until its valid_until. For a tx this MCP
- * signed, valid_until is what it signed (signed.ts), not the node's word.
+ * signed, valid_until, account and nonce are what it signed (signed.ts), not the node's word, and
+ * one the node can't show is read against the head and the account's nonce (afterTheFact).
  */
-tool("tx_status", "Check a transaction by id: finalized (with its block), failed in a block (its fee was charged), pending, or dropped from this node's mempool without running (nothing charged, but another node may still include it until valid_until, so it must not be sent again before then), with its plain-English summary.", { tx_id: z.string().regex(/^[0-9a-f]{64}$/) }, async ({ tx_id }) => {
+tool("tx_status", "Check a transaction by id: finalized (with its block), failed in a block (its fee was charged), pending, or dropped from this node's mempool without running (nothing charged, but another node may still include it until valid_until, so it must not be sent again before then), with its plain-English summary. For a tx this MCP signed that the node can't show: nonce_used (its nonce ran: it can never execute again, and may already have gone through), expired (past valid_until, nonce unused: it never ran), or unknown/dropped (still in flight).", { tx_id: z.string().regex(/^[0-9a-f]{64}$/) }, async ({ tx_id }) => {
   const client = await chain();
   const mine = SIGNED.get(tx_id);
   const link = explorer(`tx/${tx_id}`);
@@ -370,9 +543,12 @@ tool("tx_status", "Check a transaction by id: finalized (with its block), failed
   try {
     tx = await client.tx(tx_id);
   } catch (e) {
-    // This node doesn't know it. One this MCP signed may still be in another node's mempool.
+    // This node doesn't know it: pruned or never held (it ran long ago), or never reached it.
     if (e instanceof ApiError && e.status === 404 && mine) {
-      return { status: "unknown", tx_id, valid_until: mine.valid_until, next: `${RPC} doesn't know this tx, but this MCP signed it, and a node that holds it may still include it until block ${mine.valid_until}. It still counts toward the daily limit. Do NOT send it again before then: check tx_status again, and tell the user it isn't confirmed yet.`, explorer: link };
+      const fate = await slotFate(client, tx_id, mine);
+      // It ran in a block that executed after the first read: answered as what it is.
+      if (fate.recheck && fate.recheck !== "absent") return inBlock(fate.recheck.ran, link);
+      return { ...afterTheFact("unknown", tx_id, mine, fate), explorer: link };
     }
     throw e;
   }
@@ -381,18 +557,23 @@ tool("tx_status", "Check a transaction by id: finalized (with its block), failed
   const error = tx.error ? { error: clean(String(tx.error)) } : {};
   const nodeUntil = Number.isSafeInteger(tx.valid_until) ? (tx.valid_until as number) : undefined;
   const validUntil = mine?.valid_until ?? nodeUntil;
-  if (status === "finalized") return { status, summary, ...error, block: tx.height, fee: tx.fee_display, explorer: link };
-  if (status === "failed" && !txDropped(tx)) {
-    return { status, summary, ...error, block: tx.height, fee: tx.fee_display, next: `It ran${typeof tx.height === "number" ? ` in block ${tx.height}` : ""} and failed, so its fee was charged and nothing else happened. That's final.`, explorer: link };
-  }
+  if (status === "finalized" || (status === "failed" && !txDropped(tx))) return inBlock(tx, link);
   if (status === "failed") {
     // Dropped unrun: the height in the answer is where this node dropped it, not a block it ran in.
-    const head = await client.status().then((st) => (Number.isSafeInteger(st.height) ? (st.height as number) : undefined)).catch(() => undefined);
+    const at = typeof tx.height === "number" ? { dropped_at_height: tx.height } : {};
+    if (mine) {
+      const fate = await slotFate(client, tx_id, mine);
+      // Another node included it after this one dropped it, and this node has run that block since.
+      if (fate.recheck && fate.recheck !== "absent") return inBlock(fate.recheck.ran, link);
+      const r = afterTheFact("dropped", tx_id, mine, fate);
+      return { ...r, ...(r.status === "dropped" ? { dropped: true } : {}), summary, ...error, ...at, explorer: link };
+    }
+    const head = await client.status().then((st) => safeInt(st.height)).catch(() => undefined);
     const past = validUntil !== undefined && head !== undefined && head > validUntil;
     const next = past
       ? `This node dropped it without running it, and says the chain is at block ${head}, past its valid_until (${validUntil}): if that height is right, it can never execute and nothing was charged. It stays counted toward today's limit; check the height with another node before signing it again.`
       : `This node dropped it from its mempool without running it, so nothing was charged, but another node may still include it until ${until(validUntil)}. It still counts toward the daily limit. Do NOT send it again before then: check tx_status again, and tell the user it isn't confirmed yet.`;
-    return { status: "dropped", dropped: true, summary, ...error, ...(typeof tx.height === "number" ? { dropped_at_height: tx.height } : {}), valid_until: validUntil ?? "unknown", ...(head !== undefined ? { node_height: head } : {}), next, explorer: link };
+    return { status: "dropped", dropped: true, summary, ...error, ...at, valid_until: validUntil ?? "unknown", ...(head !== undefined ? { node_height: head } : {}), next, explorer: link };
   }
   return {
     status: clean(status),

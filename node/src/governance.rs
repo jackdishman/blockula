@@ -388,7 +388,13 @@ impl GovernanceJournal {
 }
 
 // Records store a proposal kind and a multisig action in their tx encoding (types.rs), which is
-// canonical and strictly decoded, as a length-prefixed byte string.
+// canonical and strictly decoded, as a length-prefixed byte string. So the tx encoding IS a state
+// encoding: any change to `Action::to_bytes`/`from_bytes` or `ProposalKind::to_bytes`/`from_bytes`
+// (a field added, removed or reordered, a width or tag changed) changes stored state (proposals,
+// pending multisig proposals) and the block logs, and needs a `SCHEMA_VERSION` bump (with its
+// history in codec.rs) and a `STORAGE_VERSION` bump (consensus.rs): an old record no longer decodes
+// (audit review-r3-wallet-2). Adding a new tag changes no stored record. The state test
+// `stored_actions_move_with_the_schema` pins every vector action's stored form to SCHEMA_VERSION.
 impl BorshSerialize for ProposalKind {
     fn serialize<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
         BorshSerialize::serialize(&self.to_bytes(), w)
@@ -401,6 +407,8 @@ impl BorshDeserialize for ProposalKind {
     }
 }
 
+// Stored in its tx encoding too: see the note above `impl BorshSerialize for ProposalKind`. Any
+// `Action::to_bytes` change needs a SCHEMA_VERSION and STORAGE_VERSION bump.
 impl BorshSerialize for Action {
     fn serialize<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
         BorshSerialize::serialize(&self.to_bytes(), w)

@@ -55,6 +55,9 @@ function api(p: string, missing: string[]): unknown {
   if (p === "/name/" + encodeURIComponent("old.boo")) return { name: "old.boo", status: "grace", available: false, owner: label(OWNER, "ghoul.boo"), registered_at: 1, expires_at: 900, grace_until: 2000 };
   if (p.startsWith("/account/")) return { account: label(OWNER, "ghoul.boo"), balance_display: "5 FANG", nonce: 1, names: ["ghoul.boo", "old.boo"], hunts_won: [], hunts_created: [], familiars: [], recent_txs: [], contribution: null };
   if (p === "/blocks?limit=15") return [];
+  // Failures answered from the node's failure memory, without the tx (node/src/api.rs `tx`).
+  if (p === `/tx/${"d0".repeat(32)}`) return { id: "d0".repeat(32), status: "failed", dropped: true, error: "expired: valid_until 990", height: 991, summary: "Transaction dropped without running: expired" };
+  if (p === `/tx/${"f0".repeat(32)}`) return { id: "f0".repeat(32), status: "failed", dropped: false, error: "insufficient balance", height: 991, summary: "Transaction failed: insufficient balance" };
   return null;
 }
 
@@ -109,6 +112,20 @@ test("governance lists proposals with tallies, council votes and timelock, and e
   await expect(app.locator('a[href^="javascript"]')).toHaveCount(0);
   await expect(app).toContainText("javascript:window.__pwned=2");
   expect(await page.evaluate(() => (window as unknown as { __pwned?: number }).__pwned)).toBeUndefined();
+});
+
+test("a tx dropped unrun isn't shown as a final failure (audit review-fix-clients-2)", async ({ page }) => {
+  await open(page, `#/tx/${"d0".repeat(32)}`);
+  const app = page.locator("#app");
+  await expect(app).toContainText("dropped from this node's mempool without running around block #991: nothing was charged, but another node may still include it until its valid_until, so don't send it again before then");
+  await expect(app.locator(".pill")).toHaveText(["dropped"]);
+  await expect(app.locator(".pill.failed")).toHaveCount(0);
+  await expect(app).not.toContainText("fee was charged");
+  // One that ran in a block and failed is final, and its fee was charged.
+  await page.goto(`${ORIGIN}/#/tx/${"f0".repeat(32)}`);
+  await expect(app).toContainText("It failed in block #991: its fee was charged, and nothing else happened. That's final.");
+  await expect(app.locator(".pill.failed")).toHaveText(["failed"]);
+  await expect(app).not.toContainText("may still include");
 });
 
 test("parameters are grouped and readable", async ({ page }) => {

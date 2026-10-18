@@ -78,9 +78,9 @@ Witness URLs must be `https://` (or `http://localhost` / `http://127.0.0.1` for 
 | `recovery-phrase.spec.ts` | BIP39 256-bit vectors, wordlist hash, round trips, abbreviations, error messages |
 | `mainnet.spec.ts` | Mainnet default and badge, pinned genesis, no browser-only keys, the build refusing a borrowed rpId or missing pins, a footer that doesn't call mainnet a test chain |
 | `stake.spec.ts` | Delegate, unstake an amount and the rest, withdraw once unbonded (each tx checked by the mock node), no CSP violations, a node lying about the stake's value or shares (the amount is signed), a node without staking |
-| `paylink.spec.ts` | Receive links carry their chain; an absurd amount is refused without crashing; Send fills a link made for this chain, refuses one made for another chain or instance, and fills an older link with a notice |
+| `paylink.spec.ts` | Receive links carry their chain and the canonical amount (a zero-padded one still fits a QR code); an absurd amount is refused without crashing; Send fills a link made for this chain, refuses one made for another chain or instance, refuses a malformed chain or genesis with fixed words, names only networks it knows, and fills an older link with a notice |
 | `governance.spec.ts` | Proposals with tallies, quorum and council votes; voting with conviction and changing the vote; releasing locks; hostile on-chain titles and links rendered inert; a node without governance |
-| `explorer.spec.ts` | The node's built-in explorer (`node/src/explorer.html`) on a mocked protocol v1 API: validator pools, Governance and proposal pages, parameters, name expiry, escaping |
+| `explorer.spec.ts` | The node's built-in explorer (`node/src/explorer.html`) on a mocked protocol v1 API: validator pools, Governance and proposal pages, parameters, name expiry, escaping, a dropped tx (not final, nothing charged) apart from one that failed in a block (its fee charged) |
 
 ## Manual release test matrix
 

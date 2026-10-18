@@ -2,7 +2,10 @@
 // a check only: a .boo name can be someone else's on another network, so Send refuses a link made
 // on another chain (or another instance of this one) and says which one it was made for; links
 // made before the check still fill the form, with a notice. Audit main-11-2: an amount too long
-// for a QR code used to crash /receive; amounts above a u64 of drops are refused.
+// for a QR code used to crash /receive; amounts above a u64 of drops are refused. Audit
+// review-r3-wallet-3: the link carries the amount's canonical form, not the typed one. Audit
+// review-r3-wallet-4: a link's chain is the sender's text: a malformed one is refused with fixed
+// words, and the wallet names only networks it knows.
 import { parseFang } from "@blockula/sdk";
 import { CHAIN_ID, GENESIS } from "./env";
 import { addressOf } from "./mock-node";
@@ -18,6 +21,11 @@ test("receive makes a link that says its chain, and survives an absurd amount", 
   await expect(link).toContainText(`chain=${CHAIN_ID}&genesis=${GENESIS.slice(0, 16)}`);
   await page.getByPlaceholder("Payer chooses").fill("1.5");
   await expect(link).toContainText(`/send?to=${account}&amount=1.5&chain=${CHAIN_ID}`);
+  // Zero-padded, it's still 1.5 FANG, and the link says so the short way: it fits a QR code.
+  await page.getByPlaceholder("Payer chooses").fill(`${"0".repeat(3000)}1.500`);
+  await expect(link).toContainText(`/send?to=${account}&amount=1.5&chain=${CHAIN_ID}`);
+  await expect(page.getByRole("img", { name: /^QR code: payment link to/ })).toBeVisible();
+  await expect(page.getByTestId("qr-too-long")).toHaveCount(0);
   // Too many digits for any amount (and for a QR code): refused, left out of the link, no crash.
   await page.getByPlaceholder("Payer chooses").fill("9".repeat(3000));
   await expect(page.getByText("That's more FANG than there can ever be.")).toBeVisible();
@@ -49,14 +57,36 @@ test("send fills a link made for this chain, and refuses one made for another", 
   // Made for another chain: nothing is filled in, it can't be reviewed, and it says which chain.
   await open("to=alice.boo&amount=1&memo=hi&chain=blockula-1&genesis=4d4d4d4d4d4d4d4d");
   const refused = page.getByTestId("paylink-refused");
-  await expect(refused).toContainText("made for chain “blockula-1”, but your wallet is on Testnet");
+  await expect(refused).toContainText("made for Mainnet, but your wallet is on Testnet");
+  // This build's menu has no Mainnet, so it doesn't send the payer looking for one.
+  await expect(refused).not.toContainText("switch networks");
   await expect(to).toHaveValue("");
   await expect(amount).toHaveValue("");
   await expect(review).toBeDisabled();
-  // Another instance of this chain id (a reset testnet), or a genesis that isn't one this wallet writes.
-  for (const genesis of ["0000000000000000", GENESIS.slice(0, 2)]) {
+  // A well-formed chain id this wallet doesn't know isn't named: it's the sender's text.
+  await open("to=alice.boo&amount=1&chain=Mainnet-upgrade-reimport-your-recovery-kit-at-evil-example");
+  await expect(refused).toContainText("made for a network this wallet doesn't know, not Testnet");
+  await expect(refused).not.toContainText("evil");
+  await expect(to).toHaveValue("");
+  await expect(review).toBeDisabled();
+  // Not a chain id at all (a bidi override and words): refused with fixed text, never echoed.
+  const bidi = encodeURIComponent("\u202eMainnet-upgrade: re-import your recovery kit at evil.example");
+  await open(`to=alice.boo&amount=1&memo=hi&chain=${bidi}`);
+  await expect(refused).toContainText("names its network in a form no Blockula network uses");
+  await expect(refused).not.toContainText("evil");
+  await expect(refused).not.toContainText("\u202e");
+  await expect(to).toHaveValue("");
+  await expect(review).toBeDisabled();
+  // Another instance of this chain id (a reset testnet).
+  await open(`to=alice.boo&amount=1&chain=${CHAIN_ID}&genesis=0000000000000000`);
+  await expect(refused).toContainText("made for another instance of Testnet (genesis 0000000000000000…)");
+  await expect(to).toHaveValue("");
+  await expect(review).toBeDisabled();
+  // A genesis that isn't one this wallet writes (too short to tell chains apart, or not hex) is malformed.
+  for (const genesis of [GENESIS.slice(0, 2), encodeURIComponent("\u202eevil.example 6e6e")]) {
     await open(`to=alice.boo&amount=1&chain=${CHAIN_ID}&genesis=${genesis}`);
-    await expect(page.getByTestId("paylink-refused")).toContainText("made for another instance of Testnet");
+    await expect(refused).toContainText("names its network in a form no Blockula network uses");
+    await expect(refused).not.toContainText("evil");
     await expect(to).toHaveValue("");
     await expect(review).toBeDisabled();
   }

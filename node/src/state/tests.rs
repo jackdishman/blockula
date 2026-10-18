@@ -443,6 +443,40 @@ fn golden_encodings() {
     assert_eq!(st.root(), "717a74bb8f4b498806dbcd36467ce6a90e6f06fa4e6e6fc66748bd7e14bf865a");
 }
 
+/// Proposals and multisig proposals store their kind and action in the tx encoding
+/// (governance.rs), so a tx encoding change is a state change (audit review-r3-wallet-2: round 3's
+/// `Undelegate.amount` changed stored multisig actions and only another package's bump covered
+/// it). This pins the stored form of a multisig proposal around every vector action (tags 0–61,
+/// so every proposal kind inside a `Propose` too) and of a proposal around each kind added since,
+/// to `SCHEMA_VERSION`: change an action's or a kind's encoding and this fails until the schema
+/// moves with it. Then bump `SCHEMA_VERSION` (and its history in codec.rs) and `STORAGE_VERSION`
+/// (the block logs hold txs in the same encoding), and record the new pair here. A new tag changes
+/// no existing record: add its vector and the new digest under the same version only then.
+#[test]
+fn stored_actions_move_with_the_schema() {
+    use crate::governance::{MultisigProposal, Proposal, ProposalStatus};
+    use crate::types::tests::{ghost_vector_actions, small_set_vector_actions, v1_vector_actions, vector_actions};
+    let stored = |action: Action| codec::encode(&MultisigProposal { id: 3, account: "boo1msig".into(), action, proposed_by: "ab".repeat(32), approvals: ["ab".repeat(32)].into(), created_at: 10, expires_at: 20 });
+    // The one that slipped: a pending multisig proposal to unbond 9 FANG by amount, byte for byte.
+    let undelegate = stored(Action::Undelegate { validator: "boo1v".into(), shares: 0, amount: 9 * crate::types::DROPS_PER_FANG });
+    // id, account, then the action as a u32-length-prefixed tx encoding (24 bytes: tag 31, the
+    // validator, `shares` 0, `amount` 9e9), then the proposer, approvals and heights.
+    assert_eq!(hex::encode(&undelegate), "030000000000000008000000626f6f316d736967180000001f0500626f6f31760000000000000000001a71180200000040000000616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261620100000040000000616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261620a000000000000001400000000000000");
+    assert_eq!(codec::decode::<MultisigProposal>(&undelegate).unwrap().action, Action::Undelegate { validator: "boo1v".into(), shares: 0, amount: 9 * crate::types::DROPS_PER_FANG });
+    let mut h = blake3::Hasher::new();
+    for action in [vector_actions(), v1_vector_actions(), ghost_vector_actions(), small_set_vector_actions()].concat() {
+        h.update(&stored(action));
+    }
+    for kind in [ProposalKind::UnflagSybil { account: "x.boo".into(), reason: "r".into() }, ProposalKind::CancelUpgrade { version: 2, activation_height: 100_000 }] {
+        h.update(&codec::encode(&Proposal { id: 1, proposer: "boo1p".into(), kind, title: "t".into(), url: String::new(), deposit: 5, created_at: 1, voting_end: 2, execute_at: None, status: ProposalStatus::Voting, aye_amount: 0, nay_amount: 0, aye_weight: 0, nay_weight: 0, voters: 0, council: Default::default(), tally: None, outcome: String::new() }));
+    }
+    assert_eq!(
+        (codec::SCHEMA_VERSION, h.finalize().to_hex().to_string()),
+        (9, "2f62e684887501fe9f9983b5a5612f3cd8f88c0d3bc91fe07ce952ec0f238d64".to_string()),
+        "a stored action or proposal kind encodes differently: proposals and multisig proposals hold them in the tx encoding, so this is a state change. Bump SCHEMA_VERSION (codec.rs, with its history) and STORAGE_VERSION (consensus.rs), then record the new pair here"
+    );
+}
+
 fn million_accounts() -> State {
     let mut st = State::default();
     for i in 0..1_000_000u64 {
