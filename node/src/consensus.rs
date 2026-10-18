@@ -103,6 +103,11 @@ pub const MAX_REPLAY: usize = 64;
 pub const PROTOCOL_VERSION: u32 = 1;
 /// Newest protocol version this binary supports, signalled in every block it proposes.
 pub const SUPPORTED_PROTOCOL_VERSION: u32 = 1;
+/// The protocol version and signal the genesis block carries, on every binary: its digest is the
+/// genesis hash every node, tx and checkpoint pins, so it can't follow a release's
+/// [`PROTOCOL_VERSION`] or [`SUPPORTED_PROTOCOL_VERSION`] (a release signalling an upgrade would
+/// otherwise derive another genesis and refuse its own chain).
+pub const GENESIS_PROTOCOL_VERSION: u32 = 1;
 
 /// The block consensus agrees on (CBlock v2). Txs are carried in their wire form
 /// (`Tx::to_bytes`), so the digest is over canonical bytes and every node parses the same thing.
@@ -274,7 +279,7 @@ pub fn genesis_block(g: &Genesis) -> CBlock {
     let (id, prefix) = (g.chain_id.as_bytes(), g.address_prefix.as_bytes());
     let seed = Blake3::hash(&[b"BLOCKULA_GENESIS_V2", &(id.len() as u32).to_be_bytes(), id, &(prefix.len() as u32).to_be_bytes(), prefix, &g.created_at_ms.to_be_bytes(), serde_json::to_string(&g.validators).unwrap().as_bytes()]);
     let root = g.initial_state().root();
-    CBlock::new(seed, 0, 0, 0, g.created_at_ms, String::new(), 0, hex_32(&root), vec![])
+    CBlock::new(seed, 0, 0, 0, g.created_at_ms, String::new(), 0, hex_32(&root), vec![]).with_versions(GENESIS_PROTOCOL_VERSION, GENESIS_PROTOCOL_VERSION)
 }
 
 pub fn hex_32(s: &str) -> [u8; 32] {
@@ -1663,6 +1668,26 @@ mod tests {
     use commonware_codec::DecodeExt as _;
     use commonware_consensus::types::{Round, View};
     use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
+
+    /// The genesis hash is the genesis block's digest, which covers its version and signal: they
+    /// are fixed, not the binary's, so a release that executes or signals a newer protocol derives
+    /// the same genesis hash as the one that launched the chain (resume-core-2).
+    #[test]
+    fn the_genesis_block_doesnt_follow_the_binarys_versions() {
+        let home = std::env::temp_dir().join(format!("blockula-genver-{}-{}", crate::chain::now_ms(), std::process::id()));
+        Chain::summon(&home, &SummonOpts::new("genver", 1)).unwrap();
+        let g = Genesis::load(&home.join("genesis.json")).unwrap();
+        let b = genesis_block(&g);
+        assert_eq!((b.version, b.signal), (GENESIS_PROTOCOL_VERSION, GENESIS_PROTOCOL_VERSION));
+        assert_eq!(GENESIS_PROTOCOL_VERSION, 1, "changing it changes every chain's genesis hash");
+        assert_eq!(crate::checkpoints::genesis_hash(&g), hex::encode(b.digest_bytes()));
+        // A binary built for v2 (signalling it, or executing it) would derive another hash if the
+        // genesis block took its constants.
+        for (version, signal) in [(1, 2), (2, 2)] {
+            assert_ne!(b.clone().with_versions(version, signal).digest(), b.digest());
+        }
+        std::fs::remove_dir_all(home).ok();
+    }
 
     #[test]
     fn cblock_v2_encodes_decodes_and_commits_to_every_field() {
