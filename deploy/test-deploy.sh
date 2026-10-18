@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Offline tests of the testnet's deploy scripts (CI `ops` job): deploy/entrypoint.sh against a
-# stand-in `blockula` that records how it was started, and the machine configurations
-# deploy/launch.sh deploys (deploy/fly-config.sh). Nothing here talks to Fly.
+# stand-in `blockula` that records how it was started, the machine configurations
+# deploy/launch.sh deploys (deploy/fly-config.sh), and launch.sh and set-github-token.sh against
+# stand-in `fly`, `curl` and `blockula` commands. Nothing here talks to Fly.
 #
 #   bash deploy/test-deploy.sh
 set -euo pipefail
@@ -144,6 +145,106 @@ if "$PY" -c "import tomllib" 2>/dev/null; then
 else
   echo "(python3 has no tomllib here: TOML syntax not checked)"
 fi
+
+# ---- launch.sh and set-github-token.sh, against a stand-in fly ----
+
+# The stand-in fly keeps each app's secret names in $FAKE_FLY/<app>.secrets (never values) and
+# logs every call; FAKE_FLY_BUILD_FAIL fails the image build, FAKE_FLY_DEPLOY_FAIL=<app> that
+# app's deploy. Each deploy records whether the app held VALIDATOR_KEY_B64 at the time.
+mkdir -p "$T/bin" "$T/fly"
+cat > "$T/bin/fly" <<'STUB'
+#!/usr/bin/env bash
+S=$FAKE_FLY
+echo "$*" >> "$S/log"
+app="" cfg=""
+args=("$@")
+for ((k = 0; k < ${#args[@]}; k++)); do
+  case ${args[$k]} in -a) app=${args[$((k + 1))]} ;; -c) cfg=${args[$((k + 1))]} ;; esac
+done
+secrets=$S/$app.secrets
+case "$1 ${2:-}" in
+  "auth whoami") echo tester ;;
+  "apps list") echo '[]' ;;
+  "machines list") echo "[{\"id\":\"m-$app\"}]" ;;
+  "volumes list") echo '[]' ;;
+  "ips list") echo '[{"Type":"v4","Address":"203.0.113.7"}]' ;;
+  "secrets list") touch "$secrets"; jq -Rn '[inputs | select(length > 0) | {name: .}]' < "$secrets" ;;
+  "secrets import") touch "$secrets"; while IFS='=' read -r k _; do [ -z "$k" ] || grep -qx "$k" "$secrets" || echo "$k" >> "$secrets"; done ;;
+  "secrets unset") touch "$secrets"; { grep -vx "$3" "$secrets" || true; } > "$S/tmp"; mv "$S/tmp" "$secrets" ;;
+  deploy*)
+    if printf '%s\n' "$*" | grep -q -- --build-only; then [ -z "${FAKE_FLY_BUILD_FAIL:-}" ] || exit 1; exit 0; fi
+    app=$(sed -nE 's/^app = "(.*)"/\1/p' "$cfg")
+    touch "$S/$app.secrets"
+    echo "$app key=$(grep -qx VALIDATOR_KEY_B64 "$S/$app.secrets" && echo yes || echo no)" >> "$S/deploys"
+    [ "${FAKE_FLY_DEPLOY_FAIL:-}" != "$app" ] || exit 1 ;;
+esac
+exit 0
+STUB
+# The stand-in curl: /api/status rises 3 blocks a call (FAKE_STALL: stays put); GitHub accepts.
+cat > "$T/bin/curl" <<'STUB'
+#!/usr/bin/env bash
+for a; do url=$a; done
+case $url in
+  */api/status) h=$(cat "$FAKE_FLY/height" 2>/dev/null || echo 100); [ -n "${FAKE_STALL:-}" ] || h=$((h + 3)); echo "$h" > "$FAKE_FLY/height"; echo "{\"height\":$h}" ;;
+  */api/health) echo '{}' ;;
+  https://api.github.com/*) cat > /dev/null; printf 'HTTP/2 200 \r\ncontent-type: application/json\r\n\r\n' ;;
+  *) exit 7 ;;
+esac
+STUB
+# A stand-in blockula for the genesis steps: keys, operator files, a genesis with the spec's clock.
+cat > "$T/bin/blockula-launch" <<'STUB'
+#!/usr/bin/env bash
+case "$1 ${2:-}" in
+  "keygen "*) echo "{\"address\":\"tboo1$(openssl rand -hex 8)\",\"seed\":\"$(openssl rand -hex 32)\"}" ;;
+  "genesis operator") while [ $# -gt 0 ]; do [ "$1" = --out ] && echo "# operator" > "$2"; shift; done ;;
+  "genesis build")
+    spec=$4 out=$6
+    printf '{"chain_id":"%s","created_at_ms":%s}\n' "$(sed -nE 's/^chain_id = "(.*)"/\1/p' "$spec")" "$(sed -nE 's/^genesis_time_ms = //p' "$spec")" > "$out" ;;
+  "checkpoint --genesis") shasum -a 256 "$3" | cut -c1-64 ;;
+esac
+STUB
+chmod +x "$T/bin/fly" "$T/bin/curl" "$T/bin/blockula-launch"
+# launch [VAR=value …]: runs launch.sh (a fresh log), prints its exit code.
+launch() {
+  : > "$T/fly/log"; : > "$T/fly/deploys"
+  env PATH="$T/bin:$PATH" HOME="$T/home" FAKE_FLY="$T/fly" BIN="$T/bin/blockula-launch" SKIP_BUILD=1 "$@" \
+    bash deploy/launch.sh > "$T/launch.out" 2>&1 && echo 0 || echo $?
+}
+has() { grep -qx "$2" "$T/fly/$1.secrets" 2>/dev/null; }
+NETDIR=$T/home/.config/blockula
+
+# A first attempt dies at the image build, after the secrets were staged.
+code=$(launch RESET=1 CHAIN_ID=t-a FAKE_FLY_BUILD_FAIL=1)
+[ "$code" != 0 ] && [ -f "$NETDIR/t-a/secrets-staged" ] && [ ! -f "$NETDIR/t-a/launched" ] && [ ! -s "$T/fly/deploys" ] \
+  && ok "launch: a failed image build stages secrets and deploys nothing" || bad "launch: failed build exited $code: $(cat "$T/launch.out")"
+# The retry (the same command) wipes the apps' secrets, so it must stage them again.
+code=$(launch RESET=1 CHAIN_ID=t-a)
+[ "$code" = 0 ] || bad "launch: retry exited $code: $(cat "$T/launch.out")"
+expect "launch: after RESET the retry stages each validator's key again" "$(cat "$T/fly/deploys")" "blockula-v3 key=yes"
+refute "launch: no validator deploys without its key" "$(cat "$T/fly/deploys")" "v0 key=no"
+has blockula-testnet BLOCKULA_FORWARDER_SECRET && ok "launch: the public node has the forwarder secret again" || bad "launch: the public node lost its forwarder secret"
+has blockula-v2 VALIDATOR_KEY_B64 && bad "launch: a key was left in Fly" || ok "launch: every key removed from Fly once seeded"
+code=$(launch RESET=1 CHAIN_ID=t-a)
+[ "$code" != 0 ] && expect "launch: RESET refused once launched" "$(cat "$T/launch.out")" "never reused" || bad "launch: RESET of a launched chain exited $code"
+code=$(launch CHAIN_ID=t-a)
+[ "$code" = 0 ] && expect "launch: re-running a launched chain redeploys it (keys stay off Fly)" "$(cat "$T/fly/deploys")" "blockula-v0 key=no" || bad "launch: upgrade exited $code: $(cat "$T/launch.out")"
+
+# A validator deploy fails: the launch stops (no public node), and the chain counts as launched.
+code=$(launch RESET=1 CHAIN_ID=t-b FAKE_FLY_DEPLOY_FAIL=blockula-v2)
+[ "$code" != 0 ] && expect "launch: a failed validator deploy stops the launch" "$(cat "$T/launch.out")" "deploying blockula-v2 failed" || bad "launch: failed deploy exited $code: $(cat "$T/launch.out")"
+refute "launch: no public node after a failed validator deploy" "$(cat "$T/fly/deploys")" "blockula-testnet"
+code=$(launch RESET=1 CHAIN_ID=t-b)
+[ -f "$NETDIR/t-b/launched" ] && [ "$code" != 0 ] && ok "launch: once validators were deployed, RESET is refused (their genesis may have signed blocks)" || bad "launch: RESET after a partial launch exited $code"
+
+# A genesis an earlier attempt built two days ago isn't launched as it is.
+code=$(launch RESET=1 CHAIN_ID=t-d FAKE_FLY_BUILD_FAIL=1)
+g=$NETDIR/t-d/genesis.json
+jq --argjson t "$((($(date +%s) - 2 * 86400) * 1000))" '.created_at_ms = $t' "$g" > "$T/g" && mv "$T/g" "$g"
+code=$(launch RESET=1 CHAIN_ID=t-d)
+[ "$code" != 0 ] && expect "launch: refuses an unlaunched genesis built days ago" "$(cat "$T/launch.out")" "was built 48 h ago" || bad "launch: old genesis exited $code: $(cat "$T/launch.out")"
+[ ! -f "$NETDIR/t-d/launched" ] && [ ! -s "$T/fly/deploys" ] && ok "launch: and deploys nothing" || bad "launch: old genesis deployed"
+code=$(launch RESET=1 CHAIN_ID=t-d GENESIS_MAX_AGE_HOURS=72)
+[ "$code" = 0 ] && ok "launch: GENESIS_MAX_AGE_HOURS launches it anyway" || bad "launch: old genesis with override exited $code: $(cat "$T/launch.out")"
 
 if [ $fails -gt 0 ]; then echo "✗ $fails failed" >&2; exit 1; fi
 echo "✓ deploy scripts behave"
