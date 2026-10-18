@@ -11,6 +11,8 @@
 #     secret), its owner tops up the self-bond and unjails it, and it rejoins;
 #   - after the (shortened) weak-subjectivity period, a plain `join` from the genesis is refused,
 #     and a fresh public node joins through the entrypoint's checkpoint path;
+#   - every validator restarting at once (launch.sh's redeploy, relaunch step 6) and the public
+#     node restarting from its joined home: the chain resumes with all four signing;
 #   - the SDK e2e passes against the public node, and every node agrees on a block and root.
 #
 #   scripts/rehearse-testnet.sh                 # build, run, tear down
@@ -182,6 +184,35 @@ wait_height "$JOINER" "$(height "$(vhttp 0)")" 300
 cp_h=$(get "$JOINER/api/status" | j 'v.checkpoint_height')
 [ "$cp_h" -gt 0 ] || fail "the joiner trusts no checkpoint: $(get "$JOINER/api/status")"
 echo "✓ a fresh public node joined after the period through the entrypoint (checkpoint #$cp_h from its validators)"
+
+# launch.sh redeploys every validator in parallel (relaunch step 6, upgrades): all four stop and
+# start from their volumes at once, and slashing protection must let them sign again. Then the
+# public node restarts (`run` from its joined home).
+# (After the late join: each restart costs missed slots, and on a release without timed
+# checkpoints, review-r3-sync-1, a joiner measures a fresh checkpoint's age from the genesis
+# clock, so the deficit would eat this rehearsal's 60-block period.)
+stop_node() { kill "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true; }
+h0=$(height "$(vhttp 0)")
+for i in 0 1 2 3; do kill "${PIDS[$i]}" 2>/dev/null || true; done
+for i in 0 1 2 3; do stop_node "${PIDS[$i]}"; done
+pkill -f "run --home $DIR/v[0-3]/home" 2>/dev/null || true
+for i in 0 1 2 3; do start_validator "$i"; done
+wait_height "$(vhttp 0)" $((h0 + 2 * EPOCH)) 300
+for i in 0 1 2 3; do wait_height "$(vhttp "$i")" $((h0 + 2 * EPOCH)) 60; done
+four() { get "$RPC/api/validators" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const v=JSON.parse(s);process.exit(v.active.length===4&&!(v.jailed??[]).length?0:1)})"; }
+four || fail "after restarting every validator at once: $(get "$RPC/api/validators" | j 'JSON.stringify({active: v.active.length, jailed: (v.jailed ?? []).map(x => x.validator.address)})')"
+# Each one proposed again since the restart: all four sign, none is stuck abstaining.
+proposers=$(for h in $(seq $((h0 + EPOCH)) $((h0 + 2 * EPOCH))); do get "$(vhttp 0)/api/block/$h" | j 'typeof v.proposer === "string" ? v.proposer : v.proposer.address'; done | sort -u | wc -l | tr -d ' ')
+[ "$proposers" = 4 ] || fail "after restarting every validator at once, only $proposers validators proposed blocks"
+echo "✓ every validator restarted at once (a redeploy): the chain resumed at #$h0+, all 4 proposing, none jailed"
+RPC_PID=${PIDS[4]}
+stop_node "$RPC_PID"
+pkill -f "run --home $DIR/rpc/full" 2>/dev/null || true
+pkill -f "join --genesis .* --home $DIR/rpc/full" 2>/dev/null || true
+start_rpc "$DIR/rpc" "$RPC_PORT" "$DIR/rpc.log"
+wait_height "$RPC" "$(height "$(vhttp 0)")" 120
+grep -q "Full node for" "$DIR/rpc.log" || fail "the public node didn't restart: $(tail -5 "$DIR/rpc.log")"
+echo "✓ the public node restarted from its joined home and caught up"
 
 echo "— SDK e2e against the public node"
 BLOCKULA_RPC=$RPC npm test -w @blockula/sdk > "$DIR/e2e.log" 2>&1 || { tail -40 "$DIR/e2e.log" >&2; fail "SDK e2e (log: $DIR/e2e.log)"; }
