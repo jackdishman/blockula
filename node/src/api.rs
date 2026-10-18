@@ -3316,14 +3316,15 @@ mod http_tests {
         // What an account can move: the vote's conviction lock holds its amount, net of stake
         // (econ::free), and `locks` says why; a wallet's preflight checks payments against it.
         let (_, a, _) = get(format!("/api/account/{me}")).await;
-        let c = n.chain.lock();
-        let at = crate::econ::now(&c.state);
+        let transferable = {
+            let c = n.chain.lock();
+            crate::econ::transferable(&c.state, &me, crate::econ::now(&c.state))
+        };
         assert_eq!(a["locked"].as_str(), Some((100_000_000 * FANG).to_string().as_str()), "{a}");
-        assert_eq!(a["transferable"].as_str(), Some(crate::econ::transferable(&c.state, &me, at).to_string().as_str()), "{a}");
+        assert_eq!(a["transferable"].as_str(), Some(transferable.to_string().as_str()), "{a}");
         assert!(a["transferable"].as_str().unwrap().parse::<u64>().unwrap() <= a["balance"].as_str().unwrap().parse::<u64>().unwrap(), "{a}");
         assert_eq!((a["locks"][0]["id"].as_str(), a["locks"][0]["vesting"].as_bool()), (Some("vote:0"), Some(false)), "{a}");
         assert_eq!((a["exists"].as_bool(), a["creation_fee"].as_str()), (Some(true), Some("0")), "{a}");
-        drop(c);
         // An address with no account yet: paying it burns the creation fee from the payer.
         let fresh = crate::crypto::Keys::from_seed([77; 32]).address();
         let (_, f, _) = get(format!("/api/account/{fresh}")).await;
