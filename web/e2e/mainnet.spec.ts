@@ -3,6 +3,7 @@
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { MAINNET_GENESIS, MAINNET_RPC } from "./env";
+import { Wallet, encodeKeyGrant, parseFang } from "@blockula/sdk";
 import { addressOf } from "./mock-node";
 import { createWallet, expect, test } from "./helpers";
 
@@ -150,4 +151,28 @@ test("explorer forms on mainnet: an unproven name is refused where an address is
   await expect(page.locator(".receipt .headline")).toBeVisible();
   expect(node.submitted.slice(before).map((t) => t.action)).toEqual([{ type: "transfer", to: "alice.boo", amount: "1000000000" }]);
   expect(node.accounts.get(alice)?.balance).toBe(1_000_000_000n);
+});
+
+// Audit review-r3-clients-4: the agent is told the account's address (the wallet's own, not a
+// node's answer), with the name only as a label: on mainnet an agent won't act for a name one
+// node vouched for (the SDK's actAs throws, the MCP's use_account asks to confirm the address).
+test("an agent's budget is set up by the account's address, its name only a label", async ({ page, node }) => {
+  node.faucet = false;
+  const hint = await createWallet(page);
+  node.names.set("alice", hint.account);
+  node.accounts.set(hint.account, { balance: parseFang("10"), nonce: 0 });
+  await page.goto("/devices#agent");
+  await page.getByRole("button", { name: "Unlock with passkey" }).click();
+  const agentSection = page.locator("#agent");
+  await expect(page.getByTestId("agent-account")).toHaveText(hint.account);
+  await expect(agentSection).toContainText("(alice.boo)");
+  const agent = Wallet.fromSeed("ab".repeat(32));
+  const grant = await agent.keyGrant(hint.account, { chainId: "blockula-1", genesisHash: MAINNET_GENESIS });
+  await agentSection.getByPlaceholder("bkgrant1.…").fill(encodeKeyGrant(grant));
+  await agentSection.getByRole("button", { name: "Allow 10 FANG/day" }).click();
+  const snippet = agentSection.locator("pre.snippet");
+  await expect(snippet).toContainText(`Your Blockula key may now spend from alice.boo (${hint.account})`);
+  await expect(snippet).toContainText(`call use_account with account "${hint.account}"`);
+  await expect(snippet).toContainText(`await wallet.actAs("${hint.account}");`);
+  await expect(snippet).not.toContainText('"alice.boo"');
 });

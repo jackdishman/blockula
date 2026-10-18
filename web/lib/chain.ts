@@ -1,4 +1,4 @@
-import { Client } from "@blockula/sdk";
+import { Client, HeightAheadError, heightLimit } from "@blockula/sdk";
 import { KNOWN_GENESIS, NETWORK, type Network } from "./config";
 import type { Status } from "./types";
 
@@ -64,6 +64,41 @@ export function saveCustomPin(rpc: string, pin: ChainPin | null) {
   }
 }
 
+/** A chain's genesis clock: its genesis.json's `created_at_ms` and `block_time_ms`. */
+export interface GenesisClock {
+  createdAtMs: number;
+  blockTimeMs: number;
+}
+
+/** The genesis clock in a node's `/api/genesis` answer for `chainId`, if it is one. */
+export function clockOf(genesis: unknown, chainId: string): GenesisClock | undefined {
+  const g = genesis && typeof genesis === "object" ? (genesis as Record<string, unknown>) : {};
+  const { created_at_ms: createdAtMs, block_time_ms: blockTimeMs } = g;
+  if (g.chain_id !== chainId || !Number.isSafeInteger(createdAtMs) || (createdAtMs as number) < 0 || !Number.isSafeInteger(blockTimeMs) || (blockTimeMs as number) < 1) return undefined;
+  return { createdAtMs: createdAtMs as number, blockTimeMs: blockTimeMs as number };
+}
+
+const CLOCKS = "blockula.genesisClock";
+
+/** Genesis clocks are a property of the chain (its id and genesis hash), remembered on first use. */
+function savedClock(chainId: string, genesisHash: string): GenesisClock | undefined {
+  try {
+    return clockOf({ ...(JSON.parse(localStorage.getItem(CLOCKS) ?? "{}") as Record<string, Record<string, unknown>>)[`${chainId} ${genesisHash}`], chain_id: chainId }, chainId);
+  } catch {
+    return undefined;
+  }
+}
+
+function saveClock(chainId: string, genesisHash: string, c: GenesisClock) {
+  try {
+    const all = JSON.parse(localStorage.getItem(CLOCKS) ?? "{}") as Record<string, unknown>;
+    all[`${chainId} ${genesisHash}`] = { created_at_ms: c.createdAtMs, block_time_ms: c.blockTimeMs };
+    localStorage.setItem(CLOCKS, JSON.stringify(all));
+  } catch {
+    /* storage unavailable: this session only */
+  }
+}
+
 /** The pin to start from for a network: its configured chain, or a custom node's remembered one. */
 export function initialPin(net: Network): ChainPin {
   if (net.key === "custom") return (typeof window !== "undefined" && savedCustomPin(net.rpc)) || {};
@@ -83,6 +118,44 @@ export class PinnedClient extends Client {
     // `Wallet.address` renders with the client's prefix: use the pinned one before the first
     // status arrives (which still checks it, through `status()` below).
     if (pin.prefix) this.prefix = pin.prefix;
+  }
+
+  private clock?: Promise<GenesisClock | undefined>;
+
+  /**
+   * The pinned chain's genesis clock: remembered in this browser for the chain's id and genesis
+   * hash, else read from the node's `/api/genesis` once and remembered (trust on first use, like
+   * a custom node's pin). `undefined` when the node serves none.
+   */
+  private chainClock(): Promise<GenesisClock | undefined> {
+    const { chainId, genesisHash } = this.pin;
+    if (!chainId || !genesisHash) return Promise.resolve(undefined);
+    const saved = typeof window === "undefined" ? undefined : savedClock(chainId, genesisHash);
+    if (saved) return Promise.resolve(saved);
+    this.clock ??= this.genesis().then(
+      (g) => {
+        const c = clockOf(g, chainId);
+        if (c && typeof window !== "undefined") saveClock(chainId, genesisHash, c);
+        return c;
+      },
+      () => undefined,
+    );
+    return this.clock;
+  }
+
+  /**
+   * Before anything is signed, the height a tx's validity window counts from must be one the chain
+   * can have reached by this machine's clock and the chain's genesis clock: a node reporting a
+   * future height could hold the signed tx and release it later, when a name signed in it may
+   * have changed hands (audit review-r3-clients-2). Then the SDK's own checks (witnesses).
+   */
+  async checkSigningHeight(height: number): Promise<void> {
+    const c = await this.chainClock();
+    if (c) {
+      const limit = heightLimit(c.createdAtMs, c.blockTimeMs, Date.now());
+      if (height > limit) throw new HeightAheadError(this.rpc, height, limit, "this machine's clock and the chain's genesis");
+    }
+    return super.checkSigningHeight(height);
   }
 
   async status(): Promise<Status> {

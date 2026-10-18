@@ -5,8 +5,10 @@
 // They never throw. Content a client can't read exactly (an unknown type, a number past 2^53 that
 // JSON rounded, a malformed amount or account) is described as such, so a UI can say "don't vote
 // on this" instead of rendering something it guessed.
+import { blake3 } from "@noble/hashes/blake3.js";
+import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
 import { bech32m } from "@scure/base";
-import { DROPS_PER_FANG } from "./tx.js";
+import { DROPS_PER_FANG, PUBLIC_KEY_LEN, proposalDigest, type ProposalKind } from "./tx.js";
 
 /** Options of `describeKind` / `describeAction`. */
 export interface DescribeOptions {
@@ -15,6 +17,14 @@ export interface DescribeOptions {
    * Default true. Pass false where it must be shown apart, marked untrusted (an agent's tools do).
    */
   freeText?: boolean;
+  /**
+   * For a `vote` action (a multisig's ballot): the node's read of the proposal it names
+   * (`client.proposal(id)`). A vote binds that proposal's content by digest, not by id (audit
+   * gap-7-6), so the proposal is described only if its kind, title and link hash to the digest
+   * the vote binds; otherwise the description says the node's proposal isn't what it backs.
+   * `reviewAction` says whether that makes the action fit to approve.
+   */
+  proposal?: unknown;
 }
 
 const obj = (v: unknown): Record<string, unknown> => (v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {});
@@ -110,6 +120,39 @@ function quoted(v: unknown, label: string, opts: DescribeOptions): string {
   return ` (${label}, as written: “${t.length > 200 ? t.slice(0, 200).join("") + "…" : t.join("")}”)`;
 }
 
+/** A network address field (host:port or a URL) as written, quoted on one line, or an unreadable one. */
+function netAddr(v: unknown): string {
+  if (typeof v !== "string" || v.length > 256) return "an unreadable address";
+  const t = [...v.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\s]+/gu, " ").replace(/[“”]/g, '"').trim()];
+  return `“${t.length > 120 ? t.slice(0, 120).join("") + "…" : t.join("")}”`;
+}
+
+/** A consensus key (hex ML-DSA-65 public key) by its key id, shortened like the other key ids. */
+function consensusKey(v: unknown): string {
+  if (typeof v !== "string" || !new RegExp(`^[0-9a-f]{${PUBLIC_KEY_LEN * 2}}$`).test(v)) return "an unreadable consensus key";
+  return `consensus key ${hex(bytesToHex(blake3(hexToBytes(v))), 32, "key id")}`;
+}
+
+/**
+ * What a `vote` action backs, given the node's read of the proposal it names (`opts.proposal`):
+ * `ok` only when that proposal's content hashes to the digest the vote binds (no node can make
+ * other content do that), and the text to append to the vote's description.
+ */
+function voteTarget(a: Record<string, unknown>, opts: DescribeOptions): { ok: boolean; text: string } {
+  const id = n(a.proposal_id);
+  if (opts.proposal === undefined) return { ok: false, text: `: read proposal #${id} and check its digest before approving` };
+  const p = obj(opts.proposal);
+  let digest: string | null = null;
+  try {
+    digest = p.kind && typeof p.kind === "object" ? proposalDigest(p.kind as ProposalKind, String(p.title ?? ""), typeof p.url === "string" ? p.url : "") : null;
+  } catch {
+    digest = null;
+  }
+  if (digest === null) return { ok: false, text: `; this client can't read the node's proposal #${id} exactly: don't approve it` };
+  if (digest !== a.proposal_digest) return { ok: false, text: `; but that's NOT what the node shows as proposal #${id} (${describeKind(p.kind, { freeText: false })}, digest ${digest}): the node is showing another proposal, or the vote was made for content #${id} doesn't have. Don't approve it` };
+  return { ok: true, text: `: proposal #${id} (its content has exactly that digest), which does this: ${describeKind(p.kind, opts)}${quoted(p.title, "title", opts)}` };
+}
+
 const REPO = /^[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}$/;
 const HANDLE = /^[A-Za-z0-9-]{1,39}$/;
 const KEY = /^[a-z0-9_]{1,64}$/;
@@ -149,7 +192,9 @@ export function describeKind(kind: unknown, opts: DescribeOptions = {}): string 
     case "schedule_upgrade":
       return `Switch the chain to protocol version ${n(k.version)} at block #${n(k.activation_height)} (nodes that can't run it stop there)`;
     case "cancel_upgrade":
-      return `Cancel the scheduled upgrade to protocol version ${n(k.version)} at block #${n(k.activation_height)}, and any upgrade scheduled after it`;
+      // The same sentence as the CLI's describe_kind and the node's static text (audit
+      // review-r3-clients-1): a cancellation also supersedes every upgrade proposal still open.
+      return `Cancel the upgrade to protocol v${n(k.version)} at block ${n(k.activation_height)} and any upgrade scheduled after it; upgrade proposals still open when it runs are superseded and can't take effect`;
     case "activate_feature":
       return `Turn on the feature ${token(k.feature, FEATURE, "feature")}`;
     case "deactivate_feature":
@@ -186,7 +231,9 @@ export function describeAction(action: unknown, opts: DescribeOptions = {}): str
     case "remove_key":
       return `Remove key ${hex(a.key_id, 32, "key id")} from the account`;
     case "register_validator":
-      return `Register a validator, bonding ${fangText(a.bond)} from the account`;
+      // The consensus key decides who signs for (and can be slashed with) the bonded pool: named
+      // by its key id, the 32 bytes the validator's address carries (review-r3-clients-5).
+      return `Register a validator with ${consensusKey(a.consensus_key)} (it signs for the validator; the validator's address carries the same key id), p2p address ${netAddr(a.p2p_addr)}, HTTP address ${netAddr(a.http_addr)}, bonding ${fangText(a.bond)} from the account`;
     case "approve_validator":
       return `Approve validator ${account(a.validator)} (admin chains only)`;
     case "remove_validator":
@@ -251,7 +298,8 @@ export function describeAction(action: unknown, opts: DescribeOptions = {}): str
     case "withdraw_unbonded":
       return "Withdraw the stake that has finished unbonding";
     case "update_validator":
-      return `Set the account's validator commission to ${n(a.commission_bps)} basis points${typeof a.p2p_addr === "string" && a.p2p_addr ? " and change its addresses" : ""}`;
+      // Each address separately: on chain an empty one means "keep it" (review-r3-clients-5).
+      return `Set the account's validator commission to ${n(a.commission_bps)} basis points${a.p2p_addr === "" ? "" : `, its p2p address to ${netAddr(a.p2p_addr)}`}${a.http_addr === "" ? "" : `, its HTTP address to ${netAddr(a.http_addr)}`}`;
     case "unjail":
       return `Unjail validator ${account(a.validator)}`;
     case "report_equivocation":
@@ -263,7 +311,8 @@ export function describeAction(action: unknown, opts: DescribeOptions = {}): str
     case "propose":
       return `Propose, bonding ${fangText(a.deposit)}: ${describeKind(a.kind, opts)}${quoted(a.title, "title", opts)}`;
     case "vote":
-      return `Vote ${a.aye === true ? "aye" : a.aye === false ? "nay" : "(unreadable side)"} on proposal #${n(a.proposal_id)} with ${fangText(a.amount)} at conviction ${n(a.conviction)}`;
+      // What #id is comes from the digest the vote binds, never from the id (audit gap-7-6).
+      return `Vote ${a.aye === true ? "aye" : a.aye === false ? "nay" : "(unreadable side)"} on proposal #${n(a.proposal_id)} with ${fangText(a.amount)} at conviction ${n(a.conviction)}, binding the proposal whose content has digest ${typeof a.proposal_digest === "string" && /^[0-9a-f]{64}$/.test(a.proposal_digest) ? a.proposal_digest : "(unreadable)"}${voteTarget(a, opts).text}`;
     case "unlock":
       return "Release the account's expired vote locks";
     case "multisig_create": {
@@ -301,4 +350,33 @@ export function describeAction(action: unknown, opts: DescribeOptions = {}): str
     default:
       return `Something this client can't read (an action of type ${typeof a.type === "string" ? token(a.type, /^[a-z_]{1,40}$/, "type") : "unknown"}): don't approve it from here`;
   }
+}
+
+/** Whether an approver can act on a description (`reviewAction`). */
+export interface ActionReview {
+  /** `describeAction(action, opts)`. */
+  does: string;
+  /**
+   * Whether this client could read all of it: false for anything it described as unreadable
+   * (an unknown type, a malformed field, a number JSON rounded, a key id the chain couldn't store)
+   * and for a `vote` whose proposal (`opts.proposal`) wasn't given or doesn't hash to the digest
+   * it binds. Don't offer to approve an action that isn't `readable`.
+   */
+  readable: boolean;
+}
+
+/**
+ * `describeAction`, and whether the description is complete enough to approve on (a multisig
+ * co-signer's check). For a `vote`, pass the node's read of the proposal it names as
+ * `opts.proposal` (`client.proposal(action.proposal_id)`): it's described, and approvable, only
+ * when its content hashes to the digest the vote binds (audit gap-7-6).
+ */
+export function reviewAction(action: unknown, opts: DescribeOptions = {}): ActionReview {
+  const does = describeAction(action, opts);
+  const a = obj(action);
+  // Strangers' quoted text is left out of the check: it can say "unreadable" too.
+  const ours = does.replace(/ \((?:reason|label|title), as written: “[^”]*”\)/g, "");
+  const unreadable = /\b(unreadable|can't read|too large for this client)\b/.test(ours);
+  const vote = a.type !== "vote" || voteTarget(a, opts).ok;
+  return { does, readable: !unreadable && vote };
 }

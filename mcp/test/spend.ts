@@ -115,6 +115,8 @@ interface Mode {
   /** Every request hangs. */
   hang?: boolean;
   status: Record<string, unknown>;
+  /** What /api/genesis serves (absent: 404, as from a node too old to serve it). */
+  genesis?: Record<string, unknown>;
 }
 // The node quotes less than the chain's parameters say (1 FANG to register, 0.1 FANG a year to renew).
 const QUOTES = { price: "1000000000", renewal_price: "100000000", params: true };
@@ -192,7 +194,10 @@ const fake: Server = createServer((req, res) => {
     if (path === "/fees") return reply(200, { height: 10, suggested: { flat: "10000", rate: "10000" }, account_creation_fee: "100000000" });
     if (path === "/params") return reply(200, { params: mode.prices.params ? { name_price_3: "100000000000", name_price_4: "25000000000", name_price_5: "5000000000", name_renewal_bps: "2000" } : {} });
     if (path === "/name/bob.boo" || path === "/name/bob") return reply(200, { name: "bob.boo", status: "active", available: false, owner: { address: BOB, name: "bob.boo" }, ...mode.prices });
+    // The lie the R1 reviewer of gap-7-1 used: validator.boo "is" Mallory's.
+    if (path === "/name/validator") return reply(200, { name: "validator.boo", status: "active", available: false, owner: { address: MALLORY, name: "validator.boo" }, ...mode.prices });
     if (path.startsWith("/name/")) return reply(200, { name: `${path.slice(6)}.boo`, status: "available", available: true, ...mode.prices });
+    if (path === "/genesis" && mode.genesis) return reply(200, mode.genesis);
     if (path.startsWith("/search/")) return reply(200, { type: "tx", id: "cd".repeat(32) });
     // An account record's Merkle proof (a one-leaf tree), for section 8.
     const proof = path.match(/^\/proof\/1\/([0-9a-f]+)$/);
@@ -598,7 +603,7 @@ assert.ok(!r.error, r.text);
 // (shown, as unproven) never decides who gets paid.
 assert.equal((posted.at(-1)!.action as { to: string }).to, "bob.boo", "the name is signed, not the node's address for it");
 assert.deepEqual([r.json().recipient_signed_as, r.json().recipient_owner_now_unproven], ["bob.boo", BOB]);
-assert.match(r.json().name_resolution, /^bob\.boo is signed as the name: the chain resolves it to whoever owns it when the transaction runs/);
+assert.match(r.json().name_resolution, /^bob\.boo is signed as the name: the chain pays whoever owns it when the transaction runs, so .* can't point it at another account now, though a node holding the signed transaction could release it later/);
 r = await s.call("send", { to: BOB, amount: "1" });
 assert.ok(!r.error && r.json().recipient_address === undefined && r.json().name_resolution === undefined, "an address needs no resolving");
 const agentKey = (await s.call("create_wallet")).json().key_id as string;
@@ -639,9 +644,94 @@ r = await s.call("send", { to: BOB, amount: "1" });
 assert.ok(!r.error && r.json().block === 11, `the confirmed address is sent to: ${r.text}`);
 assert.equal(posted.length, before + 2);
 await s.close();
+// The R1 reviewer's bypass (gap-7-1): no --network mainnet, only BLOCKULA_RPC (a "custom" network,
+// or "local" for this machine) at a node that reports blockula-1 and lies about validator.boo.
+// Mainnet is decided by the chain the client is pinned to, not the configuration's name for it:
+// nothing is signed for the name.
+for (const [env, label] of [[{ BLOCKULA_RPC: rpc }, "local dev node"], [{ BLOCKULA_RPC: rpc, BLOCKULA_NETWORK: "custom" }, "custom node"]] as const) {
+  rmSync(join(home, "known-chains.json"), { force: true });
+  s = await server(env);
+  before = posted.length;
+  r = await s.call("status");
+  assert.ok(!r.error && r.json().real_money === true && r.json().network === label, r.text);
+  for (const [tool, args] of [["stake", { validator: "validator.boo", amount: "1" }], ["unstake", { validator: "validator.boo", amount: "1" }], ["use_account", { account: "validator.boo" }]] as const) {
+    r = await s.call(tool, args);
+    assert.ok(!r.error, `${label} ${tool}: ${r.text}`);
+    assert.deepEqual([r.json().status, r.json().needs_confirmation, r.json().resolves_to, r.json().grant_code], ["not_sent", true, MALLORY, undefined], `${label} ${tool}: ${r.text}`);
+  }
+  assert.equal(posted.length, before, "nothing signed for the lying node's validator.boo");
+  r = await s.call("stake", { validator: BOB, amount: "1" });
+  assert.ok(!r.error && r.json().block === 11, `an address the user confirmed is staked to: ${r.text}`);
+  assert.equal((posted.at(-1)!.action as { validator: string }).validator, BOB);
+  await s.close();
+}
 mode.status = {};
 rmSync(join(home, "known-chains.json"), { force: true });
 console.log("✓ payments to a name sign the name (the chain resolves it); where an address is needed it's shown as unproven, and on mainnet waits for the address to be confirmed; use_account reads the account's own keys");
+
+// review-r3-clients-2: a tx's validity window counts from the height the node reports, so a node
+// reporting one the chain can't have reached could hold the signed tx and release it later (by
+// when a name signed in it may have lapsed and changed hands). The MCP bounds that height by the
+// chain's genesis clock: taken from the node's /api/genesis on first use, like the genesis hash,
+// and remembered with that hash, so a node that turns hostile later can't lift it.
+{
+  const AHEAD = { height: 10 + 31_536_000 };
+  const clockKey = `clock fake-chain ${G}`;
+  const known = () => (existsSync(join(home, "known-chains.json")) ? JSON.parse(readFileSync(join(home, "known-chains.json"), "utf8")) : {});
+  resetLedger();
+  mode.post = "accept";
+  mode.tx = "finalized";
+  mode.genesis = { chain_id: "fake-chain", created_at_ms: Date.now() - 86_400_000, block_time_ms: 1000, validators: [] };
+  s = await server({ BLOCKULA_NETWORK: "custom" });
+  r = await s.call("send", { to: BOB, amount: "1" });
+  assert.ok(!r.error && r.json().block === 11, `a height the chain can have reached is signed: ${r.text}`);
+  assert.deepEqual(known()[clockKey], { created_at_ms: mode.genesis.created_at_ms, block_time_ms: 1000 }, "the clock is remembered with the chain's genesis hash");
+  let before = posted.length;
+  mode.status = AHEAD;
+  for (const [tool, args] of [["send", { to: "bob.boo", amount: "1" }], ["stake", { validator: BOB, amount: "1" }], ["register_name", { name: "ghoul" }]] as const) {
+    r = await s.call(tool, args);
+    assert.ok(r.error && /reports height 31536010, but by this machine's clock and the chain's genesis the chain can't be past block \d+.*Nothing was signed/.test(r.text) && r.text.includes("known-chains.json"), `${tool}: ${r.text}`);
+  }
+  assert.equal(posted.length, before, "nothing signed against a height the chain can't have reached");
+  await s.close();
+  // Restarted, the node now serves a genesis that would lift the bound: the remembered clock holds.
+  mode.genesis = { chain_id: "fake-chain", created_at_ms: 0, block_time_ms: 1, validators: [] };
+  s = await server({ BLOCKULA_NETWORK: "custom" });
+  r = await s.call("send", { to: "bob.boo", amount: "1" });
+  assert.ok(r.error && /can't be past block/.test(r.text), r.text);
+  assert.equal(posted.length, before);
+  mode.status = {};
+  r = await s.call("send", { to: "bob.boo", amount: "1" });
+  assert.ok(!r.error && r.json().block === 11, r.text);
+  await s.close();
+  // A local dev chain (not remembered): the clock still holds for the session, and isn't written down.
+  rmSync(join(home, "known-chains.json"), { force: true });
+  mode.genesis = { chain_id: "fake-chain", created_at_ms: Date.now() - 86_400_000, block_time_ms: 1000, validators: [] };
+  s = await server();
+  assert.equal((await s.call("status")).json().network, "local dev node");
+  mode.status = AHEAD;
+  before = posted.length;
+  r = await s.call("send", { to: BOB, amount: "1" });
+  assert.ok(r.error && /can't be past block/.test(r.text), r.text);
+  assert.equal(posted.length, before);
+  assert.equal(known()[clockKey], undefined, "a local chain's clock isn't remembered");
+  await s.close();
+  // A node that serves no genesis (or another chain's) leaves the height its word, as before.
+  for (const g of [undefined, { chain_id: "other-chain", created_at_ms: Date.now(), block_time_ms: 1000 }]) {
+    mode.genesis = g;
+    rmSync(join(home, "known-chains.json"), { force: true });
+    s = await server({ BLOCKULA_NETWORK: "custom" });
+    r = await s.call("send", { to: BOB, amount: "1" });
+    assert.ok(!r.error, r.text);
+    assert.equal(known()[clockKey], undefined);
+    await s.close();
+  }
+  mode.status = {};
+  mode.genesis = undefined;
+  resetLedger();
+  rmSync(join(home, "known-chains.json"), { force: true });
+}
+console.log("✓ the height each tx is signed against is bounded by the chain's genesis clock (taken on first use and remembered with the genesis hash)");
 
 // gap-7-5: "unstake 10" used to be converted to shares here, at the node's value of the stake: a
 // node that reported a 1,000 FANG stake (100e9 shares) as worth 10 FANG and a drop got 99.99% of

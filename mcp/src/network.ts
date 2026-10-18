@@ -47,6 +47,32 @@ export const MAINNET_RPCS: string[] = [];
  */
 export const KNOWN_GENESIS: Record<string, string> = {};
 
+/**
+ * The genesis clock of chains whose genesis is known (`created_at_ms` and `block_time_ms` of the
+ * genesis.json that hashes to `KNOWN_GENESIS[id]`), added with the hash. With it the client
+ * refuses a node reporting a height the chain can't have reached by this machine's clock, before
+ * anything is signed (audit review-r3-clients-2; `Client.checkSigningHeight`).
+ */
+export const KNOWN_CLOCKS: Record<string, GenesisClock> = {};
+
+/** A chain's genesis clock: its genesis.json's `created_at_ms` and `block_time_ms`. */
+export interface GenesisClock {
+  createdAtMs: number;
+  blockTimeMs: number;
+}
+
+/**
+ * The genesis clock in a node's `/api/genesis` answer for chain `chainId`, or `undefined` when it
+ * isn't one (another chain's genesis, missing or malformed fields). The node's word: the MCP takes
+ * it on first use, as it does the genesis hash, and remembers it with that hash.
+ */
+export function clockFrom(genesis: unknown, chainId: string): GenesisClock | undefined {
+  const g = genesis && typeof genesis === "object" ? (genesis as Record<string, unknown>) : {};
+  const { created_at_ms: createdAtMs, block_time_ms: blockTimeMs } = g;
+  if (g.chain_id !== chainId || !Number.isSafeInteger(createdAtMs) || (createdAtMs as number) < 0 || !Number.isSafeInteger(blockTimeMs) || (blockTimeMs as number) < 1) return undefined;
+  return { createdAtMs: createdAtMs as number, blockTimeMs: blockTimeMs as number };
+}
+
 /** The networks the MCP knows by name. */
 export const KNOWN_NETWORKS: Record<Exclude<NetworkKey, "custom">, Omit<Network, "rpc" | "witnesses"> & { rpc?: string }> = {
   mainnet: { key: "mainnet", label: "Blockula mainnet", rpc: MAINNET_RPCS[0], pin: { chainId: "blockula-1", prefix: "boo" }, mainnet: true, remember: true },
@@ -162,9 +188,9 @@ export function completePin(pin: Pin, status: { chain_id?: unknown; genesis_hash
 export class KnownChains {
   constructor(readonly file: string) {}
 
-  private all(): Record<string, Pin> {
+  private all(): Record<string, unknown> {
     try {
-      return existsSync(this.file) ? (JSON.parse(readFileSync(this.file, "utf8")) as Record<string, Pin>) : {};
+      return existsSync(this.file) ? (JSON.parse(readFileSync(this.file, "utf8")) as Record<string, unknown>) : {};
     } catch {
       throw new Error(`${this.file} is corrupt; fix or delete it (it pins which chain each node must be on)`);
     }
@@ -175,13 +201,34 @@ export class KnownChains {
   }
 
   get(net: Network): Pin | undefined {
-    return net.remember ? this.all()[KnownChains.id(net)] : undefined;
+    return net.remember ? (this.all()[KnownChains.id(net)] as Pin | undefined) : undefined;
   }
 
   save(net: Network, pin: Pin) {
     if (!net.remember) return;
+    this.write(KnownChains.id(net), pin);
+  }
+
+  /** Genesis clocks are a property of the chain (its id and genesis hash), whichever node reported them. */
+  static clockId(chainId: string, genesisHash: string) {
+    return `clock ${chainId} ${genesisHash}`;
+  }
+
+  /** The genesis clock remembered for this chain (`clockFrom` of the first `/api/genesis` read for it). */
+  clock(net: Network, chainId: string, genesisHash: string): GenesisClock | undefined {
+    if (!net.remember) return undefined;
+    const c = this.all()[KnownChains.clockId(chainId, genesisHash)];
+    return clockFrom(c && typeof c === "object" ? { ...(c as Record<string, unknown>), chain_id: chainId } : undefined, chainId);
+  }
+
+  saveClock(net: Network, chainId: string, genesisHash: string, clock: GenesisClock) {
+    if (!net.remember) return;
+    this.write(KnownChains.clockId(chainId, genesisHash), { created_at_ms: clock.createdAtMs, block_time_ms: clock.blockTimeMs });
+  }
+
+  private write(key: string, value: unknown) {
     const all = this.all();
-    all[KnownChains.id(net)] = pin;
+    all[key] = value;
     mkdirSync(dirname(this.file), { recursive: true });
     writeFileSync(this.file, JSON.stringify(all, null, 2), { mode: 0o600 });
   }

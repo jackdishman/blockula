@@ -60,6 +60,7 @@ pub enum ValidatorCmd {
         key: PathBuf,
         #[arg(long)]
         rpc: String,
+        /// Account to act for (an address on mainnet), if not the validator's owner
         #[arg(long)]
         from: Option<String>,
         #[command(flatten)]
@@ -71,7 +72,8 @@ pub enum ValidatorCmd {
     /// of the members admitted it and its node showed up (it does that itself, in the epoch's last
     /// tenth); an admission counts for this epoch only, and each member admits one an epoch
     Admit {
-        /// The candidate's address or .boo name
+        /// The candidate's address (boo1…), confirmed with its operator. Not a name: a node's
+        /// answer for a name could be anyone's candidate, and an admission can't be taken back
         candidate: String,
         /// This member's consensus key (its home's validator.key)
         #[arg(long)]
@@ -79,7 +81,7 @@ pub enum ValidatorCmd {
         #[arg(long)]
         rpc: String,
         /// Account that pays the fee (default: the member's owner, as for its other system txs;
-        /// or the validator's own address)
+        /// or the validator's own address). An address on mainnet
         #[arg(long)]
         from: Option<String>,
         #[command(flatten)]
@@ -115,7 +117,8 @@ pub struct AdminArgs {
     pub key: PathBuf,
     #[arg(long)]
     pub rpc: String,
-    /// Account to act for, if the key is an added key on another account (default: the key's own address)
+    /// Account to act for, if the key is an added key on another account (default: the key's own
+    /// address). An address on mainnet
     #[arg(long)]
     pub from: Option<String>,
     #[command(flatten)]
@@ -192,6 +195,9 @@ pub(crate) async fn send_memo_with(remote: &Remote, keys: &Keys, from: &str, mak
     let rpc = remote.rpc.as_str();
     let status = remote.status().await?;
     let height = status["height"].as_u64().ok_or_else(|| anyhow!("{rpc} doesn't report its height"))?;
+    // The validity window (and any height in the action) counts from it: a height the chain can't
+    // have reached yet would let the node hold the tx and release it later (review-r3-clients-2).
+    remote.check_height(height).await?;
     let action = make(height)?;
     let nonce = match get(rpc, &format!("/account/{from}")).await {
         Ok(a) => a["next_nonce"].as_u64().unwrap_or(0),
@@ -238,6 +244,11 @@ fn tx_outcome(id: &str, t: Value, valid_until: u64) -> Option<Result<Value>> {
 }
 
 pub fn run(cmd: ValidatorCmd) -> Result<()> {
+    run_in(cmd, &crate::cli_net::blockula_dir())
+}
+
+/// [`run`] with `dir` as the blockula directory (its `known-chains.json` pins the nodes).
+pub fn run_in(cmd: ValidatorCmd, dir: &Path) -> Result<()> {
     match cmd {
         ValidatorCmd::Init { home, genesis, genesis_hash, public_p2p_addr, public_http_addr } => {
             if home.join("validator.key").exists() {
@@ -292,19 +303,19 @@ pub fn run(cmd: ValidatorCmd) -> Result<()> {
             let action = Action::RegisterValidator { consensus_key: hex::encode(keys.public_key()), p2p_addr: addrs.p2p_addr, http_addr: addrs.http_addr, bond, pop };
             // The node must be on the home's chain: its genesis pins it.
             let pin = ChainPin { network: None, chain_id: Some(g.chain_id.clone()), genesis_hash: Some(crate::checkpoints::genesis_hash(&g)) };
-            let tx = rt.block_on(async { send(&Remote::connect_in(&crate::cli_net::blockula_dir(), &rpc, &pin).await?, &keys, &me, action).await })?;
+            let tx = rt.block_on(async { send(&Remote::connect_in(dir, &rpc, &pin).await?, &keys, &me, action).await })?;
             println!("✓ {}", tx["summary"].as_str().unwrap_or_default());
             println!("  It joins the active set at an epoch boundary if its stake ranks in the top max_validators (newcomers are at most a third of a set).");
             println!("  Others can back it: blockula stake delegate {me} <FANG> --key <key file> --rpc {rpc}");
             Ok(())
         }
-        ValidatorCmd::Unjail(a) => admin(a, |v| Action::Unjail { validator: v }),
+        ValidatorCmd::Unjail(a) => admin(a, dir, |v| Action::Unjail { validator: v }),
         ValidatorCmd::Commission { bps, key, rpc, from, pin } => {
             let keys = load_seed(&key)?;
             let tx = rt()?.block_on(async {
-                let remote = Remote::connect(&crate::cli_net::blockula_dir(), &rpc, &pin).await?;
+                let remote = Remote::connect(dir, &rpc, &pin).await?;
                 let from = match from {
-                    Some(f) => remote.resolve(&f).await?,
+                    Some(f) => remote.from_account(&f).await?,
                     // A validator's consensus key signs its terms for its owner (they're the owner's call).
                     None => validator_owner(&remote, &remote.address(&keys)).await?.unwrap_or_else(|| remote.address(&keys)),
                 };
@@ -316,15 +327,15 @@ pub fn run(cmd: ValidatorCmd) -> Result<()> {
         ValidatorCmd::Admit { candidate, key, rpc, from, pin } => {
             let keys = load_seed(&key)?;
             let tx = rt()?.block_on(async {
-                let remote = Remote::connect(&crate::cli_net::blockula_dir(), &rpc, &pin).await?;
+                let remote = Remote::connect(dir, &rpc, &pin).await?;
                 let me = remote.address(&keys);
-                let candidate = remote.resolve(&candidate).await?;
+                let candidate = admit_candidate(&candidate, &remote.prefix)?;
                 let set = get(&remote.rpc, "/validators").await?;
                 if !set["active"].as_array().into_iter().flatten().any(|v| v["validator"]["address"].as_str() == Some(me.as_str())) {
                     bail!("{me} isn't in this epoch's set: only its members admit newcomers");
                 }
                 let from = match from {
-                    Some(f) => remote.resolve(&f).await?,
+                    Some(f) => remote.from_account(&f).await?,
                     None => validator_owner(&remote, &me).await?.unwrap_or_else(|| me.clone()),
                 };
                 // The epoch the next block is in: the admission fails in any other.
@@ -335,8 +346,8 @@ pub fn run(cmd: ValidatorCmd) -> Result<()> {
             println!("  It joins at the end of the epoch once a quorum of the set's members admitted it and its node showed up (in the epoch's last tenth). Admissions count for this epoch only.");
             Ok(())
         }
-        ValidatorCmd::Approve(a) => admin(a, |v| Action::ApproveValidator { validator: v }),
-        ValidatorCmd::Remove(a) => admin(a, |v| Action::RemoveValidator { validator: v }),
+        ValidatorCmd::Approve(a) => admin(a, dir, |v| Action::ApproveValidator { validator: v }),
+        ValidatorCmd::Remove(a) => admin(a, dir, |v| Action::RemoveValidator { validator: v }),
         ValidatorCmd::Pop { home, owner } => {
             let g = Genesis::load(&home.join("genesis.json"))?;
             let seed: [u8; 32] = hex::decode(std::fs::read_to_string(home.join("validator.key"))?.trim())?.try_into().map_err(|_| anyhow!("bad validator.key"))?;
@@ -372,6 +383,21 @@ pub fn run(cmd: ValidatorCmd) -> Result<()> {
     }
 }
 
+/// The candidate `validator admit` signs: an address, on every chain (audit review-r3-staking-1,
+/// review-r3-clients-3). The chain needs one, and resolving a name would make it one node's
+/// answer: in a set of one, a single admission of the wrong candidate lets a stranger in, and a
+/// stranger that stops voting halts the set for good. Nothing is resolved, so nothing is asked.
+fn admit_candidate(candidate: &str, prefix: &str) -> Result<String> {
+    let c = candidate.trim();
+    if !crate::crypto::is_address(c) {
+        bail!("`validator admit` takes the candidate's address ({prefix}1…), not {c:?}: an admission can't be taken back, and a node's answer for a name could be anyone's candidate. Get the address from the candidate's operator (it's listed under candidates in `blockula validator list`), check it with them, and pass it. Nothing was signed.");
+    }
+    if !c.starts_with(&format!("{prefix}1")) {
+        bail!("{c} is an address on another network: this chain's addresses start with {prefix}1. Nothing was signed.");
+    }
+    Ok(c.to_string())
+}
+
 /// The owner of validator `v` per the node's `/api/validators` (`None`: `v` is no validator).
 async fn validator_owner(remote: &Remote, v: &str) -> Result<Option<String>> {
     let set = get(&remote.rpc, "/validators").await?;
@@ -379,12 +405,12 @@ async fn validator_owner(remote: &Remote, v: &str) -> Result<Option<String>> {
     Ok(lists.iter().flat_map(|k| set[*k].as_array().cloned().unwrap_or_default()).find(|r| r["validator"]["address"].as_str() == Some(v)).and_then(|r| r["owner"]["address"].as_str().map(String::from)))
 }
 
-fn admin(a: AdminArgs, action: impl FnOnce(String) -> Action) -> Result<()> {
+fn admin(a: AdminArgs, dir: &Path, action: impl FnOnce(String) -> Action) -> Result<()> {
     let keys = load_seed(&a.key)?;
     let tx = rt()?.block_on(async {
-        let remote = Remote::connect(&crate::cli_net::blockula_dir(), &a.rpc, &a.pin).await?;
+        let remote = Remote::connect(dir, &a.rpc, &a.pin).await?;
         let from = match a.from {
-            Some(f) => remote.resolve(&f).await?,
+            Some(f) => remote.from_account(&f).await?,
             None => remote.address(&keys),
         };
         send(&remote, &keys, &from, action(a.validator)).await

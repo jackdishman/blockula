@@ -9,10 +9,13 @@
 //                       mainnet until public RPCs are built in)
 //   BLOCKULA_CHAIN_ID / BLOCKULA_GENESIS_HASH   pin the chain the node must be on
 //   BLOCKULA_WITNESSES  other nodes of the same chain (comma-separated URLs): .boo names that get
-//                       signed (send, stake, unstake, use_account) are proven against them. Without
+//                       signed (send, stake, unstake, use_account) are proven against them, and the
+//                       height each tx is signed against must not be ahead of their heads (nor, in
+//                       any case, past what the chain's genesis clock allows). Without
 //                       them a send signs the name itself (the chain resolves it when it runs), and
 //                       where an address is needed (stake, unstake, use_account) a name is the
-//                       node's word: on mainnet the address must be confirmed first.
+//                       node's word: on mainnet (any node on blockula-1, however it was configured)
+//                       the address must be confirmed first.
 //   BLOCKULA_HOME       where the agent wallet lives (default ~/.blockula)
 //   BLOCKULA_MAX_SEND   max FANG one call moves (sent, staked, escrowed, paid for a name, bonded; default 100)
 //   BLOCKULA_MAX_DAILY  max FANG leaving the account per UTC day through this MCP, fees included
@@ -30,13 +33,13 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { ApiError, Client, NAMESPACES, RequestTimeoutError, TxFailedError, TxPendingError, Wallet, bareName, checkTimeoutMs, decodeAccount, describeKind, encodeKeyGrant, isAddress, proposalDigest, formatFang, paramsOf, parseFang, proposalSummary, stakeSummary, txDropped, txId, type Action, type ProposalKind, type ProposalSummary, type Recipient, type Resolution } from "@blockula/sdk";
+import { ApiError, Client, HeightAheadError, MAINNET_CHAIN_ID, NAMESPACES, RequestTimeoutError, TxFailedError, TxPendingError, Wallet, bareName, checkTimeoutMs, decodeAccount, describeKind, encodeKeyGrant, isAddress, proposalDigest, formatFang, paramsOf, parseFang, proposalSummary, stakeSummary, txDropped, txId, type Action, type ProposalKind, type ProposalSummary, type Recipient, type Resolution } from "@blockula/sdk";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { z } from "zod";
-import { KnownChains, completePin, effectivePin, mismatch, mismatchError, resolveNetwork, type Network } from "./network.js";
+import { KNOWN_CLOCKS, KNOWN_GENESIS, KnownChains, clockFrom, completePin, effectivePin, mismatch, mismatchError, resolveNetwork, type GenesisClock, type Network } from "./network.js";
 import { PIN_FILE, REPO, RELEASE_KEY_ID, binPaths, checkBinaryVersion, fetchVerifiedRelease, latestTagFrom, readReleasePin, releaseKeyIdFrom } from "./release.js";
 import { SignedTxs, type SignedTx } from "./signed.js";
 import { SpendLedger } from "./spend.js";
@@ -109,9 +112,31 @@ async function chain(): Promise<Client> {
   const full = completePin(pin, status);
   KNOWN_CHAINS.save(net, full);
   const pins = { chainId: full.chainId, genesisHash: full.genesisHash, prefix: full.prefix, timeoutMs: TIMEOUT_MS };
-  // Witnesses are held to the same chain; with them, names are proven (Client.resolution).
-  pinned = new Client(net.rpc, { ...pins, witnesses: net.witnesses.map((w) => new Client(w, pins)) });
+  // Witnesses are held to the same chain; with them, names are proven (Client.resolution) and a
+  // height ahead of their heads is refused. The chain's genesis clock bounds the height too.
+  const genesisClock = await clockOf(net, full);
+  pinned = new Client(net.rpc, { ...pins, genesisClock, witnesses: net.witnesses.map((w) => new Client(w, pins)) });
   return pinned;
+}
+
+/**
+ * The pinned chain's genesis clock, which bounds the height each tx is signed against
+ * (`Client.checkSigningHeight`: a node reporting a height the chain can't have reached by this
+ * machine's clock gets nothing signed, since it could hold the tx and release it later; audit
+ * review-r3-clients-2). Built in with a known genesis; else the one remembered for this chain id
+ * and genesis hash; else the node's `/api/genesis`, taken on first use like the genesis hash and
+ * remembered with it (but for local dev chains, for this session only). A node that serves none
+ * leaves the height its word, as without the clock.
+ */
+async function clockOf(net: Network, full: { chainId?: string; genesisHash?: string }): Promise<GenesisClock | undefined> {
+  const { chainId, genesisHash } = full;
+  if (chainId === undefined || genesisHash === undefined) return undefined;
+  if (KNOWN_GENESIS[chainId] === genesisHash && KNOWN_CLOCKS[chainId]) return KNOWN_CLOCKS[chainId];
+  const remembered = KNOWN_CHAINS.clock(net, chainId, genesisHash);
+  if (remembered) return remembered;
+  const clock = clockFrom(await new Client(net.rpc, { timeoutMs: TIMEOUT_MS }).genesis().catch(() => undefined), chainId);
+  if (clock) KNOWN_CHAINS.saveClock(net, chainId, genesisHash, clock);
+  return clock;
 }
 
 async function reachable(url: string) {
@@ -141,6 +166,17 @@ const LEDGER = new SpendLedger(SPEND_FILE, MAX_DAILY, MAX_DAILY_TEXT);
 /** The txs this MCP signed (their valid_until, for tx_status): see signed.ts. */
 const SIGNED = new SignedTxs(join(HOME, "agent-txs.json"));
 
+/**
+ * Whether this is real money: the configured network is mainnet, or the chain the client is
+ * pinned to is (audit gap-7-1, R1 bypass): BLOCKULA_RPC alone pointing at a node on blockula-1 is
+ * a "custom" network, and gets mainnet's rules all the same. The client is pinned to the chain id
+ * of its first status, and refuses any later status that reports another, so this is the chain
+ * every signature it makes is for.
+ */
+async function realMoney(client: Client): Promise<boolean> {
+  return network().mainnet || (await client.status()).chain_id === MAINNET_CHAIN_ID;
+}
+
 /** What one tool call spends. */
 interface Spend {
   /** FANG this call moves out of the account (sent, staked, escrowed, paid for a name, bonded). */
@@ -151,6 +187,11 @@ interface Spend {
   perCall?: bigint;
   /** Names the amount in a refusal. */
   what?: string;
+  /**
+   * How names in fields that need an address were resolved: the SDK refuses an unproven one on
+   * mainnet against the very status the tx is signed for (a second check behind `resolved`).
+   */
+  resolutions?: Resolution[];
 }
 
 /** A tx that was submitted (or may have been) but isn't known to be final: never "failed", never to be re-sent blindly. */
@@ -178,7 +219,7 @@ const isInFlight = (r: unknown): r is InFlight => typeof r === "object" && r !==
 async function submitCapped(w: Wallet, action: Action, spend: Spend, memo = ""): Promise<any> {
   const perCall = spend.perCall ?? spend.amount;
   if (perCall > MAX_SEND) throw new Error(`${spend.what ?? "amount"} (${formatFang(perCall)}) exceeds this agent's per-call limit (BLOCKULA_MAX_SEND=${process.env.BLOCKULA_MAX_SEND ?? "100"} FANG)`);
-  const tx = await w.build(action, memo);
+  const tx = await w.build(action, memo, { resolutions: spend.resolutions ?? [] });
   const id = txId(tx);
   const maxFee = BigInt(tx.fee);
   const slot = { account: tx.from, nonce: tx.nonce };
@@ -273,7 +314,7 @@ async function namePrices(client: Client, name: string): Promise<{ price: bigint
  */
 async function resolved(client: Client, input: string, role: string): Promise<{ res: Resolution; confirm?: undefined } | { res?: undefined; confirm: Record<string, unknown> }> {
   const res = await client.resolution(input);
-  if (!res.proven && network().mainnet) {
+  if (!res.proven && (await realMoney(client))) {
     return {
       confirm: {
         status: "not_sent",
@@ -330,7 +371,13 @@ function tool<S extends z.ZodRawShape>(name: string, description: string, shape:
     } catch (e) {
       // Node errors are relayed, so they're cleaned like any chain text.
       const msg = clean(String((e as Error)?.message ?? e), 1000);
-      const hint = /fetch failed|ECONNREFUSED/.test(msg) ? ` (no node at ${RPC}${NET?.key === "local" ? " — call start_dev_node" : ""})` : e instanceof RequestTimeoutError ? ` (the node at ${RPC} isn't answering)` : "";
+      const hint = /fetch failed|ECONNREFUSED/.test(msg)
+        ? ` (no node at ${RPC}${NET?.key === "local" ? " — call start_dev_node" : ""})`
+        : e instanceof RequestTimeoutError
+          ? ` (the node at ${RPC} isn't answering)`
+          : e instanceof HeightAheadError
+            ? ` (the chain's genesis clock is built in, or remembered in ${KNOWN_CHAINS.file} from the first /api/genesis read for this chain)`
+            : "";
       return { ...text(`Error: ${msg}${hint}`), isError: true };
     }
   }) as never);
@@ -338,13 +385,14 @@ function tool<S extends z.ZodRawShape>(name: string, description: string, shape:
 
 tool("status", "Blockula network status: which network and node you're connected to (and the chain it's pinned to), chain id, height, supply, fees burned, and the crypto in use. The network, its pins and how to change them are this MCP's own facts; `node_reports` is what the node says.", {}, async () => {
   const net = network();
-  const s = await (await chain()).status();
+  const client = await chain();
+  const s = await client.status();
   // The node's report is nested and picked field by field: it can't override (or add to) what
   // this MCP states about the network (audit F73).
   const pick = ["chain_id", "height", "finalized_height", "syncing", "epoch", "active_validators", "supply_display", "burned_display", "version", "protocol_version", "head_age_ms", "crypto"];
   return {
     network: net.label,
-    real_money: net.mainnet,
+    real_money: net.mainnet || s.chain_id === MAINNET_CHAIN_ID,
     rpc: net.rpc,
     pinned: chainData({ chain_id: s.chain_id, genesis_hash: s.genesis_hash, address_prefix: s.address_prefix }),
     how_to_change: "The network is fixed while this MCP runs. The user changes it in the MCP's configuration (--network mainnet|testnet|local|custom, or BLOCKULA_RPC).",
@@ -729,7 +777,8 @@ tool("use_account", "Act for a user's account (name or address) that has authori
         address: addr,
         ...(res.name === null ? {} : { name_resolution: res.proven ? clean(res.how, 300) : `UNPROVEN: ${clean(res.how, 300)}` }),
         key_id: w.keyId,
-        grant_code: encodeKeyGrant(await w.keyGrant(addr)),
+        // The resolution itself, so the SDK refuses it too if it's unproven on mainnet.
+        grant_code: encodeKeyGrant(await w.keyGrant(res)),
         next: `Nothing was signed on-chain. Give the user the grant_code (this agent key's consent to joining ${addr} only; it holds no secret and can't spend anything). They paste it in the Blockula web wallet → Devices & agents → 'Give an agent a budget' and choose a limit and an expiry. Then call use_account again.`,
       };
     }
@@ -779,7 +828,9 @@ tool("send", "Send FANG to a .boo name or address. Amounts are in FANG, e.g. \"1
   const w = await requireWallet();
   await w.client.addressPrefix();
   // With witnesses a name's proven owner is signed; without, the name itself, which the chain
-  // resolves when the tx runs: a lying node can make it fail, not pay someone else (audit gap-7-1).
+  // resolves when the tx runs: a lying node can't point it at another account now, though one
+  // holding the signed tx could release it later in its validity window (audit gap-7-1,
+  // review-r3-clients-2).
   const rc = await w.client.recipient(to);
   const opening = await openingFee(w.client, rc.address);
   const r = await submitCapped(w, { type: "transfer", to: rc.signed, amount: drops.toString() }, { amount: drops, extra: opening }, memo ?? "");
@@ -829,7 +880,7 @@ tool("stake", "Stake (delegate) FANG from the account this agent acts for in a v
   const w = await requireWallet();
   const { res, confirm } = await resolved(w.client, validator, "validator");
   if (confirm) return confirm;
-  const r = await submitCapped(w, { type: "delegate", validator: res.address, amount: drops.toString() }, { amount: drops });
+  const r = await submitCapped(w, { type: "delegate", validator: res.address, amount: drops.toString() }, { amount: drops, resolutions: [res] });
   return isInFlight(r) ? { ...r, ...resolvedView(res, "validator") } : txResult(r, { ...resolvedView(res, "validator"), next: "my_stake shows the stake and its value" });
 });
 
@@ -853,7 +904,7 @@ tool("unstake", "Start unbonding stake from a validator's pool: an amount in FAN
   const view = drops === null
     ? { ...resolvedView(res, "validator"), unbonding: `all ${d.shares} shares (the node reports they're worth ${formatFang(BigInt(d.value))})` }
     : { ...resolvedView(res, "validator"), unbonding: `${formatFang(drops)} (at least: the chain sells the shares that much buys at the pool's price when the tx runs)` };
-  const r = await submitCapped(w, action, { amount: 0n });
+  const r = await submitCapped(w, action, { amount: 0n, resolutions: [res] });
   return isInFlight(r) ? { ...r, ...view } : txResult(r, view);
 });
 

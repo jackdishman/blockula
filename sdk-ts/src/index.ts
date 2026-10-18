@@ -4,7 +4,7 @@ import { bytesToHex, hexToBytes, randomBytes, utf8ToBytes } from "@noble/hashes/
 import { base64urlnopad, bech32m } from "@scure/base";
 import { DEFAULT_TIP_CAP_MULTIPLE, KEY_POP_CONTEXT, PUBLIC_KEY_LEN, SIGNATURE_LEN, actionDigest, baseFee, formatFang, keyPopMessage, maxTip, parseFang, parseSoul, proposalDigest, seanceCommitment, seancePairsDigest, signingBytes, type SeanceClaimRef, type Action, type BaseFee, type KeyRole, type ProposalKind, type Tx, type UnsignedTx } from "./tx.js";
 import { NAMESPACES, checkProofResponse, decodeAccount, decodeName, type ProofResponse, type ProvenRecord } from "./proof.js";
-import { describeKind } from "./describe.js";
+import { describeKind, reviewAction } from "./describe.js";
 
 export * from "./tx.js";
 export * from "./proof.js";
@@ -397,7 +397,7 @@ export interface TxOptions {
 /** `Wallet.build`'s options: a tx's, plus the resolutions of names it carries as addresses. */
 export interface BuildOptions extends TxOptions {
   /** `Client.resolution`s of names in `action`'s address fields (refused on mainnet unless proven). */
-  unproven?: Resolution[];
+  resolutions?: Resolution[];
 }
 
 /**
@@ -547,9 +547,10 @@ export class Wallet {
    * on the client's chain: hand `encodeKeyGrant(grant)` to the account's owner, who adds the key
    * with it. Pass `chain` to sign offline.
    */
-  async keyGrant(account: string, chain?: { chainId: string; genesisHash: string }): Promise<KeyGrant> {
-    const res = isAddress(account) ? null : await this.client.resolution(account);
-    const address = res?.address ?? account;
+  async keyGrant(account: string | Resolution, chain?: { chainId: string; genesisHash: string }): Promise<KeyGrant> {
+    // A resolution already made (and shown) is used as is: resolving the name again could get another answer.
+    const res = typeof account !== "string" ? (account.name === null ? null : account) : isAddress(account) ? null : await this.client.resolution(account);
+    const address = typeof account !== "string" ? account.address : (res?.address ?? account);
     let c = chain;
     if (!c) {
       const status = await this.client.status();
@@ -587,13 +588,17 @@ export class Wallet {
    * `max_tx_validity_blocks`, since validators refuse a `valid_until` further ahead than that
    * (audit gap-7-3).
    *
-   * `opts.unproven`: how names in fields that need an address got into `action` (their
+   * That height is checked first (`Client.checkSigningHeight`: against the witnesses' heads and,
+   * when the client knows its genesis clock, the clock), since a node reporting one the chain
+   * hasn't reached gets a tx it can hold and release later.
+   *
+   * `opts.resolutions`: how names in fields that need an address got into `action` (their
    * `Client.resolution`s). On mainnet a tx carrying one that only one node vouched for isn't
    * signed (`UnprovenNameError`), checked against the very status the tx is signed for, as the
    * helpers do (audit gap-7-1). Fields the chain resolves itself take `Client.recipient(x).signed`.
    */
   async build(action: Action | ((height: number) => Action), memo = "", opts: BuildOptions = {}): Promise<Tx> {
-    return this.buildChecked(action, memo, opts, opts.unproven ?? []);
+    return this.buildChecked(action, memo, opts, opts.resolutions ?? []);
   }
 
   /**
@@ -605,6 +610,7 @@ export class Wallet {
     await this.client.addressPrefix(); // so `this.account` uses the chain's prefix
     const [status, account, fees] = await Promise.all([this.client.status(), this.client.account(this.account).catch(() => null), this.client.fees()]);
     if (!Number.isSafeInteger(status.height) || status.height < 0) throw new Error(`${this.client.rpc} doesn't report its height`);
+    await this.client.checkSigningHeight(status.height);
     const max: number = status.max_tx_validity_blocks ?? Number.MAX_SAFE_INTEGER;
     const validFor = opts.validForBlocks ?? Math.min(this.validForBlocks, max);
     if (!Number.isSafeInteger(validFor) || validFor < 1) throw new Error("validForBlocks must be a positive whole number of blocks");
@@ -630,8 +636,10 @@ export class Wallet {
    * Send FANG to a `.boo` name or an address. `amount` is in FANG ("1.5") or bigint drops. A name
    * is signed as its proven owner's address when the client has witnesses (who you checked is who
    * gets paid, even if the name changes hands before the tx runs), and as the name itself when it
-   * doesn't: the chain then pays whoever owns it when the tx runs, so a lying node can make the
-   * send fail but not redirect it (audit gap-7-1). See `Client.recipient`.
+   * doesn't: the chain then pays whoever owns it when the tx runs. A lying node can't point it at
+   * another account now, but it can hold the signed tx until its validity window, which counts
+   * from the height the node reported, and release it later, by when the name may have lapsed
+   * and been registered again (audit gap-7-1, review-r3-clients-2). See `Client.recipient`.
    */
   async send(to: string, amount: string | number | bigint, opts: { memo?: string; wait?: boolean } & TxOptions = {}) {
     const recipient = await this.client.recipient(to);
@@ -997,8 +1005,15 @@ export class Wallet {
    * don't trust a summary), or it's read from `client.multisig(account)`. A node that showed
    * another action makes the approval fail. `digest`: the `actionDigest` of what you showed, if
    * that's all you kept; an action that reads differently now is refused before anything is signed.
+   * A `vote` binds its proposal by digest, not by id: show it with `reviewAction(action, {
+   * proposal: await client.proposal(action.proposal_id) })`, which describes the proposal only if
+   * its content has that digest, and don't offer the approval unless it's `readable` (gap-7-6).
+   * Pass that proposal read as `proposal` here: approving a vote is refused, before anything is
+   * signed, unless the proposal shown (else one read now) has exactly the content the vote binds.
+   * The approval counts on this wallet's account (`actAs`), which the digest doesn't bind: on
+   * mainnet act for an address you checked, not a name one node resolved.
    */
-  async multisigApprove(id: number, opts: TxOptions & { action?: Action; digest?: string } = {}) {
+  async multisigApprove(id: number, opts: TxOptions & { action?: Action; digest?: string; proposal?: unknown } = {}) {
     const n = wholeNumber(id, "id");
     let action = opts.action;
     if (!action) {
@@ -1008,6 +1023,13 @@ export class Wallet {
     }
     const action_digest = actionDigest(action);
     shownDigest(opts.digest, action_digest, `multisig action #${n}`);
+    if (action.type === "vote") {
+      // What the ballot backs is the proposal whose content has its digest, whatever the node
+      // calls #id (audit gap-7-6): a node can't make other content hash to it.
+      const proposal = opts.proposal ?? (await this.client.proposal(action.proposal_id).catch(() => undefined));
+      const review = reviewAction(action, { proposal, freeText: false });
+      if (!review.readable) throw new Error(`multisig action #${n} can't be approved from here: ${review.does}. Nothing was signed`);
+    }
     return this.act({ type: "multisig_approve", id: n, action_digest }, opts);
   }
 
@@ -1180,6 +1202,43 @@ export class UnprovenNameError extends Error {
   }
 }
 
+/**
+ * A node reports a height the chain can't have reached (`Client.checkSigningHeight`): a tx signed
+ * against it could be held and released later. Nothing was signed.
+ */
+export class HeightAheadError extends Error {
+  constructor(readonly rpc: string, readonly height: number, readonly limit: number, by: string) {
+    super(`${rpc} reports height ${height}, but by ${by} the chain can't be past block ${limit}: a transaction signed against that height could be held and released later. Nothing was signed: use another node (or check this machine's clock)`);
+    this.name = "HeightAheadError";
+  }
+}
+
+/**
+ * How far ahead of the lowest head a client's witnesses report a tx's height may be, by default
+ * (`ClientOptions.maxHeadLeadBlocks`): 30 blocks, room for propagation between nodes.
+ */
+export const DEFAULT_MAX_HEAD_LEAD_BLOCKS = 30;
+
+/**
+ * How far behind the network's clocks this machine's may be before `heightLimit` refuses an honest
+ * node: 15 minutes (the CLI uses the same, node/src/cli_net.rs `HEIGHT_CLOCK_TOLERANCE_MS`).
+ */
+export const HEIGHT_CLOCK_TOLERANCE_MS = 15 * 60 * 1000;
+
+/** How far ahead of their clocks validators accept a block's timestamp (node/src/consensus.rs `MAX_CLOCK_DRIFT_MS`). */
+const MAX_CLOCK_DRIFT_MS = 1_000;
+
+/**
+ * The highest height a chain can have reached at `nowMs` (node/src/cli_net.rs `height_limit`):
+ * every block's timestamp is at least its parent's plus the block time, and validators refuse one
+ * more than a second ahead of their clocks, so block h is stamped no earlier than genesis + h ×
+ * block time. A chain that ran slower than its block time is below this by that much, so it
+ * refuses only heights the chain can't have, not every lie.
+ */
+export function heightLimit(createdAtMs: number, blockTimeMs: number, nowMs: number): number {
+  return Math.floor(Math.max(0, nowMs + MAX_CLOCK_DRIFT_MS + HEIGHT_CLOCK_TOLERANCE_MS - createdAtMs) / Math.max(1, blockTimeMs));
+}
+
 /** The node reports a different chain than the client is pinned to (`ClientOptions`). */
 export class ChainMismatchError extends Error {
   constructor(readonly rpc: string, readonly field: "chain_id" | "genesis_hash" | "address_prefix", readonly expected: string, readonly reported: string | undefined) {
@@ -1205,7 +1264,8 @@ export interface ClientOptions {
    * (audit gap-7-1):
    * - where the chain resolves names itself (`Wallet.send`, `awardHunt`, `vouch`/`unvouch`,
    *   `grantSoul`, `flagSybil`, `clawback`, `transferName`, proposal targets), the name is signed
-   *   as the name (`recipient`), so a lying node can only make the tx fail;
+   *   as the name (`recipient`): the chain pays whoever owns it when the tx runs, so a lying node
+   *   can't point it at another account now, only hold it within its validity window;
    * - where an address is needed (`delegate`/`undelegate`/`redelegate`/`unjail`, `actAs`,
    *   `keyGrant`), a name is one node's unproven answer, and on mainnet nothing is signed with it
    *   (`UnprovenNameError`): pass the address.
@@ -1213,6 +1273,19 @@ export interface ClientOptions {
   witnesses?: Client[];
   /** Refuse to resolve a `.boo` name for a signature unless it's proven (needs `witnesses`). */
   requireProvenNames?: boolean;
+  /**
+   * With witnesses: how far ahead of the lowest head they report the height a tx is signed
+   * against may be (default `DEFAULT_MAX_HEAD_LEAD_BLOCKS`). See `Client.checkSigningHeight`.
+   */
+  maxHeadLeadBlocks?: number;
+  /**
+   * The chain's genesis time and block time (`created_at_ms` and `block_time_ms` of the
+   * genesis.json that hashes to `genesisHash`, as published with it), as pins: with them, a
+   * status claiming a height the chain can't have reached by this machine's clock is refused
+   * before anything is signed (`Client.checkSigningHeight`). Not the node's word, so don't take
+   * them from it.
+   */
+  genesisClock?: { createdAtMs: number; blockTimeMs: number };
 }
 
 /** Where a recipient (a `.boo` name or an address) goes, and how sure that is (`Client.resolution`). */
@@ -1240,7 +1313,9 @@ export interface Recipient extends Resolution {
   signed: string;
   /**
    * `signed` is the name: the chain resolves it to whoever owns it when the tx runs, so no node
-   * can redirect it. `address` is then just the node's current answer, for display.
+   * can point it at another account now (one holding the signed tx can still release it later,
+   * by when the name may have changed hands: see `recipient`). `address` is then just the node's
+   * current answer, for display.
    */
   byChain: boolean;
 }
@@ -1293,6 +1368,10 @@ export class Client {
   /** Independent nodes names are proven against (`ClientOptions.witnesses`). */
   readonly witnesses: Client[];
   readonly requireProvenNames: boolean;
+  /** See `ClientOptions.maxHeadLeadBlocks`. */
+  readonly maxHeadLeadBlocks: number;
+  /** See `ClientOptions.genesisClock`. */
+  readonly genesisClock?: { createdAtMs: number; blockTimeMs: number };
 
   /** `opts` pins the chain: a node reporting another prefix, chain id or genesis hash is refused with `ChainMismatchError`. */
   constructor(readonly rpc: string = DEFAULT_RPC, opts: ClientOptions = {}) {
@@ -1303,11 +1382,42 @@ export class Client {
     if (this.witnesses.some((w) => w === this || w.rpc.replace(/\/$/, "") === rpc.replace(/\/$/, ""))) throw new Error("a witness must be another node, not the client's own");
     this.requireProvenNames = opts.requireProvenNames === true;
     if (this.requireProvenNames && this.witnesses.length === 0) throw new Error("requireProvenNames needs witnesses to prove names against");
+    this.maxHeadLeadBlocks = opts.maxHeadLeadBlocks ?? DEFAULT_MAX_HEAD_LEAD_BLOCKS;
+    if (!Number.isSafeInteger(this.maxHeadLeadBlocks) || this.maxHeadLeadBlocks < 0) throw new Error("maxHeadLeadBlocks must be a whole number of blocks");
+    if (opts.genesisClock) {
+      const { createdAtMs, blockTimeMs } = opts.genesisClock;
+      if (!Number.isSafeInteger(createdAtMs) || createdAtMs < 0 || !Number.isSafeInteger(blockTimeMs) || blockTimeMs < 1) throw new Error("genesisClock needs the genesis's created_at_ms and block_time_ms (whole milliseconds)");
+      this.genesisClock = { createdAtMs, blockTimeMs };
+    }
     this.pinnedPrefix = opts.prefix;
     this.pinnedChainId = opts.chainId;
     this.pinnedGenesis = opts.genesisHash?.toLowerCase();
     this.prefix = opts.prefix ?? DEFAULT_PREFIX;
     this.prefixKnown = opts.prefix !== undefined;
+  }
+
+  /**
+   * Refuses (`HeightAheadError`, before anything is signed) a height a tx's validity window would
+   * count from that this client has reason to think the chain hasn't reached: more than
+   * `maxHeadLeadBlocks` past the lowest head its witnesses report, or, with a `genesisClock`, past
+   * what the chain can have reached by this machine's clock (`heightLimit`). A node reporting a
+   * future height gets a tx it can hold and release later, when the window it picked opens; with
+   * a name signed in it, after the name may have changed hands (audit review-r3-clients-2).
+   * Every witness must report its height, as every witness must confirm a proof: one honest
+   * witness is enough to refuse a height the chain hasn't reached, whatever the others say.
+   * Without witnesses or a genesis clock, the height is the node's word.
+   */
+  async checkSigningHeight(height: number): Promise<void> {
+    if (this.genesisClock) {
+      const limit = heightLimit(this.genesisClock.createdAtMs, this.genesisClock.blockTimeMs, Date.now());
+      if (height > limit) throw new HeightAheadError(this.rpc, height, limit, "this machine's clock and the chain's genesis");
+    }
+    if (!this.witnesses.length) return;
+    const heads = await Promise.all(this.witnesses.map((w) => w.status().then((s) => (Number.isSafeInteger(s.height) && s.height >= 0 ? (s.height as number) : undefined), () => undefined)));
+    const silent = this.witnesses.filter((_, i) => heads[i] === undefined);
+    if (silent.length) throw new Error(`${silent.map((w) => w.rpc).join(", ")} didn't report ${silent.length === 1 ? "its height" : "their heights"}, so ${this.rpc}'s height ${height} can't be checked against every witness: nothing was signed`);
+    const lowest = Math.min(...(heads as number[]));
+    if (height > lowest + this.maxHeadLeadBlocks) throw new HeightAheadError(this.rpc, height, lowest + this.maxHeadLeadBlocks, `the lowest head its witnesses report (#${lowest})`);
   }
 
   /** The chain's address prefix, asking the node once if it isn't known yet. */
@@ -1363,6 +1473,8 @@ export class Client {
   fees(): Promise<{ height: number; lag: number; slots: ({ height: number; max_block_bytes: number } & BaseFee)[]; suggested: BaseFee; lowest?: BaseFee; tip_cap_multiple?: number; account_creation_fee: string; [k: string]: unknown }> { return this.call("/fees"); }
   /** The governance parameters (node/src/params.rs `ChainParams`; amounts as strings) under `params`, genesis constants under `genesis`, and the issuance year. `paramsOf` flattens it. */
   params() { return this.call("/params"); }
+  /** The chain's genesis.json as this node serves it: the node's word (nothing here checks it against the genesis hash). */
+  genesis() { return this.call("/genesis"); }
   /** Upgrades: the protocol version in force, what the node's binary supports, the `schedule` (`[{ version, activation_height, active }]`, what `proposal.cancelUpgrade` names), halts and each validator's readiness signal. */
   upgrade() { return this.call("/upgrade"); }
   /** Accounts a key is authorized on (its own address, plus any it was added to). */
@@ -1512,8 +1624,12 @@ export class Client {
    * How to sign a recipient in a field the chain resolves itself (`transfer.to`, `award_hunt.to`,
    * `vouch`/`unvouch`/`flag_sybil`/`clawback.account`, `grant_soul.to`, `transfer_name.to`, and
    * proposal targets): an address as given; with witnesses a name's proven owner; without them
-   * the name itself, which the chain resolves to its owner when the tx runs, so a lying node can
-   * make the tx fail but not send it elsewhere (audit gap-7-1). Show `how` before signing.
+   * the name itself, which the chain resolves to its owner when the tx runs, so a lying node
+   * can't point it at another account now (audit gap-7-1). It can still hold the signed tx and
+   * release it later within its validity window, which counts from the height that node reported
+   * (bounded by `checkSigningHeight` only with witnesses or a `genesisClock`): whoever owns the
+   * name then is paid, so a name that lapses in between pays its next owner (review-r3-clients-2).
+   * Show `how` before signing.
    */
   async recipient(nameOrAddress: string): Promise<Recipient> {
     const r = await this.resolution(nameOrAddress);
@@ -1522,7 +1638,7 @@ export class Client {
       ...r,
       signed: `${r.name}.boo`,
       byChain: true,
-      how: `${r.name}.boo is signed as the name: the chain resolves it to whoever owns it when the transaction runs, so no node can redirect it (${this.rpc} says that's ${r.address} now, unproven)`,
+      how: `${r.name}.boo is signed as the name: the chain pays whoever owns it when the transaction runs, so ${this.rpc} can't point it at another account now, though a node holding the signed transaction could release it later in its validity window, after the name changed hands (${this.rpc} says the owner is ${r.address} now, unproven)`,
     };
   }
 

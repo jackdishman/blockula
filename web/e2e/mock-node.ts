@@ -82,6 +82,8 @@ export class MockNode {
   genesisHash: string;
   /** Extra /api/status fields (e.g. a v1 node's address_prefix). */
   statusExtra: Record<string, unknown> = {};
+  /** What `/api/genesis` serves (null: 404, as from a node that doesn't serve it). */
+  genesis: Record<string, unknown> | null = null;
   faucet = true;
   height = 100;
   accounts = new Map<string, Acct>();
@@ -553,6 +555,7 @@ export class MockNode {
     try {
       let m: RegExpMatchArray | null;
       if (req.method() === "GET" && path === "/status") return reply(200, this.status());
+      if (req.method() === "GET" && path === "/genesis") return this.genesis ? reply(200, this.genesis) : reply(404, { error: "no genesis here" });
       if (req.method() === "GET" && (m = path.match(/^\/account\/(.+)$/))) return reply(200, this.account(m[1]));
       if (req.method() === "GET" && (m = path.match(/^\/key\/([0-9a-f]{64})$/))) return reply(200, this.keyAccounts(m[1]));
       if (req.method() === "GET" && (m = path.match(/^\/name\/(.+)$/))) {

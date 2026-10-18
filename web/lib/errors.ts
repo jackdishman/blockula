@@ -30,6 +30,7 @@ export function friendly(e: unknown): string {
     [/names can't start or end/, "Names can't start or end with a dash."],
     [/still pending/, "Sent, but the network hasn't confirmed it yet. Check your activity before sending again: it may still go through."],
     [/was dropped by this node without running/, "Your node dropped this transaction before running it, so nothing was charged, but another node may still include it for a few minutes. Check your activity before sending again."],
+    [/reports height \d+, but by .* the chain can't be past block/, "Your node reports a block height the network can't have reached yet, so nothing was signed (a transaction signed against it could be held and sent later). Use another node, or check this device's clock."],
     [/disagrees about the state at block/, "The nodes this wallet checks names against disagree about who owns that name, so it wasn't used. Try again in a moment, or pay the address directly."],
     [/didn't answer within/, `The Blockula node at ${RPC} didn't answer in time. If you were sending, check your activity before trying again: it may have gone through.`],
     [/PRF extension/, "Your passkey provider doesn't support the PRF extension, which Blockula needs to derive your quantum-safe key."],

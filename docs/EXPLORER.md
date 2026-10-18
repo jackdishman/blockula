@@ -96,7 +96,7 @@ it lands on the receipt. It signs by the SDK's rules:
   winner, a vouch, a name offer) a name is signed as `Client.recipient` says: its proven owner
   with witnesses, else the name itself, so a lying node can make the transaction fail but not
   send it elsewhere. A field that needs an address (`validator`) takes `Client.resolution`'s,
-  handed to `Wallet.build` (`unproven`), so mainnet refuses one only the node vouched for
+  handed to `Wallet.build` (`resolutions`), so mainnet refuses one only the node vouched for
   against the very status it signs for (`UnprovenNameError`).
 - **Heights.** An action that carries a height (a hunt's expiry) is built by
   `wallet.build((height) => …)` from the status read that `valid_until` is counted from, and

@@ -141,7 +141,7 @@ export function ActionForm({ spec, initial = {}, fixed = [], compact = false }: 
           return spec.build(values, { height, account: wallet.account });
         },
         String(raw.memo ?? "").trim(),
-        { unproven: resolutions },
+        { resolutions },
       );
       const { pf, blockMs } = await checkTx(tx, wallet.keyId);
       setPreview({ tx, headline: spec.describe(raw), does: describeAction(tx.action), names, from, pf, blockMs });

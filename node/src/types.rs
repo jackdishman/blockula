@@ -1194,6 +1194,13 @@ impl Action {
         })
     }
 
+    /// Whether this could be a multisig's stored pending action: the format rules a
+    /// `MultisigPropose` holding it had to pass. A client checks a node's answer with it before
+    /// describing or approving one (audit review-r3-clients-7).
+    pub fn check_as_multisig_action(&self) -> Result<()> {
+        Action::MultisigPropose { action: Box::new(self.clone()) }.check_format(false)
+    }
+
     /// The action's own format rules (`Tx::check_format`). `nested`: inside a `MultisigPropose`.
     fn check_format(&self, nested: bool) -> Result<()> {
         // First, so it's the rule a too-large number meets whatever else is wrong.
