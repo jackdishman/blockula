@@ -912,7 +912,7 @@ fn replay(tip: Tip, parent: &CBlock, mut pending: Vec<Arc<CBlock>>) -> Option<cr
     let mut state = tip.state;
     for b in pending.iter().rev() {
         let txs: Vec<Tx> = b.parse_txs().into_iter().flatten().collect();
-        state.run_block(&tip.chain_id, b.height, &hex::encode(b.digest.0), &b.proposer, b.view, b.parent_view, &txs, |_, _| {});
+        state.run_block(&tip.chain_id, b.height, &hex::encode(b.digest.0), &b.proposer, b.view, b.parent_view, &txs, |_, _, _| {});
     }
     Some(state)
 }

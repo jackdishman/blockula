@@ -528,15 +528,17 @@ struct Ran<'a> {
 }
 
 /// The account a sealed tx's action named, as the chain resolved it when its block ran: the tx's
-/// index rows (`BlockMeta::history`, written as the block was executed) hold the accounts it
-/// joined, the sender and the one it named. A name signed as a name (audit gap-7-1) pays whoever
-/// owned it then, so resolving it against today's state would credit a later owner, or nobody
-/// once it lapsed (audit main13-protocol-3). `None` when the rows don't single one out (it named
-/// its own sender, or the name didn't resolve).
-fn named_at_execution(meta: &BlockMeta, idx: usize, sender: &str) -> Option<String> {
+/// index rows (`BlockMeta::history`) hold the accounts it joined: the sender and the ones it
+/// named, resolved just before it ran (`State::named_by`). A name signed as a name (audit gap-7-1)
+/// pays whoever owned it then, so resolving it against today's state, or against the state after
+/// its whole block, would credit a later owner, or nobody once it lapsed (audit
+/// main13-protocol-3, review-main13-1). No other row: it named its own sender, or (only a failed
+/// tx) a name that didn't resolve, so a failed one's is unknown (`None`).
+fn named_at_execution(meta: &BlockMeta, idx: usize, sender: &str, failed: bool) -> Option<String> {
     let mut rows = meta.history.iter().filter(|(i, a)| *i as usize == idx && a != sender).map(|(_, a)| a);
     match (rows.next(), rows.next()) {
         (Some(a), None) => Some(a.clone()),
+        (None, _) if !failed => Some(sender.to_string()),
         _ => None,
     }
 }
@@ -545,13 +547,16 @@ fn tx_json_with(v: &ReadView, tx: &Tx, ran: Option<Ran>, error: Option<&str>) ->
     let st = &v.state;
     let height = ran.map(|r| r.height);
     let sender = tx.sender().unwrap_or_default();
-    // An address names itself. A name is resolved as it was when the block ran, when this node's
-    // index has the block's rows; else (pending, or no rows) as it resolves now.
+    // An address names itself. For a sealed tx, a name is who the block's index rows say it paid
+    // when it ran, and unknown without them (never who owns it now); a pending one's resolves now.
     let named = |named: &String| -> Option<String> {
         if crypto::is_address(named) {
             return Some(named.clone());
         }
-        ran.and_then(|r| named_at_execution(r.meta?, r.idx?, &sender)).or_else(|| st.resolve(named).ok())
+        match ran {
+            Some(r) => named_at_execution(r.meta?, r.idx?, &sender, error.is_some()),
+            None => st.resolve(named).ok(),
+        }
     };
     // The name the action was signed with, for the kinds whose `to` it names.
     let signed_name = |n: &String| (!crypto::is_address(n)).then(|| format!("{}{NAME_SUFFIX}", normalize_name(n).unwrap_or_else(|_| n.clone())));
@@ -3159,6 +3164,26 @@ mod http_tests {
         let h = v["height"].as_u64().unwrap();
         let (_, b, _) = call(&n, "GET", &format!("/api/block/{h}"), None, "127.0.0.1:1").await;
         assert_eq!(b["txs"][0]["to"]["address"].as_str(), Some(alice.address().as_str()), "{b}");
+        // Audit review-main13-1: the name changes hands later in the payment's own block. Who it
+        // named is resolved just before each tx runs, so it's still reported as paid to alice.
+        step(&alice, Action::RegisterName { name: "shop".into() });
+        step(&alice, Action::TransferName { name: "shop".into(), to: bob.address() });
+        let (same, accept) = {
+            let c = n.chain.lock();
+            (mk(&c, &payer, Action::Transfer { to: "shop.boo".into(), amount: 5 * DROPS_PER_FANG }), mk(&c, &bob, Action::TransferName { name: "shop".into(), to: bob.address() }))
+        };
+        let had = n.chain.lock().state.account(&alice.address()).balance;
+        n.chain.lock().produce_block_with(vec![same.clone(), accept]).unwrap();
+        {
+            let c = n.chain.lock();
+            assert_eq!((c.state.account(&alice.address()).balance, c.state.resolve("shop.boo").unwrap()), (had + 5 * DROPS_PER_FANG, bob.address()), "the chain paid alice; bob owns it after the block");
+        }
+        let (_, v, _) = call(&n, "GET", &format!("/api/tx/{}", same.id()), None, "127.0.0.1:1").await;
+        assert_eq!((v["to"]["address"].as_str(), v["to_name"].as_str()), (Some(alice.address().as_str()), Some("shop.boo")), "{v}");
+        let (_, a, _) = call(&n, "GET", &format!("/api/account/{}", alice.address()), None, "127.0.0.1:1").await;
+        assert!(a["recent_txs"].as_array().unwrap().iter().any(|t| t["id"] == json!(same.id())), "in alice's history: {a}");
+        let (_, b, _) = call(&n, "GET", &format!("/api/account/{}", bob.address()), None, "127.0.0.1:1").await;
+        assert!(!b["recent_txs"].as_array().unwrap().iter().any(|t| t["id"] == json!(same.id())), "not in bob's: {b}");
         // An address-signed payment names no name.
         let direct = step(&payer, Action::Transfer { to: bob.address(), amount: DROPS_PER_FANG });
         let (_, d, _) = call(&n, "GET", &format!("/api/tx/{}", direct.id()), None, "127.0.0.1:1").await;
