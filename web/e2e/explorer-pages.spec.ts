@@ -427,17 +427,24 @@ test.describe("the explorer from an account holder's side", () => {
     await page.addInitScript(([key, address]) => localStorage.setItem(key, JSON.stringify([{ address, label: "mina.boo", at: 1 }])), [`blockula.watch:${RPC}`, w.mina]);
     await visit(page, "/explore", (p) => p.getByRole("heading", { name: "blockula-testnet, live" }), errors);
     await page.waitForTimeout(4500); // the first look is the baseline
-    // Right after a round reads this account, a payment from it to the watched one seals: the
-    // watched account's read announces it first, and this account's next read sees its nonce moved.
-    node.afterAccountRead = (id) => {
-      if (id !== me) return;
-      node.afterAccountRead = null;
+    // A round reads this account, then the watched one; a payment from this account to the watched
+    // one seals in between (just before the watched account's read, which only these notices
+    // make): that read announces it first, and this account's next read sees its nonce moved.
+    node.beforeAccountRead = (id) => {
+      if (id !== w.mina) return;
+      node.beforeAccountRead = null;
       node.add({ kind: "transfer", from: me, to: w.mina, amount: 2_000_000_000n, fee: 64_920n, memo: "", summary: "vlad.boo sent 2 FANG to mina.boo", action: { type: "transfer", to: w.mina, amount: "2000000000" } });
       node.acct(me).nonce += 1;
     };
     await expect(page.locator(".notice", { hasText: "Watching mina.boo" })).toBeVisible({ timeout: 9000 });
-    await page.waitForTimeout(6000); // this account's next read
-    await expect(page.locator(".notice", { hasText: "pushed out of view" })).toHaveCount(0);
+    // Through this account's next read: no notice says a spend was pushed out of view. (Sampled,
+    // not retried until it passes: a notice that showed and was dismissed still counts.)
+    const shown = new Set<string>();
+    for (let i = 0; i < 24; i++) {
+      for (const text of await page.locator(".notice").allInnerTexts()) shown.add(text);
+      await page.waitForTimeout(250);
+    }
+    expect([...shown].filter((text) => text.includes("pushed out of view"))).toEqual([]);
     expect(errors).toEqual([]);
   });
 
