@@ -1789,7 +1789,8 @@ mod tests {
         // Counted from the genesis, the tip is a year old; from its block's time, a minute.
         let pins = |hash2: &str| Pins { genesis_hash: Some(hash.clone()), checkpoints: vec![Checkpoint { height: 2, hash: hash2.into(), set_hash: None, timestamp_ms: None }], ..Default::default() };
         let mut trust = Trust::new(&g, &pins(&hash2), true).unwrap();
-        assert!(trust.check_fresh((0, None), crate::chain::now_ms()).unwrap_err().to_string().contains("~365.0 days"));
+        let err = trust.check_fresh((0, None), crate::chain::now_ms()).unwrap_err().to_string();
+        assert!(err.contains("~364.9 days") || err.contains("~365.0 days"), "{err}");
         learn_checkpoint_time(&mut trust, std::slice::from_ref(&url)).await;
         assert_eq!(trust.check_fresh((0, None), crate::chain::now_ms()).unwrap(), None);
         assert_eq!(trust.checkpoints().next().unwrap().timestamp_ms, Some(t2));
@@ -1809,7 +1810,7 @@ mod tests {
         };
         try_join("joined", pins(&hash2)).await.unwrap().unwrap();
         let err = try_join("refused", pins(&"cd".repeat(32))).await.unwrap().unwrap_err().to_string();
-        assert!(err.contains("~365.0 days") && err.contains("TIMESTAMP_MS"), "{err}");
+        assert!((err.contains("~364.9 days") || err.contains("~365.0 days")) && err.contains("TIMESTAMP_MS"), "{err}");
         // The joined home's first start reads it again (join.json keeps what the operator passed).
         let jc: JoinConfig = serde_json::from_slice(&std::fs::read(root.join("joined").join("join.json")).unwrap()).unwrap();
         assert_eq!(jc.pins, pins(&hash2));

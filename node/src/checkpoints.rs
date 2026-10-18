@@ -974,7 +974,8 @@ mod tests {
         assert_eq!(Checkpoint::parse(&cp.to_flag()).unwrap(), cp);
         assert_eq!(cp.to_flag(), format!("{boundary}:{}:{}:{}", cp.hash, cp.set_hash.as_deref().unwrap(), time(boundary)));
         let three = fetch(std::slice::from_ref(&url), Some(3)).await.unwrap().1;
-        assert_eq!((three.hash.clone(), three.timestamp_ms), (chain.lock().hash_at(3).unwrap(), Some(time(3))));
+        let hash3 = chain.lock().hash_at(3).unwrap();
+        assert_eq!((three.hash.clone(), three.timestamp_ms), (hash3, Some(time(3))));
         assert_eq!(fetch(std::slice::from_ref(&url), Some(0)).await.unwrap().1, genesis_checkpoint(&g));
         assert_eq!(genesis_checkpoint(&g).timestamp_ms, Some(g.created_at_ms));
         assert!(fetch(std::slice::from_ref(&url), Some(epoch_blocks + 100)).await.unwrap_err().to_string().contains("isn't finalized"));
