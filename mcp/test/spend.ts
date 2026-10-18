@@ -104,6 +104,8 @@ interface Mode {
   post: "accept" | "refuse" | "hang" | "lie";
   /** What GET /api/tx/{id} says about a posted tx. `failed`: it ran in a block and failed; `dropped`: evicted unrun; `gone`: 404 (pruned, or never held). */
   tx: "pending" | "finalized" | "failed" | "dropped" | "gone";
+  /** What the next GET /api/tx/{id} reads answer, one each, before `tx` again (a block executing between two reads); `down`: 500. */
+  txFirst?: (Mode["tx"] | "down")[];
   /** The executed nonce /api/account reports for accounts without a fixture (default 0); `down`: it answers 500. */
   accountNonce?: number | "down";
   /** The fee /api/tx/{id} reports for a final tx (default: half its max fee). */
@@ -163,12 +165,14 @@ const fake: Server = createServer((req, res) => {
     if (tx) {
       const t = posted.find((p) => txId(p) === tx[1]);
       if (tx[1] === "cd".repeat(32)) return reply(200, { id: tx[1], status: "finalized", summary: "boo1x sent 1 FANG to bob.boo", memo: INJECTION, public_key: "01".repeat(1952), type: "evil-type", explorer: "https://evil.example" });
-      if (!t || mode.tx === "gone") return reply(404, { error: "tx not found" });
+      const answer = (t && mode.txFirst?.shift()) || mode.tx;
+      if (answer === "down") return reply(500, { error: "busy" });
+      if (!t || answer === "gone") return reply(404, { error: "tx not found" });
       // As node/src/api.rs answers a tx dropped from its mempool: no tx fields, `dropped`.
-      if (mode.tx === "dropped") return reply(200, { id: tx[1], status: "failed", dropped: true, error: "evicted from a full mempool by a transaction with a higher tip", height: 10, summary: "Transaction dropped without running" });
+      if (answer === "dropped") return reply(200, { id: tx[1], status: "failed", dropped: true, error: "evicted from a full mempool by a transaction with a higher tip", height: 10, summary: "Transaction dropped without running" });
       const charged = mode.fee ?? (BigInt(t.fee) / 2n).toString();
-      const inBlock = mode.tx === "finalized" || mode.tx === "failed";
-      return reply(200, { id: tx[1], status: mode.tx, error: mode.tx === "failed" ? "insufficient balance" : null, summary: `sent ${t.action.type}`, fee: charged, fee_display: "fee", max_fee: t.fee, height: inBlock ? 11 : null, valid_until: t.valid_until, action: t.action });
+      const inBlock = answer === "finalized" || answer === "failed";
+      return reply(200, { id: tx[1], status: answer, error: answer === "failed" ? "insufficient balance" : null, summary: `sent ${t.action.type}`, fee: charged, fee_display: "fee", max_fee: t.fee, height: inBlock ? 11 : null, valid_until: t.valid_until, action: t.action });
     }
     if (path === `/account/${BOB}`) return reply(200, { account: { address: BOB, name: "bob.boo" }, balance: "5", nonce: 0, next_nonce: 0, keys: bobKeys });
     // Like a node: the next nonce counts the account's txs it holds (refused ones don't count).
@@ -358,6 +362,44 @@ mode.status = { height: taker.valid_until + 200_000, history_from: 1 };
 r = await s.call("tx_status", { tx_id: txId(taker) });
 ts = r.json();
 assert.ok(ts.status === "nonce_used" && /holds every block it could have run in \(from #1\) and has no record of it, so most likely another tx used that nonce/.test(ts.next), r.text);
+// review-r4-wallet-1: the block holding it executes between the read that didn't find it and the
+// nonce read (the node catching up while the head is still before valid_until). The tx is read
+// again after the nonce, so it's answered as what it is, never "most likely ... never ran".
+for (const first of ["gone", "dropped"] as const) {
+  for (const [answer, block] of [["finalized", 11], ["failed", 11]] as const) {
+    mode.status = { height: 10, history_from: 1 };
+    mode.accountNonce = taker.nonce + 1;
+    mode.tx = answer;
+    mode.txFirst = [first];
+    r = await s.call("tx_status", { tx_id: txId(taker) });
+    ts = r.json();
+    assert.ok(!r.error && ts.status === answer && ts.block === block && mode.txFirst.length === 0, r.text);
+    assert.doesNotMatch(r.text, /most likely|never ran|nonce_used|isn't confirmed/, r.text);
+    if (answer === "failed") assert.match(ts.next, /ran in block 11 and failed, so its fee was charged/);
+  }
+}
+// The second read fails, or catches the node mid-update (still pending with its nonce used): no
+// "holds every block ... no record of it", which only a second miss supports.
+for (const second of ["down", "pending"] as const) {
+  mode.status = { height: taker.valid_until + 200_000, history_from: 1 };
+  mode.accountNonce = taker.nonce + 1;
+  mode.tx = "gone";
+  mode.txFirst = ["gone", second];
+  r = await s.call("tx_status", { tx_id: txId(taker) });
+  ts = r.json();
+  assert.ok(!r.error && ts.status === "nonce_used" && mode.txFirst.length === 0 && /It may have been this one.*Do NOT send it again until you know whether it was this one: if it was, the payment already went through/.test(ts.next), r.text);
+  assert.doesNotMatch(ts.next, /most likely|has no record of it/, r.text);
+}
+// An archive node that remembers dropping it, read again after the nonce and still not in a block:
+// the same as one that doesn't know it (it ran in none of the blocks it holds).
+mode.tx = "dropped";
+mode.txFirst = [];
+r = await s.call("tx_status", { tx_id: txId(taker) });
+ts = r.json();
+assert.ok(!r.error && ts.status === "nonce_used" && ts.dropped_at_height === 10 && /holds every block it could have run in \(from #1\) and shows it in none of them, so most likely another tx used that nonce/.test(ts.next), r.text);
+mode.tx = "gone";
+mode.accountNonce = taker.nonce + 5;
+mode.status = { height: taker.valid_until + 200_000, history_from: 1 };
 // Past valid_until with the nonce unused: it never ran and never can.
 mode.accountNonce = taker.nonce;
 r = await s.call("tx_status", { tx_id: txId(taker) });

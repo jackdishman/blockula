@@ -365,6 +365,12 @@ interface SlotFate {
   proofError?: string;
   /** Another tx this MCP signed with the same (account, nonce) that the node shows in a block. */
   sibling?: { id: string; status: string; block?: number };
+  /**
+   * The tx itself, read again once its nonce showed used (audit review-r4-wallet-1): `ran`, the
+   * node now shows it in a block (it executed between the first read and the nonce read); `absent`,
+   * still in no block (404, or only its drop); unset, the read failed or caught the node mid-update.
+   */
+  recheck?: { ran: Record<string, unknown> } | "absent";
 }
 
 const safeInt = (v: unknown) => (Number.isSafeInteger(v) && (v as number) >= 0 ? (v as number) : undefined);
@@ -404,6 +410,19 @@ async function slotFate(client: Client, id: string, mine: SignedTx): Promise<Slo
     }
   }
   if (fate.accountNonce !== undefined && fate.accountNonce > mine.nonce) {
+    // The first read (that didn't find it in a block) predates the nonce read: the block it ran in
+    // may have executed in between. Only a read after the nonce read can say it's in none of the
+    // blocks this node holds.
+    try {
+      const t = await client.tx(id);
+      if (t.status === "finalized" || (t.status === "failed" && !txDropped(t))) {
+        fate.recheck = { ran: t };
+        return fate;
+      }
+      if (t.status === "failed") fate.recheck = "absent";
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 404) fate.recheck = "absent";
+    }
     for (const other of SIGNED.sameSlot(mine.account, mine.nonce, id).slice(-3)) {
       const t = await client.tx(other).catch(() => null);
       if (t && (t.status === "finalized" || (t.status === "failed" && !txDropped(t)))) {
@@ -446,10 +465,12 @@ function afterTheFact(how: "unknown" | "dropped", tx_id: string, mine: SignedTx,
       which = `This MCP signed another tx with the same nonce, ${fate.sibling.id}, which this node shows ${fate.sibling.status === "finalized" ? "finalized" : "failed (its fee was charged)"}${fate.sibling.block !== undefined ? ` in block ${fate.sibling.block}` : ""}: that one used the nonce, so this one never ran and nothing was charged for it. Check that tx (tx_status ${fate.sibling.id}), not this one.`;
     } else {
       const earliest = fate.maxValidity !== undefined ? Math.max(1, vu - fate.maxValidity) : 1;
-      const lacks = how === "dropped" ? true : fate.historyFrom === undefined || fate.historyFrom > earliest;
+      const holdsAll = fate.historyFrom !== undefined && fate.historyFrom <= earliest;
+      // "In none of them" needs a read after the nonce read that still didn't find it in a block.
+      const lacks = !holdsAll || fate.recheck !== "absent";
       which = lacks
-        ? `It may have been this one${how === "dropped" ? ", included by another node after this one dropped it" : `: this node ${fate.historyFrom !== undefined ? `only holds blocks from #${fate.historyFrom} on` : "may not hold the block it ran in"}, so it may have pruned or never held it`}. Look it up on an archive node (or in ${mine.account}'s history) to see whether this one ran and whether it succeeded.`
-        : `This node holds every block it could have run in (from #${fate.historyFrom}) and has no record of it, so most likely another tx used that nonce and this one never ran; confirm on another node (or in ${mine.account}'s history).`;
+        ? `It may have been this one${how === "dropped" ? ", included by another node after this one dropped it" : holdsAll ? ": asked again after its nonce was read, this node gave no clear answer" : `: this node ${fate.historyFrom !== undefined ? `only holds blocks from #${fate.historyFrom} on` : "may not hold the block it ran in"}, so it may have pruned or never held it`}. Look it up on an archive node (or in ${mine.account}'s history) to see whether this one ran and whether it succeeded.`
+        : `This node holds every block it could have run in (from #${fate.historyFrom}) and ${how === "dropped" ? "shows it in none of them" : "has no record of it"}, so most likely another tx used that nonce and this one never ran; confirm on another node (or in ${mine.account}'s history).`;
     }
     return {
       status: "nonce_used",
@@ -492,6 +513,15 @@ function afterTheFact(how: "unknown" | "dropped", tx_id: string, mine: SignedTx,
   };
 }
 
+/** A tx the node shows in a block: finalized, or failed (it ran, so its fee was charged). Final either way. */
+function inBlock(tx: any, link: string): Record<string, unknown> {
+  const status = String(tx.status);
+  const summary = clean(String(tx.summary ?? ""));
+  const error = tx.error ? { error: clean(String(tx.error)) } : {};
+  if (status === "finalized") return { status, summary, ...error, block: tx.height, fee: tx.fee_display, explorer: link };
+  return { status, summary, ...error, block: tx.height, fee: tx.fee_display, next: `It ran${typeof tx.height === "number" ? ` in block ${tx.height}` : ""} and failed, so its fee was charged and nothing else happened. That's final.`, explorer: link };
+}
+
 /**
  * A tx's status as the node reports it, read the way submitCapped reads it (audit
  * review-fix-clients-2): "finalized" and "failed" (it ran in a block; its fee was charged) are
@@ -510,7 +540,12 @@ tool("tx_status", "Check a transaction by id: finalized (with its block), failed
     tx = await client.tx(tx_id);
   } catch (e) {
     // This node doesn't know it: pruned or never held (it ran long ago), or never reached it.
-    if (e instanceof ApiError && e.status === 404 && mine) return { ...afterTheFact("unknown", tx_id, mine, await slotFate(client, tx_id, mine)), explorer: link };
+    if (e instanceof ApiError && e.status === 404 && mine) {
+      const fate = await slotFate(client, tx_id, mine);
+      // It ran in a block that executed after the first read: answered as what it is.
+      if (fate.recheck && fate.recheck !== "absent") return inBlock(fate.recheck.ran, link);
+      return { ...afterTheFact("unknown", tx_id, mine, fate), explorer: link };
+    }
     throw e;
   }
   const status = String(tx.status);
@@ -518,15 +553,15 @@ tool("tx_status", "Check a transaction by id: finalized (with its block), failed
   const error = tx.error ? { error: clean(String(tx.error)) } : {};
   const nodeUntil = Number.isSafeInteger(tx.valid_until) ? (tx.valid_until as number) : undefined;
   const validUntil = mine?.valid_until ?? nodeUntil;
-  if (status === "finalized") return { status, summary, ...error, block: tx.height, fee: tx.fee_display, explorer: link };
-  if (status === "failed" && !txDropped(tx)) {
-    return { status, summary, ...error, block: tx.height, fee: tx.fee_display, next: `It ran${typeof tx.height === "number" ? ` in block ${tx.height}` : ""} and failed, so its fee was charged and nothing else happened. That's final.`, explorer: link };
-  }
+  if (status === "finalized" || (status === "failed" && !txDropped(tx))) return inBlock(tx, link);
   if (status === "failed") {
     // Dropped unrun: the height in the answer is where this node dropped it, not a block it ran in.
     const at = typeof tx.height === "number" ? { dropped_at_height: tx.height } : {};
     if (mine) {
-      const r = afterTheFact("dropped", tx_id, mine, await slotFate(client, tx_id, mine));
+      const fate = await slotFate(client, tx_id, mine);
+      // Another node included it after this one dropped it, and this node has run that block since.
+      if (fate.recheck && fate.recheck !== "absent") return inBlock(fate.recheck.ran, link);
+      const r = afterTheFact("dropped", tx_id, mine, fate);
       return { ...r, ...(r.status === "dropped" ? { dropped: true } : {}), summary, ...error, ...at, explorer: link };
     }
     const head = await client.status().then((st) => safeInt(st.height)).catch(() => undefined);
