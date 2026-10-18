@@ -186,8 +186,13 @@ test("transfer_name to oneself says what the chain will do with the name, and re
   assert.match(run(mine, "accept_name").refusals.join(" "), /owns castle.boo, so this would withdraw its offer/);
   // Neither: the chain refuses it.
   assert.match(run({ owner: "boo1mina", offeredTo: null }, "accept_name").refusals.join(" "), /isn't this account's, and it isn't offered to it/);
-  // An expired name can't be accepted, or offered.
+  // An expired name can't be accepted, offered, or have its offer withdrawn.
   assert.match(run({ ...offered, status: "grace" }, "accept_name").refusals.join(" "), /has expired/);
+  assert.match(run({ ...mine, status: "grace" }, "withdraw_name_offer").refusals.join(" "), /has expired.*renew it first/);
+  // TransferName to an owner without an open offer is refused, not a successful no-op.
+  const noneOpen = run({ ...mine, offeredTo: undefined }, "withdraw_name_offer");
+  assert.match(noneOpen.refusals.join(" "), /no open offer to withdraw/);
+  assert.equal(noneOpen.headline, "No open offer of castle.boo to withdraw");
   const offer = { ...toSelf, action: { type: "transfer_name", name: "castle", to: "boo1mina" } };
   assert.match(preflight({ tx: offer, sender: sender(F), signer: "k-owner", head: 100, name: { name: "castle.boo", owner: "boo1mina" } }).refusals.join(" "), /isn't this account's to offer/);
   assert.deepEqual(preflight({ tx: offer, sender: sender(F), signer: "k-owner", head: 100, name: { name: "castle.boo", owner: "boo1vlad", status: "active" } }).refusals, []);

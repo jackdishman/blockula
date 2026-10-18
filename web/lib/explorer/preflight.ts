@@ -306,8 +306,10 @@ export function preflight(i: PreflightInput): Preflight {
       const outcome = nm.owner !== me && nm.offeredTo === me ? "accept" : nm.owner === me ? "withdraw" : null;
       if (!outcome) refusals.push(`${nm.name} isn't this account's, and it isn't offered to it.`);
       else {
-        headline = outcome === "accept" ? `Accept ${nm.name}: it becomes this account's name` : nm.offeredTo ? `Withdraw your offer of ${nm.name}` : `Withdraw an offer of ${nm.name} (there's none open: nothing changes)`;
+        headline = outcome === "accept" ? `Accept ${nm.name}: it becomes this account's name` : nm.offeredTo ? `Withdraw your offer of ${nm.name}` : `No open offer of ${nm.name} to withdraw`;
         if (outcome === "accept" && nm.status === "grace") refusals.push(`${nm.name} has expired: only its owner can renew it, so it can't be accepted.`);
+        if (outcome === "withdraw" && nm.status === "grace") refusals.push(`${nm.name} has expired: renew it first.`);
+        if (outcome === "withdraw" && !nm.offeredTo) refusals.push(`${nm.name} has no open offer to withdraw.`);
         if (i.intent === "withdraw_name_offer" && outcome === "accept") refusals.push(`${nm.name} is offered to this account, so this would accept it, not withdraw an offer. To take it, use “Accept a name”.`);
         if (i.intent === "accept_name" && outcome === "withdraw") refusals.push(`This account owns ${nm.name}, so this would withdraw its offer, not accept one.`);
       }
