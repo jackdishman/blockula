@@ -808,6 +808,11 @@ fn close_vote(state: &mut State, id: u64, height: u64, unlocked: u128) {
     if p.voters > 0 {
         state.governance.closed_votes.insert(id);
     }
+    // An upgrade proposal a cancellation superseded during its vote that passes anyway spends
+    // its number, like one that had passed when the cancellation ran (review-r3-gov-2).
+    if let (true, ProposalKind::ScheduleUpgrade { version, .. }) = (passed, &p.kind) {
+        crate::upgrade::spend_if_superseded(state, &mut j, p.created_at, *version);
+    }
     let p = proposal_mut(state, &mut j, id);
     p.tally = Some(Tally { unlocked, quorum, quorum_reached, supermajority, council_size: n, council_ayes: ayes, council_nays: nays });
     p.outcome = outcome;

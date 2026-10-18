@@ -1057,10 +1057,10 @@ fn a_scheduled_upgrade_can_be_cancelled_before_it_activates() {
 /// run after the cancellation and switch on v2's withdrawn rules with its own. The cancellation's
 /// summary (conditional while it's open) and its outcome name it; it fails when it would run.
 /// v3 had passed (its release may be out, signalled), so the cancellation spends its number too;
-/// v7, still being voted on, isn't spent (filing one mustn't spend numbers), but a release may
-/// carry it, so every advice (the cancellation's outcome, each superseded proposal's, a refused
-/// reuse) names v8 (review-r3-gov-1). The chain still accepts v4, and the executed
-/// cancellation's summary doesn't claim the later, legitimate proposal (review-r2-gov-3).
+/// v7, still being voted on (and rejected later), isn't spent (filing one mustn't spend numbers),
+/// but a release may carry it, so every advice (the cancellation's outcome, each superseded
+/// proposal's, a refused reuse) names v8 (review-r3-gov-1). The chain still accepts v4, and the
+/// executed cancellation's summary doesn't claim the later, legitimate proposal (review-r2-gov-3).
 #[test]
 fn a_cancellation_supersedes_upgrade_proposals_still_open() {
     let mut t = T::new(&[]);
@@ -1085,8 +1085,9 @@ fn a_cancellation_supersedes_upgrade_proposals_still_open() {
     assert_eq!(describe_kind(&t.st, &cancel, &|_| None), what, "a Propose tx's summary: nothing that depends on when it runs");
     t.next();
     t.next();
-    // v7 is proposed later and is still being voted on when the cancellation runs.
-    let s7 = pass(&mut t, ProposalKind::ScheduleUpgrade { version: v + 5, activation_height: a + 200 });
+    // v7 is proposed later and is still being voted on when the cancellation runs (nobody votes
+    // for it: it's rejected later).
+    let s7 = t.propose(ALICE, ProposalKind::ScheduleUpgrade { version: v + 5, activation_height: a + 200 });
     assert_eq!(describe_proposal(&t.st, t.p(c), &|_| None), format!("{what}; if it passes, as things stand it also supersedes the upgrade proposals open now, #{s3} (v{} at block {}), #{s7} (v{} at block {})", v + 1, a + 100, v + 5, a + 200));
     let ran = t.p(c).voting_end + 1;
     t.through(ran - 1);
@@ -1103,9 +1104,9 @@ fn a_cancellation_supersedes_upgrade_proposals_still_open() {
     }
     assert!(ran < t.p(s3).voting_end + timelock, "the successor is still voting or queued");
     t.finish(s7);
-    assert_eq!((t.p(s3).status, t.p(s7).status), (ProposalStatus::Failed, ProposalStatus::Failed));
+    assert_eq!((t.p(s3).status, t.p(s7).status), (ProposalStatus::Failed, ProposalStatus::Rejected));
     assert!(t.p(s3).outcome.contains(&format!("superseded: it was proposed at block {}, and the CancelUpgrade that ran at block {ran} withdrew upgrades from the schedule it was proposed against (versions through v{} are spent). Propose the upgrade again as v{} or later", t.p(s3).created_at, v + 1, v + 6)), "past v7 too: {}", t.p(s3).outcome);
-    assert!(t.p(s7).outcome.contains(&format!("Propose the upgrade again as v{} or later", v + 6)), "past its own number: {}", t.p(s7).outcome);
+    assert_eq!(t.st.upgrade.withdrawals.highest, v + 1, "rejected: v7 isn't spent");
     assert!(t.st.upgrade.schedule.is_empty(), "v2's rules never activate");
     // Proposed after the cancellation: v3 is spent; v4 isn't (v8 is the advice, v7 may be out,
     // but nothing spent v4–v7) and goes through.
@@ -1273,6 +1274,46 @@ fn a_passed_upgrade_proposal_is_spent_whatever_its_id() {
     t.finish(s3);
     assert_eq!(t.p(s3).status, ProposalStatus::Failed);
     assert!(t.p(s3).outcome.contains(&format!("Propose the upgrade again as v{} or later", v + 2)), "{}", t.p(s3).outcome);
+}
+
+/// review-r3-gov-2, the timing variant: an upgrade proposal superseded while it's still being
+/// voted on spends its number if it passes afterwards (its release may be out and signalled, as
+/// for one that had passed when the cancellation ran), and not if it's rejected (filing one
+/// mustn't spend numbers). Before, only the status at the cancellation's run decided, so a
+/// proposal passing the block after left its number free for other rules.
+#[test]
+fn a_superseded_upgrade_proposal_spends_its_number_only_if_it_passes() {
+    let mut t = T::new(&[]);
+    let v = crate::consensus::PROTOCOL_VERSION + 1;
+    let a = schedule_v(&mut t, v);
+    let c = pass_by(&mut t, BOB, ALICE, ProposalKind::CancelUpgrade { version: v, activation_height: a });
+    t.next();
+    t.next();
+    // Both are proposed two blocks after the cancellation: their votes close after it runs. One
+    // passes; nobody votes for the other.
+    let yes = pass_by(&mut t, ALICE, ALICE, ProposalKind::ScheduleUpgrade { version: v + 3, activation_height: a + 100 });
+    let no = t.propose(CAROL, ProposalKind::ScheduleUpgrade { version: v + 5, activation_height: a + 200 });
+    let ran = t.p(c).voting_end + 1;
+    assert!(t.p(yes).voting_end > ran);
+    t.through(ran);
+    assert_eq!((t.p(c).status, t.p(yes).status, t.p(no).status), (ProposalStatus::Executed, ProposalStatus::Voting, ProposalStatus::Voting), "{}", t.p(c).outcome);
+    let w = &t.st.upgrade.withdrawals;
+    assert_eq!((w.highest, w.superseded), (v, v + 5), "superseded while being voted on: not spent (yet)");
+    assert!(t.p(c).outcome.ends_with(&format!("ship the next upgrade as v{} or later", v + 6)), "{}", t.p(c).outcome);
+    // Their votes close: the one that passed spends its number then, the rejected one doesn't.
+    t.through(t.p(yes).voting_end);
+    assert_eq!((t.p(yes).status, t.p(no).status), (ProposalStatus::Queued, ProposalStatus::Rejected));
+    let w = &t.st.upgrade.withdrawals;
+    assert_eq!((w.highest, w.superseded, crate::upgrade::next_version(&t.st)), (v + 3, v + 5, v + 6), "it passed: spent when its vote closed; the step doesn't move");
+    let later = t.h + 4 * (t.st.chain_params.voting_blocks + t.st.chain_params.timelock_blocks) + 1_000;
+    refused_upgrade(&mut t, ALICE, ProposalKind::ScheduleUpgrade { version: v + 3, activation_height: later }, &format!("isn't newer than v{}, which was scheduled and withdrawn (or passed and was superseded): a version number is never reused (a binary of the withdrawn release would run it), so ship the fixed release as v{} or later", v + 3, v + 6));
+    // The rejected one's number isn't spent: the chain accepts it (the release team's call).
+    let ok = pass_by(&mut t, ALICE, ALICE, ProposalKind::ScheduleUpgrade { version: v + 4, activation_height: later });
+    t.finish(yes);
+    assert_eq!(t.p(yes).status, ProposalStatus::Failed);
+    assert!(t.p(yes).outcome.contains(&format!("(versions through v{} are spent). Propose the upgrade again as v{} or later", v + 3, v + 6)), "{}", t.p(yes).outcome);
+    t.finish(ok);
+    assert_eq!((t.p(ok).status, crate::upgrade::version_at(&t.st, later)), (ProposalStatus::Executed, v + 4), "{}", t.p(ok).outcome);
 }
 
 /// review-fix-ops-2: an upgrade proposal waiting for a multisig's approvals when a cancellation

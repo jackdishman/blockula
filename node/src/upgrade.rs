@@ -32,6 +32,8 @@
 //! Those that hadn't passed aren't spent (filing one mustn't spend numbers), but a release may
 //! carry their numbers too, so the highest of them is kept ([`Withdrawals::superseded`]): the
 //! next upgrade's number ([`next_version`], what the cancellation's outcome advises) is past it.
+//! One that passes later spends its number when its vote closes ([`spend_if_superseded`]): a
+//! passed upgrade's number is spent whether its vote closed before the cancellation ran or after.
 //!
 //! Versions only move up in small steps, at most [`MAX_VERSION_STEP`] past the newest version
 //! ever scheduled, withdrawn or superseded ([`newest_version`]), and an upgrade activates at most
@@ -108,9 +110,9 @@ pub struct ScheduledUpgrade {
 /// highest number they superseded.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Withdrawals {
-    /// The highest version a cancellation withdrew, or that an upgrade proposal had passed with
-    /// and was waiting to run with when one ran (0: none). No version up to it is ever scheduled
-    /// again.
+    /// The highest version a cancellation withdrew, or that an upgrade proposal it superseded
+    /// passed with, before it ran or after ([`spend_if_superseded`]) (0: none). No version up to
+    /// it is ever scheduled again.
     pub highest: u32,
     /// The block the latest cancellation ran in: a `ScheduleUpgrade` proposed in it or before
     /// is superseded.
@@ -264,6 +266,25 @@ pub fn check_not_superseded(state: &State, proposed_at: u64, version: u32) -> Re
         bail!("superseded: it was proposed at block {proposed_at}, and the CancelUpgrade that ran at block {at} withdrew upgrades from the schedule it was proposed against (versions through v{} are spent). Propose the upgrade again as v{} or later: a release built as v{version} carries the withdrawn rules", w.highest, next_version(state));
     }
     Ok(())
+}
+
+/// A `ScheduleUpgrade` of `version` proposed at `proposed_at` just passed its vote: if a
+/// cancellation superseded it while it was being voted on, it can't take effect, but it passed,
+/// so its release may be out and signalled just like one that had passed when the cancellation
+/// ran, and its number is spent the same way (review-r3-gov-2: whether a passed upgrade's number
+/// is spent doesn't depend on when its vote closed). Nothing changes if it isn't superseded, if
+/// its number is spent already, or if a version at least as new is scheduled (no upgrade can
+/// name it any more). The step doesn't move: the cancellation counted it in
+/// [`Withdrawals::superseded`] while it was open, so it's at most [`newest_version`].
+pub(crate) fn spend_if_superseded(state: &mut State, j: &mut Journal, proposed_at: u64, version: u32) {
+    if check_not_superseded(state, proposed_at, version).is_ok() || version <= state.upgrade.withdrawals.highest || version > newest_version(state) {
+        return;
+    }
+    if state.upgrade.schedule.last().is_some_and(|u| u.version >= version) {
+        return;
+    }
+    j.upgrade.save(&state.upgrade);
+    state.upgrade.withdrawals.highest = version;
 }
 
 /// Schedules protocol `version` from `activation_height` on ([`check_schedule_upgrade`]), for a
