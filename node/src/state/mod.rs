@@ -443,6 +443,10 @@ impl State {
         drop(tables);
         let expected: Vec<(Vec<u8>, Vec<u8>)> = state.meta_records().into_iter().map(|(k, v)| (k.to_vec(), v)).collect();
         ensure!(scalars == expected, "missing or non-canonical scalar records");
+        // A genesis takes only a known prefix (`Genesis::check_prefix`) and nothing changes it
+        // later, so a state with another one isn't a Blockula state: refuse it here, before
+        // anything renders an address with it (`crypto::render_address` panics on one).
+        ensure!(crate::crypto::is_prefix(state.params.prefix()), "the state's address prefix isn't a known one");
         leaves.sort_unstable_by_key(|(k, _)| *k);
         Ok((state, leaves))
     }
@@ -462,6 +466,8 @@ impl State {
     /// grants, open Séance budgets), and records that refer to each other agree. `Err` names the
     /// first problem.
     pub fn check_invariants(&self) -> Result<()> {
+        // First: the checks below render system addresses with it.
+        ensure!(crate::crypto::is_prefix(self.params.prefix()), "the state's address prefix isn't a known one");
         let p = &self.poc;
         let mut held: u128 = self.accounts.values().map(|a| a.balance as u128).sum();
         let open_hunts: Vec<&crate::chain::Hunt> = self.hunts.values().filter(|h| h.status == HuntStatus::Open).collect();

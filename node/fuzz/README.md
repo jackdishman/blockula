@@ -117,3 +117,8 @@ Fixed: `verify_chain` walks `range(1..)` up to `epoch`, so epoch 0 gets the gene
 `EpochRegistry::merge_sigs` accepted proofs for every epoch whose set matches ours, and that included epoch 0, whose set is public. `add_sig` then computed `epoch - 1`, which overflows. Overflow checks are on in release builds, so this panicked inside `chain.lock().merge_epochs(..)` in the spawned `exchange_epochs` task, and the task ended. From then on the node stopped collecting and serving handoff proofs, and joiners could no longer verify set changes against it. The fuzzer found this one by itself, from the `handoff-epoch-1` seed.
 
 Fixed: `add_sig` refuses epoch 0 (`checked_sub`) and `merge_sigs` skips it (regression test `epochs::tests::handoff_proofs_for_epoch_0_are_ignored`).
+
+**FUZZ-3 (fixed): a state with an unknown address prefix panicked `check_invariants`** (the nightly `state_snapshot` run of 2026-10-18).
+`snapshot::read_state` accepted a canonical state whose parameters carried an address prefix no network uses (`b#o`), and `State::check_invariants`, which the harness runs on what it decodes, then panicked rendering a system address with it (`crypto::render_address` asserts a known prefix). No running node reached it: every restore compares the rebuilt root with the certified root right after decoding, the prefix is a genesis constant the root commits to, and `check_invariants` runs only in tests and here. It isn't a seed, since the harness now refuses the input.
+
+Fixed: `State::load_records` refuses an unknown prefix and `check_invariants` reports one instead of panicking (regression test `state::tests::a_state_with_an_unknown_address_prefix_is_refused_not_a_panic`).

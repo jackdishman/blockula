@@ -323,6 +323,24 @@ fn state_proofs_verify_against_the_root() {
 }
 
 #[test]
+fn a_state_with_an_unknown_address_prefix_is_refused_not_a_panic() {
+    let mut s = sim("prefix");
+    s.run(&[(2, 0, 3, 0)]);
+    let mut st = s.c.state.clone();
+    // Same length as `boo`, so the record stays canonical and only the prefix check can refuse it.
+    st.params.address_prefix = "b#o".into();
+    assert!(st.check_invariants().unwrap_err().to_string().contains("address prefix"));
+    let mut bytes = vec![];
+    crate::snapshot::write_state(&st, &mut bytes).unwrap();
+    assert!(crate::snapshot::read_state(&mut bytes.as_slice()).err().unwrap().to_string().contains("address prefix"));
+    // The chain's own prefix still round-trips.
+    let mut ok = vec![];
+    crate::snapshot::write_state(&s.c.state, &mut ok).unwrap();
+    assert_eq!(crate::snapshot::read_state(&mut ok.as_slice()).unwrap().root(), s.c.state.root());
+    std::fs::remove_dir_all(&s.home).ok();
+}
+
+#[test]
 fn snapshots_reject_tampering() {
     let mut s = sim("snap");
     s.run(&[(2, 0, 3, 0), (7, 1, 0, 0), (13, 0, 2, 5)]);
