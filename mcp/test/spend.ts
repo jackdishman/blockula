@@ -109,6 +109,8 @@ interface Mode {
   /** Every request hangs. */
   hang?: boolean;
   status: Record<string, unknown>;
+  /** What /api/genesis serves (absent: 404, as from a node too old to serve it). */
+  genesis?: Record<string, unknown>;
 }
 // The node quotes less than the chain's parameters say (1 FANG to register, 0.1 FANG a year to renew).
 const QUOTES = { price: "1000000000", renewal_price: "100000000", params: true };
@@ -173,6 +175,7 @@ const fake: Server = createServer((req, res) => {
     // The lie the R1 reviewer of gap-7-1 used: validator.boo "is" Mallory's.
     if (path === "/name/validator") return reply(200, { name: "validator.boo", status: "active", available: false, owner: { address: MALLORY, name: "validator.boo" }, ...mode.prices });
     if (path.startsWith("/name/")) return reply(200, { name: `${path.slice(6)}.boo`, status: "available", available: true, ...mode.prices });
+    if (path === "/genesis" && mode.genesis) return reply(200, mode.genesis);
     if (path.startsWith("/search/")) return reply(200, { type: "tx", id: "cd".repeat(32) });
     if (path.startsWith("/hunts")) return reply(200, [{ id: 1, title: `${INJECTION}‮\u0007`, amount_display: "10 FANG", issue_url: "https://github.com/a/b/issues/1", funders: { [BOB]: "10" } }]);
     return reply(404, { error: `fake node: no route for ${path}` });
@@ -544,6 +547,70 @@ for (const [env, label] of [[{ BLOCKULA_RPC: rpc }, "local dev node"], [{ BLOCKU
 mode.status = {};
 rmSync(join(home, "known-chains.json"), { force: true });
 console.log("✓ payments to a name sign the name (the chain resolves it); where an address is needed it's shown as unproven, and on mainnet waits for the address to be confirmed; use_account reads the account's own keys");
+
+// review-r3-clients-2: a tx's validity window counts from the height the node reports, so a node
+// reporting one the chain can't have reached could hold the signed tx and release it later (by
+// when a name signed in it may have lapsed and changed hands). The MCP bounds that height by the
+// chain's genesis clock: taken from the node's /api/genesis on first use, like the genesis hash,
+// and remembered with that hash, so a node that turns hostile later can't lift it.
+{
+  const AHEAD = { height: 10 + 31_536_000 };
+  const clockKey = `clock fake-chain ${G}`;
+  const known = () => (existsSync(join(home, "known-chains.json")) ? JSON.parse(readFileSync(join(home, "known-chains.json"), "utf8")) : {});
+  resetLedger();
+  mode.post = "accept";
+  mode.tx = "finalized";
+  mode.genesis = { chain_id: "fake-chain", created_at_ms: Date.now() - 86_400_000, block_time_ms: 1000, validators: [] };
+  s = await server({ BLOCKULA_NETWORK: "custom" });
+  r = await s.call("send", { to: BOB, amount: "1" });
+  assert.ok(!r.error && r.json().block === 11, `a height the chain can have reached is signed: ${r.text}`);
+  assert.deepEqual(known()[clockKey], { created_at_ms: mode.genesis.created_at_ms, block_time_ms: 1000 }, "the clock is remembered with the chain's genesis hash");
+  let before = posted.length;
+  mode.status = AHEAD;
+  for (const [tool, args] of [["send", { to: "bob.boo", amount: "1" }], ["stake", { validator: BOB, amount: "1" }], ["register_name", { name: "ghoul" }]] as const) {
+    r = await s.call(tool, args);
+    assert.ok(r.error && /reports height 31536010, but by this machine's clock and the chain's genesis the chain can't be past block \d+.*Nothing was signed/.test(r.text) && r.text.includes("known-chains.json"), `${tool}: ${r.text}`);
+  }
+  assert.equal(posted.length, before, "nothing signed against a height the chain can't have reached");
+  await s.close();
+  // Restarted, the node now serves a genesis that would lift the bound: the remembered clock holds.
+  mode.genesis = { chain_id: "fake-chain", created_at_ms: 0, block_time_ms: 1, validators: [] };
+  s = await server({ BLOCKULA_NETWORK: "custom" });
+  r = await s.call("send", { to: "bob.boo", amount: "1" });
+  assert.ok(r.error && /can't be past block/.test(r.text), r.text);
+  assert.equal(posted.length, before);
+  mode.status = {};
+  r = await s.call("send", { to: "bob.boo", amount: "1" });
+  assert.ok(!r.error && r.json().block === 11, r.text);
+  await s.close();
+  // A local dev chain (not remembered): the clock still holds for the session, and isn't written down.
+  rmSync(join(home, "known-chains.json"), { force: true });
+  mode.genesis = { chain_id: "fake-chain", created_at_ms: Date.now() - 86_400_000, block_time_ms: 1000, validators: [] };
+  s = await server();
+  assert.equal((await s.call("status")).json().network, "local dev node");
+  mode.status = AHEAD;
+  before = posted.length;
+  r = await s.call("send", { to: BOB, amount: "1" });
+  assert.ok(r.error && /can't be past block/.test(r.text), r.text);
+  assert.equal(posted.length, before);
+  assert.equal(known()[clockKey], undefined, "a local chain's clock isn't remembered");
+  await s.close();
+  // A node that serves no genesis (or another chain's) leaves the height its word, as before.
+  for (const g of [undefined, { chain_id: "other-chain", created_at_ms: Date.now(), block_time_ms: 1000 }]) {
+    mode.genesis = g;
+    rmSync(join(home, "known-chains.json"), { force: true });
+    s = await server({ BLOCKULA_NETWORK: "custom" });
+    r = await s.call("send", { to: BOB, amount: "1" });
+    assert.ok(!r.error, r.text);
+    assert.equal(known()[clockKey], undefined);
+    await s.close();
+  }
+  mode.status = {};
+  mode.genesis = undefined;
+  resetLedger();
+  rmSync(join(home, "known-chains.json"), { force: true });
+}
+console.log("✓ the height each tx is signed against is bounded by the chain's genesis clock (taken on first use and remembered with the genesis hash)");
 
 // gap-7-5: "unstake 10" used to be converted to shares here, at the node's value of the stake: a
 // node that reported a 1,000 FANG stake (100e9 shares) as worth 10 FANG and a drop got 99.99% of

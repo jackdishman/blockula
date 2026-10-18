@@ -10,7 +10,8 @@
 //   BLOCKULA_CHAIN_ID / BLOCKULA_GENESIS_HASH   pin the chain the node must be on
 //   BLOCKULA_WITNESSES  other nodes of the same chain (comma-separated URLs): .boo names that get
 //                       signed (send, stake, unstake, use_account) are proven against them, and the
-//                       height each tx is signed against must not be ahead of their heads. Without
+//                       height each tx is signed against must not be ahead of their heads (nor, in
+//                       any case, past what the chain's genesis clock allows). Without
 //                       them a send signs the name itself (the chain resolves it when it runs), and
 //                       where an address is needed (stake, unstake, use_account) a name is the
 //                       node's word: on mainnet (any node on blockula-1, however it was configured)
@@ -30,13 +31,13 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { ApiError, Client, MAINNET_CHAIN_ID, RequestTimeoutError, TxFailedError, TxPendingError, Wallet, bareName, checkTimeoutMs, describeKind, encodeKeyGrant, proposalDigest, formatFang, paramsOf, parseFang, proposalSummary, stakeSummary, txDropped, txId, type Action, type ProposalKind, type ProposalSummary, type Recipient, type Resolution } from "@blockula/sdk";
+import { ApiError, Client, HeightAheadError, MAINNET_CHAIN_ID, RequestTimeoutError, TxFailedError, TxPendingError, Wallet, bareName, checkTimeoutMs, describeKind, encodeKeyGrant, proposalDigest, formatFang, paramsOf, parseFang, proposalSummary, stakeSummary, txDropped, txId, type Action, type ProposalKind, type ProposalSummary, type Recipient, type Resolution } from "@blockula/sdk";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
-import { KNOWN_CLOCKS, KNOWN_GENESIS, KnownChains, completePin, effectivePin, mismatch, mismatchError, resolveNetwork, type Network } from "./network.js";
+import { KNOWN_CLOCKS, KNOWN_GENESIS, KnownChains, clockFrom, completePin, effectivePin, mismatch, mismatchError, resolveNetwork, type GenesisClock, type Network } from "./network.js";
 import { REPO, RELEASE_KEY_ID, checkBinaryVersion, fetchVerifiedRelease, latestTagFrom, releaseKeyIdFrom } from "./release.js";
 import { SignedTxs } from "./signed.js";
 import { SpendLedger } from "./spend.js";
@@ -108,11 +109,30 @@ async function chain(): Promise<Client> {
   KNOWN_CHAINS.save(net, full);
   const pins = { chainId: full.chainId, genesisHash: full.genesisHash, prefix: full.prefix, timeoutMs: TIMEOUT_MS };
   // Witnesses are held to the same chain; with them, names are proven (Client.resolution) and a
-  // height ahead of their heads is refused. A known chain's genesis clock bounds the height too.
-  const known = full.chainId !== undefined && full.genesisHash !== undefined && KNOWN_GENESIS[full.chainId] === full.genesisHash;
-  const genesisClock = known ? KNOWN_CLOCKS[full.chainId!] : undefined;
+  // height ahead of their heads is refused. The chain's genesis clock bounds the height too.
+  const genesisClock = await clockOf(net, full);
   pinned = new Client(net.rpc, { ...pins, genesisClock, witnesses: net.witnesses.map((w) => new Client(w, pins)) });
   return pinned;
+}
+
+/**
+ * The pinned chain's genesis clock, which bounds the height each tx is signed against
+ * (`Client.checkSigningHeight`: a node reporting a height the chain can't have reached by this
+ * machine's clock gets nothing signed, since it could hold the tx and release it later; audit
+ * review-r3-clients-2). Built in with a known genesis; else the one remembered for this chain id
+ * and genesis hash; else the node's `/api/genesis`, taken on first use like the genesis hash and
+ * remembered with it (but for local dev chains, for this session only). A node that serves none
+ * leaves the height its word, as without the clock.
+ */
+async function clockOf(net: Network, full: { chainId?: string; genesisHash?: string }): Promise<GenesisClock | undefined> {
+  const { chainId, genesisHash } = full;
+  if (chainId === undefined || genesisHash === undefined) return undefined;
+  if (KNOWN_GENESIS[chainId] === genesisHash && KNOWN_CLOCKS[chainId]) return KNOWN_CLOCKS[chainId];
+  const remembered = KNOWN_CHAINS.clock(net, chainId, genesisHash);
+  if (remembered) return remembered;
+  const clock = clockFrom(await new Client(net.rpc, { timeoutMs: TIMEOUT_MS }).genesis().catch(() => undefined), chainId);
+  if (clock) KNOWN_CHAINS.saveClock(net, chainId, genesisHash, clock);
+  return clock;
 }
 
 async function reachable(url: string) {
@@ -347,7 +367,13 @@ function tool<S extends z.ZodRawShape>(name: string, description: string, shape:
     } catch (e) {
       // Node errors are relayed, so they're cleaned like any chain text.
       const msg = clean(String((e as Error)?.message ?? e), 1000);
-      const hint = /fetch failed|ECONNREFUSED/.test(msg) ? ` (no node at ${RPC}${NET?.key === "local" ? " — call start_dev_node" : ""})` : e instanceof RequestTimeoutError ? ` (the node at ${RPC} isn't answering)` : "";
+      const hint = /fetch failed|ECONNREFUSED/.test(msg)
+        ? ` (no node at ${RPC}${NET?.key === "local" ? " — call start_dev_node" : ""})`
+        : e instanceof RequestTimeoutError
+          ? ` (the node at ${RPC} isn't answering)`
+          : e instanceof HeightAheadError
+            ? ` (the chain's genesis clock is built in, or remembered in ${KNOWN_CHAINS.file} from the first /api/genesis read for this chain)`
+            : "";
       return { ...text(`Error: ${msg}${hint}`), isError: true };
     }
   }) as never);

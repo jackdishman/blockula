@@ -1461,6 +1461,8 @@ export class Client {
   fees(): Promise<{ height: number; lag: number; slots: ({ height: number; max_block_bytes: number } & BaseFee)[]; suggested: BaseFee; lowest?: BaseFee; tip_cap_multiple?: number; account_creation_fee: string; [k: string]: unknown }> { return this.call("/fees"); }
   /** The governance parameters (node/src/params.rs `ChainParams`; amounts as strings) under `params`, genesis constants under `genesis`, and the issuance year. `paramsOf` flattens it. */
   params() { return this.call("/params"); }
+  /** The chain's genesis.json as this node serves it: the node's word (nothing here checks it against the genesis hash). */
+  genesis() { return this.call("/genesis"); }
   /** Upgrades: the protocol version in force, what the node's binary supports, the `schedule` (`[{ version, activation_height, active }]`, what `proposal.cancelUpgrade` names), halts and each validator's readiness signal. */
   upgrade() { return this.call("/upgrade"); }
   /** Accounts a key is authorized on (its own address, plus any it was added to). */
