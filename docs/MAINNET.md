@@ -2,6 +2,10 @@
 
 As of 2026-10-14, v0.4.0 (commit `b1f9614`; line numbers refer to it). This is the gap between today's public testnet and a mainnet that holds real value. Every claim cites code or a doc section so it can be re-checked. Items marked ✅ were fixed after this assessment was written.
 
+For the current v1 testnet rollout and the evidence required before choosing a mainnet launch
+date, see [LAUNCH-PLAN.md](LAUNCH-PLAN.md). The assessment and estimates below retain their
+original baseline; a scripted relaunch is not evidence that the public deployment has happened.
+
 - **Paths:** Rust files are in `node/src/` and cited by file name (`chain.rs:1489`). Everything else is relative to the repo root. Doc sections are cited by heading (PLAN.md "Known limits").
 - **Effort:** S ≤ 1 engineer-week · M 2–4 engineer-weeks · L 1–3 engineer-months · XL > 3 engineer-months.
 - **Who:** Team (we do it in code) · Auditor · Counsel · Operators (independent validator operators) · Upstream (Commonware).
@@ -730,7 +734,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
 - STARK signature aggregation (PLAN.md "Roadmap", Phase 4).
 - Light-client mode, once CV-1 provides proofs.
 - Background history backfill behind fast-synced nodes, and STARK history proofs (PLAN.md "Network and sync", "Next").
-- WASM/RISC-V contracts.
+- Third-party programs (the protocol-v2 design is a proposal; see [LAUNCH-PLAN.md](LAUNCH-PLAN.md#third-party-programs)).
 - The Crypt. Ghost Mode is built and ships disabled (DEC-2): turning it on after launch takes its audit, testnet time and counsel (GHOST-MODE.md section 9), not code.
 - Ghost Mode's clients: the CLI, a WASM prover for the SDK and wallets, MCP tools and the explorer view (GHOST-MODE.md section 8, "Not built yet").
 - Covens, Seasons, the juror UI, acceptance-test Hunts, fork royalties, conviction-voting refinements and private ballots. This assumes the pool is off or governed at genesis.

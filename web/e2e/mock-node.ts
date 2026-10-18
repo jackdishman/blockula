@@ -136,6 +136,7 @@ export class MockNode {
   /** A node of one of the e2e chains, optionally at another URL (a "custom node"). */
   constructor(chain: keyof typeof CHAINS = "testnet", rpc?: string) {
     ({ rpc: this.rpc, chainId: this.chainId, genesisHash: this.genesisHash } = CHAINS[chain]);
+    this.genesis = { chain_id: this.chainId, created_at_ms: this.genesisMs, block_time_ms: 1000, validators: [] };
     if (rpc) this.rpc = rpc;
   }
 

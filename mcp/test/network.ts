@@ -214,9 +214,9 @@ rmSync(pinDir, { recursive: true, force: true });
 assert.notEqual(binPaths("/h").mcp, binPaths("/h").cli);
 assert.equal(binPaths("/h").cli, join("/h", "bin", "blockula"));
 // The built-in key id is the same in all three copies (release_cli.rs checks it too).
-const builtIn = (file: string, re: RegExp) => re.exec(readFileSync(new URL(file, import.meta.url), "utf8"))?.[1];
-assert.equal(builtIn("../../node/src/release_cli.rs", /^pub const BUILTIN_KEY_ID: &str = "([0-9a-f]*)";$/m), RELEASE_KEY_ID, "release_cli.rs BUILTIN_KEY_ID");
-assert.equal(builtIn("../../scripts/install.sh", /^BUILTIN_KEY_ID="([0-9a-f]*)"$/m), RELEASE_KEY_ID, "install.sh BUILTIN_KEY_ID");
+const releaseKeyIn = (file: string, re: RegExp) => re.exec(readFileSync(new URL(file, import.meta.url), "utf8"))?.[1];
+assert.equal(releaseKeyIn("../../node/src/release_cli.rs", /^pub const BUILTIN_KEY_ID: &str = "([0-9a-f]*)";$/m), RELEASE_KEY_ID, "release_cli.rs BUILTIN_KEY_ID");
+assert.equal(releaseKeyIn("../../scripts/install.sh", /^BUILTIN_KEY_ID="([0-9a-f]*)"$/m), RELEASE_KEY_ID, "install.sh BUILTIN_KEY_ID");
 console.log(`✓ install_node: version binding, checksum, provenance and signature checks (${releaseRefusals.length} bad releases refused), the pinned key, its own install path`);
 
 // ---- 4. the server, over stdio, against a fake node ----

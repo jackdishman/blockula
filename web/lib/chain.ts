@@ -1,5 +1,5 @@
 import { Client, HeightAheadError, heightLimit } from "@blockula/sdk";
-import { KNOWN_GENESIS, NETWORK, type Network } from "./config";
+import { KNOWN_GENESIS, NETWORK, type GenesisClock, type Network } from "./config";
 import type { Status } from "./types";
 
 /** What the node must report: the network's pins, then whatever it reported first (unpinned nodes). */
@@ -64,11 +64,7 @@ export function saveCustomPin(rpc: string, pin: ChainPin | null) {
   }
 }
 
-/** A chain's genesis clock: its genesis.json's `created_at_ms` and `block_time_ms`. */
-export interface GenesisClock {
-  createdAtMs: number;
-  blockTimeMs: number;
-}
+export type { GenesisClock };
 
 /** The genesis clock in a node's `/api/genesis` answer for `chainId`, if it is one. */
 export function clockOf(genesis: unknown, chainId: string): GenesisClock | undefined {
@@ -112,9 +108,9 @@ export function initialPin(net: Network): ChainPin {
  * switch chains mid-session either.
  */
 export class PinnedClient extends Client {
-  constructor(rpc: string, public pin: ChainPin, private onFirstPin?: (pin: ChainPin) => void, witnesses: string[] = []) {
+  constructor(rpc: string, public pin: ChainPin, private onFirstPin?: (pin: ChainPin) => void, witnesses: string[] = [], genesisClock?: GenesisClock) {
     // Witnesses only for networks whose chain is pinned by configuration: they're held to it too.
-    super(rpc, { witnesses: pin.chainId ? witnesses.map((w) => new Client(w, { chainId: pin.chainId, genesisHash: pin.genesisHash, prefix: pin.prefix })) : [] });
+    super(rpc, { genesisClock, witnesses: pin.chainId ? witnesses.map((w) => new Client(w, { chainId: pin.chainId, genesisHash: pin.genesisHash, prefix: pin.prefix })) : [] });
     // `Wallet.address` renders with the client's prefix: use the pinned one before the first
     // status arrives (which still checks it, through `status()` below).
     if (pin.prefix) this.prefix = pin.prefix;
@@ -128,6 +124,8 @@ export class PinnedClient extends Client {
    * a custom node's pin). `undefined` when the node serves none.
    */
   private chainClock(): Promise<GenesisClock | undefined> {
+    // A release pin is authoritative even on first use and if browser storage was poisoned.
+    if (this.genesisClock) return Promise.resolve(this.genesisClock);
     const { chainId, genesisHash } = this.pin;
     if (!chainId || !genesisHash) return Promise.resolve(undefined);
     const saved = typeof window === "undefined" ? undefined : savedClock(chainId, genesisHash);
@@ -180,5 +178,6 @@ export function networkClient() {
       if (NETWORK.key === "custom") saveCustomPin(NETWORK.rpc, pin);
     },
     NETWORK.witnesses ?? [],
+    NETWORK.genesisClock,
   );
 }

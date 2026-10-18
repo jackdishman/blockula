@@ -29,6 +29,20 @@ export const TESTNET_RPC = "https://blockula-testnet.fly.dev";
  */
 export const TESTNET_GENESIS_HASH: string | undefined = undefined;
 
+/** A chain's genesis clock: its genesis.json's `created_at_ms` and `block_time_ms`. */
+export interface GenesisClock {
+  createdAtMs: number;
+  blockTimeMs: number;
+}
+
+/**
+ * The testnet's genesis clock, pinned with TESTNET_GENESIS_HASH (scripts/pin-network.sh), for that
+ * genesis only. With it the wallet refuses a node reporting a height the chain can't have reached
+ * from the first payment on, instead of taking the clock from the node on first use
+ * (lib/chain.ts, audit review-r3-clients-2).
+ */
+export const TESTNET_GENESIS_CLOCK: GenesisClock | undefined = undefined;
+
 /** A mainnet deployment (`NEXT_PUBLIC_NETWORK=mainnet`): stricter rules, see next.config.ts. */
 export const IS_MAINNET_BUILD = process.env.NEXT_PUBLIC_NETWORK === "mainnet";
 
@@ -40,6 +54,8 @@ export interface Network {
   chainId?: string;
   /** The genesis hash the node must report, when known. */
   genesisHash?: string;
+  /** That genesis's clock, when built in: it bounds the height a tx is signed against (lib/chain.ts). */
+  genesisClock?: GenesisClock;
   /** The bech32m address prefix ("boo1…"), when known. */
   prefix?: string;
   /** Real money: no browser-only keys, no faucet copy, a plain badge. */
@@ -76,6 +92,8 @@ const mainnet: Network | undefined = mainnetRpc
   ? { key: "mainnet", label: "Mainnet", rpc: mainnetRpc, chainId: MAINNET_CHAIN_ID, genesisHash: MAINNET_GENESIS_HASH, prefix: MAINNET_PREFIX, mainnet: true, witnesses: witnessList(process.env.NEXT_PUBLIC_MAINNET_WITNESSES, mainnetRpc) }
   : undefined;
 
+const testnetGenesis = clean(process.env.NEXT_PUBLIC_TESTNET_GENESIS_HASH)?.toLowerCase() || TESTNET_GENESIS_HASH;
+
 // A mainnet deployment lists the testnet only when it's configured explicitly.
 const testnet: Network | undefined =
   !IS_MAINNET_BUILD || testnetRpc
@@ -84,7 +102,9 @@ const testnet: Network | undefined =
         label: "Testnet",
         rpc: testnetRpc || TESTNET_RPC,
         chainId: clean(process.env.NEXT_PUBLIC_TESTNET_CHAIN_ID) || TESTNET_CHAIN_ID,
-        genesisHash: clean(process.env.NEXT_PUBLIC_TESTNET_GENESIS_HASH)?.toLowerCase() || TESTNET_GENESIS_HASH,
+        genesisHash: testnetGenesis,
+        // The built-in clock is that of the built-in genesis: never another one's.
+        genesisClock: testnetGenesis && testnetGenesis === TESTNET_GENESIS_HASH ? TESTNET_GENESIS_CLOCK : undefined,
         prefix: clean(process.env.NEXT_PUBLIC_TESTNET_PREFIX) || TESTNET_PREFIX,
         witnesses: witnessList(process.env.NEXT_PUBLIC_TESTNET_WITNESSES, testnetRpc || TESTNET_RPC),
       }

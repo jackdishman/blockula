@@ -28,6 +28,11 @@ else
 fi
 CHAIN=$(node -p "JSON.parse(require('fs').readFileSync('$G', 'utf8')).chain_id")
 HASH=$("$BIN" checkpoint --genesis "$G")
+CLOCK=$(G="$G" node -p 'const g = JSON.parse(require("fs").readFileSync(process.env.G, "utf8")); `${g.created_at_ms}:${g.block_time_ms}`')
+CREATED=${CLOCK%:*}
+BLOCK_TIME=${CLOCK#*:}
+TIME1=$((CREATED + BLOCK_TIME))
+TIME2=$((CREATED + 2 * BLOCK_TIME))
 
 # A checkout with just what the script edits.
 fresh() {
@@ -44,19 +49,21 @@ snapshot() { (cd "$T/repo" && find . -type f | sort | xargs shasum) ; }
 
 fresh
 SET=$(printf 'cd%.0s' $(seq 32))
-CP1="3599:$(printf 'ab%.0s' $(seq 32)):$SET"
+CP1="1:$(printf 'ab%.0s' $(seq 32)):$SET:$TIME1"
 if pin "$CHAIN" "$HASH" --genesis "$G" --checkpoint "$CP1"; then ok "pins $CHAIN ($HASH)"; else bad "pin failed: $(cat "$T/out")"; fi
 f=$T/repo/node/checkpoints/$CHAIN.json
 node -e "
 const k = JSON.parse(require('fs').readFileSync('$f', 'utf8'));
-const want = { chain_id: '$CHAIN', genesis_hash: '$HASH', checkpoints: [{ height: 3599, hash: 'ab'.repeat(32), set_hash: 'cd'.repeat(32) }] };
+const want = { chain_id: '$CHAIN', genesis_hash: '$HASH', checkpoints: [{ height: 1, hash: 'ab'.repeat(32), set_hash: 'cd'.repeat(32), timestamp_ms: $TIME1 }] };
 for (const key of Object.keys(k)) if (!['chain_id', 'genesis_hash', 'checkpoints', 'note', 'weak_subjectivity_blocks'].includes(key)) throw new Error('unknown field ' + key);
 if (JSON.stringify({ chain_id: k.chain_id, genesis_hash: k.genesis_hash, checkpoints: k.checkpoints }) !== JSON.stringify(want)) throw new Error(JSON.stringify(k));
 if (!k.note) throw new Error('no note');
 " && ok "node/checkpoints/$CHAIN.json: the hash and the checkpoint, in the node's schema" || bad "trust file: $(cat "$f")"
 grep -qF "include_str!(\"../checkpoints/$CHAIN.json\")" "$T/repo/node/src/checkpoints.rs" && grep -qF 'include_str!("../checkpoints/blockula-1.json")' "$T/repo/node/src/checkpoints.rs" && ok "EMBEDDED gains the file, keeps mainnet's" || bad "EMBEDDED: $(grep EMBEDDED "$T/repo/node/src/checkpoints.rs")"
 grep -qF "export const KNOWN_GENESIS: Record<string, string> = { \"$CHAIN\": \"$HASH\" };" "$T/repo/mcp/src/network.ts" && ok "the MCP's KNOWN_GENESIS" || bad "KNOWN_GENESIS: $(grep KNOWN_GENESIS "$T/repo/mcp/src/network.ts")"
+grep -qF "\"$CHAIN\": { createdAtMs: $CREATED, blockTimeMs: $BLOCK_TIME }" "$T/repo/mcp/src/network.ts" && ok "the MCP's pinned genesis clock" || bad "MCP clock missing"
 grep -qF "export const TESTNET_GENESIS_HASH: string | undefined = \"$HASH\";" "$T/repo/web/lib/config.ts" && ok "the wallet's TESTNET_GENESIS_HASH" || bad "wallet: $(grep TESTNET_GENESIS_HASH "$T/repo/web/lib/config.ts")"
+grep -qF "export const TESTNET_GENESIS_CLOCK: GenesisClock | undefined = { createdAtMs: $CREATED, blockTimeMs: $BLOCK_TIME };" "$T/repo/web/lib/config.ts" && ok "the wallet's pinned genesis clock" || bad "wallet clock missing"
 cmp -s "$G" "$T/repo/genesis/$CHAIN/genesis.json" && ok "genesis/$CHAIN/genesis.json is the genesis (release.yml ships it as genesis-$CHAIN.json)" || bad "genesis not copied"
 src=$(dirname "$G")
 if [ -f "$src/spec.toml" ]; then
@@ -69,9 +76,9 @@ grep -rqE '"seed"|validator\.key' "$T/repo/genesis" && bad "a secret in genesis/
 after=$(snapshot)
 pin "$CHAIN" "$HASH" --genesis "$G" --checkpoint "$CP1" || bad "rerun failed: $(cat "$T/out")"
 [ "$(snapshot)" = "$after" ] && grep -q "unchanged" "$T/out" && ok "a rerun changes nothing" || bad "a rerun changed files"
-CP2="7199:$(printf 'ef%.0s' $(seq 32)):$SET"
+CP2="2:$(printf 'ef%.0s' $(seq 32)):$SET:$TIME2"
 pin "$CHAIN" "$HASH" --checkpoint "$CP2" || bad "a second checkpoint failed: $(cat "$T/out")"
-[ "$(node -p "JSON.parse(require('fs').readFileSync('$f', 'utf8')).checkpoints.map(c => c.height).join(',')")" = "3599,7199" ] && ok "checkpoints accumulate, oldest first" || bad "checkpoints: $(cat "$f")"
+[ "$(node -p "JSON.parse(require('fs').readFileSync('$f', 'utf8')).checkpoints.map(c => c.height).join(',')")" = "1,2" ] && ok "checkpoints accumulate, oldest first" || bad "checkpoints: $(cat "$f")"
 [ "$(grep -o "checkpoints/$CHAIN.json" "$T/repo/node/src/checkpoints.rs" | wc -l | tr -d ' ')" = 1 ] && ok "EMBEDDED lists the file once" || bad "EMBEDDED repeated"
 
 # Refusals leave everything as it was.
@@ -81,18 +88,26 @@ refused() { # what why args…
   if pin "$@"; then bad "$what: accepted"; elif ! grep -qF -- "$why" "$T/out"; then bad "$what: $(cat "$T/out")"; elif [ "$(snapshot)" != "$after" ]; then bad "$what: changed files"; else ok "refuses $what"; fi
 }
 OTHER=$(printf '12%.0s' $(seq 32))
-refused "another genesis for a pinned chain id" "a chain id's genesis never changes" "$CHAIN" "$OTHER"
+refused "another genesis for a pinned chain id" "hashes to $HASH, not $OTHER" "$CHAIN" "$OTHER"
 refused "a genesis file that doesn't hash to the pin" "hashes to $HASH, not $OTHER" "$CHAIN" "$OTHER" --genesis "$G"
 refused "mainnet (the ceremony pins it)" "genesis ceremony" blockula-1 "$HASH"
 refused "a malformed hash" "64 hex digits" "$CHAIN" abc
 refused "a checkpoint without its set hash" "HEIGHT:HASH:SET_HASH" "$CHAIN" "$HASH" --checkpoint "5:$HASH"
-refused "a conflicting checkpoint" "conflicts" "$CHAIN" "$HASH" --checkpoint "3599:$OTHER:$SET"
+refused "an untimed embedded checkpoint" "HEIGHT:HASH:SET_HASH:TIMESTAMP_MS" "$CHAIN" "$HASH" --checkpoint "1:$HASH:$SET"
+refused "a conflicting checkpoint" "conflicts" "$CHAIN" "$HASH" --checkpoint "1:$OTHER:$SET:$TIME1"
+refused "a checkpoint whose time changed" "conflicts" "$CHAIN" "$HASH" --checkpoint "1:$(printf 'ab%.0s' $(seq 32)):$SET:$TIME2"
+refused "a checkpoint before its earliest possible time" "earlier than" "$CHAIN" "$HASH" --checkpoint "3:$HASH:$SET:$TIME2"
+FUTURE=$(node -p 'Date.now() + 7200000')
+refused "a checkpoint from the future" "in the future" "$CHAIN" "$HASH" --checkpoint "3:$HASH:$SET:$FUTURE"
 
 # A chain that isn't the wallet's testnet leaves the wallet alone.
 fresh
 sed -i.bak "s/export const TESTNET_CHAIN_ID = \"[^\"]*\";/export const TESTNET_CHAIN_ID = \"someone-else\";/" "$T/repo/web/lib/config.ts" && rm "$T/repo/web/lib/config.ts.bak"
-pin "$CHAIN" "$HASH" || bad "pin failed: $(cat "$T/out")"
+after=$(snapshot)
+refused "a new chain without its genesis clock" "needs its genesis clock" "$CHAIN" "$HASH"
+pin "$CHAIN" "$HASH" --genesis "$G" || bad "pin failed: $(cat "$T/out")"
 grep -qF 'export const TESTNET_GENESIS_HASH: string | undefined = undefined;' "$T/repo/web/lib/config.ts" && ok "another chain doesn't touch the wallet's testnet" || bad "the wallet was pinned to another chain"
+grep -qF 'export const TESTNET_GENESIS_CLOCK: GenesisClock | undefined = undefined;' "$T/repo/web/lib/config.ts" && ok "another chain doesn't touch the wallet's clock" || bad "the wallet's clock was pinned to another chain"
 
 if [ $fails -gt 0 ]; then echo "✗ $fails failed" >&2; exit 1; fi
 echo "✓ pin-network.sh behaves"
