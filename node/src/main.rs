@@ -370,7 +370,12 @@ fn main() -> Result<()> {
         }
         Cmd::Checkpoint { peers, height, genesis, json, genesis_hash } => {
             if let Some(path) = genesis {
-                println!("{}", checkpoints::genesis_hash(&chain::Genesis::load(&path)?));
+                let g = chain::Genesis::load(&path)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&checkpoints::genesis_checkpoint(&g))?);
+                } else {
+                    println!("{}", checkpoints::genesis_hash(&g));
+                }
                 return Ok(());
             }
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;

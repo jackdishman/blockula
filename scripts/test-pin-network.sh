@@ -33,6 +33,8 @@ CREATED=${CLOCK%:*}
 BLOCK_TIME=${CLOCK#*:}
 TIME1=$((CREATED + BLOCK_TIME))
 TIME2=$((CREATED + 2 * BLOCK_TIME))
+ZERO=$("$BIN" checkpoint --genesis "$G" --json)
+ZERO_SET=$(ZERO="$ZERO" node -p 'JSON.parse(process.env.ZERO).set_hash')
 
 # A checkout with just what the script edits.
 fresh() {
@@ -99,6 +101,15 @@ refused "a checkpoint whose time changed" "conflicts" "$CHAIN" "$HASH" --checkpo
 refused "a checkpoint before its earliest possible time" "earlier than" "$CHAIN" "$HASH" --checkpoint "3:$HASH:$SET:$TIME2"
 FUTURE=$(node -p 'Date.now() + 7200000')
 refused "a checkpoint from the future" "in the future" "$CHAIN" "$HASH" --checkpoint "3:$HASH:$SET:$FUTURE"
+refused "a height-zero checkpoint with another hash" "checkpoint #0 must be the genesis hash" "$CHAIN" "$HASH" --checkpoint "0:$OTHER:$ZERO_SET:$CREATED"
+refused "a height-zero checkpoint with another set" "checkpoint #0 must pin the genesis set" "$CHAIN" "$HASH" --checkpoint "0:$HASH:$SET:$CREATED"
+refused "a height-zero checkpoint with another time" "checkpoint #0 must record created_at_ms" "$CHAIN" "$HASH" --checkpoint "0:$HASH:$ZERO_SET:$((CREATED + 1))"
+pin "$CHAIN" "$HASH" --checkpoint "0:$HASH:$ZERO_SET:$CREATED" && ok "accepts the genuine genesis checkpoint" || bad "the genuine genesis checkpoint: $(cat "$T/out")"
+# A remembered clock alone cannot authenticate the genesis validator set.
+mv "$T/repo/genesis/$CHAIN/genesis.json" "$T/saved-genesis.json"
+after=$(snapshot)
+refused "a height-zero checkpoint without its genesis" "needs its genesis to check the validator set" "$CHAIN" "$HASH" --checkpoint "0:$HASH:$ZERO_SET:$CREATED"
+mv "$T/saved-genesis.json" "$T/repo/genesis/$CHAIN/genesis.json"
 
 # A chain that isn't the wallet's testnet leaves the wallet alone.
 fresh

@@ -700,6 +700,9 @@ mod tests {
             assert_eq!(g.chain_id, chain, "{} is another chain's genesis", path.display());
             let known = embedded().iter().find(|k| k.chain_id == chain).unwrap_or_else(|| panic!("genesis/{chain}/ ships, but node/checkpoints/{chain}.json isn't embedded (scripts/pin-network.sh)"));
             assert_eq!(genesis_hash(&g), known.genesis_hash, "genesis/{chain}/genesis.json isn't the genesis this binary pins");
+            // Parsing each field isn't enough: the table must also obey this genesis's height-0
+            // hashes/time and inter-checkpoint spacing, or the released node refuses to start.
+            Trust::new(&g, &Pins::default(), false).unwrap_or_else(|err| panic!("genesis/{chain}/ cannot start with its embedded checkpoints: {err:#}"));
             if e.path().join("spec.toml").exists() {
                 let built = crate::genesis_builder::build(&e.path().join("spec.toml"), false).unwrap();
                 assert_eq!(built.json, std::fs::read_to_string(&path).unwrap(), "genesis/{chain}/spec.toml doesn't rebuild genesis.json");

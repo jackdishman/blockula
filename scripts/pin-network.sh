@@ -44,6 +44,7 @@ done
 # The genesis the clock comes from: the one given, else the one an earlier pin committed.
 SHIPPED=$ROOT/genesis/$CHAIN/genesis.json
 CLOCK_FROM=${GENESIS:-}
+GENESIS_CHECKPOINT=""
 [ -n "$CLOCK_FROM" ] || [ ! -f "$SHIPPED" ] || CLOCK_FROM=$SHIPPED
 if [ -n "$CLOCK_FROM" ]; then
   [ -f "$CLOCK_FROM" ] || die "$CLOCK_FROM: no such file"
@@ -51,25 +52,28 @@ if [ -n "$CLOCK_FROM" ]; then
   got=$("$BIN" checkpoint --genesis "$CLOCK_FROM")
   [ "$got" = "$HASH" ] || die "$CLOCK_FROM hashes to $got, not $HASH"
   [ "$(G="$CLOCK_FROM" node -p 'JSON.parse(require("fs").readFileSync(process.env.G, "utf8")).chain_id')" = "$CHAIN" ] || die "$CLOCK_FROM is another chain's genesis"
+  GENESIS_CHECKPOINT=$("$BIN" checkpoint --genesis "$CLOCK_FROM" --json)
 fi
 
 # Plan every file first (refusing on any conflict), then write them all.
-CHAIN="$CHAIN" HASH="$HASH" ROOT="$ROOT" GENESIS="$GENESIS" CLOCK_FROM="$CLOCK_FROM" CPS="${CHECKPOINTS[*]+"${CHECKPOINTS[*]}"}" node --input-type=module <<'JS'
+CHAIN="$CHAIN" HASH="$HASH" ROOT="$ROOT" GENESIS="$GENESIS" CLOCK_FROM="$CLOCK_FROM" GENESIS_CHECKPOINT="$GENESIS_CHECKPOINT" CPS="${CHECKPOINTS[*]+"${CHECKPOINTS[*]}"}" node --input-type=module <<'JS'
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-const { CHAIN, HASH, ROOT, GENESIS, CLOCK_FROM, CPS } = process.env;
+const { CHAIN, HASH, ROOT, GENESIS, CLOCK_FROM, GENESIS_CHECKPOINT, CPS } = process.env;
 const fail = (m) => { console.error(`❌ ${m}`); process.exit(1); };
 const writes = new Map(); // path -> new content
 const plan = (path, f) => { const before = writes.get(path) ?? readFileSync(path, "utf8"); const after = f(before); if (after !== before) writes.set(path, after); return after !== before; };
 const log = [];
 
 // The chain's genesis clock (created_at_ms, block_time_ms), from its genesis file.
-let clock;
+let clock, genesisCheckpoint;
 if (CLOCK_FROM) {
   const g = JSON.parse(readFileSync(CLOCK_FROM, "utf8"));
   const ok = (n, least) => Number.isSafeInteger(n) && n >= least;
   if (!ok(g.created_at_ms, 0) || !ok(g.block_time_ms, 1)) fail(`${CLOCK_FROM} has no created_at_ms / block_time_ms`);
   clock = { createdAtMs: g.created_at_ms, blockTimeMs: g.block_time_ms };
+  genesisCheckpoint = JSON.parse(GENESIS_CHECKPOINT);
+  if (genesisCheckpoint.height !== 0 || genesisCheckpoint.hash !== HASH || !/^[0-9a-f]{64}$/.test(genesisCheckpoint.set_hash) || genesisCheckpoint.timestamp_ms !== clock.createdAtMs) fail(`${CLOCK_FROM}: blockula returned an invalid genesis checkpoint (use a current binary)`);
 }
 
 // node/checkpoints/<chain>.json: the genesis hash never changes; checkpoints accumulate.
@@ -89,6 +93,14 @@ for (const flag of (CPS ?? "").split(" ").filter(Boolean)) {
   else known.checkpoints.push(c);
 }
 known.checkpoints.sort((a, b) => a.height - b.height);
+// Height zero is the genesis, not an arbitrary trusted block. Derive its set hash with the
+// node's native implementation so these rules stay in step with checkpoints::Trust::new.
+for (const c of known.checkpoints.filter((c) => c.height === 0)) {
+  if (c.hash !== HASH) fail("checkpoint #0 must be the genesis hash");
+  if (!genesisCheckpoint) fail("checkpoint #0 needs its genesis to check the validator set: pass --genesis <genesis.json>");
+  if (c.set_hash !== genesisCheckpoint.set_hash) fail("checkpoint #0 must pin the genesis set");
+  if (c.timestamp_ms !== undefined && c.timestamp_ms !== clock.createdAtMs) fail("checkpoint #0 must record created_at_ms");
+}
 // The node refuses times the chain can't have (checkpoints::Trust::check_times): blocks are at
 // least a block time apart, from the genesis' created_at_ms on, and none is from the future.
 if (clock) {
