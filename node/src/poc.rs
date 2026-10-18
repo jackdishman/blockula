@@ -1541,8 +1541,14 @@ impl State {
             live.iter().filter_map(|c| pooled.get(self.poc.claims[c].claimant.as_str()).map(|(w, n)| (*c, w * PPM / (2 * n)))).collect()
         };
         let rate_of = |c: &u64| claim_rate.get(c).copied().unwrap_or(0);
+        // What a claim is paid and credited at: its claimant's pooled rate, capped at its own
+        // score. The cap keeps the pooled rate a ceiling, never a lift: a weak claim can't borrow
+        // the quality of the person's other claims, which may be in a lighter repo, and be paid
+        // at its own repo's weight (audit review-r4-poc-2). The best claims still get no more
+        // than the pooled rate, so nothing is selected.
+        let paid_rate = |c: &u64| rate_of(c).min(score.get(c).copied().unwrap_or(0));
         // Each claim's rank among its claimant's accepted claims, best score first (ties by id):
-        // its Soul is the pooled rate's, counting `>> CLAIM_RANK_SHIFT` per rank.
+        // its Soul is its `paid_rate`'s, counting `>> CLAIM_RANK_SHIFT` per rank.
         let soul_rank: BTreeMap<u64, usize> = {
             let mut by_person: BTreeMap<&str, Vec<(u64, u64)>> = BTreeMap::new();
             for c in &live {
@@ -1591,7 +1597,7 @@ impl State {
             } else {
                 self.settle_bond(&mut j, *c, true);
                 self.set_status(&mut j, *c, ClaimStatus::Scored, height, None);
-                soul_changes.push((claimant, (ranked(CLAIM_SOUL as u128 * rate_of(c) as u128, soul_rank[c]) / PPM as u128) as i64, Some(*c)));
+                soul_changes.push((claimant, (ranked(CLAIM_SOUL as u128 * paid_rate(c) as u128, soul_rank[c]) / PPM as u128) as i64, Some(*c)));
                 accepted.push(*c);
                 results.accepted += 1;
             }
@@ -1642,19 +1648,19 @@ impl State {
             soul_changes.push((juror.clone(), delta, None));
             seat_updates.push((juror.clone(), Some(agreement), delta));
         }
-        // Rewards: jurors by agreement; claims by the claimant's pooled rate × repo weight, per
-        // person the claim in the heaviest repo in full and each further one a quarter of the one
-        // ranked above it (`ranked`: together under 4/3 of one claim at the person's rate, so
-        // volume adds at most a third: audit xcut-economic-opus-1), boosted up to 1.5× by the
-        // person's Soul. A person is the claimant account (audit xcut-economic-opus-3): a
-        // sponsor's Familiars claim as the sponsor, and every handle an account linked counts
-        // together (each handle credits one account, `Poc::handles`).
+        // Rewards: jurors by agreement; claims by `paid_rate` (the claimant's pooled rate, at most
+        // the claim's own score) × repo weight, per person the heaviest in full and each further
+        // one a quarter of the one ranked above it (`ranked`: together under 4/3 of one claim at
+        // the person's rate, so volume adds at most a third: audit xcut-economic-opus-1),
+        // boosted up to 1.5× by the person's Soul. A person is the claimant account (audit
+        // xcut-economic-opus-3): a sponsor's Familiars claim as the sponsor, and every handle an
+        // account linked counts together (each handle credits one account, `Poc::handles`).
         let juror_budget = if juror_weights.is_empty() { 0 } else { bps(s.budget, JUROR_SHARE_BPS) };
         let claims_budget = if accepted.is_empty() { 0 } else { s.budget - juror_budget };
         let mut raw: BTreeMap<String, Vec<(u64, u128)>> = BTreeMap::new();
         for c in &accepted {
             let cl = &self.poc.claims[c];
-            let w = self.poc.repos.get(&cl.repo).copied().unwrap_or(0) as u128 * rate_of(c) as u128;
+            let w = self.poc.repos.get(&cl.repo).copied().unwrap_or(0) as u128 * paid_rate(c) as u128;
             raw.entry(cl.claimant.clone()).or_default().push((*c, w));
         }
         for cs in raw.values_mut() {
@@ -2964,6 +2970,64 @@ mod scenarios {
                 assert_eq!(lucky.bond, 0, "its bond came back");
             }
             std::fs::remove_dir_all(&t.home).ok();
+        }
+    }
+
+    /// Audit review-r4-poc-2: the pooled rate is a ceiling, not a lift. A farmer's weak claim in a
+    /// heavy repo (weight 10), bundled with three strong claims in a light one (weight 1), was paid
+    /// at the strong claims' pooled rate × the heavy repo's weight: about twice what it earns alone,
+    /// nearly a solid PR's payout. Each claim is now paid at its own score where that's lower, so
+    /// bundled or not, the weak claim is paid in proportion to its own score.
+    #[test]
+    fn a_weak_claim_doesnt_borrow_another_repos_quality() {
+        let field = |bundled: bool| {
+            let mut t = setup(if bundled { "lift-bundled" } else { "lift-alone" });
+            t.admin(Action::SetRepo { repo: "jackdishman/blockula".into(), weight: 10 }).unwrap();
+            t.admin(Action::SetRepo { repo: "jackdishman/docs".into(), weight: 1 }).unwrap();
+            for j in [k(1), k(2), k(3), k(4)] {
+                t.grant(&j, 10);
+                t.tx(&j, Action::JoinJury { bond: JUROR_BOND }).unwrap();
+            }
+            t.tx(&k(4), Action::FundPool { amount: 80 * DROPS_PER_FANG }).unwrap();
+            let (farmer, solid) = (k(5), k(6));
+            t.grant(&farmer, 60);
+            t.grant(&solid, 60);
+            t.link(&farmer, "farmer");
+            t.link(&solid, "solid");
+            let weak = t.claim(&farmer, 1).unwrap();
+            let mut docs = vec![];
+            if bundled {
+                for pr in 2..=4 {
+                    t.tx(&farmer, Action::SubmitClaim { repo: "jackdishman/docs".into(), pr, familiar_key: None }).unwrap();
+                    docs.push(t.c.state.poc.next_claim_id - 1);
+                }
+            }
+            let big = t.claim(&solid, 100).unwrap();
+            let mut peers = vec![];
+            for i in 7..=10u8 {
+                t.grant(&k(i), 1);
+                t.link(&k(i), &format!("peer{i}"));
+                peers.push(t.claim(&k(i), 200 + i as u64).unwrap());
+            }
+            t.attest_all(&[&[weak, big][..], &docs, &peers].concat());
+            let sid = t.wait_for_seance();
+            let mut st = t.c.state.clone();
+            judge(&mut st, sid, |c| if c == big || docs.contains(&c) { 3 } else { 1 });
+            st.close_seance(sid, t.h());
+            st.check_invariants().unwrap();
+            let [(weak_score, weak_paid), (big_score, big_paid)] = [weak, big].map(|c| (st.poc.claims[&c].score_ppm.unwrap() as u128, st.poc.claims[&c].payout as u128));
+            let out = (weak_score, weak_paid, big_score, big_paid, paid(&st, &farmer).0);
+            std::fs::remove_dir_all(&t.home).ok();
+            out
+        };
+        // Both claims are in the heavy repo, ranked first by people with the same Soul, so each is
+        // paid in proportion to the rate it's paid at: the weak one's own score, bundled or not
+        // (rounding aside).
+        for bundled in [false, true] {
+            let (weak_score, weak_paid, big_score, big_paid, farmer_paid) = field(bundled);
+            assert!(weak_score >= MIN_SCORE_PPM as u128 && weak_paid > 0 && big_score > weak_score, "bundled {bundled}: the weak claim is accepted: {weak_score} {weak_paid}");
+            assert!(weak_paid * big_score <= big_paid * weak_score + big_score, "bundled {bundled}: the weak claim (score {weak_score}) earned {weak_paid}, the solid one (score {big_score}) {big_paid}");
+            assert!(2 * farmer_paid < big_paid as u64, "bundled {bundled}: the farmer earned {farmer_paid}, the solid PR {big_paid}");
         }
     }
 
