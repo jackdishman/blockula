@@ -341,7 +341,9 @@ fn snapshots_reject_tampering() {
     assert!(crate::snapshot::read_state(&mut [bytes.as_slice(), &[0]].concat().as_slice()).is_err());
     assert!(crate::snapshot::read_state(&mut &bytes[..bytes.len() - 1]).is_err());
     let mut schema = bytes.clone();
-    schema[8] = 9;
+    // Another schema than this binary's (the byte after the magic is its low byte).
+    assert_eq!(schema[8], crate::state::codec::SCHEMA_VERSION as u8);
+    schema[8] = schema[8].wrapping_add(1);
     assert!(crate::snapshot::read_state(&mut schema.as_slice()).err().unwrap().to_string().contains("schema"));
     assert!(crate::snapshot::read_state(&mut &b"NOTSTATE"[..]).is_err());
     // Records must come in canonical order, without duplicates or unknown namespaces.
