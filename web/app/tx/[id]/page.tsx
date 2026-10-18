@@ -8,7 +8,7 @@ import { Amount, ago, Hash, Loading, NotFound, Section, StatusPill, Term, useMe,
 import { Ledger, signerOf } from "@/components/explorer/Ledger";
 import { Copy } from "@/components/ui";
 import { nodeExplorer } from "@/lib/config";
-import { amountLeaves, deltaFor, effectsOf, formatDrops, fromMySide, parseDrops, plainDrops, type LedgerCtx } from "@/lib/explorer/ledger";
+import { amountLeaves, deltaFor, effectsOf, formatDrops, fromMySide, parseDrops, plainDrops, showsAccount, type LedgerCtx } from "@/lib/explorer/ledger";
 import { type NodeError, useNode } from "@/lib/explorer/node";
 import { to } from "@/lib/explorer/routes";
 import type { AccountDetail, BlockView, ChainStatus, HuntView, TxDetail } from "@/lib/explorer/types";
@@ -39,7 +39,8 @@ export default function TxPage() {
   const block = useNode<BlockView>(t?.height && !dropped ? `/block/${t.height}` : null);
   const sender = useNode<AccountDetail>(t?.from ? `/account/${t.from.address}` : null);
   // Paid to an address: did it have an account before this ran? Its own history says (an earlier
-  // transaction naming it), else the receipt can't tell whether this burned the creation fee.
+  // transaction that shows one, `showsAccount`), else the receipt can't tell whether this burned
+  // the creation fee.
   const paysAddress = !!t?.to && t.status === "finalized" && (t.kind ?? t.action?.type) === "transfer" && t.action?.to === t.to.address && t.to.address !== t.from?.address;
   const recipient = useNode<AccountDetail>(paysAddress && t?.to ? `/account/${t.to.address}` : null);
   const status = useNode<ChainStatus>("/status", { every: settled ? 10_000 : 1000 });
@@ -49,7 +50,8 @@ export default function TxPage() {
   if (tx.error && !t) return <NotFound what="transaction" error={tx.error} />;
   if (!t) return <Loading>Finding the transaction…</Loading>;
 
-  const ctx: LedgerCtx = { recipientExisted: !!recipient.data?.recent_txs.some((x) => x.status !== "pending" && x.height != null && t.height != null && x.height < t.height) };
+  const existed = (history: TxDetail[] | undefined, address: string | undefined) => !!address && !!history?.some((x) => x.height != null && t.height != null && x.height < t.height && showsAccount(x, address));
+  const ctx: LedgerCtx = { recipientExisted: existed(recipient.data?.recent_txs, t.to?.address), senderExisted: existed(sender.data?.recent_txs, t.from?.address) };
   const fx = effectsOf(t, ctx);
   const mine = me ? deltaFor(t, me.address, ctx) : null;
   const involved = mine && mine.direction !== "none";
