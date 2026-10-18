@@ -209,7 +209,7 @@ case "$1 ${2:-}" in
   "genesis build")
     spec=$4 out=$6
     printf '{"chain_id":"%s","created_at_ms":%s}\n' "$(sed -nE 's/^chain_id = "(.*)"/\1/p' "$spec")" "$(sed -nE 's/^genesis_time_ms = //p' "$spec")" > "$out" ;;
-  "checkpoint --genesis") shasum -a 256 "$3" | cut -c1-64 ;;
+  "checkpoint --genesis") { sha256sum "$3" 2>/dev/null || shasum -a 256 "$3"; } | cut -c1-64 ;;
 esac
 STUB
 chmod +x "$T/bin/fly" "$T/bin/curl" "$T/bin/blockula-launch"

@@ -180,9 +180,10 @@ jobs:
       # are the reviewed commit's own (audit F49 round 3).
       - name: Release files against the tagged source (scripts/check-release-files.sh)
         run: bash scripts/test-release-files.sh
-      # The public testnet's entrypoint (key seeding, checkpoint join, flags) and the Fly machine
-      # configurations deploy/launch.sh deploys, offline, under dash as in the image.
-      - name: Testnet deploy scripts (deploy/entrypoint.sh, deploy/fly-config.sh)
+      # The public testnet's entrypoint (key seeding, checkpoint join, flags) under dash as in the
+      # image, the Fly machine configurations, and launch.sh / set-github-token.sh against a
+      # stand-in fly (retries, RESET, key removal, rolling restarts), offline.
+      - name: Testnet deploy scripts (deploy/entrypoint.sh, fly-config.sh, launch.sh, set-github-token.sh)
         run: ENTRY_SH=dash bash deploy/test-deploy.sh
       # The fuzz job runs in public: crashes stay out of its log and artifacts (supply-chain-B-1).
       - name: Fuzz crashes stay private (workflow, open findings)
