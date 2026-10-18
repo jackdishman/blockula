@@ -1097,6 +1097,10 @@ fn a_cancellation_supersedes_upgrade_proposals_still_open() {
     assert_eq!((t.p(s3).status, t.p(s7).status), (ProposalStatus::Queued, ProposalStatus::Voting));
     assert_eq!(t.p(c).outcome, format!("cancelled the upgrade to protocol v{v} at block {a}; it supersedes the upgrade proposals still open, #{s3} (v{} at block {}), #{s7} (v{} at block {}), which can't take effect; versions through v{} are spent: ship the next upgrade as v{} or later", v + 1, a + 100, v + 5, a + 200, v + 1, v + 6));
     assert_eq!(t.st.upgrade.withdrawals.highest, v + 1, "the passed v3 is spent with v2; the still-voting v7 isn't");
+    // Their summaries say they'll fail, and what to ship instead.
+    for s in [s3, s7] {
+        assert!(describe_proposal(&t.st, t.p(s), &|_| None).ends_with(&format!("; but a CancelUpgrade ran after it was proposed, so it's superseded and will fail when it runs (ship it as v{} or later)", v + 6)), "{}", describe_proposal(&t.st, t.p(s), &|_| None));
+    }
     assert!(ran < t.p(s3).voting_end + timelock, "the successor is still voting or queued");
     t.finish(s7);
     assert_eq!((t.p(s3).status, t.p(s7).status), (ProposalStatus::Failed, ProposalStatus::Failed));
@@ -1108,6 +1112,7 @@ fn a_cancellation_supersedes_upgrade_proposals_still_open() {
     let e = t.err(ALICE, Action::Propose { kind: ProposalKind::ScheduleUpgrade { version: v + 1, activation_height: a + 300 }, deposit: 50 * FANG, title: "x".into(), url: String::new() });
     assert!(e.contains("never reused") && e.contains(&format!("as v{} or later", v + 6)), "{e}");
     let s4 = pass(&mut t, ProposalKind::ScheduleUpgrade { version: v + 2, activation_height: a + 300 });
+    assert_eq!(describe_proposal(&t.st, t.p(s4), &|_| None), format!("upgrade to protocol v{} at block {}", v + 2, a + 300), "proposed after the cancellation: not superseded");
     // The executed cancellation's summary doesn't claim the new proposal (its outcome is what it did).
     assert_eq!(describe_proposal(&t.st, t.p(c), &|_| None), what);
     t.finish(s4);

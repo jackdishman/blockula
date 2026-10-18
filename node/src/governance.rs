@@ -1576,14 +1576,22 @@ pub fn describe_kind(state: &State, kind: &ProposalKind, primary_name: &dyn Fn(&
 /// waiting to run, what it would withdraw and supersede if it ran now, worded as conditional
 /// (review-r2-gov-3), or, when its upgrade isn't scheduled any more (another cancellation
 /// withdrew it; a withdrawn number is never scheduled again), that it will fail and change
-/// nothing. Once it has run, its outcome (written when it ran) says what it withdrew and
-/// superseded; a rejected or failed one did neither.
+/// nothing; for an open `ScheduleUpgrade` a cancellation superseded, that it will fail. Once a
+/// cancellation has run, its outcome (written when it ran) says what it withdrew and superseded;
+/// a rejected or failed one did neither.
 pub fn describe_proposal(state: &State, p: &Proposal, primary_name: &dyn Fn(&str) -> Option<String>) -> String {
     let what = describe_kind(state, &p.kind, primary_name);
-    let ProposalKind::CancelUpgrade { version, activation_height } = p.kind else { return what };
     if !matches!(p.status, ProposalStatus::Voting | ProposalStatus::Queued) {
         return what;
     }
+    // An open upgrade proposal a cancellation superseded will fail: say so, and what to ship.
+    if let ProposalKind::ScheduleUpgrade { version, .. } = p.kind {
+        return match crate::upgrade::check_not_superseded(state, p.created_at, version) {
+            Ok(()) => what,
+            Err(_) => format!("{what}; but a CancelUpgrade ran after it was proposed, so it's superseded and will fail when it runs (ship it as v{} or later)", crate::upgrade::next_version(state)),
+        };
+    }
+    let ProposalKind::CancelUpgrade { version, activation_height } = p.kind else { return what };
     if crate::upgrade::scheduled(state, version, activation_height).is_err() {
         return format!("{what}; but v{version} at block {activation_height} isn't scheduled any more: it would fail when it runs and change nothing");
     }
