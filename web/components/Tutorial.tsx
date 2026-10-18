@@ -8,7 +8,7 @@ import { friendly } from "@/lib/errors";
 import { KIT_LABEL } from "@/lib/recovery";
 import { loadTutorial, saveTutorial, type TutorialState } from "@/lib/session";
 import type { AccountView, Status } from "@/lib/types";
-import { useUnlocked } from "@/lib/wallet";
+import { useTutorialScope, useUnlocked } from "@/lib/wallet";
 import { ErrorNote, ExplorerLink, Spinner } from "./ui";
 
 const ROMAN = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII"];
@@ -21,24 +21,31 @@ interface Item {
   action?: ReactNode;
 }
 
+/** This chain's and account's checklist progress (lib/session), and a way to update it. */
 export function useTutorial() {
-  const [t, setT] = useState<TutorialState>({});
+  const scope = useTutorialScope();
+  // Kept with the scope it was read for, so another account's or chain's ticks are never shown or written here.
+  const [s, setS] = useState<{ scope: string | null; t: TutorialState }>({ scope: null, t: {} });
   useEffect(() => {
-    setT(loadTutorial());
+    if (!scope) return;
+    setS({ scope, t: loadTutorial(scope) });
     // The explorer link can be clicked anywhere in the app; re-read when we come back to the tab.
-    const sync = () => setT(loadTutorial());
+    const sync = () => setS({ scope, t: loadTutorial(scope) });
     window.addEventListener("focus", sync);
     return () => window.removeEventListener("focus", sync);
-  }, []);
+  }, [scope]);
+  const t = s.scope !== null && s.scope === scope ? s.t : null;
   const update = (patch: Partial<TutorialState>) => {
-    const next = { ...loadTutorial(), ...patch };
-    saveTutorial(next);
-    setT(next);
+    if (!scope) return;
+    const next = { ...loadTutorial(scope), ...patch };
+    saveTutorial(scope, next);
+    setS({ scope, t: next });
   };
   return [t, update] as const;
 }
 
-export function Tutorial({ state, update }: { state: TutorialState; update: (p: Partial<TutorialState>) => void }) {
+/** The checklist. `state` is null until this chain's and account's progress has been read. */
+export function Tutorial({ state, update }: { state: TutorialState | null; update: (p: Partial<TutorialState>) => void }) {
   const { wallet, account, status, refresh } = useUnlocked();
   const [open, setOpen] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -57,16 +64,16 @@ export function Tutorial({ state, update }: { state: TutorialState; update: (p: 
     }
   };
 
-  const items = account ? buildItems(account, status, state, busy, faucet) : [];
-  for (const i of items) i.done ||= !!state.done?.includes(i.id);
+  const items = account && state ? buildItems(account, status, state, busy, faucet) : [];
+  for (const i of items) i.done ||= !!state?.done?.includes(i.id);
   // Remember ticks so they survive e.g. revoking the agent you set up.
-  const newlyDone = items.filter((i) => i.done && !state.done?.includes(i.id)).map((i) => i.id).join();
+  const newlyDone = items.filter((i) => i.done && !state?.done?.includes(i.id)).map((i) => i.id).join();
   useEffect(() => {
-    if (newlyDone) update({ done: [...(state.done ?? []), ...newlyDone.split(",")] });
+    if (newlyDone) update({ done: [...(state?.done ?? []), ...newlyDone.split(",")] });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [newlyDone]);
 
-  if (!account || state.dismissed) return null;
+  if (!account || !state || state.dismissed) return null;
   const done = items.filter((i) => i.done).length;
   return (
     <section className="card learn">

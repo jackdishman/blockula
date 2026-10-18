@@ -92,7 +92,7 @@ function Home() {
         <Ledger txs={account.recent_txs} side={addr} me={me} keys={account.keys} myKeyId={wallet.keyId} head={status?.height} blockMs={status?.block_time_ms} fresh={fresh} empty="Nothing yet. Your transactions will appear here once they're sealed into a block." />
       </section>
 
-      {tutorial.dismissed && (
+      {tutorial?.dismissed && (
         <button className="link small center-self" onClick={() => updateTutorial({ dismissed: false })}>Show the tutorial again</button>
       )}
       {hint.kind === "passkey" && <p className="dim small center-self">Unlocked with your passkey. The key lives only in this tab&apos;s memory.</p>}

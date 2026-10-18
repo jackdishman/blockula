@@ -47,9 +47,27 @@ export interface TutorialState {
   /** Items ticked once stay ticked (e.g. after revoking the agent you set up). */
   done?: string[];
 }
-export const loadTutorial = (): TutorialState => read<TutorialState>(TUTORIAL) ?? {};
-export const saveTutorial = (t: TutorialState) => localStorage.setItem(TUTORIAL, JSON.stringify(t));
-export const markTutorial = (patch: Partial<TutorialState>) => saveTutorial({ ...loadTutorial(), ...patch });
+
+/**
+ * Checklist progress is kept per chain and account: the same key has the same address on every
+ * chain, but what it did on a testnet that has since been relaunched (or with another account)
+ * isn't done here. A store from before this (no `v`) can't say which chain it was for, so it's dropped.
+ */
+interface TutorialStore {
+  v: 2;
+  scopes: Record<string, TutorialState>;
+}
+
+/** Whose checklist: the chain (id and genesis, as the node reported them to the pinned client) and the account. */
+export const tutorialScope = (chainId: string, genesisHash: string | undefined, account: string) => `${chainId}/${genesisHash ?? ""}/${account}`;
+
+const tutorials = (): Record<string, TutorialState> => {
+  const s = read<TutorialStore>(TUTORIAL);
+  return s?.v === 2 && s.scopes ? s.scopes : {};
+};
+export const loadTutorial = (scope: string): TutorialState => tutorials()[scope] ?? {};
+export const saveTutorial = (scope: string, t: TutorialState) => localStorage.setItem(TUTORIAL, JSON.stringify({ v: 2, scopes: { ...tutorials(), [scope]: t } } satisfies TutorialStore));
+export const markTutorial = (scope: string, patch: Partial<TutorialState>) => saveTutorial(scope, { ...loadTutorial(scope), ...patch });
 
 export const ONBOARDED = "blockula.onboarded";
 

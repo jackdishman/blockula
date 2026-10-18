@@ -5,7 +5,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { ChainMismatchError, networkClient, type PinnedClient } from "./chain";
 import { ensureRpcCookie } from "./config";
 import { friendly } from "./errors";
-import { clearHint, loadHint, saveHint, type Hint } from "./session";
+import { clearHint, loadHint, saveHint, tutorialScope, type Hint } from "./session";
 import type { AccountView, Status } from "./types";
 
 /** Is the node on the chain this wallet is pinned to? A mismatch is final until reload. */
@@ -73,8 +73,9 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     const a = (await client.account(w.account).catch(() => null)) as AccountView | null;
     if (a && walletRef.current === w) {
       setAccount(a);
+      // The name on this chain, or none: a name kept from another chain (a relaunched testnet) isn't this account's here.
       const name = a.names[0];
-      if (name && hintRef.current && hintRef.current.name !== name) {
+      if (hintRef.current && hintRef.current.name !== name) {
         const h = { ...hintRef.current, name };
         saveHint(h);
         setHint(h);
@@ -137,4 +138,10 @@ export function useWallet() {
 export function useUnlocked() {
   const c = useWallet();
   return { ...c, wallet: c.wallet as Wallet, hint: c.hint as Hint };
+}
+
+/** The checklist's scope (lib/session `tutorialScope`): this chain and the account, once the node has reported its chain. */
+export function useTutorialScope(): string | null {
+  const { status, hint } = useWallet();
+  return status && hint?.account ? tutorialScope(status.chain_id, status.genesis_hash, hint.account) : null;
 }
