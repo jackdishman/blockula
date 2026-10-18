@@ -78,9 +78,9 @@ pub enum ReleaseCmd {
     },
     /// Verify a file's signature against the published release key id
     Verify {
-        /// The release key id to trust (64 hex chars, published in SECURITY.md and OPERATIONS.md).
-        /// It must be the pinned one; with nothing pinned, the one this binary was built with, if
-        /// any [default: the pinned key id, else the built-in one]
+        /// The release key id to check against (64 hex chars, published in SECURITY.md and
+        /// OPERATIONS.md). Checked as given, since verify pins nothing; one that isn't the pinned
+        /// (or built-in) key is said so [default: the pinned key id, else the built-in one]
         #[arg(long = "key-id")]
         key_id: Option<String>,
         /// The pin file [default: ~/.blockula/release-key-id]
@@ -337,13 +337,30 @@ fn check_first_pin(given: &str, builtin: &str, pin_file: &Path) -> Result<()> {
     )
 }
 
-impl TrustedKey {
-    pub fn resolve(given: Option<&str>, pin_file: &Path) -> Result<Self> {
-        Self::resolve_with(given, pin_file, BUILTIN_KEY_ID)
-    }
+/// The key `release verify` checks against, and a note when it isn't the one `release install`
+/// would trust. Verify pins nothing, so a key id named explicitly is checked as given: install.sh
+/// names its own, which after a key rotation is newer than the built-in key of the blockula that
+/// checks it (audit review-r4-supply-2). Without one, the pin, else the built-in key.
+fn verify_key(given: Option<&str>, pin_file: &Path, builtin: &str) -> Result<(String, Option<String>)> {
+    let Some(given) = given else {
+        return Ok((TrustedKey::resolve_with(None, pin_file, builtin)?.id, None));
+    };
+    let given = normalize_key_id(given)?;
+    let trusted = match read_pin(pin_file)? {
+        Some(p) => Some((p, format!("pinned in {}", pin_file.display()))),
+        None if !builtin.is_empty() => Some((builtin.to_string(), "built into this blockula".to_string())),
+        None => None,
+    };
+    let note = trusted.filter(|(t, _)| *t != given).map(|(t, why)| {
+        format!("note: {given} isn't the release key {why} ({t}), so this only shows who signed the file. `release install` and `fetch` trust {t}; a new key replaces it only through a rotation statement {t} signed (docs/OPERATIONS.md \"The release key\")")
+    });
+    Ok((given, note))
+}
 
-    /// [`Self::resolve`] with the built-in key id as a parameter (tests pass one; the binary's is
-    /// [`BUILTIN_KEY_ID`]).
+impl TrustedKey {
+    /// The key `install` and `fetch` check a release against: the pin, which a different key id
+    /// given can't override; with nothing pinned, the key id given (which must be the built-in
+    /// one, if there is one) or the built-in one. `builtin` is [`BUILTIN_KEY_ID`] (tests pass one).
     fn resolve_with(given: Option<&str>, pin_file: &Path, builtin: &str) -> Result<Self> {
         let pinned = read_pin(pin_file)?;
         let given = given.map(normalize_key_id).transpose()?;
@@ -759,10 +776,10 @@ pub fn run(cmd: ReleaseCmd) -> Result<()> {
             eprintln!("signed {} with key {}", file.display(), sig.key_id);
         }
         ReleaseCmd::Verify { key_id, pin_file, tag, sig, file, sig_file } => {
-            // The same key `release install` would trust (it pins nothing here): the pin, which a
-            // different --key-id can't override, or with nothing pinned, the key id given (which
-            // must be the built-in one, if this binary has one) or the built-in one.
-            let key_id = TrustedKey::resolve(key_id.as_deref(), &pin_file.unwrap_or_else(default_pin_file))?.id;
+            let (key_id, note) = verify_key(key_id.as_deref(), &pin_file.unwrap_or_else(default_pin_file), BUILTIN_KEY_ID)?;
+            if let Some(note) = note {
+                eprintln!("{note}");
+            }
             let sig_path = match (sig, sig_file) {
                 (Some(s), None) | (None, Some(s)) => s,
                 _ => bail!("give the signature file once: --sig <file.sig> <file>, or <file> <file.sig>"),
@@ -933,7 +950,7 @@ mod tests {
         let (kid, aid) = (key_id(&k.public_key()), key_id(&attacker.public_key()));
         let pin = t.join("home/release-key-id");
         let dest = t.join("bin/blockula");
-        let inst = |tag: &str, a: SourceArgs| install(tag, &a, Some(dest.clone()), false).map_err(|e| e.to_string());
+        let inst = |tag: &str, a: SourceArgs| install_with(tag, &a, Some(dest.clone()), false, "").map_err(|e| e.to_string());
         let asset = format!("blockula-{}.tar.gz", host_target().unwrap());
 
         let genuine = t.join("genuine");
@@ -999,7 +1016,7 @@ mod tests {
     /// Audit review-r3-supply-4 / review-r2-supply-1 (round 4): after the key ceremony a fresh
     /// host's first binary (vouched for by the release announcement) knows the release key id. A
     /// different `--key-id` (from docs a compromised GitHub account edited) isn't pinned: not by
-    /// `install`, `fetch` or `pin`, and `verify` won't check against it either. The key that
+    /// `install`, `fetch` or `pin`, and `verify` says it isn't the key they trust. The key that
     /// legitimately replaced the built-in one comes in through the rotation statement it signed.
     #[test]
     fn a_first_pin_must_be_the_built_in_key() {
@@ -1029,10 +1046,18 @@ mod tests {
         let p = |k: &str, r: Option<(&Path, &Path)>| pin_with(Some(k.into()), r.map(|(a, b)| (a.to_path_buf(), b.to_path_buf())), pin.clone(), &k0_id).map_err(|e| e.to_string());
         assert!(p(&aid, None).unwrap_err().contains("you gave"));
         assert!(!pin.exists());
-        // `release verify --key-id`: nothing to pin, but it won't check against another key either.
+        // The key install and fetch would trust: never another one, given.
         assert!(TrustedKey::resolve_with(Some(&aid), &pin, &k0_id).err().unwrap().to_string().contains("you gave"));
         assert_eq!(TrustedKey::resolve_with(None, &pin, &k0_id).unwrap().id, k0_id);
         assert_eq!(TrustedKey::resolve_with(Some(&k0_id), &pin, &k0_id).unwrap().id, k0_id);
+        // `release verify --key-id` pins nothing: it checks against the key named, as install.sh
+        // needs after a rotation (review-r4-supply-2), and says when that isn't the key install
+        // would trust. Without one it checks against the built-in key.
+        let (id, note) = verify_key(Some(&aid), &pin, &k0_id).unwrap();
+        assert!(id == aid && note.as_deref().is_some_and(|n| n.contains(&format!("isn't the release key built into this blockula ({k0_id})"))), "{note:?}");
+        assert_eq!(verify_key(None, &pin, &k0_id).unwrap(), (k0_id.clone(), None));
+        assert_eq!(verify_key(Some(&k0_id.to_uppercase()), &pin, &k0_id).unwrap(), (k0_id.clone(), None));
+        assert!(!pin.exists());
         // Before the key ceremony (nothing built in) a given key id is pinned, as before.
         assert_eq!(TrustedKey::resolve_with(Some(&aid), &pin, "").unwrap().id, aid);
 
@@ -1082,7 +1107,7 @@ mod tests {
         let (old, new, other) = (Keys::from_seed([5; 32]), Keys::from_seed([6; 32]), Keys::from_seed([7; 32]));
         let (old_id, new_id, other_id) = (key_id(&old.public_key()), key_id(&new.public_key()), key_id(&other.public_key()));
         let pin_file = t.join("release-key-id");
-        let p = |k: &str, r: Option<(&Path, &Path)>| pin(Some(k.into()), r.map(|(a, b)| (a.to_path_buf(), b.to_path_buf())), Some(pin_file.clone())).map_err(|e| e.to_string());
+        let p = |k: &str, r: Option<(&Path, &Path)>| pin_with(Some(k.into()), r.map(|(a, b)| (a.to_path_buf(), b.to_path_buf())), pin_file.clone(), "").map_err(|e| e.to_string());
         let statement = |from: &str, to: &str, by: &Keys, name: &str| -> (PathBuf, PathBuf) {
             let text = format!("{ROTATION_HEADER}\nold {from}\nnew {to}\n");
             let (f, s) = (t.join(name), t.join(format!("{name}.sig")));
@@ -1160,21 +1185,21 @@ mod tests {
         fake_release(&rel, "v9.9.9", &k, "blockula 9.9.9");
         let files = vec!["genesis-blockula-1.json".to_string(), "install.sh".to_string()];
         let out = t.join("verified");
-        fetch("v9.9.9", &from_dir(&rel, Some(&kid), &pin), &out, &files).unwrap();
+        fetch_with("v9.9.9", &from_dir(&rel, Some(&kid), &pin), &out, &files, "").unwrap();
         for f in files.iter().map(String::as_str).chain(["checksums.txt", "checksums.txt.sig"]) {
             assert_eq!(std::fs::read(out.join(f)).unwrap(), std::fs::read(rel.join(f)).unwrap(), "{f}");
         }
         assert_eq!(read_pin(&pin).unwrap(), Some(kid.clone()));
         // Only into a new or empty directory.
-        assert!(fetch("v9.9.9", &from_dir(&rel, None, &pin), &out, &files).unwrap_err().to_string().contains("new or empty directory"));
+        assert!(fetch_with("v9.9.9", &from_dir(&rel, None, &pin), &out, &files, "").unwrap_err().to_string().contains("new or empty directory"));
         // A tampered file leaves nothing behind.
         std::fs::write(rel.join("genesis-blockula-1.json"), "{\"chain_id\":\"evil\"}\n").unwrap();
         let out2 = t.join("verified2");
-        assert!(fetch("v9.9.9", &from_dir(&rel, None, &pin), &out2, &files).unwrap_err().to_string().contains("doesn't match the signed checksums.txt"));
+        assert!(fetch_with("v9.9.9", &from_dir(&rel, None, &pin), &out2, &files, "").unwrap_err().to_string().contains("doesn't match the signed checksums.txt"));
         assert!(!out2.exists());
         // A file the release doesn't list.
-        assert!(fetch("v9.9.9", &from_dir(&rel, None, &pin), &out2, &["genesis-blockula-2.json".into()]).unwrap_err().to_string().contains("isn't in release v9.9.9's signed checksums.txt"));
-        assert!(fetch("v9.9.9", &from_dir(&rel, None, &pin), &out2, &["../checksums.txt".into()]).is_err());
+        assert!(fetch_with("v9.9.9", &from_dir(&rel, None, &pin), &out2, &["genesis-blockula-2.json".into()], "").unwrap_err().to_string().contains("isn't in release v9.9.9's signed checksums.txt"));
+        assert!(fetch_with("v9.9.9", &from_dir(&rel, None, &pin), &out2, &["../checksums.txt".into()], "").is_err());
         std::fs::remove_dir_all(t).ok();
     }
 
@@ -1205,13 +1230,13 @@ mod tests {
         let pin = t.join("release-key-id");
         let dest = t.join("bin/blockula");
         let args = SourceArgs { key_id: Some(kid.clone()), from: Some(base.clone()), pin_file: Some(pin.clone()) };
-        install("v9.9.9", &args, Some(dest.clone()), false).unwrap();
+        install_with("v9.9.9", &args, Some(dest.clone()), false, "").unwrap();
         assert_eq!(reports(&dest).as_deref(), Some("blockula 9.9.9"));
         let source = Source::new(Some(&base), "v9.9.9").unwrap();
         assert!(source.get("install.sh", 8).unwrap_err().to_string().contains("larger than 8 bytes"));
         assert!(source.get("missing.txt", 8).unwrap().is_none());
         std::fs::remove_file(rel.join("checksums.txt.sig")).unwrap();
-        assert!(install("v9.9.9", &args, Some(dest.clone()), false).unwrap_err().to_string().contains("no checksums.txt.sig"));
+        assert!(install_with("v9.9.9", &args, Some(dest.clone()), false, "").unwrap_err().to_string().contains("no checksums.txt.sig"));
         std::fs::remove_dir_all(t).ok();
     }
 

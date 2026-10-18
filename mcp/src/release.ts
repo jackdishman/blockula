@@ -43,6 +43,25 @@ export function binPaths(home: string): { mcp: string; cli: string } {
   return { mcp: join(home, "mcp-bin", "blockula"), cli: join(home, "bin", "blockula") };
 }
 
+/** A node binary the MCP could run, and what its `--version` printed (undefined: it didn't run). */
+export interface NodeBinary {
+  path: string;
+  version?: string;
+}
+
+/**
+ * The node binary start_dev_node and summon_chain run when BLOCKULA_BIN isn't set (audit
+ * review-r4-supply-3). `found` lists the installed ones, `blockula release install`'s first (it was
+ * checked against the pinned key), then install_node's. The first whose `--version` is this MCP's
+ * wins; else the first that runs; else the first; with none, `blockula` from PATH. `matches` says
+ * whether it's this MCP's version, so a stale binary is never run without saying so.
+ */
+export function pickNodeBinary(found: NodeBinary[], mcpVersion: string): NodeBinary & { matches: boolean } {
+  const same = found.find((b) => b.version === `blockula ${mcpVersion}`);
+  if (same) return { ...same, matches: true };
+  return { ...(found.find((b) => b.version !== undefined) ?? found[0] ?? { path: "blockula" }), matches: false };
+}
+
 /**
  * The release key id pinned in `file` (`blockula release pin` / the first `release install`), or
  * null if there's no pin. Same rules as release_cli.rs read_pin: one 64-hex key id (any case,

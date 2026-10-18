@@ -22,8 +22,9 @@
 //                       (default BLOCKULA_MAX_SEND + 1 FANG for fees, so one full-size call fits)
 //   BLOCKULA_TIMEOUT_MS how long one request to the node may take (default 15000, at most 2147483647)
 //   BLOCKULA_TX_WAIT_MS how long a tx tool waits for finality before answering "pending" (default 15000)
-//   BLOCKULA_BIN        path to the `blockula` binary (default: ~/.blockula/mcp-bin/blockula from install_node,
-//                       else ~/.blockula/bin/blockula from `blockula release install`, else PATH)
+//   BLOCKULA_BIN        path to the `blockula` binary (default: of ~/.blockula/bin/blockula from `blockula release
+//                       install` and ~/.blockula/mcp-bin/blockula from install_node, the one of this MCP's version,
+//                       the first if both or neither are; else PATH)
 //   BLOCKULA_REQUIRE_VERIFY=1   install_node needs provenance too (and refuses a checksum-only release)
 //   BLOCKULA_RELEASE_KEY_ID     the release signing key id to trust (until it's built in; it must
 //                       agree with the built-in one and with ~/.blockula/release-key-id, if pinned)
@@ -40,7 +41,7 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { z } from "zod";
 import { KNOWN_CLOCKS, KNOWN_GENESIS, KnownChains, clockFrom, completePin, effectivePin, mismatch, mismatchError, resolveNetwork, type GenesisClock, type Network } from "./network.js";
-import { PIN_FILE, REPO, RELEASE_KEY_ID, binPaths, checkBinaryVersion, fetchVerifiedRelease, latestTagFrom, readReleasePin, releaseKeyIdFrom } from "./release.js";
+import { PIN_FILE, REPO, RELEASE_KEY_ID, binPaths, checkBinaryVersion, fetchVerifiedRelease, latestTagFrom, pickNodeBinary, readReleasePin, releaseKeyIdFrom, type NodeBinary } from "./release.js";
 import { SignedTxs, onChain, type SignedTx } from "./signed.js";
 import { SpendLedger } from "./spend.js";
 import { SERVER_INSTRUCTIONS, UNTRUSTED_NOTE, chainData, clean } from "./untrusted.js";
@@ -68,9 +69,28 @@ const TX_WAIT_MS = msEnv("BLOCKULA_TX_WAIT_MS", 15_000);
 const KNOWN_CHAINS = new KnownChains(join(HOME, "known-chains.json"));
 const VERSION: string = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
 // install_node's binary has a path of its own: it never replaces the one `blockula release install`
-// checked against the operator's pinned key (audit review-r3-integrate-compose-1).
+// checked against the operator's pinned key (audit review-r3-integrate-compose-1). Which one runs is
+// decided at each use, by version (nodeBinary).
 const { mcp: INSTALLED_BIN, cli: CLI_BIN } = binPaths(HOME);
-let BIN = process.env.BLOCKULA_BIN ?? (existsSync(INSTALLED_BIN) ? INSTALLED_BIN : existsSync(CLI_BIN) ? CLI_BIN : "blockula");
+
+/** What a binary's `--version` prints, or undefined if it doesn't run. */
+function versionOf(path: string): string | undefined {
+  try {
+    return execFileSync(path, ["--version"], { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"] }).trim();
+  } catch {
+    return undefined;
+  }
+}
+
+/** The node binary to run now: BLOCKULA_BIN, else the installed one of this MCP's version (pickNodeBinary). */
+function nodeBinary(): NodeBinary & { matches?: boolean } {
+  if (process.env.BLOCKULA_BIN) return { path: process.env.BLOCKULA_BIN };
+  return pickNodeBinary([CLI_BIN, INSTALLED_BIN].filter((p) => existsSync(p)).map((path) => ({ path, version: versionOf(path) })), VERSION);
+}
+
+/** Says which binary ran, and when it isn't this MCP's version. */
+const ranWith = (b: NodeBinary & { matches?: boolean }) =>
+  `Ran ${b.path}${b.version ? ` (${b.version})` : ""}${b.matches === false && b.path !== "blockula" ? `, not this MCP's version (${VERSION}): install_node v${VERSION} (or \`blockula release install v${VERSION}\`) gets one that is.` : "."}`;
 
 /** Testnet economics, said wherever Hunts and the contribution pool come up. */
 const NO_VALUE = "Testnet FANG, Hunts and Soul have no monetary value and come with no promise of any mainnet allocation.";
@@ -668,7 +688,8 @@ tool("start_dev_node", "Start a local Blockula dev chain (faucet + built-in expl
   mkdirSync(HOME, { recursive: true });
   const log = openSync(join(HOME, "dev-node.log"), "a");
   let missing = false;
-  const child = spawn(BIN, ["dev", "--port", port, ...(reset ? ["--reset"] : [])], { detached: true, stdio: ["ignore", log, log] });
+  const bin = nodeBinary();
+  const child = spawn(bin.path, ["dev", "--port", port, ...(reset ? ["--reset"] : [])], { detached: true, stdio: ["ignore", log, log] });
   child.on("error", (e: NodeJS.ErrnoException) => {
     missing = e.code === "ENOENT";
   });
@@ -678,11 +699,11 @@ tool("start_dev_node", "Start a local Blockula dev chain (faucet + built-in expl
     if (await reachable(target)) {
       // A reset dev chain has a new genesis: re-pin on the next call.
       if (net.key === "local") pinned = null;
-      return `🧛 Dev chain is up. Explorer: ${target} · logs: ${join(HOME, "dev-node.log")}. ${using}`;
+      return `🧛 Dev chain is up. Explorer: ${target} · logs: ${join(HOME, "dev-node.log")}. ${ranWith(bin)} ${using}`;
     }
   }
   if (missing) {
-    throw new Error(`The \`${BIN}\` node binary isn't installed, so a local chain can't start. Call install_node to download the prebuilt node (checksum-verified, plus provenance or signature checks where available), then start_dev_node again.`);
+    throw new Error(`The \`${bin.path}\` node binary isn't installed, so a local chain can't start. Call install_node to download the prebuilt node (checksum-verified, plus provenance or signature checks where available), then start_dev_node again.`);
   }
   throw new Error(`node didn't start. See ${join(HOME, "dev-node.log")}`);
 });
@@ -739,9 +760,10 @@ tool(
       } finally {
         rmSync(staged, { force: true });
       }
-      BIN = INSTALLED_BIN;
       const installed = execFileSync(INSTALLED_BIN, ["--version"], { encoding: "utf8" }).trim();
-      return { installed, path: INSTALLED_BIN, sha256: rel.sha256, verified: rel.verified.length ? rel.verified : ["checksum only"], ...(rel.warning ? { warning: rel.warning } : {}), next: "start_dev_node runs a local chain; summon_chain creates your own network" };
+      const runs = nodeBinary();
+      const which = runs.path === INSTALLED_BIN ? "they run this one" : `they run ${runs.path}${runs.version ? ` (${runs.version})` : ""}, ${process.env.BLOCKULA_BIN ? "BLOCKULA_BIN" : "the binary of this MCP's version or `blockula release install`'s"}, not this one`;
+      return { installed, path: INSTALLED_BIN, sha256: rel.sha256, verified: rel.verified.length ? rel.verified : ["checksum only"], ...(rel.warning ? { warning: rel.warning } : {}), next: `start_dev_node runs a local chain; summon_chain creates your own network (${which})` };
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
@@ -749,8 +771,9 @@ tool(
 );
 
 tool("summon_chain", "Create a brand-new Blockula chain (fresh genesis + validator key) that you can run as your own network.", { chain_id: z.string().regex(/^[a-z0-9-]{3,40}$/), faucet: z.boolean().default(true) }, async ({ chain_id, faucet }) => {
-  const out = execFileSync(BIN, ["summon", chain_id, ...(faucet ? [] : ["--no-faucet"])], { encoding: "utf8" });
-  return out.trim();
+  const bin = nodeBinary();
+  const out = execFileSync(bin.path, ["summon", chain_id, ...(faucet ? [] : ["--no-faucet"])], { encoding: "utf8" });
+  return `${out.trim()}\n${ranWith(bin)}`;
 });
 
 tool("create_wallet", "Create this agent's post-quantum (ML-DSA-65) wallet, stored locally. Returns the existing one if it already exists.", {}, async () => {
