@@ -584,7 +584,7 @@ fn fast_sync_from_certified_snapshot_and_tamper_rejection() {
         assert_eq!((v.epochs.base, v.epochs.known_through), (0, last_epoch), "nothing past the certified epoch is adopted");
         assert!(v.epochs.sets.keys().all(|e| *e <= last_epoch) && v.epochs.proofs.keys().all(|e| *e <= last_epoch));
         // So is a manifest that contradicts a trusted checkpoint (here at the epoch anchor, #299).
-        let real = crate::checkpoints::Checkpoint { height: 299, hash: vals[0].chain.lock().hash_at(299).unwrap(), set_hash: None };
+        let real = crate::checkpoints::Checkpoint { height: 299, hash: vals[0].chain.lock().hash_at(299).unwrap(), set_hash: None, timestamp_ms: None };
         let trusting = |cp| crate::checkpoints::Trust::new(&genesis, &crate::checkpoints::Pins { checkpoints: vec![cp], ..Default::default() }, false).unwrap();
         snapshot::verify_manifest_trusted(&genesis, &m, &history, &trusting(real.clone())).unwrap();
         assert!(snapshot::verify_manifest_trusted(&genesis, &m, &history, &trusting(crate::checkpoints::Checkpoint { hash: "ab".repeat(32), ..real })).is_err());

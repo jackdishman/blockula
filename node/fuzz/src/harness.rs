@@ -264,7 +264,7 @@ pub fn snapshot_manifest(data: &[u8]) -> bool {
     // And against trusted checkpoints, as `join` checks it: one the manifest proves, one it can't.
     let set_hash = checkpoints::genesis_checkpoint(genesis()).set_hash;
     for (height, set_hash) in [(m.height, None), (m.height / 2, set_hash), (u64::MAX, None)] {
-        let cp = checkpoints::Checkpoint { height, hash: v.hash_at(height).unwrap_or_else(|| "ab".repeat(32)), set_hash };
+        let cp = checkpoints::Checkpoint { height, hash: v.hash_at(height).unwrap_or_else(|| "ab".repeat(32)), set_hash, timestamp_ms: None };
         let pins = checkpoints::Pins { checkpoints: vec![cp], ..Default::default() };
         let _ = v.check_trust(&checkpoints::Trust::new(genesis(), &pins, false).expect("the fixture chain is unknown, so any checkpoint past #0 is accepted"));
     }

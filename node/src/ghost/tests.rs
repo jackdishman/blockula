@@ -1181,7 +1181,68 @@ fn a_queued_shield_is_its_senders_last_tx() {
     assert!(e.contains("nothing queues behind a shield"), "{e}");
     // Once the shields are included, the account queues again.
     assert_eq!(n.block(vec![s1, mine]), [true, true]);
-    n.c.submit(Tx { nonce: 1, ..t }.sign(&alice)).unwrap();
+    n.c.submit(Tx { nonce: 1, ..t.clone() }.sign(&alice)).unwrap();
+    // Review of r3-consensus: a shield tipping 19x its base fee can't be outbid at the current
+    // base fee (that takes its tip plus a tenth, past the 20x cap), so no refusal names a tip
+    // for a replacement: each says to wait until it's included or leaves the mempool.
+    let carol = Keys::from_seed([73; 32]);
+    n.c.state.accounts.insert(carol.address(), crate::chain::Account { balance: 10 * FANG, ..Default::default() });
+    n.c.state.supply += 10 * FANG;
+    let probe = stand_in_shield(&mut n, &carol, 0, 0);
+    let base = crate::econ::base_fee(&n.c.state, n.c.height() + 1, probe.size());
+    let high = stand_in_shield(&mut n, &carol, 0, 19 * base);
+    n.c.submit(high.clone()).unwrap();
+    let cap_of = |n: &Net, tx: &Tx| crate::econ::max_tip(&n.c.state, crate::econ::base_fee(&n.c.state, n.c.height() + 1, tx.size()));
+    let cap = cap_of(&n, &high);
+    assert!(displacing_tip(high.tip, base) > cap && high.tip < cap, "{} {cap}", high.tip);
+    let mut behind = Tx { from: carol.address(), nonce: 1, public_key: hex::encode(carol.public_key()), fee: 0, ..t.clone() };
+    behind.fee = 2 * crate::econ::base_fee(&n.c.state, n.c.height() + 1, behind.size());
+    let e = err(n.c.submit(behind.clone().sign(&carol)));
+    assert!(e.contains("your shield (nonce 0) is waiting in the mempool, and nothing queues behind a shield") && e.contains(&format!("a replacement's cap at the current base fee ({cap} drops), so it can't be replaced: wait until it's included or leaves the mempool (it's valid until block {})", high.valid_until)), "{e}");
+    assert!(!e.contains("tipping at least"), "no tip past the cap: {e}");
+    // A replacement tipping its whole cap: refused, the same way.
+    let at_cap = stand_in_shield(&mut n, &carol, 0, 0);
+    let full = cap_of(&n, &at_cap);
+    let at_cap = stand_in_shield(&mut n, &carol, 0, full);
+    let e = err(n.c.submit(at_cap.clone()));
+    assert!(e.contains(&format!("your queued shield (nonce 0) can't be replaced by this one: outbidding it takes a tip past a replacement's cap at the current base fee ({} drops)", at_cap.tip)) && !e.contains("tip at least"), "{e}");
+    // What the old hint named is past the cap: the fee check refuses it.
+    let past = stand_in_shield(&mut n, &carol, 0, displacing_tip(high.tip, base));
+    assert!(err(n.c.submit(past)).contains("tip too high"));
+    // The way out: it's included, and the account queues again.
+    assert!(n.c.in_mempool(&high.id()));
+    assert_eq!(n.block(vec![high]), [true]);
+    n.c.submit(behind.sign(&carol)).unwrap();
+    n.cleanup();
+}
+
+/// Review of r3-consensus (the same class in `mempool_admit`'s same-note branch, which predates
+/// round 3): a tx spending a note a queued tx spends replaces it only by outbidding it, and when
+/// that takes a tip past the newcomer's cap the refusal says to wait rather than naming it (for
+/// an unsigned tx, the cap on the fee grid).
+#[test]
+fn a_same_note_replacement_never_names_a_tip_past_the_cap() {
+    let mut n = net("samecap", true, 1, &[]);
+    let alice = Keys::from_seed([74; 32]);
+    let shield = stand_in_shield(&mut n, &alice, 0, 0);
+    // Two unsigned spends of the same notes (the stand-in's bundle), the queued one tipping
+    // `queued`; the newcomer is the same size.
+    let spend = |tip: u64| Tx { from: String::new(), nonce: 0, public_key: String::new(), signature: String::new(), tip, fee: 0, action: Action::PrivateTransfer { bundle: Box::new(shield.action.ghost_bundle().unwrap().clone()) }, ..shield.clone() };
+    let relay = crate::econ::base_fee(&n.c.state, n.c.height() + 1, spend(0).size());
+    let cap = crate::econ::max_tip(&n.c.state, relay);
+    let grid_cap = cap / FEE_GRID * FEE_GRID;
+    let admit = |queued: u64, tip: u64| mempool_admit(&[spend(queued)], &["queued".to_string()], &spend(tip), None, relay, cap, true).map_err(|e| e.to_string());
+    // Within the cap: the refusal names the tip that gets in, and that tip does.
+    let low = 2 * FEE_GRID;
+    let need = displacing_tip(low, relay);
+    assert!(need <= grid_cap);
+    assert!(admit(low, need - FEE_GRID).unwrap_err().contains(&format!("pay a tip of at least {need} drops")));
+    assert_eq!(admit(low, need).unwrap(), vec![("queued".to_string(), "replaced by a transaction spending the same note with a higher tip")]);
+    // Queued near the cap: outbidding it is past the grid cap, so the refusal says to wait.
+    let near = grid_cap - FEE_GRID;
+    assert!(displacing_tip(near, relay) > grid_cap);
+    let e = admit(near, grid_cap).unwrap_err();
+    assert!(e.contains(&format!("it tips more than this one may (at most {grid_cap} drops), so it can't be replaced at the current base fee: wait until it's included or leaves the mempool")) && !e.contains("at least"), "{e}");
     n.cleanup();
 }
 

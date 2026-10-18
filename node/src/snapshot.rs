@@ -476,6 +476,17 @@ impl Verified {
         self.blocks.get(usize::try_from(i).ok()?).map(|b| hex::encode(b.digest_bytes()))
     }
 
+    /// The time (`timestamp_ms`) of the block at `height`, if the manifest holds that block: the
+    /// epoch anchor or one of the manifest's blocks (the snapshot's own block is only a hash).
+    pub fn time_at(&self, height: u64) -> Option<u64> {
+        if self.epoch_start.as_ref().is_some_and(|(a, _)| *a == height) {
+            let block = hex::decode(&self.anchor.as_ref()?.block).ok()?;
+            return CBlock::decode(block.as_slice()).ok().map(|b| b.timestamp_ms);
+        }
+        let i = height.checked_sub(self.height.saturating_add(1))?;
+        self.blocks.get(usize::try_from(i).ok()?).map(|b| b.timestamp_ms)
+    }
+
     /// Checks the snapshot against the checkpoints this node trusts (`checkpoints.rs`). The
     /// manifest proves blocks from the snapshot on (and the anchor), and the validator sets up to
     /// its last block's epoch: a checkpoint is checked against whichever of those it names. One
@@ -485,6 +496,12 @@ impl Verified {
     pub fn check_trust(&self, trust: &crate::checkpoints::Trust) -> Result<()> {
         let last = self.blocks.last().map(|b| b.height).unwrap_or(self.height);
         let last_epoch = trust.epoch_of(last);
+        // The first block after the snapshot is no earlier than the timed checkpoints before it
+        // allow (review-r3-sync-1: a recorded time can't claim the checkpoint is fresher than it is
+        // by more than the slots missed since).
+        if let Some(b) = self.blocks.first() {
+            trust.check_block(b.height, &hex::encode(b.digest_bytes()), Some(b.timestamp_ms))?;
+        }
         let (mut unchecked, mut newest_pin) = (vec![], None);
         for cp in trust.checkpoints().filter(|c| c.height > 0) {
             if cp.height > last {
@@ -492,7 +509,7 @@ impl Verified {
             }
             let mut checked = false;
             if let Some(hash) = self.hash_at(cp.height) {
-                trust.check_block(cp.height, &hash)?;
+                trust.check_block(cp.height, &hash, self.time_at(cp.height))?;
                 checked = true;
             }
             let pinned = trust.pinned_epoch(cp);
@@ -1160,7 +1177,7 @@ mod tests {
         let v = verify_manifest(&g, &manifest(&g, &seeds, 104), &steady(&g, 10)).unwrap();
         let real_set = crate::checkpoints::genesis_checkpoint(&g).set_hash;
         let trust = |cps: Vec<Checkpoint>| Trust::new(&g, &Pins { checkpoints: cps, ..Default::default() }, false).unwrap();
-        let cp = |height: u64, hash: &str, set_hash: Option<String>| Checkpoint { height, hash: hash.into(), set_hash };
+        let cp = |height: u64, hash: &str, set_hash: Option<String>| Checkpoint { height, hash: hash.into(), set_hash, timestamp_ms: None };
         let (other, at) = ("ab".repeat(32), |h: u64| v.hash_at(h).unwrap());
         for h in [99, 100, 103] {
             v.check_trust(&trust(vec![cp(h, &at(h), None)])).unwrap();
@@ -1198,7 +1215,7 @@ mod tests {
         }
         let forged = manifest(&g, &evil, 104);
         let v = verify_manifest(&g, &forged, &reg).expect("the history verifies from the genesis: that's the attack");
-        let pinned = |set_hash: Option<String>| Trust::new(&g, &Pins { checkpoints: vec![Checkpoint { height: 75, hash: "ab".repeat(32), set_hash }], ..Default::default() }, false).unwrap();
+        let pinned = |set_hash: Option<String>| Trust::new(&g, &Pins { checkpoints: vec![Checkpoint { height: 75, hash: "ab".repeat(32), set_hash, timestamp_ms: None }], ..Default::default() }, false).unwrap();
         let err = v.check_trust(&pinned(crate::checkpoints::genesis_checkpoint(&g).set_hash)).unwrap_err().to_string();
         assert!(err.contains("epoch 7") && err.contains("forged"), "{err}");
         std::fs::remove_dir_all(root).ok();
@@ -1336,12 +1353,12 @@ mod tests {
         assert!(format!("{:#}", verify_manifest_trusted(&g, &m, &kept, &genesis_only).err().unwrap()).contains("--checkpoint"));
         // A checkpoint at #49 pins epoch 5's set (the set certifying #50).
         let set_hash = Some(hex::encode(epochs::set_hash(&keys(&seeds))));
-        let pinned = Trust::new(&g, &Pins { checkpoints: vec![Checkpoint { height: 49, hash: "ab".repeat(32), set_hash }], ..Default::default() }, false).unwrap();
+        let pinned = Trust::new(&g, &Pins { checkpoints: vec![Checkpoint { height: 49, hash: "ab".repeat(32), set_hash, timestamp_ms: None }], ..Default::default() }, false).unwrap();
         assert_eq!(trusted_root(&g, &m, &pinned).epoch, 5);
         let v = verify_manifest_trusted(&g, &m, &kept, &pinned).unwrap();
         assert_eq!((v.epochs.base, v.epochs.known_through), (5, 10));
         // A pin the window contradicts is a forgery.
-        let wrong = Trust::new(&g, &Pins { checkpoints: vec![Checkpoint { height: 49, hash: "ab".repeat(32), set_hash: Some("cd".repeat(32)) }], ..Default::default() }, false).unwrap();
+        let wrong = Trust::new(&g, &Pins { checkpoints: vec![Checkpoint { height: 49, hash: "ab".repeat(32), set_hash: Some("cd".repeat(32)), timestamp_ms: None }], ..Default::default() }, false).unwrap();
         assert!(format!("{:#}", verify_manifest_trusted(&g, &m, &kept, &wrong).err().unwrap()).contains("forged"));
         std::fs::remove_dir_all(root).ok();
     }
@@ -1674,7 +1691,7 @@ mod tests {
         assert!(e.contains("past any height the chain can have reached"), "{e}");
         assert!(!hits.lock().clone().contains_key("future/epochs"));
         // Behind the joiner's checkpoint (#200 > #104): wait for a later snapshot.
-        let ahead = Trust::new(&g, &Pins { checkpoints: vec![Checkpoint { height: 200, hash: "ab".repeat(32), set_hash: None }], ..Default::default() }, false).unwrap();
+        let ahead = Trust::new(&g, &Pins { checkpoints: vec![Checkpoint { height: 200, hash: "ab".repeat(32), set_hash: None, timestamp_ms: None }], ..Default::default() }, false).unwrap();
         let e = fast_sync_with(&chain, &[url("behind")], &ahead, &limits).await.unwrap_err();
         assert!(e.chain().any(|c| c.is::<SnapshotBehind>()), "{e:#}");
         assert!(!hits.lock().clone().contains_key("behind/epochs"));

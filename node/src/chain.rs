@@ -2754,6 +2754,12 @@ impl Chain {
         self.head.as_deref()
     }
 
+    /// This node's newest executed block for sync trust (`checkpoints::Trust::stale`): its height
+    /// and, when the node holds it (not at a fast-sync base it hasn't built on yet), its time.
+    pub fn head_time(&self) -> (u64, Option<u64>) {
+        (self.height, self.head.as_ref().filter(|b| b.height == self.height).map(|b| b.timestamp_ms))
+    }
+
     // Tests read through the chain; the API reads the published view directly.
 
     /// Executed block at `height`, if this node holds it.
@@ -3461,7 +3467,7 @@ impl Chain {
         let own = match (!unsigned).then(|| self.queued_shield(&sender)).flatten() {
             Some((i, last)) if tx.nonce >= self.mempool[i].nonce => {
                 let shield = &self.mempool[i];
-                crate::ghost::behind_shield(shield, last, &tx, relay, crate::econ::base_fee(&self.state, next, shield.size()))?;
+                crate::ghost::behind_shield(shield, last, &tx, relay, crate::econ::base_fee(&self.state, next, shield.size()), |base| crate::econ::max_tip(&self.state, base))?;
                 Some(i)
             }
             _ => None,

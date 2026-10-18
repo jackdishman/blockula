@@ -623,7 +623,7 @@ async fn maybe_fast_sync(chain: &Shared, peers: &[String], full: bool, trust: &T
                 // state could hide such a change, so this only catches the honest case.
                 let mut live = trust.clone();
                 let shorter = live.follow(&chain.lock().state.chain_params);
-                if let Some(why) = live.stale(0, crate::chain::now_ms()).filter(|_| shorter) {
+                if let Some(why) = live.stale((0, None), crate::chain::now_ms()).filter(|_| shorter) {
                     eprintln!("⚠️  under the chain's parameters in force: {why}; if in doubt, wipe this home and join again with that checkpoint");
                 }
                 return;
@@ -806,10 +806,11 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
         rt.block_on(async {
             // An empty home also heeds the period its peers report (gap-6-1); a validator warns.
             if empty {
+                learn_checkpoint_time(&mut trust, &peers).await;
                 heed_peers(&mut trust, &peers, false).await;
             }
-            let height = shared.lock().height();
-            if let Some(why) = trust.stale(height, crate::chain::now_ms()) {
+            let own = shared.lock().head_time();
+            if let Some(why) = trust.stale(own, crate::chain::now_ms()) {
                 eprintln!("⚠️  {why}. Validators get recent checkpoints with each release: run the latest one.");
             }
             let trust = Arc::new(trust);
@@ -949,6 +950,21 @@ async fn heed_peers(trust: &mut Trust, peers: &[String], wait: bool) -> usize {
     }
 }
 
+/// An empty home whose newest checkpoint records no time (one in an older form) reads it from a
+/// peer's copy of that block (whose hash covers it), so the root's age counts from the checkpoint
+/// rather than from the genesis, where every slot the chain ever missed adds up (review-r3-sync-1).
+/// Without one, it says so: the age then counts from the genesis.
+async fn learn_checkpoint_time(trust: &mut Trust, peers: &[String]) {
+    let Some((height, hash)) = trust.untimed_newest() else { return };
+    match crate::checkpoints::peer_block_time(peers, height, &hash, STATUS_TIMEOUT).await {
+        Some((peer, time)) => match trust.learn_time(height, time) {
+            Ok(()) => println!("🕰️  checkpoint #{height} records no time; its block (from {peer}, whose copy hashes to it) carries {time}: its age counts from there"),
+            Err(e) => eprintln!("⚠️  checkpoint #{height}'s block carries the time {time}, which the other trusted checkpoints rule out ({e:#}): its age counts from the genesis"),
+        },
+        None => println!("ℹ️  checkpoint #{height} records no time, and no peer serves its block: its age counts from the genesis, so every slot the chain missed since adds to it (`blockula checkpoint` prints the HEIGHT:HASH:SET_HASH:TIMESTAMP_MS form)"),
+    }
+}
+
 /// Prepares a full-node home: genesis.json (copied or fetched from a node) + join.json.
 /// The genesis must be pinned: by `pins.genesis_hash`, or by this binary for a known chain id
 /// (`checkpoints.rs`). Checkpoints must agree with it, and the newest root must be younger than
@@ -967,16 +983,17 @@ pub fn join(genesis: &str, home: &Path, pins: &Pins, fast: bool) -> Result<()> {
         (Genesis::load(Path::new(genesis))?, vec![])
     };
     let mut trust = Trust::new(&g, pins, true)?;
-    trust.check_fresh(0, crate::chain::now_ms())?;
     for u in http_peers(&g, &[], None) {
         if !peers.contains(&u) {
             peers.push(u);
         }
     }
+    rt.block_on(learn_checkpoint_time(&mut trust, &peers));
+    trust.check_fresh((0, None), crate::chain::now_ms())?;
     if rt.block_on(heed_peers(&mut trust, &peers, false)) == 0 && !peers.is_empty() {
         println!("ℹ️  no peer answered /api/status for this chain: the weak-subjectivity period in force is checked again when the node first starts");
     }
-    trust.check_fresh(0, crate::chain::now_ms())?;
+    trust.check_fresh((0, None), crate::chain::now_ms())?;
     match trust.newest() {
         0 => println!("🔐 genesis {} pinned", trust.genesis_hash),
         h => println!("🔐 genesis {} pinned; newest trusted checkpoint #{h}", trust.genesis_hash),
@@ -1003,17 +1020,20 @@ pub fn run_full_node(home: PathBuf, net: NetOpts) -> Result<()> {
     // under the weak-subjectivity period of the parameters in force in this node's own state.
     let mut trust = Trust::new(&chain.genesis, &jc.pins, false)?;
     trust.follow(&chain.state.chain_params);
+    let peers = if net.peer_http.is_empty() { jc.peers } else { http_peers(&chain.genesis, &net.peer_http, None) };
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     // An empty home is where a stale root bites (a fresh sync); a synced one trusts its own head.
-    let (empty, height) = (chain.height() == 0 && chain.base.is_none(), chain.height());
-    trust.check_fresh(height, crate::chain::now_ms())?;
+    let (empty, own) = (chain.height() == 0 && chain.base.is_none(), chain.head_time());
+    if empty {
+        rt.block_on(learn_checkpoint_time(&mut trust, &peers));
+    }
+    trust.check_fresh(own, crate::chain::now_ms())?;
     let keep = net.pruning.keep(false, &chain.state);
     chain.set_pruning(keep);
     // A halted full node keeps serving reads at its height, with the reason in /api/health.
     crate::upgrade::configure(&mut chain, consensus::SUPPORTED_PROTOCOL_VERSION, net.halt_height);
-    let peers = if net.peer_http.is_empty() { jc.peers } else { http_peers(&chain.genesis, &net.peer_http, None) };
     println!("🦇 Full node for `{}` at height {} — syncing from {}", chain.genesis.chain_id, chain.height(), peers.join(", "));
     let shared: Shared = Arc::new(Mutex::new(chain));
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let fast = jc.fast && !net.full;
     rt.block_on(async move {
         // The API and explorer come up immediately, while syncing.
@@ -1022,7 +1042,7 @@ pub fn run_full_node(home: PathBuf, net: NetOpts) -> Result<()> {
         // an empty home waits for a peer's answer and refuses a root too old for it (`join` asked
         // too, but governance may have acted since); a synced one only warns.
         heed_peers(&mut trust, &peers, empty).await;
-        if let Some(why) = trust.check_fresh(height, crate::chain::now_ms())? {
+        if let Some(why) = trust.check_fresh(own, crate::chain::now_ms())? {
             eprintln!("⚠️  {why}");
         }
         let trust = Arc::new(trust);
@@ -1419,7 +1439,7 @@ pub(crate) fn apply_batch_trusted(chain: &Shared, verifier: &MlDsaScheme, epoch:
     let (blocks, fin_bytes) = verify_batch(chain, verifier, epoch, batch)?;
     if let Some(t) = trust {
         for b in &blocks {
-            t.check_block(b.height, &hex::encode(b.digest_bytes()))?;
+            t.check_block(b.height, &hex::encode(b.digest_bytes()), Some(b.timestamp_ms))?;
         }
     }
     // One block at a time, the chain lock held only for the in-memory parts (sync is this
@@ -1566,10 +1586,10 @@ mod tests {
         assert!(err.contains("--genesis-hash") && err.contains(&hash), "{err}");
         assert!(!root.join("full-none").exists(), "a refused join writes nothing");
         assert!(try_join(&gpath, "full-bad", &pin(&"00".repeat(32))).unwrap_err().to_string().contains("mismatch"));
-        let wrong_genesis = Pins { checkpoints: vec![Checkpoint { height: 0, hash: "ab".repeat(32), set_hash: None }], ..pin(&hash) };
+        let wrong_genesis = Pins { checkpoints: vec![Checkpoint { height: 0, hash: "ab".repeat(32), set_hash: None, timestamp_ms: None }], ..pin(&hash) };
         assert!(try_join(&gpath, "full-cp0", &wrong_genesis).unwrap_err().to_string().contains("checkpoint #0"));
         // Pinned: joined, and `run` finds the pins in join.json.
-        let pins = Pins { checkpoints: vec![Checkpoint { height: 5, hash: "cd".repeat(32), set_hash: None }], ..pin(&hash) };
+        let pins = Pins { checkpoints: vec![Checkpoint { height: 5, hash: "cd".repeat(32), set_hash: None, timestamp_ms: None }], ..pin(&hash) };
         try_join(&gpath, "full-ok", &pins).unwrap();
         let jc: JoinConfig = serde_json::from_slice(&std::fs::read(root.join("full-ok").join("join.json")).unwrap()).unwrap();
         assert_eq!(jc.pins, pins);
@@ -1614,7 +1634,7 @@ mod tests {
         };
         let url = serve(crate::api::router(crate::api::Node::new(chain.clone(), None, vec![], Default::default()))).await;
         let day = 86_400_000 / g.block_time_ms;
-        let pins = |at: u64| Pins { genesis_hash: Some(hash.clone()), checkpoints: vec![Checkpoint { height: at, hash: "cd".repeat(32), set_hash: None }], ..Default::default() };
+        let pins = |at: u64| Pins { genesis_hash: Some(hash.clone()), checkpoints: vec![Checkpoint { height: at, hash: "cd".repeat(32), set_hash: None, timestamp_ms: None }], ..Default::default() };
         let try_join = |from: &str, name: &str, pins: Pins| {
             let (from, home) = (from.to_string(), root.join(name));
             tokio::task::spawn_blocking(move || join(&from, &home, &pins, true))
@@ -1637,9 +1657,9 @@ mod tests {
         let jc: JoinConfig = serde_json::from_slice(&std::fs::read(root.join("before").join("join.json")).unwrap()).unwrap();
         assert!(jc.peers.contains(&url));
         let mut trust = Trust::new(&g, &jc.pins, false).unwrap();
-        assert_eq!(trust.check_fresh(0, crate::chain::now_ms()).unwrap(), None, "by this release alone: fresh");
+        assert_eq!(trust.check_fresh((0, None), crate::chain::now_ms()).unwrap(), None, "by this release alone: fresh");
         assert_eq!(heed_peers(&mut trust, &jc.peers, true).await, 1, "the peer answered; the genesis validator's address didn't");
-        assert!(trust.check_fresh(0, crate::chain::now_ms()).unwrap_err().to_string().contains("~7.0 days"));
+        assert!(trust.check_fresh((0, None), crate::chain::now_ms()).unwrap_err().to_string().contains("~7.0 days"));
         // A liar claiming a 1-block period is held to the floor: a week-old checkpoint still joins.
         let status = |genesis_hash: String| move || {
             let genesis_hash = genesis_hash.clone();
@@ -1688,14 +1708,112 @@ mod tests {
         let verifier = consensus::EpochProvider::new(chain.clone(), None).epoch_scheme(0).unwrap();
         let hash2 = hex::encode(blocks[2].digest_bytes());
         let genesis_set = crate::checkpoints::genesis_checkpoint(&g).set_hash;
-        let trust = |hash: &str, set: Option<String>| Trust::new(&g, &Pins { checkpoints: vec![Checkpoint { height: 2, hash: hash.into(), set_hash: set }], ..Default::default() }, false).unwrap();
+        let timed = |height: u64, hash: &str, set: Option<String>, time: Option<u64>| Trust::new(&g, &Pins { checkpoints: vec![Checkpoint { height, hash: hash.into(), set_hash: set, timestamp_ms: time }], ..Default::default() }, false).unwrap();
+        let trust = |hash: &str, set: Option<String>| timed(2, hash, set, None);
         let err = apply_batch_trusted(&chain, &verifier, 0, &batch, Some(&trust(&"ab".repeat(32), None))).unwrap_err().to_string();
         assert!(err.contains("another chain"), "{err}");
         let err = apply_batch_trusted(&chain, &verifier, 0, &batch, Some(&trust(&hash2, Some("cd".repeat(32))))).unwrap_err().to_string();
         assert!(err.contains("forged validator-set history"), "{err}");
+        // review-r3-sync-1: a checkpoint's recorded time is the block's (its hash covers it), and
+        // later blocks are no earlier than it allows: a checkpoint claiming to be fresher than it
+        // is gets caught by the blocks.
+        let at2 = blocks[2].timestamp_ms;
+        let err = apply_batch_trusted(&chain, &verifier, 0, &batch, Some(&timed(2, &hash2, genesis_set.clone(), Some(at2 + 1)))).unwrap_err().to_string();
+        assert!(err.contains("carries the time") && err.contains("the checkpoint's time is wrong"), "{err}");
+        let hash1 = hex::encode(blocks[1].digest_bytes());
+        let err = apply_batch_trusted(&chain, &verifier, 0, &batch, Some(&timed(1, &hash1, None, Some(blocks[1].timestamp_ms + 500)))).unwrap_err().to_string();
+        assert!(err.contains("block #1") && err.contains("the checkpoint's time is wrong"), "{err}");
         assert_eq!(chain.lock().height(), 0, "nothing executed");
-        apply_batch_trusted(&chain, &verifier, 0, &batch, Some(&trust(&hash2, genesis_set))).unwrap();
+        apply_batch_trusted(&chain, &verifier, 0, &batch, Some(&timed(2, &hash2, genesis_set, Some(at2)))).unwrap();
         assert_eq!(chain.lock().hash_at(2), Some(hash2));
+        drop(chain);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// review-r3-sync-1, for a checkpoint in an older form (no time): a chain a year old whose
+    /// blocks only started a minute ago (a year of missed slots, the extreme of an aging chain).
+    /// Counted from the genesis, a checkpoint at its tip is a year old, and `join` refuses it. An
+    /// empty home reads the time from a peer's copy of the checkpoint's block (`/api/sync`, the
+    /// consensus block, whose hash covers its time), so it's a minute old and joins. A peer
+    /// serving junk or another block is passed over; without a copy, the age counts from the
+    /// genesis as before.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_untimed_checkpoint_counts_from_its_blocks_time() {
+        use crate::checkpoints::Checkpoint;
+        use axum::{routing::get, Json, Router};
+        use commonware_codec::Encode as _;
+        use commonware_consensus::simplex::types::{Finalize, Proposal};
+        use commonware_consensus::types::{Epoch, Round, View};
+        let root = home("cptime");
+        let homes = Chain::summon(&root, &SummonOpts::new("cptime", 1)).unwrap();
+        let gpath = homes[0].join("genesis.json");
+        let mut g = Genesis::load(&gpath).unwrap();
+        g.created_at_ms -= 365 * 86_400_000;
+        std::fs::write(&gpath, serde_json::to_string_pretty(&g).unwrap()).unwrap();
+        let seed: [u8; 32] = hex::decode(std::fs::read_to_string(homes[0].join("validator.key")).unwrap().trim()).unwrap().try_into().unwrap();
+        let source = root.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::copy(&gpath, source.join("genesis.json")).unwrap();
+        let chain: Shared = Arc::new(Mutex::new(Chain::open(&source).unwrap()));
+        // Blocks 1..=3, a minute ago, the last certified by the one validator.
+        let start = crate::chain::now_ms() - 60_000;
+        let root_hash = consensus::hex_32(&g.initial_state().root());
+        let mut blocks = vec![consensus::genesis_block(&g)];
+        for h in 1..=3u64 {
+            let parent = blocks.last().unwrap().digest();
+            blocks.push(CBlock::new(parent, h, h, h - 1, start + 1000 * h, g.validators[0].address.clone(), 0, root_hash, vec![]));
+        }
+        let scheme = MlDsaScheme::signer(&consensus::genesis_namespace(&g), consensus::participants(&g).unwrap(), PrivateKey::from_seed_bytes(seed)).unwrap();
+        let vote = Finalize::sign(&scheme, Proposal::new(Round::new(Epoch::new(0), View::new(3)), View::new(2), blocks[3].digest())).unwrap();
+        let fin = Finalization::from_finalizes(&scheme, commonware_utils::iter::NonEmpty::try_new([vote].iter()).unwrap(), &commonware_parallel::Sequential).unwrap();
+        let batch = SyncBatch { tip: 3, blocks: blocks[1..].iter().map(|b| hex::encode(b.encode())).collect(), to: Some(3), finalization: Some(hex::encode(fin.encode())) };
+        let verifier = consensus::EpochProvider::new(chain.clone(), None).epoch_scheme(0).unwrap();
+        apply_batch_trusted(&chain, &verifier, 0, &batch, None).unwrap();
+        chain.lock().set_pruning(None); // publishes the state to the API
+        let serve = |app: Router| async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap() });
+            url
+        };
+        let url = serve(crate::api::router(crate::api::Node::new(chain.clone(), None, vec![], Default::default()))).await;
+        let (hash, hash2, t2) = (crate::checkpoints::genesis_hash(&g), hex::encode(blocks[2].digest_bytes()), blocks[2].timestamp_ms);
+        // A peer serving junk, or block #3 as #2, is passed over; the honest copy is read.
+        let b3 = hex::encode(blocks[3].encode());
+        let junk = serve(Router::new().route("/api/sync", get(|| async { Json(serde_json::json!({ "blocks": ["00ff"] })) }))).await;
+        let wrong = serve(Router::new().route("/api/sync", get(move || async move { Json(serde_json::json!({ "blocks": [b3] })) }))).await;
+        let peers = [junk.clone(), wrong.clone(), url.clone()];
+        assert_eq!(crate::checkpoints::peer_block_time(&peers, 2, &hash2, STATUS_TIMEOUT).await, Some((url.clone(), t2)));
+        assert_eq!(crate::checkpoints::peer_block_time(&peers[..2], 2, &hash2, STATUS_TIMEOUT).await, None);
+        assert_eq!(crate::checkpoints::peer_block_time(&peers, 2, &"ab".repeat(32), STATUS_TIMEOUT).await, None, "no block hashes to another hash");
+        // Counted from the genesis, the tip is a year old; from its block's time, a minute.
+        let pins = |hash2: &str| Pins { genesis_hash: Some(hash.clone()), checkpoints: vec![Checkpoint { height: 2, hash: hash2.into(), set_hash: None, timestamp_ms: None }], ..Default::default() };
+        let mut trust = Trust::new(&g, &pins(&hash2), true).unwrap();
+        let err = trust.check_fresh((0, None), crate::chain::now_ms()).unwrap_err().to_string();
+        assert!(err.contains("~364.9 days") || err.contains("~365.0 days"), "{err}");
+        learn_checkpoint_time(&mut trust, std::slice::from_ref(&url)).await;
+        assert_eq!(trust.check_fresh((0, None), crate::chain::now_ms()).unwrap(), None);
+        assert_eq!(trust.checkpoints().next().unwrap().timestamp_ms, Some(t2));
+        // A time the other checkpoints rule out isn't learned (a later timed checkpoint can't be
+        // closer than the blocks between them allow).
+        let mut pinned = pins(&hash2);
+        pinned.checkpoints.push(Checkpoint { height: 5, hash: "cd".repeat(32), set_hash: None, timestamp_ms: Some(t2 + 1000) });
+        let mut ruled_out = Trust::new(&g, &pinned, true).unwrap();
+        assert!(ruled_out.learn_time(2, t2).unwrap_err().to_string().contains("checkpoint #5 records"));
+        assert_eq!(ruled_out.untimed_newest(), None, "the newest (#5) records its time");
+        assert_eq!(ruled_out.checkpoints().next().unwrap().timestamp_ms, None, "unchanged");
+        // `join` learns it the same way, and refuses (from the genesis' line) when no peer can
+        // show the block, or the checkpoint names another one.
+        let try_join = |name: &str, pins: Pins| {
+            let (from, home) = (url.clone(), root.join(name));
+            tokio::task::spawn_blocking(move || join(&from, &home, &pins, true))
+        };
+        try_join("joined", pins(&hash2)).await.unwrap().unwrap();
+        let err = try_join("refused", pins(&"cd".repeat(32))).await.unwrap().unwrap_err().to_string();
+        assert!((err.contains("~364.9 days") || err.contains("~365.0 days")) && err.contains("TIMESTAMP_MS"), "{err}");
+        // The joined home's first start reads it again (join.json keeps what the operator passed).
+        let jc: JoinConfig = serde_json::from_slice(&std::fs::read(root.join("joined").join("join.json")).unwrap()).unwrap();
+        assert_eq!(jc.pins, pins(&hash2));
         drop(chain);
         std::fs::remove_dir_all(root).ok();
     }
