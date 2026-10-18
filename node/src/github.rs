@@ -324,6 +324,9 @@ pub struct FileDiff {
     /// A renamed file's old name.
     pub previous_filename: Option<String>,
     pub patch: Option<String>,
+    /// How many lines GitHub counts as changed (`changes`): 0 for a pure rename or mode change,
+    /// which has no `patch` either.
+    pub changes: Option<u64>,
 }
 
 impl FileDiff {
@@ -350,6 +353,7 @@ pub fn parse_files(v: &Value) -> Vec<FileDiff> {
                 sha: f["sha"].as_str().filter(|h| is_sha(h)).map(str::to_ascii_lowercase),
                 previous_filename: text(&f["previous_filename"]),
                 patch: f["patch"].as_str().map(String::from),
+                changes: f["changes"].as_u64(),
             })
         })
         .collect()
@@ -390,12 +394,17 @@ fn restores(f: &FileDiff, revert: &[FileDiff], base: &BTreeMap<String, String>) 
         "modified" | "changed" | "renamed" => {
             let Some(blob) = base.get(f.before()) else { return false };
             let back = named(f.before()).is_some_and(|r| r.status != "removed" && r.sha.as_ref() == Some(blob));
-            // A rename is undone by renaming back, or by removing the new name and adding the old.
-            let gone = f.status != "renamed" || named(f.before()).is_some_and(|r| r.previous_filename.as_deref() == Some(f.filename.as_str())) || named(&f.filename).is_some_and(|r| r.status == "removed");
-            back && gone
+            back && (f.status != "renamed" || renamed_back(f, revert))
         }
         _ => false,
     }
+}
+
+/// Whether `revert` undoes the rename of `original`'s file `f`: renames it back, or removes the
+/// new name and adds the old one.
+fn renamed_back(f: &FileDiff, revert: &[FileDiff]) -> bool {
+    let named = |name: &str| revert.iter().find(|r| r.filename == name);
+    named(f.before()).is_some_and(|r| r.previous_filename.as_deref() == Some(f.filename.as_str())) || (named(&f.filename).is_some_and(|r| r.status == "removed") && named(f.before()).is_some_and(|r| r.status == "added"))
 }
 
 /// Lines a patch adds and removes, by content ([`changed_lines`]).
@@ -407,12 +416,25 @@ fn lines_of(f: &FileDiff) -> Option<Lines<'_>> {
     f.patch.as_deref().map(changed_lines).filter(|(added, removed)| !added.is_empty() || !removed.is_empty())
 }
 
+/// A file the PR changed in place or renamed without changing a line that counts: its patch
+/// changes only blank lines, or GitHub counts no changed line (a pure rename or mode change). Its
+/// blob isn't what the PR is about, so no revert has to give that exact blob back, which a later
+/// change to the file would make impossible (audit review-r4-poc-1: one blank line in a busy file
+/// made a reverted PR revert-proof). A rename still has to be undone.
+fn no_substance(f: &FileDiff) -> bool {
+    matches!(f.status.as_str(), "modified" | "changed" | "renamed") && lines_of(f).is_none() && (f.patch.is_some() || f.changes == Some(0))
+}
+
 /// Whether the diff `revert` brings `original`'s file `f`, which has no lines to compare, back to
 /// its pre-PR state ([`restores`]), when that can be told: a file the PR added, copied or removed
 /// always can; one it changed or renamed when its blob at the PR's base is known (`base`,
 /// [`base_blobs`]), or when `revert` doesn't touch it at all (then it can't have brought it back).
-/// `None`: `revert` changes it, to a blob that can't be compared.
+/// One with [`no_substance`] is judged by its rename alone, and isn't judged if it wasn't renamed.
+/// `None`: nothing to judge, or `revert` changes it to a blob that can't be compared.
 fn restored(f: &FileDiff, revert: &[FileDiff], base: &BTreeMap<String, String>) -> Option<bool> {
+    if no_substance(f) {
+        return (f.status == "renamed").then(|| renamed_back(f, revert));
+    }
     match f.status.as_str() {
         "added" | "copied" | "removed" => Some(restores(f, revert, base)),
         "modified" | "changed" | "renamed" if base.contains_key(f.before()) => Some(restores(f, revert, base)),
@@ -427,7 +449,8 @@ fn restored(f: &FileDiff, revert: &[FileDiff], base: &BTreeMap<String, String>) 
 /// Whether the diff `revert` undoes the diff `original` (audit F20: a revert must actually revert
 /// the claim's change, not just say so), judged on both kinds of file the PR has:
 /// * its lines: more than half of the lines `original` added and removed, file by file, are
-///   removed and added back by `revert`;
+///   removed and added back by `revert` (a renamed file's under either name: audit
+///   review-fix-poc-3);
 /// * its files with no lines to compare (binary files, diffs too large for GitHub to show): more
 ///   than half of those it can tell about are brought back to their pre-PR state ([`restored`];
 ///   audit review-fix-poc-3, review-r2-poc-1). A file `revert` changes whose pre-PR blob GitHub
@@ -449,8 +472,25 @@ pub fn undoes(original: &[FileDiff], revert: &[FileDiff], base: &BTreeMap<String
             continue;
         };
         total += added.values().sum::<usize>() + removed.values().sum::<usize>();
-        let Some(r) = revert.iter().find(|r| r.filename == f.filename).and_then(|r| r.patch.as_deref()) else { continue };
-        let (r_added, r_removed) = changed_lines(r);
+        // The candidate's lines for the file: under its name, or for a renamed one also renamed
+        // back (under the old name), or its new name removed and its old one added back (audit
+        // review-fix-poc-3: `git revert` renames a file renamed with edits back).
+        let entry = |name: &str| revert.iter().find(|r| r.filename == name);
+        fn lines(r: Option<&FileDiff>) -> Option<Lines<'_>> {
+            r.and_then(|r| r.patch.as_deref()).map(changed_lines)
+        }
+        let undone = match entry(&f.filename) {
+            Some(r) if f.before() == f.filename || r.status != "removed" => lines(Some(r)),
+            _ if f.before() == f.filename => None,
+            gone => match entry(f.before()) {
+                Some(back) if back.previous_filename.as_deref() == Some(f.filename.as_str()) => lines(Some(back)),
+                back => match (lines(gone), lines(back)) {
+                    (None, None) => None,
+                    (gone, back) => Some((back.map(|b| b.0).unwrap_or_default(), gone.map(|g| g.1).unwrap_or_default())),
+                },
+            },
+        };
+        let Some((r_added, r_removed)) = undone else { continue };
         let overlap = |a: &BTreeMap<&str, usize>, b: &BTreeMap<&str, usize>| a.iter().map(|(l, n)| (*n).min(b.get(l).copied().unwrap_or(0))).sum::<usize>();
         matched += overlap(&added, &r_removed) + overlap(&removed, &r_added);
     }
@@ -463,7 +503,7 @@ pub fn undoes(original: &[FileDiff], revert: &[FileDiff], base: &BTreeMap<String
 /// The files of `original` with no lines to compare whose pre-PR blob a revert must bring back
 /// (changed or renamed ones): their paths before the PR.
 fn needs_base(original: &[FileDiff]) -> Vec<&str> {
-    original.iter().filter(|f| lines_of(f).is_none() && matches!(f.status.as_str(), "modified" | "changed" | "renamed")).map(FileDiff::before).collect()
+    original.iter().filter(|f| lines_of(f).is_none() && !no_substance(f) && matches!(f.status.as_str(), "modified" | "changed" | "renamed")).map(FileDiff::before).collect()
 }
 
 /// Most pages of commits since the merge a revert check reads (100 each), most revert-looking
@@ -705,10 +745,10 @@ fn tree_entries(v: &Value) -> Tree {
 /// (`GET /repos/{repo}/git/trees/{base}?recursive=1`: every file's blob, whatever its size or its
 /// directory's), one request however many files and directories the PR spans (audit
 /// review-r3-poc-1: reading at most 3 directories' listings, each capped at 1,000 entries, left
-/// a PR spread over 6 directories revert-proof). If GitHub truncates the tree (a repo of more than
-/// 100,000 entries) or it's over the size cap, the paths it doesn't name are looked up a tree
-/// level at a time from the base's root, in order, at most [`REVERT_BASE_TREES`] trees (each by
-/// sha, so no path goes into a URL). Every node asks the same requests. A path still not found
+/// a PR spread over 6 directories revert-proof). If GitHub truncates the tree (more than 100,000
+/// entries or 7 MB of listing, about 30,000 files) or it's over the size cap, the paths it doesn't
+/// name are looked up a tree level at a time from the base's root, in order, at most
+/// [`REVERT_BASE_TREES`] trees (each by sha, so no path goes into a URL). Every node asks the same requests. A path still not found
 /// isn't in the map: its file counts as neither restored nor not ([`undoes`]).
 async fn base_blobs<F, Fut>(get: &F, repo: &str, base: &str, paths: &[&str]) -> Result<BTreeMap<String, String>>
 where
@@ -1158,7 +1198,7 @@ mod tests {
     }
 
     fn files_json(files: &[FileDiff]) -> Value {
-        Value::Array(files.iter().map(|f| json!({ "filename": f.filename, "status": if f.status.is_empty() { "modified" } else { f.status.as_str() }, "sha": f.sha, "previous_filename": f.previous_filename, "patch": f.patch })).collect())
+        Value::Array(files.iter().map(|f| json!({ "filename": f.filename, "status": if f.status.is_empty() { "modified" } else { f.status.as_str() }, "sha": f.sha, "previous_filename": f.previous_filename, "patch": f.patch, "changes": f.changes })).collect())
     }
 
     /// Audit F55, the R1 reviewer's bypass: the claimant puts five decoy commits in its own PR #42
@@ -1540,6 +1580,31 @@ mod tests {
         assert_eq!(undoes(&renamed, &[png("old.png", "added", "0a")], &base_blobs), Some(false), "the new name must go too");
         assert_eq!(undoes(&renamed, &[png("old.png", "added", "0a"), png("new.png", "removed", "0b")], &base_blobs), Some(true));
         assert_eq!(undoes(&renamed, &back, &BTreeMap::new()), None, "nothing known to compare");
+        // Audit review-r4-poc-1: a blank line added to a file a later commit changes (CHANGELOG.md)
+        // doesn't make the PR revert-proof. Its exact pre-PR blob can't come back, and needn't:
+        // a file changed without a line that counts (blank lines, a pure rename or mode change)
+        // is judged by its rename alone.
+        let blank = |sha: &str, patch: &str| FileDiff { filename: "CHANGELOG.md".into(), status: "modified".into(), sha: Some(sha.repeat(20)), patch: Some(patch.into()), ..Default::default() };
+        let changelog = BTreeMap::from([("CHANGELOG.md".to_string(), "c0".repeat(20))]);
+        let claim = [thing_files(), vec![blank("c1", "@@ -3,2 +3,3 @@\n ## 0.5\n+\n - fixes")]].concat();
+        let revert = [undoing_files(), vec![blank("c3", "@@ -3,3 +3,2 @@\n ## 0.6\n-\n - fixes")]].concat();
+        assert!(needs_base(&claim).is_empty(), "no blob to fetch for it");
+        assert_eq!(undoes(&claim, &revert, &changelog), Some(true));
+        assert_eq!(undoes(&claim, &undoing_files(), &changelog), Some(true), "and a revert that leaves it alone");
+        let moved = |from: &str, to: &str, sha: &str| FileDiff { filename: to.into(), previous_filename: Some(from.into()), status: "renamed".into(), sha: Some(sha.repeat(20)), changes: Some(0), ..Default::default() };
+        let claim = [thing_files(), vec![moved("docs/a.md", "docs/b.md", "d1")]].concat();
+        assert!(needs_base(&claim).is_empty());
+        assert_eq!(undoes(&claim, &[undoing_files(), vec![moved("docs/b.md", "docs/a.md", "d7")]].concat(), &BTreeMap::new()), Some(true), "renamed back, whatever later commits did to it");
+        assert_eq!(undoes(&claim, &undoing_files(), &BTreeMap::new()), Some(false), "a rename that stays isn't undone");
+        // Audit review-fix-poc-3: a file renamed with edits, and `git revert` renaming it back with
+        // the reverse edits (or removing the new name and adding the old one back), is undone.
+        let edited = |from: &str, to: &str, patch: &str| FileDiff { filename: to.into(), previous_filename: Some(from.into()), status: "renamed".into(), patch: Some(patch.into()), ..Default::default() };
+        let claim = [edited("src/a.rs", "src/b.rs", "@@ -1,3 +1,3 @@\n fn a() {\n-    old();\n+    new();\n }")];
+        assert_eq!(undoes(&claim, &[edited("src/b.rs", "src/a.rs", "@@ -1,3 +1,3 @@\n fn a() {\n-    new();\n+    old();\n }")], &BTreeMap::new()), Some(true));
+        let file = |name: &str, status: &str, patch: &str| FileDiff { filename: name.into(), status: status.into(), patch: Some(patch.into()), ..Default::default() };
+        let split = [file("src/b.rs", "removed", "@@ -1,3 +0,0 @@\n-fn a() {\n-    new();\n-}"), file("src/a.rs", "added", "@@ -0,0 +1,3 @@\n+fn a() {\n+    old();\n+}")];
+        assert_eq!(undoes(&claim, &split, &BTreeMap::new()), Some(true));
+        assert_eq!(undoes(&claim, &[edited("src/b.rs", "src/a.rs", "@@ -1,3 +1,3 @@\n fn a() {\n-    new();\n+    other();\n }")], &BTreeMap::new()), Some(false), "renamed back with other edits");
         // A removed file comes back as the blob it was.
         let gone = [png("c.png", "removed", "cc")];
         assert_eq!((undoes(&gone, &[png("c.png", "added", "cc")], &BTreeMap::new()), undoes(&gone, &[png("c.png", "added", "cd")], &BTreeMap::new())), (Some(true), Some(false)));
