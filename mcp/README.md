@@ -37,9 +37,9 @@ The network is chosen by the user, once, in the MCP's configuration, and nothing
 **Getting paid for code:** once a PR to a pool repo merges, `submit_contribution` claims it for the user's account (the PR's author must be their linked GitHub handle). If you act through a session key, the user first registers it as a Familiar. Validators check GitHub, a human jury scores it, and rewards vest to the user. `my_contributions` tracks it. The bond counts toward `BLOCKULA_MAX_SEND` / `BLOCKULA_MAX_DAILY`. Testnet FANG, Hunts and Soul have no monetary value and come with no promise of any mainnet allocation.
 
 **Spending a user's money safely:**
-1. `create_wallet`, then `use_account("theirname.boo")`. Until the user has authorized the key it answers with a `grant_code`: this key's signed consent to joining that one account (no secret in it). Hand it to the user. A key id alone can't be added (AddKey needs the key's consent, so nobody can pad the key's account list).
+1. `create_wallet`, then `use_account` with the user's account address (`boo1…`: the web wallet's Devices & agents → Give an agent a budget shows it, with the name as a label). A name works on test chains; on mainnet an unproven name answers `needs_confirmation` with the address it resolved to, for the user to compare with the one their wallet shows. Until the user has authorized the key it answers with a `grant_code`: this key's signed consent to joining that one account (no secret in it). Hand it to the user. A key id alone can't be added (AddKey needs the key's consent, so nobody can pad the key's account list).
 2. The user pastes it in the Blockula web wallet at https://blockula-wallet.vercel.app (Devices & agents → Give an agent a budget) and picks a limit and an expiry. The chain enforces both.
-3. `use_account("theirname.boo")` again, then `send`.
+3. `use_account` with the same address again, then `send`.
 
 Session keys can only send transfers: staking, voting and name renewals need an owner key (the agent's own account, or one the user made it an owner of). Staking and voting lock FANG for weeks, so ask the user first.
 
