@@ -1204,7 +1204,7 @@ export class HeightAheadError extends Error {
 }
 
 /**
- * How far ahead of the newest head a client's witnesses report a tx's height may be, by default
+ * How far ahead of the lowest head a client's witnesses report a tx's height may be, by default
  * (`ClientOptions.maxHeadLeadBlocks`): 30 blocks, room for propagation between nodes.
  */
 export const DEFAULT_MAX_HEAD_LEAD_BLOCKS = 30;
@@ -1264,7 +1264,7 @@ export interface ClientOptions {
   /** Refuse to resolve a `.boo` name for a signature unless it's proven (needs `witnesses`). */
   requireProvenNames?: boolean;
   /**
-   * With witnesses: how far ahead of the newest head they report the height a tx is signed
+   * With witnesses: how far ahead of the lowest head they report the height a tx is signed
    * against may be (default `DEFAULT_MAX_HEAD_LEAD_BLOCKS`). See `Client.checkSigningHeight`.
    */
   maxHeadLeadBlocks?: number;
@@ -1389,10 +1389,12 @@ export class Client {
   /**
    * Refuses (`HeightAheadError`, before anything is signed) a height a tx's validity window would
    * count from that this client has reason to think the chain hasn't reached: more than
-   * `maxHeadLeadBlocks` past the newest head its witnesses report, or, with a `genesisClock`, past
+   * `maxHeadLeadBlocks` past the lowest head its witnesses report, or, with a `genesisClock`, past
    * what the chain can have reached by this machine's clock (`heightLimit`). A node reporting a
    * future height gets a tx it can hold and release later, when the window it picked opens; with
    * a name signed in it, after the name may have changed hands (audit review-r3-clients-2).
+   * Every witness must report its height, as every witness must confirm a proof: one honest
+   * witness is enough to refuse a height the chain hasn't reached, whatever the others say.
    * Without witnesses or a genesis clock, the height is the node's word.
    */
   async checkSigningHeight(height: number): Promise<void> {
@@ -1401,11 +1403,11 @@ export class Client {
       if (height > limit) throw new HeightAheadError(this.rpc, height, limit, "this machine's clock and the chain's genesis");
     }
     if (!this.witnesses.length) return;
-    const heads = await Promise.all(this.witnesses.map((w) => w.status().then((s) => (Number.isSafeInteger(s.height) ? (s.height as number) : undefined), () => undefined)));
-    const known = heads.filter((h): h is number => h !== undefined);
-    if (!known.length) throw new Error(`none of this client's ${this.witnesses.length} witness${this.witnesses.length === 1 ? "" : "es"} reported its height, so ${this.rpc}'s height ${height} can't be checked: nothing was signed`);
-    const newest = Math.max(...known);
-    if (height > newest + this.maxHeadLeadBlocks) throw new HeightAheadError(this.rpc, height, newest + this.maxHeadLeadBlocks, `the newest head its witnesses report (#${newest})`);
+    const heads = await Promise.all(this.witnesses.map((w) => w.status().then((s) => (Number.isSafeInteger(s.height) && s.height >= 0 ? (s.height as number) : undefined), () => undefined)));
+    const silent = this.witnesses.filter((_, i) => heads[i] === undefined);
+    if (silent.length) throw new Error(`${silent.map((w) => w.rpc).join(", ")} didn't report ${silent.length === 1 ? "its height" : "their heights"}, so ${this.rpc}'s height ${height} can't be checked against every witness: nothing was signed`);
+    const lowest = Math.min(...(heads as number[]));
+    if (height > lowest + this.maxHeadLeadBlocks) throw new HeightAheadError(this.rpc, height, lowest + this.maxHeadLeadBlocks, `the lowest head its witnesses report (#${lowest})`);
   }
 
   /** The chain's address prefix, asking the node once if it isn't known yet. */

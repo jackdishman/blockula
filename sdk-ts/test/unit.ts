@@ -478,19 +478,22 @@ console.log("✓ build and keyGrant take a caller's resolution and refuse an unp
   assert.equal(heightLimit(start, 1000, start), Math.floor((1000 + HEIGHT_CLOCK_TOLERANCE_MS) / 1000));
   assert.equal(heightLimit(start, 1000, start + 86_400_000) - heightLimit(start, 1000, start), 86_400);
   assert.equal(heightLimit(start, 1000, 0), 0);
-  // A node a year ahead of its witnesses.
+  // A node a year ahead of its witnesses. One of them colludes (it reports the same future head):
+  // the honest one is enough to refuse it, as one honest witness is enough to refuse a proof.
   const ahead = host("http://ahead.node", { height: 50 + 31_536_000 });
   host("http://head-a.node", { height: 50 });
-  const aw = Wallet.fromSeed("1c".repeat(32), new Client("http://ahead.node", { witnesses: [new Client("http://head-a.node"), new Client("http://down.node")] }));
-  await assert.rejects(aw.send(BOB, "1"), (e: unknown) => e instanceof HeightAheadError && e.height === 50 + 31_536_000 && e.limit === 80 && /Nothing was signed/.test(e.message));
+  host("http://colluding.node", { height: 50 + 31_536_000 });
+  const aw = Wallet.fromSeed("1c".repeat(32), new Client("http://ahead.node", { witnesses: [new Client("http://colluding.node"), new Client("http://head-a.node")] }));
+  await assert.rejects(aw.send(BOB, "1"), (e: unknown) => e instanceof HeightAheadError && e.height === 50 + 31_536_000 && e.limit === 80 && /lowest head its witnesses report \(#50\).*Nothing was signed/.test(e.message));
   assert.equal(ahead.posted.length, 0, "nothing signed against the future height");
   // Within the lead (propagation): signed.
   ahead.status.height = 50 + 30;
   await aw.send(BOB, "1");
   assert.equal(ahead.posted.length, 1);
-  // No witness answers: it can't be checked, so nothing is signed.
-  const lonely = Wallet.fromSeed("1c".repeat(32), new Client("http://ahead.node", { witnesses: [new Client("http://down.node")] }));
-  await assert.rejects(lonely.send(BOB, "1"), /none of this client's 1 witness reported its height.*nothing was signed/);
+  // A witness that doesn't answer: the height can't be checked against every witness, so nothing is signed.
+  const lonely = Wallet.fromSeed("1c".repeat(32), new Client("http://ahead.node", { witnesses: [new Client("http://head-a.node"), new Client("http://down.node")] }));
+  await assert.rejects(lonely.send(BOB, "1"), /http:\/\/down\.node didn't report its height, so .* can't be checked against every witness: nothing was signed/);
+  assert.equal(ahead.posted.length, 1);
   assert.throws(() => new Client("http://ahead.node", { maxHeadLeadBlocks: -1 }), /maxHeadLeadBlocks/);
   // The genesis clock: a chain that started a day ago at 1 s blocks can't be a year in.
   const clocked = host("http://clocked.node", { height: 31_536_000 });
