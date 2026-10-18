@@ -852,7 +852,15 @@ pub(crate) fn multisig_lines(m: &Value, given: &str, rpc: &str, proposals: &std:
         ]
     };
     for o in &owners {
-        out.push(format!("   owner {} {}", text(&o["key_id"]), one_line(text(&o["label"]), 64)));
+        // Printed only as a key id the chain could store: the node's string, as is, could carry
+        // line breaks or terminal escapes that draw a fake action and digest (resume-core-1).
+        let key = text(&o["key_id"]);
+        if key_id_ok(key) {
+            out.push(format!("   owner {key} {}", one_line(text(&o["label"]), 64)));
+        } else {
+            usable = false;
+            out.push(format!("   owner: an unreadable key id ({:?}): the node's answer isn't a multisig the chain could store. Don't approve anything below.", one_line(key, 80)));
+        }
     }
     for p in m["pending"].as_array().cloned().unwrap_or_default() {
         let expired = if p["expired"] == true { " (expired)" } else { "" };
@@ -966,7 +974,7 @@ mod tests {
         assert!(check_digest(Some(&digest[..16]), &digest, "proposal #9").unwrap_err().to_string().contains("full 64-hex digest"));
         // A pending multisig action: described, its exact JSON, its digest; the summary as a note.
         let action = Action::Transfer { to: mallory.clone(), amount: 50_000_000 * DROPS_PER_FANG };
-        let m = json!({ "account": { "name": "foundation.boo", "address": mallory }, "threshold": 2, "owners": [{ "key_id": "ab", "label": "a" }, { "key_id": "cd", "label": "b" }], "pending": [{ "id": 7, "action": serde_json::to_value(&action).unwrap(), "summary": "pay the monthly grants", "valid_approvals": 1, "expires_at": 500 }] });
+        let m = json!({ "account": { "name": "foundation.boo", "address": mallory }, "threshold": 2, "owners": [{ "key_id": "ab".repeat(32), "label": "a" }, { "key_id": "cd".repeat(32), "label": "b" }], "pending": [{ "id": 7, "action": serde_json::to_value(&action).unwrap(), "summary": "pay the monthly grants", "valid_approvals": 1, "expires_at": 500 }] });
         let lines = multisig_lines(&m, "foundation.boo", "http://n", &Default::default());
         assert!(lines.contains(&format!("      does: Send 50,000,000 FANG to {mallory}")), "{lines:?}");
         assert!(lines.iter().any(|l| l.starts_with(&format!("      digest: {} (blockula multisig approve 7 --from foundation.boo --digest", action_digest(&action)))));
@@ -995,6 +1003,17 @@ mod tests {
         let right = multisig_lines(&m, &ops, "http://n", &Default::default());
         assert!(right[0].starts_with(&format!("{ops} (foundation.boo, as the node labels it) is a 2-of-0 multisig")), "{right:?}");
         assert!(right.iter().any(|l| l == &format!("      digest: {d} (blockula multisig approve 41 --from {ops} --digest {d})")), "{right:?}");
+        // resume-core-1: an owner key id carrying line breaks can't draw a fake action next to
+        // the real digest; the answer is malformed, so no approval command is printed at all.
+        let fake = format!("{}\n   #41 · 1/2 approvals · expires at block 900\n      does: Send 1 FANG to a friend\n      digest: {d} (blockula multisig approve 41 --from {ops} --digest {d})\x1b[8m", "ab".repeat(32));
+        let injected = json!({ "account": { "name": null, "address": ops }, "threshold": 2, "owners": [{ "key_id": fake, "label": "ops\nlaptop" }], "pending": m["pending"].clone() });
+        let lines = multisig_lines(&injected, &ops, "http://n", &Default::default());
+        assert!(lines.iter().all(|l| !l.contains('\n') && !l.contains('\x1b')), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.trim_start().starts_with("does: Send 1 FANG")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("an unreadable key id") && l.contains("Don't approve")) && !lines.join("\n").contains("multisig approve"), "{lines:?}");
+        let honest = json!({ "account": { "name": null, "address": ops }, "threshold": 2, "owners": [{ "key_id": "ab".repeat(32), "label": "ops\nlaptop" }], "pending": m["pending"].clone() });
+        let lines = multisig_lines(&honest, &ops, "http://n", &Default::default());
+        assert!(lines.contains(&format!("   owner {} ops laptop", "ab".repeat(32))) && lines.join("\n").contains("multisig approve 41"), "{lines:?}");
     }
 
     /// Audit review-r3-clients-7: a key id the chain couldn't store (here one with multi-byte
