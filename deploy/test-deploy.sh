@@ -207,7 +207,7 @@ chmod +x "$T/bin/fly" "$T/bin/curl" "$T/bin/blockula-launch"
 # launch [VAR=value …]: runs launch.sh (a fresh log), prints its exit code.
 launch() {
   : > "$T/fly/log"; : > "$T/fly/deploys"
-  env PATH="$T/bin:$PATH" HOME="$T/home" FAKE_FLY="$T/fly" BIN="$T/bin/blockula-launch" SKIP_BUILD=1 "$@" \
+  env PATH="$T/bin:$PATH" HOME="$T/home" FAKE_FLY="$T/fly" BIN="$T/bin/blockula-launch" SKIP_BUILD=1 PROGRESS_SECS=0 "$@" \
     bash deploy/launch.sh > "$T/launch.out" 2>&1 && echo 0 || echo $?
 }
 has() { grep -qx "$2" "$T/fly/$1.secrets" 2>/dev/null; }
@@ -236,6 +236,12 @@ refute "launch: no public node after a failed validator deploy" "$(cat "$T/fly/d
 code=$(launch RESET=1 CHAIN_ID=t-b)
 [ -f "$NETDIR/t-b/launched" ] && [ "$code" != 0 ] && ok "launch: once validators were deployed, RESET is refused (their genesis may have signed blocks)" || bad "launch: RESET after a partial launch exited $code"
 
+# The chain makes no progress after the first key removal: the others keep their keys.
+code=$(launch RESET=1 CHAIN_ID=t-c FAKE_STALL=1)
+[ "$code" != 0 ] && expect "launch: no new blocks stops the rolling key removal" "$(cat "$T/launch.out")" "stopping before the next validator" || bad "launch: stall exited $code: $(cat "$T/launch.out")"
+! has blockula-v0 VALIDATOR_KEY_B64 && has blockula-v1 VALIDATOR_KEY_B64 && has blockula-v3 VALIDATOR_KEY_B64 \
+  && ok "launch: only the first validator restarted" || bad "launch: keys after a stall: $(cat "$T/fly/"*.secrets)"
+
 # A genesis an earlier attempt built two days ago isn't launched as it is.
 code=$(launch RESET=1 CHAIN_ID=t-d FAKE_FLY_BUILD_FAIL=1)
 g=$NETDIR/t-d/genesis.json
@@ -245,6 +251,16 @@ code=$(launch RESET=1 CHAIN_ID=t-d)
 [ ! -f "$NETDIR/t-d/launched" ] && [ ! -s "$T/fly/deploys" ] && ok "launch: and deploys nothing" || bad "launch: old genesis deployed"
 code=$(launch RESET=1 CHAIN_ID=t-d GENESIS_MAX_AGE_HOURS=72)
 [ "$code" = 0 ] && ok "launch: GENESIS_MAX_AGE_HOURS launches it anyway" || bad "launch: old genesis with override exited $code: $(cat "$T/launch.out")"
+
+# set-github-token.sh: one app at a time, stopping when the chain stalls.
+token() { : > "$T/fly/log"; printf 'github_pat_abc123\n' | env PATH="$T/bin:$PATH" FAKE_FLY="$T/fly" PROGRESS_SECS=0 "$@" bash deploy/set-github-token.sh > "$T/token.out" 2>&1 && echo 0 || echo $?; }
+rm -f "$T/fly/"*.secrets
+code=$(token)
+[ "$code" = 0 ] && has blockula-v3 GITHUB_TOKEN && has blockula-testnet GITHUB_TOKEN && ok "token: set on every app" || bad "token: exited $code: $(cat "$T/token.out")"
+refute "token: never in argv" "$(cat "$T/fly/log")" "github_pat_"
+rm -f "$T/fly/"*.secrets
+code=$(token FAKE_STALL=1)
+[ "$code" != 0 ] && has blockula-v0 GITHUB_TOKEN && ! has blockula-v1 GITHUB_TOKEN && ok "token: no new blocks stops before the next app" || bad "token: stall exited $code: $(cat "$T/token.out")"
 
 if [ $fails -gt 0 ]; then echo "✗ $fails failed" >&2; exit 1; fi
 echo "✓ deploy scripts behave"

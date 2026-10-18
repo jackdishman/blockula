@@ -81,6 +81,8 @@ if fly_ok; then fly auth whoami >/dev/null || { echo "Run: fly auth login" >&2; 
 mkdir -p "$CONF" && chmod 700 "$CONF"
 [ -n "${SKIP_BUILD:-}" ] || cargo build --release --locked --manifest-path node/Cargo.toml -q
 BIN=${BIN:-node/target/release/blockula}
+# Seconds between the liveness checks of a rolling restart (60 of them), for tests.
+PROGRESS_SECS=${PROGRESS_SECS:-5}
 
 if [ "${RESET:-}" = 1 ]; then
   [ ! -f "$NET/launched" ] || { echo "❌ $CHAIN_ID has launched already (its validators were deployed and may have signed blocks): a chain id is never reused. Rerun without RESET to finish this launch, or set CHAIN_ID to a new one (and RESET=1 to clear the apps)." >&2; exit 1; }
@@ -113,6 +115,8 @@ dedicated_v4() {
 }
 has_secret() { fly secrets list -a "$1" --json | jq -e --arg s "$2" 'map(.name // .Name) | index($s)' >/dev/null; }
 height() { curl -fsS -m 5 "$RPC_URL/api/status" 2>/dev/null | jq -r '.height // 0' 2>/dev/null || echo 0; }
+# Whether the chain finalizes new blocks within 5 minutes of `before` (a height).
+progressed() { for _ in $(seq 60); do [ "$(height)" -gt "$(($1 + 5))" ] && return 0; sleep "$PROGRESS_SECS"; done; return 1; }
 # Country of a Fly region, for the operator files' independence fields (DEC-14 display only).
 country_of() {
   case "$1" in
@@ -355,12 +359,12 @@ fly deploy -c "$WORK/$RPC_APP.toml" --image "$IMAGE" --ha=false >/dev/null
 
 # Keys are on their volumes now: delete them from Fly so no other machine can ever load them.
 # Not staged: each validator restarts without the variable, one at a time, the next once the
-# chain has finalized new blocks (3 of 4 keep it going).
+# chain has finalized new blocks (3 of 4 keep it going); without new blocks it stops there.
 for app in ${SEEDING[@]+"${SEEDING[@]}"}; do
   if fly ssh console -a "$app" -C "test -f /data/home/.seeded" >/dev/null 2>&1; then
     before=$(height)
     fly secrets unset VALIDATOR_KEY_B64 -a "$app" >/dev/null && echo "🔒 $app: key seeded on its volume; removed from Fly secrets"
-    for _ in $(seq 60); do [ "$(height)" -gt "$((before + 5))" ] && break; sleep 5; done
+    progressed "$before" || { echo "❌ no new blocks at $RPC_URL within 5 minutes of restarting $app (from #$before): stopping before the next validator. Check fly logs -a $app, then rerun deploy/launch.sh (without RESET) to remove the remaining keys." >&2; exit 1; }
   else
     echo "⚠️  $app: couldn't confirm the key was seeded; VALIDATOR_KEY_B64 left in place" >&2
   fi
