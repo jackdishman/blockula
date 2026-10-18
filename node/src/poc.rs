@@ -77,7 +77,7 @@ pub const BAD_AGREEMENT_PPM: u64 = 400_000;
 /// Soul for a claim at a perfect score (scaled by its claimant's pooled rate in the Séance, and by
 /// its rank among the claimant's claims there: [`CLAIM_RANK_SHIFT`]).
 pub const CLAIM_SOUL: u64 = 10 * SOUL;
-/// Volume doesn't pay (audit xcut-economic-opus-1): within one Séance a person's claims are rated
+/// Volume barely pays (audit xcut-economic-opus-1): within one Séance a person's claims are rated
 /// together, by one win rate pooled over all their comparisons (every claim the jury judged and
 /// didn't mark spam, those below the threshold too), never by the best of them: each claim's own
 /// rate is a noisy estimate from a handful of comparisons, and the best of k noisy rates grows
@@ -1645,10 +1645,10 @@ impl State {
         // Rewards: jurors by agreement; claims by the claimant's pooled rate × repo weight, per
         // person the claim in the heaviest repo in full and each further one a quarter of the one
         // ranked above it (`ranked`: together under 4/3 of one claim at the person's rate, so
-        // volume doesn't pay: audit xcut-economic-opus-1), boosted up to 1.5× by the person's
-        // Soul. A person is the claimant account (audit xcut-economic-opus-3): a sponsor's
-        // Familiars claim as the sponsor, and every handle an account linked counts together (each
-        // handle credits one account, `Poc::handles`).
+        // volume adds at most a third: audit xcut-economic-opus-1), boosted up to 1.5× by the
+        // person's Soul. A person is the claimant account (audit xcut-economic-opus-3): a
+        // sponsor's Familiars claim as the sponsor, and every handle an account linked counts
+        // together (each handle credits one account, `Poc::handles`).
         let juror_budget = if juror_weights.is_empty() { 0 } else { bps(s.budget, JUROR_SHARE_BPS) };
         let claims_budget = if accepted.is_empty() { 0 } else { s.budget - juror_budget };
         let mut raw: BTreeMap<String, Vec<(u64, u128)>> = BTreeMap::new();

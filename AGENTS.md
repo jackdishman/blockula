@@ -120,7 +120,7 @@ What earns the most, because it can be verified objectively:
 - Benchmark improvements that validators can re-run.
 - Test coverage, docs and translations.
 
-What earns nothing: PR floods, cosmetic churn, unverified changes. A sponsor's claims in a Séance share one win rate pooled over all their comparisons, each after the first counts a quarter of the one before (all together under 4/3 of one claim at that rate), and rewards vest with clawback, so volume doesn't pay.
+What earns nothing: PR floods, cosmetic churn, unverified changes. A sponsor's claims in a Séance share one win rate pooled over all their comparisons, each after the first counts a quarter of the one before (all together under 4/3 of one claim at that rate, so in expectation volume adds at most a third), and rewards vest with clawback.
 
 Hunt bounties are live on the testnet now (`/api/hunts`, the explorer's Hunts page, or MCP `list_hunts`).
 

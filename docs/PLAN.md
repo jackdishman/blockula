@@ -87,7 +87,7 @@ Native account abstraction (Phase 1). Each account holds a list of authorized ke
 ### 🐈‍⬛ Familiars: agent contributions, encouraged
 Agents are first-class contributors, but every agent is the **Familiar of a human sponsor** who has Soul.
 - **Binding:** a Familiar is a session key on the sponsor's account plus an on-chain `familiar_of` link. Its rewards go to the sponsor (who can set a split), and its mistakes cost the sponsor's Soul.
-- **Volume doesn't pay:** all of a sponsor's Familiars are pooled as one person, their claims rated and ranked together (one win rate; the first in full, each next a quarter). There's a per-Soul-tier cap on Familiars and open claims, and the claim bond grows with the number of open claims.
+- **Volume barely pays:** all of a sponsor's Familiars are pooled as one person, their claims rated and ranked together (one win rate; the first in full, each next a quarter: in expectation at most 4/3 of one claim of the same quality). There's a per-Soul-tier cap on Familiars and open claims, and the claim bond grows with the number of open claims.
 - **Agent-shaped work pays best, because it can be checked objectively:**
   - Hunts with **acceptance tests**: the bounty pays when validators re-run the declared tests and they pass.
   - **Fuzzing and bug repros**: a crash that reproduces deterministically from the submitted input.

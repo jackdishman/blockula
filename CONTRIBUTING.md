@@ -22,7 +22,7 @@ People with Soul can serve on juries (`blockula contrib join-jury`), which earns
 - One focused change, with tests. `cargo test --manifest-path node/Cargo.toml` and `bash scripts/local-testnet.sh` pass (CI runs both).
 - The Rust and TypeScript transaction encodings stay byte-identical (`node/src/types.rs` ⇄ `sdk-ts/src/tx.ts`).
 - Explain what changed and how you verified it.
-- Volume doesn't pay: a sponsor's claims in a Séance share one pooled win rate, each after the first counts a quarter of the one before, and rewards vest with clawback. One solid PR beats ten small ones.
+- Volume barely pays: a sponsor's claims in a Séance share one pooled win rate, each after the first counts a quarter of the one before (so in expectation more claims of the same quality add at most a third), and rewards vest with clawback. One solid PR beats ten small ones.
 
 ## How PRs merge
 - Everything reaches `main` through a PR: a maintainer's approval, both CI jobs green, review threads resolved, and the branch up to date with `main`. Pushing new commits after an approval needs a fresh one.
