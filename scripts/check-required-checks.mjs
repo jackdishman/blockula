@@ -17,22 +17,50 @@
 //   - a job-level `if:` other than the conditions in SAFE_JOB_IFS (which keep it on every PR);
 //   - `needs:` on a job that isn't required (if that job fails or is skipped, this one is skipped);
 //   - `continue-on-error` on the job, or a step-level `if:` or `continue-on-error` that isn't in
-//     SAFE_STEPS (exact job, step name and value: a reviewed exception, e.g. an upload on failure).
+//     SAFE_STEPS (exact job, step name, value and what the step runs: a reviewed exception, e.g.
+//     an upload on failure);
+//   - a matrix (its checks are named "<name> (<values>)") or a reusable workflow (`uses:`).
+// Round 4 (audit review-r3-supply-1): the workflows are read with a real YAML parser (the `yaml`
+// package, a root devDependency pinned in package-lock.json; CI installs it with --ignore-scripts),
+// so every spelling GitHub accepts (quoted keys, indentless or compact sequences, multi-line and
+// folded scalars, flow collections over several lines, anchors and aliases) is read as GitHub
+// reads it. What it can't read the same way is refused, never skipped: a parse error or warning,
+// a merge key (<<), an explicit tag, a key that isn't a plain scalar, two keys that differ only
+// in case (keys are read case-insensitively), more than one document, a `needs` that isn't a job
+// id or a list of them, a step that isn't a mapping, a name that isn't text. No job in any
+// workflow may be able to report a required check's name but the required job itself: a computed
+// name ("${{ … }}") counts as every name it could produce (a `matrix.<key>` over a literal list
+// expands to its values; any other expression matches anything), compared without case.
+// What a step's command does is code review's job (CODEOWNERS), not this script's: it makes sure
+// a required job runs on every pull request and that each of its steps runs and counts.
 //   node scripts/check-required-checks.mjs [--ruleset F] [--workflows DIR] [--list F]
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
+let YAML;
+try {
+  YAML = await import("yaml");
+} catch {
+  console.error("✗ scripts/check-required-checks.mjs reads the workflows with the yaml package (pinned in package-lock.json): run npm ci --ignore-scripts first");
+  process.exit(1);
+}
+
 const GITHUB_ACTIONS = 15368;
 // Job-level conditions that never skip a job on a pull request.
 const SAFE_JOB_IFS = new Set(["github.event_name != 'schedule'"]);
-// Step-level conditions in required jobs that can't make the job pass without its checks: each
-// is "<job name> / <step name> / <key>: <value>", reviewed.
-const SAFE_STEPS = new Set([
+// Job-level conditions that keep a job off pull requests altogether (the nightly fuzzers): such a
+// job isn't a pull-request check, and a required job can't have one.
+const NOT_ON_PR_IFS = new Set(["github.event_name != 'pull_request'"]);
+// Step-level conditions in required jobs that can't make the job pass without its checks: each is
+// reviewed for exactly that job, step name, key and value, and the step must do only what it says
+// (`uses`: the action, any pinned version; `run`: exactly that command), so a check step renamed
+// to an exception's name isn't one.
+const SAFE_STEPS = [
   // Uploads the Playwright traces when the tests already failed.
-  "Wallet e2e (Playwright, Chromium) / Traces of failed tests / if: failure()",
+  { job: "Wallet e2e (Playwright, Chromium)", step: "Traces of failed tests", key: "if", value: "failure()", uses: /^actions\/upload-artifact@[0-9a-f]{40}$/ },
   // Reports dev-tooling advisories; the runtime audit in the step before blocks.
-  "Dependencies (cargo-deny, npm audit) / npm audit (all, non-blocking) / continue-on-error: true",
-]);
+  { job: "Dependencies (cargo-deny, npm audit)", step: "npm audit (all, non-blocking)", key: "continue-on-error", value: "true", run: "npm audit" },
+];
 const cond = (v) => v.replace(/^\$\{\{\s*([\s\S]*?)\s*\}\}$/, "$1").trim();
 const args = process.argv.slice(2);
 const opt = (k, d) => {
@@ -62,93 +90,165 @@ else {
   if (required.size === 0) bad(`${rulesetFile} requires no status checks`);
 }
 
-// ---- the workflows (the subset of YAML these files use: block style, two-space indents) ----
-const unquote = (v) => {
-  v = v.trim();
-  const q = /^"((?:[^"\\]|\\.)*)"|^'((?:[^']|'')*)'/.exec(v);
-  if (q) return q[1] !== undefined ? q[1].replace(/\\(.)/g, "$1") : q[2].replace(/''/g, "'");
-  return v.replace(/\s+#.*$/, "").trim();
-};
-const indent = (l) => l.length - l.trimStart().length;
-const meaningful = (l) => l.trim() !== "" && !l.trim().startsWith("#");
+// ---- the workflows, read with a YAML parser (as GitHub reads them) ----
+const isMap = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+const scalar = (v) => typeof v === "string" || typeof v === "number" || typeof v === "boolean";
+const show = (v) => (typeof v === "string" ? v : JSON.stringify(v));
+// A condition as GitHub evaluates it: `${{ }}` around it is optional. Anything that isn't text
+// (`if: false`, an empty `if:`) is kept as written, so only the exact reviewed strings pass.
+const condOf = (v) => (typeof v === "string" ? cond(v) : v === null || v === undefined ? "(empty)" : show(v));
+// Check names are compared without case or surrounding/repeated spaces.
+const norm = (s) => s.trim().replace(/\s+/g, " ").toLowerCase();
 
-function parseWorkflow(file) {
-  const lines = readFileSync(file, "utf8").split("\n");
-  const block = (key) => {
-    const i = lines.findIndex((l) => new RegExp(`^${key}:`).test(l));
-    if (i < 0) return { head: null, body: [] };
-    const head = lines[i].slice(key.length + 1);
-    const body = [];
-    for (let j = i + 1; j < lines.length && !(meaningful(lines[j]) && indent(lines[j]) === 0); j++) body.push(lines[j]);
-    return { head: head.replace(/\s+#.*$/, "").trim(), body };
-  };
+// A mapping's keys, lower-cased (GitHub's keywords; refusing two that differ only in case).
+function keysOf(map, where) {
+  const m = new Map();
+  for (const [k, v] of Object.entries(map)) {
+    const lk = k.toLowerCase();
+    if (m.has(lk)) bad(`${where}: "${k}" and another key differ only in case; this checker refuses what GitHub might read either way`);
+    m.set(lk, v);
+  }
+  return m;
+}
+
+function readYaml(file, f) {
+  const docs = YAML.parseAllDocuments(readFileSync(file, "utf8"), { version: "1.2", uniqueKeys: true, merge: false, strict: true, prettyErrors: true });
+  const problems = [];
+  if (!Array.isArray(docs) || docs.length !== 1) problems.push(`${Array.isArray(docs) ? docs.length : 0} YAML documents (expected one)`);
+  for (const doc of Array.isArray(docs) ? docs : []) {
+    for (const e of [...doc.errors, ...doc.warnings]) problems.push(e.message.split("\n")[0]);
+    YAML.visit(doc, {
+      Pair(_, pair) {
+        if (!YAML.isScalar(pair.key)) problems.push(`a key that isn't a plain scalar (${String(pair.key)})`);
+        else if (pair.key.value === "<<" || typeof pair.key.value === "symbol" || pair.key.source === "<<") problems.push("a merge key (<<), which this checker doesn't expand");
+      },
+      // Workflows need no explicit tags (!!str, !!merge, !custom), and they change how a node reads.
+      Node(_, node) {
+        if (node.tag) problems.push(`an explicit YAML tag (${node.tag})`);
+      },
+    });
+  }
+  if (problems.length) {
+    bad(`${f} can't be read the way GitHub reads it, so it's refused: ${[...new Set(problems)].join("; ")}`);
+    return null;
+  }
+  const top = docs[0].toJS({ maxAliasCount: 100 });
+  if (!isMap(top)) {
+    bad(`${f} isn't a workflow (a mapping at the top)`);
+    return null;
+  }
+  return top;
+}
+
+// The regex of the names a job's check can have: its name, with each ${{ … }} replaced by what it
+// can produce (a matrix key's literal values, else anything).
+function namePattern(job) {
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const parts = job.name.split(/(\$\{\{[\s\S]*?\}\})/);
+  const rx = parts
+    .map((p, i) => {
+      if (i % 2 === 0) return p.includes("${{") ? "[\\s\\S]*" : esc(p);
+      const m = /^matrix\.([A-Za-z0-9_-]+)$/.exec(cond(p));
+      const values = m && job.matrixValues?.get(m[1].toLowerCase());
+      return values && !values.some((v) => String(v).includes("${{")) ? `(?:${values.map((v) => esc(String(v))).join("|")})` : "[\\s\\S]*";
+    })
+    .join("");
+  return new RegExp(`^\\s*${rx}\\s*$`, "i");
+}
+const canReport = (job, ctx) => (job.name.includes("${{") ? namePattern(job).test(ctx) || namePattern(job).test(norm(ctx)) : norm(job.name) === norm(ctx));
+
+function parseWorkflow(file, f) {
+  const top = readYaml(file, f);
+  if (!top) return { pr: false, prFilter: "", jobs: [], unreadable: true };
+  const wf = keysOf(top, f);
   // on: does it run on every pull request?
-  const on = block("on");
+  const on = wf.get("on");
   let pr = false;
   let prFilter = "";
-  if (on.head) {
-    // on: pull_request | on: [push, pull_request] | on: { pull_request: … }
-    if (/\bpull_request\b(?!_target)/.test(on.head)) {
-      pr = true;
-      if (/pull_request\s*:\s*\{[^}]*\b(paths|paths-ignore|branches|branches-ignore)\b/.test(on.head)) prFilter = "a filter";
-    }
-  } else {
-    for (let j = 0; j < on.body.length; j++) {
-      const l = on.body[j];
-      if (!meaningful(l) || indent(l) !== 2) continue;
-      const m = /^ {2}pull_request\s*:(.*)$/.exec(l);
-      if (!m) continue;
-      pr = true;
-      const nested = [m[1]];
-      for (let k = j + 1; k < on.body.length && !(meaningful(on.body[k]) && indent(on.body[k]) <= 2); k++) if (meaningful(on.body[k])) nested.push(on.body[k]);
-      const f = /\b(paths|paths-ignore|branches|branches-ignore)\s*:/.exec(nested.join("\n"));
-      if (f) prFilter = f[1];
+  const events = typeof on === "string" ? [on] : Array.isArray(on) ? on : isMap(on) ? Object.keys(on) : null;
+  if (!events || !events.every((e) => typeof e === "string")) bad(`${f}: can't read its on: (${show(on)})`);
+  else if (events.some((e) => e.toLowerCase() === "pull_request")) {
+    pr = true;
+    const cfg = isMap(on) ? keysOf(on, `${f}: on`).get("pull_request") : null;
+    if (cfg !== null && cfg !== undefined && !isMap(cfg)) bad(`${f}: can't read on.pull_request (${show(cfg)})`);
+    else if (isMap(cfg)) {
+      const c = keysOf(cfg, `${f}: on.pull_request`);
+      const filter = ["paths", "paths-ignore", "branches", "branches-ignore"].find((k) => c.has(k));
+      if (filter) prFilter = filter;
+      else if (c.has("types")) {
+        const types = c.get("types");
+        const list = typeof types === "string" ? [types] : Array.isArray(types) ? types : [];
+        // The default activity types are what a PR's pushes trigger; fewer is a filter.
+        if (!["opened", "synchronize", "reopened"].every((t) => list.includes(t))) prFilter = "types";
+      }
     }
   }
-  // jobs: id → { name, if, needs, continueOnError, steps: [{ name, if, continueOnError }] }
+  // jobs: id → { name, if, needs, continueOnError, uses, matrix, steps: [{ name, if, continueOnError, uses, run }] }
   const jobs = [];
-  const flow = [];
-  const jb = block("jobs").body;
-  for (let j = 0; j < jb.length; j++) {
-    if (/^ {2}[A-Za-z0-9_-]+:\s*[^\s#]/.test(jb[j])) flow.push(jb[j].trim());
-    const m = /^ {2}([A-Za-z0-9_-]+):\s*(#.*)?$/.exec(jb[j]);
-    if (!m) continue;
-    const job = { id: m[1], name: m[1], if: "", needs: [], continueOnError: "", steps: [] };
-    let inSteps = false;
-    let step = null;
-    for (let k = j + 1; k < jb.length && !(meaningful(jb[k]) && indent(jb[k]) <= 2); k++) {
-      const l = jb[k];
-      if (!meaningful(l)) continue;
-      const kv = /^ {4}([A-Za-z-]+):\s*(.*)$/.exec(l);
-      if (kv) {
-        inSteps = kv[1] === "steps";
-        step = null;
-        if (kv[1] === "name" || kv[1] === "if") job[kv[1]] = unquote(kv[2]);
-        if (kv[1] === "continue-on-error") job.continueOnError = unquote(kv[2]) || "(set)";
-        if (kv[1] === "needs") {
-          const v = unquote(kv[2]);
-          if (v.startsWith("[")) job.needs.push(...v.replace(/^\[|\]$/g, "").split(",").map((x) => unquote(x)).filter(Boolean));
-          else if (v) job.needs.push(v);
-          else for (let n = k + 1; n < jb.length && /^ {6}- /.test(jb[n]); n++) job.needs.push(unquote(jb[n].replace(/^ {6}- /, "")));
-        }
-        continue;
-      }
-      if (!inSteps) continue;
-      const item = /^ {6}- ([A-Za-z-]+):\s*(.*)$/.exec(l);
-      if (item || /^ {6}-\s*$/.test(l)) {
-        step = { name: "", if: "", continueOnError: "" };
-        job.steps.push(step);
-      }
-      const sk = item ?? /^ {8}([A-Za-z-]+):\s*(.*)$/.exec(l);
-      if (step && sk) {
-        if (sk[1] === "name") step.name = unquote(sk[2]);
-        if (sk[1] === "if") step.if = cond(unquote(sk[2])) || "(set)";
-        if (sk[1] === "continue-on-error") step.continueOnError = unquote(sk[2]) || "(set)";
+  const jobsMap = wf.get("jobs");
+  if (!isMap(jobsMap)) {
+    bad(`${f}: can't read its jobs: (${show(jobsMap)})`);
+    return { pr, prFilter, jobs, unreadable: true };
+  }
+  for (const [id, raw] of Object.entries(jobsMap)) {
+    const where = `${f}: job ${id}`;
+    if (!isMap(raw)) {
+      bad(`${where} isn't a mapping (${show(raw)}): can't read it`);
+      continue;
+    }
+    const j = keysOf(raw, where);
+    const job = { id, name: id, if: null, needs: [], continueOnError: null, uses: j.get("uses"), matrix: false, matrixValues: null, steps: [], unreadable: [] };
+    if (j.has("name")) {
+      const v = j.get("name");
+      if (scalar(v)) job.name = String(v);
+      else {
+        bad(`${where}: its name (${show(v)}) isn't text: can't tell which check it reports`);
+        job.name = "${{ unreadable }}";
       }
     }
+    if (j.has("if")) job.if = condOf(j.get("if"));
+    if (j.has("continue-on-error")) job.continueOnError = condOf(j.get("continue-on-error"));
+    const needs = j.get("needs");
+    if (typeof needs === "string") job.needs = [needs];
+    else if (Array.isArray(needs) && needs.every((n) => typeof n === "string")) job.needs = needs;
+    else if (needs !== undefined && needs !== null) job.unreadable.push(`its needs: (${show(needs)}) isn't a job id or a list of them`);
+    const strategy = j.get("strategy");
+    if (strategy !== undefined) {
+      const st = isMap(strategy) ? keysOf(strategy, `${where}: strategy`) : null;
+      const matrix = st?.get("matrix");
+      if (matrix !== undefined) {
+        job.matrix = true;
+        // A matrix of literal lists, without include (which can add values), expands names.
+        if (isMap(matrix)) {
+          const mx = keysOf(matrix, `${where}: strategy.matrix`);
+          if (!mx.has("include")) {
+            job.matrixValues = new Map();
+            for (const [k, v] of mx) if (k !== "exclude" && Array.isArray(v) && v.every(scalar)) job.matrixValues.set(k, v);
+          }
+        }
+      }
+    }
+    const steps = j.get("steps");
+    if (Array.isArray(steps)) {
+      steps.forEach((raw, i) => {
+        if (!isMap(raw)) {
+          job.unreadable.push(`its step ${i + 1} isn't a mapping (${show(raw)})`);
+          return;
+        }
+        const s = keysOf(raw, `${where}: step ${i + 1}`);
+        const name = s.get("name");
+        job.steps.push({
+          name: scalar(name) ? String(name) : "",
+          if: s.has("if") ? condOf(s.get("if")) : null,
+          continueOnError: s.has("continue-on-error") ? condOf(s.get("continue-on-error")) : null,
+          uses: s.get("uses"),
+          run: s.get("run"),
+        });
+      });
+    } else if (steps !== undefined || job.uses === undefined) job.unreadable.push(`its steps: (${show(steps)}) isn't a list`);
     jobs.push(job);
   }
-  return { pr, prFilter, jobs, flow };
+  return { pr, prFilter, jobs };
 }
 
 const prJobs = new Map(); // name → "file: job id"
@@ -156,18 +256,17 @@ const prWorkflows = []; // [file, jobs] of the workflows that run on pull reques
 const filteredJobs = new Map(); // jobs that run only on some pull requests (a paths/branches filter)
 const files = readdirSync(workflowDir).filter((f) => /\.ya?ml$/.test(f)).sort();
 if (files.length === 0) bad(`no workflows in ${workflowDir}`);
-const allJobs = new Map(); // name → ["file: job id", …] across every workflow, whatever triggers it
+const allJobs = []; // [job, "file: job id"] across every workflow, whatever triggers it
 for (const f of files) {
-  const wf = parseWorkflow(join(workflowDir, f));
-  for (const job of wf.jobs) allJobs.set(job.name, [...(allJobs.get(job.name) ?? []), `${f}: ${job.id}`]);
+  const wf = parseWorkflow(join(workflowDir, f), f);
+  for (const job of wf.jobs) allJobs.push([job, `${f}: ${job.id}`]);
   if (!wf.pr) continue;
   prWorkflows.push([f, wf.jobs]);
-  if (wf.jobs.length === 0) bad(`${f}: runs on pull_request but no jobs were found (this checker reads block-style YAML only)`);
-  for (const l of wf.flow) bad(`${f}: job "${l}" is written in flow style; this checker reads block-style YAML only, so it can't tell what the job does`);
+  if (wf.jobs.length === 0 && !wf.unreadable) bad(`${f}: runs on pull_request but has no jobs`);
   for (const job of wf.jobs) {
-    // A job whose `if:` names pull_request is taken not to run on PRs (e.g. the nightly fuzzers);
-    // a skipped job would report success, which is no check at all.
-    if (/pull_request/.test(job.if)) {
+    // A job whose if: keeps it off pull requests (exactly a reviewed NOT_ON_PR_IFS condition) isn't
+    // a pull-request check; any other job in this workflow is.
+    if (job.if !== null && NOT_ON_PR_IFS.has(job.if)) {
       if (required.has(job.name)) bad(`"${job.name}" (${f}: ${job.id}) is required, but its if: (${job.if}) skips it on pull requests, and a skipped check counts as passing`);
       continue;
     }
@@ -185,11 +284,12 @@ for (const f of files) {
   }
 }
 
-// A check run from any other job with a required name (a push-triggered copy that always passes,
-// say) could stand in for the real one on the PR's head commit.
+// A check run from any other job that can carry a required name (a push-triggered copy that always
+// passes, a computed name that evaluates to it, the same name in other letter case) could stand in
+// for the real one on the PR's head commit.
 for (const ctx of required.keys()) {
-  const where = allJobs.get(ctx) ?? [];
-  if (where.length > 1) bad(`the required check "${ctx}" is the name of ${where.length} jobs (${where.join(", ")}): any of them reporting it would satisfy the ruleset. Keep required names unique across all workflows`);
+  const where = allJobs.filter(([job]) => canReport(job, ctx)).map(([job, at]) => (job.name === ctx ? at : `${at}, named ${JSON.stringify(job.name)}`));
+  if (where.length > 1) bad(`the required check "${ctx}" could be reported by ${where.length} jobs (${where.join("; ")}): any of them reporting it would satisfy the ruleset. Keep required names unique across all workflows, and computed names unable to produce one`);
 }
 
 // ---- required jobs can't skip themselves or pass without their work ----
@@ -198,19 +298,29 @@ for (const [f, jobs] of prWorkflows) {
   for (const job of jobs) {
     if (!required.has(job.name)) continue;
     const at = `"${job.name}" (${f}: ${job.id})`;
-    const c = cond(job.if);
-    if (c && !/pull_request/.test(c) && !SAFE_JOB_IFS.has(c)) bad(`${at} is required, but its if: (${c}) can skip it, and a skipped check counts as passing. Drop the condition, or if it can't skip a pull request add it to SAFE_JOB_IFS in this script (now: ${[...SAFE_JOB_IFS].join("; ")})`);
+    for (const u of job.unreadable) bad(`${at} is required, but ${u}: this checker can't tell what it runs, so it's refused`);
+    if (job.if !== null && !NOT_ON_PR_IFS.has(job.if) && !SAFE_JOB_IFS.has(job.if)) bad(`${at} is required, but its if: (${job.if}) can skip it, and a skipped check counts as passing. Drop the condition, or if it can't skip a pull request add it to SAFE_JOB_IFS in this script (now: ${[...SAFE_JOB_IFS].join("; ")})`);
     for (const n of job.needs) {
       const dep = byId.get(n);
       if (!dep) bad(`${at} needs "${n}", which isn't a job in ${f}`);
       else if (!required.has(dep.name)) bad(`${at} is required, but it needs "${dep.name}" (${f}: ${n}), which isn't: if that job fails or is skipped, ${at} is skipped, and a skipped check counts as passing. Require it too, or drop the needs`);
     }
-    if (job.continueOnError) bad(`${at} is required, but it has continue-on-error: ${job.continueOnError}, so it can fail and still let the PR through`);
+    if (job.continueOnError !== null) bad(`${at} is required, but it has continue-on-error: ${job.continueOnError}, so it can fail and still let the PR through`);
+    if (job.uses !== undefined) bad(`${at} is required, but it calls a reusable workflow (uses: ${show(job.uses)}), whose jobs report under other names and whose conditions this checker doesn't read`);
+    if (job.matrix) bad(`${at} is required, but it has a matrix: its checks are named "${job.name} (…)", so "${job.name}" is never reported`);
     for (const st of job.steps) {
       for (const [key, v] of [["if", st.if], ["continue-on-error", st.continueOnError]]) {
-        if (!v) continue;
-        const entry = `${job.name} / ${st.name || "(unnamed step)"} / ${key}: ${v}`;
-        if (!SAFE_STEPS.has(entry)) bad(`${at} is required, but its step "${st.name || "(unnamed)"}" has ${key}: ${v}, which can let the job pass without that step's check. Drop it, or if it can't, add "${entry}" to SAFE_STEPS in this script`);
+        if (v === null) continue;
+        const safe = SAFE_STEPS.some(
+          (e) =>
+            e.job === job.name &&
+            e.step === st.name &&
+            e.key === key &&
+            e.value === v &&
+            (e.uses ? typeof st.uses === "string" && e.uses.test(st.uses) && st.run === undefined : st.uses === undefined) &&
+            (e.run !== undefined ? st.run === e.run : st.run === undefined),
+        );
+        if (!safe) bad(`${at} is required, but its step "${st.name || "(unnamed)"}" has ${key}: ${v}, which can let the job pass without that step's check. Drop it, or if it can't, add it to SAFE_STEPS in this script (job, step name, key, value, and what the step runs)`);
       }
     }
   }

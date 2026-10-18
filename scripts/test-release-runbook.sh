@@ -29,7 +29,7 @@ fail() { echo "✗ $*" >&2; exit 1; }
 ok() { pass=$((pass + 1)); echo "✓ $1"; }
 
 # ---- the blocks ----
-EXPECTED="first-install patch-install rotation upgrade validator-genesis"
+EXPECTED="first-install offline-fetch offline-unpack patch-install rotation upgrade validator-genesis"
 names=$(sed -n 's/^<!-- runbook-test: \([a-z-]*\) -->$/\1/p' "$DOC" | sort | tr '\n' ' ' | sed 's/ $//')
 [ "$names" = "$EXPECTED" ] || fail "$DOC marks the blocks '$names', expected '$EXPECTED' (a runbook lost its test marker, or a new one needs a case here)"
 # block NAME: the fenced block right after NAME's marker.
@@ -146,6 +146,7 @@ paste() {
     -e "s|^\( *\)V=vX\.Y\.Z|\1V=$TAG|" \
     -e "s|^\( *\)K=<release key id>.*|\1K=$K|" \
     -e "s|^\( *\)H=<.*|\1H=$ANNOUNCED|" \
+    -e "s|^\( *\)T=<.*|\1T=$LINUX_T|" \
     -e "s|^\( *\)NEW=<.*|\1NEW=$NK|" \
     -e "s|^\( *\)P=<.*|\1P=$PATCH|" \
     -e "s|<your-ip>|203.0.113.7|; s|<your sentry>|sentry.example.org|" \
@@ -206,11 +207,53 @@ grep -qF "FAILED" "$T/out" || fail "refused for another reason: $(cat "$T/out")"
 fails_open first-install "an attacker's archive"
 # The genuine archive, but checksums.txt re-signed by another key: the binary refuses its signature.
 RESIGNED=$T/resigned && rm -rf "$RESIGNED" && cp -R "$GENUINE" "$RESIGNED"
+SWAPPED_ARCHIVE=$T/swapped-archive && rm -rf "$SWAPPED_ARCHIVE" && cp -R "$GENUINE" "$SWAPPED_ARCHIVE" && cp "$EVIL/blockula-$LINUX_T.tar.gz" "$SWAPPED_ARCHIVE/"
 "$BIN" release sign --key "$T/attacker-key.json" "$RESIGNED/checksums.txt" > "$RESIGNED/checksums.txt.sig" 2> /dev/null
 machine fresh && MIRROR=$RESIGNED
 expect first-install refused "the genuine archive under checksums re-signed with another key"
 grep -qF "signed by key $AK, not the release key $K" "$T/out" || fail "refused for another reason: $(cat "$T/out")"
 fails_open first-install "checksums re-signed with another key"
+# A malformed announced hash (pasted with the file name, or cut short) isn't a match: macOS's
+# sha256sum accepts an improperly formatted line unless --strict.
+GOOD_ANNOUNCED=$ANNOUNCED
+for ANNOUNCED in "" "${GOOD_ANNOUNCED:0:40}" "$GOOD_ANNOUNCED  blockula-$LINUX_T.tar.gz"; do
+  machine fresh && MIRROR=$EVIL
+  expect first-install refused "an attacker's archive, the announced hash pasted malformed ('${ANNOUNCED:0:12}…')"
+done
+ANNOUNCED=$GOOD_ANNOUNCED
+
+# ---- to an offline machine (the signing machine, a genesis key machine; review-r3-supply-3) ----
+# offline-fetch runs on a host that runs a verified blockula with the key pinned; offline-unpack
+# on the offline machine, from the directory it left (carried on a stick), against the hash
+# written down: the stick's own checksums.txt can't vouch for the stick.
+TAG=v9.9.9
+OFFLINE=offline-$TAG
+machine 9.9.9 && MIRROR=$GENUINE
+paste offline-fetch
+[ $rc = 0 ] || fail "offline-fetch, the genuine release: refused: $(cat "$T/out")"
+cmp -s "$T/work/$OFFLINE/blockula-$LINUX_T.tar.gz" "$GENUINE/blockula-$LINUX_T.tar.gz" || fail "offline-fetch didn't leave the genuine archive"
+[ "$(ls "$T/work/$OFFLINE" | tr '\n' ' ')" = "blockula-$LINUX_T.tar.gz checksums.txt checksums.txt.sig " ] || fail "offline-fetch left other files: $(ls "$T/work/$OFFLINE")"
+grep -qxF "$ANNOUNCED  blockula-$LINUX_T.tar.gz" "$T/out" || fail "offline-fetch didn't print the signed SHA-256 to write down: $(cat "$T/out")"
+ok "offline-fetch, the genuine release: verified archive (and only it) in $OFFLINE, its signed SHA-256 printed"
+rm -rf "$T/stick" && cp -R "$T/work" "$T/stick"
+for evil in "$RESIGNED:checksums re-signed with another key" "$SWAPPED_ARCHIVE:an archive swapped under the genuine signature"; do
+  machine 9.9.9 && MIRROR=${evil%%:*}
+  paste offline-fetch
+  [ $rc != 0 ] || fail "offline-fetch accepted ${evil#*:}: $(cat "$T/out")"
+  [ ! -e "$T/work/$OFFLINE" ] || fail "offline-fetch left $OFFLINE behind for ${evil#*:}: $(ls -R "$T/work")"
+  ok "offline-fetch, ${evil#*:}: refused, nothing left to carry"
+done
+# On the offline machine: the genuine stick installs; a stick whose archive and checksums.txt were
+# both swapped on the way is refused before anything from it runs.
+WORKFILES=$T/stick
+machine fresh
+expect offline-unpack "installed blockula 9.9.9" "the stick offline-fetch wrote"
+cp "$EVIL/blockula-$LINUX_T.tar.gz" "$EVIL/checksums.txt" "$T/stick/$OFFLINE/"
+machine fresh
+expect offline-unpack refused "a stick with the archive and checksums.txt swapped on the way"
+grep -qF "FAILED" "$T/out" || fail "refused for another reason: $(cat "$T/out")"
+fails_open offline-unpack "a swapped archive on the stick"
+WORKFILES=
 
 # ---- upgrades (the pinned key; F49's bypass: the release controls install.sh) ----
 TAG=v9.9.10

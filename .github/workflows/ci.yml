@@ -169,7 +169,9 @@ jobs:
         run: deploy/monitoring/check.sh
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with: { node-version: 22, cache: npm }
-      - run: npm ci
+      # Nothing here needs an install script (the yaml parser check-required-checks.mjs reads the
+      # workflows with is pinned in package-lock.json), so none runs.
+      - run: npm ci --ignore-scripts
       - name: Release signature tool (known-answer vector, tamper checks)
         run: node scripts/release-sig.mjs selftest
       - name: install.sh verification policy (offline fake release)
@@ -189,7 +191,8 @@ jobs:
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends age
           REQUIRE_AGE=1 bash scripts/test-fuzz-seal.sh
-      # The ruleset requires these jobs by name (supply-chain-B-3).
+      # The ruleset requires these jobs by name (supply-chain-B-3); the workflows are read with a
+      # YAML parser, and what it can't read as GitHub does is refused (review-r3-supply-1).
       - name: Required checks match the ruleset (deploy/github/ruleset-main.json)
         run: node scripts/check-required-checks.mjs
       - name: Required-checks checker and ruleset script (offline fake gh)

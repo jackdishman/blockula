@@ -10,39 +10,85 @@
 //   2. SLSA build provenance with a logged-in GitHub CLI (`gh attestation verify`): the archive was
 //      built by this repo's release workflow. A failed check is fatal; no gh skips it.
 //   3. The offline ML-DSA-65 signature on checksums.txt (checksums.txt.sig), verified with the
-//      SDK against the pinned release key id. Once a key id is known (built in, or
-//      BLOCKULA_RELEASE_KEY_ID), every release must carry a valid signature: a missing or invalid
-//      .sig is fatal. Leaving the .sig out is exactly what a compromised GitHub account or release
-//      workflow would do, and it can't forge the offline signature (audit F69). With no key id
-//      (before the key ceremony) there's nothing to check it against, so it's skipped.
+//      SDK against the release key id. Once a key id is known (pinned in
+//      $BLOCKULA_HOME/release-key-id by `blockula release install`, built in, or
+//      BLOCKULA_RELEASE_KEY_ID; all that are set must agree), every release must carry a valid
+//      signature: a missing or invalid .sig is fatal. Leaving the .sig out is exactly what a
+//      compromised GitHub account or release workflow would do, and it can't forge the offline
+//      signature (audit F69). With no key id (before the key ceremony, nothing pinned) there's
+//      nothing to check it against, so it's skipped.
+// install_node installs to a path of its own ($BLOCKULA_HOME/mcp-bin/blockula), never over the
+// binary `blockula release install` puts in $BLOCKULA_HOME/bin (audit
+// review-r3-integrate-compose-1).
 // The checks add up (AND): provenance and the signature each refuse a release they fail. If
 // neither ran, the result says so loudly. BLOCKULA_REQUIRE_VERIFY=1 refuses a release it can only
 // checksum, and once a key id is known it requires provenance too (both checks).
 import { createHash } from "node:crypto";
+import { readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
 import { verifyReleaseSignature, type ReleaseSignature } from "@blockula/sdk";
 
 export const REPO = "jackdishman/blockula";
-/** BLAKE3 of the release public key (docs/OPERATIONS.md "Releases"). Empty until the key ceremony; BLOCKULA_RELEASE_KEY_ID sets it meanwhile. */
+/**
+ * BLAKE3 of the release public key (docs/OPERATIONS.md "The release key"). Empty until the key
+ * ceremony fills it in, together with scripts/install.sh's and node/src/release_cli.rs's
+ * BUILTIN_KEY_ID (a test keeps the three equal); BLOCKULA_RELEASE_KEY_ID sets it meanwhile.
+ */
 export const RELEASE_KEY_ID = "";
+/** The release key id pin `blockula release install` writes (release_cli.rs PIN_FILE), in $BLOCKULA_HOME. */
+export const PIN_FILE = "release-key-id";
+
+/** Where install_node puts the node binary, and where `blockula release install` and install.sh put theirs (never overwritten by install_node). */
+export function binPaths(home: string): { mcp: string; cli: string } {
+  return { mcp: join(home, "mcp-bin", "blockula"), cli: join(home, "bin", "blockula") };
+}
+
+/**
+ * The release key id pinned in `file` (`blockula release pin` / the first `release install`), or
+ * null if there's no pin. Same rules as release_cli.rs read_pin: one 64-hex key id (any case,
+ * surrounding whitespace ignored), never ignored when it's malformed, and refused when the group
+ * or others can write it (they could have swapped the key it vouches for).
+ */
+export function readReleasePin(file: string): string | null {
+  let text: string;
+  try {
+    text = readFileSync(file, "utf8");
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new Error(`reading ${file}: ${(e as Error).message}`);
+  }
+  if (process.platform !== "win32") {
+    const mode = statSync(file).mode;
+    if (mode & 0o022) throw new Error(`${file} is writable by others (mode ${(mode & 0o777).toString(8)}), so it can't vouch for a release key: chmod 644 it once you've checked it holds your key id; not installing`);
+  }
+  const k = text.trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(k)) throw new Error(`${file} isn't a release key id pin: fix it or remove it; not installing`);
+  return k;
+}
 /** A release tag. Only these are installed: `v*` tags are admin-only (deploy/github/ruleset-tags.json). */
 export const RELEASE_TAG = /^v\d+\.\d+\.\d+$/;
 /** The first line of a release's checksums.txt, before the tag (scripts/release-checksums.sh). */
 export const TAG_LINE_PREFIX = "# blockula-release ";
 
 /**
- * The release key id to trust: BLOCKULA_RELEASE_KEY_ID (from an independent channel) or the one
- * built in. If both are set they must agree: a mismatch means one of them isn't genuine.
+ * The release key id to trust: the one pinned on this machine (`blockula release install`'s pin,
+ * `pinned`, read from `pinFile` by readReleasePin), BLOCKULA_RELEASE_KEY_ID (from an independent
+ * channel) or the one built in. Every one that's set must be the same key: a mismatch means one of
+ * them isn't genuine (or the pin moved by a rotation this MCP predates: update the MCP).
  */
-export function releaseKeyIdFrom(given: string | undefined, builtIn: string): string {
-  const norm = (k: string | undefined, what: string) => {
+export function releaseKeyIdFrom(given: string | undefined, builtIn: string, pinned: string | null = null, pinFile = PIN_FILE): string {
+  const norm = (k: string | undefined | null, what: string) => {
     const v = (k ?? "").trim().toLowerCase();
     if (v && !/^[0-9a-f]{64}$/.test(v)) throw new Error(`${what} must be 64 hex characters`);
     return v;
   };
   const g = norm(given, "BLOCKULA_RELEASE_KEY_ID");
   const b = norm(builtIn, "the built-in release key id");
+  const p = norm(pinned, `the release key id pinned in ${pinFile}`);
+  if (p && g && g !== p) throw new Error(`the release key id pinned in ${pinFile} is ${p}, not BLOCKULA_RELEASE_KEY_ID (${g}); not installing. A new release key is accepted only through a rotation statement the pinned key signed (blockula release pin --key-id <new> --rotation …, docs/OPERATIONS.md "The release key").`);
+  if (p && b && b !== p) throw new Error(`this MCP was built with release key ${b}, but ${pinFile} pins ${p}; not installing. One of them isn't genuine, or the key was rotated after this MCP was released: check the pin (blockula release pin) against SECURITY.md and your operators' channel, and update the MCP.`);
   if (g && b && g !== b) throw new Error(`this MCP trusts release key ${b}, which isn't BLOCKULA_RELEASE_KEY_ID (${g}); not installing. Check both against SECURITY.md and the website.`);
-  return g || b;
+  return p || g || b;
 }
 
 /** The tag GitHub's /releases/latest redirected to (the final URL, …/releases/tag/<tag>). */

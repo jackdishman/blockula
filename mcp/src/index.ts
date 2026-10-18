@@ -19,9 +19,11 @@
 //                       (default BLOCKULA_MAX_SEND + 1 FANG for fees, so one full-size call fits)
 //   BLOCKULA_TIMEOUT_MS how long one request to the node may take (default 15000, at most 2147483647)
 //   BLOCKULA_TX_WAIT_MS how long a tx tool waits for finality before answering "pending" (default 15000)
-//   BLOCKULA_BIN        path to the `blockula` binary (default: ~/.blockula/bin/blockula from install_node, else PATH)
+//   BLOCKULA_BIN        path to the `blockula` binary (default: ~/.blockula/mcp-bin/blockula from install_node,
+//                       else ~/.blockula/bin/blockula from `blockula release install`, else PATH)
 //   BLOCKULA_REQUIRE_VERIFY=1   install_node needs provenance too (and refuses a checksum-only release)
-//   BLOCKULA_RELEASE_KEY_ID     the release signing key id to trust (until it's built in)
+//   BLOCKULA_RELEASE_KEY_ID     the release signing key id to trust (until it's built in; it must
+//                       agree with the built-in one and with ~/.blockula/release-key-id, if pinned)
 // The network never changes while the server runs (WAL-4): see network.ts. Spending caps: see
 // spend.ts (reserved before a tx is sent). Chain text is untrusted: see untrusted.ts. When acting
 // for a user's account via a session key, the chain also enforces that key's limit.
@@ -30,12 +32,12 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ApiError, Client, RequestTimeoutError, TxFailedError, TxPendingError, Wallet, bareName, checkTimeoutMs, describeKind, encodeKeyGrant, proposalDigest, formatFang, paramsOf, parseFang, proposalSummary, stakeSummary, txDropped, txId, type Action, type ProposalKind, type ProposalSummary, type Recipient, type Resolution } from "@blockula/sdk";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { z } from "zod";
 import { KnownChains, completePin, effectivePin, mismatch, mismatchError, resolveNetwork, type Network } from "./network.js";
-import { REPO, RELEASE_KEY_ID, checkBinaryVersion, fetchVerifiedRelease, latestTagFrom, releaseKeyIdFrom } from "./release.js";
+import { PIN_FILE, REPO, RELEASE_KEY_ID, binPaths, checkBinaryVersion, fetchVerifiedRelease, latestTagFrom, readReleasePin, releaseKeyIdFrom } from "./release.js";
 import { SignedTxs } from "./signed.js";
 import { SpendLedger } from "./spend.js";
 import { SERVER_INSTRUCTIONS, UNTRUSTED_NOTE, chainData, clean } from "./untrusted.js";
@@ -62,8 +64,10 @@ const TIMEOUT_MS = msEnv("BLOCKULA_TIMEOUT_MS", 15_000);
 const TX_WAIT_MS = msEnv("BLOCKULA_TX_WAIT_MS", 15_000);
 const KNOWN_CHAINS = new KnownChains(join(HOME, "known-chains.json"));
 const VERSION: string = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
-const INSTALLED_BIN = join(HOME, "bin", "blockula");
-let BIN = process.env.BLOCKULA_BIN ?? (existsSync(INSTALLED_BIN) ? INSTALLED_BIN : "blockula");
+// install_node's binary has a path of its own: it never replaces the one `blockula release install`
+// checked against the operator's pinned key (audit review-r3-integrate-compose-1).
+const { mcp: INSTALLED_BIN, cli: CLI_BIN } = binPaths(HOME);
+let BIN = process.env.BLOCKULA_BIN ?? (existsSync(INSTALLED_BIN) ? INSTALLED_BIN : existsSync(CLI_BIN) ? CLI_BIN : "blockula");
 
 /** Testnet economics, said wherever Hunts and the contribution pool come up. */
 const NO_VALUE = "Testnet FANG, Hunts and Soul have no monetary value and come with no promise of any mainnet allocation.";
@@ -434,12 +438,14 @@ tool("start_dev_node", "Start a local Blockula dev chain (faucet + built-in expl
 
 tool(
   "install_node",
-  "Download the prebuilt `blockula` node + CLI for this machine from the official GitHub release and install it to ~/.blockula/bin, after the same checks as scripts/install.sh: the release must be the version asked for (`latest` is resolved to its tag first), SHA-256 against the release checksums, build provenance from that tag with a logged-in GitHub CLI, and the offline ML-DSA-65 release signature. Once the release key id is known, a release without a valid signature is refused. It says which checks passed; with BLOCKULA_REQUIRE_VERIFY=1 it also requires provenance and refuses a release it can only checksum. Needed for start_dev_node and summon_chain; nothing else needs it.",
+  "Download the prebuilt `blockula` node + CLI for this machine from the official GitHub release and install it to ~/.blockula/mcp-bin (never over the binary `blockula release install` keeps in ~/.blockula/bin), after the same checks as scripts/install.sh: the release must be the version asked for (`latest` is resolved to its tag first), SHA-256 against the release checksums, build provenance from that tag with a logged-in GitHub CLI, and the offline ML-DSA-65 release signature. Once the release key id is known (pinned in ~/.blockula/release-key-id by `blockula release install`, built in, or BLOCKULA_RELEASE_KEY_ID, which must all agree), a release without a valid signature is refused. It says which checks passed; with BLOCKULA_REQUIRE_VERIFY=1 it also requires provenance and refuses a release it can only checksum. Needed for start_dev_node and summon_chain; nothing else needs it.",
   { version: z.string().regex(/^(latest|v\d+\.\d+\.\d+)$/).default("latest") },
   async ({ version }) => {
     const target = releaseTarget();
     if (!target) throw new Error(`No prebuilt node for ${process.platform}/${process.arch}. Build from source: https://github.com/${REPO}`);
-    const releaseKeyId = releaseKeyIdFrom(process.env.BLOCKULA_RELEASE_KEY_ID, RELEASE_KEY_ID);
+    // The operator's pin (written by `blockula release install`) binds this MCP too.
+    const pinFile = join(HOME, PIN_FILE);
+    const releaseKeyId = releaseKeyIdFrom(process.env.BLOCKULA_RELEASE_KEY_ID, RELEASE_KEY_ID, readReleasePin(pinFile), pinFile);
     // Every check is bound to one tag: GitHub redirects /releases/latest to /releases/tag/<tag>.
     const tag = version === "latest" ? latestTagFrom((await fetch(`https://github.com/${REPO}/releases/latest`, { method: "HEAD", redirect: "follow", signal: AbortSignal.timeout(60_000) })).url) : version;
     const base = `https://github.com/${REPO}/releases/download/${tag}`;
@@ -472,9 +478,16 @@ tool(
         // checkBinaryVersion reports it as unrunnable.
       }
       checkBinaryVersion(printed, tag);
-      mkdirSync(join(HOME, "bin"), { recursive: true });
-      copyFileSync(extracted, INSTALLED_BIN);
-      chmodSync(INSTALLED_BIN, 0o755);
+      // Atomically: a temporary file beside it, then a rename.
+      mkdirSync(dirname(INSTALLED_BIN), { recursive: true });
+      const staged = `${INSTALLED_BIN}.new-${process.pid}`;
+      try {
+        copyFileSync(extracted, staged);
+        chmodSync(staged, 0o755);
+        renameSync(staged, INSTALLED_BIN);
+      } finally {
+        rmSync(staged, { force: true });
+      }
       BIN = INSTALLED_BIN;
       const installed = execFileSync(INSTALLED_BIN, ["--version"], { encoding: "utf8" }).trim();
       return { installed, path: INSTALLED_BIN, sha256: rel.sha256, verified: rel.verified.length ? rel.verified : ["checksum only"], ...(rel.warning ? { warning: rel.warning } : {}), next: "start_dev_node runs a local chain; summon_chain creates your own network" };
