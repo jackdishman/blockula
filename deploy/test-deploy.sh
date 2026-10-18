@@ -148,9 +148,11 @@ fi
 
 # ---- launch.sh and set-github-token.sh, against a stand-in fly ----
 
-# The stand-in fly keeps each app's secret names in $FAKE_FLY/<app>.secrets (never values) and
+# The stand-in fly keeps each app's secret names in $FAKE_FLY/<app>.secrets (never values),
+# staged ones in <app>.staged until the app's next deploy (FAKE_FLY_HIDE_STAGED: `secrets list`
+# doesn't show them), and
 # logs every call; FAKE_FLY_BUILD_FAIL fails the image build, FAKE_FLY_DEPLOY_FAIL=<app> that
-# app's deploy. Each deploy records whether the app held VALIDATOR_KEY_B64 at the time.
+# app's deploy. Each deploy records whether the app held VALIDATOR_KEY_B64 once it applied them.
 mkdir -p "$T/bin" "$T/fly"
 cat > "$T/bin/fly" <<'STUB'
 #!/usr/bin/env bash
@@ -168,13 +170,18 @@ case "$1 ${2:-}" in
   "machines list") echo "[{\"id\":\"m-$app\"}]" ;;
   "volumes list") echo '[]' ;;
   "ips list") echo '[{"Type":"v4","Address":"203.0.113.7"}]' ;;
-  "secrets list") touch "$secrets"; jq -Rn '[inputs | select(length > 0) | {name: .}]' < "$secrets" ;;
-  "secrets import") touch "$secrets"; while IFS='=' read -r k _; do [ -z "$k" ] || grep -qx "$k" "$secrets" || echo "$k" >> "$secrets"; done ;;
-  "secrets unset") touch "$secrets"; { grep -vx "$3" "$secrets" || true; } > "$S/tmp"; mv "$S/tmp" "$secrets" ;;
+  "secrets list")
+    touch "$secrets" "$S/$app.staged"
+    { cat "$secrets"; [ -n "${FAKE_FLY_HIDE_STAGED:-}" ] || cat "$S/$app.staged"; } | jq -Rn '[inputs | select(length > 0) | {name: .}]' ;;
+  "secrets import")
+    to=$secrets; printf '%s\n' "$*" | grep -q -- --stage && to=$S/$app.staged
+    touch "$to"; while IFS='=' read -r k _; do [ -z "$k" ] || grep -qx "$k" "$to" || echo "$k" >> "$to"; done ;;
+  "secrets unset") for f in "$secrets" "$S/$app.staged"; do touch "$f"; { grep -vx "$3" "$f" || true; } > "$S/tmp"; mv "$S/tmp" "$f"; done ;;
   deploy*)
     if printf '%s\n' "$*" | grep -q -- --build-only; then [ -z "${FAKE_FLY_BUILD_FAIL:-}" ] || exit 1; exit 0; fi
     app=$(sed -nE 's/^app = "(.*)"/\1/p' "$cfg")
-    touch "$S/$app.secrets"
+    touch "$S/$app.secrets" "$S/$app.staged"
+    sort -u "$S/$app.secrets" "$S/$app.staged" > "$S/tmp"; mv "$S/tmp" "$S/$app.secrets"; : > "$S/$app.staged"
     echo "$app key=$(grep -qx VALIDATOR_KEY_B64 "$S/$app.secrets" && echo yes || echo no)" >> "$S/deploys"
     [ "${FAKE_FLY_DEPLOY_FAIL:-}" != "$app" ] || exit 1 ;;
 esac
@@ -229,6 +236,11 @@ code=$(launch RESET=1 CHAIN_ID=t-a)
 code=$(launch CHAIN_ID=t-a)
 [ "$code" = 0 ] && expect "launch: re-running a launched chain redeploys it (keys stay off Fly)" "$(cat "$T/fly/deploys")" "blockula-v0 key=no" || bad "launch: upgrade exited $code: $(cat "$T/launch.out")"
 
+# A fly whose `secrets list` doesn't show staged secrets: the keys are still removed once deployed.
+code=$(launch RESET=1 CHAIN_ID=t-e FAKE_FLY_HIDE_STAGED=1)
+[ "$code" = 0 ] && ! has blockula-v0 VALIDATOR_KEY_B64 && ! has blockula-v3 VALIDATOR_KEY_B64 \
+  && ok "launch: keys removed even when staged secrets aren't listed before the deploy" || bad "launch: hidden staged secrets exited $code: $(cat "$T/launch.out")"
+
 # A validator deploy fails: the launch stops (no public node), and the chain counts as launched.
 code=$(launch RESET=1 CHAIN_ID=t-b FAKE_FLY_DEPLOY_FAIL=blockula-v2)
 [ "$code" != 0 ] && expect "launch: a failed validator deploy stops the launch" "$(cat "$T/launch.out")" "deploying blockula-v2 failed" || bad "launch: failed deploy exited $code: $(cat "$T/launch.out")"
@@ -254,11 +266,11 @@ code=$(launch RESET=1 CHAIN_ID=t-d GENESIS_MAX_AGE_HOURS=72)
 
 # set-github-token.sh: one app at a time, stopping when the chain stalls.
 token() { : > "$T/fly/log"; printf 'github_pat_abc123\n' | env PATH="$T/bin:$PATH" FAKE_FLY="$T/fly" PROGRESS_SECS=0 "$@" bash deploy/set-github-token.sh > "$T/token.out" 2>&1 && echo 0 || echo $?; }
-rm -f "$T/fly/"*.secrets
+rm -f "$T/fly/"*.secrets "$T/fly/"*.staged
 code=$(token)
 [ "$code" = 0 ] && has blockula-v3 GITHUB_TOKEN && has blockula-testnet GITHUB_TOKEN && ok "token: set on every app" || bad "token: exited $code: $(cat "$T/token.out")"
 refute "token: never in argv" "$(cat "$T/fly/log")" "github_pat_"
-rm -f "$T/fly/"*.secrets
+rm -f "$T/fly/"*.secrets "$T/fly/"*.staged
 code=$(token FAKE_STALL=1)
 [ "$code" != 0 ] && has blockula-v0 GITHUB_TOKEN && ! has blockula-v1 GITHUB_TOKEN && ok "token: no new blocks stops before the next app" || bad "token: stall exited $code: $(cat "$T/token.out")"
 
