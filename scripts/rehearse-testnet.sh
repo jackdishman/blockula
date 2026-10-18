@@ -170,27 +170,11 @@ until_true "v3 rejoining, backed by the bootstrap delegation" 300 back
 stake3=$(get "$RPC/api/validators" | j "Number(BigInt(v.active.find(x => x.validator.address === '$V3').stake) / 10n**9n)")
 echo "✓ v3 restarted from its volume alone, was topped up and unjailed by its owner, and rejoined (backed again: $stake3 FANG at stake)"
 
-# Weak subjectivity: past the (shortened) period, the genesis alone is refused; the entrypoint's
-# checkpoint path joins.
-ws=$(get "$RPC/api/status" | j 'v.weak_subjectivity_blocks')
-wait_height "$(vhttp 0)" $((ws + 2 * EPOCH)) 300
-if "$BIN" join --genesis "$NET/genesis.json" --genesis-hash "$GHASH" --home "$DIR/stale" --port "$JOIN_PORT" > "$DIR/stale.log" 2>&1; then
-  fail "a join from the genesis alone was accepted past the weak-subjectivity period ($ws blocks)"
-fi
-grep -q "weak-subjectivity" "$DIR/stale.log" || fail "the stale join failed for another reason: $(cat "$DIR/stale.log")"
-echo "✓ past the weak-subjectivity period ($ws blocks), a join from the genesis alone is refused"
-start_rpc "$DIR/joiner" "$JOIN_PORT" "$DIR/joiner.log"
-wait_height "$JOINER" "$(height "$(vhttp 0)")" 300
-cp_h=$(get "$JOINER/api/status" | j 'v.checkpoint_height')
-[ "$cp_h" -gt 0 ] || fail "the joiner trusts no checkpoint: $(get "$JOINER/api/status")"
-echo "✓ a fresh public node joined after the period through the entrypoint (checkpoint #$cp_h from its validators)"
-
 # launch.sh redeploys every validator in parallel (relaunch step 6, upgrades): all four stop and
 # start from their volumes at once, and slashing protection must let them sign again. Then the
 # public node restarts (`run` from its joined home).
-# (After the late join: each restart costs missed slots, and on a release without timed
-# checkpoints, review-r3-sync-1, a joiner measures a fresh checkpoint's age from the genesis
-# clock, so the deficit would eat this rehearsal's 60-block period.)
+# Do this BEFORE the late join: restart downtime increases wall-clock lag, but a fresh timed
+# checkpoint must still admit that joiner (review-r3-sync-1 / resume-relaunch-7).
 stop_node() { kill "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true; }
 h0=$(height "$(vhttp 0)")
 for i in 0 1 2 3; do kill "${PIDS[$i]}" 2>/dev/null || true; done
@@ -213,6 +197,21 @@ start_rpc "$DIR/rpc" "$RPC_PORT" "$DIR/rpc.log"
 wait_height "$RPC" "$(height "$(vhttp 0)")" 120
 grep -q "Full node for" "$DIR/rpc.log" || fail "the public node didn't restart: $(tail -5 "$DIR/rpc.log")"
 echo "✓ the public node restarted from its joined home and caught up"
+
+# Weak subjectivity: past the (shortened) period, the genesis alone is refused; the entrypoint's
+# timed checkpoint path joins even after the network-wide restart above.
+ws=$(get "$RPC/api/status" | j 'v.weak_subjectivity_blocks')
+wait_height "$(vhttp 0)" $((ws + 2 * EPOCH)) 300
+if "$BIN" join --genesis "$NET/genesis.json" --genesis-hash "$GHASH" --home "$DIR/stale" --port "$JOIN_PORT" > "$DIR/stale.log" 2>&1; then
+  fail "a join from the genesis alone was accepted past the weak-subjectivity period ($ws blocks)"
+fi
+grep -q "weak-subjectivity" "$DIR/stale.log" || fail "the stale join failed for another reason: $(cat "$DIR/stale.log")"
+echo "✓ past the weak-subjectivity period ($ws blocks), a join from the genesis alone is refused"
+start_rpc "$DIR/joiner" "$JOIN_PORT" "$DIR/joiner.log"
+wait_height "$JOINER" "$(height "$(vhttp 0)")" 300
+cp_h=$(get "$JOINER/api/status" | j 'v.checkpoint_height')
+[ "$cp_h" -gt 0 ] || fail "the joiner trusts no checkpoint: $(get "$JOINER/api/status")"
+echo "✓ a fresh public node joined after the period through the entrypoint (checkpoint #$cp_h from its validators)"
 
 echo "— SDK e2e against the public node"
 BLOCKULA_RPC=$RPC npm test -w @blockula/sdk > "$DIR/e2e.log" 2>&1 || { tail -40 "$DIR/e2e.log" >&2; fail "SDK e2e (log: $DIR/e2e.log)"; }
