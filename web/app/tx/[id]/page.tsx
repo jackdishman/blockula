@@ -160,7 +160,7 @@ export default function TxPage() {
       </nav>
 
       <section className="card plate receipt">
-        <span className="eyebrow">{dropped ? "Didn't go through" : lost ? "Lost track of it" : t.status === "pending" ? "On its way" : t.status === "failed" ? "Included, but failed" : "Receipt"}</span>
+        <span className="eyebrow">{dropped ? "Dropped, not final" : lost ? "Lost track of it" : t.status === "pending" ? "On its way" : t.status === "failed" ? "Included, but failed" : "Receipt"}</span>
         <p className="headline">{fromMySide(t.summary, me)}</p>
         {/* What was signed, rendered here from the action itself: the node's summary isn't signed (audit gap-7-6). */}
         {t.action && <p className="dim small m0 wrap-any" data-testid="receipt-signs">Signed: {describeAction(t.action)}</p>}
@@ -173,7 +173,8 @@ export default function TxPage() {
           </div>
         )}
         <div className="row-gap">
-          <StatusPill status={t.status} />
+          {/* A drop isn't a failure that ran: not final, and nothing was charged (audit review-r4-wallet-2). */}
+          {dropped ? <StatusPill status="pending">dropped</StatusPill> : <StatusPill status={t.status} />}
           {t.height != null && <span className="dim small">{dropped ? "dropped at" : "in"} block #{t.height.toLocaleString("en-US")}</span>}
           {t.memo && <span className="ledger-memo">“{t.memo}”</span>}
           <ReceiptTools summary={fromMySide(t.summary, me)} />

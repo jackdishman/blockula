@@ -382,7 +382,7 @@ export const PROGRAMS: Program[] = [
       {
         kind: "undelegate",
         title: "Unstake",
-        blurb: "Start unbonding an amount of your stake in a pool (a validator's owner unbonds its self-bond this way too). It's signed as an amount, and the chain turns it into pool shares at its own price when it runs, so no node's report of your stake decides how much unbonds. It stops earning now; withdraw it once the unbonding period is over. To unstake all of it, use Stake.",
+        blurb: "Start unbonding an amount of your stake in a pool (a validator's owner unbonds its self-bond this way too). It's signed as an amount, and the chain turns it into pool shares at its own price when it runs, so no node's report of your stake decides how much unbonds. It stops earning now; withdraw it once the unbonding period is over. To unstake all of it, use the Stake page (/stake).",
         who: "owner keys of the staking account",
         ownerOnly: true,
         params: [
