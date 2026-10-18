@@ -11,7 +11,7 @@ const missing = <T,>(p: Promise<T>) => p.catch((e) => (e instanceof NodeError &&
  * price, the claim bond), fresh. What those reads mean is `preflightInput`'s (pure, and tested on
  * a dev chain's own answers: web/lib/v1.test.mjs).
  */
-export async function checkTx(tx: Tx, signer: string): Promise<{ pf: Preflight; blockMs: number }> {
+export async function checkTx(tx: Tx, signer: string, intent?: string): Promise<{ pf: Preflight; blockMs: number }> {
   const action = tx.action as unknown as { type: string; [k: string]: unknown };
   const pays = action.type === "transfer" || action.type === "award_hunt";
   const huntId = ["fund_hunt", "award_hunt", "cancel_hunt"].includes(action.type) ? Number(action.hunt_id) : null;
@@ -22,10 +22,10 @@ export async function checkTx(tx: Tx, signer: string): Promise<{ pf: Preflight; 
     pays ? nodeGet<AccountDetail>(`/account/${encodeURIComponent(String(action.to))}`) : null,
     pays ? nodeGet<Fees>("/fees").catch(() => null) : null,
     huntId != null ? missing(nodeGet<HuntView>(`/hunt/${huntId}`)).then((h) => h ?? { id: huntId, missing: true as const }, () => null) : null,
-    action.type === "register_name" || action.type === "renew_name" ? nodeGet<NameDetail>(`/name/${encodeURIComponent(String(action.name))}`) : null,
+    action.type === "register_name" || action.type === "renew_name" || action.type === "transfer_name" ? nodeGet<NameDetail>(`/name/${encodeURIComponent(String(action.name))}`) : null,
     action.type === "cancel_hunt" ? nodeGet<ValidatorsDetail>("/validators").catch(() => null) : null,
   ]);
   const reads: Reads = { status, account, multisig, recipient, fees, hunt, name, validators };
   if (name && action.type === "register_name" && !name.available) throw new Error(`${name.name} is already taken`);
-  return { pf: preflight(preflightInput({ from: tx.from, fee: tx.fee, tip: tx.tip, nonce: tx.nonce, action }, signer, reads)), blockMs: status.block_time_ms || 1000 };
+  return { pf: preflight(preflightInput({ from: tx.from, fee: tx.fee, tip: tx.tip, nonce: tx.nonce, action }, signer, reads, intent)), blockMs: status.block_time_ms || 1000 };
 }

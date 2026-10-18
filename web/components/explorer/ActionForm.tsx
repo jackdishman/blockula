@@ -143,8 +143,8 @@ export function ActionForm({ spec, initial = {}, fixed = [], compact = false }: 
         String(raw.memo ?? "").trim(),
         { unproven: resolutions },
       );
-      const { pf, blockMs } = await checkTx(tx, wallet.keyId);
-      setPreview({ tx, headline: spec.describe(raw), does: describeAction(tx.action), names, from, pf, blockMs });
+      const { pf, blockMs } = await checkTx(tx, wallet.keyId, spec.id);
+      setPreview({ tx, headline: pf.headline ?? spec.describe(raw), does: describeAction(tx.action), names, from, pf, blockMs });
     } catch (e) {
       setError(friendly(e));
     } finally {

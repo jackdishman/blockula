@@ -115,11 +115,15 @@ export function Alerts() {
       const toldBy = new Map<string, bigint>();
       for (const t of [...a.recent_txs].reverse()) {
         const was = before.get(t.id);
-        if (t.status === "pending" || (was && was !== "pending") || told.current.has(t.id)) continue;
+        if (t.status === "pending" || (was && was !== "pending")) continue;
+        // Newly sealed in this account's list: counted against its nonce even when another
+        // followed account's read announced it first (a payment to a watched account sealing
+        // between the two reads is no missed spend: audit review-main13-4).
         if (t.from?.address === addr) {
           sentSeen++;
           if (t.signer_key) toldBy.set(t.signer_key, (toldBy.get(t.signer_key) ?? 0n) - deltaFor(t, addr).delta);
         }
+        if (told.current.has(t.id)) continue;
         const n = describe(t, addr, a, meRef.current, myKey, pathRef.current);
         // Even when it isn't worth a notice, a transaction is only ever considered once.
         told.current.add(t.id);

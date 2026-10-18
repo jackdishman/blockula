@@ -89,6 +89,8 @@ export class MockNode {
   /** What `/api/name/{name}` answers instead of the truth (a lying node; gap-7-1). Execution uses `names`. */
   nameLies = new Map<string, string>();
   txs = new Map<string, TxRec>();
+  /** Runs right after `/api/account/{id}` answers: a block executing between two of the page's reads. */
+  afterAccountRead: ((id: string) => void) | null = null;
   /** Every signed tx accepted, in order. */
   submitted: Tx[] = [];
   /** Every request body the wallet sent to the node, to prove secrets never leave the page. */
@@ -551,7 +553,11 @@ export class MockNode {
     try {
       let m: RegExpMatchArray | null;
       if (req.method() === "GET" && path === "/status") return reply(200, this.status());
-      if (req.method() === "GET" && (m = path.match(/^\/account\/(.+)$/))) return reply(200, this.account(m[1]));
+      if (req.method() === "GET" && (m = path.match(/^\/account\/(.+)$/))) {
+        const body = this.account(m[1]);
+        this.afterAccountRead?.(m[1]);
+        return reply(200, body);
+      }
       if (req.method() === "GET" && (m = path.match(/^\/key\/([0-9a-f]{64})$/))) return reply(200, this.keyAccounts(m[1]));
       if (req.method() === "GET" && (m = path.match(/^\/name\/(.+)$/))) {
         const n = m[1].toLowerCase().replace(/\.boo$/, "");

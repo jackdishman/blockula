@@ -106,6 +106,10 @@ export interface PreflightInput {
   hunt?: { id: number; status: string; expires_at: number; creator?: string } | { id: number; missing: true } | null;
   /** Dev and test chains' admins (`/api/validators` `admins`): they may cancel any hunt. */
   admins?: string[];
+  /** The name a `transfer_name` moves: who owns it and who it's offered to, now. */
+  name?: { name: string; owner?: string; offeredTo?: string; status?: string } | null;
+  /** Which of a kind's forms the user opened (an ActionSpec id: `accept_name`, `withdraw_name_offer`). */
+  intent?: string;
 }
 
 export interface Budget {
@@ -132,6 +136,8 @@ export interface Preflight {
   refusals: string[];
   /** Worth knowing, not blocking. */
   notes: string[];
+  /** What it will do, when that depends on the chain's state rather than the form (a name sent to oneself). */
+  headline?: string;
 }
 
 const big = (v: unknown) => (typeof v === "bigint" ? v : typeof v === "number" ? BigInt(v) : typeof v === "string" && /^\d+$/.test(v) ? BigInt(v) : 0n);
@@ -289,8 +295,28 @@ export function preflight(i: PreflightInput): Preflight {
 
   if (sender.transferable == null && moves > 0n && kind !== "delegate") notes.push("This node doesn't report locked FANG, so vote and vesting locks weren't checked.");
 
+  // transfer_name to oneself accepts a name offered to this account, or withdraws an offer of one
+  // it owns: the chain tells them apart by the name's state when it runs, not by which form was
+  // opened (audit review-main13-2: a "withdraw" link could make someone accept an offered name).
+  let headline: string | undefined;
+  const nm = i.name;
+  if (kind === "transfer_name" && nm) {
+    const me = sender.label.address;
+    if (tx.action.to === me) {
+      const outcome = nm.owner !== me && nm.offeredTo === me ? "accept" : nm.owner === me ? "withdraw" : null;
+      if (!outcome) refusals.push(`${nm.name} isn't this account's, and it isn't offered to it.`);
+      else {
+        headline = outcome === "accept" ? `Accept ${nm.name}: it becomes this account's name` : nm.offeredTo ? `Withdraw your offer of ${nm.name}` : `Withdraw an offer of ${nm.name} (there's none open: nothing changes)`;
+        if (outcome === "accept" && nm.status === "grace") refusals.push(`${nm.name} has expired: only its owner can renew it, so it can't be accepted.`);
+        if (i.intent === "withdraw_name_offer" && outcome === "accept") refusals.push(`${nm.name} is offered to this account, so this would accept it, not withdraw an offer. To take it, use “Accept a name”.`);
+        if (i.intent === "accept_name" && outcome === "withdraw") refusals.push(`This account owns ${nm.name}, so this would withdraw its offer, not accept one.`);
+      }
+    } else if (nm.owner !== me) refusals.push(`${nm.name} isn't this account's to offer.`);
+    else if (nm.status === "grace") refusals.push(`${nm.name} has expired: renew it first.`);
+  }
+
   const balanceAfter = spendable > cost ? spendable - cost : 0n;
-  return { effects, cost, available, balanceAfter, pending, locked, budget, refusals, notes };
+  return { effects, cost, available, balanceAfter, pending, locked, budget, refusals, notes, ...(headline ? { headline } : {}) };
 }
 
 const who = (l: Label) => (l.name && !/\s/.test(l.name) ? l.name : l.short);
@@ -329,7 +355,7 @@ const claimBond: Holding = { address: "holding:claim-bond", name: "Claim bond", 
  * is locked (its biggest lock), and costs the fields don't carry come from the reads: a name's
  * price or renewal, the bond the account's next claim holds.
  */
-export function preflightInput(tx: Built, signer: string, r: Reads): PreflightInput {
+export function preflightInput(tx: Built, signer: string, r: Reads, intent?: string): PreflightInput {
   const action = tx.action;
   const mine = r.account;
   const recipient = r.recipient
@@ -372,5 +398,7 @@ export function preflightInput(tx: Built, signer: string, r: Reads): PreflightIn
     extra,
     hunt: h && "missing" in h ? h : h ? { id: h.id, status: h.status, expires_at: h.expires_at, creator: h.creator.address } : null,
     admins: r.validators?.admins?.map((a) => a.address),
+    name: name && action.type === "transfer_name" ? { name: name.name, owner: name.owner?.address, offeredTo: name.offered_to?.address, status: name.status } : null,
+    intent,
   };
 }

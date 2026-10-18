@@ -169,3 +169,26 @@ test("pending reservations include v1's staking and deposits", () => {
   const p = preflight({ tx: transfer(F), sender: sender(30n * F, [owner], [pend({ type: "delegate", validator: "boo1val", amount: String(10n * F) }), pend({ type: "propose", deposit: String(15n * F) })]), head: 1, recipient: { label: mina, isNew: false } });
   assert.equal(p.pending, 25n * F + 8000n);
 });
+
+test("transfer_name to oneself says what the chain will do with the name, and refuses the form it isn't (audit review-main13-2)", () => {
+  const toSelf = { from: "boo1vlad", fee: "4000", nonce: 3, action: { type: "transfer_name", name: "castle", to: "boo1vlad" } };
+  const run = (name, intent) => preflight({ tx: toSelf, sender: sender(F), signer: "k-owner", head: 100, name: { name: "castle.boo", ...name }, intent });
+  // Offered to this account: accepting it, whichever form was opened; the "withdraw" form refuses.
+  const offered = { owner: "boo1mallory", offeredTo: "boo1vlad", status: "active" };
+  assert.equal(run(offered, "accept_name").headline, "Accept castle.boo: it becomes this account's name");
+  assert.deepEqual(run(offered, "accept_name").refusals, []);
+  const lured = run(offered, "withdraw_name_offer");
+  assert.equal(lured.headline, "Accept castle.boo: it becomes this account's name");
+  assert.match(lured.refusals.join(" "), /is offered to this account, so this would accept it, not withdraw an offer/);
+  // Owned by this account: withdrawing its offer; the "accept" form refuses.
+  const mine = { owner: "boo1vlad", offeredTo: "boo1mina", status: "active" };
+  assert.equal(run(mine, "withdraw_name_offer").headline, "Withdraw your offer of castle.boo");
+  assert.match(run(mine, "accept_name").refusals.join(" "), /owns castle.boo, so this would withdraw its offer/);
+  // Neither: the chain refuses it.
+  assert.match(run({ owner: "boo1mina", offeredTo: null }, "accept_name").refusals.join(" "), /isn't this account's, and it isn't offered to it/);
+  // An expired name can't be accepted, or offered.
+  assert.match(run({ ...offered, status: "grace" }, "accept_name").refusals.join(" "), /has expired/);
+  const offer = { ...toSelf, action: { type: "transfer_name", name: "castle", to: "boo1mina" } };
+  assert.match(preflight({ tx: offer, sender: sender(F), signer: "k-owner", head: 100, name: { name: "castle.boo", owner: "boo1mina" } }).refusals.join(" "), /isn't this account's to offer/);
+  assert.deepEqual(preflight({ tx: offer, sender: sender(F), signer: "k-owner", head: 100, name: { name: "castle.boo", owner: "boo1vlad", status: "active" } }).refusals, []);
+});

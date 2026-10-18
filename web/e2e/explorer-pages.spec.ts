@@ -6,6 +6,7 @@
 // signed as names, expired and reserved names, hunts' cancel rule, staking's groups.
 import type { Tx } from "@blockula/sdk";
 import { HOSTILE, PHONE, seedWorld, type World } from "./explorer-world";
+import { RPC } from "./env";
 import { addressOf, VALIDATOR } from "./mock-node";
 import { createWallet, cspViolations, expect, test, watchCsp } from "./helpers";
 import type { Locator, Page } from "@playwright/test";
@@ -302,7 +303,13 @@ test.describe("the explorer from an account holder's side", () => {
     await preview("Register a name", { Name: "ghoul" });
     await preview("Renew a name", { Name: "vlad" });
     await preview("Offer a name", { Name: "castle", To: "lucy.boo" });
-    await preview("Accept a name", { Name: "castle" });
+    // review-main13-2: castle.boo is this account's (offered to mina.boo), so sending it to oneself
+    // withdraws the offer: the headline says what the chain will do, and the "accept" form refuses.
+    const accept = await preview("Accept a name", { Name: "castle" });
+    await expect(accept.getByTestId("action-preview").locator(".headline")).toHaveText("Withdraw your offer of castle.boo");
+    await expect(accept.getByTestId("preflight")).toContainText("owns castle.boo, so this would withdraw its offer, not accept one");
+    const withdraw = await preview("Withdraw an offer", { Name: "castle" });
+    await expect(withdraw.getByTestId("action-preview").locator(".headline")).toHaveText("Withdraw your offer of castle.boo");
     await preview("Release a name", { Name: "castle" });
 
     await page.goto("/programs/hunts");
@@ -408,6 +415,24 @@ test.describe("the explorer from an account holder's side", () => {
     for (let i = 0; i < 26; i++) node.add({ kind: "transfer", from: w.lucy, to: me, amount: 1n, fee: 64_920n, memo: "", summary: "lucy.boo sent 0.000000001 FANG to vlad.boo", action: { type: "transfer", to: me, amount: "1" } });
     await expect(page.locator(".notice.agent", { hasText: "Your agent “claude" })).toBeVisible({ timeout: 9000 });
     expect(await cspViolations(page)).toEqual([]);
+    expect(errors).toEqual([]);
+  });
+
+  test("a payment to a watched account that seals between the two reads is no missed spend (audit review-main13-4)", async ({ page, node }) => {
+    await page.addInitScript(([key, address]) => localStorage.setItem(key, JSON.stringify([{ address, label: "mina.boo", at: 1 }])), [`blockula.watch:${RPC}`, w.mina]);
+    await visit(page, "/explore", (p) => p.getByRole("heading", { name: "blockula-testnet, live" }), errors);
+    await page.waitForTimeout(4500); // the first look is the baseline
+    // Right after a round reads this account, a payment from it to the watched one seals: the
+    // watched account's read announces it first, and this account's next read sees its nonce moved.
+    node.afterAccountRead = (id) => {
+      if (id !== me) return;
+      node.afterAccountRead = null;
+      node.add({ kind: "transfer", from: me, to: w.mina, amount: 2_000_000_000n, fee: 64_920n, memo: "", summary: "vlad.boo sent 2 FANG to mina.boo", action: { type: "transfer", to: w.mina, amount: "2000000000" } });
+      node.acct(me).nonce += 1;
+    };
+    await expect(page.locator(".notice", { hasText: "Watching mina.boo" })).toBeVisible({ timeout: 9000 });
+    await page.waitForTimeout(6000); // this account's next read
+    await expect(page.locator(".notice", { hasText: "pushed out of view" })).toHaveCount(0);
     expect(errors).toEqual([]);
   });
 
