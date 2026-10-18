@@ -36,7 +36,7 @@ import { join } from "node:path";
 import { z } from "zod";
 import { KnownChains, completePin, effectivePin, mismatch, mismatchError, resolveNetwork, type Network } from "./network.js";
 import { REPO, RELEASE_KEY_ID, checkBinaryVersion, fetchVerifiedRelease, latestTagFrom, releaseKeyIdFrom } from "./release.js";
-import { SignedTxs, type SignedTx } from "./signed.js";
+import { SignedTxs, onChain, type SignedTx } from "./signed.js";
 import { SpendLedger } from "./spend.js";
 import { SERVER_INSTRUCTIONS, UNTRUSTED_NOTE, chainData, clean } from "./untrusted.js";
 
@@ -84,6 +84,8 @@ try {
 }
 const RPC = NET?.rpc ?? "";
 let pinned: Client | null = null;
+/** The chain `pinned` is held to (tx_status reads a signed tx's record only on the chain it was signed for). */
+let pinnedChain: { chainId?: string; genesisHash?: string; prefix?: string } = {};
 
 function network(): Network {
   if (!NET) throw new Error(`The Blockula MCP isn't configured correctly: ${NET_ERROR?.message}`);
@@ -107,6 +109,7 @@ async function chain(): Promise<Client> {
   const pins = { chainId: full.chainId, genesisHash: full.genesisHash, prefix: full.prefix, timeoutMs: TIMEOUT_MS };
   // Witnesses are held to the same chain; with them, names are proven (Client.resolution).
   pinned = new Client(net.rpc, { ...pins, witnesses: net.witnesses.map((w) => new Client(w, pins)) });
+  pinnedChain = { chainId: full.chainId, genesisHash: full.genesisHash, prefix: full.prefix };
   return pinned;
 }
 
@@ -182,7 +185,7 @@ async function submitCapped(w: Wallet, action: Action, spend: Spend, memo = ""):
   const counted = formatFang(LEDGER.held(slot));
   // Before it can reach any node: tx_status reads its valid_until from here (review-fix-clients-2).
   try {
-    SIGNED.add(id, { valid_until: tx.valid_until, account: tx.from, nonce: tx.nonce });
+    SIGNED.add(id, { valid_until: tx.valid_until, account: tx.from, nonce: tx.nonce, chain_id: tx.chain_id, genesis_hash: tx.genesis_hash });
   } catch {
     /* informational only: tx_status then says valid_until is unknown */
   }
@@ -423,7 +426,7 @@ async function slotFate(client: Client, id: string, mine: SignedTx): Promise<Slo
     } catch (e) {
       if (e instanceof ApiError && e.status === 404) fate.recheck = "absent";
     }
-    for (const other of SIGNED.sameSlot(mine.account, mine.nonce, id).slice(-3)) {
+    for (const other of SIGNED.sameSlot(mine, id).slice(-3)) {
       const t = await client.tx(other).catch(() => null);
       if (t && (t.status === "finalized" || (t.status === "failed" && !txDropped(t)))) {
         fate.sibling = { id: other, status: String(t.status), ...(safeInt(t.height) !== undefined ? { block: safeInt(t.height) } : {}) };
@@ -461,8 +464,11 @@ function afterTheFact(how: "unknown" | "dropped", tx_id: string, mine: SignedTx,
     // Its nonce was used: by this tx (through another node, or in a block this node no longer
     // holds) or by another one. Either way it's final: it can never execute again.
     let which: string;
+    // With witnesses only the nonce is proven: which tx used it (a sibling's status, a 404 and
+    // history_from) is still this node's word (audit review-r4-wallet-4).
+    const nodeWord = fate.proven ? " Only the nonce is proven: which tx used it is this node's word." : "";
     if (fate.sibling) {
-      which = `This MCP signed another tx with the same nonce, ${fate.sibling.id}, which this node shows ${fate.sibling.status === "finalized" ? "finalized" : "failed (its fee was charged)"}${fate.sibling.block !== undefined ? ` in block ${fate.sibling.block}` : ""}: that one used the nonce, so this one never ran and nothing was charged for it. Check that tx (tx_status ${fate.sibling.id}), not this one.`;
+      which = `This MCP signed another tx with the same nonce, ${fate.sibling.id}, which this node shows ${fate.sibling.status === "finalized" ? "finalized" : "failed (its fee was charged)"}${fate.sibling.block !== undefined ? ` in block ${fate.sibling.block}` : ""}: that one used the nonce, so this one never ran and nothing was charged for it. Check that tx (tx_status ${fate.sibling.id}), not this one.${nodeWord}`;
     } else {
       const earliest = fate.maxValidity !== undefined ? Math.max(1, vu - fate.maxValidity) : 1;
       const holdsAll = fate.historyFrom !== undefined && fate.historyFrom <= earliest;
@@ -470,7 +476,7 @@ function afterTheFact(how: "unknown" | "dropped", tx_id: string, mine: SignedTx,
       const lacks = !holdsAll || fate.recheck !== "absent";
       which = lacks
         ? `It may have been this one${how === "dropped" ? ", included by another node after this one dropped it" : holdsAll ? ": asked again after its nonce was read, this node gave no clear answer" : `: this node ${fate.historyFrom !== undefined ? `only holds blocks from #${fate.historyFrom} on` : "may not hold the block it ran in"}, so it may have pruned or never held it`}. Look it up on an archive node (or in ${mine.account}'s history) to see whether this one ran and whether it succeeded.`
-        : `This node holds every block it could have run in (from #${fate.historyFrom}) and ${how === "dropped" ? "shows it in none of them" : "has no record of it"}, so most likely another tx used that nonce and this one never ran; confirm on another node (or in ${mine.account}'s history).`;
+        : `This node says it holds every block it could have run in (from #${fate.historyFrom}) and ${how === "dropped" ? "shows it in none of them" : "has no record of it"}, so most likely another tx used that nonce and this one never ran; confirm on another node (or in ${mine.account}'s history).${nodeWord}`;
     }
     return {
       status: "nonce_used",
@@ -530,9 +536,12 @@ function inBlock(tx: any, link: string): Record<string, unknown> {
  * signed, valid_until, account and nonce are what it signed (signed.ts), not the node's word, and
  * one the node can't show is read against the head and the account's nonce (afterTheFact).
  */
-tool("tx_status", "Check a transaction by id: finalized (with its block), failed in a block (its fee was charged), pending, or dropped from this node's mempool without running (nothing charged, but another node may still include it until valid_until, so it must not be sent again before then), with its plain-English summary. For a tx this MCP signed that the node can't show: nonce_used (its nonce ran: it can never execute again, and may already have gone through), expired (past valid_until, nonce unused: it never ran), or unknown/dropped (still in flight).", { tx_id: z.string().regex(/^[0-9a-f]{64}$/) }, async ({ tx_id }) => {
+tool("tx_status", "Check a transaction by id: finalized (with its block), failed in a block (its fee was charged), pending, or dropped from this node's mempool without running (nothing charged, but another node may still include it until valid_until, so it must not be sent again before then), with its plain-English summary. For a tx this MCP signed that the node can't show: nonce_used (its nonce ran: it can never execute again, and may already have gone through), expired (past valid_until, nonce unused: it never ran), unknown/dropped (still in flight), or other_chain (signed for another network: ask that one).", { tx_id: z.string().regex(/^[0-9a-f]{64}$/) }, async ({ tx_id }) => {
   const client = await chain();
-  const mine = SIGNED.get(tx_id);
+  // A record from another network (BLOCKULA_HOME is shared by all of them) says nothing about this
+  // one: its account's nonce and this chain's head are another chain's (audit review-r4-wallet-3).
+  const record = SIGNED.get(tx_id);
+  const mine = record && onChain(record, pinnedChain) && isAddress(record.account, pinnedChain.prefix) ? record : undefined;
   const link = explorer(`tx/${tx_id}`);
   const until = (v: number | undefined) => (v === undefined ? "its valid_until (unknown here: this MCP didn't sign it)" : `block ${v}`);
   let tx: any;
@@ -545,6 +554,19 @@ tool("tx_status", "Check a transaction by id: finalized (with its block), failed
       // It ran in a block that executed after the first read: answered as what it is.
       if (fate.recheck && fate.recheck !== "absent") return inBlock(fate.recheck.ran, link);
       return { ...afterTheFact("unknown", tx_id, mine, fate), explorer: link };
+    }
+    if (e instanceof ApiError && e.status === 404 && record) {
+      const signedFor = record.chain_id !== undefined ? `chain ${record.chain_id} (genesis ${record.genesis_hash})` : "a chain it didn't record (it was signed before this MCP kept that)";
+      return {
+        status: "other_chain",
+        tx_id,
+        account: record.account,
+        nonce: record.nonce,
+        valid_until: record.valid_until,
+        ...(record.chain_id !== undefined ? { signed_for_chain_id: record.chain_id, signed_for_genesis_hash: record.genesis_hash } : {}),
+        next: `This MCP signed it for ${signedFor}, not the network it's on now (${pinnedChain.chainId ?? "unknown"} at ${RPC}), which can't say whether it ran. Do NOT send it again, and don't tell the user it failed or never ran: ask a node of the network it was signed for (run the MCP on that network and call tx_status again).`,
+        explorer: link,
+      };
     }
     throw e;
   }
