@@ -21,7 +21,8 @@
 #                                     unless IPS="ip ip …", or P2P_ADDRS="host:port …"); no Fly calls
 #   RESET=1 deploy/launch.sh          wipe the apps' machines, volumes and secrets (another chain's
 #                                     data) before launching $CHAIN_ID. Refused once $CHAIN_ID has
-#                                     launched: a chain id is never reused, pick a new one
+#                                     launched (its validators were deployed, even if the launch
+#                                     then failed): a chain id is never reused, pick a new one
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -79,16 +80,20 @@ if ! fly_ok && [ -n "${RESET:-}" ]; then echo "❌ RESET=1 with GENESIS_ONLY=1: 
 if fly_ok; then fly auth whoami >/dev/null || { echo "Run: fly auth login" >&2; exit 1; }; fi
 mkdir -p "$CONF" && chmod 700 "$CONF"
 [ -n "${SKIP_BUILD:-}" ] || cargo build --release --locked --manifest-path node/Cargo.toml -q
-BIN=node/target/release/blockula
+BIN=${BIN:-node/target/release/blockula}
+# Seconds between the liveness checks of a rolling restart (60 of them), for tests.
+PROGRESS_SECS=${PROGRESS_SECS:-5}
 
 if [ "${RESET:-}" = 1 ]; then
-  [ ! -f "$NET/launched" ] || { echo "❌ $CHAIN_ID has launched already: a chain id is never reused. Set CHAIN_ID to a new one (and RESET=1 to clear the apps)." >&2; exit 1; }
+  [ ! -f "$NET/launched" ] || { echo "❌ $CHAIN_ID has launched already (its validators were deployed and may have signed blocks): a chain id is never reused. Rerun without RESET to finish this launch, or set CHAIN_ID to a new one (and RESET=1 to clear the apps)." >&2; exit 1; }
   echo "♻️  RESET: destroying the apps' machines, volumes and secrets before launching $CHAIN_ID"
   for app in "${APPS[@]}"; do
     fly machines list -a "$app" --json 2>/dev/null | jq -r '.[].id' | while read -r m; do fly machine destroy "$m" -a "$app" --force >/dev/null; done
     fly volumes list -a "$app" --json 2>/dev/null | jq -r '.[].id' | while read -r v; do fly volumes destroy "$v" -a "$app" --yes >/dev/null; done
     fly secrets list -a "$app" --json 2>/dev/null | jq -r '.[].name // .[].Name' | while read -r s; do fly secrets unset "$s" -a "$app" --stage >/dev/null; done
   done
+  # Those secrets included any this chain staged on an earlier, failed attempt: stage them again.
+  rm -f "$NET/secrets-staged"
 fi
 
 ensure_app() { fly apps list --org "$ORG" --json | jq -e --arg a "$1" '.[] | select(.Name == $a)' >/dev/null || fly apps create "$1" --org "$ORG" >/dev/null; }
@@ -110,6 +115,8 @@ dedicated_v4() {
 }
 has_secret() { fly secrets list -a "$1" --json | jq -e --arg s "$2" 'map(.name // .Name) | index($s)' >/dev/null; }
 height() { curl -fsS -m 5 "$RPC_URL/api/status" 2>/dev/null | jq -r '.height // 0' 2>/dev/null || echo 0; }
+# Whether the chain finalizes new blocks within 5 minutes of `before` (a height).
+progressed() { for _ in $(seq 60); do [ "$(height)" -gt "$(($1 + 5))" ] && return 0; sleep "$PROGRESS_SECS"; done; return 1; }
 # Country of a Fly region, for the operator files' independence fields (DEC-14 display only).
 country_of() {
   case "$1" in
@@ -270,7 +277,17 @@ SPEC
   # opens the pool early (deploy/README.md lists them).
   $BIN genesis build --spec "$NET/spec.toml" --out "$NET/genesis.json"
   for i in $(seq 0 $((N - 1))); do cp "$NET/genesis.json" "$NET/v$i/genesis.json"; done
-  (umask 077; openssl rand -hex 32 > "$NET/forwarder-secret")
+  [ -f "$NET/forwarder-secret" ] || (umask 077; openssl rand -hex 32 > "$NET/forwarder-secret")
+elif fly_ok && [ ! -f "$NET/launched" ]; then
+  # A genesis an earlier, failed attempt built: its clock started then, and every hour it waits
+  # is a deficit the chain never makes up (blocks are at least a block time apart), counted
+  # against the weak-subjectivity period until a timed checkpoint exists.
+  built=$(jq -r '.created_at_ms' "$NET/genesis.json")
+  hours=$((($(date +%s) * 1000 - built) / 3600000))
+  if [ "$hours" -ge "${GENESIS_MAX_AGE_HOURS:-24}" ]; then
+    echo "❌ $NET/genesis.json was built $hours h ago and never launched. Rebuild it with a fresh clock (the keys stay): rm $NET/genesis.json $NET/spec.toml, then rerun. GENESIS_MAX_AGE_HOURS=$((hours + 1)) launches it as it is." >&2
+    exit 1
+  fi
 fi
 
 # The public node's `join` pins this genesis (CRY-2: joins without a pinned genesis are refused).
@@ -314,7 +331,12 @@ echo "🔨 Building $IMAGE on Fly's builders…"
 fly deploy . -c "$WORK/build.toml" --dockerfile deploy/Dockerfile --depot="${DEPOT:-false}" \
   --build-arg GIT_SHA="$TAG" --build-only --push --image-label "$TAG" >/dev/null
 
+# From here on validators run and sign: this genesis is live, and RESET is refused for it (a
+# retry after any failure below finishes this launch, or takes a new CHAIN_ID).
+touch "$NET/launched"
+
 SEEDING=()
+DEPLOYS=()
 for i in $(seq 0 $((N - 1))); do
   app=$PREFIX-v$i
   if has_secret "$app" VALIDATOR_KEY_B64; then SEEDING+=("$app"); fi
@@ -325,8 +347,11 @@ for i in $(seq 0 $((N - 1))); do
   echo "🧛 Deploying $app (${REGIONS[$i]})…"
   # --ha=false: exactly one machine per validator. Never scale a validator app.
   fly deploy -c "$WORK/$app.toml" --image "$IMAGE" --ha=false >/dev/null &
+  DEPLOYS+=($!)
 done
-wait
+failed=""
+for i in $(seq 0 $((N - 1))); do wait "${DEPLOYS[$i]}" || failed="$failed $PREFIX-v$i"; done
+[ -z "$failed" ] || { echo "❌ deploying$failed failed (fly logs -a <app>); rerun deploy/launch.sh, without RESET" >&2; exit 1; }
 
 rpc_toml > "$WORK/$RPC_APP.toml"
 echo "🌐 Deploying public node ${RPC_APP}…"
@@ -334,17 +359,16 @@ fly deploy -c "$WORK/$RPC_APP.toml" --image "$IMAGE" --ha=false >/dev/null
 
 # Keys are on their volumes now: delete them from Fly so no other machine can ever load them.
 # Not staged: each validator restarts without the variable, one at a time, the next once the
-# chain has finalized new blocks (3 of 4 keep it going).
+# chain has finalized new blocks (3 of 4 keep it going); without new blocks it stops there.
 for app in ${SEEDING[@]+"${SEEDING[@]}"}; do
   if fly ssh console -a "$app" -C "test -f /data/home/.seeded" >/dev/null 2>&1; then
     before=$(height)
     fly secrets unset VALIDATOR_KEY_B64 -a "$app" >/dev/null && echo "🔒 $app: key seeded on its volume; removed from Fly secrets"
-    for _ in $(seq 60); do [ "$(height)" -gt "$((before + 5))" ] && break; sleep 5; done
+    progressed "$before" || { echo "❌ no new blocks at $RPC_URL within 5 minutes of restarting $app (from #$before): stopping before the next validator. Check fly logs -a $app, then rerun deploy/launch.sh (without RESET) to remove the remaining keys." >&2; exit 1; }
   else
     echo "⚠️  $app: couldn't confirm the key was seeded; VALIDATOR_KEY_B64 left in place" >&2
   fi
 done
-touch "$NET/launched"
 
 # Informational only: a failure here (e.g. a stale local DNS cache) must not skip anything above.
 for _ in $(seq 60); do curl -fsS "$RPC_URL/api/health" >/dev/null 2>&1 && break; sleep 5; done

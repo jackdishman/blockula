@@ -10,13 +10,15 @@
 # and no permissions: it ends up on internet-facing machines.
 #
 # Apps restart one at a time, and the next waits until the chain has finalized new blocks, so
-# 3 of 4 validators are always up and the chain keeps going.
+# 3 of 4 validators are always up and the chain keeps going. Without new blocks within 5 minutes
+# it stops there, leaving the rest as they were.
 set -euo pipefail
 
 PREFIX=${PREFIX:-blockula}
 RPC_APP=${RPC_APP:-$PREFIX-testnet}
 N=${N:-4}
 RPC_URL=https://$RPC_APP.fly.dev
+PROGRESS_SECS=${PROGRESS_SECS:-5}   # between the liveness checks (60 of them), for tests
 
 IFS= read -r TOKEN || true
 TOKEN=${TOKEN//[[:space:]]/}
@@ -39,6 +41,8 @@ for app in $(for i in $(seq 0 $((N - 1))); do echo "$PREFIX-v$i"; done) "$RPC_AP
   before=$(height)
   printf 'GITHUB_TOKEN=%s\n' "$TOKEN" | fly secrets import -a "$app" >/dev/null
   echo "🔑 $app: GITHUB_TOKEN set (machine restarted)"
-  for _ in $(seq 60); do [ "$(height)" -gt "$((before + 5))" ] && break; sleep 5; done
+  ok=""
+  for _ in $(seq 60); do [ "$(height)" -gt "$((before + 5))" ] && { ok=1; break; }; sleep "$PROGRESS_SECS"; done
+  [ -n "$ok" ] || { echo "❌ no new blocks at $RPC_URL within 5 minutes of restarting $app (from #$before): stopping before the next app. Check fly logs -a $app, then rerun." >&2; exit 1; }
 done
 echo "✓ GITHUB_TOKEN set on $N validators and $RPC_APP"
