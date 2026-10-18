@@ -446,6 +446,16 @@ console.log("✓ names that get signed are proven against the client's witnesses
   fw.account = BOB; // an address the caller checked
   await fw.send(BOB, "1");
   assert.equal(flip.posted.length, 1);
+  // A tx built by hand (a generic action form) hands its resolutions to `build`, which refuses an
+  // unproven one on mainnet like the helpers do; proven ones and addresses sign (audit main13-signing-1).
+  const unproven = await mw.client.resolution("vlad.boo");
+  await assert.rejects(mw.build({ type: "delegate", validator: unproven.address, amount: "1" }, "", { unproven: [unproven] }), UnprovenNameError);
+  const given = await mw.client.resolution(VALIDATOR);
+  assert.equal((await mw.build({ type: "delegate", validator: given.address, amount: "1" }, "", { unproven: [given] })).action.type, "delegate");
+  const test = Wallet.fromSeed("0e".repeat(32), new Client("http://redirect.node"));
+  const there = await test.client.resolution("alice.boo");
+  assert.equal(there.proven, false);
+  assert.equal((await test.build({ type: "delegate", validator: there.address, amount: "1" }, "", { unproven: [there] })).action.type, "delegate", "off mainnet it's shown, not refused");
 }
 console.log("✓ on mainnet, fields that need an address never sign an unproven name (staking, actAs, key grants), checked against the signing status");
 

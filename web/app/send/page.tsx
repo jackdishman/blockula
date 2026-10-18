@@ -175,6 +175,8 @@ function Send() {
   if (review) {
     const fee = BigInt(review.tx.fee);
     const amt = BigInt((review.tx.action as { amount: string }).amount);
+    // A first payment opens the recipient's account, which burns the creation fee from this one (v1).
+    const opening = review.pf && review.pf.cost > amt + fee ? review.pf.cost - amt - fee : 0n;
     const me = account?.names[0] ?? "You";
     return (
       <main className="narrow stack-lg">
@@ -202,9 +204,15 @@ function Send() {
             <dt>Amount</dt>
             <dd>{formatFang(amt)}</dd>
             <dt>Network fee</dt>
-            <dd>{formatFang(fee)} <span className="dim small">(burned)</span></dd>
+            <dd>{formatFang(fee)} <span className="dim small">at most (burned)</span></dd>
+            {opening > 0n && (
+              <>
+                <dt>Opening their account</dt>
+                <dd data-testid="opening">{formatFang(opening)} <span className="dim small">(burned: this is the first payment to it)</span></dd>
+              </>
+            )}
             <dt className="total">Total</dt>
-            <dd className="total"><b>{formatFang(amt + fee)}</b></dd>
+            <dd className="total"><b>{formatFang(amt + fee + opening)}</b></dd>
             {review.tx.memo && (
               <>
                 <dt>Memo</dt>

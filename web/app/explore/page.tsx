@@ -101,8 +101,8 @@ export default function ExplorePage() {
           <Stat v={s?.names?.toLocaleString("en-US") ?? "—"} k={<Term k="name">.boo names</Term>} />
           <Stat v={mempool.data?.count ?? s?.mempool ?? 0} k={<Term k="mempool">waiting</Term>} />
         </div>
-        <div className="row-between small dim" style={{ padding: "8px 0" }}>
-          <span className={healthy ? "ok" : healthy === false ? "error" : "dim"} style={{ margin: 0 }}>
+        <div className="row-between small dim pad-row">
+          <span className={`m0 ${healthy ? "ok" : healthy === false ? "error" : "dim"}`}>
             ● {healthy ? "The network is healthy" : healthy === false ? `Unhealthy: ${unhealthyBecause}` : "Checking health…"}
           </span>
           {validators.data?.blocks_until_next_epoch != null && <span>{plural(validators.data.blocks_until_next_epoch, "block")} until epoch {validators.data.epoch + 1}</span>}
@@ -113,9 +113,9 @@ export default function ExplorePage() {
         title="The latest blocks"
         aside={
           <span className="legend">
-            <span><span className="sw" style={{ background: "var(--ink-soft)" }} />has transactions</span>
-            <span><span className="sw" style={{ background: "rgba(23,18,15,.16)" }} />empty</span>
-            {me && <span><span className="sw" style={{ background: "var(--blood)" }} />yours</span>}
+            <span><span className="sw ink" />has transactions</span>
+            <span><span className="sw empty" />empty</span>
+            {me && <span><span className="sw mine" />yours</span>}
           </span>
         }
       >
@@ -147,7 +147,7 @@ export default function ExplorePage() {
           <Section title="Latest transactions">
             <Ledger txs={recent.txs} side={me?.address} me={me} head={head?.height} blockMs={blockMs} empty={`No transactions in the last ${plural(blocks.length + recent.searchedBack, "block")}.`} />
             {recent.txs.length < 12 && !recent.exhausted && blocks.length > 0 && (
-              <button className="link small" disabled={recent.scanning} onClick={() => recent.further()} style={{ marginTop: 8 }}>
+              <button className="link small mt-8" disabled={recent.scanning} onClick={() => recent.further()}>
                 {recent.scanning ? "Searching further back…" : recent.searchedBack ? "Search further back" : "Search earlier blocks"}
               </button>
             )}
@@ -168,7 +168,7 @@ export default function ExplorePage() {
               <ul className="ledger">
                 {hunts.data.hunts.slice(0, 4).map((h) => (
                   <li key={h.id}>
-                    <Link href={to.hunt(h.id)} className="ledger-row" style={{ gridTemplateColumns: "minmax(0,1fr) auto" }}>
+                    <Link href={to.hunt(h.id)} className="ledger-row two">
                       <span className="ledger-main">
                         <span className="ledger-summary">{h.title}</span>
                         <span className="ledger-meta">{h.repo}#{h.issue} · {plural(h.funders.length, "funder")}</span>

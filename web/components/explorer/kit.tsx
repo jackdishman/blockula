@@ -198,7 +198,7 @@ export function NotFound({ what, error }: { what: string; error: Error }) {
 export function Loading({ children = "Rising from the grave…" }: { children?: ReactNode }) {
   return (
     <main className="wide">
-      <p className="dim center" style={{ padding: "60px 0", fontStyle: "italic" }}>
+      <p className="dim center loading-note">
         {children}
       </p>
     </main>
@@ -216,6 +216,16 @@ export function Ext({ href, children, className }: { href: string | null | undef
       {children}
     </a>
   );
+}
+
+/**
+ * A GitHub issue or PR page for a repo and number, built here from data it can check (`owner/name`
+ * and a whole number) rather than taken from a node's `*_url` field, so a link from chain data
+ * only ever goes to github.com.
+ */
+export function github(repo: string, kind: "issues" | "pull", n: number | null | undefined): string | null {
+  if (!/^[\w.-]+\/[\w.-]+$/.test(repo) || !Number.isSafeInteger(n) || (n as number) < 0) return null;
+  return `https://github.com/${repo.split("/").map(encodeURIComponent).join("/")}/${kind}/${n}`;
 }
 
 export const plural = (n: number, one: string, many = `${one}s`) => `${n.toLocaleString("en-US")} ${n === 1 ? one : many}`;

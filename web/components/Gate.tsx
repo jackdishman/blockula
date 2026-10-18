@@ -1,12 +1,12 @@
 "use client";
 
-import { Wallet } from "@blockula/sdk";
+import type { Wallet } from "@blockula/sdk";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useState, type ReactNode } from "react";
 import { localKeysAllowed } from "@/lib/config";
 import { friendly, isPrfUnsupported } from "@/lib/errors";
-import { findAccounts, unlockPasskey, type AccountChoice } from "@/lib/keys";
+import { findAccounts, openLocalKey, unlockPasskey, type AccountChoice } from "@/lib/keys";
 import type { Hint } from "@/lib/session";
 import { useWallet } from "@/lib/wallet";
 import { AccountPicker } from "./AccountPicker";
@@ -78,8 +78,7 @@ export function Unlock() {
     setError(null);
     try {
       if (h.kind === "local") {
-        if (!localOk) throw new Error("Browser-only keys are disabled on mainnet. Switch to a test network to open this one.");
-        const w = Wallet.fromSeed(h.seed as string, client);
+        const w = openLocalKey(client, h);
         if (h.account) {
           await w.actAs(h.account);
           unlocked(w, h);

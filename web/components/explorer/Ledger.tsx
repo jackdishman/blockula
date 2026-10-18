@@ -27,9 +27,26 @@ const KIND: Record<string, string> = {
   reveal_votes: "Revealed",
   withdraw_vested: "Withdrew",
   vouch: "Vouched",
+  unvouch: "Unvouched",
   register_validator: "Validator",
   approve_validator: "Approved",
   remove_validator: "Removed",
+  delegate: "Staked",
+  undelegate: "Unstaking",
+  redelegate: "Restaked",
+  withdraw_unbonded: "Unstaked",
+  update_validator: "Commission",
+  unjail: "Unjailed",
+  propose: "Proposed",
+  vote: "Voted",
+  unlock: "Unlocked",
+  multisig_create: "Multisig",
+  multisig_propose: "Multisig",
+  multisig_approve: "Approved",
+  renew_name: "Renewed",
+  transfer_name: "Name",
+  release_name: "Released",
+  claim_distribution: "Claimed",
 };
 
 /** The ledger column: what happened, read from `side` (the account the list is about). */
@@ -117,7 +134,7 @@ export function Ledger({
               <span className="ledger-when" title={t.height ? `block #${t.height}` : "waiting for a block"}>
                 {t.height ? `#${t.height}` : "pending"}
                 {t.height != null && head != null && (
-                  <span className="block" style={{ fontSize: 12 }}>
+                  <span className="ledger-age">
                     {ageOf(t.height, head, blockMs)}
                   </span>
                 )}

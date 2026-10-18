@@ -59,7 +59,11 @@
 .pill.pending { color: var(--ochre); }
 .pill.failed { color: var(--blood); }
 .pill.dim { color: var(--dim); }
-.chip { display: inline-flex; align-items: baseline; gap: 5px; padding: 0 7px; border: 1px solid var(--hair); font: 400 13px/1.55 var(--caps); letter-spacing: 0.08em; color: var(--ink-soft); white-space: nowrap; text-transform: lowercase; }
+/* A chip may carry a stranger's label: it wraps rather than push a phone's screen sideways. */
+.chip { display: inline-flex; align-items: baseline; gap: 5px; padding: 0 7px; border: 1px solid var(--hair); font: 400 13px/1.55 var(--caps); letter-spacing: 0.08em; color: var(--ink-soft); white-space: nowrap; text-transform: lowercase; max-width: 100%; }
+.chip > * { min-width: 0; }
+.chip, .ledger-memo, .wrap-any { overflow-wrap: anywhere; }
+@media (max-width: 640px) { .chip { white-space: normal; } }
 .chip.agent { border-color: var(--ink-soft); border-style: dotted; }
 .chip.this { border-color: var(--blood); color: var(--blood); }
 a.chip { text-decoration: none; }
@@ -357,6 +361,51 @@ button.tbody { cursor: pointer; }
   .tnode, .tedge .tline, .tedge .thead { transition: none; }
   .ribbon .cell.born > span { animation: none; }
 }
+
+/* Layout helpers instead of style attributes: the CSP admits no inline styles in server-rendered
+   HTML, so sizes computed at runtime arrive as CSS variables (lib/cssvars.ts). */
+.contents { display: contents; }
+.m0 { margin: 0; }
+.self-start { align-self: flex-start; }
+.span-all { grid-column: 1 / -1; }
+.mt-8 { margin-top: 8px; }
+.mt-10 { margin-top: 10px; }
+.mt-12 { margin-top: 12px; }
+.mt-16 { margin-top: 16px; }
+.mt-18 { margin-top: 18px; }
+.mb-14 { margin-bottom: 14px; }
+.pad-row { padding: 10px 0; }
+.pad-row-11 { padding: 11px 0; }
+.pad-row-12 { padding: 12px 0; }
+.stack.gap-4 { gap: 4px; }
+.stack.gap-6 { gap: 6px; }
+.ledger-row.two { grid-template-columns: minmax(0, 1fr) auto; }
+.ledger-row.one { grid-template-columns: minmax(0, 1fr); }
+.ledger-age { display: block; font-size: 12px; }
+.sw.in, .keyline.in { background: var(--in); }
+.sw.out, .keyline.out { background: var(--out); }
+.sw.ink { background: var(--ink-soft); }
+.sw.empty { background: rgba(23, 18, 15, 0.16); }
+.sw.mine { background: var(--blood); }
+.flow-sum { margin-top: 14px; border-top: 1px solid var(--ink); padding-top: 10px; }
+.flow-head.center { text-align: center; }
+.you.big { font-size: 14px; vertical-align: 8px; }
+.chip.name-chip { font-size: 15px; text-transform: none; }
+.key-label.big { font-size: 19px; }
+.loading-note { padding: 60px 0; font-style: italic; }
+.headline.won { font-size: 22px; }
+.pill.after { margin-left: 8px; }
+.h2-aside { text-transform: none; letter-spacing: 0; }
+.program-card.coming { border-style: dashed; cursor: default; }
+.btn.wrap { white-space: normal; overflow-wrap: anywhere; text-align: center; }
+.bars .bar-fill { display: block; width: var(--w, 0%); }
+.flow-bar { width: var(--w, 0%); }
+.meter > span { width: var(--w, 0%); }
+.ribbon .cell > span { height: var(--h, 0%); }
+.tooltip { left: var(--x, 0); top: var(--y, 0); }
+.trace-fit, .trace-plane { width: var(--w, auto); height: var(--h, auto); }
+.trace-plane { transform: var(--t, none); }
+.tnode { left: var(--x, 0); top: var(--y, 0); width: var(--w, auto); height: var(--h, auto); }
 
 /* Printing a receipt: just the receipt and its details, in ink on white. */
 @media print {

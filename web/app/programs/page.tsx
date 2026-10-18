@@ -42,7 +42,7 @@ export default function ProgramsPage() {
             <span className="figure">{figure[p.id]}</span>
             <ul className="iface">
               {p.actions.slice(0, 3).map((a) => (
-                <li key={a.kind}>
+                <li key={a.id ?? a.kind}>
                   <span className="fn">{a.kind}</span>
                   {signature(a).slice(a.kind.length)}
                 </li>
@@ -51,7 +51,7 @@ export default function ProgramsPage() {
             </ul>
           </Link>
         ))}
-        <div className="card program-card" style={{ borderStyle: "dashed", cursor: "default" }}>
+        <div className="card program-card coming">
           <span className="tag">coming</span>
           <h2>Your contract here</h2>
           <span className="dim">

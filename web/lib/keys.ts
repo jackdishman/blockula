@@ -41,6 +41,17 @@ export function createLocalKey(client: PinnedClient) {
   return { wallet, hint: { v: 1, kind: "local", keyId: wallet.keyId, seed: wallet.seedHex } satisfies Hint };
 }
 
+/**
+ * A browser-only key from its stored hint. Its seed sits in localStorage, where any script on
+ * this origin can read it, so it never opens on mainnet: the rule every unlock path shares (the
+ * wallet's Unlock, and the explorer's inline one; audit main13-signing-2).
+ */
+export function openLocalKey(client: PinnedClient, hint: Hint) {
+  if (!localKeysAllowed(client.pin.chainId)) throw new Error("Browser-only keys are disabled on mainnet. Switch to a test network to open this one.");
+  if (hint.kind !== "local" || !hint.seed) throw new Error("This isn't a browser-only key.");
+  return Wallet.fromSeed(hint.seed, client);
+}
+
 export type AccountChoice = { address: string; name: string | null; short: string; role: string; label: string; balance: string };
 
 /**

@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { cssVars } from "@/lib/cssvars";
 import { useLayoutEffect, useRef, useState } from "react";
 import { compactDrops } from "@/lib/explorer/ledger";
 import { to } from "@/lib/explorer/routes";
@@ -189,8 +190,8 @@ export function TraceGraph({
 
   return (
     <div className="trace-canvas" ref={box}>
-      <div className="trace-fit" style={{ width: width * scale, height: height * scale }}>
-        <div className="trace-plane" style={{ width, height, transform: scale < 1 ? `scale(${scale})` : undefined }} onPointerLeave={() => setHoverEdge(null)}>
+      <div className="trace-fit" ref={cssVars({ "--w": width * scale, "--h": height * scale })}>
+        <div className="trace-plane" ref={cssVars({ "--w": width, "--h": height, "--t": scale < 1 ? `scale(${scale})` : null })} onPointerLeave={() => setHoverEdge(null)}>
           <svg width={width} height={height} className="trace-svg" role="img" aria-label={`Money flows between ${trace.nodes.length} accounts; the list below has the same flows as text.`}>
             {geos.map((g) => {
               const t = tone(g);
@@ -236,7 +237,7 @@ export function TraceGraph({
               </>
             );
             return (
-              <div key={n.id} className={cls} style={{ left: p.x, top: p.y, width: NODE_W, height: NODE_H }} onPointerEnter={() => setHoverNode(n.id)} onPointerLeave={() => setHoverNode(null)}>
+              <div key={n.id} className={cls} ref={cssVars({ "--x": p.x, "--y": p.y, "--w": NODE_W, "--h": NODE_H })} onPointerEnter={() => setHoverNode(n.id)} onPointerLeave={() => setHoverNode(null)}>
                 {n.holding || isRoot ? (
                   <div className="tbody">{body}</div>
                 ) : (
@@ -261,7 +262,7 @@ export function TraceGraph({
             );
           })}
           {hovered && (
-            <div className="tooltip" style={{ left: hovered.mid.x, top: hovered.mid.y - hovered.w / 2 - 8 }}>
+            <div className="tooltip" ref={cssVars({ "--x": hovered.mid.x, "--y": hovered.mid.y - hovered.w / 2 - 8 })}>
               <b>{compactDrops(hovered.e.amount)} FANG</b>{" "}
               <span className="tl">
                 {whoText(at.get(hovered.e.from)?.n.who)} → {whoText(at.get(hovered.e.to)?.n.who)} · {hovered.e.txs.length} tx{hovered.e.txs.length === 1 ? "" : "s"}

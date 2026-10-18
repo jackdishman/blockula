@@ -54,21 +54,31 @@ export interface BlockView extends BlockSummary {
 
 export type TxStatus = "pending" | "finalized" | "failed";
 
-/** A transaction as `/api/tx/{id}` serves it. A dropped one has only id, status, error, height and summary. */
+/**
+ * A transaction as `/api/tx/{id}` serves it. A failure the node remembers without its transaction
+ * has only id, status, `dropped`, error, height and summary: `dropped` true means it was dropped
+ * from the mempool without running (nothing charged; `height` is when, not a block holding it),
+ * false that it ran in a block this node no longer holds (its fee was charged).
+ */
 export interface TxDetail {
   id: string;
   summary: string;
   kind?: string;
   status: TxStatus;
   error?: string | null;
+  dropped?: boolean;
   height: number | null;
   from?: Label;
+  /** Who the action named; for a sealed transaction, as the chain resolved it when it ran. */
   to?: Label | null;
+  /** The `.boo` name it was signed to, when it was signed to a name (protocol v1 nodes report it, null otherwise). */
+  to_name?: string | null;
+  valid_until?: number;
   amount?: string | null;
   amount_display?: string | null;
   fee?: string;
   fee_display?: string;
-  /** Later protocol versions: the most it allowed, and the part that tips the proposer. */
+  /** Protocol v1: the most it allowed, and the part of `fee` that tipped the proposer (the rest burned). */
   max_fee?: string;
   tip?: string;
   size_bytes?: number;
@@ -188,10 +198,30 @@ export interface ContributionProfile {
   next_claim_bond?: string;
 }
 
+/** A lock on an account's FANG (protocol v1): what's still vesting, or a vote's conviction lock. */
+export interface LockView {
+  id: string;
+  reason: string;
+  amount: string;
+  amount_display: string;
+  /** The height it ends (vesting) or lifts (a vote lock). */
+  until: number;
+  vesting: boolean;
+}
+
 export interface AccountDetail {
   account: Label;
   balance: string;
   balance_display: string;
+  /** Protocol v1: what it can move out now (locked FANG net of stake can't leave), its locks. */
+  transferable?: string;
+  transferable_display?: string;
+  locked?: string;
+  locked_display?: string;
+  locks?: LockView[];
+  /** Whether the chain has an account here yet, and what a payment that opens it burns from the payer. */
+  exists?: boolean;
+  creation_fee?: string;
   nonce: number;
   next_nonce: number;
   names: string[];
@@ -204,16 +234,26 @@ export interface AccountDetail {
   contribution: ContributionProfile | null;
 }
 
+/**
+ * `/api/name/{name}` (DEC-11): `status` is `active`; `grace` (expired: it resolves to nobody, and
+ * only its owner can renew it until `grace_until`); `reserved` (held at genesis, can't be
+ * registered); or `available`. `offered_to`: the account it's offered to, theirs once they accept.
+ */
 export interface NameDetail {
   name: string;
   available: boolean;
-  status?: string;
+  status?: "active" | "grace" | "reserved" | "available" | string;
   price?: string;
   price_display?: string;
   owner?: Label;
   registered_at?: number;
   expires_at?: number | null;
+  grace_until?: number | null;
+  offered_to?: Label | null;
+  renewal_price?: string;
   renewal_price_display?: string;
+  registration_blocks?: number;
+  grace_blocks?: number;
 }
 
 /**
@@ -239,6 +279,7 @@ export interface ValidatorRow {
   active_from_epoch?: number | null;
   active_until_epoch?: number | null;
   jailed?: { at: number; until: number; reason: string } | null;
+  tombstoned_at?: number | null;
   liveness?: { recorded: number; missed: number } | null;
 }
 
@@ -255,9 +296,25 @@ export interface ValidatorsDetail {
   approved?: ValidatorRow[];
   candidates?: ValidatorRow[];
   joining?: ValidatorRow[];
+  /** Protocol v1: active now, dropping out of the set at the next boundary. */
+  leaving?: ValidatorRow[];
   jailed?: ValidatorRow[];
+  /** Protocol v1: slashed out for double-signing, for good. */
+  tombstoned?: ValidatorRow[];
   removed?: ValidatorRow[];
+  /** Protocol v1: while the set carries one or two members, a newcomer joins only once a quorum of them admits it. */
+  admission?: { members: Label[]; quorum: number; ready_from: number } | null;
+  unbonding_blocks?: number;
   explainer?: string;
+}
+
+/** `/api/multisig/{account}`: a multisig account's threshold, owner keys and open proposals. */
+export interface MultisigView {
+  account: Label;
+  threshold: number;
+  owners: { key_id: string; label: string | null }[];
+  created_at: number;
+  pending: { id: number; action: { type: string; [k: string]: unknown }; summary: string; approvals: string[]; valid_approvals: number; expires_at: number; expired: boolean }[];
 }
 
 export interface MempoolView {

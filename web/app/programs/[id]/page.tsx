@@ -6,7 +6,8 @@ import { Suspense } from "react";
 import { ActionForm } from "@/components/explorer/ActionForm";
 import { Section, Term } from "@/components/explorer/kit";
 import { ProgramState } from "@/components/explorer/ProgramState";
-import { program, signature } from "@/lib/explorer/programs";
+import { actionId, program, signature } from "@/lib/explorer/programs";
+import { NETWORK } from "@/lib/config";
 import { to } from "@/lib/explorer/routes";
 
 export default function ProgramPage() {
@@ -30,7 +31,7 @@ function Program() {
         </section>
       </main>
     );
-  // `?do=fund_hunt&hunt_id=3` opens an action with fields filled in.
+  // `?do=fund_hunt&hunt_id=3` opens an action with fields filled in (by its id: `?do=accept_name`).
   const open = params.get("do");
   const initial = Object.fromEntries([...params.entries()].filter(([k]) => k !== "do"));
   return (
@@ -48,7 +49,7 @@ function Program() {
         <span className="sub">{p.tagline}</span>
       </div>
       {open && Object.keys(initial).length > 0 && (
-        <div className="banner">A link filled in this action. Check every field, and the preview, before you sign.</div>
+        <div className="banner">A link filled in this action. It doesn&apos;t say which network it was made for: a .boo name can belong to someone else on another one. Check every field against {NETWORK.label}, and the preview, before you sign.</div>
       )}
       <div className="cols">
         <div className="stack-lg">
@@ -56,12 +57,12 @@ function Program() {
           {p.actions.length > 0 && (
             <Section title="Actions" aside={<span className="dim small">preview, then sign</span>}>
               {p.actions.map((a) => (
-                <details key={a.kind} className="action" open={open === a.kind || (p.actions.length === 1 && !open)}>
+                <details key={actionId(a)} className="action" open={open === actionId(a) || (p.actions.length === 1 && !open)}>
                   <summary>
                     <span className="title">{a.title}</span>
                     <span className="sig">{a.kind}</span>
                   </summary>
-                  <ActionForm spec={a} initial={open === a.kind ? initial : {}} />
+                  <ActionForm spec={a} initial={open === actionId(a) ? initial : {}} />
                 </details>
               ))}
               {p.elsewhere && <p className="card-note">{p.elsewhere}</p>}
@@ -70,7 +71,7 @@ function Program() {
         </div>
         <Section title="Interface" aside={<span className="dim small">like a contract&apos;s</span>}>
           <span className="tag">reads</span>
-          <ul className="iface" style={{ marginBottom: 14 }}>
+          <ul className="iface mb-14">
             {p.reads.map((r) => (
               <li key={r.path}>
                 <span className="fn">GET {r.path}</span>
@@ -79,9 +80,9 @@ function Program() {
             ))}
           </ul>
           <span className="tag">actions</span>
-          <ul className="iface" style={{ marginBottom: 14 }}>
+          <ul className="iface mb-14">
             {p.actions.map((a) => (
-              <li key={a.kind}>
+              <li key={actionId(a)}>
                 <span className="fn">{a.kind}</span>
                 {signature(a)
                   .slice(a.kind.length)

@@ -2,6 +2,7 @@
 
 import { ApiError, CONVICTION_PERIODS, CONVICTION_TENTHS, convictionWeight, formatFang, paramsOf, parseFang, proposalSummary, type ProposalSummary } from "@blockula/sdk";
 import Link from "next/link";
+import { cssVars } from "@/lib/cssvars";
 import { useCallback, useEffect, useState } from "react";
 import { RequireWallet } from "@/components/Gate";
 import { ErrorNote, ExplorerLink, Spinner, Tip } from "@/components/ui";
@@ -123,8 +124,8 @@ function Tally({ p }: { p: ProposalSummary }) {
     <div>
       {total > 0n && (
         <div className="tally" role="img" aria-label={`${share}% aye`}>
-          <span className="aye" style={{ width: `${share}%` }} />
-          <span className="nay" style={{ width: `${100 - share}%` }} />
+          <span className="aye" ref={cssVars({ "--w": `${share}%` })} />
+          <span className="nay" ref={cssVars({ "--w": `${100 - share}%` })} />
         </div>
       )}
       <div className="dim small">

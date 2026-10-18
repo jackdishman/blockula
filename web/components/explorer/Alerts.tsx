@@ -15,7 +15,10 @@ import { signerOf } from "./Ledger";
 
 interface Notice {
   key: string;
+  /** The transaction it's about ("" when it's about several: see `href`). */
   tx: string;
+  /** Where "open" goes when there's no one transaction (an account's activity). */
+  href?: string;
   title: string;
   body: string;
   /** Signed from the side the notice is about. */
@@ -30,20 +33,37 @@ const HIDDEN_EVERY = 4;
 const SHOW_MS = 9000;
 const MAX_SHOWN = 4;
 
+/** Notices that outrank arrivals: they're what a stolen key or a runaway agent would do. */
+const urgent = (n: Notice) => n.tone === "agent" || n.tone === "out" || n.tone === "failed";
+
+/** What a poll saw of the account's own spending, to catch what scrolled out of `recent_txs`. */
+interface Spend {
+  nonce: number;
+  keys: Map<string, { spent: bigint; window: number; label: string; agent: boolean }>;
+}
+
 /**
  * Notices for money that moves while you're anywhere in the app: payments to you, spending by
  * your agents and other devices, your own transactions sealing, and activity on accounts you
  * watch. Read from the chain (works while locked), starting from what's already there: only
  * news is announced.
+ *
+ * Only while the wallet has the node on its chain (`chain.state` ok, and each round re-checks the
+ * pinned status): a node it refused never raises a notice (audit main13-signing-5). The node
+ * lists an account's newest 25 transactions, so a burst of them (anyone can pay you dust) can push
+ * a spend out of view between polls; the account's nonce and its keys' spending catch that, and
+ * arrivals in one round are folded into one notice so they can't crowd out a spend (audit
+ * main13-signing-6).
  */
 export function Alerts() {
   const me = useMe();
-  const { hint, wallet } = useWallet();
+  const { hint, wallet, chain, client } = useWallet();
   const watch = useWatchlist();
   const path = usePathname();
   const [shown, setShown] = useState<Notice[]>([]);
   const seen = useRef(new Map<string, Map<string, string>>());
   const told = useRef(new Set<string>());
+  const spends = useRef(new Map<string, Spend>());
   const pathRef = useRef(path);
   pathRef.current = path;
   const unread = useRef(0);
@@ -53,7 +73,8 @@ export function Alerts() {
   const meRef = useRef(me);
   meRef.current = me;
   const myKey = wallet?.keyId ?? hint?.keyId;
-  const followed = [...(myAddr ? [myAddr] : []), ...watch.map((w) => w.address).filter((a) => a !== myAddr)];
+  const onChain = chain.state === "ok";
+  const followed = onChain ? [...(myAddr ? [myAddr] : []), ...watch.map((w) => w.address).filter((a) => a !== myAddr)] : [];
   const followKey = followed.join(",");
 
   const dismiss = useCallback((key: string) => setShown((s) => s.filter((n) => n.key !== key)), []);
@@ -64,10 +85,15 @@ export function Alerts() {
     let tick = 0;
     let stop = false;
 
-    const announce = (n: Notice) => {
-      setShown((s) => [n, ...s.filter((x) => x.key !== n.key)].slice(0, MAX_SHOWN));
+    // Newest first, urgent ones kept over arrivals when there are too many to show.
+    const announce = (ns: Notice[]) => {
+      if (!ns.length) return;
+      setShown((s) => {
+        const all = [...ns, ...s.filter((x) => !ns.some((n) => n.key === x.key))];
+        return [...all.filter(urgent), ...all.filter((n) => !urgent(n))].slice(0, MAX_SHOWN).sort((a, b) => all.indexOf(a) - all.indexOf(b));
+      });
       if (document.visibilityState === "hidden") {
-        unread.current++;
+        unread.current += ns.length;
         title.current ??= document.title;
         document.title = `(${unread.current}) ${title.current}`;
       }
@@ -77,16 +103,50 @@ export function Alerts() {
       const before = seen.current.get(addr);
       const now = new Map(a.recent_txs.map((t) => [t.id, t.status] as const));
       seen.current.set(addr, now);
+      const own = addr === meRef.current?.address;
+      const prevSpend = spends.current.get(addr);
+      const spend: Spend = { nonce: a.nonce, keys: new Map(a.keys.map((k) => [k.key_id, { spent: parseDrops(k.spent_this_period), window: k.window_start, label: k.label, agent: k.role.type === "session" }])) };
+      spends.current.set(addr, spend);
       // The first look is the baseline: what's already there isn't news.
       if (!before) return;
+      const out: Notice[] = [];
+      const arrivals: Notice[] = [];
+      let sentSeen = 0;
+      const toldBy = new Map<string, bigint>();
       for (const t of [...a.recent_txs].reverse()) {
         const was = before.get(t.id);
         if (t.status === "pending" || (was && was !== "pending") || told.current.has(t.id)) continue;
+        if (t.from?.address === addr) {
+          sentSeen++;
+          if (t.signer_key) toldBy.set(t.signer_key, (toldBy.get(t.signer_key) ?? 0n) - deltaFor(t, addr).delta);
+        }
         const n = describe(t, addr, a, meRef.current, myKey, pathRef.current);
         // Even when it isn't worth a notice, a transaction is only ever considered once.
         told.current.add(t.id);
-        if (n) announce(n);
+        if (n) (n.tone === "in" ? arrivals : out).push(n);
       }
+      // Sent but never seen: the nonce moved further than the transactions that showed up.
+      const missed = own && prevSpend ? a.nonce - prevSpend.nonce - sentSeen : 0;
+      if (missed > 0 && prevSpend) {
+        let named = false;
+        for (const [id, k] of spend.keys) {
+          const p = prevSpend.keys.get(id);
+          const moved = !p || p.window !== k.window ? k.spent : k.spent - p.spent;
+          const extra = moved - (toldBy.get(id) ?? 0n);
+          if (k.agent && extra > 0n && id !== myKey) {
+            named = true;
+            out.push({ key: `${addr}:spent:${id}:${a.nonce}`, tx: "", title: `Your agent “${k.label}” spent`, body: `${missed} transaction${missed === 1 ? "" : "s"} from your account were pushed out of view by newer activity before this page saw ${missed === 1 ? "it" : "them"}. Check your activity.`, delta: -extra, tone: "agent", meta: `${compactDrops(k.spent)} FANG used this period`, href: to.account(addr) });
+          }
+        }
+        if (!named) out.push({ key: `${addr}:missed:${a.nonce}`, tx: "", title: "Signed on your account", body: `${missed} transaction${missed === 1 ? "" : "s"} from your account were pushed out of view by newer activity before this page saw ${missed === 1 ? "it" : "them"}. Check your activity.`, delta: null, tone: "out", href: to.account(addr) });
+      }
+      // Arrivals in one round fold into one notice.
+      const folded: Notice[] =
+        arrivals.length > 2
+          ? [{ key: `${addr}:in:${arrivals[0].tx}`, tx: "", title: "You received", body: `${arrivals.length} payments`, delta: arrivals.reduce((t, n) => t + (n.delta ?? 0n), 0n), tone: "in", href: to.account(addr) }]
+          : arrivals;
+      // Announced last, so they sit on top.
+      announce([...out.reverse(), ...folded]);
     };
 
     let busy = false;
@@ -97,6 +157,8 @@ export function Alerts() {
       if (busy || (hidden && tick % HIDDEN_EVERY)) return;
       busy = true;
       try {
+        // The pinned client's status: a node on another chain stops the round (ChainMismatchError).
+        if (!(await client.status().then(() => true, () => false))) return;
         for (const addr of hidden ? list.slice(0, myAddr ? 1 : 0) : list) {
           if (stop) return;
           const a = await nodeGet<AccountDetail>(`/account/${addr}`).catch(() => null);
@@ -120,9 +182,9 @@ export function Alerts() {
       clearInterval(t);
       document.removeEventListener("visibilitychange", back);
     };
-  }, [followKey, myAddr, myKey]);
+  }, [followKey, myAddr, myKey, client]);
 
-  if (!shown.length) return <div className="notices" aria-live="polite" />;
+  if (!onChain || !shown.length) return <div className="notices" aria-live="polite" />;
   return (
     <div className="notices" aria-live="polite">
       {shown.map((n) => (
@@ -154,8 +216,8 @@ function NoticeCard({ n, onClose }: { n: Notice; onClose: (key: string) => void 
       </div>
       <div className="notice-foot">
         {n.meta && <span className="dim">{n.meta}</span>}
-        <Link href={to.tx(n.tx)} onClick={() => onClose(n.key)}>
-          Receipt →
+        <Link href={n.tx ? to.tx(n.tx) : (n.href ?? to.explore())} onClick={() => onClose(n.key)}>
+          {n.tx ? "Receipt →" : "Activity →"}
         </Link>
       </div>
     </div>

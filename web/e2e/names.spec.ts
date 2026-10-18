@@ -37,6 +37,9 @@ test("a payment to an address signs that address", async ({ page, node }) => {
   await page.getByRole("button", { name: "Review" }).click();
   await expect(page.getByTestId("signed-to")).toHaveText(bob);
   await expect(page.getByTestId("by-chain")).toHaveCount(0);
+  // bob has no account yet: opening it burns the creation fee, and the total says so (audit main13-protocol-2).
+  await expect(page.getByTestId("opening")).toHaveText(/^0\.1 FANG/);
+  await expect(page.locator("dd.total")).toHaveText(/^2\.1000/);
   await page.getByRole("button", { name: "Confirm & send" }).click();
   await expect(page.getByRole("heading", { name: "Sent" })).toBeVisible();
   expect((node.submitted.at(-1) as Tx).action).toEqual({ type: "transfer", to: bob, amount: parseFang("2").toString() });

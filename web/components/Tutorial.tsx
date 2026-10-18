@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { cssVars } from "@/lib/cssvars";
 import { useEffect, useState, type ReactNode } from "react";
 import { explorer } from "@/lib/config";
 import { friendly } from "@/lib/errors";
@@ -76,7 +77,7 @@ export function Tutorial({ state, update }: { state: TutorialState; update: (p: 
           <button className="link small" onClick={() => update({ dismissed: true })}>Hide</button>
         </span>
       </div>
-      <div className="progress"><span style={{ width: `${(done / items.length) * 100}%` }} /></div>
+      <div className="progress"><span ref={cssVars({ "--w": `${(done / items.length) * 100}%` })} /></div>
       <ul className="checklist">
         {items.map((i, n) => (
           <li key={i.id} className={i.done ? "done" : ""}>
