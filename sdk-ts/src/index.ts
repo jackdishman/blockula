@@ -4,7 +4,7 @@ import { bytesToHex, hexToBytes, randomBytes, utf8ToBytes } from "@noble/hashes/
 import { base64urlnopad, bech32m } from "@scure/base";
 import { DEFAULT_TIP_CAP_MULTIPLE, KEY_POP_CONTEXT, PUBLIC_KEY_LEN, SIGNATURE_LEN, actionDigest, baseFee, formatFang, keyPopMessage, maxTip, parseFang, parseSoul, proposalDigest, seanceCommitment, seancePairsDigest, signingBytes, type SeanceClaimRef, type Action, type BaseFee, type KeyRole, type ProposalKind, type Tx, type UnsignedTx } from "./tx.js";
 import { NAMESPACES, checkProofResponse, decodeAccount, decodeName, type ProofResponse, type ProvenRecord } from "./proof.js";
-import { describeKind } from "./describe.js";
+import { describeKind, reviewAction } from "./describe.js";
 
 export * from "./tx.js";
 export * from "./proof.js";
@@ -998,10 +998,12 @@ export class Wallet {
    * A `vote` binds its proposal by digest, not by id: show it with `reviewAction(action, {
    * proposal: await client.proposal(action.proposal_id) })`, which describes the proposal only if
    * its content has that digest, and don't offer the approval unless it's `readable` (gap-7-6).
+   * Pass that proposal read as `proposal` here: approving a vote is refused, before anything is
+   * signed, unless the proposal shown (else one read now) has exactly the content the vote binds.
    * The approval counts on this wallet's account (`actAs`), which the digest doesn't bind: on
    * mainnet act for an address you checked, not a name one node resolved.
    */
-  async multisigApprove(id: number, opts: TxOptions & { action?: Action; digest?: string } = {}) {
+  async multisigApprove(id: number, opts: TxOptions & { action?: Action; digest?: string; proposal?: unknown } = {}) {
     const n = wholeNumber(id, "id");
     let action = opts.action;
     if (!action) {
@@ -1011,6 +1013,13 @@ export class Wallet {
     }
     const action_digest = actionDigest(action);
     shownDigest(opts.digest, action_digest, `multisig action #${n}`);
+    if (action.type === "vote") {
+      // What the ballot backs is the proposal whose content has its digest, whatever the node
+      // calls #id (audit gap-7-6): a node can't make other content hash to it.
+      const proposal = opts.proposal ?? (await this.client.proposal(action.proposal_id).catch(() => undefined));
+      const review = reviewAction(action, { proposal, freeText: false });
+      if (!review.readable) throw new Error(`multisig action #${n} can't be approved from here: ${review.does}. Nothing was signed`);
+    }
     return this.act({ type: "multisig_approve", id: n, action_digest }, opts);
   }
 

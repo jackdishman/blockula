@@ -590,6 +590,34 @@ console.log("✓ describeKind / describeAction render what a vote or approval bi
 }
 console.log("✓ describers say a cancellation supersedes open upgrade proposals, which validator addresses move and which consensus key registers; a multisig vote is described by the proposal its digest binds");
 
+// gap-7-6 through the SDK's own approval: approving a multisig's vote checks the proposal (the one
+// shown, else one read now) against the digest the vote binds, before anything is signed.
+{
+  const drain = { type: "treasury_spend", to: ATTACKER, amount: (10_000_000n * FANG).toString() };
+  const truth = proposalDigest(drain as never, "Community garden", "");
+  const ballot = { type: "vote", proposal_id: 12, aye: true, amount: (100_000_000n * FANG).toString(), conviction: 6, proposal_digest: truth } as Action;
+  const garlic = { id: 12, kind: { type: "text" }, title: "Plant garlic", url: "" };
+  const ms = host("http://ballot.node");
+  const w = Wallet.fromSeed("1e".repeat(32), new Client("http://ballot.node"));
+  ms.routes[`/multisig/${w.account}`] = { account: { address: w.account }, threshold: 2, owners: [], pending: [{ id: 4, action: ballot }] };
+  ms.routes["/proposal/12"] = garlic;
+  await assert.rejects(w.multisigApprove(4), /multisig action #4 can't be approved from here: .*NOT what the node shows as proposal #12.*Nothing was signed/);
+  await assert.rejects(w.multisigApprove(4, { action: ballot, proposal: garlic }), /NOT what the node shows as proposal #12/);
+  delete ms.routes["/proposal/12"];
+  await assert.rejects(w.multisigApprove(4), /read proposal #12 and check its digest before approving/);
+  assert.equal(ms.posted.length, 0, "no approval signed for a ballot whose proposal the node misrepresents or hides");
+  ms.routes["/proposal/12"] = { ...garlic, kind: drain, title: "Community garden", summary: "plant garlic" };
+  // A two-faced node that tells the truth now doesn't make the lie that was shown approvable.
+  await assert.rejects(w.multisigApprove(4, { proposal: garlic }), /NOT what the node shows as proposal #12/);
+  assert.equal(ms.posted.length, 0);
+  await w.multisigApprove(4);
+  assert.deepEqual(ms.posted.at(-1)!.action, { type: "multisig_approve", id: 4, action_digest: actionDigest(ballot) });
+  // Other actions are approved as before.
+  await w.multisigApprove(5, { action: { type: "transfer", to: BOB, amount: "5" } });
+  assert.equal(ms.posted.length, 2);
+}
+console.log("✓ multisigApprove of a vote checks the proposal it was shown against the digest the vote binds");
+
 // Audit gap-7-3: an absolute expiry counts from the height valid_until does, in one status read.
 // This node answers a lone status read 300 days ahead and the next one truthfully.
 const twoFaced = host("http://two-faced.node");
