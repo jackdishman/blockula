@@ -1,9 +1,10 @@
-# The public testnet, watched from outside Fly (deploy/README.md "External watch"). About every 10
-# minutes a GitHub runner checks https://blockula-testnet.fly.dev with scripts/testnet-watch.sh:
-# /api/health, the chain id, finality advancing, the head's age, the active validators, none
-# jailed or tombstoned. A failing check opens an issue labeled testnet-alert that @-mentions the
-# maintainer, so GitHub emails and pushes it to him, or comments on the one already open; the
-# first run that passes every check comments "Recovered" and closes it. To prove delivery:
+# The public testnet, watched from outside Fly (deploy/README.md "External watch"). Every 5
+# minutes, as GitHub's scheduler allows, a GitHub runner checks https://blockula-testnet.fly.dev
+# with scripts/testnet-watch.sh: /api/health, the chain id, finality advancing, the head's age,
+# the active validators, none jailed or tombstoned. A failing check opens an issue labeled
+# testnet-alert that @-mentions the maintainer, so GitHub emails and pushes it, or comments on the
+# one already open; the first run that passes every check comments "Recovered" and closes it. To
+# prove delivery:
 #   gh workflow run testnet-watch.yml -f test_alert=true
 # opens a test alert (the next healthy run closes it). The run stays green once the alert is
 # delivered and fails only when a gh call does (a broken alert path). It never runs on pull
@@ -11,7 +12,9 @@
 name: Testnet watch
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    # Off the top of the hour, when GitHub's scheduler is busiest and delays or drops the most runs
+    # (on "*/10" it started 1 of about 58 in the first ten hours).
+    - cron: "3,8,13,18,23,28,33,38,43,48,53,58 * * * *"
   workflow_dispatch:
     inputs:
       test_alert:

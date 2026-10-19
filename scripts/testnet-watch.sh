@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The public testnet, watched from outside Fly: .github/workflows/testnet-watch.yml runs this on a
-# GitHub runner about every 10 minutes (deploy/README.md "External watch"). Each check is a line
-# of the report:
+# GitHub runner every 5 minutes, as GitHub's scheduler allows (deploy/README.md "External watch").
+# Each check is a line of the report:
 #   health                /api/health answers HTTP 200 with ok: true
 #   chain id              /api/status reports CHAIN_ID
 #   finality              its finalized height advances across WAIT_SECS (two reads)
@@ -15,7 +15,7 @@
 # REMIND_SECS (a hidden marker in each report records which checks failed and when), since every
 # comment notifies the maintainer. With none open, one is opened (the label created if missing)
 # with the report, the time, the run's URL and an @-mention of the maintainer, so GitHub emails
-# and pushes it to him. When every check passes, the open one gets a "Recovered" comment and is
+# and pushes it. When every check passes, the open one gets a "Recovered" comment and is
 # closed. A test alert is opened (or commented) like a real one and says it's a test; it stays
 # open until the next run that passes every check closes it, which exercises the recovery path
 # with the same token.
@@ -262,7 +262,7 @@ if [ "$FAILURES" -gt 0 ] || [ "$TEST_ALERT" = true ]; then
     else
       title="Testnet alert: $(clean "$FIRST")"
       intro="$MENTION the external watch found the public testnet failing: $FAILING"
-      outro="While a check fails, each run (about every 10 minutes) adds its report here as a comment; the first run that passes every check comments \"Recovered\" and closes this issue. Runbooks: \`docs/OPERATIONS.md\` \"Runbooks\"; the testnet's day-2 tasks: \`deploy/README.md\` \"Day 2\"."
+      outro="While a check fails, runs add their report here as a comment when the failing checks change, and otherwise at most every $((REMIND_SECS / 60)) minutes; the first run that passes every check comments \"Recovered\" and closes this issue. Runbooks: \`docs/OPERATIONS.md\` \"Runbooks\"; the testnet's day-2 tasks: \`deploy/README.md\` \"Day 2\"."
     fi
     { echo "$intro"; echo; facts; echo; echo "$outro"; } > "$T/body.md"
     gh_run label create "$LABEL" --color B60205 --description "Opened and closed by the external testnet watch (testnet-watch.yml)" --force > /dev/null
