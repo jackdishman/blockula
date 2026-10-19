@@ -432,6 +432,18 @@ expect "launch: then the gate waits for every one to sign, link and propose agai
 for i in 0 3; do expect "launch: blockula-v$i proposed since its restart" "$(cat "$T/launch.out")" "blockula-v$i proposed #"; done
 refute "launch: no key in argv (hex)" "$(cat "$T/fly/log")" "$(tr -d '\n' < "$NETDIR/t-a/v0/validator.key")"
 refute "launch: no key in argv (base64)" "$(cat "$T/fly/log")" "$(base64 < "$NETDIR/t-a/v0/validator.key" | tr -d '\n')"
+# The spec's downtime window: half an epoch away jails (600 of 1,200 leader slots for four
+# validators), set by DOWNTIME_* (never a second line for the same key from EXTRA_PARAMS).
+spec=$(cat "$NETDIR/t-a/spec.toml")
+expect "launch: the spec's downtime window takes half an epoch away for four validators" "$spec" "downtime_window = 1200"
+expect "launch: … of which it may miss half" "$spec" "downtime_max_missed = 600"
+code=$(launch GENESIS_ONLY=1 CHAIN_ID=t-l REGIONS="iad sjc fra ams lhr sin nrt" DOWNTIME_WINDOW=900)
+spec=$(cat "$NETDIR/t-l-rehearsal/spec.toml" 2>/dev/null || true)
+[ "$code" = 0 ] && expect "launch: seven validators may miss fewer slots (300)" "$spec" "downtime_max_missed = 300" \
+  && expect "launch: DOWNTIME_WINDOW sets the window" "$spec" "downtime_window = 900" || bad "launch: downtime window for seven (exit $code): $(cat "$T/launch.out")"
+code=$(launch GENESIS_ONLY=1 CHAIN_ID=t-m EXTRA_PARAMS='jail_blocks = 20\ndowntime_window = 40\n')
+[ "$code" != 0 ] && [ ! -e "$NETDIR/t-m-rehearsal" ] && expect "launch: EXTRA_PARAMS can't set a downtime parameter again" "$(cat "$T/launch.out")" "use DOWNTIME_WINDOW and DOWNTIME_MAX_MISSED" \
+  || bad "launch: EXTRA_PARAMS with a downtime parameter (exit $code): $(cat "$T/launch.out")"
 code=$(launch RESET=1 CHAIN_ID=t-a)
 [ "$code" != 0 ] && expect "launch: RESET refused once launched" "$(cat "$T/launch.out")" "never reused" || bad "launch: RESET of a launched chain exited $code"
 code=$(launch CHAIN_ID=t-a)

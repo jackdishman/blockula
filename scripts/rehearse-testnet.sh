@@ -61,11 +61,11 @@ echo "📁 nodes: $DIR  keys: $NET"
 # machine: validators bind :: (dual stack).
 P2P_ADDRS="127.0.0.1:$BASE localhost:$((BASE + 1)) [::1]:$((BASE + 2)) [::ffff:127.0.0.1]:$((BASE + 3))"
 # A short downtime window, so an offline validator is jailed within a minute: 12 of 40 leader
-# slots. Still far stricter than the testnet's 50 of 100, and wide enough for a restart under
+# slots. Far stricter than the testnet's 600 of 1,200, and wide enough for a restart under
 # Fly's p2p preset that relinks within seconds (one that takes minutes is jailed here: a failure).
 GENESIS_ONLY=1 REHEARSAL_DIR=$NET CHAIN_ID=$CHAIN_ID EPOCH_BLOCKS=$EPOCH UNBONDING_BLOCKS=$WINDOW \
-  P2P_ADDRS=$P2P_ADDRS RPC_URL=$RPC SKIP_BUILD=1 \
-  EXTRA_PARAMS='downtime_window = 40\ndowntime_max_missed = 12\njail_blocks = 20\n' \
+  P2P_ADDRS=$P2P_ADDRS RPC_URL=$RPC SKIP_BUILD=1 DOWNTIME_WINDOW=40 DOWNTIME_MAX_MISSED=12 \
+  EXTRA_PARAMS='jail_blocks = 20\n' \
   deploy/launch.sh | tee "$DIR/launch.txt"
 GHASH=$("$BIN" checkpoint --genesis "$NET/genesis.json")
 SECRET=$(cat "$NET/forwarder-secret")

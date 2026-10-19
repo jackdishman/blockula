@@ -71,6 +71,14 @@ CONF=$HOME/.config/blockula
 NET=$CONF/$CHAIN_ID${GENESIS_ONLY:+-rehearsal}
 if [ -n "${GENESIS_ONLY:-}" ] && [ -n "${REHEARSAL_DIR:-}" ]; then NET=$REHEARSAL_DIR; fi
 N=${#REGIONS[@]}
+# Downtime: a validator is jailed past DOWNTIME_MAX_MISSED of its last DOWNTIME_WINDOW leader
+# slots. Each of N validators leads one view in N, and one that's away misses a turn every N−1
+# blocks, so the chain default (50 of 100, about right for mainnet's 31) jails one of four after
+# ~3 minutes away. These defaults jail after half an epoch away (600 of 1,200 for four validators,
+# ~30 minutes), as long as the beacon's reveal half, which jails a validator away for all of it
+# anyway (docs/OPERATIONS.md "Jailed or tombstoned").
+DOWNTIME_MAX_MISSED=${DOWNTIME_MAX_MISSED:-$((EPOCH_BLOCKS / 2 / (N > 1 ? N - 1 : 1)))}
+DOWNTIME_WINDOW=${DOWNTIME_WINDOW:-$((2 * DOWNTIME_MAX_MISSED))}
 RPC_URL=${RPC_URL:-https://$RPC_APP.fly.dev}
 APPS=("$RPC_APP"); for i in $(seq 0 $((N - 1))); do APPS+=("$PREFIX-v$i"); done
 source deploy/fly-config.sh
@@ -79,6 +87,10 @@ source deploy/restart-gate.sh
 
 fly_ok() { [ -z "${GENESIS_ONLY:-}" ]; }
 if ! fly_ok && [ -n "${RESET:-}" ]; then echo "❌ RESET=1 with GENESIS_ONLY=1: a rehearsal makes no Fly calls, so it never resets anything" >&2; exit 1; fi
+# The spec sets both downtime parameters itself: a second line for either would be a duplicate key.
+case "$(printf "%b" "${EXTRA_PARAMS:-}")" in
+  *downtime_window* | *downtime_max_missed*) echo "❌ EXTRA_PARAMS sets a downtime parameter the spec already sets: use DOWNTIME_WINDOW and DOWNTIME_MAX_MISSED" >&2; exit 1 ;;
+esac
 if fly_ok; then fly auth whoami >/dev/null || { echo "Run: fly auth login" >&2; exit 1; }; fi
 mkdir -p "$CONF" && chmod 700 "$CONF"
 [ -n "${SKIP_BUILD:-}" ] || cargo build --release --locked --manifest-path node/Cargo.toml -q
@@ -209,7 +221,7 @@ features = []
 
 # Mainnet's parameters, except durations short enough to exercise on a testnet: a week of
 # unbonding and of evidence (the weak-subjectivity period is half that), day-long votes, an
-# hour's timelock, spends open from genesis.
+# hour's timelock, spends open from genesis; and a downtime window sized for $N validators.
 [params]
 unbonding_blocks = $UNBONDING_BLOCKS
 evidence_max_age_epochs = $((UNBONDING_BLOCKS / EPOCH_BLOCKS))
@@ -217,6 +229,8 @@ voting_blocks = $DAY
 timelock_blocks = 3600
 governance_spend_height = 0
 proposal_deposit = "100000000000"
+downtime_window = $DOWNTIME_WINDOW
+downtime_max_missed = $DOWNTIME_MAX_MISSED
 $(printf "%b" "${EXTRA_PARAMS:-}")
 
 # Proof of Contribution from genesis: the pool's repos, an opening balance out of the endowment,
