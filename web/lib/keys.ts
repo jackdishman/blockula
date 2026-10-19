@@ -1,6 +1,6 @@
 "use client";
 
-import { Wallet } from "@blockula/sdk";
+import { isAddress, Wallet } from "@blockula/sdk";
 import { createPasskeyWallet, unlockPasskeyWallet } from "@blockula/sdk/passkey";
 import type { PinnedClient } from "./chain";
 import { localKeysAllowed, RP_ID, rpIdProblem } from "./config";
@@ -52,7 +52,17 @@ export function openLocalKey(client: PinnedClient, hint: Hint) {
   return Wallet.fromSeed(hint.seed, client);
 }
 
-export type AccountChoice = { address: string; name: string | null; short: string; role: string; label: string; balance: string };
+/**
+ * The account `hint` acts for, if it's an address on this chain. The hint isn't kept per chain, so
+ * one saved on another (a testnet relaunched with a new prefix: `boo1…` before `tboo1…`) names an
+ * account this chain refuses, down to the faucet: `undefined`, and the key's accounts are looked up
+ * here again.
+ */
+export async function hintAccount(client: PinnedClient, hint: Hint): Promise<string | undefined> {
+  return hint.account && isAddress(hint.account, await client.addressPrefix()) ? hint.account : undefined;
+}
+
+export type AccountChoice ={ address: string; name: string | null; short: string; role: string; label: string; balance: string };
 
 /**
  * Accounts this key may act for. The node always lists the key's own address (implicitly

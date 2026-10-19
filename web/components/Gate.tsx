@@ -6,7 +6,7 @@ import { useRouter } from "next/navigation";
 import { useEffect, useState, type ReactNode } from "react";
 import { localKeysAllowed } from "@/lib/config";
 import { friendly, isPrfUnsupported } from "@/lib/errors";
-import { findAccounts, openLocalKey, unlockPasskey, type AccountChoice } from "@/lib/keys";
+import { findAccounts, hintAccount, openLocalKey, unlockPasskey, type AccountChoice } from "@/lib/keys";
 import type { Hint } from "@/lib/session";
 import { useWallet } from "@/lib/wallet";
 import { AccountPicker } from "./AccountPicker";
@@ -78,22 +78,26 @@ export function Unlock() {
     setBusy(true);
     setError(null);
     try {
+      // An account saved on another chain isn't this one's: its key's accounts here are found
+      // again (it isn't a device waiting to be linked).
       if (h.kind === "local") {
         const w = openLocalKey(client, h);
-        if (h.account) {
-          await w.actAs(h.account);
+        const account = await hintAccount(client, h);
+        if (account) {
+          await w.actAs(account);
           unlocked(w, h);
-        } else await resolve(w, h, { waitingForLink: true });
+        } else await resolve(w, h, { waitingForLink: !h.account });
         return;
       }
       const { wallet: w, credentialId } = await unlockPasskey(client, h.credentialId);
       const next: Hint = { ...h, credentialId };
-      if (w.keyId === h.keyId && h.account) {
-        await w.actAs(h.account);
+      const account = await hintAccount(client, h);
+      if (w.keyId === h.keyId && account) {
+        await w.actAs(account);
         unlocked(w, next);
       } else {
-        // A different passkey than last time (or a device still waiting to be linked).
-        await resolve(w, { v: 1, kind: "passkey", credentialId, keyId: w.keyId }, { waitingForLink: w.keyId === h.keyId });
+        // A different passkey than last time, a device still waiting to be linked, or an account from another chain.
+        await resolve(w, { v: 1, kind: "passkey", credentialId, keyId: w.keyId }, { waitingForLink: w.keyId === h.keyId && !h.account });
       }
     } catch (e) {
       setError(isPrfUnsupported(e) && localOk ? `${friendly(e)} Start over to use a browser-only key instead.` : friendly(e));

@@ -460,6 +460,20 @@ console.log("✓ names that get signed are proven against the client's witnesses
 }
 console.log("✓ on mainnet, fields that need an address never sign an unproven name (staking, actAs, key grants), checked against the signing status");
 
+// An account kept from another chain (a testnet relaunched with a new prefix: `boo1…` on a
+// `tboo1…` chain) isn't one here: actAs refuses it, rather than act for an address whose every tx,
+// and faucet drip, the node refuses.
+{
+  host("http://tboo.node", { address_prefix: "tboo" });
+  const tw = Wallet.fromSeed("10".repeat(32), new Client("http://tboo.node"));
+  await assert.rejects(tw.actAs(addressFromPublicKey(tw.publicKey, "boo")), /is an address on another chain: this chain's addresses start with tboo1/);
+  assert.equal(tw.account, addressFromPublicKey(tw.publicKey, "tboo"), "actAs didn't switch accounts");
+  const there = addressFromPublicKey(pk(3), "tboo");
+  await tw.actAs(there);
+  assert.equal(tw.account, there);
+}
+console.log("✓ actAs refuses an address with another chain's prefix");
+
 // Audit gap-7-1 (the MCP's path): a caller that resolved a name itself hands the resolution to
 // `build` / `keyGrant`, which refuse an unproven one on mainnet against the signing status.
 {

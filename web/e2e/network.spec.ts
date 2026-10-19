@@ -1,5 +1,7 @@
+import { parseFang } from "@blockula/sdk";
+import { bech32m } from "@scure/base";
 import { CHAIN_ID, GENESIS } from "./env";
-import { createWallet, expect, test } from "./helpers";
+import { createWallet, expect, storedHint, test } from "./helpers";
 import { MockNode } from "./mock-node";
 
 test("shows the network and chain id on every screen", async ({ page }) => {
@@ -41,6 +43,26 @@ test("refuses a node whose addresses use another prefix", async ({ page, node })
   node.statusExtra = { address_prefix: "tboo" };
   await page.goto("/welcome");
   await expect(page.getByTestId("wrong-chain")).toContainText("tboo1");
+});
+
+test("an account saved on another chain is looked up again, and the faucet pays this chain's", async ({ page, node }) => {
+  // No faucet while onboarding, so the checklist's faucet is the one that pays below.
+  node.faucet = false;
+  const created = await createWallet(page);
+  node.faucet = true;
+  // The hint isn't kept per chain: a wallet from a testnet relaunched with another prefix still
+  // names that chain's address (the same key's, tboo1… on this boo1… chain), which the node
+  // refuses, down to the faucet (a 400).
+  const elsewhere = bech32m.encode("tboo", bech32m.decode(created.account as `${string}1${string}`).words);
+  await page.evaluate((h) => localStorage.setItem("blockula.wallet", h), JSON.stringify({ ...created, account: elsewhere }));
+  await page.reload();
+  await page.getByRole("button", { name: "Unlock with passkey" }).click();
+  await expect(page.getByText("The account of")).toBeVisible();
+  expect((await storedHint(page))?.account).toBe(created.account);
+  await page.getByRole("button", { name: /Get some FANG/ }).click();
+  await page.getByRole("button", { name: "Get 100 test FANG" }).click();
+  await expect.poll(() => node.acct(created.account).balance).toBe(parseFang("100"));
+  await expect(page.locator(".card.learn").getByRole("alert")).toHaveCount(0);
 });
 
 test("stops, and forgets the key, when the node switches chains mid-session", async ({ page, node }) => {

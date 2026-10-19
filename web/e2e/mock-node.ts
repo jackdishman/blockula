@@ -650,6 +650,10 @@ export class MockNode {
       if (req.method() === "POST" && path === "/faucet") {
         if (!this.faucet) throw new HttpError(400, "this chain has no faucet");
         const to = (JSON.parse(body ?? "{}") as { to: string }).to;
+        // As node/src/types.rs: an address with another chain's prefix is refused.
+        const prefix = String(this.statusExtra.address_prefix ?? "boo");
+        const theirs = to.match(/^(t?boo)1/)?.[1];
+        if (theirs && theirs !== prefix) throw new HttpError(400, `\`to\` is a ${theirs} address, but this chain's addresses start with ${prefix}1`);
         this.credit(to, "100");
         return reply(200, { id: this.record({ tx: null, kind: "transfer", from: FAUCET, to, amount: parseFang("100"), fee: 0n, memo: "faucet", summary: `faucet sent 100 FANG to ${this.label(to).short}` }) });
       }

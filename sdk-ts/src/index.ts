@@ -509,6 +509,10 @@ export class Wallet {
    */
   async actAs(account: string) {
     const r = await this.addressNeeded(await this.client.resolution(account));
+    // An address with another chain's prefix (a relaunched testnet's `boo1…` on a `tboo1…` chain)
+    // isn't an account here: every tx from it, and a faucet drip to it, would be refused.
+    const prefix = await this.client.addressPrefix();
+    if (!isAddress(r.address, prefix)) throw new Error(`${r.address} is an address on another chain: this chain's addresses start with ${prefix}1`);
     this.acting = r.address;
     this.actingUnproven = r.proven ? undefined : r;
     return this;

@@ -15,7 +15,7 @@ import type { Preflight } from "@/lib/explorer/preflight";
 import { type ActionSpec, type Param, signature, type Values } from "@/lib/explorer/programs";
 import { to } from "@/lib/explorer/routes";
 import { shortAddr } from "@/lib/format";
-import { openLocalKey, unlockPasskey } from "@/lib/keys";
+import { hintAccount, openLocalKey, unlockPasskey } from "@/lib/keys";
 import { useWallet } from "@/lib/wallet";
 import { Amount, Term } from "./kit";
 import { PreflightView } from "./PreflightView";
@@ -30,15 +30,20 @@ export function useInlineUnlock() {
   const router = useRouter();
   return async () => {
     if (!hint) return router.push("/welcome");
-    if (hint.kind === "local" && hint.account) {
+    // An account saved on another chain goes through the wallet's unlock screen, which finds this chain's.
+    if (hint.kind === "local") {
       const w = openLocalKey(client, hint);
-      await w.actAs(hint.account);
-      return unlocked(w, hint);
+      const account = await hintAccount(client, hint);
+      if (account) {
+        await w.actAs(account);
+        return unlocked(w, hint);
+      }
     }
     if (hint.kind === "passkey") {
       const { wallet: w, credentialId } = await unlockPasskey(client, hint.credentialId);
-      if (w.keyId === hint.keyId && hint.account) {
-        await w.actAs(hint.account);
+      const account = await hintAccount(client, hint);
+      if (w.keyId === hint.keyId && account) {
+        await w.actAs(account);
         return unlocked(w, { ...hint, credentialId });
       }
     }
