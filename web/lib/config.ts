@@ -131,11 +131,11 @@ export const RPC_COOKIE = "blockula_rpc";
 export const BLOCKS_PER_DAY = 86_400;
 
 /** Passkeys are bound to this hostname; wallets created elsewhere can't be unlocked here. */
-export const RP_ID = clean(process.env.NEXT_PUBLIC_RP_ID) || "blockula-wallet.vercel.app";
+export const RP_ID = clean(process.env.NEXT_PUBLIC_RP_ID) || "testnet.blockula.app";
 
 /**
  * Where payment links point. Passkeys are bound to RP_ID, so links go to the wallet on that host
- * (https://blockula-wallet.vercel.app by default), even when made on a preview deploy. When this
+ * (https://testnet.blockula.app by default), even when made on a preview deploy. When this
  * page is itself served from RP_ID (production, or `localhost` in development), its own origin is used.
  */
 export function walletUrl(): string {

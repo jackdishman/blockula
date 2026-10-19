@@ -30,7 +30,7 @@ Companion documents: [TOKENOMICS.md](TOKENOMICS.md) (supply, allocation, issuanc
 
 **Today** the founder is the repository owner and the only maintainer. He:
 - merges every PR, and so gates which PRs can earn testnet Hunts and pool rewards;
-- controls the GitHub repo and its releases, the npm packages, and the wallet origin (`blockula-wallet.vercel.app`);
+- controls the GitHub repo and its releases, the npm packages, and the wallet domain (`blockula.app`, registered in his own name; the testnet wallet is `testnet.blockula.app`, mainnet's will be `wallet.blockula.app`);
 - runs all four testnet validators, the public RPC and the explorer in one Fly.io organization, and generated every testnet key on one laptop;
 - holds the testnet's single admin key ("Season 0"). It approves validators, grants Soul, sets repo weights, flags sybils, rejects claims and claws back rewards.
 

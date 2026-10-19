@@ -17,7 +17,7 @@ Quantum entanglement is literally "spooky action at a distance". We took that pe
 
 | | |
 |---|---|
-| 👛 Wallet | **https://blockula-wallet.vercel.app**: passkey sign-up, free test FANG, claim a `.boo` name |
+| 👛 Wallet | **https://testnet.blockula.app**: passkey sign-up, free test FANG, claim a `.boo` name |
 | 🔎 Explorer + API | **https://blockula-testnet.fly.dev**: the public testnet. 4 validators across the US and Europe, ~1s finality |
 | 🤖 Agents | `claude mcp add blockula -- npx -y @blockula/mcp` uses the public testnet automatically |
 
@@ -233,7 +233,7 @@ node/     Rust node: consensus (Commonware simplex + marshal), chain execution, 
 scripts/  local-testnet.sh: 4 validators + full node smoke test
 sdk-ts/   @blockula/sdk: wallets, tx signing, client, passkey (WebAuthn PRF) helpers
 mcp/      @blockula/mcp: MCP server for coding agents
-web/      Passkey web wallet (Next.js), deployed at blockula-wallet.vercel.app
+web/      Passkey web wallet (Next.js), deployed at testnet.blockula.app
 deploy/   Fly.io testnet: Dockerfile, entrypoint, launch.sh
 docs/     ONE_PAGER.md (what this is), PLAN.md (architecture, tokenomics, roadmap), MAINNET.md (launch readiness),
           MAINNET-DESIGN.md (mainnet decisions and spec), TOKENOMICS.md (mainnet supply and allocation)

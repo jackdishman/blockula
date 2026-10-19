@@ -21,7 +21,7 @@
 
 ## What's live today
 - **Testnet** at `https://blockula-testnet.fly.dev`: 4 validators across the US and Europe, plus a public node with a built-in explorer that reads like plain English ("vlad.boo sent 5 FANG to alice.boo").
-- **Web wallet** at `https://blockula-wallet.vercel.app`: passkey sign-up, a `.boo` name, send and receive, a tutorial checklist, linking devices, and giving an agent a daily budget.
+- **Web wallet** at `https://testnet.blockula.app`: passkey sign-up, a `.boo` name, send and receive, a tutorial checklist, linking devices, and giving an agent a daily budget.
 - **`@blockula/sdk`** (TypeScript) and **`@blockula/mcp`** (for Claude Code or any MCP agent): `claude mcp add blockula -- npx -y @blockula/mcp` works with zero setup against the public testnet.
 - **Run your own:**
   - `blockula dev` gives you a local chain in one command.

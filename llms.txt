@@ -8,7 +8,7 @@
 - [Mainnet readiness](docs/MAINNET.md): launch blockers, sequence, open decisions
 - [Security](SECURITY.md): how to report vulnerabilities
 
-Public testnet: https://blockula-testnet.fly.dev · Wallet: https://blockula-wallet.vercel.app · One-pager: docs/ONE_PAGER.md
+Public testnet: https://blockula-testnet.fly.dev · Wallet: https://testnet.blockula.app · One-pager: docs/ONE_PAGER.md
 
 ## Fastest path
 1. `claude mcp add blockula -- npx -y @blockula/mcp` (the public testnet; `--network local` for a `blockula dev` chain, `--network mainnet` with `BLOCKULA_RPC` for mainnet). The network is pinned (chain id + genesis hash) and never switches on its own.

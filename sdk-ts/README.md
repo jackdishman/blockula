@@ -129,7 +129,7 @@ Every request has a timeout (`new Client(rpc, { timeoutMs })`, default 15 s, at 
 
 `verifyReleaseSignature(sig, checksumsFile, trustedKeyId)` checks a release's offline ML-DSA-65 signature (docs/OPERATIONS.md "Releases").
 
-The public testnet is `https://blockula-testnet.fly.dev`, and the wallet is https://blockula-wallet.vercel.app.
+The public testnet is `https://blockula-testnet.fly.dev`, and the wallet is https://testnet.blockula.app.
 
 Tests: `npm run test:vectors` (offline: passkey derivation, state-proof and tx-encoding vectors from the node, every protocol v1 helper against a fake node, pinning, proof freshness, timeouts, release signatures), `npm run test:kat` (ML-DSA known answers), `npm test` (end to end against `blockula dev`).
 

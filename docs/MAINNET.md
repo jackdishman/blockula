@@ -34,7 +34,7 @@ The decisions in section 6 have been made. [MAINNET-DESIGN.md](MAINNET-DESIGN.md
 | DEC-5 | 1B FANG, no sale: community 32%, treasury 25%, contribution endowment 15%, bootstrap delegation 10%, founder 10% (1-year cliff, 4-year vest), foundation 5%, operators and security grants 3%. See [TOKENOMICS.md](TOKENOMICS.md). |
 | DEC-6 | Account creation burns a fee and names renew yearly; every other record is already bonded. |
 | DEC-7 | Mainnet chain id `blockula-1` with address prefix `boo`; testnets use `tboo`. |
-| DEC-8 | The wallet's passkey domain is one the project's entity owns, never `*.vercel.app`. |
+| DEC-8 | The wallet's passkey domain is `wallet.blockula.app`, a host nothing else is served from, on a domain the project's entity owns. Never `*.vercel.app`. |
 | DEC-9 | Post-quantum transport before launch: a hybrid X25519 + ML-KEM-768 handshake in a vendored `commonware-stream`. |
 | DEC-10 | No admin keys and no faucet on mainnet. |
 | DEC-11 | Names: one-year registration, renewal at 20% a year, 30-day grace, transfer and release, a governance-assigned reserved list. |
@@ -550,7 +550,8 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
   - Local-key mode is off on mainnet.
   - The wallet is in audit scope.
 - **Effort:** M. **Who:** Team, Auditor.
-- ✅ **Code side (wave 1):** per-request nonce CSP (`strict-dynamic`), security headers, SRI on the framework chunks, local keys off on mainnet, and a mainnet build that refuses a shared-hosting rpId or missing pins (`web/proxy.ts`, `web/next.config.ts`, `web/lib/config.ts`). Pending: the domain (DEC-8), a locked-down production project, the audit.
+- ✅ **Code side (wave 1):** per-request nonce CSP (`strict-dynamic`), security headers, SRI on the framework chunks, local keys off on mainnet, and a mainnet build that refuses a shared-hosting rpId or missing pins (`web/proxy.ts`, `web/next.config.ts`, `web/lib/config.ts`). Pending: a locked-down production project, the audit.
+- ✅ **Domain (DEC-8):** `blockula.app` is registered (2026-10-18). Mainnet's rpId is `wallet.blockula.app`: a passkey bound to it can be used only there, never from `blockula.app` or a sibling such as `testnet.blockula.app`, where the testnet wallet now lives (`blockula-wallet.vercel.app` redirects there). Pending: moving the domain from the founder's Vercel account to the entity's.
 
 **WAL-4. Clients trust one RPC and can switch networks silently.**
 - **Missing:**
@@ -773,7 +774,7 @@ Tracks A and B set the date. Scope cuts shorten B and D, but not A: no contribut
 | DEC-5 | Supply and allocation | Initial supply (the testnet uses 1.1B). The split: foundation and treasury, team with vesting, operators, community, pool. Whether there's any sale (counsel). Issuance parameters (6% → 1.5% tail; 70/20/10). Fee parameters. | Phase 0; final in phase 4 |
 | DEC-6 | State rent and deposits | Which records pay, how much, and whether deposits are refundable (PLAN.md says refundable). This shapes CV-1's design. | Start of phase 1 |
 | DEC-7 | Chain id and address prefix | For example `blockula-1`. The chain id is in every signature and in the consensus namespace (`consensus.rs:65-67`), so it's permanent. Decide whether testnets get a prefix other than `boo` (`crypto.rs:11`) so their addresses can't be confused with mainnet ones. The mainnet prefix can't change after genesis. | Start of phase 1 |
-| DEC-8 | Wallet domain (passkey rpId) | Permanent. It must be a domain the project's entity owns, not `*.vercel.app`. | Phase 1, before the first mainnet passkey |
+| DEC-8 | Wallet domain (passkey rpId) | Permanent. It must be a domain the project's entity owns, not `*.vercel.app`. ✅ Decided: `wallet.blockula.app` (see "Decisions taken"). | Phase 1, before the first mainnet passkey |
 | DEC-9 | PQ transport | Either launch waits for CRY-1, or launch on X25519 and drop "no elliptic curves anywhere" from README and ONE_PAGER. | Phase 0 |
 | DEC-10 | Admin powers and faucet on mainnet | Admin powers: none; M-of-N with a timelock and a sunset date; or full governance at genesis. Faucet: suggest none (`faucet: false`). | Phase 0 |
 | DEC-11 | Name policy | Reserved or brand list, auctions for 3- and 4-character names, renewal and transfer (SF-9, LEG-3). | Phase 1 |
