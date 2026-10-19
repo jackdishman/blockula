@@ -326,7 +326,7 @@ dependencies = [
  "commonware-stream",
  "commonware-utils",
  "futures",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "hex",
  "imbl",
  "libfuzzer-sys",
