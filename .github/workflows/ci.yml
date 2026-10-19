@@ -180,6 +180,10 @@ jobs:
       # are the reviewed commit's own (audit F49 round 3).
       - name: Release files against the tagged source (scripts/check-release-files.sh)
         run: bash scripts/test-release-files.sh
+      # npm-publish.yml's own publish script, as a dry run against tarballs packed here: a publish
+      # command npm can't read fails on every PR instead of at release time (v0.5.0's dry run).
+      - name: npm publish step (npm-publish.yml's script as a dry run)
+        run: bash scripts/test-npm-publish.sh
       # The public testnet's entrypoint (key seeding, checkpoint join, flags) under dash as in the
       # image, the Fly machine configurations, and launch.sh / set-github-token.sh against a
       # stand-in fly (retries, RESET, key removal, rolling restarts), offline.

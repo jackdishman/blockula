@@ -104,7 +104,9 @@ jobs:
         run: |
           version=${GITHUB_REF_NAME#v}
           publish() {
-            tarball="dist-npm/$2-$version.tgz"
+            # "./": npm reads a bare dir/file argument as a GitHub owner/repo shorthand and tries
+            # `git ls-remote`, which is how v0.5.0's dry run failed (scripts/test-npm-publish.sh).
+            tarball="./dist-npm/$2-$version.tgz"
             [ -f "$tarball" ] || { echo "$tarball is missing" >&2; exit 1; }
             if npm view "$1@$version" version >/dev/null 2>&1; then echo "$1@$version is already on npm"; return; fi
             if [ "$DRY_RUN" = true ]; then npm publish "$tarball" --access public --provenance --ignore-scripts --dry-run; return; fi
