@@ -49,7 +49,7 @@ futures = "0.3"
 rand_core = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tracing = "0.1"
-zstd = "0.13"
+zstd = "0.14"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 imbl = { version = "=7.0.2", features = ["serde"] }
 borsh = { version = "=1.8.1", features = ["derive", "de_strict_order"] }
