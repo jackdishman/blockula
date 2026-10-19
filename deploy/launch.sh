@@ -11,8 +11,8 @@
 # consensus-key accounts, and the contribution pool open from genesis (its repos, an opening
 # balance out of the endowment, founding jurors' Soul). Keys are generated once on this laptop
 # under ~/.config/blockula/$CHAIN_ID (mode 700): consensus keys are uploaded only to their
-# validator, seeded onto its volume on first boot, then deleted from Fly; owner, founder,
-# foundation and stand-in juror keys never leave this machine. (A public testnet is still one
+# validator, seeded onto its volume on first boot, then deleted from Fly; owner, founder, grant
+# and stand-in juror keys never leave this machine. (A public testnet is still one
 # operator's machines; independent operators come with the incentivized testnet, OPS-1.)
 #
 #   deploy/launch.sh                  launch, or upgrade the nodes of, $CHAIN_ID
@@ -160,7 +160,7 @@ if [ ! -f "$NET/genesis.json" ]; then
   echo "🧬 Building the genesis of $CHAIN_ID ($N validators, prefix $ADDRESS_PREFIX)…"
   (umask 077; mkdir -p "$NET/operators")
   key() { [ -f "$1" ] || (umask 077; $BIN keygen --prefix "$ADDRESS_PREFIX" > "$1"); jq -r .address "$1"; }
-  FOUNDER=$(key "$NET/founder.json"); FOUNDATION=$(key "$NET/foundation.json"); GRANTS=$(key "$NET/grants.json")
+  FOUNDER=$(key "$NET/founder.json"); GRANTS=$(key "$NET/grants.json")
   ops="" ; allocs=""
   for i in $(seq 0 $((N - 1))); do
     (umask 077; mkdir -p "$NET/v$i")
@@ -171,8 +171,8 @@ if [ ! -f "$NET/genesis.json" ]; then
     # operators publish theirs (`genesis operator --http-addr`); validators' own HTTP stays on
     # Fly's private network, where the other nodes reach it (PEER_HTTP).
     # No seat is flagged `--founder-or-foundation`: the four stand in for a mainnet genesis's
-    # independent operators. The founder's and the foundation's stand-in accounts are excluded
-    # from the bootstrap delegation as on mainnet; flagging the seats too would leave the
+    # independent operators. The founder's stand-in account is excluded from the bootstrap
+    # delegation as on mainnet; flagging the seats too would leave the
     # delegation nobody to back, and DEC-3's cap (fewer such seats than f: none in a set of 4)
     # would keep a seat that left the set out for good (relaunch problem 2; staking test
     # `testnet_seats_leave_rejoin_and_get_the_bootstrap_delegation`).
@@ -204,7 +204,7 @@ if [ ! -f "$NET/genesis.json" ]; then
   cat > "$NET/spec.toml" <<SPEC
 # The $CHAIN_ID genesis spec, written by deploy/launch.sh. Rebuild it (byte-identically) with
 #   blockula genesis build --spec spec.toml --out genesis.json
-# Founder, foundation, grant and juror accounts are testnet stand-ins held by the launcher.
+# Founder, grant and juror accounts are testnet stand-ins held by the launcher.
 chain_id = "$CHAIN_ID"
 address_prefix = "$ADDRESS_PREFIX"
 genesis_time_ms = $GENESIS_MS
@@ -251,7 +251,7 @@ amount = "320000000"
 
 [[allocation]]
 bucket = "treasury"
-amount = "250000000"
+amount = "300000000"
 
 [[allocation]]
 bucket = "endowment"
@@ -266,12 +266,6 @@ bucket = "founder"
 address = "$FOUNDER"
 amount = "100000000"
 label = "founder (testnet stand-in)"
-
-[[allocation]]
-bucket = "foundation"
-address = "$FOUNDATION"
-amount = "50000000"
-label = "foundation (testnet stand-in)"
 
 [[allocation]]
 bucket = "operators"

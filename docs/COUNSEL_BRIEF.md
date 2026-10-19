@@ -41,7 +41,7 @@ Companion documents: [TOKENOMICS.md](TOKENOMICS.md) (supply, allocation, issuanc
 - A second wallet frontend or mirror with reproducible builds.
 - Independent RPCs.
 - The wallet domain owned by an entity (DEC-8).
-- Foundation validators limited to 2 seats at genesis and 1 later (DEC-14).
+- The founder's validators limited to 2 seats at genesis and 1 later (DEC-14).
 
 **After genesis** the founder holds 10% of supply, vesting on-chain, and has pledged not to vote while it vests, not to claim from the pool, sit on juries or award himself Hunts, and to sell only under a pre-announced plan.
 
@@ -52,16 +52,15 @@ Genesis supply is 1,000,000,000 FANG. Nothing is sold (TOKENOMICS.md section 1).
 | Bucket | % | Holder | Release |
 |---|---|---|---|
 | Community distributions | 32% | Keyless system account | Nothing at genesis. Recipients, timing and criteria are decided only after mainnet is running |
-| Community treasury | 25% | Keyless; governance spends only | Linear over 4 years |
+| Community treasury | 30% | Keyless; governance spends only. Holds the 5% once planned for a foundation | Linear over 4 years |
 | Contribution endowment | 15% | Keyless contribution pool | Linear over 10 years into the pool |
-| Validator bootstrap delegation | 10% | Keyless; delegated by formula to non-foundation validators | Returns to the treasury over years 2–4 |
+| Validator bootstrap delegation | 10% | Keyless; delegated by formula to validators not run by the founder | Returns to the treasury over years 2–4 |
 | Founder | 10% | Founder's account | 1-year cliff, 4-year linear vest, on-chain |
-| Foundation | 5% | Multisig, ≥ 2 of ≥ 3 signers not the founder | Linear over 4 years |
 | Genesis operators and security grants | 3% | Recipients, under signed service agreements | 6-month cliff, 2-year vest |
 
 - **Issuance:** 6% a year, decaying 15% a year to a 1.5% floor. 70% goes to staked validator pools, 20% to the contribution pool and 10% to the treasury. None goes to the founder, the foundation or any named person.
 - **Fees:** the per-byte base fee is burned and the tip goes to the block proposer. Creating an account burns 0.1 FANG.
-- **Votes:** unvested tokens can't vote. The foundation never votes (policy), and the founder pledges not to vote while vesting runs.
+- **Votes:** unvested tokens can't vote, and the founder pledges not to vote while vesting runs. There's no foundation allocation at genesis (DEC-5, 2026-10-18).
 - **The 3% bucket** pays genesis validator operators (through the incentivized testnet before genesis) and security work such as audits, under individual signed agreements. It's compensation for services, not a general testnet reward.
 - **No distribution has been announced.** There are no criteria and no "points". The public docs say nothing beyond the no-value disclaimer.
 
@@ -89,9 +88,9 @@ Genesis supply is 1,000,000,000 FANG. Nothing is sold (TOKENOMICS.md section 1).
 
 - **Delegation stays with the delegator.** Delegators keep their FANG and keys; only the protocol's rules move it, and nobody takes custody. Pools account in shares, and a validator's commission is minted to its owner as shares.
 - **Unbonding** takes 21 days. **Slashing:** 5% and permanent removal for double-signing, with a share paid to the reporter and the rest burned. Downtime means jail and a 0.1% slash.
-- **Not at genesis:** no liquid staking token, and no custodial staking by the foundation. Docs and frontends must not market staking as a return.
+- **Not at genesis:** no liquid staking token, and no custodial staking by the founder or a foundation. Docs and frontends must not market staking as a return.
 - **Locked tokens:** rewards earned on locked tokens are locked on the same curve. Accounts with vesting locks may delegate at most 1% of supply to any one pool.
-- **Bootstrap delegation:** the 10% bucket is delegated by a fixed formula from a keyless account, in equal shares to every active validator not run by the founder or the foundation, rebalanced each epoch. Its rewards go to the treasury, and it returns to the treasury over years 2–4. The hosting policy (caps per provider, country and facility, DEC-14) is enforced on the genesis set; the protocol can't see where later validators run.
+- **Bootstrap delegation:** the 10% bucket is delegated by a fixed formula from a keyless account, in equal shares to every active validator not run by the founder, rebalanced each epoch. Its rewards go to the treasury, and it returns to the treasury over years 2–4. The hosting policy (caps per provider, country and facility, DEC-14) is enforced on the genesis set; the protocol can't see where later validators run.
 
 ## 7. Governance
 
@@ -100,7 +99,7 @@ Genesis supply is 1,000,000,000 FANG. Nothing is sold (TOKENOMICS.md section 1).
 - **Proposal kinds** replace every former admin power: parameter changes, treasury spends, repos, bounded Soul grants, sybil flags, claim rejections, clawbacks, Hunt refunds, upgrades, feature activation and text.
 - **The treasury** is keyless; only a passed `TreasurySpend` moves it.
 - **Early capture:** quorum has an absolute floor, and spending proposals are rejected for about the first 6 months.
-- **Accounts can be M-of-N multisigs,** including the foundation's.
+- **Accounts can be M-of-N multisigs,** as a foundation's would be if governance funds one.
 - **The first distribution is unresolved.** At launch almost nothing can vote, so how the first distribution from the keyless 32% bucket is executed is still open (TOKENOMICS.md section 10). Any mechanism a single party can trigger makes that party the distributor.
 
 ## 8. Ghost Mode (disabled at genesis)
@@ -128,26 +127,26 @@ Genesis supply is 1,000,000,000 FANG. Nothing is sold (TOKENOMICS.md section 1).
 | Option | Role | Notes |
 |---|---|---|
 | **Dev company now** (US LLC, e.g. "Blockula Labs") | The founder's development work, IP, contracts | Cheap and fast. Holds no treasury and no protocol privileges. Any equity investors must get no token rights |
-| **Cayman foundation company, or a US nonprofit, before genesis** | Pre-genesis steward: owns the wallet domain and trademarks, holds the foundation's 5% in a multisig, engages auditors, runs the bug bounty, publishes quarterly reports | Cayman is memberless with a supervisor and used by the Optimism and Arbitrum foundations; the VASP Act's "virtual asset issuance" probably doesn't catch a no-sale launch (to confirm). A US nonprofit avoids offshore optics. Needs at least two independent directors or a supervisor |
+| **Cayman foundation company, or a US nonprofit, after launch** | Steward funded by a governance `TreasurySpend` (no genesis allocation; spends open ≈ 6 months after genesis): takes over the wallet domain and trademarks, engages auditors, runs the bug bounty, publishes quarterly reports | Cayman is memberless with a supervisor and used by the Optimism and Arbitrum foundations; the VASP Act's "virtual asset issuance" probably doesn't catch a no-sale launch (to confirm). A US nonprofit avoids offshore optics. Needs at least two independent directors or a supervisor |
 | **Wyoming DUNA, adopted by governance after launch** | A legal wrapper for on-chain governance itself: can contract and pay taxes, and shields members | W.S. 17-32-101 et seq. (2024 SF0050, amended by 2026 SF0022 from 2026-07-01). **Needs at least 100 members,** so it can't exist at genesis. Uniswap governance adopted one in 2025. The foundation then shrinks to a service provider or winds down |
 | No entity | | Rejected: personal liability, and possible general-partnership treatment of participants (Samuels v. Lido DAO, N.D. Cal., 2024-11-18). Nobody could own the domain or sign contracts |
 | Swiss foundation | Same role as Cayman | Only if counsel prefers Europe |
 
-**Proposed path:** dev company now, then a foundation before the genesis ceremony, then a DUNA adopted by governance once at least 100 members vote.
+**Proposed path:** dev company now, which holds the wallet domain and pays for audits, counsel and infrastructure through launch. No foundation allocation at genesis (DEC-5, 2026-10-18): its 5% is the treasury's, and governance may fund a foundation once one is formed. Then a DUNA adopted by governance once at least 100 members vote.
 
 ## 11. Checklist (from the research, section 6.7)
 
 1. **Status of FANG** under the SEC's 2026-03-17 interpretation (Release 33-11412): a digital commodity at launch? A written opinion covering genesis allocations, vesting, staking, delegation pools, slashing, the burn, issuance to the pool and treasury, and governance rights.
 2. **First distribution.** If one is made after mainnet is functional, could it consider past activity (on testnets or elsewhere) and stay within the release's p. 62 example, given its fn. 148? Does the testnet copy that told contributors they "earn" testnet FANG and Soul affect that? Is the no-value disclaimer now in README, CONTRIBUTING and AGENTS enough? No distribution, criteria or eligibility has been decided or announced.
-3. **Hunts and the contribution pool (LEG-2):** compensation for services. Who is the payer: the protocol, the foundation, or Hunt creators? Tax reporting (1099 / W-8), OFAC screening of GitHub-linked recipients, contributor terms, GitHub API terms.
-4. **The founder's allocation and tax:** taxable at genesis, at vesting, or on sale? Is §83 relevant if the allocation is tied to services to the foundation? How are staking rewards on locked tokens treated (Rev. Rul. 2023-14)?
-5. **Foundation funding** without an issuer sale: how can it pay for audits and counsel? If it must ever sell, under what policy (programmatic, small, no representations, disclosed)? Would Regulation Crypto Assets' Rule 200 startup exemption help if adopted (Release 33-11434, proposed 2026-08-18; comments close **2026-10-20**)? Should the project comment that the proposal gives no path for projects that never sell?
-6. **Entity choice and documents:** foundation jurisdiction, the Cayman VASP Act, director independence, the agreement between the dev company and the foundation, trademark and domain ownership (DEC-8), and later DUNA formation.
+3. **Hunts and the contribution pool (LEG-2):** compensation for services. Who is the payer: the protocol, the dev company, or Hunt creators? Tax reporting (1099 / W-8), OFAC screening of GitHub-linked recipients, contributor terms, GitHub API terms.
+4. **The founder's allocation and tax:** taxable at genesis, at vesting, or on sale? Is §83 relevant if the allocation is tied to services (to the dev company or the network)? How are staking rewards on locked tokens treated (Rev. Rul. 2023-14)?
+5. **Funding** without an issuer sale: the dev company pays for audits and counsel through launch. Does a governance treasury grant to a later foundation raise issuer questions for it or for the protocol? If it must ever sell, under what policy (programmatic, small, no representations, disclosed)? Would Regulation Crypto Assets' Rule 200 startup exemption help if adopted (Release 33-11434, proposed 2026-08-18; comments close **2026-10-20**)? Should the project comment that the proposal gives no path for projects that never sell?
+6. **Entity choice and documents:** foundation jurisdiction, the Cayman VASP Act, director independence, the agreement between the dev company and a later foundation, trademark and domain ownership (DEC-8), and later DUNA formation.
 7. **Communications policy:** the website, wallet, MCP, social accounts, AMAs, and statements by agents and affiliates (Release fn. 83). Terms of use and risk disclosures for the wallet, MCP and RPC (LEG-1).
 8. **EU / MiCA:** the Art. 4(3) free-offer and validation-reward exemptions; whether GitHub-linked eligibility is personal data given in exchange; Art. 5(2) listings by platforms on their own initiative; GDPR for on-chain GitHub handles and accusations (LEG-3).
 9. **Ghost Mode (DEC-2):** money-transmission and sanctions exposure for a shielded pool (DOJ statement of 2025-08-21; Roman Storm's conviction on the §1960 count). An opinion before `ActivateFeature { ghost }`.
 10. **Names (LEG-3):** if `.boo` is a live ICANN TLD, the trademark and confusion risk. The reserved list and a dispute policy.
-11. **Validator operations:** do foundation-run validators (2 at genesis) or the bootstrap delegation make the foundation a "central party"? Sanctions screening of genesis operators.
+11. **Validator operations:** do the founder's validators (2 at genesis) or the bootstrap delegation make the founder a "central party"? Sanctions screening of genesis operators.
 12. **Change of law:** what to do if the 2026 interpretation is withdrawn, or the CLARITY Act returns in the next Congress (from January 2027) with a different decentralization test.
 
 ## 12. Further open questions
@@ -160,4 +159,4 @@ Genesis supply is 1,000,000,000 FANG. Nothing is sold (TOKENOMICS.md section 1).
 - **First FANG for new users.** With no sale and no faucet, should the treasury sponsor new users' first transactions? Does a sponsored transaction raise any issue?
 - **The bug bounty** (SECURITY.md promises one on the incentivized testnet): paid in fiat by an entity, in FANG from the 3% bucket, or both?
 - **Agents.** When an AI agent (a Familiar) does paid work, is the human sponsor the contractor for tax and sanctions purposes? What do the MCP's terms need to say?
-- **The founder's own validators and RPC** before the foundation exists: who should operate them, and under which entity?
+- **The founder's own validators and RPC,** with no foundation at genesis: who should operate them, and under which entity?

@@ -49,14 +49,17 @@ pub struct Bucket {
 
 /// DEC-5. The bootstrap delegation's lock is its return to the treasury, linear over years 2–4:
 /// at each epoch boundary staking delegates what it still holds by formula and sends what has
-/// "vested" to the treasury (`staking::bootstrap_epoch`).
+/// "vested" to the treasury (`staking::bootstrap_epoch`). The foundation gets 0% since 2026-10-18:
+/// its 5% is the treasury's, for governance to fund a foundation from once one exists
+/// (TOKENOMICS.md). The bucket stays so the launched testnets' specs, which gave it 5%, still
+/// rebuild byte for byte (with a finding; `blockula-1`, always strict, refuses any).
 pub const BUCKETS: &[Bucket] = &[
     Bucket { name: "community", bps: 3_200, system: Some(community), vesting: None },
-    Bucket { name: "treasury", bps: 2_500, system: Some(treasury), vesting: Some((0, 0, 48)) },
+    Bucket { name: "treasury", bps: 3_000, system: Some(treasury), vesting: Some((0, 0, 48)) },
     Bucket { name: "endowment", bps: 1_500, system: Some(endowment), vesting: Some((0, 0, 120)) },
     Bucket { name: "bootstrap", bps: 1_000, system: Some(bootstrap_delegation), vesting: Some((12, 12, 48)) },
     Bucket { name: "founder", bps: 1_000, system: None, vesting: Some((0, 12, 48)) },
-    Bucket { name: "foundation", bps: 500, system: None, vesting: Some((0, 0, 48)) },
+    Bucket { name: "foundation", bps: 0, system: None, vesting: Some((0, 0, 48)) },
     Bucket { name: "operators", bps: 300, system: None, vesting: Some((0, 6, 24)) },
 ];
 
@@ -464,12 +467,12 @@ pub fn build_from(spec: &Spec, operators: &[OperatorFile], strict: bool) -> Resu
         ensure!(pool_repos.insert(key.clone(), r.weight).is_none(), "contribution.repo: {key} is listed twice");
     }
     let soul_ledger = spec.soul_ledger.iter().map(|s| Ok(SoulEntry { account: s.account.clone(), soul: parse_soul(&s.soul).with_context(|| format!("soul for {}", s.account))?, reason: s.reason.clone() })).collect::<Result<Vec<_>>>()?;
-    // The founder's and the foundation's accounts (and the owners of seats they run) start with
-    // no Soul: no jury seats or pool claims while their vesting runs (docs/TOKENOMICS.md, "What
-    // the founder must not do"). Founding jurors are other people.
+    // The founder's account (and the owners of the founder's or foundation's seats) start with no
+    // Soul: no jury seats or pool claims while the founder's vesting runs (docs/TOKENOMICS.md,
+    // "What the founder must not do"). Founding jurors are other people.
     let excluded = bootstrap_excluded(spec, operators);
     for e in soul_ledger.iter().filter(|e| e.soul > 0) {
-        ensure!(!excluded.contains(&e.account), "soul: {} is the founder's or the foundation's (or a seat they run), whose Soul is 0 at genesis (docs/TOKENOMICS.md)", e.account);
+        ensure!(!excluded.contains(&e.account), "soul: {} is the founder's (or owns a founder's or foundation's seat), whose Soul is 0 at genesis (docs/TOKENOMICS.md)", e.account);
     }
 
     let genesis = Genesis {
@@ -503,8 +506,9 @@ pub fn build_from(spec: &Spec, operators: &[OperatorFile], strict: bool) -> Resu
     Ok(Built { genesis, json, hash, warnings: findings })
 }
 
-/// The accounts whose validators the bootstrap delegation passes over (DEC-5): the founder's and
-/// the foundation's allocations' recipients and the owners of seats they run. Sorted, each once.
+/// The accounts whose validators the bootstrap delegation passes over (DEC-5): the founder's
+/// (and on the launched testnets the foundation's) recipients and the owners of seats marked
+/// `founder_or_foundation`. Sorted, each once.
 fn bootstrap_excluded(spec: &Spec, operators: &[OperatorFile]) -> Vec<String> {
     let allocated = spec.allocations.iter().filter(|a| BOOTSTRAP_EXCLUDED_BUCKETS.contains(&a.bucket.as_str())).filter_map(|a| a.address.clone());
     let owners = operators.iter().filter(|o| o.independence.founder_or_foundation).map(|o| o.keys.owner.clone());
@@ -706,13 +710,13 @@ mod tests {
     }
 
     /// One example operator: (seed byte, name, entity, provider, ASN, country, facility,
-    /// founder or foundation).
+    /// founder's seat).
     type ExampleOperator = (u8, &'static str, &'static str, &'static str, u32, &'static str, &'static str, bool);
 
     /// The example spec's operators.
     const EXAMPLE_OPERATORS: [ExampleOperator; 4] = [
-        (0xe1, "Foundation validator A", "Blockula Foundation", "Fly.io", 40_509, "US", "fly-iad", true),
-        (0xe2, "Foundation validator B", "Blockula Foundation", "Fly.io", 40_509, "DE", "fly-fra", true),
+        (0xe1, "Founder validator A", "Blockula Labs", "Fly.io", 40_509, "US", "fly-iad", true),
+        (0xe2, "Founder validator B", "Blockula Labs", "Fly.io", 40_509, "DE", "fly-fra", true),
         (0xe3, "Example Validators GmbH", "Example Validators GmbH", "OVHcloud", 16_276, "FR", "ovh-gra3", false),
         (0xe4, "Example Staking Ltd", "Example Staking Ltd", "Latitude.sh", 396_356, "BR", "latitude-sao2", false),
     ];
@@ -737,7 +741,7 @@ mod tests {
             std::fs::write(dir.join(format!("example-{}.toml", i + 1)), toml::to_string(&f).unwrap()).unwrap();
             println!("operator {}: owner {owner}", i + 1);
         }
-        for p in ["founder", "foundation", "security-grants"] {
+        for p in ["founder", "security-grants"] {
             println!("placeholder {p}: {}", crypto::system_address("tboo", &format!("placeholder/{p}")));
         }
     }
@@ -757,18 +761,17 @@ mod tests {
         let total: u64 = g.allocations.iter().map(|x| x.amount).sum();
         assert_eq!(total, MAX_SUPPLY);
         let held = |addr: &str| g.allocations.iter().filter(|x| x.address == addr).map(|x| x.amount).sum::<u64>();
-        assert_eq!((held(&community("tboo")), held(&treasury("tboo")), held(&endowment("tboo")), held(&bootstrap_delegation("tboo"))), (320_000_000 * FANG, 250_000_000 * FANG, 150_000_000 * FANG, 100_000_000 * FANG));
+        assert_eq!((held(&community("tboo")), held(&treasury("tboo")), held(&endowment("tboo")), held(&bootstrap_delegation("tboo"))), (320_000_000 * FANG, 300_000_000 * FANG, 150_000_000 * FANG, 100_000_000 * FANG));
         let curve = |label: &str| g.allocations.iter().find(|x| x.label.as_deref() == Some(label)).unwrap().vesting.clone();
         assert_eq!(curve("founder"), Some(Vesting { start: 0, cliff: 31_557_600, end: 126_230_400 }));
-        assert_eq!(curve("foundation"), Some(Vesting { start: 0, cliff: 0, end: 126_230_400 }));
         assert_eq!(curve("security grants"), Some(Vesting { start: 0, cliff: 15_778_800, end: 63_115_200 }));
         assert_eq!(curve("treasury"), Some(Vesting { start: 0, cliff: 0, end: 126_230_400 }));
         assert_eq!(curve("endowment"), Some(Vesting { start: 0, cliff: 0, end: 315_576_000 }));
         assert_eq!(curve("community"), None);
         assert_eq!(curve("bootstrap"), Some(Vesting { start: 31_557_600, cliff: 31_557_600, end: 126_230_400 }), "returns to the treasury over years 2–4");
-        // The founder's and the foundation's accounts and seats get no bootstrap delegation.
+        // The founder's account and the founder's or foundation's seats get no bootstrap delegation.
         let founder_seats = EXAMPLE_OPERATORS.iter().filter(|o| o.7).map(|o| owner(o.0, "tboo"));
-        let mut excluded: Vec<String> = founder_seats.chain(["founder", "foundation"].map(|l| g.allocations.iter().find(|x| x.label.as_deref() == Some(l)).unwrap().address.clone())).collect();
+        let mut excluded: Vec<String> = founder_seats.chain(["founder"].map(|l| g.allocations.iter().find(|x| x.label.as_deref() == Some(l)).unwrap().address.clone())).collect();
         excluded.sort();
         assert_eq!(g.bootstrap_excluded, excluded);
         assert!(!g.faucet && g.validator_admins.is_empty() && g.validators.len() == 4 && g.operators.len() == 4);
@@ -784,7 +787,7 @@ mod tests {
         assert_eq!(st.supply, MAX_SUPPLY);
         assert_eq!(crate::econ::transferable(&st, &owner(0xe3, "tboo"), 0), 0, "an operator's allocation is locked (its self-bond is bonded)");
         // Audit F12: the bootstrap bucket has a mover. At the first boundary it's staked with the
-        // two seats not run by the foundation; once its curve has run, it's all the treasury's.
+        // two seats not run by the founder; once its curve has run, it's all the treasury's.
         let boot = bootstrap_delegation("tboo");
         crate::staking::end_epoch(&mut st, 0);
         crate::staking::bootstrap_epoch(&mut st, 0);
@@ -803,7 +806,7 @@ mod tests {
         for expected in ["4 operators; a mainnet genesis needs at least 22", "hosting provider fly.io has 2 of the 4 operators; at most 1 may", "ASN 40509 has 2", "facility fly-iad has 1 of the 4 operators; at most 0 may"] {
             assert!(w.contains(expected), "missing warning {expected:?} in:\n{w}");
         }
-        assert!(!w.contains("legal entity"), "the foundation's two seats count against the founder cap, not the entity rule");
+        assert!(!w.contains("legal entity"), "the founder's two seats count against the founder cap, not the entity rule");
         let err = format!("{:#}", build(&example(), true).err().unwrap());
         assert!(err.contains("strict") && err.contains("at least 22"), "{err}");
     }
@@ -823,11 +826,10 @@ mod tests {
     fn spec_for(chain_id: &str, prefix: &str, ops: &[OperatorFile], extra: &str) -> Spec {
         let mut t = format!("chain_id = \"{chain_id}\"\naddress_prefix = \"{prefix}\"\ngenesis_time_ms = 1798761600000\nblock_time_ms = 1000\nepoch_blocks = 3600\ntotal_supply = \"1000000000\"\n{extra}\n");
         let alloc = |bucket: &str, address: Option<&str>, amount: u64| format!("[[allocation]]\nbucket = \"{bucket}\"\n{}amount = \"{amount}\"\n", address.map(|a| format!("address = \"{a}\"\n")).unwrap_or_default());
-        for (b, amount) in [("community", 320_000_000), ("treasury", 250_000_000), ("endowment", 150_000_000), ("bootstrap", 100_000_000)] {
+        for (b, amount) in [("community", 320_000_000), ("treasury", 300_000_000), ("endowment", 150_000_000), ("bootstrap", 100_000_000)] {
             t += &alloc(b, None, amount);
         }
         t += &alloc("founder", Some(&Keys::from_seed([0x30; 32]).address_with(prefix)), 100_000_000);
-        t += &alloc("foundation", Some(&Keys::from_seed([0x31; 32]).address_with(prefix)), 50_000_000);
         for o in ops {
             t += &alloc("operators", Some(&o.keys.owner), 1_000_000);
         }
@@ -917,13 +919,11 @@ mod tests {
         refuse(&with(&pool.replace("\"100000\"", "\"0\""), 150_000_000), "opening_balance must be more than 0");
         refuse(&with(&pool.replace("seance_blocks = 259200", "seance_blocks = 2"), 149_900_000), "seance_blocks ≥ 3");
         assert!(toml::from_str::<Spec>(&format!("{}[contribution]\nwarp = 1\n", toml_of(&spec_for("x", "tboo", &ops, "")))).is_err(), "unknown fields are refused");
-        // The founder's and the foundation's accounts start with no Soul (TOKENOMICS: no jury
-        // seats while vesting runs), so they're never founding jurors.
-        for seed in [0x30, 0x31] {
-            let mut with = spec.clone();
-            with.soul_ledger.push(SpecSoul { account: Keys::from_seed([seed; 32]).address_with("tboo"), soul: "5".into(), reason: "juror".into() });
-            refuse(&with, "is the founder's or the foundation's");
-        }
+        // The founder's account starts with no Soul (TOKENOMICS: no jury seats while vesting
+        // runs), so it's never a founding juror.
+        let mut with = spec.clone();
+        with.soul_ledger.push(SpecSoul { account: Keys::from_seed([0x30; 32]).address_with("tboo"), soul: "5".into(), reason: "juror".into() });
+        refuse(&with, "is the founder's");
     }
 
     /// A spec as TOML again (the tests build specs as values, then add sections as text).
@@ -958,11 +958,17 @@ mod tests {
         refuse(&s, &ops, "allocations add up to");
         let mut s = spec_for("blockula-1", "boo", &ops, "");
         s.allocations[0].amount = "319999999".into();
-        s.allocations[1].amount = "250000001".into();
+        s.allocations[1].amount = "300000001".into();
         refuse(&s, &ops, "bucket community holds");
         let mut s = spec_for("blockula-1", "boo", &ops, "");
         s.allocations[0].bucket = "friends".into();
         refuse(&s, &ops, "unknown bucket");
+        // DEC-5: the foundation gets 0%; its 5% is the treasury's.
+        let mut s = spec_for("blockula-1", "boo", &ops, "");
+        s.allocations[4].amount = "50000000".into();
+        s.allocations.insert(5, s.allocations[4].clone());
+        (s.allocations[5].bucket, s.allocations[5].address) = ("foundation".into(), Some(Keys::from_seed([0x31; 32]).address_with("boo")));
+        refuse(&s, &ops, "bucket foundation holds 50000000000000000 drops; DEC-5 gives it 0 (0% of the supply)");
         let mut s = spec_for("blockula-1", "boo", &ops, "");
         s.allocations[0].address = Some(Keys::from_seed([1; 32]).address());
         refuse(&s, &ops, "keyless");

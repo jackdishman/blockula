@@ -10,11 +10,11 @@ The genesis builder is `blockula genesis operator` and `blockula genesis build` 
 
 | Role | Who | Does |
 |---|---|---|
-| Coordinator | Foundation | Runs the calendar, collects submissions, checks independence, edits the spec, chairs the calls. Holds no key that matters. |
+| Coordinator | The founder's company (there's no foundation at genesis, DEC-5) | Runs the calendar, collects submissions, checks independence, edits the spec, chairs the calls. Holds no key that matters. |
 | Operators | 21–32 independent entities | Generate keys offline, submit, run validators. |
-| Builders | ≥ 3 parties, at least 2 of them not the foundation | Rebuild the binary and the genesis independently and publish the hashes. |
-| Recorder | Someone outside the foundation | Keeps the log and the recordings. |
-| Counsel | The foundation's lawyers | Sign off allocations and vesting (LEG-1) before the spec freezes. |
+| Builders | ≥ 3 parties, at least 2 of them not the founder's | Rebuild the binary and the genesis independently and publish the hashes. |
+| Recorder | Someone outside the founder's company | Keeps the log and the recordings. |
+| Counsel | The founder's company's lawyers | Sign off allocations and vesting (LEG-1) before the spec freezes. |
 
 ## Calendar
 
@@ -35,7 +35,7 @@ Each operator is one legal entity (or one individual) with its own staff, machin
 
 - No hosting provider, ASN or jurisdiction hosts more than ¼ of the set (8 of 32), measured by the ASN that announces the validator's IP and the country of its data center.
 - No facility (data center) hosts more than 15% of the set.
-- No entity runs more than one validator. The founder and the foundation run at most 2 between them (DEC-3, DEC-14).
+- No entity runs more than one validator. The founder runs at most 2 (DEC-3, DEC-14).
 - The distribution table (operator, entity jurisdiction, provider, ASN, data-center country) is published with the spec.
 
 ## 2. Offline key generation (each operator, alone)
@@ -105,8 +105,8 @@ hosting_provider = "…"
 asn = 0                                             # the ASN announcing p2p_addr
 datacenter_country = "FI"
 datacenter = "…"                                    # the facility itself
-founder_or_foundation = false                       # true only for the founder's or foundation's seats
-affiliations = []                                   # other validators, operators or the foundation you're tied to
+founder_or_foundation = false                       # true only for the founder's seats
+affiliations = []                                   # other validators, operators or the founder you're tied to
 statement = "We generated these keys offline on hardware we control. Nobody else has had access to the private keys. We control no other genesis validator."
 ```
 

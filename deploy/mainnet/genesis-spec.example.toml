@@ -8,7 +8,7 @@
 # replaces with the recipients' real accounts; the operators (operators/*.toml) use throwaway keys.
 #
 # With 4 operators this dry run breaks the mainnet policy on purpose, so the build prints
-# warnings: fewer than 22 operators (DEC-3), the two foundation seats share a provider and an ASN
+# warnings: fewer than 22 operators (DEC-3), the founder's two seats share a provider and an ASN
 # (Fly regions count as one failure domain), and with fewer than 7 operators any facility holds
 # more than 15% of the set (DEC-14). `strict = true` (always on for blockula-1) refuses them.
 
@@ -52,10 +52,11 @@ features = []
 bucket = "community"
 amount = "320000000"
 
-# 25%: the treasury (keyless; unlocks over 4 years; only TreasurySpend moves it).
+# 30%: the treasury (keyless; unlocks over 4 years; only TreasurySpend moves it). It holds the 5%
+# once meant for a foundation: governance funds one from here once one exists (TOKENOMICS.md).
 [[allocation]]
 bucket = "treasury"
-amount = "250000000"
+amount = "300000000"
 
 # 15%: the contribution endowment (keyless; streams into the pool over 10 years).
 [[allocation]]
@@ -63,9 +64,9 @@ bucket = "endowment"
 amount = "150000000"
 
 # 10%: the validator bootstrap delegation (keyless; each epoch delegated equally to the set's
-# members not run by the founder or the foundation, its rewards to the treasury; returns to the
-# treasury linearly over years 2–4). The builder lists the founder's and the foundation's
-# accounts, and the owners of `founder_or_foundation` seats, in `bootstrap_excluded`.
+# members not run by the founder, its rewards to the treasury; returns to the treasury linearly
+# over years 2–4). The builder lists the founder's account, and the owners of
+# `founder_or_foundation` seats, in `bootstrap_excluded`.
 [[allocation]]
 bucket = "bootstrap"
 amount = "100000000"
@@ -77,26 +78,19 @@ address = "tboo10une7t3u48xlwqpcskt47gsm5mzvcxennfwnf856perxhv5pvchqww54jr"
 amount = "100000000"
 label = "founder"
 
-# 5%: the foundation's multisig (4-year vest). PLACEHOLDER: the multisig account.
-[[allocation]]
-bucket = "foundation"
-address = "tboo17uy3u8lrkprha85mdqegae0r0vfudm40ntapc4hxw9yspdt6wc0qmendfx"
-amount = "50000000"
-label = "foundation"
-
 # 3%: genesis operators and security grants (6-month cliff, 2-year vest). Each operator's
 # self-bond comes out of its own allocation (locked tokens can be bonded).
 [[allocation]]
 bucket = "operators"
 address = "tboo1nrums87rrekxgpyglfxme94vsxp3fccazza7k3ynm9apksl08sfqhn7kd5"
 amount = "1000000"
-label = "genesis operator: Foundation validator A"
+label = "genesis operator: Founder validator A"
 
 [[allocation]]
 bucket = "operators"
 address = "tboo1ysrdknzd3l5yd6z4m5m8suvvnaxrfzp353g704cvhrnt6hcvj6vs5q7axy"
 amount = "1000000"
-label = "genesis operator: Foundation validator B"
+label = "genesis operator: Founder validator B"
 
 [[allocation]]
 bucket = "operators"

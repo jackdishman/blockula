@@ -1,5 +1,5 @@
 [operator]
-name = "Foundation validator B"
+name = "Founder validator B"
 contact = ["ops@operator-2.example"]
 
 [keys]
@@ -17,7 +17,7 @@ commission_bps = 500
 self_bond = "10000"
 
 [independence]
-legal_entity = "Blockula Foundation"
+legal_entity = "Blockula Labs"
 entity_jurisdiction = "DE"
 beneficial_owners = []
 hosting_provider = "Fly.io"

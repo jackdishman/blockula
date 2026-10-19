@@ -124,7 +124,7 @@ The tree file `blockula gov tree` writes (`{ distribution_id, merkle_root, total
 - A proposed action is at most `MAX_MULTISIG_ACTION_BYTES` (12 KiB) encoded, a format rule: a nested validator registration fits, 32 KiB of equivocation evidence doesn't (audit F17).
 - The owner set is always the account's current owner keys: an approved `AddKey`/`RemoveKey` changes it, but never below `threshold`. A multisig changes its threshold by proposing `MultisigCreate` again.
 
-Multisig accounts can propose, vote, register validators and do everything else an account can, through their approvals. The foundation's allocation (DEC-5) is meant to sit in one with at least two non-founder signers. A validator a multisig owns keeps signing its system txs with its consensus key (SF-13), but its terms (commission and addresses, `UpdateValidator`) and `Unjail` go through the multisig's approvals only: the consensus key can't change them for the multisig, nor from the validator's own account (audit review-r2-integrate-compose-1).
+Multisig accounts can propose, vote, register validators and do everything else an account can, through their approvals. There's no foundation allocation at genesis (DEC-5); a foundation that governance funds later should hold its funds in one with at least two non-founder signers. A validator a multisig owns keeps signing its system txs with its consensus key (SF-13), but its terms (commission and addresses, `UpdateValidator`) and `Unjail` go through the multisig's approvals only: the consensus key can't change them for the multisig, nor from the validator's own account (audit review-r2-integrate-compose-1).
 
 ## What replaced the admin levers
 
