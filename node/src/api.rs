@@ -723,7 +723,7 @@ fn head_age_ms(v: &ReadView) -> Option<u64> {
 /// `/api/status`'s summary of upgrades and halts (`/api/upgrade` has the details).
 fn upgrade_status(n: &Node, v: &ReadView) -> Value {
     json!({
-        "supported_protocol_version": crate::consensus::SUPPORTED_PROTOCOL_VERSION,
+        "supported_protocol_version": crate::upgrade::supported_version(&v.genesis),
         "next": crate::upgrade::next_after(&v.state, v.height).map(|u| json!({ "version": u.version, "activation_height": u.activation_height })),
         "halted": n.halt.get().map(|h| json!({ "kind": h.kind(), "reason": h.to_string() })),
     })
@@ -953,12 +953,12 @@ async fn upgrade(State(n): State<Node>) -> ApiResult {
     let headers = v.headers(u64::MAX, SIGNAL_WINDOW);
     let signals = crate::upgrade::signals(&active, headers.iter().map(|(height, m)| (*height, m.proposer.as_str(), m.signal)));
     let next = crate::upgrade::next_after(st, h);
-    let target = next.map(|u| u.version).unwrap_or(crate::consensus::SUPPORTED_PROTOCOL_VERSION);
+    let target = next.map(|u| u.version).unwrap_or(crate::upgrade::supported_version(&v.genesis));
     let ready = signals.values().filter(|(s, _)| *s >= target).count();
     Ok(Json(json!({
         "height": h,
         "protocol_version": crate::upgrade::version_at(st, h + 1),
-        "supported_protocol_version": crate::consensus::SUPPORTED_PROTOCOL_VERSION,
+        "supported_protocol_version": crate::upgrade::supported_version(&v.genesis),
         "schedule": st.upgrade.schedule.iter().map(|u| json!({ "version": u.version, "activation_height": u.activation_height, "active": u.activation_height <= h + 1 })).collect::<Vec<_>>(),
         // What cancellations withdrew: versions through `highest_version` are never scheduled
         // again, and upgrade proposals made by `last_cancelled_at` are superseded; the highest of
@@ -967,7 +967,7 @@ async fn upgrade(State(n): State<Node>) -> ApiResult {
         // scheduled; a new one is at most 16 past `next_version - 1`).
         "withdrawn": { "highest_version": st.upgrade.withdrawals.highest, "last_cancelled_at": st.upgrade.withdrawals.last_at, "superseded_version": st.upgrade.withdrawals.superseded },
         "next_version": crate::upgrade::next_version(st),
-        "next": next.map(|u| json!({ "version": u.version, "activation_height": u.activation_height, "blocks_left": u.activation_height.saturating_sub(h + 1), "this_binary_supports_it": u.version <= crate::consensus::SUPPORTED_PROTOCOL_VERSION })),
+        "next": next.map(|u| json!({ "version": u.version, "activation_height": u.activation_height, "blocks_left": u.activation_height.saturating_sub(h + 1), "this_binary_supports_it": u.version <= crate::upgrade::supported_version(&v.genesis) })),
         "halted": n.halt.get().map(|h| json!({ "kind": h.kind(), "reason": h.to_string() })),
         "readiness": {
             "version": target,
@@ -1078,7 +1078,7 @@ async fn metrics(State(n): State<Node>) -> Response {
         let halt = n.halt.get();
         let mut gauges = vec![
             ("blockula_protocol_version", "Protocol version in force at the next height", crate::upgrade::version_at(&v.state, h + 1) as f64),
-            ("blockula_supported_protocol_version", "Newest protocol version this binary runs", crate::consensus::SUPPORTED_PROTOCOL_VERSION as f64),
+            ("blockula_supported_protocol_version", "Newest protocol version this binary runs", crate::upgrade::supported_version(&v.genesis) as f64),
             ("blockula_upgrade_next_version", "Next scheduled protocol version (0: none)", next.map(|u| u.version as f64).unwrap_or(0.0)),
             ("blockula_upgrade_next_height", "Activation height of the next scheduled version (0: none)", next.map(|u| u.activation_height as f64).unwrap_or(0.0)),
             ("blockula_halted", "1 while the node has stopped executing (see /api/health)", f64::from(u8::from(halt.is_some()))),

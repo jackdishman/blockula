@@ -84,6 +84,78 @@ pub const EXIT_DOUBLE_SIGN_RISK: i32 = 12;
 /// Features governance can switch on and off. A name outside this list can't be activated.
 pub const KNOWN_FEATURES: &[&str] = &["ghost"];
 
+/// The protocol version this binary runs only on chains whose genesis schedules it (`upgrades`:
+/// dev and test chains): v2, while its rules land behind version gates. Every other chain gets
+/// [`SUPPORTED_PROTOCOL_VERSION`] until the release that ships v2 (docs/PROGRAMS-PLAN.md
+/// section 4), so a live chain's blocks keep signalling v1 and its nodes halt before a v2 that
+/// governance schedules there.
+pub const PREVIEW_PROTOCOL_VERSION: u32 = 2;
+
+/// A version-gated rule that only tests have (docs/PROGRAMS-PLAN.md P7): it shows that every path
+/// that admits, executes or replays a block reads the protocol version in force at that block's
+/// height, so a real gated rule flips at its activation height everywhere and nowhere else.
+#[cfg(test)]
+pub mod test_gate {
+    use std::cell::RefCell;
+
+    /// From [`super::PREVIEW_PROTOCOL_VERSION`] on, admission refuses a tx with this memo.
+    pub const MEMO: &str = "p7: refused from protocol v2";
+
+    thread_local! {
+        static SEEN: RefCell<Option<Vec<(u64, u32)>>> = const { RefCell::new(None) };
+    }
+
+    /// Starts recording, on this thread, the version each block's end-of-block steps see.
+    pub fn record() {
+        SEEN.with(|s| *s.borrow_mut() = Some(vec![]));
+    }
+
+    /// `State::end_block` reports here: block `height` closed under `version`.
+    pub fn saw(height: u64, version: u32) {
+        SEEN.with(|s| {
+            if let Some(v) = s.borrow_mut().as_mut() {
+                v.push((height, version));
+            }
+        });
+    }
+
+    /// What was recorded since [`record`], which stops recording.
+    pub fn take() -> Vec<(u64, u32)> {
+        SEEN.with(|s| s.borrow_mut().take().unwrap_or_default())
+    }
+}
+
+/// The newest protocol version this binary runs on `genesis`'s chain ([`HaltControl::supported`]).
+pub fn supported_version(genesis: &crate::chain::Genesis) -> u32 {
+    if genesis.upgrades.is_empty() { SUPPORTED_PROTOCOL_VERSION } else { PREVIEW_PROTOCOL_VERSION }
+}
+
+/// A genesis schedule (`Genesis::upgrades`): versions this binary runs on such a chain, newer
+/// than [`PROTOCOL_VERSION`], strictly increasing in both version and height, and each from
+/// block 1 on, so the genesis block keeps its version (`consensus::GENESIS_PROTOCOL_VERSION`)
+/// and every block carries the version in force at its height.
+///
+/// A preview version's rules change from release to release until the one that ships it, and
+/// nothing bumps the number in between, so nodes on two releases would run one chain's blocks
+/// under different rules. A preview chain is therefore a dev or test chain one binary summons and
+/// runs: `blockula genesis build`, which builds public networks, can't schedule one, and mainnet's
+/// genesis refuses one here (a later version reaches it only through `ScheduleUpgrade`).
+pub fn check_genesis_upgrades(upgrades: &[ScheduledUpgrade], chain_id: &str) -> Result<()> {
+    if chain_id == crate::chain::MAINNET_CHAIN_ID {
+        ensure!(upgrades.is_empty(), "{chain_id} starts at protocol v{PROTOCOL_VERSION}: a later version reaches it through a ScheduleUpgrade proposal");
+    }
+    let mut last: Option<&ScheduledUpgrade> = None;
+    for u in upgrades {
+        ensure!(u.version > PROTOCOL_VERSION && u.version <= PREVIEW_PROTOCOL_VERSION, "upgrades: this binary runs v{}–v{PREVIEW_PROTOCOL_VERSION} from genesis, not v{}", PROTOCOL_VERSION + 1, u.version);
+        ensure!(u.activation_height >= 1, "upgrades: v{} activates at block 1 or later (the genesis block stays v{PROTOCOL_VERSION})", u.version);
+        if let Some(l) = last {
+            ensure!(u.version > l.version && u.activation_height > l.activation_height, "upgrades must increase in both version and height");
+        }
+        last = Some(u);
+    }
+    Ok(())
+}
+
 /// Feature names: 1–32 of `a-z`, `0-9`, `_` and `-` (stateless; [`KNOWN_FEATURES`] is checked
 /// where a feature is switched).
 pub fn check_feature_name(f: &str) -> Result<()> {
@@ -375,13 +447,9 @@ pub fn next_after(state: &State, height: u64) -> Option<&ScheduledUpgrade> {
     state.upgrade.schedule.iter().find(|u| u.activation_height > height)
 }
 
-/// `Err` when this binary can't execute `next_height` (a version it doesn't support is
-/// scheduled there), so the node halts cleanly instead of diverging.
-pub fn check_next(state: &State, next_height: u64) -> Result<()> {
-    check_next_with(state, next_height, SUPPORTED_PROTOCOL_VERSION).map_err(Into::into)
-}
-
-/// [`check_next`] for a node that supports protocol versions up to `supported`.
+/// `Err` when a node that runs protocol versions up to `supported` (its
+/// [`HaltControl::supported`]) can't execute `next_height` (a newer version is scheduled there),
+/// so it halts cleanly instead of diverging.
 pub fn check_next_with(state: &State, next_height: u64, supported: u32) -> Result<(), Halt> {
     let version = version_at(state, next_height);
     if version > supported {
@@ -460,8 +528,8 @@ impl HaltSignal {
 /// A node's upgrade and halt settings (`Chain::halt`): not state, and not the same on every node.
 #[derive(Clone, Debug)]
 pub struct HaltControl {
-    /// Newest protocol version this node runs: [`SUPPORTED_PROTOCOL_VERSION`] (the simulator sets
-    /// others to model nodes running other binaries).
+    /// Newest protocol version this node runs: [`supported_version`] of its chain's genesis (the
+    /// simulator and tests set others to model nodes running other binaries).
     pub supported: u32,
     /// `--halt-height`: execute this height, then stop.
     pub halt_height: Option<u64>,
@@ -469,9 +537,12 @@ pub struct HaltControl {
     pub signal: HaltSignal,
 }
 
-impl Default for HaltControl {
-    fn default() -> Self {
-        Self { supported: SUPPORTED_PROTOCOL_VERSION, halt_height: None, signal: HaltSignal::default() }
+impl HaltControl {
+    /// What a node opening `genesis`'s chain starts with: the version this binary runs there
+    /// ([`supported_version`]), no halt height. (No `Default`: what a node supports depends on its
+    /// chain.)
+    pub fn for_genesis(genesis: &crate::chain::Genesis) -> Self {
+        Self { supported: supported_version(genesis), halt_height: None, signal: HaltSignal::default() }
     }
 }
 
@@ -558,13 +629,43 @@ mod tests {
     fn versions_and_the_halt_check() {
         let mut st = State::default();
         assert_eq!(version_at(&st, 0), PROTOCOL_VERSION);
-        check_next(&st, 1).unwrap();
+        check_next_with(&st, 1, SUPPORTED_PROTOCOL_VERSION).unwrap();
         st.upgrade.schedule = vec![ScheduledUpgrade { version: SUPPORTED_PROTOCOL_VERSION + 1, activation_height: 100 }];
         check_invariants(&st).unwrap();
         assert_eq!(version_at(&st, 99), PROTOCOL_VERSION);
-        check_next(&st, 99).unwrap();
-        assert!(check_next(&st, 100).unwrap_err().to_string().contains("upgrade blockula"));
+        check_next_with(&st, 99, SUPPORTED_PROTOCOL_VERSION).unwrap();
+        assert!(check_next_with(&st, 100, SUPPORTED_PROTOCOL_VERSION).unwrap_err().to_string().contains("upgrade blockula"));
         assert!(check_feature_name("ghost").is_ok() && check_feature_name("Ghost").is_err() && check_feature_name("").is_err());
+    }
+
+    /// P7: a genesis may schedule the preview version from block 1 on (dev and test chains), and
+    /// this binary runs it on exactly those chains. Every other chain, and mainnet always, starts at
+    /// v1 and is run at `SUPPORTED_PROTOCOL_VERSION`.
+    #[test]
+    fn a_genesis_schedule_is_checked_and_decides_the_supported_version() {
+        let at = |version, activation_height| ScheduledUpgrade { version, activation_height };
+        let v2 = PREVIEW_PROTOCOL_VERSION;
+        check_genesis_upgrades(&[], "dev").unwrap();
+        check_genesis_upgrades(&[at(v2, 1)], "dev").unwrap();
+        check_genesis_upgrades(&[at(v2, 500)], "dev").unwrap();
+        let refused = |u: &[ScheduledUpgrade], chain: &str| check_genesis_upgrades(u, chain).unwrap_err().to_string();
+        assert!(refused(&[at(v2, 1)], crate::chain::MAINNET_CHAIN_ID).contains("ScheduleUpgrade"));
+        assert!(refused(&[at(v2, 0)], "dev").contains("block 1 or later"));
+        assert!(refused(&[at(PROTOCOL_VERSION, 5)], "dev").contains("not v1"));
+        assert!(refused(&[at(v2 + 1, 5)], "dev").contains(&format!("not v{}", v2 + 1)));
+        assert!(refused(&[at(v2, 5), at(v2, 9)], "dev").contains("increase"));
+        // The binary runs v2 only where the genesis schedules it.
+        let minimal = serde_json::json!({ "chain_id": "dev", "token": "FANG", "decimals": 9, "block_time_ms": 1000, "validators": [], "faucet": false, "created_at_ms": 0, "allocations": [] });
+        let mut g: crate::chain::Genesis = serde_json::from_value(minimal.clone()).unwrap();
+        assert_eq!((supported_version(&g), HaltControl::for_genesis(&g).supported), (SUPPORTED_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSION));
+        g.upgrades = vec![at(v2, 1)];
+        assert_eq!((supported_version(&g), HaltControl::for_genesis(&g).supported), (v2, v2));
+        // A genesis without one serializes as it did before the field existed (same file, same hash).
+        g.upgrades.clear();
+        assert!(serde_json::to_value(&g).unwrap().get("upgrades").is_none());
+        let mut with = minimal;
+        with["upgrades"] = serde_json::json!([{ "version": v2, "activation_height": 1 }]);
+        assert_eq!(serde_json::from_value::<crate::chain::Genesis>(with).unwrap().upgrades, vec![at(v2, 1)]);
     }
 
     /// An upgrade activates at least `MIN_UPGRADE_LEAD` blocks out: that's what lets a verifier
@@ -649,7 +750,7 @@ mod tests {
         // What a node may vote on, propose or execute.
         let mut st = State::default();
         st.upgrade.schedule = vec![ScheduledUpgrade { version: SUPPORTED_PROTOCOL_VERSION + 1, activation_height: 50 }];
-        let mut c = HaltControl { halt_height: Some(30), ..Default::default() };
+        let mut c = HaltControl { supported: SUPPORTED_PROTOCOL_VERSION, halt_height: Some(30), signal: HaltSignal::default() };
         assert!(c.allows(&st, 30) && !c.allows(&st, 31));
         c.halt_height = None;
         assert!(c.allows(&st, 49) && !c.allows(&st, 50));

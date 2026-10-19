@@ -79,7 +79,7 @@ fn world(mut st: State, chain_id: &str, from: u64, to: u64, blocks: &[(u64, Vec<
         }
         let hash = format!("{salt}-{h}");
         let tx_bytes = blocks.iter().filter(|(at, _)| *at == h).flat_map(|(_, txs)| txs).map(Tx::size).sum();
-        st.end_block(&BlockInfo { height: h, hash: &hash, proposer, view: h, parent_view: h - 1, skipped: &[], tx_bytes });
+        st.end_block(&BlockInfo { height: h, version: crate::upgrade::version_at(&st, h), hash: &hash, proposer, view: h, parent_view: h - 1, skipped: &[], tx_bytes });
         st.commit_block().unwrap();
         st.check_invariants().unwrap();
     }

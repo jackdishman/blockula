@@ -74,6 +74,7 @@ fn genesis(params: &[(&str, u64)]) -> Genesis {
         reserved_names: vec![],
         soul_ledger: vec![],
         features: vec![],
+        upgrades: vec![],
         bootstrap_excluded: vec![],
         pool_repos: Default::default(),
     }
@@ -142,7 +143,7 @@ impl T {
         let hash = format!("block-{}", self.h);
         let proposer = addr(VALIDATORS[0]);
         let tx_bytes = std::mem::take(&mut self.tx_bytes);
-        self.st.end_block(&BlockInfo { height: self.h, hash: &hash, proposer: &proposer, view: self.h, parent_view: self.h - 1, skipped: &[], tx_bytes });
+        self.st.end_block(&BlockInfo { height: self.h, version: crate::upgrade::version_at(&self.st, self.h), hash: &hash, proposer: &proposer, view: self.h, parent_view: self.h - 1, skipped: &[], tx_bytes });
         self.st.commit_block().unwrap();
         self.st.debug_check(self.h);
         self.h += 1;

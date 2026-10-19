@@ -783,7 +783,9 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
     let empty = chain.height() == 0 && chain.base.is_none();
     let keep = net.pruning.keep(true, &chain.state);
     chain.set_pruning(keep);
-    crate::upgrade::configure(&mut chain, consensus::SUPPORTED_PROTOCOL_VERSION, net.halt_height);
+    // What this binary runs on this chain was set when it opened (`upgrade::supported_version`).
+    let supported = chain.halt.supported;
+    crate::upgrade::configure(&mut chain, supported, net.halt_height);
     if let Some(halt) = chain.halt.signal.get() {
         exit_halted(&halt);
     }
@@ -1052,7 +1054,8 @@ pub fn run_full_node(home: PathBuf, net: NetOpts) -> Result<()> {
     let keep = net.pruning.keep(false, &chain.state);
     chain.set_pruning(keep);
     // A halted full node keeps serving reads at its height, with the reason in /api/health.
-    crate::upgrade::configure(&mut chain, consensus::SUPPORTED_PROTOCOL_VERSION, net.halt_height);
+    let supported = chain.halt.supported;
+    crate::upgrade::configure(&mut chain, supported, net.halt_height);
     println!("🦇 Full node for `{}` at height {} — syncing from {}", chain.genesis.chain_id, chain.height(), peers.join(", "));
     let shared: Shared = Arc::new(Mutex::new(chain));
     let fast = jc.fast && !net.full;

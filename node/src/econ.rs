@@ -821,6 +821,7 @@ mod tests {
             reserved_names: vec!["reserved".into()],
             soul_ledger: vec![],
             features: vec![],
+            upgrades: vec![],
             bootstrap_excluded: vec![],
             pool_repos: Default::default(),
         };
@@ -891,7 +892,7 @@ mod tests {
     }
 
     fn info(height: u64, tx_bytes: u64) -> BlockInfo<'static> {
-        BlockInfo { height, hash: "", proposer: "", view: height, parent_view: height - 1, skipped: &[], tx_bytes }
+        BlockInfo { height, version: crate::consensus::PROTOCOL_VERSION, hash: "", proposer: "", view: height, parent_view: height - 1, skipped: &[], tx_bytes }
     }
 
     /// One block's step: a full block raises the rate by the whole step, an empty one lowers it

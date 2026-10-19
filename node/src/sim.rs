@@ -67,8 +67,8 @@ async fn start_with(
     node: Node,
 ) -> Val {
     let mut c = Chain::open(&home).unwrap();
-    if c.height() == 0 {
-        // Committed with block 1, the same on every node.
+    if c.height() == 0 && !node.schedule.is_empty() {
+        // Committed with block 1, the same on every node (a genesis schedule is already there).
         c.state.upgrade.schedule = node.schedule.clone();
     }
     crate::upgrade::configure(&mut c, node.supported, node.halt_height);
@@ -756,6 +756,79 @@ fn validators_upgrade_one_at_a_time_and_a_laggard_halts_at_the_activation_height
             assert_eq!(present, e + consensus::JOURNAL_EPOCHS_KEPT >= epoch, "epoch {e}'s journal (current epoch {epoch})");
         }
         println!("✓ upgraded across #{AT} one validator at a time; the v1 node halted at #{}, then caught up", AT - 1);
+    });
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// P7 (docs/PROGRAMS-PLAN.md): a chain whose genesis schedules v2 runs it on every node with no
+/// proposal and no restart (this binary runs v2 there: `upgrade::supported_version`), and a
+/// version-gated rule (the test-only `upgrade::test_gate`, which refuses its memo from v2 on)
+/// flips at the activation height across the network. A gated tx submitted below it is gossiped,
+/// proposed, verified and executed everywhere; from it on every node's mempool refuses one; blocks
+/// carry v1, then v2; roots agree; and a validator rebuilt from its block logs well past the
+/// activation height (its state database deleted) replays both sides of it to the same root.
+#[test]
+fn a_genesis_scheduled_version_and_its_gated_rules_activate_together_on_every_node() {
+    const AT: u64 = 30;
+    let (root, homes, mut genesis, seeds) = summon("genesis-upgrade");
+    let v2 = crate::upgrade::PREVIEW_PROTOCOL_VERSION;
+    genesis.upgrades = vec![crate::upgrade::ScheduledUpgrade { version: v2, activation_height: AT }];
+    for h in &homes {
+        std::fs::write(h.join("genesis.json"), serde_json::to_string_pretty(&genesis).unwrap()).unwrap();
+    }
+    let executor = deterministic::Runner::timed(Duration::from_secs(900));
+    executor.start(|context| async move {
+        let mut oracle = network(&context, &genesis, &[]).await;
+        let node = Node { supported: crate::upgrade::supported_version(&genesis), schedule: vec![], halt_height: None };
+        assert_eq!(node.supported, v2);
+        let mut vals = vec![];
+        for (i, (home, seed)) in homes.iter().zip(&seeds).enumerate() {
+            vals.push(start_with(&context, &mut oracle, &genesis, i, 0, home.clone(), PrivateKey::from_seed_bytes(*seed), node.clone()).await);
+        }
+        wait_for_height(&context, &vals, 3).await;
+        let (funder, alice) = (Keys::from_seed(seeds[3]), Keys::from_seed([42; 32]));
+        let gated = |nonce: u64| {
+            let mut tx = transfer(&genesis, &funder, nonce, &alice.address(), DROPS_PER_FANG);
+            tx.memo = crate::upgrade::test_gate::MEMO.into();
+            tx.fee = min_fee(tx.size());
+            tx.sign(&funder)
+        };
+        // Below the activation height: submitted to one validator, finalized on all of them.
+        let early = gated(0).id();
+        vals[3].chain.lock().submit(gated(0)).unwrap();
+        wait_until(&context, "the gated tx finalized everywhere", || vals.iter().all(|v| v.chain.lock().has_tx(&early))).await;
+        for v in &vals {
+            let (h, _) = v.chain.lock().tx_location(&early).unwrap();
+            assert!(h < AT, "included at #{h}, below #{AT}");
+        }
+        // From the activation height on: every node's mempool refuses one; ungated txs still go.
+        wait_for_height(&context, &vals, AT).await;
+        for v in &vals {
+            let err = v.chain.lock().submit(gated(1)).unwrap_err().to_string();
+            assert!(err.contains("test gate"), "{err}");
+        }
+        let plain = transfer(&genesis, &funder, 1, &alice.address(), DROPS_PER_FANG);
+        let plain_id = vals[0].chain.lock().submit(plain).unwrap();
+        wait_until(&context, "the ungated tx finalized everywhere", || vals.iter().all(|v| v.chain.lock().has_tx(&plain_id))).await;
+        {
+            let c = vals[0].chain.lock();
+            assert!((1..AT).all(|h| c.block(h).unwrap().version == 1) && (AT..=c.height()).all(|h| c.block(h).unwrap().version == v2));
+        }
+        // Validator 2's state database is lost after the activation height: it rebuilds from its
+        // block logs, replaying v1 and v2 blocks (the gated tx included), and agrees.
+        let mut v = vals.remove(2);
+        v.handle.take().unwrap().abort();
+        let (home, key) = (v.home.clone(), v.key.clone());
+        drop(v);
+        std::fs::remove_file(home.join(crate::store::DB_FILE)).unwrap();
+        vals.insert(2, start_with(&context, &mut oracle, &genesis, 2, 1, home, key, node.clone()).await);
+        let target = vals[0].chain.lock().height() + 5;
+        wait_for_height(&context, &vals, target).await;
+        let h = vals.iter().map(|v| v.chain.lock().height()).min().unwrap();
+        let roots: Vec<String> = vals.iter().map(|v| v.chain.lock().root_at(h).unwrap()).collect();
+        assert!(roots.windows(2).all(|w| w[0] == w[1]), "state roots diverged at {h}: {roots:?}");
+        assert!(vals[2].chain.lock().has_tx(&early));
+        println!("✓ v2 from genesis at #{AT}: the gated rule flipped there on every node, and a rebuild from the logs agreed");
     });
     std::fs::remove_dir_all(root).ok();
 }

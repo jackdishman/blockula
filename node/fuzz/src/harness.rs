@@ -607,8 +607,9 @@ impl Sm {
         }
         self.roots.push(commit.root);
         self.height = height;
-        // A binary that can't run the next height stops (upgrade::check_next), as the node does.
-        self.halted = crate::upgrade::check_next(&self.state, height + 1).is_err();
+        // A binary that can't run the next height stops, as the node does (`upgrade::after_block`).
+        // This genesis schedules no version, so the binary runs `SUPPORTED_PROTOCOL_VERSION`.
+        self.halted = crate::upgrade::check_next_with(&self.state, height + 1, crate::consensus::SUPPORTED_PROTOCOL_VERSION).is_err();
     }
 
     /// Interprets one op as a tx (or blocks). `amt` and the indexes come from the fuzzer.

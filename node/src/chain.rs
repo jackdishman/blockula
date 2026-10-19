@@ -175,6 +175,12 @@ pub struct Genesis {
     /// Features on from genesis (`upgrade::KNOWN_FEATURES`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub features: Vec<String>,
+    /// Protocol versions scheduled from genesis, as `ScheduleUpgrade` proposals would schedule
+    /// them: dev and test chains only (`upgrade::check_genesis_upgrades`), and a chain that has
+    /// any runs `upgrade::PREVIEW_PROTOCOL_VERSION` (`upgrade::supported_version`). Absent on
+    /// every chain that starts at v1, so their genesis and its hash don't change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upgrades: Vec<crate::upgrade::ScheduledUpgrade>,
     /// Accounts whose validators the bootstrap delegation passes over (DEC-5: the founder's and
     /// the foundation's, now and later), sorted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -374,6 +380,7 @@ impl Genesis {
         for f in &self.features {
             state.upgrade.features.insert(f.clone(), crate::upgrade::Feature { activated_at: 0 });
         }
+        state.upgrade.schedule = self.upgrades.clone();
         // P-ECON: the base fee and block-size limit for the first blocks (at the floor).
         crate::econ::init_genesis(&mut state);
         crate::beacon::init_genesis(&mut state, &self.chain_id, self.created_at_ms);
@@ -508,6 +515,7 @@ impl Genesis {
             ensure!(crate::upgrade::KNOWN_FEATURES.contains(&f.as_str()), "unknown feature {f} (known: {})", crate::upgrade::KNOWN_FEATURES.join(", "));
             ensure!(features.insert(f), "feature {f} is listed twice");
         }
+        crate::upgrade::check_genesis_upgrades(&self.upgrades, &self.chain_id)?;
         if self.chain_id == MAINNET_CHAIN_ID {
             ensure!(self.validator_admins.is_empty(), "{MAINNET_CHAIN_ID} has no admin keys: validator_admins must be empty");
             ensure!(!self.faucet, "{MAINNET_CHAIN_ID} has no faucet");
@@ -663,6 +671,9 @@ impl Journal {
 #[derive(Clone, Copy, Debug)]
 pub struct BlockInfo<'a> {
     pub height: u64,
+    /// The protocol version in force at `height` (`upgrade::version_at` on the state the block
+    /// runs on): what every version-gated rule of the block's end-of-block steps reads.
+    pub version: u32,
     pub hash: &'a str,
     /// Paid the block's tips; pays for its skipped txs.
     pub proposer: &'a str,
@@ -980,9 +991,11 @@ impl State {
     ///    (the bootstrap delegation's rewards and return to the treasury, the rest spread over the
     ///    next set), then [`State::end_epoch`] (how much set history to keep).
     ///
-    /// Then the caller commits the block and, last, runs `upgrade::check_next(height + 1)`, which
-    /// stops the node before a height its binary can't execute (3.9).
+    /// Then the caller commits the block and, last, runs `upgrade::after_block`, which stops the
+    /// node before a height its binary can't execute (3.9).
     pub fn end_block(&mut self, b: &BlockInfo) {
+        #[cfg(test)]
+        crate::upgrade::test_gate::saw(b.height, b.version);
         self.poc_end_block(b.height);
         crate::econ::end_block(self, b);
         crate::staking::end_block(self, b);
@@ -1014,6 +1027,9 @@ impl State {
     /// `tx_bytes` (econ's fullness) counts every tx the block carried, skipped ones included.
     #[allow(clippy::too_many_arguments)]
     pub fn run_block<'t>(&mut self, chain_id: &str, height: u64, hash: &str, proposer: &str, view: u64, parent_view: u64, txs: impl IntoIterator<Item = &'t Tx>, mut each: impl FnMut(&'t Tx, Vec<String>, Result<Outcome>)) {
+        // Fixed for the whole block: an upgrade its end-of-block steps schedule activates at least
+        // `MIN_UPGRADE_LEAD` blocks later.
+        let version = crate::upgrade::version_at(self, height);
         let mut skipped = vec![];
         let mut tx_bytes = 0u64;
         for tx in txs {
@@ -1026,7 +1042,7 @@ impl State {
             }
             each(tx, named, r);
         }
-        self.end_block(&BlockInfo { height, hash, proposer, view, parent_view, skipped: &skipped, tx_bytes });
+        self.end_block(&BlockInfo { height, version, hash, proposer, view, parent_view, skipped: &skipped, tx_bytes });
     }
 
     /// The accounts `tx`'s action names, resolved as the state is now: just before it runs, which
@@ -1203,6 +1219,10 @@ impl State {
         }
         tx.check_prefix(self.params.prefix())?;
         check_validity(tx, height, self.chain_params.max_tx_validity_blocks)?;
+        #[cfg(test)]
+        if tx.memo == crate::upgrade::test_gate::MEMO && crate::upgrade::version_at(self, height) >= crate::upgrade::PREVIEW_PROTOCOL_VERSION {
+            bail!("refused from protocol v{} on (the test gate)", crate::upgrade::PREVIEW_PROTOCOL_VERSION);
+        }
         let sender = tx.sender()?;
         let signer = tx.signer_key_id()?;
         let keys = self.keys_of(&sender);
@@ -1301,6 +1321,8 @@ impl State {
     /// checks, proposals) without cloning the state.
     pub fn apply_j(&mut self, j: &mut Journal, tx: &Tx, chain_id: &str, proposer: &str, height: u64, full_checks: bool) -> Result<Outcome> {
         // Unsigned ghost txs have no sender, nonce or key: their proof authorizes them (ghost.rs).
+        // They never reach `admit`, so a version-gated admission rule that must cover them goes in
+        // `ghost::apply_unsigned` too.
         if tx.is_unsigned() {
             return crate::ghost::apply_unsigned(self, j, tx, chain_id, proposer, height, full_checks);
         }
@@ -2440,6 +2462,7 @@ impl Chain {
             reserved_names: vec![],
             soul_ledger: vec![],
             features: vec![],
+            upgrades: vec![],
             bootstrap_excluded: vec![],
             pool_repos: Default::default(),
         };
@@ -2528,6 +2551,7 @@ impl Chain {
         let view = ReadView::new(state.clone(), height, last_hash.clone(), genesis_arc.clone(), genesis_hash.clone(), genesis_root.clone(), role, base.clone(), point.pruned_below, None, head.clone(), snap.clone(), disk.clone());
         let live = Arc::new(Live::new(view, epochs.clone(), disk.clone()));
         let epochs_saver = EpochsSaver::new(home.join("epochs.json"));
+        let halt = crate::upgrade::HaltControl::for_genesis(&genesis);
         let mut chain = Chain {
             home: home.into(),
             genesis,
@@ -2567,7 +2591,7 @@ impl Chain {
             replayed: 0,
             epochs_saver,
             cert_bytes: CERT_SPACING_BYTES,
-            halt: Default::default(),
+            halt,
             #[cfg(test)]
             junk_proposals: false,
             #[cfg(test)]
@@ -2935,6 +2959,7 @@ impl Chain {
         }
         // A block this binary can't run was logged by a newer one (3.9).
         crate::upgrade::check_next_with(&self.state, block.height, self.halt.supported)?;
+        let version = crate::upgrade::version_at(&self.state, block.height);
         let mut named = Vec::with_capacity(block.txs.len());
         for (i, tx) in block.txs.iter().enumerate() {
             named.push(self.state.named_by(tx));
@@ -2942,7 +2967,7 @@ impl Chain {
             check_replayed(block.height, i, &outcome, block.failed.get(&i))?;
         }
         let tx_bytes = block.txs.iter().map(Tx::size).chain(block.skipped.iter().copied()).sum();
-        self.state.end_block(&BlockInfo { height: block.height, hash: &block.hash, proposer: &block.proposer, view: block.view, parent_view: block.parent_view, skipped: &block.skipped, tx_bytes });
+        self.state.end_block(&BlockInfo { height: block.height, version, hash: &block.hash, proposer: &block.proposer, view: block.view, parent_view: block.parent_view, skipped: &block.skipped, tx_bytes });
         if self.state.params.is_boundary(block.height) {
             self.record_epoch(block.height);
         }
@@ -5367,6 +5392,7 @@ mod scaffold {
             reserved_names: vec!["blockula".into(), "foundation".into()],
             soul_ledger: vec![SoulEntry { account: owner.address(), soul: 50 * SOUL, reason: "testnet contributor".into() }],
             features: if chain_id == MAINNET_CHAIN_ID { vec![] } else { vec!["ghost".into()] },
+            upgrades: vec![],
             bootstrap_excluded: vec![],
             pool_repos: Default::default(),
         }
@@ -5669,6 +5695,72 @@ mod scaffold {
         fs::remove_file(home.join(store::DB_FILE)).unwrap();
         let c = Chain::open(&home).unwrap();
         assert_eq!((c.state.root(), c.block(1).unwrap().skipped, c.replayed), (root, vec![stale.size()], 1));
+        drop(c);
+        fs::remove_dir_all(home).ok();
+    }
+
+    /// P7 (docs/PROGRAMS-PLAN.md): a version-gated rule, here the test-only `upgrade::test_gate`
+    /// (admission refuses its memo from v2 on), flips at the activation height on every path a
+    /// node runs on its own (mempool admission and revalidation, execution, the end-of-block
+    /// steps, and replay from the block logs) and nowhere else. `consensus.rs` and the simulator
+    /// cover propose and verify.
+    #[test]
+    fn a_version_gated_rule_flips_at_its_height_on_every_path() {
+        const AT: u64 = 4;
+        let mut g = genesis("scaffold-1");
+        g.upgrades = vec![crate::upgrade::ScheduledUpgrade { version: crate::upgrade::PREVIEW_PROTOCOL_VERSION, activation_height: AT }];
+        g.check().unwrap();
+        let (home, mut c) = open("version-gate", &g);
+        // This binary runs v2 on a chain whose genesis schedules it.
+        assert_eq!(c.halt.supported, crate::upgrade::PREVIEW_PROTOCOL_VERSION);
+        let (owner, bob) = (keys(22), keys(24));
+        let gated = |c: &Chain, nonce_ahead: u64| {
+            let mut tx = signed(c, &owner, Action::Transfer { to: bob.address(), amount: FANG });
+            tx.nonce += nonce_ahead;
+            tx.memo = crate::upgrade::test_gate::MEMO.into();
+            tx.fee = min_fee(tx.size());
+            tx.sign(&owner)
+        };
+        crate::upgrade::test_gate::record();
+        // Below v2 the rule doesn't exist: admitted (at the next height, 1), included, applied.
+        let early = gated(&c, 0);
+        c.submit(early.clone()).unwrap();
+        c.produce_block().unwrap();
+        assert!(c.failure(&early.id()).is_none() && c.block(1).unwrap().txs.iter().any(|t| t.id() == early.id()));
+        c.produce_block_with(vec![]).unwrap();
+        // Admitted for block 3, but block 3 leaves it out: from block 4 (v2) on it no longer
+        // applies, so revalidation drops it from the mempool.
+        let late = gated(&c, 0);
+        c.submit(late.clone()).unwrap();
+        c.produce_block_with(vec![]).unwrap();
+        assert_eq!(c.height(), AT - 1);
+        assert!(!c.mempool.iter().any(|t| t.id() == late.id()), "dropped once the next height runs v2");
+        assert!(c.failure(&late.id()).unwrap().0.contains("test gate"));
+        // Mempool admission for block 4 refuses it outright; an ungated tx still goes in.
+        assert!(c.submit(gated(&c, 0)).unwrap_err().to_string().contains("test gate"));
+        let plain = signed(&c, &owner, Action::Transfer { to: bob.address(), amount: FANG });
+        c.submit(plain.clone()).unwrap();
+        // Execution: a block at v2 that carries one anyway skips it (unadmittable).
+        let forced = gated(&c, 1);
+        c.produce_block_with(vec![plain.clone(), forced.clone()]).unwrap();
+        let b = c.block(AT).unwrap();
+        assert!(b.txs.iter().any(|t| t.id() == plain.id()) && !b.txs.iter().any(|t| t.id() == forced.id()));
+        assert_eq!(b.skipped, vec![forced.size()]);
+        assert!(c.failure(&forced.id()).unwrap().0.contains("test gate"));
+        c.produce_block_with(vec![]).unwrap();
+        // Each block carries the version in force at its height, and its end-of-block steps saw it.
+        let versions: Vec<(u64, u32)> = (1..=AT + 1).map(|h| (h, c.block(h).unwrap().version)).collect();
+        assert_eq!(versions, vec![(1, 1), (2, 1), (3, 1), (4, 2), (5, 2)]);
+        assert_eq!(crate::upgrade::test_gate::take(), versions);
+        let root = c.state.root();
+        drop(c);
+        // Replay from the block logs: block 1's gated tx applies again (v1) and block 4 skips the
+        // other (v2), to the same root, the end-of-block steps seeing the same versions.
+        fs::remove_file(home.join(store::DB_FILE)).unwrap();
+        crate::upgrade::test_gate::record();
+        let c = Chain::open(&home).unwrap();
+        assert_eq!((c.height(), c.state.root()), (AT + 1, root));
+        assert_eq!(crate::upgrade::test_gate::take(), versions);
         drop(c);
         fs::remove_dir_all(home).ok();
     }

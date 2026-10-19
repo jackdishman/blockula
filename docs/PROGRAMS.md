@@ -484,7 +484,7 @@ stops them all at the same height, and again on every restart.
 | Memory-safety bugs in the engine | `catch_unwind` doesn't catch these: a use-after-free can diverge or worse (CVE-2025-66627). Mitigations: the narrow feature set, fixed memory, no growth, an engine per block, nightly fuzzing of `program_exec` and `program_validate` under AddressSanitizer, an exact pin plus a watch on wasmi's advisories, and a patched release through `ScheduleUpgrade` if one lands (section 16, R1) |
 | Platform | Wasm is little-endian and the interpreter has no per-architecture paths. CI runs the corpus on x86-64 and aarch64 and compares receipt digests and state roots |
 | Out of fuel | wasmi charges fuel at fixed points of one algorithm. An out-of-fuel trap reports `fuel_used = fuel_limit`. Partial accounting can't disagree, and the charge is the limit anyway (5.1) |
-| Protocol version | Every v2 behavior is a function of `upgrade::version_at(h)`, listed in 14.4, so a v2 binary replays v1 history exactly. Nothing in execution reads the version today (section 2), so plumbing it into admission, execution, `end_block` and the mempool lands first (PROGRAMS-PLAN.md P7): programs are the chain's first version-gated behavior |
+| Protocol version | Every v2 behavior is a function of `upgrade::version_at(h)`, listed in 14.4, so a v2 binary replays v1 history exactly. P7 (PROGRAMS-PLAN.md) plumbed it into admission, execution, `end_block`, the proposer and the mempool before any gated rule: programs are the chain's first version-gated behavior (14.4) |
 
 ### 4.4 Execution model: a read-only view and a sorted diff
 
@@ -2099,8 +2099,8 @@ mod escrow {
   (delay 0 on dev chains). Signing commands pin the network exactly as the existing ones do
   (`--network`, `--chain-id`, `--genesis-hash`, `known-chains.json`), and refuse a node that
   claims mainnet unless told `--network mainnet`.
-- **Local development.** `blockula dev` starts at protocol v2 (a genesis schedule entry
-  `{ version: 2, activation_height: 0 }`, 14.4) with `programs` in its genesis `features`,
+- **Local development.** `blockula dev` starts at protocol v2 (from C10: a genesis schedule entry
+  `{ version: 2, activation_height: 1 }`, 14.1) with `programs` in its genesis `features`,
   `program_min_upgrade_delay_blocks` 0, floor prices and `--program-logs`.
   `/api/simulate?trace=1` on dev chains returns a step trace, mapped to source lines through
   debug info the CLI keeps beside the stripped module. `node scripts/seed-dev.mjs` deploys the
@@ -2323,15 +2323,22 @@ audit's scope, because the mainnet binary carries it even while programs are off
     block through, and v1 nodes executing it would drop the transaction silently
     (`parse_txs().into_iter().flatten()`, `consensus.rs:1073`) and diverge. Every other v2 change
     is gated the same way (14.4).
-  - At activation, v1-only nodes halt cleanly (`upgrade::check_next`, exit code 11).
-  - `consensus::SUPPORTED_PROTOCOL_VERSION` becomes 2, read through a new
-    `upgrade::supported_version()`. Until the release that ships programs, it answers 2 only for
-    a chain whose genesis schedules v2 at height 0 (`blockula dev`, `summon`) and 1 for every
-    other, so testnet-2's blocks keep signaling 1 and nobody can schedule v2 there by mistake
-    (PROGRAMS-PLAN.md section 4). The work lands on main this way, behind the gates of 14.4.
-  - A chain starts at v2 through a genesis schedule entry `{ version: 2, activation_height: 0 }`
-    in the existing `upgrade` record, not through a new genesis `Params` field, which would change
-    the `params` record's encoding (14.4).
+  - At activation, v1-only nodes halt cleanly (`upgrade::after_block`, exit code 11).
+  - `consensus::SUPPORTED_PROTOCOL_VERSION` becomes 2. Until the release that ships programs, a
+    node reads what it supports from `upgrade::supported_version()` (P7): 2
+    (`upgrade::PREVIEW_PROTOCOL_VERSION`) for a chain whose genesis schedules v2, and 1 for every
+    other, so testnet-2's blocks keep signaling 1 and its nodes halt before a v2 scheduled there
+    by mistake (PROGRAMS-PLAN.md section 4). The work lands on main this way, behind the gates of
+    14.4.
+  - A chain starts at v2 through a genesis schedule entry `{ version: 2, activation_height: 1 }`
+    (`Genesis::upgrades`, P7) in the existing `upgrade` record, not through a new genesis `Params`
+    field, which would change the `params` record's encoding (14.4). It activates at block 1, so
+    the genesis block keeps v1 (`GENESIS_PROTOCOL_VERSION`) and every block carries the version in
+    force at its height. Only a dev or test chain a binary summons has one: a preview version's
+    rules change from release to release, so `blockula genesis build` (public networks) can't
+    schedule one, and mainnet's genesis refuses one (`upgrade::check_genesis_upgrades`). v2
+    reaches a public network through `ScheduleUpgrade`, or through its genesis once the release
+    ships it.
 - **Feature flags.** `upgrade::KNOWN_FEATURES` becomes `known_features(version)`: `["ghost"]` at
   v1, plus `programs` and `programs_freeze` from v2. `Propose`, `exec_activate_feature` and
   `check_invariants` all call it, so a v2 binary fails a pre-v2 `ActivateFeature { programs }`
@@ -2495,10 +2502,13 @@ This is the first upgrade that adds state on a live chain, so it's specified rec
    pruned validator's own local snapshot from before `H` (which it couldn't rebuild from logs, as
    `chain.rs:3927-3932` shows), and executes through `H`. A v1 binary refuses schema 10, which is
    right: it halts at `H` anyway.
-4. **Every v2 behavior change is a function of `version_at(h)`.** Today no execution path can
-   read it (section 2): P7 (PROGRAMS-PLAN.md) puts the version in force in `BlockInfo` and makes
-   it reachable in `admit`, `apply_j`, `end_block`, `dry_run` and `MempoolCheck` first, with a
-   test-only gated rule that flips at its height on every path and nowhere else.
+4. **Every v2 behavior change is a function of `version_at(h)`.** P7 (PROGRAMS-PLAN.md) made it
+   reachable on every path, on the state each path runs on: `BlockInfo.version` for the
+   end-of-block steps; `version_at(state, height)` in `admit`, `apply_j`, `dry_run` and
+   `MempoolCheck`, whose heights are the ones the tx would execute at; and the proposer's header
+   from the parent's replayed state. A test-only gated rule (`upgrade::test_gate`) flips at its
+   height on every path (execute, verify, propose, mempool, replay) and nowhere else, in unit
+   tests and a simulator scenario.
 
    | Change | Below v2 (as v1) | From v2 |
    |---|---|---|
@@ -2648,15 +2658,15 @@ than on code. With no external audit, there's no audit queue to wait for.
 | `node/Cargo.toml` | `exclude += "vm"`; the `blockula-vm` path dependency; `[profile.release.package.*] overflow-checks = true` for `blockula-vm` and every engine crate (4.3); a test that they're all listed |
 | `node/src/programs.rs`, `node/src/programs/` | The `SubState` (records, journal, optional meta, invariants); `params.rs` (`ProgramParams`, bounds, classes); `host.rs` (`impl Host` over `&State`); `commit.rs` (sorted diff, conservation, who was debited, `value_held` by account kind); `admit`; `execute` for tags 62–68 (re-checking what admission checks); `fuel.rs` (ring, `fuel_slot`, reservation, load pricing, `lowest_fuel_fee`, `MAX_FUEL_RATE`); `grants.rs`; `receipt.rs` (codec, codes, root); `end_block` (fuel ring, receipts root, sweep, folding due upgrades); the pause, freeze and exit-only rules; `check_after_action`; `describe`; API views |
 | `node/src/types.rs` | `Action` variants 62–70 (`encode`, `decode` with nested refusals of 62 and 69, `check_format`, `json_ints`, `kind`, `addresses`); `put_bytes`; `Tx::max_bytes` for `UploadCode` (`MAX_CODE_TX_BYTES`); `ProgramGrant`'s wire form; digest and selector functions; `program_vector_actions`; the every-tag test to 70. `KeyRole` unchanged |
-| `node/src/chain.rs` | `State.programs` and `State.block` (the per-block counters); `State::begin_block`, called by `run_block` and every path that applies a block's transactions; `Journal.programs` and `opened_by_program` (`absorb`, `rollback`); `admit` (no program or closed `from`, version and feature gates, the pause and freeze, the session arm for `CallProgram`, the reservation in the charge, the running count); `apply_j` (the `run_programs` flag, program execution, `check_after_action`); `apply_action` dispatch, `AddScopedKey` through the `AddKey` handler, `RemoveKey` deleting grants, credit checks for `Transfer` and `AwardHunt`; `j_credit`/`j_debit` maintaining `value_held` for native credits; `BlockInfo::fuel_counted`; `dry_run`/`simulate_queue`/`MempoolCheck::run` without the VM or the block counters; `TipRate` by the scarcer resource; `describe_with`; the schema range at open. First (P7): `BlockInfo.version`, and the version in force reachable in `admit`, `apply_j`, `end_block`, `dry_run` and `MempoolCheck` |
+| `node/src/chain.rs` | `State.programs` and `State.block` (the per-block counters); `State::begin_block`, called by `run_block` and every path that applies a block's transactions (`Chain::replay` from the block logs runs its own loop: it needs the call too); `Journal.programs` and `opened_by_program` (`absorb`, `rollback`); `admit` (no program or closed `from`, version and feature gates, the pause and freeze, the session arm for `CallProgram`, the reservation in the charge, the running count); `apply_j` (the `run_programs` flag, program execution, `check_after_action`); `apply_action` dispatch, `AddScopedKey` through the `AddKey` handler, `RemoveKey` deleting grants, credit checks for `Transfer` and `AwardHunt`; `j_credit`/`j_debit` maintaining `value_held` for native credits; `BlockInfo::fuel_counted`; `dry_run`/`simulate_queue`/`MempoolCheck::run` without the VM or the block counters; `TipRate` by the scarcer resource; `describe_with`; the schema range at open. Done in P7: `BlockInfo.version`, `Genesis::upgrades`, a node's supported version from its genesis, and the version in force on every path that admits or applies txs |
 | `node/src/econ.rs` | `check_fee`/`check_tip` with the fuel base in u128; `charge_new_accounts` skipping `opened_by_program` and, from v2, checking a session key's limit; `check_invariants` with program escrow |
 | `node/src/consensus.rs` | Stateless Σ of declared `exec` and per-transaction fee checks in `verify`; `begin_block` before the block's transactions in `verify` and `propose`; the running count in replay and apply; the proposer including `Failed` program transactions, packing by reservation, off the chain lock; the replay cache; the executor thread (verify, propose, finalized execution); `SUPPORTED_PROTOCOL_VERSION = 2` |
 | `node/src/node.rs` | Sync and startup replay on the executor thread; the API's fixed-stack pool; refusing to start without them |
 | `node/src/governance.rs` | `ParamChange` routing of `program_*` keys from v2; `known_features(version)` in `prepare_kind`; `council_may_pass` false for `programs_freeze` from v2; multisig reservations (`MultisigPropose` nested, every `MultisigApprove` of a stored program action); `action_digest` covers tags 63–68 and 70 through `encode`; `TreasurySpend` to a program checked against the value cap and closed programs |
 | `node/src/state/mod.rs`, `state/codec.rs` | `ns` 66–73; `meta::PROGRAMS` (optional); `modules()` grows to 7; the schema record as a state field; `SUPPORTED_SCHEMAS = 9..=10`; `ByteKey`; `check_invariants`, `check_bounds` |
 | `node/src/snapshot.rs` | Accepts schemas 9 and 10; a test that program state's ceiling plus native state stays under `MAX_STATE_BYTES` |
-| `node/src/upgrade.rs` | `known_features(version)`; `supported_version()` (2 only on chains born at v2 until the release that ships programs, 14.1); the genesis schedule entry respected by `version_at` |
-| `node/src/genesis_builder.rs` | An optional genesis `upgrades` list (a v2 chain: `{ version: 2, activation_height: 0 }`), written into the existing `upgrade` record |
+| `node/src/upgrade.rs` | `known_features(version)`; done in P7: `supported_version()` (2 only on chains whose genesis schedules v2, until the release that ships programs, 14.1), `check_genesis_upgrades` and the test-only `test_gate` |
+| `node/src/genesis_builder.rs` | Nothing: a public network's genesis never schedules a preview version (P7). A dev or test chain's schedule is `Genesis::upgrades` (`chain.rs`), which `blockula dev` sets from C10 |
 | `node/src/ghost.rs` | `apply_unsigned` refusing (`Err`) an `Unshield` to a closed program, one that doesn't accept transfers, or one the value cap can't take |
 | `node/src/staking.rs` | `system_tx_key` admits `ProgramsPause` |
 | `node/src/api.rs`, `view.rs`, `store.rs` | `/api/program/{address}` (with `/interface`, `/storage`, `/events`, `/view`); `/api/code/{hash}`; `POST /api/simulate`; `/api/receipt/{tx}`; the `/api/fees` fuel section and cap headroom; `/api/params` programs section; receipts in `/api/tx` (facts and claims); redb indexes `programs_by_creator`, `code_users`, `program_events`; receipts in `BlockMeta`; `--serve-simulate`, `--program-logs`, `--view-max-fuel` |

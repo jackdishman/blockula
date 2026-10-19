@@ -136,8 +136,11 @@ each correction):
    `version_at(h)`. Records, encodings and outcomes below the activation height are
    byte-identical to v1's. P2's replay gate checks this on every PR.
 2. **v2 stays dev-only until the release.**
-   - `supported_version()` returns 2 only for a chain whose genesis schedules v2 at height 0
-     (`blockula dev`, `summon`), and 1 for every other chain.
+   - `supported_version()` returns 2 only for a chain whose genesis schedules v2
+     (`Genesis::upgrades`, from block 1: dev and test chains a binary summons; `blockula dev`
+     from C10), and 1 for every other chain. A public network's genesis can't schedule one
+     (`blockula genesis build` has no `[[upgrade]]`): a preview version's rules change between
+     releases.
    - So testnet-2's blocks keep signaling 1, and nobody can schedule v2 there by mistake. O3's
      release flips this for testnet-2.
    - Mainnet's genesis refuses v2 until the audit closes.
@@ -180,7 +183,7 @@ phase too, because they don't depend on the engine.
 | **P4** | A replay cache | `consensus.rs`: post-states of verified and proposed blocks, keyed by digest, at most `MAX_REPLAY` | Each block's txs run once in verification, however many descendants are verified. A simulator scenario with forks and view changes |
 | **P5** | Packing off the chain lock | `consensus.rs` (`propose`) | HTTP submits and finalization never wait out a proposal's execution |
 | **P6** | `POST /api/simulate` for native txs | `api.rs`, `view.rs`, SDK `client.simulate`. Optionally, the explorer's preflight uses it | Returns the outcome, the refusal reason and the balance changes from a `ReadView`. Off on validators unless `--serve-simulate` |
-| **P7** | Version plumbing | `chain.rs`: `BlockInfo.version`, and the version reachable in `admit`, `apply_j`, `end_block`, `dry_run` and `MempoolCheck`. `upgrade.rs`: `supported_version()` and an optional genesis `upgrades` list. `genesis_builder.rs` | A test-only gated rule flips at its scheduled height on every path (execute, verify, propose, mempool, replay) and nowhere else |
+| **P7** ✅ | Version plumbing | `chain.rs`: `BlockInfo.version`, and the version reachable in `admit`, `apply_j`, `end_block`, `dry_run` and `MempoolCheck`. `upgrade.rs`: `supported_version()` and an optional genesis `upgrades` list. `genesis_builder.rs` | A test-only gated rule flips at its scheduled height on every path (execute, verify, propose, mempool, replay) and nowhere else |
 
 ### 5.2 Spike (branch `spike/programs-vm`, not merged)
 

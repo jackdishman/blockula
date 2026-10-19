@@ -601,7 +601,9 @@ where
         let executed = self.chain.lock().height();
         let Some(pending) = unexecuted(parent.clone(), &mut ancestry, executed).await else {
             // Far behind (still catching up): propose an empty block rather than guess (but never
-            // at a checkpoint-certifying height, which needs the real root).
+            // at a checkpoint-certifying height, which needs the real root). Its version is the
+            // executed state's: right unless an upgrade was scheduled in the blocks we skipped, in
+            // which case verifiers reject it and the view is lost, as it would be without one.
             if crate::snapshot::certifies(height).is_some() {
                 return None;
             }
@@ -621,6 +623,14 @@ where
             warn!(height, "the parent doesn't extend our finalized chain; not proposing");
             return None;
         };
+        // The header carries the version the txs are judged under: the one in force at `height` on
+        // the parent's replayed state, which may have executed past what we have (P7). An upgrade
+        // activates `MIN_UPGRADE_LEAD` blocks after the block that schedules it, so this is the
+        // version verifiers expect; one this binary can't run gets no proposal.
+        let version = crate::upgrade::version_at(&state, height);
+        if version > signal {
+            return None;
+        }
         let included: std::collections::HashSet<String> = pending.iter().flat_map(|b| b.parse_txs().into_iter().flatten().map(|t| t.id())).collect();
         let txs = {
             let c = self.chain.lock();
@@ -2002,6 +2012,76 @@ mod tests {
             let t0 = context.current();
             assert!(!verify(child(&ahead[0], e + 10, [0; 32], &[&paid[0]]), ahead).await);
             assert_eq!(context.current(), t0, "without waiting");
+        });
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// P7 (docs/PROGRAMS-PLAN.md): a version-gated rule (the test-only `upgrade::test_gate`, which
+    /// refuses its memo from v2 on) flips at the activation height in proposals and verification
+    /// too, on the replayed parent state: below it a proposer includes a gated tx and verifiers
+    /// accept a block carrying one; from it on the proposer leaves it out and verifiers reject
+    /// such a block. Ungated txs go in either way.
+    #[test]
+    fn proposals_and_verification_apply_a_version_gated_rule_from_its_height() {
+        let home = std::env::temp_dir().join(format!("blockula-gate-{}-{}", crate::chain::now_ms(), std::process::id()));
+        Chain::summon(&home, &SummonOpts::new("gate", 1)).unwrap();
+        let mut c = Chain::open(&home).unwrap();
+        let users: Vec<crate::crypto::Keys> = (1..=2u8).map(|i| crate::crypto::Keys::from_seed([i; 32])).collect();
+        for u in &users {
+            c.faucet(&u.address(), 100 * crate::types::DROPS_PER_FANG).unwrap();
+        }
+        c.produce_block().unwrap();
+        let e = c.height();
+        // v2 from e + 3 on (set directly: governance schedules it MIN_UPGRADE_LEAD ahead), on a
+        // binary that runs it.
+        let at = e + 3;
+        let v2 = crate::upgrade::PREVIEW_PROTOCOL_VERSION;
+        c.state.upgrade.schedule = vec![crate::upgrade::ScheduledUpgrade { version: v2, activation_height: at }];
+        crate::upgrade::configure(&mut c, v2, None);
+        let me = c.me().unwrap();
+        let transfer = |u: &crate::crypto::Keys, memo: &str| {
+            let mut t = Tx { chain_id: "gate".into(), genesis_hash: c.genesis_hash.clone(), from: u.address(), nonce: 0, fee: 0, tip: 0, valid_until: e + 50, action: crate::types::Action::Transfer { to: me.clone(), amount: 1 }, memo: memo.into(), public_key: hex::encode(u.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+            t.fee = crate::econ::max_fee(&c.state, t.size());
+            t.sign(u)
+        };
+        let (gated, plain) = (transfer(&users[0], crate::upgrade::test_gate::MEMO), transfer(&users[1], ""));
+        // Both are admitted for the next height (e + 1, still v1).
+        c.submit(gated.clone()).unwrap();
+        c.submit(plain.clone()).unwrap();
+        let root_e = hex_32(&c.root_at(e).unwrap());
+        let hash_e = Digest(hex_32(c.last_hash()));
+        let validator_key: [u8; 32] = hex::decode(std::fs::read_to_string(home.join("validator.key")).unwrap().trim()).unwrap().try_into().unwrap();
+        let chain: Shared = Arc::new(Mutex::new(c));
+        deterministic::Runner::timed(Duration::from_secs(60)).start(|context| async move {
+            let leader = PrivateKey::from_seed_bytes(validator_key).public_key();
+            let mut app = App { chain: chain.clone(), block_time_ms: 1_000, address_prefix: "boo".into() };
+            let run = |to: u64| line_on(e, hash_e, to);
+            let cctx = |parent: &CBlock| SimplexContext { round: Round::new(Epoch::zero(), View::new(parent.height + 1)), leader: leader.clone(), parent: (View::new(parent.view), parent.digest()) };
+            let mut propose = async |ancestors: Vec<CBlock>| {
+                let cctx = cctx(&ancestors[0]);
+                let ancestry = marshal::ancestry::from_iter(ancestors.into_iter().map(Arc::new));
+                Application::<deterministic::Context>::propose(&mut app, (context.child("propose"), cctx), ancestry, ()).await.unwrap()
+            };
+            let has = |b: &CBlock, t: &Tx| b.txs.contains(&t.to_bytes());
+            // Height e + 2 runs v1: both go in. Height e + 3 runs v2: only the ungated one.
+            let below = propose(run(e + 1)).await;
+            assert_eq!((below.height, below.version), (at - 1, 1));
+            assert!(has(&below, &gated) && has(&below, &plain));
+            let from = propose(run(e + 2)).await;
+            assert_eq!((from.height, from.version, from.signal), (at, v2, v2));
+            assert!(!has(&from, &gated) && has(&from, &plain));
+
+            let mut app = App { chain: chain.clone(), block_time_ms: 1_000, address_prefix: "boo".into() };
+            let mut verify = async |block: CBlock, ancestors: Vec<CBlock>| {
+                let cctx = cctx(&ancestors[0]);
+                let ancestry = marshal::ancestry::from_iter(std::iter::once(block).chain(ancestors).map(Arc::new));
+                Application::<deterministic::Context>::verify(&mut app, (context.child("verify"), cctx), ancestry).await
+            };
+            let child = |parent: &CBlock, version: u32, txs: &[&Tx]| CBlock::new(parent.digest(), parent.height + 1, parent.height + 1, parent.view, 1_000, leader.address("boo"), e, root_e, txs.iter().map(|t| t.to_bytes()).collect()).with_versions(version, v2);
+            let (v1_parent, v2_parent) = (run(e + 1), run(e + 2));
+            assert!(verify(child(&v1_parent[0], 1, &[&gated]), v1_parent.clone()).await, "below the activation height");
+            assert!(!verify(child(&v2_parent[0], v2, &[&gated]), v2_parent.clone()).await, "from it on");
+            assert!(verify(child(&v2_parent[0], v2, &[&plain]), v2_parent).await);
         });
         std::fs::remove_dir_all(home).ok();
     }

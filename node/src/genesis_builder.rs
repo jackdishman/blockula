@@ -493,6 +493,8 @@ pub fn build_from(spec: &Spec, operators: &[OperatorFile], strict: bool) -> Resu
         reserved_names: spec.reserved_names.clone(),
         soul_ledger,
         features: spec.features.clone(),
+        // A public network never starts on a preview version (`upgrade::check_genesis_upgrades`).
+        upgrades: vec![],
         bootstrap_excluded: excluded,
         pool_repos,
     };
@@ -924,6 +926,17 @@ mod tests {
         let mut with = spec.clone();
         with.soul_ledger.push(SpecSoul { account: Keys::from_seed([0x30; 32]).address_with("tboo"), soul: "5".into(), reason: "juror".into() });
         refuse(&with, "is the founder's");
+    }
+
+    /// A public network's genesis never starts on a preview version (P7): a spec has no
+    /// `[[upgrade]]` (unknown fields are refused), and what it builds schedules nothing.
+    #[test]
+    fn a_spec_cant_schedule_a_preview_version() {
+        let ops = operators("blockula-testnet-9", "tboo", 22);
+        let upgrade = format!("[[upgrade]]\nversion = {}\nactivation_height = 1\n", crate::upgrade::PREVIEW_PROTOCOL_VERSION);
+        assert!(toml::from_str::<Spec>(&format!("{}{upgrade}", toml_of(&spec_for("blockula-testnet-9", "tboo", &ops, "")))).is_err());
+        let built = build_from(&spec_for("blockula-testnet-9", "tboo", &ops, ""), &ops, false).unwrap();
+        assert!(built.genesis.upgrades.is_empty() && !built.json.contains("upgrades"));
     }
 
     /// A spec as TOML again (the tests build specs as values, then add sections as text).

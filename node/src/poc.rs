@@ -2320,7 +2320,7 @@ mod scenarios {
                 assert_eq!(st.apply(tx, "poc", proposer, at).unwrap(), Outcome::Applied);
             }
             let tx_bytes = txs.iter().map(Tx::size).sum();
-            st.end_block(&BlockInfo { height: at, hash, proposer, view: at, parent_view: at - 1, skipped: &[], tx_bytes });
+            st.end_block(&BlockInfo { height: at, version: crate::upgrade::version_at(&st, at), hash, proposer, view: at, parent_view: at - 1, skipped: &[], tx_bytes });
             st.check_invariants().unwrap();
             let id = st.poc.open_seance.expect("a Séance opens on the cadence");
             assert_eq!(st.poc.seances[&id].seed, hex::encode(crate::beacon::seance_seed(&st, epoch, id).unwrap()), "seeded from the beacon");
@@ -2396,7 +2396,7 @@ mod scenarios {
         assert!(crate::beacon::value(&t.c.state, epoch).is_some() && t.h() < at, "the seed is public before the opening");
         let draw = |mut st: State, from: u64| -> Seance {
             for h in from..=at {
-                st.end_block(&BlockInfo { height: h, hash: "x", proposer: "p", view: h, parent_view: h - 1, skipped: &[], tx_bytes: 0 });
+                st.end_block(&BlockInfo { height: h, version: crate::upgrade::version_at(&st, h), hash: "x", proposer: "p", view: h, parent_view: h - 1, skipped: &[], tx_bytes: 0 });
             }
             let id = st.poc.open_seance.expect("a Séance opens");
             st.poc.seances[&id].clone()
@@ -2461,7 +2461,7 @@ mod scenarios {
         assert!(crate::beacon::value(&t.c.state, epoch).is_some() && t.h() < at, "the seed is public before the opening");
         let draw = |mut st: State, from: u64| -> Option<Seance> {
             for h in from..=at {
-                st.end_block(&BlockInfo { height: h, hash: "x", proposer: "p", view: h, parent_view: h - 1, skipped: &[], tx_bytes: 0 });
+                st.end_block(&BlockInfo { height: h, version: crate::upgrade::version_at(&st, h), hash: "x", proposer: "p", view: h, parent_view: h - 1, skipped: &[], tx_bytes: 0 });
             }
             st.poc.open_seance.map(|id| st.poc.seances[&id].clone())
         };
