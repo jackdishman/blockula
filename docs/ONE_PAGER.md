@@ -27,18 +27,18 @@
   - `blockula dev` gives you a local chain in one command.
   - `blockula summon mychain --validators 4` creates your own network.
   - `blockula join` syncs a full node, with the explorer browsable while it syncs.
-  - `blockula validator register` lets you apply to validate.
+  - `blockula validator register` registers a validator with a self-bond.
 - **Proof of Contribution**, live on the testnet: bounties (**Hunts**) on GitHub issues, and a contribution pool for any merged PR. Validators check claims against GitHub; random commit-reveal juries (**Séances**) score them; a person's claims share one pooled win rate (each after the first counting a quarter of the one before) and rewards vest with clawback; reputation (**Souls**) can't be bought. Agents take part as **Familiars** of a human sponsor.
-- **Validators are added on-chain at epoch boundaries.** For Season 0 an admin allowlist approves them, and every approval is visible in the explorer.
+- **Validators are permissionless.** Anyone can register one with a self-bond, and at each epoch boundary the top validators by stake make the set (newcomers at most a third of it). The testnet has no admin key: nobody approves a validator, and every registration is visible in the explorer.
 - **Reviewed before launch.** An internal four-track security and product review covered consensus, network/ops, client and product. Its findings were fixed and turned into regression tests. A third-party audit comes before mainnet.
 
 ## Where it's going
 1. **Proof of Contribution, next steps:**
    - Hunts with acceptance tests that validators re-run, so agents can be paid without anyone's sign-off.
-   - Jury-run sybil flags and revert checks, replacing the Season 0 admin levers.
+   - Jury-run sybil flags, replacing the governance vote that flags a sybil today.
    - Covens (teams) and Seasons, plus a juror UI in the web wallet.
 2. **👻 Ghost Mode and 🪦 The Crypt (Phase 2):** private transfers and encrypted storage, built on hash-based STARKs and ML-KEM, so the privacy layer is quantum-safe too. Viewing keys allow selective disclosure.
-3. **Open validator set (Phase 3):** staking, slashing and governance (√stake + Soul voting weight, conviction voting, private ballots), then audits and mainnet.
+3. **Mainnet (Phase 3):** staking, slashing and governance (conviction voting, with the validators as a bootstrap council for the first year) are built and run on the testnet. Next: a consensus-format freeze, external audits, a testnet run by independent operators, the genesis ceremony, then mainnet.
 
 **Token:** FANG (1 FANG = 10⁹ drops). Issuance tapers to a 1.5% tail emission, split 70% stakers / 20% contribution pool / 10% treasury. Base fees are burned.
 

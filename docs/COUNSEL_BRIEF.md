@@ -32,7 +32,7 @@ Companion documents: [TOKENOMICS.md](TOKENOMICS.md) (supply, allocation, issuanc
 - merges every PR, and so gates which PRs can earn testnet Hunts and pool rewards;
 - controls the GitHub repo and its releases, the npm packages, and the wallet domain (`blockula.app`, registered in his own name; the testnet wallet is `testnet.blockula.app`, mainnet's will be `wallet.blockula.app`);
 - runs all four testnet validators, the public RPC and the explorer in one Fly.io organization, and generated every testnet key on one laptop;
-- holds the testnet's single admin key ("Season 0"). It approves validators, grants Soul, sets repo weights, flags sybils, rejects claims and claws back rewards.
+- holds no admin key on the current testnet, `blockula-testnet-2` (launched 2026-10-18): its genesis lists none, and validators join on stake with nobody's approval. The levers the earlier testnet's single admin key ("Season 0") pulled, granting Soul, setting repo weights, flagging sybils, rejecting claims and clawing back rewards, are governance proposals there, and the testnet's validators are its bootstrap council. While the founder's four validators are at least ⅔ of the active set, those proposals pass on the founder's votes alone unless token-weighted nays outweigh the ayes.
 
 **Funding.** The project is self-funded. To our knowledge there are no investors, no token sale or SAFT, no side letters and no promises of tokens to anyone. The founder must confirm this to counsel directly.
 

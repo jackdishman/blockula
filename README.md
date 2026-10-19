@@ -198,8 +198,11 @@ Validators are permissionless: anyone can register one with a self-bond, anyone 
 
 ```bash
 # 1. Create a validator home: fetches genesis, generates the ML-DSA-65 key, records your public addresses
+#    (--public-http-addr: the URL clients reach you through, a sentry or RPC node, or 127.0.0.1:7070
+#    without one. Only p2p faces the internet: firewall the validator's HTTP port, docs/OPERATIONS.md
+#    "Ports and firewall")
 blockula validator init --home ~/val --genesis https://<any node> --genesis-hash <the chain's genesis hash> \
-  --public-p2p-addr <your-ip>:30300 --public-http-addr <your-ip>:7070
+  --public-p2p-addr <your-ip>:30300 --public-http-addr https://<your sentry>
 # 2. Fund the printed address with the minimum self-bond plus fees (testnets: the faucet, POST /api/faucet)
 # 3. Start the node: it syncs now and votes once it's in the active set
 blockula run --home ~/val --bind 0.0.0.0
