@@ -175,7 +175,7 @@ Operations:
 - `--peer-http <url>` (repeatable) replaces the genesis list of HTTP peers used for sync and forwarding.
 - `join --genesis-hash <hex>` pins the chain. `summon` prints the hash.
 - A validator refuses to start if its home has history but no consensus journal, or if `machine.lock` names another instance (`BLOCKULA_INSTANCE_ID`, or `FLY_MACHINE_ID` on Fly). Pass `--i-know-this-key-is-not-running-elsewhere` to override.
-- `--p2p-preset public-nat` uses recommended limits but accepts private inbound addresses (for NATed hosts such as Fly).
+- `--p2p-preset public-nat` is for NATed or proxied hosts such as Fly, where every peer arrives from one private address: recommended limits, except that it accepts private inbound addresses, reconnects to a peer after 2 s instead of 60 s and accepts 16 inbound handshakes a second per address instead of one per 5 s (docs/OPERATIONS.md "Restarts").
 
 Nodes restart where they left off. A validator that was down catches up over HTTP first, then via consensus backfill.
 `scripts/local-testnet.sh` runs 4 validators, a full node, a CLI-onboarded 5th validator, the SDK e2e and the CLI wallet against them.

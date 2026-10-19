@@ -14,7 +14,7 @@ use commonware_consensus::simplex::types::Finalization;
 use commonware_cryptography::{Digestible, blake3::Digest, certificate::Verifier as _};
 use commonware_p2p::authenticated::discovery;
 use commonware_runtime::{Runner as _, Supervisor as _, tokio as cw_tokio};
-use commonware_utils::NZUsize;
+use commonware_utils::{NZU32, NZUsize};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -742,6 +742,38 @@ pub fn dev_is_stale(home: &Path) -> bool {
     nonempty && std::fs::read_to_string(home.join("consensus.version")).map(|v| v.trim() != consensus::STORAGE_VERSION).unwrap_or(true)
 }
 
+/// The p2p configuration for a `--p2p-preset`: Commonware's `local` or `recommended` limits, or
+/// for `public-nat` (validators behind a NAT or a TCP proxy, such as Fly's) `recommended` with
+/// shorter reconnection limits.
+fn p2p_config(preset: &str, key: PrivateKey, namespace: &[u8], listen: SocketAddr, dialable: commonware_p2p::Ingress, bootstrappers: Vec<discovery::Bootstrapper<crate::pq::PublicKey>>) -> discovery::Config<PrivateKey> {
+    let max_peers = NonZeroUsize::new(consensus::MAX_PEERS_PER_SET).unwrap();
+    let mut cfg = if preset == "local" {
+        discovery::Config::local(key, namespace, listen, dialable, bootstrappers, max_peers, MAX_MESSAGE_SIZE)
+    } else {
+        discovery::Config::recommended(key, namespace, listen, dialable, bootstrappers, max_peers, MAX_MESSAGE_SIZE)
+    };
+    if preset == "public-nat" {
+        // Inbound connections arrive from the NAT's or proxy's address, often a private one, and
+        // the same one for every peer.
+        cfg.allow_private_ips = true;
+        // So recommended's one inbound handshake per 5 s per address is one for the whole set,
+        // and with its 60 s cooldown (any reservation of a peer, failed dials too, holds off the
+        // next dial to it for 60–120 s and refuses its inbound for 60 s) a restarted validator
+        // got its links back after a median 106 s, up to minutes: that stalled
+        // blockula-testnet-2's launch and jailed a validator (2026-10-18). With these it re-linked
+        // in 4–23 s locally. Neither lets a stranger in: only keys in a tracked peer set (and
+        // bootstrappers) get past the handshake to reserve, and the per-subnet rate and the
+        // concurrent-handshake cap stay. Both limits are this node's own, so it still works with
+        // `recommended` peers, which keep Commonware's: each comes from its own address there,
+        // and a shorter cooldown for every public validator is a change to measure on its own.
+        cfg.peer_connection_cooldown = Duration::from_secs(2);
+        cfg.allowed_handshake_rate_per_ip = commonware_runtime::Quota::per_second(NZU32!(16));
+    }
+    cfg.mailbox_size = NZUsize!(4096);
+    cfg.tracked_peer_sets = NonZeroUsize::new(consensus::TRACKED_PEER_SETS).unwrap();
+    cfg
+}
+
 pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
     let mut chain = Chain::open(&home)?;
     // Validators take their genesis from the signed release; a known chain's must match it. The
@@ -862,18 +894,7 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
     let validator_home = home.clone();
     let stopped = cw_tokio::Runner::new(cfg).start(|context| async move {
         let ns = consensus::p2p_namespace(&chain_id);
-        let max_peers = NonZeroUsize::new(consensus::MAX_PEERS_PER_SET).unwrap();
-        let mut p2p_cfg = if preset == "local" {
-            discovery::Config::local(key.clone(), &ns, listen, dialable, bootstrappers, max_peers, MAX_MESSAGE_SIZE)
-        } else {
-            discovery::Config::recommended(key.clone(), &ns, listen, dialable, bootstrappers, max_peers, MAX_MESSAGE_SIZE)
-        };
-        if preset == "public-nat" {
-            // Recommended limits, but inbound connections arrive from a NAT/proxy's private address.
-            p2p_cfg.allow_private_ips = true;
-        }
-        p2p_cfg.mailbox_size = NZUsize!(4096);
-        p2p_cfg.tracked_peer_sets = NonZeroUsize::new(consensus::TRACKED_PEER_SETS).unwrap();
+        let p2p_cfg = p2p_config(&preset, key.clone(), &ns, listen, dialable, bootstrappers);
         let (mut network, oracle) = discovery::Network::new(context.child("network"), p2p_cfg);
         let channels: Vec<_> = CHANNELS.iter().map(|c| network.register(*c, consensus::quota(*c))).collect();
         network.start();
@@ -1553,6 +1574,39 @@ mod tests {
         assert_eq!(prune_epoch_journals(&dir, "blockula", 10).unwrap(), 0);
         assert_eq!(prune_epoch_journals(&dir.join("missing"), "blockula", 10).unwrap(), 0);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The blockula-testnet-2 launch stall: behind Fly's proxy every peer shares one address, and
+    /// recommended's reconnection limits kept restarted validators unlinked for minutes.
+    /// `public-nat` re-links in seconds; the other presets stay Commonware's.
+    #[test]
+    fn public_nat_reconnects_in_seconds_and_other_presets_stay_commonwares() {
+        let key = PrivateKey::from_seed_bytes([7; 32]);
+        let listen: SocketAddr = "127.0.0.1:30300".parse().unwrap();
+        let ours = |preset: &str| p2p_config(preset, key.clone(), b"ns", listen, listen.into(), vec![]);
+        let max_peers = NonZeroUsize::new(consensus::MAX_PEERS_PER_SET).unwrap();
+        let recommended = discovery::Config::recommended(key.clone(), b"ns", listen, listen, vec![], max_peers, MAX_MESSAGE_SIZE);
+        let local = discovery::Config::local(key.clone(), b"ns", listen, listen, vec![], max_peers, MAX_MESSAGE_SIZE);
+
+        let nat = ours("public-nat");
+        assert!(nat.allow_private_ips);
+        assert!(nat.peer_connection_cooldown <= Duration::from_secs(5), "{:?}", nat.peer_connection_cooldown);
+        let rate = nat.allowed_handshake_rate_per_ip;
+        assert!(rate.burst_size().get() >= 16 && rate.replenish_interval() <= Duration::from_secs(1) / 16, "{rate:?}");
+        // The rest is recommended's, the gossip timing peers rate-limit each other on included.
+        assert_eq!(nat.allowed_handshake_rate_per_subnet, recommended.allowed_handshake_rate_per_subnet);
+        assert_eq!(nat.gossip_bit_vec_frequency, recommended.gossip_bit_vec_frequency);
+        assert_eq!(nat.dial_frequency, recommended.dial_frequency);
+
+        for (preset, theirs) in [("recommended", &recommended), ("local", &local)] {
+            let cfg = ours(preset);
+            assert_eq!(cfg.peer_connection_cooldown, theirs.peer_connection_cooldown, "{preset}");
+            assert_eq!(cfg.allowed_handshake_rate_per_ip, theirs.allowed_handshake_rate_per_ip, "{preset}");
+            assert_eq!(cfg.allowed_handshake_rate_per_subnet, theirs.allowed_handshake_rate_per_subnet, "{preset}");
+            assert_eq!(cfg.allow_private_ips, theirs.allow_private_ips, "{preset}");
+            assert_eq!(cfg.dial_frequency, theirs.dial_frequency, "{preset}");
+            assert_eq!(cfg.gossip_bit_vec_frequency, theirs.gossip_bit_vec_frequency, "{preset}");
+        }
     }
 
     #[test]

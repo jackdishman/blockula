@@ -179,6 +179,43 @@ tests:
               summary: "v1: 1 p2p peers, fewer than a quorum needs"
               runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#peers
 
+  # 4 validators: each should be linked to the other 3. v1 loses a link for 4 minutes and warns
+  # after 2; v3 re-links within 2 minutes of a restart and doesn't; v2 isn't in the active set.
+  - interval: 1m
+    input_series:
+      - series: 'blockula_active_validators{job="blockula",instance="a",node="v1"}'
+        values: "4x8"
+      - series: 'blockula_p2p_peers{job="blockula",instance="a",node="v1"}'
+        values: "3 3 2 2 2 2 3 3 3"
+      - series: 'blockula_slashing_protection_voting{job="blockula",instance="a",node="v1"}'
+        values: "1x8"
+      - series: 'blockula_active_validators{job="blockula",instance="b",node="v2"}'
+        values: "4x8"
+      - series: 'blockula_p2p_peers{job="blockula",instance="b",node="v2"}'
+        values: "2x8"
+      - series: 'blockula_slashing_protection_voting{job="blockula",instance="b",node="v2"}'
+        values: "0x8"
+      - series: 'blockula_active_validators{job="blockula",instance="c",node="v3"}'
+        values: "4x8"
+      - series: 'blockula_p2p_peers{job="blockula",instance="c",node="v3"}'
+        values: "3 0 1 3 3 3 3 3 3"
+      - series: 'blockula_slashing_protection_voting{job="blockula",instance="c",node="v3"}'
+        values: "1x8"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: BlockulaMissingPeers
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: BlockulaMissingPeers
+        exp_alerts:
+          - exp_labels: { severity: warning, job: blockula, instance: a, node: v1 }
+            exp_annotations:
+              summary: "v1: 2 p2p peers, not linked to all 3 other validators"
+              runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#peers
+      - eval_time: 7m
+        alertname: BlockulaMissingPeers
+        exp_alerts: []
+
   # Slashing protection: the record moves forward, including into a new epoch (no alert); a
   # restored home takes it back (critical, kept for 30 minutes). A validator in the set that
   # signs nothing while blocks come, or keeps watching after a start, warns.

@@ -91,6 +91,7 @@ A recording rule adds `blockula:quorum` = n − ⌊(n−1)/3⌋. Host metrics co
 | `BlockulaHalted` | critical | The node stopped executing (`--halt-height`, or a protocol version its binary doesn't run) for 1 min |
 | `BlockulaUpgradeRequired` / `…Soon` | warning / critical | A protocol version this binary doesn't run is scheduled / activates within a day |
 | `BlockulaFewPeers` | warning | Fewer p2p peers than quorum − 1 for 5 min |
+| `BlockulaMissingPeers` | warning | In the active set and linked to fewer than all the other validators (p2p peers < n − 1) for 2 min |
 | `BlockulaSlashingProtectionRolledBack` | critical | The slashing-protection record went backwards (a restored or copied home) |
 | `BlockulaValidatorNotSigning` | warning | In the active set, the chain advancing, and no new vote for 10 min |
 | `BlockulaWatchingAfterStart` | warning | Still watching the network after a start, 3 min on |

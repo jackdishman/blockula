@@ -1241,7 +1241,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Connected p2p peers (validators). BlockulaFewPeers fires below quorum − 1: this node's votes may not reach enough of the set.",
+      "description": "Connected p2p peers (validators). BlockulaFewPeers fires below quorum − 1: this node's votes may not reach enough of the set. BlockulaMissingPeers fires below n − 1 for 2 min: not linked to every other validator.",
       "gridPos": {
         "h": 7,
         "w": 6,

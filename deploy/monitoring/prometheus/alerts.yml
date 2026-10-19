@@ -145,6 +145,18 @@ groups:
         annotations:
           summary: "{{ $labels.node }}: {{ $value }} p2p peers, fewer than a quorum needs"
           runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#peers
+      # In the active set but not linked to every other validator. Votes and blocks travel only
+      # over direct links, so on a small set a missing link costs blocks: leaders without a
+      # quorum's links time out (the blockula-testnet-2 launch stall). A restarted validator
+      # re-links within seconds on `public-nat` and `local`, up to minutes on `recommended`.
+      # Candidates and sentries linked to this node count as peers too.
+      - alert: BlockulaMissingPeers
+        expr: blockula_p2p_peers < blockula_active_validators - 1 and blockula_slashing_protection_voting == 1
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }}: {{ $value }} p2p peers, not linked to all {{ with printf `blockula_active_validators{node=\"%s\"} - 1` $labels.node | query }}{{ . | first | value }}{{ end }} other validators"
+          runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#peers
 
       # Slashing protection (node/src/protection.rs). The record only moves forward: going back
       # means the home was restored from a backup or copied. Stop the validator and investigate.
