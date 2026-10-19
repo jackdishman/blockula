@@ -64,13 +64,36 @@ original assessment's engineering estimates are historical estimates, not a revi
 
 ## Third-party programs
 
-Third-party, Turing-complete **programs** are a proposed protocol-v2 feature, not a capability of
-v0.5.0. The design recommends a fuel-metered WebAssembly interpreter, initially with Rust as the
-supported authoring language. The engine/version, permissions, storage pricing and activation
-policy still need maintainer decisions and implementation validation.
+Third-party, Turing-complete **programs** are a protocol-v2 feature. They're designed but not
+built: nobody can deploy one on v0.5.x. [PROGRAMS.md](PROGRAMS.md) is the design and
+[PROGRAMS-PLAN.md](PROGRAMS-PLAN.md) the implementation plan. Programs are WebAssembly, run by a
+fuel-metered interpreter and written in Rust. The engine defaults to soroban-wasmi 29.x, and
+phase 0 measures it beside wasmi 2.0 before the exact pin is chosen. The maintainer's decisions
+of 2026-10-19 (PROGRAMS-PLAN.md section 3) set how they ship:
 
-Ship through a scheduled protocol upgrade with a separate VM/host-interface audit and at least
-eight weeks of public testnet exercise before activation. Until implemented and reviewed, do not
-advertise deployable third-party programs or make their delivery a mainnet date commitment. If
-they are required at mainnet genesis, add their implementation, audit and test gates to the
-critical path before choosing the launch date.
+- **On main, behind version gates.** Below protocol v2 a new binary behaves exactly as v1, and
+  until the release that ships programs it supports v2 only on dev chains. testnet-2 gets them
+  as a scheduled upgrade to v2, then `ActivateFeature { programs }`.
+- **Live on mainnet as soon as they're ready (D2).** Ready means three gates: the consensus
+  formats are frozen, the audit has closed with no open critical or high finding, and testnet-2
+  has run programs for at least eight weeks. If those close before mainnet's genesis, programs
+  are on from block 1. Otherwise mainnet launches with them off, and the council proposes their
+  activation the day the last gate closes; it takes effect about nine days later. (The bootstrap
+  council can pass it in mainnet's first year; after that, activation takes the ⅔ token vote.)
+  Programs aren't a mainnet gate: the launch date doesn't wait for them.
+- **Reviewed by AI agents, not externally audited (D3).** Blockula is an experiment. Claude
+  audits programs with Fable agents: a review of every consensus PR, multi-agent audits at three
+  milestones and a full audit after the format freeze. A finding counts only once a second agent
+  reproduces it with a failing test, and the reports are published. No external firm reviews the
+  VM, the engine or their integration. Of programs, the external protocol audit above sees only
+  the transaction codec for tags 62–70, which the mainnet binary carries even while programs are
+  off. Describe programs as "reviewed by AI agents, not externally audited" wherever they're
+  offered, as Ghost Mode is marked "NOT AUDITED".
+- **The training wheels stay,** and matter more without an external audit: a 10M FANG cap on
+  what programs hold, a validators' pause that lapses after three days, exit-only when governance
+  switches programs off, and a tokens-only freeze. The bug bounty is to cover the VM from
+  testnet-2's activation, and Hunts are to pay for breaking programs there.
+
+Until programs are live, don't advertise deployable third-party programs or promise them by a
+date. The plan's calendar (formats frozen about May 2027, ready for mainnet about mid-August
+2027) is an estimate, not a commitment.

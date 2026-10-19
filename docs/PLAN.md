@@ -7,7 +7,7 @@
 | Name / token | Blockula / FANG (1 FANG = 10⁹ drops) |
 | Names | `.boo`, native to the protocol |
 | Node | Rust; multi-validator consensus on **Commonware** primitives (Phase 1) |
-| Execution | **Native modules only** in v1 (accounts, transfers, names, shielded pool, storage, staking). WASM/RISC-V contracts in v2. No EVM (it's bound to ECDSA). |
+| Execution | **Native modules only** in v1 (accounts, transfers, names, shielded pool, storage, staking). Third-party programs in protocol v2: WebAssembly, written in Rust ([PROGRAMS.md](PROGRAMS.md)). No EVM (it's bound to ECDSA). |
 | L1 vs L2 | Standalone L1, because settling on Ethereum would bring back its ECDSA/BLS weakness |
 
 ## Why this is quantum-safe
@@ -168,7 +168,7 @@ Next:
 | 1.5 | GitHub linking ✅ (on-chain claim + node-side gist check), Hunts v0 ✅ (escrow, crowdfunding, award/cancel/refund on-chain, `blockula hunt award` checks the merge), Familiars ✅ (registered agent session keys credited on awards and allowed to claim), validator-attested GitHub facts ✅, MCP contribution tools ✅. Remaining: acceptance-test Hunts | mostly done |
 | 2 | Proof of Contribution v1 ✅: Souls, vouching, claims, Séances (commit-reveal pairwise juries), contribution pool with per-sponsor ranked payouts, vesting and clawback. Validator revert checks ✅, a commit-reveal beacon for jury draws ✅, Ghost Mode ✅ (built, off until governance activates it). Remaining: a juror UI in the web wallet, Covens and Seasons, jury-run sybil flags, viewing keys, The Crypt, proof aggregation | in progress |
 | 3 | Built and integrated: permissionless staking with delegation, slashing and jailing ✅, issuance, the base-fee market and vesting ✅, governance (conviction voting, bootstrap council, treasury, distributions, multisig) ✅, height-gated upgrades and slashing protection ✅, sync trust tables ✅. Remaining: repo budgets and fork royalties, the audits, the incentivized testnet, the genesis ceremony, mainnet. The full gap analysis, blockers and sequence are in [MAINNET.md](MAINNET.md) | code side done |
-| 4 | WASM/RISC-V contracts, light clients, STARK signature aggregation | |
+| 4 | Third-party programs (protocol v2: [PROGRAMS.md](PROGRAMS.md), planned in [PROGRAMS-PLAN.md](PROGRAMS-PLAN.md)), light clients, STARK signature aggregation | |
 
 ## Known limits
 

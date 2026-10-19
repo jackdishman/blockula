@@ -1,9 +1,10 @@
 /**
- * The chain's built-in modules, described the way contracts will be: what state they expose,
- * which transactions call them, and the actions anyone can take, with typed parameters. One
- * generic form (components/explorer/ActionForm.tsx) renders any action, previews the exact
- * transaction, and signs it. A contract's ABI maps onto `ActionSpec` unchanged: typed params in,
- * an `Action` out. See docs/EXPLORER.md.
+ * The chain's built-in modules, described the way deployed programs will be (protocol v2,
+ * docs/PROGRAMS.md): what state they expose, which transactions call them, and the actions anyone
+ * can take, with typed parameters. One generic form (components/explorer/ActionForm.tsx) renders
+ * any action, previews the exact transaction, and signs it. A deployed program's interface maps
+ * onto `ActionSpec` too: typed params in, an `Action` out (docs/PROGRAMS.md section 11.3). See
+ * docs/EXPLORER.md.
  */
 import type { Action } from "@blockula/sdk";
 import { BLOCKS_PER_DAY } from "../config";

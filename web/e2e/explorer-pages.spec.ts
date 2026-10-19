@@ -180,7 +180,12 @@ test.describe("every explorer page", () => {
 
   test("programs, hunts, claims and Séances", async ({ page }) => {
     await visit(page, "/programs", (p) => p.getByRole("heading", { name: "What the chain can do" }), errors);
+    // Programs, never contracts (docs/PROGRAMS.md section 1), checked once every figure has loaded.
+    await expect(page.getByRole("heading", { name: "Your program here" })).toBeVisible();
+    await expect(page.locator(".program-card .figure").filter({ hasText: /…|—/ })).toHaveCount(0);
+    await expect(page.locator("main")).not.toContainText(/contract/i);
     await visit(page, "/programs/accounts", (p) => p.getByRole("heading", { name: "Accounts & keys", level: 1 }), errors);
+    await expect(page.getByText("the shape deployed programs will use")).toBeVisible();
     await visit(page, "/programs/names", (p) => p.getByRole("heading", { name: "Names", exact: true, level: 1 }), errors);
     const lookup = page.locator("section", { has: page.getByRole("heading", { name: "Look up a name" }) }).getByPlaceholder("ghoul");
     for (const [q, says] of [["tomb", "expired at block"], ["crypt", "reserved at genesis"], ["castle", "offered to"]]) {

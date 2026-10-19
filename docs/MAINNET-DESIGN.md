@@ -74,6 +74,15 @@ Action tags 0–29 keep their meaning, with two field additions before mainnet: 
 | 50–59 | reserved for Ghost Mode | P-GHOST |
 | 60 | `ValidatorReady { epoch }`: a candidate's consensus key, in `epoch`'s last tenth, once a set of one or two admitted it; writes only its readiness record (3.4, audit review-fix-staking-2) | P-STAKE |
 | 61 | `AdmitValidator { validator, epoch }`: a member of a set of one or two (its consensus key) admits a candidate at the end of `epoch`, once an epoch, by its operator's decision (3.4) | P-STAKE |
+| 62 | `UploadCode { wasm, interface }`: stores validated WebAssembly code and its interface under their hashes. Tags 62–70 are protocol v2: below it they're unadmittable, at top level and nested | Programs (7) |
+| 63 | `CreateProgram { wasm_hash, interface_hash, authority, upgrade_delay_blocks, policy, accepts_transfers, init, fuel_limit, storage_limit, bindings }` | Programs (7) |
+| 64 | `CallProgram { calls, fuel_limit, storage_limit, bindings }`: 1–8 calls, run atomically; each binds the version digest the signer previewed | Programs (7) |
+| 65 | `UpgradeProgram { program, wasm_hash, interface_hash }`: schedules new code after the program's delay (both hashes empty: cancel) | Programs (7) |
+| 66 | `ProgramAdmin { program, change }`: offer or accept the authority, renounce it, raise the delay, tighten the policy, set `accepts_transfers` | Programs (7) |
+| 67 | `CloseProgram { program, beneficiary }` | Programs (7) |
+| 68 | `RemoveCode { kind, hash }` | Programs (7) |
+| 69 | `ProgramsPause {}`: signed by an active validator's consensus key or owner; once f+1 have signed, programs pause for at most 3 days | Programs (7) |
+| 70 | `AddScopedKey { key_id, label, limit, period_blocks, expires_at, public_key, pop, grants }`: a session key with program grants | Programs (7) |
 
 ### 3.2 Blocks (CBlock v2)
 
@@ -90,6 +99,7 @@ CBlock { version: u32, parent, height, view: u64, parent_view: u64, timestamp_ms
 - Store: a Jellyfish-style sparse Merkle tree (BLAKE3; the `jmt` crate or our own) on `redb`, behind a synchronous `StateStore` trait. Commonware's `qmdb` was rejected for now: ALPHA, async-only, and its root commits to operation history rather than the key-value set (`.context/research/commonware.md` §4).
 - Every state map is an `imbl::OrdMap` (structural sharing): cloning `State` is O(1), so the API reads a per-block snapshot without the consensus lock and snapshots don't copy the world.
 - Every record has a canonical binary encoding and a key `(namespace, bytes)`. The state root is the root of an authenticated tree over `BLAKE3(namespace ‖ key) → BLAKE3(value)`, updated incrementally from the keys a block touched. Inclusion and exclusion proofs are served at `/api/proof/...`.
+- Namespaces are `state::ns` (`node/src/state/mod.rs`), never renumbered or reused. Ghost Mode holds 48–63 and staking 64–65. Programs reserve **66–73** (protocol v2, section 7), and 74–79 are held back for them.
 - Records, tree nodes and the commit point (height, root, block hash, schema version) are written per block in one transaction to an embedded database, after `blocks.jsonl` and `cblocks.bin` are synced and before consensus is acknowledged. Restart loads the database and re-executes at most the blocks after its commit point: restart time no longer depends on history length.
 - The tx index and per-account history live in the database, not in memory.
 - Snapshots stream canonical records; a joiner rebuilds the tree and checks the certified root.
@@ -192,3 +202,12 @@ Recommendation (b) from `.context/research/ghost-mode.md`: build it, ship it **d
 - Size limits per tag: ghost txs up to 256 KiB, at most 1 MiB of ghost txs per block.
 - Notes: ML-KEM-768 (`ml-kem =0.3.2`) + XChaCha20-Poly1305; incoming, full and outgoing viewing keys. Session keys can't spend shielded funds. Every hash use is versioned so a later pool can migrate.
 - Full design: `docs/GHOST-MODE.md`.
+
+## 7. Programs (protocol v2)
+
+Third-party programs are protocol v2. [PROGRAMS.md](PROGRAMS.md) specifies them and [PROGRAMS-PLAN.md](PROGRAMS-PLAN.md) plans the work; on programs, PROGRAMS.md wins over this file. In short:
+- WebAssembly run by a fuel-metered interpreter in its own crate (`node/vm`; soroban-wasmi 29.x by default, the exact pin chosen in phase 0), written in Rust, and added as one more protocol module (`programs`, shaped like `ghost`).
+- Tags 62–70 (3.1) and namespaces 66–73 (3.3), with 74–79 held back. The state schema moves from 9 to 10 at activation. Compute is a second base-fee dimension (fuel) charged on the declared limit, and storage takes refundable deposits.
+- Every program behavior is a function of the protocol version in force (3.9), so a v2 binary computes v1's state exactly below the activation height (PROGRAMS.md 14.4). Nothing in execution reads the version yet, so plumbing it in comes first (PROGRAMS-PLAN.md P7).
+- Behind the `programs` feature: `ActivateFeature { programs }` takes the ⅔ supermajority, which the council may give in year 1 (3.5). The training wheels: a 10M FANG cap on what programs hold, an f+1 validator pause that lapses after 3 days, exit-only while the feature is off, and a tokens-only freeze that lapses after 30 days.
+- Live on mainnet as soon as they're ready: formats frozen, the audit closed and at least 8 weeks on testnet-2. On at genesis if that comes first, otherwise the council activates them. They're reviewed by AI agents (Claude with Fable), not externally audited.

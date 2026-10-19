@@ -30,7 +30,7 @@ export default function ProgramsPage() {
         </span>
         <h1>What the chain can do</h1>
         <span className="sub">
-          Blockula&apos;s built-in modules, each laid out the way smart contracts will be: the state it keeps, the calls it accepts, and actions you can sign right here with a preview of exactly what you&apos;re signing.
+          Blockula&apos;s built-in modules, each laid out the way third-party programs will be: the state it keeps, the calls it accepts, and actions you can sign right here with a preview of exactly what you&apos;re signing.
         </span>
       </div>
       <div className="programs">
@@ -53,9 +53,9 @@ export default function ProgramsPage() {
         ))}
         <div className="card program-card coming">
           <span className="tag">coming</span>
-          <h2>Your contract here</h2>
+          <h2>Your program here</h2>
           <span className="dim">
-            When contracts arrive, each one gets a page like these: its state, its calls, and a form generated from its interface, with the same preview, signature and receipt.
+            When anyone can deploy a program (planned for protocol v2), each one gets a page like these: its state, its calls, and a form generated from its interface, with the same preview, signature and receipt.
           </span>
         </div>
       </div>

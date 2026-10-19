@@ -15,9 +15,10 @@ stays as a dependency-free fallback for operators and for links the MCP and CLI 
 - **Act in place.** An account page can pay that account, a name page can register the name,
   and a hunt can be funded from the hunt. Nothing needs a "connect wallet" step, because the
   wallet is already there.
-- **Contracts later.** Using a contract means reading its state, building a call, previewing it
-  and signing it. That only works well where the signer already lives. The Programs pages
-  build that loop today for the chain's built-in modules (see below).
+- **Programs anyone deploys, later.** Using a deployed program (protocol v2,
+  [PROGRAMS.md](PROGRAMS.md)) means reading its state, building a call, previewing it and
+  signing it. That only works well where the signer already lives. The Programs pages build
+  that loop today for the chain's built-in modules (see below).
 
 ## Principles
 
@@ -75,9 +76,10 @@ Borrowed from the explorers worth borrowing from, without copying any of them:
 | `/programs/{names\|hunts\|pool\|validators\|accounts}` | One program |
 | `/hunt/{id}`, `/claim/{id}`, `/seance/{id}` | Program records |
 
-## Programs: the contract surface, today
+## Programs: native today, deployed in v2
 
-Blockula has no user contracts yet, but it has five native programs: Names, Hunts, the
+Nobody can deploy a program on Blockula yet (third-party programs are protocol v2:
+[PROGRAMS.md](PROGRAMS.md)), but it has five native programs: Names, Hunts, the
 Contribution pool, Validators, and Accounts & keys. Each program is described by an interface
 (`web/lib/explorer/programs.ts`) that lists:
 
@@ -125,8 +127,10 @@ the node and `preflightInput` (pure) turns the reads into the preflight's input,
 sender, and refuse what it refused, and a receipt's exact balance changes must be what the
 balances did.
 
-When contracts arrive, a contract's ABI maps onto the same interface (parameter types in, a
-`call` action out), so contract pages reuse the form, the preview and the receipt unchanged.
+When deployed programs arrive, a program's interface maps onto the same `ActionSpec` (parameter
+types in, a `call_program` action out), so their pages reuse the form, the preview and the
+receipt. They add wider parameter types and a `prepare` step that sizes the call by simulation
+and re-simulates the exact bytes it signs ([PROGRAMS.md](PROGRAMS.md) section 11.3).
 
 ## Watching and notices
 

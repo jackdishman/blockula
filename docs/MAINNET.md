@@ -735,7 +735,7 @@ The counsel brief for LEG-1 to LEG-3 is [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md).
 - STARK signature aggregation (PLAN.md "Roadmap", Phase 4).
 - Light-client mode, once CV-1 provides proofs.
 - Background history backfill behind fast-synced nodes, and STARK history proofs (PLAN.md "Network and sync", "Next").
-- Third-party programs (the protocol-v2 design is a proposal; see [LAUNCH-PLAN.md](LAUNCH-PLAN.md#third-party-programs)).
+- Third-party programs (protocol v2: designed in [PROGRAMS.md](PROGRAMS.md) and planned in [PROGRAMS-PLAN.md](PROGRAMS-PLAN.md); live on mainnet once they're ready, at genesis or later by council activation, see [LAUNCH-PLAN.md](LAUNCH-PLAN.md#third-party-programs)).
 - The Crypt. Ghost Mode is built and ships disabled (DEC-2): turning it on after launch takes its audit, testnet time and counsel (GHOST-MODE.md section 9), not code.
 - Ghost Mode's clients: the CLI, a WASM prover for the SDK and wallets, MCP tools and the explorer view (GHOST-MODE.md section 8, "Not built yet").
 - Covens, Seasons, the juror UI, acceptance-test Hunts, fork royalties, conviction-voting refinements and private ballots. This assumes the pool is off or governed at genesis.

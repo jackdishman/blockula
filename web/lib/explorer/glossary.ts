@@ -26,7 +26,7 @@ export const GLOSSARY = {
   owner_key: "A key with full control of the account: each passkey device, plus any recovery keys. It can add and revoke other keys.",
   session_key: "A spend-limited key, usually an agent's. It can only send transfers, at most its limit per period (amounts, fees, and the fee for opening any account it pays first), until it expires. The chain enforces this, not the agent.",
   mempool: "Transactions a node has accepted but no block has sealed yet. On Blockula they usually wait about a second.",
-  program: "One of the chain's built-in modules: its state, the transactions that call it, and the actions you can take. Smart contracts will appear the same way.",
+  program: "One of the chain's built-in modules: its state, the transactions that call it, and the actions you can take. Programs anyone can deploy (planned for protocol v2) will appear the same way.",
   escrow: "FANG a program holds on everyone's behalf (a hunt's bounty, a bond) until its rules release it.",
   stake: "FANG delegated to a validator's pool. The pool's stake decides whether it's in the active set; stakers share its rewards and its slashes.",
   unbonding: "Stake on its way out of a pool: it stops earning at once and can be withdrawn when the unbonding period (21 days on mainnet) is over.",

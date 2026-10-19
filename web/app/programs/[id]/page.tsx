@@ -69,7 +69,7 @@ function Program() {
             </Section>
           )}
         </div>
-        <Section title="Interface" aside={<span className="dim small">like a contract&apos;s</span>}>
+        <Section title="Interface" aside={<span className="dim small">the shape deployed programs will use</span>}>
           <span className="tag">reads</span>
           <ul className="iface mb-14">
             {p.reads.map((r) => (
