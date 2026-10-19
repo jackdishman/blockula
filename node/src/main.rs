@@ -26,6 +26,7 @@ mod pq;
 mod poc;
 mod protection;
 mod release_cli;
+mod status_cli;
 mod types;
 mod upgrade;
 mod validator_cli;
@@ -218,6 +219,14 @@ enum Cmd {
         #[arg(long, conflicts_with = "genesis")]
         genesis_hash: Option<String>,
     },
+    /// Print a node's own state as one line of JSON: its /api/status and what its /metrics say
+    /// about it (its validator, process start, p2p peers, whether it signs). For scripts on the
+    /// node's machine, which has no curl (deploy/restart-gate.sh)
+    Status {
+        /// The node's HTTP URL
+        #[arg(long, default_value = "http://localhost:7070")]
+        rpc: String,
+    },
     /// A simple command-line wallet (key in ~/.blockula/wallet.json, mode 600)
     Wallet {
         #[command(subcommand)]
@@ -386,6 +395,10 @@ fn main() -> Result<()> {
                 println!("{}", cp.to_flag());
             }
             eprintln!("`{}` #{} as {} node{} report it: check it against other sources before you trust it", g.chain_id, cp.height, peers.len(), if peers.len() == 1 { "" } else { "s" });
+            Ok(())
+        }
+        Cmd::Status { rpc } => {
+            println!("{}", validator_cli::rt()?.block_on(status_cli::read(&rpc))?);
             Ok(())
         }
         Cmd::Validator { cmd } => validator_cli::run(cmd),

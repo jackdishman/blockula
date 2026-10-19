@@ -187,7 +187,7 @@ jobs:
       # The public testnet's entrypoint (key seeding, checkpoint join, flags) under dash as in the
       # image, the Fly machine configurations, and launch.sh / set-github-token.sh against a
       # stand-in fly (retries, RESET, key removal, rolling restarts), offline.
-      - name: Testnet deploy scripts (deploy/entrypoint.sh, fly-config.sh, launch.sh, set-github-token.sh)
+      - name: Testnet deploy scripts (deploy/entrypoint.sh, fly-config.sh, launch.sh, set-github-token.sh, restart-gate.sh)
         run: ENTRY_SH=dash bash deploy/test-deploy.sh
       # The public testnet's external watch (testnet-watch.yml): its checks and its alert issue,
       # against a mock node and a stand-in gh, offline.

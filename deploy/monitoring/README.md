@@ -63,7 +63,8 @@ From `node/src/api.rs` (`GET /metrics`):
 | `blockula_supported_protocol_version` | gauge | Newest protocol version this binary runs (its blocks signal it) |
 | `blockula_upgrade_next_version`, `blockula_upgrade_next_height` | gauge | The next scheduled upgrade (0 if none) |
 | `blockula_halted`, `blockula_halt_info{kind}` | gauge | 1 while the node has stopped executing (`halt_height`, `upgrade_required`); `/api/health` gives the reason |
-| `blockula_p2p_peers` | gauge | Validators: connected p2p peers |
+| `blockula_p2p_peers` | gauge | Validators: connected p2p peers (the active set, the last epoch's set, candidates, bootstrappers) |
+| `blockula_p2p_active_peers` | gauge | Validators: connected p2p peers in this epoch's active set (linked to all of it: active − 1) |
 | `blockula_slashing_protection_epoch`, `…_last_view` | gauge | Validators: the newest epoch and view the key signed in (the record next to `validator.key`) |
 | `blockula_slashing_protection_voting` | gauge | Validators: 1 if in the current active set |
 | `blockula_slashing_protection_abstaining` | gauge | Validators: 1 while watching the network after a start, before signing |

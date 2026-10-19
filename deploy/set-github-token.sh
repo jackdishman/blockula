@@ -9,15 +9,22 @@
 # token (github.com/settings/personal-access-tokens/new) with "Public repositories (read-only)"
 # and no permissions: it ends up on internet-facing machines.
 #
-# Apps restart one at a time, and the next waits until the restarted app itself has finalized
-# new blocks. If it cannot confirm that, stop there and leave the remaining apps untouched.
+# Apps restart one at a time, through the participation gate (deploy/restart-gate.sh): nothing
+# restarts until the network is at full participation, and the next app waits until the restarted
+# validator is back (a new process that signs, is linked to every other validator and has proposed
+# a block) and the chain is at full pace again. The public node goes last. When that can't be
+# confirmed (an app or the public node doesn't answer, or GATE_SECS go by), it stops there and
+# leaves the remaining apps untouched.
 set -euo pipefail
 
 PREFIX=${PREFIX:-blockula}
 RPC_APP=${RPC_APP:-$PREFIX-testnet}
 N=${N:-4}
 RPC_URL=https://$RPC_APP.fly.dev
-PROGRESS_SECS=${PROGRESS_SECS:-5}   # between the liveness checks (60 of them), for tests
+HTTP_PORT=7070   # validators' HTTP, on their machines
+RPC_PORT=7171    # the public node's
+# shellcheck source=deploy/restart-gate.sh
+source "$(dirname "$0")/restart-gate.sh"
 
 IFS= read -r TOKEN || true
 TOKEN=${TOKEN//[[:space:]]/}
@@ -34,21 +41,26 @@ if [ -n "$scopes" ]; then
   exit 1
 fi
 
-height() { curl -fsS -m 5 "$RPC_URL/api/status" 2>/dev/null | jq -r '.height // 0' || echo 0; }
-GENESIS_HASH=$(curl -fsS -m 5 "$RPC_URL/api/status" | jq -r '.genesis_hash')
+GENESIS_HASH=$(curl -fsS -m 10 "$RPC_URL/api/status" | jq -r '.genesis_hash') || GENESIS_HASH=""
 [[ "$GENESIS_HASH" =~ ^[0-9a-f]{64}$ ]] || { echo "No valid genesis hash at $RPC_URL; nothing restarted" >&2; exit 1; }
 
-for app in $(for i in $(seq 0 $((N - 1))); do echo "$PREFIX-v$i"; done) "$RPC_APP"; do
-  before=$(height)
+gate_wait "before the first restart" gate_check \
+  || { echo "❌ the network isn't at full participation: $GATE_WHY. Nothing restarted." >&2; exit 1; }
+for i in $(seq 0 $((N - 1))); do
+  app=$PREFIX-v$i
+  # Its process start time, from the last check (which just passed).
+  start=${GATE_STARTED[$i]:-}
+  [ -n "$start" ] || { echo "❌ no process start time for $app: nothing more restarted" >&2; exit 1; }
   printf 'GITHUB_TOKEN=%s\n' "$TOKEN" | fly secrets import -a "$app" >/dev/null
   echo "🔑 $app: GITHUB_TOKEN set (machine restarted)"
-  ok=""
-  port=7070; [ "$app" != "$RPC_APP" ] || port=7171
-  target=$((before + 6))
-  for _ in $(seq 60); do
-    if [ "$(height)" -ge "$target" ] && fly ssh console -a "$app" -C "blockula checkpoint --peer http://127.0.0.1:$port --height $target --genesis-hash $GENESIS_HASH" >/dev/null 2>&1; then ok=1; break; fi
-    sleep "$PROGRESS_SECS"
-  done
-  [ -n "$ok" ] || { echo "❌ $app did not confirm new finalized blocks after its restart (from #$before): stopping before the next app. Check fly logs -a $app, then rerun." >&2; exit 1; }
+  gate_wait "after restarting $app" gate_check "$i=$start" \
+    || { echo "❌ $app isn't back: $GATE_WHY. Stopping before the next app (the rest are untouched): check fly logs -a $app, then rerun." >&2; exit 1; }
 done
+gate_wait "before restarting $RPC_APP" gate_answering rpc \
+  || { echo "❌ $GATE_WHY: $RPC_APP not restarted (the validators have the token). Rerun once it answers." >&2; exit 1; }
+start=$GATE_RPC_STARTED
+printf 'GITHUB_TOKEN=%s\n' "$TOKEN" | fly secrets import -a "$RPC_APP" >/dev/null
+echo "🔑 $RPC_APP: GITHUB_TOKEN set (machine restarted)"
+gate_wait "after restarting $RPC_APP" gate_public_back "$start" \
+  || { echo "❌ $RPC_APP isn't back: $GATE_WHY. Check fly logs -a $RPC_APP." >&2; exit 1; }
 echo "✓ GITHUB_TOKEN set on $N validators and $RPC_APP"

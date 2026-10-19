@@ -910,7 +910,7 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
         let mut node = http_node(shared, Some(marshal), peers, &net, &trust);
         node.protection = Some(protection);
         let metrics = context.child("metrics");
-        node.p2p_peers = Some(Arc::new(move || api::connected_peers(&commonware_runtime::Metrics::encode(&metrics))));
+        node.p2p_peers = Some(Arc::new(move || api::connected_peer_labels(&commonware_runtime::Metrics::encode(&metrics))));
         tokio::spawn(serve_http(node, http_bind));
         handle.await
     });

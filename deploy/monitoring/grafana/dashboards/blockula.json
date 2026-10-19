@@ -1235,7 +1235,7 @@
     },
     {
       "type": "timeseries",
-      "title": "P2P peers",
+      "title": "P2P links to the active set",
       "id": 20,
       "datasource": {
         "type": "prometheus",
@@ -1254,8 +1254,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "blockula_p2p_peers{node=~\"$node\"}",
-          "legendFormat": "peers · {{node}}",
+          "expr": "blockula_p2p_active_peers{node=~\"$node\"} or blockula_p2p_peers{node=~\"$node\"}",
+          "legendFormat": "active-set links · {{node}}",
           "refId": "A"
         },
         {

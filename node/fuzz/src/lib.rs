@@ -37,6 +37,7 @@ mod node_src {
     pub mod snapshot;
     pub mod staking;
     pub mod state;
+    pub mod status_cli;
     pub mod store;
     pub mod types;
     pub mod upgrade;

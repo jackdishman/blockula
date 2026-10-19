@@ -160,13 +160,16 @@ tests:
               summary: "v1: protocol v2 activates within a day and this binary doesn't run it: the node will halt there"
               runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#upgrade-required
 
-  # 4 validators: a quorum is 3, so a validator needs 2 peers.
+  # 4 validators: a quorum is 3, so a validator needs links to 2 of the others. v1's candidate
+  # link (p2p_peers) doesn't count.
   - interval: 1m
     input_series:
       - series: 'blockula_active_validators{job="blockula",instance="a",node="v1"}'
         values: "4x10"
-      - series: 'blockula_p2p_peers{job="blockula",instance="a",node="v1"}'
+      - series: 'blockula_p2p_active_peers{job="blockula",instance="a",node="v1"}'
         values: "3 3 1x8"
+      - series: 'blockula_p2p_peers{job="blockula",instance="a",node="v1"}'
+        values: "4 4 2x8"
     alert_rule_test:
       - eval_time: 4m
         alertname: BlockulaFewPeers
@@ -176,17 +179,21 @@ tests:
         exp_alerts:
           - exp_labels: { severity: warning, job: blockula, instance: a, node: v1 }
             exp_annotations:
-              summary: "v1: 1 p2p peers, fewer than a quorum needs"
+              summary: "v1: linked to 1 other active validators, fewer than a quorum needs"
               runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#peers
 
   # 4 validators: each should be linked to the other 3. v1 loses a link for 4 minutes and warns
-  # after 2; v3 re-links within 2 minutes of a restart and doesn't; v2 isn't in the active set.
+  # after 2, though a candidate's link keeps its p2p_peers at 3; v3, a node without
+  # p2p_active_peers (p2p_peers stands in), re-links within 2 minutes of a restart and doesn't;
+  # v2 isn't in the active set.
   - interval: 1m
     input_series:
       - series: 'blockula_active_validators{job="blockula",instance="a",node="v1"}'
         values: "4x8"
-      - series: 'blockula_p2p_peers{job="blockula",instance="a",node="v1"}'
+      - series: 'blockula_p2p_active_peers{job="blockula",instance="a",node="v1"}'
         values: "3 3 2 2 2 2 3 3 3"
+      - series: 'blockula_p2p_peers{job="blockula",instance="a",node="v1"}'
+        values: "4 4 3 3 3 3 4 4 4"
       - series: 'blockula_slashing_protection_voting{job="blockula",instance="a",node="v1"}'
         values: "1x8"
       - series: 'blockula_active_validators{job="blockula",instance="b",node="v2"}'
@@ -210,7 +217,7 @@ tests:
         exp_alerts:
           - exp_labels: { severity: warning, job: blockula, instance: a, node: v1 }
             exp_annotations:
-              summary: "v1: 2 p2p peers, not linked to all 3 other validators"
+              summary: "v1: linked to 2 of the 3 other active validators"
               runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#peers
       - eval_time: 7m
         alertname: BlockulaMissingPeers

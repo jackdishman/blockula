@@ -136,26 +136,28 @@ groups:
           summary: "{{ $labels.node }}: newest certificate has {{ $value }} signers, below quorum for its active set"
           runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#validator-set
 
-      # Fewer connected peers than a quorum needs besides this node: its votes and blocks may not
-      # reach enough of the set. Validators only (full nodes have no p2p).
+      # Linked to fewer of the active set than a quorum needs besides this node: its votes and
+      # blocks may not reach enough of it. Validators only (full nodes have no p2p). Only links to
+      # the active set count (`blockula_p2p_active_peers`): `blockula_p2p_peers` also counts the
+      # last epoch's set, candidates and bootstrappers, and stands in on nodes that don't export it.
       - alert: BlockulaFewPeers
-        expr: blockula_p2p_peers < blockula:quorum - 1
+        expr: (blockula_p2p_active_peers or blockula_p2p_peers) < blockula:quorum - 1
         for: 5m
         labels: { severity: warning }
         annotations:
-          summary: "{{ $labels.node }}: {{ $value }} p2p peers, fewer than a quorum needs"
+          summary: "{{ $labels.node }}: linked to {{ $value }} other active validators, fewer than a quorum needs"
           runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#peers
       # In the active set but not linked to every other validator. Votes and blocks travel only
       # over direct links, so on a small set a missing link costs blocks: leaders without a
       # quorum's links time out (the blockula-testnet-2 launch stall). A restarted validator
       # re-links within seconds on `public-nat` and `local`, up to minutes on `recommended`.
-      # Candidates and sentries linked to this node count as peers too.
+      # Links to candidates and others outside the active set don't count (as above).
       - alert: BlockulaMissingPeers
-        expr: blockula_p2p_peers < blockula_active_validators - 1 and blockula_slashing_protection_voting == 1
+        expr: (blockula_p2p_active_peers or blockula_p2p_peers) < blockula_active_validators - 1 and blockula_slashing_protection_voting == 1
         for: 2m
         labels: { severity: warning }
         annotations:
-          summary: "{{ $labels.node }}: {{ $value }} p2p peers, not linked to all {{ with printf `blockula_active_validators{node=\"%s\"} - 1` $labels.node | query }}{{ . | first | value }}{{ end }} other validators"
+          summary: "{{ $labels.node }}: linked to {{ $value }} of the {{ with printf `blockula_active_validators{node=\"%s\"} - 1` $labels.node | query }}{{ . | first | value }}{{ end }} other active validators"
           runbook_url: https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md#peers
 
       # Slashing protection (node/src/protection.rs). The record only moves forward: going back

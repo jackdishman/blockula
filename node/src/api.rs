@@ -55,8 +55,9 @@ pub struct Node {
     pub halt: crate::upgrade::HaltSignal,
     /// Validators: slashing protection's state, for /metrics.
     pub protection: Option<Arc<crate::protection::Protection>>,
-    /// Validators: connected p2p peers, for /metrics.
-    pub p2p_peers: Option<Arc<dyn Fn() -> Option<usize> + Send + Sync>>,
+    /// Validators: the connected p2p peers' labels (the tracker's: each peer's key as it displays),
+    /// for /metrics.
+    pub p2p_peers: Option<Arc<dyn Fn() -> Option<Vec<String>> + Send + Sync>>,
     /// This node's validator address (its key's), if it has one: /metrics marks its series `own="1"`.
     pub me: Option<String>,
 }
@@ -69,22 +70,38 @@ pub fn mark_process_start() {
     STARTED.get_or_init(|| crate::chain::now_ms() as f64 / 1000.0);
 }
 
-/// Connected p2p peers, from the runtime's Prometheus text: the series of the authenticated
-/// p2p tracker's `connected` family (`network_tracker_directory_connected`, one per peer; the
-/// network runs under the `network` label, node.rs).
-pub fn connected_peers(runtime_metrics: &str) -> Option<usize> {
+/// Connected p2p peers, from the runtime's Prometheus text: the `peer` labels of the
+/// authenticated p2p tracker's `connected` family (`network_tracker_directory_connected`, one
+/// series per peer; the network runs under the `network` label, node.rs). The tracker counts
+/// every peer it's linked to: this epoch's set, the last epoch's, registered candidates and
+/// bootstrappers, so [`peer_label`] tells the active set's apart.
+pub fn connected_peer_labels(runtime_metrics: &str) -> Option<Vec<String>> {
     let is_family = |name: &str| name.starts_with("network_tracker") && name.ends_with("_connected");
     let mut found = false;
-    let mut n = 0;
+    let mut peers = vec![];
     for line in runtime_metrics.lines() {
         if let Some(rest) = line.strip_prefix("# TYPE ") {
             found |= rest.split(' ').next().is_some_and(is_family);
         } else if !line.starts_with('#') && is_family(line.split(['{', ' ']).next().unwrap_or_default()) {
             found = true;
-            n += 1;
+            let label = line.split_once("peer=\"").and_then(|(_, rest)| rest.split_once('"')).map(|(peer, _)| peer.to_string());
+            peers.push(label.unwrap_or_default());
         }
     }
-    found.then_some(n)
+    found.then_some(peers)
+}
+
+/// How the p2p tracker labels the peer whose consensus key is `key_hex`: the key as it displays
+/// (`pq::PublicKey`: its first 6 bytes, hex).
+fn peer_label(key_hex: &str) -> Option<String> {
+    crate::pq::PublicKey::from_bytes(&hex::decode(key_hex).ok()?).map(|k| k.to_string())
+}
+
+/// How many of the connected `peers` (the tracker's labels) are in the active set whose
+/// consensus keys (hex) are `set`.
+fn active_peers<'a>(peers: &[String], set: impl IntoIterator<Item = &'a str>) -> usize {
+    let set: std::collections::HashSet<String> = set.into_iter().filter_map(peer_label).collect();
+    peers.iter().filter(|p| set.contains(p.as_str())).count()
 }
 
 /// Counters for /metrics.
@@ -1070,7 +1087,11 @@ async fn metrics(State(n): State<Node>) -> Response {
             gauges.push(("blockula_process_start_time_seconds", "When this process started (unix seconds)", *started));
         }
         if let Some(peers) = n.p2p_peers.as_ref().and_then(|f| f()) {
-            gauges.push(("blockula_p2p_peers", "Connected p2p peers", peers as f64));
+            // Proposals and votes travel over direct links to the active set only (a node isn't
+            // its own peer, so a validator linked to all of it has active - 1).
+            let linked = active_peers(&peers, v.state.active_set(epoch).unwrap_or_default().iter().map(|r| r.consensus_key.as_str()));
+            gauges.push(("blockula_p2p_peers", "Connected p2p peers: this epoch's active set, the last epoch's, candidates and bootstrappers", peers.len() as f64));
+            gauges.push(("blockula_p2p_active_peers", "Connected p2p peers in this epoch's active set", linked as f64));
         }
         // Slashing protection (protection.rs).
         if let Some(p) = &n.protection {
@@ -2753,10 +2774,10 @@ mod http_tests {
         let p = crate::protection::Protection::in_memory(&key, crate::protection::Timing::for_block_time(1_000));
         p.enter_epoch(0, Some(0), 4, 0);
         n.protection = Some(p);
-        n.p2p_peers = Some(Arc::new(|| Some(3)));
+        n.p2p_peers = Some(Arc::new(|| Some(vec!["0a0b0c0d0e0f".into(), "1a1b1c1d1e1f".into(), "2a2b2c2d2e2f".into()])));
         mark_process_start();
         let (_, _, text) = call(&n, "GET", "/metrics", None, "127.0.0.1:1").await;
-        for want in ["blockula_halted 1", "blockula_halt_info{kind=\"upgrade_required\"} 1", "blockula_slashing_protection_abstaining 1", "blockula_slashing_protection_voting 1", "blockula_slashing_protection_last_view 0", "blockula_p2p_peers 3", "blockula_process_start_time_seconds"] {
+        for want in ["blockula_halted 1", "blockula_halt_info{kind=\"upgrade_required\"} 1", "blockula_slashing_protection_abstaining 1", "blockula_slashing_protection_voting 1", "blockula_slashing_protection_last_view 0", "blockula_p2p_peers 3", "blockula_p2p_active_peers 0", "blockula_process_start_time_seconds"] {
             assert!(text.contains(want), "{want} in {text}");
         }
         std::fs::remove_dir_all(root).ok();
@@ -2766,9 +2787,26 @@ mod http_tests {
     fn peer_count_from_the_runtime_metrics() {
         // As commonware-p2p 2026.9.0 exports it (captured from a 4-validator local chain).
         let text = "# HELP network_tracker_directory_connected Unix timestamp in milliseconds when each connected peer became active.\n# TYPE network_tracker_directory_connected gauge\nnetwork_tracker_directory_connected{peer=\"3de892cdf0a5\"} 1792045530601\nnetwork_tracker_directory_connected{peer=\"111ec16d2af5\"} 1792045529793\n# TYPE network_tracker_directory_tracked gauge\nnetwork_tracker_directory_tracked 3\nnode_validator_marshal_connected 1\n";
-        assert_eq!(connected_peers(text), Some(2));
-        assert_eq!(connected_peers("# HELP network_tracker_directory_connected x\n# TYPE network_tracker_directory_connected gauge\n"), Some(0));
-        assert_eq!(connected_peers("runtime_tasks_spawned_total 3\n"), None, "no p2p tracker");
+        assert_eq!(connected_peer_labels(text), Some(vec!["3de892cdf0a5".to_string(), "111ec16d2af5".to_string()]));
+        assert_eq!(connected_peer_labels("# HELP network_tracker_directory_connected x\n# TYPE network_tracker_directory_connected gauge\n"), Some(vec![]));
+        assert_eq!(connected_peer_labels("runtime_tasks_spawned_total 3\n"), None, "no p2p tracker");
+    }
+
+    #[test]
+    fn active_peers_are_the_connected_peers_in_the_active_set() {
+        // The tracker links to more than the active set (the last epoch's, candidates,
+        // bootstrappers): only the active set's peers carry proposals and votes.
+        let key = |i: u8| crate::pq::PublicKey::from_bytes(&crate::crypto::Keys::from_seed([i; 32]).public_key()).unwrap();
+        let hex_of = |i: u8| hex::encode(key(i).as_ref());
+        // Labelled as the tracker labels them: keys 1 and 2 are in the set, 9 is a candidate.
+        let peers = vec![key(1).to_string(), key(2).to_string(), key(9).to_string(), String::new()];
+        let set = [hex_of(0), hex_of(1), hex_of(2), hex_of(3)];
+        assert_eq!(active_peers(&peers, set.iter().map(String::as_str)), 2);
+        assert_eq!(active_peers(&peers, std::iter::empty()), 0);
+        assert_eq!(peer_label(&hex_of(1)), Some(key(1).to_string()));
+        assert_eq!(peer_label(&hex_of(1)).map(|l| l.len()), Some(12), "the first 6 bytes, hex");
+        assert_eq!(peer_label("zz"), None);
+        assert_eq!(peer_label("00"), None, "not a key");
     }
 
     /// P-ECON's reads: the fee ring and what wallets should pay, the parameters and the

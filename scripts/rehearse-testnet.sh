@@ -11,8 +11,12 @@
 #     secret), its owner tops up the self-bond and unjails it, and it rejoins;
 #   - after the (shortened) weak-subjectivity period, a plain `join` from the genesis is refused,
 #     and a fresh public node joins through the entrypoint's checkpoint path;
-#   - every validator restarting at once (launch.sh's redeploy, relaunch step 6) and the public
-#     node restarting from its joined home: the chain resumes with all four signing;
+#   - from here on with Fly's p2p preset (public-nat, FLY_P2P_PRESET; the steps above run `local`):
+#     every validator restarting at once (launch.sh's key removal and redeploys), then each one
+#     restarting in turn (set-github-token.sh), through the participation gate those scripts use
+#     (deploy/restart-gate.sh): each comes back signing, linked to the other three and proposing,
+#     the chain never stops for MAX_GAP seconds (two validators out), and nobody is jailed;
+#   - the public node restarting from its joined home;
 #   - the SDK e2e passes against the public node, and every node agrees on a block and root.
 #
 #   scripts/rehearse-testnet.sh                 # build, run, tear down
@@ -26,6 +30,8 @@ CHAIN_ID=${CHAIN_ID:-blockula-rehearsal-local}
 BASE=${BASE_PORT:-31400}
 EPOCH=${EPOCH:-20}
 WINDOW=${WINDOW:-120}          # unbonding and evidence window: the weak-subjectivity period is half
+FLY_PRESET=${FLY_P2P_PRESET:-public-nat}   # what deploy/fly-config.sh runs validators with
+MAX_GAP=${MAX_GAP:-20}         # seconds without a block that count as a stall during the restarts
 DIR=$(mktemp -d "${TMPDIR:-/tmp}/blockula-rehearse.XXXXXX")
 NET=$HOME/.config/blockula/$CHAIN_ID-rehearsal-$(date +%s)
 RPC_PORT=$((BASE + 20)); RPC=http://127.0.0.1:$RPC_PORT
@@ -54,9 +60,12 @@ echo "📁 nodes: $DIR  keys: $NET"
 # Four hosts the genesis builder sees as four (it refuses two operators on one p2p host), all this
 # machine: validators bind :: (dual stack).
 P2P_ADDRS="127.0.0.1:$BASE localhost:$((BASE + 1)) [::1]:$((BASE + 2)) [::ffff:127.0.0.1]:$((BASE + 3))"
+# A short downtime window, so an offline validator is jailed within a minute: 12 of 40 leader
+# slots. Still far stricter than the testnet's 50 of 100, and wide enough for a restart under
+# Fly's p2p preset that relinks within seconds (one that takes minutes is jailed here: a failure).
 GENESIS_ONLY=1 REHEARSAL_DIR=$NET CHAIN_ID=$CHAIN_ID EPOCH_BLOCKS=$EPOCH UNBONDING_BLOCKS=$WINDOW \
   P2P_ADDRS=$P2P_ADDRS RPC_URL=$RPC SKIP_BUILD=1 \
-  EXTRA_PARAMS='downtime_window = 20\ndowntime_max_missed = 6\njail_blocks = 20\n' \
+  EXTRA_PARAMS='downtime_window = 40\ndowntime_max_missed = 12\njail_blocks = 20\n' \
   deploy/launch.sh | tee "$DIR/launch.txt"
 GHASH=$("$BIN" checkpoint --genesis "$NET/genesis.json")
 SECRET=$(cat "$NET/forwarder-secret")
@@ -65,11 +74,13 @@ vhttp() { echo "http://127.0.0.1:$((BASE + 10 + $1))"; }
 peers_of() { local out="" j; for j in 0 1 2 3; do [ "$j" = "$1" ] || out="$out $(vhttp "$j")"; done; echo "${out# } $RPC"; }
 validators_http() { echo "$(vhttp 0) $(vhttp 1) $(vhttp 2) $(vhttp 3)"; }
 
-# A validator through the entrypoint; with "seed", from the secret (its first boot).
+# A validator through the entrypoint, with the p2p preset in PRESET; with "seed", from the secret
+# (its first boot).
+PRESET=local
 start_validator() { # i [seed]
   local i=$1 key=""
   [ "${2:-}" = seed ] && key=$(base64 < "$NET/v$i/validator.key" | tr -d '\n')
-  env ROLE=validator BLOCKULA_DATA="$DIR/v$i" BLOCKULA_ETC="$NET/v$i" BLOCKULA_BIN="$BIN" BIND=:: P2P_PRESET=local \
+  env ROLE=validator BLOCKULA_DATA="$DIR/v$i" BLOCKULA_ETC="$NET/v$i" BLOCKULA_BIN="$BIN" BIND=:: P2P_PRESET="$PRESET" \
     HTTP_PORT=$((BASE + 10 + i)) PEER_HTTP="$(peers_of "$i")" BLOCKULA_FORWARDER_SECRET="$SECRET" \
     ${key:+VALIDATOR_KEY_B64=$key} sh deploy/entrypoint.sh >> "$DIR/v$i.log" 2>&1 &
   PIDS[i]=$!
@@ -92,6 +103,34 @@ until_true() { # what secs command…
   local what=$1 secs=$2; shift 2
   for _ in $(seq 1 "$secs"); do "$@" && return 0; sleep 1; done
   fail "timed out: $what"
+}
+# The participation gate launch.sh and set-github-token.sh wait for around restarts
+# (deploy/restart-gate.sh). It reads each validator as on Fly, `fly ssh console -a <app> -C
+# "blockula status --rpc …"`: here that runs `blockula status` against the validator's own port.
+PREFIX=rehearsal N=4 RPC_URL=$RPC HTTP_PORT=7070 RPC_APP=rehearsal-rpc GENESIS_HASH=$GHASH
+PROGRESS_SECS=${PROGRESS_SECS:-2} GATE_SECS=${GATE_SECS:-300}
+# shellcheck source=deploy/restart-gate.sh
+source deploy/restart-gate.sh
+fly() {
+  local app="" cmd=""
+  while [ $# -gt 0 ]; do case $1 in -a) app=$2; shift ;; -C) cmd=$2; shift ;; esac; shift; done
+  case "$app $cmd" in
+    "$PREFIX-v"[0-3]" blockula status --rpc "*) "$BIN" status --rpc "$(vhttp "${app##*-v}")" ;;
+    *) echo "rehearsal: no stand-in for fly -a $app -C $cmd" >&2; return 1 ;;
+  esac
+}
+stop_node() { kill "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true; }
+# The longest time between consecutive blocks from #$1 to #$2, in ms (the public node's blocks).
+max_gap() {
+  local before=$(($2 + 1)) low
+  : > "$DIR/gap.jsonl"
+  while [ "$before" -gt "$1" ]; do
+    get "$RPC/api/blocks?before=$before&limit=100" | jq -c '.[] | [.height, .timestamp_ms]' >> "$DIR/gap.jsonl"
+    low=$(tail -n 1 "$DIR/gap.jsonl" | jq '.[0]')
+    [ "$low" -lt "$before" ] || break
+    before=$low
+  done
+  jq -s --argjson lo "$1" --argjson hi "$2" 'map(select(.[0] >= $lo and .[0] <= $hi)) | unique_by(.[0]) | [range(1; length) as $k | .[$k][1] - .[$k - 1][1]] | max // 0' "$DIR/gap.jsonl"
 }
 
 for i in 0 1 2 3; do start_validator "$i" seed; done
@@ -170,25 +209,51 @@ until_true "v3 rejoining, backed by the bootstrap delegation" 300 back
 stake3=$(get "$RPC/api/validators" | j "Number(BigInt(v.active.find(x => x.validator.address === '$V3').stake) / 10n**9n)")
 echo "✓ v3 restarted from its volume alone, was topped up and unjailed by its owner, and rejoined (backed again: $stake3 FANG at stake)"
 
-# launch.sh redeploys every validator in parallel (relaunch step 6, upgrades): all four stop and
-# start from their volumes at once, and slashing protection must let them sign again. Then the
-# public node restarts (`run` from its joined home).
-# Do this BEFORE the late join: restart downtime increases wall-clock lag, but a fresh timed
-# checkpoint must still admit that joiner (review-r3-sync-1 / resume-relaunch-7).
-stop_node() { kill "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true; }
-h0=$(height "$(vhttp 0)")
+# From here on the validators run Fly's p2p preset. A restarted validator relinks only as its
+# peers' reconnection limits allow: public-nat's were Commonware's `recommended` (minutes) when
+# they stretched the blockula-testnet-2 launch's restarts and jailed a validator, and this is
+# where that shows up again if they regress. Do the restarts BEFORE the late join: restart
+# downtime increases wall-clock lag, but a fresh timed checkpoint must still admit that joiner
+# (review-r3-sync-1 / resume-relaunch-7).
+four() { get "$RPC/api/validators" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const v=JSON.parse(s);process.exit(v.active.length===4&&!(v.jailed??[]).length?0:1)})"; }
+set_of() { get "$RPC/api/validators" | j 'JSON.stringify({active: v.active.length, jailed: (v.jailed ?? []).map(x => x.validator.address)})'; }
+PRESET=$FLY_PRESET
+# launch.sh's key removal and its redeploys (relaunch step 6, upgrades) restart every validator at
+# once: all four stop and start from their volumes, slashing protection must let them sign again,
+# and the gate launch.sh waits for must see each one sign, link to the other three and propose.
+gate_wait "before restarting every validator" gate_answering 0 1 2 3 || fail "before restarting every validator: $GATE_WHY"
+starts="0=${GATE_STARTED[0]} 1=${GATE_STARTED[1]} 2=${GATE_STARTED[2]} 3=${GATE_STARTED[3]}"
+h0=$(height "$(vhttp 0)"); t=$SECONDS
 for i in 0 1 2 3; do kill "${PIDS[$i]}" 2>/dev/null || true; done
 for i in 0 1 2 3; do stop_node "${PIDS[$i]}"; done
 pkill -f "run --home $DIR/v[0-3]/home" 2>/dev/null || true
 for i in 0 1 2 3; do start_validator "$i"; done
 wait_height "$(vhttp 0)" $((h0 + 2 * EPOCH)) 300
 for i in 0 1 2 3; do wait_height "$(vhttp "$i")" $((h0 + 2 * EPOCH)) 60; done
-four() { get "$RPC/api/validators" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const v=JSON.parse(s);process.exit(v.active.length===4&&!(v.jailed??[]).length?0:1)})"; }
-four || fail "after restarting every validator at once: $(get "$RPC/api/validators" | j 'JSON.stringify({active: v.active.length, jailed: (v.jailed ?? []).map(x => x.validator.address)})')"
-# Each one proposed again since the restart: all four sign, none is stuck abstaining.
-proposers=$(for h in $(seq $((h0 + EPOCH)) $((h0 + 2 * EPOCH))); do get "$(vhttp 0)/api/block/$h" | j 'typeof v.proposer === "string" ? v.proposer : v.proposer.address'; done | sort -u | wc -l | tr -d ' ')
-[ "$proposers" = 4 ] || fail "after restarting every validator at once, only $proposers validators proposed blocks"
-echo "✓ every validator restarted at once (a redeploy): the chain resumed at #$h0+, all 4 proposing, none jailed"
+# shellcheck disable=SC2086 # one INDEX=START word per validator
+gate_wait "every validator back" gate_check $starts || fail "after restarting every validator at once under $PRESET: $GATE_WHY"
+four || fail "after restarting every validator at once under $PRESET: $(set_of)"
+echo "✓ every validator restarted at once under $PRESET (the key removal, a redeploy): resumed at #$h0+, all 4 signing, linked and proposing in $((SECONDS - t)) s, none jailed"
+# set-github-token.sh restarts them one at a time, each once the network is at full
+# participation: before the next restart the gate must see the restarted validator sign, link to
+# the other three and propose, and the chain back at full pace. A gate that let a restart through
+# early would take a second validator out: no quorum, a gap of MAX_GAP seconds or more.
+gate_wait "before the rolling restart" gate_check || fail "the network isn't at full participation before the rolling restart: $GATE_WHY"
+r0=$(height "$RPC"); took=""
+for i in 0 1 2 3; do
+  start=${GATE_STARTED[$i]}; t=$SECONDS
+  stop_node "${PIDS[$i]}"
+  pkill -f "run --home $DIR/v$i/home" 2>/dev/null || true
+  sleep 4   # a Fly machine's restart
+  start_validator "$i"
+  gate_wait "v$i back" gate_check "$i=$start" || fail "v$i isn't back after its restart under $PRESET: $GATE_WHY"
+  took="$took v$i $((SECONDS - t)) s,"
+done
+r1=$(height "$RPC")
+gap=$(max_gap "$r0" "$r1")
+[ "$gap" -lt $((MAX_GAP * 1000)) ] || fail "no block for $(gate_secs "$gap") s during the rolling restart (#$r0-#$r1): two validators were out at once"
+four || fail "after the rolling restart under $PRESET: $(set_of)"
+echo "✓ a rolling restart through the participation gate under $PRESET:${took%,} (restart to back); the longest wait for a block $(gate_secs "$gap") s, none jailed"
 RPC_PID=${PIDS[4]}
 stop_node "$RPC_PID"
 pkill -f "run --home $DIR/rpc/full" 2>/dev/null || true
