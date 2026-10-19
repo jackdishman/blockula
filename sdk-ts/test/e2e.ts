@@ -321,12 +321,41 @@ assert.ok(BigInt((await client.contributions()).pool.balance) >= poolBefore + pa
 await assert.rejects(client.seance(999_999), /not found/);
 assert.ok(Array.isArray((await client.souls()).souls));
 
-// With a Season 0 admin key (scripts/local-testnet.sh passes validator 0's), run the admin side:
-// a repo in the pool, Soul grants, a juror, a vouch, and a claim that validators check on GitHub.
+// The admin key below (BLOCKULA_ADMIN_SEED: scripts/local-testnet.sh passes validator 0's) and
+// the council key further down are a validator's own, and its node signs its duties (beacon
+// commitments and reveals, claim attestations) from the same account (`Chain::system_fee_payer`),
+// so what the e2e signs with them races those duties for the account's nonces. A duty signed at
+// the same moment takes the nonce ("bad nonce"). A queued duty that stops applying refuses what's
+// signed behind it ("no longer applies") until the next block drops it, along with what was
+// already queued behind it ("an earlier transaction from the same account was dropped"): a local
+// testnet's validators attest a claim at the same tick, and those whose attestation arrives after
+// the two refutations that settle it have it dropped. None of these ran, so the tx is signed again
+// (up to 5 tries, 1 s apart). A refused tx, or one dropped once another used its nonce, can never
+// run. One dropped behind a gap could, if the gap fills (the node's next duty takes that nonce) and
+// its bytes are resubmitted, so it's signed again only when running it twice is harmless
+// (`idempotent`): a repo's weight is set, and an account's vote on a proposal replaces its earlier
+// one (`governance::vote`).
+async function asValidator<T>(what: string, send: () => Promise<T>, idempotent = false): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await send();
+    } catch (e) {
+      const why = (e as Error).message;
+      const dead = (e instanceof ApiError && e.status === 400 && /bad nonce|no longer applies/.test(why)) || (e instanceof TxFailedError && e.dropped && /bad nonce/.test(why));
+      const orphaned = e instanceof TxFailedError && e.dropped && /earlier transaction from the same account was dropped/.test(why);
+      if (attempt === 5 || !(dead || (orphaned && idempotent))) throw e;
+      console.log(`  (${what} raced the validator's own duties for its account's nonce: ${why}; signing it again)`);
+      await new Promise((r) => setTimeout(r, 1_000));
+    }
+  }
+}
+
+// With a Season 0 admin key, run the admin side: a repo in the pool, Soul grants, a juror, a
+// vouch, and a claim that validators check on GitHub.
 if (process.env.BLOCKULA_ADMIN_SEED) {
   const admin = Wallet.fromSeed(process.env.BLOCKULA_ADMIN_SEED.trim(), client);
-  console.log("✓", (await admin.setRepo("jackdishman/blockula", 10)).summary);
-  console.log("✓", (await admin.grantSoul(alice.address, "12", "e2e bootstrap")).summary);
+  console.log("✓", (await asValidator("setRepo", () => admin.setRepo("jackdishman/blockula", 10), true)).summary);
+  console.log("✓", (await asValidator("grantSoul", () => admin.grantSoul(alice.address, "12", "e2e bootstrap"))).summary);
   console.log("✓", (await alice.joinJury("10")).summary);
   console.log("✓", (await alice.vouch(bob.address)).summary);
   await bob.faucet();
@@ -442,7 +471,7 @@ if (BigInt(rules.proposal_deposit) + parseFang("5") <= BigInt((await client.acco
   votingEnds = voted.voting_ends_at;
   if (councilSeed) {
     const council = Wallet.fromSeed(councilSeed.trim(), client);
-    console.log("✓", (await council.vote(id, true, "1", 0)).summary);
+    console.log("✓", (await asValidator("the council vote", () => council.vote(id, true, "1", 0), true)).summary);
     assert.equal(proposalSummary(await client.proposal(id)).council.ayes, 1, "the validator's vote counts in the council");
   }
 } else {
