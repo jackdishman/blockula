@@ -247,8 +247,10 @@ ExecStart=/usr/local/bin/blockula run --home /var/lib/blockula/val --bind 0.0.0.
 Restart=on-failure
 RestartSec=10
 # Deliberate stops stay stopped until an operator acts: 10 --halt-height reached, 11 a protocol
-# version this binary doesn't run is in force, 12 another instance is signing with this key.
-RestartPreventExitStatus=10 11 12
+# version this binary doesn't run is in force, 12 another instance is signing with this key,
+# 13 a program faulted while executing a certified block (a restart replays it). 14, a thread the
+# OS wouldn't start for a program, restarts.
+RestartPreventExitStatus=10 11 12 13
 LimitNOFILE=65536
 NoNewPrivileges=true
 ProtectSystem=strict
@@ -790,7 +792,7 @@ Logs go to the journal (`journalctl -u blockula`). Keep at least 14 days (`Syste
 - [ ] chrony with NTS sources; offset < 10 ms.
 - [ ] Binary installed with `blockula release install` ([A first install](#a-first-install)), release key id pinned (`blockula release pin` shows it); genesis file from `blockula release fetch`, its hash checked.
 - [ ] Consensus key and owner key backed up offline, encrypted, two places; restore tested.
-- [ ] systemd unit with `BLOCKULA_INSTANCE_ID` and `RestartPreventExitStatus=10 11 12`; `GITHUB_TOKEN` set (public-read-only).
+- [ ] systemd unit with `BLOCKULA_INSTANCE_ID` and `RestartPreventExitStatus=10 11 12 13`; `GITHUB_TOKEN` set (public-read-only).
 - [ ] Provider volume snapshots off on the validator volume.
 - [ ] At least one sentry, registered as `http_addr`; validator HTTP private.
 - [ ] Monitoring stack running; receivers and heartbeat tested with a test alert.

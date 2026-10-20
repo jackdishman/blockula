@@ -5,7 +5,9 @@
 # Reads: PREFIX, RPC_APP, N, REGIONS, RPC_REGION, NET (genesis.json's directory), P2P_PORT,
 # HTTP_PORT, RPC_PORT, VALIDATOR_VM, VALIDATOR_MEMORY, RPC_VM, RPC_MEMORY, GENESIS_HASH, and the
 # optional HALT_HEIGHT and NETWORK_HALTED_AT (validators only), VALIDATOR_PRUNE_BLOCKS,
-# RPC_PRUNE_BLOCKS and RPC_ARCHIVE.
+# RPC_PRUNE_BLOCKS, RPC_ARCHIVE and RPC_SYNC_PEERS (HTTP peers the RPC node also syncs from, and
+# takes its checkpoint from, besides the validators: an archive replays from genesis, and after a
+# few hours only a node that keeps more blocks than the validators still holds the first ones).
 #
 # What the validators' configurations never hold: their key. Each consensus key is the Fly
 # secret VALIDATOR_KEY_B64 only until it's on the volume (deploy/entrypoint.sh reads it from the
@@ -79,7 +81,7 @@ primary_region = "$RPC_REGION"
   ROLE = "rpc"
   GENESIS_HASH = "$GENESIS_HASH"
   CLIENT_IP_HEADER = "fly-client-ip"
-  PEER_HTTP = "$(validator_peer_urls)"
+  PEER_HTTP = "$(validator_peer_urls)${RPC_SYNC_PEERS:+ $RPC_SYNC_PEERS}"
   HTTP_PORT = "$RPC_PORT"
   BLOCKULA_LOG = "warn,blockula=info"
 $(fly_env ARCHIVE "$archive")

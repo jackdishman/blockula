@@ -70,15 +70,23 @@ code=$(entry "$T/v3" ROLE=validator VALIDATOR_KEY_B64="$(printf 'not a key' | ba
 # Deliberate stops stay down; crashes pass through.
 code=$(entry "$T/v4" ROLE=validator VALIDATOR_KEY_B64="$KEY_B64" STUB_EXIT=3)
 [ "$code" = 3 ] && ok "validator: a crash's exit code passes through (the restart policy restarts it)" || bad "validator: crash exited $code"
-(env -i PATH="$PATH" BLOCKULA_DATA="$T/v4" BLOCKULA_ETC="$T/etc" BLOCKULA_BIN="$T/blockula" STUB_LOG="$T/log" STUB_EXIT=10 ROLE=validator ${ENTRY_SH:-sh} deploy/entrypoint.sh > "$T/out10" 2>&1) &
-idle=$!
-sleep 2
-if kill -0 "$idle" 2>/dev/null; then
-  kill -TERM "$idle"; wait "$idle" && ok "validator: exit 10 (halt height) idles instead of exiting, and stops cleanly" || bad "validator: idle exited $? on TERM"
-else
-  bad "validator: exit 10 didn't idle: $(cat "$T/out10")"
-fi
-expect "validator: says why it stays down" "$(cat "$T/out10")" "staying down"
+# 14: a thread the OS wouldn't start for a program (protocol v2), which a restart cures.
+code=$(entry "$T/v4" ROLE=validator STUB_EXIT=14)
+[ "$code" = 14 ] && ok "validator: exit 14 (a program's thread not started) passes through, to restart" || bad "validator: exit 14 exited $code"
+# stays_down CODE WHAT NEEDLE: the entrypoint idles after the node exits CODE, and says why.
+stays_down() {
+  (env -i PATH="$PATH" BLOCKULA_DATA="$T/v4" BLOCKULA_ETC="$T/etc" BLOCKULA_BIN="$T/blockula" STUB_LOG="$T/log" STUB_EXIT="$1" ROLE=validator ${ENTRY_SH:-sh} deploy/entrypoint.sh > "$T/out$1" 2>&1) &
+  local idle=$!
+  sleep 2
+  if kill -0 "$idle" 2>/dev/null; then
+    kill -TERM "$idle"; wait "$idle" && ok "validator: exit $1 ($2) idles instead of exiting, and stops cleanly" || bad "validator: exit $1 idle exited $? on TERM"
+  else
+    bad "validator: exit $1 didn't idle: $(cat "$T/out$1")"
+  fi
+  expect "validator: exit $1: says why it stays down" "$(cat "$T/out$1")" "blockula exited $1: staying down, $3"
+}
+stays_down 10 "halt height" "it reached --halt-height"
+stays_down 13 "a program faulted on a certified block" "a program faulted while this node executed a certified block"
 
 # RPC: an empty home joins with a checkpoint its PEER_HTTP nodes agree on, pinned to GENESIS_HASH.
 H=$(printf 'ee%.0s' $(seq 32))
@@ -99,8 +107,10 @@ code=$(entry "$T/r3" ROLE=rpc GENESIS_HASH="$H" PEER_HTTP="http://v0.internal:70
 expect "rpc: then joins from the genesis alone (join refuses if that's stale)" "$(log)" "join --genesis $T/etc/genesis.json --genesis-hash $H --home"
 expect "rpc: and says so" "$(cat "$T/out")" "no checkpoint from PEER_HTTP"
 code=$(entry "$T/r4" ROLE=rpc ARCHIVE=1 PRUNE_BLOCKS=5)
-expect "rpc: ARCHIVE=1 keeps everything" "$(log)" "--archive"
+expect "rpc: ARCHIVE=1 keeps everything, replayed from genesis (never fast-synced from a snapshot)" "$(log)" "join --genesis $T/etc/genesis.json --home $T/r4/full --port 7171 --bind :: --archive --full"
 refute "rpc: ARCHIVE wins over PRUNE_BLOCKS" "$(log)" "--prune-blocks"
+code=$(entry "$T/r4" ROLE=rpc ARCHIVE=1)
+expect "rpc: an archive restarts with --full too" "$(log)" "run --home $T/r4/full --port 7171 --bind :: --archive --full"
 code=$(entry "$T/r5" ROLE=rpc ARCHIVE=yes)
 [ "$code" = 1 ] && ok "rpc: a malformed ARCHIVE refuses" || bad "rpc: ARCHIVE=yes exited $code"
 code=$(entry "$T/x")
@@ -133,10 +143,11 @@ expect "rpc config: its checkpoint peers are the validators" "$r" 'PEER_HTTP = "
 expect "rpc config: keeps 14 days by default" "$r" 'PRUNE_BLOCKS = "1209600"'
 refute "rpc config: never halts with the validators" "$r" "HALT"
 expect "rpc config: restarts after a refused join" "$r" 'policy = "on-failure"'
-RPC_ARCHIVE=1
+RPC_ARCHIVE=1 RPC_SYNC_PEERS=http://blockula-rpc.internal:7171
 r=$(rpc_toml)
 expect "rpc config: RPC_ARCHIVE=1" "$r" 'ARCHIVE = "1"'
 refute "rpc config: an archive has no window" "$r" "PRUNE_BLOCKS"
+expect "rpc config: RPC_SYNC_PEERS adds peers after the validators" "$r" 'PEER_HTTP = "http://blockula-v0.internal:7070 http://blockula-v1.internal:7070 http://blockula-v2.internal:7070 http://blockula-v3.internal:7070 http://blockula-rpc.internal:7171"'
 PY=${PYTHON:-python3}
 if "$PY" -c "import tomllib" 2>/dev/null; then
   for cfg in "$v0" "$v1" "$r"; do
