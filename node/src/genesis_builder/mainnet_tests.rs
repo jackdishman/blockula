@@ -750,3 +750,58 @@ fn the_council_proposes_and_votes_through_a_node() {
     drop(c);
     std::fs::remove_dir_all(home).ok();
 }
+
+/// On `blockula-1` a validator's owner outranks its consensus key in the bootstrap council. The
+/// key is hot (it signs blocks on the validator's machine) and its account holds the operator
+/// float, so it votes from block 1; the owner's keys are cold. A vote from the key's account
+/// takes the seat unless the seat holds its owner's vote, which only the owner replaces; the
+/// key's FANG still votes. The same launch on a dry-run chain keeps the old rule (the latest vote
+/// of either holds the seat), as every other chain does, v1 or v2.
+#[test]
+fn on_mainnet_the_owner_outranks_the_consensus_key_in_the_council() {
+    let vals = council();
+    let owners: Vec<Keys> = FOUNDER_SEATS.iter().map(|(seed, ..)| owner(*seed)).collect();
+    for chain in [MAIN, DRY_RUN] {
+        let mut r = Run::new(&launch(chain));
+        // The owners' allocations vest (they can't vote before the cliff): each validator pays its
+        // owner 10 FANG out of its float, which votes at once.
+        for (v, o) in vals.iter().zip(&owners) {
+            r.tx(v, Action::Transfer { to: o.address_with("boo"), amount: 10 * FANG }).unwrap();
+        }
+        let id = r.propose(&vals[0], ProposalKind::Text {}).unwrap();
+        let seat = |r: &Run, i: usize| r.p(id).council.get(&vals[i].address_with("boo")).map(|c| (c.aye, c.voter.clone()));
+        let key = |i: usize| (vals[i].address_with("boo"), owners[i].address_with("boo"));
+        let vote = |r: &mut Run, k: &Keys, aye: bool| {
+            let digest = crate::governance::digest_of(r.p(id));
+            r.tx(k, Action::Vote { proposal_id: id, aye, amount: FANG, conviction: 0, proposal_digest: digest }).unwrap();
+        };
+        // Seat 0: the owner votes nay, then the consensus key aye.
+        vote(&mut r, &owners[0], false);
+        vote(&mut r, &vals[0], true);
+        let (k0, o0) = key(0);
+        if chain == MAIN {
+            assert_eq!(seat(&r, 0), Some((false, o0.clone())), "the owner's vote stands");
+            assert_eq!(r.st.governance.votes[&crate::governance::IdKey::new(id, &k0)].council, None, "the key's vote holds no seat");
+        } else {
+            assert_eq!(seat(&r, 0), Some((true, k0.clone())), "the latest vote holds the seat");
+        }
+        assert_eq!((r.p(id).aye_amount, r.p(id).nay_amount), ((FANG as u128), (FANG as u128)), "{chain}: both votes' FANG count");
+        // Seat 1: the key votes first; the owner replaces it, and the key can't take it back on
+        // blockula-1.
+        let (k1, o1) = key(1);
+        vote(&mut r, &vals[1], true);
+        assert_eq!(seat(&r, 1), Some((true, k1.clone())));
+        vote(&mut r, &owners[1], false);
+        assert_eq!(seat(&r, 1), Some((false, o1.clone())), "{chain}: the owner replaces the key's vote");
+        vote(&mut r, &vals[1], true);
+        assert_eq!(seat(&r, 1), if chain == MAIN { Some((false, o1.clone())) } else { Some((true, k1.clone())) }, "{chain}");
+        // The owner can always change its own vote.
+        vote(&mut r, &owners[0], true);
+        assert_eq!(seat(&r, 0), Some((true, o0.clone())), "{chain}");
+        // The tally at the close counts the seats as they stand.
+        let end = r.p(id).voting_end;
+        r.through(end);
+        let ayes = if chain == MAIN { 1 } else { 2 };
+        assert_eq!(r.p(id).tally.as_ref().map(|t| (t.council_ayes, t.council_nays)), Some((ayes, 2 - ayes)), "{chain}");
+    }
+}

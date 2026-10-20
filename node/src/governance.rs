@@ -198,7 +198,8 @@ pub struct VoteRecord {
     /// `locked_until`. Re-votes only ever grow it.
     pub lock_amount: u64,
     pub locked_until: u64,
-    /// The validator this vote also counted for in the bootstrap council.
+    /// The validator this vote also counted for in the bootstrap council (on `blockula-1`, not
+    /// a consensus key's vote that left the seat to its owner's: `owner_outranks_key`).
     pub council: Option<String>,
     pub at: u64,
 }
@@ -465,7 +466,7 @@ pub(crate) fn apply(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, s
     match &tx.action {
         // Admission checked the tx is this chain's: its `chain_id` is the chain's.
         Action::Propose { kind, deposit, title, url } => propose(state, j, &tx.chain_id, sender, key, kind, *deposit, title, url, height),
-        Action::Vote { proposal_id, aye, amount, conviction, proposal_digest } => vote(state, j, sender, signer, key, *proposal_id, *aye, *amount, *conviction, proposal_digest, height),
+        Action::Vote { proposal_id, aye, amount, conviction, proposal_digest } => vote(state, j, &tx.chain_id, sender, signer, key, *proposal_id, *aye, *amount, *conviction, proposal_digest, height),
         Action::Unlock {} => {
             owner_only(key, "unlock votes")?;
             if crate::econ::release_expired(state, j, sender, height) == 0 {
@@ -619,7 +620,7 @@ pub fn digest_of(p: &Proposal) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn vote(state: &mut State, j: &mut Journal, sender: &str, signer: &str, key: &KeyRecord, id: u64, aye: bool, amount: u64, conviction: u8, digest: &str, height: u64) -> Result<()> {
+fn vote(state: &mut State, j: &mut Journal, chain_id: &str, sender: &str, signer: &str, key: &KeyRecord, id: u64, aye: bool, amount: u64, conviction: u8, digest: &str, height: u64) -> Result<()> {
     owner_only(key, "vote")?;
     let p = state.governance.proposals.get(&id).ok_or_else(|| anyhow!("no proposal #{id}"))?;
     if p.status != ProposalStatus::Voting || height > p.voting_end {
@@ -645,6 +646,8 @@ fn vote(state: &mut State, j: &mut Journal, sender: &str, signer: &str, key: &Ke
         None => (amount, until),
     };
     let council = if height < cp.bootstrap_end_height { crate::staking::validator_for_signer(state, sender, signer, state.params.epoch_of(height)) } else { None };
+    // Not over the seat's vote its owner cast, on `blockula-1` (the tokens still count).
+    let council = council.filter(|val| !owner_outranks_key(state, chain_id, id, val, sender));
     crate::econ::lock(state, j, sender, format!("vote:{id}"), lock_amount, locked_until, height)?;
     let p = proposal_mut(state, j, id);
     if let Some(v) = &prev {
@@ -668,6 +671,23 @@ fn vote(state: &mut State, j: &mut Journal, sender: &str, signer: &str, key: &Ke
     j.governance.votes.touch(&state.governance.votes, &vk);
     state.governance.votes.insert(vk, VoteRecord { aye, amount, conviction, weight, lock_amount, locked_until, council, at: height });
     Ok(())
+}
+
+/// Whether `sender`'s vote on proposal `id` leaves validator `val`'s council seat to the vote the
+/// validator's owner cast there: on `blockula-1`, when `sender` is the validator's own account
+/// (its consensus key's) and the seat holds its owner's vote. The consensus key is hot (it signs
+/// blocks on the validator's machine), and on `blockula-1` its account holds the operator float,
+/// so it votes from block 1, while the owner's keys are cold: a leaked consensus key can't replace
+/// a council vote the owner cast, and the owner can replace either. The key's own FANG still
+/// votes; its record names no seat (`VoteRecord::council`). On every other chain the latest vote
+/// from either account holds the seat, as it always has, so testnets and dev chains are
+/// unchanged and so is protocol v2 (which changes nothing until programs are on).
+fn owner_outranks_key(state: &State, chain_id: &str, id: u64, val: &str, sender: &str) -> bool {
+    if chain_id != crate::chain::MAINNET_CHAIN_ID || sender != val {
+        return false;
+    }
+    let Some(owner) = state.validators.get(val).map(|r| r.owner.as_str()).filter(|o| *o != sender) else { return false };
+    state.governance.proposals.get(&id).and_then(|p| p.council.get(val)).is_some_and(|c| c.voter == owner)
 }
 
 /// The keyless system accounts, which never vote (only the bootstrap delegation stakes, by

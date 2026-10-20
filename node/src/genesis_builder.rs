@@ -100,7 +100,8 @@ pub const POOL_OPENING_LABEL: &str = "contribution pool: opening balance (endowm
 /// Most `operator_float` may give each genesis validator: enough for proposal deposits at the
 /// genesis `proposal_deposit` a launch would set (the parameter's floor is 1 FANG), council votes
 /// and their fees, and little to lose if a hot consensus key leaks (the key holds its seat's
-/// council vote then, as its owner's keys do).
+/// council vote then, as its owner's keys do, though on `blockula-1` never over a vote its owner
+/// cast: `governance::owner_outranks_key`).
 pub const MAX_OPERATOR_FLOAT: u64 = 1_000 * DROPS_PER_FANG;
 
 /// The label of an `operator_float` allocation (on the validator's consensus-key account).

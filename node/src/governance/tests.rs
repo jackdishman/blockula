@@ -554,6 +554,26 @@ fn the_bootstrap_council_passes_proposals_until_the_bootstrap_ends() {
     assert!(t.p(i).council.is_empty(), "votes after the bootstrap aren't council votes");
 }
 
+/// Off `blockula-1` (here a v1 chain) a validator's council seat holds the latest vote from its
+/// consensus key's account or its owner's, whichever came last, as it always has: the owner's
+/// precedence is `blockula-1`'s alone (`owner_outranks_key`; `genesis_builder::mainnet_tests`
+/// has that side, and the same launch on a v2 dry-run chain keeping this rule).
+#[test]
+fn off_mainnet_the_latest_vote_holds_a_validators_seat() {
+    let mut t = T::new(&[("bootstrap_end_height", 1_000)]);
+    let v3 = VALIDATORS[2];
+    let seat = |t: &T, id: u64| t.p(id).council.get(&addr(v3)).map(|c| (c.aye, c.voter.clone()));
+    let id = t.propose(ALICE, text());
+    t.vote(OWNER, id, false, 1, 0).unwrap();
+    assert_eq!(seat(&t, id), Some((false, addr(OWNER))));
+    t.vote(v3, id, true, 1, 0).unwrap();
+    assert_eq!(seat(&t, id), Some((true, addr(v3))), "the consensus key's account replaced the owner's vote");
+    assert_eq!(t.st.governance.votes[&IdKey::new(id, &addr(v3))].council, Some(addr(v3)));
+    t.vote(OWNER, id, false, 1, 0).unwrap();
+    assert_eq!(seat(&t, id), Some((false, addr(OWNER))), "and the owner's replaced it back");
+    t.next();
+}
+
 /// Audit F15, F16: governance's own safety parameters change only by a token supermajority, never
 /// by the bootstrap council, and never past their floors: the council can't extend itself, open
 /// spending early or rewrite quorum, voting and the timelock with two 1-FANG votes, and a simple
