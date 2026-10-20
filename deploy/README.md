@@ -147,6 +147,7 @@ The v0.4 testnet (`blockula-testnet`, `boo` addresses) can't run protocol v1, an
 
 - [`monitoring/`](monitoring/README.md): the reference Prometheus, Alertmanager and Grafana stack every operator runs, with alert rules and a dashboard.
 - [docs/OPERATIONS.md](../docs/OPERATIONS.md): hardware, ports, time, sentries, keys and restores, upgrades, incident response, runbooks and releases. Mainnet validators follow it rather than this testnet setup (one org, keys generated on one laptop).
+- [mainnet/README.md](mainnet/README.md): mainnet (`blockula-1`) on Fly with `deploy/mainnet/launch-mainnet.sh`, which shares this setup's machine configurations, entrypoint, gate and key removal but makes no key, writes no spec, resets nothing and runs the signed release's own binary.
 
 ### External watch
 
