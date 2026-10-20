@@ -126,6 +126,12 @@ tower = { version = "0.5", features = ["util"] }
 # SHA-256 of known-answer outputs (src/kat.rs).
 sha2 = "0.11"
 
+[features]
+# A binary that trusts the runbook test's release key instead of the real one, for
+# scripts/test-release-runbook.sh only (src/release_cli.rs `BUILTIN_KEY_ID`). Releases, the image
+# and reproductions never enable it (scripts/check-pins.sh).
+test-release-key = []
+
 # The vendored stream crate is a member only so its tests run against this lockfile:
 # `cargo test --manifest-path node/Cargo.toml -p commonware-stream`. Plain `cargo test` and
 # `cargo build` still act on `blockula` alone.

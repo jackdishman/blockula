@@ -67,8 +67,13 @@ jobs:
       - run: npm run build -w @blockula/sdk && npm run build -w @blockula/mcp
       - name: 4 validators + full node + SDK e2e + CLI
         run: bash scripts/local-testnet.sh
+      # The runbook test below runs a blockula built to trust its test release key (only the
+      # blockula crate rebuilds), so the real key id the ceremony builds in doesn't change what it
+      # runs (review-r4-supply-1). No release, image or reproduction enables the feature.
+      - name: A blockula that trusts the test release key (--features test-release-key)
+        run: cargo build --release --locked --manifest-path node/Cargo.toml --features test-release-key
       # The install, upgrade, patch and key-rotation runbooks in docs/OPERATIONS.md, pasted as
-      # written, with the binary local-testnet.sh just built: each fails closed, and a release
+      # written, with the binary the step above just built: each fails closed, and a release
       # can't vouch for itself (audit F49).
       - name: Release runbooks as pasted (real blockula release install|sign|verify)
         run: bash scripts/test-release-runbook.sh

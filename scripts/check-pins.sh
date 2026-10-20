@@ -4,6 +4,8 @@
 #   - a container image without an @sha256 digest (Dockerfile, compose, workflow containers)
 #   - a rust image whose version differs from rust-toolchain.toml
 #   - a cargo build/test/clippy/run/install without --locked
+#   - cargo features in a release, reproduction or image build, or a manifest that turns the test
+#     release key's feature on by itself
 set -euo pipefail
 cd "$(dirname "$0")/.."
 fail=0
@@ -52,6 +54,20 @@ while IFS= read -r hit; do
 done < <(grep -nE '(^|[^-])cargo (build|test|clippy|run|install)\b' "${workflows[@]}" scripts/*.sh deploy/*.sh deploy/Dockerfile /dev/null \
   | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' | grep -vE 'echo |Build from source' || true)
 
+# What ships is built with no cargo features: the release workflow, its build and reproduction
+# scripts and the images. (`test-release-key` makes a binary trust the runbook test's published
+# key, node/src/release_cli.rs.)
+while IFS= read -r hit; do
+  bad "a release or image build enables cargo features: $hit"
+done < <(grep -nE -- '--(all-)?features|test-release-key' .github/workflows/release.yml scripts/release-build.sh scripts/reproduce-release.sh deploy/Dockerfile deploy/mainnet/Dockerfile /dev/null 2>/dev/null || true)
+# … nor by a manifest: test-release-key is named only where node/Cargo.toml defines it, so no
+# `default = […]`, other feature or dependency turns it on in a plain `cargo build --release`
+# (where the Rust tests that hold the built-in key to the real one are compiled out).
+manifests=$(git ls-files -- Cargo.toml '*/Cargo.toml') || bad "git ls-files can't list the Cargo manifests"
+while IFS= read -r hit; do
+  bad "a manifest names test-release-key outside its definition (it could ship enabled): $hit"
+done < <(for m in $manifests; do grep -nHF -- test-release-key "$m"; done | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' | grep -vxE 'node/Cargo\.toml:[0-9]+:test-release-key = \[\]' || true)
+
 # Every exactly pinned (`=`) crate is in Dependabot's solo consensus-and-crypto group, so its bumps
 # never ride along in the weekly catch-all PR (audit F78).
 group=$(grep -A1 -E '^[[:space:]]*consensus-and-crypto:' .github/dependabot.yml | sed -nE 's/.*patterns: *\[(.*)\].*/\1/p' | tr -d '" ' | tr ',' ' ')
@@ -73,5 +89,5 @@ done < <( {
   awk '/^\[dependencies\./{n=$0; sub(/^\[dependencies\./, "", n); sub(/\].*/, "", n)} /^version *= *"=/{ if (n) print n } /^\[/ && !/^\[dependencies\./{n=""}' node/vendor/commonware-stream/Cargo.toml
 } | grep -vx 'blockula-ghost' | sort -u)
 
-[ $fail = 0 ] && echo "✓ pins: actions by SHA, images by digest, rust $channel everywhere, cargo --locked, exact crate pins in their own Dependabot group"
+[ $fail = 0 ] && echo "✓ pins: actions by SHA, images by digest, rust $channel everywhere, cargo --locked, no features in what ships, exact crate pins in their own Dependabot group"
 exit $fail
