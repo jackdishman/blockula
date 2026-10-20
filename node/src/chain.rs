@@ -525,8 +525,9 @@ impl Genesis {
             ensure!(self.validator_admins.is_empty(), "{MAINNET_CHAIN_ID} has no admin keys: validator_admins must be empty");
             ensure!(!self.faucet, "{MAINNET_CHAIN_ID} has no faucet");
             ensure!(self.validators.iter().all(|v| keys.contains(v.public_key.as_str())), "every {MAINNET_CHAIN_ID} validator needs an operator (owner, self-bond, commission)");
-            // DEC-2: Ghost Mode ships disabled; only governance switches it on, after its audit.
-            ensure!(!self.features.iter().any(|f| f == crate::ghost::FEATURE), "{MAINNET_CHAIN_ID} starts with Ghost Mode off: governance activates it after its audit");
+            // DEC-2: Ghost Mode ships disabled, and stays off until it's audited: governance can't
+            // switch it on here either (`upgrade::check_may_activate`).
+            ensure!(!self.features.iter().any(|f| f == crate::ghost::FEATURE), "{MAINNET_CHAIN_ID} starts with Ghost Mode off: it isn't audited");
             // Governance's own safety parameters start where a vote could take them at most.
             cp.check_governance_floors(&params).context(MAINNET_CHAIN_ID)?;
         }
@@ -675,6 +676,9 @@ impl Journal {
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub struct BlockInfo<'a> {
+    /// The chain the block is on (its genesis's `chain_id`): what the end-of-block steps read for
+    /// a rule only one chain has (governance's: `upgrade::check_may_activate`).
+    pub chain_id: &'a str,
     pub height: u64,
     /// The protocol version in force at `height` (`upgrade::version_at` on the state the block
     /// runs on): what every version-gated rule of the block's end-of-block steps reads.
@@ -1000,7 +1004,7 @@ impl State {
     /// node before a height its binary can't execute (3.9).
     pub fn end_block(&mut self, b: &BlockInfo) {
         #[cfg(test)]
-        crate::upgrade::test_gate::saw(b.height, b.version);
+        crate::upgrade::test_gate::saw(b.chain_id, b.height, b.version);
         self.poc_end_block(b.height);
         crate::econ::end_block(self, b);
         crate::staking::end_block(self, b);
@@ -1055,7 +1059,7 @@ impl State {
             }
             each(tx, named, r);
         }
-        self.end_block(&BlockInfo { height, version, hash, proposer, view, parent_view, skipped: &skipped, tx_bytes });
+        self.end_block(&BlockInfo { chain_id, height, version, hash, proposer, view, parent_view, skipped: &skipped, tx_bytes });
     }
 
     /// The accounts `tx`'s action names, resolved as the state is now: just before it runs, which
@@ -3013,7 +3017,7 @@ impl Chain {
             check_replayed(block.height, i, &outcome, block.failed.get(&i))?;
         }
         let tx_bytes = block.txs.iter().map(Tx::size).chain(block.skipped.iter().copied()).sum();
-        self.state.end_block(&BlockInfo { height: block.height, version, hash: &block.hash, proposer: &block.proposer, view: block.view, parent_view: block.parent_view, skipped: &block.skipped, tx_bytes });
+        self.state.end_block(&BlockInfo { chain_id: &self.genesis.chain_id, height: block.height, version, hash: &block.hash, proposer: &block.proposer, view: block.view, parent_view: block.parent_view, skipped: &block.skipped, tx_bytes });
         if self.state.params.is_boundary(block.height) {
             self.record_epoch(block.height);
         }
@@ -5694,8 +5698,8 @@ mod scaffold {
         // Upgrades and features.
         crate::upgrade::exec_deactivate_feature(s, &mut j, "ghost").unwrap();
         assert!(crate::upgrade::exec_deactivate_feature(s, &mut j, "ghost").is_err());
-        crate::upgrade::exec_activate_feature(s, &mut j, "ghost", h).unwrap();
-        assert!(crate::upgrade::exec_activate_feature(s, &mut j, "warp", h).is_err());
+        crate::upgrade::exec_activate_feature(s, &mut j, "scaffold-1", "ghost", h).unwrap();
+        assert!(crate::upgrade::exec_activate_feature(s, &mut j, "scaffold-1", "warp", h).is_err());
         assert!(crate::upgrade::exec_schedule_upgrade(s, &mut j, 9, h, h, h).is_err(), "only after now");
         crate::upgrade::exec_schedule_upgrade(s, &mut j, 9, 100, h, h).unwrap();
         assert!(crate::upgrade::exec_schedule_upgrade(s, &mut j, 10, 80, h, h).unwrap_err().to_string().contains("must come after it"), "only after the last one");
@@ -5796,20 +5800,22 @@ mod scaffold {
         assert_eq!(b.skipped, vec![forced.size()]);
         assert!(c.failure(&forced.id()).unwrap().0.contains("test gate"));
         c.produce_block_with(vec![]).unwrap();
-        // Each block carries the version in force at its height, and its end-of-block steps saw it.
+        // Each block carries the version in force at its height, and its end-of-block steps saw it,
+        // and the chain's id (`State::run_block` hands it on: chain-scoped rules read it there).
         let versions: Vec<(u64, u32)> = (1..=AT + 1).map(|h| (h, c.block(h).unwrap().version)).collect();
         assert_eq!(versions, vec![(1, 1), (2, 1), (3, 1), (4, preview), (5, preview)]);
-        assert_eq!(crate::upgrade::test_gate::take(), versions);
+        let seen: Vec<(String, u64, u32)> = versions.iter().map(|&(h, v)| (g.chain_id.clone(), h, v)).collect();
+        assert_eq!(crate::upgrade::test_gate::take(), seen);
         let root = c.state.root();
         drop(c);
         // Replay from the block logs: block 1's gated tx applies again (v1) and block 4 skips the
         // other (the preview version), to the same root, the end-of-block steps seeing the same
-        // versions.
+        // versions and chain id (`Chain::replay`'s, from the genesis).
         fs::remove_file(home.join(store::DB_FILE)).unwrap();
         crate::upgrade::test_gate::record();
         let c = Chain::open(&home).unwrap();
         assert_eq!((c.height(), c.state.root()), (AT + 1, root));
-        assert_eq!(crate::upgrade::test_gate::take(), versions);
+        assert_eq!(crate::upgrade::test_gate::take(), seen);
         drop(c);
         fs::remove_dir_all(home).ok();
     }

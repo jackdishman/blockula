@@ -721,7 +721,7 @@ fn f_plus_one_validators_pause_and_governance_resumes() {
     crate::upgrade::exec_deactivate_feature(&mut n.c.state, &mut j, FEATURE).unwrap();
     assert!(err(n.submit(&later)).contains("Ghost Mode is off"));
     let h = n.c.height();
-    crate::upgrade::exec_activate_feature(&mut n.c.state, &mut j, FEATURE, h).unwrap();
+    crate::upgrade::exec_activate_feature(&mut n.c.state, &mut j, &n.c.genesis.chain_id, FEATURE, h).unwrap();
     assert!(!paused(&n.c.state, n.c.height() + 1));
     n.submit(&later).unwrap();
     n.c.produce_block().unwrap();

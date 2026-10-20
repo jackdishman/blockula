@@ -2363,7 +2363,7 @@ mod tests {
         let (home, mut c, _) = home_at_zero("gossip-ghost");
         let mut j = crate::chain::Journal::default();
         let h = c.height();
-        crate::upgrade::exec_activate_feature(&mut c.state, &mut j, crate::ghost::FEATURE, h).unwrap();
+        crate::upgrade::exec_activate_feature(&mut c.state, &mut j, &c.genesis.chain_id, crate::ghost::FEATURE, h).unwrap();
         let (chain_id, genesis_hash, instance) = (c.genesis.chain_id.clone(), c.genesis_hash.clone(), c.state.ghost.meta.instance);
         let chain: Shared = Arc::new(Mutex::new(c));
         let gate = Mutex::new(GossipGate::<u8>::default());

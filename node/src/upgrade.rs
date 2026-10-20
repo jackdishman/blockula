@@ -133,25 +133,26 @@ pub mod test_gate {
     pub const MEMO: &str = "p7: refused from the preview version";
 
     thread_local! {
-        static SEEN: RefCell<Option<Vec<(u64, u32)>>> = const { RefCell::new(None) };
+        static SEEN: RefCell<Option<Vec<(String, u64, u32)>>> = const { RefCell::new(None) };
     }
 
-    /// Starts recording, on this thread, the version each block's end-of-block steps see.
+    /// Starts recording, on this thread, the chain id and version each block's end-of-block steps
+    /// see (the chain id is what a chain-scoped rule reads there: `check_may_activate`).
     pub fn record() {
         SEEN.with(|s| *s.borrow_mut() = Some(vec![]));
     }
 
-    /// `State::end_block` reports here: block `height` closed under `version`.
-    pub fn saw(height: u64, version: u32) {
+    /// `State::end_block` reports here: block `height` of chain `chain_id` closed under `version`.
+    pub fn saw(chain_id: &str, height: u64, version: u32) {
         SEEN.with(|s| {
             if let Some(v) = s.borrow_mut().as_mut() {
-                v.push((height, version));
+                v.push((chain_id.to_string(), height, version));
             }
         });
     }
 
     /// What was recorded since [`record`], which stops recording.
-    pub fn take() -> Vec<(u64, u32)> {
+    pub fn take() -> Vec<(String, u64, u32)> {
         SEEN.with(|s| s.borrow_mut().take().unwrap_or_default())
     }
 }
@@ -463,9 +464,25 @@ pub fn check_known_feature(feature: &str, version: u32) -> Result<()> {
     Ok(())
 }
 
-/// Switches a feature on that the version in force at `height` knows.
-pub(crate) fn exec_activate_feature(state: &mut State, j: &mut Journal, feature: &str, height: u64) -> Result<()> {
+/// Whether chain `chain_id` lets governance switch `feature` on at all: every feature but Ghost
+/// Mode on `blockula-1`. Ghost Mode is NOT AUDITED (docs/GHOST-MODE.md) and outside the protocol
+/// audit's scope (docs/AUDIT_SCOPE.md), and the bootstrap council (the genesis set, most of it
+/// run by the founder) may pass an `ActivateFeature` on its own from block 1, so a rule keeps it
+/// off rather than a promise. Its genesis can't list it either (`Genesis::check`). A later
+/// protocol version lifts this once Ghost Mode is audited (the rule then reads the version in
+/// force, [`version_at`]). Testnets and dev chains switch it as before.
+pub fn check_may_activate(feature: &str, chain_id: &str) -> Result<()> {
+    if chain_id == crate::chain::MAINNET_CHAIN_ID && feature == crate::ghost::FEATURE {
+        bail!("{chain_id} doesn't switch {feature} on: Ghost Mode isn't audited (a later protocol version lifts this once it is)");
+    }
+    Ok(())
+}
+
+/// Switches a feature on that the version in force at `height` knows, on a chain that lets it
+/// ([`check_may_activate`]).
+pub(crate) fn exec_activate_feature(state: &mut State, j: &mut Journal, chain_id: &str, feature: &str, height: u64) -> Result<()> {
     check_known_feature(feature, version_at(state, height))?;
+    check_may_activate(feature, chain_id)?;
     if is_active(state, feature) {
         bail!("{feature} is already on");
     }
@@ -773,9 +790,9 @@ mod tests {
         let mut st = State::default();
         let mut j = Journal::default();
         st.upgrade.schedule = vec![ScheduledUpgrade { version: PROGRAMS_VERSION, activation_height: 100 }];
-        assert_eq!(exec_activate_feature(&mut st, &mut j, PROGRAMS_FEATURE, 99).unwrap_err().to_string(), "unknown feature programs (known: ghost)");
+        assert_eq!(exec_activate_feature(&mut st, &mut j, "dev", PROGRAMS_FEATURE, 99).unwrap_err().to_string(), "unknown feature programs (known: ghost)");
         assert!(!is_active(&st, PROGRAMS_FEATURE));
-        exec_activate_feature(&mut st, &mut j, PROGRAMS_FEATURE, 100).unwrap();
+        exec_activate_feature(&mut st, &mut j, "dev", PROGRAMS_FEATURE, 100).unwrap();
         assert_eq!(st.upgrade.features.get(PROGRAMS_FEATURE), Some(&Feature { activated_at: 100 }));
         st.econ.height = 99;
         check_invariants(&st).unwrap();
@@ -784,6 +801,26 @@ mod tests {
         assert!(check_invariants(&st).unwrap_err().to_string().contains("unknown feature programs is active under protocol v1"));
         exec_deactivate_feature(&mut st, &mut j, PROGRAMS_FEATURE).unwrap();
         check_invariants(&st).unwrap();
+    }
+
+    /// Ghost Mode stays off on `blockula-1` by rule (it isn't audited): an activation that runs
+    /// there fails, whatever the vote, and nothing turns on. Programs switch on there as anywhere,
+    /// and Ghost Mode on every other chain.
+    #[test]
+    fn mainnet_never_switches_ghost_mode_on() {
+        let main = crate::chain::MAINNET_CHAIN_ID;
+        let ghost = crate::ghost::FEATURE;
+        let e = check_may_activate(ghost, main).unwrap_err().to_string();
+        assert_eq!(e, "blockula-1 doesn't switch ghost on: Ghost Mode isn't audited (a later protocol version lifts this once it is)");
+        for (feature, chain) in [(PROGRAMS_FEATURE, main), (ghost, "blockula-testnet-2"), (ghost, "dev")] {
+            check_may_activate(feature, chain).unwrap();
+        }
+        let mut st = State::default();
+        let mut j = Journal::default();
+        assert_eq!(exec_activate_feature(&mut st, &mut j, main, ghost, 5).unwrap_err().to_string(), e);
+        assert!(!is_active(&st, ghost));
+        exec_activate_feature(&mut st, &mut j, "blockula-testnet-2", ghost, 5).unwrap();
+        assert!(is_active(&st, ghost));
     }
 
     /// An upgrade activates at least `MIN_UPGRADE_LEAD` blocks out: that's what lets a verifier

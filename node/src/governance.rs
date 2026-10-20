@@ -463,7 +463,8 @@ pub fn owner_keys(state: &State, account: &str) -> BTreeSet<String> {
 /// ClaimDistribution.
 pub(crate) fn apply(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, signer: &str, key: &KeyRecord, height: u64) -> Result<()> {
     match &tx.action {
-        Action::Propose { kind, deposit, title, url } => propose(state, j, sender, key, kind, *deposit, title, url, height),
+        // Admission checked the tx is this chain's: its `chain_id` is the chain's.
+        Action::Propose { kind, deposit, title, url } => propose(state, j, &tx.chain_id, sender, key, kind, *deposit, title, url, height),
         Action::Vote { proposal_id, aye, amount, conviction, proposal_digest } => vote(state, j, sender, signer, key, *proposal_id, *aye, *amount, *conviction, proposal_digest, height),
         Action::Unlock {} => {
             owner_only(key, "unlock votes")?;
@@ -492,8 +493,8 @@ fn spend_gate(state: &State, height: u64) -> Result<()> {
 }
 
 /// The kind as it will be stored: account names resolved to addresses, and what can already be
-/// known to fail refused (it's checked again when it runs).
-fn prepare_kind(state: &State, kind: &ProposalKind, height: u64) -> Result<ProposalKind> {
+/// known to fail on chain `chain_id` refused (it's checked again when it runs).
+fn prepare_kind(state: &State, chain_id: &str, kind: &ProposalKind, height: u64) -> Result<ProposalKind> {
     let cp = &state.chain_params;
     // The proposal's `voting_end` (fixed now; the horizons count from it, here and when it runs),
     // and the earliest block it can run in (the timelock in force at the close decides).
@@ -580,6 +581,10 @@ fn prepare_kind(state: &State, kind: &ProposalKind, height: u64) -> Result<Propo
             // brings is proposed once it's in force. Versions never go down, so it's known when
             // it runs too (an activation is checked again then).
             crate::upgrade::check_known_feature(feature, crate::upgrade::version_at(state, height))?;
+            // And one this chain switches on at all (Ghost Mode stays off on `blockula-1`).
+            if matches!(kind, ProposalKind::ActivateFeature { .. }) {
+                crate::upgrade::check_may_activate(feature, chain_id)?;
+            }
         }
         ProposalKind::SetRepo { .. } | ProposalKind::Text {} => {}
     }
@@ -587,13 +592,13 @@ fn prepare_kind(state: &State, kind: &ProposalKind, height: u64) -> Result<Propo
 }
 
 #[allow(clippy::too_many_arguments)]
-fn propose(state: &mut State, j: &mut Journal, sender: &str, key: &KeyRecord, kind: &ProposalKind, deposit: u64, title: &str, url: &str, height: u64) -> Result<()> {
+fn propose(state: &mut State, j: &mut Journal, chain_id: &str, sender: &str, key: &KeyRecord, kind: &ProposalKind, deposit: u64, title: &str, url: &str, height: u64) -> Result<()> {
     owner_only(key, "make proposals")?;
     let min = state.chain_params.proposal_deposit;
     if deposit < min {
         bail!("a proposal bonds at least {}", fmt_fang(min));
     }
-    let kind = prepare_kind(state, kind, height)?;
+    let kind = prepare_kind(state, chain_id, kind, height)?;
     state.j_debit(j, sender, deposit)?;
     save_scalars(state, j);
     let g = &mut state.governance;
@@ -850,11 +855,11 @@ fn clamp(v: u128) -> u64 {
     v.min(u64::MAX as u128) as u64
 }
 
-/// Runs a queued proposal's action. On error nothing it did stays.
-fn execute(state: &mut State, id: u64, height: u64) {
+/// Runs a queued proposal's action on chain `chain_id`. On error nothing it did stays.
+fn execute(state: &mut State, chain_id: &str, id: u64, height: u64) {
     let p = state.governance.proposals[&id].clone();
     let mut j = Journal::default();
-    let result = run_kind(state, &mut j, &p, height);
+    let result = run_kind(state, &mut j, chain_id, &p, height);
     let (status, outcome) = match result {
         Ok(what) => (ProposalStatus::Executed, what),
         Err(e) => {
@@ -876,7 +881,7 @@ fn execute(state: &mut State, id: u64, height: u64) {
 /// A passed proposal's action (the levers have no signer checks: the vote was the check).
 /// Returns what it did, for `Proposal::outcome` (accounts shortened: names are looked up by
 /// readers, not scanned for in end-of-block code).
-fn run_kind(state: &mut State, j: &mut Journal, p: &Proposal, height: u64) -> Result<String> {
+fn run_kind(state: &mut State, j: &mut Journal, chain_id: &str, p: &Proposal, height: u64) -> Result<String> {
     Ok(match &p.kind {
         ProposalKind::ParamChange { key, value } => {
             state.exec_set_param(j, key, *value)?;
@@ -949,7 +954,7 @@ fn run_kind(state: &mut State, j: &mut Journal, p: &Proposal, height: u64) -> Re
             format!("protocol v{version} activates at block {activation_height}")
         }
         ProposalKind::ActivateFeature { feature } => {
-            crate::upgrade::exec_activate_feature(state, j, feature, height)?;
+            crate::upgrade::exec_activate_feature(state, j, chain_id, feature, height)?;
             format!("{feature} is on")
         }
         ProposalKind::DeactivateFeature { feature } => {
@@ -1052,7 +1057,7 @@ pub fn end_block(state: &mut State, b: &BlockInfo) {
     for id in state.governance.open_proposals.clone() {
         let p = &state.governance.proposals[&id];
         if p.status == ProposalStatus::Queued && p.execute_at.is_some_and(|at| height >= at) {
-            execute(state, id, height);
+            execute(state, b.chain_id, id, height);
         }
     }
     for id in state.governance.open_distributions.clone() {
