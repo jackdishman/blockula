@@ -19,7 +19,7 @@ import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { RELEASE_SIGNATURE_FORMAT, releaseMessage } from "@blockula/sdk";
-import { KNOWN_GENESIS, KnownChains, LOCAL_RPC, TESTNET_RPC, completePin, effectivePin, mismatch, networkArg, resolveNetwork } from "../src/network.js";
+import { KNOWN_CLOCKS, KNOWN_GENESIS, KnownChains, LOCAL_RPC, MAINNET_RPCS, TESTNET_RPC, completePin, effectivePin, mismatch, networkArg, resolveNetwork } from "../src/network.js";
 import { RELEASE_KEY_ID, binPaths, checkBinaryVersion, fetchVerifiedRelease, latestTagFrom, pickNodeBinary, readReleasePin, releaseKeyIdFrom, type ReleaseDeps } from "../src/release.js";
 
 const G1 = "11".repeat(32);
@@ -47,7 +47,8 @@ assert.equal(resolveNetwork({ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_CHAI
 const pinned = resolveNetwork({ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_CHAIN_ID: "x", BLOCKULA_GENESIS_HASH: G1.toUpperCase() });
 assert.deepEqual(pinned.pin, { chainId: "x", genesisHash: G1 });
 const refusals: [Record<string, string>, string[], RegExp][] = [
-  [{}, ["--network", "mainnet"], /no public mainnet RPC/],
+  // Until the launch release builds public mainnet RPCs in (scripts/pin-network.sh --mainnet).
+  ...(MAINNET_RPCS.length ? [] : [[{}, ["--network", "mainnet"], /no public mainnet RPC/] as [Record<string, string>, string[], RegExp]]),
   [{}, ["--network", "custom"], /needs BLOCKULA_RPC/],
   [{ BLOCKULA_NETWORK: "moon" }, [], /unknown network/],
   [{ BLOCKULA_RPC: "http://rpc.example" }, [], /must use https/],
@@ -65,6 +66,9 @@ const refusals: [Record<string, string>, string[], RegExp][] = [
 assert.deepEqual(resolveNetwork({ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_WITNESSES: " https://a.example/ , https://b.example ," }).witnesses, ["https://a.example", "https://b.example"]);
 assert.deepEqual(resolveNetwork({}).witnesses, []);
 for (const [env, argv, re] of refusals) assert.throws(() => resolveNetwork(env, argv), re, JSON.stringify([env, argv]));
+// Built-in mainnet RPCs: https, and the first is mainnet's default.
+for (const u of MAINNET_RPCS) assert.match(u, /^https:\/\/[^/\s]+$/, u);
+if (MAINNET_RPCS.length) assert.equal(resolveNetwork({}, ["--network", "mainnet"]).rpc, MAINNET_RPCS[0]);
 console.log("✓ the network comes from the configuration only (default: the public testnet)");
 
 // ---- 2. pins ----
@@ -76,13 +80,21 @@ assert.match(mismatch({ genesisHash: G2 }, status("a", G1)) ?? "", /genesis/);
 assert.match(mismatch({ prefix: "tboo" }, status("a", G1)) ?? "", /"boo1…" addresses/);
 assert.match(mismatch({}, { genesis_hash: G1 }) ?? "", /chain id/);
 assert.equal(mismatch({ genesisHash: G1 }, status("a", G1.toUpperCase())), null, "hex case doesn't matter");
-// A known chain id must come with its known genesis, whatever the configuration says.
+// A known chain id must come with its known genesis, whatever the configuration says. (A stand-in
+// for blockula-1's: the one the launch release pins, if any, is put back after.)
+const mainnetGenesis: string | undefined = KNOWN_GENESIS["blockula-1"];
 KNOWN_GENESIS["blockula-1"] = G1;
 assert.match(mismatch({}, status("blockula-1", G2)) ?? "", /genesis/);
 assert.equal(mismatch({}, status("blockula-1", G1)), null);
 assert.equal(resolveNetwork({ BLOCKULA_RPC: "https://rpc.example" }, ["--network", "mainnet"]).pin.genesisHash, G1);
 assert.throws(() => resolveNetwork({ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_GENESIS_HASH: G2 }, ["--network", "mainnet"]), /contradicts blockula-1's known genesis/);
-delete KNOWN_GENESIS["blockula-1"];
+if (mainnetGenesis === undefined) delete KNOWN_GENESIS["blockula-1"];
+else KNOWN_GENESIS["blockula-1"] = mainnetGenesis;
+// Every known genesis comes with its clock (scripts/pin-network.sh pins them together).
+for (const [id, hash] of Object.entries(KNOWN_GENESIS)) {
+  assert.match(hash, /^[0-9a-f]{64}$/, id);
+  assert.ok(KNOWN_CLOCKS[id] && Number.isSafeInteger(KNOWN_CLOCKS[id].createdAtMs) && KNOWN_CLOCKS[id].blockTimeMs >= 1, `${id}: KNOWN_CLOCKS has its genesis clock`);
+}
 assert.deepEqual(completePin({ chainId: "a" }, status("a", G1.toUpperCase(), "tboo")), { chainId: "a", genesisHash: G1, prefix: "tboo" });
 const dir = mkdtempSync(join(tmpdir(), "blockula-mcp-test-"));
 const known = new KnownChains(join(dir, "known-chains.json"));
@@ -322,7 +334,8 @@ assert.ok(!r.error && NO_VALUE.test(JSON.parse(r.text).note), r.text);
 r = await s.call("contribution_pool");
 assert.ok(!r.error && NO_VALUE.test(JSON.parse(r.text).note), r.text);
 await s.close();
-nodeStatus = { ...nodeStatus, chain_id: "blockula-1" };
+// (Reporting blockula-1's genesis once the launch release pins it: any other is refused.)
+nodeStatus = { ...nodeStatus, chain_id: "blockula-1", genesis_hash: KNOWN_GENESIS["blockula-1"] ?? G1 };
 s = await server({ BLOCKULA_RPC: rpc });
 r = await s.call("list_hunts");
 assert.ok(!r.error && !/monetary value/.test(r.text) && /untrusted_\*/.test(JSON.parse(r.text).note), `a node on blockula-1 is mainnet, however configured: ${r.text}`);
@@ -334,7 +347,7 @@ assert.ok(!r.error && !/monetary value/.test(r.text), r.text);
 r = await s.call("contribution_pool");
 assert.ok(!r.error && !/monetary value/.test(r.text) && JSON.parse(r.text).note === undefined, r.text);
 await s.close();
-nodeStatus = { ...nodeStatus, chain_id: "fake-chain" };
+nodeStatus = { ...nodeStatus, chain_id: "fake-chain", genesis_hash: G1 };
 console.log("✓ testnet FANG is called worthless on test chains only, never on mainnet");
 
 // A broken configuration fails every tool with the reason, instead of guessing a network.

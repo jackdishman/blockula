@@ -2,13 +2,19 @@
 # Tests scripts/pin-network.sh on a copy of the files it edits (CI `node` job, after the release
 # build): a chain gets pinned in the node's trust table, the MCP and the wallet; reruns change
 # nothing; checkpoints accumulate; a different genesis for a pinned chain id, a genesis file that
-# doesn't hash to the pin, mainnet and malformed input are refused with nothing written. The
-# copy's trust file is checked against the node's schema here; in the release PR, `cargo test`
-# (embedded_files_parse_and_mainnet_waits_for_its_ceremony) and the MCP's tests check the real
-# ones.
+# doesn't hash to the pin, mainnet without --mainnet and malformed input are refused with nothing
+# written. Then mainnet's guarded pin (--mainnet, CONFIRM_MAINNET): its refusals, and what it
+# writes (the placeholder's hash, the MCP's tables and RPCs, the wallet's mainnet constants,
+# genesis/blockula-1/). A blockula-1 genesis can't be made here (its operators' proofs of
+# possession, the builder's policy), so those cases run a stand-in blockula that hashes files
+# with SHA-256, unless MAINNET_GENESIS names a real one (the ceremony's, or a dry run's built for
+# blockula-1) to run them with the real binary. The copy's trust file is checked against the
+# node's schema here; in the release PR, `cargo test` (embedded_files_parse_and_mainnet_waits_for_
+# its_ceremony) and the MCP's tests check the real ones.
 #
 #   bash scripts/test-pin-network.sh
 #   GENESIS=~/.config/blockula/blockula-testnet-2-rehearsal/genesis.json bash scripts/test-pin-network.sh
+#   MAINNET_GENESIS=<dir>/genesis.json bash scripts/test-pin-network.sh   (spec.toml, operators/ beside it)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 BIN=${BIN:-$PWD/node/target/release/blockula}
@@ -43,7 +49,15 @@ ZERO_SET=$(ZERO="$ZERO" node -p 'JSON.parse(process.env.ZERO).set_hash')
 fresh() {
   rm -rf "$T/repo"
   mkdir -p "$T/repo/node/src" "$T/repo/node/checkpoints" "$T/repo/mcp/src" "$T/repo/web/lib"
-  cp node/checkpoints/blockula-1.json "$T/repo/node/checkpoints/"
+  # Mainnet's placeholder, as it is until the launch release pins it.
+  cat > "$T/repo/node/checkpoints/blockula-1.json" <<'PLACEHOLDER'
+{
+  "chain_id": "blockula-1",
+  "genesis_hash": "",
+  "checkpoints": [],
+  "note": "TODO(ceremony): placeholder. Set genesis_hash to the hash every genesis builder reproduced (docs/GENESIS_CEREMONY.md) in the release that launches mainnet; until then this binary refuses to run or join blockula-1. Every later release appends a checkpoint (docs/OPERATIONS.md, Weak subjectivity)."
+}
+PLACEHOLDER
   CHAIN="$CHAIN" OUT="$T/repo" node --input-type=module <<'JS' || exit 1
 import { readFileSync, writeFileSync } from "node:fs";
 const reset = (file, rules) => {
@@ -55,15 +69,19 @@ const reset = (file, rules) => {
   writeFileSync(`${process.env.OUT}/${file}`, s);
 };
 reset("node/src/checkpoints.rs", [[/const EMBEDDED: &\[&str\] = &\[[^\]]*\];/, 'const EMBEDDED: &[&str] = &[include_str!("../checkpoints/blockula-1.json")];']]);
+reset("node/src/cli_net.rs", []); // read only: the tests the mainnet pin names
 reset("mcp/src/network.ts", [
   [/export const KNOWN_GENESIS: Record<string, string> = \{[^}]*\};/, "export const KNOWN_GENESIS: Record<string, string> = {};"],
   [/export const KNOWN_CLOCKS: Record<string, GenesisClock> = \{(?:[^{}]|\{[^{}]*\})*\};/, "export const KNOWN_CLOCKS: Record<string, GenesisClock> = {};"],
+  [/export const MAINNET_RPCS: string\[\] = \[[^\]]*\];/, "export const MAINNET_RPCS: string[] = [];"],
 ]);
 // The wallet's testnet is this chain, so its constants are pinned too.
 reset("web/lib/config.ts", [
   [/export const TESTNET_CHAIN_ID = "[^"]*";/, `export const TESTNET_CHAIN_ID = "${process.env.CHAIN}";`],
   [/export const TESTNET_GENESIS_HASH: string \| undefined = (?:undefined|"[0-9a-f]{64}");/, "export const TESTNET_GENESIS_HASH: string | undefined = undefined;"],
   [/export const TESTNET_GENESIS_CLOCK: GenesisClock \| undefined = (?:undefined|\{ createdAtMs: \d+, blockTimeMs: \d+ \});/, "export const TESTNET_GENESIS_CLOCK: GenesisClock | undefined = undefined;"],
+  [/export const MAINNET_GENESIS_HASH: string \| undefined = (?:undefined|"[0-9a-f]{64}");/, "export const MAINNET_GENESIS_HASH: string | undefined = undefined;"],
+  [/export const MAINNET_GENESIS_CLOCK: GenesisClock \| undefined = (?:undefined|\{ createdAtMs: \d+, blockTimeMs: \d+ \});/, "export const MAINNET_GENESIS_CLOCK: GenesisClock | undefined = undefined;"],
 ]);
 JS
 }
@@ -140,6 +158,102 @@ refused "a new chain without its genesis clock" "needs its genesis clock" "$CHAI
 pin "$CHAIN" "$HASH" --genesis "$G" || bad "pin failed: $(cat "$T/out")"
 grep -qF 'export const TESTNET_GENESIS_HASH: string | undefined = undefined;' "$T/repo/web/lib/config.ts" && ok "another chain doesn't touch the wallet's testnet" || bad "the wallet was pinned to another chain"
 grep -qF 'export const TESTNET_GENESIS_CLOCK: GenesisClock | undefined = undefined;' "$T/repo/web/lib/config.ts" && ok "another chain doesn't touch the wallet's clock" || bad "the wallet's clock was pinned to another chain"
+
+# ---- mainnet: pinned only with --mainnet and CONFIRM_MAINNET, from the ceremony's inputs ----
+
+if [ -n "${MAINNET_GENESIS:-}" ]; then
+  MBIN=$BIN MG=$MAINNET_GENESIS
+else
+  # The stand-in blockula: a genesis file's "hash" is its SHA-256, its genesis checkpoint pins a
+  # fixed set, and `genesis build` reproduces the genesis.json beside the spec (STUB_REBUILD=other:
+  # something else, as a spec that doesn't rebuild it would).
+  MBIN=$T/stub-blockula
+  cat > "$MBIN" <<'STUB'
+#!/usr/bin/env bash
+sha() { if command -v sha256sum > /dev/null; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
+case "$1 ${2:-}" in
+  "--version ") echo "blockula 0.0.0 (stand-in)" ;;
+  "checkpoint --genesis")
+    [ -f "$3" ] || exit 1
+    if [ "${4:-}" = --json ]; then
+      G="$3" H="$(sha "$3")" node -e 'const g = JSON.parse(require("fs").readFileSync(process.env.G, "utf8")); console.log(JSON.stringify({ height: 0, hash: process.env.H, set_hash: "5e".repeat(32), timestamp_ms: g.created_at_ms }))'
+    else sha "$3"; fi ;;
+  "genesis build")
+    if [ "${STUB_REBUILD:-}" = other ]; then echo '{}' > "$6"; else cp "$(dirname "$4")/genesis.json" "$6"; fi ;;
+  *) exit 2 ;;
+esac
+STUB
+  chmod +x "$MBIN"
+  mkdir -p "$T/ceremony/operators"
+  printf '{"chain_id":"blockula-1","address_prefix":"boo","created_at_ms":%s,"block_time_ms":1000,"validators":[]}\n' "$((CREATED - 86400000))" > "$T/ceremony/genesis.json"
+  printf 'chain_id = "blockula-1"\noperators = ["operators/a.toml"]\n' > "$T/ceremony/spec.toml"
+  echo '[operator]' > "$T/ceremony/operators/a.toml"
+  MG=$T/ceremony/genesis.json
+fi
+MSRC=$(dirname "$MG")
+MH=$("$MBIN" checkpoint --genesis "$MG")
+MCLOCK=$(G="$MG" node -p 'const g = JSON.parse(require("fs").readFileSync(process.env.G, "utf8")); `${g.created_at_ms}:${g.block_time_ms}`')
+mpin() { CONFIRM_MAINNET=${CONFIRM-$MH} ROOT="$T/repo" BIN="$MBIN" bash scripts/pin-network.sh "$@" > "$T/out" 2>&1; }
+mrefused() { # what why args…
+  local what=$1 why=$2; shift 2
+  if mpin "$@"; then bad "mainnet, $what: accepted"; elif ! grep -qF -- "$why" "$T/out"; then bad "mainnet, $what: $(cat "$T/out")"; elif [ "$(snapshot)" != "$after" ]; then bad "mainnet, $what: changed files"; else ok "mainnet: refuses $what"; fi
+}
+
+fresh
+after=$(snapshot)
+mrefused "without --mainnet" "genesis ceremony" blockula-1 "$MH" --genesis "$MG"
+CONFIRM="" mrefused "without CONFIRM_MAINNET" "set CONFIRM_MAINNET" blockula-1 "$MH" --mainnet --genesis "$MG"
+CONFIRM=$OTHER mrefused "with CONFIRM_MAINNET naming another hash" "set CONFIRM_MAINNET" blockula-1 "$MH" --mainnet --genesis "$MG"
+mrefused "--mainnet for another chain" "--mainnet pins blockula-1" "$CHAIN" "$MH" --mainnet --genesis "$MG"
+mrefused "a first pin without the genesis" "needs --genesis" blockula-1 "$MH" --mainnet
+CONFIRM=$OTHER mrefused "a genesis that doesn't hash to the pin" "hashes to $MH, not $OTHER" blockula-1 "$OTHER" --mainnet --genesis "$MG"
+mrefused "an http RPC" "https://host" blockula-1 "$MH" --mainnet --genesis "$MG" --rpc http://rpc.example
+mrefused "an RPC with a path" "https://host" blockula-1 "$MH" --mainnet --genesis "$MG" --rpc https://rpc.example/api
+refused "--rpc without --mainnet" "goes with --mainnet" "$CHAIN" "$HASH" --genesis "$G" --rpc https://rpc.example
+mkdir -p "$T/bare" && cp "$MG" "$T/bare/genesis.json"
+mrefused "a genesis without its spec and operators" "spec.toml and operators" blockula-1 "$MH" --mainnet --genesis "$T/bare/genesis.json"
+if [ -z "${MAINNET_GENESIS:-}" ]; then
+  STUB_REBUILD=other mrefused "a spec that doesn't rebuild the genesis" "doesn't rebuild" blockula-1 "$MH" --mainnet --genesis "$MG"
+  mkdir -p "$T/tboo/operators" && cp "$T/ceremony/spec.toml" "$T/tboo/" && cp "$T/ceremony/operators/a.toml" "$T/tboo/operators/"
+  sed 's/"address_prefix":"boo"/"address_prefix":"tboo"/' "$MG" > "$T/tboo/genesis.json"
+  TH=$("$MBIN" checkpoint --genesis "$T/tboo/genesis.json")
+  CONFIRM=$TH mrefused "a genesis without boo addresses" "isn't mainnet's genesis" blockula-1 "$TH" --mainnet --genesis "$T/tboo/genesis.json"
+fi
+
+if mpin blockula-1 "$MH" --mainnet --genesis "$MG" --rpc https://rpc-a.blockula.example --rpc https://rpc-b.blockula.example:8443; then ok "mainnet: pins blockula-1 ($MH)"; else bad "mainnet pin failed: $(cat "$T/out")"; fi
+mf=$T/repo/node/checkpoints/blockula-1.json
+node -e "
+const k = JSON.parse(require('fs').readFileSync('$mf', 'utf8'));
+if (k.chain_id !== 'blockula-1' || k.genesis_hash !== '$MH' || k.checkpoints.length !== 0) throw new Error(JSON.stringify(k));
+if (/TODO\(ceremony\)/.test(k.note) || !/mainnet/.test(k.note)) throw new Error('note: ' + k.note);
+" && ok "mainnet: node/checkpoints/blockula-1.json has the hash, and the placeholder's note is gone" || bad "mainnet trust file: $(cat "$mf")"
+[ "$(grep -oF 'include_str!("../checkpoints/blockula-1.json")' "$T/repo/node/src/checkpoints.rs" | wc -l | tr -d ' ')" = 1 ] && ok "mainnet: EMBEDDED already lists blockula-1, once" || bad "EMBEDDED: $(grep EMBEDDED "$T/repo/node/src/checkpoints.rs")"
+grep -qF "export const KNOWN_GENESIS: Record<string, string> = { \"blockula-1\": \"$MH\" };" "$T/repo/mcp/src/network.ts" && ok "mainnet: the MCP's KNOWN_GENESIS" || bad "KNOWN_GENESIS: $(grep KNOWN_GENESIS "$T/repo/mcp/src/network.ts")"
+grep -qF "\"blockula-1\": { createdAtMs: ${MCLOCK%:*}, blockTimeMs: ${MCLOCK#*:} }" "$T/repo/mcp/src/network.ts" && ok "mainnet: the MCP's KNOWN_CLOCKS" || bad "KNOWN_CLOCKS: $(grep KNOWN_CLOCKS "$T/repo/mcp/src/network.ts")"
+grep -qF 'export const MAINNET_RPCS: string[] = ["https://rpc-a.blockula.example", "https://rpc-b.blockula.example:8443"];' "$T/repo/mcp/src/network.ts" && ok "mainnet: the MCP's MAINNET_RPCS, in order" || bad "MAINNET_RPCS: $(grep 'MAINNET_RPCS:' "$T/repo/mcp/src/network.ts")"
+grep -qF "export const MAINNET_GENESIS_HASH: string | undefined = \"$MH\";" "$T/repo/web/lib/config.ts" && ok "mainnet: the wallet's MAINNET_GENESIS_HASH" || bad "wallet: $(grep 'MAINNET_GENESIS_HASH:' "$T/repo/web/lib/config.ts")"
+grep -qF "export const MAINNET_GENESIS_CLOCK: GenesisClock | undefined = { createdAtMs: ${MCLOCK%:*}, blockTimeMs: ${MCLOCK#*:} };" "$T/repo/web/lib/config.ts" && ok "mainnet: the wallet's MAINNET_GENESIS_CLOCK" || bad "wallet clock: $(grep 'MAINNET_GENESIS_CLOCK:' "$T/repo/web/lib/config.ts")"
+grep -qF 'export const TESTNET_GENESIS_HASH: string | undefined = undefined;' "$T/repo/web/lib/config.ts" && ok "mainnet: the wallet's testnet is untouched" || bad "the wallet's testnet was pinned to mainnet"
+cmp -s "$MG" "$T/repo/genesis/blockula-1/genesis.json" && cmp -s "$MSRC/spec.toml" "$T/repo/genesis/blockula-1/spec.toml" && [ -n "$(ls "$T/repo/genesis/blockula-1/operators/")" ] \
+  && ok "mainnet: genesis/blockula-1/ has the genesis, its spec and operators" || bad "genesis/blockula-1: $(ls -R "$T/repo/genesis/blockula-1")"
+if ls "$T/repo/genesis/blockula-1" | grep -qvE '^(genesis\.json|spec\.toml|operators)$'; then bad "mainnet: something besides the public inputs: $(ls "$T/repo/genesis/blockula-1")"; else ok "mainnet: and nothing else"; fi
+expect_flip=$(grep -c 'embedded_files_parse_and_mainnet_waits_for_its_ceremony' "$T/out" || true)
+[ "$expect_flip" -ge 1 ] && ok "mainnet: says which placeholder test the PR deletes" || bad "mainnet: no word of the placeholder test: $(cat "$T/out")"
+grep -qF "tests mainnet_is_never_trusted_on_first_use validator_commands_sign_only_addresses_they_were_given stand in for mainnet" "$T/out" && ok "mainnet: and which tests' stand-in mainnet nodes need the pinned genesis" || bad "mainnet: no word of cli_net's stand-in mainnet nodes: $(cat "$T/out")"
+grep -qF "NEXT_PUBLIC_MAINNET_GENESIS_HASH must be $MH" "$T/out" && ok "mainnet: and what Vercel's NEXT_PUBLIC_MAINNET_GENESIS_HASH must be" || bad "mainnet: no word of Vercel's setting: $(cat "$T/out")"
+
+after=$(snapshot)
+mpin blockula-1 "$MH" --mainnet --genesis "$MG" --rpc https://rpc-a.blockula.example || bad "mainnet rerun failed: $(cat "$T/out")"
+[ "$(snapshot)" = "$after" ] && ok "mainnet: a rerun changes nothing" || bad "mainnet: a rerun changed files"
+! grep -qF "Also in this PR" "$T/out" && ok "mainnet: a rerun doesn't ask for the first pin's test changes again" || bad "mainnet rerun: $(cat "$T/out")"
+MCP1="10:$(printf 'ab%.0s' $(seq 32)):$SET:$((${MCLOCK%:*} + 20000))"
+mpin blockula-1 "$MH" --mainnet --checkpoint "$MCP1" --rpc https://rpc-c.blockula.example || bad "mainnet's next release (a checkpoint, a new RPC, the committed genesis): $(cat "$T/out")"
+[ "$(node -p "JSON.parse(require('fs').readFileSync('$mf', 'utf8')).checkpoints.map(c => c.height).join(',')")" = 10 ] && ok "mainnet: a later release appends its checkpoint (the committed genesis supplies the clock)" || bad "mainnet checkpoints: $(cat "$mf")"
+grep -qF '"https://rpc-b.blockula.example:8443", "https://rpc-c.blockula.example"];' "$T/repo/mcp/src/network.ts" && ok "mainnet: and adds RPCs after the built-in ones" || bad "MAINNET_RPCS: $(grep 'MAINNET_RPCS:' "$T/repo/mcp/src/network.ts")"
+after=$(snapshot)
+CONFIRM=$OTHER mrefused "another genesis once pinned" "not $OTHER" blockula-1 "$OTHER" --mainnet
+CONFIRM=$OTHER mrefused "another genesis once pinned, given with it" "not $OTHER" blockula-1 "$OTHER" --mainnet --genesis "$MG"
+refused "a testnet pin of a pinned blockula-1 without --mainnet" "genesis ceremony" blockula-1 "$MH"
 
 if [ $fails -gt 0 ]; then echo "✗ $fails failed" >&2; exit 1; fi
 echo "✓ pin-network.sh behaves"
