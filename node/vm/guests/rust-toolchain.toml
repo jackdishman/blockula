@@ -1,0 +1,8 @@
+# The repo's compiler (the root rust-toolchain.toml; tests/guests.rs checks they agree) plus the
+# guests' target, kept here so the node's builds never download wasm32v1-none. The same rustc
+# gives the same bytes: the committed modules are reproducible only with it.
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]
+targets = ["wasm32v1-none"]
+profile = "minimal"
