@@ -49,9 +49,10 @@ operators = [
 # Names nobody can register (DEC-11); governance may assign them later.
 reserved_names = ["blockula", "boo", "foundation", "treasury", "community", "validator", "admin", "support", "security", "official"]
 
-# Features on from genesis. Programs stay off unless the commissioned audit comes back clean (then
-# `features = ["programs"]`; otherwise the council switches them on later with ActivateFeature).
-# Ghost Mode ships off (DEC-2), and blockula-1 refuses to switch it on until it's audited.
+# Features on from genesis. Programs stay off: blockula-1's genesis can't list them on this
+# release, and its governance switches them on only from protocol v3 (an ActivateFeature that runs
+# under v3 or later), the version that ships what their audit asks for. Ghost Mode ships off
+# (DEC-2), and blockula-1 refuses to switch it on until it's audited.
 features = []
 
 # Liquid FANG for each genesis validator's consensus-key account, out of the operators bucket

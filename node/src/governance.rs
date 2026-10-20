@@ -582,9 +582,12 @@ fn prepare_kind(state: &State, chain_id: &str, kind: &ProposalKind, height: u64)
             // brings is proposed once it's in force. Versions never go down, so it's known when
             // it runs too (an activation is checked again then).
             crate::upgrade::check_known_feature(feature, crate::upgrade::version_at(state, height))?;
-            // And one this chain switches on at all (Ghost Mode stays off on `blockula-1`).
+            // And one this chain lets governance switch on under the version in force at the
+            // earliest block it runs in (on `blockula-1`: never Ghost Mode, and programs from v3,
+            // so one may be proposed to run after a scheduled v3; `check_may_activate` says why
+            // that block's version may be read here).
             if matches!(kind, ProposalKind::ActivateFeature { .. }) {
-                crate::upgrade::check_may_activate(feature, chain_id)?;
+                crate::upgrade::check_may_activate(feature, chain_id, crate::upgrade::version_at(state, runs_at))?;
             }
         }
         ProposalKind::SetRepo { .. } | ProposalKind::Text {} => {}

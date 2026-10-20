@@ -3,8 +3,8 @@
 //! liquid operator float on each validator's consensus-key account, so the bootstrap council can
 //! propose and vote from block 1. These tests build such a genesis with the strict builder (as
 //! `blockula genesis build` does for `blockula-1`), then run its state machine: the council passes
-//! an upgrade and switches programs on early in the chain, without the float nobody can do either
-//! until the operators' vesting cliff, and Ghost Mode stays off whatever the council votes. The
+//! an upgrade early in the chain (without the float nobody could until the operators' vesting
+//! cliff), it switches programs on only under v3, and Ghost Mode stays off whatever it votes. The
 //! same launch on a dry-run chain shows what's `blockula-1`'s alone, and one test runs the
 //! council's first proposals through a node (signed, admitted, executed and replayed).
 
@@ -215,13 +215,16 @@ fn the_founder_set_builds_strict_with_its_waivers_on_record() {
 /// (a) Governance is live at block 1. On the strict `blockula-1` genesis above, each of the four
 /// validators proposes or votes from its consensus-key account, out of its operator float (the
 /// deposit is 10 FANG; a council vote needs only a drop). The bootstrap council (the active set,
-/// ⅔ of it voting aye) passes a `ScheduleUpgrade` to v3 and `ActivateFeature { programs }` at
-/// governance's floors, with a 3-day vote and a 1-day timelock: both run at block 345,601, four
-/// days in. Programs are on, and v3 is scheduled where the proposal said: from its height every
-/// block runs v3, so this binary (which runs v2) stops cleanly before it, as every node without
-/// the next release does, and nodes on that release go on.
+/// ⅔ of it voting aye) passes a `ScheduleUpgrade` to v3 at governance's floors, with a 3-day vote
+/// and a 1-day timelock: it runs at block 345,601, four days in, and v3 is scheduled where the
+/// proposal said. From its height every block runs v3, so this binary (which runs v2) stops
+/// cleanly before it, as every node without the next release does, and nodes on that release go
+/// on. Programs switch on by governance only under v3 (`upgrade::check_may_activate`): an
+/// `ActivateFeature { programs }` proposed in block 1 would run under v2 and is refused; proposed
+/// once v3 is scheduled, it runs after v3's height, under v3 (on the release that runs it: the
+/// state machine goes on here where this binary's node would have stopped).
 #[test]
-fn the_council_upgrades_and_switches_programs_on_from_block_1() {
+fn the_council_upgrades_from_block_1_and_switches_programs_on_under_v3() {
     let g = launch(MAIN);
     let mut r = Run::new(&g);
     let vals = council();
@@ -230,32 +233,28 @@ fn the_council_upgrades_and_switches_programs_on_from_block_1() {
     assert_eq!(crate::upgrade::version_at(&r.st, r.h), 2, "born at v2");
     // The earliest activation a ScheduleUpgrade proposed now may name: after its vote and
     // timelock, then room for a CancelUpgrade's vote and the lead.
-    let runs_at = r.h + cp.voting_blocks + cp.timelock_blocks;
+    let lag = cp.voting_blocks + cp.timelock_blocks;
+    let runs_at = r.h + lag;
     let v3 = crate::upgrade::next_version(&r.st);
     let at = runs_at + cp.voting_blocks + crate::upgrade::MIN_UPGRADE_LEAD + 2;
     assert_eq!((v3, runs_at, at), (3, 345_601, 604_867));
     let upgrade = r.propose(&vals[0], ProposalKind::ScheduleUpgrade { version: v3, activation_height: at }).unwrap();
-    let programs = r.propose(&vals[1], ProposalKind::ActivateFeature { feature: crate::upgrade::PROGRAMS_FEATURE.into() }).unwrap();
+    let programs = || ProposalKind::ActivateFeature { feature: crate::upgrade::PROGRAMS_FEATURE.into() };
+    assert_eq!(r.propose(&vals[1], programs()).unwrap_err().to_string(), PROGRAMS_REFUSAL, "it would run at block {runs_at}, under v2");
     for v in &vals {
         r.vote(v, upgrade).unwrap();
-        r.vote(v, programs).unwrap();
     }
     let seats: Vec<String> = r.p(upgrade).council.keys().cloned().collect();
     assert_eq!(seats, g.validators.iter().map(|v| v.address.clone()).collect::<Vec<_>>(), "each vote counts for its validator's council seat");
-    // The votes close at the end of day 3: passed by the council, deposits back.
+    // The vote closes at the end of day 3: passed by the council, the deposit back.
     let end = r.p(upgrade).voting_end;
     r.through(end);
-    for id in [upgrade, programs] {
-        assert_eq!(r.p(id).status, ProposalStatus::Queued, "#{id}: {}", r.p(id).outcome);
-        assert!(r.p(id).outcome.starts_with("passed by the bootstrap council"), "{}", r.p(id).outcome);
-    }
+    assert_eq!(r.p(upgrade).status, ProposalStatus::Queued, "{}", r.p(upgrade).outcome);
+    assert!(r.p(upgrade).outcome.starts_with("passed by the bootstrap council"), "{}", r.p(upgrade).outcome);
     assert!(r.st.account(&vals[0].address_with("boo")).balance > 99 * FANG, "the deposit is back");
-    // They run after the timelock: programs on, v3 scheduled.
+    // It runs after the timelock: v3 scheduled.
     r.through(runs_at);
-    for id in [upgrade, programs] {
-        assert_eq!(r.p(id).status, ProposalStatus::Executed, "#{id}: {}", r.p(id).outcome);
-    }
-    assert_eq!(r.st.upgrade.features.get(crate::upgrade::PROGRAMS_FEATURE), Some(&crate::upgrade::Feature { activated_at: runs_at }));
+    assert_eq!(r.p(upgrade).status, ProposalStatus::Executed, "{}", r.p(upgrade).outcome);
     assert_eq!(r.st.upgrade.schedule, [ScheduledUpgrade { version: 2, activation_height: 1 }, ScheduledUpgrade { version: v3, activation_height: at }]);
     // The upgrade lands: v3 from its height, which this binary doesn't run, so it stops before it.
     assert_eq!((crate::upgrade::version_at(&r.st, at - 1), crate::upgrade::version_at(&r.st, at)), (2, v3));
@@ -264,7 +263,20 @@ fn the_council_upgrades_and_switches_programs_on_from_block_1() {
     assert_eq!(crate::upgrade::check_next_with(&r.st, at - 1, halt.supported), Ok(()));
     assert_eq!(crate::upgrade::check_next_with(&r.st, at, halt.supported), Err(crate::upgrade::Halt::UpgradeRequired { height: at, version: v3, supported: 2 }));
     assert_eq!(crate::upgrade::check_next_with(&r.st, at, v3), Ok(()), "the next release runs it");
+    // Programs, proposed now (v3 is scheduled), run past v3's height: under v3, so they switch on.
+    let on_at = r.h + lag;
+    assert!(on_at > at);
+    let on = r.propose(&vals[1], programs()).unwrap();
+    for v in &vals {
+        r.vote(v, on).unwrap();
+    }
+    r.through(on_at);
+    assert_eq!(r.p(on).status, ProposalStatus::Executed, "{}", r.p(on).outcome);
+    assert_eq!((crate::upgrade::version_at(&r.st, on_at), r.st.upgrade.features.get(crate::upgrade::PROGRAMS_FEATURE)), (v3, Some(&crate::upgrade::Feature { activated_at: on_at })));
 }
+
+/// What `blockula-1` refuses a programs activation under v2 with (`upgrade::check_may_activate`).
+const PROGRAMS_REFUSAL: &str = "blockula-1 switches programs on by governance only from protocol v3: v2's program rules run there only if its genesis lists them";
 
 /// (b) The freeze the float exists for. Without it, every allocation to an account with a key
 /// vests (DEC-5): the founder's from a 12-month cliff, the operators' and the grants' from a
@@ -322,41 +334,78 @@ fn without_the_float_nobody_can_propose_or_vote_until_the_operators_cliff() {
     r.through(1);
 }
 
-/// Ghost Mode stays off on `blockula-1` by rule: it isn't audited, and the council could pass its
-/// activation as easily as the programs one. An `ActivateFeature { ghost }` is refused when it's
-/// proposed, and one that got there anyway (written into the state here) passes the council and
-/// fails when it runs. The same launch on a dry-run chain switches it on.
+/// What `blockula-1`'s council can't switch on, by rule (`upgrade::check_may_activate`): Ghost
+/// Mode, which isn't audited, and programs under v2, whose rules were fixed before their audit
+/// reported. Either activation is refused when it's proposed, and one that got there anyway
+/// (written into the state here) passes the council and fails when it runs. The same launch on a
+/// dry-run chain switches both on under v2.
 #[test]
-fn ghost_mode_stays_off_on_mainnet_whatever_the_council_votes() {
-    let ghost = || ProposalKind::ActivateFeature { feature: crate::ghost::FEATURE.into() };
-    let refusal = "blockula-1 doesn't switch ghost on: Ghost Mode isn't audited (a later protocol version lifts this once it is)";
+fn ghost_mode_and_v2_programs_stay_off_on_mainnet_whatever_the_council_votes() {
+    let ghost = "blockula-1 doesn't switch ghost on: Ghost Mode isn't audited (a later protocol version lifts this once it is)";
     let vals = council();
-    for chain in [MAIN, DRY_RUN] {
-        let mut r = Run::new(&launch(chain));
-        let id = if chain == MAIN {
-            let e = r.propose(&vals[0], ghost()).unwrap_err().to_string();
-            assert!(e.contains(refusal), "{e}");
-            // As if it had got past `Propose`: a text proposal that turns into the activation.
-            let id = r.propose(&vals[0], ProposalKind::Text {}).unwrap();
-            r.st.governance.proposals.get_mut(&id).unwrap().kind = ghost();
-            id
-        } else {
-            r.propose(&vals[0], ghost()).unwrap()
-        };
-        for v in &vals {
-            r.vote(v, id).unwrap();
-        }
-        let runs_at = r.p(id).voting_end + r.st.chain_params.timelock_blocks;
-        r.through(runs_at);
-        let p = r.p(id);
-        assert!(p.tally.as_ref().is_some_and(|t| t.council_ayes == 4), "{chain}: the council passed it: {}", p.outcome);
-        let on = crate::upgrade::is_active(&r.st, crate::ghost::FEATURE);
-        if chain == MAIN {
-            assert_eq!((p.status, p.outcome.as_str(), on), (ProposalStatus::Failed, format!("failed when it ran: {refusal}").as_str(), false));
-        } else {
-            assert_eq!((p.status, on), (ProposalStatus::Executed, true), "{}", p.outcome);
+    for (feature, refusal) in [(crate::ghost::FEATURE, ghost), (crate::upgrade::PROGRAMS_FEATURE, PROGRAMS_REFUSAL)] {
+        let activate = || ProposalKind::ActivateFeature { feature: feature.into() };
+        for chain in [MAIN, DRY_RUN] {
+            let mut r = Run::new(&launch(chain));
+            let id = if chain == MAIN {
+                let e = r.propose(&vals[0], activate()).unwrap_err().to_string();
+                assert_eq!(e, refusal);
+                // As if it had got past `Propose`: a text proposal that turns into the activation.
+                let id = r.propose(&vals[0], ProposalKind::Text {}).unwrap();
+                r.st.governance.proposals.get_mut(&id).unwrap().kind = activate();
+                id
+            } else {
+                r.propose(&vals[0], activate()).unwrap()
+            };
+            for v in &vals {
+                r.vote(v, id).unwrap();
+            }
+            let runs_at = r.p(id).voting_end + r.st.chain_params.timelock_blocks;
+            r.through(runs_at);
+            let p = r.p(id);
+            assert!(p.tally.as_ref().is_some_and(|t| t.council_ayes == 4), "{chain} {feature}: the council passed it: {}", p.outcome);
+            let on = crate::upgrade::is_active(&r.st, feature);
+            if chain == MAIN {
+                assert_eq!((p.status, p.outcome.as_str(), on), (ProposalStatus::Failed, format!("failed when it ran: {refusal}").as_str(), false));
+            } else {
+                assert_eq!((p.status, on), (ProposalStatus::Executed, true), "{feature}: {}", p.outcome);
+            }
         }
     }
+}
+
+/// A programs activation on `blockula-1` is checked when it's proposed against the version in
+/// force at the earliest block it can run in: with v3 scheduled at `at`, refused while it would
+/// run before `at`, accepted from the block whose proposals run at `at`. It's checked again when
+/// it runs, so if v3 is withdrawn before then, it fails there and programs stay off.
+#[test]
+fn on_mainnet_programs_may_be_proposed_to_run_after_a_scheduled_v3() {
+    let mut r = Run::new(&launch(MAIN));
+    let vals = council();
+    let lag = r.st.chain_params.voting_blocks + r.st.chain_params.timelock_blocks;
+    // v3 at `at`, as a passed `ScheduleUpgrade` would schedule it (written into the state here).
+    let at = r.h + lag + 10;
+    r.st.upgrade.schedule.push(ScheduledUpgrade { version: 3, activation_height: at });
+    let programs = || ProposalKind::ActivateFeature { feature: crate::upgrade::PROGRAMS_FEATURE.into() };
+    assert_eq!(r.propose(&vals[0], programs()).unwrap_err().to_string(), PROGRAMS_REFUSAL, "it would run at block {}, under v2", r.h + lag);
+    r.through(at - lag - 2);
+    assert!(r.propose(&vals[0], programs()).is_err(), "it would run at block {}", at - 1);
+    r.through(at - lag - 1);
+    let id = r.propose(&vals[0], programs()).unwrap();
+    for v in &vals {
+        r.vote(v, id).unwrap();
+    }
+    assert_eq!(r.p(id).voting_end + r.st.chain_params.timelock_blocks, at, "it runs at v3's height");
+    // v3 withdrawn (as a CancelUpgrade would) before the activation runs: it fails, and programs
+    // stay off. Not withdrawn: programs switch on at `at`, under v3.
+    let mut withdrawn = Run { st: r.st.clone(), chain: MAIN.into(), h: r.h, tx_bytes: 0 };
+    withdrawn.st.upgrade.schedule.pop();
+    withdrawn.through(at);
+    let p = withdrawn.p(id);
+    assert_eq!((p.status, p.outcome.as_str(), crate::upgrade::is_active(&withdrawn.st, crate::upgrade::PROGRAMS_FEATURE)), (ProposalStatus::Failed, format!("failed when it ran: {PROGRAMS_REFUSAL}").as_str(), false));
+    r.through(at);
+    assert_eq!(r.p(id).status, ProposalStatus::Executed, "{}", r.p(id).outcome);
+    assert_eq!(r.st.upgrade.features.get(crate::upgrade::PROGRAMS_FEATURE), Some(&crate::upgrade::Feature { activated_at: at }));
 }
 
 /// (c) Waivers: each names a waivable rule once, with a one-line reason, and waives every finding
@@ -421,27 +470,30 @@ fn toml_of_head(s: &Spec) -> String {
 }
 
 /// (d) `protocol_version`: `blockula-1` is born at v2 (scheduled from block 1), with programs off,
-/// or on when the spec lists them; or at v1 with no schedule. Programs need v2 in force at block
-/// 1, Ghost Mode stays refused, and no other version is a public network's to start at: not a
-/// preview, not one this binary doesn't know.
+/// or at v1 with no schedule. This release refuses programs in its genesis (it doesn't carry them,
+/// and `blockula-1`'s governance switches them on from v3), and Ghost Mode always. Elsewhere
+/// programs may be on from genesis when v2 is in force at block 1. No other version is a public
+/// network's to start at: not a preview, not one this binary doesn't know.
 #[test]
-fn mainnet_is_born_at_v2_with_programs_off_or_on() {
+fn mainnet_is_born_at_v2_with_programs_off() {
     let ops = founder_seats(MAIN);
     let g = launch(MAIN);
     assert_eq!((g.upgrades.clone(), crate::upgrade::supported_version(&g)), (vec![ScheduledUpgrade { version: 2, activation_height: 1 }], 2));
     let st = g.initial_state();
     assert_eq!((crate::upgrade::version_at(&st, 0), crate::upgrade::version_at(&st, 1)), (1, 2), "the genesis block keeps v1; block 1 on run v2");
     assert!(!crate::upgrade::is_active(&st, crate::upgrade::PROGRAMS_FEATURE));
-    // Programs on from genesis (an audit came back clean).
-    let on = build_from(&programs_on(MAIN), &ops, false).unwrap();
+    // Not with programs on.
+    assert!(refused(&programs_on(MAIN), &ops).contains(PROGRAMS_OFF));
+    // A dry run may start with them, and needs v2 from block 1 for it.
+    let dry = founder_seats(DRY_RUN);
+    let on = build_from(&programs_on(DRY_RUN), &dry, false).unwrap();
     assert_eq!(on.genesis.features, ["programs"]);
     let st = on.genesis.initial_state();
     st.check_invariants().unwrap();
     assert_eq!(st.upgrade.features.get(crate::upgrade::PROGRAMS_FEATURE), Some(&crate::upgrade::Feature { activated_at: 0 }));
-    // Not without v2 from block 1.
-    let mut v1 = programs_on(MAIN);
+    let mut v1 = programs_on(DRY_RUN);
     v1.protocol_version = None;
-    assert!(refused(&v1, &ops).contains("unknown feature programs (known: ghost): block 1 runs v1"));
+    assert!(refused(&v1, &dry).contains("unknown feature programs (known: ghost): block 1 runs v1"));
     // Ghost Mode, never.
     let mut ghost = spec(MAIN, Some(100), "");
     ghost.features = vec!["ghost".into()];
@@ -460,6 +512,9 @@ fn mainnet_is_born_at_v2_with_programs_off_or_on() {
         assert!(refused(&s, &ops).contains(&format!("protocol_version {v}: a public network starts at a released version, v1–v2")), "v{v}");
     }
 }
+
+/// What `Genesis::check` says to a `blockula-1` genesis that lists programs.
+const PROGRAMS_OFF: &str = "blockula-1 starts with programs off: this release doesn't carry them, and governance switches them on from protocol v3";
 
 /// The launch spec with `features = ["programs"]`.
 fn programs_on(chain: &str) -> Spec {
@@ -640,7 +695,8 @@ fn only_the_floats_are_liquid_on_mainnet() {
 
 /// What `Genesis::check` refuses on `blockula-1`, so `Chain::open` (and `blockula validator init`
 /// and `join`, which load the genesis the same way) for a genesis edited by hand after the
-/// builder: any schedule but v2 from block 1, and programs on from genesis unless block 1 runs v2.
+/// builder: any schedule but v2 from block 1, and programs on from genesis (unknown when block 1
+/// runs v1, and refused by this release when it runs v2).
 #[test]
 fn a_hand_edited_mainnet_genesis_is_refused() {
     let g = launch(MAIN);
@@ -652,7 +708,8 @@ fn a_hand_edited_mainnet_genesis_is_refused() {
     }
     let e = format!("{:#}", Genesis { upgrades: vec![], features: vec![crate::upgrade::PROGRAMS_FEATURE.into()], ..g.clone() }.check().unwrap_err());
     assert_eq!(e, "unknown feature programs (known: ghost): block 1 runs v1");
-    Genesis { features: vec![crate::upgrade::PROGRAMS_FEATURE.into()], ..g.clone() }.check().unwrap();
+    let e = format!("{:#}", Genesis { features: vec![crate::upgrade::PROGRAMS_FEATURE.into()], ..g.clone() }.check().unwrap_err());
+    assert_eq!(e, PROGRAMS_OFF);
     // A node won't open on one.
     let home = std::env::temp_dir().join(format!("blockula-mainnet-bad-schedule-{}-{}", crate::chain::now_ms(), std::process::id()));
     std::fs::create_dir_all(&home).unwrap();
@@ -684,10 +741,11 @@ fn signed(c: &Chain, k: &Keys, action: Action) -> Tx {
 /// (a) through a node. The council's members sign `Propose` and `Vote` from their consensus-key
 /// accounts with their real keys; the node checks the signatures, admits the txs to its mempool
 /// and runs them in blocks (`Chain::execute`, `State::run_block`), each vote taking its
-/// validator's council seat, and a rebuild from the block logs replays them to the same state. A
-/// Ghost Mode activation is refused at admission, and one that reached execution anyway (written
-/// into the state here, as if it had got past `Propose`) fails in the block that runs it: the node
-/// hands governance `blockula-1`'s chain id. The two proposals then pass and run as in (a).
+/// validator's council seat, and a rebuild from the block logs replays them to the same state.
+/// Activations of Ghost Mode and of programs (under v2) are refused at admission, and a Ghost Mode
+/// one that reached execution anyway (written into the state here, as if it had got past
+/// `Propose`) fails in the block that runs it: the node hands governance `blockula-1`'s chain id.
+/// The two proposals (the upgrade and a text one) then pass and run as in (a).
 #[test]
 fn the_council_proposes_and_votes_through_a_node() {
     let g = launch(MAIN);
@@ -698,19 +756,21 @@ fn the_council_proposes_and_votes_through_a_node() {
     let refusal = "blockula-1 doesn't switch ghost on: Ghost Mode isn't audited (a later protocol version lifts this once it is)";
     let e = c.submit(signed(&c, &vals[0], propose(ghost()))).unwrap_err().to_string();
     assert!(e.contains(refusal), "{e}");
+    let e = c.submit(signed(&c, &vals[1], propose(ProposalKind::ActivateFeature { feature: crate::upgrade::PROGRAMS_FEATURE.into() }))).unwrap_err().to_string();
+    assert!(e.contains(PROGRAMS_REFUSAL), "{e}");
     assert!(c.mempool.is_empty());
-    // Block 1: the next version and programs, proposed by two members.
+    // Block 1: the next version and a text proposal, proposed by two members.
     let cp = c.state.chain_params.clone();
     let runs_at = 1 + cp.voting_blocks + cp.timelock_blocks;
     let (v3, at) = (crate::upgrade::next_version(&c.state), runs_at + cp.voting_blocks + crate::upgrade::MIN_UPGRADE_LEAD + 2);
     c.submit(signed(&c, &vals[0], propose(ProposalKind::ScheduleUpgrade { version: v3, activation_height: at }))).unwrap();
-    c.submit(signed(&c, &vals[1], propose(ProposalKind::ActivateFeature { feature: crate::upgrade::PROGRAMS_FEATURE.into() }))).unwrap();
+    c.submit(signed(&c, &vals[1], propose(ProposalKind::Text {}))).unwrap();
     c.produce_block().unwrap();
     assert_eq!((c.block(1).unwrap().version, c.block(1).unwrap().txs.len()), (2, 2), "block 1 runs v2 and carries both");
-    let (upgrade, programs) = (0, 1);
+    let (upgrade, text) = (0, 1);
     // Block 2: every member votes on both, from its own account.
     for v in &vals {
-        for id in [upgrade, programs] {
+        for id in [upgrade, text] {
             let digest = crate::governance::digest_of(&c.state.governance.proposals[&id]);
             c.submit(signed(&c, v, Action::Vote { proposal_id: id, aye: true, amount: FANG, conviction: 0, proposal_digest: digest })).unwrap();
         }
@@ -718,7 +778,7 @@ fn the_council_proposes_and_votes_through_a_node() {
     c.produce_block().unwrap();
     let block = c.block(2).unwrap();
     assert!(block.txs.len() == 8 && block.txs.iter().all(|t| c.failure(&t.id()).is_none()));
-    for id in [upgrade, programs] {
+    for id in [upgrade, text] {
         let seats: Vec<(String, String)> = c.state.governance.proposals[&id].council.iter().map(|(v, cv)| (v.clone(), cv.voter.clone())).collect();
         assert_eq!(seats, g.validators.iter().map(|v| (v.address.clone(), v.address.clone())).collect::<Vec<_>>(), "each member's own seat, cast from its consensus-key account");
     }
@@ -742,10 +802,9 @@ fn the_council_proposes_and_votes_through_a_node() {
     // The two proposals pass and run, the node's state carried on block by block.
     let mut r = Run { st: c.state.clone(), chain: MAIN.into(), h: c.height() + 1, tx_bytes: 0 };
     r.through(runs_at);
-    for id in [upgrade, programs] {
+    for id in [upgrade, text] {
         assert_eq!(r.p(id).status, ProposalStatus::Executed, "#{id}: {}", r.p(id).outcome);
     }
-    assert!(crate::upgrade::is_active(&r.st, crate::upgrade::PROGRAMS_FEATURE));
     assert_eq!(r.st.upgrade.schedule, [ScheduledUpgrade { version: 2, activation_height: 1 }, ScheduledUpgrade { version: v3, activation_height: at }]);
     drop(c);
     std::fs::remove_dir_all(home).ok();

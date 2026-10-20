@@ -165,7 +165,8 @@ pub struct Spec {
     /// version (at most `consensus::SUPPORTED_PROTOCOL_VERSION`, never a preview) is scheduled
     /// from block 1 (`Genesis::upgrades`); `blockula-1` is born at
     /// `upgrade::MAINNET_GENESIS_VERSION`. Features that version brings (`programs` from v2) may
-    /// then be on from genesis.
+    /// then be on from genesis, except on `blockula-1` with this release (`Genesis::check`: its
+    /// governance switches programs on from v3).
     #[serde(default)]
     pub protocol_version: Option<u32>,
     /// FANG ("100") each genesis validator's consensus-key account gets, liquid, out of the

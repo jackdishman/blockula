@@ -513,7 +513,7 @@ impl Genesis {
         crate::upgrade::check_genesis_upgrades(&self.upgrades, &self.chain_id)?;
         // The genesis block executes nothing: features on from genesis are first used in block 1,
         // so that block's version must know them (a chain born at v2 from block 1 may start with
-        // programs on; one that starts at v1 may not).
+        // programs on, but not `blockula-1` on this release, below; one that starts at v1 may not).
         let first = crate::upgrade::version_in(&self.upgrades, 1);
         let mut features = BTreeSet::new();
         for f in &self.features {
@@ -528,6 +528,12 @@ impl Genesis {
             // DEC-2: Ghost Mode ships disabled, and stays off until it's audited: governance can't
             // switch it on here either (`upgrade::check_may_activate`).
             ensure!(!self.features.iter().any(|f| f == crate::ghost::FEATURE), "{MAINNET_CHAIN_ID} starts with Ghost Mode off: it isn't audited");
+            // And with programs off: this release knows the feature's name, not its rules, so it
+            // would start such a chain without the program state a release that runs them builds
+            // from the same genesis (two genesis states), and governance switches them on here
+            // only from v3 (`upgrade::check_may_activate`). The release that ships programs v0
+            // lifts this; a genesis without them is the same either way.
+            ensure!(!self.features.iter().any(|f| f == crate::upgrade::PROGRAMS_FEATURE), "{MAINNET_CHAIN_ID} starts with programs off: this release doesn't carry them, and governance switches them on from protocol v{}", crate::upgrade::MAINNET_PROGRAMS_ACTIVATION_VERSION);
             // Governance's own safety parameters start where a vote could take them at most.
             cp.check_governance_floors(&params).context(MAINNET_CHAIN_ID)?;
         }

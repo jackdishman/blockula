@@ -114,6 +114,16 @@ pub const MAINNET_GENESIS_VERSION: u32 = 2;
 // Every binary runs the version mainnet is born at.
 const _: () = assert!(MAINNET_GENESIS_VERSION <= SUPPORTED_PROTOCOL_VERSION);
 
+/// The protocol version from which `blockula-1`'s governance may switch programs on
+/// ([`check_may_activate`]). v2's program rules are fixed in the binary `blockula-1` is born on,
+/// before their audit reports, so a council vote mustn't switch them on there; the audit's fixes
+/// ship as v3, and the version in force is then the chain's record that the rules it runs were
+/// cleared. Like [`MAINNET_GENESIS_VERSION`], a constant every later binary keeps: one that raised
+/// it would split the chain from nodes on an older binary at the first activation.
+pub const MAINNET_PROGRAMS_ACTIVATION_VERSION: u32 = 3;
+// Above the version mainnet is born at, whose program rules its governance never switches on.
+const _: () = assert!(MAINNET_PROGRAMS_ACTIVATION_VERSION > MAINNET_GENESIS_VERSION);
+
 /// The protocol version this binary runs only on chains whose genesis schedules it (`upgrades`:
 /// dev and test chains): v3, while its rules land behind version gates. Every other chain gets
 /// [`SUPPORTED_PROTOCOL_VERSION`] until the release that ships v3 (docs/PROGRAMS-PLAN.md
@@ -464,25 +474,44 @@ pub fn check_known_feature(feature: &str, version: u32) -> Result<()> {
     Ok(())
 }
 
-/// Whether chain `chain_id` lets governance switch `feature` on at all: every feature but Ghost
-/// Mode on `blockula-1`. Ghost Mode is NOT AUDITED (docs/GHOST-MODE.md) and outside the protocol
-/// audit's scope (docs/AUDIT_SCOPE.md), and the bootstrap council (the genesis set, most of it
-/// run by the founder) may pass an `ActivateFeature` on its own from block 1, so a rule keeps it
-/// off rather than a promise. Its genesis can't list it either (`Genesis::check`). A later
-/// protocol version lifts this once Ghost Mode is audited (the rule then reads the version in
-/// force, [`version_at`]). Testnets and dev chains switch it as before.
-pub fn check_may_activate(feature: &str, chain_id: &str) -> Result<()> {
-    if chain_id == crate::chain::MAINNET_CHAIN_ID && feature == crate::ghost::FEATURE {
+/// Whether chain `chain_id` lets governance switch `feature` on where protocol `version` is in
+/// force. Every chain lets it, but `blockula-1`, where the bootstrap council (the genesis set,
+/// most of it run by the founder) may pass an `ActivateFeature` on its own from block 1, so a rule
+/// keeps these off rather than a promise:
+/// - Ghost Mode, at every version. It is NOT AUDITED (docs/GHOST-MODE.md) and outside the protocol
+///   audit's scope (docs/AUDIT_SCOPE.md). Its genesis can't list it either (`Genesis::check`).
+/// - Programs below [`MAINNET_PROGRAMS_ACTIVATION_VERSION`]: a first activation and one after a
+///   `DeactivateFeature` alike. Its genesis can't list them on this release either.
+///
+/// Testnets, dry runs and dev chains switch both as before (programs from v2).
+///
+/// `version` is where the activation runs: at `Propose` the version in force at the earliest
+/// block it can run in (`governance::prepare_kind`: one may be proposed to run after a scheduled
+/// v3), and the version at the block it runs in when it executes. So `Propose` reads these
+/// answers for a version that isn't in force yet, in blocks every node runs under the old rules:
+/// they're fixed for every version by the first binary that runs `blockula-1` (this one), and a
+/// later version that changes one (lifting Ghost Mode's once it's audited) must key the change on
+/// the version in force at the block that runs the proposal, as `known_features` is read, or nodes
+/// still on an older binary would reach another outcome before it activates.
+pub fn check_may_activate(feature: &str, chain_id: &str, version: u32) -> Result<()> {
+    if chain_id != crate::chain::MAINNET_CHAIN_ID {
+        return Ok(());
+    }
+    if feature == crate::ghost::FEATURE {
         bail!("{chain_id} doesn't switch {feature} on: Ghost Mode isn't audited (a later protocol version lifts this once it is)");
+    }
+    if feature == PROGRAMS_FEATURE && version < MAINNET_PROGRAMS_ACTIVATION_VERSION {
+        bail!("{chain_id} switches programs on by governance only from protocol v{MAINNET_PROGRAMS_ACTIVATION_VERSION}: v{PROGRAMS_VERSION}'s program rules run there only if its genesis lists them");
     }
     Ok(())
 }
 
 /// Switches a feature on that the version in force at `height` knows, on a chain that lets it
-/// ([`check_may_activate`]).
+/// under that version ([`check_may_activate`]).
 pub(crate) fn exec_activate_feature(state: &mut State, j: &mut Journal, chain_id: &str, feature: &str, height: u64) -> Result<()> {
-    check_known_feature(feature, version_at(state, height))?;
-    check_may_activate(feature, chain_id)?;
+    let version = version_at(state, height);
+    check_known_feature(feature, version)?;
+    check_may_activate(feature, chain_id, version)?;
     if is_active(state, feature) {
         bail!("{feature} is already on");
     }
@@ -803,17 +832,20 @@ mod tests {
         check_invariants(&st).unwrap();
     }
 
-    /// Ghost Mode stays off on `blockula-1` by rule (it isn't audited): an activation that runs
-    /// there fails, whatever the vote, and nothing turns on. Programs switch on there as anywhere,
-    /// and Ghost Mode on every other chain.
+    /// Ghost Mode stays off on `blockula-1` by rule (it isn't audited), at every version: an
+    /// activation that runs there fails, whatever the vote, and nothing turns on. Every other chain
+    /// switches it on.
     #[test]
     fn mainnet_never_switches_ghost_mode_on() {
         let main = crate::chain::MAINNET_CHAIN_ID;
         let ghost = crate::ghost::FEATURE;
-        let e = check_may_activate(ghost, main).unwrap_err().to_string();
+        let e = check_may_activate(ghost, main, MAINNET_GENESIS_VERSION).unwrap_err().to_string();
         assert_eq!(e, "blockula-1 doesn't switch ghost on: Ghost Mode isn't audited (a later protocol version lifts this once it is)");
-        for (feature, chain) in [(PROGRAMS_FEATURE, main), (ghost, "blockula-testnet-2"), (ghost, "dev")] {
-            check_may_activate(feature, chain).unwrap();
+        for v in [PROTOCOL_VERSION, MAINNET_PROGRAMS_ACTIVATION_VERSION, PREVIEW_PROTOCOL_VERSION + 1] {
+            assert_eq!(check_may_activate(ghost, main, v).unwrap_err().to_string(), e, "v{v}");
+        }
+        for chain in ["blockula-testnet-2", "dev"] {
+            check_may_activate(ghost, chain, PROTOCOL_VERSION).unwrap();
         }
         let mut st = State::default();
         let mut j = Journal::default();
@@ -821,6 +853,41 @@ mod tests {
         assert!(!is_active(&st, ghost));
         exec_activate_feature(&mut st, &mut j, "blockula-testnet-2", ghost, 5).unwrap();
         assert!(is_active(&st, ghost));
+    }
+
+    /// `blockula-1` switches programs on by governance only from v3
+    /// (`MAINNET_PROGRAMS_ACTIVATION_VERSION`): under v2 an activation fails, a first one and one
+    /// after a `DeactivateFeature` (exit-only) alike, and from v3 on it runs. Execution reads the
+    /// version in force at the block it runs in. Every other chain switches programs on under v2.
+    #[test]
+    fn mainnet_switches_programs_on_by_governance_only_from_v3() {
+        let main = crate::chain::MAINNET_CHAIN_ID;
+        assert_eq!((MAINNET_GENESIS_VERSION, MAINNET_PROGRAMS_ACTIVATION_VERSION), (2, 3));
+        let e = check_may_activate(PROGRAMS_FEATURE, main, MAINNET_GENESIS_VERSION).unwrap_err().to_string();
+        assert_eq!(e, "blockula-1 switches programs on by governance only from protocol v3: v2's program rules run there only if its genesis lists them");
+        for v in [MAINNET_PROGRAMS_ACTIVATION_VERSION, PREVIEW_PROTOCOL_VERSION + 1] {
+            check_may_activate(PROGRAMS_FEATURE, main, v).unwrap();
+        }
+        for chain in ["blockula-testnet-2", "blockula-dryrun-1", "dev"] {
+            check_may_activate(PROGRAMS_FEATURE, chain, PROGRAMS_VERSION).unwrap();
+        }
+        // Born at v2, with v3 from block 100: refused at 99, on at 100.
+        let mut st = State::default();
+        let mut j = Journal::default();
+        let at = |version, activation_height| ScheduledUpgrade { version, activation_height };
+        st.upgrade.schedule = vec![at(2, 1), at(3, 100)];
+        assert_eq!(exec_activate_feature(&mut st, &mut j, main, PROGRAMS_FEATURE, 99).unwrap_err().to_string(), e);
+        assert!(!is_active(&st, PROGRAMS_FEATURE));
+        exec_activate_feature(&mut st, &mut j, main, PROGRAMS_FEATURE, 100).unwrap();
+        assert_eq!(st.upgrade.features.get(PROGRAMS_FEATURE), Some(&Feature { activated_at: 100 }));
+        // Switched off (exit-only), then back on where v2 is in force (a schedule without v3
+        // here): refused the same way. A dry run switches them on under v2.
+        exec_deactivate_feature(&mut st, &mut j, PROGRAMS_FEATURE).unwrap();
+        st.upgrade.schedule = vec![at(2, 1)];
+        assert_eq!(exec_activate_feature(&mut st, &mut j, main, PROGRAMS_FEATURE, 150).unwrap_err().to_string(), e);
+        assert!(!is_active(&st, PROGRAMS_FEATURE));
+        exec_activate_feature(&mut st, &mut j, "blockula-dryrun-1", PROGRAMS_FEATURE, 150).unwrap();
+        assert!(is_active(&st, PROGRAMS_FEATURE));
     }
 
     /// An upgrade activates at least `MIN_UPGRADE_LEAD` blocks out: that's what lets a verifier
