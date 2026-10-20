@@ -51,7 +51,8 @@ as v0.5.2's (`397061c`).
   reviewing every consensus PR. With no external audit there's no audit queue to wait for.
 - **Testnet history is safe.** testnet-2's public node keeps 14 days of blocks (`/api/status`
   `pruning.keep_blocks` = 1,209,600; validators keep ~2 days), so its history from genesis would
-  have started disappearing around 2026-11-01. P0 archives it, from block 1, and runs daily.
+  have started disappearing around 2026-11-01. P0 archives it, from block 1, and runs daily, and
+  P2's nightly replay keeps a copy CI reads ([REPLAY.md](REPLAY.md)).
 
 ---
 
@@ -176,9 +177,9 @@ phase too, because they don't depend on the engine.
 
 | PR | What | Where | Done when |
 |---|---|---|---|
-| **P0** ✅ | Archive testnet-2's history | [`scripts/archive-chain.mjs`](../scripts/archive-chain.mjs). It pages `/api/sync` and keeps each batch as served, with its certificate, after checking every block's height. Running since 2026-10-19 into `~/.blockula/archive/blockula-testnet-2/` (on the maintainer's Mac, outside Fly), daily at 09:20 through the launchd job `com.blockula.archive-chain`. **Open for P2:** CI needs the archive too. Either the public node becomes an archive node (`RPC_ARCHIVE=1`, a bigger volume, one redeploy), or the closed segments are uploaded somewhere CI can read | Done: heights 1–99,093 on the first run, and new ones added daily. The script is committed with P1 |
+| **P0** ✅ | Archive testnet-2's history | [`scripts/archive-chain.mjs`](../scripts/archive-chain.mjs). It pages `/api/sync` and keeps each batch as served, with its certificate, after checking every block's height. Running since 2026-10-19 into `~/.blockula/archive/blockula-testnet-2/` (on the maintainer's Mac, outside Fly), daily at 09:20 through the launchd job `com.blockula.archive-chain`. **CI's copy (P2):** the closed segments are staged on GitHub's container registry, the cheaper of the two options (an archive node's volume and nightly downloads grow without end). The nightly replay builds that copy itself from the public node with this script, so the launchd job is unchanged and the Mac's copy stays the backup ([REPLAY.md](REPLAY.md)) | Done: heights 1–99,093 on the first run, and new ones added daily. The script is committed with P1 |
 | **P1** | Land the design | `docs/PROGRAMS.md` revision 3: section 2's corrections, re-cited lines, the decisions recorded. MAINNET-DESIGN gets a section 7 that points to it, plus tags 62–70 and namespaces 66–73 (74–79 reserved) in its registries. This plan becomes `docs/PROGRAMS-PLAN.md`. The "contracts" wording is renamed: EXPLORER.md, the `web/lib/explorer/programs.ts` header, the `/programs` page's "Your contract here", the glossary, AGENTS.md/CLAUDE.md line 108, PLAN.md | Merged. No code |
-| **P2** | The v1 replay gate | **Per PR:** a recorded local history using every tag from 0 to 61 (a few thousand blocks), replayed by the PR's binary and compared root by root and outcome by outcome. **Nightly:** P0's testnet-2 archive, replayed from genesis | Green on main, and a deliberately divergent change fails it |
+| **P2** ✅ | The v1 replay gate | [REPLAY.md](REPLAY.md). `blockula replay` runs an archive through the node's own paths: sync (`node::verify_batch_trusted`: certificates and the embedded checkpoints; then `node::execute_batch`, each block after `consensus::verify`'s own checks that need no round or clock: version, spacing, leader, cited root, txs), a block-by-block comparison with the recording (outcomes, roots, whole records), and startup (`Chain::replay`). **Per PR:** two recorded chains in `node/testdata/replay` (about 2,200 blocks) using every tag a block can carry (0–54, 60–61), recorded deterministically by `node/src/replay/corpus.rs`; the v0.5.2 source replays them identically. **Nightly** (`replay.yml`): testnet-2 from genesis, from the staged copy (P0) | Done: green on main; test-only divergences (an ungated admission rule, an ungated handler change, a state-only change, with and without a recording) fail it at the block they start, on both paths, and so do a block `verify` refuses and a real divergence (`MIN_NEW_ACCOUNT` raised) |
 | **P3** | One executor thread | `consensus.rs`, `node.rs`. These paths move to one thread with a 64 MiB stack, fed by a channel: `verify`'s pass, proposal packing, finalized execution (`Executor::report`), sync, and startup replay. The API gets a pool with the same stack size. The node refuses to start without them | The simulator suite is green, and no execution path runs on a stack sized by the host |
 | **P4** | A replay cache | `consensus.rs`: post-states of verified and proposed blocks, keyed by digest, at most `MAX_REPLAY` | Each block's txs run once in verification, however many descendants are verified. A simulator scenario with forks and view changes |
 | **P5** | Packing off the chain lock | `consensus.rs` (`propose`) | HTTP submits and finalization never wait out a proposal's execution |
@@ -406,7 +407,7 @@ PRs and one approver.
 | Risk | Mitigation |
 |---|---|
 | One reviewer for about 30 consensus PRs | The size rule, the "inert below v2" section, `/code-review` first, and milestone demos so behavior can be reviewed as well as diffs |
-| Lost v1 history leaves the replay gate partial | P0 (done). The archive lives on one Mac until P2 gives CI a copy |
+| Lost v1 history leaves the replay gate partial | P0 (done), and P2's nightly keeps a second copy, staged on GitHub's container registry and replayed before it's staged |
 | Calibration hardware isn't representative | N3, then re-measure on O1's testnet machines |
 | The audit shares the author's blind spots | A different model (Fable), adversarial briefs, a test required before any finding counts, and independent evidence (fuzzing, differentials, C19). The training wheels and the bug bounty stay (9.1) |
 | An engine bug no review caught | soroban-wasmi by default (section 3). The engine-neutral ABI (C2) keeps a swap inside `engine.rs`. An exact pin and a watch on advisories |

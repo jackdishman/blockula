@@ -51,6 +51,14 @@ jobs:
         with: { node-version: 22, cache: npm }
       - run: npm ci
       - run: cargo test --release --locked --manifest-path node/Cargo.toml
+      # The v1 replay gate (docs/REPLAY.md): this PR's binary replays the recorded v1 history in
+      # node/testdata/replay through sync and startup, block by block (every certificate, cited
+      # state root, tx outcome, block state root and record). `cargo test` above ran the same
+      # corpus in the test build, and showed a binary that diverges from it fails.
+      - name: v1 replay gate (the recorded corpus)
+        run: |
+          cargo build --release --locked --manifest-path node/Cargo.toml
+          for archive in node/testdata/replay/v1-*; do node/target/release/blockula replay "$archive"; done
       # Hybrid X25519 + ML-KEM-768 p2p handshake (vendored commonware-stream, docs/PQ-TRANSPORT.md).
       - run: cargo test --release --locked --manifest-path node/Cargo.toml -p commonware-stream
       - run: bash node/vendor/commonware-stream/verify-vendor.sh
@@ -174,6 +182,9 @@ jobs:
       - run: npm ci --ignore-scripts
       - name: Release signature tool (known-answer vector, tamper checks)
         run: node scripts/release-sig.mjs selftest
+      # The nightly replay's staged archive (replay.yml): what it stages and refuses, offline.
+      - name: Archive staging (scripts/stage-archive.sh against a stand-in oras)
+        run: bash scripts/test-stage-archive.sh
       - name: install.sh verification policy (offline fake release)
         run: bash scripts/test-install.sh
       # What the release signer checks before signing: install.sh, genesis and checkpoint files

@@ -7,7 +7,7 @@ use crate::params::ChainParams;
 use crate::state::codec::SCHEMA_VERSION;
 use crate::state::tree::{Child, Hash, Node, NodeKey, NodeStore, Smt};
 use crate::state::{JMap, RecordChange, TMap};
-use crate::store::{self, hash32, BlockMeta, CommitPoint, Framing, Layout, Pos, SegLog, Snap, Store};
+use crate::store::{self, hash32, BlockMeta, CommitPoint, Pos, SegLog, Snap, Store};
 use crate::types::*;
 use crate::view::{Disk, Live, MempoolView, ReadView};
 use anyhow::{anyhow, bail, ensure, Context, Result};
@@ -1003,6 +1003,14 @@ impl State {
         crate::ghost::end_block(self, b);
         if self.params.is_boundary(b.height) {
             let epoch = self.params.epoch_of(b.height);
+            #[cfg(test)]
+            if crate::replay::diverge::on(crate::replay::diverge::Divergence::EndOfEpoch) {
+                let (community, treasury) = (community(self.params.prefix()), treasury(self.params.prefix()));
+                let mut j = Journal::default();
+                if self.j_debit(&mut j, &community, 1).is_ok() {
+                    self.j_credit(&mut j, &treasury, 1);
+                }
+            }
             crate::beacon::end_epoch(self, epoch);
             crate::econ::issue(self, epoch);
             crate::staking::end_epoch(self, epoch);
@@ -1223,6 +1231,10 @@ impl State {
         if tx.memo == crate::upgrade::test_gate::MEMO && crate::upgrade::version_at(self, height) >= crate::upgrade::PREVIEW_PROTOCOL_VERSION {
             bail!("refused from protocol v{} on (the test gate)", crate::upgrade::PREVIEW_PROTOCOL_VERSION);
         }
+        #[cfg(test)]
+        if crate::replay::diverge::on(crate::replay::diverge::Divergence::Admission) && !tx.memo.is_empty() {
+            bail!("memos are refused (a test binary that diverges from v1)");
+        }
         let sender = tx.sender()?;
         let signer = tx.signer_key_id()?;
         let keys = self.keys_of(&sender);
@@ -1411,6 +1423,10 @@ impl State {
                 let to = self.resolve(to)?;
                 if !self.accounts.contains_key(&to) && *amount < MIN_NEW_ACCOUNT {
                     bail!("sending to a new account needs at least {}", fmt_fang(MIN_NEW_ACCOUNT));
+                }
+                #[cfg(test)]
+                if crate::replay::diverge::on(crate::replay::diverge::Divergence::Handler) && !self.accounts.contains_key(&to) {
+                    bail!("transfers can't open accounts (a test binary that diverges from v1)");
                 }
                 if let KeyRole::Session { .. } = key.role {
                     let mut keys = self.account(&sender).keys;
@@ -1912,6 +1928,9 @@ pub const FAUCET_MAX_PENDING: usize = 32;
 pub const PRUNE_DAYS: u64 = 2;
 /// A rebuild (or a replay after a crash) syncs the store at least this often.
 const REPLAY_SYNC_EVERY: u64 = 1_000;
+/// A scratch home ([`Chain::set_scratch`]) commits durably this often: the store keeps every
+/// commit since the last durable one in memory.
+const SCRATCH_SYNC_EVERY: u64 = 10_000;
 
 /// The fewest heights a pruning node keeps: every kept snapshot's manifest (checkpoint +
 /// certifying blocks; the long-lived ones go back up to two `snapshot::long_interval`s), the
@@ -2007,6 +2026,8 @@ pub struct Chain {
     claims: HashMap<String, u64>,
     /// Set while a snapshot is being written, so slow disks can't pile up writer threads.
     snapshot_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// A scratch home's chain ([`Chain::set_scratch`]): it takes no state snapshots.
+    scratch: bool,
     /// What readers (the HTTP API) see: published after every block and mempool change.
     pub live: Arc<Live>,
     /// Blocks kept on disk (`None`: all of them, an archive node).
@@ -2129,6 +2150,11 @@ pub struct Writer {
     point: CommitPoint,
     /// Log segments below this height are deleted.
     files_pruned_below: u64,
+    /// A scratch home's writer (`blockula replay`, [`Chain::set_scratch`]): the commit protocol
+    /// (logs fsynced, then a durable commit) runs only every [`SCRATCH_SYNC_EVERY`] heights, and
+    /// the blocks in between are written without fsyncs, so a crash may lose any block since.
+    /// Nodes run it for every block.
+    scratch: bool,
     #[cfg(test)]
     fail_at: Option<WritePoint>,
     /// A slow disk, for tests.
@@ -2155,18 +2181,22 @@ pub struct Executed {
 
 impl Writer {
     /// The commit protocol (see `store.rs`): the consensus block, then the executed block, each
-    /// appended and fsynced, then one durable database transaction.
+    /// appended and fsynced, then one durable database transaction (a scratch home's writer: only
+    /// every [`SCRATCH_SYNC_EVERY`] heights, its other blocks just appended and committed).
     fn persist(&mut self, e: &mut Executed) -> Result<(Arc<Snap>, CommitPoint)> {
         #[cfg(test)]
         if let Some(d) = self.delay {
             std::thread::sleep(d);
         }
+        let durable = !self.scratch || e.block.height.is_multiple_of(SCRATCH_SYNC_EVERY);
         let cpos = self.cblocks.append(e.block.height, e.cblock.as_deref().unwrap_or_default())?;
         #[cfg(test)]
         if self.fail_at == Some(WritePoint::AfterCblock) {
             bail!("injected crash after the consensus block append");
         }
-        self.cblocks.sync()?;
+        if durable {
+            self.cblocks.sync()?;
+        }
         let line = serde_json::to_vec(&*e.block)?;
         e.meta.tx_spans = store::tx_spans(&line, &e.block.txs);
         let bpos = self.blocks.append(e.block.height, &line)?;
@@ -2174,9 +2204,11 @@ impl Writer {
         if self.fail_at == Some(WritePoint::AfterBlockLine) {
             bail!("injected crash after the block append");
         }
-        self.blocks.sync()?;
+        if durable {
+            self.blocks.sync()?;
+        }
         (e.meta.block, e.meta.cblock) = (bpos, Some(cpos));
-        let done = self.commit(e, true)?;
+        let done = self.commit(e, durable)?;
         #[cfg(test)]
         if self.fail_at == Some(WritePoint::AfterStoreCommit) {
             bail!("injected crash after the store commit");
@@ -2185,7 +2217,8 @@ impl Writer {
     }
 
     /// One database transaction for a block whose log positions are known, then a snapshot of
-    /// the result. Whole log segments go once their heights' rows are pruned.
+    /// the result. Whole log segments go once a durable commit has pruned their heights' rows (a
+    /// crash may undo a commit that isn't, and the home must still have the blocks it needs).
     fn commit(&mut self, e: &Executed, durable: bool) -> Result<(Arc<Snap>, CommitPoint)> {
         let mut point = self.point.clone();
         point.height = e.block.height;
@@ -2203,7 +2236,7 @@ impl Writer {
         let cert = e.cert.as_deref().map(|c| (e.block.height, c));
         self.store.commit(store::Commit { point: &mut point, records: &e.records, nodes: &e.nodes, block: Some(&e.meta), epoch_head: e.epoch_head, cert, prune_below: e.prune_below, durable })?;
         self.point = point.clone();
-        if point.pruned_below >= self.files_pruned_below.saturating_add(self.blocks.reader().seg_heights) {
+        if durable && point.pruned_below >= self.files_pruned_below.saturating_add(self.blocks.reader().seg_heights) {
             self.blocks.prune_below(point.pruned_below)?;
             self.cblocks.prune_below(point.pruned_below)?;
             self.files_pruned_below = point.pruned_below;
@@ -2513,9 +2546,7 @@ impl Chain {
             Ok(b) => Some(serde_json::from_slice(&b).context("base.json")?),
             Err(_) => None,
         };
-        let layout = Layout::load_or_create(home, opts.segment_heights.unwrap_or(store::SEGMENT_HEIGHTS))?;
-        let blocks = SegLog::open(&home.join("blocks"), "jsonl", Framing::Lines, layout.segment_heights)?;
-        let cblocks = SegLog::open(&home.join("cblocks"), "bin", Framing::Records, layout.segment_heights)?;
+        let (blocks, cblocks) = store::open_logs(home, opts.segment_heights)?;
         crate::snapshot::remove_partial(home);
         // An interrupted fast-sync download (it starts over).
         let _ = fs::remove_file(home.join("base.state.zst.part"));
@@ -2541,7 +2572,7 @@ impl Chain {
         };
         let Start { state, point, snap, epochs, rebuilt_epochs } = start;
         let disk = Arc::new(Disk::new(home.to_path_buf(), blocks.reader(), cblocks.reader()));
-        let writer = Writer { store: store.clone(), blocks, cblocks, point: point.clone(), files_pruned_below: 0, #[cfg(test)] fail_at: None, #[cfg(test)] delay: None };
+        let writer = Writer { store: store.clone(), blocks, cblocks, point: point.clone(), files_pruned_below: 0, scratch: false, #[cfg(test)] fail_at: None, #[cfg(test)] delay: None };
         let genesis_arc = Arc::new(genesis.clone());
         let (height, last_hash) = (point.height, point.block_hash.clone());
         let head = match snap.block_meta(height)? {
@@ -2585,6 +2616,7 @@ impl Chain {
             base,
             claims: HashMap::new(),
             snapshot_busy: Default::default(),
+            scratch: false,
             live,
             keep_blocks: None,
             broken: None,
@@ -2727,6 +2759,15 @@ impl Chain {
     /// What readers see: the state, history and indexes as of the last executed block.
     pub fn view(&self) -> Arc<ReadView> {
         self.live.view()
+    }
+
+    /// Makes this a scratch home (`blockula replay`'s): blocks are logged and committed as a
+    /// node's are, but fsynced and committed durably only every [`SCRATCH_SYNC_EVERY`] heights (a
+    /// crash may lose the blocks since), and it takes no state snapshots: nothing fast-syncs from
+    /// it.
+    pub fn set_scratch(&mut self) {
+        self.scratch = true;
+        self.writer.lock().scratch = true;
     }
 
     /// Keeps only the last `keep` blocks on disk (`None`: keep everything). Never fewer than
@@ -3133,7 +3174,7 @@ impl Chain {
         self.adopt(snap, point);
         self.disk.cache_block(e.block.clone(), e.meta.block.len as usize);
         self.set_finalized_tip(e.block.height);
-        if crate::snapshot::is_checkpoint(e.block.height) {
+        if crate::snapshot::is_checkpoint(e.block.height) && !self.scratch {
             self.take_snapshot();
         }
         self.drop_included();

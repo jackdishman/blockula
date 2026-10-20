@@ -34,6 +34,7 @@ mod node_src {
     pub mod pq;
     pub mod protection;
     pub mod release_cli;
+    pub mod replay;
     pub mod snapshot;
     pub mod staking;
     pub mod state;

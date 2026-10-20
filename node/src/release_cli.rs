@@ -243,7 +243,8 @@ pub fn check_tag(file: &[u8], tag: &str) -> Result<()> {
     }
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+/// The hex SHA-256 of `bytes` (also what `blockula replay` checks an archive's closed files with).
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     use commonware_cryptography::Hasher as _;
     hex::encode(commonware_cryptography::Sha256::hash(&[bytes]))
 }

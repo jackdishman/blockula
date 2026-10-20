@@ -26,6 +26,7 @@ mod pq;
 mod poc;
 mod protection;
 mod release_cli;
+mod replay;
 mod status_cli;
 mod types;
 mod upgrade;
@@ -283,6 +284,27 @@ enum Cmd {
         #[command(subcommand)]
         cmd: release_cli::ReleaseCmd,
     },
+    /// Replay a chain's archived history (scripts/archive-chain.mjs) from genesis and check this
+    /// binary reproduces it: every certificate, cited state root and, for a recorded archive,
+    /// every tx's outcome and every block's state root (docs/REPLAY.md)
+    Replay {
+        /// The archive: a directory with meta.json, genesis.json and the sync-*.jsonl[.gz] files
+        archive: PathBuf,
+        /// Where to put the replay's homes (default: a temporary directory, removed on success)
+        #[arg(long)]
+        home: Option<PathBuf>,
+        /// Stop after this height
+        #[arg(long)]
+        to: Option<u64>,
+        /// Keep only the last N blocks on disk while replaying (long histories; skips the startup
+        /// replay of a recorded archive)
+        #[arg(long)]
+        prune_blocks: Option<u64>,
+        /// Also trust checkpoint HEIGHT:HASH[:SET_HASH[:TIMESTAMP_MS]] (repeatable), as `join
+        /// --checkpoint` does: the archive must agree with it, as with those this binary embeds
+        #[arg(long = "checkpoint", value_parser = checkpoints::Checkpoint::parse)]
+        checkpoints: Vec<checkpoints::Checkpoint>,
+    },
 }
 
 fn net_opts(net: Net, http_port: Option<u16>, p2p_preset: Option<String>, ephemeral_p2p: bool) -> NetOpts {
@@ -406,6 +428,25 @@ fn main() -> Result<()> {
         Cmd::Hunt { cmd } => contrib_cli::hunt(cmd, &blockula_dir()),
         Cmd::Contrib { cmd } => contrib_cli::contrib(cmd, &blockula_dir()),
         Cmd::Release { cmd } => release_cli::run(cmd),
+        Cmd::Replay { archive, home, to, prune_blocks, checkpoints } => {
+            let r = replay::run(&replay::Opts { archive: archive.clone(), home, to, prune_blocks, checkpoints })?;
+            println!("✓ {} replayed through block {} in {:.0} s: state root {}", archive.display(), r.height, r.secs, r.state_root);
+            let [applied, failed, skipped] = r.txs();
+            println!("   every block passed the checkpoints, its batch's certificate and hash links, and verify's checks that need no round or clock; {} txs: {applied} applied, {failed} failed, {skipped} skipped (not admitted)", applied + failed + skipped);
+            if r.recorded > 0 {
+                println!("   {} blocks match the recording: each tx's outcome, the state root, the whole record ({} failure reasons worded otherwise)", r.recorded, r.reworded);
+            } else {
+                println!("   no recording: each state root is checked where a later block cites it (the last few's aren't yet)");
+            }
+            match r.startup {
+                Some(n) => println!("   Chain::open rebuilt the state from the recorded block log: {n} blocks, the same state root"),
+                None if r.recorded > 0 => println!("   the startup replay (Chain::open on the recorded block log) didn't run: --prune-blocks skips it"),
+                None => {}
+            }
+            let tags: Vec<String> = r.tags.iter().map(|(t, [a, f, s])| format!("{t}:{a}/{f}/{s}")).collect();
+            println!("   txs by tag (applied/failed/skipped): {}", tags.join(" "));
+            Ok(())
+        }
         Cmd::Gov { cmd } => gov_cli::gov(cmd, &blockula_dir()),
         Cmd::Multisig { cmd } => gov_cli::multisig(cmd, &blockula_dir()),
         Cmd::Name { cmd } => contrib_cli::name(cmd, &blockula_dir()),

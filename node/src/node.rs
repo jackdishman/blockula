@@ -1456,6 +1456,45 @@ pub(crate) fn apply_batch(chain: &Shared, verifier: &MlDsaScheme, epoch: u64, ba
 /// with another hash, or an epoch whose validator set (learned by executing up to it) isn't the
 /// one a checkpoint pins. Both are checked before anything executes.
 pub(crate) fn apply_batch_trusted(chain: &Shared, verifier: &MlDsaScheme, epoch: u64, batch: &SyncBatch, trust: Option<&Trust>) -> Result<()> {
+    let (blocks, fin_bytes) = verify_batch_trusted(chain, verifier, epoch, batch, trust)?;
+    execute_batch(chain, &blocks, &fin_bytes, None)
+}
+
+/// Looks at each block [`execute_batch`] executes: `blockula replay` checks every block of the
+/// history it replays this way (replay.rs). Nodes don't watch.
+pub(crate) trait BatchWatch {
+    /// Before `b` executes, on its parent's state. `false` stops the batch before it.
+    fn before(&mut self, b: &CBlock) -> Result<bool>;
+    /// After, with what executing it returned.
+    fn after(&mut self, b: &CBlock, executed: Result<()>) -> Result<()>;
+}
+
+/// Executes a batch [`verify_batch_trusted`] checked (`blocks` and the certificate of the last),
+/// `watch` looking at each block.
+pub(crate) fn execute_batch(chain: &Shared, blocks: &[CBlock], fin_bytes: &[u8], mut watch: Option<&mut dyn BatchWatch>) -> Result<()> {
+    // One block at a time, the chain lock held only for the in-memory parts (sync is this
+    // node's only executor, so nothing else extends the chain in between).
+    let last = blocks.last().map(|b| b.height);
+    for b in blocks {
+        if let Some(w) = &mut watch {
+            if !w.before(b)? {
+                break;
+            }
+        }
+        let cert = (Some(b.height) == last).then(|| fin_bytes.to_vec());
+        let executed = Chain::execute_shared(chain, consensus::finalized_from(b, cert));
+        match &mut watch {
+            Some(w) => w.after(b, executed)?,
+            None => executed?,
+        }
+    }
+    Ok(())
+}
+
+/// What [`apply_batch_trusted`] checks before it executes anything: [`verify_batch`], and `trust`
+/// (the epoch's set, then each block's hash and time). Returns the decoded blocks and the
+/// certificate's bytes. `blockula replay` runs its sync on this and [`execute_batch`] (replay.rs).
+pub(crate) fn verify_batch_trusted(chain: &Shared, verifier: &MlDsaScheme, epoch: u64, batch: &SyncBatch, trust: Option<&Trust>) -> Result<(Vec<CBlock>, Vec<u8>)> {
     if let Some(t) = trust {
         let keys: Vec<String> = chain.lock().state.active_set(epoch).map(|s| s.iter().map(|v| v.consensus_key.clone()).collect()).unwrap_or_default();
         t.check_set(epoch, &keys)?;
@@ -1466,14 +1505,7 @@ pub(crate) fn apply_batch_trusted(chain: &Shared, verifier: &MlDsaScheme, epoch:
             t.check_block(b.height, &hex::encode(b.digest_bytes()), Some(b.timestamp_ms))?;
         }
     }
-    // One block at a time, the chain lock held only for the in-memory parts (sync is this
-    // node's only executor, so nothing else extends the chain in between).
-    let last = blocks.last().map(|b| b.height);
-    for b in &blocks {
-        let cert = (Some(b.height) == last).then(|| fin_bytes.clone());
-        Chain::execute_shared(chain, consensus::finalized_from(b, cert))?;
-    }
-    Ok(())
+    Ok((blocks, fin_bytes))
 }
 
 /// Checks a sync batch without executing it: contiguous heights hash-linked to this node's tip,

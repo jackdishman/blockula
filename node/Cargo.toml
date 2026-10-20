@@ -42,6 +42,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std", "tls12"] }
 tracing = "0.1"
 zstd = "0.14"
+# Reads archives of a chain's history (`blockula replay`), whose closed files are gzipped
+# (scripts/archive-chain.mjs). Pure-Rust inflate (miniz_oxide).
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # State layer (see src/state): structural-sharing maps, and the canonical record encoding (a
 # consensus format, so pinned exactly).

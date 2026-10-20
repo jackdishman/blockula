@@ -710,6 +710,16 @@ impl Layout {
     }
 }
 
+/// A home's block logs: `blocks/` (executed blocks, a JSON line each) and `cblocks/` (the exact
+/// consensus blocks), in segments of `layout.json`'s heights (`segment_heights`, or
+/// [`SEGMENT_HEIGHTS`], for a new home).
+pub fn open_logs(home: &Path, segment_heights: Option<u64>) -> Result<(SegLog, SegLog)> {
+    let layout = Layout::load_or_create(home, segment_heights.unwrap_or(SEGMENT_HEIGHTS))?;
+    let blocks = SegLog::open(&home.join("blocks"), "jsonl", Framing::Lines, layout.segment_heights)?;
+    let cblocks = SegLog::open(&home.join("cblocks"), "bin", Framing::Records, layout.segment_heights)?;
+    Ok((blocks, cblocks))
+}
+
 /// Writes a file so that after a crash it holds either the old contents or the new ones: write a
 /// temporary file, fsync it, rename it over the target, fsync the directory.
 pub fn write_durably(path: &Path, bytes: &[u8]) -> Result<()> {

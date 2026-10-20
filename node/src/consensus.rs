@@ -565,6 +565,97 @@ fn admit_gossiped(chain: &Arc<Mutex<Chain>>, tx: Tx) {
     c.gossip = g;
 }
 
+// The checks `App::verify` makes of a block that need neither its consensus round nor the clock,
+// each a function `blockula replay` calls on finalized blocks too (replay.rs `check_block`), so the
+// replay gate runs these rules, not a copy of them (all but the cited root's comparison, which
+// `verify` makes once it has executed that height). A rule `verify` gains that a finalized block
+// must also meet belongs in one of them.
+
+/// A block's header against its parent, the protocol version in force at its height and its
+/// round's leader: the parent link, at least a block time after the parent, a cited height below
+/// its own (the checkpoint's at a certifying height, and recent enough to price any txs it carries).
+pub fn check_header(block: &CBlock, parent: &CBlock, version: u32, block_time_ms: u64, leader: &str) -> Result<(), &'static str> {
+    if block.version != version {
+        return Err("wrong protocol version for this height");
+    }
+    if block.parent != parent.digest() || block.height != parent.height + 1 {
+        return Err("bad parent link");
+    }
+    // Checked: the replay runs this on parents no clock check has seen.
+    if parent.timestamp_ms.checked_add(block_time_ms).is_none_or(|earliest| block.timestamp_ms < earliest) {
+        return Err("block too early");
+    }
+    if block.proposer != leader {
+        return Err("proposer is not the leader");
+    }
+    if block.exec_height >= block.height {
+        return Err("exec_height not below block height");
+    }
+    // Checkpoint rule: this block must commit to state_root(C).
+    if crate::snapshot::certifies(block.height).is_some_and(|cp| block.exec_height != cp) {
+        return Err("checkpoint-certifying block must carry the checkpoint's exec_height");
+    }
+    // Txs need a cited state that fixed this height's base fee (econ.rs): the proposer could
+    // price them, and a verifier can check them once it has executed it.
+    if !block.txs.is_empty() && block.exec_height + crate::econ::FEE_LAG < block.height {
+        return Err("txs in a block whose cited state can't price them");
+    }
+    Ok(())
+}
+
+/// A block's txs, each canonical and none twice, with their ids.
+pub fn decode_txs(block: &CBlock) -> Result<(Vec<Tx>, std::collections::HashSet<String>), &'static str> {
+    let mut seen = std::collections::HashSet::new();
+    let mut txs = Vec::with_capacity(block.txs.len());
+    for raw in &block.txs {
+        let Ok(tx) = Tx::from_bytes(raw) else { return Err("unparseable or non-canonical tx") };
+        if !seen.insert(tx.id()) {
+            return Err("duplicate tx");
+        }
+        txs.push(tx);
+    }
+    Ok((txs, seen))
+}
+
+/// Ghost txs within the size limits of the block's fee slot (fixed once `height − FEE_LAG`
+/// executed), checked before any proof is.
+pub fn check_ghost_budget(slot: &crate::econ::FeeSlot, block: &CBlock, txs: &[Tx]) -> anyhow::Result<()> {
+    let mut ghost = crate::ghost::BlockBudget::new(Some(slot));
+    for (tx, raw) in txs.iter().zip(&block.txs) {
+        ghost.take(tx, raw.len())?;
+    }
+    Ok(())
+}
+
+/// Every tx's stateless checks (signatures and Ghost Mode proofs included) and expiry at `height`.
+/// The validity window's upper bound is a governance parameter, so admission checks it on the
+/// parent's state; expiry doesn't depend on any state.
+pub fn check_txs(txs: &[Tx], chain_id: &str, genesis_hash: &str, prefix: &str, height: u64) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    for tx in txs {
+        check_tx_stateless(tx, chain_id, genesis_hash, prefix).and_then(|()| crate::chain::check_validity(tx, height, u64::MAX)).with_context(|| format!("tx {} ({})", tx.id(), tx.action.kind()))?;
+    }
+    Ok(())
+}
+
+/// Whether any of `ids` is finalized already (in a block `c` still indexes: a tx's whole validity
+/// window, `chain::min_keep_blocks`).
+pub fn replays_finalized(c: &Chain, ids: &std::collections::HashSet<String>) -> bool {
+    ids.iter().any(|id| c.has_tx(id))
+}
+
+/// The block's size and every tx's fee against its height's fee slot, which a verifier knows once
+/// it has executed the cited state and not this height.
+pub fn check_slot(slot: &crate::econ::FeeSlot, block: &CBlock, txs: &[Tx]) -> Result<(), &'static str> {
+    if block.txs.iter().map(|t| t.len() as u64).sum::<u64>() > slot.max_block_bytes {
+        return Err("block exceeds max_block_bytes");
+    }
+    if txs.iter().any(|t| slot.fee(t.size()).checked_add(t.tip).is_none_or(|c| c > t.fee)) {
+        return Err("a tx's fee doesn't cover the block's base fee");
+    }
+    Ok(())
+}
+
 impl<E> Application<E> for App
 where
     E: rand_core::Rng + Spawner + Metrics + Clock,
@@ -724,54 +815,28 @@ where
             (c.halt.allows(&c.state, block.height)).then(|| crate::upgrade::version_at(&c.state, block.height))
         };
         let Some(expected) = expected else { return futures::future::pending().await };
-        if block.version != expected {
-            return reject("wrong protocol version for this height");
-        }
-        if block.parent != parent.digest() || block.height != parent.height + 1 {
-            return reject("bad parent link");
-        }
-        if block.timestamp_ms < parent.timestamp_ms + self.block_time_ms {
-            return reject("block too early");
-        }
         if block.timestamp_ms > self.now_ms(&ctx) + MAX_CLOCK_DRIFT_MS {
             return reject("timestamp too far in the future");
         }
-        if block.proposer != cctx.leader.address(&self.address_prefix) {
-            return reject("proposer is not the leader");
+        if let Err(why) = check_header(&block, &parent, expected, self.block_time_ms, &cctx.leader.address(&self.address_prefix)) {
+            return reject(why);
         }
-        if block.exec_height >= block.height {
-            return reject("exec_height not below block height");
-        }
-        // Checkpoint rule: this block must commit to state_root(C).
         let checkpoint = crate::snapshot::certifies(block.height);
-        if checkpoint.is_some_and(|cp| block.exec_height != cp) {
-            return reject("checkpoint-certifying block must carry the checkpoint's exec_height");
-        }
         let (chain_id, genesis_hash) = {
             let c = self.chain.lock();
-            // Our executed height only grows, so this stays true once it is.
+            // Our executed height only grows, so this stays true once it is. (The replay can't
+            // check this one: it depends on how far each verifier had executed.)
             if block.exec_height + MAX_EXEC_LAG < c.height().min(parent.height) {
                 return reject("exec_height too far behind");
             }
             (c.genesis.chain_id.clone(), c.genesis_hash.clone())
         };
-        // Txs need a cited state that fixed this height's base fee (econ.rs): the proposer could
-        // price them, and we can check them once we've executed it.
-        if !block.txs.is_empty() && block.exec_height + crate::econ::FEE_LAG < block.height {
-            return reject("txs in a block whose cited state can't price them");
-        }
-        let mut seen = std::collections::HashSet::new();
-        let mut txs = Vec::with_capacity(block.txs.len());
-        for raw in &block.txs {
-            let Ok(tx) = Tx::from_bytes(raw) else { return reject("unparseable or non-canonical tx") };
-            if !seen.insert(tx.id()) {
-                return reject("duplicate tx");
-            }
-            txs.push(tx);
-        }
+        let (txs, seen) = match decode_txs(&block) {
+            Ok(decoded) => decoded,
+            Err(why) => return reject(why),
+        };
         // Ghost txs' size limits come from this height's fee slot, fixed once `height − FEE_LAG`
-        // executed (the same for every verifier, whatever parameter change executes after it), and
-        // are checked before any proof is.
+        // executed (the same for every verifier, whatever parameter change executes after it).
         if !txs.is_empty() {
             wait_executed(&ctx, &self.chain, block.height.saturating_sub(crate::econ::FEE_LAG), None).await;
             let slot = {
@@ -779,24 +844,15 @@ where
                 (c.height() < block.height).then(|| crate::econ::slot(&c.state, block.height)).flatten()
             };
             // Executed past this height already: whether it's the finalized block decides below.
-            if let Some(slot) = slot {
-                let mut ghost = crate::ghost::BlockBudget::new(Some(&slot));
-                for (tx, raw) in txs.iter().zip(&block.txs) {
-                    if let Err(e) = ghost.take(tx, raw.len()) {
-                        warn!(error = %e, "ghost txs over the block's limits");
-                        return reject("ghost txs over the size limits");
-                    }
-                }
+            if let Err(e) = slot.map_or(Ok(()), |slot| check_ghost_budget(&slot, &block, &txs)) {
+                warn!(error = %e, "ghost txs over the block's limits");
+                return reject("ghost txs over the size limits");
             }
         }
-        // Tx checks (signatures and ghost proofs included) run without holding the chain lock. The
-        // validity window's upper bound is a governance parameter, so the replay below checks it
-        // on the parent's state; expiry doesn't depend on any state.
-        for tx in &txs {
-            if let Err(e) = check_tx_stateless(tx, &chain_id, &genesis_hash, &self.address_prefix).and_then(|_| crate::chain::check_validity(tx, block.height, u64::MAX)) {
-                warn!(error = %e, "bad tx in block");
-                return reject("invalid tx");
-            }
+        // Tx checks (signatures and ghost proofs included) run without holding the chain lock.
+        if let Err(e) = check_txs(&txs, &chain_id, &genesis_hash, &self.address_prefix, block.height) {
+            warn!(error = %format!("{e:#}"), "bad tx in block");
+            return reject("invalid tx");
         }
         // The cited state root, once we've executed that height ourselves (until then the
         // verdict can still change, so we wait).
@@ -808,7 +864,7 @@ where
         }
         let (seen_already, replays, executed, slot) = {
             let c = self.chain.lock();
-            (finalized(&c, &block), seen.iter().any(|id| c.has_tx(id)), c.height(), crate::econ::slot(&c.state, block.height))
+            (finalized(&c, &block), replays_finalized(&c, &seen), c.height(), crate::econ::slot(&c.state, block.height))
         };
         match seen_already {
             Seen::Not => {}
@@ -821,13 +877,8 @@ where
         }
         // This height's size limit and base fee, exactly: we've executed the cited state (at most
         // FEE_LAG back) and not this height yet, so the slot is known.
-        if let Some(slot) = slot {
-            if block.txs.iter().map(|t| t.len() as u64).sum::<u64>() > slot.max_block_bytes {
-                return reject("block exceeds max_block_bytes");
-            }
-            if txs.iter().any(|t| slot.fee(t.size()).checked_add(t.tip).is_none_or(|c| c > t.fee)) {
-                return reject("a tx's fee doesn't cover the block's base fee");
-            }
+        if let Err(why) = slot.map_or(Ok(()), |slot| check_slot(&slot, &block, &txs)) {
+            return reject(why);
         }
         // CV-5: replay the unexecuted ancestors exactly (txs, then end-of-block and end-of-epoch
         // steps: `State::run_block`), then every tx must be admittable on the parent's state.
@@ -1219,14 +1270,36 @@ pub fn elector(seed: Option<[u8; 32]>) -> RoundRobin<Blake3> {
 /// beacon from `state`. Downtime accounting (missed leader slots, MAINNET-DESIGN 3.4) must use
 /// this (`staking::leader_index` elects with the same elector), so it charges the validators
 /// simplex actually waited for. `None`: no set for `epoch`.
-#[cfg_attr(not(test), allow(dead_code))] // tests and tools; staking uses `leader_index`
+#[cfg_attr(not(test), allow(dead_code))] // tests; staking uses `leader_index`, the replay `EpochLeaders`
 pub fn leader(state: &crate::chain::State, epoch: u64, view: u64) -> Option<String> {
-    use commonware_consensus::simplex::elector::{Config, Elector};
-    use commonware_consensus::types::{Round, View};
-    let set = keys_of(state.active_set(epoch)?.iter().map(|v| v.consensus_key.as_str()))?;
-    let e = <RoundRobin<Blake3> as Config<MlDsaScheme>>::build(elector(crate::beacon::elector_seed(state, epoch)), &set);
-    let idx = Elector::<MlDsaScheme>::elect(&e, Round::new(Epoch::new(epoch), View::new(view)), None);
-    Some(set.get(idx.get() as usize)?.address(state.params.prefix()))
+    EpochLeaders::new(state, epoch)?.leader(view)
+}
+
+/// An epoch's leader election, built once (its set's keys parsed, the beacon's order applied):
+/// [`leader`] for each of its views. `blockula replay` checks every block's proposer with it.
+pub struct EpochLeaders {
+    pub epoch: u64,
+    set: Set<PublicKey>,
+    elector: commonware_consensus::simplex::elector::RoundRobinElector<MlDsaScheme>,
+    prefix: String,
+}
+
+impl EpochLeaders {
+    /// `None`: no set for `epoch` in `state`.
+    pub fn new(state: &crate::chain::State, epoch: u64) -> Option<Self> {
+        use commonware_consensus::simplex::elector::Config;
+        let set = keys_of(state.active_set(epoch)?.iter().map(|v| v.consensus_key.as_str()))?;
+        let elector = <RoundRobin<Blake3> as Config<MlDsaScheme>>::build(elector(crate::beacon::elector_seed(state, epoch)), &set);
+        Some(Self { epoch, set, elector, prefix: state.params.prefix().to_string() })
+    }
+
+    /// The address of the leader of `view`.
+    pub fn leader(&self, view: u64) -> Option<String> {
+        use commonware_consensus::simplex::elector::Elector;
+        use commonware_consensus::types::{Round, View};
+        let idx = Elector::<MlDsaScheme>::elect(&self.elector, Round::new(Epoch::new(self.epoch), View::new(view)), None);
+        Some(self.set.get(idx.get() as usize)?.address(&self.prefix))
+    }
 }
 
 impl certificate::Provider for EpochProvider {
