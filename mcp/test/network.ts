@@ -240,6 +240,8 @@ const fake: Server = createServer((req, res) => {
   req.on("end", () => {
     const reply = (code: number, v: unknown) => res.writeHead(code, { "content-type": "application/json" }).end(JSON.stringify(v));
     if (req.url === "/api/status") return reply(200, nodeStatus);
+    if (req.url?.startsWith("/api/hunts")) return reply(200, { hunts: [] });
+    if (req.url === "/api/contributions") return reply(200, { pool: { balance_display: "0 FANG" }, repos: [], claims: [], rules: {} });
     if (req.method === "POST") posted.push(body);
     if (req.url?.startsWith("/api/account/")) return reply(404, { error: "no account" });
     return reply(404, { error: `fake node: no route for ${req.url}` });
@@ -249,8 +251,8 @@ await new Promise<void>((r) => fake.listen(0, "127.0.0.1", r));
 const rpc = `http://127.0.0.1:${(fake.address() as AddressInfo).port}`;
 const home = join(dir, "home");
 
-async function server(env: Record<string, string>) {
-  const transport = new StdioClientTransport({ command: process.execPath, args: [new URL("../dist/index.js", import.meta.url).pathname], env: { PATH: process.env.PATH ?? "", BLOCKULA_HOME: home, ...env }, stderr: "ignore" });
+async function server(env: Record<string, string>, argv: string[] = []) {
+  const transport = new StdioClientTransport({ command: process.execPath, args: [new URL("../dist/index.js", import.meta.url).pathname, ...argv], env: { PATH: process.env.PATH ?? "", BLOCKULA_HOME: home, ...env }, stderr: "ignore" });
   const c = new McpClient({ name: "test", version: "0" });
   await c.connect(transport);
   const call = async (name: string, args: Record<string, unknown> = {}) => {
@@ -301,6 +303,39 @@ s = await server({ BLOCKULA_RPC: rpc, BLOCKULA_NETWORK: "custom" });
 r = await s.call("status");
 assert.ok(r.error && /starts from genesis .*not 2222/.test(r.text) && r.text.includes("known-chains.json"), r.text);
 await s.close();
+
+// Hunts and the contribution pool say testnet FANG is worth nothing on test chains only: a tool's
+// description by the configured network (of test chains alone when the node's chain isn't known
+// yet), a result by the chain the node is on. On mainnet nothing is said about value.
+const NO_VALUE = /Testnet FANG, Hunts and Soul have no monetary value/;
+const HEDGED = /On test chains, FANG, Hunts and Soul have no monetary value/;
+const VALUE_TOOLS = ["list_hunts", "fund_hunt", "contribution_pool", "submit_contribution", "my_contributions"];
+const described = async (srv: Awaited<ReturnType<typeof server>>) => {
+  const all = await srv.tools();
+  return VALUE_TOOLS.map((n) => all.find((t) => t.name === n)?.description ?? "");
+};
+nodeStatus = { ...nodeStatus, chain_id: "fake-chain" };
+s = await server({ BLOCKULA_RPC: rpc });
+for (const d of await described(s)) assert.ok(HEDGED.test(d) && !NO_VALUE.test(d) && d === d.trim(), `an unpinned node's chain isn't known yet: "${d}"`);
+r = await s.call("list_hunts");
+assert.ok(!r.error && NO_VALUE.test(JSON.parse(r.text).note), r.text);
+r = await s.call("contribution_pool");
+assert.ok(!r.error && NO_VALUE.test(JSON.parse(r.text).note), r.text);
+await s.close();
+nodeStatus = { ...nodeStatus, chain_id: "blockula-1" };
+s = await server({ BLOCKULA_RPC: rpc });
+r = await s.call("list_hunts");
+assert.ok(!r.error && !/monetary value/.test(r.text) && /untrusted_\*/.test(JSON.parse(r.text).note), `a node on blockula-1 is mainnet, however configured: ${r.text}`);
+await s.close();
+s = await server({ BLOCKULA_RPC: rpc }, ["--network", "mainnet"]);
+for (const d of await described(s)) assert.ok(!/monetary value/.test(d) && d === d.trim(), `mainnet says nothing about value: "${d}"`);
+r = await s.call("list_hunts");
+assert.ok(!r.error && !/monetary value/.test(r.text), r.text);
+r = await s.call("contribution_pool");
+assert.ok(!r.error && !/monetary value/.test(r.text) && JSON.parse(r.text).note === undefined, r.text);
+await s.close();
+nodeStatus = { ...nodeStatus, chain_id: "fake-chain" };
+console.log("✓ testnet FANG is called worthless on test chains only, never on mainnet");
 
 // A broken configuration fails every tool with the reason, instead of guessing a network.
 s = await server({ BLOCKULA_NETWORK: "moon" });
