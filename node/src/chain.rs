@@ -172,13 +172,14 @@ pub struct Genesis {
     pub reserved_names: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub soul_ledger: Vec<SoulEntry>,
-    /// Features on from genesis (`upgrade::KNOWN_FEATURES`).
+    /// Features on from genesis: ones the version block 1 runs knows (`upgrade::known_features`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub features: Vec<String>,
     /// Protocol versions scheduled from genesis, as `ScheduleUpgrade` proposals would schedule
-    /// them: dev and test chains only (`upgrade::check_genesis_upgrades`), and a chain that has
-    /// any runs `upgrade::PREVIEW_PROTOCOL_VERSION` (`upgrade::supported_version`). Absent on
-    /// every chain that starts at v1, so their genesis and its hash don't change.
+    /// them (`upgrade::check_genesis_upgrades`): a chain born at a released version (`blockula-1`
+    /// at v2, from block 1), or a dev or test chain on the preview version, which this binary
+    /// runs there only (`upgrade::supported_version`). Absent on every chain that starts at v1,
+    /// so their genesis and its hash don't change.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub upgrades: Vec<crate::upgrade::ScheduledUpgrade>,
     /// Accounts whose validators the bootstrap delegation passes over (DEC-5: the founder's and
@@ -509,13 +510,17 @@ impl Genesis {
             ensure!(system_account(prefix, a).is_none(), "bootstrap_excluded: {a} is a keyless system account");
             ensure!(i == 0 || self.bootstrap_excluded[i - 1] < *a, "bootstrap_excluded must be sorted, each account once");
         }
+        crate::upgrade::check_genesis_upgrades(&self.upgrades, &self.chain_id)?;
+        // The genesis block executes nothing: features on from genesis are first used in block 1,
+        // so that block's version must know them (a chain born at v2 from block 1 may start with
+        // programs on; one that starts at v1 may not).
+        let first = crate::upgrade::version_in(&self.upgrades, 1);
         let mut features = BTreeSet::new();
         for f in &self.features {
             crate::upgrade::check_feature_name(f)?;
-            ensure!(crate::upgrade::KNOWN_FEATURES.contains(&f.as_str()), "unknown feature {f} (known: {})", crate::upgrade::KNOWN_FEATURES.join(", "));
+            crate::upgrade::check_known_feature(f, first).map_err(|e| anyhow!("{e}: block 1 runs v{first}"))?;
             ensure!(features.insert(f), "feature {f} is listed twice");
         }
-        crate::upgrade::check_genesis_upgrades(&self.upgrades, &self.chain_id)?;
         if self.chain_id == MAINNET_CHAIN_ID {
             ensure!(self.validator_admins.is_empty(), "{MAINNET_CHAIN_ID} has no admin keys: validator_admins must be empty");
             ensure!(!self.faucet, "{MAINNET_CHAIN_ID} has no faucet");
@@ -5741,19 +5746,20 @@ mod scaffold {
     }
 
     /// P7 (docs/PROGRAMS-PLAN.md): a version-gated rule, here the test-only `upgrade::test_gate`
-    /// (admission refuses its memo from v2 on), flips at the activation height on every path a
-    /// node runs on its own (mempool admission and revalidation, execution, the end-of-block
-    /// steps, and replay from the block logs) and nowhere else. `consensus.rs` and the simulator
-    /// cover propose and verify.
+    /// (admission refuses its memo from the preview version on), flips at the activation height on
+    /// every path a node runs on its own (mempool admission and revalidation, execution, the
+    /// end-of-block steps, and replay from the block logs) and nowhere else. `consensus.rs` and the
+    /// simulator cover propose and verify.
     #[test]
     fn a_version_gated_rule_flips_at_its_height_on_every_path() {
         const AT: u64 = 4;
+        let preview = crate::upgrade::PREVIEW_PROTOCOL_VERSION;
         let mut g = genesis("scaffold-1");
-        g.upgrades = vec![crate::upgrade::ScheduledUpgrade { version: crate::upgrade::PREVIEW_PROTOCOL_VERSION, activation_height: AT }];
+        g.upgrades = vec![crate::upgrade::ScheduledUpgrade { version: preview, activation_height: AT }];
         g.check().unwrap();
         let (home, mut c) = open("version-gate", &g);
-        // This binary runs v2 on a chain whose genesis schedules it.
-        assert_eq!(c.halt.supported, crate::upgrade::PREVIEW_PROTOCOL_VERSION);
+        // This binary runs the preview version on a chain whose genesis schedules it.
+        assert_eq!(c.halt.supported, preview);
         let (owner, bob) = (keys(22), keys(24));
         let gated = |c: &Chain, nonce_ahead: u64| {
             let mut tx = signed(c, &owner, Action::Transfer { to: bob.address(), amount: FANG });
@@ -5763,25 +5769,26 @@ mod scaffold {
             tx.sign(&owner)
         };
         crate::upgrade::test_gate::record();
-        // Below v2 the rule doesn't exist: admitted (at the next height, 1), included, applied.
+        // Below the preview version the rule doesn't exist: admitted (at the next height, 1),
+        // included, applied.
         let early = gated(&c, 0);
         c.submit(early.clone()).unwrap();
         c.produce_block().unwrap();
         assert!(c.failure(&early.id()).is_none() && c.block(1).unwrap().txs.iter().any(|t| t.id() == early.id()));
         c.produce_block_with(vec![]).unwrap();
-        // Admitted for block 3, but block 3 leaves it out: from block 4 (v2) on it no longer
-        // applies, so revalidation drops it from the mempool.
+        // Admitted for block 3, but block 3 leaves it out: from block 4 (the preview version) on
+        // it no longer applies, so revalidation drops it from the mempool.
         let late = gated(&c, 0);
         c.submit(late.clone()).unwrap();
         c.produce_block_with(vec![]).unwrap();
         assert_eq!(c.height(), AT - 1);
-        assert!(!c.mempool.iter().any(|t| t.id() == late.id()), "dropped once the next height runs v2");
+        assert!(!c.mempool.iter().any(|t| t.id() == late.id()), "dropped once the next height runs the preview version");
         assert!(c.failure(&late.id()).unwrap().0.contains("test gate"));
         // Mempool admission for block 4 refuses it outright; an ungated tx still goes in.
         assert!(c.submit(gated(&c, 0)).unwrap_err().to_string().contains("test gate"));
         let plain = signed(&c, &owner, Action::Transfer { to: bob.address(), amount: FANG });
         c.submit(plain.clone()).unwrap();
-        // Execution: a block at v2 that carries one anyway skips it (unadmittable).
+        // Execution: a block at the preview version that carries one anyway skips it (unadmittable).
         let forced = gated(&c, 1);
         c.produce_block_with(vec![plain.clone(), forced.clone()]).unwrap();
         let b = c.block(AT).unwrap();
@@ -5791,12 +5798,13 @@ mod scaffold {
         c.produce_block_with(vec![]).unwrap();
         // Each block carries the version in force at its height, and its end-of-block steps saw it.
         let versions: Vec<(u64, u32)> = (1..=AT + 1).map(|h| (h, c.block(h).unwrap().version)).collect();
-        assert_eq!(versions, vec![(1, 1), (2, 1), (3, 1), (4, 2), (5, 2)]);
+        assert_eq!(versions, vec![(1, 1), (2, 1), (3, 1), (4, preview), (5, preview)]);
         assert_eq!(crate::upgrade::test_gate::take(), versions);
         let root = c.state.root();
         drop(c);
         // Replay from the block logs: block 1's gated tx applies again (v1) and block 4 skips the
-        // other (v2), to the same root, the end-of-block steps seeing the same versions.
+        // other (the preview version), to the same root, the end-of-block steps seeing the same
+        // versions.
         fs::remove_file(home.join(store::DB_FILE)).unwrap();
         crate::upgrade::test_gate::record();
         let c = Chain::open(&home).unwrap();

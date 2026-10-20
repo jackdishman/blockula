@@ -1,8 +1,8 @@
 //! Upgrades, halts and feature flags (P-UPGRADE, MAINNET-DESIGN 3.9, DEC-2): the protocol-version
 //! schedule that `ScheduleUpgrade` proposals extend and `CancelUpgrade` proposals cut back, the
-//! feature flags `ActivateFeature` and `DeactivateFeature` flip (Ghost Mode ships off), and the
-//! node-local side of upgrades: what this binary supports, the operator's `--halt-height`, and
-//! why a node stopped.
+//! feature flags `ActivateFeature` and `DeactivateFeature` flip (Ghost Mode ships off, and so do
+//! programs, a feature from v2: [`known_features`]), and the node-local side of upgrades: what
+//! this binary supports, the operator's `--halt-height`, and why a node stopped.
 //!
 //! How a node follows the schedule:
 //! * Every block carries the version in force at its height ([`version_at`]); verifiers reject
@@ -81,25 +81,56 @@ pub const EXIT_HALT_HEIGHT: i32 = 10;
 pub const EXIT_UPGRADE_REQUIRED: i32 = 11;
 pub const EXIT_DOUBLE_SIGN_RISK: i32 = 12;
 
-/// Features governance can switch on and off. A name outside this list can't be activated.
-pub const KNOWN_FEATURES: &[&str] = &["ghost"];
+/// The programs feature (docs/PROGRAMS.md): third-party WebAssembly programs, which protocol v2
+/// ships dormant. v2 changes nothing until governance (or the genesis) switches this on.
+pub const PROGRAMS_FEATURE: &str = "programs";
+
+/// The protocol version whose rules include programs v0: [`PROGRAMS_FEATURE`] is a feature from
+/// it on ([`known_features`]).
+pub const PROGRAMS_VERSION: u32 = 2;
+
+/// Features governance can switch on and off under protocol `version`: Ghost Mode from v1, and
+/// programs from [`PROGRAMS_VERSION`]. A name outside the list can't be activated, so a feature
+/// joins it with the version whose rules run it, and a binary refuses it before that version is
+/// in force exactly as an older binary does.
+///
+/// Read at the version in force at the block that does it: block 1's for a genesis's `features`
+/// (`Genesis::check`), the proposal's own block at `Propose` (`governance::prepare_kind`), and the
+/// block it runs in when it executes (`exec_activate_feature`). Never at a later block's version:
+/// an upgrade scheduled there isn't in force yet, and until it is, every node runs the block
+/// under the old rules, including nodes whose binary doesn't have the new ones (they halt only at
+/// the activation height). Versions never go down, so those three keep every active feature known
+/// from then on. [`check_invariants`] asserts that too, but only test builds run it
+/// (`State::debug_check`): it's a check on the three, not a fourth guard at runtime.
+pub fn known_features(version: u32) -> &'static [&'static str] {
+    if version >= PROGRAMS_VERSION { &[crate::ghost::FEATURE, PROGRAMS_FEATURE] } else { &[crate::ghost::FEATURE] }
+}
+
+/// `blockula-1` is born at v2: its genesis schedules exactly this version from block 1 (or nothing,
+/// for a chain that starts at v1; [`check_genesis_upgrades`]). A constant, not
+/// [`SUPPORTED_PROTOCOL_VERSION`]: the genesis never changes, and every later binary must still
+/// load it.
+pub const MAINNET_GENESIS_VERSION: u32 = 2;
+// Every binary runs the version mainnet is born at.
+const _: () = assert!(MAINNET_GENESIS_VERSION <= SUPPORTED_PROTOCOL_VERSION);
 
 /// The protocol version this binary runs only on chains whose genesis schedules it (`upgrades`:
-/// dev and test chains): v2, while its rules land behind version gates. Every other chain gets
-/// [`SUPPORTED_PROTOCOL_VERSION`] until the release that ships v2 (docs/PROGRAMS-PLAN.md
-/// section 4), so a live chain's blocks keep signalling v1 and its nodes halt before a v2 that
-/// governance schedules there.
-pub const PREVIEW_PROTOCOL_VERSION: u32 = 2;
+/// dev and test chains): v3, while its rules land behind version gates. Every other chain gets
+/// [`SUPPORTED_PROTOCOL_VERSION`] until the release that ships v3 (docs/PROGRAMS-PLAN.md
+/// section 4), so a live chain's blocks keep signalling the supported version and its nodes halt
+/// before a v3 that governance schedules there.
+pub const PREVIEW_PROTOCOL_VERSION: u32 = 3;
 
 /// A version-gated rule that only tests have (docs/PROGRAMS-PLAN.md P7): it shows that every path
 /// that admits, executes or replays a block reads the protocol version in force at that block's
-/// height, so a real gated rule flips at its activation height everywhere and nowhere else.
+/// height, so a real gated rule flips at its activation height everywhere and nowhere else. It
+/// gates on the preview version, which no released rule uses.
 #[cfg(test)]
 pub mod test_gate {
     use std::cell::RefCell;
 
     /// From [`super::PREVIEW_PROTOCOL_VERSION`] on, admission refuses a tx with this memo.
-    pub const MEMO: &str = "p7: refused from protocol v2";
+    pub const MEMO: &str = "p7: refused from the preview version";
 
     thread_local! {
         static SEEN: RefCell<Option<Vec<(u64, u32)>>> = const { RefCell::new(None) };
@@ -125,9 +156,13 @@ pub mod test_gate {
     }
 }
 
-/// The newest protocol version this binary runs on `genesis`'s chain ([`HaltControl::supported`]).
+/// The newest protocol version this binary runs on `genesis`'s chain ([`HaltControl::supported`]):
+/// [`PREVIEW_PROTOCOL_VERSION`] on a chain born with a preview schedule (its genesis schedules a
+/// version past [`SUPPORTED_PROTOCOL_VERSION`]: dev and test chains), else
+/// [`SUPPORTED_PROTOCOL_VERSION`], whether the chain starts at v1 or is born at a released
+/// version (`blockula-1` at v2).
 pub fn supported_version(genesis: &crate::chain::Genesis) -> u32 {
-    if genesis.upgrades.is_empty() { SUPPORTED_PROTOCOL_VERSION } else { PREVIEW_PROTOCOL_VERSION }
+    if genesis.upgrades.iter().any(|u| u.version > SUPPORTED_PROTOCOL_VERSION) { PREVIEW_PROTOCOL_VERSION } else { SUPPORTED_PROTOCOL_VERSION }
 }
 
 /// A genesis schedule (`Genesis::upgrades`): versions this binary runs on such a chain, newer
@@ -135,14 +170,18 @@ pub fn supported_version(genesis: &crate::chain::Genesis) -> u32 {
 /// block 1 on, so the genesis block keeps its version (`consensus::GENESIS_PROTOCOL_VERSION`)
 /// and every block carries the version in force at its height.
 ///
-/// A preview version's rules change from release to release until the one that ships it, and
-/// nothing bumps the number in between, so nodes on two releases would run one chain's blocks
-/// under different rules. A preview chain is therefore a dev or test chain one binary summons and
-/// runs: `blockula genesis build`, which builds public networks, can't schedule one, and mainnet's
-/// genesis refuses one here (a later version reaches it only through `ScheduleUpgrade`).
+/// A released version (up to [`SUPPORTED_PROTOCOL_VERSION`]) has fixed rules, so a public network
+/// may be born at it: `blockula genesis build` schedules it from block 1 (`protocol_version` in
+/// the spec), and `blockula-1` may carry exactly [`MAINNET_GENESIS_VERSION`] from block 1 and
+/// nothing else. A preview version's rules change from release to release until the one that
+/// ships it, and nothing bumps the number in between, so nodes on two releases would run one
+/// chain's blocks under different rules. A preview chain is therefore a dev or test chain one
+/// binary summons and runs: the builder can't schedule one, and mainnet's genesis refuses one here
+/// (a later version reaches it only through `ScheduleUpgrade`).
 pub fn check_genesis_upgrades(upgrades: &[ScheduledUpgrade], chain_id: &str) -> Result<()> {
     if chain_id == crate::chain::MAINNET_CHAIN_ID {
-        ensure!(upgrades.is_empty(), "{chain_id} starts at protocol v{PROTOCOL_VERSION}: a later version reaches it through a ScheduleUpgrade proposal");
+        let born = [ScheduledUpgrade { version: MAINNET_GENESIS_VERSION, activation_height: 1 }];
+        ensure!(upgrades.is_empty() || upgrades == born, "{chain_id} starts at protocol v{PROTOCOL_VERSION}, or is born at v{MAINNET_GENESIS_VERSION} (upgrades: exactly v{MAINNET_GENESIS_VERSION} from block 1); a later version reaches it through a ScheduleUpgrade proposal");
     }
     let mut last: Option<&ScheduledUpgrade> = None;
     for u in upgrades {
@@ -156,7 +195,7 @@ pub fn check_genesis_upgrades(upgrades: &[ScheduledUpgrade], chain_id: &str) -> 
     Ok(())
 }
 
-/// Feature names: 1–32 of `a-z`, `0-9`, `_` and `-` (stateless; [`KNOWN_FEATURES`] is checked
+/// Feature names: 1–32 of `a-z`, `0-9`, `_` and `-` (stateless; [`known_features`] is checked
 /// where a feature is switched).
 pub fn check_feature_name(f: &str) -> Result<()> {
     if f.is_empty() || f.len() > crate::types::MAX_FEATURE || !f.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-') {
@@ -414,11 +453,19 @@ pub(crate) fn scheduled(state: &State, version: u32, activation_height: u64) -> 
     }
 }
 
-/// Switches a known feature on.
-pub(crate) fn exec_activate_feature(state: &mut State, j: &mut Journal, feature: &str, height: u64) -> Result<()> {
-    if !KNOWN_FEATURES.contains(&feature) {
-        bail!("unknown feature {feature} (known: {})", KNOWN_FEATURES.join(", "));
+/// Whether `feature` is one protocol `version` knows ([`known_features`]); `Err` says which ones
+/// it does, worded as v1 binaries word it, so under v1 a refusal reads the same on every binary.
+pub fn check_known_feature(feature: &str, version: u32) -> Result<()> {
+    let known = known_features(version);
+    if !known.contains(&feature) {
+        bail!("unknown feature {feature} (known: {})", known.join(", "));
     }
+    Ok(())
+}
+
+/// Switches a feature on that the version in force at `height` knows.
+pub(crate) fn exec_activate_feature(state: &mut State, j: &mut Journal, feature: &str, height: u64) -> Result<()> {
+    check_known_feature(feature, version_at(state, height))?;
     if is_active(state, feature) {
         bail!("{feature} is already on");
     }
@@ -439,7 +486,13 @@ pub(crate) fn exec_deactivate_feature(state: &mut State, j: &mut Journal, featur
 
 /// The protocol version in force at `height`.
 pub fn version_at(state: &State, height: u64) -> u32 {
-    state.upgrade.schedule.iter().filter(|u| u.activation_height <= height).map(|u| u.version).next_back().unwrap_or(PROTOCOL_VERSION)
+    version_in(&state.upgrade.schedule, height)
+}
+
+/// The protocol version a `schedule` (ascending by height) puts in force at `height`: the state's,
+/// or a genesis's before its state exists (`Genesis::check` reads block 1's).
+pub fn version_in(schedule: &[ScheduledUpgrade], height: u64) -> u32 {
+    schedule.iter().filter(|u| u.activation_height <= height).map(|u| u.version).next_back().unwrap_or(PROTOCOL_VERSION)
 }
 
 /// The next scheduled upgrade after `height`, if any.
@@ -607,7 +660,8 @@ pub fn signals<'a>(active: &[String], blocks: impl IntoIterator<Item = (u64, &'a
     out
 }
 
-/// The upgrade module's consistency rules (part of `State::check_invariants`).
+/// The upgrade module's consistency rules (part of `State::check_invariants`, which test builds
+/// run after every block).
 pub fn check_invariants(state: &State) -> Result<()> {
     let s = &state.upgrade.schedule;
     ensure!(s.windows(2).all(|w| w[0].activation_height < w[1].activation_height && w[0].version < w[1].version), "the upgrade schedule isn't increasing");
@@ -615,8 +669,12 @@ pub fn check_invariants(state: &State) -> Result<()> {
     ensure!((w.highest > 0) == w.last_at.is_some(), "the upgrade withdrawals disagree: v{} withdrawn, last at {:?}", w.highest, w.last_at);
     ensure!(w.superseded == 0 || w.last_at.is_some(), "v{} superseded with no cancellation", w.superseded);
     ensure!(s.iter().all(|u| u.version != w.highest), "withdrawn v{} is still scheduled", w.highest);
+    // Versions only go up, and a feature switches on under a version that knows it (at genesis:
+    // block 1's), so the version txs execute under next knows every active one. A test-time
+    // check of the three places that enforce it ([`known_features`]); nodes don't run it.
+    let version = version_at(state, crate::econ::now(state));
     for f in state.upgrade.features.keys() {
-        ensure!(KNOWN_FEATURES.contains(&f.as_str()), "unknown feature {f} is active");
+        ensure!(known_features(version).contains(&f.as_str()), "unknown feature {f} is active under protocol v{version}");
     }
     Ok(())
 }
@@ -639,33 +697,93 @@ mod tests {
     }
 
     /// P7: a genesis may schedule the preview version from block 1 on (dev and test chains), and
-    /// this binary runs it on exactly those chains. Every other chain, and mainnet always, starts at
-    /// v1 and is run at `SUPPORTED_PROTOCOL_VERSION`.
+    /// this binary runs it on exactly those chains. Every other chain is run at
+    /// `SUPPORTED_PROTOCOL_VERSION`: one that starts at v1, and one born at a released version.
     #[test]
     fn a_genesis_schedule_is_checked_and_decides_the_supported_version() {
         let at = |version, activation_height| ScheduledUpgrade { version, activation_height };
-        let v2 = PREVIEW_PROTOCOL_VERSION;
+        let (v2, preview) = (SUPPORTED_PROTOCOL_VERSION, PREVIEW_PROTOCOL_VERSION);
+        assert!(PROTOCOL_VERSION < v2 && v2 < preview, "v1 < released < preview");
         check_genesis_upgrades(&[], "dev").unwrap();
-        check_genesis_upgrades(&[at(v2, 1)], "dev").unwrap();
-        check_genesis_upgrades(&[at(v2, 500)], "dev").unwrap();
+        for v in [v2, preview] {
+            check_genesis_upgrades(&[at(v, 1)], "dev").unwrap();
+            check_genesis_upgrades(&[at(v, 500)], "dev").unwrap();
+        }
+        check_genesis_upgrades(&[at(v2, 1), at(preview, 9)], "dev").unwrap();
         let refused = |u: &[ScheduledUpgrade], chain: &str| check_genesis_upgrades(u, chain).unwrap_err().to_string();
-        assert!(refused(&[at(v2, 1)], crate::chain::MAINNET_CHAIN_ID).contains("ScheduleUpgrade"));
         assert!(refused(&[at(v2, 0)], "dev").contains("block 1 or later"));
         assert!(refused(&[at(PROTOCOL_VERSION, 5)], "dev").contains("not v1"));
-        assert!(refused(&[at(v2 + 1, 5)], "dev").contains(&format!("not v{}", v2 + 1)));
-        assert!(refused(&[at(v2, 5), at(v2, 9)], "dev").contains("increase"));
-        // The binary runs v2 only where the genesis schedules it.
+        assert!(refused(&[at(preview + 1, 5)], "dev").contains(&format!("not v{}", preview + 1)));
+        assert!(refused(&[at(preview, 5), at(preview, 9)], "dev").contains("increase"));
+        assert!(refused(&[at(preview, 5), at(v2, 9)], "dev").contains("increase"));
+        // The binary runs the preview version only where the genesis schedules it; a chain born at
+        // the released version runs that, like one that starts at v1.
         let minimal = serde_json::json!({ "chain_id": "dev", "token": "FANG", "decimals": 9, "block_time_ms": 1000, "validators": [], "faucet": false, "created_at_ms": 0, "allocations": [] });
         let mut g: crate::chain::Genesis = serde_json::from_value(minimal.clone()).unwrap();
-        assert_eq!((supported_version(&g), HaltControl::for_genesis(&g).supported), (SUPPORTED_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSION));
+        let supported = |g: &crate::chain::Genesis| (supported_version(g), HaltControl::for_genesis(g).supported);
+        assert_eq!(supported(&g), (v2, v2));
         g.upgrades = vec![at(v2, 1)];
-        assert_eq!((supported_version(&g), HaltControl::for_genesis(&g).supported), (v2, v2));
+        assert_eq!(supported(&g), (v2, v2));
+        g.upgrades = vec![at(preview, 1)];
+        assert_eq!(supported(&g), (preview, preview));
+        g.upgrades = vec![at(v2, 1), at(preview, 50)];
+        assert_eq!(supported(&g), (preview, preview));
         // A genesis without one serializes as it did before the field existed (same file, same hash).
         g.upgrades.clear();
         assert!(serde_json::to_value(&g).unwrap().get("upgrades").is_none());
         let mut with = minimal;
-        with["upgrades"] = serde_json::json!([{ "version": v2, "activation_height": 1 }]);
-        assert_eq!(serde_json::from_value::<crate::chain::Genesis>(with).unwrap().upgrades, vec![at(v2, 1)]);
+        with["upgrades"] = serde_json::json!([{ "version": preview, "activation_height": 1 }]);
+        assert_eq!(serde_json::from_value::<crate::chain::Genesis>(with).unwrap().upgrades, vec![at(preview, 1)]);
+    }
+
+    /// `blockula-1` is born at v1 or at v2 (from block 1), and at nothing else: never a preview
+    /// version, never a later activation, never more than the one entry. And every later binary
+    /// must still load that genesis, so the rule names v2 itself, not this release's version.
+    #[test]
+    fn mainnet_may_be_born_at_v2_and_nothing_else() {
+        let main = crate::chain::MAINNET_CHAIN_ID;
+        let at = |version, activation_height| ScheduledUpgrade { version, activation_height };
+        assert_eq!(MAINNET_GENESIS_VERSION, 2);
+        assert_eq!(MAINNET_GENESIS_VERSION, PROGRAMS_VERSION, "mainnet is born at the version that ships programs v0");
+        check_genesis_upgrades(&[], main).unwrap();
+        check_genesis_upgrades(&[at(2, 1)], main).unwrap();
+        let refused = |u: &[ScheduledUpgrade]| check_genesis_upgrades(u, main).unwrap_err().to_string();
+        for u in [vec![at(2, 2)], vec![at(2, 500)], vec![at(PREVIEW_PROTOCOL_VERSION, 1)], vec![at(2, 1), at(PREVIEW_PROTOCOL_VERSION, 9)], vec![at(PREVIEW_PROTOCOL_VERSION + 1, 1)], vec![at(1, 1)], vec![at(2, 0)]] {
+            let e = refused(&u);
+            assert!(e.contains("born at v2") && e.contains("ScheduleUpgrade"), "{u:?}: {e}");
+        }
+        // Only what's in force at block 1 decides which features a genesis may start with.
+        assert_eq!((version_in(&[], 1), version_in(&[at(2, 1)], 0), version_in(&[at(2, 1)], 1), version_in(&[at(2, 5)], 1)), (1, 1, 2, 1));
+    }
+
+    /// `known_features(version)`: Ghost Mode from v1, programs from v2. Each place a feature is
+    /// switched reads it at its own height: execution at the block it runs in, the invariants at
+    /// the next block.
+    #[test]
+    fn programs_are_a_feature_from_v2() {
+        assert_eq!(known_features(1), &["ghost"]);
+        assert_eq!(known_features(PROGRAMS_VERSION), &["ghost", "programs"]);
+        assert_eq!(known_features(PREVIEW_PROTOCOL_VERSION), &["ghost", "programs"]);
+        assert!(check_feature_name(PROGRAMS_FEATURE).is_ok());
+        check_known_feature("ghost", 1).unwrap();
+        assert_eq!(check_known_feature("programs", 1).unwrap_err().to_string(), "unknown feature programs (known: ghost)", "as a binary without v2 words it");
+        check_known_feature("programs", 2).unwrap();
+        assert!(check_known_feature("contracts", 2).unwrap_err().to_string().contains("known: ghost, programs"));
+        // On a v1 chain with v2 scheduled at 100: refused at 99, on at 100.
+        let mut st = State::default();
+        let mut j = Journal::default();
+        st.upgrade.schedule = vec![ScheduledUpgrade { version: PROGRAMS_VERSION, activation_height: 100 }];
+        assert_eq!(exec_activate_feature(&mut st, &mut j, PROGRAMS_FEATURE, 99).unwrap_err().to_string(), "unknown feature programs (known: ghost)");
+        assert!(!is_active(&st, PROGRAMS_FEATURE));
+        exec_activate_feature(&mut st, &mut j, PROGRAMS_FEATURE, 100).unwrap();
+        assert_eq!(st.upgrade.features.get(PROGRAMS_FEATURE), Some(&Feature { activated_at: 100 }));
+        st.econ.height = 99;
+        check_invariants(&st).unwrap();
+        // The invariant: an active feature the next block's version doesn't know is a broken state.
+        st.upgrade.schedule.clear();
+        assert!(check_invariants(&st).unwrap_err().to_string().contains("unknown feature programs is active under protocol v1"));
+        exec_deactivate_feature(&mut st, &mut j, PROGRAMS_FEATURE).unwrap();
+        check_invariants(&st).unwrap();
     }
 
     /// An upgrade activates at least `MIN_UPGRADE_LEAD` blocks out: that's what lets a verifier

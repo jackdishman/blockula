@@ -1462,6 +1462,44 @@ fn proposals_are_checked_when_they_are_made() {
     }
 }
 
+/// Programs are a feature from v2 (`upgrade::known_features`), and a proposal to switch a feature
+/// on or off is checked against the version in force at its own block. On a chain at v1,
+/// `ActivateFeature { programs }` and `DeactivateFeature { programs }` are refused when they're
+/// proposed, in the words of a binary without v2, and they stay refused while v2 is only
+/// scheduled, even in a block whose proposals would run after it activates: until then every node
+/// runs the chain's blocks under v1, nodes whose binary doesn't have v2 included (they halt only at
+/// the activation height), and each must reach the same outcome. From the activation height on it
+/// may be proposed, and it runs a vote and a timelock later.
+#[test]
+fn programs_switch_on_only_once_v2_is_in_force() {
+    let programs = || ProposalKind::ActivateFeature { feature: crate::upgrade::PROGRAMS_FEATURE.into() };
+    let off = || ProposalKind::DeactivateFeature { feature: crate::upgrade::PROGRAMS_FEATURE.into() };
+    // What a binary without v2 reports (its feature list is `["ghost"]`), word for word.
+    let v1 = "unknown feature programs (known: ghost)";
+    let v2 = crate::upgrade::PROGRAMS_VERSION;
+    let mut t = T::new(&[]);
+    let lag = t.st.chain_params.voting_blocks + t.st.chain_params.timelock_blocks;
+    for kind in [programs(), off()] {
+        assert_eq!(t.err(ALICE, Action::Propose { kind, deposit: 50 * FANG, title: "x".into(), url: String::new() }), v1);
+    }
+    let a = schedule_v(&mut t, v2);
+    // Scheduled, not in force: refused in the block whose proposals would run at the activation
+    // height, and in the last block before it.
+    t.through(a - lag - 1);
+    refused_upgrade(&mut t, ALICE, programs(), v1);
+    t.through(a - 2);
+    assert_eq!(crate::upgrade::version_at(&t.st, t.h), crate::consensus::PROTOCOL_VERSION);
+    refused_upgrade(&mut t, ALICE, programs(), v1);
+    refused_upgrade(&mut t, ALICE, off(), v1);
+    // In force: proposed at the activation height, it runs a vote and a timelock later.
+    t.through(a - 1);
+    assert_eq!((t.h, crate::upgrade::version_at(&t.st, t.h)), (a, v2));
+    let on = pass_by(&mut t, ALICE, ALICE, programs());
+    t.finish(on);
+    assert_eq!(t.p(on).status, ProposalStatus::Executed, "{}", t.p(on).outcome);
+    assert_eq!(t.st.upgrade.features.get(crate::upgrade::PROGRAMS_FEATURE), Some(&crate::upgrade::Feature { activated_at: a + lag }));
+}
+
 #[test]
 fn merkle_trees_build_and_verify() {
     for n in 1..=9usize {

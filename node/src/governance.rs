@@ -574,9 +574,12 @@ fn prepare_kind(state: &State, kind: &ProposalKind, height: u64) -> Result<Propo
             }
         }
         ProposalKind::ActivateFeature { feature } | ProposalKind::DeactivateFeature { feature } => {
-            if !crate::upgrade::KNOWN_FEATURES.contains(&feature.as_str()) {
-                bail!("unknown feature {feature} (known: {})", crate::upgrade::KNOWN_FEATURES.join(", "));
-            }
+            // Known to the version in force at this block, not at `runs_at`: until a scheduled
+            // upgrade activates, every node runs this block under the old version's rules,
+            // nodes whose binary doesn't have the new ones included, so a feature the upgrade
+            // brings is proposed once it's in force. Versions never go down, so it's known when
+            // it runs too (an activation is checked again then).
+            crate::upgrade::check_known_feature(feature, crate::upgrade::version_at(state, height))?;
         }
         ProposalKind::SetRepo { .. } | ProposalKind::Text {} => {}
     }

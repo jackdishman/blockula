@@ -99,10 +99,14 @@ pub const MAX_REPLAY: usize = 64;
 
 // ------------------------------------------------------------------------------------ block
 
-/// Protocol version this binary executes (MAINNET-DESIGN 3.9: the version in force at a height).
+/// The protocol version a chain starts at: in force at every height until a scheduled upgrade
+/// (MAINNET-DESIGN 3.9: the version in force at a height, `upgrade::version_at`).
 pub const PROTOCOL_VERSION: u32 = 1;
-/// Newest protocol version this binary supports, signalled in every block it proposes.
-pub const SUPPORTED_PROTOCOL_VERSION: u32 = 1;
+/// Newest protocol version this binary supports, signalled in every block it proposes: v2, which
+/// ships programs v0 dormant (nothing in v2 differs from v1 until the `programs` feature is on,
+/// `upgrade::known_features`). A chain born with a preview schedule runs
+/// `upgrade::PREVIEW_PROTOCOL_VERSION` instead (`upgrade::supported_version`).
+pub const SUPPORTED_PROTOCOL_VERSION: u32 = 2;
 /// The protocol version and signal the genesis block carries, on every binary: its digest is the
 /// genesis hash every node, tx and checkpoint pins, so it can't follow a release's
 /// [`PROTOCOL_VERSION`] or [`SUPPORTED_PROTOCOL_VERSION`] (a release signalling an upgrade would
@@ -1778,12 +1782,16 @@ mod tests {
 
     #[test]
     fn cblock_v2_encodes_decodes_and_commits_to_every_field() {
-        let b = CBlock::new(Digest([1; 32]), 5, 9, 7, 1_000, "boo1proposer".into(), 4, [2; 32], vec![vec![1, 2, 3], vec![]]);
+        // A new block runs the chain's starting version and signals what this binary supports;
+        // the known answer below is for a v1 block signalling v1, whatever the release.
+        let fresh = CBlock::new(Digest([1; 32]), 5, 9, 7, 1_000, "boo1proposer".into(), 4, [2; 32], vec![vec![1, 2, 3], vec![]]);
+        assert_eq!((fresh.version, fresh.signal), (PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSION));
+        let b = fresh.with_versions(1, 1);
         let bytes = b.encode();
         assert_eq!(bytes.len(), b.encode_size());
         let back = CBlock::decode(bytes.as_ref()).unwrap();
         assert_eq!(back, b);
-        assert_eq!((back.version, back.view, back.parent_view, back.signal), (PROTOCOL_VERSION, 9, 7, SUPPORTED_PROTOCOL_VERSION));
+        assert_eq!((back.version, back.view, back.parent_view, back.signal), (1, 9, 7, 1));
         assert_eq!(b.digest(), Blake3::hash(&[b"BLOCKULA_CBLOCK_V2", bytes.as_ref()]));
         assert_eq!(hex::encode(b.digest_bytes()), "ca6c7aad4e59ed281b8cca54e99c172eb72ebdf3f5ce4e51c5c83cd3eecb23e3");
         // Every header field is under the digest.
@@ -1990,15 +1998,16 @@ mod tests {
                 }
             };
             assert_eq!(verify(1, above(20)).await, Some(true), "v1 before the activation height");
-            assert_eq!(verify(2, above(20)).await, Some(false), "v2 too early");
-            // This binary runs v1 only: from the activation height on, no vote either way.
-            assert_eq!(verify(2, above(73)).await, None);
+            assert_eq!(verify(v2, above(20)).await, Some(false), "the new version too early");
+            // This binary doesn't run the new version: from the activation height on, no vote
+            // either way.
+            assert_eq!(verify(v2, above(73)).await, None);
             assert_eq!(verify(1, above(73)).await, None);
             crate::upgrade::configure(&mut chain.lock(), v2, None);
             assert_eq!(verify(1, above(73)).await, Some(false), "v1 after the activation height");
-            assert_eq!(verify(2, above(73)).await, Some(true));
+            assert_eq!(verify(v2, above(73)).await, Some(true));
             // A block 64+ heights past what we executed waits until the version there is certain.
-            assert_eq!(verify(2, above(80)).await, None);
+            assert_eq!(verify(v2, above(80)).await, None);
             // --halt-height 50: nothing past it gets a vote.
             crate::upgrade::configure(&mut chain.lock(), v2, Some(50));
             assert_eq!(verify(1, above(20)).await, Some(true));
@@ -2090,10 +2099,10 @@ mod tests {
     }
 
     /// P7 (docs/PROGRAMS-PLAN.md): a version-gated rule (the test-only `upgrade::test_gate`, which
-    /// refuses its memo from v2 on) flips at the activation height in proposals and verification
-    /// too, on the replayed parent state: below it a proposer includes a gated tx and verifiers
-    /// accept a block carrying one; from it on the proposer leaves it out and verifiers reject
-    /// such a block. Ungated txs go in either way.
+    /// refuses its memo from the preview version on) flips at the activation height in proposals
+    /// and verification too, on the replayed parent state: below it a proposer includes a gated tx
+    /// and verifiers accept a block carrying one; from it on the proposer leaves it out and
+    /// verifiers reject such a block. Ungated txs go in either way.
     #[test]
     fn proposals_and_verification_apply_a_version_gated_rule_from_its_height() {
         let home = std::env::temp_dir().join(format!("blockula-gate-{}-{}", crate::chain::now_ms(), std::process::id()));
@@ -2105,8 +2114,8 @@ mod tests {
         }
         c.produce_block().unwrap();
         let e = c.height();
-        // v2 from e + 3 on (set directly: governance schedules it MIN_UPGRADE_LEAD ahead), on a
-        // binary that runs it.
+        // The preview version from e + 3 on (set directly: governance schedules it
+        // MIN_UPGRADE_LEAD ahead), on a binary that runs it.
         let at = e + 3;
         let v2 = crate::upgrade::PREVIEW_PROTOCOL_VERSION;
         c.state.upgrade.schedule = vec![crate::upgrade::ScheduledUpgrade { version: v2, activation_height: at }];
@@ -2136,7 +2145,8 @@ mod tests {
                 Application::<deterministic::Context>::propose(&mut app, (context.child("propose"), cctx), ancestry, ()).await.unwrap()
             };
             let has = |b: &CBlock, t: &Tx| b.txs.contains(&t.to_bytes());
-            // Height e + 2 runs v1: both go in. Height e + 3 runs v2: only the ungated one.
+            // Height e + 2 runs v1: both go in. Height e + 3 runs the preview version: only the
+            // ungated one.
             let below = propose(run(e + 1)).await;
             assert_eq!((below.height, below.version), (at - 1, 1));
             assert!(has(&below, &gated) && has(&below, &plain));
