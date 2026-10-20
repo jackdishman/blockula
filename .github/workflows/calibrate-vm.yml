@@ -1,0 +1,73 @@
+# Floor-machine calibration for the programs engine (node/vm, docs/PROGRAMS.md 4.5): runs its
+# calibration bench (node/vm/benches/calibrate.rs) on x86-64 and aarch64, under the fuel schedule
+# the engine prices with (meter::SCHEDULE_V0), and uploads each run's tables as an artifact: the
+# evidence that no path in its corpus runs slower than 2.5 ns per fuel on the floor machines.
+#
+# Dispatch only: it never runs on push or pull requests. The numbers are performance
+# measurements, safe to log.
+#
+# x86-64 here is GitHub's shared `ubuntu-24.04` runner, not a dedicated machine: cheaper but
+# noisier, so its numbers are a first pass, and schedule v0's 1.5–3× margin is what absorbs the
+# noise for every item but upload. Upload's price has ~1.22× (node/vm/src/meter.rs), so the bench
+# reports it as a go/no-go line of its own: each run puts that line in its summary and fails on
+# NO-GO, after saving the tables. Phase 0's records (node/vm/CALIBRATION*.md) came from the same
+# two runners.
+name: Calibrate programs engine
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: quick (3 reps) or full (9 reps)
+        type: choice
+        options: [quick, full]
+        default: quick
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  calibrate:
+    name: Calibrate ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, os: ubuntu-24.04 }
+          - { arch: aarch64, os: ubuntu-24.04-arm }
+    env:
+      PROFILE: ${{ inputs.profile }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustc --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with: { workspaces: node/vm }
+      # The bench loads the committed tests/programs/*.wasm, so no wasm toolchain is needed.
+      - name: Calibrate (soroban-wasmi)
+        working-directory: node/vm
+        run: |
+          if [ "$PROFILE" = quick ]; then set -- --quick; else set --; fi
+          cargo bench --locked --bench calibrate -- "$@" --out "$RUNNER_TEMP/calibration-$ARCH.md"
+      - name: Show the tables in the log
+        run: cat "$RUNNER_TEMP/calibration-$ARCH.md"
+      - name: Upload the calibration tables
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: calibration-${{ matrix.arch }}
+          path: ${{ runner.temp }}/calibration-${{ matrix.arch }}.md
+          if-no-files-found: error
+      - name: Upload go/no-go
+        run: |
+          line=$(grep -m1 'Upload go/no-go:' "$RUNNER_TEMP/calibration-$ARCH.md") || { echo "::error::$ARCH: the report has no upload go/no-go line"; exit 1; }
+          echo "$ARCH: $line" >> "$GITHUB_STEP_SUMMARY"
+          case "$line" in
+            *NO-GO*) echo "::error::$ARCH: $line"; exit 1 ;;
+            *) echo "$line" ;;
+          esac
