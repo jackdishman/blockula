@@ -34,6 +34,7 @@ while read -r where image; do
   [[ $image =~ @sha256:[0-9a-f]{64}$ ]] || bad "image not pinned by digest: $where $image"
 done < <( {
   grep -nE '^FROM ' deploy/Dockerfile | sed -E 's/^([0-9]+):FROM ([^ ]+).*/deploy\/Dockerfile:\1 \2/'
+  grep -nE '^FROM ' deploy/mainnet/Dockerfile | sed -E 's/^([0-9]+):FROM ([^ ]+).*/deploy\/mainnet\/Dockerfile:\1 \2/'
   grep -nE '^RELEASE_IMAGE=' scripts/reproduce-release.sh | sed -E 's/^([0-9]+):RELEASE_IMAGE=/scripts\/reproduce-release.sh:\1 /'
   grep -noE '(image|container): *"?[^"}, ]+' deploy/monitoring/docker-compose.yml "${workflows[@]}" /dev/null \
     | grep -vF "\${{" | sed -E 's/^([^:]+:[0-9]+):(image|container): *"?/\1 /'
