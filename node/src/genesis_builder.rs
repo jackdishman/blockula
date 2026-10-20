@@ -1017,17 +1017,12 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../deploy/mainnet/genesis-spec.example.toml")
     }
 
-    /// One example operator: (seed byte, name, entity, provider, ASN, country, facility,
-    /// founder's seat).
-    type ExampleOperator = (u8, &'static str, &'static str, &'static str, u32, &'static str, &'static str, bool);
+    /// One example operator: (seed byte, Fly region, data-center country).
+    type ExampleOperator = (u8, &'static str, &'static str);
 
-    /// The example spec's operators.
-    const EXAMPLE_OPERATORS: [ExampleOperator; 4] = [
-        (0xe1, "Founder validator A", "Blockula Labs", "Fly.io", 40_509, "US", "fly-iad", true),
-        (0xe2, "Founder validator B", "Blockula Labs", "Fly.io", 40_509, "DE", "fly-fra", true),
-        (0xe3, "Example Validators GmbH", "Example Validators GmbH", "OVHcloud", 16_276, "FR", "ovh-gra3", false),
-        (0xe4, "Example Staking Ltd", "Example Staking Ltd", "Latitude.sh", 396_356, "BR", "latitude-sao2", false),
-    ];
+    /// The example spec's operators: the founder's four Fly validators, one region each, as the
+    /// experimental launch runs them (unflagged, an owner each, commission 0).
+    const EXAMPLE_OPERATORS: [ExampleOperator; 4] = [(0xe1, "iad", "US"), (0xe2, "sjc", "US"), (0xe3, "fra", "DE"), (0xe4, "ams", "NL")];
 
     fn owner(seed: u8, prefix: &str) -> String {
         Keys::from_seed([seed.wrapping_sub(0x10); 32]).address_with(prefix)
@@ -1041,11 +1036,11 @@ mod tests {
     fn regenerate_example_operators() {
         let dir = example().parent().unwrap().join("operators");
         std::fs::create_dir_all(&dir).unwrap();
-        for (i, (seed, name, entity, provider, asn, country, facility, founder)) in EXAMPLE_OPERATORS.into_iter().enumerate() {
+        for (i, (seed, region, country)) in EXAMPLE_OPERATORS.into_iter().enumerate() {
             let owner = owner(seed, "tboo");
-            let independence = Independence { legal_entity: entity.into(), entity_jurisdiction: country.into(), hosting_provider: provider.into(), asn, datacenter_country: country.into(), datacenter: facility.into(), founder_or_foundation: founder, statement: "Example operator for the dry-run spec: throwaway keys, not a real submission.".into(), ..Default::default() };
-            let info = OperatorInfo { name: name.into(), contact: vec![format!("ops@operator-{}.example", i + 1)] };
-            let f = operator_file(&Keys::from_seed([seed; 32]), "blockula-dryrun-1", &owner, &format!("203.0.113.{}:30300", i + 1), &format!("https://rpc{}.operator.example", i + 1), 500, "10000", info, independence).unwrap();
+            let independence = Independence { legal_entity: "Blockula Labs".into(), entity_jurisdiction: "US".into(), hosting_provider: "Fly.io".into(), asn: 40_509, datacenter_country: country.into(), datacenter: format!("fly-{region}"), founder_or_foundation: false, statement: "Example operator for the dry-run spec: throwaway keys, not a real submission. Run by the founder (disclosed).".into(), ..Default::default() };
+            let info = OperatorInfo { name: format!("Blockula validator {region}"), contact: vec![format!("ops@operator-{}.example", i + 1)] };
+            let f = operator_file(&Keys::from_seed([seed; 32]), "blockula-dryrun-1", &owner, &format!("203.0.113.{}:30300", i + 1), &format!("https://rpc{}.operator.example", i + 1), 0, "10000", info, independence).unwrap();
             std::fs::write(dir.join(format!("example-{}.toml", i + 1)), toml::to_string(&f).unwrap()).unwrap();
             println!("operator {}: owner {owner}", i + 1);
         }
@@ -1054,9 +1049,12 @@ mod tests {
         }
     }
 
-    /// The example spec builds to the same bytes and hash every time, encodes DEC-5 exactly
-    /// (buckets, keyless accounts, vesting curves), and loads as a genesis; its dry-run
-    /// shortcuts are warnings, which `--strict` refuses.
+    /// The example spec builds to the same bytes and hash every time, strict, as the experimental
+    /// launch: DEC-5 exactly (buckets, keyless accounts, vesting curves, the operator floats inside
+    /// the operators bucket), born at v2 with programs off, governance live from block 1, and the
+    /// independence findings of a founder-run set of 4 waived on record, each printed. It loads as
+    /// a genesis, and the bootstrap delegation backs the four unflagged seats, paying them no
+    /// commission.
     #[test]
     fn example_spec_builds_byte_identically() {
         let a = build(&example(), false).unwrap();
@@ -1077,13 +1075,38 @@ mod tests {
         assert_eq!(curve("endowment"), Some(Vesting { start: 0, cliff: 0, end: 315_576_000 }));
         assert_eq!(curve("community"), None);
         assert_eq!(curve("bootstrap"), Some(Vesting { start: 31_557_600, cliff: 31_557_600, end: 126_230_400 }), "returns to the treasury over years 2–4");
-        // The founder's account and the founder's or foundation's seats get no bootstrap delegation.
-        let founder_seats = EXAMPLE_OPERATORS.iter().filter(|o| o.7).map(|o| owner(o.0, "tboo"));
-        let mut excluded: Vec<String> = founder_seats.chain(["founder"].map(|l| g.allocations.iter().find(|x| x.label.as_deref() == Some(l)).unwrap().address.clone())).collect();
-        excluded.sort();
-        assert_eq!(g.bootstrap_excluded, excluded);
+        // The operators bucket: four owners, the grants and four 100 FANG floats, liquid, on the
+        // validators' consensus-key accounts.
+        let operators: u64 = g.allocations.iter().filter(|x| x.vesting.as_ref() == curve("security grants").as_ref() || x.label.as_deref() == Some(OPERATOR_FLOAT_LABEL)).map(|x| x.amount).sum();
+        assert_eq!(operators, 30_000_000 * FANG);
+        let floats: Vec<(String, u64)> = g.allocations.iter().filter(|x| x.vesting.is_none() && system_account("tboo", &x.address).is_none()).map(|x| (x.address.clone(), x.amount)).collect();
+        assert_eq!(floats, g.validators.iter().map(|v| (v.address.clone(), 100 * FANG)).collect::<Vec<_>>());
+        // Born at v2, programs off; governance's parameters for a small set.
+        assert_eq!((g.upgrades.clone(), g.features.clone()), (vec![crate::upgrade::ScheduledUpgrade { version: 2, activation_height: 1 }], vec![]));
+        let cp = g.chain_params().unwrap();
+        assert_eq!((cp.proposal_deposit, cp.voting_blocks, cp.timelock_blocks, cp.bootstrap_end_height, cp.downtime_window, cp.downtime_max_missed), (10 * FANG, 259_200, 86_400, 63_072_000, 1_200, 600));
+        cp.check_governance_floors(&g.params()).unwrap();
+        assert_eq!(cp.bootstrap_commission_cap_bps, 0, "the bootstrap delegation pays the founder's seats no commission, whatever they charge");
+        // Unflagged founder-run seats, an owner each, commission 0: only the founder's own account
+        // is passed over by the bootstrap delegation.
+        assert_eq!(g.bootstrap_excluded, [g.allocations.iter().find(|x| x.label.as_deref() == Some("founder")).unwrap().address.clone()]);
+        assert!(g.operators.iter().all(|o| o.commission_bps == 0) && g.operators.iter().map(|o| &o.owner).collect::<BTreeSet<_>>().len() == 4);
         assert!(!g.faucet && g.validator_admins.is_empty() && g.validators.len() == 4 && g.operators.len() == 4);
         assert!(g.validators.windows(2).all(|w| w[0].address < w[1].address), "validators in canonical order");
+        // The waivers, each finding printed with its reason; nothing else.
+        assert!(a.warnings.is_empty(), "{:?}", a.warnings);
+        let w = a.waived.join("\n");
+        for expected in [
+            "WAIVED: operator-minimum: 4 operators; a mainnet genesis needs at least 22 (DEC-3) (experimental launch: the founder's 4 validators (DEC-3 asks for 22); seats open to stake after launch)",
+            "WAIVED: provider-cap: hosting provider fly.io has 4 of the 4 operators; at most 1 may (all 4 run on Fly.io, one failure domain, disclosed)",
+            "WAIVED: asn-cap: ASN 40509 has 4 of the 4 operators; at most 1 may (all 4 announce from Fly's ASN 40509)",
+            "WAIVED: country-cap: data-center country us has 2 of the 4 operators; at most 1 may (two of the 4 regions are in the US (iad, sjc))",
+            "WAIVED: facility-cap: facility fly-iad has 1 of the 4 operators; at most 0 may (with fewer than 7 operators any facility holds more than 15% of the set)",
+            "WAIVED: one-seat-per-entity: legal entity blockula labs has 4 of the 4 operators; at most 1 may (the founder runs all 4 seats, unflagged so a seat that leaves can rejoin; disclosed as founder-run)",
+        ] {
+            assert!(w.contains(expected), "missing {expected:?} in:\n{w}");
+        }
+        assert_eq!(a.waived.len(), 9, "four facilities");
         // It's a genesis like any other: the file loads, and its state holds the allocation.
         let dir = std::env::temp_dir().join(format!("blockula-genesis-example-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1094,29 +1117,27 @@ mod tests {
         st.check_invariants().unwrap();
         assert_eq!(st.supply, MAX_SUPPLY);
         assert_eq!(crate::econ::transferable(&st, &owner(0xe3, "tboo"), 0), 0, "an operator's allocation is locked (its self-bond is bonded)");
+        assert_eq!(crate::econ::voting_balance(&st, &g.validators[0].address, 1), 100 * FANG, "a council member votes from block 1");
         // Audit F12: the bootstrap bucket has a mover. At the first boundary it's staked with the
-        // two seats not run by the founder; once its curve has run, it's all the treasury's.
+        // four seats; once its curve has run, it's all the treasury's.
         let boot = bootstrap_delegation("tboo");
         crate::staking::end_epoch(&mut st, 0);
         crate::staking::bootstrap_epoch(&mut st, 0);
         let staked: Vec<(String, u64)> = crate::staking::delegations_of(&st, &boot).into_iter().map(|(v, _)| (v.clone(), crate::staking::delegation_value(&st, &boot, &v))).collect();
-        let independent: Vec<String> = g.operators.iter().filter(|o| !g.bootstrap_excluded.contains(&o.owner)).map(|o| crypto::address_with_prefix("tboo", &hex::decode(&o.consensus_key).unwrap())).collect();
-        assert_eq!(staked.iter().map(|(v, _)| v.clone()).collect::<Vec<_>>(), independent);
-        assert!(staked.iter().all(|(_, w)| *w == 50_000_000 * FANG), "{staked:?}");
+        assert_eq!(staked.iter().map(|(v, _)| v.clone()).collect::<Vec<_>>(), g.validators.iter().map(|v| v.address.clone()).collect::<Vec<_>>());
+        assert!(staked.iter().all(|(_, w)| *w == 25_000_000 * FANG), "{staked:?}");
         let treasury_before = st.account(&treasury("tboo")).balance;
         let past_curve = st.params.epoch_of(126_230_400) + 1;
         crate::staking::bootstrap_epoch(&mut st, past_curve);
         assert!(crate::staking::delegations_of(&st, &boot).is_empty() && st.account(&boot).balance == 0);
         assert_eq!(st.account(&treasury("tboo")).balance - treasury_before, 100_000_000 * FANG);
         std::fs::remove_dir_all(dir).ok();
-        // The dry run's shortcuts.
-        let w = a.warnings.join("\n");
-        for expected in ["4 operators; a mainnet genesis needs at least 22", "hosting provider fly.io has 2 of the 4 operators; at most 1 may", "ASN 40509 has 2", "facility fly-iad has 1 of the 4 operators; at most 0 may"] {
-            assert!(w.contains(expected), "missing warning {expected:?} in:\n{w}");
-        }
-        assert!(!w.contains("legal entity"), "the founder's two seats count against the founder cap, not the entity rule");
-        let err = format!("{:#}", build(&example(), true).err().unwrap());
-        assert!(err.contains("strict") && err.contains("at least 22"), "{err}");
+        // Without the waivers, strict refuses it.
+        let mut bare: Spec = toml::from_str(&std::fs::read_to_string(example()).unwrap()).unwrap();
+        bare.waivers.clear();
+        let ops: Vec<OperatorFile> = bare.operators.iter().map(|f| OperatorFile::load(&example().parent().unwrap().join(f)).unwrap()).collect();
+        let err = format!("{:#}", build_from(&bare, &ops, false).err().unwrap());
+        assert!(err.contains("strict") && err.contains("at least 22") && err.contains("may waive"), "{err}");
     }
 
     /// `n` operators on distinct providers, ASNs, countries and facilities, each owning an
