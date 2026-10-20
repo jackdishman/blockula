@@ -2,7 +2,8 @@
 //! real host, on every engine (`EngineKind::ALL`, wasmi 0.38 too with `--features ref038`):
 //!
 //! * **Upload.** Code reaches `MemHost` only through `MemHost::upload`: upload validation (4.2),
-//!   then a test translation on a throwaway engine of every kind, then storage by hash.
+//!   then a test translation on a throwaway soroban-wasmi engine (`upload::check`), then storage
+//!   by hash.
 //! * **Execution.** Every transaction runs through `exec::execute` on a fresh block engine loaded
 //!   with exactly its declared programs' code (cold), then again on that engine (warm): the two
 //!   receipts must be identical, fuel included. The engines must agree on everything but fuel:
@@ -13,24 +14,27 @@
 //!   account it opened. Then its diff is applied, as commit would.
 //!
 //! These are the guests agent's stand-in host checks (once in `tests/guests.rs`) on the real
-//! host, plus the router's cross-program calls and the engine-per-block lifecycle (4.3).
+//! host, plus the router's cross-program calls and an engine's lifecycle (per block as 4.3 has
+//! it, and per transaction as the node runs it).
 //! `cargo test --test e2e fuel_table -- --nocapture` prints each call's fuel on every engine.
 
 use std::collections::BTreeSet;
 use std::path::Path;
 
 use blockula_vm::abi::status;
-use blockula_vm::engine::{Address, EngineKind, Trap, new_block_engine};
-use blockula_vm::exec::{Call, Diff, Event, FailCode, Receipt, TxLimits, execute};
-use blockula_vm::host::View;
-use blockula_vm::meter::V1;
-use blockula_vm::testing::{MemHost, UploadError, addr, strip_custom_sections};
+use blockula_vm::engine::{Address, EngineKind, TrapKind, new_block_engine};
+use blockula_vm::exec::{ANY_VERSION, Call, Diff, Event, FailCode, Receipt, TxLimits, execute};
+use blockula_vm::host::{MethodKind, View};
+use blockula_vm::meter::SCHEDULE_V0;
+use blockula_vm::storage::capacity;
+use blockula_vm::testing::{MemHost, addr, strip_custom_sections};
+use blockula_vm::upload::Refusal;
 use blockula_vm::validate::{Rule, validate};
 
 const FANG: u64 = 1_000_000_000;
 const LIMITS: TxLimits = TxLimits { fuel_limit: 10_000_000, storage_limit: FANG };
 const PROGRAMS: &[&str] = &["counter", "token", "escrow", "router"];
-/// Drops per byte a deposit bonds (`MemHost`'s flat price).
+/// Drops per byte a deposit bonds (`MemHost`'s price, far below its soft cap).
 const PRICE: i128 = 100;
 
 fn wasm(name: &str) -> Vec<u8> {
@@ -46,13 +50,16 @@ fn cat(parts: &[&[u8]]) -> Vec<u8> {
     parts.concat()
 }
 
+/// A `CallProgram` call; `Chain::tx` binds it to its program's version in force, as a wallet
+/// would after previewing it.
 fn call(program: &str, method: &str, input: Vec<u8>, value: u64) -> Call {
-    Call { program: addr(program), method: method.into(), input, value }
+    Call { program: addr(program), version_digest: ANY_VERSION, method: method.into(), input, value, kind: MethodKind::Call }
 }
 
-/// The deposit `key` ‖ a `value_len`-byte value bonds.
+/// The deposit `key` ‖ a `value_len`-byte value bonds: its capacity (`storage::capacity`) at
+/// `PRICE`.
 fn deposit(key_len: usize, value_len: usize) -> i128 {
-    PRICE * (key_len + value_len) as i128
+    PRICE * i128::from(capacity(key_len, value_len))
 }
 
 /// Runs `f` on a thread with the executor thread's stack (4.3: 64 MiB).
@@ -60,19 +67,24 @@ fn on_executor_thread<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     std::thread::scope(|s| std::thread::Builder::new().stack_size(64 << 20).spawn_scoped(s, f).unwrap().join().unwrap())
 }
 
-fn trapped(r: &Receipt) -> (Address, Trap) {
+fn trapped(r: &Receipt) -> (Address, TrapKind) {
     match &r.fail {
-        Some(FailCode::Trapped { program, trap }) => (*program, trap.clone()),
+        Some(FailCode::Trapped { program, kind }) => (*program, *kind),
         other => panic!("expected a trap, got {other:?}"),
     }
 }
 
 /// The program and code of an abort.
-fn aborted(r: &Receipt) -> (Address, i32) {
-    match trapped(r) {
-        (program, Trap::Abort { code, .. }) => (program, code),
+fn aborted(r: &Receipt) -> (Address, u32) {
+    match &r.fail {
+        Some(FailCode::Aborted { program, code, .. }) => (*program, *code),
         other => panic!("expected an abort, got {other:?}"),
     }
+}
+
+/// An abort's program, code and message.
+fn abort(program: &str, code: u32, message: &str) -> Option<FailCode> {
+    Some(FailCode::Aborted { program: addr(program), code, message: message.into() })
 }
 
 fn delta(r: &Receipt, account: Address) -> i128 {
@@ -82,15 +94,15 @@ fn delta(r: &Receipt, account: Address) -> i128 {
 fn outcome(r: &Receipt) -> String {
     match &r.fail {
         None => "ok".into(),
-        Some(FailCode::Trapped { trap: Trap::Abort { code, .. }, .. }) => format!("Abort({code})"),
-        Some(FailCode::Trapped { trap, .. }) => format!("{trap:?}"),
+        Some(FailCode::Aborted { code, .. }) => format!("Abort({code})"),
+        Some(FailCode::Trapped { kind, .. }) => format!("{kind:?}"),
         Some(f) => format!("{f:?}"),
     }
 }
 
 /// 4.4's commit checks from the outside, plus what `Diff::check` can't see (see the module doc).
 fn audit(host: &MemHost, signer: Address, calls: &[Call], reachable: &BTreeSet<Address>, r: &Receipt) {
-    if !r.ok {
+    if !r.ok() {
         assert_eq!((&r.diff, r.events.len(), r.returns.len()), (&Diff::default(), 0, 0), "a failed transaction changes nothing");
         return;
     }
@@ -142,17 +154,19 @@ impl Chain {
     /// One transaction in a block of its own, on every engine: see the module doc.
     fn tx(&mut self, label: &str, signer: &str, calls: Vec<Call>, declared: &[&str]) -> Receipt {
         let signer = addr(signer);
+        let calls: Vec<Call> = calls.into_iter().map(|c| self.host.bind(c)).collect();
         let declared: Vec<Address> = declared.iter().map(|d| addr(d)).collect();
         let reachable: BTreeSet<Address> = calls.iter().map(|c| c.program).chain(declared.iter().copied()).collect();
         let programs: Vec<Address> = reachable.iter().copied().collect();
+        let bindings = MemHost::any_version(&declared);
         let host = &self.host;
         let receipts: Vec<Receipt> = EngineKind::ALL
             .iter()
             .map(|&kind| {
                 on_executor_thread(|| {
-                    let (engine, _) = host.engine_for(kind, &V1, &programs).expect("uploaded code loads");
-                    let cold = execute(engine.as_ref(), host, signer, &calls, &declared, LIMITS, &V1);
-                    let warm = execute(engine.as_ref(), host, signer, &calls, &declared, LIMITS, &V1);
+                    let (engine, _) = host.engine_for(kind, &SCHEDULE_V0, &programs).expect("uploaded code loads");
+                    let cold = execute(engine.as_ref(), host, signer, &calls, &bindings, LIMITS, &SCHEDULE_V0).expect("no node fault");
+                    let warm = execute(engine.as_ref(), host, signer, &calls, &bindings, LIMITS, &SCHEDULE_V0).expect("no node fault");
                     assert_eq!(cold, warm, "{label}: cold and warm differ on {}", kind.name());
                     cold
                 })
@@ -165,7 +179,7 @@ impl Chain {
         }
         audit(host, signer, &calls, &reachable, &first);
         self.log.push((label.into(), outcome(&first), receipts.iter().map(|r| r.fuel_used).collect()));
-        if first.ok {
+        if first.ok() {
             self.host.apply(&first.diff);
         }
         first
@@ -201,8 +215,8 @@ impl Chain {
 
 // --- upload ---
 
-/// Every committed guest passes upload validation and both engines' test translations; refused
-/// code is stored nowhere. The float and `memory.grow` cases are ones both engines translate
+/// Every committed guest passes upload validation and the test translation; refused code is stored
+/// nowhere. The float and `memory.grow` cases are ones both engines translate
 /// (`tests/engines.rs`, `validate.rs`'s tests), so it's validation, run first, that keeps them
 /// from the engines.
 #[test]
@@ -210,8 +224,8 @@ fn code_arrives_only_through_upload_validation() {
     let mut host = MemHost::new();
     for p in PROGRAMS {
         let code = wasm(p);
-        let hash = host.upload(&code).unwrap_or_else(|e| panic!("{p}: {e}"));
-        assert_eq!(host.upload(&code), Ok(hash), "{p}: uploading again is a no-op");
+        let hash = host.upload(&code).expect("no node fault").unwrap_or_else(|e| panic!("{p}: {e}"));
+        assert_eq!(host.upload(&code), Ok(Ok(hash)), "{p}: uploading again is a no-op");
         assert_eq!(host.code(&hash), Some(&code[..]));
         assert_eq!(validate(&code).unwrap().exports.len(), match *p {
             "counter" | "router" => 2,
@@ -221,7 +235,7 @@ fn code_arrives_only_through_upload_validation() {
     }
     let refused = |host: &mut MemHost, code: &[u8], rule: Rule| {
         match host.upload(code) {
-            Err(UploadError::Invalid(e)) => assert_eq!(e.rule, rule, "{e}"),
+            Ok(Err(Refusal::Invalid(e))) => assert_eq!(e.rule, rule, "{e}"),
             other => panic!("expected {rule:?}, got {other:?}"),
         }
         assert_eq!(host.code(blake3::hash(code).as_bytes()), None, "refused code isn't stored");
@@ -261,7 +275,7 @@ fn counter_counts_across_transactions() {
     let r = c.tx("counter.increment (input)", "alice", vec![call("counter", "increment", b"x".to_vec(), 0)], &[]);
     assert_eq!(aborted(&r), (addr("counter"), 1), "input must be empty");
     assert_eq!(c.tx("counter.get", "alice", get(), &[]).returns, vec![le(2)]);
-    assert_eq!(c.balance("alice"), Some(FANG - 900));
+    assert_eq!(c.balance("alice"), Some(FANG - deposit(1, 8) as u64));
 }
 
 #[test]
@@ -277,7 +291,7 @@ fn token_moves_balances_and_emits_transfers() {
 
     assert_eq!(c.tx("token.total_supply", "alice", vec![call("token", "total_supply", vec![], 0)], &[]).returns, vec![le(0)]);
     let r = c.tx("token.init", "bob", vec![call("token", "init", cat(&[&alice, &le(1_000)]), 0)], &[]);
-    assert!(r.ok, "anyone may init, for anyone: {r:?}");
+    assert!(r.ok(), "anyone may init, for anyone: {r:?}");
     assert_eq!(delta(&r, bob), -(deposit(1, 8) + entry), "bob bonded the supply and alice's balance");
     let r = c.tx("token.init (again)", "alice", vec![call("token", "init", cat(&[&alice, &le(5)]), 0)], &[]);
     assert_eq!(aborted(&r), (addr("token"), 10));
@@ -291,9 +305,9 @@ fn token_moves_balances_and_emits_transfers() {
     assert_eq!((balance_of(&mut c, &alice), balance_of(&mut c, &bob)), (700, 300));
 
     let r = c.tx("token.transfer (short)", "bob", transfer(&carol, 301), &[]);
-    assert_eq!(trapped(&r), (addr("token"), Trap::Abort { code: 11, message: "balance short".into() }));
+    assert_eq!(r.fail, abort("token", 11, "balance short"));
     let r = c.tx("token.transfer (empties)", "bob", transfer(&carol, 300), &[]);
-    assert!(r.ok, "{r:?}");
+    assert!(r.ok(), "{r:?}");
     assert_eq!(c.stored("token", &cat(&[b"b", &bob])), None, "an emptied balance is removed");
     // Its deposit goes back to whoever paid it (alice, who sent the tokens), never the remover;
     // bob bonds carol's new entry.
@@ -370,10 +384,10 @@ fn escrow_releases_to_the_seller_and_refunds_the_buyer() {
     c.tx("escrow.open (small)", "mallory", escrow("open", open(3, &fresh), fee - 1), &[]);
     let kept = c.stored("escrow", &cat(&[b"d", &le(3)]));
     let r = c.tx("escrow.release (smaller than the fee)", "mallory", escrow("release", le(3), 0), &[]);
-    assert_eq!(trapped(&r), (addr("escrow"), Trap::Abort { code: 4, message: "transfer failed".into() }));
+    assert_eq!(r.fail, abort("escrow", 4, "transfer failed"));
     assert_eq!((c.stored("escrow", &cat(&[b"d", &le(3)])), c.balance("fresh")), (kept, None));
     c.host.fund(fresh, 0);
-    assert!(c.tx("escrow.refund (small)", "fresh", escrow("refund", le(3), 0), &[]).ok);
+    assert!(c.tx("escrow.refund (small)", "fresh", escrow("refund", le(3), 0), &[]).ok());
     assert_eq!(c.balance("mallory"), Some(FANG));
 
     assert_eq!(aborted(&c.tx("escrow.open (short input)", "mallory", escrow("open", vec![0; 39], 1), &[])), (addr("escrow"), 1));
@@ -413,10 +427,10 @@ fn router_moves_its_own_tokens_by_call_and_try_call() {
 
     // The token must be in the declared set.
     let r = c.tx("router.send (token unbound)", "alice", vec![call("router", "send", route(&[], "carol", 1), 0)], &[]);
-    assert_eq!(trapped(&r), (router, Trap::UnboundProgram));
+    assert_eq!(trapped(&r), (router, TrapKind::UnboundProgram));
     // `call` traps the caller with the callee's failure, reported where it began.
     let r = c.tx("router.send (balance short)", "alice", vec![call("router", "send", route(&[], "carol", 10_000), 0)], &["token"]);
-    assert_eq!(trapped(&r), (addr("token"), Trap::Abort { code: 11, message: "balance short".into() }));
+    assert_eq!(r.fail, abort("token", 11, "balance short"));
     let r = c.tx("router.send (value)", "alice", vec![call("router", "send", route(&[], "carol", 1), 1)], &["token"]);
     assert_eq!(aborted(&r), (router, 2));
     let r = c.tx("router.send (bad input)", "alice", vec![call("router", "send", vec![0; 73], 0)], &["token"]);
@@ -429,7 +443,7 @@ fn router_moves_its_own_tokens_by_call_and_try_call() {
     // The token aborts: the router runs on with its code (`last_abort_code`) and its message
     // (`last_return`); the token's layer is dropped, its event with it.
     let r = c.tx("router.try_send (abort)", "alice", vec![call("router", "try_send", route(&[], "carol", 10_000), 0)], &["token"]);
-    assert!(r.ok, "{r:?}");
+    assert!(r.ok(), "{r:?}");
     assert_eq!(r.returns, vec![tried(status::ERR_ABORT, 11, b"balance short")]);
     assert!(r.events.is_empty() && r.diff == Diff::default(), "{r:?}");
     // Unbound: one code for every host-level failure, and nothing to read.
@@ -459,22 +473,22 @@ fn routers_forward_up_to_the_depth_limit() {
     assert_eq!(r.events, vec![Event { program: addr("token"), name: "transfer".into(), data: cat(&[&r7, &addr("carol"), &le(100)]) }]);
     // r1 → … → r8 → token would be the ninth frame.
     let r = c.tx("router.send (depth 9)", "alice", vec![call("r1", "send", route(&names[1..8], "carol", 100), 0)], &declared(8));
-    assert_eq!(trapped(&r), (addr("r8"), Trap::CallDepth));
+    assert_eq!(trapped(&r), (addr("r8"), TrapKind::CallDepth));
     // r1 → r2 → r1.
     let r = c.tx("router.send (reentrant)", "alice", vec![call("r1", "send", route(&["r2", "r1"], "carol", 1), 0)], &["r2", "token"]);
-    assert_eq!(trapped(&r), (addr("r2"), Trap::Reentrancy));
+    assert_eq!(trapped(&r), (addr("r2"), TrapKind::Reentrancy));
     // r2 isn't declared.
     let r = c.tx("router.send (hop unbound)", "alice", vec![call("r1", "send", route(&["r2"], "carol", 1), 0)], &["token"]);
-    assert_eq!(trapped(&r), (addr("r1"), Trap::UnboundProgram));
+    assert_eq!(trapped(&r), (addr("r1"), TrapKind::UnboundProgram));
 }
 
-// --- an engine per block (4.3) ---
+// --- an engine per block (4.3), and per transaction ---
 
 /// 4.3's lifecycle with real programs: the escrow's whole flow in two blocks, each on a fresh
 /// block engine that loads exactly its transactions' declared code before any of them runs, and
-/// is dropped after. Every receipt must equal a fresh engine's for that transaction alone (fuel
-/// included: nothing may depend on what an engine ran before), and every engine must end in the
-/// same state with the same receipts (fuel aside).
+/// is dropped after. Every receipt must equal a fresh engine's for that transaction alone (the
+/// engine per transaction the node runs; fuel included: nothing may depend on what an engine ran
+/// before), and every engine must end in the same state with the same receipts (fuel aside).
 #[test]
 fn escrow_flow_on_a_fresh_engine_per_block() {
     let (seller, bob, mallory, fresh) = (addr("seller"), addr("bob"), addr("mallory"), addr("fresh"));
@@ -507,16 +521,16 @@ fn escrow_flow_on_a_fresh_engine_per_block() {
                 for (height, block) in blocks.iter().enumerate() {
                     host.height = height as u64 + 1;
                     let programs: Vec<Address> = block.iter().map(|(_, call)| call.program).collect();
-                    let (engine, load_fuel) = host.engine_for(kind, &V1, &programs).unwrap();
-                    assert_eq!(load_fuel, V1.load_fuel(wasm("escrow").len()), "one distinct code, loaded once");
+                    let (engine, load_fuel) = host.engine_for(kind, &SCHEDULE_V0, &programs).unwrap();
+                    assert_eq!(load_fuel, SCHEDULE_V0.load_fuel(wasm("escrow").len()), "one distinct code, loaded once");
                     assert!(engine.info(&token_code).is_none(), "undeclared code isn't loaded");
                     for (signer, call) in block {
-                        let calls = std::slice::from_ref(call);
-                        let r = execute(engine.as_ref(), &host, *signer, calls, &[], LIMITS, &V1);
-                        let alone = host.engine_for(kind, &V1, &programs).unwrap().0;
-                        assert_eq!(r, execute(alone.as_ref(), &host, *signer, calls, &[], LIMITS, &V1), "{}: block {height}", kind.name());
+                        let calls = &[host.bind(call.clone())];
+                        let r = execute(engine.as_ref(), &host, *signer, calls, &[], LIMITS, &SCHEDULE_V0).expect("no node fault");
+                        let alone = host.engine_for(kind, &SCHEDULE_V0, &programs).unwrap().0;
+                        assert_eq!(Ok(&r), execute(alone.as_ref(), &host, *signer, calls, &[], LIMITS, &SCHEDULE_V0).as_ref(), "{}: block {height}", kind.name());
                         audit(&host, *signer, calls, &BTreeSet::from([call.program]), &r);
-                        if r.ok {
+                        if r.ok() {
                             host.apply(&r.diff);
                         }
                         receipts.push(r);
@@ -529,7 +543,7 @@ fn escrow_flow_on_a_fresh_engine_per_block() {
         .collect();
 
     let (host, receipts) = &runs[0];
-    let got: Vec<Result<(), i32>> = receipts.iter().map(|r| if r.ok { Ok(()) } else { Err(aborted(r).1) }).collect();
+    let got: Vec<Result<(), u32>> = receipts.iter().map(|r| if r.ok() { Ok(()) } else { Err(aborted(r).1) }).collect();
     assert_eq!(got, expected);
     for (kind, (other, theirs)) in EngineKind::ALL.iter().zip(&runs).skip(1) {
         assert_eq!(other, host, "{}: another end state", kind.name());
@@ -592,9 +606,9 @@ fn fuel_table() {
         let t = std::time::Instant::now();
         let info = validate(&code).unwrap();
         let validate_us = t.elapsed().as_micros();
-        out += &format!("| {p} | {} | {validate_us} | {} | {} |", code.len(), V1.load_fuel(code.len()), V1.instantiate_fuel(info.pages, info.data_bytes));
+        out += &format!("| {p} | {} | {validate_us} | {} | {} |", code.len(), SCHEDULE_V0.load_fuel(code.len()), SCHEDULE_V0.instantiate_fuel(&info.code));
         for &k in EngineKind::ALL {
-            let mut engine = new_block_engine(k, &V1);
+            let mut engine = new_block_engine(k, &SCHEDULE_V0).unwrap();
             let t = std::time::Instant::now();
             engine.load([0; 32], &code).unwrap();
             out += &format!(" {} |", t.elapsed().as_micros());
@@ -619,19 +633,20 @@ fn fuel_table() {
     ];
     let mut out = format!("| call | {} |\n|---|{}\n", EngineKind::ALL.iter().map(|k| format!("{} µs", k.name())).collect::<Vec<_>>().join(" | "), "---:|".repeat(EngineKind::ALL.len()));
     for (label, signer, call, declared) in &samples {
-        let declared: Vec<Address> = declared.iter().map(|d| addr(d)).collect();
+        let declared = MemHost::any_version(&declared.iter().map(|d| addr(d)).collect::<Vec<_>>());
+        let call = c.host.bind(call.clone());
         out += &format!("| {label} |");
         for &kind in EngineKind::ALL {
             let host = &c.host;
             let median = on_executor_thread(|| {
-                let engine = host.engine(kind, &V1).unwrap();
+                let engine = host.engine(kind, &SCHEDULE_V0).unwrap();
                 let runs = if cfg!(debug_assertions) { 11 } else { 101 };
                 let mut times: Vec<u128> = (0..runs)
                     .map(|_| {
                         let t = std::time::Instant::now();
-                        let r = execute(engine.as_ref(), host, addr(signer), std::slice::from_ref(call), &declared, LIMITS, &V1);
+                        let r = execute(engine.as_ref(), host, addr(signer), std::slice::from_ref(&call), &declared, LIMITS, &SCHEDULE_V0).unwrap();
                         let elapsed = t.elapsed().as_nanos();
-                        assert!(r.ok, "{label}: {r:?}");
+                        assert!(r.ok(), "{label}: {r:?}");
                         elapsed
                     })
                     .collect();

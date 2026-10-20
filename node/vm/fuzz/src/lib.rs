@@ -5,17 +5,22 @@
 //! The invariants, from docs/PROGRAMS.md 4.2–4.4:
 //! * [`program_validate`]: `validate()` never panics, and everything it accepts uploads: the test
 //!   translation neither panics nor refuses it.
-//! * [`program_exec`]: the executor, host and overlay never panic or corrupt memory, however a
-//!   batch of calls to the hand-written guests is shaped. Only validated code runs, as on a node.
+//! * [`program_exec`]: the executor, host and overlay never panic, corrupt memory or report a node
+//!   fault (`MemHost` is a sound view, so one would be the executor's bug), however a batch of calls
+//!   to the hand-written guests is shaped: callees, methods, inputs, values, the kinds and
+//!   payability their interfaces declare, the kind each call runs as, and stale version digests.
+//!   Only validated code runs, as on a node.
 
 use arbitrary::Arbitrary;
 use blockula_vm::engine::EngineKind;
-use blockula_vm::exec::{Call, TxLimits, execute};
-use blockula_vm::meter::V1;
-use blockula_vm::testing::{MemHost, UploadError, addr};
+use blockula_vm::exec::{ANY_VERSION, Call, TxLimits, execute};
+use blockula_vm::host::MethodKind;
+use blockula_vm::meter::SCHEDULE_V0;
+use blockula_vm::testing::{MemHost, addr};
+use blockula_vm::upload::Refusal;
 
 /// `validate()` must never panic, and every module it accepts must upload. `upload()` runs the
-/// test translation under `catch_unwind` and reports `Panicked` if it panicked, which we turn back
+/// test translation under `catch_unwind` and reports a panic as a node fault, which we turn back
 /// into a panic for the fuzzer to catch; a refusal is a disagreement between validation and the
 /// engine, also a finding.
 pub fn program_validate(data: &[u8]) {
@@ -24,10 +29,10 @@ pub fn program_validate(data: &[u8]) {
     }
     let mut host = MemHost::new();
     match host.upload(data) {
-        Ok(_) => {}
-        Err(UploadError::Invalid(e)) => panic!("validate() accepted a module upload() then refused ({:?})", e.rule),
-        Err(UploadError::Translate { .. }) => panic!("validate() accepted a module the engine refused"),
-        Err(UploadError::Panicked { .. }) => panic!("validate() accepted a module that panicked the engine's translator"),
+        Ok(Ok(_)) => {}
+        Ok(Err(Refusal::Invalid(e))) => panic!("validate() accepted a module upload() then refused ({:?})", e.rule),
+        Ok(Err(Refusal::Translate(_))) => panic!("validate() accepted a module the engine refused"),
+        Err(fault) => panic!("validate() accepted a module whose upload is a node fault: {fault}"),
     }
 }
 
@@ -49,6 +54,8 @@ const METHODS: &[&str] = &[
 #[derive(Arbitrary, Debug)]
 pub struct Scenario {
     engine: u8,
+    /// Interface entries to change before the batch runs: (guest, method, kind, payable).
+    methods: Vec<(u8, u8, u8, bool)>,
     calls: Vec<CallSpec>,
 }
 
@@ -56,9 +63,15 @@ pub struct Scenario {
 pub struct CallSpec {
     program: u8,
     method: u8,
+    /// The kind the call runs as (`Call`, `View` or `Init`).
+    kind: u8,
+    /// Sign a digest of zeros instead of the version in force.
+    stale: bool,
     value: u64,
     input: Vec<u8>,
 }
+
+const KINDS: [MethodKind; 3] = [MethodKind::Call, MethodKind::View, MethodKind::Init];
 
 /// Drive the executor with a batch of calls to the guests, shaped by the fuzzer. The engine, the
 /// callees, the methods, the inputs and the values are all fuzzer-chosen; any panic or ASan report
@@ -76,6 +89,13 @@ pub fn program_exec(scenario: Scenario) {
         // The committed guests always upload; deploy would only panic if that regressed.
         host.deploy(addr(name), wasm);
     }
+    for (program, method, kind, payable) in scenario.methods.into_iter().take(8) {
+        let program = addr(GUESTS[usize::from(program) % GUESTS.len()].0);
+        let method = METHODS[usize::from(method) % METHODS.len()];
+        if host.interfaces[&program].methods.contains_key(method) {
+            host.set_method(program, method, KINDS[usize::from(kind) % KINDS.len()], payable);
+        }
+    }
 
     let calls: Vec<Call> = scenario
         .calls
@@ -85,24 +105,28 @@ pub fn program_exec(scenario: Scenario) {
             let (name, _) = GUESTS[usize::from(c.program) % GUESTS.len()];
             let mut input = c.input;
             input.truncate(8192);
-            Call {
+            let call = Call {
                 program: addr(name),
+                version_digest: ANY_VERSION,
                 method: METHODS[usize::from(c.method) % METHODS.len()].to_string(),
                 input,
                 value: c.value,
-            }
+                kind: KINDS[usize::from(c.kind) % KINDS.len()],
+            };
+            if c.stale { call } else { host.bind(call) }
         })
         .collect();
     if calls.is_empty() {
         return;
     }
 
-    let (engine, _loaded) = match host.engine_for(kind, &V1, &declared) {
-        Ok(e) => e,
-        Err(_) => return,
+    let Ok((engine, _loaded)) = host.engine_for(kind, &SCHEDULE_V0, &declared) else {
+        panic!("the guests' code doesn't load");
     };
     let limits = TxLimits { fuel_limit: 10_000_000, storage_limit: 1_000_000_000 };
-    let _ = execute(engine.as_ref(), &host, signer, &calls, &declared, limits, &V1);
+    if let Err(fault) = execute(engine.as_ref(), &host, signer, &calls, &MemHost::any_version(&declared), limits, &SCHEDULE_V0) {
+        panic!("a node fault on a sound view: {fault}");
+    }
 }
 
 #[cfg(test)]

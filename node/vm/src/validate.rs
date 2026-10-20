@@ -1,7 +1,7 @@
 //! Upload validation (docs/PROGRAMS.md 4.2): the rules a program's code must pass before any
 //! engine sees it, Blockula's own and independent of the engine. `UploadCode` runs [`validate`]
-//! first and a test translation in a throwaway engine second (4.3, 7.1); calls later re-parse
-//! stored bytes that already passed both.
+//! first and a test translation in a throwaway engine second (`upload::check`, 4.3, 7.1); calls
+//! later re-parse stored bytes that already passed both.
 //!
 //! wasmparser's validator runs under [`FEATURES`] (Wasm 1.0, which is MVP plus mutable globals,
 //! without floats: what `wasm32v1-none` emits). It doesn't catch everything that profile excludes,
@@ -24,6 +24,7 @@
 //! sums are checked, nothing indexes a slice without a bound, and every error from wasmparser
 //! becomes a [`ValidateError`].
 
+use crate::engine::CodeInfo;
 use crate::{abi, config};
 use std::fmt;
 use wasmparser::{
@@ -59,61 +60,68 @@ const MAX_QUOTED: usize = 64;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModuleInfo {
     /// Method names: the `bk_` function exports without the prefix, sorted, each an
-    /// [`abi::is_ident`]. `UploadCode` matches them one to one with the interface (7.1).
+    /// [`abi::is_ident`], at most [`config::MAX_METHODS`]. `UploadCode` matches them one to one
+    /// with the interface (7.1).
     pub exports: Vec<String>,
-    /// Memory pages, initial = maximum (at most [`config::MAX_PAGES`]).
-    pub pages: u32,
-    /// Bytes of data segments, which every instantiation copies (`meter::Schedule::instantiate_fuel`).
-    pub data_bytes: usize,
     /// The host functions imported, in import order: `imports[i]` is function index `i`. No
     /// function is imported twice.
     pub imports: Vec<&'static str>,
+    /// Its size, memory and entity counts: what loading and instantiating it cost
+    /// (`meter::Schedule`). The same reading an engine makes when it loads the code.
+    pub code: CodeInfo,
 }
 
-/// Which rule a module broke.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Which rule a module broke. An upload's receipt records the rule as its
+/// [`number`](Rule::number), never the message.
+///
+/// **The numbers are consensus** once receipts are committed, as `TrapKind`'s are: a rule keeps
+/// its number forever, a new rule takes the next unused number with a protocol version, and none
+/// is reused. `tests::rules_keep_their_numbers` pins the table.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Rule {
     /// Larger than [`config::MAX_CODE_BYTES`].
-    Size,
+    Size = 1,
     /// Malformed, or refused by wasmparser's validator under [`FEATURES`] (types, stack,
     /// indices, section order…).
-    Wasm,
+    Wasm = 2,
     /// An instruction, type, section or encoding outside Wasm 1.0's integer subset, other than a
     /// float (sign extension, bulk memory, reference types, multi-value, SIMD…).
-    Feature,
+    Feature = 3,
     /// A float type or instruction, reachable or not.
-    Float,
+    Float = 4,
     /// An import that isn't an ABI v1 host function with its exact signature, or a duplicate.
-    Import,
+    Import = 5,
     /// Not exactly one memory, defined, exported as `memory`, initial = maximum ≤ `MAX_PAGES`,
     /// 32-bit, unshared, 64 KiB pages.
-    Memory,
+    Memory = 6,
     /// A `memory.grow`, reachable or not. Refused rather than left to fail at run time:
     /// - the memory is fixed (initial = maximum), so a grow could only ever return −1 or grow by
     ///   0 pages: it does nothing a program needs (`memory.size` stays allowed);
     /// - what a refused grow costs is the engine's own (soroban-wasmi charges 1,024 fuel per
     ///   requested page before refusing; wasmi 0.38 refuses at its static cost), so refusing it
     ///   here keeps the outcome independent of the engine and its version.
-    MemoryGrow,
+    MemoryGrow = 7,
     /// More than one table, more than `MAX_TABLE_ENTRIES`, or not a plain `funcref` table.
-    Table,
-    /// Functions, locals, globals, parameters, segments or operand stack height past their limit.
-    Limit,
+    Table = 8,
+    /// Functions, locals, globals, parameters, segments, methods or operand stack height past
+    /// their limit.
+    Limit = 9,
     /// Data segments larger in total than the code section, or a data or element segment that
     /// doesn't fit its memory or table (the module could never be instantiated).
-    Segment,
+    Segment = 10,
     /// The average function body is smaller than [`config::MIN_AVG_BODY_BYTES`] in a code
     /// section of at least [`config::MIN_AVG_BODY_FROM`] bytes.
-    BodySize,
+    BodySize = 11,
     /// An export other than `memory` and functions `bk_<ident>` of type `[] -> []`.
-    Export,
+    Export = 12,
     /// A start section.
-    Start,
+    Start = 13,
     /// A custom section. Refused rather than ignored:
     /// - soroban-wasmi has no `ignore_custom_sections` and copies every one into each `Module`
     ///   (`Module::custom_sections()`), so ignoring them would hold on one engine only;
-    /// - they do nothing at run time, yet they'd be stored, hashed and loaded on every block that
-    ///   declares the program, and two uploads differing only in one would get different code
+    /// - they do nothing at run time, yet they'd be stored, hashed and loaded by every transaction
+    ///   that declares the program, and two uploads differing only in one would get different code
     ///   hashes for the same behavior, which defeats deduplication and verifiable builds (7.5);
     /// - they carry arbitrary bytes (and text an explorer might show) at code prices;
     /// - `blockula program build` strips them (4.3 names offending functions from the name
@@ -121,7 +129,37 @@ pub enum Rule {
     ///   and `target_features`.
     ///
     /// Bounding their size instead would keep the hash ambiguity for no benefit.
-    CustomSection,
+    CustomSection = 14,
+}
+
+impl Rule {
+    /// Every rule, in number order.
+    pub const ALL: &[Rule] = &[
+        Rule::Size,
+        Rule::Wasm,
+        Rule::Feature,
+        Rule::Float,
+        Rule::Import,
+        Rule::Memory,
+        Rule::MemoryGrow,
+        Rule::Table,
+        Rule::Limit,
+        Rule::Segment,
+        Rule::BodySize,
+        Rule::Export,
+        Rule::Start,
+        Rule::CustomSection,
+    ];
+
+    /// The rule's number in receipts.
+    pub fn number(self) -> u8 {
+        self as u8
+    }
+
+    /// The rule numbered `n`, if there is one.
+    pub fn from_number(n: u8) -> Option<Rule> {
+        Rule::ALL.iter().copied().find(|r| r.number() == n)
+    }
 }
 
 /// Why [`validate`] refused a module: the rule, where, and a message for the uploader.
@@ -459,6 +497,11 @@ impl Checker<'_> {
         if kind != ExternalKind::Func {
             return Err(err(Rule::Export, offset, format!("export {} isn't a function", quoted(name))));
         }
+        // An interface has at most this many methods, matched one to one with the exports, and
+        // each export costs every instantiation (`meter.rs`).
+        if self.exports.len() >= config::MAX_METHODS {
+            return Err(err(Rule::Limit, offset, format!("more than {} methods (bk_ exports)", config::MAX_METHODS)));
+        }
         // A method must be the program's own code: re-exporting a host function would let a call
         // enter the host with no program frame.
         let defined = index.checked_sub(self.imports.len() as u32).ok_or_else(|| {
@@ -519,12 +562,10 @@ impl Checker<'_> {
             return Err(err(Rule::Memory, end, "the memory isn't exported as \"memory\""));
         }
         self.exports.sort();
-        Ok(ModuleInfo {
-            exports: self.exports,
-            pages: self.pages,
-            data_bytes: self.data_bytes as usize, // ≤ MAX_CODE_BYTES
-            imports: self.imports,
-        })
+        // A structural re-read of what passed, so the counts are exactly what an engine's load
+        // reads. It can't fail on a module wasmparser just validated.
+        let code = CodeInfo::read(self.wasm).map_err(|e| err(Rule::Wasm, end, e.to_string()))?;
+        Ok(ModuleInfo { exports: self.exports, imports: self.imports, code })
     }
 }
 
@@ -796,24 +837,70 @@ mod tests {
         (drop (call $transfer (i32.const 0) (call $value) (i32.const 0)))
         (call $return_data (i32.const 8) (i32.const 8))))"#;
 
+    // An upload's receipt records the rule's number (`Rule::number`): changing one changes
+    // consensus.
+    #[test]
+    fn rules_keep_their_numbers() {
+        use Rule::*;
+        let table = [
+            (Size, 1),
+            (Wasm, 2),
+            (Feature, 3),
+            (Float, 4),
+            (Import, 5),
+            (Memory, 6),
+            (MemoryGrow, 7),
+            (Table, 8),
+            (Limit, 9),
+            (Segment, 10),
+            (BodySize, 11),
+            (Export, 12),
+            (Start, 13),
+            (CustomSection, 14),
+        ];
+        assert_eq!(Rule::ALL.len(), table.len(), "a rule without a row");
+        for (rule, number) in table {
+            assert_eq!(rule.number(), number, "{rule:?}");
+            assert_eq!(Rule::from_number(number), Some(rule));
+        }
+        assert_eq!(Rule::from_number(0), None);
+        assert_eq!(Rule::from_number(15), None);
+    }
+
     #[test]
     fn accepts_a_minimal_program() {
-        let info = validate(&wat(MINIMAL)).unwrap();
-        assert_eq!(
-            info,
-            ModuleInfo { exports: vec!["echo".into()], pages: 1, data_bytes: 2, imports: vec!["input_len_v1", "return_data_v1"] }
-        );
-        let bare = validate(&minimal_bytes()).unwrap();
-        assert_eq!(bare, ModuleInfo { exports: vec![], pages: 1, data_bytes: 0, imports: vec![] });
+        let wasm = wat(MINIMAL);
+        let info = validate(&wasm).unwrap();
+        let code = CodeInfo { size: wasm.len(), pages: 1, data_bytes: 2, imports: 2, exports: 2, functions: 1, data_segments: 1, ..CodeInfo::default() };
+        assert_eq!(info, ModuleInfo { exports: vec!["echo".into()], imports: vec!["input_len_v1", "return_data_v1"], code });
+        let bytes = minimal_bytes();
+        let bare = validate(&bytes).unwrap();
+        let code = CodeInfo { size: bytes.len(), pages: 1, exports: 1, functions: 1, ..CodeInfo::default() };
+        assert_eq!(bare, ModuleInfo { exports: vec![], imports: vec![], code });
     }
 
     #[test]
     fn accepts_everything_a_program_may_use() {
-        let info = validate(&wat(RICH)).unwrap();
+        let wasm = wat(RICH);
+        let info = validate(&wasm).unwrap();
         assert_eq!(info.exports, ["dispatch", "increment"]);
-        assert_eq!((info.pages, info.data_bytes), (32, 7));
         assert_eq!(info.imports.len(), 8);
         assert_eq!(info.imports[0], "input_len_v1");
+        // Every entity instantiation prices (`meter.rs`), counted.
+        let code = CodeInfo {
+            size: wasm.len(),
+            pages: 32,
+            data_bytes: 7,
+            imports: 8,
+            exports: 3,
+            functions: 5,
+            globals: 2,
+            element_segments: 1,
+            elements: 3,
+            data_segments: 1,
+        };
+        assert_eq!(info.code, code);
+        assert_eq!(CodeInfo::read(&wasm), Ok(code), "what an engine's load reads");
     }
 
     // ---- One refusal per rule -------------------------------------------------------------
@@ -984,7 +1071,7 @@ mod tests {
             refused(&wat(&format!("(module {memory})")), Rule::Memory);
         }
         let at_limit = validate(&wat(&format!(r#"(module (memory (export "memory") {0} {0}))"#, config::MAX_PAGES))).unwrap();
-        assert_eq!(at_limit.pages, config::MAX_PAGES);
+        assert_eq!(at_limit.code.pages, config::MAX_PAGES);
     }
 
     /// `memory.grow` is Wasm 1.0, so wasmparser and the engine accept it; `validate` refuses it
@@ -1142,6 +1229,20 @@ mod tests {
         let max = "a".repeat(32);
         let info = validate(&program(&format!(r#"(func (export "bk_{max}")) (func (export "bk_a1_"))"#))).unwrap();
         assert_eq!(info.exports, ["a1_".to_string(), max]);
+    }
+
+    /// At most `MAX_METHODS` (64) methods: the interface's limit, matched one to one.
+    #[test]
+    fn refuses_more_methods_than_an_interface_holds() {
+        let methods = |n: usize| program(&(0..n).map(|i| format!(r#"(func (export "bk_m{i}"))"#)).collect::<String>());
+        let info = validate(&methods(config::MAX_METHODS)).unwrap();
+        assert_eq!(info.exports.len(), 64);
+        assert_eq!(info.code.exports, 65, "and the memory");
+        let e = refused(&methods(config::MAX_METHODS + 1), Rule::Limit);
+        assert!(e.message.contains("more than 64 methods"), "{e}");
+        // One function under many names counts as many methods.
+        let aliases: String = (0..=config::MAX_METHODS).map(|i| format!(r#"(export "bk_a{i}" (func 0))"#)).collect();
+        refused(&program(&format!("(func) {aliases}")), Rule::Limit);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! soroban-wasmi 29.0.0, the default engine (D3): Stellar's fork of wasmi 0.31.
+//! soroban-wasmi 29.0.0, the engine (D1): Stellar's fork of wasmi 0.31, pinned exactly.
 //!
 //! # The 4.2 settings, mapped
 //!
@@ -31,10 +31,11 @@
 //!   (trampolines and `Func`s go into the store, function types are only read), `get_typed_func`,
 //!   and a nested `TypedFunc::call` (a nested read guard; spin readers don't wait for a waiting
 //!   writer). `soroban_inside_host_call_store_instantiate_and_call_are_safe`. That's exactly
-//!   what a nested `call_v1` does here, so every declared code must be loaded before a block runs.
+//!   what a nested `call_v1` does here, so every declared code must be loaded before anything
+//!   runs on the engine (`BlockEngine::load` takes `&mut self`, `invoke` `&self`).
 //! * Translating on a *different* engine from inside a host call is safe (another lock).
 
-use super::{BlockEngine, CodeHash, CodeInfo, EngineKind, Host, HostPtr, Instance, Invoked, LoadError, Trap, WasmTrap};
+use super::{BlockEngine, CodeHash, CodeInfo, EngineKind, Host, HostPtr, Instance, Invoked, LoadError, NodeFault, Trap, TrapKind};
 use crate::{abi, config, meter::Schedule};
 use soroban_wasmi as sw;
 use std::collections::BTreeMap;
@@ -56,7 +57,7 @@ pub struct SorobanEngine {
 }
 
 /// The engine configuration: 4.2 as far as soroban-wasmi's `Config` reaches (the table above).
-pub fn config(schedule: &Schedule) -> sw::Config {
+pub fn config(schedule: &Schedule) -> Result<sw::Config, NodeFault> {
     let mut costs = sw::FuelCosts::default();
     costs.base = schedule.ops.base.into();
     costs.entity = schedule.ops.entity.into();
@@ -69,7 +70,7 @@ pub fn config(schedule: &Schedule) -> sw::Config {
         cells(config::MAX_STACK_BYTES),
         config::MAX_RECURSION_DEPTH as usize,
     )
-    .expect("the minimum stack is below the maximum");
+    .map_err(|e| NodeFault::Engine(e.to_string()))?;
     let mut c = sw::Config::default();
     c.consume_fuel(true)
         .fuel_consumption_mode(sw::FuelConsumptionMode::Eager)
@@ -85,12 +86,12 @@ pub fn config(schedule: &Schedule) -> sw::Config {
         .wasm_extended_const(false)
         .set_stack_limits(stack)
         .set_cached_stacks(2);
-    c
+    Ok(c)
 }
 
 impl SorobanEngine {
-    pub fn new(schedule: &Schedule) -> Self {
-        let engine = sw::Engine::new(&config(schedule));
+    pub fn new(schedule: &Schedule) -> Result<Self, NodeFault> {
+        let engine = sw::Engine::new(&config(schedule)?);
         let mut linker = sw::Linker::new(&engine);
         for (index, f) in abi::HOST_FNS.iter().enumerate() {
             let ty = |t: &abi::Ty| match t {
@@ -102,9 +103,9 @@ impl SorobanEngine {
                 .func_new(abi::MODULE, f.name, func_type, move |caller, params, results| {
                     host_call(index, caller, params, results)
                 })
-                .expect("ABI names are distinct");
+                .map_err(|e| NodeFault::Engine(e.to_string()))?;
         }
-        SorobanEngine { engine, linker, modules: BTreeMap::new() }
+        Ok(SorobanEngine { engine, linker, modules: BTreeMap::new() })
     }
 }
 
@@ -116,23 +117,27 @@ fn host_call(
     results: &mut [sw::Value],
 ) -> Result<(), sw::core::Trap> {
     let mut args = [0i64; 8];
+    if params.len() > args.len() {
+        return Err(Trap::Fault(NodeFault::Host("a host function with more than 8 arguments")).into());
+    }
     for (arg, p) in args.iter_mut().zip(params) {
         *arg = match p {
             sw::Value::I32(v) => i64::from(*v),
             sw::Value::I64(v) => *v,
-            _ => return Err(Trap::Fault("a non-integer argument".into()).into()),
+            _ => return Err(Trap::Fault(NodeFault::Host("a non-integer argument")).into()),
         };
     }
     let Slot { host, memory } = *caller.data();
-    let memory = memory.ok_or_else(|| Trap::Fault("a host call before instantiation".into()))?;
+    let memory = memory.ok_or(Trap::Fault(NodeFault::Host("a host call before instantiation")))?;
     let mut instance = Frame { caller: &mut caller, memory };
     // SAFETY: we're inside the `invoke` that put `host` in this store.
     let out = unsafe { host.get() }.call(index, &args[..params.len()], &mut instance)?;
-    if let Some(r) = results.first_mut() {
-        *r = match abi::HOST_FNS[index].results[0] {
-            abi::Ty::I32 => sw::Value::I32(out as i32),
-            abi::Ty::I64 => sw::Value::I64(out),
-        };
+    let result = abi::HOST_FNS.get(index).and_then(|f| f.results.first());
+    match (results.first_mut(), result) {
+        (Some(r), Some(abi::Ty::I32)) => *r = sw::Value::I32(out as i32),
+        (Some(r), Some(abi::Ty::I64)) => *r = sw::Value::I64(out),
+        (None, None) => {}
+        _ => return Err(Trap::Fault(NodeFault::Host("results unlike the ABI's")).into()),
     }
     Ok(())
 }
@@ -147,31 +152,36 @@ impl Instance for Frame<'_, '_> {
     fn memory(&mut self) -> &mut [u8] {
         self.memory.data_mut(&mut *self.caller)
     }
-    fn fuel(&self) -> u64 {
-        let total = self.caller.fuel_total().unwrap_or(0);
-        total.saturating_sub(self.caller.fuel_consumed().unwrap_or(0))
+    fn fuel(&self) -> Result<u64, NodeFault> {
+        let total = self.caller.fuel_total().ok_or(NodeFault::Fuel)?;
+        let consumed = self.caller.fuel_consumed().ok_or(NodeFault::Fuel)?;
+        total.checked_sub(consumed).ok_or(NodeFault::Fuel)
     }
-    fn set_fuel(&mut self, fuel: u64) {
+    fn set_fuel(&mut self, fuel: u64) -> Result<(), NodeFault> {
         // The fork's own API (no `set_fuel`): zero both counters, then add.
-        let _ = self.caller.reset_fuel();
-        let _ = self.caller.add_fuel(fuel);
+        self.caller.reset_fuel().map_err(|_| NodeFault::Fuel)?;
+        self.caller.add_fuel(fuel).map_err(|_| NodeFault::Fuel)
     }
 }
 
+/// The engine-neutral trap behind one of the engine's trap codes. Float conversions and growth
+/// limits can't trap in validated code (floats and `memory.grow` are refused at upload; there's
+/// no `table.grow`), so they're node faults.
 fn wasm_trap(code: sw::core::TrapCode) -> Trap {
     use sw::core::TrapCode as C;
-    Trap::Wasm(match code {
-        C::OutOfFuel => return Trap::OutOfFuel,
-        C::UnreachableCodeReached => WasmTrap::Unreachable,
-        C::MemoryOutOfBounds => WasmTrap::MemoryOutOfBounds,
-        C::TableOutOfBounds => WasmTrap::TableOutOfBounds,
-        C::IndirectCallToNull => WasmTrap::IndirectCallToNull,
-        C::IntegerDivisionByZero => WasmTrap::DivisionByZero,
-        C::IntegerOverflow => WasmTrap::IntegerOverflow,
-        C::BadConversionToInteger => WasmTrap::BadConversionToInteger,
-        C::StackOverflow => WasmTrap::StackOverflow,
-        C::BadSignature => WasmTrap::BadSignature,
-        C::GrowthOperationLimited => WasmTrap::Other,
+    Trap::Kind(match code {
+        C::OutOfFuel => TrapKind::OutOfFuel,
+        C::UnreachableCodeReached => TrapKind::Unreachable,
+        C::MemoryOutOfBounds => TrapKind::MemoryOutOfBounds,
+        C::TableOutOfBounds => TrapKind::TableOutOfBounds,
+        C::IndirectCallToNull => TrapKind::IndirectCallToNull,
+        C::IntegerDivisionByZero => TrapKind::DivisionByZero,
+        C::IntegerOverflow => TrapKind::IntegerOverflow,
+        C::StackOverflow => TrapKind::StackOverflow,
+        C::BadSignature => TrapKind::BadSignature,
+        C::BadConversionToInteger | C::GrowthOperationLimited => {
+            return Trap::Fault(NodeFault::Engine(format!("{code:?} in validated code")));
+        }
     })
 }
 
@@ -182,15 +192,15 @@ fn from_trap(t: sw::core::Trap) -> Trap {
     }
     match t.trap_code() {
         Some(code) => wasm_trap(code),
-        None => Trap::Fault(t.to_string()),
+        None => Trap::Fault(NodeFault::Engine(t.to_string())),
     }
 }
 
-fn from_error(e: sw::Error) -> Trap {
-    match e {
-        sw::Error::Trap(t) => from_trap(t),
-        e => Trap::Fault(e.to_string()),
-    }
+/// Fuel left in `store`, or why it can't be read.
+fn fuel_left(store: &sw::Store<Slot>) -> Result<u64, NodeFault> {
+    let total = store.fuel_total().ok_or(NodeFault::Fuel)?;
+    let consumed = store.fuel_consumed().ok_or(NodeFault::Fuel)?;
+    total.checked_sub(consumed).ok_or(NodeFault::Fuel)
 }
 
 impl BlockEngine for SorobanEngine {
@@ -214,21 +224,25 @@ impl BlockEngine for SorobanEngine {
 
     fn invoke(&self, hash: &CodeHash, export: &str, fuel: u64, host: &mut dyn Host) -> Invoked {
         let Some((module, _)) = self.modules.get(hash) else {
-            return Invoked { result: Err(Trap::Fault("code not loaded".into())), fuel_left: fuel };
+            return Invoked { result: Err(Trap::Fault(NodeFault::NotLoaded)), fuel_left: fuel };
         };
         let mut store = sw::Store::new(&self.engine, Slot { host: HostPtr::new(host), memory: None });
-        store.add_fuel(fuel).expect("metering is on");
+        if store.add_fuel(fuel).is_err() {
+            return Invoked { result: Err(Trap::Fault(NodeFault::Fuel)), fuel_left: fuel };
+        }
         let result = (|| {
-            let pre = self.linker.instantiate(&mut store, module).map_err(from_error)?;
-            let instance = pre.ensure_no_start(&mut store).map_err(|e| Trap::Fault(e.to_string()))?;
-            let memory = instance.get_memory(&store, "memory").ok_or_else(|| Trap::Fault("no memory export".into()))?;
+            let pre = self.linker.instantiate(&mut store, module).map_err(|e| NodeFault::Instantiate(e.to_string()))?;
+            let instance = pre.ensure_no_start(&mut store).map_err(|e| NodeFault::Instantiate(e.to_string()))?;
+            let memory = instance.get_memory(&store, "memory").ok_or(NodeFault::Instantiate("no memory export".into()))?;
             store.data_mut().memory = Some(memory);
-            let func = instance.get_typed_func::<(), ()>(&store, export).map_err(|_| Trap::NoMethod)?;
+            let func = instance.get_typed_func::<(), ()>(&store, export).map_err(|_| TrapKind::NoMethod)?;
             func.call(&mut store, ()).map_err(from_trap)
         })();
-        let total = store.fuel_total().unwrap_or(0);
-        let fuel_left = total.saturating_sub(store.fuel_consumed().unwrap_or(0));
-        Invoked { result, fuel_left }
+        match fuel_left(&store) {
+            Ok(fuel_left) => Invoked { result, fuel_left },
+            // A node fault in the frame wins over the engine's fuel trouble: both are the node's.
+            Err(fault) => Invoked { result: result.and(Err(Trap::Fault(fault))), fuel_left: 0 },
+        }
     }
 }
 
@@ -252,7 +266,7 @@ mod tests {
     fn probe(inside: fn(&mut sw::Caller<'_, ()>, &sw::Engine, &sw::Module)) -> bool {
         let (done, wait) = mpsc::channel();
         std::thread::spawn(move || {
-            let engine = sw::Engine::new(&config(&crate::meter::V1));
+            let engine = sw::Engine::new(&config(&crate::meter::SCHEDULE_V0).unwrap());
             let callee = std::sync::Arc::new(sw::Module::new(&engine, wat::parse_str(CALLEE).unwrap()).unwrap());
             let outer = sw::Module::new(&engine, wat::parse_str(OUTER).unwrap()).unwrap();
             let mut linker = sw::Linker::<()>::new(&engine);
@@ -284,7 +298,7 @@ mod tests {
     #[test]
     fn soroban_inside_host_call_translating_on_another_engine_is_safe() {
         assert!(probe(|_, _, _| {
-            let other = sw::Engine::new(&config(&crate::meter::V1));
+            let other = sw::Engine::new(&config(&crate::meter::SCHEDULE_V0).unwrap());
             sw::Module::new(&other, wat::parse_str(CALLEE).unwrap()).unwrap();
         }));
     }

@@ -12,9 +12,16 @@
 //! With `--features ref038` every table gains a wasmi 0.38 column, for comparison only.
 //!
 //! Sections: `ops` (ns per fuel by operator class), `translate` (validation and translation ns
-//! per byte), `instantiate`, `host` (every ABI v1 function), `block` (a `max_block_fuel` block of
-//! the worst patterns), `warm` (cold versus warm, an engine's cost per block), `stack` (the
-//! smallest native stack for the deepest call chain, bisected in child processes).
+//! per byte, and upload's go/no-go), `instantiate`, `host` (every ABI v1 function), `block` (a
+//! `max_block_fuel` block of the worst patterns), `warm` (cold versus warm, an engine's cost per
+//! block), `stack` (the smallest native stack for the deepest call chain, bisected in child
+//! processes).
+//!
+//! **Upload's go/no-go.** Upload's price has the schedule's thinnest margin (`meter.rs`: ~1.22×
+//! the worst floor figure, against 1.5–3× for every other item), so `translate` ends with a line
+//! of its own, `Upload go/no-go: GO` or `NO-GO`: the worst ns per fuel of an upload as the node
+//! runs it (`upload::check` and the code's hash) against 2.5. `calibrate-vm.yml` puts the line in
+//! the run's summary and fails on `NO-GO`.
 //!
 //! Method: plain `Instant` timing with warmup and repetitions; every sample is a batch long
 //! enough for the clock (at least `sample` ns), setup outside the clock, outputs dropped after it.
@@ -23,10 +30,12 @@
 //! fixed cost cancel. Everything runs through the real executor (`exec::execute`) and host
 //! (`MemHost`) unless a row says otherwise, on a thread with the executor's 64 MiB stack.
 
-use blockula_vm::engine::{Address, BlockEngine, CodeHash, EngineKind, Host, Instance, Trap, new_block_engine};
-use blockula_vm::exec::{Call, Entry, Receipt, TxLimits, execute};
-use blockula_vm::meter::V1;
+use blockula_vm::engine::{Address, BlockEngine, CodeHash, EngineKind, Host, Instance, NodeFault, Trap, TrapKind, new_block_engine};
+use blockula_vm::exec::{ANY_VERSION, Call, Entry, FailCode, Receipt, TxLimits, execute};
+use blockula_vm::host::MethodKind;
+use blockula_vm::meter::{SCHEDULE_V0, Schedule};
 use blockula_vm::testing::{MemHost, addr};
+use blockula_vm::upload;
 use blockula_vm::validate::validate;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -34,6 +43,8 @@ use std::hint::black_box;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+/// The schedule under test: every fuel number below is its.
+const SCHEDULE: &Schedule = &SCHEDULE_V0;
 /// The design's calibration rule: no path slower than this (4.5).
 const NS_PER_FUEL: f64 = 2.5;
 const BLOCK_FUEL: u64 = 60_000_000;
@@ -41,6 +52,8 @@ const TX_FUEL: u64 = 20_000_000;
 const BLOCK_MS: f64 = 150.0;
 /// A fuel limit no measured loop reaches.
 const UNLIMITED: u64 = 1 << 50;
+/// The node's code hash domain (`wasm_hash`, PROGRAMS.md 7.1): an upload hashes its code once.
+const CODE_HASH_CONTEXT: &str = "blockula program code v1";
 
 // ---- configuration, timing, statistics -----------------------------------------------------
 
@@ -295,15 +308,19 @@ fn world() -> MemHost {
 }
 
 fn call(program: Address, method: &str, input: Vec<u8>) -> Call {
-    Call { program, method: method.into(), input, value: 0 }
+    Call { program, version_digest: ANY_VERSION, method: method.into(), input, value: 0, kind: MethodKind::Call }
 }
 
+/// A transaction of `calls`, each bound to its program's version in force (a hash and a lookup
+/// per call, inside the clock like the rest of the executor's fixed cost), reaching `declared`.
 fn run_tx(engine: &dyn BlockEngine, host: &MemHost, calls: &[Call], declared: &[Address], fuel: u64) -> Receipt {
-    execute(engine, host, signer(), calls, declared, TxLimits { fuel_limit: fuel, storage_limit: 1 << 60 }, &V1)
+    let calls: Vec<Call> = calls.iter().map(|c| host.bind(c.clone())).collect();
+    let limits = TxLimits { fuel_limit: fuel, storage_limit: 1 << 60 };
+    execute(engine, host, signer(), &calls, &MemHost::any_version(declared), limits, SCHEDULE).expect("no node fault")
 }
 
 fn ok(r: &Receipt, what: &str) {
-    assert!(r.ok, "{what}: {:?}", r.fail);
+    assert!(r.ok(), "{what}: {:?}", r.fail);
 }
 
 /// A host for raw `BlockEngine::invoke` timing: programs that call it are refused.
@@ -311,7 +328,7 @@ struct NullHost;
 
 impl Host for NullHost {
     fn call(&mut self, _: usize, _: &[i64], _: &mut dyn Instance) -> Result<i64, Trap> {
-        Err(Trap::Fault("no host here".into()))
+        Err(Trap::Fault(NodeFault::Host("no host here")))
     }
 }
 
@@ -571,7 +588,7 @@ fn measure_loop(engine: &dyn BlockEngine, host: &MemHost, p: Address, method: &s
 
 fn section_ops() -> Vec<OpResult> {
     emit("## 1. ns per fuel by operator class\n");
-    emit("Each case is a loop whose body is `k` copies of one unit dominated by one class (plus the loop's own fuel: `br_if`, a decrement, `br`). ns per fuel = (time of N iterations − time of 0) / N / (fuel per iteration), so instantiation and the transaction's fixed cost cancel. Fuel per unit = fuel per iteration / k, under each engine's mapping of schedule v1 (wasmi 0.38: its own IR fuel). Cells: **ns/fuel median [min–max]** (fuel per unit). Values above 2.5 ns/fuel are marked **bold**.\n");
+    emit("Each case is a loop whose body is `k` copies of one unit dominated by one class (plus the loop's own fuel: `br_if`, a decrement, `br`). ns per fuel = (time of N iterations − time of 0) / N / (fuel per iteration), so instantiation and the transaction's fixed cost cancel. Fuel per unit = fuel per iteration / k, under each engine's mapping of the schedule under test (wasmi 0.38: its own IR fuel). Cells: **ns/fuel median [min–max]** (fuel per unit). Values above 2.5 ns/fuel are marked **bold**.\n");
     let mut results = Vec::new();
     for op in ops() {
         progress(format!("ops: {}", op.name));
@@ -579,7 +596,7 @@ fn section_ops() -> Vec<OpResult> {
         let (host, p) = op_world(&wasm);
         let mut per = Vec::new();
         for &kind in engines() {
-            let engine = host.engine(kind, &V1).expect("loads");
+            let engine = host.engine(kind, SCHEDULE).expect("loads");
             let (fuel, s) = measure_loop(engine.as_ref(), &host, p, "run", op_input, &[], &op.name);
             let units = if op.k == 0 { 1.0 } else { op.k as f64 };
             per.push((kind, fuel, fuel as f64 / units, s));
@@ -698,8 +715,9 @@ fn translation_corpus() -> Vec<(String, Vec<u8>)> {
     add(&format!("{n} distinct function types"), w);
     let (n, w) = fit(MAX, |n| wat(&module(&"(type (func))".repeat(n))));
     add(&format!("{n} identical function types"), w);
-    let (n, w) = fit(MAX, |n| wat(&format!("(module {mem} (func $f) {})", (0..n).map(|i| format!("(export \"bk_e{i}\" (func $f))")).collect::<String>())));
-    add(&format!("{n} exports of one function"), w);
+    // Exports are capped at `config::MAX_METHODS`, so they can't fill a module any more.
+    let n = blockula_vm::config::MAX_METHODS;
+    add(&format!("{n} exports of one function"), wat(&format!("(module {mem} (func $f) {})", (0..n).map(|i| format!("(export \"bk_e{i}\" (func $f))")).collect::<String>())));
     let callees = format!("(func $f {})", "i64.const 0 drop ".repeat(14));
     let (n, w) = fit(MAX, |n| wat(&module(&format!("{callees} (func {})", "call $f ".repeat(n)))));
     add(&format!("{n} calls"), w);
@@ -726,22 +744,25 @@ struct LoadResult {
     validate: Stats,
     /// Per engine: load (`BlockEngine::load` on a fresh engine), then the engine's drop.
     load: Vec<(EngineKind, Stats, Stats)>,
+    /// An upload of this code as the node runs it: `upload::check` (validation, a fresh
+    /// soroban-wasmi engine, the test translation, the engine's drop), then the code's hash.
+    upload: Stats,
 }
 
 fn time_load(kind: EngineKind, wasm: &[u8]) -> (Stats, Stats) {
     let hash: CodeHash = *blake3::hash(wasm).as_bytes();
     let load = time_with(
-        || new_block_engine(kind, &V1),
+        || new_block_engine(kind, SCHEDULE).expect("an engine"),
         |mut e| {
             e.load(hash, wasm).expect("loads");
             e
         },
     );
     // The drop of an engine holding the module, less an empty engine's.
-    let empty = time_with(|| new_block_engine(kind, &V1), drop);
+    let empty = time_with(|| new_block_engine(kind, SCHEDULE).expect("an engine"), drop);
     let full = time_with(
         || {
-            let mut e = new_block_engine(kind, &V1);
+            let mut e = new_block_engine(kind, SCHEDULE).expect("an engine");
             e.load(hash, wasm).expect("loads");
             e
         },
@@ -752,7 +773,8 @@ fn time_load(kind: EngineKind, wasm: &[u8]) -> (Stats, Stats) {
 
 fn section_translate() -> Vec<LoadResult> {
     emit("## 2. Translation and validation, ns per byte\n");
-    emit("Cold: each load is `BlockEngine::load` (a structural read of memory and data, then the engine's `Module::new`: its own parse, validation and translation) on a fresh block engine made outside the clock, as a block loads every declared code into a fresh engine (4.3). `validate` is upload validation (`validate.rs`, wasmparser 0.228 plus our rules). CPU caches are warm (the same bytes are loaded repeatedly), so these are lower bounds for a cold machine. *Implied fuel* = time / 2.5 ns. **Implied LOAD_PER_BYTE** = (load time / 2.5 ns − LOAD_BASE 2,000) / bytes, against schedule v1's 10; **implied LOAD_BASE** comes from the smallest modules.\n");
+    let l = SCHEDULE.load;
+    emit(format!("Cold: each load is `BlockEngine::load` (a structural read of the module's sections, then the engine's `Module::new`: its own parse, validation and translation) on a fresh block engine made outside the clock, as a block loads every declared code into a fresh engine (4.3). `validate` is upload validation (`validate.rs`, wasmparser 0.228 plus our rules). CPU caches are warm (the same bytes are loaded repeatedly), so these are lower bounds for a cold machine. *Implied fuel* = time / 2.5 ns. **Implied LOAD_PER_BYTE** = (load time / 2.5 ns − LOAD_BASE {}) / bytes, against schedule v{}'s {}; **implied LOAD_BASE** comes from the smallest modules.\n", n0(l.load_base as f64), SCHEDULE.version, l.load_per_byte));
     let mut results = Vec::new();
     for (name, wasm) in translation_corpus() {
         progress(format!("translate: {name} ({} B)", wasm.len()));
@@ -762,7 +784,9 @@ fn section_translate() -> Vec<LoadResult> {
             let (l, d) = time_load(kind, &wasm);
             load.push((kind, l, d));
         }
-        results.push(LoadResult { name, size: wasm.len(), validate: v, load });
+        assert!(matches!(upload::check(&wasm, SCHEDULE), Ok(Ok(_))), "{name}: the upload is refused");
+        let up = time(|| (upload::check(&wasm, SCHEDULE), blake3::derive_key(CODE_HASH_CONTEXT, &wasm)));
+        results.push(LoadResult { name, size: wasm.len(), validate: v, load, upload: up });
     }
     let mut header = vec!["module".to_string(), "bytes".into(), "validate µs (ns/B)".into()];
     for k in engines() {
@@ -780,9 +804,9 @@ fn section_translate() -> Vec<LoadResult> {
                 row.push(format!("{} ({})", us(l.med), f2(l.med / b)));
             }
             for (_, l, _) in &r.load {
-                let per = (l.med / NS_PER_FUEL - V1.load.load_base as f64) / b;
+                let per = (l.med / NS_PER_FUEL - SCHEDULE.load.load_base as f64) / b;
                 let cell = f2(per.max(0.0));
-                row.push(if per > V1.load.load_per_byte as f64 { format!("**{cell}**") } else { cell });
+                row.push(if per > SCHEDULE.load.load_per_byte as f64 { format!("**{cell}**") } else { cell });
             }
             row
         })
@@ -821,7 +845,7 @@ fn section_translate() -> Vec<LoadResult> {
         let big: Vec<&LoadResult> = results.iter().filter(|r| r.size > 100_000).collect();
         let worst_big = big.iter().max_by(|a, b| (a.load[i].1.med / a.size as f64).partial_cmp(&(b.load[i].1.med / b.size as f64)).expect("no NaN")).expect("big modules");
         let minimal = results.iter().find(|r| r.name == "minimal program").expect("minimal");
-        let per = (worst_big.load[i].1.med / NS_PER_FUEL - V1.load.load_base as f64) / worst_big.size as f64;
+        let per = (worst_big.load[i].1.med / NS_PER_FUEL - SCHEDULE.load.load_base as f64) / worst_big.size as f64;
         // Upload's worst is its own maximum (validation's cost differs by shape), not the worst load's.
         let upload_per_byte = |r: &LoadResult| (r.validate.med + r.load[i].1.med) / r.size as f64;
         let worst_upload = big.iter().max_by(|a, b| upload_per_byte(a).partial_cmp(&upload_per_byte(b)).expect("no NaN")).expect("big modules");
@@ -834,9 +858,38 @@ fn section_translate() -> Vec<LoadResult> {
             format!("{} ({} ns/B = {} fuel/B)", worst_upload.name, f2(upload_per_byte(worst_upload)), f2(upload_per_byte(worst_upload) / NS_PER_FUEL)),
         ]);
     }
-    emit("**Summary.** Schedule v1: LOAD_BASE 2,000, LOAD_PER_BYTE 10; upload 50,000 + 20 per byte.\n");
+    let l = SCHEDULE.load;
+    emit(format!("**Summary.** Schedule v{}: LOAD_BASE {}, LOAD_PER_BYTE {}; upload {} + {} per byte.\n", SCHEDULE.version, n0(l.load_base as f64), l.load_per_byte, n0(l.upload_base as f64), l.upload_per_byte));
     table(&["engine", "worst ns/B, any size", "worst ns/B, modules > 100 KB", "implied LOAD_PER_BYTE (worst > 100 KB)", "minimal module's load (implied LOAD_BASE)", "worst upload (validate + load), modules > 100 KB"], &rows);
+    upload_gate(&results);
     results
+}
+
+/// Upload's go/no-go: each module's upload as the node runs it, over the fuel the schedule charges
+/// for the code alone (an interface would only add fuel), and the worst against 2.5 ns per fuel.
+fn upload_gate(results: &[LoadResult]) {
+    let l = SCHEDULE.load;
+    emit("### Upload, ns per fuel (go/no-go)\n");
+    emit(format!("Each upload is `upload::check` (validation, a fresh soroban-wasmi engine, the test translation and the engine's drop) plus the code's hash, as the node runs `UploadCode` on new code, over `upload_fuel(bytes, 0)` = {} + {} × bytes. Upload burns no engine fuel, so this is wall time over the price. Schedule v{}'s {} per byte is the most that keeps a maximum upload within `MAX_TX_FUEL`, so it has the schedule's thinnest margin; values above 2.5 ns/fuel are marked **bold**.\n", n0(l.upload_base as f64), l.upload_per_byte, SCHEDULE.version, l.upload_per_byte));
+    let per_fuel = |r: &LoadResult| r.upload.med / SCHEDULE.upload_fuel(r.size, 0) as f64;
+    let rows: Vec<Vec<String>> = results
+        .iter()
+        .map(|r| {
+            let cell = range(r.upload.map(|t| t / SCHEDULE.upload_fuel(r.size, 0) as f64));
+            vec![r.name.clone(), n0(r.size as f64), us(r.upload.med), n0(SCHEDULE.upload_fuel(r.size, 0) as f64), if per_fuel(r) > NS_PER_FUEL { format!("**{cell}**") } else { cell }]
+        })
+        .collect();
+    table(&["module", "bytes", "upload µs", "upload fuel", "ns/fuel"], &rows);
+    let worst = results.iter().max_by(|a, b| per_fuel(a).partial_cmp(&per_fuel(b)).expect("no NaN")).expect("a corpus");
+    let verdict = if per_fuel(worst) <= NS_PER_FUEL { "GO" } else { "NO-GO" };
+    emit(format!(
+        "**Upload go/no-go: {verdict}.** Worst: {} ({} B), {} ns per fuel against {NS_PER_FUEL} ({} fuel per byte against the price's {}).\n",
+        worst.name,
+        n0(worst.size as f64),
+        f2(per_fuel(worst)),
+        f2(worst.upload.med / worst.size as f64 / NS_PER_FUEL),
+        l.upload_per_byte,
+    ));
 }
 
 // ---- 3. instantiation -----------------------------------------------------------------------
@@ -867,11 +920,14 @@ fn inst_corpus() -> Vec<(String, Vec<u8>)> {
     let (n, w) = fit(MAX, |n| wat(&m(1, false, &small.repeat(n))));
     validate(&w).expect("valid");
     c.push((format!("{n} functions"), w));
-    let (n, w) = fit(MAX, |n| wat(&m(1, false, &(0..n).map(|i| format!("(export \"bk_e{i}\" (func $noop))")).collect::<String>())));
+    // The most methods validation allows (`config::MAX_METHODS`, `bk_noop` included) and the memory.
+    let methods = blockula_vm::config::MAX_METHODS - 1;
+    let exports = (0..methods).map(|i| format!("(export \"bk_e{i}\" (func $noop))")).collect::<String>();
+    let w = wat(&m(1, false, &exports));
     validate(&w).expect("valid");
-    c.push((format!("{n} exports"), w));
-    // Everything at once, within the size limit: imports, 32 pages, globals, the table, functions
-    // and as many exports as fit.
+    c.push((format!("{} exports", methods + 2), w));
+    // Everything at once, within the size limit: imports, 32 pages, globals, the table, functions,
+    // data segments and the most methods.
     let base = format!(
         "{} {} {} {}",
         "(global (mut i64) (i64.const 7))".repeat(256),
@@ -879,9 +935,9 @@ fn inst_corpus() -> Vec<(String, Vec<u8>)> {
         small.repeat(2_000),
         (0..1000).map(|i| format!("(data (i32.const {i}) \"x\")")).collect::<String>(),
     );
-    let (n, w) = fit(MAX, |n| wat(&m(32, true, &format!("{base} {}", (0..n).map(|i| format!("(export \"bk_e{i}\" (func $noop))")).collect::<String>()))));
+    let w = wat(&m(32, true, &format!("{base} {exports}")));
     validate(&w).expect("valid");
-    c.push((format!("all: {} imports, 32 pages, 256 globals, table + 1,000 elems, 2,001 funcs, 1,000 data, {n} exports", abi_len()), w));
+    c.push((format!("all: {} imports, 32 pages, 256 globals, table + 1,000 elems, 2,001 funcs, 1,000 data, {} exports", abi_len(), methods + 2), w));
     c
 }
 
@@ -913,7 +969,7 @@ fn caller_input(callee: Address) -> impl Fn(u32) -> Vec<u8> {
 
 fn section_instantiate() {
     emit("## 3. Instantiation\n");
-    emit("Per module, three ways: **raw** (`BlockEngine::invoke` of an empty `bk_noop` with a host that refuses every import: the engine's store, linking, instance and drop), **tx** (a top-level transaction calling `bk_noop` through `execute`: also the executor's fixed cost) and **call_v1** (each call of a loop `call_v1`s `bk_noop` on the module: the repeatable pattern, charged `call` 20,100 + `instantiate_fuel`). *Schedule* = `instantiate_fuel(pages, data)` (1,000 + 2,000 per page + 1 per data byte), which counts no imports, functions, exports, globals, tables or segments. Time ÷ 2.5 ns is the fuel it would need.\n");
+    emit("Per module, three ways: **raw** (`BlockEngine::invoke` of an empty `bk_noop` with a host that refuses every import: the engine's store, linking, instance and drop), **tx** (a top-level transaction calling `bk_noop` through `execute`: also the executor's fixed cost) and **call_v1** (each call of a loop `call_v1`s `bk_noop` on the module: the repeatable pattern, charged `call` + `instantiate_fuel`). *Schedule* = `instantiate_fuel` (meter.rs: a base, plus a price per import, export, function, global, element segment and element, data segment, page and data byte). Time ÷ 2.5 ns is the fuel it would need.\n");
     let corpus = inst_corpus();
     let caller = caller_program();
     let mark = |ns: f64, fuel: f64| {
@@ -924,16 +980,16 @@ fn section_instantiate() {
     for (name, wasm) in &corpus {
         progress(format!("instantiate: {name}"));
         let info = blockula_vm::engine::CodeInfo::read(wasm).expect("reads");
-        let sched = V1.instantiate_fuel(info.pages, info.data_bytes);
+        let sched = SCHEDULE.instantiate_fuel(&info);
         let mut host = world();
         let (p, c) = (addr("inst"), addr("caller"));
         let hash = host.deploy(p, wasm);
         host.deploy(c, &caller);
         let mut row = vec![name.clone(), n0(wasm.len() as f64), n0(sched as f64)];
-        let mut row_call = vec![name.clone(), n0((V1.host.base + V1.host.call + sched) as f64)];
+        let mut row_call = vec![name.clone(), n0((SCHEDULE.host.base + SCHEDULE.host.call + sched) as f64)];
         let mut row_touch = vec![name.clone()];
         for &kind in engines() {
-            let engine = host.engine(kind, &V1).expect("loads");
+            let engine = host.engine(kind, SCHEDULE).expect("loads");
             let raw = time(|| engine.invoke(&hash, "bk_noop", UNLIMITED, &mut NullHost));
             let r = run_tx(engine.as_ref(), &host, &[call(p, "noop", vec![])], &[], UNLIMITED);
             ok(&r, name);
@@ -1181,10 +1237,10 @@ fn section_host() {
         let mut per_engine = Vec::new();
         let mut fuel_cell = String::new();
         for &kind in engines() {
-            let engine = host.engine(kind, &V1).expect("loads");
+            let engine = host.engine(kind, SCHEDULE).expect("loads");
             let (fuel, ns_call) = if case.method == "abort" {
                 let r = run_tx(engine.as_ref(), &host, &[call(addr(HB), "abort", case.input(0))], &declared, UNLIMITED);
-                assert!(!r.ok);
+                assert!(!r.ok());
                 let empty = run_tx(engine.as_ref(), &host, &[call(addr(HB), "input_len", case.input(0))], &declared, UNLIMITED);
                 let t = time(|| run_tx(engine.as_ref(), &host, &[call(addr(HB), "abort", case.input(0))], &declared, UNLIMITED));
                 let t0 = time(|| run_tx(engine.as_ref(), &host, &[call(addr(HB), "input_len", case.input(0))], &declared, UNLIMITED));
@@ -1301,7 +1357,7 @@ fn section_block(worst: &[OpResult]) {
         host.deploy(c, &caller);
         for &kind in engines() {
             progress(format!("block: {} {label}", short(kind)));
-            let engine = host.engine(kind, &V1).expect("loads");
+            let engine = host.engine(kind, SCHEDULE).expect("loads");
             let (_, per) = measure_loop(engine.as_ref(), &host, c, "run", caller_input(p), &[p], label);
             rows.push(block_row(kind, label, per));
         }
@@ -1314,7 +1370,7 @@ fn section_block(worst: &[OpResult]) {
         let calls = [call(addr(HB), "storage_write", case.input(64))];
         for &kind in engines() {
             progress(format!("block: {} storage storm", short(kind)));
-            let engine = host.engine(kind, &V1).expect("loads");
+            let engine = host.engine(kind, SCHEDULE).expect("loads");
             let r = run_tx(engine.as_ref(), &host, &calls, &[], UNLIMITED);
             ok(&r, "storm");
             let fuel = r.fuel_used;
@@ -1335,9 +1391,9 @@ fn section_block(worst: &[OpResult]) {
             }
         }
         for (label, wasm) in [(format!("load: distinct \"{}\"", worst_shape.2), worst_shape.1.clone()), ("load: distinct minimal programs".to_string(), tiny.clone())] {
-            let count = (BLOCK_FUEL / V1.load_fuel(wasm.len())).max(1);
+            let count = (BLOCK_FUEL / SCHEDULE.load_fuel(wasm.len())).max(1);
             progress(format!("block: {} {label}", short(kind)));
-            let load_fuel = V1.load_fuel(wasm.len());
+            let load_fuel = SCHEDULE.load_fuel(wasm.len());
             let per = time_load(kind, &wasm).0.map(|t| t / load_fuel as f64);
             rows.push(block_row(kind, &format!("{label} × {count} ({} B each)", n0(wasm.len() as f64)), per));
         }
@@ -1354,7 +1410,7 @@ fn section_block(worst: &[OpResult]) {
         progress(format!("block e2e: {} {}", short(kind), op.name));
         let (host, p) = op_world(&op.module());
         let calls = [call(p, "run", op_input(u32::MAX))];
-        let engine = host.engine(kind, &V1).expect("loads");
+        let engine = host.engine(kind, SCHEDULE).expect("loads");
         let burn = || {
             let mut used = 0u64;
             for _ in 0..BLOCK_FUEL / TX_FUEL {
@@ -1396,7 +1452,7 @@ fn section_warm() {
         host.deploy(addr("token"), &token);
         let mut init = signer().to_vec();
         init.extend(1_000_000u64.to_le_bytes());
-        let e = host.engine(EngineKind::Soroban, &V1).expect("loads");
+        let e = host.engine(EngineKind::Soroban, SCHEDULE).expect("loads");
         let r = run_tx(e.as_ref(), &host, &[call(addr("token"), "init", init)], &[], 10_000_000);
         ok(&r, "token init");
         host.apply(&r.diff);
@@ -1409,7 +1465,7 @@ fn section_warm() {
         host.deploy(addr("escrow"), &escrow);
         let mut input = 1u64.to_le_bytes().to_vec();
         input.extend(addr("seller"));
-        let c = Call { program: addr("escrow"), method: "open".into(), input, value: 1_000_000_000 };
+        let c = Call { value: 1_000_000_000, ..call(addr("escrow"), "open", input) };
         scenarios.push(("escrow open (payable)".into(), host, vec![c], vec![]));
     }
     for name in ["call, 1,024 locals", "i64.div_u by 1, chain", "pointer chase, 2 MiB, random"] {
@@ -1430,14 +1486,14 @@ fn section_warm() {
         for &kind in engines() {
             let mut cold_fuel = Vec::new();
             let cold = time_with(
-                || host.engine(kind, &V1).expect("loads"),
+                || host.engine(kind, SCHEDULE).expect("loads"),
                 |e| {
                     let r = run_tx(e.as_ref(), host, calls, declared, 100_000_000);
                     cold_fuel.push(r.fuel_used);
                     (e, r)
                 },
             );
-            let engine = host.engine(kind, &V1).expect("loads");
+            let engine = host.engine(kind, SCHEDULE).expect("loads");
             let first = run_tx(engine.as_ref(), host, calls, declared, 100_000_000);
             ok(&first, name);
             for _ in 0..10 {
@@ -1463,13 +1519,13 @@ fn section_warm() {
     let big = corpus.iter().find(|(n, _)| n.starts_with("one function, straight-line")).expect("big").1.clone();
     let mut rows = Vec::new();
     for &kind in engines() {
-        let create = time(|| new_block_engine(kind, &V1));
-        let drop_empty = time_with(|| new_block_engine(kind, &V1), drop);
+        let create = time(|| new_block_engine(kind, SCHEDULE).expect("an engine"));
+        let drop_empty = time_with(|| new_block_engine(kind, SCHEDULE).expect("an engine"), drop);
         rows.push(vec![short(kind).to_string(), "create an empty engine".into(), us(create.med), format!("drop {}", us(drop_empty.med))]);
         for (label, wasm, n) in [("guest token.wasm", &token, 1usize), ("guest token.wasm", &token, 10), ("guest token.wasm", &token, 100), ("guest token.wasm", &token, 1_000), ("256 KB straight-line", &big, 1), ("256 KB straight-line", &big, 10)] {
             let hashes: Vec<CodeHash> = (0..n).map(|i| *blake3::hash(&(i as u64).to_le_bytes()).as_bytes()).collect();
             let load = time_with(
-                || new_block_engine(kind, &V1),
+                || new_block_engine(kind, SCHEDULE).expect("an engine"),
                 |mut e| {
                     for h in &hashes {
                         e.load(*h, wasm).expect("loads");
@@ -1479,7 +1535,7 @@ fn section_warm() {
             );
             let dropped = time_with(
                 || {
-                    let mut e = new_block_engine(kind, &V1);
+                    let mut e = new_block_engine(kind, SCHEDULE).expect("an engine");
                     for h in &hashes {
                         e.load(*h, wasm).expect("loads");
                     }
@@ -1552,9 +1608,9 @@ fn stack_probe(kind: usize, scenario: usize, bytes: usize) -> ! {
         .stack_size(bytes)
         .spawn(move || {
             let (host, calls, declared) = chain_tx(programs, rec);
-            let engine = host.engine(kind, &V1).expect("loads");
+            let engine = host.engine(kind, SCHEDULE).expect("loads");
             let r = run_tx(engine.as_ref(), &host, &calls, &declared, 100_000_000);
-            r.ok == expect_ok && (expect_ok || matches!(&r.fail, Some(blockula_vm::exec::FailCode::Trapped { trap: Trap::CallDepth, .. })))
+            r.ok() == expect_ok && (expect_ok || matches!(&r.fail, Some(FailCode::Trapped { kind: TrapKind::CallDepth, .. })))
         })
         .expect("spawns");
     let ok = handle.join().unwrap_or(false);

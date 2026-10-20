@@ -246,14 +246,14 @@ fn guests_build_with_the_repo_compiler() {
 fn the_engine_loads_them_under_the_design_config() {
     let soroban = soroban_engine();
     for (name, _) in PROGRAMS {
-        soroban_wasmi::Module::new(&soroban, &wasm(name)).unwrap_or_else(|e| panic!("{name} on soroban-wasmi: {e}"));
+        soroban_wasmi::Module::new(&soroban, wasm(name)).unwrap_or_else(|e| panic!("{name} on soroban-wasmi: {e}"));
     }
 }
 
-/// soroban-wasmi under the design's configuration (4.2), schedule v1's operator classes.
+/// soroban-wasmi under the design's configuration (4.2), schedule v0's operator classes.
 fn soroban_engine() -> soroban_wasmi::Engine {
     use soroban_wasmi as w;
-    let ops = blockula_vm::meter::V1.ops;
+    let ops = blockula_vm::meter::SCHEDULE_V0.ops;
     let mut costs = w::FuelCosts::default();
     (costs.base, costs.entity, costs.load, costs.store, costs.call) = (ops.base.into(), ops.entity.into(), ops.load.into(), ops.store.into(), ops.call.into());
     let mut c = w::Config::default();

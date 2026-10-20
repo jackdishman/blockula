@@ -4,12 +4,14 @@ Two cargo-fuzz targets over `blockula-vm` (docs/PROGRAMS-PLAN.md C1, C8):
 
 - **`program_validate`**: `validate()` never panics, and everything it accepts
   uploads: `MemHost::upload` (validation, then a test translation on
-  soroban-wasmi under `catch_unwind`) neither panics nor refuses it. Any
+  soroban-wasmi under `catch_unwind`) neither faults nor refuses it. Any
   disagreement between validation and the engine is a finding.
-- **`program_exec`**: the executor, host and overlay never panic or corrupt
-  memory, however a batch of calls to the four guests is shaped (callees,
-  methods, inputs and values are all fuzzer-chosen). Only validated code runs,
-  as on a node.
+- **`program_exec`**: the executor, host and overlay never panic, corrupt
+  memory or report a node fault (`MemHost` is a sound view, so a `NodeFault`
+  is the executor's bug), however a batch of calls to the four guests is
+  shaped: callees, methods, inputs, values, the method kinds and payability
+  their interfaces declare, the kind each call runs as and stale version
+  digests are all fuzzer-chosen. Only validated code runs, as on a node.
 
 ## Run it
 

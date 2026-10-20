@@ -2,8 +2,8 @@
 //! boundary only (soroban-wasmi, and wasmi 0.38 with `--features ref038`). Executable notes for
 //! `validate.rs`: where the engine accepts what 4.2 refuses, validation has to refuse it.
 
-use blockula_vm::engine::{BlockEngine, EngineKind, Host, Instance, Invoked, Trap, new_block_engine};
-use blockula_vm::meter::V1;
+use blockula_vm::engine::{BlockEngine, EngineKind, Host, Instance, Invoked, NodeFault, Trap, TrapKind, new_block_engine};
+use blockula_vm::meter::SCHEDULE_V0;
 
 struct NoHost;
 impl Host for NoHost {
@@ -14,7 +14,7 @@ impl Host for NoHost {
 
 fn engine(kind: EngineKind, body: &str) -> (Box<dyn BlockEngine>, Result<(), String>) {
     let wasm = wat::parse_str(format!(r#"(module (memory (export "memory") 1 1) {body})"#)).unwrap();
-    let mut e = new_block_engine(kind, &V1);
+    let mut e = new_block_engine(kind, &SCHEDULE_V0).unwrap();
     let loaded = e.load([0; 32], &wasm).map_err(|e| e.to_string());
     (e, loaded)
 }
@@ -81,7 +81,7 @@ fn a_start_function_never_runs() {
     for kind in EngineKind::ALL {
         let (e, loaded) = engine(*kind, r#"(func $s unreachable) (start $s) (func (export "bk_x"))"#);
         assert_eq!(loaded, Ok(()), "{}", kind.name());
-        assert!(matches!(invoke(e.as_ref(), 1_000).result, Err(Trap::Fault(_))), "{}", kind.name());
+        assert!(matches!(invoke(e.as_ref(), 1_000).result, Err(Trap::Fault(NodeFault::Instantiate(_)))), "{}", kind.name());
     }
 }
 
@@ -94,7 +94,7 @@ fn out_of_fuel_leaves_a_remainder() {
     for kind in EngineKind::ALL {
         let (e, _) = engine(*kind, r#"(func (export "bk_x") (loop $l (br $l)))"#);
         let r = [invoke(e.as_ref(), 1_000), invoke(e.as_ref(), 1_001)];
-        assert!(r.iter().all(|r| r.result == Err(Trap::OutOfFuel)));
+        assert!(r.iter().all(|r| r.result == Err(Trap::Kind(TrapKind::OutOfFuel))));
         assert!(r.iter().any(|r| r.fuel_left > 0), "{}", kind.name());
     }
 }
@@ -128,7 +128,7 @@ fn what_the_engines_do_with_a_grow_validation_never_lets_through() {
         let (e, _) = engine(*kind, &grow(1_000, -1));
         let r = invoke(e.as_ref(), 200_000);
         match kind {
-            EngineKind::Soroban => assert_eq!(r.result, Err(Trap::OutOfFuel), "{name}"),
+            EngineKind::Soroban => assert_eq!(r.result, Err(Trap::Kind(TrapKind::OutOfFuel)), "{name}"),
             #[cfg(feature = "ref038")]
             EngineKind::Wasmi038 => assert_eq!(r.result, Ok(()), "{name}: −1 at the static cost"),
         }

@@ -2,9 +2,11 @@
 //! `blockula`, each named with its ABI version. Engine-neutral: no engine type appears here, so
 //! the engine behind `engine.rs` can change without changing what programs see.
 //!
-//! The spike (docs/PROGRAMS-PLAN.md S1) implements the subset S1 needs: input and output, storage,
-//! context, transfers, cross-program calls and events. The rest of 10.2 (beacon, names, crypto,
-//! `origin_session`, `caller_auth`) lands with C14.
+//! This is a subset of 10.2: input and output, storage, context, transfers, cross-program calls
+//! and events, plus `last_return_len_v1` and `last_abort_code_v1`, which 10.2 lacks. Functions
+//! are only ever added, and only with a protocol version (10.1), so what this table holds when
+//! programs activate is frozen; the rest of 10.2 (`storage_next`, the beacon, names, crypto,
+//! `origin_session`, `caller_auth`, `epoch`, `chain_instance`, `tx_hash`) comes with a later one.
 
 /// The import module every host function lives in.
 pub const MODULE: &str = "blockula";
@@ -31,8 +33,8 @@ const fn f(name: &'static str, params: &'static [Ty], results: &'static [Ty]) ->
     HostFn { name, params, results }
 }
 
-/// Host ABI v1, as far as the spike goes. An import not listed here, or listed with another
-/// signature, fails upload validation (`validate.rs`).
+/// Host ABI v1. An import not listed here, or listed with another signature, fails upload
+/// validation (`validate.rs`).
 ///
 /// # Reading into a buffer
 ///
@@ -97,8 +99,9 @@ pub fn host_fn(name: &str) -> Option<&'static HostFn> {
 /// Status codes host functions return.
 pub mod status {
     pub const OK: i32 = 0;
-    /// A transfer the program can't make: its balance is short, or the recipient doesn't exist
-    /// and no opening flag was passed, or it's a closed program.
+    /// A transfer the program can't make: its balance is short (with `OPEN_PAY`, short of the
+    /// amount and the creation fee; with `OPEN_DEDUCT`, an amount below the fee), or the recipient
+    /// doesn't exist and no opening flag was passed.
     pub const ERR_TRANSFER: i32 = 1;
     /// `try_call`: the callee aborted. Its code is `last_abort_code_v1()`, its message
     /// `last_return_v1` (see [`HOST_FNS`](super::HOST_FNS)).
