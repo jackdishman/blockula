@@ -14,11 +14,14 @@ trap 'if [ -n "$MOCK" ]; then kill "$MOCK" 2> /dev/null || true; wait "$MOCK" 2>
 fails=0
 ok() { echo "✓ $1"; }
 bad() { echo "✗ $1" >&2; fails=$((fails + 1)); }
+# The haystack goes to grep as a here-string, never through a pipe: under pipefail, grep -q quits at
+# its match and a long haystack's writer then dies of SIGPIPE, which would read as no match (a
+# refute passing over a log that holds what it refutes).
 expect() { # what haystack needle
-  if printf '%s\n' "$2" | grep -qF -- "$3"; then ok "$1"; else bad "$1: no \"$3\" in: $2"; fi
+  if grep -qF -- "$3" <<<"$2"; then ok "$1"; else bad "$1: no \"$3\" in: $2"; fi
 }
 refute() { # what haystack needle
-  if printf '%s\n' "$2" | grep -qF -- "$3"; then bad "$1: \"$3\" in: $2"; else ok "$1"; fi
+  if grep -qF -- "$3" <<<"$2"; then bad "$1: \"$3\" in: $2"; else ok "$1"; fi
 }
 
 # ---- the mock node: /api/health, /api/status and /api/validators as $T/state says ----
@@ -185,7 +188,7 @@ b=$(body)
 expect "stalled: the body @-mentions @jackdishman" "$b" "@jackdishman the external watch found the public testnet failing: **health** is the first failing check."
 expect "stalled: the body has the report" "$b" "✗ head age: 75000 ms, over the 60000 ms limit"
 expect "stalled: the body has the run's URL" "$b" "- Run: https://github.com/jackdishman/blockula/actions/runs/4242"
-printf '%s\n' "$b" | grep -qE '^- Time: [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} UTC$' && ok "stalled: the body has the time (UTC)" || bad "stalled: no UTC time in: $b"
+grep -qE '^- Time: [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} UTC$' <<<"$b" && ok "stalled: the body has the time (UTC)" || bad "stalled: no UTC time in: $b"
 expect "stalled: the log says what it did" "$(out)" "→ opened an alert issue: https://github.com/jackdishman/blockula/issues/42"
 
 # ---- a failure with an alert open: a comment there, no second issue ----

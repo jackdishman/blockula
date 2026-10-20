@@ -15,11 +15,14 @@ trap 'rm -rf "$T"' EXIT
 fails=0
 ok() { echo "✓ $1"; }
 bad() { echo "✗ $1" >&2; fails=$((fails + 1)); }
+# The haystack goes to grep as a here-string, never through a pipe: under pipefail, grep -q quits at
+# its match and a long haystack's writer then dies of SIGPIPE, which would read as no match (a
+# refute passing over a log that holds what it refutes).
 expect() { # what haystack needle
-  if printf '%s\n' "$2" | grep -qF -- "$3"; then ok "$1"; else bad "$1: no \"$3\" in: $2"; fi
+  if grep -qF -- "$3" <<<"$2"; then ok "$1"; else bad "$1: no \"$3\" in: $2"; fi
 }
 refute() { # what haystack needle
-  if printf '%s\n' "$2" | grep -qF -- "$3"; then bad "$1: \"$3\" in: $2"; else ok "$1"; fi
+  if grep -qF -- "$3" <<<"$2"; then bad "$1: \"$3\" in: $2"; else ok "$1"; fi
 }
 sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
 
@@ -218,7 +221,7 @@ code=$(lm launch DRY_RUN=1 LAUNCH_WINDOW_MINS=5)
 # The day before, the keys are still encrypted: a dry run plans the launch without them.
 before=$(wc -l < "$T/fly/verifier.log")
 code=$(lm launch DRY_RUN=1 KEYS_DIR=)
-[ "$code" = 0 ] && [ -z "$(writes)" ] && [ "$(grep -c '^DRY_RUN fly deploy -c' "$T/out")" = 6 ] && ! tail -n +"$((before + 1))" "$T/fly/verifier.log" | grep -q 'genesis operator' \
+[ "$code" = 0 ] && [ -z "$(writes)" ] && [ "$(grep -c '^DRY_RUN fly deploy -c' "$T/out")" = 6 ] && ! grep -q 'genesis operator' < <(tail -n +"$((before + 1))" "$T/fly/verifier.log") \
   && expect "launch, DRY_RUN without KEYS_DIR: plans the six deploys, reading no key, and says so" "$(out)" "DRY_RUN without KEYS_DIR: no key is read" || bad "launch DRY_RUN without KEYS_DIR exited $code: writes $(writes): $(out)"
 expect "launch, DRY_RUN without KEYS_DIR: still matches each app to its genesis validator" "$(out)" "bm-v3  ams  198.51.100.4  boo1c3c3c3c3c3c3c3c3"
 untouched "without KEYS_DIR" "$(lm launch KEYS_DIR=)" "KEYS_DIR is required"

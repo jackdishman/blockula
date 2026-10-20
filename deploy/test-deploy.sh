@@ -12,11 +12,14 @@ trap 'rm -rf "$T"' EXIT
 fails=0
 ok() { echo "✓ $1"; }
 bad() { echo "✗ $1" >&2; fails=$((fails + 1)); }
+# The haystack goes to grep as a here-string, never through a pipe: under pipefail, grep -q quits at
+# its match and a long haystack's writer then dies of SIGPIPE, which would read as no match (a
+# refute passing over a log that holds what it refutes).
 expect() { # what haystack needle
-  if printf '%s\n' "$2" | grep -qF -- "$3"; then ok "$1"; else bad "$1: no \"$3\" in: $2"; fi
+  if grep -qF -- "$3" <<<"$2"; then ok "$1"; else bad "$1: no \"$3\" in: $2"; fi
 }
 refute() { # what haystack needle
-  if printf '%s\n' "$2" | grep -qF -- "$3"; then bad "$1: \"$3\" in: $2"; else ok "$1"; fi
+  if grep -qF -- "$3" <<<"$2"; then bad "$1: \"$3\" in: $2"; else ok "$1"; fi
 }
 
 # ---- the entrypoint, with a stand-in node ----
