@@ -6,6 +6,7 @@ import { Suspense } from "react";
 import { ActionForm } from "@/components/explorer/ActionForm";
 import { Section, Term } from "@/components/explorer/kit";
 import { ProgramState } from "@/components/explorer/ProgramState";
+import { ProgramActivity } from "@/components/explorer/ProgramActivity";
 import { actionId, program, signature } from "@/lib/explorer/programs";
 import { NETWORK } from "@/lib/config";
 import { to } from "@/lib/explorer/routes";
@@ -101,6 +102,7 @@ function Program() {
           <p className="card-note">Every call is a signed transaction with a receipt. Calls without a form here need special keys or a secret between steps.</p>
         </Section>
       </div>
+      <ProgramActivity key={p.id} program={p} />
     </main>
   );
 }

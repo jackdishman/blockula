@@ -80,6 +80,7 @@ export function Ledger({
   head,
   blockMs,
   fresh,
+  showFee = false,
   empty = "Nothing yet.",
 }: {
   txs: TxDetail[];
@@ -93,6 +94,8 @@ export function Ledger({
   head?: number;
   blockMs?: number;
   fresh?: ReadonlySet<string>;
+  /** Program activity can sort by fees, so show the charged fee beside each summary. */
+  showFee?: boolean;
   empty?: string;
 }) {
   if (!txs.length) return <p className="ledger-empty">{empty}</p>;
@@ -109,9 +112,10 @@ export function Ledger({
               <span className={`ledger-kind ${dir}`}>{label}</span>
               <span className="ledger-main">
                 <span className="ledger-summary">{fromMySide(t.summary, me ?? null)}</span>
-                {(t.memo || (signer && !signer.mine) || t.status !== "finalized") && (
+                {(showFee || t.memo || (signer && !signer.mine) || t.status !== "finalized") && (
                   <span className="ledger-meta">
                     {t.status !== "finalized" && <StatusPill status={t.status} />}
+                    {showFee && t.fee != null && <span>{t.status === "pending" ? "max fee " : "fee "}<Amount drops={t.status === "pending" ? t.max_fee ?? t.fee : t.fee} exact /></span>}
                     {/* Your own device is the default; only other keys (an agent, another device) are called out. */}
                     {signer && !signer.mine && <span className={`chip ${signer.agent ? "agent" : ""}`}>{signer.agent ? `agent · ${signer.label}` : signer.label}</span>}
                     {t.memo && <span className="ledger-memo">“{t.memo}”</span>}
