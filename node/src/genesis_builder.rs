@@ -13,14 +13,35 @@
 //! each bucket holds its share (docs/TOKENOMICS.md); every operator's proof of possession, keys
 //! and addresses; the independence policy (DEC-3, DEC-14: at least 22 operators; per hosting
 //! provider, ASN and country at most ⌊n/4⌋; per facility at most 15%; at most 2 founder or
-//! foundation seats; one seat per entity); and everything `Genesis::check` does (parameter bounds,
-//! no faucet and no admins on `blockula-1`). Bucket and independence findings are warnings unless
-//! the spec (or `--strict`) says `strict`; `blockula-1` is always strict.
+//! foundation seats; one seat per entity); the staking rules a genesis set can trip over from
+//! block 1 (seats that couldn't rejoin the set once they leave it, owners with nothing unstaked
+//! to pay their validators' system txs, several seats of one entity the bootstrap delegation
+//! backs while their owners may take commission on it); and everything `Genesis::check` does
+//! (parameter bounds, no faucet and no admins on `blockula-1`). Policy findings are warnings unless the spec (or
+//! `--strict`) says `strict`; `blockula-1` is always strict.
+//!
+//! The spec may also:
+//! * waive a finding of a waivable rule ([`Rule::waivable`]: the independence policy, founder
+//!   seats, the rejoin trap, fee headroom, the bootstrap delegation's commission) with a
+//!   `[[waiver]]` naming the rule and a reason. Every
+//!   build prints each waived finding as `WAIVED: <rule>: <finding> (<reason>)`, and a waiver no
+//!   finding matches is an error, so the waivers on record are exactly what the set breaks. They
+//!   live in the spec (which ships next to the genesis and rebuilds it), not in `genesis.json`.
+//!   DEC-5 (the buckets' shares, the endowment's curve), the faucet, admin keys, the supply, the
+//!   prefix, governance's floors and Ghost Mode are never waived.
+//! * give each genesis validator's consensus-key account a liquid `operator_float` out of the
+//!   operators bucket (at most [`MAX_OPERATOR_FLOAT`]), so the bootstrap council can propose and
+//!   vote from block 1: every other allocation to an account with a key vests, and unvested
+//!   tokens neither vote nor pay a deposit (on `blockula-1` the floats are the only liquid ones).
+//! * start the chain at a released protocol version (`protocol_version`): scheduled from block 1
+//!   (`Genesis::upgrades`). `blockula-1` is born at v2 (`upgrade::MAINNET_GENESIS_VERSION`).
 
 use crate::chain::{bootstrap_delegation, check_host_port, check_http_addr, community, endowment, make_pop, system_account, treasury, Allocation, Genesis, Operator, SoulEntry, ValidatorInfo, Vesting, MAINNET_CHAIN_ID};
+use crate::consensus::{PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSION};
 use crate::crypto;
 use crate::params::MAX_SUPPLY;
 use crate::types::*;
+use crate::upgrade::ScheduledUpgrade;
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
@@ -76,6 +97,23 @@ pub const FAUCET_BUCKET: &str = "faucet";
 /// The label of the contribution pool's opening balance (`[contribution] opening_balance`).
 pub const POOL_OPENING_LABEL: &str = "contribution pool: opening balance (endowment)";
 
+/// Most `operator_float` may give each genesis validator: enough for proposal deposits at the
+/// genesis `proposal_deposit` a launch would set (the parameter's floor is 1 FANG), council votes
+/// and their fees, and little to lose if a hot consensus key leaks (the key holds its seat's
+/// council vote then, as its owner's keys do).
+pub const MAX_OPERATOR_FLOAT: u64 = 1_000 * DROPS_PER_FANG;
+
+/// The label of an `operator_float` allocation (on the validator's consensus-key account).
+pub const OPERATOR_FLOAT_LABEL: &str = "operator float (operators bucket)";
+
+/// Least an operator's owner should keep unstaked after its self-bonds: a node pays its
+/// validator's system txs (beacon commitments and reveals, attestations) from the owner
+/// (`Chain::system_fee_payer`; locked tokens may pay base fees), and a commitment it can't follow
+/// with a reveal jails and slashes it (`beacon::end_epoch`). A commitment and a reveal an
+/// hour-long epoch, about 5.5 KB each, cost about 1.1 FANG a year at the floor base fee, so this
+/// lasts years, through busy blocks and attestations too.
+pub const MIN_OWNER_FEE_HEADROOM: u64 = 10 * DROPS_PER_FANG;
+
 impl Bucket {
     /// Its vesting curve in blocks at this block time.
     pub fn curve(&self, block_time_ms: u64) -> Option<Vesting> {
@@ -102,7 +140,7 @@ pub struct Spec {
     pub validator_admins: Vec<String>,
     /// FANG ("1000000000"); the allocations must add up to exactly this.
     pub total_supply: String,
-    /// Bucket and independence findings are errors (always on for `blockula-1`).
+    /// Policy findings the spec doesn't waive are errors (always on for `blockula-1`).
     #[serde(default)]
     pub strict: bool,
     /// Operator files (TOML or JSON, from `blockula genesis operator`), relative to the spec.
@@ -122,6 +160,148 @@ pub struct Spec {
     /// Proof of Contribution from genesis: timings, the pool's repos and its opening balance.
     #[serde(default)]
     pub contribution: Option<SpecContribution>,
+    /// The protocol version blocks run from block 1 (left out: v1, with no schedule). A released
+    /// version (at most `consensus::SUPPORTED_PROTOCOL_VERSION`, never a preview) is scheduled
+    /// from block 1 (`Genesis::upgrades`); `blockula-1` is born at
+    /// `upgrade::MAINNET_GENESIS_VERSION`. Features that version brings (`programs` from v2) may
+    /// then be on from genesis.
+    #[serde(default)]
+    pub protocol_version: Option<u32>,
+    /// FANG ("100") each genesis validator's consensus-key account gets, liquid, out of the
+    /// operators bucket: the spec's operators allocations and every float add up to the bucket's
+    /// share. What a validator's council votes and proposals spend from block 1; at most
+    /// [`MAX_OPERATOR_FLOAT`].
+    #[serde(default)]
+    pub operator_float: Option<String>,
+    /// Policy findings this spec waives, each with its reason (`[[waiver]]`).
+    #[serde(default, rename = "waiver")]
+    pub waivers: Vec<SpecWaiver>,
+}
+
+/// `[[waiver]]`: every finding of a waivable rule ([`Rule::waivable`]), waived for a reason
+/// published with the spec. Each build prints what it waived.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpecWaiver {
+    /// A [`Rule`] by name ("operator-minimum").
+    pub rule: String,
+    /// Why, in one line.
+    pub reason: String,
+}
+
+/// A rule the builder checks a spec against that a launch may break and still build (unlike the
+/// errors: supply, prefix, faucet, admin keys, governance's floors, Ghost Mode). Its findings are
+/// warnings, errors when strict, and for a waivable rule printed waivers when the spec carries
+/// one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Rule {
+    /// DEC-3: at least [`MIN_GENESIS_OPERATORS`] operators.
+    OperatorMinimum,
+    /// DEC-14: at most ⌊n/4⌋ operators per hosting provider …
+    ProviderCap,
+    /// … per ASN …
+    AsnCap,
+    /// … and per data-center country …
+    CountryCap,
+    /// … and at most [`MAX_FACILITY_BPS`] of them per facility.
+    FacilityCap,
+    /// DEC-14: one seat per legal entity (the founder's and the foundation's are capped together
+    /// instead).
+    OneSeatPerEntity,
+    /// DEC-3: at most [`MAX_FOUNDER_SEATS`] seats run by the founder or the foundation.
+    FounderSeats,
+    /// A seat that couldn't rejoin the set once it leaves it (staking.rs: an owner with unvested
+    /// tokens brings back one seat; the founder's and the foundation's accounts no more than
+    /// `staking::excluded_seats_cap` of the set).
+    RejoinTrap,
+    /// An owner left less than [`MIN_OWNER_FEE_HEADROOM`] unstaked to pay its validators' system
+    /// txs.
+    FeeHeadroom,
+    /// DEC-5: the bootstrap delegation backs several seats of one entity, and their owners may
+    /// keep commission on it (`bootstrap_commission_cap_bps` above 0), which nobody votes on.
+    BootstrapCommission,
+    /// Every operator fills in its independence fields (what the caps are counted from).
+    IndependenceFields,
+    /// DEC-5: each bucket holds exactly its share.
+    BucketShares,
+    /// DEC-5: the endowment releases linearly from zero (the contribution pool's opening balance).
+    OpeningBalance,
+}
+
+impl Rule {
+    pub const ALL: [Rule; 13] = [Rule::OperatorMinimum, Rule::ProviderCap, Rule::AsnCap, Rule::CountryCap, Rule::FacilityCap, Rule::OneSeatPerEntity, Rule::FounderSeats, Rule::RejoinTrap, Rule::FeeHeadroom, Rule::BootstrapCommission, Rule::IndependenceFields, Rule::BucketShares, Rule::OpeningBalance];
+
+    /// Its name in a `[[waiver]]` and in what the builder prints.
+    pub fn name(self) -> &'static str {
+        match self {
+            Rule::OperatorMinimum => "operator-minimum",
+            Rule::ProviderCap => "provider-cap",
+            Rule::AsnCap => "asn-cap",
+            Rule::CountryCap => "country-cap",
+            Rule::FacilityCap => "facility-cap",
+            Rule::OneSeatPerEntity => "one-seat-per-entity",
+            Rule::FounderSeats => "founder-seats",
+            Rule::RejoinTrap => "rejoin-trap",
+            Rule::FeeHeadroom => "fee-headroom",
+            Rule::BootstrapCommission => "bootstrap-commission",
+            Rule::IndependenceFields => "independence-fields",
+            Rule::BucketShares => "bucket-shares",
+            Rule::OpeningBalance => "opening-balance",
+        }
+    }
+
+    /// Whether a spec may waive it: the independence policy and the staking rules a small set
+    /// trips over, which a launch may knowingly break and say so. Never DEC-5 (the buckets and the
+    /// endowment's curve) or the independence fields every other rule is counted from.
+    pub fn waivable(self) -> bool {
+        !matches!(self, Rule::IndependenceFields | Rule::BucketShares | Rule::OpeningBalance)
+    }
+}
+
+/// Rules that are errors, never findings, so never waived: named so a waiver of one says so.
+const NEVER_WAIVED: &[&str] = &["faucet", "admin-keys", "total-supply", "prefix", "governance-floors", "ghost"];
+
+/// What breaks a [`Rule`], in words.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Finding {
+    pub rule: Rule,
+    pub text: String,
+}
+
+impl Finding {
+    fn new(rule: Rule, text: String) -> Self {
+        Finding { rule, text }
+    }
+}
+
+impl std::fmt::Display for Finding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.rule.name(), self.text)
+    }
+}
+
+/// Splits `findings` into the ones `waivers` waive (as the lines a build prints, in the
+/// findings' order) and the rest. A waiver must name a waivable rule, once, with a one-line
+/// reason, and waive at least one finding: a stale waiver is an error, not a silent no-op, so
+/// what a spec records it waives is what its set breaks.
+pub fn apply_waivers(waivers: &[SpecWaiver], findings: Vec<Finding>) -> Result<(Vec<String>, Vec<Finding>)> {
+    let mut reasons: BTreeMap<Rule, &str> = BTreeMap::new();
+    for w in waivers {
+        let what = format!("waiver {:?}", w.rule);
+        let Some(rule) = Rule::ALL.into_iter().find(|r| r.name() == w.rule) else {
+            ensure!(!NEVER_WAIVED.contains(&w.rule.as_str()), "{what}: never waivable (the builder refuses it outright)");
+            bail!("{what}: unknown rule (waivable: {})", Rule::ALL.iter().filter(|r| r.waivable()).map(|r| r.name()).collect::<Vec<_>>().join(", "));
+        };
+        ensure!(rule.waivable(), "{what}: never waivable");
+        let reason = w.reason.trim();
+        ensure!(!reason.is_empty() && !reason.chars().any(|c| c.is_control()), "{what}: needs a reason, in one line");
+        ensure!(reasons.insert(rule, reason).is_none(), "{what}: listed twice");
+    }
+    let (waived, kept): (Vec<Finding>, Vec<Finding>) = findings.into_iter().partition(|f| reasons.contains_key(&f.rule));
+    for rule in reasons.keys() {
+        ensure!(waived.iter().any(|f| f.rule == *rule), "waiver {:?} matches no finding: remove it (a spec waives only what its set breaks)", rule.name());
+    }
+    Ok((waived.iter().map(|f| format!("WAIVED: {f} ({})", reasons[&f.rule])).collect(), kept))
 }
 
 /// `[contribution]`: the contribution pool open from block 1 instead of after a `SetRepo`
@@ -336,8 +516,11 @@ pub struct Built {
     pub json: String,
     /// hex of the genesis block's digest (what `join --genesis-hash` pins).
     pub hash: String,
-    /// Bucket and independence findings that didn't stop the build (none when strict).
+    /// Policy findings the spec doesn't waive that didn't stop the build (none when strict), as
+    /// `<rule>: <finding>`.
     pub warnings: Vec<String>,
+    /// What the spec's `[[waiver]]`s waived, as `WAIVED: <rule>: <finding> (<reason>)`.
+    pub waived: Vec<String>,
 }
 
 fn parse_fang_amount(s: &str) -> Result<u64> {
@@ -368,7 +551,7 @@ pub fn build_from(spec: &Spec, operators: &[OperatorFile], strict: bool) -> Resu
     let mainnet = spec.chain_id == MAINNET_CHAIN_ID;
     let strict = strict || spec.strict || mainnet;
     let prefix = spec.address_prefix.as_str();
-    let mut findings: Vec<String> = vec![];
+    let mut findings: Vec<Finding> = vec![];
     ensure!(!spec.chain_id.is_empty() && spec.chain_id.len() <= MAX_CHAIN_ID && spec.chain_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'), "chain_id must be 1–{MAX_CHAIN_ID} of a-z, 0-9 and '-'");
     ensure!(crypto::is_prefix(prefix), "address_prefix must be one of {:?}", crypto::KNOWN_PREFIXES);
     ensure!(spec.genesis_time_ms > 0, "genesis_time_ms must be a fixed time (UTC milliseconds)");
@@ -376,6 +559,13 @@ pub fn build_from(spec: &Spec, operators: &[OperatorFile], strict: bool) -> Resu
         ensure!(prefix == crypto::ADDRESS_HRP, "{MAINNET_CHAIN_ID} uses the {} prefix", crypto::ADDRESS_HRP);
         ensure!(!spec.faucet && spec.validator_admins.is_empty(), "{MAINNET_CHAIN_ID} has no faucet and no admin keys (DEC-10)");
     }
+    // A released version from block 1, or v1 with no schedule. Never a preview version: its rules
+    // change from release to release (`upgrade::check_genesis_upgrades`).
+    let upgrades = match spec.protocol_version {
+        None | Some(PROTOCOL_VERSION) => vec![],
+        Some(v) if (PROTOCOL_VERSION + 1..=SUPPORTED_PROTOCOL_VERSION).contains(&v) => vec![ScheduledUpgrade { version: v, activation_height: 1 }],
+        Some(v) => bail!("protocol_version {v}: a public network starts at a released version, v{PROTOCOL_VERSION}–v{SUPPORTED_PROTOCOL_VERSION}"),
+    };
 
     // Allocations, by bucket.
     let total = parse_fang_amount(&spec.total_supply).context("total_supply")?;
@@ -424,15 +614,7 @@ pub fn build_from(spec: &Spec, operators: &[OperatorFile], strict: bool) -> Resu
         sum += amount as u128;
         *by_bucket.entry("endowment").or_default() += amount as u128;
         allocations.push(Allocation { address: crate::poc::pool_address(prefix), amount, vesting: None, label: Some(POOL_OPENING_LABEL.into()) });
-        findings.push(format!("the contribution pool opens with {} out of the endowment, which DEC-5 releases linearly from zero (docs/TOKENOMICS.md, section 1)", fmt_fang(amount)));
-    }
-    ensure!(sum == total as u128, "allocations add up to {} drops, but total_supply is {} drops", sum, total);
-    for b in BUCKETS {
-        let want = (total as u128 - faucet) * b.bps as u128 / 10_000;
-        let has = by_bucket.get(b.name).copied().unwrap_or(0);
-        if has != want {
-            findings.push(format!("bucket {} holds {} drops; DEC-5 gives it {} ({}% of the supply)", b.name, has, want, crate::staking::fmt_bps(b.bps)));
-        }
+        findings.push(Finding::new(Rule::OpeningBalance, format!("the contribution pool opens with {} out of the endowment, which DEC-5 releases linearly from zero (docs/TOKENOMICS.md, section 1)", fmt_fang(amount))));
     }
 
     // Operators: their entries and validators, the independence policy.
@@ -452,10 +634,34 @@ pub fn build_from(spec: &Spec, operators: &[OperatorFile], strict: bool) -> Resu
         entries.push(o.entry().with_context(|| who.clone())?);
         validators.push(ValidatorInfo { address, public_key: o.keys.consensus_public_key.clone(), p2p_addr: o.network.p2p_addr.clone(), http_addr: o.network.http_addr.clone() });
     }
-    findings.extend(independence_findings(operators));
     // Canonical order, whatever order the files were listed in.
     validators.sort_by_key(|v| v.address.clone());
     entries.sort_by_key(|o| crypto::address_with_prefix(prefix, &hex::decode(&o.consensus_key).unwrap_or_default()));
+
+    // The operator floats: liquid, on each validator's consensus-key account, out of the operators
+    // bucket, after the spec's allocations, in the validators' canonical order.
+    if let Some(float) = &spec.operator_float {
+        let amount = parse_fang_amount(float).context("operator_float")?;
+        ensure!(amount > 0 && amount <= MAX_OPERATOR_FLOAT, "operator_float must be more than 0 and at most {} (or left out)", fmt_fang(MAX_OPERATOR_FLOAT));
+        for v in &validators {
+            sum += amount as u128;
+            *by_bucket.entry("operators").or_default() += amount as u128;
+            allocations.push(Allocation { address: v.address.clone(), amount, vesting: None, label: Some(OPERATOR_FLOAT_LABEL.into()) });
+        }
+    }
+    ensure!(sum == total as u128, "allocations add up to {} drops, but total_supply is {} drops", sum, total);
+    for b in BUCKETS {
+        let want = (total as u128 - faucet) * b.bps as u128 / 10_000;
+        let has = by_bucket.get(b.name).copied().unwrap_or(0);
+        if has != want {
+            let floats = if b.name == "operators" && spec.operator_float.is_some() { ", operator floats included" } else { "" };
+            findings.push(Finding::new(Rule::BucketShares, format!("bucket {} holds {} drops{floats}; DEC-5 gives it {} ({}% of the supply)", b.name, has, want, crate::staking::fmt_bps(b.bps))));
+        }
+    }
+    if mainnet {
+        check_only_floats_liquid(prefix, &allocations, &validators)?;
+    }
+    findings.extend(independence_findings(operators));
 
     let mut param_overrides = BTreeMap::new();
     for (k, v) in &spec.params {
@@ -474,6 +680,7 @@ pub fn build_from(spec: &Spec, operators: &[OperatorFile], strict: bool) -> Resu
     for e in soul_ledger.iter().filter(|e| e.soul > 0) {
         ensure!(!excluded.contains(&e.account), "soul: {} is the founder's (or owns a founder's or foundation's seat), whose Soul is 0 at genesis (docs/TOKENOMICS.md)", e.account);
     }
+    findings.extend(staking_findings(operators, &entries, &allocations, &excluded));
 
     let genesis = Genesis {
         chain_id: spec.chain_id.clone(),
@@ -493,19 +700,22 @@ pub fn build_from(spec: &Spec, operators: &[OperatorFile], strict: bool) -> Resu
         reserved_names: spec.reserved_names.clone(),
         soul_ledger,
         features: spec.features.clone(),
-        // A public network never starts on a preview version (`upgrade::check_genesis_upgrades`).
-        upgrades: vec![],
+        upgrades,
         bootstrap_excluded: excluded,
         pool_repos,
     };
     ensure!(!genesis.validators.is_empty(), "a genesis needs at least one operator");
     genesis.check()?;
+    findings.extend(bootstrap_commission_findings(operators, &genesis)?);
+    let (waived, findings) = apply_waivers(&spec.waivers, findings)?;
     if strict && !findings.is_empty() {
-        bail!("the spec breaks the policy (strict):\n  - {}", findings.join("\n  - "));
+        let waivable: Vec<&str> = findings.iter().filter(|f| f.rule.waivable()).map(|f| f.rule.name()).collect::<BTreeSet<_>>().into_iter().collect();
+        let hint = if waivable.is_empty() { String::new() } else { format!("\n(a [[waiver]] with a reason may waive {})", waivable.join(", ")) };
+        bail!("the spec breaks the policy (strict):\n  - {}{hint}", findings.iter().map(Finding::to_string).collect::<Vec<_>>().join("\n  - "));
     }
     let json = serde_json::to_string_pretty(&genesis)? + "\n";
     let hash = hex::encode(crate::consensus::genesis_block(&genesis).digest_bytes());
-    Ok(Built { genesis, json, hash, warnings: findings })
+    Ok(Built { genesis, json, hash, warnings: findings.iter().map(Finding::to_string).collect(), waived })
 }
 
 /// The accounts whose validators the bootstrap delegation passes over (DEC-5): the founder's
@@ -517,22 +727,64 @@ fn bootstrap_excluded(spec: &Spec, operators: &[OperatorFile]) -> Vec<String> {
     allocated.chain(owners).collect::<BTreeSet<String>>().into_iter().collect()
 }
 
+/// DEC-5 on `blockula-1`: the operator floats are the only liquid allocations to accounts with a
+/// key. No spec reaches this today: the faucet is refused, every keyed bucket in [`BUCKETS`]
+/// vests and the pool's opening balance goes to a keyless account. It keeps the rule if one of
+/// them changes.
+fn check_only_floats_liquid(prefix: &str, allocations: &[Allocation], validators: &[ValidatorInfo]) -> Result<()> {
+    for a in allocations.iter().filter(|a| a.vesting.is_none() && system_account(prefix, &a.address).is_none()) {
+        let float = a.label.as_deref() == Some(OPERATOR_FLOAT_LABEL) && validators.iter().any(|v| v.address == a.address);
+        ensure!(float, "{MAINNET_CHAIN_ID}: {} gets a liquid allocation; only the operator floats are liquid (DEC-5)", a.address);
+    }
+    Ok(())
+}
+
+/// The bootstrap delegation's rewards are the treasury's (DEC-5), but it backs every seat whose
+/// owner isn't in `bootstrap_excluded`, and a seat's owner may raise its commission without a
+/// vote (`UpdateValidator`, by `commission_max_change_bps` an epoch) and keep up to
+/// `bootstrap_commission_cap_bps` of what the seat's share of the delegation earns
+/// (`staking::owners_commission`). For an independent operator that's DEC-5's pay. For several
+/// seats one entity runs (founder-run seats a small set leaves unflagged, so they can rejoin it:
+/// the rejoin trap), it's one share each of the treasury's yield, taken on the owners' word: a
+/// finding unless the cap is 0. The cap is a validators' parameter (`params::VALIDATOR_KEYS`), so
+/// only a token supermajority moves it, never the bootstrap council.
+fn bootstrap_commission_findings(operators: &[OperatorFile], g: &Genesis) -> Result<Vec<Finding>> {
+    let cp = g.chain_params()?;
+    let boot = bootstrap_delegation(&g.address_prefix);
+    if cp.bootstrap_commission_cap_bps == 0 || !g.allocations.iter().any(|a| a.address == boot) {
+        return Ok(vec![]);
+    }
+    let mut by: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+    for o in operators.iter().filter(|o| !g.bootstrap_excluded.contains(&o.keys.owner)) {
+        let entity = o.independence.legal_entity.trim().to_ascii_lowercase();
+        if !entity.is_empty() {
+            by.entry(entity).or_default().push(&o.operator.name);
+        }
+    }
+    let (cap, step) = (crate::staking::fmt_bps(cp.bootstrap_commission_cap_bps), crate::staking::fmt_bps(cp.commission_max_change_bps));
+    Ok(by
+        .into_iter()
+        .filter(|(_, seats)| seats.len() > 1)
+        .map(|(entity, seats)| Finding::new(Rule::BootstrapCommission, format!("the bootstrap delegation backs {} seats of {entity} ({}), and bootstrap_commission_cap_bps is {cap}%: each seat's owner may raise its commission without a vote (UpdateValidator, {step}% an epoch) and keep up to {cap}% of what its share of the delegation earns, which DEC-5 gives the treasury, one share per seat. Set params.bootstrap_commission_cap_bps = 0 (a validators' parameter: only a token supermajority changes it)", seats.len(), seats.join(", "))))
+        .collect())
+}
+
 /// The independence policy (DEC-3, DEC-14) over a set of operators: what breaks it, in words.
-pub fn independence_findings(operators: &[OperatorFile]) -> Vec<String> {
+pub fn independence_findings(operators: &[OperatorFile]) -> Vec<Finding> {
     let n = operators.len();
     let mut out = vec![];
     if n < MIN_GENESIS_OPERATORS {
-        out.push(format!("{n} operators; a mainnet genesis needs at least {MIN_GENESIS_OPERATORS} (DEC-3)"));
+        out.push(Finding::new(Rule::OperatorMinimum, format!("{n} operators; a mainnet genesis needs at least {MIN_GENESIS_OPERATORS} (DEC-3)")));
     }
     for o in operators {
         let i = &o.independence;
         let missing: Vec<&str> = [("legal_entity", &i.legal_entity), ("entity_jurisdiction", &i.entity_jurisdiction), ("hosting_provider", &i.hosting_provider), ("datacenter_country", &i.datacenter_country), ("datacenter", &i.datacenter)].into_iter().filter(|(_, v)| v.trim().is_empty()).map(|(k, _)| k).collect();
         if !missing.is_empty() || i.asn == 0 {
-            out.push(format!("operator {:?} leaves independence fields empty: {}", o.operator.name, missing.into_iter().chain((i.asn == 0).then_some("asn")).collect::<Vec<_>>().join(", ")));
+            out.push(Finding::new(Rule::IndependenceFields, format!("operator {:?} leaves independence fields empty: {}", o.operator.name, missing.into_iter().chain((i.asn == 0).then_some("asn")).collect::<Vec<_>>().join(", "))));
         }
     }
     let quarter = n / 4;
-    let mut count = |what: &str, cap: usize, key: &dyn Fn(&Independence) -> String| {
+    let mut count = |rule: Rule, what: &str, cap: usize, key: &dyn Fn(&Independence) -> String| {
         let mut by: BTreeMap<String, usize> = BTreeMap::new();
         for o in operators {
             let k = key(&o.independence);
@@ -541,20 +793,66 @@ pub fn independence_findings(operators: &[OperatorFile]) -> Vec<String> {
             }
         }
         for (k, c) in by.into_iter().filter(|(_, c)| *c > cap) {
-            out.push(format!("{what} {k} has {c} of the {n} operators; at most {cap} may"));
+            out.push(Finding::new(rule, format!("{what} {k} has {c} of the {n} operators; at most {cap} may")));
         }
     };
     let lower = |s: &str| s.trim().to_ascii_lowercase();
     // DEC-14: ⌊n/4⌋ per provider, ASN and country; 15% per facility; one seat per entity (the
     // founder's and the foundation's seats are capped together instead).
-    count("hosting provider", quarter, &|i| lower(&i.hosting_provider));
-    count("ASN", quarter, &|i| if i.asn == 0 { String::new() } else { i.asn.to_string() });
-    count("data-center country", quarter, &|i| lower(&i.datacenter_country));
-    count("facility", n * MAX_FACILITY_BPS / 10_000, &|i| lower(&i.datacenter));
-    count("legal entity", 1, &|i| if i.founder_or_foundation { String::new() } else { lower(&i.legal_entity) });
+    count(Rule::ProviderCap, "hosting provider", quarter, &|i| lower(&i.hosting_provider));
+    count(Rule::AsnCap, "ASN", quarter, &|i| if i.asn == 0 { String::new() } else { i.asn.to_string() });
+    count(Rule::CountryCap, "data-center country", quarter, &|i| lower(&i.datacenter_country));
+    count(Rule::FacilityCap, "facility", n * MAX_FACILITY_BPS / 10_000, &|i| lower(&i.datacenter));
+    count(Rule::OneSeatPerEntity, "legal entity", 1, &|i| if i.founder_or_foundation { String::new() } else { lower(&i.legal_entity) });
     let founder = operators.iter().filter(|o| o.independence.founder_or_foundation).count();
     if founder > MAX_FOUNDER_SEATS {
-        out.push(format!("{founder} seats are the founder's or the foundation's; at most {MAX_FOUNDER_SEATS} (DEC-3)"));
+        out.push(Finding::new(Rule::FounderSeats, format!("{founder} seats are the founder's or the foundation's; at most {MAX_FOUNDER_SEATS} (DEC-3)")));
+    }
+    out
+}
+
+/// The staking rules a genesis set can trip over from block 1, over its operators (`entries`,
+/// in canonical order, with `operators` for their names), the built allocations and the
+/// bootstrap delegation's excluded accounts:
+/// * the rejoin trap. A validator that leaves the set (jailed for downtime, or for committing to
+///   the beacon and not revealing: `beacon::end_epoch`) comes back as a newcomer, and newcomers
+///   are held to the insiders' seat rules (`staking::insiders_within_seats`): an owner with
+///   unvested tokens brings back only one seat, so seats sharing a vesting owner can't rejoin
+///   while another of them is in the set; and the founder's and the foundation's accounts
+///   (`bootstrap_excluded`) hold at most `staking::excluded_seats_cap(m)` of a set of `m` once
+///   they're newcomers, none below 7 seats, so their seats in a small set can't rejoin at all.
+/// * fee headroom: an owner whose self-bonds leave it less than [`MIN_OWNER_FEE_HEADROOM`]
+///   unstaked can't pay its validators' system txs for long (the node pays them from the owner,
+///   `Chain::system_fee_payer`; locked tokens may pay base fees), and a beacon commitment it
+///   can't follow with a reveal jails and slashes the validator.
+fn staking_findings(operators: &[OperatorFile], entries: &[Operator], allocations: &[Allocation], excluded: &[String]) -> Vec<Finding> {
+    let mut out = vec![];
+    let name = |owner: &str, consensus_key: &str| operators.iter().find(|o| o.keys.owner == owner && o.keys.consensus_public_key == consensus_key).map(|o| o.operator.name.clone()).unwrap_or_default();
+    let mut seats: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for e in entries {
+        seats.entry(&e.owner).or_default().push(name(&e.owner, &e.consensus_key));
+    }
+    let held = |owner: &str| allocations.iter().filter(|a| a.address == owner).map(|a| a.amount as u128).sum::<u128>();
+    for (owner, names) in &seats {
+        let vesting = allocations.iter().filter(|a| a.address == *owner).filter_map(|a| a.vesting.as_ref()).map(|v| v.end).max();
+        if let (true, Some(end)) = (names.len() > 1, vesting) {
+            out.push(Finding::new(Rule::RejoinTrap, format!("{} seats ({}) share the owner {owner}, whose allocation vests until block {end}: an owner with unvested tokens brings back one seat (staking.rs insiders_within_seats), so a seat that leaves the set (jailed for downtime, or for a beacon commitment it didn't reveal) can't rejoin while another of them is in it. Give each seat its own owner", names.len(), names.join(", "))));
+        }
+        let bonds: u128 = entries.iter().filter(|e| e.owner == *owner).map(|e| e.self_bond as u128).sum();
+        let left = held(owner).saturating_sub(bonds);
+        if left < MIN_OWNER_FEE_HEADROOM as u128 {
+            out.push(Finding::new(Rule::FeeHeadroom, format!("the owner {owner} of {} keeps {} unstaked after its self-bond: its node pays the validator's system txs (beacon commitments and reveals, attestations) from the owner, and a commitment it can't follow with a reveal jails and slashes the validator (beacon.rs end_epoch). Leave at least {} unbonded", names.join(", "), fmt_fang(left as u64), fmt_fang(MIN_OWNER_FEE_HEADROOM))));
+        }
+    }
+    // A seat of these that leaves comes back into a set of `n` (the others holding theirs) as the
+    // k-th of them, which `excluded_seats_cap(n)` must allow; in a larger set, `m` members.
+    let n = entries.len();
+    let trapped: Vec<String> = entries.iter().filter(|e| excluded.contains(&e.owner)).map(|e| name(&e.owner, &e.consensus_key)).collect();
+    let (k, cap) = (trapped.len(), crate::staking::excluded_seats_cap(n));
+    if k > cap {
+        let others = if k > 1 { "while the others hold theirs, " } else { "" };
+        let back = (n..=crate::consensus::MAX_PEERS_PER_SET).find(|m| crate::staking::excluded_seats_cap(*m) >= k).map_or(format!("at any set size (at most {MAX_FOUNDER_SEATS} such seats ever come back)"), |m| format!("until the set has {m} members"));
+        out.push(Finding::new(Rule::RejoinTrap, format!("{k} of the {n} seats ({}) are owned by the founder's or the foundation's accounts (bootstrap_excluded), and a set of {n} holds at most {cap} of them once one is a newcomer (staking.rs excluded_seats_cap): one that leaves the set (jailed for downtime, or for a beacon commitment it didn't reveal) can't rejoin {others}{back}. Leave founder-run seats unflagged, each with its own operators-bucket owner, and set params.bootstrap_commission_cap_bps = 0 (the bootstrap delegation then backs them: bootstrap-commission)", trapped.join(", "))));
     }
     out
 }
@@ -639,15 +937,15 @@ pub enum GenesisCmd {
     /// (consensus key, owner, addresses, proof of possession, independence fields)
     Operator(Box<OperatorArgs>),
     /// Build genesis.json from a spec (byte-identical for the same spec and binary) and print its
-    /// genesis hash
+    /// genesis hash, and every policy finding the spec waives (WAIVED: rule: finding (reason))
     Build {
         #[arg(long)]
         spec: PathBuf,
         /// Write genesis.json here (default: print it to stdout and the hash to stderr)
         #[arg(long)]
         out: Option<PathBuf>,
-        /// Refuse a spec that breaks the bucket table or the independence policy (always on
-        /// for blockula-1)
+        /// Refuse a spec that breaks the bucket table, the independence policy or the staking
+        /// rules, unless it waives the finding (always on for blockula-1)
         #[arg(long)]
         strict: bool,
     },
@@ -672,12 +970,16 @@ pub fn run(cmd: GenesisCmd) -> Result<()> {
         }
         GenesisCmd::Build { spec, out, strict } => {
             let built = build(&spec, strict)?;
+            for w in &built.waived {
+                eprintln!("{w}");
+            }
             for w in &built.warnings {
                 eprintln!("warning: {w}");
             }
             let g = &built.genesis;
+            let born = g.upgrades.first().map(|u| format!(", protocol v{} from block {}", u.version, u.activation_height)).unwrap_or_default();
             let summary = format!(
-                "chain {} ({} validators, supply {}), state root {}\ngenesis hash: {}",
+                "chain {} ({} validators, supply {}{born}), state root {}\ngenesis hash: {}",
                 g.chain_id,
                 g.validators.len(),
                 fmt_fang(g.allocations.iter().map(|a| a.amount).sum()),
@@ -698,6 +1000,10 @@ pub fn run(cmd: GenesisCmd) -> Result<()> {
         }
     }
 }
+
+// `blockula-1`'s launch shape: the waivers, the floats and the council's first proposals.
+#[cfg(test)]
+mod mainnet_tests;
 
 #[cfg(test)]
 mod tests {
@@ -879,7 +1185,7 @@ mod tests {
         let spec = with(pool, 149_900_000);
         let a = build_from(&spec, &ops, false).unwrap();
         assert_eq!(a.json, build_from(&spec, &ops, false).unwrap().json, "byte-identical");
-        assert_eq!(a.warnings, vec!["the contribution pool opens with 100000 FANG out of the endowment, which DEC-5 releases linearly from zero (docs/TOKENOMICS.md, section 1)".to_string()], "the endowment bucket still holds its 15%");
+        assert_eq!(a.warnings, vec!["opening-balance: the contribution pool opens with 100000 FANG out of the endowment, which DEC-5 releases linearly from zero (docs/TOKENOMICS.md, section 1)".to_string()], "the endowment bucket still holds its 15%");
         let g = &a.genesis;
         assert_eq!(g.pool_repos, BTreeMap::from([("jackdishman/blockula".to_string(), 10)]));
         let times = g.contribution.clone().unwrap();
@@ -929,14 +1235,25 @@ mod tests {
     }
 
     /// A public network's genesis never starts on a preview version (P7): a spec has no
-    /// `[[upgrade]]` (unknown fields are refused), and what it builds schedules nothing.
+    /// `[[upgrade]]` (unknown fields are refused), and what it builds schedules nothing but the
+    /// released version `protocol_version` names, from block 1.
     #[test]
     fn a_spec_cant_schedule_a_preview_version() {
         let ops = operators("blockula-testnet-9", "tboo", 22);
-        let upgrade = format!("[[upgrade]]\nversion = {}\nactivation_height = 1\n", crate::upgrade::PREVIEW_PROTOCOL_VERSION);
+        let preview = crate::upgrade::PREVIEW_PROTOCOL_VERSION;
+        let upgrade = format!("[[upgrade]]\nversion = {preview}\nactivation_height = 1\n");
         assert!(toml::from_str::<Spec>(&format!("{}{upgrade}", toml_of(&spec_for("blockula-testnet-9", "tboo", &ops, "")))).is_err());
         let built = build_from(&spec_for("blockula-testnet-9", "tboo", &ops, ""), &ops, false).unwrap();
         assert!(built.genesis.upgrades.is_empty() && !built.json.contains("upgrades"));
+        let v2 = build_from(&spec_for("blockula-testnet-9", "tboo", &ops, "protocol_version = 2"), &ops, false).unwrap();
+        assert_eq!(v2.genesis.upgrades, [crate::upgrade::ScheduledUpgrade { version: 2, activation_height: 1 }]);
+        let err = format!("{:#}", build_from(&spec_for("blockula-testnet-9", "tboo", &ops, &format!("protocol_version = {preview}")), &ops, false).err().unwrap());
+        assert!(err.contains(&format!("protocol_version {preview}: a public network starts at a released version")), "{err}");
+    }
+
+    /// Findings as the builder prints them, one a line.
+    fn texts(findings: &[Finding]) -> String {
+        findings.iter().map(Finding::to_string).collect::<Vec<_>>().join("\n")
     }
 
     /// A spec as TOML again (the tests build specs as values, then add sections as text).
@@ -1067,8 +1384,8 @@ mod tests {
         set[22].independence.datacenter_country = "de".into();
         set[23].independence.datacenter = "Shared".into();
         set[24].independence.legal_entity = "E0".into();
-        let f = independence_findings(&set).join("\n");
-        for expected in ["hosting provider big has 8", "ASN 1 has 8", "data-center country de has 8", "facility shared has 5 of the 28 operators; at most 4", "legal entity e0 has 2"] {
+        let f = texts(&independence_findings(&set));
+        for expected in ["provider-cap: hosting provider big has 8", "asn-cap: ASN 1 has 8", "country-cap: data-center country de has 8", "facility-cap: facility shared has 5 of the 28 operators; at most 4", "one-seat-per-entity: legal entity e0 has 2"] {
             assert!(f.contains(expected), "missing {expected:?} in:\n{f}");
         }
         // Founder seats share an entity without breaking the entity rule; a third is too many.
@@ -1081,9 +1398,9 @@ mod tests {
         set[2].independence.founder_or_foundation = true;
         set[3].independence.datacenter = String::new();
         set[4].independence.asn = 0;
-        let f = independence_findings(&set).join("\n");
-        assert!(f.contains("3 seats are the founder's") && f.contains("leaves independence fields empty: datacenter") && f.contains("empty: asn"), "{f}");
-        assert!(independence_findings(&set[..21]).join(" ").contains("21 operators; a mainnet genesis needs at least 22"));
+        let f = texts(&independence_findings(&set));
+        assert!(f.contains("founder-seats: 3 seats are the founder's") && f.contains("independence-fields: operator \"e3\" leaves independence fields empty: datacenter") && f.contains("empty: asn"), "{f}");
+        assert!(texts(&independence_findings(&set[..21])).contains("operator-minimum: 21 operators; a mainnet genesis needs at least 22"));
     }
 
     /// The operator entry: TOML and JSON round trips, the PoP binds the chain, owner and
