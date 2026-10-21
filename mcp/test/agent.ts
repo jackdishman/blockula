@@ -215,6 +215,8 @@ const fake = {
   lag: false,
   /** /api/account trails the last block that ran: one nonce behind (seen on a dev chain right after a block). */
   trail: false,
+  /** The next this-many correctly numbered txs are refused as "expected nonce + 1" (the node's mempool race, PERF-1). */
+  race: 0,
   /** Every /api/account answer waits this long (so builds made in parallel would overlap). */
   accountDelayMs: 0,
   accounts: new Map<string, Acct>(),
@@ -244,6 +246,11 @@ const node: Server = createServer((req, res) => {
       const tx = JSON.parse(body) as Tx;
       const from = acct(tx.from);
       const expected = from.nonce + pendingOf(tx.from);
+      if (fake.race > 0 && tx.nonce === expected) {
+        fake.race--;
+        fake.refused.push(`race: expected ${expected + 1}, got ${tx.nonce}`);
+        return reply(400, { error: `bad nonce: expected ${expected + 1}, got ${tx.nonce}` });
+      }
       if (tx.nonce !== expected) {
         fake.refused.push(`bad nonce: expected ${expected}, got ${tx.nonce}`);
         return reply(400, { error: `bad nonce: expected ${expected}, got ${tx.nonce}` });
@@ -504,7 +511,22 @@ assert.deepEqual([me.stored_at, statSync(me.stored_at).mode & 0o777, me.existed,
   }
   assert.equal(fake.refused.length, refusedBefore);
   fake.trail = false;
-  console.log("✓ nonces: three parallel sends in one session and two from another session all finalize, each with its own nonce; a node whose view lags its mempool, or trails a block that just ran, doesn't get a used nonce again");
+  // The node's mempool race refuses a correct nonce as if a later one were due: the same signed tx
+  // is offered again, and goes through once (one tx, one nonce).
+  fake.race = 2;
+  const postedBefore = fake.posted.length;
+  r = await s.call("send", { to: BOB, amount: "0.1" });
+  assert.ok(!r.error && r.json().block === 11 && fake.posted.length === postedBefore + 1 && fake.race === 0, r.text);
+  assert.equal(fake.refused.length, refusedBefore + 2);
+  // A nonce that's really taken is refused the same way every time: answered after a few tries.
+  fake.race = 10;
+  r = await s.call("send", { to: BOB, amount: "0.1" });
+  assert.ok(r.error && /bad nonce: expected \d+, got \d+/.test(r.text) && fake.race === 6, r.text);
+  fake.race = 0;
+  r = await s.call("send", { to: BOB, amount: "0.1" });
+  assert.ok(!r.error && r.json().block === 11, `the refused one's nonce is reused: ${r.text}`);
+  assert.equal(fake.refused.length, refusedBefore + 2 + 4, "four tries of the taken nonce, then nothing refused");
+  console.log("✓ nonces: three parallel sends in one session and two from another session all finalize, each with its own nonce; a node whose view lags its mempool, or trails a block that just ran, doesn't get a used nonce again; the node's mempool race gets the same tx again");
 }
 
 // ---- 7. your own node, a chain without a faucet, copy and ergonomics ----

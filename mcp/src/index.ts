@@ -298,6 +298,29 @@ function withNonce(w: Wallet, tx: Tx, nonce: number): Tx {
   return w.sign({ ...unsigned, nonce });
 }
 
+/** A node's "bad nonce" refusal: the nonce it expects and the one it got. */
+const BAD_NONCE = /bad nonce: expected (\d+), got (\d+)/i;
+
+/**
+ * Submits a signed tx. A node that says it expects a later nonce than this tx's may be mid-block:
+ * while a block persists, admission can count the txs it just ran twice and refuse the next
+ * correct nonce (PERF-1; seen here against a dev chain). #62 fixes it in the node, but nodes
+ * from before it still do it. The same signed tx is offered again a few times, which is safe:
+ * it's one tx, so at most one copy runs. A nonce another tx really took gets the same refusal
+ * each time, and that one is answered.
+ */
+async function submitPatiently(client: Client, tx: Tx) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await client.submit(tx, false);
+    } catch (e) {
+      const m = e instanceof ApiError && e.status >= 400 && e.status < 500 ? BAD_NONCE.exec(e.message) : null;
+      if (!m || Number(m[2]) !== tx.nonce || Number(m[1]) <= tx.nonce || attempt >= 4) throw e;
+      await new Promise((r) => setTimeout(r, 300 * attempt));
+    }
+  }
+}
+
 /**
  * Signs `action`, reserves what it can cost (the spend plus the tx's max fee) against today's
  * budget under its (chain, account, nonce) slot, and only then submits it. Final: the unused part
@@ -347,7 +370,7 @@ async function submitCapped(w: Wallet, action: Action, spend: Spend, memo = ""):
       /* informational only: tx_status then says valid_until is unknown */
     }
     try {
-      await w.client.submit(tx, false);
+      await submitPatiently(w.client, tx);
     } catch (e) {
       // The node says it refused it. An honest node then never relayed it, but a lying one can say
       // so and relay it anyway, so the reservation stays: the next tx this MCP signs with the same
