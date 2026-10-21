@@ -31,8 +31,12 @@ export interface Network {
   /**
    * Independent nodes of the same chain (BLOCKULA_WITNESSES, comma-separated): names that end up
    * in a signature are proven against them (audit gap-7-1). Empty: a name is the node's word.
+   * Unset, and the node isn't one of its network's public RPCs (your own node), they're those
+   * RPCs (`defaultWitnesses`; OPERATOR-6).
    */
   witnesses: string[];
+  /** BLOCKULA_WITNESSES was set (`none` included): no witnesses are added by default. */
+  witnessesSet: boolean;
 }
 
 export const LOCAL_RPC = "http://localhost:7070";
@@ -74,7 +78,7 @@ export function clockFrom(genesis: unknown, chainId: string): GenesisClock | und
 }
 
 /** The networks the MCP knows by name. */
-export const KNOWN_NETWORKS: Record<Exclude<NetworkKey, "custom">, Omit<Network, "rpc" | "witnesses"> & { rpc?: string }> = {
+export const KNOWN_NETWORKS: Record<Exclude<NetworkKey, "custom">, Omit<Network, "rpc" | "witnesses" | "witnessesSet"> & { rpc?: string }> = {
   mainnet: { key: "mainnet", label: "Blockula mainnet", rpc: MAINNET_RPCS[0], pin: { chainId: "blockula-1", prefix: "boo" }, mainnet: true, remember: true },
   // The protocol v1 public testnet (deploy/launch.sh): its own chain id (never reused) and the
   // testnet prefix (DEC-7). Its genesis hash exists only once it launches: until a release adds it
@@ -82,6 +86,32 @@ export const KNOWN_NETWORKS: Record<Exclude<NetworkKey, "custom">, Omit<Network,
   testnet: { key: "testnet", label: "public testnet", rpc: TESTNET_RPC, pin: { chainId: "blockula-testnet-2", prefix: "tboo" }, mainnet: false, remember: true },
   local: { key: "local", label: "local dev node", rpc: LOCAL_RPC, pin: {}, mainnet: false, remember: false },
 };
+
+/** The public RPCs of the chains whose public RPCs are built in, by chain id. */
+const PUBLIC_RPCS: Record<string, string[]> = { "blockula-testnet-2": [TESTNET_RPC] };
+
+/**
+ * The witnesses a node of `chainId` gets when BLOCKULA_WITNESSES is unset: the chain's public RPCs,
+ * unless the node is one of them. So your own node's answers about names and heights are checked
+ * against the public ones (OPERATOR-6). None for chains without public RPCs (dev chains, and the
+ * chains people launch themselves: there, BLOCKULA_WITNESSES lists other nodes).
+ */
+export function defaultWitnesses(chainId: string | undefined, rpc: string): string[] {
+  const rpcs = (chainId && PUBLIC_RPCS[chainId]) || [];
+  return rpcs.includes(rpc) ? [] : [...rpcs];
+}
+
+/** The public network a chain id is, when it's one (for labels). */
+const PUBLIC_LABEL: Record<string, string> = { "blockula-testnet-2": "the public testnet" };
+
+/**
+ * What `status` calls the network: once the node's chain is known, a node on this machine that
+ * is on a public network is "your node on <it>", never a "local dev node".
+ */
+export function networkLabel(net: Network, chainId?: string): string {
+  const pub = chainId ? PUBLIC_LABEL[chainId] : undefined;
+  return pub && isLocalUrl(net.rpc) ? `your node on ${pub}` : net.label;
+}
 
 const isLocalUrl = (u: string) => {
   try {
@@ -156,10 +186,14 @@ export function resolveNetwork(env: Record<string, string | undefined>, argv: st
   pin.genesisHash ??= known;
   // A real-money chain is never the local or a custom network by accident.
   const mainnet = base.mainnet || pin.chainId === KNOWN_NETWORKS.mainnet.pin.chainId;
-  const witnesses = (env.BLOCKULA_WITNESSES ?? "").split(",").map((w) => w.trim()).filter(Boolean).map((w) => checkRpcUrl(w, "BLOCKULA_WITNESSES"));
+  // `none` opts out of the default witnesses; unset, a node that isn't its network's public RPC
+  // gets them (defaultWitnesses; a node whose chain isn't known yet, once it's pinned).
+  const listed = (env.BLOCKULA_WITNESSES ?? "").trim();
+  const witnessesSet = listed !== "";
+  const witnesses = listed.toLowerCase() === "none" ? [] : witnessesSet ? listed.split(",").map((w) => w.trim()).filter(Boolean).map((w) => checkRpcUrl(w, "BLOCKULA_WITNESSES")) : defaultWitnesses(pin.chainId, url);
   if (witnesses.includes(url)) throw new Error("BLOCKULA_WITNESSES must be other nodes than BLOCKULA_RPC's");
   if (new Set(witnesses).size !== witnesses.length) throw new Error("BLOCKULA_WITNESSES lists a node twice");
-  return { key, label: base.label, rpc: url, pin, mainnet, remember: base.remember, witnesses };
+  return { key, label: base.label, rpc: url, pin, mainnet, remember: base.remember, witnesses, witnessesSet };
 }
 
 /** Why a node's status doesn't match a pin, or null if it does. Known chain ids must come with their known genesis. */

@@ -15,11 +15,13 @@
 //                       them a send signs the name itself (the chain resolves it when it runs), and
 //                       where an address is needed (stake, unstake, use_account) a name is the
 //                       node's word: on mainnet (any node on blockula-1, however it was configured)
-//                       the address must be confirmed first.
+//                       the address must be confirmed first. Unset, your own node of the public
+//                       testnet (any node but its public RPC) gets the public RPC as a witness;
+//                       `none` opts out.
 //   BLOCKULA_HOME       where the agent wallet lives (default ~/.blockula)
 //   BLOCKULA_MAX_SEND   max FANG one call moves (sent, staked, escrowed, paid for a name, bonded; default 100)
-//   BLOCKULA_MAX_DAILY  max FANG leaving the account per UTC day through this MCP, fees included
-//                       (default BLOCKULA_MAX_SEND + 1 FANG for fees, so one full-size call fits)
+//   BLOCKULA_MAX_DAILY  max FANG leaving the account per UTC day through this MCP on each chain, fees
+//                       included (default BLOCKULA_MAX_SEND + 1 FANG for fees, so one full-size call fits)
 //   BLOCKULA_TIMEOUT_MS how long one request to the node may take (default 15000, at most 2147483647)
 //   BLOCKULA_TX_WAIT_MS how long a tx tool waits for finality before answering "pending" (default 15000)
 //   BLOCKULA_BIN        path to the `blockula` binary (default: of ~/.blockula/bin/blockula from `blockula release
@@ -29,43 +31,40 @@
 //   BLOCKULA_RELEASE_KEY_ID     the release signing key id to trust (until it's built in; it must
 //                       agree with the built-in one and with ~/.blockula/release-key-id, if pinned)
 // The network never changes while the server runs (WAL-4): see network.ts. Spending caps: see
-// spend.ts (reserved before a tx is sent). Chain text is untrusted: see untrusted.ts. When acting
-// for a user's account via a session key, the chain also enforces that key's limit.
+// spend.ts (reserved before a tx is sent) and budget.ts (the caps, and what's refused before
+// signing). Chain text is untrusted: see untrusted.ts. When acting for a user's account via a
+// session key, the chain also enforces that key's limit. The account acted for is kept per chain
+// (accounts.ts), and one tx at a time is built per account (locks.ts).
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { ApiError, Client, HeightAheadError, MAINNET_CHAIN_ID, NAMESPACES, RequestTimeoutError, TxFailedError, TxPendingError, Wallet, bareName, checkTimeoutMs, decodeAccount, describeKind, encodeKeyGrant, isAddress, proposalDigest, formatFang, paramsOf, parseFang, proposalSummary, stakeSummary, txDropped, txId, type Action, type ProposalKind, type ProposalSummary, type Recipient, type Resolution } from "@blockula/sdk";
+import { ApiError, Client, HeightAheadError, MAINNET_CHAIN_ID, NAMESPACES, RequestTimeoutError, TxFailedError, TxPendingError, Wallet, addressPrefix, bareName, baseFee, decodeAccount, describeKind, encodeKeyGrant, isAddress, proposalDigest, formatFang, paramsOf, proposalSummary, stakeSummary, txDropped, txId, type Action, type ProposalKind, type ProposalSummary, type Recipient, type Resolution, type Tx } from "@blockula/sdk";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { z } from "zod";
-import { KNOWN_CLOCKS, KNOWN_GENESIS, KnownChains, clockFrom, completePin, effectivePin, mismatch, mismatchError, resolveNetwork, type GenesisClock, type Network } from "./network.js";
+import { KNOWN_CLOCKS, KNOWN_GENESIS, KnownChains, clockFrom, completePin, defaultWitnesses, effectivePin, mismatch, mismatchError, networkLabel, resolveNetwork, type GenesisClock, type Network } from "./network.js";
+import { WALLET_URLS, actingFor, checkCode, createWalletFile, ignoredNote, newWalletFile, readWalletFile, secretOf, setActingFor, writeWalletFile, type ActingFor, type WalletFile } from "./accounts.js";
+import { aboutBlocks, allowanceOf, amountArg, capsFrom, configError, dropsOf, keyOn, msFrom, preflight, spendableNow } from "./budget.js";
+import { AccountLocks, NonceTracker } from "./locks.js";
 import { PIN_FILE, REPO, RELEASE_KEY_ID, binPaths, checkBinaryVersion, fetchVerifiedRelease, latestTagFrom, pickNodeBinary, readReleasePin, releaseKeyIdFrom, type NodeBinary } from "./release.js";
 import { SignedTxs, onChain, type SignedTx } from "./signed.js";
-import { SpendLedger } from "./spend.js";
+import { SpendLedger, chainKey } from "./spend.js";
 import { SERVER_INSTRUCTIONS, UNTRUSTED_NOTE, chainData, clean } from "./untrusted.js";
 
 const HOME = process.env.BLOCKULA_HOME ?? join(homedir(), ".blockula");
 const WALLET_FILE = join(HOME, "agent-wallet.json");
-const MAX_SEND = parseFang(process.env.BLOCKULA_MAX_SEND ?? "100");
-/**
- * Fees count toward BLOCKULA_MAX_DAILY (they leave the account too), so by default the daily cap
- * is the per-call cap plus this much for fees: one call of BLOCKULA_MAX_SEND fits in a day, with
- * room for the fees of many more small txs (audit review-fix-clients-3).
- */
-const DAILY_FEE_ALLOWANCE = parseFang("1");
-const MAX_DAILY = process.env.BLOCKULA_MAX_DAILY ? parseFang(process.env.BLOCKULA_MAX_DAILY) : MAX_SEND + DAILY_FEE_ALLOWANCE;
-const MAX_DAILY_TEXT = process.env.BLOCKULA_MAX_DAILY ? `BLOCKULA_MAX_DAILY=${process.env.BLOCKULA_MAX_DAILY} FANG` : `BLOCKULA_MAX_DAILY, by default BLOCKULA_MAX_SEND + 1 FANG for fees = ${formatFang(MAX_DAILY)}`;
 const SPEND_FILE = join(HOME, "agent-spend.json");
-const msEnv = (name: string, fallback: number) => {
-  const v = process.env[name];
-  if (v === undefined || v === "") return fallback;
-  if (!/^\d+$/.test(v)) throw new Error(`${name} must be a positive number of milliseconds`);
-  return checkTimeoutMs(Number(v), name);
-};
-const TIMEOUT_MS = msEnv("BLOCKULA_TIMEOUT_MS", 15_000);
-const TX_WAIT_MS = msEnv("BLOCKULA_TX_WAIT_MS", 15_000);
+/**
+ * The caps' and durations' variables, parsed once inside a try (AGENT-15): a bad one is reported by
+ * every tool, as a bad network is, instead of exiting before the client can be told why (the
+ * defaults stand in meanwhile, and nothing uses them).
+ */
+const CONFIG_ERROR = configError(process.env);
+const CAPS = capsFrom(CONFIG_ERROR ? {} : process.env);
+const TIMEOUT_MS = CONFIG_ERROR ? 15_000 : msFrom(process.env, "BLOCKULA_TIMEOUT_MS", 15_000);
+const TX_WAIT_MS = CONFIG_ERROR ? 15_000 : msFrom(process.env, "BLOCKULA_TX_WAIT_MS", 15_000);
 const KNOWN_CHAINS = new KnownChains(join(HOME, "known-chains.json"));
 const VERSION: string = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
 // install_node's binary has a path of its own: it never replaces the one `blockula release install`
@@ -125,10 +124,25 @@ const described = (text: string) => [text, NO_VALUE_DESCRIBED].filter(Boolean).j
 let pinned: Client | null = null;
 /** The chain `pinned` is held to (tx_status reads a signed tx's record only on the chain it was signed for). */
 let pinnedChain: { chainId?: string; genesisHash?: string; prefix?: string } = {};
+/** The witnesses `pinned` checks names and heights against: configured, or the public RPCs for your own node. */
+let activeWitnesses: string[] = [];
+
+/** Why this MCP can't run as configured (the network, a cap or a duration), or null. */
+const BAD_CONFIG = NET_ERROR ?? CONFIG_ERROR;
 
 function network(): Network {
-  if (!NET) throw new Error(`The Blockula MCP isn't configured correctly: ${NET_ERROR?.message}`);
+  if (!NET || BAD_CONFIG) throw new Error(`The Blockula MCP isn't configured correctly: ${BAD_CONFIG?.message}`);
   return NET;
+}
+
+/** The pinned chain as the ledger, the key file and the nonce tracker key it: `<chain_id> <genesis_hash>`. */
+function chainNow(): string | undefined {
+  const { chainId, genesisHash } = pinnedChain;
+  try {
+    return chainId && genesisHash ? chainKey(chainId, genesisHash) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -148,9 +162,13 @@ async function chain(): Promise<Client> {
   const pins = { chainId: full.chainId, genesisHash: full.genesisHash, prefix: full.prefix, timeoutMs: TIMEOUT_MS };
   // Witnesses are held to the same chain; with them, names are proven (Client.resolution) and a
   // height ahead of their heads is refused. The chain's genesis clock bounds the height too.
+  // Unset, your own node of a public network (its chain known only now, for a local or custom
+  // node) is checked against that network's public RPCs (OPERATOR-6).
   const genesisClock = await clockOf(net, full);
-  pinned = new Client(net.rpc, { ...pins, genesisClock, witnesses: net.witnesses.map((w) => new Client(w, pins)) });
+  const witnesses = net.witnessesSet || net.witnesses.length ? net.witnesses : defaultWitnesses(full.chainId, net.rpc);
+  pinned = new Client(net.rpc, { ...pins, genesisClock, witnesses: witnesses.map((w) => new Client(w, pins)) });
   pinnedChain = { chainId: full.chainId, genesisHash: full.genesisHash, prefix: full.prefix };
+  activeWitnesses = witnesses;
   return pinned;
 }
 
@@ -195,11 +213,14 @@ async function moduleRead<T>(what: string, read: Promise<T>): Promise<T> {
   }
 }
 
-// ---- spending caps (BLOCKULA_MAX_SEND per call, BLOCKULA_MAX_DAILY per UTC day) ----
+// ---- spending caps (BLOCKULA_MAX_SEND per call, BLOCKULA_MAX_DAILY per UTC day and chain) ----
 
-const LEDGER = new SpendLedger(SPEND_FILE, MAX_DAILY, MAX_DAILY_TEXT);
+const LEDGER = new SpendLedger(SPEND_FILE, CAPS.maxDaily, CAPS.dailyText);
 /** The txs this MCP signed (their valid_until, for tx_status): see signed.ts. */
 const SIGNED = new SignedTxs(join(HOME, "agent-txs.json"));
+/** One tx at a time per account, and the last nonce signed while it's pending: see locks.ts. */
+const LOCKS = new AccountLocks(join(HOME, "nonces"));
+const NONCES = new NonceTracker(join(HOME, "nonces"));
 
 /**
  * Whether this is real money: the configured network is mainnet, or the chain the client is
@@ -231,6 +252,12 @@ interface Spend {
   /** Names the amount in a refusal. */
   what?: string;
   /**
+   * What the action takes out of the FANG the account can move now (sent, a name's price,
+   * escrowed, bonded), checked before signing (budget.ts `preflight`). 0 for what locked FANG can
+   * pay for (a stake) and what only locks (a vote).
+   */
+  outflow?: bigint;
+  /**
    * How names in fields that need an address were resolved: the SDK refuses an unproven one on
    * mainnet against the very status the tx is signed for (a second check behind `resolved`).
    */
@@ -250,69 +277,143 @@ interface InFlight {
 
 const isInFlight = (r: unknown): r is InFlight => typeof r === "object" && r !== null && "tx_id" in r && ["pending", "unknown", "dropped"].includes((r as InFlight).status);
 
+/** What a result's tx cost (the fee charged, once final) or can cost (its max fee, in flight). Kept out of the result's JSON. */
+const COST = new WeakMap<object, { fee: bigint; final: boolean }>();
+
+/** The fee `w.build` will set for this action (base fee for its size + tip), or undefined when it can't be priced here. */
+function feeFor(w: Wallet, status: any, action: Action, memo: string, fees: any): bigint | undefined {
+  try {
+    if (typeof status?.chain_id !== "string" || typeof status?.genesis_hash !== "string") return undefined;
+    // Every number in the signing bytes is fixed width, so a draft prices the same as the tx.
+    const draft = { chain_id: status.chain_id, genesis_hash: status.genesis_hash, from: w.account, nonce: 0, fee: "0", tip: w.tip.toString(), valid_until: 0, action, memo };
+    return baseFee(draft, fees?.suggested) + w.tip;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The same tx with another nonce, signed again: the nonce is fixed width, so its size and fee don't change. */
+function withNonce(w: Wallet, tx: Tx, nonce: number): Tx {
+  const { public_key: _key, signature: _sig, ...unsigned } = tx;
+  return w.sign({ ...unsigned, nonce });
+}
+
 /**
  * Signs `action`, reserves what it can cost (the spend plus the tx's max fee) against today's
- * budget under its (account, nonce) slot, and only then submits it. Final: the unused part of the
- * max fee is given back and the tx is returned. Everything else stays counted: failed in a block
- * (its fee was charged), dropped, pending, timed out, unknown, and refused too, since the node's
- * refusal is only its word and it may relay the signed tx anyway (audit F68, F72, F74). A refused
- * tx stops counting twice once this MCP signs another tx with its nonce (the next send, after an
- * honest refusal): see spend.ts.
+ * budget under its (chain, account, nonce) slot, and only then submits it. Final: the unused part
+ * of the max fee is given back and the tx is returned. Everything else stays counted: failed in a
+ * block (its fee was charged), dropped, pending, timed out, unknown, and refused too, since the
+ * node's refusal is only its word and it may relay the signed tx anyway (audit F68, F72, F74). A
+ * refused tx stops counting twice once this MCP signs another tx with its nonce (the next send,
+ * after an honest refusal): see spend.ts.
+ *
+ * Before anything is signed, what the chain would refuse by the node's own reads is refused here
+ * (budget.ts `preflight`: a session key's limits, what the account can move, a key that isn't on
+ * the account; AGENT-6), and so is what wouldn't fit today's budget. Building, signing and
+ * submitting hold the account's lock (locks.ts; AGENT-10), so parallel calls and other sessions
+ * take nonces one after another; waiting for finality doesn't.
  */
 async function submitCapped(w: Wallet, action: Action, spend: Spend, memo = ""): Promise<any> {
   const perCall = spend.perCall ?? spend.amount;
-  if (perCall > MAX_SEND) throw new Error(`${spend.what ?? "amount"} (${formatFang(perCall)}) exceeds this agent's per-call limit (BLOCKULA_MAX_SEND=${process.env.BLOCKULA_MAX_SEND ?? "100"} FANG)`);
-  const tx = await w.build(action, memo, { resolutions: spend.resolutions ?? [] });
-  const id = txId(tx);
-  const maxFee = BigInt(tx.fee);
-  const slot = { account: tx.from, nonce: tx.nonce };
-  const reservation = LEDGER.reserve(spend.amount + (spend.extra ?? 0n) + maxFee, slot);
-  const counted = formatFang(LEDGER.held(slot));
-  // Before it can reach any node: tx_status reads its valid_until from here (review-fix-clients-2).
-  try {
-    SIGNED.add(id, { valid_until: tx.valid_until, account: tx.from, nonce: tx.nonce, chain_id: tx.chain_id, genesis_hash: tx.genesis_hash });
-  } catch {
-    /* informational only: tx_status then says valid_until is unknown */
-  }
-  const inFlight = (status: InFlight["status"], why: string): InFlight => ({
-    status,
-    tx_id: id,
-    valid_until: tx.valid_until,
-    counted_toward_daily_limit: counted,
-    next: `${why} It can still execute until block ${tx.valid_until}, so it already counts toward the daily limit. Do NOT send it again: check it with tx_status (tx_id ${id}) and tell the user it isn't confirmed yet.`,
-    explorer: explorer(`tx/${id}`),
-  });
-  try {
-    await w.client.submit(tx, false);
-  } catch (e) {
-    // The node says it refused it. An honest node then never relayed it, but a lying one can say
-    // so and relay it anyway, so the reservation stays: the next tx this MCP signs with the same
-    // nonce (after a real refusal, the node's next nonce didn't move) takes the slot over.
-    if (e instanceof ApiError && e.status >= 400 && e.status < 500) {
-      throw new Error(`${e.message} (the node refused tx ${id}; it still counts toward today's limit until another tx reuses its nonce ${tx.nonce}, since a node could refuse a tx and relay it anyway)`);
+  if (perCall > CAPS.maxSend) throw new Error(`${spend.what ?? "amount"} (${formatFang(perCall)}) exceeds this agent's per-call limit (${CAPS.sendText})`);
+  await w.client.addressPrefix();
+  const chainId = chainNow();
+  const lockKey = `${chainId ?? "unknown-chain"} ${w.account}`;
+  const sent = await LOCKS.run(lockKey, async () => {
+    const [status, account, fees] = await Promise.all([w.client.status(), w.client.account(w.account).catch(() => null), w.client.fees().catch(() => null)]);
+    const height = safeInt(status.height) ?? 0;
+    const fee = feeFor(w, status, action, memo, fees);
+    preflight({ account, keyId: w.keyId, actingFor: w.account, action: action.type, outflow: spend.outflow ?? 0n, opening: spend.extra ?? 0n, fee: fee ?? 0n, height: height + 1, blockTimeMs: w.client.genesisClock?.blockTimeMs });
+    // Today's budget, before signing: what the tx's slot would add (a nonce already used today counts once).
+    if (fee !== undefined && safeInt(account?.next_nonce) !== undefined) {
+      const need = spend.amount + (spend.extra ?? 0n) + fee;
+      const held = LEDGER.held({ account: w.account, nonce: account.next_nonce, chain: chainId });
+      const adds = need > held ? need - held : 0n;
+      const today = LEDGER.spent(chainId);
+      if (today + adds > CAPS.maxDaily) throw new Error(`this would exceed the agent's daily limit (${CAPS.dailyText}; ${formatFang(today)} already spent or in flight today on this chain, and this needs ${formatFang(adds)} more including fees). Nothing was signed.`);
     }
-    // Admitted, but the first read of its status failed: wait for it below like any other.
-    if (!(e instanceof TxPendingError)) return inFlight("unknown", `The node didn't answer clearly (${clean(String((e as Error)?.message ?? e), 200)}), so the tx (${id}) may or may not have arrived.`);
-  }
+    let tx = await w.build(action, memo, { resolutions: spend.resolutions ?? [] });
+    // A node whose view lags (its mempool, or a block that just ran) mustn't hand out a nonce this MCP already used.
+    const floor = NONCES.floor(lockKey, height);
+    const bumped = floor !== undefined && tx.nonce < floor;
+    if (bumped) tx = withNonce(w, tx, floor);
+    const id = txId(tx);
+    const slot = { account: tx.from, nonce: tx.nonce, chain: chainId };
+    const reservation = LEDGER.reserve(spend.amount + (spend.extra ?? 0n) + BigInt(tx.fee), slot);
+    // Before it can reach any node: tx_status reads its valid_until from here (review-fix-clients-2).
+    try {
+      SIGNED.add(id, { valid_until: tx.valid_until, account: tx.from, nonce: tx.nonce, chain_id: tx.chain_id, genesis_hash: tx.genesis_hash });
+    } catch {
+      /* informational only: tx_status then says valid_until is unknown */
+    }
+    try {
+      await w.client.submit(tx, false);
+    } catch (e) {
+      // The node says it refused it. An honest node then never relayed it, but a lying one can say
+      // so and relay it anyway, so the reservation stays: the next tx this MCP signs with the same
+      // nonce (after a real refusal, the node's next nonce didn't move) takes the slot over.
+      if (e instanceof ApiError && e.status >= 400 && e.status < 500) {
+        NONCES.settled(lockKey, tx.nonce);
+        // Signed past the node's nonce, and refused for it: the node is behind, or a tx this MCP
+        // counted on was dropped. Its view is used next time.
+        const lag = bumped && /bad nonce/i.test(e.message);
+        if (lag) NONCES.forget(lockKey);
+        const why = lag ? ` This MCP signed it with nonce ${tx.nonce}, past the last nonce it used; the node expects an earlier one, so the node is behind or that tx was dropped: check the last tx with tx_status, then try again.` : "";
+        throw new Error(`${e.message} (the node refused tx ${id}; it still counts toward today's limit until another tx reuses its nonce ${tx.nonce}, since a node could refuse a tx and relay it anyway)${why}`);
+      }
+      // Admitted, but the first read of its status failed: wait for it below like any other.
+      if (!(e instanceof TxPendingError)) return { tx, id, reservation, unclear: clean(String((e as Error)?.message ?? e), 200) };
+    }
+    NONCES.pending(lockKey, tx.nonce, tx.valid_until);
+    return { tx, id, reservation };
+  });
+  const { tx, id, reservation } = sent;
+  const maxFee = BigInt(tx.fee);
+  const counted = formatFang(LEDGER.held({ account: tx.from, nonce: tx.nonce, chain: chainId }));
+  // What became of its nonce: spent for good once it ran in a block; free again if it was dropped.
+  const ran = () => LOCKS.run(lockKey, async () => NONCES.ran(lockKey, tx.nonce)).catch(() => undefined);
+  const settle = () => LOCKS.run(lockKey, async () => NONCES.settled(lockKey, tx.nonce)).catch(() => undefined);
+  const inFlight = (status: InFlight["status"], why: string): InFlight => {
+    const r: InFlight = {
+      status,
+      tx_id: id,
+      valid_until: tx.valid_until,
+      counted_toward_daily_limit: counted,
+      next: `${why} It can still execute until block ${tx.valid_until}, so it already counts toward the daily limit. Do NOT send it again: check it with tx_status (tx_id ${id}) and tell the user it isn't confirmed yet.`,
+      explorer: explorer(`tx/${id}`),
+    };
+    COST.set(r, { fee: maxFee, final: false });
+    return r;
+  };
+  if ("unclear" in sent) return inFlight("unknown", `The node didn't answer clearly (${sent.unclear}), so the tx (${id}) may or may not have arrived.`);
   try {
     const done = await w.client.waitForTx(id, TX_WAIT_MS, tx.valid_until);
+    await ran();
     // Only a whole number of drops below the max fee gives anything back (audit gap-7-4).
     const charged = /^\d+$/.test(String(done.fee ?? "")) ? BigInt(done.fee) : maxFee;
     if (charged < maxFee) LEDGER.release(reservation, maxFee - charged);
+    if (done && typeof done === "object") COST.set(done, { fee: charged < maxFee ? charged : maxFee, final: true });
     return done;
   } catch (e) {
     // Dropped from this node's mempool unrun: nothing was charged, but it isn't dead (audit review-fix-clients-2).
-    if (e instanceof TxFailedError && e.dropped) return inFlight("dropped", `This node dropped tx ${id} from its mempool without running it (${clean(e.reason, 200)}), so nothing was charged yet, but another node may still include it.`);
-    if (e instanceof TxFailedError) throw new Error(`tx ${id} failed${typeof e.tx?.height === "number" ? ` in block ${e.tx.height}` : ""}: ${clean(e.reason, 300)}. It ran, so its fee was charged, and it stays counted toward the daily limit (${counted}).`);
+    if (e instanceof TxFailedError && e.dropped) {
+      await settle();
+      return inFlight("dropped", `This node dropped tx ${id} from its mempool without running it (${clean(e.reason, 200)}), so nothing was charged yet, but another node may still include it.`);
+    }
+    if (e instanceof TxFailedError) {
+      await ran();
+      throw new Error(`tx ${id} failed${typeof e.tx?.height === "number" ? ` in block ${e.tx.height}` : ""}: ${clean(e.reason, 300)}. It ran, so its fee was charged, and it stays counted toward the daily limit (${counted}).`);
+    }
     return inFlight("pending", `Submitted (tx ${id}), but not final after ${Math.round(TX_WAIT_MS / 1000)} s.`);
   }
 }
 
 /**
- * What opening `to`'s account would burn on top of a transfer (0 if it exists). `/api/account`
- * answers for any address, with a zero balance and the address's own "original key" when it has
- * no account, so an account counts as existing only by what a missing one can't have: a balance
- * or a nonce. An existing account with neither is counted as new: the cap errs high, never low.
+ * What opening `to`'s account would burn on top of a transfer (0 if it exists): the node's
+ * `exists` and `creation_fee`. A node too old to say answers for any address, with a zero
+ * balance and the address's own "original key" when it has no account, so there an account
+ * counts as existing only by what a missing one can't have: a balance or a nonce. An existing
+ * account with neither is counted as new: the cap errs high, never low.
  */
 async function openingFee(client: Client, to: string): Promise<bigint> {
   let a: any = null;
@@ -321,6 +422,8 @@ async function openingFee(client: Client, to: string): Promise<bigint> {
   } catch (e) {
     if (!(e instanceof ApiError && e.status === 404)) throw e;
   }
+  // Nodes since protocol v1 say it outright: whether the account exists, and what opening it burns.
+  if (typeof a?.exists === "boolean" && /^\d+$/.test(String(a?.creation_fee ?? ""))) return a.exists ? 0n : BigInt(a.creation_fee);
   const exists = (/^\d+$/.test(String(a?.balance ?? "")) && BigInt(a.balance) > 0n) || (Number.isSafeInteger(a?.nonce) && a.nonce > 0);
   return exists ? 0n : reported((await client.fees()).account_creation_fee, "the account creation fee");
 }
@@ -387,35 +490,59 @@ const server = new McpServer({ name: "blockula", version: VERSION }, { instructi
 
 const text = (v: unknown) => ({ content: [{ type: "text" as const, text: typeof v === "string" ? v : JSON.stringify(v, (_, x) => (typeof x === "bigint" ? x.toString() : x), 2) }] });
 
-interface WalletFile { address: string; key_id: string; seed: string; account?: string }
-
-function readWalletFile(): WalletFile | null {
-  return existsSync(WALLET_FILE) ? JSON.parse(readFileSync(WALLET_FILE, "utf8")) : null;
+/** The agent's key and who it acts for, on the pinned chain (accounts.ts). Null before create_wallet. */
+async function walletState(): Promise<{ w: Wallet; f: WalletFile; acting: ActingFor; chain?: string } | null> {
+  const client = await chain();
+  const f = readWalletFile(WALLET_FILE);
+  if (!f) return null;
+  const w = Wallet.fromSeed(secretOf(f), client);
+  const prefix = await client.addressPrefix();
+  const key = chainNow();
+  const acting: ActingFor = key ? actingFor(f, key, prefix) : { changed: false };
+  // A 0.5.1 account moved to this chain: written back whole, key included.
+  if (acting.changed) writeWalletFile(WALLET_FILE, f);
+  if (acting.account) w.account = acting.account;
+  return { w, f, acting, chain: key };
 }
 
 async function loadWallet(): Promise<Wallet | null> {
-  const f = readWalletFile();
-  if (!f) return null;
-  const w = Wallet.fromSeed(f.seed, await chain());
-  if (f.account) w.account = f.account;
-  return w;
+  return (await walletState())?.w ?? null;
 }
 
 async function requireWallet(): Promise<Wallet> {
   const w = await loadWallet();
-  if (!w) throw new Error("No agent wallet yet — call create_wallet first.");
+  if (!w) throw new Error("No agent wallet yet: call create_wallet first.");
   return w;
 }
 
+/** How clients show and gate each tool (AGENT-9): reads are read-only; what signs moves FANG (fees at least) on a public chain. */
+const READS = new Set(["status", "tx_status", "wallet_info", "check_name", "lookup", "latest_blocks", "my_stake", "list_proposals", "list_hunts", "contribution_pool", "my_contributions"]);
+const MOVES = new Set(["send", "stake", "unstake", "withdraw_stake", "vote", "register_name", "renew_name", "fund_hunt", "submit_contribution", "link_github"]);
+const TITLES: Record<string, string> = {
+  status: "Network status", tx_status: "Transaction status", start_dev_node: "Start a dev chain", install_node: "Install the node", summon_chain: "Create a chain",
+  create_wallet: "Create the agent wallet", use_account: "Act for an account", wallet_info: "Wallet and budget", faucet: "Get test FANG", send: "Send FANG",
+  check_name: "Check a name", register_name: "Register a name", renew_name: "Renew a name", lookup: "Look up", latest_blocks: "Latest blocks",
+  stake: "Stake FANG", unstake: "Unstake FANG", withdraw_stake: "Withdraw unbonded stake", my_stake: "My stake", list_proposals: "Governance proposals", vote: "Vote",
+  list_hunts: "Hunts", link_github: "Link GitHub", fund_hunt: "Fund a Hunt", contribution_pool: "Contribution pool", submit_contribution: "Claim a contribution", my_contributions: "My contributions",
+};
+const annotationsOf = (name: string) =>
+  READS.has(name)
+    ? { readOnlyHint: true, destructiveHint: false, openWorldHint: true }
+    : MOVES.has(name)
+      ? { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true }
+      : { readOnlyHint: false, destructiveHint: false, openWorldHint: true };
+
 function tool<S extends z.ZodRawShape>(name: string, description: string, shape: S, run: (args: z.infer<z.ZodObject<S>>) => Promise<unknown>) {
-  server.registerTool(name, { description, inputSchema: shape }, (async (args: z.infer<z.ZodObject<S>>) => {
+  server.registerTool(name, { title: TITLES[name], description, inputSchema: shape, annotations: { title: TITLES[name], ...annotationsOf(name) } }, (async (args: z.infer<z.ZodObject<S>>) => {
     try {
+      // A bad configuration (the network, a cap, a duration) is every tool's answer (AGENT-15).
+      if (BAD_CONFIG) throw new Error(`The Blockula MCP isn't configured correctly: ${BAD_CONFIG.message}`);
       return text(await run(args));
     } catch (e) {
       // Node errors are relayed, so they're cleaned like any chain text.
       const msg = clean(String((e as Error)?.message ?? e), 1000);
       const hint = /fetch failed|ECONNREFUSED/.test(msg)
-        ? ` (no node at ${RPC}${NET?.key === "local" ? " — call start_dev_node" : ""})`
+        ? ` (no node at ${RPC}${NET?.key === "local" ? " — call start_dev_node" : ""}${activeWitnesses.length ? `, or a witness isn't answering: ${activeWitnesses.join(", ")}; BLOCKULA_WITNESSES=none opts out` : ""})`
         : e instanceof RequestTimeoutError
           ? ` (the node at ${RPC} isn't answering)`
           : e instanceof HeightAheadError
@@ -426,7 +553,7 @@ function tool<S extends z.ZodRawShape>(name: string, description: string, shape:
   }) as never);
 }
 
-tool("status", "Blockula network status: which network and node you're connected to (and the chain it's pinned to), chain id, height, supply, fees burned, and the crypto in use. The network, its pins and how to change them are this MCP's own facts; `node_reports` is what the node says.", {}, async () => {
+tool("status", "Blockula network status: which network and node you're connected to (and the chain it's pinned to), the witnesses names are proven against, chain id, height, supply, fees burned, and the crypto in use. The network, its pins and how to change them are this MCP's own facts; `node_reports` is what the node says.", {}, async () => {
   const net = network();
   const client = await chain();
   const s = await client.status();
@@ -434,9 +561,12 @@ tool("status", "Blockula network status: which network and node you're connected
   // this MCP states about the network (audit F73).
   const pick = ["chain_id", "height", "finalized_height", "syncing", "epoch", "active_validators", "supply_display", "burned_display", "version", "protocol_version", "head_age_ms", "crypto"];
   return {
-    network: net.label,
+    network: networkLabel(net, pinnedChain.chainId),
     real_money: net.mainnet || s.chain_id === MAINNET_CHAIN_ID,
     rpc: net.rpc,
+    // OPERATOR-6: who checks this node's answers about names and heights.
+    witnesses: activeWitnesses,
+    names: activeWitnesses.length ? `proven against ${activeWitnesses.length} node${activeWitnesses.length === 1 ? "" : "s"} (${activeWitnesses.join(", ")})` : `UNPROVEN: one node's word (${net.rpc}). BLOCKULA_WITNESSES lists other nodes to prove them against.`,
     pinned: chainData({ chain_id: s.chain_id, genesis_hash: s.genesis_hash, address_prefix: s.address_prefix }),
     how_to_change: "The network is fixed while this MCP runs. The user changes it in the MCP's configuration (--network mainnet|testnet|local|custom, or BLOCKULA_RPC).",
     explorer: net.rpc,
@@ -730,7 +860,7 @@ tool("start_dev_node", "Start a local Blockula dev chain (faucet + built-in expl
 
 tool(
   "install_node",
-  "Download the prebuilt `blockula` node + CLI for this machine from the official GitHub release and install it to ~/.blockula/mcp-bin (never over the binary `blockula release install` keeps in ~/.blockula/bin), after the same checks as scripts/install.sh: the release must be the version asked for (`latest` is resolved to its tag first), SHA-256 against the release checksums, build provenance from that tag with a logged-in GitHub CLI, and the offline ML-DSA-65 release signature. Once the release key id is known (pinned in ~/.blockula/release-key-id by `blockula release install`, built in, or BLOCKULA_RELEASE_KEY_ID, which must all agree), a release without a valid signature is refused. It says which checks passed; with BLOCKULA_REQUIRE_VERIFY=1 it also requires provenance and refuses a release it can only checksum. Needed for start_dev_node and summon_chain; nothing else needs it.",
+  "Download the prebuilt `blockula` node + CLI for this machine from the official GitHub release into ~/.blockula/mcp-bin, after the same checks as scripts/install.sh (the version asked for, its checksum, provenance and release signature; the result says which passed). Needed for start_dev_node and summon_chain; nothing else needs it.",
   { version: z.string().regex(/^(latest|v\d+\.\d+\.\d+)$/).default("latest") },
   async ({ version }) => {
     const target = releaseTarget();
@@ -796,86 +926,187 @@ tool("summon_chain", "Create a brand-new Blockula chain (fresh genesis + validat
   return `${out.trim()}\n${ranWith(bin)}`;
 });
 
-tool("create_wallet", "Create this agent's post-quantum (ML-DSA-65) wallet, stored locally. Returns the existing one if it already exists.", {}, async () => {
-  let w = await loadWallet();
-  const existed = !!w;
-  if (!w) {
-    w = Wallet.generate(await chain());
-    await w.client.addressPrefix();
-    mkdirSync(HOME, { recursive: true });
-    writeFileSync(WALLET_FILE, JSON.stringify({ address: w.address, key_id: w.keyId, seed: w.seedHex }, null, 2), { mode: 0o600 });
+/**
+ * What the agent can spend for an account now (AGENT-7), from its `/api/account` answer: what it
+ * can move, what's locked and until when, the session key's allowance this window, this MCP's
+ * caps, and the smallest of them. wallet_info and use_account return it.
+ */
+async function budgetOf(w: Wallet, a: any): Promise<Record<string, unknown>> {
+  const client = w.client;
+  const head = safeInt((await client.status()).height) ?? 0;
+  // As of the next block, the first a tx can run in.
+  const height = head + 1;
+  const blockTimeMs = client.genesisClock?.blockTimeMs ?? 1000;
+  const key = keyOn(a, w.keyId);
+  const allowance = allowanceOf(key ?? undefined, height);
+  const transferable = dropsOf(a?.transferable);
+  const locked = dropsOf(a?.locked);
+  const today = LEDGER.spent(chainNow());
+  const dailyLeft = CAPS.maxDaily > today ? CAPS.maxDaily - today : 0n;
+  const spendable = spendableNow({ transferable, allowance, height, blockTimeMs, dailyLeft, caps: CAPS });
+  const locks = (Array.isArray(a?.locks) ? a.locks : []).filter((l: any) => safeInt(l?.until) !== undefined && dropsOf(l?.amount) !== undefined);
+  const lastEnd = locks.reduce((m: number, l: any) => Math.max(m, l.until), 0);
+  return {
+    ...(transferable !== undefined ? { transferable: formatFang(transferable) } : {}),
+    ...(locked !== undefined && locked > 0n
+      ? {
+          locked: formatFang(locked),
+          ...(lastEnd > 0 ? { locked_until_block: lastEnd, locked_until: lastEnd > head ? `${aboutBlocks(lastEnd - head, blockTimeMs)} from now` : "now" } : {}),
+          locks: locks.slice(0, 10).map((l: any) => ({ id: clean(String(l.id ?? ""), 60), amount: formatFang(dropsOf(l.amount)!), until_block: l.until, ends_in: l.until > head ? aboutBlocks(l.until - head, blockTimeMs) : "now", vesting: l.vesting === true })),
+        }
+      : {}),
+    spendable_now: formatFang(spendable.amount),
+    spendable_now_limited_by: spendable.limitedBy,
+    spending_limits: spendable.limits,
+    ...(allowance
+      ? {
+          session_key: {
+            limit: `${formatFang(allowance.limit)} per ${aboutBlocks(allowance.periodBlocks, blockTimeMs).replace(/^about /, "")}`,
+            spent_this_period: formatFang(allowance.spent),
+            left: formatFang(allowance.expired ? 0n : allowance.left),
+            ...(allowance.resetsAt !== undefined ? { resets_at_block: allowance.resetsAt, resets_in: aboutBlocks(allowance.resetsAt - head, blockTimeMs) } : {}),
+            expires_at_block: allowance.expiresAt,
+            expires_in: allowance.expired ? "expired" : aboutBlocks(allowance.expiresAt - head, blockTimeMs),
+          },
+        }
+      : {}),
+    caps: { per_call: formatFang(CAPS.maxSend), per_day: formatFang(CAPS.maxDaily) },
+    spent_today: `${formatFang(today)} of ${formatFang(CAPS.maxDaily)} (${CAPS.dailyText}; on this chain; txs that are pending, dropped or refused still count until they're final or their nonce is reused)`,
+  };
+}
+
+/** An address of another network's prefix gets a clear answer (AGENT-14), not "isn't a valid address". */
+function otherNetwork(input: string, prefix: string) {
+  const p = addressPrefix(input.trim());
+  if (p === undefined || p === prefix) return;
+  const which = p === "tboo" ? "a testnet address" : "another network's address";
+  throw new Error(`${clean(input, 100)} is ${which} (${p}1…), and this MCP is on ${networkLabel(network(), pinnedChain.chainId)}, whose addresses start with ${prefix}1. Nothing was signed.`);
+}
+
+/** What a payment cost (AGENT-1): the amount, the fee charged and what opening the recipient's account burned. */
+function costView(r: object, amount: bigint, opening: bigint): Record<string, unknown> {
+  const c = COST.get(r);
+  return {
+    ...(opening > 0n ? { account_opening_fee_burned: formatFang(opening) } : {}),
+    ...(c ? { total_cost: formatFang(amount + c.fee + opening), ...(c.final ? {} : { total_cost_is: "at most, if it runs: the fee charged is the base fee of the block that includes it" }) } : {}),
+  };
+}
+
+tool("create_wallet", "Create this agent's post-quantum (ML-DSA-65) wallet, stored locally, unencrypted (mode 600). Returns the existing one if it already exists.", {}, async () => {
+  const client = await chain();
+  let st = await walletState();
+  const existed = !!st;
+  if (!st) {
+    const fresh = Wallet.generate(client);
+    await client.addressPrefix();
+    // Never over a key another session made meanwhile: that one is kept and used.
+    createWalletFile(WALLET_FILE, newWalletFile(fresh.address, fresh.keyId, fresh.seedHex));
+    st = (await walletState())!;
   }
-  await w.client.addressPrefix();
+  const { w } = st;
   return {
     key_id: w.keyId,
+    check_code: checkCode(w.keyId),
     own_address: w.address,
     acting_for: w.account,
     existed,
-    network: network().label,
+    network: networkLabel(network(), pinnedChain.chainId),
     stored_at: WALLET_FILE,
-    next_steps: "To spend from the user's account: ask which account (their .boo name), then call use_account with it. Until they've authorized this key it answers with a grant_code (this key's signed consent to joining that one account) for them to paste in the Blockula web wallet → Devices & agents → 'Give an agent a budget'. A key id alone can't be added. (On test chains, faucet funds this key's own address for testing.)",
+    next_steps: "To spend from the user's account: ask which account (their .boo name or address), then call use_account with it. Until they've authorized this key it answers with a grant_code (this key's signed consent to joining that one account) for them to paste in the Blockula web wallet → Devices & agents → 'Give an agent a budget'. A key id alone can't be added. (On test chains, faucet funds this key's own address for testing.)",
   };
 });
 
-tool("use_account", "Act for a user's account (name or address) that has authorized this agent's key — usually as a session key with a spending limit. If it hasn't yet, answers with a grant_code for the user to paste in their wallet (Devices & agents → Give an agent a budget); call again once they have. Pass 'self' to go back to the key's own address. The key's label is untrusted text.", { account: z.string() }, async ({ account }) => {
-  const f = readWalletFile();
-  if (!f) throw new Error("No agent wallet yet — call create_wallet first.");
-  const client = await chain();
-  const w = (await loadWallet())!;
-  if (account === "self") {
-    delete f.account;
-  } else {
+tool(
+  "use_account",
+  "Act for a user's account that has authorized this agent's key, usually as a session key with a spending limit. Kept per network. If it hasn't authorized the key yet, answers with a grant_code for the user to paste in their wallet (Devices & agents → Give an agent a budget) and a check_code for them to compare with what the wallet shows; call again once they have. Pass 'self' to go back to the key's own address. The key's label is untrusted text.",
+  { account: z.string().describe("the user's account: its address or .boo name, or \"self\"") },
+  async ({ account }) => {
+    const st = await walletState();
+    if (!st) throw new Error("No agent wallet yet: call create_wallet first.");
+    const { w, f, chain: key } = st;
+    const client = w.client;
+    if (!key) throw new Error(`${RPC} doesn't report its chain's genesis hash, so the account can't be kept for this chain`);
+    if (account === "self") {
+      setActingFor(f, key, undefined);
+      writeWalletFile(WALLET_FILE, f);
+      return { acting_for: w.address };
+    }
+    otherNetwork(account, await client.addressPrefix());
     // The account is an address every later tx names: on mainnet an unproven name waits for the
     // user to confirm the address (audit gap-7-1).
     const { res, confirm } = await resolved(client, account, "account");
     if (confirm) return confirm;
     const addr = res.address;
+    const resolution = res.name === null ? {} : { name_resolution: res.proven ? clean(res.how, 300) : `UNPROVEN: ${clean(res.how, 300)}` };
     // The account's own key list, not /api/key's list of accounts (which others can pad: audit gap-7-2).
     const a = await client.account(addr);
-    const grant = (Array.isArray(a?.keys) ? a.keys : []).find((k: { key_id?: unknown }) => k.key_id === w.keyId);
+    // An address with no account can't add a key (that takes a tx, and a tx takes FANG): no grant to hand out.
+    if (a?.exists === false) {
+      return { status: "no_account", account: clean(account, 100), address: addr, ...resolution, next: `There's no account at ${addr} on ${networkLabel(network(), pinnedChain.chainId)}: nothing was signed. Check the address with the user (their wallet shows it under Devices & agents). An account exists once it has received FANG.` };
+    }
+    const grant = keyOn(a, w.keyId);
     if (!grant) {
       // Adding a key needs its consent to the account (audit gap-7-2): this key signs it for this
       // one address, and the user's wallet refuses a code made for any other account.
+      const wallet = pinnedChain.chainId ? WALLET_URLS[pinnedChain.chainId] : undefined;
+      // The resolution itself, so the SDK refuses it too if it's unproven on mainnet.
+      const grantCode = encodeKeyGrant(await w.keyGrant(res));
+      // AGENT-5: thousands of characters are easy to mangle when retyped; a file can be copied whole.
+      const grantFile = join(HOME, `grant-${pinnedChain.chainId ?? "chain"}-${addr}.txt`);
+      let saved = false;
+      try {
+        mkdirSync(HOME, { recursive: true });
+        writeFileSync(grantFile, `${grantCode}\n`, { mode: 0o600 });
+        saved = true;
+      } catch {
+        /* the code is in the answer anyway */
+      }
       return {
         status: "not_authorized_yet",
         account: clean(account, 100),
         address: addr,
-        ...(res.name === null ? {} : { name_resolution: res.proven ? clean(res.how, 300) : `UNPROVEN: ${clean(res.how, 300)}` }),
+        ...resolution,
         key_id: w.keyId,
-        // The resolution itself, so the SDK refuses it too if it's unproven on mainnet.
-        grant_code: encodeKeyGrant(await w.keyGrant(res)),
-        next: `Nothing was signed on-chain. Give the user the grant_code (this agent key's consent to joining ${addr} only; it holds no secret and can't spend anything). They paste it in the Blockula web wallet → Devices & agents → 'Give an agent a budget' and choose a limit and an expiry. Then call use_account again.`,
+        check_code: checkCode(w.keyId),
+        ...(wallet ? { wallet_url: wallet } : {}),
+        grant_code: grantCode,
+        ...(saved ? { grant_file: grantFile, copy_it: `${process.platform === "darwin" ? "pbcopy" : "xclip -selection clipboard"} < ${grantFile}` } : {}),
+        next: `Nothing was signed on-chain. Give the user the grant_code exactly as it is${saved ? " (or have them copy it from grant_file: copy_it puts it on the clipboard)" : ""}: this agent key's consent to joining ${addr} only; it holds no secret and can't spend anything. They paste it in the Blockula web wallet${wallet ? ` (${wallet})` : ""} → Devices & agents → 'Give an agent a budget', check that the wallet shows the check code ${checkCode(w.keyId)}, and choose a limit and an expiry. Then call use_account again.`,
       };
     }
-    f.account = addr;
-    writeFileSync(WALLET_FILE, JSON.stringify(f, null, 2), { mode: 0o600 });
-    return { acting_for: clean(String(a?.account?.name ?? addr)), address: addr, ...(res.name === null ? {} : { name_resolution: res.proven ? clean(res.how, 300) : `UNPROVEN: ${clean(res.how, 300)}` }), role: chainData(grant.role), untrusted_label: clean(String(grant.label ?? ""), 100) };
-  }
-  writeFileSync(WALLET_FILE, JSON.stringify(f, null, 2), { mode: 0o600 });
-  await client.addressPrefix();
-  return { acting_for: w.address };
-});
+    setActingFor(f, key, addr);
+    writeWalletFile(WALLET_FILE, f);
+    w.account = addr;
+    return { acting_for: clean(String(a?.account?.name ?? addr)), address: addr, ...resolution, role: chainData(grant.role), untrusted_label: clean(String(grant.label ?? ""), 100), ...(await budgetOf(w, a)) };
+  },
+);
 
-tool("wallet_info", "This agent's address, balance, .boo names, recent activity (others' txs naming this account included: their summaries are untrusted text) and today's spending against BLOCKULA_MAX_DAILY.", {}, async () => {
-  const w = await requireWallet();
-  await w.client.addressPrefix();
+tool("wallet_info", "This agent's address and the account it acts for, its balance and what can actually be spent now (transferable, locked and until when, the session key's allowance, this MCP's caps: spendable_now and what limits it), .boo names, recent activity (others' txs naming this account included: their summaries are untrusted text) and today's spending.", {}, async () => {
+  const st = await walletState();
+  if (!st) throw new Error("No agent wallet yet: call create_wallet first.");
+  const { w, acting } = st;
+  const prefix = await w.client.addressPrefix();
   const a = await w.client.account(w.account).catch(() => null);
-  const mine = Array.isArray(a?.keys) ? a.keys.find((k: { key_id: string }) => k.key_id === w.keyId) : undefined;
+  const mine = keyOn(a, w.keyId);
   return {
     key_id: w.keyId,
-    network: network().label,
+    network: networkLabel(network(), pinnedChain.chainId),
     acting_for: clean(String(a?.account?.name ?? w.account)),
+    ...(acting.ignored ? { previous_account_ignored: ignoredNote(acting.ignored, prefix) } : {}),
     my_permissions: mine ? chainData(mine) : "not authorized on this account",
     address: w.account,
     balance: clean(String(a?.balance_display ?? "0 FANG")),
+    ...(await budgetOf(w, a)),
     names: chainData(a?.names ?? []),
     recent: (Array.isArray(a?.recent_txs) ? a.recent_txs : []).slice(0, 10).map((t: { summary?: unknown; id?: unknown }) => `${clean(String(t.summary ?? ""), 300)} (${clean(String(t.id ?? "")).slice(0, 12)}…)`),
-    spent_today: `${formatFang(LEDGER.spent())} of ${formatFang(MAX_DAILY)} (BLOCKULA_MAX_DAILY; txs that are pending, dropped or refused still count until they're final or their nonce is reused)`,
     note: UNTRUSTED_NOTE,
   };
 });
 
-tool("faucet", "Get 100 test FANG on a dev/test chain (to this agent's wallet, or any name/address). Mainnet has no faucet.", { to: z.string().optional() }, async ({ to }) => {
+/** What `faucet` answers when the node says its chain has none. */
+const NO_FAUCET = "This chain has no faucet, so nothing was sent. Its FANG comes from accounts that already hold some: ask whoever runs the chain. The public testnet and dev chains (start_dev_node) have faucets.";
+
+tool("faucet", "Get 100 test FANG from the chain's faucet (to this agent's wallet, or any name/address). On a chain without one, it answers status no_faucet.", { to: z.string().optional().describe("a name or address; default: the account this agent acts for") }, async ({ to }) => {
   const client = await chain();
   let target = to;
   if (!target) {
@@ -883,40 +1114,57 @@ tool("faucet", "Get 100 test FANG on a dev/test chain (to this agent's wallet, o
     await w.client.addressPrefix();
     target = w.account;
   }
-  const tx = await client.faucet(target);
-  return { summary: clean(String(tx.summary ?? "")), tx_id: tx.id, explorer: explorer(`tx/${tx.id}`) };
+  try {
+    const tx = await client.faucet(target);
+    return { summary: clean(String(tx.summary ?? "")), tx_id: tx.id, explorer: explorer(`tx/${tx.id}`) };
+  } catch (e) {
+    // The node's answer on a chain whose genesis has no faucet (node/src/api.rs `faucet`).
+    if (e instanceof ApiError && e.status === 400 && /no faucet/i.test(e.message)) return { status: "no_faucet", summary: NO_FAUCET };
+    throw e;
+  }
 });
 
-tool("send", "Send FANG to a .boo name or address. Amounts are in FANG, e.g. \"1.5\". A name is signed as the name (the chain pays whoever owns it when the tx runs) unless BLOCKULA_WITNESSES proved its owner. Counts toward BLOCKULA_MAX_SEND / BLOCKULA_MAX_DAILY (with the fee, and what opening a new account burns). If it comes back \"pending\", it was submitted: check tx_status, never send it again.", { to: z.string(), amount: z.string(), memo: z.string().max(256).optional() }, async ({ to, amount, memo }) => {
-  const drops = parseFang(amount);
-  if (drops <= 0n) throw new Error("send more than 0");
-  const w = await requireWallet();
-  await w.client.addressPrefix();
-  // With witnesses a name's proven owner is signed; without, the name itself, which the chain
-  // resolves when the tx runs: a lying node can't point it at another account now, though one
-  // holding the signed tx could release it later in its validity window (audit gap-7-1,
-  // review-r3-clients-2).
-  const rc = await w.client.recipient(to);
-  const opening = await openingFee(w.client, rc.address);
-  const r = await submitCapped(w, { type: "transfer", to: rc.signed, amount: drops.toString() }, { amount: drops, extra: opening }, memo ?? "");
-  return isInFlight(r) ? { ...r, ...recipientView(rc, "recipient") } : txResult(r, recipientView(rc, "recipient"));
-});
+tool(
+  "send",
+  "Send FANG to a .boo name or address. Amounts are in FANG, e.g. \"1.5\". A name is signed as the name (the chain pays whoever owns it when the tx runs) unless BLOCKULA_WITNESSES proved its owner. Paying an address that has no account yet also burns the account creation fee (0.1 FANG on today's chains) to open it: the result reports account_opening_fee_burned and total_cost (amount, fee and burn). Counts toward BLOCKULA_MAX_SEND / BLOCKULA_MAX_DAILY (with the fee and that burn). What the chain would refuse (a session key's limit, FANG that's locked) is refused before signing. If it comes back \"pending\", it was submitted: check tx_status, never send it again.",
+  {
+    to: z.string().describe("a .boo name or an address of this network"),
+    amount: z.string().describe("FANG, e.g. \"1.5\" (up to 9 decimals)"),
+    memo: z.string().max(256).optional().describe("public and permanent: anyone can read it, forever. Never put personal data in it"),
+  },
+  async ({ to, amount, memo }) => {
+    const drops = amountArg(amount);
+    if (drops <= 0n) throw new Error("send more than 0");
+    const w = await requireWallet();
+    otherNetwork(to, await w.client.addressPrefix());
+    // With witnesses a name's proven owner is signed; without, the name itself, which the chain
+    // resolves when the tx runs: a lying node can't point it at another account now, though one
+    // holding the signed tx could release it later in its validity window (audit gap-7-1,
+    // review-r3-clients-2).
+    const rc = await w.client.recipient(to);
+    if (rc.address === w.account) throw new Error(`${clean(to, 100)} is the account this agent acts for (${w.account}): a payment to itself only pays a fee. Nothing was signed.`);
+    const opening = await openingFee(w.client, rc.address);
+    const r = await submitCapped(w, { type: "transfer", to: rc.signed, amount: drops.toString() }, { amount: drops, extra: opening, outflow: drops }, memo ?? "");
+    const view = { ...recipientView(rc, "recipient"), ...costView(r, drops, opening) };
+    return isInFlight(r) ? { ...r, ...view } : txResult(r, view);
+  },
+);
 
 tool("check_name", "Check whether a .boo name is available and what it costs, or who owns it and when it expires.", { name: z.string() }, async ({ name }) => chainData(await (await chain()).name(name)));
 
-tool("register_name", "Claim a .boo name for the account this agent acts for (3–32 chars, a-z 0-9 -). Shorter names cost more (the price is burned); names are registered for a year at a time. The price counts toward BLOCKULA_MAX_SEND / BLOCKULA_MAX_DAILY. Session keys can't register names.", { name: z.string() }, async ({ name }) => {
+tool("register_name", "Claim a .boo name for the account this agent acts for (3–32 chars, a-z 0-9 -). Shorter names cost more; the price is paid to the treasury. Names are registered for a year at a time, are public, and go to whoever asks first. The price counts toward BLOCKULA_MAX_SEND / BLOCKULA_MAX_DAILY. Session keys can't register names (refused before signing).", { name: z.string().describe("e.g. \"vlad\" or \"vlad.boo\"") }, async ({ name }) => {
   const w = await requireWallet();
   const n = bareName(name);
   const { price } = await namePrices(w.client, n);
-  return txResult(await submitCapped(w, { type: "register_name", name: n }, { amount: price, what: "the name's price" }), { price: formatFang(price) });
+  return txResult(await submitCapped(w, { type: "register_name", name: n }, { amount: price, outflow: price, what: "the name's price" }), { price: formatFang(price), paid_to: "the treasury" });
 });
 
-tool("renew_name", "Extend a .boo name the account this agent acts for owns, by 1–10 years (paid at the chain's renewal price per year, which is burned; counts toward BLOCKULA_MAX_SEND / BLOCKULA_MAX_DAILY). Names that aren't renewed expire after a grace period and anyone can register them.", { name: z.string(), years: z.number().int().min(1).max(10).default(1) }, async ({ name, years }) => {
+tool("renew_name", "Extend a .boo name the account this agent acts for owns, by 1–10 years (at the chain's renewal price per year, paid to the treasury; counts toward BLOCKULA_MAX_SEND / BLOCKULA_MAX_DAILY). Names that aren't renewed expire after a grace period and anyone can register them. Session keys can't renew names.", { name: z.string().describe("e.g. \"vlad.boo\""), years: z.number().int().min(1).max(10).default(1) }, async ({ name, years }) => {
   const w = await requireWallet();
   const n = bareName(name);
   const { renewal, info } = await namePrices(w.client, n);
   const cost = renewal * BigInt(years);
-  return txResult(await submitCapped(w, { type: "renew_name", name: n, years }, { amount: cost, what: "the renewal" }), { cost: formatFang(cost), ...(typeof info?.expires_at === "number" ? { expired_at_before: info.expires_at } : {}) });
+  return txResult(await submitCapped(w, { type: "renew_name", name: n, years }, { amount: cost, outflow: cost, what: "the renewal" }), { cost: formatFang(cost), paid_to: "the treasury", ...(typeof info?.expires_at === "number" ? { expired_at_before: info.expires_at } : {}) });
 });
 
 const LOOKUP_TYPES = new Set(["block", "tx", "account", "name"]);
@@ -940,7 +1188,7 @@ tool("latest_blocks", "The most recent blocks, summarized.", { limit: z.number()
 // ---- staking ----
 
 tool("stake", "Stake (delegate) FANG from the account this agent acts for in a validator's pool. Staked FANG earns a share of issuance, is slashed if the validator misbehaves, and takes the unbonding period (21 days on mainnet) to come back after unstake. Session keys can't stake. Counts toward BLOCKULA_MAX_SEND / BLOCKULA_MAX_DAILY.", { validator: z.string().describe("validator address (or a .boo name its account holds)"), amount: z.string().describe("FANG, e.g. \"10\"") }, async ({ validator, amount }) => {
-  const drops = parseFang(amount);
+  const drops = amountArg(amount);
   if (drops <= 0n) throw new Error("delegate more than 0");
   const w = await requireWallet();
   const { res, confirm } = await resolved(w.client, validator, "validator");
@@ -950,7 +1198,7 @@ tool("stake", "Stake (delegate) FANG from the account this agent acts for in a v
 });
 
 tool("unstake", "Start unbonding stake from a validator's pool: an amount in FANG (signed as that amount: the chain converts it to pool shares at its own price when the tx runs) or \"all\". It stops earning now and can be withdrawn with withdraw_stake once the unbonding period is over.", { validator: z.string(), amount: z.string().default("all").describe("FANG, or \"all\"") }, async ({ validator, amount }) => {
-  const drops = amount === "all" ? null : parseFang(amount);
+  const drops = amount === "all" ? null : amountArg(amount);
   if (drops !== null && drops <= 0n) throw new Error("unstake more than 0 FANG, or \"all\"");
   const w = await requireWallet();
   const { res, confirm } = await resolved(w.client, validator, "validator");
@@ -1031,7 +1279,7 @@ tool("list_proposals", `On-chain governance proposals (parameter changes, treasu
 });
 
 tool("vote", "Vote on a governance proposal for the account this agent acts for. Pass the proposal_digest list_proposals returned with what you showed the user: the vote binds exactly that content, and is refused (nothing signed) if the proposal reads differently now. `amount` FANG of its unlocked holdings is locked: conviction 0 locks nothing and counts 0.1×; 1–6 lock for 1, 2, 4, 8, 16 or 32 lock periods (a week each on mainnet) after voting ends and count 1×–6×. Voting again replaces the vote. Session keys can't vote. Ask the user before locking their FANG.", { proposal_id: z.number().int().min(0), proposal_digest: z.string().regex(/^[0-9a-f]{64}$/).describe("list_proposals' proposal_digest for this proposal: what the user was shown"), vote: z.enum(["aye", "nay"]), amount: z.string().describe("FANG to lock"), conviction: z.number().int().min(0).max(6).default(1) }, async ({ proposal_id, proposal_digest: shown, vote, amount, conviction }) => {
-  const drops = parseFang(amount);
+  const drops = amountArg(amount);
   if (drops <= 0n) throw new Error("vote with more than 0");
   // The amount is locked, not spent: it's held to BLOCKULA_MAX_SEND, and only the fee counts toward the daily limit.
   const w = await requireWallet();
@@ -1056,28 +1304,32 @@ tool("vote", "Vote on a governance proposal for the account this agent acts for.
 
 // ---- Hunts and the contribution pool ----
 
-tool("list_hunts", described(`Open bounties (Hunts) on GitHub issues, with FANG escrowed on-chain. Each links to an issue with acceptance criteria: implement it, open a PR, and the bounty is awarded on-chain when it merges. Titles are written by whoever created the hunt. ${UNTRUSTED_NOTE}`), { status: z.enum(["open", "awarded", "cancelled", "expired"]).default("open") }, async ({ status }) => {
+/** Where to find work when no Hunt is open (AGENT-4). */
+const GOOD_FIRST = "https://github.com/jackdishman/blockula/issues?q=is%3Aopen+label%3Afamiliar-friendly";
+
+tool("list_hunts", described(`Bounties (Hunts) on GitHub issues, with FANG escrowed on-chain. Each links to an issue with acceptance criteria: implement it and open a PR. The Hunt's creator awards the bounty after the PR merges, to the account linked to the PR author's GitHub (link_github, with an owner key). Each Hunt says when it expires. Titles are written by whoever created the hunt. ${UNTRUSTED_NOTE}`), { status: z.enum(["open", "awarded", "cancelled", "expired"]).default("open") }, async ({ status }) => {
   const res = await (await chain()).hunts(status);
-  const hunts = (Array.isArray(res) ? res : Array.isArray(res?.hunts) ? res.hunts : []) as { id: unknown; title?: unknown; amount_display?: unknown; issue_url?: unknown; funders?: unknown }[];
+  const hunts = (Array.isArray(res) ? res : Array.isArray(res?.hunts) ? res.hunts : []) as { id: unknown; title?: unknown; amount_display?: unknown; issue_url?: unknown; funders?: unknown; expires_at?: unknown }[];
   const funders = (f: unknown) => (Array.isArray(f) ? f.length : f && typeof f === "object" ? Object.keys(f).length : 0);
   return {
-    hunts: hunts.slice(0, 100).map((h) => ({ hunt_id: Number(h.id), bounty: clean(String(h.amount_display ?? ""), 40), untrusted_title: clean(String(h.title ?? ""), 120), issue: clean(String(h.issue_url ?? ""), 200), funders: funders(h.funders), explorer: explorer(`hunt/${Number(h.id)}`) })),
+    hunts: hunts.slice(0, 100).map((h) => ({ hunt_id: Number(h.id), bounty: clean(String(h.amount_display ?? ""), 40), untrusted_title: clean(String(h.title ?? ""), 120), issue: clean(String(h.issue_url ?? ""), 200), funders: funders(h.funders), ...(safeInt(h.expires_at) !== undefined ? { expires_at_block: safeInt(h.expires_at) } : {}), explorer: explorer(`hunt/${Number(h.id)}`) })),
+    ...(hunts.length === 0 ? { next: `No ${status} Hunts right now. Merged PRs to the contribution pool's repos can earn from the pool without a Hunt: contribution_pool lists them. Issues labeled familiar-friendly are a good start: ${GOOD_FIRST}` } : {}),
     note: noteOf(UNTRUSTED_NOTE, await valueNote()),
   };
 });
 
-tool("link_github", "Link a GitHub handle to the account this agent acts for, so Hunt awards show up on its profile. First create a PUBLIC gist (as that GitHub user) containing the account's address, then pass the gist id here.", { handle: z.string().regex(/^[A-Za-z0-9-]{1,39}$/), gist_id: z.string().regex(/^[0-9a-f]{20,40}$/) }, async ({ handle, gist_id }) => {
+tool("link_github", "Link a GitHub handle to the account this agent acts for, so Hunt awards and pool claims credit it. It needs an owner key: when this agent acts through a session key, ask the user to link GitHub in their wallet instead. First create a PUBLIC gist (as that GitHub user) containing the account's address, then pass the gist id here.", { handle: z.string().regex(/^[A-Za-z0-9-]{1,39}$/).describe("the GitHub username"), gist_id: z.string().regex(/^[0-9a-f]{20,40}$/).describe("the public gist's id (from its URL)") }, async ({ handle, gist_id }) => {
   const w = await requireWallet();
   const r = await submitCapped(w, { type: "link_github", handle, gist_id }, { amount: 0n });
   if (isInFlight(r)) return r;
   const check = await w.client.github(handle).catch(() => null);
-  return { summary: clean(String(r.summary ?? "")), verified: check?.verified === true, explorer: explorer(`tx/${r.id}`) };
+  return { summary: clean(String(r.summary ?? "")), tx_id: r.id, verified: check?.verified === true, ...(check?.verified === true ? {} : { next: `The link is on chain, but this node can't verify the gist yet${check?.reason ? ` (${clean(String(check.reason), 200)})` : ""}. Validators check it for every contribution claim, so fix it before submit_contribution.` }), explorer: explorer(`tx/${r.id}`) };
 });
 
 tool("fund_hunt", described(`Add FANG to an open Hunt's bounty (crowdfunding). Refunded to you if the hunt is cancelled.`), { hunt_id: z.number().int().min(0), amount: z.string() }, async ({ hunt_id, amount }) => {
-  const drops = parseFang(amount);
+  const drops = amountArg(amount);
   if (drops <= 0n) throw new Error("fund more than 0");
-  const r = await submitCapped(await requireWallet(), { type: "fund_hunt", hunt_id, amount: drops.toString() }, { amount: drops });
+  const r = await submitCapped(await requireWallet(), { type: "fund_hunt", hunt_id, amount: drops.toString() }, { amount: drops, outflow: drops });
   return isInFlight(r) ? r : { summary: clean(String(r.summary ?? "")), fee: r.fee_display, tx_id: r.id, explorer: explorer(`hunt/${hunt_id}`) };
 });
 
@@ -1096,19 +1348,31 @@ tool("contribution_pool", described(`Blockula's contribution pool (Proof of Cont
   };
 });
 
-tool("submit_contribution", described(`Claim a merged PR for the contribution pool, for the account this agent acts for. The PR's author must be that account's linked GitHub handle. Costs a small refundable bond (lost if the jury marks it spam). If you act for a user through a session key, they must first register that key as a Familiar (wallet.registerFamiliar), or the chain refuses the claim; the claim then credits you as their Familiar.`), { repo: z.string().regex(/^[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}$/), pr: z.number().int().min(1) }, async ({ repo, pr }) => {
-  const w = await requireWallet();
-  await w.client.addressPrefix();
-  const me = await w.client.account(w.account).catch(() => null);
-  // node/src/poc.rs `claim_bond`: CLAIM_BOND (1 FANG) per claim, more with open claims; never counted below it.
-  const quoted = me?.contribution?.next_claim_bond;
-  const bond = /^\d+$/.test(String(quoted ?? "")) && BigInt(quoted) > 1_000_000_000n ? BigInt(quoted) : 1_000_000_000n;
-  const r = await submitCapped(w, { type: "submit_claim", repo, pr }, { amount: bond, what: `the claim bond (${formatFang(bond)})` });
-  if (isInFlight(r)) return r;
-  const claims = await w.client.claims({ account: w.account }).catch(() => null);
-  const claim = (Array.isArray(claims?.claims) ? claims.claims : []).find((c: { repo: string; pr: number }) => c.repo === repo.toLowerCase() && c.pr === pr);
-  return { summary: clean(String(r.summary ?? "")), claim_id: claim?.id, status: claim ? clean(String(claim.status)) : undefined, next: "Validators check GitHub within a minute or two; then it waits for the revert window and the next Séance. Track it with my_contributions.", note: noteOf(await valueNote()), explorer: explorer(`claim/${claim?.id ?? ""}`) };
-});
+tool(
+  "submit_contribution",
+  described(`Claim a merged PR for the contribution pool, for the account this agent acts for. The PR's author must be that account's linked GitHub handle, verified by its gist (checked first: refused when it isn't, unless force is true). Costs a bond (1 FANG, more with open claims): it's returned unless validators refute the claim (an unmerged PR, another author, a gist that doesn't verify) or the jury marks it spam. If you act for a user through a session key, they must first register that key as a Familiar in their wallet, or the claim is refused; the claim then credits them as your sponsor.`),
+  { repo: z.string().regex(/^[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}$/).describe("owner/name"), pr: z.number().int().min(1), force: z.boolean().default(false).describe("claim even though the GitHub link doesn't verify now (the bond is likely lost)") },
+  async ({ repo, pr, force }) => {
+    const w = await requireWallet();
+    await w.client.addressPrefix();
+    const me = await w.client.account(w.account).catch(() => null);
+    // CONTRIB-4: validators refute a claim whose author's link doesn't verify, and the bond goes to the pool.
+    if (!force) {
+      const handle = typeof me?.github?.handle === "string" ? me.github.handle : undefined;
+      if (!handle) throw new Error(`${w.account} has no GitHub link, so validators would refute the claim and keep the bond. Link the PR author's GitHub first (link_github, or in the user's wallet). Nothing was signed.`);
+      const check = await w.client.github(handle).catch(() => null);
+      if (check?.verified !== true) throw new Error(`@${clean(handle, 40)}'s link to ${w.account} doesn't verify${check?.reason ? ` (${clean(String(check.reason), 200)})` : ""}, so validators would likely refute the claim and keep the bond. Fix the gist, or pass force: true to claim anyway. Nothing was signed.`);
+    }
+    // node/src/poc.rs `claim_bond`: CLAIM_BOND (1 FANG) per claim, more with open claims; never counted below it.
+    const quoted = me?.contribution?.next_claim_bond;
+    const bond = /^\d+$/.test(String(quoted ?? "")) && BigInt(quoted) > 1_000_000_000n ? BigInt(quoted) : 1_000_000_000n;
+    const r = await submitCapped(w, { type: "submit_claim", repo, pr }, { amount: bond, outflow: bond, what: `the claim bond (${formatFang(bond)})` });
+    if (isInFlight(r)) return r;
+    const claims = await w.client.claims({ account: w.account }).catch(() => null);
+    const claim = (Array.isArray(claims?.claims) ? claims.claims : []).find((c: { repo: string; pr: number }) => c.repo === repo.toLowerCase() && c.pr === pr);
+    return { summary: clean(String(r.summary ?? "")), tx_id: r.id, claim_id: claim?.id, status: claim ? clean(String(claim.status)) : undefined, next: "Validators check GitHub within a minute or two; then it waits for the revert window and the next Séance. Track it with my_contributions.", note: noteOf(await valueNote()), explorer: explorer(`claim/${claim?.id ?? ""}`) };
+  },
+);
 
 tool("my_contributions", described(`The Soul (reputation), contribution claims, vesting rewards, vouch and jury status of the account this agent acts for. A claim's untrusted_note is written by whoever judged or rejected it.`), {}, async () => {
   const w = await requireWallet();
@@ -1127,5 +1391,5 @@ tool("my_contributions", described(`The Soul (reputation), contribution claims, 
   };
 });
 
-if (NET_ERROR) console.error(`blockula-mcp: ${NET_ERROR.message}`);
+if (BAD_CONFIG) console.error(`blockula-mcp: ${BAD_CONFIG.message} (every tool answers with this until the configuration is fixed)`);
 await server.connect(new StdioServerTransport());

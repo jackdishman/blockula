@@ -19,7 +19,7 @@ import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { RELEASE_SIGNATURE_FORMAT, releaseMessage } from "@blockula/sdk";
-import { KNOWN_CLOCKS, KNOWN_GENESIS, KnownChains, LOCAL_RPC, MAINNET_RPCS, TESTNET_RPC, completePin, effectivePin, mismatch, networkArg, resolveNetwork } from "../src/network.js";
+import { KNOWN_CLOCKS, KNOWN_GENESIS, KnownChains, LOCAL_RPC, MAINNET_RPCS, TESTNET_RPC, completePin, defaultWitnesses, effectivePin, mismatch, networkArg, networkLabel, resolveNetwork } from "../src/network.js";
 import { RELEASE_KEY_ID, binPaths, checkBinaryVersion, fetchVerifiedRelease, latestTagFrom, pickNodeBinary, readReleasePin, releaseKeyIdFrom, type ReleaseDeps } from "../src/release.js";
 
 const G1 = "11".repeat(32);
@@ -65,6 +65,19 @@ const refusals: [Record<string, string>, string[], RegExp][] = [
 // gap-7-1: witnesses names are proven against.
 assert.deepEqual(resolveNetwork({ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_WITNESSES: " https://a.example/ , https://b.example ," }).witnesses, ["https://a.example", "https://b.example"]);
 assert.deepEqual(resolveNetwork({}).witnesses, []);
+// OPERATOR-6: your own node of the public testnet gets its public RPC as a witness unless
+// BLOCKULA_WITNESSES says otherwise (`none` opts out); the public RPC itself gets none, and so do
+// chains without built-in public RPCs.
+const own = resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171" }, ["--network", "testnet"]);
+assert.deepEqual([own.key, own.rpc, own.witnesses, own.witnessesSet], ["testnet", "http://127.0.0.1:7171", [TESTNET_RPC], false]);
+assert.deepEqual([resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171", BLOCKULA_WITNESSES: "none" }, ["--network", "testnet"]).witnesses, resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171", BLOCKULA_WITNESSES: "None" }, ["--network", "testnet"]).witnessesSet], [[], true]);
+assert.deepEqual(resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171", BLOCKULA_WITNESSES: "https://w.example" }, ["--network", "testnet"]).witnesses, ["https://w.example"], "listed witnesses replace the default");
+assert.deepEqual(resolveNetwork({}, ["--network", "testnet"]).witnesses, [], "the public RPC isn't its own witness");
+assert.deepEqual([defaultWitnesses("blockula-testnet-2", "http://127.0.0.1:7171"), defaultWitnesses("blockula-testnet-2", TESTNET_RPC), defaultWitnesses("blockula-dev", "http://127.0.0.1:7070"), defaultWitnesses("blockula-1", "http://127.0.0.1:7171"), defaultWitnesses(undefined, "x")], [[TESTNET_RPC], [], [], [], []]);
+// A node on this machine is "your node on" the public testnet once its chain is known.
+assert.equal(networkLabel(resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171" }), "blockula-testnet-2"), "your node on the public testnet");
+assert.equal(networkLabel(resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171" }), "blockula-dev"), "local dev node");
+assert.equal(networkLabel(resolveNetwork({}), "blockula-testnet-2"), "public testnet");
 for (const [env, argv, re] of refusals) assert.throws(() => resolveNetwork(env, argv), re, JSON.stringify([env, argv]));
 // Built-in mainnet RPCs: https, and the first is mainnet's default.
 for (const u of MAINNET_RPCS) assert.match(u, /^https:\/\/[^/\s]+$/, u);
