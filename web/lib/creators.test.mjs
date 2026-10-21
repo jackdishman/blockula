@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  alertMemo,
   approveCommand,
   approxDate,
   BOND_TERMS,
@@ -10,6 +11,8 @@ import {
   CONTRIBUTION_NOTES,
   CONTRIBUTION_NOTES_BOTH,
   GITHUB_HANDLE,
+  MEMO_FOLDED,
+  MEMO_WARNING,
   memoLooksLikeContact,
   memoView,
   multisigRule,
@@ -34,8 +37,8 @@ test("a payment under 0.01 FANG, or under ten times its fee, is tiny", () => {
   assert.equal(tinyPayment(pay(F, "", { fee: String(F / 50n) })), false);
   // Pending: what it allows to be charged.
   assert.equal(tinyPayment({ amount: String(F / 10n), max_fee: String(F / 50n) }), true);
-  // No amount (not a payment) folds too.
-  assert.equal(tinyPayment({ amount: null, fee: FEE }), true);
+  // No amount: not a payment, so not a tiny one (review WC-3: it was folded as one).
+  assert.equal(tinyPayment({ amount: null, fee: FEE }), false);
 });
 
 test("a tiny payment's memo is folded; a real one's isn't; the viewer's own never is", () => {
@@ -43,6 +46,17 @@ test("a tiny payment's memo is folded; a real one's isn't; the viewer's own neve
   assert.deepEqual(memoView(pay(3n * F, "for the pumpkins")), { text: "for the pumpkins", folded: false, warn: false });
   assert.equal(memoView(pay(1n, "hi"), "boo1vlad").folded, false);
   assert.equal(memoView(pay(1n, "")), null);
+  // A Hunt's award or a name offer has no amount: its memo shows, flagged if it reads like a contact.
+  assert.deepEqual(memoView({ amount: null, fee: FEE, memo: "great PR!", from: vlad }), { text: "great PR!", folded: false, warn: false });
+  assert.deepEqual(memoView({ amount: null, fee: FEE, memo: "renew at https://x.example", from: vlad }), { text: "renew at https://x.example", folded: false, warn: true });
+});
+
+test("a 'You received' notice shows a memo as the ledger does: folded on dust, flagged when it reads like a contact (review WC-2)", () => {
+  assert.equal(alertMemo(pay(1n, "URGENT: renew at https://blockula-renew.example")), MEMO_FOLDED);
+  assert.equal(alertMemo(pay(3n * F, "Blockula support: verify at https://x.example")), `“Blockula support: verify at https://x.example” · ${MEMO_WARNING}`);
+  assert.equal(alertMemo(pay(3n * F, "for the pumpkins")), "“for the pumpkins”");
+  assert.equal(alertMemo(pay(3n * F, "")), undefined);
+  assert.equal(alertMemo(pay(1n, "hi"), "boo1vlad"), "“hi”");
 });
 
 test("memos that read like someone getting in touch carry the warning", () => {
@@ -83,12 +97,27 @@ test("a multisig says how many owners must approve", () => {
   assert.equal(approveCommand(4, "boo1coven", "ab".repeat(32)), `blockula multisig approve 4 --from boo1coven --digest ${"ab".repeat(32)}`);
 });
 
-test("contribution notes: testnet's is the house line, mainnet's isn't a testnet disclaimer, and the bond isn't 'refundable'", () => {
-  assert.match(CONTRIBUTION_NOTES.testnet, /^Testnet FANG, Hunts and Soul have no monetary value/);
-  assert.doesNotMatch(CONTRIBUTION_NOTES.mainnet, /Testnet FANG/);
-  assert.match(CONTRIBUTION_NOTES_BOTH, /On the testnet: .* On mainnet: /);
+test("contribution notes: testnet's is the house line, and the bond isn't 'refundable'", () => {
+  assert.equal(CONTRIBUTION_NOTES.testnet, "Testnet FANG, Hunts and Soul have no monetary value and come with no promise of any mainnet allocation.");
   assert.equal(BOND_TERMS, "returned unless validators refute the claim or the jury marks it spam");
-  for (const s of [CONTRIBUTION_NOTES.testnet, CONTRIBUTION_NOTES.mainnet, BOND_TERMS]) assert.doesNotMatch(s, /contract|refundable/i);
+  assert.equal(CONTRIBUTION_NOTES_BOTH, `On the testnet: ${CONTRIBUTION_NOTES.testnet} On mainnet: ${CONTRIBUTION_NOTES.mainnet}`);
+  for (const s of [CONTRIBUTION_NOTES.testnet, BOND_TERMS]) assert.doesNotMatch(s, /contract|refundable/i);
+});
+
+// Mainnet's note waits on D7 (the Hunts design), so this checks what any wording of it must keep,
+// not the words: settling D7 rewrites CONTRIBUTION_NOTES.mainnet and nothing here.
+test("mainnet's contribution note (waiting on D7): no testnet disclaimer, Hunts not put on the testnet, provisional, no promises", () => {
+  const note = CONTRIBUTION_NOTES.mainnet;
+  assert.ok(note.length > 0);
+  // The testnet's line would be false on mainnet.
+  assert.doesNotMatch(note, /Testnet FANG|no monetary value/i);
+  // D7 changed: contributors earn FANG on blockula-1 through Hunts, so no sentence puts Hunts on
+  // the testnet (review WC-1: it said "Blockula runs Hunts and the contribution pool on the testnet for now").
+  for (const sentence of note.split(/(?<=\.)\s+/)) assert.doesNotMatch(sentence, /\bHunts?\b.*\btestnet\b/i, sentence);
+  // Legal text is a draft for counsel (D4), and says so.
+  assert.match(note, /Provisional, under counsel review\./);
+  // House copy rules: no value, return, listing or airdrop language, no rate, no "contracts".
+  assert.doesNotMatch(note, /contract|refundable|\bAPY\b|\bAPR\b|guarantee|\breturns?\b|profit|airdrop|listing|invest|%/i);
 });
 
 test("an approximate date is a calendar day in UTC", () => {

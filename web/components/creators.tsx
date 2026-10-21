@@ -128,13 +128,14 @@ function PendingAction({ p, threshold, labels, address, head }: { p: Pending; th
   } catch {
     digest = null;
   }
-  const approvable = review.readable && !!digest && !p.expired;
+  // An action the chain would refuse to file (expired, or an upgrade proposal a cancellation superseded) gets no approve command.
+  const approvable = review.readable && !!digest && !p.expired && !p.superseded;
   const by = p.approvals.map((k) => labels.get(k) ?? `a key that isn't an owner (${keyCode(k)})`);
   return (
     <li className="cre-ms-action" data-testid="ms-action">
       <div className="row-between">
         <span className="cre-ms-id">#{p.id}</span>
-        <span className={`pill ${p.expired ? "dim" : "pending"}`}>
+        <span className={`pill ${p.expired || p.superseded ? "dim" : "pending"}`}>
           {p.valid_approvals} of {threshold} approvals
         </span>
       </div>
@@ -142,6 +143,11 @@ function PendingAction({ p, threshold, labels, address, head }: { p: Pending; th
         {review.does}
       </p>
       {!review.readable && <p className="warn small m0">This wallet can&apos;t read all of it: don&apos;t approve it.</p>}
+      {p.superseded && (
+        <p className="dim small m0 wrap-any" data-testid="ms-superseded">
+          No approval can file it any more. The node says: {p.superseded}
+        </p>
+      )}
       <span className="small dim block">
         {by.length ? `approved by ${by.join(", ")}` : "no approvals yet"} · {p.expired ? "expired at" : "expires at"} block #{p.expires_at.toLocaleString("en-US")}
         {!p.expired && head != null && p.expires_at <= head ? " (any moment now)" : ""}

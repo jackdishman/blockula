@@ -5,6 +5,7 @@
 // /api/github: it's mocked here with page.route.
 import { actionDigest, describeAction, type Action } from "@blockula/sdk";
 import type { Page, Route } from "@playwright/test";
+import { CONTRIBUTION_NOTES, MEMO_FOLDED, MEMO_WARNING } from "../lib/creators";
 import { ADDR, DUST_MEMO, HOSTILE, PHISH_MEMO, seedWorld } from "./explorer-world";
 import { RPC } from "./env";
 import { createWallet, cspViolations, expect, test, watchCsp } from "./helpers";
@@ -105,21 +106,35 @@ test.describe("a creator's public page", () => {
   test("a 2-of-2 multisig shows its threshold, and its pending action from the action, not the node's summary", async ({ page, node }) => {
     seedWorld(node);
     const action = { type: "transfer", to: ADDR.mina, amount: "2000000000" } as Action;
+    // A stored upgrade proposal a CancelUpgrade superseded: the node says why no approval can file it.
+    const upgrade = { type: "propose", kind: { type: "schedule_upgrade", version: 2, activation_height: 90_000 }, deposit: "1000000000000", title: "Protocol v2" } as Action;
+    const superseded = "superseded: it was proposed at block 142, and the CancelUpgrade that ran at block 150 withdrew upgrades from the schedule it was proposed against (versions through v2 are spent). Propose the upgrade again as v3 or later: a release built as v2 carries the withdrawn rules";
+    const ms = node.multisigs.get(ADDR.coven) as { pending: object[] };
+    ms.pending.push({ id: 1, action: upgrade, summary: "coven.boo would propose an upgrade", approvals: [], valid_approvals: 0, expires_at: node.height + 500, expired: false, superseded });
     await page.goto("/account/coven.boo");
     await expect(page.getByTestId("multisig-chip")).toHaveText("2-of-2 multisig");
     await expect(page.getByTestId("multisig-rule")).toHaveText("Both owners must approve every action.");
     await expect(page.getByText("Owners can do anything")).toHaveCount(0);
 
-    const pending = page.getByTestId("ms-action");
-    await expect(pending).toHaveCount(1);
+    await expect(page.getByTestId("ms-action")).toHaveCount(2);
+    const pending = page.getByTestId("ms-action").filter({ has: page.locator(".cre-ms-id", { hasText: /^#0$/ }) });
     await expect(pending.getByTestId("ms-does")).toHaveText(describeAction(action));
     await expect(pending.getByTestId("ms-does")).toHaveText(`Send 2 FANG to ${ADDR.mina}`);
     await expect(pending).toContainText("1 of 2 approvals");
     await expect(pending).toContainText("approved by the other witch");
     await expect(pending.getByTestId("ms-digest")).toHaveText(`digest ${actionDigest(action)}`);
     await expect(pending).toContainText(`blockula multisig approve 0 --from ${ADDR.coven} --digest ${actionDigest(action)}`);
+    await expect(pending.getByTestId("ms-superseded")).toHaveCount(0);
+
+    // The superseded one is described and its digest shown, but no approve command is offered (review WC-4).
+    const stale = page.getByTestId("ms-action").filter({ has: page.locator(".cre-ms-id", { hasText: /^#1$/ }) });
+    await expect(stale.getByTestId("ms-does")).toHaveText(describeAction(upgrade));
+    await expect(stale.getByTestId("ms-digest")).toHaveText(`digest ${actionDigest(upgrade)}`);
+    await expect(stale.getByTestId("ms-superseded")).toHaveText(`No approval can file it any more. The node says: ${superseded}`);
+    await expect(stale).not.toContainText("blockula multisig approve");
     // The node's own words (hostile ones here) never show.
     await expect(page.locator("main")).not.toContainText("would send");
+    await expect(page.locator("main")).not.toContainText("would propose");
     await expect(page.locator("main")).not.toContainText(HOSTILE);
     await expect(page.getByText("Passkey owners can't approve in the wallet yet")).toBeVisible();
 
@@ -166,6 +181,34 @@ test.describe("a creator's public page", () => {
     expect(await cspViolations(page)).toEqual([]);
     expect(errors).toEqual([]);
   });
+});
+
+test("a 'You received' notice folds a dust payment's memo and flags a contact-looking one, as the ledger does (review WC-2)", async ({ page, node }) => {
+  await watchCsp(page);
+  const { account } = await createWallet(page);
+  seedWorld(node);
+  const pay = (amount: bigint, memo: string) =>
+    node.add({ kind: "transfer", from: ADDR.stranger, to: account, amount, fee: 64_920n, memo, summary: `${ADDR.stranger} sent some FANG to you`, action: { type: "transfer", to: account, amount: amount.toString() } });
+  await page.goto("/explore");
+  await expect(page.getByRole("heading", { name: "blockula-testnet, live" })).toBeVisible();
+  await page.waitForTimeout(4500); // the first look is the baseline
+
+  // A stranger's dust with a phishing memo: the notice says a memo was hidden, never what it says.
+  pay(1n, DUST_MEMO);
+  const dust = page.locator(".notice", { hasText: "You received" });
+  await expect(dust).toBeVisible({ timeout: 9000 });
+  await expect(dust.locator(".notice-foot")).toContainText(MEMO_FOLDED);
+  await expect(dust).not.toContainText("URGENT");
+  await expect(dust).not.toContainText("blockula-renew");
+  await dust.getByRole("button", { name: "Dismiss" }).click();
+
+  // A real payment's memo shows, flagged when it reads like a contact.
+  pay(500_000_000n, PHISH_MEMO);
+  const phish = page.locator(".notice", { hasText: "You received" });
+  await expect(phish).toBeVisible({ timeout: 9000 });
+  await expect(phish.locator(".notice-foot")).toContainText(`“${PHISH_MEMO}” · ${MEMO_WARNING}`);
+  await expect(page.locator(".notice a[href*='blockula-help']")).toHaveCount(0);
+  expect(await cspViolations(page)).toEqual([]);
 });
 
 test("receive: memos are public, and a payment link for print carries the address, not the name", async ({ page, node }) => {
@@ -266,7 +309,8 @@ test.describe("contribution pages", () => {
     await expect(page.locator(".card-note", { hasText: "On the testnet: Testnet FANG, Hunts and Soul have no monetary value" })).toBeVisible();
     await expect(page.locator("main")).not.toContainText("refundable bond is held");
     await page.goto("/programs/hunts");
-    await expect(page.locator(".card-note", { hasText: "On mainnet: Blockula runs Hunts and the contribution pool on the testnet for now." })).toBeVisible();
+    // Mainnet's note is the one D7 spot (lib/creators.ts): checked as that constant, not as words.
+    await expect(page.locator(".card-note", { hasText: `On mainnet: ${CONTRIBUTION_NOTES.mainnet}` })).toBeVisible();
     await page.goto("/programs/accounts");
     await expect(page.locator(".card-note", { hasText: "Passkey owners can't approve in the wallet yet" })).toBeVisible();
     await expect(page.locator("main")).not.toContainText(/contract/i);

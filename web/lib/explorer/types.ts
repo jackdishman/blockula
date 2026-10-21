@@ -324,7 +324,8 @@ export interface MultisigView {
   threshold: number;
   owners: { key_id: string; label: string | null }[];
   created_at: number;
-  pending: { id: number; action: { type: string; [k: string]: unknown }; summary: string; approvals: string[]; valid_approvals: number; expires_at: number; expired: boolean }[];
+  /** `superseded`: why no approval can file it any more (an upgrade proposal a cancellation superseded), else null. */
+  pending: { id: number; action: { type: string; [k: string]: unknown }; summary: string; approvals: string[]; valid_approvals: number; expires_at: number; expired: boolean; superseded?: string | null }[];
 }
 
 export interface MempoolView {

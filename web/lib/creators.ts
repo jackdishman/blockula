@@ -3,7 +3,7 @@
  * multisig reads, a claim's timeline, and the copy those pages share. Pure (only type imports and
  * lib/explorer/ledger.ts), so `node --test` runs it directly (lib/creators.test.mjs).
  *
- * Copy that waits on a decision lives here, in one place each: CONTRIBUTION_NOTES (D7).
+ * Copy that waits on a decision lives here, in one place each: CONTRIBUTION_NOTES (waiting on D7, the Hunts design).
  */
 import { DROPS_PER_FANG, parseDrops } from "./explorer/ledger.ts";
 import type { ClaimView, TxDetail } from "./explorer/types";
@@ -24,8 +24,14 @@ const URLISH = /(?:\b(?:https?|ftp):\/\/|\bwww\.|\b[a-z0-9-]+\.(?:com|net|org|io
 /** Words a fake "Blockula support" message leans on. */
 const CONTACT_WORDS = /\b(?:renew|support|refund|expir|verif|recover|urgent|helpdesk)/i;
 
-/** Whether a payment is small enough that its memo folds: under TINY_PAYMENT_DROPS, or under TINY_FEE_MULTIPLE × its fee. */
+/**
+ * Whether a payment is small enough that its memo folds: under TINY_PAYMENT_DROPS, or under
+ * TINY_FEE_MULTIPLE × its fee. A transaction without an amount isn't a payment, so it isn't a tiny
+ * one: a kind that names an account without paying it, like a name offer, takes more than dust
+ * to send (a name to offer). A contact-looking memo on one still carries MEMO_WARNING.
+ */
 export function tinyPayment(t: Pick<TxDetail, "amount" | "fee" | "max_fee">): boolean {
+  if (t.amount == null) return false;
   const amount = parseDrops(t.amount);
   const fee = parseDrops(t.fee ?? t.max_fee);
   return amount < TINY_PAYMENT_DROPS || amount < TINY_FEE_MULTIPLE * fee;
@@ -53,6 +59,14 @@ export function memoView(t: Pick<TxDetail, "memo" | "amount" | "fee" | "max_fee"
 
 export const MEMO_FOLDED = "memo hidden (tiny payment)";
 export const MEMO_WARNING = "Blockula never contacts you in a memo";
+
+/** A memo as a "You received" notice shows it (components/explorer/Alerts.tsx): folded and flagged as the ledger does, or nothing. */
+export function alertMemo(t: Pick<TxDetail, "memo" | "amount" | "fee" | "max_fee" | "from">, viewer?: string | null): string | undefined {
+  const m = memoView(t, viewer);
+  if (!m) return undefined;
+  if (m.folded) return MEMO_FOLDED;
+  return m.warn ? `“${m.text}” · ${MEMO_WARNING}` : `“${m.text}”`;
+}
 /** Receive (CRE-7). */
 export const PUBLIC_MEMOS = "Payments and memos are public and permanent; anyone can send you one.";
 
@@ -106,14 +120,20 @@ export const MULTISIG_APPROVALS =
 // Contribution pages (CONTRIB-2, CONTRIB-4, CONTRIB-16).
 
 /**
- * What Hunts and the contribution pool mean on each network. WAITING ON A DECISION (D7, Hunts and
- * the pool on mainnet at launch): the mainnet text follows the recommended answer (they stay on
- * the testnet; the pool has no repos on mainnet) and is a draft for counsel review. Change it here.
+ * What Hunts and the contribution pool mean on each network.
+ *
+ * WAITING ON YOUR DECISION (D7): the Hunts design. The maintainer changed D7 on 2026-10-21:
+ * contributors should be able to earn FANG on blockula-1 through Hunts, in a way that can't be
+ * gamed and is legally clear. Its design isn't final, so until it is, `mainnet` says nothing about
+ * where Hunts and the pool run or what they pay, and it's a draft for counsel review (D4). This is
+ * the one place the text lives: the pages, programs.ts and the specs all read it from here, so
+ * settling D7 changes this text and nothing else (lib/creators.test.mjs checks what any wording
+ * must keep).
  */
 export const CONTRIBUTION_NOTES = {
   testnet: "Testnet FANG, Hunts and Soul have no monetary value and come with no promise of any mainnet allocation.",
   mainnet:
-    "Blockula runs Hunts and the contribution pool on the testnet for now. A Hunt on mainnet is paid only by the people who put it up and fund it. Mainnet FANG is experimental and may be worth nothing, and nothing here promises income. You're responsible for any taxes.",
+    "How Hunts and the contribution pool work on mainnet is still being designed. Mainnet FANG is experimental and may be worth nothing, and nothing here promises income. You're responsible for any taxes. Provisional, under counsel review.",
 } as const;
 
 /** Both, for a page that can't know its network when it's rendered (programs.ts blurbs). */

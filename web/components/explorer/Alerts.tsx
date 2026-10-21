@@ -4,6 +4,7 @@ import "@/app/explorer.css";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { alertMemo } from "@/lib/creators";
 import { compactDrops, deltaFor, fromMySide, parseDrops, type Me } from "@/lib/explorer/ledger";
 import { nodeGet } from "@/lib/explorer/node";
 import { to } from "@/lib/explorer/routes";
@@ -248,7 +249,7 @@ function describe(t: TxDetail, addr: string, a: AccountDetail, viewer: Me | null
   if (!fromMe) {
     // Home lights up arrivals itself.
     if (d.direction !== "in" || path === "/") return null;
-    return { key, tx: t.id, title: "You received", body: summary, delta, tone: "in", meta: t.memo ? `“${t.memo}”` : undefined };
+    return { key, tx: t.id, title: "You received", body: summary, delta, tone: "in", meta: alertMemo(t, me) };
   }
   const signer = signerOf(t, a.keys, myKey);
   if (signer?.mine || !signer) {
