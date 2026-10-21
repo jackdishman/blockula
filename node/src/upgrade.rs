@@ -493,6 +493,13 @@ pub fn check_known_feature(feature: &str, version: u32) -> Result<()> {
 /// later version that changes one (lifting Ghost Mode's once it's audited) must key the change on
 /// the version in force at the block that runs the proposal, as `known_features` is read, or nodes
 /// still on an older binary would reach another outcome before it activates.
+///
+/// Nor can a later version add a rule like the programs one for itself ("on `blockula-1` only
+/// from vN", for a release that fixes v3's program rules). Keyed on the version in force at the
+/// block, it never refuses anything (where vN is in force, the version isn't below N); keyed any
+/// other way, it refuses what older binaries accept while v(N-1) is in force. So from v3 on,
+/// keeping programs off under a version a known fix supersedes is the council's to do: it doesn't
+/// propose the activation, or it schedules the fix to land before the activation runs.
 pub fn check_may_activate(feature: &str, chain_id: &str, version: u32) -> Result<()> {
     if chain_id != crate::chain::MAINNET_CHAIN_ID {
         return Ok(());
@@ -865,8 +872,11 @@ mod tests {
         assert_eq!((MAINNET_GENESIS_VERSION, MAINNET_PROGRAMS_ACTIVATION_VERSION), (2, 3));
         let e = check_may_activate(PROGRAMS_FEATURE, main, MAINNET_GENESIS_VERSION).unwrap_err().to_string();
         assert_eq!(e, "blockula-1 switches programs on by governance only from protocol v3: v2's program rules run there only if its genesis lists them");
-        for v in [MAINNET_PROGRAMS_ACTIVATION_VERSION, PREVIEW_PROTOCOL_VERSION + 1] {
-            check_may_activate(PROGRAMS_FEATURE, main, v).unwrap();
+        // Every binary that runs blockula-1 gives these answers, for every version: `Propose`
+        // reads them for a version not in force yet, so a later one can't raise the threshold or
+        // add an "only from vN" rule of its own (`check_may_activate` says why).
+        for v in (PROTOCOL_VERSION..=PREVIEW_PROTOCOL_VERSION + MAX_VERSION_STEP).chain([u32::MAX]) {
+            assert_eq!(check_may_activate(PROGRAMS_FEATURE, main, v).is_ok(), v >= MAINNET_PROGRAMS_ACTIVATION_VERSION, "v{v}");
         }
         for chain in ["blockula-testnet-2", "blockula-dryrun-1", "dev"] {
             check_may_activate(PROGRAMS_FEATURE, chain, PROGRAMS_VERSION).unwrap();
