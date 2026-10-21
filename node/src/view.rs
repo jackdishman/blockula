@@ -610,9 +610,12 @@ impl Live {
         self.claimed.load(Ordering::Relaxed).max(self.finalized(height))
     }
 
-    /// Behind what peers claim (or what we verified) by more than a few blocks: for display
-    /// (`/api/status`, `/api/health`). Validator duties use `Chain::syncing`, verified heights only.
+    /// Behind what peers claim (or what we verified) by more than a few blocks, or a full node
+    /// that hasn't executed a block yet (waiting for a snapshot, or for its first blocks: its
+    /// peers' claims may not have arrived; audit PERF-12, TR-12): for display (`/api/status`,
+    /// `/api/health`). Validator duties use `Chain::syncing`, verified heights only.
     pub fn syncing(&self, height: u64) -> bool {
-        height + crate::chain::SYNC_SLACK < self.network_height_claimed(height)
+        let unstarted = height == 0 && self.view().role == crate::chain::Role::FullNode;
+        unstarted || height + crate::chain::SYNC_SLACK < self.network_height_claimed(height)
     }
 }

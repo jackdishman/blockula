@@ -832,7 +832,13 @@ fn block_json(v: &ReadView, b: &Block) -> Value {
 
 fn sync_progress(live: &Live, height: u64) -> f64 {
     let t = live.network_height_claimed(height);
-    if t == 0 { 1.0 } else { (height as f64 / t as f64).min(1.0) }
+    if height == 0 && live.syncing(0) {
+        0.0
+    } else if t == 0 {
+        1.0
+    } else {
+        (height as f64 / t as f64).min(1.0)
+    }
 }
 
 fn head_age_ms(v: &ReadView) -> Option<u64> {
@@ -1051,6 +1057,7 @@ async fn health(State(n): State<Node>) -> Response {
     let halt = n.halt.get();
     let reason = match age {
         _ if halt.is_some() => halt.as_ref().map(|h| format!("halted: {h}")),
+        _ if v.height == 0 && n.live.syncing(0) => Some("syncing: waiting for a snapshot or the first blocks from peers".to_string()),
         _ if n.live.syncing(v.height) => Some(format!("syncing: {} of {}", v.height, n.live.network_height_claimed(v.height))),
         None => Some("no blocks yet".to_string()),
         Some(a) if a > 10 * bt => Some(format!("head is {}s old", a / 1000)),
@@ -3804,6 +3811,33 @@ mod http_tests {
         assert!(r["limited_by"].is_null() && r["error"].as_str().unwrap().contains("too many transactions from your IP"), "{r}");
         assert_eq!([wait_text(1), wait_text(45), wait_text(60), wait_text(61)], ["1 second", "45 seconds", "1 minute", "2 minutes"]);
         for dir in [root, home_f, home_g, home_u, home_l, home_m] {
+            std::fs::remove_dir_all(dir).ok();
+        }
+    }
+
+    /// Audit PERF-12 / TR-12: a full node that hasn't executed a block yet (waiting for a
+    /// snapshot, or for its first blocks) reports `syncing` before any peer claims a height, so
+    /// a readiness check keyed on it waits. A validator at its genesis doesn't, and the full
+    /// node stops once it has executed a block (and isn't behind what peers claim).
+    #[tokio::test]
+    async fn a_full_node_at_height_zero_is_syncing() {
+        let (root, v) = node("sync0");
+        let (home, f) = full_node(&v, "sync0", vec![]);
+        let (_, st, _) = call(&f, "GET", "/api/status", None, "127.0.0.1:1").await;
+        assert_eq!((st["height"].as_u64(), st["syncing"].as_bool(), st["sync_progress"].as_f64()), (Some(0), Some(true), Some(0.0)), "{st}");
+        let (s, h, _) = call(&f, "GET", "/api/health", None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(h["reason"].as_str().unwrap().contains("waiting for a snapshot"), "{h}");
+        let (_, st, _) = call(&v, "GET", "/api/status", None, "127.0.0.1:1").await;
+        assert_eq!((st["height"].as_u64(), st["syncing"].as_bool()), (Some(0), Some(false)), "a validator at its genesis");
+        {
+            let mut c = f.chain.lock();
+            let b = c.test_block(vec![]);
+            c.execute(b).unwrap();
+        }
+        let (_, st, _) = call(&f, "GET", "/api/status", None, "127.0.0.1:1").await;
+        assert_eq!((st["height"].as_u64(), st["syncing"].as_bool(), st["sync_progress"].as_f64()), (Some(1), Some(false), Some(1.0)), "{st}");
+        for dir in [root, home] {
             std::fs::remove_dir_all(dir).ok();
         }
     }
