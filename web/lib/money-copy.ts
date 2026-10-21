@@ -2,9 +2,10 @@
  * The safety lines the wallet shows before money moves: on Send's review, and on the review steps
  * for staking and voting. One place, so counsel's edits land here.
  *
- * DRAFT for counsel review (decision D4): adapted from the legal-safety review's in-product copy
- * (sections 4 to 6). The founder-run line (D3, D8) is true at launch and comes out once outside
- * operators run most of the active set. Plain words, no value or return language, never a rate.
+ * DRAFT for counsel review (D4, decided: the legal texts publish as "provisional, under counsel
+ * review"): adapted from the legal-safety review's in-product copy (sections 4 to 6). The
+ * founder-run line (D3, D8, decided) is true at launch and comes out once outside operators run
+ * most of the active set. Plain words, no value or return language, never a rate.
  */
 
 /** Above Send's Confirm button, on every network. */

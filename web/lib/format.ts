@@ -65,13 +65,18 @@ export const plural = (n: number, one: string, many = `${one}s`) => `${n.toLocal
 
 /**
  * When a block `blocksAhead` from now is about due, in the reader's own clock: "about 21:15"
- * within the next 18 hours, else "about Oct 28" (with the year when it isn't this one).
- * `timeZone` is for tests.
+ * within the next 18 hours ("about 03:00 tomorrow" once that's past midnight), else "about Oct 28"
+ * (with the year when it isn't this one). `timeZone` is for tests.
  */
 export function aboutWhen(blocksAhead: number, blockTimeMs = 1000, now = Date.now(), timeZone?: string): string {
   const ms = Math.max(0, blocksAhead) * blockTimeMs;
   const at = new Date(now + ms);
-  if (ms < 18 * 3_600_000) return `about ${at.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone })}`;
+  if (ms < 18 * 3_600_000) {
+    const time = at.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone });
+    // The reader's calendar day: a bare "03:00" tomorrow would read as earlier today.
+    const day = (d: Date) => d.toLocaleDateString("en-CA", { timeZone });
+    return day(at) === day(new Date(now)) ? `about ${time}` : `about ${time} tomorrow`;
+  }
   const sameYear = new Date(now).toLocaleDateString("en-US", { year: "numeric", timeZone }) === at.toLocaleDateString("en-US", { year: "numeric", timeZone });
   return `about ${at.toLocaleDateString("en-US", { month: "short", day: "numeric", ...(sameYear ? {} : { year: "numeric" }), timeZone })}`;
 }

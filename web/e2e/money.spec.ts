@@ -48,14 +48,15 @@ test("Send checks what can move now, Max fills it less the fee, and payments are
   node.locks.set(account, [{ id: "vote:2", reason: "vote:2", amount: parseFang("50"), until: node.height + 900, vesting: false }]);
   await page.getByRole("link", { name: "Send", exact: true }).first().click();
   const f = sendForm(page);
-  await expect(page.getByTestId("can-send")).toHaveText("Can send now: 50 FANG · 50 FANG locked");
+  // The fee comes out of what can move (review WM-R8): it says so before the review would.
+  await expect(page.getByTestId("can-send")).toHaveText("Can send now: 50 FANG, less the fee · 50 FANG locked");
   await f.to.fill("alice.boo");
   await expect(page.getByText(/the chain pays its owner when this runs/)).toBeVisible();
 
   // More than can move: refused before anything is built.
   await f.amount.fill("90");
   // The lock in words: whose vote, and until about when (USER-5), not "vote:2 until block #…".
-  await expect(page.getByText(/^You can send up to 50 FANG now: 50 FANG of your balance is locked by your vote on proposal #2 until about \d{2}:\d{2}\.$/)).toBeVisible();
+  await expect(page.getByText(/^You can send up to 50 FANG now: 50 FANG of your balance is locked by your vote on proposal #2 until about \d{2}:\d{2}( tomorrow)?\.$/)).toBeVisible();
   await expect(f.review).toBeDisabled();
 
   // Max: everything that can move, less the fee.
@@ -93,7 +94,7 @@ test("Max leaves room for opening a new account", async ({ page }) => {
   await createWallet(page);
   await page.getByRole("link", { name: "Send", exact: true }).first().click();
   const f = sendForm(page);
-  await expect(page.getByTestId("can-send")).toHaveText("Can send now: 100 FANG");
+  await expect(page.getByTestId("can-send")).toHaveText("Can send now: 100 FANG, less the fee");
   await expect(f.max).toBeDisabled();
   await f.to.fill(FRESH);
   await f.max.click();
@@ -109,7 +110,7 @@ test("a refusal the chain's state settles offers no Send anyway; one it might no
   await createWallet(page);
   await page.getByRole("link", { name: "Send", exact: true }).first().click();
   const f = sendForm(page);
-  await expect(page.getByTestId("can-send")).toHaveText("Can send now: 100 FANG");
+  await expect(page.getByTestId("can-send")).toHaveText("Can send now: 100 FANG, less the fee");
   // All 100 FANG, with nothing left for the fee: certain.
   await f.to.fill(FRESH);
   await f.amount.fill("100");
@@ -154,6 +155,8 @@ test("a name gets a warning only when it lapses within the payment's validity, o
   await expect(page.getByTestId("name-risk")).toHaveCount(1);
   await expect(page.getByTestId("name-risk")).toContainText("bobby.boo expires about");
   await expect(page.getByTestId("name-risk")).toContainText("before this payment stops being valid");
+  // What the chain does then (review WM-R3): it fails, nobody else gets it during the grace period.
+  await expect(page.getByTestId("name-risk")).toContainText("If it runs after that, it fails unless the owner renews the name first, and its fee may still be charged.");
   await pay("carol.boo");
   await expect(page.getByTestId("name-risk")).toHaveCount(1);
   await expect(page.getByTestId("name-risk")).toContainText("carol.boo was registered or changed hands in the last 30 days");
@@ -220,6 +223,9 @@ test("moving stake to another validator: a review first, then the pool shares ar
   await expect(review).toContainText(VALIDATOR);
   await expect(review).toContainText(OTHER_VALIDATOR);
   await expect(review).toContainText("10% of what the pool earns");
+  // Each row says which validator it's about, once (review WM-R2: "Commission" and "Status" were
+  // there twice, under the same React key).
+  expect(await review.locator("dl.kv > dt").allTextContents()).toEqual(["From", "From · commission", "From · status", "To", "To · commission", "To · status", "Amount", "Network fee"]);
   await expect(review.getByTestId("review-terms")).toContainText("It moves now, without waiting out the unbonding period.");
   const before = node.submitted.length;
   await review.getByRole("button", { name: "Confirm & move" }).click();

@@ -175,6 +175,10 @@ function Stake() {
 }
 
 /** A validator in a review: its name and full address, what it charges, and whether it's in. */
+/**
+ * A validator's rows in a review. `heading` names it ("Validator", or "From" and "To" when moving
+ * stake, whose rows then say which side they're about: "From · commission").
+ */
 function validatorRows(v: ValidatorView | undefined, address: string, t: Terms, heading = "Validator"): [string, ReactNode][] {
   const who: ReactNode = (
     <>
@@ -190,10 +194,11 @@ function validatorRows(v: ValidatorView | undefined, address: string, t: Terms, 
       : v.status === "active"
         ? "In the active set"
         : "A candidate: it earns once it joins the active set";
+  const about = (what: string) => (heading === "Validator" ? what : `${heading} · ${what.toLowerCase()}`);
   return [
     [heading, who],
-    ["Commission", `${pct(v.commission_bps)} of what the pool earns`],
-    ["Status", <span key="s" className={v.jailed || v.tombstoned_at != null ? "warn" : undefined} data-testid="validator-status">{state}</span>],
+    [about("Commission"), `${pct(v.commission_bps)} of what the pool earns`],
+    [about("Status"), <span key="s" className={v.jailed || v.tombstoned_at != null ? "warn" : undefined} data-testid="validator-status">{state}</span>],
   ];
 }
 

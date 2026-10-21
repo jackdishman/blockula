@@ -36,8 +36,9 @@ export function ReviewStep({
       </div>
       <p className="summary money-wrap">{summary}</p>
       <dl className="kv">
-        {rows.map(([k, v]) => (
-          <Fragment key={k}>
+        {/* Keyed by place: a review may repeat a heading, and its rows never reorder. */}
+        {rows.map(([k, v], i) => (
+          <Fragment key={i}>
             <dt>{k}</dt>
             <dd>{v}</dd>
           </Fragment>

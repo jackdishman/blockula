@@ -11,7 +11,7 @@ import { ErrorNote, ExplorerLink, Spinner, Tip } from "@/components/ui";
 import { RPC } from "@/lib/config";
 import { friendly } from "@/lib/errors";
 import { aboutWhen, blocksToHuman, displayFang, shortAddr } from "@/lib/format";
-import { voteLockEnd, voteLocks, type HistoryTx, type LockView } from "@/lib/money";
+import { ACCOUNT_HISTORY, MAX_LOCKS, voteLockEnd, voteLocks, type HistoryTx, type LockView } from "@/lib/money";
 import { voteTerms } from "@/lib/money-copy";
 import type { AccountView, TxView } from "@/lib/types";
 import { useUnlocked } from "@/lib/wallet";
@@ -113,9 +113,10 @@ function Governance() {
   const open = data.proposals.filter((p) => isOpen(p, height));
   const closed = data.proposals.filter((p) => !isOpen(p, height));
   // "Release expired locks" only once a vote lock has ended (USER-19): from this account's votes in
-  // its recent history. When the wallet can't tell (older history), the chain answers.
+  // its recent history. When the wallet can't tell (the account not read yet, or older history than
+  // the node lists), the chain answers.
   const acct = account as Account | null;
-  const recent = (acct?.recent_txs ?? []) as unknown as HistoryTx[];
+  const recent = acct ? ((acct.recent_txs ?? []) as unknown as HistoryTx[]) : null;
   const locks = voteLocks({
     recent,
     me: wallet.account,
@@ -123,11 +124,14 @@ function Governance() {
     lockPeriodBlocks: data.lockPeriod,
     head: height,
     active: (acct?.locks ?? []).filter((l) => !l.vesting),
-    historyFull: recent.filter((t) => t.height != null).length >= 25,
+    historyFull: (recent ?? []).filter((t) => t.height != null).length >= ACCOUNT_HISTORY,
   });
   const canRelease = locks.ended.length > 0 || !locks.known;
+  // An ended lock already holds nothing (node/src/econ.rs `free`): releasing it only clears it from
+  // the account, which keeps MAX_LOCKS at most (a vote on another proposal needs a free one).
+  const one = locks.ended.length === 1;
   const lockHint = locks.ended.length
-    ? `Your vote lock${locks.ended.length === 1 ? "" : "s"} on proposal ${locks.ended.map((id) => `#${id}`).join(", ")} ended. Release ${locks.ended.length === 1 ? "it" : "them"} to send that FANG again.`
+    ? `Your vote lock${one ? "" : "s"} on proposal${one ? "" : "s"} ${locks.ended.map((id) => `#${id}`).join(", ")} ${one ? "has" : "have"} ended and ${one ? "holds" : "hold"} nothing now. Releasing ${one ? "it clears it" : "them clears them"} from your account, which can keep ${MAX_LOCKS} locks at most.`
     : !locks.known
       ? "Release vote locks that have ended:"
       : locks.nextEnd !== null

@@ -25,11 +25,17 @@ test("displayFang groups thousands, rounds summaries to 4 decimals with ≈, and
   assert.equal(plural(1200, "block"), "1,200 blocks");
 });
 
-test("aboutWhen: a clock time today, a date further out", () => {
+test("aboutWhen: a clock time today or tomorrow, a date further out", () => {
   assert.equal(aboutWhen(3_600, 1000, NOW, "UTC"), "about 13:00");
   assert.equal(aboutWhen(14 * 86_400, 1000, NOW, "UTC"), "about Nov 14");
   assert.equal(aboutWhen(100 * 86_400, 1000, NOW, "UTC"), "about Feb 8, 2027");
   assert.equal(aboutWhen(30, 1000, NOW, "UTC"), "about 12:00");
+  // Past midnight in the reader's own clock: "tomorrow", not a bare time that reads as earlier
+  // today (review WM-R4). NOW is 12:00 UTC, 08:00 in New York.
+  assert.equal(aboutWhen(11 * 3_600, 1000, NOW, "UTC"), "about 23:00");
+  assert.equal(aboutWhen(17 * 3_600, 1000, NOW, "UTC"), "about 05:00 tomorrow");
+  assert.equal(aboutWhen(15 * 3_600, 1000, NOW, "America/New_York"), "about 23:00");
+  assert.equal(aboutWhen(17 * 3_600, 1000, NOW, "America/New_York"), "about 01:00 tomorrow");
 });
 
 test("a vote's lock ends after voting ends, plus the conviction's lock periods; conviction 0 still holds until voting ends", () => {
@@ -73,6 +79,9 @@ test("voteLocks: unsure when history may be cut short or a proposal is missing",
   assert.equal(voteLocks({ recent: [vote(50, 9, 1)], me, proposals, lockPeriodBlocks: 10, head: 500 }).known, false);
   assert.equal(voteLocks({ recent: [], me, proposals, lockPeriodBlocks: 10, head: 500, historyFull: true }).known, false);
   assert.equal(voteLocks({ recent: [vote(50, 1, 1)], me, proposals, head: 500 }).known, false);
+  // The account hasn't been read (a failed or pending /api/account): nothing is known, so no
+  // "You have no vote locks" and no disabled button (review WM-R1).
+  assert.deepEqual(voteLocks({ recent: null, me, proposals, lockPeriodBlocks: 10, head: 500 }), { ended: [], nextEnd: null, known: false });
 });
 
 test("nameRisks: only when the name lapses before the payment stops being valid, or changed hands lately (CRE-5)", () => {
@@ -80,6 +89,13 @@ test("nameRisks: only when the name lapses before the payment stops being valid,
   const o = { name: "bobby.boo", head, validUntil: head + 600, signedAsName: true, now: NOW };
   assert.deepEqual(nameRisks({ status: "active", registered_at: 1_000, expires_at: head + 1_000_000 }, o), []);
   assert.match(nameRisks({ status: "active", registered_at: 1_000, expires_at: head + 300 }, o)[0], /^bobby\.boo expires about \d{2}:\d{2}, before this payment stops being valid/);
+  // What happens then, as the chain does it (review WM-R3): an expired name doesn't resolve, so the
+  // payment fails (and may be charged its fee) unless renewed; nobody else gets it while the grace
+  // period lasts, and only a grace period shorter than the validity window lets a newcomer in.
+  const lapsing = nameRisks({ status: "active", registered_at: 1_000, expires_at: head + 300, grace_until: head + 300 + 2_592_000 }, o)[0];
+  assert.match(lapsing, /If it runs after that, it fails unless the owner renews the name first, and its fee may still be charged\. Pay their address instead\.$/);
+  assert.doesNotMatch(lapsing, /today's owner/);
+  assert.match(nameRisks({ status: "active", registered_at: 1_000, expires_at: head + 300, grace_until: head + 400 }, o)[0], /it fails, or once the name's grace period ends it can pay whoever registers the name next\./);
   // Signed as the owner's address, expiry can't redirect it.
   assert.deepEqual(nameRisks({ status: "active", registered_at: 1_000, expires_at: head + 300 }, { ...o, signedAsName: false }), []);
   assert.match(nameRisks({ status: "grace", registered_at: 1_000, expires_at: head - 5 }, o)[0], /has expired/);

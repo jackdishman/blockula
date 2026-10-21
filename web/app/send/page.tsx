@@ -372,7 +372,8 @@ function Send() {
             <span className="warn">{amountErr}</span>
           ) : (
             <span className="dim small" data-testid="can-send">
-              Can send now: {can ? exact(can.available) : "…"}
+              {/* The fee comes out of it too (review WM-R8): all of it would be refused in the review. */}
+              Can send now: {can ? `${exact(can.available)}, less the fee` : "…"}
               {can && can.locked > 0n ? ` · ${displayFang(can.locked)} locked` : ""}
             </span>
           )}

@@ -138,12 +138,23 @@ test("releases vote locks once one has ended, not before", async ({ page, node }
 
   // Voting ends and its lock period passes: now there's something to release.
   node.height = ends + 10;
-  await expect(page.getByTestId("locks-hint")).toHaveText("Your vote lock on proposal #3 ended. Release it to send that FANG again.", { timeout: 15_000 });
+  await expect(page.getByTestId("locks-hint")).toHaveText("Your vote lock on proposal #3 has ended and holds nothing now. Releasing it clears it from your account, which can keep 64 locks at most.", { timeout: 15_000 });
   await page.getByRole("button", { name: "Release expired locks" }).click();
   await expect(page.getByRole("status")).toContainText("unlocked their expired vote locks");
   expect(node.submitted.at(-1)?.action).toEqual({ type: "unlock" });
   await expect(page.getByTestId("locks-hint")).toHaveText("You have no vote locks to release.");
   await expect(page.getByRole("button", { name: "Release expired locks" })).toBeDisabled();
+});
+
+// Review WM-R1: with no account read (it failed, or hasn't answered yet) the wallet knows nothing
+// about its votes, so it mustn't say there are none and switch the button off.
+test("keeps Release on, and claims nothing, when the account can't be read", async ({ page }) => {
+  const { account } = await createWallet(page);
+  await page.route(`${RPC}/api/account/${account}`, (route) => route.fulfill({ status: 503, contentType: "application/json", headers: { "access-control-allow-origin": "*" }, body: JSON.stringify({ error: "busy" }) }));
+  await page.goto("/governance");
+  await page.getByRole("button", { name: "Unlock with passkey" }).click();
+  await expect(page.getByTestId("locks-hint")).toHaveText("Release vote locks that have ended:");
+  await expect(page.getByRole("button", { name: "Release expired locks" })).toBeEnabled();
 });
 
 test("explains when the network has no governance yet", async ({ page, node }) => {

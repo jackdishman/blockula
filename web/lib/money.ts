@@ -43,6 +43,12 @@ export function lockWords(l: LockView, head: number, blockMs = 1000, now = Date.
   return `by ${l.reason || l.id} until ${when}`;
 }
 
+/** Sealed transactions `/api/account` lists, newest first (node/src/api.rs `account`). */
+export const ACCOUNT_HISTORY = 25;
+
+/** Most locks an account holds at once (node/src/chain.rs `MAX_LOCKS`); `Unlock` clears ended ones. */
+export const MAX_LOCKS = 64;
+
 /** What `voteLocks` reads of a transaction (`/api/account` `recent_txs[]`). */
 export interface HistoryTx {
   kind?: string;
@@ -55,11 +61,13 @@ export interface HistoryTx {
 /**
  * Which of this account's vote locks have ended and not been released yet, from its votes in its
  * recent history and the proposals' voting ends. `known` is false when the wallet can't be sure
- * (history cut short, a proposal or the lock period it can't see): keep "Release expired locks"
- * usable then, and let the chain answer. `nextEnd` is the soonest lock still holding.
+ * (the account not read yet, history cut short, a proposal or the lock period it can't see): keep
+ * "Release expired locks" usable then, and let the chain answer. `nextEnd` is the soonest lock
+ * still holding.
  */
 export function voteLocks(i: {
-  recent: HistoryTx[];
+  /** The account's recent transactions (`/api/account` `recent_txs`); null when it hasn't been read. */
+  recent: HistoryTx[] | null;
   me: string;
   proposals: { id: number; voting_ends_at: number }[];
   lockPeriodBlocks?: number;
@@ -69,10 +77,10 @@ export function voteLocks(i: {
   /** The node lists only its newest sealed transactions: true when the list may be cut short. */
   historyFull?: boolean;
 }): { ended: number[]; nextEnd: number | null; known: boolean } {
-  const sealed = i.recent.filter((t) => t.height != null && t.status !== "failed" && t.from?.address === i.me);
+  const sealed = (i.recent ?? []).filter((t) => t.height != null && t.status !== "failed" && t.from?.address === i.me);
   const typeOf = (t: HistoryTx) => t.action?.type ?? t.kind;
   const lastUnlock = Math.max(-1, ...sealed.filter((t) => typeOf(t) === "unlock").map((t) => t.height as number));
-  let known = !i.historyFull && i.lockPeriodBlocks !== undefined;
+  let known = i.recent !== null && !i.historyFull && i.lockPeriodBlocks !== undefined;
   // A re-vote only ever extends its lock: the latest end per proposal.
   const ends = new Map<number, number>();
   for (const t of sealed.filter((x) => typeOf(x) === "vote")) {
@@ -132,8 +140,17 @@ export function nameRisks(n: NameInfo, o: { name: string; head: number; validUnt
   const out: string[] = [];
   const blockMs = o.blockMs ?? 1000;
   if (o.signedAsName && n.status === "grace") out.push(`${o.name} has expired. Until its owner renews it, payments to it fail, and after its grace period anyone can register it. Pay the owner's address instead.`);
-  else if (o.signedAsName && n.expires_at !== undefined && n.expires_at < o.validUntil)
-    out.push(`${o.name} expires ${aboutWhen(n.expires_at - o.head, blockMs, o.now)}, before this payment stops being valid. If it runs after that, it won't reach today's owner. Pay their address instead.`);
+  else if (o.signedAsName && n.expires_at !== undefined && n.expires_at < o.validUntil) {
+    // An expired name doesn't resolve (node/src/chain.rs `resolve`), so a payment that runs after
+    // it fails: nodes drop it unrun, but one a block includes is charged its fee. Only once the
+    // grace period is over can someone else register it and be paid.
+    const when = aboutWhen(n.expires_at - o.head, blockMs, o.now);
+    const after =
+      n.grace_until !== undefined && n.grace_until < o.validUntil
+        ? "it fails, or once the name's grace period ends it can pay whoever registers the name next"
+        : "it fails unless the owner renews the name first, and its fee may still be charged";
+    out.push(`${o.name} expires ${when}, before this payment stops being valid. If it runs after that, ${after}. Pay their address instead.`);
+  }
   if (changedHandsLately(n, o.head, blockMs))
     out.push(`${o.name} was registered or changed hands in the last ${RECENT_NAME_DAYS} days. If you meant someone who had it before, ask them for their address.`);
   return out;
