@@ -1,6 +1,7 @@
 "use client";
 
-import { formatFang, isAddress, parseFang, type Tx } from "@blockula/sdk";
+import "@/app/money.css";
+import { isAddress, parseFang, type Tx } from "@blockula/sdk";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
@@ -12,10 +13,13 @@ import { ErrorNote, ExplorerLink, Spinner, Tip } from "@/components/ui";
 import { explorer, MAINNET_PREFIX, NETWORK } from "@/lib/config";
 import { friendly } from "@/lib/errors";
 import { checkTx } from "@/lib/explorer/check";
-import type { Preflight } from "@/lib/explorer/preflight";
-import { shortAddr } from "@/lib/format";
+import { movable, type Preflight } from "@/lib/explorer/preflight";
+import type { TxDetail } from "@/lib/explorer/types";
+import { displayFang, fangInput, shortAddr } from "@/lib/format";
+import { lockWords, nameRisks, type LockView, type NameInfo } from "@/lib/money";
+import { PAYMENTS_FINAL } from "@/lib/money-copy";
 import { checkLinkChain, linkChain } from "@/lib/paylink";
-import type { TxView } from "@/lib/types";
+import type { AccountView, TxView } from "@/lib/types";
 import { useUnlocked } from "@/lib/wallet";
 
 export default function SendPage() {
@@ -32,10 +36,23 @@ type Recipient =
   | { state: "empty" }
   | { state: "checking" }
   /** `signed`: what goes in the transfer; `byChain`: it's the name, and `address` only the node's current answer. */
-  | { state: "ok"; signed: string; address: string; display: string; detail: string; proven?: boolean; byChain?: boolean }
+  | { state: "ok"; signed: string; address: string; display: string; detail: string; name?: string; proven?: boolean; byChain?: boolean }
   | { state: "bad"; msg: string };
 
 const utf8Len = (s: string) => new TextEncoder().encode(s).length;
+const exact = (d: bigint) => displayFang(d, { exact: true });
+
+/** What `/api/account` adds for v1 nodes: what can move now, and why the rest can't. */
+type Account = AccountView & { transferable?: string; locks?: (LockView & { amount: string })[] };
+
+/** The biggest lock, in words that follow "is locked" ("by your vote on proposal #2 until about 21:15"). */
+const lockedBy = (a: Account, head: number, blockMs?: number) => {
+  const l = [...(a.locks ?? [])].sort((x, y) => (BigInt(y.amount) > BigInt(x.amount) ? 1 : BigInt(y.amount) < BigInt(x.amount) ? -1 : 0))[0];
+  return l ? lockWords(l, head, blockMs) : "by a vote or vesting";
+};
+
+/** What the account can send now (transferable less pending), from what the node says. */
+const sendableOf = (a: Account) => movable({ label: a.account, balance: a.balance, transferable: a.transferable, recent: a.recent_txs as unknown as TxDetail[] });
 
 function useRecipient(input: string): Recipient {
   const { client, status } = useUnlocked();
@@ -64,7 +81,7 @@ function useRecipient(input: string): Recipient {
         const res = await client.recipient(q);
         if (!live) return;
         const detail = res.byChain ? `the chain pays its owner when this runs · your node says ${shortAddr(res.address)} (not proven)` : `${shortAddr(res.address)} · proven by ${client.witnesses.length} other node${client.witnesses.length === 1 ? "" : "s"}`;
-        setR({ state: "ok", signed: res.signed, address: res.address, display: `${res.name}.boo`, detail, proven: res.proven, byChain: res.byChain });
+        setR({ state: "ok", signed: res.signed, address: res.address, display: `${res.name}.boo`, name: res.name ?? undefined, detail, proven: res.proven, byChain: res.byChain });
       } catch (e) {
         if (live) setR({ state: "bad", msg: friendly(e) });
       }
@@ -77,8 +94,20 @@ function useRecipient(input: string): Recipient {
   return r;
 }
 
+interface Review {
+  tx: Tx;
+  display: string;
+  proven: boolean;
+  byChain: boolean;
+  nodeSays: string;
+  pf: Preflight | null;
+  blockMs: number;
+  /** When paying this name by name could reach someone else (CRE-5): it lapses soon, or changed hands lately. */
+  risks: string[];
+}
+
 function Send() {
-  const { wallet, account, client, refresh } = useUnlocked();
+  const { wallet, account, client, status, refresh } = useUnlocked();
   const params = useSearchParams();
   const prefilled = params.has("to") || params.has("amount") || params.has("memo");
   // A payment link says which chain it was made for: a check, never a switch. A .boo name can be
@@ -91,25 +120,34 @@ function Send() {
   const [to, setTo] = useState(() => fromLink("to"));
   const [amount, setAmount] = useState(() => fromLink("amount"));
   const [memo, setMemo] = useState(() => fromLink("memo"));
+  const [priority, setPriority] = useState(false);
   useEffect(() => {
     if (!refused) return;
     setTo("");
     setAmount("");
     setMemo("");
   }, [refused]);
-  const [review, setReview] = useState<{ tx: Tx; display: string; proven: boolean; byChain: boolean; nodeSays: string; pf: Preflight | null; blockMs: number } | null>(null);
+  const [review, setReview] = useState<Review | null>(null);
   const [sent, setSent] = useState<TxView | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const recipient = useRecipient(to);
 
+  // What can move now: v1 nodes report `transferable` (vote and vesting locks hold the rest), and
+  // pending payments take theirs first (USER-5, TR-11).
+  const can = account ? sendableOf(account as Account) : null;
   let drops: bigint | null = null;
   let amountErr: string | null = null;
   try {
     if (amount.trim()) {
       drops = parseFang(amount);
       if (drops === 0n) amountErr = "Enter more than zero.";
-      else if (account && drops > BigInt(account.balance)) amountErr = `You only have ${account.balance_display}.`;
+      else if (can && drops > can.available)
+        amountErr = can.locked > 0n
+          ? `You can send up to ${exact(can.available)} now: ${exact(can.locked)} of your balance is locked ${lockedBy(account as Account, status?.height ?? 0, status?.block_time_ms)}.`
+          : can.pending > 0n
+            ? `You can send up to ${exact(can.available)} now, after your pending transactions.`
+            : `You only have ${exact(can.available)}.`;
     }
   } catch {
     amountErr = "Use a number like 1 or 0.25 (up to 9 decimals).";
@@ -118,15 +156,47 @@ function Send() {
   const self = recipient.state === "ok" && recipient.address === wallet.account;
   const canReview = recipient.state === "ok" && drops !== null && !amountErr && !memoErr && !self && !refused && linkCheck?.state !== "pending";
 
+  /**
+   * Builds the transfer. With Priority on, it tips the block's proposer one base fee on top (the
+   * same again), well inside the chain's cap (`tip_cap_multiple` × the base fee, 20× by default).
+   */
+  const build = async (to: string, amount: bigint) => {
+    const action = { type: "transfer" as const, to, amount: amount.toString() };
+    const plain = await wallet.build(action, memo);
+    return priority ? wallet.build(action, memo, { tip: BigInt(plain.fee) }) : plain;
+  };
+
+  /** Everything that can move now, less the fee and what opening their account burns (TR-11). */
+  const fillMax = async () => {
+    if (recipient.state !== "ok") return;
+    setBusy(true);
+    setError(null);
+    try {
+      const [probe, mine, theirs] = await Promise.all([build(recipient.signed, 1n), client.account(wallet.account) as Promise<Account>, client.account(recipient.signed).catch(() => null)]);
+      const opening = BigInt((theirs as { creation_fee?: string } | null)?.creation_fee ?? "0");
+      const free = sendableOf(mine).available;
+      const max = free - BigInt(probe.fee) - opening;
+      if (max > 0n) setAmount(fangInput(max));
+      else setError(`Nothing left to send: the fee${opening ? " and opening their account" : ""} would take all ${exact(free)} you can send now.`);
+    } catch (e) {
+      setError(friendly(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const toReview = async () => {
     if (recipient.state !== "ok" || drops === null) return;
     setBusy(true);
     setError(null);
     try {
       // Build and sign now so the fee shown is exactly what will be paid.
-      const tx = await wallet.build({ type: "transfer", to: recipient.signed, amount: drops.toString() }, memo);
-      // What it will do and whether the chain will take it; the review still works without it.
-      const check = await checkTx(tx, wallet.keyId).catch(() => null);
+      const tx = await build(recipient.signed, drops);
+      // What it will do and whether the chain will take it, and whether the name is risky to pay
+      // by name; the review still works without either.
+      const [check, info] = await Promise.all([checkTx(tx, wallet.keyId).catch(() => null), recipient.name ? (client.name(recipient.name) as Promise<NameInfo>).catch(() => null) : null]);
+      const blockMs = check?.blockMs ?? status?.block_time_ms ?? 1000;
+      const head = status?.height ?? tx.valid_until - 600;
       setReview({
         tx,
         display: recipient.display,
@@ -134,7 +204,8 @@ function Send() {
         byChain: recipient.byChain === true,
         nodeSays: recipient.address,
         pf: check?.pf ?? null,
-        blockMs: check?.blockMs ?? 1000,
+        blockMs,
+        risks: info ? nameRisks(info, { name: recipient.display, head, validUntil: tx.valid_until, signedAsName: recipient.byChain === true, blockMs }) : [],
       });
     } catch (e) {
       setError(friendly(e));
@@ -176,10 +247,15 @@ function Send() {
 
   if (review) {
     const fee = BigInt(review.tx.fee);
+    const tip = BigInt(review.tx.tip ?? "0");
     const amt = BigInt((review.tx.action as { amount: string }).amount);
     // A first payment opens the recipient's account, which burns the creation fee from this one (v1).
     const opening = review.pf && review.pf.cost > amt + fee ? review.pf.cost - amt - fee : 0n;
-    const me = account?.names[0] ?? "You";
+    const me = account?.names[0];
+    const signed = review.tx.action.type === "transfer" ? review.tx.action.to : "";
+    const refusals = review.pf?.refusals.length ?? 0;
+    // A refusal the chain's state settles (balance, locks): no "Send anyway", only Edit.
+    const sure = review.pf?.certain === true;
     return (
       <main className="narrow stack-lg">
         <div className="section-head">
@@ -188,33 +264,58 @@ function Send() {
         </div>
         <section className="card stack">
           <p className="summary">
-            {me} sends {formatFang(amt)} to {review.display}
+            {me ? `${me} sends` : "You send"} {exact(amt)} to {review.display}
           </p>
           <dl className="kv">
             <dt>To</dt>
             <dd>
-              {review.display}
-              {/* Always show exactly what's signed: the address, or the name the chain resolves. */}
-              <div className="mono small break" data-testid="signed-to">{review.tx.action.type === "transfer" ? review.tx.action.to : ""}</div>
+              {/* One line: who it pays, then exactly what's signed (the address, or the name the chain resolves). */}
+              <div className="money-payee" data-testid="payee">
+                Pays{" "}
+                {review.byChain ? (
+                  <>
+                    <b data-testid="signed-to">{signed}</b> · <span className="mono">{shortAddr(review.nodeSays)}</span> <span className="dim small">(your node&apos;s answer)</span>
+                  </>
+                ) : signed === review.nodeSays && review.display !== shortAddr(signed) ? (
+                  <>
+                    <b>{review.display}</b> · <span className="mono break" data-testid="signed-to">{signed}</span>
+                  </>
+                ) : (
+                  <span className="mono break" data-testid="signed-to">{signed}</span>
+                )}
+              </div>
               {review.byChain && (
-                <div className="small" data-testid="by-chain">
-                  Signed as the name: the chain pays whoever owns {review.display} when this transaction runs, so your node can&apos;t point it at another account now. Your node says that&apos;s <span className="mono break">{review.nodeSays}</span> (not proven). A dishonest node could still hold the transaction and release it later (its validity window counts from the height that node reports), after the name changed hands: for a name about to expire, pay the address instead.
-                </div>
+                <details className="money-why" data-testid="by-chain">
+                  <summary>Why is this safe?</summary>
+                  <p className="small">
+                    Signed as the name: the chain pays whoever owns {review.display} when this transaction runs, so your node can&apos;t point it at another account now. Your node says that&apos;s <span className="mono break">{review.nodeSays}</span> (not proven). A dishonest node could still hold the transaction and release it later (its validity window counts from the height that node reports), after the name changed hands.
+                  </p>
+                </details>
+              )}
+              {review.proven && !review.byChain && review.display !== shortAddr(signed) && client.witnesses.length > 0 && (
+                <div className="ok small">Proven by {client.witnesses.length} other node{client.witnesses.length === 1 ? "" : "s"}.</div>
               )}
               {!review.proven && !review.byChain && <div className="warn small">Looked up on your node only, not proven. For a large payment, check this address with the person you&apos;re paying.</div>}
+              {review.risks.map((r) => (
+                <p key={r} className="warn small money-note" data-testid="name-risk">
+                  {r}
+                </p>
+              ))}
             </dd>
             <dt>Amount</dt>
-            <dd>{formatFang(amt)}</dd>
+            <dd>{exact(amt)}</dd>
             <dt>Network fee</dt>
-            <dd>{formatFang(fee)} <span className="dim small">at most (burned)</span></dd>
+            <dd>
+              {exact(fee)} <span className="dim small">at most ({tip > 0n ? <>burned, but for a {exact(tip)} tip to the block&apos;s proposer</> : "burned"})</span>
+            </dd>
             {opening > 0n && (
               <>
                 <dt>Opening their account</dt>
-                <dd data-testid="opening">{formatFang(opening)} <span className="dim small">(burned: this is the first payment to it)</span></dd>
+                <dd data-testid="opening">{exact(opening)} <span className="dim small">(burned: this is the first payment to it)</span></dd>
               </>
             )}
             <dt className="total">Total</dt>
-            <dd className="total"><b>{formatFang(amt + fee + opening)}</b></dd>
+            <dd className="total"><b>{exact(amt + fee + opening)}</b></dd>
             {review.tx.memo && (
               <>
                 <dt>Memo</dt>
@@ -227,12 +328,17 @@ function Send() {
         <Tip>
           The fee is priced by size: post-quantum signatures are about 3.3 KB, so every transaction pays a little for its bytes, and that fee is destroyed rather than paid to anyone.
         </Tip>
+        {/* DRAFT copy for counsel (D4): lib/money-copy.ts. */}
+        <p className="money-final" data-testid="payments-final">{PAYMENTS_FINAL}</p>
         <div className="row-gap">
           <button className="btn" disabled={busy} onClick={() => setReview(null)}>← Edit</button>
-          <button className={`btn grow ${review.pf?.refusals.length ? "" : "primary"}`} disabled={busy} onClick={confirm}>
-            {busy ? <Spinner>Sealing into a block…</Spinner> : review.pf?.refusals.length ? "Send anyway" : "Confirm & send"}
-          </button>
+          {!sure && (
+            <button className={`btn grow ${refusals ? "" : "primary"}`} disabled={busy} onClick={confirm}>
+              {busy ? <Spinner>Sealing into a block…</Spinner> : refusals ? "Send anyway" : "Confirm & send"}
+            </button>
+          )}
         </div>
+        {sure && <p className="dim small" data-testid="cannot-send">The chain would refuse this as it is, so there&apos;s nothing to confirm. Change the amount, or wait for FANG to arrive or unlock.</p>}
         <ErrorNote error={error} />
       </main>
     );
@@ -261,14 +367,30 @@ function Send() {
             <span className="suffix">FANG</span>
           </div>
         </label>
-        <div className="name-status">
-          {amountErr ? <span className="warn">{amountErr}</span> : <span className="dim small">Balance: {account?.balance_display ?? "…"}</span>}
+        <div className="name-status money-amount-row">
+          {amountErr ? (
+            <span className="warn">{amountErr}</span>
+          ) : (
+            <span className="dim small" data-testid="can-send">
+              Can send now: {can ? exact(can.available) : "…"}
+              {can && can.locked > 0n ? ` · ${displayFang(can.locked)} locked` : ""}
+            </span>
+          )}
+          <button type="button" className="btn small ghost" disabled={recipient.state !== "ok" || self || busy || !can} onClick={fillMax} title={recipient.state === "ok" ? "Everything you can send now, less the fee" : "Choose who to pay first"}>
+            Max
+          </button>
         </div>
         <label className="field">
           <span>Memo <span className="dim">(optional, public)</span></span>
           <input value={memo} onChange={(e) => setMemo(e.target.value)} placeholder="trick or treat" />
         </label>
         {memoErr && <span className="warn">{memoErr}</span>}
+        <label className="money-check">
+          <input type="checkbox" checked={priority} onChange={(e) => setPriority(e.target.checked)} />
+          <span>
+            Priority <span className="dim small">(adds a tip for the block&apos;s proposer, the same again as the fee, so busy blocks take it first)</span>
+          </span>
+        </label>
         <button className="btn primary" disabled={!canReview || busy} onClick={toReview}>
           {busy ? <Spinner>Preparing…</Spinner> : "Review"}
         </button>
@@ -277,7 +399,7 @@ function Send() {
       <Tip>
         {client.witnesses.length
           ? <>Names are proven against {client.witnesses.length + 1} independent nodes before you sign, and the review shows the exact address that gets paid.</>
-          : <>A name is signed as the name: the chain pays whoever owns it when the transaction runs, so the node you&apos;re connected to can&apos;t point it at another account now (a dishonest one could only hold the transaction and release it later, by when the name may have changed hands). The review shows exactly what gets signed.</>}
+          : <>A payment to a name is signed as the name: the chain pays whoever owns it when the payment runs. The review shows exactly what gets signed.</>}
       </Tip>
     </main>
   );
