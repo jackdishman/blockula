@@ -59,6 +59,12 @@ jobs:
         run: |
           cargo build --release --locked --manifest-path node/Cargo.toml
           for archive in node/testdata/replay/v1-*; do node/target/release/blockula replay "$archive"; done
+      - name: Python SDK (shared signing vectors and local dev-chain e2e)
+        run: |
+          python3 -m venv .venv-sdk-py
+          .venv-sdk-py/bin/python -m pip install -c sdk-py/constraints.txt ./sdk-py
+          .venv-sdk-py/bin/python -m unittest discover -s sdk-py/tests -v
+          PYTHON=.venv-sdk-py/bin/python bash sdk-py/tests/local-e2e.sh
       # Hybrid X25519 + ML-KEM-768 p2p handshake (vendored commonware-stream, docs/PQ-TRANSPORT.md).
       - run: cargo test --release --locked --manifest-path node/Cargo.toml -p commonware-stream
       - run: bash node/vendor/commonware-stream/verify-vendor.sh

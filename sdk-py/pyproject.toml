@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blockula-sdk"
+version = "0.1.0"
+description = "Minimal synchronous Blockula Python SDK"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = ["blake3>=1.0.8,<2", "pycryptodome>=4.1.0,<5"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

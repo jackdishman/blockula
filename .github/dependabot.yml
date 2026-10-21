@@ -4,6 +4,12 @@
 # review them alone and run the simulator and local testnet.
 version: 2
 updates:
+  - package-ecosystem: pip
+    directory: /sdk-py
+    schedule: { interval: weekly, day: monday }
+    cooldown: { default-days: 7 }
+    open-pull-requests-limit: 5
+    commit-message: { prefix: "deps(python)" }
   # The node (with the vendored p2p stream, a workspace member) and Ghost Mode's core (its own
   # workspace and lockfile), so their exact pins are surfaced too.
   - package-ecosystem: cargo
