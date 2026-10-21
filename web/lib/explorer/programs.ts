@@ -8,6 +8,7 @@
  */
 import type { Action } from "@blockula/sdk";
 import { BLOCKS_PER_DAY } from "../config";
+import { BOND_TERMS, CONTRIBUTION_NOTES_BOTH } from "../creators";
 import type { TermKey } from "./glossary";
 
 /**
@@ -127,7 +128,7 @@ export const PROGRAMS: Program[] = [
       },
     ],
     elsewhere:
-      "Keys join an account only with their own consent, a grant code their holder makes for it, so adding and revoking keys has its own guided flow (grant codes, budgets, expiry) on Devices & agents. Multisig accounts are set up and approved with the CLI (`blockula multisig create`, `propose`, `approve`), which decodes each action before an approval binds it.",
+      "Keys join an account only with their own consent, a grant code their holder makes for it, so adding and revoking keys has its own guided flow (grant codes, budgets, expiry) on Devices & agents. Multisig accounts are set up and approved with the CLI (`blockula multisig create`, `propose`, `approve`), which decodes each action before an approval binds it. Passkey owners can't approve in the wallet yet, and the CLI signs with a key file, so a multisig whose owners are passkeys can't approve anything for now.",
   },
   {
     id: "names",
@@ -217,6 +218,7 @@ export const PROGRAMS: Program[] = [
       { path: "/api/hunt/{id}", what: "one hunt: funders, winner, PR" },
     ],
     calls: ["create_hunt", "fund_hunt", "award_hunt", "cancel_hunt"],
+    elsewhere: CONTRIBUTION_NOTES_BOTH,
     actions: [
       {
         kind: "create_hunt",
@@ -312,7 +314,7 @@ export const PROGRAMS: Program[] = [
       {
         kind: "submit_claim",
         title: "Claim a merged PR",
-        blurb: "Submit a PR you authored (with your linked handle) to a pool repo. A refundable bond is held until it's judged.",
+        blurb: `Submit a PR you authored (with your linked handle) to a pool repo. A bond is held until it's judged: it's ${BOND_TERMS}.`,
         who: "owner keys or a registered Familiar",
         ownerOnly: false,
         params: [
@@ -353,7 +355,7 @@ export const PROGRAMS: Program[] = [
         describe: () => "Withdraw your vested contribution rewards",
       },
     ],
-    elsewhere: "Sealing and revealing Séance votes keeps a secret salt between the two steps, and a sealed judgment binds the pairs it was made on, so jurors use the CLI: `blockula contrib vote`, then `blockula contrib reveal`.",
+    elsewhere: `Sealing and revealing Séance votes keeps a secret salt between the two steps, and a sealed judgment binds the pairs it was made on, so jurors use the CLI: \`blockula contrib vote\`, then \`blockula contrib reveal\`. ${CONTRIBUTION_NOTES_BOTH}`,
   },
   {
     id: "validators",

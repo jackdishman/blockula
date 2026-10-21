@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { Loading, NotFound, plural, Section, StatusPill, Term, useMe, Who } from "@/components/explorer/kit";
+import { ContributionNote } from "@/components/creators";
 import { claimPill } from "@/components/explorer/ProgramState";
 import { useNode } from "@/lib/explorer/node";
 import { to } from "@/lib/explorer/routes";
@@ -41,6 +42,7 @@ export default function SeancePage() {
           </p>
         )}
       </section>
+      <ContributionNote />
       <div className="cols">
         <Section title={`Claims (${s.claims.length})`}>
           <ul className="ledger">
