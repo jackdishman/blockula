@@ -1,12 +1,12 @@
 # 🧛 Blockula
 
-**The post-quantum blockchain that never dies.** Wallets unlocked by passkeys, human-readable `.boo` names, an explorer that explains itself, and an SDK + MCP server so any coding agent can use it, or run its own copy, from one prompt.
+**Launch your own quantum-safe ledger.** One command starts a chain; your friends' computers join it. Post-quantum signatures throughout, wallets unlocked by passkeys, human-readable `.boo` names, an explorer that explains itself, and an SDK + MCP server so any coding agent can use it, or run its own copy, from one prompt. It runs on machines you already have: no hosting to pay for and nothing to buy. **[Launch a chain →](docs/LAUNCH.md)**
 
 Quantum entanglement is literally "spooky action at a distance". We took that personally.
 
 | | |
 |---|---|
-| Token | **FANG** (1 FANG = 10⁹ drops 🩸) |
+| Unit | **FANG** (1 FANG = 10⁹ drops 🩸): each chain's own, handed out by its faucet to pay fees. It has no value: nobody sells it, buys it or gets paid in it |
 | Signatures | **ML-DSA-65** (NIST FIPS 204), no elliptic curves on-chain |
 | Hashing | BLAKE3-256 |
 | Network | Validators key their channels with hybrid X25519 + **ML-KEM-768** (FIPS 203) and authenticate with ML-DSA-65 |
@@ -23,7 +23,7 @@ Quantum entanglement is literally "spooky action at a distance". We took that pe
 
 What it is, on one page: [docs/ONE_PAGER.md](docs/ONE_PAGER.md).
 
-**It's a testnet.** Testnet FANG, Hunts and Soul have no monetary value and come with no promise of any mainnet allocation.
+**It's a testnet.** Testnet FANG, Hunts and Soul have no monetary value. Blockula isn't launching a mainnet or selling a token: it's software for running your own ledger.
 
 ## npm packages
 
@@ -50,7 +50,7 @@ Prebuilt for macOS (Apple Silicon and Intel) and Linux (x64 and arm64). The scri
 
 ## Contribute
 
-> Testnet FANG, Hunts and Soul have no monetary value and come with no promise of any mainnet allocation.
+> Testnet FANG, Hunts and Soul have no monetary value.
 
 Open **Hunts** are [issues labeled `hunt`](https://github.com/jackdishman/blockula/issues?q=is%3Aopen+label%3Ahunt), each with acceptance criteria and a testnet FANG bounty. Agents are welcome as Familiars. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -129,10 +129,16 @@ Then paste the prompt from [AGENTS.md](AGENTS.md). With no local node running, i
 same binary runs a 1-validator chain or a multi-validator network. Validators can be added and
 removed on-chain without a new genesis; the set changes at **epoch** boundaries.
 
+**To run a chain with friends on their own computers, follow [docs/LAUNCH.md](docs/LAUNCH.md):** start it with `--host <your address>` (a Tailscale address works), and they join, become validators and get approved in a few commands. A summoned chain makes a block every 5 seconds by default, which keeps an idle validator's traffic to about a fifth of 1-second blocks; `--block-time-ms 1000` makes it faster.
+
 ```bash
-# one validator (HTTP on 7070)
+# one validator (HTTP on 7070), for this machine only
 blockula summon mychain
 blockula run --home ~/.blockula/mychain
+
+# one other machines reach: published at <your address>:30300 (p2p) and :7070 (HTTP)
+blockula summon mychain --host <your address>
+blockula run --home ~/.blockula/mychain --bind 0.0.0.0
 
 # a local 4-validator testnet: ~/.blockula/mynet/v0 … v3, ports picked automatically
 blockula summon mynet --validators 4
@@ -144,9 +150,9 @@ blockula run --home ~/.blockula/mynet/v0     # repeat for v1, v2, v3 (each print
 blockula join --genesis http://127.0.0.1:<v0 http port> --genesis-hash <hash> --home ~/.blockula/mynet-full --port 7171
 ```
 
-`summon` is for chains you run for yourself: it gives the first validator's account (or each `--admin`) the validator-admin levers of dev and test chains (pin or remove a validator), which mainnet doesn't have.
+`summon` is for chains you run for yourself: it gives the first validator's account (or each `--admin`) the validator-admin levers of dev and test chains (pin or remove a validator), which a chain whose genesis is built from a spec (below) doesn't have.
 
-**On public servers**, build the genesis the way mainnet's is built, with no admin keys (the validators pass proposals as the bootstrap council):
+**On public servers**, build the genesis from a spec, with no admin keys (the validators pass proposals as the bootstrap council):
 1. Each operator writes its public entry offline: `blockula genesis operator --chain-id pubnet --key validator.key --owner <owner account> --p2p-addr 203.0.113.10:30300 --http-addr https://… --out v0.toml` (the addresses peers will dial).
 2. `blockula genesis build --spec spec.toml --out genesis.json` turns a reviewed spec (allocations by bucket with their vesting, the operator files, parameters, reserved names, the contribution pool) into the same `genesis.json` and hash on every machine. `deploy/launch.sh` does both for the public testnet ([deploy/README.md](deploy/README.md)); `deploy/mainnet/genesis-spec.example.toml` is mainnet's shape.
 3. Each server runs `blockula run --home <its home, holding genesis.json and its validator.key> --bind 0.0.0.0` (or `--bind ::`).
@@ -155,7 +161,7 @@ blockula join --genesis http://127.0.0.1:<v0 http port> --genesis-hash <hash> --
 
 Full nodes: `blockula join --genesis genesis.json --genesis-hash <hash> --home full --bind 0.0.0.0 --port 7171` (`blockula checkpoint --genesis genesis.json` prints the hash). On a chain older than its weak-subjectivity period (half the evidence window: ~10.5 days on mainnet, 3.5 days on the public testnet), also pass a recent `--checkpoint` ([OPERATIONS.md, Weak subjectivity](docs/OPERATIONS.md#weak-subjectivity)).
 
-Mainnet's genesis is built the same way, by independent operators in a ceremony: [docs/GENESIS_CEREMONY.md](docs/GENESIS_CEREMONY.md).
+A public network's genesis can be built the same way, by independent operators in a ceremony: [docs/GENESIS_CEREMONY.md](docs/GENESIS_CEREMONY.md).
 
 Any node accepts txs, which are gossiped to the leader. On chains with a faucet, any node also accepts faucet requests: genesis validators pay from their own accounts, and other nodes forward the request. A forwarded request is never forwarded again.
 
@@ -222,7 +228,7 @@ blockula validator unjail boo1… --key ~/val/validator.key --rpc https://<any n
 blockula validator list --rpc https://<any node>
 ```
 
-Chains made with `blockula summon` also have validator admins, who can pin a validator ahead of stake (`blockula validator approve`) or remove one (`blockula validator remove`). Mainnet and the public testnet have none: there, stake alone decides the set.
+Chains made with `blockula summon` also have validator admins, who can pin a validator ahead of stake (`blockula validator approve`) or remove one (`blockula validator remove`). The public testnet has none, and neither does a genesis built from a spec (above): there, stake alone decides the set.
 
 The p2p transport authenticates peers with ML-DSA-65 and derives its ChaCha20-Poly1305 keys from a
 hybrid X25519 + ML-KEM-768 exchange, so recorded traffic stays private unless both are broken
@@ -238,10 +244,10 @@ sdk-ts/   @blockula/sdk: wallets, tx signing, client, passkey (WebAuthn PRF) hel
 mcp/      @blockula/mcp: MCP server for coding agents
 web/      Passkey web wallet (Next.js), deployed at testnet.blockula.app
 deploy/   Fly.io testnet: Dockerfile, entrypoint, launch.sh
-docs/     ONE_PAGER.md (what this is), PLAN.md (architecture, tokenomics, roadmap), MAINNET.md (launch readiness),
-          MAINNET-DESIGN.md (mainnet decisions and spec), TOKENOMICS.md (mainnet supply and allocation)
+docs/     LAUNCH.md (launch your own ledger), ONE_PAGER.md (what this is), PLAN.md (architecture, roadmap),
+          MAINNET.md, MAINNET-DESIGN.md, TOKENOMICS.md (the value-bearing mainnet that was planned, then dropped)
 ```
 
 ## Status
 
-Public testnet live (Phase 1), with Hunts and Proof of Contribution v1 (Phases 1.5–2). An internal four-track security and product review was completed and its findings fixed. **No third-party audit yet: test value only.** See [docs/PLAN.md](docs/PLAN.md), and [docs/MAINNET.md](docs/MAINNET.md) for what stands between this and a mainnet. Report vulnerabilities privately: [SECURITY.md](SECURITY.md).
+Public testnet live (Phase 1), with Hunts and Proof of Contribution v1 (Phases 1.5–2). An internal four-track security and product review was completed and its findings fixed. **No third-party audit yet: test value only.** Blockula isn't launching a mainnet: it's a kit for running your own ledger ([docs/LAUNCH.md](docs/LAUNCH.md)). See [docs/PLAN.md](docs/PLAN.md); [docs/MAINNET.md](docs/MAINNET.md) records what a value-bearing mainnet would have needed. Report vulnerabilities privately: [SECURITY.md](SECURITY.md).

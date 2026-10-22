@@ -71,7 +71,7 @@ for p in $(seq "$PORT" $((PORT + 4))); do
 done
 echo "📁 $DIR ($("$BIN" --version 2>/dev/null || echo "$BIN"))"
 
-"$BIN" summon testnet --home "$DIR" --validators 3 --epoch-blocks "$EPOCH" --dev-durations >"$DIR/summon.txt"
+"$BIN" summon testnet --home "$DIR" --validators 3 --block-time-ms 1000 --epoch-blocks "$EPOCH" --dev-durations >"$DIR/summon.txt"
 GHASH=$(grep -o 'genesis hash: [0-9a-f]*' "$DIR/summon.txt" | awk '{print $3}')
 addr() { node -e "console.log(require('$DIR/genesis.json').validators[$1].http_addr)"; }
 status() { curl -sf -m 3 "http://$1/api/status"; }

@@ -1905,12 +1905,32 @@ pub struct SummonOpts {
     /// Genesis `params` overrides (`blockula dev` shortens durations with
     /// `ChainParams::dev_overrides`). `min_bond`, when set, wins for `min_self_bond`.
     pub params: BTreeMap<String, u64>,
+    /// Where other machines reach the validators (an IP or a DNS name): validator i is published
+    /// at `host:30300+i` (p2p) and `host:7070+i` (HTTP). `None`: 127.0.0.1 with free ports, a
+    /// chain for this machine only.
+    pub host: Option<String>,
 }
 
 impl SummonOpts {
     pub fn new(chain_id: &str, validators: usize) -> Self {
-        Self { chain_id: chain_id.into(), faucet: true, block_time_ms: 1000, validators, http_port: None, admins: vec![], epoch_blocks: default_epoch_blocks(), min_bond: None, contribution: None, address_prefix: default_address_prefix(), params: BTreeMap::new() }
+        Self { chain_id: chain_id.into(), faucet: true, block_time_ms: 1000, validators, http_port: None, admins: vec![], epoch_blocks: default_epoch_blocks(), min_bond: None, contribution: None, address_prefix: default_address_prefix(), params: BTreeMap::new(), host: None }
     }
+}
+
+/// The p2p and HTTP ports `summon --host` publishes validator `i` at: the defaults, counted up.
+pub const SUMMON_P2P_PORT: u16 = 30300;
+pub const SUMMON_HTTP_PORT: u16 = 7070;
+
+/// `summon`'s default epoch: about 10 minutes of blocks (600 at 1-second blocks, as before).
+pub fn summon_epoch_blocks(block_time_ms: u64) -> u64 {
+    (600_000 / block_time_ms.max(1)).max(2)
+}
+
+/// `host` as it goes before `:port` (an IPv6 address in brackets), checked as an address.
+fn summon_host(host: &str) -> Result<String> {
+    let h = if host.contains(':') && !host.starts_with('[') { format!("[{host}]") } else { host.to_string() };
+    check_host_port(&format!("{h}:{SUMMON_P2P_PORT}")).map_err(|_| anyhow!("--host must be an IP address or a DNS name, got {host:?}"))?;
+    Ok(h)
 }
 
 /// How far behind the (claimed) network height still counts as synced.
@@ -2448,7 +2468,7 @@ fn state_records(state: &State) -> impl FnMut(store::RecordSink) -> Result<()> +
 impl Chain {
     /// Creates a new chain. With one validator, `home` gets genesis.json + validator.key.
     /// With N > 1, `home/v0 … home/v{N-1}` each get the shared genesis and their own key,
-    /// with localhost ports picked automatically.
+    /// with localhost ports picked automatically, or the ones `host` publishes them at.
     pub fn summon(home: &Path, o: &SummonOpts) -> Result<Vec<PathBuf>> {
         let (chain_id, faucet, block_time_ms, validators, http_port) = (o.chain_id.as_str(), o.faucet, o.block_time_ms, o.validators, o.http_port);
         let prefix = o.address_prefix.as_str();
@@ -2469,14 +2489,25 @@ impl Chain {
         if let Some(t) = &o.contribution {
             t.check()?;
         }
+        let host = o.host.as_deref().map(summon_host).transpose()?;
+        if host.is_some() && validators > usize::from(u16::MAX - SUMMON_P2P_PORT) + 1 {
+            bail!("--host publishes validator i at port {SUMMON_P2P_PORT} + i: at most {} validators", u16::MAX - SUMMON_P2P_PORT + 1);
+        }
         let keys: Vec<Keys> = (0..validators).map(|_| Keys::generate()).collect();
         let mut infos = vec![];
         for (i, k) in keys.iter().enumerate() {
-            let http = match (i, http_port) {
-                (0, Some(p)) => p,
-                _ => free_port()?,
+            let (p2p_addr, http_addr) = match &host {
+                // Fixed ports, so the machine's firewall and port forwards can be set up before the start.
+                Some(h) => (format!("{h}:{}", SUMMON_P2P_PORT + i as u16), format!("{h}:{}", SUMMON_HTTP_PORT + i as u16)),
+                None => {
+                    let http = match (i, http_port) {
+                        (0, Some(p)) => p,
+                        _ => free_port()?,
+                    };
+                    (format!("127.0.0.1:{}", free_port()?), format!("127.0.0.1:{http}"))
+                }
             };
-            infos.push(ValidatorInfo { address: k.address_with(prefix), public_key: hex::encode(k.public_key()), p2p_addr: format!("127.0.0.1:{}", free_port()?), http_addr: format!("127.0.0.1:{http}") });
+            infos.push(ValidatorInfo { address: k.address_with(prefix), public_key: hex::encode(k.public_key()), p2p_addr, http_addr });
         }
         let per_validator = 1_000_000_000 * DROPS_PER_FANG / validators as u64;
         let mut allocations: Vec<Allocation> = keys.iter().map(|k| Allocation { address: k.address_with(prefix), amount: per_validator, vesting: None, label: None }).collect();
@@ -4222,6 +4253,39 @@ mod tests {
         assert_eq!(c.height(), 2);
         assert_eq!(c.state.primary_name(&alice.address()).unwrap(), "alice.boo");
         fs::remove_dir_all(home).ok();
+    }
+
+    /// `summon --host`: other machines reach the validators at the host, on fixed ports counted up
+    /// from the defaults, and each operator's proof of possession signs those addresses (the
+    /// genesis checks it). Without a host the chain stays on 127.0.0.1.
+    #[test]
+    fn summon_publishes_its_validators_at_the_host() {
+        let base = std::env::temp_dir().join(format!("blockula-host-{}-{}", now_ms(), std::process::id()));
+        let summon = |name: &str, host: Option<&str>, validators: usize| {
+            let home = base.join(name);
+            Chain::summon(&home, &SummonOpts { host: host.map(String::from), ..SummonOpts::new("hosted", validators) }).map(|_| Genesis::load(&home.join("genesis.json")).unwrap())
+        };
+        let addrs = |g: &Genesis| g.validators.iter().map(|v| (v.p2p_addr.clone(), v.http_addr.clone())).collect::<Vec<_>>();
+        let g = summon("dns", Some("ledger.example.org"), 2).unwrap();
+        assert_eq!(addrs(&g), [("ledger.example.org:30300".into(), "ledger.example.org:7070".into()), ("ledger.example.org:30301".into(), "ledger.example.org:7071".into())]);
+        assert_eq!(g.operators.iter().map(|o| (o.p2p_addr.clone(), o.http_addr.clone())).collect::<Vec<_>>(), addrs(&g), "the stake records publish the same addresses");
+        g.check().unwrap();
+        // A Tailscale address, and an IPv6 one (bracketed before its port).
+        assert_eq!(addrs(&summon("tailnet", Some("100.101.102.103"), 1).unwrap()), [("100.101.102.103:30300".into(), "100.101.102.103:7070".into())]);
+        assert_eq!(addrs(&summon("v6", Some("fd00::1"), 1).unwrap()), [("[fd00::1]:30300".into(), "[fd00::1]:7070".into())]);
+        for (i, bad) in ["two words", "", "host/path"].into_iter().enumerate() {
+            let err = summon(&format!("bad{i}"), Some(bad), 1).unwrap_err().to_string();
+            assert!(err.contains("--host must be an IP address or a DNS name"), "{bad:?}: {err}");
+        }
+        let local = summon("local", None, 2).unwrap();
+        assert!(local.validators.iter().all(|v| v.p2p_addr.starts_with("127.0.0.1:") && v.http_addr.starts_with("127.0.0.1:")));
+        fs::remove_dir_all(base).ok();
+    }
+
+    /// `summon`'s default epoch is about 10 minutes of blocks, as 600 one-second blocks were.
+    #[test]
+    fn summon_epochs_last_about_ten_minutes() {
+        assert_eq!([1_000, 5_000, 2_000, 60_000, 600_000, 0].map(summon_epoch_blocks), [600, 120, 300, 10, 2, 600_000]);
     }
 
     fn signed(c: &Chain, from: &str, keys: &Keys, nonce: u64, action: Action) -> Tx {
