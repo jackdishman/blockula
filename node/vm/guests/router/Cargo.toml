@@ -1,0 +1,12 @@
+[package]
+name = "router"
+description = "Calls the token on its own behalf, by call and try_call: the guests' cross-program caller."
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+abi = { path = "../abi" }

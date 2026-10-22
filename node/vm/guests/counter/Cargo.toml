@@ -1,0 +1,12 @@
+[package]
+name = "counter"
+description = "The smallest stateful program: one u64 in storage."
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+abi = { path = "../abi" }

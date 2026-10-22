@@ -1,0 +1,28 @@
+# The test programs (docs/PROGRAMS-PLAN.md S2), written by hand against host ABI v1 and built for
+# wasm32v1-none by build.sh, which copies them to ../tests/programs/.
+#
+# Its own workspace, like node/vm and node/ghost: profiles are per workspace, and a program's
+# (opt-level "z", panic = "abort") must never reach the node's.
+[workspace]
+members = ["abi", "counter", "token", "escrow", "router"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+version = "0.0.0"
+publish = false
+
+# Size-optimized and reproducible. No wasm-opt: binaryen
+# enables sign-ext by default and rewrites `x << 56 >> 56` into `i64.extend8_s`, which the engine
+# configuration refuses.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+# Drops the name, producers and target_features sections and core's DWARF; also what
+# `--compress-relocations` (.cargo/config.toml) needs.
+strip = true
+overflow-checks = true
+incremental = false

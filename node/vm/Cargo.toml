@@ -1,0 +1,48 @@
+[package]
+name = "blockula-vm"
+version = "0.1.0"
+edition = "2024"
+publish = false
+# The repo's license (LICENSE), as the node's: cargo-deny reads it once the node depends on this.
+license = "MIT"
+description = "Programs (protocol v2): the engine-neutral VM, upload validation, the host ABI, metering and the overlay (docs/PROGRAMS.md 4, 5, 6, 8, 10)."
+
+# Its own workspace, like node/ghost: its pins and profiles never touch the node's.
+[workspace]
+
+[dependencies]
+blake3 = "=1.8.7"
+# Upload validation (validate.rs), the gatekeeper parser: pinned on its own, since what it accepts
+# is consensus. Without its defaults (hash collections, simd, serde, the component model).
+wasmparser = { version = "=0.228.0", default-features = false, features = ["std", "validate", "features", "prefer-btree-collections"] }
+# The engine (D1): soroban-wasmi, pinned exactly (docs/PROGRAMS.md 4.1). Any bump is a consensus
+# change, made with a protocol version.
+soroban-wasmi = "=29.0.0"
+# wasmi 0.38.0, the last audited wasmi release, as a differential oracle for tests only
+# (`--features ref038`): never what a node runs. `no-hash-maps` is one of its defaults: without it
+# wasmi_collections uses hashbrown with a random state, so `default-features = false` must name it.
+wasmi = { version = "=0.38.0", default-features = false, features = ["std", "no-hash-maps"], optional = true }
+
+[features]
+# `MemHost`, an in-memory chain for tests, benches and fuzzing. Never in a node build.
+testing = []
+# The wasmi 0.38 reference backend: every test that runs on `EngineKind::ALL` runs on it too.
+ref038 = ["dep:wasmi", "testing"]
+
+[dev-dependencies]
+# The crate itself with `testing`, so its tests, benches and the guests' checks get `MemHost`.
+blockula-vm = { path = ".", features = ["testing"] }
+wat = "1"
+
+# Calibration (`cargo bench --bench calibrate`): plain std timing, no harness.
+[[bench]]
+name = "calibrate"
+harness = false
+
+# Only this workspace's profiles apply to its own builds (tests, benches, fuzzing). Once the node
+# depends on this crate, node/Cargo.toml's profiles apply instead, and must list it and the engine's
+# crates (README.md, "Overflow checks").
+[profile.release]
+overflow-checks = true
+[profile.bench]
+overflow-checks = true

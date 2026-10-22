@@ -4,10 +4,11 @@
 # review them alone and run the simulator and local testnet.
 version: 2
 updates:
-  # The node (with the vendored p2p stream, a workspace member) and Ghost Mode's core (its own
-  # workspace and lockfile), so their exact pins are surfaced too.
+  # The node (with the vendored p2p stream, a workspace member), Ghost Mode's core and the programs
+  # engine with its test guests (each its own workspace and lockfile), so their exact pins are
+  # surfaced too.
   - package-ecosystem: cargo
-    directories: ["/node", "/node/ghost"]
+    directories: ["/node", "/node/ghost", "/node/vm", "/node/vm/guests"]
     schedule: { interval: weekly, day: monday }
     cooldown: { default-days: 7 }
     open-pull-requests-limit: 5
@@ -17,14 +18,21 @@ updates:
       # decides a consensus format, the state root, signatures, keys or the transport: the record
       # encoding and state maps (borsh, imbl), the database format (redb), the tx JSON parser
       # (serde_json), consensus and its crypto (commonware-*, ml-dsa, blake3, bech32), Ghost Mode's
-      # STARK (p3-*), the transport's KEM and key handling (ml-kem, x25519-dalek, zeroize). A bump
+      # STARK (p3-*), the transport's KEM and key handling (ml-kem, x25519-dalek, zeroize), the
+      # programs engine and its upload parser (soroban-wasmi and its wasmi_* crates, wasmparser*;
+      # wasmi, the test oracle). A bump
       # can change block validity without a protocol version, which only a network of old and new
       # binaries would show: its PR is reviewed alone, with the simulator, the local testnet and a
       # mixed-version run, never merged as part of the catch-all batch below (audit F78).
       consensus-and-crypto:
-        patterns: ["commonware-*", "ml-dsa", "ml-kem", "blake3", "bech32", "borsh", "borsh-*", "imbl", "imbl-*", "redb", "serde_json", "arc-swap", "p3-*", "x25519-dalek", "zeroize", "getrandom", "rand_core"]
+        patterns: ["commonware-*", "ml-dsa", "ml-kem", "blake3", "bech32", "borsh", "borsh-*", "imbl", "imbl-*", "redb", "serde_json", "arc-swap", "p3-*", "x25519-dalek", "zeroize", "getrandom", "rand_core", "soroban-wasmi", "wasmi", "wasmi_*", "wasmparser*"]
       cargo:
         patterns: ["*"]
+    ignore:
+      # wasmi 0.38.0 is node/vm's test-only differential oracle (`ref038`), the last audited
+      # release, kept there on purpose: only its patch releases are proposed.
+      - dependency-name: wasmi
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
 
   - package-ecosystem: npm
     directory: /

@@ -46,7 +46,11 @@ jobs:
       - name: Rust toolchain (rust-toolchain.toml)
         run: rustup toolchain install && rustc --version
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with: { workspaces: node }
+        with:
+          # The node's workspace and the programs engine's (its own, like node/ghost).
+          workspaces: |
+            node
+            node/vm
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with: { node-version: 22, cache: npm }
       - run: npm ci
@@ -64,6 +68,15 @@ jobs:
       - run: bash node/vendor/commonware-stream/verify-vendor.sh
       # Ghost Mode core (disabled at genesis, docs/GHOST-MODE.md).
       - run: cargo test --release --locked --manifest-path node/ghost/Cargo.toml
+      # The programs engine (protocol v2, docs/PROGRAMS.md, node/vm/README.md), then again with the
+      # wasmi 0.38 differential oracle running every test beside soroban-wasmi (`ref038`: every
+      # receipt but its fuel must agree).
+      - run: cargo test --release --locked --manifest-path node/vm/Cargo.toml
+      - run: cargo test --release --locked --manifest-path node/vm/Cargo.toml --features ref038
+      # The committed guests (node/vm/tests/programs/*.wasm) rebuild byte for byte from their
+      # sources with the pinned compiler: this Linux build is the reference.
+      - name: Programs engine guests rebuild byte for byte (node/vm/guests/build.sh --check)
+        run: rustup target add wasm32v1-none --toolchain 1.98.1 && node/vm/guests/build.sh --check
       - run: npm run build -w @blockula/sdk && npm run build -w @blockula/mcp
       - name: 4 validators + full node + SDK e2e + CLI
         run: bash scripts/local-testnet.sh
@@ -129,9 +142,12 @@ jobs:
       - name: Rust toolchain (rust-toolchain.toml)
         run: rustup toolchain install && rustc --version
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with: { workspaces: node }
-      # Blocking: correctness, suspicious, perf and a few restriction lints. The style and
-      # complexity count goes to the job summary.
+        with:
+          workspaces: |
+            node
+            node/vm
+      # Blocking: correctness, suspicious, perf and a few restriction lints, on the node and the
+      # programs engine. The style and complexity count goes to the job summary.
       - run: scripts/clippy.sh
 
   deps:
@@ -150,6 +166,8 @@ jobs:
           sudo install -m 755 /tmp/cargo-deny /usr/local/bin/cargo-deny
       # Advisories (RustSec), licenses, bans and sources, per deny.toml.
       - run: cargo deny --manifest-path node/Cargo.toml --locked check
+      # The programs engine's own workspace and lockfile (node/vm), under the same policy.
+      - run: cargo deny --manifest-path node/vm/Cargo.toml --locked check
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with: { node-version: 22 }
       # Blocking for what ships (SDK, MCP, wallet); dev tooling is reported only.

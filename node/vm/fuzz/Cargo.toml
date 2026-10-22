@@ -1,0 +1,41 @@
+# cargo-fuzz crate for the programs engine (docs/PROGRAMS-PLAN.md S4): upload validation and the
+# executor, `program_validate` and `program_exec` (plan C1, C8), under AddressSanitizer. See
+# README.md.
+[package]
+name = "blockula-vm-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+# The engine crate with `MemHost` (`testing`). `ref038` is left off: the fuzzers exercise the
+# engine a node runs, not the reference.
+blockula-vm = { path = "..", features = ["testing"] }
+
+# Like node/vm's release build (and the node's): arithmetic overflow panics instead of wrapping.
+[profile.release]
+debug = 1
+overflow-checks = true
+
+[[bin]]
+name = "program_validate"
+path = "fuzz_targets/program_validate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "program_exec"
+path = "fuzz_targets/program_exec.rs"
+test = false
+doc = false
+bench = false
+
+# Its own workspace, so cargo-fuzz's instrumented build never touches node/vm's or the node's.
+[workspace]
+members = ["."]
