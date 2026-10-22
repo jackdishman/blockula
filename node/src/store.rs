@@ -604,10 +604,23 @@ impl Snap {
 
     /// An account's newest history entries (height, tx index), newest first.
     pub fn history(&self, account: &str, limit: usize) -> Result<Vec<(u64, usize)>> {
+        self.history_range(account, None, limit)
+    }
+
+    /// An account's history entries (height, tx index) before the entry `before` (exclusive;
+    /// `None`: from the newest), newest first, at most `limit`: one page of a cursor over the
+    /// index, which is keyed `(account, height, index)`, so a page is one range read.
+    pub fn history_range(&self, account: &str, before: Option<(u64, u32)>, limit: usize) -> Result<Vec<(u64, usize)>> {
         let mut lo = account.as_bytes().to_vec();
         lo.push(0);
-        let mut hi = account.as_bytes().to_vec();
-        hi.push(1);
+        let hi = match before {
+            Some((height, idx)) => history_key(account, height, idx),
+            None => {
+                let mut hi = account.as_bytes().to_vec();
+                hi.push(1);
+                hi
+            }
+        };
         let mut out = vec![];
         for r in self.history.range(lo.as_slice()..hi.as_slice()).map_err(storage)?.rev().take(limit) {
             let (k, _) = r.map_err(storage)?;
@@ -1140,6 +1153,38 @@ mod tests {
         }
         assert!(tx_spans(&line, &txs[..2]).is_empty(), "the wrong tx list");
         assert!(tx_spans(b"{\"height\":1}", &txs).is_empty());
+    }
+
+    /// `history_range` pages one account's rows by a `(height, index)` cursor: newest first, the
+    /// cursor itself excluded (it's the previous page's last row), a cursor that isn't a row
+    /// works, and an address that's a prefix of another never reads the other's rows.
+    #[test]
+    fn history_ranges_page_one_account_by_cursor() {
+        let d = dir("history");
+        let store = Store::open(&d.join("state.redb")).unwrap();
+        let mut point = CommitPoint { format: 0, schema: 0, genesis_hash: String::new(), height: 0, block_hash: String::new(), root: [0; 32], root_child: vec![], base: 0, pruned_below: 0, records: 0, blocks_end: (0, 0), cblocks_end: (0, 0) };
+        let (a, ab) = ("boo1a", "boo1ab");
+        let rows: [(u64, Vec<(u32, &str)>); 4] = [(1, vec![(0, a), (1, ab)]), (2, vec![(0, a), (2, a)]), (3, vec![(0, ab)]), (4, vec![(5, a)])];
+        for (height, history) in rows {
+            let m = BlockMeta { hash: [height as u8; 32], prev_hash: [0; 32], state_root: [0; 32], timestamp_ms: height, proposer: String::new(), tx_count: 0, failed_count: 0, block: Pos::default(), cblock: None, txs: vec![], tx_spans: vec![], failed: vec![], history: history.into_iter().map(|(i, who)| (i, who.to_string())).collect(), version: 1, signal: 1, base_fee: None };
+            point.height = height;
+            store.commit(Commit { point: &mut point, records: &[], nodes: &[], block: Some(&m), epoch_head: false, cert: None, prune_below: 0, durable: false }).unwrap();
+        }
+        let snap = store.snapshot().unwrap();
+        let page = |who: &str, before: Option<(u64, u32)>, limit: usize| snap.history_range(who, before, limit).unwrap();
+        assert_eq!(page(a, None, 10), [(4, 5), (2, 2), (2, 0), (1, 0)]);
+        assert_eq!(snap.history(a, 2).unwrap(), [(4, 5), (2, 2)]);
+        assert_eq!(page(a, Some((4, 5)), 2), [(2, 2), (2, 0)], "after the previous page's last row");
+        assert_eq!(page(a, Some((2, 2)), 10), [(2, 0), (1, 0)]);
+        assert_eq!(page(a, Some((2, 1)), 10), [(2, 0), (1, 0)], "a cursor that isn't a row");
+        assert_eq!(page(a, Some((1, 0)), 10), []);
+        assert_eq!(page(a, Some((u64::MAX, u32::MAX)), 1), [(4, 5)]);
+        assert_eq!(page(ab, None, 10), [(3, 0), (1, 1)]);
+        assert_eq!(page(ab, Some((3, 0)), 10), [(1, 1)]);
+        assert_eq!(page("boo1", None, 10), [], "a prefix of both");
+        drop(snap);
+        drop(store);
+        fs::remove_dir_all(d).ok();
     }
 
     #[test]
