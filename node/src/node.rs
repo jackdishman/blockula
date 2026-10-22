@@ -33,7 +33,13 @@ async fn serve_http(node: Node, bind: SocketAddr) {
         }
     };
     let port = bind.port();
-    println!("🦇 Explorer:  http://localhost:{port}\n🔌 API:       http://localhost:{port}/api/status   (bound to {bind})\n📁 Data:      {}", home.display());
+    // The address it answers on here: localhost for a loopback or every-interface bind.
+    let host = match bind {
+        _ if bind.ip().is_loopback() || bind.ip().is_unspecified() => "localhost".to_string(),
+        SocketAddr::V6(a) => format!("[{}]", a.ip()),
+        SocketAddr::V4(a) => a.ip().to_string(),
+    };
+    println!("🦇 Explorer:  http://{host}:{port}\n🔌 API:       http://{host}:{port}/api/status   (bound to {bind})\n📁 Data:      {}", home.display());
     if let Err(e) = axum::serve(listener, api::router(node).into_make_service_with_connect_info::<SocketAddr>()).await {
         eprintln!("http server failed: {e}");
     }
@@ -48,6 +54,10 @@ fn port_of(addr: &str) -> Option<u16> {
 #[derive(Clone, Debug)]
 pub struct NetOpts {
     pub bind: String,
+    /// `--http-bind`: the interface HTTP listens on, if not `bind` (OPERATOR-2).
+    pub http_bind: Option<String>,
+    /// `--p2p-bind`: the interface p2p listens on, if not `bind`.
+    pub p2p_bind: Option<String>,
     pub http_port: Option<u16>,
     /// `local` allows private/loopback peer addresses; `recommended` is for public networks.
     /// Default: `local` when our advertised p2p host is private, else `recommended`.
@@ -70,6 +80,18 @@ pub struct NetOpts {
     /// `--network-halted-at`: the operator says the network halted at this height, which lets
     /// slashing protection's restart rule escape there when no HTTP peer answers (protection.rs).
     pub network_halted_at: Option<u64>,
+}
+
+impl NetOpts {
+    /// The interface HTTP listens on: `--http-bind`, else `--bind`.
+    pub fn http_iface(&self) -> &str {
+        self.http_bind.as_deref().unwrap_or(&self.bind)
+    }
+
+    /// The interface p2p listens on: `--p2p-bind`, else `--bind`.
+    pub fn p2p_iface(&self) -> &str {
+        self.p2p_bind.as_deref().unwrap_or(&self.bind)
+    }
 }
 
 /// How many blocks a node keeps on disk.
@@ -362,6 +384,61 @@ async fn peer_tip(client: &reqwest::Client, peer: &str, genesis_hash: &str) -> O
     ["height", "finalized_height", "network_height_claimed"].iter().filter_map(|k| v[*k].as_u64()).max()
 }
 
+/// One scheduled upgrade as a node reports it in its log ([`upgrade_notices`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UpgradeNotice {
+    pub version: u32,
+    pub height: u64,
+    /// Whether this binary runs it (an INFO); if not, the node stops at `height` (a WARN).
+    pub supported: bool,
+    pub text: String,
+}
+
+/// What a node at `height` logs about the upgrades scheduled after it (OPERATOR-9): an INFO for
+/// each this binary runs (it supports up to `supported`), then a WARN for the first it doesn't,
+/// where it will stop (exit 11 for a validator). Nothing after that: the node never gets there.
+pub(crate) fn upgrade_notices(state: &crate::chain::State, height: u64, supported: u32, block_time_ms: u64) -> Vec<UpgradeNotice> {
+    let mut out = vec![];
+    for u in state.upgrade.schedule.iter().filter(|u| u.activation_height > height) {
+        let eta = crate::cli_net::span_words(u.activation_height - height, block_time_ms);
+        let ok = u.version <= supported;
+        let text = if ok {
+            format!("protocol v{} activates at #{} (in about {eta}); this release runs it", u.version, u.activation_height)
+        } else {
+            format!("protocol v{} activates at #{} (in about {eta}): install a release that supports it. This one runs up to v{supported}, so this node stops there (docs/OPERATIONS.md, Upgrades)", u.version, u.activation_height)
+        };
+        out.push(UpgradeNotice { version: u.version, height: u.activation_height, supported: ok, text });
+        if !ok {
+            break;
+        }
+    }
+    out
+}
+
+/// How often a node logs a coming upgrade it can't run.
+const UPGRADE_WARN_EVERY: Duration = Duration::from_secs(3600);
+
+/// Logs the upgrade schedule ([`upgrade_notices`]) at start and every hour: an upgrade this
+/// binary can't run as a WARN each time, until the node has a release that runs it; one it can,
+/// once, at INFO.
+async fn watch_upgrades(chain: Shared) {
+    let mut told = std::collections::BTreeSet::new();
+    loop {
+        let notices = {
+            let c = chain.lock();
+            upgrade_notices(&c.state, c.height(), c.halt.supported, c.genesis.block_time_ms)
+        };
+        for n in notices {
+            if !n.supported {
+                tracing::warn!("{}", n.text);
+            } else if told.insert((n.version, n.height)) {
+                tracing::info!("{}", n.text);
+            }
+        }
+        tokio::time::sleep(UPGRADE_WARN_EVERY).await;
+    }
+}
+
 /// Validators check pending contribution claims against GitHub (the PR and the claimant's gist)
 /// and attest what they find. A quorum of attestations settles a claim on-chain.
 async fn attest_claims(chain: Shared) {
@@ -601,19 +678,87 @@ async fn attest_reverts(chain: Shared) {
     }
 }
 
-/// How often (every 10 s) fast sync waits for a snapshot newer than a trusted checkpoint
-/// before it falls back to syncing from genesis.
+/// How often (every [`SNAPSHOT_WAIT`]) fast sync waits for a snapshot it can use (one newer than
+/// a trusted checkpoint, or any at all from peers that have none yet and can't serve block 1
+/// either) before it falls back to syncing from genesis.
 const SNAPSHOT_WAITS: usize = 30;
+const SNAPSHOT_WAIT: Duration = Duration::from_secs(10);
 
-async fn maybe_fast_sync(chain: &Shared, peers: &[String], full: bool, trust: &Trust) {
-    let empty = {
-        let c = chain.lock();
-        c.height() == 0 && c.base.is_none()
-    };
-    if !empty || full || peers.is_empty() {
-        return;
+/// Why a fast sync that failed with `e` might wait and try again rather than sync from genesis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SnapshotWait {
+    /// A peer's snapshot ends before our newest checkpoint: one is taken every 100 blocks.
+    Behind,
+    /// The peers have none yet (503): a young chain's nodes before block 100, or a node that
+    /// fast-synced itself until it takes its first (PERF-12).
+    NoneYet,
+}
+
+fn snapshot_wait(e: &anyhow::Error) -> Option<SnapshotWait> {
+    if e.chain().any(|c| c.is::<crate::snapshot::SnapshotBehind>()) {
+        Some(SnapshotWait::Behind)
+    } else if has_status(e, 503) {
+        Some(SnapshotWait::NoneYet)
+    } else {
+        None
     }
-    for wait in 0.. {
+}
+
+/// Whether one of `peers` holds this chain from block 1 (its `/api/status`: this genesis, a
+/// block executed, `history_from` 1), so an empty home can sync it from genesis rather than wait
+/// for a snapshot.
+async fn a_peer_holds_block_one(peers: &[String], genesis_hash: &str) -> bool {
+    let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(5)).build() else {
+        return false;
+    };
+    let holds = |peer: &String| {
+        let client = client.clone();
+        let url = format!("{peer}/api/status");
+        async move {
+            let body = get_capped(&client, &url, 1 << 20).await.ok()?;
+            let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
+            let ours = v["genesis_hash"].as_str() == Some(genesis_hash);
+            Some(ours && v["height"].as_u64().is_some_and(|h| h >= 1) && v["history_from"].as_u64().is_some_and(|f| f <= 1))
+        }
+    };
+    futures::future::join_all(peers.iter().map(holds)).await.into_iter().any(|h| h == Some(true))
+}
+
+/// Whether `e` is (or was caused by) a peer answering HTTP `code` ([`get_capped`]).
+fn has_status(e: &anyhow::Error, code: u16) -> bool {
+    e.chain().any(|c| c.downcast_ref::<HttpStatus>().is_some_and(|s| s.0.as_u16() == code))
+}
+
+/// A peer's answer with a status other than success, from [`get_capped`]. It reads as the
+/// status, as the error it replaces did.
+#[derive(Debug)]
+pub struct HttpStatus(pub reqwest::StatusCode);
+
+impl std::fmt::Display for HttpStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for HttpStatus {}
+
+/// Whether this node holds nothing yet: no block executed, no snapshot installed.
+fn is_empty_home(chain: &Shared) -> bool {
+    let c = chain.lock();
+    c.height() == 0 && c.base.is_none()
+}
+
+async fn maybe_fast_sync(chain: &Shared, peers: &[String], full: bool, trust: &Trust) -> bool {
+    maybe_fast_sync_with(chain, peers, full, trust, SNAPSHOT_WAIT, SNAPSHOT_WAITS).await
+}
+
+/// [`maybe_fast_sync`], waiting `wait` up to `waits` times for a usable snapshot. Returns whether
+/// it installed one.
+async fn maybe_fast_sync_with(chain: &Shared, peers: &[String], full: bool, trust: &Trust, wait: Duration, waits: usize) -> bool {
+    if !is_empty_home(chain) || full || peers.is_empty() {
+        return false;
+    }
+    for tried in 0.. {
         match crate::snapshot::fast_sync(chain, peers, trust).await {
             Ok(h) => {
                 println!("⚡ fast-synced to #{h} from a certified snapshot; history before it isn't stored on this node");
@@ -626,16 +771,30 @@ async fn maybe_fast_sync(chain: &Shared, peers: &[String], full: bool, trust: &T
                 if let Some(why) = live.stale((0, None), crate::chain::now_ms()).filter(|_| shorter) {
                     eprintln!("⚠️  under the chain's parameters in force: {why}; if in doubt, wipe this home and join again with that checkpoint");
                 }
-                return;
+                return true;
             }
-            // A checkpoint newer than every peer's snapshot: one is taken every 100 blocks.
-            Err(e) if wait < SNAPSHOT_WAITS && e.chain().any(|c| c.is::<crate::snapshot::SnapshotBehind>()) => {
-                println!("⏳ {e:#}; waiting for a newer snapshot");
-                tokio::time::sleep(Duration::from_secs(10)).await;
+            Err(e) => {
+                let again = tried < waits
+                    && match snapshot_wait(&e) {
+                        Some(SnapshotWait::Behind) => true,
+                        // Peers without one yet: wait only if none of them can serve the chain from
+                        // block 1. A young chain's can, so it syncs from genesis at once, as before.
+                        Some(SnapshotWait::NoneYet) => {
+                            let genesis_hash = chain.lock().genesis_hash.clone();
+                            !a_peer_holds_block_one(peers, &genesis_hash).await
+                        }
+                        None => false,
+                    };
+                if !again {
+                    println!("ℹ️  no usable snapshot ({e:#}); syncing from genesis instead");
+                    return false;
+                }
+                println!("⏳ {e:#}; waiting for a snapshot (asking again in {} s)", wait.as_secs());
+                tokio::time::sleep(wait).await;
             }
-            Err(e) => return println!("ℹ️  no usable snapshot ({e:#}); syncing from genesis instead"),
         }
     }
+    false
 }
 
 /// The HTTP peers a node syncs from and forwards to: `--peer-http` if given, otherwise the
@@ -657,7 +816,7 @@ pub fn http_peers(genesis: &Genesis, override_: &[String], me: Option<&str>) -> 
 
 pub fn socket(bind: &str, port: u16) -> Result<SocketAddr> {
     let host = bind.trim_start_matches('[').trim_end_matches(']');
-    let ip: std::net::IpAddr = host.parse().with_context(|| format!("--bind must be an IP address, got {bind}"))?;
+    let ip: std::net::IpAddr = host.parse().with_context(|| format!("--bind, --http-bind and --p2p-bind take an IP address, got {bind}"))?;
     Ok(SocketAddr::new(ip, port))
 }
 
@@ -806,8 +965,8 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
     };
     let http_port = net.http_port.or_else(|| port_of(&addrs.http_addr).filter(|_| !addrs.http_addr.starts_with("http"))).unwrap_or(7070);
     let p2p_port = if net.ephemeral_p2p { 0 } else { port_of(&addrs.p2p_addr).ok_or_else(|| anyhow!("bad p2p_addr {}", addrs.p2p_addr))? };
-    let listen = socket(&net.bind, p2p_port)?;
-    let http_bind = socket(&net.bind, http_port)?;
+    let listen = socket(net.p2p_iface(), p2p_port)?;
+    let http_bind = socket(net.http_iface(), http_port)?;
     let dialable = if net.ephemeral_p2p { listen.into() } else { ingress(&addrs.p2p_addr)? };
     let peers = if net.ephemeral_p2p { vec![] } else { http_peers(&genesis, &net.peer_http, Some(&me)) };
 
@@ -849,7 +1008,7 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
             }
             let trust = Arc::new(trust);
             maybe_fast_sync(&shared, &peers, net.full, &trust).await;
-            catch_up(shared.clone(), peers.clone(), trust.clone()).await;
+            catch_up(shared.clone(), peers.clone(), trust.clone(), !net.full).await;
             trust
         })
     } else {
@@ -881,6 +1040,12 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
     } else {
         println!("🔗 p2p: listening on {listen}, advertised as {} ({preset} preset)", addrs.p2p_addr);
     }
+    println!("🔌 HTTP: listening on {http_bind}");
+    // A validator's HTTP API shares the state lock with consensus: the public belongs on a full
+    // node in front of it (OPERATOR-2, SEC-4).
+    if !http_bind.ip().is_loopback() && !net.ephemeral_p2p {
+        tracing::info!("this validator's HTTP API listens on {http_bind}, beyond this machine: keep it private (docs/OPERATIONS.md, Ports and firewall), or bind it with --http-bind 127.0.0.1");
+    }
     consensus::log_memory_budget(bootstrappers.len());
     match keep {
         Some(k) => println!("🗄️  keeping the last {k} blocks on disk (--archive keeps all)"),
@@ -909,6 +1074,7 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
         tokio::spawn(attest_reverts(shared.clone()));
         tokio::spawn(watch_halts(shared.clone(), protection.clone(), home.clone()));
         tokio::spawn(watch_network(shared.clone(), peers.clone(), protection.clone(), net.network_halted_at));
+        tokio::spawn(watch_upgrades(shared.clone()));
         let mut node = http_node(shared, Some(marshal), peers, &net, &trust);
         node.protection = Some(protection);
         let metrics = context.child("metrics");
@@ -1036,7 +1202,10 @@ pub fn join(genesis: &str, home: &Path, pins: &Pins, fast: bool) -> Result<()> {
 }
 
 pub fn run_full_node(home: PathBuf, net: NetOpts) -> Result<()> {
-    let bind = socket(&net.bind, net.http_port.unwrap_or(7171))?;
+    let bind = socket(net.http_iface(), net.http_port.unwrap_or(7171))?;
+    if net.p2p_bind.is_some() {
+        eprintln!("ℹ️  --p2p-bind is for validators: a full node syncs over HTTP and listens for no p2p");
+    }
     let jc: JoinConfig = serde_json::from_slice(&std::fs::read(home.join("join.json")).context("not a joined home — use `blockula join`")?)?;
     let mut chain = Chain::open(&home)?;
     // The pins were checked at `join`; they (and the embedded checkpoints) apply on every start,
@@ -1072,7 +1241,8 @@ pub fn run_full_node(home: PathBuf, net: NetOpts) -> Result<()> {
         let trust = Arc::new(trust);
         maybe_fast_sync(&shared, &peers, !fast, &trust).await;
         tokio::spawn(exchange_epochs(shared.clone(), peers.clone()));
-        sync_loop(shared, peers, false, trust).await;
+        tokio::spawn(watch_upgrades(shared.clone()));
+        sync_loop(shared, peers, false, trust, fast).await;
         Ok(())
     })
 }
@@ -1093,8 +1263,7 @@ pub const MAX_SYNC_RESPONSE: usize = 32 << 20;
 pub async fn get_capped(client: &reqwest::Client, url: &str, cap: usize) -> Result<Vec<u8>> {
     let mut res = client.get(url).send().await?;
     if !res.status().is_success() {
-        let status = res.status();
-        bail!("{status}");
+        return Err(anyhow::Error::new(HttpStatus(res.status())));
     }
     if res.content_length().is_some_and(|l| l as usize > cap) {
         bail!("response too large");
@@ -1377,7 +1546,7 @@ impl Rotation {
 /// sync keeps to the fastest peer, and one that sends blocks slower than the chain makes them or
 /// far slower than the others, or stalls, is benched ([`Rotation`]), so one stalling, trickling
 /// or lying peer can't hold the node back.
-async fn sync_loop(chain: Shared, peers: Vec<String>, stop_when_caught_up: bool, trust: Arc<Trust>) {
+async fn sync_loop(chain: Shared, peers: Vec<String>, stop_when_caught_up: bool, trust: Arc<Trust>, fast: bool) {
     let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build().unwrap();
     let provider = consensus::EpochProvider::new(chain.clone(), None);
     let block_time = Duration::from_millis(chain.lock().genesis.block_time_ms);
@@ -1388,6 +1557,10 @@ async fn sync_loop(chain: Shared, peers: Vec<String>, stop_when_caught_up: bool,
     let mut rotation = Rotation::new(peers.len());
     let mut idle_rounds = 0usize;
     let mut failures = 0usize;
+    // Peers that answered 410 (pruned) to this empty home's ask for block 1, in a row, and when it
+    // last went back to fast sync for that (PERF-12).
+    let mut pruned = std::collections::BTreeSet::new();
+    let mut refast_at: Option<std::time::Instant> = None;
     let halt = chain.lock().halt.signal.clone();
     loop {
         if let Some(h) = halt.get() {
@@ -1424,6 +1597,26 @@ async fn sync_loop(chain: Shared, peers: Vec<String>, stop_when_caught_up: bool,
                 if !e.to_string().contains("sent nothing") && halt.get().is_none() {
                     eprintln!("⚠️  sync from {url}: {e:#}");
                 }
+                // Every peer pruned block 1, so this empty home can only start from a snapshot (at
+                // most once a minute).
+                if has_status(&e, 410) && is_empty_home(&chain) {
+                    pruned.insert(url.clone());
+                    if pruned.len() >= peers.len() && refast_at.is_none_or(|t| t.elapsed() >= REFAST_EVERY) {
+                        pruned.clear();
+                        refast_at = Some(std::time::Instant::now());
+                        if !fast {
+                            eprintln!("⚠️  every peer pruned the start of the chain (410), and --full replays it from genesis: add an archive node with --peer-http, or start without --full to fast-sync from a snapshot");
+                        } else {
+                            println!("ℹ️  every peer pruned the start of the chain (410): fast-syncing from a certified snapshot instead");
+                            if maybe_fast_sync(&chain, &peers, false, &trust).await {
+                                failures = 0;
+                                continue;
+                            }
+                        }
+                    }
+                } else {
+                    pruned.clear();
+                }
                 rotation.failed(std::time::Instant::now());
                 failures += 1;
                 if stop_when_caught_up && failures >= peers.len() * 2 {
@@ -1435,10 +1628,15 @@ async fn sync_loop(chain: Shared, peers: Vec<String>, stop_when_caught_up: bool,
     }
 }
 
-/// Validators: sync over HTTP until no peer has anything newer (or none answer).
-async fn catch_up(chain: Shared, peers: Vec<String>, trust: Arc<Trust>) {
+/// How often, at most, an empty home whose peers all pruned the start of the chain goes back to
+/// fast sync.
+const REFAST_EVERY: Duration = Duration::from_secs(60);
+
+/// Validators: sync over HTTP until no peer has anything newer (or none answer). `fast`: an empty
+/// home whose peers all pruned the start of the chain goes back to fast sync.
+async fn catch_up(chain: Shared, peers: Vec<String>, trust: Arc<Trust>, fast: bool) {
     let start = chain.lock().height();
-    sync_loop(chain.clone(), peers, true, trust).await;
+    sync_loop(chain.clone(), peers, true, trust, fast).await;
     let end = chain.lock().height();
     if end > start {
         println!("⏩ caught up over HTTP: {start} → {end}");
@@ -2352,7 +2550,7 @@ mod tests {
             }
             let started = std::time::Instant::now();
             let peers = vec![format!("http://{addr}/{who}"), format!("http://{addr}/honest")];
-            tokio::time::timeout(Duration::from_secs(40), catch_up(chain.clone(), peers, trust.clone())).await.expect("catching up ends");
+            tokio::time::timeout(Duration::from_secs(40), catch_up(chain.clone(), peers, trust.clone(), false)).await.expect("catching up ends");
             assert_eq!(chain.lock().height(), TIP);
             let (trickled, honest) = (peer.hits[0].load(Ordering::SeqCst), peer.hits[1].load(Ordering::SeqCst));
             assert!(trickled <= most, "{who}: {trickled} rounds ({honest} to the honest peer)");
@@ -2392,5 +2590,131 @@ mod tests {
         assert_eq!(chain.lock().network_height_claimed(), 0);
         assert!(!chain.lock().syncing());
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// PERF-12: peers without a snapshot yet (503) are asked again after a wait, like one whose
+    /// snapshot is behind a checkpoint, unless one of them holds the chain from block 1 (a young
+    /// chain): then, as before, and on any other failure, it syncs from genesis at once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fast_sync_waits_for_a_peer_without_a_snapshot_yet() {
+        use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = home("nosnap");
+        let homes = Chain::summon(&root, &SummonOpts::new("nosnap", 1)).unwrap();
+        let chain: Shared = Arc::new(Mutex::new(Chain::open(&homes[0]).unwrap()));
+        let trust = Trust::new(&chain.lock().genesis, &Pins::default(), false).unwrap();
+        let genesis_hash = chain.lock().genesis_hash.clone();
+        // "late": 503 twice (no certified snapshot yet), then 404, and no /api/status. "broken":
+        // 500 every time. "young" and "fastsynced": 503 every time, with a status that holds
+        // block 1 or starts at its snapshot. "stranger": holds block 1 of another chain.
+        let asked: Arc<[AtomicUsize; 5]> = Arc::new(Default::default());
+        async fn late(State(a): State<Arc<[AtomicUsize; 5]>>) -> (StatusCode, &'static str) {
+            match a[0].fetch_add(1, Ordering::SeqCst) {
+                0 | 1 => (StatusCode::SERVICE_UNAVAILABLE, "no certified snapshot yet"),
+                _ => (StatusCode::NOT_FOUND, "not found"),
+            }
+        }
+        async fn broken(State(a): State<Arc<[AtomicUsize; 5]>>) -> (StatusCode, &'static str) {
+            a[1].fetch_add(1, Ordering::SeqCst);
+            (StatusCode::INTERNAL_SERVER_ERROR, "oops")
+        }
+        let none_yet = |i: usize| move |State(a): State<Arc<[AtomicUsize; 5]>>| async move {
+            a[i].fetch_add(1, Ordering::SeqCst);
+            (StatusCode::SERVICE_UNAVAILABLE, "no certified snapshot yet")
+        };
+        let status = |hash: &str, height: u64, from: u64| {
+            let body = serde_json::json!({ "genesis_hash": hash, "height": height, "history_from": from });
+            move || async move { Json(body) }
+        };
+        let app = Router::new()
+            .route("/late/api/snapshot/latest", get(late))
+            .route("/broken/api/snapshot/latest", get(broken))
+            .route("/young/api/snapshot/latest", get(none_yet(2)))
+            .route("/young/api/status", get(status(&genesis_hash, 50, 1)))
+            .route("/fastsynced/api/snapshot/latest", get(none_yet(3)))
+            .route("/fastsynced/api/status", get(status(&genesis_hash, 160, 105)))
+            .route("/stranger/api/snapshot/latest", get(none_yet(4)))
+            .route("/stranger/api/status", get(status(&"ab".repeat(32), 50, 1)))
+            .with_state(asked.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let peer = |p: &str| format!("http://{addr}/{p}");
+        let count = |i: usize| asked[i].load(Ordering::SeqCst);
+        let wait = Duration::from_millis(20);
+        assert!(!maybe_fast_sync_with(&chain, &[peer("late")], false, &trust, wait, 5).await);
+        assert_eq!(count(0), 3, "asked again after each 503, then gave up on the 404");
+        assert!(!maybe_fast_sync_with(&chain, &[peer("broken")], false, &trust, wait, 5).await);
+        assert_eq!(count(1), 1, "a 500 isn't waited out");
+        // The waits are bounded: a peer that never has one is asked `waits` + 1 times.
+        asked[0].store(0, Ordering::SeqCst);
+        assert!(!maybe_fast_sync_with(&chain, &[peer("late")], false, &trust, wait, 1).await);
+        assert_eq!(count(0), 2);
+        // A young chain (its first snapshot comes at block 100): its peers hold block 1, so it
+        // syncs from genesis at once, with the whole history.
+        assert!(!maybe_fast_sync_with(&chain, &[peer("young")], false, &trust, wait, 5).await);
+        assert_eq!(count(2), 1, "a peer that holds block 1 isn't waited for");
+        // Peers that all start later (fast-synced or pruned), or hold another chain's block 1:
+        // genesis is out of reach, so it waits for a snapshot.
+        assert!(!maybe_fast_sync_with(&chain, &[peer("fastsynced"), peer("stranger")], false, &trust, wait, 2).await);
+        assert_eq!((count(3), count(4)), (3, 3), "asked again after each 503");
+        // One peer with block 1 among them is enough to sync from genesis.
+        assert!(!maybe_fast_sync_with(&chain, &[peer("fastsynced"), peer("young")], false, &trust, wait, 5).await);
+        assert_eq!((count(3), count(2)), (4, 2));
+        // `--full`, or a home that holds blocks, doesn't fast-sync at all.
+        assert!(!maybe_fast_sync_with(&chain, &[peer("broken")], true, &trust, wait, 5).await);
+        assert_eq!(count(1), 1);
+        let e = anyhow::Error::new(HttpStatus(reqwest::StatusCode::SERVICE_UNAVAILABLE)).context("from a peer");
+        assert!(snapshot_wait(&e) == Some(SnapshotWait::NoneYet) && e.chain().any(|c| c.to_string() == "503 Service Unavailable"), "{e:#}");
+        assert_eq!(snapshot_wait(&anyhow::Error::new(HttpStatus(reqwest::StatusCode::GONE))), None);
+        assert_eq!(snapshot_wait(&anyhow::Error::new(crate::snapshot::SnapshotBehind { certified: 100, checkpoint: 250 }).context("from a peer")), Some(SnapshotWait::Behind));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// PERF-12: an empty home whose every peer pruned the start of the chain (410 for block 1)
+    /// goes back to fast sync (at most once a minute), unless it was told `--full`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_empty_home_whose_peers_pruned_block_one_goes_back_to_fast_sync() {
+        use axum::{extract::State, http::StatusCode, routing::get, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = home("pruned");
+        let homes = Chain::summon(&root, &SummonOpts::new("pruned", 1)).unwrap();
+        let chain: Shared = Arc::new(Mutex::new(Chain::open(&homes[0]).unwrap()));
+        let trust = Arc::new(Trust::new(&chain.lock().genesis, &Pins::default(), false).unwrap());
+        let snapshots = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/api/sync", get(|| async { (StatusCode::GONE, "pruned") }))
+            .route(
+                "/api/snapshot/latest",
+                get(|State(n): State<Arc<AtomicUsize>>| async move {
+                    n.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::NOT_FOUND, "not found")
+                }),
+            )
+            .with_state(snapshots.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let peers = vec![format!("http://{addr}")];
+        tokio::time::timeout(Duration::from_secs(20), catch_up(chain.clone(), peers.clone(), trust.clone(), true)).await.expect("gives up");
+        assert_eq!(snapshots.load(Ordering::SeqCst), 1, "back to fast sync once");
+        tokio::time::timeout(Duration::from_secs(20), catch_up(chain.clone(), peers, trust, false)).await.expect("gives up");
+        assert_eq!(snapshots.load(Ordering::SeqCst), 1, "not with --full");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// OPERATOR-9: a node logs each scheduled upgrade it runs, then a warning for the first it
+    /// can't, with the height and about how long until then; nothing after it.
+    #[test]
+    fn upgrades_this_release_cant_run_are_warned_about() {
+        use crate::upgrade::ScheduledUpgrade;
+        let mut st = crate::chain::State::default();
+        assert!(upgrade_notices(&st, 10, 1, 1000).is_empty());
+        st.upgrade.schedule = vec![ScheduledUpgrade { version: 2, activation_height: 5 }, ScheduledUpgrade { version: 3, activation_height: 10_000 }, ScheduledUpgrade { version: 4, activation_height: 200_000 }, ScheduledUpgrade { version: 5, activation_height: 300_000 }];
+        let n = upgrade_notices(&st, 100, 3, 1000);
+        assert_eq!(n.iter().map(|n| (n.version, n.supported)).collect::<Vec<_>>(), [(3, true), (4, false)], "past ones skipped, nothing after the first it can't run");
+        assert_eq!(n[0].text, "protocol v3 activates at #10000 (in about 2 hours); this release runs it");
+        assert_eq!(n[1].text, "protocol v4 activates at #200000 (in about 2 days): install a release that supports it. This one runs up to v3, so this node stops there (docs/OPERATIONS.md, Upgrades)");
+        assert!(upgrade_notices(&st, 100, 5, 1000).iter().all(|n| n.supported));
     }
 }

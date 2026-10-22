@@ -57,9 +57,18 @@ struct Cli {
 
 #[derive(Args, Clone)]
 struct Net {
-    /// Interface to listen on for HTTP and p2p: 127.0.0.1 (default), 0.0.0.0 or :: for servers
+    /// Interface to listen on for HTTP and p2p: 127.0.0.1 (default), 0.0.0.0 or :: for servers.
+    /// --http-bind and --p2p-bind set one of them apart
     #[arg(long, default_value = "127.0.0.1")]
     bind: String,
+    /// Interface the HTTP API listens on (default: --bind). A validator's stays private: keep it
+    /// on 127.0.0.1, or a private network its own full nodes reach
+    #[arg(long)]
+    http_bind: Option<String>,
+    /// Interface p2p listens on (default: --bind). A validator on a public chain needs 0.0.0.0
+    /// (or ::) here, so the other validators can dial it
+    #[arg(long)]
+    p2p_bind: Option<String>,
     /// IP of a proxy or full node whose `X-Blockula-Client-IP` header is trusted for faucet/tx
     /// rate limits (repeatable)
     #[arg(long = "trusted-forwarder")]
@@ -324,7 +333,7 @@ fn net_opts(net: Net, http_port: Option<u16>, p2p_preset: Option<String>, epheme
         (_, Some(n)) => node::Pruning::Keep(n),
         _ => node::Pruning::Default,
     };
-    NetOpts { bind: net.bind, http_port, p2p_preset, ephemeral_p2p, client_ip, peer_http: net.peer_http, force_key: net.force_key, full: net.full, pruning, http, halt_height: net.halt_height, network_halted_at: net.network_halted_at }
+    NetOpts { bind: net.bind, http_bind: net.http_bind, p2p_bind: net.p2p_bind, http_port, p2p_preset, ephemeral_p2p, client_ip, peer_http: net.peer_http, force_key: net.force_key, full: net.full, pruning, http, halt_height: net.halt_height, network_halted_at: net.network_halted_at }
 }
 
 fn main() -> Result<()> {
@@ -473,6 +482,31 @@ mod cli_tests {
     fn the_cli_is_well_formed() {
         use clap::CommandFactory;
         super::Cli::command().debug_assert();
+    }
+
+    /// OPERATOR-2: without --http-bind and --p2p-bind, HTTP and p2p both listen where --bind says
+    /// (so today's deploys, which pass `--bind ::`, are unchanged); each flag moves one of them.
+    #[test]
+    fn http_and_p2p_bind_where_bind_says_unless_told_apart() {
+        use clap::Parser;
+        let opts = |args: &[&str]| match super::Cli::try_parse_from(["blockula"].iter().chain(args)).unwrap().cmd {
+            super::Cmd::Run { net, port, p2p_preset, .. } => super::net_opts(net, port, p2p_preset, false),
+            super::Cmd::Join { net, port, .. } => super::net_opts(net, Some(port), None, false),
+            super::Cmd::Dev { net, port, .. } => super::net_opts(net, Some(port), Some("local".into()), true),
+            _ => unreachable!(),
+        };
+        let ifaces = |n: crate::node::NetOpts| (n.http_iface().to_string(), n.p2p_iface().to_string());
+        let same = |i: &str| (i.to_string(), i.to_string());
+        assert_eq!(ifaces(opts(&["run", "--home", "h"])), same("127.0.0.1"));
+        assert_eq!(ifaces(opts(&["run", "--home", "h", "--bind", "::"])), same("::"), "the Fly entrypoint's flags");
+        assert_eq!(ifaces(opts(&["join", "--genesis", "g.json", "--home", "h", "--bind", "0.0.0.0"])), same("0.0.0.0"));
+        assert_eq!(ifaces(opts(&["dev"])), same("127.0.0.1"));
+        assert_eq!(ifaces(opts(&["run", "--home", "h", "--p2p-bind", "0.0.0.0"])), ("127.0.0.1".to_string(), "0.0.0.0".to_string()), "what `validator init` suggests");
+        assert_eq!(ifaces(opts(&["run", "--home", "h", "--bind", "::", "--http-bind", "127.0.0.1"])), ("127.0.0.1".to_string(), "::".to_string()));
+        assert_eq!(ifaces(opts(&["run", "--home", "h", "--http-bind", "10.0.0.2", "--p2p-bind", "::"])), ("10.0.0.2".to_string(), "::".to_string()));
+        let n = opts(&["run", "--home", "h", "--http-bind", "::1", "--p2p-bind", "0.0.0.0"]);
+        assert_eq!((crate::node::socket(n.http_iface(), 7070).unwrap().to_string(), crate::node::socket(n.p2p_iface(), 30300).unwrap().to_string()), ("[::1]:7070".to_string(), "0.0.0.0:30300".to_string()));
+        assert!(crate::node::socket("localhost", 1).unwrap_err().to_string().contains("--http-bind"));
     }
 
     /// D10: the tagline makes no "never dies" claim.
