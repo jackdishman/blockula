@@ -110,7 +110,10 @@ export function initialPin(net: Network): ChainPin {
 export class PinnedClient extends Client {
   constructor(rpc: string, public pin: ChainPin, private onFirstPin?: (pin: ChainPin) => void, witnesses: string[] = [], genesisClock?: GenesisClock) {
     // Witnesses only for networks whose chain is pinned by configuration: they're held to it too.
-    super(rpc, { genesisClock, witnesses: pin.chainId ? witnesses.map((w) => new Client(w, { chainId: pin.chainId, genesisHash: pin.genesisHash, prefix: pin.prefix })) : [] });
+    // It pins the chain itself (`status()`: the configured chain, or the one a custom node reported
+    // first), and the network is the user's choice in the header, so it opts in to signing on
+    // mainnet (the SDK refuses blockula-1 to clients that didn't, DEV-1).
+    super(rpc, { genesisClock, allowMainnet: true, witnesses: pin.chainId ? witnesses.map((w) => new Client(w, { chainId: pin.chainId, genesisHash: pin.genesisHash, prefix: pin.prefix })) : [] });
     // `Wallet.address` renders with the client's prefix: use the pinned one before the first
     // status arrives (which still checks it, through `status()` below).
     if (pin.prefix) this.prefix = pin.prefix;
