@@ -261,6 +261,10 @@ pub struct ClaimsMemo {
     pub active_jurors: usize,
 }
 
+/// One page of an account's history ([`ReadView::history_page`]): its txs (height, index in the
+/// block), newest first, and the cursor of the page after it (`None`: none).
+pub type HistoryPage = (Vec<(u64, usize)>, Option<(u64, usize)>);
+
 /// A Hunt's status as the API shows it (`expired`: open past its deadline).
 pub fn hunt_status(h: &crate::chain::Hunt, height: u64) -> &'static str {
     match h.status {
@@ -448,6 +452,22 @@ impl ReadView {
         self.snap.history(account, limit).unwrap_or_default().into_iter().filter(|(h, _)| *h >= self.history_from()).collect()
     }
 
+    /// One page of an account's finalized txs (height, index), newest first: at most `limit`,
+    /// before the tx `before` (a cursor; `None`: from the newest), none below `history_from`.
+    /// With the cursor of the page after it, `None` when this one reaches the end of what this
+    /// node holds.
+    pub fn history_page(&self, account: &str, before: Option<(u64, u32)>, limit: usize) -> HistoryPage {
+        let from = self.history_from();
+        // One more than a page, to know whether there's another. A row below `history_from`
+        // ends the history, as in `history`: a guard, since the commit that moves `pruned_below`
+        // past a height removes its index rows, and a fast-synced node has none below its base.
+        let mut rows: Vec<(u64, usize)> = self.snap.history_range(account, before, limit.saturating_add(1)).unwrap_or_default().into_iter().take_while(|(h, _)| *h >= from).collect();
+        let more = rows.len() > limit;
+        rows.truncate(limit);
+        let next = if more { rows.last().copied() } else { None };
+        (rows, next)
+    }
+
     /// Names an account owns, oldest registration first.
     pub fn names_of(&self, owner: &str, limit: usize) -> Vec<String> {
         let rows = self.snap.index(ix::NAME, owner.as_bytes(), false, limit).unwrap_or_default();
@@ -610,9 +630,12 @@ impl Live {
         self.claimed.load(Ordering::Relaxed).max(self.finalized(height))
     }
 
-    /// Behind what peers claim (or what we verified) by more than a few blocks: for display
-    /// (`/api/status`, `/api/health`). Validator duties use `Chain::syncing`, verified heights only.
+    /// Behind what peers claim (or what we verified) by more than a few blocks, or a full node
+    /// that hasn't executed a block yet (waiting for a snapshot, or for its first blocks: its
+    /// peers' claims may not have arrived; audit PERF-12, TR-12): for display (`/api/status`,
+    /// `/api/health`). Validator duties use `Chain::syncing`, verified heights only.
     pub fn syncing(&self, height: u64) -> bool {
-        height + crate::chain::SYNC_SLACK < self.network_height_claimed(height)
+        let unstarted = height == 0 && self.view().role == crate::chain::Role::FullNode;
+        unstarted || height + crate::chain::SYNC_SLACK < self.network_height_claimed(height)
     }
 }

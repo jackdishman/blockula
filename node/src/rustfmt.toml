@@ -1,0 +1,4 @@
+# The node crate (node/src) is formatted by hand, wider than rustfmt's defaults, so `cargo fmt`
+# would rewrite thousands of lines into an unreviewable diff. Match the surrounding style instead.
+# This covers node/src only: node/vm, a workspace of its own, keeps rustfmt's formatting.
+disable_all_formatting = true
