@@ -13,7 +13,7 @@ Your own node gives you your own view of the chain. Your wallet, apps and agents
 > - **Stake is slow to leave.** Unbonding takes 21 days on mainnet, and FANG that's unbonding can still be slashed for a fault from before it left.
 > - **Upgrades can stop your node.** When governance schedules a protocol version your release doesn't run, your node stops at that height until you install one that does. The network can also be halted on purpose to fix a problem.
 > - **Most validators are run by Blockula's founder** at launch, and until the bootstrap period ends they can pass proposals as a council.
-> - **No pay is promised.** Validator rewards come from protocol issuance and aren't guaranteed. On mainnet the commission cap is 0 at launch, so a validator earns only on its own stake, like any delegator. There's no service agreement and no compensation for downtime, slashes or halts.
+> - **No pay is promised.** Validator rewards come from protocol issuance and aren't guaranteed. The bootstrap delegation backing each mainnet launch seat pays no commission (its cap is 0). A validator earns on its own stake until outside delegators appear; its commission on those still applies. There's no service agreement and no compensation for downtime, slashes or halts.
 > - **You're responsible for your own compliance:** the law where you are, taxes, and your hosting provider's terms (some ban blockchain workloads).
 > - **Your validator's addresses are public and permanent.** The chain publishes the p2p and HTTP addresses you register, and peers see your node's IP.
 
@@ -173,4 +173,4 @@ A validator registers with a self-bond of at least the chain's `min_self_bond`: 
 
 - **Public testnet:** ask for a 10,000 test-FANG self-bond with the [node operator form](https://github.com/jackdishman/blockula/issues/new?template=node-operator.yml). The faucet gives 100 test FANG at a time (once an hour per address, once every 10 minutes per IP), so collecting the bond from it takes 17 hours at best. Test FANG has no value.
 - **Mainnet:** there's no faucet, and almost no FANG circulates at launch. Outside operators who are ready by the genesis ceremony get a locked allocation from the security-grants allocation, enough to self-bond. After genesis, new seats and grants go through governance.
-- **Validating is unpaid in year 1.** The bootstrap commission cap is 0, so a validator takes no cut of its delegators' rewards: nobody pays the operator for running it. Its own stake earns like any delegator's, and rewards aren't guaranteed.
+- **Plan to validate without operating pay in year 1.** The bootstrap delegation pays no commission (its cap is 0), so an operator earns only on its own stake until outside delegators appear. The validator's commission on outside delegations still applies under the chain's normal commission cap. Rewards aren't guaranteed.

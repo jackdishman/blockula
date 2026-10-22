@@ -704,10 +704,10 @@ fn snapshot_wait(e: &anyhow::Error) -> Option<SnapshotWait> {
     }
 }
 
-/// Whether one of `peers` holds this chain from block 1 (its `/api/status`: this genesis, a
-/// block executed, `history_from` 1), so an empty home can sync it from genesis rather than wait
-/// for a snapshot.
-async fn a_peer_holds_block_one(peers: &[String], genesis_hash: &str) -> bool {
+/// Whether one of `peers` can serve this chain from genesis (`history_from` at most 1), so an
+/// empty home needn't wait for a snapshot. Height zero counts: a validator starting there may
+/// be needed to finalize the first block, before any snapshot can exist.
+async fn a_peer_has_genesis_history(peers: &[String], genesis_hash: &str) -> bool {
     let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(5)).build() else {
         return false;
     };
@@ -718,7 +718,7 @@ async fn a_peer_holds_block_one(peers: &[String], genesis_hash: &str) -> bool {
             let body = get_capped(&client, &url, 1 << 20).await.ok()?;
             let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
             let ours = v["genesis_hash"].as_str() == Some(genesis_hash);
-            Some(ours && v["height"].as_u64().is_some_and(|h| h >= 1) && v["history_from"].as_u64().is_some_and(|f| f <= 1))
+            Some(ours && v["height"].as_u64().is_some() && v["history_from"].as_u64().is_some_and(|f| f <= 1))
         }
     };
     futures::future::join_all(peers.iter().map(holds)).await.into_iter().any(|h| h == Some(true))
@@ -778,10 +778,10 @@ async fn maybe_fast_sync_with(chain: &Shared, peers: &[String], full: bool, trus
                     && match snapshot_wait(&e) {
                         Some(SnapshotWait::Behind) => true,
                         // Peers without one yet: wait only if none of them can serve the chain from
-                        // block 1. A young chain's can, so it syncs from genesis at once, as before.
+                        // genesis. This includes a fresh chain before its first block.
                         Some(SnapshotWait::NoneYet) => {
                             let genesis_hash = chain.lock().genesis_hash.clone();
-                            !a_peer_holds_block_one(peers, &genesis_hash).await
+                            !a_peer_has_genesis_history(peers, &genesis_hash).await
                         }
                         None => false,
                     };
@@ -2607,18 +2607,19 @@ mod tests {
         // "late": 503 twice (no certified snapshot yet), then 404, and no /api/status. "broken":
         // 500 every time. "young" and "fastsynced": 503 every time, with a status that holds
         // block 1 or starts at its snapshot. "stranger": holds block 1 of another chain.
-        let asked: Arc<[AtomicUsize; 5]> = Arc::new(Default::default());
-        async fn late(State(a): State<Arc<[AtomicUsize; 5]>>) -> (StatusCode, &'static str) {
+        // "newborn": still at genesis, before the validators have made their first block.
+        let asked: Arc<[AtomicUsize; 6]> = Arc::new(Default::default());
+        async fn late(State(a): State<Arc<[AtomicUsize; 6]>>) -> (StatusCode, &'static str) {
             match a[0].fetch_add(1, Ordering::SeqCst) {
                 0 | 1 => (StatusCode::SERVICE_UNAVAILABLE, "no certified snapshot yet"),
                 _ => (StatusCode::NOT_FOUND, "not found"),
             }
         }
-        async fn broken(State(a): State<Arc<[AtomicUsize; 5]>>) -> (StatusCode, &'static str) {
+        async fn broken(State(a): State<Arc<[AtomicUsize; 6]>>) -> (StatusCode, &'static str) {
             a[1].fetch_add(1, Ordering::SeqCst);
             (StatusCode::INTERNAL_SERVER_ERROR, "oops")
         }
-        let none_yet = |i: usize| move |State(a): State<Arc<[AtomicUsize; 5]>>| async move {
+        let none_yet = |i: usize| move |State(a): State<Arc<[AtomicUsize; 6]>>| async move {
             a[i].fetch_add(1, Ordering::SeqCst);
             (StatusCode::SERVICE_UNAVAILABLE, "no certified snapshot yet")
         };
@@ -2635,6 +2636,8 @@ mod tests {
             .route("/fastsynced/api/status", get(status(&genesis_hash, 160, 105)))
             .route("/stranger/api/snapshot/latest", get(none_yet(4)))
             .route("/stranger/api/status", get(status(&"ab".repeat(32), 50, 1)))
+            .route("/newborn/api/snapshot/latest", get(none_yet(5)))
+            .route("/newborn/api/status", get(status(&genesis_hash, 0, 1)))
             .with_state(asked.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2654,6 +2657,10 @@ mod tests {
         // syncs from genesis at once, with the whole history.
         assert!(!maybe_fast_sync_with(&chain, &[peer("young")], false, &trust, wait, 5).await);
         assert_eq!(count(2), 1, "a peer that holds block 1 isn't waited for");
+        // A validator joining a peer at height zero must start immediately: the first block
+        // may need its vote, so waiting for that block's snapshot delays the whole chain.
+        assert!(!maybe_fast_sync_with(&chain, &[peer("newborn")], false, &trust, wait, 5).await);
+        assert_eq!(count(5), 1, "a peer at genesis isn't waited for");
         // Peers that all start later (fast-synced or pruned), or hold another chain's block 1:
         // genesis is out of reach, so it waits for a snapshot.
         assert!(!maybe_fast_sync_with(&chain, &[peer("fastsynced"), peer("stranger")], false, &trust, wait, 2).await);

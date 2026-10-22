@@ -716,7 +716,7 @@ pub fn contrib(cmd: ContribCmd, dir: &Path) -> Result<()> {
 // it's right on any chain. Keep it here (`hunt create` and `hunt fund` say who pays in their help).
 
 /// What `hunt create`, `hunt fund` and `hunt award` print on mainnet before they sign.
-pub const HUNT_PAYER_NOTICE: &str = "On mainnet you pay this with your own FANG. Payment for work may be taxable for the person you pay, and you must not pay anyone sanctioned or in a sanctioned region (CONTRIBUTOR-TERMS.md).";
+pub const HUNT_PAYER_NOTICE: &str = "On mainnet you pay this with your own FANG. Payment for work may be taxable for the person you pay, and you must not pay anyone sanctioned or in a sanctioned region (CONTRIBUTOR-TERMS.md, provisional and under counsel review).";
 
 /// Why `contrib claim`, `vouch` and `join-jury` refuse on a chain whose pool has no repositories.
 pub const POOL_CLOSED: &str = "This chain's contribution pool has no repositories yet, so there's nothing to claim. Nothing was signed.";
