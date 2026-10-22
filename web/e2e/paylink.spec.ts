@@ -8,6 +8,7 @@
 // words, and the wallet names only networks it knows.
 import { parseFang } from "@blockula/sdk";
 import { CHAIN_ID, GENESIS } from "./env";
+import { seedWorld } from "./explorer-world";
 import { addressOf } from "./mock-node";
 import { createWallet, cspViolations, expect, test, watchCsp } from "./helpers";
 
@@ -115,4 +116,99 @@ test("send fills a link made for this chain, and refuses one made for another", 
   await expect(to).toHaveValue("alice.boo");
   await expect(review).toBeEnabled();
   expect(await cspViolations(page)).toEqual([]);
+});
+
+// Audit USER-8 / CRE-1: a payment link opened without a wallet used to lose the request on the way
+// through onboarding. RequireWallet now carries it to /welcome as `next` (only this site's own
+// `/send?…`), /welcome says who asked for how much, and onboarding ends on the filled-in payment.
+test("a visitor with no wallet onboards and lands on the payment the link asked for", async ({ page, node }) => {
+  await watchCsp(page);
+  node.names.set("alice", ALICE);
+  const query = `to=alice.boo&amount=3&memo=pizza&chain=${CHAIN_ID}&genesis=${GENESIS.slice(0, 16)}`;
+  await page.goto(`/send?${query}`);
+  await expect(page).toHaveURL(/\/welcome\?next=/);
+  expect(new URL(page.url()).searchParams.get("next")).toBe(`/send?${query}`);
+  const ask = page.getByTestId("pay-request");
+  await expect(ask).toContainText("alice.boo asked you for 3 FANG.");
+  // The memo is the sender's text: never shown before Send's own review.
+  await expect(ask).not.toContainText("pizza");
+  await page.getByRole("button", { name: "Skip intro" }).click();
+  await expect(ask).toContainText("alice.boo asked you for 3 FANG.");
+  await page.getByRole("button", { name: "Create wallet with passkey" }).click();
+  await page.getByRole("button", { name: "Next: your recovery kit" }).click();
+  await page.getByRole("button", { name: /^Skip for now/ }).click();
+  await page.getByRole("button", { name: "Skip for now" }).click();
+  await page.getByRole("button", { name: "Continue to the payment" }).click();
+  // Send, filled in from the link, with its own check of the link's chain.
+  await expect(page.getByRole("heading", { name: "Send FANG" })).toBeVisible();
+  await expect(page).toHaveURL(new RegExp(`/send\\?${query.replace(/[.?*+^$()|[\]\\]/g, "\\$&")}$`));
+  await expect(page.getByTestId("paylink-filled")).toContainText("made for Testnet");
+  await expect(page.getByPlaceholder(/^alice\.boo or /)).toHaveValue("alice.boo");
+  await expect(page.getByPlaceholder("0.0")).toHaveValue("3");
+  await page.getByRole("button", { name: "Review" }).click();
+  await page.getByRole("button", { name: "Confirm & send" }).click();
+  await expect(page.getByRole("heading", { name: "Sent" })).toBeVisible();
+  expect(node.submitted.at(-1)?.action).toEqual({ type: "transfer", to: "alice.boo", amount: parseFang("3").toString() });
+  expect(node.submitted.at(-1)?.memo).toBe("pizza");
+  expect(await cspViolations(page)).toEqual([]);
+});
+
+// An account page's Pay button (CRE-1) opens Send for that account: a visitor with no wallet goes
+// through onboarding the same way, and isn't told anyone asked them to pay.
+test("an account page's Pay button takes a visitor with no wallet through onboarding to the payment", async ({ page, node }) => {
+  await watchCsp(page);
+  seedWorld(node);
+  await page.goto("/account/mina.boo");
+  await page.getByTestId("pay").click();
+  await expect(page).toHaveURL(/\/welcome\?next=/);
+  expect(new URL(page.url()).searchParams.get("next")).toBe("/send?to=mina.boo");
+  const ask = page.getByTestId("pay-request");
+  await expect(ask).toContainText("Paying mina.boo. Once your wallet is ready, you'll see the payment filled in");
+  await expect(ask).not.toContainText("asked you");
+  await page.getByRole("button", { name: "Skip intro" }).click();
+  await page.getByRole("button", { name: "Create wallet with passkey" }).click();
+  await page.getByRole("button", { name: "Next: your recovery kit" }).click();
+  await page.getByRole("button", { name: /^Skip for now/ }).click();
+  await page.getByRole("button", { name: "Skip for now" }).click();
+  await page.getByRole("button", { name: "Continue to the payment" }).click();
+  await expect(page.getByRole("heading", { name: "Send FANG" })).toBeVisible();
+  await expect(page.getByPlaceholder(/^alice\.boo or /)).toHaveValue("mina.boo");
+  expect(await cspViolations(page)).toEqual([]);
+});
+
+test("/welcome repeats a link's recipient only when it's a well-formed name or address", async ({ page }) => {
+  const welcome = (next: string) => page.goto(`/welcome?next=${encodeURIComponent(next)}`);
+  const ask = page.getByTestId("pay-request");
+  // The sender's text: a bidi override, or words, never shown as the payee.
+  await welcome(`/send?to=${encodeURIComponent("\u202evlad.boo")}&amount=1`);
+  await expect(ask).toContainText("Someone asked you for 1 FANG.");
+  await expect(ask).not.toContainText("vlad");
+  await welcome(`/send?to=${encodeURIComponent("pay me at evil.example")}`);
+  await expect(ask).toContainText("Someone sent you a payment link.");
+  await expect(ask).not.toContainText("evil");
+});
+
+test("onboarding never follows a next that isn't this site's own payment link", async ({ page }) => {
+  // The whole way through: an absolute URL is ignored, and onboarding ends at Home.
+  await page.goto(`/welcome?next=${encodeURIComponent("https://evil.example/send?to=alice.boo&amount=3")}`);
+  await expect(page.getByTestId("pay-request")).toHaveCount(0);
+  await page.getByRole("button", { name: "Skip intro" }).click();
+  await page.getByRole("button", { name: "Create wallet with passkey" }).click();
+  await page.getByRole("button", { name: "Next: your recovery kit" }).click();
+  await page.getByRole("button", { name: /^Skip for now/ }).click();
+  await page.getByRole("button", { name: "Skip for now" }).click();
+  await expect(page.getByRole("button", { name: "Continue to the payment" })).toHaveCount(0);
+  await page.getByRole("button", { name: "Open my wallet" }).click();
+  await expect(page.getByText("The account of")).toBeVisible();
+  expect(page.url()).toMatch(/^http:\/\/localhost:\d+\/$/);
+
+  // With a wallet on this browser, /welcome goes on at once: to Home for anything but a payment link here.
+  for (const next of ["//evil.example", "//evil.example/send?to=alice.boo", "https://evil.example", "/\\evil.example", "/send?to=a\\b", "/devices", "javascript:alert(1)"]) {
+    await page.goto(`/welcome?next=${encodeURIComponent(next)}`);
+    await expect(page.getByRole("button", { name: "Unlock with passkey" })).toBeVisible();
+    expect(page.url(), next).toMatch(/^http:\/\/localhost:\d+\/$/);
+  }
+  // Its own payment link: there.
+  await page.goto(`/welcome?next=${encodeURIComponent("/send?to=alice.boo&amount=2")}`);
+  await expect(page).toHaveURL(/\/send\?to=alice\.boo&amount=2$/);
 });
