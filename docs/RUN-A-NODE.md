@@ -6,15 +6,13 @@ Your own node gives you your own view of the chain. Your wallet, apps and agents
 
 > **Before you run a node or validator**
 >
-> *Provisional, under counsel review. Not final wording.*
->
-> - **It's experimental software, provided as is**, under the MIT license, without warranty. Mainnet (`blockula-1`) is new and isn't externally audited. Read [docs/RISKS.md](RISKS.md) and the [Terms](../TERMS.md).
+> - **It's experimental software, provided as is**, under the MIT license, without warranty. It isn't externally audited.
 > - **Validators can lose stake.** Signing two different blocks for the same turn (two copies of one key, a restored disk) slashes 5% of the validator's pool, its delegators' stake included, and bans the validator for good. Missing too many turns jails it and slashes a little.
-> - **Stake is slow to leave.** Unbonding takes 21 days on mainnet, and FANG that's unbonding can still be slashed for a fault from before it left.
+> - **Stake is slow to leave.** Unbonding takes 21 days by default (a week on the public testnet), and FANG that's unbonding can still be slashed for a fault from before it left.
 > - **Upgrades can stop your node.** When governance schedules a protocol version your release doesn't run, your node stops at that height until you install one that does. The network can also be halted on purpose to fix a problem.
-> - **Most validators are run by Blockula's founder** at launch, and until the bootstrap period ends they can pass proposals as a council.
-> - **No pay is promised.** Validator rewards come from protocol issuance and aren't guaranteed. The bootstrap delegation backing each mainnet launch seat pays no commission (its cap is 0). A validator earns on its own stake until outside delegators appear; its commission on those still applies. There's no service agreement and no compensation for downtime, slashes or halts.
-> - **You're responsible for your own compliance:** the law where you are, taxes, and your hosting provider's terms (some ban blockchain workloads).
+> - **Whoever runs the validators governs at first.** Until a chain's bootstrap period ends, its validators can pass proposals as a council. The project runs all of the public testnet's.
+> - **Validating isn't paid work.** Rewards are FANG from the chain's issuance, and FANG has no value. There's no service agreement and no compensation for downtime, slashes or halts.
+> - **You're responsible for your own compliance:** the law where you are, and your hosting provider's terms (some ban blockchain workloads).
 > - **Your validator's addresses are public and permanent.** The chain publishes the p2p and HTTP addresses you register, and peers see your node's IP.
 
 ## Which node?
@@ -79,7 +77,7 @@ It fetches the genesis from that node, checks it against the one this release kn
   WantedBy=multi-user.target
   ```
 
-- **Mainnet** (`blockula-1`): the launch release builds in its genesis. Until it does, this binary refuses to join it. Then it's the same command with the network's public RPC as `--genesis`.
+- **A chain someone launched** ([LAUNCH.md](LAUNCH.md)): the same command with one of its nodes as `--genesis`, and the genesis hash its creator gives you as `--genesis-hash`.
 
 ## Use your node
 
@@ -112,7 +110,7 @@ Point everything at `http://localhost:7171`. Your own node answers for what you 
     -- npx -y @blockula/mcp --network testnet
   ```
 
-- **The web wallet:** open the network menu and pick **Custom node…**, then enter your node's URL. The wallet then shows a warning, because a custom node isn't checked against the network's pins. Browsers may refuse a plain-`http` node from an `https` page, so serve it over HTTPS, or use the SDK, MCP or CLI. A "my node" option that keeps the network's pins is planned for launch week.
+- **The web wallet:** open the network menu and pick **Custom node…**, then enter your node's URL. The wallet then shows a warning, because a custom node isn't checked against the network's pins. Browsers may refuse a plain-`http` node from an `https` page, so serve it over HTTPS, or use the SDK, MCP or CLI. A "my node" option that keeps the network's pins is planned.
 
 ## Running at home
 
@@ -164,14 +162,11 @@ blockula validator set-addr --key ~/val/validator.key --rpc https://blockula-tes
 
 It signs `update_validator` with your current commission, so only the addresses change. The consensus key can do this once an epoch; the owner's key any time. `--home` also updates `node.json`, which your node advertises: restart it afterwards. [OPERATIONS.md, Moving a validator](OPERATIONS.md#moving-a-validator) covers a move to another machine.
 
-On mainnet, `init`, `register` and `stake delegate` also print a short summary of what staking risks, and every signing command shows a one-time notice the first time it reaches `blockula-1`.
-
 ## Getting the self-bond
 
 <!-- D8 (decided 2026-10-21): the self-bond path for outside validators. Keep it in this section. -->
 
-A validator registers with a self-bond of at least the chain's `min_self_bond`: 10,000 FANG on mainnet and on the public testnet.
+A validator registers with a self-bond of at least the chain's `min_self_bond`: 10,000 FANG on the public testnet. A chain you launch sets its own: `blockula summon` defaults to 50 FANG, and to 10,000 with `--no-faucet` ([LAUNCH.md](LAUNCH.md#who-can-join)).
 
 - **Public testnet:** ask for a 10,000 test-FANG self-bond with the [node operator form](https://github.com/jackdishman/blockula/issues/new?template=node-operator.yml). The faucet gives 100 test FANG at a time (once an hour per address, once every 10 minutes per IP), so collecting the bond from it takes 17 hours at best. Test FANG has no value.
-- **Mainnet:** there's no faucet, and almost no FANG circulates at launch. Outside operators who are ready by the genesis ceremony get a locked allocation from the security-grants allocation, enough to self-bond. After genesis, new seats and grants go through governance.
-- **Plan to validate without operating pay in year 1.** The bootstrap delegation pays no commission (its cap is 0), so an operator earns only on its own stake until outside delegators appear. The validator's commission on outside delegations still applies under the chain's normal commission cap. Rewards aren't guaranteed.
+- **A chain you launch:** its faucet pays the bond (`blockula wallet faucet --to`), or, on a chain without one, a validator's account sends it (`blockula wallet send --key`): [LAUNCH.md](LAUNCH.md).

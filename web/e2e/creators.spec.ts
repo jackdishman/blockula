@@ -269,7 +269,7 @@ test.describe("contribution pages", () => {
   });
 
   test("carry the testnet note, the bond's terms and a claim's timeline", async ({ page }) => {
-    const note = "Testnet FANG, Hunts and Soul have no monetary value and come with no promise of any mainnet allocation.";
+    const note = "Testnet FANG, Hunts and Soul have no value.";
     for (const path of ["/hunt/0", "/claim/0", "/seance/1"]) {
       await page.goto(path);
       await expect(page.getByTestId("contribution-note"), path).toHaveText(note);
@@ -306,7 +306,7 @@ test.describe("contribution pages", () => {
     await page.goto("/programs/pool");
     await page.locator("summary", { hasText: "Claim a merged PR" }).click();
     await expect(page.locator("details.action[open]")).toContainText("A bond is held until it's judged: it's returned unless validators refute the claim or the jury marks it spam.");
-    await expect(page.locator(".card-note", { hasText: "On the testnet: Testnet FANG, Hunts and Soul have no monetary value" })).toBeVisible();
+    await expect(page.locator(".card-note", { hasText: "On the testnet: Testnet FANG, Hunts and Soul have no value." })).toBeVisible();
     await expect(page.locator("main")).not.toContainText("refundable bond is held");
     await page.goto("/programs/hunts");
     // Mainnet's note is the one D7 spot (lib/creators.ts): checked as that constant, not as words.

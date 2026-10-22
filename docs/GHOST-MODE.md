@@ -353,7 +353,7 @@ length checks before slicing), so nothing in it can wrap in either profile.
 `node/src/ghost.rs`, with hooks in `types.rs` (encodings), `chain.rs` (admission, execution,
 mempool), `consensus.rs` (size limits, proofs before voting), `state/` (records) and `api.rs`.
 Every ghost action is refused ("Ghost Mode is off") until governance runs
-`ActivateFeature { ghost }` (upgrade.rs); a mainnet genesis can't list the feature
+`ActivateFeature { ghost }` (upgrade.rs); a `blockula-1` genesis can't list the feature
 (`Genesis::check`), and `ghost_pool_cap` starts at 0, so an activated pool still takes no
 deposits until governance raises the cap too.
 

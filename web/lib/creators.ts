@@ -131,7 +131,7 @@ export const MULTISIG_APPROVALS =
  * must keep).
  */
 export const CONTRIBUTION_NOTES = {
-  testnet: "Testnet FANG, Hunts and Soul have no monetary value and come with no promise of any mainnet allocation.",
+  testnet: "Testnet FANG, Hunts and Soul have no value.",
   mainnet:
     "How Hunts and the contribution pool work on mainnet is still being designed. Mainnet FANG is experimental and may be worth nothing, and nothing here promises income. You're responsible for any taxes. Provisional, under counsel review.",
 } as const;

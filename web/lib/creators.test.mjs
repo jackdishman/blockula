@@ -98,7 +98,7 @@ test("a multisig says how many owners must approve", () => {
 });
 
 test("contribution notes: testnet's is the house line, and the bond isn't 'refundable'", () => {
-  assert.equal(CONTRIBUTION_NOTES.testnet, "Testnet FANG, Hunts and Soul have no monetary value and come with no promise of any mainnet allocation.");
+  assert.equal(CONTRIBUTION_NOTES.testnet, "Testnet FANG, Hunts and Soul have no value.");
   assert.equal(BOND_TERMS, "returned unless validators refute the claim or the jury marks it spam");
   assert.equal(CONTRIBUTION_NOTES_BOTH, `On the testnet: ${CONTRIBUTION_NOTES.testnet} On mainnet: ${CONTRIBUTION_NOTES.mainnet}`);
   for (const s of [CONTRIBUTION_NOTES.testnet, BOND_TERMS]) assert.doesNotMatch(s, /contract|refundable/i);

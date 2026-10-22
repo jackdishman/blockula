@@ -72,4 +72,4 @@ All checked on 2026-10-14. Each pinned version is the newest release.
 | `@noble/hashes` | `2.4.0` | Audited by Cure53 at 1.0.0 (January 2022), but that audit's scope excluded `blake3`, which the SDK uses for addresses and key ids. The cross-implementation vectors check its BLAKE3 against the Rust crate's. |
 | `@scure/base` | `2.4.0` | Address encoding. Audited by Cure53 at 1.0.0, self-audited at 2.2.0. |
 
-Commonware (consensus, p2p, codec) is pinned separately at `=2026.9.0`. SEC-1's external audit has to cover our use of both ML-DSA libraries (MAINNET.md SEC-2).
+Commonware (consensus, p2p, codec) is pinned separately at `=2026.9.0`. An external audit of the protocol ([docs/AUDIT_SCOPE.md](../../../docs/AUDIT_SCOPE.md)) would have to cover our use of both ML-DSA libraries.

@@ -2,7 +2,7 @@
 
 Humans and agents are both welcome. Agents contribute as **Familiars** of a human sponsor, who is accountable for their work and receives their rewards (see "Proof of Contribution" in [docs/PLAN.md](docs/PLAN.md)).
 
-> Testnet FANG, Hunts and Soul have no monetary value and come with no promise of any mainnet allocation.
+> Testnet FANG, Hunts and Soul have no value.
 
 ## Hunts: bounties with acceptance criteria
 - Open Hunts are GitHub issues labeled [`hunt`](https://github.com/jackdishman/blockula/issues?q=is%3Aopen+label%3Ahunt). Each has objective acceptance criteria and a testnet FANG bounty escrowed on-chain.

@@ -1,8 +1,6 @@
 # FANG tokenomics (mainnet design)
 
-> **Status: decided design, not final.** This is DEC-5 in [MAINNET-DESIGN.md](MAINNET-DESIGN.md), written out. It becomes final only after written opinions from securities and tax counsel (MAINNET.md LEG-1), before the genesis ceremony. Nothing here is legal, tax or investment advice, and nothing here is an offer: FANG is not sold.
->
-> **Testnets:** testnet FANG, Hunts and Soul have no monetary value and come with no promise of any mainnet allocation. Mainnet (`blockula-1`) is a new chain, and no testnet balance carries over.
+> **There's no mainnet** (decided Oct 22, 2026). Blockula is a kit for running your own ledger ([LAUNCH.md](LAUNCH.md)), and each chain's FANG has no value: nobody sells it, buys it or is paid in it. This is DEC-5 in [MAINNET-DESIGN.md](MAINNET-DESIGN.md), written out. Its allocation buckets were the mainnet's plan, and so were the founder's share and the legal posture (sections 7 and 9). The issuance schedule applies to every Blockula chain. Nothing here is legal, tax or investment advice, or an offer.
 
 FANG is the native token of Blockula. It pays transaction fees, bonds validators and delegations, is locked to vote in governance, and registers `.boo` names. 1 FANG = 10⁹ drops. All on-chain amounts are integers in drops, and every formula below is integer math.
 
@@ -147,7 +145,7 @@ Staking rewards are payment for validating and securing the network. They aren't
 
 ## 9. Legal posture
 
-> **Not legal advice; pending counsel.** This summarizes engineering-side research (as of 2026-10-14) to prepare the brief for counsel, [COUNSEL_BRIEF.md](COUNSEL_BRIEF.md). Every conclusion here needs a written opinion before genesis.
+> **Not legal advice; pending counsel.** This summarizes engineering-side research (as of 2026-10-14) to prepare the brief for counsel, COUNSEL_BRIEF.md (removed with the mainnet plan). Every conclusion here needs a written opinion before genesis.
 
 **The aim** is a permissionless protocol whose token is the native asset of a working network: never sold, with no promises of managerial efforts, and no central party.
 

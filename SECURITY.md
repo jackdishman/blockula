@@ -1,6 +1,6 @@
 # Security policy
 
-Blockula is an unaudited testnet: it has had an internal review but no third-party audit yet (see the README). Nothing on it has real value, but the code is meant to secure a mainnet one day, so we want to hear about every vulnerability now.
+Blockula is software for running your own ledger, and a public testnet that runs it. It has had an internal review but no third-party audit (see the README). FANG has no value on any chain, but the chains people launch with Blockula should still be safe to run, so we want to hear about every vulnerability.
 
 ## Reporting
 
@@ -17,7 +17,7 @@ Include what you found, how to reproduce it (a deterministic repro, such as a fa
 
 Especially wanted: anything that halts or splits the chain, mints or moves FANG without authorization, bypasses a session key's limits, forges a signature or certificate, or makes nodes disagree on state.
 
-Known limitations listed in [docs/PLAN.md](docs/PLAN.md#known-limits) and [docs/MAINNET.md](docs/MAINNET.md) are known, but a concrete exploit of one is still welcome.
+Known limitations listed in [docs/PLAN.md](docs/PLAN.md#known-limits) are known, but a concrete exploit of one is still welcome.
 
 ## Fuzzing findings
 
@@ -32,11 +32,11 @@ These are targets, not guarantees:
 
 ## Bug bounty
 
-[docs/BUG_BOUNTY.md](docs/BUG_BOUNTY.md) has the scope, severity tiers, rewards, rules and safe harbor. It opens, funded, on the incentivized testnet at least a month before mainnet; until the amounts are confirmed there, valid reports are rewarded under its table once it is.
+[docs/BUG_BOUNTY.md](docs/BUG_BOUNTY.md) has the scope, severity levels, rules and safe harbor. There's no paid bounty program: any reward is at the maintainers' discretion, and nothing in these files is an offer to pay.
 
 ## Audits
 
-No third-party audit yet. The scope for the external audit of the mainnet code (SEC-1) is [docs/AUDIT_SCOPE.md](docs/AUDIT_SCOPE.md); reports will be published here when they're done.
+No third-party audit. [docs/AUDIT_SCOPE.md](docs/AUDIT_SCOPE.md) is the scope an external audit of the protocol would cover; a report would be published here.
 
 The internal review of protocol v1 and its fix rounds (October 2026) is [docs/AUDIT-2026-10.md](docs/AUDIT-2026-10.md): its findings, their fixes, and the risks and limits that remain. AI models ran it. It is not a third-party audit and doesn't replace one.
 

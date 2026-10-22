@@ -1,10 +1,12 @@
 # Genesis ceremony
 
-How mainnet (`blockula-1`, prefix `boo`) gets its first validator set and its `genesis.json`. Closes the process side of OPS-1 (key ceremony, operator independence) and OPS-2 (a genesis built from reviewed inputs and reproduced by several parties) in [MAINNET.md](MAINNET.md). The rules come from [MAINNET-DESIGN.md](MAINNET-DESIGN.md): DEC-3 (21–32 independent operators), DEC-7 (chain id and prefix), DEC-10 (no admin keys, no faucet), DEC-14 (hosting limits) and 3.7 (the deterministic builder). Operator requirements are in [OPERATIONS.md](OPERATIONS.md).
+> **There's no mainnet** (decided Oct 22, 2026). Blockula is a kit for running your own ledger ([LAUNCH.md](LAUNCH.md)), where `blockula summon` makes a chain's genesis. This ceremony was `blockula-1`'s plan; its builder and the rules it checks are what any chain built from a reviewed spec uses. MAINNET.md, the mainnet readiness list it cites, was removed with the plan (`git show a7288977:docs/MAINNET.md` shows it).
+
+How mainnet (`blockula-1`, prefix `boo`) gets its first validator set and its `genesis.json`. Closes the process side of OPS-1 (key ceremony, operator independence) and OPS-2 (a genesis built from reviewed inputs and reproduced by several parties) in MAINNET.md. The rules come from [MAINNET-DESIGN.md](MAINNET-DESIGN.md): DEC-3 (21–32 independent operators), DEC-7 (chain id and prefix), DEC-10 (no admin keys, no faucet), DEC-14 (hosting limits) and 3.7 (the deterministic builder). Operator requirements are in [OPERATIONS.md](OPERATIONS.md).
 
 The testnet did all of this on one laptop (`deploy/launch.sh`). Mainnet must not: **no private key in this ceremony is ever generated, seen or held by anyone but its owner.**
 
-The genesis builder is `blockula genesis operator` and `blockula genesis build` (P-ECON, `node/src/genesis_builder.rs`); `deploy/mainnet/genesis-spec.example.toml` is a complete example spec (the DEC-5 allocation on a throwaway chain).
+The genesis builder is `blockula genesis operator` and `blockula genesis build` (P-ECON, `node/src/genesis_builder.rs`); `node/testdata/genesis-example/spec.toml` is a complete example spec (the DEC-5 allocation on a throwaway chain).
 
 ## Roles
 
@@ -114,7 +116,7 @@ The coordinator checks every submission: the PoP verifies for `blockula-1`; keys
 
 ## 4. The spec
 
-`genesis/blockula-1/spec.toml` (format: `deploy/mainnet/genesis-spec.example.toml`) collects everything the genesis is made from, as reviewed text:
+`genesis/blockula-1/spec.toml` (format: `node/testdata/genesis-example/spec.toml`) collects everything the genesis is made from, as reviewed text:
 
 - `chain_id = "blockula-1"`, address prefix `boo`, and a fixed `genesis_time` (UTC milliseconds), never "now";
 - protocol parameters (block time, epoch length, `max_validators = 32`, staking, slashing, fees, issuance, governance; MAINNET-DESIGN section 3);
@@ -143,7 +145,7 @@ Each builder posts, in the ceremony issue and signed (a signed commit adding `ge
 
 - `genesis.json` is committed as `genesis/blockula-1/genesis.json` before the release is tagged. The release workflow attaches it as `genesis-blockula-1.json`, attests it and lists it in `checksums.txt`, so the offline ML-DSA release signature covers it.
 - The mainnet genesis hash is compiled into the binary as the known hash for `blockula-1` (CRY-2): the launch release sets `genesis_hash` in `node/checkpoints/blockula-1.json`, a placeholder until then, so earlier binaries refuse `blockula-1` altogether. `blockula join` and `blockula run` refuse any other genesis for that chain id, `--genesis-hash` or not.
-- One command makes the launch release's pins, once the builders' hashes match: `CONFIRM_MAINNET=<hash> scripts/pin-network.sh blockula-1 <hash> --mainnet --genesis <genesis.json> [--rpc https://<public RPC>]…`, with `spec.toml` and `operators/` beside the genesis. It refuses unless the spec rebuilds the genesis byte for byte and the genesis hashes to the hash given (twice), then writes the checkpoint file, `genesis/blockula-1/` (genesis, spec, operators), the MCP's known genesis, **genesis clock** and public RPCs (`mcp/src/network.ts`) and the wallet's built-in mainnet genesis hash and **clock** (`web/lib/config.ts`). The clock (`created_at_ms`, `block_time_ms`) is what lets clients refuse a node that reports a height the chain can't have reached, before anything is signed; without the pin they take it from the first node they ask. The same PR deletes the placeholder test the script names (`checkpoints::tests::embedded_files_parse_and_mainnet_waits_for_its_ceremony`), and the wallet's deployment sets `NEXT_PUBLIC_MAINNET_GENESIS_HASH` to the same hash (a mainnet build refuses a different one). The launch runbook is [deploy/mainnet/README.md](../deploy/mainnet/README.md).
+- One command makes the launch release's pins, once the builders' hashes match: `CONFIRM_MAINNET=<hash> scripts/pin-network.sh blockula-1 <hash> --mainnet --genesis <genesis.json> [--rpc https://<public RPC>]…`, with `spec.toml` and `operators/` beside the genesis. It refuses unless the spec rebuilds the genesis byte for byte and the genesis hashes to the hash given (twice), then writes the checkpoint file, `genesis/blockula-1/` (genesis, spec, operators), the MCP's known genesis, **genesis clock** and public RPCs (`mcp/src/network.ts`) and the wallet's built-in mainnet genesis hash and **clock** (`web/lib/config.ts`). The clock (`created_at_ms`, `block_time_ms`) is what lets clients refuse a node that reports a height the chain can't have reached, before anything is signed; without the pin they take it from the first node they ask. The same PR deletes the placeholder test the script names (`checkpoints::tests::embedded_files_parse_and_mainnet_waits_for_its_ceremony`), and the wallet's deployment sets `NEXT_PUBLIC_MAINNET_GENESIS_HASH` to the same hash (a mainnet build refuses a different one).
 - The hash is also published on the website, the project's social accounts and in the operator channel, so no single channel can substitute it.
 - Each operator checks before starting: `sha256sum genesis.json` against the published value, and the hash the node prints at startup against the genesis hash.
 
