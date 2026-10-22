@@ -1,12 +1,13 @@
-# Example genesis spec: blockula-1's experimental launch shape, with the DEC-5 allocation
-# (docs/TOKENOMICS.md), on a throwaway chain.
+# Example genesis spec, and the genesis builder's test fixture (genesis_builder::tests): the shape
+# of blockula-1's experimental launch, which was planned and then dropped (there's no mainnet),
+# with the DEC-5 allocation (docs/TOKENOMICS.md), on a throwaway chain.
 #
-#   blockula genesis build --spec deploy/mainnet/genesis-spec.example.toml --out genesis.json
+#   blockula genesis build --spec node/testdata/genesis-example/spec.toml --out genesis.json
 #
-# The real one is genesis/blockula-1/spec.toml, reviewed and frozen as docs/GENESIS_CEREMONY.md
-# describes. Every builder must get the same genesis.json (byte for byte) and genesis hash from
-# the same spec and binary. Addresses marked PLACEHOLDER are keyless stand-ins that the ceremony
-# replaces with the recipients' real accounts; the operators (operators/*.toml) use throwaway keys.
+# docs/GENESIS_CEREMONY.md describes how a real spec is reviewed and frozen. Every builder must get
+# the same genesis.json (byte for byte) and genesis hash from the same spec and binary. Addresses
+# marked PLACEHOLDER are keyless stand-ins for the recipients' real accounts; the operators
+# (operators/*.toml) use throwaway keys.
 #
 # The experimental launch: the founder's four validators on Fly.io, born at protocol v2 with
 # programs off, and governance live from block 1. The set breaks the independence policy on

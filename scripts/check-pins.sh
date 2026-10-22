@@ -34,7 +34,6 @@ while read -r where image; do
   [[ $image =~ @sha256:[0-9a-f]{64}$ ]] || bad "image not pinned by digest: $where $image"
 done < <( {
   grep -nE '^FROM ' deploy/Dockerfile | sed -E 's/^([0-9]+):FROM ([^ ]+).*/deploy\/Dockerfile:\1 \2/'
-  grep -nE '^FROM ' deploy/mainnet/Dockerfile | sed -E 's/^([0-9]+):FROM ([^ ]+).*/deploy\/mainnet\/Dockerfile:\1 \2/'
   grep -nE '^RELEASE_IMAGE=' scripts/reproduce-release.sh | sed -E 's/^([0-9]+):RELEASE_IMAGE=/scripts\/reproduce-release.sh:\1 /'
   grep -noE '(image|container): *"?[^"}, ]+' deploy/monitoring/docker-compose.yml "${workflows[@]}" /dev/null \
     | grep -vF "\${{" | sed -E 's/^([^:]+:[0-9]+):(image|container): *"?/\1 /'
@@ -60,7 +59,7 @@ done < <(grep -nE '(^|[^-])cargo (build|test|clippy|run|install)\b' "${workflows
 # key, node/src/release_cli.rs.)
 while IFS= read -r hit; do
   bad "a release or image build enables cargo features: $hit"
-done < <(grep -nE -- '--(all-)?features|test-release-key' .github/workflows/release.yml scripts/release-build.sh scripts/reproduce-release.sh deploy/Dockerfile deploy/mainnet/Dockerfile /dev/null 2>/dev/null || true)
+done < <(grep -nE -- '--(all-)?features|test-release-key' .github/workflows/release.yml scripts/release-build.sh scripts/reproduce-release.sh deploy/Dockerfile /dev/null 2>/dev/null || true)
 # … nor by a manifest: test-release-key is named only where node/Cargo.toml defines it, so no
 # `default = […]`, other feature or dependency turns it on in a plain `cargo build --release`
 # (where the Rust tests that hold the built-in key to the real one are compiled out).

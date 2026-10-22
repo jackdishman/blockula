@@ -2,8 +2,8 @@
 # Offline tests of scripts/testnet-watch.sh (CI `ops` job): its checks against a mock node
 # (python3 -I serving canned JSON on a random localhost port, switched between healthy, stalled,
 # wrong-chain, jailed, tombstoned, down, hanging, flaky and hostile answers) and its alert issue
-# against a stand-in gh that records every call and the bodies it would post, as the testnet's
-# watch and as mainnet's (NETWORK=mainnet). Nothing here talks to a node or to GitHub.
+# against a stand-in gh that records every call and the bodies it would post. Nothing here talks
+# to a node or to GitHub.
 #
 #   bash scripts/test-testnet-watch.sh
 set -euo pipefail
@@ -307,34 +307,6 @@ code=$(watch healthy EXPECT_VALIDATORS=four)
 [ "$code" = 2 ] && [ ! -s "$T/gh.log" ] && expect "bad input: exit 2, nothing called" "$(out)" "EXPECT_VALIDATORS must be a whole number" || bad "bad input: exited $code: $(out)"
 code=$(watch healthy TEST_ALERT=yes)
 [ "$code" = 2 ] && ok "TEST_ALERT must be true or false" || bad "TEST_ALERT=yes: exited $code: $(out)"
-
-# ---- NETWORK=mainnet: mainnet's node and chain, its own alert issue ----
-
-code=$(watch healthy NETWORK=mainnet RPC=)
-[ "$code" = 2 ] && [ ! -s "$T/gh.log" ] && expect "mainnet: no default node (exit 2, nothing called)" "$(out)" "RPC must name the node to watch" || bad "mainnet without RPC: exited $code: $(out)"
-code=$(watch healthy NETWORK=moon)
-[ "$code" = 2 ] && expect "NETWORK must be testnet or mainnet" "$(out)" "NETWORK must be testnet or mainnet" || bad "NETWORK=moon: exited $code: $(out)"
-code=$(watch healthy NETWORK=mainnet)
-[ "$code" = 0 ] && expect "mainnet: expects blockula-1 by default" "$(out)" "✗ chain id: blockula-testnet-2, expected blockula-1" || bad "mainnet: exited $code: $(out)"
-expect "mainnet: says what it watched" "$(out)" "Mainnet watch of $RPC (expecting blockula-1)"
-[ "$(order)" = "issue list,label create,issue create" ] && expect "mainnet: looks for, labels and opens a mainnet-alert issue" "$(calls)" "issue list --label mainnet-alert --state open" || bad "mainnet: gh calls: $(calls)"
-expect "mainnet: its own label" "$(calls)" "label create mainnet-alert --color B60205 --description Opened and closed by the external mainnet watch (mainnet-watch.yml)"
-expect "mainnet: titled as mainnet's" "$(calls)" "issue create --title Mainnet alert: chain id: blockula-testnet-2, expected blockula-1 --label mainnet-alert"
-b=$(body)
-expect "mainnet: the body names mainnet" "$b" "@jackdishman the external watch found mainnet failing: **chain id** is the first failing check."
-expect "mainnet: and its runbook" "$b" "mainnet's runbook: \`deploy/mainnet/README.md\`"
-expect "mainnet: its reports carry mainnet's marker" "$b" "<!-- mainnet-watch failing=chain_id at="
-refute "mainnet: nothing about the testnet" "$(calls)
-$b" "testnet-alert"
-code=$(watch healthy NETWORK=mainnet CHAIN_ID=blockula-testnet-2)
-[ "$code" = 0 ] && [ "$(calls)" = "issue list --label mainnet-alert --state open --json number --limit 100" ] && ok "mainnet: CHAIN_ID overrides, and a healthy run only looks" || bad "mainnet healthy: exited $code: $(calls) $(out)"
-code=$(watch wrong-chain NETWORK=mainnet CHAIN_ID=blockula-testnet-2 FAKE_GH_OPEN=7 FAKE_GH_VIEW="$(seen chain_id $((now - 900)) chain_id $((now - 300)))")
-[ "$code" = 0 ] && [ "$(order)" = "issue list,issue view,issue comment" ] && ok "mainnet: a testnet report's marker isn't mainnet's (a comment)" || bad "mainnet marker: exited $code, gh calls: $(calls)"
-mseen() { printf '{"body":"<!-- mainnet-watch failing=%s at=%s -->","comments":[]}' "$1" "$2"; }
-code=$(watch wrong-chain NETWORK=mainnet CHAIN_ID=blockula-testnet-2 FAKE_GH_OPEN=7 FAKE_GH_VIEW="$(mseen chain_id $((now - 300)))")
-[ "$code" = 0 ] && [ "$(order)" = "issue list,issue view" ] && ok "mainnet: its own recent report: no new comment" || bad "mainnet recent report: exited $code, gh calls: $(calls)"
-code=$(watch healthy NETWORK=mainnet CHAIN_ID=blockula-testnet-2 TEST_ALERT=true)
-expect "mainnet: a test alert names mainnet-watch.yml" "$(body)" "from a manual run of \`mainnet-watch.yml\` with \`test_alert\`"
 
 refute "the token (GH_TOKEN) is never printed, nor passed to gh as an argument, in any run" "$(cat "$T/all")" "$TOKEN"
 

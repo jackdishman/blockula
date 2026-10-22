@@ -835,7 +835,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Faucet drips per hour (test chains only; mainnet has no faucet).",
+      "description": "Faucet drips per hour (chains with a faucet only).",
       "gridPos": {
         "h": 8,
         "w": 12,
