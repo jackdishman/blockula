@@ -80,8 +80,13 @@ jobs:
       - run: npm run build -w @blockula/sdk && npm run build -w @blockula/mcp
       - name: 4 validators + full node + SDK e2e + CLI
         run: bash scripts/local-testnet.sh
+      # The runbook test below runs a blockula built to trust its test release key (only the
+      # blockula crate rebuilds), so the real key id the ceremony builds in doesn't change what it
+      # runs (review-r4-supply-1). No release, image or reproduction enables the feature.
+      - name: A blockula that trusts the test release key (--features test-release-key)
+        run: cargo build --release --locked --manifest-path node/Cargo.toml --features test-release-key
       # The install, upgrade, patch and key-rotation runbooks in docs/OPERATIONS.md, pasted as
-      # written, with the binary local-testnet.sh just built: each fails closed, and a release
+      # written, with the binary the step above just built: each fails closed, and a release
       # can't vouch for itself (audit F49).
       - name: Release runbooks as pasted (real blockula release install|sign|verify)
         run: bash scripts/test-release-runbook.sh
@@ -218,6 +223,11 @@ jobs:
       # stand-in fly (retries, RESET, key removal, rolling restarts), offline.
       - name: Testnet deploy scripts (deploy/entrypoint.sh, fly-config.sh, launch.sh, set-github-token.sh, restart-gate.sh)
         run: ENTRY_SH=dash bash deploy/test-deploy.sh
+      # Mainnet's launcher against the same stand-ins: its refusals (testnet-2's names, RESET, a
+      # dirty checkout, an unverified release, keys that aren't the genesis's), the image from
+      # the verified binary, the launch and key removal, and the gated rolling upgrade, offline.
+      - name: Mainnet launcher (deploy/mainnet/launch-mainnet.sh against a stand-in fly)
+        run: bash deploy/mainnet/test-launch-mainnet.sh
       # The public testnet's external watch (testnet-watch.yml): its checks and its alert issue,
       # against a mock node and a stand-in gh, offline.
       - name: Testnet watch (scripts/testnet-watch.sh against a mock node and a stand-in gh)

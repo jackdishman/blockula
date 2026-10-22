@@ -1,6 +1,6 @@
 import type { NextConfig } from "next";
 import path from "node:path";
-import { isNodeUrl, MAINNET_GENESIS_HASH, NETWORKS, rpIdProblem } from "./lib/config";
+import { isNodeUrl, MAINNET_GENESIS_HASH, MAINNET_GENESIS_HASH_ENV, NETWORKS, rpIdProblem } from "./lib/config";
 import { STATIC_HEADERS } from "./lib/csp";
 
 // Node URLs end up in the CSP and genesis pins in every status check: a malformed one must fail
@@ -15,7 +15,9 @@ if (process.env.NEXT_PUBLIC_NETWORK === "mainnet") {
   const problems = [
     rpIdProblem(),
     !NETWORKS.mainnet && "NEXT_PUBLIC_MAINNET_RPC is unset",
-    !/^[0-9a-f]{64}$/.test(MAINNET_GENESIS_HASH ?? "") && "NEXT_PUBLIC_MAINNET_GENESIS_HASH must be the 64-hex genesis hash",
+    !/^[0-9a-f]{64}$/.test(MAINNET_GENESIS_HASH_ENV ?? "") && "NEXT_PUBLIC_MAINNET_GENESIS_HASH must be the 64-hex genesis hash",
+    // Once the release builds the hash in (scripts/pin-network.sh), the deployment must agree.
+    MAINNET_GENESIS_HASH && MAINNET_GENESIS_HASH_ENV !== MAINNET_GENESIS_HASH && `NEXT_PUBLIC_MAINNET_GENESIS_HASH isn't the genesis hash this release pins (${MAINNET_GENESIS_HASH})`,
   ].filter(Boolean);
   if (problems.length) throw new Error(`Refusing to build the mainnet wallet: ${problems.join("; ")}.`);
 }

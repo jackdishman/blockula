@@ -29,7 +29,8 @@ import { join } from "node:path";
 import { Client as McpClient } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
-import { NAMESPACES, addressFromPublicKey, decodeKeyGrant, keyHash, leafHash, parseFang, proposalDigest, txId, valueHash, verifyKeyGrant, type Tx } from "@blockula/sdk";
+import { NAMESPACES, addressFromPublicKey, decodeKeyGrant, heightLimit, keyHash, leafHash, parseFang, proposalDigest, txId, valueHash, verifyKeyGrant, type Tx } from "@blockula/sdk";
+import { KNOWN_CLOCKS, KNOWN_GENESIS } from "../src/network.js";
 import { SpendLedger } from "../src/spend.js";
 import { chainData, clean } from "../src/untrusted.js";
 
@@ -653,8 +654,12 @@ await s.close();
 // Mainnet without witnesses: where an address is needed (stake, use_account) a name is one node's
 // word, so nothing is signed until the user confirms the address (the agent then passes it). A
 // payment signs the name, which the chain resolves itself: no confirmation needed.
+// The fake node is on blockula-1 as the launch release pins it, if it does (mcp/src/network.ts): its
+// genesis, and a height its genesis clock allows (none past 0 before genesis time).
+const mainnetClock = KNOWN_CLOCKS["blockula-1"];
+const MAINNET_STATUS = { chain_id: "blockula-1", genesis_hash: KNOWN_GENESIS["blockula-1"] ?? G, height: mainnetClock ? Math.min(10, heightLimit(mainnetClock.createdAtMs, mainnetClock.blockTimeMs, Date.now())) : 10 };
 rmSync(join(home, "known-chains.json"), { force: true });
-mode.status = { chain_id: "blockula-1" };
+mode.status = MAINNET_STATUS;
 s = await server({ BLOCKULA_NETWORK: "mainnet", BLOCKULA_CHAIN_ID: "blockula-1" });
 before = posted.length;
 r = await s.call("stake", { validator: "bob.boo", amount: "1" });

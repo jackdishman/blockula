@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # The public testnet, watched from outside Fly: .github/workflows/testnet-watch.yml runs this on a
 # GitHub runner every 5 minutes, as GitHub's scheduler allows (deploy/README.md "External watch").
+# With NETWORK=mainnet it watches mainnet's RPC instead (.github/workflows/mainnet-watch.yml,
+# deploy/mainnet/README.md "Monitoring"): RPC has no default there, the chain id is blockula-1,
+# and the alert is its own (a mainnet-alert issue, "Mainnet alert: …").
 # Each check is a line of the report:
 #   health                /api/health answers HTTP 200 with ok: true
 #   chain id              /api/status reports CHAIN_ID
@@ -10,7 +13,7 @@
 #   jailed or tombstoned  /api/validators lists none (the report counts each)
 # No answer, a timeout or an answer that isn't JSON fails the check that needed it.
 #
-# The alert is a GitHub issue labeled testnet-alert. When a check fails (or TEST_ALERT=true), the
+# The alert is a GitHub issue labeled testnet-alert (mainnet-alert). When a check fails (or TEST_ALERT=true), the
 # open one gets the report as a comment, but while the same checks keep failing only every
 # REMIND_SECS (a hidden marker in each report records which checks failed and when), since every
 # comment notifies the maintainer. With none open, one is opened (the label created if missing)
@@ -26,13 +29,28 @@
 #   scripts/testnet-watch.sh
 #   DRY_RUN=true scripts/testnet-watch.sh   # prints the gh calls instead of making them (no gh
 #                                           # needed; it assumes no alert issue is open)
-# Environment: RPC, CHAIN_ID, EXPECT_VALIDATORS, MAX_HEAD_AGE_MS, TEST_ALERT, DRY_RUN, GH (the gh
-# command; the tests use a stand-in), WAIT_SECS, CURL_TIMEOUT, CURL_RETRIES, MENTION, REMIND_SECS.
+# Environment: NETWORK (testnet or mainnet: the defaults and the alert's names), RPC, CHAIN_ID,
+# EXPECT_VALIDATORS, MAX_HEAD_AGE_MS, TEST_ALERT, DRY_RUN, GH (the gh command; the tests use a
+# stand-in), WAIT_SECS, CURL_TIMEOUT, CURL_RETRIES, MENTION, REMIND_SECS.
 set -euo pipefail
 
-RPC=${RPC:-https://blockula-testnet.fly.dev}
+usage() { echo "✗ testnet-watch.sh: $*" >&2; exit 2; }
+NETWORK=${NETWORK:-testnet}
+# Per network: its name in the alert, what the alert calls the network, the node and chain watched
+# by default, and where its runbook is. The label, the issues' marker and the workflow follow the
+# name (testnet-alert, testnet-watch, testnet-watch.yml).
+case $NETWORK in
+  testnet) NAME=Testnet WHAT="the public testnet" DEFAULT_RPC=https://blockula-testnet.fly.dev DEFAULT_CHAIN=blockula-testnet-2
+    RUNBOOK="the testnet's day-2 tasks: \`deploy/README.md\` \"Day 2\"" ;;
+  mainnet) NAME=Mainnet WHAT=mainnet DEFAULT_RPC="" DEFAULT_CHAIN=blockula-1
+    RUNBOOK="mainnet's runbook: \`deploy/mainnet/README.md\`" ;;
+  *) usage "NETWORK must be testnet or mainnet (got '$NETWORK')" ;;
+esac
+KIND=$(printf '%s' "$NAME" | tr 'A-Z' 'a-z')
+RPC=${RPC:-$DEFAULT_RPC}
+[ -n "$RPC" ] || usage "RPC must name the node to watch (mainnet has no default: the repository variable MAINNET_RPC)"
 RPC=${RPC%/}
-CHAIN_ID=${CHAIN_ID:-blockula-testnet-2}
+CHAIN_ID=${CHAIN_ID:-$DEFAULT_CHAIN}
 EXPECT_VALIDATORS=${EXPECT_VALIDATORS:-4}
 MAX_HEAD_AGE_MS=${MAX_HEAD_AGE_MS:-60000}
 TEST_ALERT=${TEST_ALERT:-false} # empty on scheduled runs: the input exists on manual ones only
@@ -43,9 +61,9 @@ CURL_TIMEOUT=${CURL_TIMEOUT:-15} # seconds per attempt
 CURL_RETRIES=${CURL_RETRIES:-2}
 MENTION=${MENTION:-@jackdishman}
 REMIND_SECS=${REMIND_SECS:-3600} # while the same checks keep failing, a comment at most this often
-LABEL=testnet-alert
+LABEL=$KIND-alert
+WATCH=$KIND-watch
 
-usage() { echo "✗ testnet-watch.sh: $*" >&2; exit 2; }
 for v in EXPECT_VALIDATORS MAX_HEAD_AGE_MS WAIT_SECS CURL_TIMEOUT CURL_RETRIES REMIND_SECS; do
   [[ ${!v} =~ ^[0-9]+$ ]] || usage "$v must be a whole number (got '${!v}')"
 done
@@ -179,7 +197,7 @@ else
   fi
 fi
 
-echo "Testnet watch of $RPC (expecting $CHAIN_ID) at $NOW"
+echo "$NAME watch of $RPC (expecting $CHAIN_ID) at $NOW"
 printf '%s' "$REPORT"
 
 # ---- the alert issue ----
@@ -188,7 +206,7 @@ printf '%s' "$REPORT"
 # while a gh call's output goes to a file: the annotation goes to the log, fd 3.)
 delivery_failed() {
   echo "✗ alert delivery failed: $1" >&2
-  if [ "${GITHUB_ACTIONS:-}" = true ]; then echo "::error title=Testnet watch::alert delivery failed; the report is in this run's log" >&3; fi
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then echo "::error title=$NAME watch::alert delivery failed; the report is in this run's log" >&3; fi
   exit 1
 }
 # gh_run ARGS…: $GH ARGS, its output on stdout; a failure ends the run (delivery_failed). With
@@ -218,17 +236,17 @@ facts() {
   echo "- Time: $NOW"
   if [ -n "$RUN_URL" ]; then echo "- Run: $RUN_URL"; fi
   echo "- Node: $RPC (expecting \`$CHAIN_ID\`)"
-  echo "<!-- testnet-watch failing=$SIG at=$NOW_S -->"
+  echo "<!-- $WATCH failing=$SIG at=$NOW_S -->"
 }
 
-# The alert issue: the oldest open one labeled testnet-alert, if any.
+# The alert issue: the oldest open one labeled $LABEL, if any.
 gh_run issue list --label "$LABEL" --state open --json number --limit 100 > "$T/open.json"
 if ! OPEN=$(jq -r 'map(.number) | min // empty' "$T/open.json" 2> /dev/null); then
   delivery_failed "gh issue list didn't answer with a list of issues: $(head -c 300 "$T/open.json")"
 fi
 # Which checks fail, as one comparable word (the names, sorted, joined by commas).
 SIG=$(printf '%s' "$REPORT" | sed -n 's/^✗ \([^:]*\):.*/\1/p' | tr ' ' '_' | sort | paste -sd, -)
-TEST_LEAD="this is a **test of alert delivery**, from a manual run of \`testnet-watch.yml\` with \`test_alert\`"
+TEST_LEAD="this is a **test of alert delivery**, from a manual run of \`$WATCH.yml\` with \`test_alert\`"
 FAILING="**$FIRST_NAME** is the first failing check."
 if [ "$TEST_ALERT" = true ]; then FAILING+=" This run was also a test of alert delivery (\`test_alert\`)."; fi
 
@@ -237,7 +255,7 @@ if [ "$FAILURES" -gt 0 ] || [ "$TEST_ALERT" = true ]; then
     # The newest report this watch left on the issue: the same checks failing, less than
     # REMIND_SECS ago, needs no new comment (every comment notifies the maintainer).
     gh_run issue view "$OPEN" --json body,comments > "$T/issue.json"
-    last=$(jq -r '[.body // "", (.comments // [] | .[].body // "")] | map(capture("<!-- testnet-watch failing=(?<sig>[^ ]*) at=(?<at>[0-9]+) -->")) | last // empty | "\(.sig) \(.at)"' "$T/issue.json" 2> /dev/null || true)
+    last=$(jq -r --arg watch "$WATCH" '[.body // "", (.comments // [] | .[].body // "")] | map(capture("<!-- \($watch) failing=(?<sig>[^ ]*) at=(?<at>[0-9]+) -->")) | last // empty | "\(.sig) \(.at)"' "$T/issue.json" 2> /dev/null || true)
     if [ -n "$last" ] && [ "${last% *}" = "$SIG" ] && [ $((NOW_S - ${last##* })) -lt "$REMIND_SECS" ]; then
       echo "→ still failing ($SIG), as reported on alert issue #$OPEN under ${REMIND_SECS} s ago: no new comment"
       exit 0
@@ -245,7 +263,7 @@ if [ "$FAILURES" -gt 0 ] || [ "$TEST_ALERT" = true ]; then
   fi
   if [ -n "$OPEN" ]; then
     if [ "$FAILURES" = 0 ]; then
-      intro="$MENTION $TEST_LEAD: every check passes. If this comment reached you as an email or a push notification, testnet alerts reach you. The next scheduled run that passes every check closes this issue."
+      intro="$MENTION $TEST_LEAD: every check passes. If this comment reached you as an email or a push notification, $KIND alerts reach you. The next scheduled run that passes every check closes this issue."
     elif [ "$TEST_ALERT" = true ]; then
       intro="$MENTION failing: $FAILING"
     else
@@ -256,16 +274,16 @@ if [ "$FAILURES" -gt 0 ] || [ "$TEST_ALERT" = true ]; then
     said "commented on alert issue #$OPEN"
   else
     if [ "$FAILURES" = 0 ]; then
-      title="Testnet alert: test of alert delivery"
-      intro="$MENTION $TEST_LEAD. Every check passes; nothing needs doing. If this reached you as an email or a push notification, testnet alerts reach you."
+      title="$NAME alert: test of alert delivery"
+      intro="$MENTION $TEST_LEAD. Every check passes; nothing needs doing. If this reached you as an email or a push notification, $KIND alerts reach you."
       outro="The next scheduled run that passes every check comments \"Recovered\" and closes this issue (which tests the recovery path too)."
     else
-      title="Testnet alert: $(clean "$FIRST")"
-      intro="$MENTION the external watch found the public testnet failing: $FAILING"
-      outro="While a check fails, runs add their report here as a comment when the failing checks change, and otherwise at most every $((REMIND_SECS / 60)) minutes; the first run that passes every check comments \"Recovered\" and closes this issue. Runbooks: \`docs/OPERATIONS.md\` \"Runbooks\"; the testnet's day-2 tasks: \`deploy/README.md\` \"Day 2\"."
+      title="$NAME alert: $(clean "$FIRST")"
+      intro="$MENTION the external watch found $WHAT failing: $FAILING"
+      outro="While a check fails, runs add their report here as a comment when the failing checks change, and otherwise at most every $((REMIND_SECS / 60)) minutes; the first run that passes every check comments \"Recovered\" and closes this issue. Runbooks: \`docs/OPERATIONS.md\` \"Runbooks\"; $RUNBOOK."
     fi
     { echo "$intro"; echo; facts; echo; echo "$outro"; } > "$T/body.md"
-    gh_run label create "$LABEL" --color B60205 --description "Opened and closed by the external testnet watch (testnet-watch.yml)" --force > /dev/null
+    gh_run label create "$LABEL" --color B60205 --description "Opened and closed by the external $KIND watch ($WATCH.yml)" --force > /dev/null
     gh_run issue create --title "$title" --label "$LABEL" --body-file "$T/body.md" > "$T/created"
     said "opened an alert issue$(sed 's/^/: /' "$T/created")"
   fi
