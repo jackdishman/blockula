@@ -35,6 +35,8 @@ trap cleanup EXIT
 echo "📁 $DIR"
 
 EPOCH=${EPOCH:-20}
+# The tee below opens $DIR/summon.txt before summon creates $DIR (a DIR=… that doesn't exist yet).
+mkdir -p "$DIR"
 "$BIN" summon testnet --home "$DIR" --validators "$N" --epoch-blocks "$EPOCH" --dev-durations | tee "$DIR/summon.txt"
 GHASH=$(grep -o 'genesis hash: [0-9a-f]*' "$DIR/summon.txt" | awk '{print $3}')
 addr() { node -e "console.log(require('$DIR/genesis.json').validators[$1].http_addr)"; }
