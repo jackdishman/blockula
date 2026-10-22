@@ -76,11 +76,15 @@ of 2026-10-19 (PROGRAMS-PLAN.md section 3) set how they ship:
   as a scheduled upgrade to v2, then `ActivateFeature { programs }`.
 - **Live on mainnet as soon as they're ready (D2).** Ready means three gates: the consensus
   formats are frozen, the audit has closed with no open critical or high finding, and testnet-2
-  has run programs for at least eight weeks. If those close before mainnet's genesis, programs
-  are on from block 1. Otherwise mainnet launches with them off, and the council proposes their
-  activation the day the last gate closes; it takes effect about nine days later. (The bootstrap
-  council can pass it in mainnet's first year; after that, activation takes the ⅔ token vote.)
-  Programs aren't a mainnet gate: the launch date doesn't wait for them.
+  has run programs for at least eight weeks. Mainnet (`blockula-1`) launches with them off
+  whenever the gates close, and the binary holds it to that: its genesis can't list them
+  (`Genesis::check`), and its governance switches them on only from protocol v3
+  (`upgrade::check_may_activate`), the version that ships what their audit asks for. So once the
+  last gate closes, turning them on takes a release that supports v3, the council's
+  `ScheduleUpgrade { version: 3 }`, and then its `ActivateFeature { programs }`, which must run
+  where v3 is in force. (The bootstrap council can pass both until `bootstrap_end_height`; after
+  that, each takes the ⅔ token vote.) Programs aren't a mainnet gate: the launch date doesn't
+  wait for them.
 - **Reviewed by AI agents, not externally audited (D3).** Blockula is an experiment. Claude
   audits programs with Fable agents: a review of every consensus PR, multi-agent audits at three
   milestones and a full audit after the format freeze. A finding counts only once a second agent

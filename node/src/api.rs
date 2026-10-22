@@ -2755,15 +2755,16 @@ mod http_tests {
         let (_, blocks, _) = call(&n, "GET", "/api/blocks", None, "127.0.0.1:1").await;
         assert_eq!((blocks[0]["version"].as_u64(), blocks[0]["signal"].as_u64()), (Some(1), Some(crate::consensus::SUPPORTED_PROTOCOL_VERSION as u64)));
         let (_, _, text) = call(&n, "GET", "/metrics", None, "127.0.0.1:1").await;
-        for want in ["blockula_upgrade_next_version 2", "blockula_upgrade_next_height 4", "blockula_supported_protocol_version 1", "blockula_protocol_version 1", "blockula_halted 0"] {
-            assert!(text.contains(want), "{want} in {text}");
+        let supported = crate::consensus::SUPPORTED_PROTOCOL_VERSION;
+        for want in [format!("blockula_upgrade_next_version {v2}"), "blockula_upgrade_next_height 4".into(), format!("blockula_supported_protocol_version {supported}"), "blockula_protocol_version 1".into(), "blockula_halted 0".into()] {
+            assert!(text.contains(&want), "{want} in {text}");
         }
-        // Block 3 executes; block 4 runs v2, which this binary doesn't: halted.
+        // Block 3 executes; block 4 runs the next version, which this binary doesn't: halted.
         assert!(n.chain.lock().produce_block_with(vec![]).is_err());
         let (s, h, _) = call(&n, "GET", "/api/health", None, "127.0.0.1:1").await;
         assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(h["halted"], "upgrade_required");
-        assert!(h["reason"].as_str().unwrap().starts_with("halted: block 4 runs protocol v2"), "{h}");
+        assert!(h["reason"].as_str().unwrap().starts_with(&format!("halted: block 4 runs protocol v{v2}")), "{h}");
         let (_, status, _) = call(&n, "GET", "/api/status", None, "127.0.0.1:1").await;
         assert_eq!(status["upgrade"]["halted"]["kind"], "upgrade_required");
         // Reads keep working.

@@ -76,7 +76,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::LazyLock;
 
-/// The feature flag (upgrade.rs `KNOWN_FEATURES`).
+/// The feature flag (upgrade.rs `known_features`).
 pub const FEATURE: &str = "ghost";
 /// Most ghost txs the mempool holds (each is ~135 KiB).
 pub const MAX_MEMPOOL_GHOST: usize = 256;

@@ -179,7 +179,7 @@ impl T {
         let proposer = self.leader(epoch, view);
         let skipped = std::mem::take(&mut self.skipped);
         let tx_bytes = std::mem::take(&mut self.tx_bytes) + skipped.iter().sum::<u64>();
-        self.st.end_block(&BlockInfo { height: h, version: crate::upgrade::version_at(&self.st, h), hash: &format!("{h:064x}"), proposer: &proposer, view, parent_view, skipped: &skipped, tx_bytes });
+        self.st.end_block(&BlockInfo { chain_id: CHAIN, height: h, version: crate::upgrade::version_at(&self.st, h), hash: &format!("{h:064x}"), proposer: &proposer, view, parent_view, skipped: &skipped, tx_bytes });
         self.st.commit_block().unwrap();
         self.st.debug_check(h);
         self.height += 1;
