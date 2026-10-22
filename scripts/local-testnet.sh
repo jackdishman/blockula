@@ -98,16 +98,21 @@ for _ in $(seq 1 60); do
   bal=$(curl -sf "http://$V0/api/account/$NEWV" | field .balance 2>/dev/null || echo 0)
   [[ "$bal" != "0" ]] && break; sleep 1
 done
-"$BIN" validator register --home "$DIR/v$N" --rpc "http://$V2"
+# Its node first: `register` checks the home's node answers for this chain (OPERATOR-11).
 "$BIN" run --home "$DIR/v$N" >>"$DIR/v$N.log" 2>&1 &
 PIDS[$((N + 1))]=$!
+NEWHTTP=$(node -e "console.log(require('$DIR/v$N/node.json').http_addr)")
+wait_height "$NEWHTTP" 1
+echo "  its node runs at #$(status "$NEWHTTP" | field .height) (the network at #$(status "$V0" | field .height))"
+"$BIN" validator register --home "$DIR/v$N" --rpc "http://$V2" | tee "$DIR/register.txt"
+# A free seat puts it straight into the next epoch's set ("joins in N blocks"); else it says how it ranks.
+grep -qE "joins at an epoch boundary|it joins in [0-9]+ blocks" "$DIR/register.txt" || { echo "❌ register didn't say how the validator gets in" >&2; exit 1; }
 active=""
 for _ in $(seq 1 $((EPOCH * 3 + 30))); do
   active=$(curl -sf "http://$V0/api/validators" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).active.some(v=>v.validator.address==='$NEWV')))")
   [[ "$active" == "true" ]] && break; sleep 1
 done
 [[ "$active" == "true" ]] || { echo "❌ new validator never became active" >&2; exit 1; }
-NEWHTTP=$(node -e "console.log(require('$DIR/v$N/node.json').http_addr)")
 wait_height "$NEWHTTP" "$(status "$V0" | field .height)"
 proposed=0
 for _ in $(seq 1 60); do
@@ -116,6 +121,14 @@ for _ in $(seq 1 60); do
 done
 [[ "$proposed" -gt 0 ]] || { echo "❌ new validator never proposed a block" >&2; exit 1; }
 echo "✓ validator $NEWV joined by stake at an epoch boundary and is proposing blocks"
+
+echo "— moving a validator's published address (validator set-addr)"
+# From host:port to a URL for the same node: what the chain publishes changes, and it stays a
+# place peers can reach this validator's node.
+"$BIN" validator set-addr --key "$DIR/v$N/validator.key" --http "http://$NEWHTTP" --rpc "http://$V0"
+published=$(curl -sf "http://$V0/api/validators" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const v=JSON.parse(s).active.find(v=>v.validator.address==='$NEWV');console.log(v.http_addr+' '+v.commission_bps)})")
+[[ "$published" == "http://$NEWHTTP 0" ]] || { echo "❌ set-addr: the chain publishes $published" >&2; exit 1; }
+echo "✓ set-addr changed $NEWV's published http_addr (commission unchanged)"
 
 echo "— restarting validator 1"
 kill "${PIDS[1]}"; wait "${PIDS[1]}" 2>/dev/null || true
