@@ -37,9 +37,11 @@ pub struct Node {
     pub live: Arc<Live>,
     /// Validators: marshal, to serve finalized blocks + certificates to joining nodes.
     pub marshal: Option<MarshalMailbox>,
-    /// Full nodes (and validators without a faucet account): validator HTTP endpoints that txs
-    /// and faucet requests are forwarded to.
+    /// Full nodes (and validators without a faucet account): the HTTP endpoints txs and faucet
+    /// requests are forwarded to, in order (validators, or full nodes that relay to them).
     pub peers: Vec<String>,
+    /// The one HTTP client forwarding uses (its connections are pooled and reused).
+    http: reqwest::Client,
     pub client_ip: ClientIpPolicy,
     limits: Arc<Limits>,
     reads: Arc<ReadLimiter>,
@@ -316,10 +318,14 @@ pub const MAX_BODY_BYTES: usize = 128 * 1024;
 /// JSON (twice the size), with room for the JSON around it.
 pub const MAX_TX_BODY_BYTES: usize = 2 * MAX_GHOST_TX_BYTES + 64 * 1024;
 
-fn too_many(what: &str, wait: Duration) -> ApiError {
+fn too_many(what: &str, wait: Duration) -> Refused {
     let mins = wait.as_secs().div_ceil(60);
-    ApiError(StatusCode::TOO_MANY_REQUESTS, format!("{what}: try again in {mins} minute{}", if mins == 1 { "" } else { "s" }))
+    let err = ApiError(StatusCode::TOO_MANY_REQUESTS, format!("{what}: try again in {mins} minute{}", if mins == 1 { "" } else { "s" }));
+    Refused { err, retry_after: Some((wait.as_millis() as u64).div_ceil(1000).max(1)), limited_by: None }
 }
+
+/// How long a forwarded request may take, per peer tried.
+pub const FORWARD_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl Node {
     pub fn new(chain: Shared, marshal: Option<MarshalMailbox>, peers: Vec<String>, client_ip: ClientIpPolicy) -> Self {
@@ -327,7 +333,8 @@ impl Node {
             let c = chain.lock();
             (c.live.clone(), c.halt.signal.clone(), c.me())
         };
-        Self { chain, live, marshal, peers, client_ip, limits: Default::default(), reads: Arc::new(ReadLimiter::new(READ_RPS, READ_BURST)), timeout: HTTP_TIMEOUT, stats: Default::default(), extra_metrics: None, github_cache: Default::default(), checkpoint_height: 0, halt, protection: None, p2p_peers: None, me }
+        let http = reqwest::Client::builder().timeout(FORWARD_TIMEOUT).build().expect("an HTTP client with a timeout");
+        Self { chain, live, marshal, peers, http, client_ip, limits: Default::default(), reads: Arc::new(ReadLimiter::new(READ_RPS, READ_BURST)), timeout: HTTP_TIMEOUT, stats: Default::default(), extra_metrics: None, github_cache: Default::default(), checkpoint_height: 0, halt, protection: None, p2p_peers: None, me }
     }
 
     /// Per-client read limits: `rps` per second, bursts of `burst` (`rps` 0: unlimited).
@@ -344,33 +351,97 @@ impl Node {
     }
 
 
-    async fn forward(&self, path: &str, body: &Value, client: Option<IpAddr>) -> Result<Value, ApiError> {
-        let http = reqwest::Client::builder().timeout(Duration::from_secs(15)).build().unwrap();
-        let mut last = String::from("no peers configured");
-        for peer in &self.peers {
-            let mut req = http.post(format!("{}/api{path}", peer.trim_end_matches('/'))).json(body).header(FORWARDED_HEADER, "1");
+    /// Forwards a tx or a faucet request to this node's peers, in order, until one takes it.
+    /// `hops`: the nodes it will have come through, this one included ([`FORWARDED_HEADER`]). A
+    /// peer that can't be reached, or fails (a 5xx, or an answer that isn't JSON), is passed over
+    /// for the next: the same signed bytes submitted again are the same tx. A 508 too: a validator
+    /// later in the list takes any count. Each validator limits drips per address on its own, so
+    /// one that dripped but answered too late may be followed by another's drip (faucet chains
+    /// only). The hop count bounds the fan-out: each node tries its own peers, for at most
+    /// [`MAX_FORWARD_HOPS`] hops. A peer's 4xx is its verdict, returned as it is, but a rate limit
+    /// (429) keeps its `Retry-After` and says which node set it ([`relayed_limit`]). What the
+    /// client hears names a peer by its place ([`relay_peer`]), never by its URL: a sentry's peer
+    /// is often a validator's unlisted endpoint. The log has the URL.
+    async fn forward(&self, path: &str, body: &Value, client: Option<IpAddr>, hops: u32) -> Result<Value, Refused> {
+        let mut failed: Option<Refused> = None;
+        let mut unreachable = String::from("no peers configured");
+        for (i, peer) in self.peers.iter().enumerate() {
+            let peer = peer.trim_end_matches('/');
+            let label = relay_peer(i, self.peers.len(), hops);
+            let mut req = self.http.post(format!("{peer}/api{path}")).json(body).header(FORWARDED_HEADER, hops.to_string());
             if let Some(ip) = client {
                 req = req.header("x-blockula-client-ip", ip.to_string());
             }
             if let Some(secret) = &self.client_ip.forwarder_secret {
                 req = req.header("x-blockula-forwarder-key", secret);
             }
-            match req.send().await {
-                Ok(res) => {
-                    let status = StatusCode::from_u16(res.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-                    let ok = res.status().is_success();
-                    let v: Value = res.json().await.map_err(|e| ApiError(StatusCode::BAD_GATEWAY, e.to_string()))?;
-                    if ok {
-                        return Ok(v);
-                    }
-                    let code = if status.is_client_error() || status == StatusCode::SERVICE_UNAVAILABLE { status } else { StatusCode::BAD_GATEWAY };
-                    return Err(ApiError(code, v["error"].as_str().unwrap_or("peer rejected the request").to_string()));
+            let res = match req.send().await {
+                Ok(res) => res,
+                Err(e) => {
+                    let what = if e.is_timeout() { format!("didn't answer within {}s", FORWARD_TIMEOUT.as_secs()) } else if e.is_connect() { "couldn't be reached".into() } else { "couldn't take the request".into() };
+                    tracing::warn!(peer, path, error = %format!("{:#}", anyhow::Error::from(e)), "couldn't forward to a --peer-http peer");
+                    unreachable = format!("{label} {what}");
+                    continue;
                 }
-                Err(e) => last = format!("{:#}", anyhow::Error::from(e)),
+            };
+            let status = StatusCode::from_u16(res.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let retry_after = res.headers().get(axum::http::header::RETRY_AFTER).and_then(|v| v.to_str().ok()).and_then(|s| s.trim().parse::<u64>().ok());
+            let v: Option<Value> = res.json().await.ok();
+            let error = v.as_ref().and_then(|v| v["error"].as_str()).map(str::to_string);
+            match v {
+                Some(v) if status.is_success() => return Ok(v),
+                v if status == StatusCode::TOO_MANY_REQUESTS => {
+                    tracing::info!(peer, path, retry_after, "a --peer-http peer rate-limited a relayed request");
+                    return Err(relayed_limit(&label, path, v, retry_after));
+                }
+                _ if status.is_client_error() => return Err(ApiError(status, error.unwrap_or_else(|| "peer rejected the request".into())).into()),
+                _ => {
+                    tracing::warn!(peer, path, %status, "a --peer-http peer failed a relayed request");
+                    // A busy faucet (503) and a loop (508) say so; any other failure is a bad gateway.
+                    let code = if matches!(status, StatusCode::SERVICE_UNAVAILABLE | StatusCode::LOOP_DETECTED) { status } else { StatusCode::BAD_GATEWAY };
+                    failed = Some(ApiError(code, error.unwrap_or_else(|| format!("{label} answered {status}"))).into());
+                }
             }
         }
-        Err(ApiError(StatusCode::BAD_GATEWAY, format!("couldn't reach a validator: {last}")))
+        Err(failed.unwrap_or_else(|| ApiError(StatusCode::BAD_GATEWAY, format!("couldn't reach a validator: {unreachable}")).into()))
     }
+}
+
+/// How a relayed answer names the peer that gave it: its place in the relaying node's
+/// `--peer-http` (`i` from 0, of `n`) and that node's place on the way (`hops`: 1 is the node
+/// the client called). Never its URL (review NR-1): a sentry's peer is often a validator's
+/// unlisted HTTP endpoint, and the relaying node's log names it for its operator.
+fn relay_peer(i: usize, n: usize, hops: u32) -> String {
+    let node = if hops <= 1 { "the node you called".to_string() } else { format!("node {hops} on the way (the node you called is node 1)") };
+    format!("peer {} of {n} in the --peer-http of {node}", i + 1)
+}
+
+/// A peer's 429, relayed with its `Retry-After`. A node that relays one it got from further up
+/// (it names the node that set it, `limited_by`) passes it on unchanged. Otherwise the peer set
+/// it, and for a tx that limit is per IP: the relaying node's, unless the peer trusts that node
+/// to pass on its clients' IPs (`--trusted-forwarder`), so the client hears which node limits
+/// whom rather than "too many transactions from your IP" (audit TR-4). A faucet's limit (per
+/// address or per IP) keeps its own words. `peer` is the limiting peer's [`relay_peer`].
+fn relayed_limit(peer: &str, path: &str, body: Option<Value>, retry_after: Option<u64>) -> Refused {
+    let body = body.unwrap_or(Value::Null);
+    let theirs = body["error"].as_str().unwrap_or("too many requests").to_string();
+    if let Some(by) = body["limited_by"].as_str() {
+        return Refused { err: ApiError(StatusCode::TOO_MANY_REQUESTS, theirs), retry_after, limited_by: Some(by.to_string()) };
+    }
+    let message = if path == "/tx" { relayed_tx_limit(peer, retry_after) } else { theirs };
+    Refused { err: ApiError(StatusCode::TOO_MANY_REQUESTS, message), retry_after, limited_by: Some(peer.to_string()) }
+}
+
+/// What a client hears when a peer limits the txs this node relays (one place, to reword).
+fn relayed_tx_limit(peer: &str, retry_after: Option<u64>) -> String {
+    let wait = retry_after.map(|s| format!(" Try again in {}.", wait_text(s))).unwrap_or_default();
+    format!("A node this transaction was relayed to limits how many transactions it takes from the node that relayed it: {peer}.{wait} Its operator can add the relaying node with --trusted-forwarder, so each client it relays for is limited on its own.")
+}
+
+/// "45 seconds", "2 minutes".
+fn wait_text(secs: u64) -> String {
+    let (n, unit) = if secs < 60 { (secs.max(1), "second") } else { (secs.div_ceil(60), "minute") };
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
 }
 
 const EXPLORER: &str = include_str!("explorer.html");
@@ -422,12 +493,26 @@ async fn explorer() -> Response {
     ([(header::CONTENT_SECURITY_POLICY, explorer_csp()), (header::X_CONTENT_TYPE_OPTIONS, "nosniff"), (header::REFERRER_POLICY, "no-referrer")], Html(EXPLORER)).into_response()
 }
 
-/// Set on requests a node forwards to another; a forwarded request is never forwarded again
-/// (so misconfigured peers — e.g. a node listed as its own peer — can't loop).
+/// Set on requests a node forwards to another: how many nodes the request has come through (`1`
+/// from the first). A node relays a forwarded tx or faucet request only while that's below
+/// [`MAX_FORWARD_HOPS`], so misconfigured peers (a node listed as its own peer, two full nodes
+/// listing each other) can't loop for long. A value that isn't a number counts as one hop:
+/// nodes from before the count sent `1`, and refused anything forwarded.
 pub const FORWARDED_HEADER: &str = "x-blockula-forwarded";
 
-fn forwarded(h: &HeaderMap) -> bool {
-    h.contains_key(FORWARDED_HEADER)
+/// How many nodes a forwarded tx or faucet request may come through before a validator takes it:
+/// enough for a user's own node, then the network's public RPC, then a sentry in front of a
+/// validator (audit PERF-3: the public RPC is every validator's published HTTP address).
+pub const MAX_FORWARD_HOPS: u32 = 3;
+
+/// How many nodes a request came through (0: straight from a client).
+fn forwarded_hops(h: &HeaderMap) -> u32 {
+    h.get(FORWARDED_HEADER).map_or(0, |v| v.to_str().ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(1).max(1))
+}
+
+/// The refusal of a request that came through `hops` nodes already.
+fn forwarding_loop(hops: u32) -> ApiError {
+    ApiError(StatusCode::LOOP_DETECTED, format!("forwarding loop: this request came through {hops} nodes already, and nodes relay one through at most {MAX_FORWARD_HOPS}; check those nodes' --peer-http"))
 }
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -461,6 +546,40 @@ impl From<anyhow::Error> for ApiError {
     }
 }
 
+/// How `/api/tx` and `/api/faucet` refuse: an [`ApiError`], with a `Retry-After` (seconds) when
+/// it's a rate limit (this node's, or a peer's it relays), and for a relayed one the node that set
+/// it (`limited_by` in the body).
+struct Refused {
+    err: ApiError,
+    retry_after: Option<u64>,
+    limited_by: Option<String>,
+}
+
+impl From<ApiError> for Refused {
+    fn from(err: ApiError) -> Self {
+        Self { err, retry_after: None, limited_by: None }
+    }
+}
+
+impl From<anyhow::Error> for Refused {
+    fn from(e: anyhow::Error) -> Self {
+        ApiError::from(e).into()
+    }
+}
+
+impl IntoResponse for Refused {
+    fn into_response(self) -> Response {
+        let mut res = match self.limited_by {
+            Some(by) => (self.err.0, Json(json!({ "error": self.err.1, "limited_by": by }))).into_response(),
+            None => self.err.into_response(),
+        };
+        if let Some(secs) = self.retry_after {
+            res.headers_mut().insert(axum::http::header::RETRY_AFTER, secs.into());
+        }
+        res
+    }
+}
+
 fn not_found(what: &str) -> ApiError {
     ApiError(StatusCode::NOT_FOUND, format!("{what} not found"))
 }
@@ -477,6 +596,7 @@ pub fn router(node: Node) -> Router {
         .route("/api/tx/{id}", get(tx))
         .route("/api/tx", post(submit).layer(DefaultBodyLimit::max(MAX_TX_BODY_BYTES)))
         .route("/api/account/{id}", get(account))
+        .route("/api/account/{id}/txs", get(account_txs))
         .route("/api/name/{name}", get(name))
         .route("/api/params", get(params))
         .route("/api/fees", get(fees))
@@ -713,7 +833,13 @@ fn block_json(v: &ReadView, b: &Block) -> Value {
 
 fn sync_progress(live: &Live, height: u64) -> f64 {
     let t = live.network_height_claimed(height);
-    if t == 0 { 1.0 } else { (height as f64 / t as f64).min(1.0) }
+    if height == 0 && live.syncing(0) {
+        0.0
+    } else if t == 0 {
+        1.0
+    } else {
+        (height as f64 / t as f64).min(1.0)
+    }
 }
 
 fn head_age_ms(v: &ReadView) -> Option<u64> {
@@ -842,14 +968,14 @@ async fn tx(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
     Err(not_found("transaction"))
 }
 
-async fn submit(State(n): State<Node>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, body: axum::body::Bytes) -> ApiResult {
+async fn submit(State(n): State<Node>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, body: axum::body::Bytes) -> Result<Json<Value>, Refused> {
     let client = n.client_ip(peer, &headers);
     if let Some(ip) = client {
         n.limits.allow(&[(format!("tx:{}", ip_key(ip)), TX_PER_IP_PER_MINUTE, Duration::from_secs(60))]).map_err(|w| too_many("too many transactions from your IP", w))?;
     }
     let result = match parse_tx(&headers, &body) {
         Ok(tx) => submit_inner(&n, &headers, client, tx).await,
-        Err(e) => Err(e),
+        Err(e) => Err(e.into()),
     };
     bump(if result.is_ok() { &n.stats.tx_submitted } else { &n.stats.tx_rejected });
     result
@@ -873,7 +999,7 @@ fn parse_tx(headers: &HeaderMap, body: &[u8]) -> Result<Tx, ApiError> {
     serde_json::from_slice(body).map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, format!("bad transaction JSON: {e}")))
 }
 
-async fn submit_inner(n: &Node, headers: &HeaderMap, client: Option<IpAddr>, tx: Tx) -> ApiResult {
+async fn submit_inner(n: &Node, headers: &HeaderMap, client: Option<IpAddr>, tx: Tx) -> Result<Json<Value>, Refused> {
     // Format + ML-DSA signature checks run without the chain lock, after the cheap check that the
     // fee covers the next block's base fee.
     let (chain_id, genesis_hash, prefix, role, ghost_off) = {
@@ -897,12 +1023,15 @@ async fn submit_inner(n: &Node, headers: &HeaderMap, client: Option<IpAddr>, tx:
         tx
     };
     if role == Role::FullNode {
-        if forwarded(headers) {
-            return Err(ApiError(StatusCode::LOOP_DETECTED, "forwarding loop: this full node was sent a forwarded tx".into()));
+        // A full node relays a tx another node forwarded (a user's own node sends through the
+        // network's public RPC, a full node), up to MAX_FORWARD_HOPS nodes.
+        let hops = forwarded_hops(headers);
+        if hops >= MAX_FORWARD_HOPS {
+            return Err(forwarding_loop(hops).into());
         }
-        // Admit locally (same checks as a validator), then hand it to a validator.
+        // Admit locally (same checks as a validator), then hand it on towards a validator.
         let id = n.chain.lock().submit(tx.clone())?;
-        if let Err(e) = n.forward("/tx", &serde_json::to_value(&tx).unwrap(), forwarded_client_ip(&tx, client)).await {
+        if let Err(e) = n.forward("/tx", &serde_json::to_value(&tx).unwrap(), forwarded_client_ip(&tx, client), hops + 1).await {
             n.chain.lock().drop_pending(&id);
             return Err(e);
         }
@@ -929,6 +1058,7 @@ async fn health(State(n): State<Node>) -> Response {
     let halt = n.halt.get();
     let reason = match age {
         _ if halt.is_some() => halt.as_ref().map(|h| format!("halted: {h}")),
+        _ if v.height == 0 && n.live.syncing(0) => Some("syncing: waiting for a snapshot or the first blocks from peers".to_string()),
         _ if n.live.syncing(v.height) => Some(format!("syncing: {} of {}", v.height, n.live.network_height_claimed(v.height))),
         None => Some("no blocks yet".to_string()),
         Some(a) if a > 10 * bt => Some(format!("head is {}s old", a / 1000)),
@@ -1176,13 +1306,7 @@ async fn account(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
     let mp = n.live.mempool();
     // The mempool is capped (`MAX_MEMPOOL`), so this scan is bounded.
     let mut recent: Vec<Value> = mp.newest().filter(|t| t.from == addr || matches!(&t.action, Action::Transfer { to, .. } if st.resolve(to).ok().as_deref() == Some(addr.as_str()))).map(|t| tx_json(&v, t, None)).collect();
-    // Each block's index row once, for who its txs paid when they ran.
-    let history = v.history(&addr, 25);
-    let mut metas: BTreeMap<u64, Option<BlockMeta>> = BTreeMap::new();
-    for &(h, _) in &history {
-        metas.entry(h).or_insert_with(|| v.block_meta(h));
-    }
-    recent.extend(history.into_iter().filter_map(|(h, i)| v.finalized_tx(h, i).map(|(t, e)| tx_json_with(&v, &t, Some(Ran { height: h, idx: Some(i), meta: metas.get(&h).and_then(Option::as_ref) }), e.as_deref()))));
+    recent.extend(finalized_json(&v, v.history(&addr, HISTORY_PAGE)));
     let hunts_created: Vec<u64> = v.ids(ix::HUNT_CREATOR, &addr, false, ACCOUNT_LIST_LIMIT);
     let hunts_won: Vec<Value> = v.ids(ix::HUNT_WINNER, &addr, false, ACCOUNT_LIST_LIMIT).into_iter().filter_map(|id| st.hunts.get(&id)).map(|h| json!({ "id": h.id, "repo": h.repo, "issue": h.issue, "amount_display": fmt_fang(h.amount), "pr": h.pr, "self_awarded": h.self_awarded() })).collect();
     let keys = st.keys_of(&addr);
@@ -1226,6 +1350,46 @@ async fn account(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
         "hunts_won": hunts_won,
         "contribution": contribution_profile(&v, &addr),
     })))
+}
+
+/// Finalized txs (height, index in the block) as `/api/account` lists them, each block's index
+/// row read once (for who its txs paid when they ran).
+fn finalized_json(v: &ReadView, rows: Vec<(u64, usize)>) -> Vec<Value> {
+    let mut metas: BTreeMap<u64, Option<BlockMeta>> = BTreeMap::new();
+    for &(h, _) in &rows {
+        metas.entry(h).or_insert_with(|| v.block_meta(h));
+    }
+    rows.into_iter().filter_map(|(h, i)| v.finalized_tx(h, i).map(|(t, e)| tx_json_with(v, &t, Some(Ran { height: h, idx: Some(i), meta: metas.get(&h).and_then(Option::as_ref) }), e.as_deref()))).collect()
+}
+
+/// Txs per `/api/account/{id}/txs` page: by default, and at most.
+pub const HISTORY_PAGE: usize = 25;
+pub const HISTORY_PAGE_LIMIT: usize = 100;
+
+#[derive(Deserialize)]
+struct HistoryQuery {
+    /// `<height>.<index>`: the previous page's `next`.
+    before: Option<String>,
+    limit: Option<usize>,
+}
+
+/// A history cursor, `<height>.<index>` (the tx's block and its place in it).
+fn history_cursor(s: &str) -> Result<(u64, u32), ApiError> {
+    let parsed = s.split_once('.').and_then(|(h, i)| Some((h.parse::<u64>().ok()?, i.parse::<u32>().ok()?)));
+    parsed.ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, format!("`before` must be <height>.<index>, as `next` gives it; got {s:?}")))
+}
+
+/// `/api/account/{id}/txs?before=<height>.<index>&limit=`: an account's finalized txs (sent by
+/// it or naming it; `/api/account`'s `recent_txs` has the pending ones), newest first, a page at a
+/// time (audit TR-3, CRE-12, DEV-4). `next` is the cursor for the page after this one: `null` once
+/// a page reaches `history_from`, the first block this node holds (older ones: an archive node).
+async fn account_txs(State(n): State<Node>, Path(id): Path<String>, Query(q): Query<HistoryQuery>) -> ApiResult {
+    let v = n.live.view();
+    let addr = v.state.resolve(&id)?;
+    let limit = q.limit.unwrap_or(HISTORY_PAGE).clamp(1, HISTORY_PAGE_LIMIT);
+    let before = q.before.as_deref().filter(|s| !s.is_empty()).map(history_cursor).transpose()?;
+    let (rows, next) = v.history_page(&addr, before, limit);
+    Ok(Json(json!({ "txs": finalized_json(&v, rows), "next": next.map(|(h, i)| format!("{h}.{i}")), "history_from": v.history_from() })))
 }
 
 /// Which accounts a key may act for — lets a newly linked device find its account. From the
@@ -1397,7 +1561,7 @@ async fn search(State(n): State<Node>, Path(q): Path<String>) -> ApiResult {
     Ok(Json(hit))
 }
 
-async fn faucet(State(n): State<Node>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Json(body): Json<HashMap<String, String>>) -> ApiResult {
+async fn faucet(State(n): State<Node>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Json(body): Json<HashMap<String, String>>) -> Result<Json<Value>, Refused> {
     let to = body.get("to").ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, "missing `to`".into()))?.clone();
     let to = &to;
     let (faucet_here, resolved, enabled, busy) = {
@@ -1406,10 +1570,10 @@ async fn faucet(State(n): State<Node>, ConnectInfo(peer): ConnectInfo<SocketAddr
         (here, c.state.resolve(to)?, c.genesis.faucet, here && c.faucet_busy())
     };
     if !enabled {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "this chain has no faucet".into()));
+        return Err(ApiError(StatusCode::BAD_REQUEST, "this chain has no faucet".into()).into());
     }
     if busy {
-        return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "faucet busy, retry in a few seconds".into()));
+        return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "faucet busy, retry in a few seconds".into()).into());
     }
     let client = n.client_ip(peer, &headers);
     let mut rules = vec![(format!("faucet-addr:{resolved}"), 1, FAUCET_ADDRESS_WINDOW)];
@@ -1421,12 +1585,14 @@ async fn faucet(State(n): State<Node>, ConnectInfo(peer): ConnectInfo<SocketAddr
     // The slot is taken before the drip (atomically: parallel requests can't all pass a check
     // first, F28) and given back if the drip doesn't go out.
     let reserved = if limited { Some(n.limits.allow(&rules).map_err(|w| too_many("the faucet already dripped for you", w))?) } else { None };
-    let dripped = async {
+    let dripped: Result<Value, Refused> = async {
         if !faucet_here {
-            if forwarded(&headers) {
-                return Err(ApiError(StatusCode::LOOP_DETECTED, "forwarding loop: no faucet here".into()));
+            // Relayed towards a validator with the faucet, as a tx is.
+            let hops = forwarded_hops(&headers);
+            if hops >= MAX_FORWARD_HOPS {
+                return Err(forwarding_loop(hops).into());
             }
-            let v = n.forward("/faucet", &json!({ "to": to }), client).await?;
+            let v = n.forward("/faucet", &json!({ "to": to }), client, hops + 1).await?;
             if let Ok(tx) = serde_json::from_value::<Tx>(v["tx"].clone()) {
                 let _ = n.chain.lock().track_pending(tx);
             }
@@ -1434,7 +1600,7 @@ async fn faucet(State(n): State<Node>, ConnectInfo(peer): ConnectInfo<SocketAddr
         } else {
             let tx = n.chain.lock().faucet(to, 100 * DROPS_PER_FANG).map_err(|e| {
                 let msg = e.to_string();
-                ApiError(if msg.contains("faucet busy") { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::BAD_REQUEST }, msg)
+                Refused::from(ApiError(if msg.contains("faucet busy") { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::BAD_REQUEST }, msg))
             })?;
             Ok(json!({ "id": tx.id(), "amount_display": "100 FANG", "tx": tx }))
         }
@@ -2512,10 +2678,13 @@ mod http_tests {
     async fn forwarding_supports_https_peers() {
         let (root, mut n) = node("tlsfwd");
         n.peers = vec!["https://127.0.0.1:9".into()];
-        let err = n.forward("/faucet", &json!({ "to": "x" }), None).await.err().unwrap();
+        let err = n.forward("/faucet", &json!({ "to": "x" }), None, 1).await.err().unwrap().err;
         assert_eq!(err.0, StatusCode::BAD_GATEWAY);
-        assert!(!err.1.contains("scheme"), "{}", err.1);
-        assert!(err.1.contains("couldn't reach"), "{}", err.1);
+        assert!(err.1.contains("couldn't reach") && !err.1.contains("127.0.0.1"), "{}", err.1);
+        // The client forward uses tried to connect (the log line has why it failed): no scheme refusal.
+        let e = n.http.post("https://127.0.0.1:9/api/faucet").send().await.unwrap_err();
+        let why = format!("{:#}", anyhow::Error::from(e));
+        assert!(!why.contains("scheme"), "{why}");
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -3482,6 +3651,319 @@ mod http_tests {
         let fee = n.chain.lock().state.chain_params.account_creation_fee;
         assert!(fee > 0);
         assert_eq!((f["exists"].as_bool(), f["creation_fee"].as_str(), f["locked"].as_str(), f["transferable"].as_str()), (Some(false), Some(fee.to_string().as_str()), Some("0"), Some("0")), "{f}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// `call` with request headers, answering the response's headers too.
+    async fn call_with(n: &Node, method: &str, uri: &str, body: Option<Value>, peer: &str, extra: &[(&str, &str)]) -> (StatusCode, Value, HeaderMap) {
+        let app = router(n.clone()).layer(MockConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+        let mut req = Request::builder().method(method).uri(uri).header("content-type", "application/json");
+        for (k, v) in extra {
+            req = req.header(*k, *v);
+        }
+        let res = app.oneshot(req.body(body.map(|b| Body::from(b.to_string())).unwrap_or_else(Body::empty)).unwrap()).await.unwrap();
+        let (status, headers) = (res.status(), res.headers().clone());
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null), headers)
+    }
+
+    /// A local port to serve on, and its URL.
+    async fn listen() -> (tokio::net::TcpListener, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        (listener, url)
+    }
+
+    fn serve_on(listener: tokio::net::TcpListener, app: Router) {
+        tokio::spawn(async move { axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap() });
+    }
+
+    /// A full node of `validator`'s chain (its genesis, no key, at height 0), forwarding to `peers`.
+    fn full_node(validator: &Node, tag: &str, peers: Vec<String>) -> (std::path::PathBuf, Node) {
+        let home = std::env::temp_dir().join(format!("blockula-api-full-{tag}-{}-{}", crate::chain::now_ms(), std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::copy(validator.chain.lock().home.join("genesis.json"), home.join("genesis.json")).unwrap();
+        let chain = Arc::new(Mutex::new(Chain::open(&home).unwrap()));
+        assert_eq!(chain.lock().role, Role::FullNode);
+        (home, Node::new(chain, None, peers, ClientIpPolicy::default()))
+    }
+
+    /// A transfer from the validator's genesis-funded account, valid on a node at height 0.
+    fn genesis_transfer(validator: &Node, nonce: u64, amount: u64) -> Tx {
+        let c = validator.chain.lock();
+        let keys = crate::crypto::Keys::from_seed(c.keys.as_ref().unwrap().seed());
+        let to = crate::crypto::Keys::from_seed([88; 32]).address();
+        let mut tx = Tx { chain_id: c.genesis.chain_id.clone(), genesis_hash: c.genesis_hash.clone(), from: keys.address(), nonce, fee: 0, tip: 0, valid_until: 100, action: Action::Transfer { to, amount }, memo: String::new(), public_key: hex::encode(keys.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+        tx.fee = crate::econ::max_fee(&c.state, tx.size());
+        tx.sign(&keys)
+    }
+
+    /// Audit PERF-3: a node you run can send. The public RPC is a full node and every validator's
+    /// published HTTP address, so a user's own full node forwards to a full node: the forwarded
+    /// header counts hops, and a full node relays a forwarded tx or faucet request while it came
+    /// through fewer than MAX_FORWARD_HOPS nodes. Here: full node B (its only peer is A) -> full
+    /// node A -> the validator, for a tx and a faucet drip. Two full nodes that list each other
+    /// pass a request back and forth until the fourth hop is refused, and neither keeps the tx.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn full_nodes_relay_to_a_validator_and_loops_end() {
+        let (root, v) = node("relay");
+        let (vl, v_url) = listen().await;
+        serve_on(vl, router(v.clone()));
+        let (home_a, a) = full_node(&v, "a", vec![v_url.clone()]);
+        let (al, a_url) = listen().await;
+        serve_on(al, router(a.clone()));
+        let (home_b, b) = full_node(&v, "b", vec![a_url.clone()]);
+
+        let tx = genesis_transfer(&v, 0, DROPS_PER_FANG);
+        let (s, r, _) = call_with(&b, "POST", "/api/tx", Some(serde_json::to_value(&tx).unwrap()), "127.0.0.1:1", &[]).await;
+        assert_eq!((s, r["id"].as_str(), r["status"].as_str()), (StatusCode::OK, Some(tx.id().as_str()), Some("pending")), "{r}");
+        for (who, n) in [("validator", &v), ("A", &a), ("B", &b)] {
+            assert!(n.chain.lock().in_mempool(&tx.id()), "{who} holds it");
+        }
+        // A faucet request through B is served by the validator, and tracked on the way.
+        let to = crate::crypto::Keys::from_seed([89; 32]).address();
+        let (s, r, _) = call_with(&b, "POST", "/api/faucet", Some(json!({ "to": to })), "127.0.0.1:1", &[]).await;
+        assert_eq!(s, StatusCode::OK, "{r}");
+        let drip = r["id"].as_str().unwrap().to_string();
+        for (who, n) in [("validator", &v), ("A", &a), ("B", &b)] {
+            assert!(n.chain.lock().in_mempool(&drip), "{who} holds the drip");
+        }
+        // The tx and the drip finalize on the validator.
+        v.chain.lock().produce_block().unwrap();
+        assert!(v.chain.lock().has_tx(&tx.id()) && v.chain.lock().has_tx(&drip));
+        // A validator takes a forwarded tx whatever its count (only full nodes relay).
+        let next = genesis_transfer(&v, 2, 2);
+        let (s, r, _) = call_with(&v, "POST", "/api/tx", Some(serde_json::to_value(&next).unwrap()), "127.0.0.1:1", &[(FORWARDED_HEADER, "9")]).await;
+        assert_eq!(s, StatusCode::OK, "{r}");
+
+        // A loop: P and Q list each other. P (0) -> Q (1) -> P (2) -> Q, which refuses the 4th hop.
+        let ((pl, p_url), (ql, q_url)) = (listen().await, listen().await);
+        let (home_p, p) = full_node(&v, "p", vec![q_url]);
+        let (home_q, q) = full_node(&v, "q", vec![p_url]);
+        serve_on(pl, router(p.clone()));
+        serve_on(ql, router(q.clone()));
+        let (s, r, _) = call_with(&p, "POST", "/api/tx", Some(serde_json::to_value(&tx).unwrap()), "127.0.0.1:1", &[]).await;
+        assert_eq!(s, StatusCode::LOOP_DETECTED, "{r}");
+        let err = r["error"].as_str().unwrap();
+        assert!(err.contains("forwarding loop") && err.contains("came through 3 nodes"), "{err}");
+        assert!(!p.chain.lock().in_mempool(&tx.id()) && !q.chain.lock().in_mempool(&tx.id()), "a tx that went nowhere isn't kept");
+        let (s, r, _) = call_with(&p, "POST", "/api/faucet", Some(json!({ "to": to })), "127.0.0.1:1", &[]).await;
+        assert_eq!(s, StatusCode::LOOP_DETECTED, "{r}");
+        // Straight to a full node with a count at the limit: refused there and then.
+        let (s, _, _) = call_with(&a, "POST", "/api/tx", Some(serde_json::to_value(&tx).unwrap()), "127.0.0.1:1", &[(FORWARDED_HEADER, "3")]).await;
+        assert_eq!(s, StatusCode::LOOP_DETECTED);
+        for dir in [root, home_a, home_b, home_p, home_q] {
+            std::fs::remove_dir_all(dir).ok();
+        }
+    }
+
+    /// Nodes before the count sent `x-blockula-forwarded: 1`; any value that isn't a number
+    /// counts as one hop, and no header is none.
+    #[test]
+    fn forwarded_hops_read_old_and_new_headers() {
+        let hops = |v: Option<&str>| {
+            let mut h = HeaderMap::new();
+            if let Some(v) = v {
+                h.insert(FORWARDED_HEADER, v.parse().unwrap());
+            }
+            forwarded_hops(&h)
+        };
+        assert_eq!([hops(None), hops(Some("1")), hops(Some("2")), hops(Some(" 3 ")), hops(Some("yes")), hops(Some("0")), hops(Some("-4"))], [0, 1, 2, 3, 1, 1, 1]);
+        assert_eq!(hops(Some("4294967295")), u32::MAX, "refused, never wrapped");
+    }
+
+    /// Audit TR-4: forwarding uses one HTTP client, passes over a peer that fails (5xx) for the
+    /// next (the same signed bytes are the same tx), and relays a peer's rate limit with its
+    /// `Retry-After`, saying which node limits this node's IP and how its operator lifts that
+    /// (`--trusted-forwarder`), not "too many transactions from your IP". A node further down the
+    /// line passes that on unchanged. This node's own write limits send `Retry-After` too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn relayed_rate_limits_say_who_set_them_and_failing_peers_are_passed_over() {
+        use axum::http::header::RETRY_AFTER;
+        let (root, v) = node("relaylimit");
+        let (vl, v_url) = listen().await;
+        serve_on(vl, router(v.clone()));
+        let (fl, failing) = listen().await;
+        serve_on(fl, Router::new().route("/api/tx", post(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "boom") })));
+        let (ll, limiting) = listen().await;
+        serve_on(ll, Router::new().route("/api/tx", post(|| async { (StatusCode::TOO_MANY_REQUESTS, [(RETRY_AFTER, "42")], Json(json!({ "error": "too many transactions from your IP: try again in 1 minute" }))) })));
+        let tx = genesis_transfer(&v, 0, DROPS_PER_FANG);
+        let body = serde_json::to_value(&tx).unwrap();
+
+        // A failing peer first: the next one takes it.
+        let (home_f, f) = full_node(&v, "f", vec![failing.clone(), v_url.clone()]);
+        let (s, r, _) = call_with(&f, "POST", "/api/tx", Some(body.clone()), "127.0.0.1:1", &[]).await;
+        assert_eq!(s, StatusCode::OK, "{r}");
+        assert!(v.chain.lock().in_mempool(&tx.id()));
+        // Only failing peers: the failure, as a bad gateway, naming the peer by its place in
+        // --peer-http, never by its URL (review NR-1: a sentry's peer is a validator's unlisted
+        // endpoint). Unreachable peers alike.
+        let (gone, gone_url) = listen().await;
+        drop(gone);
+        let (home_g, g) = full_node(&v, "g", vec![gone_url.clone(), failing.clone()]);
+        let (s, r, _) = call_with(&g, "POST", "/api/tx", Some(body.clone()), "127.0.0.1:1", &[]).await;
+        assert_eq!(s, StatusCode::BAD_GATEWAY, "{r}");
+        assert_eq!(r["error"].as_str(), Some("peer 2 of 2 in the --peer-http of the node you called answered 500 Internal Server Error"), "{r}");
+        assert!(!g.chain.lock().in_mempool(&tx.id()));
+        let (home_u, u) = full_node(&v, "u", vec![gone_url.clone()]);
+        let (s, r, _) = call_with(&u, "POST", "/api/tx", Some(body.clone()), "127.0.0.1:1", &[]).await;
+        assert_eq!(s, StatusCode::BAD_GATEWAY, "{r}");
+        assert_eq!(r["error"].as_str(), Some("couldn't reach a validator: peer 1 of 1 in the --peer-http of the node you called couldn't be reached"), "{r}");
+
+        // A limiting peer: its Retry-After, and who limits whom, by place.
+        let (home_l, l) = full_node(&v, "l", vec![limiting.clone()]);
+        let (s, r, h) = call_with(&l, "POST", "/api/tx", Some(body.clone()), "127.0.0.1:1", &[]).await;
+        assert_eq!((s, h.get(RETRY_AFTER).and_then(|v| v.to_str().ok())), (StatusCode::TOO_MANY_REQUESTS, Some("42")), "{r}");
+        let err = r["error"].as_str().unwrap().to_string();
+        let by_l = "peer 1 of 1 in the --peer-http of the node you called";
+        assert!(err.contains(by_l) && err.contains("from the node that relayed it") && err.contains("--trusted-forwarder") && err.contains("Try again in 42 seconds."), "{err}");
+        assert!(!err.contains("your IP"), "{err}");
+        assert_eq!(r["limited_by"].as_str(), Some(by_l));
+        assert!(!l.chain.lock().in_mempool(&tx.id()), "not kept: it went nowhere");
+        // One more node down the line passes it on as it is: L, now the second node on the way,
+        // names the limiting peer, and M doesn't rename it.
+        let (llis, l_url) = listen().await;
+        serve_on(llis, router(l.clone()));
+        let (home_m, m) = full_node(&v, "m", vec![l_url.clone()]);
+        let (s, r2, h) = call_with(&m, "POST", "/api/tx", Some(body.clone()), "127.0.0.1:1", &[]).await;
+        assert_eq!((s, h.get(RETRY_AFTER).and_then(|v| v.to_str().ok())), (StatusCode::TOO_MANY_REQUESTS, Some("42")));
+        let by_l2 = "peer 1 of 1 in the --peer-http of node 2 on the way (the node you called is node 1)";
+        assert_eq!(r2["limited_by"].as_str(), Some(by_l2), "{r2}");
+        assert!(r2["error"].as_str().unwrap().contains(by_l2), "{r2}");
+        for said in [&r, &r2] {
+            assert!(!said.to_string().contains(limiting.trim_start_matches("http://")), "{said}");
+        }
+
+        // This node's own limit: 120 txs a minute per IP, then a 429 with Retry-After.
+        for _ in 0..TX_PER_IP_PER_MINUTE {
+            let (s, _, _) = call_with(&v, "POST", "/api/tx", Some(json!({ "junk": true })), "203.0.113.7:1", &[]).await;
+            assert!(s.is_client_error() && s != StatusCode::TOO_MANY_REQUESTS, "{s}");
+        }
+        let (s, r, h) = call_with(&v, "POST", "/api/tx", Some(body.clone()), "203.0.113.7:1", &[]).await;
+        let wait: u64 = h.get(RETRY_AFTER).and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok()).unwrap_or(0);
+        assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{r}");
+        assert!((1..=60).contains(&wait), "Retry-After {wait}");
+        assert!(r["limited_by"].is_null() && r["error"].as_str().unwrap().contains("too many transactions from your IP"), "{r}");
+        assert_eq!([wait_text(1), wait_text(45), wait_text(60), wait_text(61)], ["1 second", "45 seconds", "1 minute", "2 minutes"]);
+        for dir in [root, home_f, home_g, home_u, home_l, home_m] {
+            std::fs::remove_dir_all(dir).ok();
+        }
+    }
+
+    /// Audit PERF-12 / TR-12: a full node that hasn't executed a block yet (waiting for a
+    /// snapshot, or for its first blocks) reports `syncing` before any peer claims a height, so
+    /// a readiness check keyed on it waits. A validator at its genesis doesn't, and the full
+    /// node stops once it has executed a block (and isn't behind what peers claim).
+    #[tokio::test]
+    async fn a_full_node_at_height_zero_is_syncing() {
+        let (root, v) = node("sync0");
+        let (home, f) = full_node(&v, "sync0", vec![]);
+        let (_, st, _) = call(&f, "GET", "/api/status", None, "127.0.0.1:1").await;
+        assert_eq!((st["height"].as_u64(), st["syncing"].as_bool(), st["sync_progress"].as_f64()), (Some(0), Some(true), Some(0.0)), "{st}");
+        let (s, h, _) = call(&f, "GET", "/api/health", None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(h["reason"].as_str().unwrap().contains("waiting for a snapshot"), "{h}");
+        let (_, st, _) = call(&v, "GET", "/api/status", None, "127.0.0.1:1").await;
+        assert_eq!((st["height"].as_u64(), st["syncing"].as_bool()), (Some(0), Some(false)), "a validator at its genesis");
+        {
+            let mut c = f.chain.lock();
+            let b = c.test_block(vec![]);
+            c.execute(b).unwrap();
+        }
+        let (_, st, _) = call(&f, "GET", "/api/status", None, "127.0.0.1:1").await;
+        assert_eq!((st["height"].as_u64(), st["syncing"].as_bool(), st["sync_progress"].as_f64()), (Some(1), Some(false), Some(1.0)), "{st}");
+        for dir in [root, home] {
+            std::fs::remove_dir_all(dir).ok();
+        }
+    }
+
+    /// Audit TR-3 / CRE-12 / DEV-4: `/api/account/{id}/txs` pages an account's whole finalized
+    /// history, newest first, by a `<height>.<index>` cursor: each tx once, in the shape
+    /// `recent_txs` has, two txs of one block in order. On a pruning node the pages stop at
+    /// `history_from` (`next` is `null` there), and a cursor below it gets an empty page.
+    #[tokio::test]
+    async fn account_history_pages_back_to_history_from() {
+        let root = std::env::temp_dir().join(format!("blockula-api-history-{}-{}", crate::chain::now_ms(), std::process::id()));
+        let homes = Chain::summon(&root, &SummonOpts { block_time_ms: 60_000, ..SummonOpts::new("history", 1) }).unwrap();
+        let mut c = Chain::open(&homes[0]).unwrap();
+        let alice = crate::crypto::Keys::from_seed([31; 32]);
+        let me = c.me().unwrap();
+        c.faucet(&alice.address(), 100 * DROPS_PER_FANG).unwrap();
+        c.produce_block().unwrap();
+        let send = |c: &Chain, nonce: u64| {
+            let mut tx = Tx { chain_id: "history".into(), genesis_hash: c.genesis_hash.clone(), from: alice.address(), nonce, fee: 0, tip: 0, valid_until: c.height() + 10, action: Action::Transfer { to: me.clone(), amount: 1 + nonce }, memo: String::new(), public_key: hex::encode(alice.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+            tx.fee = crate::econ::max_fee(&c.state, tx.size());
+            tx.sign(&alice)
+        };
+        // One of alice's txs in each of blocks 2..=30, then two in block 31: 32 rows with the drip.
+        for nonce in 0..29 {
+            let t = send(&c, nonce);
+            c.produce_block_with(vec![t]).unwrap();
+        }
+        let two = vec![send(&c, 29), send(&c, 30)];
+        c.produce_block_with(two).unwrap();
+        c.set_pruning(Some(1));
+        let keep = c.keep_blocks().unwrap();
+        let n = Node::new(Arc::new(Mutex::new(c)), None, vec![], ClientIpPolicy::default());
+        let page_all = |limit: usize| {
+            let n = n.clone();
+            let addr = alice.address();
+            async move {
+                let (mut seen, mut before, mut pages) = (Vec::<Value>::new(), None::<String>, 0);
+                loop {
+                    let uri = format!("/api/account/{addr}/txs?limit={limit}{}", before.as_ref().map(|b| format!("&before={b}")).unwrap_or_default());
+                    let (s, v, _) = call(&n, "GET", &uri, None, "127.0.0.1:1").await;
+                    assert_eq!(s, StatusCode::OK, "{v}");
+                    let txs = v["txs"].as_array().unwrap();
+                    assert!(txs.len() <= limit);
+                    seen.extend(txs.iter().cloned());
+                    pages += 1;
+                    match v["next"].as_str() {
+                        Some(next) => {
+                            let last = txs.last().unwrap();
+                            assert_eq!(next.split_once('.').unwrap().0, last["height"].as_u64().unwrap().to_string(), "the cursor is the page's last tx");
+                            before = Some(next.to_string());
+                        }
+                        None => return (seen, pages, v["history_from"].as_u64().unwrap()),
+                    }
+                }
+            }
+        };
+        let (all, pages, from) = page_all(2).await;
+        assert_eq!((all.len(), pages, from), (32, 16, 1));
+        let at: Vec<(u64, u64)> = all.iter().map(|t| (t["height"].as_u64().unwrap(), t["nonce"].as_u64().unwrap())).collect();
+        assert!(at.windows(2).all(|w| w[0].0 >= w[1].0), "newest first: {at:?}");
+        assert_eq!((at[0], at[1], at[31].0), ((31, 30), (31, 29), 1), "the block's second tx first, the drip last");
+        let mut ids: Vec<&str> = all.iter().map(|t| t["id"].as_str().unwrap()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 32, "each tx once");
+        // The shape `recent_txs` has (no tx is pending, so it's the newest 25).
+        let (_, acct, _) = call(&n, "GET", &format!("/api/account/{}", alice.address()), None, "127.0.0.1:1").await;
+        assert_eq!(acct["recent_txs"].as_array().unwrap()[..], all[..HISTORY_PAGE]);
+        let (s, unknown, _) = call(&n, "GET", "/api/account/nobody.boo/txs", None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "an unregistered name: {unknown}");
+        let (_, first, _) = call(&n, "GET", &format!("/api/account/{}/txs", alice.address()), None, "127.0.0.1:1").await;
+        assert_eq!((first["txs"].as_array().unwrap().len(), first["next"].as_str()), (HISTORY_PAGE, Some("8.0")), "25 by default");
+        let (_, big, _) = call(&n, "GET", &format!("/api/account/{}/txs?limit=1000", alice.address()), None, "127.0.0.1:1").await;
+        assert_eq!((big["txs"].as_array().unwrap().len(), big["next"].as_str()), (32, None), "at most HISTORY_PAGE_LIMIT, which is plenty here");
+        let (_, one, _) = call(&n, "GET", &format!("/api/account/{}/txs?limit=0", alice.address()), None, "127.0.0.1:1").await;
+        assert_eq!(one["txs"].as_array().unwrap().len(), 1, "at least one");
+        for bad in ["7", "x.1", "7.", "7.-1"] {
+            let (s, e, _) = call(&n, "GET", &format!("/api/account/{}/txs?before={bad}", alice.address()), None, "127.0.0.1:1").await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}: {e}");
+        }
+        // Pruned below #21: the pages stop there.
+        let at = n.chain.lock().height();
+        for _ in at..keep + 20 {
+            n.chain.lock().produce_block_with(vec![]).unwrap();
+        }
+        let (kept, _, from) = page_all(3).await;
+        assert_eq!(from, 21);
+        let heights: Vec<u64> = kept.iter().map(|t| t["height"].as_u64().unwrap()).collect();
+        assert_eq!(heights, [31, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21]);
+        let (s, below, _) = call(&n, "GET", &format!("/api/account/{}/txs?before=15.0", alice.address()), None, "127.0.0.1:1").await;
+        assert_eq!((s, below["txs"].as_array().map(Vec::len), below["next"].is_null()), (StatusCode::OK, Some(0), true), "{below}");
         std::fs::remove_dir_all(root).ok();
     }
 }
