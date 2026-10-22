@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { explorer, NETWORK } from "@/lib/config";
 import { friendly } from "@/lib/errors";
+import { SAFETY } from "@/lib/onboarding-copy";
 import { shortAddr } from "@/lib/format";
 import { confirmPositions, generateKit, KIT_LABEL, kitText, wordIndex, type Kit } from "@/lib/recovery";
 import type { TxView } from "@/lib/types";
@@ -112,7 +113,7 @@ export function RecoveryKitSetup({
             A <b>recovery kit</b> is a paper backup: 24 words that act as one more owner key on your account. If you ever lose every device and passkey, the words let you add a new one.
           </p>
           <p className="dim">
-            The words are made here, in this browser, and never sent anywhere. Anyone who finds them can take your account, so keep the kit offline, like a passport.
+            The words are made here, in this browser, and never sent anywhere. Anyone who finds them can take your account, so keep the kit offline, like a passport. {SAFETY.kitNeverAsk}
           </p>
           <button className="btn primary" disabled={busy} onClick={make}>Make my recovery kit</button>
           <ErrorNote error={error} />
@@ -177,6 +178,12 @@ export function RecoveryKitSetup({
         <h2>Adding the kit to your account</h2>
         {busy ? <Spinner>Sealing the kit&apos;s key into a block…</Spinner> : <ErrorNote error={error} />}
         {!busy && error && <button className="btn primary" onClick={() => activate(stage.grant)}>Try again</button>}
+        {/* The node may be away: the kit stays pending (Home and Devices offer to activate it), so don't strand the user here. */}
+        {!busy && error && onFinish && (
+          <button className="link center-self" onClick={onFinish}>
+            Activate it later from Devices &amp; agents
+          </button>
+        )}
       </section>
     );
 
@@ -229,7 +236,7 @@ export function KitSheet({ kit }: { kit: Kit }) {
         <dt>To restore</dt>
         <dd>Open {kit.walletUrl}, choose <i>Restore with a recovery kit</i> and type the words. Then revoke the lost device and make a new kit.</dd>
       </dl>
-      <p className="kit-warning">Anyone holding these words controls this account. Keep the kit offline, and only ever type the words into the Blockula wallet.</p>
+      <p className="kit-warning">{SAFETY.kitWarning}</p>
     </section>
   );
 }

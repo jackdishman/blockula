@@ -3,6 +3,7 @@
 import { decodeKeyGrant, formatFang, parseFang, type KeyGrant } from "@blockula/sdk";
 import Link from "next/link";
 import { useEffect, useState } from "react";
+import "@/app/onboarding.css";
 import { RequireWallet } from "@/components/Gate";
 import { RecoveryKitSetup } from "@/components/RecoveryKit";
 import { Apparition } from "@/components/Haunt";
@@ -11,6 +12,7 @@ import { Copy, ErrorNote, ExplorerLink, Spinner, Tip } from "@/components/ui";
 import { BLOCKS_PER_DAY, DEFAULT_NETWORK, explorer, NETWORK, walletUrl } from "@/lib/config";
 import { friendly } from "@/lib/errors";
 import { blocksToHuman, keyCode } from "@/lib/format";
+import { SAFETY } from "@/lib/onboarding-copy";
 import { deviceLink } from "@/lib/paylink";
 import { KIT_LABEL } from "@/lib/recovery";
 import type { KeyView, TxView } from "@/lib/types";
@@ -193,7 +195,8 @@ function parseGrant(code: string, account: string): { grant: KeyGrant | null; pr
 function AddDevice() {
   const { wallet, client, status, refresh } = useUnlocked();
   const [id, setId] = useState("");
-  const [label, setLabel] = useState("My phone");
+  // Labels are written on-chain for good: nothing filled in that could name a person.
+  const [label, setLabel] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState<TxView | null>(null);
@@ -264,8 +267,8 @@ function AddDevice() {
       </label>
       {id.trim() && (grant ? <span className="ok">Check code: <b className="code inline">{keyCode(grant.key_id)}</b> (the new device shows the same)</span> : <span className="warn">{problem}</span>)}
       <label className="field">
-        <span>Name it</span>
-        <input value={label} onChange={(e) => setLabel(e.target.value)} maxLength={64} />
+        <span>Name it <span className="dim onb-public">{SAFETY.publicLabel}</span></span>
+        <input value={label} onChange={(e) => setLabel(e.target.value)} maxLength={64} placeholder="Laptop" />
       </label>
       <button className="btn primary" disabled={!valid || busy} onClick={add}>
         {busy ? <Spinner>Adding…</Spinner> : "Add as owner device"}
@@ -280,6 +283,21 @@ function AddDevice() {
 function AddAgent() {
   const { wallet, account, status, refresh } = useUnlocked();
   const [id, setId] = useState("");
+  // Filled in from a `#grant=<code>` link (an agent's wallet_url): a fragment never reaches a server.
+  const [fromLink, setFromLink] = useState(false);
+  useEffect(() => {
+    const m = window.location.hash.match(/^#grant=(.+)$/);
+    if (!m) return;
+    let code: string;
+    try {
+      code = decodeURIComponent(m[1]).trim();
+    } catch {
+      return;
+    }
+    setId(code);
+    setFromLink(true);
+    document.getElementById("agent")?.scrollIntoView();
+  }, []);
   const [label, setLabel] = useState("claude");
   const [limit, setLimit] = useState("10");
   const [days, setDays] = useState("30");
@@ -334,6 +352,7 @@ SDK:  await wallet.actAs("${me}");
       <p className="dim">
         Let an AI agent pay for things without handing over your wallet. It gets its own key, a daily limit and an expiry date, and can only send FANG.
       </p>
+      <p className="onb-warn" data-testid="agent-warning">{SAFETY.agentResponsibility}</p>
       <ol className="steps">
         <li>
           Tell your agent (e.g. Claude Code with the Blockula MCP) to <code>use_account</code> with this account&apos;s address
@@ -346,10 +365,18 @@ SDK:  await wallet.actAs("${me}");
         <textarea value={id} onChange={(e) => setId(e.target.value)} placeholder="bkgrant1.…" className="mono" autoCapitalize="none" spellCheck={false} rows={3} />
       </label>
       {id.trim() && !grant && <span className="warn">{problem}</span>}
+      {grant && (
+        <span className="ok" data-testid="agent-check">
+          Check code: <b className="code inline">{keyCode(grant.key_id)}</b> (your agent shows the same)
+        </span>
+      )}
+      {fromLink && id.trim() && (
+        <p className="warn small" data-testid="agent-from-link">{SAFETY.agentFromLink}</p>
+      )}
       <div className="grid-2">
         <label className="field">
-          <span>Label</span>
-          <input value={label} onChange={(e) => setLabel(e.target.value)} maxLength={64} />
+          <span>Label <span className="dim onb-public">{SAFETY.publicLabelShort}</span></span>
+          <input value={label} onChange={(e) => setLabel(e.target.value)} maxLength={64} placeholder="claude" />
         </label>
         <label className="field">
           <span>Daily limit</span>
