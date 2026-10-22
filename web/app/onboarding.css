@@ -1,0 +1,30 @@
+/*
+ * Onboarding and Home notes (the wallet-onboarding package): the first-FANG card, pay requests
+ * carried through /welcome, Home's balance parts and banners, and the warnings next to public
+ * labels and agent budgets. Every class is prefixed onb-.
+ */
+
+/* "How FANG reaches you": a left-aligned card even inside a centered step. */
+.onb-card { text-align: left; align-self: stretch; }
+.onb-card h2 { margin-bottom: 4px; }
+.onb-list { margin: 0; padding-left: 22px; display: flex; flex-direction: column; gap: 8px; color: var(--ink-soft); font-size: 17px; }
+.onb-list li::marker { color: var(--blood); }
+
+/* A payment link carried through onboarding. */
+.onb-ask { text-align: left; align-self: stretch; overflow-wrap: anywhere; }
+
+/* The faucet step's "no value" line. */
+.onb-novalue { margin: 0; }
+
+/* Under Home's balance: what can move now, what's staked, what's locked. */
+.onb-parts { margin: 2px 0 6px; font-size: 15px; color: var(--ink-soft); display: flex; flex-wrap: wrap; justify-content: center; gap: 2px 12px; }
+.onb-parts b { font-weight: 600; color: var(--ink); white-space: nowrap; }
+
+/* Home banners: one passkey, a name to renew. */
+.onb-banner { text-align: left; overflow-wrap: anywhere; }
+.onb-banner .link { margin-left: 4px; }
+
+/* Warnings next to what goes on-chain or spends for you. */
+.onb-warn { margin: 0; padding: 10px 12px; border: 1px dashed var(--ochre); color: var(--ink-soft); font-size: 16px; }
+.onb-terms { margin: 0; font-size: 15px; color: var(--dim); }
+.onb-public { font-size: 15px; }
