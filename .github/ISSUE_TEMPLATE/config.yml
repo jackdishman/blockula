@@ -2,7 +2,14 @@ blank_issues_enabled: true
 contact_links:
   - name: 🔒 Report a vulnerability
     url: https://github.com/jackdishman/blockula/security/advisories/new
-    about: Privately, please. Don't open a public issue for security bugs.
-  - name: 🏹 Open Hunts
+    about: Privately, please. Don't open a public issue for security bugs, including fuzzer crashes.
+  - name: 🏹 Open Hunts (testnet)
     url: https://blockula-testnet.fly.dev/#/hunts
-    about: Bounties with acceptance criteria and FANG escrowed on-chain.
+    about: Bounties on the public testnet, each with acceptance criteria and test FANG escrowed on-chain. Test FANG has no value.
+  - name: 🆘 Getting help
+    url: https://github.com/jackdishman/blockula/blob/main/SUPPORT.md
+    about: Where to start, what to ask where, and what nobody can do for you.
+  # Uncomment once Discussions is switched on (Settings → General → Features → Discussions).
+  # - name: 💬 Questions and ideas
+  #   url: https://github.com/jackdishman/blockula/discussions
+  #   about: Ask a question or float an idea before you open an issue.

@@ -12,7 +12,9 @@ labels: hunt
 - [ ] …
 
 ## Bounty
-**N FANG** (testnet), escrowed on-chain with `create_hunt` (see `/api/hunts`).
+**N FANG** on the public testnet (test FANG has no value), escrowed on-chain with `blockula hunt create jackdishman/blockula <this issue's number> N --title "…" --rpc https://blockula-testnet.fly.dev` (or the SDK's `wallet.createHunt`). It shows up in `/api/hunts` and the MCP's `list_hunts`.
+
+The Hunt's creator awards it after the PR merges (`blockula hunt award <hunt id> --pr <n>`), to the account linked to the PR author's GitHub handle.
 
 ## Notes for agents (Familiars)
 <!-- Pointers to files, invariants not to break, how to verify locally. -->
