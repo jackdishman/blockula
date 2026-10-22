@@ -128,7 +128,7 @@
   <nav><a href="#/">Blocks</a><a href="#/validators">Validators</a><a href="#/governance">Governance</a><a href="#/mempool">Mempool</a><a href="#/hunts">Hunts</a><a href="#/contribute">Contribute</a><a href="#/params">Parameters</a><a href="#/learn">Learn</a></nav>
 </header>
 <main id="app"><div class="loading">Rising from the grave…</div></main>
-<footer><span id="imprint">Post-quantum signatures · ML-DSA-65 · Not audited, test chains only</span><button type="button" class="motion-toggle" data-motion-toggle hidden></button></footer>
+<footer><span id="imprint">Post-quantum signatures · ML-DSA-65 · Not audited, test chains only</span> · <span id="notice">Test FANG has no value</span> · <a id="terms" href="https://github.com/jackdishman/blockula/blob/main/TERMS.md">Terms</a> · <a id="risks" href="https://github.com/jackdishman/blockula/blob/main/docs/RISKS.md">Risks</a><button type="button" class="motion-toggle" data-motion-toggle hidden></button></footer>
 <script>
 // The animated ASCII backdrop (moon, fog, bats), bundled from web/lib/ascii. This script adds it, not a
 // tag in the page: the CSP trusts only this script (by hash), and 'strict-dynamic' extends that trust to
@@ -156,7 +156,7 @@ const GLOSSARY = {
   hunt: "A bounty on a GitHub issue. The FANG sits in escrow until the creator awards it for a pull request. Once it expires the creator can cancel it, refunding every funder exactly; before that only a governance refund can.",
   proposer: "The validator that proposed this block. A 2/3+ quorum of validators then voted (ML-DSA-65 signatures) to finalize it.",
   certificate: "The finality proof: ML-DSA-65 votes from a 2/3+ quorum of validators. Blocks finalized as an ancestor of a later block share that later block's certificate.",
-  burned: "Fees destroyed forever. Burning offsets new issuance and ties the token's value to real network usage.",
+  burned: "Fees destroyed forever. The base fee prices block space so spam costs the spammer; burning it takes that FANG out of the supply. It isn't a mechanism to manage FANG's price.",
   soul: "Reputation that can't be bought or transferred. It's earned when juries accept your work (or by serving well as a juror), it slowly decays, and it's lost for spam or vouching for fakes.",
   seance: "A review jury. Randomly drawn jurors with Soul compare pairs of merged PRs (“which mattered more?”), seal their votes, then reveal them. The outcome scores each claim and pays the pool out.",
   vouch: "Staking FANG (and your Soul) on a newcomer being a real, distinct person. If they turn out to be a sybil, the voucher loses both. Newcomers can decline a vouch.",
@@ -356,7 +356,7 @@ views.hunts = async function () {
   const r = await api("/hunts");
   const row = (h) => `<div class="row"><div><a href="#/hunt/${h.id}"><b>${esc(h.amount_display)}</b> · ${esc(h.title)}</a>
     <span class="dim">· <a href="${esc(h.issue_url)}">${esc(h.repo)}#${h.issue}</a> · ${plural(h.funders.length, "funder")}</span></div><span class="pill ${h.status == "open" ? "" : "pending"}">${esc(h.status)}</span></div>`;
-  return `<div class="stack">${card(`<span class="eyebrow">Bounties</span><h1>Hunts</h1><p>${term("hunt", "Hunts")} are bounties on GitHub issues. Anyone can add to one. Fix the issue, get the pull request merged, and the bounty is awarded to your account (or to your ${term("familiar", "Familiar")}'s sponsor). Open bounties right now: <b>${esc(r.open_bounties_display)}</b>.</p>
+  return `<div class="stack">${card(`<span class="eyebrow">Bounties</span><h1>Hunts</h1><p>${term("hunt", "Hunts")} are bounties on GitHub issues. Anyone can add to one. Fix the issue and get the pull request merged, and its creator can award the bounty to your account (or to your ${term("familiar", "Familiar")}'s sponsor). Open bounties right now: <b>${esc(r.open_bounties_display)}</b>.</p>
     <p class="dim">Put one up with the SDK: <span class="mono">wallet.createHunt({ repo: "owner/name", issue: 12, amount: "50", title: "…", expiresInBlocks: 100000 })</span></p>`, "learn")}
     ${card(`<h2>All hunts (${r.count})</h2>${r.hunts.length ? `<div class="rows">${r.hunts.map(row).join("")}</div>` : '<p class="empty">No hunts yet.</p>'}`)}</div>`;
 };
@@ -407,7 +407,7 @@ views.contribute = async function () {
     </div>
     ${card(`<h2>How it works</h2><ol>
       <li><b>Link GitHub</b> (a public gist with your address) and get a pull request merged into a pool repo${c.repos.length ? ` (${c.repos.map((x) => `<a href="https://github.com/${esc(x.repo)}">${esc(x.repo)}</a>`).join(", ")})` : ""}.</li>
-      <li><b>${term("claim", "Claim it")}</b> with a small refundable bond (${esc(r.claim_bond_display)}, more if you have several open). You need ${term("soul", "Soul")} or a ${term("vouch", "vouch")} from someone who has it.</li>
+      <li><b>${term("claim", "Claim it")}</b> with a small bond (${esc(r.claim_bond_display)}, more if you have several open), returned unless validators refute the claim or the jury marks it spam. You need ${term("soul", "Soul")} or a ${term("vouch", "vouch")} from someone who has it.</li>
       <li><b>Validators check GitHub</b>: the PR must be merged and authored by your linked handle. ${r.claim_maturity_blocks ? `Then it waits ${r.claim_maturity_blocks.toLocaleString()} blocks in case it's reverted.` : ""}</li>
       <li><b>A ${term("seance", "Séance")} judges it.</b> Up to ${r.jury_size} jurors drawn at random compare pairs of claims, seal their votes, then reveal them. Jurors who agree with the outcome earn Soul and ${esc(r.juror_share)} of the payout; those who keep disagreeing lose Soul, and no-shows lose part of their bond.</li>
       <li><b>Payout.</b> Each Séance distributes up to ${esc(r.pool_share_per_seance)} of the pool (the full share once it judges claims of ${r.full_budget_people || 16} people; one person's many claims count once). Your claims are scored against other people's, never each other, and all of yours share one win rate, pooled over all their comparisons: the first counts in full at that rate, each next one a quarter of the one before (all together less than 4/3 of one), so one solid PR beats a pile of tiny ones, weak claims pull your rate down, and spam costs you. A person is the claimant account: every GitHub handle it links, and a sponsor's ${term("familiar", "Familiars")}, count together. Rewards ${term("vesting", "vest")} over ${r.vesting_blocks.toLocaleString()} blocks.</li>
@@ -428,7 +428,7 @@ views.claim = async function (id) {
       ${claimPill(c)}${c.reason ? ` <span class="dim">${esc(c.reason)}</span>` : ""}`)}
     ${card(`<dl>
       <dt>Submitted</dt><dd>block #${c.submitted_at}${c.familiar ? ` by their ${term("familiar", "Familiar")} ${esc(c.familiar)}` : ""}</dd>
-      <dt>${term("bond")}</dt><dd>${c.bond !== "0" ? esc(c.bond_display) + " (held until it's judged)" : "settled"}</dd>
+      <dt>${term("bond")}</dt><dd>${c.bond !== "0" ? esc(c.bond_display) + " (held until it's judged: returned unless validators refute the claim or the jury marks it spam)" : "settled"}</dd>
       ${c.verified_at != null ? `<dt>Verified</dt><dd>block #${c.verified_at} · merge <span class="mono">${esc((c.merge_sha || "").slice(0, 12))}</span> · judged from block #${c.eligible_at}</dd>` : ""}
       ${c.expires_at ? `<dt>Refunded if unchecked by</dt><dd>block #${c.expires_at}</dd>` : ""}
       ${c.seance != null ? `<dt>${term("seance", "Séance")}</dt><dd><a href="#/seance/${c.seance}">#${c.seance}</a></dd>` : ""}
@@ -640,8 +640,15 @@ $("#search").addEventListener("submit", async (e) => {
 });
 window.addEventListener("hashchange", route);
 route();
-// Test chains say so in the footer; mainnet doesn't.
-api("/status").then((s) => { if (s.chain_id === "blockula-1") $("#imprint").textContent = "Post-quantum signatures · ML-DSA-65"; }).catch(() => {});
+// The footer's notice: test chains (the page's own text) say test FANG has no value; mainnet says
+// it's experimental. Legal copy (D4: provisional, under counsel review) in the brand wording (D10):
+// keep it in MAINNET_NOTICE, and the Terms and Risks links in the footer above.
+const MAINNET_NOTICE = { imprint: "Post-quantum signatures · ML-DSA-65", notice: "Experimental mainnet · not externally audited" };
+api("/status").then((s) => {
+  if (s.chain_id !== "blockula-1") return;
+  $("#imprint").textContent = MAINNET_NOTICE.imprint;
+  $("#notice").textContent = MAINNET_NOTICE.notice;
+}).catch(() => {});
 setInterval(() => { if (!location.hash || location.hash === "#/") route(); }, 3000);
 </script>
 </body>

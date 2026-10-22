@@ -44,8 +44,12 @@ use cli_net::blockula_dir;
 use node::NetOpts;
 use std::path::PathBuf;
 
+/// `blockula --help`'s tagline, in the brand wording (D10): "post-quantum
+/// signatures (ML-DSA-65)", and no "never dies" on a surface people read before they take a risk.
+const ABOUT: &str = "🧛 Blockula: a blockchain with post-quantum signatures (ML-DSA-65)";
+
 #[derive(Parser)]
-#[command(name = "blockula", version, about = "🧛 Blockula — a post-quantum blockchain that never dies")]
+#[command(name = "blockula", version, about = ABOUT)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -469,5 +473,13 @@ mod cli_tests {
     fn the_cli_is_well_formed() {
         use clap::CommandFactory;
         super::Cli::command().debug_assert();
+    }
+
+    /// D10: the tagline makes no "never dies" claim.
+    #[test]
+    fn the_tagline_follows_the_brand_wording() {
+        use clap::CommandFactory;
+        let about = super::Cli::command().get_about().map(|a| a.to_string()).unwrap_or_default();
+        assert!(about.contains("post-quantum signatures (ML-DSA-65)") && !about.contains("never dies"), "{about}");
     }
 }
