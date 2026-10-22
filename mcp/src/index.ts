@@ -95,7 +95,7 @@ const ranWith = (b: NodeBinary & { matches?: boolean }) =>
  * Testnet economics, said wherever Hunts and the contribution pool come up, on test chains only:
  * on mainnet FANG is real, so nothing is said about value there (valueNote).
  */
-const NO_VALUE = "Testnet FANG, Hunts and Soul have no monetary value and come with no promise of any mainnet allocation.";
+const NO_VALUE = "Testnet FANG, Hunts and Soul have no value.";
 
 function releaseTarget(): string | null {
   const key = `${process.platform}-${process.arch}`;
@@ -118,7 +118,7 @@ const RPC = NET?.rpc ?? "";
  * isn't known until it answers (a local or custom node without BLOCKULA_CHAIN_ID), the same said of
  * test chains only, which is true on either. Results say it by the chain the node is on (valueNote).
  */
-const NO_VALUE_DESCRIBED = NET?.mainnet ? "" : NET?.pin.chainId ? NO_VALUE : "On test chains, FANG, Hunts and Soul have no monetary value and come with no promise of any mainnet allocation.";
+const NO_VALUE_DESCRIBED = NET?.mainnet ? "" : NET?.pin.chainId ? NO_VALUE : "On test chains, FANG, Hunts and Soul have no value.";
 /** A Hunt or contribution tool's description: `text`, then NO_VALUE_DESCRIBED when there is one. */
 const described = (text: string) => [text, NO_VALUE_DESCRIBED].filter(Boolean).join(" ");
 let pinned: Client | null = null;

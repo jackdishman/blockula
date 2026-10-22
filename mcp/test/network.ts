@@ -298,7 +298,7 @@ const tools = await s.tools();
 for (const name of ["stake", "unstake", "my_stake", "withdraw_stake", "list_proposals", "vote", "renew_name"]) assert.ok(tools.some((t) => t.name === name), `tool ${name}`);
 for (const name of ["list_hunts", "lookup", "list_proposals"]) assert.match(tools.find((t) => t.name === name)?.description ?? "", /untrusted_\*/, `${name} says its chain text is untrusted`);
 for (const name of ["list_hunts", "fund_hunt", "contribution_pool", "submit_contribution", "my_contributions"]) {
-  assert.match(tools.find((t) => t.name === name)?.description ?? "", /Testnet FANG, Hunts and Soul have no monetary value/, `${name} carries the disclaimer`);
+  assert.match(tools.find((t) => t.name === name)?.description ?? "", /Testnet FANG, Hunts and Soul have no value/, `${name} carries the disclaimer`);
 }
 r = await s.call("status");
 assert.ok(r.error && /Refusing .*chain "fake-chain", not "another-chain"/.test(r.text), r.text);
@@ -332,8 +332,8 @@ await s.close();
 // Hunts and the contribution pool say testnet FANG is worth nothing on test chains only: a tool's
 // description by the configured network (of test chains alone when the node's chain isn't known
 // yet), a result by the chain the node is on. On mainnet nothing is said about value.
-const NO_VALUE = /Testnet FANG, Hunts and Soul have no monetary value/;
-const HEDGED = /On test chains, FANG, Hunts and Soul have no monetary value/;
+const NO_VALUE = /Testnet FANG, Hunts and Soul have no value/;
+const HEDGED = /On test chains, FANG, Hunts and Soul have no value/;
 const VALUE_TOOLS = ["list_hunts", "fund_hunt", "contribution_pool", "submit_contribution", "my_contributions"];
 const described = async (srv: Awaited<ReturnType<typeof server>>) => {
   const all = await srv.tools();
@@ -351,14 +351,14 @@ await s.close();
 nodeStatus = { ...nodeStatus, chain_id: "blockula-1", genesis_hash: KNOWN_GENESIS["blockula-1"] ?? G1 };
 s = await server({ BLOCKULA_RPC: rpc });
 r = await s.call("list_hunts");
-assert.ok(!r.error && !/monetary value/.test(r.text) && /untrusted_\*/.test(JSON.parse(r.text).note), `a node on blockula-1 is mainnet, however configured: ${r.text}`);
+assert.ok(!r.error && !/have no value/.test(r.text) && /untrusted_\*/.test(JSON.parse(r.text).note), `a node on blockula-1 is mainnet, however configured: ${r.text}`);
 await s.close();
 s = await server({ BLOCKULA_RPC: rpc }, ["--network", "mainnet"]);
-for (const d of await described(s)) assert.ok(!/monetary value/.test(d) && d === d.trim(), `mainnet says nothing about value: "${d}"`);
+for (const d of await described(s)) assert.ok(!/have no value/.test(d) && d === d.trim(), `mainnet says nothing about value: "${d}"`);
 r = await s.call("list_hunts");
-assert.ok(!r.error && !/monetary value/.test(r.text), r.text);
+assert.ok(!r.error && !/have no value/.test(r.text), r.text);
 r = await s.call("contribution_pool");
-assert.ok(!r.error && !/monetary value/.test(r.text) && JSON.parse(r.text).note === undefined, r.text);
+assert.ok(!r.error && !/have no value/.test(r.text) && JSON.parse(r.text).note === undefined, r.text);
 await s.close();
 nodeStatus = { ...nodeStatus, chain_id: "fake-chain", genesis_hash: G1 };
 console.log("✓ testnet FANG is called worthless on test chains only, never on mainnet");
