@@ -245,7 +245,7 @@ Every request has a timeout (`new Client(rpc, { timeoutMs })`, default 15 s, at 
 
 The public testnet is `https://blockula-testnet.fly.dev`, and the wallet is https://testnet.blockula.app.
 
-Tests: `npm run test:vectors` (offline: passkey derivation, state-proof and tx-encoding vectors from the node, every protocol v1 helper against a fake node, pinning, proof freshness, timeouts, release signatures, and `test/integrators.ts`: network presets, the mainnet opt-in, balances, the nonce queue, `sendMany`, `quote`, history and `watchPayments`), `npm run test:kat` (ML-DSA known answers), `npm test` (end to end against `blockula dev`: `test/e2e.ts`, then `test/e2e-integrators.ts`). The `examples/` directory at the repository's root has two runnable scripts: receiving payments, and paying from a script.
+Tests: `npm run test:vectors` (offline: passkey derivation, state-proof and tx-encoding vectors from the node, every protocol v1 helper against a fake node, pinning, proof freshness, timeouts, release signatures, and `test/integrators.ts`: network presets, the mainnet opt-in, balances, the nonce queue, `sendMany`, `quote`, history, `watchPayments` and `onSigned`; and `test/examples.ts`, which runs `examples/pay-from-a-script.mjs` against a fake node, so build first), `npm run test:kat` (ML-DSA known answers), `npm test` (end to end against `blockula dev`: `test/e2e.ts`, then `test/e2e-integrators.ts`). The `examples/` directory at the repository's root has two runnable scripts: receiving payments, and paying from a script.
 
 ## Changes in 0.6
 
