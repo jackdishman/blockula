@@ -176,7 +176,7 @@ The rule: **validators serve consensus, sentries serve people.**
 
 - A validator's HTTP listens on a private interface (or is firewalled to one) and answers only its operator's sentries and monitoring. Validator-to-validator HTTP, where it's needed at all, also runs only over private links.
 - Each operator runs at least one sentry, ideally two in different regions. The sentry does the public work: the API and explorer, `/api/sync` and snapshots for joiners, tx intake with rate limits.
-- Register the sentry's public URL as your validator's `http_addr` (that's what other nodes and the explorer use), not the validator's own address. `deploy/launch.sh` does the same for the testnet.
+- Register the sentry's public URL as your validator's `http_addr` (that's what other nodes and the explorer use), not the validator's own address. `deploy/launch.sh` does the same for the testnet. Other nodes fetch the validator-set handoffs your validator signs from there too (`/api/epochs`; the sentry pulls them from the validator in its `--peer-http`), and on a public chain they skip an `http_addr` on a private or loopback address.
 
 **Today:** a sentry is a full node. It joins with `blockula join` (HTTP sync from its validator over the private link), forwards txs and faucet requests to the validator with `--peer-http http://<validator-private-ip>:7070`, and authenticates that forwarding with a shared `BLOCKULA_FORWARDER_SECRET` (≥ 32 chars, same value on both). Put a reverse proxy in front for TLS and rate limits, and tell the node which header carries the client IP:
 
