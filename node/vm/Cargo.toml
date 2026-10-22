@@ -14,7 +14,7 @@ description = "Programs (protocol v2): the engine-neutral VM, upload validation,
 blake3 = "=1.8.7"
 # Upload validation (validate.rs), the gatekeeper parser: pinned on its own, since what it accepts
 # is consensus. Without its defaults (hash collections, simd, serde, the component model).
-wasmparser = { version = "=0.228.0", default-features = false, features = ["std", "validate", "features", "prefer-btree-collections"] }
+wasmparser = { version = "=0.262.0", default-features = false, features = ["std", "validate", "features", "prefer-btree-collections"] }
 # The engine (D1): soroban-wasmi, pinned exactly (docs/PROGRAMS.md 4.1). Any bump is a consensus
 # change, made with a protocol version.
 soroban-wasmi = "=29.0.0"

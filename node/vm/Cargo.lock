@@ -53,7 +53,7 @@ dependencies = [
  "blockula-vm",
  "soroban-wasmi",
  "wasmi",
- "wasmparser 0.228.0",
+ "wasmparser",
  "wat",
 ]
 
@@ -336,7 +336,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4495a6f85dd94c411c749303efcbc5defade0b0cbdbc0541495241ab917a9b5a"
 dependencies = [
  "leb128fmt",
- "wasmparser 0.262.0",
+ "wasmparser",
 ]
 
 [[package]]
@@ -403,16 +403,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a3345445247388df2b5b35250a30c9209c27c8d2c6db1bf4c89b65636264bf9"
 dependencies = [
  "wasmi_core 0.38.0",
-]
-
-[[package]]
-name = "wasmparser"
-version = "0.228.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4abf1132c1fdf747d56bbc1bb52152400c70f336870f968b85e89ea422198ae3"
-dependencies = [
- "bitflags",
- "indexmap",
 ]
 
 [[package]]
