@@ -596,6 +596,7 @@ pub fn router(node: Node) -> Router {
         .route("/api/tx/{id}", get(tx))
         .route("/api/tx", post(submit).layer(DefaultBodyLimit::max(MAX_TX_BODY_BYTES)))
         .route("/api/account/{id}", get(account))
+        .route("/api/account/{id}/txs", get(account_txs))
         .route("/api/name/{name}", get(name))
         .route("/api/params", get(params))
         .route("/api/fees", get(fees))
@@ -1305,13 +1306,7 @@ async fn account(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
     let mp = n.live.mempool();
     // The mempool is capped (`MAX_MEMPOOL`), so this scan is bounded.
     let mut recent: Vec<Value> = mp.newest().filter(|t| t.from == addr || matches!(&t.action, Action::Transfer { to, .. } if st.resolve(to).ok().as_deref() == Some(addr.as_str()))).map(|t| tx_json(&v, t, None)).collect();
-    // Each block's index row once, for who its txs paid when they ran.
-    let history = v.history(&addr, 25);
-    let mut metas: BTreeMap<u64, Option<BlockMeta>> = BTreeMap::new();
-    for &(h, _) in &history {
-        metas.entry(h).or_insert_with(|| v.block_meta(h));
-    }
-    recent.extend(history.into_iter().filter_map(|(h, i)| v.finalized_tx(h, i).map(|(t, e)| tx_json_with(&v, &t, Some(Ran { height: h, idx: Some(i), meta: metas.get(&h).and_then(Option::as_ref) }), e.as_deref()))));
+    recent.extend(finalized_json(&v, v.history(&addr, HISTORY_PAGE)));
     let hunts_created: Vec<u64> = v.ids(ix::HUNT_CREATOR, &addr, false, ACCOUNT_LIST_LIMIT);
     let hunts_won: Vec<Value> = v.ids(ix::HUNT_WINNER, &addr, false, ACCOUNT_LIST_LIMIT).into_iter().filter_map(|id| st.hunts.get(&id)).map(|h| json!({ "id": h.id, "repo": h.repo, "issue": h.issue, "amount_display": fmt_fang(h.amount), "pr": h.pr, "self_awarded": h.self_awarded() })).collect();
     let keys = st.keys_of(&addr);
@@ -1355,6 +1350,46 @@ async fn account(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
         "hunts_won": hunts_won,
         "contribution": contribution_profile(&v, &addr),
     })))
+}
+
+/// Finalized txs (height, index in the block) as `/api/account` lists them, each block's index
+/// row read once (for who its txs paid when they ran).
+fn finalized_json(v: &ReadView, rows: Vec<(u64, usize)>) -> Vec<Value> {
+    let mut metas: BTreeMap<u64, Option<BlockMeta>> = BTreeMap::new();
+    for &(h, _) in &rows {
+        metas.entry(h).or_insert_with(|| v.block_meta(h));
+    }
+    rows.into_iter().filter_map(|(h, i)| v.finalized_tx(h, i).map(|(t, e)| tx_json_with(v, &t, Some(Ran { height: h, idx: Some(i), meta: metas.get(&h).and_then(Option::as_ref) }), e.as_deref()))).collect()
+}
+
+/// Txs per `/api/account/{id}/txs` page: by default, and at most.
+pub const HISTORY_PAGE: usize = 25;
+pub const HISTORY_PAGE_LIMIT: usize = 100;
+
+#[derive(Deserialize)]
+struct HistoryQuery {
+    /// `<height>.<index>`: the previous page's `next`.
+    before: Option<String>,
+    limit: Option<usize>,
+}
+
+/// A history cursor, `<height>.<index>` (the tx's block and its place in it).
+fn history_cursor(s: &str) -> Result<(u64, u32), ApiError> {
+    let parsed = s.split_once('.').and_then(|(h, i)| Some((h.parse::<u64>().ok()?, i.parse::<u32>().ok()?)));
+    parsed.ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, format!("`before` must be <height>.<index>, as `next` gives it; got {s:?}")))
+}
+
+/// `/api/account/{id}/txs?before=<height>.<index>&limit=`: an account's finalized txs (sent by
+/// it or naming it; `/api/account`'s `recent_txs` has the pending ones), newest first, a page at a
+/// time (audit TR-3, CRE-12, DEV-4). `next` is the cursor for the page after this one: `null` once
+/// a page reaches `history_from`, the first block this node holds (older ones: an archive node).
+async fn account_txs(State(n): State<Node>, Path(id): Path<String>, Query(q): Query<HistoryQuery>) -> ApiResult {
+    let v = n.live.view();
+    let addr = v.state.resolve(&id)?;
+    let limit = q.limit.unwrap_or(HISTORY_PAGE).clamp(1, HISTORY_PAGE_LIMIT);
+    let before = q.before.as_deref().filter(|s| !s.is_empty()).map(history_cursor).transpose()?;
+    let (rows, next) = v.history_page(&addr, before, limit);
+    Ok(Json(json!({ "txs": finalized_json(&v, rows), "next": next.map(|(h, i)| format!("{h}.{i}")), "history_from": v.history_from() })))
 }
 
 /// Which accounts a key may act for — lets a newly linked device find its account. From the
@@ -3840,5 +3875,95 @@ mod http_tests {
         for dir in [root, home] {
             std::fs::remove_dir_all(dir).ok();
         }
+    }
+
+    /// Audit TR-3 / CRE-12 / DEV-4: `/api/account/{id}/txs` pages an account's whole finalized
+    /// history, newest first, by a `<height>.<index>` cursor: each tx once, in the shape
+    /// `recent_txs` has, two txs of one block in order. On a pruning node the pages stop at
+    /// `history_from` (`next` is `null` there), and a cursor below it gets an empty page.
+    #[tokio::test]
+    async fn account_history_pages_back_to_history_from() {
+        let root = std::env::temp_dir().join(format!("blockula-api-history-{}-{}", crate::chain::now_ms(), std::process::id()));
+        let homes = Chain::summon(&root, &SummonOpts { block_time_ms: 60_000, ..SummonOpts::new("history", 1) }).unwrap();
+        let mut c = Chain::open(&homes[0]).unwrap();
+        let alice = crate::crypto::Keys::from_seed([31; 32]);
+        let me = c.me().unwrap();
+        c.faucet(&alice.address(), 100 * DROPS_PER_FANG).unwrap();
+        c.produce_block().unwrap();
+        let send = |c: &Chain, nonce: u64| {
+            let mut tx = Tx { chain_id: "history".into(), genesis_hash: c.genesis_hash.clone(), from: alice.address(), nonce, fee: 0, tip: 0, valid_until: c.height() + 10, action: Action::Transfer { to: me.clone(), amount: 1 + nonce }, memo: String::new(), public_key: hex::encode(alice.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+            tx.fee = crate::econ::max_fee(&c.state, tx.size());
+            tx.sign(&alice)
+        };
+        // One of alice's txs in each of blocks 2..=30, then two in block 31: 32 rows with the drip.
+        for nonce in 0..29 {
+            let t = send(&c, nonce);
+            c.produce_block_with(vec![t]).unwrap();
+        }
+        let two = vec![send(&c, 29), send(&c, 30)];
+        c.produce_block_with(two).unwrap();
+        c.set_pruning(Some(1));
+        let keep = c.keep_blocks().unwrap();
+        let n = Node::new(Arc::new(Mutex::new(c)), None, vec![], ClientIpPolicy::default());
+        let page_all = |limit: usize| {
+            let n = n.clone();
+            let addr = alice.address();
+            async move {
+                let (mut seen, mut before, mut pages) = (Vec::<Value>::new(), None::<String>, 0);
+                loop {
+                    let uri = format!("/api/account/{addr}/txs?limit={limit}{}", before.as_ref().map(|b| format!("&before={b}")).unwrap_or_default());
+                    let (s, v, _) = call(&n, "GET", &uri, None, "127.0.0.1:1").await;
+                    assert_eq!(s, StatusCode::OK, "{v}");
+                    let txs = v["txs"].as_array().unwrap();
+                    assert!(txs.len() <= limit);
+                    seen.extend(txs.iter().cloned());
+                    pages += 1;
+                    match v["next"].as_str() {
+                        Some(next) => {
+                            let last = txs.last().unwrap();
+                            assert_eq!(next.split_once('.').unwrap().0, last["height"].as_u64().unwrap().to_string(), "the cursor is the page's last tx");
+                            before = Some(next.to_string());
+                        }
+                        None => return (seen, pages, v["history_from"].as_u64().unwrap()),
+                    }
+                }
+            }
+        };
+        let (all, pages, from) = page_all(2).await;
+        assert_eq!((all.len(), pages, from), (32, 16, 1));
+        let at: Vec<(u64, u64)> = all.iter().map(|t| (t["height"].as_u64().unwrap(), t["nonce"].as_u64().unwrap())).collect();
+        assert!(at.windows(2).all(|w| w[0].0 >= w[1].0), "newest first: {at:?}");
+        assert_eq!((at[0], at[1], at[31].0), ((31, 30), (31, 29), 1), "the block's second tx first, the drip last");
+        let mut ids: Vec<&str> = all.iter().map(|t| t["id"].as_str().unwrap()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 32, "each tx once");
+        // The shape `recent_txs` has (no tx is pending, so it's the newest 25).
+        let (_, acct, _) = call(&n, "GET", &format!("/api/account/{}", alice.address()), None, "127.0.0.1:1").await;
+        assert_eq!(acct["recent_txs"].as_array().unwrap()[..], all[..HISTORY_PAGE]);
+        let (s, unknown, _) = call(&n, "GET", "/api/account/nobody.boo/txs", None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "an unregistered name: {unknown}");
+        let (_, first, _) = call(&n, "GET", &format!("/api/account/{}/txs", alice.address()), None, "127.0.0.1:1").await;
+        assert_eq!((first["txs"].as_array().unwrap().len(), first["next"].as_str()), (HISTORY_PAGE, Some("8.0")), "25 by default");
+        let (_, big, _) = call(&n, "GET", &format!("/api/account/{}/txs?limit=1000", alice.address()), None, "127.0.0.1:1").await;
+        assert_eq!((big["txs"].as_array().unwrap().len(), big["next"].as_str()), (32, None), "at most HISTORY_PAGE_LIMIT, which is plenty here");
+        let (_, one, _) = call(&n, "GET", &format!("/api/account/{}/txs?limit=0", alice.address()), None, "127.0.0.1:1").await;
+        assert_eq!(one["txs"].as_array().unwrap().len(), 1, "at least one");
+        for bad in ["7", "x.1", "7.", "7.-1"] {
+            let (s, e, _) = call(&n, "GET", &format!("/api/account/{}/txs?before={bad}", alice.address()), None, "127.0.0.1:1").await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}: {e}");
+        }
+        // Pruned below #21: the pages stop there.
+        let at = n.chain.lock().height();
+        for _ in at..keep + 20 {
+            n.chain.lock().produce_block_with(vec![]).unwrap();
+        }
+        let (kept, _, from) = page_all(3).await;
+        assert_eq!(from, 21);
+        let heights: Vec<u64> = kept.iter().map(|t| t["height"].as_u64().unwrap()).collect();
+        assert_eq!(heights, [31, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21]);
+        let (s, below, _) = call(&n, "GET", &format!("/api/account/{}/txs?before=15.0", alice.address()), None, "127.0.0.1:1").await;
+        assert_eq!((s, below["txs"].as_array().map(Vec::len), below["next"].is_null()), (StatusCode::OK, Some(0), true), "{below}");
+        std::fs::remove_dir_all(root).ok();
     }
 }
