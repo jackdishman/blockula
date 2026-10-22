@@ -227,6 +227,11 @@ const HANDOFF_VERIFIES_PER_ROUND: usize = 512;
 /// `/api/epochs` pages read per peer per round, at most: past a change nobody has a quorum for,
 /// the next pages may still hold signatures we lack.
 const HANDOFF_PAGES_PER_ROUND: usize = 4;
+/// Validators' recorded HTTP endpoints asked per round, at most, after the configured peers
+/// ([`handoff_peers`]): a set that lists slow or hostile endpoints costs a round this many peers'
+/// requests at most (each capped in bytes and time), and the window moves every round, so none
+/// of them keeps the others unasked.
+const LEARNED_PEERS_PER_ROUND: usize = 8;
 
 /// Where the next `/api/epochs` page starts (`null` after the last).
 #[derive(serde::Deserialize)]
@@ -239,15 +244,24 @@ struct PageNext {
 /// validator), so this node can serve complete proofs to fast-syncing joiners. Incremental
 /// (F19, F26): it asks only while some set change lacks a quorum here, only for pages from the
 /// first such change on, and verifies only signatures it lacks, without the chain lock.
+///
+/// It asks the configured `peers` (`--peer-http`, else the genesis validators), then the
+/// validators the chain knows ([`handoff_peers`]): a validator that joined after genesis signs
+/// its own handoffs, and none of the configured peers may hold them. Without them, a change whose
+/// quorum needs one stays unproven here, and so does every change after it, for every joiner.
 async fn exchange_epochs(chain: Shared, peers: Vec<String>) {
     let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
-    let (live, instance) = {
+    let (live, instance, me, public) = {
         let mut c = chain.lock();
         c.sign_handoffs();
-        (c.live.clone(), c.instance())
+        (c.live.clone(), c.instance(), c.me(), is_public_chain(&c.genesis))
     };
+    let mut round = 0u64;
     loop {
-        for peer in &peers {
+        // Only while something is unproven: `handoff_signers` is empty otherwise.
+        let signers = handoff_signers(&live.epochs());
+        let learned = if signers.is_empty() { vec![] } else { recorded_http_addrs(&live.view().state, &signers) };
+        for peer in &handoff_peers(&peers, &learned, me.as_deref(), public, LEARNED_PEERS_PER_ROUND, round) {
             let ours = live.epochs();
             let from = ours.proven_through();
             if from >= ours.known_through {
@@ -283,7 +297,102 @@ async fn exchange_epochs(chain: Shared, peers: Vec<String>) {
                 chain.lock().add_handoffs(verified);
             }
         }
+        round = round.wrapping_add(1);
         tokio::time::sleep(Duration::from_secs(30)).await;
+    }
+}
+
+/// The validators worth asking for the handoff signatures `reg` lacks (consensus keys, each once,
+/// most useful first): for every set change short of a quorum, oldest first, the members of the
+/// outgoing set whose signature it lacks (each holds its own), then the rest of both sides of the
+/// change and the newest set it knows (they collect what they lack too). Nobody when every change
+/// has its quorum.
+fn handoff_signers(reg: &crate::epochs::EpochRegistry) -> Vec<String> {
+    let (mut lacking, mut others): (Vec<&String>, Vec<&String>) = (vec![], vec![]);
+    for epoch in reg.changes().filter(|e| *e <= reg.known_through) {
+        let (Some(prev), Some(new)) = (reg.set(epoch - 1), reg.sets.get(&epoch)) else { continue };
+        let have = reg.proofs.get(&epoch);
+        if have.map_or(0, |h| h.len()) >= crate::epochs::quorum(prev.len()) {
+            continue;
+        }
+        for (i, key) in prev.iter().enumerate() {
+            if have.is_some_and(|h| h.contains_key(&(i as u32))) { others.push(key) } else { lacking.push(key) }
+        }
+        others.extend(new);
+    }
+    if lacking.is_empty() && others.is_empty() {
+        return vec![];
+    }
+    others.extend(reg.set(reg.known_through).into_iter().flatten());
+    let mut seen = std::collections::HashSet::new();
+    lacking.into_iter().chain(others).filter(|k| seen.insert(*k)).cloned().collect()
+}
+
+/// The HTTP endpoints the staking state records for the validators with these consensus `keys`
+/// (`RegisterValidator`'s `http_addr`, or `UpdateValidator`'s since), in the same order, as
+/// (validator address, `http_addr`). Keys of no registered validator are left out.
+fn recorded_http_addrs(state: &crate::chain::State, keys: &[String]) -> Vec<(String, String)> {
+    let prefix = state.params.prefix();
+    keys.iter()
+        .filter_map(|k| {
+            let address = crate::crypto::address_with_prefix(prefix, &hex::decode(k).ok()?);
+            state.validators.get(&address).map(|r| (address, r.http_addr.clone()))
+        })
+        .collect()
+}
+
+/// Where to ask for handoff signatures this round: the `configured` peers as given (they're the
+/// operator's word, private addresses included), then the endpoints `learned` from the staking
+/// state ((validator, `http_addr`), most useful first, as from [`recorded_http_addrs`]) as base
+/// URLs ([`crate::chain::http_url`]), leaving out this node's own (`me`), empty ones and ones
+/// already listed, and on a `public` chain ([`is_public_chain`]) any on this machine, a private
+/// network or a link-local address ([`is_private_url`]): the state is anyone's to write, and a
+/// public chain's nodes don't fetch from those on its word. Of the learned ones, at most `max`:
+/// a window that moves by `max` each `round`, so a long list is asked in turn.
+fn handoff_peers(configured: &[String], learned: &[(String, String)], me: Option<&str>, public: bool, max: usize, round: u64) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    for p in configured {
+        if !out.contains(p) {
+            out.push(p.clone());
+        }
+    }
+    let mut extra: Vec<String> = vec![];
+    for (validator, addr) in learned {
+        let addr = addr.trim();
+        if Some(validator.as_str()) == me || addr.is_empty() {
+            continue;
+        }
+        let url = crate::chain::http_url(addr);
+        if (public && is_private_url(&url)) || out.contains(&url) || extra.contains(&url) {
+            continue;
+        }
+        extra.push(url);
+    }
+    if !extra.is_empty() {
+        let start = ((round as u128 * max as u128) % extra.len() as u128) as usize;
+        out.extend(extra.iter().cycle().skip(start).take(max.min(extra.len())).cloned());
+    }
+    out
+}
+
+/// Whether a chain is public: a genesis validator advertises a p2p address off this machine and
+/// private networks (what [`is_private_host`] tells a validator of its own when it picks its p2p
+/// preset). A chain `summon` made for one machine (every address on 127.0.0.1) isn't.
+fn is_public_chain(g: &Genesis) -> bool {
+    g.validators.iter().any(|v| !is_private_host(&v.p2p_addr))
+}
+
+/// Whether a base URL's host is this machine, a private network or link-local ([`is_private_ip`]),
+/// a `localhost` name, or isn't a URL at all.
+fn is_private_url(url: &str) -> bool {
+    let Ok(u) = reqwest::Url::parse(url) else { return true };
+    let Some(host) = u.host_str() else { return true };
+    match host.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>() {
+        Ok(ip) => is_private_ip(ip),
+        Err(_) => {
+            let name = host.trim_end_matches('.').to_ascii_lowercase();
+            name == "localhost" || name.ends_with(".localhost")
+        }
     }
 }
 
@@ -673,11 +782,20 @@ pub fn ingress(addr: &str) -> Result<commonware_p2p::Ingress> {
 
 fn is_private_host(addr: &str) -> bool {
     match addr.parse::<SocketAddr>() {
-        Ok(sa) => match sa.ip() {
-            std::net::IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified(),
-            std::net::IpAddr::V6(ip) => ip.is_loopback() || ip.is_unspecified() || (ip.segments()[0] & 0xfe00) == 0xfc00,
-        },
+        Ok(sa) => is_private_ip(sa.ip()),
         Err(_) => addr.starts_with("localhost:"),
+    }
+}
+
+/// This machine, a private network (RFC 1918, IPv6 unique local), link-local or unspecified; an
+/// IPv4-mapped IPv6 address as its IPv4 one.
+fn is_private_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified(),
+        std::net::IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+            Some(v4) => is_private_ip(v4.into()),
+            None => ip.is_loopback() || ip.is_unspecified() || (ip.segments()[0] & 0xfe00) == 0xfc00 || (ip.segments()[0] & 0xffc0) == 0xfe80,
+        },
     }
 }
 
@@ -1763,6 +1881,250 @@ mod tests {
         let other = serve(Router::new().route("/api/status", get(status("00".repeat(32))))).await;
         assert_eq!(crate::checkpoints::peer_periods(&[other.clone(), url.clone()], &hash, Duration::from_secs(5)).await, vec![(url.clone(), 7 * day)]);
         drop(chain);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The consensus key (hex) a 32-byte secret derives.
+    fn consensus_key(secret: [u8; 32]) -> String {
+        hex::encode(commonware_cryptography::Signer::public_key(&PrivateKey::from_seed_bytes(secret)).as_ref())
+    }
+
+    /// A validator that joined after genesis signs its own handoffs and serves them, and only the
+    /// staking state says where (local-testnet.sh's fast join, 2026-10-21). Genesis validators
+    /// A, B and C; D joined with a node, E without one. The set {A, B, C, D, E} handing off to
+    /// {A, B, C, D} needs 4 of its 5 signatures: the genesis nodes hold their 3 (they asked each
+    /// other), D holds its own as well (it asked them). Every node is a real chain behind the real
+    /// API. A's exchange asks its configured peers (the genesis validators) and, from its state,
+    /// D and E (who doesn't answer): it completes the proof, and a joiner that fast-syncs from A
+    /// verifies the history through the change. Asking only the configured peers, it never did,
+    /// and every joiner failed as run 5 did ("has 3 valid handoff signatures, needs 4").
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handoffs_are_collected_from_validators_that_joined_after_genesis() {
+        use crate::epochs::{verify_history, EpochRegistry, Instance, Root};
+        let root = home("handoffs");
+        let homes = Chain::summon(&root, &SummonOpts::new("handoffs", 3)).unwrap();
+        // Each node's API listens where its record says: bound first, so the genesis can say it.
+        let mut listeners = vec![];
+        for _ in 0..4 {
+            listeners.push(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+        }
+        let addr_of = |l: &tokio::net::TcpListener| format!("127.0.0.1:{}", l.local_addr().unwrap().port());
+        // `summon` lists home i's validator i-th, in `validators` and `operators` alike.
+        let seeds: Vec<[u8; 32]> = homes.iter().map(|h| hex::decode(std::fs::read_to_string(h.join("validator.key")).unwrap().trim()).unwrap().try_into().unwrap()).collect();
+        let mut g = Genesis::load(&homes[0].join("genesis.json")).unwrap();
+        for (((v, o), l), seed) in g.validators.iter_mut().zip(&mut g.operators).zip(&listeners).zip(&seeds) {
+            (v.http_addr, o.http_addr) = (addr_of(l), addr_of(l));
+            o.pop = crate::chain::make_pop(*seed, &g.chain_id, &o.owner, &o.p2p_addr, &o.http_addr);
+        }
+        for h in &homes {
+            std::fs::write(h.join("genesis.json"), serde_json::to_string_pretty(&g).unwrap()).unwrap();
+        }
+        let g = Genesis::load(&homes[0].join("genesis.json")).unwrap();
+        let (d_seed, e_seed) = ([77u8; 32], [78u8; 32]);
+        let d_home = root.join("d");
+        std::fs::create_dir_all(&d_home).unwrap();
+        std::fs::copy(homes[0].join("genesis.json"), d_home.join("genesis.json")).unwrap();
+        std::fs::write(d_home.join("validator.key"), hex::encode(d_seed)).unwrap();
+        let d_http = addr_of(&listeners[3]);
+        let d_url = format!("http://{d_http}");
+        // E registered an address nothing answers at.
+        let e_http = addr_of(&tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+
+        // The history every node executed: the genesis set, then D and E in, then E out.
+        let s0 = EpochRegistry::genesis(&g).sets[&0].clone();
+        let sorted = |extra: &[[u8; 32]]| {
+            let mut s = s0.clone();
+            s.extend(extra.iter().map(|k| consensus_key(*k)));
+            s.sort();
+            s
+        };
+        let (s1, s2) = (sorted(&[d_seed, e_seed]), sorted(&[d_seed]));
+        let mut truth = EpochRegistry::genesis(&g);
+        assert!(truth.record(1, s1.clone()) && truth.record(2, s2.clone()));
+        let at = Instance::of(&g);
+        let signed_by = |secret: [u8; 32]| {
+            let mut r = truth.clone();
+            r.sign_missing(&at, secret, |e| truth.set(e).cloned());
+            r
+        };
+        let mut genesis_nodes = truth.clone();
+        for s in &seeds {
+            genesis_nodes.merge_sigs(&at, &signed_by(*s));
+        }
+        let mut d_node = genesis_nodes.clone();
+        d_node.merge_sigs(&at, &signed_by(d_seed));
+        assert_eq!((genesis_nodes.proven_through(), d_node.proven_through()), (1, 2), "the genesis signatures prove the change to five, not the one out of it");
+
+        // The nodes: each a chain holding that history and D's and E's registrations.
+        let prefix = g.address_prefix.clone();
+        let address = |secret: [u8; 32]| crate::crypto::address_with_prefix(&prefix, &hex::decode(consensus_key(secret)).unwrap());
+        let open = |home: &Path, reg: &EpochRegistry| -> Shared {
+            let mut c = Chain::open(home).unwrap();
+            let template = c.state.validators.get(&g.validators[0].address).unwrap().clone();
+            for (seed, http) in [(d_seed, d_http.clone()), (e_seed, e_http.clone())] {
+                let mut r = template.clone();
+                (r.address, r.owner, r.consensus_key, r.http_addr) = (address(seed), address(seed), consensus_key(seed), http);
+                c.state.validators.insert(r.address.clone(), r);
+            }
+            c.set_pruning(None); // publishes the state to readers
+            c.epochs = reg.clone();
+            c.live.publish_epochs(Arc::new(reg.clone()));
+            Arc::new(Mutex::new(c))
+        };
+        let mut chains = vec![];
+        for (i, l) in listeners.into_iter().enumerate() {
+            let chain = if i < 3 { open(&homes[i], &genesis_nodes) } else { open(&d_home, &d_node) };
+            chains.push(chain.clone());
+            let app = crate::api::router(crate::api::Node::new(chain, None, vec![], Default::default()));
+            tokio::spawn(async move { axum::serve(l, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap() });
+        }
+        let a = chains[0].clone();
+        let a_url = crate::chain::http_url(&g.validators[0].http_addr);
+
+        // A joiner fast-syncing from A checks the history through the change out of the five.
+        let client = reqwest::Client::new();
+        let joiner = |peer: String| {
+            let (client, g) = (client.clone(), g.clone());
+            async move {
+                let history = crate::snapshot::fetch_history(&client, &peer, 0, 2, &Default::default()).await?;
+                verify_history(&g, &history, &Root::genesis(&g), 2).map(|(set, _)| set)
+            }
+        };
+        let before = joiner(a_url.clone()).await.unwrap_err();
+        assert!(format!("{before:#}").contains("set change at epoch 2 has 3 valid handoff signatures, needs 4"), "{before:#}");
+
+        // A asks its configured peers, which aren't D.
+        let me = a.lock().me().unwrap();
+        assert_eq!(me, g.validators[0].address);
+        let peers = http_peers(&g, &[], Some(&me));
+        assert_eq!(peers.len(), 2);
+        assert!(!peers.contains(&d_url));
+        let live = a.lock().live.clone();
+        let exchange = tokio::spawn(exchange_epochs(a.clone(), peers));
+        // Its first round starts at once and takes well under a second here.
+        for _ in 0..200 {
+            if live.epochs().proven_through() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        exchange.abort();
+        let held = live.epochs();
+        assert_eq!(held.proven_through(), 2, "A never collected D's handoff signature: it holds signers {:?} of the change at epoch 2", held.proofs.get(&2).map(|p| p.keys().collect::<Vec<_>>()));
+        assert_eq!(joiner(a_url).await.unwrap(), s2, "a joiner verifies A's history through the change");
+        drop((a, chains));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The validators asked for handoff signatures: for each change short of a quorum, the outgoing
+    /// members whose signature it lacks first, then everyone else in the sets involved and the
+    /// newest set; each once. Nobody once every change is proven.
+    #[test]
+    fn handoff_signers_are_the_ones_lacking_first() {
+        use crate::epochs::{quorum, EpochRegistry};
+        let key = |c: char| c.to_string().repeat(4);
+        let mut reg = EpochRegistry { sets: [(0, vec![key('a'), key('b'), key('c'), key('d')])].into(), ..Default::default() };
+        assert!(handoff_signers(&reg).is_empty(), "nothing changed");
+        reg.record(1, vec![key('a'), key('b'), key('c'), key('d'), key('e')]);
+        reg.record(2, vec![key('a'), key('b'), key('c'), key('e'), key('f')]);
+        reg.record(3, vec![key('a'), key('b'), key('c'), key('e'), key('f')]);
+        assert_eq!(reg.known_through, 3);
+        // The change at 1 has a quorum (3 of 4); the one at 2 has a and c of the five (needs 4).
+        reg.proofs.insert(1, (0..quorum(4) as u32).map(|i| (i, "sig".to_string())).collect());
+        reg.proofs.insert(2, [(0, "sig".to_string()), (2, "sig".to_string())].into());
+        assert_eq!(reg.proven_through(), 1);
+        assert_eq!(handoff_signers(&reg), ["bbbb", "dddd", "eeee", "aaaa", "cccc", "ffff"]);
+        reg.proofs.get_mut(&2).unwrap().extend([(1, "sig".to_string()), (3, "sig".to_string())]);
+        assert_eq!(reg.proven_through(), 3);
+        assert!(handoff_signers(&reg).is_empty(), "everything proven: nobody to ask");
+    }
+
+    /// Where a round asks: the configured peers as given (deduplicated, private ones too), then the
+    /// validators' recorded endpoints as base URLs, without this node's own, empty or duplicate
+    /// ones, and on a public chain none on this machine, a private network or link-local.
+    #[test]
+    fn handoff_peers_dedupe_skip_self_and_private_addresses_on_public_chains() {
+        let configured = vec!["http://10.0.0.5:7070".to_string(), "https://v1.example.net".to_string(), "http://10.0.0.5:7070".to_string()];
+        let learned: Vec<(String, String)> = [
+            ("me", "198.51.100.1:7070"),
+            ("v2", "198.51.100.2:7070"),
+            ("v3", "http://198.51.100.2:7070/"),
+            ("v4", ""),
+            ("v5", "https://v1.example.net"),
+            ("v6", "127.0.0.1:7070"),
+            ("v7", "10.1.2.3:7070"),
+            ("v8", "[fe80::1]:7070"),
+            ("v9", "localhost:7070"),
+            ("v10", "192.168.1.2:7070"),
+            ("v11", "[::ffff:10.0.0.1]:7070"),
+            ("v12", "[fd00::1]:7070"),
+            ("v13", "169.254.1.1:7070"),
+            ("v14", "0.0.0.0:7070"),
+            ("v15", "[::1]:7070"),
+            ("v16", "node.localhost:7070"),
+            ("v17", "http://2130706433:7070"),
+            ("v18", "172.20.0.4:7070"),
+            ("v19", "https://v19.example.org:8443"),
+            ("v20", "[2001:db8::7]:7070"),
+        ]
+        .iter()
+        .map(|(v, a)| (v.to_string(), a.to_string()))
+        .collect();
+        let public = handoff_peers(&configured, &learned, Some("me"), true, 64, 0);
+        assert_eq!(public, ["http://10.0.0.5:7070", "https://v1.example.net", "http://198.51.100.2:7070", "https://v19.example.org:8443", "http://[2001:db8::7]:7070"]);
+        // A chain on one machine or a private network asks them all (not itself).
+        let local = handoff_peers(&configured, &learned, Some("me"), false, 64, 0);
+        assert_eq!(local.len(), 2 + 16, "{local:?}");
+        assert!(local.contains(&"http://127.0.0.1:7070".to_string()) && local.contains(&"http://[fe80::1]:7070".to_string()));
+        assert!(!local.contains(&"http://198.51.100.1:7070".to_string()), "never itself");
+        // A full node (no validator of its own) skips nobody for being it.
+        assert!(handoff_peers(&configured, &learned, None, true, 64, 0).contains(&"http://198.51.100.1:7070".to_string()));
+        // Nothing learned: exactly the configured peers.
+        assert_eq!(handoff_peers(&configured, &[], Some("me"), true, 8, 5), ["http://10.0.0.5:7070", "https://v1.example.net"]);
+    }
+
+    /// At most `max` learned endpoints a round, the window moving each round, so a long list (or
+    /// slow and hostile entries at its head) never keeps the rest from being asked.
+    #[test]
+    fn handoff_peers_ask_a_moving_window_of_learned_endpoints() {
+        let configured = vec!["https://seed.example.net".to_string()];
+        let learned: Vec<(String, String)> = (0..20).map(|i| (format!("v{i}"), format!("203.0.113.{i}:7070"))).collect();
+        let url = |i: usize| format!("http://203.0.113.{i}:7070");
+        let rounds: Vec<Vec<String>> = (0..3).map(|r| handoff_peers(&configured, &learned, None, true, 8, r)).collect();
+        for r in &rounds {
+            assert_eq!(r[0], configured[0], "the configured peers come first, every round");
+            assert!(r.len() <= 1 + 8, "{r:?}");
+        }
+        assert_eq!(rounds[0][1..], (0..8).map(url).collect::<Vec<_>>());
+        assert_eq!(rounds[1][1..], (8..16).map(url).collect::<Vec<_>>());
+        assert_eq!(rounds[2][1..], (16..20).chain(0..4).map(url).collect::<Vec<_>>());
+        let asked: std::collections::HashSet<&String> = rounds.iter().flat_map(|r| &r[1..]).collect();
+        assert_eq!(asked.len(), 20, "everyone within three rounds");
+        // A short list is asked whole every round.
+        let few = &learned[..3];
+        for r in 0..4 {
+            let mut got = handoff_peers(&configured, few, None, true, 8, r);
+            got.sort();
+            assert_eq!(got, ["http://203.0.113.0:7070", "http://203.0.113.1:7070", "http://203.0.113.2:7070", "https://seed.example.net"]);
+        }
+        // Rounds wrap without overflowing.
+        assert_eq!(handoff_peers(&configured, &learned, None, true, 8, u64::MAX).len(), 9);
+    }
+
+    /// A chain is public once a genesis validator's p2p address is off this machine and private
+    /// networks: a `summon`ed one isn't.
+    #[test]
+    fn a_chain_is_public_when_a_genesis_validator_is() {
+        let root = home("public");
+        let homes = Chain::summon(&root, &SummonOpts::new("public", 2)).unwrap();
+        let mut g = Genesis::load(&homes[0].join("genesis.json")).unwrap();
+        assert!(!is_public_chain(&g), "every address on 127.0.0.1");
+        g.validators[1].p2p_addr = "10.0.0.7:7000".into();
+        assert!(!is_public_chain(&g), "a private network");
+        g.validators[1].p2p_addr = "v1.blockula.example:7000".into();
+        assert!(is_public_chain(&g), "a DNS name");
+        g.validators[1].p2p_addr = "198.51.100.7:7000".into();
+        assert!(is_public_chain(&g), "a public IP");
         std::fs::remove_dir_all(root).ok();
     }
 
