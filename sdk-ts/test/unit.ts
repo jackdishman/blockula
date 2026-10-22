@@ -434,12 +434,12 @@ console.log("✓ names that get signed are proven against the client's witnesses
   assert.deepEqual(main.posted.map((t) => t.action.type === "delegate" ? t.action.validator : t.action.type === "transfer" ? t.action.to : ""), [VALIDATOR, "bob.boo"]);
   assert.equal((await mw.keyGrant(BOB)).account, BOB);
   // Two-faced: the name is resolved while the node says it's a test chain, the tx is built when it
-  // says mainnet (an unpinned client): refused at signing.
+  // says mainnet (an unpinned client that opted in to mainnet): refused at signing.
   const flip = host("http://flip.node");
   flip.names = { bob: ATTACKER };
   let flipReads = 0;
   Object.defineProperty(flip.status, "chain_id", { enumerable: true, get: () => (flipReads++ < 1 ? "unit" : MAINNET_CHAIN_ID) });
-  const fw = Wallet.fromSeed("0f".repeat(32), new Client("http://flip.node"));
+  const fw = Wallet.fromSeed("0f".repeat(32), new Client("http://flip.node", { allowMainnet: true }));
   await fw.actAs("bob.boo");
   assert.equal(fw.account, ATTACKER);
   await assert.rejects(fw.send(BOB, "1"), UnprovenNameError, "the account actAs found on one node's word isn't signed for on mainnet");
@@ -479,7 +479,7 @@ console.log("✓ actAs refuses an address with another chain's prefix");
 {
   const main = host("http://mainnet2.node", { chain_id: MAINNET_CHAIN_ID });
   main.names = { vlad: ATTACKER };
-  const c = new Client("http://mainnet2.node");
+  const c = new Client("http://mainnet2.node", { allowMainnet: true });
   const w = Wallet.fromSeed("1a".repeat(32), c);
   const res = await c.resolution("vlad.boo");
   assert.equal(res.proven, false);

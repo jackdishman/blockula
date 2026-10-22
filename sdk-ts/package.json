@@ -1,7 +1,7 @@
 {
   "name": "@blockula/sdk",
   "version": "0.5.1",
-  "description": "\ud83e\udddb TypeScript SDK for Blockula \u2014 post-quantum wallets (ML-DSA-65), .boo names, transfers",
+  "description": "\ud83e\udddb TypeScript SDK for Blockula: wallets with post-quantum signatures (ML-DSA-65), .boo names and transfers. Experimental software, provided as is under MIT; read \"Using the SDK on mainnet\" first.",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -16,9 +16,9 @@
   ],
   "scripts": {
     "build": "tsc",
-    "test": "tsx test/e2e.ts",
+    "test": "tsx test/e2e.ts && tsx test/e2e-integrators.ts",
     "test:kat": "tsx test/kat.ts",
-    "test:vectors": "tsx test/passkey-vectors.ts && tsx test/proof-vectors.ts && tsx test/tx-vectors.ts && tsx test/unit.ts"
+    "test:vectors": "tsx test/passkey-vectors.ts && tsx test/proof-vectors.ts && tsx test/tx-vectors.ts && tsx test/unit.ts && tsx test/integrators.ts"
   },
   "license": "MIT",
   "dependencies": {
