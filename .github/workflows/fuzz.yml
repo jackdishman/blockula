@@ -47,12 +47,18 @@ jobs:
       - name: Rust toolchain (rust-toolchain.toml)
         run: rustup toolchain install && rustc --version
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with: { workspaces: node/fuzz }
+        with:
+          workspaces: |
+            node/fuzz
+            node/vm/fuzz
       - name: Fuzz crate matches the node's modules and dependencies
         run: node/fuzz/check-sync.sh
       # Open findings live outside this public tree (node/fuzz/README.md): here, only the seeds.
       - name: Seeds are accepted
         run: cargo test --locked --manifest-path node/fuzz/Cargo.toml
+      # The programs engine's harnesses (node/vm/fuzz/README.md): their seeds, the same way.
+      - name: Programs engine seeds are accepted
+        run: cargo test --locked --manifest-path node/vm/fuzz/Cargo.toml
 
   fuzz:
     name: Fuzz ${{ matrix.target }}

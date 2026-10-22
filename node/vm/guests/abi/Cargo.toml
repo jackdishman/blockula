@@ -1,0 +1,6 @@
+[package]
+name = "abi"
+description = "Host ABI v1 bindings for the test guests, by hand: no SDK, no alloc."
+edition.workspace = true
+version.workspace = true
+publish.workspace = true

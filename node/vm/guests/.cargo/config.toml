@@ -1,0 +1,18 @@
+# The only place the guests' link flags live: build.sh unsets RUSTFLAGS and friends, which would
+# replace these rather than add to them.
+[build]
+target = "wasm32v1-none"
+
+[target.wasm32v1-none]
+rustflags = [
+  # A 64 KiB stack (rustc's default is 1 MiB), first in memory: an overflow runs below address 0
+  # and traps out of bounds instead of corrupting data. The later -z stack-size wins.
+  "-C", "link-arg=-zstack-size=65536",
+  # 32 pages (2 MiB, config::MAX_PAGES), initial = maximum: upload validation requires
+  # initial = maximum ≤ MAX_PAGES, and every guest gets the most it allows.
+  # Without these lld emits 17 initial pages and no maximum.
+  "-C", "link-arg=--initial-memory=2097152",
+  "-C", "link-arg=--max-memory=2097152",
+  # Minimal LEBs instead of 5-byte padded ones: about 9% smaller. Needs stripped output.
+  "-C", "link-arg=--compress-relocations",
+]
