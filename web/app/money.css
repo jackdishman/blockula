@@ -1,0 +1,53 @@
+/* Money flows (wallet-money): Send's review, the review steps before staking and voting, and
+   readable amounts. Every class here starts with money-; globals.css and explorer.css stay as
+   they are. No inline styles anywhere (the CSP is strict). */
+
+/* Send: who it pays, on one line that wraps on a phone. */
+.money-payee { overflow-wrap: anywhere; }
+.money-payee b { font-weight: 600; }
+
+/* "Why is this safe?": the node-trust explanation, folded away. */
+.money-why > summary { cursor: pointer; color: var(--ink-soft); font: 400 15px var(--caps); letter-spacing: 0.06em; width: fit-content; }
+.money-why > summary:hover { color: var(--blood); }
+.money-why > p { margin: 6px 0 0; }
+
+/* "Payments are final", right above Confirm. */
+.money-final { margin: 0; padding: 10px 14px; border: 1.5px solid var(--blood); color: var(--ink); font-size: 16px; }
+
+/* The amount's status line, with Max at its end. */
+.money-amount-row { display: flex; gap: 10px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
+.money-amount-row > span { min-width: 0; flex: 1 1 12em; }
+
+/* A checkbox with its words. */
+.money-check { display: flex; gap: 10px; align-items: flex-start; cursor: pointer; }
+.money-check input { margin-top: 5px; accent-color: var(--blood); }
+
+/* A review step (stake, unstake, move stake, vote): what gets signed, then the terms. */
+.money-review { display: flex; flex-direction: column; gap: 14px; }
+.money-review .kv { grid-template-columns: 130px minmax(0, 1fr); }
+.money-review .kv dd { min-width: 0; overflow-wrap: anywhere; }
+.money-terms { margin: 0; padding: 0 0 0 1.1em; display: flex; flex-direction: column; gap: 4px; }
+.money-terms li { line-height: 1.4; }
+.money-actions { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.money-actions .grow { flex: 1 1 12em; }
+
+/* Long chain text (a proposal's "does", with its bech32 address) wraps instead of widening the page. */
+.money-wrap { overflow-wrap: anywhere; min-width: 0; }
+
+/* Pool shares, folded behind their value. */
+.money-shares { display: inline; }
+.money-shares > summary { display: inline; cursor: pointer; list-style: none; color: var(--dim); }
+.money-shares > summary::-webkit-details-marker { display: none; }
+.money-shares > summary:hover { color: var(--blood); }
+.money-shares[open] > summary { color: var(--ink-soft); }
+
+/* Selects never push a phone's page sideways (an option's text sets their width). */
+.money-select { max-width: 100%; min-width: 0; }
+
+@media (max-width: 520px) {
+  .money-review .kv { grid-template-columns: 1fr; gap: 2px 0; }
+  .money-review .kv dd { margin-bottom: 8px; }
+}
+
+/* A warning under a review line. */
+.money-note { margin: 4px 0 0; }

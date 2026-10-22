@@ -1,7 +1,7 @@
 // lib/explorer/preflight.ts: effects and refusals before signing. Run with `npm test -w @blockula/web`.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { preflight, preflightInput } from "./explorer/preflight.ts";
+import { movable, preflight, preflightInput } from "./explorer/preflight.ts";
 
 const F = 1_000_000_000n;
 const label = (name) => ({ address: `boo1${name}`, name: `${name}.boo`, short: `boo1${name}…` });
@@ -125,10 +125,11 @@ test("an agent key's budget counts the creation fee too (audit main13-render-4)"
 });
 
 test("locked FANG (votes, vesting) can't leave, nor pay a tip, but can be staked (audit main13-render-5)", () => {
-  const locked = { transferable: String(14_149_677_470n), locked: String(80n * F), lockReason: "vote on proposal #1 until block #9,000" };
+  const locked = { transferable: String(14_149_677_470n), locked: String(80n * F), lockReason: "by your vote on proposal #1 until about 21:15" };
   const s = sender(94_149_677_470n, [owner], [], locked);
   const p = preflight({ tx: transfer(50n * F, fee), sender: s, signer: "k-owner", head: 10, recipient: { label: mina, isNew: false } });
-  assert.match(p.refusals[0], /80 FANG of this account is locked \(vote on proposal #1 until block #9,000\).*14\.14967747 FANG can move now/);
+  assert.match(p.refusals[0], /80 FANG of this account is locked by your vote on proposal #1 until about 21:15: locked FANG can be staked, not moved out.*14\.14967747 FANG can move now/);
+  assert.equal(p.certain, true, "a lock settles it: no point sending anyway");
   assert.equal(p.locked, 80n * F);
   assert.deepEqual(preflight({ tx: transfer(14n * F, fee), sender: s, signer: "k-owner", head: 10, recipient: { label: mina, isNew: false } }).refusals, []);
   const stake = { from: "boo1vlad", fee: String(fee), nonce: 1, action: { type: "delegate", validator: "boo1val", amount: String(90n * F) } };
@@ -217,4 +218,40 @@ test("a lapsed name still in the node's records cannot be offered, accepted or w
   assert.match(run(mina.address, vlad.address, vlad.address).refusals.join(" "), /has expired/);
   assert.match(run(vlad.address, mina.address, vlad.address).refusals.join(" "), /has expired/);
   assert.match(run(vlad.address, mina.address, mina.address).refusals.join(" "), /has expired/);
+});
+
+test("a lock's reason reads as words, not the node's id (USER-5)", () => {
+  const tx = transfer(90n * F, fee);
+  const account = { account: vlad, balance: String(100n * F), transferable: String(50n * F), locked: String(50n * F), locks: [{ id: "vote:2", reason: "vote:2", amount: String(50n * F), until: 952, vesting: false }], nonce: 3, keys: [owner], recent_txs: [] };
+  const now = Date.UTC(2026, 9, 31, 12, 0);
+  const input = preflightInput(tx, "k-owner", { status: { height: 900, block_time_ms: 1000 }, now, account, recipient: { ...account, account: mina, exists: true } });
+  assert.match(input.sender.lockReason, /^by your vote on proposal #2 until about \d{2}:\d{2}$/);
+  const p = preflight(input);
+  assert.match(p.refusals[0], /^50 FANG of this account is locked by your vote on proposal #2 until about \d{2}:\d{2}: locked FANG can be staked, not moved out/);
+  assert.doesNotMatch(p.refusals[0], /vote:2|block #952/);
+  assert.equal(p.certain, true);
+  // A vesting lock says so.
+  const vesting = preflightInput(tx, "k-owner", { status: { height: 900, block_time_ms: 1000 }, now, account: { ...account, locks: [{ id: "vesting", reason: "founder", amount: String(50n * F), until: 900 + 86_400 * 40, vesting: true }] } });
+  assert.match(vesting.sender.lockReason, /^while it vests \(founder\), until about [A-Z][a-z]{2} \d{1,2}/);
+});
+
+test("refusals the chain's state settles are certain; ones resting on other reads aren't", () => {
+  const poor = preflight({ tx: transfer(5n * F), sender: sender(F), signer: "k-owner", head: 1, recipient: { label: mina, isNew: false } });
+  assert.match(poor.refusals[0], /Not enough FANG/);
+  assert.equal(poor.certain, true);
+  const lowFirst = preflight({ tx: transfer(F / 1000n), sender: sender(F), head: 1, recipient: { label: mina, isNew: true } });
+  assert.match(lowFirst.refusals[0], /new to the chain/);
+  assert.equal(lowFirst.certain, false);
+  const fine = preflight({ tx: transfer(F), sender: sender(5n * F), head: 1, recipient: { label: mina, isNew: false } });
+  assert.equal(fine.certain, false);
+});
+
+test("movable: what can move now is transferable less pending, and the rest is locked", () => {
+  const pend = { id: "p", summary: "", status: "pending", height: null, kind: "transfer", from: vlad, to: mina, amount: String(4n * F), fee: "4000", action: { type: "transfer", to: "boo1mina", amount: String(4n * F) } };
+  const m = movable({ label: vlad, balance: String(100n * F), transferable: String(50n * F), recent: [pend] });
+  assert.equal(m.locked, 50n * F);
+  assert.equal(m.pending, 4n * F + 4000n);
+  assert.equal(m.available, 46n * F - 4000n);
+  // An older node without `transferable`: the balance.
+  assert.equal(movable({ label: vlad, balance: String(10n * F) }).available, 10n * F);
 });

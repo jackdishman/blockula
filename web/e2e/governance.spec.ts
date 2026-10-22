@@ -1,7 +1,9 @@
 // The Governance page: proposals with tallies and council votes, voting with conviction (signed
-// by the passkey wallet, checked by the mock node), on-chain text rendered as text, and a node
-// without governance.
+// by the passkey wallet after a review step, checked by the mock node; no lock beyond the vote
+// unless asked for), on-chain text rendered as text, releasing vote locks once one has ended, and
+// a node without governance.
 import { parseFang, proposalDigest, type ProposalKind, type Tx } from "@blockula/sdk";
+import { RPC } from "./env";
 import { addressOf } from "./mock-node";
 import { createWallet, cspViolations, expect, test, watchCsp } from "./helpers";
 
@@ -63,12 +65,29 @@ test("lists proposals and votes with conviction", async ({ page, node }) => {
   await expect(hostile.getByTestId("vote-form")).toHaveCount(0);
   expect(await page.evaluate(() => (window as unknown as { __pwned?: number }).__pwned)).toBeUndefined();
 
-  // Vote aye with 10 FANG at 2× conviction (locked two lock periods: two weeks here).
+  // No lock beyond the vote itself unless asked for (USER-4): conviction 0 by default.
+  await expect(open.getByLabel("Conviction")).toHaveValue("0");
+  await expect(open.getByLabel("Conviction").locator("option:checked")).toHaveText("0.1× · locked until voting ends");
+
+  // Vote aye with 10 FANG at 2× conviction (locked two lock periods: two weeks here), after a review.
   await open.getByRole("button", { name: "Aye" }).click();
   await open.getByLabel("Amount to vote with").fill("10");
   await open.getByLabel("Conviction").selectOption("2");
   await expect(open.getByLabel("Conviction")).toContainText("2× · locked 14 days after voting ends");
   await open.getByRole("button", { name: "Vote aye with 10 FANG (weight 20 FANG)" }).click();
+  const review = open.getByTestId("review");
+  await expect(review).toContainText("Vote aye on proposal #7 with 10 FANG");
+  // What the vote binds, rendered from the kind: the same words as the card.
+  await expect(review).toContainText("Set the chain parameter max_validators to 40");
+  await expect(review).toContainText("2×: counts as 20 FANG");
+  // Locked through voting's end (block 5,000 from now), then two weeks of lock periods.
+  const end = Number(node.proposals.find((x) => x.id === 7)?.voting_end) + 1 + 2 * 604_800;
+  await expect(review.getByTestId("vote-locked-until")).toContainText(`(block #${end.toLocaleString("en-US")})`);
+  await expect(review.getByTestId("review-terms")).toContainText("Your vote and its amount are public.");
+  await expect(review.getByTestId("review-terms")).toContainText("10 FANG stays locked until about");
+  await expect(review.getByTestId("review-terms")).toContainText("you can't shorten the lock");
+  expect(node.submitted).toHaveLength(0);
+  await review.getByRole("button", { name: "Confirm vote" }).click();
   await expect(page.getByRole("status")).toContainText("voted aye on proposal #7 with 10 FANG");
   const tx = node.submitted.at(-1) as Tx;
   expect(tx.action).toMatchObject({ type: "vote", proposal_id: 7, aye: true, amount: parseFang("10").toString(), conviction: 2 });
@@ -80,13 +99,62 @@ test("lists proposals and votes with conviction", async ({ page, node }) => {
   await open.getByRole("button", { name: "Nay" }).click();
   await open.getByLabel("Conviction").selectOption("0");
   await open.getByRole("button", { name: "Vote nay with 10 FANG (weight 1 FANG)" }).click();
+  await expect(review.getByTestId("review-terms")).toContainText("10 FANG stays locked until voting ends, about");
+  await review.getByRole("button", { name: "Confirm vote" }).click();
   await expect(open).toContainText("300 FANG aye · 101 FANG nay");
 
+  // No vote lock has ended: nothing to release yet, and it says when the next one ends (USER-19).
+  await expect(page.getByRole("button", { name: "Release expired locks" })).toBeDisabled();
+  await expect(page.getByTestId("locks-hint")).toContainText("None has ended yet: your next vote lock ends about");
+  // The tally bars and everything else render under the strict CSP.
+  expect(await cspViolations(page)).toEqual([]);
+});
+
+// USER-19: "Release expired locks" used to be always on, and answered "no expired vote locks to
+// release" from the node. It waits for a vote lock to end now, read from the account's own votes.
+test("releases vote locks once one has ended, not before", async ({ page, node }) => {
+  // A lock period of 2 blocks, so a lock can end within the test.
+  const cors = { "access-control-allow-origin": "*" };
+  await page.route(`${RPC}/api/params`, (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", headers: cors, body: JSON.stringify({ params: { unbonding_blocks: "20", lock_period_blocks: "2" }, genesis: { block_time_ms: 1000, epoch_blocks: 3600, address_prefix: "boo", epochs_per_year: 8766 }, issuance: { year: 1, rate_ppm: 60000 } }) }),
+  );
+  await createWallet(page);
+  const zero = { amount: { drops: "0", display: "0 FANG" }, weight: { drops: "0", display: "0 FANG" } };
+  const ends = node.height + 4;
+  node.proposals = [{ id: 3, title: "Short vote", url: "", kind: { type: "param_change", key: "max_validators", value: "40" }, summary: "", proposer: { address: addressOf("66".repeat(32)), name: null }, deposit: "0", status: "voting", created_at: node.height - 1, voting_end: ends, execute_at: null, supermajority: false, ayes: zero, nays: zero, voters: 0, council: [], tally: null, outcome: "" }];
+  await page.getByRole("link", { name: "Governance", exact: true }).click();
+  const card = page.getByTestId("proposal").filter({ hasText: "Short vote" });
+  await expect(page.getByTestId("locks-hint")).toHaveText("You have no vote locks to release.");
+  await expect(page.getByRole("button", { name: "Release expired locks" })).toBeDisabled();
+  await card.getByRole("button", { name: "Aye" }).click();
+  await card.getByLabel("Amount to vote with").fill("1");
+  await card.getByLabel("Conviction").selectOption("1");
+  await card.getByRole("button", { name: /^Vote aye with 1 FANG/ }).click();
+  await expect(card.getByTestId("vote-locked-until")).toContainText(`(block #${ends + 1 + 2})`);
+  await card.getByRole("button", { name: "Confirm vote" }).click();
+  await expect(page.getByRole("status")).toContainText("voted aye on proposal #3");
+  await expect(page.getByRole("button", { name: "Release expired locks" })).toBeDisabled();
+  await expect(page.getByTestId("locks-hint")).toContainText("None has ended yet");
+
+  // Voting ends and its lock period passes: now there's something to release.
+  node.height = ends + 10;
+  await expect(page.getByTestId("locks-hint")).toHaveText("Your vote lock on proposal #3 has ended and holds nothing now. Releasing it clears it from your account, which can keep 64 locks at most.", { timeout: 15_000 });
   await page.getByRole("button", { name: "Release expired locks" }).click();
   await expect(page.getByRole("status")).toContainText("unlocked their expired vote locks");
   expect(node.submitted.at(-1)?.action).toEqual({ type: "unlock" });
-  // The tally bars and everything else render under the strict CSP.
-  expect(await cspViolations(page)).toEqual([]);
+  await expect(page.getByTestId("locks-hint")).toHaveText("You have no vote locks to release.");
+  await expect(page.getByRole("button", { name: "Release expired locks" })).toBeDisabled();
+});
+
+// Review WM-R1: with no account read (it failed, or hasn't answered yet) the wallet knows nothing
+// about its votes, so it mustn't say there are none and switch the button off.
+test("keeps Release on, and claims nothing, when the account can't be read", async ({ page }) => {
+  const { account } = await createWallet(page);
+  await page.route(`${RPC}/api/account/${account}`, (route) => route.fulfill({ status: 503, contentType: "application/json", headers: { "access-control-allow-origin": "*" }, body: JSON.stringify({ error: "busy" }) }));
+  await page.goto("/governance");
+  await page.getByRole("button", { name: "Unlock with passkey" }).click();
+  await expect(page.getByTestId("locks-hint")).toHaveText("Release vote locks that have ended:");
+  await expect(page.getByRole("button", { name: "Release expired locks" })).toBeEnabled();
 });
 
 test("explains when the network has no governance yet", async ({ page, node }) => {
@@ -123,6 +191,10 @@ test("a proposal card says what the vote binds, whatever the node's summary says
   await garden.getByRole("button", { name: "Nay" }).click();
   await garden.getByLabel("Amount to vote with").fill("1");
   await garden.getByRole("button", { name: /^Vote nay with 1 FANG/ }).click();
+  // The review says what the vote binds, from the kind: the drain, not the garden.
+  await expect(garden.getByTestId("review")).toContainText(`Pay 10,000,000 FANG from the treasury to ${mallory}`);
+  await expect(garden.getByTestId("review")).not.toContainText("garlic");
+  await garden.getByRole("button", { name: "Confirm vote" }).click();
   await expect(page.getByRole("status")).toContainText("voted nay on proposal #8");
   const tx = node.submitted.at(-1) as Tx;
   expect(tx.action.type === "vote" && tx.action.proposal_digest).toBe(digest);

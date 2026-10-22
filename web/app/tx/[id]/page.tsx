@@ -8,6 +8,7 @@ import { Amount, ago, Hash, Loading, NotFound, Section, StatusPill, Term, useMe,
 import { Ledger, signerOf } from "@/components/explorer/Ledger";
 import { Copy } from "@/components/ui";
 import { nodeExplorer } from "@/lib/config";
+import { plural } from "@/lib/format";
 import { amountLeaves, deltaFor, effectsOf, formatDrops, fromMySide, parseDrops, plainDrops, showsAccount, type LedgerCtx } from "@/lib/explorer/ledger";
 import { type NodeError, useNode } from "@/lib/explorer/node";
 import { to } from "@/lib/explorer/routes";
@@ -144,7 +145,7 @@ export default function TxPage() {
             {b?.signature_bytes ? <><Term k="certificate">quorum certificate</Term>, {b.signature_bytes.toLocaleString("en-US")} bytes</> : <>by a later block&apos;s <Term k="certificate">certificate</Term></>}
           </>
         ),
-      when: t.height != null && head != null && !dropped ? `${(head - t.height).toLocaleString("en-US")} blocks deep` : undefined,
+      when: t.height != null && head != null && !dropped ? `${plural(head - t.height, "block")} deep` : undefined,
     },
   ];
 

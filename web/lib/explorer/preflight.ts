@@ -10,6 +10,7 @@
  * transaction outright, charging nothing. They're read from the chain's state as of now, so
  * they're a forecast: the node's answer on submit is the final word.
  */
+import { lockWords } from "../money.ts";
 import type { KeyView, Label } from "../types";
 import { DROPS_PER_FANG, effectsOf, formatDrops, type Change, type Effects, type Holding } from "./ledger.ts";
 import type { AccountDetail, HuntView, MultisigView, NameDetail, TxDetail, ValidatorsDetail } from "./types";
@@ -75,7 +76,7 @@ export interface Sender {
   balance: string;
   /** Protocol v1 nodes: what it can move out now (vesting and vote locks hold the rest, net of stake). */
   transferable?: string;
-  /** Protocol v1 nodes: what its locks hold, and why (for the refusal's words). */
+  /** Protocol v1 nodes: what its locks hold, and why, in words that follow "is locked" ("by your vote on proposal #2 until about 21:15"). */
   locked?: string;
   lockReason?: string;
   keys: KeyView[];
@@ -134,6 +135,11 @@ export interface Preflight {
   budget: Budget | null;
   /** Reasons the chain will refuse it. */
   refusals: string[];
+  /**
+   * A refusal the chain's state settles (not enough FANG, or it's locked): sending it anyway can
+   * only be refused. Other refusals rest on reads a wallet may get wrong, so it may still offer to try.
+   */
+  certain: boolean;
   /** Worth knowing, not blocking. */
   notes: string[];
   /** What it will do, when that depends on the chain's state rather than the form (a name sent to oneself). */
@@ -141,6 +147,20 @@ export interface Preflight {
 }
 
 const big = (v: unknown) => (typeof v === "bigint" ? v : typeof v === "number" ? BigInt(v) : typeof v === "string" && /^\d+$/.test(v) ? BigInt(v) : 0n);
+
+/**
+ * What a sender can move out now: what v1 nodes call `transferable` (its balance, less what vote
+ * and vesting locks hold; older nodes: the balance), less what its pending transactions will take
+ * when blocks apply them first. The preflight and Send's amount check and Max share it.
+ */
+export function movable(sender: Pick<Sender, "label" | "balance" | "transferable" | "recent">) {
+  const queued = (sender.recent ?? []).filter((t) => t.status === "pending" && t.from?.address === sender.label.address);
+  const pending = queued.reduce((sum, t) => sum + txDebit(t), 0n);
+  const balance = big(sender.balance);
+  const canMove = sender.transferable != null ? big(sender.transferable) : balance;
+  const locked = sender.transferable != null && balance > canMove ? balance - canMove : 0n;
+  return { balance, pending, locked, queued, available: canMove > pending ? canMove - pending : 0n, spendable: balance > pending ? balance - pending : 0n };
+}
 
 /** The amount the node reports for each kind (`tx_json` in node/src/api.rs). */
 function amountOf(a: Built["action"]): bigint {
@@ -217,15 +237,8 @@ export function preflight(i: PreflightInput): Preflight {
   const mine = changes.find((c) => c.who.address === sender.label.address);
   const cost = mine && mine.delta < 0n ? -mine.delta : fee;
 
-  // Pending transactions from this account reserve what they'll take.
-  const queued = (sender.recent ?? []).filter((t) => t.status === "pending" && t.from?.address === sender.label.address);
-  const pending = queued.reduce((sum, t) => sum + txDebit(t), 0n);
-  const balance = big(sender.balance);
-  // What it can move: v1 nodes report it (locks hold the rest); older ones, the balance.
-  const movable = sender.transferable != null ? big(sender.transferable) : balance;
-  const locked = sender.transferable != null && balance > movable ? balance - movable : 0n;
-  const available = movable > pending ? movable - pending : 0n;
-  const spendable = balance > pending ? balance - pending : 0n;
+  // Pending transactions from this account reserve what they'll take; locks hold the rest.
+  const { queued, pending, locked, available, spendable } = movable(sender);
 
   const refusals: string[] = [];
   const notes: string[] = [];
@@ -239,13 +252,15 @@ export function preflight(i: PreflightInput): Preflight {
   // Locked tokens may pay the burned base fee, never the tip, and nothing they hold may leave:
   // the fee is paid first, then whatever the action takes out must fit in what's left to move
   // (node/src/econ.rs `check_locks`). Staking locked tokens is fine (delegate keeps them held).
-  const locks = sender.lockReason ? ` (${sender.lockReason})` : "";
+  const locks = sender.lockReason ? ` ${sender.lockReason}` : "";
   const moves = cost > fee ? cost - fee : 0n;
+  const settled = refusals.length;
   if (spendable < fee) refusals.push(`Not enough FANG for the fee: it needs ${formatDrops(fee)}${pending ? " after your pending transactions" : ""}, and ${formatDrops(spendable)} is free.`);
   else if (spendable < cost) refusals.push(`Not enough FANG: this needs ${formatDrops(cost)}, and ${pending ? `${formatDrops(spendable)} is free after your pending transactions` : `the balance is ${formatDrops(spendable)}`}.`);
   else if (locked > 0n && kind !== "delegate" && moves > 0n && available < cost)
     refusals.push(`${formatDrops(locked)} of this account is locked${locks}: locked FANG can be staked, not moved out, and this takes ${formatDrops(cost)} while ${formatDrops(available)} can move now.`);
   else if (locked > 0n && tip > available) refusals.push(`The tip must come from FANG that can move: ${formatDrops(available)} can, and ${formatDrops(locked)} is locked${locks}.`);
+  const certain = refusals.length > settled;
 
   let budget: Budget | null = null;
   if (key?.role.type === "session") {
@@ -322,7 +337,7 @@ export function preflight(i: PreflightInput): Preflight {
   }
 
   const balanceAfter = spendable > cost ? spendable - cost : 0n;
-  return { effects, cost, available, balanceAfter, pending, locked, budget, refusals, notes, ...(headline ? { headline } : {}) };
+  return { effects, cost, available, balanceAfter, pending, locked, budget, refusals, certain, notes, ...(headline ? { headline } : {}) };
 }
 
 const who = (l: Label) => (l.name && !/\s/.test(l.name) ? l.name : l.short);
@@ -335,6 +350,8 @@ export interface Fees {
 /** What `checkTx` reads from the node for one transaction, as the node answered (node/src/api.rs). */
 export interface Reads {
   status: { height: number; block_time_ms?: number };
+  /** The reader's clock (ms), for when a lock ends in words; default now. */
+  now?: number;
   /** The sender's `/api/account`. */
   account: AccountDetail;
   /** The sender's `/api/multisig` (null: not a multisig, a 404). */
@@ -392,7 +409,7 @@ export function preflightInput(tx: Built, signer: string, r: Reads, intent?: str
       balance: mine.balance,
       transferable: mine.transferable,
       locked: mine.locked,
-      lockReason: lock ? `${lock.reason}${lock.vesting ? "" : ` until block #${lock.until.toLocaleString("en-US")}`}` : undefined,
+      lockReason: lock ? lockWords(lock, r.status.height, r.status.block_time_ms || 1000, r.now) : undefined,
       keys: mine.keys,
       recent: mine.recent_txs,
       familiars: (mine.familiars ?? []).map((f) => f.key_id),
