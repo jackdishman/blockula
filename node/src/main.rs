@@ -143,7 +143,9 @@ enum Cmd {
         home: Option<PathBuf>,
         #[arg(long)]
         no_faucet: bool,
-        #[arg(long, default_value = "1000")]
+        /// Milliseconds between blocks. 5 seconds keeps an idle validator's traffic and a node's
+        /// disk growth to about a fifth of 1-second blocks (docs/LAUNCH.md); 1000 for faster blocks
+        #[arg(long, default_value = "5000")]
         block_time_ms: u64,
         /// Number of genesis validators. With N > 1, `home/v0 … home/vN-1` are created.
         #[arg(long, default_value = "1")]
@@ -151,9 +153,15 @@ enum Cmd {
         /// Season 0 validator admin account (repeatable). Default: the first validator's account.
         #[arg(long = "admin")]
         admins: Vec<String>,
-        /// Blocks per epoch; the validator set changes only at epoch boundaries
-        #[arg(long, default_value = "600")]
-        epoch_blocks: u64,
+        /// Blocks per epoch; the validator set changes only at epoch boundaries (default: about
+        /// 10 minutes of blocks)
+        #[arg(long)]
+        epoch_blocks: Option<u64>,
+        /// Where other machines reach this chain's validators: this machine's IP or DNS name (a
+        /// Tailscale address works). Validator i is published at port 30300+i (p2p) and 7070+i
+        /// (HTTP). Default: 127.0.0.1, for a chain on this machine only
+        #[arg(long)]
+        host: Option<String>,
         /// Minimum validator bond in FANG (default: 50 with a faucet, 10000 without)
         #[arg(long)]
         min_bond: Option<String>,
@@ -320,6 +328,11 @@ enum Cmd {
     },
 }
 
+/// A block time as people read it: "5 s", or "250 ms" when it isn't whole seconds.
+fn fmt_block_time(ms: u64) -> String {
+    if ms % 1000 == 0 { format!("{} s", ms / 1000) } else { format!("{ms} ms") }
+}
+
 fn net_opts(net: Net, http_port: Option<u16>, p2p_preset: Option<String>, ephemeral_p2p: bool) -> NetOpts {
     let client_ip = api::ClientIpPolicy {
         trusted_forwarders: net.trusted_forwarders,
@@ -362,11 +375,12 @@ fn main() -> Result<()> {
             }
             node::run_validator(home, net_opts(net, Some(port), Some("local".into()), true))
         }
-        Cmd::Summon { chain_id, home, no_faucet, block_time_ms, validators, admins, epoch_blocks, min_bond, seance_blocks, claim_maturity_blocks, vesting_blocks, address_prefix, dev_durations } => {
+        Cmd::Summon { chain_id, home, no_faucet, block_time_ms, validators, admins, epoch_blocks, host, min_bond, seance_blocks, claim_maturity_blocks, vesting_blocks, address_prefix, dev_durations } => {
             let home = home.unwrap_or_else(|| blockula_dir().join(&chain_id));
             if home.join("genesis.json").exists() {
                 anyhow::bail!("{} already has a chain", home.display());
             }
+            let epoch_blocks = epoch_blocks.unwrap_or_else(|| chain::summon_epoch_blocks(block_time_ms));
             let opts = SummonOpts {
                 chain_id: chain_id.clone(),
                 faucet: !no_faucet,
@@ -383,20 +397,30 @@ fn main() -> Result<()> {
                 }),
                 address_prefix,
                 params: if dev_durations { params::ChainParams::dev_overrides(block_time_ms, epoch_blocks) } else { Default::default() },
+                host: host.clone(),
             };
             let homes = Chain::summon(&home, &opts)?;
             let g = chain::Genesis::load(&homes[0].join("genesis.json"))?;
             println!("🪦 Summoned chain `{chain_id}` with {validators} validator{} at {}", if validators == 1 { "" } else { "s" }, home.display());
+            // Published at another host, a validator listens on every interface (`::` for an IPv6 one).
+            let bind = match &host {
+                Some(h) if h.contains(':') => " --bind ::",
+                Some(_) => " --bind 0.0.0.0",
+                None => "",
+            };
             for (h, v) in homes.iter().zip(&g.validators) {
-                println!("   blockula run --home {}    # http://{}  p2p {}", h.display(), v.http_addr, v.p2p_addr);
+                println!("   blockula run --home {}{bind}    # http://{}  p2p {}", h.display(), v.http_addr, v.p2p_addr);
             }
             println!("   genesis hash: {}  (joiners can pin it with --genesis-hash)", hex::encode(consensus::genesis_block(&g).digest_bytes()));
-            println!("   epochs: {} blocks · min self-bond: {} · validator admins: {}", g.epoch_blocks, types::fmt_fang(g.chain_params()?.min_self_bond), g.validator_admins.join(", "));
+            println!("   a block every {} · epochs: {} blocks (about {} min) · min self-bond: {} · validator admins: {}", fmt_block_time(block_time_ms), g.epoch_blocks, g.epoch_blocks.saturating_mul(block_time_ms).div_ceil(60_000), types::fmt_fang(g.chain_params()?.min_self_bond), g.validator_admins.join(", "));
             if dev_durations {
                 let cp = g.chain_params()?;
                 println!("   dev durations: unbonding {} blocks · voting {} · timelock {} · deposit {}", cp.unbonding_blocks, cp.voting_blocks, cp.timelock_blocks, types::fmt_fang(cp.proposal_deposit));
             }
-            println!("   (Edit validators[].p2p_addr / http_addr in genesis.json before the first start if nodes will be reached at other addresses; every node must use the same file.)");
+            match &host {
+                Some(_) => println!("   others join with: blockula join --genesis {} --home ~/.blockula/{chain_id}   (docs/LAUNCH.md)", chain::http_url(&g.validators[0].http_addr)),
+                None => println!("   (These validators are published at 127.0.0.1, so other machines can't reach them: to run a chain with others, summon it with --host <this machine's IP or DNS name>. docs/LAUNCH.md)"),
+            }
             Ok(())
         }
         Cmd::Run { home, port, p2p_preset, net } => {
@@ -507,6 +531,21 @@ mod cli_tests {
         let n = opts(&["run", "--home", "h", "--http-bind", "::1", "--p2p-bind", "0.0.0.0"]);
         assert_eq!((crate::node::socket(n.http_iface(), 7070).unwrap().to_string(), crate::node::socket(n.p2p_iface(), 30300).unwrap().to_string()), ("[::1]:7070".to_string(), "0.0.0.0:30300".to_string()));
         assert!(crate::node::socket("localhost", 1).unwrap_err().to_string().contains("--http-bind"));
+    }
+
+    /// Chains people launch default to 5-second blocks and about 10-minute epochs, lighter on home
+    /// connections and disks (docs/LAUNCH.md); every one of them can still be set.
+    #[test]
+    fn summoned_chains_default_to_light_blocks() {
+        use clap::Parser;
+        let summon = |args: &[&str]| match super::Cli::try_parse_from(["blockula", "summon", "mychain"].iter().chain(args)).unwrap().cmd {
+            super::Cmd::Summon { block_time_ms, epoch_blocks, host, .. } => (block_time_ms, epoch_blocks.unwrap_or_else(|| crate::chain::summon_epoch_blocks(block_time_ms)), host),
+            _ => unreachable!(),
+        };
+        assert_eq!(summon(&[]), (5_000, 120, None));
+        assert_eq!(summon(&["--block-time-ms", "1000"]), (1_000, 600, None), "the old default, as the test scripts pin it");
+        assert_eq!(summon(&["--epoch-blocks", "20", "--host", "100.64.0.7"]), (5_000, 20, Some("100.64.0.7".into())));
+        assert_eq!((super::fmt_block_time(5_000), super::fmt_block_time(1_500)), ("5 s".to_string(), "1500 ms".to_string()));
     }
 
     /// D10: the tagline makes no "never dies" claim.

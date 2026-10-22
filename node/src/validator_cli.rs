@@ -806,6 +806,10 @@ pub enum WalletCmd {
         memo: String,
         #[arg(long, default_value = "http://localhost:7070")]
         rpc: String,
+        /// Send from this key file's account instead of the wallet's: e.g. a validator home's
+        /// validator.key, whose account holds a summoned chain's genesis units
+        #[arg(long)]
+        key: Option<PathBuf>,
         #[command(flatten)]
         pin: ChainPin,
     },
@@ -821,6 +825,10 @@ pub enum WalletCmd {
     Faucet {
         #[arg(long, default_value = "http://localhost:7070")]
         rpc: String,
+        /// Send it to this address instead of the wallet's: a new validator's own account, which
+        /// pays its bond (no wallet needed)
+        #[arg(long)]
+        to: Option<String>,
     },
 }
 
@@ -866,8 +874,11 @@ pub fn wallet(cmd: WalletCmd, dir: &Path) -> Result<()> {
             println!("{me}  {}", a["balance_display"].as_str().unwrap_or("0 FANG"));
             Ok(())
         }
-        WalletCmd::Send { to, amount, memo, rpc, pin } => {
-            let keys = wallet_keys(dir)?;
+        WalletCmd::Send { to, amount, memo, rpc, key, pin } => {
+            let keys = match key {
+                Some(path) => load_seed(&path)?,
+                None => wallet_keys(dir)?,
+            };
             let amount = parse_fang(&amount)?;
             let tx = rt()?.block_on(async {
                 let remote = Remote::connect(dir, &rpc, &pin).await?;
@@ -887,20 +898,32 @@ pub fn wallet(cmd: WalletCmd, dir: &Path) -> Result<()> {
             println!("✓ {}", tx["summary"].as_str().unwrap_or_default());
             Ok(())
         }
-        WalletCmd::Faucet { rpc } => {
-            let keys = wallet_keys(dir)?;
+        WalletCmd::Faucet { rpc, to } => {
             let rt = rt()?;
             let res = rt.block_on(async {
-                let me = own_address(&rpc, &keys).await?;
+                let me = match to {
+                    Some(to) => to,
+                    None => own_address(&rpc, &wallet_keys(dir)?).await?,
+                };
                 let res = reqwest::Client::new().post(format!("{}/api/faucet", rpc.trim_end_matches('/'))).json(&serde_json::json!({ "to": me })).send().await?;
                 let ok = res.status().is_success();
                 let v: Value = res.json().await?;
                 if !ok {
                     bail!("{}", v["error"].as_str().unwrap_or("faucet refused"));
                 }
-                Ok::<_, anyhow::Error>(v)
+                // Wait until it's final, so the next command (a validator's `register`) can spend it.
+                let id = v["id"].as_str().unwrap_or_default().to_string();
+                let valid_until = v["tx"]["valid_until"].as_u64().unwrap_or_default();
+                for _ in 0..240 {
+                    if let Some(done) = get(&rpc, &format!("/tx/{id}")).await.ok().and_then(|t| tx_outcome(&id, t, valid_until)) {
+                        return done.map(|t| (me, v, t["height"].as_u64()));
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                bail!("the faucet's tx {id} is still pending after 120s: check it (GET /api/tx/{id}) before asking again")
             })?;
-            println!("✓ faucet sent {} (tx {})", res["amount_display"].as_str().unwrap_or("FANG"), res["id"].as_str().unwrap_or_default());
+            let (to, sent, height) = res;
+            println!("✓ faucet sent {} to {to} (tx {}{})", sent["amount_display"].as_str().unwrap_or("FANG"), sent["id"].as_str().unwrap_or_default(), height.map(|h| format!(", final in block #{h}")).unwrap_or_default());
             Ok(())
         }
     }
@@ -1108,6 +1131,26 @@ mod tests {
             }
         });
         (root, homes, chain, rt, url)
+    }
+
+    /// The launch guide's funding steps (docs/LAUNCH.md): `wallet faucet --to` pays another address
+    /// (a new validator's own account) with no wallet, and returns only once the payment is final,
+    /// so a `register` right after it can spend it; `wallet send --key` pays from a key file's
+    /// account (a summoned chain's units sit on its validators' accounts).
+    #[test]
+    fn faucet_to_and_send_with_a_key_fund_a_new_validator() {
+        let (root, homes, chain, _rt, url) = local_node("fund");
+        let dir = root.join("cli");
+        std::fs::create_dir_all(&dir).unwrap();
+        let newcomer = crate::crypto::Keys::generate().address();
+        wallet(WalletCmd::Faucet { rpc: url.clone(), to: Some(newcomer.clone()) }, &dir).unwrap();
+        assert_eq!(chain.lock().state.account(&newcomer).balance, 100 * DROPS_PER_FANG, "final when it returns");
+        let key = homes[0].join("validator.key");
+        wallet(WalletCmd::Send { to: newcomer.clone(), amount: "25".into(), memo: String::new(), rpc: url.clone(), key: Some(key), pin: ChainPin::default() }, &dir).unwrap();
+        assert_eq!(chain.lock().state.account(&newcomer).balance, 125 * DROPS_PER_FANG);
+        assert!(!dir.join("wallet.json").exists(), "neither needed a wallet");
+        assert!(wallet(WalletCmd::Faucet { rpc: url.clone(), to: None }, &dir).unwrap_err().to_string().contains("no wallet"), "without --to it pays the wallet");
+        std::fs::remove_dir_all(root).ok();
     }
 
     /// OPERATOR-3: `set-addr` changes the validator's published addresses and nothing else (its

@@ -755,7 +755,7 @@ mod tests {
         });
         let dir = root.join("cli");
         wallet(WalletCmd::New { rpc: None, prefix: None }, &dir).unwrap();
-        wallet(WalletCmd::Faucet { rpc: honest.clone() }, &dir).unwrap();
+        wallet(WalletCmd::Faucet { rpc: honest.clone(), to: None }, &dir).unwrap();
         let me = crate::validator_cli::wallet_keys(&dir).unwrap().address();
         for _ in 0..100 {
             if chain.lock().state.account(&me).balance > 0 {
@@ -764,7 +764,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         let bob = Keys::from_seed([9; 32]).address();
-        let send = |rpc: &str, pin: ChainPin| wallet(WalletCmd::Send { to: bob.clone(), amount: "1".into(), memo: String::new(), rpc: rpc.into(), pin }, &dir);
+        let send = |rpc: &str, pin: ChainPin| wallet(WalletCmd::Send { to: bob.clone(), amount: "1".into(), memo: String::new(), rpc: rpc.into(), key: None, pin }, &dir);
         // The honest local node: signed and finalized.
         send(&honest, ChainPin::default()).unwrap();
         assert_eq!(chain.lock().state.account(&bob).balance, DROPS);
@@ -878,7 +878,7 @@ mod tests {
         });
         let dir = root.join("cli");
         wallet(WalletCmd::New { rpc: None, prefix: None }, &dir).unwrap();
-        wallet(WalletCmd::Faucet { rpc: honest.clone() }, &dir).unwrap();
+        wallet(WalletCmd::Faucet { rpc: honest.clone(), to: None }, &dir).unwrap();
         let me = crate::validator_cli::wallet_keys(&dir).unwrap().address();
         for _ in 0..100 {
             if chain.lock().state.account(&me).balance > 0 {
@@ -909,7 +909,7 @@ mod tests {
         }));
         let signer = crate::contrib_cli::Signer { key: None, from: None, rpc: node.clone(), pin: ChainPin::default() };
         // A send to a name: the name is what's signed (here nobody owns it, so the chain refuses it).
-        let err = wallet(WalletCmd::Send { to: "Count.boo".into(), amount: "1".into(), memo: String::new(), rpc: node.clone(), pin: ChainPin::default() }, &dir).unwrap_err().to_string();
+        let err = wallet(WalletCmd::Send { to: "Count.boo".into(), amount: "1".into(), memo: String::new(), rpc: node.clone(), key: None, pin: ChainPin::default() }, &dir).unwrap_err().to_string();
         assert!(err.contains("no one has claimed count.boo"), "{err}");
         assert!(posted.lock().iter().all(|t| t["action"]["to"] != mallory.as_str()), "the node's answer for the name was never signed");
         assert_eq!(posted.lock().last().unwrap()["action"]["to"], "count.boo");
@@ -1002,7 +1002,7 @@ mod tests {
         });
         let dir = root.join("cli");
         wallet(WalletCmd::New { rpc: None, prefix: None }, &dir).unwrap();
-        wallet(WalletCmd::Faucet { rpc: honest.clone() }, &dir).unwrap();
+        wallet(WalletCmd::Faucet { rpc: honest.clone(), to: None }, &dir).unwrap();
         let me_keys = crate::validator_cli::wallet_keys(&dir).unwrap();
         let me = me_keys.address();
         for _ in 0..100 {

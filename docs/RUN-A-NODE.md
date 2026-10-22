@@ -39,6 +39,7 @@ Measured on 2026-10-21 with release 0.5.2: a local chain of 4 validators and a f
 
 - **Memory** grows with the chain's state (accounts, names), not with its history or the size of the set. Give any node at least 1 GB of RAM for headroom; a public RPC node needs more under load.
 - **Bandwidth** is what limits a home validator. Certificates are sent to every other validator, so a validator's traffic grows with the size of the set. The 7- and 32-validator figures come from the certificate maths in [OPERATIONS.md, Bandwidth](OPERATIONS.md#bandwidth). A home connection with a 1.2 TB monthly cap fits a validator in a set of up to about 10.
+- **Chains you launch yourself** (`blockula summon`, [LAUNCH.md](LAUNCH.md)) make a block every 5 seconds by default, so an idle validator sends about a fifth of the upload above, which was measured at the public testnet's 1-second blocks. [LAUNCH.md, What it costs](LAUNCH.md#what-it-costs) has both, measured side by side.
 - **Disk** for a full node grows with use: about 80 MB a day on an idle chain of 4 validators (about 30 GB a year), plus about 17 KB per transfer. A full node keeps every block unless you pass `--prune-blocks N`. A validator keeps about two days. [OPERATIONS.md, Disk sizing](OPERATIONS.md#disk-sizing) has the full tables.
 
 ## Install
