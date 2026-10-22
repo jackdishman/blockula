@@ -3169,11 +3169,17 @@ impl Chain {
         let e = self.prepare_commit(block, &named, Some(f.cblock), commit.records, f.certificate)?;
         self.cert_bytes = if e.cert.is_some() { 0 } else { self.cert_bytes.saturating_add(cblock_bytes) };
         self.advance(&e.block);
+        // The mempool sheds the block's txs with the state it moved past them, under the same
+        // lock (audit PERF-1, TR-1): while the block is written (`execute_shared`, without the
+        // lock), admission and `next_nonce` count only what's still queued, and a proposal walks
+        // a mempool without them. Readers see them pending until `finish`.
+        self.shed_included();
         Ok(e)
     }
 
     /// After the writer committed the block: the tree adopts the new database snapshot, readers
-    /// get the new view, the mempool sheds the block's txs, and checkpoints get a snapshot.
+    /// get the new view and a mempool without the block's txs (admission's queues shed them in
+    /// `apply_block`), and checkpoints get a snapshot.
     fn finish(&mut self, e: Executed, written: Result<(Arc<Snap>, CommitPoint)>) -> Result<()> {
         let (snap, point) = match written {
             Ok(w) if self.height == e.block.height => w,
@@ -3404,9 +3410,24 @@ impl Chain {
         self.lane.extend(joined);
     }
 
-    /// Removes the txs the head block included from the mempool (cheap: ids are kept). A new
-    /// head also makes every admission simulation stale.
+    /// Removes the txs the head block included from the readers' mirror of the mempool (cheap:
+    /// ids are kept), published by the caller (`finish`). Admission's queues shed them already,
+    /// in `apply_block` ([`Chain::shed_included`]), and nothing in the head is queued again
+    /// (`has_tx` finds it through `head_ids`). The simulations admission built since then stay:
+    /// they ran on the state `finish` keeps (`adopt` only moves the tree onto the new database
+    /// snapshot), so a sender's next tx doesn't re-run its queue (review NR-2).
     fn drop_included(&mut self) {
+        for id in &self.head_ids {
+            self.mp.remove(id);
+        }
+    }
+
+    /// Removes the head block's txs from the queues admission and proposals use, with the
+    /// state's step past the block (`apply_block`). The readers' mirror (`mp`) keeps them as
+    /// pending until `finish` publishes the block with it ([`Chain::drop_included`]), so a
+    /// reader never sees the previous state without them (its `next_nonce` would be short, and
+    /// an included tx not found). A new head also makes every admission simulation stale.
+    fn shed_included(&mut self) {
         self.sims.clear();
         if self.head_ids.is_empty() {
             return;
@@ -3415,7 +3436,6 @@ impl Chain {
         self.remove_from_mempool(|id| included.contains(id));
         for id in &included {
             self.pool.remove(id);
-            self.mp.remove(id);
         }
         self.head_ids = included;
         self.rebuild_pending();
@@ -3921,6 +3941,23 @@ impl Chain {
     pub fn produce_block_with(&mut self, txs: Vec<Tx>) -> Result<()> {
         let f = self.test_block(txs);
         self.execute(f)
+    }
+
+    /// Tests: the first half of [`Chain::execute`], the block applied in memory. Until
+    /// [`Chain::execute_end`] the chain is in the window `execute_shared` leaves while the block
+    /// is written without the lock: admission, `next_nonce` and proposals run in it.
+    #[cfg(test)]
+    pub(crate) fn execute_begin(&mut self, f: Finalized) -> Result<Executed> {
+        self.execute_in_memory(f)
+    }
+
+    /// Tests: the rest of [`Chain::execute`] for a block [`Chain::execute_begin`] applied.
+    #[cfg(test)]
+    pub(crate) fn execute_end(&mut self, mut e: Executed) -> Result<()> {
+        let written = self.writer.clone().lock().persist(&mut e);
+        self.finish(e, written)?;
+        self.revalidate_mempool();
+        Ok(())
     }
 
     /// The next block with `txs`, as consensus would hand it over (tests).
@@ -6524,6 +6561,87 @@ mod persistence {
         println!("block written in {total:?}; the chain lock was free throughout the 300 ms write");
         drop(c);
         drop(chain);
+        fs::remove_dir_all(h).ok();
+    }
+
+    /// Audit PERF-1 / TR-1: the mempool sheds a block's txs in the locked step that moves the
+    /// state past them. In the window `execute_shared` leaves while the block is written (the
+    /// lock free, readers still on the previous block), a sender's next nonce is admitted (it
+    /// was refused with a false "expected"), `next_nonce` counts only what's still queued, and a
+    /// validator's own tx gets the nonce right after its included one (it got one past that,
+    /// which could never apply). Readers see the previous mempool until the block is on disk.
+    #[test]
+    fn the_mempool_sheds_a_block_with_its_state() {
+        let (h, mut c, alice) = active("shed", 3);
+        // Alice pays the validator, the validator's own txs pay alice (existing accounts both).
+        let (a, me) = (alice.address(), c.system_fee_payer().unwrap());
+        let pay = |to: &str, amount: u64| Action::Transfer { to: to.into(), amount };
+        let (n0, k0) = (c.next_nonce(&a), c.next_nonce(&me));
+        let t1 = tx(&c, &alice, pay(&me, 1));
+        c.submit(t1.clone()).unwrap();
+        let t2 = tx(&c, &alice, pay(&me, 2));
+        c.submit(t2.clone()).unwrap();
+        let s1 = c.submit_system(pay(&a, 3), "duty").unwrap();
+        assert_eq!((t1.nonce, t2.nonce, s1.nonce), (n0, n0 + 1, k0));
+        let height = c.height();
+        let f = c.test_block(c.mempool.clone());
+        let written = c.execute_begin(f).unwrap();
+        // The window: the state is past the block, and so is the mempool.
+        assert_eq!(c.state.account(&a).nonce, n0 + 2);
+        assert_eq!((c.pending_count(&a), c.next_nonce(&a), c.mempool.len()), (0, n0 + 2, 0));
+        let t3 = tx(&c, &alice, pay(&me, 4));
+        assert_eq!(t3.nonce, n0 + 2);
+        c.submit(t3.clone()).expect("the sender's next nonce is admitted");
+        let s2 = c.submit_system(pay(&a, 5), "duty").unwrap();
+        assert_eq!(s2.nonce, k0 + 1, "the nonce after its included tx");
+        // A tx the block included is known (accepted again idempotently), not queued again.
+        assert_eq!(c.submit_tx(t1.clone()).unwrap(), (t1.id(), false));
+        assert_eq!(c.mempool.len(), 2);
+        // Readers are on the previous block until it's written, with its txs still pending, so
+        // what they make of it adds up: `/api/account`'s next nonce is admission's.
+        let (view, mp) = (c.view(), c.live.mempool());
+        assert_eq!(view.height, height);
+        assert!(mp.contains(&t1.id()) && mp.contains(&t2.id()) && mp.contains(&t3.id()));
+        assert_eq!(view.state.account(&a).nonce + mp.pending_count(&a) as u64, c.next_nonce(&a));
+        c.execute_end(written).unwrap();
+        assert!(!c.live.mempool().contains(&t1.id()) && c.live.mempool().contains(&t3.id()) && c.live.mempool().contains(&s2.id()));
+        // What the window admitted runs in the next block.
+        c.produce_block().unwrap();
+        for t in [&t3, &s2] {
+            assert!(c.failure(&t.id()).is_none() && c.tx_location(&t.id()).is_some(), "{} ran", t.nonce);
+        }
+        assert_eq!((c.state.account(&a).nonce, c.state.account(&me).nonce), (n0 + 3, k0 + 2));
+        drop(c);
+        fs::remove_dir_all(h).ok();
+    }
+
+    /// Review NR-2: the simulations admission builds while a block is written stay once the
+    /// block is on disk (they ran on the state `finish` keeps), so a sender's next tx is one dry
+    /// run, not its whole queue again. What they admitted runs.
+    #[test]
+    fn simulations_built_while_a_block_is_written_are_kept() {
+        let (h, mut c, alice) = active("windowsims", 3);
+        let (a, me) = (alice.address(), c.system_fee_payer().unwrap());
+        let pay = |amount: u64| Action::Transfer { to: me.clone(), amount };
+        let n0 = c.state.account(&a).nonce;
+        let t1 = tx(&c, &alice, pay(1));
+        c.submit(t1.clone()).unwrap();
+        let f = c.test_block(c.mempool.clone());
+        let written = c.execute_begin(f).unwrap();
+        // The window: alice's first tx runs on the state, her second on a simulation of the first.
+        let rebuilt = c.sims.rebuilt;
+        for amount in [2, 3] {
+            c.submit(tx(&c, &alice, pay(amount))).unwrap();
+        }
+        assert_eq!(c.sims.rebuilt, rebuilt + 1, "one queued tx simulated");
+        c.execute_end(written).unwrap();
+        assert!(!c.live.mempool().contains(&t1.id()), "the readers' mirror shed the block");
+        // On disk now: her third tx runs on the window's simulation, which applied her two.
+        c.submit(tx(&c, &alice, pay(4))).unwrap();
+        assert_eq!(c.sims.rebuilt, rebuilt + 1, "her queue wasn't simulated again");
+        c.produce_block().unwrap();
+        assert_eq!((c.pending_count(&a), c.state.account(&a).nonce), (0, n0 + 4));
+        drop(c);
         fs::remove_dir_all(h).ok();
     }
 
