@@ -2,6 +2,8 @@
 
 For validator operators, sentry and RPC operators, and the release and incident teams. It closes the documentation side of OPS-1, OPS-4, OPS-5, OPS-6, OPS-7, SF-14 and CRY-2 (weak subjectivity) in [MAINNET.md](MAINNET.md), and follows the decisions in [MAINNET-DESIGN.md](MAINNET-DESIGN.md) (DEC-3, DEC-14, section 3.9).
 
+New to running a node? Start with [RUN-A-NODE.md](RUN-A-NODE.md): a full node at home or on a small server, connecting your wallet, SDK, MCP and CLI to it, and becoming a validator, sized for today's network. This document is the reference for running validators professionally.
+
 Some of what's below needs protocol v1 code that is still landing. Those parts are marked **(planned: P-…)** with the package that delivers them; everything else works with today's binary.
 
 ## Contents
@@ -11,7 +13,7 @@ Some of what's below needs protocol v1 code that is still landing. Those parts a
 3. [Reference hardware](#reference-hardware), [Bandwidth](#bandwidth), [Disk sizing](#disk-sizing)
 4. [Ports and firewall](#ports-and-firewall), [Time](#time), [Sentries](#sentries)
 5. [Running a validator](#running-a-validator)
-6. [Keys, backups and restores](#keys-backups-and-restores)
+6. [Keys, backups and restores](#keys-backups-and-restores), [Moving a validator](#moving-a-validator)
 7. [Upgrades](#upgrades)
 8. [Incident response](#incident-response)
 9. [Runbooks](#runbooks) (one per alert)
@@ -56,6 +58,8 @@ A validator's HTTP API locks the same state the consensus engine uses, so a publ
   - AWS and GCP work, but **internet egress is billed per GB**: ~12 TB/month of certificates alone costs on the order of $1,000 per validator per month at list prices. Use them only with committed-use egress pricing, or for sentries in front of a bare-metal validator.
 
 ## Reference hardware
+
+Sized for a full active set of 32 validators and full blocks. At launch scale a node needs far less: measured on a chain of 4 validators (release 0.5.2, idle), a validator used about 80 MB of memory and 1–2% of a core, and sent about 59 KB/s, roughly 150 GB a month. [RUN-A-NODE.md](RUN-A-NODE.md#what-it-takes) has the numbers by set size; plan for this table as the set grows.
 
 | | Minimum | Recommended | Why |
 |---|---|---|---|
@@ -126,7 +130,7 @@ So:
 | 9090, 9093, 3000, 9100 | monitoring | localhost, or the private link to the monitoring host |
 | Outbound | all | p2p to peers, NTP (UDP 123, or TCP 4460 for NTS), HTTPS to GitHub (contribution checks) |
 
-`blockula run --bind` sets the interface for **both** HTTP and p2p. A validator that binds `0.0.0.0` for p2p therefore also listens for HTTP on every interface, and the firewall is what keeps HTTP private. With nftables (Debian/Ubuntu):
+`blockula run --bind` sets the interface for **both** HTTP and p2p; `--http-bind` and `--p2p-bind` set one of them apart. Bind a validator's p2p to every interface and its HTTP to this machine, or to the private link its sentries and monitoring use: `--p2p-bind 0.0.0.0 --http-bind 127.0.0.1` (or the WireGuard address, `--http-bind 10.8.0.2`). With `--bind 0.0.0.0` alone, HTTP listens on every interface too, and only the firewall keeps it private: the node then logs "keep it private" at start. Use the firewall either way. With nftables (Debian/Ubuntu):
 
 ```bash
 # /etc/nftables.conf (excerpt): drop everything inbound except SSH (admin), p2p and the private link.
@@ -307,6 +311,27 @@ What that means for you: the watch adds a few seconds to a restart once the node
 
 **Quarterly restore drill** (OPS-6): on a testnet, restore a validator from its offline key backup onto a fresh host following the steps above, time it, and record the result in the operator log.
 
+## Moving a validator
+
+To another machine, another IP, or another provider. The rule is the same as for a restore: **never let two copies of `validator.key` run**, even for a minute. Two copies double-sign, which slashes 5% of the pool and tombstones the validator for good.
+
+1. **Prepare the new host** (hardware, firewall, time, verified binary), and start nothing on it.
+2. **Stop the old node, and keep it stopped:** `systemctl disable --now blockula`. If you can't be sure it stays down (a provider that restarts machines), power it off and detach its volume.
+3. **Copy the home** to the new host: `validator.key`, the newest `slashing-protection.json`, `genesis.json` and `node.json`. Chain data can come along or be synced again ([Restoring after losing a validator host](#keys-backups-and-restores), steps 4–5).
+4. **Publish the new addresses** if they changed:
+
+   ```bash
+   blockula validator set-addr --key <home>/validator.key --rpc <a node URL> \
+     --p2p <new host>:30300 --http https://<your sentry> --home <home>
+   ```
+
+   It sends `update_validator` with the validator's current commission (read from `/api/validators`), so only the addresses change. Sign with the consensus key (for its owner, once an epoch) or the owner's key. Your node advertises the p2p address in `node.json`, which `--home` updates, and other validators also take the chain's record as a starting point when they start. Give either flag alone to change one address. On a public chain, loopback and private addresses are refused unless you pass `--allow-private-addr`.
+5. **Start the new node.** The startup guard refuses a home last used by another machine (`BLOCKULA_INSTANCE_ID`): once you've proven the old node is down, start it once with `--i-know-this-key-is-not-running-elsewhere`. Then check it signs (`blockula status`), has its peers, and proposes blocks.
+
+**Genesis validators** advertise the p2p address in the genesis file, whatever the chain records later, so give them DNS names at genesis: moving one is then a DNS change. `set-addr` still updates what the chain publishes.
+
+**A loopback or private address published by mistake** (`validator init` once defaulted to 127.0.0.1): run `set-addr` with the right address. Nothing needs to move.
+
 ## Upgrades
 
 Upgrades are announced, released, signalled, scheduled and activated at a height (`node/src/upgrade.rs`, MAINNET-DESIGN 3.9). Nobody restarts everything at once.
@@ -323,7 +348,7 @@ Install the new binary ([Upgrading](#upgrading)) and start it: it executes the n
 1. **Announce** at least two weeks ahead (planned upgrades): the version number, what changes, the release date, and the proposed activation height. Post in the operator channel and publicly.
 2. **Release** a signed, reproducible build ([Releases](#releases)). Operators install it with `blockula release install` ([Upgrading](#upgrading)), which checks the ML-DSA signature against their pinned release key id and provenance; ideally they rebuild it too.
 3. **Install and signal.** Each operator restarts onto the new binary in their own maintenance window, one node at a time, each only once the previous one is back (below). Across the network, never more than ⌊(n−1)/3⌋ validators out at once (one more halts the chain), counting any down for other reasons and any still reconnecting, so one at a time on sets of four to six: coordinate in the operator channel. The new binary signals the new version in every block it proposes. `GET /api/upgrade` shows readiness: the newest signal from each active validator and whether ≥ ⅔ are ready.
-4. **Schedule.** Once ≥ ⅔ of the active set signal the version, a `ScheduleUpgrade { version, activation_height }` proposal goes to governance (a ⅔ supermajority; MAINNET-DESIGN 3.5; `blockula gov propose upgrade`). Pick the height so the vote, the timelock, a cancellation's vote (below; the node refuses heights that leave no room for one) and a margin for stragglers fit before it. Every node then shows `blockula_upgrade_next_version` and `…_next_height`; nodes without the new binary fire `BlockulaUpgradeRequired`, and `…Soon` a day before.
+4. **Schedule.** Once ≥ ⅔ of the active set signal the version, a `ScheduleUpgrade { version, activation_height }` proposal goes to governance (a ⅔ supermajority; MAINNET-DESIGN 3.5; `blockula gov propose upgrade`). Pick the height so the vote, the timelock, a cancellation's vote (below; the node refuses heights that leave no room for one) and a margin for stragglers fit before it. Every node then shows `blockula_upgrade_next_version` and `…_next_height`; nodes without the new binary fire `BlockulaUpgradeRequired`, and `…Soon` a day before. Their logs say it too, without Prometheus: a node logs each scheduled version it runs once (INFO), and one it doesn't every hour from when it's scheduled (WARN: "protocol vN activates at #H (in about …): install a release that supports it").
 5. **Activate.** At the height every upgraded node switches rules. Watch `/api/upgrade` and the explorer: blocks from the activation height on carry the new `version`. Stragglers halt cleanly (above) instead of diverging; they upgrade and continue.
 
 **Withdrawing a scheduled upgrade** (the release is pulled for a bug, a reproducibility failure or a release-key incident; the release slips past the height). Until the activation is near, governance can take it back: a `CancelUpgrade { version, activation_height }` proposal (`blockula gov propose cancel-upgrade <version> --title "…"`, which looks the height up in `/api/upgrade`; SDK `proposal.cancelUpgrade(version, height)`). It needs the same ⅔ supermajority as scheduling (or, during the bootstrap, ⅔ of the council), has no timelock (it runs the block after its vote closes: it keeps the rules in force), and withdraws that entry and any upgrade scheduled after it. It can be proposed once the `ScheduleUpgrade` has run (while that one is still being voted on, vote nay), and only while it would land at least 64 blocks before the activation: at least `voting_blocks + 65` blocks ahead (a week and a bit on mainnet). Every `ScheduleUpgrade` has to leave room for one (at the voting period in force when it was proposed), and a cancellation that finds nothing to withdraw when it runs (a second one, a stale one) fails and changes nothing. Once it has run, `/api/upgrade` no longer lists the version, `blockula_upgrade_next_*` drop, and nobody halts at that height. The withdrawn version number (and every one up to it) is spent: the chain refuses to schedule it again (`/api/upgrade`'s `withdrawn.highest_version`), because halts and readiness signals compare only numbers, and a binary of the pulled release would run a re-scheduled version with the pulled rules. Ship the fixed release as the number the cancellation's outcome names ("ship the next upgrade as vN or later", also `/api/upgrade`'s `next_version`: past every spent number and every superseded proposal's own), signal it, and propose its `ScheduleUpgrade` after the cancellation has run: any `ScheduleUpgrade` proposed in or before the cancellation's block (still voting or queued when it ran) is superseded and fails when it would run, since it was proposed against the schedule the cancellation withdrew from (the cancellation's outcome lists them, and each one's own outcome names the same number). A `ScheduleUpgrade` waiting in a multisig for approvals when the cancellation ran (the foundation's k-of-n keys, say) is superseded too: the chain refuses the approval that would file it ("superseded"; `/api/multisig` shows it as `superseded`), so abandon it (let it expire), treat its number as spent, and file the fixed release's `Propose` as a new multisig action after the cancellation (review-fix-ops-2; the outcome counts them). The numbers of the superseded proposals that had passed (their vote ended by the block the cancellation ran in, whatever the proposal ids: every vote of a block closes before anything runs in it) are spent by the chain too, since their releases may be out and signalled, and so is the number of one superseded while still being voted on that passes anyway (when its vote closes). A number whose `ScheduleUpgrade` was rejected, or that waited in a multisig, isn't spent by the chain (filing one mustn't spend numbers); the advice goes past those that were open or stored when the cancellation ran (`withdrawn.superseded_version`), since a release may carry them, and if a release for any number was published, never reuse it. Anyone can push the advice up by filing an upgrade proposal at the top of the step while a cancellation is pending (at most 16 numbers per cancellation, and the step moves with it): a number between `withdrawn.highest_version` and the advice is still accepted, so use one only if you know no release carries it. Versions move up in steps of at most 16 past the newest ever scheduled, withdrawn or superseded, so the advised number is always one the chain accepts (review-r3-gov-1), and an upgrade activates at most 365 days after its proposal's vote ends, so a mistaken huge version is refused when it's proposed (review-r2-gov-1). A node already running the pulled release keeps following the chain (it runs the rules in force); replace it with the previous or the fixed release before the fixed one's activation, since it halts there.
