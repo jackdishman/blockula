@@ -33,7 +33,13 @@ async fn serve_http(node: Node, bind: SocketAddr) {
         }
     };
     let port = bind.port();
-    println!("🦇 Explorer:  http://localhost:{port}\n🔌 API:       http://localhost:{port}/api/status   (bound to {bind})\n📁 Data:      {}", home.display());
+    // The address it answers on here: localhost for a loopback or every-interface bind.
+    let host = match bind {
+        _ if bind.ip().is_loopback() || bind.ip().is_unspecified() => "localhost".to_string(),
+        SocketAddr::V6(a) => format!("[{}]", a.ip()),
+        SocketAddr::V4(a) => a.ip().to_string(),
+    };
+    println!("🦇 Explorer:  http://{host}:{port}\n🔌 API:       http://{host}:{port}/api/status   (bound to {bind})\n📁 Data:      {}", home.display());
     if let Err(e) = axum::serve(listener, api::router(node).into_make_service_with_connect_info::<SocketAddr>()).await {
         eprintln!("http server failed: {e}");
     }
@@ -48,6 +54,10 @@ fn port_of(addr: &str) -> Option<u16> {
 #[derive(Clone, Debug)]
 pub struct NetOpts {
     pub bind: String,
+    /// `--http-bind`: the interface HTTP listens on, if not `bind` (OPERATOR-2).
+    pub http_bind: Option<String>,
+    /// `--p2p-bind`: the interface p2p listens on, if not `bind`.
+    pub p2p_bind: Option<String>,
     pub http_port: Option<u16>,
     /// `local` allows private/loopback peer addresses; `recommended` is for public networks.
     /// Default: `local` when our advertised p2p host is private, else `recommended`.
@@ -70,6 +80,18 @@ pub struct NetOpts {
     /// `--network-halted-at`: the operator says the network halted at this height, which lets
     /// slashing protection's restart rule escape there when no HTTP peer answers (protection.rs).
     pub network_halted_at: Option<u64>,
+}
+
+impl NetOpts {
+    /// The interface HTTP listens on: `--http-bind`, else `--bind`.
+    pub fn http_iface(&self) -> &str {
+        self.http_bind.as_deref().unwrap_or(&self.bind)
+    }
+
+    /// The interface p2p listens on: `--p2p-bind`, else `--bind`.
+    pub fn p2p_iface(&self) -> &str {
+        self.p2p_bind.as_deref().unwrap_or(&self.bind)
+    }
 }
 
 /// How many blocks a node keeps on disk.
@@ -227,6 +249,11 @@ const HANDOFF_VERIFIES_PER_ROUND: usize = 512;
 /// `/api/epochs` pages read per peer per round, at most: past a change nobody has a quorum for,
 /// the next pages may still hold signatures we lack.
 const HANDOFF_PAGES_PER_ROUND: usize = 4;
+/// Validators' recorded HTTP endpoints asked per round, at most, after the configured peers
+/// ([`handoff_peers`]): a set that lists slow or hostile endpoints costs a round this many peers'
+/// requests at most (each capped in bytes and time), and the window moves every round, so none
+/// of them keeps the others unasked.
+const LEARNED_PEERS_PER_ROUND: usize = 8;
 
 /// Where the next `/api/epochs` page starts (`null` after the last).
 #[derive(serde::Deserialize)]
@@ -239,15 +266,24 @@ struct PageNext {
 /// validator), so this node can serve complete proofs to fast-syncing joiners. Incremental
 /// (F19, F26): it asks only while some set change lacks a quorum here, only for pages from the
 /// first such change on, and verifies only signatures it lacks, without the chain lock.
+///
+/// It asks the configured `peers` (`--peer-http`, else the genesis validators), then the
+/// validators the chain knows ([`handoff_peers`]): a validator that joined after genesis signs
+/// its own handoffs, and none of the configured peers may hold them. Without them, a change whose
+/// quorum needs one stays unproven here, and so does every change after it, for every joiner.
 async fn exchange_epochs(chain: Shared, peers: Vec<String>) {
     let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
-    let (live, instance) = {
+    let (live, instance, me, public) = {
         let mut c = chain.lock();
         c.sign_handoffs();
-        (c.live.clone(), c.instance())
+        (c.live.clone(), c.instance(), c.me(), is_public_chain(&c.genesis))
     };
+    let mut round = 0u64;
     loop {
-        for peer in &peers {
+        // Only while something is unproven: `handoff_signers` is empty otherwise.
+        let signers = handoff_signers(&live.epochs());
+        let learned = if signers.is_empty() { vec![] } else { recorded_http_addrs(&live.view().state, &signers) };
+        for peer in &handoff_peers(&peers, &learned, me.as_deref(), public, LEARNED_PEERS_PER_ROUND, round) {
             let ours = live.epochs();
             let from = ours.proven_through();
             if from >= ours.known_through {
@@ -283,7 +319,102 @@ async fn exchange_epochs(chain: Shared, peers: Vec<String>) {
                 chain.lock().add_handoffs(verified);
             }
         }
+        round = round.wrapping_add(1);
         tokio::time::sleep(Duration::from_secs(30)).await;
+    }
+}
+
+/// The validators worth asking for the handoff signatures `reg` lacks (consensus keys, each once,
+/// most useful first): for every set change short of a quorum, oldest first, the members of the
+/// outgoing set whose signature it lacks (each holds its own), then the rest of both sides of the
+/// change and the newest set it knows (they collect what they lack too). Nobody when every change
+/// has its quorum.
+fn handoff_signers(reg: &crate::epochs::EpochRegistry) -> Vec<String> {
+    let (mut lacking, mut others): (Vec<&String>, Vec<&String>) = (vec![], vec![]);
+    for epoch in reg.changes().filter(|e| *e <= reg.known_through) {
+        let (Some(prev), Some(new)) = (reg.set(epoch - 1), reg.sets.get(&epoch)) else { continue };
+        let have = reg.proofs.get(&epoch);
+        if have.map_or(0, |h| h.len()) >= crate::epochs::quorum(prev.len()) {
+            continue;
+        }
+        for (i, key) in prev.iter().enumerate() {
+            if have.is_some_and(|h| h.contains_key(&(i as u32))) { others.push(key) } else { lacking.push(key) }
+        }
+        others.extend(new);
+    }
+    if lacking.is_empty() && others.is_empty() {
+        return vec![];
+    }
+    others.extend(reg.set(reg.known_through).into_iter().flatten());
+    let mut seen = std::collections::HashSet::new();
+    lacking.into_iter().chain(others).filter(|k| seen.insert(*k)).cloned().collect()
+}
+
+/// The HTTP endpoints the staking state records for the validators with these consensus `keys`
+/// (`RegisterValidator`'s `http_addr`, or `UpdateValidator`'s since), in the same order, as
+/// (validator address, `http_addr`). Keys of no registered validator are left out.
+fn recorded_http_addrs(state: &crate::chain::State, keys: &[String]) -> Vec<(String, String)> {
+    let prefix = state.params.prefix();
+    keys.iter()
+        .filter_map(|k| {
+            let address = crate::crypto::address_with_prefix(prefix, &hex::decode(k).ok()?);
+            state.validators.get(&address).map(|r| (address, r.http_addr.clone()))
+        })
+        .collect()
+}
+
+/// Where to ask for handoff signatures this round: the `configured` peers as given (they're the
+/// operator's word, private addresses included), then the endpoints `learned` from the staking
+/// state ((validator, `http_addr`), most useful first, as from [`recorded_http_addrs`]) as base
+/// URLs ([`crate::chain::http_url`]), leaving out this node's own (`me`), empty ones and ones
+/// already listed, and on a `public` chain ([`is_public_chain`]) any on this machine, a private
+/// network or a link-local address ([`is_private_url`]): the state is anyone's to write, and a
+/// public chain's nodes don't fetch from those on its word. Of the learned ones, at most `max`:
+/// a window that moves by `max` each `round`, so a long list is asked in turn.
+fn handoff_peers(configured: &[String], learned: &[(String, String)], me: Option<&str>, public: bool, max: usize, round: u64) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    for p in configured {
+        if !out.contains(p) {
+            out.push(p.clone());
+        }
+    }
+    let mut extra: Vec<String> = vec![];
+    for (validator, addr) in learned {
+        let addr = addr.trim();
+        if Some(validator.as_str()) == me || addr.is_empty() {
+            continue;
+        }
+        let url = crate::chain::http_url(addr);
+        if (public && is_private_url(&url)) || out.contains(&url) || extra.contains(&url) {
+            continue;
+        }
+        extra.push(url);
+    }
+    if !extra.is_empty() {
+        let start = ((round as u128 * max as u128) % extra.len() as u128) as usize;
+        out.extend(extra.iter().cycle().skip(start).take(max.min(extra.len())).cloned());
+    }
+    out
+}
+
+/// Whether a chain is public: a genesis validator advertises a p2p address off this machine and
+/// private networks (what [`is_private_host`] tells a validator of its own when it picks its p2p
+/// preset). A chain `summon` made for one machine (every address on 127.0.0.1) isn't.
+fn is_public_chain(g: &Genesis) -> bool {
+    g.validators.iter().any(|v| !is_private_host(&v.p2p_addr))
+}
+
+/// Whether a base URL's host is this machine, a private network or link-local ([`is_private_ip`]),
+/// a `localhost` name, or isn't a URL at all.
+fn is_private_url(url: &str) -> bool {
+    let Ok(u) = reqwest::Url::parse(url) else { return true };
+    let Some(host) = u.host_str() else { return true };
+    match host.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>() {
+        Ok(ip) => is_private_ip(ip),
+        Err(_) => {
+            let name = host.trim_end_matches('.').to_ascii_lowercase();
+            name == "localhost" || name.ends_with(".localhost")
+        }
     }
 }
 
@@ -360,6 +491,61 @@ async fn peer_tip(client: &reqwest::Client, peer: &str, genesis_hash: &str) -> O
         return None;
     }
     ["height", "finalized_height", "network_height_claimed"].iter().filter_map(|k| v[*k].as_u64()).max()
+}
+
+/// One scheduled upgrade as a node reports it in its log ([`upgrade_notices`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UpgradeNotice {
+    pub version: u32,
+    pub height: u64,
+    /// Whether this binary runs it (an INFO); if not, the node stops at `height` (a WARN).
+    pub supported: bool,
+    pub text: String,
+}
+
+/// What a node at `height` logs about the upgrades scheduled after it (OPERATOR-9): an INFO for
+/// each this binary runs (it supports up to `supported`), then a WARN for the first it doesn't,
+/// where it will stop (exit 11 for a validator). Nothing after that: the node never gets there.
+pub(crate) fn upgrade_notices(state: &crate::chain::State, height: u64, supported: u32, block_time_ms: u64) -> Vec<UpgradeNotice> {
+    let mut out = vec![];
+    for u in state.upgrade.schedule.iter().filter(|u| u.activation_height > height) {
+        let eta = crate::cli_net::span_words(u.activation_height - height, block_time_ms);
+        let ok = u.version <= supported;
+        let text = if ok {
+            format!("protocol v{} activates at #{} (in about {eta}); this release runs it", u.version, u.activation_height)
+        } else {
+            format!("protocol v{} activates at #{} (in about {eta}): install a release that supports it. This one runs up to v{supported}, so this node stops there (docs/OPERATIONS.md, Upgrades)", u.version, u.activation_height)
+        };
+        out.push(UpgradeNotice { version: u.version, height: u.activation_height, supported: ok, text });
+        if !ok {
+            break;
+        }
+    }
+    out
+}
+
+/// How often a node logs a coming upgrade it can't run.
+const UPGRADE_WARN_EVERY: Duration = Duration::from_secs(3600);
+
+/// Logs the upgrade schedule ([`upgrade_notices`]) at start and every hour: an upgrade this
+/// binary can't run as a WARN each time, until the node has a release that runs it; one it can,
+/// once, at INFO.
+async fn watch_upgrades(chain: Shared) {
+    let mut told = std::collections::BTreeSet::new();
+    loop {
+        let notices = {
+            let c = chain.lock();
+            upgrade_notices(&c.state, c.height(), c.halt.supported, c.genesis.block_time_ms)
+        };
+        for n in notices {
+            if !n.supported {
+                tracing::warn!("{}", n.text);
+            } else if told.insert((n.version, n.height)) {
+                tracing::info!("{}", n.text);
+            }
+        }
+        tokio::time::sleep(UPGRADE_WARN_EVERY).await;
+    }
 }
 
 /// Validators check pending contribution claims against GitHub (the PR and the claimant's gist)
@@ -601,19 +787,87 @@ async fn attest_reverts(chain: Shared) {
     }
 }
 
-/// How often (every 10 s) fast sync waits for a snapshot newer than a trusted checkpoint
-/// before it falls back to syncing from genesis.
+/// How often (every [`SNAPSHOT_WAIT`]) fast sync waits for a snapshot it can use (one newer than
+/// a trusted checkpoint, or any at all from peers that have none yet and can't serve block 1
+/// either) before it falls back to syncing from genesis.
 const SNAPSHOT_WAITS: usize = 30;
+const SNAPSHOT_WAIT: Duration = Duration::from_secs(10);
 
-async fn maybe_fast_sync(chain: &Shared, peers: &[String], full: bool, trust: &Trust) {
-    let empty = {
-        let c = chain.lock();
-        c.height() == 0 && c.base.is_none()
-    };
-    if !empty || full || peers.is_empty() {
-        return;
+/// Why a fast sync that failed with `e` might wait and try again rather than sync from genesis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SnapshotWait {
+    /// A peer's snapshot ends before our newest checkpoint: one is taken every 100 blocks.
+    Behind,
+    /// The peers have none yet (503): a young chain's nodes before block 100, or a node that
+    /// fast-synced itself until it takes its first (PERF-12).
+    NoneYet,
+}
+
+fn snapshot_wait(e: &anyhow::Error) -> Option<SnapshotWait> {
+    if e.chain().any(|c| c.is::<crate::snapshot::SnapshotBehind>()) {
+        Some(SnapshotWait::Behind)
+    } else if has_status(e, 503) {
+        Some(SnapshotWait::NoneYet)
+    } else {
+        None
     }
-    for wait in 0.. {
+}
+
+/// Whether one of `peers` can serve this chain from genesis (`history_from` at most 1), so an
+/// empty home needn't wait for a snapshot. Height zero counts: a validator starting there may
+/// be needed to finalize the first block, before any snapshot can exist.
+async fn a_peer_has_genesis_history(peers: &[String], genesis_hash: &str) -> bool {
+    let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(5)).build() else {
+        return false;
+    };
+    let holds = |peer: &String| {
+        let client = client.clone();
+        let url = format!("{peer}/api/status");
+        async move {
+            let body = get_capped(&client, &url, 1 << 20).await.ok()?;
+            let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
+            let ours = v["genesis_hash"].as_str() == Some(genesis_hash);
+            Some(ours && v["height"].as_u64().is_some() && v["history_from"].as_u64().is_some_and(|f| f <= 1))
+        }
+    };
+    futures::future::join_all(peers.iter().map(holds)).await.into_iter().any(|h| h == Some(true))
+}
+
+/// Whether `e` is (or was caused by) a peer answering HTTP `code` ([`get_capped`]).
+fn has_status(e: &anyhow::Error, code: u16) -> bool {
+    e.chain().any(|c| c.downcast_ref::<HttpStatus>().is_some_and(|s| s.0.as_u16() == code))
+}
+
+/// A peer's answer with a status other than success, from [`get_capped`]. It reads as the
+/// status, as the error it replaces did.
+#[derive(Debug)]
+pub struct HttpStatus(pub reqwest::StatusCode);
+
+impl std::fmt::Display for HttpStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for HttpStatus {}
+
+/// Whether this node holds nothing yet: no block executed, no snapshot installed.
+fn is_empty_home(chain: &Shared) -> bool {
+    let c = chain.lock();
+    c.height() == 0 && c.base.is_none()
+}
+
+async fn maybe_fast_sync(chain: &Shared, peers: &[String], full: bool, trust: &Trust) -> bool {
+    maybe_fast_sync_with(chain, peers, full, trust, SNAPSHOT_WAIT, SNAPSHOT_WAITS).await
+}
+
+/// [`maybe_fast_sync`], waiting `wait` up to `waits` times for a usable snapshot. Returns whether
+/// it installed one.
+async fn maybe_fast_sync_with(chain: &Shared, peers: &[String], full: bool, trust: &Trust, wait: Duration, waits: usize) -> bool {
+    if !is_empty_home(chain) || full || peers.is_empty() {
+        return false;
+    }
+    for tried in 0.. {
         match crate::snapshot::fast_sync(chain, peers, trust).await {
             Ok(h) => {
                 println!("⚡ fast-synced to #{h} from a certified snapshot; history before it isn't stored on this node");
@@ -626,16 +880,30 @@ async fn maybe_fast_sync(chain: &Shared, peers: &[String], full: bool, trust: &T
                 if let Some(why) = live.stale((0, None), crate::chain::now_ms()).filter(|_| shorter) {
                     eprintln!("⚠️  under the chain's parameters in force: {why}; if in doubt, wipe this home and join again with that checkpoint");
                 }
-                return;
+                return true;
             }
-            // A checkpoint newer than every peer's snapshot: one is taken every 100 blocks.
-            Err(e) if wait < SNAPSHOT_WAITS && e.chain().any(|c| c.is::<crate::snapshot::SnapshotBehind>()) => {
-                println!("⏳ {e:#}; waiting for a newer snapshot");
-                tokio::time::sleep(Duration::from_secs(10)).await;
+            Err(e) => {
+                let again = tried < waits
+                    && match snapshot_wait(&e) {
+                        Some(SnapshotWait::Behind) => true,
+                        // Peers without one yet: wait only if none of them can serve the chain from
+                        // genesis. This includes a fresh chain before its first block.
+                        Some(SnapshotWait::NoneYet) => {
+                            let genesis_hash = chain.lock().genesis_hash.clone();
+                            !a_peer_has_genesis_history(peers, &genesis_hash).await
+                        }
+                        None => false,
+                    };
+                if !again {
+                    println!("ℹ️  no usable snapshot ({e:#}); syncing from genesis instead");
+                    return false;
+                }
+                println!("⏳ {e:#}; waiting for a snapshot (asking again in {} s)", wait.as_secs());
+                tokio::time::sleep(wait).await;
             }
-            Err(e) => return println!("ℹ️  no usable snapshot ({e:#}); syncing from genesis instead"),
         }
     }
+    false
 }
 
 /// The HTTP peers a node syncs from and forwards to: `--peer-http` if given, otherwise the
@@ -657,7 +925,7 @@ pub fn http_peers(genesis: &Genesis, override_: &[String], me: Option<&str>) -> 
 
 pub fn socket(bind: &str, port: u16) -> Result<SocketAddr> {
     let host = bind.trim_start_matches('[').trim_end_matches(']');
-    let ip: std::net::IpAddr = host.parse().with_context(|| format!("--bind must be an IP address, got {bind}"))?;
+    let ip: std::net::IpAddr = host.parse().with_context(|| format!("--bind, --http-bind and --p2p-bind take an IP address, got {bind}"))?;
     Ok(SocketAddr::new(ip, port))
 }
 
@@ -673,11 +941,20 @@ pub fn ingress(addr: &str) -> Result<commonware_p2p::Ingress> {
 
 fn is_private_host(addr: &str) -> bool {
     match addr.parse::<SocketAddr>() {
-        Ok(sa) => match sa.ip() {
-            std::net::IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified(),
-            std::net::IpAddr::V6(ip) => ip.is_loopback() || ip.is_unspecified() || (ip.segments()[0] & 0xfe00) == 0xfc00,
-        },
+        Ok(sa) => is_private_ip(sa.ip()),
         Err(_) => addr.starts_with("localhost:"),
+    }
+}
+
+/// This machine, a private network (RFC 1918, IPv6 unique local), link-local or unspecified; an
+/// IPv4-mapped IPv6 address as its IPv4 one.
+fn is_private_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified(),
+        std::net::IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+            Some(v4) => is_private_ip(v4.into()),
+            None => ip.is_loopback() || ip.is_unspecified() || (ip.segments()[0] & 0xfe00) == 0xfc00 || (ip.segments()[0] & 0xffc0) == 0xfe80,
+        },
     }
 }
 
@@ -806,8 +1083,8 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
     };
     let http_port = net.http_port.or_else(|| port_of(&addrs.http_addr).filter(|_| !addrs.http_addr.starts_with("http"))).unwrap_or(7070);
     let p2p_port = if net.ephemeral_p2p { 0 } else { port_of(&addrs.p2p_addr).ok_or_else(|| anyhow!("bad p2p_addr {}", addrs.p2p_addr))? };
-    let listen = socket(&net.bind, p2p_port)?;
-    let http_bind = socket(&net.bind, http_port)?;
+    let listen = socket(net.p2p_iface(), p2p_port)?;
+    let http_bind = socket(net.http_iface(), http_port)?;
     let dialable = if net.ephemeral_p2p { listen.into() } else { ingress(&addrs.p2p_addr)? };
     let peers = if net.ephemeral_p2p { vec![] } else { http_peers(&genesis, &net.peer_http, Some(&me)) };
 
@@ -849,7 +1126,7 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
             }
             let trust = Arc::new(trust);
             maybe_fast_sync(&shared, &peers, net.full, &trust).await;
-            catch_up(shared.clone(), peers.clone(), trust.clone()).await;
+            catch_up(shared.clone(), peers.clone(), trust.clone(), !net.full).await;
             trust
         })
     } else {
@@ -881,6 +1158,12 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
     } else {
         println!("🔗 p2p: listening on {listen}, advertised as {} ({preset} preset)", addrs.p2p_addr);
     }
+    println!("🔌 HTTP: listening on {http_bind}");
+    // A validator's HTTP API shares the state lock with consensus: the public belongs on a full
+    // node in front of it (OPERATOR-2, SEC-4).
+    if !http_bind.ip().is_loopback() && !net.ephemeral_p2p {
+        tracing::info!("this validator's HTTP API listens on {http_bind}, beyond this machine: keep it private (docs/OPERATIONS.md, Ports and firewall), or bind it with --http-bind 127.0.0.1");
+    }
     consensus::log_memory_budget(bootstrappers.len());
     match keep {
         Some(k) => println!("🗄️  keeping the last {k} blocks on disk (--archive keeps all)"),
@@ -909,6 +1192,7 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
         tokio::spawn(attest_reverts(shared.clone()));
         tokio::spawn(watch_halts(shared.clone(), protection.clone(), home.clone()));
         tokio::spawn(watch_network(shared.clone(), peers.clone(), protection.clone(), net.network_halted_at));
+        tokio::spawn(watch_upgrades(shared.clone()));
         let mut node = http_node(shared, Some(marshal), peers, &net, &trust);
         node.protection = Some(protection);
         let metrics = context.child("metrics");
@@ -1036,7 +1320,10 @@ pub fn join(genesis: &str, home: &Path, pins: &Pins, fast: bool) -> Result<()> {
 }
 
 pub fn run_full_node(home: PathBuf, net: NetOpts) -> Result<()> {
-    let bind = socket(&net.bind, net.http_port.unwrap_or(7171))?;
+    let bind = socket(net.http_iface(), net.http_port.unwrap_or(7171))?;
+    if net.p2p_bind.is_some() {
+        eprintln!("ℹ️  --p2p-bind is for validators: a full node syncs over HTTP and listens for no p2p");
+    }
     let jc: JoinConfig = serde_json::from_slice(&std::fs::read(home.join("join.json")).context("not a joined home — use `blockula join`")?)?;
     let mut chain = Chain::open(&home)?;
     // The pins were checked at `join`; they (and the embedded checkpoints) apply on every start,
@@ -1072,7 +1359,8 @@ pub fn run_full_node(home: PathBuf, net: NetOpts) -> Result<()> {
         let trust = Arc::new(trust);
         maybe_fast_sync(&shared, &peers, !fast, &trust).await;
         tokio::spawn(exchange_epochs(shared.clone(), peers.clone()));
-        sync_loop(shared, peers, false, trust).await;
+        tokio::spawn(watch_upgrades(shared.clone()));
+        sync_loop(shared, peers, false, trust, fast).await;
         Ok(())
     })
 }
@@ -1093,8 +1381,7 @@ pub const MAX_SYNC_RESPONSE: usize = 32 << 20;
 pub async fn get_capped(client: &reqwest::Client, url: &str, cap: usize) -> Result<Vec<u8>> {
     let mut res = client.get(url).send().await?;
     if !res.status().is_success() {
-        let status = res.status();
-        bail!("{status}");
+        return Err(anyhow::Error::new(HttpStatus(res.status())));
     }
     if res.content_length().is_some_and(|l| l as usize > cap) {
         bail!("response too large");
@@ -1377,7 +1664,7 @@ impl Rotation {
 /// sync keeps to the fastest peer, and one that sends blocks slower than the chain makes them or
 /// far slower than the others, or stalls, is benched ([`Rotation`]), so one stalling, trickling
 /// or lying peer can't hold the node back.
-async fn sync_loop(chain: Shared, peers: Vec<String>, stop_when_caught_up: bool, trust: Arc<Trust>) {
+async fn sync_loop(chain: Shared, peers: Vec<String>, stop_when_caught_up: bool, trust: Arc<Trust>, fast: bool) {
     let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build().unwrap();
     let provider = consensus::EpochProvider::new(chain.clone(), None);
     let block_time = Duration::from_millis(chain.lock().genesis.block_time_ms);
@@ -1388,6 +1675,10 @@ async fn sync_loop(chain: Shared, peers: Vec<String>, stop_when_caught_up: bool,
     let mut rotation = Rotation::new(peers.len());
     let mut idle_rounds = 0usize;
     let mut failures = 0usize;
+    // Peers that answered 410 (pruned) to this empty home's ask for block 1, in a row, and when it
+    // last went back to fast sync for that (PERF-12).
+    let mut pruned = std::collections::BTreeSet::new();
+    let mut refast_at: Option<std::time::Instant> = None;
     let halt = chain.lock().halt.signal.clone();
     loop {
         if let Some(h) = halt.get() {
@@ -1424,6 +1715,26 @@ async fn sync_loop(chain: Shared, peers: Vec<String>, stop_when_caught_up: bool,
                 if !e.to_string().contains("sent nothing") && halt.get().is_none() {
                     eprintln!("⚠️  sync from {url}: {e:#}");
                 }
+                // Every peer pruned block 1, so this empty home can only start from a snapshot (at
+                // most once a minute).
+                if has_status(&e, 410) && is_empty_home(&chain) {
+                    pruned.insert(url.clone());
+                    if pruned.len() >= peers.len() && refast_at.is_none_or(|t| t.elapsed() >= REFAST_EVERY) {
+                        pruned.clear();
+                        refast_at = Some(std::time::Instant::now());
+                        if !fast {
+                            eprintln!("⚠️  every peer pruned the start of the chain (410), and --full replays it from genesis: add an archive node with --peer-http, or start without --full to fast-sync from a snapshot");
+                        } else {
+                            println!("ℹ️  every peer pruned the start of the chain (410): fast-syncing from a certified snapshot instead");
+                            if maybe_fast_sync(&chain, &peers, false, &trust).await {
+                                failures = 0;
+                                continue;
+                            }
+                        }
+                    }
+                } else {
+                    pruned.clear();
+                }
                 rotation.failed(std::time::Instant::now());
                 failures += 1;
                 if stop_when_caught_up && failures >= peers.len() * 2 {
@@ -1435,10 +1746,15 @@ async fn sync_loop(chain: Shared, peers: Vec<String>, stop_when_caught_up: bool,
     }
 }
 
-/// Validators: sync over HTTP until no peer has anything newer (or none answer).
-async fn catch_up(chain: Shared, peers: Vec<String>, trust: Arc<Trust>) {
+/// How often, at most, an empty home whose peers all pruned the start of the chain goes back to
+/// fast sync.
+const REFAST_EVERY: Duration = Duration::from_secs(60);
+
+/// Validators: sync over HTTP until no peer has anything newer (or none answer). `fast`: an empty
+/// home whose peers all pruned the start of the chain goes back to fast sync.
+async fn catch_up(chain: Shared, peers: Vec<String>, trust: Arc<Trust>, fast: bool) {
     let start = chain.lock().height();
-    sync_loop(chain.clone(), peers, true, trust).await;
+    sync_loop(chain.clone(), peers, true, trust, fast).await;
     let end = chain.lock().height();
     if end > start {
         println!("⏩ caught up over HTTP: {start} → {end}");
@@ -1763,6 +2079,250 @@ mod tests {
         let other = serve(Router::new().route("/api/status", get(status("00".repeat(32))))).await;
         assert_eq!(crate::checkpoints::peer_periods(&[other.clone(), url.clone()], &hash, Duration::from_secs(5)).await, vec![(url.clone(), 7 * day)]);
         drop(chain);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The consensus key (hex) a 32-byte secret derives.
+    fn consensus_key(secret: [u8; 32]) -> String {
+        hex::encode(commonware_cryptography::Signer::public_key(&PrivateKey::from_seed_bytes(secret)).as_ref())
+    }
+
+    /// A validator that joined after genesis signs its own handoffs and serves them, and only the
+    /// staking state says where (local-testnet.sh's fast join, 2026-10-21). Genesis validators
+    /// A, B and C; D joined with a node, E without one. The set {A, B, C, D, E} handing off to
+    /// {A, B, C, D} needs 4 of its 5 signatures: the genesis nodes hold their 3 (they asked each
+    /// other), D holds its own as well (it asked them). Every node is a real chain behind the real
+    /// API. A's exchange asks its configured peers (the genesis validators) and, from its state,
+    /// D and E (who doesn't answer): it completes the proof, and a joiner that fast-syncs from A
+    /// verifies the history through the change. Asking only the configured peers, it never did,
+    /// and every joiner failed as run 5 did ("has 3 valid handoff signatures, needs 4").
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handoffs_are_collected_from_validators_that_joined_after_genesis() {
+        use crate::epochs::{verify_history, EpochRegistry, Instance, Root};
+        let root = home("handoffs");
+        let homes = Chain::summon(&root, &SummonOpts::new("handoffs", 3)).unwrap();
+        // Each node's API listens where its record says: bound first, so the genesis can say it.
+        let mut listeners = vec![];
+        for _ in 0..4 {
+            listeners.push(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+        }
+        let addr_of = |l: &tokio::net::TcpListener| format!("127.0.0.1:{}", l.local_addr().unwrap().port());
+        // `summon` lists home i's validator i-th, in `validators` and `operators` alike.
+        let seeds: Vec<[u8; 32]> = homes.iter().map(|h| hex::decode(std::fs::read_to_string(h.join("validator.key")).unwrap().trim()).unwrap().try_into().unwrap()).collect();
+        let mut g = Genesis::load(&homes[0].join("genesis.json")).unwrap();
+        for (((v, o), l), seed) in g.validators.iter_mut().zip(&mut g.operators).zip(&listeners).zip(&seeds) {
+            (v.http_addr, o.http_addr) = (addr_of(l), addr_of(l));
+            o.pop = crate::chain::make_pop(*seed, &g.chain_id, &o.owner, &o.p2p_addr, &o.http_addr);
+        }
+        for h in &homes {
+            std::fs::write(h.join("genesis.json"), serde_json::to_string_pretty(&g).unwrap()).unwrap();
+        }
+        let g = Genesis::load(&homes[0].join("genesis.json")).unwrap();
+        let (d_seed, e_seed) = ([77u8; 32], [78u8; 32]);
+        let d_home = root.join("d");
+        std::fs::create_dir_all(&d_home).unwrap();
+        std::fs::copy(homes[0].join("genesis.json"), d_home.join("genesis.json")).unwrap();
+        std::fs::write(d_home.join("validator.key"), hex::encode(d_seed)).unwrap();
+        let d_http = addr_of(&listeners[3]);
+        let d_url = format!("http://{d_http}");
+        // E registered an address nothing answers at.
+        let e_http = addr_of(&tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+
+        // The history every node executed: the genesis set, then D and E in, then E out.
+        let s0 = EpochRegistry::genesis(&g).sets[&0].clone();
+        let sorted = |extra: &[[u8; 32]]| {
+            let mut s = s0.clone();
+            s.extend(extra.iter().map(|k| consensus_key(*k)));
+            s.sort();
+            s
+        };
+        let (s1, s2) = (sorted(&[d_seed, e_seed]), sorted(&[d_seed]));
+        let mut truth = EpochRegistry::genesis(&g);
+        assert!(truth.record(1, s1.clone()) && truth.record(2, s2.clone()));
+        let at = Instance::of(&g);
+        let signed_by = |secret: [u8; 32]| {
+            let mut r = truth.clone();
+            r.sign_missing(&at, secret, |e| truth.set(e).cloned());
+            r
+        };
+        let mut genesis_nodes = truth.clone();
+        for s in &seeds {
+            genesis_nodes.merge_sigs(&at, &signed_by(*s));
+        }
+        let mut d_node = genesis_nodes.clone();
+        d_node.merge_sigs(&at, &signed_by(d_seed));
+        assert_eq!((genesis_nodes.proven_through(), d_node.proven_through()), (1, 2), "the genesis signatures prove the change to five, not the one out of it");
+
+        // The nodes: each a chain holding that history and D's and E's registrations.
+        let prefix = g.address_prefix.clone();
+        let address = |secret: [u8; 32]| crate::crypto::address_with_prefix(&prefix, &hex::decode(consensus_key(secret)).unwrap());
+        let open = |home: &Path, reg: &EpochRegistry| -> Shared {
+            let mut c = Chain::open(home).unwrap();
+            let template = c.state.validators.get(&g.validators[0].address).unwrap().clone();
+            for (seed, http) in [(d_seed, d_http.clone()), (e_seed, e_http.clone())] {
+                let mut r = template.clone();
+                (r.address, r.owner, r.consensus_key, r.http_addr) = (address(seed), address(seed), consensus_key(seed), http);
+                c.state.validators.insert(r.address.clone(), r);
+            }
+            c.set_pruning(None); // publishes the state to readers
+            c.epochs = reg.clone();
+            c.live.publish_epochs(Arc::new(reg.clone()));
+            Arc::new(Mutex::new(c))
+        };
+        let mut chains = vec![];
+        for (i, l) in listeners.into_iter().enumerate() {
+            let chain = if i < 3 { open(&homes[i], &genesis_nodes) } else { open(&d_home, &d_node) };
+            chains.push(chain.clone());
+            let app = crate::api::router(crate::api::Node::new(chain, None, vec![], Default::default()));
+            tokio::spawn(async move { axum::serve(l, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap() });
+        }
+        let a = chains[0].clone();
+        let a_url = crate::chain::http_url(&g.validators[0].http_addr);
+
+        // A joiner fast-syncing from A checks the history through the change out of the five.
+        let client = reqwest::Client::new();
+        let joiner = |peer: String| {
+            let (client, g) = (client.clone(), g.clone());
+            async move {
+                let history = crate::snapshot::fetch_history(&client, &peer, 0, 2, &Default::default()).await?;
+                verify_history(&g, &history, &Root::genesis(&g), 2).map(|(set, _)| set)
+            }
+        };
+        let before = joiner(a_url.clone()).await.unwrap_err();
+        assert!(format!("{before:#}").contains("set change at epoch 2 has 3 valid handoff signatures, needs 4"), "{before:#}");
+
+        // A asks its configured peers, which aren't D.
+        let me = a.lock().me().unwrap();
+        assert_eq!(me, g.validators[0].address);
+        let peers = http_peers(&g, &[], Some(&me));
+        assert_eq!(peers.len(), 2);
+        assert!(!peers.contains(&d_url));
+        let live = a.lock().live.clone();
+        let exchange = tokio::spawn(exchange_epochs(a.clone(), peers));
+        // Its first round starts at once and takes well under a second here.
+        for _ in 0..200 {
+            if live.epochs().proven_through() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        exchange.abort();
+        let held = live.epochs();
+        assert_eq!(held.proven_through(), 2, "A never collected D's handoff signature: it holds signers {:?} of the change at epoch 2", held.proofs.get(&2).map(|p| p.keys().collect::<Vec<_>>()));
+        assert_eq!(joiner(a_url).await.unwrap(), s2, "a joiner verifies A's history through the change");
+        drop((a, chains));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The validators asked for handoff signatures: for each change short of a quorum, the outgoing
+    /// members whose signature it lacks first, then everyone else in the sets involved and the
+    /// newest set; each once. Nobody once every change is proven.
+    #[test]
+    fn handoff_signers_are_the_ones_lacking_first() {
+        use crate::epochs::{quorum, EpochRegistry};
+        let key = |c: char| c.to_string().repeat(4);
+        let mut reg = EpochRegistry { sets: [(0, vec![key('a'), key('b'), key('c'), key('d')])].into(), ..Default::default() };
+        assert!(handoff_signers(&reg).is_empty(), "nothing changed");
+        reg.record(1, vec![key('a'), key('b'), key('c'), key('d'), key('e')]);
+        reg.record(2, vec![key('a'), key('b'), key('c'), key('e'), key('f')]);
+        reg.record(3, vec![key('a'), key('b'), key('c'), key('e'), key('f')]);
+        assert_eq!(reg.known_through, 3);
+        // The change at 1 has a quorum (3 of 4); the one at 2 has a and c of the five (needs 4).
+        reg.proofs.insert(1, (0..quorum(4) as u32).map(|i| (i, "sig".to_string())).collect());
+        reg.proofs.insert(2, [(0, "sig".to_string()), (2, "sig".to_string())].into());
+        assert_eq!(reg.proven_through(), 1);
+        assert_eq!(handoff_signers(&reg), ["bbbb", "dddd", "eeee", "aaaa", "cccc", "ffff"]);
+        reg.proofs.get_mut(&2).unwrap().extend([(1, "sig".to_string()), (3, "sig".to_string())]);
+        assert_eq!(reg.proven_through(), 3);
+        assert!(handoff_signers(&reg).is_empty(), "everything proven: nobody to ask");
+    }
+
+    /// Where a round asks: the configured peers as given (deduplicated, private ones too), then the
+    /// validators' recorded endpoints as base URLs, without this node's own, empty or duplicate
+    /// ones, and on a public chain none on this machine, a private network or link-local.
+    #[test]
+    fn handoff_peers_dedupe_skip_self_and_private_addresses_on_public_chains() {
+        let configured = vec!["http://10.0.0.5:7070".to_string(), "https://v1.example.net".to_string(), "http://10.0.0.5:7070".to_string()];
+        let learned: Vec<(String, String)> = [
+            ("me", "198.51.100.1:7070"),
+            ("v2", "198.51.100.2:7070"),
+            ("v3", "http://198.51.100.2:7070/"),
+            ("v4", ""),
+            ("v5", "https://v1.example.net"),
+            ("v6", "127.0.0.1:7070"),
+            ("v7", "10.1.2.3:7070"),
+            ("v8", "[fe80::1]:7070"),
+            ("v9", "localhost:7070"),
+            ("v10", "192.168.1.2:7070"),
+            ("v11", "[::ffff:10.0.0.1]:7070"),
+            ("v12", "[fd00::1]:7070"),
+            ("v13", "169.254.1.1:7070"),
+            ("v14", "0.0.0.0:7070"),
+            ("v15", "[::1]:7070"),
+            ("v16", "node.localhost:7070"),
+            ("v17", "http://2130706433:7070"),
+            ("v18", "172.20.0.4:7070"),
+            ("v19", "https://v19.example.org:8443"),
+            ("v20", "[2001:db8::7]:7070"),
+        ]
+        .iter()
+        .map(|(v, a)| (v.to_string(), a.to_string()))
+        .collect();
+        let public = handoff_peers(&configured, &learned, Some("me"), true, 64, 0);
+        assert_eq!(public, ["http://10.0.0.5:7070", "https://v1.example.net", "http://198.51.100.2:7070", "https://v19.example.org:8443", "http://[2001:db8::7]:7070"]);
+        // A chain on one machine or a private network asks them all (not itself).
+        let local = handoff_peers(&configured, &learned, Some("me"), false, 64, 0);
+        assert_eq!(local.len(), 2 + 16, "{local:?}");
+        assert!(local.contains(&"http://127.0.0.1:7070".to_string()) && local.contains(&"http://[fe80::1]:7070".to_string()));
+        assert!(!local.contains(&"http://198.51.100.1:7070".to_string()), "never itself");
+        // A full node (no validator of its own) skips nobody for being it.
+        assert!(handoff_peers(&configured, &learned, None, true, 64, 0).contains(&"http://198.51.100.1:7070".to_string()));
+        // Nothing learned: exactly the configured peers.
+        assert_eq!(handoff_peers(&configured, &[], Some("me"), true, 8, 5), ["http://10.0.0.5:7070", "https://v1.example.net"]);
+    }
+
+    /// At most `max` learned endpoints a round, the window moving each round, so a long list (or
+    /// slow and hostile entries at its head) never keeps the rest from being asked.
+    #[test]
+    fn handoff_peers_ask_a_moving_window_of_learned_endpoints() {
+        let configured = vec!["https://seed.example.net".to_string()];
+        let learned: Vec<(String, String)> = (0..20).map(|i| (format!("v{i}"), format!("203.0.113.{i}:7070"))).collect();
+        let url = |i: usize| format!("http://203.0.113.{i}:7070");
+        let rounds: Vec<Vec<String>> = (0..3).map(|r| handoff_peers(&configured, &learned, None, true, 8, r)).collect();
+        for r in &rounds {
+            assert_eq!(r[0], configured[0], "the configured peers come first, every round");
+            assert!(r.len() <= 1 + 8, "{r:?}");
+        }
+        assert_eq!(rounds[0][1..], (0..8).map(url).collect::<Vec<_>>());
+        assert_eq!(rounds[1][1..], (8..16).map(url).collect::<Vec<_>>());
+        assert_eq!(rounds[2][1..], (16..20).chain(0..4).map(url).collect::<Vec<_>>());
+        let asked: std::collections::HashSet<&String> = rounds.iter().flat_map(|r| &r[1..]).collect();
+        assert_eq!(asked.len(), 20, "everyone within three rounds");
+        // A short list is asked whole every round.
+        let few = &learned[..3];
+        for r in 0..4 {
+            let mut got = handoff_peers(&configured, few, None, true, 8, r);
+            got.sort();
+            assert_eq!(got, ["http://203.0.113.0:7070", "http://203.0.113.1:7070", "http://203.0.113.2:7070", "https://seed.example.net"]);
+        }
+        // Rounds wrap without overflowing.
+        assert_eq!(handoff_peers(&configured, &learned, None, true, 8, u64::MAX).len(), 9);
+    }
+
+    /// A chain is public once a genesis validator's p2p address is off this machine and private
+    /// networks: a `summon`ed one isn't.
+    #[test]
+    fn a_chain_is_public_when_a_genesis_validator_is() {
+        let root = home("public");
+        let homes = Chain::summon(&root, &SummonOpts::new("public", 2)).unwrap();
+        let mut g = Genesis::load(&homes[0].join("genesis.json")).unwrap();
+        assert!(!is_public_chain(&g), "every address on 127.0.0.1");
+        g.validators[1].p2p_addr = "10.0.0.7:7000".into();
+        assert!(!is_public_chain(&g), "a private network");
+        g.validators[1].p2p_addr = "v1.blockula.example:7000".into();
+        assert!(is_public_chain(&g), "a DNS name");
+        g.validators[1].p2p_addr = "198.51.100.7:7000".into();
+        assert!(is_public_chain(&g), "a public IP");
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -2352,7 +2912,7 @@ mod tests {
             }
             let started = std::time::Instant::now();
             let peers = vec![format!("http://{addr}/{who}"), format!("http://{addr}/honest")];
-            tokio::time::timeout(Duration::from_secs(40), catch_up(chain.clone(), peers, trust.clone())).await.expect("catching up ends");
+            tokio::time::timeout(Duration::from_secs(40), catch_up(chain.clone(), peers, trust.clone(), false)).await.expect("catching up ends");
             assert_eq!(chain.lock().height(), TIP);
             let (trickled, honest) = (peer.hits[0].load(Ordering::SeqCst), peer.hits[1].load(Ordering::SeqCst));
             assert!(trickled <= most, "{who}: {trickled} rounds ({honest} to the honest peer)");
@@ -2392,5 +2952,138 @@ mod tests {
         assert_eq!(chain.lock().network_height_claimed(), 0);
         assert!(!chain.lock().syncing());
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// PERF-12: peers without a snapshot yet (503) are asked again after a wait, like one whose
+    /// snapshot is behind a checkpoint, unless one of them holds the chain from block 1 (a young
+    /// chain): then, as before, and on any other failure, it syncs from genesis at once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fast_sync_waits_for_a_peer_without_a_snapshot_yet() {
+        use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = home("nosnap");
+        let homes = Chain::summon(&root, &SummonOpts::new("nosnap", 1)).unwrap();
+        let chain: Shared = Arc::new(Mutex::new(Chain::open(&homes[0]).unwrap()));
+        let trust = Trust::new(&chain.lock().genesis, &Pins::default(), false).unwrap();
+        let genesis_hash = chain.lock().genesis_hash.clone();
+        // "late": 503 twice (no certified snapshot yet), then 404, and no /api/status. "broken":
+        // 500 every time. "young" and "fastsynced": 503 every time, with a status that holds
+        // block 1 or starts at its snapshot. "stranger": holds block 1 of another chain.
+        // "newborn": still at genesis, before the validators have made their first block.
+        let asked: Arc<[AtomicUsize; 6]> = Arc::new(Default::default());
+        async fn late(State(a): State<Arc<[AtomicUsize; 6]>>) -> (StatusCode, &'static str) {
+            match a[0].fetch_add(1, Ordering::SeqCst) {
+                0 | 1 => (StatusCode::SERVICE_UNAVAILABLE, "no certified snapshot yet"),
+                _ => (StatusCode::NOT_FOUND, "not found"),
+            }
+        }
+        async fn broken(State(a): State<Arc<[AtomicUsize; 6]>>) -> (StatusCode, &'static str) {
+            a[1].fetch_add(1, Ordering::SeqCst);
+            (StatusCode::INTERNAL_SERVER_ERROR, "oops")
+        }
+        let none_yet = |i: usize| move |State(a): State<Arc<[AtomicUsize; 6]>>| async move {
+            a[i].fetch_add(1, Ordering::SeqCst);
+            (StatusCode::SERVICE_UNAVAILABLE, "no certified snapshot yet")
+        };
+        let status = |hash: &str, height: u64, from: u64| {
+            let body = serde_json::json!({ "genesis_hash": hash, "height": height, "history_from": from });
+            move || async move { Json(body) }
+        };
+        let app = Router::new()
+            .route("/late/api/snapshot/latest", get(late))
+            .route("/broken/api/snapshot/latest", get(broken))
+            .route("/young/api/snapshot/latest", get(none_yet(2)))
+            .route("/young/api/status", get(status(&genesis_hash, 50, 1)))
+            .route("/fastsynced/api/snapshot/latest", get(none_yet(3)))
+            .route("/fastsynced/api/status", get(status(&genesis_hash, 160, 105)))
+            .route("/stranger/api/snapshot/latest", get(none_yet(4)))
+            .route("/stranger/api/status", get(status(&"ab".repeat(32), 50, 1)))
+            .route("/newborn/api/snapshot/latest", get(none_yet(5)))
+            .route("/newborn/api/status", get(status(&genesis_hash, 0, 1)))
+            .with_state(asked.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let peer = |p: &str| format!("http://{addr}/{p}");
+        let count = |i: usize| asked[i].load(Ordering::SeqCst);
+        let wait = Duration::from_millis(20);
+        assert!(!maybe_fast_sync_with(&chain, &[peer("late")], false, &trust, wait, 5).await);
+        assert_eq!(count(0), 3, "asked again after each 503, then gave up on the 404");
+        assert!(!maybe_fast_sync_with(&chain, &[peer("broken")], false, &trust, wait, 5).await);
+        assert_eq!(count(1), 1, "a 500 isn't waited out");
+        // The waits are bounded: a peer that never has one is asked `waits` + 1 times.
+        asked[0].store(0, Ordering::SeqCst);
+        assert!(!maybe_fast_sync_with(&chain, &[peer("late")], false, &trust, wait, 1).await);
+        assert_eq!(count(0), 2);
+        // A young chain (its first snapshot comes at block 100): its peers hold block 1, so it
+        // syncs from genesis at once, with the whole history.
+        assert!(!maybe_fast_sync_with(&chain, &[peer("young")], false, &trust, wait, 5).await);
+        assert_eq!(count(2), 1, "a peer that holds block 1 isn't waited for");
+        // A validator joining a peer at height zero must start immediately: the first block
+        // may need its vote, so waiting for that block's snapshot delays the whole chain.
+        assert!(!maybe_fast_sync_with(&chain, &[peer("newborn")], false, &trust, wait, 5).await);
+        assert_eq!(count(5), 1, "a peer at genesis isn't waited for");
+        // Peers that all start later (fast-synced or pruned), or hold another chain's block 1:
+        // genesis is out of reach, so it waits for a snapshot.
+        assert!(!maybe_fast_sync_with(&chain, &[peer("fastsynced"), peer("stranger")], false, &trust, wait, 2).await);
+        assert_eq!((count(3), count(4)), (3, 3), "asked again after each 503");
+        // One peer with block 1 among them is enough to sync from genesis.
+        assert!(!maybe_fast_sync_with(&chain, &[peer("fastsynced"), peer("young")], false, &trust, wait, 5).await);
+        assert_eq!((count(3), count(2)), (4, 2));
+        // `--full`, or a home that holds blocks, doesn't fast-sync at all.
+        assert!(!maybe_fast_sync_with(&chain, &[peer("broken")], true, &trust, wait, 5).await);
+        assert_eq!(count(1), 1);
+        let e = anyhow::Error::new(HttpStatus(reqwest::StatusCode::SERVICE_UNAVAILABLE)).context("from a peer");
+        assert!(snapshot_wait(&e) == Some(SnapshotWait::NoneYet) && e.chain().any(|c| c.to_string() == "503 Service Unavailable"), "{e:#}");
+        assert_eq!(snapshot_wait(&anyhow::Error::new(HttpStatus(reqwest::StatusCode::GONE))), None);
+        assert_eq!(snapshot_wait(&anyhow::Error::new(crate::snapshot::SnapshotBehind { certified: 100, checkpoint: 250 }).context("from a peer")), Some(SnapshotWait::Behind));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// PERF-12: an empty home whose every peer pruned the start of the chain (410 for block 1)
+    /// goes back to fast sync (at most once a minute), unless it was told `--full`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_empty_home_whose_peers_pruned_block_one_goes_back_to_fast_sync() {
+        use axum::{extract::State, http::StatusCode, routing::get, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = home("pruned");
+        let homes = Chain::summon(&root, &SummonOpts::new("pruned", 1)).unwrap();
+        let chain: Shared = Arc::new(Mutex::new(Chain::open(&homes[0]).unwrap()));
+        let trust = Arc::new(Trust::new(&chain.lock().genesis, &Pins::default(), false).unwrap());
+        let snapshots = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/api/sync", get(|| async { (StatusCode::GONE, "pruned") }))
+            .route(
+                "/api/snapshot/latest",
+                get(|State(n): State<Arc<AtomicUsize>>| async move {
+                    n.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::NOT_FOUND, "not found")
+                }),
+            )
+            .with_state(snapshots.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let peers = vec![format!("http://{addr}")];
+        tokio::time::timeout(Duration::from_secs(20), catch_up(chain.clone(), peers.clone(), trust.clone(), true)).await.expect("gives up");
+        assert_eq!(snapshots.load(Ordering::SeqCst), 1, "back to fast sync once");
+        tokio::time::timeout(Duration::from_secs(20), catch_up(chain.clone(), peers, trust, false)).await.expect("gives up");
+        assert_eq!(snapshots.load(Ordering::SeqCst), 1, "not with --full");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// OPERATOR-9: a node logs each scheduled upgrade it runs, then a warning for the first it
+    /// can't, with the height and about how long until then; nothing after it.
+    #[test]
+    fn upgrades_this_release_cant_run_are_warned_about() {
+        use crate::upgrade::ScheduledUpgrade;
+        let mut st = crate::chain::State::default();
+        assert!(upgrade_notices(&st, 10, 1, 1000).is_empty());
+        st.upgrade.schedule = vec![ScheduledUpgrade { version: 2, activation_height: 5 }, ScheduledUpgrade { version: 3, activation_height: 10_000 }, ScheduledUpgrade { version: 4, activation_height: 200_000 }, ScheduledUpgrade { version: 5, activation_height: 300_000 }];
+        let n = upgrade_notices(&st, 100, 3, 1000);
+        assert_eq!(n.iter().map(|n| (n.version, n.supported)).collect::<Vec<_>>(), [(3, true), (4, false)], "past ones skipped, nothing after the first it can't run");
+        assert_eq!(n[0].text, "protocol v3 activates at #10000 (in about 2 hours); this release runs it");
+        assert_eq!(n[1].text, "protocol v4 activates at #200000 (in about 2 days): install a release that supports it. This one runs up to v3, so this node stops there (docs/OPERATIONS.md, Upgrades)");
+        assert!(upgrade_notices(&st, 100, 5, 1000).iter().all(|n| n.supported));
     }
 }

@@ -292,6 +292,7 @@ if [ -n "$MAINNET" ] && [ -z "$pinned" ] && [ -f "$ROOT/node/src/cli_net.rs" ]; 
   stale=$(grep -oE 'fn (mainnet_is_never_trusted_on_first_use|validator_commands_sign_only_addresses_they_were_given)\(' "$ROOT/node/src/cli_net.rs" | sed 's/^fn //; s/($//' | paste -sd' ' - || true)
   [ -z "$stale" ] || echo "Also in this PR: node/src/cli_net.rs's tests $stale stand in for mainnet with nodes on another genesis, which this pin refuses: have those stand-ins report the pinned hash (known_genesis(MAINNET_CHAIN_ID))."
 fi
+[ -z "$MAINNET" ] || ! grep -q '^  genesisHash: undefined,$' "$ROOT/sdk-ts/src/networks.ts" 2>/dev/null || echo "Also in this PR: sdk-ts/src/networks.ts's MAINNET preset takes the same pins as the MCP's (genesisHash, genesisClock, and rpc: the first --rpc); npm run test:vectors -w @blockula/sdk checks that they match."
 if [ -n "$MAINNET" ]; then
   echo "Next: cargo test --release --locked --manifest-path node/Cargo.toml -- checkpoints cli_net; npm run build -w @blockula/sdk && npm test -w @blockula/mcp; npm test -w web && npm run test:e2e -w web (the mainnet build now pins this genesis: Vercel's NEXT_PUBLIC_MAINNET_GENESIS_HASH must be $HASH); commit, and release (deploy/mainnet/README.md)."
 else

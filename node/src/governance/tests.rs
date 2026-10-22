@@ -1894,6 +1894,67 @@ fn multisig_accounts_need_their_threshold() {
     assert!(t.tx_as(&k2, &alice, Action::MultisigPropose { action: send(1) }).unwrap_err().to_string().contains("32 open multisig proposals"));
 }
 
+/// The Hunts program's account (the Hunts plan, D7): a 2-of-3 multisig creates a Hunt and awards
+/// it to an address that doesn't exist yet. No owner key does either alone; the account, not the
+/// winner, pays the burn that opens the winner's account; and a session key on it still sends
+/// transfers (why the program's account carries none).
+#[test]
+fn a_multisig_creates_and_awards_a_hunt_to_a_new_address() {
+    let mut t = T::new(&[]);
+    let alice = addr(ALICE);
+    let (k1, k2, k3) = (keys(ALICE), keys(11), keys(12));
+    for seed in [11, 12] {
+        t.tx(ALICE, add_key(seed, &alice, &format!("device {seed}"), KeyRole::Owner)).unwrap();
+    }
+    t.tx(ALICE, Action::MultisigCreate { owners: vec![kid(ALICE), kid(11), kid(12)], threshold: 2 }).unwrap();
+    let bounty = 25 * FANG;
+    let create = Action::CreateHunt { repo: "jackdishman/blockula".into(), issue: 7, amount: bounty, expires_at: t.h + 1_000, title: "a program hunt".into() };
+    // An owner key alone can't create it: it proposes, and the second approval runs it.
+    assert!(t.tx_as(&k1, &alice, create.clone()).unwrap_err().to_string().contains("2-of-3 multisig: propose this"));
+    let id = t.st.next_hunt_id;
+    let before = t.bal(ALICE);
+    let fee = t.tx_as(&k1, &alice, Action::MultisigPropose { action: Box::new(create) }).unwrap();
+    assert!(t.st.hunts.get(&id).is_none(), "one approval stores it");
+    let p = *t.st.governance.multisigs[&alice].pending.iter().next().unwrap();
+    let fee = fee + t.tx_as(&k2, &alice, t.approve(p)).unwrap();
+    let h = t.st.hunts.get(&id).unwrap().clone();
+    assert_eq!((h.creator, h.amount, h.status), (alice.clone(), bounty, crate::chain::HuntStatus::Open));
+    assert_eq!(t.bal(ALICE), before - bounty - fee, "the bounty is escrowed from the account");
+    // Nor award it alone.
+    let winner = addr(60);
+    assert!(!t.st.accounts.contains_key(&winner));
+    let award = Action::AwardHunt { hunt_id: id, to: winner.clone(), pr: 9, familiar_key: None };
+    assert!(t.tx_as(&k3, &alice, award.clone()).unwrap_err().to_string().contains("2-of-3 multisig: propose this"));
+    let (before, burned) = (t.bal(ALICE), t.st.burned);
+    let fee = t.tx_as(&k3, &alice, Action::MultisigPropose { action: Box::new(award) }).unwrap();
+    assert_eq!(t.st.hunts.get(&id).unwrap().status, crate::chain::HuntStatus::Open);
+    let p = *t.st.governance.multisigs[&alice].pending.iter().next().unwrap();
+    let approve = t.approve(p);
+    let fee = fee + t.tx_as(&k1, &alice, approve).unwrap();
+    // The winner holds the bounty, all of it; the account paid the fees and the opening burn.
+    let open = t.st.chain_params.account_creation_fee;
+    assert_eq!(open, FANG / 10);
+    assert_eq!(t.st.account(&winner).balance, bounty);
+    assert_eq!(t.bal(ALICE), before - fee - open);
+    assert!(t.st.burned >= burned + open, "the opening burn is burned");
+    let h = t.st.hunts.get(&id).unwrap().clone();
+    assert_eq!((h.status, h.awarded_to, h.awarded_by, h.pr), (crate::chain::HuntStatus::Awarded, Some(winner.clone()), Some(alice.clone()), Some(9)));
+    assert!(t.st.governance.multisigs[&alice].pending.is_empty());
+    // A session key on the account can't create or award a Hunt, but it can still send FANG
+    // without any approval: the reason the program's account must carry no session keys.
+    let agent = keys(50);
+    let add = add_key(50, &alice, "agent", KeyRole::Session { limit: 5 * FANG, period_blocks: 100, expires_at: t.h + 1_000 });
+    t.tx_as(&k1, &alice, Action::MultisigPropose { action: Box::new(add) }).unwrap();
+    let p = *t.st.governance.multisigs[&alice].pending.iter().next().unwrap();
+    t.tx_as(&k2, &alice, t.approve(p)).unwrap();
+    let hunt = Action::CreateHunt { repo: "jackdishman/blockula".into(), issue: 8, amount: 10 * FANG, expires_at: t.h + 1_000, title: "t".into() };
+    assert!(t.tx_as(&agent, &alice, hunt).unwrap_err().to_string().contains("session keys can only"));
+    let bob = t.bal(BOB);
+    t.tx_as(&agent, &alice, Action::Transfer { to: addr(BOB), amount: 2 * FANG }).unwrap();
+    assert_eq!(t.bal(BOB), bob + 2 * FANG);
+    t.next();
+}
+
 /// Audit F14: one owner key of a 2-of-3 multisig can't fill the pending list and keep the others
 /// from proposing (even its own removal): each key may have proposed only its share, ⌊32 / 3⌋.
 /// Audit F17: what's left of its spam expires and is swept without anyone sending anything, and
