@@ -1,6 +1,9 @@
 "use client";
 
+import "@/app/creators.css";
 import Link from "next/link";
+import { useState, type KeyboardEvent, type MouseEvent } from "react";
+import { MEMO_FOLDED, MEMO_WARNING, memoView } from "@/lib/creators";
 import { deltaFor, formatDrops, fromMySide, knownKind, type Me } from "@/lib/explorer/ledger";
 import { to } from "@/lib/explorer/routes";
 import type { TxDetail } from "@/lib/explorer/types";
@@ -118,7 +121,7 @@ export function Ledger({
                     {showFee && t.fee != null && <span>{t.status === "pending" ? "max fee " : "fee "}<Amount drops={t.status === "pending" ? t.max_fee ?? t.fee : t.fee} exact /></span>}
                     {/* Your own device is the default; only other keys (an agent, another device) are called out. */}
                     {signer && !signer.mine && <span className={`chip ${signer.agent ? "agent" : ""}`}>{signer.agent ? `agent · ${signer.label}` : signer.label}</span>}
-                    {t.memo && <span className="ledger-memo">“{t.memo}”</span>}
+                    {t.memo && <Memo t={t} viewer={me?.address} />}
                     {t.status === "failed" && t.error && <span className="error">{t.error}</span>}
                   </span>
                 )}
@@ -148,5 +151,43 @@ export function Ledger({
         );
       })}
     </ul>
+  );
+}
+
+/**
+ * A memo is a stranger's text, shown as text (never a link). On a tiny payment it's folded until
+ * the reader asks (anyone can write on an account's page for a few drops), and one that reads like
+ * someone getting in touch says Blockula never does (CRE-8, lib/creators.ts).
+ */
+function Memo({ t, viewer }: { t: TxDetail; viewer?: string | null }) {
+  const [open, setOpen] = useState(false);
+  const m = memoView(t, viewer);
+  if (!m) return null;
+  if (m.folded && !open) {
+    // Inside the row's link: showing the memo mustn't open the transaction.
+    const show = (e: MouseEvent | KeyboardEvent) => {
+      if ("key" in e && e.key !== "Enter" && e.key !== " ") return;
+      e.preventDefault();
+      e.stopPropagation();
+      setOpen(true);
+    };
+    return (
+      <span className="cre-memo-hidden" data-testid="memo-folded">
+        {MEMO_FOLDED} ·{" "}
+        <span role="button" tabIndex={0} className="cre-memo-show" onClick={show} onKeyDown={show}>
+          show
+        </span>
+      </span>
+    );
+  }
+  return (
+    <>
+      <span className="ledger-memo">“{m.text}”</span>
+      {m.warn && (
+        <span className="cre-memo-warn" data-testid="memo-warning">
+          {MEMO_WARNING}
+        </span>
+      )}
+    </>
   );
 }

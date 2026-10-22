@@ -2,16 +2,24 @@
 
 import Link from "next/link";
 import { useParams } from "next/navigation";
+import { ClaimTimeline, ContributionNote } from "@/components/creators";
 import { Ext, github, Loading, NotFound, Section, Term, useMe, Who } from "@/components/explorer/kit";
 import { claimPill } from "@/components/explorer/ProgramState";
+import { BOND_TERMS, type PocRules } from "@/lib/creators";
 import { useNode } from "@/lib/explorer/node";
 import { to } from "@/lib/explorer/routes";
-import type { ClaimView } from "@/lib/explorer/types";
+import type { ChainStatus, ClaimView, ContributionsView } from "@/lib/explorer/types";
+
+/** What became of a settled bond, as far as the claim's status tells (a refuted claim's reason says which way it went). */
+const settled = (status: string) => (status === "scored" ? "returned" : status === "spam" ? "went to the pool: the jury marked it spam" : status === "rejected" ? "settled (the reason above says how)" : "settled");
 
 export default function ClaimPage() {
   const { id } = useParams<{ id: string }>();
   const me = useMe();
   const claim = useNode<ClaimView>(`/claim/${encodeURIComponent(id)}`, { every: 10_000 });
+  // The pool's timings and the head, for the claim's timeline (CONTRIB-16).
+  const pool = useNode<ContributionsView>("/contributions", { every: 60_000 });
+  const status = useNode<ChainStatus>("/status", { every: 10_000 });
   if (claim.error && !claim.data) return <NotFound what="claim" error={claim.error} />;
   const c = claim.data;
   if (!c) return <Loading>Finding the claim…</Loading>;
@@ -39,6 +47,7 @@ export default function ClaimPage() {
           {c.reason && <span className="dim">{c.reason}</span>}
         </div>
       </section>
+      <ContributionNote />
       <div className="cols">
         <Section title={`Validator checks (${c.attestations?.length ?? 0})`}>
           {c.attestations?.length ? (
@@ -75,7 +84,7 @@ export default function ClaimPage() {
             <dt>
               <Term k="bond" />
             </dt>
-            <dd>{c.bond !== "0" ? `${c.bond_display} (held until it's judged)` : "settled"}</dd>
+            <dd data-testid="claim-bond">{c.bond !== "0" ? `${c.bond_display}, held: ${BOND_TERMS}` : settled(c.status)}</dd>
             {c.verified_at != null && (
               <>
                 <dt>Verified</dt>
@@ -105,6 +114,7 @@ export default function ClaimPage() {
           </dl>
         </Section>
       </div>
+      <ClaimTimeline claim={c} rules={pool.data?.rules as PocRules | undefined} head={status.data?.height} blockMs={status.data?.block_time_ms} />
     </main>
   );
 }

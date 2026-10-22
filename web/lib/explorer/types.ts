@@ -142,6 +142,10 @@ export interface ClaimView {
   payout: string;
   payout_display: string;
   soul_awarded_display?: string;
+  /** When it was settled (scored, spam or rejected): a scored claim's reward starts vesting then. */
+  closed_at?: number | null;
+  /** While verified: when validators stop watching its PR for a revert (the same height as `eligible_at`). */
+  revert_window_until?: number | null;
   attestations?: { validator: Label; ok: boolean; merge_sha: string; note?: string; at: number }[];
 }
 
@@ -228,7 +232,8 @@ export interface AccountDetail {
   names: string[];
   keys: KeyView[];
   recent_txs: TxDetail[];
-  github: { handle: string; gist_id: string; linked_at: number } | null;
+  /** A linked handle: claimed on chain, which checks nothing; `/api/github/{handle}` checks it off-chain. */
+  github: { handle: string; gist_id: string; linked_at: number; verify_url?: string } | null;
   familiars: { key_id: string; label: string }[];
   hunts_created: number[];
   hunts_won: { id: number; repo: string; issue: number; amount_display: string; pr: number; self_awarded: boolean }[];
@@ -309,13 +314,18 @@ export interface ValidatorsDetail {
   explainer?: string;
 }
 
-/** `/api/multisig/{account}`: a multisig account's threshold, owner keys and open proposals. */
+/**
+ * `/api/multisig/{account}`: a multisig account's threshold, owner keys and open proposals. A
+ * pending proposal's `summary` is the node's words, which no approval binds: show what the client
+ * renders from `action` (`reviewAction`), never the summary.
+ */
 export interface MultisigView {
   account: Label;
   threshold: number;
   owners: { key_id: string; label: string | null }[];
   created_at: number;
-  pending: { id: number; action: { type: string; [k: string]: unknown }; summary: string; approvals: string[]; valid_approvals: number; expires_at: number; expired: boolean }[];
+  /** `superseded`: why no approval can file it any more (an upgrade proposal a cancellation superseded), else null. */
+  pending: { id: number; action: { type: string; [k: string]: unknown }; summary: string; approvals: string[]; valid_approvals: number; expires_at: number; expired: boolean; superseded?: string | null }[];
 }
 
 export interface MempoolView {

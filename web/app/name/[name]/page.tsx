@@ -1,9 +1,11 @@
 "use client";
 
+import "@/app/creators.css";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { ActionForm } from "@/components/explorer/ActionForm";
 import { Loading, NotFound, Section, Term, useMe, Who } from "@/components/explorer/kit";
+import { approxDate } from "@/lib/creators";
 import { blocksToHuman } from "@/lib/format";
 import { useNode } from "@/lib/explorer/node";
 import { actionId, program } from "@/lib/explorer/programs";
@@ -33,12 +35,19 @@ export default function NamePage() {
   const mine = !!me && !!r.owner && me.address === r.owner.address;
   const offeredToMe = !!me && !!r.offered_to && me.address === r.offered_to.address;
   const lapsed = st === "available" && !!r.owner;
+  // The renew form, opened and brought into view (the terms line's "Renew it").
+  const openRenew = () => {
+    const el = document.getElementById("do-renew_name") as HTMLDetailsElement | null;
+    if (!el) return;
+    el.open = true;
+    el.scrollIntoView({ block: "center" });
+  };
   const eyebrow = st === "grace" ? "Expired name" : st === "reserved" ? "Reserved name" : st === "available" ? "Unclaimed name" : "Name";
   const form = (id: string, title: string, open = false) => {
     const a = spec(id);
     if (!a) return null;
     return (
-      <details className="action" open={open}>
+      <details className="action" open={open} id={`do-${id}`}>
         <summary>
           <span className="title">{title}</span>
           <span className="sig">{a.kind}</span>
@@ -79,9 +88,29 @@ export default function NamePage() {
             )}
           </span>
         )}
+        {/* What it costs and when it lapses (CRE-11): a creator's printed links depend on it. */}
+        {st === "active" && r.owner && (r.price_display || r.renewal_price_display || r.expires_at != null) && (
+          <span className="sub cre-terms" data-testid="name-terms">
+            {[
+              r.price_display && `${r.price_display} a year to register`,
+              r.renewal_price_display && `renews at ${r.renewal_price_display} a year`,
+              r.expires_at != null && head != null && `expires around ${approxDate(Math.max(0, r.expires_at - head), blockMs)}`,
+            ]
+              .filter(Boolean)
+              .join(" · ")}
+            {mine && (
+              <>
+                {" · "}
+                <button type="button" className="link small" onClick={openRenew}>
+                  Renew it
+                </button>
+              </>
+            )}
+          </span>
+        )}
         {st === "grace" && (
           <span className="sub warn" data-testid="name-status">
-            Expired at block #{r.expires_at?.toLocaleString("en-US")}: it points to nobody now, so payments to it fail. Its owner {r.owner && <Who who={r.owner} me={me?.address} />} can renew it until block #{r.grace_until?.toLocaleString("en-US")}
+            Expired at block #{r.expires_at?.toLocaleString("en-US")}: it points to nobody now, so payments to it fail. Its owner {r.owner && <Who who={r.owner} me={me?.address} />} can renew it{r.renewal_price_display ? ` (${r.renewal_price_display} a year)` : ""} until block #{r.grace_until?.toLocaleString("en-US")}
             {head != null && r.grace_until != null && r.grace_until > head ? ` (about ${blocksToHuman(r.grace_until - head, blockMs)} from now)` : ""}; after that anyone can register it.
           </span>
         )}

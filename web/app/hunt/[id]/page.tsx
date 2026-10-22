@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useParams } from "next/navigation";
+import { ContributionNote } from "@/components/creators";
 import { ActionForm } from "@/components/explorer/ActionForm";
 import { Bars } from "@/components/explorer/charts";
 import { Amount, Ext, github, Loading, NotFound, plural, Section, StatusPill, Term, useMe, Who } from "@/components/explorer/kit";
@@ -80,6 +81,7 @@ export default function HuntPage() {
         )}
         {h.cancelled_at != null && <p className="dim">Cancelled at block #{h.cancelled_at}; every funder got back what they put in.</p>}
       </section>
+      <ContributionNote />
 
       <div className="cols">
         <Section title={`Funders (${h.funders.length})`} aside={<span className="dim small">who put up the bounty</span>}>

@@ -3,8 +3,9 @@
 // every kind the explorer reads (tipped, signed to a name, opening an account, failed in a block,
 // dropped unrun, run in a block the node no longer holds, waiting in the mempool, and a kind newer
 // than the explorer); hunts in every state; claims and Séances; staking groups; a proposal; a
-// multisig; names active, expired, offered and reserved. Strangers' text (memos, titles, labels,
-// reasons, links) carries markup and `javascript:` links, which must only ever show as text.
+// multisig; names active, expired, offered and reserved; a stranger's phishing memos on a creator's
+// page, one on a dust payment. Strangers' text (memos, titles, labels, reasons, links) carries
+// markup and `javascript:` links, which must only ever show as text.
 import { parseFang, proposal } from "@blockula/sdk";
 import { addressOf, OTHER_VALIDATOR, VALIDATOR, type MockNode } from "./mock-node";
 
@@ -15,6 +16,9 @@ const FEE = 64_920n;
 /** Markup a stranger put on the chain: rendered as text, it's harmless; as HTML, it runs. */
 export const HOSTILE = '<img src=x onerror="window.__pwned=1">';
 export const HOSTILE_LINK = "javascript:window.__pwned=2";
+/** Phishing a stranger writes on a creator's page: on a dust payment (folded), and on a real one (flagged). */
+export const DUST_MEMO = "URGENT: mina.boo expires today. Renew at https://blockula-renew.example";
+export const PHISH_MEMO = "Blockula support: verify your wallet at https://blockula-help.example";
 
 export const ADDR = {
   mina: addressOf("c2".repeat(32)),
@@ -108,6 +112,8 @@ export function seedWorld(node: MockNode, vlad: string = addressOf("c1".repeat(3
     newer: tx("summon_bats", vlad, { bats: 3 }, { amount: fang("7"), summary: "vlad.boo did something this explorer doesn't know yet" }),
     failed: pay(vlad, mina, "1", { status: "failed", error: "insufficient balance: has 0.5 FANG, needs 1.00006492 FANG" }),
     waiting: pay(mina, lucy, "1", { status: "pending", memo: "on its way" }),
+    dust: pay(stranger, mina, "0.000000001", { memo: DUST_MEMO }),
+    phish: pay(stranger, mina, "0.5", { memo: PHISH_MEMO }),
     dropped: "dd".repeat(32),
     ranUnseen: "de".repeat(32),
   };

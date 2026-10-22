@@ -3,17 +3,19 @@
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useState } from "react";
+import { GithubChip, MultisigActions } from "@/components/creators";
 import { FlowChart, Meter } from "@/components/explorer/charts";
-import { Amount, Ext, Fang, Hash, Loading, NotFound, plural, Section, Stat, StatusPill, Term, useMe, whoText } from "@/components/explorer/kit";
+import { Amount, Fang, Hash, Loading, NotFound, plural, Section, Stat, StatusPill, Term, useMe, whoText } from "@/components/explorer/kit";
 import { Ledger } from "@/components/explorer/Ledger";
 import { WatchButton } from "@/components/explorer/Watch";
 import { blocksToHuman, keyCode } from "@/lib/format";
 import { nodeExplorer } from "@/lib/config";
+import { multisigRule, multisigShape } from "@/lib/creators";
 import { activityCsv } from "@/lib/explorer/csv";
 import { bySigner, deltaFor, flowsOf, formatDrops, parseDrops } from "@/lib/explorer/ledger";
 import { useNode } from "@/lib/explorer/node";
 import { to } from "@/lib/explorer/routes";
-import type { AccountDetail, ChainStatus, TxDetail } from "@/lib/explorer/types";
+import type { AccountDetail, ChainStatus, MultisigView, TxDetail } from "@/lib/explorer/types";
 import type { KeyView } from "@/lib/types";
 import { useWallet } from "@/lib/wallet";
 
@@ -36,6 +38,12 @@ export default function AccountPage() {
   const { wallet } = useWallet();
   const acct = useNode<AccountDetail>(`/account/${encodeURIComponent(ref)}`, { every: 3000 });
   const status = useNode<ChainStatus>("/status", { every: 5000 });
+  // A multisig's threshold and open actions (CRE-3). Most accounts aren't one (the node answers
+  // 404), so it's read once, and kept fresh only for a multisig.
+  const known = acct.data?.account.address;
+  const [msPoll, setMsPoll] = useState(false);
+  const multisig = useNode<MultisigView>(known ? `/multisig/${encodeURIComponent(known)}` : null, { every: msPoll ? 10_000 : undefined });
+  if (multisig.data && !msPoll) setMsPoll(true);
   const [filter, setFilter] = useState<Filter>({ by: "all" });
 
   if (acct.error && !acct.data) {
@@ -58,6 +66,9 @@ export default function AccountPage() {
   const owners = a.keys.filter((k) => k.role.type === "owner");
   const agents = a.keys.filter((k) => k.role.type === "session");
   const familiar = new Set(a.familiars.map((f) => f.key_id));
+  // Only the node's answer for this very account counts as this account's multisig.
+  const msRead = multisig.data;
+  const ms = msRead && msRead.account?.address === addr && Array.isArray(msRead.owners) && Array.isArray(msRead.pending) ? msRead : null;
 
   const shown = a.recent_txs.filter((t) => {
     if (filter.by === "all") return true;
@@ -85,17 +96,19 @@ export default function AccountPage() {
           <Term k="address" />: <Hash value={addr} />
         </span>
         <div className="tools">
-          {a.github && (
-            <Ext className="chip" href={`https://github.com/${encodeURIComponent(a.github.handle)}`}>
-              github · @{a.github.handle}
-            </Ext>
+          {ms && (
+            <span className="chip" data-testid="multisig-chip">
+              {multisigShape(ms.threshold, ms.owners.length)}
+            </span>
           )}
+          {a.github && <GithubChip link={a.github} account={addr} />}
           {a.familiars.length > 0 && <span className="chip agent">{plural(a.familiars.length, "familiar")}</span>}
           {pc && pc.soul.points > 0 && <span className="chip">soul · {pc.soul.display}</span>}
           {pc?.sybil && <span className="pill failed" title={pc.sybil.reason}>flagged as a sybil</span>}
-          {!yours && me && !system && (
-            <Link className="btn small primary" href={`/send?to=${encodeURIComponent(name ?? addr)}`}>
-              Send to {name ?? "this address"}
+          {/* Visitors pay from here, with a wallet or not: Send takes a new one through onboarding (CRE-1). */}
+          {!yours && !system && (
+            <Link className="btn small primary" href={`/send?to=${encodeURIComponent(name ?? addr)}`} data-testid="pay">
+              Pay {name ?? "this account"}
             </Link>
           )}
           {!yours && <WatchButton who={a.account} />}
@@ -194,10 +207,18 @@ export default function AccountPage() {
                 <KeyRow key={k.key_id} k={k} head={head} blockMs={blockMs} signed={signers.get(k.key_id)} familiar={familiar.has(k.key_id)} mine={k.key_id === wallet?.keyId} onPick={() => setFilter({ by: "key", key: k.key_id })} />
               ))}
             </ul>
-            <p className="card-note">
-              An account is a list of keys. Owners can do anything; agents can only send, within a limit the chain enforces.
-            </p>
+            {ms ? (
+              <p className="card-note" data-testid="multisig-rule">
+                {multisigRule(ms.threshold, ms.owners.length)}{agents.length ? "; agents can still send, within a limit the chain enforces" : ""}.
+              </p>
+            ) : (
+              <p className="card-note">
+                An account is a list of keys. Owners can do anything; agents can only send, within a limit the chain enforces.
+              </p>
+            )}
           </Section>
+
+          {ms && <MultisigActions ms={ms} address={addr} head={status.data?.height} />}
 
           {!!a.locks?.length && (
             <Section title={<Term k="locked">Locked</Term>} aside={<span className="dim small">can be staked, not sent</span>}>

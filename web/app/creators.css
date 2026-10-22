@@ -1,0 +1,45 @@
+/* Creators' pieces (product review, wallet-creators): GitHub pills, multisig actions, memo
+   hygiene, the print-safe payment link, name terms, contribution notes and claim timelines.
+   Every class starts with cre-. Imported by components/creators.tsx, the Ledger and Receive. */
+
+/* GitHub: the chip and its "unverified" pill stay together when the tools wrap. */
+.cre-gh { display: inline-flex; align-items: baseline; gap: 6px; max-width: 100%; flex-wrap: wrap; }
+.cre-gh-pill { cursor: help; vertical-align: baseline; }
+
+/* Multisig: one open action per row, described from the action itself. */
+.cre-ms-action { padding: 12px 4px; border-bottom: 1px solid var(--hair); display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.cre-ms-id { font: 400 15px var(--mono); color: var(--dim); }
+.cre-ms-does { margin: 0; font-size: 17px; overflow-wrap: anywhere; }
+.cre-cmd { margin-top: 4px; padding: 4px 6px; overflow-wrap: anywhere; word-break: break-all; }
+
+/* Memos: a tiny payment's memo is folded; a contact-looking one carries a warning. */
+.cre-memo-hidden { font-style: italic; color: var(--dim); }
+.cre-memo-show { color: var(--ink-soft); text-decoration: underline; text-decoration-color: var(--hair); text-underline-offset: 3px; cursor: pointer; }
+.cre-memo-show:hover, .cre-memo-show:focus-visible { color: var(--blood); text-decoration-color: var(--blood); }
+.cre-memo-warn { font: 400 13px/1.5 var(--caps); letter-spacing: 0.06em; color: var(--ochre); border: 1px dashed currentColor; padding: 0 6px; }
+
+/* Receive: the print toggle and the public-memo line. */
+.cre-print { display: flex; gap: 10px; align-items: baseline; font-size: 16px; cursor: pointer; }
+.cre-print input { flex: none; width: auto; accent-color: var(--blood); }
+.cre-print > span { min-width: 0; overflow-wrap: anywhere; }
+.cre-public { margin: 0; color: var(--ink-soft); font-size: 16px; }
+
+/* Names: price, renewal and expiry in one line. */
+.cre-terms { display: block; margin-top: 4px; }
+
+/* Contribution pages: the per-network note. */
+.cre-note { margin: 0; padding: 8px 12px; border: 1px dashed var(--hair); color: var(--ink-soft); font-size: 16px; font-style: italic; }
+
+/* A claim's timeline: a list of steps, done ones solid, later ones hollow. */
+.cre-timeline { list-style: none; margin: 0; padding: 0; }
+.cre-step { position: relative; display: grid; grid-template-columns: minmax(0, 180px) minmax(0, 1fr); gap: 4px 14px; padding: 9px 0 9px 22px; border-bottom: 1px solid var(--hair); }
+.cre-step::before { content: ""; position: absolute; left: 2px; top: 15px; width: 10px; height: 10px; border-radius: 50%; background: var(--ink); }
+.cre-step.now::before { background: var(--ochre); }
+.cre-step.later::before { background: var(--paper-hi); border: 1.5px solid var(--dim); box-sizing: border-box; }
+.cre-step.skipped::before { background: var(--hair); }
+.cre-step.skipped { color: var(--dim); }
+.cre-step-label { font: 400 16px var(--caps); letter-spacing: 0.06em; }
+.cre-step-when { font-size: 16px; color: var(--ink-soft); overflow-wrap: anywhere; }
+@media (max-width: 560px) {
+  .cre-step { grid-template-columns: minmax(0, 1fr); }
+}

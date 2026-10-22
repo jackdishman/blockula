@@ -1,5 +1,6 @@
 "use client";
 
+import "@/app/creators.css";
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { RequireWallet } from "@/components/Gate";
@@ -7,6 +8,7 @@ import { Apparition } from "@/components/Haunt";
 import { QrCode } from "@/components/QrCode";
 import { Copy, ExplorerLink, Spinner, Tip } from "@/components/ui";
 import { DEFAULT_NETWORK, explorer, NETWORK, walletUrl } from "@/lib/config";
+import { PUBLIC_MEMOS } from "@/lib/creators";
 import { payLink, requestAmountError } from "@/lib/paylink";
 import { useUnlocked } from "@/lib/wallet";
 
@@ -29,7 +31,7 @@ function Receive() {
       <Link href="/" className="back">← Home</Link>
       <Apparition kind="cauldron" />
       <h1>Receive FANG</h1>
-      <PayRequest to={name ?? addr} />
+      <PayRequest name={name} address={addr} />
       {name ? (
         <section className="card stack">
           <span className="eyebrow">Share your name</span>
@@ -56,11 +58,18 @@ function Receive() {
   );
 }
 
-/** QR code + payment link that opens Send with the recipient (and optionally amount and memo) filled in. */
-function PayRequest({ to }: { to: string }) {
+/**
+ * QR code + payment link that opens Send with the recipient (and optionally amount and memo) filled
+ * in. It names the account by its name, unless it's for print: a name lapses if it isn't renewed,
+ * and then whoever registers it next is paid, but a printed code can't be changed, so a code for
+ * print carries the address (CRE-5).
+ */
+function PayRequest({ name, address }: { name?: string; address: string }) {
   const { client, status } = useUnlocked();
   const [amount, setAmount] = useState("");
   const [memo, setMemo] = useState("");
+  const [print, setPrint] = useState(false);
+  const to = name && !print ? name : address;
   const [canShare, setCanShare] = useState(false);
   useEffect(() => setCanShare(typeof navigator.share === "function"), []);
 
@@ -76,7 +85,7 @@ function PayRequest({ to }: { to: string }) {
   if (!link) return <section className="card"><Spinner>Making your payment link…</Spinner></section>;
   return (
     <section className="card stack">
-      <span className="eyebrow">Scan to pay</span>
+      <span className="eyebrow">{print && name ? "Scan to pay, for print" : "Scan to pay"}</span>
       <div className="qr-frame">
         <QrCode text={link} label={`QR code: payment link to ${to}`} />
       </div>
@@ -93,6 +102,19 @@ function PayRequest({ to }: { to: string }) {
         <input value={memo} onChange={(e) => setMemo(e.target.value)} placeholder="for the pumpkins" />
       </label>
       {memoErr && <span className="warn">{memoErr}</span>}
+      {name && (
+        <label className="cre-print">
+          <input type="checkbox" checked={print} onChange={(e) => setPrint(e.target.checked)} data-testid="for-print" />
+          <span>
+            For print (never changes hands)
+            <span className="dim small block">
+              {print
+                ? "This link and code use your address, so they pay you even if your name lapses and someone else registers it."
+                : `Uses ${name}. A name you stop renewing can be registered by someone else, and a printed code can't be changed: tick this before you print it.`}
+            </span>
+          </span>
+        </label>
+      )}
       <div className="mono address small" data-testid="paylink">{link}</div>
       <div className="row-gap">
         <Copy text={link} label="Copy link" />
@@ -108,6 +130,7 @@ function PayRequest({ to }: { to: string }) {
         </span>
       )}
       <span className="dim small">The link only fills in the form: the payer still sees who it goes to and signs it themselves.</span>
+      <p className="cre-public" data-testid="public-memos">{PUBLIC_MEMOS}</p>
     </section>
   );
 }
