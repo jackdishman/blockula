@@ -1,5 +1,6 @@
 // The Stake page: delegate to a validator's pool, unstake, withdraw once unbonded, all signed
-// by the passkey wallet and checked by the mock node; and a node without staking.
+// by the passkey wallet and checked by the mock node, each after a review step that says what
+// gets signed and what it means (USER-4); and a node without staking.
 import { formatFang, parseFang, type Tx } from "@blockula/sdk";
 import { VALIDATOR } from "./mock-node";
 import { createWallet, cspViolations, expect, test, watchCsp } from "./helpers";
@@ -14,16 +15,35 @@ test("delegates, unstakes and withdraws", async ({ page, node }) => {
   await expect(page.getByTestId("staked")).toHaveText("0 FANG");
   await expect(page.getByText("You haven't staked yet.")).toBeVisible();
 
-  // Delegate 25 FANG to the first validator.
+  // Delegate 25 FANG to the first validator: a review first, and nothing is signed until Confirm.
   await page.getByLabel("Validator").selectOption(VALIDATOR);
   await page.getByLabel("Amount to delegate").fill("25");
   await page.getByRole("button", { name: /^Delegate 25 FANG to/ }).click();
+  const review = page.getByTestId("review");
+  await expect(review).toContainText("Stake 25 FANG with");
+  await expect(review).toContainText(VALIDATOR);
+  await expect(review).toContainText("5% of what the pool earns");
+  await expect(review.getByTestId("validator-status")).toHaveText("In the active set");
+  await expect(review.getByTestId("review-terms")).toContainText("You can unstake any time, but it takes 21 days to come back.");
+  await expect(review.getByTestId("review-terms")).toContainText("slashed if the validator misbehaves, and rewards aren't guaranteed");
+  // Testnet: no founder line (that's mainnet's).
+  await expect(review).not.toContainText("founder");
+  expect(node.submitted).toHaveLength(0);
+  // Edit keeps what was typed.
+  await review.getByRole("button", { name: "← Edit" }).click();
+  await expect(page.getByLabel("Amount to delegate")).toHaveValue("25");
+  await page.getByRole("button", { name: /^Delegate 25 FANG to/ }).click();
+  await page.getByRole("button", { name: "Confirm & stake" }).click();
   await expect(page.getByRole("status")).toContainText("delegated 25 FANG");
   expect(actionOf(node.submitted.at(-1))).toEqual({ type: "delegate", validator: VALIDATOR, amount: parseFang("25").toString() });
   expect(node.submitted.at(-1)?.from).toBe(account);
   await expect(page.getByTestId("staked")).toHaveText("25 FANG");
   await expect(page.getByTestId("pool")).toContainText("25 FANG");
   await expect(page.getByTestId("pool")).toContainText("5% commission");
+  // Pool shares are there on request, behind the value.
+  await expect(page.getByTestId("pool").getByText(/pool shares/)).toBeHidden();
+  await page.getByTestId("pool").locator("summary", { hasText: "shares" }).click();
+  await expect(page.getByTestId("pool").getByText(/25,000,000,000 pool shares/)).toBeVisible();
 
   // A bad amount is refused before anything is signed.
   await page.getByLabel("Validator").selectOption(VALIDATOR);
@@ -34,9 +54,13 @@ test("delegates, unstakes and withdraws", async ({ page, node }) => {
 
   // Unstake 10 of it: signed as 10 FANG, which the chain converts to pool shares at its price.
   const submitted = node.submitted.length;
-  await page.getByTestId("pool").getByRole("button", { name: "Unstake" }).click();
+  await page.getByTestId("pool").getByRole("button", { name: "Unstake", exact: true }).click();
   await page.getByLabel("Amount to unstake").fill("10");
   await page.getByRole("button", { name: "Unstake 10 FANG" }).click();
+  await expect(review).toContainText("Unstake 10 FANG from");
+  await expect(review.getByTestId("review-terms")).toContainText("comes back in 21 days");
+  expect(node.submitted.length).toBe(submitted);
+  await page.getByRole("button", { name: "Confirm & unstake" }).click();
   await expect(page.getByRole("status")).toContainText("started unbonding 10 FANG");
   expect(node.submitted.length).toBe(submitted + 1);
   expect(actionOf(node.submitted.at(-1))).toEqual({ type: "undelegate", validator: VALIDATOR, shares: "0", amount: parseFang("10").toString() });
@@ -44,9 +68,12 @@ test("delegates, unstakes and withdraws", async ({ page, node }) => {
   await expect(page.getByText("Unbonding", { exact: true })).toBeVisible();
   await expect(page.getByText(/ready at block #/)).toBeVisible();
 
-  // Unstake the rest ("all"): every share held.
-  await page.getByTestId("pool").getByRole("button", { name: "Unstake" }).click();
+  // Unstake the rest ("all", an empty field): it asks first, every share held.
+  await page.getByTestId("pool").getByRole("button", { name: "Unstake", exact: true }).click();
   await page.getByRole("button", { name: "Unstake all" }).click();
+  await expect(review).toContainText("Unstake all of your stake with");
+  expect(node.submitted.length).toBe(submitted + 1);
+  await page.getByRole("button", { name: "Confirm & unstake" }).click();
   await expect(page.getByText("You haven't staked yet.")).toBeVisible();
   expect(actionOf(node.submitted.at(-1))).toEqual({ type: "undelegate", validator: VALIDATOR, shares: parseFang("15").toString() });
 
@@ -72,6 +99,7 @@ test("a node lying about the stake can't turn a partial unstake into all of it",
   await page.getByLabel("Validator").selectOption(VALIDATOR);
   await page.getByLabel("Amount to delegate").fill("25");
   await page.getByRole("button", { name: /^Delegate 25 FANG to/ }).click();
+  await page.getByRole("button", { name: "Confirm & stake" }).click();
   await expect(page.getByTestId("pool")).toContainText("25 FANG");
   const held = node.shares.get(account)?.get(VALIDATOR) as bigint;
   const lies: [string, (t: { shares: bigint; value: bigint }) => { shares: bigint; value: bigint }, string][] = [
@@ -83,9 +111,10 @@ test("a node lying about the stake can't turn a partial unstake into all of it",
     node.reportStake = report;
     await page.reload();
     await page.getByRole("button", { name: "Unlock with passkey" }).click();
-    await page.getByTestId("pool").getByRole("button", { name: "Unstake" }).click();
+    await page.getByTestId("pool").getByRole("button", { name: "Unstake", exact: true }).click();
     await page.getByLabel("Amount to unstake").fill(amount);
     await page.getByRole("button", { name: `Unstake ${amount} FANG` }).click();
+    await page.getByRole("button", { name: "Confirm & unstake" }).click();
     await expect(page.getByRole("status")).toContainText(`started unbonding ${amount} FANG`);
     expect(actionOf(node.submitted.at(-1)), lie).toEqual({ type: "undelegate", validator: VALIDATOR, shares: "0", amount: parseFang(amount).toString() });
     unbonded += parseFang(amount);

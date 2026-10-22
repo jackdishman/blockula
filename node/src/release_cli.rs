@@ -44,8 +44,21 @@ pub const REPO: &str = "jackdishman/blockula";
 
 /// The release key id this binary trusts when nothing is pinned and no `--key-id` is given (it's
 /// then pinned). Empty until the key ceremony fills it in, with `scripts/install.sh`'s
-/// `BUILTIN_KEY_ID` (docs/OPERATIONS.md "The release key"). A pin always wins over it.
+/// `BUILTIN_KEY_ID` and `mcp/src/release.ts`'s `RELEASE_KEY_ID` (docs/OPERATIONS.md "The release
+/// key"). A pin always wins over it.
+#[cfg(not(feature = "test-release-key"))]
 pub const BUILTIN_KEY_ID: &str = "";
+/// A build for `scripts/test-release-runbook.sh` only (`--features test-release-key`; no release
+/// build enables it, scripts/check-pins.sh): it trusts the test key that signs that test's
+/// stand-in releases, so the runbook's first-install cases pass whatever key id the ceremony
+/// builds in above (audit review-r4-supply-1).
+#[cfg(feature = "test-release-key")]
+pub const BUILTIN_KEY_ID: &str = TEST_RELEASE_KEY_ID;
+
+/// The key id of the runbook test's release key, whose seed is 0x5e × 32: a published seed, so it
+/// can never sign a real release. Compiled in only for tests and the `test-release-key` build.
+#[cfg(any(test, feature = "test-release-key"))]
+pub const TEST_RELEASE_KEY_ID: &str = "7a5bbac18c21113d1468145462b95b6fb30bcc241a43b2a4174cb84dbd6792ac";
 
 /// The release key id pinned at onboarding, in the blockula directory: `~/.blockula/release-key-id`
 /// (`$BLOCKULA_HOME/release-key-id`). One line, 64 hex characters.
@@ -1243,7 +1256,8 @@ mod tests {
 
     /// The built-in key id (filled in at the key ceremony) is a key id, and the same as
     /// install.sh's and the MCP's (audit review-r3-integrate-compose-1): every copy is filled in
-    /// together, or this fails.
+    /// together, or this fails. (The `test-release-key` build trusts the test key instead.)
+    #[cfg(not(feature = "test-release-key"))]
     #[test]
     fn built_in_key_id_matches_install_sh() {
         assert!(BUILTIN_KEY_ID.is_empty() || normalize_key_id(BUILTIN_KEY_ID).ok().as_deref() == Some(BUILTIN_KEY_ID));
@@ -1253,5 +1267,25 @@ mod tests {
         let mcp = include_str!("../../mcp/src/release.ts");
         let lines: Vec<&str> = mcp.lines().filter(|l| l.contains("RELEASE_KEY_ID =")).collect();
         assert_eq!(lines, [format!("export const RELEASE_KEY_ID = \"{BUILTIN_KEY_ID}\";")], "mcp/src/release.ts and release_cli.rs must build in the same release key id");
+    }
+
+    /// The test key's id is its seed's, the seed scripts/test-release-runbook.sh signs with, and
+    /// it's never the real release key.
+    #[test]
+    fn the_test_release_key_is_the_published_seeds() {
+        assert_eq!(TEST_RELEASE_KEY_ID, key_id(&Keys::from_seed([0x5e; 32]).public_key()));
+        let script = include_str!("../../scripts/test-release-runbook.sh");
+        assert!(script.contains("TEST_SEED=$(printf '5e%.0s' $(seq 32))"), "the runbook test signs with seed 0x5e × 32");
+        #[cfg(not(feature = "test-release-key"))]
+        assert_ne!(BUILTIN_KEY_ID, TEST_RELEASE_KEY_ID, "the test key is built in only with the test-release-key feature");
+    }
+
+    /// Nothing in the manifest turns `test-release-key` on by itself (a `default = […]`, another
+    /// feature, a dependency): that build compiles out the checks above that keep the test key from
+    /// being built in, so this one has no cfg. (scripts/check-pins.sh checks every manifest too.)
+    #[test]
+    fn no_manifest_line_enables_the_test_release_key() {
+        let named: Vec<&str> = include_str!("../Cargo.toml").lines().map(str::trim).filter(|l| !l.starts_with('#') && l.contains("test-release-key")).collect();
+        assert_eq!(named, ["test-release-key = []"], "node/Cargo.toml names test-release-key only where it defines it");
     }
 }

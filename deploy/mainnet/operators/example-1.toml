@@ -1,5 +1,5 @@
 [operator]
-name = "Founder validator A"
+name = "Blockula validator iad"
 contact = ["ops@operator-1.example"]
 
 [keys]
@@ -13,7 +13,7 @@ p2p_addr = "203.0.113.1:30300"
 http_addr = "https://rpc1.operator.example"
 
 [staking]
-commission_bps = 500
+commission_bps = 0
 self_bond = "10000"
 
 [independence]
@@ -24,6 +24,6 @@ hosting_provider = "Fly.io"
 asn = 40509
 datacenter_country = "US"
 datacenter = "fly-iad"
-founder_or_foundation = true
+founder_or_foundation = false
 affiliations = []
-statement = "Example operator for the dry-run spec: throwaway keys, not a real submission."
+statement = "Example operator for the dry-run spec: throwaway keys, not a real submission. Run by the founder (disclosed)."

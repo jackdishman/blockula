@@ -19,7 +19,7 @@ Everything is a build-time `NEXT_PUBLIC_*` variable.
 | `NEXT_PUBLIC_NETWORK` | (unset) | `mainnet` makes a mainnet deployment: mainnet is the default network, browser-only keys are off, and the build fails unless `NEXT_PUBLIC_RP_ID`, `NEXT_PUBLIC_MAINNET_RPC` and `NEXT_PUBLIC_MAINNET_GENESIS_HASH` are set and the rpId isn't on a shared hosting domain (`*.vercel.app`, `*.pages.dev`, …). |
 | `NEXT_PUBLIC_RP_ID` | `testnet.blockula.app` | The passkey relying-party id. Passkeys, and so wallets, are bound to it for good. Mainnet's is `wallet.blockula.app` (DEC-8). Payment links point at this host. |
 | `NEXT_PUBLIC_MAINNET_RPC` | (unset) | Adds the Mainnet network (chain `blockula-1`, prefix `boo`). Hidden until set. |
-| `NEXT_PUBLIC_MAINNET_GENESIS_HASH` | (unset) | Mainnet's genesis hash. Hard-code it in `lib/config.ts` once the ceremony has produced it. |
+| `NEXT_PUBLIC_MAINNET_GENESIS_HASH` | (unset) | Mainnet's genesis hash. The launch release builds it (and the genesis clock) into `lib/config.ts` (`scripts/pin-network.sh blockula-1 … --mainnet`); from then on a mainnet build refuses any other value here. |
 | `NEXT_PUBLIC_MAINNET_WITNESSES` | (unset) | Comma-separated `https://` URLs of other mainnet nodes (independent operators'). Names that end up in a signature are proven against them first (audit gap-7-1); without any, a name is the selected node's word and the wallet says so. |
 | `NEXT_PUBLIC_BLOCKULA_RPC` | `https://blockula-testnet.fly.dev` | The testnet's RPC. On a mainnet deployment, the testnet is listed only if this is set. |
 | `NEXT_PUBLIC_TESTNET_CHAIN_ID` | `blockula-testnet-2` | The chain id the testnet node must report (`TESTNET_CHAIN_ID`). A relaunched testnet takes a new chain id, so set this only for another testnet. |

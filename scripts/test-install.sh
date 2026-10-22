@@ -7,6 +7,8 @@
 #   bash scripts/test-install.sh
 #   INSTALL_SH=/path/to/an/older/install.sh KEEP_GOING=1 bash scripts/test-install.sh   (what it misses)
 #   TEST_SH=/bin/dash bash scripts/test-install.sh   (another POSIX shell; CI's /bin/sh is dash)
+# The cases run on copies of install.sh with the key id they need built in (none, as before the
+# key ceremony, or a test key), so filling in the real one at the ceremony changes nothing here.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 INSTALL=${INSTALL_SH:-$PWD/scripts/install.sh}
@@ -14,6 +16,13 @@ T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 KEY=$(printf 'ab%.0s' $(seq 32))
 OTHER_KEY=$(printf 'cd%.0s' $(seq 32))
+# with_key ID OUT: a copy of install.sh that builds in key id ID ("" for none).
+with_key() {
+  sed "s/^BUILTIN_KEY_ID=\"[0-9a-fA-F]*\"$/BUILTIN_KEY_ID=\"$1\"/" "$INSTALL" > "$2"
+  grep -qx "BUILTIN_KEY_ID=\"$1\"" "$2" || { echo "✗ couldn't build key id '$1' into a copy of install.sh (no BUILTIN_KEY_ID=\"…\" line?)" >&2; exit 1; }
+}
+with_key "" "$T/install-no-key.sh"
+with_key "$KEY" "$T/install-with-key.sh"
 target=x86_64-unknown-linux-gnu
 REPO_URL=https://github.com/jackdishman/blockula
 
@@ -96,7 +105,7 @@ failure() {
   [ "${KEEP_GOING:-}" = 1 ] || exit 1
   failed=$((failed + 1))
 }
-script=$INSTALL
+script=$T/install-no-key.sh
 # run NAME EXPECT(installs|refuses) PATTERN [VAR=value…]: runs install.sh in a clean environment,
 # by default from the v9.9.9 mirror (later VAR=value arguments override, VAR= unsets).
 run() {
@@ -176,8 +185,6 @@ run "a malformed key id: refused" refuses "64 hex characters" BLOCKULA_RELEASE_K
 # stronger than the script (docs/OPERATIONS.md "Installing and upgrading"); the operator's own key id
 # wins any disagreement.
 script=$T/install-with-key.sh
-sed "s/^BUILTIN_KEY_ID=\"\"/BUILTIN_KEY_ID=\"$KEY\"/" "$INSTALL" > "$script"
-grep -q "^BUILTIN_KEY_ID=\"$KEY\"" "$script" || { echo "✗ couldn't build the key into a copy of install.sh" >&2; exit 1; }
 sig "$T/release" good
 run "built-in key id, verifier, valid signature: installs" installs "release signature (ML-DSA-65 key abababababababab…, built into this script)" "$WITH_VERIFIER"
 run "built-in key id, no verifier: installs with a loud warning" installs "THE RELEASE SIGNATURE WAS NOT CHECKED"
@@ -186,7 +193,7 @@ rm -rf "$T/unsigned" && cp -R "$T/release" "$T/unsigned" && sig "$T/unsigned" no
 run "built-in key id, no .sig: refused" refuses "no checksums.txt.sig" BLOCKULA_RELEASE_URL="file://$T/unsigned" "$WITH_VERIFIER"
 run "built-in key id other than BLOCKULA_RELEASE_KEY_ID: refused" refuses "isn't the key id you gave" BLOCKULA_RELEASE_KEY_ID="$OTHER_KEY" "$WITH_VERIFIER"
 run "built-in key id equal to BLOCKULA_RELEASE_KEY_ID: installs" installs "from BLOCKULA_RELEASE_KEY_ID" BLOCKULA_RELEASE_KEY_ID="$KEY" "$WITH_VERIFIER"
-script=$INSTALL
+script=$T/install-no-key.sh
 
 # A tampered archive.
 sig "$T/release" none

@@ -92,7 +92,10 @@ function nodeBinary(): NodeBinary & { matches?: boolean } {
 const ranWith = (b: NodeBinary & { matches?: boolean }) =>
   `Ran ${b.path}${b.version ? ` (${b.version})` : ""}${b.matches === false && b.path !== "blockula" ? `, not this MCP's version (${VERSION}): install_node v${VERSION} (or \`blockula release install v${VERSION}\`) gets one that is.` : "."}`;
 
-/** Testnet economics, said wherever Hunts and the contribution pool come up. */
+/**
+ * Testnet economics, said wherever Hunts and the contribution pool come up, on test chains only:
+ * on mainnet FANG is real, so nothing is said about value there (valueNote).
+ */
 const NO_VALUE = "Testnet FANG, Hunts and Soul have no monetary value and come with no promise of any mainnet allocation.";
 
 function releaseTarget(): string | null {
@@ -110,6 +113,15 @@ try {
   NET_ERROR = e as Error;
 }
 const RPC = NET?.rpc ?? "";
+/**
+ * NO_VALUE in a tool's description, which is fixed when the server starts: on a network pinned to
+ * a test chain (any chain but blockula-1), NO_VALUE; on mainnet, nothing; on a node whose chain
+ * isn't known until it answers (a local or custom node without BLOCKULA_CHAIN_ID), the same said of
+ * test chains only, which is true on either. Results say it by the chain the node is on (valueNote).
+ */
+const NO_VALUE_DESCRIBED = NET?.mainnet ? "" : NET?.pin.chainId ? NO_VALUE : "On test chains, FANG, Hunts and Soul have no monetary value and come with no promise of any mainnet allocation.";
+/** A Hunt or contribution tool's description: `text`, then NO_VALUE_DESCRIBED when there is one. */
+const described = (text: string) => [text, NO_VALUE_DESCRIBED].filter(Boolean).join(" ");
 let pinned: Client | null = null;
 /** The chain `pinned` is held to (tx_status reads a signed tx's record only on the chain it was signed for). */
 let pinnedChain: { chainId?: string; genesisHash?: string; prefix?: string } = {};
@@ -199,6 +211,14 @@ const SIGNED = new SignedTxs(join(HOME, "agent-txs.json"));
 async function realMoney(client: Client): Promise<boolean> {
   return network().mainnet || (await client.status()).chain_id === MAINNET_CHAIN_ID;
 }
+
+/** NO_VALUE for a result, by the chain the node is pinned to: said on test chains, nothing on mainnet. */
+async function valueNote(): Promise<string> {
+  return (await realMoney(await chain())) ? "" : NO_VALUE;
+}
+
+/** A result's `note`: its parts that aren't empty, or nothing at all. */
+const noteOf = (...parts: string[]) => parts.filter(Boolean).join(" ") || undefined;
 
 /** What one tool call spends. */
 interface Spend {
@@ -1036,13 +1056,13 @@ tool("vote", "Vote on a governance proposal for the account this agent acts for.
 
 // ---- Hunts and the contribution pool ----
 
-tool("list_hunts", `Open bounties (Hunts) on GitHub issues, with FANG escrowed on-chain. Each links to an issue with acceptance criteria: implement it, open a PR, and the bounty is awarded on-chain when it merges. Titles are written by whoever created the hunt. ${UNTRUSTED_NOTE} ${NO_VALUE}`, { status: z.enum(["open", "awarded", "cancelled", "expired"]).default("open") }, async ({ status }) => {
+tool("list_hunts", described(`Open bounties (Hunts) on GitHub issues, with FANG escrowed on-chain. Each links to an issue with acceptance criteria: implement it, open a PR, and the bounty is awarded on-chain when it merges. Titles are written by whoever created the hunt. ${UNTRUSTED_NOTE}`), { status: z.enum(["open", "awarded", "cancelled", "expired"]).default("open") }, async ({ status }) => {
   const res = await (await chain()).hunts(status);
   const hunts = (Array.isArray(res) ? res : Array.isArray(res?.hunts) ? res.hunts : []) as { id: unknown; title?: unknown; amount_display?: unknown; issue_url?: unknown; funders?: unknown }[];
   const funders = (f: unknown) => (Array.isArray(f) ? f.length : f && typeof f === "object" ? Object.keys(f).length : 0);
   return {
     hunts: hunts.slice(0, 100).map((h) => ({ hunt_id: Number(h.id), bounty: clean(String(h.amount_display ?? ""), 40), untrusted_title: clean(String(h.title ?? ""), 120), issue: clean(String(h.issue_url ?? ""), 200), funders: funders(h.funders), explorer: explorer(`hunt/${Number(h.id)}`) })),
-    note: `${UNTRUSTED_NOTE} ${NO_VALUE}`,
+    note: noteOf(UNTRUSTED_NOTE, await valueNote()),
   };
 });
 
@@ -1054,14 +1074,14 @@ tool("link_github", "Link a GitHub handle to the account this agent acts for, so
   return { summary: clean(String(r.summary ?? "")), verified: check?.verified === true, explorer: explorer(`tx/${r.id}`) };
 });
 
-tool("fund_hunt", `Add FANG to an open Hunt's bounty (crowdfunding). Refunded to you if the hunt is cancelled. ${NO_VALUE}`, { hunt_id: z.number().int().min(0), amount: z.string() }, async ({ hunt_id, amount }) => {
+tool("fund_hunt", described(`Add FANG to an open Hunt's bounty (crowdfunding). Refunded to you if the hunt is cancelled.`), { hunt_id: z.number().int().min(0), amount: z.string() }, async ({ hunt_id, amount }) => {
   const drops = parseFang(amount);
   if (drops <= 0n) throw new Error("fund more than 0");
   const r = await submitCapped(await requireWallet(), { type: "fund_hunt", hunt_id, amount: drops.toString() }, { amount: drops });
   return isInFlight(r) ? r : { summary: clean(String(r.summary ?? "")), fee: r.fee_display, tx_id: r.id, explorer: explorer(`hunt/${hunt_id}`) };
 });
 
-tool("contribution_pool", `Blockula's contribution pool (Proof of Contribution): its balance, which GitHub repos earn from it, the rules, and the Séance (review jury) that's open now. Merged PRs to pool repos can be claimed for a share; payouts are judged by human juries, rate a sponsor's claims in a Séance together (one pooled win rate; each next a quarter of the one before), and vest over ~90 days. ${NO_VALUE}`, {}, async () => {
+tool("contribution_pool", described(`Blockula's contribution pool (Proof of Contribution): its balance, which GitHub repos earn from it, the rules, and the Séance (review jury) that's open now. Merged PRs to pool repos can be claimed for a share; payouts are judged by human juries, rate a sponsor's claims in a Séance together (one pooled win rate; each next a quarter of the one before), and vest over ~90 days.`), {}, async () => {
   const c = await (await chain()).contributions();
   return {
     pool: chainData(c.pool?.balance_display),
@@ -1071,12 +1091,12 @@ tool("contribution_pool", `Blockula's contribution pool (Proof of Contribution):
     open_seance: c.open_seance ? { id: c.open_seance.id, phase: chainData(c.open_seance.phase), claims: Array.isArray(c.open_seance.claims) ? c.open_seance.claims.length : 0, jurors: Array.isArray(c.open_seance.jurors) ? c.open_seance.jurors.length : 0, reveals_until_block: c.open_seance.reveal_until } : null,
     rules: chainData(c.rules),
     how_to_earn: "Get a PR merged into a pool repo's default branch, authored by the GitHub handle linked to the account you act for (link_github), then submit_contribution. Validators check the merge on GitHub; a jury compares it with other claims.",
-    note: NO_VALUE,
+    note: noteOf(await valueNote()),
     explorer: explorer("contribute"),
   };
 });
 
-tool("submit_contribution", `Claim a merged PR for the contribution pool, for the account this agent acts for. The PR's author must be that account's linked GitHub handle. Costs a small refundable bond (lost if the jury marks it spam). If you act for a user through a session key, they must first register that key as a Familiar (wallet.registerFamiliar), or the chain refuses the claim; the claim then credits you as their Familiar. ${NO_VALUE}`, { repo: z.string().regex(/^[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}$/), pr: z.number().int().min(1) }, async ({ repo, pr }) => {
+tool("submit_contribution", described(`Claim a merged PR for the contribution pool, for the account this agent acts for. The PR's author must be that account's linked GitHub handle. Costs a small refundable bond (lost if the jury marks it spam). If you act for a user through a session key, they must first register that key as a Familiar (wallet.registerFamiliar), or the chain refuses the claim; the claim then credits you as their Familiar.`), { repo: z.string().regex(/^[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}$/), pr: z.number().int().min(1) }, async ({ repo, pr }) => {
   const w = await requireWallet();
   await w.client.addressPrefix();
   const me = await w.client.account(w.account).catch(() => null);
@@ -1087,10 +1107,10 @@ tool("submit_contribution", `Claim a merged PR for the contribution pool, for th
   if (isInFlight(r)) return r;
   const claims = await w.client.claims({ account: w.account }).catch(() => null);
   const claim = (Array.isArray(claims?.claims) ? claims.claims : []).find((c: { repo: string; pr: number }) => c.repo === repo.toLowerCase() && c.pr === pr);
-  return { summary: clean(String(r.summary ?? "")), claim_id: claim?.id, status: claim ? clean(String(claim.status)) : undefined, next: "Validators check GitHub within a minute or two; then it waits for the revert window and the next Séance. Track it with my_contributions.", note: NO_VALUE, explorer: explorer(`claim/${claim?.id ?? ""}`) };
+  return { summary: clean(String(r.summary ?? "")), claim_id: claim?.id, status: claim ? clean(String(claim.status)) : undefined, next: "Validators check GitHub within a minute or two; then it waits for the revert window and the next Séance. Track it with my_contributions.", note: noteOf(await valueNote()), explorer: explorer(`claim/${claim?.id ?? ""}`) };
 });
 
-tool("my_contributions", `The Soul (reputation), contribution claims, vesting rewards, vouch and jury status of the account this agent acts for. A claim's untrusted_note is written by whoever judged or rejected it. ${NO_VALUE}`, {}, async () => {
+tool("my_contributions", described(`The Soul (reputation), contribution claims, vesting rewards, vouch and jury status of the account this agent acts for. A claim's untrusted_note is written by whoever judged or rejected it.`), {}, async () => {
   const w = await requireWallet();
   await w.client.addressPrefix();
   const a = await w.client.account(w.account);
@@ -1103,7 +1123,7 @@ tool("my_contributions", `The Soul (reputation), contribution claims, vesting re
     rewards: chainData({ withdrawable: p.rewards?.withdrawable_display, still_vesting: p.rewards?.unvested_display }),
     claims: (Array.isArray(p.claims) ? p.claims : []).map((c: { id: number; repo: string; pr: number; status: string; score_display?: string; payout_display: string; reason?: string }) => ({ id: c.id, pr: clean(`${c.repo}#${c.pr}`, 160), status: clean(String(c.status)), score: chainData(c.score_display), earned: chainData(c.payout_display), ...(c.reason ? { untrusted_note: clean(c.reason, 300) } : {}) })),
     next_claim_bond: chainData(p.next_claim_bond_display),
-    note: `${UNTRUSTED_NOTE} ${NO_VALUE}`,
+    note: noteOf(UNTRUSTED_NOTE, await valueNote()),
   };
 });
 

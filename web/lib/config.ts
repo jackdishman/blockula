@@ -13,10 +13,16 @@ export const MAINNET_CHAIN_ID = "blockula-1";
 export const MAINNET_PREFIX = "boo";
 
 /**
- * Mainnet's genesis hash. Pinned from the environment until launch; once the ceremony has
- * produced it, hard-code it here so no deploy setting can change it.
+ * Mainnet's genesis hash and clock, built in by the release that launches mainnet
+ * (`scripts/pin-network.sh blockula-1 … --mainnet`, after the genesis ceremony), so no deploy
+ * setting can change them. Until then the hash comes from NEXT_PUBLIC_MAINNET_GENESIS_HASH alone
+ * and the clock from the node on first use (lib/chain.ts). A mainnet build needs that variable
+ * either way, and once the hash is built in the two must agree (next.config.ts).
  */
-export const MAINNET_GENESIS_HASH = clean(process.env.NEXT_PUBLIC_MAINNET_GENESIS_HASH)?.toLowerCase();
+export const MAINNET_GENESIS_HASH: string | undefined = undefined;
+export const MAINNET_GENESIS_CLOCK: GenesisClock | undefined = undefined;
+/** NEXT_PUBLIC_MAINNET_GENESIS_HASH, as this deployment sets it. */
+export const MAINNET_GENESIS_HASH_ENV = clean(process.env.NEXT_PUBLIC_MAINNET_GENESIS_HASH)?.toLowerCase();
 
 /** The public testnet (deploy/launch.sh): its own chain id, never reused (DEC-7), and the testnet prefix. */
 export const TESTNET_CHAIN_ID = "blockula-testnet-2";
@@ -88,8 +94,21 @@ export function witnessList(v: string | undefined, rpc: string): string[] {
   return out;
 }
 
+const mainnetGenesis = MAINNET_GENESIS_HASH ?? MAINNET_GENESIS_HASH_ENV;
+
 const mainnet: Network | undefined = mainnetRpc
-  ? { key: "mainnet", label: "Mainnet", rpc: mainnetRpc, chainId: MAINNET_CHAIN_ID, genesisHash: MAINNET_GENESIS_HASH, prefix: MAINNET_PREFIX, mainnet: true, witnesses: witnessList(process.env.NEXT_PUBLIC_MAINNET_WITNESSES, mainnetRpc) }
+  ? {
+      key: "mainnet",
+      label: "Mainnet",
+      rpc: mainnetRpc,
+      chainId: MAINNET_CHAIN_ID,
+      genesisHash: mainnetGenesis,
+      // The built-in clock is that of the built-in genesis: never another one's.
+      genesisClock: mainnetGenesis && mainnetGenesis === MAINNET_GENESIS_HASH ? MAINNET_GENESIS_CLOCK : undefined,
+      prefix: MAINNET_PREFIX,
+      mainnet: true,
+      witnesses: witnessList(process.env.NEXT_PUBLIC_MAINNET_WITNESSES, mainnetRpc),
+    }
   : undefined;
 
 const testnetGenesis = clean(process.env.NEXT_PUBLIC_TESTNET_GENESIS_HASH)?.toLowerCase() || TESTNET_GENESIS_HASH;

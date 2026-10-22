@@ -19,7 +19,12 @@
 #     `p2p_active_peers` counts only those links, where `p2p_peers` also counts the last epoch's
 #     set, candidates and bootstrappers);
 #   - the active set is exactly the N validators read: one this script doesn't run would go
-#     unread, and the next restart could leave the rest short of a quorum;
+#     unread, and the next restart could leave the rest short of a quorum. Validators other
+#     operators run (OUTSIDE_VALIDATORS, mainnet's outside genesis operators) can't be read on
+#     their machines, so each one in the active set must instead have proposed one of the public
+#     node's last PACE_BLOCKS blocks: simplex leads every validator once in any n consecutive views
+#     of an epoch (twice that across an epoch's end), and a finalized proposal of its own shows it
+#     signs and is linked to a quorum;
 #   - each validator just restarted runs a new process (its start time moved) and has proposed a
 #     block since that process started.
 # Nothing that doesn't answer counts as passing. `gate_wait` repeats a check until it passes or
@@ -33,8 +38,9 @@
 # a restart passes in 15-35 s under public-nat, but with Commonware's `recommended` reconnection
 # limits, public-nat's until they were shortened, a restarted validator took up to ~3 minutes to
 # sign, link and propose again, and in one local run nearly 9 to link to all three peers),
-# GATE_ROUNDS (at most this many checks; tests), PACE_BLOCKS (20), PACE_SECS (25) and
-# HEAD_MAX_SECS (10).
+# GATE_ROUNDS (at most this many checks; tests), PACE_BLOCKS (20), PACE_SECS (25),
+# HEAD_MAX_SECS (10) and OUTSIDE_VALIDATORS (the addresses of validators in the active set that
+# other operators run, space-separated; unset on the testnet, where the set is ours alone).
 
 PROGRESS_SECS=${PROGRESS_SECS:-5}
 GATE_SECS=${GATE_SECS:-600}
@@ -133,8 +139,9 @@ gate_status() { # app port
 # INDEX=START (its process start time before its restart) is back; else 1 (2: waiting can't help),
 # with GATE_WHY. Records every validator's process start time in GATE_STARTED.
 gate_check() { # [INDEX=START …]
-  local blocks="" span n i a start order="" why proposed="" mine="" others=""
+  local blocks="" span n i a start order="" why proposed="" mine="" others="" outside=0 x unknown="" late="" theirs=""
   GATE_WHY="" GATE_OK=""
+  for x in ${OUTSIDE_VALIDATORS:-}; do outside=$((outside + 1)); done
   for a in "$@"; do
     gate_is_time "${a#*=}" || { GATE_WHY="no process start time for $PREFIX-v${a%%=*} from before its restart"; return 2; }
   done
@@ -143,8 +150,17 @@ gate_check() { # [INDEX=START …]
   # The active set, as a count that matches its list: what the link check counts against.
   n=$(jq -r 'if (.active_validators | type) == "number" and (.validators | type) == "array" and (.validators | length) == .active_validators then .active_validators else "" end' <<<"$GATE_PUB") || n=""
   case "$n" in "" | *[!0-9]*) GATE_WHY="the public node's status doesn't list the active set"; return 1 ;; esac
-  if [ "$n" -gt "$N" ]; then
-    GATE_WHY="the active set has $n validators, more than the $N this script runs: it can't tell whether the others sign or are linked, so it won't restart anything (restart the validators together instead: deploy/README.md, Restarting validators)"
+  if [ "$n" -gt $((N + outside)) ]; then
+    if [ "$outside" = 0 ]; then
+      GATE_WHY="the active set has $n validators, more than the $N this script runs: it can't tell whether the others sign or are linked, so it won't restart anything (restart the validators together instead: deploy/README.md, Restarting validators)"
+    else
+      GATE_WHY="the active set has $n validators, more than the $N this script runs and the $outside OUTSIDE_VALIDATORS names: it can't tell whether the others sign or are linked, so it won't restart anything"
+    fi
+    return 2
+  fi
+  # Outside validators are seen only by their proposals: every one of n leads within 2n − 1 views.
+  if [ "$outside" -gt 0 ] && [ "$PACE_BLOCKS" -lt $((2 * n - 1)) ]; then
+    GATE_WHY="PACE_BLOCKS ($PACE_BLOCKS) is fewer blocks than it takes each of $n validators to lead ($((2 * n - 1))), so it can't vouch for the outside validators"
     return 2
   fi
   if ! blocks=$(curl -fsS -m 10 "$RPC_URL/api/blocks?limit=$PACE_BLOCKS" 2>/dev/null) \
@@ -178,14 +194,33 @@ gate_check() { # [INDEX=START …]
       *) GATE_WHY="$PREFIX-v$i $why"; return 1 ;;
     esac
   done
-  # Each of ours is in the active set and it has at most N members, so it's ours alone, unless two
-  # of our apps report one validator (one key on two machines): then someone else's is unread.
-  others=$(jq -r --arg mine "$mine" '[.validators[]? | if type == "string" then . else .address end] - ($mine | split(" ")) | join(", ")' <<<"$GATE_PUB") || others="?"
-  if [ -n "$others" ]; then
-    GATE_WHY="the active set also has validators this script doesn't run ($others), and two of its apps report the same validator: it won't restart anything"
+  # Each of ours is in the active set and it has at most N members (with no outside validators), so
+  # it's ours alone, unless two of our apps report one validator (one key on two machines): then
+  # someone else's is unread. The rest must be outside validators that proposed in the window.
+  if ! others=$(jq -r --arg mine "$mine" '[.validators[]? | if type == "string" then . else .address end] - ($mine | split(" ")) | join(" ")' <<<"$GATE_PUB"); then
+    others="" unknown="?"
+  fi
+  for x in $others; do
+    case " ${OUTSIDE_VALIDATORS:-} " in
+      *" $x "*)
+        theirs="$theirs${theirs:+, }$x"
+        jq -e --arg v "$x" 'any(.[]; .p == $v)' >/dev/null 2>&1 <<<"$blocks" || late="$late${late:+, }$x" ;;
+      *) unknown="$unknown${unknown:+, }$x" ;;
+    esac
+  done
+  if [ -n "$unknown" ]; then
+    if [ "$outside" = 0 ]; then
+      GATE_WHY="the active set also has validators this script doesn't run ($unknown), and two of its apps report the same validator: it won't restart anything"
+    else
+      GATE_WHY="the active set has validators neither this script runs nor OUTSIDE_VALIDATORS names ($unknown): it won't restart anything"
+    fi
     return 2
   fi
-  GATE_OK="all $N validators sign, each linked to the $((n - 1)) other active ones; the last $PACE_BLOCKS blocks took $(gate_secs "$span") s$proposed"
+  if [ -n "$late" ]; then
+    GATE_WHY="outside validator $late proposed none of the last $PACE_BLOCKS blocks (down, behind or unlinked: ask its operator)"
+    return 1
+  fi
+  GATE_OK="all $N validators sign, each linked to the $((n - 1)) other active ones; the last $PACE_BLOCKS blocks took $(gate_secs "$span") s$proposed${theirs:+; outside validators that proposed in them: $theirs}"
 }
 
 # The public node answers for this genesis, and so does each node named (INDEX: a validator, rpc:

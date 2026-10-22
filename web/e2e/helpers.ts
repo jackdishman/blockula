@@ -30,6 +30,9 @@ export const test = base.extend<{ node: MockNode; passkeys: Awaited<ReturnType<t
   node: [
     async ({ context }, use, info) => {
       const node = new MockNode(info.project.name === "mainnet" ? "mainnet" : "testnet");
+      // A mainnet pinned to a genesis time still ahead: the browser's clock runs from the node's
+      // present, as it will once the chain is live.
+      if (node.nowMs > Date.now()) await context.clock.install({ time: node.nowMs });
       await node.install(context);
       await use(node);
     },

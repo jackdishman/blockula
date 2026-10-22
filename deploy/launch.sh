@@ -84,6 +84,8 @@ APPS=("$RPC_APP"); for i in $(seq 0 $((N - 1))); do APPS+=("$PREFIX-v$i"); done
 source deploy/fly-config.sh
 # The participation gate a restart waits for (PROGRESS_SECS between its checks, GATE_SECS at most).
 source deploy/restart-gate.sh
+# The keys' removal from Fly once they're on the volumes (keys_in_fly, remove_seeded_keys, has_secret).
+source deploy/key-removal.sh
 
 fly_ok() { [ -z "${GENESIS_ONLY:-}" ]; }
 if ! fly_ok && [ -n "${RESET:-}" ]; then echo "❌ RESET=1 with GENESIS_ONLY=1: a rehearsal makes no Fly calls, so it never resets anything" >&2; exit 1; fi
@@ -125,7 +127,6 @@ dedicated_v4() {
   [ -n "$ip" ] || { fly ips allocate-v4 -a "$1" --yes >/dev/null; ip=$(fly ips list -a "$1" --json | jq -r '[.[] | select(.Type == "v4")][0].Address'); }
   echo "$ip"
 }
-has_secret() { fly secrets list -a "$1" --json | jq -e --arg s "$2" 'map(.name // .Name) | index($s)' >/dev/null; }
 # Country of a Fly region, for the operator files' independence fields (DEC-14 display only).
 country_of() {
   case "$1" in
@@ -340,7 +341,6 @@ fly deploy . -c "$WORK/build.toml" --dockerfile deploy/Dockerfile --depot="${DEP
 # retry after any failure below finishes this launch, or takes a new CHAIN_ID).
 touch "$NET/launched"
 
-SEEDING=()
 DEPLOYS=()
 for i in $(seq 0 $((N - 1))); do
   app=$PREFIX-v$i
@@ -356,51 +356,16 @@ done
 failed=""
 for i in $(seq 0 $((N - 1))); do wait "${DEPLOYS[$i]}" || failed="$failed $PREFIX-v$i"; done
 [ -z "$failed" ] || { echo "❌ deploying$failed failed (fly logs -a <app>); rerun deploy/launch.sh, without RESET" >&2; exit 1; }
-# Which validators (by index) still hold their key in Fly, asked once the deploys applied the
-# staged secrets (a staged secret may not be listed before).
-for i in $(seq 0 $((N - 1))); do
-  if has_secret "$PREFIX-v$i" VALIDATOR_KEY_B64; then SEEDING+=("$i"); fi
-done
+# Which validators still hold their key in Fly, asked once the deploys applied the staged secrets.
+keys_in_fly
 
 rpc_toml > "$WORK/$RPC_APP.toml"
 echo "🌐 Deploying public node ${RPC_APP}…"
 fly deploy -c "$WORK/$RPC_APP.toml" --image "$IMAGE" --ha=false >/dev/null
 
-# Keys are on their volumes now: delete them from Fly so no other machine can ever load them.
-# Not staged, so every validator still holding its key restarts without the variable: all of them
-# together, once. One at a time is what nearly stalled the blockula-testnet-2 launch (each restart
-# waited out its peers' reconnection cooldowns, minutes before public-nat's were shortened, and a
-# gate that didn't wait for links took two of four validators out at once: no quorum, then a crawl
-# that jailed one). Even gated, it would cost a minute or two and a few missed slots per
-# validator, with the keys left in Fly until the last restart. Together, on a chain nobody uses yet,
-# the chain pauses once (slashing protection signs again once it sees the network standing still),
-# each validator misses about a slot, and they relink in one round. Before it, the public node and
-# each of them must answer (their process start times tell the gate their new processes from the
-# old ones), or nothing restarts and the keys stay for a rerun; after it, the participation gate
-# (deploy/restart-gate.sh).
-REMOVE=()
-for i in ${SEEDING[@]+"${SEEDING[@]}"}; do
-  if fly ssh console -a "$PREFIX-v$i" -C "test -f /data/home/.seeded" >/dev/null 2>&1; then
-    REMOVE+=("$i")
-  else
-    echo "⚠️  $PREFIX-v$i: couldn't confirm the key was seeded; VALIDATOR_KEY_B64 left in place" >&2
-  fi
-done
-if [ ${#REMOVE[@]} -gt 0 ]; then
-  names=""; for i in "${REMOVE[@]}"; do names="$names $PREFIX-v$i"; done
-  echo "🔒 Removing the keys seeded on their volumes from Fly, restarting$names together…"
-  gate_wait "before the restart" gate_answering "${REMOVE[@]}" \
-    || { echo "❌ $GATE_WHY: nothing restarted, and the keys stay in Fly. Rerun deploy/launch.sh (without RESET) to remove them." >&2; exit 1; }
-  STARTS=(); PIDS=()
-  for i in "${REMOVE[@]}"; do STARTS+=("$i=${GATE_STARTED[$i]}"); done
-  for i in "${REMOVE[@]}"; do fly secrets unset VALIDATOR_KEY_B64 -a "$PREFIX-v$i" >/dev/null & PIDS+=($!); done
-  failed=""
-  for k in $(seq 0 $((${#PIDS[@]} - 1))); do wait "${PIDS[$k]}" || failed="$failed $PREFIX-v${REMOVE[$k]}"; done
-  [ -z "$failed" ] || { echo "❌ removing VALIDATOR_KEY_B64 from$failed failed (fly logs -a <app>): rerun deploy/launch.sh (without RESET)" >&2; exit 1; }
-  echo "🔒$names: VALIDATOR_KEY_B64 removed from Fly secrets (restarted)"
-  gate_wait "after the restart" gate_check "${STARTS[@]}" \
-    || { echo "❌ the validators aren't back at full participation after the key removal: $GATE_WHY. The keys are off Fly; check fly logs -a <app> before anything else restarts a validator." >&2; exit 1; }
-fi
+# Keys are on their volumes now: delete them from Fly so no other machine can ever load them, with
+# one restart of those validators together and the participation gate (deploy/key-removal.sh).
+remove_seeded_keys || exit 1
 
 # Informational only: a failure here (e.g. a stale local DNS cache) must not skip anything above.
 for _ in $(seq 60); do curl -fsS "$RPC_URL/api/health" >/dev/null 2>&1 && break; sleep 5; done

@@ -198,7 +198,8 @@ pub struct VoteRecord {
     /// `locked_until`. Re-votes only ever grow it.
     pub lock_amount: u64,
     pub locked_until: u64,
-    /// The validator this vote also counted for in the bootstrap council.
+    /// The validator this vote also counted for in the bootstrap council (on `blockula-1`, not
+    /// a consensus key's vote that left the seat to its owner's: `owner_outranks_key`).
     pub council: Option<String>,
     pub at: u64,
 }
@@ -463,8 +464,9 @@ pub fn owner_keys(state: &State, account: &str) -> BTreeSet<String> {
 /// ClaimDistribution.
 pub(crate) fn apply(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, signer: &str, key: &KeyRecord, height: u64) -> Result<()> {
     match &tx.action {
-        Action::Propose { kind, deposit, title, url } => propose(state, j, sender, key, kind, *deposit, title, url, height),
-        Action::Vote { proposal_id, aye, amount, conviction, proposal_digest } => vote(state, j, sender, signer, key, *proposal_id, *aye, *amount, *conviction, proposal_digest, height),
+        // Admission checked the tx is this chain's: its `chain_id` is the chain's.
+        Action::Propose { kind, deposit, title, url } => propose(state, j, &tx.chain_id, sender, key, kind, *deposit, title, url, height),
+        Action::Vote { proposal_id, aye, amount, conviction, proposal_digest } => vote(state, j, &tx.chain_id, sender, signer, key, *proposal_id, *aye, *amount, *conviction, proposal_digest, height),
         Action::Unlock {} => {
             owner_only(key, "unlock votes")?;
             if crate::econ::release_expired(state, j, sender, height) == 0 {
@@ -492,8 +494,8 @@ fn spend_gate(state: &State, height: u64) -> Result<()> {
 }
 
 /// The kind as it will be stored: account names resolved to addresses, and what can already be
-/// known to fail refused (it's checked again when it runs).
-fn prepare_kind(state: &State, kind: &ProposalKind, height: u64) -> Result<ProposalKind> {
+/// known to fail on chain `chain_id` refused (it's checked again when it runs).
+fn prepare_kind(state: &State, chain_id: &str, kind: &ProposalKind, height: u64) -> Result<ProposalKind> {
     let cp = &state.chain_params;
     // The proposal's `voting_end` (fixed now; the horizons count from it, here and when it runs),
     // and the earliest block it can run in (the timelock in force at the close decides).
@@ -574,8 +576,18 @@ fn prepare_kind(state: &State, kind: &ProposalKind, height: u64) -> Result<Propo
             }
         }
         ProposalKind::ActivateFeature { feature } | ProposalKind::DeactivateFeature { feature } => {
-            if !crate::upgrade::KNOWN_FEATURES.contains(&feature.as_str()) {
-                bail!("unknown feature {feature} (known: {})", crate::upgrade::KNOWN_FEATURES.join(", "));
+            // Known to the version in force at this block, not at `runs_at`: until a scheduled
+            // upgrade activates, every node runs this block under the old version's rules,
+            // nodes whose binary doesn't have the new ones included, so a feature the upgrade
+            // brings is proposed once it's in force. Versions never go down, so it's known when
+            // it runs too (an activation is checked again then).
+            crate::upgrade::check_known_feature(feature, crate::upgrade::version_at(state, height))?;
+            // And one this chain lets governance switch on under the version in force at the
+            // earliest block it runs in (on `blockula-1`: never Ghost Mode, and programs from v3,
+            // so one may be proposed to run after a scheduled v3; `check_may_activate` says why
+            // that block's version may be read here).
+            if matches!(kind, ProposalKind::ActivateFeature { .. }) {
+                crate::upgrade::check_may_activate(feature, chain_id, crate::upgrade::version_at(state, runs_at))?;
             }
         }
         ProposalKind::SetRepo { .. } | ProposalKind::Text {} => {}
@@ -584,13 +596,13 @@ fn prepare_kind(state: &State, kind: &ProposalKind, height: u64) -> Result<Propo
 }
 
 #[allow(clippy::too_many_arguments)]
-fn propose(state: &mut State, j: &mut Journal, sender: &str, key: &KeyRecord, kind: &ProposalKind, deposit: u64, title: &str, url: &str, height: u64) -> Result<()> {
+fn propose(state: &mut State, j: &mut Journal, chain_id: &str, sender: &str, key: &KeyRecord, kind: &ProposalKind, deposit: u64, title: &str, url: &str, height: u64) -> Result<()> {
     owner_only(key, "make proposals")?;
     let min = state.chain_params.proposal_deposit;
     if deposit < min {
         bail!("a proposal bonds at least {}", fmt_fang(min));
     }
-    let kind = prepare_kind(state, kind, height)?;
+    let kind = prepare_kind(state, chain_id, kind, height)?;
     state.j_debit(j, sender, deposit)?;
     save_scalars(state, j);
     let g = &mut state.governance;
@@ -611,7 +623,7 @@ pub fn digest_of(p: &Proposal) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn vote(state: &mut State, j: &mut Journal, sender: &str, signer: &str, key: &KeyRecord, id: u64, aye: bool, amount: u64, conviction: u8, digest: &str, height: u64) -> Result<()> {
+fn vote(state: &mut State, j: &mut Journal, chain_id: &str, sender: &str, signer: &str, key: &KeyRecord, id: u64, aye: bool, amount: u64, conviction: u8, digest: &str, height: u64) -> Result<()> {
     owner_only(key, "vote")?;
     let p = state.governance.proposals.get(&id).ok_or_else(|| anyhow!("no proposal #{id}"))?;
     if p.status != ProposalStatus::Voting || height > p.voting_end {
@@ -637,6 +649,8 @@ fn vote(state: &mut State, j: &mut Journal, sender: &str, signer: &str, key: &Ke
         None => (amount, until),
     };
     let council = if height < cp.bootstrap_end_height { crate::staking::validator_for_signer(state, sender, signer, state.params.epoch_of(height)) } else { None };
+    // Not over the seat's vote its owner cast, on `blockula-1` (the tokens still count).
+    let council = council.filter(|val| !owner_outranks_key(state, chain_id, id, val, sender));
     crate::econ::lock(state, j, sender, format!("vote:{id}"), lock_amount, locked_until, height)?;
     let p = proposal_mut(state, j, id);
     if let Some(v) = &prev {
@@ -660,6 +674,23 @@ fn vote(state: &mut State, j: &mut Journal, sender: &str, signer: &str, key: &Ke
     j.governance.votes.touch(&state.governance.votes, &vk);
     state.governance.votes.insert(vk, VoteRecord { aye, amount, conviction, weight, lock_amount, locked_until, council, at: height });
     Ok(())
+}
+
+/// Whether `sender`'s vote on proposal `id` leaves validator `val`'s council seat to the vote the
+/// validator's owner cast there: on `blockula-1`, when `sender` is the validator's own account
+/// (its consensus key's) and the seat holds its owner's vote. The consensus key is hot (it signs
+/// blocks on the validator's machine), and on `blockula-1` its account holds the operator float,
+/// so it votes from block 1, while the owner's keys are cold: a leaked consensus key can't replace
+/// a council vote the owner cast, and the owner can replace either. The key's own FANG still
+/// votes; its record names no seat (`VoteRecord::council`). On every other chain the latest vote
+/// from either account holds the seat, as it always has, so testnets and dev chains are
+/// unchanged and so is protocol v2 (which changes nothing until programs are on).
+fn owner_outranks_key(state: &State, chain_id: &str, id: u64, val: &str, sender: &str) -> bool {
+    if chain_id != crate::chain::MAINNET_CHAIN_ID || sender != val {
+        return false;
+    }
+    let Some(owner) = state.validators.get(val).map(|r| r.owner.as_str()).filter(|o| *o != sender) else { return false };
+    state.governance.proposals.get(&id).and_then(|p| p.council.get(val)).is_some_and(|c| c.voter == owner)
 }
 
 /// The keyless system accounts, which never vote (only the bootstrap delegation stakes, by
@@ -847,11 +878,11 @@ fn clamp(v: u128) -> u64 {
     v.min(u64::MAX as u128) as u64
 }
 
-/// Runs a queued proposal's action. On error nothing it did stays.
-fn execute(state: &mut State, id: u64, height: u64) {
+/// Runs a queued proposal's action on chain `chain_id`. On error nothing it did stays.
+fn execute(state: &mut State, chain_id: &str, id: u64, height: u64) {
     let p = state.governance.proposals[&id].clone();
     let mut j = Journal::default();
-    let result = run_kind(state, &mut j, &p, height);
+    let result = run_kind(state, &mut j, chain_id, &p, height);
     let (status, outcome) = match result {
         Ok(what) => (ProposalStatus::Executed, what),
         Err(e) => {
@@ -873,7 +904,7 @@ fn execute(state: &mut State, id: u64, height: u64) {
 /// A passed proposal's action (the levers have no signer checks: the vote was the check).
 /// Returns what it did, for `Proposal::outcome` (accounts shortened: names are looked up by
 /// readers, not scanned for in end-of-block code).
-fn run_kind(state: &mut State, j: &mut Journal, p: &Proposal, height: u64) -> Result<String> {
+fn run_kind(state: &mut State, j: &mut Journal, chain_id: &str, p: &Proposal, height: u64) -> Result<String> {
     Ok(match &p.kind {
         ProposalKind::ParamChange { key, value } => {
             state.exec_set_param(j, key, *value)?;
@@ -946,7 +977,7 @@ fn run_kind(state: &mut State, j: &mut Journal, p: &Proposal, height: u64) -> Re
             format!("protocol v{version} activates at block {activation_height}")
         }
         ProposalKind::ActivateFeature { feature } => {
-            crate::upgrade::exec_activate_feature(state, j, feature, height)?;
+            crate::upgrade::exec_activate_feature(state, j, chain_id, feature, height)?;
             format!("{feature} is on")
         }
         ProposalKind::DeactivateFeature { feature } => {
@@ -1049,7 +1080,7 @@ pub fn end_block(state: &mut State, b: &BlockInfo) {
     for id in state.governance.open_proposals.clone() {
         let p = &state.governance.proposals[&id];
         if p.status == ProposalStatus::Queued && p.execute_at.is_some_and(|at| height >= at) {
-            execute(state, id, height);
+            execute(state, b.chain_id, id, height);
         }
     }
     for id in state.governance.open_distributions.clone() {

@@ -10,7 +10,7 @@ import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { createHash } from "node:crypto";
 import type { BrowserContext, Page, Route } from "@playwright/test";
 import { bech32m } from "@scure/base";
-import { CHAIN_ID, GENESIS, MAINNET_GENESIS, MAINNET_RPC, RPC } from "./env";
+import { CHAIN_ID, GENESIS, MAINNET_GENESIS, MAINNET_GENESIS_CLOCK, MAINNET_RPC, RPC } from "./env";
 
 type Role = { type: "owner" } | { type: "session"; limit: string; period_blocks: number; expires_at: number };
 interface KeyRec { label: string; role: Role; added_at: number }
@@ -132,12 +132,24 @@ export class MockNode {
   multisigs = new Map<string, Json>();
   /** Merged into `/api/validators` (v1's leaving, tombstoned, admission…). */
   validatorsExtra: Json = {};
-  /** When block 1 was sealed: blocks come a second apart. */
-  private readonly genesisMs = Date.now() - 100_000;
+  /**
+   * When block 1 was sealed: blocks come a second apart, the newest (#100) about now. A mainnet
+   * whose genesis clock lib/config.ts builds in starts no earlier than that genesis time, so its
+   * heights are ones the wallet's clock check allows.
+   */
+  private readonly genesisMs: number;
+  /**
+   * This node's present: its newest block's time when it was made. Later than the real one only
+   * for a mainnet pinned to a genesis time still ahead (the launch release's, before launch): the
+   * browser's clock is then moved to it (e2e/helpers.ts).
+   */
+  readonly nowMs: number;
 
   /** A node of one of the e2e chains, optionally at another URL (a "custom node"). */
   constructor(chain: keyof typeof CHAINS = "testnet", rpc?: string) {
     ({ rpc: this.rpc, chainId: this.chainId, genesisHash: this.genesisHash } = CHAINS[chain]);
+    this.genesisMs = Math.max(Date.now() - 100_000, (chain === "mainnet" && MAINNET_GENESIS_CLOCK?.createdAtMs) || 0);
+    this.nowMs = this.genesisMs + 100_000;
     this.genesis = { chain_id: this.chainId, created_at_ms: this.genesisMs, block_time_ms: 1000, validators: [] };
     if (rpc) this.rpc = rpc;
   }
