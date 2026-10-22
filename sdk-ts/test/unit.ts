@@ -9,7 +9,7 @@ import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex, hexToBytes, utf8ToBytes } from "@noble/hashes/utils.js";
 import {
-  ApiError, ChainMismatchError, Client, MAINNET_CHAIN_ID, MAX_TIMEOUT_MS, UnprovenNameError, actionDigest, describeAction, describeKind, fangText, decodeKeyGrant, encodeKeyGrant, proposalDigest, seancePairsDigest, verifyKeyGrant, RELEASE_SIGNATURE_FORMAT, RequestTimeoutError, StaleProofError, TxFailedError, TxPendingError, Wallet, txDropped, addressFromPublicKey, bareName, buildDistribution, convictionWeight, distributionLeaf, distributionNode,
+  ApiError, ChainMismatchError, Client, MAINNET_CHAIN_ID, MAX_TIMEOUT_MS, MainnetNotAllowedError, UnprovenNameError, actionDigest, describeAction, describeKind, fangText, decodeKeyGrant, encodeKeyGrant, proposalDigest, seancePairsDigest, verifyKeyGrant, RELEASE_SIGNATURE_FORMAT, RequestTimeoutError, StaleProofError, TxFailedError, TxPendingError, Wallet, txDropped, addressFromPublicKey, bareName, buildDistribution, convictionWeight, distributionLeaf, distributionNode,
   HeightAheadError, HEIGHT_CLOCK_TOLERANCE_MS, heightLimit, reviewAction,
   keyHash, keyId, leafHash, maxTip, minFee, paramsOf, proposal, proposalSummary, releaseMessage, sharesFor, signingBytes, stakeSummary, valueHash, verifyDistributionProof, verifyReleaseSignature, type Action,
   type Tx,
@@ -434,14 +434,22 @@ console.log("✓ names that get signed are proven against the client's witnesses
   assert.deepEqual(main.posted.map((t) => t.action.type === "delegate" ? t.action.validator : t.action.type === "transfer" ? t.action.to : ""), [VALIDATOR, "bob.boo"]);
   assert.equal((await mw.keyGrant(BOB)).account, BOB);
   // Two-faced: the name is resolved while the node says it's a test chain, the tx is built when it
-  // says mainnet (an unpinned client that opted in to mainnet): refused at signing.
+  // says mainnet: refused at signing. A client whose reads aren't pinned to that chain signs nothing
+  // there at all, and one that says it pins the chain itself (`chainPin`) still won't sign the
+  // account actAs found on one node's word.
   const flip = host("http://flip.node");
   flip.names = { bob: ATTACKER };
   let flipReads = 0;
   Object.defineProperty(flip.status, "chain_id", { enumerable: true, get: () => (flipReads++ < 1 ? "unit" : MAINNET_CHAIN_ID) });
-  const fw = Wallet.fromSeed("0f".repeat(32), new Client("http://flip.node", { allowMainnet: true }));
+  class SelfPinned extends Client {
+    protected override chainPin() {
+      return MAINNET_CHAIN_ID;
+    }
+  }
+  const fw = Wallet.fromSeed("0f".repeat(32), new SelfPinned("http://flip.node"));
   await fw.actAs("bob.boo");
   assert.equal(fw.account, ATTACKER);
+  await assert.rejects(Wallet.fromSeed("0f".repeat(32), new Client("http://flip.node")).send(BOB, "1"), MainnetNotAllowedError, "an unpinned client signs nothing there");
   await assert.rejects(fw.send(BOB, "1"), UnprovenNameError, "the account actAs found on one node's word isn't signed for on mainnet");
   assert.equal(flip.posted.length, 0);
   fw.account = BOB; // an address the caller checked
@@ -479,7 +487,7 @@ console.log("✓ actAs refuses an address with another chain's prefix");
 {
   const main = host("http://mainnet2.node", { chain_id: MAINNET_CHAIN_ID });
   main.names = { vlad: ATTACKER };
-  const c = new Client("http://mainnet2.node", { allowMainnet: true });
+  const c = new Client("http://mainnet2.node", { chainId: MAINNET_CHAIN_ID });
   const w = Wallet.fromSeed("1a".repeat(32), c);
   const res = await c.resolution("vlad.boo");
   assert.equal(res.proven, false);
