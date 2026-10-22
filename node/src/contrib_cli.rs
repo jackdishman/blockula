@@ -314,7 +314,9 @@ pub enum ContribCmd {
         #[command(flatten)]
         signer: Signer,
     },
-    /// Claim a merged PR (authored by your linked GitHub handle) for the contribution pool
+    /// Claim a merged PR (authored by your linked GitHub handle) for the contribution pool. It
+    /// first checks GitHub as validators will (merged, by your linked handle, your gist): the
+    /// bond is lost if they refute the claim
     Claim {
         /// owner/name (must be in the pool)
         repo: String,
@@ -322,6 +324,9 @@ pub enum ContribCmd {
         /// Credit one of your Familiars (its key id)
         #[arg(long)]
         familiar: Option<String>,
+        /// Don't check GitHub before bonding
+        #[arg(long)]
+        skip_github: bool,
         #[command(flatten)]
         signer: Signer,
     },
@@ -534,7 +539,12 @@ pub fn contrib(cmd: ContribCmd, dir: &Path) -> Result<()> {
             println!("  {}: {}", if v["verified"] == true { "✓ verified" } else { "⚠️  not verified yet" }, v["reason"].as_str().unwrap_or_default());
             Ok(())
         }
-        ContribCmd::Claim { repo, pr, familiar, signer } => submit(dir, &signer, Action::SubmitClaim { repo, pr, familiar_key: familiar }).map(|_| ()),
+        ContribCmd::Claim { repo, pr, familiar, skip_github, signer } => {
+            if !skip_github {
+                precheck_claim(dir, &signer, &repo, pr)?;
+            }
+            submit(dir, &signer, Action::SubmitClaim { repo, pr, familiar_key: familiar }).map(|_| ()).map_err(vouch_hint)
+        }
         ContribCmd::Claims { account, signer } => {
             let rt = rt()?;
             let who = match account.or(signer.from.clone()) {
@@ -676,6 +686,61 @@ pub fn contrib(cmd: ContribCmd, dir: &Path) -> Result<()> {
     }
 }
 
+/// Where a newcomer asks for a vouch (the issue form `.github/ISSUE_TEMPLATE/vouch-request.yml`).
+pub const VOUCH_REQUEST_URL: &str = "https://github.com/jackdishman/blockula/issues/new?template=vouch-request.yml";
+
+/// A refusal for want of Soul or a vouch, with where to ask for one (CONTRIB-3).
+fn vouch_hint(e: anyhow::Error) -> anyhow::Error {
+    if e.to_string().contains("Soul or a vouch") {
+        anyhow!("{e:#}. Ask someone with Soul to vouch for you: request one at {VOUCH_REQUEST_URL} (who has Soul: GET /api/souls on any node)")
+    } else {
+        e
+    }
+}
+
+/// Checks a claim on GitHub the way validators will ([`crate::github::check_claim`]) before it's
+/// bonded: validators refute a PR that isn't merged into the repo's default branch, isn't by the
+/// claimant's linked handle, or a link whose gist doesn't name the claimant, and the bond is lost
+/// (CONTRIB-4). Refuses with the reason; nothing is signed.
+fn precheck_claim(dir: &Path, signer: &Signer, repo: &str, pr: u64) -> Result<()> {
+    use crate::github::Verdict;
+    let keys = signer.keys(dir)?;
+    rt()?.block_on(async {
+        let remote = signer.connect(dir).await?;
+        let me = signer.acting_for(&remote, &keys).await?;
+        let acct = get(&remote.rpc, &format!("/account/{me}")).await?;
+        let (Some(handle), Some(gist)) = (acct["github"]["handle"].as_str(), acct["github"]["gist_id"].as_str()) else {
+            bail!("{me} hasn't linked a GitHub handle: run `blockula contrib link-github <handle> <gist id>` first. Nothing was signed");
+        };
+        let skip = "Pass --skip-github to claim anyway";
+        match crate::github::check_claim(handle, repo, pr, &me, gist).await {
+            Ok(Verdict::Confirmed { .. }) => Ok(()),
+            Ok(Verdict::Refuted(why)) => bail!("validators would refute this claim ({why}), and its bond would be lost. Nothing was signed. {skip}"),
+            Ok(Verdict::Wait) => bail!("{repo}#{pr} isn't merged yet: claim it once it is. Nothing was signed. {skip}"),
+            Err(e) => bail!("couldn't check {repo}#{pr} on GitHub ({e:#}; set GITHUB_TOKEN if rate limited). Nothing was signed. {skip}"),
+        }
+    })
+}
+
+/// About when block `height` comes, by the chain's block time from the node's `status` (its
+/// height then): a UTC date, for display.
+fn about_date(height: u64, status: &Value) -> Option<String> {
+    let (now, block_ms) = (status["height"].as_u64()?, status["block_time_ms"].as_u64()?);
+    let ms = crate::chain::now_ms() as i128 + (height as i128 - now as i128) * block_ms as i128;
+    let days = ms.div_euclid(86_400_000) as i64;
+    // Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    Some(format!("{y:04}-{m:02}-{d:02}"))
+}
+
 // ------------------------------------------------------------------------------------- names
 
 #[derive(Subcommand)]
@@ -686,7 +751,8 @@ pub enum NameCmd {
         #[command(flatten)]
         rpc: Rpc,
     },
-    /// Extend a name you own (1–10 years, paid at the renewal price per year, burned)
+    /// Extend a name you own (1–10 years at the renewal price per year, paid to the treasury, not
+    /// burned)
     Renew {
         name: String,
         #[arg(long, default_value = "1")]
@@ -731,7 +797,10 @@ pub enum NameCmd {
 pub fn name(cmd: NameCmd, dir: &Path) -> Result<()> {
     match cmd {
         NameCmd::Show { name, rpc } => {
-            let v = rt()?.block_on(get(&rpc.rpc, &format!("/name/{name}")))?;
+            let rt = rt()?;
+            let v = rt.block_on(get(&rpc.rpc, &format!("/name/{name}")))?;
+            // For the dates: the node's height and block time (display only).
+            let status = rt.block_on(get(&rpc.rpc, "/status")).ok();
             let n = v["name"].as_str().unwrap_or_default();
             if v["available"] == true {
                 println!("{n} is available for {}", v["price_display"].as_str().unwrap_or_default());
@@ -739,11 +808,15 @@ pub fn name(cmd: NameCmd, dir: &Path) -> Result<()> {
                 println!("{n} belongs to {} (registered at block {})", v["owner"]["address"].as_str().unwrap_or_default(), v["registered_at"]);
                 // Expiry fields come with name renewals (DEC-11); older nodes don't report them.
                 if let Some(e) = v["expires_at"].as_u64() {
-                    println!("   expires at block {e}{}", v["grace_until"].as_u64().map(|g| format!(", renewable by its owner until block {g}")).unwrap_or_default());
+                    let when = status.as_ref().and_then(|s| about_date(e, s)).map(|d| format!(" (about {d})")).unwrap_or_default();
+                    println!("   expires at block {e}{when}{}", v["grace_until"].as_u64().map(|g| format!(", renewable by its owner until block {g}")).unwrap_or_default());
                 }
                 if let Some(to) = v["offered_to"]["address"].as_str() {
                     println!("   offered to {to}: theirs once they accept it (blockula name accept {n})");
                 }
+            }
+            if let (Some(price), Some(renewal)) = (v["price_display"].as_str(), v["renewal_price_display"].as_str()) {
+                println!("   {price} to register for a year, then {renewal} a year to renew; both paid to the treasury");
             }
             Ok(())
         }
@@ -894,7 +967,18 @@ pub fn stake(cmd: StakeCmd, dir: &Path) -> Result<()> {
             }
             Ok(())
         }
-        StakeCmd::Delegate { validator, amount, signer } => submit(dir, &signer, Action::Delegate { validator, amount: parse_fang(&amount)? }).map(|_| ()),
+        StakeCmd::Delegate { validator, amount, signer } => {
+            let amount = parse_fang(&amount)?;
+            // On mainnet, what staking risks, with the chain's own figures (OPERATOR-18).
+            rt()?.block_on(async {
+                let remote = signer.connect(dir).await?;
+                if remote.chain_id == crate::chain::MAINNET_CHAIN_ID {
+                    eprintln!("{}", crate::validator_cli::staking_notice(&remote).await?);
+                }
+                Ok::<_, anyhow::Error>(())
+            })?;
+            submit(dir, &signer, Action::Delegate { validator, amount }).map(|_| ())
+        }
         StakeCmd::Undelegate { validator, shares: Unbonding { amount: Some(amount), .. }, signer } => {
             let amount = parse_fang(&amount)?;
             if amount == 0 {
@@ -970,6 +1054,26 @@ mod tests {
         assert_eq!((from_validator.as_str(), to_validator.as_str(), signer.from), ("boo1v", "boo1w", None));
         let Ok(StakeCmd::Redelegate { from_validator, signer, .. }) = parse(&["redelegate", "boo1v", "boo1w", "--all", "--from", "vlad.boo"]) else { panic!("with --from") };
         assert_eq!((from_validator.as_str(), signer.from.as_deref()), ("boo1v", Some("vlad.boo")));
+    }
+
+    /// CRE-11: `name show` dates an expiry by the chain's block time; CONTRIB-3: a claim refused
+    /// for want of Soul says where to ask for a vouch.
+    #[test]
+    fn name_expiry_dates_and_the_vouch_hint() {
+        let status = serde_json::json!({ "height": 1000, "block_time_ms": 1000 });
+        let today = about_date(1000, &status).unwrap();
+        assert!(today.len() == 10 && today.starts_with("20"), "{today}");
+        let in_a_year = about_date(1000 + 365 * 86_400, &status).unwrap();
+        assert_eq!(in_a_year[..4].parse::<i32>().unwrap(), today[..4].parse::<i32>().unwrap() + 1, "{today} → {in_a_year}");
+        // Fixed points of the civil-date conversion: the epoch, a leap day, and the year 2100.
+        let far = serde_json::json!({ "height": 1_000_000_000u64, "block_time_ms": 1000 });
+        let at = |days: i64| about_date((1_000_000_000 + (days * 86_400_000 - crate::chain::now_ms() as i64).div_euclid(1000) + 1) as u64, &far).unwrap();
+        assert_eq!(at(19_782), "2024-02-29");
+        assert_eq!(at(47_541), "2100-03-01");
+        assert!(about_date(5, &serde_json::json!({ "height": 1 })).is_none(), "no block time, no date");
+        let hint = vouch_hint(anyhow!("claims need Soul or a vouch from someone with Soul")).to_string();
+        assert!(hint.contains(VOUCH_REQUEST_URL) && hint.contains("/api/souls"), "{hint}");
+        assert_eq!(vouch_hint(anyhow!("insufficient balance")).to_string(), "insufficient balance");
     }
 
     #[test]
