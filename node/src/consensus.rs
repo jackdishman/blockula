@@ -741,6 +741,12 @@ where
                 if stuck.contains(&tx.from) || included.contains(&tx.id()) {
                     continue;
                 }
+                // A nonce the parent's state already used (an executed tx the mempool hasn't shed
+                // yet, or another tx that took its nonce): it can never apply, and it holds none
+                // of its sender's later txs back (audit PERF-1).
+                if !tx.is_unsigned() && tx.nonce < state.account(&tx.from).nonce {
+                    continue;
+                }
                 let raw = tx.to_bytes();
                 let mut budget = ghost;
                 if raw.len() > tx.max_bytes() || bytes + raw.len() > limit || budget.take(tx, raw.len()).is_err() {
@@ -2165,6 +2171,58 @@ mod tests {
             assert!(verify(child(&v1_parent[0], 1, &[&gated]), v1_parent.clone()).await, "below the activation height");
             assert!(!verify(child(&v2_parent[0], v2, &[&gated]), v2_parent.clone()).await, "from it on");
             assert!(verify(child(&v2_parent[0], v2, &[&plain]), v2_parent).await);
+        });
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// Audit PERF-1: a proposal built while its parent is being written (executed in memory, the
+    /// chain lock free) takes each sender's next tx. The parent's own txs left the mempool with
+    /// the state, so they don't make their sender look stuck, and a queued tx whose nonce another
+    /// tx took is passed over without holding back its sender's later ones. The leader used to
+    /// propose an empty block here with a full mempool.
+    #[test]
+    fn proposals_in_the_write_window_take_the_next_nonces() {
+        let (home, mut c, seed) = home_at_zero("window");
+        let users: Vec<crate::crypto::Keys> = (1..=2u8).map(|i| crate::crypto::Keys::from_seed([i; 32])).collect();
+        for u in &users {
+            c.faucet(&u.address(), 100 * DROPS_PER_FANG).unwrap();
+        }
+        c.produce_block().unwrap();
+        let (e, me) = (c.height(), c.me().unwrap());
+        let transfer = |u: &crate::crypto::Keys, nonce: u64, amount: u64| {
+            let mut t = Tx { chain_id: "window".into(), genesis_hash: c.genesis_hash.clone(), from: u.address(), nonce, fee: 0, tip: 0, valid_until: e + 50, action: crate::types::Action::Transfer { to: me.clone(), amount }, memo: String::new(), public_key: hex::encode(u.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+            t.fee = crate::econ::max_fee(&c.state, t.size());
+            t.sign(u)
+        };
+        // users[0] queues nonces 0 and 1, and the parent includes the first. users[1] queues 0
+        // and 1 too, but the parent includes another tx with nonce 0 (one this node never saw).
+        let (a0, a1) = (transfer(&users[0], 0, 1), transfer(&users[0], 1, 2));
+        let (b0, b1, other) = (transfer(&users[1], 0, 3), transfer(&users[1], 1, 4), transfer(&users[1], 0, 5));
+        for t in [&a0, &a1, &b0, &b1] {
+            c.submit(t.clone()).unwrap();
+        }
+        let leader = PrivateKey::from_seed_bytes(seed).public_key();
+        let parent = CBlock::new(Digest(hex_32(c.last_hash())), e + 1, e + 1, e, 1_000, leader.address("boo"), e, hex_32(&c.root_at(e).unwrap()), vec![a0.to_bytes(), other.to_bytes()]);
+        let chain: Shared = Arc::new(Mutex::new(c));
+        deterministic::Runner::timed(Duration::from_secs(60)).start(|context| async move {
+            let mut app = App { chain: chain.clone(), block_time_ms: 1_000, address_prefix: "boo".into() };
+            let written = chain.lock().execute_begin(finalized_from(&parent, None)).unwrap();
+            {
+                let c = chain.lock();
+                assert_eq!(c.height(), e + 1);
+                assert!(!c.in_mempool(&a0.id()) && c.in_mempool(&a1.id()) && c.in_mempool(&b0.id()), "the parent's txs left; b0 waits for the post-block check");
+            }
+            let cctx = SimplexContext { round: Round::new(Epoch::zero(), View::new(e + 2)), leader: leader.clone(), parent: (View::new(e + 1), parent.digest()) };
+            let ancestry = marshal::ancestry::from_iter([Arc::new(parent.clone())]);
+            let block = Application::<deterministic::Context>::propose(&mut app, (context.child("propose"), cctx.clone()), ancestry, ()).await.expect("proposes");
+            let has = |t: &Tx| block.txs.contains(&t.to_bytes());
+            assert!(has(&a1) && has(&b1) && block.txs.len() == 2, "{} txs", block.txs.len());
+            assert_eq!(block.exec_height, e + 1, "it cites the parent's state");
+            chain.lock().execute_end(written).unwrap();
+            assert!(!chain.lock().in_mempool(&b0.id()), "dropped once the block is written");
+            // A valid block: it verifies on the parent.
+            let ancestry = marshal::ancestry::from_iter([Arc::new(block), Arc::new(parent)]);
+            assert!(Application::<deterministic::Context>::verify(&mut app, (context.child("verify"), cctx), ancestry).await);
         });
         std::fs::remove_dir_all(home).ok();
     }

@@ -88,10 +88,18 @@ fn submit_at(dir: &Path, s: &Signer, make: impl FnOnce(u64, u64) -> Result<Actio
 /// [`submit_at`] for an action that names the account it's signed for (`make(from, height,
 /// blocks_per_day)`): the same account the tx is `from`, never a second resolution of `--from`.
 fn submit_as(dir: &Path, s: &Signer, make: impl FnOnce(&str, u64, u64) -> Result<Action>) -> Result<Value> {
+    submit_noting(dir, s, None, make)
+}
+
+/// [`submit_as`], printing `mainnet_note` to stderr before it signs when the node is on mainnet.
+fn submit_noting(dir: &Path, s: &Signer, mainnet_note: Option<&str>, make: impl FnOnce(&str, u64, u64) -> Result<Action>) -> Result<Value> {
     let keys = s.keys(dir)?;
     let rt = rt()?;
     let tx = rt.block_on(async {
         let remote = s.connect(dir).await?;
+        if let Some(note) = mainnet_note.filter(|_| remote.chain_id == crate::chain::MAINNET_CHAIN_ID) {
+            eprintln!("ℹ️  {note}");
+        }
         let from = s.acting_for(&remote, &keys).await?;
         let day = remote.blocks_per_day().await?;
         crate::validator_cli::send_memo_with(&remote, &keys, &from, |height| make(&from, height, day), String::new()).await
@@ -140,7 +148,8 @@ pub enum HuntCmd {
         #[command(flatten)]
         rpc: Rpc,
     },
-    /// Put a bounty on a GitHub issue (escrowed from your account)
+    /// Put a bounty on a GitHub issue, escrowed from your account. You're its payer: only you can
+    /// award it, and the chain doesn't check the pull request
     Create {
         /// owner/name
         repo: String,
@@ -155,7 +164,8 @@ pub enum HuntCmd {
         #[command(flatten)]
         signer: Signer,
     },
-    /// Add FANG to an open hunt
+    /// Add FANG to an open hunt. It goes to whoever the hunt's creator awards it to; you can't take
+    /// it back, except through the creator's cancel after expiry or a governance refund
     Fund {
         id: u64,
         amount: String,
@@ -223,10 +233,13 @@ pub fn hunt(cmd: HuntCmd, dir: &Path) -> Result<()> {
             let amount = parse_fang(&amount)?;
             // The expiry counts `days` days of the genesis's blocks from the status the tx is
             // signed against, not a separate read or the node's block time (audit gap-7-3).
-            submit_at(dir, &signer, |height, day| Ok(Action::CreateHunt { repo, issue, amount, expires_at: height.saturating_add(days.saturating_mul(day)), title }))?;
+            submit_noting(dir, &signer, Some(HUNT_PAYER_NOTICE), |_, height, day| Ok(Action::CreateHunt { repo, issue, amount, expires_at: height.saturating_add(days.saturating_mul(day)), title }))?;
             Ok(())
         }
-        HuntCmd::Fund { id, amount, signer } => submit(dir, &signer, Action::FundHunt { hunt_id: id, amount: parse_fang(&amount)? }).map(|_| ()),
+        HuntCmd::Fund { id, amount, signer } => {
+            let amount = parse_fang(&amount)?;
+            submit_noting(dir, &signer, Some(HUNT_PAYER_NOTICE), |_, _, _| Ok(Action::FundHunt { hunt_id: id, amount })).map(|_| ())
+        }
         HuntCmd::Award { id, pr, to, familiar, skip_github, yes, signer } => award(dir, id, pr, to, familiar, skip_github, yes, &signer),
         HuntCmd::Cancel { id, signer } => submit(dir, &signer, Action::CancelHunt { hunt_id: id }).map(|_| ()),
     }
@@ -292,6 +305,7 @@ fn award(dir: &Path, id: u64, pr: u64, to: Option<String>, familiar: Option<Stri
             hit["key_id"].as_str().map(String::from)
         }
     };
+    hunt_payer_notice(dir, signer)?;
     confirm(&format!("Award {} (hunt #{id}, {repo}#{issue}) to {} ({recipient}) for PR #{pr}{why}?", h["amount_display"].as_str().unwrap_or_default(), name_of(&acct["account"])), yes)?;
     submit(dir, signer, Action::AwardHunt { hunt_id: id, to: recipient, pr, familiar_key })?;
     Ok(())
@@ -314,7 +328,9 @@ pub enum ContribCmd {
         #[command(flatten)]
         signer: Signer,
     },
-    /// Claim a merged PR (authored by your linked GitHub handle) for the contribution pool
+    /// Claim a merged PR (authored by your linked GitHub handle) for the contribution pool. It
+    /// first checks GitHub as validators will (merged, by your linked handle, your gist): the
+    /// bond is lost if they refute the claim
     Claim {
         /// owner/name (must be in the pool)
         repo: String,
@@ -322,6 +338,9 @@ pub enum ContribCmd {
         /// Credit one of your Familiars (its key id)
         #[arg(long)]
         familiar: Option<String>,
+        /// Don't check GitHub before bonding
+        #[arg(long)]
+        skip_github: bool,
         #[command(flatten)]
         signer: Signer,
     },
@@ -529,12 +548,22 @@ pub fn contrib(cmd: ContribCmd, dir: &Path) -> Result<()> {
             Ok(())
         }
         ContribCmd::LinkGithub { handle, gist_id, signer } => {
+            // Hunt awards use the link too, so a pool without repositories is only said.
+            if !rt()?.block_on(pool_open(&signer.rpc))? {
+                eprintln!("ℹ️  {POOL_CLOSED_LINK}");
+            }
             submit(dir, &signer, Action::LinkGithub { handle: handle.clone(), gist_id })?;
             let v = rt()?.block_on(get(&signer.rpc, &format!("/github/{handle}")))?;
             println!("  {}: {}", if v["verified"] == true { "✓ verified" } else { "⚠️  not verified yet" }, v["reason"].as_str().unwrap_or_default());
             Ok(())
         }
-        ContribCmd::Claim { repo, pr, familiar, signer } => submit(dir, &signer, Action::SubmitClaim { repo, pr, familiar_key: familiar }).map(|_| ()),
+        ContribCmd::Claim { repo, pr, familiar, skip_github, signer } => {
+            refuse_if_pool_closed(&signer.rpc)?;
+            if !skip_github {
+                precheck_claim(dir, &signer, &repo, pr)?;
+            }
+            submit(dir, &signer, Action::SubmitClaim { repo, pr, familiar_key: familiar }).map(|_| ()).map_err(vouch_hint)
+        }
         ContribCmd::Claims { account, signer } => {
             let rt = rt()?;
             let who = match account.or(signer.from.clone()) {
@@ -551,13 +580,18 @@ pub fn contrib(cmd: ContribCmd, dir: &Path) -> Result<()> {
         }
         ContribCmd::Vouch { account, signer } => {
             let to = crate::cli_net::account_ref(&account)?;
+            refuse_if_pool_closed(&signer.rpc)?;
             submit(dir, &signer, Action::Vouch { account: to }).map(|_| ())
         }
         ContribCmd::Unvouch { account, signer } => {
             let to = crate::cli_net::account_ref(&account)?;
             submit(dir, &signer, Action::Unvouch { account: to }).map(|_| ())
         }
-        ContribCmd::JoinJury { bond, signer } => submit(dir, &signer, Action::JoinJury { bond: parse_fang(&bond)? }).map(|_| ()),
+        ContribCmd::JoinJury { bond, signer } => {
+            let bond = parse_fang(&bond)?;
+            refuse_if_pool_closed(&signer.rpc)?;
+            submit(dir, &signer, Action::JoinJury { bond }).map(|_| ())
+        }
         ContribCmd::LeaveJury { signer } => submit(dir, &signer, Action::LeaveJury {}).map(|_| ()),
         ContribCmd::Seance { id, signer } => {
             let rt = rt()?;
@@ -676,6 +710,102 @@ pub fn contrib(cmd: ContribCmd, dir: &Path) -> Result<()> {
     }
 }
 
+// ------------------------------------------------------------------------ Hunts and the pool (D7)
+//
+// The Hunts plan's CLI text: the payer notice is mainnet's; the rest is driven by the node's data, so
+// it's right on any chain. Keep it here (`hunt create` and `hunt fund` say who pays in their help).
+
+/// What `hunt create`, `hunt fund` and `hunt award` print on mainnet before they sign.
+pub const HUNT_PAYER_NOTICE: &str = "On mainnet you pay this with your own FANG. Payment for work may be taxable for the person you pay, and you must not pay anyone sanctioned or in a sanctioned region (CONTRIBUTOR-TERMS.md, provisional and under counsel review).";
+
+/// Why `contrib claim`, `vouch` and `join-jury` refuse on a chain whose pool has no repositories.
+pub const POOL_CLOSED: &str = "This chain's contribution pool has no repositories yet, so there's nothing to claim. Nothing was signed.";
+
+/// What `contrib link-github` says there instead: the link still lets a Hunt's creator pay you.
+pub const POOL_CLOSED_LINK: &str = "This chain's contribution pool has no repositories yet, so there's nothing to claim. The link still lets a Hunt's creator pay you by your GitHub handle.";
+
+/// Prints [`HUNT_PAYER_NOTICE`] when `signer`'s node is on mainnet (`hunt award`, before it asks;
+/// `hunt create` and `fund` print it as they sign, [`submit_noting`]).
+fn hunt_payer_notice(dir: &Path, signer: &Signer) -> Result<()> {
+    rt()?.block_on(async {
+        if signer.connect(dir).await?.chain_id == crate::chain::MAINNET_CHAIN_ID {
+            eprintln!("ℹ️  {HUNT_PAYER_NOTICE}");
+        }
+        Ok(())
+    })
+}
+
+/// Whether the pool `/api/contributions` describes has a repository to claim for.
+fn has_repos(contributions: &Value) -> bool {
+    contributions["repos"].as_array().is_some_and(|r| !r.is_empty())
+}
+
+/// Whether the pool of the chain at `rpc` has a repository.
+async fn pool_open(rpc: &str) -> Result<bool> {
+    Ok(has_repos(&get(rpc, "/contributions").await?))
+}
+
+/// Refuses, before anything is signed, when the pool of the chain at `rpc` has no repositories.
+fn refuse_if_pool_closed(rpc: &str) -> Result<()> {
+    ensure!(rt()?.block_on(pool_open(rpc))?, "{POOL_CLOSED}");
+    Ok(())
+}
+
+/// Where a newcomer asks for a vouch (the issue form `.github/ISSUE_TEMPLATE/vouch-request.yml`).
+pub const VOUCH_REQUEST_URL: &str = "https://github.com/jackdishman/blockula/issues/new?template=vouch-request.yml";
+
+/// A refusal for want of Soul or a vouch, with where to ask for one (CONTRIB-3).
+fn vouch_hint(e: anyhow::Error) -> anyhow::Error {
+    if e.to_string().contains("Soul or a vouch") {
+        anyhow!("{e:#}. Ask someone with Soul to vouch for you: request one at {VOUCH_REQUEST_URL} (who has Soul: GET /api/souls on any node)")
+    } else {
+        e
+    }
+}
+
+/// Checks a claim on GitHub the way validators will ([`crate::github::check_claim`]) before it's
+/// bonded: validators refute a PR that isn't merged into the repo's default branch, isn't by the
+/// claimant's linked handle, or a link whose gist doesn't name the claimant, and the bond is lost
+/// (CONTRIB-4). Refuses with the reason; nothing is signed.
+fn precheck_claim(dir: &Path, signer: &Signer, repo: &str, pr: u64) -> Result<()> {
+    use crate::github::Verdict;
+    let keys = signer.keys(dir)?;
+    rt()?.block_on(async {
+        let remote = signer.connect(dir).await?;
+        let me = signer.acting_for(&remote, &keys).await?;
+        let acct = get(&remote.rpc, &format!("/account/{me}")).await?;
+        let (Some(handle), Some(gist)) = (acct["github"]["handle"].as_str(), acct["github"]["gist_id"].as_str()) else {
+            bail!("{me} hasn't linked a GitHub handle: run `blockula contrib link-github <handle> <gist id>` first. Nothing was signed");
+        };
+        let skip = "Pass --skip-github to claim anyway";
+        match crate::github::check_claim(handle, repo, pr, &me, gist).await {
+            Ok(Verdict::Confirmed { .. }) => Ok(()),
+            Ok(Verdict::Refuted(why)) => bail!("validators would refute this claim ({why}), and its bond would be lost. Nothing was signed. {skip}"),
+            Ok(Verdict::Wait) => bail!("{repo}#{pr} isn't merged yet: claim it once it is. Nothing was signed. {skip}"),
+            Err(e) => bail!("couldn't check {repo}#{pr} on GitHub ({e:#}; set GITHUB_TOKEN if rate limited). Nothing was signed. {skip}"),
+        }
+    })
+}
+
+/// About when block `height` comes, by the chain's block time from the node's `status` (its
+/// height then): a UTC date, for display.
+fn about_date(height: u64, status: &Value) -> Option<String> {
+    let (now, block_ms) = (status["height"].as_u64()?, status["block_time_ms"].as_u64()?);
+    let ms = crate::chain::now_ms() as i128 + (height as i128 - now as i128) * block_ms as i128;
+    let days = ms.div_euclid(86_400_000) as i64;
+    // Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    Some(format!("{y:04}-{m:02}-{d:02}"))
+}
+
 // ------------------------------------------------------------------------------------- names
 
 #[derive(Subcommand)]
@@ -686,7 +816,8 @@ pub enum NameCmd {
         #[command(flatten)]
         rpc: Rpc,
     },
-    /// Extend a name you own (1–10 years, paid at the renewal price per year, burned)
+    /// Extend a name you own (1–10 years at the renewal price per year, paid to the treasury, not
+    /// burned)
     Renew {
         name: String,
         #[arg(long, default_value = "1")]
@@ -731,7 +862,10 @@ pub enum NameCmd {
 pub fn name(cmd: NameCmd, dir: &Path) -> Result<()> {
     match cmd {
         NameCmd::Show { name, rpc } => {
-            let v = rt()?.block_on(get(&rpc.rpc, &format!("/name/{name}")))?;
+            let rt = rt()?;
+            let v = rt.block_on(get(&rpc.rpc, &format!("/name/{name}")))?;
+            // For the dates: the node's height and block time (display only).
+            let status = rt.block_on(get(&rpc.rpc, "/status")).ok();
             let n = v["name"].as_str().unwrap_or_default();
             if v["available"] == true {
                 println!("{n} is available for {}", v["price_display"].as_str().unwrap_or_default());
@@ -739,11 +873,15 @@ pub fn name(cmd: NameCmd, dir: &Path) -> Result<()> {
                 println!("{n} belongs to {} (registered at block {})", v["owner"]["address"].as_str().unwrap_or_default(), v["registered_at"]);
                 // Expiry fields come with name renewals (DEC-11); older nodes don't report them.
                 if let Some(e) = v["expires_at"].as_u64() {
-                    println!("   expires at block {e}{}", v["grace_until"].as_u64().map(|g| format!(", renewable by its owner until block {g}")).unwrap_or_default());
+                    let when = status.as_ref().and_then(|s| about_date(e, s)).map(|d| format!(" (about {d})")).unwrap_or_default();
+                    println!("   expires at block {e}{when}{}", v["grace_until"].as_u64().map(|g| format!(", renewable by its owner until block {g}")).unwrap_or_default());
                 }
                 if let Some(to) = v["offered_to"]["address"].as_str() {
                     println!("   offered to {to}: theirs once they accept it (blockula name accept {n})");
                 }
+            }
+            if let (Some(price), Some(renewal)) = (v["price_display"].as_str(), v["renewal_price_display"].as_str()) {
+                println!("   {price} to register for a year, then {renewal} a year to renew; both paid to the treasury");
             }
             Ok(())
         }
@@ -894,7 +1032,18 @@ pub fn stake(cmd: StakeCmd, dir: &Path) -> Result<()> {
             }
             Ok(())
         }
-        StakeCmd::Delegate { validator, amount, signer } => submit(dir, &signer, Action::Delegate { validator, amount: parse_fang(&amount)? }).map(|_| ()),
+        StakeCmd::Delegate { validator, amount, signer } => {
+            let amount = parse_fang(&amount)?;
+            // On mainnet, what staking risks, with the chain's own figures (OPERATOR-18).
+            rt()?.block_on(async {
+                let remote = signer.connect(dir).await?;
+                if remote.chain_id == crate::chain::MAINNET_CHAIN_ID {
+                    eprintln!("{}", crate::validator_cli::staking_notice(&remote).await?);
+                }
+                Ok::<_, anyhow::Error>(())
+            })?;
+            submit(dir, &signer, Action::Delegate { validator, amount }).map(|_| ())
+        }
         StakeCmd::Undelegate { validator, shares: Unbonding { amount: Some(amount), .. }, signer } => {
             let amount = parse_fang(&amount)?;
             if amount == 0 {
@@ -970,6 +1119,56 @@ mod tests {
         assert_eq!((from_validator.as_str(), to_validator.as_str(), signer.from), ("boo1v", "boo1w", None));
         let Ok(StakeCmd::Redelegate { from_validator, signer, .. }) = parse(&["redelegate", "boo1v", "boo1w", "--all", "--from", "vlad.boo"]) else { panic!("with --from") };
         assert_eq!((from_validator.as_str(), signer.from.as_deref()), ("boo1v", Some("vlad.boo")));
+    }
+
+    /// CRE-11: `name show` dates an expiry by the chain's block time; CONTRIB-3: a claim refused
+    /// for want of Soul says where to ask for a vouch.
+    #[test]
+    fn name_expiry_dates_and_the_vouch_hint() {
+        let status = serde_json::json!({ "height": 1000, "block_time_ms": 1000 });
+        let today = about_date(1000, &status).unwrap();
+        assert!(today.len() == 10 && today.starts_with("20"), "{today}");
+        let in_a_year = about_date(1000 + 365 * 86_400, &status).unwrap();
+        assert_eq!(in_a_year[..4].parse::<i32>().unwrap(), today[..4].parse::<i32>().unwrap() + 1, "{today} → {in_a_year}");
+        // Fixed points of the civil-date conversion: the epoch, a leap day, and the year 2100.
+        let far = serde_json::json!({ "height": 1_000_000_000u64, "block_time_ms": 1000 });
+        let at = |days: i64| about_date((1_000_000_000 + (days * 86_400_000 - crate::chain::now_ms() as i64).div_euclid(1000) + 1) as u64, &far).unwrap();
+        assert_eq!(at(19_782), "2024-02-29");
+        assert_eq!(at(47_541), "2100-03-01");
+        assert!(about_date(5, &serde_json::json!({ "height": 1 })).is_none(), "no block time, no date");
+        let hint = vouch_hint(anyhow!("claims need Soul or a vouch from someone with Soul")).to_string();
+        assert!(hint.contains(VOUCH_REQUEST_URL) && hint.contains("/api/souls"), "{hint}");
+        assert_eq!(vouch_hint(anyhow!("insufficient balance")).to_string(), "insufficient balance");
+    }
+
+    /// D7: claims, vouches and jury seats are refused before signing on a chain whose pool has no
+    /// repositories (blockula-1 at launch); the mainnet payer notice says who pays and what to check.
+    #[test]
+    fn a_pool_without_repositories_is_refused_and_the_payer_notice_says_who_pays() {
+        assert!(!has_repos(&serde_json::json!({ "repos": [] })));
+        assert!(!has_repos(&serde_json::json!({})), "a node that doesn't report repos has none to claim for");
+        assert!(has_repos(&serde_json::json!({ "repos": [{ "repo": "jackdishman/blockula", "weight": 10 }] })));
+        assert!(POOL_CLOSED.ends_with("Nothing was signed.") && POOL_CLOSED_LINK.contains("Hunt's creator"));
+        for want in ["your own FANG", "taxable", "sanctioned", "CONTRIBUTOR-TERMS.md"] {
+            assert!(HUNT_PAYER_NOTICE.contains(want), "{want}");
+        }
+        // Against a node: refused with no repositories, let through with one. The node runs on a
+        // thread of its own, since the CLI's runtime only runs while a command waits on it.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async move {
+                use axum::{routing::get, Json, Router};
+                let app = Router::new()
+                    .route("/closed/api/contributions", get(|| async { Json(serde_json::json!({ "repos": [] })) }))
+                    .route("/open/api/contributions", get(|| async { Json(serde_json::json!({ "repos": [{ "repo": "o/r", "weight": 1 }] })) }));
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                tx.send(listener.local_addr().unwrap()).unwrap();
+                axum::serve(listener, app).await.unwrap();
+            })
+        });
+        let rpc = format!("http://{}", rx.recv().unwrap());
+        assert_eq!(refuse_if_pool_closed(&format!("{rpc}/closed")).unwrap_err().to_string(), POOL_CLOSED);
+        refuse_if_pool_closed(&format!("{rpc}/open")).unwrap();
     }
 
     #[test]
