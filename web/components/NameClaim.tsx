@@ -2,12 +2,15 @@
 
 import { parseFang } from "@blockula/sdk";
 import { useEffect, useState } from "react";
+import "@/app/onboarding.css";
 import { friendly } from "@/lib/errors";
-import type { NameView } from "@/lib/types";
+import type { NameDetail } from "@/lib/explorer/types";
+import { blocksToHuman } from "@/lib/format";
+import { SAFETY } from "@/lib/onboarding-copy";
 import { useUnlocked } from "@/lib/wallet";
 import { ErrorNote, Spinner } from "./ui";
 
-type Check = { state: "idle" } | { state: "checking" } | { state: "ok"; view: NameView } | { state: "bad"; msg: string };
+type Check = { state: "idle" } | { state: "checking" } | { state: "ok"; view: NameDetail } | { state: "bad"; msg: string };
 
 const clean = (s: string) => s.trim().toLowerCase().replace(/\.boo$/, "");
 
@@ -18,7 +21,7 @@ export function epitaph(name: string) {
 }
 
 export function NameClaim({ onClaimed, onName, suggestion = "" }: { onClaimed: (name: string) => void; onName?: (name: string) => void; suggestion?: string }) {
-  const { client, wallet, account, refresh } = useUnlocked();
+  const { client, wallet, account, status, refresh } = useUnlocked();
   const [input, setInput] = useState(suggestion);
   const [check, setCheck] = useState<Check>({ state: "idle" });
   const [busy, setBusy] = useState(false);
@@ -33,7 +36,7 @@ export function NameClaim({ onClaimed, onName, suggestion = "" }: { onClaimed: (
     let live = true;
     const t = setTimeout(async () => {
       try {
-        const view = (await client.name(n)) as NameView;
+        const view = (await client.name(n)) as NameDetail;
         if (live) setCheck({ state: "ok", view });
       } catch (e) {
         if (live) setCheck({ state: "bad", msg: friendly(e) });
@@ -49,6 +52,11 @@ export function NameClaim({ onClaimed, onName, suggestion = "" }: { onClaimed: (
   const balance = BigInt(account?.balance ?? "0");
   // Price plus a generous allowance for the (tiny, size-based) network fee.
   const short = view?.available && view.price ? balance < BigInt(view.price) + parseFang("0.001") : false;
+  // A year and the grace period, as the node counts them (registration_blocks, grace_blocks).
+  const bt = status?.block_time_ms ?? 1000;
+  const days = view?.registration_blocks ? (view.registration_blocks * bt) / 86_400_000 : 365;
+  const term = Math.abs(days - 365.25) < 2 || !view?.registration_blocks ? "one year" : blocksToHuman(view.registration_blocks, bt);
+  const grace = view?.grace_blocks ? blocksToHuman(view.grace_blocks, bt) : null;
 
   const claim = async () => {
     setBusy(true);
@@ -87,9 +95,19 @@ export function NameClaim({ onClaimed, onName, suggestion = "" }: { onClaimed: (
           </span>
         )}
       </div>
-      {short && view?.price && <p className="warn">You need {view.price_display} plus a tiny fee. Grab test FANG from the faucet first.</p>}
-      <p className="dim small">
-        Shorter names cost more: 3 letters 100 FANG, 4 letters 25, 5+ letters 5. The payment goes to the community treasury.
+      {short && view?.price && (
+        <p className="warn">
+          You need {view.price_display} plus a small fee.{status?.faucet ? " Grab test FANG from the faucet first." : ""}
+        </p>
+      )}
+      {/* Prices are governance parameters: always the node's answer for this name, never a table. */}
+      <p className="dim small" data-testid="name-price">
+        {view?.price_display
+          ? SAFETY.namePrice(view.price_display, term, view.renewal_price_display ?? "the renewal price")
+          : "Shorter names cost more. Type one to see its price."}
+      </p>
+      <p className="onb-terms" data-testid="name-terms">
+        {SAFETY.nameTerms(grace)}
       </p>
       <button className="btn primary" disabled={!view?.available || busy || short} onClick={claim}>
         {busy ? <Spinner>Claiming…</Spinner> : view?.available ? `Claim ${view.name}` : "Claim name"}
