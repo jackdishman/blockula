@@ -77,7 +77,8 @@ mainnet as soon as they're ready** (D2): the consensus formats frozen, the audit
 open critical or high finding, and at least 8 weeks of adversarial testing on testnet-2. If that
 comes before mainnet's genesis, they're on from block 1. Otherwise the mainnet binary carries
 them switched off, and the council proposes `ActivateFeature { programs }` the day the last gate
-closes, which takes effect about 9 days later. **The audit is
+closes, which takes effect about 9 days later. (`blockula-1`'s binary allows neither under v2: it
+switches them on only from protocol v3, 14.3.) **The audit is
 Claude's, run with Fable agents, not an external firm's** (D3, section 13), so programs are
 described as "reviewed by AI agents, not externally audited". The training wheels matter more
 for it. [PROGRAMS-PLAN.md](PROGRAMS-PLAN.md) puts readiness about mid-August 2027.
@@ -2457,7 +2458,8 @@ on a v1 binary. `/api/params` gains a `programs` section.
 - **Mainnet: live as soon as they're ready (D2).** Ready means three gates: the consensus formats
   are frozen (PROGRAMS-PLAN.md M6), the audit has closed with no open critical or high finding
   (section 13), and testnet-2 has run programs for at least 8 weeks (16.1). The mainnet binary
-  carries v2, and its genesis starts at v2 (a schedule entry at height 0), with `programs`:
+  carries v2, and its genesis starts at v2 (a schedule entry at height 1), with `programs` (on
+  `blockula-1`, neither under v2: below):
   - **on** (`features = ["programs"]`) if every gate closes before the genesis ceremony. Today
     the chain refuses Ghost Mode in `blockula-1`'s genesis (`chain.rs:516`); programs get no such
     refusal once their gates have closed, and the genesis builder checks that the audit report
@@ -2467,13 +2469,21 @@ on a v1 binary. `/api/params` gains a `programs` section.
     bootstrap council can pass it only in mainnet's first year (`bootstrap_end_height`); after
     that it takes the ⅔ token vote.
 
+  `blockula-1` takes neither path under v2, and its binary holds it to that: its genesis can't
+  list `programs` (`Genesis::check`, as for Ghost Mode), and its governance switches them on only
+  from protocol v3 (`upgrade::check_may_activate`, `MAINNET_PROGRAMS_ACTIVATION_VERSION`), the
+  version that ships what their audit asks for. Once the gates close, turning them on there takes
+  a release that supports v3, the council's `ScheduleUpgrade { version: 3 }`, and then an
+  `ActivateFeature { programs }` that runs where v3 is in force. Other chains keep both paths
+  under v2.
+
   If the format freeze lands after mainnet's own (MAINNET.md phase 1), mainnet launches at v1 and
   programs arrive as the same v2 upgrade testnet-2 rehearsed.
 - **Which one happens depends on mainnet's date, not on programs.** Programs aren't a mainnet
   launch gate (LAUNCH-PLAN.md). The plan's calendar (PROGRAMS-PLAN.md section 10) has the formats
   frozen about May 2027, testnet-2's activation in June and readiness about mid-August 2027. A
   genesis after that has them on from block 1; an earlier one launches with them off, and the
-  council switches them on once they're ready.
+  council switches them on once they're ready (on `blockula-1`, through v3: above).
 
 ### 14.4 The v1 → v2 transition
 

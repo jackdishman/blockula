@@ -704,6 +704,8 @@ mod tests {
             // hashes/time and inter-checkpoint spacing, or the released node refuses to start.
             Trust::new(&g, &Pins::default(), false).unwrap_or_else(|err| panic!("genesis/{chain}/ cannot start with its embedded checkpoints: {err:#}"));
             if e.path().join("spec.toml").exists() {
+                // `blockula-1`'s spec builds strict: every finding its set breaks must be waived
+                // on record in it, and every waiver must still match one, or this fails.
                 let built = crate::genesis_builder::build(&e.path().join("spec.toml"), false).unwrap();
                 assert_eq!(built.json, std::fs::read_to_string(&path).unwrap(), "genesis/{chain}/spec.toml doesn't rebuild genesis.json");
             }

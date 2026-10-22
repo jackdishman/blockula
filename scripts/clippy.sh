@@ -7,6 +7,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 manifest=node/Cargo.toml
+# The programs engine is its own workspace (node/vm/Cargo.toml), linted with every feature on so
+# the wasmi 0.38 oracle's backend is too. Its clippy.toml also refuses hash-ordered collections.
+vm=(--manifest-path node/vm/Cargo.toml --all-targets --all-features)
 
 blocking=(
   -A clippy::all
@@ -20,10 +23,12 @@ blocking=(
 
 if [ "${1:-}" != --report ]; then
   cargo clippy --locked --manifest-path "$manifest" --all-targets -- "${blocking[@]}"
+  cargo clippy --locked "${vm[@]}" -- "${blocking[@]}"
 fi
 
 # Everything else clippy warns about by default, deduplicated across the bin and test targets.
-report=$(cargo clippy --locked --manifest-path "$manifest" --all-targets --message-format=json 2>/dev/null \
+report=$( { cargo clippy --locked --manifest-path "$manifest" --all-targets --message-format=json 2>/dev/null
+            cargo clippy --locked "${vm[@]}" --message-format=json 2>/dev/null; } \
   | jq -r 'select(.reason == "compiler-message" and .message.level == "warning" and .message.code != null)
            | "\(.message.code.code) \(.message.spans[0].file_name):\(.message.spans[0].line_start)"' | sort -u)
 count=$(printf '%s' "$report" | grep -c . || true)

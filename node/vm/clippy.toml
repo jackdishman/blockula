@@ -1,0 +1,5 @@
+# Determinism (docs/PROGRAMS.md 4.3): no hash-ordered collections anywhere in execution.
+disallowed-types = [
+  { path = "std::collections::HashMap", reason = "iteration order isn't deterministic: use BTreeMap" },
+  { path = "std::collections::HashSet", reason = "iteration order isn't deterministic: use BTreeSet" },
+]

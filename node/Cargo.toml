@@ -137,7 +137,7 @@ test-release-key = []
 # `cargo build` still act on `blockula` alone.
 [workspace]
 members = ["vendor/commonware-stream"]
-exclude = ["fuzz", "ghost"]
+exclude = ["fuzz", "ghost", "vm"]
 
 # p2p key exchange: hybrid X25519 + ML-KEM-768 instead of X25519 alone (docs/PQ-TRANSPORT.md).
 [patch.crates-io]

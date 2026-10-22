@@ -83,7 +83,9 @@ while IFS= read -r crate; do
   done
   [ $hit = 1 ] || bad "$crate is pinned with = but isn't in dependabot.yml's consensus-and-crypto group"
 done < <( {
-  for m in node/Cargo.toml node/ghost/Cargo.toml; do
+  # The node, the Ghost Mode core, and the programs engine with its test guests (each its own
+  # workspace and lockfile).
+  for m in node/Cargo.toml node/ghost/Cargo.toml node/vm/Cargo.toml node/vm/guests/Cargo.toml node/vm/guests/*/Cargo.toml; do
     sed -nE 's/^([a-z0-9_-]+) *= *(\{ *version *= *)?"=[^"]+".*/\1/p' "$m"
   done
   # Table-form pins: `[dependencies.NAME]` followed by `version = "=…"`.

@@ -143,7 +143,7 @@ impl T {
         let hash = format!("block-{}", self.h);
         let proposer = addr(VALIDATORS[0]);
         let tx_bytes = std::mem::take(&mut self.tx_bytes);
-        self.st.end_block(&BlockInfo { height: self.h, version: crate::upgrade::version_at(&self.st, self.h), hash: &hash, proposer: &proposer, view: self.h, parent_view: self.h - 1, skipped: &[], tx_bytes });
+        self.st.end_block(&BlockInfo { chain_id: CHAIN, height: self.h, version: crate::upgrade::version_at(&self.st, self.h), hash: &hash, proposer: &proposer, view: self.h, parent_view: self.h - 1, skipped: &[], tx_bytes });
         self.st.commit_block().unwrap();
         self.st.debug_check(self.h);
         self.h += 1;
@@ -552,6 +552,26 @@ fn the_bootstrap_council_passes_proposals_until_the_bootstrap_ends() {
     let i = t.propose(ALICE, text());
     t.vote(v1, i, true, 1, 0).unwrap();
     assert!(t.p(i).council.is_empty(), "votes after the bootstrap aren't council votes");
+}
+
+/// Off `blockula-1` (here a v1 chain) a validator's council seat holds the latest vote from its
+/// consensus key's account or its owner's, whichever came last, as it always has: the owner's
+/// precedence is `blockula-1`'s alone (`owner_outranks_key`; `genesis_builder::mainnet_tests`
+/// has that side, and the same launch on a v2 dry-run chain keeping this rule).
+#[test]
+fn off_mainnet_the_latest_vote_holds_a_validators_seat() {
+    let mut t = T::new(&[("bootstrap_end_height", 1_000)]);
+    let v3 = VALIDATORS[2];
+    let seat = |t: &T, id: u64| t.p(id).council.get(&addr(v3)).map(|c| (c.aye, c.voter.clone()));
+    let id = t.propose(ALICE, text());
+    t.vote(OWNER, id, false, 1, 0).unwrap();
+    assert_eq!(seat(&t, id), Some((false, addr(OWNER))));
+    t.vote(v3, id, true, 1, 0).unwrap();
+    assert_eq!(seat(&t, id), Some((true, addr(v3))), "the consensus key's account replaced the owner's vote");
+    assert_eq!(t.st.governance.votes[&IdKey::new(id, &addr(v3))].council, Some(addr(v3)));
+    t.vote(OWNER, id, false, 1, 0).unwrap();
+    assert_eq!(seat(&t, id), Some((false, addr(OWNER))), "and the owner's replaced it back");
+    t.next();
 }
 
 /// Audit F15, F16: governance's own safety parameters change only by a token supermajority, never
@@ -1460,6 +1480,44 @@ fn proposals_are_checked_when_they_are_made() {
     for action in [Action::Propose { kind: text(), deposit: 50 * FANG, title: "x".into(), url: String::new() }, Action::Vote { proposal_id: id, aye: true, amount: FANG, conviction: 0, proposal_digest: t.digest(id) }, Action::Unlock {}] {
         assert!(t.tx_as(&agent, &addr(ALICE), action).unwrap_err().to_string().contains("session keys can only"));
     }
+}
+
+/// Programs are a feature from v2 (`upgrade::known_features`), and a proposal to switch a feature
+/// on or off is checked against the version in force at its own block. On a chain at v1,
+/// `ActivateFeature { programs }` and `DeactivateFeature { programs }` are refused when they're
+/// proposed, in the words of a binary without v2, and they stay refused while v2 is only
+/// scheduled, even in a block whose proposals would run after it activates: until then every node
+/// runs the chain's blocks under v1, nodes whose binary doesn't have v2 included (they halt only at
+/// the activation height), and each must reach the same outcome. From the activation height on it
+/// may be proposed, and it runs a vote and a timelock later.
+#[test]
+fn programs_switch_on_only_once_v2_is_in_force() {
+    let programs = || ProposalKind::ActivateFeature { feature: crate::upgrade::PROGRAMS_FEATURE.into() };
+    let off = || ProposalKind::DeactivateFeature { feature: crate::upgrade::PROGRAMS_FEATURE.into() };
+    // What a binary without v2 reports (its feature list is `["ghost"]`), word for word.
+    let v1 = "unknown feature programs (known: ghost)";
+    let v2 = crate::upgrade::PROGRAMS_VERSION;
+    let mut t = T::new(&[]);
+    let lag = t.st.chain_params.voting_blocks + t.st.chain_params.timelock_blocks;
+    for kind in [programs(), off()] {
+        assert_eq!(t.err(ALICE, Action::Propose { kind, deposit: 50 * FANG, title: "x".into(), url: String::new() }), v1);
+    }
+    let a = schedule_v(&mut t, v2);
+    // Scheduled, not in force: refused in the block whose proposals would run at the activation
+    // height, and in the last block before it.
+    t.through(a - lag - 1);
+    refused_upgrade(&mut t, ALICE, programs(), v1);
+    t.through(a - 2);
+    assert_eq!(crate::upgrade::version_at(&t.st, t.h), crate::consensus::PROTOCOL_VERSION);
+    refused_upgrade(&mut t, ALICE, programs(), v1);
+    refused_upgrade(&mut t, ALICE, off(), v1);
+    // In force: proposed at the activation height, it runs a vote and a timelock later.
+    t.through(a - 1);
+    assert_eq!((t.h, crate::upgrade::version_at(&t.st, t.h)), (a, v2));
+    let on = pass_by(&mut t, ALICE, ALICE, programs());
+    t.finish(on);
+    assert_eq!(t.p(on).status, ProposalStatus::Executed, "{}", t.p(on).outcome);
+    assert_eq!(t.st.upgrade.features.get(crate::upgrade::PROGRAMS_FEATURE), Some(&crate::upgrade::Feature { activated_at: a + lag }));
 }
 
 #[test]

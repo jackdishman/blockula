@@ -1,4 +1,5 @@
-# Example genesis spec: the DEC-5 allocation (docs/TOKENOMICS.md) on a throwaway chain.
+# Example genesis spec: blockula-1's experimental launch shape, with the DEC-5 allocation
+# (docs/TOKENOMICS.md), on a throwaway chain.
 #
 #   blockula genesis build --spec deploy/mainnet/genesis-spec.example.toml --out genesis.json
 #
@@ -7,10 +8,13 @@
 # the same spec and binary. Addresses marked PLACEHOLDER are keyless stand-ins that the ceremony
 # replaces with the recipients' real accounts; the operators (operators/*.toml) use throwaway keys.
 #
-# With 4 operators this dry run breaks the mainnet policy on purpose, so the build prints
-# warnings: fewer than 22 operators (DEC-3), the founder's two seats share a provider and an ASN
-# (Fly regions count as one failure domain), and with fewer than 7 operators any facility holds
-# more than 15% of the set (DEC-14). `strict = true` (always on for blockula-1) refuses them.
+# The experimental launch: the founder's four validators on Fly.io, born at protocol v2 with
+# programs off, and governance live from block 1. The set breaks the independence policy on
+# purpose (DEC-3: at least 22 operators; DEC-14: hosting, country and facility caps, one seat per
+# entity), so the spec waives each rule it breaks, with its reason, on record ([[waiver]] at the
+# end). `strict = true` (always on for blockula-1) refuses any finding the spec doesn't waive, and
+# a waiver that matches no finding. The build prints every finding it waives:
+#   WAIVED: <rule>: <finding> (<reason>)
 
 chain_id = "blockula-dryrun-1"
 address_prefix = "tboo"
@@ -22,8 +26,19 @@ faucet = false
 validator_admins = []
 # FANG. The allocations below must add up to exactly this.
 total_supply = "1000000000"
-strict = false
+strict = true
 
+# Blocks run protocol v2 from block 1 (blockula-1 is born at v2): v1 plus programs v0, dormant
+# until the `programs` feature is on.
+protocol_version = 2
+
+# The founder's validators: not flagged `founder_or_foundation` (a flagged seat that leaves a set
+# this small could never rejoin it), each owned by its own operators-bucket account, commission 0,
+# and disclosed as founder-run. The bootstrap delegation backs them, so [params] caps the
+# commission it pays at 0 (bootstrap_commission_cap_bps, below). An
+# outside operator ready by the ceremony adds its file and an operators-bucket allocation for its
+# owner (the security grants shrink by as much); others join on stake after launch. Five or six
+# validators tolerate no more faults than four (one); seven tolerate two.
 operators = [
   "operators/example-1.toml",
   "operators/example-2.toml",
@@ -34,18 +49,48 @@ operators = [
 # Names nobody can register (DEC-11); governance may assign them later.
 reserved_names = ["blockula", "boo", "foundation", "treasury", "community", "validator", "admin", "support", "security", "official"]
 
-# Features on from genesis. Ghost Mode ships off (DEC-2).
+# Features on from genesis. Programs stay off: blockula-1's genesis can't list them on this
+# release, and its governance switches them on only from protocol v3 (an ActivateFeature that runs
+# under v3 or later), the version that ships what their audit asks for. Ghost Mode ships off
+# (DEC-2), and blockula-1 refuses to switch it on until it's audited.
 features = []
+
+# Liquid FANG for each genesis validator's consensus-key account, out of the operators bucket
+# (the security grants below are 4 × 100 FANG smaller): every other allocation to an account with
+# a key vests, and unvested tokens neither vote nor pay a proposal deposit, so without it nobody
+# could propose or vote until the operators' 6-month cliff. The bootstrap council (the genesis
+# validators) votes from these accounts, signed by the consensus keys. At most 1000 FANG each; on
+# blockula-1 the only liquid allocations.
+operator_float = "100"
 
 # Governance parameters (node/src/params.rs) that differ from their defaults, as numbers or
 # strings. The defaults are mainnet's: 31 validators, 2 MiB blocks, 6% issuance falling 15% a year
 # to 1.5%, a 0.1 FANG account creation fee, one-year names…
 [params]
-# max_validators = 31
+# 10 FANG proposals (the floor is 1 FANG), so the floats pay deposits.
+proposal_deposit = "10000000000"
+# Governance at mainnet's floors: 3-day votes, a 1-day timelock.
+voting_blocks = 259200
+timelock_blocks = 86400
+# The bootstrap council for 730 days (a vote can only shorten it).
+bootstrap_end_height = 63072000
+# Downtime sized for 4 validators: jailed after missing 600 of its last 1200 leader slots
+# (the default 50 of 100 jails one of four after about 3 minutes away).
+downtime_window = 1200
+downtime_max_missed = 600
+# The bootstrap delegation backs the founder's seats (unflagged, above), and an owner may raise
+# its commission without a vote (UpdateValidator, 1% an epoch). At 0 the delegation pays no
+# commission whatever a validator charges, so all of its rewards go to the treasury (DEC-5); at
+# the default 10% the founder's owners could take about 4M FANG of them in year 1. Outside
+# operators get none on it either, until token holders raise it: a validators' parameter, which
+# only a token supermajority changes, never the council. The builder refuses a blockula-1 set
+# with several seats of one entity the delegation backs above 0, unless the spec waives it
+# (bootstrap-commission).
+bootstrap_commission_cap_bps = 0
 
 # ---- DEC-5. Each allocation names its bucket; the builder gives it the bucket's vesting curve
 # (in blocks at block_time_ms) and, for keyless buckets, their system account. Each bucket must
-# hold exactly its share.
+# hold exactly its share (the operator floats count toward the operators bucket).
 
 # 32%: community distributions (keyless; criteria announced only after mainnet works).
 [[allocation]]
@@ -64,9 +109,10 @@ bucket = "endowment"
 amount = "150000000"
 
 # 10%: the validator bootstrap delegation (keyless; each epoch delegated equally to the set's
-# members not run by the founder, its rewards to the treasury; returns to the treasury linearly
-# over years 2–4). The builder lists the founder's account, and the owners of
-# `founder_or_foundation` seats, in `bootstrap_excluded`.
+# members, its rewards to the treasury; returns to the treasury linearly over years 2–4). It
+# passes over seats owned by `bootstrap_excluded` accounts, which the builder lists: the
+# founder's account and the owners of `founder_or_foundation` seats. Here it backs the four
+# unflagged seats and pays them no commission (bootstrap_commission_cap_bps = 0).
 [[allocation]]
 bucket = "bootstrap"
 amount = "100000000"
@@ -78,37 +124,38 @@ address = "tboo10une7t3u48xlwqpcskt47gsm5mzvcxennfwnf856perxhv5pvchqww54jr"
 amount = "100000000"
 label = "founder"
 
-# 3%: genesis operators and security grants (6-month cliff, 2-year vest). Each operator's
-# self-bond comes out of its own allocation (locked tokens can be bonded).
+# 3%: genesis operators, the operator floats and security grants (6-month cliff, 2-year vest; the
+# floats are liquid). Each operator's self-bond comes out of its own allocation (locked tokens
+# can be bonded), leaving it FANG unstaked to pay its validator's beacon duties.
 [[allocation]]
 bucket = "operators"
 address = "tboo1nrums87rrekxgpyglfxme94vsxp3fccazza7k3ynm9apksl08sfqhn7kd5"
 amount = "1000000"
-label = "genesis operator: Founder validator A"
+label = "genesis operator: Blockula validator iad"
 
 [[allocation]]
 bucket = "operators"
 address = "tboo1ysrdknzd3l5yd6z4m5m8suvvnaxrfzp353g704cvhrnt6hcvj6vs5q7axy"
 amount = "1000000"
-label = "genesis operator: Founder validator B"
+label = "genesis operator: Blockula validator sjc"
 
 [[allocation]]
 bucket = "operators"
 address = "tboo1r4lmujqn2wqlm60tj6jwkyr8hvxdlmvlmw0p8x4rmuy8f7jphtcqysz4v6"
 amount = "1000000"
-label = "genesis operator: Example Validators GmbH"
+label = "genesis operator: Blockula validator fra"
 
 [[allocation]]
 bucket = "operators"
 address = "tboo1q6788utvxgxlnka23vufu6rfh0mvya29vn8wyy3r4rfmvau4nn0qklfrt3"
 amount = "1000000"
-label = "genesis operator: Example Staking Ltd"
+label = "genesis operator: Blockula validator ams"
 
 # PLACEHOLDER: security grants (auditors who accept FANG), one allocation per recipient.
 [[allocation]]
 bucket = "operators"
 address = "tboo1yvjkg24e34v6m3aglt922un8ge32k4zk4jtda5mnh255xfut3mrs5v4d95"
-amount = "26000000"
+amount = "25999600"
 label = "security grants"
 
 # ---- The Soul ledger (MAINNET-DESIGN 3.5): published contributors' starting Soul, if any.
@@ -116,3 +163,30 @@ label = "security grants"
 # account = "tboo1…"
 # soul = "12.5"
 # reason = "testnet contributor"
+
+# ---- What this set breaks, waived on record. Each waiver names a rule and why; the build prints
+# every finding it waives. Never waivable: DEC-5's shares, the faucet, admin keys, the supply,
+# the prefix, governance's floors and Ghost Mode.
+[[waiver]]
+rule = "operator-minimum"
+reason = "experimental launch: the founder's 4 validators (DEC-3 asks for 22); seats open to stake after launch"
+
+[[waiver]]
+rule = "provider-cap"
+reason = "all 4 run on Fly.io, one failure domain, disclosed"
+
+[[waiver]]
+rule = "asn-cap"
+reason = "all 4 announce from Fly's ASN 40509"
+
+[[waiver]]
+rule = "country-cap"
+reason = "two of the 4 regions are in the US (iad, sjc)"
+
+[[waiver]]
+rule = "facility-cap"
+reason = "with fewer than 7 operators any facility holds more than 15% of the set"
+
+[[waiver]]
+rule = "one-seat-per-entity"
+reason = "the founder runs all 4 seats, unflagged so a seat that leaves can rejoin; disclosed as founder-run"
