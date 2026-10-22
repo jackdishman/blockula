@@ -10,10 +10,43 @@
 #
 #   scripts/test-handoff-exchange.sh                  # node/target/release/blockula
 #   BIN=… PORT=28000 scripts/test-handoff-exchange.sh # ports PORT…PORT+4: the joiner, D, E (unused)
+#   scripts/test-handoff-exchange.sh --self-test      # checks the verdict below, starts no node
 #
 # The genesis validators get free ports from `summon`, as in local-testnet.sh.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+# The verdict: snapshot height, change epoch, epoch blocks. A pass needs a snapshot in the epoch
+# of the change or later: a joiner starting before it needs only the genesis signatures, so a
+# snapshot from before the change would pass without proving anything.
+verdict() {
+  local from=$1 change=$2 epoch=$3
+  if [[ ! "$from" =~ ^[0-9]+$ ]]; then
+    echo "❌ FAIL: the joiner didn't start from a snapshot"
+    return 1
+  fi
+  if (( from < change * epoch )); then
+    echo "❌ FAIL: the joiner fast-synced from snapshot #$from, before the change at epoch $change (block $((change * epoch)))"
+    return 1
+  fi
+  echo "✅ PASS: the joiner fast-synced from snapshot #$from (past the change at epoch $change, block $((change * epoch)))"
+}
+
+if [[ "${1:-}" == --self-test ]]; then
+  expect() { # want (0 pass, 1 fail), from, change, epoch
+    local got=0
+    verdict "$2" "$3" "$4" >/dev/null || got=1
+    if [[ "$got" != "$1" ]]; then echo "❌ verdict($2, $3, $4) = $got, want $1" >&2; exit 1; fi
+  }
+  expect 0 100 3 10 # after the change
+  expect 0 30 3 10  # the change's first block
+  expect 1 29 3 10  # the block before it
+  expect 1 20 3 10  # an older snapshot
+  expect 1 "" 3 10  # no snapshot
+  expect 1 abc 3 10
+  echo "✅ verdict self-test passed"
+  exit 0
+fi
 
 BIN=${BIN:-node/target/release/blockula}
 PORT=${PORT:-28000}
@@ -109,9 +142,8 @@ for _ in $(seq 1 180); do
   grep -q "no usable snapshot" "$DIR/fast.log" 2>/dev/null && break
   sleep 1
 done
-if [[ "$from" =~ ^[0-9]+$ ]]; then
-  echo "✅ PASS: the joiner fast-synced from snapshot #$from (past the change at epoch $CHANGE)"
+if verdict "$from" "$CHANGE" "$EPOCH"; then
   exit 0
 fi
-echo "❌ FAIL: the joiner didn't start from a snapshot: $(grep -o 'no usable snapshot.*' "$DIR/fast.log" || tail -3 "$DIR/fast.log")"
+[[ "$from" =~ ^[0-9]+$ ]] || echo "   $(grep -o 'no usable snapshot.*' "$DIR/fast.log" || tail -3 "$DIR/fast.log")"
 exit 1
