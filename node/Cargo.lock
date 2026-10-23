@@ -320,7 +320,7 @@ dependencies = [
 
 [[package]]
 name = "blockula"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1188,9 +1188,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.3"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03bb0e1cc970d482d121d9a1744999169b69a07470b3d644a7894e53fcaf4574"
+checksum = "38d28fb6aa7dd680b3ffd1a3e64e115c177bdba63c0ae7f9cd48129ff05c4fa0"
 dependencies = [
  "cmov",
  "subtle",

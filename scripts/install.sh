@@ -227,5 +227,4 @@ case ":$PATH:" in
 esac
 echo "  Try:  blockula dev        (local chain + explorer at http://localhost:7070)"
 echo "        blockula wallet new && blockula wallet faucet --rpc https://blockula-testnet.fly.dev"
-# Legal copy (D4: provisional, under counsel review): the as-is line.
-echo "  Blockula is experimental, MIT-licensed software, provided as is, without warranty. Mainnet risks: https://github.com/jackdishman/blockula/blob/main/docs/RISKS.md"
+echo "  Blockula is experimental, MIT-licensed software, provided as is, without warranty. Launch your own chain: https://github.com/jackdishman/blockula/blob/main/docs/LAUNCH.md"

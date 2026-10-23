@@ -609,8 +609,8 @@ export class Wallet {
     if (!c) {
       const status = await this.client.status();
       if (typeof status.genesis_hash !== "string") throw new Error(`${this.client.rpc} doesn't report a genesis_hash; it's too old for this SDK`);
-      // A `chain` given by the caller names the chain itself; one read from the node needs the opt-in.
-      this.client.checkMainnetOptIn(status.chain_id);
+      // A `chain` given by the caller names the chain itself; one read from the node is checked like a signing status.
+      this.client.checkMainnetPin(status.chain_id);
       c = { chainId: status.chain_id, genesisHash: status.genesis_hash };
     }
     if (res && !res.proven && c.chainId === MAINNET_CHAIN_ID) throw new UnprovenNameError(res, this.client.rpc);
@@ -666,8 +666,8 @@ export class Wallet {
     await this.client.addressPrefix(); // so `this.account` uses the chain's prefix
     const [status, account, fees] = await Promise.all([this.client.status(), this.client.account(this.account).catch(() => null), this.client.fees()]);
     if (!Number.isSafeInteger(status.height) || status.height < 0) throw new Error(`${this.client.rpc} doesn't report its height`);
-    // Mainnet only for a client that opted in (DEV-1), checked against the very status the tx is signed for.
-    this.client.checkMainnetOptIn(status.chain_id);
+    // blockula-1 only through a client pinned to it (DEV-1), checked against the very status the tx is signed for.
+    this.client.checkMainnetPin(status.chain_id);
     await this.client.checkSigningHeight(status.height);
     const max: number = status.max_tx_validity_blocks ?? Number.MAX_SAFE_INTEGER;
     const validFor = opts.validForBlocks ?? Math.min(this.validForBlocks, max);
@@ -1436,13 +1436,12 @@ export class ApiError extends Error {
 }
 
 /**
- * The node is on blockula-1, Blockula's mainnet, and this client wasn't made for it (DEV-1).
- * Nothing was signed. Opt in where the client is created: `new Client(rpc, { network: "mainnet" })`,
- * a `chainId: "blockula-1"` pin, or `allowMainnet: true` for code that pins the chain itself.
+ * The node says it's on blockula-1, and this client isn't pinned to that chain (DEV-1). Nothing
+ * was signed. A client signs there only with a `chainId: "blockula-1"` pin.
  */
 export class MainnetNotAllowedError extends Error {
   constructor(readonly rpc: string) {
-    super(`${rpc} is on blockula-1, Blockula's mainnet, and this client wasn't made for mainnet, so nothing was signed. Transactions there are final. To sign on mainnet, create the client with { network: "mainnet" } (or pin chainId: "${MAINNET_CHAIN_ID}", or pass allowMainnet: true if your code pins the chain itself)`);
+    super(`${rpc} says it's on ${MAINNET_CHAIN_ID}, and this client isn't pinned to that chain, so nothing was signed. If that's the chain you mean, pin it where the client is created: { chainId: "${MAINNET_CHAIN_ID}" }`);
     this.name = "MainnetNotAllowedError";
   }
 }
@@ -1676,15 +1675,9 @@ export interface ClientOptions {
   /**
    * A network this SDK knows (`NETWORKS`): its public RPC (when no URL is given) and every pin it
    * has (chain id, genesis hash, address prefix, genesis clock), set up front. Pins you pass too
-   * must agree with it. `"mainnet"` is also the opt-in to sign there.
+   * must agree with it.
    */
   network?: NetworkName;
-  /**
-   * Let wallets sign on blockula-1 (mainnet) through this client without a `network: "mainnet"`
-   * or `chainId: "blockula-1"` pin: for code that pins the chain itself. Off by default, so a
-   * script pointed at a mainnet node by mistake signs nothing (`MainnetNotAllowedError`).
-   */
-  allowMainnet?: boolean;
   /**
    * Submit txs in their wire form (`txBytes`, `application/octet-stream`): about half the bytes
    * of JSON. Off by default: the JSON form is refused outright when it has a field the node doesn't
@@ -1693,7 +1686,10 @@ export interface ClientOptions {
   wireTxs?: boolean;
   /** The address prefix you expect (`boo` or `tboo`). */
   prefix?: string;
-  /** The chain id the node must report (e.g. `blockula-1`). */
+  /**
+   * The chain id the node must report (e.g. `blockula-testnet-2`). Wallets sign on `blockula-1`
+   * only through a client pinned to it (`MainnetNotAllowedError`).
+   */
   chainId?: string;
   /** The genesis hash (hex) the node must report. */
   genesisHash?: string;
@@ -1854,8 +1850,6 @@ export class Client {
   readonly rpc: string;
   /** The network this client was made for (`ClientOptions.network`), if any. */
   readonly network?: NetworkName;
-  /** Whether wallets may sign on blockula-1 through this client (`MainnetNotAllowedError`). */
-  readonly mainnetAllowed: boolean;
   /** See `ClientOptions.wireTxs`. */
   readonly wireTxs: boolean;
 
@@ -1863,15 +1857,6 @@ export class Client {
   static testnet(opts: Omit<ClientOptions, "network"> & { rpc?: string } = {}): Client {
     const { rpc, ...rest } = opts;
     return new Client(rpc, { ...rest, network: "testnet" });
-  }
-
-  /**
-   * Mainnet, blockula-1 (`NETWORKS.mainnet`), and the opt-in to sign there. Pass a mainnet node's
-   * URL until a release builds one in.
-   */
-  static mainnet(opts: Omit<ClientOptions, "network"> & { rpc?: string } = {}): Client {
-    const { rpc, ...rest } = opts;
-    return new Client(rpc, { ...rest, network: "mainnet" });
   }
 
   /** A `blockula dev` chain on this machine (`NETWORKS.local`). */
@@ -1893,7 +1878,7 @@ export class Client {
       if (rpc === null || typeof rpc !== "object") throw new Error("new Client(rpc, opts) takes the node's URL, or the options alone");
       opts = { ...rpc, ...options };
     }
-    if (opts.network !== undefined && !isNetworkName(opts.network)) throw new Error(`unknown network ${JSON.stringify(opts.network)} (mainnet, testnet or local)`);
+    if (opts.network !== undefined && !isNetworkName(opts.network)) throw new Error(`unknown network ${JSON.stringify(opts.network)} (testnet or local)`);
     const preset: NetworkPreset | undefined = opts.network === undefined ? undefined : NETWORKS[opts.network];
     if (preset) {
       url ??= preset.rpc;
@@ -1905,7 +1890,6 @@ export class Client {
     this.wireTxs = opts.wireTxs === true;
     if (opts.prefix !== undefined && !(KNOWN_PREFIXES as readonly string[]).includes(opts.prefix)) throw new Error(`unknown address prefix ${opts.prefix}`);
     if (opts.genesisHash !== undefined && !/^[0-9a-f]{64}$/i.test(opts.genesisHash)) throw new Error("genesisHash must be 64 hex characters");
-    this.mainnetAllowed = opts.allowMainnet === true || opts.chainId === MAINNET_CHAIN_ID || preset?.mainnet === true;
     const rpcUrl = this.rpc;
     this.timeoutMs = checkTimeoutMs(opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
     this.witnesses = [...(opts.witnesses ?? [])];
@@ -1957,12 +1941,16 @@ export class Client {
   }
 
   /**
-   * Throws `MainnetNotAllowedError` for a status on blockula-1 unless this client opted in
-   * (`network: "mainnet"`, a `chainId: "blockula-1"` pin, or `allowMainnet`). Wallets call it
-   * with the very status each tx is signed for (DEV-1).
+   * Throws `MainnetNotAllowedError` for a status on blockula-1 unless this client is pinned to that
+   * chain (`chainPin`). Wallets call it with the very status each tx is signed for (DEV-1).
    */
-  checkMainnetOptIn(chainId: unknown): void {
-    if (chainId === MAINNET_CHAIN_ID && !this.mainnetAllowed) throw new MainnetNotAllowedError(this.rpc);
+  checkMainnetPin(chainId: unknown): void {
+    if (chainId === MAINNET_CHAIN_ID && this.chainPin() !== MAINNET_CHAIN_ID) throw new MainnetNotAllowedError(this.rpc);
+  }
+
+  /** The chain id this client is pinned to (`ClientOptions.chainId`), if any. A client that pins the chain itself reports its own pin. */
+  protected chainPin(): string | undefined {
+    return this.pinnedChainId;
   }
 
   /** One request, bounded by `timeoutMs` (headers and body): a node that never answers fails with `RequestTimeoutError` instead of hanging. */

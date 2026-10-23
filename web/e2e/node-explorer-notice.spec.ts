@@ -1,16 +1,15 @@
 // The node's built-in explorer (node/src/explorer.html), as explorer.spec.ts serves it: its footer
-// says what network this is (mainnet: experimental, not externally audited; test chains: test FANG
-// has no value) with Terms and Risks links, its copy makes no value or reward promises, and its
-// Hunts and contribution pool copy (D7) says who pays and what a pool without repositories pays.
+// says the chain's FANG has no value (test chains: test FANG; a chain someone launched: its own),
+// its copy makes no value or reward promises, and its Hunts and contribution pool copy says who
+// pays and what a pool without repositories pays.
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { expect, test, type Page } from "@playwright/test";
 
 const ORIGIN = "https://node-explorer.blockula.test";
 const HTML = readFileSync(path.join(__dirname, "../../node/src/explorer.html"), "utf8");
-const TERMS = "https://github.com/jackdishman/blockula/blob/main/TERMS.md";
-const RISKS = "https://github.com/jackdishman/blockula/blob/main/docs/RISKS.md";
-const HUNTS_PROGRAM = "https://github.com/jackdishman/blockula/blob/main/docs/HUNTS-PROGRAM.md";
+// A chain someone launched with `blockula summon` (docs/LAUNCH.md).
+const OWN_CHAIN = "mychain";
 const BURNED = "Fees destroyed forever. The base fee prices block space so spam costs the spammer; burning it takes that FANG out of the supply. It isn't a mechanism to manage FANG's price.";
 const HUNT_TIP = "A bounty on a GitHub issue. Its FANG sits in escrow until the creator awards it. The chain doesn't check the pull request: the creator decides who's paid. Once it expires the creator can cancel it, refunding every funder exactly; before that only a governance refund can.";
 const CREATOR = { address: "boo1creatorqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq", name: "maker.boo", short: "boo1creato…qqqq" };
@@ -41,38 +40,41 @@ async function open(page: Page, chainId: string, hash = "", repos: { repo: strin
   await page.goto(`${ORIGIN}/${hash}`);
 }
 
-test("on mainnet the footer says it's experimental and not externally audited, with Terms and Risks", async ({ page }) => {
-  await open(page, "blockula-1");
-  const footer = page.locator("footer");
-  await expect(page.locator("#notice")).toHaveText("Experimental mainnet · not externally audited");
+test("a chain someone launched says it isn't audited and its FANG has no value", async ({ page }) => {
+  await open(page, OWN_CHAIN);
   // explorer.spec.ts holds the imprint itself to this.
-  await expect(page.locator("#imprint")).toHaveText("Post-quantum signatures · ML-DSA-65");
-  await expect(footer).not.toContainText("test chains only");
-  await expect(footer).not.toContainText("no value");
-  await expect(footer.getByRole("link", { name: "Terms" })).toHaveAttribute("href", TERMS);
-  await expect(footer.getByRole("link", { name: "Risks" })).toHaveAttribute("href", RISKS);
+  await expect(page.locator("#imprint")).toHaveText("Post-quantum signatures · ML-DSA-65 · Not audited");
+  await expect(page.locator("#notice")).toHaveText("This chain's FANG has no value");
+  await expect(page.locator("footer")).not.toContainText("test chains only");
+  await expect(page.locator("footer").getByRole("link")).toHaveCount(0);
 });
 
-test("a test chain's footer says it isn't audited and test FANG has no value", async ({ page }) => {
-  await open(page, "blockula-testnet-2");
-  // Wait for the page to have read the status (the home view shows the chain's height).
-  await expect(page.locator("#app")).toContainText("#1000");
-  await expect(page.locator("#imprint")).toHaveText("Post-quantum signatures · ML-DSA-65 · Not audited, test chains only");
-  await expect(page.locator("#notice")).toHaveText("Test FANG has no value");
-  await expect(page.locator("footer").getByRole("link", { name: "Risks" })).toHaveAttribute("href", RISKS);
-  await expect(page.locator("footer")).not.toContainText("Experimental mainnet");
+for (const chain of ["blockula-testnet-2", "blockula-dev"]) {
+  test(`a test chain's footer (${chain}) says it isn't audited and test FANG has no value`, async ({ page }) => {
+    await open(page, chain);
+    // Wait for the page to have read the status (the home view shows the chain's height).
+    await expect(page.locator("#app")).toContainText("#1000");
+    await expect(page.locator("#imprint")).toHaveText("Post-quantum signatures · ML-DSA-65 · Not audited, test chains only");
+    await expect(page.locator("#notice")).toHaveText("Test FANG has no value");
+    await expect(page.locator("footer").getByRole("link")).toHaveCount(0);
+  });
+}
+
+test("a node that says it's on blockula-1 gets no mainnet footer", async ({ page }) => {
+  await open(page, "blockula-1");
+  await expect(page.locator("#notice")).toHaveText("This chain's FANG has no value");
+  await expect(page.locator("footer")).not.toContainText(/mainnet|Terms|Risks/i);
 });
 
 test("the glossary's 'burned' makes no price claim, and a Hunt says who pays it", async ({ page }) => {
-  await open(page, "blockula-1");
+  await open(page, OWN_CHAIN);
   await expect(page.locator("#app .term", { hasText: "burned" }).first()).toHaveAttribute("data-tip", BURNED);
   await expect(page.locator("body")).not.toContainText("ties the token");
   await page.goto(`${ORIGIN}/#/hunts`);
   const app = page.locator("#app");
-  await expect(app).toContainText("Hunts are bounties on GitHub issues, paid by whoever created and funded them. Fix the issue and get the pull request merged, and the creator can award you the bounty (or your Familiar's sponsor). The chain doesn't check the pull request, and anyone can add FANG to an open Hunt.");
-  await expect(app).toContainText("Open bounties right now: 0 FANG.");
-  await expect(app).toContainText("FANG paid here carries no promise of value, and payment for work may be taxable.");
-  await expect(app.getByRole("link", { name: "docs/HUNTS-PROGRAM.md" })).toHaveAttribute("href", HUNTS_PROGRAM);
+  await expect(app).toContainText("Hunts are bounties on GitHub issues, paid by whoever created and funded them. Fix the issue and get the pull request merged, and the creator can award you the bounty (or your Familiar's sponsor). The chain doesn't check the pull request, and anyone can add FANG to an open Hunt. Before you start, check who created a Hunt and what its rules are. Open bounties right now: 0 FANG.");
+  await expect(app).toContainText("FANG paid here has no value.");
+  await expect(app).not.toContainText(/taxable|promise|HUNTS-PROGRAM/);
   await expect(app.locator(".term", { hasText: "Hunts" }).first()).toHaveAttribute("data-tip", HUNT_TIP);
   await expect(app).not.toContainText("is awarded to your account");
   await page.goto(`${ORIGIN}/#/hunt/7`);
@@ -81,7 +83,7 @@ test("the glossary's 'burned' makes no price claim, and a Hunt says who pays it"
 });
 
 test("a pool with no repositories says it pays nothing, and keeps how it would work folded", async ({ page }) => {
-  await open(page, "blockula-1", "#/contribute");
+  await open(page, OWN_CHAIN, "#/contribute");
   const app = page.locator("#app");
   await expect(app.locator("h1")).toHaveText("The contribution pool");
   await expect(app).not.toContainText("Get paid for useful work");
@@ -107,7 +109,7 @@ test("a pool with repositories says how it works and the most a Séance can pay"
 });
 
 test("Learn says who pays for useful work, and that a pool without repositories pays nothing", async ({ page }) => {
-  await open(page, "blockula-1", "#/learn");
+  await open(page, OWN_CHAIN, "#/learn");
   const app = page.locator("#app");
   await expect(app).toContainText("Useful work can be paid. Hunts are bounties on GitHub issues, paid by whoever posts them. The contribution pool pays for merged pull requests to repositories governance adds, judged by juries of people with Soul; it pays nothing until it has one, and its payments unlock slowly.");
   await expect(app.getByRole("link", { name: "Hunts →" })).toHaveAttribute("href", "#/hunts");

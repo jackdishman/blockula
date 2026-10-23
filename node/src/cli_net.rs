@@ -187,7 +187,7 @@ pub fn mismatch(pin: &Pin, status: &Value) -> Option<String> {
     match pin.chain_id.as_deref() {
         Some(want) if want != chain_id => return Some(format!("the node is on chain `{chain_id}`, not `{want}`")),
         None if chain_id == MAINNET_CHAIN_ID => {
-            return Some(format!("the node is on mainnet (`{MAINNET_CHAIN_ID}`, real FANG), and this command wasn't told to use mainnet. Pass --network mainnet if that's what you mean"));
+            return Some(format!("the node is on mainnet (`{MAINNET_CHAIN_ID}`), and this command wasn't told to use mainnet. Pass --network mainnet if that's what you mean"));
         }
         _ => {}
     }
@@ -321,9 +321,6 @@ impl Remote {
             known.save(&net, &full)?;
             eprintln!("📌 {} is `{chain_id}` (genesis {}…): pinned in {}", net.rpc, &genesis_hash[..16], known.file.display());
         }
-        if chain_id == MAINNET_CHAIN_ID {
-            mainnet_notice_once(dir, crate::api::VERSION);
-        }
         Ok(Remote { rpc: net.rpc, chain_id, genesis_hash, prefix })
     }
 
@@ -447,37 +444,9 @@ pub fn account_ref(who: &str) -> Result<String> {
     Ok(name)
 }
 
-// ------------------------------------------------------------------------------------ notices
-//
-// What the CLI tells people about mainnet (legal-safety-13, OPERATOR-18). Legal copy (D4: provisional,
-// under counsel review) in the brand wording (D10): it lives here, in these constants and
-// functions, and nowhere else.
+// -------------------------------------------------------------------------------------- words
 
-/// Where the CLI records the one-time notices it showed, in the blockula directory.
-pub const NOTICES_FILE: &str = "notices.json";
-/// The terms of use, on GitHub, so the link works wherever the CLI runs.
-pub const TERMS_URL: &str = "https://github.com/jackdishman/blockula/blob/main/TERMS.md";
-/// The risks of using Blockula, on GitHub.
-pub const RISKS_URL: &str = "https://github.com/jackdishman/blockula/blob/main/docs/RISKS.md";
-
-/// What a signing command prints the first time it reaches a node on mainnet (per blockula
-/// directory and binary version, [`mainnet_notice_once`]).
-pub fn mainnet_notice() -> String {
-    format!(
-        "⚠️  Blockula mainnet (`{MAINNET_CHAIN_ID}`) is experimental. It isn't externally audited, most of its validators are run by its founder, and it can halt or be changed by governance.\n   Transactions are final and public, and nobody can recover a lost key. The software is provided as is, without warranty.\n   Terms (provisional, under counsel review): {TERMS_URL}\n   Risks: {RISKS_URL}\n   (Shown once for this version of blockula.)"
-    )
-}
-
-/// The three lines `validator init`, `validator register` and `stake delegate` print on mainnet,
-/// with the chain's own figures: the double-sign slash (`slash`, e.g. "5%") and the unbonding
-/// period (`unbonding`, e.g. "21 days").
-pub fn mainnet_staking_notice(slash: &str, unbonding: &str) -> String {
-    format!(
-        "⚠️  Mainnet staking: a validator that signs twice loses {slash} of its pool's stake, its delegators' included, and is banned for good (tombstoned).\n   Unbonding takes {unbonding}, and a protocol upgrade halts every node whose release doesn't run it.\n   Rewards come from protocol issuance and aren't guaranteed. Risks: {RISKS_URL}"
-    )
-}
-
-/// What `wallet new` adds for a mainnet (`boo`) address.
+/// What `wallet new` prints with every new key.
 pub const UNRECOVERABLE_KEY: &str = "Nobody, Blockula included, can recover this key.";
 
 /// `blocks` of `block_time_ms` each, in words: "21 days", "36 hours", "5 minutes" (rounded down,
@@ -494,81 +463,12 @@ pub fn span_words(blocks: u64, block_time_ms: u64) -> String {
     format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
 }
 
-/// Prints [`mainnet_notice`] to stderr unless `dir`'s notices file says this `version` of
-/// blockula showed it already, and records that it did. Best effort: a notices file it can't read
-/// or write never stops a command (it shows the notice again next time). Returns whether it
-/// printed.
-pub fn mainnet_notice_once(dir: &Path, version: &str) -> bool {
-    show_once(dir, "mainnet", version, || eprintln!("{}", mainnet_notice()))
-}
-
-/// Runs `show` unless `dir`'s [`NOTICES_FILE`] records notice `key` for `version`, then records it
-/// (`{"<key>": {"<version>": <unix ms>}}`, keeping everything else in the file).
-fn show_once(dir: &Path, key: &str, version: &str, show: impl FnOnce()) -> bool {
-    let file = dir.join(NOTICES_FILE);
-    let mut all: serde_json::Map<String, Value> = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-    if all.get(key).and_then(|v| v.get(version)).is_some() {
-        return false;
-    }
-    show();
-    let entry = all.entry(key.to_string()).or_insert_with(|| Value::Object(Default::default()));
-    if !entry.is_object() {
-        *entry = Value::Object(Default::default());
-    }
-    entry[version] = crate::chain::now_ms().into();
-    let saved = std::fs::create_dir_all(dir).map_err(anyhow::Error::from).and_then(|()| {
-        let tmp = file.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_string_pretty(&all)?)?;
-        Ok(std::fs::rename(&tmp, &file)?)
-    });
-    if let Err(e) = saved {
-        tracing::debug!(file = %file.display(), error = %e, "couldn't record a notice");
-    }
-    true
-}
-
 #[cfg(test)]
-mod notices {
-    use super::*;
-
-    /// legal-safety-13: the mainnet notice shows once per blockula directory and binary version, a
-    /// corrupt record shows it again (and is repaired), and other entries in the file survive.
-    #[test]
-    fn the_mainnet_notice_shows_once_per_home_and_version() {
-        let root = std::env::temp_dir().join(format!("blockula-notices-{}-{}", crate::chain::now_ms(), std::process::id()));
-        let (a, b) = (root.join("a"), root.join("b"));
-        assert!(mainnet_notice_once(&a, "0.6.0"), "first time in a home");
-        assert!(!mainnet_notice_once(&a, "0.6.0"), "not again for the same version");
-        assert!(mainnet_notice_once(&a, "0.6.1"), "again for a new version");
-        assert!(!mainnet_notice_once(&a, "0.6.1"));
-        assert!(mainnet_notice_once(&b, "0.6.0"), "another home has its own record");
-        let rec: Value = serde_json::from_slice(&std::fs::read(a.join(NOTICES_FILE)).unwrap()).unwrap();
-        assert!(rec["mainnet"]["0.6.0"].as_u64().is_some() && rec["mainnet"]["0.6.1"].as_u64().is_some(), "{rec}");
-        std::fs::write(b.join(NOTICES_FILE), "{ not json").unwrap();
-        assert!(mainnet_notice_once(&b, "0.6.0"), "a record it can't read shows it again");
-        assert!(!mainnet_notice_once(&b, "0.6.0"), "and is rewritten");
-        std::fs::write(b.join(NOTICES_FILE), r#"{"other":{"x":1},"mainnet":"junk"}"#).unwrap();
-        assert!(mainnet_notice_once(&b, "0.6.0"));
-        let rec: Value = serde_json::from_slice(&std::fs::read(b.join(NOTICES_FILE)).unwrap()).unwrap();
-        assert_eq!(rec["other"]["x"], 1, "other notices stay");
-        // A directory it can't write to never stops the command: it just shows the notice each time.
-        let file_not_dir = root.join("plain-file");
-        std::fs::write(&file_not_dir, "").unwrap();
-        assert!(mainnet_notice_once(&file_not_dir, "0.6.0") && mainnet_notice_once(&file_not_dir, "0.6.0"));
-        std::fs::remove_dir_all(&root).ok();
-    }
+mod words {
+    use super::span_words;
 
     #[test]
-    fn the_notices_say_what_counsel_will_review() {
-        let n = mainnet_notice();
-        for want in ["experimental", "isn't externally audited", "run by its founder", "final", "as is", "provisional, under counsel review", TERMS_URL, RISKS_URL] {
-            assert!(n.contains(want), "{want}: {n}");
-        }
-        let s = mainnet_staking_notice("5%", "21 days");
-        assert_eq!(s.lines().count(), 3, "{s}");
-        for want in ["5%", "tombstoned", "21 days", "upgrade halts", "aren't guaranteed", RISKS_URL] {
-            assert!(s.contains(want), "{want}: {s}");
-        }
+    fn spans_read_in_whole_units() {
         assert_eq!(span_words(21 * 86_400, 1000), "21 days");
         assert_eq!(span_words(36 * 3600, 1000), "36 hours");
         assert_eq!(span_words(300, 1000), "5 minutes");
