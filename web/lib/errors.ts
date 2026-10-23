@@ -1,4 +1,14 @@
-import { RPC } from "./config";
+import { NETWORK, RPC } from "./config";
+import { BRAND, FIRST_FANG } from "./onboarding-copy";
+
+/**
+ * What to try when the node can't be reached: `blockula dev` only means something for a local
+ * node; anywhere else it's the node or the network that's down.
+ */
+export const unreachableHint = () =>
+  NETWORK.key === "local"
+    ? "Start a local node with `blockula dev`, or pick another network in the menu at the top."
+    : "Try again in a minute, or pick another node in the menu at the top.";
 
 /** Turn node / WebAuthn / network error strings into something a human can act on. */
 export function friendly(e: unknown): string {
@@ -16,7 +26,7 @@ export function friendly(e: unknown): string {
     [/(\S+) isn't registered/, (m) => `${m[1]} isn't registered yet. Double-check the spelling.`],
     [/bad nonce/, "Your previous transaction is still settling. Give it a second and try again."],
     [/fee too low/, "The fee was too low for this transaction's size. Try again."],
-    [/this chain has no faucet/, "This chain has no faucet. Ask a friend to send you some FANG."],
+    [/this chain has no faucet/, FIRST_FANG.noFaucetError],
     [/can't remove the last owner key/, "That's your last owner key. Removing it would lock you out forever."],
     [/that key is already on this account/, "That key is already linked to this account."],
     [/at most \d+ keys/, "This account already has the maximum number of keys. Revoke one first."],
@@ -33,8 +43,8 @@ export function friendly(e: unknown): string {
     [/reports height \d+, but by .* the chain can't be past block/, "Your node reports a block height the network can't have reached yet, so nothing was signed (a transaction signed against it could be held and sent later). Use another node, or check this device's clock."],
     [/disagrees about the state at block/, "The nodes this wallet checks names against disagree about who owns that name, so it wasn't used. Try again in a moment, or pay the address directly."],
     [/didn't answer within/, `The Blockula node at ${RPC} didn't answer in time. If you were sending, check your activity before trying again: it may have gone through.`],
-    [/PRF extension/, "Your passkey provider doesn't support the PRF extension, which Blockula needs to derive your quantum-safe key."],
-    [/Failed to fetch|NetworkError|Load failed|fetch failed/i, `Can't reach the Blockula node at ${RPC}. Pick another network in the menu at the top, or start a local node with \`blockula dev\`.`],
+    [/PRF extension/, `Your passkey provider doesn't support the PRF extension, which Blockula needs to derive your ${BRAND.signingKey}.`],
+    [/Failed to fetch|NetworkError|Load failed|fetch failed/i, `Can't reach the Blockula node at ${RPC}. ${unreachableHint()}`],
   ];
   if (name === "NotAllowedError") return "The passkey prompt was cancelled or timed out.";
   if (name === "InvalidStateError") return "This device already has a passkey for this wallet.";

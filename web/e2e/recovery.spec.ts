@@ -46,6 +46,7 @@ test("makes a recovery kit during onboarding: print, download, confirm, activate
       await expect(p.getByTestId("kit-words")).toBeVisible();
       const words = (await p.getByTestId("kit-words").locator(".kit-w").allTextContents()).map((w) => w.trim());
       const keyId = ((await p.getByTestId("kit-key-id").textContent()) ?? "").trim();
+      await expect(p.getByTestId("recovery-kit")).toContainText("Blockula will never ask you for them.");
       // The 24 words are the kit key's seed.
       expect(Wallet.fromSeed(wordsToSeed(words.join(" "))).keyId).toBe(keyId);
 
@@ -58,6 +59,7 @@ test("makes a recovery kit during onboarding: print, download, confirm, activate
       expect(text).toContain("BLOCKULA RECOVERY KIT");
       expect(text).toContain(keyId);
       expect(text).toContain("chain blockula-testnet");
+      expect(text).toContain("Blockula will never ask you for these words.");
       for (const [i, w] of words.entries()) expect(text).toMatch(new RegExp(`\\b${i + 1}\\. ${w}\\b`));
 
       // A wrong word is caught; the right ones activate the kit.
@@ -118,9 +120,21 @@ test("restores on a new device with the kit, then revokes the lost device", asyn
   expect(keyIdOf(hexToBytes(add?.public_key ?? ""))).toBe(kit.keyId);
   expect(node.keysOf(lost.account).get(restored?.keyId as string)?.role.type).toBe("owner");
 
-  // Revoke the lost device, signed by the new passkey.
+  // Revoke the lost device, signed by the new passkey, once the user confirms it (audit USER-19).
   const lostRow = fresh.locator(".key-row", { hasText: "original key" });
+  const before = node.submitted.length;
+  fresh.once("dialog", (d) => d.dismiss());
   await lostRow.getByRole("button", { name: "Revoke" }).click();
+  await expect(lostRow).toBeVisible();
+  expect(node.submitted.length).toBe(before);
+  const asked = new Promise<string>((resolve) =>
+    fresh.once("dialog", (d) => {
+      resolve(d.message());
+      void d.accept();
+    }),
+  );
+  await lostRow.getByRole("button", { name: "Revoke" }).click();
+  expect(await asked).toBe("Revoke “original key”? It stops working on the next block.");
   await expect(lostRow).toHaveCount(0);
   expect(node.submitted.at(-1)?.action).toEqual({ type: "remove_key", key_id: lost.keyId });
   expect(node.keysOf(lost.account).has(lost.keyId)).toBe(false);

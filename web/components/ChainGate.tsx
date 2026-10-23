@@ -1,6 +1,6 @@
 "use client";
 
-import type { ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { saveCustomPin, type ChainMismatchError } from "@/lib/chain";
 import { NETWORK, NETWORKS, RPC, setNetwork, type Network } from "@/lib/config";
 import { useWallet } from "@/lib/wallet";
@@ -8,16 +8,36 @@ import { Splash } from "./Gate";
 import { Apparition } from "./Haunt";
 import { Tip } from "./ui";
 
-/** Nothing renders until the node has proved it's on the expected chain; a wrong chain blocks the app. */
+/** How long to wait on a silent node before letting the app render, as for one that can't be reached. */
+const NODE_PATIENCE_MS = 8000;
+
+/**
+ * Nothing renders until the node has proved it's on the expected chain; a wrong chain blocks the
+ * app. A node that can't be reached, or hasn't answered after a few seconds, doesn't: the app
+ * renders without its answers (nothing is signed through a node before its status is checked),
+ * so onboarding and the explorer can say what's wrong.
+ */
 export function ChainGate({ children }: { children: ReactNode }) {
   const { chain, refresh } = useWallet();
-  if (chain.state === "checking") return <Splash text="Checking which chain this node is on…" />;
+  const [slow, setSlow] = useState(false);
+  useEffect(() => {
+    if (chain.state !== "checking") return;
+    const t = setTimeout(() => setSlow(true), NODE_PATIENCE_MS);
+    return () => clearTimeout(t);
+  }, [chain.state]);
+  if (chain.state === "checking" && !slow) return <Splash text="Checking which chain this node is on…" />;
   if (chain.state === "mismatch") return <WrongChain error={chain.error} />;
   return (
     <>
       {chain.state === "unreachable" && (
         <div className="banner danger" role="alert">
           <b>Can&apos;t reach the node.</b> {chain.error}{" "}
+          <button className="link" onClick={() => refresh()}>Retry</button>
+        </div>
+      )}
+      {chain.state === "checking" && (
+        <div className="banner" role="alert" data-testid="node-slow">
+          <b>The node hasn&apos;t answered yet.</b> Nothing from it is shown until it does.{" "}
           <button className="link" onClick={() => refresh()}>Retry</button>
         </div>
       )}
