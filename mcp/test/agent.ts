@@ -240,6 +240,39 @@ const today = () => new Date().toISOString().slice(0, 10);
   console.log("✓ a lock that was taken over and made afresh before a second waiter removes it isn't removed; the one that's really dead still is");
 }
 
+{
+  // A live holder keeps its lock fresh (review of mcp-agents-kit, notes): a call that outlasts
+  // `staleMs` (a node that hangs until BLOCKULA_TIMEOUT_MS) isn't a stuck holder, and its lock isn't
+  // taken over while it works. One that stops touching its lock (hung, or the process is gone) still
+  // is, after `staleMs`.
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const nonces = join(dir, "units", "heartbeat");
+  const opts = { staleMs: 500, waitMs: 10_000, pollMs: 5, refreshMs: 50 };
+  const holder = new AccountLocks(nonces, opts);
+  const waiter = new AccountLocks(nonces, opts); // another process sharing the directory, as far as the file goes
+  let inside = 0;
+  let most = 0;
+  const work = (ms: number) => async () => {
+    inside++;
+    most = Math.max(most, inside);
+    await sleep(ms);
+    inside--;
+  };
+  const slow = holder.run("k", work(1_600)); // outlasts staleMs three times over
+  await sleep(100);
+  const second = waiter.run("k", work(10));
+  await Promise.all([slow, second]);
+  assert.equal(most, 1, "the waiter didn't take over a live holder's lock");
+  // A lock nobody touches any more is a stuck holder's, even if its process is alive.
+  const lock = waiter.file("k");
+  writeFileSync(lock, `${process.pid} 0 stuck`);
+  const past = new Date(Date.now() - 10_000);
+  utimesSync(lock, past, past);
+  assert.equal(await waiter.run("k", async () => "ran"), "ran", "a lock untouched for staleMs is taken over");
+  assert.deepEqual(readdirSync(nonces), []);
+  console.log("✓ a live holder keeps its lock fresh, so a call slower than the stale limit isn't taken over; a lock nobody touches still is");
+}
+
 // ---- a fake node that enforces nonces like the real mempool ----
 
 const kp = (n: number) => ml_dsa65.keygen(new Uint8Array(32).fill(n)).publicKey;
