@@ -8,7 +8,7 @@
 //    remembers the chain across restarts, and notices a node that switches mid-session.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -19,7 +19,7 @@ import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { RELEASE_SIGNATURE_FORMAT, releaseMessage } from "@blockula/sdk";
-import { KNOWN_CLOCKS, KNOWN_GENESIS, KnownChains, LOCAL_RPC, MAINNET_RPCS, TESTNET_RPC, canonicalUrl, completePin, defaultWitnesses, effectivePin, mismatch, networkArg, networkLabel, resolveNetwork } from "../src/network.js";
+import { KNOWN_CLOCKS, KNOWN_GENESIS, KnownChains, LOCAL_RPC, MAINNET_RPCS, TESTNET_RPC, canonicalUrl, completePin, defaultWitnesses, effectivePin, mismatch, networkArg, networkLabel, resolveNetwork, unusableChain } from "../src/network.js";
 import { RELEASE_KEY_ID, binPaths, checkBinaryVersion, fetchVerifiedRelease, latestTagFrom, pickNodeBinary, readReleasePin, releaseKeyIdFrom, type ReleaseDeps } from "../src/release.js";
 
 const G1 = "11".repeat(32);
@@ -70,6 +70,9 @@ const refusals: [Record<string, string>, string[], RegExp][] = [
   [{ BLOCKULA_RPC: "https://rpc.example/?key=1" }, [], /without a query or a fragment/],
   [{ BLOCKULA_RPC: "https://rpc.example/#x" }, [], /without a query or a fragment/],
   [{ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_WITNESSES: "https://w.example/?k=1" }, [], /BLOCKULA_WITNESSES must be a node's URL, without a query or a fragment/],
+  // Audit MCK-3: a pinned chain id is one this MCP can key its ledger and files by.
+  [{ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_CHAIN_ID: "../x" }, [], /BLOCKULA_CHAIN_ID must be a chain id/],
+  [{ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_CHAIN_ID: "a".repeat(65) }, [], /BLOCKULA_CHAIN_ID must be a chain id/],
 ];
 // gap-7-1: witnesses names are proven against.
 assert.deepEqual(resolveNetwork({ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_WITNESSES: " https://a.example/ , https://b.example ," }).witnesses, ["https://a.example", "https://b.example"]);
@@ -165,6 +168,15 @@ if (builtIn) {
   assert.match(mismatch(testnet.pin, status("blockula-testnet-2", G1 === builtIn ? G2 : G1, "tboo")) ?? "", /genesis/, "a node on another instance of the testnet is refused");
   assert.equal(mismatch(testnet.pin, status("blockula-testnet-2", builtIn, "tboo")), null);
 }
+// Audit MCK-3: a node's chain id is a ledger key and part of file names, so a node reporting one
+// this MCP can't key by (a path, a space, past 64 characters) isn't pinned at all.
+assert.equal(unusableChain(status("fake-chain", G1)), null);
+assert.equal(unusableChain(status("blockula_dev.1", G1.toUpperCase())), null);
+assert.equal(unusableChain({ chain_id: "a".repeat(64) }), null, "a node that reports no genesis hash is pinned by its chain id alone");
+for (const bad of ["../../escaped/x", "a/b", "a\\b", "a b", "", "a".repeat(65), "x\n", "é"]) assert.match(unusableChain(status(bad, G1)) ?? "", /the node reports the chain id .*1 to 64 letters/, JSON.stringify(bad));
+assert.match(unusableChain(status("a".repeat(100), G1)) ?? "", /"a{80}…"/, "a long id is cut short in the message");
+for (const bad of ["abc", "zz".repeat(32), `${G1}0`, 5, ""]) assert.match(unusableChain({ chain_id: "a", genesis_hash: bad }) ?? "", /genesis hash that isn't 64 hex/, JSON.stringify(bad));
+assert.equal(unusableChain({ chain_id: 5 }), null, "(not a string: `mismatch` says it reports no chain id)");
 // A release before canonicalUrl remembered a node's URL as it was typed. That entry is the same
 // node's, so its pin holds (the node isn't pinned afresh on trust) and moves to the canonical spelling.
 const legacyFile = join(dir, "legacy-known-chains.json");
@@ -181,7 +193,7 @@ assert.equal(legacy.get(resolveNetwork({ BLOCKULA_RPC: "https://elsewhere.exampl
 const local = resolveNetwork({}, ["--network", "local"]);
 known.save(local, { chainId: "blockula-dev", genesisHash: G1 });
 assert.equal(known.get(local), undefined, "dev chains are re-pinned each session (a reset makes a new genesis)");
-console.log("✓ pins: chain id, genesis, prefix, known genesis, trust on first use; a pin remembered under another spelling of a URL moves to the canonical one");
+console.log("✓ pins: chain id, genesis, prefix, known genesis, trust on first use; a chain id that can't key files and ledgers isn't pinned; a pin remembered under another spelling of a URL moves to the canonical one");
 
 // ---- 3. release checks ----
 
@@ -387,6 +399,37 @@ assert.ok(r.error && /starts from genesis .*not 2222/.test(r.text) && r.text.inc
 assert.deepEqual(Object.keys(JSON.parse(readFileSync(join(legacyHome, "known-chains.json"), "utf8"))), [`custom ${rpc}`]);
 await s.close();
 
+// A node whose chain can't key the ledger, the locks or a file name isn't pinned: every tool refuses
+// it for that reason (not for a missing genesis hash), and nothing is written outside BLOCKULA_HOME
+// (audit MCK-3: `use_account` used to say the node reported no genesis hash).
+mkdirSync(join(dir, "escaped"));
+const outside = readdirSync(dir).sort();
+for (const [chain_id, genesis_hash, why] of [
+  ["x/../../escaped/y", G1, /the node reports the chain id "x\/\.\.\/\.\.\/escaped\/y", and a chain id here is 1 to 64/],
+  ["a".repeat(65), G1, /the node reports the chain id "a{65}", and a chain id here/],
+  ["fake-chain", "zz".repeat(32), /the node reports a genesis hash that isn't 64 hex characters/],
+] as const) {
+  nodeStatus = { ...nodeStatus, chain_id, genesis_hash };
+  s = await server({ BLOCKULA_RPC: rpc });
+  for (const [tool, args] of [["status", {}], ["create_wallet", {}], ["use_account", { account: "self" }]] as const) {
+    r = await s.call(tool, args);
+    assert.ok(r.error && /^Error: Refusing .*Nothing was signed or sent\.$/.test(r.text) && why.test(r.text), `${tool}: ${r.text}`);
+    assert.ok(!/genesis hash, so the account can't be kept|relaunched|start_dev_node/.test(r.text), `${tool}: the reason is the chain's, and forgetting a remembered chain wouldn't help: ${r.text}`);
+  }
+  await s.close();
+}
+assert.deepEqual(readdirSync(dir).sort(), outside, "nothing was written outside BLOCKULA_HOME");
+assert.deepEqual(readdirSync(join(dir, "escaped")), [], "where a chain id like that would have put a grant file");
+assert.ok(!readdirSync(home).some((f) => f.startsWith("grant-")), "no grant file");
+// A node that reports no genesis hash can be used, but can't keep an account: that's what use_account says.
+const { genesis_hash: _none, ...noGenesis } = { ...nodeStatus, chain_id: "fake-chain", genesis_hash: G1 };
+nodeStatus = noGenesis as typeof nodeStatus;
+s = await server({ BLOCKULA_RPC: rpc });
+r = await s.call("use_account", { account: "self" });
+assert.ok(r.error && /doesn't report its chain's genesis hash, so the account can't be kept for this chain/.test(r.text), r.text);
+await s.close();
+nodeStatus = { ...nodeStatus, chain_id: "fake-chain", genesis_hash: G1 };
+
 // Hunts and the contribution pool say testnet FANG is worth nothing on test chains only: a tool's
 // description by the configured network (of test chains alone when the node's chain isn't known
 // yet), a result by the chain the node is on. On mainnet nothing is said about value.
@@ -429,4 +472,4 @@ await s.close();
 
 fake.close();
 rmSync(dir, { recursive: true, force: true });
-console.log("✓ the server refuses the wrong chain, notices a switch, remembers chains across restarts (and across a URL's spellings)");
+console.log("✓ the server refuses the wrong chain, notices a switch, remembers chains across restarts (and across a URL's spellings), and refuses a node whose chain id or genesis hash can't be pinned");

@@ -165,6 +165,30 @@ export function checkRpcUrl(u: string, what = "BLOCKULA_RPC"): string {
   return canonicalUrl(u);
 }
 
+/**
+ * The chain ids this MCP pins, and keys its ledger (spend.ts `chainKey`), lock and nonce records
+ * and grant files by: 1 to 64 letters, digits, '-', '_' and '.'. A genesis built for a public
+ * network has letters, digits and '-' (node/src/genesis_builder.rs, at most 64: MAX_CHAIN_ID), so
+ * every real chain fits. A node reporting anything else (a path separator, a space) is refused
+ * when its chain is pinned (`unusableChain`), so nothing it names is ever used as a file name or
+ * a ledger key (audit MCK-3).
+ */
+export const CHAIN_ID = /^[A-Za-z0-9._-]{1,64}$/;
+
+/**
+ * Why a node's chain can't be pinned at all, or null: a chain id outside CHAIN_ID, or a genesis
+ * hash that isn't 64 hex characters, can't key what this MCP keeps per chain. (A node that reports
+ * no genesis hash is pinned by its chain id alone, as before; it can't sign, and `use_account`
+ * says that's why.)
+ */
+export function unusableChain(status: { chain_id?: unknown; genesis_hash?: unknown }): string | null {
+  const id = status.chain_id;
+  if (typeof id === "string" && !CHAIN_ID.test(id)) return `the node reports the chain id ${JSON.stringify(id.length > 80 ? `${id.slice(0, 80)}…` : id)}, and a chain id here is 1 to 64 letters, digits, '-', '_' or '.'`;
+  const g = status.genesis_hash;
+  if (g !== undefined && g !== null && (typeof g !== "string" || !/^[0-9a-fA-F]{64}$/.test(g))) return "the node reports a genesis hash that isn't 64 hex characters";
+  return null;
+}
+
 /** `--network <name>` or `--network=<name>` from the command line. */
 export function networkArg(argv: string[]): string | undefined {
   for (let i = 0; i < argv.length; i++) {
@@ -198,6 +222,7 @@ export function resolveNetwork(env: Record<string, string | undefined>, argv: st
   const chainId = env.BLOCKULA_CHAIN_ID?.trim() || undefined;
   const genesisHash = env.BLOCKULA_GENESIS_HASH?.trim().toLowerCase() || undefined;
   if (chainId) {
+    if (!CHAIN_ID.test(chainId)) throw new Error(`BLOCKULA_CHAIN_ID must be a chain id: 1 to 64 letters, digits, '-', '_' or '.' (got ${JSON.stringify(chainId.slice(0, 80))})`);
     if (pin.chainId && pin.chainId !== chainId) throw new Error(`BLOCKULA_CHAIN_ID=${chainId} contradicts the ${base.label} (${pin.chainId})`);
     pin.chainId = chainId;
   }
@@ -325,12 +350,18 @@ export function effectivePin(net: Network, remembered?: Pin): Pin {
   return { chainId: net.pin.chainId ?? r?.chainId, genesisHash: net.pin.genesisHash ?? r?.genesisHash, prefix: net.pin.prefix ?? r?.prefix };
 }
 
-/** The error an agent sees when a node is on the wrong chain: what happened and what the user can do. */
-export function mismatchError(net: Network, why: string, knownChainsFile: string) {
-  const fix = net.remember
-    ? ` If this network was relaunched on purpose, the user can remove its entry ("${KnownChains.id(net)}") from ${knownChainsFile}, or set BLOCKULA_GENESIS_HASH.`
-    : net.key === "local"
-      ? " A reset dev chain starts from a new genesis: call start_dev_node to use the one running now."
-      : "";
+/**
+ * The error an agent sees when a node is on the wrong chain: what happened and what the user can
+ * do. `relaunched` is false for a node whose chain can't be pinned at all (`unusableChain`):
+ * forgetting what was remembered wouldn't help there.
+ */
+export function mismatchError(net: Network, why: string, knownChainsFile: string, relaunched = true) {
+  const fix = !relaunched
+    ? ""
+    : net.remember
+      ? ` If this network was relaunched on purpose, the user can remove its entry ("${KnownChains.id(net)}") from ${knownChainsFile}, or set BLOCKULA_GENESIS_HASH.`
+      : net.key === "local"
+        ? " A reset dev chain starts from a new genesis: call start_dev_node to use the one running now."
+        : "";
   return new Error(`Refusing ${net.rpc} (${net.label}): ${why}. Nothing was signed or sent.${fix}`);
 }

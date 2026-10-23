@@ -44,7 +44,7 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, 
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { z } from "zod";
-import { KNOWN_CLOCKS, KNOWN_GENESIS, KnownChains, clockFrom, completePin, defaultWitnesses, effectivePin, mismatch, mismatchError, networkLabel, resolveNetwork, type GenesisClock, type Network } from "./network.js";
+import { KNOWN_CLOCKS, KNOWN_GENESIS, KnownChains, clockFrom, completePin, defaultWitnesses, effectivePin, mismatch, mismatchError, networkLabel, resolveNetwork, unusableChain, type GenesisClock, type Network } from "./network.js";
 import { WALLET_URLS, actingFor, checkCode, createWalletFile, ignoredNote, newWalletFile, readWalletFile, secretOf, setActingFor, writeWalletFile, type ActingFor, type WalletFile } from "./accounts.js";
 import { aboutBlocks, allowanceOf, amountArg, capsFrom, configError, dropsOf, keyOn, msFrom, preflight, spendableNow } from "./budget.js";
 import { AccountLocks, NonceTracker } from "./locks.js";
@@ -135,7 +135,11 @@ function network(): Network {
   return NET;
 }
 
-/** The pinned chain as the ledger, the key file and the nonce tracker key it: `<chain_id> <genesis_hash>`. */
+/**
+ * The pinned chain as the ledger, the key file and the nonce tracker key it: `<chain_id>
+ * <genesis_hash>`. `chain()` refused a chain id or genesis hash that doesn't fit, so this is
+ * undefined only for a node that reports no genesis hash (and can't sign).
+ */
 function chainNow(): string | undefined {
   const { chainId, genesisHash } = pinnedChain;
   try {
@@ -155,6 +159,10 @@ async function chain(): Promise<Client> {
   const net = network();
   const pin = effectivePin(net, KNOWN_CHAINS.get(net));
   const status = await new Client(net.rpc, { timeoutMs: TIMEOUT_MS }).status();
+  // A chain id or genesis hash this MCP can't key its ledger, locks and grant files by is refused
+  // here, once, so nothing later has to check what a node named (audit MCK-3).
+  const unusable = unusableChain(status);
+  if (unusable) throw mismatchError(net, unusable, KNOWN_CHAINS.file, false);
   const why = mismatch(pin, status);
   if (why) throw mismatchError(net, why, KNOWN_CHAINS.file);
   const full = completePin(pin, status);
@@ -1075,6 +1083,7 @@ tool(
       // The resolution itself, so the SDK refuses it too if it's unproven on mainnet.
       const grantCode = encodeKeyGrant(await w.keyGrant(res));
       // AGENT-5: thousands of characters are easy to mangle when retyped; a file can be copied whole.
+      // Its name is a chain id `chain()` checked (no path separator can be in it) and an address.
       const grantFile = join(HOME, `grant-${pinnedChain.chainId ?? "chain"}-${addr}.txt`);
       let saved = false;
       try {

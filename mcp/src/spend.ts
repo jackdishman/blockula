@@ -22,6 +22,7 @@
 import { closeSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { formatFang } from "@blockula/sdk";
+import { CHAIN_ID } from "./network.js";
 
 /** A tx's nonce slot: at most one tx with this account and nonce can execute (on one chain). */
 export interface NonceSlot {
@@ -33,7 +34,7 @@ export interface NonceSlot {
 
 /** A chain as the ledger keys it: `<chain_id> <genesis_hash>`. */
 export const chainKey = (chainId: string, genesisHash: string) => {
-  if (!/^[A-Za-z0-9._-]{1,64}$/.test(chainId) || !/^[0-9a-f]{64}$/.test(genesisHash)) throw new Error("a chain is its id and its 64-hex genesis hash");
+  if (!CHAIN_ID.test(chainId) || !/^[0-9a-f]{64}$/.test(genesisHash)) throw new Error("a chain is its id and its 64-hex genesis hash");
   return `${chainId} ${genesisHash}`;
 };
 
