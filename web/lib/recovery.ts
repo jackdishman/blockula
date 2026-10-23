@@ -153,6 +153,7 @@ export function kitText(k: Kit) {
     "",
     "Anyone holding these 24 words controls the account below. Keep this offline: print it or",
     "write it down, and delete any digital copy. Only ever type the words into the Blockula wallet.",
+    "Blockula will never ask you for these words.",
     "",
     `Account    ${k.name ? `${k.name}  ` : ""}${k.account}`,
     `Network    ${k.network} (chain ${k.chainId})`,

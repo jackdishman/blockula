@@ -7,6 +7,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { localKeysAllowed } from "@/lib/config";
 import { friendly, isPrfUnsupported } from "@/lib/errors";
 import { findAccounts, hintAccount, openLocalKey, unlockPasskey, type AccountChoice } from "@/lib/keys";
+import { welcomeHref } from "@/lib/onboarding";
 import type { Hint } from "@/lib/session";
 import { useWallet } from "@/lib/wallet";
 import { AccountPicker } from "./AccountPicker";
@@ -22,13 +23,16 @@ export function Splash({ text = "Rising from the grave…" }: { text?: string })
   );
 }
 
-/** Renders children only when a wallet is unlocked; otherwise unlock or onboard. */
+/**
+ * Renders children only when a wallet is unlocked; otherwise unlock or onboard. A payment link
+ * (`/send?…`) opened with no wallet goes along to /welcome as `next`, so onboarding ends on it.
+ */
 export function RequireWallet({ children }: { children: ReactNode }) {
   const { ready, hint, wallet } = useWallet();
   const router = useRouter();
   useEffect(() => {
     if (!ready) return;
-    if (!hint) router.replace("/welcome");
+    if (!hint) router.replace(welcomeHref(window.location.pathname, window.location.search));
     else if (wallet && !hint.account) router.replace("/link");
   }, [ready, hint, wallet, router]);
   if (!ready || !hint) return <Splash />;
@@ -37,8 +41,8 @@ export function RequireWallet({ children }: { children: ReactNode }) {
   return <>{children}</>;
 }
 
-/** Shared "a key is unlocked; now which account does it act for?" step. */
-export function useAccountResolution() {
+/** Shared "a key is unlocked; now which account does it act for?" step, then `home` (a same-origin path). */
+export function useAccountResolution(home = "/") {
   const { client, unlocked } = useWallet();
   const router = useRouter();
   const [choices, setChoices] = useState<{ wallet: Wallet; hint: Hint; list: AccountChoice[] } | null>(null);
@@ -46,7 +50,7 @@ export function useAccountResolution() {
   const finish = async (w: Wallet, h: Hint, c: AccountChoice) => {
     await w.actAs(c.address);
     unlocked(w, { ...h, account: c.address, name: c.name ?? undefined });
-    router.replace("/");
+    router.replace(home);
   };
 
   const resolve = async (w: Wallet, h: Hint, opts: { waitingForLink?: boolean } = {}) => {

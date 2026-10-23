@@ -7,6 +7,7 @@ import { Heartbeat } from "@/components/explorer/Heartbeat";
 import { useMe } from "@/components/explorer/kit";
 import { Ledger } from "@/components/explorer/Ledger";
 import { Apparition } from "@/components/Haunt";
+import { BalanceBreakdown, NameExpiryBanner, OnePasskeyBanner } from "@/components/HomeNotes";
 import { Tutorial, useTutorial } from "@/components/Tutorial";
 import { Copy, ExplorerLink, Spinner } from "@/components/ui";
 import { explorer } from "@/lib/config";
@@ -69,6 +70,7 @@ function Home() {
           {frac && <span className="frac">.{frac}</span>}
           <span className="unit">FANG</span>
         </div>
+        <BalanceBreakdown account={account} />
         <div className="actions">
           <Link className="btn primary" href="/send">Send</Link>
           <Link className="btn" href="/receive">Receive</Link>
@@ -81,6 +83,8 @@ function Home() {
           <b>Your recovery kit isn&apos;t active yet.</b> <Link href="/devices#recovery">Activate it</Link> once you have a little FANG for the fee.
         </div>
       )}
+      <OnePasskeyBanner account={account} />
+      <NameExpiryBanner account={account} />
 
       <Tutorial state={tutorial} update={updateTutorial} />
 

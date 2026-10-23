@@ -163,8 +163,10 @@ function Cleanup({ account, kitKeyId, deviceKeyId, tx, onDone }: { account: Acco
   const [error, setError] = useState<string | null>(null);
   const others = (view?.keys ?? []).filter((k) => k.role.type === "owner" && k.key_id !== deviceKeyId);
 
-  const revoke = async (keyId: string) => {
+  const revoke = async (keyId: string, label: string) => {
     if (!wallet) return;
+    // As on Devices & agents: revoking is for good, so ask first.
+    if (!confirm(keyId === kitKeyId ? "Revoke the kit you just used? Its words stop working on the next block." : `Revoke “${label}”? It stops working on the next block.`)) return;
     setBusy(keyId);
     setError(null);
     try {
@@ -195,7 +197,7 @@ function Cleanup({ account, kitKeyId, deviceKeyId, tx, onDone }: { account: Acco
               <span className="key-label">{k.label}</span> {k.key_id === kitKeyId && <span className="pill">the kit you just used</span>}
               <span className="dim small block mono">{keyCode(k.key_id)}</span>
             </div>
-            <button className="btn small danger" disabled={!!busy} onClick={() => revoke(k.key_id)}>
+            <button className="btn small danger" disabled={!!busy} onClick={() => revoke(k.key_id, k.label)}>
               {busy === k.key_id ? <Spinner /> : "Revoke"}
             </button>
           </div>

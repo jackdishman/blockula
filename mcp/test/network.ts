@@ -8,7 +8,7 @@
 //    remembers the chain across restarts, and notices a node that switches mid-session.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -19,7 +19,7 @@ import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { RELEASE_SIGNATURE_FORMAT, releaseMessage } from "@blockula/sdk";
-import { KNOWN_CLOCKS, KNOWN_GENESIS, KnownChains, LOCAL_RPC, MAINNET_RPCS, TESTNET_RPC, completePin, effectivePin, mismatch, networkArg, resolveNetwork } from "../src/network.js";
+import { KNOWN_CLOCKS, KNOWN_GENESIS, KnownChains, LOCAL_RPC, MAINNET_RPCS, TESTNET_RPC, canonicalUrl, completePin, defaultWitnesses, effectivePin, mismatch, networkArg, networkLabel, resolveNetwork, unusableChain } from "../src/network.js";
 import { RELEASE_KEY_ID, binPaths, checkBinaryVersion, fetchVerifiedRelease, latestTagFrom, pickNodeBinary, readReleasePin, releaseKeyIdFrom, type ReleaseDeps } from "../src/release.js";
 
 const G1 = "11".repeat(32);
@@ -61,15 +61,65 @@ const refusals: [Record<string, string>, string[], RegExp][] = [
   [{ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_WITNESSES: "http://w.example" }, [], /BLOCKULA_WITNESSES must use https/],
   [{ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_WITNESSES: "https://rpc.example/" }, [], /other nodes than BLOCKULA_RPC/],
   [{ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_WITNESSES: "https://w.example,https://w.example" }, [], /twice/],
+  // Audit MCK-1: a node spelled two ways is one node, for the guards as for the defaults.
+  [{ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_WITNESSES: "https://RPC.example:443/." }, [], /other nodes than BLOCKULA_RPC/],
+  [{ BLOCKULA_RPC: "https://Rpc.Example:443/.", BLOCKULA_WITNESSES: "https://rpc.example" }, [], /other nodes than BLOCKULA_RPC/],
+  [{ BLOCKULA_RPC: "https://Blockula-Testnet.fly.dev", BLOCKULA_WITNESSES: TESTNET_RPC }, [], /other nodes than BLOCKULA_RPC/],
+  [{ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_WITNESSES: "https://w.example,https://W.example:443/" }, [], /twice/],
+  // What the client appends /api/… to is a node's URL: a query or a fragment would be dropped or misread.
+  [{ BLOCKULA_RPC: "https://rpc.example/?key=1" }, [], /without a query or a fragment/],
+  [{ BLOCKULA_RPC: "https://rpc.example/#x" }, [], /without a query or a fragment/],
+  [{ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_WITNESSES: "https://w.example/?k=1" }, [], /BLOCKULA_WITNESSES must be a node's URL, without a query or a fragment/],
+  // Audit MCK-3: a pinned chain id is one this MCP can key its ledger and files by.
+  [{ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_CHAIN_ID: "../x" }, [], /BLOCKULA_CHAIN_ID must be a chain id/],
+  [{ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_CHAIN_ID: "a".repeat(65) }, [], /BLOCKULA_CHAIN_ID must be a chain id/],
 ];
 // gap-7-1: witnesses names are proven against.
 assert.deepEqual(resolveNetwork({ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_WITNESSES: " https://a.example/ , https://b.example ," }).witnesses, ["https://a.example", "https://b.example"]);
 assert.deepEqual(resolveNetwork({}).witnesses, []);
+// OPERATOR-6: your own node of the public testnet gets its public RPC as a witness unless
+// BLOCKULA_WITNESSES says otherwise (`none` opts out); the public RPC itself gets none, and so do
+// chains without built-in public RPCs.
+const own = resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171" }, ["--network", "testnet"]);
+assert.deepEqual([own.key, own.rpc, own.witnesses, own.witnessesSet], ["testnet", "http://127.0.0.1:7171", [TESTNET_RPC], false]);
+assert.deepEqual([resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171", BLOCKULA_WITNESSES: "none" }, ["--network", "testnet"]).witnesses, resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171", BLOCKULA_WITNESSES: "None" }, ["--network", "testnet"]).witnessesSet], [[], true]);
+assert.deepEqual(resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171", BLOCKULA_WITNESSES: "https://w.example" }, ["--network", "testnet"]).witnesses, ["https://w.example"], "listed witnesses replace the default");
+assert.deepEqual(resolveNetwork({}, ["--network", "testnet"]).witnesses, [], "the public RPC isn't its own witness");
+assert.deepEqual([defaultWitnesses("blockula-testnet-2", "http://127.0.0.1:7171"), defaultWitnesses("blockula-testnet-2", TESTNET_RPC), defaultWitnesses("blockula-dev", "http://127.0.0.1:7070"), defaultWitnesses("blockula-1", "http://127.0.0.1:7171"), defaultWitnesses(undefined, "x")], [[TESTNET_RPC], [], [], [], []]);
+// Audit MCK-1: the public RPC under any spelling is the public RPC, and never its own witness (a
+// proof checked against the state root the same node reports proves nothing, yet would be called
+// "proven against 1 independent node").
+for (const spelled of ["https://Blockula-Testnet.fly.dev", "https://BLOCKULA-TESTNET.FLY.DEV/", "https://blockula-testnet.fly.dev:443", "https://blockula-testnet.fly.dev/.", "https://blockula-testnet.fly.dev./", "https://blockula-testnet.fly.dev:443/./"]) {
+  assert.deepEqual(defaultWitnesses("blockula-testnet-2", spelled), [], spelled);
+  const n = resolveNetwork({ BLOCKULA_RPC: spelled });
+  assert.deepEqual([n.key, n.rpc, n.witnesses, n.pin.chainId], ["testnet", TESTNET_RPC, [], "blockula-testnet-2"], `${spelled} is the public testnet`);
+}
+assert.deepEqual(defaultWitnesses("blockula-testnet-2", "http://127.0.0.1:7171/."), [TESTNET_RPC], "your own node, however spelled, still gets the public RPC");
+assert.deepEqual(resolveNetwork({ BLOCKULA_RPC: "http://LOCALHOST:7171//" }, ["--network", "testnet"]).witnesses, [TESTNET_RPC]);
+// A URL has one spelling: the node's own, as the URL parser normalizes it, without the trailing slash.
+for (const [typed, canonical] of [
+  ["https://rpc.example/", "https://rpc.example"],
+  ["HTTPS://Rpc.Example:443", "https://rpc.example"],
+  ["http://LocalHost:80/a/./b//", "http://localhost/a/b"],
+  ["https://rpc.example./", "https://rpc.example"],
+  ["https://rpc.example.:8443/x/", "https://rpc.example:8443/x"],
+  ["http://[::1]:7070/", "http://[::1]:7070"],
+  ["https://rpc.example/Node1", "https://rpc.example/Node1"], // a path is case-sensitive
+  ["http://127.1:7070", "http://127.0.0.1:7070"],
+  ["ftp://rpc.example/", "ftp://rpc.example/"], // not a node URL: as it is
+  ["not a url", "not a url"],
+]) assert.equal(canonicalUrl(typed), canonical, typed);
+for (const u of [TESTNET_RPC, LOCAL_RPC, ...MAINNET_RPCS]) assert.equal(canonicalUrl(u), u, `${u}: the built-in RPCs are in canonical spelling`);
+assert.deepEqual(resolveNetwork({ BLOCKULA_RPC: "https://Rpc.Example:443/.", BLOCKULA_WITNESSES: "https://W.example/ , https://x.example:8443/" }).witnesses, ["https://w.example", "https://x.example:8443"]);
+// A node on this machine is "your node on" the public testnet once its chain is known.
+assert.equal(networkLabel(resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171" }), "blockula-testnet-2"), "your node on the public testnet");
+assert.equal(networkLabel(resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171" }), "blockula-dev"), "local dev node");
+assert.equal(networkLabel(resolveNetwork({}), "blockula-testnet-2"), "public testnet");
 for (const [env, argv, re] of refusals) assert.throws(() => resolveNetwork(env, argv), re, JSON.stringify([env, argv]));
 // Built-in mainnet RPCs: https, and the first is mainnet's default.
 for (const u of MAINNET_RPCS) assert.match(u, /^https:\/\/[^/\s]+$/, u);
 if (MAINNET_RPCS.length) assert.equal(resolveNetwork({}, ["--network", "mainnet"]).rpc, MAINNET_RPCS[0]);
-console.log("✓ the network comes from the configuration only (default: the public testnet)");
+console.log("✓ the network comes from the configuration only (default: the public testnet); a node is one node however its URL is spelled, so the public RPC is never its own witness");
 
 // ---- 2. pins ----
 
@@ -118,10 +168,32 @@ if (builtIn) {
   assert.match(mismatch(testnet.pin, status("blockula-testnet-2", G1 === builtIn ? G2 : G1, "tboo")) ?? "", /genesis/, "a node on another instance of the testnet is refused");
   assert.equal(mismatch(testnet.pin, status("blockula-testnet-2", builtIn, "tboo")), null);
 }
+// Audit MCK-3: a node's chain id is a ledger key and part of file names, so a node reporting one
+// this MCP can't key by (a path, a space, past 64 characters) isn't pinned at all.
+assert.equal(unusableChain(status("fake-chain", G1)), null);
+assert.equal(unusableChain(status("blockula_dev.1", G1.toUpperCase())), null);
+assert.equal(unusableChain({ chain_id: "a".repeat(64) }), null, "a node that reports no genesis hash is pinned by its chain id alone");
+for (const bad of ["../../escaped/x", "a/b", "a\\b", "a b", "", "a".repeat(65), "x\n", "é"]) assert.match(unusableChain(status(bad, G1)) ?? "", /the node reports the chain id .*1 to 64 letters/, JSON.stringify(bad));
+assert.match(unusableChain(status("a".repeat(100), G1)) ?? "", /"a{80}…"/, "a long id is cut short in the message");
+for (const bad of ["abc", "zz".repeat(32), `${G1}0`, 5, ""]) assert.match(unusableChain({ chain_id: "a", genesis_hash: bad }) ?? "", /genesis hash that isn't 64 hex/, JSON.stringify(bad));
+assert.equal(unusableChain({ chain_id: 5 }), null, "(not a string: `mismatch` says it reports no chain id)");
+// A release before canonicalUrl remembered a node's URL as it was typed. That entry is the same
+// node's, so its pin holds (the node isn't pinned afresh on trust) and moves to the canonical spelling.
+const legacyFile = join(dir, "legacy-known-chains.json");
+const clockEntry = { created_at_ms: 1, block_time_ms: 1000 };
+writeFileSync(legacyFile, JSON.stringify({ "custom https://Rpc.Example:443/.": { chainId: "a", genesisHash: G1 }, "custom https://other.example": { chainId: "b", genesisHash: G2 }, "testnet http://127.0.0.1:7171/.": { chainId: "t", genesisHash: G2 }, [`clock a ${G1}`]: clockEntry }));
+const legacy = new KnownChains(legacyFile);
+const rpcExample = resolveNetwork({ BLOCKULA_RPC: "https://rpc.example" });
+assert.deepEqual(legacy.get(rpcExample), { chainId: "a", genesisHash: G1 });
+assert.deepEqual(JSON.parse(readFileSync(legacyFile, "utf8")), { "custom https://rpc.example": { chainId: "a", genesisHash: G1 }, "custom https://other.example": { chainId: "b", genesisHash: G2 }, "testnet http://127.0.0.1:7171/.": { chainId: "t", genesisHash: G2 }, [`clock a ${G1}`]: clockEntry }, "moved: the entry an error names is the only one");
+assert.deepEqual(new KnownChains(legacyFile).get(rpcExample), { chainId: "a", genesisHash: G1 });
+assert.equal(legacy.get(resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171" }, ["--network", "custom"])), undefined, "another network's entry for the same URL isn't this one's");
+assert.deepEqual(legacy.get(resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171" }, ["--network", "testnet"])), { chainId: "t", genesisHash: G2 });
+assert.equal(legacy.get(resolveNetwork({ BLOCKULA_RPC: "https://elsewhere.example" })), undefined);
 const local = resolveNetwork({}, ["--network", "local"]);
 known.save(local, { chainId: "blockula-dev", genesisHash: G1 });
 assert.equal(known.get(local), undefined, "dev chains are re-pinned each session (a reset makes a new genesis)");
-console.log("✓ pins: chain id, genesis, prefix, known genesis, trust on first use");
+console.log("✓ pins: chain id, genesis, prefix, known genesis, trust on first use; a chain id that can't key files and ledgers isn't pinned; a pin remembered under another spelling of a URL moves to the canonical one");
 
 // ---- 3. release checks ----
 
@@ -285,7 +357,7 @@ const tools = await s.tools();
 for (const name of ["stake", "unstake", "my_stake", "withdraw_stake", "list_proposals", "vote", "renew_name"]) assert.ok(tools.some((t) => t.name === name), `tool ${name}`);
 for (const name of ["list_hunts", "lookup", "list_proposals"]) assert.match(tools.find((t) => t.name === name)?.description ?? "", /untrusted_\*/, `${name} says its chain text is untrusted`);
 for (const name of ["list_hunts", "fund_hunt", "contribution_pool", "submit_contribution", "my_contributions"]) {
-  assert.match(tools.find((t) => t.name === name)?.description ?? "", /Testnet FANG, Hunts and Soul have no monetary value/, `${name} carries the disclaimer`);
+  assert.match(tools.find((t) => t.name === name)?.description ?? "", /Testnet FANG, Hunts and Soul have no value/, `${name} carries the disclaimer`);
 }
 r = await s.call("status");
 assert.ok(r.error && /Refusing .*chain "fake-chain", not "another-chain"/.test(r.text), r.text);
@@ -316,11 +388,53 @@ r = await s.call("status");
 assert.ok(r.error && /starts from genesis .*not 2222/.test(r.text) && r.text.includes("known-chains.json"), r.text);
 await s.close();
 
+// A pin remembered under another spelling of the node's URL (before canonicalUrl) still holds after
+// the upgrade, and the entry the error names is the one in the file (audit MCK-1).
+const legacyHome = join(dir, "legacy-home");
+mkdirSync(legacyHome, { recursive: true });
+writeFileSync(join(legacyHome, "known-chains.json"), JSON.stringify({ [`custom ${rpc}/.`]: { chainId: "fake-chain", genesisHash: G2 } }));
+s = await server({ BLOCKULA_RPC: rpc, BLOCKULA_NETWORK: "custom", BLOCKULA_HOME: legacyHome });
+r = await s.call("status");
+assert.ok(r.error && /starts from genesis .*not 2222/.test(r.text) && r.text.includes(`("custom ${rpc}")`), r.text);
+assert.deepEqual(Object.keys(JSON.parse(readFileSync(join(legacyHome, "known-chains.json"), "utf8"))), [`custom ${rpc}`]);
+await s.close();
+
+// A node whose chain can't key the ledger, the locks or a file name isn't pinned: every tool refuses
+// it for that reason (not for a missing genesis hash), and nothing is written outside BLOCKULA_HOME
+// (audit MCK-3: `use_account` used to say the node reported no genesis hash).
+mkdirSync(join(dir, "escaped"));
+const outside = readdirSync(dir).sort();
+for (const [chain_id, genesis_hash, why] of [
+  ["x/../../escaped/y", G1, /the node reports the chain id "x\/\.\.\/\.\.\/escaped\/y", and a chain id here is 1 to 64/],
+  ["a".repeat(65), G1, /the node reports the chain id "a{65}", and a chain id here/],
+  ["fake-chain", "zz".repeat(32), /the node reports a genesis hash that isn't 64 hex characters/],
+] as const) {
+  nodeStatus = { ...nodeStatus, chain_id, genesis_hash };
+  s = await server({ BLOCKULA_RPC: rpc });
+  for (const [tool, args] of [["status", {}], ["create_wallet", {}], ["use_account", { account: "self" }]] as const) {
+    r = await s.call(tool, args);
+    assert.ok(r.error && /^Error: Refusing .*Nothing was signed or sent\.$/.test(r.text) && why.test(r.text), `${tool}: ${r.text}`);
+    assert.ok(!/genesis hash, so the account can't be kept|relaunched|start_dev_node/.test(r.text), `${tool}: the reason is the chain's, and forgetting a remembered chain wouldn't help: ${r.text}`);
+  }
+  await s.close();
+}
+assert.deepEqual(readdirSync(dir).sort(), outside, "nothing was written outside BLOCKULA_HOME");
+assert.deepEqual(readdirSync(join(dir, "escaped")), [], "where a chain id like that would have put a grant file");
+assert.ok(!readdirSync(home).some((f) => f.startsWith("grant-")), "no grant file");
+// A node that reports no genesis hash can be used, but can't keep an account: that's what use_account says.
+const { genesis_hash: _none, ...noGenesis } = { ...nodeStatus, chain_id: "fake-chain", genesis_hash: G1 };
+nodeStatus = noGenesis as typeof nodeStatus;
+s = await server({ BLOCKULA_RPC: rpc });
+r = await s.call("use_account", { account: "self" });
+assert.ok(r.error && /doesn't report its chain's genesis hash, so the account can't be kept for this chain/.test(r.text), r.text);
+await s.close();
+nodeStatus = { ...nodeStatus, chain_id: "fake-chain", genesis_hash: G1 };
+
 // Hunts and the contribution pool say testnet FANG is worth nothing on test chains only: a tool's
 // description by the configured network (of test chains alone when the node's chain isn't known
 // yet), a result by the chain the node is on. On mainnet nothing is said about value.
-const NO_VALUE = /Testnet FANG, Hunts and Soul have no monetary value/;
-const HEDGED = /On test chains, FANG, Hunts and Soul have no monetary value/;
+const NO_VALUE = /Testnet FANG, Hunts and Soul have no value/;
+const HEDGED = /On test chains, FANG, Hunts and Soul have no value/;
 const VALUE_TOOLS = ["list_hunts", "fund_hunt", "contribution_pool", "submit_contribution", "my_contributions"];
 const described = async (srv: Awaited<ReturnType<typeof server>>) => {
   const all = await srv.tools();
@@ -338,14 +452,14 @@ await s.close();
 nodeStatus = { ...nodeStatus, chain_id: "blockula-1", genesis_hash: KNOWN_GENESIS["blockula-1"] ?? G1 };
 s = await server({ BLOCKULA_RPC: rpc });
 r = await s.call("list_hunts");
-assert.ok(!r.error && !/monetary value/.test(r.text) && /untrusted_\*/.test(JSON.parse(r.text).note), `a node on blockula-1 is mainnet, however configured: ${r.text}`);
+assert.ok(!r.error && !/have no value/.test(r.text) && /untrusted_\*/.test(JSON.parse(r.text).note), `a node on blockula-1 is mainnet, however configured: ${r.text}`);
 await s.close();
 s = await server({ BLOCKULA_RPC: rpc }, ["--network", "mainnet"]);
-for (const d of await described(s)) assert.ok(!/monetary value/.test(d) && d === d.trim(), `mainnet says nothing about value: "${d}"`);
+for (const d of await described(s)) assert.ok(!/have no value/.test(d) && d === d.trim(), `mainnet says nothing about value: "${d}"`);
 r = await s.call("list_hunts");
-assert.ok(!r.error && !/monetary value/.test(r.text), r.text);
+assert.ok(!r.error && !/have no value/.test(r.text), r.text);
 r = await s.call("contribution_pool");
-assert.ok(!r.error && !/monetary value/.test(r.text) && JSON.parse(r.text).note === undefined, r.text);
+assert.ok(!r.error && !/have no value/.test(r.text) && JSON.parse(r.text).note === undefined, r.text);
 await s.close();
 nodeStatus = { ...nodeStatus, chain_id: "fake-chain", genesis_hash: G1 };
 console.log("✓ testnet FANG is called worthless on test chains only, never on mainnet");
@@ -358,4 +472,4 @@ await s.close();
 
 fake.close();
 rmSync(dir, { recursive: true, force: true });
-console.log("✓ the server refuses the wrong chain, notices a switch, and remembers chains across restarts");
+console.log("✓ the server refuses the wrong chain, notices a switch, remembers chains across restarts (and across a URL's spellings), and refuses a node whose chain id or genesis hash can't be pinned");

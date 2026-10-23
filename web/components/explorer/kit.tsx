@@ -4,6 +4,7 @@ import "@/app/explorer.css";
 import Link from "next/link";
 import { useEffect, useState, type ReactNode } from "react";
 import { Copy } from "@/components/ui";
+import { unreachableHint } from "@/lib/errors";
 import { GLOSSARY, type TermKey } from "@/lib/explorer/glossary";
 import { compactDrops, formatDrops, parseDrops, type Holding, type Me } from "@/lib/explorer/ledger";
 import { to } from "@/lib/explorer/routes";
@@ -187,7 +188,7 @@ export function NotFound({ what, error }: { what: string; error: Error }) {
         <span className="eyebrow">{unreachable ? "The node is silent" : "Nothing here"}</span>
         <h1>{unreachable ? "Can't reach the node" : `No such ${what}`}</h1>
         <p className="dim">
-          {unreachable ? "The network picked at the top isn't answering. Try another, or start a local node with `blockula dev`." : `${error.message}. It may be on another network: check the one picked at the top.`}
+          {unreachable ? `The network picked at the top isn't answering. ${unreachableHint()}` : `${error.message}. It may be on another network: check the one picked at the top.`}
         </p>
         <Link href={to.explore()}>Back to the explorer</Link>
       </section>
