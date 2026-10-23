@@ -1830,6 +1830,24 @@ export interface HistoryPage {
   paged: boolean;
 }
 
+/**
+ * A node's URL in one spelling, so a node compares equal to itself however it's written: scheme and
+ * host lowercased, a default port, dot segments and credentials dropped (the URL parser's own
+ * normalization), no trailing dot on the host, no trailing slash, no query or fragment. What isn't
+ * an http(s) URL comes back as it is. (`Client` compares witnesses with its own node by it.)
+ */
+function canonicalNodeUrl(u: string): string {
+  try {
+    const url = new URL(u);
+    if (!/^https?:$/.test(url.protocol)) return u;
+    // `host` carries the port; a fully qualified name's trailing dot comes before it, or ends it.
+    const host = url.host.replace(/\.(?=:\d+$|$)/, "");
+    return `${url.protocol}//${host}${url.pathname.replace(/\/+$/, "")}`;
+  } catch {
+    return u;
+  }
+}
+
 export class Client {
   /** The chain's address prefix: given, learned from `/api/status`, or `boo` until then. */
   prefix: string;
@@ -1893,7 +1911,9 @@ export class Client {
     const rpcUrl = this.rpc;
     this.timeoutMs = checkTimeoutMs(opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
     this.witnesses = [...(opts.witnesses ?? [])];
-    if (this.witnesses.some((w) => w === this || w.rpc.replace(/\/$/, "") === rpcUrl.replace(/\/$/, ""))) throw new Error("a witness must be another node, not the client's own");
+    // The same node under another spelling (`https://Node.Example:443/.`) is still the client's own: a proof checked against the state root the node itself reports proves nothing.
+    const ownUrl = canonicalNodeUrl(rpcUrl);
+    if (this.witnesses.some((w) => w === this || canonicalNodeUrl(w.rpc) === ownUrl)) throw new Error("a witness must be another node, not the client's own");
     this.requireProvenNames = opts.requireProvenNames === true;
     if (this.requireProvenNames && this.witnesses.length === 0) throw new Error("requireProvenNames needs witnesses to prove names against");
     this.maxHeadLeadBlocks = opts.maxHeadLeadBlocks ?? DEFAULT_MAX_HEAD_LEAD_BLOCKS;

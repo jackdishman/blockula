@@ -4,18 +4,18 @@
 //   claude mcp add blockula -- npx -y @blockula/mcp --network local      (a `blockula dev` chain)
 //
 // Env:
-//   BLOCKULA_NETWORK    mainnet, testnet (default), local or custom (same as --network)
-//   BLOCKULA_RPC        node URL (default: the network's public RPC; required for custom, and for
-//                       mainnet until public RPCs are built in)
-//   BLOCKULA_CHAIN_ID / BLOCKULA_GENESIS_HASH   pin the chain the node must be on
+//   BLOCKULA_NETWORK    testnet (default), local or custom (same as --network)
+//   BLOCKULA_RPC        node URL (default: the network's public RPC; required for custom)
+//   BLOCKULA_CHAIN_ID / BLOCKULA_GENESIS_HASH   pin the chain the node must be on (a node that says
+//                       it's on blockula-1 is refused unless BLOCKULA_CHAIN_ID=blockula-1)
 //   BLOCKULA_WITNESSES  other nodes of the same chain (comma-separated URLs): .boo names that get
 //                       signed (send, stake, unstake, use_account) are proven against them, and the
 //                       height each tx is signed against must not be ahead of their heads (nor, in
 //                       any case, past what the chain's genesis clock allows). Without
 //                       them a send signs the name itself (the chain resolves it when it runs), and
 //                       where an address is needed (stake, unstake, use_account) a name is the
-//                       node's word: on mainnet (any node on blockula-1, however it was configured)
-//                       the address must be confirmed first. Unset, your own node of the public
+//                       node's word: on blockula-1 (BLOCKULA_CHAIN_ID=blockula-1) the address must be
+//                       confirmed first. Unset, your own node of the public
 //                       testnet (any node but its public RPC) gets the public RPC as a witness;
 //                       `none` opts out.
 //   BLOCKULA_HOME       where the agent wallet lives (default ~/.blockula)
@@ -38,13 +38,13 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { ApiError, Client, HeightAheadError, MAINNET_CHAIN_ID, NAMESPACES, RequestTimeoutError, TxFailedError, TxPendingError, Wallet, addressPrefix, bareName, baseFee, decodeAccount, describeKind, encodeKeyGrant, isAddress, proposalDigest, formatFang, paramsOf, proposalSummary, stakeSummary, txDropped, txId, type Action, type ProposalKind, type ProposalSummary, type Recipient, type Resolution, type Tx } from "@blockula/sdk";
+import { ApiError, Client, HeightAheadError, NAMESPACES, RequestTimeoutError, TxFailedError, TxPendingError, Wallet, addressPrefix, bareName, baseFee, decodeAccount, describeKind, encodeKeyGrant, isAddress, proposalDigest, formatFang, paramsOf, proposalSummary, stakeSummary, txDropped, txId, type Action, type ProposalKind, type ProposalSummary, type Recipient, type Resolution, type Tx } from "@blockula/sdk";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { z } from "zod";
-import { KNOWN_CLOCKS, KNOWN_GENESIS, KnownChains, clockFrom, completePin, defaultWitnesses, effectivePin, mismatch, mismatchError, networkLabel, resolveNetwork, unusableChain, type GenesisClock, type Network } from "./network.js";
+import { BLOCKULA_1, KNOWN_CLOCKS, KNOWN_GENESIS, KnownChains, clockFrom, completePin, defaultWitnesses, effectivePin, mismatch, mismatchError, networkLabel, resolveNetwork, unpinnedBlockula1, unusableChain, type GenesisClock, type Network } from "./network.js";
 import { WALLET_URLS, actingFor, checkCode, createWalletFile, ignoredNote, newWalletFile, readWalletFile, secretOf, setActingFor, writeWalletFile, type ActingFor, type WalletFile } from "./accounts.js";
 import { aboutBlocks, allowanceOf, amountArg, capsFrom, configError, dropsOf, keyOn, msFrom, preflight, spendableNow } from "./budget.js";
 import { AccountLocks, NonceTracker } from "./locks.js";
@@ -91,11 +91,8 @@ function nodeBinary(): NodeBinary & { matches?: boolean } {
 const ranWith = (b: NodeBinary & { matches?: boolean }) =>
   `Ran ${b.path}${b.version ? ` (${b.version})` : ""}${b.matches === false && b.path !== "blockula" ? `, not this MCP's version (${VERSION}): install_node v${VERSION} (or \`blockula release install v${VERSION}\`) gets one that is.` : "."}`;
 
-/**
- * Testnet economics, said wherever Hunts and the contribution pool come up, on test chains only:
- * on mainnet FANG is real, so nothing is said about value there (valueNote).
- */
-const NO_VALUE = "Testnet FANG, Hunts and Soul have no value.";
+/** Said wherever Hunts and the contribution pool come up: on every chain, FANG, Hunts and Soul have no value. */
+const NO_VALUE = "FANG, Hunts and Soul have no value.";
 
 function releaseTarget(): string | null {
   const key = `${process.platform}-${process.arch}`;
@@ -112,15 +109,8 @@ try {
   NET_ERROR = e as Error;
 }
 const RPC = NET?.rpc ?? "";
-/**
- * NO_VALUE in a tool's description, which is fixed when the server starts: on a network pinned to
- * a test chain (any chain but blockula-1), NO_VALUE; on mainnet, nothing; on a node whose chain
- * isn't known until it answers (a local or custom node without BLOCKULA_CHAIN_ID), the same said of
- * test chains only, which is true on either. Results say it by the chain the node is on (valueNote).
- */
-const NO_VALUE_DESCRIBED = NET?.mainnet ? "" : NET?.pin.chainId ? NO_VALUE : "On test chains, FANG, Hunts and Soul have no value.";
-/** A Hunt or contribution tool's description: `text`, then NO_VALUE_DESCRIBED when there is one. */
-const described = (text: string) => [text, NO_VALUE_DESCRIBED].filter(Boolean).join(" ");
+/** A Hunt or contribution tool's description: `text`, then NO_VALUE. */
+const described = (text: string) => `${text} ${NO_VALUE}`;
 let pinned: Client | null = null;
 /** The chain `pinned` is held to (tx_status reads a signed tx's record only on the chain it was signed for). */
 let pinnedChain: { chainId?: string; genesisHash?: string; prefix?: string } = {};
@@ -165,6 +155,9 @@ async function chain(): Promise<Client> {
   if (unusable) throw mismatchError(net, unusable, KNOWN_CHAINS.file, false);
   const why = mismatch(pin, status);
   if (why) throw mismatchError(net, why, KNOWN_CHAINS.file);
+  // blockula-1 only where the user pinned it: forgetting what was remembered wouldn't help.
+  const unpinned = unpinnedBlockula1(pin, status);
+  if (unpinned) throw mismatchError(net, unpinned, KNOWN_CHAINS.file, false);
   const full = completePin(pin, status);
   KNOWN_CHAINS.save(net, full);
   const pins = { chainId: full.chainId, genesisHash: full.genesisHash, prefix: full.prefix, timeoutMs: TIMEOUT_MS };
@@ -231,23 +224,16 @@ const LOCKS = new AccountLocks(join(HOME, "nonces"));
 const NONCES = new NonceTracker(join(HOME, "nonces"));
 
 /**
- * Whether this is real money: the configured network is mainnet, or the chain the client is
- * pinned to is (audit gap-7-1, R1 bypass): BLOCKULA_RPC alone pointing at a node on blockula-1 is
- * a "custom" network, and gets mainnet's rules all the same. The client is pinned to the chain id
- * of its first status, and refuses any later status that reports another, so this is the chain
- * every signature it makes is for.
+ * Whether this is blockula-1, where an address that was resolved from a name by one node isn't
+ * signed until the user confirms it (audit gap-7-1, R1 bypass): decided by the chain the client is
+ * pinned to, not by what the configuration calls the network, so BLOCKULA_RPC alone at a node on
+ * blockula-1 gets the same rule. The client is pinned to the chain id of its first status, and
+ * refuses any later status that reports another, so this is the chain every signature it makes is
+ * for.
  */
-async function realMoney(client: Client): Promise<boolean> {
-  return network().mainnet || (await client.status()).chain_id === MAINNET_CHAIN_ID;
+async function onBlockula1(client: Client): Promise<boolean> {
+  return (await client.status()).chain_id === BLOCKULA_1;
 }
-
-/** NO_VALUE for a result, by the chain the node is pinned to: said on test chains, nothing on mainnet. */
-async function valueNote(): Promise<string> {
-  return (await realMoney(await chain())) ? "" : NO_VALUE;
-}
-
-/** A result's `note`: its parts that aren't empty, or nothing at all. */
-const noteOf = (...parts: string[]) => parts.filter(Boolean).join(" ") || undefined;
 
 /** What one tool call spends. */
 interface Spend {
@@ -267,7 +253,7 @@ interface Spend {
   outflow?: bigint;
   /**
    * How names in fields that need an address were resolved: the SDK refuses an unproven one on
-   * mainnet against the very status the tx is signed for (a second check behind `resolved`).
+   * blockula-1 against the very status the tx is signed for (a second check behind `resolved`).
    */
   resolutions?: Resolution[];
 }
@@ -484,14 +470,14 @@ async function namePrices(client: Client, name: string): Promise<{ price: bigint
 /**
  * A name or address resolved for a field that needs an address (staking's validator, the account
  * use_account acts for; audit gap-7-1). With BLOCKULA_WITNESSES a name is proven against them
- * (`Client.resolution`). Without, it's the node's word: on mainnet that's not enough to sign real
- * money to, so the tool answers with the address for the user to confirm instead (the agent then
- * passes the address); elsewhere it signs and says it's unproven. Payments don't come here: they
- * sign the name (`Client.recipient`), which the chain resolves itself.
+ * (`Client.resolution`). Without, it's the node's word: on blockula-1 that's not enough to sign, so
+ * the tool answers with the address for the user to confirm instead (the agent then passes the
+ * address); elsewhere it signs and says it's unproven. Payments don't come here: they sign the
+ * name (`Client.recipient`), which the chain resolves itself.
  */
 async function resolved(client: Client, input: string, role: string): Promise<{ res: Resolution; confirm?: undefined } | { res?: undefined; confirm: Record<string, unknown> }> {
   const res = await client.resolution(input);
-  if (!res.proven && (await realMoney(client))) {
+  if (!res.proven && (await onBlockula1(client))) {
     return {
       confirm: {
         status: "not_sent",
@@ -499,7 +485,7 @@ async function resolved(client: Client, input: string, role: string): Promise<{ 
         [role]: clean(input, 100),
         resolves_to: res.address,
         resolved_by: clean(res.how, 300),
-        next: `Nothing was signed. This is real money, and ${clean(input, 100)} was resolved by one node without proof: a node can point a name anywhere. Show the user the address ${res.address}; only if they confirm it's the right ${role}, call this tool again with that address instead of the name. (With BLOCKULA_WITNESSES configured, names are proven and this step isn't needed.)`,
+        next: `Nothing was signed. ${clean(input, 100)} was resolved by one node without proof, and on ${BLOCKULA_1} that isn't signed: a node can point a name anywhere. Show the user the address ${res.address}; only if they confirm it's the right ${role}, call this tool again with that address instead of the name. (With BLOCKULA_WITNESSES configured, names are proven and this step isn't needed.)`,
       },
     };
   }
@@ -593,13 +579,12 @@ tool("status", "Blockula network status: which network and node you're connected
   const pick = ["chain_id", "height", "finalized_height", "syncing", "epoch", "active_validators", "supply_display", "burned_display", "version", "protocol_version", "head_age_ms", "crypto"];
   return {
     network: networkLabel(net, pinnedChain.chainId),
-    real_money: net.mainnet || s.chain_id === MAINNET_CHAIN_ID,
     rpc: net.rpc,
     // OPERATOR-6: who checks this node's answers about names and heights.
     witnesses: activeWitnesses,
     names: activeWitnesses.length ? `proven against ${activeWitnesses.length} node${activeWitnesses.length === 1 ? "" : "s"} (${activeWitnesses.join(", ")})` : `UNPROVEN: one node's word (${net.rpc}). BLOCKULA_WITNESSES lists other nodes to prove them against.`,
     pinned: chainData({ chain_id: s.chain_id, genesis_hash: s.genesis_hash, address_prefix: s.address_prefix }),
-    how_to_change: "The network is fixed while this MCP runs. The user changes it in the MCP's configuration (--network mainnet|testnet|local|custom, or BLOCKULA_RPC).",
+    how_to_change: "The network is fixed while this MCP runs. The user changes it in the MCP's configuration (--network testnet|local|custom, or BLOCKULA_RPC).",
     explorer: net.rpc,
     mcp_version: VERSION,
     node_reports: chainData(Object.fromEntries(pick.filter((k) => k in s).map((k) => [k, s[k]]))),
@@ -1063,7 +1048,7 @@ tool(
       return { acting_for: w.address };
     }
     otherNetwork(account, await client.addressPrefix());
-    // The account is an address every later tx names: on mainnet an unproven name waits for the
+    // The account is an address every later tx names: on blockula-1 an unproven name waits for the
     // user to confirm the address (audit gap-7-1).
     const { res, confirm } = await resolved(client, account, "account");
     if (confirm) return confirm;
@@ -1080,7 +1065,7 @@ tool(
       // Adding a key needs its consent to the account (audit gap-7-2): this key signs it for this
       // one address, and the user's wallet refuses a code made for any other account.
       const wallet = pinnedChain.chainId ? WALLET_URLS[pinnedChain.chainId] : undefined;
-      // The resolution itself, so the SDK refuses it too if it's unproven on mainnet.
+      // The resolution itself, so the SDK refuses it too if it's unproven on blockula-1.
       const grantCode = encodeKeyGrant(await w.keyGrant(res));
       // AGENT-5: thousands of characters are easy to mangle when retyped; a file can be copied whole.
       // Its name is a chain id `chain()` checked (no path separator can be in it) and an address.
@@ -1219,7 +1204,7 @@ tool("latest_blocks", "The most recent blocks, summarized.", { limit: z.number()
 
 // ---- staking ----
 
-tool("stake", "Stake (delegate) FANG from the account this agent acts for in a validator's pool. Staked FANG earns a share of issuance, is slashed if the validator misbehaves, and takes the unbonding period (21 days on mainnet) to come back after unstake. Session keys can't stake. Counts toward BLOCKULA_MAX_SEND / BLOCKULA_MAX_DAILY.", { validator: z.string().describe("validator address (or a .boo name its account holds)"), amount: z.string().describe("FANG, e.g. \"10\"") }, async ({ validator, amount }) => {
+tool("stake", "Stake (delegate) FANG from the account this agent acts for in a validator's pool. Staked FANG earns a share of issuance, is slashed if the validator misbehaves, and takes the chain's unbonding period (21 days by default) to come back after unstake. Session keys can't stake. Counts toward BLOCKULA_MAX_SEND / BLOCKULA_MAX_DAILY.", { validator: z.string().describe("validator address (or a .boo name its account holds)"), amount: z.string().describe("FANG, e.g. \"10\"") }, async ({ validator, amount }) => {
   const drops = amountArg(amount);
   if (drops <= 0n) throw new Error("delegate more than 0");
   const w = await requireWallet();
@@ -1310,7 +1295,7 @@ tool("list_proposals", `On-chain governance proposals (parameter changes, treasu
   return { proposals: list.slice(0, limit).map((p) => proposalView(proposalSummary(p, res.params))), note: UNTRUSTED_NOTE };
 });
 
-tool("vote", "Vote on a governance proposal for the account this agent acts for. Pass the proposal_digest list_proposals returned with what you showed the user: the vote binds exactly that content, and is refused (nothing signed) if the proposal reads differently now. `amount` FANG of its unlocked holdings is locked: conviction 0 locks nothing and counts 0.1×; 1–6 lock for 1, 2, 4, 8, 16 or 32 lock periods (a week each on mainnet) after voting ends and count 1×–6×. Voting again replaces the vote. Session keys can't vote. Ask the user before locking their FANG.", { proposal_id: z.number().int().min(0), proposal_digest: z.string().regex(/^[0-9a-f]{64}$/).describe("list_proposals' proposal_digest for this proposal: what the user was shown"), vote: z.enum(["aye", "nay"]), amount: z.string().describe("FANG to lock"), conviction: z.number().int().min(0).max(6).default(1) }, async ({ proposal_id, proposal_digest: shown, vote, amount, conviction }) => {
+tool("vote", "Vote on a governance proposal for the account this agent acts for. Pass the proposal_digest list_proposals returned with what you showed the user: the vote binds exactly that content, and is refused (nothing signed) if the proposal reads differently now. `amount` FANG of its unlocked holdings is locked: conviction 0 locks nothing and counts 0.1×; 1–6 lock for 1, 2, 4, 8, 16 or 32 lock periods (a week each by default) after voting ends and count 1×–6×. Voting again replaces the vote. Session keys can't vote. Ask the user before locking their FANG.", { proposal_id: z.number().int().min(0), proposal_digest: z.string().regex(/^[0-9a-f]{64}$/).describe("list_proposals' proposal_digest for this proposal: what the user was shown"), vote: z.enum(["aye", "nay"]), amount: z.string().describe("FANG to lock"), conviction: z.number().int().min(0).max(6).default(1) }, async ({ proposal_id, proposal_digest: shown, vote, amount, conviction }) => {
   const drops = amountArg(amount);
   if (drops <= 0n) throw new Error("vote with more than 0");
   // The amount is locked, not spent: it's held to BLOCKULA_MAX_SEND, and only the fee counts toward the daily limit.
@@ -1346,7 +1331,7 @@ tool("list_hunts", described(`Bounties (Hunts) on GitHub issues, with FANG escro
   return {
     hunts: hunts.slice(0, 100).map((h) => ({ hunt_id: Number(h.id), bounty: clean(String(h.amount_display ?? ""), 40), untrusted_title: clean(String(h.title ?? ""), 120), issue: clean(String(h.issue_url ?? ""), 200), funders: funders(h.funders), ...(safeInt(h.expires_at) !== undefined ? { expires_at_block: safeInt(h.expires_at) } : {}), explorer: explorer(`hunt/${Number(h.id)}`) })),
     ...(hunts.length === 0 ? { next: `No ${status} Hunts right now. Merged PRs to the contribution pool's repos can earn from the pool without a Hunt: contribution_pool lists them. Issues labeled familiar-friendly are a good start: ${GOOD_FIRST}` } : {}),
-    note: noteOf(UNTRUSTED_NOTE, await valueNote()),
+    note: `${UNTRUSTED_NOTE} ${NO_VALUE}`,
   };
 });
 
@@ -1375,7 +1360,7 @@ tool("contribution_pool", described(`Blockula's contribution pool (Proof of Cont
     open_seance: c.open_seance ? { id: c.open_seance.id, phase: chainData(c.open_seance.phase), claims: Array.isArray(c.open_seance.claims) ? c.open_seance.claims.length : 0, jurors: Array.isArray(c.open_seance.jurors) ? c.open_seance.jurors.length : 0, reveals_until_block: c.open_seance.reveal_until } : null,
     rules: chainData(c.rules),
     how_to_earn: "Get a PR merged into a pool repo's default branch, authored by the GitHub handle linked to the account you act for (link_github), then submit_contribution. Validators check the merge on GitHub; a jury compares it with other claims.",
-    note: noteOf(await valueNote()),
+    note: NO_VALUE,
     explorer: explorer("contribute"),
   };
 });
@@ -1402,7 +1387,7 @@ tool(
     if (isInFlight(r)) return r;
     const claims = await w.client.claims({ account: w.account }).catch(() => null);
     const claim = (Array.isArray(claims?.claims) ? claims.claims : []).find((c: { repo: string; pr: number }) => c.repo === repo.toLowerCase() && c.pr === pr);
-    return { summary: clean(String(r.summary ?? "")), tx_id: r.id, claim_id: claim?.id, status: claim ? clean(String(claim.status)) : undefined, next: "Validators check GitHub within a minute or two; then it waits for the revert window and the next Séance. Track it with my_contributions.", note: noteOf(await valueNote()), explorer: explorer(`claim/${claim?.id ?? ""}`) };
+    return { summary: clean(String(r.summary ?? "")), tx_id: r.id, claim_id: claim?.id, status: claim ? clean(String(claim.status)) : undefined, next: "Validators check GitHub within a minute or two; then it waits for the revert window and the next Séance. Track it with my_contributions.", note: NO_VALUE, explorer: explorer(`claim/${claim?.id ?? ""}`) };
   },
 );
 
@@ -1419,7 +1404,7 @@ tool("my_contributions", described(`The Soul (reputation), contribution claims, 
     rewards: chainData({ withdrawable: p.rewards?.withdrawable_display, still_vesting: p.rewards?.unvested_display }),
     claims: (Array.isArray(p.claims) ? p.claims : []).map((c: { id: number; repo: string; pr: number; status: string; score_display?: string; payout_display: string; reason?: string }) => ({ id: c.id, pr: clean(`${c.repo}#${c.pr}`, 160), status: clean(String(c.status)), score: chainData(c.score_display), earned: chainData(c.payout_display), ...(c.reason ? { untrusted_note: clean(c.reason, 300) } : {}) })),
     next_claim_bond: chainData(p.next_claim_bond_display),
-    note: noteOf(UNTRUSTED_NOTE, await valueNote()),
+    note: `${UNTRUSTED_NOTE} ${NO_VALUE}`,
   };
 });
 

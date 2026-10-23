@@ -12,7 +12,7 @@
 // 7. Your own node: the network's public RPC as a witness by default; a chain without a faucet;
 //    copy and ergonomics.
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -186,6 +186,91 @@ const today = () => new Date().toISOString().slice(0, 10);
   t.forget("c a");
   assert.equal(t.floor("c a", 10), undefined);
   console.log("✓ the account lock serializes per account (in process and by its file, taking over a dead holder's); the nonce tracker");
+}
+
+{
+  // Taking over a dead holder's lock is race-free (review of mcp-agents-kit, notes). Two waiters
+  // judge the same dead holder's lock; the first takes it over and a new holder makes a fresh one
+  // before the second removes anything. The second must leave the fresh lock alone: removing by
+  // name deleted it, and both then worked on one account.
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const nonces = join(dir, "units", "takeover");
+  mkdirSync(nonces, { recursive: true });
+  const DEAD = "2147483646 0 dead";
+  const FRESH = `${process.pid} ${Date.now()} fresh`;
+  const seen = (l: string) => (existsSync(l) ? readFileSync(l, "utf8") : null);
+  class Racing extends AccountLocks {
+    /** Runs between this waiter judging the lock dead and removing it: the rest of the world's turn. */
+    between?: (lock: string) => void;
+    afterwards: (string | null)[] = [];
+    protected takeOver(lock: string, seenToken: string) {
+      this.between?.(lock);
+      this.between = undefined;
+      super.takeOver(lock, seenToken);
+      this.afterwards.push(seen(lock));
+    }
+  }
+  const waiter = new Racing(nonces, { staleMs: 60_000, waitMs: 5_000, pollMs: 5 });
+  const lock = waiter.file("k");
+  writeFileSync(lock, DEAD);
+  // The other waiter has taken the dead lock over, and its holder made this one, by the time we remove.
+  waiter.between = (l) => {
+    rmSync(l);
+    writeFileSync(l, FRESH);
+  };
+  let ran = false;
+  const done = waiter.run("k", async () => {
+    ran = true;
+  });
+  await sleep(150);
+  assert.deepEqual([waiter.afterwards[0], seen(lock), ran], [FRESH, FRESH, false], "the fresh lock survives the takeover of the one it replaced, and the waiter waits for it");
+  rmSync(lock); // its holder finishes
+  await done;
+  assert.ok(ran && !existsSync(lock), "then the waiter gets its turn, and releases");
+  assert.deepEqual(readdirSync(nonces), [], "no moved-aside lock files are left behind");
+  // A dead holder's lock is still taken over, and the one moved aside goes with it.
+  writeFileSync(lock, DEAD);
+  assert.equal(await waiter.run("k", async () => "ran"), "ran");
+  assert.deepEqual([waiter.afterwards.at(-1), readdirSync(nonces)], [null, []]);
+  // A lock that vanished between judging and removing is nothing to take over.
+  writeFileSync(lock, DEAD);
+  waiter.between = (l) => rmSync(l);
+  assert.equal(await waiter.run("k", async () => "ran"), "ran");
+  assert.deepEqual(readdirSync(nonces), []);
+  console.log("✓ a lock that was taken over and made afresh before a second waiter removes it isn't removed; the one that's really dead still is");
+}
+
+{
+  // A live holder keeps its lock fresh (review of mcp-agents-kit, notes): a call that outlasts
+  // `staleMs` (a node that hangs until BLOCKULA_TIMEOUT_MS) isn't a stuck holder, and its lock isn't
+  // taken over while it works. One that stops touching its lock (hung, or the process is gone) still
+  // is, after `staleMs`.
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const nonces = join(dir, "units", "heartbeat");
+  const opts = { staleMs: 500, waitMs: 10_000, pollMs: 5, refreshMs: 50 };
+  const holder = new AccountLocks(nonces, opts);
+  const waiter = new AccountLocks(nonces, opts); // another process sharing the directory, as far as the file goes
+  let inside = 0;
+  let most = 0;
+  const work = (ms: number) => async () => {
+    inside++;
+    most = Math.max(most, inside);
+    await sleep(ms);
+    inside--;
+  };
+  const slow = holder.run("k", work(1_600)); // outlasts staleMs three times over
+  await sleep(100);
+  const second = waiter.run("k", work(10));
+  await Promise.all([slow, second]);
+  assert.equal(most, 1, "the waiter didn't take over a live holder's lock");
+  // A lock nobody touches any more is a stuck holder's, even if its process is alive.
+  const lock = waiter.file("k");
+  writeFileSync(lock, `${process.pid} 0 stuck`);
+  const past = new Date(Date.now() - 10_000);
+  utimesSync(lock, past, past);
+  assert.equal(await waiter.run("k", async () => "ran"), "ran", "a lock untouched for staleMs is taken over");
+  assert.deepEqual(readdirSync(nonces), []);
+  console.log("✓ a live holder keeps its lock fresh, so a call slower than the stale limit isn't taken over; a lock nobody touches still is");
 }
 
 // ---- a fake node that enforces nonces like the real mempool ----
