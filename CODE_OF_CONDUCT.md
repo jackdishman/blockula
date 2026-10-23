@@ -1,5 +1,3 @@
-<!-- [CONTACT]: the enforcement contact (an address the project, not a person, holds) is Jack's to fill in before this merges. -->
-
 # Contributor Covenant Code of Conduct
 
 ## Our Pledge
@@ -39,7 +37,7 @@ Examples of representing our community include using an official e-mail address,
 
 ## Enforcement
 
-Instances of abusive, harassing, or otherwise unacceptable behavior may be reported to the community leaders responsible for enforcement at [CONTACT].
+Instances of abusive, harassing, or otherwise unacceptable behavior may be reported to the community leaders responsible for enforcement at <me@jackdishman.com>.
 All complaints will be reviewed and investigated promptly and fairly.
 
 All community leaders are obligated to respect the privacy and security of the reporter of any incident.
