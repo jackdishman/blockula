@@ -143,6 +143,29 @@ test("Home says what can be sent, what's staked and what's locked", async ({ pag
   await expect(parts.getByRole("link", { name: "Staked" })).toHaveAttribute("href", "/stake");
 });
 
+// Review WOK-3: the node's `locked` is the gross lock, and stake counts toward it (`transferable` is
+// the balance less max(0, locked − staked − unbonding)), so Home's "Locked" is the part of the
+// balance that can't move: what's left after "Can send now", not the gross figure.
+test("Home's Locked is what a lock holds of the balance: stake that covers a lock leaves none held", async ({ page, node }) => {
+  const { account } = await createWallet(page);
+  await expect(page.getByText("The account of")).toBeVisible();
+  // A vote holds 50 FANG, and 50 FANG is staked: the lock is covered, so the whole 100 FANG balance can move
+  // (what a node answers: `locked` 50, `transferable` 100).
+  node.shares.set(account, new Map([[VALIDATOR, parseFang("50")]]));
+  node.locks.set(account, [{ id: "vote:2", reason: "vote on proposal #2", amount: parseFang("50"), until: node.height + 7200, vesting: false }]);
+  node.accountExtra.set(account, { transferable: parseFang("100").toString() });
+  node.height += 30;
+  const parts = page.getByTestId("balance-parts");
+  await expect(parts).toContainText("Can send now 100 FANG");
+  await expect(parts).toContainText("Staked 50 FANG");
+  await expect(parts).not.toContainText("Locked");
+  // Part of the balance held (the node's `transferable` 40 of a 100 FANG balance): the other 60 is Locked, and the two add up.
+  node.accountExtra.set(account, { transferable: parseFang("40").toString() });
+  node.height += 30;
+  await expect(parts).toContainText("Can send now 40 FANG");
+  await expect(parts).toContainText(/Locked 60 FANG until about/);
+});
+
 test("Home says a browser-only key is the only way in, not a passkey", async ({ page }) => {
   // A passkey provider without PRF: the fallback is offered, and its wallet has one key.
   await page.addInitScript(() => {

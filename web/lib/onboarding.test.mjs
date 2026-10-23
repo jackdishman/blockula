@@ -65,17 +65,35 @@ test("payRequest shows only a well-formed recipient and amount, never the memo",
   assert.equal(payRequest(null), null);
 });
 
-test("breakdown: what can move, what's staked, what's locked and until when", () => {
+test("breakdown: what can move, what's staked, what a lock holds and until when", () => {
   // Nothing staked or locked: no line under the balance.
-  assert.equal(breakdown({ balance: "100", transferable: "100", locked: "0", locks: [] }, { bonded: "0", unbonding: "0" }).show, false);
+  assert.equal(breakdown({ balance: "100", transferable: "100", locks: [] }, { bonded: "0", unbonding: "0" }).show, false);
   // A node from before protocol v1 doesn't say: everything is spendable.
   assert.equal(breakdown({ balance: "100" }, null).show, false);
   const b = breakdown(
-    { balance: "100", transferable: "50", locked: "50", locks: [{ amount: "50", until: 900 }, { amount: "20", until: 1200 }, { amount: "0", until: 5000 }] },
+    { balance: "100", transferable: "50", locks: [{ amount: "50", until: 900 }, { amount: "20", until: 1200 }, { amount: "0", until: 5000 }] },
     { bonded: "10", unbonding: "3" },
   );
   assert.deepEqual(b, { canSend: 50n, staked: 10n, unstaking: 3n, locked: 50n, lockedUntil: 1200, show: true });
   assert.equal(breakdown({ balance: "100", transferable: "100" }, { bonded: "1" }).show, true);
+});
+
+test("breakdown: Locked is the part of the balance a lock holds, so it adds up with Can send now", () => {
+  // The node's `locked` is the gross lock, and stake counts toward it (transferable = balance −
+  // max(0, locked − staked − unbonding)): nothing here reads it, only the balance and what can move.
+  // Vesting 100 FANG with 60 staked: balance 40, nothing can move, so all 40 is held.
+  const vesting = breakdown({ balance: "40", transferable: "0", locked: "100", locks: [{ amount: "100", until: 5000 }] }, { bonded: "60" });
+  assert.deepEqual(vesting, { canSend: 0n, staked: 60n, unstaking: 0n, locked: 40n, lockedUntil: 5000, show: true });
+  assert.equal(vesting.canSend + vesting.locked, 40n);
+  // A vote lock of 50 covered by 50 staked: the lock holds none of the balance, so no "Locked".
+  const covered = breakdown({ balance: "10", transferable: "10", locked: "50", locks: [{ amount: "50", until: 5000 }] }, { bonded: "50" });
+  assert.deepEqual(covered, { canSend: 10n, staked: 50n, unstaking: 0n, locked: 0n, lockedUntil: null, show: true });
+  // Lock held, nothing staked: the gross lock and the held part are the same figure.
+  assert.equal(breakdown({ balance: "100", transferable: "50", locked: "50", locks: [{ amount: "50", until: 7 }] }, null).locked, 50n);
+  // A lock that holds nothing and nothing staked: nothing to show.
+  const idle = breakdown({ balance: "100", transferable: "100", locked: "50", locks: [{ amount: "50", until: 7 }] }, null);
+  assert.equal(idle.show, false);
+  assert.equal(idle.lockedUntil, null);
 });
 
 test("nameAlert: a name expiring within the window, or in grace, if it's still ours", () => {

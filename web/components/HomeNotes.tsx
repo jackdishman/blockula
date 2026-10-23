@@ -18,9 +18,10 @@ const fang = (drops: bigint) => {
 };
 
 /**
- * Under Home's balance: what can be sent now, what's staked, what's locked (and until about
- * when), from `/api/account` (`transferable`, `locked`, `locks`) and `/api/staking`. Shown only
- * when the balance isn't simply all spendable.
+ * Under Home's balance: what can be sent now, what's staked, and the part of the balance a lock
+ * holds (and until about when), from `/api/account` (`balance`, `transferable`, `locks`) and
+ * `/api/staking`. "Can send now" and "Locked" add up to the balance; stake sits beside it. Shown
+ * only when something is staked, unstaking or locked.
  */
 export function BalanceBreakdown({ account }: { account: AccountView }) {
   const { client, status } = useUnlocked();

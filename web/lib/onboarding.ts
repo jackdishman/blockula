@@ -75,7 +75,6 @@ export function payRequest(next: string | null): PayRequest | null {
 export interface BalanceParts {
   balance: string;
   transferable?: string;
-  locked?: string;
   locks?: { amount: string; until: number }[];
 }
 
@@ -88,13 +87,18 @@ export interface StakeTotals {
 export interface Breakdown {
   /** What can leave the account now (`transferable`). */
   canSend: bigint;
-  /** Delegated, earning or slashable, and the part on its way back. */
+  /** Delegated, earning or slashable, and the part on its way back: beside the balance, not in it. */
   staked: bigint;
   unstaking: bigint;
-  /** Held by vesting or vote locks, and the height the last of them lifts. */
+  /**
+   * The part of the balance a lock holds now: the balance less what can be sent, so the two add up
+   * to it. Not `/api/account`'s `locked`, the gross lock: stake counts toward what a lock holds
+   * (node/src/econ.rs `free`), so a lock the stake covers holds none of the balance. Send's
+   * `movable` says it the same way.
+   */
   locked: bigint;
   lockedUntil: number | null;
-  /** Worth a line under the balance: anything staked or locked, or a balance that can't all move. */
+  /** Worth a line under the balance: anything staked, unstaking, or held by a lock. */
   show: boolean;
 }
 
@@ -103,13 +107,14 @@ export function breakdown(a: BalanceParts, s: StakeTotals | null): Breakdown {
   const canSend = a.transferable !== undefined ? BigInt(a.transferable) : balance;
   const staked = BigInt(s?.bonded ?? "0");
   const unstaking = BigInt(s?.unbonding ?? "0");
-  const locked = a.locked !== undefined ? BigInt(a.locked) : 0n;
+  const locked = balance > canSend ? balance - canSend : 0n;
   const holding = (a.locks ?? []).filter((l) => BigInt(l.amount) > 0n);
-  const lockedUntil = holding.length ? Math.max(...holding.map((l) => l.until)) : null;
-  return { canSend, staked, unstaking, locked, lockedUntil, show: staked > 0n || unstaking > 0n || locked > 0n || canSend !== balance };
+  const lockedUntil = locked > 0n && holding.length ? Math.max(...holding.map((l) => l.until)) : null;
+  return { canSend, staked, unstaking, locked, lockedUntil, show: staked > 0n || unstaking > 0n || locked > 0n };
 }
 
 /** A name of this account's that needs renewing: in its grace period, or expiring within the window. */
+  /** When the last lock holding anything ends, while one holds part of the balance. */
 export interface NameAlert {
   name: string;
   state: "grace" | "expiring";
