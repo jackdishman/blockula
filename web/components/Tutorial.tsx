@@ -5,6 +5,7 @@ import { cssVars } from "@/lib/cssvars";
 import { useEffect, useState, type ReactNode } from "react";
 import { explorer } from "@/lib/config";
 import { friendly } from "@/lib/errors";
+import { BRAND, FIRST_FANG } from "@/lib/onboarding-copy";
 import { KIT_LABEL } from "@/lib/recovery";
 import { loadTutorial, saveTutorial, type TutorialState } from "@/lib/session";
 import type { AccountView, Status } from "@/lib/types";
@@ -110,6 +111,9 @@ export function Tutorial({ state, update }: { state: TutorialState | null; updat
 
 function buildItems(account: AccountView, status: Status | null, state: TutorialState, busy: boolean, faucet: () => void): Item[] {
   const me = account.account.address;
+  const name = account.names[0];
+  // Faucet copy only where there is one: elsewhere FANG arrives when someone sends it.
+  const where = status?.faucet ? "This chain has a faucet that hands it out free." : FIRST_FANG.noFaucet;
   const txs = account.recent_txs;
   const sent = txs.find((t) => t.kind === "transfer" && t.from.address === me);
   const ownerKeys = account.keys.filter((k) => k.role.type === "owner" && k.label !== KIT_LABEL).length;
@@ -120,11 +124,13 @@ function buildItems(account: AccountView, status: Status | null, state: Tutorial
       id: "fang",
       title: "Get some FANG",
       done: BigInt(account.balance) > 0n || txs.some((t) => t.to?.address === me),
-      learn: "FANG is Blockula's currency (1 FANG = 1,000,000,000 drops). Your balance isn't stored in this app; it lives on the blockchain, a shared ledger every node agrees on. Test chains have a faucet that hands it out free.",
+      learn: `FANG is ${BRAND.unit} (1 FANG = 1,000,000,000 drops). Your balance isn't stored in this app; it lives on the blockchain, a shared ledger every node agrees on. ${where}`,
       action: status?.faucet ? (
         <button className="btn small" disabled={busy} onClick={faucet}>{busy ? <Spinner>Dripping…</Spinner> : "Get 100 test FANG"}</button>
       ) : (
-        <span className="dim small">Ask a friend to send you some: share your name from Receive.</span>
+        <span className="dim small" data-testid="share-to-receive">
+          Someone has to send you some: share your {name ? <>name, <b>{name}</b>,</> : "address"} from <Link href="/receive">Receive</Link>.
+        </span>
       ),
     },
     {
@@ -138,7 +144,7 @@ function buildItems(account: AccountView, status: Status | null, state: Tutorial
       id: "send",
       title: "Send FANG to a friend",
       done: !!sent,
-      learn: "Sending signs a transaction with your quantum-safe ML-DSA key. A validator seals it into a block about a second later, and then it's final. A tiny fee, priced by size, is burned forever.",
+      learn: "Sending signs a transaction with your post-quantum ML-DSA-65 key. A validator seals it into a block seconds later, and then it's final. A tiny fee, priced by size, is burned forever.",
       action: (
         <span className="row-gap">
           <Link className="btn small" href="/send">Send</Link>

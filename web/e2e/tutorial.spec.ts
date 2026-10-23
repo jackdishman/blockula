@@ -35,3 +35,25 @@ test("the checklist ignores ticks from another chain or account, and keeps this 
   const mine = await page.evaluate((scope) => JSON.parse(localStorage.getItem("blockula.tutorial") ?? "{}").scopes?.[scope], `${CHAIN_ID}/${GENESIS}/${created.account}`);
   expect(mine).toMatchObject({ viewedExplorer: true, done: expect.arrayContaining(["fang", "explorer"]) });
 });
+
+// Audit USER-2 / TOK-10: without a faucet, "Get some FANG" says someone has to send it, and to
+// share the address until there's a name to share (it used to say "share your name" to people
+// who had none).
+test("without a faucet, the checklist says to share your address, then your name once you have one", async ({ page, node }) => {
+  node.faucet = false;
+  const { account } = await createWallet(page);
+  const checklist = page.locator(".card.learn");
+  await page.getByRole("button", { name: /Get some FANG/ }).click();
+  await expect(checklist).toContainText("FANG is this chain's native unit (1 FANG = 1,000,000,000 drops).");
+  await expect(checklist).toContainText("This chain has no faucet.");
+  await expect(checklist).not.toContainText("Test chains have a faucet");
+  const share = page.getByTestId("share-to-receive");
+  await expect(share).toHaveText("Someone has to send you some: share your address from Receive.");
+  await expect(share.getByRole("link", { name: "Receive" })).toHaveAttribute("href", "/receive");
+  node.names.set("vlad", account);
+  await expect(share).toHaveText("Someone has to send you some: share your name, vlad.boo, from Receive.");
+  // Sending is signed post-quantum, not "quantum-safe", and a block is seconds away on any chain
+  // (a second on the testnet, 5 seconds by default on a chain someone launches).
+  await page.getByRole("button", { name: /Send FANG to a friend/ }).click();
+  await expect(checklist).toContainText("Sending signs a transaction with your post-quantum ML-DSA-65 key. A validator seals it into a block seconds later, and then it's final.");
+});

@@ -3,6 +3,7 @@
 import { decodeKeyGrant, formatFang, parseFang, type KeyGrant } from "@blockula/sdk";
 import Link from "next/link";
 import { useEffect, useState } from "react";
+import "@/app/onboarding.css";
 import { RequireWallet } from "@/components/Gate";
 import { RecoveryKitSetup } from "@/components/RecoveryKit";
 import { Apparition } from "@/components/Haunt";
@@ -11,6 +12,7 @@ import { Copy, ErrorNote, ExplorerLink, Spinner, Tip } from "@/components/ui";
 import { BLOCKS_PER_DAY, DEFAULT_NETWORK, explorer, NETWORK, walletUrl } from "@/lib/config";
 import { friendly } from "@/lib/errors";
 import { blocksToHuman, keyCode } from "@/lib/format";
+import { SAFETY } from "@/lib/onboarding-copy";
 import { deviceLink } from "@/lib/paylink";
 import { KIT_LABEL } from "@/lib/recovery";
 import type { KeyView, TxView } from "@/lib/types";
@@ -193,7 +195,8 @@ function parseGrant(code: string, account: string): { grant: KeyGrant | null; pr
 function AddDevice() {
   const { wallet, client, status, refresh } = useUnlocked();
   const [id, setId] = useState("");
-  const [label, setLabel] = useState("My phone");
+  // Labels are written on-chain for good: nothing filled in that could name a person.
+  const [label, setLabel] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState<TxView | null>(null);
@@ -264,8 +267,8 @@ function AddDevice() {
       </label>
       {id.trim() && (grant ? <span className="ok">Check code: <b className="code inline">{keyCode(grant.key_id)}</b> (the new device shows the same)</span> : <span className="warn">{problem}</span>)}
       <label className="field">
-        <span>Name it</span>
-        <input value={label} onChange={(e) => setLabel(e.target.value)} maxLength={64} />
+        <span>Name it <span className="dim onb-public">{SAFETY.publicLabel}</span></span>
+        <input value={label} onChange={(e) => setLabel(e.target.value)} maxLength={64} placeholder="Laptop" />
       </label>
       <button className="btn primary" disabled={!valid || busy} onClick={add}>
         {busy ? <Spinner>Adding…</Spinner> : "Add as owner device"}
@@ -304,6 +307,13 @@ function AddAgent() {
   const who = name ? `${name} (${me})` : me;
   // A "day" in blocks. A fixed constant: block timing reported by the node isn't trusted here.
   const day = BLOCKS_PER_DAY;
+  // What that many blocks come to at the block time the node reports, for reading only (what's
+  // signed is the blocks): a day on a 1-second chain, 5 days on the 5-second chains `blockula
+  // summon` makes by default. Until the node has said, the blocks themselves.
+  const span = (blocks: number) => (status ? blocksToHuman(blocks, status.block_time_ms).replace(/^day$/, "1 day") : `${blocks.toLocaleString("en-US")} blocks`);
+  const per = span(day).replace(/^1 day$/, "day");
+  const daily = per === "day";
+  const about = (blocks: number) => (status ? ` (about ${span(blocks)})` : "");
 
   const add = async () => {
     if (!grant) return;
@@ -322,7 +332,7 @@ function AddAgent() {
   };
 
   const snippet = `Your Blockula key may now spend from ${who}
-(up to ${done?.limit ?? limit} FANG per day, sends only, for ${done?.days ?? nDays} days).
+(up to ${done?.limit ?? limit} FANG per ${per}, sends only, for ${span((done?.days ?? nDays) * day)}).
 
 MCP:  call use_account with account "${me}"
 SDK:  await wallet.actAs("${me}");
@@ -332,8 +342,9 @@ SDK:  await wallet.actAs("${me}");
     <section className="card stack" id="agent">
       <h2>Give an agent a budget</h2>
       <p className="dim">
-        Let an AI agent pay for things without handing over your wallet. It gets its own key, a daily limit and an expiry date, and can only send FANG.
+        Let an AI agent pay for things without handing over your wallet. It gets its own key, {daily ? "a daily limit" : `a limit per ${per}`} and an expiry date, and can only send FANG.
       </p>
+      <p className="onb-warn" data-testid="agent-warning">{SAFETY.agentResponsibility}</p>
       <ol className="steps">
         <li>
           Tell your agent (e.g. Claude Code with the Blockula MCP) to <code>use_account</code> with this account&apos;s address
@@ -346,13 +357,18 @@ SDK:  await wallet.actAs("${me}");
         <textarea value={id} onChange={(e) => setId(e.target.value)} placeholder="bkgrant1.…" className="mono" autoCapitalize="none" spellCheck={false} rows={3} />
       </label>
       {id.trim() && !grant && <span className="warn">{problem}</span>}
+      {grant && (
+        <span className="ok" data-testid="agent-check">
+          Check code: <b className="code inline">{keyCode(grant.key_id)}</b> (the start and end of your agent's key_id)
+        </span>
+      )}
       <div className="grid-2">
         <label className="field">
-          <span>Label</span>
-          <input value={label} onChange={(e) => setLabel(e.target.value)} maxLength={64} />
+          <span>Label <span className="dim onb-public">{SAFETY.publicLabelShort}</span></span>
+          <input value={label} onChange={(e) => setLabel(e.target.value)} maxLength={64} placeholder="claude" />
         </label>
         <label className="field">
-          <span>Daily limit</span>
+          <span>{daily ? "Daily limit" : `Limit per ${per}`}</span>
           <div className="suffix-input">
             <input value={limit} onChange={(e) => setLimit(e.target.value)} inputMode="decimal" />
             <span className="suffix">FANG</span>
@@ -362,16 +378,16 @@ SDK:  await wallet.actAs("${me}");
           <span>Expires after</span>
           <div className="suffix-input">
             <input value={days} onChange={(e) => setDays(e.target.value)} inputMode="numeric" />
-            <span className="suffix">days</span>
+            <span className="suffix">{daily ? "days" : `× ${per}`}</span>
           </div>
         </label>
       </div>
       <button className="btn primary" disabled={!valid || busy} onClick={add}>
-        {busy ? <Spinner>Granting…</Spinner> : `Allow ${limitOk ? limit : "…"} FANG/day`}
+        {busy ? <Spinner>Granting…</Spinner> : `Allow ${limitOk ? limit : "…"} FANG${daily ? "/day" : ` per ${per}`}`}
       </button>
       {valid && (
         <p className="dim small">
-          You&apos;ll sign: key <span className="mono">{grant?.key_id.slice(0, 12)}…</span> (check code {grant ? keyCode(grant.key_id) : ""}) may send at most {limit} FANG (amount + fees) every {BLOCKS_PER_DAY.toLocaleString()} blocks (~1 day), transfers only, until {nDays} days of blocks from now. Revoke it any time.
+          You&apos;ll sign: key <span className="mono">{grant?.key_id.slice(0, 12)}…</span> (check code {grant ? keyCode(grant.key_id) : ""}) may send at most {limit} FANG (amount + fees) every {day.toLocaleString("en-US")} blocks{about(day)}, transfers only, for the next {(nDays * day).toLocaleString("en-US")} blocks{about(nDays * day)}. Revoke it any time.
         </p>
       )}
       <ErrorNote error={error} />
@@ -383,7 +399,7 @@ SDK:  await wallet.actAs("${me}");
           <Copy text={snippet} label="Copy for your agent" />
         </div>
       )}
-      <Tip>The limit counts the amount plus fees and resets every {day.toLocaleString()} blocks (about a day). Revoke any time above; it stops working on the very next block.</Tip>
+      <Tip>The limit counts the amount plus fees and resets every {day.toLocaleString("en-US")} blocks{about(day)}. Revoke any time above; it stops working on the very next block.</Tip>
     </section>
   );
 }
