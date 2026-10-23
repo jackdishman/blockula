@@ -29,6 +29,9 @@ updates:
       cargo:
         patterns: ["*"]
     ignore:
+      # The programs validator is calibrated and fuzzed on 0.228.0. Upgrade deliberately,
+      # with the parser API changes, renewed calibration and fuzzing in the same work.
+      - dependency-name: wasmparser
       # wasmi 0.38.0 is node/vm's test-only differential oracle (`ref038`), the last audited
       # release, kept there on purpose: only its patch releases are proposed.
       - dependency-name: wasmi
