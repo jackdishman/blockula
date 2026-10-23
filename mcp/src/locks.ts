@@ -5,13 +5,15 @@
 // - AccountLocks serializes building, signing and submitting per account: in this process with a
 //   promise chain, and across processes sharing BLOCKULA_HOME with a lock file (spend.ts's
 //   pattern, made asynchronous: a request to the node can take seconds). Waiting for finality
-//   happens outside the lock, so parallel sends still overlap there.
+//   happens outside the lock, so parallel sends still overlap there. A takeover moves the lock
+//   aside under a name of its own before it deletes it, and puts back a lock it moved by mistake
+//   (`takeOver`).
 // - NonceTracker remembers the last nonce this MCP signed per (chain, account) while its tx is
 //   pending (submitted, not yet final). The next tx takes max(node next_nonce, last + 1), so a node
 //   whose view lags the mempool that took the last one can't hand out its nonce again. It only
 //   informs: an unreadable file means the node's next_nonce, as before.
 import { createHash } from "node:crypto";
-import { mkdirSync, openSync, closeSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, openSync, closeSync, linkSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -79,9 +81,10 @@ export class AccountLocks {
       }
       // Held: by a process that's gone, or for too long, it's taken over.
       try {
-        const holder = Number(readFileSync(lock, "utf8").split(" ")[0]);
+        const seen = readFileSync(lock, "utf8");
+        const holder = Number(seen.split(" ")[0]);
         const stale = Date.now() - statSync(lock).mtimeMs > this.opts.staleMs;
-        if (stale || (Number.isSafeInteger(holder) && holder > 0 && holder !== process.pid && !alive(holder))) rmSync(lock, { force: true });
+        if (stale || (Number.isSafeInteger(holder) && holder > 0 && holder !== process.pid && !alive(holder))) this.takeOver(lock, seen);
       } catch {
         /* it went away, or is being written: try again */
       }
@@ -96,6 +99,28 @@ export class AccountLocks {
       } catch {
         /* taken over as stale, or removed */
       }
+    }
+  }
+
+  /**
+   * Removes `lock`, which was read as `seen` and judged dead or stuck. Several waiters can judge
+   * the same lock at once, and the first one's takeover lets another process create a fresh lock
+   * before the second one's removal: deleting by name would then delete that fresh lock, and two
+   * holders would work on one account. So the lock is renamed to a name of this takeover's own
+   * (only one rename of it succeeds, and a lock that's gone throws ENOENT: nothing to do), and
+   * deleted only if what was moved is `seen`. If it's another lock, it's put back, unless a third
+   * process has already made a new one (then nothing can undo that; the window is the few calls
+   * between the rename and the link).
+   */
+  protected takeOver(lock: string, seen: string) {
+    const grave = `${lock}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.stale`;
+    renameSync(lock, grave);
+    try {
+      if (readFileSync(grave, "utf8") !== seen) linkSync(grave, lock);
+    } catch {
+      /* a new lock is there already, or the moved one is unreadable: it's dropped with the grave */
+    } finally {
+      rmSync(grave, { force: true });
     }
   }
 }
