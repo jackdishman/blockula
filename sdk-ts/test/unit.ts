@@ -413,6 +413,36 @@ assert.deepEqual([(await new Client("http://redirect.node", { witnesses }).recip
 assert.deepEqual(await new Client("http://redirect.node").resolution(BOB), { input: BOB, address: BOB, name: null, proven: true, how: "an address, signed as given" });
 assert.throws(() => new Client("http://redirect.node", { requireProvenNames: true }), /needs witnesses/);
 assert.throws(() => new Client("http://redirect.node", { witnesses: [new Client("http://redirect.node/")] }), /another node/);
+// The same node under any spelling is still the client's own (audit MCK-1, as in the MCP): scheme
+// and host case, a default port, a trailing dot on the host, dot segments, extra slashes, credentials.
+for (const [own, spelled] of [
+  ["https://node.example", "https://Node.Example"],
+  ["https://node.example", "HTTPS://NODE.EXAMPLE/"],
+  ["https://node.example", "https://node.example:443"],
+  ["http://node.example", "http://node.example:80/"],
+  ["https://node.example", "https://node.example./"],
+  ["https://node.example:8443/rpc", "https://node.example.:8443/rpc/"],
+  ["https://node.example", "https://node.example/."],
+  ["https://node.example/a/b", "https://node.example/a/./c/../b//"],
+  ["https://Node.Example:443/./", "https://node.example"],
+  ["https://node.example", "https://user:pw@node.example/"],
+  ["http://127.0.0.1:7070", "http://127.1:7070/"],
+  ["http://[::1]:7070", "http://[0:0:0:0:0:0:0:1]:7070/"],
+] as const) {
+  assert.throws(() => new Client(own, { witnesses: [new Client(spelled)] }), /another node/, `${own} is ${spelled}`);
+  assert.throws(() => new Client(spelled, { witnesses: [new Client(own)] }), /another node/, `${spelled} is ${own}`);
+}
+// Other nodes stay other: another host, port, path (case-sensitive) or scheme.
+for (const [own, other] of [
+  ["https://node.example", "https://other.example"],
+  ["https://node.example", "https://node.example:8443"],
+  ["https://node.example/a", "https://node.example/A"],
+  ["https://node.example/a", "https://node.example"],
+  ["https://node.example", "http://node.example"],
+  ["https://node.example", "https://node.example.org"],
+] as const) {
+  assert.equal(new Client(own, { witnesses: [new Client(other)] }).witnesses.length, 1, `${own} and ${other} are two nodes`);
+}
 console.log("✓ names that get signed are proven against the client's witnesses, else signed as the name where the chain resolves it (a lying node can't point either at another account)");
 
 // Audit gap-7-1, fields that need an address (staking, actAs, key grants): on mainnet an unproven
