@@ -143,6 +143,26 @@ test("Home says what can be sent, what's staked and what's locked", async ({ pag
   await expect(parts.getByRole("link", { name: "Staked" })).toHaveAttribute("href", "/stake");
 });
 
+test("Home says a browser-only key is the only way in, not a passkey", async ({ page }) => {
+  // A passkey provider without PRF: the fallback is offered, and its wallet has one key.
+  await page.addInitScript(() => {
+    PublicKeyCredential.prototype.getClientExtensionResults = () => ({});
+  });
+  await page.goto("/welcome");
+  await page.getByRole("button", { name: "Skip intro" }).click();
+  await page.getByRole("button", { name: "Create wallet with passkey" }).click();
+  await page.getByRole("button", { name: /browser-only key/ }).click();
+  await page.getByRole("button", { name: "Next: your recovery kit" }).click();
+  await page.getByRole("button", { name: /^Skip for now/ }).click();
+  await page.getByRole("button", { name: "Skip for now" }).click();
+  await page.getByRole("button", { name: "Open my wallet" }).click();
+  await expect(page.getByText("The account of")).toBeVisible();
+  const banner = page.getByTestId("one-passkey");
+  await expect(banner).toContainText("Only this browser's key opens your wallet. If you lose it, nothing can get you back in.");
+  await expect(banner).not.toContainText("passkey");
+  await expect(banner.getByRole("link", { name: "Make a recovery kit" })).toHaveAttribute("href", "/devices#recovery");
+});
+
 test("Home warns while one passkey is the only way in, until there's a second key", async ({ page, node }) => {
   const { account } = await createWallet(page);
   const banner = page.getByTestId("one-passkey");

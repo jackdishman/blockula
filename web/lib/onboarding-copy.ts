@@ -38,7 +38,7 @@ export const BRAND = {
 
 /**
  * The safety lines at moments that can't be undone: claiming a name, labels written on-chain, an
- * agent's budget, the recovery kit, and a wallet only one passkey opens.
+ * agent's budget, the recovery kit, and a wallet only one key opens.
  */
 export const SAFETY = {
   /** NameClaim, under the node's price for the name typed. It's paid to the treasury (node/src/econ.rs), not the community account. */
@@ -54,7 +54,8 @@ export const SAFETY = {
   /** The recovery kit. */
   kitNeverAsk: "Blockula will never ask you for these words.",
   kitWarning: "Anyone holding these words controls this account. Keep the kit offline, and only ever type the words into the Blockula wallet's restore screen. Blockula will never ask you for them.",
-  /** Home, while one passkey is the only way in. */
+  /** Home, while one key is the only way in: a passkey, or a browser-only key (test chains). */
   onePasskey: "Only this passkey opens your wallet.",
+  oneBrowserKey: "Only this browser's key opens your wallet.",
   onePasskeyLost: "If you lose it, nothing can get you back in.",
 };

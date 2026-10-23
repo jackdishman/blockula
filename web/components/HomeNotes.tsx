@@ -70,8 +70,9 @@ export function BalanceBreakdown({ account }: { account: AccountView }) {
 const ONE_KEY_DISMISSED = "blockula.onb.oneKey";
 
 /**
- * Only one passkey opens this wallet, there's no recovery kit, and there's FANG in it: say so
- * until the user makes a kit or links a device (or hides it for this browser session).
+ * Only one key opens this wallet (a passkey, or on test chains a browser-only key), there's no
+ * recovery kit, and there's FANG in it: say so until the user makes a kit or links a device (or
+ * hides it for this browser session).
  */
 export function OnePasskeyBanner({ account }: { account: AccountView }) {
   const { hint } = useUnlocked();
@@ -92,7 +93,7 @@ export function OnePasskeyBanner({ account }: { account: AccountView }) {
   if (hidden === addr || devices !== 1 || kits > 0 || pendingKit || BigInt(account.balance) <= 0n) return null;
   return (
     <div className="banner onb-banner" data-testid="one-passkey">
-      <b>{SAFETY.onePasskey}</b> {SAFETY.onePasskeyLost}{" "}
+      <b>{hint.kind === "local" ? SAFETY.oneBrowserKey : SAFETY.onePasskey}</b> {SAFETY.onePasskeyLost}{" "}
       <Link href="/devices#recovery">Make a recovery kit</Link> or <Link href="/devices#device">link a second device</Link>.
       <button
         className="link"
