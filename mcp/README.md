@@ -16,7 +16,7 @@ To run an exact release, name it: `npx -y @blockula/mcp@0.5.0` (the first releas
 The network is chosen by the user, once, in the MCP's configuration, and nothing changes it while the server runs: it never switches to whatever answers on `localhost:7070`, and no tool can point it somewhere else.
 
 - `--network` (or `BLOCKULA_NETWORK`): `testnet` (default), `mainnet`, `local` (`http://localhost:7070`) or `custom`.
-- `BLOCKULA_RPC` picks the node: required for `custom`, and for `mainnet` until public mainnet RPCs are built in. Plain `http://` only on this machine or a private network.
+- `BLOCKULA_RPC` picks the node: required for `custom`, and for `mainnet` until public mainnet RPCs are built in. Plain `http://` only on this machine or a private network, and no query or fragment. A node written two ways (`Blockula-Testnet.fly.dev`, `:443`, a trailing `/.`) is one node: the public RPC is never its own witness.
 - Every network pins a chain id (`blockula-1` for mainnet, `blockula-testnet-2` for the testnet, with the `tboo` address prefix), and a genesis hash where one is known (`KNOWN_GENESIS` in `src/network.ts`: a release pins a launched chain's). `BLOCKULA_CHAIN_ID` and `BLOCKULA_GENESIS_HASH` pin them for any node. Whatever isn't pinned is pinned from the first status the node reports and remembered in `~/.blockula/known-chains.json` (except for local dev chains, which `--reset` replaces).
 - A node reporting another chain id, genesis hash or address prefix is refused, before anything is signed, at startup or mid-session. If a network was relaunched on purpose under the same chain id, the user removes its entry from `known-chains.json` or sets `BLOCKULA_GENESIS_HASH`. (A relaunch takes a new chain id, as the testnet's did: an entry remembered for the old `blockula-testnet` isn't held against `blockula-testnet-2`.)
 
@@ -103,7 +103,7 @@ The checks add up: each refuses a release it fails. The result lists what was ve
 | Env | Default | |
 |---|---|---|
 | `BLOCKULA_NETWORK` | `testnet` | `mainnet`, `testnet`, `local` or `custom` (same as `--network`) |
-| `BLOCKULA_RPC` | the network's public RPC | node URL |
+| `BLOCKULA_RPC` | the network's public RPC | node URL (no query or fragment) |
 | `BLOCKULA_CHAIN_ID` / `BLOCKULA_GENESIS_HASH` | the network's pins | the chain the node must be on |
 | `BLOCKULA_HOME` | `~/.blockula` | the agent key (mode 600), the spending ledger and `known-chains.json` |
 | `BLOCKULA_MAX_SEND` | `100` | max FANG one call moves: sent, staked, escrowed, paid for a name, bonded (and per vote) |

@@ -97,8 +97,9 @@ const PUBLIC_RPCS: Record<string, string[]> = { "blockula-testnet-2": [TESTNET_R
  * chains people launch themselves: there, BLOCKULA_WITNESSES lists other nodes).
  */
 export function defaultWitnesses(chainId: string | undefined, rpc: string): string[] {
-  const rpcs = (chainId && PUBLIC_RPCS[chainId]) || [];
-  return rpcs.includes(rpc) ? [] : [...rpcs];
+  const rpcs = ((chainId && PUBLIC_RPCS[chainId]) || []).map(canonicalUrl);
+  // The same node however `rpc` is spelled: a node is never its own witness (audit MCK-1).
+  return rpcs.includes(canonicalUrl(rpc)) ? [] : rpcs;
 }
 
 /** The public network a chain id is, when it's one (for labels). */
@@ -128,7 +129,29 @@ const isPrivateUrl = (u: string) => {
   return /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h) || /\.(internal|local|lan)$/.test(h);
 };
 
-/** A node URL: http(s) without credentials; plain http only on this machine or a private network. */
+/**
+ * A node URL in one spelling: the scheme and host lowercased, a default port and dot segments
+ * dropped (the URL parser's own normalization), no trailing dot on the host and no trailing
+ * slash. So a node compares equal however it's written: `https://Blockula-Testnet.fly.dev:443/.`
+ * is the public RPC, and is never its own witness (audit MCK-1). What isn't an http(s) URL comes
+ * back as it is.
+ */
+export function canonicalUrl(u: string): string {
+  try {
+    const url = new URL(u);
+    if (!/^https?:$/.test(url.protocol)) return u;
+    // `host` carries the port; a fully qualified name's trailing dot comes before it, or ends it.
+    const host = url.host.replace(/\.(?=:\d+$|$)/, "");
+    return `${url.protocol}//${host}${url.pathname.replace(/\/+$/, "")}`;
+  } catch {
+    return u;
+  }
+}
+
+/**
+ * A node URL, spelled canonically (canonicalUrl): http(s) without credentials, a query or a
+ * fragment (the client appends /api/… to it); plain http only on this machine or a private network.
+ */
 export function checkRpcUrl(u: string, what = "BLOCKULA_RPC"): string {
   let url: URL;
   try {
@@ -137,8 +160,9 @@ export function checkRpcUrl(u: string, what = "BLOCKULA_RPC"): string {
     throw new Error(`${what} isn't a URL: ${u}`);
   }
   if (!/^https?:$/.test(url.protocol) || url.username || url.password) throw new Error(`${what} must be an http(s) URL without credentials: ${u}`);
+  if (url.search || url.hash) throw new Error(`${what} must be a node's URL, without a query or a fragment: ${u}`);
   if (url.protocol === "http:" && !isPrivateUrl(u)) throw new Error(`${what} must use https unless the node is on this machine or a private network: ${u}`);
-  return u.replace(/\/+$/, "");
+  return canonicalUrl(u);
 }
 
 /** `--network <name>` or `--network=<name>` from the command line. */
@@ -161,11 +185,11 @@ export function resolveNetwork(env: Record<string, string | undefined>, argv: st
   const rpc = env.BLOCKULA_RPC?.trim() ? checkRpcUrl(env.BLOCKULA_RPC.trim()) : undefined;
   let key: NetworkKey;
   if (named) key = named as NetworkKey;
-  else if (rpc) key = (Object.values(KNOWN_NETWORKS).find((n) => n.rpc && n.rpc === rpc)?.key as NetworkKey | undefined) ?? (isLocalUrl(rpc) ? "local" : "custom");
+  else if (rpc) key = (Object.values(KNOWN_NETWORKS).find((n) => n.rpc && canonicalUrl(n.rpc) === rpc)?.key as NetworkKey | undefined) ?? (isLocalUrl(rpc) ? "local" : "custom");
   else key = "testnet";
 
   const base = key === "custom" ? { key, label: "custom node", pin: {}, mainnet: false, remember: true } : KNOWN_NETWORKS[key];
-  const url = rpc ?? base.rpc;
+  const url = rpc ?? (base.rpc ? canonicalUrl(base.rpc) : undefined);
   if (!url) {
     throw new Error(key === "mainnet" ? "no public mainnet RPC is built in yet: set BLOCKULA_RPC to a mainnet node you trust" : "the custom network needs BLOCKULA_RPC");
   }
@@ -191,6 +215,7 @@ export function resolveNetwork(env: Record<string, string | undefined>, argv: st
   const listed = (env.BLOCKULA_WITNESSES ?? "").trim();
   const witnessesSet = listed !== "";
   const witnesses = listed.toLowerCase() === "none" ? [] : witnessesSet ? listed.split(",").map((w) => w.trim()).filter(Boolean).map((w) => checkRpcUrl(w, "BLOCKULA_WITNESSES")) : defaultWitnesses(pin.chainId, url);
+  // Every URL here is canonical (checkRpcUrl), so a node spelled two ways is still one node.
   if (witnesses.includes(url)) throw new Error("BLOCKULA_WITNESSES must be other nodes than BLOCKULA_RPC's");
   if (new Set(witnesses).size !== witnesses.length) throw new Error("BLOCKULA_WITNESSES lists a node twice");
   return { key, label: base.label, rpc: url, pin, mainnet, remember: base.remember, witnesses, witnessesSet };
@@ -235,7 +260,25 @@ export class KnownChains {
   }
 
   get(net: Network): Pin | undefined {
-    return net.remember ? (this.all()[KnownChains.id(net)] as Pin | undefined) : undefined;
+    if (!net.remember) return undefined;
+    const all = this.all();
+    const id = KnownChains.id(net);
+    if (all[id] !== undefined) return all[id] as Pin;
+    // A release before canonicalUrl kept a node's URL as it was typed (`custom https://Rpc.Example`):
+    // that entry is this node's under another spelling. Its pin holds, and moves to this spelling,
+    // so the node isn't pinned afresh on trust, and the entry an error names is the only one.
+    const old = Object.keys(all).filter((k) => {
+      const at = k.indexOf(" ");
+      return k !== id && at > 0 && k.slice(0, at) === net.key && canonicalUrl(k.slice(at + 1)) === net.rpc;
+    });
+    if (old.length === 0) return undefined;
+    const pin = all[old[0]] as Pin;
+    try {
+      this.write(id, pin, old);
+    } catch {
+      /* the file can't be written: the pin still holds this session */
+    }
+    return pin;
   }
 
   save(net: Network, pin: Pin) {
@@ -260,8 +303,10 @@ export class KnownChains {
     this.write(KnownChains.clockId(chainId, genesisHash), { created_at_ms: clock.createdAtMs, block_time_ms: clock.blockTimeMs });
   }
 
-  private write(key: string, value: unknown) {
+  /** Sets one entry (and drops the entries `drop` names, in the same write). */
+  private write(key: string, value: unknown, drop: string[] = []) {
     const all = this.all();
+    for (const k of drop) delete all[k];
     all[key] = value;
     mkdirSync(dirname(this.file), { recursive: true });
     writeFileSync(this.file, JSON.stringify(all, null, 2), { mode: 0o600 });
