@@ -88,18 +88,10 @@ fn submit_at(dir: &Path, s: &Signer, make: impl FnOnce(u64, u64) -> Result<Actio
 /// [`submit_at`] for an action that names the account it's signed for (`make(from, height,
 /// blocks_per_day)`): the same account the tx is `from`, never a second resolution of `--from`.
 fn submit_as(dir: &Path, s: &Signer, make: impl FnOnce(&str, u64, u64) -> Result<Action>) -> Result<Value> {
-    submit_noting(dir, s, None, make)
-}
-
-/// [`submit_as`], printing `mainnet_note` to stderr before it signs when the node is on mainnet.
-fn submit_noting(dir: &Path, s: &Signer, mainnet_note: Option<&str>, make: impl FnOnce(&str, u64, u64) -> Result<Action>) -> Result<Value> {
     let keys = s.keys(dir)?;
     let rt = rt()?;
     let tx = rt.block_on(async {
         let remote = s.connect(dir).await?;
-        if let Some(note) = mainnet_note.filter(|_| remote.chain_id == crate::chain::MAINNET_CHAIN_ID) {
-            eprintln!("ℹ️  {note}");
-        }
         let from = s.acting_for(&remote, &keys).await?;
         let day = remote.blocks_per_day().await?;
         crate::validator_cli::send_memo_with(&remote, &keys, &from, |height| make(&from, height, day), String::new()).await
@@ -233,13 +225,10 @@ pub fn hunt(cmd: HuntCmd, dir: &Path) -> Result<()> {
             let amount = parse_fang(&amount)?;
             // The expiry counts `days` days of the genesis's blocks from the status the tx is
             // signed against, not a separate read or the node's block time (audit gap-7-3).
-            submit_noting(dir, &signer, Some(HUNT_PAYER_NOTICE), |_, height, day| Ok(Action::CreateHunt { repo, issue, amount, expires_at: height.saturating_add(days.saturating_mul(day)), title }))?;
+            submit_at(dir, &signer, |height, day| Ok(Action::CreateHunt { repo, issue, amount, expires_at: height.saturating_add(days.saturating_mul(day)), title }))?;
             Ok(())
         }
-        HuntCmd::Fund { id, amount, signer } => {
-            let amount = parse_fang(&amount)?;
-            submit_noting(dir, &signer, Some(HUNT_PAYER_NOTICE), |_, _, _| Ok(Action::FundHunt { hunt_id: id, amount })).map(|_| ())
-        }
+        HuntCmd::Fund { id, amount, signer } => submit(dir, &signer, Action::FundHunt { hunt_id: id, amount: parse_fang(&amount)? }).map(|_| ()),
         HuntCmd::Award { id, pr, to, familiar, skip_github, yes, signer } => award(dir, id, pr, to, familiar, skip_github, yes, &signer),
         HuntCmd::Cancel { id, signer } => submit(dir, &signer, Action::CancelHunt { hunt_id: id }).map(|_| ()),
     }
@@ -305,7 +294,6 @@ fn award(dir: &Path, id: u64, pr: u64, to: Option<String>, familiar: Option<Stri
             hit["key_id"].as_str().map(String::from)
         }
     };
-    hunt_payer_notice(dir, signer)?;
     confirm(&format!("Award {} (hunt #{id}, {repo}#{issue}) to {} ({recipient}) for PR #{pr}{why}?", h["amount_display"].as_str().unwrap_or_default(), name_of(&acct["account"])), yes)?;
     submit(dir, signer, Action::AwardHunt { hunt_id: id, to: recipient, pr, familiar_key })?;
     Ok(())
@@ -710,30 +698,16 @@ pub fn contrib(cmd: ContribCmd, dir: &Path) -> Result<()> {
     }
 }
 
-// ------------------------------------------------------------------------ Hunts and the pool (D7)
+// ------------------------------------------------------------------------ Hunts and the pool
 //
-// The Hunts plan's CLI text: the payer notice is mainnet's; the rest is driven by the node's data, so
-// it's right on any chain. Keep it here (`hunt create` and `hunt fund` say who pays in their help).
-
-/// What `hunt create`, `hunt fund` and `hunt award` print on mainnet before they sign.
-pub const HUNT_PAYER_NOTICE: &str = "On mainnet you pay this with your own FANG. Payment for work may be taxable for the person you pay, and you must not pay anyone sanctioned or in a sanctioned region (CONTRIBUTOR-TERMS.md, provisional and under counsel review).";
+// Driven by the node's data, so it's right on any chain (`hunt create` and `hunt fund` say who pays
+// in their help).
 
 /// Why `contrib claim`, `vouch` and `join-jury` refuse on a chain whose pool has no repositories.
 pub const POOL_CLOSED: &str = "This chain's contribution pool has no repositories yet, so there's nothing to claim. Nothing was signed.";
 
 /// What `contrib link-github` says there instead: the link still lets a Hunt's creator pay you.
 pub const POOL_CLOSED_LINK: &str = "This chain's contribution pool has no repositories yet, so there's nothing to claim. The link still lets a Hunt's creator pay you by your GitHub handle.";
-
-/// Prints [`HUNT_PAYER_NOTICE`] when `signer`'s node is on mainnet (`hunt award`, before it asks;
-/// `hunt create` and `fund` print it as they sign, [`submit_noting`]).
-fn hunt_payer_notice(dir: &Path, signer: &Signer) -> Result<()> {
-    rt()?.block_on(async {
-        if signer.connect(dir).await?.chain_id == crate::chain::MAINNET_CHAIN_ID {
-            eprintln!("ℹ️  {HUNT_PAYER_NOTICE}");
-        }
-        Ok(())
-    })
-}
 
 /// Whether the pool `/api/contributions` describes has a repository to claim for.
 fn has_repos(contributions: &Value) -> bool {
@@ -1032,18 +1006,7 @@ pub fn stake(cmd: StakeCmd, dir: &Path) -> Result<()> {
             }
             Ok(())
         }
-        StakeCmd::Delegate { validator, amount, signer } => {
-            let amount = parse_fang(&amount)?;
-            // On mainnet, what staking risks, with the chain's own figures (OPERATOR-18).
-            rt()?.block_on(async {
-                let remote = signer.connect(dir).await?;
-                if remote.chain_id == crate::chain::MAINNET_CHAIN_ID {
-                    eprintln!("{}", crate::validator_cli::staking_notice(&remote).await?);
-                }
-                Ok::<_, anyhow::Error>(())
-            })?;
-            submit(dir, &signer, Action::Delegate { validator, amount }).map(|_| ())
-        }
+        StakeCmd::Delegate { validator, amount, signer } => submit(dir, &signer, Action::Delegate { validator, amount: parse_fang(&amount)? }).map(|_| ()),
         StakeCmd::Undelegate { validator, shares: Unbonding { amount: Some(amount), .. }, signer } => {
             let amount = parse_fang(&amount)?;
             if amount == 0 {
@@ -1141,17 +1104,14 @@ mod tests {
         assert_eq!(vouch_hint(anyhow!("insufficient balance")).to_string(), "insufficient balance");
     }
 
-    /// D7: claims, vouches and jury seats are refused before signing on a chain whose pool has no
-    /// repositories (blockula-1 at launch); the mainnet payer notice says who pays and what to check.
+    /// Claims, vouches and jury seats are refused before signing on a chain whose pool has no
+    /// repositories.
     #[test]
-    fn a_pool_without_repositories_is_refused_and_the_payer_notice_says_who_pays() {
+    fn a_pool_without_repositories_is_refused() {
         assert!(!has_repos(&serde_json::json!({ "repos": [] })));
         assert!(!has_repos(&serde_json::json!({})), "a node that doesn't report repos has none to claim for");
         assert!(has_repos(&serde_json::json!({ "repos": [{ "repo": "jackdishman/blockula", "weight": 10 }] })));
         assert!(POOL_CLOSED.ends_with("Nothing was signed.") && POOL_CLOSED_LINK.contains("Hunt's creator"));
-        for want in ["your own FANG", "taxable", "sanctioned", "CONTRIBUTOR-TERMS.md"] {
-            assert!(HUNT_PAYER_NOTICE.contains(want), "{want}");
-        }
         // Against a node: refused with no repositories, let through with one. The node runs on a
         // thread of its own, since the CLI's runtime only runs while a command waits on it.
         let (tx, rx) = std::sync::mpsc::channel();

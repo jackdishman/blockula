@@ -1,5 +1,5 @@
 // Offline tests of what integrators lean on (DEV-1–4, DEV-7, DEV-14, TR-3, TR-5, TR-6): network
-// presets and the mainnet opt-in, honest balances, the per-wallet nonce queue and `sendMany`,
+// presets and the blockula-1 pin, honest balances, the per-wallet nonce queue and `sendMany`,
 // `quote` and the opening burn, fee headroom, paged blocks and history, and `watchPayments`.
 // Against a fake node behind fetch that keeps nonces, a mempool and blocks the way node/src
 // does. No node needed: `npm run test:vectors -w @blockula/sdk`.
@@ -10,7 +10,7 @@ import {
   ApiError, ChainMismatchError, Client, HistoryPrunedError, MAINNET_CHAIN_ID, MIN_NEW_ACCOUNT, MainnetNotAllowedError, NETWORKS, Wallet,
   addressFromPublicKey, baseFee, formatFang, parseFang, paymentsIn, signingBytes, txBytes, txId, watchPayments, type Payment, type Tx,
 } from "../src/index.js";
-import { KNOWN_CLOCKS, KNOWN_GENESIS, KNOWN_NETWORKS, MAINNET_RPCS, TESTNET_RPC } from "../../mcp/src/network.js";
+import { KNOWN_CLOCKS, KNOWN_GENESIS, KNOWN_NETWORKS, TESTNET_RPC } from "../../mcp/src/network.js";
 
 const FANG = 1_000_000_000n;
 const GENESIS = "6e".repeat(32);
@@ -202,7 +202,7 @@ function funded(n: Node, rpc: string, byte: number, balance = 1_000n * FANG, opt
   assert.ok(Wallet.generate(new Client({ network: "testnet" })).address.startsWith("tboo1"));
   assert.equal(fetchCalls, calls, "no request needed to render the address");
   const t = new Client({ network: "testnet" });
-  assert.deepEqual([t.rpc, t.network, t.prefix, t.genesisClock, t.mainnetAllowed], [NETWORKS.testnet.rpc, "testnet", "tboo", NETWORKS.testnet.genesisClock, false]);
+  assert.deepEqual([t.rpc, t.network, t.prefix, t.genesisClock], [NETWORKS.testnet.rpc, "testnet", "tboo", NETWORKS.testnet.genesisClock]);
   // Your own node, held to the testnet's pins.
   const own = new Client("http://own.node", { network: "testnet" });
   assert.equal(own.rpc, "http://own.node");
@@ -213,10 +213,10 @@ function funded(n: Node, rpc: string, byte: number, balance = 1_000n * FANG, opt
   assert.throws(() => new Client({ network: "testnet", prefix: "boo" }), /contradicts/);
   assert.throws(() => new Client({ network: "moon" as never }), /unknown network/);
   assert.doesNotThrow(() => new Client({ network: "testnet", genesisHash: NETWORKS.testnet.genesisHash!.toUpperCase() }));
-  // Mainnet: no RPC built in until the release that pins the launched chain; with a URL, the opt-in.
-  if (!NETWORKS.mainnet.rpc) assert.throws(() => new Client({ network: "mainnet" }), /no public mainnet RPC is built into this SDK yet/);
-  const m = Client.mainnet({ rpc: "https://mainnet.example" });
-  assert.deepEqual([m.prefix, m.network, m.mainnetAllowed], ["boo", "mainnet", true]);
+  // No mainnet preset: the SDK knows the public testnet and a local dev chain.
+  assert.deepEqual(Object.keys(NETWORKS), ["testnet", "local"]);
+  assert.throws(() => new Client("https://rpc.example", { network: "mainnet" as never }), /unknown network "mainnet" \(testnet or local\)/);
+  assert.equal((Client as unknown as Record<string, unknown>).mainnet, undefined, "no Client.mainnet()");
   assert.equal(Client.local().rpc, "http://localhost:7070");
   assert.equal(new Client("http://x.example", 5 as never).rpc, "http://x.example", "a bad options value is ignored as before");
   assert.ok(Object.isFrozen(NETWORKS) && Object.isFrozen(NETWORKS.testnet) && Object.isFrozen(NETWORKS.testnet.genesisClock));
@@ -228,41 +228,41 @@ function funded(n: Node, rpc: string, byte: number, balance = 1_000n * FANG, opt
   assert.equal(NETWORKS.testnet.prefix, KNOWN_NETWORKS.testnet.pin.prefix);
   assert.equal(NETWORKS.testnet.genesisHash, KNOWN_GENESIS[NETWORKS.testnet.chainId!]);
   assert.deepEqual(NETWORKS.testnet.genesisClock, KNOWN_CLOCKS[NETWORKS.testnet.chainId!]);
-  assert.equal(NETWORKS.mainnet.chainId, MAINNET_CHAIN_ID);
-  assert.equal(NETWORKS.mainnet.chainId, KNOWN_NETWORKS.mainnet.pin.chainId);
-  assert.equal(NETWORKS.mainnet.prefix, KNOWN_NETWORKS.mainnet.pin.prefix);
-  // Once the MCP knows mainnet's genesis, its clock and an RPC, so must the SDK.
-  assert.equal(NETWORKS.mainnet.genesisHash, KNOWN_GENESIS[MAINNET_CHAIN_ID], "the SDK's mainnet genesis hash is the MCP's (copy KNOWN_GENESIS into sdk-ts/src/networks.ts)");
-  assert.deepEqual(NETWORKS.mainnet.genesisClock, KNOWN_CLOCKS[MAINNET_CHAIN_ID], "the SDK's mainnet genesis clock is the MCP's (copy KNOWN_CLOCKS into sdk-ts/src/networks.ts)");
-  assert.equal(NETWORKS.mainnet.rpc, MAINNET_RPCS[0], "the SDK's mainnet RPC is the MCP's first (copy MAINNET_RPCS[0] into sdk-ts/src/networks.ts)");
   assert.equal(NETWORKS.local.rpc, KNOWN_NETWORKS.local.rpc);
 }
 console.log("✓ network presets pin everything up front (tboo1… before any request) and match the MCP's networks");
 
-// ---- the mainnet opt-in (DEV-1) ----
+// ---- blockula-1 only through a client pinned to it (DEV-1) ----
 
 {
   const main = fakeNode("http://main.node", { chain_id: MAINNET_CHAIN_ID });
   const lost = funded(main, "http://main.node", 0x21);
-  // A script pointed at a mainnet node without saying so signs nothing.
+  // A client that isn't pinned to blockula-1 signs nothing for a node that says it's on it.
   for (const run of [() => lost.send(BOB, "1"), () => lost.build({ type: "unlock" }), () => lost.keyGrant(BOB), () => lost.registerName("ghoul")]) {
-    await assert.rejects(run(), (e: unknown) => e instanceof MainnetNotAllowedError && /network: "mainnet"/.test((e as Error).message) && /nothing was signed/.test((e as Error).message));
+    await assert.rejects(run(), (e: unknown) => e instanceof MainnetNotAllowedError && /chainId: "blockula-1"/.test((e as Error).message) && /nothing was signed/.test((e as Error).message));
   }
+  // The old opt-in is gone: allowMainnet is no option.
+  await assert.rejects(funded(main, "http://main.node", 0x22, 1_000n * FANG, { allowMainnet: true } as never).send(BOB, "1"), MainnetNotAllowedError);
   assert.equal(main.posts.length, 0, "nothing submitted");
-  // A key's consent made offline for mainnet names the chain itself.
+  // A key's consent made offline names the chain itself.
   assert.equal((await lost.keyGrant(BOB, { chainId: MAINNET_CHAIN_ID, genesisHash: GENESIS })).account, BOB);
-  // Each of the three opt-ins.
-  for (const opts of [{ network: "mainnet" as const }, { chainId: MAINNET_CHAIN_ID }, { allowMainnet: true }]) {
-    const w = funded(main, "http://main.node", 0x22 + main.posts.length, 1_000n * FANG, opts);
-    await w.send(BOB, "1");
+  // The pin, and a client that pins the chain itself (as the web wallet's does) and says so.
+  await funded(main, "http://main.node", 0x23, 1_000n * FANG, { chainId: MAINNET_CHAIN_ID }).send(BOB, "1");
+  class SelfPinned extends Client {
+    protected override chainPin() {
+      return MAINNET_CHAIN_ID;
+    }
   }
-  assert.equal(main.posts.length, 3, "opted-in clients sign on mainnet");
-  // Test chains need no opt-in.
+  const self = Wallet.fromSeed(new Uint8Array(32).fill(0x24), new SelfPinned("http://main.node"));
+  main.accounts.set(self.address, { balance: 1_000n * FANG, nonce: 0 });
+  await self.send(BOB, "1");
+  assert.equal(main.posts.length, 2, "pinned clients sign there");
+  // Other chains need no pin.
   const test = fakeNode("http://test.node");
   await funded(test, "http://test.node", 0x25).send(BOB, "1");
   assert.equal(test.posts.length, 1);
 }
-console.log("✓ mainnet needs an opt-in (network: \"mainnet\", a blockula-1 pin, or allowMainnet): MainnetNotAllowedError otherwise, nothing signed");
+console.log("✓ blockula-1 only through a client pinned to it: MainnetNotAllowedError otherwise, nothing signed; no mainnet preset or opt-in");
 
 // ---- honest balances (DEV-2) ----
 
