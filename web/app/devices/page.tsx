@@ -283,21 +283,6 @@ function AddDevice() {
 function AddAgent() {
   const { wallet, account, status, refresh } = useUnlocked();
   const [id, setId] = useState("");
-  // Filled in from a `#grant=<code>` link (an agent's wallet_url): a fragment never reaches a server.
-  const [fromLink, setFromLink] = useState(false);
-  useEffect(() => {
-    const m = window.location.hash.match(/^#grant=(.+)$/);
-    if (!m) return;
-    let code: string;
-    try {
-      code = decodeURIComponent(m[1]).trim();
-    } catch {
-      return;
-    }
-    setId(code);
-    setFromLink(true);
-    document.getElementById("agent")?.scrollIntoView();
-  }, []);
   const [label, setLabel] = useState("claude");
   const [limit, setLimit] = useState("10");
   const [days, setDays] = useState("30");
@@ -367,11 +352,8 @@ SDK:  await wallet.actAs("${me}");
       {id.trim() && !grant && <span className="warn">{problem}</span>}
       {grant && (
         <span className="ok" data-testid="agent-check">
-          Check code: <b className="code inline">{keyCode(grant.key_id)}</b> (your agent shows the same)
+          Check code: <b className="code inline">{keyCode(grant.key_id)}</b> (the start and end of your agent's key_id)
         </span>
-      )}
-      {fromLink && id.trim() && (
-        <p className="warn small" data-testid="agent-from-link">{SAFETY.agentFromLink}</p>
       )}
       <div className="grid-2">
         <label className="field">

@@ -51,7 +51,6 @@ export const SAFETY = {
   publicLabelShort: "(public and permanent)",
   agentResponsibility:
     "You're responsible for what your agent sends. Within this limit its payments are final, like yours. AI agents make mistakes and can be tricked by text they read (memos, issues, web pages). Start small, and revoke the key here when you're done.",
-  agentFromLink: "A link filled in this grant code. Allow it only if the check code matches the one your agent shows you.",
   /** The recovery kit. */
   kitNeverAsk: "Blockula will never ask you for these words.",
   kitWarning: "Anyone holding these words controls this account. Keep the kit offline, and only ever type the words into the Blockula wallet's restore screen. Blockula will never ask you for them.",

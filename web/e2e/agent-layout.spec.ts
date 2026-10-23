@@ -43,20 +43,18 @@ test("agent authorization stays within the viewport and copies the full instruct
   expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(instructions);
 });
 
-// Audit AGENT-5: an agent can hand the user a link (`/devices#grant=<code>`) instead of a 7,000-
-// character code to copy. The fragment fills in the grant, never reaching a server; the wallet
-// shows the check code to compare with the agent's, and that the agent is the user's
-// responsibility (legal-safety-10). Labels go on-chain for good, so they say so (legal-safety-11).
-test("a #grant= link fills in the agent's grant code and shows its check code", async ({ page, node }) => {
+// Audit AGENT-5: the wallet shows the check code of a pasted grant to compare with the agent's, and
+// that the agent is the user's responsibility (legal-safety-10). Labels go on-chain for good, so
+// they say so (legal-safety-11).
+test("a pasted grant code shows its check code, the agent's responsibility and the public-label hints", async ({ page, node }) => {
   const created = await createWallet(page);
   const agent = Wallet.generate();
   const code = encodeKeyGrant(await agent.keyGrant(created.account, { chainId: CHAIN_ID, genesisHash: GENESIS }));
-  await page.goto(`/devices#grant=${encodeURIComponent(code)}`);
+  await page.goto("/devices");
   await page.getByRole("button", { name: "Unlock with passkey" }).click();
   const card = page.locator("#agent");
-  await expect(card.getByPlaceholder("bkgrant1.…")).toHaveValue(code);
-  await expect(card.getByTestId("agent-check")).toHaveText(`Check code: ${keyCode(agent.keyId)} (your agent shows the same)`);
-  await expect(card.getByTestId("agent-from-link")).toContainText("Allow it only if the check code matches the one your agent shows you.");
+  await card.getByPlaceholder("bkgrant1.…").fill(code);
+  await expect(card.getByTestId("agent-check")).toHaveText(`Check code: ${keyCode(agent.keyId)} (the start and end of your agent's key_id)`);
   await expect(card.getByTestId("agent-warning")).toHaveText(
     "You're responsible for what your agent sends. Within this limit its payments are final, like yours. AI agents make mistakes and can be tricked by text they read (memos, issues, web pages). Start small, and revoke the key here when you're done.",
   );
@@ -71,16 +69,34 @@ test("a #grant= link fills in the agent's grant code and shows its check code", 
 
   await card.getByRole("button", { name: "Allow 10 FANG/day" }).click();
   await expect(card.locator("pre.snippet")).toBeVisible();
-  expect(node.submitted.at(-1)?.action).toMatchObject({ type: "add_key", key_id: agent.keyId, label: "claude", role: { type: "session" } });
+  expect(node.submitted.at(-1)?.action).toMatchObject({ type: "add_key", key_id: agent.keyId, label: "claude", role: { type: "session", period_blocks: 86_400 } });
 
-  // A code for another account isn't taken from a link either.
+  // A code for another account isn't taken either.
   const stranger = Wallet.generate();
   const other = encodeKeyGrant(await stranger.keyGrant(stranger.address, { chainId: CHAIN_ID, genesisHash: GENESIS }));
-  // (A full load: a goto that only changes the fragment wouldn't be one.)
-  await page.goto("/");
-  await page.goto(`/devices#grant=${encodeURIComponent(other)}`);
-  await page.getByRole("button", { name: "Unlock with passkey" }).click();
+  await card.getByPlaceholder("bkgrant1.…").fill(other);
   await expect(card.getByText(/This code is for another account/)).toBeVisible();
   await expect(card.getByTestId("agent-check")).toHaveCount(0);
   await expect(card.getByRole("button", { name: "Allow 10 FANG/day" })).toBeDisabled();
+});
+
+// Review WOK-1: approving a grant adds a spending key to the account, and anyone can make a grant
+// for an address they know. So a link never fills one in: the user pastes the code their own agent
+// gave them. (A `#grant=` receiver would turn that into one click on whatever a link carried.)
+test("a #grant= link fills in nothing: a grant is pasted, never carried by a link", async ({ page, node }) => {
+  const created = await createWallet(page);
+  const agent = Wallet.generate();
+  const code = encodeKeyGrant(await agent.keyGrant(created.account, { chainId: CHAIN_ID, genesisHash: GENESIS }));
+  const submitted = node.submitted.length;
+  await page.goto(`/devices#grant=${encodeURIComponent(code)}`);
+  await page.getByRole("button", { name: "Unlock with passkey" }).click();
+  const card = page.locator("#agent");
+  await expect(card.getByRole("heading", { name: "Give an agent a budget" })).toBeVisible();
+  // Let a receiver's effect run (it would on mount) before saying nothing happened.
+  await page.waitForTimeout(500);
+  await expect(card.getByPlaceholder("bkgrant1.…")).toHaveValue("");
+  await expect(card.getByTestId("agent-check")).toHaveCount(0);
+  await expect(card.getByTestId("agent-from-link")).toHaveCount(0);
+  await expect(card.getByRole("button", { name: "Allow 10 FANG/day" })).toBeDisabled();
+  expect(node.submitted.length).toBe(submitted);
 });
