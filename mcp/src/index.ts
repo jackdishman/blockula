@@ -6,14 +6,15 @@
 // Env:
 //   BLOCKULA_NETWORK    testnet (default), local or custom (same as --network)
 //   BLOCKULA_RPC        node URL (default: the network's public RPC; required for custom)
-//   BLOCKULA_CHAIN_ID / BLOCKULA_GENESIS_HASH   pin the chain the node must be on
+//   BLOCKULA_CHAIN_ID / BLOCKULA_GENESIS_HASH   pin the chain the node must be on (a node that says
+//                       it's on blockula-1 is refused unless BLOCKULA_CHAIN_ID=blockula-1)
 //   BLOCKULA_WITNESSES  other nodes of the same chain (comma-separated URLs): .boo names that get
 //                       signed (send, stake, unstake, use_account) are proven against them, and the
 //                       height each tx is signed against must not be ahead of their heads (nor, in
 //                       any case, past what the chain's genesis clock allows). Without
 //                       them a send signs the name itself (the chain resolves it when it runs), and
 //                       where an address is needed (stake, unstake, use_account) a name is the
-//                       node's word: on blockula-1 (a node pinned to that chain) the address must be
+//                       node's word: on blockula-1 (BLOCKULA_CHAIN_ID=blockula-1) the address must be
 //                       confirmed first. Unset, your own node of the public
 //                       testnet (any node but its public RPC) gets the public RPC as a witness;
 //                       `none` opts out.
@@ -37,13 +38,13 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { ApiError, Client, HeightAheadError, MAINNET_CHAIN_ID, NAMESPACES, RequestTimeoutError, TxFailedError, TxPendingError, Wallet, addressPrefix, bareName, baseFee, decodeAccount, describeKind, encodeKeyGrant, isAddress, proposalDigest, formatFang, paramsOf, proposalSummary, stakeSummary, txDropped, txId, type Action, type ProposalKind, type ProposalSummary, type Recipient, type Resolution, type Tx } from "@blockula/sdk";
+import { ApiError, Client, HeightAheadError, NAMESPACES, RequestTimeoutError, TxFailedError, TxPendingError, Wallet, addressPrefix, bareName, baseFee, decodeAccount, describeKind, encodeKeyGrant, isAddress, proposalDigest, formatFang, paramsOf, proposalSummary, stakeSummary, txDropped, txId, type Action, type ProposalKind, type ProposalSummary, type Recipient, type Resolution, type Tx } from "@blockula/sdk";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { z } from "zod";
-import { KNOWN_CLOCKS, KNOWN_GENESIS, KnownChains, clockFrom, completePin, defaultWitnesses, effectivePin, mismatch, mismatchError, networkLabel, resolveNetwork, unusableChain, type GenesisClock, type Network } from "./network.js";
+import { BLOCKULA_1, KNOWN_CLOCKS, KNOWN_GENESIS, KnownChains, clockFrom, completePin, defaultWitnesses, effectivePin, mismatch, mismatchError, networkLabel, resolveNetwork, unpinnedBlockula1, unusableChain, type GenesisClock, type Network } from "./network.js";
 import { WALLET_URLS, actingFor, checkCode, createWalletFile, ignoredNote, newWalletFile, readWalletFile, secretOf, setActingFor, writeWalletFile, type ActingFor, type WalletFile } from "./accounts.js";
 import { aboutBlocks, allowanceOf, amountArg, capsFrom, configError, dropsOf, keyOn, msFrom, preflight, spendableNow } from "./budget.js";
 import { AccountLocks, NonceTracker } from "./locks.js";
@@ -154,6 +155,9 @@ async function chain(): Promise<Client> {
   if (unusable) throw mismatchError(net, unusable, KNOWN_CHAINS.file, false);
   const why = mismatch(pin, status);
   if (why) throw mismatchError(net, why, KNOWN_CHAINS.file);
+  // blockula-1 only where the user pinned it: forgetting what was remembered wouldn't help.
+  const unpinned = unpinnedBlockula1(pin, status);
+  if (unpinned) throw mismatchError(net, unpinned, KNOWN_CHAINS.file, false);
   const full = completePin(pin, status);
   KNOWN_CHAINS.save(net, full);
   const pins = { chainId: full.chainId, genesisHash: full.genesisHash, prefix: full.prefix, timeoutMs: TIMEOUT_MS };
@@ -228,7 +232,7 @@ const NONCES = new NonceTracker(join(HOME, "nonces"));
  * for.
  */
 async function onBlockula1(client: Client): Promise<boolean> {
-  return (await client.status()).chain_id === MAINNET_CHAIN_ID;
+  return (await client.status()).chain_id === BLOCKULA_1;
 }
 
 /** What one tool call spends. */
@@ -481,7 +485,7 @@ async function resolved(client: Client, input: string, role: string): Promise<{ 
         [role]: clean(input, 100),
         resolves_to: res.address,
         resolved_by: clean(res.how, 300),
-        next: `Nothing was signed. ${clean(input, 100)} was resolved by one node without proof, and on ${MAINNET_CHAIN_ID} that isn't signed: a node can point a name anywhere. Show the user the address ${res.address}; only if they confirm it's the right ${role}, call this tool again with that address instead of the name. (With BLOCKULA_WITNESSES configured, names are proven and this step isn't needed.)`,
+        next: `Nothing was signed. ${clean(input, 100)} was resolved by one node without proof, and on ${BLOCKULA_1} that isn't signed: a node can point a name anywhere. Show the user the address ${res.address}; only if they confirm it's the right ${role}, call this tool again with that address instead of the name. (With BLOCKULA_WITNESSES configured, names are proven and this step isn't needed.)`,
       },
     };
   }

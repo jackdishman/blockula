@@ -6,11 +6,19 @@
 // BLOCKULA_GENESIS_HASH pin them for any node. Whatever isn't pinned is pinned from the first
 // status the node reports (trust on first use) and, except for throwaway local dev chains,
 // remembered in BLOCKULA_HOME/known-chains.json, so a node that later reports another chain is
-// refused, across restarts too.
+// refused, across restarts too. A node that says it's on blockula-1 is refused unless
+// BLOCKULA_CHAIN_ID=blockula-1 pins that chain (`unpinnedBlockula1`).
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 export type NetworkKey = "testnet" | "local" | "custom";
+
+/**
+ * The chain id Blockula's mainnet was to have: no chain runs under it, so nothing is used under it
+ * by accident (`unpinnedBlockula1`), and where an address is needed an unproven name isn't signed
+ * on it (index.ts `onBlockula1`).
+ */
+export const BLOCKULA_1 = "blockula-1";
 
 /** What the node must report in `/api/status`. */
 export interface Pin {
@@ -206,7 +214,10 @@ export function networkArg(argv: string[]): string | undefined {
  */
 export function resolveNetwork(env: Record<string, string | undefined>, argv: string[] = []): Network {
   const named = (networkArg(argv) ?? env.BLOCKULA_NETWORK)?.trim().toLowerCase() || undefined;
-  if (named !== undefined && !["testnet", "local", "custom"].includes(named)) throw new Error(`unknown network "${named}" (testnet, local or custom)`);
+  if (named !== undefined && !["testnet", "local", "custom"].includes(named)) {
+    const hint = named === "mainnet" ? `: there's no mainnet network, and a node that says it's on ${BLOCKULA_1} is used only with BLOCKULA_CHAIN_ID=${BLOCKULA_1}` : "";
+    throw new Error(`unknown network "${named}" (testnet, local or custom)${hint}`);
+  }
   const rpc = env.BLOCKULA_RPC?.trim() ? checkRpcUrl(env.BLOCKULA_RPC.trim()) : undefined;
   let key: NetworkKey;
   if (named) key = named as NetworkKey;
@@ -254,6 +265,17 @@ export function mismatch(pin: Pin, status: { chain_id?: unknown; genesis_hash?: 
   if (wantGenesis && genesis !== wantGenesis) return `the node's "${chainId}" starts from genesis ${genesis ?? "(none reported)"}, not ${wantGenesis}`;
   if (pin.prefix && prefix && prefix !== pin.prefix) return `the node uses "${prefix}1…" addresses, not "${pin.prefix}1…"`;
   return null;
+}
+
+/**
+ * Why a node that says it's on blockula-1 is refused, or null: the pin (configured, or remembered
+ * from a configuration that named it) isn't that chain. A node that reports blockula-1 is never
+ * trusted on first use, as the CLI doesn't (`cli_net`): set BLOCKULA_CHAIN_ID=blockula-1 to mean it.
+ * (A pin on another chain is refused by `mismatch` first, in its own words.)
+ */
+export function unpinnedBlockula1(pin: Pin, status: { chain_id?: unknown }): string | null {
+  if (status.chain_id !== BLOCKULA_1 || pin.chainId === BLOCKULA_1) return null;
+  return `the node says it's on ${BLOCKULA_1}, and this MCP isn't pinned to that chain. If that's the chain you mean, the user sets BLOCKULA_CHAIN_ID=${BLOCKULA_1}`;
 }
 
 /** The pin after a first status: every field the node reported that wasn't pinned yet. */

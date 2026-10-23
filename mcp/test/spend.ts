@@ -690,10 +690,11 @@ assert.ok(!r.error && r.json().block === 11, `the confirmed address is sent to: 
 assert.equal(posted.length, before + 2);
 await s.close();
 // The R1 reviewer's bypass (gap-7-1): BLOCKULA_RPC (a "custom" network, or "local" for this
-// machine) at a node that reports blockula-1 and lies about validator.boo. The rule is decided by
-// the chain the client is pinned to, not the configuration's name for it: nothing is signed for the
-// name.
-for (const [env, label] of [[{ BLOCKULA_RPC: rpc }, "local dev node"], [{ BLOCKULA_RPC: rpc, BLOCKULA_NETWORK: "custom" }, "custom node"]] as const) {
+// machine) at a node that reports blockula-1 and lies about validator.boo. Without
+// BLOCKULA_CHAIN_ID=blockula-1 the node isn't used at all: nothing is signed (test/network.ts). With
+// it, the rule is decided by the chain the client is pinned to, not the configuration's name for
+// it: nothing is signed for the name.
+for (const [env, label] of [[{ BLOCKULA_RPC: rpc, BLOCKULA_CHAIN_ID: "blockula-1" }, "local dev node"], [{ BLOCKULA_RPC: rpc, BLOCKULA_NETWORK: "custom", BLOCKULA_CHAIN_ID: "blockula-1" }, "custom node"]] as const) {
   rmSync(join(home, "known-chains.json"), { force: true });
   s = await server(env);
   before = posted.length;
@@ -708,6 +709,17 @@ for (const [env, label] of [[{ BLOCKULA_RPC: rpc }, "local dev node"], [{ BLOCKU
   r = await s.call("stake", { validator: BOB, amount: "1" });
   assert.ok(!r.error && r.json().block === 11, `an address the user confirmed is staked to: ${r.text}`);
   assert.equal((posted.at(-1)!.action as { validator: string }).validator, BOB);
+  await s.close();
+}
+for (const env of [{ BLOCKULA_RPC: rpc }, { BLOCKULA_RPC: rpc, BLOCKULA_NETWORK: "custom" }]) {
+  rmSync(join(home, "known-chains.json"), { force: true });
+  s = await server(env);
+  before = posted.length;
+  for (const [tool, args] of [["stake", { validator: "validator.boo", amount: "1" }], ["use_account", { account: "validator.boo" }], ["send", { to: "validator.boo", amount: "1" }]] as const) {
+    r = await s.call(tool, args);
+    assert.ok(r.error && /isn't pinned to that chain/.test(r.text), `${JSON.stringify(env)} ${tool}: ${r.text}`);
+  }
+  assert.equal(posted.length, before, "nothing signed or sent for a node that says it's on blockula-1 and wasn't pinned");
   await s.close();
 }
 mode.status = {};

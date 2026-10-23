@@ -18,8 +18,8 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
-import { RELEASE_SIGNATURE_FORMAT, releaseMessage } from "@blockula/sdk";
-import { KNOWN_CLOCKS, KNOWN_GENESIS, KnownChains, LOCAL_RPC, TESTNET_RPC, canonicalUrl, completePin, defaultWitnesses, effectivePin, mismatch, networkArg, networkLabel, resolveNetwork, unusableChain } from "../src/network.js";
+import { MAINNET_CHAIN_ID, RELEASE_SIGNATURE_FORMAT, releaseMessage } from "@blockula/sdk";
+import { BLOCKULA_1, KNOWN_CLOCKS, KNOWN_GENESIS, KnownChains, LOCAL_RPC, TESTNET_RPC, canonicalUrl, completePin, defaultWitnesses, effectivePin, mismatch, networkArg, networkLabel, resolveNetwork, unpinnedBlockula1, unusableChain } from "../src/network.js";
 import { RELEASE_KEY_ID, binPaths, checkBinaryVersion, fetchVerifiedRelease, latestTagFrom, pickNodeBinary, readReleasePin, releaseKeyIdFrom, type ReleaseDeps } from "../src/release.js";
 
 const G1 = "11".repeat(32);
@@ -129,14 +129,24 @@ assert.match(mismatch({}, { genesis_hash: G1 }) ?? "", /chain id/);
 assert.equal(mismatch({ genesisHash: G1 }, status("a", G1.toUpperCase())), null, "hex case doesn't matter");
 // A known chain id must come with its known genesis, whatever the configuration says. (A stand-in
 // for blockula-1's: the one the launch release pins, if any, is put back after.)
-const mainnetGenesis: string | undefined = KNOWN_GENESIS["blockula-1"];
+const blockula1Genesis: string | undefined = KNOWN_GENESIS["blockula-1"];
 KNOWN_GENESIS["blockula-1"] = G1;
 assert.match(mismatch({}, status("blockula-1", G2)) ?? "", /genesis/);
 assert.equal(mismatch({}, status("blockula-1", G1)), null);
 assert.equal(resolveNetwork({ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_CHAIN_ID: "blockula-1" }).pin.genesisHash, G1);
 assert.throws(() => resolveNetwork({ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_CHAIN_ID: "blockula-1", BLOCKULA_GENESIS_HASH: G2 }), /contradicts blockula-1's known genesis/);
-if (mainnetGenesis === undefined) delete KNOWN_GENESIS["blockula-1"];
-else KNOWN_GENESIS["blockula-1"] = mainnetGenesis;
+if (blockula1Genesis === undefined) delete KNOWN_GENESIS["blockula-1"];
+else KNOWN_GENESIS["blockula-1"] = blockula1Genesis;
+// A node that says it's on blockula-1 is used only where the user pinned that chain: it's never
+// trusted on first use (as the CLI doesn't), so a configuration that never named it can't land there.
+assert.equal(BLOCKULA_1, MAINNET_CHAIN_ID, "the same chain id as the SDK's");
+assert.match(unpinnedBlockula1({}, status("blockula-1", G1)) ?? "", /says it's on blockula-1, and this MCP isn't pinned to that chain.*BLOCKULA_CHAIN_ID=blockula-1/);
+assert.match(unpinnedBlockula1({ genesisHash: G1, prefix: "boo" }, status("blockula-1", G1)) ?? "", /isn't pinned to that chain/, "a genesis hash or prefix isn't the chain");
+assert.equal(unpinnedBlockula1({ chainId: "blockula-1" }, status("blockula-1", G1)), null);
+assert.equal(unpinnedBlockula1({}, status("a", G1)), null);
+assert.match(unpinnedBlockula1({ chainId: "a" }, status("blockula-1", G1)) ?? "", /isn't pinned to that chain/, "a pin on another chain isn't a pin on blockula-1 (mismatch says so first)");
+assert.match(mismatch({ chainId: "a" }, status("blockula-1", G1)) ?? "", /chain "blockula-1", not "a"/);
+assert.throws(() => resolveNetwork({ BLOCKULA_RPC: "https://rpc.example" }, ["--network", "mainnet"]), /there's no mainnet network, and a node that says it's on blockula-1 is used only with BLOCKULA_CHAIN_ID=blockula-1/);
 // Every known genesis comes with its clock (scripts/pin-network.sh pins them together).
 for (const [id, hash] of Object.entries(KNOWN_GENESIS)) {
   assert.match(hash, /^[0-9a-f]{64}$/, id);
@@ -457,6 +467,38 @@ await sayNoValue(s, "a node pinned to blockula-1");
 await s.close();
 nodeStatus = { ...nodeStatus, chain_id: "fake-chain", genesis_hash: G1 };
 console.log("✓ FANG, Hunts and Soul are called worthless on every chain, in descriptions and results");
+
+// A node that says it's on blockula-1 is refused unless the user pinned that chain: BLOCKULA_RPC
+// alone (a "local" or "custom" network) at such a node gets nothing signed, sent or remembered, from
+// every tool. With BLOCKULA_CHAIN_ID=blockula-1 it's used, and remembered as pinned.
+nodeStatus = { ...nodeStatus, chain_id: "blockula-1", genesis_hash: KNOWN_GENESIS["blockula-1"] ?? G1 };
+const b1Home = join(dir, "blockula-1-home");
+for (const env of [{ BLOCKULA_RPC: rpc }, { BLOCKULA_RPC: rpc, BLOCKULA_NETWORK: "custom" }]) {
+  s = await server({ ...env, BLOCKULA_HOME: b1Home });
+  for (const [tool, args] of [["status", {}], ["create_wallet", {}], ["list_hunts", {}], ["send", { to: "boo1x", amount: "1" }], ["use_account", { account: "self" }]] as const) {
+    r = await s.call(tool, args);
+    assert.ok(r.error && /^Error: Refusing .*the node says it's on blockula-1, and this MCP isn't pinned to that chain.*BLOCKULA_CHAIN_ID=blockula-1.*Nothing was signed or sent\.$/.test(r.text), `${JSON.stringify(env)} ${tool}: ${r.text}`);
+    assert.ok(!/relaunched|known-chains/.test(r.text), `forgetting a remembered chain wouldn't help: ${r.text}`);
+  }
+  await s.close();
+}
+assert.equal(posted.length, 0, "nothing was sent");
+assert.ok(!readdirSync(join(dir)).includes("blockula-1-home") || !readdirSync(b1Home).some((f) => f === "known-chains.json" || f === "agent-wallet.json"), "the node wasn't remembered, and no wallet was made for it");
+s = await server({ BLOCKULA_RPC: rpc, BLOCKULA_NETWORK: "custom", BLOCKULA_CHAIN_ID: "blockula-1", BLOCKULA_HOME: b1Home });
+r = await s.call("status");
+assert.ok(!r.error && JSON.parse(r.text).pinned.chain_id === "blockula-1", r.text);
+await s.close();
+s = await server({ BLOCKULA_RPC: rpc, BLOCKULA_NETWORK: "custom", BLOCKULA_HOME: b1Home });
+r = await s.call("status");
+assert.ok(!r.error, `a pin the user's configuration named, remembered, still counts: ${r.text}`);
+await s.close();
+// Another chain id pinned: that's the refusal the pin always gave.
+s = await server({ BLOCKULA_RPC: rpc, BLOCKULA_CHAIN_ID: "fake-chain", BLOCKULA_HOME: b1Home });
+r = await s.call("status");
+assert.ok(r.error && /chain "blockula-1", not "fake-chain"/.test(r.text), r.text);
+await s.close();
+nodeStatus = { ...nodeStatus, chain_id: "fake-chain", genesis_hash: G1 };
+console.log("✓ a node that says it's on blockula-1 is refused (nothing signed, sent or remembered) unless BLOCKULA_CHAIN_ID pins that chain");
 
 // A broken configuration fails every tool with the reason, instead of guessing a network.
 s = await server({ BLOCKULA_NETWORK: "moon" });
