@@ -42,4 +42,4 @@ Then try the rest:
 
 `--network testnet` uses the public testnet's RPC and pins its chain; add `--rpc http://localhost:7171` to go through your own node (`blockula join`). The testnet's faucet gives 100 test FANG an hour per address.
 
-`--network mainnet` is what lets a script sign on mainnet at all: without it, the SDK refuses (`MainnetNotAllowedError`). Pass `--rpc` with a mainnet node until a release builds one in. Read [Using the SDK on mainnet](../sdk-ts/README.md#using-the-sdk-on-mainnet) first.
+On a chain of your own ([docs/LAUNCH.md](../docs/LAUNCH.md)), pass one of its nodes with `--rpc`.

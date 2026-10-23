@@ -4,18 +4,18 @@
 // submit it, wait for it, keep the receipt. If anything is unclear afterwards, rebroadcast the
 // same signed bytes; never sign the payment again.
 //
-//   node examples/pay-from-a-script.mjs <to> <amount> [--memo TEXT] [--rpc URL] [--network local|testnet|mainnet]
+//   node examples/pay-from-a-script.mjs <to> <amount> [--memo TEXT] [--rpc URL] [--network local|testnet]
 //        (--key FILE | --faucet) [--outbox FILE] [--dry-run]
 //   node examples/pay-from-a-script.mjs --rebroadcast <tx id> [--rpc URL] [--network …] [--outbox FILE]
 //
 // --key FILE: a key file written by `blockula wallet new` ($BLOCKULA_HOME/wallet.json).
 // --faucet:   a new key, funded by the chain's faucet (blockula dev and test chains only).
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
-import { ApiError, Client, MainnetNotAllowedError, TxFailedError, TxPendingError, Wallet, formatFang, txId } from "@blockula/sdk";
+import { ApiError, Client, TxFailedError, TxPendingError, Wallet, formatFang, txId } from "@blockula/sdk";
 
 const { positional, flags } = parseArgs(process.argv.slice(2));
 const rpc = flags.rpc ?? process.env.BLOCKULA_RPC;
-// A network pins its chain (id, genesis, prefix); mainnet also needs it to sign at all.
+// A network pins its chain (id, genesis, prefix): a node on another chain is refused.
 const client = flags.network ? new Client(rpc, { network: flags.network }) : new Client(rpc ?? "http://localhost:7070");
 const outbox = flags.outbox ?? "./outbox.jsonl";
 
@@ -29,7 +29,7 @@ if (flags.rebroadcast) {
 
 const [to, amount] = positional;
 if (!to || !amount || (!flags.key && !flags.faucet)) {
-  console.error("usage: node examples/pay-from-a-script.mjs <to> <amount> [--memo TEXT] [--rpc URL] [--network local|testnet|mainnet] (--key FILE | --faucet) [--outbox FILE] [--dry-run]");
+  console.error("usage: node examples/pay-from-a-script.mjs <to> <amount> [--memo TEXT] [--rpc URL] [--network local|testnet] (--key FILE | --faucet) [--outbox FILE] [--dry-run]");
   process.exit(2);
 }
 
@@ -58,13 +58,7 @@ if (flags["dry-run"]) process.exit(0);
 // 2. Sign, and store the signed tx and its id before it leaves this machine. One payment per run:
 // build() doesn't take the nonce it signs with, so a service paying several at once from one key
 // uses wallet.send(to, amount, { onSigned }) instead, which stores each one in the wallet's queue.
-let tx;
-try {
-  tx = await wallet.build({ type: "transfer", to: q.recipient.signed, amount: q.amount.toString() }, memo);
-} catch (e) {
-  if (e instanceof MainnetNotAllowedError) fail(`${e.message}\n(pass --network mainnet to pay on mainnet)`);
-  throw e;
-}
+const tx = await wallet.build({ type: "transfer", to: q.recipient.signed, amount: q.amount.toString() }, memo);
 const id = txId(tx);
 appendFileSync(outbox, JSON.stringify({ id, tx, at: new Date().toISOString() }) + "\n");
 
