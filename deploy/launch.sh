@@ -13,7 +13,7 @@
 # under ~/.config/blockula/$CHAIN_ID (mode 700): consensus keys are uploaded only to their
 # validator, seeded onto its volume on first boot, then deleted from Fly; owner, founder, grant
 # and stand-in juror keys never leave this machine. (A public testnet is still one
-# operator's machines; independent operators come with the incentivized testnet, OPS-1.)
+# operator's machines; independent operators make their own keys: docs/GENESIS_CEREMONY.md.)
 #
 #   deploy/launch.sh                  launch, or upgrade the nodes of, $CHAIN_ID
 #   GENESIS_ONLY=1 deploy/launch.sh   rehearsal: only build keys, operator files, spec and genesis
@@ -38,10 +38,10 @@ EPOCH_BLOCKS=${EPOCH_BLOCKS:-3600}      # 1-hour epochs at 1 s blocks (DEC-12)
 DAY=86400                               # blocks a day at 1 s blocks
 FAUCET_FANG=${FAUCET_FANG:-2500000}     # per validator's consensus-key account (drips + fees)
 SELF_BOND=${SELF_BOND:-10000}           # FANG each owner bonds (the default min_self_bond)
-# Unbonding, and the evidence window with it: a week (mainnet: 21 days), so the weak-subjectivity
+# Unbonding, and the evidence window with it: a week (the default: 21 days), so the weak-subjectivity
 # period (half the evidence window) is 3.5 days, not hours, and unbonding is still a week's
 # exercise. Below governance's 14-day floor on the evidence window, which a vote then can't lower
-# further but can raise (params.rs `governance_band`; mainnet's genesis must start inside it).
+# further but can raise (params.rs `governance_band`; a blockula-1 genesis must start inside it).
 UNBONDING_BLOCKS=${UNBONDING_BLOCKS:-$((7 * DAY))}
 # The contribution pool, open from genesis.
 POOL_FANG=${POOL_FANG:-100000}          # its opening balance, out of the endowment
@@ -73,7 +73,7 @@ if [ -n "${GENESIS_ONLY:-}" ] && [ -n "${REHEARSAL_DIR:-}" ]; then NET=$REHEARSA
 N=${#REGIONS[@]}
 # Downtime: a validator is jailed past DOWNTIME_MAX_MISSED of its last DOWNTIME_WINDOW leader
 # slots. Each of N validators leads one view in N, and one that's away misses a turn every N−1
-# blocks, so the chain default (50 of 100, about right for mainnet's 31) jails one of four after
+# blocks, so the chain default (50 of 100, about right for a set of 31) jails one of four after
 # ~3 minutes away. These defaults jail after half an epoch away (600 of 1,200 for four validators,
 # ~30 minutes), as long as the beacon's reveal half, which jails a validator away for all of it
 # anyway (docs/OPERATIONS.md "Jailed or tombstoned").
@@ -168,12 +168,12 @@ if [ ! -f "$NET/genesis.json" ]; then
     CONSENSUS=$(key "$NET/v$i/consensus.json")
     [ -f "$NET/v$i/validator.key" ] || (umask 077; jq -r .seed "$NET/v$i/consensus.json" > "$NET/v$i/validator.key")
     OWNER=$(key "$NET/owner-$i.json")
-    # Each validator publishes the public node as its HTTP endpoint: its sentry, as mainnet
+    # Each validator publishes the public node as its HTTP endpoint: its sentry, as independent
     # operators publish theirs (`genesis operator --http-addr`); validators' own HTTP stays on
     # Fly's private network, where the other nodes reach it (PEER_HTTP).
-    # No seat is flagged `--founder-or-foundation`: the four stand in for a mainnet genesis's
+    # No seat is flagged `--founder-or-foundation`: the four stand in for a public genesis's
     # independent operators. The founder's stand-in account is excluded from the bootstrap
-    # delegation as on mainnet; flagging the seats too would leave the
+    # delegation (DEC-5); flagging the seats too would leave the
     # delegation nobody to back, and DEC-3's cap (fewer such seats than f: none in a set of 4)
     # would keep a seat that left the set out for good (relaunch problem 2; staking test
     # `testnet_seats_leave_rejoin_and_get_the_bootstrap_delegation`).
@@ -220,7 +220,7 @@ $(printf "%b" "$ops")]
 reserved_names = ["blockula", "boo", "foundation", "treasury", "community", "validator", "admin", "support", "security", "official"]
 features = []
 
-# Mainnet's parameters, except durations short enough to exercise on a testnet: a week of
+# The default parameters, except durations short enough to exercise on a testnet: a week of
 # unbonding and of evidence (the weak-subjectivity period is half that), day-long votes, an
 # hour's timelock, spends open from genesis; and a downtime window sized for $N validators.
 [params]
@@ -279,7 +279,7 @@ label = "security grants (testnet stand-in)"
 SPEC
   # Each operator's allocation (its self-bond comes out of it) and its validator's faucet float.
   printf "%b" "$allocs" >> "$NET/spec.toml"
-  # Warnings are expected: a testnet breaks mainnet's independence policy (DEC-3, DEC-14) and
+  # Warnings are expected: a testnet breaks the genesis independence policy (DEC-3, DEC-14) and
   # opens the pool early (deploy/README.md lists them).
   $BIN genesis build --spec "$NET/spec.toml" --out "$NET/genesis.json"
   for i in $(seq 0 $((N - 1))); do cp "$NET/genesis.json" "$NET/v$i/genesis.json"; done

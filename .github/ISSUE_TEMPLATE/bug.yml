@@ -1,0 +1,74 @@
+name: 🐛 Bug report
+description: The node, CLI, wallet, explorer, SDK, MCP server or docs don't do what they say.
+title: "Bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. A bug with a clear repro is one of the most useful things you can send.
+
+        **Security bugs go privately**, through a [security advisory](https://github.com/jackdishman/blockula/security/advisories/new), never in a public issue ([SECURITY.md](https://github.com/jackdishman/blockula/blob/main/SECURITY.md)). That includes any crash a fuzzer found.
+
+        **Never paste a key file, recovery words or a wallet backup.** Addresses, tx ids and block heights are public, so they're fine.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Where
+      options:
+        - Node or CLI (blockula)
+        - Web wallet or explorer
+        - SDK (@blockula/sdk)
+        - MCP server (@blockula/mcp)
+        - Docs
+        - Something else
+    validations:
+      required: true
+  - type: dropdown
+    id: network
+    attributes:
+      label: Network
+      options:
+        - Public testnet (blockula-testnet-2)
+        - A chain I or someone else launched (blockula summon)
+        - A local chain (blockula dev or local-testnet.sh)
+        - Another chain, or none
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "`blockula --version`, the npm package's version, or `version` and `git_sha` from the node's `/api/status`."
+      placeholder: "blockula 0.5.2 (git 1a2b3c4)"
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to reproduce it
+      description: The commands or clicks, in order. A failing test or a script is best.
+      placeholder: |
+        1. blockula dev
+        2. blockula wallet send alice.boo 1 --rpc http://127.0.0.1:7070
+        3. …
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and tx ids
+      description: Relevant log lines, error messages, tx ids or block heights. Remove anything private first.
+      render: text
+  - type: input
+    id: os
+    attributes:
+      label: OS, browser or Node version
+      placeholder: "macOS 26 on Apple Silicon, Chrome 141, Node 22"

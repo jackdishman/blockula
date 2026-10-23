@@ -293,7 +293,7 @@ if [ -n "$MAINNET" ] && [ -z "$pinned" ] && [ -f "$ROOT/node/src/cli_net.rs" ]; 
   [ -z "$stale" ] || echo "Also in this PR: node/src/cli_net.rs's tests $stale stand in for mainnet with nodes on another genesis, which this pin refuses: have those stand-ins report the pinned hash (known_genesis(MAINNET_CHAIN_ID))."
 fi
 if [ -n "$MAINNET" ]; then
-  echo "Next: cargo test --release --locked --manifest-path node/Cargo.toml -- checkpoints cli_net; npm run build -w @blockula/sdk && npm test -w @blockula/mcp; npm test -w web && npm run test:e2e -w web (the mainnet build now pins this genesis: Vercel's NEXT_PUBLIC_MAINNET_GENESIS_HASH must be $HASH); commit, and release (deploy/mainnet/README.md)."
+  echo "Next: cargo test --release --locked --manifest-path node/Cargo.toml -- checkpoints cli_net; npm run build -w @blockula/sdk && npm test -w @blockula/mcp; npm test -w web && npm run test:e2e -w web (the mainnet build now pins this genesis: Vercel's NEXT_PUBLIC_MAINNET_GENESIS_HASH must be $HASH); commit, and release (docs/OPERATIONS.md \"Releases\")."
 else
   echo "Next: cargo test --release --locked --manifest-path node/Cargo.toml -- checkpoints cli_net; npm run build -w @blockula/sdk && npm test -w @blockula/mcp; npm test -w web; commit, and release (deploy/README.md \"Relaunch\")."
 fi

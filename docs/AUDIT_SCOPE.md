@@ -1,8 +1,10 @@
 # Blockula security audit: scope and request for proposals
 
-Blockula is a post-quantum layer-1 blockchain: ML-DSA-65 (FIPS 204) signatures for every transaction, vote and certificate, BLAKE3 hashing, and Commonware's simplex BFT consensus with an ML-DSA certificate scheme we wrote. This document is the scope for SEC-1 in [MAINNET.md](MAINNET.md): the external audit of the frozen genesis commit, followed by fixes and a re-review. Send it to firms as the request for proposals.
+> **There's no mainnet** (decided Oct 22, 2026). Blockula is a kit for running your own ledger ([LAUNCH.md](LAUNCH.md)). This scope was written for the mainnet's audit; it still describes what an external audit of the protocol every Blockula chain runs would cover. MAINNET.md, the mainnet readiness list it cites, was removed with the plan (`git show a7288977:docs/MAINNET.md` shows it).
 
-The protocol being audited is specified in [MAINNET-DESIGN.md](MAINNET-DESIGN.md) ("protocol v1"). Background: [PLAN.md](PLAN.md) (architecture), [MAINNET.md](MAINNET.md) (the known gaps, with code citations), [OPERATIONS.md](OPERATIONS.md) (how it's run), [GENESIS_CEREMONY.md](GENESIS_CEREMONY.md).
+Blockula is a post-quantum layer-1 blockchain: ML-DSA-65 (FIPS 204) signatures for every transaction, vote and certificate, BLAKE3 hashing, and Commonware's simplex BFT consensus with an ML-DSA certificate scheme we wrote. This document is the scope for SEC-1 in MAINNET.md: the external audit of the frozen genesis commit, followed by fixes and a re-review. Send it to firms as the request for proposals.
+
+The protocol being audited is specified in [MAINNET-DESIGN.md](MAINNET-DESIGN.md) ("protocol v1"). Background: [PLAN.md](PLAN.md) (architecture), MAINNET.md (the known gaps, with code citations), [OPERATIONS.md](OPERATIONS.md) (how it's run), [GENESIS_CEREMONY.md](GENESIS_CEREMONY.md).
 
 ## Engagements
 

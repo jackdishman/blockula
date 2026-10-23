@@ -49,7 +49,7 @@ The node is a binary crate with no library target, so `src/lib.rs` compiles its 
 |---|---|---|
 | `evidence` | 186,811 (120 s, 1 worker), its first run, from the committed seeds; corpus 182 | no crash, no invariant failure |
 
-Certificate-derived conflicts (a validator's direct vote against its signature inside another block's certificate) aren't evidence the chain accepts yet: `ReportEquivocation` carries simplex's own `ConflictingNotarize`/`ConflictingFinalize`/`NullifyFinalize`, which pair two votes. Extracting a vote from a certificate needs simplex's per-signer certificate layout (`pq::Certificate`'s signer bitmap and signatures) to be decoded and re-verified per signer on chain, a new evidence format with its own golden vector and fuzzing. It's tracked as CV-3's pending item in docs/MAINNET.md.
+Certificate-derived conflicts (a validator's direct vote against its signature inside another block's certificate) aren't evidence the chain accepts yet: `ReportEquivocation` carries simplex's own `ConflictingNotarize`/`ConflictingFinalize`/`NullifyFinalize`, which pair two votes. Extracting a vote from a certificate needs simplex's per-signer certificate layout (`pq::Certificate`'s signer bitmap and signatures) to be decoded and re-verified per signer on chain, a new evidence format with its own golden vector and fuzzing. It isn't built (CV-3's pending item).
 
 ## Results (2026-10-15, local, Apple M-series, nightly-2026-10-06): the integrated node
 

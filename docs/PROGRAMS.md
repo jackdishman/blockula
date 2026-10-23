@@ -3,6 +3,12 @@
 > **A design, not built yet: nobody can deploy a program today. Programs will be reviewed by AI
 > agents, not externally audited (D3).**
 
+> **Update, 2026-10-22: there's no mainnet.** Blockula 1.0 is a kit for launching your own ledger
+> ([LAUNCH.md](LAUNCH.md)), and programs are an optional feature with no deadline: built into the
+> node and switched off. What this design says about going live on mainnet (D2, 14.3, section 16)
+> is dropped. MAINNET.md, LAUNCH-PLAN.md and COUNSEL_BRIEF.md, which it cites, were removed with
+> the mainnet plan.
+
 Status: design, revision 3, 2026-10-19. Line numbers cite main at `2bbecde` (after v0.5.2), each one
 re-opened for this revision. Revision 2 (2026-10-17) was written against `ff1cbc4`. The design
 builds on four independent designs (`design-wasmi.md`, `design-polkavm.md`, `design-evm.md`,
@@ -13,9 +19,8 @@ and pull requests.
 
 Revision 3 records the maintainer's decisions of 2026-10-19 (PROGRAMS-PLAN.md section 3) and
 corrects what had drifted from the code:
-- programs go live on mainnet as soon as they're ready: formats frozen, the audit closed, and at
-  least 8 weeks on testnet-2. They're on at genesis if that comes first; otherwise the council
-  activates them (D2, 14.3);
+- programs were to go live on mainnet as soon as they were ready (D2, 14.3), a decision dropped
+  with the mainnet on 2026-10-22;
 - Claude audits them with Fable agents, not an external firm (D3, section 13). So the default engine
   is soroban-wasmi 29.x, not wasmi 2.0, and phase 0 measures both (4.1, D1);
 - the work lands on main behind version gates, and v2 runs only on chains born at v2 until the
@@ -71,21 +76,19 @@ the developer model works in production. From the other designs and the review i
   enforces.
 
 Programs ship as **protocol v2 behind a `programs` feature flag**, built on main behind version
-gates. They land first on `blockula-testnet-2` as a height-gated upgrade, which rehearses the
-mainnet upgrade path, including the first state migration on a live chain. **They go live on
-mainnet as soon as they're ready** (D2): the consensus formats frozen, the audit closed with no
-open critical or high finding, and at least 8 weeks of adversarial testing on testnet-2. If that
-comes before mainnet's genesis, they're on from block 1. Otherwise the mainnet binary carries
-them switched off, and the council proposes `ActivateFeature { programs }` the day the last gate
-closes, which takes effect about 9 days later. (`blockula-1`'s binary allows neither under v2: it
-switches them on only from protocol v3, 14.3.) **The audit is
+gates. They land first on `blockula-testnet-2` as a height-gated upgrade, the first state
+migration on a live chain, and get at least 8 weeks of adversarial testing there. They were to go
+live on mainnet as soon as they were ready (D2: the consensus formats frozen, the audit closed
+with no open critical or high finding, and those 8 weeks); there's no mainnet now, so they're an
+optional feature with no deadline. (`blockula-1`'s binary allows them neither at genesis nor
+under v2: it switches them on only from protocol v3, 14.3.) **The audit is
 Claude's, run with Fable agents, not an external firm's** (D3, section 13), so programs are
 described as "reviewed by AI agents, not externally audited". The training wheels matter more
 for it. [PROGRAMS-PLAN.md](PROGRAMS-PLAN.md) puts readiness about mid-August 2027.
 
 **Decided on 2026-10-19** (section 15, PROGRAMS-PLAN.md section 3):
 - build on this design, landing on main behind version gates;
-- when programs go live on mainnet (D2) and who audits them (D3);
+- when programs go live on mainnet (D2, dropped since) and who audits them (D3);
 - the engine default, soroban-wasmi 29.x, with wasmi 2.0 measured beside it in phase 0 (D1);
 - calibration on the existing stack: an ephemeral Fly `performance-4x` with 16 GB for x86, and
   GitHub's `ubuntu-24.04-arm` runners for aarch64.
@@ -327,8 +330,8 @@ developers and adoption, and delivery risk and fit with the code.
   proxies, adds 160-bit aliases, and contradicts PLAN.md.
 - **On delivery,** wasmi keeps program state in the existing `SubState`/`TMap` model under a cap.
   It extends the fee machinery the way Ghost Mode did, and its engine is a pure-Rust interpreter
-  with no code generation. None of that touches the state layer whose schedule sets the mainnet
-  date (MAINNET.md section 5, Track A).
+  with no code generation. None of that touches the state layer whose schedule set the mainnet
+  date then (MAINNET.md section 5, Track A).
 
 The developers judge's caveat stands. If porting existing DeFi as fast as possible were the top
 priority, the EVM would win on speed alone, at a real cost to safety and to the chain's identity.
@@ -1140,7 +1143,7 @@ verifiers the user configured. There's never a foundation-granted badge (9.7).
 
 - A wasmi bump, a schedule change or a new host function is a protocol version
   (`ScheduleUpgrade`).
-- **Before release,** every module stored on testnet and mainnet must validate under the new
+- **Before release,** every module stored on a live chain must validate under the new
   engine, and the corpus must replay with identical receipts. Any difference has to be
   deliberate and listed in the release notes.
 - **The replay policy: every binary carries every engine, schedule and host ABI ever in
@@ -1695,7 +1698,7 @@ For the founder and the foundation:
 - the wallet and explorer list programs neutrally: no featured programs, prices, APYs or
   "trending", and badges only for facts (immutable, build verified by you, upgrade pending).
 
-Questions to add to COUNSEL_BRIEF.md (LEG items) before mainnet activation:
+Open legal questions (they were for counsel before a mainnet activation, which was dropped):
 - whether publishing reference financial program code is a "managerial effort" under Release
   33-11412;
 - what obligations a front-end that renders and signs third-party program calls takes on;
@@ -2247,7 +2250,7 @@ finding keeps that test. A model reading code misses some things however it's pr
 assurance work below is evidence that doesn't depend on any reviewer's judgment, and the
 backstops stay: the training wheels (14.1), the bug bounty from testnet-2's activation, and
 Hunts for breaking programs. The tx codec for tags 62–70 is also in the external protocol
-audit's scope, because the mainnet binary carries it even while programs are off.
+audit's scope, because every binary carries it even while programs are off.
 
 **Assurance work:**
 - **Differential.**
@@ -2432,7 +2435,7 @@ on a v1 binary. `/api/params` gains a `programs` section.
 
 ### 14.3 On at genesis, or after?
 
-- **Testnet-2 rehearses mainnet.** `blockula-testnet-2` has been live since 2026-10-18 at
+- **Testnet-2 first.** `blockula-testnet-2` has been live since 2026-10-18 at
   protocol v1, without programs. It runs four validators on Fly `shared-cpu-2x` machines with
   2 GB of RAM each (`deploy/README.md`) and a public node that keeps 14 days of blocks; a daily
   job archives its history from genesis for the replay checks (`scripts/archive-chain.mjs`,
@@ -2445,45 +2448,22 @@ on a v1 binary. `/api/params` gains a `programs` section.
   4. the council passes `ScheduleUpgrade { version: 2, activation_height }`. The activation
      must leave room, after the vote and the timelock, for a `CancelUpgrade`'s own vote plus 66
      blocks (`governance.rs:553-556`): on testnet-2's parameters (1 day of voting, a 1-hour
-     timelock) that's at least about 2 days after the proposal, and on mainnet's (7 days and 2
+     timelock) that's at least about 2 days after the proposal, and at the defaults (7 days and 2
      days) about 16;
   5. at the activation height `begin_block` adds META `programs` and the fuel ring and moves the
      schema record to 10 (14.4), and v1-only nodes halt cleanly;
-  6. then `ActivateFeature { programs }` passes (another 25 hours on testnet-2, 9 days on
-     mainnet).
+  6. then `ActivateFeature { programs }` passes (another 25 hours on testnet-2, 9 days at
+     the defaults).
 
-  That exercises every piece of the mainnet upgrade path: release signing, operator upgrades,
+  That exercises every piece of a live chain's upgrade path: release signing, operator upgrades,
   council votes, the first state migration on a live chain, a feature switch and a halt of
   laggards.
-- **Mainnet: live as soon as they're ready (D2).** Ready means three gates: the consensus formats
-  are frozen (PROGRAMS-PLAN.md M6), the audit has closed with no open critical or high finding
-  (section 13), and testnet-2 has run programs for at least 8 weeks (16.1). The mainnet binary
-  carries v2, and its genesis starts at v2 (a schedule entry at height 1), with `programs` (on
-  `blockula-1`, neither under v2: below):
-  - **on** (`features = ["programs"]`) if every gate closes before the genesis ceremony. Today
-    the chain refuses Ghost Mode in `blockula-1`'s genesis (`chain.rs:516`); programs get no such
-    refusal once their gates have closed, and the genesis builder checks that the audit report
-    exists and that testnet-2's 8 weeks have passed;
-  - **off** otherwise. The council proposes `ActivateFeature { programs }` the day the last gate
-    closes, and it takes effect about 9 days later (7 days of voting, a 2-day timelock). The
-    bootstrap council can pass it only in mainnet's first year (`bootstrap_end_height`); after
-    that it takes the ⅔ token vote.
-
-  `blockula-1` takes neither path under v2, and its binary holds it to that: its genesis can't
-  list `programs` (`Genesis::check`, as for Ghost Mode), and its governance switches them on only
-  from protocol v3 (`upgrade::check_may_activate`, `MAINNET_PROGRAMS_ACTIVATION_VERSION`), the
-  version that ships what their audit asks for. Once the gates close, turning them on there takes
-  a release that supports v3, the council's `ScheduleUpgrade { version: 3 }`, and then an
-  `ActivateFeature { programs }` that runs where v3 is in force. Other chains keep both paths
-  under v2.
-
-  If the format freeze lands after mainnet's own (MAINNET.md phase 1), mainnet launches at v1 and
-  programs arrive as the same v2 upgrade testnet-2 rehearsed.
-- **Which one happens depends on mainnet's date, not on programs.** Programs aren't a mainnet
-  launch gate (LAUNCH-PLAN.md). The plan's calendar (PROGRAMS-PLAN.md section 10) has the formats
-  frozen about May 2027, testnet-2's activation in June and readiness about mid-August 2027. A
-  genesis after that has them on from block 1; an earlier one launches with them off, and the
-  council switches them on once they're ready (on `blockula-1`, through v3: above).
+- **Mainnet: dropped.** D2 had programs go live on mainnet as soon as they were ready: on at its
+  genesis, or switched on by its council. There's no mainnet now (decided 2026-10-22), so they
+  stay optional. The binary still holds `blockula-1` to its rules: its genesis can't list
+  `programs` (`Genesis::check`, as for Ghost Mode), and its governance switches them on only from
+  protocol v3 (`upgrade::check_may_activate`, `MAINNET_PROGRAMS_ACTIVATION_VERSION`). Other
+  chains keep both paths under v2.
 
 ### 14.4 The v1 → v2 transition
 
@@ -2558,7 +2538,7 @@ freeze.
 | # | Decision | Decided, or the default it's built with |
 |---|---|---|
 | D1 | Engine pin: soroban-wasmi 29.x, wasmi 2.0.x or wasmi 0.38.0 | **soroban-wasmi 29.x by default** (since D3), settled in phase 0 on measurements. wasmi 2.0 only if its measured advantages are large and its fuzzing comes back clean. Not 0.38 (unmaintained, so we'd own a fork). The engine sits behind `engine.rs`, so the pick doesn't touch the ABI, fees, state or tools |
-| D2 | When programs go live on mainnet | **Decided: as soon as they're ready.** Ready means the formats are frozen, the audit has closed with no open critical or high finding, and testnet-2 has run them ≥ 8 weeks. On at genesis if that comes before the ceremony; otherwise in the genesis binary at v2, off, and activated by a council vote proposed the day the last gate closes (about 9 days; 14.3) |
+| D2 | When programs go live on mainnet | **Dropped with the mainnet (2026-10-22).** It was decided: as soon as they're ready. Ready means the formats are frozen, the audit has closed with no open critical or high finding, and testnet-2 has run them ≥ 8 weeks. On at genesis if that comes before the ceremony; otherwise in the genesis binary at v2, off, and activated by a council vote proposed the day the last gate closes (about 9 days; 14.3) |
 | D3 | Who audits | **Decided: Claude, with Fable agents, not an external firm** (section 13). Blockula is an experiment, and programs are labeled "reviewed by AI agents, not externally audited". Revision 2 recommended booking a separate VM audit team; that's dropped, and the training wheels (D4) matter more |
 | D4 | Training wheels | **All four, each bounded:** the f + 1 pause (3 days, once per validator per 30 days); exit-only when governance switches programs off; a tokens-only ⅔ freeze that lapses after 30 days; and the 10M FANG cap on program balances (deposits excluded). Accept the cap's griefing cost explicitly (anyone can park 10M FANG to block inflows, for its forgone yield). Retire the cap, and revisit the pause, after a year without incidents |
 | D5 | Compute charged on the declared limit (no refund) or on use | **On the limit, plus the declared code's load.** Exact charges, budgets, tip cap and block bound; users overpay their ~10% margin and the load a cache would have spared them |
@@ -2569,7 +2549,7 @@ freeze.
 | D10 | Plain transfers to programs | **Refused unless the program set `accepts_transfers`**. They never run code. Closed programs accept nothing |
 | D11 | Timestamp in the host API | **None in v1** (heights only). Add only with `run_block` plumbing and replay records, if programs prove they need it |
 | D12 | Agent grants: pinned to a version or following upgrades | **The chain allows both. The wallet defaults to pinned**, and labels unpinned grants "follows upgrades" |
-| D13 | The foundation deploying financial programs | **No.** It publishes reference programs as source; any an affiliate deploys are immutable; counsel's opinion before mainnet activation |
+| D13 | The foundation deploying financial programs | **No.** It publishes reference programs as source; any an affiliate deploys are immutable |
 | D14 | Officially supported languages | **Rust only.** C and Zig work but are unsupported. Fund the std library and templates through Hunts |
 | D15 | Program state cap | **A 512 MiB soft cap whose price doubles each eighth past it, with a memory ceiling at twice the soft cap** (~3 GiB of RAM at the ceiling). The soft cap's bound is 1 GiB in code; beyond that takes a protocol version with a larger snapshot limit. Disk-backed cold storage is v2 |
 | D16 | Replay across engine versions | **Carry every engine, schedule and host ABI ever in force**, with a multi-boundary replay in every release's CI, so `--full` and rebuilds from genesis keep working. The one exception, an exploited memory-safety bug in history, is handled by the fixing release's checkpoint (7.6). The alternative, snapshot-only history across every engine boundary, would change OPERATIONS.md and `--full` |
@@ -2590,7 +2570,7 @@ freeze.
 | **2. Tooling** | Jan to Jun 2027, overlapping, 1–2 engineers | `program-sdk` crates, macros, harness, native mode, templates, std; the builder image and `verify`; `@blockula/sdk/program`, codegen and the receipt codec; MCP tools with elicitation; web pages, `specFromInterface`, bigint params, `prepare` with re-simulation, and agent scopes; AGENTS.md rows and rules, GOVERNANCE.md keys, OPERATIONS.md's replay policy. **An SDK and MCP release that reads tag 70, grants and receipts ships at least 4 weeks before testnet-2's activation** | An outside developer ships a template-derived program on `blockula dev` in a day from the docs alone; the SDK e2e covers every tag; an agent calls a program through the MCP on a scoped grant, confirmed by elicitation, end to end |
 | **3. Testnet-2 upgrade** | June to Aug 2027, ≥ 8 weeks after activation | The validators resized to the floor spec (they're 2 GB today); a release with v2; `ScheduleUpgrade { 2 }` then `ActivateFeature { programs }` through the council (14.3). Hunts for programs and for breaking them; a bug bounty covering the VM; spam at the fuel limits; storage-cap and value-cap griefing; chaos (restarts with cold caches, a lagging verifier, a node rebuilt from genesis across the boundary); at least one aarch64 validator. Drills: a pause and its lapse, exit-only and reactivation, a `max_block_fuel` change within its bounds, and a v3 upgrade that recalibrates the fuel schedule and carries both engines (7.6). The freeze vote and its lapse are drilled on a separate `summon`ed chain: they're tokens-only, and testnet-2's token vote can't reach quorum before about April 2027 | ≥ 8 weeks with no halt, divergence or manual intervention; every operator upgraded on their own; the fuel and byte controllers behave under spam; calibration holds on testnet hardware; no open high finding |
 | **4. Audit (D3)** | Per PR from M1; milestone audits at M1, M3 and M5; the full audit May to June 2027 | Claude with Fable agents (section 13): `node/vm`, the integration (the v1 → v2 transition included), the engine's enabled paths in the pinned upstream source, the SDK macros, the TS preview, re-simulation and MCP elicitation paths. A finding counts once a second agent reproduces it with a failing test. The tx codec for tags 62–70 also goes into the external protocol audit's scope (it's reachable in the genesis binary even while off). Counsel's opinion on activation, on the training-wheel levers and on D13 | No open critical or high findings; fixes re-verified by a fresh agent; reports published in `docs/audits/`, saying "reviewed by AI agents, not externally audited"; AUDIT_SCOPE.md updated |
-| **5. Mainnet** | When the last gate closes: about mid-August 2027 on the plan's calendar | On at genesis or activated by the council (14.3, D2). After activation, the council raises the caps in steps, within their code bounds, as data comes in | Activation passes; the first week's blocks stay inside the budget |
+| **5. Mainnet** | Dropped (2026-10-22): there's no mainnet | | |
 | **Later** | | Adopting the verified state at finalization; resident code; declared accounts; host ABI v2 (`program_names`, `program_hunts`, factories); `program_staking` after counsel; parallel execution; floats under the deterministic profile; disk-backed cold program storage or rent; a remote signer for consensus keys, so an engine escape reaches less | |
 
 Calendar: about 9 to 10 months from the start of phase 0 to readiness (PROGRAMS-PLAN.md section 10).
@@ -2625,8 +2605,7 @@ than on code. With no external audit, there's no audit queue to wait for.
    - *Mitigation:* soroban-wasmi by default, wasmi 2.0 only on clean measurements (D1); the
      engine-neutral ABI keeps a swap cheap; a different model (Fable) with adversarial briefs, and
      a failing test before any finding counts; evidence that doesn't depend on a reviewer
-     (fuzzing, differentials, the CI gate); the training wheels and the bug bounty; and mainnet
-     activation only once every gate has closed (D2).
+     (fuzzing, differentials, the CI gate); the training wheels and the bug bounty.
 4. **R4: users' and agents' assets inside programs.**
    - The threats: non-FANG assets the chain can't meter, interface and event phishing, a program
      that behaves differently under the signed limits than in simulation, upgrade rugs, agents
@@ -2653,8 +2632,8 @@ than on code. With no external audit, there's no audit queue to wait for.
      build programs well.
 8. **R8: the first live state migration.**
    - The threat: a v2 binary that computes a different root from v1 binaries before activation,
-     can't load v1 state or snapshots, or wakes a v2 behavior early splits testnet-2, and later
-     mainnet, at the upgrade.
+     can't load v1 state or snapshots, or wakes a v2 behavior early splits testnet-2 at the
+     upgrade.
    - *Mitigation:* byte-identical state below `H`, two supported schemas, every behavior gated on
      `version_at` (14.4), the mixed-binary harness, and testnet-2's rehearsal.
 
@@ -2687,7 +2666,7 @@ than on code. With no external audit, there's no audit queue to wait for.
 | `sdk-ts/src/tx.ts`, `program.ts`, `describe.ts`, `proof.ts`, `index.ts`, `test/` | Tags 62–70, `KeyGrants` decoding, the interface codec, Borsh with `bigint`, selectors, the receipt codec, `Program`, `wallet.call` with re-simulation, proven program reads, grants and receipts, codegen, vectors |
 | `mcp/src/index.ts`, `untrusted.ts`, `spend.ts` | `program_*` tools, elicitation and the confirm digest, `BLOCKULA_PROGRAMS`, `BLOCKULA_UNCONFIRMED_MAX`, refusals, the `programText` pass, spend reservation |
 | `web/lib/explorer/programs.ts`, `interface.ts` (new), `preflight.ts`, `components/explorer/ActionForm.tsx`, app routes | Deployed programs, `specFromInterface`, bigint `ParamType`s, `prepare` with re-simulation, facts and claims in previews, full addresses with fingerprints, the program and code pages, agent scopes with allowances |
-| `docs/` | Landed with revision 3: `PROGRAMS.md` (this file), `PROGRAMS-PLAN.md`, MAINNET-DESIGN's tags 62–70, namespaces 66–73 and section 7, LAUNCH-PLAN.md's programs section, and the renames in section 1. With the code: AGENTS.md rows for tags 62–70 and rules of the road; GOVERNANCE.md keys; OPERATIONS.md (memory, `--serve-simulate`, the replay policy, the upgrade's schema change); COUNSEL_BRIEF.md questions; PLAN.md Known limits (MEV, randomness, the cap, the training wheels); BUG_BOUNTY.md (the VM in scope from testnet-2's activation); AUDIT_SCOPE.md (the tags 62–70 codec in the protocol engagement; the VM and its integration outside it, D3) and `docs/audits/` (section 13) |
+| `docs/` | Landed with revision 3: `PROGRAMS.md` (this file), `PROGRAMS-PLAN.md`, MAINNET-DESIGN's tags 62–70, namespaces 66–73 and section 7, LAUNCH-PLAN.md's programs section, and the renames in section 1. With the code: AGENTS.md rows for tags 62–70 and rules of the road; GOVERNANCE.md keys; OPERATIONS.md (memory, `--serve-simulate`, the replay policy, the upgrade's schema change); PLAN.md Known limits (MEV, randomness, the cap, the training wheels); BUG_BOUNTY.md (the VM in scope from testnet-2's activation); AUDIT_SCOPE.md (the tags 62–70 codec in the protocol engagement; the VM and its integration outside it, D3) and `docs/audits/` (section 13) |
 
 ## Appendix B. An agent's call, end to end
 

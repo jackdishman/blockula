@@ -1,0 +1,33 @@
+# The repo's labels, synced by hand (nothing reads this file automatically). Apply it with gh,
+# after a dry run of the list:
+#
+#   node -e 'const y=require("yaml");for(const l of y.parse(require("fs").readFileSync(".github/labels.yml","utf8")))console.log([l.name,l.color,l.description].join("\t"))' |
+#     while IFS=$'\t' read -r name color description; do
+#       gh label create "$name" --color "$color" --description "$description" --force
+#     done
+#
+# --force updates a label that exists. Labels that aren't here are left alone.
+
+- name: hunt
+  color: "8b0000"
+  description: A bounty with acceptance criteria and test FANG escrowed on-chain
+
+- name: familiar-friendly
+  color: "5319e7"
+  description: Specified tightly enough for an agent (a Familiar) to finish end to end
+
+- name: good-first-issue
+  color: "7057ff"
+  description: A small, well-scoped first contribution
+
+- name: needs-vouch
+  color: "fbca04"
+  description: A newcomer asking for a vouch so they can claim for the contribution pool
+
+- name: node-operator
+  color: "0e8a16"
+  description: Running a node or validator, including testnet self-bond requests
+
+- name: bug
+  color: "d73a4a"
+  description: Something doesn't work as described

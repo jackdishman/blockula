@@ -154,7 +154,7 @@ blockula join --genesis http://127.0.0.1:<v0 http port> --genesis-hash <hash> --
 
 **On public servers**, build the genesis from a spec, with no admin keys (the validators pass proposals as the bootstrap council):
 1. Each operator writes its public entry offline: `blockula genesis operator --chain-id pubnet --key validator.key --owner <owner account> --p2p-addr 203.0.113.10:30300 --http-addr https://… --out v0.toml` (the addresses peers will dial).
-2. `blockula genesis build --spec spec.toml --out genesis.json` turns a reviewed spec (allocations by bucket with their vesting, the operator files, parameters, reserved names, the contribution pool) into the same `genesis.json` and hash on every machine. `deploy/launch.sh` does both for the public testnet ([deploy/README.md](deploy/README.md)); `deploy/mainnet/genesis-spec.example.toml` is mainnet's shape.
+2. `blockula genesis build --spec spec.toml --out genesis.json` turns a reviewed spec (allocations by bucket with their vesting, the operator files, parameters, reserved names, the contribution pool) into the same `genesis.json` and hash on every machine. `deploy/launch.sh` does both for the public testnet ([deploy/README.md](deploy/README.md)); [`node/testdata/genesis-example/spec.toml`](node/testdata/genesis-example/spec.toml) is a complete example.
 3. Each server runs `blockula run --home <its home, holding genesis.json and its validator.key> --bind 0.0.0.0` (or `--bind ::`).
    - The node listens on the bind address and advertises its genesis addresses.
    - Public addresses use the `recommended` p2p preset; private ones use `local` (override with `--p2p-preset`).
@@ -245,9 +245,9 @@ mcp/      @blockula/mcp: MCP server for coding agents
 web/      Passkey web wallet (Next.js), deployed at testnet.blockula.app
 deploy/   Fly.io testnet: Dockerfile, entrypoint, launch.sh
 docs/     LAUNCH.md (launch your own ledger), ONE_PAGER.md (what this is), PLAN.md (architecture, roadmap),
-          MAINNET.md, MAINNET-DESIGN.md, TOKENOMICS.md (the value-bearing mainnet that was planned, then dropped)
+          MAINNET-DESIGN.md, TOKENOMICS.md (the protocol's design, written for the value-bearing mainnet that was planned, then dropped)
 ```
 
 ## Status
 
-Public testnet live (Phase 1), with Hunts and Proof of Contribution v1 (Phases 1.5–2). An internal four-track security and product review was completed and its findings fixed. **No third-party audit yet: test value only.** Blockula isn't launching a mainnet: it's a kit for running your own ledger ([docs/LAUNCH.md](docs/LAUNCH.md)). See [docs/PLAN.md](docs/PLAN.md); [docs/MAINNET.md](docs/MAINNET.md) records what a value-bearing mainnet would have needed. Report vulnerabilities privately: [SECURITY.md](SECURITY.md).
+Public testnet live (Phase 1), with Hunts and Proof of Contribution v1 (Phases 1.5–2). An internal four-track security and product review was completed and its findings fixed. **No third-party audit yet: test value only.** Blockula isn't launching a mainnet: it's a kit for running your own ledger ([docs/LAUNCH.md](docs/LAUNCH.md)). See [docs/PLAN.md](docs/PLAN.md). Report vulnerabilities privately: [SECURITY.md](SECURITY.md).

@@ -160,7 +160,7 @@ CSP violation, console error, server-rendered style attribute or markup run from
 ## What the node would need for more
 
 All of this runs on the node's existing HTTP API. These endpoints would close the gaps that
-remain. They're best built on the read path the mainnet work introduces (`ReadView` in
+remain. They're best built on the newer read path (`ReadView` in
 `node/src/view.rs`) rather than on today's handlers:
 
 - **Balance over time.** Balances are only known at the head, and some effects aren't

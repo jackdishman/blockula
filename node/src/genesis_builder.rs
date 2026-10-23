@@ -1014,9 +1014,9 @@ mod tests {
 
     const FANG: u64 = DROPS_PER_FANG;
 
-    /// deploy/mainnet/genesis-spec.example.toml.
+    /// node/testdata/genesis-example/spec.toml.
     fn example() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../deploy/mainnet/genesis-spec.example.toml")
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/genesis-example/spec.toml")
     }
 
     /// One example operator: (seed byte, Fly region, data-center country).

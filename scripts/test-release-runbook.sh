@@ -134,7 +134,7 @@ release() {
     tar -czf "$dir/blockula-$t.tar.gz" -C "$T/stage" "blockula-$t"
   done
   printf '#!/bin/sh\ntouch "%s/INSTALL_SH_RAN"\n' "$T" > "$dir/install.sh"
-  echo '{"chain_id":"blockula-1"}' > "$dir/genesis-blockula-1.json"
+  echo '{"chain_id":"blockula-testnet-2"}' > "$dir/genesis-blockula-testnet-2.json"
   scripts/release-checksums.sh "$tag" "$dir" > /dev/null
   "$BIN" release sign --key "$key" "$dir/checksums.txt" > "$dir/checksums.txt.sig" 2> /dev/null
 }
@@ -315,7 +315,7 @@ fi
 
 # ---- the emergency patch (built in the private fork: no attestation; review-r2-supply-3) ----
 TAG=v9.9.11
-PATCH=$T/patch && release "$PATCH" v9.9.11 "$T/release-key.json" && rm "$PATCH/install.sh" "$PATCH/genesis-blockula-1.json"
+PATCH=$T/patch && release "$PATCH" v9.9.11 "$T/release-key.json" && rm "$PATCH/install.sh" "$PATCH/genesis-blockula-testnet-2.json"
 rm "$PATCH/checksums.txt" && scripts/release-checksums.sh v9.9.11 "$PATCH" > /dev/null && "$BIN" release sign --key "$T/release-key.json" "$PATCH/checksums.txt" > "$PATCH/checksums.txt.sig" 2> /dev/null
 machine 9.9.10 && MIRROR=$T/empty && mkdir -p "$MIRROR"
 FAKE_ATTEST=none expect patch-install "installed blockula 9.9.11" "a signed patch with a logged-in gh and no attestation"
@@ -330,13 +330,13 @@ FAKE_ATTEST=none fails_open patch-install "a patch signed by another key"
 TAG=v9.9.10
 machine 9.9.10 && MIRROR=$NEXT
 expect validator-genesis "installed blockula 9.9.10" "the release's genesis file"
-cmp -s "$ROOTFS/var/lib/blockula/genesis-blockula-1.json" "$NEXT/genesis-blockula-1.json" || fail "the genesis file wasn't installed"
-grep -qF -- "-u blockula $ROOTFS/usr/local/bin/blockula validator init --home $ROOTFS/var/lib/blockula/val --genesis $ROOTFS/var/lib/blockula/genesis-blockula-1.json" "$T/sudo.log" || fail "validator init didn't get the verified genesis file: $(cat "$T/sudo.log")"
+cmp -s "$ROOTFS/var/lib/blockula/genesis-blockula-testnet-2.json" "$NEXT/genesis-blockula-testnet-2.json" || fail "the genesis file wasn't installed"
+grep -qF -- "-u blockula $ROOTFS/usr/local/bin/blockula validator init --home $ROOTFS/var/lib/blockula/val --genesis $ROOTFS/var/lib/blockula/genesis-blockula-testnet-2.json" "$T/sudo.log" || fail "validator init didn't get the verified genesis file: $(cat "$T/sudo.log")"
 ok "validator-genesis: validator init got the verified genesis file"
-BADGEN=$T/badgenesis && release "$BADGEN" v9.9.10 "$T/release-key.json" && echo '{"chain_id":"evil"}' > "$BADGEN/genesis-blockula-1.json"
+BADGEN=$T/badgenesis && release "$BADGEN" v9.9.10 "$T/release-key.json" && echo '{"chain_id":"evil"}' > "$BADGEN/genesis-blockula-testnet-2.json"
 machine 9.9.10 && MIRROR=$BADGEN
 expect validator-genesis refused "a genesis file that isn't the signed one"
-[ ! -e "$ROOTFS/var/lib/blockula/genesis-blockula-1.json" ] || fail "the swapped genesis file was installed"
+[ ! -e "$ROOTFS/var/lib/blockula/genesis-blockula-testnet-2.json" ] || fail "the swapped genesis file was installed"
 fails_open validator-genesis "a swapped genesis file"
 
 # ---- moving the pin to a new release key ----

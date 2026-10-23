@@ -20,7 +20,7 @@
 #     set, candidates and bootstrappers);
 #   - the active set is exactly the N validators read: one this script doesn't run would go
 #     unread, and the next restart could leave the rest short of a quorum. Validators other
-#     operators run (OUTSIDE_VALIDATORS, mainnet's outside genesis operators) can't be read on
+#     operators run (OUTSIDE_VALIDATORS) can't be read on
 #     their machines, so each one in the active set must instead have proposed one of the public
 #     node's last PACE_BLOCKS blocks: simplex leads every validator once in any n consecutive views
 #     of an epoch (twice that across an epoch's end), and a finalized proposal of its own shows it

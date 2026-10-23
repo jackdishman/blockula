@@ -1,0 +1,56 @@
+name: 🤝 Request a vouch
+description: Ask someone with Soul to vouch for you, so you can claim merged PRs for the contribution pool.
+title: "Vouch: "
+labels: [needs-vouch]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A contribution claim needs **Soul** or a **vouch** from someone who has at least 10 Soul. A voucher bonds 10 FANG that you're a real, distinct person. They lose it, and Soul, if you turn out to be a sybil. So they'll look at your GitHub history first.
+
+        **Where this works.** The contribution pool runs on the public testnet (`blockula-testnet-2`). Test FANG and Soul have no value.
+
+        **Who answers.** testnet-2's only Soul holders today are three stand-ins the maintainer holds, so the maintainer answers these requests until other people earn Soul.
+
+        **Before a jury exists.** None of those stand-ins sits on a jury yet, and a Séance needs at least three jurors. Until three join, a claim that validators verify waits, with its bond, for a Séance that can judge it.
+
+        Before you ask, link your GitHub handle to your account (`blockula contrib link-github`, or the MCP's `link_github`) with a public gist that contains your address.
+  - type: input
+    id: address
+    attributes:
+      label: Your account address
+      description: The `tboo1…` address you'll claim from.
+      placeholder: tboo1…
+    validations:
+      required: true
+  - type: input
+    id: github
+    attributes:
+      label: Your GitHub handle
+      description: The handle your account linked. It must author the PRs you claim.
+      placeholder: "@octocat"
+    validations:
+      required: true
+  - type: textarea
+    id: work
+    attributes:
+      label: Your work
+      description: Links to the merged PR you want to claim, or the issue you're working on.
+    validations:
+      required: true
+  - type: textarea
+    id: about
+    attributes:
+      label: Anything else
+      description: Optional. Other open-source work, or how you found Blockula.
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Before you send it
+      options:
+        - label: I'm one person, and this is the only account I'm asking a vouch for.
+          required: true
+        - label: My GitHub link is verified (the explorer or `/api/github/<handle>` says so).
+          required: true
+        - label: I know test FANG and Soul have no value.
+          required: true

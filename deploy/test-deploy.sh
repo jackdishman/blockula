@@ -352,7 +352,7 @@ code=$(token FAKE_STALL=1 GATE_ROUNDS=3)
 code=$(token FAKE_OUTSIDER=1 GATE_ROUNDS=3)
 [ "$code" != 0 ] && none_set && expect "token: an active set with a validator it doesn't run: nothing restarts, at once" "$(cat "$T/token.out")" "the active set has 5 validators, more than the 4 this script runs" \
   || bad "token: an outside validator in the set (exit $code): $(cat "$T/token.out")"
-# Validators other operators run (mainnet's outside genesis operators), named in OUTSIDE_VALIDATORS:
+# Validators other operators run, named in OUTSIDE_VALIDATORS:
 # the gate can't read their machines, so each must have proposed in the window it reads.
 code=$(token FAKE_OUTSIDER=1 FAKE_OUTSIDER_PROPOSES=1 OUTSIDE_VALIDATORS=tboo1outsider)
 [ "$code" = 0 ] && [ "$(early)" = 0 ] && expect "token: an outside validator OUTSIDE_VALIDATORS names, proposing: every app restarts, one at a time" "$(cat "$T/token.out")" "outside validators that proposed in them: tboo1outsider" \

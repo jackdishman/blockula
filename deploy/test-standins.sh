@@ -1,6 +1,6 @@
 # shellcheck shell=bash
-# Stand-ins for Fly and the network the deploy scripts talk to, sourced by deploy/test-deploy.sh
-# and deploy/mainnet/test-launch-mainnet.sh: `write_standins DIR` writes `fly`, `curl` and `world`
+# Stand-ins for Fly and the network the deploy scripts talk to, sourced by deploy/test-deploy.sh:
+# `write_standins DIR` writes `fly`, `curl` and `world`
 # into DIR (put it first on PATH). They keep their state, and the log of every call, under
 # $FAKE_FLY. Nothing here talks to Fly.
 write_standins() {
@@ -14,7 +14,7 @@ write_standins() {
   # them. A deploy, or a secret change that isn't staged, restarts the app's node in the stand-in
   # network below; `ssh console -C "blockula status …"` asks it, and
   # `-C "test -f /data/home/.seeded"` fails for FAKE_UNSEEDED=<app> (its key isn't on its volume).
-  # With FAKE_FLY_STATEFUL (mainnet's launcher, which reads back what exists) it also keeps apps
+  # With FAKE_FLY_STATEFUL (for a launcher that reads back what exists) it also keeps apps
   # by org, volumes (with their creation time), IPs (dedicated IPv4s are 198.51.100.1, .2 … in
   # the order allocated), certificates and, once an app deployed, its machine (and the
   # configuration and arguments of its last deploy, <app>.toml and <app>.args; a second machine

@@ -1,8 +1,7 @@
 # shellcheck shell=bash
 # Removing each validator's consensus key from Fly once it's on the validator's volume: sourced by
-# deploy/launch.sh (the testnet) and deploy/mainnet/launch-mainnet.sh, after their first deploy of
-# the validators. deploy/test-deploy.sh and deploy/mainnet/test-launch-mainnet.sh test it against a
-# stand-in fly.
+# deploy/launch.sh (the testnet), after its first deploy of the validators. deploy/test-deploy.sh
+# tests it against a stand-in fly.
 #
 # A consensus key reaches its validator as the Fly secret VALIDATOR_KEY_B64, which the entrypoint
 # writes onto an empty volume once (deploy/entrypoint.sh). While the secret exists, any second
@@ -17,10 +16,9 @@
 # that jailed one). Even gated, it would cost a minute or two and a few missed slots per
 # validator, with the keys left in Fly until the last restart. Together, on a chain nobody uses yet,
 # the chain pauses once (slashing protection signs again once it sees the network standing still),
-# each validator misses about a slot, and they relink in one round. (Mainnet's launcher does it
-# before genesis time, while there's no chain to pause.) Before it, the public node and each of
-# them must answer (their process start times tell the gate their new processes from the old
-# ones), or nothing restarts and the keys stay for a rerun; after it, the participation gate
+# each validator misses about a slot, and they relink in one round. Before it, the public node and
+# each of them must answer (their process start times tell the gate their new processes from the
+# old ones), or nothing restarts and the keys stay for a rerun; after it, the participation gate
 # (deploy/restart-gate.sh, sourced first).
 #
 # Reads PREFIX and N (validators $PREFIX-v0 …), KEY_RERUN (the command that finishes the job after
