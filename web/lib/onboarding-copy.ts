@@ -41,8 +41,8 @@ export const BRAND = {
  * agent's budget, the recovery kit, and a wallet only one passkey opens.
  */
 export const SAFETY = {
-  /** NameClaim, under the node's price for the name typed. */
-  namePrice: (price: string, term: string, renewal: string) => `${price} for ${term}, then ${renewal} a year. The price goes to the community treasury and isn't refunded.`,
+  /** NameClaim, under the node's price for the name typed. It's paid to the treasury (node/src/econ.rs), not the community account. */
+  namePrice: (price: string, term: string, renewal: string) => `${price} for ${term}, then ${renewal} a year. The price goes to the treasury and isn't refunded.`,
   /** `grace`: the node's grace period, in words ("30 days"), when it says. */
   nameTerms: (grace: string | null) =>
     `Names are public and go to whoever asks first. They aren't internet (ICANN) domains, give you no trademark or other rights, and mustn't impersonate anyone. Renew it in time: ${grace ? `${grace} after it expires` : "after a grace period"}, anyone can register it.`,

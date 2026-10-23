@@ -103,7 +103,7 @@ test("a name's price, renewal price and term come from the node", async ({ page,
   await expect(page.getByTestId("name-price")).toHaveText("Shorter names cost more. Type one to see its price.");
   await page.getByPlaceholder("vlad").fill("ghoul");
   await expect(page.getByText("✓ ghoul.boo is available · 7.5 FANG")).toBeVisible();
-  await expect(page.getByTestId("name-price")).toHaveText("7.5 FANG for one year, then 1.25 FANG a year. The price goes to the community treasury and isn't refunded.");
+  await expect(page.getByTestId("name-price")).toHaveText("7.5 FANG for one year, then 1.25 FANG a year. The price goes to the treasury and isn't refunded.");
   const terms = page.getByTestId("name-terms");
   await expect(terms).toContainText("Names are public and go to whoever asks first.");
   await expect(terms).toContainText("They aren't internet (ICANN) domains, give you no trademark or other rights, and mustn't impersonate anyone.");
