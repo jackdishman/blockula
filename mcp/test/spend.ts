@@ -29,6 +29,7 @@ import { join } from "node:path";
 import { Client as McpClient } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
+import { bech32m } from "@scure/base";
 import { NAMESPACES, addressFromPublicKey, decodeKeyGrant, heightLimit, keyHash, leafHash, parseFang, proposalDigest, txId, valueHash, verifyKeyGrant, type Tx } from "@blockula/sdk";
 import { KNOWN_CLOCKS, KNOWN_GENESIS } from "../src/network.js";
 import { SpendLedger } from "../src/spend.js";
@@ -93,6 +94,8 @@ console.log("✓ the spending ledger and the chain-text cleaner");
 // ---- a fake node ----
 
 const pk = (seed: number) => ml_dsa65.keygen(new Uint8Array(32).fill(seed)).publicKey;
+/** The key id inside an address (the same 32 bytes): the "original key" a node lists for any address. */
+const originalKey = (address: string) => Buffer.from(bech32m.fromWords(bech32m.decode(address as `${string}1${string}`, 200).words)).toString("hex");
 const BOB = addressFromPublicKey(pk(3));
 const NEWCOMER = addressFromPublicKey(pk(4));
 const G = "11".repeat(32);
@@ -183,7 +186,7 @@ const fake: Server = createServer((req, res) => {
     // Like node/src/api.rs: any address answers; without an account, with a zero balance and nonce
     // and the address's own key (`keys_of` lists it for every address).
     if (path.startsWith("/account/") && mode.accountNonce === "down") return reply(500, { error: "busy" });
-    if (path.startsWith("/account/")) return reply(200, { account: { address: path.slice(9), name: null }, balance: "0", nonce: mode.accountNonce ?? 0, next_nonce: nextNonce(path.slice(9)), keys: [{ key_id: "ee".repeat(32), label: "original key", role: { type: "owner" }, added_at: 0, spent_this_period: "0", window_start: 0 }], recent_txs: [] });
+    if (path.startsWith("/account/")) return reply(200, { account: { address: path.slice(9), name: null }, balance: "0", nonce: mode.accountNonce ?? 0, next_nonce: nextNonce(path.slice(9)), keys: [{ key_id: originalKey(path.slice(9)), label: "original key", role: { type: "owner" }, added_at: 0, spent_this_period: "0", window_start: 0 }], recent_txs: [] });
     if (path === `/staking/${stakingFor}`) return reply(200, staking());
     if (path === "/proposal/1") return reply(200, { id: 1, kind: { type: "text" }, title: "Plant garlic", url: "https://forum.example/p/1", status: "voting" });
     // gap-7-6: proposal #9 is a 10,000,000 FANG treasury spend to Mallory. `gov.summaryLie`: the
@@ -617,9 +620,18 @@ assert.ok(!r.error && r.json().status === "unknown" && /may or may not have arri
 assert.ok(ledger() > FANG, "counted");
 await s.close();
 mode.post = "accept";
-// review-fix-clients-1: a timeout a timer can't hold (it would fire at once) is a startup error.
-await assert.rejects(server({ BLOCKULA_TIMEOUT_MS: "3000000000" }), "BLOCKULA_TIMEOUT_MS above 2^31 - 1 ms is refused");
-console.log("✓ a node that never answers fails the call after BLOCKULA_TIMEOUT_MS; an unanswered submit stays counted; timeouts past a timer's range are refused");
+// review-fix-clients-1: a timeout a timer can't hold (it would fire at once) is a configuration
+// error. AGENT-15: the server stays up and says so in every tool's answer, instead of exiting
+// before the client can be told why.
+s = await server({ BLOCKULA_TIMEOUT_MS: "3000000000" });
+before = posted.length;
+for (const [tool, args] of [["status", {}], ["send", { to: "bob.boo", amount: "1" }], ["install_node", {}]] as const) {
+  r = await s.call(tool, args);
+  assert.ok(r.error && /isn't configured correctly: BLOCKULA_TIMEOUT_MS/.test(r.text), `${tool}: ${r.text}`);
+}
+assert.equal(posted.length, before);
+await s.close();
+console.log("✓ a node that never answers fails the call after BLOCKULA_TIMEOUT_MS; an unanswered submit stays counted; timeouts past a timer's range are a configuration error every tool reports");
 
 // ---- 6. names that get signed ----
 

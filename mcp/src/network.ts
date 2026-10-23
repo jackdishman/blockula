@@ -31,8 +31,12 @@ export interface Network {
   /**
    * Independent nodes of the same chain (BLOCKULA_WITNESSES, comma-separated): names that end up
    * in a signature are proven against them (audit gap-7-1). Empty: a name is the node's word.
+   * Unset, and the node isn't one of its network's public RPCs (your own node), they're those
+   * RPCs (`defaultWitnesses`; OPERATOR-6).
    */
   witnesses: string[];
+  /** BLOCKULA_WITNESSES was set (`none` included): no witnesses are added by default. */
+  witnessesSet: boolean;
 }
 
 export const LOCAL_RPC = "http://localhost:7070";
@@ -74,7 +78,7 @@ export function clockFrom(genesis: unknown, chainId: string): GenesisClock | und
 }
 
 /** The networks the MCP knows by name. */
-export const KNOWN_NETWORKS: Record<Exclude<NetworkKey, "custom">, Omit<Network, "rpc" | "witnesses"> & { rpc?: string }> = {
+export const KNOWN_NETWORKS: Record<Exclude<NetworkKey, "custom">, Omit<Network, "rpc" | "witnesses" | "witnessesSet"> & { rpc?: string }> = {
   mainnet: { key: "mainnet", label: "Blockula mainnet", rpc: MAINNET_RPCS[0], pin: { chainId: "blockula-1", prefix: "boo" }, mainnet: true, remember: true },
   // The protocol v1 public testnet (deploy/launch.sh): its own chain id (never reused) and the
   // testnet prefix (DEC-7). Its genesis hash exists only once it launches: until a release adds it
@@ -82,6 +86,33 @@ export const KNOWN_NETWORKS: Record<Exclude<NetworkKey, "custom">, Omit<Network,
   testnet: { key: "testnet", label: "public testnet", rpc: TESTNET_RPC, pin: { chainId: "blockula-testnet-2", prefix: "tboo" }, mainnet: false, remember: true },
   local: { key: "local", label: "local dev node", rpc: LOCAL_RPC, pin: {}, mainnet: false, remember: false },
 };
+
+/** The public RPCs of the chains whose public RPCs are built in, by chain id. */
+const PUBLIC_RPCS: Record<string, string[]> = { "blockula-testnet-2": [TESTNET_RPC] };
+
+/**
+ * The witnesses a node of `chainId` gets when BLOCKULA_WITNESSES is unset: the chain's public RPCs,
+ * unless the node is one of them. So your own node's answers about names and heights are checked
+ * against the public ones (OPERATOR-6). None for chains without public RPCs (dev chains, and the
+ * chains people launch themselves: there, BLOCKULA_WITNESSES lists other nodes).
+ */
+export function defaultWitnesses(chainId: string | undefined, rpc: string): string[] {
+  const rpcs = ((chainId && PUBLIC_RPCS[chainId]) || []).map(canonicalUrl);
+  // The same node however `rpc` is spelled: a node is never its own witness (audit MCK-1).
+  return rpcs.includes(canonicalUrl(rpc)) ? [] : rpcs;
+}
+
+/** The public network a chain id is, when it's one (for labels). */
+const PUBLIC_LABEL: Record<string, string> = { "blockula-testnet-2": "the public testnet" };
+
+/**
+ * What `status` calls the network: once the node's chain is known, a node on this machine that
+ * is on a public network is "your node on <it>", never a "local dev node".
+ */
+export function networkLabel(net: Network, chainId?: string): string {
+  const pub = chainId ? PUBLIC_LABEL[chainId] : undefined;
+  return pub && isLocalUrl(net.rpc) ? `your node on ${pub}` : net.label;
+}
 
 const isLocalUrl = (u: string) => {
   try {
@@ -98,7 +129,29 @@ const isPrivateUrl = (u: string) => {
   return /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h) || /\.(internal|local|lan)$/.test(h);
 };
 
-/** A node URL: http(s) without credentials; plain http only on this machine or a private network. */
+/**
+ * A node URL in one spelling: the scheme and host lowercased, a default port and dot segments
+ * dropped (the URL parser's own normalization), no trailing dot on the host and no trailing
+ * slash. So a node compares equal however it's written: `https://Blockula-Testnet.fly.dev:443/.`
+ * is the public RPC, and is never its own witness (audit MCK-1). What isn't an http(s) URL comes
+ * back as it is.
+ */
+export function canonicalUrl(u: string): string {
+  try {
+    const url = new URL(u);
+    if (!/^https?:$/.test(url.protocol)) return u;
+    // `host` carries the port; a fully qualified name's trailing dot comes before it, or ends it.
+    const host = url.host.replace(/\.(?=:\d+$|$)/, "");
+    return `${url.protocol}//${host}${url.pathname.replace(/\/+$/, "")}`;
+  } catch {
+    return u;
+  }
+}
+
+/**
+ * A node URL, spelled canonically (canonicalUrl): http(s) without credentials, a query or a
+ * fragment (the client appends /api/… to it); plain http only on this machine or a private network.
+ */
 export function checkRpcUrl(u: string, what = "BLOCKULA_RPC"): string {
   let url: URL;
   try {
@@ -107,8 +160,33 @@ export function checkRpcUrl(u: string, what = "BLOCKULA_RPC"): string {
     throw new Error(`${what} isn't a URL: ${u}`);
   }
   if (!/^https?:$/.test(url.protocol) || url.username || url.password) throw new Error(`${what} must be an http(s) URL without credentials: ${u}`);
+  if (url.search || url.hash) throw new Error(`${what} must be a node's URL, without a query or a fragment: ${u}`);
   if (url.protocol === "http:" && !isPrivateUrl(u)) throw new Error(`${what} must use https unless the node is on this machine or a private network: ${u}`);
-  return u.replace(/\/+$/, "");
+  return canonicalUrl(u);
+}
+
+/**
+ * The chain ids this MCP pins, and keys its ledger (spend.ts `chainKey`), lock and nonce records
+ * and grant files by: 1 to 64 letters, digits, '-', '_' and '.'. A genesis built for a public
+ * network has letters, digits and '-' (node/src/genesis_builder.rs, at most 64: MAX_CHAIN_ID), so
+ * every real chain fits. A node reporting anything else (a path separator, a space) is refused
+ * when its chain is pinned (`unusableChain`), so nothing it names is ever used as a file name or
+ * a ledger key (audit MCK-3).
+ */
+export const CHAIN_ID = /^[A-Za-z0-9._-]{1,64}$/;
+
+/**
+ * Why a node's chain can't be pinned at all, or null: a chain id outside CHAIN_ID, or a genesis
+ * hash that isn't 64 hex characters, can't key what this MCP keeps per chain. (A node that reports
+ * no genesis hash is pinned by its chain id alone, as before; it can't sign, and `use_account`
+ * says that's why.)
+ */
+export function unusableChain(status: { chain_id?: unknown; genesis_hash?: unknown }): string | null {
+  const id = status.chain_id;
+  if (typeof id === "string" && !CHAIN_ID.test(id)) return `the node reports the chain id ${JSON.stringify(id.length > 80 ? `${id.slice(0, 80)}…` : id)}, and a chain id here is 1 to 64 letters, digits, '-', '_' or '.'`;
+  const g = status.genesis_hash;
+  if (g !== undefined && g !== null && (typeof g !== "string" || !/^[0-9a-fA-F]{64}$/.test(g))) return "the node reports a genesis hash that isn't 64 hex characters";
+  return null;
 }
 
 /** `--network <name>` or `--network=<name>` from the command line. */
@@ -131,11 +209,11 @@ export function resolveNetwork(env: Record<string, string | undefined>, argv: st
   const rpc = env.BLOCKULA_RPC?.trim() ? checkRpcUrl(env.BLOCKULA_RPC.trim()) : undefined;
   let key: NetworkKey;
   if (named) key = named as NetworkKey;
-  else if (rpc) key = (Object.values(KNOWN_NETWORKS).find((n) => n.rpc && n.rpc === rpc)?.key as NetworkKey | undefined) ?? (isLocalUrl(rpc) ? "local" : "custom");
+  else if (rpc) key = (Object.values(KNOWN_NETWORKS).find((n) => n.rpc && canonicalUrl(n.rpc) === rpc)?.key as NetworkKey | undefined) ?? (isLocalUrl(rpc) ? "local" : "custom");
   else key = "testnet";
 
   const base = key === "custom" ? { key, label: "custom node", pin: {}, mainnet: false, remember: true } : KNOWN_NETWORKS[key];
-  const url = rpc ?? base.rpc;
+  const url = rpc ?? (base.rpc ? canonicalUrl(base.rpc) : undefined);
   if (!url) {
     throw new Error(key === "mainnet" ? "no public mainnet RPC is built in yet: set BLOCKULA_RPC to a mainnet node you trust" : "the custom network needs BLOCKULA_RPC");
   }
@@ -144,6 +222,7 @@ export function resolveNetwork(env: Record<string, string | undefined>, argv: st
   const chainId = env.BLOCKULA_CHAIN_ID?.trim() || undefined;
   const genesisHash = env.BLOCKULA_GENESIS_HASH?.trim().toLowerCase() || undefined;
   if (chainId) {
+    if (!CHAIN_ID.test(chainId)) throw new Error(`BLOCKULA_CHAIN_ID must be a chain id: 1 to 64 letters, digits, '-', '_' or '.' (got ${JSON.stringify(chainId.slice(0, 80))})`);
     if (pin.chainId && pin.chainId !== chainId) throw new Error(`BLOCKULA_CHAIN_ID=${chainId} contradicts the ${base.label} (${pin.chainId})`);
     pin.chainId = chainId;
   }
@@ -156,10 +235,15 @@ export function resolveNetwork(env: Record<string, string | undefined>, argv: st
   pin.genesisHash ??= known;
   // A real-money chain is never the local or a custom network by accident.
   const mainnet = base.mainnet || pin.chainId === KNOWN_NETWORKS.mainnet.pin.chainId;
-  const witnesses = (env.BLOCKULA_WITNESSES ?? "").split(",").map((w) => w.trim()).filter(Boolean).map((w) => checkRpcUrl(w, "BLOCKULA_WITNESSES"));
+  // `none` opts out of the default witnesses; unset, a node that isn't its network's public RPC
+  // gets them (defaultWitnesses; a node whose chain isn't known yet, once it's pinned).
+  const listed = (env.BLOCKULA_WITNESSES ?? "").trim();
+  const witnessesSet = listed !== "";
+  const witnesses = listed.toLowerCase() === "none" ? [] : witnessesSet ? listed.split(",").map((w) => w.trim()).filter(Boolean).map((w) => checkRpcUrl(w, "BLOCKULA_WITNESSES")) : defaultWitnesses(pin.chainId, url);
+  // Every URL here is canonical (checkRpcUrl), so a node spelled two ways is still one node.
   if (witnesses.includes(url)) throw new Error("BLOCKULA_WITNESSES must be other nodes than BLOCKULA_RPC's");
   if (new Set(witnesses).size !== witnesses.length) throw new Error("BLOCKULA_WITNESSES lists a node twice");
-  return { key, label: base.label, rpc: url, pin, mainnet, remember: base.remember, witnesses };
+  return { key, label: base.label, rpc: url, pin, mainnet, remember: base.remember, witnesses, witnessesSet };
 }
 
 /** Why a node's status doesn't match a pin, or null if it does. Known chain ids must come with their known genesis. */
@@ -201,7 +285,25 @@ export class KnownChains {
   }
 
   get(net: Network): Pin | undefined {
-    return net.remember ? (this.all()[KnownChains.id(net)] as Pin | undefined) : undefined;
+    if (!net.remember) return undefined;
+    const all = this.all();
+    const id = KnownChains.id(net);
+    if (all[id] !== undefined) return all[id] as Pin;
+    // A release before canonicalUrl kept a node's URL as it was typed (`custom https://Rpc.Example`):
+    // that entry is this node's under another spelling. Its pin holds, and moves to this spelling,
+    // so the node isn't pinned afresh on trust, and the entry an error names is the only one.
+    const old = Object.keys(all).filter((k) => {
+      const at = k.indexOf(" ");
+      return k !== id && at > 0 && k.slice(0, at) === net.key && canonicalUrl(k.slice(at + 1)) === net.rpc;
+    });
+    if (old.length === 0) return undefined;
+    const pin = all[old[0]] as Pin;
+    try {
+      this.write(id, pin, old);
+    } catch {
+      /* the file can't be written: the pin still holds this session */
+    }
+    return pin;
   }
 
   save(net: Network, pin: Pin) {
@@ -226,8 +328,10 @@ export class KnownChains {
     this.write(KnownChains.clockId(chainId, genesisHash), { created_at_ms: clock.createdAtMs, block_time_ms: clock.blockTimeMs });
   }
 
-  private write(key: string, value: unknown) {
+  /** Sets one entry (and drops the entries `drop` names, in the same write). */
+  private write(key: string, value: unknown, drop: string[] = []) {
     const all = this.all();
+    for (const k of drop) delete all[k];
     all[key] = value;
     mkdirSync(dirname(this.file), { recursive: true });
     writeFileSync(this.file, JSON.stringify(all, null, 2), { mode: 0o600 });
@@ -246,12 +350,18 @@ export function effectivePin(net: Network, remembered?: Pin): Pin {
   return { chainId: net.pin.chainId ?? r?.chainId, genesisHash: net.pin.genesisHash ?? r?.genesisHash, prefix: net.pin.prefix ?? r?.prefix };
 }
 
-/** The error an agent sees when a node is on the wrong chain: what happened and what the user can do. */
-export function mismatchError(net: Network, why: string, knownChainsFile: string) {
-  const fix = net.remember
-    ? ` If this network was relaunched on purpose, the user can remove its entry ("${KnownChains.id(net)}") from ${knownChainsFile}, or set BLOCKULA_GENESIS_HASH.`
-    : net.key === "local"
-      ? " A reset dev chain starts from a new genesis: call start_dev_node to use the one running now."
-      : "";
+/**
+ * The error an agent sees when a node is on the wrong chain: what happened and what the user can
+ * do. `relaunched` is false for a node whose chain can't be pinned at all (`unusableChain`):
+ * forgetting what was remembered wouldn't help there.
+ */
+export function mismatchError(net: Network, why: string, knownChainsFile: string, relaunched = true) {
+  const fix = !relaunched
+    ? ""
+    : net.remember
+      ? ` If this network was relaunched on purpose, the user can remove its entry ("${KnownChains.id(net)}") from ${knownChainsFile}, or set BLOCKULA_GENESIS_HASH.`
+      : net.key === "local"
+        ? " A reset dev chain starts from a new genesis: call start_dev_node to use the one running now."
+        : "";
   return new Error(`Refusing ${net.rpc} (${net.label}): ${why}. Nothing was signed or sent.${fix}`);
 }
