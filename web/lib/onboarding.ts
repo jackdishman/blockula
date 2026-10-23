@@ -10,7 +10,7 @@
  *
  * The words these screens show are in lib/onboarding-copy.ts.
  */
-import { fangDecimal, requestDrops } from "./paylink.ts";
+import { checkLinkChain, fangDecimal, linkChain, requestDrops, type LinkChain, type LinkCheck, type WalletChain } from "./paylink.ts";
 import type { NameDetail } from "./explorer/types";
 
 /** A base that can't be this site: a path that resolves to another origin against it isn't one. */
@@ -49,15 +49,18 @@ const NAME = /^[a-z0-9][a-z0-9-]{1,30}[a-z0-9](\.boo)?$/;
 const ADDRESS = /^[a-z]{1,10}1[02-9ac-hj-np-z]{38,90}$/;
 
 /**
- * What /welcome says about a payment link: who it pays and how much. It's the sender's text, so
- * only a well-formed name or address and a valid amount are shown (null otherwise), never the memo.
- * Send checks the link again (its chain, the recipient) before anything is signed.
+ * What /welcome says about a payment link: what it asks for, and the chain it says it was made
+ * for, which /welcome checks as Send does (lib/paylink.ts `checkLinkChain`). It's the sender's
+ * text, so only a well-formed name or address and a valid amount are shown (null otherwise), never
+ * the memo. Send checks the link again (its chain, the recipient) before anything is signed.
  */
 export interface PayRequest {
   /** `vlad.boo` or a `boo1…` address. */
   to: string | null;
   /** FANG, as the shortest decimal ("1.5"). */
   amount: string | null;
+  /** The chain the link says it was made for, unchecked; null when it doesn't say. */
+  chain: LinkChain | null;
 }
 
 export function payRequest(next: string | null): PayRequest | null {
@@ -68,7 +71,21 @@ export function payRequest(next: string | null): PayRequest | null {
   return {
     to: NAME.test(to) ? (to.endsWith(".boo") ? to : `${to}.boo`) : ADDRESS.test(to) ? to : null,
     amount: drops === null ? null : fangDecimal(drops),
+    chain: linkChain(q),
   };
+}
+
+/**
+ * What /welcome does with the payment link it was handed (`next`, from `safeNext`): what it says
+ * about it (`request`), the link's chain against the wallet's (`check`, as Send checks it), and
+ * where onboarding ends (`payment`): the link's own path, unless it was made for another chain,
+ * which Send wouldn't fill in, so onboarding ends at Home. While the wallet doesn't know its own
+ * chain yet (`pending`) the link goes on to Send, which checks it again.
+ */
+export function welcomePayment(next: string | null, wallet: WalletChain): { request: PayRequest | null; check: LinkCheck | null; payment: string | null } {
+  const request = payRequest(next);
+  const check = request ? checkLinkChain(request.chain, wallet) : null;
+  return { request, check, payment: check?.state === "mismatch" ? null : next };
 }
 
 /** `/api/account`'s balance and its protocol v1 parts (lib/explorer/types `AccountDetail`). */
@@ -97,6 +114,7 @@ export interface Breakdown {
    * `movable` says it the same way.
    */
   locked: bigint;
+  /** When the last lock holding anything ends, while one holds part of the balance. */
   lockedUntil: number | null;
   /** Worth a line under the balance: anything staked, unstaking, or held by a lock. */
   show: boolean;
@@ -114,7 +132,6 @@ export function breakdown(a: BalanceParts, s: StakeTotals | null): Breakdown {
 }
 
 /** A name of this account's that needs renewing: in its grace period, or expiring within the window. */
-  /** When the last lock holding anything ends, while one holds part of the balance. */
 export interface NameAlert {
   name: string;
   state: "grace" | "expiring";

@@ -15,7 +15,7 @@ import { season } from "@/lib/ascii/settings";
 import { localKeysAllowed } from "@/lib/config";
 import { friendly, isPrfUnsupported } from "@/lib/errors";
 import { createLocalKey, createPasskey, unlockPasskey } from "@/lib/keys";
-import { canAffordName, cheapestName, payRequest, safeNext } from "@/lib/onboarding";
+import { canAffordName, cheapestName, safeNext, welcomePayment } from "@/lib/onboarding";
 import { BRAND, FIRST_FANG } from "@/lib/onboarding-copy";
 import type { Hint } from "@/lib/session";
 import { useWallet } from "@/lib/wallet";
@@ -58,10 +58,11 @@ export default function WelcomePage() {
 function Welcome() {
   const { ready, hint, wallet, account, client, status, unlocked, refresh } = useWallet();
   const router = useRouter();
-  // A payment link opened without a wallet (RequireWallet): onboarding ends there instead of Home.
+  // A payment link opened without a wallet (RequireWallet): onboarding ends there instead of Home,
+  // unless it was made for another chain (checked as Send checks it), which Send won't fill.
   const next = safeNext(useSearchParams().get("next"));
-  const request = payRequest(next);
-  const home = next ?? "/";
+  const { request, check: linkCheck, payment } = welcomePayment(next, client.pin);
+  const home = payment ?? "/";
   const [step, setStep] = useState<Step>(0);
   const [nickname, setNickname] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
@@ -187,7 +188,7 @@ function Welcome() {
     </>
   );
 
-  const ask = request && <PayRequestBanner request={request} />;
+  const ask = request && linkCheck && <PayRequestBanner request={request} check={linkCheck} />;
 
   if (typeof step === "number") {
     const s = INTRO[step];
@@ -383,7 +384,7 @@ function Welcome() {
       {firstFang && <HowFangReachesYou />}
       {ask}
       <Tip>Your home screen has a short checklist that walks you through sending, the explorer, and giving an AI agent a budget.</Tip>
-      <button className="btn primary big" onClick={() => router.replace(home)}>{next ? "Continue to the payment" : "Open my wallet"}</button>
+      <button className="btn primary big" onClick={() => router.replace(home)}>{payment ? "Continue to the payment" : "Open my wallet"}</button>
     </main>
   );
 }

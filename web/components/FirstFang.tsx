@@ -5,6 +5,7 @@ import "@/app/onboarding.css";
 import { shortAddr } from "@/lib/format";
 import type { PayRequest } from "@/lib/onboarding";
 import { FIRST_FANG } from "@/lib/onboarding-copy";
+import type { LinkCheck } from "@/lib/paylink";
 
 /** Where FANG comes from on a chain without a faucet: someone sends it. It has no value either way. */
 export function HowFangReachesYou() {
@@ -23,13 +24,23 @@ export function HowFangReachesYou() {
 }
 
 /**
- * The payment a link (or an account page's Pay button) asked for, while its visitor makes a
- * wallet. Only what lib/onboarding.ts `payRequest` let through (a well-formed name or address, a
- * valid amount), never the memo: Send checks the link again before anything is signed.
+ * The payment a link (or an account page's Pay button) opens, while its visitor makes a wallet:
+ * what the link says, as its claim, never as who asked. Only what lib/onboarding.ts `payRequest`
+ * let through (a well-formed name or address, a valid amount), never the memo. `check` is the
+ * link's chain against the wallet's, as Send checks it (lib/paylink.ts `checkLinkChain`): a link
+ * made for another chain fills nothing there, so it's only said that it won't; until the wallet
+ * knows its own chain, nothing. Send checks the link again before anything is signed.
  */
-export function PayRequestBanner({ request }: { request: PayRequest }) {
-  const who = request.to ? (request.to.endsWith(".boo") ? request.to : shortAddr(request.to)) : "Someone";
-  const lead = request.amount ? `${who} asked you for ${request.amount} FANG.` : request.to ? `Paying ${who}.` : "Someone sent you a payment link.";
+export function PayRequestBanner({ request, check }: { request: PayRequest; check: LinkCheck }) {
+  if (check.state === "pending") return null;
+  if (check.state === "mismatch")
+    return (
+      <div className="banner onb-ask" data-testid="pay-request">
+        This payment link isn&apos;t for this network, so it won&apos;t be filled in here.
+      </div>
+    );
+  const who = request.to ? (request.to.endsWith(".boo") ? request.to : shortAddr(request.to)) : null;
+  const lead = request.amount ? `This link asks for ${request.amount} FANG${who ? ` to ${who}` : ""}.` : who ? `This link opens a payment to ${who}.` : "This link opens a payment.";
   return (
     <div className="banner onb-ask" data-testid="pay-request">
       <b>{lead}</b> Once your wallet is ready, you&apos;ll see the payment filled in, and nothing is sent until you confirm it.

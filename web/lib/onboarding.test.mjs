@@ -2,7 +2,7 @@
 // Home's balance parts and name banners. Run with `npm test -w @blockula/web`.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { breakdown, canAffordName, cheapestName, nameAlert, payRequest, safeNext, welcomeHref } from "./onboarding.ts";
+import { breakdown, canAffordName, cheapestName, nameAlert, payRequest, safeNext, welcomeHref, welcomePayment } from "./onboarding.ts";
 
 const ADDR = "boo1yuuvyc7ngus0l2vytdt6yr0zqhj2qyz9j4zyfxk97vjtpsw9rk4qzmxxe9";
 
@@ -54,15 +54,55 @@ test("welcomeHref carries payment links only", () => {
 });
 
 test("payRequest shows only a well-formed recipient and amount, never the memo", () => {
-  assert.deepEqual(payRequest("/send?to=Vlad.boo&amount=3&memo=pizza"), { to: "vlad.boo", amount: "3" });
-  assert.deepEqual(payRequest("/send?to=vlad&amount=0001.500"), { to: "vlad.boo", amount: "1.5" });
-  assert.deepEqual(payRequest(`/send?to=${ADDR}`), { to: ADDR, amount: null });
+  assert.deepEqual(payRequest("/send?to=Vlad.boo&amount=3&memo=pizza"), { to: "vlad.boo", amount: "3", chain: null });
+  assert.deepEqual(payRequest("/send?to=vlad&amount=0001.500"), { to: "vlad.boo", amount: "1.5", chain: null });
+  assert.deepEqual(payRequest(`/send?to=${ADDR}`), { to: ADDR, amount: null, chain: null });
   // The sender's text: a bidi override, words, an impossible amount.
-  assert.deepEqual(payRequest(`/send?to=${encodeURIComponent("‮vlad.boo")}&amount=1`), { to: null, amount: "1" });
-  assert.deepEqual(payRequest(`/send?to=${encodeURIComponent("pay me at evil.example")}&amount=abc`), { to: null, amount: null });
-  assert.deepEqual(payRequest("/send?to=-vlad&amount=0"), { to: null, amount: null });
-  assert.deepEqual(payRequest("/send?to=vlad.boo&amount=18446744073.709551616"), { to: "vlad.boo", amount: null });
+  assert.deepEqual(payRequest(`/send?to=${encodeURIComponent("‮vlad.boo")}&amount=1`), { to: null, amount: "1", chain: null });
+  assert.deepEqual(payRequest(`/send?to=${encodeURIComponent("pay me at evil.example")}&amount=abc`), { to: null, amount: null, chain: null });
+  assert.deepEqual(payRequest("/send?to=-vlad&amount=0"), { to: null, amount: null, chain: null });
+  assert.deepEqual(payRequest("/send?to=vlad.boo&amount=18446744073.709551616"), { to: "vlad.boo", amount: null, chain: null });
   assert.equal(payRequest(null), null);
+});
+
+test("payRequest carries the chain the link says it was made for, unchecked", () => {
+  assert.deepEqual(payRequest("/send?to=alice.boo&amount=3&chain=blockula-other&genesis=deadbeefdeadbeef"), {
+    to: "alice.boo",
+    amount: "3",
+    chain: { chainId: "blockula-other", genesis: "deadbeefdeadbeef" },
+  });
+  assert.deepEqual(payRequest("/send?to=alice.boo&chain=blockula-testnet")?.chain, { chainId: "blockula-testnet" });
+  // Not a chain id: kept as the link wrote it, for checkLinkChain to refuse as malformed.
+  assert.deepEqual(payRequest("/send?to=alice.boo&chain=evil%20chain")?.chain, { chainId: "evil chain" });
+});
+
+test("welcomePayment: a link made for another chain isn't carried through onboarding", () => {
+  const here = { chainId: "blockula-testnet", genesisHash: "6e".repeat(32) };
+  const link = (q) => `/send?to=alice.boo&amount=3&${q}`;
+  const made = link(`chain=blockula-testnet&genesis=${"6e".repeat(8)}`);
+  // Made for this chain, or saying nothing about its chain: Send gets it (and checks it again).
+  assert.deepEqual(welcomePayment(made, here).check, { state: "match" });
+  assert.equal(welcomePayment(made, here).payment, made);
+  assert.deepEqual(welcomePayment(link("memo=x"), here).check, { state: "unchecked" });
+  assert.equal(welcomePayment(link("memo=x"), here).payment, link("memo=x"));
+  // Another chain, another instance of this one, or a chain id that isn't one: the payment isn't
+  // carried (Send would refuse to fill it), so onboarding ends at Home.
+  for (const [q, why] of [
+    ["chain=blockula-other", "chain"],
+    [`chain=blockula-testnet&genesis=${"ab".repeat(8)}`, "genesis"],
+    ["chain=evil%20chain", "malformed"],
+  ]) {
+    const w = welcomePayment(link(q), here);
+    assert.deepEqual(w.check, { state: "mismatch", why }, q);
+    assert.equal(w.payment, null, q);
+    // What it asked for is still read (as the sender's text, well-formed only), for the banner.
+    assert.equal(w.request?.amount, "3", q);
+  }
+  // The wallet doesn't know its own chain yet: nothing to say, and the link goes on to Send.
+  assert.deepEqual(welcomePayment(made, {}).check, { state: "pending" });
+  assert.equal(welcomePayment(made, {}).payment, made);
+  // No link, no payment.
+  assert.deepEqual(welcomePayment(null, here), { request: null, check: null, payment: null });
 });
 
 test("breakdown: what can move, what's staked, what a lock holds and until when", () => {
