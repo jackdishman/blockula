@@ -19,7 +19,7 @@ import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { RELEASE_SIGNATURE_FORMAT, releaseMessage } from "@blockula/sdk";
-import { KNOWN_CLOCKS, KNOWN_GENESIS, KnownChains, LOCAL_RPC, MAINNET_RPCS, TESTNET_RPC, canonicalUrl, completePin, defaultWitnesses, effectivePin, mismatch, networkArg, networkLabel, resolveNetwork, unusableChain } from "../src/network.js";
+import { KNOWN_CLOCKS, KNOWN_GENESIS, KnownChains, LOCAL_RPC, TESTNET_RPC, canonicalUrl, completePin, defaultWitnesses, effectivePin, mismatch, networkArg, networkLabel, resolveNetwork, unusableChain } from "../src/network.js";
 import { RELEASE_KEY_ID, binPaths, checkBinaryVersion, fetchVerifiedRelease, latestTagFrom, pickNodeBinary, readReleasePin, releaseKeyIdFrom, type ReleaseDeps } from "../src/release.js";
 
 const G1 = "11".repeat(32);
@@ -35,20 +35,20 @@ assert.deepEqual(
 assert.equal(resolveNetwork({}, ["--network", "local"]).rpc, LOCAL_RPC);
 assert.equal(resolveNetwork({}, ["--network=local"]).key, "local");
 assert.equal(resolveNetwork({ BLOCKULA_NETWORK: "local" }).key, "local");
-assert.equal(networkArg(["--foo", "--network", "mainnet"]), "mainnet");
+assert.equal(networkArg(["--foo", "--network", "local"]), "local");
 assert.equal(resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7391/" }).key, "local", "a localhost RPC is the local network");
 assert.equal(resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7391/" }).rpc, "http://127.0.0.1:7391");
 assert.equal(resolveNetwork({ BLOCKULA_RPC: TESTNET_RPC }).key, "testnet", "the testnet's own URL keeps its pins");
 assert.equal(resolveNetwork({ BLOCKULA_RPC: "https://rpc.example" }).key, "custom");
 assert.equal(resolveNetwork({ BLOCKULA_RPC: "http://10.0.0.5:7070" }).key, "custom", "plain http on a private network");
-const main = resolveNetwork({ BLOCKULA_RPC: "https://rpc.example" }, ["--network", "mainnet"]);
-assert.deepEqual([main.key, main.mainnet, main.pin.chainId, main.pin.prefix], ["mainnet", true, "blockula-1", "boo"]);
-assert.equal(resolveNetwork({ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_CHAIN_ID: "blockula-1" }).mainnet, true, "a custom node pinned to blockula-1 is real money");
+// There's no mainnet network: a node on blockula-1 is reached with BLOCKULA_CHAIN_ID, like any chain.
+const onBlockula1 = resolveNetwork({ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_CHAIN_ID: "blockula-1" });
+assert.deepEqual([onBlockula1.key, onBlockula1.pin.chainId, onBlockula1.pin.prefix], ["custom", "blockula-1", undefined]);
 const pinned = resolveNetwork({ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_CHAIN_ID: "x", BLOCKULA_GENESIS_HASH: G1.toUpperCase() });
 assert.deepEqual(pinned.pin, { chainId: "x", genesisHash: G1 });
 const refusals: [Record<string, string>, string[], RegExp][] = [
-  // Until the launch release builds public mainnet RPCs in (scripts/pin-network.sh --mainnet).
-  ...(MAINNET_RPCS.length ? [] : [[{}, ["--network", "mainnet"], /no public mainnet RPC/] as [Record<string, string>, string[], RegExp]]),
+  [{ BLOCKULA_RPC: "https://rpc.example" }, ["--network", "mainnet"], /unknown network "mainnet" \(testnet, local or custom\)/],
+  [{ BLOCKULA_NETWORK: "Mainnet" }, [], /unknown network "mainnet"/],
   [{}, ["--network", "custom"], /needs BLOCKULA_RPC/],
   [{ BLOCKULA_NETWORK: "moon" }, [], /unknown network/],
   [{ BLOCKULA_RPC: "http://rpc.example" }, [], /must use https/],
@@ -109,16 +109,13 @@ for (const [typed, canonical] of [
   ["ftp://rpc.example/", "ftp://rpc.example/"], // not a node URL: as it is
   ["not a url", "not a url"],
 ]) assert.equal(canonicalUrl(typed), canonical, typed);
-for (const u of [TESTNET_RPC, LOCAL_RPC, ...MAINNET_RPCS]) assert.equal(canonicalUrl(u), u, `${u}: the built-in RPCs are in canonical spelling`);
+for (const u of [TESTNET_RPC, LOCAL_RPC]) assert.equal(canonicalUrl(u), u, `${u}: the built-in RPCs are in canonical spelling`);
 assert.deepEqual(resolveNetwork({ BLOCKULA_RPC: "https://Rpc.Example:443/.", BLOCKULA_WITNESSES: "https://W.example/ , https://x.example:8443/" }).witnesses, ["https://w.example", "https://x.example:8443"]);
 // A node on this machine is "your node on" the public testnet once its chain is known.
 assert.equal(networkLabel(resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171" }), "blockula-testnet-2"), "your node on the public testnet");
 assert.equal(networkLabel(resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171" }), "blockula-dev"), "local dev node");
 assert.equal(networkLabel(resolveNetwork({}), "blockula-testnet-2"), "public testnet");
 for (const [env, argv, re] of refusals) assert.throws(() => resolveNetwork(env, argv), re, JSON.stringify([env, argv]));
-// Built-in mainnet RPCs: https, and the first is mainnet's default.
-for (const u of MAINNET_RPCS) assert.match(u, /^https:\/\/[^/\s]+$/, u);
-if (MAINNET_RPCS.length) assert.equal(resolveNetwork({}, ["--network", "mainnet"]).rpc, MAINNET_RPCS[0]);
 console.log("✓ the network comes from the configuration only (default: the public testnet); a node is one node however its URL is spelled, so the public RPC is never its own witness");
 
 // ---- 2. pins ----
@@ -136,8 +133,8 @@ const mainnetGenesis: string | undefined = KNOWN_GENESIS["blockula-1"];
 KNOWN_GENESIS["blockula-1"] = G1;
 assert.match(mismatch({}, status("blockula-1", G2)) ?? "", /genesis/);
 assert.equal(mismatch({}, status("blockula-1", G1)), null);
-assert.equal(resolveNetwork({ BLOCKULA_RPC: "https://rpc.example" }, ["--network", "mainnet"]).pin.genesisHash, G1);
-assert.throws(() => resolveNetwork({ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_GENESIS_HASH: G2 }, ["--network", "mainnet"]), /contradicts blockula-1's known genesis/);
+assert.equal(resolveNetwork({ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_CHAIN_ID: "blockula-1" }).pin.genesisHash, G1);
+assert.throws(() => resolveNetwork({ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_CHAIN_ID: "blockula-1", BLOCKULA_GENESIS_HASH: G2 }), /contradicts blockula-1's known genesis/);
 if (mainnetGenesis === undefined) delete KNOWN_GENESIS["blockula-1"];
 else KNOWN_GENESIS["blockula-1"] = mainnetGenesis;
 // Every known genesis comes with its clock (scripts/pin-network.sh pins them together).
@@ -357,7 +354,7 @@ const tools = await s.tools();
 for (const name of ["stake", "unstake", "my_stake", "withdraw_stake", "list_proposals", "vote", "renew_name"]) assert.ok(tools.some((t) => t.name === name), `tool ${name}`);
 for (const name of ["list_hunts", "lookup", "list_proposals"]) assert.match(tools.find((t) => t.name === name)?.description ?? "", /untrusted_\*/, `${name} says its chain text is untrusted`);
 for (const name of ["list_hunts", "fund_hunt", "contribution_pool", "submit_contribution", "my_contributions"]) {
-  assert.match(tools.find((t) => t.name === name)?.description ?? "", /Testnet FANG, Hunts and Soul have no value/, `${name} carries the disclaimer`);
+  assert.match(tools.find((t) => t.name === name)?.description ?? "", / FANG, Hunts and Soul have no value\.$/, `${name} carries the disclaimer`);
 }
 r = await s.call("status");
 assert.ok(r.error && /Refusing .*chain "fake-chain", not "another-chain"/.test(r.text), r.text);
@@ -430,39 +427,36 @@ assert.ok(r.error && /doesn't report its chain's genesis hash, so the account ca
 await s.close();
 nodeStatus = { ...nodeStatus, chain_id: "fake-chain", genesis_hash: G1 };
 
-// Hunts and the contribution pool say testnet FANG is worth nothing on test chains only: a tool's
-// description by the configured network (of test chains alone when the node's chain isn't known
-// yet), a result by the chain the node is on. On mainnet nothing is said about value.
-const NO_VALUE = /Testnet FANG, Hunts and Soul have no value/;
-const HEDGED = /On test chains, FANG, Hunts and Soul have no value/;
+// Hunts and the contribution pool say FANG is worth nothing, in a tool's description and in a
+// result, on every chain: a pinned test chain, a node whose chain isn't known until it answers, and
+// a node on blockula-1 alike.
+const NO_VALUE = /FANG, Hunts and Soul have no value\.$/;
 const VALUE_TOOLS = ["list_hunts", "fund_hunt", "contribution_pool", "submit_contribution", "my_contributions"];
 const described = async (srv: Awaited<ReturnType<typeof server>>) => {
   const all = await srv.tools();
   return VALUE_TOOLS.map((n) => all.find((t) => t.name === n)?.description ?? "");
 };
+const sayNoValue = async (srv: Awaited<ReturnType<typeof server>>, what: string) => {
+  for (const d of await described(srv)) assert.ok(NO_VALUE.test(d) && !/mainnet|real money|testnet|test chains/i.test(d), `${what}: "${d}"`);
+  for (const tool of ["list_hunts", "contribution_pool"]) {
+    const res = await srv.call(tool);
+    assert.ok(!res.error && /FANG, Hunts and Soul have no value\.$/.test(JSON.parse(res.text).note), `${what} ${tool}: ${res.text}`);
+  }
+};
 nodeStatus = { ...nodeStatus, chain_id: "fake-chain" };
 s = await server({ BLOCKULA_RPC: rpc });
-for (const d of await described(s)) assert.ok(HEDGED.test(d) && !NO_VALUE.test(d) && d === d.trim(), `an unpinned node's chain isn't known yet: "${d}"`);
-r = await s.call("list_hunts");
-assert.ok(!r.error && NO_VALUE.test(JSON.parse(r.text).note), r.text);
-r = await s.call("contribution_pool");
-assert.ok(!r.error && NO_VALUE.test(JSON.parse(r.text).note), r.text);
+await sayNoValue(s, "a node whose chain isn't pinned");
 await s.close();
-// (Reporting blockula-1's genesis once the launch release pins it: any other is refused.)
+s = await server({ BLOCKULA_RPC: rpc, BLOCKULA_CHAIN_ID: "fake-chain" });
+await sayNoValue(s, "a node pinned to a test chain");
+await s.close();
+// (Reporting blockula-1's genesis once a release pins it: any other is refused.)
 nodeStatus = { ...nodeStatus, chain_id: "blockula-1", genesis_hash: KNOWN_GENESIS["blockula-1"] ?? G1 };
-s = await server({ BLOCKULA_RPC: rpc });
-r = await s.call("list_hunts");
-assert.ok(!r.error && !/have no value/.test(r.text) && /untrusted_\*/.test(JSON.parse(r.text).note), `a node on blockula-1 is mainnet, however configured: ${r.text}`);
-await s.close();
-s = await server({ BLOCKULA_RPC: rpc }, ["--network", "mainnet"]);
-for (const d of await described(s)) assert.ok(!/have no value/.test(d) && d === d.trim(), `mainnet says nothing about value: "${d}"`);
-r = await s.call("list_hunts");
-assert.ok(!r.error && !/have no value/.test(r.text), r.text);
-r = await s.call("contribution_pool");
-assert.ok(!r.error && !/have no value/.test(r.text) && JSON.parse(r.text).note === undefined, r.text);
+s = await server({ BLOCKULA_RPC: rpc, BLOCKULA_CHAIN_ID: "blockula-1" });
+await sayNoValue(s, "a node pinned to blockula-1");
 await s.close();
 nodeStatus = { ...nodeStatus, chain_id: "fake-chain", genesis_hash: G1 };
-console.log("✓ testnet FANG is called worthless on test chains only, never on mainnet");
+console.log("✓ FANG, Hunts and Soul are called worthless on every chain, in descriptions and results");
 
 // A broken configuration fails every tool with the reason, instead of guessing a network.
 s = await server({ BLOCKULA_NETWORK: "moon" });
