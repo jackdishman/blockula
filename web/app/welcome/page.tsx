@@ -1,8 +1,10 @@
 "use client";
 
+import { formatFang } from "@blockula/sdk";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
-import { useEffect, useRef, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { Suspense, useEffect, useRef, useState } from "react";
+import { HowFangReachesYou, PayRequestBanner } from "@/components/FirstFang";
 import { Splash, useAccountResolution } from "@/components/Gate";
 import { epitaph, NameClaim } from "@/components/NameClaim";
 import { Apparition } from "@/components/Haunt";
@@ -13,17 +15,23 @@ import { season } from "@/lib/ascii/settings";
 import { localKeysAllowed } from "@/lib/config";
 import { friendly, isPrfUnsupported } from "@/lib/errors";
 import { createLocalKey, createPasskey, unlockPasskey } from "@/lib/keys";
+import { canAffordName, cheapestName, safeNext, welcomePayment } from "@/lib/onboarding";
+import { BRAND, FIRST_FANG } from "@/lib/onboarding-copy";
 import type { Hint } from "@/lib/session";
 import { useWallet } from "@/lib/wallet";
 
 type Step = 0 | 1 | 2 | "start" | "have" | "prf" | "fund" | "kit" | "name" | "done";
 
+/** How long the fund step waits for the node before offering a way on without it. */
+const NODE_PATIENCE_MS = 8000;
+
+/** The story before the wallet. Chapters I and III's words are in lib/onboarding-copy.ts. */
 const INTRO: { ornament: PropKind; chapter: string; title: string; body: string }[] = [
   {
     ornament: "bat",
     chapter: "Chapter I",
     title: "A wallet is a key, not a vault",
-    body: "Your FANG lives on the Blockula blockchain, a public ledger kept by many computers. A wallet holds the secret key that proves which coins are yours and lets you move them.",
+    body: BRAND.chapterOne,
   },
   {
     ornament: "key",
@@ -34,14 +42,27 @@ const INTRO: { ornament: PropKind; chapter: string; title: string; body: string 
   {
     ornament: "moon",
     chapter: "Chapter III",
-    title: "Safe from tomorrow's quantum computers",
-    body: "A large quantum computer could forge the signatures Bitcoin and Ethereum use. Blockula signs with ML-DSA-65, a NIST post-quantum standard. Your passkey only unlocks that key; it never signs anything on-chain.",
+    title: BRAND.chapterThreeTitle,
+    body: BRAND.chapterThreeBody,
   },
 ];
 
-export default function Welcome() {
-  const { ready, hint, wallet, client, status, unlocked, refresh } = useWallet();
+export default function WelcomePage() {
+  return (
+    <Suspense>
+      <Welcome />
+    </Suspense>
+  );
+}
+
+function Welcome() {
+  const { ready, hint, wallet, account, client, status, unlocked, refresh } = useWallet();
   const router = useRouter();
+  // A payment link opened without a wallet (RequireWallet): onboarding ends there instead of Home,
+  // unless it was made for another chain (checked as Send checks it), which Send won't fill.
+  const next = safeNext(useSearchParams().get("next"));
+  const { request, check: linkCheck, payment } = welcomePayment(next, client.pin);
+  const home = payment ?? "/";
   const [step, setStep] = useState<Step>(0);
   const [nickname, setNickname] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
@@ -49,13 +70,13 @@ export default function Welcome() {
   const [funded, setFunded] = useState<string | null>(null);
   const [claimed, setClaimed] = useState<string | null>(null);
   const [typed, setTyped] = useState("");
-  const { resolve, picker } = useAccountResolution();
+  const { resolve, picker } = useAccountResolution(home);
   const inFlow = useRef(false);
 
-  // Already set up on this browser? Go home (unless we're mid-onboarding).
+  // Already set up on this browser? Go home, or to the payment (unless we're mid-onboarding).
   useEffect(() => {
-    if (ready && hint && !inFlow.current) router.replace("/");
-  }, [ready, hint, router]);
+    if (ready && hint && !inFlow.current) router.replace(home);
+  }, [ready, hint, router, home]);
 
   const start = async (w: Parameters<typeof unlocked>[0], h: Hint) => {
     inFlow.current = true;
@@ -96,6 +117,28 @@ export default function Welcome() {
     const { wallet: w, hint: h } = createLocalKey(client);
     await start(w, h);
   };
+
+  // A node that doesn't answer mustn't hold the new wallet hostage: after a while, offer to go on.
+  const [stalled, setStalled] = useState(false);
+  useEffect(() => {
+    if (step !== "fund" || status) return;
+    const t = setTimeout(() => setStalled(true), NODE_PATIENCE_MS);
+    return () => clearTimeout(t);
+  }, [step, status]);
+
+  // The name step: the cheapest name's price (a governance parameter), to tell whether to offer one yet.
+  const [cheapest, setCheapest] = useState<bigint | null>(null);
+  useEffect(() => {
+    if (step !== "name") return;
+    let live = true;
+    client
+      .params()
+      .then((p: { params?: Record<string, unknown> } | null) => live && setCheapest(cheapestName(p?.params)))
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [step, client]);
 
   // Step: auto-fund from the faucet if this chain has one (once; status refreshes every few seconds).
   const fundStarted = useRef(false);
@@ -145,10 +188,13 @@ export default function Welcome() {
     </>
   );
 
+  const ask = request && linkCheck && <PayRequestBanner request={request} check={linkCheck} />;
+
   if (typeof step === "number") {
     const s = INTRO[step];
     return (
       <main className="narrow center onboarding">
+        {ask}
         <Apparition kind={s.ornament} />
         <span className="eyebrow">{s.chapter}</span>
         <h1>{s.title}</h1>
@@ -167,6 +213,7 @@ export default function Welcome() {
   if (step === "start")
     return (
       <main className="narrow stack-lg">
+        {ask}
         <div className="center">
           <span className="eyebrow">Your wallet</span>
           <h1>Create your wallet</h1>
@@ -192,6 +239,7 @@ export default function Welcome() {
   if (step === "have")
     return (
       <main className="narrow stack-lg">
+        {ask}
         <div className="center">
           <Apparition kind="key" />
           <span className="eyebrow">Welcome back</span>
@@ -215,7 +263,7 @@ export default function Welcome() {
         </div>
         <section className="card stack">
           <p>
-            Blockula derives your quantum-safe key from a secret your passkey produces through a feature called <b>PRF</b>. The passkey provider you picked doesn&apos;t support it.
+            Blockula derives your {BRAND.signingKey} from a secret your passkey produces through a feature called <b>PRF</b>. The passkey provider you picked doesn&apos;t support it.
           </p>
           <p className="dim">
             Try again with <b>iCloud Keychain</b> (Safari / iOS 18+), <b>Google Password Manager</b> (Chrome), <b>1Password</b>, or a recent YubiKey.
@@ -234,21 +282,45 @@ export default function Welcome() {
       </main>
     );
 
-  if (step === "fund")
+  if (step === "fund") {
+    const toKit = (
+      <button className="btn primary big" onClick={() => { setError(null); setStep("kit"); }}>
+        Next: your recovery kit
+      </button>
+    );
+    // Until the node says whether this chain has a faucet, nothing about faucets (a chain without
+    // one goes straight on to the kit).
+    if (!status?.faucet)
+      return (
+        <main className="narrow center stack-lg" data-testid="fund-waiting">
+          <Apparition kind="bat" />
+          <h1>{stalled && !status ? "Your wallet is created" : "Checking the network…"}</h1>
+          {stalled && !status ? (
+            <>
+              <p className="lead">The network isn&apos;t answering right now. You can continue, and check your balance later.</p>
+              {toKit}
+            </>
+          ) : (
+            <Spinner>Asking the node about this chain…</Spinner>
+          )}
+        </main>
+      );
     return (
       <main className="narrow center stack-lg">
         <Apparition kind="bat" />
         <h1>{funded ? `${funded} landed!` : "Fetching some test FANG…"}</h1>
         <p className="lead">
           {funded
-            ? "That's FANG, Blockula's currency. The faucet just sent it to you in a real transaction, sealed into a block. Let's use some of it to claim a name."
-            : "This test chain has a faucet that gives new wallets free FANG to play with."}
+            ? `That's FANG, ${BRAND.unit}. The faucet just sent it to you in a real transaction, sealed into a block. Let's use some of it to claim a name.`
+            : "This chain has a faucet that gives new wallets free FANG to try things with."}
         </p>
+        <p className="dim small onb-novalue" data-testid="fang-no-value">{FIRST_FANG.noValue}</p>
         {!funded && !error && <Spinner>Waiting for the next block…</Spinner>}
         <ErrorNote error={error} />
-        {(funded || error) && <button className="btn primary big" onClick={() => { setError(null); setStep("kit"); }}>Next: your recovery kit</button>}
+        {(funded || error) && toKit}
       </main>
     );
+  }
 
   if (step === "kit")
     return (
@@ -262,7 +334,24 @@ export default function Welcome() {
       </main>
     );
 
-  if (step === "name")
+  if (step === "name") {
+    // A chain without a faucet, and not enough FANG for any name: nothing to claim yet, and no
+    // faucet to send the user to. Say so, and when (the heading stays: it's the same step).
+    const balance = BigInt(account?.balance ?? "0");
+    if (!status?.faucet && !canAffordName(balance, cheapest))
+      return (
+        <main className="narrow stack-lg" data-testid="name-later">
+          <div className="center">
+            <Apparition kind="grave" />
+            <span className="eyebrow">Your name, later</span>
+            <h1>Claim your .boo name</h1>
+            <p className="dim">
+              A name like <b>vlad.boo</b> points to your long address, so people can send to it. Names cost FANG{cheapest !== null ? `, from ${formatFang(cheapest)} for a year` : ""}, and this wallet {balance > 0n ? "doesn't have enough yet" : "has none yet"}. Once some reaches you, claim one from Home.
+            </p>
+          </div>
+          <button className="btn primary big center-self" onClick={() => setStep("done")}>Skip for now</button>
+        </main>
+      );
     return (
       <main className="narrow stack-lg">
         <div className="center">
@@ -279,17 +368,23 @@ export default function Welcome() {
         <button className="link center-self" onClick={() => setStep("done")}>Skip for now</button>
       </main>
     );
+  }
 
+  // The node says this chain has no faucet: say how FANG does arrive. (With the node silent, nothing
+  // is known either way, so nothing is said.)
+  const firstFang = !!status && !status.faucet;
   return (
     <main className="narrow center stack-lg">
       {/* Never the first render (so no hydration to match): fine to read the date here. */}
       <Apparition kind={season() === "halloween" ? "pumpkin" : "moon"} />
       <h1>{claimed ? `Welcome to the night, ${claimed}` : "Your wallet is ready"}</h1>
       <p className="lead">
-        You now own a quantum-safe account. Next time, just unlock with your passkey. Linking a second device is a good idea too, and if you skipped the recovery kit, make one from Devices &amp; agents.
+        {BRAND.accountSigns} Next time, just unlock with your passkey. Linking a second device is a good idea too, and if you skipped the recovery kit, make one from Devices &amp; agents.
       </p>
+      {firstFang && <HowFangReachesYou />}
+      {ask}
       <Tip>Your home screen has a short checklist that walks you through sending, the explorer, and giving an AI agent a budget.</Tip>
-      <button className="btn primary big" onClick={() => router.replace("/")}>Open my wallet</button>
+      <button className="btn primary big" onClick={() => router.replace(home)}>{payment ? "Continue to the payment" : "Open my wallet"}</button>
     </main>
   );
 }
