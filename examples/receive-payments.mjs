@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Watch an address for payments and match them to orders by memo (docs/INTEGRATION.md, "Deposits").
 //
-//   node examples/receive-payments.mjs <address> [--rpc URL] [--network local|testnet|mainnet]
+//   node examples/receive-payments.mjs <address> [--rpc URL] [--network local|testnet]
 //        [--state FILE] [--from HEIGHT] [--expect MEMO=AMOUNT]...
 //
 // It keeps where it got to in --state (a small JSON file), so it resumes after a restart without
@@ -13,7 +13,7 @@ import { Client, formatFang, isAddress, parseFang, watchPayments } from "@blocku
 const { positional, flags } = parseArgs(process.argv.slice(2));
 const address = positional[0];
 if (!address || !isAddress(address)) {
-  console.error("usage: node examples/receive-payments.mjs <address> [--rpc URL] [--network local|testnet|mainnet] [--state FILE] [--from HEIGHT] [--expect MEMO=AMOUNT]...");
+  console.error("usage: node examples/receive-payments.mjs <address> [--rpc URL] [--network local|testnet] [--state FILE] [--from HEIGHT] [--expect MEMO=AMOUNT]...");
   console.error("Watch an address, not a .boo name: names expire and change hands.");
   process.exit(2);
 }

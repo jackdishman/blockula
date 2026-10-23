@@ -340,10 +340,6 @@ pub fn run_in(cmd: ValidatorCmd, dir: &Path) -> Result<()> {
             println!("   address (account + validator id): {me}");
             println!("   consensus key: ML-DSA-65, {}…", &hex::encode(keys.public_key())[..32]);
             println!("   advertised p2p {p2p} · http {http}");
-            if g.chain_id == crate::chain::MAINNET_CHAIN_ID {
-                let cp = g.chain_params()?;
-                eprintln!("{}", crate::cli_net::mainnet_staking_notice(&format!("{}%", crate::staking::fmt_bps(cp.slash_double_sign_bps)), &crate::cli_net::span_words(cp.unbonding_blocks, g.block_time_ms)));
-            }
             println!("\nNext:");
             let faucet = if g.faucet { format!(" (test chains: POST /api/faucet {{\"to\": \"{me}\"}})") } else { String::new() };
             println!("   1. Fund {me} with at least {} plus fees{faucet}", fmt_fang(g.chain_params()?.min_self_bond));
@@ -384,13 +380,7 @@ pub fn run_in(cmd: ValidatorCmd, dir: &Path) -> Result<()> {
             let action = Action::RegisterValidator { consensus_key: hex::encode(keys.public_key()), p2p_addr: addrs.p2p_addr, http_addr: addrs.http_addr, bond, pop };
             // The node must be on the home's chain: its genesis pins it.
             let pin = ChainPin { network: None, chain_id: Some(g.chain_id.clone()), genesis_hash: Some(crate::checkpoints::genesis_hash(&g)) };
-            let tx = rt.block_on(async {
-                let remote = Remote::connect_in(dir, &rpc, &pin).await?;
-                if remote.chain_id == crate::chain::MAINNET_CHAIN_ID {
-                    eprintln!("{}", staking_notice(&remote).await?);
-                }
-                send(&remote, &keys, &me, action).await
-            })?;
+            let tx = rt.block_on(async { send(&Remote::connect_in(dir, &rpc, &pin).await?, &keys, &me, action).await })?;
             println!("✓ {}", tx["summary"].as_str().unwrap_or_default());
             // The chain's actual way in, from its own answer (OPERATOR-11).
             match rt.block_on(get(&rpc, "/validators")) {
@@ -649,16 +639,6 @@ async fn check_node_running(local: &str, rpc: &str, genesis_hash: &str) -> Resul
     Ok(())
 }
 
-/// The three-line mainnet staking notice with this chain's figures (`/api/validators`, and the
-/// block time of the pinned genesis).
-pub(crate) async fn staking_notice(remote: &Remote) -> Result<String> {
-    let set = get(&remote.rpc, "/validators").await?;
-    let block_time_ms = remote.genesis().await?.block_time_ms;
-    let slash = set["slash_double_sign_display"].as_str().unwrap_or("5%");
-    let unbonding = set["unbonding_blocks"].as_u64().map(|b| crate::cli_net::span_words(b, block_time_ms)).unwrap_or_else(|| "21 days".into());
-    Ok(crate::cli_net::mainnet_staking_notice(slash, &unbonding))
-}
-
 /// What `register` says about how its validator gets into the active set, from the chain's
 /// `/api/validators`: a small set's admission, an admin's approval, or stake ranking at an epoch
 /// boundary (with the lowest stake in the set).
@@ -861,9 +841,7 @@ pub fn wallet(cmd: WalletCmd, dir: &Path) -> Result<()> {
             write_secret(&dir.join("wallet.json"), &serde_json::to_string_pretty(&f)?)?;
             println!("🧛 New wallet {}", f.address);
             println!("   key saved to {} (mode 600 — back it up; anyone with it controls the funds)", dir.join("wallet.json").display());
-            if prefix == crate::crypto::ADDRESS_HRP {
-                println!("   {}", crate::cli_net::UNRECOVERABLE_KEY);
-            }
+            println!("   {}", crate::cli_net::UNRECOVERABLE_KEY);
             Ok(())
         }
         WalletCmd::Balance { rpc } => {

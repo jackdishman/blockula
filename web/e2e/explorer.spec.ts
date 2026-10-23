@@ -24,7 +24,7 @@ function api(p: string, missing: string[]): unknown {
     validator: label(address), owner: label(OWNER, "vlad.boo"), status: "active", consensus_key: "", p2p_addr: "203.0.113.1:30300", http_addr: "", genesis: false,
     stake: "0", stake_display: "0 FANG", self_bond: "0", self_bond_display: "0 FANG", commission_bps: 0, commission_display: "0%", eligible: true, jailed: null, tombstoned_at: null, slashed_display: "0 FANG", liveness: null, registered_at: 0, ...extra,
   });
-  if (p === "/status") return { chain_id: "blockula-1", height: 1000, block_time_ms: 1000, epoch: 3, active_validators: 2, mempool: 0, supply_display: "1000000000 FANG", burned_display: "12 FANG", accounts: 5, names: 1, head_age_ms: 500, history_from: 1 };
+  if (p === "/status") return { chain_id: "mychain", height: 1000, block_time_ms: 1000, epoch: 3, active_validators: 2, mempool: 0, supply_display: "1000000000 FANG", burned_display: "12 FANG", accounts: 5, names: 1, head_age_ms: 500, history_from: 1 };
   if (p === "/validators") {
     const active = [
       validator(V1, { stake: (2_000_000n * FANG).toString(), stake_display: "2000000 FANG", self_bond_display: "10000 FANG", commission_bps: 500, commission_display: "5%" }),
@@ -85,8 +85,8 @@ test("validators show pools, stake, commission and jail", async ({ page }) => {
   await expect(app).toContainText("3,000,000FANGstaked in the active set");
   await expect(app).toContainText("of 31");
   await expect(app).not.toContainText("test chain");
-  // Not a test chain: the footer says nothing about test chains.
-  await expect(page.locator("#imprint")).toHaveText("Post-quantum signatures · ML-DSA-65");
+  // A chain someone launched, not a test chain: the footer says nothing about test chains.
+  await expect(page.locator("#imprint")).toHaveText("Post-quantum signatures · ML-DSA-65 · Not audited");
 });
 
 test("governance lists proposals with tallies, council votes and timelock, and escapes them", async ({ page }) => {
