@@ -60,6 +60,10 @@ test("a pasted grant code shows its check code, the agent's responsibility and t
   );
   await expect(card.getByLabel(/^Label/)).toHaveAttribute("placeholder", "claude");
   await expect(card.locator(".onb-public")).toHaveText("(public and permanent)");
+  // A 1-second chain: a day is a day.
+  await expect(card.getByLabel("Daily limit")).toHaveValue("10");
+  await expect(card.locator("p", { hasText: "You'll sign:" })).toContainText("every 86,400 blocks (about 1 day), transfers only, for the next 2,592,000 blocks (about 30 days)");
+  await expect(card.locator(".tip")).toContainText("resets every 86,400 blocks (about 1 day)");
   // A new device's name is public too: nothing filled in that could name its owner.
   const device = page.locator("#device");
   const name = device.getByLabel(/^Name it/);
@@ -99,4 +103,32 @@ test("a #grant= link fills in nothing: a grant is pasted, never carried by a lin
   await expect(card.getByTestId("agent-from-link")).toHaveCount(0);
   await expect(card.getByRole("button", { name: "Allow 10 FANG/day" })).toBeDisabled();
   expect(node.submitted.length).toBe(submitted);
+});
+
+// Review WOK-5: the budget is signed in blocks (86,400 a period), a day only at 1-second blocks. On
+// a chain `blockula summon` made with its default 5-second blocks the card says what the blocks come to.
+test("the agent card says what its period is on a 5-second chain, and signs the same blocks", async ({ page, node }) => {
+  const created = await createWallet(page);
+  node.statusExtra = { block_time_ms: 5000 };
+  const agent = Wallet.generate();
+  const code = encodeKeyGrant(await agent.keyGrant(created.account, { chainId: CHAIN_ID, genesisHash: GENESIS }));
+  await page.goto("/devices");
+  await page.getByRole("button", { name: "Unlock with passkey" }).click();
+  const card = page.locator("#agent");
+  await expect(card.getByText("a limit per 5 days and an expiry date")).toBeVisible();
+  await expect(card.getByLabel("Limit per 5 days")).toHaveValue("10");
+  await expect(card.getByLabel("Daily limit")).toHaveCount(0);
+  await expect(card.locator(".suffix", { hasText: "× 5 days" })).toBeVisible();
+  await card.getByPlaceholder("bkgrant1.…").fill(code);
+  await expect(card.locator("p", { hasText: "You'll sign:" })).toContainText("every 86,400 blocks (about 5 days), transfers only, for the next 2,592,000 blocks (about 150 days)");
+  await expect(card.locator(".tip")).toContainText("resets every 86,400 blocks (about 5 days)");
+  await expect(card).not.toContainText(/FANG\/day|Daily|a day|per day/);
+  await card.getByRole("button", { name: "Allow 10 FANG per 5 days" }).click();
+  const snippet = card.locator("pre.snippet");
+  await expect(snippet).toContainText("up to 10 FANG per 5 days, sends only, for 150 days");
+  // What's signed is the same blocks as on any chain.
+  const action = node.submitted.at(-1)?.action as { role: { period_blocks: number; expires_at: number } };
+  expect(action).toMatchObject({ type: "add_key", key_id: agent.keyId, role: { type: "session", period_blocks: 86_400 } });
+  expect(action.role.expires_at - node.height).toBeGreaterThan(30 * 86_400 - 100);
+  expect(action.role.expires_at - node.height).toBeLessThan(30 * 86_400 + 100);
 });
