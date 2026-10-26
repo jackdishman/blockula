@@ -87,7 +87,55 @@ pub fn is_address(s: &str) -> bool {
 
 /// Lowercase hex only (no uppercase aliases of the same bytes).
 pub fn is_lower_hex(s: &str) -> bool {
-    s.len() % 2 == 0 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    // Every byte is looked at, with no early exit, which lets the loop run a vector at a time:
+    // a tx's key and signature are 10,522 characters of this, checked each time it is.
+    s.len().is_multiple_of(2) && s.bytes().fold(true, |ok, b| ok & (b.is_ascii_digit() | (b'a'..=b'f').contains(&b)))
+}
+
+/// The bytes of canonical lowercase hex: `Some` exactly when [`is_lower_hex`] holds, and then what
+/// `hex::decode` returns. Any other string (odd length, a character outside `0-9a-f`, uppercase
+/// included) is `None`, for the caller to hand to `hex::decode` if it wants that function's answer.
+/// A tx pays this for its 1,952-byte key and 3,309-byte signature each time it is checked,
+/// encoded or named, and one table lookup a digit is several times faster than `hex::decode`.
+pub fn decode_lower_hex(s: &str) -> Option<Vec<u8>> {
+    decode_lower(s.as_bytes())
+}
+
+/// [`decode_lower_hex`] on bytes, so a test can try every byte value.
+fn decode_lower(s: &[u8]) -> Option<Vec<u8>> {
+    /// The value of each lowercase hex digit; every other byte maps to 0xff (past any nibble).
+    const NIBBLE: [u8; 256] = {
+        let mut table = [0xff; 256];
+        let mut i = 0;
+        while i < 16 {
+            table[b"0123456789abcdef"[i] as usize] = i as u8;
+            i += 1;
+        }
+        table
+    };
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    let (pairs, _) = s.as_chunks::<2>();
+    let mut out = vec![0u8; pairs.len()];
+    // Every nibble is 0–15, so `bad` stays under 16 exactly when every character was a digit.
+    let mut bad = 0u8;
+    for (byte, &[high, low]) in out.iter_mut().zip(pairs) {
+        let (high, low) = (NIBBLE[usize::from(high)], NIBBLE[usize::from(low)]);
+        bad |= high | low;
+        *byte = (high << 4) | low;
+    }
+    (bad < 16).then_some(out)
+}
+
+/// `hex::encode` (lowercase) of `bytes`, written into a buffer a pair of digits at a time.
+pub fn encode_lower_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = vec![0u8; bytes.len() * 2];
+    for (pair, &b) in out.as_chunks_mut::<2>().0.iter_mut().zip(bytes) {
+        *pair = [DIGITS[usize::from(b >> 4)], DIGITS[usize::from(b & 15)]];
+    }
+    String::from_utf8(out).expect("hex digits are ASCII")
 }
 
 pub struct Keys {
@@ -211,5 +259,102 @@ mod tests {
         assert_eq!(v.address(), "boo15le8r6nlt2mpl4k9df9zd5ragyw35m9hm5spjr6td8h93kdkps7qaltngu");
         assert_eq!(v.address_with(TESTNET_HRP), "tboo15le8r6nlt2mpl4k9df9zd5ragyw35m9hm5spjr6td8h93kdkps7qscv9f0");
         assert_eq!(network_of(TESTNET_HRP), "testnet");
+    }
+
+    /// `is_lower_hex` as it was before it became a `fold` (it was `all`, which stops at the
+    /// first bad byte), word for word.
+    #[allow(clippy::manual_is_multiple_of)]
+    fn before_is_lower_hex(s: &str) -> bool {
+        s.len() % 2 == 0 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+
+    /// What the hex helpers must say for `s`, from `hex` and nothing of ours: the bytes if every
+    /// byte is a lowercase hex digit and there is an even number of them, else `None`.
+    fn oracle(s: &[u8]) -> Option<Vec<u8>> {
+        (s.len().is_multiple_of(2) && s.iter().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))).then(|| hex::decode(s).unwrap())
+    }
+
+    /// Both bytes of every pair, all 65,536 of them (so every byte value in the high and the low
+    /// place), and every length of one, are all the table decoder's behaviour depends on: it
+    /// looks at each pair alone, and at the length's parity.
+    #[test]
+    fn decode_lower_hex_is_hex_decode_for_lowercase_hex_and_nothing_else_on_every_pair_of_bytes() {
+        assert_eq!(decode_lower(b""), Some(vec![]));
+        for a in 0..=255u8 {
+            assert_eq!(decode_lower(&[a]), None, "an odd number of characters ({a:#x})");
+            for b in 0..=255u8 {
+                assert_eq!(decode_lower(&[a, b]), oracle(&[a, b]), "{a:#x} {b:#x}");
+            }
+        }
+        // Several pairs, one wrong anywhere: the bad nibble is never lost in the `bad` accumulator.
+        for bad in [0u8, b'G', b'A', b'/', b':', b'`', b'g', 0x80, 0xff] {
+            for at in 0..16 {
+                let mut s = *b"0123456789abcdef";
+                s[at] = bad;
+                assert_eq!(decode_lower(&s), oracle(&s), "{bad:#x} at {at}");
+            }
+        }
+    }
+
+    /// Whole strings, as `&str`: every character the language has, in the position of a digit
+    /// (all the multi-byte forms among them), on both sides of a good one; and the length checks.
+    #[test]
+    fn the_hex_checks_agree_with_the_old_ones_and_with_hex_on_every_character() {
+        for c in (0..=char::MAX as u32).filter_map(char::from_u32) {
+            for s in [format!("{c}0"), format!("0{c}"), format!("a{c}f0"), c.to_string()] {
+                assert_eq!(is_lower_hex(&s), before_is_lower_hex(&s), "{c:?} in {s:?}");
+                assert_eq!(decode_lower_hex(&s), oracle(s.as_bytes()), "{c:?} in {s:?}");
+            }
+        }
+        for n in 0..40 {
+            let (s, odd) = ("0f".repeat(n), format!("{}a", "0f".repeat(n)));
+            assert!(is_lower_hex(&s) && !is_lower_hex(&odd));
+            assert_eq!(decode_lower_hex(&s), Some(vec![0x0f; n]));
+            assert_eq!(decode_lower_hex(&odd), None);
+        }
+        assert!(is_lower_hex("") && decode_lower_hex("") == Some(vec![]));
+    }
+
+    /// `encode_lower_hex` is `hex::encode`: every byte in each place of a pair, and a longer input
+    /// decoded back.
+    #[test]
+    fn encode_lower_hex_is_hex_encode() {
+        assert_eq!(encode_lower_hex(&[]), "");
+        for a in 0..=255u8 {
+            assert_eq!(encode_lower_hex(&[a]), hex::encode([a]));
+            for b in 0..=255u8 {
+                assert_eq!(encode_lower_hex(&[a, b]), hex::encode([a, b]));
+            }
+        }
+        let all: Vec<u8> = (0..=255).collect();
+        assert_eq!(encode_lower_hex(&all), hex::encode(&all));
+        assert_eq!(decode_lower_hex(&encode_lower_hex(&all)), Some(all));
+    }
+
+    proptest::proptest! {
+        /// Strings over an alphabet that has every kind of mistake (both cases, a character past
+        /// `f`, a non-ASCII one, a space), up to 70 characters (odd lengths and even).
+        #[test]
+        fn the_hex_checks_agree_with_the_old_ones_and_with_hex_on_any_string(s in "[0-9a-fA-Fg é-]{0,70}") {
+            proptest::prop_assert_eq!(is_lower_hex(&s), before_is_lower_hex(&s));
+            proptest::prop_assert_eq!(decode_lower_hex(&s), oracle(s.as_bytes()));
+        }
+
+        /// Hex of any bytes (as long as a signature), and the same with one character changed.
+        #[test]
+        fn encode_then_decode_is_the_identity(bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..3400), at in proptest::prelude::any::<proptest::sample::Index>()) {
+            let hex = encode_lower_hex(&bytes);
+            proptest::prop_assert_eq!(&hex, &hex::encode(&bytes));
+            proptest::prop_assert_eq!(decode_lower_hex(&hex), Some(bytes.clone()));
+            proptest::prop_assert!(is_lower_hex(&hex));
+            if !hex.is_empty() {
+                let mut upper = hex.clone().into_bytes();
+                let i = at.index(upper.len());
+                upper[i] = upper[i].to_ascii_uppercase();
+                let upper = String::from_utf8(upper).unwrap();
+                proptest::prop_assert_eq!(decode_lower_hex(&upper).is_some(), upper == hex);
+                proptest::prop_assert_eq!(is_lower_hex(&upper), upper == hex);
+            }
+        }
     }
 }
