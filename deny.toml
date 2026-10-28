@@ -27,6 +27,14 @@ ignore = [
   # by commonware-codec (pinned =2026.9.0); nothing of it runs in the node. Goes away when
   # Commonware drops it.
   { id = "RUSTSEC-2024-0436", reason = "paste: unmaintained proc macro, compile-time only, via commonware-codec" },
+  # zstd 0.13.3 and zstd-safe 7.3.0 come only through commonware-storage (=2026.9.0, its newest
+  # release), which requires zstd ^0.13.3; the fixes are in zstd 0.14.3 / zstd-safe 8.2.0, and our
+  # own zstd is 0.14.3. commonware-storage calls only `zstd::bulk::compress` and `zstd::decode_all`
+  # (journal/frame.rs, journal/segmented/glob.rs), with zstd's default features (no `seekable`).
+  # Goes away when Commonware moves to zstd >= 0.14.3.
+  { id = "RUSTSEC-2026-0391", reason = "zstd 0.13.3 via commonware-storage: only stream::raw Encoder/Decoder::with_context leak across reused contexts; commonware-storage uses bulk::compress and decode_all" },
+  { id = "RUSTSEC-2026-0398", reason = "zstd-safe 7.3.0 via commonware-storage: Seekable::decompress needs the `seekable` feature, which is off" },
+  { id = "RUSTSEC-2026-0403", reason = "zstd-safe 7.3.0 via commonware-storage: DCtx::decompress_stream on a failed legacy frame, reached through stream::write::Decoder; decode_all and the bulk API are not affected (the advisory says so)" },
 ]
 
 [licenses]
