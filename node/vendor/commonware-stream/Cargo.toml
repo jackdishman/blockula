@@ -80,7 +80,7 @@ features = ["zeroize"]
 # security rests on this crate, so upgrades are reviewed, not picked up by `cargo update`.
 # Default features stay on (`alloc` boxes the expanded keys); `zeroize` wipes them on drop.
 [dependencies.ml-kem]
-version = "=0.3.2"
+version = "=0.3.3"
 features = ["zeroize"]
 
 [dependencies.zeroize]

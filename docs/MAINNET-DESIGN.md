@@ -202,7 +202,7 @@ Recommendation (b) from `.context/research/ghost-mode.md`: build it, ship it **d
 - State: commitment tree frontier and a window of recent roots, the nullifier set, the transparent pool balance (a turnstile: unshield can never exceed it, and it's in `check_invariants`), a governance pool cap, and the feature record.
 - Tags: 50 `Shield`, 51 `PrivateTransfer`, 52 `Unshield` (unsigned: the proof authorizes them, nullifiers prevent replay), 53 `SetGhostAddress` (1,216-byte ML-KEM address published under a `.boo` name), 54 `GhostPause` (takes effect once f+1 validators sign; f+1 can halt the chain anyway, so it adds no power), 55–59 reserved.
 - Size limits per tag: ghost txs up to 256 KiB, at most 1 MiB of ghost txs per block.
-- Notes: ML-KEM-768 (`ml-kem =0.3.2`) + XChaCha20-Poly1305; incoming, full and outgoing viewing keys. Session keys can't spend shielded funds. Every hash use is versioned so a later pool can migrate.
+- Notes: ML-KEM-768 (`ml-kem =0.3.3`) + XChaCha20-Poly1305; incoming, full and outgoing viewing keys. Session keys can't spend shielded funds. Every hash use is versioned so a later pool can migrate.
 - Full design: `docs/GHOST-MODE.md`.
 
 ## 7. Programs (protocol v2)

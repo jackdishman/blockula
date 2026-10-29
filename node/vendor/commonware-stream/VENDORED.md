@@ -27,7 +27,7 @@ Upstream files (each change is marked `Blockula:`):
 - `Cargo.toml`: the `[lints.clippy]` and `[lints.rust]` deny tables are dropped (path dependencies
   aren't lint-capped, and `warnings = "deny"` would break our build on a newer rustc); the
   `unexpected_cfgs` table stays. `resolver` is dropped (the workspace root sets it). Adds
-  `ml-kem = "=0.3.2"` with `zeroize`, names x25519-dalek's `zeroize` feature, and swaps the unused
+  `ml-kem = "=0.3.3"` with `zeroize`, names x25519-dalek's `zeroize` feature, and swaps the unused
   `criterion` dev-dependency for the test-only ones (ML-DSA signer, vectors, aws-lc-rs oracle).
 - `src/lib.rs`: declares `pub mod hybrid` and says so in the crate docs.
 - `src/encrypted.rs`: imports `Syn`, `SynAck`, `Ack`, `Context` and the four handshake functions
