@@ -36,6 +36,12 @@ updates:
       # release, kept there on purpose: only its patch releases are proposed.
       - dependency-name: wasmi
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      # parking_lot 0.13 drops its locks' eventual fairness and rewrites lock_api's raw locks
+      # (parking_lot#533, #544). The chain's state sits behind one of its mutexes, which
+      # consensus, sync and the API all take. Upgrade deliberately, with a run that loads the API
+      # beside consensus; 0.12's patch releases are still proposed.
+      - dependency-name: parking_lot
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
 
   - package-ecosystem: npm
     directory: /
