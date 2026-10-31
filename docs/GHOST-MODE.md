@@ -23,7 +23,7 @@ choice of stack: `.context/research/ghost-mode.md`.
 | Circuit | One Action: 2 spends + 2 outputs, dummies allowed, 128 rows × 261 columns, 453 constraints, degree 3 |
 | Security | 100 bits proven (list-decoding regime), 110 conjectured, from Plonky3's calculator |
 | Proof | 126–132 KiB; prove ~60 ms, verify ~6.3 ms (one core, Apple M4 Max) |
-| Note encryption | ML-KEM-768 (`ml-kem =0.3.2`) + XChaCha20-Poly1305; 1,481 bytes per output |
+| Note encryption | ML-KEM-768 (`ml-kem =0.3.3`) + XChaCha20-Poly1305; 1,481 bytes per output |
 
 ## 1. Keys and addresses
 
