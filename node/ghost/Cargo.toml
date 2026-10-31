@@ -27,7 +27,7 @@ p3-uni-stark = "=0.8.0"
 p3-security = "=0.8.0"
 blake3 = "1.8.7"
 # `zeroize`: the expanded decapsulation key (held by `TrialDecryptor`) wipes itself on drop.
-ml-kem = { version = "=0.3.2", features = ["zeroize"] }
+ml-kem = { version = "=0.3.3", features = ["zeroize"] }
 # Wipes the key types' secret bytes on drop (ml-kem's `zeroize` feature needs it anyway).
 zeroize = { version = "=1.9.1", default-features = false }
 chacha20poly1305 = { version = "0.11.0", features = ["alloc"] }

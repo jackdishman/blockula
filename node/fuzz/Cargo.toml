@@ -55,7 +55,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 imbl = { version = "=7.0.2", features = ["serde"] }
 borsh = { version = "=1.8.1", features = ["derive", "de_strict_order"] }
 redb = "=4.4.0"
-arc-swap = "=1.9.2"
+arc-swap = "=1.9.3"
 toml = "1.1"
 blockula-ghost = { path = "../ghost", version = "=0.1.0" }
 
