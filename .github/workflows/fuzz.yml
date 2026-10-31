@@ -52,7 +52,7 @@ jobs:
         with: { persist-credentials: false }
       - name: Rust toolchain (rust-toolchain.toml)
         run: rustup toolchain install && rustc --version
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: |
             node/fuzz
@@ -84,7 +84,7 @@ jobs:
       - name: Rust toolchains (rust-toolchain.toml, and the pinned nightly)
         run: rustup toolchain install && rustup toolchain install "$FUZZ_NIGHTLY" --profile minimal && rustc "+$FUZZ_NIGHTLY" --version
       # One shared cache of the instrumented dependencies (identical for every target).
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with: { workspaces: node/fuzz, shared-key: fuzz-nightly, save-if: "${{ matrix.target == 'cblock' }}" }
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked --version 0.13.2
@@ -169,7 +169,7 @@ jobs:
       - name: Rust toolchains (rust-toolchain.toml, and the pinned nightly)
         run: rustup toolchain install && rustup toolchain install "$FUZZ_NIGHTLY" --profile minimal && rustc "+$FUZZ_NIGHTLY" --version
       # One shared cache of the instrumented dependencies (identical for every target).
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with: { workspaces: node/vm/fuzz, shared-key: fuzz-vm-nightly, save-if: "${{ matrix.target == 'program_validate' }}" }
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked --version 0.13.2
