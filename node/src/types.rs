@@ -642,6 +642,16 @@ impl GhostBundle {
     }
 }
 
+/// `hex::decode`, answering canonical lowercase hex (the only kind a tx that passes
+/// `check_format` carries) without it: [`crypto::decode_lower_hex`] gives the same bytes, and
+/// anything else goes to `hex::decode` for its bytes or its error.
+fn decode_hex(h: &str) -> Result<Vec<u8>, hex::FromHexError> {
+    match crypto::decode_lower_hex(h) {
+        Some(bytes) => Ok(bytes),
+        None => hex::decode(h),
+    }
+}
+
 /// Strings carry a u16 length. Longer ones can't occur in a valid tx: `check_format` caps the
 /// whole tx at `MAX_TX_BYTES` (counted on the real lengths) before anything relies on them.
 fn put_str(out: &mut Vec<u8>, s: &str) {
@@ -1877,7 +1887,7 @@ impl Tx {
     /// [`Tx::from_bytes`] is its strict inverse. Only txs that pass [`Tx::check_format`]
     /// round-trip (malformed hex is written as zeros).
     pub fn to_bytes(&self) -> Vec<u8> {
-        let raw = |h: &str| hex::decode(h).unwrap_or_else(|_| vec![0; h.len() / 2]);
+        let raw = |h: &str| decode_hex(h).unwrap_or_else(|_| vec![0; h.len() / 2]);
         let mut out = self.signing_bytes();
         out.extend_from_slice(&raw(&self.public_key));
         out.extend_from_slice(&raw(&self.signature));
@@ -1916,8 +1926,8 @@ impl Tx {
                 valid_until: r.u64()?,
                 action: Action::decode(&mut r)?,
                 memo: r.str("memo", MAX_MEMO)?,
-                public_key: hex::encode(r.take(crypto::PUBLIC_KEY_LEN)?),
-                signature: hex::encode(r.take(crypto::SIGNATURE_LEN)?),
+                public_key: crypto::encode_lower_hex(r.take(crypto::PUBLIC_KEY_LEN)?),
+                signature: crypto::encode_lower_hex(r.take(crypto::SIGNATURE_LEN)?),
             };
             if tx.action.is_unsigned() {
                 bail!("private transfers and unshields are unsigned: they travel in the BLOCKULA_GHOST_V1 form");
@@ -1931,10 +1941,21 @@ impl Tx {
         if bytes.len() > max {
             bail!("transaction too large ({} bytes, max {max})", bytes.len());
         }
-        if tx.to_bytes() != bytes {
+        if !tx.writes_as(bytes) {
             bail!("non-canonical transaction encoding");
         }
         Ok(tx)
+    }
+
+    /// Whether [`Tx::to_bytes`] writes exactly `bytes`, for a tx that [`Tx::from_bytes`] has just
+    /// read from them (so that nothing trails its key and signature), without writing them out
+    /// again. `to_bytes` writes the signing bytes, then the key and signature decoded from the
+    /// hex this tx holds, and `from_bytes` made that hex from the last bytes of `bytes` (a ghost
+    /// tx has neither), which decode back to themselves. So the two are equal exactly when the
+    /// signing bytes are what comes before those last bytes.
+    fn writes_as(&self, bytes: &[u8]) -> bool {
+        let tail = self.public_key.len() / 2 + self.signature.len() / 2;
+        bytes.len().checked_sub(tail).is_some_and(|body| self.signing_bytes() == bytes[..body])
     }
 
     /// The codec's size bound for this tx: [`MAX_GHOST_TX_BYTES`] for one carrying a ghost
@@ -2018,7 +2039,7 @@ impl Tx {
     /// (e.g. uppercase) can't produce a different id for the same tx.
     pub fn id(&self) -> String {
         let mut b = self.signing_bytes();
-        match hex::decode(&self.signature) {
+        match decode_hex(&self.signature) {
             Ok(sig) => b.extend_from_slice(&sig),
             Err(_) => b.extend_from_slice(self.signature.as_bytes()),
         }
@@ -3128,6 +3149,441 @@ pub(crate) mod tests {
         )
     }
 
+    // `Tx::check_format`, `to_bytes`, `from_bytes` and `id` were made a good deal cheaper (one
+    // decode of the key and the signature, no second one, no re-encoding and no hex crate for the
+    // lowercase hex a valid tx has). Nothing may change for any input: not what is accepted, not
+    // the error text, not the bytes, not the id. The old functions follow as they were before
+    // that change, and the tests hold the new ones to their answers.
+
+    /// `crypto::is_lower_hex` as it was (`all`, which stops at the first bad byte), word for word.
+    #[allow(clippy::manual_is_multiple_of)]
+    fn before_is_lower_hex(s: &str) -> bool {
+        s.len() % 2 == 0 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+
+    /// The four functions as they were before, word for word but for each one's calls of the
+    /// others (and of `is_lower_hex`), which are to these copies.
+    impl Tx {
+        fn before_to_bytes(&self) -> Vec<u8> {
+            let raw = |h: &str| hex::decode(h).unwrap_or_else(|_| vec![0; h.len() / 2]);
+            let mut out = self.signing_bytes();
+            out.extend_from_slice(&raw(&self.public_key));
+            out.extend_from_slice(&raw(&self.signature));
+            out
+        }
+
+        fn before_from_bytes(bytes: &[u8]) -> Result<Tx> {
+            if bytes.len() > MAX_GHOST_TX_BYTES {
+                bail!("transaction too large ({} bytes, max {MAX_GHOST_TX_BYTES})", bytes.len());
+            }
+            let mut r = Reader { buf: bytes };
+            let tx = if bytes.starts_with(GHOST_TX_DOMAIN) {
+                r.take(GHOST_TX_DOMAIN.len())?;
+                let (chain_id, genesis_hash) = (r.str("chain_id", MAX_CHAIN_ID)?, hex::encode(r.take(32)?));
+                let (fee, tip, valid_until) = (r.u64()?, r.u64()?, r.u64()?);
+                let action = Action::decode(&mut r)?;
+                if !action.is_unsigned() {
+                    bail!("only private transfers and unshields travel unsigned");
+                }
+                Tx { chain_id, genesis_hash, from: String::new(), nonce: 0, fee, tip, valid_until, action, memo: String::new(), public_key: String::new(), signature: String::new() }
+            } else {
+                if r.take(TX_DOMAIN.len())? != TX_DOMAIN {
+                    bail!("not a v3 transaction");
+                }
+                let tx = Tx {
+                    chain_id: r.str("chain_id", MAX_CHAIN_ID)?,
+                    genesis_hash: hex::encode(r.take(32)?),
+                    from: r.str("from", MAX_ADDRESS)?,
+                    nonce: r.u64()?,
+                    fee: r.u64()?,
+                    tip: r.u64()?,
+                    valid_until: r.u64()?,
+                    action: Action::decode(&mut r)?,
+                    memo: r.str("memo", MAX_MEMO)?,
+                    public_key: hex::encode(r.take(crypto::PUBLIC_KEY_LEN)?),
+                    signature: hex::encode(r.take(crypto::SIGNATURE_LEN)?),
+                };
+                if tx.action.is_unsigned() {
+                    bail!("private transfers and unshields are unsigned: they travel in the BLOCKULA_GHOST_V1 form");
+                }
+                tx
+            };
+            if !r.buf.is_empty() {
+                bail!("{} trailing bytes after the transaction", r.buf.len());
+            }
+            let max = tx.max_bytes();
+            if bytes.len() > max {
+                bail!("transaction too large ({} bytes, max {max})", bytes.len());
+            }
+            if tx.before_to_bytes() != bytes {
+                bail!("non-canonical transaction encoding");
+            }
+            Ok(tx)
+        }
+
+        fn before_id(&self) -> String {
+            let mut b = self.signing_bytes();
+            match hex::decode(&self.signature) {
+                Ok(sig) => b.extend_from_slice(&sig),
+                Err(_) => b.extend_from_slice(self.signature.as_bytes()),
+            }
+            hex::encode(crypto::hash(&b))
+        }
+
+        fn before_check_format(&self) -> Result<()> {
+            let (size, max) = (self.size() as usize, self.max_bytes());
+            if size > max {
+                bail!("transaction too large ({size} bytes, max {max})");
+            }
+            if self.chain_id.len() > MAX_CHAIN_ID {
+                bail!("chain_id too long");
+            }
+            check_json_ints(&[("nonce", self.nonce), ("valid_until", self.valid_until)])?;
+            if self.genesis_hash.len() != 64 || !before_is_lower_hex(&self.genesis_hash) {
+                bail!("genesis_hash must be the chain's genesis hash (32 bytes of lowercase hex, from /api/status)");
+            }
+            if self.is_unsigned() {
+                if !self.from.is_empty() || self.nonce != 0 || !self.memo.is_empty() || !self.public_key.is_empty() || !self.signature.is_empty() {
+                    bail!("private transfers and unshields are unsigned (their proof authorizes them): `from`, `memo`, `public_key` and `signature` must be empty and `nonce` 0");
+                }
+            } else {
+                if !crypto::is_address(&self.from) {
+                    bail!("`from` must be a lowercase address (boo1… or tboo1…)");
+                }
+                if self.memo.len() > MAX_MEMO {
+                    bail!("memo too long (max {MAX_MEMO} bytes)");
+                }
+                if !before_is_lower_hex(&self.public_key) || self.public_key.len() != crypto::PUBLIC_KEY_LEN * 2 {
+                    bail!("public_key must be {} bytes of lowercase hex", crypto::PUBLIC_KEY_LEN);
+                }
+                if !before_is_lower_hex(&self.signature) || self.signature.len() != crypto::SIGNATURE_LEN * 2 {
+                    bail!("signature must be {} bytes of lowercase hex", crypto::SIGNATURE_LEN);
+                }
+            }
+            self.action.check_format(false)?;
+            // Whatever the wire form can't carry exactly (e.g. `familiar_key: Some("")`) is invalid.
+            match Tx::before_from_bytes(&self.before_to_bytes()) {
+                Ok(back) if back == *self => Ok(()),
+                Ok(_) => bail!("transaction doesn't survive the wire encoding (an optional field is empty?)"),
+                Err(e) => Err(e.context("transaction doesn't survive the wire encoding")),
+            }
+        }
+    }
+
+    /// A result that compares: `Ok`, or the error's whole chain of messages (what `{:#}` prints).
+    fn outcome<T>(r: Result<T>) -> Result<T, Vec<String>> {
+        r.map_err(|e| e.chain().map(|c| c.to_string()).collect())
+    }
+
+    /// What a failure says about a tx (not all of it: a ghost tx is 135 KiB).
+    fn brief(tx: &Tx) -> String {
+        format!("a {} tx (from {:?}, key {} and signature {} characters, genesis hash {:?}, chain {} characters, memo {} bytes)", tx.action.kind(), tx.from, tx.public_key.len(), tx.signature.len(), tx.genesis_hash, tx.chain_id.len(), tx.memo.len())
+    }
+
+    /// `Err(what differs)` unless the new `check_format`, `to_bytes`, `id` and `from_bytes` (of the
+    /// wire form `to_bytes` writes) answer as the old ones do.
+    fn same_as_before(tx: &Tx) -> Result<(), String> {
+        let (new, old) = (outcome(tx.check_format()), outcome(tx.before_check_format()));
+        if new != old {
+            return Err(format!("check_format says {new:?}, it said {old:?}, for {}", brief(tx)));
+        }
+        let wire = tx.before_to_bytes();
+        if tx.to_bytes() != wire {
+            return Err(format!("to_bytes writes other bytes for {}", brief(tx)));
+        }
+        if tx.id() != tx.before_id() {
+            return Err(format!("id is {}, it was {}, for {}", tx.id(), tx.before_id(), brief(tx)));
+        }
+        same_from_bytes_as_before(&wire)
+    }
+
+    /// `Err(what differs)` unless `Tx::from_bytes(bytes)` answers as the old one: the same tx, or
+    /// the same error with the same context.
+    fn same_from_bytes_as_before(bytes: &[u8]) -> Result<(), String> {
+        let (new, old) = (outcome(Tx::from_bytes(bytes)), outcome(Tx::before_from_bytes(bytes)));
+        if new == old { Ok(()) } else { Err(format!("from_bytes of {} bytes says {:?}, it said {:?}", bytes.len(), new.map(|tx| brief(&tx)), old.map(|tx| brief(&tx)))) }
+    }
+
+    /// The address of the key from `fill`.
+    fn address_of(fill: u8) -> String {
+        crypto::Keys::from_seed([fill; 32]).address()
+    }
+
+    /// `n` bytes of hex that aren't all alike, from `fill`.
+    fn pattern(fill: u8, n: usize) -> String {
+        hex::encode((0..n).map(|i| fill.wrapping_add(i as u8) ^ (i >> 8) as u8).collect::<Vec<u8>>())
+    }
+
+    /// `hex` gone wrong in one way, by `op` (0 leaves it alone): all uppercase, one uppercase
+    /// digit, an odd length (a digit short or long), a character `bad` where it should be a digit,
+    /// a byte short or long, empty, a `0x` prefix, a trailing space, half of it, twice it, its
+    /// digits all `0`.
+    fn vary_hex(hex: &str, op: u8, at: usize, bad: char) -> String {
+        let at = at % hex.len().max(1);
+        let short = |n: usize| hex[..hex.len().saturating_sub(n)].to_string();
+        match op {
+            1 => hex.to_uppercase(),
+            2 => format!("{}{}{}", &hex[..at], hex[at..].chars().next().map(|c| c.to_ascii_uppercase()).unwrap_or('A'), hex.get(at + 1..).unwrap_or("")),
+            3 => short(1),
+            4 => format!("{hex}0"),
+            5 if hex.is_empty() => bad.to_string(),
+            5 => format!("{}{bad}{}", &hex[..at], &hex[at + 1..]),
+            6 => short(2),
+            7 => format!("{hex}00"),
+            8 => String::new(),
+            9 => format!("0x{hex}"),
+            10 => format!("{hex} "),
+            11 => short(hex.len() / 2),
+            12 => hex.repeat(2),
+            13 => "0".repeat(hex.len()),
+            _ => hex.to_string(),
+        }
+    }
+
+    /// Every vector action (tags 0–54 and 60–61), where one names a validator by the stand-in
+    /// address the SDK's vectors use, with a real address in its place, so that more of them pass
+    /// the format rules (what is left that doesn't is a case for the error paths).
+    fn edge_actions() -> &'static [Action] {
+        static ACTIONS: std::sync::OnceLock<Vec<Action>> = std::sync::OnceLock::new();
+        ACTIONS.get_or_init(|| {
+            let (v, w) = (address_of(31), address_of(32));
+            let all = vector_actions().into_iter().chain(v1_vector_actions()).chain(ghost_vector_actions()).chain(small_set_vector_actions());
+            all.map(|a| serde_json::from_str(&serde_json::to_string(&a).unwrap().replace("\"boo1v\"", &format!("\"{v}\"")).replace("\"boo1w\"", &format!("\"{w}\""))).unwrap()).collect()
+        })
+    }
+
+    /// A tx around `action` that passes the format rules (so that a case reaches the rule it
+    /// varies, and the wire round trip at the end), with `vary` of its fields gone wrong: by
+    /// `[genesis hash, from, memo, chain id, numbers, what an unsigned tx must leave empty]`
+    /// (0 leaves each alone) and the hex of its key and signature (`vary_hex`).
+    fn edge_tx(action: &Action, [genesis, from, memo, chain, numbers, noise]: [u8; 6], key: (u8, usize, char), sig: (u8, usize, char), fill: u8) -> Tx {
+        let real = address_of(9);
+        let mut tx = Tx { chain_id: "c".into(), genesis_hash: "ab".repeat(32), from: real.clone(), nonce: 3, fee: 1_000_000_000, tip: 0, valid_until: 500, action: action.clone(), memo: "hi".into(), public_key: pattern(fill, crypto::PUBLIC_KEY_LEN), signature: pattern(fill.wrapping_add(1), crypto::SIGNATURE_LEN) };
+        if tx.is_unsigned() {
+            tx = Tx { from: String::new(), nonce: 0, memo: String::new(), public_key: String::new(), signature: String::new(), ..tx };
+        }
+        tx.genesis_hash = match genesis {
+            1 => "AB".repeat(32),
+            2 => "ab".repeat(31),
+            3 => "ab".repeat(33),
+            4 => String::new(),
+            5 => "g".repeat(64),
+            6 => "a".repeat(63),
+            _ => tx.genesis_hash,
+        };
+        match noise {
+            1 => tx.from = real.clone(),
+            2 => tx.nonce = 1,
+            3 => tx.memo = "m".into(),
+            _ => {}
+        }
+        if !tx.is_unsigned() {
+            tx.from = match from {
+                1 => String::new(),
+                2 => real.to_uppercase(),
+                3 => "boo1from".into(),
+                4 => crypto::Keys::from_seed([9; 32]).address_with(crypto::TESTNET_HRP),
+                5 => format!("{}q", &real[..real.len() - 1]),
+                _ => tx.from,
+            };
+            tx.memo = match memo {
+                1 => String::new(),
+                2 => "m".repeat(MAX_MEMO),
+                3 => "m".repeat(MAX_MEMO + 1),
+                4 => "m".repeat(70_000),
+                5 => "é".repeat(MAX_MEMO / 2 + 1),
+                _ => tx.memo,
+            };
+        }
+        tx.chain_id = match chain {
+            1 => "c".repeat(MAX_CHAIN_ID),
+            2 => "c".repeat(MAX_CHAIN_ID + 1),
+            3 => String::new(),
+            4 => "блокула-🧛".into(),
+            5 => "c".repeat(70_000),
+            _ => tx.chain_id,
+        };
+        match numbers {
+            1 => (tx.nonce, tx.valid_until) = (MAX_JSON_INT, MAX_JSON_INT),
+            2 => tx.nonce = MAX_JSON_INT + 1,
+            3 => tx.valid_until = MAX_JSON_INT + 1,
+            4 => (tx.nonce, tx.fee, tx.tip, tx.valid_until) = (u64::MAX, u64::MAX, u64::MAX, u64::MAX),
+            _ => {}
+        }
+        tx.public_key = vary_hex(&tx.public_key, key.0, key.1, key.2);
+        tx.signature = vary_hex(&tx.signature, sig.0, sig.1, sig.2);
+        tx
+    }
+
+    const BAD_DIGITS: [char; 9] = ['g', 'G', 'z', ' ', '-', 'é', '\0', 'x', '😀'];
+
+    /// A tx of `edge_tx`'s kind, most of the time with one or two things wrong.
+    fn arb_edge_tx() -> impl Strategy<Value = Tx> {
+        let hex_op = || (prop_oneof![4 => Just(0u8), 6 => 1u8..14], any::<usize>(), prop::sample::select(BAD_DIGITS.to_vec()));
+        let field_op = || prop_oneof![5 => Just(0u8), 1 => 1u8..8];
+        (0..edge_actions().len(), [field_op(), field_op(), field_op(), field_op(), field_op(), field_op()], hex_op(), hex_op(), any::<u8>()).prop_map(|(i, parts, key, sig, fill)| edge_tx(&edge_actions()[i], parts, key, sig, fill))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1024))]
+
+        /// On any tx near enough to valid to get past the early rules (every action, the
+        /// hex of the key and signature gone wrong in each way, the other fields at their bounds), the
+        /// new `check_format`, `to_bytes`, `id` and `from_bytes` say what the old ones said.
+        #[test]
+        fn the_cheaper_functions_answer_as_before_near_valid_txs(tx in arb_edge_tx()) {
+            prop_assert_eq!(same_as_before(&tx), Ok(()));
+        }
+
+        /// The same on txs of any shape (the generator `wire_round_trip` uses, which seldom gets
+        /// past `from`), key and signature hex gone wrong in any way.
+        #[test]
+        fn the_cheaper_functions_answer_as_before_any_tx(tx in arb_tx(), key in "[0-9a-fA-Fg ]{0,40}", sig in "[0-9a-fA-Fg ]{0,40}", swap in 0u8..3) {
+            let tx = match swap {
+                0 => tx,
+                1 => Tx { public_key: key, signature: sig, ..tx },
+                _ => Tx { signature: key, ..tx },
+            };
+            prop_assert_eq!(same_as_before(&tx), Ok(()));
+        }
+
+        /// `from_bytes` on a wire form mangled at one place (a byte changed, one inserted or removed, or the
+        /// end cut off): the same tx or the same error as before.
+        #[test]
+        fn from_bytes_answers_as_before_on_mangled_wires(tx in arb_edge_tx(), at in any::<prop::sample::Index>(), byte in any::<u8>(), op in 0u8..4) {
+            let mut bytes = tx.before_to_bytes();
+            let i = at.index(bytes.len());
+            match op {
+                0 => bytes[i] = byte,
+                1 => bytes.insert(i, byte),
+                2 => { bytes.remove(i); }
+                _ => bytes.truncate(i),
+            }
+            prop_assert_eq!(same_from_bytes_as_before(&bytes), Ok(()));
+        }
+
+        /// `from_bytes` on bytes with nothing to do with a tx, and on a real one's start followed by them.
+        #[test]
+        fn from_bytes_answers_as_before_on_noise(noise in proptest::collection::vec(any::<u8>(), 0..300), domain in 0u8..3) {
+            let bytes = match domain {
+                0 => noise,
+                1 => [TX_DOMAIN, &noise].concat(),
+                _ => [GHOST_TX_DOMAIN, &noise].concat(),
+            };
+            prop_assert_eq!(same_from_bytes_as_before(&bytes), Ok(()));
+        }
+
+        /// An id is the same for any string in the signature's place: hex of any case or length,
+        /// or not hex at all.
+        #[test]
+        fn id_answers_as_before_for_any_signature_string(sig in "\\PC{0,60}", tx in arb_edge_tx()) {
+            let tx = Tx { signature: sig, ..tx };
+            prop_assert_eq!(tx.id(), tx.before_id());
+        }
+    }
+
+    /// The same cases that matter most, listed (so that the mutations the change was checked with each
+    /// have an input that catches them, and the property's luck isn't all there is): every action
+    /// with the key and then the signature gone wrong in each way, and both together on a transfer and
+    /// a private transfer. Counts what the old function said, so that the test fails
+    /// if it stops reaching a rule.
+    #[test]
+    fn the_cheaper_functions_answer_as_before_on_every_listed_edge() {
+        let mut said: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut tags = std::collections::BTreeSet::new();
+        let ops = (0..14).map(|op| (op, 1_000_003 * usize::from(op) + 7, BAD_DIGITS[usize::from(op) % BAD_DIGITS.len()])).collect::<Vec<_>>();
+        let none = (0u8, 0, 'g');
+        for action in edge_actions() {
+            tags.insert(action.to_bytes()[0]);
+            let mut cases: Vec<Tx> = vec![];
+            for &op in &ops {
+                cases.push(edge_tx(action, [0; 6], op, none, 5));
+                cases.push(edge_tx(action, [0; 6], none, op, 6));
+            }
+            if ["transfer", "private_transfer"].contains(&action.kind()) {
+                for &key in &ops[1..] {
+                    cases.extend(ops[1..].iter().map(|&sig| edge_tx(action, [0; 6], key, sig, 7)));
+                }
+            }
+            for field in 0..6 {
+                for value in 1..8 {
+                    let mut parts = [0; 6];
+                    parts[field] = value;
+                    cases.push(edge_tx(action, parts, none, none, 8));
+                }
+            }
+            // Two of the other fields wrong at once, so that the rule that speaks first is the one
+            // that always did (the order of the checks is part of what they say).
+            if ["transfer", "private_transfer"].contains(&action.kind()) {
+                for (first, second) in (0..6).flat_map(|a| (a + 1..6).map(move |b| (a, b))) {
+                    for (x, y) in (1..8).flat_map(|x| (1..8).map(move |y| (x, y))) {
+                        let mut parts = [0; 6];
+                        (parts[first], parts[second]) = (x, y);
+                        cases.push(edge_tx(action, parts, (x, 3, 'g'), (y, 5, 'z'), 9));
+                    }
+                }
+            }
+            for tx in cases {
+                if let Err(differs) = same_as_before(&tx) {
+                    panic!("{differs}");
+                }
+                *said.entry(match outcome(tx.before_check_format()) {
+                    Ok(()) => "accepted".to_string(),
+                    Err(e) => e[0].clone(),
+                })
+                .or_default() += 1;
+            }
+        }
+        assert_eq!(tags, (0..=54).chain(60..=61).collect(), "every action tag (v1's 30–49 among them)");
+        let said_with = |start: &str| said.iter().filter(|(k, _)| k.starts_with(start)).map(|(_, n)| n).sum::<usize>();
+        for (what, at_least) in [
+            ("accepted", 1_000),
+            ("public_key must be", 200),
+            ("signature must be", 200),
+            ("genesis_hash must be", 20),
+            ("`from` must be a lowercase address", 20),
+            ("memo too long", 20),
+            ("chain_id too long", 20),
+            ("transaction too large", 20),
+            ("private transfers and unshields are unsigned", 20),
+            ("nonce must be at most", 2),
+            ("valid_until must be at most", 2),
+        ] {
+            assert!(said_with(what) >= at_least, "the old check_format said `{what}` {} times, expected {at_least}: {said:#?}", said_with(what));
+        }
+    }
+
+    /// `writes_as` says what writing the tx out again would, on bytes the tx could have been read
+    /// from (a body, then its key and signature) whose body is right and wrong in each way.
+    #[test]
+    fn writes_as_says_what_to_bytes_would() {
+        let (mut yes, mut no) = (0, 0);
+        for action in edge_actions() {
+            let tx = edge_tx(action, [0; 6], (0, 0, 'g'), (0, 0, 'g'), 3);
+            let signing = tx.signing_bytes();
+            let (pk, sig) = (hex::decode(&tx.public_key).unwrap(), hex::decode(&tx.signature).unwrap());
+            let mut flipped = signing.clone();
+            flipped[signing.len() / 2] ^= 1;
+            let mut flipped_first = signing.clone();
+            flipped_first[0] ^= 0x80;
+            let mut flipped_last = signing.clone();
+            *flipped_last.last_mut().unwrap() ^= 1;
+            let (mut longer, mut shorter) = (signing.clone(), signing.clone());
+            longer.push(0);
+            shorter.pop();
+            for body in [signing, flipped, flipped_first, flipped_last, longer, shorter, vec![], vec![0; 3]] {
+                let bytes = [body, pk.clone(), sig.clone()].concat();
+                let would = tx.before_to_bytes() == bytes;
+                assert_eq!(tx.writes_as(&bytes), would, "{}", brief(&tx));
+                if would { yes += 1 } else { no += 1 }
+            }
+        }
+        let n = edge_actions().len();
+        assert_eq!((yes, no), (n, 7 * n), "the body as written is the wire form, and no other is");
+        // Too short to hold the key and signature it is said to end with: not the wire form.
+        assert!(!edge_tx(&edge_actions()[0], [0; 6], (0, 0, 'g'), (0, 0, 'g'), 3).writes_as(&[0; 10]));
+    }
+
     proptest! {
         #[test]
         fn wire_round_trip(tx in arb_tx()) {
@@ -3149,6 +3605,49 @@ pub(crate) mod tests {
             if let Ok(parsed) = Tx::from_bytes(&bytes) {
                 prop_assert_eq!(parsed.to_bytes(), bytes);
             }
+        }
+    }
+
+    /// A signed transfer (the v1 tx every node sees most) and a signed delegation, with a real key
+    /// and signature, so each has the 1,952-byte key and 3,309-byte signature a block carries.
+    fn timing_txs() -> Vec<(&'static str, Tx)> {
+        let keys = crypto::Keys::from_seed([5; 32]);
+        let tx = |action| Tx { chain_id: "blockula-1".into(), genesis_hash: "ab".repeat(32), from: keys.address(), nonce: 3, fee: 1_000_000, tip: 0, valid_until: 500, action, memo: String::new(), public_key: String::new(), signature: String::new() }.sign(&keys);
+        vec![
+            ("a v1 transfer", tx(Action::Transfer { to: "alice.boo".into(), amount: 1_000_000_000 })),
+            ("a delegation", tx(Action::Delegate { validator: keys.address(), amount: 5_000_000_000 })),
+        ]
+    }
+
+    /// Times `Tx::check_format` and `Tx::id` (microseconds a call: the median of 101 batches of
+    /// 100 calls, and the 10th and 90th percentiles). Run it on a quiet
+    /// machine, back to back before and after a change:
+    /// `cargo test --release --locked types::tests::timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a timing: cargo test --release --locked types::tests::timing -- --ignored --nocapture"]
+    fn timing_of_check_format_and_id() {
+        fn per_call_us(mut f: impl FnMut()) -> (f64, f64, f64) {
+            for _ in 0..200 {
+                f();
+            }
+            let mut batches: Vec<f64> = (0..101)
+                .map(|_| {
+                    let started = std::time::Instant::now();
+                    for _ in 0..100 {
+                        f();
+                    }
+                    started.elapsed().as_secs_f64() * 1e6 / 100.0
+                })
+                .collect();
+            batches.sort_by(f64::total_cmp);
+            (batches[50], batches[10], batches[90])
+        }
+        for (name, tx) in timing_txs() {
+            tx.check_format().unwrap();
+            let (m, lo, hi) = per_call_us(|| std::hint::black_box(&tx).check_format().unwrap());
+            println!("timing: {name} ({} bytes): check_format {m:.1} us (p10 {lo:.1}, p90 {hi:.1})", tx.size());
+            let (m, lo, hi) = per_call_us(|| drop(std::hint::black_box(std::hint::black_box(&tx).id())));
+            println!("timing: {name} ({} bytes): id {m:.1} us (p10 {lo:.1}, p90 {hi:.1})", tx.size());
         }
     }
 

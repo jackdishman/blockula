@@ -14,7 +14,7 @@
   "dependencies": {
     "@blockula/sdk": "^0.5.0",
     "@noble/hashes": "2.4.0",
-    "next": "^16.4.1",
+    "next": "^16.4.2",
     "react": "^19.3.1",
     "react-dom": "^19.3.1"
   },
