@@ -1,6 +1,6 @@
 {
   "name": "@blockula/sdk",
-  "version": "0.5.1",
+  "version": "1.0.0",
   "description": "\ud83e\udddb TypeScript SDK for Blockula: wallets with post-quantum signatures (ML-DSA-65), .boo names and transfers. Experimental software, provided as is under MIT.",
   "type": "module",
   "main": "dist/index.js",
