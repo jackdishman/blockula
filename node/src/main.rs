@@ -24,6 +24,8 @@ mod node;
 mod params;
 mod pq;
 mod poc;
+mod program_cli;
+mod programs;
 mod protection;
 mod release_cli;
 mod replay;
@@ -112,6 +114,16 @@ struct Net {
     /// Longest an HTTP request may take, in seconds
     #[arg(long, default_value_t = api::HTTP_TIMEOUT.as_secs())]
     http_timeout_secs: u64,
+    /// Serve `POST /api/program/{address}/view` (a program's read-only methods, run on this node
+    /// for whoever asks) from a validator. Full nodes serve it without the flag; a validator's
+    /// HTTP is private by convention, and a view runs a VM for the caller (docs/PROGRAMS-V0.md §8.2)
+    #[arg(long)]
+    program_views: bool,
+    /// The most fuel one program view may use (default: the transaction maximum; at most what a
+    /// transaction may declare, 20,000,000). A view never gets more than the chain's current
+    /// `program_max_tx_fuel` either, so lowering that parameter lowers this at once
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=blockula_vm::meter::MAX_TX_FUEL))]
+    view_max_fuel: Option<u64>,
     /// Execute this height, then stop: validators exit (code 10) and don't vote past it, full
     /// nodes keep serving reads. For coordinated restarts and incidents (docs/OPERATIONS.md)
     #[arg(long)]
@@ -133,6 +145,13 @@ enum Cmd {
         /// Wipe the dev chain and start fresh
         #[arg(long)]
         reset: bool,
+        /// Start a new dev chain with programs on from block 1 (protocol v2 and the `programs`
+        /// feature in its genesis), to upload, create, call and view WebAssembly programs with
+        /// `blockula program`. A chain already made without it keeps its genesis: add --reset.
+        /// Programs are experimental and not yet audited: a chain made with them now may need to be
+        /// recreated after an update
+        #[arg(long)]
+        programs: bool,
         #[command(flatten)]
         net: Net,
     },
@@ -182,6 +201,13 @@ enum Cmd {
         /// open at once. For local multi-validator chains that exercise those flows end to end.
         #[arg(long)]
         dev_durations: bool,
+        /// Programs on from block 1: protocol v2 and the `programs` feature in the genesis, so
+        /// anyone can upload, create and call WebAssembly programs (`blockula program`). Without
+        /// it the chain starts as before, and governance can switch programs on later. Programs are
+        /// experimental and not yet audited: a chain made with them now may need to be recreated
+        /// after an update
+        #[arg(long)]
+        programs: bool,
     },
     /// Run a validator (a home with validator.key) or a joined full node
     Run {
@@ -279,6 +305,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: contrib_cli::NameCmd,
     },
+    /// 🧩 Programs: upload, create, call and view WebAssembly programs (on a chain that has them on)
+    Program {
+        #[command(subcommand)]
+        cmd: program_cli::ProgramCmd,
+    },
     /// 🥩 Stake: delegate to validator pools, unbond, withdraw
     Stake {
         #[command(subcommand)]
@@ -340,7 +371,7 @@ fn net_opts(net: Net, http_port: Option<u16>, p2p_preset: Option<String>, epheme
         header: net.client_ip_header.map(|h| h.to_lowercase()),
         hops: net.client_ip_hops as usize,
     };
-    let http = node::HttpOpts { read_rps: net.read_rps, read_burst: net.read_burst, timeout: std::time::Duration::from_secs(net.http_timeout_secs.max(1)) };
+    let http = node::HttpOpts { read_rps: net.read_rps, read_burst: net.read_burst, timeout: std::time::Duration::from_secs(net.http_timeout_secs.max(1)), program_views: net.program_views, view_max_fuel: net.view_max_fuel };
     let pruning = match (net.archive, net.prune_blocks) {
         (true, _) => node::Pruning::Archive,
         (_, Some(n)) => node::Pruning::Keep(n),
@@ -358,7 +389,7 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     match Cli::parse().cmd {
-        Cmd::Dev { port, reset, net } => {
+        Cmd::Dev { port, reset, programs, net } => {
             let home = blockula_dir().join("dev");
             let stale = home.join("genesis.json").exists() && (chain::Genesis::load(&home.join("genesis.json")).is_err() || node::dev_is_stale(&home));
             if reset || stale {
@@ -370,12 +401,25 @@ fn main() -> Result<()> {
             if !home.join("genesis.json").exists() {
                 // One-minute epochs: unbonding, jail, Séances and the beacon move in minutes.
                 let dev = SummonOpts { epoch_blocks: 60, ..SummonOpts::new("blockula-dev", 1) };
+                let dev = if programs { dev.with_programs() } else { dev };
                 let params = params::ChainParams::dev_overrides(dev.block_time_ms, dev.epoch_blocks);
                 Chain::summon(&home, &SummonOpts { http_port: Some(port), contribution: Some(poc::PocTimes::dev(dev.block_time_ms)), params, ..dev })?;
             }
-            node::run_validator(home, net_opts(net, Some(port), Some("local".into()), true))
+            let programs_on = chain::Genesis::load(&home.join("genesis.json"))?.features.iter().any(|f| f == upgrade::PROGRAMS_FEATURE);
+            if programs && !programs_on {
+                // A genesis is the chain's: asking for programs can't change one that's running.
+                anyhow::bail!("the dev chain at {} was made without programs, and a chain's genesis can't change; start a new one with `blockula dev --programs --reset`", home.display());
+            }
+            if programs_on {
+                println!("🧩 Programs are on from block 1: `blockula program --help` uploads, creates, calls and views them. Programs are experimental and not yet audited: a chain made with them now may need to be recreated after an update");
+            }
+            // The dev validator is the one node, and its HTTP is the RPC: it serves program views
+            // (`/api/program/{address}/view`) as a full node would, with no --program-views.
+            let mut opts = net_opts(net, Some(port), Some("local".into()), true);
+            opts.http.program_views = true;
+            node::run_validator(home, opts)
         }
-        Cmd::Summon { chain_id, home, no_faucet, block_time_ms, validators, admins, epoch_blocks, host, min_bond, seance_blocks, claim_maturity_blocks, vesting_blocks, address_prefix, dev_durations } => {
+        Cmd::Summon { chain_id, home, no_faucet, block_time_ms, validators, admins, epoch_blocks, host, min_bond, seance_blocks, claim_maturity_blocks, vesting_blocks, address_prefix, dev_durations, programs } => {
             let home = home.unwrap_or_else(|| blockula_dir().join(&chain_id));
             if home.join("genesis.json").exists() {
                 anyhow::bail!("{} already has a chain", home.display());
@@ -398,7 +442,10 @@ fn main() -> Result<()> {
                 address_prefix,
                 params: if dev_durations { params::ChainParams::dev_overrides(block_time_ms, epoch_blocks) } else { Default::default() },
                 host: host.clone(),
+                upgrades: vec![],
+                features: vec![],
             };
+            let opts = if programs { opts.with_programs() } else { opts };
             let homes = Chain::summon(&home, &opts)?;
             let g = chain::Genesis::load(&homes[0].join("genesis.json"))?;
             println!("🪦 Summoned chain `{chain_id}` with {validators} validator{} at {}", if validators == 1 { "" } else { "s" }, home.display());
@@ -413,6 +460,9 @@ fn main() -> Result<()> {
             }
             println!("   genesis hash: {}  (joiners can pin it with --genesis-hash)", hex::encode(consensus::genesis_block(&g).digest_bytes()));
             println!("   a block every {} · epochs: {} blocks (about {} min) · min self-bond: {} · validator admins: {}", fmt_block_time(block_time_ms), g.epoch_blocks, g.epoch_blocks.saturating_mul(block_time_ms).div_ceil(60_000), types::fmt_fang(g.chain_params()?.min_self_bond), g.validator_admins.join(", "));
+            if programs {
+                println!("   programs are on from block 1 (protocol v2): `blockula program` uploads, creates, calls and views them. Full nodes serve program views; a validator serves them only with --program-views. Programs are experimental and not yet audited: a chain made with them now may need to be recreated after an update");
+            }
             if dev_durations {
                 let cp = g.chain_params()?;
                 println!("   dev durations: unbonding {} blocks · voting {} · timelock {} · deposit {}", cp.unbonding_blocks, cp.voting_blocks, cp.timelock_blocks, types::fmt_fang(cp.proposal_deposit));
@@ -487,6 +537,7 @@ fn main() -> Result<()> {
         Cmd::Gov { cmd } => gov_cli::gov(cmd, &blockula_dir()),
         Cmd::Multisig { cmd } => gov_cli::multisig(cmd, &blockula_dir()),
         Cmd::Name { cmd } => contrib_cli::name(cmd, &blockula_dir()),
+        Cmd::Program { cmd } => program_cli::program(cmd, &blockula_dir()),
         Cmd::Stake { cmd } => contrib_cli::stake(cmd, &blockula_dir()),
         Cmd::Keygen { prefix } => {
             anyhow::ensure!(crypto::is_prefix(&prefix), "prefix must be one of {:?}", crypto::KNOWN_PREFIXES);
@@ -546,6 +597,44 @@ mod cli_tests {
         assert_eq!(summon(&["--block-time-ms", "1000"]), (1_000, 600, None), "the old default, as the test scripts pin it");
         assert_eq!(summon(&["--epoch-blocks", "20", "--host", "100.64.0.7"]), (5_000, 20, Some("100.64.0.7".into())));
         assert_eq!((super::fmt_block_time(5_000), super::fmt_block_time(1_500)), ("5 s".to_string(), "1500 ms".to_string()));
+    }
+
+    /// `--programs` asks `dev` and `summon` for a chain with programs on from block 1 (WBS S6b), and
+    /// `--program-views` and `--view-max-fuel` reach the HTTP options (the view fuel is at most what a
+    /// transaction may declare, and at least 1).
+    #[test]
+    fn the_programs_flags_parse() {
+        use clap::Parser;
+        let parse = |args: &[&str]| super::Cli::try_parse_from(["blockula"].iter().chain(args));
+        match parse(&["dev", "--programs"]).unwrap().cmd {
+            super::Cmd::Dev { programs, reset, .. } => assert!(programs && !reset),
+            _ => unreachable!(),
+        }
+        match parse(&["dev"]).unwrap().cmd {
+            super::Cmd::Dev { programs, .. } => assert!(!programs, "off unless asked"),
+            _ => unreachable!(),
+        }
+        match parse(&["summon", "mychain", "--programs"]).unwrap().cmd {
+            super::Cmd::Summon { programs, .. } => assert!(programs),
+            _ => unreachable!(),
+        }
+        match parse(&["summon", "mychain"]).unwrap().cmd {
+            super::Cmd::Summon { programs, .. } => assert!(!programs),
+            _ => unreachable!(),
+        }
+        let http = |args: &[&str]| match parse(args).unwrap().cmd {
+            super::Cmd::Run { net, port, p2p_preset, .. } => super::net_opts(net, port, p2p_preset, false).http,
+            _ => unreachable!(),
+        };
+        let h = http(&["run", "--home", "h"]);
+        assert!(!h.program_views && h.view_max_fuel.is_none(), "a validator serves no views unless told to");
+        let h = http(&["run", "--home", "h", "--program-views", "--view-max-fuel", "123456"]);
+        assert!(h.program_views && h.view_max_fuel == Some(123_456));
+        let max = blockula_vm::meter::MAX_TX_FUEL.to_string();
+        assert!(parse(&["run", "--home", "h", "--view-max-fuel", &max]).is_ok());
+        for bad in ["0", "20000001", "-1", "lots"] {
+            assert!(parse(&["run", "--home", "h", "--view-max-fuel", bad]).is_err(), "--view-max-fuel {bad}");
+        }
     }
 
     /// D10: the tagline makes no "never dies" claim.

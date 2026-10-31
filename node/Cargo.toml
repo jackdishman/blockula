@@ -60,6 +60,10 @@ toml = "1.1"
 # Ghost Mode's cryptographic core (keys, notes, the commitment tree, the Action STARK on Plonky3,
 # note encryption): its own workspace, pinned there. Disabled at genesis (src/ghost.rs).
 blockula-ghost = { path = "ghost", version = "=0.1.0" }
+# Programs (protocol v2): the VM, upload validation, the host ABI, metering and the storage
+# overlay, on soroban-wasmi: its own workspace, pinned there. Dormant until governance switches
+# the `programs` feature on (src/programs).
+blockula-vm = { path = "vm", version = "=0.1.0" }
 
 # ML-DSA and consensus are slow unoptimized; keep our crate debuggable but optimize deps.
 [profile.dev.package."*"]
@@ -118,6 +122,24 @@ overflow-checks = true
 [profile.release.package.p3-uni-stark]
 overflow-checks = true
 [profile.release.package.p3-util]
+overflow-checks = true
+
+# Programs run untrusted code: an arithmetic overflow in the VM or the engine must panic (which
+# the VM catches and reports as a node fault, never a transaction outcome) instead of wrapping.
+# Only this workspace's profiles apply to them (node/vm/README.md, "Overflow checks"), so they're
+# listed here; `programs::tests::release_profile_covers_the_vm` fails if one in Cargo.lock is
+# missing. `panic` stays "unwind": the VM's catch_unwind relies on it.
+[profile.release.package.blockula-vm]
+overflow-checks = true
+[profile.release.package.soroban-wasmi]
+overflow-checks = true
+[profile.release.package.wasmi_arena]
+overflow-checks = true
+[profile.release.package.wasmi_core]
+overflow-checks = true
+[profile.release.package.wasmparser]
+overflow-checks = true
+[profile.release.package.wasmparser-nostd]
 overflow-checks = true
 
 [dev-dependencies]

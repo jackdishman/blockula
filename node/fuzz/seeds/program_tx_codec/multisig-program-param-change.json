@@ -1,0 +1,1 @@
+{"type":"multisig_propose","action":{"type":"propose","kind":{"type":"param_change","key":"program_max_tx_fuel","value":"5000000"},"deposit":"1000000000000","title":"Lower the fuel a program call may sign for","url":""}}

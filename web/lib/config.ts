@@ -260,4 +260,5 @@ export const nodeExplorer = {
   tx: (id: string) => `${RPC}/#/tx/${id}`,
   account: (nameOrAddress: string) => `${RPC}/#/account/${encodeURIComponent(nameOrAddress)}`,
   block: (height: number) => `${RPC}/#/block/${height}`,
+  program: (address: string) => `${RPC}/#/program/${encodeURIComponent(address)}`,
 };

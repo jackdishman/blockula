@@ -1,0 +1,56 @@
+{
+  "format": 1,
+  "methods": [
+    {
+      "name": "send",
+      "kind": "call",
+      "payable": false,
+      "args": [
+        {
+          "name": "hops",
+          "type": {
+            "vec": [
+              "address",
+              8
+            ]
+          }
+        },
+        {
+          "name": "token",
+          "type": "address"
+        },
+        {
+          "name": "to",
+          "type": "address"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ],
+      "returns": "u64"
+    },
+    {
+      "name": "try_send",
+      "kind": "call",
+      "payable": false,
+      "args": [
+        {
+          "name": "token",
+          "type": "address"
+        },
+        {
+          "name": "to",
+          "type": "address"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ],
+      "returns": {
+        "bytes": 268
+      }
+    }
+  ]
+}

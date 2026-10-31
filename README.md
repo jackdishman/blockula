@@ -44,6 +44,8 @@ Both need Node 20 or newer. The MCP server uses the public testnet unless its co
 ```bash
 curl -fsSL https://github.com/jackdishman/blockula/releases/latest/download/install.sh | sh
 blockula dev          # local chain + explorer at http://localhost:7070
+# blockula dev --programs   # a new dev chain with WebAssembly programs on from block 1 (experimental,
+#                           # off by default; add --reset to replace one): docs/PROGRAMS-V0.md
 ```
 
 Prebuilt for macOS (Apple Silicon and Intel) and Linux (x64 and arm64). The script checks the version, the SHA-256 checksum, build provenance (with a logged-in `gh`) and the offline release signature (with an installed `blockula`). It's still the release's own script, though, so validators don't use it: they install and upgrade with `blockula release install vX.Y.Z`, which checks the release against the release key id they pinned at their first install and never runs the release's scripts ([OPERATIONS.md "Installing and upgrading"](docs/OPERATIONS.md#installing-and-upgrading)). Agents can call the MCP's `install_node` tool instead.
@@ -129,7 +131,7 @@ Then paste the prompt from [AGENTS.md](AGENTS.md). With no local node running, i
 same binary runs a 1-validator chain or a multi-validator network. Validators can be added and
 removed on-chain without a new genesis; the set changes at **epoch** boundaries.
 
-**To run a chain with friends on their own computers, follow [docs/LAUNCH.md](docs/LAUNCH.md):** start it with `--host <your address>` (a Tailscale address works), and they join, become validators and get approved in a few commands. A summoned chain makes a block every 5 seconds by default, which keeps an idle validator's traffic to about a fifth of 1-second blocks; `--block-time-ms 1000` makes it faster.
+**To run a chain with friends on their own computers, follow [docs/LAUNCH.md](docs/LAUNCH.md):** start it with `--host <your address>` (a Tailscale address works), and they join, become validators and get approved in a few commands. A summoned chain makes a block every 5 seconds by default, which keeps an idle validator's traffic to about a fifth of 1-second blocks; `--block-time-ms 1000` makes it faster. Small WebAssembly programs on the chain are optional and off by default: `blockula summon mychain --programs` starts a chain with them ([docs/LAUNCH.md](docs/LAUNCH.md#programs-experimental-off-by-default)).
 
 ```bash
 # one validator (HTTP on 7070), for this machine only
@@ -245,6 +247,7 @@ mcp/      @blockula/mcp: MCP server for coding agents
 web/      Passkey web wallet (Next.js), deployed at testnet.blockula.app
 deploy/   Fly.io testnet: Dockerfile, entrypoint, launch.sh
 docs/     LAUNCH.md (launch your own ledger), ONE_PAGER.md (what this is), PLAN.md (architecture, roadmap),
+          PROGRAMS-V0.md (the specification of programs, optional and off by default),
           MAINNET-DESIGN.md, TOKENOMICS.md (the protocol's design, written for the value-bearing mainnet that was planned, then dropped)
 ```
 

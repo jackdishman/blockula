@@ -1281,3 +1281,4 @@ fn ghost_txs_finalize_through_consensus() {
 }
 
 mod byzantine;
+mod programs;

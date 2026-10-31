@@ -50,6 +50,10 @@ const KIND: Record<string, string> = {
   transfer_name: "Name",
   release_name: "Released",
   claim_distribution: "Claimed",
+  upload_code: "Uploaded",
+  create_program: "Created",
+  call_program: "Called",
+  programs_pause: "Pause",
 };
 
 /** The ledger column: what happened, read from `side` (the account the list is about). */

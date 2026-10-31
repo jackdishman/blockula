@@ -1,5 +1,11 @@
 # Programs: implementation plan
 
+> **Programs v0 was built from this plan and cut down from it; [PROGRAMS-V0.md](PROGRAMS-V0.md)
+> is what the node runs** (its section 0 lists the differences). The plan's calendar and its
+> audit gates are superseded by the launch kit's scope: programs are optional and off by default
+> (PROGRAMS-V0.md sections 0 and 9.3). The fuzz targets as built are in PROGRAMS.md section 13's
+> "As built for v0".
+
 > **Update, 2026-10-22: there's no mainnet.** Blockula 1.0 is a kit for launching your own ledger ([LAUNCH.md](LAUNCH.md)), and programs are an optional feature with no deadline: built into the node and switched off. The plan's mainnet step (Phase 5, D2, section 9.2) is dropped. LAUNCH-PLAN.md and COUNSEL_BRIEF.md, which it mentions, were removed with the mainnet plan.
 
 Status: plan, 2026-10-19, against main at `2bbecde` (after v0.5.2). It turns the design in
@@ -219,14 +225,14 @@ root.
 | PR | What | Key files | Tests |
 |---|---|---|---|
 | **C1** | VM core: engine configuration, upload validation, the versioned fuel schedule, the engine wrapper with its per-block lifetime | `node/vm/` (a new crate in its own workspace, pinned exactly to S5's pick: soroban-wasmi 29.x unless phase 0 picks wasmi 2.0); `node/Cargo.toml` (`exclude`, overflow-check profiles for every engine crate, and a test that they're all listed) | The Wasm spec suite under this configuration; the `program_validate` fuzz target |
-| **C2** | Host ABI v1 and execution: the engine-neutral host table, written in full because it's the contract with `program-sdk`; frames; the meter; the overlay; `MemHost` | `node/vm/src/{abi,exec,testing}.rs` | Unit tests for each function on `MemHost`; the `host_abi` fuzz target |
+| **C2** | Host ABI v1 and execution: the engine-neutral host table, written in full because it's the contract with `program-sdk`; frames; the meter; the overlay; `MemHost` | `node/vm/src/{abi,exec,testing}.rs` | Unit tests for each function on `MemHost`; the `host_abi` fuzz target (as built: part of `program_exec`) |
 | **C3** | The interface format: codec, checks, digests, selectors | `node/vm/src/interface.rs`; `sdk-ts/src/program.ts` (the codec only); `sdk-ts/test/interface-vectors.json` | Rust-written vectors checked by TypeScript; the `interface_codec` fuzz target |
-| **C4** | Tx formats for tags 62–70 | `types.rs` (`encode`, `decode` with the nested refusals, `check_format`, `json_ints`, `kind`, `addresses`, `put_bytes`, `Tx::max_bytes`); `sdk-ts/src/{tx,describe}.ts`; `tx-vectors.json`; the tag list in `tx-vectors.ts`; the hash group in `e2e.ts`; `node/fuzz` (`program_tx_codec`, seeds, the program tags in `state_machine`) | Every tag round-trips. Every one is `Err` at admission below v2 |
+| **C4** | Tx formats for tags 62–70 | `types.rs` (`encode`, `decode` with the nested refusals, `check_format`, `json_ints`, `kind`, `addresses`, `put_bytes`, `Tx::max_bytes`); `sdk-ts/src/{tx,describe}.ts`; `tx-vectors.json`; the tag list in `tx-vectors.ts`; the hash group in `e2e.ts`; `node/fuzz` (`program_tx_codec`, seeds; as built the program ops live in `state_machine_programs`, and v1's `state_machine` is unchanged) | Every tag round-trips. Every one is `Err` at admission below v2 |
 | **C5** | State: namespaces 66–73, the `Programs` sub-state and its journal, the optional META `programs` record, `ByteKey`, schema 10, `begin_block`, `known_features(version)` | `state/{mod,codec}.rs`; `chain.rs` (`modules()` from 6 to 7, `absorb`, `rollback`); `snapshot.rs`; `upgrade.rs`; `proof_vectors.rs`; `sdk-ts/src/proof.ts` (`NAMESPACES`, decoders) | A v2 binary opens schema-9 state and snapshots. `begin_block` is idempotent on every path. Invariants hold |
 | **C6** | Fuel and fees: the fuel ring; reservations, multisig cases included; load pricing; `check_fee` and `check_tip` in u128; verify's stateless Σ; the block counters; the fuel controller and its clamp; `TipRate`; a fuel section in `/api/fees` | `programs/fuel.rs`, `econ.rs`, `consensus.rs`, `chain.rs`, `api.rs` | 10,000 consecutive full blocks with no overflow. Fees agree across the activation boundary |
 | **C7** | Upload and create: validation in a throwaway engine; `BlobRef`; the deposit curve and escrow accounting; program addresses; adoption; init; no program as a tx's `from` | `programs/{mod,lifecycle}.rs`; `chain.rs` (`admit`, the `apply_action` dispatch) | Mallory's front-run-then-remove case; an adopted balance counted once; vectors for program addresses |
 | **C8** | Calls: the host over `&State` (input, return, abort, storage with deposits and `storage_limit`, context and chain reads, hashes); commit with the conservation and who-was-debited checks; `CallProgram` with batches; the `catch_unwind` backstop and an engine rebuilt after a fault; mempool paths that skip the VM; proposers including `Failed` program txs | `programs/{host,commit,exec}.rs`; `chain.rs` (`apply_j`'s `run_programs`); `consensus.rs` | The `program_exec` and `program_commit` fuzz targets; an injected fault compared against a fresh node |
-| **C9** | Receipts: the codec and fail codes; the receipts root (namespace 70) and its sweep; `BlockMeta`; `/api/receipt/{tx}`; a program section in `/api/tx`, with facts kept apart from the program's claims | `programs/receipt.rs`, `store.rs`, `api.rs`; the SDK's receipt codec; receipt vectors | Rewording every programs error moves no receipt digest; the `receipt_codec` fuzz target |
+| **C9** | Receipts: the codec and fail codes; the receipts root (namespace 70) and its sweep; `BlockMeta`; `/api/receipt/{tx}`; a program section in `/api/tx`, with facts kept apart from the program's claims | `programs/receipt.rs`, `store.rs`, `api.rs`; the SDK's receipt codec; receipt vectors | Rewording every programs error moves no receipt digest; the `receipt_codec` fuzz target (as built: `program_receipt`, beside `program_commit` and `state_machine_programs`) |
 | **C10** | Reads and a minimal CLI: `/api/program/{address}` with `/interface` and `/storage`; `/api/code/{hash}`; `POST …/view`; program txs in `/api/simulate`; `blockula program upload\|create\|call\|view\|show`; `blockula dev` at v2 | `api.rs`, `view.rs`, `program_cli.rs`, `main.rs`, `explorer.html` | A CLI run on a v2 dev chain in `local-testnet.sh` |
 
 ### M2: programs hold FANG
@@ -410,6 +416,5 @@ PRs and one approver.
 1. ~~Decide N1–N4, D2 and D3~~ (done, section 3).
 2. ~~P0: archive testnet-2's history~~ (done).
 3. P1: land PROGRAMS.md revision 3 and this plan in `docs/`, together with
-   `scripts/archive-chain.mjs`. Revision 3 records D2 and D3 and updates LAUNCH-PLAN.md's
-   "separate VM/host-interface audit" to match.
+   `scripts/archive-chain.mjs`. Revision 3 records D2 and D3.
 4. Start S1 (soroban-wasmi and wasmi 2.0 side by side) and P7 in parallel.

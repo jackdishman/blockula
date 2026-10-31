@@ -15,12 +15,13 @@ Some of what's below needs protocol v1 code that is still landing. Those parts a
 5. [Running a validator](#running-a-validator)
 6. [Keys, backups and restores](#keys-backups-and-restores), [Moving a validator](#moving-a-validator)
 7. [Upgrades](#upgrades)
-8. [Incident response](#incident-response)
-9. [Runbooks](#runbooks) (one per alert)
-10. [Weak subjectivity](#weak-subjectivity): what a joining node trusts, and checkpoints in releases
-11. [Releases](#releases) (and [installing and upgrading](#installing-and-upgrading) one), [npm packages](#npm-packages) and [repository settings](#repository-settings-github)
-12. [Monitoring](#monitoring)
-13. [Checklists](#checklists)
+8. [Programs (optional, off by default)](#programs-optional-off-by-default): limits, exit codes, the quarantine and the trial marker, metrics
+9. [Incident response](#incident-response) (including [programs: a fault, a stop and the pause](#programs-a-fault-a-stop-and-the-pause))
+10. [Runbooks](#runbooks) (one per alert)
+11. [Weak subjectivity](#weak-subjectivity): what a joining node trusts, and checkpoints in releases
+12. [Releases](#releases) (and [installing and upgrading](#installing-and-upgrading) one), [npm packages](#npm-packages) and [repository settings](#repository-settings-github)
+13. [Monitoring](#monitoring)
+14. [Checklists](#checklists)
 
 ## Roles and topology
 
@@ -267,7 +268,7 @@ WantedBy=multi-user.target
 
 `/etc/blockula/env` (mode 600, root) holds `BLOCKULA_FORWARDER_SECRET=…` and a fine-grained, public-read-only `GITHUB_TOKEN=…` (validators check contribution claims against GitHub; without a token they hit the anonymous rate limit). Then `sudo systemctl enable --now blockula`, `journalctl -u blockula -f`, and `curl -s 127.0.0.1:7070/api/health`.
 
-Exit codes: `0` never for a validator (it runs until stopped), `1` an error (the log says what), `10`, `11` and `12` the deliberate stops in the unit above ([Halted](#halted), [Upgrade required](#upgrade-required), [Slashing protection](#slashing-protection)).
+Exit codes: `0` never for a validator (it runs until stopped), `1` an error (the log says what), `10`, `11`, `12` and `13` the deliberate stops in the unit above that stay stopped ([Halted](#halted), [Upgrade required](#upgrade-required), [Slashing protection](#slashing-protection), and 13, a program that faulted while the node executed a certified block: [A program fault](#a-program-fault-exit-13)), and `14` a stop that restarts (the node couldn't start a thread or build an engine for a program, or a block it had verified clean faulted when it executed it: [A resources stop](#a-resources-stop-exit-14)). A node whose startup replay meets a block in a protocol version this binary doesn't run exits `11`, a full node as well as a validator; on a chain with programs, one whose replay meets a program fault exits 13 or 14 the same way. [Programs](#programs-optional-off-by-default) lists what each means and the limits a validator needs.
 
 Double-signing protection, in layers:
 
@@ -340,6 +341,8 @@ Upgrades are announced, released, signalled, scheduled and activated at a height
 - a **validator exits with code 11** (systemd keeps it down, `RestartPreventExitStatus`), and does so again on every start until it's upgraded;
 - a **full node keeps serving reads** at that height, with `/api/health` 503 and `"halted": "upgrade_required"`, until it's upgraded.
 
+(A node whose *startup replay* meets such a block, after a downgrade with its database gone or behind its block log, exits 11 too, full node or validator.)
+
 Install the new binary ([Upgrading](#upgrading)) and start it: it executes the new version's blocks and catches up.
 
 **The hard-fork process.**
@@ -366,6 +369,91 @@ A restart takes a validator out until it's back: it loads the state database, ex
 **Coordinated stop at a height** (incidents, emergency patches): `blockula run … --halt-height H` executes block `H` and stops. A validator doesn't vote on or propose anything above `H` and exits with code 10 (and again at once on every start with the same flag); a full node keeps serving reads at `H`. If at least ⅓ of the set runs with the same `H`, the chain itself stops at `H`. Remove the flag (or raise it) to continue.
 
 The public testnet (`blockula-testnet-2`) runs the same version gating: a release that changes no rules is a redeploy (`deploy/launch.sh`, validators in parallel, so blocks pause briefly), and a new protocol version goes through a `ScheduleUpgrade` the validators pass as its bootstrap council, as above ([deploy/README.md](../deploy/README.md), "Day 2").
+
+## Programs (optional, off by default)
+
+Programs are small WebAssembly programs that anyone can upload and run on a chain ([PROGRAMS-V0.md](PROGRAMS-V0.md) is the specification). A chain has none unless it was made with them (`blockula summon --programs`, `blockula dev --programs`: [LAUNCH.md](LAUNCH.md#programs-experimental-off-by-default)) or its governance switched them on ([GOVERNANCE.md](GOVERNANCE.md#programs-optional-off-by-default)). On a chain without them nothing here applies: the node computes what it always did, and exits 13 and 14 never happen. This section is for the operators of a chain that has them. It's an experiment, and the people running the validators carry the consequences of it.
+
+### What a chain takes on
+
+- **Third-party code runs on every validator.** It runs in a fuel-metered interpreter, and what it does is the same on every node of one release. The failure to watch for is one node differing from the others (another build, another architecture, a machine that's short of memory). The node never lets that become an outcome: it leaves a transaction out, abstains from a vote, or stops (below).
+- **Every validator runs the same release.** A fault that only some validators hit is the sign of a mismatch, and it costs the chain proposals. Upgrade together ([Upgrades](#upgrades)).
+- **A pause needs people.** Any `f + 1` validators can pause programs for three days, and only validators can. Know who to ask, and read [the pause](#the-pause) before you need it. On a chain of 1 to 3 validators `f + 1` is 1: any one validator can pause programs for three days alone, and can keep renewing while a fix is pending, up to 30 days in any 60 (the cap). Choose validators you trust.
+- **Each validator needs a fee float on its own account.** The pause is signed by the validator's key from that account, like its other duties.
+- **Programs hold FANG.** The chain's unit is worthless by design, but a program's balance is still the chain's: a cap (`program_value_cap`, 10,000,000 FANG by default) bounds what programs control, and governance can lower it or switch programs off (exit-only: calls that pay users out still work).
+
+Where a chain stands: `curl -s 127.0.0.1:7070/api/params | jq .programs` (`status` is `on`, `exit_only` or `paused`; the key is absent until programs were first switched on), `/api/fees` (a `fuel` section appears with them), and `blockula_programs_status` in `/metrics` (1 on, 2 exit-only, 3 paused).
+
+### Limits a validator needs
+
+Each block that holds a program transaction runs on a thread of its own with a 64 MiB stack (`blockula-program-pass`), and the engine on it holds the code that block's transactions load. A node runs such a *pass* when it executes a certified block, replays an unexecuted ancestor, packs a proposal, verifies a block, or replays its block log at start. Per pass that is:
+
+- one thread with a **64 MiB stack**: virtual memory, of which tens of KiB are touched;
+- **under 32 MiB** of translated code (a pass's engine is dropped past 1 MiB of loaded code, which bounds it);
+- on a validator **at most two passes run at once** (the runtime has two workers and each pass blocks one; nothing else enforces it), so allow 128 MiB of virtual stack and under 64 MiB of translated code. A full node runs one at a time.
+- A node that serves views (a full node always; a validator only with `--program-views`) adds up to **two concurrent views**, each a 64 MiB thread and an engine (`--view-max-fuel` bounds one).
+
+A node that can't start a thread (it tries three times) or build an engine stops with **exit 14** when that happens while it executes a certified block (below); proposing, it leaves the program transactions out of its proposal, and verifying, it abstains. What can refuse it:
+
+| Limit | What to set |
+|---|---|
+| Strict overcommit, `vm.overcommit_memory = 2` | The stacks count against the commit limit: leave room for the 64 MiB stacks above (a few hundred MiB) beyond the node's own memory, or use the default heuristic overcommit |
+| A container or cgroup memory cap | Counts the stack: size the cap for the node's usual memory plus the above |
+| A task or process limit (`TasksMax=` in the unit, `LimitNPROC=`, a container's pids limit) | The node needs a handful of threads more than before; the unit above sets neither, so systemd's default applies, which is generous. Don't set a tight one |
+| An address-space limit (`ulimit -v`, `LimitAS=`) | Don't set one on a validator |
+
+None of this changes for a chain without programs.
+
+### Exit codes
+
+`0` never for a validator (it runs until stopped), `1` an error (the log says what), and the deliberate stops: `10` `--halt-height` reached, `11` a protocol version in force that this binary doesn't run, `12` another instance is signing with this key, `13` a program faulted while the node executed a certified block, `14` the node couldn't start a thread or build an engine for a program, or a block it had verified clean faulted when it executed it.
+
+- **10, 11, 12 and 13 stay down.** The unit lists them in `RestartPreventExitStatus`, and `deploy/entrypoint.sh` idles instead of restarting. **13 stays down** because a certified block is one a quorum ran without a fault: a node that faults on it differs from them, and a restart would replay the same block and most likely fault again. An operator looks first.
+- **14 restarts.** A thread the OS refused is cured by a restart: the block wasn't committed, so consensus delivers it again. It is in neither stay-down list, so systemd restarts it every `RestartSec` (10 seconds in the unit above) for as long as it recurs: **if it exits 14, or crashes, again at the same height, stop the unit yourself.** The unit as written never trips systemd's own start limit, because its starts are ten seconds apart. Optionally add `StartLimitIntervalSec=600` and `StartLimitBurst=5` to its `[Unit]` section: after five starts in ten minutes systemd stops restarting it and leaves it failed (until `systemctl reset-failed blockula`), which ends a 14 loop for you.
+- **Full nodes exit too.** A full node that meets a 13 doesn't exit: it stops following the chain and goes on serving reads at its height (`/api/health`: `halted: "program_fault"`). On a 14 it exits, because nothing restarts a process that doesn't, so its supervisor restarts it.
+- **A startup replay can halt too, for any halt.** A node (validator or full node) whose replay of its block log meets a block it can't run exits with that halt's code: 13 or 14 for a program fault, and **11** for a block in a protocol version this binary doesn't support (a downgrade, with the database gone or behind the log). It used to exit 1.
+
+The node prints why, then `exit code N (kind): see docs/OPERATIONS.md, "Upgrades" and "Incident response"`. `/api/health` and `/api/status` report the kind (`program_fault`, `program_resources`) while a full node is parked, and `blockula_halted` and `blockula_halt_info{kind}` in `/metrics` do.
+
+### What a node remembers: the quarantine, the trial marker and strikes
+
+All three are this node's own, never consensus, and they only ever hold back program transactions; every one of them expires.
+
+**The quarantine.** When a program transaction faults the node while it *proposes* (the packing trial), the node leaves it out, drops it from its mempool, and quarantines it:
+- the transaction's id, until the chain passes its `valid_until`;
+- its sender's *program* transactions (tags 62 to 64; its transfers and everything else go through), for 600 blocks (`MEMPOOL_TTL_BLOCKS`: ten minutes at 1-second blocks, fifty at 5-second ones);
+- for an upload, its code hash, for a day of blocks.
+
+A call's or a create's declared code is never quarantined: it belongs to other people. The quarantine holds at most 1,024 ids, 1,024 senders and 256 code hashes, and a restart empties it. While an entry lasts, this node's door refuses the transaction ("quarantined on this node after a program execution fault, until block N: see its log"), and its verification abstains from a block that carries a quarantined id (and only that). Other nodes aren't told: a fault on one node alone (memory, a bad build) quarantines a valid transaction there only, for at most an hour, and the others include it. There is no list: read the sizes in `blockula_program_quarantined{kind="tx"|"sender"|"code"}` and the entries in the log, where each fault is an error line, `a program execution fault on this node: leaving the transaction out of this proposal`, with the `path`, `height`, `tx`, `class` and `fault` fields.
+
+**The trial marker.** Before a proposal or a verification tries a program transaction, the node writes its id, sender, kind, `valid_until` (and an upload's code hash) to `<home>/program-trial`, and empties the entry when the trial ends. The file is a fixed 4 KiB of text lines (`id sender kind valid_until hash`) and then zeros, written in one `pwrite` with no `fsync`; an all-zero file, or none, means nothing was in flight. At start the node reads it and removes it, and quarantines each record under the rule above, with an error log: `the last run stopped while trying tx <id>: quarantined`. So a transaction that kills the process (an abort, a stack overflow, an out-of-memory kill, a panic outside the program thread) kills a validator at most once while it proposes or verifies, instead of looping it through its own mempool and its peers' gossip. A host that dies loses only this hint.
+
+**What the marker does not cover** (finding S4C-R9). It covers the *trials* of proposing and verifying. It marks nothing when the node *executes a certified block*, replays the block log at start, or replays an unexecuted ancestor before it proposes or votes. So a transaction that kills the process there restarts into the same crash, with no marker to name it. That matches the rule for exit 13 (a node that faults on a certified block differs from the quorum that certified it), and for you it means:
+- A **crash loop** (the process dies and the supervisor restarts it) at the same height, without a "the last run stopped while trying" line, is this case. **Stop the unit yourself:** a process that dies on a signal is not one of the stay-down exit codes, so systemd restarts it every `RestartSec` for as long as it recurs. The journal's last lines before the death name the height; the transaction is one of the program transactions of that block, which you read from any other node: `curl -s 127.0.0.1:7070/api/block/<height> | jq '[.txs[] | select(.kind | IN("upload_code","create_program","call_program")) | {id, from, kind}]'`. Compare with the other operators, and see [A program fault](#a-program-fault-exit-13).
+- The marker can't tell a crash the transaction caused from an unrelated kill. If many validators are killed together while they verify the same block that carries a program transaction (a zone outage), that transaction and its sender's program transactions are quarantined on all of them, for up to the transaction's validity (an hour at most) and 600 blocks. It stalls nothing, and an honest sender resubmits.
+
+**Strikes.** A leader whose proposals carrying a program transaction never certify (other validators fault on it and abstain, so the view is nullified) counts a strike against that transaction for each such view of its own. At two strikes the leader drops it from its mempool ("not certified in two proposals: other validators may be faulting on it") and holds its sender's program transactions at its own door for 600 blocks ("held on this node until block N: two of this node's proposals carrying this sender's program transactions weren't certified; other nodes accept them"). `blockula_program_uncertified_proposals_total` counts the strikes. A view can also be skipped for reasons that have nothing to do with the transaction (a slow link, an overloaded proposer): then an innocent sender is held at that one node for 600 blocks and the others include it.
+
+**The verified-clean set.** Verification remembers the digests of the last 64 blocks it ran through without a fault (in memory only, and only for blocks that carry a program transaction). It decides what exit 14 means below.
+
+### Metrics
+
+With programs on, `/metrics` adds (nothing before they were first switched on):
+
+| Series | Reading |
+|---|---|
+| `blockula_programs_status` | 1 on, 2 exit-only, 3 paused |
+| `blockula_program_block_fuel`, `blockula_program_fuel_rate` | The last executed block's counted fuel; the milli-drops per fuel the next block charges (it rises 12.5% per full block, falls when blocks are empty, never below `program_fuel_floor_rate`) |
+| `blockula_program_value_held_drops`, `blockula_program_sponsored_drops` | FANG program accounts hold; deposits programs paid themselves. Their sum is what the cap bounds |
+| `blockula_program_state_bytes` | Program state's accounted bytes (the storage price curve reads it) |
+| `blockula_program_node_faults_total{path,class}` | **Faults this process met** (never an outcome). `path` is `propose`, `verify`, `execute` or `startup`; `class` is `tx` (tied to a transaction) or `setup` (a thread or engine this node couldn't make). Any increase is an event: read the log. |
+| `blockula_program_quarantined{kind}` | Entries the quarantine holds now (`tx`, `sender`, `code`) |
+| `blockula_program_uncertified_proposals_total` | Strikes: program transactions this node proposed in a view that never certified |
+| `blockula_program_accounting_drift` | **1 when the last epoch-boundary check found a program total (value held, sponsored, escrow) that differs from its sum.** A bookkeeping bug that moves the cap is an alarm, not a silence |
+| `blockula_replay_cache_hits_total` | Ancestor replays that started from a cached post-state. No alert; a lagging verifier shows hits |
+| `blockula_program_views_total{outcome}` | Views served: `ok`, `failed`, `refused`, `limited`, `fault` |
+
+The reference alerts don't watch these yet. Page on `increase(blockula_program_node_faults_total[15m]) > 0` (a ticket, not a page, for `class="setup"` on one node) and on `blockula_program_accounting_drift == 1`, and watch `blockula_program_uncertified_proposals_total` across the set.
 
 ## Incident response
 
@@ -408,6 +496,74 @@ The public testnet (`blockula-testnet-2`) runs the same version gating: a releas
 **Key compromise:** the operator stops the validator at once. In protocol v1 the stake belongs to the cold owner account, so a stolen consensus key can't move it, nor the owner's balance (the system txs it signs for the owner carry no tip), but it can still equivocate and get the pool slashed, and make the owner pay base fees for system txs. Protocol v1 has no consensus-key rotation: the owner undelegates the self-bond, registers a new validator with a fresh key generated offline, and asks delegators to redelegate (P-STAKE). Report it in the operator channel so others watch for votes from the old key.
 
 **Vulnerability reported privately:** the security lead triages within the SECURITY.md targets, decides severity with the IC, and runs the private patch flow below. Credit per [BUG_BOUNTY.md](BUG_BOUNTY.md).
+
+### Programs: a fault, a stop and the pause
+
+These apply only to a chain that has programs. A program transaction is third-party code, so a fault in running it is never taken for the transaction's outcome (Section "Exit codes" above says what each exit means). Read the log first: every fault is an error line, `a program execution fault on this node: …`, with the `path`, `height`, `tx`, `class` and `fault` fields, and `blockula_program_node_faults_total{path,class}` counts them.
+
+#### A program fault (exit 13)
+
+The log ends with `block H can't be executed here: a program execution fault in tx <id> (<what>); this node stopped rather than guess an outcome`, then `exit code 13 (program_fault)`. This node executed a block that a quorum certified, and the program transaction in it faulted *here*. The validators that certified it ran it without a fault, so this node differs from them: its binary, its build, its hardware or its memory. A restart replays the same block and most likely faults again, so the unit stays down (`RestartPreventExitStatus`), and the rest of the set goes on if a quorum is left.
+
+1. **Don't restart yet.** Keep the journal (`journalctl -u blockula --since …`) and note the height and the transaction id.
+2. **Are you alone?** Ask in the operator channel and compare `/api/status` (`version`, `git_sha`, `height`) on other validators. Others advancing past `H` means this node is the odd one. Check that your binary is the announced release (`blockula release install` verifies it against the pinned key), the architecture the others run, and the machine: `dmesg | grep -i -E 'oom|mce|hardware'`, memory errors (bad RAM can produce a different result), a container's memory cap.
+3. **Several validators exited 13 on the same transaction?** That is a defect in the engine or its integration, not a node: SEV-1. Don't discuss the transaction in public. Report it privately ([SECURITY.md](../SECURITY.md)): a transaction that crashes or faults the engine is a vulnerability. Then pause programs while the fix is made ([the pause](#the-pause)) and ship the fix as a release ([Patch distribution](#patch-distribution)); a rules change needs a scheduled version ([Upgrades](#upgrades)).
+4. **Restart once you know why.** The node replays the block. If it passes, the cause was local and gone. If it exits 13 again, the cause is still there: don't loop it. Check the machine again (step 2), reinstall the announced release, and see whether a full node of that release on other hardware (`blockula join`) executes the block. Never copy the validator's home to another machine to test it ([Keys, backups and restores](#keys-backups-and-restores)). Until it executes, the node can't vote on the next block.
+
+A full node that meets this doesn't exit: it parks at its height, serves reads, and `/api/health` says `"halted": "program_fault"`. Handle it the same way.
+
+#### A resources stop (exit 14)
+
+The log reads `block H can't be executed here: this node couldn't make what a program transaction needs (<what>); it stopped rather than guess an outcome, and a restart may cure it`, then `exit code 14 (program_resources)`. The OS refused a thread three times, or an engine wouldn't build. That is this node's environment, not the transaction: the block wasn't committed, so consensus delivers it again, and the supervisor restarts the node on its own (14 is in neither stay-down list; systemd restarts it every `RestartSec` for as long as it recurs, so **stop the unit yourself if it exits 14, or crashes, again at the same height**).
+
+1. After the restart, check it executes past `H` (`blockula_height`).
+2. Find the limit that refused it ([Limits a validator needs](#limits-a-validator-needs)): `TasksMax` or a pids limit, a memory cap, `vm.overcommit_memory = 2`, an out-of-memory condition (`dmesg`).
+3. If it stops again with 14 at the same height and you can't find the limit, treat it as a fault ([above](#a-program-fault-exit-13)).
+
+A full node exits 14 too, for its supervisor to restart.
+
+#### The verified-clean retry: a 14 that comes back as 13
+
+The exit-14 message can read instead `this node verified block H without a fault, then faulted executing it (tx <id>: <what>): restarting once`. Before it voted for that block, this node ran the same transactions on the same state without a fault. A fault a moment later is the node's doing (a transient panic, an engine or instantiation error under memory pressure), not a sign it differs from the quorum, so it's treated like a resource stop: exit 14, and the supervisor restarts it once. The set of verified digests lives in memory, so it doesn't survive the restart. **If the block faults again after the restart, it exits 13 and stays down**, and you are in [A program fault](#a-program-fault-exit-13) with a node that has now faulted twice on a block it once verified: look for memory pressure first, then at the machine.
+
+#### Program transactions are not certified: `blockula_program_uncertified_proposals_total` rises on some validators
+
+A leader counts a strike when its proposal carrying a program transaction fails to certify. That happens when other validators fault on the transaction and abstain, and it also happens when a view is skipped for reasons that have nothing to do with it (a slow link, an overloaded proposer). So a strike counter that rises on one validator proves nothing by itself, and a validator with a poor link rises alone by definition. The evidence is on the *other* validators.
+
+1. **Look for the faults on the other validators:** the error line `a program execution fault on this node: abstaining` with `path=verify`, or a rise in `blockula_program_node_faults_total{path="verify",class="tx"}`. Strikes without those are a network or proposer problem, not the engine: check the leader's link, clock and load, and **do not pause**.
+2. If the faults are there on some validators and not on others, **the set disagrees about the engine.** That is a consensus defect, not a node's problem, and strikes only limit what it costs (two views per leader). It can come from a mixed set (one validator on another release or architecture) or from a defect that some machines trigger and others don't. Compare `/api/status`'s `git_sha` across the set in the operator channel; if one validator is on another release, fix that ([Upgrades](#upgrades)).
+3. If the releases match, **pause, then fix.** Agree on the pause ([below](#the-pause)); while it runs no program transaction is admitted, the chain's blocks carry none, and the strikes stop. Then report privately and ship the fix.
+
+#### Accounting drift
+
+`blockula_program_accounting_drift 1` means a total in program state (value held, sponsored deposits, escrow) differs from the sum of the accounts, records and blobs it should equal. The log has `program accounting drift: …` with what was recorded and what was found. The cap and exit-only read those totals, so treat it as SEV-1: pause ([below](#the-pause)), keep the log, report privately.
+
+#### The pause
+
+A pause stops new program transactions (uploads, creates and calls, including the ones that would withdraw FANG) and native credits to programs for three days, from the block after enough validators signed. It moves no funds, ends by itself, has no undo, and leaves views, plain transfers and everything else running. It is the one thing validators can do together in minutes when the engine itself is in doubt; governance takes days.
+
+**Who and how many.** A validator of the current epoch's active set, `f + 1` of them: `⌊(n − 1) / 3⌋ + 1` (1 of 1 to 3, 2 of 4, 3 of 7, 4 of 10). A signature waits a day for the others. Two signatures in adjacent epochs count together; one older than a day doesn't.
+
+**1. Agree before you sign.** Say so in the operator channel, name who signs, and sign within the hour. A lone signature that doesn't reach the threshold changes nothing and costs its fee, and its validator can't sign again until its signature lapses (a day), but it spends nothing else. A signature that starts or renews a pause is what spends a validator's 30-day window.
+
+**2. Check you may sign.** `blockula program pause --key <home>/validator.key --rpc http://127.0.0.1:7070` prints what a pause does, the live signatures (`Live signatures: 1 of the 2 needed`), whether this validator may sign now and why not, and asks before it signs. It uses the chain's own admission rules, so a refused signature is never charged. The rules it applies:
+- a validator with a live signature of its own can't sign again until it lapses;
+- a validator that started or renewed a pause may sign again only after 30 days, **unless a fix is pending**: a `ScheduleUpgrade` or a `DeactivateFeature { programs }` proposal that is voting or queued, or an upgrade scheduled and not yet active. The CLI prints `a fix is pending.` or `a fix is not pending.`;
+- **the cap:** a run of pauses (one pause, then renewals while it runs) never extends past 30 days from its start, whether or not a fix is pending. Past that, `this pause has reached its 30-day cap`. A new run can't start within 60 days of the last run's start (`programs can be paused again from block N`). So a second, unrelated incident within 60 days of a run's start gets exit-only and `--halt-height` ([Coordinated restart at a height](#coordinated-restart-at-a-height)), not a pause. These are days at the chain's block time.
+
+**3. Which form.** There are two ways to sign a pause, and one that doesn't work.
+- **The duty form (the default; what `blockula program pause` signs).** The validator's *consensus key* (`validator.key`), from the validator's *own account* (the validator's address). It needs a fee float on that account. It is a validator duty, so it has a slot in the mempool's lane and a full mempool can't keep it out. It may carry a tip, out of that account's transferable FANG, like any key on that account; you don't need one.
+- **The owner-key form.** When the validator is owned by another account, the owner can sign it from its own account with an owner key, with `wallet.programsPause()` of the SDK (the CLI signs only the duty form). It may tip too. It isn't a duty, so in a full mempool it competes by its tip: use it only if the validator's own account can't pay. A validator that owns itself has one account and one key, and the two forms are the same.
+- **Not admitted:** the consensus key signing *from the owner's account* (the form validators use for their other system transactions, with the owner paying). A pause isn't one of those, so the chain answers `this key isn't authorized on <owner>`. If you see that, you signed with the wrong key for that account.
+- Whichever form signs, the validator counts once. An owner key counts for the lowest-addressed of the validators that owner runs; sign for the others with their own consensus keys.
+
+**4. Confirm.** `curl -s 127.0.0.1:7070/api/params | jq .programs` shows `status` (`paused` once enough signed), `pause` (`from`, `until`, `started`, `signers`), `votes` (live signatures, with their heights), `pause_signed` and `fix_pending`. `blockula_programs_status 3`. A refused program transaction reads `programs are paused until block N`.
+
+**5. Renew while the fix is pending.** The pause lapses at `until` on its own. If the fix isn't live, `f + 1` validators sign again *before* it lapses (a signature during a pause counts toward renewing it; each renewal moves `until` three days past its block and never back), until the fix lands or the 30-day cap. The window doesn't apply while a fix is pending (item 2), so the same validators can renew. Plan the fix path to fit: proposed at `t`, a `ScheduleUpgrade` takes the voting period and the timelock to run, then a cancellation's voting period and 66 blocks before the version may activate (about 7 days and 66 blocks at the governance floors, 16 at the default periods), and the cap covers either. Propose the `DeactivateFeature { programs }` and the `ScheduleUpgrade` in the first hour so that `fix_pending` holds. **`fix_pending` holds only while a proposal is voting or queued, or an upgrade is scheduled and not yet active.** A proposal nobody votes for is rejected at its close, and a `DeactivateFeature` stops counting the moment it executes, so keep a `ScheduleUpgrade` open or scheduled until the fix is live, and check `fix_pending` in `/api/params` before each renewal (the CLI prints it).
+
+**6. Afterwards.** The pause ends by itself. Exit-only (a `DeactivateFeature { programs }` that passed) keeps value-free calls and withdrawals working while the fix is made; `ActivateFeature { programs }` turns programs back on ([GOVERNANCE.md](GOVERNANCE.md#programs-optional-off-by-default)).
+
+**Rehearse it** on a throwaway chain before you need it. Run `export BLOCKULA_HOME=$(mktemp -d)` first, so that the CLI's wallet and its remembered chains stay out of `~/.blockula`, then `blockula dev --programs` (the chain is in `$BLOCKULA_HOME/dev`, so the key to pass is `$BLOCKULA_HOME/dev/validator.key`, and the node answers on `http://127.0.0.1:7070`, the default for `--rpc`). Run the commands above with that key. To have something to refuse, upload a sample program: the guests in `node/vm/tests/programs` and `scripts/test-program-cli.sh` show the calls (`blockula wallet new` and `blockula wallet faucet` give the account its FANG). A dev chain has one validator, so one signature pauses at once, and its votes last 60 blocks. For step 5, open a fix with `blockula gov propose deactivate programs --title "…" --key $BLOCKULA_HOME/dev/validator.key` (it asks nothing), then vote with `blockula gov vote <id> aye 1 --digest <the digest blockula gov show <id> prints> --key $BLOCKULA_HOME/dev/validator.key`.
 
 ### Patch distribution
 
@@ -524,8 +680,9 @@ The node restarted in the last 15 minutes. Was it you? If not: `journalctl -u bl
 
 - `halt_height`: it was started with `--halt-height` and reached it. Expected during a coordinated restart; otherwise remove the flag.
 - `upgrade_required`: the protocol version in force at the next height isn't supported by this binary. Install the release for it ([Upgrades](#upgrades)) and restart.
+- `program_fault` (a full node parked on it) and `program_resources`: on a chain with programs, a program faulted while the node executed a certified block ([A program fault](#a-program-fault-exit-13), [A resources stop](#a-resources-stop-exit-14)).
 
-Validators exit instead (code 10 or 11, `BlockulaNodeDown`): `journalctl -u blockula -n 50` shows the same reason.
+Validators exit instead (code 10, 11 or 13, `BlockulaNodeDown`; 14 restarts): `journalctl -u blockula -n 50` shows the same reason.
 
 ### Upgrade required
 
@@ -806,6 +963,8 @@ Every operator runs the reference stack in [`deploy/monitoring`](../deploy/monit
 - Each operator is in the on-call rotation for their own nodes. The core team runs a network-wide rotation (primary and secondary, weekly handover, escalation to the security lead after 15 minutes without acknowledgement for a SEV-1).
 - The project runs a public status page fed by the public RPC nodes' health (`/api/health`).
 
+On a chain with programs, add rules for the series in [Programs, Metrics](#metrics) (the reference alerts don't cover them yet).
+
 Logs go to the journal (`journalctl -u blockula`). Keep at least 14 days (`SystemMaxUse=` in `journald.conf` sized for it); attach the relevant window to every incident.
 
 ## Checklists
@@ -817,6 +976,7 @@ Logs go to the journal (`journalctl -u blockula`). Keep at least 14 days (`Syste
 - [ ] Binary installed with `blockula release install` ([A first install](#a-first-install)), release key id pinned (`blockula release pin` shows it); genesis file from `blockula release fetch`, its hash checked.
 - [ ] Consensus key and owner key backed up offline, encrypted, two places; restore tested.
 - [ ] systemd unit with `BLOCKULA_INSTANCE_ID` and `RestartPreventExitStatus=10 11 12 13`; `GITHUB_TOKEN` set (public-read-only).
+- [ ] On a chain with programs: no tight `TasksMax`, memory or address-space limit ([Limits a validator needs](#limits-a-validator-needs)); a fee float on the validator's own account; the pause read, and the other validators' operators known ([The pause](#the-pause)).
 - [ ] Provider volume snapshots off on the validator volume.
 - [ ] At least one sentry, registered as `http_addr`; validator HTTP private.
 - [ ] Monitoring stack running; receivers and heartbeat tested with a test alert.

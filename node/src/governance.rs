@@ -503,13 +503,18 @@ fn prepare_kind(state: &State, chain_id: &str, kind: &ProposalKind, height: u64)
     let runs_at = vote_end.saturating_add(cp.timelock_blocks);
     let mut k = kind.clone();
     match &mut k {
+        // Programs' own parameters, once programs exist (at this block's version, as features are
+        // read below); otherwise `program_*` is unknown to `ChainParams`, as in v1.
+        ProposalKind::ParamChange { key, value } if crate::programs::is_program_param(state, key, height) => crate::programs::check_param(state, key, *value)?,
         ProposalKind::ParamChange { key, value } => {
             cp.check_governance_change(key, *value, &state.params, height)?;
             cp.clone().set(key, *value, &state.params)?;
         }
-        ProposalKind::TreasurySpend { to, .. } => {
+        ProposalKind::TreasurySpend { to, amount } => {
             spend_gate(state, height)?;
             *to = state.resolve(to)?;
+            // Never to a program (docs/PROGRAMS-V0.md §7.1); checked again when it runs.
+            crate::programs::check_credit(state, to, *amount, crate::programs::Credit::Other, height)?;
         }
         ProposalKind::Distribution { distribution_id, claim_until, .. } => {
             spend_gate(state, height)?;
@@ -919,6 +924,9 @@ fn run_kind(state: &mut State, j: &mut Journal, chain_id: &str, p: &Proposal, he
             }
             state.j_debit(j, &treasury, *amount)?;
             state.j_credit(j, to, *amount);
+            // Never to a program (docs/PROGRAMS-V0.md §7.1): one created at `to` since the proposal
+            // makes it fail.
+            crate::programs::native_credit(state, j, to, *amount, crate::programs::Credit::Other, height)?;
             format!("paid {} to {}", fmt_fang(*amount), short(to))
         }
         ProposalKind::Distribution { distribution_id, merkle_root, total, claim_until } => {
@@ -1364,7 +1372,7 @@ fn approvals(state: &State, p: &MultisigProposal) -> usize {
 fn run_multisig(state: &mut State, j: &mut Journal, tx: &Tx, sender: &str, signer: &str, p: &MultisigProposal, height: u64) -> Result<()> {
     let inner = Tx { action: p.action.clone(), ..tx.clone() };
     let key = state.keys_of(sender).get(signer).cloned().ok_or_else(|| anyhow!("this key isn't on {}", short(sender)))?;
-    state.apply_action(j, &inner, sender, signer, &key, height).map_err(|e| anyhow!("multisig action #{}: {e}", p.id))?;
+    state.apply_action(j, &inner, None, sender, signer, &key, height).map_err(|e| anyhow!("multisig action #{}: {e}", p.id))?;
     if let Some(m) = state.governance.multisigs.get(sender) {
         let n = owner_keys(state, sender).len();
         ensure!(n >= m.threshold as usize, "multisig action #{} would leave {n} owner key(s), fewer than the threshold ({})", p.id, m.threshold);

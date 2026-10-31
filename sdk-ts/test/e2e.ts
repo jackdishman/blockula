@@ -522,12 +522,15 @@ if (proposalId !== undefined && councilSeed && validators.active.length === 1 &&
 }
 
 // Refused for their own reasons, not the encoding.
+const scheduledV2 = ((await client.upgrade()).schedule as { version: number; activation_height: number }[]).find((u) => u.version === 2);
 const governance: [Action, RegExp][] = [
   [{ type: "vote", proposal_id: 1_000_000, aye: true, amount: "1", conviction: 1, proposal_digest: "00".repeat(32) }, /no proposal #1000000/],
   [{ type: "multisig_propose", action: { type: "transfer", to: bob.address, amount: "1" } }, /isn't a multisig account/],
   [{ type: "claim_distribution", distribution_id: 1_000_000, amount: "1", proof: ["cd".repeat(32)] }, /no distribution #1000000/],
-  // `cancel_upgrade` (F50): the node decodes the SDK's encoding and refuses what isn't scheduled.
-  [{ type: "propose", kind: proposal.cancelUpgrade(2, 1_000_000), deposit: rules.proposal_deposit, title: "e2e: cancel an upgrade" }, /no upgrade to v2 at block 1000000 is scheduled/],
+  // `cancel_upgrade` (F50): the node decodes the SDK's encoding and refuses what isn't scheduled. Which words it refuses in depends
+  // on the chain: a `blockula dev --programs` chain has v2 scheduled (at block 1) and says which block it is at, a v1 chain has none.
+  // Each chain is held to its own text, chosen from its own schedule, never to either.
+  [{ type: "propose", kind: proposal.cancelUpgrade(2, 1_000_000), deposit: rules.proposal_deposit, title: "e2e: cancel an upgrade" }, scheduledV2 ? new RegExp(`v2 is scheduled at block ${scheduledV2.activation_height}, not 1000000`) : /no upgrade to v2 at block 1000000 is scheduled/],
 ];
 for (const [action, why] of governance) {
   await assert.rejects(client.submit(await alice.build(action)), why, action.type);

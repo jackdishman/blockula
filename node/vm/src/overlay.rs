@@ -16,7 +16,7 @@
 //! Ordered maps only (`BTreeMap`/`BTreeSet`), so the diff's order is canonical.
 
 use crate::abi::{flags, status};
-use crate::config::{MAX_EVENT_BYTES, MAX_EVENTS, MAX_KEYS_WRITTEN, MAX_WRITTEN_BYTES};
+use crate::config::{MAX_EVENT_BYTES, MAX_EVENTS, MAX_KEYS_WRITTEN, MAX_WRITTEN_BYTES, MIN_NEW_ACCOUNT};
 use crate::engine::{Address, NodeFault, Trap, TrapKind};
 use crate::host::View;
 use crate::storage::capacity;
@@ -86,7 +86,7 @@ pub struct Diff {
 
 /// Which of 4.4's commit checks a diff failed: a host bug, never a program's doing, but computed
 /// from the diff alone, so every node reaches the same verdict and the transaction fails
-/// (`FailCode::Commit`; the node counts it, `blockula_program_conservation_faults_total`).
+/// (`FailCode::Commit`; the node records it in the transaction's receipt, outcome `commit`).
 /// Numbered like `TrapKind`, and as stable.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -251,7 +251,8 @@ impl Overlay {
     }
 
     /// A program's `transfer_v1` from its own balance (10.2): a status, never a trap. To an
-    /// account that doesn't exist it fails unless `flags` says who pays for opening it.
+    /// account that doesn't exist it fails unless `flags` says who pays for opening it, and unless
+    /// the account opens with at least `MIN_NEW_ACCOUNT` in it (docs/PROGRAMS-V0.md A30).
     pub fn transfer(&mut self, view: &dyn View, from: Address, to: Address, amount: u64, flags: i32, fee: u64) -> i32 {
         let (amount, fee) = (i128::from(amount), i128::from(fee));
         let have = self.balance(view, &from);
@@ -259,15 +260,20 @@ impl Overlay {
         let (debit, credit, burn) = if !opening {
             (amount, amount, 0)
         } else if flags & flags::OPEN_DEDUCT != 0 {
-            if amount < fee {
-                return status::ERR_TRANSFER;
-            }
+            // The new account pays its creation fee out of the amount.
             (amount, amount - fee, fee)
         } else if flags & flags::OPEN_PAY != 0 {
+            // The program pays it on top.
             (amount + fee, amount, fee)
         } else {
             return status::ERR_TRANSFER;
         };
+        // As for the node's native transfers, an account opens only with at least
+        // `MIN_NEW_ACCOUNT` credited, under either flag; with `OPEN_DEDUCT` that's after the fee,
+        // so an amount below the fee is refused here too.
+        if opening && credit < i128::from(MIN_NEW_ACCOUNT) {
+            return status::ERR_TRANSFER;
+        }
         if have < debit {
             return status::ERR_TRANSFER;
         }
@@ -480,6 +486,82 @@ mod tests {
         assert_eq!(diff.balances, vec![(signer, -128)]);
         assert_eq!((diff.escrow, diff.state_bytes), (128, 128));
         assert_eq!(diff.programs, vec![ProgramStorage { program, items: 1, bytes: 128, deposit: 128 }]);
+    }
+
+    /// docs/PROGRAMS-V0.md A30: an account opens only with at least `MIN_NEW_ACCOUNT` credited,
+    /// under either flag (with `OPEN_DEDUCT` the amount less the fee, with `OPEN_PAY` the amount);
+    /// a refused opening moves nothing. An account that exists, or that this transaction already
+    /// opened, takes any amount, and costs no fee.
+    #[test]
+    fn an_account_opens_with_at_least_min_new_account() {
+        /// The program `a(2)` with 10 FANG and an empty account `a(3)`; nobody else exists.
+        struct Sparse;
+        impl View for Sparse {
+            fn height(&self) -> u64 {
+                1
+            }
+            fn balance(&self, account: &Address) -> Option<u64> {
+                [(a(2), 10_000_000_000), (a(3), 0)].into_iter().find(|(x, _)| x == account).map(|(_, b)| b)
+            }
+            fn code_of(&self, _: &Address) -> Option<crate::engine::CodeHash> {
+                None
+            }
+            fn version_digest(&self, _: &Address) -> Option<crate::engine::Digest> {
+                None
+            }
+            fn method(&self, _: &Address, _: &str) -> Option<crate::host::MethodInfo> {
+                None
+            }
+            fn storage(&self, _: &Address, _: &[u8]) -> Option<Entry> {
+                None
+            }
+            fn state_bytes(&self) -> u64 {
+                0
+            }
+            fn storage_price(&self, _: u64) -> Option<u64> {
+                Some(1)
+            }
+            fn account_creation_fee(&self) -> u64 {
+                FEE
+            }
+        }
+        const FEE: u64 = 100_000_000;
+        const MIN: u64 = MIN_NEW_ACCOUNT;
+        let (signer, program, existing, fresh) = (a(1), a(2), a(3), a(9));
+        let pay = |to: Address, amount: u64, f: i32| {
+            let mut o = Overlay::new(signer);
+            let status = o.transfer(&Sparse, program, to, amount, f, FEE);
+            (status, o.finish(&Sparse).unwrap().0)
+        };
+        let opened = |debit: u64, credit: u64| Diff {
+            balances: vec![(program, -i128::from(debit)), (fresh, i128::from(credit))],
+            opened: vec![fresh],
+            burned: u128::from(FEE),
+            ..Diff::default()
+        };
+        let refused = (status::ERR_TRANSFER, Diff::default());
+
+        assert_eq!(pay(fresh, FEE + MIN, flags::OPEN_DEDUCT), (status::OK, opened(FEE + MIN, MIN)), "OPEN_DEDUCT at the minimum");
+        assert_eq!(pay(fresh, FEE + MIN + 1, flags::OPEN_DEDUCT), (status::OK, opened(FEE + MIN + 1, MIN + 1)));
+        for amount in [FEE + MIN - 1, FEE, FEE - 1, 0] {
+            assert_eq!(pay(fresh, amount, flags::OPEN_DEDUCT), refused, "OPEN_DEDUCT of {amount}");
+        }
+        assert_eq!(pay(fresh, MIN, flags::OPEN_PAY), (status::OK, opened(MIN + FEE, MIN)), "OPEN_PAY at the minimum");
+        for amount in [MIN - 1, 1, 0] {
+            assert_eq!(pay(fresh, amount, flags::OPEN_PAY), refused, "OPEN_PAY of {amount}");
+        }
+        assert_eq!(pay(fresh, FEE + MIN, 0), refused, "no flag, no opening");
+
+        // An account that exists takes any amount, with any flag or none, and no fee.
+        for f in [0, flags::OPEN_DEDUCT, flags::OPEN_PAY] {
+            let moved = Diff { balances: vec![(program, -1), (existing, 1)], ..Diff::default() };
+            assert_eq!(pay(existing, 1, f), (status::OK, moved), "flags {f}");
+        }
+        // So does one this transaction opened.
+        let mut o = Overlay::new(signer);
+        assert_eq!(o.transfer(&Sparse, program, fresh, MIN, flags::OPEN_PAY, FEE), status::OK);
+        assert_eq!(o.transfer(&Sparse, program, fresh, 1, 0, FEE), status::OK);
+        assert_eq!(o.finish(&Sparse).unwrap().0, opened(MIN + FEE + 1, MIN + 1));
     }
 
     /// A view with every account holding 1,000 drops, no programs, no storage, and a price of

@@ -1,0 +1,1 @@
+{"type":"create_program","wasm_hash":"c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1","interface_hash":"1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f","authority":null,"upgrade_delay_blocks":0,"policy":"open","accepts_transfers":true,"init":null,"fuel_limit":0,"storage_limit":"1000000000","bindings":[]}

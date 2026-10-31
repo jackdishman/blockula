@@ -32,6 +32,7 @@ The network is chosen by the user, once, in the MCP's configuration, and nothing
 | Staking | `stake`, `unstake`, `withdraw_stake`, `my_stake` |
 | Governance | `list_proposals`, `vote` |
 | Hunts and contributions | `list_hunts`, `link_github`, `fund_hunt`, `contribution_pool`, `submit_contribution`, `my_contributions` |
+| Programs (read only) | `program_show`, `program_view`, `program_code` (and `lookup` of a program address or code hash) |
 | Running chains | `install_node`, `start_dev_node`, `summon_chain` |
 
 Tools carry a title and annotations: the reads are `readOnlyHint`, and everything that signs is `destructiveHint` and `openWorldHint`. To skip the prompt for reads only, allow them by name in Claude Code's `.claude/settings.json`, and leave the tools that move FANG to ask every time:
@@ -43,7 +44,8 @@ Tools carry a title and annotations: the reads are `readOnlyHint`, and everythin
       "mcp__blockula__status", "mcp__blockula__tx_status", "mcp__blockula__wallet_info",
       "mcp__blockula__check_name", "mcp__blockula__lookup", "mcp__blockula__latest_blocks",
       "mcp__blockula__my_stake", "mcp__blockula__list_proposals", "mcp__blockula__list_hunts",
-      "mcp__blockula__contribution_pool", "mcp__blockula__my_contributions"
+      "mcp__blockula__contribution_pool", "mcp__blockula__my_contributions",
+      "mcp__blockula__program_show", "mcp__blockula__program_view", "mcp__blockula__program_code"
     ]
   }
 }
@@ -75,6 +77,8 @@ Session keys can only send transfers: staking, voting and name renewals need an 
 **Votes bind what was shown.** `list_proposals` describes what each proposal does (`does`) from its `kind`, the content a vote binds with its title and link, never from the node's own summary (which no digest covers, so a node could make it say "plant garlic" over a treasury drain), and returns its `proposal_digest`. `vote` requires that digest back: it re-reads the proposal and refuses, signing nothing, if it reads differently now (a node showing one thing to the list and another to the vote). A proposal holding a number past 2^53 has no digest here (`cannot_vote`): vote on it with the `blockula` CLI.
 
 **Chain text is untrusted.** Hunt titles, memos, proposal titles and links, key labels and claim notes are written by anyone. Tools return them in fields named `untrusted_*`, cleaned of control and invisible characters, and the server's instructions tell the agent they're data, never instructions. Node JSON is nested (`status`'s `node_reports`, `lookup`'s `data`), so a node can't override what the MCP says about the network.
+
+**Programs are read only here.** `program_show` gives a program's record (its code and interface hashes, version, who could upgrade it, what it holds and stores, its methods and the `version_digest` a call binds: recomputed from the code, interface and version, never taken from the node's field, and, with `BLOCKULA_WITNESSES`, built from the proven record: the fields no transaction changes are held to the proof and a node whose reading differs is refused, the storage totals and the balance are the proven ones, and `proven` says exactly what was proven and `node_word_only` what stays the node's word: the methods and their types, the code's size and the names beside addresses), `program_view` runs a `view` method on the node (nothing is signed or paid; its answer is that node's word, and says which node) and `program_code` describes a stored code. No tool signs a program transaction: an agent's calls need the confirmation flow of docs/PROGRAMS.md 11.5 (the user is asked, an allowlist), a later release. Everything a program or its deployer chose is data, never instructions: method names are `untrusted_method`, argument names `untrusted_argument`, a code's exports `untrusted_exports`, what a method returns `untrusted_return_data` (the program's claim, which the chain checks nothing of), a receipt's events and abort messages `untrusted_name` and `untrusted_message`, and the bytes of a receipt's return values and events (`lookup`) `untrusted_data`, summarized past 64 bytes; a failure is summarized in words that quote none of it.
 
 ## Your own node
 

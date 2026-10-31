@@ -22,6 +22,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use blockula_vm::abi::status;
+use blockula_vm::config::MIN_NEW_ACCOUNT;
 use blockula_vm::engine::{Address, EngineKind, TrapKind, new_block_engine};
 use blockula_vm::exec::{ANY_VERSION, Call, Diff, Event, FailCode, Receipt, TxLimits, execute};
 use blockula_vm::host::{MethodKind, View};
@@ -379,11 +380,12 @@ fn escrow_releases_to_the_seller_and_refunds_the_buyer() {
     assert_eq!(delta(&r, alice), 3 * FANG as i128 + deal);
     assert_eq!(c.balance("alice"), Some(5 * FANG));
 
-    // A deal smaller than the creation fee can't open its new seller: the release aborts 4, the
-    // removal before it rolls back, and the deal can still be refunded once the seller exists.
-    c.tx("escrow.open (small)", "mallory", escrow("open", open(3, &fresh), fee - 1), &[]);
+    // A deal that would leave a new seller less than `MIN_NEW_ACCOUNT` once the creation fee is
+    // out can't open it (docs/PROGRAMS-V0.md A30): the release aborts 4, the removal before it
+    // rolls back, and the deal can still be refunded once the seller exists.
+    c.tx("escrow.open (small)", "mallory", escrow("open", open(3, &fresh), fee + MIN_NEW_ACCOUNT - 1), &[]);
     let kept = c.stored("escrow", &cat(&[b"d", &le(3)]));
-    let r = c.tx("escrow.release (smaller than the fee)", "mallory", escrow("release", le(3), 0), &[]);
+    let r = c.tx("escrow.release (smaller than the fee and the minimum)", "mallory", escrow("release", le(3), 0), &[]);
     assert_eq!(r.fail, abort("escrow", 4, "transfer failed"));
     assert_eq!((c.stored("escrow", &cat(&[b"d", &le(3)])), c.balance("fresh")), (kept, None));
     c.host.fund(fresh, 0);

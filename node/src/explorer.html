@@ -99,6 +99,8 @@
   .empty { font-style:italic; color:var(--dim); }
   details summary { cursor:pointer; color:var(--dim); margin-top:14px; font:400 16px var(--caps); letter-spacing:.06em; }
   pre.mono { background:var(--paper-hi); border:1px solid var(--hair); padding:12px; white-space:pre-wrap; }
+  .named { font:700 .9em var(--mono); background:var(--paper-hi); border:1px dashed var(--hair); padding:0 .3em; overflow-wrap:anywhere; }
+  .claims { border-left:3px double var(--hair); padding-left:14px; margin:8px 0; list-style:none; } .claims li { margin:4px 0; overflow-wrap:anywhere; }
   .tally { display:flex; height:10px; border:1px solid var(--ink); margin:8px 0 4px; background:var(--paper-hi); }
   .tally .aye { background:var(--moss); } .tally .nay { background:var(--blood); }
   table.params { width:100%; border-collapse:collapse; font-size:16px; }
@@ -189,6 +191,9 @@ const GLOSSARY = {
   council: "Until the bootstrap period ends, a proposal also passes if two-thirds of the active validators approve it and token-weighted nays don't outweigh ayes.",
   timelock: "A passed proposal waits this long before it executes, so anyone affected can see it coming.",
   expiry: "Names are registered for a year at a time. After expiry there's a grace period when only the owner can renew; then anyone can register the name.",
+  fuel: "What running a program costs: a unit of computation. A program transaction reserves an amount at the chain's current price, pays for all of it (burned, never refunded) whether or not it runs out, and the price rises when blocks are full.",
+  digest: "What a call binds: a fingerprint of the program's address, its code, its interface and its version. A call runs only while the program still has exactly that digest, so it runs the code its signer was shown.",
+  program_claim: "What a program says happened (what a method returned, the events it emitted, an abort message). The chain applied the facts beside it and checks none of the claims: they're the program's words.",
 };
 const term = (key, text) => `<span class="term" data-tip="${esc(GLOSSARY[key])}">${esc(text ?? key)}</span>`;
 // The node labels unnamed system accounts ("🧛 validator", "🏛️ treasury"); show those as an italic label.
@@ -306,7 +311,8 @@ const views = {
         <dt>${term("signature")}</dt><dd>${esc(t.signature_scheme)} · ${t.size_bytes.toLocaleString()} byte transaction</dd>
         <dt>${term("hash", "transaction id")}</dt><dd class="mono">${esc(t.id)}</dd>
       </dl>
-      <details><summary>Raw data, for the brave</summary><pre class="mono">${esc(JSON.stringify(t.action, null, 2))}</pre></details>`)}
+      <details><summary>Raw data, for the brave</summary><pre class="mono">${esc(signedAction(t.action))}</pre></details>`)}
+      ${programReceipt(t)}
     </div>`;
   },
   async account(id) {
@@ -635,6 +641,144 @@ views.params = async function () {
   </div>`;
 };
 
+// ---- Programs (protocol v2): third-party WebAssembly. What a program or its deployer chose (a method's, an
+// argument's or an event's name, an abort message, what a call returned) is a stranger's text: it only ever goes
+// through `esc`, with what hides or reorders text removed and a cut, in a box of its own, marked as theirs. ----
+
+const inert = (s, max = 64) => {
+  const t = String(s ?? "").replace(/[\p{Cc}\p{Cf}\p{Co}\p{Cs}\p{Zl}\p{Zp}]+/gu, " ").replace(/ {2,}/g, " ").trim();
+  const c = [...t];
+  return c.length > max ? c.slice(0, max).join("") + "…" : t;
+};
+const named = (s, max) => `<code class="named">${esc(inert(s, max))}</code>`;
+const isAddr = (a) => /^t?boo1[02-9ac-hj-np-z]{40,}$/.test(String(a));
+const shortAddr = (a) => `${String(a).slice(0, 10)}…${String(a).slice(-6)}`;
+const acct = (a) => (isAddr(a) ? `<a href="#/account/${esc(a)}" class="mono" title="${esc(a)}">${esc(shortAddr(a))}</a>` : named(a, 24));
+const big = (v) => (/^-?\d+$/.test(String(v ?? "")) ? BigInt(v) : 0n);
+const drops = (v) => { const b = big(v); return `${b < 0n ? "−" : ""}${esc(fmtDrops((b < 0n ? -b : b).toString()))}`; };
+const hexData = (d) => typeof d === "string" && /^([0-9a-f]{2})*$/.test(d)
+  ? d === "" ? '<span class="dim">nothing</span>' : `<span class="mono">0x${esc(d.slice(0, 128))}${d.length > 128 ? "…" : ""}</span> <span class="dim">(${d.length / 2} bytes)</span>`
+  : named(d, 32);
+/** The fields of a program action that carry bytes (code, an interface, a call's input) or a receipt's claimed data: hex that runs to hundreds of kilobytes. */
+const PROGRAM_BLOBS = new Set(["wasm", "interface", "input", "data", "return_data"]);
+/** `JSON.stringify(v, null, 2)` for a program's raw data: a blob field past `max` characters is cut (a program's code, in hex, is hundreds of kilobytes), and what hides or reorders text is written out as \uXXXX so it shows. Every other field is whole. */
+const abridged = (v, max = 160) => {
+  const shown = (x) => x.replace(/[\p{Cf}\p{Co}\p{Cs}\p{Zl}\p{Zp}]/gu, (c) => "\\u" + c.codePointAt(0).toString(16).padStart(4, "0"));
+  return JSON.stringify(v, (k, x) => (typeof x === "string" ? shown(PROGRAM_BLOBS.has(k) && x.length > max ? `${x.slice(0, 64)}… (${x.length.toLocaleString("en-US")} characters)` : x) : x), 2);
+};
+/** An action as "Raw data" shows it: a program action's blobs are abridged; every other action prints exactly as JSON.stringify does, whole (an added key's public key, a proof, evidence). */
+const signedAction = (a) => (a && ["upload_code", "create_program", "call_program"].includes(a.type) ? abridged(a) : JSON.stringify(a, null, 2));
+/** A failed program transaction's outcome in words, from its numbers: never the program's own message, which is shown apart as its claim. */
+const outcomeWords = (o) => {
+  const prog = o.program ? shortAddr(o.program) : "?";
+  const num = (n) => (Number.isSafeInteger(n) ? String(n) : "?");
+  switch (o.code) {
+    case "trapped": return `program ${prog} trapped: ${inert((o.trap && o.trap.name) || "?", 40).replace(/_/g, " ")} (trap ${num(o.trap && o.trap.number)})${o.trap && o.trap.name === "storage_limit" ? ": the call's writes bond a deposit its storage limit didn't allow" : ""}`;
+    case "aborted": return `program ${prog} aborted with code ${num(o.abort_code)}`;
+    case "commit": return `the changes failed the chain's own commit checks (commit error ${num(o.commit_error)})`;
+    case "value_cap": return `programs would hold more than the value cap (${/^\d+$/.test(String(o.cap)) ? o.cap : "?"} drops)`;
+    case "exit_only": return "programs are exit-only: a call may not put more FANG under programs' control";
+    case "storage_limit": return "the deposits passed the transaction's storage limit";
+    case "state_full": return "program state is full";
+    case "invalid_code": return `the code was refused: validation rule ${num(o.rule && o.rule.number)} (${inert((o.rule && o.rule.name) || "?", 40)})`;
+    case "translation_refused": return "the engine refused to translate the code";
+    case "interface_mismatch": return "the interface's methods aren't the code's exports";
+    case "native": return "a native check failed (funds, locks or the creation fee)";
+    default: return `it failed with a code this explorer doesn't know (${inert(o.code, 24)})`;
+  }
+};
+const num = (n) => (Number.isSafeInteger(n) ? n.toLocaleString("en-US") : "?");
+
+/** A program transaction's receipt: what the chain did, then (apart, marked) what the programs said. */
+function programReceipt(t) {
+  const p = t.program;
+  if (p === undefined) return "";
+  if (p === null) return card(`<h2>What the program did</h2><p class="dim">${t.status === "pending" ? "It hasn't run yet: its receipt is here once a block has run it." : "This node no longer holds the block it ran in, so its receipt isn't shown."}</p>`);
+  const f = p.facts || {}, o = p.outcome || {}, fee = f.fee || {}, out = f.outside_vm || {}, fuel = f.fuel || {}, st = f.storage || {};
+  const outTotal = big(out.record_deposit) + big(out.upload_deposit) + big(out.account_creation_fee);
+  const feeTotal = big(fee.bytes) + big(fee.fuel) + big(fee.tip);
+  const words = o.ok ? "It applied." : `${esc(outcomeWords(o))}. <span class="dim">Its fee was charged and nothing else happened.</span>`;
+  const facts = card(`<h2>What the program did</h2><p class="dim">Facts the chain applied.</p><dl>
+    <dt>How it ended</dt><dd>${o.ok ? words : `<span class="err">${words}</span>`}</dd>
+    <dt>${term("fee", "Fee")}</dt><dd>${esc(fmtDrops(feeTotal.toString()))} <span class="dim">= ${esc(big(fee.bytes))} drops for its bytes + ${esc(big(fee.fuel))} for its fuel${big(fee.tip) > 0n ? ` + ${esc(big(fee.tip))} tip to the proposer` : ""}; the rest burned</span></dd>
+    <dt>${term("fuel", "Fuel")}</dt><dd>${esc(num(fuel.reserved))} reserved (${esc(num(fuel.limit))} to run, ${esc(num(fuel.load))} to load its code), ${esc(num(fuel.used))} used, at ${esc(num(fuel.rate))} milli-drops each <span class="dim">· paid for as reserved, never refunded</span></dd>
+    ${typeof f.created === "string" ? `<dt>Created</dt><dd>${isAddr(f.created) ? `<a href="#/program/${esc(f.created)}" class="mono">${esc(f.created)}</a>` : named(f.created, 90)}</dd>` : ""}
+    ${f.upload ? `<dt>Stored</dt><dd>code <span class="mono">${esc(f.upload.wasm_hash)}</span> ${f.upload.new_code ? "(new)" : "(already stored)"}<br>interface <span class="mono">${esc(f.upload.interface_hash)}</span> ${f.upload.new_interface ? "(new)" : "(already stored)"}</dd>` : ""}
+    ${outTotal > 0n ? `<dt>Left the signer outside the program's own diff</dt><dd>${esc(fmtDrops(outTotal.toString()))} <span class="dim">= ${[big(out.record_deposit) > 0n && `${big(out.record_deposit)} record deposit`, big(out.upload_deposit) > 0n && `${big(out.upload_deposit)} upload deposit`, big(out.account_creation_fee) > 0n && `${big(out.account_creation_fee)} account creation fee (burned)`].filter(Boolean).map((x) => esc(x)).join(" + ")} drops; deposits are bonded for good</span></dd>` : ""}
+    ${big(f.burned_by_programs) > 0n ? `<dt>Burned by its programs</dt><dd>${esc(fmtDrops(big(f.burned_by_programs).toString()))} <span class="dim">= the creation fee of an account a program's own send opened, out of the programs' balance (not the signer's): gone for good</span></dd>` : ""}
+    ${big(st.bonded) > 0n || big(st.refunded) > 0n || (Number.isSafeInteger(st.bytes_delta) && st.bytes_delta !== 0) ? `<dt>Storage</dt><dd>${esc(Number.isSafeInteger(st.bytes_delta) ? (st.bytes_delta >= 0 ? "+" : "") + st.bytes_delta.toLocaleString("en-US") : "?")} bytes · ${drops(st.bonded)} bonded · ${drops(st.refunded)} refunded</dd>` : ""}
+    ${list(f.balance_changes).length ? `<dt>Moved by its programs</dt><dd>${list(f.balance_changes).map((c) => `${acct(c.account)}: ${drops(c.change)}`).join("<br>")}<br><span class="dim">The programs' own diff: not the fee, and not what left outside it.</span></dd>` : ""}
+  </dl>`);
+  const c = p.claims || {};
+  const returns = list(c.return_data), events = list(c.events), omitted = c.omitted && typeof c.omitted === "object" ? c.omitted : null;
+  if (!returns.length && !events.length && !omitted && !o.untrusted_message) return facts;
+  const claims = card(`<h2>What the program reports</h2><p class="dim">${term("program_claim", "Claims")}: the chain applied the facts above and checks none of this. It's what the programs said, under names their deployer chose.</p><ul class="claims">
+    ${o.untrusted_message ? `<li>aborted with the message ${named(o.untrusted_message, 256)}</li>` : ""}
+    ${returns.map((r) => `<li>${acct(r.program)} · ${named(r.untrusted_method)} returned ${hexData(r.data)}${big(r.value) > 0n ? ` <span class="dim">(sent ${drops(r.value)})</span>` : ""}</li>`).join("")}
+    ${events.map((e) => `<li>${acct(e.program)} · emitted ${named(e.untrusted_name)} with ${hexData(e.data)}</li>`).join("")}
+    ${omitted ? `<li class="dim">${esc(num(omitted.events))} events and ${esc(num(omitted.return_bytes))} bytes of return data were left out of this receipt (the block's claims budget): its facts are all here.</li>` : ""}
+  </ul>`);
+  return facts + claims;
+}
+
+/** A type from an interface ("u64", { vec: ["address", 8] }) as a short signature: a closed vocabulary, each part cut. */
+const typeText = (t, depth = 0) => {
+  if (typeof t === "string") return inert(t, 16);
+  if (depth > 4 || !t || typeof t !== "object") return "?";
+  const [key, value] = Object.entries(t)[0] || [];
+  if (key === "option") return `option<${typeText(value, depth + 1)}>`;
+  if (key === "vec" && Array.isArray(value)) return `vec<${typeText(value[0], depth + 1)}, ${inert(value[1], 6)}>`;
+  if (key === "bytes" || key === "text") return `${key}(${inert(value, 6)})`;
+  return "?";
+};
+
+views.program = async function (address) {
+  if (!isAddr(address)) throw new Error("A program is named by its address (boo1… or tboo1…), never by a .boo name");
+  const [p, a] = await Promise.all([api("/program/" + encodeURIComponent(address)), api("/account/" + encodeURIComponent(address)).catch(() => null)]);
+  const methods = Array.isArray(p.methods) ? p.methods : null;
+  const upgrade = p.authority ? `${esc(p.authority.address)} may upgrade it, to ${p.policy === "open" ? "any code" : "code that keeps every method"}, with ${esc(num(p.upgrade_delay_blocks))} blocks' notice, once a protocol version adds program upgrades. None exists yet: it can't today.` : "Immutable: no account can ever change this program's code.";
+  const kindWords = (k) => (k === "call" ? "call: a transaction runs it" : k === "view" ? "view: a read, nothing signed" : k === "init" ? "init: runs once, when the program is created" : "a kind this explorer doesn't know");
+  const method = (m) => `<div class="row"><div>${named(m.untrusted_name)}(${list(m.args).map((x) => `${named(x.untrusted_name)}: <span class="mono">${esc(typeText(x.type))}</span>`).join(", ")})${m.returns ? ` → <span class="mono">${esc(typeText(m.returns))}</span>` : ""}<br><span class="dim">${esc(kindWords(m.kind))}${m.payable ? ", payable" : ""}</span></div></div>`;
+  return `<div class="stack">
+    ${card(`<span class="eyebrow">${term("program", "Program")} · deployed</span><h1 class="mono">${esc(address)}</h1><p class="dim">WebAssembly anyone can deploy, run by the chain under a fuel meter. What it holds and stores are facts the state proves; every name it uses is its deployer's claim.</p>`)}
+    <div class="figures">
+      ${stat(fang(p.balance_display), "FANG it holds")}
+      ${stat(esc(num(p.storage && p.storage.items)), "storage entries")}
+      ${stat(esc(num(p.version)), term("digest", "version"))}
+      ${stat(esc(num(p.created_at)), "created at block")}
+    </div>
+    ${card(`<h2>The record</h2><dl>
+      <dt>Created by</dt><dd>${who(p.creator)} at block <a href="#/block/${esc(p.created_at)}">#${esc(p.created_at)}</a></dd>
+      <dt>Code</dt><dd><a href="#/code/${esc(p.code && p.code.wasm_hash)}" class="mono">${esc(p.code && p.code.wasm_hash)}</a> <span class="dim">(${p.code && p.code.size != null ? esc(num(p.code.size)) + " bytes" : "size unknown"})</span></dd>
+      <dt>Interface</dt><dd class="mono">${esc(p.code && p.code.interface_hash)}</dd>
+      <dt>${term("digest", "Version digest")}</dt><dd class="mono">${esc(p.version_digest)}<br><span class="dim">What a call binds: it runs only while the program still has exactly this code, interface and version.</span></dd>
+      <dt>Upgrades</dt><dd>${upgrade}</dd>
+      <dt>Takes plain transfers</dt><dd>${p.accepts_transfers ? "yes" : "no"}</dd>
+      <dt>Storage</dt><dd>${esc(num(p.storage && p.storage.items))} entries, ${esc(num(p.storage && p.storage.bytes))} bytes, ${drops(p.storage && p.storage.deposit)} bonded</dd>
+      <dt>Record deposit</dt><dd>${drops(p.record_deposit)} <span class="dim">bonded for good by</span> ${who(p.record_payer)}</dd>
+      <dt>Proof</dt><dd><a href="/api/proof/66/${esc(Array.from(new TextEncoder().encode(address), (b) => b.toString(16).padStart(2, "0")).join(""))}">its record with a Merkle proof</a> <span class="dim">against the state root (namespace 66)</span></dd>
+    </dl>`)}
+    ${card(`<h2>Methods</h2><p class="dim">Named by the deployer. The chain enforces each one's kind (a transaction, a read, or the initializer) and whether it takes FANG, nothing else about it.</p>${methods === null ? '<p class="empty">This node couldn\'t read the program\'s interface.</p>' : `<div class="rows">${methods.map(method).join("")}</div>`}`)}
+    ${card(`<h2>Call it</h2><p class="dim">This page signs nothing. Calls to a deployed program are signed with the CLI or the SDK:</p><pre class="mono">${esc(`blockula program view ${address} <method>\nblockula program call ${address} <method> --storage-limit 1`)}</pre>`)}
+    ${card(`<h2>Recent transactions</h2>${a && list(a.recent_txs).length ? `<div class="rows">${a.recent_txs.map(txRow).join("")}</div>` : '<p class="empty">No transaction has named it yet.</p>'}`)}
+  </div>`;
+};
+
+views.code = async function (hash) {
+  if (!/^[0-9a-f]{64}$/.test(hash)) throw new Error("A stored code is named by its 64-character hash");
+  const c = await api("/code/" + encodeURIComponent(hash));
+  return `<div class="stack">
+    ${card(`<span class="eyebrow">${term("program", "Program")} code</span><h1 class="mono">${esc(hash)}</h1><p class="dim">WebAssembly stored by its hash. Programs are created from it; it is usable from the block after the one that stored it.</p>`)}
+    ${card(`<dl>
+      <dt>Size</dt><dd>${esc(num(c.size))} bytes</dd>
+      <dt>Stored by</dt><dd>${c.uploader ? who(c.uploader) : "—"}${c.uploaded_at != null ? ` at block <a href="#/block/${esc(c.uploaded_at)}">#${esc(c.uploaded_at)}</a>` : ""}</dd>
+      <dt>Deposit</dt><dd>${c.deposit != null ? drops(c.deposit) : "—"}</dd>
+      <dt>Programs using it</dt><dd>${c.refs != null ? esc(num(c.refs)) : "—"}</dd>
+      <dt>Methods it exports</dt><dd>${list(c.untrusted_exports).map((e) => named(e)).join(" ")}<br><span class="dim">named by the deployer</span></dd>
+    </dl>`)}
+  </div>`;
+};
+
 function txRow(t) {
   return `<div class="row"><div><a href="#/tx/${t.id}">${esc(t.summary)}</a>${t.memo ? ` <span class="dim"><i>“${esc(t.memo)}”</i></span>` : ""}</div><span class="pill ${t.status}">${t.status}</span></div>`;
 }
@@ -644,7 +788,7 @@ async function route() {
   // Own views only: `views["constructor"]` is Object, which hands the route id back unescaped.
   const fn = Object.hasOwn(views, view) ? views[view] : views.home;
   // Detail pages (a block, tx, account, name) don't belong to one section; a single hunt does.
-  const sections = { block: null, tx: null, account: null, name: null, hunt: "hunts", claim: "contribute", seance: "contribute", proposal: "governance" };
+  const sections = { block: null, tx: null, account: null, name: null, program: null, code: null, hunt: "hunts", claim: "contribute", seance: "contribute", proposal: "governance" };
   const current = Object.hasOwn(sections, view) ? sections[view] : view;
   document.querySelectorAll("nav a").forEach((a) => a.toggleAttribute("aria-current", current !== null && a.getAttribute("href") === `#/${current}`));
   try {

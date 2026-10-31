@@ -116,9 +116,29 @@ Measured on an idle chain of 4 validators on one machine, on Oct 22, 2026 (the s
 - **Upgrade** with `blockula release install vX.Y.Z` ([OPERATIONS.md](OPERATIONS.md#installing-and-upgrading)).
 - **Check on it:** every node's explorer shows blocks, accounts and validators, and `/api/health` answers 200 while the node is in sync.
 
+## Programs (experimental, off by default)
+
+Programs are small programs, written for WebAssembly, that anyone on your chain can upload and run: a bit like apps that live on the ledger. The node has them built in but switched off. You only need this section if you want to try them.
+
+**Start a chain with programs from the first block:**
+
+```bash
+blockula summon mychain --host <your address> --programs
+```
+
+`blockula dev --programs` does the same for a throwaway local chain to experiment on (add `--reset` to replace one that already exists). It's the genesis that says so, so a chain made without `--programs` can't get them by restarting it with the flag. It can get them by a vote: the validators schedule protocol v2 if the chain isn't on it yet, then switch the feature on ([GOVERNANCE.md](GOVERNANCE.md#programs-optional-off-by-default)). Either way, the machines need a release that supports protocol v2, and `blockula program --help` then uploads, creates, calls and views programs. The full specification is [PROGRAMS-V0.md](PROGRAMS-V0.md).
+
+**What you take on by turning them on:**
+
+- **Strangers' code runs on every validator.** It's metered and sandboxed, and the node is built to cope when it misbehaves, but it's new and not yet audited. Treat programs as an experiment, not as something to rely on: a chain made with them now may need to be recreated after an update.
+- **A little more memory.** Don't set a tight memory or process limit on the service ([OPERATIONS.md](OPERATIONS.md#limits-a-validator-needs) has the numbers).
+- **Everyone runs the same release.** If one validator runs another build, it can fail on programs the others run fine.
+- **A pause button, and the duty to agree on it.** If something is wrong with programs, enough validators can stop new program transactions for three days (one if your chain has 1 to 3 validators, two of 4, three of 7). On a small chain that means any one of you can pause programs for three days, and keep doing it for up to 30 days of every 60, so choose validators you trust. Agree with the others before anyone signs, then `blockula program pause --key ~/.blockula/mychain/validator.key`. A validator signs it from its own account, so keep a few FANG there. [OPERATIONS.md](OPERATIONS.md#the-pause) walks through it.
+- **Programs can hold FANG.** FANG has no value on your chain, but there's a cap on how much programs can hold together (10,000,000 FANG to start with) that a vote can change, and a vote can switch programs off again (they keep what they hold and people can take it out).
+
 ## Good to know
 
 - **Try it first** on Blockula's public testnet, which runs the same software: [testnet.blockula.app](https://testnet.blockula.app).
-- **Programs** (small programs in WebAssembly that run on the chain) are built into the node but switched off. They're an optional feature for later.
+- **Programs** (small programs in WebAssembly that run on the chain) are optional and off unless you ask for them: [see above](#programs-experimental-off-by-default).
 - **Making blocks only when there are transactions** would cut an idle chain's cost further. That's a protocol change, for later.
 - **The software comes as is,** with no warranty ([LICENSE](../LICENSE)). If you ever want your chain's FANG to have value, by selling it or paying people in it, that's your project, and a question for your own lawyer.

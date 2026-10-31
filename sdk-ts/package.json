@@ -17,8 +17,9 @@
   "scripts": {
     "build": "tsc",
     "test": "tsx test/e2e.ts && tsx test/e2e-integrators.ts",
+    "test:programs": "tsx test/e2e-programs.ts",
     "test:kat": "tsx test/kat.ts",
-    "test:vectors": "tsx test/passkey-vectors.ts && tsx test/proof-vectors.ts && tsx test/tx-vectors.ts && tsx test/unit.ts && tsx test/integrators.ts && tsx test/examples.ts"
+    "test:vectors": "tsx test/passkey-vectors.ts && tsx test/proof-vectors.ts && tsx test/tx-vectors.ts && tsx test/program-vectors.ts && tsx test/programs.ts && tsx test/unit.ts && tsx test/integrators.ts && tsx test/examples.ts"
   },
   "license": "MIT",
   "dependencies": {

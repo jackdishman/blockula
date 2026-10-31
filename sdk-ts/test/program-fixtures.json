@@ -1,0 +1,1059 @@
+{
+ "_about": "Recorded from `blockula dev --programs` (node 0.5.2 at 9e8cd806) with the counter and escrow guests of node/vm/tests/programs: real answers of /api/program, /api/code, /api/interface, /api/fees, /api/params, /api/proof, /api/tx (a finalized upload, create, failed call, call that writes, payable call, release and abort) and /view. test/programs.ts serves them from a fake node and holds the SDK's checks to them; the hostile variants it makes are rewrites of these.",
+ "counter": {
+  "code": {
+   "deposit": "56500000",
+   "height": 27,
+   "last_used_at": 15,
+   "refs": 1,
+   "size": 565,
+   "untrusted_exports": [
+    "get",
+    "increment"
+   ],
+   "uploaded_at": 15,
+   "uploader": {
+    "address": "boo1fer2zyhavwtt6vjcf3uex2w4la29kg23k5c87qrzw9geh0qrd24sxf0epf",
+    "name": null,
+    "short": "boo1fer2zy\u2026xf0epf"
+   },
+   "wasm_hash": "b7ecebb3e444cd5f074173fc0a385c6ea40df2a4358acd07a7707eca7e5c325e"
+  },
+  "code_wasm": {
+   "deposit": "56500000",
+   "height": 27,
+   "last_used_at": 15,
+   "refs": 1,
+   "size": 565,
+   "untrusted_exports": [
+    "get",
+    "increment"
+   ],
+   "uploaded_at": 15,
+   "uploader": {
+    "address": "boo1fer2zyhavwtt6vjcf3uex2w4la29kg23k5c87qrzw9geh0qrd24sxf0epf",
+    "name": null,
+    "short": "boo1fer2zy\u2026xf0epf"
+   },
+   "wasm": "0061736d01000000012b086000017f60057f7f7f7f7f0060037f7f7f0060027f7f0060047f7f7f7f017f6000006000017e60017f00027e0508626c6f636b756c610c696e7075745f6c656e5f7631000008626c6f636b756c611073746f726167655f77726974655f7631000108626c6f636b756c610861626f72745f7631000208626c6f636b756c610e72657475726e5f646174615f7631000308626c6f636b756c610f73746f726167655f726561645f76310004030a090502050607050505050504010120200608017f01418080040b072203066d656d6f7279020006626b5f67657400070c626b5f696e6372656d656e74000a0a9402091500024010000d000f0b410141808004410c1006000b0b002000200120021002000b2401017f230041106b22002400100520001008370308200041086a1009200041106a24000b5403017f017e017f230041106b220024004200210102400240418c80044101200041086a410810042202417f460d0020024108470d01200029030821010b200041106a240020010f0b4103418d8004410d1006000b08002000410810030b5302017f017e230041106b220024001005024010082201427f510d002000200142017c2201370308418c80044101200041086a41084100100120002001370308200041086a1009200041106a24000f0b100b000b0500100d000b0d00417f419a800441051006000b0500100c000b0b270100418080040b1f696e707574206c656e6774686e73746f726564206c656e67746870616e6963",
+   "wasm_hash": "b7ecebb3e444cd5f074173fc0a385c6ea40df2a4358acd07a7707eca7e5c325e"
+  },
+  "interface": {
+   "deposit": "2600000",
+   "height": 27,
+   "hex": "010203676574010000010409696e6372656d656e740000000104",
+   "interface_hash": "330ad24843011b5d7d605df8fa06ffcae430eb98da7aa72c9e24c1519375f2c0",
+   "last_used_at": 15,
+   "refs": 1,
+   "size": 26,
+   "untrusted_interface": {
+    "format": 1,
+    "methods": [
+     {
+      "args": [],
+      "kind": "view",
+      "name": "get",
+      "payable": false,
+      "returns": "u64"
+     },
+     {
+      "args": [],
+      "kind": "call",
+      "name": "increment",
+      "payable": false,
+      "returns": "u64"
+     }
+    ]
+   },
+   "uploaded_at": 15,
+   "uploader": {
+    "address": "boo1fer2zyhavwtt6vjcf3uex2w4la29kg23k5c87qrzw9geh0qrd24sxf0epf",
+    "name": null,
+    "short": "boo1fer2zy\u2026xf0epf"
+   }
+  },
+  "program": {
+   "accepts_transfers": false,
+   "address": "boo1juzwlx65f3vp0s6v5aj46pjqr7h5m573uksm2k6ply8hgsmuqqpq949pt3",
+   "authority": null,
+   "balance": "0",
+   "balance_display": "0 FANG",
+   "code": {
+    "interface_hash": "330ad24843011b5d7d605df8fa06ffcae430eb98da7aa72c9e24c1519375f2c0",
+    "size": 565,
+    "wasm_hash": "b7ecebb3e444cd5f074173fc0a385c6ea40df2a4358acd07a7707eca7e5c325e"
+   },
+   "created_at": 21,
+   "creator": {
+    "address": "boo1fer2zyhavwtt6vjcf3uex2w4la29kg23k5c87qrzw9geh0qrd24sxf0epf",
+    "name": null,
+    "short": "boo1fer2zy\u2026xf0epf"
+   },
+   "height": 27,
+   "methods": [
+    {
+     "args": [],
+     "kind": "view",
+     "payable": false,
+     "returns": "u64",
+     "selector": "1d3fce7875d1cf4c",
+     "untrusted_name": "get"
+    },
+    {
+     "args": [],
+     "kind": "call",
+     "payable": false,
+     "returns": "u64",
+     "selector": "f6d67bcc8c301090",
+     "untrusted_name": "increment"
+    }
+   ],
+   "policy": "open",
+   "proof_path": "/api/proof/66/626f6f316a757a776c783635663376703073367635616a3436706a71723768356d353733756b736d326b36706c79386867736d7571717071393439707433",
+   "record_deposit": "25600000",
+   "record_payer": {
+    "address": "boo1fer2zyhavwtt6vjcf3uex2w4la29kg23k5c87qrzw9geh0qrd24sxf0epf",
+    "name": null,
+    "short": "boo1fer2zy\u2026xf0epf"
+   },
+   "storage": {
+    "bytes": 0,
+    "deposit": "0",
+    "items": 0,
+    "sponsored": "0"
+   },
+   "upgradability": "immutable",
+   "upgrade_delay_blocks": 0,
+   "version": 1,
+   "version_digest": "48ea55a4a4ef63563ec13618a0b7e44b09072b1f6cdcd269c45746d86f33e4e3"
+  },
+  "proof": {
+   "block_hash": "6ed90e25ea8e2b1704acce07b0e8f28590f622fc04199400af7e10c66095610f",
+   "height": 27,
+   "key": "626f6f316a757a776c783635663376703073367635616a3436706a71723768356d353733756b736d326b36706c79386867736d7571717071393439707433",
+   "namespace": 66,
+   "proof": {
+    "leaf": {
+     "key": "335a72691b5930c63b3fa14e0046537cb46ad209082443940306b16dd324912d",
+     "value": "f32931078ecf488cf83a1a3a84dcedf92da9718da97f35cdc23253bca66b2b11"
+    },
+    "siblings": [
+     "e3fc83015e5d34496d09dd9ef28a1cd9dbe031dfdea3aa6386b402ed5eb6b5fb",
+     "4d77e01c9182b163d39fdbf72f8ff153dc68ea684d9c7c38bc126bc71035a6ce",
+     "686833211f9abe1201d5df440c10378b4e388b26e1f8998afd6e2a8a8019c220",
+     "9cbb6f50ac8f30638cbee26e67348aef0e9781ca520609237e3f92c81bbab653",
+     "0000000000000000000000000000000000000000000000000000000000000000",
+     "9cbb58fbd801e107d90628009c54cff722a236be83bc05f51a70e99cb4bc5701",
+     "0000000000000000000000000000000000000000000000000000000000000000",
+     "2c229c2a2dcaddda606b036cc9ff19091add344d590d42eb2595475e45337b38"
+    ]
+   },
+   "root": "c836788cdb4ad9260de6d02d706c75f5b042eca75dcd6631a00e57ae45e289da",
+   "value": "013e000000626f6f31666572327a7968617677747436766a6366337565783277346c6132396b6732336b3563383771727a7739676568307172643234737866306570661500000000000000b7ecebb3e444cd5f074173fc0a385c6ea40df2a4358acd07a7707eca7e5c325e330ad24843011b5d7d605df8fa06ffcae430eb98da7aa72c9e24c1519375f2c0010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a08601000000003e000000626f6f31666572327a7968617677747436766a6366337565783277346c6132396b6732336b3563383771727a773967656830717264323473786630657066"
+  },
+  "tx_call_failed": {
+   "action": {
+    "bindings": [],
+    "calls": [
+     {
+      "input": "",
+      "method": "increment",
+      "program": "boo1juzwlx65f3vp0s6v5aj46pjqr7h5m573uksm2k6ply8hgsmuqqpq949pt3",
+      "value": "0",
+      "version_digest": "48ea55a4a4ef63563ec13618a0b7e44b09072b1f6cdcd269c45746d86f33e4e3"
+     }
+    ],
+    "fuel_limit": 10000000,
+    "storage_limit": "0",
+    "type": "call_program"
+   },
+   "amount": null,
+   "amount_display": null,
+   "error": "program boo1juzwlx\u2026949pt3 trapped: storage limit (trap 25)",
+   "fee": "2574060",
+   "fee_display": "0.00257406 FANG",
+   "from": {
+    "address": "boo1fer2zyhavwtt6vjcf3uex2w4la29kg23k5c87qrzw9geh0qrd24sxf0epf",
+    "name": null,
+    "short": "boo1fer2zy\u2026xf0epf"
+   },
+   "height": 29,
+   "id": "2087ef8258ea207141ba02bb00e9b45dcd21f27464ddf6cdc3d24e789b33cafb",
+   "kind": "call_program",
+   "max_fee": "18455665",
+   "memo": "",
+   "nonce": 2,
+   "program": {
+    "claims": {
+     "events": [],
+     "omitted": null,
+     "return_data": [
+      {
+       "data": "",
+       "program": "boo1juzwlx65f3vp0s6v5aj46pjqr7h5m573uksm2k6ply8hgsmuqqpq949pt3",
+       "untrusted_method": "increment",
+       "value": "0"
+      }
+     ]
+    },
+    "facts": {
+     "balance_changes": [],
+     "burned_by_programs": "0",
+     "created": null,
+     "fee": {
+      "bytes": "65910",
+      "fuel": "2508150",
+      "tip": "0"
+     },
+     "fuel": {
+      "limit": 10000000,
+      "load": 32600,
+      "rate": 250,
+      "reserved": 10032600,
+      "used": 76123
+     },
+     "outside_vm": {
+      "account_creation_fee": "0",
+      "record_deposit": "0",
+      "total": "0",
+      "upload_deposit": "0"
+     },
+     "storage": {
+      "bonded": "0",
+      "bytes_delta": 0,
+      "refunded": "0"
+     },
+     "upload": null
+    },
+    "kind": "call",
+    "outcome": {
+     "code": "trapped",
+     "number": 1,
+     "ok": false,
+     "program": "boo1juzwlx65f3vp0s6v5aj46pjqr7h5m573uksm2k6ply8hgsmuqqpq949pt3",
+     "trap": {
+      "name": "storage_limit",
+      "number": 25
+     }
+    },
+    "version": 1
+   },
+   "signature_scheme": "ML-DSA-65 (FIPS 204)",
+   "signer_key": "4e46a112fd6396bd32584c799329d5ff545b2151b5307f006271519bbc036aab",
+   "size_bytes": 5591,
+   "status": "failed",
+   "summary": "boo1fer2zy\u2026xf0epf called program boo1juzwlx\u2026949pt3",
+   "tip": "0",
+   "to": null,
+   "to_name": null,
+   "valid_until": 627
+  },
+  "tx_call_ok": {
+   "action": {
+    "bindings": [],
+    "calls": [
+     {
+      "input": "",
+      "method": "increment",
+      "program": "boo1juzwlx65f3vp0s6v5aj46pjqr7h5m573uksm2k6ply8hgsmuqqpq949pt3",
+      "value": "0",
+      "version_digest": "48ea55a4a4ef63563ec13618a0b7e44b09072b1f6cdcd269c45746d86f33e4e3"
+     }
+    ],
+    "fuel_limit": 10000000,
+    "storage_limit": "1000000000",
+    "type": "call_program"
+   },
+   "amount": null,
+   "amount_display": null,
+   "error": null,
+   "fee": "2574060",
+   "fee_display": "0.00257406 FANG",
+   "from": {
+    "address": "boo1fer2zyhavwtt6vjcf3uex2w4la29kg23k5c87qrzw9geh0qrd24sxf0epf",
+    "name": null,
+    "short": "boo1fer2zy\u2026xf0epf"
+   },
+   "height": 30,
+   "id": "3f80598225b450bc7b4684d7ddb0bf935405c163c9e167a08a80d9af43ca27b3",
+   "kind": "call_program",
+   "max_fee": "18455665",
+   "memo": "",
+   "nonce": 3,
+   "program": {
+    "claims": {
+     "events": [],
+     "omitted": null,
+     "return_data": [
+      {
+       "data": "0100000000000000",
+       "program": "boo1juzwlx65f3vp0s6v5aj46pjqr7h5m573uksm2k6ply8hgsmuqqpq949pt3",
+       "untrusted_method": "increment",
+       "value": "0"
+      }
+     ]
+    },
+    "facts": {
+     "balance_changes": [
+      {
+       "account": "boo1fer2zyhavwtt6vjcf3uex2w4la29kg23k5c87qrzw9geh0qrd24sxf0epf",
+       "change": "-12800000"
+      }
+     ],
+     "burned_by_programs": "0",
+     "created": null,
+     "fee": {
+      "bytes": "65910",
+      "fuel": "2508150",
+      "tip": "0"
+     },
+     "fuel": {
+      "limit": 10000000,
+      "load": 32600,
+      "rate": 250,
+      "reserved": 10032600,
+      "used": 76273
+     },
+     "outside_vm": {
+      "account_creation_fee": "0",
+      "record_deposit": "0",
+      "total": "0",
+      "upload_deposit": "0"
+     },
+     "storage": {
+      "bonded": "12800000",
+      "bytes_delta": 128,
+      "refunded": "0"
+     },
+     "upload": null
+    },
+    "kind": "call",
+    "outcome": {
+     "ok": true
+    },
+    "version": 1
+   },
+   "signature_scheme": "ML-DSA-65 (FIPS 204)",
+   "signer_key": "4e46a112fd6396bd32584c799329d5ff545b2151b5307f006271519bbc036aab",
+   "size_bytes": 5591,
+   "status": "finalized",
+   "summary": "boo1fer2zy\u2026xf0epf called program boo1juzwlx\u2026949pt3",
+   "tip": "0",
+   "to": null,
+   "to_name": null,
+   "valid_until": 629
+  },
+  "tx_create": {
+   "action": {
+    "accepts_transfers": false,
+    "authority": null,
+    "bindings": [],
+    "fuel_limit": 0,
+    "init": null,
+    "interface_hash": "330ad24843011b5d7d605df8fa06ffcae430eb98da7aa72c9e24c1519375f2c0",
+    "policy": "open",
+    "storage_limit": "28160000",
+    "type": "create_program",
+    "upgrade_delay_blocks": 0,
+    "wasm_hash": "b7ecebb3e444cd5f074173fc0a385c6ea40df2a4358acd07a7707eca7e5c325e"
+   },
+   "amount": null,
+   "amount_display": null,
+   "error": null,
+   "fee": "65820",
+   "fee_display": "0.00006582 FANG",
+   "from": {
+    "address": "boo1fer2zyhavwtt6vjcf3uex2w4la29kg23k5c87qrzw9geh0qrd24sxf0epf",
+    "name": null,
+    "short": "boo1fer2zy\u2026xf0epf"
+   },
+   "height": 21,
+   "id": "c2a690c3c93ab700a77b73ed038ff38e96d915d4c3b73f07100570242b666698",
+   "kind": "create_program",
+   "max_fee": "65820",
+   "memo": "",
+   "nonce": 1,
+   "program": {
+    "claims": {
+     "events": [],
+     "omitted": null,
+     "return_data": []
+    },
+    "facts": {
+     "balance_changes": [],
+     "burned_by_programs": "0",
+     "created": "boo1juzwlx65f3vp0s6v5aj46pjqr7h5m573uksm2k6ply8hgsmuqqpq949pt3",
+     "fee": {
+      "bytes": "65820",
+      "fuel": "0",
+      "tip": "0"
+     },
+     "fuel": {
+      "limit": 0,
+      "load": 0,
+      "rate": 250,
+      "reserved": 0,
+      "used": 0
+     },
+     "outside_vm": {
+      "account_creation_fee": "100000000",
+      "record_deposit": "25600000",
+      "total": "125600000",
+      "upload_deposit": "0"
+     },
+     "storage": {
+      "bonded": "25600000",
+      "bytes_delta": 256,
+      "refunded": "0"
+     },
+     "upload": null
+    },
+    "kind": "create",
+    "outcome": {
+     "ok": true
+    },
+    "version": 1
+   },
+   "signature_scheme": "ML-DSA-65 (FIPS 204)",
+   "signer_key": "4e46a112fd6396bd32584c799329d5ff545b2151b5307f006271519bbc036aab",
+   "size_bytes": 5582,
+   "status": "finalized",
+   "summary": "boo1fer2zy\u2026xf0epf created program boo1juzwlx\u2026949pt3 (immutable) from code b7ecebb3e4\u2026",
+   "tip": "0",
+   "to": null,
+   "to_name": null,
+   "valid_until": 620
+  },
+  "tx_upload": {
+   "action": {
+    "interface": "010203676574010000010409696e6372656d656e740000000104",
+    "storage_limit": "65010000",
+    "type": "upload_code",
+    "wasm": "0061736d01000000012b086000017f60057f7f7f7f7f0060037f7f7f0060027f7f0060047f7f7f7f017f6000006000017e60017f00027e0508626c6f636b756c610c696e7075745f6c656e5f7631000008626c6f636b756c611073746f726167655f77726974655f7631000108626c6f636b756c610861626f72745f7631000208626c6f636b756c610e72657475726e5f646174615f7631000308626c6f636b756c610f73746f726167655f726561645f76310004030a090502050607050505050504010120200608017f01418080040b072203066d656d6f7279020006626b5f67657400070c626b5f696e6372656d656e74000a0a9402091500024010000d000f0b410141808004410c1006000b0b002000200120021002000b2401017f230041106b22002400100520001008370308200041086a1009200041106a24000b5403017f017e017f230041106b220024004200210102400240418c80044101200041086a410810042202417f460d0020024108470d01200029030821010b200041106a240020010f0b4103418d8004410d1006000b08002000410810030b5302017f017e230041106b220024001005024010082201427f510d002000200142017c2201370308418c80044101200041086a41084100100120002001370308200041086a1009200041106a24000f0b100b000b0500100d000b0d00417f419a800441051006000b0500100c000b0b270100418080040b1f696e707574206c656e6774686e73746f726564206c656e67746870616e6963"
+   },
+   "amount": null,
+   "amount_display": null,
+   "error": null,
+   "fee": "93260",
+   "fee_display": "0.00009326 FANG",
+   "from": {
+    "address": "boo1fer2zyhavwtt6vjcf3uex2w4la29kg23k5c87qrzw9geh0qrd24sxf0epf",
+    "name": null,
+    "short": "boo1fer2zy\u2026xf0epf"
+   },
+   "height": 15,
+   "id": "86186474b554be3b5aecee31d8ca9d7fe7059700bc96016713030861a0229dd9",
+   "kind": "upload_code",
+   "max_fee": "238834",
+   "memo": "",
+   "nonce": 0,
+   "program": {
+    "claims": {
+     "events": [],
+     "omitted": null,
+     "return_data": []
+    },
+    "facts": {
+     "balance_changes": [],
+     "burned_by_programs": "0",
+     "created": null,
+     "fee": {
+      "bytes": "70270",
+      "fuel": "22990",
+      "tip": "0"
+     },
+     "fuel": {
+      "limit": 91961,
+      "load": 0,
+      "rate": 250,
+      "reserved": 91961,
+      "used": 91961
+     },
+     "outside_vm": {
+      "account_creation_fee": "0",
+      "record_deposit": "0",
+      "total": "59100000",
+      "upload_deposit": "59100000"
+     },
+     "storage": {
+      "bonded": "59100000",
+      "bytes_delta": 591,
+      "refunded": "0"
+     },
+     "upload": {
+      "deposit": "59100000",
+      "interface_hash": "330ad24843011b5d7d605df8fa06ffcae430eb98da7aa72c9e24c1519375f2c0",
+      "new_code": true,
+      "new_interface": true,
+      "wasm_hash": "b7ecebb3e444cd5f074173fc0a385c6ea40df2a4358acd07a7707eca7e5c325e"
+     }
+    },
+    "kind": "upload",
+    "outcome": {
+     "ok": true
+    },
+    "version": 1
+   },
+   "signature_scheme": "ML-DSA-65 (FIPS 204)",
+   "signer_key": "4e46a112fd6396bd32584c799329d5ff545b2151b5307f006271519bbc036aab",
+   "size_bytes": 6027,
+   "status": "finalized",
+   "summary": "boo1fer2zy\u2026xf0epf uploaded program code b7ecebb3e4\u2026 (565 bytes) with interface 330ad24843\u2026 (2 methods), bonding at most 0.06501 FANG",
+   "tip": "0",
+   "to": null,
+   "to_name": null,
+   "valid_until": 614
+  },
+  "view_ok": {
+   "fuel_used": 70973,
+   "height": 30,
+   "ok": true,
+   "outcome": {
+    "ok": true
+   },
+   "return_data": "0100000000000000"
+  },
+  "view_out_of_fuel": {
+   "fuel_used": 1,
+   "height": 700,
+   "ok": false,
+   "outcome": {
+    "code": "trapped",
+    "number": 1,
+    "ok": false,
+    "program": "boo1juzwlx65f3vp0s6v5aj46pjqr7h5m573uksm2k6ply8hgsmuqqpq949pt3",
+    "trap": {
+     "name": "out_of_fuel",
+     "number": 1
+    }
+   },
+   "return_data": null
+  }
+ },
+ "escrow": {
+  "accounts": {
+   "alice": "boo1nauwlw92jzn2wms7c0yxrmnrka5gewqank69quxujnuym4cwtm8qex9x4m",
+   "bob": "boo14d5my4rneugh2ucr0ems979tv3qs0hfy5e00v3npdjx986p4x68qsfwvtm"
+  },
+  "program": {
+   "accepts_transfers": false,
+   "address": "boo1ql2d64ndysapyr8zyvv9hudyfd8xc2x9axjz57e0ln7myqwfd2hs2tf44y",
+   "authority": null,
+   "balance": "0",
+   "balance_display": "0 FANG",
+   "code": {
+    "interface_hash": "1cac93c3daf68b69d222168a8ded8d409fdbd68355e094ba0de727a261bcc0f3",
+    "size": 3389,
+    "wasm_hash": "ea880d6f98eafceff247f8d25bc38445587a6ad243e6d521a7eb17b2f226ffb0"
+   },
+   "created_at": 684,
+   "creator": {
+    "address": "boo1nauwlw92jzn2wms7c0yxrmnrka5gewqank69quxujnuym4cwtm8qex9x4m",
+    "name": null,
+    "short": "boo1nauwlw\u2026ex9x4m"
+   },
+   "height": 688,
+   "methods": [
+    {
+     "args": [
+      {
+       "type": "u64",
+       "untrusted_name": "id"
+      },
+      {
+       "type": "address",
+       "untrusted_name": "seller"
+      }
+     ],
+     "kind": "call",
+     "payable": true,
+     "returns": null,
+     "selector": "368748746e189a1a",
+     "untrusted_name": "open"
+    },
+    {
+     "args": [
+      {
+       "type": "u64",
+       "untrusted_name": "id"
+      }
+     ],
+     "kind": "call",
+     "payable": false,
+     "returns": null,
+     "selector": "b1fb5e1f31ef7557",
+     "untrusted_name": "refund"
+    },
+    {
+     "args": [
+      {
+       "type": "u64",
+       "untrusted_name": "id"
+      }
+     ],
+     "kind": "call",
+     "payable": false,
+     "returns": null,
+     "selector": "425207ee37b97af1",
+     "untrusted_name": "release"
+    }
+   ],
+   "policy": "open",
+   "proof_path": "/api/proof/66/626f6f31716c326436346e64797361707972387a7976763968756479666438786332783961786a7a353765306c6e376d7971776664326873327466343479",
+   "record_deposit": "25600000",
+   "record_payer": {
+    "address": "boo1nauwlw92jzn2wms7c0yxrmnrka5gewqank69quxujnuym4cwtm8qex9x4m",
+    "name": null,
+    "short": "boo1nauwlw\u2026ex9x4m"
+   },
+   "storage": {
+    "bytes": 0,
+    "deposit": "0",
+    "items": 0,
+    "sponsored": "0"
+   },
+   "upgradability": "immutable",
+   "upgrade_delay_blocks": 0,
+   "version": 1,
+   "version_digest": "b2b39e36f59fb02316335331516911f452d63c6218ee347d06acc385b15da562"
+  },
+  "tx_abort": {
+   "action": {
+    "bindings": [],
+    "calls": [
+     {
+      "input": "0700000000000000",
+      "method": "release",
+      "program": "boo1ql2d64ndysapyr8zyvv9hudyfd8xc2x9axjz57e0ln7myqwfd2hs2tf44y",
+      "value": "0",
+      "version_digest": "b2b39e36f59fb02316335331516911f452d63c6218ee347d06acc385b15da562"
+     }
+    ],
+    "fuel_limit": 10000000,
+    "storage_limit": "0",
+    "type": "call_program"
+   },
+   "amount": null,
+   "amount_display": null,
+   "error": "program boo1ql2d64\u20262tf44y aborted with code 22",
+   "fee": "2602360",
+   "fee_display": "0.00260236 FANG",
+   "from": {
+    "address": "boo1nauwlw92jzn2wms7c0yxrmnrka5gewqank69quxujnuym4cwtm8qex9x4m",
+    "name": null,
+    "short": "boo1nauwlw\u2026ex9x4m"
+   },
+   "height": 688,
+   "id": "0b64c62a3ee1efe5fcb311bf0cb5351c462dfc731d43a2c00dc48da75943244a",
+   "kind": "call_program",
+   "max_fee": "18662781",
+   "memo": "",
+   "nonce": 4,
+   "program": {
+    "claims": {
+     "events": [],
+     "omitted": null,
+     "return_data": [
+      {
+       "data": "",
+       "program": "boo1ql2d64ndysapyr8zyvv9hudyfd8xc2x9axjz57e0ln7myqwfd2hs2tf44y",
+       "untrusted_method": "release",
+       "value": "0"
+      }
+     ]
+    },
+    "facts": {
+     "balance_changes": [],
+     "burned_by_programs": "0",
+     "created": null,
+     "fee": {
+      "bytes": "65970",
+      "fuel": "2536390",
+      "tip": "0"
+     },
+     "fuel": {
+      "limit": 10000000,
+      "load": 145560,
+      "rate": 250,
+      "reserved": 10145560,
+      "used": 76359
+     },
+     "outside_vm": {
+      "account_creation_fee": "0",
+      "record_deposit": "0",
+      "total": "0",
+      "upload_deposit": "0"
+     },
+     "storage": {
+      "bonded": "0",
+      "bytes_delta": 0,
+      "refunded": "0"
+     },
+     "upload": null
+    },
+    "kind": "call",
+    "outcome": {
+     "abort_code": 22,
+     "code": "aborted",
+     "number": 2,
+     "ok": false,
+     "program": "boo1ql2d64ndysapyr8zyvv9hudyfd8xc2x9axjz57e0ln7myqwfd2hs2tf44y",
+     "untrusted_message": "no deal"
+    },
+    "version": 1
+   },
+   "signature_scheme": "ML-DSA-65 (FIPS 204)",
+   "signer_key": "9f78efb8aa90a6a76e1ec3c861ee63b7688cb81d9db45070dc94f84dd70e5ece",
+   "size_bytes": 5597,
+   "status": "failed",
+   "summary": "boo1nauwlw\u2026ex9x4m called program boo1ql2d64\u20262tf44y",
+   "tip": "0",
+   "to": null,
+   "to_name": null,
+   "valid_until": 1287
+  },
+  "tx_open": {
+   "action": {
+    "bindings": [],
+    "calls": [
+     {
+      "input": "0100000000000000ab69b25473cf117573037e7702f8ab644107dd24a65ef646616c8c53e835368e",
+      "method": "open",
+      "program": "boo1ql2d64ndysapyr8zyvv9hudyfd8xc2x9axjz57e0ln7myqwfd2hs2tf44y",
+      "value": "1000000000",
+      "version_digest": "b2b39e36f59fb02316335331516911f452d63c6218ee347d06acc385b15da562"
+     }
+    ],
+    "fuel_limit": 10000000,
+    "storage_limit": "1000000000",
+    "type": "call_program"
+   },
+   "amount": null,
+   "amount_display": null,
+   "error": null,
+   "fee": "2602650",
+   "fee_display": "0.00260265 FANG",
+   "from": {
+    "address": "boo1nauwlw92jzn2wms7c0yxrmnrka5gewqank69quxujnuym4cwtm8qex9x4m",
+    "name": null,
+    "short": "boo1nauwlw\u2026ex9x4m"
+   },
+   "height": 686,
+   "id": "9cb3787d133f420633b7d4b5051ce21b3452bb10c5c82ba50c0bae3650b12083",
+   "kind": "call_program",
+   "max_fee": "18663071",
+   "memo": "",
+   "nonce": 2,
+   "program": {
+    "claims": {
+     "events": [
+      {
+       "data": "01000000000000009f78efb8aa90a6a76e1ec3c861ee63b7688cb81d9db45070dc94f84dd70e5eceab69b25473cf117573037e7702f8ab644107dd24a65ef646616c8c53e835368e00ca9a3b00000000",
+       "program": "boo1ql2d64ndysapyr8zyvv9hudyfd8xc2x9axjz57e0ln7myqwfd2hs2tf44y",
+       "untrusted_name": "open"
+      }
+     ],
+     "omitted": null,
+     "return_data": [
+      {
+       "data": "",
+       "program": "boo1ql2d64ndysapyr8zyvv9hudyfd8xc2x9axjz57e0ln7myqwfd2hs2tf44y",
+       "untrusted_method": "open",
+       "value": "1000000000"
+      }
+     ]
+    },
+    "facts": {
+     "balance_changes": [
+      {
+       "account": "boo1ql2d64ndysapyr8zyvv9hudyfd8xc2x9axjz57e0ln7myqwfd2hs2tf44y",
+       "change": "1000000000"
+      },
+      {
+       "account": "boo1nauwlw92jzn2wms7c0yxrmnrka5gewqank69quxujnuym4cwtm8qex9x4m",
+       "change": "-1019200000"
+      }
+     ],
+     "burned_by_programs": "0",
+     "created": null,
+     "fee": {
+      "bytes": "66260",
+      "fuel": "2536390",
+      "tip": "0"
+     },
+     "fuel": {
+      "limit": 10000000,
+      "load": 145560,
+      "rate": 250,
+      "reserved": 10145560,
+      "used": 92801
+     },
+     "outside_vm": {
+      "account_creation_fee": "0",
+      "record_deposit": "0",
+      "total": "0",
+      "upload_deposit": "0"
+     },
+     "storage": {
+      "bonded": "19200000",
+      "bytes_delta": 192,
+      "refunded": "0"
+     },
+     "upload": null
+    },
+    "kind": "call",
+    "outcome": {
+     "ok": true
+    },
+    "version": 1
+   },
+   "signature_scheme": "ML-DSA-65 (FIPS 204)",
+   "signer_key": "9f78efb8aa90a6a76e1ec3c861ee63b7688cb81d9db45070dc94f84dd70e5ece",
+   "size_bytes": 5626,
+   "status": "finalized",
+   "summary": "boo1nauwlw\u2026ex9x4m called program boo1ql2d64\u20262tf44y with 1 FANG attached",
+   "tip": "0",
+   "to": null,
+   "to_name": null,
+   "valid_until": 1285
+  },
+  "tx_release": {
+   "action": {
+    "bindings": [],
+    "calls": [
+     {
+      "input": "0100000000000000",
+      "method": "release",
+      "program": "boo1ql2d64ndysapyr8zyvv9hudyfd8xc2x9axjz57e0ln7myqwfd2hs2tf44y",
+      "value": "0",
+      "version_digest": "b2b39e36f59fb02316335331516911f452d63c6218ee347d06acc385b15da562"
+     }
+    ],
+    "fuel_limit": 10000000,
+    "storage_limit": "0",
+    "type": "call_program"
+   },
+   "amount": null,
+   "amount_display": null,
+   "error": null,
+   "fee": "2602360",
+   "fee_display": "0.00260236 FANG",
+   "from": {
+    "address": "boo1nauwlw92jzn2wms7c0yxrmnrka5gewqank69quxujnuym4cwtm8qex9x4m",
+    "name": null,
+    "short": "boo1nauwlw\u2026ex9x4m"
+   },
+   "height": 687,
+   "id": "1bee1a40263d82955b64d41e4c8f8847dfce6d7c63e642e4d76fd6dd6b348771",
+   "kind": "call_program",
+   "max_fee": "18662781",
+   "memo": "",
+   "nonce": 3,
+   "program": {
+    "claims": {
+     "events": [
+      {
+       "data": "0100000000000000ab69b25473cf117573037e7702f8ab644107dd24a65ef646616c8c53e835368e00ca9a3b00000000",
+       "program": "boo1ql2d64ndysapyr8zyvv9hudyfd8xc2x9axjz57e0ln7myqwfd2hs2tf44y",
+       "untrusted_name": "release"
+      }
+     ],
+     "omitted": null,
+     "return_data": [
+      {
+       "data": "",
+       "program": "boo1ql2d64ndysapyr8zyvv9hudyfd8xc2x9axjz57e0ln7myqwfd2hs2tf44y",
+       "untrusted_method": "release",
+       "value": "0"
+      }
+     ]
+    },
+    "facts": {
+     "balance_changes": [
+      {
+       "account": "boo1ql2d64ndysapyr8zyvv9hudyfd8xc2x9axjz57e0ln7myqwfd2hs2tf44y",
+       "change": "-1000000000"
+      },
+      {
+       "account": "boo1nauwlw92jzn2wms7c0yxrmnrka5gewqank69quxujnuym4cwtm8qex9x4m",
+       "change": "19200000"
+      },
+      {
+       "account": "boo14d5my4rneugh2ucr0ems979tv3qs0hfy5e00v3npdjx986p4x68qsfwvtm",
+       "change": "900000000"
+      }
+     ],
+     "burned_by_programs": "100000000",
+     "created": null,
+     "fee": {
+      "bytes": "65970",
+      "fuel": "2536390",
+      "tip": "0"
+     },
+     "fuel": {
+      "limit": 10000000,
+      "load": 145560,
+      "rate": 250,
+      "reserved": 10145560,
+      "used": 104181
+     },
+     "outside_vm": {
+      "account_creation_fee": "0",
+      "record_deposit": "0",
+      "total": "0",
+      "upload_deposit": "0"
+     },
+     "storage": {
+      "bonded": "0",
+      "bytes_delta": -192,
+      "refunded": "19200000"
+     },
+     "upload": null
+    },
+    "kind": "call",
+    "outcome": {
+     "ok": true
+    },
+    "version": 1
+   },
+   "signature_scheme": "ML-DSA-65 (FIPS 204)",
+   "signer_key": "9f78efb8aa90a6a76e1ec3c861ee63b7688cb81d9db45070dc94f84dd70e5ece",
+   "size_bytes": 5597,
+   "status": "finalized",
+   "summary": "boo1nauwlw\u2026ex9x4m called program boo1ql2d64\u20262tf44y",
+   "tip": "0",
+   "to": null,
+   "to_name": null,
+   "valid_until": 1286
+  }
+ },
+ "fees": {
+  "account_creation_fee": "100000000",
+  "account_creation_fee_display": "0.1 FANG",
+  "floor": {
+   "flat": "10000",
+   "per_byte": "10"
+  },
+  "fuel": {
+   "block_fuel": 0,
+   "floor_rate": 250,
+   "load_base": 10000,
+   "load_per_byte": 40,
+   "max_block_fuel": 40000000,
+   "max_tx_code_bytes": 524288,
+   "max_tx_fuel": 10000000,
+   "paused_until": null,
+   "rate": 250,
+   "rate_unit": "milli-drops per fuel",
+   "schedule": 0,
+   "sponsored": "0",
+   "state_bytes": 847,
+   "state_soft_bytes": 67108864,
+   "status": "on",
+   "storage_price": "100000",
+   "suggested_rate": 1833,
+   "upload_base": 50000,
+   "upload_per_byte": 71,
+   "value_cap": "10000000000000000",
+   "value_headroom": "10000000000000000",
+   "value_held": "0"
+  },
+  "height": 27,
+  "lag": 17,
+  "lowest": {
+   "flat": "10000",
+   "rate": "10000"
+  },
+  "max_change_bps": 1250,
+  "rate_scale": 1000,
+  "slots": [
+   {
+    "flat": "10000",
+    "ghost_max_block_bytes": 1048576,
+    "ghost_max_tx_bytes": 262144,
+    "height": 27,
+    "max_block_bytes": 2097152,
+    "rate": "10000"
+   },
+   {
+    "flat": "10000",
+    "ghost_max_block_bytes": 1048576,
+    "ghost_max_tx_bytes": 262144,
+    "height": 28,
+    "max_block_bytes": 2097152,
+    "rate": "10000"
+   }
+  ],
+  "suggested": {
+   "flat": "10000",
+   "rate": "10000"
+  },
+  "target_fullness_bps": 5000,
+  "tip_cap_multiple": 20
+ },
+ "params_programs": {
+  "escrow": "84700000",
+  "fix_pending": false,
+  "fuel_rate": 250,
+  "params": {
+   "program_fuel_floor_rate": {
+    "class": "council",
+    "default": "250",
+    "max": "1000000",
+    "min": "1",
+    "value": "250"
+   },
+   "program_max_block_fuel": {
+    "class": "council",
+    "default": "40000000",
+    "max": "60000000",
+    "min": "20000000",
+    "value": "40000000"
+   },
+   "program_max_tx_fuel": {
+    "class": "council",
+    "default": "10000000",
+    "max": "20000000",
+    "min": "1000000",
+    "value": "10000000"
+   },
+   "program_min_upgrade_delay_blocks": {
+    "class": "tokens_only",
+    "default": "172800",
+    "max": "7776000",
+    "min": "3600",
+    "value": "172800"
+   },
+   "program_state_soft_bytes": {
+    "class": "council",
+    "default": "67108864",
+    "max": "536870912",
+    "min": "16777216",
+    "value": "67108864"
+   },
+   "program_storage_price": {
+    "class": "council",
+    "default": "100000",
+    "max": "10000000",
+    "min": "1000",
+    "value": "100000"
+   },
+   "program_value_cap": {
+    "class": "council",
+    "default": "10000000000000000",
+    "max": "1000000000000000000",
+    "min": "0",
+    "value": "10000000000000000"
+   }
+  },
+  "pause": null,
+  "pause_signed": [],
+  "paused_until": null,
+  "programs": 1,
+  "sponsored": "0",
+  "state_bytes": 847,
+  "status": "on",
+  "value_held": "0",
+  "votes": []
+ }
+}

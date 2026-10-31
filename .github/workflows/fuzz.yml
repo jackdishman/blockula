@@ -35,6 +35,12 @@ env:
   # Pinned so a nightly regression can't masquerade as a finding; bump deliberately.
   # (nightly-2026-10-13 panics compiling p3-monty-31, which Ghost Mode's prover pulls in.)
   FUZZ_NIGHTLY: nightly-2026-10-06
+  # The most units a target's cached corpus keeps between nights (scripts/fuzz-bound-corpus.sh):
+  # libFuzzer replays the whole corpus before it fuzzes and doesn't stop for -max_total_time, so an
+  # unbounded one would one day take the whole budget to replay, and the job would fuzz nothing new
+  # and stay green. A state-machine unit costs tens of milliseconds, so 2,000 replay in under a
+  # minute. scripts/check-fuzz-workflow.sh requires the bound before the fuzzers start.
+  CORPUS_MAX_UNITS: "2000"
 
 jobs:
   harness:
@@ -68,7 +74,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [cblock, tx_json, tx_wire, snapshot_manifest, state_snapshot, sync_batch, epochs_registry, certificate, state_machine, ghost_tx, evidence]
+        target: [cblock, tx_json, tx_wire, snapshot_manifest, state_snapshot, sync_batch, epochs_registry, certificate, state_machine, ghost_tx, evidence, program_tx_codec, program_receipt, program_commit, state_machine_programs]
     env:
       SECONDS_PER_TARGET: ${{ github.event.inputs.seconds || '300' }}
       TARGET: ${{ matrix.target }}
@@ -96,12 +102,24 @@ jobs:
           path: node/fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: fuzz-corpus-${{ matrix.target }}-
+      # A cached corpus is replayed in full before the fuzzing starts: bound it first.
+      - name: Bound the corpus
+        working-directory: node
+        run: |
+          mkdir -p "fuzz/corpus/$TARGET"
+          ../scripts/fuzz-bound-corpus.sh "fuzz/corpus/$TARGET" "$CORPUS_MAX_UNITS"
       - name: Fuzz
         id: fuzz
         working-directory: node
         run: |
           mkdir -p "fuzz/corpus/$TARGET" "$RUNNER_TEMP/crash/$TARGET"
-          if cargo "+$FUZZ_NIGHTLY" fuzz run "$TARGET" "fuzz/corpus/$TARGET" "fuzz/seeds/$TARGET" -- "-max_total_time=$SECONDS_PER_TARGET" -timeout=20 -rss_limit_mb=4096 -print_final_stats=0 > "$RUNNER_TEMP/crash/$TARGET/fuzz.log" 2>&1; then
+          # The state machines' inputs are op streams: libFuzzer's length control would hold them to the
+          # shortest seed's length (229 bytes in S8f's first run), so they start at the maximum.
+          LENGTH=()
+          case "$TARGET" in
+            state_machine | state_machine_programs) LENGTH=(-len_control=0 -max_len=4096) ;;
+          esac
+          if cargo "+$FUZZ_NIGHTLY" fuzz run "$TARGET" "fuzz/corpus/$TARGET" "fuzz/seeds/$TARGET" -- "-max_total_time=$SECONDS_PER_TARGET" -timeout=20 -rss_limit_mb=4096 "${LENGTH[@]}" -print_final_stats=0 > "$RUNNER_TEMP/crash/$TARGET/fuzz.log" 2>&1; then
             echo "✓ $TARGET: no crash in ${SECONDS_PER_TARGET}s"
             rm -rf "$RUNNER_TEMP/crash/$TARGET"
           else
@@ -119,6 +137,85 @@ jobs:
           if [ -n "$RECIPIENTS" ]; then sudo apt-get update -qq > /dev/null && sudo apt-get install -y -qq --no-install-recommends age > /dev/null; fi
           ../scripts/fuzz-seal-crash.sh "$TARGET" "$RUNNER_TEMP/crash/$TARGET" "$RUNNER_TEMP/sealed"
         working-directory: node
+      - name: Upload the sealed crash
+        if: failure() && steps.seal.outputs.sealed == '1'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: ${{ runner.temp }}/sealed/fuzz-crash-${{ matrix.target }}.tar.age
+          if-no-files-found: error
+          retention-days: 14
+
+  # The programs engine's fuzzers (node/vm/fuzz, docs/PROGRAMS-V0.md §10.4): upload validation and the
+  # test translation of whatever it accepts, the executor, and the interface codec. A crate and a
+  # corpus of their own, and the campaign's flags (docs/PROGRAMS-V0.md §10.6: a run past 10 seconds is
+  # a hang, and a hang is a finding; 2 GiB is the memory bound), otherwise the job above: its output
+  # goes to a file, and a crash leaves the runner only sealed.
+  fuzz-vm:
+    name: Fuzz ${{ matrix.target }}
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [program_validate, program_exec, interface_codec]
+    env:
+      SECONDS_PER_TARGET: ${{ github.event.inputs.seconds || '300' }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - name: Rust toolchains (rust-toolchain.toml, and the pinned nightly)
+        run: rustup toolchain install && rustup toolchain install "$FUZZ_NIGHTLY" --profile minimal && rustc "+$FUZZ_NIGHTLY" --version
+      # One shared cache of the instrumented dependencies (identical for every target).
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with: { workspaces: node/vm/fuzz, shared-key: fuzz-vm-nightly, save-if: "${{ matrix.target == 'program_validate' }}" }
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version 0.13.2
+      # cargo-fuzz has no --locked: fail here instead if node/vm/fuzz/Cargo.lock is out of date.
+      - name: Dependencies match node/vm/fuzz/Cargo.lock
+        run: cargo fetch --locked --manifest-path node/vm/fuzz/Cargo.toml
+      # Built in its own step, so a build failure is in the log; the run below prints nothing.
+      - name: Build the fuzzer
+        working-directory: node/vm
+        run: cargo "+$FUZZ_NIGHTLY" fuzz build "$TARGET"
+      # The corpus is saved only after a run without a crash (actions/cache saves on success).
+      - name: Restore the corpus
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: node/vm/fuzz/corpus/${{ matrix.target }}
+          key: fuzz-vm-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-vm-corpus-${{ matrix.target }}-
+      # A cached corpus is replayed in full before the fuzzing starts: bound it first.
+      - name: Bound the corpus
+        working-directory: node/vm
+        run: |
+          mkdir -p "fuzz/corpus/$TARGET"
+          ../../scripts/fuzz-bound-corpus.sh "fuzz/corpus/$TARGET" "$CORPUS_MAX_UNITS"
+      - name: Fuzz
+        id: fuzz
+        working-directory: node/vm
+        run: |
+          mkdir -p "fuzz/corpus/$TARGET" "$RUNNER_TEMP/crash/$TARGET"
+          if cargo "+$FUZZ_NIGHTLY" fuzz run "$TARGET" "fuzz/corpus/$TARGET" "fuzz/seeds/$TARGET" -- "-max_total_time=$SECONDS_PER_TARGET" -timeout=10 -rss_limit_mb=2048 -print_final_stats=0 > "$RUNNER_TEMP/crash/$TARGET/fuzz.log" 2>&1; then
+            echo "✓ $TARGET: no crash in ${SECONDS_PER_TARGET}s"
+            rm -rf "$RUNNER_TEMP/crash/$TARGET"
+          else
+            echo "crash=1" >> "$GITHUB_OUTPUT"
+            echo "::error::Fuzz $TARGET: crash found (a panic, a timeout or an out-of-memory input). Its details are sealed for the maintainers; it's handled as a private security advisory (SECURITY.md)."
+            exit 1
+          fi
+      - name: Seal the crash for the maintainers
+        id: seal
+        if: failure() && steps.fuzz.outputs.crash == '1'
+        env:
+          RECIPIENTS: ${{ vars.FUZZ_CRASH_AGE_RECIPIENTS }}
+        run: |
+          if [ -d "fuzz/artifacts/$TARGET" ]; then mv "fuzz/artifacts/$TARGET" "$RUNNER_TEMP/crash/$TARGET/artifacts"; fi
+          if [ -n "$RECIPIENTS" ]; then sudo apt-get update -qq > /dev/null && sudo apt-get install -y -qq --no-install-recommends age > /dev/null; fi
+          ../../scripts/fuzz-seal-crash.sh "$TARGET" "$RUNNER_TEMP/crash/$TARGET" "$RUNNER_TEMP/sealed"
+        working-directory: node/vm
       - name: Upload the sealed crash
         if: failure() && steps.seal.outputs.sealed == '1'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

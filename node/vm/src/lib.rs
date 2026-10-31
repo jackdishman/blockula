@@ -9,7 +9,11 @@
 //! * [`config`], [`meter`]: limits and the fuel schedule.
 //! * [`validate`]: upload validation (4.2), before any engine sees the code.
 //! * [`upload`]: `UploadCode`'s checks on new code: validation, then a test translation (7.1).
-//! * [`engine`]: the engine-neutral boundary and its backends (an engine per transaction).
+//! * [`interface`]: interface format 1, the methods a program declares, and their match with its
+//!   code's exports (docs/PROGRAMS-V0.md §3).
+//! * [`engine`]: the engine-neutral boundary and its backends (an engine per transaction outside a
+//!   block pass, one per pass in the node: README.md, "How the node drives it", and
+//!   CALIBRATION-node.md, "A3: one thread and one engine per block pass").
 //! * [`host`], [`overlay`], [`exec`]: execution against a read-only view and a sorted diff (4.4),
 //!   frames, method kinds, the declared program set, no reentrancy, depth 8 (8.1, 8.2).
 //! * [`storage`]: an entry's accounted capacity and the price curve (6.2, 6.3).
@@ -23,6 +27,7 @@ pub mod meter;
 pub mod engine;
 pub mod exec;
 pub mod host;
+pub mod interface;
 pub mod overlay;
 pub mod storage;
 #[cfg(feature = "testing")]

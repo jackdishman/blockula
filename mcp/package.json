@@ -15,7 +15,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "test": "tsc && node ../scripts/mcp-shrinkwrap.mjs --dry-run && tsx test/network.ts && tsx test/spend.ts && tsx test/agent.ts"
+    "test": "tsc && node ../scripts/mcp-shrinkwrap.mjs --dry-run && tsx test/network.ts && tsx test/spend.ts && tsx test/agent.ts && tsx test/programs.ts"
   },
   "license": "MIT",
   "dependencies": {

@@ -62,6 +62,9 @@ pub struct Node {
     pub p2p_peers: Option<Arc<dyn Fn() -> Option<Vec<String>> + Send + Sync>>,
     /// This node's validator address (its key's), if it has one: /metrics marks its series `own="1"`.
     pub me: Option<String>,
+    /// Whether this node serves program views, with how much fuel, and how many run at once
+    /// (programs/view_api.rs).
+    pub(crate) views: Arc<crate::programs::view_api::ViewGate>,
 }
 
 /// When this process started (unix seconds), for `blockula_process_start_time_seconds`.
@@ -203,6 +206,12 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// A hit [`Node::allow_per_ip`] took from a client's budget, which [`Node::refund_per_ip`] gives back.
+pub(crate) struct IpHit {
+    rules: Vec<(String, usize, Duration)>,
+    at: Instant,
+}
+
 /// Sliding-window rate limits, in memory.
 #[derive(Default)]
 struct Limits {
@@ -329,12 +338,20 @@ pub const FORWARD_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl Node {
     pub fn new(chain: Shared, marshal: Option<MarshalMailbox>, peers: Vec<String>, client_ip: ClientIpPolicy) -> Self {
-        let (live, halt, me) = {
+        let (live, halt, me, role) = {
             let c = chain.lock();
-            (c.live.clone(), c.halt.signal.clone(), c.me())
+            (c.live.clone(), c.halt.signal.clone(), c.me(), c.role)
         };
         let http = reqwest::Client::builder().timeout(FORWARD_TIMEOUT).build().expect("an HTTP client with a timeout");
-        Self { chain, live, marshal, peers, http, client_ip, limits: Default::default(), reads: Arc::new(ReadLimiter::new(READ_RPS, READ_BURST)), timeout: HTTP_TIMEOUT, stats: Default::default(), extra_metrics: None, github_cache: Default::default(), checkpoint_height: 0, halt, protection: None, p2p_peers: None, me }
+        Self { chain, live, marshal, peers, http, client_ip, limits: Default::default(), reads: Arc::new(ReadLimiter::new(READ_RPS, READ_BURST)), timeout: HTTP_TIMEOUT, stats: Default::default(), extra_metrics: None, github_cache: Default::default(), checkpoint_height: 0, halt, protection: None, p2p_peers: None, me, views: crate::programs::view_api::ViewGate::for_role(role) }
+    }
+
+    /// Whether this node serves program views, and the most fuel one may use (`None`: the
+    /// transaction maximum, `program_max_tx_fuel`). A full node serves them by default and a
+    /// validator doesn't (docs/PROGRAMS-V0.md §8.2): `on` turns them on for either, and never off.
+    pub fn with_program_views(mut self, on: bool, max_fuel: Option<u64>) -> Self {
+        self.views = crate::programs::view_api::ViewGate::new(self.views.enabled() || on, max_fuel);
+        self
     }
 
     /// Per-client read limits: `rps` per second, bursts of `burst` (`rps` 0: unlimited).
@@ -346,8 +363,26 @@ impl Node {
     /// The client's IP for rate limiting, or `None` for local (loopback, un-proxied) callers.
     /// Order: `X-Blockula-Client-IP` from an authenticated forwarder (secret or trusted socket
     /// IP), then the configured proxy header, then the socket peer. Unconfigured headers are ignored.
-    fn client_ip(&self, peer: SocketAddr, h: &HeaderMap) -> Option<IpAddr> {
+    pub(crate) fn client_ip(&self, peer: SocketAddr, h: &HeaderMap) -> Option<IpAddr> {
         self.client_ip.resolve(peer, h)
+    }
+
+    /// Takes one hit of `client`'s budget for `what` (`max` per `window`, kept beside the other
+    /// writes' windows in `Limits`), or says how long until there's room. The hit, to give back
+    /// with [`Node::refund_per_ip`] if the request turns out to be one the node refuses for its own
+    /// reasons; a local caller (`None`) has no budget, so no hit.
+    pub(crate) fn allow_per_ip(&self, what: &str, client: Option<IpAddr>, max: usize, window: Duration) -> Result<Option<IpHit>, Duration> {
+        let Some(ip) = client else { return Ok(None) };
+        let rules = vec![(format!("{what}:{}", ip_key(ip)), max, window)];
+        let at = self.limits.allow(&rules)?;
+        Ok(Some(IpHit { rules, at }))
+    }
+
+    /// Gives back a hit [`Node::allow_per_ip`] took.
+    pub(crate) fn refund_per_ip(&self, hit: Option<IpHit>) {
+        if let Some(IpHit { rules, at }) = hit {
+            self.limits.refund(&rules, at);
+        }
     }
 
 
@@ -530,7 +565,7 @@ pub fn p2p_transport() -> String {
     format!("{}, ML-DSA-65 peer auth ({label})", commonware_stream::hybrid::SUITE)
 }
 
-struct ApiError(StatusCode, String);
+pub(crate) struct ApiError(pub(crate) StatusCode, pub(crate) String);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -580,11 +615,11 @@ impl IntoResponse for Refused {
     }
 }
 
-fn not_found(what: &str) -> ApiError {
+pub(crate) fn not_found(what: &str) -> ApiError {
     ApiError(StatusCode::NOT_FOUND, format!("{what} not found"))
 }
 
-type ApiResult = Result<Json<Value>, ApiError>;
+pub(crate) type ApiResult = Result<Json<Value>, ApiError>;
 
 pub fn router(node: Node) -> Router {
     Router::new()
@@ -629,6 +664,11 @@ pub fn router(node: Node) -> Router {
         .route("/api/health", get(health))
         .route("/api/upgrade", get(upgrade))
         .route("/api/beacon", get(beacon))
+        .route("/api/program/{address}", get(crate::programs::api::program))
+        .route("/api/program/{address}/storage", get(crate::programs::api::storage))
+        .route("/api/code/{hash}", get(crate::programs::api::code))
+        .route("/api/interface/{hash}", get(crate::programs::api::interface))
+        .route("/api/program/{address}/view", post(crate::programs::view_api::view))
         .route("/metrics", get(metrics))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(axum::middleware::from_fn_with_state(node.clone(), limit_reads))
@@ -637,7 +677,7 @@ pub fn router(node: Node) -> Router {
         .with_state(node)
 }
 
-fn label(v: &ReadView, addr: &str) -> Value {
+pub(crate) fn label(v: &ReadView, addr: &str) -> Value {
     let st = &v.state;
     let system = crate::chain::system_account(st.params.prefix(), addr).map(|role| match role {
         "treasury" => "🏛️ treasury".to_string(),
@@ -655,16 +695,18 @@ fn label(v: &ReadView, addr: &str) -> Value {
 }
 
 fn tx_json(v: &ReadView, tx: &Tx, height: Option<u64>) -> Value {
-    tx_json_with(v, tx, height.map(|height| Ran { height, idx: None, meta: None }), None)
+    tx_json_with(v, tx, height.map(|height| Ran { height, idx: None, meta: None, block: None }), None)
 }
 
 /// Where a sealed tx ran: its block's height and, when the caller has them, its index in the
-/// block and the block's index row (for who its action named, see `named_at_execution`).
+/// block, the block's index row (for who its action named, see `named_at_execution`) and the block
+/// itself (for a program tx's receipt, `programs::tx_json`).
 #[derive(Clone, Copy)]
 struct Ran<'a> {
     height: u64,
     idx: Option<usize>,
     meta: Option<&'a BlockMeta>,
+    block: Option<&'a Block>,
 }
 
 /// The account a sealed tx's action named, as the chain resolved it when its block ran: the tx's
@@ -745,9 +787,11 @@ fn tx_json_with(v: &ReadView, tx: &Tx, ran: Option<Ran>, error: Option<&str>) ->
         Action::Unshield { to, amount, .. } => ("unshield", named(to), Some(*amount)),
         a => (a.kind(), None, None),
     };
+    // A program tx's receipt (programs/tx_json.rs), for the tx a block ran.
+    let receipt = ran.and_then(|r| crate::programs::tx_json::receipt_of(v, tx, r.height, r.idx, r.block));
     // An unsigned ghost tx pays exactly its fee (it's in its proof's value balance).
-    let charged = if tx.is_unsigned() { tx.fee } else { charged(v, tx, height) };
-    json!({
+    let charged = if tx.is_unsigned() { tx.fee } else { charged(v, tx, height, receipt.as_ref()) };
+    let mut out = json!({
         "id": tx.id(),
         "summary": v.describe(tx, height),
         "kind": kind,
@@ -774,13 +818,23 @@ fn tx_json_with(v: &ReadView, tx: &Tx, ran: Option<Ran>, error: Option<&str>) ->
         // Ghost bundles without their ~130 KiB proof (its size and hash instead).
         "action": crate::ghost::action_json(&tx.action).unwrap_or_else(|| json!(tx.action)),
         "signature_scheme": if tx.is_unsigned() { "none: a Plonky3 STARK (the Action proof) authorizes it" } else { "ML-DSA-65 (FIPS 204)" },
-    })
+    });
+    // Only a program transaction has the key (every other tx's JSON is what it always was): the
+    // receipt, or null where there's none to show (pending, or pruned).
+    if crate::programs::is_program_tx(tx) {
+        out["program"] = crate::programs::tx_json::section(receipt.as_ref());
+    }
+    out
 }
 
 /// What a tx was (or, pending, would next be) charged: its block's base fee for its size plus
 /// its tip, at most its `fee`. Blocks record their base fee (P-ECON); a pending tx is priced at
-/// the next block's.
-fn charged(v: &ReadView, tx: &Tx, height: Option<u64>) -> u64 {
+/// the next block's. A program tx a block ran was charged what its receipt says (its bytes' base
+/// fee, its fuel fee and its tip: `programs::tx_json::charged`).
+fn charged(v: &ReadView, tx: &Tx, height: Option<u64>, receipt: Option<&crate::programs::receipt::ProgramReceipt>) -> u64 {
+    if let Some(r) = receipt {
+        return crate::programs::tx_json::charged(r).min(tx.fee);
+    }
     let charge = match height.and_then(|h| v.base_fee(h)) {
         Some(slot) => slot.fee(tx.size()).checked_add(tx.tip),
         None => crate::econ::charge(&v.state, tx, height.unwrap_or_else(|| crate::econ::now(&v.state))),
@@ -825,7 +879,7 @@ fn block_json(v: &ReadView, b: &Block) -> Value {
         // The base fee its txs paid (flat drops + `rate` milli-drops per byte, econ.rs).
         "base_fee": b.base_fee.map(|s| json!({ "flat": s.flat.to_string(), "rate": s.rate.to_string(), "max_block_bytes": s.max_block_bytes })),
         "summary": block_summary(b.height, b.txs.len()),
-        "txs": b.txs.iter().enumerate().map(|(i, t)| tx_json_with(v, t, Some(Ran { height: b.height, idx: Some(i), meta: meta.as_ref() }), b.failed.get(&i).map(|s| s.as_str()))).collect::<Vec<_>>(),
+        "txs": b.txs.iter().enumerate().map(|(i, t)| tx_json_with(v, t, Some(Ran { height: b.height, idx: Some(i), meta: meta.as_ref(), block: Some(b) }), b.failed.get(&i).map(|s| s.as_str()))).collect::<Vec<_>>(),
         "signature_bytes": v.cert_len(b.height),
         "failed_count": b.failed.len(),
     })
@@ -948,7 +1002,7 @@ async fn tx(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
     if let Some((h, i)) = v.tx_location(&id) {
         if let Some((t, err)) = v.finalized_tx(h, i) {
             let meta = v.block_meta(h);
-            return Ok(Json(tx_json_with(&v, &t, Some(Ran { height: h, idx: Some(i), meta: meta.as_ref() }), err.as_deref())));
+            return Ok(Json(tx_json_with(&v, &t, Some(Ran { height: h, idx: Some(i), meta: meta.as_ref(), block: None }), err.as_deref())));
         }
     }
     let mp = n.live.mempool();
@@ -1002,16 +1056,18 @@ fn parse_tx(headers: &HeaderMap, body: &[u8]) -> Result<Tx, ApiError> {
 async fn submit_inner(n: &Node, headers: &HeaderMap, client: Option<IpAddr>, tx: Tx) -> Result<Json<Value>, Refused> {
     // Format + ML-DSA signature checks run without the chain lock, after the cheap check that the
     // fee covers the next block's base fee.
-    let (chain_id, genesis_hash, prefix, role, ghost_off) = {
+    let (chain_id, genesis_hash, prefix, role, early) = {
         let v = n.live.view();
         // Ghost txs are refused before their proof is verified while Ghost Mode is off or paused.
         let ghost_off = if tx.action.is_ghost() { crate::ghost::check_enabled(&v.state, v.height + 1).err() } else { None };
-        if ghost_off.is_none() {
+        // So are program txs that programs' status refuses at the next height (docs/PROGRAMS-V0.md §8.2).
+        let early = ghost_off.or_else(|| crate::programs::refuse_early(&v.state, &tx).err());
+        if early.is_none() {
             crate::econ::check_fee(&v.state, &tx, crate::econ::now(&v.state))?;
         }
-        (v.genesis.chain_id.clone(), v.genesis_hash.clone(), v.genesis.address_prefix.clone(), v.role, ghost_off)
+        (v.genesis.chain_id.clone(), v.genesis_hash.clone(), v.genesis.address_prefix.clone(), v.role, early)
     };
-    if let Some(e) = ghost_off {
+    if let Some(e) = early {
         return Err(e.into());
     }
     let tx = if tx.action.ghost_bundle().is_some() {
@@ -1278,6 +1334,9 @@ async fn metrics(State(n): State<Node>) -> Response {
         if let Some(h) = halt {
             let _ = writeln!(out, "# HELP blockula_halt_info Why the node halted\n# TYPE blockula_halt_info gauge\nblockula_halt_info{{kind=\"{}\"}} 1", h.kind());
         }
+        // Programs (programs/api.rs): nothing until programs first switch on.
+        out.push_str(&crate::programs::api::metrics(&v));
+        out.push_str(&crate::programs::view_api::metrics(&v));
     }
     if let Some(extra) = &n.extra_metrics {
         out.push_str(&extra());
@@ -1326,7 +1385,7 @@ async fn account(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
             json!({ "id": l.id, "reason": l.reason, "amount": l.amount.locked_at(now).to_string(), "amount_display": fmt_fang(l.amount.locked_at(now)), "until": until, "vesting": matches!(l.amount, crate::chain::LockAmount::Vesting { .. }) })
         })
         .collect();
-    Ok(Json(json!({
+    let mut out = json!({
         "account": label(&v, &addr),
         "balance": acct.balance.to_string(),
         "balance_display": fmt_fang(acct.balance),
@@ -1349,7 +1408,12 @@ async fn account(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
         "hunts_created": hunts_created,
         "hunts_won": hunts_won,
         "contribution": contribution_profile(&v, &addr),
-    })))
+    });
+    // A program's account: what it is, and where its record is (programs/api.rs).
+    if let Some(program) = crate::programs::api::account_section(&v, &addr) {
+        out["program"] = program;
+    }
+    Ok(Json(out))
 }
 
 /// Finalized txs (height, index in the block) as `/api/account` lists them, each block's index
@@ -1359,7 +1423,7 @@ fn finalized_json(v: &ReadView, rows: Vec<(u64, usize)>) -> Vec<Value> {
     for &(h, _) in &rows {
         metas.entry(h).or_insert_with(|| v.block_meta(h));
     }
-    rows.into_iter().filter_map(|(h, i)| v.finalized_tx(h, i).map(|(t, e)| tx_json_with(v, &t, Some(Ran { height: h, idx: Some(i), meta: metas.get(&h).and_then(Option::as_ref) }), e.as_deref()))).collect()
+    rows.into_iter().filter_map(|(h, i)| v.finalized_tx(h, i).map(|(t, e)| tx_json_with(v, &t, Some(Ran { height: h, idx: Some(i), meta: metas.get(&h).and_then(Option::as_ref), block: None }), e.as_deref()))).collect()
 }
 
 /// Txs per `/api/account/{id}/txs` page: by default, and at most.
@@ -1489,7 +1553,7 @@ async fn params(State(n): State<Node>) -> ApiResult {
     let params: serde_json::Map<String, Value> = st.chain_params.to_map().into_iter().map(|(k, v)| (k.to_string(), v.to_string().into())).collect();
     let epy = crate::econ::epochs_per_year(&st.params);
     let iss = st.econ.issuance;
-    Ok(Json(json!({
+    let mut out = json!({
         "params": params,
         "genesis": { "block_time_ms": st.params.block_time_ms, "epoch_blocks": st.params.epoch_blocks, "address_prefix": st.params.prefix(), "epochs_per_year": epy },
         "issuance": {
@@ -1509,7 +1573,12 @@ async fn params(State(n): State<Node>) -> ApiResult {
             "validators": crate::params::VALIDATOR_KEYS,
             "council": crate::params::COUNCIL_KEYS,
         },
-    })))
+    });
+    // Programs' parameters, classes and totals, once programs exist (programs/api.rs).
+    if let Some(programs) = crate::programs::api::params_section(&v) {
+        out["programs"] = programs;
+    }
+    Ok(Json(out))
 }
 
 /// The base fee (MAINNET-DESIGN 3.6): every block's slot from the last executed one to `lag`
@@ -1527,7 +1596,7 @@ async fn fees(State(n): State<Node>) -> ApiResult {
     let slot = |h: u64, s: &crate::econ::FeeSlot| json!({ "height": h, "flat": s.flat.to_string(), "rate": s.rate.to_string(), "max_block_bytes": s.max_block_bytes, "ghost_max_tx_bytes": s.ghost_max_tx_bytes, "ghost_max_block_bytes": s.ghost_max_block_bytes });
     let slots: Vec<Value> = st.econ.fees.iter().enumerate().map(|(i, s)| slot(st.econ.height + i as u64, s)).collect();
     let (s, low) = (crate::econ::suggested(st), crate::econ::lowest(st));
-    Ok(Json(json!({
+    let mut out = json!({
         "height": st.econ.height,
         "lag": FEE_LAG,
         "rate_scale": RATE_SCALE,
@@ -1540,7 +1609,12 @@ async fn fees(State(n): State<Node>) -> ApiResult {
         "max_change_bps": cp.base_fee_max_change_bps,
         "account_creation_fee": cp.account_creation_fee.to_string(),
         "account_creation_fee_display": fmt_fang(cp.account_creation_fee),
-    })))
+    });
+    // What program fuel costs, once programs exist (programs/api.rs).
+    if let Some(fuel) = crate::programs::api::fees_fuel(st) {
+        out["fuel"] = fuel;
+    }
+    Ok(Json(out))
 }
 
 async fn search(State(n): State<Node>, Path(q): Path<String>) -> ApiResult {
@@ -1551,6 +1625,8 @@ async fn search(State(n): State<Node>, Path(q): Path<String>) -> ApiResult {
         json!({ "type": "block", "id": q })
     } else if v.tx_location(&q).is_some() || mp.contains(&q) || mp.failure(&q).is_some() {
         json!({ "type": "tx", "id": q })
+    } else if let Some(hit) = crate::programs::api::search(&v.state, &q) {
+        hit
     } else if crypto::is_address(&q) {
         json!({ "type": "account", "id": q })
     } else if let Ok(n) = normalize_name(&q) {

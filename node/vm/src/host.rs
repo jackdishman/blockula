@@ -397,3 +397,119 @@ impl Run<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What `sanitize` replaces, written out independently of it: the controls (`char::is_control`,
+    /// Unicode's `Cc`: C0, DEL and C1) and its table of format, bidi and private-use code points.
+    const REFUSED: &[(u32, u32)] = &[
+        (0x00, 0x1F),
+        (0x7F, 0x9F),
+        (0xAD, 0xAD),
+        (0x600, 0x605),
+        (0x61C, 0x61C),
+        (0x6DD, 0x6DD),
+        (0x70F, 0x70F),
+        (0x890, 0x891),
+        (0x8E2, 0x8E2),
+        (0x180E, 0x180E),
+        (0x200B, 0x200F),
+        (0x202A, 0x202E),
+        (0x2060, 0x2064),
+        (0x2066, 0x206F),
+        (0xE000, 0xF8FF),
+        (0xFEFF, 0xFEFF),
+        (0xFFF9, 0xFFFB),
+        (0x110BD, 0x110BD),
+        (0x110CD, 0x110CD),
+        (0x13430, 0x1343F),
+        (0x1BCA0, 0x1BCA3),
+        (0x1D173, 0x1D17A),
+        (0xE0001, 0xE0001),
+        (0xE0020, 0xE007F),
+        (0xF0000, 0xFFFFD),
+        (0x100000, 0x10FFFD),
+    ];
+
+    fn refused(c: u32) -> bool {
+        REFUSED.iter().any(|(lo, hi)| (*lo..=*hi).contains(&c))
+    }
+
+    fn one(c: char) -> String {
+        sanitize(c.encode_utf8(&mut [0; 4]).as_bytes())
+    }
+
+    /// docs/PROGRAMS-V0.md §9.2 freezes `sanitize`: a caller reads a callee's sanitized abort
+    /// message after `try_call_v1`, so its output is program-visible. Every Unicode scalar value
+    /// is either kept or replaced by U+FFFD exactly as `REFUSED` says, so a change to the table,
+    /// to `char::is_control` or to the replacement fails here; each range's bounds and the code
+    /// points just outside them are spelled out too.
+    #[test]
+    fn sanitize_replaces_exactly_its_table() {
+        for c in (0..=0x10FFFF).filter_map(char::from_u32) {
+            let expected = if refused(c as u32) { "\u{FFFD}".to_string() } else { c.to_string() };
+            assert_eq!(one(c), expected, "U+{:04X}", c as u32);
+        }
+        for (lo, hi) in REFUSED {
+            for inside in [*lo, *hi] {
+                assert_eq!(one(char::from_u32(inside).unwrap()), "\u{FFFD}", "U+{inside:04X}");
+            }
+            for outside in [lo.wrapping_sub(1), hi + 1] {
+                if let Some(c) = char::from_u32(outside).filter(|_| !refused(outside)) {
+                    assert_eq!(one(c), c.to_string(), "U+{outside:04X}");
+                }
+            }
+        }
+        // The neighbours a reader might expect refused, kept: no-break space, the line and
+        // paragraph separators, the word joiner's unassigned neighbour, the object replacement
+        // character, and plane 15's two noncharacters.
+        for kept in [0xA0, 0x2028, 0x2029, 0x2065, 0xFFFC, 0xFFFE, 0xFFFFE, 0xFFFFF, 0x10FFFE, 0x10FFFF] {
+            let c = char::from_u32(kept).unwrap();
+            assert_eq!(one(c), c.to_string(), "U+{kept:04X}");
+        }
+    }
+
+    /// The cut: at most `MAX_ABORT_MESSAGE` (256) bytes of output, counting what replaces a
+    /// refused character (3 bytes for U+FFFD), and never inside a character: the first one that
+    /// doesn't fit ends the message, even if a shorter one follows.
+    #[test]
+    fn sanitize_cuts_at_256_bytes_between_characters() {
+        let a = |n: usize| "a".repeat(n);
+        assert_eq!(sanitize(&[b'a'; 256]), a(256));
+        assert_eq!(sanitize(&[b'a'; 257]), a(256), "a 257-byte message");
+        assert_eq!(sanitize(&[b'a'; 10_000]), a(256));
+        assert_eq!(sanitize(format!("{}é", a(254)).as_bytes()), format!("{}é", a(254)), "ends exactly at 256");
+        assert_eq!(sanitize(format!("{}éb", a(255)).as_bytes()), a(255), "é doesn't fit, and b after it isn't taken");
+        assert_eq!(sanitize(format!("{}\0", a(253)).as_bytes()), format!("{}\u{FFFD}", a(253)), "the replacement's 3 bytes fit");
+        assert_eq!(sanitize(format!("{}\0", a(254)).as_bytes()), a(254), "the replacement's 3 bytes don't");
+        assert_eq!(sanitize(format!("{}🦇", a(252)).as_bytes()), format!("{}🦇", a(252)));
+        assert_eq!(sanitize(format!("{}🦇", a(253)).as_bytes()), a(253));
+        assert_eq!(sanitize(&[]), "");
+    }
+
+    /// Invalid UTF-8 becomes U+FFFD per maximal invalid subsequence, as `String::from_utf8_lossy`
+    /// decodes it; valid text around it is kept.
+    #[test]
+    fn sanitize_replaces_invalid_utf8() {
+        let vectors: &[(&[u8], &str)] = &[
+            (b"\xff", "\u{FFFD}"),
+            (b"a\xffb", "a\u{FFFD}b"),
+            (b"\xc3", "\u{FFFD}"),                                 // a 2-byte sequence cut short
+            (b"\xc3(", "\u{FFFD}("),
+            (b"\xe2\x82", "\u{FFFD}"),                             // a 3-byte sequence cut short: one replacement
+            (b"\xe2\x82(", "\u{FFFD}("),
+            (b"\xf0\x9f\xa6", "\u{FFFD}"),                         // a 4-byte sequence cut short
+            (b"\xc0\xaf", "\u{FFFD}\u{FFFD}"),                     // an overlong '/'
+            (b"\xed\xa0\x80", "\u{FFFD}\u{FFFD}\u{FFFD}"),         // an encoded surrogate
+            (b"\xf4\x90\x80\x80", "\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}"), // past U+10FFFF
+            (b"\x80\xbf", "\u{FFFD}\u{FFFD}"),                     // lone continuation bytes
+            (b"ok \xe2\x80\xae evil", "ok \u{FFFD} evil"),         // valid U+202E, refused
+            (b"caf\xc3\xa9", "café"),
+        ];
+        for (input, expected) in vectors {
+            assert_eq!(sanitize(input), *expected, "{input:?}");
+        }
+    }
+}

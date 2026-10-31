@@ -2353,7 +2353,7 @@ fn records_round_trip_and_journals_roll_back() {
     for (k, from, action) in txs {
         let mut tx = Tx { chain_id: CHAIN.into(), genesis_hash: "00".repeat(32), from: from.clone(), nonce: t.st.account(&from).nonce, fee: 0, tip: 0, valid_until: t.h + 10, action, memo: String::new(), public_key: hex::encode(k.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
         tx.fee = min_fee(tx.size());
-        assert_eq!(t.st.apply_j(&mut j, &tx, CHAIN, &addr(VALIDATORS[0]), t.h, true).unwrap(), Outcome::Applied, "{:?}", tx.action);
+        assert_eq!(t.st.apply_j(&mut j, &tx, CHAIN, &addr(VALIDATORS[0]), t.h, crate::chain::ApplyMode::Block).unwrap(), Outcome::Applied, "{:?}", tx.action);
     }
     assert_eq!(t.st.governance.next_proposal_id, id + 4, "the approval proposed #{}", id + 3);
     t.st.rollback(j);

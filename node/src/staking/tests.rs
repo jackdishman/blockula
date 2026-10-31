@@ -1717,7 +1717,7 @@ fn staking_txs_roll_back_completely() {
     let mut j = Journal::default();
     let mut apply = |t: &mut T, k: &Keys, a: Action| {
         let tx = t.tx_from(k, &k.address(), a);
-        assert_eq!(t.st.apply_j(&mut j, &tx, CHAIN, &vaddr(0), t.height, true).unwrap(), Outcome::Applied);
+        assert_eq!(t.st.apply_j(&mut j, &tx, CHAIN, &vaddr(0), t.height, crate::chain::ApplyMode::Block).unwrap(), Outcome::Applied);
     };
     apply(&mut t, &alice, Action::Delegate { validator: vaddr(1), amount: 500 * FANG });
     apply(&mut t, &alice, Action::Undelegate { validator: vaddr(0), shares: 100 * FANG, amount: 0 });

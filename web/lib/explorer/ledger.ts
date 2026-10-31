@@ -109,6 +109,11 @@ const NOTES: Record<string, (tx: TxDetail) => string | null> = {
   transfer_name: () => "Names change hands by offer and acceptance; no FANG moves.",
   release_name: () => "Gave the name up: anyone can register it now.",
   propose: () => "The deposit is refunded once the proposal reaches quorum, and burned if it doesn't.",
+  // Programs (protocol v2): what the receipt's facts don't say in a line. Never a method name or anything a program wrote.
+  upload_code: () => "Code and interface are stored by their hashes; a deposit for each one that's new is bonded for good (v0 has no way to take it back). The code is usable from the next block.",
+  create_program: () => "Creates the program at an address made from the sender and this transaction's nonce, bonds a deposit for its record for good, and burns the account creation fee when nothing held an account at that address.",
+  call_program: () => "A call pays for the fuel it reserves whether or not it uses it, and a failed call still pays that fee. What the programs return and emit are their own claims: the chain checks none of it.",
+  programs_pause: () => "A pause vote moves nothing but its fee: programs pause once enough validators have signed.",
 };
 
 /** Kinds whose fields show everything they move (besides those above). */
@@ -173,6 +178,60 @@ function tipOf(tx: TxDetail, fee: bigint): bigint | null {
   return fee > min ? fee - min : 0n;
 }
 
+/** Transactions that run or store program code (tags 62–64, protocol v2): their receipt holds what they did. */
+const PROGRAM_TXS = new Set(["upload_code", "create_program", "call_program"]);
+const PENDING_PROGRAM = "A program transaction pays for the fuel it reserves when it runs (never refunded), bonds deposits and can move FANG through its programs: its receipt says what, once it has run.";
+const NO_RECEIPT = "This node no longer holds the block it ran in, so its receipt (the deposits it bonded and what its programs moved) isn't shown; only its fee is.";
+
+/** A signed decimal string of drops (a balance change), 0n for anything else. */
+export const signedDrops = (s: string | null | undefined) => (s && /^-?\d+$/.test(s) ? BigInt(s) : 0n);
+
+/** The node's short form of an address, for an account a receipt names by its address alone. */
+const labelOf = (address: string): Label => ({ address, name: null, short: address.length > 18 ? `${address.slice(0, 10)}…${address.slice(-6)}` : address });
+
+/**
+ * What a program transaction did to balances, from its receipt's facts (docs/PROGRAMS-V0.md §8.1): the
+ * signer's balance moved by −(fee + what left outside the VM) + the VM's own diff of it, exactly; every
+ * other account named moved by the VM's diff; the deposits sit bonded; the account creation fee burns.
+ * Claims (return data, events) move nothing, and nothing a program wrote is read here.
+ */
+function programEffects(tx: TxDetail, from: Label, fee: bigint, tip: bigint | null, pending: boolean): Effects {
+  const tipped: Change[] = tip ? [{ who: PROPOSER, delta: tip, why: "tip, on top of the base fee that burns" }] : [];
+  const burnedFee = fee - (tip ?? 0n);
+  const receipt = tx.program;
+  if (pending || !receipt?.facts) {
+    return { changes: [{ who: from, delta: -fee, why: "fee" }, ...tipped], burned: burnedFee, unseen: pending ? PENDING_PROGRAM : NO_RECEIPT, unseenFor: "all", note: null, pending };
+  }
+  const { facts } = receipt;
+  const outside = { record: big(facts.outside_vm?.record_deposit), upload: big(facts.outside_vm?.upload_deposit), creation: big(facts.outside_vm?.account_creation_fee) };
+  const vm = new Map<string, bigint>();
+  for (const c of facts.balance_changes ?? []) vm.set(c.account, (vm.get(c.account) ?? 0n) + signedDrops(c.change));
+  const mine = vm.get(from.address) ?? 0n;
+  const out = outside.record + outside.upload + outside.creation;
+  const parts = ["fee"];
+  if (outside.record > 0n) parts.push("record deposit");
+  if (outside.upload > 0n) parts.push("upload deposit");
+  if (outside.creation > 0n) parts.push("account-creation fee");
+  if (mine < 0n) parts.push("what its programs took");
+  const why = parts.length === 1 ? "fee" : `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}`;
+  const changes: Change[] = [{ who: from, delta: mine - fee - out, why: mine > 0n ? `${why}, less what its programs returned` : why }];
+  for (const [address, change] of vm) if (address !== from.address && change !== 0n) changes.push({ who: labelOf(address), delta: change, why: change > 0n ? "paid by its programs" : "taken by its programs" });
+  if (outside.record > 0n) changes.push({ who: holding("program-record", "Program record deposit, bonded"), delta: outside.record, why: "bonded for good" });
+  if (outside.upload > 0n) changes.push({ who: holding("code-deposit", "Code storage deposit, bonded"), delta: outside.upload, why: "bonded for good" });
+  changes.push(...tipped);
+  // What its programs' own sends burned (the creation fee of an account a program opened): the receipt states it
+  // (`burned_by_programs`), and FANG is conserved, so it must also be what the VM's diff lacks of the deposits it bonded (net of
+  // the refunds it paid back): Σ changes + (bonded − record − upload − refunded) + burned = 0. A receipt whose facts don't add up
+  // that way (or, from a node that predates the field, whose derived burn is negative) is never read as money.
+  const vmBonded = big(facts.storage?.bonded) - outside.record - outside.upload;
+  const derivedBurn = big(facts.storage?.refunded) - vmBonded - [...vm.values()].reduce((sum, c) => sum + c, 0n);
+  const stated = facts.burned_by_programs === undefined ? null : /^\d+$/.test(String(facts.burned_by_programs)) ? BigInt(facts.burned_by_programs) : -1n;
+  const vmBurn = stated ?? derivedBurn;
+  const note = NOTES[tx.kind ?? tx.action?.type ?? ""]?.(tx) ?? null;
+  if (vmBurn < 0n || vmBurn !== derivedBurn) return { changes, burned: burnedFee + outside.creation, unseen: "This receipt's deposits and balance changes don't balance, so what its programs burned can't be told: its totals are unverified.", unseenFor: "all", note, pending };
+  return { changes, burned: burnedFee + outside.creation + vmBurn, unseen: null, unseenFor: null, note, pending };
+}
+
 /** A node that predates `to_name` resolved a name at read time, so its `to` is the name's owner now. */
 const readTimeOwner = (tx: TxDetail) => tx.status !== "pending" && tx.to_name === undefined && typeof tx.action?.to === "string" && !isAddress(tx.action.to);
 
@@ -201,6 +260,7 @@ export function effectsOf(tx: TxDetail, ctx: LedgerCtx = {}): Effects {
   // A kind newer than this explorer: the fee is all that's certain (its amount may even be
   // coming in, not going out).
   if (!knownKind(kind)) return { changes: [{ who: tx.from, delta: -fee, why: "fee" }, ...tipped], burned: burnedFee, unseen: UNKNOWN, unseenFor: "all", note: null, pending };
+  if (PROGRAM_TXS.has(kind)) return programEffects(tx, tx.from, fee, tip, pending);
 
   const amount = big(tx.amount);
   const changes: Change[] = [];

@@ -16,7 +16,7 @@ The protocol being audited is specified in [MAINNET-DESIGN.md](MAINNET-DESIGN.md
 | Skills | BFT consensus, Rust, state machines with economic invariants, lattice signatures in practice | Web security, WebAuthn/passkeys, key handling in browsers, supply chain |
 | Calendar | 6–10 weeks including fixes and re-review | 2–4 weeks |
 
-One firm may bid on both. Ghost Mode (the shielded pool, DEC-2) gets its own audit before it's activated and is **not** in this scope.
+One firm may bid on both. Ghost Mode (the shielded pool, DEC-2) gets its own audit before it's activated and is **not** in this scope. Programs (optional, off by default) have [their own scope below](#programs-optional-off-by-default).
 
 ## Commit and size
 
@@ -108,6 +108,71 @@ Questions we'd like answered explicitly:
 3. **Fix review:** every fix for a critical, high or medium finding re-verified on a new commit.
 4. **Re-review of the diff** between the audited commit and the genesis release, so the code that launches is the code that was audited. Any consensus-format change after the audit goes through re-review again.
 5. A final report we publish, after fixes are deployed.
+
+## Programs (optional, off by default)
+
+Programs (protocol v2) let anyone upload and run WebAssembly on a chain that has switched them on. The feature is built, optional and off by default, and it is **not in Engagements A and B above**: it has its own scope here, an external audit of it is required before a supported programs-on release (a launch kit chain may turn them on now, as an experiment), and none has been done. The specification the code is audited against is [PROGRAMS-V0.md](PROGRAMS-V0.md) (§10.6 lists the release gates; its appendix is the review log of the two adversarial reviews and the stage reviews so far). Operators' view: [OPERATIONS.md](OPERATIONS.md#programs-optional-off-by-default).
+
+Where v2 differs from v1 only through programs, the v1 chain is untouched by construction ("v2 = v1 + dormant programs", PROGRAMS-V0.md §0 and §1.2), and the binary replays the recorded v1 history byte for byte (`docs/REPLAY.md`). An auditor of Engagement A reads the dormant hooks (§1.2 lists them) as part of the node; this scope is the code that runs once the feature is on.
+
+### Scope
+
+| Area | Where | What to look for |
+|---|---|---|
+| **The VM crate** | `node/vm` (its own workspace; `blockula-vm`) | The `HostPtr` `unsafe`; upload validation (`validate.rs`, the numbered rules, wasmparser pinned `=0.228.0`) and `upload::check`'s test translation; the executor, frames and call depth; the host ABI v1 (`abi.rs`, `host.rs`) and `host::sanitize`, which is consensus; metering (`meter.rs`, `SCHEDULE_V0`) and its calibration records; the overlay, the commit checks and `Diff::check` (conservation, who was debited); storage accounting and the price curve (`storage.rs`); the interface codec (`interface.rs`); soroban-wasmi's enabled paths at the pin (`=29.0.0`), its configuration, and the engine's memory use (translated code stays resident until an engine is dropped) |
+| **The node's programs module** | `node/src/programs/` | State and its invariants (`state.rs`, `check_invariants`, `check_totals`), the digests and address derivation (`digest.rs`), `upload`, `create` (adoption), `call`, `exec` and `view`, `commit` (the order, the control `value_held + sponsored`, the cap and exit-only), `credit` (the four native-credit sites), `params`, `activate`, `receipt` (the claims budget), `describe` |
+| **The pass thread** | `programs/pass.rs`, `programs/exec.rs` | One 64 MiB-stack thread and one engine per block pass: when the engine is dropped (a fault, 1 MiB of loaded code, a schedule change, the pass's end), what crosses to the thread (`State` is `Send` and `Sync`), the `catch_unwind` backstops, the fallback when the OS refuses the thread. That load is counted per transaction, so no outcome depends on what an engine already holds (the argument is in `node/vm/CALIBRATION-node.md`, "A3") |
+| **Admission and the hooks** | `programs/admit.rs`, the hooks listed in PROGRAMS-V0.md §1.2 and the stages' one-line additions in `chain.rs`, `consensus.rs`, `node.rs`, `api.rs`, `governance.rs`, `staking.rs`, `ghost.rs`, `upgrade.rs` | `programs::status` (version, feature, pause, exit-only) gating every path; the signer rules (owner keys only, no session or multisig key, a program as `from`); the codec of tags 62 to 64 and 69 (`types.rs`: `check_format`, the refusal to nest, the Rust ⇄ TypeScript byte match with `sdk-ts/src/tx.ts`); `ApplyMode` and the mempool never running the VM |
+| **Fees and fuel** | `programs/fuel.rs`, `chain.rs`/`econ.rs` fee hooks | The fuel fee (`rate × reserved / 1000`), the reservation (`exec + load`, bounded by `MAX_RESERVATION`), checked arithmetic at both rate ceilings, the controller (`next_rate`, `MAX_FUEL_RATE`), the per-block budget, `lowest_fuel_fee`, proposal order (`TipRate`), and whether the work a block does is bounded by what it was paid for |
+| **Commit and receipts** | `programs/commit.rs`, `programs/receipt.rs`, `Block::programs` | Balance conservation across upload, create (record deposit, account creation), call and sponsored storage; the receipt as a display-only record that replay must still reproduce; the claims budget |
+| **Pause, cap and exit-only** | `programs/pause.rs`, `programs/credit.rs`, `staking::duty_of` and `State::admit` for tag 69 | The threshold, vote life, window and cap (PROGRAMS-V0.md §7.2); which key forms are admitted (§2.5); the cap on what programs control; that exit-only still lets value leave |
+| **Fault handling** | `programs/fault.rs` and its `quarantine`, `marker`, `totals`; `consensus.rs` (propose, verify, the replay cache); `chain.rs` (`apply_block`, `replay`); `upgrade.rs` (halts, exit codes 13 and 14) | A node fault is never an outcome (§6.2): the proposer's exclusion, verification's abstentions, the halts, the verified-clean retry, the quarantine, strikes and the trial marker as node-local safeguards that cannot be used to censor or to split consensus; the replay cache (`consensus.rs`) |
+| **The API surface** | `programs/view_api.rs` (`POST /api/program/{address}/view`), `programs/api.rs` (`/api/program`, `/api/code`, `/api/interface`, `/api/params`, `/api/fees`), `programs/tx_json.rs` | `/view` runs a VM for whoever asks: its budgets (60 a minute per client, two at once, 250 ms of waiting, the fuel bound), that it can't write, and that a node fault is a 500 and never a halt. Off on validators unless `--program-views` |
+| **Clients** | `sdk-ts/src/programs.ts`, `mcp/src` (the read tools and `untrusted.ts`), `node/src/program_cli.rs`, `web/` (the programs pages) | They overlap Engagement B. Programs add: digests mirrored in TypeScript, `provenProgram`, that every string a deployer or program chose (method names, event names, abort messages) is shown as untrusted data and cannot reach a tool description or a signing prompt, and that the CLI and SDK sign only what was shown (the whole version digest, the reservation checked against a block's budget) |
+
+### What an audit of programs should answer
+
+1. Can any program, upload or call make two honest nodes of one release compute different outcomes, fuel or state (iteration order, an engine's behaviour across architectures, memory)?
+2. Can a program or a transaction create FANG, take FANG that is not its balance, or get around the cap or exit-only?
+3. Can a transaction crash, hang or halt a validator, or make the node-local safeguards (quarantine, strikes, the trial marker, abstentions) censor an honest sender, or split the set?
+4. Is the work a block does bounded by what it paid for: is `SCHEDULE_V0` an upper bound on measured time on the floor machines, translation included?
+5. Does v2 change a v1 chain in any way (state, bytes, outcomes), before programs are switched on?
+6. Do the Rust and TypeScript encoders and digests agree on every input?
+
+### The fuzz record
+
+Honestly: **the campaign has not been run.** What has been run is a set of smoke runs and the codec targets' 24-hour runs, all on one aarch64 Mac under AddressSanitizer. Nothing has run on x86-64 or without the sanitizer, and no run has been shared across machines. No run has found a crash in the node or the VM.
+
+**The targets.** `node/vm/fuzz`: `program_validate` (validation, then the test translation of whatever it accepts, with `wasm-smith` modules in v0's subset), `program_exec` (batches of calls to the four guests, the host and overlay), `interface_codec`. `node/fuzz` (`TARGETS` in `src/harness.rs`): `program_tx_codec` (tags 62 to 64 and 69), `program_receipt`, `program_commit`, `state_machine_programs` (the state machine on a v2 fixture, with its own oracles), and v1's `state_machine`, unchanged. Each has committed seeds, and CI checks the seeds on every pull request and runs each target for five minutes nightly (`fuzz.yml`), with crashes sealed to the maintainers' keys. Their descriptions and results tables are `node/fuzz/README.md` and `node/vm/fuzz/README.md`.
+
+**Local runs so far** (`node/fuzz/README.md`, "Results (2026-10-29)": one worker, `-timeout=10 -rss_limit_mb=2048`; the state machines with `-len_control=0 -max_len=4096`; the fixed oracles, after a review showed the first ones too weak):
+
+| Target | Run | Executions | Edges (start → end) | Corpus | Result |
+|---|---|---|---|---|---|
+| `state_machine_programs` | 1,201 s | 14,103 (11/s) | 26,107 → 34,727 | 2,766 units, longest 4,078 B | no crash, no failed check |
+| `program_receipt` | 1,201 s | 2,240,389 (1,865/s) | 9,693 → 12,552 | 3,593 units, longest 4,621 B | no crash, no failed check |
+| `program_commit` | 1,201 s | 315,577 (262/s) | 18,670 → 19,479 | 413 units, longest 267 B | no crash, no failed check |
+| `state_machine` (v1) | 601 s | 11,018 (18/s) | 15,801 → 20,704 | 2,124 units, longest 2,750 B | no crash, no failed check |
+
+After the pass-thread change (one thread and one engine per block pass) the binaries were rebuilt and run again: `state_machine_programs` 600 s, 11,748 executions (19/s), edges 26,284 → 34,359, 2,364 units; `state_machine` 300 s, 7,160 executions, edges 15,830 → 20,515: no crash, no failed check. The slowest unit of every run took under a second. The oracles were checked by planting 18 bugs in the node's code: each is now caught on seed replay by an oracle, and `tests/oracles.rs` holds each oracle to the change a bug would make.
+
+**The codec targets' 24-hour runs** (the codec is reachable even while programs are off, since every node decodes every gossiped transaction):
+
+| Target | Built from | Result |
+|---|---|---|
+| `program_tx_codec`, run 1 | the first codec | Stopped after about 9 hours (53,276,452 runs) on a failed check in the harness's own assertion, a false positive on a private-transfer action (not a node bug); fixed in the harness |
+| `program_tx_codec`, run 2 | the fixed harness | 160,102,729 runs in 86,401 s, no artifact |
+| `program_tx_codec`, run 3 | the integration head once the pause and the credit guard had landed | 153,332,338 runs in 86,401 s (1,774/s), coverage 13,434 edges, no artifact |
+| `program_tx_codec`, run 4 | the final codec (after the cheaper transaction check) | 163,552,034 runs in 86,401 s (1,892/s), coverage 14,601 edges, corpus 4,396 units, longest 6,861 B, no artifact |
+| `interface_codec` | the final interface codec | A 24-hour run (2026-10-21 to 22) ended clean; its counts were not kept (its logs were in a temporary directory that was cleaned), so the number to cite is the 1-hour run on the same binary: 34,370,618 runs in 3,601 s (9,544/s), corpus 1,516 units, no artifact. Its code has not changed since |
+
+Together that is about 3.4 CPU-days of `program_tx_codec` and about 1 of `interface_codec`, on aarch64 under AddressSanitizer. Neither counts toward the others' families. `program_validate` and `program_exec` have had only short runs: ten minutes each in the stage that wrote their harnesses (91,185 and 244,535 executions, no artifact), and the nightly five minutes since.
+
+**The campaign, as planned and not yet run** (PROGRAMS-V0.md §10.6; `node/fuzz/README.md`, "The campaign"): at least **14 CPU-days per family in total**, summed over four configurations (AddressSanitizer and plain, x86-64 and aarch64) with none under 2 CPU-days, on one shared corpus per target, and the last 24 hours of wall-clock without a finding in any configuration. The three families are the VM's validation and translation (`program_validate`, `interface_codec`), the VM's execution (`program_exec`), and the node's targets with the v2 fixture. So **42 CPU-days at least** (the stricter reading, 14 in each configuration, would be 168, and is not what the gate says). The planned split of each family's 14: 5 on x86-64 with the sanitizer, 3 on aarch64 with it, 4 on x86-64 without, 2 on aarch64 without. The node family splits `state_machine_programs` 8, `program_commit` 3, `program_receipt` 1.5 and `program_tx_codec` 1.5. Corpora are merged across configurations about every 12 hours. At the measured speeds (the state machine runs 10 to 40 executions a second per worker) that is about three days of wall-clock on one 16-worker x86-64 machine and one aarch64 machine. Coverage, corpus size and the longest unit are to be recorded here when it runs. A finding restarts the last 24 hours after its fix; a finding is handled privately ([SECURITY.md](../SECURITY.md#fuzzing-findings)), and none is open.
+
+### Evidence the auditor can re-run
+
+`cargo test --release --locked` in `node` and in `node/vm` (also `--features ref038`, an older engine kept as a differential oracle); `bash scripts/test-program-cli.sh` and `blockula dev --programs` for the CLI end to end; `npm run test:vectors -w @blockula/sdk` for the byte-for-byte match with the TypeScript encoders; `blockula replay node/testdata/replay/v1-open` for the v1 corpus; the calibration records `node/vm/CALIBRATION-x86_64.md`, `CALIBRATION-aarch64.md` and `CALIBRATION-node.md` (every item within the 2.5 ns per fuel rule on both floor runners); and `node scripts/check-spec-citations.mjs`, which checks that the code's references to the specification all resolve (citations that name the file, bare `§` and amendment ids in the programs code, and the item and step numbers they give).
 
 ## Proposal
 
