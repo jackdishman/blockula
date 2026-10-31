@@ -100,8 +100,9 @@ pub fn host_fn(name: &str) -> Option<&'static HostFn> {
 pub mod status {
     pub const OK: i32 = 0;
     /// A transfer the program can't make: its balance is short (with `OPEN_PAY`, short of the
-    /// amount and the creation fee; with `OPEN_DEDUCT`, an amount below the fee), or the recipient
-    /// doesn't exist and no opening flag was passed.
+    /// amount and the creation fee), or the recipient doesn't exist and either no opening flag was
+    /// passed or it would open with less than `config::MIN_NEW_ACCOUNT` (with `OPEN_DEDUCT`, the
+    /// amount less the creation fee; with `OPEN_PAY`, the amount).
     pub const ERR_TRANSFER: i32 = 1;
     /// `try_call`: the callee aborted. Its code is `last_abort_code_v1()`, its message
     /// `last_return_v1` (see [`HOST_FNS`](super::HOST_FNS)).
@@ -115,9 +116,11 @@ pub mod status {
 pub mod flags {
     /// `storage_write`: the program pays the deposit from its own balance (6.3).
     pub const SPONSOR: i32 = 1;
-    /// `transfer` to an account that doesn't exist: the creation fee comes out of the amount.
+    /// `transfer` to an account that doesn't exist: the creation fee comes out of the amount, and
+    /// what's left, at least `config::MIN_NEW_ACCOUNT`, opens it.
     pub const OPEN_DEDUCT: i32 = 1;
-    /// `transfer` to an account that doesn't exist: the program burns the creation fee on top.
+    /// `transfer` to an account that doesn't exist: the program burns the creation fee on top of
+    /// the amount, at least `config::MIN_NEW_ACCOUNT`, which opens it.
     pub const OPEN_PAY: i32 = 2;
 }
 

@@ -8,12 +8,13 @@ import { useMe } from "@/components/explorer/kit";
 import { Ledger } from "@/components/explorer/Ledger";
 import { Apparition } from "@/components/Haunt";
 import { BalanceBreakdown, NameExpiryBanner, OnePasskeyBanner } from "@/components/HomeNotes";
+import { Landing } from "@/components/Landing";
 import { Tutorial, useTutorial } from "@/components/Tutorial";
 import { Copy, ExplorerLink, Spinner } from "@/components/ui";
 import { explorer } from "@/lib/config";
 import { fangParts, shortAddr } from "@/lib/format";
 import type { TxView } from "@/lib/types";
-import { useUnlocked } from "@/lib/wallet";
+import { useUnlocked, useWallet } from "@/lib/wallet";
 
 /**
  * Ids of payments into `me` that showed up since the last poll (none on first load), held for a
@@ -40,6 +41,9 @@ function useArrivals(txs: TxView[] | undefined, me: string | undefined) {
 }
 
 export default function HomePage() {
+  const { ready, hint } = useWallet();
+  // A first visit (no wallet on this device) gets the landing page; the wallet is a click away.
+  if (ready && !hint) return <Landing />;
   return (
     <RequireWallet>
       <Home />

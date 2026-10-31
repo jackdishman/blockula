@@ -71,3 +71,58 @@ jobs:
             *NO-GO*) echo "::error::$ARCH: $line"; exit 1 ;;
             *) echo "$line" ;;
           esac
+
+  # The node's benches (node/src/programs/bench.rs, docs/PROGRAMS-V0.md §5.2 item 3): a block of
+  # program transactions through the node's own path (`run_block`, `commit_block`, `persist`),
+  # which the VM's bench above can't see. Each pattern prints a GO or NO-GO against 2.5 ns per
+  # counted fuel and a NO-GO fails its test; this job records every run's tables either way (the
+  # verdicts go to the summary), since the fallbacks are chosen from them. quick: one run, full: three.
+  node-benches:
+    name: Node benches ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, os: ubuntu-24.04 }
+          - { arch: aarch64, os: ubuntu-24.04-arm }
+    env:
+      PROFILE: ${{ inputs.profile }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustc --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with: { workspaces: node }
+      - name: Build the node's tests (release)
+        working-directory: node
+        run: cargo test --release --locked --no-run
+      - name: Run the node benches
+        working-directory: node
+        run: |
+          out="$RUNNER_TEMP/node-benches-$ARCH.txt"
+          { echo "runner: $ARCH ($(nproc) cores), $(uname -srm)"; grep -m1 'model name' /proc/cpuinfo || true; } > "$out"
+          if [ "$PROFILE" = quick ]; then runs=1; else runs=3; fi
+          # Each run times the block passes (A3), then the same benches the way they ran before A3
+          # (BLOCKULA_BENCH_PER_TX: a thread and an engine per program transaction), back to back.
+          for i in $(seq "$runs"); do
+            for path in pass per-tx; do
+              echo "=== run $i ($path), load $(cut -d' ' -f1-3 /proc/loadavg)" >> "$out"
+              if [ "$path" = per-tx ]; then export BLOCKULA_BENCH_PER_TX=1; else unset BLOCKULA_BENCH_PER_TX; fi
+              cargo test --release --locked programs::bench -- --ignored --nocapture --test-threads=1 >> "$out" 2>&1 \
+                && echo "=== run $i ($path): every pattern GO" >> "$out" || echo "=== run $i ($path): a pattern NO-GO (or the run failed)" >> "$out"
+            done
+          done
+          cat "$out"
+      - name: Upload the node bench tables
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: node-benches-${{ matrix.arch }}
+          path: ${{ runner.temp }}/node-benches-${{ matrix.arch }}.txt
+          if-no-files-found: error
+      - name: Verdicts
+        run: |
+          grep -E '^=== run|GO' "$RUNNER_TEMP/node-benches-$ARCH.txt" | sed "s/^/$ARCH: /" >> "$GITHUB_STEP_SUMMARY" || true

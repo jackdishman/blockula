@@ -23,7 +23,8 @@ into the node (the records, admission, fees, commit, receipts root) is the node'
 | `src/meter.rs` | Fuel schedule v0 (`SCHEDULE_V0`), the schedule per protocol version, the reservation bounds |
 | `src/validate.rs` | Upload validation (4.2), engine-independent, on `wasmparser =0.228.0`; each `Rule` numbered for receipts |
 | `src/upload.rs` | `upload::check`: `UploadCode`'s checks on new code (validation, then a test translation), refusals apart from node faults |
-| `src/engine/mod.rs` | The engine-neutral boundary: `BlockEngine` (an engine per transaction), `Host`, `Instance`, `Trap`, `TrapKind`, `NodeFault`, `CodeInfo` |
+| `src/interface.rs` | Interface format 1 (docs/PROGRAMS-V0.md §3): `decode` (every rule), `encode`, method selectors, `check_exports` against the code's `bk_` exports, `Interface::method` |
+| `src/engine/mod.rs` | The engine-neutral boundary: `BlockEngine` (an engine per transaction, or per block pass in the node), `Host`, `Instance`, `Trap`, `TrapKind`, `NodeFault`, `CodeInfo` |
 | `src/engine/soroban.rs` | The soroban-wasmi backend and its configuration (4.2 mapped onto its `Config`) |
 | `src/engine/wasmi038.rs` | The wasmi 0.38 oracle backend (`ref038` only) |
 | `src/host.rs` | The `View` trait (what execution reads), method kinds, the host functions |
@@ -33,23 +34,30 @@ into the node (the records, admission, fees, commit, receipts root) is the node'
 | `src/testing.rs` | `MemHost`, an in-memory chain (feature `testing`: tests, benches, fuzzing; never a node build) |
 | `guests/` | Hand-written test programs for `wasm32v1-none` (`counter`, `token`, `escrow`, `router`), their own workspace |
 | `tests/programs/*.wasm` | The built guests, committed so tests are hermetic (`guests/build.sh --check` rebuilds them byte for byte; CI does on Linux) |
-| `tests/` | `exec.rs` (the executor, WAT programs), `e2e.rs` (the guests end to end), `guests.rs` (the guests against 4.2 and ABI v1), `engines.rs` (engine facts) |
-| `fuzz/` | cargo-fuzz targets `program_validate` and `program_exec`, their own workspace |
+| `tests/programs/*.iface.json`, `*.iface` | The guests' interfaces, as a deployer writes them (JSON, §3.4) and as `UploadCode` carries them (format 1); `tests/interfaces.rs` writes and checks both |
+| `tests/` | `exec.rs` (the executor, WAT programs), `e2e.rs` (the guests end to end), `guests.rs` (the guests against 4.2 and ABI v1), `engines.rs` (engine facts), `interfaces.rs` (the guests' interfaces) |
+| `fuzz/` | cargo-fuzz targets `program_validate` (with a wasm-smith generator for v0's subset), `program_exec` and `interface_codec`, their own workspace |
 | `benches/calibrate.rs` | The calibration bench (`cargo bench --bench calibrate`; `.github/workflows/calibrate-vm.yml` runs it on the floor machines) |
 | `CALIBRATION*.md` | Phase 0's measurements, the basis of schedule v0 |
 
 ## How the node drives it
 
-**An engine per program transaction.** PROGRAMS.md 4.3 shares one engine across a block; this
-release doesn't: each program transaction gets a fresh engine, loaded with only the code it
-declares and dropped when it's done, so nothing an engine holds (its code map, its arenas) carries
-from one transaction to the next, and each pays its own load. The API serves either;
-`BlockEngine` and `new_block_engine` keep 4.3's names. For each program transaction, on a thread
-made for it with a 64 MiB stack (host calls nest native frames up to `MAX_CALL_DEPTH` deep):
+**An engine per transaction outside a block pass, one per pass in the node.** PROGRAMS.md 4.3
+shares one engine across a block, and so does the node's block pass (`node/src/programs/pass.rs`,
+docs/PROGRAMS-V0.md A3, with the argument in `CALIBRATION-node.md`, "A3: one thread and one engine
+per block pass"): one thread with a 64 MiB stack and one engine for all the program
+transactions of a pass, where each transaction still loads every code it declares, code the engine
+already holds is a no-op, and the engine is dropped after any fault and when it has taken in too
+much code. Outside a pass (`/view`, a lone transaction, or a pass the OS gave no thread) each program
+transaction gets a fresh engine, loaded with only the code it declares and dropped when it's done,
+on a thread made for it. Either way nothing a transaction does depends on what else its engine
+holds: it reaches only its declared set, and no fuel is read off the engine. The API serves
+either; `BlockEngine` and `new_block_engine` keep 4.3's names. For each program transaction, on a
+64 MiB stack (host calls nest native frames up to `MAX_CALL_DEPTH` deep):
 1. `meter::schedule(version_at(h))` is the schedule (`None` before v2: no program can run).
-2. `engine::new_block_engine(EngineKind::Soroban, schedule)` makes the transaction's engine (an
-   `Err` is a node fault). A `Box<dyn BlockEngine>` isn't `Send`: make it on the thread that runs
-   the transaction, and let it go with that thread.
+2. `engine::new_block_engine(EngineKind::Soroban, schedule)` makes the engine (an `Err` is a node
+   fault). A `Box<dyn BlockEngine>` isn't `Send`: make it on the thread that uses it, and let it
+   go with that thread.
 3. `engine.load(hash, wasm)` loads every distinct code the transaction declares (the code in force
    of each call's program and each binding), **before anything runs**: soroban-wasmi deadlocks if
    code is translated on an engine while a call runs on it, so `load` takes `&mut self` and
@@ -64,7 +72,9 @@ made for it with a 64 MiB stack (host calls nest native frames up to `MAX_CALL_D
      with `receipt.fail`, its fee charged, nothing else applied.
    - `Err(NodeFault)`: the node can't execute it. Commit nothing of the block and halt; never
      record it as a transaction's failure.
-5. The engine is dropped with the thread, after the receipt and after any node fault alike.
+5. The engine is dropped with the thread, after the receipt and after any node fault alike, or
+   (on a pass's engine) kept for the pass's next transaction after a receipt and dropped after any
+   node fault.
 
 **Applying a diff** (4.4), in this order: `storage` (each `StorageChange` sets or removes
 `program ‖ key`); `programs` (each program's `items`, `bytes` and `deposit` change, for its
@@ -72,6 +82,13 @@ record) and `state_bytes` (META's total); then `balances` (net per account, depo
 debits then credits); then `opened` (accounts the transaction opened; `burned` is their creation
 fees, already debited from the programs that opened them); `escrow` is the change in deposits
 held. `execute` has already checked conservation and who was debited (`Diff::check`).
+
+**Interfaces** (docs/PROGRAMS-V0.md §3): `interface::decode(bytes)` checks an interface statelessly
+(format 1, every rule of §3.2, one encoding per interface), so the node runs it in `check_format`
+on every `UploadCode`. At upload, and at create when the code and the interface came from
+different uploads, `interface::check_exports(&interface, &exports)` matches its methods one to
+one with the code's `bk_` exports (`ModuleInfo::exports`, or the stored code's). The node answers
+`View::method` from the stored interface with `Interface::method(name)`.
 
 **Upload** (`UploadCode`, 7.1): for code the chain doesn't hold yet, `upload::check(wasm,
 schedule)`, on the same kind of thread, runs upload validation (`validate::validate`), then a test
@@ -185,13 +202,29 @@ before it. The node bonds what it stores outside execution by the same rule: eac
 (code, then interface) and a create's program record at `storage_price(used)`, `used` counting
 that blob or record.
 
+## Opening accounts
+
+A program's `transfer_v1` to an account that doesn't exist is a failure status (`ERR_TRANSFER`,
+nothing moves) unless it passes a flag, and unless the account opens with at least
+`config::MIN_NEW_ACCOUNT` (0.01 FANG, the node's `types::MIN_NEW_ACCOUNT`) in it
+(docs/PROGRAMS-V0.md A30), as for the node's native transfers:
+- `OPEN_DEDUCT`: the creation fee comes out of the amount, so the amount must be at least the fee
+  plus `MIN_NEW_ACCOUNT`;
+- `OPEN_PAY`: the program burns the fee on top of the amount, which must be at least
+  `MIN_NEW_ACCOUNT`.
+
+Accounts a transaction opened are `Diff::opened` (their fees are `Diff::burned`), so the node
+never bills the signer for them again. A keyless system account is an existing account to the VM:
+the node's `View::balance` reads it as `Some(0)`, so no program pays to "open" one.
+
 ## Rules the crate keeps
 
 - **Upload validation first.** Code reaches an engine only after `validate::validate()` passed
   it, then a test translation on a throwaway engine (`upload::check`): no engine's translator is
   trusted with code validation refused. A panic in either is a node fault, never a refusal.
-- **An engine per transaction**, made on its thread, loaded before anything runs, dropped after
-  (above). No code cache outlives a transaction.
+- **An engine for a transaction, or a pass**, made on its thread, loaded before anything runs, and
+  dropped after any node fault (above). No code cache outlives a pass, and nothing a transaction
+  reaches comes from what an earlier one loaded.
 - **Memory never grows: validation refuses `memory.grow`.** Exactly one memory, defined, exported
   as `memory`, initial = maximum ≤ `config::MAX_PAGES`; `memory.grow` is refused anywhere in a
   body, reachable or not (`Rule::MemoryGrow`): with a fixed memory it can do nothing a program

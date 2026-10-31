@@ -27,10 +27,41 @@ use commonware_parallel::Sequential;
 use commonware_utils::{iter::NonEmpty, ordered::Set, sys_rng};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
+// The `state_machine_programs` target's v2 fixture and program ops, and the node targets for programs'
+// receipts and commits.
+mod commit;
+mod oracle;
+mod receipt;
+mod v2;
+pub use commit::{commit_of, commit_tampered, plan_is_stable, program_commit, Commit};
+pub use receipt::program_receipt;
+
+/// The `state_machine_programs` seeds, the `program_receipt` seeds and the `program_commit` seeds,
+/// by name: what `tests/harness.rs` holds each to (`seeds()` has them with every other target's,
+/// but builds a chain in a directory named after the process, which tests can't share).
+pub fn state_machine_programs_seeds() -> Vec<(&'static str, Vec<u8>)> {
+    v2::seeds()
+}
+
+pub fn program_commit_seeds() -> Vec<(&'static str, Vec<u8>)> {
+    commit::seeds()
+}
+
+pub fn program_receipt_seeds() -> Vec<(String, Vec<u8>)> {
+    receipt::seeds()
+}
+
+/// The profile (`'G'`, `'T'`, `'X'` or `'P'`, `v2.rs`'s table) that `state_machine_programs` runs
+/// `data` on: its first byte's.
+pub fn state_machine_programs_profile(data: &[u8]) -> char {
+    v2::Profile::of(data.first().copied().unwrap_or(0)).letter()
+}
+
 /// The fuzz targets, by name (`fuzz_targets/<name>.rs`, `seeds/<name>/`).
-pub const TARGETS: [&str; 11] = ["cblock", "tx_json", "tx_wire", "ghost_tx", "snapshot_manifest", "state_snapshot", "sync_batch", "epochs_registry", "certificate", "state_machine", "evidence"];
+pub const TARGETS: [&str; 15] = ["cblock", "tx_json", "tx_wire", "ghost_tx", "snapshot_manifest", "state_snapshot", "sync_batch", "epochs_registry", "certificate", "state_machine", "evidence", "program_tx_codec", "program_receipt", "program_commit", "state_machine_programs"];
 
 /// Runs target `name` on `data`.
 pub fn run(name: &str, data: &[u8]) -> bool {
@@ -46,6 +77,10 @@ pub fn run(name: &str, data: &[u8]) -> bool {
         "certificate" => certificate(data),
         "state_machine" => state_machine(data),
         "evidence" => evidence(data),
+        "program_tx_codec" => program_tx_codec(data),
+        "program_receipt" => program_receipt(data),
+        "program_commit" => program_commit(data),
+        "state_machine_programs" => state_machine_programs(data),
         _ => panic!("unknown fuzz target {name}"),
     }
 }
@@ -476,6 +511,9 @@ fn evidence_seed(kind: u8, signer: usize, epoch: u64, view: u64) -> Vec<u8> {
 /// are reachable), funded users (one with a vesting lock), 4-block epochs and Proof of
 /// Contribution timings of a few blocks, so epochs, Séances and vesting all happen.
 const SM_CHAIN: &str = "blockula-fuzz-sm";
+/// The v2 fixture's chain (`state_machine_programs`): the same genesis born at protocol v2 with
+/// programs on, under a chain id of its own (the proofs of possession and key consents bind it).
+const SM_CHAIN_V2: &str = "blockula-fuzz-sm-v2";
 const SM_USERS: usize = 6;
 const SM_AGENTS: usize = 3;
 /// Ops past this many are ignored, so one input stays fast.
@@ -499,79 +537,228 @@ impl Who {
 }
 
 struct SmFixture {
+    /// The chain the ops' txs are for.
+    chain: &'static str,
+    /// The state the first op runs on, and its height: genesis (0) for v1; for v2 the state after
+    /// the blocks that upload and create the four guests (`v2::fixture`).
     state: State,
+    height: u64,
+    /// The newest protocol version a node running this genesis supports (the halt check's).
+    supported: u32,
     validator: Who,
+    /// The genesis validators, `validator` first: one, but for the pause profile's four.
+    validators: Vec<Who>,
     users: Vec<Who>,
     agents: Vec<Who>,
     /// Per user: a consensus key it may register as a validator, and that key's PoP.
     candidates: Vec<(String, String)>,
     /// Addresses that hold nothing at genesis.
     newcomers: Vec<String>,
+    /// The `newcomers`' keys, which sign for the validators a user registers with them (their
+    /// consensus keys' own accounts).
+    newcomer_keys: Vec<Who>,
     /// Per agent, per user: the agent key's consent to joining that user's account (AddKey's pop).
     agent_pops: Vec<Vec<String>>,
+    /// The four guests and the programs made of them; `None` on the v1 fixture.
+    programs: Option<v2::Guests>,
 }
 
-fn sm_fixture() -> &'static SmFixture {
+/// The v1 fixture (`None`: the chain as it has always run, protocol v1 with no programs) or the v2
+/// one of a profile ([`v2::fixture`]).
+fn sm_fixture(v2: Option<v2::Profile>) -> &'static SmFixture {
     static F: OnceLock<SmFixture> = OnceLock::new();
-    F.get_or_init(|| {
-        let validator = Keys::from_seed(VALIDATOR_SEED);
-        let users: Vec<Keys> = (1..=SM_USERS as u8).map(|i| Keys::from_seed([i; 32])).collect();
-        let agents: Vec<Keys> = (0..SM_AGENTS as u8).map(|i| Keys::from_seed([100 + i; 32])).collect();
-        let mut allocations = vec![json!({ "address": validator.address(), "amount": "10000000000000000" })];
-        for (i, u) in users.iter().enumerate() {
-            let mut a = json!({ "address": u.address(), "amount": "100000000000000" });
-            if i == SM_USERS - 1 {
-                a["vesting"] = json!({ "start": 0, "cliff": 20, "end": 200 });
-            }
-            allocations.push(a);
+    match v2 {
+        Some(profile) => v2::fixture(profile),
+        None => F.get_or_init(|| sm_build(SM_CHAIN, Build::V1)),
+    }
+}
+
+/// Which genesis `sm_build` builds.
+#[derive(Clone, Copy)]
+enum Build {
+    /// The v1 fixture: protocol v1, one validator.
+    V1,
+    /// Born at protocol v2 with the `programs` feature on (and no program yet): with this many
+    /// genesis validators and this block time.
+    V2 { validators: usize, block_time_ms: u64 },
+}
+
+/// The seeds of genesis validators beyond the first, who are not the admin: each holds 1,000 FANG
+/// to pay its signatures' fees.
+const MORE_VALIDATOR_SEEDS: [[u8; 32]; 3] = [[0x43; 32], [0x44; 32], [0x45; 32]];
+
+/// The state machine's genesis state and keys on `chain`.
+fn sm_build(chain: &'static str, build: Build) -> SmFixture {
+    let (more, block_time_ms) = match build {
+        Build::V1 => (0, 1_000),
+        Build::V2 { validators, block_time_ms } => (validators.saturating_sub(1), block_time_ms),
+    };
+    let validator = Keys::from_seed(VALIDATOR_SEED);
+    let others: Vec<Keys> = MORE_VALIDATOR_SEEDS.iter().take(more).map(|s| Keys::from_seed(*s)).collect();
+    let users: Vec<Keys> = (1..=SM_USERS as u8).map(|i| Keys::from_seed([i; 32])).collect();
+    let agents: Vec<Keys> = (0..SM_AGENTS as u8).map(|i| Keys::from_seed([100 + i; 32])).collect();
+    let mut allocations = vec![json!({ "address": validator.address(), "amount": "10000000000000000" })];
+    for (i, u) in users.iter().enumerate() {
+        let mut a = json!({ "address": u.address(), "amount": "100000000000000" });
+        if i == SM_USERS - 1 {
+            a["vesting"] = json!({ "start": 0, "cliff": 20, "end": 200 });
         }
-        let genesis: Genesis = serde_json::from_value(json!({
-            "chain_id": SM_CHAIN, "token": "FANG", "decimals": 9, "block_time_ms": 1000, "faucet": false, "created_at_ms": GENESIS_MS,
-            "validators": [{ "address": validator.address(), "public_key": hex::encode(validator.public_key()), "p2p_addr": "127.0.0.1:7071", "http_addr": "127.0.0.1:7070" }],
-            "allocations": allocations,
-            "epoch_blocks": 4,
-            "validator_admins": [validator.address()],
-            "contribution": { "seance_blocks": 6, "claim_maturity_blocks": 0, "vesting_blocks": 10, "vouch_lock_blocks": 5, "claim_ttl_blocks": 15, "soul_half_life_blocks": 100 },
-        }))
-        .expect("state machine genesis no longer parses: update harness::sm_fixture");
-        genesis.check().expect("state machine genesis is invalid: update harness::sm_fixture");
-        let candidates = users
-            .iter()
-            .enumerate()
-            .map(|(i, u)| {
-                let seed = [200 + i as u8; 32];
-                (hex::encode(Keys::from_seed(seed).public_key()), crate::chain::make_pop(seed, SM_CHAIN, &u.address(), "203.0.113.9:7071", "https://v.example"))
-            })
-            .collect();
-        let newcomers = (0..8u8).map(|i| Keys::from_seed([200 + i; 32]).address()).collect();
-        let agent_pops = agents.iter().map(|a| users.iter().map(|u| types::key_pop(a, SM_CHAIN, &"00".repeat(32), &u.address())).collect()).collect();
-        SmFixture { state: genesis.initial_state(), validator: Who::of(&validator), users: users.iter().map(Who::of).collect(), agents: agents.iter().map(Who::of).collect(), candidates, newcomers, agent_pops }
-    })
+        allocations.push(a);
+    }
+    allocations.extend(others.iter().map(|k| json!({ "address": k.address(), "amount": "1000000000000" })));
+    let validator_infos: Vec<Value> = std::iter::once(&validator).chain(&others).enumerate().map(|(i, k)| json!({ "address": k.address(), "public_key": hex::encode(k.public_key()), "p2p_addr": format!("127.0.0.1:{}", 7071 + 2 * i), "http_addr": format!("127.0.0.1:{}", 7070 + 2 * i) })).collect();
+    let mut genesis = json!({
+        "chain_id": chain, "token": "FANG", "decimals": 9, "block_time_ms": block_time_ms, "faucet": false, "created_at_ms": GENESIS_MS,
+        "validators": validator_infos,
+        "allocations": allocations,
+        "epoch_blocks": 4,
+        "validator_admins": [validator.address()],
+        "contribution": { "seance_blocks": 6, "claim_maturity_blocks": 0, "vesting_blocks": 10, "vouch_lock_blocks": 5, "claim_ttl_blocks": 15, "soul_half_life_blocks": 100 },
+    });
+    if block_time_ms != 1_000 {
+        // Parameters whose defaults or bounds are a count of blocks per day, which a slow chain has
+        // few of: a day of 10 blocks (the least one whose bounds are a range) takes these two.
+        genesis["params"] = json!({ "max_tx_validity_blocks": 10, "ghost_anchor_window": 300 });
+    }
+    if matches!(build, Build::V2 { .. }) {
+        genesis["features"] = json!([crate::upgrade::PROGRAMS_FEATURE]);
+        genesis["upgrades"] = json!([{ "version": crate::upgrade::PROGRAMS_VERSION, "activation_height": 1 }]);
+    }
+    let genesis: Genesis = serde_json::from_value(genesis).expect("state machine genesis no longer parses: update harness::sm_build");
+    genesis.check().expect("state machine genesis is invalid: update harness::sm_build");
+    let candidates = users
+        .iter()
+        .enumerate()
+        .map(|(i, u)| {
+            let key_seed = [200 + i as u8; 32];
+            (hex::encode(Keys::from_seed(key_seed).public_key()), crate::chain::make_pop(key_seed, chain, &u.address(), "203.0.113.9:7071", "https://v.example"))
+        })
+        .collect();
+    let newcomer_keys: Vec<Keys> = (0..8u8).map(|i| Keys::from_seed([200 + i; 32])).collect();
+    let newcomers = newcomer_keys.iter().map(Keys::address).collect();
+    let agent_pops = agents.iter().map(|a| users.iter().map(|u| types::key_pop(a, chain, &"00".repeat(32), &u.address())).collect()).collect();
+    SmFixture {
+        chain,
+        state: genesis.initial_state(),
+        height: 0,
+        supported: crate::upgrade::supported_version(&genesis),
+        validator: Who::of(&validator),
+        validators: std::iter::once(&validator).chain(&others).map(Who::of).collect(),
+        users: users.iter().map(Who::of).collect(),
+        agents: agents.iter().map(Who::of).collect(),
+        candidates,
+        newcomers,
+        newcomer_keys: newcomer_keys.iter().map(Who::of).collect(),
+        agent_pops,
+        programs: None,
+    }
+}
+
+/// How a block of the v2 fixture is run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Exec {
+    /// Unrolled (`v2::run_block`), with the oracles looking at the state around each transaction.
+    Unrolled,
+    /// Through `State::run_block` itself: the determinism rerun's second pass.
+    RunBlock,
+}
+
+/// Whether `tx` is a program transaction (tags 62–64): the fee byte of one can ask for a fee below
+/// its charge, a tx without fuel can't.
+fn v2_is_program_tx(tx: &Tx) -> bool {
+    matches!(tx.action, Action::UploadCode { .. } | Action::CreateProgram { .. } | Action::CallProgram { .. })
+}
+
+/// What a block of the v2 fixture ran, for the checks after it.
+enum Block {
+    Unrolled(v2::Ran),
+    RunBlock { included: Vec<Tx>, failed: BTreeMap<usize, String> },
 }
 
 /// One fuzzed run of the state machine: the ops' txs in blocks, as execution applies them.
-struct Sm {
+struct Sm<'a> {
+    fx: &'a SmFixture,
     state: State,
     height: u64,
     txs: Vec<Tx>,
     applied: usize,
-    /// Every block's root, for the determinism check.
+    /// Every block's root, for the determinism check (on the v2 fixture, each followed by the
+    /// digest of the block's program receipts).
     roots: Vec<[u8; 32]>,
     halted: bool,
+    /// How the v2 fixture's blocks run (the v1 fixture's always run `State::run_block`).
+    exec: Exec,
+    /// The v2 fixture's program transactions by kind and outcome code, as their receipts say.
+    seen: BTreeMap<(&'static str, &'static str), usize>,
+    /// Why admission refused each program transaction the unrolled block skipped, in order.
+    refused: Vec<String>,
+    /// The first receipt of each kind and outcome (the seeds' source).
+    kept: BTreeMap<(&'static str, &'static str), crate::programs::receipt::ProgramReceipt>,
+    /// What the guests' storage must read, from the transactions that applied (`oracle`).
+    guests: oracle::Guests,
+    /// The fuel the input's program transactions have asked for so far (`v2::FUEL_CAP`).
+    fuel_signed: u64,
+    /// How many of the queued txs of each sender are signed for a fee the chain must refuse (a drop
+    /// short of the charge, or an idle chain's): a refused tx takes no nonce, so the sender's next
+    /// one signs the same.
+    doomed: BTreeMap<String, u64>,
+    /// The machine couldn't run the input (a Setup-class fault twice, `v2::run_block`): not a
+    /// finding, and the run stops there.
+    resource_error: bool,
+    /// The v2 fixture's empty blocks that have run with every check so far, and whether the next
+    /// ones are made quick (`Sm::quick_block`).
+    full_empty: u32,
+    quick: bool,
+    /// Tests only: a change made to the state right after each transaction the unrolled block
+    /// applies, to show an oracle sees it.
+    tamper: Option<fn(&mut State, &Tx)>,
 }
 
-impl Sm {
+impl<'a> Sm<'a> {
+    /// A run from the fixture's state.
+    fn new(fx: &'a SmFixture) -> Sm<'a> {
+        Sm { fx, state: fx.state.clone(), height: fx.height, txs: vec![], applied: 0, roots: vec![], halted: false, exec: Exec::Unrolled, seen: BTreeMap::new(), refused: vec![], kept: BTreeMap::new(), guests: Default::default(), fuel_signed: 0, doomed: BTreeMap::new(), resource_error: false, full_empty: 0, quick: false, tamper: None }
+    }
+
     fn proposer(&self) -> String {
-        sm_fixture().validator.address.clone()
+        self.fx.validator.address.clone()
     }
 
     /// Queues a tx from `from` signed (in name: the state machine doesn't check signatures,
     /// admission does) by `signer`, at that sender's next nonce in this block.
     fn tx(&mut self, signer: &Who, from: &str, tip: u64, action: Action) {
+        self.tx_paying(signer, from, tip, v2::Fee::Idle, action);
+    }
+
+    /// [`Sm::tx`] with a maximum fee of `fee`: what a tx pays on an idle chain (`Tx::charge`), or
+    /// far above, or the exact charge in the block it will be in (`econ::charge` says what the node
+    /// charges there; the oracles say what it should), or a drop less.
+    fn tx_paying(&mut self, signer: &Who, from: &str, tip: u64, fee: v2::Fee, action: Action) {
+        let nonce = self.next_nonce(from);
+        let mut tx = Tx { chain_id: self.fx.chain.into(), genesis_hash: "00".repeat(32), from: from.into(), nonce, fee: 0, tip, valid_until: self.height + 10, action, memo: String::new(), public_key: signer.public_key.clone(), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+        // The block this tx is queued for is the next one, on the state as it is now.
+        let charge = |tx: &Tx| crate::econ::charge(&self.state, tx, self.height + 1).unwrap_or(u64::MAX);
+        tx.fee = match fee {
+            v2::Fee::Idle => tx.charge().unwrap_or(u64::MAX),
+            v2::Fee::Max => v2::PROGRAM_FEE,
+            v2::Fee::Exact => charge(&tx),
+            v2::Fee::Short => charge(&tx).saturating_sub(1),
+        };
+        if matches!(fee, v2::Fee::Short | v2::Fee::Idle) && v2_is_program_tx(&tx) {
+            *self.doomed.entry(from.to_string()).or_default() += 1;
+        }
+        self.queue(tx);
+    }
+
+    /// The nonce of the next tx `from` signs in this block: its account's, past those it has
+    /// queued that will be taken.
+    fn next_nonce(&self, from: &str) -> u64 {
         let queued = self.txs.iter().filter(|t| t.from == from).count() as u64;
-        let nonce = self.state.account(from).nonce + queued;
-        let mut tx = Tx { chain_id: SM_CHAIN.into(), genesis_hash: "00".repeat(32), from: from.into(), nonce, fee: 0, tip, valid_until: self.height + 10, action, memo: String::new(), public_key: signer.public_key.clone(), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
-        tx.fee = tx.charge().unwrap_or(u64::MAX);
+        self.state.account(from).nonce + queued - self.doomed.get(from).copied().unwrap_or(0)
+    }
+
+    /// Queues `tx`, ending the block at 16.
+    fn queue(&mut self, tx: Tx) {
         self.txs.push(tx);
         if self.txs.len() >= 16 {
             self.end_block();
@@ -584,21 +771,62 @@ impl Sm {
         if self.halted {
             return;
         }
+        // The v2 fixture's blocks are bounded (`v2::BLOCK_CAP`): an input of slow blocks is not slower.
+        if self.fx.programs.is_some() && self.height - self.fx.height >= v2::BLOCK_CAP {
+            self.txs.clear();
+            self.halted = true;
+            return;
+        }
         let height = self.height + 1;
         let proposer = self.proposer();
+        let chain = self.fx.chain;
         let txs = std::mem::take(&mut self.txs);
+        self.doomed.clear();
+        // A pause's spans are hundreds of blocks, so the v2 fixture lets empty ones pass quickly.
+        if self.fx.programs.is_some() && txs.is_empty() {
+            if self.quick || self.full_empty >= v2::FULL_EMPTY_BLOCKS {
+                return self.quick_block(height, &proposer);
+            }
+            self.full_empty += 1;
+        }
         // Dry run + rollback (proposals, mempool checks) must leave the state exactly as it was.
         let before = self.state.full_root();
         let mut j = crate::chain::Journal::default();
         for tx in &txs {
-            let _ = self.state.apply_j(&mut j, tx, SM_CHAIN, &proposer, height, false);
+            let _ = self.state.apply_j(&mut j, tx, chain, &proposer, height, crate::chain::ApplyMode::Mempool);
         }
         self.state.rollback(j);
         assert_eq!(self.state.full_root(), before, "a rolled-back dry run changed the state");
         // Exactly as execution runs a block (`State::run_block`).
         let hash = hex::encode(crate::crypto::hash(&height.to_le_bytes()));
         let mut applied = 0;
-        self.state.run_block(SM_CHAIN, height, &hash, &proposer, height, height - 1, &txs, |_, _, r| applied += matches!(r, Ok(Outcome::Applied)) as usize);
+        let fx = self.fx;
+        let ran = match (&fx.programs, self.exec) {
+            (None, _) => {
+                self.state.run_block(chain, height, &hash, &proposer, height, height - 1, &txs, |_, _, r| applied += matches!(r, Ok(Outcome::Applied)) as usize);
+                None
+            }
+            (Some(_), Exec::Unrolled) => match v2::run_block(self, height, &hash, &proposer, &txs, &mut applied) {
+                Some(ran) => Some(Block::Unrolled(ran)),
+                None => return self.stop(),
+            },
+            (Some(_), Exec::RunBlock) => {
+                let (mut included, mut failed) = (vec![], BTreeMap::new());
+                self.state.run_block(chain, height, &hash, &proposer, height, height - 1, &txs, |tx, _, r| {
+                    if let Ok(outcome) = r {
+                        applied += matches!(outcome, Outcome::Applied) as usize;
+                        if let Outcome::Failed(why) = outcome {
+                            failed.insert(included.len(), why);
+                        }
+                        included.push(tx.clone());
+                    }
+                });
+                if v2::fault_of(&self.state, height).is_err() {
+                    return self.stop();
+                }
+                Some(Block::RunBlock { included, failed })
+            }
+        };
         self.applied += applied;
         let commit = self.state.commit_block().expect("an in-memory tree can't fail");
         assert_eq!(commit.root, self.state.full_root(), "incremental state root diverged from a full rebuild at height {height}");
@@ -606,15 +834,47 @@ impl Sm {
             panic!("state invariant broken at height {height}: {e}");
         }
         self.roots.push(commit.root);
+        match ran {
+            None => {}
+            Some(Block::Unrolled(ran)) => {
+                let digest = v2::check_block(self, height, ran);
+                self.roots.push(digest);
+            }
+            Some(Block::RunBlock { included, failed }) => {
+                let digest = v2::digest_block(self, height, &included, &failed);
+                self.roots.push(digest);
+            }
+        }
         self.height = height;
         // A binary that can't run the next height stops, as the node does (`upgrade::after_block`).
-        // This genesis schedules no version, so the binary runs `SUPPORTED_PROTOCOL_VERSION`.
-        self.halted = crate::upgrade::check_next_with(&self.state, height + 1, crate::consensus::SUPPORTED_PROTOCOL_VERSION).is_err();
+        // The v1 genesis schedules no version, so its binary runs `SUPPORTED_PROTOCOL_VERSION`; the
+        // v2 one schedules v2, which that binary runs too (`upgrade::supported_version`).
+        self.halted = crate::upgrade::check_next_with(&self.state, height + 1, self.fx.supported).is_err();
+    }
+
+    /// An empty block of the v2 fixture without the per-block checks (the dry run, the rebuilt root,
+    /// the invariants, the oracles): only its end-of-block steps and its commit. Its root and the
+    /// digest of its (no) receipts join `roots` as any block's do, on either path.
+    fn quick_block(&mut self, height: u64, proposer: &str) {
+        let hash = hex::encode(crate::crypto::hash(&height.to_le_bytes()));
+        let version = crate::upgrade::version_at(&self.state, height);
+        self.state.end_block(&crate::chain::BlockInfo { chain_id: self.fx.chain, height, version, hash: &hash, proposer, view: height, parent_view: height - 1, skipped: &[], tx_bytes: 0 });
+        let commit = self.state.commit_block().expect("an in-memory tree can't fail");
+        self.roots.push(commit.root);
+        self.roots.push(v2::empty_digest());
+        self.height = height;
+        self.halted = crate::upgrade::check_next_with(&self.state, height + 1, self.fx.supported).is_err();
+    }
+
+    /// The machine can't run this input (`v2::Resource`): the run ends here, unjudged.
+    fn stop(&mut self) {
+        self.resource_error = true;
+        self.halted = true;
     }
 
     /// Interprets one op as a tx (or blocks). `amt` and the indexes come from the fuzzer.
     fn op(&mut self, kind: u8, a: u8, b: u8, amt: u64, raw: &[u8]) {
-        let f = sm_fixture();
+        let f = self.fx;
         let (ai, bi) = (a as usize % SM_USERS, b as usize % SM_USERS);
         let (user, other) = (&f.users[ai], f.users[bi].address.clone());
         let me = user.address.clone();
@@ -627,7 +887,8 @@ impl Sm {
         let hunt = amt % self.state.next_hunt_id.max(1);
         let claim = amt % self.state.poc.next_claim_id.max(1);
         let validator_addr = |s: &Self| s.state.validators.keys().nth(b as usize % s.state.validators.len().max(1)).cloned().unwrap_or_else(|| f.validator.address.clone());
-        let kind = match kind % 40 {
+        // The v2 fixture's ops are numbered after v1's (`v2::OPS`); v1's decode as before.
+        let kind = match kind % if f.programs.is_some() { v2::OPS } else { 40 } {
             36 => 17,
             37 => 18,
             38 | 39 => 25,
@@ -777,31 +1038,47 @@ impl Sm {
             // A tx the state machine must refuse (a stranger's key, a stale nonce), not apply.
             35 if amt % 2 == 0 => return self.tx(agent, &me, tip, Action::RegisterName { name: format!("sneaky{}", b % 4) }),
             35 => {
-                let mut t = Tx { chain_id: SM_CHAIN.into(), genesis_hash: "00".repeat(32), from: me.clone(), nonce: self.state.account(&me).nonce.wrapping_sub(1), fee: 0, tip, valid_until: h + 10, action: Action::WithdrawVested {}, memo: String::new(), public_key: user.public_key.clone(), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+                let mut t = Tx { chain_id: f.chain.into(), genesis_hash: "00".repeat(32), from: me.clone(), nonce: self.state.account(&me).nonce.wrapping_sub(1), fee: 0, tip, valid_until: h + 10, action: Action::WithdrawVested {}, memo: String::new(), public_key: user.public_key.clone(), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
                 t.fee = t.charge().unwrap_or(u64::MAX);
                 self.txs.push(t);
                 return;
             }
+            // The v2 fixture's program ops (kinds 40–46): `v2.rs`.
+            v2::OP_CALL..=v2::OP_GOV => return v2::op(self, kind, a, b, amt, raw),
             _ => return,
         };
         self.tx(user, &me, tip, action);
     }
 }
 
-/// Runs the ops in `data` from the state machine fixture's genesis: every block's root, and how
-/// many txs applied.
-fn sm_run(data: &[u8]) -> (Vec<[u8; 32]>, usize) {
-    let mut sm = Sm { state: sm_fixture().state.clone(), height: 0, txs: vec![], applied: 0, roots: vec![], halted: false };
+/// Runs the ops in `data` from the v1 state machine fixture's genesis: every block's root, and how
+/// many txs applied. Exactly as the target has always run (v1's op stream: kinds modulo 40).
+fn sm_run(data: &[u8]) -> Sm<'static> {
+    let mut sm = Sm::new(sm_fixture(None));
+    sm.exec = Exec::RunBlock;
+    sm_interpret(&mut sm, data, 40);
+    sm_finish(sm)
+}
+
+/// The ops of `data` on `sm`, kinds taken modulo `kinds`.
+fn sm_interpret(sm: &mut Sm<'_>, data: &[u8], kinds: u8) {
     let mut rest = data;
     for _ in 0..SM_MAX_OPS {
         let Some((op, tail)) = rest.split_first_chunk::<SM_OP>() else { break };
         rest = tail;
         let [kind, a, b, lo, hi] = *op;
         let amt = u16::from_le_bytes([lo, hi]) as u64;
-        // The raw-action op (33) takes `b % 64 + 1` more bytes: an action's wire encoding.
-        let raw = if kind % 40 == 33 || kind % 40 == 32 {
+        let k = kind % kinds;
+        // The raw-action ops (32, 33) take `b % 64 + 1` more bytes: an action's wire encoding.
+        let raw = if k == 33 || k == 32 {
             let n = (b as usize % 64 + 1).min(rest.len());
             let (raw, tail) = rest.split_at(n);
+            rest = tail;
+            raw
+        } else if (v2::OP_CALL..=v2::OP_GOV).contains(&k) && kinds == v2::OPS {
+            // A program op's payload: a length byte, then that many bytes (fewer at the end).
+            let (n, tail) = rest.split_first().map_or((0, rest), |(n, tail)| (*n as usize, tail));
+            let (raw, tail) = tail.split_at(n.min(tail.len()));
             rest = tail;
             raw
         } else {
@@ -809,13 +1086,16 @@ fn sm_run(data: &[u8]) -> (Vec<[u8; 32]>, usize) {
         };
         sm.op(kind, a, b, amt, raw);
     }
+}
+
+/// The run's last block, and the final state's snapshot round trip (what fast sync rebuilds from).
+fn sm_finish(mut sm: Sm<'static>) -> Sm<'static> {
     sm.end_block();
-    // The final state survives the snapshot encoding (what fast sync rebuilds from).
     let mut bytes = vec![];
     snapshot::write_state(&sm.state, &mut bytes).unwrap();
     let back = snapshot::read_state(&mut bytes.as_slice()).expect("a state the state machine built must decode from its snapshot");
     assert_eq!(back.root_hash(), sm.state.root_hash(), "the snapshot of a state rebuilds another root");
-    (sm.roots, sm.applied)
+    sm
 }
 
 /// The state machine (MAINNET-DESIGN 2, SEC-3): fuzzer-chosen sequences of txs of every kind (the
@@ -824,18 +1104,312 @@ fn sm_run(data: &[u8]) -> (Vec<[u8; 32]>, usize) {
 /// equal a full rebuild, a rolled-back dry run must leave no trace, and the invariants (supply
 /// conservation, record bounds) must hold. One input in four runs twice: the same ops must give
 /// the same roots (nondeterminism, e.g. from hash-map order, splits a chain).
+///
+/// Protocol v1, programs not in it. The v2 fixture, with program ops, is `state_machine_programs`.
 pub fn state_machine(data: &[u8]) -> bool {
-    let (roots, applied) = sm_run(data);
+    let run = sm_run(data);
     if crate::crypto::hash(data)[0] % 4 == 0 {
-        let (again, _) = sm_run(data);
-        assert_eq!(roots, again, "the same txs from the same genesis gave different state roots");
+        let again = sm_run(data);
+        assert_eq!(run.roots, again.roots, "the same txs from the same genesis gave different state roots");
     }
-    applied > 0
+    run.applied > 0
+}
+
+/// `state_machine_programs`, on a v2 fixture whose profile is `data`'s first byte (`v2.rs`'s
+/// table): a run of `data`'s other bytes as ops, 0–39 as v1's and 40–46 program ops, with every
+/// check of `state_machine`'s and the oracles of `oracle.rs` (docs/PROGRAMS-V0.md §10.4).
+fn smp_run(data: &[u8], exec: Exec) -> Sm<'static> {
+    let (profile, ops) = data.split_first().map_or((v2::Profile::of(0), &[][..]), |(first, ops)| (v2::Profile::of(*first), ops));
+    let mut sm = Sm::new(sm_fixture(Some(profile)));
+    sm.exec = exec;
+    sm_interpret(&mut sm, ops, v2::OPS);
+    sm_finish(sm)
+}
+
+/// The v2 fixture's state machine: [`smp_run`], then for one input in four a second run through
+/// `State::run_block`, which must reach the same roots and the same digests of each block's
+/// receipts as the unrolled blocks, and so does hold `State::run_block` to the unrolled copy. An
+/// input the machine can't run (a Setup-class fault, not a finding) is not accepted and not
+/// judged further. Accepted: some transaction applied.
+pub fn state_machine_programs(data: &[u8]) -> bool {
+    let run = smp_run(data, Exec::Unrolled);
+    if !run.resource_error && crate::crypto::hash(data)[0] % 4 == 0 {
+        rerun_must_agree(data, &run);
+    }
+    run.applied > 0
+}
+
+/// The determinism rerun: `data` through `State::run_block`, against `run`.
+fn rerun_must_agree(data: &[u8], run: &Sm<'_>) {
+    let again = smp_run(data, Exec::RunBlock);
+    if !again.resource_error {
+        assert_eq!(run.roots, again.roots, "the unrolled blocks and State::run_block gave different state roots or receipts from the same txs");
+    }
+}
+
+/// How many program transactions of each kind ended each way (`("call_program", "aborted")`), as
+/// their receipts say, when `data` runs on the v2 fixture: what its seeds and the fuzzer reach,
+/// for `tests/harness.rs` and the campaign's record. It also runs the determinism rerun, whatever
+/// the input.
+pub fn state_machine_programs_receipts(data: &[u8]) -> BTreeMap<(&'static str, &'static str), usize> {
+    let run = smp_run(data, Exec::Unrolled);
+    assert!(!run.resource_error, "this machine couldn't run the input");
+    rerun_must_agree(data, &run);
+    run.seen
+}
+
+/// `state_machine_programs` with `tamper` called on the state after every transaction the unrolled
+/// block applies: for `tests/harness.rs`, which shows each oracle sees the change a bug in the node
+/// would make. Returns whether some transaction applied. A run the machine can't make (a Setup-class
+/// fault) returns `None`.
+pub fn state_machine_programs_tampered(data: &[u8], tamper: fn(&mut State, &Tx)) -> Option<bool> {
+    let (profile, ops) = data.split_first().map_or((v2::Profile::of(0), &[][..]), |(first, ops)| (v2::Profile::of(*first), ops));
+    let mut sm = Sm::new(sm_fixture(Some(profile)));
+    sm.tamper = Some(tamper);
+    sm_interpret(&mut sm, ops, v2::OPS);
+    let sm = sm_finish(sm);
+    (!sm.resource_error).then_some(sm.applied > 0)
+}
+
+/// The numbers `oracle::spec` copies from the spec, with the names `tests/harness.rs` holds them to
+/// the node's `SCHEDULE_V0` and limits by.
+pub fn oracle_spec_numbers() -> Vec<(&'static str, u64)> {
+    use oracle::spec;
+    vec![
+        ("load_base", spec::LOAD_BASE),
+        ("load_per_byte", spec::LOAD_PER_BYTE),
+        ("upload_base", spec::UPLOAD_BASE),
+        ("upload_per_byte", spec::UPLOAD_PER_BYTE),
+        ("rate_scale", spec::RATE_SCALE),
+        ("max_reservation", spec::MAX_RESERVATION),
+        ("max_fuel_rate", spec::MAX_FUEL_RATE),
+        ("floor_rate", spec::DEFAULT_FLOOR_RATE),
+        ("max_block_fuel", spec::DEFAULT_MAX_BLOCK_FUEL),
+        ("max_tx_fuel", spec::DEFAULT_MAX_TX_FUEL),
+        ("value_cap", spec::DEFAULT_VALUE_CAP),
+    ]
+}
+
+/// Every block's root of `state_machine`'s run of `data` and how many txs applied: for
+/// `tests/harness.rs`, which holds the v1 seeds' runs to what the harness of 9e8cd806 (before any
+/// of programs' fuzzing) gave.
+pub fn state_machine_trace(data: &[u8]) -> (Vec<[u8; 32]>, usize) {
+    let run = sm_run(data);
+    (run.roots, run.applied)
+}
+
+/// Why admission refused each program transaction of a run of `data` on the v2 fixture, in order:
+/// the texts `oracle::check_refused` reads, and so what `tests/harness.rs` shows is still said.
+pub fn state_machine_programs_refusals(data: &[u8]) -> Vec<String> {
+    smp_run(data, Exec::Unrolled).refused
+}
+
+/// Where a run of `data` on the v2 fixture ended, for `tests/harness.rs`: the height, the last run
+/// of pauses (`started`, `from`, `until`, how many signed), programs' fuel rate and whether the
+/// feature is on.
+pub fn state_machine_programs_end(data: &[u8]) -> (u64, Option<(u64, u64, u64, usize)>, u64, bool) {
+    let run = smp_run(data, Exec::Unrolled);
+    let meta = run.state.programs.meta.as_ref().expect("the v2 fixture has programs");
+    (run.height, meta.pause.as_ref().map(|p| (p.started, p.from, p.until, p.signers.len())), meta.fuel_rate, crate::upgrade::is_active(&run.state, crate::upgrade::PROGRAMS_FEATURE))
 }
 
 /// A state machine input from `(kind, a, b, amt)` ops (and raw bytes after a raw-action op).
 fn sm_ops(ops: &[(u8, u8, u8, u16)]) -> Vec<u8> {
     ops.iter().flat_map(|&(k, a, b, amt)| [k, a, b, amt.to_le_bytes()[0], amt.to_le_bytes()[1]]).collect()
+}
+
+// --------------------------------------------------------------------------- program tx codec
+
+/// The height `program_tx_codec` admits its txs at: the first block after genesis.
+const PROGRAM_HEIGHT: u64 = 1;
+/// The most the envelope's tx may be charged (1 FANG): far above the fixtures' base fee for the
+/// largest tx, an upload of `programs::MAX_CODE_TX_BYTES`, so no action outgrows it.
+const PROGRAM_FEE: u64 = types::DROPS_PER_FANG;
+
+/// What `program_tx_codec` checks against: two chains on which programs are dormant, and the tx
+/// each input's action travels in.
+struct ProgramFixture {
+    /// The fixture chain (protocol v1, as testnet-2 runs), and the same chain born at v2 with
+    /// programs off (as `blockula-1` is). On both, `programs::status` is `Dormant` at
+    /// [`PROGRAM_HEIGHT`].
+    dormant: [(&'static str, State); 2],
+    /// The tx around each action: from the fixture's funded account (its genesis key, at nonce 0),
+    /// at most [`PROGRAM_FEE`] and no tip, valid at [`PROGRAM_HEIGHT`], with no memo and a
+    /// signature of zeros. `State::apply` doesn't check signatures (gossip, the API and block
+    /// verification do before it, which `tx_wire` fuzzes), so the dormant chains refuse a program
+    /// action for what it is.
+    envelope: Tx,
+    /// The envelope's wire form around its action: everything before the action, and everything
+    /// after it (the empty memo, the public key and the signature).
+    head: Vec<u8>,
+    tail: Vec<u8>,
+}
+
+fn program_fixture() -> &'static ProgramFixture {
+    static F: OnceLock<ProgramFixture> = OnceLock::new();
+    F.get_or_init(|| {
+        let funded = Keys::from_seed(VALIDATOR_SEED);
+        let mut v2 = serde_json::to_value(genesis()).unwrap();
+        v2["upgrades"] = json!([{ "version": crate::upgrade::PROGRAMS_VERSION, "activation_height": PROGRAM_HEIGHT }]);
+        let v2: Genesis = serde_json::from_value(v2).expect("the v2 fixture genesis no longer parses: update harness::program_fixture");
+        v2.check().expect("the v2 fixture genesis is invalid: update harness::program_fixture");
+        let dormant = [("the v1 chain", genesis().initial_state()), ("the chain born at v2 with programs off", v2.initial_state())];
+        assert_eq!(crate::upgrade::version_at(&dormant[1].1, PROGRAM_HEIGHT), crate::upgrade::PROGRAMS_VERSION, "the v2 fixture doesn't run v2");
+        let envelope = Tx { chain_id: CHAIN_ID.into(), genesis_hash: genesis_hash().into(), from: funded.address(), nonce: 0, fee: PROGRAM_FEE, tip: 0, valid_until: VALID_UNTIL, action: Action::ProgramsPause {}, memo: String::new(), public_key: hex::encode(funded.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+        // The envelope holds tag 69 alone, so its signing bytes end with that byte and the empty
+        // memo (a u16 length of 0), and the key and signature follow them.
+        let (signing, wire) = (envelope.signing_bytes(), envelope.to_bytes());
+        let (head, tail) = (signing[..signing.len() - 3].to_vec(), wire[signing.len() - 2..].to_vec());
+        assert_eq!([&head[..], &[69], &tail[..]].concat(), wire, "the envelope's wire form isn't head ‖ action ‖ tail: update harness::program_fixture");
+        // So a program action's refusal is the action's: the envelope admits a transfer, its fee
+        // covers the base fee of the largest tx the format lets through, and programs are
+        // dormant, on both chains.
+        for (name, st) in &dormant {
+            let transfer = Tx { action: Action::Transfer { to: Keys::from_seed([0x43; 32]).address(), amount: types::DROPS_PER_FANG }, ..envelope.clone() };
+            let outcome = st.clone().apply(&transfer, CHAIN_ID, &funded.address(), PROGRAM_HEIGHT);
+            assert!(matches!(outcome, Ok(Outcome::Applied)), "{name}: a transfer in the program_tx_codec envelope doesn't apply ({outcome:?}): update harness::program_fixture");
+            let largest = crate::econ::base_fee(st, PROGRAM_HEIGHT, crate::programs::MAX_CODE_TX_BYTES as u64);
+            assert!(largest <= PROGRAM_FEE, "{name}: the envelope's fee doesn't cover the base fee of an upload of the largest size ({largest} drops): raise PROGRAM_FEE");
+            assert_eq!(crate::programs::status(st, PROGRAM_HEIGHT), crate::programs::Status::Dormant, "{name}: programs aren't dormant");
+        }
+        ProgramFixture { dormant, envelope, head, tail }
+    })
+}
+
+/// Whether programs' rules refuse `action` while programs are dormant: a program action (tags
+/// 62–64 and 69), or a parameter change of a `program_*` key, bare or proposed by a multisig,
+/// which the codec lets through and admission refuses until programs exist (docs/PROGRAMS-V0.md
+/// §4.5, `programs::params::admit`).
+fn is_programs_action(action: &Action) -> bool {
+    let program_param = |a: &Action| matches!(a, Action::Propose { kind: ProposalKind::ParamChange { key, .. }, .. } if key.starts_with(crate::programs::params::PREFIX));
+    action.is_program() || program_param(action) || matches!(action, Action::MultisigPropose { action } if program_param(action))
+}
+
+/// Programs' actions (tags 62–64 and 69, docs/PROGRAMS-V0.md §2) as blocks, gossip and `POST
+/// /api/tx` carry them: every node decodes and checks them, programs on or off (§10.4). An input
+/// is an action's wire encoding (`Action::to_bytes`, the tag first) or, starting with `{` (which
+/// no tag is), its JSON.
+///
+/// The wire decoder (`Action::from_bytes`) never panics, and what it takes is canonical (it
+/// encodes back to the same bytes). Inside a multisig proposal (tag 43 first, `decode_at`'s
+/// `nested`) a program tag never decodes, and any action a proposal may hold decodes as itself.
+/// In a tx's place (the envelope's wire form around the input) the gossip decoder
+/// (`Tx::from_bytes`) takes every action the action decoder takes, as it is, within the tx's size
+/// bound, except a private transfer or an unshield (which travel unsigned only), and only
+/// canonical bytes. Then, for an action from either form, [`program_action`]'s checks.
+/// Accepted: one of programs' actions that a tx carries through its wire form.
+pub fn program_tx_codec(data: &[u8]) -> bool {
+    let f = program_fixture();
+    if data.first() == Some(&b'{') {
+        let Ok(action) = serde_json::from_slice::<Action>(data) else { return false };
+        return program_action(f, action);
+    }
+    let decoded = Action::from_bytes(data);
+    if let Ok(a) = &decoded {
+        assert_eq!(a.to_bytes(), data, "Action::from_bytes accepted a non-canonical encoding");
+    }
+    let nested = Action::from_bytes(&[&[43], data].concat());
+    if matches!(data.first(), Some(62..=64 | 69)) {
+        assert!(nested.is_err(), "a multisig proposal decoded holding a program action");
+    }
+    if let Some(a) = decoded.as_ref().ok().filter(|a| !(a.is_program() || a.is_ghost() || matches!(a, Action::MultisigPropose { .. }))) {
+        assert_eq!(nested.as_ref().ok(), Some(&Action::MultisigPropose { action: Box::new(a.clone()) }), "an action decodes otherwise inside a multisig proposal");
+    }
+    let wire = [&f.head[..], data, &f.tail[..]].concat();
+    let in_tx = Tx::from_bytes(&wire);
+    if let Ok(tx) = &in_tx {
+        assert_eq!(tx.to_bytes(), wire, "Tx::from_bytes accepted a non-canonical encoding");
+    }
+    let Ok(action) = decoded else { return false };
+    if action.is_unsigned() {
+        // Unshields and private transfers travel only in their own unsigned form (`ghost_tx`'s),
+        // which is all `Tx::to_bytes` gives them, so the signed form must refuse them (review F-1).
+        assert!(in_tx.is_err(), "the gossip decoder took a private transfer or unshield in the signed form");
+    } else {
+        let tx = Tx { action: action.clone(), ..f.envelope.clone() };
+        assert_eq!(tx.to_bytes(), wire, "a tx's wire form doesn't carry its action's encoding in place");
+        if wire.len() <= tx.max_bytes() {
+            assert_eq!(in_tx.ok(), Some(tx), "the gossip decoder refused, or changed, an action the action decoder takes");
+        }
+    }
+    program_action(f, action)
+}
+
+/// The checks of [`program_tx_codec`] on a decoded action, from the wire or JSON. Its JSON gives
+/// back the same action; a multisig proposal can't hold a program action (`check_format`'s
+/// `nested`). In the envelope: the stateless checks (`check_tx_stateless`, as gossip runs them,
+/// an upload's interface decoded) never panic, and a tx that passes `check_format` survives its
+/// wire form and has a summary. Programs' actions (tags 62–64 and 69, and `program_*` parameter
+/// changes) are refused on both dormant chains, by programs' own rules whenever nothing else in
+/// the tx is wrong ([`check_dormant_refusal`]), and nobody is charged: v2 stays v1 until programs
+/// switch on (§1.2).
+fn program_action(f: &ProgramFixture, action: Action) -> bool {
+    let back: Action = serde_json::from_slice(&serde_json::to_vec(&action).unwrap()).expect("an action must parse again from its JSON");
+    assert_eq!(back, action, "the JSON round trip changed the action");
+    if action.is_program() {
+        assert!(action.check_as_multisig_action().is_err(), "a multisig proposal may hold a program action");
+    }
+    let tx = Tx { action, ..f.envelope.clone() };
+    let _ = consensus::check_tx_stateless(&tx, CHAIN_ID, genesis_hash(), prefix());
+    let carried = Tx::from_bytes(&tx.to_bytes()).is_ok_and(|back| back == tx);
+    if tx.check_format().is_ok() {
+        assert!(carried, "a tx check_format passed doesn't survive its wire form");
+        genesis_state().describe(&tx, None);
+    }
+    if !is_programs_action(&tx.action) {
+        return false;
+    }
+    for (name, st) in &f.dormant {
+        let (sender, supply, burned) = (st.account(&tx.from), st.supply, st.burned);
+        let mut after = st.clone();
+        let outcome = after.apply(&tx, CHAIN_ID, &f.envelope.from, PROGRAM_HEIGHT);
+        if let Err(why) = check_dormant_refusal(&tx, &outcome) {
+            panic!("{name}: {why}");
+        }
+        let charged = after.account(&tx.from);
+        assert_eq!((charged.balance, charged.nonce, after.supply, after.burned), (sender.balance, sender.nonce, supply, burned), "{name}: a refused {} tx changed the sender's account or the supply", tx.action.kind());
+    }
+    carried
+}
+
+/// Whether `outcome`, a dormant chain's `State::apply` of `tx` (one of programs' actions in the
+/// envelope, [`program_tx`]), is what dormancy owes it: `Err(why not)` when it isn't. It must be a
+/// refusal. When `tx` passes the stateless checks `State::admit` makes before programs' own (its
+/// format and its addresses' prefix), the refusal must be programs' own, in `programs::admit`'s
+/// words ([`dormant_refusal`]): the envelope passes all the others (the fixture checks it), so a
+/// refusal of any other kind would mean a program action got past programs' rules into a later
+/// check or handler (review F-4). A tx that fails those checks may be refused for them instead.
+pub fn check_dormant_refusal(tx: &Tx, outcome: &anyhow::Result<Outcome>) -> Result<(), String> {
+    let kind = tx.action.kind();
+    let refusal = match outcome {
+        Ok(o) => return Err(format!("programs are dormant, yet a {kind} tx was admitted: {o:?}")),
+        Err(e) => format!("{e:#}"),
+    };
+    if tx.check_format().is_err() || tx.check_prefix(prefix()).is_err() {
+        return Ok(());
+    }
+    let owed = dormant_refusal(&tx.action);
+    if refusal != owed {
+        return Err(format!("programs are dormant, yet a {kind} tx was refused for something else: {refusal:?}, not {owed:?}"));
+    }
+    Ok(())
+}
+
+/// Programs' refusal of one of programs' actions while they're dormant, in `programs::admit`'s
+/// words (programs/tests.rs and activate/tests.rs pin them): a program action's "programs are
+/// off", and for a `program_*` parameter change v1's "unknown parameter" (under "the proposed
+/// action" when a multisig proposes it, as `Action::check_format` words a nested refusal).
+fn dormant_refusal(action: &Action) -> String {
+    match action {
+        Action::Propose { kind: ProposalKind::ParamChange { key, .. }, .. } => format!("unknown parameter `{key}`"),
+        Action::MultisigPropose { action } => format!("the proposed action: {}", dormant_refusal(action)),
+        a => format!("programs are off: a {} transaction is refused until protocol v2 is in force and governance switches the `programs` feature on", a.kind()),
+    }
+}
+
+/// `action` in the tx `program_tx_codec` checks every action in (the fixture's envelope).
+pub fn program_tx(action: Action) -> Tx {
+    Tx { action, ..program_fixture().envelope.clone() }
 }
 
 // ------------------------------------------------------------------------------------ seeds
@@ -1038,5 +1612,57 @@ pub fn seeds() -> Vec<(&'static str, &'static str, Vec<u8>)> {
     out.push(("evidence", "conflicting-notarize", evidence_seed(staking::CONFLICTING_NOTARIZE, 0, 1, 4)));
     out.push(("evidence", "conflicting-finalize", evidence_seed(staking::CONFLICTING_FINALIZE, 2, 3, 9)));
     out.push(("evidence", "nullify-finalize", evidence_seed(staking::NULLIFY_FINALIZE, 3, 0, 1)));
+
+    // Programs' actions, each as its wire encoding and as its JSON: the vectors the SDK checks
+    // (sdk-ts/test/tx-vectors.json's `program_cases`, which types::tests writes and keeps current:
+    // every tag, each option set and unset, and integers, lengths and counts at their bounds), the
+    // four guests' uploads with their interfaces, and a `program_*` parameter change, bare and
+    // proposed by a multisig.
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let read = |path: &str| std::fs::read(repo.join(path)).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let vectors: Value = serde_json::from_slice(&read("sdk-ts/test/tx-vectors.json")).unwrap();
+    let cases = vectors["program_cases"].as_array().expect("sdk-ts/test/tx-vectors.json has no program_cases");
+    let mut programs: Vec<(&'static str, &'static str, Action)> = cases
+        .iter()
+        .map(|c| {
+            let label = c["label"].as_str().expect("a program case without a label");
+            let action = serde_json::from_value(c["tx"]["action"].clone()).unwrap_or_else(|e| panic!("program case {label:?}: {e}"));
+            // Seed names are `&'static str`, as the literal ones are: two short strings a case,
+            // leaked once per call of this generator.
+            let wire = program_case_seed(label);
+            let json: &'static str = format!("{wire}.json").leak();
+            let wire: &'static str = wire.leak();
+            (wire, json, action)
+        })
+        .collect();
+    for (guest, wire, json) in [("counter", "upload-counter", "upload-counter.json"), ("token", "upload-token", "upload-token.json"), ("escrow", "upload-escrow", "upload-escrow.json"), ("router", "upload-router", "upload-router.json")] {
+        let blob = |ext: &str| types::HexBytes(read(&format!("node/vm/tests/programs/{guest}.{ext}")));
+        programs.push((wire, json, Action::UploadCode { wasm: blob("wasm"), interface: blob("iface"), storage_limit: 30 * types::DROPS_PER_FANG }));
+    }
+    let param = Action::Propose { kind: ProposalKind::ParamChange { key: "program_max_tx_fuel".into(), value: 5_000_000 }, deposit: 1_000_000_000_000, title: "Lower the fuel a program call may sign for".into(), url: String::new() };
+    programs.push(("program-param-change", "program-param-change.json", param.clone()));
+    programs.push(("multisig-program-param-change", "multisig-program-param-change.json", Action::MultisigPropose { action: Box::new(param) }));
+    for (wire, json, action) in programs {
+        out.push(("program_tx_codec", wire, action.to_bytes()));
+        out.push(("program_tx_codec", json, serde_json::to_vec(&action).unwrap()));
+    }
+
+    // The v2 fixture's state machine runs (every kind of program op, each profile), the receipts
+    // they and some hand-made ones leave (`program_receipt`), and diffs in the shapes the guests'
+    // calls make (`program_commit`). Names are leaked, as the codec seeds' are.
+    out.extend(v2::seeds().into_iter().map(|(name, bytes)| ("state_machine_programs", name, bytes)));
+    out.extend(receipt::seeds().into_iter().map(|(name, bytes)| ("program_receipt", &*name.leak(), bytes)));
+    out.extend(commit::seeds().into_iter().map(|(name, bytes)| ("program_commit", name, bytes)));
     out
+}
+
+/// The name of the `program_tx_codec` seed of sdk-ts/test/tx-vectors.json's `program_cases` entry
+/// `label` (and, with `.json`, of its JSON's): the label's words (runs of ASCII letters and
+/// digits) in lowercase, joined by `-`, so `call_program, a batch (tag 64)` is
+/// `call-program-a-batch-tag-64`. Every vector the SDK checks is a seed, with no list to keep
+/// (review F-2); `tests/seeds.rs` checks no two seeds share a name.
+fn program_case_seed(label: &str) -> String {
+    let words: Vec<String> = label.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_ascii_lowercase).collect();
+    assert!(!words.is_empty(), "program case {label:?}: a label needs a letter or a digit to name its seed");
+    words.join("-")
 }

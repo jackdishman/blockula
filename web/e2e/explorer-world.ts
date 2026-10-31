@@ -6,7 +6,7 @@
 // multisig; names active, expired, offered and reserved; a stranger's phishing memos on a creator's
 // page, one on a dust payment. Strangers' text (memos, titles, labels, reasons, links) carries
 // markup and `javascript:` links, which must only ever show as text.
-import { parseFang, proposal } from "@blockula/sdk";
+import { interfaceHash, parseFang, proposal, versionDigest, wasmHash } from "@blockula/sdk";
 import { addressOf, OTHER_VALIDATOR, VALIDATOR, type MockNode } from "./mock-node";
 
 const F = 10n ** 9n;
@@ -19,6 +19,16 @@ export const HOSTILE_LINK = "javascript:window.__pwned=2";
 /** Phishing a stranger writes on a creator's page: on a dust payment (folded), and on a real one (flagged). */
 export const DUST_MEMO = "URGENT: mina.boo expires today. Renew at https://blockula-renew.example";
 export const PHISH_MEMO = "Blockula support: verify your wallet at https://blockula-help.example";
+
+/**
+ * Text a program's deployer (or the program) chose, as a lying node, or a later protocol version with looser names, could
+ * serve it: a method's name, an event's, an abort message. It must only ever show as text, and never run.
+ */
+export const HOSTILE_METHOD = "<script>window.__pwned=4</script>";
+export const HOSTILE_EVENT = '"><img src=x onerror=window.__pwned=5>';
+export const HOSTILE_ABORT = 'oops</code><img src=x onerror="window.__pwned=6">';
+/** A deployed program (protocol v2). */
+export const PROGRAM = addressOf("e1".repeat(32));
 
 export const ADDR = {
   mina: addressOf("c2".repeat(32)),
@@ -38,6 +48,9 @@ export const ADDR = {
 export const PHONE = "b1".repeat(32);
 export const AGENT = "a9".repeat(32);
 export const COVEN_OTHER = "c9".repeat(32);
+/** An ML-DSA-65 public key (1,952 bytes) and a proof of possession (3,309), in hex, as an `add_key` carries them: distinct throughout, so no prefix tells two apart. */
+export const LONG_KEY = Array.from({ length: 1952 }, (_, i) => ((i * 7 + 3) % 256).toString(16).padStart(2, "0")).join("");
+export const LONG_POP = Array.from({ length: 3309 }, (_, i) => ((i * 11 + 5) % 256).toString(16).padStart(2, "0")).join("");
 
 export type World = ReturnType<typeof seedWorld>;
 
@@ -77,6 +90,29 @@ export function seedWorld(node: MockNode, vlad: string = addressOf("c1".repeat(3
   const pay = (from: string, to: string, amount: string, o: Partial<Parameters<MockNode["add"]>[0]> = {}) =>
     tx("transfer", from, { to: o.toName ?? to, amount: fang(amount).toString() }, { to, amount: fang(amount), summary: `${node.label(from).name ?? node.label(from).short} sent ${amount} FANG to ${o.toName ?? node.label(to).name ?? node.label(to).short}`, ...o });
 
+  // A program anyone deployed: its code and interface stored by hash, its record, and the receipts of what ran.
+  const wasmBytes = Uint8Array.from({ length: 560 }, (_, i) => (i < 8 ? [0, 97, 115, 109, 1, 0, 0, 0][i] : i % 251));
+  const ifaceBytes = Uint8Array.from([1, 2, 3, 103, 101, 116, 1, 0, 0, 1, 4]);
+  const [wasm_hash, interface_hash] = [wasmHash(wasmBytes), interfaceHash(ifaceBytes)];
+  const toHex = (b: Uint8Array) => Buffer.from(b).toString("hex");
+  const section = (kind: "upload" | "create" | "call", o: { fee: [bigint, bigint]; outcome?: Record<string, unknown>; outside?: Record<string, string>; fuel?: [number, number, number]; created?: string | null; upload?: Record<string, unknown> | null; changes?: { account: string; change: string }[]; storage?: { bytes_delta: number; bonded: string; refunded: string }; returns?: { program: string; untrusted_method: string; value: string; data: string }[]; events?: { program: string; untrusted_name: string; data: string }[]; omitted?: Record<string, number> | null; burned?: string }) => {
+    const outside = { record_deposit: "0", upload_deposit: "0", account_creation_fee: "0", ...o.outside };
+    const [limit, load, used] = o.fuel ?? [0, 0, 0];
+    return {
+      version: 1, kind, outcome: o.outcome ?? { ok: true },
+      facts: {
+        balance_changes: o.changes ?? [], storage: o.storage ?? { bytes_delta: 0, bonded: "0", refunded: "0" },
+        outside_vm: { ...outside, total: (BigInt(outside.record_deposit) + BigInt(outside.upload_deposit) + BigInt(outside.account_creation_fee)).toString() },
+        burned_by_programs: o.burned ?? "0",
+        fuel: { limit, load, used, reserved: limit + load, rate: 250 }, fee: { bytes: o.fee[0].toString(), fuel: o.fee[1].toString(), tip: "0" }, created: o.created ?? null, upload: o.upload ?? null,
+      },
+      claims: { return_data: o.returns ?? [], events: o.events ?? [], omitted: o.omitted ?? null },
+    };
+  };
+  const short = (a: string) => `${a.slice(0, 10)}…${a.slice(-6)}`;
+  const call = { program: PROGRAM, version_digest: versionDigest(PROGRAM, wasm_hash, interface_hash, 1), method: HOSTILE_METHOD, input: "", value: "0" };
+  const callAction = { calls: [call], fuel_limit: 10_000_000, storage_limit: "1000000000", bindings: [] };
+
   const ids = {
     sent: pay(vlad, mina, "12.5", { memo: "for the castle repairs", signer: null }),
     received: pay(mina, vlad, "3", { memo: HOSTILE }),
@@ -89,7 +125,8 @@ export function seedWorld(node: MockNode, vlad: string = addressOf("c1".repeat(3
     renewed: tx("renew_name", lucy, { name: "lucy", years: 1 }, { summary: "lucy.boo renewed lucy.boo for 1 year" }),
     offered: tx("transfer_name", vlad, { name: "castle", to: mina }, { to: mina, summary: "vlad.boo offered castle.boo to mina.boo" }),
     released: tx("release_name", renfield, { name: "bat" }, { summary: "renfield.boo released bat.boo" }),
-    keyAdded: tx("add_key", vlad, { key_id: AGENT, label: "claude", role: { type: "session" } }, { summary: `vlad.boo added key ${AGENT.slice(0, 8)}… (claude) as a session key` }),
+    // A v1 action carrying a long key and its proof of possession: "What was signed, exactly" shows every character of them.
+    keyAdded: tx("add_key", vlad, { key_id: AGENT, label: "claude", role: { type: "session" }, public_key: LONG_KEY, pop: LONG_POP }, { summary: `vlad.boo added key ${AGENT.slice(0, 8)}… (claude) as a session key` }),
     keyRemoved: tx("remove_key", vlad, { key_id: "d0".repeat(32) }, { summary: "vlad.boo revoked key d0d0d0d0…" }),
     hunt: tx("create_hunt", vlad, { repo: "jackdishman/blockula", issue: 14, amount: fang("25").toString(), expires_at: node.height + 200_000, title: HOSTILE }, { amount: fang("25"), summary: "vlad.boo put 25 FANG on jackdishman/blockula#14" }),
     funded: tx("fund_hunt", lucy, { hunt_id: 0, amount: fang("5").toString() }, { amount: fang("5"), summary: "lucy.boo added 5 FANG to hunt #0" }),
@@ -114,14 +151,38 @@ export function seedWorld(node: MockNode, vlad: string = addressOf("c1".repeat(3
     waiting: pay(mina, lucy, "1", { status: "pending", memo: "on its way" }),
     dust: pay(stranger, mina, "0.000000001", { memo: DUST_MEMO }),
     phish: pay(stranger, mina, "0.5", { memo: PHISH_MEMO }),
+    programUpload: tx("upload_code", vlad, { wasm: toHex(wasmBytes), interface: toHex(ifaceBytes), storage_limit: "65010000" }, { fee: 93_260n, maxFee: 238_834n, summary: `${short(vlad)} uploaded program code ${wasm_hash.slice(0, 10)}… (560 bytes) with interface ${interface_hash.slice(0, 10)}… (2 methods), bonding at most 0.06501 FANG`, program: section("upload", { fee: [70_270n, 22_990n], fuel: [91_961, 0, 91_961], outside: { upload_deposit: "59100000" }, storage: { bytes_delta: 591, bonded: "59100000", refunded: "0" }, upload: { wasm_hash, interface_hash, new_code: true, new_interface: true, deposit: "59100000" } }) }),
+    programCreate: tx("create_program", vlad, { wasm_hash, interface_hash, authority: null, upgrade_delay_blocks: 0, policy: "open", accepts_transfers: false, init: null, fuel_limit: 0, storage_limit: "28160000", bindings: [] }, { fee: 65_820n, maxFee: 65_820n, summary: `${short(vlad)} created program ${short(PROGRAM)} (immutable) from code ${wasm_hash.slice(0, 10)}…`, program: section("create", { fee: [65_820n, 0n], outside: { record_deposit: "25600000", account_creation_fee: "100000000" }, storage: { bytes_delta: 256, bonded: "25600000", refunded: "0" }, created: PROGRAM }) }),
+    programCall: tx("call_program", vlad, callAction, { fee: 2_574_060n, maxFee: 18_455_665n, names: [PROGRAM], summary: `${short(vlad)} called program ${short(PROGRAM)}`, program: section("call", { fee: [65_910n, 2_508_150n], fuel: [10_000_000, 32_600, 76_273], changes: [{ account: vlad, change: "-12800000" }, { account: HOSTILE_LINK, change: "0" }], storage: { bytes_delta: 128, bonded: "12800000", refunded: "0" }, returns: [{ program: PROGRAM, untrusted_method: HOSTILE_METHOD, value: "0", data: "0100000000000000" }], events: [{ program: PROGRAM, untrusted_name: HOSTILE_EVENT, data: "ab".repeat(200) }] }) }),
+    programFailed: tx("call_program", vlad, callAction, { status: "failed", error: `program ${short(PROGRAM)} aborted with code 7`, fee: 2_574_060n, maxFee: 18_455_665n, names: [PROGRAM], summary: `${short(vlad)} called program ${short(PROGRAM)}`, program: section("call", { fee: [65_910n, 2_508_150n], fuel: [10_000_000, 32_600, 76_123], outcome: { ok: false, number: 2, code: "aborted", program: PROGRAM, abort_code: 7, untrusted_message: HOSTILE_ABORT }, returns: [{ program: PROGRAM, untrusted_method: HOSTILE_METHOD, value: "0", data: "" }] }) }),
+    // From mina, not the account the tests sign as (a pending transaction of its own would hold its next nonce).
+    programWaiting: tx("call_program", mina, callAction, { status: "pending", fee: 2_574_060n, maxFee: 18_455_665n, names: [PROGRAM], summary: `${short(mina)} called program ${short(PROGRAM)}`, program: null }),
     dropped: "dd".repeat(32),
     ranUnseen: "de".repeat(32),
   };
   node.failures.set(ids.dropped, { dropped: true, error: "dropped from the mempool: castle.boo belongs to vlad.boo", height: node.height - 3 });
   node.failures.set(ids.ranUnseen, { dropped: false, error: "hunt #9 is closed", height: 40 });
 
-  // Hunts in every state (hunt_json), the creator vlad's.
   const label = (a: string) => node.label(a);
+  // The program's record and what it's made of, as /api/program, /api/code and /api/interface serve them (node/src/programs/api.rs).
+  const created = node.txs.get(ids.programCreate)?.height ?? node.height;
+  const uploaded = node.txs.get(ids.programUpload)?.height ?? node.height;
+  node.credit(PROGRAM, "1");
+  node.programs.set(PROGRAM, {
+    address: PROGRAM, creator: label(vlad), created_at: created, code: { wasm_hash, size: wasmBytes.length, interface_hash }, version: 1, version_digest: call.version_digest,
+    authority: null, upgrade_delay_blocks: 0, policy: "open", upgradability: "immutable", accepts_transfers: false, balance: (1n * F).toString(), balance_display: "1 FANG",
+    storage: { items: 1, bytes: 128, deposit: "12800000", sponsored: "0" }, record_deposit: "25600000", record_payer: label(vlad),
+    methods: [
+      { untrusted_name: "get", selector: "1d3fce7875d1cf4c", kind: "view", payable: false, args: [], returns: "u64" },
+      { untrusted_name: HOSTILE_METHOD, selector: "0000000000000000", kind: "call", payable: true, args: [{ untrusted_name: HOSTILE_EVENT, type: "u64" }, { untrusted_name: "to", type: { vec: ["address", 8] } }], returns: null },
+    ],
+    proof_path: `/api/proof/66/${Buffer.from(PROGRAM).toString("hex")}`,
+  });
+  node.accountExtra.set(PROGRAM, { program: { creator: label(vlad), created_at: created, version_digest: call.version_digest, upgradability: "immutable", accepts_transfers: false, link: `/api/program/${PROGRAM}` } });
+  node.codes.set(wasm_hash, { wasm_hash, size: wasmBytes.length, untrusted_exports: ["get", HOSTILE_METHOD], uploader: label(vlad), deposit: "56000000", refs: 1, uploaded_at: uploaded, last_used_at: uploaded });
+  node.interfaces.set(interface_hash, { interface_hash, size: ifaceBytes.length, hex: toHex(ifaceBytes), untrusted_interface: { format: 1, methods: [] }, uploader: label(vlad), deposit: "3000000", refs: 1, uploaded_at: uploaded, last_used_at: uploaded });
+
+  // Hunts in every state (hunt_json), the creator vlad's.
   const hunt = (id: number, o: Record<string, unknown>) => ({
     id, repo: "jackdishman/blockula", issue: 10 + id, issue_url: HOSTILE_LINK, title: `Hunt ${id}`, amount: (25n * F).toString(), amount_display: "25 FANG", creator: label(vlad),
     funders: [{ account: label(vlad), amount: (20n * F).toString(), amount_display: "20 FANG" }, { account: label(lucy), amount: (5n * F).toString(), amount_display: "5 FANG" }],
@@ -204,5 +265,13 @@ export function seedWorld(node: MockNode, vlad: string = addressOf("c1".repeat(3
       status: "voting", created_at: node.height - 30, voting_end: node.height + 5000, execute_at: null, supermajority: false, ayes: { amount: { drops: (5n * F).toString(), display: "5 FANG" }, weight: { drops: (5n * F).toString(), display: "5 FANG" } }, nays: { amount: { drops: "0", display: "0 FANG" }, weight: { drops: "0", display: "0 FANG" } }, voters: 1, council: [], tally: null, outcome: "",
     },
   ];
-  return { vlad, ids, ...ADDR };
+  /**
+   * A payout to an account that didn't exist, made on request (not part of the world: the activity scan reads a bounded number of
+   * blocks, and a world with one more would push the oldest ones past it): the creation fee (0.1 FANG) comes out of the amount,
+   * inside the programs' own diff (burned_by_programs).
+   */
+  const addPayout = () =>
+    tx("call_program", vlad, callAction, { fee: 2_574_060n, maxFee: 18_455_665n, names: [PROGRAM], summary: `${short(vlad)} called program ${short(PROGRAM)}`, program: section("call", { fee: [65_910n, 2_508_150n], fuel: [10_000_000, 32_600, 41_000], changes: [{ account: vlad, change: "19200000" }, { account: PROGRAM, change: "-1000000000" }, { account: mina, change: "900000000" }], storage: { bytes_delta: -128, bonded: "0", refunded: "19200000" }, burned: "100000000" }) });
+
+  return { vlad, ids, wasm_hash, interface_hash, addPayout, ...ADDR };
 }

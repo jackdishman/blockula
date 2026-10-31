@@ -37,7 +37,7 @@ pub struct Rpc {
 }
 
 impl Signer {
-    fn keys(&self, dir: &Path) -> Result<Keys> {
+    pub(crate) fn keys(&self, dir: &Path) -> Result<Keys> {
         match &self.key {
             Some(p) => load_seed(p),
             None => wallet_keys(dir),

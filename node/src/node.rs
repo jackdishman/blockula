@@ -117,23 +117,29 @@ impl Pruning {
     }
 }
 
-/// HTTP limits: per-client reads (token bucket) and the request timeout.
+/// HTTP limits: per-client reads (token bucket) and the request timeout, and how program views are
+/// served.
 #[derive(Clone, Debug)]
 pub struct HttpOpts {
     pub read_rps: u32,
     pub read_burst: u32,
     pub timeout: Duration,
+    /// `--program-views`: a validator serves `POST /api/program/{address}/view` too (full nodes
+    /// always do: docs/PROGRAMS-V0.md §8.2).
+    pub program_views: bool,
+    /// `--view-max-fuel`: the most fuel one view may use (`None`: `program_max_tx_fuel`, which bounds it anyway).
+    pub view_max_fuel: Option<u64>,
 }
 
 impl Default for HttpOpts {
     fn default() -> Self {
-        Self { read_rps: api::READ_RPS, read_burst: api::READ_BURST, timeout: api::HTTP_TIMEOUT }
+        Self { read_rps: api::READ_RPS, read_burst: api::READ_BURST, timeout: api::HTTP_TIMEOUT, program_views: false, view_max_fuel: None }
     }
 }
 
 /// The HTTP API for `chain`, with this node's limits and trust.
 fn http_node(chain: Shared, marshal: Option<consensus::MarshalMailbox>, peers: Vec<String>, net: &NetOpts, trust: &Trust) -> Node {
-    let mut node = Node::new(chain, marshal, peers, net.client_ip.clone()).with_read_limits(net.http.read_rps, net.http.read_burst);
+    let mut node = Node::new(chain, marshal, peers, net.client_ip.clone()).with_read_limits(net.http.read_rps, net.http.read_burst).with_program_views(net.http.program_views, net.http.view_max_fuel);
     node.timeout = net.http.timeout;
     node.checkpoint_height = trust.newest();
     node
@@ -149,6 +155,16 @@ fn exit_halted(halt: &Halt) -> ! {
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
     std::process::exit(halt.exit_code())
+}
+
+/// `Chain::open`'s error, unless it's a halt: a block the startup replay can't execute (a program
+/// node fault, docs/PROGRAMS-V0.md §6.2) stops the node with the halt's exit code, as executing
+/// it would have, not with 1. Exits in that case.
+fn exit_on_halt(e: anyhow::Error) -> anyhow::Error {
+    if let Some(halt) = e.downcast_ref::<Halt>() {
+        exit_halted(halt);
+    }
+    e
 }
 
 /// Where a validator home records that slashing protection stopped it (exit 12). The halt itself
@@ -1052,7 +1068,7 @@ fn p2p_config(preset: &str, key: PrivateKey, namespace: &[u8], listen: SocketAdd
 }
 
 pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
-    let mut chain = Chain::open(&home)?;
+    let mut chain = Chain::open(&home).map_err(exit_on_halt)?;
     // Validators take their genesis from the signed release; a known chain's must match it. The
     // weak-subjectivity period is the one the parameters in force set, if governance shortened it.
     let mut trust = Trust::new(&chain.genesis, &Pins::default(), false)?;
@@ -1325,7 +1341,7 @@ pub fn run_full_node(home: PathBuf, net: NetOpts) -> Result<()> {
         eprintln!("ℹ️  --p2p-bind is for validators: a full node syncs over HTTP and listens for no p2p");
     }
     let jc: JoinConfig = serde_json::from_slice(&std::fs::read(home.join("join.json")).context("not a joined home — use `blockula join`")?)?;
-    let mut chain = Chain::open(&home)?;
+    let mut chain = Chain::open(&home).map_err(exit_on_halt)?;
     // The pins were checked at `join`; they (and the embedded checkpoints) apply on every start,
     // under the weak-subjectivity period of the parameters in force in this node's own state.
     let mut trust = Trust::new(&chain.genesis, &jc.pins, false)?;
@@ -1685,6 +1701,12 @@ async fn sync_loop(chain: Shared, peers: Vec<String>, stop_when_caught_up: bool,
             if stop_when_caught_up {
                 return; // a validator catching up: run_validator exits with the halt's code
             }
+            // A thread or an engine this node couldn't make is what a restart cures (exit 14,
+            // docs/PROGRAMS-V0.md §6.2), and nothing restarts a process that doesn't exit: a full
+            // node leaves for its supervisor, as a validator does. Only programs raise this halt.
+            if matches!(h, Halt::ProgramResources { .. }) {
+                exit_halted(&h);
+            }
             // A full node stops following the chain but keeps serving reads (/api/health says why).
             eprintln!("🛑 {h}\n   still serving reads at height {}; /api/health reports the halt", chain.lock().height());
             return futures::future::pending().await;
@@ -1958,6 +1980,75 @@ mod tests {
             assert_eq!(cfg.dial_frequency, theirs.dial_frequency, "{preset}");
             assert_eq!(cfg.gossip_bit_vec_frequency, theirs.gossip_bit_vec_frequency, "{preset}");
         }
+    }
+
+    /// A chain at `home` whose halt signal already says `halt`, as a full node's `sync_loop` finds it
+    /// after executing a block it halted on.
+    fn halted(home: &Path, halt: Halt) -> Shared {
+        Chain::summon(home, &SummonOpts::new("sync-halts", 1)).unwrap();
+        let chain = Chain::open(home).unwrap();
+        chain.halt.signal.set(halt);
+        Arc::new(Mutex::new(chain))
+    }
+
+    /// The child half of [`a_full_node_exits_14_on_program_resources_and_parks_on_every_other_halt`],
+    /// which runs this test binary again for it (`BLOCKULA_S4B_SYNC_ROOT`, a directory for its
+    /// homes): `sync_loop` on a chain that already halted, under each halt, saying on stderr what
+    /// it did. Exits 14 as the full node does for `ProgramResources`; 99 if that parks instead.
+    #[test]
+    #[ignore = "the child process of a_full_node_exits_14_on_program_resources_and_parks_on_every_other_halt"]
+    fn sync_loop_halts_child() {
+        let Ok(root) = std::env::var("BLOCKULA_S4B_SYNC_ROOT") else { return };
+        let root = PathBuf::from(root);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        // No peer answers: a loop that went on past its halt check would only fail rounds.
+        let sync = |chain: Shared, stop_when_caught_up: bool| {
+            let trust = Arc::new(Trust::new(&chain.lock().genesis, &Pins::default(), false).unwrap());
+            sync_loop(chain, vec!["http://127.0.0.1:1".into()], stop_when_caught_up, trust, false)
+        };
+        let waiting = Duration::from_millis(500);
+        let others = [
+            Halt::AtHeight { height: 7 },
+            Halt::UpgradeRequired { height: 8, version: 3, supported: 2 },
+            Halt::DoubleSignRisk { reason: "x".into() },
+            Halt::ProgramFault { height: 9, tx: "ab".repeat(32), fault: "a panic in program execution".into() },
+        ];
+        for (i, halt) in others.into_iter().enumerate() {
+            let kind = halt.kind();
+            let parked = rt.block_on(async { tokio::time::timeout(waiting, sync(halted(&root.join(i.to_string()), halt), false)).await }).is_err();
+            eprintln!("{kind}: {}", if parked { "parked" } else { "returned" });
+        }
+        let resources = || Halt::ProgramResources { height: 10, fault: "the OS refused a program thread 3 times".into() };
+        // A validator catching up returns on any halt (`run_validator` exits with its code).
+        let returned = rt.block_on(async { tokio::time::timeout(waiting, sync(halted(&root.join("5"), resources()), true)).await }).is_ok();
+        eprintln!("program_resources while catching up: {}", if returned { "returned" } else { "parked" });
+        // A full node exits through `exit_halted` here: this never returns.
+        let parked = rt.block_on(async { tokio::time::timeout(waiting * 4, sync(halted(&root.join("6"), resources()), false)).await }).is_err();
+        eprintln!("program_resources on a full node: {}", if parked { "parked" } else { "returned" });
+        std::process::exit(99);
+    }
+
+    /// §6.2: a full node's sync loop exits with 14 (`exit_halted`, which its supervisor restarts)
+    /// on `Halt::ProgramResources`, which a restart cures, and parks serving reads on every other
+    /// halt, as it always did. A validator catching up (`stop_when_caught_up`) returns on any halt,
+    /// that one included, for `run_validator` to exit with. Run in a child process: it exits.
+    #[test]
+    fn a_full_node_exits_14_on_program_resources_and_parks_on_every_other_halt() {
+        let root = home("sync-halts");
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "node::tests::sync_loop_halts_child", "--ignored", "--nocapture", "--test-threads=1"])
+            .env("BLOCKULA_S4B_SYNC_ROOT", &root)
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(&root).ok();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        for kind in ["halt_height", "upgrade_required", "double_sign_risk", "program_fault"] {
+            assert!(stderr.contains(&format!("{kind}: parked\n")), "{kind} parks: {stderr}");
+        }
+        assert_eq!(stderr.matches("still serving reads at height 0").count(), 4, "the four halts that park keep serving reads, and program_resources must exit instead: {stderr}");
+        assert!(stderr.contains("program_resources while catching up: returned\n"), "a validator catching up returns on any halt, this one too: {stderr}");
+        assert_eq!(out.status.code(), Some(crate::upgrade::EXIT_PROGRAM_RESOURCES), "a full node exits 14 on program_resources: {stderr}");
+        assert!(stderr.contains("exit code 14 (program_resources)") && !stderr.contains("program_resources on a full node"), "through exit_halted: {stderr}");
     }
 
     #[test]

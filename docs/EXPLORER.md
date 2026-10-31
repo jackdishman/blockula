@@ -15,10 +15,10 @@ stays as a dependency-free fallback for operators and for links the MCP and CLI 
 - **Act in place.** An account page can pay that account, a name page can register the name,
   and a hunt can be funded from the hunt. Nothing needs a "connect wallet" step, because the
   wallet is already there.
-- **Programs anyone deploys, later.** Using a deployed program (protocol v2,
+- **Programs anyone deploys.** Using a deployed program (protocol v2,
   [PROGRAMS.md](PROGRAMS.md)) means reading its state, building a call, previewing it and
   signing it. That only works well where the signer already lives. The Programs pages build
-  that loop today for the chain's built-in modules (see below).
+  that loop for the chain's built-in modules, and read deployed programs (see below).
 
 ## Principles
 
@@ -74,12 +74,12 @@ Borrowed from the explorers worth borrowing from, without copying any of them:
 | `/name/{name}` | Status (active; expired, in its grace period, when only its owner can renew it; reserved; free), owner, expiry, a pending offer, and the owner's renew, offer and release actions (or the recipient's accept); or the price and a register button |
 | `/programs` | The chain's built-in modules, each with its state, its calls and its actions |
 | `/programs/{names\|hunts\|pool\|validators\|accounts}` | One program |
+| `/program/{address}` | A program anyone deployed, read only: its record (creator, code and interface hashes, version digest, who could upgrade it, balance, storage), its methods as its deployer named them, the calls that named it; or, for a code's 64-character hash, what's stored |
 | `/hunt/{id}`, `/claim/{id}`, `/seance/{id}` | Program records |
 
-## Programs: native today, deployed in v2
+## Programs: native, and deployed (protocol v2)
 
-Nobody can deploy a program on Blockula yet (third-party programs are protocol v2:
-[PROGRAMS.md](PROGRAMS.md)), but it has five native programs: Names, Hunts, the
+The chain has five native programs: Names, Hunts, the
 Contribution pool, Validators, and Accounts & keys. Each program is described by an interface
 (`web/lib/explorer/programs.ts`) that lists:
 
@@ -127,10 +127,9 @@ the node and `preflightInput` (pure) turns the reads into the preflight's input,
 sender, and refuse what it refused, and a receipt's exact balance changes must be what the
 balances did.
 
-When deployed programs arrive, a program's interface maps onto the same `ActionSpec` (parameter
-types in, a `call_program` action out), so their pages reuse the form, the preview and the
-receipt. They add wider parameter types and a `prepare` step that sizes the call by simulation
-and re-simulates the exact bytes it signs ([PROGRAMS.md](PROGRAMS.md) section 11.3).
+**Deployed programs** (a chain that has switched programs on) are listed beside these (`Program.kind` is `"native"` or `"deployed"`, `deployedProgram()`), and have a page of their own, `/program/{address}`. It's read only in this release: calls are made with `blockula program call` or the SDK's `wallet.call`, which show the digest and the fee, so there are no `ActionSpec` forms yet. A later release maps a program's interface onto the same `ActionSpec` (parameter types in, a `call_program` action out), reusing the form, the preview and the receipt, with wider parameter types and a `prepare` step that sizes the call by simulation and re-simulates the exact bytes it signs ([PROGRAMS.md](PROGRAMS.md) section 11.3).
+
+Everything a deployed program or its deployer chose (a method's, an argument's or an event's name, an abort message, what a call returned) is a stranger's text. The explorer shows it as text, in a box of its own (`.named`), with what hides or reorders text removed and cut short (`web/lib/explorer/inert.ts`), marked "named by the deployer", and never in its own sentences; it's never markup, and the node's own explorer (`node/src/explorer.html`) escapes it the same way. A program transaction's receipt (`ProgramReceipt`) shows **facts** (the outcome in words from its numbers, the fee in bytes, fuel and tip, the fuel reserved and used, deposits and the account creation fee that left outside the program's own diff, the balance changes its programs made, what its programs' own sends burned (`burned_by_programs`: the creation fee of an account a program opened, out of the programs' balance), the program a create made, what an upload stored) apart from **claims** ("what the program reports": what each call returned, the events, an abort message). `lib/explorer/ledger.ts` reads the facts as money: the signer's balance moves by exactly −(fee + what left outside the diff) + the program diff's entry for it, deposits sit bonded, the creation fee burns, and what the programs burned is the receipt's own `burned_by_programs`, which must equal what conservation implies (a receipt that doesn't balance is never read as money); `scripts/explorer-program-vectors.mjs` records a `blockula dev --programs` chain's own answers (`web/lib/program-vectors.json`) and `web/lib/program.test.mjs` holds the ledger to the balances they moved. (`web/lib/v1-vectors.json` is the v1 file and is left as it is: its script makes new wallets and names every run, so a fresh run against a `blockula dev --programs` chain is compared with it by `node scripts/vdiff.mjs web/lib/v1-vectors.json fresh.json`, which normalises the random wallets, names and numbers and exits 1 on any difference in a refusal, a result, a balance change or a read's key paths.) "What was signed, exactly" (the node explorer's "Raw data") abridges only the blobs a program action carries (`wasm`, `interface`, `input`): every v1 action prints exactly as `JSON.stringify(action, null, 2)` does, an added key's public key and its proof whole. Until the node serves a list of programs, the Programs page lists the creates in a window of recent blocks, and says so; an older program is opened by its address.
 
 ## Watching and notices
 

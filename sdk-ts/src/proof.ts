@@ -31,6 +31,13 @@ export const NAMESPACES = {
   // 44–46, upgrade 47); see node/src/state/mod.rs for what each holds.
   RESERVED_NAMES: 43,
   FEATURES: 47,
+  // Programs (protocol v2, docs/PROGRAMS-V0.md §4.1): empty until programs first switch on.
+  /** A program's record, keyed by its address as a string (as accounts are). */
+  PROGRAMS: 66,
+  PROGRAM_CODE: 67,
+  PROGRAM_INTERFACES: 68,
+  PROGRAM_STORAGE: 69,
+  PROGRAM_BLOB_REFS: 72,
 } as const;
 
 /** Hash of an empty subtree. */
@@ -225,6 +232,19 @@ class Reader {
     this.at += 8;
     return v;
   }
+  /** `n` raw bytes. */
+  fixed(n: number) {
+    this.need(n);
+    const v = this.b.subarray(this.at, this.at + n);
+    this.at += n;
+    return v;
+  }
+  /** A borsh bool: one byte, 0 or 1 and nothing else. */
+  bool() {
+    const v = this.u8();
+    if (v > 1) throw new Error(`record holds ${v} where a bool should be`);
+    return v === 1;
+  }
   str() {
     const n = this.u32();
     this.need(n);
@@ -311,4 +331,70 @@ export function decodeName(value: Uint8Array): NameRecord {
   if (r.at === value.length) return rec;
   rec.grace_blocks = sat(r.u64());
   return rec;
+}
+
+/**
+ * A program's record as the state holds it (node/src/programs/state.rs `ProgramRecord`, format 1),
+ * decoded from the value `/api/proof/66/{address}` proves. `version_digest` isn't in the record:
+ * `Client.provenProgram` computes it from the record's own fields (`versionDigest`).
+ */
+export interface ProgramRecord {
+  /** The account whose transaction created it. */
+  creator: string;
+  created_at: number;
+  /** Lowercase hex, 64 characters. */
+  wasm_hash: string;
+  interface_hash: string;
+  version: number;
+  /** Stored as created, with no power until program upgrades exist. */
+  authority: string | null;
+  upgrade_delay_blocks: number;
+  /** 0 open, 1 additive. */
+  policy: "open" | "additive";
+  accepts_transfers: boolean;
+  /** Its storage entries: how many, Σ their accounted bytes, Σ their deposits (drops, as decimal strings). */
+  storage: { items: number; bytes: number; deposit: string };
+  /** The part of those deposits the program paid itself. */
+  sponsored: string;
+  /** What its creator bonded for the record itself, and who. */
+  record_deposit: string;
+  record_payer: string;
+}
+
+/** A number the record holds as a u64, which must be one JSON and JS carry exactly. */
+const exactCount = (v: bigint, what: string): number => {
+  if (v > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error(`a program record's ${what} (${v}) is past 2^53 − 1, which this SDK can't carry exactly`);
+  return Number(v);
+};
+
+/**
+ * Decodes a program record: the format byte (1: the only format this SDK reads, as the node's
+ * `Versioned` does) and the borsh body, field by field in the order the node writes them. Refuses
+ * a format it doesn't know, a bool or an option tag that isn't 0 or 1, text that isn't UTF-8 and
+ * bytes left over, so what it returns is what the state holds.
+ */
+export function decodeProgram(value: Uint8Array): ProgramRecord {
+  const r = new Reader(value);
+  const format = r.u8();
+  if (format !== 1) throw new Error(`program record format ${format}: this SDK reads format 1`);
+  const creator = r.str();
+  const created_at = exactCount(r.u64(), "created_at");
+  const wasm_hash = bytesToHex(r.fixed(32));
+  const interface_hash = bytesToHex(r.fixed(32));
+  const version = r.u32();
+  const hasAuthority = r.u8();
+  if (hasAuthority > 1) throw new Error(`a program record's authority has option tag ${hasAuthority}`);
+  const authority = hasAuthority === 1 ? r.str() : null;
+  const upgrade_delay_blocks = exactCount(r.u64(), "upgrade_delay_blocks");
+  const policyByte = r.u8();
+  if (policyByte > 1) throw new Error(`a program record's policy is ${policyByte}: this SDK knows open (0) and additive (1)`);
+  const accepts_transfers = r.bool();
+  const items = exactCount(r.u64(), "items");
+  const bytes = exactCount(r.u64(), "bytes");
+  const deposit = r.u64().toString();
+  const sponsored = r.u64().toString();
+  const record_deposit = r.u64().toString();
+  const record_payer = r.str();
+  if (r.at !== value.length) throw new Error("a program record has bytes after its last field");
+  return { creator, created_at, wasm_hash, interface_hash, version, authority, upgrade_delay_blocks, policy: policyByte === 0 ? "open" : "additive", accepts_transfers, storage: { items, bytes, deposit }, sponsored, record_deposit, record_payer };
 }

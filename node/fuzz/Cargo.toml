@@ -58,6 +58,7 @@ redb = "=4.4.0"
 arc-swap = "=1.9.3"
 toml = "1.1"
 blockula-ghost = { path = "../ghost", version = "=0.1.0" }
+blockula-vm = { path = "../vm", version = "=0.1.0" }
 
 # Like the node's release build: arithmetic overflow panics instead of wrapping.
 rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std", "tls12"] }
@@ -150,6 +151,34 @@ bench = false
 [[bin]]
 name = "evidence"
 path = "fuzz_targets/evidence.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "program_tx_codec"
+path = "fuzz_targets/program_tx_codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "program_receipt"
+path = "fuzz_targets/program_receipt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "program_commit"
+path = "fuzz_targets/program_commit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "state_machine_programs"
+path = "fuzz_targets/state_machine_programs.rs"
 test = false
 doc = false
 bench = false

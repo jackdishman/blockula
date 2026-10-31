@@ -188,6 +188,29 @@ await wallet.multisigCreate([phoneKeyId, laptopKeyId, kitKeyId], 2);
 - `convictionWeight(amount, conviction)` is a vote's weight: 0.1× with no lock, then 1×–6× for 1, 2, 4, 8, 16 or 32 lock periods (`CONVICTION_PERIODS`).
 - Reads: `client.staking(account)`, `client.proposals()`, `client.proposal(id)`, `client.params()`, `client.fees()`, `client.upgrade()`, `client.distribution(id)`, `client.multisig(account)`. `stakeSummary`, `proposalSummary` and `paramsOf` turn them into stable shapes, tolerating renamed or missing fields.
 
+### Programs (protocol v2)
+
+Programs are third-party WebAssembly, on a chain that has switched the `programs` feature on (`blockula dev --programs` does). Everything a program or its deployer chooses (method, argument and event names, an abort message, what a method returns) is a stranger's claim: the SDK keeps those as the node serves them, under `untrusted_*`. A failure's words (`ProgramFailedError.message`) hold only numbers and the chain's own names, never what the program wrote: an abort message is on the error as `untrusted_message`. Any other text of a node or a program that an error quotes is stripped of control, format (bidi, zero-width), private-use and separator characters. Every node answer is checked before it's used: digests are 64 lowercase hex, heights whole numbers the clock allows, amounts decimal strings, and a program's `version_digest` is the one its own code, interface and version compute (`ProgramAnswerError` otherwise).
+
+```ts
+import { Client, Wallet, reconcileSigner } from "@blockula/sdk";
+import { readFileSync } from "node:fs";
+
+const wasm = readFileSync("counter.wasm"), iface = readFileSync("counter.iface"); // format-1 interface bytes: `blockula program interface encode`
+const up = await wallet.uploadCode(wasm, iface);                         // bonds a deposit (v0 never gives it back); resolves once the block after it is sealed
+const { address, receipt } = await wallet.createProgram({ wasmHash: up.wasmHash, interfaceHash: up.interfaceHash }); // the address, only once the create has applied
+await wallet.call(address, "increment", "", { storageLimit: "1" });      // a call's storage limit is 0 unless given: a method that writes needs one
+(await client.view(address, "get")).return_data;                         // a read, as the node's newest block has it: the program's claim, as hex
+const proven = await client.provenProgram(address, { witnesses });       // its record, Merkle-proven; the digest recomputed from it
+```
+
+- **Fees include fuel.** A program tx reserves fuel (`fuelLimit`, default `min(program_max_tx_fuel, program_max_block_fuel − load)`, plus the load of the code it declares) and pays for all of it, never refunded; its `fee` is the bytes' base fee plus `suggested_rate × reserved / 1000`, and `feeHeadroom`, `maxFee` and the tip cap count it. A reservation no block could carry (`program_max_block_fuel`) is refused before signing (`FuelReservationError`).
+- **Sign what was shown.** A call binds the program's `versionDigest`. Pass the one you showed the user (`call(..., { versionDigest })`) and the call is refused if the program isn't the one it names; without it the SDK recomputes it from the record (proven against the client's `witnesses` when it has some), never signing a digest because a node reported it. A binding without a digest gets the version in force, never "any version" (`ANY_PROGRAM_VERSION` is explicit).
+- **Waiting.** Upload and create are one step per block: each resolves after its block is final and the next one sealed, and a create or call first waits for the code or program to be usable (`waitMs`), instead of being refused by the mempool.
+- **Receipts.** Each result has `receipt`: facts the chain applied (`facts`: outcome, balance changes, fuel, fees, `outside_vm` deposits and the creation fee, `burned_by_programs`: the creation fees of accounts a program's own sends opened) apart from claims (`claims`: return data, events). A signer's balance moves by exactly −(fee + `outside_vm.total`) + its entry in `facts.balance_changes`: `reconcileSigner(receipt, signer, before, after)` checks it (and that the receipt conserves FANG: Σ balance changes + (bonded − record deposit − upload deposit − refunded) + `burned_by_programs` = 0, which `checkReceipt` holds every receipt to), and `cost` says what it debited. A failed call throws `ProgramFailedError` (its fee was charged; `.receipt`, `.words`; a `storage_limit` trap says to pass a limit).
+- Reads: `client.program(address)`, `client.code(hash, { wasm })`, `client.interface(hash)`, `client.view(address, method, input, { bindings, fuel })`, `client.provenProgram(address, { witnesses })`, `client.programFuel()`, `client.programParams()`. Programs are named by address, never by a `.boo` name. `wallet.programsPause()` is for a validator's own key.
+- There's no interface JSON codec in the SDK yet: `uploadCode` takes the format-1 bytes (`blockula program interface encode` prints them).
+
 ### Which chain? Pinning and proofs
 
 ```ts
@@ -229,7 +252,7 @@ Every request has a timeout (`new Client(rpc, { timeoutMs })`, default 15 s, at 
 
 The public testnet is `https://blockula-testnet.fly.dev`, and the wallet is https://testnet.blockula.app.
 
-Tests: `npm run test:vectors` (offline: passkey derivation, state-proof and tx-encoding vectors from the node, every protocol v1 helper against a fake node, pinning, proof freshness, timeouts, release signatures, and `test/integrators.ts`: network presets, the `blockula-1` pin, balances, the nonce queue, `sendMany`, `quote`, history, `watchPayments` and `onSigned`; and `test/examples.ts`, which runs `examples/pay-from-a-script.mjs` against a fake node, so build first), `npm run test:kat` (ML-DSA known answers), `npm test` (end to end against `blockula dev`: `test/e2e.ts`, then `test/e2e-integrators.ts`). The `examples/` directory at the repository's root has two runnable scripts: receiving payments, and paying from a script.
+Tests: `npm run test:vectors` (offline: passkey derivation, state-proof and tx-encoding vectors from the node, every protocol v1 helper against a fake node, pinning, proof freshness, timeouts, release signatures, and `test/integrators.ts`: network presets, the `blockula-1` pin, balances, the nonce queue, `sendMany`, `quote`, history, `watchPayments` and `onSigned`; `test/programs.ts` (programs: every answer check, the fuel and deposit arithmetic, receipts and balance reconciliation, `provenProgram`'s refusals one by one, and the Wallet's helpers against a fake node serving answers recorded from a dev chain), and `test/examples.ts`, which runs `examples/pay-from-a-script.mjs` against a fake node, so build first), `npm run test:kat` (ML-DSA known answers), `npm test` (end to end against `blockula dev`: `test/e2e.ts` and `test/e2e-integrators.ts`, on a chain with programs or without), `npm run test:programs` (`test/e2e-programs.ts`, which needs `blockula dev --programs`: on a chain without programs it says so and passes, and `BLOCKULA_E2E_PROGRAMS=1` makes that a failure, as CI sets it). The `examples/` directory at the repository's root has two runnable scripts: receiving payments, and paying from a script.
 
 ## Changes in 0.6
 

@@ -1,6 +1,6 @@
 # cargo-fuzz crate for the programs engine (docs/PROGRAMS-PLAN.md S4): upload validation and the
-# executor, `program_validate` and `program_exec` (plan C1, C8), under AddressSanitizer. See
-# README.md.
+# executor, `program_validate` and `program_exec` (plan C1, C8), and the interface codec,
+# `interface_codec` (docs/PROGRAMS-V0.md §10.4), under AddressSanitizer. See README.md.
 [package]
 name = "blockula-vm-fuzz"
 version = "0.0.0"
@@ -16,6 +16,13 @@ arbitrary = { version = "1", features = ["derive"] }
 # The engine crate with `MemHost` (`testing`). `ref038` is left off: the fuzzers exercise the
 # engine a node runs, not the reference.
 blockula-vm = { path = "..", features = ["testing"] }
+# `program_validate`'s generator of modules in v0's subset (docs/PROGRAMS-V0.md §10.4), without its
+# `wasmparser` feature: that would turn on wasmparser's `simd` here, and the fuzzers' build of the
+# upload validator would no longer be the node's.
+wasm-smith = "=0.228.0"
+# Reads what wasm-smith wrote, to shape it for v0: the validator's own wasmparser, with exactly
+# node/vm's features, so it adds none.
+wasmparser = { version = "=0.228.0", default-features = false, features = ["std", "validate", "features", "prefer-btree-collections"] }
 
 # Like node/vm's release build (and the node's): arithmetic overflow panics instead of wrapping.
 [profile.release]
@@ -32,6 +39,13 @@ bench = false
 [[bin]]
 name = "program_exec"
 path = "fuzz_targets/program_exec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "interface_codec"
+path = "fuzz_targets/interface_codec.rs"
 test = false
 doc = false
 bench = false

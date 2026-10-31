@@ -1,0 +1,19 @@
+{
+  "format": 1,
+  "methods": [
+    {
+      "name": "get",
+      "kind": "view",
+      "payable": false,
+      "args": [],
+      "returns": "u64"
+    },
+    {
+      "name": "increment",
+      "kind": "call",
+      "payable": false,
+      "args": [],
+      "returns": "u64"
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 {
   "name": "@blockula/mcp",
-  "version": "0.5.1",
+  "version": "1.0.0",
   "description": "\ud83e\udddb MCP server for Blockula \u2014 lets any coding agent run a node, hold a post-quantum wallet, send FANG and claim .boo names",
   "type": "module",
   "bin": {
@@ -15,12 +15,12 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "test": "tsc && node ../scripts/mcp-shrinkwrap.mjs --dry-run && tsx test/network.ts && tsx test/spend.ts && tsx test/agent.ts"
+    "test": "tsc && node ../scripts/mcp-shrinkwrap.mjs --dry-run && tsx test/network.ts && tsx test/spend.ts && tsx test/agent.ts && tsx test/programs.ts"
   },
   "license": "MIT",
   "dependencies": {
-    "@blockula/sdk": "0.5.1",
-    "@modelcontextprotocol/sdk": "1.32.1",
+    "@blockula/sdk": "1.0.0",
+    "@modelcontextprotocol/sdk": "1.32.2",
     "zod": "4.6.7"
   },
   "devDependencies": {

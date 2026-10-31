@@ -6,10 +6,12 @@ import { useParams } from "next/navigation";
 import { useEffect, useState, type ReactNode } from "react";
 import { Amount, ago, Hash, Loading, NotFound, Section, StatusPill, Term, useMe, useNow, Who } from "@/components/explorer/kit";
 import { Ledger, signerOf } from "@/components/explorer/Ledger";
+import { ProgramReceipt } from "@/components/explorer/ProgramReceipt";
 import { Copy } from "@/components/ui";
 import { nodeExplorer } from "@/lib/config";
 import { plural } from "@/lib/format";
 import { amountLeaves, deltaFor, effectsOf, formatDrops, fromMySide, parseDrops, plainDrops, showsAccount, type LedgerCtx } from "@/lib/explorer/ledger";
+import { signedAction } from "@/lib/explorer/inert";
 import { type NodeError, useNode } from "@/lib/explorer/node";
 import { to } from "@/lib/explorer/routes";
 import type { AccountDetail, BlockView, ChainStatus, HuntView, TxDetail } from "@/lib/explorer/types";
@@ -239,6 +241,9 @@ export default function TxPage() {
         </p>
       </section>
 
+      {/* A program transaction's receipt: what the chain did, then (apart, marked) what the programs said. */}
+      {!dropped && <ProgramReceipt t={t} />}
+
       <div className="cols">
         <Section title="Details">
           <dl className="details">
@@ -326,7 +331,7 @@ export default function TxPage() {
           {t.action && (
             <details className="raw mt-16">
               <summary>What was signed, exactly</summary>
-              <pre>{JSON.stringify(t.action, null, 2)}</pre>
+              <pre>{signedAction(t.action)}</pre>
             </details>
           )}
           <p className="card-note">

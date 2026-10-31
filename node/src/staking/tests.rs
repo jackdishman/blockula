@@ -1717,7 +1717,7 @@ fn staking_txs_roll_back_completely() {
     let mut j = Journal::default();
     let mut apply = |t: &mut T, k: &Keys, a: Action| {
         let tx = t.tx_from(k, &k.address(), a);
-        assert_eq!(t.st.apply_j(&mut j, &tx, CHAIN, &vaddr(0), t.height, true).unwrap(), Outcome::Applied);
+        assert_eq!(t.st.apply_j(&mut j, &tx, CHAIN, &vaddr(0), t.height, crate::chain::ApplyMode::Block).unwrap(), Outcome::Applied);
     };
     apply(&mut t, &alice, Action::Delegate { validator: vaddr(1), amount: 500 * FANG });
     apply(&mut t, &alice, Action::Undelegate { validator: vaddr(0), shares: 100 * FANG, amount: 0 });
@@ -2259,4 +2259,24 @@ fn the_boundary_counts_admissions_against_the_members_it_carries_over() {
     assert_eq!(select_next(&t.st, 1).joining, vec![vaddr(3)]);
     t.finish_epoch();
     assert_eq!(t.set(2).len(), 3);
+}
+
+#[test]
+fn jailed_validators_stay_peers_until_they_unjail_unless_tombstoned_or_removed() {
+    let mut t = Setup::default().start();
+    let jail = |at: u64| Some(Jail { at, until: at + 30, reason: "missed leader slots".into() });
+    t.st.staking.pools.get_mut(&vaddr(1)).unwrap().jail = jail(10);
+    t.st.staking.pools.get_mut(&vaddr(2)).unwrap().jail = jail(20);
+    let p3 = t.st.staking.pools.get_mut(&vaddr(3)).unwrap();
+    p3.jail = jail(30);
+    p3.tombstoned_at = Some(30);
+    assert!(jailed_followers(&t.st, 0).is_empty(), "epoch 0's set holds all of them: they're primary peers already");
+    t.st.active_sets.insert(1, [vaddr(0)].into_iter().collect());
+    assert_eq!(jailed_followers(&t.st, 1), vec![vaddr(2), vaddr(1)], "most recently jailed first; a tombstoned one isn't followed");
+    assert!(likely_candidates(&t.st, 1, usize::MAX).is_empty(), "none of them is a candidate while jailed");
+    t.st.validators.get_mut(&vaddr(2)).unwrap().status = ValidatorStatus::Removed;
+    assert_eq!(jailed_followers(&t.st, 1), vec![vaddr(1)], "nor a removed one");
+    t.st.staking.pools.get_mut(&vaddr(1)).unwrap().jail = None;
+    assert!(jailed_followers(&t.st, 1).is_empty(), "unjailed, it's a candidate again");
+    assert_eq!(likely_candidates(&t.st, 1, usize::MAX), vec![vaddr(1)]);
 }

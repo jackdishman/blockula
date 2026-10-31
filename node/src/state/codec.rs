@@ -52,6 +52,11 @@ use std::io::{Read, Write};
 /// `shares`, which changes the stored action of a pending multisig `Undelegate` proposal (audit
 /// review-r3-wallet-2). 9 (the fourth audit round): the `upgrade` record's withdrawals keep the
 /// highest version a cancellation superseded (`Withdrawals::superseded`, review-r3-gov-1).
+///
+/// Records a feature adds when it first switches on, in namespaces and META keys no earlier state
+/// has, each value led by its own format byte, don't change it (programs, protocol v2:
+/// namespaces 66–69 and 72 and META `programs`, docs/PROGRAMS-V0.md §4.7); re-encoding a record
+/// that exists does.
 pub const SCHEMA_VERSION: u32 = 9;
 
 pub fn encode<T: BorshSerialize + ?Sized>(v: &T) -> Vec<u8> {
@@ -97,6 +102,23 @@ impl RecordKey for [u8; 32] {
     }
 }
 
+/// A key that is raw bytes, compared as bytes (`Vec<u8>`'s order is lexicographic), so the map
+/// sorts exactly as its record keys do. Composite keys whose parts the map scans by prefix
+/// (programs' storage: a program's 32 address bytes ‖ its key, so one program's entries are
+/// contiguous; their blobs: kind ‖ hash). What a key must look like is its map's rule, checked by
+/// its module's invariants, not here.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct ByteKey(pub Vec<u8>);
+
+impl RecordKey for ByteKey {
+    fn key_bytes(&self) -> Cow<'_, [u8]> {
+        Cow::Borrowed(&self.0)
+    }
+    fn from_key_bytes(b: &[u8]) -> Result<Self> {
+        Ok(ByteKey(b.to_vec()))
+    }
+}
+
 // `KeyRole` lives in types.rs (the tx format); its state encoding is written out here.
 impl BorshSerialize for KeyRole {
     fn serialize<W: Write>(&self, w: &mut W) -> std::io::Result<()> {
@@ -135,6 +157,29 @@ mod tests {
         assert_eq!(u64::from_key_bytes(&bytes[3]).unwrap(), 256);
         assert!(u64::from_key_bytes(&[1, 2]).is_err());
         assert!(String::from_key_bytes(&[0xff]).is_err());
+    }
+
+    /// `ByteKey` (programs' storage and blob references) orders a map exactly as its record keys
+    /// sort: a prefix before its extensions, then bytewise, so a program's entries (its 32 address
+    /// bytes ‖ key) are one contiguous range. Any bytes round-trip, the empty key included.
+    #[test]
+    fn byte_keys_sort_like_their_bytes() {
+        let raw: Vec<Vec<u8>> = vec![vec![], vec![0], vec![0, 0], vec![0, 0xff], vec![1], vec![1, 0], vec![0x7f, 0xff, 0xff], vec![0x80], vec![0xff; 32], [vec![0xff; 32], vec![0]].concat(), vec![0xff; 33]];
+        let keys: Vec<ByteKey> = raw.iter().cloned().map(ByteKey).collect();
+        assert!(keys.windows(2).all(|w| w[0] < w[1]) && raw.windows(2).all(|w| w[0] < w[1]), "listed in order");
+        let map: BTreeMap<ByteKey, ()> = keys.iter().rev().cloned().map(|k| (k, ())).collect();
+        let sorted: Vec<Vec<u8>> = map.keys().map(|k| k.key_bytes().into_owned()).collect();
+        assert_eq!(sorted, raw, "a map of them iterates in byte order");
+        for k in &keys {
+            assert_eq!(ByteKey::from_key_bytes(&k.key_bytes()).unwrap(), *k);
+        }
+        // A prefix scan: everything under program `p`'s 32 bytes, and nothing else.
+        let (p, q) = ([7u8; 32], [8u8; 32]);
+        let under = |prog: [u8; 32], key: &[u8]| ByteKey([prog.as_slice(), key].concat());
+        let m: BTreeMap<ByteKey, ()> = [under(p, b"a"), under(q, b"a"), under(p, b"zz"), under([6; 32], b"\xff")].into_iter().map(|k| (k, ())).collect();
+        let lo = ByteKey(p.to_vec());
+        let hi = ByteKey(q.to_vec());
+        assert_eq!(m.range(lo..hi).map(|(k, _)| k.clone()).collect::<Vec<_>>(), vec![under(p, b"a"), under(p, b"zz")]);
     }
 
     #[test]

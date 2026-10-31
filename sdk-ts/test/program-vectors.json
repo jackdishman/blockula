@@ -1,0 +1,140 @@
+{
+  "contexts": {
+    "address": "blockula program address v1",
+    "code": "blockula program code v1",
+    "interface": "blockula program interface v1",
+    "method": "blockula program method v1",
+    "version": "blockula program version v1"
+  },
+  "description": "Programs' digests (node/src/programs/digest.rs `program_vectors`), for sdk-ts's ports (docs/PROGRAMS-V0.md §2.1). Regenerate: cargo test --manifest-path node/Cargo.toml programs::digest::tests::write_program_vectors -- --ignored",
+  "interface_hashes": [
+    {
+      "hash": "834a4c128c597ca05adaf5f72df15fba2d72d719eb712c23ebd6358d3b24fac7",
+      "input": "",
+      "label": ""
+    },
+    {
+      "hash": "5a0652d6be568dd0c88e44032c8d91db5a3ed8c155a8c85f764674efb72c977b",
+      "input": "0061736d01000000010401600000",
+      "label": "the Wasm header and a type section"
+    },
+    {
+      "hash": "eedaaa7493e4c2c3dd1026c0fbd19e42bf176fbd59c30a342cdf84443589a396",
+      "input": "010303676574010000010409696e6372656d656e74000001026279040004696e69740201010573746172740400",
+      "label": "an interface: get, increment, init"
+    },
+    {
+      "hash": "9b0edd7feae80f0a1607353749bf54b821b9d6391b9f5dae6a8531b52c43d0e5",
+      "input": "ababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+      "label": "1,025 bytes of 0xab (past one BLAKE3 chunk)"
+    }
+  ],
+  "program_addresses": [
+    {
+      "boo": "boo1r8t9laxrw4l2n6wdtya7ljxz8va293favpwccy8xpuzn2mhds3rqkjfhj5",
+      "bytes": "19d65ff4c3757ea9e9cd593befc8c23b3aa2c53d605d8c10e60f05356eed8446",
+      "creator": "177c577d91cf59f1008512a5960e280ffc1889d74e10966fa6d6b9d12fbecc3c",
+      "nonce": "0",
+      "tboo": "tboo1r8t9laxrw4l2n6wdtya7ljxz8va293favpwccy8xpuzn2mhds3rqm4wpn8"
+    },
+    {
+      "boo": "boo1286essu0nd9psq3f43v7jkuxl4sc9gf8cn63m70djw0dwffuq6aq9xawvk",
+      "bytes": "51f598438f9b4a180229ac59e95b86fd6182a127c4f51df9ed939ed7253c06ba",
+      "creator": "177c577d91cf59f1008512a5960e280ffc1889d74e10966fa6d6b9d12fbecc3c",
+      "nonce": "1",
+      "tboo": "tboo1286essu0nd9psq3f43v7jkuxl4sc9gf8cn63m70djw0dwffuq6aqgp6cd9"
+    },
+    {
+      "boo": "boo1j0n3l6kxccnpsq6dcrxt69allff8e3v8vull6ywt7vedmacgklxq4jzhf4",
+      "bytes": "93e71feac6c62618034dc0ccbd17bffa527cc587673ffd11cbf332ddf708b7cc",
+      "creator": "24f6e6fd930a9d10680705972cf647232e1a63d8ce9ad28298b800205185a6b6",
+      "nonce": "7",
+      "tboo": "tboo1j0n3l6kxccnpsq6dcrxt69allff8e3v8vull6ywt7vedmacgklxqc49pgx"
+    },
+    {
+      "boo": "boo193gwauv248wnajxlh7klt3neatv92h2xy5hpsc6tnr9cu40vr5fshm6ckg",
+      "bytes": "2c50eef18aa9dd3ec8dfbfadf5c679ead8555d46252e18634b98cb8e55ec1d13",
+      "creator": "24f6e6fd930a9d10680705972cf647232e1a63d8ce9ad28298b800205185a6b6",
+      "nonce": "18446744073709551615",
+      "tboo": "tboo193gwauv248wnajxlh7klt3neatv92h2xy5hpsc6tnr9cu40vr5fs6uawhm"
+    }
+  ],
+  "selectors": [
+    {
+      "method": "a",
+      "selector": "ef8edbb151c7a712"
+    },
+    {
+      "method": "get",
+      "selector": "1d3fce7875d1cf4c"
+    },
+    {
+      "method": "increment",
+      "selector": "f6d67bcc8c301090"
+    },
+    {
+      "method": "init",
+      "selector": "be9269d978ccde0c"
+    },
+    {
+      "method": "transfer",
+      "selector": "fd2b261f863ff24f"
+    },
+    {
+      "method": "a_method_name_of_32_characters_x",
+      "selector": "5828318a698d1383"
+    }
+  ],
+  "version_digests": [
+    {
+      "address": "boo1r8t9laxrw4l2n6wdtya7ljxz8va293favpwccy8xpuzn2mhds3rqkjfhj5",
+      "digest": "2460883bca10960e0331c2fb223de83689cd1dd17bfd6a54ef18af47366410d8",
+      "interface_hash": "eedaaa7493e4c2c3dd1026c0fbd19e42bf176fbd59c30a342cdf84443589a396",
+      "version": 1,
+      "wasm_hash": "a1abd0dc7a017101838b64f6e46c876811adc1c7ea15e996bdf32113fef57942"
+    },
+    {
+      "address": "tboo1r8t9laxrw4l2n6wdtya7ljxz8va293favpwccy8xpuzn2mhds3rqm4wpn8",
+      "digest": "fd1456b2a4024c51a2eff00647fbeef761440aa55934c1dcfd61be292b4b04e4",
+      "interface_hash": "eedaaa7493e4c2c3dd1026c0fbd19e42bf176fbd59c30a342cdf84443589a396",
+      "version": 1,
+      "wasm_hash": "a1abd0dc7a017101838b64f6e46c876811adc1c7ea15e996bdf32113fef57942"
+    },
+    {
+      "address": "boo1r8t9laxrw4l2n6wdtya7ljxz8va293favpwccy8xpuzn2mhds3rqkjfhj5",
+      "digest": "241538f4dd834598c4645aa5553517634d9d403c2ecaff67615dc7e3cec4df23",
+      "interface_hash": "a1abd0dc7a017101838b64f6e46c876811adc1c7ea15e996bdf32113fef57942",
+      "version": 1,
+      "wasm_hash": "eedaaa7493e4c2c3dd1026c0fbd19e42bf176fbd59c30a342cdf84443589a396"
+    },
+    {
+      "address": "boo1r8t9laxrw4l2n6wdtya7ljxz8va293favpwccy8xpuzn2mhds3rqkjfhj5",
+      "digest": "2ab0240e47d3a53eae9a911f1fee672e4e360d1bcb5e42fc1085927f938bd232",
+      "interface_hash": "eedaaa7493e4c2c3dd1026c0fbd19e42bf176fbd59c30a342cdf84443589a396",
+      "version": 4294967295,
+      "wasm_hash": "a1abd0dc7a017101838b64f6e46c876811adc1c7ea15e996bdf32113fef57942"
+    }
+  ],
+  "wasm_hashes": [
+    {
+      "hash": "5a5ee4423b6040b5b293aa0a0851771c44630fcc0fd935383f56758696fa2f1c",
+      "input": "",
+      "label": ""
+    },
+    {
+      "hash": "a1abd0dc7a017101838b64f6e46c876811adc1c7ea15e996bdf32113fef57942",
+      "input": "0061736d01000000010401600000",
+      "label": "the Wasm header and a type section"
+    },
+    {
+      "hash": "999ddf4e203fae1755efad2a7575b8eea8e49fab6649bf32f849a8bb5f4c8c77",
+      "input": "010303676574010000010409696e6372656d656e74000001026279040004696e69740201010573746172740400",
+      "label": "an interface: get, increment, init"
+    },
+    {
+      "hash": "4d11618019923261bf9eade6f1435b289ab056293baa245362a424999fa1eac8",
+      "input": "ababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+      "label": "1,025 bytes of 0xab (past one BLAKE3 chunk)"
+    }
+  ]
+}
