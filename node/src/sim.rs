@@ -204,10 +204,15 @@ fn summon_with(name: &str, epoch_blocks: u64, params: &[(&str, u64)]) -> (PathBu
 /// Simulated network: genesis validators as primary peers, `extra` (would-be validators) as
 /// secondary, all linked to each other.
 async fn network(context: &deterministic::Context, genesis: &Genesis, extra: &[PublicKey]) -> Oracle<PublicKey, deterministic::Context> {
+    network_tracking(context, genesis, extra, 4).await
+}
+
+/// [`network`], keeping `tracked` peer sets (production keeps `consensus::TRACKED_PEER_SETS`).
+async fn network_tracking(context: &deterministic::Context, genesis: &Genesis, extra: &[PublicKey], tracked: usize) -> Oracle<PublicKey, deterministic::Context> {
     let participants = consensus::participants(genesis).unwrap();
     let (network, oracle) = Network::new_with_split_peers(
         context.child("network"),
-        NetConfig { max_size: consensus::MAX_MESSAGE_SIZE, max_peers_per_set: NZUsize!(16), disconnect_on_block: true, tracked_peer_sets: NZUsize!(4) },
+        NetConfig { max_size: consensus::MAX_MESSAGE_SIZE, max_peers_per_set: NZUsize!(16), disconnect_on_block: true, tracked_peer_sets: std::num::NonZeroUsize::new(tracked).unwrap() },
         participants.iter().cloned(),
         extra.iter().cloned(),
     )
@@ -1227,6 +1232,62 @@ fn junk_leaders_and_offline_validators_are_jailed_and_come_back() {
     std::fs::remove_dir_all(root).ok();
 }
 
+/// A validator jailed for downtime whose node stays online, with production's peer tracking: it
+/// keeps following the chain after the sets it was in age out (jailed validators stay secondary
+/// peers, `staking::jailed_followers`), and an `Unjail` sent through its own node gets out and
+/// brings it back. Before, its node lost its last peer two epochs after it left the set, froze until
+/// restarted, and kept its `Unjail` in its own mempool.
+#[test]
+fn a_jailed_validator_that_stays_online_keeps_following_and_unjails_through_its_own_node() {
+    let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_env("BLOCKULA_LOG").unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off"))).with_test_writer().try_init();
+    let (root, homes, genesis, seeds) = summon_with("jail-follow", EPOCH_BLOCKS, &[("downtime_window", 8), ("downtime_max_missed", 3), ("jail_blocks", 15)]);
+    let executor = deterministic::Runner::timed(Duration::from_secs(6_000));
+    executor.start(|context| async move {
+        let mut oracle = network_tracking(&context, &genesis, &[], consensus::TRACKED_PEER_SETS).await;
+        let mut vals = vec![];
+        for (i, (home, seed)) in homes.iter().zip(&seeds).enumerate() {
+            vals.push(start(&context, &mut oracle, &genesis, i, 0, home.clone(), PrivateKey::from_seed_bytes(*seed)).await);
+        }
+        wait_for_height(&context, &vals, 3).await;
+        let k = Keys::from_seed(seeds[3]);
+        let who = k.address();
+        let others = |vals: &[Val]| vals[..3].iter().map(|v| v.chain.lock().height()).min().unwrap();
+        let jailed = |vals: &[Val]| vals[..3].iter().all(|v| v.chain.lock().state.staking.pools[&who].jail.is_some());
+        let in_set = |vals: &[Val]| vals[..3].iter().all(|v| v.chain.lock().state.validators[&who].status == ValidatorStatus::Active);
+
+        // It proposes junk until it's jailed and out of the set; its node never stops.
+        vals[3].chain.lock().junk_proposals = true;
+        wait_until(&context, "its jailing", || jailed(&vals)).await;
+        wait_until(&context, "its exit", || !in_set(&vals)).await;
+        vals[3].chain.lock().junk_proposals = false;
+
+        // Well past the sets it was in: it still follows.
+        let target = others(&vals) + (consensus::TRACKED_PEER_SETS as u64 + 2) * EPOCH_BLOCKS;
+        wait_until(&context, "the others to move on", || others(&vals) >= target).await;
+        wait_until(&context, "the jailed node to keep up", || vals[3].chain.lock().height() >= target).await;
+
+        // Its own node takes the `Unjail`, and it reaches a block.
+        let until = vals[0].chain.lock().state.staking.pools[&who].jail.as_ref().unwrap().until;
+        wait_until(&context, "the jail to run out", || others(&vals) >= until).await;
+        {
+            let mut c = vals[3].chain.lock();
+            let nonce = c.next_nonce(&who);
+            let mut tx = signed(&genesis, &k, nonce, Action::Unjail { validator: who.clone() });
+            tx.fee *= 4; // the base fee rose while its junk filled blocks
+            c.submit(tx.sign(&k)).unwrap();
+        }
+        wait_until(&context, "the unjail through its own node", || vals[..3].iter().all(|v| v.chain.lock().state.staking.pools[&who].jail.is_none())).await;
+        wait_until(&context, "its return to the set", || in_set(&vals)).await;
+        let target = others(&vals) + 2 * EPOCH_BLOCKS;
+        wait_for_height(&context, &vals, target).await;
+        let h = vals.iter().map(|v| v.chain.lock().height()).min().unwrap();
+        let roots: Vec<String> = vals.iter().map(|v| v.chain.lock().root_at(h).unwrap().to_string()).collect();
+        assert!(roots.windows(2).all(|w| w[0] == w[1]), "state roots diverged at {h}: {roots:?}");
+        println!("✓ a jailed validator kept following with {} tracked peer sets, unjailed through its own node and rejoined; 4 nodes agree at height {h}", consensus::TRACKED_PEER_SETS);
+    });
+    std::fs::remove_dir_all(root).ok();
+}
+
 /// 👻 Ghost Mode through real consensus: a shield, an unsigned private transfer and an unshield,
 /// each submitted to one validator, gossiped (the unsigned ones carry no sender at all), proposed
 /// by whoever leads, proof-checked by every verifier before it votes and executed by every node
@@ -1282,3 +1343,5 @@ fn ghost_txs_finalize_through_consensus() {
 
 mod byzantine;
 mod programs;
+
+
