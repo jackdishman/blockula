@@ -1712,6 +1712,26 @@ pub fn likely_candidates(state: &State, epoch: u64, limit: usize) -> Vec<String>
     c
 }
 
+/// Jailed validators (not tombstoned or removed) outside `epoch`'s set, most recently jailed
+/// first. They can't be chosen until they unjail, but their nodes keep following the chain, and an
+/// `Unjail` sent through one has to reach the others: validators let them connect too, or a jailed
+/// node that stays online loses its last peer once the sets it was in age out, and stalls.
+pub fn jailed_followers(state: &State, epoch: u64) -> Vec<String> {
+    let current = state.active_sets.get(&epoch).cloned().unwrap_or_default();
+    let mut j: Vec<(u64, String)> = state
+        .validators
+        .iter()
+        .filter(|(a, r)| !current.contains(*a) && matches!(r.status, ValidatorStatus::Candidate | ValidatorStatus::Active))
+        .filter_map(|(a, _)| {
+            let pool = state.staking.pools.get(a)?;
+            let jail = pool.jail.as_ref()?;
+            pool.tombstoned_at.is_none().then(|| (jail.at, a.clone()))
+        })
+        .collect();
+    j.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    j.into_iter().map(|(_, a)| a).collect()
+}
+
 // ------------------------------------------------------------------- the bootstrap delegation
 
 /// DEC-5's validator bootstrap delegation (docs/TOKENOMICS.md, section 1), run at every epoch

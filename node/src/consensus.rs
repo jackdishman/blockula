@@ -1355,11 +1355,15 @@ impl EpochProvider {
     }
 
     /// Secondary peers besides `epoch`'s set: the eligible candidates most likely to join next
-    /// (bonded, so not strangers), at most `limit` of them, so they sync before they vote. The
-    /// p2p layer panics on a peer set over its cap, so the list is capped here.
+    /// (bonded, so not strangers), so they sync before they vote, then jailed validators, so their
+    /// nodes keep following and their `Unjail` gets out (`staking::jailed_followers`). At most
+    /// `limit` of them: the p2p layer panics on a peer set over its cap, so the list is capped here.
     pub fn candidates(&self, epoch: u64, limit: usize) -> Set<PublicKey> {
         let c = self.chain.lock();
-        let keys: Vec<PublicKey> = crate::staking::likely_candidates(&c.state, epoch, limit).iter().filter_map(|a| c.state.validators.get(a)).filter_map(|v| PublicKey::from_bytes(&hex::decode(&v.consensus_key).ok()?)).collect();
+        let mut addrs = crate::staking::likely_candidates(&c.state, epoch, limit);
+        let room = limit.saturating_sub(addrs.len());
+        addrs.extend(crate::staking::jailed_followers(&c.state, epoch).into_iter().take(room));
+        let keys: Vec<PublicKey> = addrs.iter().filter_map(|a| c.state.validators.get(a)).filter_map(|v| PublicKey::from_bytes(&hex::decode(&v.consensus_key).ok()?)).collect();
         Set::from_iter_dedup(keys)
     }
 
