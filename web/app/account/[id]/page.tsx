@@ -87,7 +87,7 @@ export default function AccountPage() {
       </nav>
 
       <div className="page-head">
-        <span className="eyebrow">{yours ? "Your account, as the chain sees it" : system ? "System account" : "Account"}</span>
+        <span className="eyebrow">{yours ? "Your account, as the chain sees it" : a.program ? "Program account" : system ? "System account" : "Account"}</span>
         <h1>
           {name ?? (system ? <i>{whoText(a.account)}</i> : "Unnamed account")}
           {yours && <span className="you big">you</span>}
@@ -96,6 +96,11 @@ export default function AccountPage() {
           <Term k="address" />: <Hash value={addr} />
         </span>
         <div className="tools">
+          {a.program && (
+            <Link className="chip" href={to.deployed(addr)} data-testid="is-a-program">
+              a program · open its page
+            </Link>
+          )}
           {ms && (
             <span className="chip" data-testid="multisig-chip">
               {multisigShape(ms.threshold, ms.owners.length)}

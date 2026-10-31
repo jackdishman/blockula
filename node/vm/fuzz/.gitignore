@@ -1,3 +1,7 @@
 corpus/
 artifacts/
 target/
+# Coverage reports name the code a crash reaches.
+coverage/
+# Open findings: undisclosed vulnerabilities, never committed (node/fuzz/README.md "Findings").
+private/

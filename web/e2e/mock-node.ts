@@ -39,6 +39,10 @@ export interface TxRec {
   error?: string | null;
   signer?: string | null;
   nonce?: number;
+  /** Accounts the transaction names without paying (a call's programs: the node indexes its history under them). */
+  names?: string[];
+  /** A program transaction's `program` section as /api/tx serves it (`null`: none to show); absent on every other transaction. */
+  program?: unknown;
 }
 
 /** A lock on an account's FANG (`/api/account` `locks`). */
@@ -130,6 +134,10 @@ export class MockNode {
   souls: Json[] = [];
   contributions: Json | null = null;
   multisigs = new Map<string, Json>();
+  /** Deployed programs (protocol v2) as /api/program serves them, by address; stored code and interfaces by hash. */
+  programs = new Map<string, Json>();
+  codes = new Map<string, Json>();
+  interfaces = new Map<string, Json>();
   /** Merged into `/api/validators` (v1's leaving, tombstoned, admission…). */
   validatorsExtra: Json = {};
   /**
@@ -230,6 +238,8 @@ export class MockNode {
       memo: r.memo,
       action: r.tx?.action ?? r.action ?? null,
       signature_scheme: "ML-DSA-65 (FIPS 204)",
+      // Only a program transaction has the key (node/src/programs/tx_json.rs); null when there's no receipt to show.
+      ...("program" in r ? { program: r.program ?? null } : {}),
     };
   }
 
@@ -298,7 +308,7 @@ export class MockNode {
     const a = this.acct(address);
     const keys = [...this.keysOf(address)].map(([key_id, k]) => ({ key_id, label: k.label, role: k.role, added_at: k.added_at, spent_this_period: (this.spent.get(key_id) ?? 0n).toString(), window_start: Math.max(0, this.height - 10) }));
     // Pending first, then the newest 25 sealed (node/src/api.rs `account`).
-    const mine = [...this.txs.values()].filter((t) => t.from === address || t.to === address).reverse();
+    const mine = [...this.txs.values()].filter((t) => t.from === address || t.to === address || t.names?.includes(address)).reverse();
     const recent = [...mine.filter((t) => t.height == null), ...mine.filter((t) => t.height != null).slice(0, 25)].map((t) => this.txView(t));
     const locks = (this.locks.get(address) ?? []).filter((l) => l.amount > 0n);
     const locked = locks.reduce((m, l) => (l.amount > m ? l.amount : m), 0n);
@@ -622,6 +632,8 @@ export class MockNode {
         const n = q.replace(/\.boo$/, "");
         if (/^\d+$/.test(q) && Number(q) >= 1 && Number(q) <= this.height) return reply(200, { type: "block", id: q });
         if (this.txs.has(q) || this.failures.has(q)) return reply(200, { type: "tx", id: q });
+        if (this.programs.has(q)) return reply(200, { type: "program", id: q });
+        if (this.codes.has(q)) return reply(200, { type: "code", id: q });
         if (/^t?boo1/.test(q)) return reply(200, { type: "account", id: q });
         if (/^[a-z0-9-]{3,32}$/.test(n)) return reply(200, this.names.has(n) ? { type: "account", id: `${n}.boo` } : { type: "name", id: n });
         return reply(404, { error: "nothing matching that not found" });
@@ -635,6 +647,18 @@ export class MockNode {
       if (req.method() === "GET" && (m = path.match(/^\/hunt\/(\d+)$/))) {
         const h = this.hunts.find((x) => x.id === Number(m?.[1]));
         return h ? reply(200, h) : reply(404, { error: "hunt not found" });
+      }
+      if (req.method() === "GET" && (m = path.match(/^\/program\/(t?boo1[0-9a-z]+)$/))) {
+        const p = this.programs.get(m[1]);
+        return p ? reply(200, { ...p, height: this.height }) : reply(404, { error: "no program has this address" });
+      }
+      if (req.method() === "GET" && (m = path.match(/^\/code\/([0-9a-f]{64})$/))) {
+        const c = this.codes.get(m[1]);
+        return c ? reply(200, { ...c, height: this.height }) : reply(404, { error: "no code has this hash" });
+      }
+      if (req.method() === "GET" && (m = path.match(/^\/interface\/([0-9a-f]{64})$/))) {
+        const i = this.interfaces.get(m[1]);
+        return i ? reply(200, { ...i, height: this.height }) : reply(404, { error: "no interface has this hash" });
       }
       if (req.method() === "GET" && path === "/contributions") return this.contributions ? reply(200, this.contributions) : reply(404, { error: "no contribution pool" });
       if (req.method() === "GET" && path === "/claims") {

@@ -1056,7 +1056,9 @@ fn host_bench_program() -> Vec<u8> {
         ("block_height", "", "(drop (call $block_height))"),
         ("self_balance", "", "(drop (call $self_balance))"),
         ("transfer", "", "(drop (call $transfer (i32.const 12) (i64.const 1) (i32.const 0)))"),
-        ("transfer_open", "(i32.store (i32.const 100004) (i32.const 0x5eed))", "(i32.store (i32.const 100000) (local.get $i)) (drop (call $transfer (i32.const 100000) (i64.const 100000000) (i32.const 1)))"),
+        // 0.11 FANG: `MemHost`'s creation fee plus `config::MIN_NEW_ACCOUNT`, the least that
+        // opens an account under `OPEN_DEDUCT`, so every iteration takes the opening path.
+        ("transfer_open", "(i32.store (i32.const 100004) (i32.const 0x5eed))", "(i32.store (i32.const 100000) (local.get $i)) (drop (call $transfer (i32.const 100000) (i64.const 110000000) (i32.const 1)))"),
         ("call_noop", "", "(drop (call $call (i32.const 12) (i32.const 90000) (i32.const 60000) (i32.const 4) (i32.const 40000) (local.get $L) (i64.const 0) (i64.const 0)))"),
         ("try_call_trap", "", "(drop (call $try_call (i32.const 12) (i32.const 90000) (i32.const 60008) (i32.const 4) (i32.const 40000) (i32.const 0) (i64.const 0) (i64.const 0)))"),
         // L: the callee method's name pointer, K: its length ("noop" returns nothing, "ret4k" 4 KiB).

@@ -408,6 +408,11 @@ fn namespaces_and_meta_keys_are_unique() {
         (ns::GHOST_ADDRESSES, 48..=55),
         (ns::STAKE_ENTRIES_BY_VALIDATOR, 64..=255),
         (ns::STAKE_VIEWS, 64..=255),
+        (ns::PROGRAMS, 66..=79),
+        (ns::PROGRAM_CODE, 66..=79),
+        (ns::PROGRAM_INTERFACES, 66..=79),
+        (ns::PROGRAM_STORAGE, 66..=79),
+        (ns::PROGRAM_BLOB_REFS, 66..=79),
     ];
     let mut seen = std::collections::BTreeSet::from([ns::META]);
     let st = State::default();
@@ -419,8 +424,10 @@ fn namespaces_and_meta_keys_are_unique() {
         assert!(!(1..=27).contains(&n), "namespace {n} collides with the base state");
         seen.insert(n);
     }
-    assert_eq!(seen.len(), 1 + 20 + 16 + 5 + 2, "every namespace is distinct");
-    let keys = [meta::BURNED, meta::CHAIN_PARAMS, meta::NEXT_HUNT_ID, meta::PARAMS, meta::POC, meta::SCHEMA, meta::SUPPLY, meta::STAKING, meta::GOVERNANCE, meta::ECON, meta::BEACON, meta::UPGRADE, meta::GHOST];
+    assert_eq!(seen.len(), 1 + 20 + 16 + 5 + 2 + 5, "every namespace is distinct");
+    // Programs' reserved numbers (70 receipt roots, 71 key grants, 73 due upgrades) stay free.
+    assert!([70, 71, 73].iter().all(|n| !seen.contains(n)));
+    let keys = [meta::BURNED, meta::CHAIN_PARAMS, meta::NEXT_HUNT_ID, meta::PARAMS, meta::POC, meta::SCHEMA, meta::SUPPLY, meta::STAKING, meta::GOVERNANCE, meta::ECON, meta::BEACON, meta::UPGRADE, meta::GHOST, meta::PROGRAMS];
     assert_eq!(keys.iter().collect::<std::collections::BTreeSet<_>>().len(), keys.len());
     assert!(st.meta_records().iter().all(|(k, _)| keys.contains(k)), "every scalar record uses a declared key");
 }
@@ -693,6 +700,27 @@ fn largest_records_fit_in_a_snapshot() {
         g.retired.insert(u64::MAX, [0xff; 32]);
         g.nullifiers.insert([0xff; 32], u64::MAX);
         g.addresses.insert(addr(0), vec![0xff; crate::types::GHOST_ADDRESS_BYTES]);
+    }
+    // Programs (protocol v2): a record with every string an address, the largest code (with every
+    // method name at its longest) and interface, an entry with the longest key and value, a blob
+    // reference, and META with a pause and a vote and a signature from every validator of the
+    // largest set.
+    {
+        use crate::programs::state::*;
+        use blockula_vm::config::{MAX_CODE_BYTES, MAX_INTERFACE_BYTES, MAX_KEY_BYTES as MAX_PROGRAM_KEY, MAX_METHODS, MAX_VALUE_BYTES as MAX_PROGRAM_VALUE};
+        let p = &mut st.programs;
+        let record = ProgramRecord { creator: addr(0), created_at: u64::MAX, wasm_hash: [0xff; 32], interface_hash: [0xff; 32], version: u32::MAX, authority: Some(addr(1)), upgrade_delay_blocks: u64::MAX, policy: u8::MAX, accepts_transfers: true, items: u64::MAX, bytes: u64::MAX, deposit: u64::MAX, sponsored: u64::MAX, record_deposit: u64::MAX, record_payer: addr(2) };
+        p.records.insert(addr(3), Versioned(record));
+        let exports = (0..MAX_METHODS).map(|i| format!("m{i:0>31}")).collect();
+        p.code.insert([0xff; 32], Versioned(CodeRecord { wasm: vec![0xff; MAX_CODE_BYTES], exports }));
+        p.interfaces.insert([0xff; 32], Versioned(InterfaceRecord::new(vec![0xff; MAX_INTERFACE_BYTES])));
+        let entry = Entry { value: vec![0xff; MAX_PROGRAM_VALUE], payer: [0xff; 32], deposit: u64::MAX, capacity: u32::MAX };
+        p.storage.insert(storage_key(&[0xff; 32], &[0xff; MAX_PROGRAM_KEY]), Versioned(entry));
+        p.blob_refs.insert(blob_key(BLOB_INTERFACE, &[0xff; 32]), Versioned(BlobRef { uploader: addr(0), deposit: u64::MAX, size: u32::MAX, refs: u32::MAX, uploaded_at: u64::MAX, last_used_at: u64::MAX }));
+        let set: Vec<String> = st.active_sets[&0].clone();
+        let params = crate::programs::params::defaults(&st.params);
+        let pause = Pause { from: u64::MAX, until: u64::MAX, started: u64::MAX, signers: set.clone() };
+        st.programs.meta = Some(ProgramsMeta { params, programs: u64::MAX, state_bytes: u64::MAX, value_held: u64::MAX, sponsored: u64::MAX, escrow: u64::MAX, fuel_rate: u64::MAX, pause: Some(pause), votes: set.iter().map(|v| (v.clone(), u64::MAX)).collect(), pause_signed: set.iter().map(|v| (v.clone(), u64::MAX)).collect() });
     }
 
     let mut largest = std::collections::BTreeMap::new();

@@ -1982,11 +1982,12 @@ pub fn system_tx_key(state: &State, tx: &Tx, sender: &str, signer: &str) -> Opti
 /// set's readiness and admissions for `epoch` while they'd apply (audit review-r2-consensus-2:
 /// the node sends the readiness itself, from the account that pays its beacon duties, so it must
 /// not hold them out of the lane): at most one candidate an epoch may signal readiness, once, and
-/// each of the set's one or two members admit once. Returns the validator and the kind of duty. A
-/// full mempool must not refuse these for want of a tip (they carry none from an owner's account:
-/// `State::admit`), so the mempool queues them in a small lane of their own and proposals take
-/// them first (`Chain::admit_to_mempool`). Mempool policy only: blocks are verified the same
-/// either way.
+/// each of the set's one or two members admit once. So is a `ProgramsPause` its consensus key signs
+/// from its own account while it may sign (`programs::pause::may_sign`: never while programs are
+/// dormant). Returns the validator and the kind of duty. A full mempool must not refuse these for
+/// want of a tip (they carry none from an owner's account: `State::admit`), so the mempool queues
+/// them in a small lane of their own and proposals take them first (`Chain::admit_to_mempool`).
+/// Mempool policy only: blocks are verified the same either way.
 pub fn duty_of(state: &State, tx: &Tx, epoch: u64) -> Option<(String, &'static str)> {
     let kind = match tx.action {
         Action::BeaconCommit { .. } => "beacon_commit",
@@ -1996,6 +1997,7 @@ pub fn duty_of(state: &State, tx: &Tx, epoch: u64) -> Option<(String, &'static s
         Action::AttestRevert { .. } => "attest_revert",
         Action::ValidatorReady { .. } => "validator_ready",
         Action::AdmitValidator { .. } => "admit_validator",
+        Action::ProgramsPause {} => "programs_pause",
         _ => return None,
     };
     let v = validator_of_key(state, &tx.signer_key_id().ok()?)?;
@@ -2003,6 +2005,10 @@ pub fn duty_of(state: &State, tx: &Tx, epoch: u64) -> Option<(String, &'static s
     let due = match &tx.action {
         Action::ValidatorReady { epoch: e } => *e == epoch && may_show_up(state, &v, epoch),
         Action::AdmitValidator { validator, epoch: e } => *e == epoch && check_admit(state, &v, validator, epoch).is_ok(),
+        // Signed from the validator's own account (its consensus key is a key there; from its
+        // owner's it isn't admitted), while it's in the epoch's set and may sign at the next height
+        // (docs/PROGRAMS-V0.md §2.5, §7.2). An owner key's signature competes by its tip.
+        Action::ProgramsPause {} => tx.from == v && state.active_sets.get(&epoch).is_some_and(|s| s.contains(&v)) && crate::programs::pause::may_sign(state, &v, crate::econ::now(state)).is_ok(),
         _ => {
             let active = [epoch, epoch + 1].iter().any(|e| state.active_sets.get(e).is_some_and(|s| s.contains(&rec.address)));
             let owed = matches!(&tx.action, Action::BeaconReveal { epoch: target, .. } if *target == epoch + 1 && state.beacon.rounds.get(target).and_then(|r| r.get(&rec.address)).is_some_and(|e| e.secret.is_none()));

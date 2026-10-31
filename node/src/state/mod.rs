@@ -97,6 +97,14 @@ pub mod ns {
     /// reads only that validator's), and the highest view executed per epoch (evidence bounds).
     pub const STAKE_ENTRIES_BY_VALIDATOR: u8 = 64;
     pub const STAKE_VIEWS: u8 = 65;
+    /// programs (protocol v2, docs/PROGRAMS-V0.md §4.1): 66–69 and 72 in use, all empty until
+    /// programs first switch on; 70 (receipt roots), 71 (key grants) and 73 (due upgrades) are
+    /// reserved for the program actions that bring them, and 74–79 for more.
+    pub const PROGRAMS: u8 = 66;
+    pub const PROGRAM_CODE: u8 = 67;
+    pub const PROGRAM_INTERFACES: u8 = 68;
+    pub const PROGRAM_STORAGE: u8 = 69;
+    pub const PROGRAM_BLOB_REFS: u8 = 72;
 }
 
 /// Keys of the scalar records (namespace [`ns::META`]). They're emitted sorted by key.
@@ -120,6 +128,8 @@ pub mod meta {
     pub const UPGRADE: &[u8] = b"upgrade";
     /// Ghost Mode's scalars (`ghost::GhostMeta`).
     pub const GHOST: &[u8] = b"ghost";
+    /// Programs' scalars (`programs::state::ProgramsMeta`): absent until programs first switch on.
+    pub const PROGRAMS: &[u8] = b"programs";
 }
 
 /// Largest record key and value a snapshot may contain (bounds allocations while decoding).
@@ -209,9 +219,9 @@ where
 }
 
 impl State {
-    /// The protocol v1 modules, whose maps and scalars are records too.
-    fn modules(&self) -> [&dyn SubState; 6] {
-        [&self.staking, &self.governance, &self.econ, &self.beacon, &self.upgrade, &self.ghost]
+    /// The protocol v1 modules, and programs (protocol v2), whose maps and scalars are records too.
+    fn modules(&self) -> [&dyn SubState; 7] {
+        [&self.staking, &self.governance, &self.econ, &self.beacon, &self.upgrade, &self.ghost, &self.programs]
     }
 
     /// Every map, by namespace, in namespace order. The destructuring is exhaustive on purpose:
@@ -219,7 +229,7 @@ impl State {
     /// namespace), as a module (whose own `tables` destructure exhaustively), or skipped as a
     /// scalar that `meta_records` covers, so nothing escapes the root.
     fn tables(&self) -> Vec<(u8, &dyn Table)> {
-        let State { accounts, names, supply: _, burned: _, validators, active_sets, params: _, chain_params: _, hunts, next_hunt_id: _, github, github_by_account, familiars, poc, staking, governance, econ, beacon, upgrade, ghost, tree: _ } = self;
+        let State { accounts, names, supply: _, burned: _, validators, active_sets, params: _, chain_params: _, hunts, next_hunt_id: _, github, github_by_account, familiars, poc, staking, governance, econ, beacon, upgrade, ghost, programs, tree: _ } = self;
         let Poc { repos, souls, vouches, dropped_vouches, sybils, claims, claim_by_pr, handles, handle_holds, jurors, seances, grants, next_claim_id: _, next_seance_id: _, next_grant_id: _, open_seance: _, next_seance_at: _ } = poc;
         let mut t: Vec<(u8, &dyn Table)> = vec![
             (ns::ACCOUNTS, accounts),
@@ -243,7 +253,7 @@ impl State {
             (ns::DROPPED_VOUCHES, dropped_vouches),
             (ns::HANDLE_HOLDS, handle_holds),
         ];
-        let modules: [&dyn SubState; 6] = [staking, governance, econ, beacon, upgrade, ghost];
+        let modules: [&dyn SubState; 7] = [staking, governance, econ, beacon, upgrade, ghost, programs];
         for m in modules {
             t.extend(m.tables());
         }
@@ -253,7 +263,7 @@ impl State {
 
     /// [`State::tables`], mutably (same list, same order).
     fn tables_mut(&mut self) -> Vec<(u8, &mut dyn Table)> {
-        let State { accounts, names, supply: _, burned: _, validators, active_sets, params: _, chain_params: _, hunts, next_hunt_id: _, github, github_by_account, familiars, poc, staking, governance, econ, beacon, upgrade, ghost, tree: _ } = self;
+        let State { accounts, names, supply: _, burned: _, validators, active_sets, params: _, chain_params: _, hunts, next_hunt_id: _, github, github_by_account, familiars, poc, staking, governance, econ, beacon, upgrade, ghost, programs, tree: _ } = self;
         let Poc { repos, souls, vouches, dropped_vouches, sybils, claims, claim_by_pr, handles, handle_holds, jurors, seances, grants, next_claim_id: _, next_seance_id: _, next_grant_id: _, open_seance: _, next_seance_at: _ } = poc;
         let mut t: Vec<(u8, &mut dyn Table)> = vec![
             (ns::ACCOUNTS, accounts),
@@ -277,7 +287,7 @@ impl State {
             (ns::DROPPED_VOUCHES, dropped_vouches),
             (ns::HANDLE_HOLDS, handle_holds),
         ];
-        let modules: [&mut dyn SubState; 6] = [staking, governance, econ, beacon, upgrade, ghost];
+        let modules: [&mut dyn SubState; 7] = [staking, governance, econ, beacon, upgrade, ghost, programs];
         for m in modules {
             t.extend(m.tables_mut());
         }
@@ -288,7 +298,7 @@ impl State {
     /// The scalar records, sorted by key. Cheap, so every commit re-checks them all. Exhaustive
     /// like [`State::tables`].
     fn meta_records(&self) -> Vec<(&'static [u8], Vec<u8>)> {
-        let State { supply, burned, params, chain_params, next_hunt_id, poc, accounts: _, names: _, validators: _, active_sets: _, hunts: _, github: _, github_by_account: _, familiars: _, staking: _, governance: _, econ: _, beacon: _, upgrade: _, ghost: _, tree: _ } = self;
+        let State { supply, burned, params, chain_params, next_hunt_id, poc, accounts: _, names: _, validators: _, active_sets: _, hunts: _, github: _, github_by_account: _, familiars: _, staking: _, governance: _, econ: _, beacon: _, upgrade: _, ghost: _, programs: _, tree: _ } = self;
         let Poc { next_claim_id, next_seance_id, next_grant_id, open_seance, next_seance_at, repos: _, souls: _, vouches: _, dropped_vouches: _, sybils: _, claims: _, claim_by_pr: _, handles: _, handle_holds: _, jurors: _, seances: _, grants: _ } = poc;
         let mut m = vec![
             (meta::BURNED, encode(burned)),
@@ -322,7 +332,7 @@ impl State {
             }
             meta::SUPPLY => self.supply = decode(v)?,
             _ => {
-                let modules: [&mut dyn SubState; 6] = [&mut self.staking, &mut self.governance, &mut self.econ, &mut self.beacon, &mut self.upgrade, &mut self.ghost];
+                let modules: [&mut dyn SubState; 7] = [&mut self.staking, &mut self.governance, &mut self.econ, &mut self.beacon, &mut self.upgrade, &mut self.ghost, &mut self.programs];
                 for m in modules {
                     if m.load_meta(key, v)? {
                         return Ok(());
@@ -361,6 +371,9 @@ impl State {
     /// touched, and any scalar that moved) and returns the new root with the changed records.
     /// Execution calls it once per block, after the end-of-block steps.
     pub fn commit_block(&mut self) -> Result<Commit> {
+        // A state that hit a program node fault ran its block otherwise than the chain did: never
+        // committed, whichever path got here (docs/PROGRAMS-V0.md §6.2). The error is its halt.
+        crate::programs::fault::refuse_commit(self)?;
         let mut records = vec![];
         for (k, v) in self.meta_records() {
             if self.tree.get(&tree::key_hash(ns::META, k))? != Some(tree::value_hash(&v)) {
@@ -463,7 +476,7 @@ impl State {
 
     /// Accounting and consistency: every drop of the supply sits in a balance or an escrow
     /// (open hunts, stake pools and unbonding entries, vouches (withdrawn ones too, while held), jurors, claim bonds, unwithdrawn
-    /// grants, open Séance budgets), and records that refer to each other agree. `Err` names the
+    /// grants, open Séance budgets, program deposits), and records that refer to each other agree. `Err` names the
     /// first problem.
     pub fn check_invariants(&self) -> Result<()> {
         // First: the checks below render system addresses with it.
@@ -486,8 +499,9 @@ impl State {
         }
         held += p.seances.values().filter(|s| !s.closed).map(|s| s.budget as u128).sum::<u128>();
         // The protocol v1 modules' escrows: stake and unbonding, proposal deposits, open
-        // distributions, the shielded pool.
+        // distributions, the shielded pool; and programs' deposits.
         held += crate::staking::escrow(self) + crate::governance::escrow(self) + crate::ghost::escrow(self);
+        held += crate::programs::escrow(self);
         ensure!(held == self.supply as u128, "supply is {} drops but balances and escrows hold {held}", self.supply);
         // Running totals and indexes the maps keep (`tmap::Aggregate`) match a recomputation.
         let full = self.accounts.full_aggregate();
@@ -501,6 +515,7 @@ impl State {
         crate::beacon::check_invariants(self)?;
         crate::upgrade::check_invariants(self)?;
         crate::ghost::check_invariants(self)?;
+        crate::programs::check_invariants(self)?;
 
         for h in open_hunts {
             let funded = h.funders.values().map(|v| v.parse::<u128>().unwrap_or(u128::MAX)).sum::<u128>();
@@ -582,7 +597,7 @@ impl State {
             ensure!(s.claims.len() <= MAX_SEANCE_CLAIMS && s.jurors.len() <= JURY_SIZE, "Séance #{id} has {} claims and {} jurors", s.claims.len(), s.jurors.len());
             ensure!(s.jurors.values().all(|seat| seat.pairs.len() <= PAIRS_PER_JUROR && seat.spam.len() <= MAX_SEANCE_CLAIMS), "Séance #{id} has an oversized jury seat");
         }
-        Ok(())
+        crate::programs::check_bounds(self)
     }
 
     /// Every record fits what a snapshot may carry ([`MAX_KEY_BYTES`], [`MAX_VALUE_BYTES`]).

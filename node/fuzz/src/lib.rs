@@ -32,6 +32,8 @@ mod node_src {
     pub mod params;
     pub mod poc;
     pub mod pq;
+    pub mod program_cli;
+    pub mod programs;
     pub mod protection;
     pub mod release_cli;
     pub mod replay;

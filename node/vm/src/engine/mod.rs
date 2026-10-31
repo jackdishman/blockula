@@ -6,13 +6,16 @@
 //!
 //! # The shape
 //!
-//! * **An engine per transaction** ([`BlockEngine`]): created, loaded with every code the
-//!   transaction declares before anything runs, used by its `exec::execute`, and dropped after,
-//!   on the transaction's own thread (a `Box<dyn BlockEngine>` isn't `Send`). Loading translates;
-//!   nothing translates while a call runs (soroban-wasmi's engine holds a spin lock for the whole
-//!   of a call: see `soroban.rs`). PROGRAMS.md 4.3 shares one engine across a block; the node this
-//!   release ships doesn't, so nothing an engine holds can carry from one transaction to another,
-//!   and each pays its own load. The API serves either; the names are 4.3's.
+//! * **An engine for a transaction, or for a run of them** ([`BlockEngine`]): created on the thread
+//!   that uses it (a `Box<dyn BlockEngine>` isn't `Send`), loaded with every code a transaction
+//!   declares before anything of its runs, used by its `exec::execute`, and dropped after any node
+//!   fault. Loading translates; nothing translates while a call runs (soroban-wasmi's engine holds
+//!   a spin lock for the whole of a call: see `soroban.rs`). The node shares one engine across a
+//!   block pass (docs/PROGRAMS-V0.md A3): every transaction still loads what it declares, and code
+//!   the engine holds already is a no-op, so a code several transactions declare is translated
+//!   once; nothing a transaction does depends on what else the engine holds (it reaches only its
+//!   declared set, and no fuel is read off the engine). `upload::check` keeps a throwaway engine of its
+//!   own. The API serves either; the names are 4.3's.
 //! * **A store per frame** ([`BlockEngine::invoke`]): every call, top-level or nested, gets a
 //!   fresh store with one instance, its fuel and its memory, dropped when the frame returns. So at
 //!   most `MAX_CALL_DEPTH` instances are ever live (4.3), and a store's arenas (which never shrink)
@@ -402,11 +405,13 @@ pub struct Invoked {
     pub fuel_left: u64,
 }
 
-/// An engine: one per program transaction, made on the thread that runs the transaction (it isn't
-/// `Send`), loaded with every code the transaction declares before anything that may reach it
-/// runs, and dropped with that thread, so neither its memory nor its code map depends on a node's
-/// history. Dropped after any node fault. (The name is PROGRAMS.md 4.3's engine per block, which
-/// this API also serves.)
+/// An engine: made on the thread that uses it (it isn't `Send`), loaded with every code a
+/// transaction declares before anything that may reach it runs, and dropped after any node fault.
+/// One per program transaction, or one for a run of them (the node's block pass, docs/
+/// PROGRAMS-V0.md A3: the node drops it when the code loaded into it passes a bound, too, since
+/// soroban-wasmi keeps every translated function until its engine is dropped). What a transaction
+/// does never depends on what else is loaded: it reaches only its declared set. (The name is
+/// PROGRAMS.md 4.3's engine per block.)
 pub trait BlockEngine {
     fn kind(&self) -> EngineKind;
     /// Translates `wasm` (once per hash: loading a hash again is a no-op). Never called while a

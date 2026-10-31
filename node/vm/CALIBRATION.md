@@ -1,11 +1,17 @@
 # node/vm calibration (S3)
 
-> **A record of phase 0.** These measurements (here and in `CALIBRATION-x86_64.md`,
-> `CALIBRATION-aarch64.md`) were taken on the phase 0 prototype, with the starting schedule v1 and
-> three engines side by side. They decided D1 (soroban-wasmi 29.0.0; wasmi 2.0 was dropped) and
-> are the basis of fuel schedule v0 (`src/meter.rs`, README.md "Fuel schedule v0"). The bench in
-> this directory now measures soroban-wasmi (and wasmi 0.38 with `--features ref038`) under
-> schedule v0; re-run it on the floor machines before changing a price.
+> **A record of phase 0.** These measurements were taken on the phase 0 prototype, with the
+> starting schedule v1 and three engines side by side, as were the floor runs that sat beside them
+> until 2026-10-28 (in git history). They decided D1 (soroban-wasmi 29.0.0; wasmi 2.0 was dropped)
+> and are the basis of fuel schedule v0 (`src/meter.rs`, README.md "Fuel schedule v0"). The bench
+> in this directory now measures soroban-wasmi (and wasmi 0.38 with `--features ref038`) under
+> schedule v0. `CALIBRATION-x86_64.md` and `CALIBRATION-aarch64.md` now hold its full run on both
+> floor runners under schedule v0 (2026-10-28): every pattern within 2.5 ns per fuel (the worst
+> median is an upload's, 1.89 on aarch64; the worst single repetition, 2.47, a load of a 256 KiB
+> module on x86_64). Re-run it on the floor machines before changing a price. The node's own
+> patterns (blocks of program calls through `run_block`, `commit_block` and `persist`, and A3's one
+> thread and one engine per block pass) are in `CALIBRATION-node.md`, with the floor runs after A3
+> (run 40763852590: every pattern within 2.5 ns per fuel, the minimal calls at 1.50 to 1.66).
 
 Phase 0's local measurements for the programs engine (docs/PROGRAMS-PLAN.md S3; docs/PROGRAMS.md
 4.5 and 12.2). They size the fuel schedule against the design's **2.5 ns-per-fuel** rule: on the

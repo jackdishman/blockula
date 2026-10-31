@@ -147,9 +147,9 @@ impl Receipt {
 ///
 /// Returns the transaction's receipt, failed or not, or a [`NodeFault`] if the node can't execute
 /// it: then nothing of the transaction (or the block) may be committed, and the engine must be
-/// dropped. Must run on a large-stack thread (the node gives each program transaction one of
-/// 64 MiB, which also makes and drops its engine): host calls nest native frames up to
-/// `MAX_CALL_DEPTH` deep.
+/// dropped. Must run on a large-stack thread (the node gives each program transaction, or each
+/// block pass, one of 64 MiB, which also makes and drops its engine): host calls nest native frames
+/// up to `MAX_CALL_DEPTH` deep.
 pub fn execute(
     engine: &dyn BlockEngine,
     view: &dyn View,

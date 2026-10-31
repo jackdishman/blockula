@@ -1,0 +1,56 @@
+{
+  "format": 1,
+  "methods": [
+    {
+      "name": "balance_of",
+      "kind": "view",
+      "payable": false,
+      "args": [
+        {
+          "name": "account",
+          "type": "address"
+        }
+      ],
+      "returns": "u64"
+    },
+    {
+      "name": "init",
+      "kind": "init",
+      "payable": false,
+      "args": [
+        {
+          "name": "owner",
+          "type": "address"
+        },
+        {
+          "name": "supply",
+          "type": "u64"
+        }
+      ],
+      "returns": null
+    },
+    {
+      "name": "total_supply",
+      "kind": "view",
+      "payable": false,
+      "args": [],
+      "returns": "u64"
+    },
+    {
+      "name": "transfer",
+      "kind": "call",
+      "payable": false,
+      "args": [
+        {
+          "name": "to",
+          "type": "address"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ],
+      "returns": null
+    }
+  ]
+}

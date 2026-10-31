@@ -28,7 +28,7 @@ export function Header() {
   const open = wallet && hint?.account;
   const known = Object.values(NETWORKS).filter((n): n is Network => !!n);
   // A program's records (a hunt, a claim, a Séance) belong to Programs; every other chain page to Explore.
-  const programs = /^\/(programs|hunt|claim|seance)(\/|$)/.test(path);
+  const programs = /^\/(programs?|hunt|claim|seance)(\/|$)/.test(path);
   const explore = isExplorerPath(path) && !programs;
   return (
     <>

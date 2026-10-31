@@ -245,9 +245,10 @@ pub fn base_fee(state: &State, height: u64, size: u64) -> u64 {
     FeeSlot::pricing(last.flat.max(cp.base_fee_floor_flat), rate.min(MAX_RATE as u128) as u64).fee(size)
 }
 
-/// What `tx` is charged in block `height`: the base fee plus its tip (`None` on overflow).
+/// What `tx` is charged in block `height`: the base fee (its bytes', plus a program tx's fuel,
+/// `programs::fuel_fee`) plus its tip (`None` on overflow).
 pub fn charge(state: &State, tx: &Tx, height: u64) -> Option<u64> {
-    base_fee(state, height, tx.size()).checked_add(tx.tip)
+    base_fee(state, height, tx.size()).saturating_add(crate::programs::fuel_fee(state, tx, height)).checked_add(tx.tip)
 }
 
 /// The most a tx whose base fee is `base` may tip: `tip_cap_multiple` × `base`. Priority bidding
@@ -264,9 +265,10 @@ pub fn check_tip(state: &State, tip: u64, base: u64, height: u64) -> Result<()> 
 }
 
 /// The exact fee check (admission and execution): the charge, if `fee` covers it and the tip is
-/// within its cap ([`check_tip`]).
+/// within its cap ([`check_tip`]). A program tx's base fee includes the fuel it reserves
+/// (`programs::fuel_fee`, 0 for every other tx), so its tip cap does too.
 pub fn check_fee(state: &State, tx: &Tx, height: u64) -> Result<u64> {
-    let base = base_fee(state, height, tx.size());
+    let base = base_fee(state, height, tx.size()).saturating_add(crate::programs::fuel_fee(state, tx, height));
     check_tip(state, tx.tip, base, height)?;
     match base.checked_add(tx.tip) {
         Some(c) if c <= tx.fee => Ok(c),
@@ -543,11 +545,12 @@ pub fn check_locks(state: &State, touched: &[(String, Option<u64>)], sender: &st
 }
 
 /// Burns `account_creation_fee` from the sender for every account the action opened (`touched`
-/// entries that didn't exist before; keyless system accounts are free). A session key's spend
-/// counts it.
+/// entries that didn't exist before; keyless system accounts are free, and so are the accounts a
+/// program's commit opened, whose fees the program burned: `j.programs.opened`). A session key's
+/// spend counts it.
 pub fn charge_new_accounts(state: &mut State, j: &mut Journal, touched: &[(String, Option<u64>)], sender: &str, signer: &str, key: &KeyRecord) -> Result<()> {
     let prefix = state.params.prefix().to_string();
-    let opened = touched.iter().filter(|(a, before)| before.is_none() && state.accounts.contains_key(a) && system_account(&prefix, a).is_none()).count() as u64;
+    let opened = touched.iter().filter(|(a, before)| before.is_none() && state.accounts.contains_key(a) && system_account(&prefix, a).is_none() && !j.programs.opened.contains(a)).count() as u64;
     let fee = state.chain_params.account_creation_fee.checked_mul(opened).ok_or_else(|| anyhow!("account creation fee overflow"))?;
     if fee == 0 {
         return Ok(());
