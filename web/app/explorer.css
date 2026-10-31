@@ -119,7 +119,7 @@ a.ledger-row:hover .ledger-summary { text-decoration: underline; text-decoration
 .details.tight-130 { grid-template-columns: 130px minmax(0, 1fr); }
 .details.tight-150 { grid-template-columns: 150px minmax(0, 1fr); }
 details.raw > summary { cursor: pointer; color: var(--dim); font: 400 16px var(--caps); letter-spacing: 0.06em; }
-details.raw pre { background: var(--paper-hi); border: 1px solid var(--hair); padding: 12px; white-space: pre-wrap; word-break: break-all; font: 14px/1.5 var(--mono); max-height: 420px; overflow: auto; }
+details.raw pre, pre.raw { background: var(--paper-hi); border: 1px solid var(--hair); padding: 12px; white-space: pre-wrap; word-break: break-all; font: 14px/1.5 var(--mono); max-height: 420px; overflow: auto; }
 
 /* Charts */
 .chart { position: relative; }
@@ -221,6 +221,14 @@ details.raw pre { background: var(--paper-hi); border: 1px solid var(--hair); pa
 .iface .ty { color: var(--blood); }
 .iface .who-can { font: italic 14px var(--serif); color: var(--dim); }
 .tag { font: 400 13px var(--caps); letter-spacing: 0.1em; color: var(--dim); text-transform: lowercase; }
+
+/* Deployed programs: what a program or its deployer chose is a claim, set in a box of its own */
+.named { font: 700 0.9em var(--mono); color: var(--ink); background: var(--paper-hi); border: 1px dashed var(--hair); padding: 0 0.3em; overflow-wrap: anywhere; }
+.claims { border-left: 3px double var(--hair); padding-left: 14px; }
+.claims li { margin: 4px 0; overflow-wrap: anywhere; }
+.method-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+.method-list li { border-top: 1px solid var(--hair); padding-top: 8px; overflow-wrap: anywhere; }
+.method-list .sig { font: 14px/1.7 var(--mono); color: var(--ink-soft); }
 
 .program-activity-stats { margin-bottom: 18px; grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .activity-controls { display: flex; flex-wrap: wrap; gap: 12px 18px; align-items: end; margin-bottom: 16px; }

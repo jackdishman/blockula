@@ -4,6 +4,7 @@
 //! has its own cost model). `cargo test --test exec fuel_table -- --nocapture` prints the fuel.
 
 use blockula_vm::abi::{flags, status};
+use blockula_vm::config::MIN_NEW_ACCOUNT;
 use blockula_vm::engine::{Address, BlockEngine, CodeInfo, Digest, EngineKind, NodeFault, TrapKind};
 use blockula_vm::exec::{ANY_VERSION, Binding, Call, CommitError, Entry, FailCode, MethodInfo, ProgramStorage, Receipt, TxLimits, execute};
 use blockula_vm::host::{MethodKind, View};
@@ -337,7 +338,8 @@ fn pay_missing() -> Scenario {
 
 fn pay_missing_deduct() -> Scenario {
     let fee = world().creation_fee;
-    Scenario::new("transfer opening (OPEN_DEDUCT)", world(), pay(addr("newbie"), fee + 1_000, fee + 500, flags::OPEN_DEDUCT), &[])
+    let amount = fee + MIN_NEW_ACCOUNT + 500;
+    Scenario::new("transfer opening (OPEN_DEDUCT)", world(), pay(addr("newbie"), amount + 500, amount, flags::OPEN_DEDUCT), &[])
 }
 
 fn nested_value() -> Scenario {
@@ -548,11 +550,11 @@ fn transfer_to_a_missing_account_needs_a_flag() {
     assert_eq!(r.returns, vec![status::OK.to_le_bytes().to_vec()]);
     assert_eq!(r.diff.opened, vec![addr("newbie")]);
     assert_eq!(r.diff.burned, u128::from(fee));
-    assert_eq!(balance(r, addr("newbie")), 500);
+    assert_eq!(balance(r, addr("newbie")), i128::from(MIN_NEW_ACCOUNT + 500), "the amount less the fee");
     assert_eq!(balance(r, addr("vault")), 500);
     let mut host = s.host.clone();
     host.apply(&r.diff);
-    assert_eq!(host.balance(&addr("newbie")), Some(500));
+    assert_eq!(host.balance(&addr("newbie")), Some(MIN_NEW_ACCOUNT + 500));
 }
 
 #[test]
@@ -1293,26 +1295,50 @@ fn a_batch_no_transaction_has_is_a_node_fault() {
 #[test]
 fn open_pay_burns_the_fee_on_top() {
     let fee = world().creation_fee;
-    let s = Scenario::new("transfer opening (OPEN_PAY)", world(), pay(addr("newbie"), fee + 1_000, 400, flags::OPEN_PAY), &[]);
+    let amount = MIN_NEW_ACCOUNT + 400;
+    let s = Scenario::new("transfer opening (OPEN_PAY)", world(), pay(addr("newbie"), fee + amount + 600, amount, flags::OPEN_PAY), &[]);
     let r = &run(&s)[0];
     assert!(r.ok(), "{r:?}");
     assert_eq!(r.returns, vec![status::OK.to_le_bytes().to_vec()]);
     assert_eq!((r.diff.opened.clone(), r.diff.burned), (vec![addr("newbie")], u128::from(fee)));
-    assert_eq!(balance(r, addr("newbie")), 400, "the amount arrives whole");
-    assert_eq!(balance(r, addr("vault")), 600, "the program paid 400 and the fee");
+    assert_eq!(balance(r, addr("newbie")), i128::from(amount), "the amount arrives whole");
+    assert_eq!(balance(r, addr("vault")), 600, "the program paid the amount and the fee");
     let mut host = s.host.clone();
     host.apply(&r.diff);
-    assert_eq!(host.balance(&addr("newbie")), Some(400));
+    assert_eq!(host.balance(&addr("newbie")), Some(amount));
 
-    let short = Scenario::new("OPEN_PAY, short of the fee", world(), pay(addr("newbie"), fee + 399, 400, flags::OPEN_PAY), &[]);
+    let short = Scenario::new("OPEN_PAY, short of the fee", world(), pay(addr("newbie"), fee + amount - 1, amount, flags::OPEN_PAY), &[]);
     let r = &run(&short)[0];
     assert_eq!(r.returns, vec![status::ERR_TRANSFER.to_le_bytes().to_vec()]);
     assert!(r.diff.opened.is_empty() && r.diff.burned == 0);
-    assert_eq!(balance(r, addr("vault")), i128::from(fee + 399));
+    assert_eq!(balance(r, addr("vault")), i128::from(fee + amount - 1));
 
     let existing = Scenario::new("OPEN_PAY to an account that exists", world(), pay(addr("alice"), 1_000, 400, flags::OPEN_PAY), &[]);
     let r = &run(&existing)[0];
     assert_eq!((balance(r, addr("alice")), balance(r, addr("vault")), r.diff.burned), (400, 600, 0));
+}
+
+/// docs/PROGRAMS-V0.md A30: a program's transfer opens an account only if it credits at least
+/// `MIN_NEW_ACCOUNT`, under either flag, as the node's native transfers must. One drop less is a
+/// status (the call goes on, nothing is opened or burned), never a trap.
+#[test]
+fn an_opening_transfer_credits_at_least_min_new_account() {
+    let fee = world().creation_fee;
+    let value = fee + MIN_NEW_ACCOUNT;
+    for (f, at_min) in [(flags::OPEN_DEDUCT, fee + MIN_NEW_ACCOUNT), (flags::OPEN_PAY, MIN_NEW_ACCOUNT)] {
+        let s = Scenario::new("an opening at MIN_NEW_ACCOUNT", world(), pay(addr("newbie"), value, at_min, f), &[]);
+        let r = &run(&s)[0];
+        assert_eq!(r.returns, vec![status::OK.to_le_bytes().to_vec()], "flags {f}");
+        assert_eq!((r.diff.opened.clone(), r.diff.burned), (vec![addr("newbie")], u128::from(fee)));
+        assert_eq!((balance(r, addr("newbie")), balance(r, addr("vault"))), (i128::from(MIN_NEW_ACCOUNT), 0), "flags {f}");
+
+        let s = Scenario::new("an opening below MIN_NEW_ACCOUNT", world(), pay(addr("newbie"), value, at_min - 1, f), &[]);
+        let r = &run(&s)[0];
+        assert!(r.ok(), "flags {f}: a status, not a trap");
+        assert_eq!(r.returns, vec![status::ERR_TRANSFER.to_le_bytes().to_vec()], "flags {f}");
+        assert!(r.diff.opened.is_empty() && r.diff.burned == 0, "flags {f}");
+        assert_eq!((balance(r, addr("newbie")), balance(r, addr("vault"))), (0, i128::from(value)), "flags {f}: only the call's value moved");
+    }
 }
 
 // --- method kinds (11.1): View frames, Init, payable ---

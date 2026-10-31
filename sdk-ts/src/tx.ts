@@ -1,6 +1,7 @@
 // Canonical transaction encoding. Must stay byte-identical to node/src/types.rs `Tx::signing_bytes`.
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex, concatBytes, hexToBytes } from "@noble/hashes/utils.js";
+import { bech32m } from "@scure/base";
 
 export type KeyRole =
   | { type: "owner" }
@@ -121,7 +122,76 @@ export type Action =
   /** A candidate's consensus key: its node is running, in the last tenth of `epoch` (the epoch the tx lands in). Changes nothing but the readiness record; refused until the members admitted it. Nodes send it themselves. */
   | { type: "validator_ready"; epoch: number }
   /** An active member's consensus key admits candidate `validator` (an address) into the set at the end of `epoch` (the epoch the tx lands in): its operator's decision, once an epoch. */
-  | { type: "admit_validator"; validator: string; epoch: number };
+  | { type: "admit_validator"; validator: string; epoch: number }
+  // ---- Programs (tags 62–64 and 69, protocol v2; docs/PROGRAMS-V0.md §2). Off until governance switches the `programs` feature on: until then nodes refuse every one of them. Programs are named by address, never by name; none of these goes in a multisig proposal. Tags 65–68 and 70 are reserved for later program actions. ----
+  /**
+   * Upload a program's code (WebAssembly 1.0) and its interface (format 1), both lowercase hex,
+   * bonding a storage deposit for each that isn't stored yet: at most `storage_limit` drops. The
+   * code is usable from the block after the upload's; a create names the two by their hashes
+   * (`wasmHash`, `interfaceHash`).
+   */
+  | { type: "upload_code"; wasm: string; interface: string; storage_limit: string }
+  /**
+   * Create a program from stored code and interface, named by their hashes (64 lowercase hex). Its
+   * address is `programAddress(from, nonce)`: don't send FANG there before the create has applied
+   * (a failed create spends its nonce, stranding whatever was sent). `authority` (an address, or
+   * null for an immutable program), `upgrade_delay_blocks` and `policy` are stored with no power
+   * until program upgrades exist; an immutable program has delay 0 and policy "open". `init` runs
+   * the interface's `Init` method, present exactly when the interface declares one; without it,
+   * `fuel_limit` is 0 and there are no bindings.
+   */
+  | {
+      type: "create_program"; wasm_hash: string; interface_hash: string; authority?: string | null; upgrade_delay_blocks: number;
+      policy: ProgramPolicy; accepts_transfers: boolean; init?: InitCall | null; fuel_limit: number; storage_limit: string; bindings: ProgramBinding[];
+    }
+  /**
+   * Call programs: 1–8 calls run in order, all or nothing, sharing `fuel_limit` (1 to 20,000,000,
+   * and at most the chain's `program_max_tx_fuel`) and `storage_limit` (the most their storage
+   * deposits may bond, drops). Each call names the `versionDigest` of the program it was shown. The
+   * code a call may reach is the calls' own programs' and the `bindings`'.
+   */
+  | { type: "call_program"; calls: ProgramCall[]; fuel_limit: number; storage_limit: string; bindings: ProgramBinding[] }
+  /** An active validator (from its own account or its owner's) votes to pause programs; they pause once f + 1 of the epoch's validators have. */
+  | { type: "programs_pause" };
+
+/**
+ * What a `create_program`'s authority may later do to it, once program upgrades exist (inert in
+ * v0; node/src/types.rs `ProgramPolicy`): replace its code freely ("open"), or only with code
+ * whose interface keeps every method ("additive").
+ */
+export type ProgramPolicy = "open" | "additive";
+
+/**
+ * A `create_program`'s initializer (node/src/types.rs `InitCall`): the interface's `Init` method,
+ * its input (lowercase hex) and the FANG sent with it (drops; only if the method is payable).
+ */
+export interface InitCall {
+  method: string;
+  input: string;
+  value: string;
+}
+
+/**
+ * One call of a `call_program` (node/src/types.rs `ProgramCall`): a program (by address), the
+ * `versionDigest` of it the signer was shown (never 64 zeros), a method of kind `Call`, its input
+ * (lowercase hex) and the FANG sent with it (drops; only if the method is payable).
+ */
+export interface ProgramCall {
+  program: string;
+  version_digest: string;
+  method: string;
+  input: string;
+  value: string;
+}
+
+/**
+ * A program whose code a program action may reach besides its calls' own (node/src/types.rs
+ * `Binding`): by address, at the version digest given, or at any version for 64 zeros.
+ */
+export interface ProgramBinding {
+  program: string;
+  version_digest: string;
+}
 
 /**
  * What a ghost action carries (node/src/types.rs `GhostBundle`), every field lowercase hex: the
@@ -246,6 +316,23 @@ export function uintField(v: unknown, max: bigint, what = "integer field"): bigi
 /** A u64 field (`uintField` up to 2^64 − 1). */
 export const u64Field = (v: unknown, what?: string) => uintField(v, U64_LIMIT - 1n, what);
 
+/**
+ * A bytes field as the node's JSON carries it (node/src/types.rs `HexBytes`): lowercase hex, two
+ * digits a byte. The node's parser refuses uppercase and odd lengths, so this does too, instead of
+ * signing bytes the node can't read back from the JSON.
+ */
+function lowerHexBytes(v: unknown, what: string): Uint8Array {
+  if (typeof v !== "string") throw new TypeError(`${what} must be a string of lowercase hex`);
+  if (!/^(?:[0-9a-f]{2})*$/.test(v)) throw new Error(`${what} must be lowercase hex, two digits a byte`);
+  return hexToBytes(v);
+}
+
+/** An entry of a list field (a program call, a binding, an initializer): a JSON object. */
+function fields(v: unknown, what: string): Record<string, unknown> {
+  if (!v || typeof v !== "object" || Array.isArray(v)) throw new TypeError(`${what} must be an object`);
+  return v as Record<string, unknown>;
+}
+
 class Writer {
   private parts: number[] = [];
   bytes(b: Uint8Array) { for (const x of b) this.parts.push(x); }
@@ -285,6 +372,18 @@ class Writer {
     this.u16(xs.length, `${what} length`);
     for (const x of xs) this.str(x, what);
   }
+  /** Bytes with a u32 length (node/src/types.rs `put_bytes`: a program's code, interface and inputs), from lowercase hex. */
+  putBytes(hex: unknown, what = "bytes field") {
+    const b = lowerHexBytes(hex, what);
+    this.u32(b.length, `${what} length`);
+    this.bytes(b);
+  }
+  /** A u8 count, then each entry (a program action's calls and bindings). More than 255 are refused, never wrapped. */
+  entries(xs: unknown, what: string, each: (x: Record<string, unknown>) => void) {
+    if (!Array.isArray(xs)) throw new TypeError(`${what} must be an array`);
+    this.u8(xs.length, `${what} count`);
+    for (const x of xs) each(fields(x, `each of ${what}`));
+  }
   done() { return Uint8Array.from(this.parts); }
 }
 
@@ -299,6 +398,11 @@ export function genesisHashBytes(genesisHash: string): Uint8Array {
 /** Unsigned ghost txs (`private_transfer`, `unshield`): no key signs them, their proof authorizes them. */
 export function isUnsignedAction(a: Action): boolean {
   return a.type === "private_transfer" || a.type === "unshield";
+}
+
+/** A program action (tags 62–64 and 69, node/src/types.rs `Action::is_program`). */
+export function isProgramAction(a: Action): boolean {
+  return a.type === "upload_code" || a.type === "create_program" || a.type === "call_program" || a.type === "programs_pause";
 }
 
 /**
@@ -467,6 +571,8 @@ function encodeAction(w: Writer, a: Action) {
       break;
     case "multisig_propose":
       if (a.action.type === "multisig_propose") throw new Error("a multisig proposal can't contain another");
+      // The node won't decode one (docs/PROGRAMS-V0.md §2.1, "No nesting").
+      if (isProgramAction(a.action)) throw new Error("a multisig proposal can't hold a program action");
       w.u8(43); encodeAction(w, a.action);
       break;
     case "multisig_approve":
@@ -508,9 +614,57 @@ function encodeAction(w: Writer, a: Action) {
     case "admit_validator":
       w.u8(61); w.str(a.validator); w.int(a.epoch, "epoch");
       break;
+    // Programs (docs/PROGRAMS-V0.md §2.2–2.5). Counts are a u8; byte fields a u32 length (`putBytes`).
+    case "upload_code":
+      w.u8(62); w.putBytes(a.wasm, "wasm"); w.putBytes(a.interface, "interface"); w.u64(a.storage_limit, "storage_limit");
+      break;
+    case "create_program": {
+      w.u8(63); w.str(a.wasm_hash, "wasm_hash"); w.str(a.interface_hash, "interface_hash"); w.str(authorityField(a.authority), "authority");
+      w.int(a.upgrade_delay_blocks, "upgrade_delay_blocks"); w.u8(policyByte(a.policy)); w.bool(a.accepts_transfers, "accepts_transfers");
+      // `init`: a presence byte, then the method, its input and value (absent or null: none, as the node reads the JSON).
+      if (a.init === undefined || a.init === null) w.u8(0);
+      else {
+        const init = fields(a.init, "init");
+        w.u8(1); w.str(init.method, "init.method"); w.putBytes(init.input, "init.input"); w.u64(init.value, "init.value");
+      }
+      w.int(a.fuel_limit, "fuel_limit"); w.u64(a.storage_limit, "storage_limit"); encodeBindings(w, a.bindings);
+      break;
+    }
+    case "call_program":
+      w.u8(64);
+      w.entries(a.calls, "calls", (c) => { w.str(c.program, "calls.program"); w.str(c.version_digest, "calls.version_digest"); w.str(c.method, "calls.method"); w.putBytes(c.input, "calls.input"); w.u64(c.value, "calls.value"); });
+      w.int(a.fuel_limit, "fuel_limit"); w.u64(a.storage_limit, "storage_limit"); encodeBindings(w, a.bindings);
+      break;
+    case "programs_pause":
+      w.u8(69);
+      break;
     default:
       throw new Error(`unknown action type ${(a as { type: string }).type}`);
   }
+}
+
+/** A program action's bindings (node/src/types.rs `put_bindings`): a u8 count, then each program and version digest. */
+function encodeBindings(w: Writer, bindings: unknown) {
+  w.entries(bindings, "bindings", (b) => { w.str(b.program, "bindings.program"); w.str(b.version_digest, "bindings.version_digest"); });
+}
+
+/**
+ * A create's `authority` as the codec writes it (an optional string: `""` for none). The node
+ * reads JSON `""` as an authority that isn't an address, and refuses it, but its bytes would be
+ * an immutable program's: so `""` is refused here, never signed as the other.
+ */
+function authorityField(authority: unknown): string {
+  if (authority === undefined || authority === null) return "";
+  if (authority === "") throw new Error('authority must be an address, or null for an immutable program (not "")');
+  if (typeof authority !== "string") throw new TypeError("authority must be a string (an address) or null");
+  return authority;
+}
+
+/** A program policy's byte (node/src/types.rs `ProgramPolicy::byte`). */
+function policyByte(policy: unknown): number {
+  if (policy === "open") return 0;
+  if (policy === "additive") return 1;
+  throw new Error(`policy must be "open" or "additive", not ${typeof policy === "string" ? JSON.stringify(policy) : typeof policy}`);
 }
 
 /** A bundle without its proof, raw and in wire order: what the sighash covers. */
@@ -690,6 +844,122 @@ function digestOf(what: string, context: string, encode: (w: Writer) => void): s
     throw e;
   }
   return bytesToHex(blake3(w.done(), { context: utf8.encode(context) }));
+}
+
+// ---- Programs' digests (node/src/programs/digest.rs, docs/PROGRAMS-V0.md §2.1), checked offline
+// against test/program-vectors.json, which the node writes. Frozen with protocol v2. ----
+
+/**
+ * The contexts of programs' five digests, each BLAKE3 in derive-key mode: node/src/programs/digest.rs
+ * `CODE_CONTEXT`, `INTERFACE_CONTEXT`, `VERSION_CONTEXT` and `ADDRESS_CONTEXT`, and the VM's
+ * `SELECTOR_CONTEXT` (node/vm/src/interface.rs), the selector's only home on the node.
+ */
+export const PROGRAM_DIGEST_CONTEXTS = Object.freeze({
+  code: "blockula program code v1",
+  interface: "blockula program interface v1",
+  version: "blockula program version v1",
+  address: "blockula program address v1",
+  method: "blockula program method v1",
+});
+
+/** Every v0 program's version (node/src/programs/digest.rs `FIRST_VERSION`): only a program upgrade, in a later protocol version, raises it. */
+export const FIRST_PROGRAM_VERSION = 1;
+
+/** Address prefixes (index.ts `KNOWN_PREFIXES`, node/src/crypto.rs `KNOWN_PREFIXES`), kept here so this module imports nothing of the SDK's. */
+const ADDRESS_PREFIXES: readonly string[] = ["boo", "tboo"];
+
+/**
+ * A canonical address's prefix and 32 bytes (node/src/crypto.rs `parse_address`): a known prefix,
+ * and only the exact rendering, so neither uppercase nor another checksum aliases the account.
+ * Programs are named by address, never by name.
+ */
+function parseAddress(s: unknown, what: string): { prefix: string; bytes: Uint8Array } {
+  if (typeof s === "string" && s.length <= 90) {
+    try {
+      const { prefix, words } = bech32m.decode(s as `${string}1${string}`);
+      const bytes = bech32m.fromWords(words);
+      if (ADDRESS_PREFIXES.includes(prefix) && bytes.length === 32 && bech32m.encode(prefix, words) === s) return { prefix, bytes };
+    } catch {
+      // Not bech32m: refused below.
+    }
+  }
+  throw new Error(`${what} must be an address (boo1… or tboo1…), not ${typeof s === "string" ? JSON.stringify(s) : typeof s}`);
+}
+
+/** A 32-byte digest as a program action's JSON carries it: 64 lowercase hex (node/src/types.rs `check_hex_32`). */
+function hex32(v: unknown, what: string): Uint8Array {
+  if (typeof v !== "string" || !/^[0-9a-f]{64}$/.test(v)) throw new Error(`${what} must be 32 bytes of lowercase hex`);
+  return hexToBytes(v);
+}
+
+/** BLAKE3 in derive-key mode (the node's `blake3::derive_key`). */
+const deriveKey = (context: string, input: Uint8Array) => blake3(input, { context: utf8.encode(context) });
+
+/** Bytes, or lowercase hex as `upload_code` carries them. */
+const bytesOf = (v: Uint8Array | string, what: string) => (v instanceof Uint8Array ? v : lowerHexBytes(v, what));
+
+/**
+ * The hash that names a program's code (node/src/programs/digest.rs `wasm_hash`): BLAKE3-KDF("blockula
+ * program code v1", wasm), as 64 lowercase hex. A `create_program` names its code by it, once an
+ * `upload_code` of the same bytes (as bytes, or lowercase hex) has applied.
+ */
+export function wasmHash(wasm: Uint8Array | string): string {
+  return bytesToHex(deriveKey(PROGRAM_DIGEST_CONTEXTS.code, bytesOf(wasm, "wasm")));
+}
+
+/** The hash that names an interface, its format-1 bytes (node/src/programs/digest.rs `interface_hash`): as `wasmHash`, under "blockula program interface v1". */
+export function interfaceHash(iface: Uint8Array | string): string {
+  return bytesToHex(deriveKey(PROGRAM_DIGEST_CONTEXTS.interface, bytesOf(iface, "interface")));
+}
+
+/**
+ * What a call to `program` binds (node/src/programs/digest.rs `version_digest`): BLAKE3-KDF("blockula
+ * program version v1", the program's address as a string field (u16 LE length, its bytes) ‖ its
+ * code's hash ‖ its interface's hash ‖ its version, u32 LE), as 64 lowercase hex. A call runs only
+ * while this is the program's digest in force, so it runs the code its signer was shown: compute it
+ * from the record you show (its hashes and version), rather than sign a digest a node reported.
+ */
+export function versionDigest(program: string, wasmHashHex: string, interfaceHashHex: string, version: number = FIRST_PROGRAM_VERSION): string {
+  parseAddress(program, "program");
+  const w = new Writer();
+  w.str(program, "program");
+  w.bytes(hex32(wasmHashHex, "wasm_hash"));
+  w.bytes(hex32(interfaceHashHex, "interface_hash"));
+  w.u32(version, "version");
+  return bytesToHex(deriveKey(PROGRAM_DIGEST_CONTEXTS.version, w.done()));
+}
+
+/**
+ * The address of the program `creator` creates with its transaction of `nonce` (node/src/programs/digest.rs
+ * `program_address`): bech32m(prefix, BLAKE3-KDF("blockula program address v1", the creator's 32
+ * address bytes ‖ nonce u64 LE)). `prefix` defaults to the creator's own (a chain admits only its
+ * prefix, so for any create it runs the two are the same).
+ *
+ * Don't send FANG to it before the create has applied: a create that fails spends its nonce, no
+ * later create reaches the address, and what was sent there is stranded for good (docs/PROGRAMS-V0.md
+ * §2.3). Fund a program through its initializer's value, or by transfer once it exists.
+ */
+export function programAddress(creator: string, nonce: number | bigint | string, prefix?: string): string {
+  const c = parseAddress(creator, "creator");
+  const p = prefix ?? c.prefix;
+  if (!ADDRESS_PREFIXES.includes(p)) throw new Error(`unknown address prefix ${p}`);
+  const w = new Writer();
+  w.bytes(c.bytes);
+  w.u64(nonce, "nonce");
+  return bech32m.encode(p, bech32m.toWords(deriveKey(PROGRAM_DIGEST_CONTEXTS.address, w.done())));
+}
+
+/** A method name: an identifier, `[a-z][a-z0-9_]{0,31}` (node/vm `abi::is_ident`). */
+const METHOD_NAME = /^[a-z][a-z0-9_]{0,31}$/;
+
+/**
+ * A method's selector (node/vm/src/interface.rs `selector`): the first 8 bytes of
+ * BLAKE3-KDF("blockula program method v1", its name), as 16 lowercase hex. An interface's methods
+ * have distinct selectors. Only identifiers are method names, so anything else is refused.
+ */
+export function methodSelector(name: string): string {
+  if (typeof name !== "string" || !METHOD_NAME.test(name)) throw new Error(`a method name is an identifier ([a-z][a-z0-9_]{0,31}), not ${typeof name === "string" ? JSON.stringify(name) : typeof name}`);
+  return bytesToHex(deriveKey(PROGRAM_DIGEST_CONTEXTS.method, utf8.encode(name)).subarray(0, 8));
 }
 
 /** One claim of a Séance pair, as the juror judged it. */

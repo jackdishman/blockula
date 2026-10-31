@@ -55,3 +55,9 @@ pub const MAX_BINDINGS: usize = 16;
 pub const MAX_TX_CODE_BYTES: usize = 512 * 1024;
 /// An abort message, after the host replaces control, format, bidi and private-use characters.
 pub const MAX_ABORT_MESSAGE: usize = 256;
+
+/// The least a program's `transfer_v1` that opens an account may credit it, in drops (0.01 FANG),
+/// under either opening flag (docs/PROGRAMS-V0.md A30): the node's `types::MIN_NEW_ACCOUNT`, which
+/// its native transfers keep too, so no program opens dust accounts. A node test keeps the two
+/// equal (`programs::tests`).
+pub const MIN_NEW_ACCOUNT: u64 = 10_000_000;

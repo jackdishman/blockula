@@ -63,7 +63,7 @@
 //! | 52 `GHOST_ADDRESSES` | account → its 1,216-byte address | `SetGhostAddress` |
 //! | META `ghost` | [`GhostMeta`] | instance, frontier, anchor, pool, pause |
 
-use crate::chain::{check_validity, short, BlockInfo, Genesis, Journal, KeyRecord, Outcome, State, TipRate};
+use crate::chain::{check_validity, short, ApplyMode, BlockInfo, Genesis, Journal, KeyRecord, Outcome, State, TipRate};
 use crate::state::codec::{decode, encode};
 use crate::state::{meta, ns, JMap, SubState, TMap, Table};
 use crate::types::*;
@@ -587,11 +587,11 @@ pub fn canonical_fee(state: &State, opens_account: bool) -> u64 {
 /// `State::apply_j` for an unsigned ghost tx (`PrivateTransfer`, `Unshield`): every check first,
 /// then the effects. There's no account to charge, so it either applies in full or can't be
 /// included (`Err`, state untouched); it never fails with a fee charged.
-pub(crate) fn apply_unsigned(state: &mut State, j: &mut Journal, tx: &Tx, chain_id: &str, proposer: &str, height: u64, full_checks: bool) -> Result<Outcome> {
+pub(crate) fn apply_unsigned(state: &mut State, j: &mut Journal, tx: &Tx, chain_id: &str, proposer: &str, height: u64, mode: ApplyMode) -> Result<Outcome> {
     if tx.chain_id != chain_id {
         bail!("wrong chain_id: expected {chain_id}");
     }
-    if full_checks {
+    if mode == ApplyMode::Block {
         tx.check_format()?;
     }
     tx.check_prefix(state.params.prefix())?;
@@ -618,6 +618,8 @@ pub(crate) fn apply_unsigned(state: &mut State, j: &mut Journal, tx: &Tx, chain_
     let payee = match &tx.action {
         Action::Unshield { to, amount, .. } => {
             let to = state.resolve(to)?;
+            // Never to a program (docs/PROGRAMS-V0.md §7.1): unadmittable, before any effect.
+            crate::programs::check_credit(state, &to, *amount, crate::programs::Credit::Other, height)?;
             if !state.accounts.contains_key(&to) && *amount < MIN_NEW_ACCOUNT {
                 bail!("unshielding to a new account needs at least {}", fmt_fang(MIN_NEW_ACCOUNT));
             }
@@ -864,7 +866,7 @@ pub fn mempool_admit(queued: &[Tx], ids: &[String], tx: &Tx, own: Option<usize>,
             return TipRate::of(q);
         }
         let then = queued.iter().enumerate().skip(i).filter(|(j, t)| kept(*j) && !t.is_unsigned() && t.from == q.from);
-        then.fold(TipRate { tip: 0, size: 0 }, |c, (_, t)| TipRate { tip: c.tip.saturating_add(t.tip), size: c.size.saturating_add(t.size()) })
+        then.map(|(_, t)| TipRate::of(t)).fold(TipRate { tip: 0, share: 0 }, |c, r| TipRate { tip: c.tip.saturating_add(r.tip), share: c.share.saturating_add(r.share) })
     };
     let mut ghosts = 0;
     let mut replaces = vec![];

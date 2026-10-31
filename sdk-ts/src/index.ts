@@ -2,8 +2,9 @@ import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex, hexToBytes, randomBytes, utf8ToBytes } from "@noble/hashes/utils.js";
 import { base64urlnopad, bech32m } from "@scure/base";
-import { DEFAULT_TIP_CAP_MULTIPLE, KEY_POP_CONTEXT, PUBLIC_KEY_LEN, SIGNATURE_LEN, actionDigest, baseFee, formatFang, keyPopMessage, maxTip, parseFang, parseSoul, proposalDigest, seanceCommitment, seancePairsDigest, signingBytes, txBytes, txId, type SeanceClaimRef, type Action, type BaseFee, type KeyRole, type ProposalKind, type Tx, type UnsignedTx } from "./tx.js";
-import { NAMESPACES, checkProofResponse, decodeAccount, decodeName, type ProofResponse, type ProvenRecord } from "./proof.js";
+import { DEFAULT_TIP_CAP_MULTIPLE, KEY_POP_CONTEXT, PUBLIC_KEY_LEN, SIGNATURE_LEN, actionDigest, baseFee, formatFang, interfaceHash, keyPopMessage, maxTip, parseFang, parseSoul, programAddress, proposalDigest, seanceCommitment, seancePairsDigest, signingBytes, txBytes, txId, versionDigest, wasmHash, type SeanceClaimRef, type Action, type BaseFee, type KeyRole, type ProposalKind, type ProgramPolicy, type Tx, type UnsignedTx } from "./tx.js";
+import { NAMESPACES, checkProofResponse, decodeAccount, decodeName, decodeProgram, type ProofResponse, type ProvenRecord } from "./proof.js";
+import { ANY_PROGRAM_VERSION, MAX_PROGRAM_BINDINGS, MAX_PROGRAM_CALLS, MAX_PROGRAM_CODE_BYTES, MAX_PROGRAM_INTERFACE_BYTES, ProgramAnswerError, ProgramsOffError, defaultFuelLimit, depositWithMargin, plainText, positiveFuel, programAddressArg, programBytesArg, programHashArg, programInputArg, programMethodArg, checkCode, checkFuel, checkInterface, checkParams, checkProgram, checkProgramsStatus, checkReceipt, checkView, outcomeWords, priceFuel, programCost, programRecordDeposit, programUploadDeposit, reserveFuel, uploadFuel, type FuelReservation, type ProgramCodeInfo, type ProgramCost, type ProgramFuel, type ProgramInfo, type ProgramInterfaceInfo, type ProgramParams, type ProgramReceipt, type ProgramViewResult } from "./programs.js";
 import { describeKind, reviewAction } from "./describe.js";
 import { NETWORKS, isNetworkName, type NetworkClock, type NetworkName, type NetworkPreset } from "./networks.js";
 
@@ -14,6 +15,7 @@ export * from "./release.js";
 export * from "./describe.js";
 export * from "./networks.js";
 export * from "./payments.js";
+export * from "./programs.js";
 
 export const DEFAULT_RPC = "http://localhost:7070";
 /** Address prefixes: `boo` on mainnet (and dev chains), `tboo` on public testnets. */
@@ -70,6 +72,20 @@ const wholeNumber = (n: number, what: string) => {
   if (!Number.isSafeInteger(n) || n < 0) throw new Error(`${what} must be a whole number`);
   return n;
 };
+
+/** `n` as drops a transaction can carry: 0 to 2^64 − 1. */
+const checkedDrops = (n: bigint, what: string) => {
+  if (n < 0n || n >= 1n << 64n) throw new Error(`${what}: amount too large`);
+  return n;
+};
+
+/** How long a program helper waits by default for what it needs to be usable: a minute of blocks. */
+const DEFAULT_PROGRAM_WAIT_MS = 60_000;
+
+/** The program actions that reserve fuel (tags 62–64) and the helper that prices it: `build()` and the generic paths refuse them, naming it. */
+const PROGRAM_HELPERS = new Map<string, string>([["upload_code", "wallet.uploadCode"], ["create_program", "wallet.createProgram"], ["call_program", "wallet.callProgram (or wallet.call)"]]);
+
+const programWaitMs = (ms: number | undefined) => (ms === undefined ? DEFAULT_PROGRAM_WAIT_MS : checkTimeoutMs(ms, "waitMs"));
 
 const hexArg = (s: string, what: string) => {
   const h = s.trim().toLowerCase();
@@ -662,7 +678,7 @@ export class Wallet {
    * (the helpers' resolutions of names in fields that need an address) or the account `actAs`
    * found that way (audit gap-7-1). Checked against the very status the tx is signed for.
    */
-  private async buildChecked(action: Action | ((height: number) => Action), memo: string, opts: TxOptions, unproven: Resolution[]): Promise<Tx> {
+  private async buildChecked(action: Action | ((height: number) => Action), memo: string, opts: TxOptions & { reserved?: FuelReservation }, unproven: Resolution[]): Promise<Tx> {
     await this.client.addressPrefix(); // so `this.account` uses the chain's prefix
     const [status, account, fees] = await Promise.all([this.client.status(), this.client.account(this.account).catch(() => null), this.client.fees()]);
     if (!Number.isSafeInteger(status.height) || status.height < 0) throw new Error(`${this.client.rpc} doesn't report its height`);
@@ -679,24 +695,32 @@ export class Wallet {
     if (guess && status.chain_id === MAINNET_CHAIN_ID) throw new UnprovenNameError(guess, this.client.rpc);
     // Binds the tx to this chain instance (not just its id), so it can't replay on a relaunch.
     const act = typeof action === "function" ? action(status.height) : action;
+    // A program action reserves fuel and pays for it (§5.1): only the helpers below price that, so this generic path refuses it.
+    const helper = PROGRAM_HELPERS.get(act.type);
+    if (helper && !opts.reserved) throw new Error(`a ${act.type} reserves fuel, which this generic builder doesn't price (its fee would be too low and the chain would refuse it): use ${helper}. Nothing was signed`);
     const nonce = await this.nonceFor(cursorKey(status.chain_id, status.genesis_hash, this.account), Number(account?.next_nonce ?? 0), status.height);
     const unsigned: UnsignedTx = { chain_id: status.chain_id, genesis_hash: status.genesis_hash, from: this.account, nonce, fee: "0", tip: tip.toString(), valid_until: status.height + validFor, action: act, memo };
-    unsigned.fee = this.feeFor(unsigned, fees.suggested, tip, opts).toString();
+    // A program transaction also pays for the fuel it reserves (§5.1): at the rate the next blocks can reach, from this very read
+    // of the node's prices, which also refuses a reservation no block could carry (programs.ts `priceFuel`).
+    const fuel = opts.reserved ? priceFuel(checkFuel(this.client.rpc, fees.fuel), opts.reserved) : { suggested: 0n, floor: 0n };
+    unsigned.fee = this.feeFor(unsigned, fees.suggested, tip, opts, fuel.suggested).toString();
     if (tip > 0n) {
-      // The cap is a multiple of the base fee of the block that includes the tx: price it at the lowest upcoming one.
+      // The cap is a multiple of the base fee of the block that includes the tx (its bytes' and its fuel's): price it at the lowest upcoming
+      // one, and a program's fuel at the floor rate, which no block undercuts.
       const multiple = fees.tip_cap_multiple ?? DEFAULT_TIP_CAP_MULTIPLE;
-      const cap = maxTip(unsigned, fees.lowest ?? fees.suggested, multiple);
+      const cap = maxTip(unsigned, fees.lowest ?? fees.suggested, multiple) + BigInt(multiple) * fuel.floor;
       if (tip > cap) throw new Error(`tip too high: at most ${multiple}× the base fee, ${cap} drops for this transaction now`);
     }
     return this.sign(unsigned);
   }
 
   /**
-   * A tx's `fee`: the base fee at `suggested` for its size, times the headroom, plus the tip; or
-   * `maxFee` outright, which must cover at least the base fee at `suggested` plus the tip.
+   * A tx's `fee`: the base fee at `suggested` for its size (and, for a program transaction, its
+   * fuel fee at the suggested rate: `fuelFee`), times the headroom, plus the tip; or `maxFee`
+   * outright, which must cover at least that base fee plus the tip.
    */
-  private feeFor(unsigned: UnsignedTx, suggested: BaseFee, tip: bigint, opts: TxOptions): bigint {
-    const base = baseFee(unsigned, suggested);
+  private feeFor(unsigned: UnsignedTx, suggested: BaseFee, tip: bigint, opts: TxOptions, fuelFee = 0n): bigint {
+    const base = baseFee(unsigned, suggested) + fuelFee;
     if (opts.maxFee !== undefined) {
       const fee = parseFang(opts.maxFee);
       if (fee < base + tip) throw new Error(`maxFee ${formatFang(fee)} is below what this transaction costs now: ${formatFang(base + tip)} (base fee ${formatFang(base)} + tip ${formatFang(tip)})`);
@@ -748,7 +772,7 @@ export class Wallet {
    * misjudge a correct nonce for a moment), then the node's next nonce is used. Anything else
    * (a timeout, a 5xx, a broken connection) may have been admitted, so its nonce isn't reused.
    */
-  private async submitQueued(action: Action | ((height: number) => Action), memo: string, opts: TxOptions & { wait?: boolean; onSigned?: SendOptions["onSigned"] }, unproven: Resolution[], retry: RetryBusy = NO_RETRY): Promise<any> {
+  private async submitQueued(action: Action | ((height: number) => Action), memo: string, opts: TxOptions & { wait?: boolean; onSigned?: SendOptions["onSigned"]; reserved?: FuelReservation }, unproven: Resolution[], retry: RetryBusy = NO_RETRY): Promise<any> {
     const { tx, id } = await this.enqueue(async () => {
       const tx = await this.buildChecked(action, memo, opts, unproven);
       // Stored before it leaves (store first, then send); a store that fails submits nothing.
@@ -1344,6 +1368,355 @@ export class Wallet {
     return this.act({ type: "attest_revert", claim_id: wholeNumber(claimId, "claimId"), revert_sha: revertSha }, opts);
   }
 
+  // ---- programs (protocol v2: tags 62, 63, 64 and 69; docs/PROGRAMS-V0.md §8.4). Third-party WebAssembly: every node answer is
+  // checked before it's used (programs.ts), fuel is priced at the node's suggested rate and refused when no block could carry it,
+  // and nothing is signed that the user wasn't shown the digest of. Upload, create and call are one step per block (§2.1): each
+  // waits for what it needs to be usable instead of being refused by the mempool. ----
+
+  /** The chain's fuel prices, with programs required to be on (`ProgramsOffError`) and to admit this kind of transaction now. */
+  private async programsFor(kind: "upload" | "create" | "call", sendsValue: boolean): Promise<ProgramFuel> {
+    const fuel = await this.client.programFuel();
+    checkProgramsStatus(fuel, kind, sendsValue);
+    return fuel;
+  }
+
+  /** Waits (up to `waitMs`) for the node's head to pass `height`: what block `height` stored is usable from the next one (§2.1). */
+  private async waitPast(height: number, waitMs: number, what: string): Promise<void> {
+    const until = Date.now() + waitMs;
+    for (;;) {
+      const head = (await this.client.status()).height;
+      if (!Number.isSafeInteger(head) || head < 0) throw new Error(`${this.client.rpc} doesn't report its height`);
+      this.client.checkHeightClock(head);
+      if (head > height) return;
+      if (Date.now() > until) throw new Error(`${what} is final in block ${height}, but ${this.client.rpc} hasn't sealed the block after it in ${waitMs} ms, so it can't be used yet: check again shortly`);
+      await sleep(250);
+    }
+  }
+
+  /**
+   * Runs what follows a transaction that was submitted and is final, saying so if it fails: `what` names
+   * the transaction (its id, and what it made), which was sent and ran, so the failure is of the receipt,
+   * the wait or the read after it, and the transaction must not be sent again. The typed error stays
+   * as `cause`; its reason is quoted stripped of hidden characters (it may hold a node's text). `what` may be a function
+   * so the name can grow as `run` learns more (the address a create made).
+   */
+  private async finalThen<T>(what: string | (() => string), run: () => Promise<T>): Promise<T> {
+    try {
+      return await run();
+    } catch (e) {
+      const reason = plainText(String((e as Error)?.message ?? e)).slice(0, 600);
+      throw new Error(`${typeof what === "string" ? what : what()} was sent and is final: it already ran, so don't send it again. What came after it failed: ${reason}`, { cause: e });
+    }
+  }
+
+  /**
+   * Waits (up to `waitMs`) until `read` finds what it names (`null`: not there yet) stored in a block
+   * before the node's head, which is when it's usable (§2.1: a create, or a call, signed earlier is
+   * refused by the mempool). Says what was waited for if it never is.
+   */
+  private async waitUsable<T>(what: string, waitMs: number, read: () => Promise<{ stored: number | null; found: T } | null>): Promise<T> {
+    const until = Date.now() + waitMs;
+    let seen: number | null = null;
+    for (;;) {
+      const r = await read();
+      if (r && r.stored !== null) {
+        seen = r.stored;
+        const head = (await this.client.status()).height;
+        if (!Number.isSafeInteger(head) || head < 0) throw new Error(`${this.client.rpc} doesn't report its height`);
+        this.client.checkHeightClock(head);
+        if (r.stored < head) return r.found;
+      }
+      if (Date.now() > until) throw new Error(`${what} isn't usable after ${waitMs} ms: ${seen === null ? "it isn't stored (upload or create it first)" : `it was stored in block ${seen}, and is usable from the block after it`}. Nothing was signed`);
+      await sleep(250);
+    }
+  }
+
+  /** A program as a call needs it: usable (stored in an earlier block), its digest recomputed from its own record, and proven against the client's witnesses when it has some. */
+  private async programForCall(address: string, waitMs: number): Promise<{ info: ProgramInfo; digest: string }> {
+    const info = await this.waitUsable(`the program ${address}`, waitMs, async () => {
+      try {
+        const p = await this.client.program(address);
+        return { stored: p.created_at, found: p };
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 404) return null;
+        throw e;
+      }
+    });
+    if (info.code.size === null) throw new ProgramAnswerError(this.client.rpc, `GET /api/program/${address}`, "code.size", "is missing: the code's load can't be priced");
+    if (this.client.witnesses.length) {
+      const proven = await this.client.provenProgram(address, { witnesses: this.client.witnesses });
+      if (!proven) throw new Error(`${address} isn't a program: its record is provably absent (proven against ${this.client.witnesses.length} witness${this.client.witnesses.length === 1 ? "" : "es"}), whatever ${this.client.rpc} says. Nothing was signed`);
+      if (proven.version_digest !== info.version_digest || proven.wasm_hash !== info.code.wasm_hash || proven.interface_hash !== info.code.interface_hash) throw new Error(`${this.client.rpc} and its witnesses disagree about the code at ${address}: the proven record's digest is ${proven.version_digest.slice(0, 16)}…, the node says ${info.version_digest.slice(0, 16)}…. Nothing was signed`);
+    }
+    return { info, digest: info.version_digest };
+  }
+
+  /**
+   * The bindings of a transaction (`ProgramBindingInput`s): each program read (usable, checked, proven
+   * with witnesses), its version digest filled with the version in force now when none is given (never
+   * "any version", 64 zeros, unless asked: `ANY_PROGRAM_VERSION`), and its code added to `declared`,
+   * which load fuel is counted on.
+   */
+  private async resolveBindings(bindings: ProgramBindingInput[], declared: Map<string, number>, waitMs: number): Promise<{ program: string; version_digest: string }[]> {
+    if (!Array.isArray(bindings) || bindings.length > MAX_PROGRAM_BINDINGS) throw new Error(`a transaction binds at most ${MAX_PROGRAM_BINDINGS} programs`);
+    const out: { program: string; version_digest: string }[] = [];
+    for (const b of bindings) {
+      const program = programAddressArg(b.program, "a binding");
+      if (out.some((o) => o.program === program)) throw new Error(`${program} is bound twice`);
+      const { info, digest } = await this.programForCall(program, waitMs);
+      const given = b.versionDigest === undefined ? undefined : programHashArg(b.versionDigest, "a binding's version digest");
+      if (given !== undefined && given !== ANY_PROGRAM_VERSION) shownDigest(given, digest, `the program ${program}`);
+      declared.set(info.code.wasm_hash, info.code.size as number);
+      out.push({ program, version_digest: given ?? digest });
+    }
+    return out;
+  }
+
+  /**
+   * Signs and submits a program transaction (reserving `reservation` fuel: its fee is priced with it),
+   * waits for it, checks its receipt (programs.ts `checkReceipt`) and returns it with what it cost.
+   * One that ran and failed throws `ProgramFailedError` (its fee was charged; `storageLimit` names
+   * the limit it signed, for the hint a `storage_limit` trap needs).
+   *
+   * Once the transaction is submitted and the node reports it final, **every failure says so**
+   * (`finalThen`): a receipt or answer that doesn't check isn't "nothing happened, ask another node",
+   * since the transaction ran, and a payable call sent again pays twice. The typed error is the `cause`.
+   */
+  private async sendProgram(kind: "upload" | "create" | "call", action: Action, reservation: FuelReservation, opts: ProgramTxOptions, storageLimit?: bigint): Promise<ProgramTxResult & { signed: Tx }> {
+    let signed: Tx | undefined;
+    let done: any;
+    try {
+      done = await this.submitQueued(action, "", { ...opts, wait: true, reserved: reservation, onSigned: async (tx, id) => { signed = tx; await opts.onSigned?.(tx, id); } }, []);
+    } catch (e) {
+      if (e instanceof TxFailedError && !e.dropped) throw programFailure(this.client.rpc, e, storageLimit);
+      throw e;
+    }
+    const tx = signed as Tx | undefined;
+    const id = tx ? txId(tx) : "(its id wasn't seen here)";
+    return this.finalThen(`the ${kind} (tx ${id})`, async () => {
+      if (!tx) throw new Error("a program transaction was submitted without being signed here");
+      if (done?.id !== id) throw new ProgramAnswerError(this.client.rpc, `GET /api/tx/${id}`, "id", `isn't the transaction that was submitted (${plainText(String(done?.id)).slice(0, 16)})`);
+      const receipt = checkReceipt(this.client.rpc, done);
+      if (!receipt) throw new ProgramAnswerError(this.client.rpc, `GET /api/tx/${id}`, "program", "is null for a transaction that is final: it should hold its receipt");
+      if (receipt.kind !== kind) throw new ProgramAnswerError(this.client.rpc, `GET /api/tx/${id}`, "program.kind", `is ${receipt.kind}, not ${kind}`);
+      if (!receipt.outcome.ok) throw new ProgramAnswerError(this.client.rpc, `GET /api/tx/${id}`, "program.outcome", "says it failed for a transaction that is final");
+      if (!Number.isSafeInteger(done.height) || done.height < 0) throw new ProgramAnswerError(this.client.rpc, `GET /api/tx/${id}`, "height", "isn't a block height");
+      this.client.checkHeightClock(done.height);
+      return { tx: done, receipt, cost: programCost(receipt, tx.from), signed: tx };
+    });
+  }
+
+  /**
+   * Uploads a program's code (WebAssembly 1.0) and its interface (format 1: `blockula program interface
+   * encode`, or the `.iface` files beside the guests), bonding a storage deposit for each that isn't
+   * stored yet: the deposit at today's price (`programUploadDeposit`), which v0 never gives back. `storageLimit`
+   * (FANG, default that deposit plus 10%) is the most the upload may bond; below the deposit it's
+   * refused before signing, as the upload would fail and still be charged. Fuel is priced at the
+   * node's suggested rate. Resolves once the upload is final **and the block after it has been sealed**,
+   * when the code is usable (a create signed sooner is refused, §2.1), with its receipt and what it
+   * cost: the fee, and the deposit, which `receipt.facts.outside_vm` holds apart from the VM's diff.
+   */
+  async uploadCode(wasm: Uint8Array | string, iface: Uint8Array | string, opts: ProgramTxOptions & { storageLimit?: Amount } = {}): Promise<UploadedCode> {
+    const code = programBytesArg(wasm, "the code", MAX_PROGRAM_CODE_BYTES);
+    const interfaceBytes = programBytesArg(iface, "the interface", MAX_PROGRAM_INTERFACE_BYTES);
+    const waitMs = programWaitMs(opts.waitMs);
+    const [wasm_hash, interface_hash] = [wasmHash(code), interfaceHash(interfaceBytes)];
+    const fuel = await this.programsFor("upload", false);
+    const params = await this.client.programParams();
+    // What's stored already bonds nothing again (an upload of stored blobs only refreshes them). That's one node's word, so it only
+    // says what deposit to expect: the limit defaults to the deposit as if both blobs were new, a ceiling the chain bonds only
+    // what's new against, which a node that says "already stored" can't lower (it'd make the upload fail, and charge its fee).
+    const stored = async (read: () => Promise<unknown>) => read().then(() => true, (e) => (e instanceof ApiError && e.status === 404 ? false : Promise.reject(e)));
+    const [codeStored, interfaceStored] = await Promise.all([stored(() => this.client.code(wasm_hash)), stored(() => this.client.interface(interface_hash))]);
+    const deposit = programUploadDeposit(fuel, params, [{ size: code.length, isNew: !codeStored }, { size: interfaceBytes.length, isNew: !interfaceStored }]);
+    if (deposit === null) throw new Error("program state is full: nothing more can be stored at any price. Nothing was signed");
+    const ceiling = programUploadDeposit(fuel, params, [{ size: code.length, isNew: true }, { size: interfaceBytes.length, isNew: true }]) ?? deposit;
+    const storageLimit = opts.storageLimit === undefined ? depositWithMargin(ceiling) : checkedDrops(parseFang(opts.storageLimit), "storageLimit");
+    if (storageLimit < deposit) throw new Error(`storageLimit ${formatFang(storageLimit)} is below the deposit ${formatFang(deposit)} at today's price: the upload would fail and still be charged its fee. Nothing was signed`);
+    // An upload reserves its own validation, test translation and hashing (§5.1), priced by its size.
+    const reservation = reserveFuel(fuel, uploadFuel(code.length, interfaceBytes.length), new Map(), false);
+    const action: Action = { type: "upload_code", wasm: bytesToHex(code), interface: bytesToHex(interfaceBytes), storage_limit: storageLimit.toString() };
+    const { tx, receipt, cost } = await this.sendProgram("upload", action, reservation, opts, storageLimit);
+    return this.finalThen(`the upload (tx ${tx.id})`, async () => {
+      const upload = receipt.facts.upload;
+      if (!upload || upload.wasm_hash !== wasm_hash || upload.interface_hash !== interface_hash) throw new ProgramAnswerError(this.client.rpc, `GET /api/tx/${tx.id}`, "program.facts.upload", "isn't the code and interface that were uploaded");
+      await this.waitPast(tx.height, waitMs, "the upload");
+      return { wasmHash: wasm_hash, interfaceHash: interface_hash, deposit: upload.deposit, tx, receipt, cost };
+    });
+  }
+
+  /**
+   * Creates a program from stored code and interface (`uploadCode`'s hashes), at the address made from
+   * this account and the transaction's nonce, which is returned **only once the create has applied**
+   * and the block after it has been sealed (the program is then usable), never predicted ahead of it:
+   * FANG sent to a program's address before its create is final is stranded for good if the create
+   * fails (§2.3). It first waits for the code and interface to be usable (an upload a block ago).
+   *
+   * `init` runs the interface's `Init` method with its `input` and `value`, present exactly when the
+   * interface declares one; it runs under `fuelLimit` (default `program_max_tx_fuel`, 0 without `init`).
+   * `storageLimit` (FANG) is the most the record's deposit and what the initializer's writes bond may
+   * be: default the record's deposit plus 10%, which a program whose initializer writes needs more than.
+   * `authority` (an address, never a name) may upgrade it once a protocol version adds upgrades, with
+   * `delayBlocks` of notice (default and least: `program_min_upgrade_delay_blocks`) and an upgrade
+   * `policy`; without one the program is immutable. `bindings` are programs the initializer may reach.
+   * The receipt's `outside_vm` holds the record deposit and the account creation fee the create burns
+   * when the program's address held no account yet.
+   */
+  async createProgram(opts: CreateProgramOptions): Promise<CreatedProgram> {
+    const wasm_hash = programHashArg(opts.wasmHash, "wasmHash");
+    const interface_hash = programHashArg(opts.interfaceHash, "interfaceHash");
+    const waitMs = programWaitMs(opts.waitMs);
+    const init = opts.init;
+    const initMethod = init === undefined ? undefined : programMethodArg(init.method);
+    const initValue = checkedDrops(parseFang(init?.value ?? 0n), "init.value");
+    if (init === undefined && (opts.fuelLimit !== undefined || opts.bindings?.length)) throw new Error("fuelLimit and bindings are an initializer's: pass `init`, or leave them out");
+    if (opts.authority === undefined && (opts.delayBlocks !== undefined || opts.policy !== undefined)) throw new Error("delayBlocks and policy are an upgrade authority's: pass `authority` (an immutable program has neither)");
+    const authority = opts.authority === undefined ? null : programAddressArg(opts.authority, "an upgrade authority");
+    const fuel = await this.programsFor("create", initValue > 0n);
+    const params = await this.client.programParams();
+    const stored = <R extends { uploaded_at: number | null }>(read: () => Promise<R>) => async () => {
+      try {
+        const r = await read();
+        return { stored: r.uploaded_at, found: r };
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 404) return null;
+        throw e;
+      }
+    };
+    // Both blobs usable: stored in an earlier block (the upload may be a block away).
+    const code = await this.waitUsable("the code", waitMs, stored(() => this.client.code(wasm_hash)));
+    const iface = await this.waitUsable("the interface", waitMs, stored(() => this.client.interface(interface_hash)));
+    // The interface says whether it has an initializer (the node's reading of its bytes; the chain enforces it either way).
+    const methods = (iface.untrusted_interface as { methods?: { kind?: unknown }[] } | null)?.methods;
+    if (Array.isArray(methods)) {
+      const declares = methods.some((m) => m?.kind === "init");
+      if (declares && init === undefined) throw new Error("this interface declares an initializer, so the create must run it: pass `init`. Nothing was signed");
+      if (!declares && init !== undefined) throw new Error("this interface declares no initializer, so `init` has none to run. Nothing was signed");
+    }
+    const declared = new Map<string, number>();
+    if (init !== undefined) declared.set(wasm_hash, code.size);
+    const bindings = await this.resolveBindings(opts.bindings ?? [], declared, waitMs);
+    const fuelLimit = init === undefined ? 0n : opts.fuelLimit === undefined ? defaultFuelLimit(fuel, declared) : BigInt(positiveFuel(opts.fuelLimit));
+    const reservation = reserveFuel(fuel, fuelLimit, declared);
+    const delay = authority === null ? 0 : opts.delayBlocks ?? params.min_upgrade_delay_blocks;
+    if (authority !== null && (!Number.isSafeInteger(delay) || delay < params.min_upgrade_delay_blocks)) throw new Error(`delayBlocks ${delay} is below program_min_upgrade_delay_blocks (${params.min_upgrade_delay_blocks}): an upgradable program gives at least that much notice. Nothing was signed`);
+    const policy: ProgramPolicy = authority === null ? "open" : opts.policy ?? "open";
+    if (policy !== "open" && policy !== "additive") throw new Error(`policy is "open" or "additive", not ${JSON.stringify(policy)}`);
+    const record = programRecordDeposit(fuel, params);
+    if (record === null) throw new Error("program state is full: nothing more can be stored at any price. Nothing was signed");
+    const storageLimit = opts.storageLimit === undefined ? depositWithMargin(record) : checkedDrops(parseFang(opts.storageLimit), "storageLimit");
+    if (storageLimit < record) throw new Error(`storageLimit ${formatFang(storageLimit)} is below the record deposit ${formatFang(record)} at today's price: the create would fail and still be charged its fee. Nothing was signed`);
+    const action: Action = {
+      type: "create_program",
+      wasm_hash,
+      interface_hash,
+      authority,
+      upgrade_delay_blocks: delay,
+      policy,
+      accepts_transfers: opts.acceptsTransfers === true,
+      init: init === undefined ? null : { method: initMethod as string, input: programInputArg(init.input ?? ""), value: initValue.toString() },
+      fuel_limit: Number(fuelLimit),
+      storage_limit: storageLimit.toString(),
+      bindings,
+    };
+    const { tx, receipt, cost, signed } = await this.sendProgram("create", action, reservation, opts, storageLimit);
+    // The address this transaction makes is its sender's and its nonce's: what the receipt names must be that one.
+    let what = `the create (tx ${tx.id})`;
+    return this.finalThen(() => what, async () => {
+      const address = programAddress(signed.from, signed.nonce, await this.client.addressPrefix());
+      what = `the create (tx ${tx.id}), which made ${address},`;
+      if (receipt.facts.created !== address) throw new ProgramAnswerError(this.client.rpc, `GET /api/tx/${tx.id}`, "program.facts.created", `names ${String(receipt.facts.created)}, not ${address}, the program this create makes`);
+      await this.waitPast(tx.height, waitMs, "the create");
+      const program = await this.client.program(address);
+      if (program.code.wasm_hash !== wasm_hash || program.code.interface_hash !== interface_hash) throw new ProgramAnswerError(this.client.rpc, `GET /api/program/${address}`, "code", "isn't the code and interface this create named");
+      return { address, program, tx, receipt, cost };
+    });
+  }
+
+  /**
+   * Calls programs: 1 to 8 calls run in order, all or nothing, sharing `fuelLimit` (default
+   * `program_max_tx_fuel`) and `storageLimit` (FANG): **the default is 0, which consents to no new
+   * storage**, so a call whose writes bond a deposit traps `storage_limit` and still pays its fee
+   * (`ProgramFailedError` says so): pass a limit for any method that writes.
+   *
+   * Each call binds the `versionDigest` of the program it's calling: when you pass the digest you
+   * showed the user (`ProgramCallInput.versionDigest`) the call is refused if the program's code,
+   * interface or version isn't the one that digest names; without it, it's recomputed from the
+   * program's record (proven against the client's witnesses when it has any), never taken from the
+   * node's `version_digest`. Fuel is priced at the node's suggested rate on what's reserved (fuel to
+   * run, plus the load of the code the calls and `bindings` declare) and refused when no block
+   * could carry it (`FuelReservationError`). Waits for each program to be usable (created a block ago).
+   * The receipt's `claims` are what the programs say happened: the chain checks none of it.
+   */
+  async callProgram(calls: ProgramCallInput[], opts: ProgramCallOptions = {}): Promise<ProgramTxResult> {
+    if (!Array.isArray(calls) || calls.length < 1 || calls.length > MAX_PROGRAM_CALLS) throw new Error(`a call_program runs 1 to ${MAX_PROGRAM_CALLS} calls`);
+    const waitMs = programWaitMs(opts.waitMs);
+    const parsed = calls.map((c, i) => ({
+      program: programAddressArg(c.program, `call ${i + 1}'s program`),
+      method: programMethodArg(c.method),
+      input: programInputArg(c.input ?? ""),
+      value: checkedDrops(parseFang(c.value ?? 0n), `call ${i + 1}'s value`),
+      shown: c.versionDigest === undefined ? undefined : programHashArg(c.versionDigest, `call ${i + 1}'s versionDigest`),
+    }));
+    const fuel = await this.programsFor("call", parsed.some((c) => c.value > 0n));
+    const declared = new Map<string, number>();
+    const read = new Map<string, { info: ProgramInfo; digest: string }>();
+    const signed = [];
+    for (const c of parsed) {
+      let p = read.get(c.program);
+      if (!p) read.set(c.program, (p = await this.programForCall(c.program, waitMs)));
+      if (c.shown !== undefined) shownDigest(c.shown, p.digest, `the program ${c.program}`);
+      declared.set(p.info.code.wasm_hash, p.info.code.size as number);
+      signed.push({ program: c.program, version_digest: p.digest, method: c.method, input: c.input, value: c.value.toString() });
+    }
+    const bindings = await this.resolveBindings(opts.bindings ?? [], declared, waitMs);
+    const fuelLimit = opts.fuelLimit === undefined ? defaultFuelLimit(fuel, declared) : BigInt(positiveFuel(opts.fuelLimit));
+    const reservation = reserveFuel(fuel, fuelLimit, declared);
+    const storageLimit = opts.storageLimit === undefined ? 0n : checkedDrops(parseFang(opts.storageLimit), "storageLimit");
+    const action: Action = { type: "call_program", calls: signed, fuel_limit: Number(fuelLimit), storage_limit: storageLimit.toString(), bindings };
+    const { tx, receipt, cost } = await this.sendProgram("call", action, reservation, opts, storageLimit);
+    return { tx, receipt, cost };
+  }
+
+  /**
+   * One call: `program`'s `method` (a `call` method of its interface; read a `view` with
+   * `client.view`) with `input` (bytes, or lowercase hex) and `value` FANG attached (only to a
+   * payable method). It reads the program first, so a method its interface doesn't have, a view,
+   * an initializer, or FANG sent to a method that isn't payable is refused before anything is signed
+   * (the chain refuses them too, and charges the fee), and signs its `version_digest`: see `callProgram`,
+   * whose options it takes, including the 0 default of `storageLimit`.
+   */
+  async call(program: string, method: string, input: Uint8Array | string = "", opts: ProgramCallOptions & { value?: Amount; versionDigest?: string } = {}): Promise<ProgramTxResult> {
+    const address = programAddressArg(program);
+    const name = programMethodArg(method);
+    const { info } = await this.programForCall(address, programWaitMs(opts.waitMs));
+    const m = info.methods?.find((x) => x.untrusted_name === name);
+    if (info.methods && !m) throw new Error(`the program's interface has no method ${JSON.stringify(name)}: client.program(${JSON.stringify(address)}) lists them. Nothing was signed`);
+    if (m && m.kind === "view") throw new Error(`${JSON.stringify(name)} is a view: read it with client.view (a transaction can't call it). Nothing was signed`);
+    if (m && m.kind === "init") throw new Error(`${JSON.stringify(name)} is the program's initializer, which runs only when it's created. Nothing was signed`);
+    if (m && !m.payable && checkedDrops(parseFang(opts.value ?? 0n), "value") > 0n) throw new Error(`${JSON.stringify(name)} isn't payable, so the call can't send it FANG. Nothing was signed`);
+    return this.callProgram([{ program: address, method: name, input, value: opts.value, versionDigest: opts.versionDigest }], opts);
+  }
+
+  /**
+   * For a validator: signs a vote to pause programs (tag 69), from the validator's own account with
+   * its key (build the wallet from `validator.key`'s seed and `actAs` nothing: it signs as itself).
+   * Programs pause from the block after f + 1 of the epoch's validators have signed, for days, with
+   * no undo, so check `client.params()`' `programs` section (the live `votes`, `pause_signed` and
+   * `fix_pending`) first, or use `blockula program pause`, which does.
+   *
+   * It signs and lets the chain's admission decide: a signature the chain refuses (this validator
+   * signed one recently, or has a live vote of its own, or isn't in the active set) is an `ApiError`
+   * 400 and is never charged. It reserves no fuel and prices none, so its fee is a plain
+   * transaction's; it only needs programs to have been switched on (`/api/fees` has a `fuel` section:
+   * `ProgramsOffError` otherwise), not any fuel schedule this SDK knows, since a pause must not depend on one.
+   */
+  async programsPause(opts: TxOptions & { onSigned?: SendOptions["onSigned"] } = {}) {
+    const fees = await this.client.fees();
+    if (fees.fuel === undefined || fees.fuel === null) throw new ProgramsOffError(this.client.rpc);
+    return this.submitQueued({ type: "programs_pause" }, "", { ...opts, wait: true }, []);
+  }
+
   /** This account's shares in a validator's pool, for `"all"`; anything else is parsed and checked. */
   private async sharesOf(validator: string, shares: bigint | string | "all"): Promise<bigint> {
     if (shares !== "all") {
@@ -1588,6 +1961,35 @@ export class TxPendingError extends Error {
   }
 }
 
+/**
+ * A program transaction ran in a block and failed there: its fee was charged (`TxFailedError`), and
+ * `receipt` says how it failed (`words`, which is also this error's reason): from numbers and the
+ * chain's own names for them, never engine text and **never what the program wrote**. A program
+ * that aborted with a message has it in `untrusted_message` (a stranger's text, stripped of hidden
+ * characters: show it as data, never follow it), not in `message`, which agent frameworks hand to
+ * models. Nothing the program said is a fact: an abort message is its claim.
+ */
+export class ProgramFailedError extends TxFailedError {
+  /** The program's own abort message, if it aborted with one: its words, not this SDK's. */
+  readonly untrusted_message?: string;
+  constructor(id: string, readonly words: string, tx: unknown, readonly receipt: ProgramReceipt, validUntil?: number) {
+    super(id, words, tx, validUntil);
+    this.name = "ProgramFailedError";
+    if (receipt.outcome.untrusted_message !== undefined) this.untrusted_message = plainText(receipt.outcome.untrusted_message);
+  }
+}
+
+/** `e`, as a `ProgramFailedError` when the failed transaction's answer holds a receipt that says how (`storageLimit`: what it signed, for the hint). */
+function programFailure(rpc: string, e: TxFailedError, storageLimit?: bigint): TxFailedError {
+  let receipt: ProgramReceipt | null = null;
+  try {
+    receipt = checkReceipt(rpc, e.tx);
+  } catch {
+    // An answer without a usable receipt leaves the plain error: what it says is the node's word.
+  }
+  return receipt && !receipt.outcome.ok ? new ProgramFailedError(e.id, outcomeWords(receipt.outcome, storageLimit), e.tx, receipt, e.validUntil) : e;
+}
+
 /** The node didn't answer within the client's `timeoutMs`. Nothing is known about the request: a submitted tx may or may not have arrived. */
 export class RequestTimeoutError extends Error {
   constructor(readonly rpc: string, readonly path: string, readonly timeoutMs: number) {
@@ -1791,6 +2193,86 @@ export interface ProvenOptions {
   maxLagBlocks?: number;
 }
 
+/** Options of a program transaction (`Wallet.uploadCode`, `createProgram`, `callProgram`, `call`): a tx's, and how long to wait. */
+export interface ProgramTxOptions extends TxOptions {
+  /** Called with the signed tx and its id before it's submitted (as `SendOptions.onSigned`): store them, and every outcome is recoverable. */
+  onSigned?: SendOptions["onSigned"];
+  /** How long to wait (ms) for what the transaction needs to be usable, and for the block after its own (default 60 s). */
+  waitMs?: number;
+}
+
+/** What `callProgram` and `call` take beyond a tx's options. */
+export interface ProgramCallOptions extends ProgramTxOptions {
+  /** Fuel to run the calls, at most `program_max_tx_fuel` (default that). Reserved fuel is paid for and never refunded. */
+  fuelLimit?: number;
+  /** The most the calls' storage deposits may bond (FANG). Default 0: no new storage; a method that writes needs a limit. */
+  storageLimit?: Amount;
+  /** Programs the calls may reach besides their own. */
+  bindings?: ProgramBindingInput[];
+}
+
+/** A program the transaction may reach: by address, at the version digest given, or the version in force now when none is (`ANY_PROGRAM_VERSION` for any). */
+export interface ProgramBindingInput {
+  program: string;
+  versionDigest?: string;
+}
+
+/** One call of `callProgram`. */
+export interface ProgramCallInput {
+  /** The program's address, never a name. */
+  program: string;
+  /** A `call` method of its interface. */
+  method: string;
+  /** What the method reads: bytes, or lowercase hex. Default none. */
+  input?: Uint8Array | string;
+  /** FANG sent with the call (only to a payable method). */
+  value?: Amount;
+  /** The version digest the user was shown for this program: the call is refused if the program isn't the one it names. */
+  versionDigest?: string;
+}
+
+/** What a finalized program transaction gave: the node's answer, its checked receipt, and what it cost its signer. */
+export interface ProgramTxResult {
+  tx: any;
+  receipt: ProgramReceipt;
+  cost: ProgramCost;
+}
+
+/** `Wallet.uploadCode`'s result. */
+export interface UploadedCode extends ProgramTxResult {
+  wasmHash: string;
+  interfaceHash: string;
+  /** What this upload bonded (drops): 0 when both were stored already. */
+  deposit: bigint;
+}
+
+/** What `Wallet.createProgram` takes. */
+export interface CreateProgramOptions extends ProgramTxOptions {
+  /** The stored code's hash and the stored interface's (`uploadCode` returns them). */
+  wasmHash: string;
+  interfaceHash: string;
+  /** Run the interface's `Init` method as the program is created (present exactly when the interface has one). */
+  init?: { method: string; input?: Uint8Array | string; value?: Amount };
+  /** Fuel for the initializer, at most `program_max_tx_fuel` (default that). */
+  fuelLimit?: number;
+  /** The most the record's deposit and the initializer's writes may bond (FANG; default the record's deposit plus 10%). */
+  storageLimit?: Amount;
+  bindings?: ProgramBindingInput[];
+  /** An account (an address) that may upgrade the program once upgrades exist; without it the program is immutable. */
+  authority?: string;
+  delayBlocks?: number;
+  policy?: ProgramPolicy;
+  /** The program takes plain transfers to its address. */
+  acceptsTransfers?: boolean;
+}
+
+/** `Wallet.createProgram`'s result: the program's address, only once the create has applied. */
+export interface CreatedProgram extends ProgramTxResult {
+  address: string;
+  /** The program as the node reads it a block after the create. */
+  program: ProgramInfo;
+}
+
 /** A record proven against a state root, and the newest head height that root was checked against. */
 export type ProvenRead = ProvenRecord & { head: number };
 
@@ -1942,16 +2424,25 @@ export class Client {
    * Without witnesses or a genesis clock, the height is the node's word.
    */
   async checkSigningHeight(height: number): Promise<void> {
-    if (this.genesisClock) {
-      const limit = heightLimit(this.genesisClock.createdAtMs, this.genesisClock.blockTimeMs, Date.now());
-      if (height > limit) throw new HeightAheadError(this.rpc, height, limit, "this machine's clock and the chain's genesis");
-    }
+    this.checkHeightClock(height);
     if (!this.witnesses.length) return;
     const heads = await Promise.all(this.witnesses.map((w) => w.status().then((s) => (Number.isSafeInteger(s.height) && s.height >= 0 ? (s.height as number) : undefined), () => undefined)));
     const silent = this.witnesses.filter((_, i) => heads[i] === undefined);
     if (silent.length) throw new Error(`${silent.map((w) => w.rpc).join(", ")} didn't report ${silent.length === 1 ? "its height" : "their heights"}, so ${this.rpc}'s height ${height} can't be checked against every witness: nothing was signed`);
     const lowest = Math.min(...(heads as number[]));
     if (height > lowest + this.maxHeadLeadBlocks) throw new HeightAheadError(this.rpc, height, lowest + this.maxHeadLeadBlocks, `the lowest head its witnesses report (#${lowest})`);
+  }
+
+  /**
+   * Refuses (`HeightAheadError`) a height the chain can't have reached by this machine's clock and
+   * the `genesisClock` this client was given: the clock half of `checkSigningHeight`, for heights a
+   * node reports that aren't signed against (a read's, a wait's). Without a `genesisClock` the
+   * height is the node's word.
+   */
+  checkHeightClock(height: number): void {
+    if (!this.genesisClock) return;
+    const limit = heightLimit(this.genesisClock.createdAtMs, this.genesisClock.blockTimeMs, Date.now());
+    if (height > limit) throw new HeightAheadError(this.rpc, height, limit, "this machine's clock and the chain's genesis");
   }
 
   /** The chain's address prefix, asking the node once if it isn't known yet. */
@@ -2121,6 +2612,88 @@ export class Client {
   distribution(id: number) { return this.call(`/distribution/${id}`); }
   /** A multisig account: owners, threshold, open proposals and their approvals. */
   multisig(account: string) { return this.call(`/multisig/${encodeURIComponent(account)}`); }
+
+  // ---- programs (protocol v2, docs/PROGRAMS-V0.md §8.2, §8.4): third-party WebAssembly. Every answer is checked
+  // before it's used (programs.ts), and what a program or its deployer chose is kept as `untrusted_*`. ----
+
+  /**
+   * The chain's fuel prices and program bounds now (`/api/fees`' `fuel` section), checked.
+   * `ProgramsOffError` when programs have never been switched on there (the section is absent).
+   */
+  async programFuel(): Promise<ProgramFuel> {
+    return checkFuel(this.rpc, (await this.fees()).fuel);
+  }
+
+  /** The programs parameters a deposit is priced with (`/api/params`' `programs` section), checked. */
+  async programParams(): Promise<ProgramParams> {
+    return checkParams(this.rpc, (await this.params()).programs);
+  }
+
+  /**
+   * A program by its address (never a name): its record, the version digest a call binds (recomputed
+   * from its code, interface and version: a node whose digest isn't what those compute is refused),
+   * who could upgrade it, what it holds and its methods, whose names are the deployer's
+   * (`untrusted_name`). One node's word (`proven: false`): `provenProgram` proves the record itself.
+   */
+  async program(address: string): Promise<ProgramInfo> {
+    programAddressArg(address);
+    return checkProgram(this.rpc, address, await this.call(`/program/${address}`), (h) => this.checkHeightClock(h));
+  }
+
+  /**
+   * A stored code by its hash: its size, who uploaded it and for what deposit, how many programs use
+   * it, when it was stored (usable from the block after) and its exported methods (`untrusted_exports`).
+   * With `wasm`, the code itself too, checked to hash to what was asked for.
+   */
+  async code(hash: string, opts: { wasm?: boolean } = {}): Promise<ProgramCodeInfo> {
+    programHashArg(hash, "a code hash");
+    return checkCode(this.rpc, hash, await this.call(`/code/${hash}${opts.wasm ? "?wasm=1" : ""}`), opts.wasm === true, (h) => this.checkHeightClock(h));
+  }
+
+  /**
+   * A stored interface by its hash: its format-1 bytes (checked to hash to what was asked for) and
+   * the node's JSON reading of them (`untrusted_interface`, every name the deployer's, not checked
+   * against the bytes: this SDK has no interface decoder yet).
+   */
+  async interface(hash: string): Promise<ProgramInterfaceInfo> {
+    programHashArg(hash, "an interface hash");
+    return checkInterface(this.rpc, hash, await this.call(`/interface/${hash}`), (h) => this.checkHeightClock(h));
+  }
+
+  /**
+   * Runs a program's `view` method on the node, as of its newest block: nothing is signed or paid.
+   * `input` is what the method reads (bytes, or lowercase hex); `bindings` name the other programs
+   * it may reach (a program's address, and the version digest it must be at, or none for "any
+   * version", which a read may take); `fuel` caps the run (the node caps it too). The answer's
+   * `return_data` is the program's own claim, which the chain checks nothing of. Refused views
+   * (`ApiError`: 403 when the node serves none, 429 with `retryAfterMs`, 400/404/422 for a request
+   * the node won't run) never ran.
+   */
+  async view(address: string, method: string, input: Uint8Array | string = "", opts: { bindings?: { program: string; versionDigest?: string }[]; fuel?: number } = {}): Promise<ProgramViewResult> {
+    programAddressArg(address);
+    const body: Record<string, unknown> = {
+      method: programMethodArg(method),
+      input: programInputArg(input),
+      bindings: (opts.bindings ?? []).map((b) => ({ program: programAddressArg(b.program, "a binding"), version_digest: b.versionDigest === undefined ? null : programHashArg(b.versionDigest, "a binding's version digest") })),
+    };
+    if (opts.fuel !== undefined) body.fuel = positiveFuel(opts.fuel);
+    return checkView(this.rpc, address, await this.call(`/program/${address}/view`, body), (h) => this.checkHeightClock(h));
+  }
+
+  /**
+   * A program's record, proven: its Merkle proof (namespace 66) checked against the state root the
+   * node reports, which each of `witnesses` must report too, and fresh (see `provenRecord`).
+   * The record is decoded here and its `version_digest` recomputed from its own fields, so a call
+   * built from it binds the code the chain holds. `null` if the program provably doesn't exist.
+   * Without witnesses it's only as sure as this node (it can't be called proven).
+   */
+  async provenProgram(address: string, opts: ProvenOptions = {}) {
+    programAddressArg(address);
+    const r = await this.provenRecord(NAMESPACES.PROGRAMS, address, opts);
+    if (r.value === null) return null;
+    const rec = decodeProgram(r.value);
+    return { address, ...rec, version_digest: versionDigest(address, rec.wasm_hash, rec.interface_hash, rec.version), witnesses: opts.witnesses?.length ?? 0, height: r.height, root: r.root, head: r.head };
+  }
 
   /** `/api/proof/{namespace}/{key}`, unchecked. Prefer `provenRecord`. */
   proof(namespace: number, key: string | Uint8Array): Promise<ProofResponse> {

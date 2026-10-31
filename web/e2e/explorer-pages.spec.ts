@@ -5,14 +5,14 @@
 // no `javascript:` link), and read v1's rules right: dropped vs failed receipts, tips, names
 // signed as names, expired and reserved names, hunts' cancel rule, staking's groups.
 import type { Tx } from "@blockula/sdk";
-import { HOSTILE, PHONE, seedWorld, type World } from "./explorer-world";
+import { HOSTILE, HOSTILE_ABORT, HOSTILE_EVENT, HOSTILE_METHOD, LONG_KEY, LONG_POP, PHONE, PROGRAM, seedWorld, type World } from "./explorer-world";
 import { RPC } from "./env";
 import { addressOf, VALIDATOR } from "./mock-node";
 import { createWallet, cspViolations, expect, test, watchCsp } from "./helpers";
 import type { Locator, Page } from "@playwright/test";
 
 /** Node reads that answer 404 on purpose (not a multisig, a page about something that isn't there). */
-const EXPECTED_404 = [/\/api\/multisig\//, /\/api\/tx\/0{64}$/, /\/api\/account\/nosuch\.boo$/, /\/api\/hunt\/99$/];
+const EXPECTED_404 = [/\/api\/multisig\//, /\/api\/tx\/0{64}$/, /\/api\/account\/nosuch\.boo$/, /\/api\/hunt\/99$/, /\/api\/program\/boo1[0-9a-z]+$/];
 
 /** Errors the page logs, uncaught exceptions, and node reads that failed unexpectedly, from now on. */
 function watchErrors(page: Page) {
@@ -47,7 +47,7 @@ const receipt = (p: Page) => p.locator(".receipt .headline");
 test("no explorer page server-renders a style attribute (the CSP would block it)", async ({ request, node }) => {
   test.skip(!!process.env.E2E_DEV, "next dev relaxes the CSP");
   const w = seedWorld(node);
-  const paths = ["/explore", `/tx/${w.ids.sent}`, `/tx/${w.ids.dropped}`, "/account/vlad.boo", "/block/101", "/trace/vlad.boo", "/name/castle", "/name/tomb", "/programs", "/programs/hunts", "/programs/validators", "/programs/pool", "/programs/names", "/programs/accounts", "/hunt/0", "/claim/1", "/seance/2", "/governance"];
+  const paths = ["/explore", `/tx/${w.ids.sent}`, `/tx/${w.ids.dropped}`, "/account/vlad.boo", "/block/101", "/trace/vlad.boo", "/name/castle", "/name/tomb", "/programs", "/programs/hunts", "/programs/validators", "/programs/pool", "/programs/names", "/programs/accounts", "/hunt/0", "/claim/1", "/seance/2", "/governance", `/program/${PROGRAM}`, `/program/${w.wasm_hash}`, `/tx/${w.ids.programCall}`, `/tx/${w.ids.programFailed}`];
   for (const path of paths) {
     const res = await request.get(path);
     expect(res.status(), path).toBe(200);
@@ -98,13 +98,13 @@ test.describe("every explorer page", () => {
       const eyebrow = (p: Page) => p.locator(".receipt .eyebrow");
       for (const [name, id] of Object.entries(w.ids).filter((_, i) => i % PARTS === part)) {
         await visit(page, `/tx/${id}`, receipt, errors);
-        if (["failed", "ranUnseen"].includes(name)) await expect(eyebrow(page), name).toHaveText("Included, but failed");
+        if (["failed", "ranUnseen", "programFailed"].includes(name)) await expect(eyebrow(page), name).toHaveText("Included, but failed");
         else if (name === "dropped") {
           // Not a failure that ran: not final, nothing charged, no red pill (review-r4-wallet-2).
           await expect(eyebrow(page), name).toHaveText("Dropped, not final");
           await expect(page.locator(".receipt .pill"), name).toHaveText(["dropped"]);
         }
-        else if (name === "waiting") await expect(eyebrow(page), name).toHaveText("On its way");
+        else if (["waiting", "programWaiting"].includes(name)) await expect(eyebrow(page), name).toHaveText("On its way");
         else await expect(eyebrow(page), name).toHaveText("Receipt");
         // What was signed is rendered here from the action, never taken from the node's summary.
         if (!["dropped", "ranUnseen"].includes(name)) await expect(page.getByTestId("receipt-signs"), name).toBeVisible();
@@ -226,6 +226,111 @@ test.describe("every explorer page", () => {
     await visit(page, "/seance/2", (p) => p.getByText(/^Sealing votes until block/), errors);
   });
 
+  test("a deployed program, its receipts, and the text its deployer chose", async ({ page, node }) => {
+    // The program's page: what the chain holds (facts) apart from the names its deployer chose (claims, as text).
+    await visit(page, `/program/${PROGRAM}`, (p) => p.getByTestId("program-record"), errors);
+    await expect(page.getByTestId("version-digest")).toContainText(/[0-9a-f]{64}/);
+    await expect(page.getByTestId("upgradability")).toContainText("Immutable: no account can ever change this program's code.");
+    await expect(page.getByRole("heading", { name: "Methods" })).toBeVisible();
+    await expect(page.getByText("named by the deployer").first()).toBeVisible();
+    // A method named `<script>…` is text in a box of its own: no element came of it.
+    await expect(page.getByTestId("methods").locator("code.named", { hasText: HOSTILE_METHOD })).toBeVisible();
+    await expect(page.getByTestId("methods").locator("code.named", { hasText: HOSTILE_EVENT })).toBeVisible();
+    await expect(page.locator("main script, main img")).toHaveCount(0);
+    await expect(page.getByTestId("methods")).toContainText("view: a read, nothing signed");
+    await expect(page.getByTestId("methods")).toContainText("payable");
+    // Its transactions are the calls that named it; a call is read, never made, from here.
+    await expect(page.locator(".ledger-summary", { hasText: "called program" }).first()).toBeVisible();
+    await expect(page.getByRole("button", { name: /^(Sign|Send)/ })).toHaveCount(0);
+    // The code it's made of.
+    await visit(page, `/program/${w.wasm_hash}`, (p) => p.getByTestId("code-record"), errors);
+    await expect(page.getByTestId("exports").locator("code.named", { hasText: HOSTILE_METHOD })).toBeVisible();
+    // Not an address, a hash or a name that's there.
+    await visit(page, "/program/castle.boo", (p) => p.getByRole("heading", { name: "No such program" }), errors);
+    await visit(page, `/program/${addressOf("ee".repeat(32))}`, (p) => p.getByRole("heading", { name: "No such program" }), errors);
+
+    // The receipts: facts the chain applied, then (apart) what the programs said.
+    await visit(page, `/tx/${w.ids.programUpload}`, receipt, errors);
+    await expect(page.getByTestId("program-facts")).toContainText("It applied.");
+    await expect(page.getByTestId("program-outside-vm")).toContainText("59100000 upload deposit");
+    await expect(page.getByTestId("program-claims")).toHaveCount(0);
+    // The raw action, with its code in hex, is cut: hundreds of kilobytes aren't dumped on the page.
+    await page.getByText("What was signed, exactly").click();
+    await expect(page.locator("details.raw pre")).toContainText(/\(\d[\d,]* characters\)/);
+
+    // A v1 action is shown exactly as before, whole: an added key's public key and its proof aren't cut (only a program's blobs are).
+    await visit(page, `/tx/${w.ids.keyAdded}`, receipt, errors);
+    await page.getByText("What was signed, exactly").click();
+    const rawAction = await page.locator("details.raw pre").innerText();
+    expect(rawAction).toBe(JSON.stringify(node.txs.get(w.ids.keyAdded)?.action, null, 2));
+    expect(rawAction).toContain(LONG_KEY);
+    expect(rawAction).toContain(LONG_POP);
+    expect(rawAction).not.toMatch(/\(\d[\d,]* characters\)/);
+
+    await visit(page, `/tx/${w.ids.programCreate}`, receipt, errors);
+    await expect(page.getByTestId("program-created")).toContainText(PROGRAM);
+    await expect(page.getByTestId("program-outside-vm")).toContainText("25600000 record deposit + 100000000 account creation fee (burned)");
+    await expect(page.locator(".changes")).toContainText("Program record deposit, bonded");
+    await expect(page.locator(".changes")).toContainText("fee, record deposit and account-creation fee");
+    await page.getByTestId("program-created").getByRole("link").click();
+    await expect(page.getByTestId("program-record")).toBeVisible();
+
+    await visit(page, `/tx/${w.ids.programCall}`, receipt, errors);
+    await expect(page.getByTestId("program-balance-changes")).toContainText("−0.0128");
+    // A node's junk where an address goes is text, never a link.
+    await expect(page.getByTestId("program-balance-changes").getByRole("link")).toHaveCount(1);
+    await expect(page.getByTestId("program-balance-changes").locator("code.named", { hasText: "javascript:" })).toBeVisible();
+    await expect(page.getByTestId("program-claims-note")).toContainText("checks none of this");
+    const claims = page.getByTestId("program-claims");
+    await expect(claims.locator("code.named", { hasText: HOSTILE_METHOD })).toBeVisible();
+    await expect(claims.locator("code.named", { hasText: HOSTILE_EVENT })).toBeVisible();
+    await expect(claims).toContainText("0x0100000000000000");
+    await expect(claims).toContainText("(200 bytes)");
+    await expect(page.locator("main script, main img")).toHaveCount(0);
+    // What was signed is described from the action's structure, never its method name.
+    await expect(page.getByTestId("receipt-signs")).toContainText("Call program");
+    await expect(page.getByTestId("receipt-signs")).not.toContainText("script");
+
+    // A payout that opened an account: what its program's own send burned is a fact of the receipt, and the ledger counts it.
+    const payout = w.addPayout();
+    await visit(page, `/tx/${payout}`, receipt, errors);
+    await expect(page.getByTestId("program-burned")).toContainText(/0\.1\s*FANG/);
+    await expect(page.getByTestId("program-burned")).toContainText("not the signer's");
+    await expect(page.getByTestId("program-facts")).toContainText("Burned by its programs");
+    await expect(page.locator(".changes")).not.toContainText("don't balance");
+    await visit(page, `/tx/${w.ids.programCall}`, receipt, errors);
+    await expect(page.getByTestId("program-burned")).toHaveCount(0);
+
+    await visit(page, `/tx/${w.ids.programFailed}`, receipt, errors);
+    await expect(page.getByTestId("program-outcome")).toContainText("aborted with code 7");
+    await expect(page.getByTestId("program-outcome")).toContainText("Its fee was charged and nothing else happened.");
+    await expect(page.getByTestId("program-outcome")).not.toContainText("oops");
+    await expect(page.getByTestId("program-claims").locator("code.named", { hasText: HOSTILE_ABORT })).toBeVisible();
+    await expect(page.locator(".changes")).toContainText("fee (the action failed)");
+
+    await visit(page, `/tx/${w.ids.programWaiting}`, receipt, errors);
+    await expect(page.getByTestId("program-facts")).toContainText("It hasn't run yet");
+
+    // The programs page lists it beside the built-in ones; its account page says it's a program.
+    await visit(page, "/programs", (p) => p.getByRole("heading", { name: "Programs anyone deployed" }), errors);
+    // The page says what it lists: the creates in a window of recent blocks, not every program.
+    await expect(page.locator('section[aria-labelledby="deployed-heading"] .sub')).toContainText("programs created in a window of recent blocks");
+    const card = page.getByTestId("deployed-card").first();
+    await expect(card).toBeVisible();
+    await expect(card.locator("code.named", { hasText: HOSTILE_METHOD })).toBeVisible();
+    await expect(page.locator("main script, main img")).toHaveCount(0);
+    await card.click();
+    await expect(page.getByTestId("program-record")).toBeVisible();
+    await visit(page, `/account/${PROGRAM}`, (p) => p.getByTestId("is-a-program"), errors);
+    await page.getByTestId("is-a-program").click();
+    await expect(page.getByTestId("program-record")).toBeVisible();
+    // Typing an address opens it.
+    await visit(page, "/programs", (p) => p.getByRole("search", { name: "Open a program or code" }), errors);
+    await page.getByLabel("Open a program by its address, or a code by its hash").fill(PROGRAM);
+    await page.getByRole("button", { name: "Open", exact: true }).click();
+    await expect(page.getByTestId("program-record")).toBeVisible();
+  });
+
   test("the command palette finds names, accounts and transactions", async ({ page }) => {
     await visit(page, "/explore", (p) => p.getByRole("heading", { name: "blockula-testnet, live" }), errors);
     await page.keyboard.press("Control+k");
@@ -235,6 +340,9 @@ test.describe("every explorer page", () => {
     await expect(search.getByText("castle.boo").first()).toBeVisible();
     await search.getByRole("textbox", { name: "Search" }).fill(w.ids.sent);
     await expect(search.getByText(/Transaction|transaction/).first()).toBeVisible();
+    // A program by its address.
+    await search.getByRole("textbox", { name: "Search" }).fill(PROGRAM);
+    await expect(search.getByText(/^Program boo1/).first()).toBeVisible();
     expect(await cspViolations(page)).toEqual([]);
     expect(errors).toEqual([]);
   });

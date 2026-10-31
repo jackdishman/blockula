@@ -88,6 +88,104 @@ export interface TxDetail {
   memo?: string;
   action?: { type: string; [k: string]: unknown };
   signature_scheme?: string;
+  /**
+   * A program transaction's receipt (protocol v2, tags 62–64): facts the chain applied apart from
+   * claims the programs made. `null` when none is to be shown (still pending, or its block pruned
+   * from this node); absent on every other transaction. Read tolerantly, like the rest.
+   */
+  program?: ProgramSection | null;
+}
+
+/** How a program transaction ended (docs/PROGRAMS-V0.md §8.1): numbers, and a program's own abort message (its words). */
+export interface ProgramOutcome {
+  ok: boolean;
+  code?: string;
+  number?: number;
+  program?: string;
+  trap?: { number: number; name: string };
+  abort_code?: number;
+  /** A program's own message: text a stranger wrote. */
+  untrusted_message?: string;
+  commit_error?: number;
+  cap?: string;
+  control?: string;
+  rule?: { number: number; name: string };
+  func?: number;
+  offset?: number;
+}
+
+/** `/api/tx`'s `program` section (node/src/programs/tx_json.rs): facts, then claims. Amounts are decimal strings of drops. */
+export interface ProgramSection {
+  version: number;
+  kind: "upload" | "create" | "call" | string;
+  outcome: ProgramOutcome;
+  facts: {
+    /** The VM's diff, net per account (a signed decimal string): not the fee, not what left outside the VM. */
+    balance_changes: { account: string; change: string }[];
+    storage: { bytes_delta: number; bonded: string; refunded: string };
+    /** What the signer was debited outside the VM's diff: deposits, and the account creation fee a create burns. */
+    outside_vm: { record_deposit: string; upload_deposit: string; account_creation_fee: string; total: string };
+    /** What the VM's diff burned: the creation fees of the accounts its programs' own sends opened, out of the programs' balances (absent on a node that predates it). */
+    burned_by_programs?: string;
+    fuel: { limit: number; load: number; used: number; reserved: number; rate: number };
+    fee: { bytes: string; fuel: string; tip: string };
+    created: string | null;
+    upload: { wasm_hash: string; interface_hash: string; new_code: boolean; new_interface: boolean; deposit: string } | null;
+  };
+  claims: {
+    /** What each call returned: the program's claim, under a method name its deployer chose. */
+    return_data: { program: string; untrusted_method: string; value: string; data: string }[];
+    events: { program: string; untrusted_name: string; data: string }[];
+    omitted: { events: number; event_bytes: number; return_bytes: number } | null;
+  };
+}
+
+/** One method of a deployed program's interface (`/api/program/{address}`): its names are the deployer's. */
+export interface ProgramMethodView {
+  untrusted_name: string;
+  selector: string;
+  kind: "call" | "view" | "init" | string;
+  payable: boolean;
+  args: { untrusted_name: string; type: unknown }[];
+  returns: unknown;
+}
+
+/** `/api/program/{address}`: a deployed program's record and what follows from it. */
+export interface DeployedProgramView {
+  address: string;
+  creator: Label;
+  created_at: number;
+  code: { wasm_hash: string; size: number | null; interface_hash: string };
+  version: number;
+  /** What a call to it binds. */
+  version_digest: string;
+  authority: Label | null;
+  upgrade_delay_blocks: number;
+  policy: string;
+  /** The node's sentence about who may upgrade it. */
+  upgradability: string;
+  accepts_transfers: boolean;
+  balance: string;
+  balance_display: string;
+  storage: { items: number; bytes: number; deposit: string; sponsored: string };
+  record_deposit: string;
+  record_payer: Label;
+  methods: ProgramMethodView[] | null;
+  proof_path: string;
+  height: number;
+}
+
+/** `/api/code/{hash}`: a stored code. */
+export interface StoredCodeView {
+  wasm_hash: string;
+  size: number;
+  untrusted_exports: string[];
+  uploader: Label | null;
+  deposit: string | null;
+  refs: number | null;
+  uploaded_at: number | null;
+  last_used_at: number | null;
+  height: number;
 }
 
 export interface HuntView {
@@ -238,6 +336,8 @@ export interface AccountDetail {
   hunts_created: number[];
   hunts_won: { id: number; repo: string; issue: number; amount_display: string; pr: number; self_awarded: boolean }[];
   contribution: ContributionProfile | null;
+  /** Present only on a program's own account (protocol v2): what it is, and where its record is served. */
+  program?: { creator: Label; created_at: number; version_digest: string; upgradability: string; accepts_transfers: boolean; link: string };
 }
 
 /**

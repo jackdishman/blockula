@@ -51,7 +51,7 @@ import { AccountLocks, NonceTracker } from "./locks.js";
 import { PIN_FILE, REPO, RELEASE_KEY_ID, binPaths, checkBinaryVersion, fetchVerifiedRelease, latestTagFrom, pickNodeBinary, readReleasePin, releaseKeyIdFrom, type NodeBinary } from "./release.js";
 import { SignedTxs, onChain, type SignedTx } from "./signed.js";
 import { SpendLedger, chainKey } from "./spend.js";
-import { SERVER_INSTRUCTIONS, UNTRUSTED_NOTE, chainData, clean } from "./untrusted.js";
+import { PROGRAM_NOTE, SERVER_INSTRUCTIONS, UNTRUSTED_NOTE, chainData, clean, codeView, programView, provenDifferences, viewView } from "./untrusted.js";
 
 const HOME = process.env.BLOCKULA_HOME ?? join(homedir(), ".blockula");
 const WALLET_FILE = join(HOME, "agent-wallet.json");
@@ -533,7 +533,7 @@ async function requireWallet(): Promise<Wallet> {
 }
 
 /** How clients show and gate each tool (AGENT-9): reads are read-only; what signs moves FANG (fees at least) on a public chain. */
-const READS = new Set(["status", "tx_status", "wallet_info", "check_name", "lookup", "latest_blocks", "my_stake", "list_proposals", "list_hunts", "contribution_pool", "my_contributions"]);
+const READS = new Set(["status", "tx_status", "wallet_info", "check_name", "lookup", "latest_blocks", "my_stake", "list_proposals", "list_hunts", "contribution_pool", "my_contributions", "program_show", "program_view", "program_code"]);
 const MOVES = new Set(["send", "stake", "unstake", "withdraw_stake", "vote", "register_name", "renew_name", "fund_hunt", "submit_contribution", "link_github"]);
 const TITLES: Record<string, string> = {
   status: "Network status", tx_status: "Transaction status", start_dev_node: "Start a dev chain", install_node: "Install the node", summon_chain: "Create a chain",
@@ -541,6 +541,7 @@ const TITLES: Record<string, string> = {
   check_name: "Check a name", register_name: "Register a name", renew_name: "Renew a name", lookup: "Look up", latest_blocks: "Latest blocks",
   stake: "Stake FANG", unstake: "Unstake FANG", withdraw_stake: "Withdraw unbonded stake", my_stake: "My stake", list_proposals: "Governance proposals", vote: "Vote",
   list_hunts: "Hunts", link_github: "Link GitHub", fund_hunt: "Fund a Hunt", contribution_pool: "Contribution pool", submit_contribution: "Claim a contribution", my_contributions: "My contributions",
+  program_show: "Show a program", program_view: "Run a program's view", program_code: "Show a program's code",
 };
 const annotationsOf = (name: string) =>
   READS.has(name)
@@ -1184,18 +1185,66 @@ tool("renew_name", "Extend a .boo name the account this agent acts for owns, by 
   return txResult(await submitCapped(w, { type: "renew_name", name: n, years }, { amount: cost, outflow: cost, what: "the renewal" }), { cost: formatFang(cost), paid_to: "the treasury", ...(typeof info?.expires_at === "number" ? { expired_at_before: info.expires_at } : {}) });
 });
 
-const LOOKUP_TYPES = new Set(["block", "tx", "account", "name"]);
+const LOOKUP_TYPES = new Set(["block", "tx", "account", "name", "program", "code"]);
 
-tool("lookup", `Look up anything — a .boo name, address, block number/hash or tx id — and get a plain-English explanation. ${UNTRUSTED_NOTE}`, { query: z.string() }, async ({ query }) => {
+tool("lookup", `Look up anything — a .boo name, address, block number/hash, tx id, program address or stored code hash — and get a plain-English explanation. ${UNTRUSTED_NOTE}`, { query: z.string() }, async ({ query }) => {
   const client = await chain();
   const hit = await client.search(query);
   const type = String(hit?.type ?? "");
   const id = String(hit?.id ?? "");
   if (!LOOKUP_TYPES.has(type)) throw new Error(`nothing found for ${clean(query, 100)}`);
+  // A program or a stored code is read by the SDK, which checks it, and shown through untrusted.ts (never the node's JSON as is).
+  if (type === "program" || type === "code") {
+    const data = type === "program" ? await programShown(client, id) : codeView(await client.code(id));
+    return { type, ...(type === "program" ? { explorer: explorer(`program/${encodeURIComponent(id)}`) } : {}), data, note: PROGRAM_NOTE };
+  }
   const data = type === "block" ? await client.block(id) : type === "tx" ? await client.tx(id) : type === "account" ? await client.account(id) : await client.name(id);
   // The node's JSON is nested (it can't override `type` or `explorer`), cleaned and labeled.
   return { type, explorer: explorer(`${type}/${encodeURIComponent(id)}`), data: chainData(data), note: UNTRUSTED_NOTE };
 });
+
+// ---- programs (docs/PROGRAMS-V0.md §8.5): third-party WebAssembly, read only. No tool here signs a program transaction: an agent's
+// calls need the confirmation flow of PRG 11.5 (the user is asked, an allowlist), a later release. What a program or its deployer
+// chose reaches the agent only as untrusted_* (untrusted.ts), and no description below holds any of it. ----
+
+/**
+ * A program as `program_show` shows it. With BLOCKULA_WITNESSES its record is proven (its Merkle proof against the witnesses' state
+ * roots), and so is its account's balance: the result is built from what was proven, and the node's own reading must agree with the
+ * proof on every field no transaction changes (`provenDifferences`), else it's refused. What isn't proven (methods and types, the code's
+ * size, the names beside addresses) is the node's word, and the result says so. Without witnesses it's all one node's word, checked
+ * for consistency by the SDK (its version digest is the one its own code, interface and version compute), and says so.
+ */
+async function programShown(client: Client, address: string): Promise<Record<string, unknown>> {
+  const info = await client.program(address);
+  if (!client.witnesses.length) return programView(info);
+  const witnesses = client.witnesses;
+  const record = await client.provenProgram(address, { witnesses });
+  if (!record) throw new Error(`${address} isn't a program: its record is provably absent against ${witnesses.length} witness(es), whatever ${RPC} says`);
+  const odd = provenDifferences(info, record);
+  if (odd.length) throw new Error(`${RPC} and its witnesses disagree about the program at ${address}: ${odd.join("; ")}. Nothing it said was used`);
+  // The balance, proven at its own block (a program holds an account from its create on; none proves 0).
+  const account = await client.provenRecord(NAMESPACES.ACCOUNTS, address, { witnesses });
+  return programView(info, { record, balance: { drops: (account.value === null ? 0n : decodeAccount(account.value).balance).toString(), height: account.height }, witnesses: witnesses.length });
+}
+
+tool("program_show", "A program on this chain by its address (never a .boo name): its record (who created it and when, its code and interface hashes, its version), who could upgrade it, what it holds and stores, its methods (kinds and types as the chain enforces them; the names are the deployer's) and the version digest a call binds. Read only: this MCP signs no program transaction. Every program-chosen name is an untrusted_* field. " + PROGRAM_NOTE, { address: z.string().describe("the program's address (boo1… or tboo1…)") }, async ({ address }) => {
+  const client = await chain();
+  return { ...(await programShown(client, address)), explorer: explorer(`program/${encodeURIComponent(address)}`) };
+});
+
+tool("program_view", "Run a program's read-only (`view`) method on the node, as of its newest block: nothing is signed, sent or paid. Returns what the method returned as the program's own claim (untrusted_return_data, hex), or how it failed (numbers, never engine text). A method that changes state is a transaction, which this MCP doesn't sign. Some nodes serve no views (403) and each client may run 60 a minute (429). " + PROGRAM_NOTE, {
+  address: z.string().describe("the program's address (boo1… or tboo1…)"),
+  method: z.string().regex(/^[a-z][a-z0-9_]{0,31}$/).describe("a `view` method of its interface (see program_show)"),
+  input: z.string().regex(/^([0-9a-f]{2})*$/).max(65536).default("").describe("what the method reads, lowercase hex of whole bytes (default none)"),
+  bindings: z.array(z.object({ program: z.string(), version_digest: z.string().regex(/^[0-9a-f]{64}$/).optional() })).max(16).default([]).describe("other programs the view may reach, by address and the version digest they must be at (none: any version, which a read may take)"),
+  fuel: z.number().int().min(1).optional().describe("the most fuel the view may use (the node caps it too)"),
+}, async ({ address, method, input, bindings, fuel }) => {
+  const client = await chain();
+  const v = await client.view(address, method, input, { bindings: bindings.map((b) => ({ program: b.program, versionDigest: b.version_digest })), fuel });
+  return viewView(address, method, v, RPC);
+});
+
+tool("program_code", "A stored program code by its hash (a program's `code.wasm_hash`): its size, the methods its exported functions carry (untrusted_exports: the deployer's names), who uploaded it and for what deposit, how many programs use it and from which block it's usable. Read only. The code's bytes aren't returned. " + PROGRAM_NOTE, { hash: z.string().regex(/^[0-9a-f]{64}$/).describe("64 lowercase hex characters") }, async ({ hash }) => codeView(await (await chain()).code(hash)));
 
 tool("latest_blocks", "The most recent blocks, summarized.", { limit: z.number().int().min(1).max(50).default(10) }, async ({ limit }) => {
   const blocks = await (await chain()).blocks(limit);

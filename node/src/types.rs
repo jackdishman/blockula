@@ -1,5 +1,7 @@
 use crate::crypto;
 use anyhow::{anyhow, bail, Context, Result};
+use blockula_vm::config::{MAX_BINDINGS, MAX_CALLS, MAX_CODE_BYTES, MAX_INPUT, MAX_INTERFACE_BYTES};
+use blockula_vm::meter::MAX_TX_FUEL;
 use serde::{Deserialize, Serialize};
 
 /// 1 FANG = 10^9 drops 🩸
@@ -295,6 +297,52 @@ pub enum Action {
     /// validator admit`; nodes never send it). A newcomer into a set of one or two needs a
     /// quorum of the members it joins. Once per member and epoch.
     AdmitValidator { validator: String, epoch: u64 },
+
+    // ---- Programs (tags 62–64 and 69, protocol v2; programs/, docs/PROGRAMS-V0.md §2). Dormant
+    // until governance switches the `programs` feature on: until then admission refuses every one
+    // of them (`programs::status`). Tags 65–68 and 70 keep the meanings docs/PROGRAMS.md gives
+    // them but aren't decoded in v0 ("unknown action tag"). None of them nests in a multisig
+    // proposal. Addresses only, never names. ----
+    /// Upload a program's code (WebAssembly) and its interface (format 1, `blockula_vm::interface`),
+    /// bonding a deposit for each that isn't stored yet, at most `storage_limit` drops. The code is
+    /// usable from the block after.
+    UploadCode {
+        wasm: HexBytes,
+        interface: HexBytes,
+        #[serde(with = "u64_str")]
+        storage_limit: u64,
+    },
+    /// Create a program from stored code and interface (named by their hashes). Its address
+    /// derives from the sender and this tx's nonce (`programs::digest::program_address`).
+    /// `authority`, `upgrade_delay_blocks` and `policy` are stored with no power until program
+    /// upgrades exist (a later protocol version); a program without an authority is immutable.
+    /// `init` runs the interface's `Init` method, present exactly when the interface declares one.
+    CreateProgram {
+        wasm_hash: String,
+        interface_hash: String,
+        authority: Option<String>,
+        upgrade_delay_blocks: u64,
+        policy: ProgramPolicy,
+        accepts_transfers: bool,
+        init: Option<InitCall>,
+        fuel_limit: u64,
+        #[serde(with = "u64_str")]
+        storage_limit: u64,
+        bindings: Vec<Binding>,
+    },
+    /// Call programs: 1–8 calls run in order, all or nothing, sharing `fuel_limit` and
+    /// `storage_limit` (the most their deposits may bond). Code a call reaches is the calls' own
+    /// programs and `bindings`.
+    CallProgram {
+        calls: Vec<ProgramCall>,
+        fuel_limit: u64,
+        #[serde(with = "u64_str")]
+        storage_limit: u64,
+        bindings: Vec<Binding>,
+    },
+    /// An active validator (from its own account or its owner's) votes to pause programs; they
+    /// pause once f + 1 of the epoch's validators have.
+    ProgramsPause {},
 }
 
 /// What a `Propose` asks for: every former admin lever, plus parameters, spending, upgrades and
@@ -642,6 +690,154 @@ impl GhostBundle {
     }
 }
 
+/// The header every uploaded program's code starts with: the WebAssembly binary magic
+/// (`\0asm`) and version 1 (docs/PROGRAMS-V0.md §2.2).
+pub const WASM_HEADER: [u8; 8] = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+/// Longest method name: an identifier, `[a-z][a-z0-9_]{0,31}` (`blockula_vm::abi::is_ident`).
+pub const MAX_METHOD: usize = 32;
+
+/// What a `CreateProgram`'s authority may later do to it, once program upgrades exist (inert in
+/// v0): replace its code freely (`open`), or only with code whose interface keeps every method
+/// (`additive`). An immutable program (no authority) is `open`, its one encoding. Byte 0 or 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramPolicy {
+    Open,
+    Additive,
+}
+
+impl ProgramPolicy {
+    fn byte(self) -> u8 {
+        match self {
+            ProgramPolicy::Open => 0,
+            ProgramPolicy::Additive => 1,
+        }
+    }
+
+    fn decode(r: &mut Reader) -> Result<ProgramPolicy> {
+        match r.u8()? {
+            0 => Ok(ProgramPolicy::Open),
+            1 => Ok(ProgramPolicy::Additive),
+            p => bail!("unknown program policy {p}"),
+        }
+    }
+}
+
+/// A `CreateProgram`'s initializer: the interface's `Init` method, its input and the FANG it's
+/// sent (drops; only if the method is payable). Wire form: `str method ‖ bytes input ‖ u64 value`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InitCall {
+    pub method: String,
+    pub input: HexBytes,
+    #[serde(with = "u64_str")]
+    pub value: u64,
+}
+
+impl InitCall {
+    fn check(&self) -> Result<()> {
+        check_method(&self.method)?;
+        if self.input.0.len() > MAX_INPUT {
+            bail!("`init.input` too long ({} bytes, max {MAX_INPUT})", self.input.0.len());
+        }
+        Ok(())
+    }
+}
+
+/// One call of a `CallProgram`: a program (by address), the version of it the signer previewed
+/// (`programs::digest::version_digest`; never 64 zeros), a method of kind `Call`, its input and
+/// the FANG it's sent (drops; only if the method is payable). Wire form: `addr program ‖ hex64
+/// version_digest ‖ str method ‖ bytes input ‖ u64 value`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProgramCall {
+    pub program: String,
+    pub version_digest: String,
+    pub method: String,
+    pub input: HexBytes,
+    #[serde(with = "u64_str")]
+    pub value: u64,
+}
+
+impl ProgramCall {
+    fn encode(&self, out: &mut Vec<u8>) {
+        put_str(out, &self.program);
+        put_str(out, &self.version_digest);
+        put_str(out, &self.method);
+        put_bytes(out, &self.input.0);
+        put_u64(out, self.value);
+    }
+
+    fn decode(r: &mut Reader) -> Result<ProgramCall> {
+        Ok(ProgramCall { program: r.str("program", MAX_ADDRESS)?, version_digest: r.str("version_digest", HEX_32)?, method: r.str("method", MAX_METHOD)?, input: HexBytes(r.bytes("input", MAX_INPUT)?), value: r.u64()? })
+    }
+
+    fn check(&self) -> Result<()> {
+        check_address("program", &self.program)?;
+        check_hex_32("version_digest", &self.version_digest)?;
+        if self.version_digest == hex::encode(blockula_vm::exec::ANY_VERSION) {
+            bail!("a call names the version of its program it was shown: its version_digest can't be 64 zeros (only a binding's may)");
+        }
+        check_method(&self.method)
+    }
+}
+
+/// A program a program transaction's code may reach besides its calls' own (the declared set):
+/// by address, at the version digest given, or at any version for 64 zeros. Wire form: `addr
+/// program ‖ hex64 version_digest`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Binding {
+    pub program: String,
+    pub version_digest: String,
+}
+
+/// A program action's bindings: a u8 count, then each.
+fn put_bindings(out: &mut Vec<u8>, bindings: &[Binding]) {
+    out.push(bindings.len() as u8);
+    for b in bindings {
+        put_str(out, &b.program);
+        put_str(out, &b.version_digest);
+    }
+}
+
+/// At most `MAX_BINDINGS` bindings, each an address and a 32-byte hex digest, naming distinct
+/// programs and none of `calls`' (a call's program is declared already).
+fn check_bindings(bindings: &[Binding], calls: &[ProgramCall]) -> Result<()> {
+    if bindings.len() > MAX_BINDINGS {
+        bail!("at most {MAX_BINDINGS} bindings, not {}", bindings.len());
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for b in bindings {
+        check_address("bindings.program", &b.program)?;
+        check_hex_32("bindings.version_digest", &b.version_digest)?;
+        if !seen.insert(b.program.as_str()) {
+            bail!("each binding names a different program");
+        }
+        if calls.iter().any(|c| c.program == b.program) {
+            bail!("a binding can't name a program one of the calls names (it's declared already)");
+        }
+    }
+    Ok(())
+}
+
+/// A method name: an identifier.
+fn check_method(method: &str) -> Result<()> {
+    if !blockula_vm::abi::is_ident(method) {
+        bail!("a method name must be an identifier: [a-z][a-z0-9_]{{0,31}}");
+    }
+    Ok(())
+}
+
+/// The fuel a program transaction that runs code reserves: 1 to `meter::MAX_TX_FUEL`, the code
+/// bound of the `program_max_tx_fuel` parameter (which admission holds it to).
+fn check_fuel_limit(fuel_limit: u64) -> Result<()> {
+    if fuel_limit == 0 || fuel_limit > MAX_TX_FUEL {
+        bail!("fuel_limit must be 1–{MAX_TX_FUEL}, not {fuel_limit}");
+    }
+    Ok(())
+}
+
 /// `hex::decode`, answering canonical lowercase hex (the only kind a tx that passes
 /// `check_format` carries) without it: [`crypto::decode_lower_hex`] gives the same bytes, and
 /// anything else goes to `hex::decode` for its bytes or its error.
@@ -653,8 +849,9 @@ fn decode_hex(h: &str) -> Result<Vec<u8>, hex::FromHexError> {
 }
 
 /// Strings carry a u16 length. Longer ones can't occur in a valid tx: `check_format` caps the
-/// whole tx at `MAX_TX_BYTES` (counted on the real lengths) before anything relies on them.
-fn put_str(out: &mut Vec<u8>, s: &str) {
+/// whole tx at `MAX_TX_BYTES` (counted on the real lengths) before anything relies on them. (A
+/// program's version digest hashes its address as this writes it, `programs::digest`.)
+pub(crate) fn put_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(&(s.len() as u16).to_le_bytes());
     out.extend_from_slice(s.as_bytes());
 }
@@ -675,6 +872,13 @@ fn put_strs(out: &mut Vec<u8>, xs: &[String]) {
     for x in xs {
         put_str(out, x);
     }
+}
+
+/// Raw bytes with a u32 length (a program's code, interface and inputs). `check_format` bounds
+/// every such field far below 4 GiB.
+fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+    out.extend_from_slice(b);
 }
 
 /// Bounds-checked cursor over a tx's wire bytes (the inverse of `put_*`).
@@ -744,6 +948,31 @@ impl<'a> Reader<'a> {
             bail!("`{field}` has too many entries ({n}, max {max})");
         }
         (0..n).map(|_| self.str(field, max_len)).collect()
+    }
+
+    /// Bytes with a u32 length (`put_bytes`), at most `max`: a longer length is refused before
+    /// anything is taken.
+    fn bytes(&mut self, field: &str, max: usize) -> Result<Vec<u8>> {
+        let len = self.u32()? as usize;
+        if len > max {
+            bail!("`{field}` too long ({len} bytes, max {max})");
+        }
+        Ok(self.take(len)?.to_vec())
+    }
+
+    /// A u8 count of entries (a program action's calls or bindings), at most `max`.
+    fn count(&mut self, field: &str, max: usize) -> Result<usize> {
+        let n = self.u8()? as usize;
+        if n > max {
+            bail!("`{field}` has too many entries ({n}, max {max})");
+        }
+        Ok(n)
+    }
+
+    /// A program action's bindings (`put_bindings`).
+    fn bindings(&mut self) -> Result<Vec<Binding>> {
+        let n = self.count("bindings", MAX_BINDINGS)?;
+        (0..n).map(|_| Ok(Binding { program: self.str("program", MAX_ADDRESS)?, version_digest: self.str("version_digest", HEX_32)? })).collect()
     }
 }
 
@@ -1090,6 +1319,45 @@ impl Action {
                 put_str(out, validator);
                 put_u64(out, *epoch);
             }
+            // Programs (docs/PROGRAMS-V0.md §2.2–2.5). Counts are a u8 (check_format bounds them).
+            Action::UploadCode { wasm, interface, storage_limit } => {
+                out.push(62);
+                put_bytes(out, &wasm.0);
+                put_bytes(out, &interface.0);
+                put_u64(out, *storage_limit);
+            }
+            Action::CreateProgram { wasm_hash, interface_hash, authority, upgrade_delay_blocks, policy, accepts_transfers, init, fuel_limit, storage_limit, bindings } => {
+                out.push(63);
+                put_str(out, wasm_hash);
+                put_str(out, interface_hash);
+                put_str(out, authority.as_deref().unwrap_or(""));
+                put_u64(out, *upgrade_delay_blocks);
+                out.push(policy.byte());
+                out.push(*accepts_transfers as u8);
+                match init {
+                    None => out.push(0),
+                    Some(InitCall { method, input, value }) => {
+                        out.push(1);
+                        put_str(out, method);
+                        put_bytes(out, &input.0);
+                        put_u64(out, *value);
+                    }
+                }
+                put_u64(out, *fuel_limit);
+                put_u64(out, *storage_limit);
+                put_bindings(out, bindings);
+            }
+            Action::CallProgram { calls, fuel_limit, storage_limit, bindings } => {
+                out.push(64);
+                out.push(calls.len() as u8);
+                for c in calls {
+                    c.encode(out);
+                }
+                put_u64(out, *fuel_limit);
+                put_u64(out, *storage_limit);
+                put_bindings(out, bindings);
+            }
+            Action::ProgramsPause {} => out.push(69),
         }
     }
 
@@ -1200,6 +1468,30 @@ impl Action {
             54 => Action::GhostPause {},
             60 => Action::ValidatorReady { epoch: r.u64()? },
             61 => Action::AdmitValidator { validator: r.str("validator", MAX_ADDRESS)?, epoch: r.u64()? },
+            // Programs (65–68 and 70 are reserved for later program actions: unknown here).
+            62..=64 | 69 if nested => bail!("a multisig proposal can't hold a program action"),
+            62 => Action::UploadCode { wasm: HexBytes(r.bytes("wasm", MAX_CODE_BYTES)?), interface: HexBytes(r.bytes("interface", MAX_INTERFACE_BYTES)?), storage_limit: r.u64()? },
+            63 => Action::CreateProgram {
+                wasm_hash: r.str("wasm_hash", HEX_32)?,
+                interface_hash: r.str("interface_hash", HEX_32)?,
+                authority: r.opt_str("authority", MAX_ADDRESS)?,
+                upgrade_delay_blocks: r.u64()?,
+                policy: ProgramPolicy::decode(r)?,
+                accepts_transfers: r.bool("accepts_transfers")?,
+                init: match r.bool("init")? {
+                    true => Some(InitCall { method: r.str("method", MAX_METHOD)?, input: HexBytes(r.bytes("input", MAX_INPUT)?), value: r.u64()? }),
+                    false => None,
+                },
+                fuel_limit: r.u64()?,
+                storage_limit: r.u64()?,
+                bindings: r.bindings()?,
+            },
+            64 => {
+                let n = r.count("calls", MAX_CALLS)?;
+                let calls = (0..n).map(|_| ProgramCall::decode(r)).collect::<Result<_>>()?;
+                Action::CallProgram { calls, fuel_limit: r.u64()?, storage_limit: r.u64()?, bindings: r.bindings()? }
+            }
+            69 => Action::ProgramsPause {},
             t => bail!("unknown action tag {t}"),
         })
     }
@@ -1473,6 +1765,9 @@ impl Action {
                 if action.is_ghost() {
                     bail!("a multisig proposal can't hold a ghost action");
                 }
+                if action.is_program() {
+                    bail!("a multisig proposal can't hold a program action");
+                }
                 let size = action.to_bytes().len();
                 if size > MAX_MULTISIG_ACTION_BYTES {
                     bail!("a multisig proposal's action is at most {MAX_MULTISIG_ACTION_BYTES} bytes encoded, not {size}");
@@ -1528,6 +1823,54 @@ impl Action {
             }
             Action::GhostPause {} | Action::ValidatorReady { .. } => {}
             Action::AdmitValidator { validator, .. } => check_address("validator", validator)?,
+            // Programs (docs/PROGRAMS-V0.md §2.2–2.4). A malformed interface never reaches admission.
+            Action::UploadCode { wasm, interface, .. } => {
+                if wasm.0.len() < WASM_HEADER.len() || wasm.0.len() > MAX_CODE_BYTES {
+                    bail!("`wasm` must be {}–{MAX_CODE_BYTES} bytes, not {}", WASM_HEADER.len(), wasm.0.len());
+                }
+                if !wasm.0.starts_with(&WASM_HEADER) {
+                    bail!("`wasm` must be WebAssembly 1.0: it starts 00 61 73 6d 01 00 00 00");
+                }
+                if interface.0.is_empty() || interface.0.len() > MAX_INTERFACE_BYTES {
+                    bail!("`interface` must be 1–{MAX_INTERFACE_BYTES} bytes, not {}", interface.0.len());
+                }
+                blockula_vm::interface::decode(&interface.0)?;
+            }
+            Action::CreateProgram { wasm_hash, interface_hash, authority, upgrade_delay_blocks, policy, init, fuel_limit, bindings, .. } => {
+                check_hex_32("wasm_hash", wasm_hash)?;
+                check_hex_32("interface_hash", interface_hash)?;
+                match authority {
+                    Some(a) => check_address("authority", a)?,
+                    // An immutable program has one encoding.
+                    None if *upgrade_delay_blocks != 0 || *policy != ProgramPolicy::Open => bail!("a program without an authority is immutable: its upgrade_delay_blocks is 0 and its policy open"),
+                    None => {}
+                }
+                match init {
+                    Some(i) => {
+                        i.check()?;
+                        check_fuel_limit(*fuel_limit)?;
+                    }
+                    // No code runs at creation, so nothing is reserved or declared.
+                    None if *fuel_limit != 0 || !bindings.is_empty() => bail!("a create without init runs no code: its fuel_limit is 0 and it has no bindings"),
+                    None => {}
+                }
+                check_bindings(bindings, &[])?;
+            }
+            Action::CallProgram { calls, fuel_limit, bindings, .. } => {
+                if calls.is_empty() || calls.len() > MAX_CALLS {
+                    bail!("a program call carries 1–{MAX_CALLS} calls, not {}", calls.len());
+                }
+                for c in calls {
+                    c.check()?;
+                }
+                let input = calls.iter().fold(0usize, |n, c| n.saturating_add(c.input.0.len()));
+                if input > MAX_INPUT {
+                    bail!("the calls' inputs add up to {input} bytes: at most {MAX_INPUT}");
+                }
+                check_fuel_limit(*fuel_limit)?;
+                check_bindings(bindings, calls)?;
+            }
+            Action::ProgramsPause {} => {}
         }
         Ok(())
     }
@@ -1535,6 +1878,12 @@ impl Action {
     /// A Ghost Mode action (tags 50–54).
     pub fn is_ghost(&self) -> bool {
         matches!(self, Action::Shield { .. } | Action::PrivateTransfer { .. } | Action::Unshield { .. } | Action::SetGhostAddress { .. } | Action::GhostPause {})
+    }
+
+    /// A program action (tags 62–64 and 69; programs/). Of these, the ones that run code and
+    /// reserve fuel are `programs::is_program_tx`'s (62–64).
+    pub fn is_program(&self) -> bool {
+        matches!(self, Action::UploadCode { .. } | Action::CreateProgram { .. } | Action::CallProgram { .. } | Action::ProgramsPause {})
     }
 
     /// Travels unsigned: `PrivateTransfer` and `Unshield`, whose proof authorizes them.
@@ -1572,6 +1921,8 @@ impl Action {
             Action::Vote { proposal_id, .. } => vec![("proposal_id", *proposal_id)],
             Action::MultisigApprove { id, .. } => vec![("id", *id)],
             Action::ClaimDistribution { distribution_id, .. } => vec![("distribution_id", *distribution_id)],
+            Action::CreateProgram { upgrade_delay_blocks, fuel_limit, .. } => vec![("upgrade_delay_blocks", *upgrade_delay_blocks), ("fuel_limit", *fuel_limit)],
+            Action::CallProgram { fuel_limit, .. } => vec![("fuel_limit", *fuel_limit)],
             _ => vec![],
         }
     }
@@ -1636,6 +1987,10 @@ impl Action {
             Action::GhostPause {} => "ghost_pause",
             Action::ValidatorReady { .. } => "validator_ready",
             Action::AdmitValidator { .. } => "admit_validator",
+            Action::UploadCode { .. } => "upload_code",
+            Action::CreateProgram { .. } => "create_program",
+            Action::CallProgram { .. } => "call_program",
+            Action::ProgramsPause {} => "programs_pause",
         }
     }
 
@@ -1653,6 +2008,9 @@ impl Action {
                 _ => vec![],
             },
             Action::MultisigPropose { action } => action.addresses(),
+            // A program is named by address only (and a create's authority too), so all of them.
+            Action::CreateProgram { authority, bindings, .. } => authority.iter().map(|a| ("authority", a.as_str())).chain(bindings.iter().map(|b| ("bindings.program", b.program.as_str()))).collect(),
+            Action::CallProgram { calls, bindings, .. } => calls.iter().map(|c| ("calls.program", c.program.as_str())).chain(bindings.iter().map(|b| ("bindings.program", b.program.as_str()))).collect(),
             _ => vec![],
         }
     }
@@ -1799,7 +2157,11 @@ impl ProposalKind {
         check_json_ints(&self.json_ints())?;
         match self {
             ProposalKind::ParamChange { key, .. } => {
-                if !crate::params::ChainParams::KEYS.contains(&key.as_str()) {
+                // Programs' parameters (protocol v2) get past here too, so that a block can carry a
+                // change of one once programs exist; until then admission refuses them in these
+                // words (`programs::params::admit`), so they're unadmittable wherever v1 refuses
+                // them here.
+                if !crate::params::ChainParams::KEYS.contains(&key.as_str()) && crate::programs::params::Param::from_key(key).is_none() {
                     bail!("unknown parameter `{key}`");
                 }
             }
@@ -1959,9 +2321,13 @@ impl Tx {
     }
 
     /// The codec's size bound for this tx: [`MAX_GHOST_TX_BYTES`] for one carrying a ghost
-    /// bundle, [`MAX_TX_BYTES`] for the rest.
+    /// bundle, `programs::MAX_CODE_TX_BYTES` for a program upload, [`MAX_TX_BYTES`] for the rest.
     pub fn max_bytes(&self) -> usize {
-        if self.action.ghost_bundle().is_some() { MAX_GHOST_TX_BYTES } else { MAX_TX_BYTES }
+        match &self.action {
+            a if a.ghost_bundle().is_some() => MAX_GHOST_TX_BYTES,
+            Action::UploadCode { .. } => crate::programs::MAX_CODE_TX_BYTES,
+            _ => MAX_TX_BYTES,
+        }
     }
 
     /// An unsigned ghost tx (`PrivateTransfer`, `Unshield`): no sender, nonce, key or signature;
@@ -2017,7 +2383,9 @@ impl Tx {
     /// What this tx is charged while the base fee is at its genesis floor: `min_fee(size)` plus
     /// the proposer's tip (`None` on overflow). The base fee moves with block fullness, so the
     /// exact charge depends on the block (`econ::charge`); this is what wallets and tests pay
-    /// on an idle chain.
+    /// on an idle chain. It is a v1 transaction's charge: a program transaction (tags 62–64) also
+    /// pays its fuel fee (`programs::fuel_fee`), which this leaves out, so a program transaction
+    /// that signs this as its maximum fee is refused.
     #[cfg_attr(not(test), allow(dead_code))] // tests and the fuzz harness
     pub fn charge(&self) -> Option<u64> {
         min_fee(self.size()).checked_add(self.tip)
@@ -2314,6 +2682,12 @@ pub struct Block {
     /// recomputes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_fee: Option<crate::econ::FeeSlot>,
+    /// The receipts of its program transactions (tags 62–64, applied or failed), by index into
+    /// `txs` (docs/PROGRAMS-V0.md §8.1): what this node computed, the same on every node. Display
+    /// only: replay recomputes it, and no root commits to it. Absent, not empty, from a block
+    /// without one, so every v1 block's record is byte for byte what it was.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub programs: std::collections::BTreeMap<usize, crate::programs::receipt::ProgramReceipt>,
 }
 
 #[cfg(test)]
@@ -2424,6 +2798,62 @@ pub(crate) mod tests {
         vec![Action::ValidatorReady { epoch: 3 }, Action::AdmitValidator { validator: "boo1v".into(), epoch: 3 }]
     }
 
+    /// Programs (tags 62–64 and 69, docs/PROGRAMS-V0.md §2): each tag, each option set and
+    /// unset, each passing the format rules. Mirrored by the SDK's encoder from WBS S7a.
+    pub(crate) fn program_vector_actions() -> Vec<Action> {
+        let (a, b, c) = (vector_address(41), vector_address(42), vector_address(43));
+        let digest = |n: u8| hex::encode([n; 32]);
+        let call = |program: &str, version: u8, method: &str, input: Vec<u8>, value: u64| ProgramCall { program: program.into(), version_digest: digest(version), method: method.into(), input: HexBytes(input), value };
+        vec![
+            Action::UploadCode { wasm: HexBytes(vector_wasm()), interface: HexBytes(vector_interface()), storage_limit: 30 * DROPS_PER_FANG },
+            // Immutable, no initializer: nothing runs at creation.
+            Action::CreateProgram { wasm_hash: digest(0xc1), interface_hash: digest(0x1f), authority: None, upgrade_delay_blocks: 0, policy: ProgramPolicy::Open, accepts_transfers: false, init: None, fuel_limit: 0, storage_limit: DROPS_PER_FANG, bindings: vec![] },
+            // Upgradable (additive) once upgrades exist, accepting transfers, initialized with
+            // FANG, and two bindings (one at any version).
+            Action::CreateProgram {
+                wasm_hash: digest(0xc1),
+                interface_hash: digest(0x1f),
+                authority: Some(a.clone()),
+                upgrade_delay_blocks: 100_800,
+                policy: ProgramPolicy::Additive,
+                accepts_transfers: true,
+                init: Some(InitCall { method: "init".into(), input: HexBytes(vec![7; 8]), value: 5 * DROPS_PER_FANG }),
+                fuel_limit: 2_000_000,
+                storage_limit: 500_000_000,
+                bindings: vec![Binding { program: b.clone(), version_digest: hex::encode(blockula_vm::exec::ANY_VERSION) }, Binding { program: c.clone(), version_digest: digest(0xd3) }],
+            },
+            Action::CallProgram { calls: vec![call(&b, 0xd2, "increment", vec![], 0)], fuel_limit: 400_000, storage_limit: 0, bindings: vec![] },
+            // A batch: one program twice (once with FANG), another once, and a binding.
+            Action::CallProgram { calls: vec![call(&b, 0xd2, "swap", vec![1, 2, 3], 5 * DROPS_PER_FANG), call(&b, 0xd2, "increment", vec![], 0), call(&c, 0xd3, "settle", vec![9; 40], 0)], fuel_limit: 1_000_000, storage_limit: 2_000_000, bindings: vec![Binding { program: a, version_digest: digest(0xd1) }] },
+            Action::ProgramsPause {},
+        ]
+    }
+
+    /// A real address (programs are named by address only), from a fixed key.
+    pub(crate) fn vector_address(key_seed: u8) -> String {
+        crypto::Keys::from_seed([key_seed; 32]).address()
+    }
+
+    /// Short code the format rules take (upload validation wouldn't: it exports nothing): the
+    /// Wasm 1.0 header and a type section of one `[] -> []` function type.
+    pub(crate) fn vector_wasm() -> Vec<u8> {
+        [WASM_HEADER.as_slice(), &[0x01, 0x04, 0x01, 0x60, 0x00, 0x00]].concat()
+    }
+
+    /// An interface (format 1): `get` (a view returning a u64), `increment` (a call taking a u64)
+    /// and `init` (payable, taking a u64).
+    pub(crate) fn vector_interface() -> Vec<u8> {
+        use blockula_vm::host::MethodKind;
+        use blockula_vm::interface::{encode, Arg, Interface, Method, Type};
+        let method = |name: &str, kind, payable, args: Vec<Arg>, returns| Method { name: name.into(), kind, payable, args, returns };
+        let methods = vec![
+            method("get", MethodKind::View, false, vec![], Some(Type::U64)),
+            method("increment", MethodKind::Call, false, vec![Arg { name: "by".into(), ty: Type::U64 }], None),
+            method("init", MethodKind::Init, true, vec![Arg { name: "start".into(), ty: Type::U64 }], None),
+        ];
+        encode(&Interface { methods }).unwrap()
+    }
+
     /// A bundle whose fields are `[1; 32]`, `[2; 32]` … in wire order and whose 300-byte proof is
     /// `[proof; 300]`.
     pub(crate) fn vector_bundle(proof: u8) -> Box<GhostBundle> {
@@ -2482,14 +2912,53 @@ pub(crate) mod tests {
             at("readiness at the JS bound", Action::ValidatorReady { epoch: JS_MAX }),
             at("admission at the JS bound", Action::AdmitValidator { validator: "boo1v".into(), epoch: JS_MAX }),
         ]);
-        let cases: Vec<serde_json::Value> = cases
+        let case = |(label, tx): (String, Tx)| {
+            let json = serde_json::to_value(&tx).unwrap();
+            assert_eq!(serde_json::from_value::<Tx>(json.clone()).unwrap(), tx, "{label}: the JSON parses back");
+            serde_json::json!({ "label": label, "tx": json, "signing_bytes": hex::encode(tx.signing_bytes()) })
+        };
+        let cases: Vec<serde_json::Value> = cases.into_iter().map(case).collect();
+        // Programs (tags 62–64 and 69, protocol v2), in the same shape, apart: sdk-ts encodes them
+        // from WBS stage S7a and checks them in tx-vectors.ts.
+        // Each tag, then every integer width at its bound, a u32 length past 255, the most
+        // bindings and calls the codec decodes, the longest method name, and creates that tell a
+        // create's adjacent one-byte fields apart. A tag with several vectors names each by what
+        // it sets, so the SDK's assertion says which one differs.
+        let [upload, immutable, create, call, batch, pause]: [Action; 6] = program_vector_actions().try_into().unwrap();
+        let tagged = [(upload, ""), (immutable, "immutable"), (create, "upgradable, with init and bindings"), (call, "one call"), (batch, "a batch"), (pause, "")];
+        let mut program_cases: Vec<(String, Tx)> = tagged
             .into_iter()
-            .map(|(label, tx)| {
-                let json = serde_json::to_value(&tx).unwrap();
-                assert_eq!(serde_json::from_value::<Tx>(json.clone()).unwrap(), tx, "{label}: the JSON parses back");
-                serde_json::json!({ "label": label, "tx": json, "signing_bytes": hex::encode(tx.signing_bytes()) })
+            .map(|(a, what)| {
+                let label = if what.is_empty() { format!("{} (tag {})", a.kind(), a.to_bytes()[0]) } else { format!("{}, {what} (tag {})", a.kind(), a.to_bytes()[0]) };
+                (label, unsigned(vector_tx(a)))
             })
             .collect();
+        let (p, q) = (vector_address(42), vector_address(43));
+        let big = |n: usize| HexBytes((0..n).map(|i| i as u8).collect());
+        let bindings: Vec<Binding> = (0..MAX_BINDINGS as u8).map(|i| Binding { program: vector_address(100 + i), version_digest: hex::encode([i; 32]) }).collect();
+        let longest = "m".repeat(MAX_METHOD);
+        program_cases.extend([
+            at("upload at the bounds", Action::UploadCode { wasm: HexBytes([vector_wasm(), vec![0; 300]].concat()), interface: HexBytes(vector_interface()), storage_limit: u64::MAX }),
+            at("create at the bounds", Action::CreateProgram { wasm_hash: "ff".repeat(32), interface_hash: "00".repeat(32), authority: Some(p.clone()), upgrade_delay_blocks: JS_MAX, policy: ProgramPolicy::Additive, accepts_transfers: true, init: Some(InitCall { method: longest.clone(), input: big(300), value: u64::MAX }), fuel_limit: JS_MAX, storage_limit: u64::MAX, bindings: bindings.clone() }),
+            at("call at the bounds", Action::CallProgram { calls: (0..MAX_CALLS).map(|i| ProgramCall { program: if i % 2 == 0 { p.clone() } else { q.clone() }, version_digest: "ff".repeat(32), method: longest.clone(), input: big(if i == 0 { 300 } else { 0 }), value: u64::MAX }).collect(), fuel_limit: JS_MAX, storage_limit: u64::MAX, bindings }),
+            at("a call with every integer at zero", Action::CallProgram { calls: vec![ProgramCall { program: p.clone(), version_digest: "01".repeat(32), method: "m".into(), input: HexBytes::default(), value: 0 }], fuel_limit: 0, storage_limit: 0, bindings: vec![] }),
+        ]);
+        // A create writes three one-byte fields in a row: the policy, accepts_transfers and init's
+        // presence. They read 0, 0, 0 in the immutable vector and 1, 1, 1 in the other two; these
+        // read 0, 1, 0 and 1, 0, 0, so an encoder that writes any of them in another's place
+        // differs from the node's bytes (review S7a-R1). Both are creates the format rules take.
+        let flags = [
+            ("create, immutable, accepting transfers", Action::CreateProgram { wasm_hash: "c1".repeat(32), interface_hash: "1f".repeat(32), authority: None, upgrade_delay_blocks: 0, policy: ProgramPolicy::Open, accepts_transfers: true, init: None, fuel_limit: 0, storage_limit: DROPS_PER_FANG, bindings: vec![] }),
+            ("create, upgradable, without init, refusing transfers", Action::CreateProgram { wasm_hash: "c1".repeat(32), interface_hash: "1f".repeat(32), authority: Some(p), upgrade_delay_blocks: 100_800, policy: ProgramPolicy::Additive, accepts_transfers: false, init: None, fuel_limit: 0, storage_limit: DROPS_PER_FANG, bindings: vec![] }),
+        ];
+        for (label, action) in &flags {
+            action.check_format(false).unwrap_or_else(|e| panic!("{label}: {e:#}"));
+        }
+        program_cases.extend(flags.map(|(label, action)| at(label, action)));
+        // Every program case has its own label (`cases` repeat theirs: the SDK has them as they are).
+        let labels: std::collections::BTreeSet<&str> = program_cases.iter().map(|(label, _)| label.as_str()).collect();
+        assert_eq!(labels.len(), program_cases.len(), "two program vectors share a label");
+        let program_cases: Vec<serde_json::Value> = program_cases.into_iter().map(case).collect();
         // What approvals, votes and sealed judgments bind (audit gap-7-6), and a key's consent
         // message (gap-7-2): the SDK's `actionDigest`, `proposalDigest`, `seancePairsDigest` and
         // `keyPopMessage` must compute the same.
@@ -2524,6 +2993,7 @@ pub(crate) mod tests {
         serde_json::json!({
             "description": "Signing bytes of txs from their JSON (node/src/types.rs `tx_vectors`), for sdk-ts/src/tx.ts `signingBytes`. Regenerate: cargo test --manifest-path node/Cargo.toml types::tests::write_tx_vectors -- --ignored",
             "cases": cases,
+            "program_cases": program_cases,
             "action_digests": digests,
             "proposal_digests": proposals,
             "seance_pairs_digest": seance,
@@ -2641,6 +3111,16 @@ pub(crate) mod tests {
             assert_eq!(serde_json::from_value::<Action>(serde_json::to_value(&a).unwrap()).unwrap(), a);
         }
         assert!(serde_json::from_str::<Action>(r#"{"type":"validator_ready","epoch":3,"commission_bps":0}"#).is_err(), "readiness carries no terms");
+        // Programs (tags 62–64 and 69, protocol v2), hashed on their own; the pause is its tag
+        // alone, and an upload's lengths are u32s.
+        let mut h = blake3::Hasher::new();
+        for action in program_vector_actions() {
+            h.update(&vector_tx(action).signing_bytes());
+        }
+        assert_eq!(h.finalize().to_hex().to_string(), "af4c1c8b05d4d95016634ff87f136f9d70b0fd77c2dd26575701988f24beeb18");
+        assert_eq!(Action::ProgramsPause {}.to_bytes(), [69]);
+        let upload = Action::UploadCode { wasm: HexBytes(vec![0xaa; 2]), interface: HexBytes(vec![0xbb]), storage_limit: 0x0102 };
+        assert_eq!(upload.to_bytes(), [62, 2, 0, 0, 0, 0xaa, 0xaa, 1, 0, 0, 0, 0xbb, 2, 1, 0, 0, 0, 0, 0, 0]);
     }
 
     /// Unsigned ghost txs (51, 52) travel in their own wire form; nothing else does, and they
@@ -2736,7 +3216,7 @@ pub(crate) mod tests {
     fn every_tag_round_trips_through_the_wire_form() {
         let mut tags = std::collections::BTreeSet::new();
         let mut kinds = std::collections::BTreeSet::new();
-        for action in vector_actions().into_iter().chain(v1_vector_actions()).chain(ghost_vector_actions()).chain(small_set_vector_actions()) {
+        for action in vector_actions().into_iter().chain(v1_vector_actions()).chain(ghost_vector_actions()).chain(small_set_vector_actions()).chain(program_vector_actions()) {
             let enc = action.to_bytes();
             tags.insert(enc[0]);
             if let Action::Propose { kind, .. } = &action {
@@ -2747,7 +3227,7 @@ pub(crate) mod tests {
             let tx = vector_tx(action);
             assert_eq!(Tx::from_bytes(&tx.to_bytes()).unwrap(), tx);
         }
-        assert_eq!(tags, (0..=54).chain(60..=61).collect(), "the vectors cover every action tag (55–59 are Ghost Mode's, unused)");
+        assert_eq!(tags, (0..=54).chain(60..=64).chain([69]).collect(), "the vectors cover every action tag (55–59 are Ghost Mode's, unused; 65–68 and 70 programs', not decoded in v0)");
         assert_eq!(kinds, (0..=13).collect(), "and every proposal kind");
     }
 
@@ -2795,7 +3275,7 @@ pub(crate) mod tests {
         ];
         let rule = format!("must be at most {MAX_JSON_INT}");
         let mut checked = 0;
-        for action in vector_actions().into_iter().chain(v1_vector_actions()).chain(ghost_vector_actions()).chain(small_set_vector_actions()).chain(extra) {
+        for action in vector_actions().into_iter().chain(v1_vector_actions()).chain(ghost_vector_actions()).chain(small_set_vector_actions()).chain(program_vector_actions()).chain(extra) {
             let json = serde_json::to_value(&action).unwrap();
             let mut paths = vec![];
             numbers(&json, &mut vec![], &mut paths);
@@ -2867,6 +3347,16 @@ pub(crate) mod tests {
         // Proposals: the kind's own rules, a deposit, a title, an https link or nothing.
         ok(propose(ProposalKind::ParamChange { key: "quorum_bps".into(), value: 1 }));
         assert!(bad(propose(ProposalKind::ParamChange { key: "nope".into(), value: 1 })).contains("unknown parameter"));
+        // Programs' seven keys get past the codec, on their own and in a multisig, and admission
+        // refuses them in the same words until programs exist (`programs::params::admit`); any
+        // other `program_*` key is refused here as v1 refuses it.
+        for p in crate::programs::params::Param::ALL {
+            let change = propose(ProposalKind::ParamChange { key: p.key().into(), value: 1 });
+            ok(change.clone());
+            ok(Action::MultisigPropose { action: Box::new(change) });
+        }
+        assert_eq!(bad(propose(ProposalKind::ParamChange { key: "program_warp".into(), value: 1 })), "unknown parameter `program_warp`");
+        assert_eq!(bad(Action::MultisigPropose { action: Box::new(propose(ProposalKind::ParamChange { key: "program_warp".into(), value: 1 })) }), "the proposed action: unknown parameter `program_warp`");
         assert!(bad(propose(ProposalKind::GrantSoul { to: addr.clone(), amount: crate::poc::MAX_SOUL_GRANT + 1, reason: "r".into() })).contains("milli-Soul"));
         assert!(bad(propose(ProposalKind::Distribution { distribution_id: 0, merkle_root: hex32.clone(), total: 0, claim_until: 1 })).contains("total"));
         assert!(bad(propose(ProposalKind::ActivateFeature { feature: "Ghost Mode".into() })).contains("feature"));
@@ -2907,6 +3397,225 @@ pub(crate) mod tests {
         ] {
             assert!(tx(a.clone()).check_prefix("boo").unwrap_err().to_string().contains("tboo"), "{a:?}");
         }
+    }
+
+    /// Programs (docs/PROGRAMS-V0.md §2.1–2.4): each tag round-trips through the wire form and
+    /// JSON, in the JSON shape §2 gives, and the format rules refuse each malformed field, one at
+    /// a time.
+    #[test]
+    fn program_actions_round_trip_and_are_bounded() {
+        for a in program_vector_actions() {
+            a.check_format(false).unwrap_or_else(|e| panic!("{a:?}: {e:#}"));
+            assert_eq!(Action::from_bytes(&a.to_bytes()).unwrap(), a);
+            let json = serde_json::to_value(&a).unwrap();
+            assert_eq!(json["type"], a.kind());
+            assert_eq!(serde_json::from_value::<Action>(json).unwrap(), a);
+            let tx = vector_tx(a);
+            assert_eq!(Tx::from_bytes(&tx.to_bytes()).unwrap(), tx);
+        }
+        // The JSON: bytes as lowercase hex, amounts as strings, the rest as §2 shows them.
+        let [upload, immutable, create, call, batch, pause]: [Action; 6] = program_vector_actions().try_into().unwrap();
+        let (a, b, c) = (vector_address(41), vector_address(42), vector_address(43));
+        assert_eq!(serde_json::to_value(&upload).unwrap(), serde_json::json!({ "type": "upload_code", "wasm": hex::encode(vector_wasm()), "interface": hex::encode(vector_interface()), "storage_limit": "30000000000" }));
+        assert_eq!(
+            serde_json::to_value(&immutable).unwrap(),
+            serde_json::json!({ "type": "create_program", "wasm_hash": "c1".repeat(32), "interface_hash": "1f".repeat(32), "authority": null, "upgrade_delay_blocks": 0, "policy": "open", "accepts_transfers": false, "init": null, "fuel_limit": 0, "storage_limit": "1000000000", "bindings": [] })
+        );
+        let json = serde_json::to_value(&create).unwrap();
+        assert_eq!((json["authority"].as_str(), json["policy"].as_str()), (Some(a.as_str()), Some("additive")));
+        assert_eq!(json["init"], serde_json::json!({ "method": "init", "input": "07".repeat(8), "value": "5000000000" }));
+        assert_eq!(json["bindings"], serde_json::json!([{ "program": b, "version_digest": "00".repeat(32) }, { "program": c, "version_digest": "d3".repeat(32) }]));
+        assert_eq!(serde_json::to_value(&call).unwrap(), serde_json::json!({ "type": "call_program", "calls": [{ "program": b, "version_digest": "d2".repeat(32), "method": "increment", "input": "", "value": "0" }], "fuel_limit": 400_000, "storage_limit": "0", "bindings": [] }));
+        assert_eq!(serde_json::to_value(&pause).unwrap(), serde_json::json!({ "type": "programs_pause" }));
+        // Nothing unsigned rides along, at any depth; bytes are lowercase hex; the policy is one of
+        // two words.
+        let edit = |a: &Action, f: &dyn Fn(&mut serde_json::Value)| {
+            let mut j = serde_json::to_value(a).unwrap();
+            f(&mut j);
+            serde_json::from_value::<Action>(j)
+        };
+        assert!(edit(&create, &|j| j["init"]["x"] = 1.into()).is_err());
+        assert!(edit(&create, &|j| j["bindings"][0]["x"] = 1.into()).is_err());
+        assert!(edit(&batch, &|j| j["calls"][0]["x"] = 1.into()).is_err());
+        assert!(edit(&pause, &|j| j["x"] = 1.into()).is_err());
+        assert!(edit(&upload, &|j| j["wasm"] = "0061736D01000000".into()).is_err());
+        assert!(edit(&create, &|j| j["policy"] = "Open".into()).is_err());
+        assert!(edit(&create, &|j| j["policy"] = 1.into()).is_err());
+        assert_eq!(edit(&immutable, &|j| _ = j.as_object_mut().unwrap().remove("authority")).unwrap(), immutable, "an absent option is none, as `null` is");
+
+        let bad = |a: Action| match a.check_format(false) {
+            Ok(()) => panic!("{a:?} should be refused"),
+            Err(e) => format!("{e:#}"),
+        };
+        let upload_with = |wasm: Vec<u8>, interface: Vec<u8>| Action::UploadCode { wasm: HexBytes(wasm), interface: HexBytes(interface), storage_limit: 0 };
+        let header = WASM_HEADER.to_vec();
+        // Upload: 8–256 KiB of Wasm 1.0, and 1–16 KiB of an interface that decodes.
+        upload_with(header.clone(), vector_interface()).check_format(false).unwrap();
+        upload_with([header.clone(), vec![0; MAX_CODE_BYTES - 8]].concat(), vector_interface()).check_format(false).unwrap();
+        assert!(bad(upload_with(header[..7].to_vec(), vector_interface())).contains("`wasm` must be 8–262144 bytes"));
+        assert!(bad(upload_with([header.clone(), vec![0; MAX_CODE_BYTES - 7]].concat(), vector_interface())).contains("`wasm` must be 8–262144 bytes"));
+        assert!(bad(upload_with(vec![0x00, 0x61, 0x73, 0x6d, 0x02, 0x00, 0x00, 0x00], vector_interface())).contains("WebAssembly 1.0"));
+        assert!(bad(upload_with(b"\0asm\x01\0\0\0".iter().rev().copied().collect(), vector_interface())).contains("WebAssembly 1.0"));
+        assert!(bad(upload_with(header.clone(), vec![])).contains("`interface` must be 1–16384 bytes"));
+        assert!(bad(upload_with(header.clone(), vec![1; MAX_INTERFACE_BYTES + 1])).contains("`interface` must be 1–16384 bytes"));
+        let mut format2 = vector_interface();
+        format2[0] = 2;
+        assert!(bad(upload_with(header.clone(), format2)).contains("interface: format 2"));
+        assert!(bad(upload_with(header.clone(), [vector_interface(), vec![0]].concat())).contains("interface: 1 bytes after the last method"));
+        // Create.
+        let create_with = |edit: &dyn Fn(&mut Action)| {
+            let mut a = create.clone();
+            edit(&mut a);
+            a
+        };
+        macro_rules! create {
+            ($($field:ident),* => $body:expr) => {
+                create_with(&|a| if let Action::CreateProgram { $($field,)* .. } = a { $body })
+            };
+        }
+        assert!(bad(create!(wasm_hash => *wasm_hash = "C1".repeat(32))).contains("`wasm_hash` must be 32 bytes of lowercase hex"));
+        assert!(bad(create!(interface_hash => *interface_hash = "1f".repeat(31))).contains("`interface_hash` must be 32 bytes of lowercase hex"));
+        assert!(bad(create!(authority => *authority = Some("vlad.boo".into()))).contains("`authority` must be a lowercase boo1… address"));
+        assert!(bad(create!(authority, policy => { *authority = None; *policy = ProgramPolicy::Open })).contains("immutable"), "a delay without an authority");
+        assert!(bad(create!(authority, upgrade_delay_blocks => { *authority = None; *upgrade_delay_blocks = 0 })).contains("immutable"), "a policy without an authority");
+        create!(authority, upgrade_delay_blocks, policy => { *authority = None; *upgrade_delay_blocks = 0; *policy = ProgramPolicy::Open }).check_format(false).unwrap();
+        assert!(bad(create!(init, bindings => { *init = None; *bindings = vec![] })).contains("runs no code"), "a fuel limit without init");
+        assert!(bad(create!(init, fuel_limit => { *init = None; *fuel_limit = 0 })).contains("runs no code"), "bindings without init");
+        for (method, ok) in [("init", true), ("a", true), ("m".repeat(MAX_METHOD).as_str(), true), ("", false), ("Init", false), ("ïnit", false), ("1nit", false), ("in it", false), ("m".repeat(MAX_METHOD + 1).as_str(), false)] {
+            let a = create!(init => init.as_mut().unwrap().method = method.into());
+            assert_eq!(a.check_format(false).is_ok(), ok, "{method:?}");
+            if !ok {
+                assert!(bad(a).contains("an identifier"), "{method:?}");
+            }
+        }
+        create!(init => init.as_mut().unwrap().input = HexBytes(vec![0; MAX_INPUT])).check_format(false).unwrap();
+        assert!(bad(create!(init => init.as_mut().unwrap().input = HexBytes(vec![0; MAX_INPUT + 1]))).contains("`init.input` too long"));
+        create!(fuel_limit => *fuel_limit = MAX_TX_FUEL).check_format(false).unwrap();
+        for f in [0, MAX_TX_FUEL + 1] {
+            assert!(bad(create!(fuel_limit => *fuel_limit = f)).contains("fuel_limit must be 1–20000000"), "{f}");
+        }
+        let binding = |key_seed: u8| Binding { program: vector_address(key_seed), version_digest: "00".repeat(32) };
+        create!(bindings => *bindings = (0..MAX_BINDINGS as u8).map(binding).collect()).check_format(false).unwrap();
+        assert!(bad(create!(bindings => *bindings = (0..=MAX_BINDINGS as u8).map(binding).collect())).contains("at most 16 bindings"));
+        assert!(bad(create!(bindings => *bindings = vec![binding(1), binding(1)])).contains("a different program"));
+        assert!(bad(create!(bindings => bindings[0].program = "vlad.boo".into())).contains("`bindings.program` must be"));
+        assert!(bad(create!(bindings => bindings[0].version_digest = "zero".into())).contains("`bindings.version_digest` must be"));
+        // Call.
+        let call_with = |edit: &dyn Fn(&mut Action)| {
+            let mut a = batch.clone();
+            edit(&mut a);
+            a
+        };
+        macro_rules! call {
+            ($($field:ident),* => $body:expr) => {
+                call_with(&|a| if let Action::CallProgram { $($field,)* .. } = a { $body })
+            };
+        }
+        assert!(bad(call!(calls => calls.clear())).contains("1–8 calls"));
+        call!(calls => *calls = vec![calls[0].clone(); MAX_CALLS]).check_format(false).unwrap();
+        assert!(bad(call!(calls => *calls = vec![calls[0].clone(); MAX_CALLS + 1])).contains("1–8 calls"));
+        assert!(bad(call!(calls => calls[1].program = "vlad.boo".into())).contains("`program` must be a lowercase boo1… address"));
+        assert!(bad(call!(calls => calls[1].version_digest = "00".repeat(32))).contains("can't be 64 zeros"));
+        assert!(bad(call!(calls => calls[1].version_digest = "d2".repeat(33))).contains("`version_digest` must be 32 bytes"));
+        assert!(bad(call!(calls => calls[2].method = "Settle".into())).contains("an identifier"));
+        // The inputs share one bound, whichever calls carry them.
+        call!(calls => (calls[0].input, calls[2].input) = (HexBytes(vec![0; MAX_INPUT / 2]), HexBytes(vec![0; MAX_INPUT / 2]))).check_format(false).unwrap();
+        assert!(bad(call!(calls => (calls[0].input, calls[2].input) = (HexBytes(vec![0; MAX_INPUT / 2]), HexBytes(vec![0; MAX_INPUT / 2 + 1])))).contains("add up to 32769 bytes"));
+        for f in [0, MAX_TX_FUEL + 1] {
+            assert!(bad(call!(fuel_limit => *fuel_limit = f)).contains("fuel_limit must be 1–20000000"), "{f}");
+        }
+        assert!(bad(call!(calls, bindings => bindings[0].program = calls[2].program.clone())).contains("declared already"));
+        assert!(bad(call!(bindings => *bindings = vec![binding(1); 2])).contains("a different program"));
+        // Programs are named by address only, and every one is held to the chain's prefix.
+        let testnet = crypto::Keys::from_seed([41; 32]).address_with(crypto::TESTNET_HRP);
+        let named: Vec<&str> = batch.addresses().into_iter().map(|(_, a)| a).collect();
+        assert_eq!(named, vec![b.as_str(), b.as_str(), c.as_str(), a.as_str()]);
+        assert_eq!(create.addresses(), vec![("authority", a.as_str()), ("bindings.program", b.as_str()), ("bindings.program", c.as_str())]);
+        for edited in [create!(authority => *authority = Some(testnet.clone())), create!(bindings => bindings[1].program = testnet.clone()), call!(calls => calls[2].program = testnet.clone()), call!(bindings => bindings[0].program = testnet.clone())] {
+            assert!(vector_tx(edited).check_prefix("boo").unwrap_err().to_string().contains("is a tboo (testnet) address"));
+        }
+    }
+
+    /// Program actions never nest in a multisig proposal (docs/PROGRAMS-V0.md A8), in either
+    /// direction, so no stored proposal holds one; and the program tags v0 doesn't have are
+    /// unknown, as any tag nobody assigned.
+    #[test]
+    fn program_actions_dont_nest_and_later_program_tags_are_unknown() {
+        for a in program_vector_actions() {
+            let m = Action::MultisigPropose { action: Box::new(a.clone()) };
+            assert!(m.check_format(false).unwrap_err().to_string().contains("can't hold a program action"), "{}", a.kind());
+            assert!(a.check_as_multisig_action().unwrap_err().to_string().contains("can't hold a program action"));
+            assert!(Action::from_bytes(&m.to_bytes()).unwrap_err().to_string().contains("can't hold a program action"), "{}", a.kind());
+        }
+        for t in (65..=68).chain(70..=79) {
+            assert_eq!(Action::from_bytes(&[t]).unwrap_err().to_string(), format!("unknown action tag {t}"));
+        }
+        // Inside a proposal, the decoder refuses a program tag before reading its fields.
+        assert!(Action::from_bytes(&[43, 69]).unwrap_err().to_string().contains("can't hold a program action"));
+        assert!(Action::from_bytes(&[43, 65]).unwrap_err().to_string().contains("unknown action tag 65"));
+    }
+
+    /// The wire form's bounds: an upload's own size bound (`programs::MAX_CODE_TX_BYTES`, 320
+    /// KiB, which its largest fields fit), every other program action `MAX_TX_BYTES`, and each
+    /// field's length refused before its bytes are read.
+    #[test]
+    fn program_uploads_have_their_own_size_bound() {
+        use crate::programs::MAX_CODE_TX_BYTES;
+        let [upload, ..]: [Action; 6] = program_vector_actions().try_into().unwrap();
+        assert_eq!(vector_tx(upload).max_bytes(), MAX_CODE_TX_BYTES);
+        for a in program_vector_actions().into_iter().skip(1) {
+            assert_eq!(vector_tx(a).max_bytes(), MAX_TX_BYTES);
+        }
+        // The largest an upload's fields allow is above every other tx's bound, below its own,
+        // and travels.
+        let largest = vector_tx(Action::UploadCode { wasm: HexBytes(vec![1; MAX_CODE_BYTES]), interface: HexBytes(vec![2; MAX_INTERFACE_BYTES]), storage_limit: u64::MAX });
+        let size = largest.size() as usize;
+        assert!(size > MAX_TX_BYTES && size <= MAX_CODE_TX_BYTES, "{size}");
+        assert_eq!(Tx::from_bytes(&largest.to_bytes()).unwrap(), largest);
+        // A valid upload larger than MAX_TX_BYTES passes the format rules.
+        let keys = crypto::Keys::from_seed([9; 32]);
+        let tx = |action: Action| Tx { chain_id: "c".into(), genesis_hash: "00".repeat(32), from: keys.address(), nonce: 0, fee: 1, tip: 0, valid_until: 9, action, memo: String::new(), public_key: String::new(), signature: "00".repeat(crypto::SIGNATURE_LEN) }.sign(&keys);
+        let big = tx(Action::UploadCode { wasm: HexBytes([WASM_HEADER.to_vec(), vec![0; 100 << 10]].concat()), interface: HexBytes(vector_interface()), storage_limit: 1 });
+        assert!(big.size() as usize > MAX_TX_BYTES);
+        big.check_format().unwrap();
+        // Past the code's own bound the whole tx is too large before the action's rules are read.
+        let huge = tx(Action::UploadCode { wasm: HexBytes([WASM_HEADER.to_vec(), vec![0; MAX_CODE_TX_BYTES]].concat()), interface: HexBytes(vector_interface()), storage_limit: 1 });
+        assert!(huge.check_format().unwrap_err().to_string().contains(&format!("transaction too large ({} bytes, max {MAX_CODE_TX_BYTES})", huge.size())));
+        // Lengths past a field's bound are refused before anything is taken: here with nothing
+        // after them at all.
+        let field = |prefix: &[u8], len: usize| {
+            let mut b = prefix.to_vec();
+            b.extend_from_slice(&(len as u32).to_le_bytes());
+            Action::from_bytes(&b).unwrap_err().to_string()
+        };
+        assert_eq!(field(&[62], MAX_CODE_BYTES + 1), "`wasm` too long (262145 bytes, max 262144)");
+        assert_eq!(field(&[62], MAX_CODE_BYTES), "truncated transaction");
+        assert_eq!(field(&[[62].as_slice(), &0u32.to_le_bytes()].concat(), MAX_INTERFACE_BYTES + 1), "`interface` too long (16385 bytes, max 16384)");
+        assert_eq!(field(&[[62].as_slice(), &0u32.to_le_bytes()].concat(), u32::MAX as usize), "`interface` too long (4294967295 bytes, max 16384)");
+        // Counts and the rest: calls past 8, bindings past 16, a policy, bools and the init flag.
+        assert_eq!(Action::from_bytes(&[64, 9]).unwrap_err().to_string(), "`calls` has too many entries (9, max 8)");
+        let immutable = program_vector_actions().remove(1).to_bytes();
+        let n = immutable.len();
+        let mut more = immutable.clone();
+        more[n - 1] = 17;
+        assert_eq!(Action::from_bytes(&more).unwrap_err().to_string(), "`bindings` has too many entries (17, max 16)");
+        // From the end: bindings (1), storage_limit and fuel_limit (16), init (1), accepts_transfers
+        // (1), policy (1).
+        let at = |back: usize, b: u8| {
+            let mut m = immutable.clone();
+            m[n - back] = b;
+            Action::from_bytes(&m).unwrap_err().to_string()
+        };
+        assert_eq!(at(1 + 16 + 1, 2), "`init` must be 0 or 1, got 2");
+        assert_eq!(at(1 + 16 + 2, 2), "`accepts_transfers` must be 0 or 1, got 2");
+        assert_eq!(at(1 + 16 + 3, 2), "unknown program policy 2");
+        // A method name longer than an identifier can be, from the wire.
+        let call = program_vector_actions().remove(3).to_bytes();
+        let method_at = 2 + (2 + vector_address(42).len()) + (2 + 64);
+        assert_eq!(&call[method_at..method_at + 2], &9u16.to_le_bytes(), "\"increment\"");
+        let mut long = call[..method_at].to_vec();
+        long.extend_from_slice(&33u16.to_le_bytes());
+        assert_eq!(Action::from_bytes(&long).unwrap_err().to_string(), "`method` too long (33 bytes, max 32)");
     }
 
     #[test]
@@ -2953,7 +3662,9 @@ pub(crate) mod tests {
         let tag_at = TX_DOMAIN.len() + 2 + 3 + 32 + 2 + 8 + 4 * 8;
         assert_eq!(good[tag_at], 21);
         let mut unknown = good.clone();
-        for t in [55, 59, 62] {
+        // 55–59 are Ghost Mode's, unused; 65–68 and 70 are program actions v0 doesn't decode,
+        // 71–79 kept for later ones (docs/PROGRAMS-V0.md §2.6).
+        for t in [55, 59, 65, 66, 67, 68, 70, 71, 79] {
             unknown[tag_at] = t;
             assert!(err(&unknown).contains(&format!("unknown action tag {t}")));
         }
@@ -3075,7 +3786,7 @@ pub(crate) mod tests {
         let opt = proptest::option::of(arb_str(6).prop_filter("Some is never empty", |s| !s.is_empty()));
         let ids = proptest::collection::vec(any::<u64>(), 0..4);
         let list = proptest::collection::vec(arb_str(6), 0..4);
-        (0u8..57, strs, nums, any::<bool>(), opt, ids, list, 0u8..16, any::<u8>()).prop_map(|(tag, [a, b, c, d], [w, x, y], ok, familiar_key, spam, list, kind, small)| match tag {
+        (0u8..61, strs, nums, any::<bool>(), opt, ids, list, 0u8..16, any::<u8>()).prop_map(|(tag, [a, b, c, d], [w, x, y], ok, familiar_key, spam, list, kind, small)| match tag {
             0 => Action::Transfer { to: a, amount: w },
             1 => Action::RegisterName { name: a },
             2 => Action::AddKey { key_id: a, label: b, role: if ok { KeyRole::Owner } else { KeyRole::Session { limit: w, period_blocks: x, expires_at: y } }, public_key: c, pop: d },
@@ -3134,6 +3845,27 @@ pub(crate) mod tests {
             // Tags 60–61 (55–59 are Ghost Mode's, unused).
             55 => Action::ValidatorReady { epoch: w },
             56 => Action::AdmitValidator { validator: a, epoch: w },
+            // Programs: tags 62–64 and 69.
+            57 => Action::UploadCode { wasm: HexBytes(a.into_bytes()), interface: HexBytes(b.into_bytes()), storage_limit: w },
+            58 => Action::CreateProgram {
+                wasm_hash: a,
+                interface_hash: b,
+                authority: familiar_key,
+                upgrade_delay_blocks: w,
+                policy: if small % 2 == 0 { ProgramPolicy::Open } else { ProgramPolicy::Additive },
+                accepts_transfers: ok,
+                init: (small % 3 != 0).then(|| InitCall { method: c, input: HexBytes(d.into_bytes()), value: y }),
+                fuel_limit: x,
+                storage_limit: y,
+                bindings: list.into_iter().map(|p| Binding { program: p, version_digest: "ab".into() }).collect(),
+            },
+            59 => Action::CallProgram {
+                calls: list.into_iter().zip(spam).map(|(p, v)| ProgramCall { program: p, version_digest: c.clone(), method: d.clone(), input: HexBytes(a.clone().into_bytes()), value: v }).collect(),
+                fuel_limit: w,
+                storage_limit: x,
+                bindings: if ok { vec![Binding { program: b, version_digest: String::new() }] } else { vec![] },
+            },
+            60 => Action::ProgramsPause {},
             _ => unreachable!(),
         })
     }
@@ -3340,14 +4072,14 @@ pub(crate) mod tests {
         }
     }
 
-    /// Every vector action (tags 0–54 and 60–61), where one names a validator by the stand-in
+    /// Every vector action (tags 0–54, 60–64 and 69), where one names a validator by the stand-in
     /// address the SDK's vectors use, with a real address in its place, so that more of them pass
     /// the format rules (what is left that doesn't is a case for the error paths).
     fn edge_actions() -> &'static [Action] {
         static ACTIONS: std::sync::OnceLock<Vec<Action>> = std::sync::OnceLock::new();
         ACTIONS.get_or_init(|| {
             let (v, w) = (address_of(31), address_of(32));
-            let all = vector_actions().into_iter().chain(v1_vector_actions()).chain(ghost_vector_actions()).chain(small_set_vector_actions());
+            let all = vector_actions().into_iter().chain(v1_vector_actions()).chain(ghost_vector_actions()).chain(small_set_vector_actions()).chain(program_vector_actions());
             all.map(|a| serde_json::from_str(&serde_json::to_string(&a).unwrap().replace("\"boo1v\"", &format!("\"{v}\"")).replace("\"boo1w\"", &format!("\"{w}\""))).unwrap()).collect()
         })
     }
@@ -3484,8 +4216,8 @@ pub(crate) mod tests {
 
     /// The same cases that matter most, listed (so that the mutations the change was checked with each
     /// have an input that catches them, and the property's luck isn't all there is): every action
-    /// with the key and then the signature gone wrong in each way, and both together on a transfer and
-    /// a private transfer. Counts what the old function said, so that the test fails
+    /// with the key and then the signature gone wrong in each way, and both together on a transfer, a
+    /// program call and a private transfer. Counts what the old function said, so that the test fails
     /// if it stops reaching a rule.
     #[test]
     fn the_cheaper_functions_answer_as_before_on_every_listed_edge() {
@@ -3500,7 +4232,7 @@ pub(crate) mod tests {
                 cases.push(edge_tx(action, [0; 6], op, none, 5));
                 cases.push(edge_tx(action, [0; 6], none, op, 6));
             }
-            if ["transfer", "private_transfer"].contains(&action.kind()) {
+            if ["transfer", "call_program", "private_transfer"].contains(&action.kind()) {
                 for &key in &ops[1..] {
                     cases.extend(ops[1..].iter().map(|&sig| edge_tx(action, [0; 6], key, sig, 7)));
                 }
@@ -3514,7 +4246,7 @@ pub(crate) mod tests {
             }
             // Two of the other fields wrong at once, so that the rule that speaks first is the one
             // that always did (the order of the checks is part of what they say).
-            if ["transfer", "private_transfer"].contains(&action.kind()) {
+            if ["transfer", "call_program", "private_transfer"].contains(&action.kind()) {
                 for (first, second) in (0..6).flat_map(|a| (a + 1..6).map(move |b| (a, b))) {
                     for (x, y) in (1..8).flat_map(|x| (1..8).map(move |y| (x, y))) {
                         let mut parts = [0; 6];
@@ -3534,7 +4266,7 @@ pub(crate) mod tests {
                 .or_default() += 1;
             }
         }
-        assert_eq!(tags, (0..=54).chain(60..=61).collect(), "every action tag (v1's 30–49 among them)");
+        assert_eq!(tags, (0..=54).chain(60..=64).chain([69]).collect(), "every action tag (program tags 62–64 and 69, v1's 30–49 among them)");
         let said_with = |start: &str| said.iter().filter(|(k, _)| k.starts_with(start)).map(|(_, n)| n).sum::<usize>();
         for (what, at_least) in [
             ("accepted", 1_000),
@@ -3608,14 +4340,17 @@ pub(crate) mod tests {
         }
     }
 
-    /// A signed transfer (the v1 tx every node sees most) and a signed delegation, with a real key
-    /// and signature, so each has the 1,952-byte key and 3,309-byte signature a block carries.
+    /// A signed transfer (the v1 tx every node sees most), a signed delegation and a signed program
+    /// call (tag 64: the one S4c's benches pad a block with), with a real key and signature, so
+    /// each has the 1,952-byte key and 3,309-byte signature a block carries.
     fn timing_txs() -> Vec<(&'static str, Tx)> {
         let keys = crypto::Keys::from_seed([5; 32]);
         let tx = |action| Tx { chain_id: "blockula-1".into(), genesis_hash: "ab".repeat(32), from: keys.address(), nonce: 3, fee: 1_000_000, tip: 0, valid_until: 500, action, memo: String::new(), public_key: String::new(), signature: String::new() }.sign(&keys);
+        let call = ProgramCall { program: keys.address(), version_digest: "cd".repeat(32), method: "nop".into(), input: HexBytes(vec![]), value: 0 };
         vec![
             ("a v1 transfer", tx(Action::Transfer { to: "alice.boo".into(), amount: 1_000_000_000 })),
             ("a delegation", tx(Action::Delegate { validator: keys.address(), amount: 5_000_000_000 })),
+            ("a program call", tx(Action::CallProgram { calls: vec![call], fuel_limit: 6_000, storage_limit: 50_000_000_000, bindings: vec![] })),
         ]
     }
 

@@ -9,6 +9,8 @@ export const to = {
   name: (name: string) => `/name/${encodeURIComponent(name.replace(/\.boo$/, ""))}`,
   programs: () => "/programs",
   program: (id: string) => `/programs/${id}`,
+  /** A program anyone deployed, by its address (or a stored code, by its hash). */
+  deployed: (address: string) => `/program/${encodeURIComponent(address)}`,
   hunt: (id: number | string) => `/hunt/${encodeURIComponent(String(id))}`,
   claim: (id: number | string) => `/claim/${encodeURIComponent(String(id))}`,
   seance: (id: number | string) => `/seance/${encodeURIComponent(String(id))}`,
@@ -16,9 +18,9 @@ export const to = {
 
 /** Where a `/api/search` hit lives in the app. */
 export const searchHref = (hit: { type: string; id: string }) =>
-  hit.type === "block" ? to.block(hit.id) : hit.type === "tx" ? to.tx(hit.id) : hit.type === "account" ? to.account(hit.id) : to.name(hit.id);
+  hit.type === "block" ? to.block(hit.id) : hit.type === "tx" ? to.tx(hit.id) : hit.type === "account" ? to.account(hit.id) : hit.type === "program" || hit.type === "code" ? to.deployed(hit.id) : to.name(hit.id);
 
 /** Explorer pages are wide (charts, tables); the wallet's own pages are a narrow column. */
 export function isExplorerPath(path: string) {
-  return /^\/(explore|block|tx|account|trace|programs|hunt|claim|seance)(\/|$)/.test(path) || /^\/name\/[^/]+/.test(path);
+  return /^\/(explore|block|tx|account|trace|programs?|hunt|claim|seance)(\/|$)/.test(path) || /^\/name\/[^/]+/.test(path);
 }

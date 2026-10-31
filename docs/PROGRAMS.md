@@ -1,12 +1,20 @@
 # Programs: third-party, Turing-complete programs on Blockula
 
-> **A design, not built yet: nobody can deploy a program today. Programs will be reviewed by AI
-> agents, not externally audited (D3).**
+> **Programs v0 is built, and [PROGRAMS-V0.md](PROGRAMS-V0.md) is its specification.** It amends
+> this design (its section 0 lists every amendment, A1 to A40) and is what the node runs: where
+> the two disagree, PROGRAMS-V0.md wins for protocol v2, and what it doesn't mention and its v0
+> cut keeps holds as written here. This file stays as the longer design: the reasoning, the
+> alternatives, and the parts v0 defers (tags 65 to 68 and 70, grants, upgrades, `/simulate`, the
+> receipts root). Programs are optional and off by default: a chain gets them with `blockula summon
+> --programs` or by governance. The audit and eight-weeks-on-testnet gates this design describes
+> (D2, 14.3) are superseded by the launch kit's scope (PROGRAMS-V0.md section 0 and 9.3); section
+> 10.6 there lists what a supported programs-on release needs, and
+> [AUDIT_SCOPE.md](AUDIT_SCOPE.md#programs-optional-off-by-default) the external audit's scope.
 
 > **Update, 2026-10-22: there's no mainnet.** Blockula 1.0 is a kit for launching your own ledger
 > ([LAUNCH.md](LAUNCH.md)), and programs are an optional feature with no deadline: built into the
 > node and switched off. What this design says about going live on mainnet (D2, 14.3, section 16)
-> is dropped. MAINNET.md, LAUNCH-PLAN.md and COUNSEL_BRIEF.md, which it cites, were removed with
+> is dropped. MAINNET.md, LAUNCH-PLAN.md and COUNSEL_BRIEF.md, which it cited, were removed with
 > the mainnet plan.
 
 Status: design, revision 3, 2026-10-19. Line numbers cite main at `2bbecde` (after v0.5.2), each one
@@ -133,7 +141,7 @@ Existing text renamed when this landed (revision 3):
   contract's ABI maps onto `ActionSpec`"), the `/programs` pages ("smart contracts", "Your
   contract here", "like a contract's") and the glossary's `program`.
 - PLAN.md's Execution decision and roadmap phase 4: "WASM/RISC-V contracts".
-- MAINNET.md section 4's pointer, and AGENTS.md's "the same shape contracts will use".
+- AGENTS.md's "the same shape contracts will use".
 
 ---
 
@@ -331,7 +339,7 @@ developers and adoption, and delivery risk and fit with the code.
 - **On delivery,** wasmi keeps program state in the existing `SubState`/`TMap` model under a cap.
   It extends the fee machinery the way Ghost Mode did, and its engine is a pure-Rust interpreter
   with no code generation. None of that touches the state layer whose schedule set the mainnet
-  date then (MAINNET.md section 5, Track A).
+  date then.
 
 The developers judge's caveat stands. If porting existing DeFi as fast as possible were the top
 priority, the EVM would win on speed alone, at a real cost to safety and to the chain's identity.
@@ -470,8 +478,8 @@ function and offset, if:
 
 MAINNET-DESIGN section 2 bars floats, wall clocks, randomness and `HashMap` order from anything that
 touches state or block validity, so admission, execution, replay and snapshot restore must agree.
-A reachable panic is a halt of every validator: MAINNET.md notes that one in end-of-block code
-stops them all at the same height, and again on every restart.
+A reachable panic is a halt of every validator: one in end-of-block code stops them all at the
+same height, and again on every restart.
 
 | Hazard | How it's closed |
 |---|---|
@@ -1549,7 +1557,7 @@ the fee phase, fees stop counting. Released SDKs also throw on an account holdin
     `Σ value` plus the deposits it bonded.
 
   A mismatch is a runtime fault: the transaction fails (`ConservationFault`),
-  `blockula_program_conservation_faults_total` fires, and nothing is minted or taken. This is the
+  `blockula_program_conservation_faults_total` fires, and nothing is minted or taken. (v0 does not emit this counter: the receipt carries the outcome, `commit`, with W1's `CommitError` number; PROGRAMS-V0.md §8.1 and §8.2.) This is the
   runtime check MAINNET-DESIGN's invariant ("supply = Σ balances + escrows…") otherwise gets only
   in tests. The `program_commit` fuzz target asserts both properties.
 - **Opening accounts.** A program's `transfer` to an account that doesn't exist fails (a status,
@@ -2269,6 +2277,16 @@ audit's scope, because every binary carries it even while programs are off.
   - `host_abi` (pointer, length and amount fuzzing).
 
   `program_validate` and `program_exec` also run nightly under AddressSanitizer.
+
+  **As built for v0** (PROGRAMS-V0.md section 10.4; the record and the campaign's plan are in
+  [AUDIT_SCOPE.md](AUDIT_SCOPE.md#programs-optional-off-by-default)). In `node/vm/fuzz`:
+  `program_validate`, `program_exec` and `interface_codec`; `host_abi` is part of `program_exec`
+  (the host, overlay and executor under fuzzer-shaped batches). In `node/fuzz` (the `TARGETS` of
+  `src/harness.rs`): `program_tx_codec` (tags 62 to 64 and 69, since v0 decodes only those),
+  `program_receipt` (the receipt codec, which is JSON in v0: there is no `receipt_codec`),
+  `program_commit`, and `state_machine_programs`, the state machine on a v2 fixture with programs on
+  and four guests created, with its own oracles. Every one runs nightly for five minutes; the
+  CPU-day campaign of PROGRAMS-V0.md section 10.6 has not been run.
 - **Property tests:** 10,000 consecutive full blocks through the fuel controller with no overflow;
   rewording every programs error message moves no receipt digest; the action × signer matrix.
 - **The worst-case-block CI gate.** For every pattern in the adversarial corpus (4.5), a full
@@ -2666,7 +2684,7 @@ than on code. With no external audit, there's no audit queue to wait for.
 | `sdk-ts/src/tx.ts`, `program.ts`, `describe.ts`, `proof.ts`, `index.ts`, `test/` | Tags 62–70, `KeyGrants` decoding, the interface codec, Borsh with `bigint`, selectors, the receipt codec, `Program`, `wallet.call` with re-simulation, proven program reads, grants and receipts, codegen, vectors |
 | `mcp/src/index.ts`, `untrusted.ts`, `spend.ts` | `program_*` tools, elicitation and the confirm digest, `BLOCKULA_PROGRAMS`, `BLOCKULA_UNCONFIRMED_MAX`, refusals, the `programText` pass, spend reservation |
 | `web/lib/explorer/programs.ts`, `interface.ts` (new), `preflight.ts`, `components/explorer/ActionForm.tsx`, app routes | Deployed programs, `specFromInterface`, bigint `ParamType`s, `prepare` with re-simulation, facts and claims in previews, full addresses with fingerprints, the program and code pages, agent scopes with allowances |
-| `docs/` | Landed with revision 3: `PROGRAMS.md` (this file), `PROGRAMS-PLAN.md`, MAINNET-DESIGN's tags 62–70, namespaces 66–73 and section 7, LAUNCH-PLAN.md's programs section, and the renames in section 1. With the code: AGENTS.md rows for tags 62–70 and rules of the road; GOVERNANCE.md keys; OPERATIONS.md (memory, `--serve-simulate`, the replay policy, the upgrade's schema change); PLAN.md Known limits (MEV, randomness, the cap, the training wheels); BUG_BOUNTY.md (the VM in scope from testnet-2's activation); AUDIT_SCOPE.md (the tags 62–70 codec in the protocol engagement; the VM and its integration outside it, D3) and `docs/audits/` (section 13) |
+| `docs/` | Landed with revision 3: `PROGRAMS.md` (this file), `PROGRAMS-PLAN.md`, MAINNET-DESIGN's tags 62–70, namespaces 66–73 and section 7, and the renames in section 1. With the code: AGENTS.md rows for tags 62–70 and rules of the road; GOVERNANCE.md keys; OPERATIONS.md (memory, `--serve-simulate`, the replay policy, the upgrade's schema change); PLAN.md Known limits (MEV, randomness, the cap, the training wheels); BUG_BOUNTY.md (the VM in scope from testnet-2's activation); AUDIT_SCOPE.md (the tags 62–70 codec in the protocol engagement; the VM and its integration outside it, D3) and `docs/audits/` (section 13) |
 
 ## Appendix B. An agent's call, end to end
 

@@ -1,0 +1,45 @@
+{
+  "format": 1,
+  "methods": [
+    {
+      "name": "open",
+      "kind": "call",
+      "payable": true,
+      "args": [
+        {
+          "name": "id",
+          "type": "u64"
+        },
+        {
+          "name": "seller",
+          "type": "address"
+        }
+      ],
+      "returns": null
+    },
+    {
+      "name": "refund",
+      "kind": "call",
+      "payable": false,
+      "args": [
+        {
+          "name": "id",
+          "type": "u64"
+        }
+      ],
+      "returns": null
+    },
+    {
+      "name": "release",
+      "kind": "call",
+      "payable": false,
+      "args": [
+        {
+          "name": "id",
+          "type": "u64"
+        }
+      ],
+      "returns": null
+    }
+  ]
+}

@@ -8,7 +8,7 @@
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
 import { bech32m } from "@scure/base";
-import { DROPS_PER_FANG, PUBLIC_KEY_LEN, proposalDigest, type ProposalKind } from "./tx.js";
+import { DROPS_PER_FANG, PUBLIC_KEY_LEN, interfaceHash, isProgramAction, proposalDigest, wasmHash, type Action, type ProposalKind } from "./tx.js";
 
 /** Options of `describeKind` / `describeAction`. */
 export interface DescribeOptions {
@@ -131,6 +131,75 @@ function netAddr(v: unknown): string {
 function consensusKey(v: unknown): string {
   if (typeof v !== "string" || !new RegExp(`^[0-9a-f]{${PUBLIC_KEY_LEN * 2}}$`).test(v)) return "an unreadable consensus key";
   return `consensus key ${hex(bytesToHex(blake3(hexToBytes(v))), 32, "key id")}`;
+}
+
+// ---- Program actions (tags 62–64 and 69, docs/PROGRAMS-V0.md §2), described from their structure
+// only, as node/src/programs/describe.rs does: programs and code by address and hash, the FANG
+// that goes in, what the program may become. A method's name, an interface's identifiers and a
+// call's input are the deployer's or the caller's words, and these never quote them (PRG 9.7). ----
+
+/** An address a program action names (a program, an authority): in full, or unreadable. Never a name: programs are named by address. */
+function addressOnly(v: unknown, what: string): string {
+  return address(v) ? v : `an unreadable ${what}`;
+}
+
+/** Uploaded bytes (lowercase hex, as `upload_code` carries them) by the hash a create names them with, and their size. */
+function blob(v: unknown, hash: (hex: string) => string, what: string): string {
+  if (typeof v !== "string" || !/^(?:[0-9a-f]{2})*$/.test(v)) return `an unreadable ${what}`;
+  return `${what} ${hex(hash(v), 32, "hash")} (${grouped(String(v.length / 2))} bytes)`;
+}
+
+/** A binding's digest that admits any version of its program (node/vm `exec::ANY_VERSION`). */
+const ANY_VERSION = "0".repeat(64);
+
+/** The other programs a program action's code may reach (its bindings), or nothing when there are none. */
+function bindings(v: unknown): string {
+  if (!Array.isArray(v)) return "; its code may also reach an unreadable list of programs";
+  if (v.length === 0) return "";
+  const each = v.map((b) => {
+    const x = obj(b);
+    const version = x.version_digest === ANY_VERSION ? " (any version)" : typeof x.version_digest === "string" && /^[0-9a-f]{64}$/.test(x.version_digest) ? "" : " (an unreadable version)";
+    return `${addressOnly(x.program, "program")}${version}`;
+  });
+  return `; its code may also reach ${each.join(", ")}`;
+}
+
+/**
+ * What a create's authority may later do to the program, once program upgrades exist (inert in
+ * v0): the sentence's subject ("an immutable program" or "a program") and what follows the code.
+ */
+function upgrades(a: Record<string, unknown>): [string, string] {
+  if (a.authority === undefined || a.authority === null) {
+    // The one encoding of an immutable program; the chain refuses any other.
+    if (whole(a.upgrade_delay_blocks) === 0n && a.policy === "open") return ["an immutable program", ""];
+    return ["a program", ", with an unreadable upgrade setting (no authority, but an upgrade delay or policy)"];
+  }
+  const policy = a.policy === "open" ? "any code" : a.policy === "additive" ? "code that keeps every method" : "an unreadable policy";
+  return ["a program", `, upgradable by ${addressOnly(a.authority, "account")} to ${policy} with ${n(a.upgrade_delay_blocks)} blocks' notice once program upgrades exist`];
+}
+
+/** A create's initializer (the interface's `Init` method, never named here) and the FANG it's sent, or nothing when there's none. */
+function initializer(v: unknown): string {
+  if (v === undefined || v === null) return "";
+  if (typeof v !== "object" || Array.isArray(v)) return ", running an unreadable initializer";
+  const value = obj(v).value;
+  return whole(value) === 0n ? ", running its initializer" : `, running its initializer with ${fangText(value)} attached`;
+}
+
+/** The sum of the calls' values (drops), or `undefined` if one can't be read exactly. */
+function callValue(calls: Record<string, unknown>[]): bigint | undefined {
+  let sum = 0n;
+  for (const c of calls) {
+    const v = whole(c.value);
+    if (v === undefined) return undefined;
+    sum += v;
+  }
+  return sum;
+}
+
+/** The storage deposits a program action may bond, at most (`storage_limit`, and what for), or nothing when it's 0. */
+function storage(v: unknown, what = ""): string {
+  return whole(v) === 0n ? "" : `, bonding at most ${fangText(v)} in storage deposits${what}`;
 }
 
 /**
@@ -347,6 +416,28 @@ export function describeAction(action: unknown, opts: DescribeOptions = {}): str
       return `Signal that the account's candidate validator node is running, to join a set of one or two at the end of epoch ${n(a.epoch)} (validators)`;
     case "admit_validator":
       return `Admit candidate validator ${account(a.validator)} into a set of one or two at the end of epoch ${n(a.epoch)} (validators)`;
+    case "upload_code":
+      return `Upload ${blob(a.wasm, wasmHash, "program code")} with ${blob(a.interface, interfaceHash, "interface")}${storage(a.storage_limit, " for whichever isn't stored yet")}`;
+    case "create_program": {
+      const [program, upgradable] = upgrades(a);
+      const transfers = a.accepts_transfers === true ? ", accepting transfers" : a.accepts_transfers === false ? "" : ", with an unreadable transfer setting";
+      return `Create ${program} from code ${hex(a.wasm_hash, 32, "code hash")} and interface ${hex(a.interface_hash, 32, "interface hash")}${upgradable}${transfers}${initializer(a.init)}${storage(a.storage_limit)}${bindings(a.bindings)}`;
+    }
+    case "call_program": {
+      if (!Array.isArray(a.calls) || a.calls.length === 0) return `Call programs: an unreadable list of calls${bindings(a.bindings)}`;
+      const calls = a.calls.map(obj);
+      // The programs called, each once, in the order the calls first name them.
+      const programs = [...new Set(calls.map((c) => addressOnly(c.program, "program")))];
+      const what =
+        calls.length === 1 ? `Call program ${programs[0]}`
+        : programs.length === 1 ? `Make ${calls.length} calls to program ${programs[0]} (all or nothing)`
+        : `Call ${programs.length} programs (${programs.join(", ")}) in ${calls.length} calls (all or nothing)`;
+      const value = callValue(calls);
+      const attached = value === undefined ? " with an unreadable amount of FANG attached" : value > 0n ? ` with ${fangText(value)} attached` : "";
+      return `${what}${attached}${storage(a.storage_limit)}${bindings(a.bindings)}`;
+    }
+    case "programs_pause":
+      return "Vote to pause programs (validators: they pause once f + 1 of the epoch's validators have)";
     default:
       return `Something this client can't read (an action of type ${typeof a.type === "string" ? token(a.type, /^[a-z_]{1,40}$/, "type") : "unknown"}): don't approve it from here`;
   }
@@ -360,7 +451,9 @@ export interface ActionReview {
    * Whether this client could read all of it: false for anything it described as unreadable
    * (an unknown type, a malformed field, a number JSON rounded, a key id the chain couldn't store)
    * and for a `vote` whose proposal (`opts.proposal`) wasn't given or doesn't hash to the digest
-   * it binds. Don't offer to approve an action that isn't `readable`.
+   * it binds; and for a program action, which no multisig holds (the node never decodes one inside
+   * a multisig proposal), so a node that shows one as pending isn't showing what the chain stores.
+   * Don't offer to approve an action that isn't `readable`.
    */
   readable: boolean;
 }
@@ -378,5 +471,7 @@ export function reviewAction(action: unknown, opts: DescribeOptions = {}): Actio
   const ours = does.replace(/ \((?:reason|label|title), as written: “[^”]*”\)/g, "");
   const unreadable = /\b(unreadable|can't read|too large for this client)\b/.test(ours);
   const vote = a.type !== "vote" || voteTarget(a, opts).ok;
-  return { does, readable: !unreadable && vote };
+  // A multisig holds no program action: the node never decodes one inside a multisig proposal.
+  const multisigCanHold = !isProgramAction(a as unknown as Action);
+  return { does, readable: !unreadable && vote && multisigCanHold };
 }

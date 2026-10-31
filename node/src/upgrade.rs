@@ -76,10 +76,16 @@ pub const MAX_VERSION_STEP: u32 = 16;
 pub const MAX_UPGRADE_HORIZON_DAYS: u64 = 365;
 
 /// Exit codes of a node that stops on purpose (docs/OPERATIONS.md: systemd's
-/// `RestartPreventExitStatus=10 11 12` keeps it down until an operator acts).
+/// `RestartPreventExitStatus=10 11 12 13` keeps it down until an operator acts, and so does
+/// `deploy/entrypoint.sh`). 13 stays down: a program faulted while this node executed a block a
+/// quorum executed without one, so this node differs from them, and a restart would replay the
+/// block. 14 restarts: this node couldn't make a program's thread or engine, which a restart may
+/// cure (docs/PROGRAMS-V0.md §6.2).
 pub const EXIT_HALT_HEIGHT: i32 = 10;
 pub const EXIT_UPGRADE_REQUIRED: i32 = 11;
 pub const EXIT_DOUBLE_SIGN_RISK: i32 = 12;
+pub const EXIT_PROGRAM_FAULT: i32 = 13;
+pub const EXIT_PROGRAM_RESOURCES: i32 = 14;
 
 /// The programs feature (docs/PROGRAMS.md): third-party WebAssembly programs, which protocol v2
 /// ships dormant. v2 changes nothing until governance (or the genesis) switches this on.
@@ -514,7 +520,8 @@ pub fn check_may_activate(feature: &str, chain_id: &str, version: u32) -> Result
 }
 
 /// Switches a feature on that the version in force at `height` knows, on a chain that lets it
-/// under that version ([`check_may_activate`]).
+/// under that version ([`check_may_activate`]). Programs' first activation creates their state
+/// (`programs::on_activate`, journaled with the rest; a reactivation after exit-only keeps it).
 pub(crate) fn exec_activate_feature(state: &mut State, j: &mut Journal, chain_id: &str, feature: &str, height: u64) -> Result<()> {
     let version = version_at(state, height);
     check_known_feature(feature, version)?;
@@ -524,6 +531,9 @@ pub(crate) fn exec_activate_feature(state: &mut State, j: &mut Journal, chain_id
     }
     j.upgrade.features.touch(&state.upgrade.features, feature);
     state.upgrade.features.insert(feature.to_string(), Feature { activated_at: height });
+    if feature == PROGRAMS_FEATURE {
+        crate::programs::on_activate(state, Some(j));
+    }
     Ok(())
 }
 
@@ -576,6 +586,13 @@ pub enum Halt {
     /// Slashing protection saw this validator's key sign something this process didn't
     /// (`protection.rs`): another instance runs with the same key.
     DoubleSignRisk { reason: String },
+    /// Executing block `height`, a program transaction (`tx`, its id) met a node fault tied to it
+    /// (`fault`, what happened: docs/PROGRAMS-V0.md §6.2), never an outcome. The block is
+    /// certified, so a quorum executed it without one: this node differs from them.
+    ProgramFault { height: u64, tx: String, fault: String },
+    /// Executing block `height`, this node couldn't make what a program transaction needs (a
+    /// thread or an engine: `fault`, what happened), which a restart may cure (§6.2).
+    ProgramResources { height: u64, fault: String },
 }
 
 impl Halt {
@@ -585,6 +602,8 @@ impl Halt {
             Halt::AtHeight { .. } => EXIT_HALT_HEIGHT,
             Halt::UpgradeRequired { .. } => EXIT_UPGRADE_REQUIRED,
             Halt::DoubleSignRisk { .. } => EXIT_DOUBLE_SIGN_RISK,
+            Halt::ProgramFault { .. } => EXIT_PROGRAM_FAULT,
+            Halt::ProgramResources { .. } => EXIT_PROGRAM_RESOURCES,
         }
     }
 
@@ -594,6 +613,8 @@ impl Halt {
             Halt::AtHeight { .. } => "halt_height",
             Halt::UpgradeRequired { .. } => "upgrade_required",
             Halt::DoubleSignRisk { .. } => "double_sign_risk",
+            Halt::ProgramFault { .. } => "program_fault",
+            Halt::ProgramResources { .. } => "program_resources",
         }
     }
 }
@@ -606,6 +627,12 @@ impl std::fmt::Display for Halt {
                 write!(f, "block {height} runs protocol v{version}, but this binary supports up to v{supported}: upgrade blockula to keep following the chain")
             }
             Halt::DoubleSignRisk { reason } => write!(f, "stopped to avoid double-signing: {reason}"),
+            Halt::ProgramFault { height, tx, fault } => {
+                write!(f, "block {height} can't be executed here: a program execution fault in tx {tx} ({fault}); this node stopped rather than guess an outcome: see docs/OPERATIONS.md, Incident response")
+            }
+            Halt::ProgramResources { height, fault } => {
+                write!(f, "block {height} can't be executed here: this node couldn't make what a program transaction needs ({fault}); it stopped rather than guess an outcome, and a restart may cure it: see docs/OPERATIONS.md, Incident response")
+            }
         }
     }
 }
@@ -968,12 +995,19 @@ mod tests {
             Halt::AtHeight { height: 7 },
             Halt::UpgradeRequired { height: 8, version: 3, supported: 2 },
             Halt::DoubleSignRisk { reason: "x".into() },
+            Halt::ProgramFault { height: 9, tx: "ab".repeat(32), fault: "a panic in program execution".into() },
+            Halt::ProgramResources { height: 10, fault: "the OS refused a program thread 3 times".into() },
         ];
         let codes: Vec<i32> = halts.iter().map(Halt::exit_code).collect();
-        assert_eq!(codes, [EXIT_HALT_HEIGHT, EXIT_UPGRADE_REQUIRED, EXIT_DOUBLE_SIGN_RISK]);
+        assert_eq!(codes, [EXIT_HALT_HEIGHT, EXIT_UPGRADE_REQUIRED, EXIT_DOUBLE_SIGN_RISK, EXIT_PROGRAM_FAULT, EXIT_PROGRAM_RESOURCES]);
+        assert_eq!(codes, [10, 11, 12, 13, 14], "the codes deploy/entrypoint.sh and docs/OPERATIONS.md's unit name (13 stays down, 14 restarts)");
         assert!(codes.iter().all(|c| ![0, 1, 2].contains(c)), "distinct from success, errors and usage errors");
-        assert_eq!(halts.iter().map(Halt::kind).collect::<Vec<_>>(), ["halt_height", "upgrade_required", "double_sign_risk"]);
+        assert_eq!(halts.iter().map(Halt::kind).collect::<Vec<_>>(), ["halt_height", "upgrade_required", "double_sign_risk", "program_fault", "program_resources"]);
         assert!(halts[1].to_string().contains("block 8 runs protocol v3, but this binary supports up to v2"));
+        let fault = halts[3].to_string();
+        assert!(fault.starts_with(&format!("block 9 can't be executed here: a program execution fault in tx {} (a panic in program execution);", "ab".repeat(32))) && fault.ends_with("see docs/OPERATIONS.md, Incident response"), "{fault}");
+        let resources = halts[4].to_string();
+        assert!(resources.starts_with("block 10 can't be executed here: this node couldn't make what a program transaction needs (the OS refused a program thread 3 times);") && resources.contains("a restart may cure it"), "{resources}");
         // The first reason sticks.
         let signal = HaltSignal::default();
         signal.set(halts[0].clone());

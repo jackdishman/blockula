@@ -10,6 +10,8 @@ import type { Action } from "@blockula/sdk";
 import { BLOCKS_PER_DAY } from "../config";
 import { BOND_TERMS, CONTRIBUTION_NOTES_BOTH } from "../creators";
 import type { TermKey } from "./glossary";
+import { inertText, shortAddress } from "./inert";
+import type { DeployedProgramView } from "./types";
 
 /**
  * - `account`: a `.boo` name or an address, in a field the chain resolves itself (a payment's
@@ -65,19 +67,43 @@ export interface ActionSpec {
   describe(raw: Record<string, string>): string;
 }
 
-export interface Program {
-  id: "names" | "hunts" | "pool" | "validators" | "accounts";
+/** The chain's built-in modules (what `PROGRAMS` lists). */
+export type NativeProgramId = "names" | "hunts" | "pool" | "validators" | "accounts";
+
+interface ProgramBase {
   title: string;
   tagline: string;
   term: TermKey;
   /** State it exposes, by node path. */
   reads: { path: string; what: string }[];
-  /** Transaction kinds that belong to it. */
+  /** Transaction kinds that belong to it (a deployed program's: the methods its interface names, the deployer's words). */
   calls: string[];
   actions: ActionSpec[];
   /** Calls that need special keys or tools, explained instead of offered. */
   elsewhere?: string;
 }
+
+/** A built-in module: its id is one of five, and its actions are forms. */
+export interface NativeProgram extends ProgramBase {
+  kind: "native";
+  id: NativeProgramId;
+}
+
+/**
+ * A program anyone deployed (protocol v2): WebAssembly the chain runs, named by its address. It's
+ * described the way a built-in one is, but with no `ActionSpec` forms yet: in v0 calls are made with
+ * the CLI and the SDK, and this explorer only reads (docs/PROGRAMS-V0.md §8.6, docs/PROGRAMS.md 11.3).
+ * Everything it names (its methods, their arguments) is its deployer's claim: `calls` holds text a
+ * stranger wrote, to be shown as text and marked as theirs, never as markup or as the explorer's own words.
+ */
+export interface DeployedProgram extends ProgramBase {
+  kind: "deployed";
+  /** Its address. */
+  id: string;
+  actions: [];
+}
+
+export type Program = NativeProgram | DeployedProgram;
 
 export const actionId = (a: ActionSpec) => a.id ?? a.kind;
 
@@ -86,8 +112,9 @@ const blocksOf = (days: number) => days * BLOCKS_PER_DAY;
 const fang = (v: Values, k: string) => String(v[k]);
 const bare = (n: string) => (n || "…").toLowerCase().replace(/\.boo$/, "");
 
-export const PROGRAMS: Program[] = [
+export const PROGRAMS: NativeProgram[] = [
   {
+    kind: "native",
     id: "accounts",
     title: "Accounts & keys",
     tagline: "Balances, transfers, and the keys allowed to sign for each account.",
@@ -131,6 +158,7 @@ export const PROGRAMS: Program[] = [
       "Keys join an account only with their own consent, a grant code their holder makes for it, so adding and revoking keys has its own guided flow (grant codes, budgets, expiry) on Devices & agents. Multisig accounts are set up and approved with the CLI (`blockula multisig create`, `propose`, `approve`), which decodes each action before an approval binds it. Passkey owners can't approve in the wallet yet, and the CLI signs with a key file, so a multisig whose owners are passkeys can't approve anything for now.",
   },
   {
+    kind: "native",
     id: "names",
     title: "Names",
     tagline: "Human-readable .boo names that point to accounts, registered a year at a time.",
@@ -209,6 +237,7 @@ export const PROGRAMS: Program[] = [
     ],
   },
   {
+    kind: "native",
     id: "hunts",
     title: "Hunts",
     tagline: "Bounties on GitHub issues, held in escrow until the creator awards one for a merged PR.",
@@ -276,6 +305,7 @@ export const PROGRAMS: Program[] = [
     ],
   },
   {
+    kind: "native",
     id: "pool",
     title: "Contribution pool",
     tagline: "Pays for merged PRs, judged by Séances of human jurors with Soul.",
@@ -358,6 +388,7 @@ export const PROGRAMS: Program[] = [
     elsewhere: `Sealing and revealing Séance votes keeps a secret salt between the two steps, and a sealed judgment binds the pairs it was made on, so jurors use the CLI: \`blockula contrib vote\`, then \`blockula contrib reveal\`. ${CONTRIBUTION_NOTES_BOTH}`,
   },
   {
+    kind: "native",
     id: "validators",
     title: "Validators",
     tagline: "Who proposes and finalizes blocks, chosen by stake epoch by epoch.",
@@ -435,3 +466,35 @@ export const program = (id: string) => PROGRAMS.find((p) => p.id === id);
 
 /** `fund_hunt(hunt_id: int, amount: fang)`: an action's signature, as an interface listing shows it. */
 export const signature = (a: ActionSpec) => `${a.kind}(${a.params.map((p) => `${p.key}${p.optional ? "?" : ""}: ${p.type}`).join(", ")})`;
+
+/** Who may upgrade a deployed program, in this explorer's own words (the node's sentence is the node's). */
+export function upgradeSentence(p: Pick<DeployedProgramView, "authority" | "policy" | "upgrade_delay_blocks">): string {
+  if (!p.authority) return "Immutable: no account can ever change this program's code.";
+  const who = p.authority.address;
+  return `${who} may upgrade it, to ${p.policy === "open" ? "any code" : "code that keeps every method"}, with ${p.upgrade_delay_blocks.toLocaleString("en-US")} blocks' notice, once a protocol version adds program upgrades. None exists yet: it can't today.`;
+}
+
+/**
+ * A deployed program as a `Program` (the same shape the built-in ones have): what it exposes, and its
+ * methods under `calls`. No forms: calls are the CLI's and the SDK's in v0. Read tolerantly; the
+ * address is checked by the page that asks, and nothing here is markup.
+ */
+export function deployedProgram(v: DeployedProgramView): DeployedProgram {
+  const methods = Array.isArray(v.methods) ? v.methods : [];
+  return {
+    kind: "deployed",
+    id: v.address,
+    title: `Program ${shortAddress(v.address)}`,
+    tagline: upgradeSentence(v),
+    term: "program",
+    reads: [
+      { path: `/api/program/${v.address}`, what: "its record: creator, code and interface hashes, version digest, balance, storage totals, methods" },
+      { path: `/api/program/${v.address}/storage`, what: "its storage, a page at a time" },
+      { path: `POST /api/program/${v.address}/view`, what: "what a view method returns, run on the node" },
+      { path: v.proof_path, what: "its record with a Merkle proof against the state root" },
+    ],
+    calls: methods.filter((m) => m.kind === "call").map((m) => inertText(m.untrusted_name)),
+    actions: [],
+    elsewhere: "Calling a deployed program is signed with `blockula program call` or the SDK's `wallet.call` in this release: this page reads it, and signs nothing.",
+  };
+}

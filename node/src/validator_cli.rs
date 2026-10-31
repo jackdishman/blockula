@@ -239,6 +239,25 @@ pub(crate) async fn send_memo(remote: &Remote, keys: &Keys, from: &str, action: 
 /// builds it from the height `valid_until` counts from, one status read, so a node that lies
 /// about the height can stretch it by at most the validity window (audit gap-7-3).
 pub(crate) async fn send_memo_with(remote: &Remote, keys: &Keys, from: &str, make: impl FnOnce(u64) -> Result<Action>, memo: String) -> Result<Value> {
+    let (id, valid_until) = submit_with(remote, keys, from, make, memo, SendOpts::default()).await?;
+    wait_final(&remote.rpc, &id, valid_until).await
+}
+
+/// What a program transaction adds to the common send (`program_cli`): both default to a plain tx's.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SendOpts {
+    /// The fuel the tx reserves (docs/PROGRAMS-V0.md §5.1: its `fuel_limit` and the load of the code
+    /// it declares), priced at `/api/fees`' `fuel.suggested_rate` into the fee it signs, which is only
+    /// a ceiling: the including block charges its own rate. 0 for every tx but tags 62–64.
+    pub reserved_fuel: u64,
+    /// Sign at this nonce, not the account's next one: the caller printed what a nonce makes (the
+    /// address a create gets) before signing.
+    pub nonce: Option<u64>,
+}
+
+/// [`send_memo_with`] up to the node taking the tx: builds, signs and submits it, and returns its id
+/// and the height it's valid until, without waiting for it ([`wait_final`] does).
+pub(crate) async fn submit_with(remote: &Remote, keys: &Keys, from: &str, make: impl FnOnce(u64) -> Result<Action>, memo: String, opts: SendOpts) -> Result<(String, u64)> {
     let rpc = remote.rpc.as_str();
     let status = remote.status().await?;
     let height = status["height"].as_u64().ok_or_else(|| anyhow!("{rpc} doesn't report its height"))?;
@@ -246,18 +265,18 @@ pub(crate) async fn send_memo_with(remote: &Remote, keys: &Keys, from: &str, mak
     // have reached yet would let the node hold the tx and release it later (review-r3-clients-2).
     remote.check_height(height).await?;
     let action = make(height)?;
-    let nonce = match get(rpc, &format!("/account/{from}")).await {
-        Ok(a) => a["next_nonce"].as_u64().unwrap_or(0),
-        Err(_) => 0,
+    let nonce = match opts.nonce {
+        Some(n) => n,
+        None => match get(rpc, &format!("/account/{from}")).await {
+            Ok(a) => a["next_nonce"].as_u64().unwrap_or(0),
+            Err(_) => 0,
+        },
     };
     // Valid for 600 blocks (or the chain's maximum, if shorter).
     let validity = status["max_tx_validity_blocks"].as_u64().unwrap_or(600).min(600);
     let valid_until = height + validity;
-    let mut tx = Tx { chain_id: remote.chain_id.clone(), genesis_hash: remote.genesis_hash.clone(), from: from.into(), nonce, fee: 0, tip: 0, valid_until, action, memo, public_key: hex::encode(keys.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
-    // The highest base fee fixed for the next blocks (`/api/fees`); only the actual one is charged.
-    let fees = get(rpc, "/fees").await?;
-    let part = |k: &str| fees["suggested"][k].as_str().and_then(|v| v.parse().ok()).ok_or_else(|| anyhow!("{rpc}/api/fees has no suggested {k}"));
-    tx.fee = crate::econ::FeeSlot::pricing(part("flat")?, part("rate")?).fee(tx.size());
+    let mut tx = unsigned_tx(remote, keys, from, nonce, valid_until, action, memo);
+    tx.fee = fee_ceiling(rpc, &tx, opts.reserved_fuel).await?;
     let tx = tx.sign(keys);
     let res = reqwest::Client::new().post(format!("{}/api/tx", rpc.trim_end_matches('/'))).json(&tx).send().await?;
     let ok = res.status().is_success();
@@ -265,9 +284,36 @@ pub(crate) async fn send_memo_with(remote: &Remote, keys: &Keys, from: &str, mak
     if !ok {
         bail!("{}", v["error"].as_str().unwrap_or("rejected"));
     }
-    let id = v["id"].as_str().unwrap_or_default().to_string();
+    Ok((v["id"].as_str().unwrap_or_default().to_string(), valid_until))
+}
+
+/// `action` as a tx from `from` on `remote`'s chain, ready for [`fee_ceiling`] and signing: no fee
+/// yet, and a signature of the right length that isn't one, so its size is the signed tx's.
+pub(crate) fn unsigned_tx(remote: &Remote, keys: &Keys, from: &str, nonce: u64, valid_until: u64, action: Action, memo: String) -> Tx {
+    Tx { chain_id: remote.chain_id.clone(), genesis_hash: remote.genesis_hash.clone(), from: from.into(), nonce, fee: 0, tip: 0, valid_until, action, memo, public_key: hex::encode(keys.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) }
+}
+
+/// The fee `tx` signs: the highest base fee fixed for the next blocks (`/api/fees`) for its size and,
+/// for a program tx that reserves `reserved_fuel`, the most the fuel rate can reach in them (§5.5) on
+/// that. Only a ceiling: the including block charges its own base fee and rate, so it's also the most
+/// the tx can cost in fees (with no tip).
+pub(crate) async fn fee_ceiling(rpc: &str, tx: &Tx, reserved_fuel: u64) -> Result<u64> {
+    let fees = get(rpc, "/fees").await?;
+    let part = |k: &str| fees["suggested"][k].as_str().and_then(|v| v.parse().ok()).ok_or_else(|| anyhow!("{rpc}/api/fees has no suggested {k}"));
+    let mut fee = crate::econ::FeeSlot::pricing(part("flat")?, part("rate")?).fee(tx.size());
+    if reserved_fuel > 0 {
+        let rate = fees["fuel"]["suggested_rate"].as_u64().ok_or_else(|| anyhow!("{rpc}/api/fees has no fuel rate: programs are off there"))?;
+        let fuel = u128::from(rate) * u128::from(reserved_fuel) / u128::from(crate::econ::RATE_SCALE);
+        fee = fee.saturating_add(u64::try_from(fuel).unwrap_or(u64::MAX));
+    }
+    Ok(fee)
+}
+
+/// Waits for the tx `id` (valid until `valid_until`) to be final: its finalized JSON, or why it
+/// wasn't ([`tx_outcome`]); a tx still pending after a minute is reported as such, not as failed.
+pub(crate) async fn wait_final(rpc: &str, id: &str, valid_until: u64) -> Result<Value> {
     for _ in 0..120 {
-        if let Some(done) = get(rpc, &format!("/tx/{id}")).await.ok().and_then(|t| tx_outcome(&id, t, valid_until)) {
+        if let Some(done) = get(rpc, &format!("/tx/{id}")).await.ok().and_then(|t| tx_outcome(id, t, valid_until)) {
             return done;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;

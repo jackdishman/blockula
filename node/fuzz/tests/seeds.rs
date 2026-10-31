@@ -12,9 +12,15 @@ fn seeds_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("seeds")
 }
 
+/// Every seed `harness::seeds` builds is accepted, and each has a name of its own: `write_seeds`
+/// writes it to `seeds/<target>/<name>`, so two with one name would leave one. (One test, since
+/// `harness::seeds` builds a chain in a directory named after the process: two calls at once in
+/// one test binary would share it.)
 #[test]
 fn fresh_seeds_are_accepted() {
+    let mut names = std::collections::BTreeSet::new();
     for (target, name, bytes) in harness::seeds() {
+        assert!(names.insert((target, name)), "two seeds are named {target}/{name}");
         assert!(harness::run(target, &bytes), "{target}/{name}: the harness rejects the seed it built");
     }
 }

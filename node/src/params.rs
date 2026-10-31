@@ -254,10 +254,11 @@ pub const COUNCIL_KEYS: &[&str] = &[
 ];
 
 /// Whether a `ParamChange` of `key` is the token holders' alone: it needs the supermajority and
-/// the bootstrap council can't pass it. That's every key but [`COUNCIL_KEYS`]: governance's own
-/// ([`GOVERNANCE_KEYS`]) and the validators' ([`VALIDATOR_KEYS`]).
+/// the bootstrap council can't pass it. That's every key but [`COUNCIL_KEYS`] and programs' own
+/// council keys (`programs::COUNCIL_PARAMS`: all of programs' parameters but the minimum upgrade
+/// delay): governance's own ([`GOVERNANCE_KEYS`]) and the validators' ([`VALIDATOR_KEYS`]).
 pub fn tokens_only(key: &str) -> bool {
-    !COUNCIL_KEYS.contains(&key)
+    !COUNCIL_KEYS.contains(&key) && !crate::programs::COUNCIL_PARAMS.contains(&key)
 }
 
 /// How far past the block that changes it `governance_spend_height` may move (a year): a vote can

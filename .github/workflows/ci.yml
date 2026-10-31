@@ -80,6 +80,25 @@ jobs:
       - run: npm run build -w @blockula/sdk && npm run build -w @blockula/mcp
       - name: 4 validators + full node + SDK e2e + CLI
         run: bash scripts/local-testnet.sh
+      # The programs SDK e2e (docs/PROGRAMS-V0.md §8.4, WBS S7b): the SDK uploads, creates, calls and views real guests
+      # against `blockula dev --programs` (a temporary home), and the v1 SDK e2e runs there too, where its refusals depend
+      # on v2 being scheduled. The local testnet above is a v1 chain, where `test:programs` would skip: with
+      # BLOCKULA_E2E_PROGRAMS=1 a chain without programs fails the script instead. Nothing else runs the live programs path,
+      # so the recorded answers the unit tests, the MCP's and the explorers' tests serve can't drift from the node unseen.
+      - name: SDK programs e2e (blockula dev --programs)
+        run: |
+          home=$(mktemp -d)
+          BLOCKULA_HOME="$home" node/target/release/blockula dev --programs --port 7071 >"$home/dev.log" 2>&1 &
+          dev=$!
+          trap 'kill "$dev" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 90); do
+            curl -fsS http://127.0.0.1:7071/api/status 2>/dev/null | grep -q '"height":[1-9]' && break
+            kill -0 "$dev" 2>/dev/null || { cat "$home/dev.log"; exit 1; }
+            sleep 1
+          done
+          export BLOCKULA_RPC=http://127.0.0.1:7071 BLOCKULA_E2E_PROGRAMS=1
+          npm run test:programs -w @blockula/sdk
+          npm test -w @blockula/sdk
       # The runbook test below runs a blockula built to trust its test release key (only the
       # blockula crate rebuilds), so the real key id the ceremony builds in doesn't change what it
       # runs (review-r4-supply-1). No release, image or reproduction enables the feature.
@@ -234,9 +253,14 @@ jobs:
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends age
           REQUIRE_AGE=1 bash scripts/test-fuzz-seal.sh
+      # The nightly corpus is bounded so replaying it can't take the budget (scripts/fuzz-bound-corpus.sh).
+      - name: Fuzz corpus bound (the script, and the workflow's use of it)
+        run: bash scripts/test-fuzz-corpus.sh
       # The ruleset requires these jobs by name (supply-chain-B-3); the workflows are read with a
       # YAML parser, and what it can't read as GitHub does is refused (review-r3-supply-1).
       - name: Required checks match the ruleset (deploy/github/ruleset-main.json)
         run: node scripts/check-required-checks.mjs
+      - name: Every citation of docs/PROGRAMS-V0.md names a section or amendment it has
+        run: node scripts/check-spec-citations.mjs
       - name: Required-checks checker and ruleset script (offline fake gh)
         run: bash scripts/test-github-settings.sh

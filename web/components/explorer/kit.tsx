@@ -6,6 +6,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { Copy } from "@/components/ui";
 import { unreachableHint } from "@/lib/errors";
 import { GLOSSARY, type TermKey } from "@/lib/explorer/glossary";
+import { inertText } from "@/lib/explorer/inert";
 import { compactDrops, formatDrops, parseDrops, type Holding, type Me } from "@/lib/explorer/ledger";
 import { to } from "@/lib/explorer/routes";
 import type { KeyView, Label } from "@/lib/types";
@@ -227,6 +228,14 @@ export function Ext({ href, children, className }: { href: string | null | undef
 export function github(repo: string, kind: "issues" | "pull", n: number | null | undefined): string | null {
   if (!/^[\w.-]+\/[\w.-]+$/.test(repo) || !Number.isSafeInteger(n) || (n as number) < 0) return null;
   return `https://github.com/${repo.split("/").map(encodeURIComponent).join("/")}/${kind}/${n}`;
+}
+
+/**
+ * Text a program or its deployer chose (a method's, an argument's or an event's name, an abort message), shown as
+ * text in a box of its own: what hides or reorders text removed, cut short. Never in the explorer's own words.
+ */
+export function Named({ text, max = 64 }: { text: unknown; max?: number }) {
+  return <code className="named">{inertText(text, max)}</code>;
 }
 
 export const plural = (n: number, one: string, many = `${one}s`) => `${n.toLocaleString("en-US")} ${n === 1 ? one : many}`;
