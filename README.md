@@ -253,4 +253,4 @@ docs/     LAUNCH.md (launch your own ledger), ONE_PAGER.md (what this is), PLAN.
 
 ## Status
 
-Public testnet live (Phase 1), with Hunts and Proof of Contribution v1 (Phases 1.5–2). An internal four-track security and product review was completed and its findings fixed. **No third-party audit yet: test value only.** Blockula isn't launching a mainnet: it's a kit for running your own ledger ([docs/LAUNCH.md](docs/LAUNCH.md)). See [docs/PLAN.md](docs/PLAN.md). Report vulnerabilities privately: [SECURITY.md](SECURITY.md).
+**Blockula 1.0:** a kit for running your own ledger ([docs/LAUNCH.md](docs/LAUNCH.md)), with WebAssembly programs as an experimental feature that's off by default ([docs/PROGRAMS-V0.md](docs/PROGRAMS-V0.md)). Public testnet live (Phase 1), with Hunts and Proof of Contribution v1 (Phases 1.5–2). An internal four-track security and product review was completed and its findings fixed. **No third-party audit yet: test value only.** Blockula isn't launching a mainnet or selling a token. See [docs/PLAN.md](docs/PLAN.md). Report vulnerabilities privately: [SECURITY.md](SECURITY.md).
